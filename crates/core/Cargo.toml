@@ -16,4 +16,5 @@ anyhow.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 uuid.workspace = true
+chrono.workspace = true
 tracing.workspace = true
