@@ -4,21 +4,23 @@ use std::io::{self, Write};
 use tracing_subscriber::EnvFilter;
 use wyj_config::Config;
 use wyj_core::{Agent, Session};
+use wyj_tools::{ToolCtx, ToolRegistry};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "wyj-code",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "wyj-code — 终端 AI 编程助手"
-)]
+#[command(name = "wyj-code", version = env!("CARGO_PKG_VERSION"),
+          about = "wyj-code — 终端 AI 编程助手")]
 struct Cli {
-    /// 打印配置状态并退出
     #[arg(long)]
     config_status: bool,
-
-    /// 单次 headless 问答（不进入交互模式）
+    /// 单次问答（不启动 TUI）
     #[arg(short = 'p', long)]
     prompt: Option<String>,
+    /// 工作目录（默认当前目录）
+    #[arg(long)]
+    cwd: Option<std::path::PathBuf>,
+    /// 强制使用 headless REPL 模式
+    #[arg(long)]
+    headless: bool,
 }
 
 #[tokio::main]
@@ -41,78 +43,58 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
     let provider = wyj_api::build_provider(&cfg)?;
-    let agent = Agent::new(provider).with_max_tokens(cfg.max_tokens);
+    let registry = ToolRegistry::standard();
+    let tool_ctx = ToolCtx::new(&cwd);
 
-    if let Some(prompt) = cli.prompt {
-        // 单次 headless 问答
-        let mut session = Session::new();
-        session.push_user(prompt);
-        agent
-            .run_turn(&mut session, &mut |delta| {
-                print!("{delta}");
-                let _ = io::stdout().flush();
-            })
-            .await?;
-        println!();
-        eprintln!("\n{}", session.cost_summary());
-    } else {
-        // 交互式 headless REPL（M3 之前的简易版本）
-        repl(agent).await?;
+    let mut agent = Agent::new(provider).with_max_tokens(cfg.max_tokens);
+    for def in registry.definitions() {
+        let name = def.name.clone();
+        if let Some(t) = registry.get(&name) {
+            agent.register_tool(t);
+        }
     }
 
+    if let Some(prompt) = cli.prompt {
+        let mut session = Session::new();
+        session.push_user(prompt);
+        agent.run_turn(&mut session, &tool_ctx, &mut |d| { print!("{d}"); let _ = io::stdout().flush(); }).await?;
+        println!();
+        eprintln!("\n{}", session.cost_summary());
+    } else if cli.headless {
+        repl(agent, tool_ctx).await?;
+    } else {
+        wyj_tui::run_tui(agent, tool_ctx, cwd).await?;
+    }
     Ok(())
 }
 
-async fn repl(agent: Agent) -> Result<()> {
+async fn repl(agent: Agent, ctx: ToolCtx) -> Result<()> {
     use std::io::BufRead;
-
-    println!(
-        "wyj-code v{} — 输入问题，回车发送。Ctrl-C 或 Ctrl-D 退出。",
-        env!("CARGO_PKG_VERSION")
-    );
-
+    println!("wyj-code v{} headless — 输入问题回车发送，Ctrl-D 退出", env!("CARGO_PKG_VERSION"));
     let mut session = Session::new();
     let stdin = io::stdin();
-
     loop {
         print!("\n> ");
         io::stdout().flush()?;
-
         let mut input = String::new();
         match stdin.lock().read_line(&mut input) {
-            Ok(0) => break, // EOF
+            Ok(0) => break,
             Ok(_) => {}
-            Err(e) => {
-                eprintln!("读取失败: {e}");
-                break;
-            }
+            Err(e) => { eprintln!("读取失败: {e}"); break; }
         }
-
         let trimmed = input.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed == "/exit" || trimmed == "/quit" {
-            break;
-        }
-
+        if trimmed.is_empty() { continue; }
+        if matches!(trimmed, "/exit" | "/quit") { break; }
         session.push_user(trimmed);
         println!();
-
-        if let Err(e) = agent
-            .run_turn(&mut session, &mut |delta| {
-                print!("{delta}");
-                let _ = io::stdout().flush();
-            })
-            .await
-        {
+        if let Err(e) = agent.run_turn(&mut session, &ctx, &mut |d| { print!("{d}"); let _ = io::stdout().flush(); }).await {
             eprintln!("\n[错误] {e}");
         }
         println!();
         eprintln!("{}", session.cost_summary());
     }
-
     println!("再见！");
     Ok(())
 }

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 wyj-core.workspace = true
+wyj-api.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,3 +21,7 @@ ignore.workspace = true
 similar.workspace = true
 reqwest.workspace = true
 tracing.workspace = true
+scraper.workspace = true
+encoding_rs.workspace = true
+futures.workspace = true
+regex.workspace = true

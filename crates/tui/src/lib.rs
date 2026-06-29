@@ -1,1 +1,9 @@
-//! wyj-tui crate — 待实现（M1+ 里程碑）
+//! wyj-tui — ratatui 终端 UI
+
+pub mod app;
+pub mod event;
+pub mod input;
+pub mod render;
+pub mod theme;
+
+pub use app::run_tui;
