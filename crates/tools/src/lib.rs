@@ -7,9 +7,13 @@ mod edit;
 mod glob;
 mod grep;
 mod webfetch;
+pub mod todo;
+pub mod sub_agent;
 pub mod ctx;
 pub mod registry;
 
 pub use ctx::ToolCtx;
 pub use registry::ToolRegistry;
+pub use todo::{TodoStore, TodoWriteTool};
+pub use sub_agent::SubAgentTool;
 pub use wyj_core::tool::{Tool, ToolResult};
