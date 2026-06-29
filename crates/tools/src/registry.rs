@@ -28,7 +28,7 @@ impl ToolRegistry {
         defs
     }
 
-    /// 构建包含所有标准工具的注册表
+    /// 构建核心工具注册表（不含需要外部状态的工具如 TodoWrite/SubAgent）
     pub fn standard() -> Self {
         use crate::{bash::BashTool, read::ReadTool, write::WriteTool, edit::EditTool,
                     glob::GlobTool, grep::GrepTool, webfetch::WebFetchTool};
@@ -41,6 +41,11 @@ impl ToolRegistry {
         r.register(GrepTool);
         r.register(WebFetchTool::new());
         r
+    }
+
+    /// 注册需要共享状态或工厂的工具
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
     }
 }
 
