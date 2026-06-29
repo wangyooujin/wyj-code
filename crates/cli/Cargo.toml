@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 wyj-config.workspace = true
+wyj-api.workspace = true
+wyj-core.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
