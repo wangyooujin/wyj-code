@@ -18,6 +18,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use wyj_commands::{builtin::standard_registry, CommandContext, CommandResult};
 use wyj_core::{Agent, Session};
 use wyj_tools::ToolCtx;
 
@@ -162,6 +163,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let agent = Arc::new(agent);
     let session = Arc::new(Mutex::new(Session::new()));
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let cmd_registry = standard_registry();
 
     loop {
         terminal.draw(|f| render::draw(f, &state, &input))?;
@@ -208,33 +210,69 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     } else if key.code == KeyCode::Enter && !state.is_thinking {
                         if !input.is_empty() {
                             let text = input.take();
-                            state.push_user(text.clone());
-                            state.is_thinking = true;
                             state.scroll_offset = 0;
 
-                            let agent_c = agent.clone();
-                            let session_c = session.clone();
-                            let tx = agent_tx.clone();
-                            let ctx_cwd = cwd.clone();
-
-                            tokio::spawn(async move {
-                                let mut sess = session_c.lock().await;
-                                sess.push_user(text);
-
-                                let ctx = ToolCtx::new(&ctx_cwd);
-                                let tx2 = tx.clone();
-                                let mut on_text = move |d: &str| {
-                                    let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
-                                };
-                                match agent_c.run_turn(&mut sess, &ctx, &mut on_text).await {
-                                    Ok(_) => {
-                                        let _ = tx.send(AgentEvent::TurnDone).await;
+                            // 先检测是否是 slash 命令
+                            let cmd_ctx = CommandContext {
+                                cwd: cwd.clone(),
+                                model: "".to_string(),
+                            };
+                            if let Some(result) = cmd_registry.dispatch(&text, &cmd_ctx).await {
+                                match result {
+                                    Ok(CommandResult::Output(out)) => {
+                                        state.messages.push(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: out,
+                                            is_error: false,
+                                        });
+                                    }
+                                    Ok(CommandResult::ClearHistory) => {
+                                        state.messages.clear();
+                                        let mut sess = session.lock().await;
+                                        *sess = Session::new();
+                                    }
+                                    Ok(CommandResult::SetModel(m)) => {
+                                        state.messages.push(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: format!("模型已切换: {m}（重启生效）"),
+                                            is_error: false,
+                                        });
+                                    }
+                                    Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
+                                        state.should_quit = true;
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+                                        state.messages.push(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: format!("[命令错误] {e}"),
+                                            is_error: true,
+                                        });
                                     }
                                 }
-                            });
+                            } else {
+                                // 普通消息 → 发给 agent
+                                state.push_user(text.clone());
+                                state.is_thinking = true;
+
+                                let agent_c = agent.clone();
+                                let session_c = session.clone();
+                                let tx = agent_tx.clone();
+                                let ctx_cwd = cwd.clone();
+
+                                tokio::spawn(async move {
+                                    let mut sess = session_c.lock().await;
+                                    sess.push_user(text);
+                                    let ctx = ToolCtx::new(&ctx_cwd);
+                                    let tx2 = tx.clone();
+                                    let mut on_text = move |d: &str| {
+                                        let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
+                                    };
+                                    match agent_c.run_turn(&mut sess, &ctx, &mut on_text).await {
+                                        Ok(_) => { let _ = tx.send(AgentEvent::TurnDone).await; }
+                                        Err(e) => { let _ = tx.send(AgentEvent::Error(e.to_string())).await; }
+                                    }
+                                });
+                            }
                         }
                     } else if key.code == KeyCode::PageUp {
                         state.scroll_offset = state.scroll_offset.saturating_add(5);

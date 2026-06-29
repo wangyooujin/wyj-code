@@ -1,1 +1,6 @@
-//! wyj-commands crate — 待实现（M1+ 里程碑）
+//! wyj-commands — Slash 命令系统
+
+pub mod registry;
+pub mod builtin;
+
+pub use registry::{Command, CommandContext, CommandRegistry, CommandResult};
