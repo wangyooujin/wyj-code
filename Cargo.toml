@@ -1,0 +1,73 @@
+# wyj-code — 独立实现的 Rust 终端 AI 编程助手
+# Clean-room 净室实现，不包含任何第三方专有提示词或资产。
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/config",
+    "crates/api",
+    "crates/core",
+    "crates/tools",
+    "crates/tui",
+    "crates/commands",
+    "crates/mcp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["owen"]
+rust-version = "1.80"
+
+[workspace.dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+# HTTP + SSE
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# JSON Schema
+schemars = { version = "0.8", features = ["derive"] }
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+# 日志（本地，无遥测）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 配置目录
+directories = "5"
+# CLI 解析
+clap = { version = "4", features = ["derive", "env"] }
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+# 异步 trait
+async-trait = "0.1"
+# 文件匹配
+globset = "0.4"
+ignore = "0.4"
+# diff / edit 验证
+similar = "2"
+# 其他工具
+futures = "0.3"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# 内部 crate
+wyj-config = { path = "crates/config" }
+wyj-api = { path = "crates/api" }
+wyj-core = { path = "crates/core" }
+wyj-tools = { path = "crates/tools" }
+wyj-tui = { path = "crates/tui" }
+wyj-commands = { path = "crates/commands" }
+wyj-mcp = { path = "crates/mcp" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1

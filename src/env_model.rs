@@ -1,0 +1,74 @@
+//! 已知 Claude Code 环境变量清单与校验。用于 `set`/`unset`/`toggle` 的提示与补全。
+
+/// 具名字段对应的 env key(与 config::Profile 字段一一对应)。
+#[allow(dead_code)]
+pub const NAMED_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "MAX_THINKING_TOKENS",
+    "API_TIMEOUT_MS",
+];
+
+/// 常用开关类 env(布尔语义,适合 `toggle`)。
+pub const SWITCH_KEYS: &[&str] = &[
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "DISABLE_AUTOUPDATER",
+    "DISABLE_TELEMETRY",
+    "DISABLE_ERROR_REPORTING",
+    "DISABLE_BUG_COMMAND",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+];
+
+/// 所有已知 env key(具名 + 开关 + 其他常用)。
+#[allow(dead_code)]
+pub const KNOWN_KEYS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "API_TIMEOUT_MS",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "MAX_THINKING_TOKENS",
+    "MAX_MCP_OUTPUT_TOKENS",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "DISABLE_AUTOUPDATER",
+    "DISABLE_TELEMETRY",
+    "DISABLE_ERROR_REPORTING",
+    "DISABLE_BUG_COMMAND",
+    "DISABLE_NON_ESSENTIAL_MODEL_CALLS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "BASH_DEFAULT_TIMEOUT_MS",
+    "BASH_MAX_TIMEOUT_MS",
+    "BASH_MAX_OUTPUT_LENGTH",
+];
+
+#[allow(dead_code)]
+pub fn is_named_key(key: &str) -> bool {
+    NAMED_KEYS.contains(&key)
+}
+
+pub fn is_switch_key(key: &str) -> bool {
+    SWITCH_KEYS.contains(&key)
+}
