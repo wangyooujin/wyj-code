@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 wyj-core.workspace = true
 wyj-tools.workspace = true
+wyj-api.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
