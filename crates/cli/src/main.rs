@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use tracing_subscriber::EnvFilter;
 use std::sync::{Arc, Mutex};
 use wyj_config::Config;
-use wyj_core::{Agent, Session};
+use wyj_core::{Agent, HistoryEntry, HistoryStore, Session, new_session_id, now_iso};
 use wyj_tools::{ToolCtx, ToolRegistry, TodoStore, TodoWriteTool, SubAgentTool};
 
 #[derive(Parser, Debug)]
@@ -45,6 +45,10 @@ async fn main() -> Result<()> {
     }
 
     let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let session_id = new_session_id();
+    let history_store = wyj_config::config_dir()
+        .ok()
+        .and_then(|d| HistoryStore::new(d.join("history")).ok());
     let cfg_clone = cfg.clone();
     let provider = wyj_api::build_provider(&cfg)?;
     let mut registry = ToolRegistry::standard();
@@ -79,22 +83,40 @@ async fn main() -> Result<()> {
     if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
         session.push_user(prompt);
+        let turns = session.messages.len();
         agent.run_turn(&mut session, &tool_ctx, &mut |d| { print!("{d}"); let _ = io::stdout().flush(); }).await?;
         println!();
         eprintln!("\n{}", session.cost_summary());
+        if let Some(hs) = &history_store {
+            let _ = hs.append(&HistoryEntry {
+                timestamp: now_iso(),
+                session_id: session_id.clone(),
+                input_tokens: session.total_input_tokens,
+                output_tokens: session.total_output_tokens,
+                turns,
+                cwd: cwd.display().to_string(),
+            });
+        }
     } else if cli.headless {
-        repl(agent, tool_ctx).await?;
+        repl(agent, tool_ctx, history_store, session_id, cwd).await?;
     } else {
         wyj_tui::run_tui(agent, tool_ctx, cwd).await?;
     }
     Ok(())
 }
 
-async fn repl(agent: Agent, ctx: ToolCtx) -> Result<()> {
+async fn repl(
+    agent: Agent,
+    ctx: ToolCtx,
+    history_store: Option<HistoryStore>,
+    session_id: String,
+    cwd: std::path::PathBuf,
+) -> Result<()> {
     use std::io::BufRead;
-    println!("wyj-code v{} headless — 输入问题回车发送，Ctrl-D 退出", env!("CARGO_PKG_VERSION"));
+    println!("wyj-code v{} — 输入问题回车发送，/quit 退出，Ctrl-D 退出", env!("CARGO_PKG_VERSION"));
     let mut session = Session::new();
     let stdin = io::stdin();
+    let mut turns = 0usize;
     loop {
         print!("\n> ");
         io::stdout().flush()?;
@@ -107,13 +129,37 @@ async fn repl(agent: Agent, ctx: ToolCtx) -> Result<()> {
         let trimmed = input.trim();
         if trimmed.is_empty() { continue; }
         if matches!(trimmed, "/exit" | "/quit") { break; }
+        if trimmed == "/history" {
+            if let Some(hs) = &history_store {
+                match hs.recent(10) {
+                    Ok(entries) => {
+                        for e in &entries {
+                            println!("[{}] {} tokens:{}+{}", e.timestamp, e.session_id, e.input_tokens, e.output_tokens);
+                        }
+                    }
+                    Err(e) => eprintln!("读取历史失败: {e}"),
+                }
+            }
+            continue;
+        }
         session.push_user(trimmed);
+        turns += 1;
         println!();
         if let Err(e) = agent.run_turn(&mut session, &ctx, &mut |d| { print!("{d}"); let _ = io::stdout().flush(); }).await {
             eprintln!("\n[错误] {e}");
         }
         println!();
         eprintln!("{}", session.cost_summary());
+    }
+    if let Some(hs) = &history_store {
+        let _ = hs.append(&HistoryEntry {
+            timestamp: now_iso(),
+            session_id,
+            input_tokens: session.total_input_tokens,
+            output_tokens: session.total_output_tokens,
+            turns,
+            cwd: cwd.display().to_string(),
+        });
     }
     println!("再见！");
     Ok(())
