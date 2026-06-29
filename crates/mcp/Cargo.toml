@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 wyj-core.workspace = true
+wyj-api.workspace = true
 wyj-config.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -15,3 +16,4 @@ serde_json.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+rmcp = { version = "1.8", features = ["client", "transport-child-process"] }
