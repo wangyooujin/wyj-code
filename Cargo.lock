@@ -3415,6 +3415,7 @@ dependencies = [
  "base64",
  "crossterm",
  "futures",
+ "ignore",
  "png 0.17.16",
  "pulldown-cmark",
  "ratatui",
