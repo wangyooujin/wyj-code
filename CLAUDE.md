@@ -26,6 +26,12 @@ cargo fmt                        # 格式化（max_width = 100，见 rustfmt.tom
 cargo clippy                     # lint
 ```
 
+## Git 提交约定
+
+- **不要**在 commit message 中添加 `Co-Authored-By: Claude <noreply@anthropic.com>` 或任何指向 Claude / Anthropic 的署名 trailer。仓库历史已清理过一次以移除这些 trailer——它们会让 GitHub 在 Contributors 列表中显示 "Claude"，本仓库希望仅展示真实人类作者。
+- commit message 用简体中文，首行 `type: 简述`，空行后列要点。
+- 用户说"提交代码并 push"时：`git add -A` → `git commit` → `git push`。仅当用户要求时才提交/推送；若在默认分支上，先建分支（本项目 master 为单作者主线，按用户指示可直接提交）。
+
 ## Configuration
 
 配置文件：`~/.wyj-code/config.toml`，API Key 优先读取环境变量 `WYJ_CODE_API_KEY`。

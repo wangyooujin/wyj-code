@@ -6,7 +6,7 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, KeyModifiers, MouseEventKind,
         MouseButton, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
@@ -411,6 +411,8 @@ pub struct AppState {
     pub turn_start_output_tokens: u32,
     /// 上次渲染的滚动条区域（用于鼠标点击 ▲▼ 箭头命中检测）
     pub scrollbar_area: Rect,
+    /// true = 鼠标捕获开启（滚轮滚动），false = 选择模式（终端原生文本选中）
+    pub mouse_capture: bool,
 }
 
 impl AppState {
@@ -456,6 +458,7 @@ impl AppState {
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
             scrollbar_area: Rect::default(),
+            mouse_capture: true,
         }
     }
 
@@ -629,6 +632,7 @@ pub async fn run_tui(
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
@@ -655,6 +659,7 @@ pub async fn run_tui(
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste
     )?;
@@ -1422,6 +1427,19 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             } else {
                                 state.last_esc = Some(Instant::now());
                             }
+                        }
+                        continue;
+                    }
+
+                    // Ctrl+T → 切换鼠标捕获模式（滚动 ↔ 文本选择）
+                    if key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        state.mouse_capture = !state.mouse_capture;
+                        if state.mouse_capture {
+                            let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
+                        } else {
+                            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                         }
                         continue;
                     }
