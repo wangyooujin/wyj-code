@@ -37,15 +37,44 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 截断超长字符串（按字符数）
-fn truncate_line(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        s.to_string()
+/// 字符显示宽度：CJK 全角 = 2，其余 = 1
+fn char_display_width(c: char) -> usize {
+    if c == '\t' { return 4; }
+    let cp = c as u32;
+    if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
+        || (0x2E80..=0x303E).contains(&cp)   // CJK Radicals
+        || (0x3041..=0x33FF).contains(&cp)   // Japanese
+        || (0xAC00..=0xD7A3).contains(&cp)   // Hangul Syllables
+        || (0xF900..=0xFAFF).contains(&cp)   // CJK Compatibility
+        || (0xFE10..=0xFE6F).contains(&cp)   // CJK Compatibility Forms
+        || (0xFF00..=0xFF60).contains(&cp)   // Fullwidth
+        || (0xFFE0..=0xFFE6).contains(&cp)   // Fullwidth Signs
+        || (0x1F300..=0x1F9FF).contains(&cp) // Emoji
+        || (0x20000..=0x2FA1F).contains(&cp) // CJK Extension
+    {
+        2
     } else {
-        let t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-        format!("{t}…")
+        1
     }
+}
+
+/// 截断超长字符串（按终端显示宽度，CJK 字符占 2 列）
+fn truncate_line(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut width = 0usize;
+    let mut result = String::new();
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if width + cw > max_cols.saturating_sub(1) {
+            result.push('…');
+            return result;
+        }
+        width += cw;
+        result.push(c);
+    }
+    s.to_string()
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -169,7 +198,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let content_area = cols[0];
     let scrollbar_area = cols[1];
 
-    let max_content_width = content_area.width.saturating_sub(4) as usize;
+    let max_content_width = content_area.width.saturating_sub(2) as usize;
     let sep_width = content_area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
     let mut is_first_user = true;
@@ -380,16 +409,35 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .scroll((scroll, 0));
     f.render_widget(para, content_area);
 
-    // 滚动条（仅内容超出可视区时显示）
+    // 记录滚动条区域供鼠标点击命中检测
+    state.scrollbar_area = scrollbar_area;
+
+    // 滚动条（内容超出可视区时显示 ▲/▼ 箭头 + 拇指指示器）
+    let can_scroll_up = clamped_offset < max_scroll;   // 还有更早内容
+    let can_scroll_down = clamped_offset > 0;           // 还有更新内容
     if total_visual_lines > visible_height && visible_height > 0 {
-        let thumb_row = if max_scroll > 0 {
+        // 拇指在中间轨道（排除头尾各 1 行的箭头位置）
+        let track_height = visible_height.saturating_sub(2);
+        let thumb_row = if max_scroll > 0 && track_height > 0 {
             let pct = clamped_offset as f32 / max_scroll as f32; // 0=底部 1=顶部
-            visible_height.saturating_sub(1) - (pct * visible_height.saturating_sub(1) as f32) as u16
+            1 + (track_height.saturating_sub(1) as f32 * (1.0 - pct)) as u16
         } else {
-            visible_height.saturating_sub(1)
+            1
         };
         let bar_lines: Vec<Line<'static>> = (0..visible_height).map(|row| {
-            if row == thumb_row {
+            if row == 0 {
+                if can_scroll_up {
+                    Line::from(Span::styled("▲", Style::default().fg(Color::DarkGray)))
+                } else {
+                    Line::from(Span::styled("╷", Theme::dim()))
+                }
+            } else if row == visible_height - 1 {
+                if can_scroll_down {
+                    Line::from(Span::styled("▼", Style::default().fg(Color::DarkGray)))
+                } else {
+                    Line::from(Span::styled("╵", Theme::dim()))
+                }
+            } else if row == thumb_row {
                 Line::from(Span::styled("█", Style::default().fg(Color::DarkGray)))
             } else {
                 Line::from(Span::styled("│", Theme::dim()))
