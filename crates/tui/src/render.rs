@@ -58,8 +58,8 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Spinner 动画帧（来回扫动效果）
-pub const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✽', '✻', '✶', '✳', '✢', '·'];
+/// Spinner 动画帧（braille，复刻 Claude Code 风格）
+pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
@@ -344,6 +344,12 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                 ]));
                 lines.push(Line::from(""));
             }
+            MessageRole::TurnSummary => {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}", msg.content), Theme::dim()),
+                ]));
+                lines.push(Line::from(""));
+            }
         }
     }
 
@@ -352,12 +358,12 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         render_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
-    // is_thinking 时在底部显示 spinner 行
-    if state.is_thinking {
+    // is_thinking 且无工具在执行时显示 spinner 行（工具执行期间 ToolCall 消息已可见）
+    if state.is_thinking && state.current_op.is_none() {
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
         lines.push(Line::from(vec![
             Span::styled(format!("{frame} "), Style::default().fg(Theme::CLAUDE)),
-            Span::styled("思考中…", Theme::dim()),
+            Span::styled("Thinking…", Theme::dim()),
         ]));
     }
 
@@ -486,8 +492,9 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
 
     let (title_content, title_style) = if state.is_thinking {
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
+        let op = state.current_op.as_deref().unwrap_or("Thinking");
         (
-            format!(" {frame} esc to interrupt · ctrl+c to cancel "),
+            format!(" {frame} {op} · esc to interrupt "),
             Style::default().fg(Theme::CLAUDE),
         )
     } else if is_bang {

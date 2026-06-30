@@ -47,6 +47,8 @@ pub enum MessageRole {
     BashOutput,
     /// 系统通知（模式切换、会话事件等）
     System,
+    /// 每轮结束后的耗时/token 摘要行
+    TurnSummary,
 }
 
 /// 渲染用消息
@@ -137,6 +139,26 @@ impl ChatMessage {
 
     pub fn system(content: String) -> Self {
         Self::base(MessageRole::System, content)
+    }
+
+    fn turn_summary(elapsed_secs: f64, d_input: u32, d_output: u32) -> Self {
+        let content = format!(
+            "⏱ {:.1}s · ↑{} ↓{}",
+            elapsed_secs,
+            fmt_tokens(d_input),
+            fmt_tokens(d_output),
+        );
+        Self::base(MessageRole::TurnSummary, content)
+    }
+}
+
+fn fmt_tokens(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
+    } else if n >= 1000 {
+        format!("{},{:03}", n / 1000, n % 1000)
+    } else {
+        n.to_string()
     }
 }
 
@@ -370,6 +392,14 @@ pub struct AppState {
     pub file_selected: usize,
     /// @ 选取器当前浏览目录
     pub at_browse_dir: PathBuf,
+    /// 当前正在执行的操作名（工具调用时为 "ToolName(arg)"，LLM 思考时为 None）
+    pub current_op: Option<String>,
+    /// 本轮对话开始时间（用于计算耗时）
+    pub turn_start_time: Option<Instant>,
+    /// 本轮对话开始时的 input_tokens 快照
+    pub turn_start_input_tokens: u32,
+    /// 本轮对话开始时的 output_tokens 快照
+    pub turn_start_output_tokens: u32,
 }
 
 impl AppState {
@@ -409,6 +439,10 @@ impl AppState {
             file_completions: vec![],
             file_selected: 0,
             at_browse_dir: PathBuf::new(),
+            current_op: None,
+            turn_start_time: None,
+            turn_start_input_tokens: 0,
+            turn_start_output_tokens: 0,
         }
     }
 
@@ -461,6 +495,7 @@ impl AppState {
                 } else {
                     format!("{name}({arg})")
                 };
+                self.current_op = Some(display.clone());
                 self.tool_info.insert(id, (name, seq));
                 self.flush_streaming();
                 self.messages.push(ChatMessage::tool_call(display, seq));
@@ -472,6 +507,7 @@ impl AppState {
                 is_error,
                 elapsed_secs,
             } => {
+                self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
                 self.messages.push(ChatMessage::tool_result(
@@ -499,8 +535,15 @@ impl AppState {
             AgentEvent::TurnDone => {
                 self.flush_streaming();
                 self.is_thinking = false;
+                self.current_op = None;
                 self.turns += 1;
                 self.save_needed = true;
+                if let Some(start) = self.turn_start_time.take() {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let d_in = self.total_input_tokens.saturating_sub(self.turn_start_input_tokens);
+                    let d_out = self.total_output_tokens.saturating_sub(self.turn_start_output_tokens);
+                    self.messages.push(ChatMessage::turn_summary(elapsed, d_in, d_out));
+                }
             }
 
             AgentEvent::Error(e) => {
@@ -864,8 +907,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             }
         }
 
-        // 推进 spinner 动画帧（每 ~120ms 一帧）
-        if state.is_thinking && last_spinner_advance.elapsed().as_millis() >= 120 {
+        // 推进 spinner 动画帧（每 ~80ms 一帧，与 Claude Code 节奏一致）
+        if state.is_thinking && last_spinner_advance.elapsed().as_millis() >= 80 {
             state.spinner_frame = (state.spinner_frame + 1) % render::SPINNER_FRAMES.len();
             last_spinner_advance = Instant::now();
         }
@@ -1535,6 +1578,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         state.push_user(prompt.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
+                                        state.turn_start_time = Some(Instant::now());
+                                        state.turn_start_input_tokens = state.total_input_tokens;
+                                        state.turn_start_output_tokens = state.total_output_tokens;
 
                                         let agent_c = shared_agent.read().unwrap().clone();
                                         let session_c = session.clone();
@@ -1674,6 +1720,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 state.input_history.push(text.clone());
                                 state.is_thinking = true;
                                 state.spinner_frame = 0;
+                                state.turn_start_time = Some(Instant::now());
+                                state.turn_start_input_tokens = state.total_input_tokens;
+                                state.turn_start_output_tokens = state.total_output_tokens;
 
                                 // 捕获并清空附件列表（移入 async task）
                                 let attachments = std::mem::take(&mut state.pending_attachments);
