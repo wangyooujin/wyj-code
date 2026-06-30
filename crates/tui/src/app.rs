@@ -21,9 +21,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
+use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::AgentMode;
-use wyj_core::{now_iso, Agent, HistoryEntry, HistoryStore, Session, ToolEvent};
+use wyj_core::{
+    extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
+    Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
+};
 use wyj_tools::todo::TodoItem;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
 use wyj_tools::{TodoStore, ToolCtx};
@@ -149,6 +153,14 @@ pub struct AskQuestionDialog {
     pub options: Vec<String>,
     pub selected: usize,
     pub response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+}
+
+/// 会话选择器状态（/sessions 命令触发）
+pub struct SessionPickerState {
+    /// 历史会话列表（index 0 对应显示项 1，显示项 0 固定为"新建会话"）
+    pub sessions: Vec<SessionMeta>,
+    /// 当前选中项：0 = 新建会话，1..=n = sessions[selected-1]
+    pub selected: usize,
 }
 
 // ── 工具展示帮助函数 ─────────────────────────────────────────────────────────
@@ -285,6 +297,10 @@ pub struct AppState {
     pub session_allowed: HashSet<String>,
     /// 当前任务列表快照（TodoWrite 更新），用于底部固定面板渲染
     pub current_todos: Option<Vec<TodoItem>>,
+    /// 会话选择器（/sessions 命令触发时 Some）
+    pub session_picker: Option<SessionPickerState>,
+    /// 标记当前轮次完成后需保存 session 文件
+    pub save_needed: bool,
 }
 
 impl AppState {
@@ -316,6 +332,8 @@ impl AppState {
             history_idx: None,
             session_allowed: HashSet::new(),
             current_todos: None,
+            session_picker: None,
+            save_needed: false,
         }
     }
 
@@ -406,6 +424,7 @@ impl AppState {
                 self.flush_streaming();
                 self.is_thinking = false;
                 self.turns += 1;
+                self.save_needed = true;
             }
 
             AgentEvent::Error(e) => {
@@ -457,6 +476,8 @@ pub async fn run_tui(
     rebuild_fn: RebuildFn,
     cwd: PathBuf,
     history_store: Option<HistoryStore>,
+    session_store: Option<Arc<SessionStore>>,
+    initial_messages: Vec<Message>,
     session_id: String,
     model_name: String,
     context_window: u32,
@@ -475,6 +496,8 @@ pub async fn run_tui(
         rebuild_fn,
         cwd,
         history_store,
+        session_store,
+        initial_messages,
         session_id,
         model_name,
         context_window,
@@ -543,6 +566,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     rebuild_fn: RebuildFn,
     cwd: PathBuf,
     history_store: Option<HistoryStore>,
+    session_store: Option<Arc<SessionStore>>,
+    initial_messages: Vec<Message>,
     session_id: String,
     model_name: String,
     context_window: u32,
@@ -552,6 +577,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     let mut state = AppState::new(cwd.clone(), model_name, context_window, mode);
     let mut input = InputBox::new();
+    let mut current_session_id = session_id;
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (ui_ask_tx, mut ui_ask_rx) = mpsc::channel::<UiAskRequest>(8);
@@ -595,7 +621,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
-    let session = Arc::new(Mutex::new(Session::new()));
+
+    // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
+    let has_initial = !initial_messages.is_empty();
+    let mut init_sess = Session::new();
+    init_sess.messages = initial_messages;
+    if has_initial {
+        state.messages = reconstruct_display(&init_sess.messages);
+        state.messages.push(ChatMessage::system(format!(
+            "已恢复会话  共 {} 条消息",
+            init_sess.messages.len()
+        )));
+        state.scroll_offset = 0;
+    }
+    let session = Arc::new(Mutex::new(init_sess));
 
     let mut last_spinner_advance = Instant::now();
 
@@ -621,6 +660,28 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             match agent_rx.try_recv() {
                 Ok(ev) => state.apply_agent_event(ev),
                 Err(_) => break,
+            }
+        }
+
+        // 每轮对话结束后自动保存 session 文件
+        if state.save_needed {
+            state.save_needed = false;
+            if let Some(store) = &session_store {
+                let sess = session.lock().await;
+                if !sess.messages.is_empty() {
+                    let sf = SessionFile {
+                        session_id: current_session_id.clone(),
+                        title: extract_title(&sess.messages),
+                        last_preview: extract_preview(&sess.messages),
+                        cwd: cwd.display().to_string(),
+                        timestamp: now_iso(),
+                        turns: state.turns,
+                        input_tokens: sess.total_input_tokens,
+                        output_tokens: sess.total_output_tokens,
+                        messages: sess.messages.clone(),
+                    };
+                    let _ = store.save(&sf);
+                }
             }
         }
 
@@ -651,6 +712,121 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     _ => {}
                 },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
+                    if state.session_picker.is_some() {
+                        match key.code {
+                            KeyCode::Up => {
+                                if let Some(picker) = &mut state.session_picker {
+                                    if picker.selected > 0 {
+                                        picker.selected -= 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(picker) = &mut state.session_picker {
+                                    let max = picker.sessions.len(); // 0=新建，1..=n=sessions
+                                    if picker.selected < max {
+                                        picker.selected += 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(picker) = state.session_picker.take() {
+                                    if picker.selected == 0 {
+                                        // 新建会话：自动保存当前后重置
+                                        if let Some(store) = &session_store {
+                                            let sess = session.lock().await;
+                                            if !sess.messages.is_empty() {
+                                                let _ = store.save(&SessionFile {
+                                                    session_id: current_session_id.clone(),
+                                                    title: extract_title(&sess.messages),
+                                                    last_preview: extract_preview(&sess.messages),
+                                                    cwd: cwd.display().to_string(),
+                                                    timestamp: now_iso(),
+                                                    turns: state.turns,
+                                                    input_tokens: sess.total_input_tokens,
+                                                    output_tokens: sess.total_output_tokens,
+                                                    messages: sess.messages.clone(),
+                                                });
+                                            }
+                                        }
+                                        let mut sess = session.lock().await;
+                                        *sess = Session::new();
+                                        drop(sess);
+                                        current_session_id = new_session_id();
+                                        state.messages.clear();
+                                        state.total_input_tokens = 0;
+                                        state.total_output_tokens = 0;
+                                        state.turns = 0;
+                                        state.messages.push(ChatMessage::system(
+                                            "已开始新会话".to_string(),
+                                        ));
+                                    } else {
+                                        // 切换到选定历史会话
+                                        let meta = &picker.sessions[picker.selected - 1];
+                                        if let Some(store) = &session_store {
+                                            // 自动保存当前会话
+                                            {
+                                                let sess = session.lock().await;
+                                                if !sess.messages.is_empty() {
+                                                    let _ = store.save(&SessionFile {
+                                                        session_id: current_session_id.clone(),
+                                                        title: extract_title(&sess.messages),
+                                                        last_preview: extract_preview(
+                                                            &sess.messages,
+                                                        ),
+                                                        cwd: cwd.display().to_string(),
+                                                        timestamp: now_iso(),
+                                                        turns: state.turns,
+                                                        input_tokens: sess.total_input_tokens,
+                                                        output_tokens: sess.total_output_tokens,
+                                                        messages: sess.messages.clone(),
+                                                    });
+                                                }
+                                            }
+                                            // 加载目标会话
+                                            match store.load(&meta.session_id) {
+                                                Ok(file) => {
+                                                    let display_msgs =
+                                                        reconstruct_display(&file.messages);
+                                                    let mut sess = session.lock().await;
+                                                    sess.total_input_tokens = file.input_tokens;
+                                                    sess.total_output_tokens = file.output_tokens;
+                                                    sess.messages = file.messages;
+                                                    drop(sess);
+                                                    current_session_id = file.session_id.clone();
+                                                    state.messages = display_msgs;
+                                                    state.total_input_tokens = file.input_tokens;
+                                                    state.total_output_tokens = file.output_tokens;
+                                                    state.turns = file.turns;
+                                                    state.scroll_offset = 0;
+                                                    state.messages.push(ChatMessage::system(
+                                                        format!(
+                                                            "已切换至会话 {}  共 {} 轮对话",
+                                                            file.session_id, file.turns
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                            "[加载会话失败] {e}"
+                                                        )),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.session_picker = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // ① AskQuestion 对话框优先拦截全部按键
                     if state.ask_question_dialog.is_some() {
                         match key.code {
@@ -1013,6 +1189,34 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             ));
                                         }
                                     },
+                                    Ok(CommandResult::OpenSessionPicker) => {
+                                        if state.is_thinking {
+                                            state.messages.push(ChatMessage::assistant(
+                                                "请等待当前任务完成后再切换会话。".to_string(),
+                                            ));
+                                        } else if let Some(store) = &session_store {
+                                            match store.list() {
+                                                Ok(sessions) => {
+                                                    state.session_picker =
+                                                        Some(SessionPickerState {
+                                                            sessions,
+                                                            selected: 0,
+                                                        });
+                                                }
+                                                Err(e) => {
+                                                    state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                            "[会话列表失败] {e}"
+                                                        )),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            state.messages.push(ChatMessage::assistant(
+                                                "会话存储未初始化，无法加载会话列表。".to_string(),
+                                            ));
+                                        }
+                                    }
                                     Ok(CommandResult::RunPrompt(prompt)) => {
                                         // Skill 展开后的 prompt → 当作用户消息发给 agent
                                         state.push_user(prompt.clone());
@@ -1059,6 +1263,68 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             }
                                         });
                                         state.current_task = Some(handle.abort_handle());
+                                    }
+                                    Ok(CommandResult::ResumeSession(id)) => {
+                                        if state.is_thinking {
+                                            state.messages.push(ChatMessage::assistant(
+                                                "请等待当前任务完成后再切换会话。".to_string(),
+                                            ));
+                                        } else if let Some(store) = &session_store {
+                                            // 自动保存当前会话
+                                            {
+                                                let sess = session.lock().await;
+                                                if !sess.messages.is_empty() {
+                                                    let _ = store.save(&SessionFile {
+                                                        session_id: current_session_id.clone(),
+                                                        title: extract_title(&sess.messages),
+                                                        last_preview: extract_preview(
+                                                            &sess.messages,
+                                                        ),
+                                                        cwd: cwd.display().to_string(),
+                                                        timestamp: now_iso(),
+                                                        turns: state.turns,
+                                                        input_tokens: sess.total_input_tokens,
+                                                        output_tokens: sess.total_output_tokens,
+                                                        messages: sess.messages.clone(),
+                                                    });
+                                                }
+                                            }
+                                            // 加载目标会话
+                                            match store.load(&id) {
+                                                Ok(file) => {
+                                                    let display_msgs =
+                                                        reconstruct_display(&file.messages);
+                                                    let mut sess = session.lock().await;
+                                                    sess.total_input_tokens = file.input_tokens;
+                                                    sess.total_output_tokens = file.output_tokens;
+                                                    sess.messages = file.messages;
+                                                    drop(sess);
+                                                    current_session_id = file.session_id.clone();
+                                                    state.messages = display_msgs;
+                                                    state.total_input_tokens = file.input_tokens;
+                                                    state.total_output_tokens = file.output_tokens;
+                                                    state.turns = file.turns;
+                                                    state.scroll_offset = 0;
+                                                    state.messages.push(ChatMessage::system(
+                                                        format!(
+                                                            "已恢复会话 {}  共 {} 轮对话",
+                                                            file.session_id, file.turns
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                            "[会话不存在或加载失败] {e}"
+                                                        )),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            state.messages.push(ChatMessage::assistant(
+                                                "会话存储未初始化。".to_string(),
+                                            ));
+                                        }
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;
@@ -1241,11 +1507,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         }
     }
 
-    // 退出时保存会话历史
+    // 退出时保存会话历史元数据
     if let Some(hs) = history_store {
         let _ = hs.append(&HistoryEntry {
             timestamp: now_iso(),
-            session_id,
+            session_id: current_session_id.clone(),
             input_tokens: state.total_input_tokens,
             output_tokens: state.total_output_tokens,
             turns: state.turns,
@@ -1253,5 +1519,88 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         });
     }
 
+    // 退出时保存完整会话文件
+    if let Some(store) = &session_store {
+        if let Ok(sess) = session.try_lock() {
+            if !sess.messages.is_empty() {
+                let _ = store.save(&SessionFile {
+                    session_id: current_session_id.clone(),
+                    title: extract_title(&sess.messages),
+                    last_preview: extract_preview(&sess.messages),
+                    cwd: cwd.display().to_string(),
+                    timestamp: now_iso(),
+                    turns: state.turns,
+                    input_tokens: sess.total_input_tokens,
+                    output_tokens: sess.total_output_tokens,
+                    messages: sess.messages.clone(),
+                });
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// 将 API Message 列表重建为 TUI 显示用的 ChatMessage 列表
+fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
+    let mut result = Vec::new();
+    let mut tool_seq = 0usize;
+
+    for msg in messages {
+        match &msg.role {
+            Role::User => {
+                let mut has_text = false;
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } if !text.trim().is_empty() => {
+                            result.push(ChatMessage::user(text.clone()));
+                            has_text = true;
+                        }
+                        ContentBlock::ToolResult {
+                            content, is_error, ..
+                        } => {
+                            let text = match content {
+                                ToolResultContent::Text(s) => s.clone(),
+                                ToolResultContent::Blocks(v) => {
+                                    serde_json::to_string_pretty(v).unwrap_or_default()
+                                }
+                            };
+                            let summary = text
+                                .lines()
+                                .next()
+                                .map(|l| l.trim().to_string())
+                                .unwrap_or_default();
+                            result.push(ChatMessage::tool_result(
+                                text, *is_error, 0.0, tool_seq, String::new(), summary,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                let _ = has_text;
+            }
+            Role::Assistant => {
+                let mut text_buf = String::new();
+                for block in &msg.content {
+                    match block {
+                        ContentBlock::Text { text } => text_buf.push_str(text),
+                        ContentBlock::ToolUse { name, .. } => {
+                            if !text_buf.trim().is_empty() {
+                                result.push(ChatMessage::assistant(std::mem::take(&mut text_buf)));
+                            } else {
+                                text_buf.clear();
+                            }
+                            tool_seq += 1;
+                            result.push(ChatMessage::tool_call(name.clone(), tool_seq));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text_buf.trim().is_empty() {
+                    result.push(ChatMessage::assistant(text_buf));
+                }
+            }
+        }
+    }
+    result
 }

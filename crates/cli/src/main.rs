@@ -6,7 +6,8 @@ use tracing_subscriber::EnvFilter;
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::{
-    new_session_id, now_iso, Agent, HistoryEntry, HistoryStore, MemoryStore, Session, ToolEvent,
+    extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
+    MemoryStore, Session, SessionFile, SessionStore, ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
@@ -33,6 +34,12 @@ struct Cli {
     /// Bypass 模式：自动允许所有工具调用，不弹权限确认对话框
     #[arg(long)]
     bypass_permissions: bool,
+    /// 恢复上次会话（继续上次对话）
+    #[arg(short = 'c', long = "continue")]
+    continue_session: bool,
+    /// 恢复指定会话 ID（如 sess-1719723000）
+    #[arg(long)]
+    resume: Option<String>,
 }
 
 #[tokio::main]
@@ -63,10 +70,52 @@ async fn main() -> Result<()> {
     }
 
     let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
-    let session_id = new_session_id();
     let config_base = wyj_config::config_dir()?;
 
     let history_store = HistoryStore::new(config_base.join("history")).ok();
+    let session_store = SessionStore::new(config_base.join("sessions")).ok();
+
+    // 根据 --continue/-c 或 --resume 恢复历史会话
+    let (session_id, initial_messages) = match (&cli.resume, cli.continue_session) {
+        (Some(id), _) => {
+            let msgs = session_store
+                .as_ref()
+                .and_then(|s| s.load(id).ok())
+                .map(|f| f.messages)
+                .unwrap_or_default();
+            if msgs.is_empty() {
+                eprintln!("未找到会话 {id}，将开始新会话。");
+            } else {
+                eprintln!("已恢复会话 {id}（{} 条消息）", msgs.len());
+            }
+            (id.clone(), msgs)
+        }
+        (None, true) => {
+            let last = session_store.as_ref().and_then(|s| s.last().ok().flatten());
+            match last {
+                Some(meta) => {
+                    let msgs = session_store
+                        .as_ref()
+                        .and_then(|s| s.load(&meta.session_id).ok())
+                        .map(|f| f.messages)
+                        .unwrap_or_default();
+                    if msgs.is_empty() {
+                        (new_session_id(), vec![])
+                    } else {
+                        eprintln!("已恢复上次会话 {}（{} 条消息）", meta.session_id, msgs.len());
+                        (meta.session_id, msgs)
+                    }
+                }
+                None => {
+                    eprintln!("暂无历史会话，将开始新会话。");
+                    (new_session_id(), vec![])
+                }
+            }
+        }
+        _ => (new_session_id(), vec![]),
+    };
+
+    let session_store_arc = session_store.map(std::sync::Arc::new);
 
     let memory_store = MemoryStore::new(&config_base, &cwd)
         .map(Arc::new)
@@ -217,6 +266,7 @@ async fn main() -> Result<()> {
 
     if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
+        session.messages = initial_messages;
         session.push_user(prompt);
         let turns = session.messages.len();
         agent
@@ -241,8 +291,21 @@ async fn main() -> Result<()> {
                 cwd: cwd.display().to_string(),
             });
         }
+        if let Some(store) = &session_store_arc {
+            let _ = store.save(&SessionFile {
+                session_id: session_id.clone(),
+                title: extract_title(&session.messages),
+                last_preview: extract_preview(&session.messages),
+                cwd: cwd.display().to_string(),
+                timestamp: now_iso(),
+                turns,
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+                messages: session.messages.clone(),
+            });
+        }
     } else if cli.headless {
-        repl(agent, tool_ctx, history_store, session_id, cwd).await?;
+        repl(agent, tool_ctx, history_store, session_id, cwd, initial_messages).await?;
     } else {
         let cfg_for_rebuild = cfg.clone();
         let todo_store_for_rebuild = todo_store.clone();
@@ -266,6 +329,8 @@ async fn main() -> Result<()> {
             rebuild_fn,
             cwd,
             history_store,
+            session_store_arc,
+            initial_messages,
             session_id,
             model_name,
             context_window,
@@ -283,6 +348,7 @@ async fn repl(
     history_store: Option<HistoryStore>,
     session_id: String,
     cwd: std::path::PathBuf,
+    initial_messages: Vec<wyj_api::types::Message>,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
@@ -290,6 +356,7 @@ async fn repl(
         env!("CARGO_PKG_VERSION")
     );
     let mut session = Session::new();
+    session.messages = initial_messages;
     let stdin = io::stdin();
     let mut turns = 0usize;
     let repl_home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default();
@@ -355,6 +422,12 @@ async fn repl(
                     let in_tok = session.total_input_tokens;
                     let out_tok = session.total_output_tokens;
                     eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
+                }
+                Ok(CommandResult::OpenSessionPicker) => {
+                    println!("[headless 模式不支持会话选择器，请用 --resume <session-id> 恢复指定会话]");
+                }
+                Ok(CommandResult::ResumeSession(id)) => {
+                    println!("[headless 模式：请用 wyj-code --resume {id} 恢复该会话]");
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),

@@ -22,6 +22,10 @@ pub enum CommandResult {
     None,
     /// Skill 执行结果：包含展开后的 prompt，由调用方转发给 agent
     RunPrompt(String),
+    /// 打开会话选择器
+    OpenSessionPicker,
+    /// 直接恢复指定 session（session-id）
+    ResumeSession(String),
 }
 
 /// 命令执行上下文
