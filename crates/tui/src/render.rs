@@ -14,6 +14,29 @@ use ratatui::{
 use wyj_config::AgentMode;
 use wyj_tools::todo::TodoStatus;
 
+/// 将 @token 渲染为青色高亮 Span，其余部分为普通文本
+fn highlight_at_refs(line: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut rest = line;
+    while let Some(at_pos) = rest.find('@') {
+        if at_pos > 0 {
+            spans.push(Span::raw(rest[..at_pos].to_string()));
+        }
+        let after = &rest[at_pos + 1..];
+        let end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        let token = rest[at_pos..at_pos + 1 + end].to_string();
+        spans.push(Span::styled(
+            token,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        rest = &rest[at_pos + 1 + end..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::raw(rest.to_string()));
+    }
+    Line::from(spans)
+}
+
 /// 截断超长字符串（按字符数）
 fn truncate_line(s: &str, max_chars: usize) -> String {
     let count = s.chars().count();
@@ -38,16 +61,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Spinner 动画帧（来回扫动效果）
 pub const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✽', '✻', '✶', '✳', '✢', '·'];
 
-pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
+pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
     let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
     let input_height = (input.visual_height(inner_width) as u16 + 2).max(3).min(10);
 
-    // 补全列表高度
-    let completion_height = if state.slash_completions.is_empty() {
-        0u16
-    } else {
+    // 补全列表高度（@ 文件选取器优先于 slash 补全）
+    let completion_height = if !state.file_completions.is_empty() {
+        (state.file_completions.len() as u16 + 2).min(10)
+    } else if !state.slash_completions.is_empty() {
         (state.slash_completions.len() as u16 + 2).min(8)
+    } else {
+        0u16
     };
 
     // 附件预览条高度（有附件时显示）
@@ -82,7 +107,9 @@ pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
             }
         }
     }
-    if !state.slash_completions.is_empty() {
+    if !state.file_completions.is_empty() {
+        draw_file_completions(f, state, chunks[2]);
+    } else if !state.slash_completions.is_empty() {
         draw_slash_completions(f, state, chunks[2]);
     }
     if !state.pending_attachments.is_empty() {
@@ -125,7 +152,7 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
 
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
 
-fn draw_chat(f: &mut Frame, state: &AppState, area: Rect) {
+fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Theme::border())
@@ -134,8 +161,16 @@ fn draw_chat(f: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let max_content_width = inner.width.saturating_sub(4) as usize;
-    let sep_width = inner.width.saturating_sub(2) as usize;
+    // 右侧 1 列留给滚动条
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let content_area = cols[0];
+    let scrollbar_area = cols[1];
+
+    let max_content_width = content_area.width.saturating_sub(4) as usize;
+    let sep_width = content_area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
     let mut is_first_user = true;
 
@@ -327,20 +362,43 @@ fn draw_chat(f: &mut Frame, state: &AppState, area: Rect) {
     }
 
     let text = Text::from(lines);
-    let total_lines = text.lines.len() as u16;
-    let visible_height = inner.height;
 
-    let scroll = if total_lines > visible_height {
-        let max_scroll = total_lines - visible_height;
-        max_scroll.saturating_sub(state.scroll_offset)
-    } else {
-        0
-    };
+    // 计算折行后的实际视觉行数（CJK/长行会比逻辑行数多）
+    let cw = content_area.width.max(1);
+    let total_visual_lines: u16 = text.lines.iter().map(|line| {
+        let w = line.width() as u16;
+        if w == 0 { 1u16 } else { (w + cw - 1) / cw }
+    }).sum();
+
+    let visible_height = content_area.height;
+    state.chat_height = visible_height;
+
+    let max_scroll = total_visual_lines.saturating_sub(visible_height);
+    let clamped_offset = state.scroll_offset.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(clamped_offset);
 
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
-    f.render_widget(para, inner);
+    f.render_widget(para, content_area);
+
+    // 滚动条（仅内容超出可视区时显示）
+    if total_visual_lines > visible_height && visible_height > 0 {
+        let thumb_row = if max_scroll > 0 {
+            let pct = clamped_offset as f32 / max_scroll as f32; // 0=底部 1=顶部
+            visible_height.saturating_sub(1) - (pct * visible_height.saturating_sub(1) as f32) as u16
+        } else {
+            visible_height.saturating_sub(1)
+        };
+        let bar_lines: Vec<Line<'static>> = (0..visible_height).map(|row| {
+            if row == thumb_row {
+                Line::from(Span::styled("█", Style::default().fg(Color::DarkGray)))
+            } else {
+                Line::from(Span::styled("│", Theme::dim()))
+            }
+        }).collect();
+        f.render_widget(Paragraph::new(Text::from(bar_lines)), scrollbar_area);
+    }
 }
 
 /// 底部固定面板：任务列表
@@ -484,16 +542,23 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
         return;
     }
 
-    let lines: Vec<Line> = input
-        .display_lines()
-        .iter()
-        .map(|l| Line::from(l.as_str()))
-        .collect();
-
     let text_style = if is_bang {
         Style::default().fg(Theme::SUCCESS)
     } else {
         Theme::input_box()
+    };
+    let lines: Vec<Line> = if is_bang {
+        input
+            .display_lines()
+            .iter()
+            .map(|l| Line::from(l.as_str()))
+            .collect()
+    } else {
+        input
+            .display_lines()
+            .iter()
+            .map(|l| highlight_at_refs(l))
+            .collect()
     };
     let para = Paragraph::new(Text::from(lines))
         .style(text_style)
@@ -547,6 +612,79 @@ fn draw_attachments(f: &mut Frame, state: &AppState, area: Rect) {
         spans.push(Span::raw("  "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
+// ─── @ 文件选取器下拉 ─────────────────────────────────────────────────────────
+
+fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " @ 文件 ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_show = inner.height as usize;
+    let items = &state.file_completions;
+    let selected = state.file_selected;
+
+    let start = if selected >= max_show { selected - max_show + 1 } else { 0 };
+
+    let name_col_w = items
+        .iter()
+        .map(|e| e.display.chars().count() + 2)
+        .max()
+        .unwrap_or(8)
+        .min(32);
+    let desc_budget = (inner.width as usize).saturating_sub(name_col_w + 4);
+
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .skip(start)
+        .take(max_show)
+        .enumerate()
+        .map(|(i, entry)| {
+            let real_idx = start + i;
+            let prefix = if entry.is_dir { "▸ " } else { "  " };
+            let display = format!("{prefix}{}", entry.display);
+            let name_padded = format!(" {:width$}", display, width = name_col_w.saturating_sub(1));
+            let hint = if entry.is_dir {
+                format!("  {}/", truncate_chars(&entry.rel_path, desc_budget.saturating_sub(1)))
+            } else {
+                format!("  {}", truncate_chars(&entry.rel_path, desc_budget))
+            };
+
+            if real_idx == selected {
+                Line::from(vec![
+                    Span::styled(
+                        name_padded,
+                        Style::default()
+                            .bg(Color::Cyan)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(hint, Style::default().bg(Color::Cyan).fg(Color::Black)),
+                ])
+            } else {
+                let name_style = if entry.is_dir {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(vec![
+                    Span::styled(name_padded, name_style),
+                    Span::styled(hint, Theme::dim()),
+                ])
+            }
+        })
+        .collect();
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
 }
 
 // ─── Slash 命令补全下拉 ───────────────────────────────────────────────────────

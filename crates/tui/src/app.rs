@@ -6,8 +6,9 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, KeyModifiers, MouseEventKind,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -161,6 +162,14 @@ pub struct SessionPickerState {
     pub sessions: Vec<SessionMeta>,
     /// 当前选中项：0 = 新建会话，1..=n = sessions[selected-1]
     pub selected: usize,
+}
+
+/// @ 文件选取器候选项
+#[derive(Clone)]
+pub struct FileEntry {
+    pub display: String,
+    pub rel_path: String,
+    pub is_dir: bool,
 }
 
 /// 待发送附件（图片或文件）
@@ -317,6 +326,8 @@ pub struct AppState {
     pub permission_dialog: Option<PermissionDialog>,
     pub ask_question_dialog: Option<AskQuestionDialog>,
     pub scroll_offset: u16,
+    /// 上次渲染的聊天区可见行高（用于按页滚动）
+    pub chat_height: u16,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     pub cwd: PathBuf,
@@ -334,6 +345,7 @@ pub struct AppState {
     pub current_task: Option<AbortHandle>,
     pub ctrl_c_pressed: bool,
     pub last_ctrl_c: Option<Instant>,
+    pub last_esc: Option<Instant>,
     /// Slash 命令补全候选列表（命令名, 描述）
     pub slash_completions: Vec<(String, String)>,
     /// 当前选中的补全项索引
@@ -352,6 +364,12 @@ pub struct AppState {
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
     pub pending_attachments: Vec<Attachment>,
+    /// @ 文件选取器候选列表
+    pub file_completions: Vec<FileEntry>,
+    /// 当前选中的文件选取器项索引
+    pub file_selected: usize,
+    /// @ 选取器当前浏览目录
+    pub at_browse_dir: PathBuf,
 }
 
 impl AppState {
@@ -363,6 +381,7 @@ impl AppState {
             permission_dialog: None,
             ask_question_dialog: None,
             scroll_offset: 0,
+            chat_height: 20,
             total_input_tokens: 0,
             total_output_tokens: 0,
             cwd,
@@ -377,6 +396,7 @@ impl AppState {
             current_task: None,
             ctrl_c_pressed: false,
             last_ctrl_c: None,
+            last_esc: None,
             slash_completions: vec![],
             slash_selected: 0,
             input_history: vec![],
@@ -386,6 +406,9 @@ impl AppState {
             session_picker: None,
             save_needed: false,
             pending_attachments: vec![],
+            file_completions: vec![],
+            file_selected: 0,
+            at_browse_dir: PathBuf::new(),
         }
     }
 
@@ -539,7 +562,13 @@ pub async fn run_tui(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -562,8 +591,10 @@ pub async fn run_tui(
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
     result
@@ -590,6 +621,139 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
         AgentMode::Normal => PermissionMode::Prompt,
+    }
+}
+
+/// 扫描目录并按过滤词返回文件候选列表
+fn scan_files(dir: &std::path::Path, filter: &str, cwd: &std::path::Path, depth: usize) -> Vec<FileEntry> {
+    use ignore::WalkBuilder;
+
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let walker = WalkBuilder::new(dir)
+        .max_depth(Some(depth))
+        .hidden(false)
+        .git_ignore(true)
+        .ignore(true)
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path == dir {
+            continue;
+        }
+        let is_dir = path.is_dir();
+        let display = path
+            .strip_prefix(dir)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        if display.is_empty() {
+            continue;
+        }
+        if !filter.is_empty() {
+            let lf = filter.to_lowercase();
+            let ld = display.to_lowercase();
+            if !ld.contains(lf.as_str()) {
+                continue;
+            }
+        }
+        let rel_path = path
+            .strip_prefix(cwd)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.display().to_string());
+        entries.push(FileEntry { display, rel_path, is_dir });
+        if entries.len() >= 200 {
+            break;
+        }
+    }
+
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.display.cmp(&b.display)));
+    entries
+}
+
+/// 根据输入框光标前的 @ 触发词更新文件候选列表
+fn update_file_completions(state: &mut AppState, input: &InputBox, cwd: &std::path::Path) {
+    let line = input.lines.get(input.cursor_row).map(|s| s.as_str()).unwrap_or("");
+    let before_cursor: String = line.chars().take(input.cursor_col).collect();
+
+    // 找最后一个 @ —— 须在行首或紧跟空白（避免误触 email）
+    let at_byte = before_cursor.rfind('@');
+    let at_byte = match at_byte {
+        None => {
+            state.file_completions.clear();
+            return;
+        }
+        Some(p) => p,
+    };
+    let before_at = &before_cursor[..at_byte];
+    if !before_at.is_empty() && !before_at.ends_with(|c: char| c.is_whitespace()) {
+        state.file_completions.clear();
+        return;
+    }
+
+    let query = &before_cursor[at_byte + 1..];
+    let (browse_dir, filter, depth) = if let Some(slash_pos) = query.rfind('/') {
+        let dir_part = &query[..slash_pos];
+        (cwd.join(dir_part), query[slash_pos + 1..].to_string(), 1usize)
+    } else {
+        (cwd.to_path_buf(), query.to_string(), 3usize)
+    };
+
+    if !browse_dir.exists() {
+        state.file_completions.clear();
+        return;
+    }
+
+    state.file_completions = scan_files(&browse_dir, &filter, cwd, depth);
+    state.file_selected = 0;
+    state.at_browse_dir = browse_dir;
+}
+
+/// 将输入框当前行最后一个 @ 后的 query 替换为 new_path
+fn replace_at_query(input: &mut InputBox, new_path: &str) {
+    let line = input.lines.get(input.cursor_row).map(|s| s.as_str()).unwrap_or("").to_string();
+    let before_cursor: String = line.chars().take(input.cursor_col).collect();
+    if let Some(at_byte) = before_cursor.rfind('@') {
+        let chars_before_at = before_cursor[..at_byte].chars().count();
+        let chars_from_at = input.cursor_col - chars_before_at;
+        for _ in 0..chars_from_at {
+            input.backspace();
+        }
+        for c in format!("@{new_path}").chars() {
+            input.insert_char(c);
+        }
+        if !new_path.ends_with('/') {
+            input.insert_char(' ');
+        }
+    }
+}
+
+/// 扫描消息中的 @file 引用，将存在的文件路径追加到 pending_attachments
+fn expand_at_refs_to_attachments(msg: &str, cwd: &std::path::Path, attachments: &mut Vec<Attachment>) {
+    let mut rest = msg;
+    while let Some(at_pos) = rest.find('@') {
+        let after = &rest[at_pos + 1..];
+        let end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        let token = &after[..end];
+        if !token.is_empty() {
+            let path = cwd.join(token);
+            if path.exists() && path.is_file() {
+                let already = attachments
+                    .iter()
+                    .any(|a| matches!(a, Attachment::File { path: p } if p == &path));
+                if !already {
+                    attachments.push(Attachment::File { path });
+                }
+            }
+        }
+        if end == 0 {
+            rest = &rest[at_pos + 1..];
+        } else {
+            rest = &after[end..];
+        }
     }
 }
 
@@ -706,7 +870,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             last_spinner_advance = Instant::now();
         }
 
-        terminal.draw(|f| render::draw(f, &state, &input))?;
+        terminal.draw(|f| render::draw(f, &mut state, &input))?;
 
         // 清空 agent 事件队列
         loop {
@@ -790,6 +954,17 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             input.insert_text(&pasted);
                             update_slash_completions(&mut state, &input, &cmd_registry);
                         }
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            state.scroll_offset = state.scroll_offset.saturating_add(3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        }
+                        _ => {}
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -992,6 +1167,41 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
+                    // ② @ 文件选取器拦截 ↑/↓/Tab/Enter/Esc
+                    if !state.file_completions.is_empty() {
+                        let fc_len = state.file_completions.len();
+                        match key.code {
+                            KeyCode::Up => {
+                                if state.file_selected > 0 {
+                                    state.file_selected -= 1;
+                                }
+                                continue;
+                            }
+                            KeyCode::Down => {
+                                if state.file_selected + 1 < fc_len {
+                                    state.file_selected += 1;
+                                }
+                                continue;
+                            }
+                            KeyCode::Tab | KeyCode::Enter => {
+                                let entry = state.file_completions[state.file_selected].clone();
+                                if entry.is_dir {
+                                    replace_at_query(&mut input, &format!("{}/", entry.rel_path));
+                                } else {
+                                    replace_at_query(&mut input, &entry.rel_path);
+                                    state.file_completions.clear();
+                                }
+                                update_file_completions(&mut state, &input, &cwd);
+                                continue;
+                            }
+                            KeyCode::Esc => {
+                                state.file_completions.clear();
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // ③ Slash 补全列表拦截 ↑/↓/Tab/Esc
                     if !state.slash_completions.is_empty() {
                         match key.code {
@@ -1034,12 +1244,18 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // Ctrl+C → 中断 Agent 或二次确认退出
+                    // Ctrl+C → 中断 Agent / 清空输入框 / 二次确认退出
                     if key.code == KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         if state.is_thinking {
                             state.interrupt();
+                        } else if !input.is_empty() {
+                            input = InputBox::new();
+                            state.slash_completions.clear();
+                            state.file_completions.clear();
+                            state.ctrl_c_pressed = false;
+                            state.last_ctrl_c = None;
                         } else if state.ctrl_c_pressed {
                             state.should_quit = true;
                         } else {
@@ -1049,10 +1265,24 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ESC → 中断 Agent
+                    // ESC → 中断 Agent / 连按两次清空输入框
                     if key.code == KeyCode::Esc {
                         if state.is_thinking {
                             state.interrupt();
+                            state.last_esc = None;
+                        } else {
+                            let double_esc = state
+                                .last_esc
+                                .map(|t| t.elapsed() < Duration::from_millis(500))
+                                .unwrap_or(false);
+                            if double_esc && !input.is_empty() {
+                                input = InputBox::new();
+                                state.slash_completions.clear();
+                                state.file_completions.clear();
+                                state.last_esc = None;
+                            } else {
+                                state.last_esc = Some(Instant::now());
+                            }
                         }
                         continue;
                     }
@@ -1081,6 +1311,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             let text = input.take();
                             state.scroll_offset = 0;
                             state.slash_completions.clear();
+                            state.file_completions.clear();
                             state.history_idx = None;
 
                             let trimmed = text.trim().to_string();
@@ -1420,6 +1651,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 state.input_history.push(trimmed);
                             } else {
                                 // ── 普通消息 → 发给 agent ───────────────────
+                                // 展开 @file 引用 → 追加到 pending_attachments
+                                expand_at_refs_to_attachments(&text, &cwd, &mut state.pending_attachments);
                                 // 构建显示用文本（含附件摘要）
                                 let display_text = if state.pending_attachments.is_empty() {
                                     text.clone()
@@ -1518,9 +1751,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                         }
                     } else if key.code == KeyCode::PageUp {
-                        state.scroll_offset = state.scroll_offset.saturating_add(5);
+                        let step = state.chat_height.max(3);
+                        state.scroll_offset = state.scroll_offset.saturating_add(step);
                     } else if key.code == KeyCode::PageDown {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(5);
+                        let step = state.chat_height.max(3);
+                        state.scroll_offset = state.scroll_offset.saturating_sub(step);
                     } else if key.code == KeyCode::Up && !state.is_thinking {
                         // 输入历史导航（仅在无补全列表时）
                         if state.slash_completions.is_empty() {
@@ -1572,9 +1807,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             input.backspace();
                         }
                         update_slash_completions(&mut state, &input, &cmd_registry);
+                        update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Delete {
                         input.delete_char_forward();
                         update_slash_completions(&mut state, &input, &cmd_registry);
+                        update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Home {
                         input.move_to_start_of_line();
                     } else if key.code == KeyCode::End {
@@ -1604,14 +1841,17 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 'k' => {
                                     input.kill_to_end_of_line();
                                     update_slash_completions(&mut state, &input, &cmd_registry);
+                                    update_file_completions(&mut state, &input, &cwd);
                                 }
                                 'u' => {
                                     input.kill_to_start_of_line();
                                     update_slash_completions(&mut state, &input, &cmd_registry);
+                                    update_file_completions(&mut state, &input, &cwd);
                                 }
                                 'w' => {
                                     input.delete_word_backward();
                                     update_slash_completions(&mut state, &input, &cmd_registry);
+                                    update_file_completions(&mut state, &input, &cwd);
                                 }
                                 'l' => {
                                     state.scroll_offset = 0;
@@ -1666,6 +1906,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             state.history_idx = None;
                             input.insert_char(c);
                             update_slash_completions(&mut state, &input, &cmd_registry);
+                            update_file_completions(&mut state, &input, &cwd);
                         }
                     }
                 }
