@@ -35,6 +35,8 @@ impl Command for HelpCmd {
               /memory            查看项目跨会话记忆内容\n\
               /model [名称]      查看或切换 AI 模型（无参：显示当前）\n\
               /mode [模式]       切换运行模式（normal / plan / bypass）\n\
+              /resume [id]       恢复历史会话（无参数=选择器，有 id=直接恢复）\n\
+              /sessions          查看和切换历史会话\n\
               /init              在当前目录生成 WYJ.md 项目说明\n\
               /quit              退出 wyj-code\n\
             \n\
@@ -513,6 +515,51 @@ impl Command for ConfigCmd {
     }
 }
 
+// ── /resume ───────────────────────────────────────────────────────────────────
+
+pub struct ResumeCmd;
+
+#[async_trait]
+impl Command for ResumeCmd {
+    fn name(&self) -> &str {
+        "resume"
+    }
+    fn description(&self) -> &str {
+        "恢复历史会话 (无参数=选择器, /resume <session-id>=直接恢复)"
+    }
+    fn usage(&self) -> &str {
+        "/resume [session-id]"
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let id = args.trim();
+        if id.is_empty() {
+            Ok(CommandResult::OpenSessionPicker)
+        } else {
+            Ok(CommandResult::ResumeSession(id.to_string()))
+        }
+    }
+}
+
+// ── /sessions ─────────────────────────────────────────────────────────────────
+
+pub struct SessionsCmd;
+
+#[async_trait]
+impl Command for SessionsCmd {
+    fn name(&self) -> &str {
+        "sessions"
+    }
+    fn description(&self) -> &str {
+        "查看和切换历史会话"
+    }
+    fn usage(&self) -> &str {
+        "/sessions"
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenSessionPicker)
+    }
+}
+
 // ── /quit ─────────────────────────────────────────────────────────────────────
 
 pub struct QuitCmd;
@@ -545,6 +592,8 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
+    reg.register(Arc::new(ResumeCmd));
+    reg.register(Arc::new(SessionsCmd));
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(QuitCmd));
@@ -574,6 +623,8 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
+    reg.register(Arc::new(ResumeCmd));
+    reg.register(Arc::new(SessionsCmd));
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(QuitCmd));
