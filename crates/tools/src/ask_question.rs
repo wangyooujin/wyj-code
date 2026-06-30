@@ -19,7 +19,7 @@ fn coerce_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Object(m) => {
-            for key in &["label", "text", "value", "option", "name"] {
+            for key in &["label", "text", "value", "option", "name", "content", "title", "description"] {
                 if let Some(Value::String(s)) = m.get(*key) {
                     return s.clone();
                 }

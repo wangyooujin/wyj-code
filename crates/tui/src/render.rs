@@ -854,6 +854,13 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
+    } else if !state.mouse_capture {
+        (
+            "select mode (ctrl+t to scroll)",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         ("ctrl+d or ctrl+c twice to exit  /help", Theme::dim())
     };
