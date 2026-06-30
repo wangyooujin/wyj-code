@@ -11,7 +11,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, tool: impl Tool + 'static) {
@@ -30,8 +32,10 @@ impl ToolRegistry {
 
     /// 构建核心工具注册表（不含需要外部状态的工具如 TodoWrite/SubAgent）
     pub fn standard() -> Self {
-        use crate::{bash::BashTool, read::ReadTool, write::WriteTool, edit::EditTool,
-                    glob::GlobTool, grep::GrepTool, webfetch::WebFetchTool};
+        use crate::{
+            bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool, read::ReadTool,
+            webfetch::WebFetchTool, write::WriteTool,
+        };
         let mut r = Self::new();
         r.register(BashTool);
         r.register(ReadTool);

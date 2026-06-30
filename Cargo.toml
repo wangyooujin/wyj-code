@@ -65,6 +65,8 @@ scraper = "0.21"
 encoding_rs = "0.8"
 # 正则（Grep 工具）
 regex = "1"
+# Markdown 解析（TUI 渲染）
+pulldown-cmark = { version = "0.12", default-features = false }
 
 # 内部 crate
 wyj-config = { path = "crates/config" }

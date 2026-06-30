@@ -1,44 +1,132 @@
-//! 色彩主题（暗色系）
+//! 色彩主题（暗色系，RGB 精确值，参照 smj-code darkTheme）
 
 use ratatui::style::{Color, Modifier, Style};
 
 pub struct Theme;
 
 impl Theme {
+    // ── 语义颜色（RGB 精确值）─────────────────────────────────────────────────
+    pub const SUCCESS: Color = Color::Rgb(78, 186, 101); // 绿色
+    pub const ERROR: Color = Color::Rgb(255, 107, 128); // 红色
+    pub const WARNING: Color = Color::Rgb(200, 155, 30); // 琥珀
+    pub const CLAUDE: Color = Color::Rgb(215, 119, 87); // 品牌橙（助手/spinner）
+    pub const INACTIVE: Color = Color::Rgb(153, 153, 153); // 灰色（dim/border）
+    pub const SUGGESTION: Color = Color::Rgb(177, 185, 249); // 蓝紫（用户前缀/权限）
+    pub const TEXT: Color = Color::Rgb(255, 255, 255); // 白色
+    pub const BORDER: Color = Color::Rgb(102, 102, 102); // 深灰边框
+    pub const STATUS_BG: Color = Color::Rgb(30, 30, 30); // 状态栏背景
+    pub const CODE_FG: Color = Color::Rgb(147, 165, 255); // 代码块内容浅蓝
+
+    // ── 样式方法 ─────────────────────────────────────────────────────────────
+
+    /// 用户消息前缀 "▶ 你"
     pub fn user_prefix() -> Style {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Self::SUGGESTION)
+            .add_modifier(Modifier::BOLD)
     }
+
+    /// 助手消息前缀 "◆ AI"
     pub fn assistant_prefix() -> Style {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Self::CLAUDE)
+            .add_modifier(Modifier::BOLD)
     }
+
+    /// 工具调用状态行（运行中）
     pub fn tool_call() -> Style {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(Self::CLAUDE)
     }
+
+    /// 工具结果正常内容
     pub fn tool_result() -> Style {
-        Style::default().fg(Color::Blue)
+        Style::default().fg(Self::SUGGESTION)
     }
+
+    /// 成功状态（✓）
+    pub fn success() -> Style {
+        Style::default().fg(Self::SUCCESS)
+    }
+
+    /// 错误状态（✗）
     pub fn error() -> Style {
-        Style::default().fg(Color::Red)
+        Style::default().fg(Self::ERROR)
     }
+
+    /// 警告状态（⚠）
+    pub fn warning() -> Style {
+        Style::default().fg(Self::WARNING)
+    }
+
+    /// 淡化（不活跃内容、截断提示）
     pub fn dim() -> Style {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Self::INACTIVE)
     }
+
+    /// 边框
     pub fn border() -> Style {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Self::BORDER)
     }
+
+    /// 状态栏
     pub fn status_bar() -> Style {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        Style::default().bg(Self::STATUS_BG).fg(Self::INACTIVE)
     }
+
+    /// 输入框文字
     pub fn input_box() -> Style {
-        Style::default().fg(Color::White)
+        Style::default().fg(Self::TEXT)
     }
+
+    /// 权限对话框（边框和标题）
     pub fn permission_dialog() -> Style {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Self::SUGGESTION)
+            .add_modifier(Modifier::BOLD)
     }
+
+    /// 流式文本（助手实时输出）
     pub fn streaming() -> Style {
-        Style::default().fg(Color::Green)
+        Style::default().fg(Self::CLAUDE)
     }
+
+    /// 高亮文字（对话框内提示键等）
     pub fn highlight() -> Style {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::TEXT).add_modifier(Modifier::BOLD)
+    }
+
+    /// 代码块标记行（```）
+    pub fn code_fence() -> Style {
+        Style::default().fg(Self::INACTIVE)
+    }
+
+    /// 代码块内容行
+    pub fn code_body() -> Style {
+        Style::default().fg(Self::CODE_FG)
+    }
+
+    /// 状态栏品牌标志 ◆ 的颜色
+    pub fn claude_brand() -> Style {
+        Style::default().fg(Self::CLAUDE)
+    }
+
+    /// 进度条已填充颜色（< 70%）
+    pub fn progress_normal() -> Style {
+        Style::default().fg(Self::SUGGESTION)
+    }
+
+    /// 进度条告警颜色（70-90%）
+    pub fn progress_warn() -> Style {
+        Style::default().fg(Self::WARNING)
+    }
+
+    /// 进度条危险颜色（>= 90%）
+    pub fn progress_danger() -> Style {
+        Style::default().fg(Self::ERROR)
+    }
+
+    /// 进度条空余部分
+    pub fn progress_empty() -> Style {
+        Style::default().fg(Self::INACTIVE)
     }
 }

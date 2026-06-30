@@ -33,7 +33,8 @@ impl Tool for GrepTool {
         ToolDefinition {
             name: self.name().to_string(),
             description: "在文件内容中搜索正则表达式匹配。\
-                返回匹配行及其行号。自动忽略二进制文件和 .gitignore 的内容。".to_string(),
+                返回匹配行及其行号。自动忽略二进制文件和 .gitignore 的内容。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -68,14 +69,20 @@ impl Tool for GrepTool {
         let root = match &inp.path {
             Some(p) => {
                 let pb = std::path::Path::new(p);
-                if pb.is_absolute() { pb.to_path_buf() } else { ctx.cwd().join(pb) }
+                if pb.is_absolute() {
+                    pb.to_path_buf()
+                } else {
+                    ctx.cwd().join(pb)
+                }
             }
             None => ctx.cwd().to_path_buf(),
         };
 
-        let include_glob = inp.include.as_deref().map(|g| {
-            globset::Glob::new(g).ok().map(|g| g.compile_matcher())
-        }).flatten();
+        let include_glob = inp
+            .include
+            .as_deref()
+            .map(|g| globset::Glob::new(g).ok().map(|g| g.compile_matcher()))
+            .flatten();
 
         let mut results = vec![];
         let mut truncated = false;
@@ -92,9 +99,7 @@ impl Tool for GrepTool {
                 .filter(|e| e.path().is_file())
                 .filter(|e| {
                     include_glob.as_ref().map_or(true, |g| {
-                        e.path().file_name()
-                            .map(|n| g.is_match(n))
-                            .unwrap_or(false)
+                        e.path().file_name().map(|n| g.is_match(n)).unwrap_or(false)
                     })
                 })
                 .map(|e| e.path().to_path_buf())

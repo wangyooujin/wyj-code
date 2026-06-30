@@ -14,17 +14,28 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
     }
 }
 
 /// 工具上下文（由运行时注入）
+#[async_trait]
 pub trait ToolContext: Send + Sync {
     fn cwd(&self) -> &std::path::Path;
     fn is_allowed(&self, name: &str, input: &Value) -> bool;
+    /// 向用户提问并等待选择（TUI 模式下弹浮层，headless 返回 None）
+    async fn ask_user(&self, _question: &str, _options: &[String]) -> Option<usize> {
+        None
+    }
 }
 
 /// 工具抽象

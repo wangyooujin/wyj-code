@@ -29,11 +29,14 @@ pub struct WriteTool {
 
 impl Default for WriteTool {
     fn default() -> Self {
-        Self { tracker: ReadTracker::default() }
+        Self {
+            tracker: ReadTracker::default(),
+        }
     }
 }
 
 impl WriteTool {
+    #[allow(dead_code)]
     pub fn tracker(&self) -> ReadTracker {
         self.tracker.clone()
     }
@@ -56,7 +59,8 @@ impl Tool for WriteTool {
             name: self.name().to_string(),
             description: "将内容写入文件（覆盖现有内容）。\
                 写入已存在的文件前，必须先用 Read 读取该文件。\
-                父目录不存在时会自动创建。".to_string(),
+                父目录不存在时会自动创建。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -102,5 +106,9 @@ impl Tool for WriteTool {
 
 fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
     let pb = std::path::Path::new(p);
-    if pb.is_absolute() { pb.to_path_buf() } else { cwd.join(pb) }
+    if pb.is_absolute() {
+        pb.to_path_buf()
+    } else {
+        cwd.join(pb)
+    }
 }
