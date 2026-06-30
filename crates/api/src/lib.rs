@@ -11,12 +11,18 @@ pub use provider::Provider;
 pub use types::*;
 
 use anyhow::Result;
+use std::sync::Arc;
 use wyj_config::{Config, Provider as CfgProvider};
 
-/// 根据配置构建对应的 Provider（动态派发）
-pub fn build_provider(cfg: &Config) -> Result<Box<dyn Provider>> {
+/// 根据配置构建对应的 Provider（Arc 包装，可跨线程共享）
+pub fn build_provider(cfg: &Config) -> Result<Arc<dyn Provider>> {
+    build_provider_with_model(cfg, &cfg.model.clone())
+}
+
+/// 以指定模型构建 Provider（用于 per-mode 模型覆盖）
+pub fn build_provider_with_model(cfg: &Config, model: &str) -> Result<Arc<dyn Provider>> {
     match cfg.provider {
-        CfgProvider::Anthropic => Ok(Box::new(AnthropicProvider::new(cfg)?)),
-        CfgProvider::OpenAI => Ok(Box::new(OpenAIProvider::new(cfg)?)),
+        CfgProvider::Anthropic => Ok(Arc::new(AnthropicProvider::with_model(cfg, model)?)),
+        CfgProvider::OpenAI => Ok(Arc::new(OpenAIProvider::with_model(cfg, model)?)),
     }
 }

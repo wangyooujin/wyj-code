@@ -1,119 +1,325 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, ChatMessage, MessageRole, PermissionDialog};
+use crate::app::{AppState, AskQuestionDialog, MessageRole, PermissionDialog};
 use crate::input::InputBox;
+use crate::markdown::render_markdown;
 use crate::theme::Theme;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use wyj_config::AgentMode;
+use wyj_tools::todo::TodoStatus;
+
+/// 截断超长字符串（按字符数）
+fn truncate_line(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{t}…")
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = chars[..max_chars].iter().collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Spinner 动画帧（来回扫动效果）
+pub const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '✽', '✻', '✶', '✳', '✢', '·'];
 
 pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
     let area = f.area();
-
-    // 状态栏高度 1 行，输入框最小 3 行，剩余给对话区
     let input_height = (input.display_lines().len() as u16 + 2).max(3).min(10);
+
+    // 补全列表高度
+    let completion_height = if state.slash_completions.is_empty() {
+        0u16
+    } else {
+        (state.slash_completions.len() as u16 + 2).min(8)
+    };
+
+    // 底部面板高度：AskQuestion 优先，否则 TaskList，否则 0
+    let (panel_height, panel_kind) = bottom_panel_size(state, area.height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(panel_height),
+            Constraint::Length(completion_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(area);
 
     draw_chat(f, state, chunks[0]);
-    draw_input(f, state, input, chunks[1]);
-    draw_status(f, state, chunks[2]);
+    match panel_kind {
+        BottomPanel::None => {}
+        BottomPanel::AskQuestion => {
+            if let Some(dlg) = &state.ask_question_dialog {
+                draw_ask_question_panel(f, dlg, chunks[1]);
+            }
+        }
+        BottomPanel::TodoList => {
+            if let Some(items) = &state.current_todos {
+                draw_todo_panel(f, items, state.spinner_frame, chunks[1]);
+            }
+        }
+    }
+    if !state.slash_completions.is_empty() {
+        draw_slash_completions(f, state, chunks[2]);
+    }
+    draw_input(f, state, input, chunks[3]);
+    draw_status(f, state, chunks[4]);
 
-    // 权限对话框覆盖在中央
+    // 权限对话框仍以浮层叠加（后渲染的在前）
     if let Some(dlg) = &state.permission_dialog {
         draw_permission_dialog(f, dlg, area);
     }
 }
 
+/// 底部面板类型与高度
+enum BottomPanel {
+    None,
+    AskQuestion,
+    TodoList,
+}
+
+fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
+    if let Some(dlg) = &state.ask_question_dialog {
+        let h = (dlg.options.len() as u16 + 6).min(area_height);
+        return (h, BottomPanel::AskQuestion);
+    }
+    if let Some(items) = &state.current_todos {
+        if !items.is_empty() {
+            let h = (items.len() as u16 + 2).min(area_height);
+            return (h, BottomPanel::TodoList);
+        }
+    }
+    (0, BottomPanel::None)
+}
+
+// ─── 对话区 ──────────────────────────────────────────────────────────────────
+
 fn draw_chat(f: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Theme::border())
-        .title(" wyj-code ");
+        .border_style(Theme::border())
+        .title(Span::styled(" wyj-code ", Theme::dim()));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // 构建所有行
-    let mut lines: Vec<Line> = vec![];
+    let max_content_width = inner.width.saturating_sub(4) as usize;
+    let sep_width = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = vec![];
+    let mut is_first_user = true;
+
     for msg in &state.messages {
         match msg.role {
             MessageRole::User => {
-                lines.push(Line::from(vec![
-                    Span::styled("你  ", Theme::user_prefix()),
-                    Span::raw(""),
-                ]));
-                for l in msg.content.lines() {
-                    lines.push(Line::from(Span::raw(format!("  {l}"))));
-                }
-                lines.push(Line::from(""));
-            }
-            MessageRole::Assistant => {
-                lines.push(Line::from(vec![
-                    Span::styled("AI  ", Theme::assistant_prefix()),
-                    Span::raw(""),
-                ]));
-                render_assistant_text(&mut lines, &msg.content);
-                lines.push(Line::from(""));
-            }
-            MessageRole::ToolCall => {
-                lines.push(Line::from(vec![
-                    Span::styled("⚙ ", Theme::tool_call()),
-                    Span::styled(&msg.content, Theme::tool_call()),
-                ]));
-            }
-            MessageRole::ToolResult => {
-                let style = if msg.is_error {
-                    Theme::error()
-                } else {
-                    Theme::tool_result()
-                };
-                // 工具结果限制展示行数
-                let content_lines: Vec<&str> = msg.content.lines().collect();
-                let show = content_lines.len().min(8);
-                for l in &content_lines[..show] {
-                    lines.push(Line::from(Span::styled(format!("  {l}"), style)));
-                }
-                if content_lines.len() > show {
+                if !is_first_user {
+                    lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        format!("  …（共 {} 行）", content_lines.len()),
+                        "─".repeat(sep_width.min(60)),
                         Theme::dim(),
                     )));
                 }
+                is_first_user = false;
+
+                let mut content_lines = msg.content.lines();
+                let first_line = content_lines.next().unwrap_or("");
+                lines.push(Line::from(vec![
+                    Span::styled("❯ ", Theme::user_prefix()),
+                    Span::styled(
+                        truncate_line(first_line, max_content_width),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                for l in content_lines {
+                    lines.push(Line::from(Span::raw(format!(
+                        "  {}",
+                        truncate_line(l, max_content_width)
+                    ))));
+                }
+                lines.push(Line::from(""));
+            }
+
+            MessageRole::Assistant => {
+                if msg.is_error {
+                    for l in msg.content.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  ✗ {}", truncate_line(l, max_content_width)),
+                            Theme::error(),
+                        )));
+                    }
+                } else {
+                    render_markdown(&mut lines, &msg.content, max_content_width);
+                }
+                lines.push(Line::from(""));
+            }
+
+            // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
+            MessageRole::ToolCall => {
+                lines.push(Line::from(vec![
+                    Span::styled("  ⏺ ", Theme::tool_call()),
+                    Span::styled(
+                        truncate_line(&msg.content, max_content_width.saturating_sub(4)),
+                        Theme::tool_call(),
+                    ),
+                ]));
+            }
+
+            // ─── ⎿  summary · elapsed  ────────────────────────────────────
+            MessageRole::ToolResult => {
+                let elapsed_str = msg
+                    .elapsed_secs
+                    .filter(|&s| s > 0.0)
+                    .map(|s| format!("  {s:.1}s"))
+                    .unwrap_or_default();
+
+                let (summary_style, prefix) = if msg.is_error {
+                    (Theme::error(), "✗ ")
+                } else {
+                    (Theme::dim(), "")
+                };
+
+                let summary = if msg.display_summary.is_empty() {
+                    msg.content
+                        .lines()
+                        .next()
+                        .unwrap_or("done")
+                        .trim()
+                        .to_string()
+                } else {
+                    msg.display_summary.clone()
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled("    ⎿  ", Theme::dim()),
+                    Span::styled(
+                        format!(
+                            "{prefix}{}",
+                            truncate_line(&summary, max_content_width.saturating_sub(12))
+                        ),
+                        summary_style,
+                    ),
+                    Span::styled(elapsed_str, Theme::dim()),
+                ]));
+
+                // 展开/折叠详细内容（ctrl+o）
+                if !msg.content.is_empty() && msg.content != summary {
+                    let content_lines: Vec<&str> = msg.content.lines().collect();
+                    let line_style = if msg.is_error {
+                        Theme::error()
+                    } else {
+                        Theme::tool_result()
+                    };
+
+                    if msg.expanded {
+                        lines.push(Line::from(Span::styled(
+                            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
+                            Theme::dim(),
+                        )));
+                        for l in &content_lines {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "       {}",
+                                    truncate_line(l, max_content_width.saturating_sub(8))
+                                ),
+                                line_style,
+                            )));
+                        }
+                        lines.push(Line::from(Span::styled(
+                            "       [ctrl+o to collapse]".to_string(),
+                            Theme::dim(),
+                        )));
+                    } else if content_lines.len() > 3 {
+                        lines.push(Line::from(Span::styled(
+                            format!("       …({} lines, ctrl+o to expand)", content_lines.len()),
+                            Theme::dim(),
+                        )));
+                    }
+                }
+            }
+
+            MessageRole::BashOutput => {
+                let (icon, style) = if msg.is_error {
+                    ("✗", Theme::error())
+                } else {
+                    ("$", Style::default().fg(Color::Green))
+                };
+                let elapsed_str = msg
+                    .elapsed_secs
+                    .filter(|&s| s > 0.0)
+                    .map(|s| format!(" · {s:.1}s"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} bash", icon), style),
+                    Span::styled(elapsed_str, Theme::dim()),
+                ]));
+                for l in msg.content.lines().take(20) {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "    {}",
+                            truncate_line(l, max_content_width.saturating_sub(2))
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                let total = msg.content.lines().count();
+                if total > 20 {
+                    lines.push(Line::from(Span::styled(
+                        format!("    …（共 {} 行）", total),
+                        Theme::dim(),
+                    )));
+                }
+            }
+
+            MessageRole::System => {
+                lines.push(Line::from(vec![
+                    Span::styled("  ⚙ ", Style::default().fg(Color::Cyan)),
+                    Span::styled(msg.content.clone(), Style::default().fg(Color::Cyan)),
+                ]));
                 lines.push(Line::from(""));
             }
         }
     }
 
-    // 流式中当前积累的文本
+    // 流式文本（实时输出中）
     if !state.streaming_buf.is_empty() {
+        render_markdown(&mut lines, &state.streaming_buf, max_content_width);
+    }
+
+    // is_thinking 时在底部显示 spinner 行
+    if state.is_thinking {
+        let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
         lines.push(Line::from(vec![
-            Span::styled("AI  ", Theme::assistant_prefix()),
-            Span::raw(""),
+            Span::styled(format!("{frame} "), Style::default().fg(Theme::CLAUDE)),
+            Span::styled("思考中…", Theme::dim()),
         ]));
-        render_assistant_text(&mut lines, &state.streaming_buf);
     }
 
     let text = Text::from(lines);
     let total_lines = text.lines.len() as u16;
     let visible_height = inner.height;
 
-    // 滚动：从底部往上计算偏移
     let scroll = if total_lines > visible_height {
         let max_scroll = total_lines - visible_height;
-        let offset = state.scroll_offset;
-        max_scroll.saturating_sub(offset)
+        max_scroll.saturating_sub(state.scroll_offset)
     } else {
         0
     };
@@ -124,90 +330,317 @@ fn draw_chat(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(para, inner);
 }
 
-fn render_assistant_text<'a>(lines: &mut Vec<Line<'a>>, text: &str) {
-    // 简单代码块检测：``` 开头的行用不同颜色
-    let mut in_code = false;
-    for raw_line in text.lines() {
-        if raw_line.starts_with("```") {
-            in_code = !in_code;
-            lines.push(Line::from(Span::styled(
-                raw_line.to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else if in_code {
-            lines.push(Line::from(Span::styled(
-                format!("  {raw_line}"),
-                Style::default().fg(Color::Cyan),
-            )));
-        } else {
-            lines.push(Line::from(Span::raw(format!("  {raw_line}"))));
-        }
-    }
-}
+/// 底部固定面板：任务列表
+fn draw_todo_panel(
+    f: &mut Frame,
+    items: &[wyj_tools::todo::TodoItem],
+    spinner_frame: usize,
+    area: Rect,
+) {
+    let total = items.len();
+    let done = items
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let title = format!(" 任务列表 [{done}/{total}] ");
 
-fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
-    let title = if state.is_thinking {
-        " 思考中… (Ctrl+C 中断) "
-    } else {
-        " 输入 (Enter 发送 / Shift+Enter 换行) "
-    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Theme::border())
-        .title(title);
+        .border_style(Theme::border())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_content_width = inner.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line<'static>> = vec![];
+
+    for (i, item) in items.iter().enumerate() {
+        let (icon, item_style) = match item.status {
+            TodoStatus::Pending => ("○".to_string(), Style::default().fg(Color::DarkGray)),
+            TodoStatus::InProgress => {
+                let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+                (
+                    frame.to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+            TodoStatus::Completed => (
+                "✓".to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        };
+
+        let prio_str = item
+            .priority
+            .as_deref()
+            .map(|p| format!("[{p}] "))
+            .unwrap_or_default();
+        let idx_str = format!("{}/{}", i + 1, total);
+        let content = truncate_line(
+            &format!("{prio_str}{}", item.content),
+            max_content_width.saturating_sub(10),
+        );
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{idx_str}] "), Theme::dim()),
+            Span::styled(format!("{icon} "), item_style),
+            Span::styled(content, item_style),
+        ]));
+    }
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
+
+// ─── 输入框 ──────────────────────────────────────────────────────────────────
+
+fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
+    let (title_content, title_style) = if state.is_thinking {
+        let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
+        (
+            format!(" {frame} esc to interrupt · ctrl+c to cancel "),
+            Style::default().fg(Theme::CLAUDE),
+        )
+    } else {
+        match &state.mode {
+            AgentMode::Plan => (
+                " [plan] Enter to send · Shift+Tab to switch mode ".to_string(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AgentMode::Bypass => (
+                " [bypass] Enter to send · Shift+Tab to switch mode ".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AgentMode::Normal => (
+                " Enter to send · Shift+Enter newline · / commands · ! bash · Shift+Tab mode "
+                    .to_string(),
+                Theme::dim(),
+            ),
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(match &state.mode {
+            AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
+            AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Yellow),
+            _ => Theme::border(),
+        })
+        .title(Span::styled(title_content, title_style));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if state.is_thinking {
-        let para = Paragraph::new("…").style(Theme::dim());
-        f.render_widget(para, inner);
+        // is_thinking 时不设置光标位置，ratatui 会自动隐藏终端光标
         return;
     }
 
     let lines: Vec<Line> = input
         .display_lines()
         .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if i == input.cursor_row {
-                // 渲染光标位置
-                let col = input.cursor_display_col();
-                let before = &l[..col.min(l.len())];
-                let cursor_char = l.chars().nth(col).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
-                let after = if col < l.len() { &l[col + cursor_char.len()..] } else { "" };
-                Line::from(vec![
-                    Span::raw(before.to_string()),
-                    Span::styled(cursor_char, Style::default().bg(Color::White).fg(Color::Black)),
-                    Span::raw(after.to_string()),
-                ])
-            } else {
-                Line::from(l.as_str())
-            }
-        })
+        .map(|l| Line::from(l.as_str()))
         .collect();
 
     let para = Paragraph::new(Text::from(lines)).style(Theme::input_box());
     f.render_widget(para, inner);
+
+    // 设置真正的终端光标位置（同时解决：光标不可见 + IME 候选框定位）
+    let cursor_x =
+        (inner.x + input.cursor_display_col() as u16).min(inner.x + inner.width.saturating_sub(1));
+    let cursor_y =
+        (inner.y + input.cursor_row as u16).min(inner.y + inner.height.saturating_sub(1));
+    f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
+// ─── Slash 命令补全下拉 ───────────────────────────────────────────────────────
+
+fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(Span::styled(
+            " / 命令 & Skill ",
+            Style::default().fg(Color::Blue),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_show = inner.height as usize;
+    let items = &state.slash_completions;
+    let selected = state.slash_selected;
+
+    // 滚动窗口：保持 selected 可见
+    let start = if selected >= max_show {
+        selected - max_show + 1
+    } else {
+        0
+    };
+
+    // 固定名称列宽（所有候选中最长的 name，上限 28 字符）
+    let name_col_w = items
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(6)
+        .min(28);
+    let desc_budget = (inner.width as usize).saturating_sub(name_col_w + 4);
+
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .skip(start)
+        .take(max_show)
+        .enumerate()
+        .map(|(i, (name, desc))| {
+            let real_idx = start + i;
+            let name_pad = format!(" {:width$}", name, width = name_col_w);
+            let desc_str = format!("  {}", truncate_chars(desc, desc_budget));
+            if real_idx == selected {
+                Line::from(vec![
+                    Span::styled(
+                        name_pad,
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        desc_str,
+                        Style::default()
+                            .bg(Color::Blue)
+                            .fg(Color::Rgb(180, 200, 255)),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(name_pad, Style::default().fg(Color::White)),
+                    Span::styled(desc_str, Theme::dim()),
+                ])
+            }
+        })
+        .collect();
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
+
+// ─── 状态栏 ──────────────────────────────────────────────────────────────────
+
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let tokens = format!(
-        " tokens: {}↑ {}↓  cwd: {}",
-        state.total_input_tokens,
-        state.total_output_tokens,
-        state.cwd.display()
+    let (used, total) = (state.total_input_tokens, state.context_window);
+    let pct = if total > 0 {
+        (used as f64 / total as f64).min(1.0)
+    } else {
+        0.0
+    };
+    let bar_width = 8usize;
+    let filled = ((pct * bar_width as f64).round() as usize).min(bar_width);
+    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+    let pct_int = (pct * 100.0).round() as u32;
+
+    let progress_style = if pct >= 0.90 {
+        Theme::progress_danger()
+    } else if pct >= 0.70 {
+        Theme::progress_warn()
+    } else {
+        Theme::progress_normal()
+    };
+
+    let cwd_str = {
+        let full = state.cwd.display().to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() && full.starts_with(&home) {
+            format!("~{}", &full[home.len()..])
+        } else {
+            full
+        }
+    };
+
+    let (right_help, right_style) = if state.ctrl_c_pressed {
+        (
+            "ctrl+c again to exit",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("ctrl+d or ctrl+c twice to exit  /help", Theme::dim())
+    };
+
+    let mode_span = match &state.mode {
+        AgentMode::Plan => Some(Span::styled(
+            " [plan] ",
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        )),
+        AgentMode::Bypass => Some(Span::styled(
+            " [bypass] ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        AgentMode::Normal => None,
+    };
+
+    let mode_str = match &state.mode {
+        AgentMode::Plan => " [plan]",
+        AgentMode::Bypass => " [bypass]",
+        AgentMode::Normal => "",
+    };
+    let left_text = format!(
+        " ◆ {}{} · [{}] {}% · {}",
+        state.model_name, mode_str, bar, pct_int, cwd_str
     );
-    let help = "Ctrl+C 退出  /help 命令";
-    let padding = area.width.saturating_sub(tokens.len() as u16 + help.len() as u16 + 2);
-    let text = format!("{tokens}{}{help}", " ".repeat(padding as usize));
-    let para = Paragraph::new(text).style(Theme::status_bar());
+    let right_len = right_help.chars().count();
+    let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
+
+    let mut spans = vec![
+        Span::styled(
+            " ◆ ",
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(state.model_name.clone(), Theme::dim()),
+    ];
+    if let Some(ms) = mode_span {
+        spans.push(ms);
+    }
+    spans.extend([
+        Span::styled(" · [".to_string(), Theme::dim()),
+        Span::styled(bar, progress_style),
+        Span::styled(format!("] {}% · {}", pct_int, cwd_str), Theme::dim()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(right_help, right_style),
+        Span::raw(" "),
+    ]);
+
+    let line = Line::from(spans);
+    let para = Paragraph::new(line).style(Theme::status_bar());
     f.render_widget(para, area);
 }
 
+// ─── 权限对话框（分级授权） ────────────────────────────────────────────────────
+
 fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
-    let width = (area.width * 3 / 4).max(40);
-    let height = 10u16;
+    let width = (area.width * 3 / 4).max(40).min(area.width);
+    let height = 11u16;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
@@ -216,32 +649,85 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .style(Theme::permission_dialog())
-        .title(" 权限确认 ");
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(" ⚑ 权限确认 ", Theme::permission_dialog()));
 
     let inner = block.inner(dialog_area);
     f.render_widget(block, dialog_area);
 
-    let lines = vec![
+    let preview = truncate_chars(&dlg.input_preview, (inner.width as usize * 3).max(80));
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled("工具: ", Theme::dim()),
+            Span::styled(dlg.tool_name.clone(), Theme::permission_dialog()),
+        ]),
         Line::from(Span::styled(
-            format!("工具: {}", dlg.tool_name),
-            Theme::permission_dialog(),
+            "─".repeat(inner.width as usize),
+            Theme::border(),
         )),
+        Line::from(Span::raw(preview)),
         Line::from(""),
-        Line::from(Span::styled("参数预览:", Theme::highlight())),
-        Line::from(Span::raw(truncate(&dlg.input_preview, 200))),
-        Line::from(""),
-        Line::from(Span::styled("[y] 允许    [n] 拒绝", Theme::highlight())),
+        Line::from(Span::styled(
+            "  [y] 本次允许  [s] Session 允许  [p] 永久允许  [n] 拒绝",
+            Theme::highlight(),
+        )),
     ];
 
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
     f.render_widget(para, inner);
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+// ─── AskQuestion 底部面板 ─────────────────────────────────────────────────────
+
+fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            " ◆ Agent 提问 ",
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_w = inner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            truncate_line(&dlg.question, max_w),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("─".repeat(max_w), Theme::border())),
+    ];
+
+    for (i, opt) in dlg.options.iter().enumerate() {
+        if i == dlg.selected {
+            lines.push(Line::from(Span::styled(
+                format!("  ▶ {}", truncate_line(opt, max_w.saturating_sub(4))),
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", truncate_line(opt, max_w.saturating_sub(4))),
+                Style::default().fg(Color::White),
+            )));
+        }
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ 选择  Enter 确认  Esc 取消",
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
 }

@@ -64,10 +64,7 @@ pub enum ContentBlock {
         is_error: bool,
     },
     /// base64 图片
-    Image {
-        media_type: String,
-        data: String,
-    },
+    Image { media_type: String, data: String },
 }
 
 /// 工具结果内容（文本或结构化 JSON）
@@ -118,7 +115,10 @@ pub enum StreamEvent {
     /// 消息结束
     MessageStop { stop_reason: StopReason },
     /// 用量统计（可选）
-    Usage { input_tokens: u32, output_tokens: u32 },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
 }
 
 /// 一次完整推理的汇总结果（流结束后组装）

@@ -31,7 +31,8 @@ impl Tool for BashTool {
             name: self.name().to_string(),
             description: "在系统 shell 中执行命令，并返回 stdout/stderr 输出。\
                 适合运行构建命令、测试、文件操作、查看日志等。\
-                长时间运行的命令会在超时后终止。".to_string(),
+                长时间运行的命令会在超时后终止。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -101,7 +102,10 @@ impl Tool for BashTool {
                 if is_error {
                     result = format!("退出码 {}\n{result}", out.status.code().unwrap_or(-1));
                 }
-                Ok(ToolResult { content: result, is_error })
+                Ok(ToolResult {
+                    content: result,
+                    is_error,
+                })
             }
         }
     }
@@ -111,9 +115,5 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    format!(
-        "{}…（已截断，原长 {} 字节）",
-        &s[..max],
-        s.len()
-    )
+    format!("{}…（已截断，原长 {} 字节）", &s[..max], s.len())
 }

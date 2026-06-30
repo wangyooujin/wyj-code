@@ -29,7 +29,8 @@ impl Tool for EditTool {
             name: self.name().to_string(),
             description: "对文件进行精确的字符串替换。\
                 old_string 必须在文件中唯一出现（除非 replace_all=true）。\
-                替换前必须先用 Read 读取文件确认精确的缩进和内容。".to_string(),
+                替换前必须先用 Read 读取文件确认精确的缩进和内容。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -101,5 +102,9 @@ impl Tool for EditTool {
 
 fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
     let pb = std::path::Path::new(p);
-    if pb.is_absolute() { pb.to_path_buf() } else { cwd.join(pb) }
+    if pb.is_absolute() {
+        pb.to_path_buf()
+    } else {
+        cwd.join(pb)
+    }
 }

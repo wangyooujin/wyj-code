@@ -52,7 +52,10 @@ pub trait Provider: Send + Sync {
                 }
                 StreamEvent::ToolUseEnd { .. } => {}
                 StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
-                StreamEvent::Usage { input_tokens: i, output_tokens: o } => {
+                StreamEvent::Usage {
+                    input_tokens: i,
+                    output_tokens: o,
+                } => {
                     input_tokens = i;
                     output_tokens = o;
                 }
@@ -64,10 +67,16 @@ pub trait Provider: Send + Sync {
             content.push(ContentBlock::Text { text: text_buf });
         }
         for (id, name, json) in tool_bufs {
-            let input: serde_json::Value = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+            let input: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
             content.push(ContentBlock::ToolUse { id, name, input });
         }
 
-        Ok(CompletionResult { content, stop_reason, input_tokens, output_tokens })
+        Ok(CompletionResult {
+            content,
+            stop_reason,
+            input_tokens,
+            output_tokens,
+        })
     }
 }

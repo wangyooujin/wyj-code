@@ -45,7 +45,8 @@ impl Tool for WebFetchTool {
             name: self.name().to_string(),
             description: "抓取网页内容并转换为纯文本（移除 HTML 标签）。\
                 适合读取文档、README、API 参考页面。\
-                不适合需要 JavaScript 渲染的页面。".to_string(),
+                不适合需要 JavaScript 渲染的页面。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -96,11 +97,7 @@ impl Tool for WebFetchTool {
             || text.trim_start().starts_with("<!DOCTYPE")
             || text.trim_start().starts_with("<html");
 
-        let result = if is_html {
-            html_to_text(&text)
-        } else {
-            text
-        };
+        let result = if is_html { html_to_text(&text) } else { text };
 
         Ok(ToolResult::ok(truncate(&result, MAX_CONTENT)))
     }

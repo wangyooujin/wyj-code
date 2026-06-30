@@ -3,40 +3,63 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// 来自 Agent 的输出事件（发到 UI 线程）
-#[derive(Debug, Clone)]
+// 注意：含 oneshot::Sender 的变体不能 Clone，故整体不 derive Clone
+#[derive(Debug)]
 pub enum AgentEvent {
     /// 流式文本片段
     TextDelta(String),
-    /// 工具调用开始
-    ToolStart { id: String, name: String },
-    /// 工具调用完成
-    ToolEnd { id: String, output: String, is_error: bool },
-    /// 权限确认请求
-    PermissionRequest { tool_name: String, input_preview: String, tx_id: String },
+    /// 工具调用开始（携带输入 JSON，用于提取展示参数）
+    ToolStart {
+        id: String,
+        name: String,
+        input_json: serde_json::Value,
+    },
+    /// 工具调用完成（包含实际执行耗时）
+    ToolEnd {
+        id: String,
+        output: String,
+        is_error: bool,
+        elapsed_secs: f64,
+    },
+    /// 权限确认请求（stub，目前仅展示）
+    PermissionRequest {
+        tool_name: String,
+        input_preview: String,
+        tx_id: String,
+    },
     /// Agent 一轮完成
     TurnDone,
     /// Agent 出错
     Error(String),
-    /// Token 用量
+    /// Token 用量（覆盖式更新）
     Usage { input: u32, output: u32 },
+    /// TodoWrite 工具完成后推送任务列表快照
+    TodoUpdate(Vec<wyj_tools::todo::TodoItem>),
+    /// AskQuestion 工具请求用户选择（含 oneshot 响应通道）
+    AskQuestion {
+        question: String,
+        options: Vec<String>,
+        response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    },
+    /// ! Bash 命令执行完成
+    BashResult {
+        output: String,
+        exit_code: i32,
+        elapsed_secs: f64,
+    },
 }
 
-/// 来自 UI 的用户事件
+/// 来自 UI 的用户事件（保留定义，目前未使用）
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    /// 用户提交消息
     Submit(String),
-    /// 对权限请求的响应
     PermissionResponse { tx_id: String, approved: bool },
-    /// 滚动操作
     ScrollUp,
     ScrollDown,
-    /// 退出
     Quit,
 }
 
-/// 检测是否是退出快捷键 (Ctrl+C / Ctrl+D / Escape)
+/// 检测是否是立即退出快捷键 (Ctrl+D)
 pub fn is_quit(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL))
-        || matches!(key.code, KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL))
+    matches!(key.code, KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL))
 }

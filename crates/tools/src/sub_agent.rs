@@ -6,7 +6,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use wyj_api::types::ToolDefinition;
-use wyj_core::{tool::{Tool, ToolContext, ToolResult}, Agent, Session};
+use wyj_core::{
+    tool::{Tool, ToolContext, ToolResult},
+    Agent, Session,
+};
 
 pub struct SubAgentTool {
     /// 工厂函数：创建子 Agent（持有 provider 和工具集）
@@ -15,7 +18,9 @@ pub struct SubAgentTool {
 
 impl SubAgentTool {
     pub fn new(factory: impl Fn() -> Agent + Send + Sync + 'static) -> Self {
-        Self { agent_factory: Arc::new(factory) }
+        Self {
+            agent_factory: Arc::new(factory),
+        }
     }
 }
 
@@ -37,7 +42,8 @@ impl Tool for SubAgentTool {
             name: self.name().to_string(),
             description: "启动一个独立的子 Agent 完成指定任务。\
                 子 Agent 拥有独立的上下文和工具集，完成后将结果返回。\
-                适用于需要多步骤规划、并行执行或隔离上下文的复杂子任务。".to_string(),
+                适用于需要多步骤规划、并行执行或隔离上下文的复杂子任务。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -70,7 +76,9 @@ impl Tool for SubAgentTool {
         let sub_ctx = crate::ctx::ToolCtx::new(&cwd);
 
         let mut output_buf = String::new();
-        agent.run_turn(&mut session, &sub_ctx, &mut |d| output_buf.push_str(d)).await?;
+        agent
+            .run_turn(&mut session, &sub_ctx, &mut |d| output_buf.push_str(d))
+            .await?;
 
         // 把最后一条 assistant 消息提取出来
         let result = if output_buf.is_empty() {
