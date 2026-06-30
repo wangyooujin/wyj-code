@@ -30,6 +30,7 @@ pub enum ToolEvent {
     },
 }
 
+#[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn Provider>,
     system_prompt: String,
@@ -102,6 +103,12 @@ impl Agent {
         self.tools.retain(|d| d.name != def.name);
         self.tools.push(def);
         self.tool_impls.insert(tool.name().to_string(), tool);
+    }
+
+    /// 追加单个工具（用于 per-turn 动态注册，如 ExitPlanMode）
+    pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.register_tool(tool);
+        self
     }
 
     /// 批量注册工具
