@@ -48,7 +48,11 @@ impl TodoStore {
         self.items
             .iter()
             .map(|t| {
-                let prio = t.priority.as_deref().map(|p| format!("[{p}] ")).unwrap_or_default();
+                let prio = t
+                    .priority
+                    .as_deref()
+                    .map(|p| format!("[{p}] "))
+                    .unwrap_or_default();
                 format!("{} {}{} ({})", t.status, prio, t.content, t.id)
             })
             .collect::<Vec<_>>()
@@ -91,7 +95,8 @@ impl Tool for TodoWriteTool {
             name: self.name().to_string(),
             description: "创建或更新结构化任务列表。每次调用会覆盖整个列表。\
                 status 可为 pending、in_progress 或 completed。\
-                priority 可为 high、medium、low（可选）。".to_string(),
+                priority 可为 high、medium、low（可选）。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -123,17 +128,30 @@ impl Tool for TodoWriteTool {
 
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
-        let items: Vec<TodoItem> = inp.todos.into_iter().map(|t| TodoItem {
-            id: t.id,
-            content: t.content,
-            status: t.status,
-            priority: t.priority,
-        }).collect();
+        let items: Vec<TodoItem> = inp
+            .todos
+            .into_iter()
+            .map(|t| TodoItem {
+                id: t.id,
+                content: t.content,
+                status: t.status,
+                priority: t.priority,
+            })
+            .collect();
 
         let count = items.len();
-        let pending = items.iter().filter(|t| t.status == TodoStatus::Pending).count();
-        let in_progress = items.iter().filter(|t| t.status == TodoStatus::InProgress).count();
-        let done = items.iter().filter(|t| t.status == TodoStatus::Completed).count();
+        let pending = items
+            .iter()
+            .filter(|t| t.status == TodoStatus::Pending)
+            .count();
+        let in_progress = items
+            .iter()
+            .filter(|t| t.status == TodoStatus::InProgress)
+            .count();
+        let done = items
+            .iter()
+            .filter(|t| t.status == TodoStatus::Completed)
+            .count();
 
         {
             let mut store = self.store.lock().unwrap();

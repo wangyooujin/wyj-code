@@ -12,18 +12,27 @@ pub enum CommandResult {
     Output(String),
     /// 清空对话历史
     ClearHistory,
-    /// 切换模型
+    /// 切换模型（运行时热切换）
     SetModel(String),
+    /// 手动触发上下文压缩
+    CompactHistory,
     /// 退出应用
     Quit,
     /// 无动作（静默成功）
     None,
+    /// Skill 执行结果：包含展开后的 prompt，由调用方转发给 agent
+    RunPrompt(String),
 }
 
 /// 命令执行上下文
 pub struct CommandContext {
     pub cwd: std::path::PathBuf,
     pub model: String,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub context_window: u32,
+    pub estimated_tokens: u32,
+    pub home_dir: std::path::PathBuf,
 }
 
 /// Slash 命令 trait
@@ -41,7 +50,9 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn new() -> Self {
-        Self { commands: HashMap::new() }
+        Self {
+            commands: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, cmd: Arc<dyn Command>) {
@@ -78,17 +89,19 @@ impl CommandRegistry {
         }
         match self.commands.get(name) {
             Some(cmd) => Some(cmd.run(args, ctx).await),
-            None => Some(Err(anyhow::anyhow!("未知命令: /{name}  (输入 /help 查看所有命令)"))),
+            None => Some(Err(anyhow::anyhow!(
+                "未知命令: /{name}  (输入 /help 查看所有命令)"
+            ))),
         }
     }
 
-    /// 返回以 prefix 开头的命令名（用于补全）
-    pub fn complete(&self, prefix: &str) -> Vec<String> {
+    /// 返回以 prefix 开头的 (命令名, 描述) 对（用于补全）
+    pub fn complete(&self, prefix: &str) -> Vec<(String, String)> {
         let p = prefix.trim_start_matches('/');
         self.commands
-            .keys()
-            .filter(|k| k.starts_with(p))
-            .map(|k| format!("/{k}"))
+            .iter()
+            .filter(|(k, _)| k.starts_with(p))
+            .map(|(k, v)| (format!("/{k}"), v.description().to_string()))
             .collect()
     }
 }

@@ -30,8 +30,10 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "读取文件内容，附带行号前缀。支持偏移量和行数限制，适合读取大文件的特定部分。\
-                对图片文件返回 base64 编码。".to_string(),
+            description:
+                "读取文件内容，附带行号前缀。支持偏移量和行数限制，适合读取大文件的特定部分。\
+                对图片文件返回 base64 编码。"
+                    .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -62,8 +64,15 @@ impl Tool for ReadTool {
         }
 
         // 图片文件：返回 base64
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        ) {
             let bytes = tokio::fs::read(&path).await?;
             let b64 = base64_encode(&bytes);
             let mime = match ext.as_str() {
@@ -107,7 +116,11 @@ impl Tool for ReadTool {
 
 fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
     let pb = std::path::Path::new(p);
-    if pb.is_absolute() { pb.to_path_buf() } else { cwd.join(pb) }
+    if pb.is_absolute() {
+        pb.to_path_buf()
+    } else {
+        cwd.join(pb)
+    }
 }
 
 fn base64_encode(data: &[u8]) -> String {
@@ -115,12 +128,28 @@ fn base64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
-        out.push(TABLE[(b0 >> 2)] as char);
+        let b1 = if chunk.len() > 1 {
+            chunk[1] as usize
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            chunk[2] as usize
+        } else {
+            0
+        };
+        out.push(TABLE[b0 >> 2] as char);
         out.push(TABLE[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[b2 & 0x3f] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[b2 & 0x3f] as char
+        } else {
+            '='
+        });
     }
     out
 }

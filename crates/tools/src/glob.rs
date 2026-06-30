@@ -31,7 +31,8 @@ impl Tool for GlobTool {
             name: self.name().to_string(),
             description: "按 glob 模式搜索文件路径。\
                 自动忽略 .gitignore 中的文件。\
-                支持 **、? 等通配符。返回匹配文件的绝对路径列表。".to_string(),
+                支持 **、? 等通配符。返回匹配文件的绝对路径列表。"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +55,11 @@ impl Tool for GlobTool {
         let root = match &inp.path {
             Some(p) => {
                 let pb = std::path::Path::new(p);
-                if pb.is_absolute() { pb.to_path_buf() } else { ctx.cwd().join(pb) }
+                if pb.is_absolute() {
+                    pb.to_path_buf()
+                } else {
+                    ctx.cwd().join(pb)
+                }
             }
             None => ctx.cwd().to_path_buf(),
         };

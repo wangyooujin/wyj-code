@@ -1372,6 +1372,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2405,6 +2416,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2977,8 +2994,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wyj-api",
+ "wyj-commands",
  "wyj-config",
  "wyj-core",
+ "wyj-mcp",
  "wyj-tools",
  "wyj-tui",
 ]
@@ -3074,6 +3093,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "futures",
+ "pulldown-cmark",
  "ratatui",
  "serde",
  "serde_json",
@@ -3081,6 +3101,7 @@ dependencies = [
  "tracing",
  "wyj-api",
  "wyj-commands",
+ "wyj-config",
  "wyj-core",
  "wyj-tools",
 ]

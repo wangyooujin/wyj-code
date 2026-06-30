@@ -23,13 +23,17 @@ pub struct OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new(cfg: &Config) -> Result<Self> {
+        Self::with_model(cfg, &cfg.model.clone())
+    }
+
+    pub fn with_model(cfg: &Config, model: &str) -> Result<Self> {
         let api_key = cfg.api_key()?.to_string();
         let base_url = cfg.resolved_base_url().trim_end_matches('/').to_string();
         Ok(Self {
             client: Client::new(),
             api_key,
             base_url,
-            model: cfg.model.clone(),
+            model: model.to_string(),
         })
     }
 }
@@ -141,7 +145,11 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                 for block in &m.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
-                        ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
                             let content_str = match content {
                                 crate::types::ToolResultContent::Text(t) => t.clone(),
                                 crate::types::ToolResultContent::Blocks(b) => {
@@ -181,8 +189,7 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                                 call_type: "function",
                                 function: ApiFunctionCall {
                                     name: name.clone(),
-                                    arguments: serde_json::to_string(input)
-                                        .unwrap_or_default(),
+                                    arguments: serde_json::to_string(input).unwrap_or_default(),
                                 },
                             });
                         }
@@ -196,7 +203,11 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                     } else {
                         Some(Value::String(text_parts.join("")))
                     },
-                    tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                     tool_call_id: None,
                 });
             }
@@ -251,7 +262,9 @@ impl Provider for OpenAIProvider {
             tools: api_tools,
             max_tokens,
             stream: true,
-            stream_options: StreamOptions { include_usage: true },
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
@@ -283,9 +296,7 @@ impl Provider for OpenAIProvider {
                     let result: Option<Result<StreamEvent>> = (|| {
                         let event = match item {
                             Ok(e) => e,
-                            Err(e) => {
-                                return Some(Err(anyhow::anyhow!("SSE 读取失败: {e}")))
-                            }
+                            Err(e) => return Some(Err(anyhow::anyhow!("SSE 读取失败: {e}"))),
                         };
                         if event.data == "[DONE]" {
                             return None;
