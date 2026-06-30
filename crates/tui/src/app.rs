@@ -6,14 +6,15 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        self, DisableBracketedPaste, EnableBracketedPaste,
         Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, KeyModifiers, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        MouseButton, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -400,6 +401,8 @@ pub struct AppState {
     pub turn_start_input_tokens: u32,
     /// 本轮对话开始时的 output_tokens 快照
     pub turn_start_output_tokens: u32,
+    /// 上次渲染的滚动条区域（用于鼠标点击 ▲▼ 箭头命中检测）
+    pub scrollbar_area: Rect,
 }
 
 impl AppState {
@@ -443,6 +446,7 @@ impl AppState {
             turn_start_time: None,
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
+            scrollbar_area: Rect::default(),
         }
     }
 
@@ -609,7 +613,6 @@ pub async fn run_tui(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -636,8 +639,7 @@ pub async fn run_tui(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     result
@@ -1006,6 +1008,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         }
                         MouseEventKind::ScrollDown => {
                             state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let sb = state.scrollbar_area;
+                            let col = mouse.column;
+                            let row = mouse.row;
+                            if col == sb.x && sb.height > 0 {
+                                if row == sb.y {
+                                    // 点击 ▲ 跳到最顶
+                                    state.scroll_offset = u16::MAX;
+                                } else if row == sb.y + sb.height - 1 {
+                                    // 点击 ▼ 跳到最底
+                                    state.scroll_offset = 0;
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -1805,6 +1821,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     } else if key.code == KeyCode::PageDown {
                         let step = state.chat_height.max(3);
                         state.scroll_offset = state.scroll_offset.saturating_sub(step);
+                    } else if key.code == KeyCode::Home
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // Ctrl+Home：跳到最顶（render 内 clamp 到 max_scroll）
+                        state.scroll_offset = u16::MAX;
+                    } else if key.code == KeyCode::End
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // Ctrl+End：跳到最底（最新消息）
+                        state.scroll_offset = 0;
                     } else if key.code == KeyCode::Up && !state.is_thinking {
                         // 输入历史导航（仅在无补全列表时）
                         if state.slash_completions.is_empty() {
