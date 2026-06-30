@@ -47,6 +47,11 @@ pub enum AgentEvent {
         exit_code: i32,
         elapsed_secs: f64,
     },
+    /// ExitPlanMode 工具触发的计划批准请求
+    PlanApprovalRequest {
+        plan_path: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

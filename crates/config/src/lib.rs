@@ -58,7 +58,10 @@ impl AgentMode {
     /// Plan 模式下允许的只读工具集
     pub fn allowed_tools(&self) -> Option<&'static [&'static str]> {
         match self {
-            AgentMode::Plan => Some(&["read", "glob", "grep", "web_fetch"]),
+            AgentMode::Plan => Some(&[
+                "read", "glob", "grep", "web_fetch",
+                "ask_question", "write", "bash", "exit_plan_mode",
+            ]),
             _ => None,
         }
     }

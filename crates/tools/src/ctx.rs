@@ -18,11 +18,19 @@ pub enum PermissionMode {
     Allowlist(HashSet<String>),
 }
 
-/// AskQuestion 工具向 TUI 发送的交互请求
-pub struct UiAskRequest {
-    pub question: String,
-    pub options: Vec<String>,
-    pub response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+/// 工具向 TUI 发送的交互请求
+pub enum UiAskRequest {
+    /// AskQuestion 工具的普通问答请求
+    Question {
+        question: String,
+        options: Vec<String>,
+        response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    },
+    /// ExitPlanMode 工具的计划批准请求
+    ExitPlanMode {
+        plan_path: Option<String>,
+        response_tx: tokio::sync::oneshot::Sender<bool>,
+    },
 }
 
 pub struct ToolCtx {
@@ -59,12 +67,28 @@ impl ToolContext for ToolCtx {
     async fn ask_user(&self, question: &str, options: &[String]) -> Option<usize> {
         let tx = self.ui_ask_tx.as_ref()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let req = UiAskRequest {
+        let req = UiAskRequest::Question {
             question: question.to_string(),
             options: options.to_vec(),
             response_tx,
         };
         tx.send(req).await.ok()?;
         response_rx.await.ok().flatten()
+    }
+
+    async fn exit_plan_mode(&self, plan_path: Option<&str>) -> bool {
+        let tx = match &self.ui_ask_tx {
+            Some(t) => t,
+            None => return true, // headless：自动批准
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let req = UiAskRequest::ExitPlanMode {
+            plan_path: plan_path.map(str::to_string),
+            response_tx,
+        };
+        if tx.send(req).await.is_err() {
+            return false;
+        }
+        response_rx.await.unwrap_or(false)
     }
 }
