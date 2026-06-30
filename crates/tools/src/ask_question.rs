@@ -30,6 +30,99 @@ fn coerce_string(v: &Value) -> String {
     }
 }
 
+/// 尝试将 LLM 错误地打包进单字符串的多选项拆分出来。
+/// 支持换行分隔 ("A. 是\nB. 否") 和字母前缀逗号分隔 ("A. 是, B. 否")。
+fn try_split_packed_options(s: &str) -> Option<Vec<String>> {
+    // 1. 优先按换行拆
+    let by_newline: Vec<String> = s
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if by_newline.len() >= 2 {
+        return Some(by_newline);
+    }
+
+    // 2. 检测 "X. " 形式的字母前缀分割点（B/C/D 出现在空格或逗号/分号后面）
+    let mut split_points: Vec<usize> = vec![0];
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    for i in 1..len {
+        let ch = chars[i];
+        if matches!(ch, 'B' | 'C' | 'D')
+            && i + 2 < len
+            && chars[i + 1] == '.'
+            && chars[i + 2] == ' '
+        {
+            // 前一个非空白字符应是分隔符（逗号、分号、空格）
+            let prev = chars[..i]
+                .iter()
+                .rev()
+                .find(|&&c| c != ' ')
+                .copied()
+                .unwrap_or(',');
+            if matches!(prev, ',' | ';' | '，' | '；') {
+                split_points.push(i);
+            }
+        }
+    }
+
+    if split_points.len() < 2 {
+        return None;
+    }
+
+    let s_chars: Vec<char> = s.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    for (j, &start) in split_points.iter().enumerate() {
+        let end = if j + 1 < split_points.len() {
+            split_points[j + 1]
+        } else {
+            s_chars.len()
+        };
+        let part: String = s_chars[start..end]
+            .iter()
+            .collect::<String>()
+            .trim_start_matches(|c: char| c == ',' || c == '，' || c == ';' || c == '；' || c == ' ')
+            .trim()
+            .to_string();
+        if !part.is_empty() {
+            parts.push(part);
+        }
+    }
+
+    if parts.len() >= 2 {
+        Some(parts)
+    } else {
+        None
+    }
+}
+
+/// 从 JSON Value 中解析选项列表，兼容 LLM 将多选项打包成单字符串的情况。
+fn parse_options(raw: &Value) -> Option<Vec<String>> {
+    // 标准路径：数组
+    if let Some(arr) = raw.as_array() {
+        let strings: Vec<String> = arr.iter().map(coerce_string).collect();
+        if strings.len() >= 2 {
+            return Some(strings);
+        }
+        // 只有 1 个元素时尝试拆包
+        if let Some(single) = strings.first() {
+            if let Some(split) = try_split_packed_options(single) {
+                return Some(split);
+            }
+        }
+        return if strings.is_empty() { None } else { Some(strings) };
+    }
+    // 容错路径：options 直接是字符串
+    if let Some(s) = raw.as_str() {
+        if let Some(split) = try_split_packed_options(s) {
+            return Some(split);
+        }
+        return Some(vec![s.to_string()]);
+    }
+    None
+}
+
 #[async_trait]
 impl Tool for AskQuestionTool {
     fn name(&self) -> &str {
@@ -70,14 +163,10 @@ impl Tool for AskQuestionTool {
             None => return Ok(ToolResult::err("缺少 question 字段")),
         };
 
-        let options: Vec<String> = match input.get("options").and_then(|v| v.as_array()) {
-            Some(arr) => arr.iter().map(coerce_string).collect(),
-            None => return Ok(ToolResult::err("缺少 options 字段或不是数组")),
+        let options: Vec<String> = match input.get("options").and_then(|v| parse_options(v)) {
+            Some(opts) if !opts.is_empty() => opts,
+            _ => return Ok(ToolResult::err("缺少 options 字段或无法解析选项")),
         };
-
-        if options.is_empty() {
-            return Ok(ToolResult::err("选项不能为空"));
-        }
 
         match ctx.ask_user(&question, &options).await {
             Some(idx) if idx < options.len() => Ok(ToolResult::ok(options[idx].clone())),

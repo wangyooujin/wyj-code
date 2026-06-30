@@ -358,14 +358,6 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         render_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
-    // is_thinking 且无工具在执行时显示 spinner 行（工具执行期间 ToolCall 消息已可见）
-    if state.is_thinking && state.current_op.is_none() {
-        let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
-        lines.push(Line::from(vec![
-            Span::styled(format!("{frame} "), Style::default().fg(Theme::CLAUDE)),
-            Span::styled("Thinking…", Theme::dim()),
-        ]));
-    }
 
     let text = Text::from(lines);
 
