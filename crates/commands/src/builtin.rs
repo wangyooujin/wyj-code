@@ -34,6 +34,7 @@ impl Command for HelpCmd {
               /doctor            诊断环境（API Key / 配置 / 记忆）\n\
               /memory            查看项目跨会话记忆内容\n\
               /model [名称]      查看或切换 AI 模型（无参：显示当前）\n\
+              /plan              切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）\n\
               /mode [模式]       切换运行模式（normal / plan / bypass）\n\
               /resume [id]       恢复历史会话（无参数=选择器，有 id=直接恢复）\n\
               /sessions          查看和切换历史会话\n\
@@ -59,7 +60,7 @@ impl Command for HelpCmd {
             \n\
             模式:\n\
               Normal    默认模式，工具调用前弹出权限确认对话框\n\
-              Plan      只读模式，仅允许 read/glob/grep/web_fetch\n\
+              Plan      只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode\n\
               Bypass    跳过所有权限确认，自动批准工具调用"
         );
         Ok(CommandResult::Output(text))

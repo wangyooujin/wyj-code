@@ -32,7 +32,7 @@ use wyj_core::{
 };
 use wyj_tools::todo::TodoItem;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
-use wyj_tools::{TodoStore, ToolCtx};
+use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 
 /// 用于 /model 热切换的 Agent 重建函数类型
 pub type RebuildFn = Arc<dyn Fn(&str) -> anyhow::Result<Agent> + Send + Sync>;
@@ -177,6 +177,12 @@ pub struct AskQuestionDialog {
     pub options: Vec<String>,
     pub selected: usize,
     pub response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+}
+
+/// ExitPlanMode 工具触发的计划批准对话框状态
+pub struct PlanApprovalDialog {
+    pub plan_path: Option<String>,
+    pub response_tx: tokio::sync::oneshot::Sender<bool>,
 }
 
 /// 会话选择器状态（/sessions 命令触发）
@@ -348,6 +354,8 @@ pub struct AppState {
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
     pub ask_question_dialog: Option<AskQuestionDialog>,
+    /// ExitPlanMode 触发的计划批准对话框
+    pub plan_dialog: Option<PlanApprovalDialog>,
     pub scroll_offset: u16,
     /// 上次渲染的聊天区可见行高（用于按页滚动）
     pub chat_height: u16,
@@ -413,6 +421,7 @@ impl AppState {
             is_thinking: false,
             permission_dialog: None,
             ask_question_dialog: None,
+            plan_dialog: None,
             scroll_offset: 0,
             chat_height: 20,
             total_input_tokens: 0,
@@ -467,6 +476,9 @@ impl AppState {
         self.permission_dialog = None;
         if let Some(dlg) = self.ask_question_dialog.take() {
             let _ = dlg.response_tx.send(None);
+        }
+        if let Some(dlg) = self.plan_dialog.take() {
+            let _ = dlg.response_tx.send(false);
         }
         self.pending_attachments.clear();
     }
@@ -589,6 +601,11 @@ impl AppState {
                     .push(ChatMessage::bash_output(output, exit_code, elapsed_secs));
                 self.scroll_offset = 0;
             }
+
+            AgentEvent::PlanApprovalRequest { plan_path, response_tx } => {
+                self.is_thinking = false; // 暂停 spinner，等待用户操作
+                self.plan_dialog = Some(PlanApprovalDialog { plan_path, response_tx });
+            }
         }
     }
 }
@@ -654,14 +671,43 @@ fn cycle_mode(mode: &AgentMode) -> AgentMode {
     }
 }
 
+/// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
+fn plan_turn_agent(
+    base: &Arc<Agent>,
+    mode: &AgentMode,
+    cwd: &std::path::Path,
+) -> Arc<Agent> {
+    if !matches!(mode, AgentMode::Plan) {
+        return Arc::clone(base);
+    }
+    let plan_path = cwd.join(".wyj").join("plan.md");
+    let mut a = (**base).clone();
+    a.register_tool(Arc::new(ExitPlanModeTool));
+    let a = a.append_system(&format!(
+        "## 当前模式：Plan（规划分析）\n\n\
+        你只能使用只读工具（Read/Glob/Grep/WebFetch/Bash）以及 Write（仅用于写入计划文档）。\n\
+        请先充分分析代码，然后将完整计划写入：`{}`\n\
+        写完后调用 `ExitPlanMode` 工具提交计划，等待用户批准后才能执行。\n\
+        Bash 命令只允许只读操作（ls/find/cat/grep 等），不得执行写入操作。",
+        plan_path.display()
+    ));
+    Arc::new(a)
+}
+
 /// 根据 AgentMode 构建对应的 PermissionMode
 fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
     match mode {
         AgentMode::Plan => {
-            let set: HashSet<String> = ["Read", "Glob", "Grep", "WebFetch", "AskQuestion"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let set: HashSet<String> = [
+                "Read", "Glob", "Grep", "WebFetch",
+                "AskQuestion",
+                "Write",        // 写计划文件
+                "Bash",         // 只读命令，由 system prompt 约束
+                "ExitPlanMode", // 提交计划并请求批准
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             PermissionMode::Allowlist(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
@@ -947,14 +993,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             }
         }
 
-        // 消费 ui_ask 请求，转成 AgentEvent::AskQuestion（含 oneshot sender）
+        // 消费 ui_ask 请求，分发为对应 AgentEvent
         loop {
             match ui_ask_rx.try_recv() {
-                Ok(req) => {
+                Ok(UiAskRequest::Question { question, options, response_tx }) => {
                     state.apply_agent_event(AgentEvent::AskQuestion {
-                        question: req.question,
-                        options: req.options,
-                        response_tx: req.response_tx,
+                        question,
+                        options,
+                        response_tx,
+                    });
+                }
+                Ok(UiAskRequest::ExitPlanMode { plan_path, response_tx }) => {
+                    state.apply_agent_event(AgentEvent::PlanApprovalRequest {
+                        plan_path,
+                        response_tx,
                     });
                 }
                 Err(_) => break,
@@ -1142,7 +1194,35 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ① AskQuestion 对话框优先拦截全部按键
+                    // ① plan 批准对话框最高优先级
+                    if state.plan_dialog.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                if let Some(dlg) = state.plan_dialog.take() {
+                                    let _ = dlg.response_tx.send(true);
+                                    // 切换至执行模式
+                                    let new_mode = AgentMode::Normal;
+                                    *shared_mode.lock().await = new_mode.clone();
+                                    state.mode = new_mode;
+                                    state.messages.push(ChatMessage::system(
+                                        "已批准计划，切换至执行模式。".to_string(),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                if let Some(dlg) = state.plan_dialog.take() {
+                                    let _ = dlg.response_tx.send(false);
+                                    state.messages.push(ChatMessage::system(
+                                        "已取消，继续保持 plan 模式。".to_string(),
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ② AskQuestion 对话框优先拦截全部按键
                     if state.ask_question_dialog.is_some() {
                         match key.code {
                             KeyCode::Up => {
@@ -1174,7 +1254,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ② 权限对话框拦截（分级授权）
+                    // ③ 权限对话框拦截（分级授权）
                     if state.permission_dialog.is_some() {
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
@@ -1423,6 +1503,18 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 continue;
                             }
 
+                            // ── /plan 命令：直接切换至 plan 模式 ────────────
+                            if trimmed == "/plan" {
+                                let new_mode = AgentMode::Plan;
+                                *shared_mode.lock().await = new_mode.clone();
+                                state.mode = new_mode;
+                                state.messages.push(ChatMessage::system(
+                                    "已切换至 plan 模式。请描述你想分析或规划的内容。".to_string(),
+                                ));
+                                state.input_history.push(trimmed);
+                                continue;
+                            }
+
                             // ── /mode 命令：运行时切换模式 ───────────────────
                             if let Some(args) = trimmed.strip_prefix("/mode") {
                                 let args = args.trim();
@@ -1612,12 +1704,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
                                             ctx.permission_mode = mode_to_permission(&current_mode);
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+                                            let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
                                             let tx2 = tx.clone();
                                             let mut on_text = move |d: &str| {
                                                 let _ = tx2
                                                     .try_send(AgentEvent::TextDelta(d.to_string()));
                                             };
-                                            match agent_c
+                                            match turn_agent
                                                 .run_turn(&mut sess, &ctx, &mut on_text)
                                                 .await
                                             {
@@ -1793,11 +1886,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     let mut ctx = ToolCtx::new(&ctx_cwd);
                                     ctx.permission_mode = mode_to_permission(&current_mode);
                                     ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+                                    let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
                                     let tx2 = tx.clone();
                                     let mut on_text = move |d: &str| {
                                         let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
                                     };
-                                    match agent_c.run_turn(&mut sess, &ctx, &mut on_text).await {
+                                    match turn_agent.run_turn(&mut sess, &ctx, &mut on_text).await {
                                         Ok(_) => {
                                             let _ = tx
                                                 .send(AgentEvent::Usage {

@@ -36,6 +36,10 @@ pub trait ToolContext: Send + Sync {
     async fn ask_user(&self, _question: &str, _options: &[String]) -> Option<usize> {
         None
     }
+    /// 请求退出 plan 模式并等待用户批准（headless 自动批准返回 true）
+    async fn exit_plan_mode(&self, _plan_path: Option<&str>) -> bool {
+        true
+    }
 }
 
 /// 工具抽象

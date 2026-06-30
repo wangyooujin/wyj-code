@@ -1,6 +1,6 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, Attachment, AskQuestionDialog, MessageRole, PermissionDialog, SessionPickerState};
+use crate::app::{AppState, Attachment, AskQuestionDialog, MessageRole, PermissionDialog, PlanApprovalDialog, SessionPickerState};
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
@@ -125,6 +125,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     draw_chat(f, state, chunks[0]);
     match panel_kind {
         BottomPanel::None => {}
+        BottomPanel::PlanApproval => {
+            if let Some(dlg) = &state.plan_dialog {
+                draw_plan_approval_panel(f, dlg, chunks[1]);
+            }
+        }
         BottomPanel::AskQuestion => {
             if let Some(dlg) = &state.ask_question_dialog {
                 draw_ask_question_panel(f, dlg, chunks[1]);
@@ -161,11 +166,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 /// 底部面板类型与高度
 enum BottomPanel {
     None,
+    PlanApproval,
     AskQuestion,
     TodoList,
 }
 
 fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
+    if state.plan_dialog.is_some() {
+        return (5u16.min(area_height), BottomPanel::PlanApproval);
+    }
     if let Some(dlg) = &state.ask_question_dialog {
         let h = (dlg.options.len() as u16 + 6).min(area_height);
         return (h, BottomPanel::AskQuestion);
@@ -946,6 +955,36 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
 }
 
 // ─── AskQuestion 底部面板 ─────────────────────────────────────────────────────
+
+fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Blue))
+        .title(Span::styled(
+            " 📋 计划已就绪 ",
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_w = inner.width as usize;
+    let file_line = if let Some(path) = &dlg.plan_path {
+        format!("文件：{}", truncate_line(path, max_w.saturating_sub(4)))
+    } else {
+        "（未写入计划文件）".to_string()
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(file_line, Style::default().fg(Color::White))),
+        Line::from(Span::styled(
+            "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划",
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
 
 fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
     let block = Block::default()
