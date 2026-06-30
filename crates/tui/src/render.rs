@@ -1,6 +1,6 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, AskQuestionDialog, MessageRole, PermissionDialog, SessionPickerState};
+use crate::app::{AppState, Attachment, AskQuestionDialog, MessageRole, PermissionDialog, SessionPickerState};
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
@@ -40,7 +40,8 @@ pub const SPINNER_FRAMES: &[char] = &['·', '✢', '✳', '✶', '✻', '✽', '
 
 pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
     let area = f.area();
-    let input_height = (input.display_lines().len() as u16 + 2).max(3).min(10);
+    let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
+    let input_height = (input.visual_height(inner_width) as u16 + 2).max(3).min(10);
 
     // 补全列表高度
     let completion_height = if state.slash_completions.is_empty() {
@@ -48,6 +49,9 @@ pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
     } else {
         (state.slash_completions.len() as u16 + 2).min(8)
     };
+
+    // 附件预览条高度（有附件时显示）
+    let attach_height: u16 = if state.pending_attachments.is_empty() { 0 } else { 3 };
 
     // 底部面板高度：AskQuestion 优先，否则 TaskList，否则 0
     let (panel_height, panel_kind) = bottom_panel_size(state, area.height);
@@ -58,6 +62,7 @@ pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
             Constraint::Min(3),
             Constraint::Length(panel_height),
             Constraint::Length(completion_height),
+            Constraint::Length(attach_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
@@ -80,8 +85,11 @@ pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
     if !state.slash_completions.is_empty() {
         draw_slash_completions(f, state, chunks[2]);
     }
-    draw_input(f, state, input, chunks[3]);
-    draw_status(f, state, chunks[4]);
+    if !state.pending_attachments.is_empty() {
+        draw_attachments(f, state, chunks[3]);
+    }
+    draw_input(f, state, input, chunks[4]);
+    draw_status(f, state, chunks[5]);
 
     // 权限对话框仍以浮层叠加（后渲染的在前）
     if let Some(dlg) = &state.permission_dialog {
@@ -410,11 +418,26 @@ fn draw_todo_panel(
 // ─── 输入框 ──────────────────────────────────────────────────────────────────
 
 fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
+    // 检测 ! bash 模式：首行以 ! 开头且不在思考中
+    let is_bang = !state.is_thinking
+        && input
+            .display_lines()
+            .first()
+            .map(|l| l.starts_with('!'))
+            .unwrap_or(false);
+
     let (title_content, title_style) = if state.is_thinking {
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
         (
             format!(" {frame} esc to interrupt · ctrl+c to cancel "),
             Style::default().fg(Theme::CLAUDE),
+        )
+    } else if is_bang {
+        (
+            " $ bash · Enter to run ".to_string(),
+            Style::default()
+                .fg(Theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
         match &state.mode {
@@ -438,13 +461,19 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
         }
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(match &state.mode {
+    let border_style = if is_bang {
+        Style::default().fg(Theme::SUCCESS)
+    } else {
+        match &state.mode {
             AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
             AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Yellow),
             _ => Theme::border(),
-        })
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
         .title(Span::styled(title_content, title_style));
 
     let inner = block.inner(area);
@@ -461,15 +490,63 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
         .map(|l| Line::from(l.as_str()))
         .collect();
 
-    let para = Paragraph::new(Text::from(lines)).style(Theme::input_box());
+    let text_style = if is_bang {
+        Style::default().fg(Theme::SUCCESS)
+    } else {
+        Theme::input_box()
+    };
+    let para = Paragraph::new(Text::from(lines))
+        .style(text_style)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, inner);
 
-    // 设置真正的终端光标位置（同时解决：光标不可见 + IME 候选框定位）
-    let cursor_x =
-        (inner.x + input.cursor_display_col() as u16).min(inner.x + inner.width.saturating_sub(1));
-    let cursor_y =
-        (inner.y + input.cursor_row as u16).min(inner.y + inner.height.saturating_sub(1));
+    // 光标位置：考虑长行折行后的视觉坐标
+    let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
+    let cursor_x = (inner.x + vis_col as u16).min(inner.x + inner.width.saturating_sub(1));
+    let cursor_y = (inner.y + vis_row as u16).min(inner.y + inner.height.saturating_sub(1));
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+// ─── 附件预览条 ───────────────────────────────────────────────────────────────
+
+fn draw_attachments(f: &mut Frame, state: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " 附件 · Enter 发送 · ESC 中断清空 ",
+            Style::default().fg(Color::Cyan),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut spans: Vec<Span> = vec![];
+    for att in &state.pending_attachments {
+        match att {
+            Attachment::Image { preview_label, .. } => {
+                spans.push(Span::styled(
+                    format!(" [图片 {preview_label}] "),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            Attachment::File { path } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                spans.push(Span::styled(
+                    format!(" [文件 {name}] "),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+        spans.push(Span::raw("  "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // ─── Slash 命令补全下拉 ───────────────────────────────────────────────────────
