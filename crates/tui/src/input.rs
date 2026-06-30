@@ -55,6 +55,17 @@ impl InputBox {
         self.cursor_col += 1;
     }
 
+    /// 批量插入文本（bracketed paste 使用）：'\n' 当换行处理，'\r' 过滤，其余字符逐一插入
+    pub fn insert_text(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\n' => self.insert_newline(),
+                '\r' => {}
+                c => self.insert_char(c),
+            }
+        }
+    }
+
     pub fn insert_newline(&mut self) {
         let byte_offset = self.cursor_byte_offset();
         let rest = self.lines[self.cursor_row].split_off(byte_offset);
@@ -223,5 +234,35 @@ impl InputBox {
 
     pub fn display_lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// 单行的视觉行数（考虑终端折行，width=0 时按 1 行算）
+    fn line_visual_rows(line: &str, width: usize) -> usize {
+        if width == 0 {
+            return 1;
+        }
+        let disp: usize = line.chars().map(char_width).sum();
+        if disp == 0 { 1 } else { (disp + width - 1) / width }
+    }
+
+    /// 所有内容折行后的总视觉行数（用于动态调整输入框高度）
+    pub fn visual_height(&self, width: usize) -> usize {
+        self.lines
+            .iter()
+            .map(|l| Self::line_visual_rows(l, width))
+            .sum::<usize>()
+            .max(1)
+    }
+
+    /// 光标的视觉位置 (visual_row, visual_col)，考虑折行
+    pub fn cursor_visual_pos(&self, width: usize) -> (usize, usize) {
+        if width == 0 {
+            return (self.cursor_row, self.cursor_display_col());
+        }
+        let prev_vis_rows: usize = (0..self.cursor_row)
+            .map(|r| Self::line_visual_rows(&self.lines[r], width))
+            .sum();
+        let disp_col = self.cursor_display_col();
+        (prev_vis_rows + disp_col / width, disp_col % width)
     }
 }

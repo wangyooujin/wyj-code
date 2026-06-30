@@ -18,6 +18,11 @@ impl Session {
         self.messages.push(Message::user(text));
     }
 
+    /// 推送含多个内容块的用户消息（支持图片/文件附件）
+    pub fn push_user_with_blocks(&mut self, blocks: Vec<ContentBlock>) {
+        self.messages.push(Message { role: Role::User, content: blocks });
+    }
+
     pub fn push_assistant(&mut self, blocks: Vec<ContentBlock>) {
         self.messages.push(Message {
             role: Role::Assistant,

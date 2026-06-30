@@ -379,6 +379,29 @@ async fn repl(
             continue;
         }
 
+        // ── ! Bash 内联执行 ──────────────────────────────────────────────────
+        if let Some(cmd_str) = trimmed.strip_prefix('!') {
+            let cmd_str = cmd_str.trim();
+            use std::process::Command;
+            match Command::new("sh").arg("-c").arg(cmd_str).output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stdout.is_empty() {
+                        print!("{stdout}");
+                    }
+                    if !stderr.is_empty() {
+                        eprint!("{stderr}");
+                    }
+                    if !out.status.success() {
+                        eprintln!("[exit {}]", out.status.code().unwrap_or(-1));
+                    }
+                }
+                Err(e) => eprintln!("执行失败: {e}"),
+            }
+            continue;
+        }
+
         let home_dir = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();

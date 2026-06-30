@@ -6,8 +6,8 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -163,6 +163,19 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
+/// 待发送附件（图片或文件）
+#[derive(Debug, Clone)]
+pub enum Attachment {
+    Image {
+        media_type: String,
+        data: String,
+        preview_label: String,
+    },
+    File {
+        path: std::path::PathBuf,
+    },
+}
+
 // ── 工具展示帮助函数 ─────────────────────────────────────────────────────────
 
 /// 从工具输入 JSON 中提取用于展示的参数字符串（如文件路径或命令）
@@ -260,6 +273,42 @@ fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
+// ── 附件辅助函数 ──────────────────────────────────────────────────────────────
+
+/// 将 arboard 返回的 RGBA 字节编码为 PNG 字节序列
+fn encode_rgba_to_png(bytes: &[u8], width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut encoder = png::Encoder::new(&mut buf, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(bytes)?;
+    drop(writer);
+    Ok(buf)
+}
+
+/// 判断粘贴文本是否像文件路径（绝对路径或以 ~/ ./ 开头，单行）
+fn looks_like_file_path(s: &str) -> bool {
+    let s = s.trim();
+    !s.contains('\n')
+        && (s.starts_with('/') || s.starts_with("~/") || s.starts_with("./"))
+}
+
+/// 展开 ~/ 前缀并检查文件是否存在，仅当是普通文件时返回 Some
+fn try_resolve_path(s: &str) -> Option<std::path::PathBuf> {
+    let s = s.trim();
+    if !looks_like_file_path(s) {
+        return None;
+    }
+    let path = if let Some(rest) = s.strip_prefix("~/") {
+        let home = std::env::var("HOME").ok()?;
+        std::path::PathBuf::from(format!("{home}/{rest}"))
+    } else {
+        std::path::PathBuf::from(s)
+    };
+    if path.exists() && path.is_file() { Some(path) } else { None }
+}
+
 /// 全局 UI 状态
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
@@ -301,6 +350,8 @@ pub struct AppState {
     pub session_picker: Option<SessionPickerState>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
+    /// 待发送附件列表（图片或文件，发送时附到消息）
+    pub pending_attachments: Vec<Attachment>,
 }
 
 impl AppState {
@@ -334,6 +385,7 @@ impl AppState {
             current_todos: None,
             session_picker: None,
             save_needed: false,
+            pending_attachments: vec![],
         }
     }
 
@@ -355,6 +407,7 @@ impl AppState {
         if let Some(dlg) = self.ask_question_dialog.take() {
             let _ = dlg.response_tx.send(None);
         }
+        self.pending_attachments.clear();
     }
 
     fn push_user(&mut self, text: String) {
@@ -486,7 +539,7 @@ pub async fn run_tui(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -510,7 +563,7 @@ pub async fn run_tui(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     result
@@ -702,15 +755,43 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         if event::poll(std::time::Duration::from_millis(50))? {
             let ev = event::read()?;
             match ev {
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                Event::Paste(pasted) if !state.is_thinking => {
+                    // 优先检查剪贴板是否有图片
+                    let has_image = match arboard::Clipboard::new() {
+                        Ok(mut cb) => match cb.get_image() {
+                            Ok(img) => {
+                                match encode_rgba_to_png(&img.bytes, img.width as u32, img.height as u32) {
+                                    Ok(png_bytes) => {
+                                        use base64::Engine as _;
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&png_bytes);
+                                        let label = format!("{}×{}", img.width, img.height);
+                                        state.pending_attachments.push(Attachment::Image {
+                                            media_type: "image/png".to_string(),
+                                            data: b64,
+                                            preview_label: label,
+                                        });
+                                        true
+                                    }
+                                    Err(_) => false,
+                                }
+                            }
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    };
+
+                    if !has_image {
+                        // 文件路径检测
+                        if let Some(path) = try_resolve_path(pasted.trim()) {
+                            state.pending_attachments.push(Attachment::File { path });
+                        } else {
+                            // 普通文字粘贴
+                            input.insert_text(&pasted);
+                            update_slash_completions(&mut state, &input, &cmd_registry);
+                        }
                     }
-                    MouseEventKind::ScrollDown => {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                    }
-                    _ => {}
-                },
+                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {
@@ -1106,6 +1187,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         state.messages.clear();
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
+                                        state.pending_attachments.clear();
                                         let mut sess = session.lock().await;
                                         *sess = Session::new();
                                         state.messages.push(ChatMessage::assistant(
@@ -1338,10 +1420,30 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 state.input_history.push(trimmed);
                             } else {
                                 // ── 普通消息 → 发给 agent ───────────────────
-                                state.push_user(text.clone());
+                                // 构建显示用文本（含附件摘要）
+                                let display_text = if state.pending_attachments.is_empty() {
+                                    text.clone()
+                                } else {
+                                    let mut s = text.clone();
+                                    for att in &state.pending_attachments {
+                                        match att {
+                                            Attachment::Image { preview_label, .. } => {
+                                                s.push_str(&format!("\n[图片 {preview_label}]"));
+                                            }
+                                            Attachment::File { path } => {
+                                                s.push_str(&format!("\n[附件 {}]", path.display()));
+                                            }
+                                        }
+                                    }
+                                    s
+                                };
+                                state.push_user(display_text);
                                 state.input_history.push(text.clone());
                                 state.is_thinking = true;
                                 state.spinner_frame = 0;
+
+                                // 捕获并清空附件列表（移入 async task）
+                                let attachments = std::mem::take(&mut state.pending_attachments);
 
                                 let agent_c = shared_agent.read().unwrap().clone();
                                 let session_c = session.clone();
@@ -1352,7 +1454,43 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
                                 let handle = tokio::spawn(async move {
                                     let mut sess = session_c.lock().await;
-                                    sess.push_user(text);
+                                    if attachments.is_empty() {
+                                        sess.push_user(text);
+                                    } else {
+                                        let mut blocks =
+                                            vec![ContentBlock::Text { text }];
+                                        for att in attachments {
+                                            match att {
+                                                Attachment::Image {
+                                                    media_type,
+                                                    data,
+                                                    ..
+                                                } => {
+                                                    blocks.push(ContentBlock::Image {
+                                                        media_type,
+                                                        data,
+                                                    });
+                                                }
+                                                Attachment::File { path } => {
+                                                    let content = tokio::fs::read_to_string(&path)
+                                                        .await
+                                                        .unwrap_or_else(|e| {
+                                                            format!(
+                                                                "[文件读取失败 {}: {e}]",
+                                                                path.display()
+                                                            )
+                                                        });
+                                                    blocks.push(ContentBlock::Text {
+                                                        text: format!(
+                                                            "\n\n<file path=\"{}\">\n{content}\n</file>",
+                                                            path.display()
+                                                        ),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        sess.push_user_with_blocks(blocks);
+                                    }
                                     let current_mode = mode_arc.lock().await.clone();
                                     let mut ctx = ToolCtx::new(&ctx_cwd);
                                     ctx.permission_mode = mode_to_permission(&current_mode);
@@ -1487,6 +1625,39 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         .find(|m| matches!(m.role, MessageRole::ToolResult))
                                     {
                                         last_tool.expanded = !last_tool.expanded;
+                                    }
+                                }
+                                'y' => {
+                                    // Ctrl+Y — 复制最后一条 AI 回复到系统剪贴板
+                                    if let Some(text) = state
+                                        .messages
+                                        .iter()
+                                        .rev()
+                                        .find(|m| {
+                                            matches!(m.role, MessageRole::Assistant)
+                                                && !m.is_error
+                                        })
+                                        .map(|m| m.content.clone())
+                                    {
+                                        match arboard::Clipboard::new() {
+                                            Ok(mut cb) => match cb.set_text(text) {
+                                                Ok(()) => {
+                                                    state.messages.push(ChatMessage::system(
+                                                        "已复制最后一条 AI 回复到剪贴板".to_string(),
+                                                    ));
+                                                }
+                                                Err(e) => {
+                                                    state.messages.push(ChatMessage::system(
+                                                        format!("复制失败: {e}"),
+                                                    ));
+                                                }
+                                            },
+                                            Err(e) => {
+                                                state.messages.push(ChatMessage::system(
+                                                    format!("剪贴板访问失败: {e}"),
+                                                ));
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}

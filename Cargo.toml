@@ -67,6 +67,10 @@ encoding_rs = "0.8"
 regex = "1"
 # Markdown 解析（TUI 渲染）
 pulldown-cmark = { version = "0.12", default-features = false }
+# 剪贴板（图片粘贴 + Ctrl+Y 复制）
+arboard = "3"
+base64 = "0.22"
+png = "0.17"
 
 # 内部 crate
 wyj-config = { path = "crates/config" }
