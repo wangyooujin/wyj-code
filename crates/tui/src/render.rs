@@ -1,6 +1,6 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, AskQuestionDialog, MessageRole, PermissionDialog};
+use crate::app::{AppState, AskQuestionDialog, MessageRole, PermissionDialog, SessionPickerState};
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
@@ -86,6 +86,11 @@ pub fn draw(f: &mut Frame, state: &AppState, input: &InputBox) {
     // 权限对话框仍以浮层叠加（后渲染的在前）
     if let Some(dlg) = &state.permission_dialog {
         draw_permission_dialog(f, dlg, area);
+    }
+
+    // 会话选择器叠加在最顶层
+    if let Some(picker) = &state.session_picker {
+        draw_session_picker(f, picker, area);
     }
 }
 
@@ -730,4 +735,153 @@ fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
 
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
+}
+
+// ─── 会话选择器 ───────────────────────────────────────────────────────────────
+
+fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
+    let n_sessions = picker.sessions.len();
+    // 显示项：1条"新建会话" + 1条分割线 + n条历史 + 1条分割线 + 1条提示 = n+4
+    let height = ((n_sessions as u16 + 4).max(5)).min(area.height.saturating_sub(4));
+    let width = (area.width * 4 / 5).min(92).max(50);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" 会话列表 ({n_sessions}) "),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let w = inner.width as usize;
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // "新建会话" 条目（selected == 0 时高亮）
+    if picker.selected == 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ▶ {:<w$}", "+ 新建会话", w = w.saturating_sub(4)),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("    {:<w$}", "+ 新建会话", w = w.saturating_sub(4)),
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    if !picker.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(w),
+            Theme::border(),
+        )));
+
+        for (i, meta) in picker.sessions.iter().enumerate() {
+            let selected = picker.selected == i + 1;
+
+            // cwd 缩短显示（取最后一级目录名）
+            let cwd_short = if !home.is_empty() && meta.cwd.starts_with(&home) {
+                format!("~{}", &meta.cwd[home.len()..])
+            } else {
+                meta.cwd.clone()
+            };
+            let cwd_last = cwd_short
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&cwd_short)
+                .to_string();
+
+            let time_str = format_relative_time(&meta.timestamp);
+            let right = format!("  {}  {}  {}轮", time_str, cwd_last, meta.turns);
+            let right_w = right.chars().count();
+            let title_w = w.saturating_sub(right_w + 4);
+            let title = truncate_chars(&meta.title, title_w);
+
+            let line_str = format!("    {:<tw$}{}", title, right, tw = title_w);
+            let line_str: String = line_str.chars().take(w).collect();
+
+            if selected {
+                lines.push(Line::from(Span::styled(
+                    line_str,
+                    Style::default()
+                        .bg(Color::Blue)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                lines.push(Line::from(Span::raw(line_str)));
+            }
+        }
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    lines.push(Line::from(Span::styled(
+        "  ↑↓ 导航  Enter 选择  Esc 取消",
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
+
+/// 将 ISO 8601 时间戳格式化为相对时间字符串
+fn format_relative_time(timestamp: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let ts = parse_iso_to_secs(timestamp).unwrap_or(now);
+    let diff = now.saturating_sub(ts);
+
+    if diff < 60 {
+        "刚才".to_string()
+    } else if diff < 3600 {
+        format!("{}分钟前", diff / 60)
+    } else if diff < 86400 {
+        format!("{}小时前", diff / 3600)
+    } else if diff < 7 * 86400 {
+        format!("{}天前", diff / 86400)
+    } else {
+        timestamp.get(..10).unwrap_or(timestamp).to_string()
+    }
+}
+
+/// 粗略地将 ISO 8601 字符串（"2024-06-29T15:30:45Z"）解析为 Unix 秒
+fn parse_iso_to_secs(s: &str) -> Option<u64> {
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut dp = date.split('-');
+    let year: u64 = dp.next()?.parse().ok()?;
+    let month: u64 = dp.next()?.parse().ok()?;
+    let day: u64 = dp.next()?.parse().ok()?;
+    let mut tp = time.split(':');
+    let h: u64 = tp.next()?.parse().ok()?;
+    let m: u64 = tp.next()?.parse().ok()?;
+    let sec: u64 = tp.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // 粗略计算（不考虑闰年/闰秒，仅用于相对时间展示）
+    let y_days = (year.saturating_sub(1970)) * 365;
+    let mo_days: u64 = [0u64, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+        .get((month as usize).saturating_sub(1))
+        .copied()
+        .unwrap_or(0);
+    Some((y_days + mo_days + day.saturating_sub(1)) * 86400 + h * 3600 + m * 60 + sec)
 }
