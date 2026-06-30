@@ -454,13 +454,15 @@ impl Ctx {
             }
         }
 
-        // 若表格超出可用宽度，按比例压缩（最小 4）
+        // 若表格超出可用宽度，只压缩宽列（保留窄列，最小 4）
         let total = col_w.iter().sum::<usize>() + ncols * 3 + 1;
         if total > self.max_width && ncols > 0 {
             let avail = self.max_width.saturating_sub(ncols * 3 + 1);
             let max_col = (avail / ncols).max(4);
             for w in &mut col_w {
-                *w = (*w).min(max_col);
+                if *w > max_col {
+                    *w = max_col;
+                }
             }
         }
 
