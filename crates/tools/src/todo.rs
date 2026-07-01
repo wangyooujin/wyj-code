@@ -164,3 +164,206 @@ impl Tool for TodoWriteTool {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ctx::ToolCtx;
+    use serde_json::json;
+
+    fn empty_store() -> Arc<Mutex<TodoStore>> {
+        Arc::new(Mutex::new(TodoStore::default()))
+    }
+
+    fn make_ctx() -> ToolCtx {
+        ToolCtx::new(std::env::temp_dir())
+    }
+
+    #[test]
+    fn status_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&TodoStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TodoStatus::InProgress).unwrap(),
+            "\"in_progress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TodoStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+    }
+
+    #[test]
+    fn status_deserializes_in_progress_with_underscore() {
+        let s: TodoStatus = serde_json::from_str("\"in_progress\"").unwrap();
+        assert_eq!(s, TodoStatus::InProgress);
+        assert!(serde_json::from_str::<TodoStatus>("\"in-progress\"").is_err());
+    }
+
+    #[test]
+    fn status_display_format() {
+        assert_eq!(TodoStatus::Pending.to_string(), "[ ]");
+        assert_eq!(TodoStatus::InProgress.to_string(), "[~]");
+        assert_eq!(TodoStatus::Completed.to_string(), "[x]");
+    }
+
+    #[test]
+    fn render_text_empty_store() {
+        assert_eq!(TodoStore::default().render_text(), "任务列表为空");
+    }
+
+    #[test]
+    fn render_text_includes_priority_and_id() {
+        let store = TodoStore {
+            items: vec![TodoItem {
+                id: "t1".into(),
+                content: "写文档".into(),
+                status: TodoStatus::Pending,
+                priority: Some("high".into()),
+            }],
+        };
+        let out = store.render_text();
+        assert!(out.contains("[ ]"));
+        assert!(out.contains("[high]"));
+        assert!(out.contains("写文档"));
+        assert!(out.contains("(t1)"));
+    }
+
+    #[tokio::test]
+    async fn run_writes_items_and_returns_summary() {
+        let store = empty_store();
+        let tool = TodoWriteTool::new(store.clone());
+        let r = tool
+            .run(
+                json!({
+                    "todos": [
+                        {"id":"a","content":"task-a","status":"pending"},
+                        {"id":"b","content":"task-b","status":"in_progress"},
+                        {"id":"c","content":"task-c","status":"completed"}
+                    ]
+                }),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("3 项"));
+        assert!(r.content.contains("待处理 1"));
+        assert!(r.content.contains("进行中 1"));
+        assert!(r.content.contains("已完成 1"));
+        let g = store.lock().unwrap();
+        assert_eq!(g.items.len(), 3);
+        assert_eq!(g.items[1].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn run_is_overwrite_not_append() {
+        let store = empty_store();
+        let tool = TodoWriteTool::new(store.clone());
+        tool.run(
+            json!({"todos":[
+                {"id":"a","content":"x","status":"pending"},
+                {"id":"b","content":"y","status":"pending"},
+                {"id":"c","content":"z","status":"pending"}
+            ]}),
+            &make_ctx(),
+        )
+        .await
+        .unwrap();
+        tool.run(
+            json!({"todos":[{"id":"d","content":"only","status":"completed"}]}),
+            &make_ctx(),
+        )
+        .await
+        .unwrap();
+        let g = store.lock().unwrap();
+        assert_eq!(g.items.len(), 1);
+        assert_eq!(g.items[0].id, "d");
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_status() {
+        let r = TodoWriteTool::new(empty_store())
+            .run(
+                json!({"todos":[{"id":"a","content":"x","status":"done"}]}),
+                &make_ctx(),
+            )
+            .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_rejects_missing_required_field() {
+        let r = TodoWriteTool::new(empty_store())
+            .run(
+                json!({"todos":[{"id":"a","status":"pending"}]}),
+                &make_ctx(),
+            )
+            .await;
+        assert!(r.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_zero_items_is_valid() {
+        let store = empty_store();
+        let tool = TodoWriteTool::new(store.clone());
+        tool.run(
+            json!({"todos":[{"id":"x","content":"y","status":"pending"}]}),
+            &make_ctx(),
+        )
+        .await
+        .unwrap();
+        let r = tool.run(json!({"todos":[]}), &make_ctx()).await.unwrap();
+        assert!(!r.is_error);
+        assert!(r.content.contains("0 项"));
+        assert!(store.lock().unwrap().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_priority_defaults_to_none() {
+        let store = empty_store();
+        TodoWriteTool::new(store.clone())
+            .run(
+                json!({"todos":[{"id":"a","content":"x","status":"pending"}]}),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert!(store.lock().unwrap().items[0].priority.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_preserves_priority_when_provided() {
+        let store = empty_store();
+        TodoWriteTool::new(store.clone())
+            .run(
+                json!({"todos":[{"id":"a","content":"x","status":"pending","priority":"low"}]}),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.lock().unwrap().items[0].priority.as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn tool_name_is_todowrite() {
+        assert_eq!(TodoWriteTool::new(empty_store()).name(), "TodoWrite");
+    }
+
+    #[test]
+    fn definition_declares_required_todos_field() {
+        let def = TodoWriteTool::new(empty_store()).definition();
+        assert_eq!(def.name, "TodoWrite");
+        let req = def
+            .input_schema
+            .pointer("/required")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(req.iter().any(|v| v == "todos"));
+    }
+}

@@ -3423,6 +3423,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "unicode-width 0.2.0",
  "wyj-api",
  "wyj-commands",
  "wyj-config",

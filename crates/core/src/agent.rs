@@ -253,7 +253,7 @@ impl Agent {
                             Err(e) => (format!("工具执行错误: {e}"), true),
                         }
                     } else {
-                        (format!("工具 `{name}` 在当前模式下不被允许（plan 模式仅支持 read/glob/grep/web_fetch/ask_question）"), true)
+                        (format!("工具 `{name}` 在当前模式下不被允许"), true)
                     }
                 } else {
                     (format!("工具 `{name}` 未注册"), true)

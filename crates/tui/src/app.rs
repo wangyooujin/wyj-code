@@ -6,11 +6,12 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, KeyModifiers, MouseEventKind,
-        MouseButton, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyboardEnhancementFlags, KeyModifiers, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
+    style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
@@ -185,6 +186,12 @@ pub struct PlanApprovalDialog {
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
 }
 
+/// 检测到"计划已批准但仍在 plan 模式"时弹出的确认对话框
+pub struct ExecModeConfirmDialog {
+    pub pending_message: String,
+    pub pending_attachments: Vec<Attachment>,
+}
+
 /// 会话选择器状态（/sessions 命令触发）
 pub struct SessionPickerState {
     /// 历史会话列表（index 0 对应显示项 1，显示项 0 固定为"新建会话"）
@@ -356,6 +363,8 @@ pub struct AppState {
     pub ask_question_dialog: Option<AskQuestionDialog>,
     /// ExitPlanMode 触发的计划批准对话框
     pub plan_dialog: Option<PlanApprovalDialog>,
+    /// 检测到计划已批准仍在 plan 模式发消息时的确认对话框
+    pub exec_mode_confirm: Option<ExecModeConfirmDialog>,
     pub scroll_offset: u16,
     /// 上次渲染的聊天区可见行高（用于按页滚动）
     pub chat_height: u16,
@@ -409,10 +418,8 @@ pub struct AppState {
     pub turn_start_input_tokens: u32,
     /// 本轮对话开始时的 output_tokens 快照
     pub turn_start_output_tokens: u32,
-    /// 上次渲染的滚动条区域（用于鼠标点击 ▲▼ 箭头命中检测）
+    /// 上次渲染的滚动条区域（保留字段供将来用）
     pub scrollbar_area: Rect,
-    /// true = 鼠标捕获开启（滚轮滚动），false = 选择模式（终端原生文本选中）
-    pub mouse_capture: bool,
 }
 
 impl AppState {
@@ -424,6 +431,7 @@ impl AppState {
             permission_dialog: None,
             ask_question_dialog: None,
             plan_dialog: None,
+            exec_mode_confirm: None,
             scroll_offset: 0,
             chat_height: 20,
             total_input_tokens: 0,
@@ -458,7 +466,6 @@ impl AppState {
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
             scrollbar_area: Rect::default(),
-            mouse_capture: true,
         }
     }
 
@@ -483,6 +490,7 @@ impl AppState {
         if let Some(dlg) = self.plan_dialog.take() {
             let _ = dlg.response_tx.send(false);
         }
+        self.exec_mode_confirm = None;
         self.pending_attachments.clear();
     }
 
@@ -632,7 +640,6 @@ pub async fn run_tui(
     execute!(
         stdout,
         EnterAlternateScreen,
-        EnableMouseCapture,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
@@ -659,12 +666,31 @@ pub async fn run_tui(
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
         LeaveAlternateScreen,
         DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
-    result
+
+    match result {
+        Ok(Some(resumable_session_id)) => {
+            let mut stdout = io::stdout();
+            let _ = execute!(
+                stdout,
+                Print("\n"),
+                SetForegroundColor(Color::DarkGrey),
+                Print("恢复此会话："),
+                ResetColor,
+                Print("\n  wyj-code --resume "),
+                SetForegroundColor(Color::Cyan),
+                Print(&resumable_session_id),
+                ResetColor,
+                Print("\n"),
+            );
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// 循环切换 Agent 模式：Normal → Plan → Bypass → Normal
@@ -674,6 +700,41 @@ fn cycle_mode(mode: &AgentMode) -> AgentMode {
         AgentMode::Plan => AgentMode::Bypass,
         AgentMode::Bypass => AgentMode::Normal,
     }
+}
+
+/// 检测历史消息中最后一次 ExitPlanMode 调用是否已被用户批准
+fn has_plan_approved(messages: &[Message]) -> bool {
+    let mut last_id: Option<String> = None;
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolUse { id, name, .. } = block {
+                if name == "ExitPlanMode" {
+                    last_id = Some(id.clone());
+                }
+            }
+        }
+    }
+    let target_id = match last_id {
+        Some(id) => id,
+        None => return false,
+    };
+    for msg in messages {
+        for block in &msg.content {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = block
+            {
+                if tool_use_id == &target_id && !is_error {
+                    if let ToolResultContent::Text(s) = content {
+                        return s.contains("已批准计划");
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
@@ -699,6 +760,92 @@ fn plan_turn_agent(
     Arc::new(a)
 }
 
+/// 构建消息的聊天区显示文本（含附件摘要）
+fn build_display_text(text: &str, attachments: &[Attachment]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    let mut s = text.to_string();
+    for att in attachments {
+        match att {
+            Attachment::Image { preview_label, .. } => {
+                s.push_str(&format!("\n[图片 {preview_label}]"));
+            }
+            Attachment::File { path } => {
+                s.push_str(&format!("\n[附件 {}]", path.display()));
+            }
+        }
+    }
+    s
+}
+
+/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle
+#[allow(clippy::too_many_arguments)]
+fn spawn_agent_turn(
+    text: String,
+    attachments: Vec<Attachment>,
+    agent_c: Arc<Agent>,
+    session_c: Arc<Mutex<Session>>,
+    tx: mpsc::Sender<AgentEvent>,
+    ctx_cwd: PathBuf,
+    mode_arc: Arc<tokio::sync::Mutex<AgentMode>>,
+    ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
+) -> AbortHandle {
+    let handle = tokio::spawn(async move {
+        let mut sess = session_c.lock().await;
+        if attachments.is_empty() {
+            sess.push_user(text);
+        } else {
+            let mut blocks = vec![ContentBlock::Text { text }];
+            for att in attachments {
+                match att {
+                    Attachment::Image { media_type, data, .. } => {
+                        blocks.push(ContentBlock::Image { media_type, data });
+                    }
+                    Attachment::File { path } => {
+                        let content = tokio::fs::read_to_string(&path)
+                            .await
+                            .unwrap_or_else(|e| {
+                                format!("[文件读取失败 {}: {e}]", path.display())
+                            });
+                        blocks.push(ContentBlock::Text {
+                            text: format!(
+                                "\n\n<file path=\"{}\">\n{content}\n</file>",
+                                path.display()
+                            ),
+                        });
+                    }
+                }
+            }
+            sess.push_user_with_blocks(blocks);
+        }
+        let current_mode = mode_arc.lock().await.clone();
+        let mut ctx = ToolCtx::new(&ctx_cwd);
+        ctx.permission_mode = mode_to_permission(&current_mode);
+        ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+        let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
+        let tx2 = tx.clone();
+        let mut on_text = move |d: &str| {
+            let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
+        };
+        match turn_agent.run_turn(&mut sess, &ctx, &mut on_text).await {
+            Ok(_) => {
+                let _ = tx
+                    .send(AgentEvent::Usage {
+                        input: sess.total_input_tokens,
+                        output: sess.total_output_tokens,
+                    })
+                    .await;
+                let _ = tx.send(AgentEvent::TurnDone).await;
+            }
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Error(e.to_string())).await;
+            }
+        }
+    });
+    handle.abort_handle()
+}
+
 /// 根据 AgentMode 构建对应的 PermissionMode
 fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
     match mode {
@@ -709,6 +856,7 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "Write",        // 写计划文件
                 "Bash",         // 只读命令，由 system prompt 约束
                 "ExitPlanMode", // 提交计划并请求批准
+                "TodoWrite",    // 任务追踪，plan 模式同样有用
             ]
             .iter()
             .map(|s| s.to_string())
@@ -886,7 +1034,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     context_window: u32,
     mode: AgentMode,
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     let mut state = AppState::new(cwd.clone(), model_name, context_window, mode);
     let mut input = InputBox::new();
@@ -945,6 +1093,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             "已恢复会话  共 {} 条消息",
             init_sess.messages.len()
         )));
+        if state.mode == AgentMode::Plan && has_plan_approved(&init_sess.messages) {
+            state.messages.push(ChatMessage::system(
+                "上轮会话计划已批准，继续输入时会提示切换执行模式".to_string(),
+            ));
+        }
         state.scroll_offset = 0;
     }
     let session = Arc::new(Mutex::new(init_sess));
@@ -1058,31 +1211,6 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         }
                     }
                 }
-                Event::Mouse(mouse) => {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            state.scroll_offset = state.scroll_offset.saturating_add(3);
-                        }
-                        MouseEventKind::ScrollDown => {
-                            state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                        }
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let sb = state.scrollbar_area;
-                            let col = mouse.column;
-                            let row = mouse.row;
-                            if col == sb.x && sb.height > 0 {
-                                if row == sb.y {
-                                    // 点击 ▲ 跳到最顶
-                                    state.scroll_offset = u16::MAX;
-                                } else if row == sb.y + sb.height - 1 {
-                                    // 点击 ▼ 跳到最底
-                                    state.scroll_offset = 0;
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {
@@ -1165,6 +1293,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
                                                     sess.messages = file.messages;
+                                                    let plan_approved =
+                                                        has_plan_approved(&sess.messages);
                                                     drop(sess);
                                                     current_session_id = file.session_id.clone();
                                                     state.messages = display_msgs;
@@ -1178,6 +1308,14 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                             file.session_id, file.turns
                                                         ),
                                                     ));
+                                                    if state.mode == AgentMode::Plan
+                                                        && plan_approved
+                                                    {
+                                                        state.messages.push(ChatMessage::system(
+                                                            "该会话计划已批准，继续输入时会提示切换执行模式"
+                                                                .to_string(),
+                                                        ));
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     state.messages.push(
@@ -1221,6 +1359,78 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         "已取消，继续保持 plan 模式。".to_string(),
                                     ));
                                 }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ①.5 检测到计划已批准仍在 plan 模式发消息 → 确认切换执行模式
+                    if state.exec_mode_confirm.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                if let Some(dlg) = state.exec_mode_confirm.take() {
+                                    let new_mode = AgentMode::Normal;
+                                    *shared_mode.lock().await = new_mode.clone();
+                                    state.mode = new_mode;
+                                    state.messages.push(ChatMessage::system(
+                                        "已切换至执行模式。".to_string(),
+                                    ));
+                                    let display_text = build_display_text(
+                                        &dlg.pending_message,
+                                        &dlg.pending_attachments,
+                                    );
+                                    state.push_user(display_text);
+                                    state.is_thinking = true;
+                                    state.spinner_frame = 0;
+                                    state.turn_start_time = Some(Instant::now());
+                                    state.turn_start_input_tokens = state.total_input_tokens;
+                                    state.turn_start_output_tokens = state.total_output_tokens;
+                                    let agent_c = shared_agent.read().unwrap().clone();
+                                    let handle = spawn_agent_turn(
+                                        dlg.pending_message,
+                                        dlg.pending_attachments,
+                                        agent_c,
+                                        session.clone(),
+                                        agent_tx.clone(),
+                                        cwd.clone(),
+                                        shared_mode.clone(),
+                                        ui_ask_tx.clone(),
+                                    );
+                                    state.current_task = Some(handle);
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                if let Some(dlg) = state.exec_mode_confirm.take() {
+                                    let display_text = build_display_text(
+                                        &dlg.pending_message,
+                                        &dlg.pending_attachments,
+                                    );
+                                    state.push_user(display_text);
+                                    state.is_thinking = true;
+                                    state.spinner_frame = 0;
+                                    state.turn_start_time = Some(Instant::now());
+                                    state.turn_start_input_tokens = state.total_input_tokens;
+                                    state.turn_start_output_tokens = state.total_output_tokens;
+                                    let agent_c = shared_agent.read().unwrap().clone();
+                                    let handle = spawn_agent_turn(
+                                        dlg.pending_message,
+                                        dlg.pending_attachments,
+                                        agent_c,
+                                        session.clone(),
+                                        agent_tx.clone(),
+                                        cwd.clone(),
+                                        shared_mode.clone(),
+                                        ui_ask_tx.clone(),
+                                    );
+                                    state.current_task = Some(handle);
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.exec_mode_confirm = None;
+                                state.messages.push(ChatMessage::system(
+                                    "已取消发送。".to_string(),
+                                ));
                             }
                             _ => {}
                         }
@@ -1427,19 +1637,6 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             } else {
                                 state.last_esc = Some(Instant::now());
                             }
-                        }
-                        continue;
-                    }
-
-                    // Ctrl+T → 切换鼠标捕获模式（滚动 ↔ 文本选择）
-                    if key.code == KeyCode::Char('t')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        state.mouse_capture = !state.mouse_capture;
-                        if state.mouse_capture {
-                            let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
-                        } else {
-                            let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
                         }
                         continue;
                     }
@@ -1784,6 +1981,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
                                                     sess.messages = file.messages;
+                                                    let plan_approved =
+                                                        has_plan_approved(&sess.messages);
                                                     drop(sess);
                                                     current_session_id = file.session_id.clone();
                                                     state.messages = display_msgs;
@@ -1797,6 +1996,14 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                             file.session_id, file.turns
                                                         ),
                                                     ));
+                                                    if state.mode == AgentMode::Plan
+                                                        && plan_approved
+                                                    {
+                                                        state.messages.push(ChatMessage::system(
+                                                            "该会话计划已批准，继续输入时会提示切换执行模式"
+                                                                .to_string(),
+                                                        ));
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     state.messages.push(
@@ -1826,105 +2033,50 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 // ── 普通消息 → 发给 agent ───────────────────
                                 // 展开 @file 引用 → 追加到 pending_attachments
                                 expand_at_refs_to_attachments(&text, &cwd, &mut state.pending_attachments);
-                                // 构建显示用文本（含附件摘要）
-                                let display_text = if state.pending_attachments.is_empty() {
-                                    text.clone()
+
+                                // plan 模式下若历史中已有获批的 ExitPlanMode → 拦截，弹确认框
+                                let plan_already_approved = matches!(state.mode, AgentMode::Plan)
+                                    && session
+                                        .try_lock()
+                                        .map(|sess| has_plan_approved(&sess.messages))
+                                        .unwrap_or(false);
+
+                                if plan_already_approved {
+                                    state.exec_mode_confirm = Some(ExecModeConfirmDialog {
+                                        pending_message: text.clone(),
+                                        pending_attachments: std::mem::take(
+                                            &mut state.pending_attachments,
+                                        ),
+                                    });
+                                    state.input_history.push(text);
                                 } else {
-                                    let mut s = text.clone();
-                                    for att in &state.pending_attachments {
-                                        match att {
-                                            Attachment::Image { preview_label, .. } => {
-                                                s.push_str(&format!("\n[图片 {preview_label}]"));
-                                            }
-                                            Attachment::File { path } => {
-                                                s.push_str(&format!("\n[附件 {}]", path.display()));
-                                            }
-                                        }
-                                    }
-                                    s
-                                };
-                                state.push_user(display_text);
-                                state.input_history.push(text.clone());
-                                state.is_thinking = true;
-                                state.spinner_frame = 0;
-                                state.turn_start_time = Some(Instant::now());
-                                state.turn_start_input_tokens = state.total_input_tokens;
-                                state.turn_start_output_tokens = state.total_output_tokens;
+                                    let display_text = build_display_text(
+                                        &text,
+                                        &state.pending_attachments,
+                                    );
+                                    state.push_user(display_text);
+                                    state.input_history.push(text.clone());
+                                    state.is_thinking = true;
+                                    state.spinner_frame = 0;
+                                    state.turn_start_time = Some(Instant::now());
+                                    state.turn_start_input_tokens = state.total_input_tokens;
+                                    state.turn_start_output_tokens = state.total_output_tokens;
 
-                                // 捕获并清空附件列表（移入 async task）
-                                let attachments = std::mem::take(&mut state.pending_attachments);
-
-                                let agent_c = shared_agent.read().unwrap().clone();
-                                let session_c = session.clone();
-                                let tx = agent_tx.clone();
-                                let ctx_cwd = cwd.clone();
-                                let mode_arc = shared_mode.clone();
-                                let ui_ask_tx_clone = ui_ask_tx.clone();
-
-                                let handle = tokio::spawn(async move {
-                                    let mut sess = session_c.lock().await;
-                                    if attachments.is_empty() {
-                                        sess.push_user(text);
-                                    } else {
-                                        let mut blocks =
-                                            vec![ContentBlock::Text { text }];
-                                        for att in attachments {
-                                            match att {
-                                                Attachment::Image {
-                                                    media_type,
-                                                    data,
-                                                    ..
-                                                } => {
-                                                    blocks.push(ContentBlock::Image {
-                                                        media_type,
-                                                        data,
-                                                    });
-                                                }
-                                                Attachment::File { path } => {
-                                                    let content = tokio::fs::read_to_string(&path)
-                                                        .await
-                                                        .unwrap_or_else(|e| {
-                                                            format!(
-                                                                "[文件读取失败 {}: {e}]",
-                                                                path.display()
-                                                            )
-                                                        });
-                                                    blocks.push(ContentBlock::Text {
-                                                        text: format!(
-                                                            "\n\n<file path=\"{}\">\n{content}\n</file>",
-                                                            path.display()
-                                                        ),
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        sess.push_user_with_blocks(blocks);
-                                    }
-                                    let current_mode = mode_arc.lock().await.clone();
-                                    let mut ctx = ToolCtx::new(&ctx_cwd);
-                                    ctx.permission_mode = mode_to_permission(&current_mode);
-                                    ctx.ui_ask_tx = Some(ui_ask_tx_clone);
-                                    let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
-                                    let tx2 = tx.clone();
-                                    let mut on_text = move |d: &str| {
-                                        let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
-                                    };
-                                    match turn_agent.run_turn(&mut sess, &ctx, &mut on_text).await {
-                                        Ok(_) => {
-                                            let _ = tx
-                                                .send(AgentEvent::Usage {
-                                                    input: sess.total_input_tokens,
-                                                    output: sess.total_output_tokens,
-                                                })
-                                                .await;
-                                            let _ = tx.send(AgentEvent::TurnDone).await;
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(AgentEvent::Error(e.to_string())).await;
-                                        }
-                                    }
-                                });
-                                state.current_task = Some(handle.abort_handle());
+                                    // 捕获并清空附件列表（移入 async task）
+                                    let attachments = std::mem::take(&mut state.pending_attachments);
+                                    let agent_c = shared_agent.read().unwrap().clone();
+                                    let handle = spawn_agent_turn(
+                                        text,
+                                        attachments,
+                                        agent_c,
+                                        session.clone(),
+                                        agent_tx.clone(),
+                                        cwd.clone(),
+                                        shared_mode.clone(),
+                                        ui_ask_tx.clone(),
+                                    );
+                                    state.current_task = Some(handle);
+                                }
                             }
                         }
                     } else if key.code == KeyCode::PageUp {
@@ -1943,9 +2095,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     {
                         // Ctrl+End：跳到最底（最新消息）
                         state.scroll_offset = 0;
-                    } else if key.code == KeyCode::Up && !state.is_thinking {
-                        // 输入历史导航（仅在无补全列表时）
-                        if state.slash_completions.is_empty() {
+                    } else if key.code == KeyCode::Up {
+                        // 输入框空 → 滚动聊天区（含鼠标滚轮上滚转来的 Up）
+                        // 输入框有内容 → 历史导航
+                        if input.is_empty() && state.slash_completions.is_empty() {
+                            state.scroll_offset = state.scroll_offset.saturating_add(3);
+                        } else if !state.is_thinking && state.slash_completions.is_empty() {
                             let hist_len = state.input_history.len();
                             if hist_len > 0 {
                                 let new_idx = match state.history_idx {
@@ -1964,8 +2119,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 }
                             }
                         }
-                    } else if key.code == KeyCode::Down && !state.is_thinking {
-                        if state.slash_completions.is_empty() {
+                    } else if key.code == KeyCode::Down {
+                        // 输入框空 → 滚动聊天区（含鼠标滚轮下滚转来的 Down）
+                        // 输入框有内容 → 历史导航
+                        if input.is_empty() && state.slash_completions.is_empty() {
+                            state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                        } else if !state.is_thinking && state.slash_completions.is_empty() {
                             if let Some(idx) = state.history_idx {
                                 if idx + 1 < state.input_history.len() {
                                     let new_idx = idx + 1;
@@ -2119,6 +2278,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     }
 
     // 退出时保存完整会话文件
+    let mut resumable_session_id = None;
     if let Some(store) = &session_store {
         if let Ok(sess) = session.try_lock() {
             if !sess.messages.is_empty() {
@@ -2133,11 +2293,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     output_tokens: sess.total_output_tokens,
                     messages: sess.messages.clone(),
                 });
+                resumable_session_id = Some(current_session_id.clone());
             }
         }
     }
 
-    Ok(())
+    Ok(resumable_session_id)
 }
 
 /// 将 API Message 列表重建为 TUI 显示用的 ChatMessage 列表

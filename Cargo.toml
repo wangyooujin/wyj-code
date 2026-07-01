@@ -71,6 +71,8 @@ pulldown-cmark = { version = "0.12", default-features = false }
 arboard = "3"
 base64 = "0.22"
 png = "0.17"
+# 字符显示宽度（与 ratatui 保持一致）
+unicode-width = "0.2"
 
 # 内部 crate
 wyj-config = { path = "crates/config" }

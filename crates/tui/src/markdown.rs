@@ -8,49 +8,33 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── 字符宽度 ──────────────────────────────────────────────────────────────────
 
-/// 终端列宽：CJK 全角字符=2，其余=1
-fn char_width(c: char) -> usize {
-    let cp = c as u32;
-    if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
-        || (0x2E80..=0x9FFF).contains(&cp)   // CJK 各区块
-        || (0xA960..=0xA97F).contains(&cp)
-        || (0xAC00..=0xD7FF).contains(&cp)   // 谚文音节
-        || (0xF900..=0xFAFF).contains(&cp)
-        || (0xFE10..=0xFE1F).contains(&cp)
-        || (0xFE30..=0xFE4F).contains(&cp)
-        || (0xFF00..=0xFF60).contains(&cp)   // 全角字母
-        || (0xFFE0..=0xFFE6).contains(&cp)
-        || cp >= 0x2_0000
-    // 扩展区 B+
-    {
-        2
-    } else {
-        1
-    }
-}
-
+/// 与 ratatui 保持一致：用 unicode-width 0.2 计算终端显示列数
 pub fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    s.width()
 }
 
-/// 按显示宽度截断，超出后附 `…`
+/// 按显示宽度截断，超出后附 `…`（`…` 占 1 列）
 fn truncate_dw(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_string();
+    }
+    // 为 `…` 留出 1 列
+    let target = max.saturating_sub(1);
     let mut w = 0usize;
     let mut out = String::new();
-    let chars: Vec<char> = s.chars().collect();
-    for &c in &chars {
-        let cw = char_width(c);
-        if w + cw > max {
-            // 留一格放 …
-            out.push('…');
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(1);
+        if w + cw > target {
             break;
         }
         out.push(c);
         w += cw;
     }
+    out.push('…');
     out
 }
 
