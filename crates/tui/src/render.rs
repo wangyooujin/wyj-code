@@ -1,8 +1,9 @@
 //! 对话渲染与布局
 
 use crate::app::{
-    AppState, AskQuestionDialog, Attachment, ExecModeConfirmDialog, MessageRole, PermissionDialog,
-    PlanApprovalDialog, SessionPickerState, SettingsDialog, SETTINGS_API_KEY_FIELD_IDX,
+    AppState, AskQuestionDialog, Attachment, ExecModeConfirmDialog, MemoryDialog, MemoryRow,
+    MessageRole, PermissionDialog, PlanApprovalDialog, ProfileDialog, ProfileOverlay,
+    SessionPickerState, SettingsDialog, PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS,
     SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
@@ -16,6 +17,7 @@ use ratatui::{
     Frame,
 };
 use wyj_config::AgentMode;
+use wyj_core::ClaudeMdSource;
 use wyj_tools::todo::TodoStatus;
 
 /// 将 @token 渲染为青色高亮 Span，其余部分为普通文本
@@ -185,6 +187,16 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 设置面板叠加在最顶层
     if let Some(dialog) = &state.settings_dialog {
         draw_settings_dialog(f, dialog, area);
+    }
+
+    // 分组管理面板叠加在最顶层
+    if let Some(dialog) = &state.profile_dialog {
+        draw_profile_dialog(f, dialog, area);
+    }
+
+    // CLAUDE.md 记忆面板叠加在最顶层
+    if let Some(dialog) = &state.memory_dialog {
+        draw_memory_dialog(f, dialog, area);
     }
 }
 
@@ -1258,10 +1270,10 @@ fn mask_secret(s: &str) -> String {
 }
 
 fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
-    // 10 字段 + 分隔线 + 错误行 + 分隔线 + 提示行
-    let content_lines = SETTINGS_FIELD_COUNT as u16 + 4;
+    // 2 字段（log_level/language）+ 分隔线 + 错误行 + 提示行
+    let content_lines = SETTINGS_FIELD_COUNT as u16 + 3;
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
-    let width = (area.width * 7 / 10).clamp(60, 100).min(area.width);
+    let width = (area.width * 6 / 10).clamp(50, 90).min(area.width);
 
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -1288,23 +1300,13 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
     for idx in 0..SETTINGS_FIELD_COUNT {
         let label = wyj_i18n::tr(SETTINGS_FIELD_LABEL_KEYS[idx]);
         let selected = idx == dialog.selected;
-        let editing = selected && dialog.editing.is_some();
-
-        let value = if editing {
-            dialog.editing.as_ref().unwrap().lines.join("")
-        } else if idx == SETTINGS_API_KEY_FIELD_IDX {
-            mask_secret(&dialog.draft.api_key)
-        } else {
-            dialog.draft.display_value(idx)
-        };
+        let value = dialog.draft.display_value(idx);
 
         let marker = if selected { "▶ " } else { "  " };
         let text = format!("{marker}{label:<label_width$}{value}");
         let text = truncate_line(&text, w);
 
-        let style = if editing {
-            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
-        } else if selected {
+        let style = if selected {
             Style::default()
                 .fg(Theme::CLAUDE)
                 .add_modifier(Modifier::BOLD)
@@ -1330,16 +1332,344 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
 
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
+}
 
-    // 编辑态下把终端原生光标定位到对应字段行、值文本内的正确列
+/// CLAUDE.md 记忆面板渲染（/memory 命令触发）
+fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
+    let content_lines = dialog.rows.len() as u16 + 3; // 行列表 + 分隔线 + 错误行 + 提示行
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            wyj_i18n::tr("memory.dialog.title"),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+    let label_width = 10usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (idx, row) in dialog.rows.iter().enumerate() {
+        let selected = idx == dialog.selected;
+        let marker = if selected { "▶ " } else { "  " };
+
+        let text = match row {
+            MemoryRow::File(f) => {
+                let source_label = wyj_i18n::tr(match f.source {
+                    ClaudeMdSource::Global => "claude_md.source.global",
+                    ClaudeMdSource::Project => "claude_md.source.project",
+                    ClaudeMdSource::Subdir => "claude_md.source.subdir",
+                });
+                let suffix = if f.exists {
+                    String::new()
+                } else {
+                    format!("  {}", wyj_i18n::tr("memory.dialog.not_found"))
+                };
+                format!("{marker}[{source_label:<4}] {}{suffix}", f.path.display())
+            }
+            MemoryRow::AutoMemoryToggle => {
+                let label = wyj_i18n::tr("memory.dialog.auto_memory_label");
+                let value = wyj_i18n::tr(if dialog.auto_memory_enabled {
+                    "memory.dialog.auto_memory_on"
+                } else {
+                    "memory.dialog.auto_memory_off"
+                });
+                format!("{marker}{label:<label_width$}{value}")
+            }
+            MemoryRow::AutoMemoryIndex { path, exists } => {
+                let label = wyj_i18n::tr("memory.dialog.auto_memory_index_label");
+                let value = if *exists {
+                    path.display().to_string()
+                } else {
+                    wyj_i18n::tr("memory.dialog.auto_memory_index_empty")
+                };
+                format!("{marker}{label:<label_width$}{value}")
+            }
+        };
+        let text = truncate_line(&text, w);
+
+        let style = if selected {
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("memory.dialog.hint"),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
+
+/// 分组管理面板渲染（/model 无参命令触发）
+fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
+    let rows = dialog.rows();
+    let content_lines = rows.len() as u16 + 4; // 行列表 + 分隔线 + 错误行 + 提示两行
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr("profile.title")),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+    let label_width = 18usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (row_idx, (entry_idx, field_idx)) in rows.iter().enumerate() {
+        let entry = &dialog.entries[*entry_idx];
+        let selected_row = row_idx == dialog.cursor;
+        let editing = selected_row && dialog.editing.is_some();
+
+        let text = match field_idx {
+            None => {
+                let marker = if *entry_idx == dialog.active_idx {
+                    "●"
+                } else {
+                    " "
+                };
+                let expand_marker = if dialog.expanded == Some(*entry_idx) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let cursor = if selected_row { "▶" } else { " " };
+                let summary = format!(
+                    "{} [{}] {}",
+                    entry.display_value(0),
+                    entry.model,
+                    entry.name
+                );
+                format!("{cursor} {expand_marker} {marker} {summary}")
+            }
+            Some(f_idx) => {
+                let label = wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*f_idx]);
+                let value = if editing {
+                    dialog.editing.as_ref().unwrap().lines.join("")
+                } else if *f_idx == PROFILE_API_KEY_FIELD_IDX {
+                    mask_secret(entry.text_value(*f_idx))
+                } else {
+                    entry.display_value(*f_idx)
+                };
+                let cursor = if selected_row { "▶" } else { " " };
+                format!("{cursor}     {label:<label_width$}{value}")
+            }
+        };
+        let text = truncate_line(&text, w);
+
+        let style = if editing {
+            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
+        } else if selected_row {
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate_line(&wyj_i18n::tr("profile.dialog.hint1"), w),
+        Theme::dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        truncate_line(&wyj_i18n::tr("profile.dialog.hint2"), w),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
     if let Some(ib) = &dialog.editing {
-        let (_, vis_col) = ib.cursor_visual_pos(w.saturating_sub(2 + label_width));
-        let cursor_x = (inner.x + (2 + label_width + vis_col) as u16)
+        let (_, vis_col) = ib.cursor_visual_pos(w.saturating_sub(7 + label_width));
+        let cursor_x = (inner.x + (7 + label_width + vis_col) as u16)
             .min(inner.x + inner.width.saturating_sub(1));
         let cursor_y =
-            (inner.y + dialog.selected as u16).min(inner.y + inner.height.saturating_sub(1));
+            (inner.y + dialog.cursor as u16).min(inner.y + inner.height.saturating_sub(1));
         f.set_cursor_position(Position::new(cursor_x, cursor_y));
     }
+
+    match &dialog.overlay {
+        ProfileOverlay::None => {}
+        ProfileOverlay::Renaming { input, .. } => {
+            draw_profile_text_overlay(
+                f,
+                area,
+                "profile.overlay.rename_title",
+                &input.lines.join(""),
+            );
+        }
+        ProfileOverlay::TemplatePicker { selected } => {
+            draw_profile_list_overlay(
+                f,
+                area,
+                "profile.overlay.template_title",
+                wyj_api::PROFILE_TEMPLATES
+                    .iter()
+                    .map(|t| {
+                        if t.note.is_empty() {
+                            t.label.to_string()
+                        } else {
+                            format!("{}  ({})", t.label, t.note)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                *selected,
+            );
+        }
+        ProfileOverlay::ConfirmDelete { entry_idx } => {
+            let name = &dialog.entries[*entry_idx].name;
+            draw_profile_text_overlay(
+                f,
+                area,
+                "profile.overlay.confirm_delete_title",
+                &wyj_i18n::tr_fmt("profile.overlay.confirm_delete_body", &[("name", name)]),
+            );
+        }
+        ProfileOverlay::FetchingModels { .. } => {
+            draw_profile_text_overlay(
+                f,
+                area,
+                "profile.overlay.fetching_title",
+                &wyj_i18n::tr("profile.fetch.in_progress"),
+            );
+        }
+        ProfileOverlay::ModelsPicker {
+            models, selected, ..
+        } => {
+            draw_profile_list_overlay(
+                f,
+                area,
+                "profile.overlay.models_title",
+                models.clone(),
+                *selected,
+            );
+        }
+    }
+}
+
+fn draw_profile_text_overlay(f: &mut Frame, area: Rect, title_key: &str, body: &str) {
+    let width = (area.width * 5 / 10).clamp(40, 70).min(area.width);
+    let height = 5u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr(title_key)),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+    let w = inner.width as usize;
+    let para = Paragraph::new(Text::from(vec![Line::from(truncate_line(body, w))]));
+    f.render_widget(para, inner);
+}
+
+fn draw_profile_list_overlay(
+    f: &mut Frame,
+    area: Rect,
+    title_key: &str,
+    items: Vec<String>,
+    selected: usize,
+) {
+    let width = (area.width * 6 / 10).clamp(40, 90).min(area.width);
+    let height = ((items.len() as u16) + 2)
+        .min(area.height.saturating_sub(2))
+        .max(4);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr(title_key)),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+    let w = inner.width as usize;
+
+    let lines: Vec<Line<'static>> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let marker = if i == selected { "▶ " } else { "  " };
+            let text = truncate_line(&format!("{marker}{item}"), w);
+            let style = if i == selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// 将 ISO 8601 时间戳格式化为相对时间字符串

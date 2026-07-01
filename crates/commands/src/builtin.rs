@@ -179,69 +179,10 @@ impl Command for MemoryCmd {
     fn usage(&self) -> String {
         "/memory".to_string()
     }
-    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
-        let pid = wyj_core::project_id(&ctx.cwd);
-        let mem_dir = ctx.home_dir.join(".wyj-code").join("memory").join(&pid);
-
-        if !mem_dir.exists() {
-            return Ok(CommandResult::Output(tr("memory.empty")));
-        }
-
-        let index_path = mem_dir.join("MEMORY.md");
-        if !index_path.exists() {
-            return Ok(CommandResult::Output(tr("memory.empty")));
-        }
-
-        let index = std::fs::read_to_string(&index_path)?;
-        if index.trim().is_empty() {
-            return Ok(CommandResult::Output(tr("memory.empty")));
-        }
-
-        let mut out = tr_fmt("memory.index_header", &[("index", &index)]);
-
-        // 读取各记忆文件正文
-        let mut details = Vec::new();
-        for line in index.lines() {
-            if let Some(fname) = extract_md_link(line) {
-                let fpath = mem_dir.join(&fname);
-                if let Ok(content) = std::fs::read_to_string(&fpath) {
-                    let body = strip_frontmatter(&content);
-                    if !body.trim().is_empty() {
-                        details.push(format!("### {fname}\n\n{}", body.trim()));
-                    }
-                }
-            }
-        }
-
-        if !details.is_empty() {
-            out.push_str(&tr("memory.detail_header"));
-            out.push_str(&details.join("\n\n---\n\n"));
-        }
-
-        Ok(CommandResult::Output(out))
-    }
-}
-
-fn extract_md_link(line: &str) -> Option<String> {
-    let start = line.find("](")? + 2;
-    let end = line[start..].find(')')? + start;
-    let target = line[start..end].trim();
-    if target.ends_with(".md") && !target.starts_with("http") {
-        Some(target.to_string())
-    } else {
-        None
-    }
-}
-
-fn strip_frontmatter(content: &str) -> &str {
-    if !content.starts_with("---") {
-        return content;
-    }
-    let after_first = &content[3..];
-    if let Some(pos) = after_first.find("\n---") {
-        &after_first[pos + 4..]
-    } else {
-        content
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        // 面板本体（列出当前会话适用的 CLAUDE.md 系文件 + auto-memory 开关/索引）
+        // 由 TUI 侧构建，此处只负责触发打开。
+        Ok(CommandResult::OpenMemoryDialog)
     }
 }
 
@@ -298,19 +239,24 @@ impl Command for DoctorCmd {
         // Provider + Model
         lines.push(tr_fmt(
             "doctor.provider",
-            &[("provider", &cfg.provider.to_string())],
+            &[("provider", &cfg.provider().to_string())],
         ));
         lines.push(tr_fmt("doctor.model", &[("model", &ctx.model)]));
 
-        // WYJ.md
-        let wyj_md = ctx.cwd.join("WYJ.md");
-        if wyj_md.exists() {
-            lines.push(tr_fmt(
-                "doctor.wyjmd_ok",
-                &[("path", &wyj_md.display().to_string())],
-            ));
+        // CLAUDE.md 系文件（全局 + 祖先链）
+        let claude_md_files = wyj_core::discover_files(&ctx.cwd);
+        let existing: Vec<String> = claude_md_files
+            .iter()
+            .filter(|f| f.exists)
+            .map(|f| f.path.display().to_string())
+            .collect();
+        if existing.is_empty() {
+            lines.push(tr("doctor.claude_md_missing"));
         } else {
-            lines.push(tr("doctor.wyjmd_missing"));
+            lines.push(tr_fmt(
+                "doctor.claude_md_ok",
+                &[("paths", &existing.join(", "))],
+            ));
         }
 
         // 记忆目录
@@ -365,16 +311,13 @@ impl Command for ModelCmd {
         tr("model.desc")
     }
     fn usage(&self) -> String {
-        "/model [model-name]".to_string()
+        "/model [profile-name]".to_string()
     }
-    async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
-        if args.is_empty() {
-            return Ok(CommandResult::Output(tr_fmt(
-                "model.current",
-                &[("model", &ctx.model)],
-            )));
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        if args.trim().is_empty() {
+            return Ok(CommandResult::OpenProfileDialog);
         }
-        Ok(CommandResult::SetModel(args.trim().to_string()))
+        Ok(CommandResult::SwitchProfile(args.trim().to_string()))
     }
 }
 
@@ -438,19 +381,14 @@ impl Command for InitCmd {
         "/init".to_string()
     }
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
-        let path = ctx.cwd.join("WYJ.md");
-        if path.exists() {
-            return Ok(CommandResult::Output(tr_fmt(
-                "init.exists",
-                &[("path", &path.display().to_string())],
-            )));
-        }
-        let content = tr_fmt("init.template", &[("cwd", &ctx.cwd.display().to_string())]);
-        std::fs::write(&path, content)?;
-        Ok(CommandResult::Output(tr_fmt(
-            "init.created",
-            &[("path", &path.display().to_string())],
-        )))
+        // 对齐真实 Claude Code：/init 不是静态模板写文件，而是触发一次真正的 agent
+        // 回合，让它自己去探索项目（Cargo.toml/package.json/README/目录结构等）
+        // 生成或合并改进 CLAUDE.md。已存在则要求读取后合并而非整体覆盖。
+        let prompt = tr_fmt(
+            "init.agent_prompt",
+            &[("cwd", &ctx.cwd.display().to_string())],
+        );
+        Ok(CommandResult::RunPrompt(prompt))
     }
 }
 

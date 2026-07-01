@@ -19,8 +19,16 @@ system_prompt:
     工具使用原则：Read 后才能 Write；Edit 前必须精确匹配。
     使用简洁、准确的中文与用户沟通，优先给出可运行的代码和具体的操作步骤。
   plan_mode: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（read / glob / grep / web_fetch）。\n不得写入、编辑文件或执行 shell 命令。\n请专注于分析代码、规划方案、解释架构。"
-  wyjmd_header: "## 当前项目说明 (WYJ.md)\n\n{content}"
   plan_turn: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（Read/Glob/Grep/WebFetch/Bash）以及 Write（仅用于写入计划文档）。\n请先充分分析代码，然后将完整计划写入：`{path}`\n写完后调用 `ExitPlanMode` 工具提交计划，等待用户批准后才能执行。\nBash 命令只允许只读操作（ls/find/cat/grep 等），不得执行写入操作。"
+
+claude_md:
+  source:
+    global: "全局"
+    project: "项目"
+    subdir: "子目录"
+  reminder_intro: "以下是适用于当前项目的 CLAUDE.md 记忆文件内容，请遵照其中的指示行事。"
+  subdir_reminder_intro: "你刚访问的目录下存在额外的 CLAUDE.md 说明，请一并遵照："
+  section_header: "Contents of {path} ({source}):\n\n"
 
 cli:
   about: "wyj-code — 终端 AI 编程助手"
@@ -31,6 +39,8 @@ cli:
   bypass_help: "Bypass 模式：自动允许所有工具调用，不弹权限确认对话框"
   continue_help: "恢复上次会话（继续上次对话）"
   resume_help: "恢复指定会话 ID（如 sess-1719723000）"
+  profile_help: "一次性指定本次运行使用的调用分组（不落盘、不改 active_profile）"
+  profile_not_found: "未找到分组 '{name}'，请用 --config-status 查看已有分组"
 
 main:
   session_not_found: "未找到会话 {id}，将开始新会话。"
@@ -50,16 +60,19 @@ help:
     /help              显示此帮助
     /clear             清空对话历史
     /compact [提示]    手动压缩上下文，减少 token 消耗
-    /config            打开配置设置面板（provider/model/api_key/base_url/language 等）
+    /config            打开配置设置面板（log_level/language，全局设置）
     /cost              显示本会话 token 用量与费用估算
     /doctor            诊断环境（API Key / 配置 / 记忆）
-    /memory            查看项目跨会话记忆内容
-    /model [名称]      查看或切换 AI 模型（无参：显示当前）
+    /memory            打开 CLAUDE.md 记忆面板（列出全部生效文件，可选中打开系统编辑器
+                       编辑，含 auto-memory 开关与索引入口）
+    /model [分组名]    管理调用分组（provider/model/base_url/api_key 等）：
+                       无参数打开分组管理面板（新建/编辑/删除/切换）；
+                       带分组名直接切换到该分组，如 /model glm-cheap
     /plan              切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     /mode [模式]       切换运行模式（normal / plan / bypass）
     /resume [id]       恢复历史会话（无参数=选择器，有 id=直接恢复）
     /sessions          查看和切换历史会话
-    /init              在当前目录生成 WYJ.md 项目说明
+    /init              让 Agent 探索项目并生成/合并更新 CLAUDE.md
     /quit              退出 wyj-code
 
     快捷键:
@@ -99,13 +112,21 @@ cost:
   context_line: "上下文: {pct}% ({estimated} / {window} tokens)"
 
 memory:
-  desc: "查看当前项目的跨会话记忆内容"
-  empty: "当前项目暂无跨会话记忆。"
-  index_header: "## 项目记忆索引\n\n{index}\n"
-  detail_header: "\n---\n\n## 记忆详情\n\n"
+  desc: "打开 CLAUDE.md 记忆面板"
+  headless_unsupported: "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
+  dialog:
+    title: " ◆ CLAUDE.md 记忆 "
+    not_found: "（未创建，回车可新建）"
+    auto_memory_label: "auto-memory 自动记忆提取"
+    auto_memory_on: "已启用"
+    auto_memory_off: "已禁用"
+    auto_memory_index_label: "auto-memory 索引"
+    auto_memory_index_empty: "（暂无内容）"
+    hint: "↑↓ 选择   Enter 打开/切换   Esc 关闭"
+    editor_failed: "打开编辑器失败: {err}"
 
 doctor:
-  desc: "诊断运行环境（API Key / 配置 / WYJ.md / 记忆）"
+  desc: "诊断运行环境（API Key / 配置 / CLAUDE.md / 记忆）"
   header: "wyj-code v{version} 环境诊断\n"
   api_key_missing: "  ✗  API Key      未配置（请设置 WYJ_CODE_API_KEY 或 config.toml）"
   config_file_ok: "  ✓  配置文件    {path}"
@@ -113,8 +134,8 @@ doctor:
   config_dir_err: "  ✗  配置目录    {err}"
   provider: "  ✓  供应商      {provider}"
   model: "  ✓  模型        {model}"
-  wyjmd_ok: "  ✓  WYJ.md      {path}"
-  wyjmd_missing: "  ✗  WYJ.md      未找到（运行 /init 可生成）"
+  claude_md_ok: "  ✓  CLAUDE.md   {paths}"
+  claude_md_missing: "  ✗  CLAUDE.md   未找到（运行 /init 可生成）"
   memory_dir_with_count: "  ✓  记忆目录    {path} ({count} 条)"
   memory_dir_empty: "  ✗  记忆目录    {path} (暂无记忆)"
   mcp_configured: "  ✓  MCP 服务    {count} 个已配置"
@@ -122,6 +143,7 @@ doctor:
 
 status:
   api_key_ok: "  ✓  API Key      {prefix}... (已配置)"
+  active_profile: "激活分组: {name}"
   provider: "供应商:  {provider}"
   model: "模型:    {model}"
   plan_model: "Plan 模型: {model}"
@@ -129,13 +151,11 @@ status:
   endpoint: "端点:    {url}"
   api_key_configured: "API Key: {prefix}...（已配置）"
   api_key_error: "API Key: {err}"
+  other_profiles: "其他分组: {names}"
   mcp_servers: "MCP servers: {count}"
 
 model:
-  desc: "查看或切换 AI 模型 (如: /model claude-sonnet-4-6)"
-  current: "当前模型: {model}"
-  switched: "模型已切换至 {model}"
-  switch_failed: "[切换失败] {err}"
+  desc: "管理调用分组：/model 打开分组管理面板，/model <分组名> 直接切换"
 
 mode:
   desc: "切换运行模式: /mode [normal|plan|bypass]"
@@ -148,13 +168,23 @@ cwd:
   body: "工作目录: {cwd}"
 
 init:
-  desc: "在当前目录生成 WYJ.md 项目说明文件"
-  exists: "{path} 已存在"
-  created: "已创建 {path}"
-  template: "# 项目说明\n\n工作目录: {cwd}\n\n在此填写项目背景、技术栈、开发约定等信息，\n供 wyj-code AI 助手参考。\n"
+  desc: "让 Agent 探索项目并生成/合并更新 CLAUDE.md"
+  agent_prompt: |-
+    请为当前项目生成或更新 CLAUDE.md 记忆文件（工作目录：{cwd}）。
+
+    步骤：
+    1. 探索项目结构：查看 Cargo.toml/package.json/pyproject.toml/go.mod 等清单文件、README、
+       已有的 lint/CI 配置（如 .eslintrc、.golangci.yml、GitHub Actions workflow），
+       判断技术栈、构建命令、测试命令、代码规范。
+    2. 若 {cwd}/CLAUDE.md 已存在，先完整读取，在其基础上合并、补充、改进，
+       不要整体覆盖或丢弃已有内容。
+    3. 若项目中存在 AGENTS.md、.cursorrules 等其它 AI 助手规则文件，
+       阅读并将其中仍然适用的部分整合进 CLAUDE.md。
+    4. 最终把结果写入 {cwd}/CLAUDE.md，内容至少包含：项目概览、构建/测试/lint 命令、
+       代码架构说明、开发约定。保持简洁，避免臆测不确定的信息。
 
 config:
-  desc: "打开配置设置面板"
+  desc: "打开配置设置面板（log_level/language，全局设置）"
 
 resume:
   desc: "恢复历史会话 (无参数=选择器, /resume <session-id>=直接恢复)"
@@ -182,7 +212,7 @@ dialog:
 
 settings:
   title: "配置设置"
-  hint: "  ↑↓ 移动  Enter 编辑/切换  Ctrl+S 保存  Esc 取消"
+  hint: "  ↑↓ 移动  Enter/←→ 切换  Ctrl+S 保存  Esc 取消"
   saved: "配置已保存"
   save_failed: "配置保存失败: {err}"
   rebuild_failed: "配置已保存，但重建连接失败: {err}（当前会话仍使用旧配置，重启后生效）"
@@ -200,3 +230,30 @@ settings:
   error:
     invalid_max_tokens: "Max Tokens 必须是正整数"
     invalid_context_window: "Context Window 必须是正整数"
+
+profile:
+  title: "调用分组管理"
+  saved: "分组已保存"
+  switched: "已切换至分组 {name}"
+  switch_failed: "[切换失败] {err}"
+  not_found: "未找到分组 '{name}'"
+  headless_unsupported: "[headless 模式不支持 /model 管理分组，请在 TUI 模式下使用]"
+  dialog:
+    hint1: "  ↑↓ 移动  Enter 展开/编辑  a 激活  n 新建  d 删除  r 重命名"
+    hint2: "  Ctrl+L 拉取模型列表  Ctrl+S 保存  Esc 取消"
+  error:
+    empty_name: "分组名称不能为空"
+    duplicate_name: "分组名称重复，请改一个唯一的名字"
+    last_one: "至少保留一个分组"
+    delete_active: "请先切换到其他分组，再删除当前激活的分组"
+  fetch:
+    need_api_key: "请先填写 API Key 再拉取模型列表"
+    in_progress: "正在拉取模型列表…"
+    failed: "拉取模型列表失败: {err}（可继续手动输入模型名）"
+  overlay:
+    rename_title: "重命名分组"
+    template_title: "选择新建分组模板"
+    confirm_delete_title: "确认删除"
+    confirm_delete_body: "确定删除分组 '{name}' 吗？(y/Enter 确认，n/Esc 取消)"
+    fetching_title: "拉取模型列表"
+    models_title: "选择模型（↑↓ 选择，Enter 确认，Esc 取消）"
