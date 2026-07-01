@@ -26,6 +26,8 @@ pub enum CommandResult {
     OpenSessionPicker,
     /// 直接恢复指定 session（session-id）
     ResumeSession(String),
+    /// 打开配置设置面板（/config 命令触发）
+    OpenSettingsDialog,
 }
 
 /// 命令执行上下文
@@ -43,8 +45,8 @@ pub struct CommandContext {
 #[async_trait]
 pub trait Command: Send + Sync {
     fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn usage(&self) -> &str;
+    fn description(&self) -> String;
+    fn usage(&self) -> String;
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult>;
 }
 
@@ -94,7 +96,8 @@ impl CommandRegistry {
         match self.commands.get(name) {
             Some(cmd) => Some(cmd.run(args, ctx).await),
             None => Some(Err(anyhow::anyhow!(
-                "未知命令: /{name}  (输入 /help 查看所有命令)"
+                "{}",
+                wyj_i18n::tr_fmt("command.unknown", &[("name", name)])
             ))),
         }
     }
@@ -105,7 +108,7 @@ impl CommandRegistry {
         self.commands
             .iter()
             .filter(|(k, _)| k.starts_with(p))
-            .map(|(k, v)| (format!("/{k}"), v.description().to_string()))
+            .map(|(k, v)| (format!("/{k}"), v.description()))
             .collect()
     }
 }

@@ -19,11 +19,11 @@ impl Command for SkillCommand {
     fn name(&self) -> &str {
         &self.skill_name
     }
-    fn description(&self) -> &str {
-        &self.skill_description
+    fn description(&self) -> String {
+        self.skill_description.clone()
     }
-    fn usage(&self) -> &str {
-        &self.usage_str
+    fn usage(&self) -> String {
+        self.usage_str.clone()
     }
 
     async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
@@ -40,17 +40,15 @@ impl Command for SkillCommand {
 
 // ─── 内置 skill（嵌入二进制，优先级最低，可被用户文件覆盖）──────────────────
 
-static BUILTIN_SKILLS: &[(&str, &str, &str)] = &[
+static BUILTIN_SKILLS: &[(&str, &str)] = &[
     (
         "run",
-        "构建并运行当前项目",
         "Build and run the current project using the appropriate build tool \
 (cargo, npm, python, make, etc.). Show all output and errors. \
 If it fails, diagnose and fix the issue.\n\n$ARGUMENTS",
     ),
     (
         "review",
-        "代码审查（正确性 / 简化 / 效率）",
         "Review the following code or recent changes for:\n\
 - Correctness bugs and edge cases\n\
 - Reuse and simplification opportunities\n\
@@ -61,20 +59,17 @@ Be concise; focus on the highest-impact findings.\n\n$ARGUMENTS",
     ),
     (
         "fix",
-        "修复指定错误或问题",
         "Fix the following issue in the codebase:\n\n$ARGUMENTS\n\n\
 Identify the root cause first, apply a minimal targeted fix, then verify it works.",
     ),
     (
         "explain",
-        "详细解释代码或概念",
         "Explain the following code or concept in detail:\n\n$ARGUMENTS\n\n\
 Cover how it works, why it is designed this way, \
 the data flow, and any important caveats or edge cases.",
     ),
     (
         "commit",
-        "生成提交信息并执行 git commit",
         "Review the current changes with `git diff` and `git status`, then:\n\
 1. Write a clear, conventional commit message (type: subject)\n\
 2. Run: git add -A && git commit -m \"<message>\"\n\n\
@@ -145,12 +140,12 @@ pub fn load_skills(home: &Path, cwd: &Path) -> Vec<Arc<dyn Command>> {
     let mut skills: HashMap<String, SkillCommand> = HashMap::new();
 
     // 1. 内置 skill（优先级最低）
-    for &(name, desc, template) in BUILTIN_SKILLS {
+    for &(name, template) in BUILTIN_SKILLS {
         skills.insert(
             name.to_string(),
             SkillCommand {
                 skill_name: name.to_string(),
-                skill_description: desc.to_string(),
+                skill_description: wyj_i18n::tr(&format!("skill.{name}.desc")),
                 prompt_template: template.to_string(),
                 usage_str: format!("/{name} [$ARGUMENTS]"),
             },

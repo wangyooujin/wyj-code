@@ -15,57 +15,85 @@ use wyj_tools::{
 
 #[derive(Parser, Debug)]
 #[command(name = "wyj-code", version = env!("CARGO_PKG_VERSION"),
-          about = "wyj-code — 终端 AI 编程助手")]
+          about = wyj_i18n::tr("cli.about"))]
 struct Cli {
     #[arg(long)]
     config_status: bool,
-    /// 单次问答（不启动 TUI）
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, help = wyj_i18n::tr("cli.prompt_help"))]
     prompt: Option<String>,
-    /// 工作目录（默认当前目录）
-    #[arg(long)]
+    #[arg(long, help = wyj_i18n::tr("cli.cwd_help"))]
     cwd: Option<std::path::PathBuf>,
-    /// 强制使用 headless REPL 模式
-    #[arg(long)]
+    #[arg(long, help = wyj_i18n::tr("cli.headless_help"))]
     headless: bool,
-    /// Plan 模式：仅启用只读工具（read/glob/grep/web_fetch），适合规划分析
-    #[arg(long)]
+    #[arg(long, help = wyj_i18n::tr("cli.plan_help"))]
     plan: bool,
-    /// Bypass 模式：自动允许所有工具调用，不弹权限确认对话框
-    #[arg(long)]
+    #[arg(long, help = wyj_i18n::tr("cli.bypass_help"))]
     bypass_permissions: bool,
-    /// 恢复上次会话（继续上次对话）
-    #[arg(short = 'c', long = "continue")]
+    #[arg(short = 'c', long = "continue", help = wyj_i18n::tr("cli.continue_help"))]
     continue_session: bool,
-    /// 恢复指定会话 ID（如 sess-1719723000）
-    #[arg(long)]
+    #[arg(long, help = wyj_i18n::tr("cli.resume_help"))]
     resume: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
+    // --help 文本、以及后续所有输出都使用正确的语言。
     let cfg = Config::load()?;
+    let lang = cfg
+        .language
+        .clone()
+        .unwrap_or_else(|| wyj_i18n::detect_system_locale().to_string());
+    wyj_i18n::set_locale(&lang);
+
+    let cli = Cli::parse();
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if cli.config_status {
-        println!("供应商:  {}", cfg.provider);
-        println!("模型:    {}", cfg.model);
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt(
+                "status.provider",
+                &[("provider", &cfg.provider.to_string())]
+            )
+        );
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt("status.model", &[("model", &cfg.model)])
+        );
         if let Some(m) = &cfg.plan_model {
-            println!("Plan 模型: {m}");
+            println!("{}", wyj_i18n::tr_fmt("status.plan_model", &[("model", m)]));
         }
         if let Some(m) = &cfg.exec_model {
-            println!("Exec 模型: {m}");
+            println!("{}", wyj_i18n::tr_fmt("status.exec_model", &[("model", m)]));
         }
-        println!("端点:    {}", cfg.resolved_base_url());
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt("status.endpoint", &[("url", cfg.resolved_base_url())])
+        );
         match cfg.api_key() {
-            Ok(k) => println!("API Key: {}...（已配置）", &k[..k.len().min(8)]),
-            Err(e) => println!("API Key: {}", e),
+            Ok(k) => println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.api_key_configured",
+                    &[("prefix", &k[..k.len().min(8)])]
+                )
+            ),
+            Err(e) => println!(
+                "{}",
+                wyj_i18n::tr_fmt("status.api_key_error", &[("err", &e.to_string())])
+            ),
         }
-        println!("MCP servers: {}", cfg.mcp_servers.len());
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt(
+                "status.mcp_servers",
+                &[("count", &cfg.mcp_servers.len().to_string())]
+            )
+        );
         return Ok(());
     }
 
@@ -84,9 +112,18 @@ async fn main() -> Result<()> {
                 .map(|f| f.messages)
                 .unwrap_or_default();
             if msgs.is_empty() {
-                eprintln!("未找到会话 {id}，将开始新会话。");
+                eprintln!(
+                    "{}",
+                    wyj_i18n::tr_fmt("main.session_not_found", &[("id", id)])
+                );
             } else {
-                eprintln!("已恢复会话 {id}（{} 条消息）", msgs.len());
+                eprintln!(
+                    "{}",
+                    wyj_i18n::tr_fmt(
+                        "main.session_resumed",
+                        &[("id", id), ("count", &msgs.len().to_string())]
+                    )
+                );
             }
             (id.clone(), msgs)
         }
@@ -102,12 +139,18 @@ async fn main() -> Result<()> {
                     if msgs.is_empty() {
                         (new_session_id(), vec![])
                     } else {
-                        eprintln!("已恢复上次会话 {}（{} 条消息）", meta.session_id, msgs.len());
+                        eprintln!(
+                            "{}",
+                            wyj_i18n::tr_fmt(
+                                "main.session_resumed_last",
+                                &[("id", &meta.session_id), ("count", &msgs.len().to_string())]
+                            )
+                        );
                         (meta.session_id, msgs)
                     }
                 }
                 None => {
-                    eprintln!("暂无历史会话，将开始新会话。");
+                    eprintln!("{}", wyj_i18n::tr("main.no_session_history"));
                     (new_session_id(), vec![])
                 }
             }
@@ -144,11 +187,20 @@ async fn main() -> Result<()> {
     let mut tool_ctx = ToolCtx::new(&cwd);
     tool_ctx.permission_mode = match &mode {
         AgentMode::Plan => {
-            let set: std::collections::HashSet<String> =
-                ["Read", "Glob", "Grep", "WebFetch", "AskQuestion", "Write", "Bash", "ExitPlanMode", "TodoWrite"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+            let set: std::collections::HashSet<String> = [
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
+                "AskQuestion",
+                "Write",
+                "Bash",
+                "ExitPlanMode",
+                "TodoWrite",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
             PermissionMode::Allowlist(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
@@ -190,21 +242,29 @@ async fn main() -> Result<()> {
         .with_max_tokens(cfg.max_tokens)
         .with_context_window(cfg.context_window);
 
+    // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
+    // 供 TUI 侧在运行时切换语言、需要用新语言重建 system prompt 时，能在新的
+    // default 提示词后原样拼回这些追加内容（WYJ.md 说明、Plan 模式限制等），
+    // 避免语言切换把这些内容冲掉。
+    let mut system_prompt_extra = String::new();
+
     // Plan 模式在系统提示中说明只读约束
     if matches!(mode, AgentMode::Plan) {
-        agent = agent.append_system(
-            "## 当前模式：Plan（规划分析）\n\n\
-            你只能使用只读工具（read / glob / grep / web_fetch）。\n\
-            不得写入、编辑文件或执行 shell 命令。\n\
-            请专注于分析代码、规划方案、解释架构。",
-        );
+        let extra = wyj_i18n::tr("system_prompt.plan_mode");
+        agent = agent.append_system(extra.clone());
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(&extra);
     }
 
     let wyj_md = cwd.join("WYJ.md");
     if wyj_md.exists() {
         if let Ok(content) = std::fs::read_to_string(&wyj_md) {
             if !content.trim().is_empty() {
-                agent = agent.append_system(format!("## 当前项目说明 (WYJ.md)\n\n{content}"));
+                let extra =
+                    wyj_i18n::tr_fmt("system_prompt.wyjmd_header", &[("content", &content)]);
+                agent = agent.append_system(extra.clone());
+                system_prompt_extra.push_str("\n\n");
+                system_prompt_extra.push_str(&extra);
                 tracing::debug!("已加载 WYJ.md ({} 字节)", content.len());
             }
         }
@@ -224,9 +284,9 @@ async fn main() -> Result<()> {
     // headless/single-shot 模式：注册格式化工具事件输出到 stderr
     if cli.headless || cli.prompt.is_some() {
         let mode_info = match mode {
-            AgentMode::Plan => " [plan 模式：仅只读工具]",
-            AgentMode::Bypass => " [bypass 模式：跳过权限确认]",
-            AgentMode::Normal => "",
+            AgentMode::Plan => wyj_i18n::tr("main.mode_info_plan"),
+            AgentMode::Bypass => wyj_i18n::tr("main.mode_info_bypass"),
+            AgentMode::Normal => String::new(),
         };
         if !mode_info.is_empty() {
             eprintln!("\x1b[38;2;150;150;150m{mode_info}\x1b[0m");
@@ -279,7 +339,7 @@ async fn main() -> Result<()> {
         // 升级版会话统计
         let in_tok = session.total_input_tokens;
         let out_tok = session.total_output_tokens;
-        eprintln!("\n── 会话统计 ──");
+        eprintln!("\n── {} ──", wyj_i18n::tr("main.session_stats"));
         eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
         if let Some(hs) = &history_store {
             let _ = hs.append(&HistoryEntry {
@@ -305,15 +365,22 @@ async fn main() -> Result<()> {
             });
         }
     } else if cli.headless {
-        repl(agent, tool_ctx, history_store, session_id, cwd, initial_messages).await?;
+        repl(
+            agent,
+            tool_ctx,
+            history_store,
+            session_id,
+            cwd,
+            initial_messages,
+        )
+        .await?;
     } else {
-        let cfg_for_rebuild = cfg.clone();
         let todo_store_for_rebuild = todo_store.clone();
-        let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |new_model: &str| {
-            let provider = wyj_api::build_provider_with_model(&cfg_for_rebuild, new_model)?;
+        let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
+            let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let mut new_agent = Agent::new(provider)
-                .with_max_tokens(cfg_for_rebuild.max_tokens)
-                .with_context_window(cfg_for_rebuild.context_window);
+                .with_max_tokens(cfg.max_tokens)
+                .with_context_window(cfg.context_window);
             let mut reg = ToolRegistry::standard();
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
             reg.register_arc(Arc::new(AskQuestionTool::new()));
@@ -336,6 +403,8 @@ async fn main() -> Result<()> {
             context_window,
             mode,
             todo_store,
+            system_prompt_extra,
+            cfg,
         )
         .await?;
     }
@@ -359,7 +428,9 @@ async fn repl(
     session.messages = initial_messages;
     let stdin = io::stdin();
     let mut turns = 0usize;
-    let repl_home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+    let repl_home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
     let cmd_registry = standard_registry_with_skills(&repl_home, &cwd);
 
     loop {
@@ -447,10 +518,15 @@ async fn repl(
                     eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
                 }
                 Ok(CommandResult::OpenSessionPicker) => {
-                    println!("[headless 模式不支持会话选择器，请用 --resume <session-id> 恢复指定会话]");
+                    println!(
+                        "[headless 模式不支持会话选择器，请用 --resume <session-id> 恢复指定会话]"
+                    );
                 }
                 Ok(CommandResult::ResumeSession(id)) => {
                     println!("[headless 模式：请用 wyj-code --resume {id} 恢复该会话]");
+                }
+                Ok(CommandResult::OpenSettingsDialog) => {
+                    println!("[headless 模式不支持设置面板，请直接编辑 ~/.wyj-code/config.toml]");
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),

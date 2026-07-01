@@ -20,7 +20,10 @@ impl Session {
 
     /// 推送含多个内容块的用户消息（支持图片/文件附件）
     pub fn push_user_with_blocks(&mut self, blocks: Vec<ContentBlock>) {
-        self.messages.push(Message { role: Role::User, content: blocks });
+        self.messages.push(Message {
+            role: Role::User,
+            content: blocks,
+        });
     }
 
     pub fn push_assistant(&mut self, blocks: Vec<ContentBlock>) {
@@ -37,15 +40,21 @@ impl Session {
             content: ToolResultContent::text(output),
             is_error,
         };
-        // 工具结果追加到最后一条 user 消息，若最后是 assistant 则新建 user 消息
+        self.push_user_blocks_merged(vec![block]);
+    }
+
+    /// 追加内容块：若最后一条已是 user 消息则合并进去，否则新建一条 user 消息。
+    /// 用于工具结果、以及 Agent 忙碌时用户补充输入的运行时注入，二者都必须
+    /// 保持与已有 user 消息同一轮次，以满足 Provider 对角色严格交替的要求。
+    pub fn push_user_blocks_merged(&mut self, blocks: Vec<ContentBlock>) {
         match self.messages.last_mut() {
-            Some(m) if matches!(m.role, wyj_api::types::Role::User) => {
-                m.content.push(block);
+            Some(m) if matches!(m.role, Role::User) => {
+                m.content.extend(blocks);
             }
             _ => {
                 self.messages.push(Message {
                     role: Role::User,
-                    content: vec![block],
+                    content: blocks,
                 });
             }
         }

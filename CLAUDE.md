@@ -10,6 +10,11 @@ cargo run                        # 启动 TUI 模式
 cargo run -- --headless          # 启动 headless REPL 模式
 cargo run -- -p "your prompt"    # 单次问答（不启动 TUI）
 cargo run -- --config-status     # 查看当前配置和 API Key 状态
+cargo run -- --cwd <dir>         # 指定工作目录（默认当前目录）
+cargo run -- --plan              # 以 Plan 模式启动（仅只读工具）
+cargo run -- --bypass-permissions # 以 Bypass 模式启动（跳过权限确认）
+cargo run -- -c / --continue     # 恢复上一次会话
+cargo run -- --resume <id>       # 恢复指定会话 ID
 
 ./build.sh                       # 等同 cargo build --release
 ./build.sh package               # 打包到 dist/<binary>-<version>-<platform>
@@ -32,6 +37,13 @@ cargo clippy                     # lint
 - commit message 用简体中文，首行 `type: 简述`，空行后列要点。
 - 用户说"提交代码并 push"时：`git add -A` → `git commit` → `git push`。仅当用户要求时才提交/推送；若在默认分支上，先建分支（本项目 master 为单作者主线，按用户指示可直接提交）。
 
+## Slash 命令约定
+
+- **每新增一条 `/xxx` slash 命令，必须同步在 `/help` 输出中注册该命令的说明**，包括：命令名、用途简介、用法/参数（若有）、示例（可选）。`/help` 是用户发现命令的唯一入口，未注册的命令等同于对用户不可见。
+- 注册位置：`/help` 的输出由 `crates/commands/src/builtin.rs` 中 `HelpCmd` 读取的 i18n 模板 `help.body` 渲染（**不是**动态枚举注册表），因此新增命令时必须同步在 `crates/i18n/locales/{en,zh}.yml` 的 `help.body` 模板里追加该命令的说明行，保持与现有条目相同的格式与缩进。
+- 同步要求：新增命令的 PR/提交里就应包含对应的 `/help` 条目，不要留到后续补；若临时不希望暴露（如调试命令），应在 `/help` 中显式标注「内部/调试」而非直接省略。
+- 命令文案需走 i18n（`tr()` key），与 `/help` 其余条目一致，不可硬编码中文。
+
 ## Configuration
 
 配置文件：`~/.wyj-code/config.toml`，API Key 优先读取环境变量 `WYJ_CODE_API_KEY`。
@@ -39,10 +51,13 @@ cargo clippy                     # lint
 ```toml
 provider = "anthropic"       # 或 "openai"
 model = "claude-opus-4-8"
+plan_model = ""              # Plan 模式专用模型，留空则使用 model
+exec_model = ""              # Exec/Bypass 模式专用模型，留空则使用 model
 base_url = ""                # 留空使用供应商默认端点
 max_tokens = 8192
 context_window = 200000
 log_level = "warn"           # 调试时设为 "debug"
+language = ""                # "en"/"zh"，留空自动检测系统 locale
 
 [[mcp_servers]]
 name = "my-server"
@@ -53,6 +68,8 @@ args = ["--flag"]
 
 **WYJ.md**：在项目根目录放置 `WYJ.md`，其内容会自动追加到 system prompt，类似 CLAUDE.md 的作用。
 
+**`/config`**：TUI 内 `/config` 打开交互式设置面板（`OpenSettingsDialog`），可直接编辑 `base_url`/`api_key`/`model`/`plan_model`/`exec_model`/`language` 并写回 `config.toml`；`language` 留空则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文。当前 i18n 仅覆盖核心用户可见文案（TUI 对话框、slash 命令输出、CLI --help/--config-status、system prompt），工具内部错误消息等仍为中文，待后续阶段迁移。
+
 ## Architecture
 
 这是一个 Rust workspace，单一 `wyj-code` 二进制，零遥测。各 crate 职责：
@@ -62,8 +79,9 @@ args = ["--flag"]
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session、HistoryStore、MemoryStore、上下文压缩 |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite/SubAgent）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent）|
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
+| `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框 |
 | `crates/cli` | 二进制入口 | 组装所有 crate，解析 CLI 参数，启动 TUI/REPL/单次模式 |
@@ -76,6 +94,7 @@ args = ["--flag"]
 4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt。
 5. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
 6. **SubAgent**：`tools::SubAgentTool` 通过工厂函数创建拥有独立 provider 和工具集的子 Agent，顺序执行不嵌套并发。
+7. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
 
 ### 权限模型（TUI）
 

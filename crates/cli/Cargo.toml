@@ -18,6 +18,7 @@ wyj-tools.workspace = true
 wyj-tui.workspace = true
 wyj-mcp.workspace = true
 wyj-commands.workspace = true
+wyj-i18n.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
