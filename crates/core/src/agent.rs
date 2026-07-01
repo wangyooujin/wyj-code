@@ -57,7 +57,8 @@ impl Agent {
             tools: vec![],
             tool_impls: HashMap::new(),
             max_tokens: 8192,
-            max_turns: 20,
+            // 真正的成本/时长上限由每轮 token 预算触发的自动压缩承担；这里仅防止模型死循环
+            max_turns: 200,
             context_window: 200_000,
             memory: None,
             claude_md: None,
