@@ -52,6 +52,8 @@ pub enum AgentEvent {
         plan_path: Option<String>,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Agent 忙碌期间排队的补充消息已被消费并合并进 session
+    Injected,
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

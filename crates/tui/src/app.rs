@@ -7,7 +7,7 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyboardEnhancementFlags, KeyModifiers, PopKeyboardEnhancementFlags,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
-use wyj_config::AgentMode;
+use wyj_config::{AgentMode, Config};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
     Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
@@ -35,8 +35,8 @@ use wyj_tools::todo::TodoItem;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
 use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 
-/// 用于 /model 热切换的 Agent 重建函数类型
-pub type RebuildFn = Arc<dyn Fn(&str) -> anyhow::Result<Agent> + Send + Sync>;
+/// 用于 /model 热切换 / 设置面板保存后重建 Agent 的函数类型
+pub type RebuildFn = Arc<dyn Fn(&Config, &str) -> anyhow::Result<Agent> + Send + Sync>;
 
 /// 消息角色
 #[derive(Debug, Clone)]
@@ -200,6 +200,237 @@ pub struct SessionPickerState {
     pub selected: usize,
 }
 
+/// log_level 固定候选表（供设置面板循环切换/校验）
+pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
+
+/// 设置面板的可编辑字段索引（对应渲染顺序）
+pub const SETTINGS_FIELD_COUNT: usize = 10;
+
+/// 每个字段对应的 i18n label key，下标即字段索引
+pub const SETTINGS_FIELD_LABEL_KEYS: [&str; SETTINGS_FIELD_COUNT] = [
+    "settings.field.provider",
+    "settings.field.model",
+    "settings.field.plan_model",
+    "settings.field.exec_model",
+    "settings.field.base_url",
+    "settings.field.api_key",
+    "settings.field.max_tokens",
+    "settings.field.context_window",
+    "settings.field.log_level",
+    "settings.field.language",
+];
+
+/// api_key 字段索引（渲染时需要打码）
+pub const SETTINGS_API_KEY_FIELD_IDX: usize = 5;
+
+/// 设置表单草稿（/config 命令触发时从 AppState.config 初始化，Ctrl+S 时写回）
+pub struct SettingsDraft {
+    /// 0 = Anthropic, 1 = OpenAI
+    pub provider_idx: usize,
+    pub model: String,
+    /// 空串表示未覆盖（对应 Config.plan_model == None）
+    pub plan_model: String,
+    /// 空串表示未覆盖（对应 Config.exec_model == None）
+    pub exec_model: String,
+    /// 空串表示使用供应商默认端点
+    pub base_url: String,
+    pub api_key: String,
+    /// 编辑态存文本，保存时校验解析为 u32
+    pub max_tokens: String,
+    pub context_window: String,
+    /// 对应 LOG_LEVELS 下标
+    pub log_level_idx: usize,
+    /// 对应 wyj_i18n::AVAILABLE_LOCALES 下标
+    pub language_idx: usize,
+}
+
+impl SettingsDraft {
+    fn from_config(cfg: &Config) -> Self {
+        let log_level_idx = LOG_LEVELS
+            .iter()
+            .position(|l| *l == cfg.log_level)
+            .unwrap_or(3); // 默认 warn
+        let current_lang = cfg
+            .language
+            .clone()
+            .unwrap_or_else(|| wyj_i18n::detect_system_locale().to_string());
+        let language_idx = wyj_i18n::AVAILABLE_LOCALES
+            .iter()
+            .position(|l| *l == current_lang)
+            .unwrap_or(0);
+        Self {
+            provider_idx: match cfg.provider {
+                wyj_config::Provider::Anthropic => 0,
+                wyj_config::Provider::OpenAI => 1,
+            },
+            model: cfg.model.clone(),
+            plan_model: cfg.plan_model.clone().unwrap_or_default(),
+            exec_model: cfg.exec_model.clone().unwrap_or_default(),
+            base_url: cfg.base_url.clone(),
+            api_key: cfg.api_key.clone().unwrap_or_default(),
+            max_tokens: cfg.max_tokens.to_string(),
+            context_window: cfg.context_window.to_string(),
+            log_level_idx,
+            language_idx,
+        }
+    }
+
+    /// 用草稿覆盖出一份新 Config（基于 base 保留未编辑的字段，如 mcp_servers）
+    fn to_config(&self, base: &Config) -> Config {
+        let mut cfg = base.clone();
+        cfg.provider = if self.provider_idx == 0 {
+            wyj_config::Provider::Anthropic
+        } else {
+            wyj_config::Provider::OpenAI
+        };
+        cfg.model = self.model.clone();
+        cfg.plan_model = if self.plan_model.trim().is_empty() {
+            None
+        } else {
+            Some(self.plan_model.clone())
+        };
+        cfg.exec_model = if self.exec_model.trim().is_empty() {
+            None
+        } else {
+            Some(self.exec_model.clone())
+        };
+        cfg.base_url = self.base_url.clone();
+        cfg.api_key = if self.api_key.trim().is_empty() {
+            None
+        } else {
+            Some(self.api_key.clone())
+        };
+        cfg.max_tokens = self.max_tokens.trim().parse().unwrap_or(base.max_tokens);
+        cfg.context_window = self
+            .context_window
+            .trim()
+            .parse()
+            .unwrap_or(base.context_window);
+        cfg.log_level = LOG_LEVELS[self.log_level_idx].to_string();
+        cfg.language = Some(wyj_i18n::AVAILABLE_LOCALES[self.language_idx].to_string());
+        cfg
+    }
+
+    /// 数字类文本字段校验（保存前调用）：任一非法则返回对应的 i18n key
+    fn validate(&self) -> Option<&'static str> {
+        if self.max_tokens.trim().parse::<u32>().is_err() {
+            return Some("settings.error.invalid_max_tokens");
+        }
+        if self.context_window.trim().parse::<u32>().is_err() {
+            return Some("settings.error.invalid_context_window");
+        }
+        None
+    }
+
+    /// 字段是否为文本类（Enter 进入行内编辑），与 SettingsFieldKind 保持一致
+    fn text_value(&self, idx: usize) -> &str {
+        match idx {
+            1 => &self.model,
+            2 => &self.plan_model,
+            3 => &self.exec_model,
+            4 => &self.base_url,
+            5 => &self.api_key,
+            6 => &self.max_tokens,
+            7 => &self.context_window,
+            _ => "",
+        }
+    }
+
+    fn set_text_value(&mut self, idx: usize, value: String) {
+        match idx {
+            1 => self.model = value,
+            2 => self.plan_model = value,
+            3 => self.exec_model = value,
+            4 => self.base_url = value,
+            5 => self.api_key = value,
+            6 => self.max_tokens = value,
+            7 => self.context_window = value,
+            _ => {}
+        }
+    }
+
+    /// 枚举字段循环切换（provider=0 / log_level=8 / language=9）
+    fn cycle_enum(&mut self, idx: usize, forward: bool) {
+        match idx {
+            0 => self.provider_idx = cycle_index(self.provider_idx, 2, forward),
+            8 => self.log_level_idx = cycle_index(self.log_level_idx, LOG_LEVELS.len(), forward),
+            9 => {
+                self.language_idx = cycle_index(
+                    self.language_idx,
+                    wyj_i18n::AVAILABLE_LOCALES.len(),
+                    forward,
+                )
+            }
+            _ => {}
+        }
+    }
+
+    /// 供渲染用：返回某字段当前值的展示字符串（枚举字段已转成可读文本）
+    pub fn display_value(&self, idx: usize) -> String {
+        match idx {
+            0 => {
+                if self.provider_idx == 0 {
+                    "Anthropic".to_string()
+                } else {
+                    "OpenAI".to_string()
+                }
+            }
+            8 => LOG_LEVELS[self.log_level_idx].to_string(),
+            9 => wyj_i18n::locale_display_name(wyj_i18n::AVAILABLE_LOCALES[self.language_idx])
+                .to_string(),
+            _ => self.text_value(idx).to_string(),
+        }
+    }
+}
+
+fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// 设置面板状态（/config 命令触发）
+pub struct SettingsDialog {
+    pub draft: SettingsDraft,
+    /// 0..SETTINGS_FIELD_COUNT，当前高亮字段
+    pub selected: usize,
+    /// Some 表示当前字段正在行内文本编辑
+    pub editing: Option<InputBox>,
+    /// 校验失败时的提示（如 max_tokens 非数字），保存成功后清空
+    pub error: Option<String>,
+}
+
+impl SettingsDialog {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            draft: SettingsDraft::from_config(cfg),
+            selected: 0,
+            editing: None,
+            error: None,
+        }
+    }
+}
+
+/// 设置面板里可编辑字段的类型
+pub enum SettingsFieldKind {
+    /// 枚举字段：Enter/Left/Right 原地循环切换
+    Enum,
+    /// 文本字段：Enter 进入行内编辑
+    Text,
+}
+
+pub fn settings_field_kind(idx: usize) -> SettingsFieldKind {
+    match idx {
+        0 | 8 | 9 => SettingsFieldKind::Enum, // provider / log_level / language
+        _ => SettingsFieldKind::Text,
+    }
+}
+
 /// @ 文件选取器候选项
 #[derive(Clone)]
 pub struct FileEntry {
@@ -335,8 +566,7 @@ fn encode_rgba_to_png(bytes: &[u8], width: u32, height: u32) -> anyhow::Result<V
 /// 判断粘贴文本是否像文件路径（绝对路径或以 ~/ ./ 开头，单行）
 fn looks_like_file_path(s: &str) -> bool {
     let s = s.trim();
-    !s.contains('\n')
-        && (s.starts_with('/') || s.starts_with("~/") || s.starts_with("./"))
+    !s.contains('\n') && (s.starts_with('/') || s.starts_with("~/") || s.starts_with("./"))
 }
 
 /// 展开 ~/ 前缀并检查文件是否存在，仅当是普通文件时返回 Some
@@ -351,7 +581,11 @@ fn try_resolve_path(s: &str) -> Option<std::path::PathBuf> {
     } else {
         std::path::PathBuf::from(s)
     };
-    if path.exists() && path.is_file() { Some(path) } else { None }
+    if path.exists() && path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// 全局 UI 状态
@@ -400,6 +634,8 @@ pub struct AppState {
     pub current_todos: Option<Vec<TodoItem>>,
     /// 会话选择器（/sessions 命令触发时 Some）
     pub session_picker: Option<SessionPickerState>,
+    /// 设置面板（/config 命令触发时 Some）
+    pub settings_dialog: Option<SettingsDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -420,10 +656,23 @@ pub struct AppState {
     pub turn_start_output_tokens: u32,
     /// 上次渲染的滚动条区域（保留字段供将来用）
     pub scrollbar_area: Rect,
+    /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
+    pub injector: Option<mpsc::UnboundedSender<Vec<ContentBlock>>>,
+    /// 排队中尚未被 Agent 消费的补充消息（文本 + 附件），用于状态栏提示计数、
+    /// 消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
+    pub pending_queue: Vec<(String, Vec<Attachment>)>,
+    /// 当前生效的完整配置（/config 设置面板的数据来源与保存目标）
+    pub config: Config,
 }
 
 impl AppState {
-    fn new(cwd: PathBuf, model_name: String, context_window: u32, mode: AgentMode) -> Self {
+    fn new(
+        cwd: PathBuf,
+        model_name: String,
+        context_window: u32,
+        mode: AgentMode,
+        config: Config,
+    ) -> Self {
         Self {
             messages: vec![],
             streaming_buf: String::new(),
@@ -456,7 +705,9 @@ impl AppState {
             session_allowed: HashSet::new(),
             current_todos: None,
             session_picker: None,
+            settings_dialog: None,
             save_needed: false,
+            config,
             pending_attachments: vec![],
             file_completions: vec![],
             file_selected: 0,
@@ -466,6 +717,8 @@ impl AppState {
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
             scrollbar_area: Rect::default(),
+            injector: None,
+            pending_queue: vec![],
         }
     }
 
@@ -492,6 +745,13 @@ impl AppState {
         }
         self.exec_mode_confirm = None;
         self.pending_attachments.clear();
+        self.injector = None;
+        if !self.pending_queue.is_empty() {
+            let n = self.pending_queue.len();
+            self.pending_queue.clear();
+            self.messages
+                .push(ChatMessage::system(format!("已中断，{n} 条排队消息已丢弃")));
+        }
     }
 
     fn push_user(&mut self, text: String) {
@@ -565,19 +825,34 @@ impl AppState {
                 self.current_op = None;
                 self.turns += 1;
                 self.save_needed = true;
+                self.injector = None;
                 if let Some(start) = self.turn_start_time.take() {
                     let elapsed = start.elapsed().as_secs_f64();
-                    let d_in = self.total_input_tokens.saturating_sub(self.turn_start_input_tokens);
-                    let d_out = self.total_output_tokens.saturating_sub(self.turn_start_output_tokens);
-                    self.messages.push(ChatMessage::turn_summary(elapsed, d_in, d_out));
+                    let d_in = self
+                        .total_input_tokens
+                        .saturating_sub(self.turn_start_input_tokens);
+                    let d_out = self
+                        .total_output_tokens
+                        .saturating_sub(self.turn_start_output_tokens);
+                    self.messages
+                        .push(ChatMessage::turn_summary(elapsed, d_in, d_out));
                 }
             }
 
             AgentEvent::Error(e) => {
                 self.flush_streaming();
                 self.is_thinking = false;
+                self.injector = None;
                 self.messages
                     .push(ChatMessage::assistant_err(format!("[错误] {e}")));
+            }
+
+            AgentEvent::Injected => {
+                if !self.pending_queue.is_empty() {
+                    let (text, attachments) = self.pending_queue.remove(0);
+                    let display_text = build_display_text(&text, &attachments);
+                    self.push_user(display_text);
+                }
             }
 
             AgentEvent::Usage { input, output } => {
@@ -613,9 +888,15 @@ impl AppState {
                 self.scroll_offset = 0;
             }
 
-            AgentEvent::PlanApprovalRequest { plan_path, response_tx } => {
+            AgentEvent::PlanApprovalRequest {
+                plan_path,
+                response_tx,
+            } => {
                 self.is_thinking = false; // 暂停 spinner，等待用户操作
-                self.plan_dialog = Some(PlanApprovalDialog { plan_path, response_tx });
+                self.plan_dialog = Some(PlanApprovalDialog {
+                    plan_path,
+                    response_tx,
+                });
             }
         }
     }
@@ -634,6 +915,11 @@ pub async fn run_tui(
     context_window: u32,
     mode: AgentMode,
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
+    // append_system() 追加到 system prompt 的内容（含前导 "\n\n"），语言切换时
+    // 需要在新语言的默认提示词后原样拼回，避免冲掉 WYJ.md/Plan 模式说明。
+    system_prompt_extra: String,
+    // 当前生效的完整配置（供 /config 设置面板展示初始值、保存后重建 Agent 用）
+    config: Config,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -659,6 +945,8 @@ pub async fn run_tui(
         context_window,
         mode,
         todo_store,
+        system_prompt_extra,
+        config,
     )
     .await;
 
@@ -738,26 +1026,56 @@ fn has_plan_approved(messages: &[Message]) -> bool {
 }
 
 /// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
-fn plan_turn_agent(
-    base: &Arc<Agent>,
-    mode: &AgentMode,
-    cwd: &std::path::Path,
-) -> Arc<Agent> {
+fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode, cwd: &std::path::Path) -> Arc<Agent> {
     if !matches!(mode, AgentMode::Plan) {
         return Arc::clone(base);
     }
     let plan_path = cwd.join(".wyj").join("plan.md");
     let mut a = (**base).clone();
     a.register_tool(Arc::new(ExitPlanModeTool));
-    let a = a.append_system(&format!(
-        "## 当前模式：Plan（规划分析）\n\n\
-        你只能使用只读工具（Read/Glob/Grep/WebFetch/Bash）以及 Write（仅用于写入计划文档）。\n\
-        请先充分分析代码，然后将完整计划写入：`{}`\n\
-        写完后调用 `ExitPlanMode` 工具提交计划，等待用户批准后才能执行。\n\
-        Bash 命令只允许只读操作（ls/find/cat/grep 等），不得执行写入操作。",
-        plan_path.display()
+    let a = a.append_system(wyj_i18n::tr_fmt(
+        "system_prompt.plan_turn",
+        &[("path", &plan_path.display().to_string())],
     ));
     Arc::new(a)
+}
+
+/// 给重建出的 Agent 挂上工具事件回调（ToolStart/ToolEnd → AgentEvent，
+/// TodoWrite 额外广播快照），/model 热切换与设置面板保存后重建 Agent 共用。
+fn wire_tool_callback(
+    agent: Agent,
+    tool_tx: mpsc::Sender<AgentEvent>,
+    todo_store: Arc<std::sync::Mutex<TodoStore>>,
+) -> Agent {
+    agent.with_tool_callback(move |event: ToolEvent| match event {
+        ToolEvent::Start { id, name, input } => {
+            let _ = tool_tx.try_send(AgentEvent::ToolStart {
+                id,
+                name,
+                input_json: input,
+            });
+        }
+        ToolEvent::End {
+            id,
+            name,
+            is_error,
+            elapsed_secs,
+            output,
+        } => {
+            if name == "TodoWrite" && !is_error {
+                if let Ok(store) = todo_store.lock() {
+                    let items = store.items.clone();
+                    let _ = tool_tx.try_send(AgentEvent::TodoUpdate(items));
+                }
+            }
+            let _ = tool_tx.try_send(AgentEvent::ToolEnd {
+                id,
+                output,
+                is_error,
+                elapsed_secs,
+            });
+        }
+    })
 }
 
 /// 构建消息的聊天区显示文本（含附件摘要）
@@ -779,7 +1097,34 @@ fn build_display_text(text: &str, attachments: &[Attachment]) -> String {
     s
 }
 
-/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle
+/// 把文本 + 附件转换为发给 Provider 的内容块（图片直接内联，文件读内容包装为 `<file>` 标签）。
+/// 供正常发送与 Agent 忙碌期间的补充信息注入两处复用。
+async fn build_user_blocks(text: String, attachments: Vec<Attachment>) -> Vec<ContentBlock> {
+    if attachments.is_empty() {
+        return vec![ContentBlock::Text { text }];
+    }
+    let mut blocks = vec![ContentBlock::Text { text }];
+    for att in attachments {
+        match att {
+            Attachment::Image {
+                media_type, data, ..
+            } => {
+                blocks.push(ContentBlock::Image { media_type, data });
+            }
+            Attachment::File { path } => {
+                let content = tokio::fs::read_to_string(&path)
+                    .await
+                    .unwrap_or_else(|e| format!("[文件读取失败 {}: {e}]", path.display()));
+                blocks.push(ContentBlock::Text {
+                    text: format!("\n\n<file path=\"{}\">\n{content}\n</file>", path.display()),
+                });
+            }
+        }
+    }
+    blocks
+}
+
+/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle 及补充信息注入通道
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_turn(
     text: String,
@@ -790,33 +1135,14 @@ fn spawn_agent_turn(
     ctx_cwd: PathBuf,
     mode_arc: Arc<tokio::sync::Mutex<AgentMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
-) -> AbortHandle {
+) -> (AbortHandle, mpsc::UnboundedSender<Vec<ContentBlock>>) {
+    let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<Vec<ContentBlock>>();
     let handle = tokio::spawn(async move {
         let mut sess = session_c.lock().await;
         if attachments.is_empty() {
             sess.push_user(text);
         } else {
-            let mut blocks = vec![ContentBlock::Text { text }];
-            for att in attachments {
-                match att {
-                    Attachment::Image { media_type, data, .. } => {
-                        blocks.push(ContentBlock::Image { media_type, data });
-                    }
-                    Attachment::File { path } => {
-                        let content = tokio::fs::read_to_string(&path)
-                            .await
-                            .unwrap_or_else(|e| {
-                                format!("[文件读取失败 {}: {e}]", path.display())
-                            });
-                        blocks.push(ContentBlock::Text {
-                            text: format!(
-                                "\n\n<file path=\"{}\">\n{content}\n</file>",
-                                path.display()
-                            ),
-                        });
-                    }
-                }
-            }
+            let blocks = build_user_blocks(text, attachments).await;
             sess.push_user_with_blocks(blocks);
         }
         let current_mode = mode_arc.lock().await.clone();
@@ -828,7 +1154,20 @@ fn spawn_agent_turn(
         let mut on_text = move |d: &str| {
             let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
         };
-        match turn_agent.run_turn(&mut sess, &ctx, &mut on_text).await {
+        let tx3 = tx.clone();
+        let on_inject = move || {
+            let _ = tx3.try_send(AgentEvent::Injected);
+        };
+        match turn_agent
+            .run_turn_with_injection(
+                &mut sess,
+                &ctx,
+                &mut on_text,
+                Some(&mut inject_rx),
+                on_inject,
+            )
+            .await
+        {
             Ok(_) => {
                 let _ = tx
                     .send(AgentEvent::Usage {
@@ -843,7 +1182,7 @@ fn spawn_agent_turn(
             }
         }
     });
-    handle.abort_handle()
+    (handle.abort_handle(), inject_tx)
 }
 
 /// 根据 AgentMode 构建对应的 PermissionMode
@@ -851,7 +1190,10 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
     match mode {
         AgentMode::Plan => {
             let set: HashSet<String> = [
-                "Read", "Glob", "Grep", "WebFetch",
+                "Read",
+                "Glob",
+                "Grep",
+                "WebFetch",
                 "AskQuestion",
                 "Write",        // 写计划文件
                 "Bash",         // 只读命令，由 system prompt 约束
@@ -869,7 +1211,12 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
 }
 
 /// 扫描目录并按过滤词返回文件候选列表
-fn scan_files(dir: &std::path::Path, filter: &str, cwd: &std::path::Path, depth: usize) -> Vec<FileEntry> {
+fn scan_files(
+    dir: &std::path::Path,
+    filter: &str,
+    cwd: &std::path::Path,
+    depth: usize,
+) -> Vec<FileEntry> {
     use ignore::WalkBuilder;
 
     let mut entries: Vec<FileEntry> = Vec::new();
@@ -908,7 +1255,11 @@ fn scan_files(dir: &std::path::Path, filter: &str, cwd: &std::path::Path, depth:
             .strip_prefix(cwd)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.display().to_string());
-        entries.push(FileEntry { display, rel_path, is_dir });
+        entries.push(FileEntry {
+            display,
+            rel_path,
+            is_dir,
+        });
         if entries.len() >= 200 {
             break;
         }
@@ -920,7 +1271,11 @@ fn scan_files(dir: &std::path::Path, filter: &str, cwd: &std::path::Path, depth:
 
 /// 根据输入框光标前的 @ 触发词更新文件候选列表
 fn update_file_completions(state: &mut AppState, input: &InputBox, cwd: &std::path::Path) {
-    let line = input.lines.get(input.cursor_row).map(|s| s.as_str()).unwrap_or("");
+    let line = input
+        .lines
+        .get(input.cursor_row)
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let before_cursor: String = line.chars().take(input.cursor_col).collect();
 
     // 找最后一个 @ —— 须在行首或紧跟空白（避免误触 email）
@@ -941,7 +1296,11 @@ fn update_file_completions(state: &mut AppState, input: &InputBox, cwd: &std::pa
     let query = &before_cursor[at_byte + 1..];
     let (browse_dir, filter, depth) = if let Some(slash_pos) = query.rfind('/') {
         let dir_part = &query[..slash_pos];
-        (cwd.join(dir_part), query[slash_pos + 1..].to_string(), 1usize)
+        (
+            cwd.join(dir_part),
+            query[slash_pos + 1..].to_string(),
+            1usize,
+        )
     } else {
         (cwd.to_path_buf(), query.to_string(), 3usize)
     };
@@ -958,7 +1317,12 @@ fn update_file_completions(state: &mut AppState, input: &InputBox, cwd: &std::pa
 
 /// 将输入框当前行最后一个 @ 后的 query 替换为 new_path
 fn replace_at_query(input: &mut InputBox, new_path: &str) {
-    let line = input.lines.get(input.cursor_row).map(|s| s.as_str()).unwrap_or("").to_string();
+    let line = input
+        .lines
+        .get(input.cursor_row)
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
     let before_cursor: String = line.chars().take(input.cursor_col).collect();
     if let Some(at_byte) = before_cursor.rfind('@') {
         let chars_before_at = before_cursor[..at_byte].chars().count();
@@ -976,11 +1340,17 @@ fn replace_at_query(input: &mut InputBox, new_path: &str) {
 }
 
 /// 扫描消息中的 @file 引用，将存在的文件路径追加到 pending_attachments
-fn expand_at_refs_to_attachments(msg: &str, cwd: &std::path::Path, attachments: &mut Vec<Attachment>) {
+fn expand_at_refs_to_attachments(
+    msg: &str,
+    cwd: &std::path::Path,
+    attachments: &mut Vec<Attachment>,
+) {
     let mut rest = msg;
     while let Some(at_pos) = rest.find('@') {
         let after = &rest[at_pos + 1..];
-        let end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
         let token = &after[..end];
         if !token.is_empty() {
             let path = cwd.join(token);
@@ -1034,9 +1404,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     context_window: u32,
     mode: AgentMode,
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
+    system_prompt_extra: String,
+    config: Config,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
-    let mut state = AppState::new(cwd.clone(), model_name, context_window, mode);
+    let mut state = AppState::new(cwd.clone(), model_name, context_window, mode, config);
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
 
@@ -1129,6 +1501,44 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             }
         }
 
+        // 竞态兜底：极小概率下，用户提交补充消息的时机恰好晚于 run_turn 最后一次
+        // 排空注入队列的检查，导致该轮 TurnDone/Error 已到达而消息仍留在
+        // pending_queue 里未被消费。此时视同用户在轮次结束的瞬间正常发送。
+        if !state.is_thinking && !state.pending_queue.is_empty() {
+            let queued = std::mem::take(&mut state.pending_queue);
+            state.injector = None;
+            let mut combined_text = String::new();
+            let mut combined_attachments = vec![];
+            for (i, (text, atts)) in queued.into_iter().enumerate() {
+                if i > 0 {
+                    combined_text.push_str("\n---\n");
+                }
+                combined_text.push_str(&text);
+                combined_attachments.extend(atts);
+            }
+            let display_text = build_display_text(&combined_text, &combined_attachments);
+            state.push_user(display_text);
+            state.input_history.push(combined_text.clone());
+            state.is_thinking = true;
+            state.spinner_frame = 0;
+            state.turn_start_time = Some(Instant::now());
+            state.turn_start_input_tokens = state.total_input_tokens;
+            state.turn_start_output_tokens = state.total_output_tokens;
+            let agent_c = shared_agent.read().unwrap().clone();
+            let (handle, injector) = spawn_agent_turn(
+                combined_text,
+                combined_attachments,
+                agent_c,
+                session.clone(),
+                agent_tx.clone(),
+                cwd.clone(),
+                shared_mode.clone(),
+                ui_ask_tx.clone(),
+            );
+            state.current_task = Some(handle);
+            state.injector = Some(injector);
+        }
+
         // 每轮对话结束后自动保存 session 文件
         if state.save_needed {
             state.save_needed = false;
@@ -1154,14 +1564,21 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         // 消费 ui_ask 请求，分发为对应 AgentEvent
         loop {
             match ui_ask_rx.try_recv() {
-                Ok(UiAskRequest::Question { question, options, response_tx }) => {
+                Ok(UiAskRequest::Question {
+                    question,
+                    options,
+                    response_tx,
+                }) => {
                     state.apply_agent_event(AgentEvent::AskQuestion {
                         question,
                         options,
                         response_tx,
                     });
                 }
-                Ok(UiAskRequest::ExitPlanMode { plan_path, response_tx }) => {
+                Ok(UiAskRequest::ExitPlanMode {
+                    plan_path,
+                    response_tx,
+                }) => {
                     state.apply_agent_event(AgentEvent::PlanApprovalRequest {
                         plan_path,
                         response_tx,
@@ -1179,7 +1596,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     let has_image = match arboard::Clipboard::new() {
                         Ok(mut cb) => match cb.get_image() {
                             Ok(img) => {
-                                match encode_rgba_to_png(&img.bytes, img.width as u32, img.height as u32) {
+                                match encode_rgba_to_png(
+                                    &img.bytes,
+                                    img.width as u32,
+                                    img.height as u32,
+                                ) {
                                     Ok(png_bytes) => {
                                         use base64::Engine as _;
                                         let b64 = base64::engine::general_purpose::STANDARD
@@ -1258,9 +1679,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
                                         state.turns = 0;
-                                        state.messages.push(ChatMessage::system(
-                                            "已开始新会话".to_string(),
-                                        ));
+                                        state
+                                            .messages
+                                            .push(ChatMessage::system("已开始新会话".to_string()));
                                     } else {
                                         // 切换到选定历史会话
                                         let meta = &picker.sessions[picker.selected - 1];
@@ -1337,6 +1758,206 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
+                    // ⓪.5 设置面板拦截（/config 命令触发）
+                    if state.settings_dialog.is_some() {
+                        let is_editing = state
+                            .settings_dialog
+                            .as_ref()
+                            .map(|d| d.editing.is_some())
+                            .unwrap_or(false);
+
+                        if is_editing {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        if let Some(mut ib) = dialog.editing.take() {
+                                            let text = ib.take();
+                                            let idx = dialog.selected;
+                                            dialog.draft.set_text_value(idx, text);
+                                            dialog.error = None;
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(dialog) = &mut state.settings_dialog {
+                                        dialog.editing = None;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(ib) = state
+                                        .settings_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.insert_char(c);
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(ib) = state
+                                        .settings_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.backspace();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if let Some(ib) = state
+                                        .settings_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.move_left();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(ib) = state
+                                        .settings_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.move_right();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        match key.code {
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    if dialog.selected > 0 {
+                                        dialog.selected -= 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    if dialog.selected + 1 < SETTINGS_FIELD_COUNT {
+                                        dialog.selected += 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Left => {
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    let idx = dialog.selected;
+                                    if matches!(settings_field_kind(idx), SettingsFieldKind::Enum) {
+                                        dialog.draft.cycle_enum(idx, false);
+                                    }
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    let idx = dialog.selected;
+                                    if matches!(settings_field_kind(idx), SettingsFieldKind::Enum) {
+                                        dialog.draft.cycle_enum(idx, true);
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    let idx = dialog.selected;
+                                    match settings_field_kind(idx) {
+                                        SettingsFieldKind::Enum => {
+                                            dialog.draft.cycle_enum(idx, true)
+                                        }
+                                        SettingsFieldKind::Text => {
+                                            let mut ib = InputBox::new();
+                                            ib.insert_text(dialog.draft.text_value(idx));
+                                            dialog.editing = Some(ib);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let mut should_close = false;
+                                if let Some(dialog) = &mut state.settings_dialog {
+                                    if let Some(err_key) = dialog.draft.validate() {
+                                        dialog.error = Some(wyj_i18n::tr(err_key));
+                                    } else {
+                                        let new_cfg = dialog.draft.to_config(&state.config);
+                                        match new_cfg.save() {
+                                            Ok(()) => {
+                                                should_close = true;
+                                                state.config = new_cfg.clone();
+                                                let lang = state
+                                                    .config
+                                                    .language
+                                                    .clone()
+                                                    .unwrap_or_else(|| {
+                                                        wyj_i18n::detect_system_locale().to_string()
+                                                    });
+                                                wyj_i18n::set_locale(&lang);
+
+                                                let mut new_prompt =
+                                                    wyj_i18n::tr("system_prompt.default");
+                                                new_prompt.push_str(&system_prompt_extra);
+
+                                                let model_for_mode = state
+                                                    .config
+                                                    .model_for_mode(&state.mode)
+                                                    .to_string();
+                                                match rebuild_fn(&state.config, &model_for_mode) {
+                                                    Ok(new_agent) => {
+                                                        let new_agent =
+                                                            new_agent.with_system(new_prompt);
+                                                        let new_agent = wire_tool_callback(
+                                                            new_agent,
+                                                            agent_tx.clone(),
+                                                            todo_store.clone(),
+                                                        );
+                                                        *shared_agent.write().unwrap() =
+                                                            Arc::new(new_agent);
+                                                        state.model_name = model_for_mode;
+                                                        state.context_window =
+                                                            state.config.context_window;
+                                                        state.messages.push(ChatMessage::system(
+                                                            wyj_i18n::tr("settings.saved"),
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        let updated_agent =
+                                                            (*shared_agent.read().unwrap())
+                                                                .as_ref()
+                                                                .clone()
+                                                                .with_system(new_prompt);
+                                                        *shared_agent.write().unwrap() =
+                                                            Arc::new(updated_agent);
+                                                        state.messages.push(
+                                                            ChatMessage::assistant_err(
+                                                                wyj_i18n::tr_fmt(
+                                                                    "settings.rebuild_failed",
+                                                                    &[("err", &e.to_string())],
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                                    "settings.save_failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                if should_close {
+                                    state.settings_dialog = None;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.settings_dialog = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // ① plan 批准对话框最高优先级
                     if state.plan_dialog.is_some() {
                         match key.code {
@@ -1387,7 +2008,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     state.turn_start_input_tokens = state.total_input_tokens;
                                     state.turn_start_output_tokens = state.total_output_tokens;
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let handle = spawn_agent_turn(
+                                    let (handle, injector) = spawn_agent_turn(
                                         dlg.pending_message,
                                         dlg.pending_attachments,
                                         agent_c,
@@ -1398,6 +2019,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         ui_ask_tx.clone(),
                                     );
                                     state.current_task = Some(handle);
+                                    state.injector = Some(injector);
                                 }
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -1413,7 +2035,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     state.turn_start_input_tokens = state.total_input_tokens;
                                     state.turn_start_output_tokens = state.total_output_tokens;
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let handle = spawn_agent_turn(
+                                    let (handle, injector) = spawn_agent_turn(
                                         dlg.pending_message,
                                         dlg.pending_attachments,
                                         agent_c,
@@ -1424,13 +2046,14 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         ui_ask_tx.clone(),
                                     );
                                     state.current_task = Some(handle);
+                                    state.injector = Some(injector);
                                 }
                             }
                             KeyCode::Esc => {
                                 state.exec_mode_confirm = None;
-                                state.messages.push(ChatMessage::system(
-                                    "已取消发送。".to_string(),
-                                ));
+                                state
+                                    .messages
+                                    .push(ChatMessage::system("已取消发送。".to_string()));
                             }
                             _ => {}
                         }
@@ -1647,9 +2270,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         let label = new_mode.label();
                         *shared_mode.lock().await = new_mode.clone();
                         state.mode = new_mode;
-                        state
-                            .messages
-                            .push(ChatMessage::system(format!("已切换至 {} 模式", label)));
+                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                            "mode.switched",
+                            &[("mode", label)],
+                        )));
                         continue;
                     }
 
@@ -1723,9 +2347,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 let new_mode = AgentMode::Plan;
                                 *shared_mode.lock().await = new_mode.clone();
                                 state.mode = new_mode;
-                                state.messages.push(ChatMessage::system(
-                                    "已切换至 plan 模式。请描述你想分析或规划的内容。".to_string(),
-                                ));
+                                state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                                    "mode.switched_to_plan",
+                                )));
                                 state.input_history.push(trimmed);
                                 continue;
                             }
@@ -1744,14 +2368,15 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         let label = m.label();
                                         *shared_mode.lock().await = m.clone();
                                         state.mode = m;
-                                        state.messages.push(ChatMessage::system(format!(
-                                            "已切换至 {} 模式",
-                                            label
+                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                            "mode.switched",
+                                            &[("mode", label)],
                                         )));
                                     }
                                     None => {
-                                        state.messages.push(ChatMessage::system(format!(
-                                            "未知模式 '{args}'。可选：normal / plan / bypass"
+                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                            "mode.unknown",
+                                            &[("args", args)],
                                         )));
                                     }
                                 }
@@ -1815,59 +2440,34 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             }
                                         }
                                     }
-                                    Ok(CommandResult::SetModel(m)) => match rebuild_fn(&m) {
-                                        Ok(new_agent) => {
-                                            let tool_tx2 = agent_tx.clone();
-                                            let todo_cb = todo_store.clone();
-                                            let new_agent = new_agent.with_tool_callback(
-                                                move |event: ToolEvent| match event {
-                                                    ToolEvent::Start { id, name, input } => {
-                                                        let _ = tool_tx2.try_send(
-                                                            AgentEvent::ToolStart {
-                                                                id,
-                                                                name,
-                                                                input_json: input,
-                                                            },
-                                                        );
-                                                    }
-                                                    ToolEvent::End {
-                                                        id,
-                                                        name,
-                                                        is_error,
-                                                        elapsed_secs,
-                                                        output,
-                                                    } => {
-                                                        if name == "TodoWrite" && !is_error {
-                                                            if let Ok(store) = todo_cb.lock() {
-                                                                let items = store.items.clone();
-                                                                let _ = tool_tx2.try_send(
-                                                                    AgentEvent::TodoUpdate(items),
-                                                                );
-                                                            }
-                                                        }
-                                                        let _ = tool_tx2.try_send(
-                                                            AgentEvent::ToolEnd {
-                                                                id,
-                                                                output,
-                                                                is_error,
-                                                                elapsed_secs,
-                                                            },
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                            *shared_agent.write().unwrap() = Arc::new(new_agent);
-                                            state.model_name = m.clone();
-                                            state.messages.push(ChatMessage::assistant(format!(
-                                                "模型已切换至 {m}"
-                                            )));
+                                    Ok(CommandResult::SetModel(m)) => {
+                                        match rebuild_fn(&state.config, &m) {
+                                            Ok(new_agent) => {
+                                                let new_agent = wire_tool_callback(
+                                                    new_agent,
+                                                    agent_tx.clone(),
+                                                    todo_store.clone(),
+                                                );
+                                                *shared_agent.write().unwrap() =
+                                                    Arc::new(new_agent);
+                                                state.model_name = m.clone();
+                                                state.messages.push(ChatMessage::assistant(
+                                                    wyj_i18n::tr_fmt(
+                                                        "model.switched",
+                                                        &[("model", &m)],
+                                                    ),
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                state.messages.push(ChatMessage::assistant_err(
+                                                    wyj_i18n::tr_fmt(
+                                                        "model.switch_failed",
+                                                        &[("err", &e.to_string())],
+                                                    ),
+                                                ));
+                                            }
                                         }
-                                        Err(e) => {
-                                            state.messages.push(ChatMessage::assistant_err(
-                                                format!("[切换失败] {e}"),
-                                            ));
-                                        }
-                                    },
+                                    }
                                     Ok(CommandResult::OpenSessionPicker) => {
                                         if state.is_thinking {
                                             state.messages.push(ChatMessage::assistant(
@@ -1919,7 +2519,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
                                             ctx.permission_mode = mode_to_permission(&current_mode);
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
-                                            let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
+                                            let turn_agent =
+                                                plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
                                             let tx2 = tx.clone();
                                             let mut on_text = move |d: &str| {
                                                 let _ = tx2
@@ -2019,6 +2620,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             ));
                                         }
                                     }
+                                    Ok(CommandResult::OpenSettingsDialog) => {
+                                        state.settings_dialog =
+                                            Some(SettingsDialog::new(&state.config));
+                                    }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;
                                     }
@@ -2032,7 +2637,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             } else {
                                 // ── 普通消息 → 发给 agent ───────────────────
                                 // 展开 @file 引用 → 追加到 pending_attachments
-                                expand_at_refs_to_attachments(&text, &cwd, &mut state.pending_attachments);
+                                expand_at_refs_to_attachments(
+                                    &text,
+                                    &cwd,
+                                    &mut state.pending_attachments,
+                                );
 
                                 // plan 模式下若历史中已有获批的 ExitPlanMode → 拦截，弹确认框
                                 let plan_already_approved = matches!(state.mode, AgentMode::Plan)
@@ -2050,10 +2659,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     });
                                     state.input_history.push(text);
                                 } else {
-                                    let display_text = build_display_text(
-                                        &text,
-                                        &state.pending_attachments,
-                                    );
+                                    let display_text =
+                                        build_display_text(&text, &state.pending_attachments);
                                     state.push_user(display_text);
                                     state.input_history.push(text.clone());
                                     state.is_thinking = true;
@@ -2063,9 +2670,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     state.turn_start_output_tokens = state.total_output_tokens;
 
                                     // 捕获并清空附件列表（移入 async task）
-                                    let attachments = std::mem::take(&mut state.pending_attachments);
+                                    let attachments =
+                                        std::mem::take(&mut state.pending_attachments);
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let handle = spawn_agent_turn(
+                                    let (handle, injector) = spawn_agent_turn(
                                         text,
                                         attachments,
                                         agent_c,
@@ -2076,7 +2684,34 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         ui_ask_tx.clone(),
                                     );
                                     state.current_task = Some(handle);
+                                    state.injector = Some(injector);
                                 }
+                            }
+                        }
+                    } else if key.code == KeyCode::Enter && state.is_thinking {
+                        // Agent 忙碌期间提交 → 排队，不打断当前操作
+                        if !input.is_empty() || !state.pending_attachments.is_empty() {
+                            let text = input.take();
+                            state.slash_completions.clear();
+                            state.file_completions.clear();
+                            state.history_idx = None;
+                            expand_at_refs_to_attachments(
+                                &text,
+                                &cwd,
+                                &mut state.pending_attachments,
+                            );
+                            let attachments = std::mem::take(&mut state.pending_attachments);
+                            if let Some(tx) = &state.injector {
+                                let blocks =
+                                    build_user_blocks(text.clone(), attachments.clone()).await;
+                                let _ = tx.send(blocks);
+                                state.pending_queue.push((text, attachments));
+                            } else {
+                                // 理论上不应发生：is_thinking 但没有活跃任务，按普通消息兜底处理
+                                let display_text = build_display_text(&text, &attachments);
+                                state.push_user(display_text);
+                                state.input_history.push(text);
+                                state.pending_attachments = attachments;
                             }
                         }
                     } else if key.code == KeyCode::PageUp {
@@ -2220,8 +2855,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         .iter()
                                         .rev()
                                         .find(|m| {
-                                            matches!(m.role, MessageRole::Assistant)
-                                                && !m.is_error
+                                            matches!(m.role, MessageRole::Assistant) && !m.is_error
                                         })
                                         .map(|m| m.content.clone())
                                     {
@@ -2229,7 +2863,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             Ok(mut cb) => match cb.set_text(text) {
                                                 Ok(()) => {
                                                     state.messages.push(ChatMessage::system(
-                                                        "已复制最后一条 AI 回复到剪贴板".to_string(),
+                                                        "已复制最后一条 AI 回复到剪贴板"
+                                                            .to_string(),
                                                     ));
                                                 }
                                                 Err(e) => {
@@ -2239,9 +2874,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                 }
                                             },
                                             Err(e) => {
-                                                state.messages.push(ChatMessage::system(
-                                                    format!("剪贴板访问失败: {e}"),
-                                                ));
+                                                state.messages.push(ChatMessage::system(format!(
+                                                    "剪贴板访问失败: {e}"
+                                                )));
                                             }
                                         }
                                     }
@@ -2331,7 +2966,12 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                                 .map(|l| l.trim().to_string())
                                 .unwrap_or_default();
                             result.push(ChatMessage::tool_result(
-                                text, *is_error, 0.0, tool_seq, String::new(), summary,
+                                text,
+                                *is_error,
+                                0.0,
+                                tool_seq,
+                                String::new(),
+                                summary,
                             ));
                         }
                         _ => {}

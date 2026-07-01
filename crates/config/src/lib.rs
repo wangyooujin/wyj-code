@@ -59,8 +59,14 @@ impl AgentMode {
     pub fn allowed_tools(&self) -> Option<&'static [&'static str]> {
         match self {
             AgentMode::Plan => Some(&[
-                "read", "glob", "grep", "web_fetch",
-                "ask_question", "write", "bash", "exit_plan_mode",
+                "read",
+                "glob",
+                "grep",
+                "web_fetch",
+                "ask_question",
+                "write",
+                "bash",
+                "exit_plan_mode",
             ]),
             _ => None,
         }
@@ -109,6 +115,9 @@ pub struct Config {
     pub context_window: u32,
     /// 日志级别
     pub log_level: String,
+    /// 界面/AI 回复语言（"en"/"zh"）。留空则自动检测系统 locale。
+    #[serde(default)]
+    pub language: Option<String>,
     /// MCP server 列表（空列表则不启动任何 MCP）
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
@@ -126,6 +135,7 @@ impl Default for Config {
             max_tokens: 8192,
             context_window: 200_000,
             log_level: "warn".to_string(),
+            language: None,
             mcp_servers: vec![],
         }
     }
