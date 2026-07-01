@@ -12,8 +12,10 @@ pub enum CommandResult {
     Output(String),
     /// 清空对话历史
     ClearHistory,
-    /// 切换模型（运行时热切换）
-    SetModel(String),
+    /// 打开分组（Profile）管理面板（/model 无参触发）
+    OpenProfileDialog,
+    /// 按名切换激活分组（/model <name> 触发）
+    SwitchProfile(String),
     /// 手动触发上下文压缩
     CompactHistory,
     /// 退出应用
@@ -28,6 +30,8 @@ pub enum CommandResult {
     ResumeSession(String),
     /// 打开配置设置面板（/config 命令触发）
     OpenSettingsDialog,
+    /// 打开 CLAUDE.md 记忆面板（/memory 命令触发）
+    OpenMemoryDialog,
 }
 
 /// 命令执行上下文

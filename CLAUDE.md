@@ -66,7 +66,7 @@ command = "/path/to/server"
 args = ["--flag"]
 ```
 
-**WYJ.md**：在项目根目录放置 `WYJ.md`，其内容会自动追加到 system prompt，类似 CLAUDE.md 的作用。
+**CLAUDE.md 记忆机制**（对齐真实 Claude Code，`core::claude_md::ClaudeMdLoader`）：查找范围为全局 `~/.claude/CLAUDE.md`（复用真实 Claude Code 的路径） + 从 git 仓库根到 cwd 的祖先链（找不到 `.git` 则只用 cwd 本身）；每级目录内 `CLAUDE.md`/`CLAUDE.local.md` 都存在就都读（local 视作个人覆盖追加，不提交 git），两者都不存在则回退读 `AGENTS.md`；支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。**不焊死进 system prompt**，而是每轮对话开始时重新读盘，以 `<system-reminder>` 文本块前插进当轮 user 消息（`Session::prepend_to_last_user`）——保证运行期间编辑立即生效、压缩后依然完整。工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有 CLAUDE.md 系文件且本会话未展示过，会在 `agent.rs` 的工具执行循环里追加一条独立 reminder（`ClaudeMdLoader::maybe_dir_reminder`，按目录去重）。`/init` 触发一次真正的 agent 回合（`CommandResult::RunPrompt`）去探索项目并生成/合并更新 CLAUDE.md，而非静态模板写文件；`/memory` 打开 TUI 面板列出当前会话适用的全部文件，选中后挂起 TUI 唤起 `$EDITOR` 编辑，同时暴露 auto-memory（跨会话记忆提取）开关与索引入口（`Config.auto_memory_enabled`）。不再兼容旧版 `WYJ.md`。
 
 **`/config`**：TUI 内 `/config` 打开交互式设置面板（`OpenSettingsDialog`），可直接编辑 `base_url`/`api_key`/`model`/`plan_model`/`exec_model`/`language` 并写回 `config.toml`；`language` 留空则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文。当前 i18n 仅覆盖核心用户可见文案（TUI 对话框、slash 命令输出、CLI --help/--config-status、system prompt），工具内部错误消息等仍为中文，待后续阶段迁移。
 
@@ -78,7 +78,7 @@ args = ["--flag"]
 |---|---|---|
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
-| `crates/core` | `wyj-core` | Agent 推理循环、Session、HistoryStore、MemoryStore、上下文压缩 |
+| `crates/core` | `wyj-core` | Agent 推理循环、Session、HistoryStore、MemoryStore、ClaudeMdLoader、上下文压缩 |
 | `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent）|
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
@@ -91,10 +91,11 @@ args = ["--flag"]
 1. **Tool trait**（`core::tool`）：所有工具实现 `async fn run(input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>`，由 `tools::ToolRegistry` 统一管理。
 2. **Agent 推理循环**（`core::agent::Agent::run_turn`）：流式接收 LLM 输出 → 累积工具调用 → 顺序执行（因 `ToolContext` 非 Send）→ 将结果追回 session → 继续直到 `stop_reason != tool_use`。
 3. **上下文压缩**（`core::compact`）：估算 token 数（字符数/3 粗略），当 `estimated > context_window - 40_000` 时调用 LLM 生成摘要替换旧消息，保留最近 6 条。
-4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt。
-5. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
-6. **SubAgent**：`tools::SubAgentTool` 通过工厂函数创建拥有独立 provider 和工具集的子 Agent，顺序执行不嵌套并发。
-7. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
+4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
+5. **CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 CLAUDE.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
+6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
+7. **SubAgent**：`tools::SubAgentTool` 通过工厂函数创建拥有独立 provider 和工具集的子 Agent，顺序执行不嵌套并发。
+8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
 
 ### 权限模型（TUI）
 

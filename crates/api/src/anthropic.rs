@@ -25,7 +25,7 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(cfg: &Config) -> Result<Self> {
-        Self::with_model(cfg, &cfg.model.clone())
+        Self::with_model(cfg, &cfg.active_profile().model.clone())
     }
 
     pub fn with_model(cfg: &Config, model: &str) -> Result<Self> {

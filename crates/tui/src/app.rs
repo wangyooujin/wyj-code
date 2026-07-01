@@ -28,8 +28,8 @@ use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::{
-    extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
-    Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
+    discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent, DiscoveredFile,
+    HistoryEntry, HistoryStore, Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
 };
 use wyj_tools::todo::TodoItem;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
@@ -203,41 +203,16 @@ pub struct SessionPickerState {
 /// log_level 固定候选表（供设置面板循环切换/校验）
 pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
-/// 设置面板的可编辑字段索引（对应渲染顺序）
-pub const SETTINGS_FIELD_COUNT: usize = 10;
+/// 设置面板的可编辑字段索引（对应渲染顺序）——现仅剩 log_level/language，
+/// 调用相关字段（provider/model/base_url/api_key 等）已迁到 /model 的 ProfileDialog。
+pub const SETTINGS_FIELD_COUNT: usize = 2;
 
 /// 每个字段对应的 i18n label key，下标即字段索引
-pub const SETTINGS_FIELD_LABEL_KEYS: [&str; SETTINGS_FIELD_COUNT] = [
-    "settings.field.provider",
-    "settings.field.model",
-    "settings.field.plan_model",
-    "settings.field.exec_model",
-    "settings.field.base_url",
-    "settings.field.api_key",
-    "settings.field.max_tokens",
-    "settings.field.context_window",
-    "settings.field.log_level",
-    "settings.field.language",
-];
-
-/// api_key 字段索引（渲染时需要打码）
-pub const SETTINGS_API_KEY_FIELD_IDX: usize = 5;
+pub const SETTINGS_FIELD_LABEL_KEYS: [&str; SETTINGS_FIELD_COUNT] =
+    ["settings.field.log_level", "settings.field.language"];
 
 /// 设置表单草稿（/config 命令触发时从 AppState.config 初始化，Ctrl+S 时写回）
 pub struct SettingsDraft {
-    /// 0 = Anthropic, 1 = OpenAI
-    pub provider_idx: usize,
-    pub model: String,
-    /// 空串表示未覆盖（对应 Config.plan_model == None）
-    pub plan_model: String,
-    /// 空串表示未覆盖（对应 Config.exec_model == None）
-    pub exec_model: String,
-    /// 空串表示使用供应商默认端点
-    pub base_url: String,
-    pub api_key: String,
-    /// 编辑态存文本，保存时校验解析为 u32
-    pub max_tokens: String,
-    pub context_window: String,
     /// 对应 LOG_LEVELS 下标
     pub log_level_idx: usize,
     /// 对应 wyj_i18n::AVAILABLE_LOCALES 下标
@@ -259,71 +234,223 @@ impl SettingsDraft {
             .position(|l| *l == current_lang)
             .unwrap_or(0);
         Self {
-            provider_idx: match cfg.provider {
-                wyj_config::Provider::Anthropic => 0,
-                wyj_config::Provider::OpenAI => 1,
-            },
-            model: cfg.model.clone(),
-            plan_model: cfg.plan_model.clone().unwrap_or_default(),
-            exec_model: cfg.exec_model.clone().unwrap_or_default(),
-            base_url: cfg.base_url.clone(),
-            api_key: cfg.api_key.clone().unwrap_or_default(),
-            max_tokens: cfg.max_tokens.to_string(),
-            context_window: cfg.context_window.to_string(),
             log_level_idx,
             language_idx,
         }
     }
 
-    /// 用草稿覆盖出一份新 Config（基于 base 保留未编辑的字段，如 mcp_servers）
+    /// 用草稿覆盖出一份新 Config（基于 base 保留未编辑的字段，如 profiles/mcp_servers）
     fn to_config(&self, base: &Config) -> Config {
         let mut cfg = base.clone();
-        cfg.provider = if self.provider_idx == 0 {
-            wyj_config::Provider::Anthropic
-        } else {
-            wyj_config::Provider::OpenAI
-        };
-        cfg.model = self.model.clone();
-        cfg.plan_model = if self.plan_model.trim().is_empty() {
-            None
-        } else {
-            Some(self.plan_model.clone())
-        };
-        cfg.exec_model = if self.exec_model.trim().is_empty() {
-            None
-        } else {
-            Some(self.exec_model.clone())
-        };
-        cfg.base_url = self.base_url.clone();
-        cfg.api_key = if self.api_key.trim().is_empty() {
-            None
-        } else {
-            Some(self.api_key.clone())
-        };
-        cfg.max_tokens = self.max_tokens.trim().parse().unwrap_or(base.max_tokens);
-        cfg.context_window = self
-            .context_window
-            .trim()
-            .parse()
-            .unwrap_or(base.context_window);
         cfg.log_level = LOG_LEVELS[self.log_level_idx].to_string();
         cfg.language = Some(wyj_i18n::AVAILABLE_LOCALES[self.language_idx].to_string());
         cfg
     }
 
-    /// 数字类文本字段校验（保存前调用）：任一非法则返回对应的 i18n key
-    fn validate(&self) -> Option<&'static str> {
-        if self.max_tokens.trim().parse::<u32>().is_err() {
-            return Some("settings.error.invalid_max_tokens");
+    /// 枚举字段循环切换（log_level=0 / language=1）
+    fn cycle_enum(&mut self, idx: usize, forward: bool) {
+        match idx {
+            0 => self.log_level_idx = cycle_index(self.log_level_idx, LOG_LEVELS.len(), forward),
+            1 => {
+                self.language_idx = cycle_index(
+                    self.language_idx,
+                    wyj_i18n::AVAILABLE_LOCALES.len(),
+                    forward,
+                )
+            }
+            _ => {}
         }
-        if self.context_window.trim().parse::<u32>().is_err() {
-            return Some("settings.error.invalid_context_window");
-        }
-        None
     }
 
-    /// 字段是否为文本类（Enter 进入行内编辑），与 SettingsFieldKind 保持一致
-    fn text_value(&self, idx: usize) -> &str {
+    /// 供渲染用：返回某字段当前值的展示字符串
+    pub fn display_value(&self, idx: usize) -> String {
+        match idx {
+            0 => LOG_LEVELS[self.log_level_idx].to_string(),
+            1 => wyj_i18n::locale_display_name(wyj_i18n::AVAILABLE_LOCALES[self.language_idx])
+                .to_string(),
+            _ => String::new(),
+        }
+    }
+}
+
+fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// 设置面板状态（/config 命令触发，现仅管理 log_level/language 两项全局设置）
+pub struct SettingsDialog {
+    pub draft: SettingsDraft,
+    /// 0..SETTINGS_FIELD_COUNT，当前高亮字段
+    pub selected: usize,
+    /// 设置面板字段目前全部是枚举字段，此字段始终为 None，保留以复用渲染/交互模式
+    pub editing: Option<InputBox>,
+    /// 校验失败时的提示，保存成功后清空
+    pub error: Option<String>,
+}
+
+impl SettingsDialog {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            draft: SettingsDraft::from_config(cfg),
+            selected: 0,
+            editing: None,
+            error: None,
+        }
+    }
+}
+
+// ── CLAUDE.md 记忆面板：/memory 命令触发 ──────────────────────────────────────
+
+/// 记忆面板里的一行：CLAUDE.md 系候选文件 / auto-memory 开关 / auto-memory 索引入口
+pub enum MemoryRow {
+    File(DiscoveredFile),
+    AutoMemoryToggle,
+    AutoMemoryIndex { path: PathBuf, exists: bool },
+}
+
+pub struct MemoryDialog {
+    pub rows: Vec<MemoryRow>,
+    pub selected: usize,
+    pub auto_memory_enabled: bool,
+    pub error: Option<String>,
+}
+
+impl MemoryDialog {
+    fn new(cwd: &std::path::Path, memory_index_path: PathBuf, auto_memory_enabled: bool) -> Self {
+        let mut rows: Vec<MemoryRow> = discover_files(cwd)
+            .into_iter()
+            .map(MemoryRow::File)
+            .collect();
+        rows.push(MemoryRow::AutoMemoryToggle);
+        let exists = memory_index_path.exists();
+        rows.push(MemoryRow::AutoMemoryIndex {
+            path: memory_index_path,
+            exists,
+        });
+        Self {
+            rows,
+            selected: 0,
+            auto_memory_enabled,
+            error: None,
+        }
+    }
+}
+
+/// 设置面板/分组面板里可编辑字段的类型
+pub enum SettingsFieldKind {
+    /// 枚举字段：Enter/Left/Right 原地循环切换
+    Enum,
+    /// 文本字段：Enter 进入行内编辑
+    Text,
+}
+
+pub fn settings_field_kind(_idx: usize) -> SettingsFieldKind {
+    // /config 现仅剩 log_level/language，两者都是枚举字段
+    SettingsFieldKind::Enum
+}
+
+// ── 分组（Profile）管理面板：/model 命令触发 ──────────────────────────────────
+
+/// 单个分组的可编辑字段数（provider/model/plan_model/exec_model/base_url/api_key/max_tokens/context_window）
+pub const PROFILE_FIELD_COUNT: usize = 8;
+
+/// 分组字段对应的 i18n label key，复用 /config 时代已有的 settings.field.* key
+pub const PROFILE_FIELD_LABEL_KEYS: [&str; PROFILE_FIELD_COUNT] = [
+    "settings.field.provider",
+    "settings.field.model",
+    "settings.field.plan_model",
+    "settings.field.exec_model",
+    "settings.field.base_url",
+    "settings.field.api_key",
+    "settings.field.max_tokens",
+    "settings.field.context_window",
+];
+
+/// api_key 字段索引（渲染时需要打码）
+pub const PROFILE_API_KEY_FIELD_IDX: usize = 5;
+
+/// model/plan_model/exec_model 字段索引集合（这几个字段支持"拉取模型列表"）
+pub const PROFILE_MODEL_FIELD_IDXS: [usize; 3] = [1, 2, 3];
+
+pub fn profile_field_kind(idx: usize) -> SettingsFieldKind {
+    match idx {
+        0 => SettingsFieldKind::Enum, // provider
+        _ => SettingsFieldKind::Text,
+    }
+}
+
+/// 单个分组的编辑草稿
+#[derive(Clone)]
+pub struct ProfileEntryDraft {
+    pub name: String,
+    /// 0 = Anthropic, 1 = OpenAI
+    pub provider_idx: usize,
+    pub model: String,
+    pub plan_model: String,
+    pub exec_model: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub max_tokens: String,
+    pub context_window: String,
+}
+
+impl ProfileEntryDraft {
+    fn from_profile(p: &wyj_config::Profile) -> Self {
+        Self {
+            name: p.name.clone(),
+            provider_idx: match p.provider {
+                wyj_config::Provider::Anthropic => 0,
+                wyj_config::Provider::OpenAI => 1,
+            },
+            model: p.model.clone(),
+            plan_model: p.plan_model.clone().unwrap_or_default(),
+            exec_model: p.exec_model.clone().unwrap_or_default(),
+            base_url: p.base_url.clone(),
+            api_key: p.api_key.clone().unwrap_or_default(),
+            max_tokens: p.max_tokens.to_string(),
+            context_window: p.context_window.to_string(),
+        }
+    }
+
+    fn from_template(t: &wyj_api::ProfileTemplate, existing_names: &[String]) -> Self {
+        let mut name = t.key.to_string();
+        let mut n = 2;
+        while existing_names.iter().any(|e| e == &name) {
+            name = format!("{}-{}", t.key, n);
+            n += 1;
+        }
+        Self {
+            name,
+            provider_idx: match t.provider {
+                wyj_config::Provider::Anthropic => 0,
+                wyj_config::Provider::OpenAI => 1,
+            },
+            model: t.example_model.to_string(),
+            plan_model: String::new(),
+            exec_model: String::new(),
+            base_url: t.base_url.to_string(),
+            api_key: String::new(),
+            max_tokens: "8192".to_string(),
+            context_window: "200000".to_string(),
+        }
+    }
+
+    fn provider(&self) -> wyj_config::Provider {
+        if self.provider_idx == 0 {
+            wyj_config::Provider::Anthropic
+        } else {
+            wyj_config::Provider::OpenAI
+        }
+    }
+
+    pub fn text_value(&self, idx: usize) -> &str {
         match idx {
             1 => &self.model,
             2 => &self.plan_model,
@@ -349,23 +476,10 @@ impl SettingsDraft {
         }
     }
 
-    /// 枚举字段循环切换（provider=0 / log_level=8 / language=9）
-    fn cycle_enum(&mut self, idx: usize, forward: bool) {
-        match idx {
-            0 => self.provider_idx = cycle_index(self.provider_idx, 2, forward),
-            8 => self.log_level_idx = cycle_index(self.log_level_idx, LOG_LEVELS.len(), forward),
-            9 => {
-                self.language_idx = cycle_index(
-                    self.language_idx,
-                    wyj_i18n::AVAILABLE_LOCALES.len(),
-                    forward,
-                )
-            }
-            _ => {}
-        }
+    fn cycle_provider(&mut self, forward: bool) {
+        self.provider_idx = cycle_index(self.provider_idx, 2, forward);
     }
 
-    /// 供渲染用：返回某字段当前值的展示字符串（枚举字段已转成可读文本）
     pub fn display_value(&self, idx: usize) -> String {
         match idx {
             0 => {
@@ -375,59 +489,155 @@ impl SettingsDraft {
                     "OpenAI".to_string()
                 }
             }
-            8 => LOG_LEVELS[self.log_level_idx].to_string(),
-            9 => wyj_i18n::locale_display_name(wyj_i18n::AVAILABLE_LOCALES[self.language_idx])
-                .to_string(),
             _ => self.text_value(idx).to_string(),
         }
     }
-}
 
-fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
-    if len == 0 {
-        return 0;
+    /// 校验 max_tokens/context_window 是否为合法 u32，非法则返回 i18n key
+    fn validate(&self) -> Option<&'static str> {
+        if self.max_tokens.trim().parse::<u32>().is_err() {
+            return Some("settings.error.invalid_max_tokens");
+        }
+        if self.context_window.trim().parse::<u32>().is_err() {
+            return Some("settings.error.invalid_context_window");
+        }
+        None
     }
-    if forward {
-        (current + 1) % len
-    } else {
-        (current + len - 1) % len
-    }
-}
 
-/// 设置面板状态（/config 命令触发）
-pub struct SettingsDialog {
-    pub draft: SettingsDraft,
-    /// 0..SETTINGS_FIELD_COUNT，当前高亮字段
-    pub selected: usize,
-    /// Some 表示当前字段正在行内文本编辑
-    pub editing: Option<InputBox>,
-    /// 校验失败时的提示（如 max_tokens 非数字），保存成功后清空
-    pub error: Option<String>,
-}
-
-impl SettingsDialog {
-    fn new(cfg: &Config) -> Self {
-        Self {
-            draft: SettingsDraft::from_config(cfg),
-            selected: 0,
-            editing: None,
-            error: None,
+    fn to_profile(&self) -> wyj_config::Profile {
+        wyj_config::Profile {
+            name: self.name.clone(),
+            provider: self.provider(),
+            model: self.model.clone(),
+            plan_model: if self.plan_model.trim().is_empty() {
+                None
+            } else {
+                Some(self.plan_model.clone())
+            },
+            exec_model: if self.exec_model.trim().is_empty() {
+                None
+            } else {
+                Some(self.exec_model.clone())
+            },
+            base_url: self.base_url.clone(),
+            api_key: if self.api_key.trim().is_empty() {
+                None
+            } else {
+                Some(self.api_key.clone())
+            },
+            max_tokens: self.max_tokens.trim().parse().unwrap_or(8192),
+            context_window: self.context_window.trim().parse().unwrap_or(200_000),
         }
     }
 }
 
-/// 设置面板里可编辑字段的类型
-pub enum SettingsFieldKind {
-    /// 枚举字段：Enter/Left/Right 原地循环切换
-    Enum,
-    /// 文本字段：Enter 进入行内编辑
-    Text,
+/// ProfileDialog 里当前展示的浮层
+pub enum ProfileOverlay {
+    None,
+    /// 重命名 entries[entry_idx]
+    Renaming {
+        entry_idx: usize,
+        input: InputBox,
+    },
+    /// 新建分组模板选择器
+    TemplatePicker {
+        selected: usize,
+    },
+    /// 删除二次确认
+    ConfirmDelete {
+        entry_idx: usize,
+    },
+    /// 拉取模型列表中（entry_idx 的 field_idx 字段）
+    FetchingModels {
+        entry_idx: usize,
+        field_idx: usize,
+    },
+    /// 模型列表拉取成功，供选择
+    ModelsPicker {
+        entry_idx: usize,
+        field_idx: usize,
+        models: Vec<String>,
+        selected: usize,
+    },
 }
 
-pub fn settings_field_kind(idx: usize) -> SettingsFieldKind {
-    match idx {
-        0 | 8 | 9 => SettingsFieldKind::Enum, // provider / log_level / language
-        _ => SettingsFieldKind::Text,
+/// 分组管理面板状态（/model 无参命令触发）
+pub struct ProfileDialog {
+    pub entries: Vec<ProfileEntryDraft>,
+    /// 保存后将写入 Config.active_profile 的 entries 下标
+    pub active_idx: usize,
+    /// 扁平化行游标（entry 头行 + 展开后的字段行统一编号）
+    pub cursor: usize,
+    /// 当前展开显示字段的 entry 下标
+    pub expanded: Option<usize>,
+    /// Some 表示当前字段正在行内文本编辑
+    pub editing: Option<InputBox>,
+    pub overlay: ProfileOverlay,
+    pub error: Option<String>,
+}
+
+impl ProfileDialog {
+    fn new(cfg: &Config) -> Self {
+        let entries = cfg
+            .profiles
+            .iter()
+            .map(ProfileEntryDraft::from_profile)
+            .collect::<Vec<_>>();
+        let active_idx = cfg
+            .profiles
+            .iter()
+            .position(|p| p.name == cfg.active_profile)
+            .unwrap_or(0);
+        Self {
+            entries,
+            active_idx,
+            cursor: 0,
+            expanded: None,
+            editing: None,
+            overlay: ProfileOverlay::None,
+            error: None,
+        }
+    }
+
+    /// 扁平化行列表：(entry_idx, field_idx)，field_idx = None 表示是 entry 头行
+    pub fn rows(&self) -> Vec<(usize, Option<usize>)> {
+        let mut rows = Vec::new();
+        for i in 0..self.entries.len() {
+            rows.push((i, None));
+            if self.expanded == Some(i) {
+                for f in 0..PROFILE_FIELD_COUNT {
+                    rows.push((i, Some(f)));
+                }
+            }
+        }
+        rows
+    }
+
+    /// 当前游标所在行对应的 (entry_idx, field_idx)
+    fn selected_row(&self) -> (usize, Option<usize>) {
+        self.rows().get(self.cursor).copied().unwrap_or((0, None))
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    /// 名字非空且唯一性校验，返回冲突/为空的 i18n key
+    fn validate_names(&self) -> Option<&'static str> {
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.name.trim().is_empty() {
+                return Some("profile.error.empty_name");
+            }
+            if self.entries[..i].iter().any(|o| o.name == e.name) {
+                return Some("profile.error.duplicate_name");
+            }
+        }
+        None
     }
 }
 
@@ -636,6 +846,10 @@ pub struct AppState {
     pub session_picker: Option<SessionPickerState>,
     /// 设置面板（/config 命令触发时 Some）
     pub settings_dialog: Option<SettingsDialog>,
+    /// 分组管理面板（/model 无参命令触发时 Some）
+    pub profile_dialog: Option<ProfileDialog>,
+    /// CLAUDE.md 记忆面板（/memory 命令触发时 Some）
+    pub memory_dialog: Option<MemoryDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -706,6 +920,8 @@ impl AppState {
             current_todos: None,
             session_picker: None,
             settings_dialog: None,
+            profile_dialog: None,
+            memory_dialog: None,
             save_needed: false,
             config,
             pending_attachments: vec![],
@@ -898,6 +1114,37 @@ impl AppState {
                     response_tx,
                 });
             }
+
+            AgentEvent::ModelsFetched {
+                entry_idx,
+                field_idx,
+                result,
+            } => {
+                if let Some(dialog) = &mut self.profile_dialog {
+                    let matches_pending = matches!(
+                        dialog.overlay,
+                        ProfileOverlay::FetchingModels {
+                            entry_idx: e,
+                            field_idx: f,
+                        } if e == entry_idx && f == field_idx
+                    );
+                    if matches_pending {
+                        dialog.overlay = match result {
+                            Ok(models) => ProfileOverlay::ModelsPicker {
+                                entry_idx,
+                                field_idx,
+                                models,
+                                selected: 0,
+                            },
+                            Err(e) => {
+                                dialog.error =
+                                    Some(wyj_i18n::tr_fmt("profile.fetch.failed", &[("err", &e)]));
+                                ProfileOverlay::None
+                            }
+                        };
+                    }
+                }
+            }
         }
     }
 }
@@ -916,7 +1163,7 @@ pub async fn run_tui(
     mode: AgentMode,
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
     // append_system() 追加到 system prompt 的内容（含前导 "\n\n"），语言切换时
-    // 需要在新语言的默认提示词后原样拼回，避免冲掉 WYJ.md/Plan 模式说明。
+    // 需要在新语言的默认提示词后原样拼回，避免冲掉 Plan 模式说明。
     system_prompt_extra: String,
     // 当前生效的完整配置（供 /config 设置面板展示初始值、保存后重建 Agent 用）
     config: Config,
@@ -1076,6 +1323,39 @@ fn wire_tool_callback(
             });
         }
     })
+}
+
+/// 挂起 TUI（离开 alternate screen + 关闭 raw mode），交给 $EDITOR（未设置回退 vi）
+/// 打开指定文件，编辑完成后恢复 TUI 并强制整屏重绘。文件父目录若不存在会先创建，
+/// 方便直接对着尚不存在的候选路径按 Enter 新建。
+async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
+    terminal: &mut Terminal<B>,
+    path: &std::path::Path,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let path_buf = path.to_path_buf();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&editor).arg(&path_buf).status()
+    })
+    .await;
+
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.clear()?;
+
+    match status {
+        Ok(Ok(s)) if s.success() => Ok(()),
+        Ok(Ok(s)) => anyhow::bail!("编辑器退出码 {:?}", s.code()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// 构建消息的聊天区显示文本（含附件摘要）
@@ -1592,6 +1872,19 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             let ev = event::read()?;
             match ev {
                 Event::Paste(pasted) if !state.is_thinking => {
+                    // 分组管理面板/设置面板正在编辑文本字段时，粘贴内容应进当前编辑的
+                    // 字段（如 API Key、Base URL、重命名输入框），而不是主聊天输入框。
+                    if let Some(dialog) = &mut state.profile_dialog {
+                        if let Some(ib) = dialog.editing.as_mut() {
+                            ib.insert_text(&pasted);
+                            continue;
+                        }
+                        if let ProfileOverlay::Renaming { input, .. } = &mut dialog.overlay {
+                            input.insert_text(&pasted);
+                            continue;
+                        }
+                    }
+
                     // 优先检查剪贴板是否有图片
                     let has_image = match arboard::Clipboard::new() {
                         Ok(mut cb) => match cb.get_image() {
@@ -1758,72 +2051,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ⓪.5 设置面板拦截（/config 命令触发）
+                    // ⓪.5 设置面板拦截（/config 命令触发，现仅 log_level/language 两个枚举字段）
                     if state.settings_dialog.is_some() {
-                        let is_editing = state
-                            .settings_dialog
-                            .as_ref()
-                            .map(|d| d.editing.is_some())
-                            .unwrap_or(false);
-
-                        if is_editing {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if let Some(dialog) = &mut state.settings_dialog {
-                                        if let Some(mut ib) = dialog.editing.take() {
-                                            let text = ib.take();
-                                            let idx = dialog.selected;
-                                            dialog.draft.set_text_value(idx, text);
-                                            dialog.error = None;
-                                        }
-                                    }
-                                }
-                                KeyCode::Esc => {
-                                    if let Some(dialog) = &mut state.settings_dialog {
-                                        dialog.editing = None;
-                                    }
-                                }
-                                KeyCode::Char(c) => {
-                                    if let Some(ib) = state
-                                        .settings_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.insert_char(c);
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    if let Some(ib) = state
-                                        .settings_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.backspace();
-                                    }
-                                }
-                                KeyCode::Left => {
-                                    if let Some(ib) = state
-                                        .settings_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.move_left();
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    if let Some(ib) = state
-                                        .settings_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.move_right();
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
                         match key.code {
                             KeyCode::Up => {
                                 if let Some(dialog) = &mut state.settings_dialog {
@@ -1844,40 +2073,19 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             KeyCode::Left => {
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     let idx = dialog.selected;
-                                    if matches!(settings_field_kind(idx), SettingsFieldKind::Enum) {
-                                        dialog.draft.cycle_enum(idx, false);
-                                    }
+                                    dialog.draft.cycle_enum(idx, false);
                                 }
                             }
-                            KeyCode::Right => {
+                            KeyCode::Right | KeyCode::Enter => {
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     let idx = dialog.selected;
-                                    if matches!(settings_field_kind(idx), SettingsFieldKind::Enum) {
-                                        dialog.draft.cycle_enum(idx, true);
-                                    }
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(dialog) = &mut state.settings_dialog {
-                                    let idx = dialog.selected;
-                                    match settings_field_kind(idx) {
-                                        SettingsFieldKind::Enum => {
-                                            dialog.draft.cycle_enum(idx, true)
-                                        }
-                                        SettingsFieldKind::Text => {
-                                            let mut ib = InputBox::new();
-                                            ib.insert_text(dialog.draft.text_value(idx));
-                                            dialog.editing = Some(ib);
-                                        }
-                                    }
+                                    dialog.draft.cycle_enum(idx, true);
                                 }
                             }
                             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 let mut should_close = false;
                                 if let Some(dialog) = &mut state.settings_dialog {
-                                    if let Some(err_key) = dialog.draft.validate() {
-                                        dialog.error = Some(wyj_i18n::tr(err_key));
-                                    } else {
+                                    {
                                         let new_cfg = dialog.draft.to_config(&state.config);
                                         match new_cfg.save() {
                                             Ok(()) => {
@@ -1912,8 +2120,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                         *shared_agent.write().unwrap() =
                                                             Arc::new(new_agent);
                                                         state.model_name = model_for_mode;
-                                                        state.context_window =
-                                                            state.config.context_window;
+                                                        state.context_window = state
+                                                            .config
+                                                            .active_profile()
+                                                            .context_window;
                                                         state.messages.push(ChatMessage::system(
                                                             wyj_i18n::tr("settings.saved"),
                                                         ));
@@ -1952,6 +2162,527 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                             KeyCode::Esc => {
                                 state.settings_dialog = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.55 CLAUDE.md 记忆面板拦截（/memory 命令触发）
+                    if state.memory_dialog.is_some() {
+                        match key.code {
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.memory_dialog {
+                                    if dialog.selected > 0 {
+                                        dialog.selected -= 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.memory_dialog {
+                                    if dialog.selected + 1 < dialog.rows.len() {
+                                        dialog.selected += 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                enum MemoryRowAction {
+                                    Open(PathBuf),
+                                    Toggle,
+                                    None,
+                                }
+                                let action = match state
+                                    .memory_dialog
+                                    .as_ref()
+                                    .and_then(|d| d.rows.get(d.selected))
+                                {
+                                    Some(MemoryRow::File(f)) => {
+                                        MemoryRowAction::Open(f.path.clone())
+                                    }
+                                    Some(MemoryRow::AutoMemoryIndex { path, exists: true }) => {
+                                        MemoryRowAction::Open(path.clone())
+                                    }
+                                    Some(MemoryRow::AutoMemoryToggle) => MemoryRowAction::Toggle,
+                                    _ => MemoryRowAction::None,
+                                };
+                                match action {
+                                    MemoryRowAction::Open(path) => {
+                                        let result = open_path_in_editor(terminal, &path).await;
+                                        if let Some(dialog) = &mut state.memory_dialog {
+                                            match result {
+                                                Ok(()) => dialog.error = None,
+                                                Err(e) => {
+                                                    dialog.error = Some(wyj_i18n::tr_fmt(
+                                                        "memory.dialog.editor_failed",
+                                                        &[("err", &e.to_string())],
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                    }
+                                    MemoryRowAction::Toggle => {
+                                        let new_value = !state
+                                            .memory_dialog
+                                            .as_ref()
+                                            .map(|d| d.auto_memory_enabled)
+                                            .unwrap_or(true);
+                                        state.config.auto_memory_enabled = new_value;
+                                        let save_result = state.config.save();
+                                        if let Some(mem) = shared_agent.read().unwrap().memory_ref()
+                                        {
+                                            mem.set_enabled(new_value);
+                                        }
+                                        if let Some(dialog) = &mut state.memory_dialog {
+                                            dialog.auto_memory_enabled = new_value;
+                                            dialog.error = save_result.err().map(|e| e.to_string());
+                                        }
+                                    }
+                                    MemoryRowAction::None => {}
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.memory_dialog = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.6 分组管理面板拦截（/model 无参命令触发）
+                    if state.profile_dialog.is_some() {
+                        let is_editing = state
+                            .profile_dialog
+                            .as_ref()
+                            .map(|d| d.editing.is_some())
+                            .unwrap_or(false);
+
+                        if is_editing {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let Some(dialog) = &mut state.profile_dialog {
+                                        if let Some(mut ib) = dialog.editing.take() {
+                                            let text = ib.take();
+                                            if let (entry_idx, Some(field_idx)) =
+                                                dialog.selected_row()
+                                            {
+                                                dialog.entries[entry_idx]
+                                                    .set_text_value(field_idx, text);
+                                            }
+                                            dialog.error = None;
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(dialog) = &mut state.profile_dialog {
+                                        dialog.editing = None;
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(ib) = state
+                                        .profile_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.insert_char(c);
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(ib) = state
+                                        .profile_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.backspace();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if let Some(ib) = state
+                                        .profile_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.move_left();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(ib) = state
+                                        .profile_dialog
+                                        .as_mut()
+                                        .and_then(|d| d.editing.as_mut())
+                                    {
+                                        ib.move_right();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        let has_overlay = state
+                            .profile_dialog
+                            .as_ref()
+                            .map(|d| !matches!(d.overlay, ProfileOverlay::None))
+                            .unwrap_or(false);
+                        if has_overlay {
+                            let dialog = state.profile_dialog.as_mut().unwrap();
+                            match &mut dialog.overlay {
+                                ProfileOverlay::Renaming { entry_idx, input } => {
+                                    let entry_idx = *entry_idx;
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            let new_name = input.take();
+                                            dialog.entries[entry_idx].name = new_name;
+                                            dialog.overlay = ProfileOverlay::None;
+                                        }
+                                        KeyCode::Esc => {
+                                            dialog.overlay = ProfileOverlay::None;
+                                        }
+                                        KeyCode::Char(c) => input.insert_char(c),
+                                        KeyCode::Backspace => input.backspace(),
+                                        KeyCode::Left => input.move_left(),
+                                        KeyCode::Right => input.move_right(),
+                                        _ => {}
+                                    }
+                                }
+                                ProfileOverlay::TemplatePicker { selected } => match key.code {
+                                    KeyCode::Up => {
+                                        if *selected > 0 {
+                                            *selected -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        if *selected + 1 < wyj_api::PROFILE_TEMPLATES.len() {
+                                            *selected += 1;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        let idx = *selected;
+                                        let existing_names: Vec<String> =
+                                            dialog.entries.iter().map(|e| e.name.clone()).collect();
+                                        let template = &wyj_api::PROFILE_TEMPLATES[idx];
+                                        let new_entry = ProfileEntryDraft::from_template(
+                                            template,
+                                            &existing_names,
+                                        );
+                                        let suggested_name = new_entry.name.clone();
+                                        dialog.entries.push(new_entry);
+                                        let new_idx = dialog.entries.len() - 1;
+                                        dialog.expanded = Some(new_idx);
+                                        dialog.cursor = dialog
+                                            .rows()
+                                            .len()
+                                            .saturating_sub(PROFILE_FIELD_COUNT + 1);
+                                        // 新建后立即提示命名，而不是让用户自己发现 'r' 键
+                                        let mut ib = InputBox::new();
+                                        ib.insert_text(&suggested_name);
+                                        dialog.overlay = ProfileOverlay::Renaming {
+                                            entry_idx: new_idx,
+                                            input: ib,
+                                        };
+                                    }
+                                    KeyCode::Esc => {
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                    _ => {}
+                                },
+                                ProfileOverlay::ConfirmDelete { entry_idx } => {
+                                    let entry_idx = *entry_idx;
+                                    match key.code {
+                                        KeyCode::Char('y')
+                                        | KeyCode::Char('Y')
+                                        | KeyCode::Enter => {
+                                            dialog.entries.remove(entry_idx);
+                                            if dialog.active_idx > entry_idx {
+                                                dialog.active_idx -= 1;
+                                            }
+                                            match dialog.expanded {
+                                                Some(e) if e == entry_idx => dialog.expanded = None,
+                                                Some(e) if e > entry_idx => {
+                                                    dialog.expanded = Some(e - 1)
+                                                }
+                                                _ => {}
+                                            }
+                                            dialog.overlay = ProfileOverlay::None;
+                                            dialog.clamp_cursor();
+                                        }
+                                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                            dialog.overlay = ProfileOverlay::None;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                ProfileOverlay::FetchingModels { .. } => {
+                                    if let KeyCode::Esc = key.code {
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                }
+                                ProfileOverlay::ModelsPicker {
+                                    entry_idx,
+                                    field_idx,
+                                    models,
+                                    selected,
+                                } => match key.code {
+                                    KeyCode::Up => {
+                                        if *selected > 0 {
+                                            *selected -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        if *selected + 1 < models.len() {
+                                            *selected += 1;
+                                        }
+                                    }
+                                    KeyCode::Enter => {
+                                        let entry_idx = *entry_idx;
+                                        let field_idx = *field_idx;
+                                        let chosen = models[*selected].clone();
+                                        dialog.entries[entry_idx].set_text_value(field_idx, chosen);
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                    KeyCode::Esc => {
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                    _ => {}
+                                },
+                                ProfileOverlay::None => {}
+                            }
+                            continue;
+                        }
+
+                        match key.code {
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    if dialog.cursor > 0 {
+                                        dialog.cursor -= 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let len = dialog.rows().len();
+                                    if dialog.cursor + 1 < len {
+                                        dialog.cursor += 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Left => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, field_idx) = dialog.selected_row();
+                                    if let Some(f) = field_idx {
+                                        if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
+                                        {
+                                            dialog.entries[entry_idx].cycle_provider(false);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, field_idx) = dialog.selected_row();
+                                    if let Some(f) = field_idx {
+                                        if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
+                                        {
+                                            dialog.entries[entry_idx].cycle_provider(true);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, field_idx) = dialog.selected_row();
+                                    match field_idx {
+                                        None => {
+                                            dialog.expanded = if dialog.expanded == Some(entry_idx)
+                                            {
+                                                None
+                                            } else {
+                                                Some(entry_idx)
+                                            };
+                                            dialog.clamp_cursor();
+                                        }
+                                        Some(f) => match profile_field_kind(f) {
+                                            SettingsFieldKind::Enum => {
+                                                dialog.entries[entry_idx].cycle_provider(true)
+                                            }
+                                            SettingsFieldKind::Text => {
+                                                let mut ib = InputBox::new();
+                                                ib.insert_text(
+                                                    dialog.entries[entry_idx].text_value(f),
+                                                );
+                                                dialog.editing = Some(ib);
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+                            KeyCode::Char('a') => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, _) = dialog.selected_row();
+                                    dialog.active_idx = entry_idx;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    dialog.overlay = ProfileOverlay::TemplatePicker { selected: 0 };
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, _) = dialog.selected_row();
+                                    if dialog.entries.len() <= 1 {
+                                        dialog.error = Some(wyj_i18n::tr("profile.error.last_one"));
+                                    } else if entry_idx == dialog.active_idx {
+                                        dialog.error =
+                                            Some(wyj_i18n::tr("profile.error.delete_active"));
+                                    } else {
+                                        dialog.overlay =
+                                            ProfileOverlay::ConfirmDelete { entry_idx };
+                                    }
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, _) = dialog.selected_row();
+                                    let mut ib = InputBox::new();
+                                    ib.insert_text(&dialog.entries[entry_idx].name);
+                                    dialog.overlay = ProfileOverlay::Renaming {
+                                        entry_idx,
+                                        input: ib,
+                                    };
+                                }
+                            }
+                            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    let (entry_idx, field_idx) = dialog.selected_row();
+                                    if let Some(f) = field_idx {
+                                        if PROFILE_MODEL_FIELD_IDXS.contains(&f) {
+                                            let entry = dialog.entries[entry_idx].clone();
+                                            let api_key = entry.api_key.clone();
+                                            if api_key.trim().is_empty() {
+                                                dialog.error = Some(wyj_i18n::tr(
+                                                    "profile.fetch.need_api_key",
+                                                ));
+                                            } else {
+                                                let provider = entry.provider();
+                                                let base_url = if entry.base_url.trim().is_empty() {
+                                                    match provider {
+                                                        wyj_config::Provider::Anthropic => {
+                                                            "https://api.anthropic.com".to_string()
+                                                        }
+                                                        wyj_config::Provider::OpenAI => {
+                                                            "https://api.openai.com/v1".to_string()
+                                                        }
+                                                    }
+                                                } else {
+                                                    entry.base_url.clone()
+                                                };
+                                                dialog.overlay = ProfileOverlay::FetchingModels {
+                                                    entry_idx,
+                                                    field_idx: f,
+                                                };
+                                                let tx = agent_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let result = wyj_api::fetch_model_ids(
+                                                        &provider, &base_url, &api_key,
+                                                    )
+                                                    .await
+                                                    .map_err(|e| e.to_string());
+                                                    let _ = tx
+                                                        .send(AgentEvent::ModelsFetched {
+                                                            entry_idx,
+                                                            field_idx: f,
+                                                            result,
+                                                        })
+                                                        .await;
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let mut should_close = false;
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    if let Some(err_key) = dialog.validate_names() {
+                                        dialog.error = Some(wyj_i18n::tr(err_key));
+                                    } else if let Some((bad_idx, err_key)) = dialog
+                                        .entries
+                                        .iter()
+                                        .enumerate()
+                                        .find_map(|(i, e)| e.validate().map(|k| (i, k)))
+                                    {
+                                        dialog.expanded = Some(bad_idx);
+                                        dialog.clamp_cursor();
+                                        dialog.error = Some(wyj_i18n::tr(err_key));
+                                    } else {
+                                        let mut new_cfg = state.config.clone();
+                                        new_cfg.profiles =
+                                            dialog.entries.iter().map(|e| e.to_profile()).collect();
+                                        new_cfg.active_profile =
+                                            dialog.entries[dialog.active_idx].name.clone();
+                                        match new_cfg.save() {
+                                            Ok(()) => {
+                                                should_close = true;
+                                                state.config = new_cfg.clone();
+                                                let model_for_mode = state
+                                                    .config
+                                                    .model_for_mode(&state.mode)
+                                                    .to_string();
+                                                match rebuild_fn(&state.config, &model_for_mode) {
+                                                    Ok(new_agent) => {
+                                                        let mut new_prompt =
+                                                            wyj_i18n::tr("system_prompt.default");
+                                                        new_prompt.push_str(&system_prompt_extra);
+                                                        let new_agent =
+                                                            new_agent.with_system(new_prompt);
+                                                        let new_agent = wire_tool_callback(
+                                                            new_agent,
+                                                            agent_tx.clone(),
+                                                            todo_store.clone(),
+                                                        );
+                                                        *shared_agent.write().unwrap() =
+                                                            Arc::new(new_agent);
+                                                        state.model_name = model_for_mode;
+                                                        state.context_window = state
+                                                            .config
+                                                            .active_profile()
+                                                            .context_window;
+                                                        state.messages.push(ChatMessage::system(
+                                                            wyj_i18n::tr("profile.saved"),
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        state.messages.push(
+                                                            ChatMessage::assistant_err(
+                                                                wyj_i18n::tr_fmt(
+                                                                    "settings.rebuild_failed",
+                                                                    &[("err", &e.to_string())],
+                                                                ),
+                                                            ),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                                    "settings.save_failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                if should_close {
+                                    state.profile_dialog = None;
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.profile_dialog = None;
                             }
                             _ => {}
                         }
@@ -2355,8 +3086,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
 
                             // ── /mode 命令：运行时切换模式 ───────────────────
-                            if let Some(args) = trimmed.strip_prefix("/mode") {
-                                let args = args.trim();
+                            // 注意：必须要求 "/mode" 后紧跟空格或结尾，否则 "/model" 这类
+                            // 以 "/mode" 为前缀的命令会被误吞（strip_prefix 不检查词边界）。
+                            if trimmed == "/mode" || trimmed.starts_with("/mode ") {
+                                let args = trimmed.strip_prefix("/mode").unwrap().trim();
                                 let new_mode = match args {
                                     "plan" => Some(AgentMode::Plan),
                                     "bypass" => Some(AgentMode::Bypass),
@@ -2440,31 +3173,74 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             }
                                         }
                                     }
-                                    Ok(CommandResult::SetModel(m)) => {
-                                        match rebuild_fn(&state.config, &m) {
-                                            Ok(new_agent) => {
-                                                let new_agent = wire_tool_callback(
-                                                    new_agent,
-                                                    agent_tx.clone(),
-                                                    todo_store.clone(),
-                                                );
-                                                *shared_agent.write().unwrap() =
-                                                    Arc::new(new_agent);
-                                                state.model_name = m.clone();
-                                                state.messages.push(ChatMessage::assistant(
-                                                    wyj_i18n::tr_fmt(
-                                                        "model.switched",
-                                                        &[("model", &m)],
-                                                    ),
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                state.messages.push(ChatMessage::assistant_err(
-                                                    wyj_i18n::tr_fmt(
-                                                        "model.switch_failed",
-                                                        &[("err", &e.to_string())],
-                                                    ),
-                                                ));
+                                    Ok(CommandResult::OpenProfileDialog) => {
+                                        state.profile_dialog =
+                                            Some(ProfileDialog::new(&state.config));
+                                    }
+                                    Ok(CommandResult::SwitchProfile(name)) => {
+                                        if !state.config.profiles.iter().any(|p| p.name == name) {
+                                            state.messages.push(ChatMessage::assistant_err(
+                                                wyj_i18n::tr_fmt(
+                                                    "profile.not_found",
+                                                    &[("name", &name)],
+                                                ),
+                                            ));
+                                        } else {
+                                            let mut new_cfg = state.config.clone();
+                                            new_cfg.active_profile = name.clone();
+                                            match new_cfg.save() {
+                                                Ok(()) => {
+                                                    state.config = new_cfg.clone();
+                                                    let model_for_mode = state
+                                                        .config
+                                                        .model_for_mode(&state.mode)
+                                                        .to_string();
+                                                    match rebuild_fn(&state.config, &model_for_mode)
+                                                    {
+                                                        Ok(new_agent) => {
+                                                            let new_agent = wire_tool_callback(
+                                                                new_agent,
+                                                                agent_tx.clone(),
+                                                                todo_store.clone(),
+                                                            );
+                                                            *shared_agent.write().unwrap() =
+                                                                Arc::new(new_agent);
+                                                            state.model_name = model_for_mode;
+                                                            state.context_window = state
+                                                                .config
+                                                                .active_profile()
+                                                                .context_window;
+                                                            state.messages.push(
+                                                                ChatMessage::assistant(
+                                                                    wyj_i18n::tr_fmt(
+                                                                        "profile.switched",
+                                                                        &[("name", &name)],
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            state.messages.push(
+                                                                ChatMessage::assistant_err(
+                                                                    wyj_i18n::tr_fmt(
+                                                                        "profile.switch_failed",
+                                                                        &[("err", &e.to_string())],
+                                                                    ),
+                                                                ),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    state.messages.push(
+                                                        ChatMessage::assistant_err(
+                                                            wyj_i18n::tr_fmt(
+                                                                "profile.switch_failed",
+                                                                &[("err", &e.to_string())],
+                                                            ),
+                                                        ),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -2623,6 +3399,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     Ok(CommandResult::OpenSettingsDialog) => {
                                         state.settings_dialog =
                                             Some(SettingsDialog::new(&state.config));
+                                    }
+                                    Ok(CommandResult::OpenMemoryDialog) => {
+                                        let pid = wyj_core::project_id(&state.cwd);
+                                        let index_path = wyj_config::home_dir()
+                                            .unwrap_or_default()
+                                            .join(".wyj-code")
+                                            .join("memory")
+                                            .join(pid)
+                                            .join("MEMORY.md");
+                                        state.memory_dialog = Some(MemoryDialog::new(
+                                            &state.cwd,
+                                            index_path,
+                                            state.config.auto_memory_enabled,
+                                        ));
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;

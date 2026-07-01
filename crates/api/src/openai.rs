@@ -23,7 +23,7 @@ pub struct OpenAIProvider {
 
 impl OpenAIProvider {
     pub fn new(cfg: &Config) -> Result<Self> {
-        Self::with_model(cfg, &cfg.model.clone())
+        Self::with_model(cfg, &cfg.active_profile().model.clone())
     }
 
     pub fn with_model(cfg: &Config, model: &str) -> Result<Self> {
@@ -267,7 +267,7 @@ impl Provider for OpenAIProvider {
             },
         };
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .client
             .post(&url)

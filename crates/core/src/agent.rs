@@ -1,5 +1,6 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
+use crate::claude_md::ClaudeMdLoader;
 use crate::compact::{compact_session, estimate_tokens, COMPACT_TRIGGER_BUFFER};
 use crate::memory::MemoryStore;
 use crate::session::Session;
@@ -42,6 +43,8 @@ pub struct Agent {
     context_window: u32,
     /// 跨会话记忆存储（可选）
     memory: Option<Arc<MemoryStore>>,
+    /// CLAUDE.md 系记忆文件加载器（可选）
+    claude_md: Option<Arc<ClaudeMdLoader>>,
     /// 可选的工具事件回调（Send + Sync，可跨线程）
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
 }
@@ -57,6 +60,7 @@ impl Agent {
             max_turns: 20,
             context_window: 200_000,
             memory: None,
+            claude_md: None,
             tool_cb: None,
         }
     }
@@ -76,7 +80,7 @@ impl Agent {
         self
     }
 
-    /// 在默认系统提示末尾追加额外内容（如项目 WYJ.md 说明）
+    /// 在默认系统提示末尾追加额外内容（如 Plan 模式限制说明）
     pub fn append_system(mut self, extra: impl Into<String>) -> Self {
         let e = extra.into();
         if !e.is_empty() {
@@ -89,6 +93,19 @@ impl Agent {
     pub fn with_memory(mut self, mem: Arc<MemoryStore>) -> Self {
         self.memory = Some(mem);
         self
+    }
+
+    pub fn memory_ref(&self) -> Option<&Arc<MemoryStore>> {
+        self.memory.as_ref()
+    }
+
+    pub fn with_claude_md(mut self, loader: Arc<ClaudeMdLoader>) -> Self {
+        self.claude_md = Some(loader);
+        self
+    }
+
+    pub fn claude_md_ref(&self) -> Option<&Arc<ClaudeMdLoader>> {
+        self.claude_md.as_ref()
     }
 
     /// 注册工具事件回调（用于 headless 格式化输出或 TUI 事件推送）
@@ -153,6 +170,15 @@ impl Agent {
         } else {
             self.system_prompt.clone()
         };
+
+        // 每轮对话开始时重新读盘拼装 CLAUDE.md 系文件内容，以 <system-reminder> 文本块
+        // 前插进本轮刚 push 的 user 消息（而非焊死进 system prompt）：
+        // 保证运行期间编辑立即生效、压缩后依然完整（每轮都重新拼装，不依赖历史消息留存）。
+        if let Some(loader) = &self.claude_md {
+            if let Some(reminder) = loader.turn_reminder() {
+                session.prepend_to_last_user(vec![ContentBlock::Text { text: reminder }]);
+            }
+        }
 
         let mut turn = 0;
         loop {
@@ -237,8 +263,14 @@ impl Agent {
             if has_tool_calls {
                 // 顺序执行所有工具（ctx 不是 Send，不能并发）
                 let mut tool_results = vec![];
+                let mut touched_dirs: Vec<std::path::PathBuf> = vec![];
                 for (id, name, json) in pending_tools {
                     let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                    if self.claude_md.is_some() {
+                        if let Some(dir) = touched_dir(&name, &input, ctx.cwd()) {
+                            touched_dirs.push(dir);
+                        }
+                    }
                     let tool = self.tool_impls.get(&name).cloned();
 
                     // 触发工具开始回调
@@ -283,6 +315,20 @@ impl Agent {
                 for (id, _name, (output, is_error), _elapsed) in tool_results {
                     session.push_tool_result(id, output, is_error);
                 }
+
+                // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
+                // 追加进同一条工具结果消息（复用注入合并的既有模式）。
+                if let Some(loader) = &self.claude_md {
+                    let mut reminders = vec![];
+                    for dir in touched_dirs {
+                        if let Some(text) = loader.maybe_dir_reminder(&dir) {
+                            reminders.push(ContentBlock::Text { text });
+                        }
+                    }
+                    if !reminders.is_empty() {
+                        session.push_user_blocks_merged(reminders);
+                    }
+                }
             }
 
             // 排空可选的注入通道：把 Agent 忙碌期间用户提交的补充内容块，
@@ -325,4 +371,30 @@ impl Agent {
 
 fn default_system_prompt() -> String {
     wyj_i18n::tr("system_prompt.default")
+}
+
+/// 从工具调用输入里推导其触达的目录，供 CLAUDE.md 子目录动态加载判断。
+/// Read/Edit/Write 用 file_path（取父目录）；Glob/Grep 用 path（文件取父目录，目录取自身）。
+fn touched_dir(
+    tool_name: &str,
+    input: &serde_json::Value,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let field = match tool_name {
+        "Read" | "Edit" | "Write" => "file_path",
+        "Glob" | "Grep" => "path",
+        _ => return None,
+    };
+    let raw = input.get(field)?.as_str()?;
+    let p = std::path::Path::new(raw);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    if resolved.is_dir() {
+        Some(resolved)
+    } else {
+        resolved.parent().map(|p| p.to_path_buf())
+    }
 }

@@ -5,7 +5,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 use wyj_api::{
     provider::Provider,
@@ -27,6 +30,8 @@ struct MemoryItem {
 /// 记忆存储：管理项目级持久化记忆文件
 pub struct MemoryStore {
     dir: PathBuf,
+    /// 是否启用跨会话记忆自动提取（/memory 面板可切换，对应 Config.auto_memory_enabled）
+    enabled: AtomicBool,
 }
 
 impl MemoryStore {
@@ -35,7 +40,18 @@ impl MemoryStore {
         let pid = project_id(cwd);
         let dir = base_dir.join("memory").join(pid);
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            enabled: AtomicBool::new(true),
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// 加载记忆摘要，返回供注入 system prompt 的字符串
@@ -78,6 +94,9 @@ impl MemoryStore {
         messages: Vec<Message>,
         provider: Arc<dyn Provider>,
     ) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         if messages.len() < 4 {
             return Ok(());
         }

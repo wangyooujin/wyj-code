@@ -33,41 +33,60 @@ struct Cli {
     continue_session: bool,
     #[arg(long, help = wyj_i18n::tr("cli.resume_help"))]
     resume: Option<String>,
+    #[arg(long, help = wyj_i18n::tr("cli.profile_help"))]
+    profile: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
     // --help 文本、以及后续所有输出都使用正确的语言。
-    let cfg = Config::load()?;
+    let mut cfg = Config::load()?;
     let lang = cfg
         .language
         .clone()
         .unwrap_or_else(|| wyj_i18n::detect_system_locale().to_string());
     wyj_i18n::set_locale(&lang);
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    if let Some(name) = cli.profile.take() {
+        if !cfg.profiles.iter().any(|p| p.name == name) {
+            eprintln!(
+                "{}",
+                wyj_i18n::tr_fmt("cli.profile_not_found", &[("name", &name)])
+            );
+            std::process::exit(1);
+        }
+        // 仅覆盖本次运行使用的分组，不落盘、不改 active_profile 持久值
+        cfg.active_profile = name;
+    }
+
     if cli.config_status {
+        let active = cfg.active_profile().clone();
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt("status.active_profile", &[("name", &active.name)])
+        );
         println!(
             "{}",
             wyj_i18n::tr_fmt(
                 "status.provider",
-                &[("provider", &cfg.provider.to_string())]
+                &[("provider", &active.provider.to_string())]
             )
         );
         println!(
             "{}",
-            wyj_i18n::tr_fmt("status.model", &[("model", &cfg.model)])
+            wyj_i18n::tr_fmt("status.model", &[("model", &active.model)])
         );
-        if let Some(m) = &cfg.plan_model {
+        if let Some(m) = &active.plan_model {
             println!("{}", wyj_i18n::tr_fmt("status.plan_model", &[("model", m)]));
         }
-        if let Some(m) = &cfg.exec_model {
+        if let Some(m) = &active.exec_model {
             println!("{}", wyj_i18n::tr_fmt("status.exec_model", &[("model", m)]));
         }
         println!(
@@ -86,6 +105,18 @@ async fn main() -> Result<()> {
                 "{}",
                 wyj_i18n::tr_fmt("status.api_key_error", &[("err", &e.to_string())])
             ),
+        }
+        let others: Vec<&str> = cfg
+            .profiles
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|n| *n != active.name)
+            .collect();
+        if !others.is_empty() {
+            println!(
+                "{}",
+                wyj_i18n::tr_fmt("status.other_profiles", &[("names", &others.join(", "))])
+            );
         }
         println!(
             "{}",
@@ -161,9 +192,20 @@ async fn main() -> Result<()> {
     let session_store_arc = session_store.map(std::sync::Arc::new);
 
     let memory_store = MemoryStore::new(&config_base, &cwd)
-        .map(Arc::new)
+        .map(|m| {
+            m.set_enabled(cfg.auto_memory_enabled);
+            Arc::new(m)
+        })
         .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
         .ok();
+
+    // CLAUDE.md 系记忆文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
+    // （共享子目录动态加载去重状态）。
+    let claude_md_loader = Arc::new(wyj_core::ClaudeMdLoader::new(&cwd));
+
+    // 供 TUI 语言/模型切换重建 Agent 时复用（避免重建后丢失记忆能力）
+    let memory_store_for_rebuild = memory_store.clone();
+    let claude_md_for_rebuild = claude_md_loader.clone();
 
     // 确定当前运行模式
     let mode = if cli.plan {
@@ -211,12 +253,15 @@ async fn main() -> Result<()> {
     registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
+    let claude_md_for_sub = claude_md_loader.clone();
     registry.register_arc(Arc::new(SubAgentTool::new(move || {
         let sub_model = cfg_clone.model_for_mode(&AgentMode::Normal).to_string();
         let sub_provider = wyj_api::build_provider_with_model(&cfg_clone, &sub_model)
             .expect("子 Agent 创建 provider 失败");
         let sub_registry = ToolRegistry::standard();
-        let mut sub_agent = Agent::new(sub_provider).with_max_tokens(cfg_clone.max_tokens);
+        let mut sub_agent = Agent::new(sub_provider)
+            .with_max_tokens(cfg_clone.active_profile().max_tokens)
+            .with_claude_md(claude_md_for_sub.clone());
         for def in sub_registry.definitions() {
             if let Some(t) = sub_registry.get(&def.name) {
                 sub_agent.register_tool(t);
@@ -239,13 +284,13 @@ async fn main() -> Result<()> {
     }
 
     let mut agent = Agent::new(provider)
-        .with_max_tokens(cfg.max_tokens)
-        .with_context_window(cfg.context_window);
+        .with_max_tokens(cfg.active_profile().max_tokens)
+        .with_context_window(cfg.active_profile().context_window);
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧在运行时切换语言、需要用新语言重建 system prompt 时，能在新的
-    // default 提示词后原样拼回这些追加内容（WYJ.md 说明、Plan 模式限制等），
-    // 避免语言切换把这些内容冲掉。
+    // default 提示词后原样拼回这些追加内容（目前仅 Plan 模式限制说明；CLAUDE.md
+    // 系文件不再焊死进 system prompt，而是每轮重新读盘注入对话历史，见 with_claude_md）。
     let mut system_prompt_extra = String::new();
 
     // Plan 模式在系统提示中说明只读约束
@@ -256,19 +301,7 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str(&extra);
     }
 
-    let wyj_md = cwd.join("WYJ.md");
-    if wyj_md.exists() {
-        if let Ok(content) = std::fs::read_to_string(&wyj_md) {
-            if !content.trim().is_empty() {
-                let extra =
-                    wyj_i18n::tr_fmt("system_prompt.wyjmd_header", &[("content", &content)]);
-                agent = agent.append_system(extra.clone());
-                system_prompt_extra.push_str("\n\n");
-                system_prompt_extra.push_str(&extra);
-                tracing::debug!("已加载 WYJ.md ({} 字节)", content.len());
-            }
-        }
-    }
+    agent = agent.with_claude_md(claude_md_loader.clone());
 
     if let Some(mem) = memory_store {
         agent = agent.with_memory(mem);
@@ -322,7 +355,7 @@ async fn main() -> Result<()> {
         agent
     };
 
-    let context_window = cfg.context_window;
+    let context_window = cfg.active_profile().context_window;
 
     if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
@@ -379,8 +412,12 @@ async fn main() -> Result<()> {
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let mut new_agent = Agent::new(provider)
-                .with_max_tokens(cfg.max_tokens)
-                .with_context_window(cfg.context_window);
+                .with_max_tokens(cfg.active_profile().max_tokens)
+                .with_context_window(cfg.active_profile().context_window)
+                .with_claude_md(claude_md_for_rebuild.clone());
+            if let Some(mem) = &memory_store_for_rebuild {
+                new_agent = new_agent.with_memory(mem.clone());
+            }
             let mut reg = ToolRegistry::standard();
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
             reg.register_arc(Arc::new(AskQuestionTool::new()));
@@ -497,7 +534,9 @@ async fn repl(
                 Ok(CommandResult::CompactHistory) => {
                     println!("[headless 模式不支持 /compact]");
                 }
-                Ok(CommandResult::SetModel(m)) => println!("模型已切换: {m}（重启生效）"),
+                Ok(CommandResult::OpenProfileDialog) | Ok(CommandResult::SwitchProfile(_)) => {
+                    println!("{}", wyj_i18n::tr("profile.headless_unsupported"));
+                }
                 Ok(CommandResult::RunPrompt(prompt)) => {
                     // Skill 展开后的 prompt → 当作用户消息发给 agent
                     session.push_user(prompt);
@@ -527,6 +566,11 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenSettingsDialog) => {
                     println!("[headless 模式不支持设置面板，请直接编辑 ~/.wyj-code/config.toml]");
+                }
+                Ok(CommandResult::OpenMemoryDialog) => {
+                    println!(
+                        "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
+                    );
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),

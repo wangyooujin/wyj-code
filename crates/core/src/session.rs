@@ -60,6 +60,18 @@ impl Session {
         }
     }
 
+    /// 把内容块前插到最后一条消息（必须是 user 消息）的内容开头。
+    /// 用于每轮对话开始时把 CLAUDE.md `<system-reminder>` 插在用户实际输入之前。
+    pub fn prepend_to_last_user(&mut self, blocks: Vec<ContentBlock>) {
+        if let Some(m) = self.messages.last_mut() {
+            if matches!(m.role, Role::User) {
+                let mut new_content = blocks;
+                new_content.append(&mut m.content);
+                m.content = new_content;
+            }
+        }
+    }
+
     pub fn add_usage(&mut self, input: u32, output: u32) {
         self.total_input_tokens += input;
         self.total_output_tokens += output;

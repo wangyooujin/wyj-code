@@ -54,6 +54,12 @@ pub enum AgentEvent {
     },
     /// Agent 忙碌期间排队的补充消息已被消费并合并进 session
     Injected,
+    /// 分组管理面板"拉取模型列表"结果（entry 下标, field 下标, 拉取结果）
+    ModelsFetched {
+        entry_idx: usize,
+        field_idx: usize,
+        result: Result<Vec<String>, String>,
+    },
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

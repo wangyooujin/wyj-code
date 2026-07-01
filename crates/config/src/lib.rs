@@ -91,10 +91,11 @@ impl std::fmt::Display for Provider {
     }
 }
 
-/// 主配置结构，对应 ~/.wyj-code/config.toml
+/// 一个具名的"调用分组"：一套完整的供应商调用参数，可与其他分组并存、按名切换。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Config {
+pub struct Profile {
+    /// 分组名称（在 Config.profiles 中唯一）
+    pub name: String,
     /// LLM 供应商格式（anthropic 或 openai）
     pub provider: Provider,
     /// 默认模型名称
@@ -106,26 +107,21 @@ pub struct Config {
     #[serde(default)]
     pub exec_model: Option<String>,
     /// API 端点（留空使用供应商默认值）
+    #[serde(default)]
     pub base_url: String,
-    /// API Key（优先从环境变量 WYJ_CODE_API_KEY 读取）
+    /// API Key（优先从环境变量 WYJ_CODE_API_KEY 读取，覆盖到激活分组）
+    #[serde(default)]
     pub api_key: Option<String>,
     /// 最大 token 预算（每轮）
     pub max_tokens: u32,
     /// 模型最大上下文窗口 token 数（用于自动压缩触发判断）
     pub context_window: u32,
-    /// 日志级别
-    pub log_level: String,
-    /// 界面/AI 回复语言（"en"/"zh"）。留空则自动检测系统 locale。
-    #[serde(default)]
-    pub language: Option<String>,
-    /// MCP server 列表（空列表则不启动任何 MCP）
-    #[serde(default)]
-    pub mcp_servers: Vec<McpServerConfig>,
 }
 
-impl Default for Config {
+impl Default for Profile {
     fn default() -> Self {
         Self {
+            name: "default".to_string(),
             provider: Provider::Anthropic,
             model: "claude-opus-4-8".to_string(),
             plan_model: None,
@@ -134,6 +130,81 @@ impl Default for Config {
             api_key: None,
             max_tokens: 8192,
             context_window: 200_000,
+        }
+    }
+}
+
+/// 主配置结构，对应 ~/.wyj-code/config.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    /// 当前激活的分组名（对应 profiles 中某一项的 name）
+    pub active_profile: String,
+    /// 所有已配置的调用分组
+    pub profiles: Vec<Profile>,
+    /// 日志级别
+    pub log_level: String,
+    /// 界面/AI 回复语言（"en"/"zh"）。留空则自动检测系统 locale。
+    #[serde(default)]
+    pub language: Option<String>,
+    /// MCP server 列表（空列表则不启动任何 MCP）
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// 是否启用跨会话记忆自动提取（/memory 面板可切换，默认开启）
+    #[serde(default = "default_true")]
+    pub auto_memory_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            active_profile: "default".to_string(),
+            profiles: vec![Profile::default()],
+            log_level: "warn".to_string(),
+            language: None,
+            mcp_servers: vec![],
+            auto_memory_enabled: true,
+        }
+    }
+}
+
+/// 旧版（v0）扁平配置结构，仅用于 `Config::load()` 里一次性迁移旧 config.toml。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct LegacyConfigV0 {
+    provider: Provider,
+    model: String,
+    #[serde(default)]
+    plan_model: Option<String>,
+    #[serde(default)]
+    exec_model: Option<String>,
+    base_url: String,
+    api_key: Option<String>,
+    max_tokens: u32,
+    context_window: u32,
+    log_level: String,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
+}
+
+impl Default for LegacyConfigV0 {
+    fn default() -> Self {
+        let p = Profile::default();
+        Self {
+            provider: p.provider,
+            model: p.model,
+            plan_model: p.plan_model,
+            exec_model: p.exec_model,
+            base_url: p.base_url,
+            api_key: p.api_key,
+            max_tokens: p.max_tokens,
+            context_window: p.context_window,
             log_level: "warn".to_string(),
             language: None,
             mcp_servers: vec![],
@@ -141,44 +212,111 @@ impl Default for Config {
     }
 }
 
-impl Config {
-    /// 根据 AgentMode 返回对应模型名（未配置则回退到全局 model）
-    pub fn model_for_mode(&self, mode: &AgentMode) -> &str {
-        match mode {
-            AgentMode::Plan => self.plan_model.as_deref().unwrap_or(&self.model),
-            AgentMode::Normal | AgentMode::Bypass => {
-                self.exec_model.as_deref().unwrap_or(&self.model)
-            }
+impl From<LegacyConfigV0> for Config {
+    fn from(legacy: LegacyConfigV0) -> Self {
+        Config {
+            active_profile: "default".to_string(),
+            profiles: vec![Profile {
+                name: "default".to_string(),
+                provider: legacy.provider,
+                model: legacy.model,
+                plan_model: legacy.plan_model,
+                exec_model: legacy.exec_model,
+                base_url: legacy.base_url,
+                api_key: legacy.api_key,
+                max_tokens: legacy.max_tokens,
+                context_window: legacy.context_window,
+            }],
+            log_level: legacy.log_level,
+            language: legacy.language,
+            mcp_servers: legacy.mcp_servers,
+            auto_memory_enabled: true,
         }
     }
 }
 
 impl Config {
-    /// 加载配置：先读文件，再用环境变量覆盖 api_key。
+    /// 返回当前激活分组（按名查找，找不到则回退到第一个；profiles 非空是不变量）。
+    pub fn active_profile(&self) -> &Profile {
+        self.profiles
+            .iter()
+            .find(|p| p.name == self.active_profile)
+            .unwrap_or(&self.profiles[0])
+    }
+
+    /// 返回当前激活分组的可变引用。
+    pub fn active_profile_mut(&mut self) -> &mut Profile {
+        let name = self.active_profile.clone();
+        if let Some(idx) = self.profiles.iter().position(|p| p.name == name) {
+            &mut self.profiles[idx]
+        } else {
+            &mut self.profiles[0]
+        }
+    }
+
+    /// 当前激活分组的供应商格式。
+    pub fn provider(&self) -> &Provider {
+        &self.active_profile().provider
+    }
+
+    /// 根据 AgentMode 返回对应模型名（未配置则回退到激活分组的 model）
+    pub fn model_for_mode(&self, mode: &AgentMode) -> &str {
+        let p = self.active_profile();
+        match mode {
+            AgentMode::Plan => p.plan_model.as_deref().unwrap_or(&p.model),
+            AgentMode::Normal | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
+        }
+    }
+}
+
+impl Config {
+    /// 加载配置：先读文件（含旧格式一次性迁移），再用环境变量覆盖激活分组的 api_key。
     pub fn load() -> Result<Self> {
         let config_path = config_file_path()?;
         let mut cfg: Config = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path)
                 .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
-            toml::from_str(&content)
-                .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?
+            let value: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?;
+            if value.get("profiles").is_some() {
+                toml::from_str(&content)
+                    .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?
+            } else {
+                let legacy: LegacyConfigV0 = toml::from_str(&content)
+                    .with_context(|| format!("解析旧版配置文件失败: {}", config_path.display()))?;
+                let migrated: Config = legacy.into();
+                migrated.save().context("迁移旧版配置文件失败")?;
+                tracing::info!(
+                    "已将旧版配置迁移为分组结构，默认分组名为 default: {}",
+                    config_path.display()
+                );
+                migrated
+            }
         } else {
             Config::default()
         };
 
-        // 环境变量优先
+        if cfg.profiles.is_empty() {
+            cfg.profiles.push(Profile::default());
+        }
+        if !cfg.profiles.iter().any(|p| p.name == cfg.active_profile) {
+            cfg.active_profile = cfg.profiles[0].name.clone();
+        }
+
+        // 环境变量优先，覆盖到激活分组
         if let Ok(key) = std::env::var("WYJ_CODE_API_KEY") {
             if !key.is_empty() {
-                cfg.api_key = Some(key);
+                cfg.active_profile_mut().api_key = Some(key);
             }
         }
 
         Ok(cfg)
     }
 
-    /// 返回有效的 API Key，若无则报错。
+    /// 返回激活分组的有效 API Key，若无则报错。
     pub fn api_key(&self) -> Result<&str> {
-        self.api_key
+        self.active_profile()
+            .api_key
             .as_deref()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| {
@@ -188,14 +326,15 @@ impl Config {
             })
     }
 
-    /// 返回供应商的默认 base_url（若配置为空时使用）。
+    /// 返回激活分组的 base_url（若配置为空则用供应商默认值）。
     pub fn resolved_base_url(&self) -> &str {
-        if !self.base_url.is_empty() {
-            &self.base_url
+        let p = self.active_profile();
+        if !p.base_url.is_empty() {
+            &p.base_url
         } else {
-            match self.provider {
+            match p.provider {
                 Provider::Anthropic => "https://api.anthropic.com",
-                Provider::OpenAI => "https://api.openai.com",
+                Provider::OpenAI => "https://api.openai.com/v1",
             }
         }
     }
@@ -224,4 +363,17 @@ pub fn config_dir() -> Result<PathBuf> {
 /// 返回主配置文件路径（~/.wyj-code/config.toml）。
 pub fn config_file_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
+}
+
+/// 返回真实 Claude Code 的全局配置目录路径（~/.claude），仅解析路径、不创建。
+/// 复用该路径是为了让 wyj-code 直接吃到用户已有的真实 Claude Code 全局
+/// CLAUDE.md 记忆，与其使用习惯保持一致。
+pub fn claude_home_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude"))
+}
+
+/// 返回用户主目录路径。
+pub fn home_dir() -> Result<PathBuf> {
+    let user_dirs = UserDirs::new().ok_or_else(|| anyhow::anyhow!("无法获取用户主目录"))?;
+    Ok(user_dirs.home_dir().to_path_buf())
 }
