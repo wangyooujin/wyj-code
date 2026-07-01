@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
     tool_ctx.permission_mode = match &mode {
         AgentMode::Plan => {
             let set: std::collections::HashSet<String> =
-                ["Read", "Glob", "Grep", "WebFetch", "AskQuestion"]
+                ["Read", "Glob", "Grep", "WebFetch", "AskQuestion", "Write", "Bash", "ExitPlanMode", "TodoWrite"]
                     .iter()
                     .map(|s| s.to_string())
                     .collect();

@@ -1,6 +1,6 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, Attachment, AskQuestionDialog, MessageRole, PermissionDialog, PlanApprovalDialog, SessionPickerState};
+use crate::app::{AppState, Attachment, AskQuestionDialog, ExecModeConfirmDialog, MessageRole, PermissionDialog, PlanApprovalDialog, SessionPickerState};
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
@@ -125,6 +125,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     draw_chat(f, state, chunks[0]);
     match panel_kind {
         BottomPanel::None => {}
+        BottomPanel::ExecModeConfirm => {
+            if let Some(dlg) = &state.exec_mode_confirm {
+                draw_exec_mode_confirm_panel(f, dlg, chunks[1]);
+            }
+        }
         BottomPanel::PlanApproval => {
             if let Some(dlg) = &state.plan_dialog {
                 draw_plan_approval_panel(f, dlg, chunks[1]);
@@ -166,12 +171,16 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 /// 底部面板类型与高度
 enum BottomPanel {
     None,
+    ExecModeConfirm,
     PlanApproval,
     AskQuestion,
     TodoList,
 }
 
 fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
+    if state.exec_mode_confirm.is_some() {
+        return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
+    }
     if state.plan_dialog.is_some() {
         return (5u16.min(area_height), BottomPanel::PlanApproval);
     }
@@ -854,13 +863,6 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
-    } else if !state.mouse_capture {
-        (
-            "select mode (ctrl+t to scroll)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
     } else {
         ("ctrl+d or ctrl+c twice to exit  /help", Theme::dim())
     };
@@ -987,6 +989,35 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
         Line::from(Span::styled(
             "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划",
             Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+}
+
+fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmDialog, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::warning())
+        .title(Span::styled(
+            " ⚠ 检测到计划已批准 ",
+            Theme::warning().add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_w = inner.width as usize;
+    let preview = truncate_line(&dlg.pending_message, max_w.saturating_sub(6));
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("待发送：", Style::default().fg(Color::DarkGray)),
+            Span::styled(preview, Style::default().fg(Color::White)),
+        ]),
+        Line::from(Span::styled(
+            "  [y/Enter] 切换执行模式并发送   [n] 保持规划模式发送   [Esc] 取消",
+            Theme::warning().add_modifier(Modifier::BOLD),
         )),
     ];
     let para = Paragraph::new(Text::from(lines));
