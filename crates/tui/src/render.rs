@@ -1,6 +1,10 @@
 //! 对话渲染与布局
 
-use crate::app::{AppState, Attachment, AskQuestionDialog, ExecModeConfirmDialog, MessageRole, PermissionDialog, PlanApprovalDialog, SessionPickerState};
+use crate::app::{
+    AppState, AskQuestionDialog, Attachment, ExecModeConfirmDialog, MessageRole, PermissionDialog,
+    PlanApprovalDialog, SessionPickerState, SettingsDialog, SETTINGS_API_KEY_FIELD_IDX,
+    SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+};
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
@@ -23,11 +27,15 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
             spans.push(Span::raw(rest[..at_pos].to_string()));
         }
         let after = &rest[at_pos + 1..];
-        let end = after.find(|c: char| c.is_whitespace()).unwrap_or(after.len());
+        let end = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
         let token = rest[at_pos..at_pos + 1 + end].to_string();
         spans.push(Span::styled(
             token,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
         rest = &rest[at_pos + 1 + end..];
     }
@@ -39,7 +47,9 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
 
 /// 字符显示宽度：CJK 全角 = 2，其余 = 1
 fn char_display_width(c: char) -> usize {
-    if c == '\t' { return 4; }
+    if c == '\t' {
+        return 4;
+    }
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
         || (0x2E80..=0x303E).contains(&cp)   // CJK Radicals
@@ -50,7 +60,8 @@ fn char_display_width(c: char) -> usize {
         || (0xFF00..=0xFF60).contains(&cp)   // Fullwidth
         || (0xFFE0..=0xFFE6).contains(&cp)   // Fullwidth Signs
         || (0x1F300..=0x1F9FF).contains(&cp) // Emoji
-        || (0x20000..=0x2FA1F).contains(&cp) // CJK Extension
+        || (0x20000..=0x2FA1F).contains(&cp)
+    // CJK Extension
     {
         2
     } else {
@@ -105,7 +116,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     };
 
     // 附件预览条高度（有附件时显示）
-    let attach_height: u16 = if state.pending_attachments.is_empty() { 0 } else { 3 };
+    let attach_height: u16 = if state.pending_attachments.is_empty() {
+        0
+    } else {
+        3
+    };
 
     // 底部面板高度：AskQuestion 优先，否则 TaskList，否则 0
     let (panel_height, panel_kind) = bottom_panel_size(state, area.height);
@@ -165,6 +180,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 会话选择器叠加在最顶层
     if let Some(picker) = &state.session_picker {
         draw_session_picker(f, picker, area);
+    }
+
+    // 设置面板叠加在最顶层
+    if let Some(dialog) = &state.settings_dialog {
+        draw_settings_dialog(f, dialog, area);
     }
 }
 
@@ -392,9 +412,10 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                 lines.push(Line::from(""));
             }
             MessageRole::TurnSummary => {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {}", msg.content), Theme::dim()),
-                ]));
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {}", msg.content),
+                    Theme::dim(),
+                )]));
                 lines.push(Line::from(""));
             }
         }
@@ -405,15 +426,22 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         render_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
-
     let text = Text::from(lines);
 
     // 计算折行后的实际视觉行数（CJK/长行会比逻辑行数多）
     let cw = content_area.width.max(1);
-    let total_visual_lines: u16 = text.lines.iter().map(|line| {
-        let w = line.width() as u16;
-        if w == 0 { 1u16 } else { (w + cw - 1) / cw }
-    }).sum();
+    let total_visual_lines: u16 = text
+        .lines
+        .iter()
+        .map(|line| {
+            let w = line.width() as u16;
+            if w == 0 {
+                1u16
+            } else {
+                (w + cw - 1) / cw
+            }
+        })
+        .sum();
 
     let visible_height = content_area.height;
     state.chat_height = visible_height;
@@ -431,8 +459,8 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     state.scrollbar_area = scrollbar_area;
 
     // 滚动条（内容超出可视区时显示 ▲/▼ 箭头 + 拇指指示器）
-    let can_scroll_up = clamped_offset < max_scroll;   // 还有更早内容
-    let can_scroll_down = clamped_offset > 0;           // 还有更新内容
+    let can_scroll_up = clamped_offset < max_scroll; // 还有更早内容
+    let can_scroll_down = clamped_offset > 0; // 还有更新内容
     if total_visual_lines > visible_height && visible_height > 0 {
         // 拇指在中间轨道（排除头尾各 1 行的箭头位置）
         let track_height = visible_height.saturating_sub(2);
@@ -442,25 +470,27 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         } else {
             1
         };
-        let bar_lines: Vec<Line<'static>> = (0..visible_height).map(|row| {
-            if row == 0 {
-                if can_scroll_up {
-                    Line::from(Span::styled("▲", Style::default().fg(Color::DarkGray)))
+        let bar_lines: Vec<Line<'static>> = (0..visible_height)
+            .map(|row| {
+                if row == 0 {
+                    if can_scroll_up {
+                        Line::from(Span::styled("▲", Style::default().fg(Color::DarkGray)))
+                    } else {
+                        Line::from(Span::styled("╷", Theme::dim()))
+                    }
+                } else if row == visible_height - 1 {
+                    if can_scroll_down {
+                        Line::from(Span::styled("▼", Style::default().fg(Color::DarkGray)))
+                    } else {
+                        Line::from(Span::styled("╵", Theme::dim()))
+                    }
+                } else if row == thumb_row {
+                    Line::from(Span::styled("█", Style::default().fg(Color::DarkGray)))
                 } else {
-                    Line::from(Span::styled("╷", Theme::dim()))
+                    Line::from(Span::styled("│", Theme::dim()))
                 }
-            } else if row == visible_height - 1 {
-                if can_scroll_down {
-                    Line::from(Span::styled("▼", Style::default().fg(Color::DarkGray)))
-                } else {
-                    Line::from(Span::styled("╵", Theme::dim()))
-                }
-            } else if row == thumb_row {
-                Line::from(Span::styled("█", Style::default().fg(Color::DarkGray)))
-            } else {
-                Line::from(Span::styled("│", Theme::dim()))
-            }
-        }).collect();
+            })
+            .collect();
         f.render_widget(Paragraph::new(Text::from(bar_lines)), scrollbar_area);
     }
 }
@@ -687,7 +717,9 @@ fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
             " @ 文件 ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -697,7 +729,11 @@ fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
     let items = &state.file_completions;
     let selected = state.file_selected;
 
-    let start = if selected >= max_show { selected - max_show + 1 } else { 0 };
+    let start = if selected >= max_show {
+        selected - max_show + 1
+    } else {
+        0
+    };
 
     let name_col_w = items
         .iter()
@@ -718,7 +754,10 @@ fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
             let display = format!("{prefix}{}", entry.display);
             let name_padded = format!(" {:width$}", display, width = name_col_w.saturating_sub(1));
             let hint = if entry.is_dir {
-                format!("  {}/", truncate_chars(&entry.rel_path, desc_budget.saturating_sub(1)))
+                format!(
+                    "  {}/",
+                    truncate_chars(&entry.rel_path, desc_budget.saturating_sub(1))
+                )
             } else {
                 format!("  {}", truncate_chars(&entry.rel_path, desc_budget))
             };
@@ -856,15 +895,28 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         }
     };
 
-    let (right_help, right_style) = if state.ctrl_c_pressed {
+    let (right_help, right_style) = if !state.pending_queue.is_empty() {
         (
-            "ctrl+c again to exit",
+            format!(
+                "● {} 条消息已排队，将在当前操作完成后发送",
+                state.pending_queue.len()
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if state.ctrl_c_pressed {
+        (
+            "ctrl+c again to exit".to_string(),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("ctrl+d or ctrl+c twice to exit  /help", Theme::dim())
+        (
+            "ctrl+d or ctrl+c twice to exit  /help".to_string(),
+            Theme::dim(),
+        )
     };
 
     let mode_span = match &state.mode {
@@ -935,7 +987,10 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Theme::permission_dialog())
-        .title(Span::styled(" ⚑ 权限确认 ", Theme::permission_dialog()));
+        .title(Span::styled(
+            wyj_i18n::tr("dialog.permission_title"),
+            Theme::permission_dialog(),
+        ));
 
     let inner = block.inner(dialog_area);
     f.render_widget(block, dialog_area);
@@ -944,7 +999,7 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
 
     let lines: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled("工具: ", Theme::dim()),
+            Span::styled(wyj_i18n::tr("dialog.permission_tool_label"), Theme::dim()),
             Span::styled(dlg.tool_name.clone(), Theme::permission_dialog()),
         ]),
         Line::from(Span::styled(
@@ -954,7 +1009,7 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
         Line::from(Span::raw(preview)),
         Line::from(""),
         Line::from(Span::styled(
-            "  [y] 本次允许  [s] Session 允许  [p] 永久允许  [n] 拒绝",
+            wyj_i18n::tr("dialog.permission_hint"),
             Theme::highlight(),
         )),
     ];
@@ -971,7 +1026,9 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
         .border_style(Style::default().fg(Color::Blue))
         .title(Span::styled(
             " 📋 计划已就绪 ",
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -988,7 +1045,9 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
         Line::from(Span::styled(file_line, Style::default().fg(Color::White))),
         Line::from(Span::styled(
             "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划",
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
     let para = Paragraph::new(Text::from(lines));
@@ -1029,7 +1088,7 @@ fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::CLAUDE))
         .title(Span::styled(
-            " ◆ Agent 提问 ",
+            wyj_i18n::tr("dialog.ask_question_title"),
             Style::default()
                 .fg(Theme::CLAUDE)
                 .add_modifier(Modifier::BOLD),
@@ -1068,7 +1127,7 @@ fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑↓ 选择  Enter 确认  Esc 取消",
+        wyj_i18n::tr("dialog.hint_select_confirm_cancel"),
         Theme::dim(),
     )));
 
@@ -1094,7 +1153,10 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::CLAUDE))
         .title(Span::styled(
-            format!(" 会话列表 ({n_sessions}) "),
+            wyj_i18n::tr_fmt(
+                "dialog.session_picker_title",
+                &[("count", &n_sessions.to_string())],
+            ),
             Style::default()
                 .fg(Theme::CLAUDE)
                 .add_modifier(Modifier::BOLD),
@@ -1105,29 +1167,27 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
 
     let w = inner.width as usize;
     let home = std::env::var("HOME").unwrap_or_default();
+    let new_session_label = wyj_i18n::tr("dialog.new_session_label");
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // "新建会话" 条目（selected == 0 时高亮）
     if picker.selected == 0 {
         lines.push(Line::from(Span::styled(
-            format!("  ▶ {:<w$}", "+ 新建会话", w = w.saturating_sub(4)),
+            format!("  ▶ {:<w$}", new_session_label, w = w.saturating_sub(4)),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("    {:<w$}", "+ 新建会话", w = w.saturating_sub(4)),
+            format!("    {:<w$}", new_session_label, w = w.saturating_sub(4)),
             Style::default().fg(Color::Green),
         )));
     }
 
     if !picker.sessions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "─".repeat(w),
-            Theme::border(),
-        )));
+        lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
 
         for (i, meta) in picker.sessions.iter().enumerate() {
             let selected = picker.selected == i + 1;
@@ -1146,7 +1206,15 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
                 .to_string();
 
             let time_str = format_relative_time(&meta.timestamp);
-            let right = format!("  {}  {}  {}轮", time_str, cwd_last, meta.turns);
+            let right = format!(
+                "  {}  {}  {}",
+                time_str,
+                cwd_last,
+                wyj_i18n::tr_fmt(
+                    "dialog.session_turns_suffix",
+                    &[("turns", &meta.turns.to_string())]
+                )
+            );
             let right_w = right.chars().count();
             let title_w = w.saturating_sub(right_w + 4);
             let title = truncate_chars(&meta.title, title_w);
@@ -1170,12 +1238,108 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
 
     lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
     lines.push(Line::from(Span::styled(
-        "  ↑↓ 导航  Enter 选择  Esc 取消",
+        wyj_i18n::tr("dialog.hint_nav_select_cancel"),
         Theme::dim(),
     )));
 
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
+}
+
+// ─── 语言选择器 ───────────────────────────────────────────────────────────────
+
+/// api_key 打码展示：只保留前 8 位 + "..."
+fn mask_secret(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let prefix: String = s.chars().take(8).collect();
+    format!("{prefix}...")
+}
+
+fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
+    // 10 字段 + 分隔线 + 错误行 + 分隔线 + 提示行
+    let content_lines = SETTINGS_FIELD_COUNT as u16 + 4;
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 7 / 10).clamp(60, 100).min(area.width);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr("settings.title")),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+    let label_width = 18usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for idx in 0..SETTINGS_FIELD_COUNT {
+        let label = wyj_i18n::tr(SETTINGS_FIELD_LABEL_KEYS[idx]);
+        let selected = idx == dialog.selected;
+        let editing = selected && dialog.editing.is_some();
+
+        let value = if editing {
+            dialog.editing.as_ref().unwrap().lines.join("")
+        } else if idx == SETTINGS_API_KEY_FIELD_IDX {
+            mask_secret(&dialog.draft.api_key)
+        } else {
+            dialog.draft.display_value(idx)
+        };
+
+        let marker = if selected { "▶ " } else { "  " };
+        let text = format!("{marker}{label:<label_width$}{value}");
+        let text = truncate_line(&text, w);
+
+        let style = if editing {
+            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
+        } else if selected {
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("settings.hint"),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
+    // 编辑态下把终端原生光标定位到对应字段行、值文本内的正确列
+    if let Some(ib) = &dialog.editing {
+        let (_, vis_col) = ib.cursor_visual_pos(w.saturating_sub(2 + label_width));
+        let cursor_x = (inner.x + (2 + label_width + vis_col) as u16)
+            .min(inner.x + inner.width.saturating_sub(1));
+        let cursor_y =
+            (inner.y + dialog.selected as u16).min(inner.y + inner.height.saturating_sub(1));
+        f.set_cursor_position(Position::new(cursor_x, cursor_y));
+    }
 }
 
 /// 将 ISO 8601 时间戳格式化为相对时间字符串
@@ -1191,13 +1355,22 @@ fn format_relative_time(timestamp: &str) -> String {
     let diff = now.saturating_sub(ts);
 
     if diff < 60 {
-        "刚才".to_string()
+        wyj_i18n::tr("dialog.time_just_now")
     } else if diff < 3600 {
-        format!("{}分钟前", diff / 60)
+        wyj_i18n::tr_fmt(
+            "dialog.time_minutes_ago",
+            &[("n", &(diff / 60).to_string())],
+        )
     } else if diff < 86400 {
-        format!("{}小时前", diff / 3600)
+        wyj_i18n::tr_fmt(
+            "dialog.time_hours_ago",
+            &[("n", &(diff / 3600).to_string())],
+        )
     } else if diff < 7 * 86400 {
-        format!("{}天前", diff / 86400)
+        wyj_i18n::tr_fmt(
+            "dialog.time_days_ago",
+            &[("n", &(diff / 86400).to_string())],
+        )
     } else {
         timestamp.get(..10).unwrap_or(timestamp).to_string()
     }

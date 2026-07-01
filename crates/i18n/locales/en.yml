@@ -1,0 +1,202 @@
+_version: 1
+command:
+  unknown: "Unknown command: /{name}  (type /help to see all commands)"
+skill:
+  run:
+    desc: "Build and run the current project"
+  review:
+    desc: "Code review (correctness / simplification / efficiency)"
+  fix:
+    desc: "Fix a specified error or issue"
+  explain:
+    desc: "Explain code or a concept in detail"
+  commit:
+    desc: "Generate a commit message and run git commit"
+system_prompt:
+  default: |-
+    You are a professional AI programming assistant, skilled at analyzing code, solving technical problems, and writing programs.
+    When you need to operate on the file system, run commands, or search code, proactively use tools to get the task done.
+    Tool usage principle: Read before Write; Edit requires an exact match beforehand.
+    Communicate with the user in clear, accurate English, and prioritize runnable code and concrete action steps.
+  plan_mode: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (read / glob / grep / web_fetch).\nYou must not write or edit files, or run shell commands.\nFocus on analyzing code, planning approaches, and explaining architecture."
+  wyjmd_header: "## Current Project Notes (WYJ.md)\n\n{content}"
+  plan_turn: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (Read/Glob/Grep/WebFetch/Bash) and Write (only for writing the plan document).\nFirst analyze the code thoroughly, then write the complete plan to: `{path}`\nAfter writing it, call the `ExitPlanMode` tool to submit the plan and wait for user approval before executing.\nBash commands must be read-only (ls/find/cat/grep, etc.) — no write operations."
+
+cli:
+  about: "wyj-code — terminal AI coding assistant"
+  prompt_help: "One-shot Q&A (does not start the TUI)"
+  cwd_help: "Working directory (defaults to the current directory)"
+  headless_help: "Force headless REPL mode"
+  plan_help: "Plan mode: enable only read-only tools (read/glob/grep/web_fetch), for planning and analysis"
+  bypass_help: "Bypass mode: auto-approve every tool call, no permission prompts"
+  continue_help: "Resume the last session (continue the previous conversation)"
+  resume_help: "Resume a specific session ID (e.g. sess-1719723000)"
+
+main:
+  session_not_found: "Session {id} not found, starting a new session."
+  session_resumed: "Resumed session {id} ({count} messages)"
+  session_resumed_last: "Resumed last session {id} ({count} messages)"
+  no_session_history: "No session history yet, starting a new session."
+  mode_info_plan: " [plan mode: read-only tools only]"
+  mode_info_bypass: " [bypass mode: skipping permission prompts]"
+  session_stats: "Session stats"
+
+help:
+  desc: "Show all available commands and keyboard shortcuts"
+  body: |-
+    wyj-code v{version} — terminal AI coding assistant
+
+    Commands:
+    /help              Show this help
+    /clear             Clear conversation history
+    /compact [hint]    Manually compact context to reduce token usage
+    /config            Open the configuration settings panel (provider/model/api_key/base_url/language, etc.)
+    /cost              Show token usage and cost estimate for this session
+    /doctor            Diagnose environment (API Key / config / memory)
+    /memory            View cross-session memory for this project
+    /model [name]      View or switch AI model (no arg: show current)
+    /plan              Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
+    /mode [mode]       Switch run mode (normal / plan / bypass)
+    /resume [id]       Resume a past session (no arg = picker, id = resume directly)
+    /sessions          View and switch between past sessions
+    /init              Generate a WYJ.md project overview in the current directory
+    /quit              Quit wyj-code
+
+    Keyboard shortcuts:
+    Enter              Send message
+    Shift+Enter        Insert newline
+    Ctrl+C             Interrupt current task (press twice to quit)
+    Esc                Interrupt current task
+    Shift+Tab          Cycle mode Normal → Plan → Bypass
+    Ctrl+O             Expand/collapse tool result
+    Ctrl+L             Clear screen (keeps conversation history)
+    Ctrl+A / Ctrl+E    Jump to start / end of line
+    Ctrl+K             Delete from cursor to end of line
+    Ctrl+U             Delete from cursor to start of line
+    Ctrl+W             Delete previous word
+    PageUp / PageDown  Scroll chat area
+    ↑ / ↓              Browse input history
+    /                  Command completion (Tab to confirm, Esc to cancel)
+    !<command>         Run a Bash command directly
+
+    Modes:
+    Normal    Default mode, shows a permission dialog before each tool call
+    Plan      Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
+    Bypass    Skips all permission prompts, auto-approves every tool call
+
+clear:
+  desc: "Clear the current conversation history"
+
+compact:
+  desc: "Manually compact conversation context to reduce token usage"
+  usage: "/compact [summary hint]"
+
+cost:
+  desc: "Show token usage and cost estimate for this session"
+  header: "Token usage for this session"
+  line_with_price: "  Input:  {input} tokens  (~${input_cost})\nOutput: {output} tokens  (~${output_cost})\nTotal:  {total} tokens  (~${total_cost})"
+  line_no_price: "  Input:  {input} tokens\nOutput: {output} tokens\nTotal:  {total} tokens"
+  context_line: "Context: {pct}% ({estimated} / {window} tokens)"
+
+memory:
+  desc: "View cross-session memory for the current project"
+  empty: "No cross-session memory for the current project yet."
+  index_header: "## Project Memory Index\n\n{index}\n"
+  detail_header: "\n---\n\n## Memory Details\n\n"
+
+doctor:
+  desc: "Diagnose the runtime environment (API Key / config / WYJ.md / memory)"
+  header: "wyj-code v{version} environment diagnostics\n"
+  api_key_missing: "  ✗  API Key      not configured (set WYJ_CODE_API_KEY or config.toml)"
+  config_file_ok: "  ✓  Config file  {path}"
+  config_file_missing: "  ✗  Config file  {path} (missing, using defaults)"
+  config_dir_err: "  ✗  Config dir   {err}"
+  provider: "  ✓  Provider     {provider}"
+  model: "  ✓  Model        {model}"
+  wyjmd_ok: "  ✓  WYJ.md       {path}"
+  wyjmd_missing: "  ✗  WYJ.md       not found (run /init to generate)"
+  memory_dir_with_count: "  ✓  Memory dir   {path} ({count} entries)"
+  memory_dir_empty: "  ✗  Memory dir   {path} (no memory yet)"
+  mcp_configured: "  ✓  MCP servers  {count} configured"
+  mcp_none: "  -  MCP servers  not configured"
+
+status:
+  api_key_ok: "  ✓  API Key      {prefix}... (configured)"
+  provider: "Provider: {provider}"
+  model: "Model:    {model}"
+  plan_model: "Plan model: {model}"
+  exec_model: "Exec model: {model}"
+  endpoint: "Endpoint: {url}"
+  api_key_configured: "API Key: {prefix}... (configured)"
+  api_key_error: "API Key: {err}"
+  mcp_servers: "MCP servers: {count}"
+
+model:
+  desc: "View or switch the AI model (e.g. /model claude-sonnet-4-6)"
+  current: "Current model: {model}"
+  switched: "Switched model to {model}"
+  switch_failed: "[Switch failed] {err}"
+
+mode:
+  desc: "Switch run mode: /mode [normal|plan|bypass]"
+  switched: "Switched to {mode} mode"
+  switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
+  unknown: "Unknown mode '{args}'. Options: normal / plan / bypass"
+
+cwd:
+  desc: "Show the current working directory"
+  body: "Working directory: {cwd}"
+
+init:
+  desc: "Generate a WYJ.md project overview file in the current directory"
+  exists: "{path} already exists"
+  created: "Created {path}"
+  template: "# Project Notes\n\nWorking directory: {cwd}\n\nFill in project background, tech stack, and development conventions here\nfor the wyj-code AI assistant to reference.\n"
+
+config:
+  desc: "Open the configuration settings panel"
+
+resume:
+  desc: "Resume a past session (no arg = picker, /resume <session-id> = resume directly)"
+
+sessions:
+  desc: "View and switch between past sessions"
+
+quit:
+  desc: "Quit wyj-code"
+
+dialog:
+  permission_title: " ⚑ Permission Confirm "
+  permission_tool_label: "Tool: "
+  permission_hint: "  [y] Allow once  [s] Allow for session  [p] Always allow  [n] Deny"
+  ask_question_title: " ◆ Agent Question "
+  hint_select_confirm_cancel: "  ↑↓ Select  Enter Confirm  Esc Cancel"
+  session_picker_title: " Sessions ({count}) "
+  new_session_label: "+ New session"
+  hint_nav_select_cancel: "  ↑↓ Navigate  Enter Select  Esc Cancel"
+  session_turns_suffix: "{turns} turns"
+  time_just_now: "just now"
+  time_minutes_ago: "{n}m ago"
+  time_hours_ago: "{n}h ago"
+  time_days_ago: "{n}d ago"
+
+settings:
+  title: "Settings"
+  hint: "  ↑↓ Move  Enter Edit/Toggle  Ctrl+S Save  Esc Cancel"
+  saved: "Settings saved"
+  save_failed: "Failed to save settings: {err}"
+  rebuild_failed: "Settings saved, but reconnecting failed: {err} (this session still uses the old config; the new config takes effect after restart)"
+  field:
+    provider: "Provider"
+    model: "Model"
+    plan_model: "Plan Model"
+    exec_model: "Exec Model"
+    base_url: "Base URL"
+    api_key: "API Key"
+    max_tokens: "Max Tokens"
+    context_window: "Context Window"
+    log_level: "Log Level"
+    language: "Language"
+  error:
+    invalid_max_tokens: "Max Tokens must be a positive integer"
+    invalid_context_window: "Context Window must be a positive integer"

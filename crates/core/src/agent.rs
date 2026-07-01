@@ -126,6 +126,22 @@ impl Agent {
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
     ) -> Result<()> {
+        self.run_turn_with_injection(session, ctx, on_text, None, || {})
+            .await
+    }
+
+    /// 与 [`run_turn`] 相同，但额外支持在工具调用往返之间／回合结束前的自然边界
+    /// 排空一个可选的注入通道，把 Agent 忙碌期间用户提交的补充内容块合并进当前
+    /// 对话，而不打断正在进行的流式生成或工具执行。`on_inject` 在每次实际发生
+    /// 注入时被调用一次，供调用方（如 TUI）同步 UI 状态。
+    pub async fn run_turn_with_injection(
+        &self,
+        session: &mut Session,
+        ctx: &dyn ToolContext,
+        on_text: &mut impl FnMut(&str),
+        mut inject_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<Vec<ContentBlock>>>,
+        mut on_inject: impl FnMut(),
+    ) -> Result<()> {
         // 将记忆上下文追加到系统提示末尾
         let system = if let Some(mem) = &self.memory {
             let ctx_str = mem.load_context();
@@ -216,7 +232,72 @@ impl Agent {
             }
             session.push_assistant(assistant_blocks);
 
-            if stop_reason != StopReason::ToolUse || pending_tools.is_empty() {
+            let has_tool_calls = stop_reason == StopReason::ToolUse && !pending_tools.is_empty();
+
+            if has_tool_calls {
+                // 顺序执行所有工具（ctx 不是 Send，不能并发）
+                let mut tool_results = vec![];
+                for (id, name, json) in pending_tools {
+                    let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                    let tool = self.tool_impls.get(&name).cloned();
+
+                    // 触发工具开始回调
+                    if let Some(cb) = &self.tool_cb {
+                        cb(ToolEvent::Start {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                        });
+                    }
+                    let start = Instant::now();
+
+                    let result: (String, bool) = if let Some(t) = tool {
+                        if ctx.is_allowed(&name, &input) {
+                            match t.run(input, ctx).await {
+                                Ok(r) => (r.content, r.is_error),
+                                Err(e) => (format!("工具执行错误: {e}"), true),
+                            }
+                        } else {
+                            (format!("工具 `{name}` 在当前模式下不被允许"), true)
+                        }
+                    } else {
+                        (format!("工具 `{name}` 未注册"), true)
+                    };
+
+                    let elapsed_secs = start.elapsed().as_secs_f64();
+
+                    // 触发工具完成回调
+                    if let Some(cb) = &self.tool_cb {
+                        cb(ToolEvent::End {
+                            id: id.clone(),
+                            name: name.clone(),
+                            is_error: result.1,
+                            elapsed_secs,
+                            output: result.0.clone(),
+                        });
+                    }
+
+                    tool_results.push((id, name, result, elapsed_secs));
+                }
+
+                for (id, _name, (output, is_error), _elapsed) in tool_results {
+                    session.push_tool_result(id, output, is_error);
+                }
+            }
+
+            // 排空可选的注入通道：把 Agent 忙碌期间用户提交的补充内容块，
+            // 合并进当前工具结果所在的 user 消息（若刚执行过工具），
+            // 或作为一条新的 user 消息续接对话（若本轮本要结束）。
+            let mut got_injection = false;
+            if let Some(rx) = inject_rx.as_deref_mut() {
+                while let Ok(blocks) = rx.try_recv() {
+                    session.push_user_blocks_merged(blocks);
+                    got_injection = true;
+                    on_inject();
+                }
+            }
+
+            if !has_tool_calls && !got_injection {
                 // 对话轮次结束，触发后台记忆提取
                 if let Some(mem) = self.memory.as_ref().cloned() {
                     let provider = self.provider.clone();
@@ -228,55 +309,6 @@ impl Agent {
                     });
                 }
                 break;
-            }
-
-            // 顺序执行所有工具（ctx 不是 Send，不能并发）
-            let mut tool_results = vec![];
-            for (id, name, json) in pending_tools {
-                let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-                let tool = self.tool_impls.get(&name).cloned();
-
-                // 触发工具开始回调
-                if let Some(cb) = &self.tool_cb {
-                    cb(ToolEvent::Start {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                    });
-                }
-                let start = Instant::now();
-
-                let result: (String, bool) = if let Some(t) = tool {
-                    if ctx.is_allowed(&name, &input) {
-                        match t.run(input, ctx).await {
-                            Ok(r) => (r.content, r.is_error),
-                            Err(e) => (format!("工具执行错误: {e}"), true),
-                        }
-                    } else {
-                        (format!("工具 `{name}` 在当前模式下不被允许"), true)
-                    }
-                } else {
-                    (format!("工具 `{name}` 未注册"), true)
-                };
-
-                let elapsed_secs = start.elapsed().as_secs_f64();
-
-                // 触发工具完成回调
-                if let Some(cb) = &self.tool_cb {
-                    cb(ToolEvent::End {
-                        id: id.clone(),
-                        name: name.clone(),
-                        is_error: result.1,
-                        elapsed_secs,
-                        output: result.0.clone(),
-                    });
-                }
-
-                tool_results.push((id, name, result, elapsed_secs));
-            }
-
-            for (id, _name, (output, is_error), _elapsed) in tool_results {
-                session.push_tool_result(id, output, is_error);
             }
         }
         Ok(())
@@ -292,9 +324,5 @@ impl Agent {
 }
 
 fn default_system_prompt() -> String {
-    "你是一个专业的 AI 编程助手，擅长分析代码、解决技术问题、编写程序。\n\
-    当需要操作文件系统、执行命令或搜索代码时，你会主动使用工具完成任务。\n\
-    工具使用原则：Read 后才能 Write；Edit 前必须精确匹配。\n\
-    使用简洁、准确的中文与用户沟通，优先给出可运行的代码和具体的操作步骤。"
-        .to_string()
+    wyj_i18n::tr("system_prompt.default")
 }

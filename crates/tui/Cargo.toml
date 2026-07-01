@@ -12,6 +12,7 @@ wyj-tools.workspace = true
 wyj-api.workspace = true
 wyj-commands.workspace = true
 wyj-config.workspace = true
+wyj-i18n.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

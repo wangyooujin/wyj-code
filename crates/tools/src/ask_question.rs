@@ -19,7 +19,16 @@ fn coerce_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Object(m) => {
-            for key in &["label", "text", "value", "option", "name", "content", "title", "description"] {
+            for key in &[
+                "label",
+                "text",
+                "value",
+                "option",
+                "name",
+                "content",
+                "title",
+                "description",
+            ] {
                 if let Some(Value::String(s)) = m.get(*key) {
                     return s.clone();
                 }
@@ -82,7 +91,9 @@ fn try_split_packed_options(s: &str) -> Option<Vec<String>> {
         let part: String = s_chars[start..end]
             .iter()
             .collect::<String>()
-            .trim_start_matches(|c: char| c == ',' || c == '，' || c == ';' || c == '；' || c == ' ')
+            .trim_start_matches(|c: char| {
+                c == ',' || c == '，' || c == ';' || c == '；' || c == ' '
+            })
             .trim()
             .to_string();
         if !part.is_empty() {
@@ -111,7 +122,11 @@ fn parse_options(raw: &Value) -> Option<Vec<String>> {
                 return Some(split);
             }
         }
-        return if strings.is_empty() { None } else { Some(strings) };
+        return if strings.is_empty() {
+            None
+        } else {
+            Some(strings)
+        };
     }
     // 容错路径：options 直接是字符串
     if let Some(s) = raw.as_str() {

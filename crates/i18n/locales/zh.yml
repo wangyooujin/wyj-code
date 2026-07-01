@@ -1,0 +1,202 @@
+_version: 1
+command:
+  unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
+skill:
+  run:
+    desc: "构建并运行当前项目"
+  review:
+    desc: "代码审查（正确性 / 简化 / 效率）"
+  fix:
+    desc: "修复指定错误或问题"
+  explain:
+    desc: "详细解释代码或概念"
+  commit:
+    desc: "生成提交信息并执行 git commit"
+system_prompt:
+  default: |-
+    你是一个专业的 AI 编程助手，擅长分析代码、解决技术问题、编写程序。
+    当需要操作文件系统、执行命令或搜索代码时，你会主动使用工具完成任务。
+    工具使用原则：Read 后才能 Write；Edit 前必须精确匹配。
+    使用简洁、准确的中文与用户沟通，优先给出可运行的代码和具体的操作步骤。
+  plan_mode: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（read / glob / grep / web_fetch）。\n不得写入、编辑文件或执行 shell 命令。\n请专注于分析代码、规划方案、解释架构。"
+  wyjmd_header: "## 当前项目说明 (WYJ.md)\n\n{content}"
+  plan_turn: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（Read/Glob/Grep/WebFetch/Bash）以及 Write（仅用于写入计划文档）。\n请先充分分析代码，然后将完整计划写入：`{path}`\n写完后调用 `ExitPlanMode` 工具提交计划，等待用户批准后才能执行。\nBash 命令只允许只读操作（ls/find/cat/grep 等），不得执行写入操作。"
+
+cli:
+  about: "wyj-code — 终端 AI 编程助手"
+  prompt_help: "单次问答（不启动 TUI）"
+  cwd_help: "工作目录（默认当前目录）"
+  headless_help: "强制使用 headless REPL 模式"
+  plan_help: "Plan 模式：仅启用只读工具（read/glob/grep/web_fetch），适合规划分析"
+  bypass_help: "Bypass 模式：自动允许所有工具调用，不弹权限确认对话框"
+  continue_help: "恢复上次会话（继续上次对话）"
+  resume_help: "恢复指定会话 ID（如 sess-1719723000）"
+
+main:
+  session_not_found: "未找到会话 {id}，将开始新会话。"
+  session_resumed: "已恢复会话 {id}（{count} 条消息）"
+  session_resumed_last: "已恢复上次会话 {id}（{count} 条消息）"
+  no_session_history: "暂无历史会话，将开始新会话。"
+  mode_info_plan: " [plan 模式：仅只读工具]"
+  mode_info_bypass: " [bypass 模式：跳过权限确认]"
+  session_stats: "会话统计"
+
+help:
+  desc: "显示所有可用命令和快捷键"
+  body: |-
+    wyj-code v{version} — 终端 AI 编程助手
+
+    命令:
+    /help              显示此帮助
+    /clear             清空对话历史
+    /compact [提示]    手动压缩上下文，减少 token 消耗
+    /config            打开配置设置面板（provider/model/api_key/base_url/language 等）
+    /cost              显示本会话 token 用量与费用估算
+    /doctor            诊断环境（API Key / 配置 / 记忆）
+    /memory            查看项目跨会话记忆内容
+    /model [名称]      查看或切换 AI 模型（无参：显示当前）
+    /plan              切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
+    /mode [模式]       切换运行模式（normal / plan / bypass）
+    /resume [id]       恢复历史会话（无参数=选择器，有 id=直接恢复）
+    /sessions          查看和切换历史会话
+    /init              在当前目录生成 WYJ.md 项目说明
+    /quit              退出 wyj-code
+
+    快捷键:
+    Enter              发送消息
+    Shift+Enter        插入换行
+    Ctrl+C             中断当前任务（二次按下退出程序）
+    Esc                中断当前任务
+    Shift+Tab          循环切换模式 Normal → Plan → Bypass
+    Ctrl+O             展开/折叠工具结果
+    Ctrl+L             清屏（保留对话历史）
+    Ctrl+A / Ctrl+E    跳到行首 / 行尾
+    Ctrl+K             删除光标到行尾
+    Ctrl+U             删除光标到行首
+    Ctrl+W             删除前一个词
+    PageUp / PageDown  滚动对话区
+    ↑ / ↓              浏览输入历史
+    /                  命令补全（Tab 确认，Esc 取消）
+    !<命令>            直接执行 Bash 命令
+
+    模式:
+    Normal    默认模式，工具调用前弹出权限确认对话框
+    Plan      只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
+    Bypass    跳过所有权限确认，自动批准工具调用
+
+clear:
+  desc: "清空当前对话历史"
+
+compact:
+  desc: "手动压缩对话上下文，减少 token 消耗"
+  usage: "/compact [摘要提示]"
+
+cost:
+  desc: "显示本会话 token 用量与费用估算"
+  header: "本会话 Token 用量"
+  line_with_price: "  输入:   {input} tokens  (~${input_cost})\n输出:   {output} tokens  (~${output_cost})\n合计:   {total} tokens  (~${total_cost})"
+  line_no_price: "  输入:   {input} tokens\n输出:   {output} tokens\n合计:   {total} tokens"
+  context_line: "上下文: {pct}% ({estimated} / {window} tokens)"
+
+memory:
+  desc: "查看当前项目的跨会话记忆内容"
+  empty: "当前项目暂无跨会话记忆。"
+  index_header: "## 项目记忆索引\n\n{index}\n"
+  detail_header: "\n---\n\n## 记忆详情\n\n"
+
+doctor:
+  desc: "诊断运行环境（API Key / 配置 / WYJ.md / 记忆）"
+  header: "wyj-code v{version} 环境诊断\n"
+  api_key_missing: "  ✗  API Key      未配置（请设置 WYJ_CODE_API_KEY 或 config.toml）"
+  config_file_ok: "  ✓  配置文件    {path}"
+  config_file_missing: "  ✗  配置文件    {path} (不存在，使用默认值)"
+  config_dir_err: "  ✗  配置目录    {err}"
+  provider: "  ✓  供应商      {provider}"
+  model: "  ✓  模型        {model}"
+  wyjmd_ok: "  ✓  WYJ.md      {path}"
+  wyjmd_missing: "  ✗  WYJ.md      未找到（运行 /init 可生成）"
+  memory_dir_with_count: "  ✓  记忆目录    {path} ({count} 条)"
+  memory_dir_empty: "  ✗  记忆目录    {path} (暂无记忆)"
+  mcp_configured: "  ✓  MCP 服务    {count} 个已配置"
+  mcp_none: "  -  MCP 服务    未配置"
+
+status:
+  api_key_ok: "  ✓  API Key      {prefix}... (已配置)"
+  provider: "供应商:  {provider}"
+  model: "模型:    {model}"
+  plan_model: "Plan 模型: {model}"
+  exec_model: "Exec 模型: {model}"
+  endpoint: "端点:    {url}"
+  api_key_configured: "API Key: {prefix}...（已配置）"
+  api_key_error: "API Key: {err}"
+  mcp_servers: "MCP servers: {count}"
+
+model:
+  desc: "查看或切换 AI 模型 (如: /model claude-sonnet-4-6)"
+  current: "当前模型: {model}"
+  switched: "模型已切换至 {model}"
+  switch_failed: "[切换失败] {err}"
+
+mode:
+  desc: "切换运行模式: /mode [normal|plan|bypass]"
+  switched: "已切换至 {mode} 模式"
+  switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
+  unknown: "未知模式 '{args}'。可选：normal / plan / bypass"
+
+cwd:
+  desc: "显示当前工作目录"
+  body: "工作目录: {cwd}"
+
+init:
+  desc: "在当前目录生成 WYJ.md 项目说明文件"
+  exists: "{path} 已存在"
+  created: "已创建 {path}"
+  template: "# 项目说明\n\n工作目录: {cwd}\n\n在此填写项目背景、技术栈、开发约定等信息，\n供 wyj-code AI 助手参考。\n"
+
+config:
+  desc: "打开配置设置面板"
+
+resume:
+  desc: "恢复历史会话 (无参数=选择器, /resume <session-id>=直接恢复)"
+
+sessions:
+  desc: "查看和切换历史会话"
+
+quit:
+  desc: "退出 wyj-code"
+
+dialog:
+  permission_title: " ⚑ 权限确认 "
+  permission_tool_label: "工具: "
+  permission_hint: "  [y] 本次允许  [s] Session 允许  [p] 永久允许  [n] 拒绝"
+  ask_question_title: " ◆ Agent 提问 "
+  hint_select_confirm_cancel: "  ↑↓ 选择  Enter 确认  Esc 取消"
+  session_picker_title: " 会话列表 ({count}) "
+  new_session_label: "+ 新建会话"
+  hint_nav_select_cancel: "  ↑↓ 导航  Enter 选择  Esc 取消"
+  session_turns_suffix: "{turns}轮"
+  time_just_now: "刚才"
+  time_minutes_ago: "{n}分钟前"
+  time_hours_ago: "{n}小时前"
+  time_days_ago: "{n}天前"
+
+settings:
+  title: "配置设置"
+  hint: "  ↑↓ 移动  Enter 编辑/切换  Ctrl+S 保存  Esc 取消"
+  saved: "配置已保存"
+  save_failed: "配置保存失败: {err}"
+  rebuild_failed: "配置已保存，但重建连接失败: {err}（当前会话仍使用旧配置，重启后生效）"
+  field:
+    provider: "Provider"
+    model: "Model"
+    plan_model: "Plan Model"
+    exec_model: "Exec Model"
+    base_url: "Base URL"
+    api_key: "API Key"
+    max_tokens: "Max Tokens"
+    context_window: "Context Window"
+    log_level: "Log Level"
+    language: "Language"
+  error:
+    invalid_max_tokens: "Max Tokens 必须是正整数"
+    invalid_context_window: "Context Window 必须是正整数"

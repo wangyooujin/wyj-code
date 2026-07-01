@@ -242,7 +242,11 @@ impl InputBox {
             return 1;
         }
         let disp: usize = line.chars().map(char_width).sum();
-        if disp == 0 { 1 } else { (disp + width - 1) / width }
+        if disp == 0 {
+            1
+        } else {
+            (disp + width - 1) / width
+        }
     }
 
     /// 所有内容折行后的总视觉行数（用于动态调整输入框高度）

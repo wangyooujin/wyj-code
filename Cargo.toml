@@ -11,6 +11,7 @@ members = [
     "crates/tui",
     "crates/commands",
     "crates/mcp",
+    "crates/i18n",
 ]
 
 [workspace.package]
@@ -73,6 +74,8 @@ base64 = "0.22"
 png = "0.17"
 # 字符显示宽度（与 ratatui 保持一致）
 unicode-width = "0.2"
+# 多语言（i18n）
+rust-i18n = "3"
 
 # 内部 crate
 wyj-config = { path = "crates/config" }
@@ -82,6 +85,7 @@ wyj-tools = { path = "crates/tools" }
 wyj-tui = { path = "crates/tui" }
 wyj-commands = { path = "crates/commands" }
 wyj-mcp = { path = "crates/mcp" }
+wyj-i18n = { path = "crates/i18n" }
 
 [profile.release]
 opt-level = 3
