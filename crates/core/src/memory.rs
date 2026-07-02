@@ -17,6 +17,8 @@ use wyj_api::{
 
 const MEMORY_INDEX: &str = "MEMORY.md";
 const MAX_INDEX_ENTRIES: usize = 200;
+/// 注入 system prompt 的记忆正文总字符上限，超限截断（避免 system prompt 臃肿）。
+const MAX_CONTEXT_CHARS: usize = 8_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MemoryItem {
@@ -82,10 +84,28 @@ impl MemoryStore {
             return String::new();
         }
 
-        format!(
-            "## 项目记忆（来自历史会话）\n\n{}",
-            file_bodies.join("\n\n---\n\n")
-        )
+        // 拼接时限制总字符数，超限截断（避免 system prompt 臃肿影响缓存命中率）
+        let mut joined = String::new();
+        let header = "## 项目记忆（来自历史会话）\n\n";
+        joined.push_str(header);
+        for (i, body) in file_bodies.iter().enumerate() {
+            let sep = if i > 0 { "\n\n---\n\n" } else { "" };
+            if joined.len() + sep.len() + body.len() > MAX_CONTEXT_CHARS {
+                let remaining = MAX_CONTEXT_CHARS.saturating_sub(joined.len() + sep.len());
+                if remaining > 20 {
+                    joined.push_str(sep);
+                    let body_chars: Vec<char> = body.chars().take(remaining).collect();
+                    joined.extend(body_chars);
+                    joined.push_str("…");
+                }
+                joined.push_str("\n\n（记忆已截断，仅显示部分）");
+                break;
+            }
+            joined.push_str(sep);
+            joined.push_str(body);
+        }
+
+        joined
     }
 
     /// 从对话消息中提取记忆并异步写入磁盘（供 tokio::spawn 调用）

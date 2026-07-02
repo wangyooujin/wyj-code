@@ -19,23 +19,60 @@ pub struct CompactResult {
 }
 
 /// 粗略估算消息列表的 token 数。
-/// 文本按字符数 / 3，工具 JSON 按字节数 / 4，图片 base64 按字节数 / 3。
+///
+/// 改进点（对比旧版 `chars/3`）：旧版对中文严重低估（中文约 1-2 token/字，
+/// `/3` 只估 0.33，偏低 3-6 倍），导致压缩触发过晚、真实上下文可能溢出。
+/// 现采用启发式：CJK 字符按 1.5 token/字，其余按 0.25 token/字（≈4 字符/token），
+/// 对中文和代码混合场景更接近真实值，英文场景略微高估（安全方向，触发偏早）。
 pub fn estimate_tokens(messages: &[Message]) -> u32 {
     messages
         .iter()
         .flat_map(|m| m.content.iter())
         .map(|b| match b {
-            ContentBlock::Text { text } => text.chars().count() / 3,
+            ContentBlock::Text { text } => estimate_text_tokens(text),
             ContentBlock::ToolUse { name, input, .. } => {
-                name.chars().count() / 3 + input.to_string().len() / 4
+                estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
             }
             ContentBlock::ToolResult { content, .. } => match content {
-                ToolResultContent::Text(t) => t.len() / 4,
-                ToolResultContent::Blocks(v) => v.iter().map(|x| x.to_string().len() / 4).sum(),
+                ToolResultContent::Text(t) => estimate_text_tokens(t),
+                ToolResultContent::Blocks(v) => {
+                    v.iter().map(|x| estimate_text_tokens(&x.to_string())).sum()
+                }
             },
             ContentBlock::Image { data, .. } => data.len() / 3,
         })
         .sum::<usize>() as u32
+}
+
+/// 启发式 token 估算：CJK 字符按 1.5 token/字，其余按 0.25 token/字。
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (cjk * 3 / 2) + (other / 4)
+}
+
+/// 判断字符是否为 CJK 统一表意文字或常见全角字符（中日韩）。
+fn is_cjk(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3000..=0x303F |   // CJK 标点符号
+        0x3040..=0x309F |   // 平假名
+        0x30A0..=0x30FF |   // 片假名
+        0x3400..=0x4DBF |   // CJK 扩展 A
+        0x4E00..=0x9FFF |   // CJK 统一表意文字
+        0xF900..=0xFAFF |   // CJK 兼容表意文字
+        0xFF00..=0xFFEF |   // 全角 ASCII / 半角片假名
+        0x20000..=0x2A6DF | // CJK 扩展 B
+        0x2A700..=0x2B73F | // CJK 扩展 C
+        0x2B740..=0x2B81F | // CJK 扩展 D
+        0x2B820..=0x2CEAF   // CJK 扩展 E
+    )
 }
 
 /// 压缩会话：调用 LLM 生成摘要，替换旧消息，保留最近若干条。
@@ -164,7 +201,15 @@ fn messages_to_text(messages: &[Message]) -> String {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(truncate_chars(text, 600)),
+                    ContentBlock::Text { text } => {
+                        // 跳过历史中残留的 CLAUDE.md <system-reminder> 块（旧版本注入
+                        // 到 user 消息的遗留），避免摘要里混入记忆文件碎片。
+                        if text.contains("<system-reminder>") {
+                            None
+                        } else {
+                            Some(truncate_chars(text, 600))
+                        }
+                    }
                     ContentBlock::ToolUse { name, .. } => Some(format!("[工具调用: {name}]")),
                     ContentBlock::ToolResult {
                         content, is_error, ..

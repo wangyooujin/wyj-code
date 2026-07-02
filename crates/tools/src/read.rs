@@ -55,6 +55,11 @@ impl Tool for ReadTool {
         }
     }
 
+    /// Read 是纯只读 I/O 操作，无副作用，可安全并发执行。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
         let path = resolve_path(ctx.cwd(), &inp.file_path);

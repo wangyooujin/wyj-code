@@ -7,6 +7,9 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    /// 累计命中 prompt 缓存的输入 token 数（按约 0.1x 价格计费，不计入
+    /// `total_input_tokens`，单独统计以便 /cost 展示缓存命中情况）
+    pub total_cache_read_tokens: u32,
 }
 
 impl Session {
@@ -77,10 +80,21 @@ impl Session {
         self.total_output_tokens += output;
     }
 
+    pub fn add_cache_read(&mut self, cache_read: u32) {
+        self.total_cache_read_tokens += cache_read;
+    }
+
     pub fn cost_summary(&self) -> String {
-        format!(
-            "累计 tokens: 输入 {} / 输出 {}",
-            self.total_input_tokens, self.total_output_tokens
-        )
+        if self.total_cache_read_tokens > 0 {
+            format!(
+                "累计 tokens: 输入 {} (缓存命中 {}) / 输出 {}",
+                self.total_input_tokens, self.total_cache_read_tokens, self.total_output_tokens
+            )
+        } else {
+            format!(
+                "累计 tokens: 输入 {} / 输出 {}",
+                self.total_input_tokens, self.total_output_tokens
+            )
+        }
     }
 }

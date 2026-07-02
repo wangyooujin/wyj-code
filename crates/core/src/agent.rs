@@ -58,6 +58,12 @@ pub struct Agent {
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
     /// 可选的 token 用量回调（子 Agent 向 Hub 汇报用量用）
     usage_cb: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+    /// 会话标题生成器（可选，仅主 Agent 设置，子 Agent 不设置）
+    summary: Option<Arc<crate::summary::SummaryGenerator>>,
+    /// 当前会话 ID（用于标题生成，子 Agent 不设置）
+    session_id: Option<String>,
+    /// 标题生成完成回调（TUI 据此更新终端窗口标题）
+    title_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl Agent {
@@ -75,6 +81,9 @@ impl Agent {
             claude_md: None,
             tool_cb: None,
             usage_cb: None,
+            summary: None,
+            session_id: None,
+            title_cb: None,
         }
     }
 
@@ -90,6 +99,13 @@ impl Agent {
 
     pub fn with_context_window(mut self, n: u32) -> Self {
         self.context_window = n;
+        self
+    }
+
+    /// 设置单回合最大推理轮数（默认 200）。真正的成本/时长上限由自动压缩承担，
+    /// 此值仅防止模型死循环。可适当调低以限制极端情况下的 API 调用次数。
+    pub fn with_max_turns(mut self, n: usize) -> Self {
+        self.max_turns = n;
         self
     }
 
@@ -130,6 +146,29 @@ impl Agent {
     /// 注册 token 用量回调（每收到一次流式 Usage 事件调用一次，参数为增量值）
     pub fn with_usage_callback(mut self, cb: impl Fn(u32, u32) + Send + Sync + 'static) -> Self {
         self.usage_cb = Some(Arc::new(cb));
+        self
+    }
+
+    /// 设置会话标题生成器（仅主 Agent 设置，子 Agent 不设置）
+    pub fn with_summary(mut self, gen: Arc<crate::summary::SummaryGenerator>) -> Self {
+        self.summary = Some(gen);
+        self
+    }
+
+    /// 设置当前会话 ID（用于标题生成写盘定位）
+    pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
+        self.session_id = Some(id.into());
+        self
+    }
+
+    /// 更新当前会话 ID（用于 TUI 切换会话后更新，无需 rebuild Agent）
+    pub fn set_session_id(&mut self, id: impl Into<String>) {
+        self.session_id = Some(id.into());
+    }
+
+    /// 注册标题生成完成回调（TUI 据此更新终端窗口标题）
+    pub fn with_title_callback(mut self, cb: impl Fn(String) + Send + Sync + 'static) -> Self {
+        self.title_cb = Some(Arc::new(cb));
         self
     }
 
@@ -180,24 +219,22 @@ impl Agent {
         >,
         mut on_inject: impl FnMut(InjectionKind),
     ) -> Result<()> {
-        // 将记忆上下文追加到系统提示末尾
-        let system = if let Some(mem) = &self.memory {
+        // 构建 system prompt 基础部分：默认提示 + 跨会话记忆 + CLAUDE.md 祖先链。
+        // CLAUDE.md 内容拼进 system prompt（而非注入 user 消息），配合 prompt caching
+        // 使其首轮全价、后续轮次命中缓存按 0.1x 计费，避免跨轮线性累积。
+        // 子目录动态 reminder 在循环内追加到 system 末尾（只增不减，前缀仍可缓存）。
+        let mut system = self.system_prompt.clone();
+        if let Some(mem) = &self.memory {
             let ctx_str = mem.load_context();
-            if ctx_str.is_empty() {
-                self.system_prompt.clone()
-            } else {
-                format!("{}\n\n{}", self.system_prompt, ctx_str)
+            if !ctx_str.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(&ctx_str);
             }
-        } else {
-            self.system_prompt.clone()
-        };
-
-        // 每轮对话开始时重新读盘拼装 CLAUDE.md 系文件内容，以 <system-reminder> 文本块
-        // 前插进本轮刚 push 的 user 消息（而非焊死进 system prompt）：
-        // 保证运行期间编辑立即生效、压缩后依然完整（每轮都重新拼装，不依赖历史消息留存）。
+        }
         if let Some(loader) = &self.claude_md {
             if let Some(reminder) = loader.turn_reminder() {
-                session.prepend_to_last_user(vec![ContentBlock::Text { text: reminder }]);
+                system.push_str("\n\n");
+                system.push_str(&reminder);
             }
         }
 
@@ -257,8 +294,12 @@ impl Agent {
                     StreamEvent::Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read_input_tokens,
                     } => {
+                        // 供应商返回的 input_tokens 仅含未命中缓存的（全价）部分，
+                        // 缓存命中的 cache_read_input_tokens 单独累计用于 /cost 展示。
                         session.add_usage(input_tokens, output_tokens);
+                        session.add_cache_read(cache_read_input_tokens);
                         if let Some(cb) = &self.usage_cb {
                             cb(input_tokens, output_tokens);
                         }
@@ -339,16 +380,18 @@ impl Agent {
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
-                // 追加进同一条工具结果消息（复用注入合并的既有模式）。
+                // 追加到 system prompt 末尾（而非注入 user 消息），使历史消息保持
+                // 干净、避免跨轮重复发送；seen_dirs 去重保证每条只追加一次。
                 if let Some(loader) = &self.claude_md {
-                    let mut reminders = vec![];
-                    for dir in touched_dirs {
-                        if let Some(text) = loader.maybe_dir_reminder(&dir) {
-                            reminders.push(ContentBlock::Text { text });
+                    let mut new_reminders = String::new();
+                    for dir in &touched_dirs {
+                        if let Some(text) = loader.maybe_dir_reminder(dir) {
+                            new_reminders.push_str("\n\n");
+                            new_reminders.push_str(&text);
                         }
                     }
-                    if !reminders.is_empty() {
-                        session.push_user_blocks_merged(reminders);
+                    if !new_reminders.is_empty() {
+                        system.push_str(&new_reminders);
                     }
                 }
             }
@@ -375,6 +418,20 @@ impl Agent {
                             tracing::debug!("记忆提取失败: {e}");
                         }
                     });
+                }
+                // 首轮后触发后台标题生成（若已配置 SummaryGenerator 且有 session_id）
+                if let Some(gen) = self.summary.as_ref().cloned() {
+                    if let Some(sid) = self.session_id.clone() {
+                        let msgs = session.messages.clone();
+                        let title_cb = self.title_cb.clone();
+                        tokio::spawn(async move {
+                            if let Some(title) = gen.generate_title(&sid, &msgs).await {
+                                if let Some(cb) = title_cb {
+                                    cb(title);
+                                }
+                            }
+                        });
+                    }
                 }
                 break;
             }
