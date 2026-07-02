@@ -219,7 +219,6 @@ async fn main() -> Result<()> {
     // 按模式选择模型
     let model_name = cfg.model_for_mode(&mode).to_string();
 
-    let cfg_clone = cfg.clone();
     let provider = wyj_api::build_provider_with_model(&cfg, &model_name)?;
 
     // 始终注册全部工具（模式过滤在运行时由 ToolCtx.permission_mode 负责，支持运行时切换）
@@ -239,6 +238,7 @@ async fn main() -> Result<()> {
                 "Bash",
                 "ExitPlanMode",
                 "TodoWrite",
+                "Agent",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -253,22 +253,18 @@ async fn main() -> Result<()> {
     registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
-    let claude_md_for_sub = claude_md_loader.clone();
-    registry.register_arc(Arc::new(SubAgentTool::new(move || {
-        let sub_model = cfg_clone.model_for_mode(&AgentMode::Normal).to_string();
-        let sub_provider = wyj_api::build_provider_with_model(&cfg_clone, &sub_model)
-            .expect("子 Agent 创建 provider 失败");
-        let sub_registry = ToolRegistry::standard();
-        let mut sub_agent = Agent::new(sub_provider)
-            .with_max_tokens(cfg_clone.active_profile().max_tokens)
-            .with_claude_md(claude_md_for_sub.clone());
-        for def in sub_registry.definitions() {
-            if let Some(t) = sub_registry.get(&def.name) {
-                sub_agent.register_tool(t);
-            }
-        }
-        sub_agent
-    })));
+    // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
+    let agent_defs = Arc::new(wyj_core::load_agent_defs(&cwd));
+    let sub_agent_hub = Arc::new(wyj_tools::SubAgentHub::new());
+    let sub_agent_factory = make_sub_agent_factory(cfg.clone(), claude_md_loader.clone());
+    registry.register_arc(Arc::new(SubAgentTool::new(
+        agent_defs.clone(),
+        sub_agent_hub.clone(),
+        {
+            let f = sub_agent_factory.clone();
+            move |def| f(def)
+        },
+    )));
 
     for mcp_cfg in &cfg.mcp_servers {
         match wyj_mcp::bridge::connect_mcp_server(mcp_cfg).await {
@@ -301,6 +297,14 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str(&extra);
     }
 
+    // headless/单次问答模式没有 UI 可交互，AskQuestion 会被自动取消：
+    // 告知模型不要调用该工具，直接给出假设并继续（不写入 system_prompt_extra，
+    // 因为该变量只服务于 TUI 运行时重建 Agent，headless/-p 路径不会触发重建）。
+    if cli.headless || cli.prompt.is_some() {
+        let extra = wyj_i18n::tr("system_prompt.non_interactive");
+        agent = agent.append_system(extra);
+    }
+
     agent = agent.with_claude_md(claude_md_loader.clone());
 
     if let Some(mem) = memory_store {
@@ -312,6 +316,59 @@ async fn main() -> Result<()> {
         if let Some(t) = registry.get(&name) {
             agent.register_tool(t);
         }
+    }
+
+    // headless/single-shot 模式：子 Agent 进度以纯文本行打印到 stderr
+    if cli.headless || cli.prompt.is_some() {
+        sub_agent_hub.set_event_cb(|ev| {
+            use wyj_tools::SubAgentEvent as E;
+            match ev {
+                E::Started {
+                    id,
+                    agent_type,
+                    description,
+                    background,
+                } => {
+                    let bg = if background { " ◇bg" } else { "" };
+                    eprintln!(
+                        "\x1b[38;2;215;119;87m⏺ [a{id}]{bg} {agent_type}({description})\x1b[0m"
+                    );
+                }
+                E::ToolStart {
+                    id,
+                    tool_name,
+                    arg_summary,
+                } => {
+                    eprintln!(
+                        "\x1b[38;2;150;150;150m  [a{id}] ⏺ {tool_name}({arg_summary})\x1b[0m"
+                    );
+                }
+                E::ToolEnd { .. } | E::Usage { .. } => {}
+                E::Done {
+                    id,
+                    agent_type,
+                    result,
+                    is_error,
+                    elapsed_secs,
+                    background,
+                    ..
+                } => {
+                    if is_error {
+                        eprintln!(
+                            "\x1b[38;2;255;107;128m✗ [a{id}] {agent_type} · {elapsed_secs:.1}s\x1b[0m"
+                        );
+                    } else {
+                        eprintln!(
+                            "\x1b[38;2;78;186;101m✓ [a{id}] {agent_type} · {elapsed_secs:.1}s\x1b[0m"
+                        );
+                    }
+                    // 后台任务的结果无法回填进已结束的对话轮次，直接打印
+                    if background {
+                        eprintln!("{result}");
+                    }
+                }
+            }
+        });
     }
 
     // headless/single-shot 模式：注册格式化工具事件输出到 stderr
@@ -369,6 +426,15 @@ async fn main() -> Result<()> {
             })
             .await?;
         println!();
+        // 结束前等待全部后台子 Agent 完成（结果由 Done 事件回调打印）
+        let bg_count = sub_agent_hub.background_count();
+        if bg_count > 0 {
+            eprintln!(
+                "{}",
+                wyj_i18n::tr_fmt("subagent.waiting_bg", &[("count", &bg_count.to_string())])
+            );
+        }
+        sub_agent_hub.wait_background().await;
         // 升级版会话统计
         let in_tok = session.total_input_tokens;
         let out_tok = session.total_output_tokens;
@@ -409,6 +475,8 @@ async fn main() -> Result<()> {
         .await?;
     } else {
         let todo_store_for_rebuild = todo_store.clone();
+        let agent_defs_for_rebuild = agent_defs.clone();
+        let hub_for_rebuild = sub_agent_hub.clone();
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let mut new_agent = Agent::new(provider)
@@ -421,6 +489,13 @@ async fn main() -> Result<()> {
             let mut reg = ToolRegistry::standard();
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
             reg.register_arc(Arc::new(AskQuestionTool::new()));
+            // 用重建时的最新配置构建子 Agent 工厂，保证 Profile 变更即时生效
+            let sub_factory = make_sub_agent_factory(cfg.clone(), claude_md_for_rebuild.clone());
+            reg.register_arc(Arc::new(SubAgentTool::new(
+                agent_defs_for_rebuild.clone(),
+                hub_for_rebuild.clone(),
+                move |def| sub_factory(def),
+            )));
             for def in reg.definitions() {
                 if let Some(t) = reg.get(&def.name) {
                     new_agent.register_tool(t);
@@ -442,10 +517,86 @@ async fn main() -> Result<()> {
             todo_store,
             system_prompt_extra,
             cfg,
+            sub_agent_hub.clone(),
         )
         .await?;
     }
     Ok(())
+}
+
+/// 构建子 Agent 工厂：按 agent 定义解析 Profile 与模型，注册按定义过滤后的工具集。
+/// 模型解析优先级：定义的 model 字段（Profile 名）→ [subagent].explore_profile（仅
+/// Explore 类型）→ [subagent].default_profile → 主 Agent 当前激活分组的 Normal 模型。
+fn make_sub_agent_factory(
+    cfg: Config,
+    claude_md: Arc<wyj_core::ClaudeMdLoader>,
+) -> wyj_tools::AgentFactory {
+    Arc::new(move |def: &wyj_core::AgentDefinition| {
+        let mut profile = None;
+        if let Some(name) = &def.model {
+            profile = cfg.profile_by_name(name);
+            if profile.is_none() {
+                tracing::warn!(
+                    "agent 定义 `{}` 引用的 Profile `{}` 不存在，回退默认",
+                    def.name,
+                    name
+                );
+            }
+        }
+        if profile.is_none() && def.name == "Explore" {
+            if let Some(name) = &cfg.subagent.explore_profile {
+                profile = cfg.profile_by_name(name);
+                if profile.is_none() {
+                    tracing::warn!("[subagent].explore_profile `{name}` 不存在，回退默认");
+                }
+            }
+        }
+        if profile.is_none() {
+            if let Some(name) = &cfg.subagent.default_profile {
+                profile = cfg.profile_by_name(name);
+                if profile.is_none() {
+                    tracing::warn!("[subagent].default_profile `{name}` 不存在，回退默认");
+                }
+            }
+        }
+        let (p, model) = match profile {
+            Some(p) => (p, p.model.clone()),
+            None => (
+                cfg.active_profile(),
+                cfg.model_for_mode(&AgentMode::Normal).to_string(),
+            ),
+        };
+        let provider = wyj_api::build_provider_from_profile(p, Some(&model))?;
+
+        let mut sub_agent = Agent::new(provider)
+            .with_max_tokens(p.max_tokens)
+            .with_context_window(p.context_window)
+            .with_claude_md(claude_md.clone());
+        if !def.system_prompt.is_empty() {
+            sub_agent = sub_agent.with_system(def.system_prompt.clone());
+        }
+
+        let sub_registry = ToolRegistry::standard();
+        for tdef in sub_registry.definitions() {
+            let allowed = def
+                .tools
+                .as_ref()
+                .map_or(true, |list| list.iter().any(|n| n == &tdef.name));
+            if allowed {
+                if let Some(t) = sub_registry.get(&tdef.name) {
+                    sub_agent.register_tool(t);
+                }
+            }
+        }
+        if let Some(list) = &def.tools {
+            for n in list {
+                if sub_registry.get(n).is_none() {
+                    tracing::warn!("agent 定义 `{}` 引用了未知工具 `{n}`，已忽略", def.name);
+                }
+            }
+        }
+        Ok(sub_agent)
+    })
 }
 
 async fn repl(
@@ -521,6 +672,8 @@ async fn repl(
             context_window: 200_000,
             estimated_tokens: wyj_core::estimate_tokens(&session.messages),
             home_dir,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
         };
         if let Some(result) = cmd_registry.dispatch(trimmed, &cmd_ctx).await {
             match result {

@@ -21,7 +21,7 @@ pub fn char_width(c: char) -> usize {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct InputBox {
     pub lines: Vec<String>,
     pub cursor_row: usize,
@@ -236,17 +236,38 @@ impl InputBox {
         &self.lines
     }
 
+    /// 按显示宽度贪心切分一行为多个视觉行的字符边界（首尾含 0 和总字符数）。
+    /// 遇到全角字符在当前行放不下时整体换到下一行，不会从字符中间断开——
+    /// 这个规则必须与实际渲染时的折行方式完全一致，否则光标位置计算
+    /// （由本函数驱动）会和屏幕上真实换行的位置产生偏差，导致光标错位、
+    /// 看起来像输入内容错乱。
+    fn wrap_boundaries(line: &str, width: usize) -> Vec<usize> {
+        let mut bounds = vec![0usize];
+        if width == 0 {
+            bounds.push(line.chars().count());
+            return bounds;
+        }
+        let mut col = 0usize;
+        let mut idx = 0usize;
+        for c in line.chars() {
+            let w = char_width(c);
+            if col + w > width && col > 0 {
+                bounds.push(idx);
+                col = 0;
+            }
+            col += w;
+            idx += 1;
+        }
+        bounds.push(idx);
+        bounds
+    }
+
     /// 单行的视觉行数（考虑终端折行，width=0 时按 1 行算）
     fn line_visual_rows(line: &str, width: usize) -> usize {
         if width == 0 {
             return 1;
         }
-        let disp: usize = line.chars().map(char_width).sum();
-        if disp == 0 {
-            1
-        } else {
-            (disp + width - 1) / width
-        }
+        (Self::wrap_boundaries(line, width).len() - 1).max(1)
     }
 
     /// 所有内容折行后的总视觉行数（用于动态调整输入框高度）
@@ -266,7 +287,88 @@ impl InputBox {
         let prev_vis_rows: usize = (0..self.cursor_row)
             .map(|r| Self::line_visual_rows(&self.lines[r], width))
             .sum();
-        let disp_col = self.cursor_display_col();
-        (prev_vis_rows + disp_col / width, disp_col % width)
+        let line = &self.lines[self.cursor_row];
+        let bounds = Self::wrap_boundaries(line, width);
+        let last_seg = bounds.len() - 2;
+        let mut seg = last_seg;
+        for (i, end) in bounds[1..].iter().enumerate() {
+            if self.cursor_col < *end || i == last_seg {
+                seg = i;
+                break;
+            }
+        }
+        let seg_start = bounds[seg];
+        let col: usize = line
+            .chars()
+            .skip(seg_start)
+            .take(self.cursor_col.saturating_sub(seg_start))
+            .map(char_width)
+            .sum();
+        (prev_vis_rows + seg, col)
+    }
+
+    /// 按显示宽度手动折行，供渲染使用：必须与 [`cursor_visual_pos`] 用同一套算法，
+    /// 不依赖 ratatui 内置 `Wrap`（其按空格分词，对无空格的中日韩文本不适用，
+    /// 且与本文件独立的宽度计算容易产生偏差）。
+    pub fn wrap_for_render(line: &str, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![line.to_string()];
+        }
+        let bounds = Self::wrap_boundaries(line, width);
+        let chars: Vec<char> = line.chars().collect();
+        (0..bounds.len() - 1)
+            .map(|i| chars[bounds[i]..bounds[i + 1]].iter().collect())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试：99 列终端（内容区宽度 97，奇数）下输入 60 个全角字符，
+    /// 光标应落在渲染出的折行文字之后，而不是叠在最后一两个字符上——
+    /// 此前 cursor_visual_pos 用 `disp_col / width` 朴素除法计算折行，
+    /// 假设每一视觉行都恰好塞满 width 列，但全角字符在奇数宽度下每行会
+    /// 留一列空白，实测 tmux 复现出光标偏左 2 列、叠在文字上的错位。
+    #[test]
+    fn cursor_visual_pos_matches_rendered_wrap_for_wide_chars() {
+        let mut ib = InputBox::new();
+        for _ in 0..30 {
+            ib.insert_char('测');
+            ib.insert_char('试');
+        }
+        let width = 97;
+        let rendered = InputBox::wrap_for_render(&ib.lines[0], width);
+        let (vis_row, vis_col) = ib.cursor_visual_pos(width);
+
+        assert_eq!(vis_row, rendered.len() - 1, "光标应在最后一个渲染行上");
+        let last_line_width: usize = rendered[vis_row].chars().map(char_width).sum();
+        assert_eq!(
+            vis_col, last_line_width,
+            "光标列应正好在最后渲染行内容之后，而非叠在文字中间"
+        );
+    }
+
+    #[test]
+    fn wrap_for_render_never_splits_wide_char_across_lines() {
+        let line: String = "测试".repeat(30);
+        let segs = InputBox::wrap_for_render(&line, 97);
+        for seg in &segs {
+            let w: usize = seg.chars().map(char_width).sum();
+            assert!(w <= 97, "每个视觉行不应超过可用宽度");
+        }
+        let rejoined: String = segs.concat();
+        assert_eq!(rejoined, line, "折行不应丢字符或产生乱码");
+    }
+
+    #[test]
+    fn line_visual_rows_matches_wrap_for_render_len() {
+        let line: String = "a测b试c".repeat(10);
+        let width = 13;
+        assert_eq!(
+            InputBox::line_visual_rows(&line, width),
+            InputBox::wrap_for_render(&line, width).len()
+        );
     }
 }

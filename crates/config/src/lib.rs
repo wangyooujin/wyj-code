@@ -134,6 +134,16 @@ impl Default for Profile {
     }
 }
 
+/// [subagent] 节 — 子 Agent 全局模型配置
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubAgentCfg {
+    /// 子 Agent 默认使用的 Profile 名（留空则沿用主 Agent 当前分组与模型）
+    pub default_profile: Option<String>,
+    /// 内置 Explore 类型专用 Profile 名（留空则回退 default_profile）
+    pub explore_profile: Option<String>,
+}
+
 /// 主配置结构，对应 ~/.wyj-code/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -153,6 +163,9 @@ pub struct Config {
     /// 是否启用跨会话记忆自动提取（/memory 面板可切换，默认开启）
     #[serde(default = "default_true")]
     pub auto_memory_enabled: bool,
+    /// 子 Agent 模型配置（[subagent] 节）
+    #[serde(default)]
+    pub subagent: SubAgentCfg,
 }
 
 fn default_true() -> bool {
@@ -168,6 +181,7 @@ impl Default for Config {
             language: None,
             mcp_servers: vec![],
             auto_memory_enabled: true,
+            subagent: SubAgentCfg::default(),
         }
     }
 }
@@ -231,11 +245,17 @@ impl From<LegacyConfigV0> for Config {
             language: legacy.language,
             mcp_servers: legacy.mcp_servers,
             auto_memory_enabled: true,
+            subagent: SubAgentCfg::default(),
         }
     }
 }
 
 impl Config {
+    /// 按名查找分组。
+    pub fn profile_by_name(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
+    }
+
     /// 返回当前激活分组（按名查找，找不到则回退到第一个；profiles 非空是不变量）。
     pub fn active_profile(&self) -> &Profile {
         self.profiles

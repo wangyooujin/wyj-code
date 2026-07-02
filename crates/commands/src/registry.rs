@@ -43,6 +43,9 @@ pub struct CommandContext {
     pub context_window: u32,
     pub estimated_tokens: u32,
     pub home_dir: std::path::PathBuf,
+    /// 子 Agent 累计 token 用量（与主会话分开统计，/cost 单列；headless 传 0）
+    pub sub_input_tokens: u32,
+    pub sub_output_tokens: u32,
 }
 
 /// Slash 命令 trait

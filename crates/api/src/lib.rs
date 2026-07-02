@@ -28,3 +28,21 @@ pub fn build_provider_with_model(cfg: &Config, model: &str) -> Result<Arc<dyn Pr
         CfgProvider::OpenAI => Ok(Arc::new(OpenAIProvider::with_model(cfg, model)?)),
     }
 }
+
+/// 以指定分组构建 Provider（子 Agent 按 Profile 覆盖供应商/端点/Key 时使用）。
+/// 通过构造一个只含该分组的临时 Config 复用现有构造器，避免改动 Provider 内部。
+pub fn build_provider_from_profile(
+    profile: &wyj_config::Profile,
+    model_override: Option<&str>,
+) -> Result<Arc<dyn Provider>> {
+    let cfg = Config {
+        active_profile: profile.name.clone(),
+        profiles: vec![profile.clone()],
+        ..Config::default()
+    };
+    let model = model_override.unwrap_or(&profile.model).to_string();
+    match profile.provider {
+        CfgProvider::Anthropic => Ok(Arc::new(AnthropicProvider::with_model(&cfg, &model)?)),
+        CfgProvider::OpenAI => Ok(Arc::new(OpenAIProvider::with_model(&cfg, &model)?)),
+    }
+}
