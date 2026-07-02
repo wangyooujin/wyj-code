@@ -331,3 +331,7 @@ profile:
     confirm_delete_body: "Delete profile '{name}'? (y/Enter to confirm, n/Esc to cancel)"
     fetching_title: "Fetching Models"
     models_title: "Select a Model (↑↓ select, Enter confirm, Esc cancel)"
+
+welcome:
+  placeholder: 'Try "fix this bug" or ask anything…'
+  greeting: 'Welcome back'
