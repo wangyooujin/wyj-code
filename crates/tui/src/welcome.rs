@@ -1,9 +1,10 @@
 //! TUI 欢迎页面（聊天区为空时显示）
 //!
 //! 极简布局：
-//! - `WYJ-CODE` 阴影块状艺术字（figlet ANSI Shadow 风格，6 行高，主题橙 + BOLD）
+//! - 上方空 2 行（顶部留白）
+//! - `WYJ-CODE` 阴影块状艺术字（figlet ANSI Shadow 风格，6 行高，主题橙 + BOLD），整体左缩进 2 格
 //! - 空 2 行
-//! - `欢迎回来`（灰色 dim，走 i18n）
+//! - `欢迎回来`（灰色 dim，走 i18n），左缩进 4 格
 //!
 //! 渲染入口是 [`render_welcome`]，由 `crates/tui/src/render.rs` 的
 //! `draw_chat` 在 `messages.is_empty() && streaming_buf.is_empty()` 时调用。
@@ -18,6 +19,15 @@ use ratatui::text::{Line, Span};
 /// 保留 struct 仅为了让 `render_welcome` 的签名保持向后兼容（render.rs 仍在调用）。
 pub struct WelcomeContext {}
 
+/// 整体左侧缩进：logo 6 行统一前缀。
+const LOGO_INDENT: &str = "  ";
+/// 问候语左侧缩进：比 logo 多 2 格，视觉上与 logo 左缘错开、呼吸感更自然。
+const GREETING_INDENT: &str = "    ";
+/// logo 与问候语之间保持 2 行空行间隔。
+const INTER_BLANK_LINES: usize = 2;
+/// 欢迎页顶部留白行数（位于 logo 上方）。
+const TOP_BLANK_LINES: usize = 2;
+
 /// WYJ-CODE 艺术字（figlet ANSI Shadow 字体，6 行高，73 列宽）。
 ///
 /// 字符来源：从 figlet 字体表 `ANSI Shadow.flf` 提取 W/Y/J/-/C/O/D/E 八个
@@ -31,30 +41,41 @@ const ASCII_LOGO: &[&str] = &[
     " ╚══╝╚══╝     ╚═╝     ╚════╝          ╚═════╝  ╚═════╝  ╚═════╝  ╚══════╝",
 ];
 
-/// 生成欢迎页所有 Line（不含自动垂直居中，调用方负责）。
+/// 生成欢迎页所有 Line（含自动垂直居中？否——调用方负责垂直/水平定位）。
 ///
 /// 布局（自上而下）：
-/// - 6 行 logo（橙色 + BOLD）
-/// - 空 2 行
-/// - `欢迎回来`（dim，走 i18n）
+/// - 顶部 `TOP_BLANK_LINES` 行空行（视觉上把 logo 推到屏幕偏中偏下一点的位置）
+/// - 6 行 logo（橙色 + BOLD，**整体左缩进 `LOGO_INDENT`**）
+/// - `INTER_BLANK_LINES` 行空行
+/// - `欢迎回来`（dim，走 i18n，**左缩进 `GREETING_INDENT`**）
 pub fn render_welcome(_ctx: &WelcomeContext, _area_width: u16) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(ASCII_LOGO.len() + 3);
+    let total = TOP_BLANK_LINES + ASCII_LOGO.len() + INTER_BLANK_LINES + 1;
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
 
-    // 1) logo 6 行（橙色 + BOLD）
+    // 0) 顶部留白（让 logo 距聊天框顶 2 行）
+    for _ in 0..TOP_BLANK_LINES {
+        lines.push(Line::from(""));
+    }
+
+    // 1) logo 6 行（橙色 + BOLD，左缩进 LOGO_INDENT）
     let logo_style = Style::default()
         .fg(Theme::CLAUDE)
         .add_modifier(Modifier::BOLD);
     for row in ASCII_LOGO {
-        lines.push(Line::from(Span::styled(row.to_string(), logo_style)));
+        lines.push(Line::from(Span::styled(
+            format!("{LOGO_INDENT}{row}"),
+            logo_style,
+        )));
     }
 
-    // 2) 空 2 行
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
+    // 2) logo 与问候语之间空 INTER_BLANK_LINES 行
+    for _ in 0..INTER_BLANK_LINES {
+        lines.push(Line::from(""));
+    }
 
-    // 3) 「欢迎回来」/「Welcome back」（i18n）
+    // 3) 「欢迎回来」/「Welcome back」（i18n），左缩进 GREETING_INDENT
     lines.push(Line::from(Span::styled(
-        wyj_i18n::tr("welcome.greeting"),
+        format!("{GREETING_INDENT}{}", wyj_i18n::tr("welcome.greeting")),
         Theme::dim(),
     )));
 
@@ -74,37 +95,42 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_first_line_is_logo() {
+    fn render_welcome_first_line_is_blank_padding() {
+        // 顶部留白（logo 之上）——首行是空行，方便 ratatui 把 logo 推到聊天框中段
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let first = lines.first().expect("welcome 不能为空");
-        assert!(
-            first.spans[0].content.contains("██"),
-            "首行应是 logo 第一行（含 ██ 块字符）；实际：{:?}",
-            first.spans[0].content
-        );
+        for i in 0..TOP_BLANK_LINES {
+            assert_eq!(
+                collect_text(&lines[i]),
+                "",
+                "顶部第 {} 行应为留白空行",
+                i + 1
+            );
+        }
     }
 
     #[test]
-    fn render_welcome_total_lines_is_logo_plus_three() {
-        // logo 6 行 + 2 空行 + 1 问候 = 9 行
+    fn render_welcome_total_lines_is_top_pad_plus_logo_plus_inter_plus_greeting() {
+        // 顶部 2 行 + logo 6 行 + 中间 2 行 + 1 行问候 = 11 行
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
+        let expected = TOP_BLANK_LINES + ASCII_LOGO.len() + INTER_BLANK_LINES + 1;
         assert_eq!(
             lines.len(),
-            ASCII_LOGO.len() + 3,
+            expected,
             "欢迎页应固定 {} 行；实际 {} 行",
-            ASCII_LOGO.len() + 3,
+            expected,
             lines.len()
         );
     }
 
     #[test]
     fn render_welcome_logo_has_six_rows() {
-        // 总行数 = 9，但 logo 本身固定 6 行
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let logo_lines = &lines[..ASCII_LOGO.len()];
+        let start = TOP_BLANK_LINES;
+        let end = start + ASCII_LOGO.len();
+        let logo_lines = &lines[start..end];
         assert_eq!(logo_lines.len(), 6, "logo 应为 6 行");
         for (i, line) in logo_lines.iter().enumerate() {
             assert_eq!(
@@ -118,16 +144,15 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_logo_first_row_starts_at_column_zero() {
-        // 第一行绝对贴左（无前导空格），是 logo 在视觉上对齐的标志。
-        // logo 内部行（含第 6 行）允许有内部空格，但首行贴顶。
+    fn render_welcome_logo_first_row_starts_with_indent() {
+        // logo 整体左缩进 LOGO_INDENT（2 空格）；首字符应是块状字符 '█' 之外的空格
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let first = &lines[0];
-        let content = &first.spans[0].content;
+        let first_logo_row = &lines[TOP_BLANK_LINES];
+        let content = &first_logo_row.spans[0].content;
         assert!(
-            !content.starts_with(' '),
-            "logo 第 1 行应贴左（无前导空格）；实际：{:?}",
+            content.starts_with(LOGO_INDENT),
+            "logo 第 1 行应以 `{LOGO_INDENT}` 缩进起首；实际：{:?}",
             content
         );
     }
@@ -136,14 +161,17 @@ mod tests {
     fn render_welcome_logo_uses_claude_color() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let logo = &lines[0];
+        let first_logo_row = &lines[TOP_BLANK_LINES];
         assert_eq!(
-            logo.spans[0].style.fg,
+            first_logo_row.spans[0].style.fg,
             Some(Theme::CLAUDE),
             "logo 应使用主题橙 CLAUDE"
         );
         assert!(
-            logo.spans[0].style.add_modifier.contains(Modifier::BOLD),
+            first_logo_row.spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD),
             "logo 应为 BOLD"
         );
     }
@@ -152,18 +180,35 @@ mod tests {
     fn render_welcome_includes_two_blank_lines_between_logo_and_greeting() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let blank1 = &lines[ASCII_LOGO.len()];
-        let blank2 = &lines[ASCII_LOGO.len() + 1];
-        assert_eq!(collect_text(blank1), "", "logo 后第 1 行应为空行");
-        assert_eq!(collect_text(blank2), "", "logo 后第 2 行应为空行");
+        let inter_start = TOP_BLANK_LINES + ASCII_LOGO.len();
+        for i in 0..INTER_BLANK_LINES {
+            let blank = &lines[inter_start + i];
+            assert_eq!(
+                collect_text(blank),
+                "",
+                "logo 后第 {} 行应为空行",
+                i + 1
+            );
+        }
     }
 
     #[test]
-    fn render_welcome_greeting_is_last_line() {
+    fn render_welcome_greeting_is_last_line_and_indented() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
         let last = lines.last().expect("welcome 不能为空");
-        assert!(!last.spans[0].content.is_empty(), "问候行内容不能为空");
+        let content = &last.spans[0].content;
+        // 问候语左缩进 GREETING_INDENT（4 空格），紧跟一句本地化文案
+        assert!(
+            content.starts_with(GREETING_INDENT),
+            "问候行应以 `{GREETING_INDENT}` 缩进起首；实际：{:?}",
+            content
+        );
+        assert!(
+            content.len() > GREETING_INDENT.len(),
+            "问候行除缩进外还应有本地化文本；实际：{:?}",
+            content
+        );
     }
 
     #[test]
@@ -182,10 +227,9 @@ mod tests {
     fn render_welcome_logo_lines_have_uniform_width() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let widths: Vec<usize> = lines
-            .iter()
-            .take(ASCII_LOGO.len())
-            .map(|l| collect_text(l).chars().count())
+        let start = TOP_BLANK_LINES;
+        let widths: Vec<usize> = (start..start + ASCII_LOGO.len())
+            .map(|i| collect_text(&lines[i]).chars().count())
             .collect();
         let first = widths[0];
         for (i, w) in widths.iter().enumerate() {
