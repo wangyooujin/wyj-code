@@ -6,9 +6,9 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -556,7 +556,9 @@ impl AskQuestionDialog {
 
 /// ExitPlanMode 工具触发的计划批准对话框状态
 pub struct PlanApprovalDialog {
-    pub plan_path: Option<String>,
+    pub plan: String,
+    /// 已向下滚动的行数（0 = 顶部）
+    pub scroll: u16,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
 }
 
@@ -1532,13 +1534,11 @@ impl AppState {
                 self.scroll_offset = 0;
             }
 
-            AgentEvent::PlanApprovalRequest {
-                plan_path,
-                response_tx,
-            } => {
+            AgentEvent::PlanApprovalRequest { plan, response_tx } => {
                 self.is_thinking = false; // 暂停 spinner，等待用户操作
                 self.plan_dialog = Some(PlanApprovalDialog {
-                    plan_path,
+                    plan,
+                    scroll: 0,
                     response_tx,
                 });
             }
@@ -1748,6 +1748,7 @@ pub async fn run_tui(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -1777,7 +1778,8 @@ pub async fn run_tui(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
 
@@ -1848,17 +1850,13 @@ fn has_plan_approved(messages: &[Message]) -> bool {
 }
 
 /// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
-fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode, cwd: &std::path::Path) -> Arc<Agent> {
+fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode) -> Arc<Agent> {
     if !matches!(mode, AgentMode::Plan) {
         return Arc::clone(base);
     }
-    let plan_path = cwd.join(".wyj").join("plan.md");
     let mut a = (**base).clone();
     a.register_tool(Arc::new(ExitPlanModeTool));
-    let a = a.append_system(wyj_i18n::tr_fmt(
-        "system_prompt.plan_turn",
-        &[("path", &plan_path.display().to_string())],
-    ));
+    let a = a.append_system(wyj_i18n::tr("system_prompt.plan_turn"));
     Arc::new(a)
 }
 
@@ -1912,7 +1910,11 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let path_buf = path.to_path_buf();
@@ -1922,7 +1924,11 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     .await;
 
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     terminal.clear()?;
 
     match status {
@@ -2018,7 +2024,7 @@ fn spawn_agent_turn(
         let mut ctx = ToolCtx::new(&ctx_cwd);
         ctx.permission_mode = mode_to_permission(&current_mode);
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
-        let turn_agent = plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
+        let turn_agent = plan_turn_agent(&agent_c, &current_mode);
         let tx2 = tx.clone();
         let mut on_text = move |d: &str| {
             let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
@@ -2069,9 +2075,8 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "Grep",
                 "WebFetch",
                 "AskQuestion",
-                "Write",        // 写计划文件
                 "Bash",         // 只读命令，由 system prompt 约束
-                "ExitPlanMode", // 提交计划并请求批准
+                "ExitPlanMode", // 提交计划并请求批准（计划文本作为参数直传，不落盘）
                 "TodoWrite",    // 任务追踪，plan 模式同样有用
                 "Agent",        // 子 Agent（继承同一白名单，不会绕过 plan 模式限制）
             ]
@@ -2470,14 +2475,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         response_tx,
                     });
                 }
-                Ok(UiAskRequest::ExitPlanMode {
-                    plan_path,
-                    response_tx,
-                }) => {
-                    state.apply_agent_event(AgentEvent::PlanApprovalRequest {
-                        plan_path,
-                        response_tx,
-                    });
+                Ok(UiAskRequest::ExitPlanMode { plan, response_tx }) => {
+                    state.apply_agent_event(AgentEvent::PlanApprovalRequest { plan, response_tx });
                 }
                 Err(_) => break,
             }
@@ -2486,7 +2485,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         if event::poll(std::time::Duration::from_millis(50))? {
             let ev = event::read()?;
             match ev {
-                Event::Paste(pasted) if !state.is_thinking => {
+                Event::Paste(pasted) => {
                     // 分组管理面板/设置面板正在编辑文本字段时，粘贴内容应进当前编辑的
                     // 字段（如 API Key、Base URL、重命名输入框），而不是主聊天输入框。
                     if let Some(dialog) = &mut state.profile_dialog {
@@ -2540,6 +2539,15 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         }
                     }
                 }
+                Event::Mouse(MouseEvent { kind, .. }) => match kind {
+                    MouseEventKind::ScrollUp => {
+                        state.scroll_offset = state.scroll_offset.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                    }
+                    _ => {}
+                },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {
@@ -3331,6 +3339,26 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     ));
                                 }
                             }
+                            KeyCode::Up => {
+                                if let Some(dlg) = state.plan_dialog.as_mut() {
+                                    dlg.scroll = dlg.scroll.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dlg) = state.plan_dialog.as_mut() {
+                                    dlg.scroll = dlg.scroll.saturating_add(1);
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if let Some(dlg) = state.plan_dialog.as_mut() {
+                                    dlg.scroll = dlg.scroll.saturating_sub(10);
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if let Some(dlg) = state.plan_dialog.as_mut() {
+                                    dlg.scroll = dlg.scroll.saturating_add(10);
+                                }
+                            }
                             _ => {}
                         }
                         continue;
@@ -3909,7 +3937,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             ctx.permission_mode = mode_to_permission(&current_mode);
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
-                                                plan_turn_agent(&agent_c, &current_mode, &ctx_cwd);
+                                                plan_turn_agent(&agent_c, &current_mode);
                                             let tx2 = tx.clone();
                                             let mut on_text = move |d: &str| {
                                                 let _ = tx2

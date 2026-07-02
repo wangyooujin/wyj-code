@@ -25,9 +25,9 @@ pub enum UiAskRequest {
         questions: Vec<AskQuestionSpec>,
         response_tx: tokio::sync::oneshot::Sender<Option<Vec<QuestionAnswer>>>,
     },
-    /// ExitPlanMode 工具的计划批准请求
+    /// ExitPlanMode 工具的计划批准请求，plan 为完整计划文本（Markdown）
     ExitPlanMode {
-        plan_path: Option<String>,
+        plan: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
 }
@@ -81,14 +81,14 @@ impl ToolContext for ToolCtx {
         response_rx.await.ok().flatten()
     }
 
-    async fn exit_plan_mode(&self, plan_path: Option<&str>) -> bool {
+    async fn exit_plan_mode(&self, plan: &str) -> bool {
         let tx = match &self.ui_ask_tx {
             Some(t) => t,
             None => return true, // headless：自动批准
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let req = UiAskRequest::ExitPlanMode {
-            plan_path: plan_path.map(str::to_string),
+            plan: plan.to_string(),
             response_tx,
         };
         if tx.send(req).await.is_err() {
