@@ -285,7 +285,10 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Theme::border())
-        .title(Span::styled(" wyj-code ", Theme::dim()));
+        .title(Span::styled(
+            format!(" wyj-code v{} ", env!("CARGO_PKG_VERSION")),
+            Theme::dim(),
+        ));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
