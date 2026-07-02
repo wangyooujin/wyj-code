@@ -3,9 +3,10 @@
 //! 整体布局（自上而下）：
 //!
 //! - 顶部 1 行留白（让 logo 落在聊天区上 1/3 位置）
-//! - `WYJ-CODE` shadow 字体艺术字（5 行 × 25 列）
+//! - `WYJ-CODE` standard 字体艺术字（6 行 × 52 列，靠左对齐）
 //!   - 横向 RGB 渐变（橙 215,119,87 → 中间橙黄 225,160,85 → 暖黄 240,200,80）
 //!   - BOLD 强调，无背景填充（避免与下方终端默认背景形成突兀色块）
+//!   - 左缩进 `INFO_INDENT`（2 空格），与下方信息行共用同一左基准
 //! - 1 行间隔
 //! - `Profile · Model`（左对齐，dim 灰）
 //! - `‹ cwd ›`（左对齐，dim 灰）
@@ -33,29 +34,30 @@ pub struct WelcomeContext {
 const TOP_BLANK_LINES: usize = 1;
 /// logo 与 Profile/Model 信息行之间的间隔行数。
 const LOGO_INFO_BLANK_LINES: usize = 1;
-/// 信息行左缩进：与下方用户消息前缀 `❯` 的左对齐基准呼应，
-/// 让「功能信息」与「装饰信息」在视觉层上分离（logo 居中、信息靠左）。
+/// 信息行左缩进：与 logo 和下方信息行的左对齐基准一致，
+/// 让所有欢迎页元素在同一列起首（统一靠左）。
 const INFO_INDENT: &str = "  ";
 /// 隐藏默认 Profile 名：仅当 profile 名非空且不是 "default" 时才显示。
 const DEFAULT_PROFILE: &str = "default";
 
-/// WYJ-CODE 艺术字（figlet shadow 字体，5 行高 × 25 列宽）
+/// WYJ-CODE 艺术字（figlet standard 字体，6 行高 × 52 列宽）
 ///
-/// 字符来源：从 figlet `shadow.flf` 提取 W/Y/J/-/C/O/D/E 八个字符的
-/// 5 行定义，字符间以 1 列空格拼接。
+/// 字符来源：本地 figlet `standard.flf` 渲染 "WYJ-CODE" 输出，
+/// 每行严格 52 列；第 6 行为空行（与 figlet 一致，保留原字体形状）。
 const ASCII_LOGO: &[&str] = &[
-    "\\ \\        /   \\ \\   /       |       _____|    ___|    _ \\   __ \\  ____| ",
-    " \\ \\  \\   /      \\   /         |      |         |        |   |  |   | __|   ",
-    "  \\ \\  \\ /     \\   |    \\   |  _____|  |        |        |   |  |   | |     ",
-    "   \\_/\\_/         _|        \\___| \\____|  \\____| \\___/  ____/  _____| _____| ",
-    "                                                                            ",
+    "__        ____   __  _        ____ ___  ____  _____ ",
+    "\\ \\      / /\\ \\ / / | |      / ___/ _ \\|  _ \\| ____|",
+    " \\ \\ /\\ / /  \\ V /  | |_____| |  | | | | | | |  _|  ",
+    "  \\ V  V /    | | |_| |_____| |__| |_| | |_| | |___ ",
+    "   \\_/\\_/     |_|\\___/       \\____\\___/|____/|_____|",
+    "                                                    ",
 ];
 
 /// 生成欢迎页所有 Line
 ///
 /// 布局（自上而下）：
 /// - 顶部 `TOP_BLANK_LINES` 行留白
-/// - 5 行 logo（按列渐变橙→黄，整块中间色背景）
+/// - logo 行（按列渐变橙→黄，靠左对齐，左缩进 `INFO_INDENT`）
 /// - `LOGO_INFO_BLANK_LINES` 行间隔
 /// - 1 行 Profile/Model（左缩进 `INFO_INDENT`，dim 灰）
 /// - 1 行 CWD（左缩进 `INFO_INDENT`，dim 灰，‹ › 包裹）
@@ -68,15 +70,26 @@ pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static
         lines.push(Line::from(""));
     }
 
-    // 1) logo 5 行（按可用宽度截断 + 横向渐变 fg + BOLD）
+    // 1) logo 行（按可用宽度截断 + 横向渐变 fg + BOLD）
+    //
+    // 靠左对齐：使用 INFO_INDENT 缩进，与下方 Profile/Model、CWD 信息行共用
+    // 同一左基准，让 logo 与文字在视觉层上同列起首。
     let logo_width = ASCII_LOGO[0].chars().count();
     let available = area_width as usize;
-    let visible_logo_width = logo_width.min(available);
+    let visible_logo_width = logo_width.min(available.saturating_sub(INFO_INDENT.len()));
+    let mut spans = logo_line_spans(ASCII_LOGO[0], visible_logo_width);
+    spans.insert(0, Span::raw(INFO_INDENT));
+    let first_logo_row = Line::from(spans);
 
-    for row in ASCII_LOGO {
-        let spans = logo_line_spans(row, visible_logo_width);
-        lines.push(Line::from(spans));
+    // logo 第 1 行已经构好，剩余行复用同缩进 + 各自可见宽度的渐变 spans
+    let mut logo_lines: Vec<Line<'static>> = Vec::with_capacity(ASCII_LOGO.len());
+    logo_lines.push(first_logo_row);
+    for row in ASCII_LOGO.iter().skip(1) {
+        let mut row_spans = logo_line_spans(row, visible_logo_width);
+        row_spans.insert(0, Span::raw(INFO_INDENT));
+        logo_lines.push(Line::from(row_spans));
     }
+    lines.extend(logo_lines);
 
     // 2) logo 与信息行之间的间隔
     for _ in 0..LOGO_INFO_BLANK_LINES {
@@ -134,18 +147,10 @@ fn logo_color_at(col: usize, total_cols: usize) -> Color {
     // 两段线性插值：0..0.5 用 START→MID，0.5..1 用 MID→END
     let (r, g, b) = if t <= 0.5 {
         let k = t * 2.0;
-        (
-            sr + (mr - sr) * k,
-            sg + (mg - sg) * k,
-            sb + (mb - sb) * k,
-        )
+        (sr + (mr - sr) * k, sg + (mg - sg) * k, sb + (mb - sb) * k)
     } else {
         let k = (t - 0.5) * 2.0;
-        (
-            mr + (er - mr) * k,
-            mg + (eg - mg) * k,
-            mb + (eb - mb) * k,
-        )
+        (mr + (er - mr) * k, mg + (eg - mg) * k, mb + (eb - mb) * k)
     };
     Color::Rgb(r.round() as u8, g.round() as u8, b.round() as u8)
 }
@@ -265,7 +270,11 @@ mod tests {
         let start = TOP_BLANK_LINES;
         let end = start + ASCII_LOGO.len();
         let logo_lines = &lines[start..end];
-        assert_eq!(logo_lines.len(), 5, "shadow 字体 logo 应为 5 行");
+        assert_eq!(
+            logo_lines.len(),
+            ASCII_LOGO.len(),
+            "logo 行数应与 ASCII_LOGO 一致"
+        );
 
         // 每行可见字符数应一致（figlet shadow 是固定宽字体）
         let first_visible = logo_lines[0]
@@ -282,7 +291,8 @@ mod tests {
                 .map(|s| s.content.chars().count())
                 .sum::<usize>();
             assert_eq!(
-                visible, first_visible,
+                visible,
+                first_visible,
                 "logo 第 {} 行可见宽度应等于首行宽度 {}；实际 {}",
                 i + 1,
                 first_visible,
@@ -362,17 +372,23 @@ mod tests {
         assert!(
             r >= sr.min(er).saturating_sub(5) && r <= sr.max(er).saturating_add(5),
             "中点 R {} 应在 [{}, {}] 范围内",
-            r, sr, er
+            r,
+            sr,
+            er
         );
         assert!(
             g >= sg.min(eg).saturating_sub(5) && g <= sg.max(eg).saturating_add(5),
             "中点 G {} 应在 [{}, {}] 范围内",
-            g, sg, eg
+            g,
+            sg,
+            eg
         );
         assert!(
             b >= sb.min(eb).saturating_sub(5) && b <= sb.max(eb).saturating_add(5),
             "中点 B {} 应在 [{}, {}] 范围内",
-            b, sb, eb
+            b,
+            sb,
+            eb
         );
     }
 
@@ -383,12 +399,7 @@ mod tests {
         let inter_start = TOP_BLANK_LINES + ASCII_LOGO.len();
         for i in 0..LOGO_INFO_BLANK_LINES {
             let blank = &lines[inter_start + i];
-            assert_eq!(
-                collect_text(blank),
-                "",
-                "logo 后第 {} 行应为空行",
-                i + 1
-            );
+            assert_eq!(collect_text(blank), "", "logo 后第 {} 行应为空行", i + 1);
         }
     }
 
@@ -506,10 +517,7 @@ mod tests {
     #[test]
     fn shorten_cwd_replaces_home_with_tilde() {
         std::env::set_var("HOME", "/Users/foo");
-        assert_eq!(
-            shorten_cwd("/Users/foo/projects/bar"),
-            "~/projects/bar"
-        );
+        assert_eq!(shorten_cwd("/Users/foo/projects/bar"), "~/projects/bar");
         assert_eq!(shorten_cwd("/Users/foo"), "~");
         assert_eq!(
             shorten_cwd("/tmp/somewhere"),
@@ -521,14 +529,8 @@ mod tests {
     #[test]
     fn logo_color_at_boundaries() {
         // 边界条件：col=0 应返回 START，col=total_cols-1 应返回 END，total_cols<=1 取中点
-        assert_eq!(
-            logo_color_at(0, 10),
-            Theme::WELCOME_LOGO_GRADIENT_START
-        );
-        assert_eq!(
-            logo_color_at(9, 10),
-            Theme::WELCOME_LOGO_GRADIENT_END
-        );
+        assert_eq!(logo_color_at(0, 10), Theme::WELCOME_LOGO_GRADIENT_START);
+        assert_eq!(logo_color_at(9, 10), Theme::WELCOME_LOGO_GRADIENT_END);
         let single = logo_color_at(0, 1);
         let (r, g, b) = match single {
             Color::Rgb(r, g, b) => (r, g, b),
@@ -543,7 +545,12 @@ mod tests {
                 && (g as i32 - mg as i32).abs() <= 5
                 && (b as i32 - mb as i32).abs() <= 5,
             "单列 fallback 应取中点 RGB；实际 ({}, {}, {}) 期望接近 ({}, {}, {})",
-            r, g, b, mr, mg, mb
+            r,
+            g,
+            b,
+            mr,
+            mg,
+            mb
         );
     }
 }
