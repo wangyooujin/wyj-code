@@ -327,4 +327,6 @@ profile:
 
 welcome:
   placeholder: '试试 "修复这个 bug" 或随便问点啥…'
-  greeting: '~~欢迎回来~~'
+  # 旧的 greeting key（~~欢迎回来~~ 删除线）已废弃，
+  # 欢迎页改为展示 Profile/Model + cwd 两行信息看板
+  greeting: ''
