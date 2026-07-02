@@ -39,6 +39,12 @@ pub enum AgentEvent {
         output: u32,
         context_tokens: u32,
     },
+    /// 单次 LLM 流式返回的增量 token 用量（非累计），用于把 token 消耗实时归因到
+    /// 当前 in_progress 的任务（与 `Usage` 的覆盖式总量不同）。
+    UsageDelta {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
     /// TodoWrite 工具完成后推送任务列表快照
     TodoUpdate(Vec<wyj_tools::todo::TodoItem>),
     /// AskQuestion 工具请求用户完成多题访谈（含 oneshot 响应通道）

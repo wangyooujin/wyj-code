@@ -138,6 +138,7 @@ help:
     Esc                Interrupt current task
     Shift+Tab          Cycle mode Normal → Plan → Bypass
     Ctrl+O             Expand/collapse tool result
+    Ctrl+T             Expand/collapse task list
     Ctrl+L             Clear screen (keeps conversation history)
     Ctrl+A / Ctrl+E    Jump to start / end of line
     Ctrl+K             Delete from cursor to end of line
