@@ -152,8 +152,8 @@ impl ChatMessage {
 
     fn turn_summary(elapsed_secs: f64, d_input: u32, d_output: u32) -> Self {
         let content = format!(
-            "⏱ {:.1}s · ↑{} ↓{}",
-            elapsed_secs,
+            "⏱ {} · ↑{} ↓{}",
+            format_hms(elapsed_secs),
             fmt_tokens(d_input),
             fmt_tokens(d_output),
         );
@@ -237,6 +237,30 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
         format!("{},{:03}", n / 1000, n % 1000)
     } else {
         n.to_string()
+    }
+}
+
+/// 将秒数格式化为 xh ym zs，便于一眼辨识长耗时。
+/// - 小于 10 秒保留一位小数（0.3s / 1.2s）
+/// - 10-60 秒显示整数秒
+/// - 超过 1 分钟显示 m s；超过 1 小时显示 h m s
+pub(crate) fn format_hms(secs: f64) -> String {
+    if secs < 60.0 {
+        if secs < 10.0 {
+            format!("{:.1}s", secs)
+        } else {
+            format!("{:.0}s", secs)
+        }
+    } else {
+        let total = secs as u64;
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        let s = total % 60;
+        if h > 0 {
+            format!("{}h {}m {}s", h, m, s)
+        } else {
+            format!("{}m {}s", m, s)
+        }
     }
 }
 
@@ -1808,7 +1832,7 @@ impl AppState {
                             ("id", format!("a{id}").as_str()),
                             ("type", &agent_type),
                             ("desc", &description),
-                            ("elapsed", &format!("{elapsed_secs:.0}")),
+                            ("elapsed", &format_hms(elapsed_secs)),
                             ("result", &result),
                         ],
                     );
@@ -4591,6 +4615,19 @@ mod sub_agent_ui_tests {
             description: desc.to_string(),
             background,
         }));
+    }
+
+    #[test]
+    fn format_hms_buckets() {
+        assert_eq!(format_hms(0.0), "0.0s");
+        assert_eq!(format_hms(0.3), "0.3s");
+        assert_eq!(format_hms(9.9), "9.9s");
+        assert_eq!(format_hms(10.0), "10s");
+        assert_eq!(format_hms(59.9), "60s");
+        assert_eq!(format_hms(60.0), "1m 0s");
+        assert_eq!(format_hms(65.0), "1m 5s");
+        assert_eq!(format_hms(3_661.0), "1h 1m 1s");
+        assert_eq!(format_hms(3_730.0), "1h 2m 10s");
     }
 
     #[test]
