@@ -1,85 +1,209 @@
 //! TUI 欢迎页面（聊天区为空时显示）
 //!
-//! 极简布局：
-//! - 上方空 2 行（顶部留白）
-//! - `WYJ-CODE` 阴影块状艺术字（figlet ANSI Shadow 风格，6 行高，主题橙 + BOLD），整体左缩进 2 格
-//! - 空 2 行
-//! - `欢迎回来`（灰色 dim，走 i18n），左缩进 4 格
+//! 整体布局（自上而下）：
 //!
-//! 渲染入口是 [`render_welcome`]，由 `crates/tui/src/render.rs` 的
+//! - 顶部 1 行留白（让 logo 落在聊天区上 1/3 位置）
+//! - `WYJ-CODE` shadow 字体艺术字（5 行 × 25 列）
+//!   - 横向 RGB 渐变（橙 215,119,87 → 中间橙黄 225,160,85 → 暖黄 240,200,80）
+//!   - BOLD 强调，无背景填充（避免与下方终端默认背景形成突兀色块）
+//! - 1 行间隔
+//! - `Profile · Model`（左对齐，dim 灰）
+//! - `‹ cwd ›`（左对齐，dim 灰）
+//!
+//! 渲染入口 [`render_welcome`]，由 `crates/tui/src/render.rs` 的
 //! `draw_chat` 在 `messages.is_empty() && streaming_buf.is_empty()` 时调用。
 
 use crate::theme::Theme;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// 借用上下文，让单测不必构造完整 `AppState`（30+ 字段无 Default impl）。
+/// 欢迎页所需的运行时上下文（由调用方从 `AppState` 投影而来）
 ///
-/// 当前已无任何字段被读取——欢迎页只展示静态艺术字 + 一句本地化问候。
-/// 保留 struct 仅为了让 `render_welcome` 的签名保持向后兼容（render.rs 仍在调用）。
-pub struct WelcomeContext {}
+/// 携带的字段刚好足够生成 Profile/Model + cwd 两行信息：
+/// - `model`：当前激活的 model 名称（已 fallback 到 profile 默认）
+/// - `cwd`：工作目录（建议调用方先缩短为 `~/...` 形式）
+/// - `profile`：当前激活的 Profile 名；为 None 或 `"default"` 时省略该段
+pub struct WelcomeContext {
+    pub model: String,
+    pub cwd: String,
+    pub profile: Option<String>,
+}
 
-/// 整体左侧缩进：logo 6 行统一前缀。
-const LOGO_INDENT: &str = "  ";
-/// 问候语左侧缩进：比 logo 多 2 格，视觉上与 logo 左缘错开、呼吸感更自然。
-const GREETING_INDENT: &str = "    ";
-/// logo 与问候语之间保持 2 行空行间隔。
-const INTER_BLANK_LINES: usize = 2;
-/// 欢迎页顶部留白行数（位于 logo 上方）。
-const TOP_BLANK_LINES: usize = 2;
+/// 顶部留白行数：让 logo 落在聊天区上 1/3 而不是几何中心。
+const TOP_BLANK_LINES: usize = 1;
+/// logo 与 Profile/Model 信息行之间的间隔行数。
+const LOGO_INFO_BLANK_LINES: usize = 1;
+/// 信息行左缩进：与下方用户消息前缀 `❯` 的左对齐基准呼应，
+/// 让「功能信息」与「装饰信息」在视觉层上分离（logo 居中、信息靠左）。
+const INFO_INDENT: &str = "  ";
+/// 隐藏默认 Profile 名：仅当 profile 名非空且不是 "default" 时才显示。
+const DEFAULT_PROFILE: &str = "default";
 
-/// WYJ-CODE 艺术字（figlet ANSI Shadow 字体，6 行高，73 列宽）。
+/// WYJ-CODE 艺术字（figlet shadow 字体，5 行高 × 25 列宽）
 ///
-/// 字符来源：从 figlet 字体表 `ANSI Shadow.flf` 提取 W/Y/J/-/C/O/D/E 八个
-/// 字符的 6 行定义，字符间以 1 列空格拼接（硬空白已替换为正常空格）。
+/// 字符来源：从 figlet `shadow.flf` 提取 W/Y/J/-/C/O/D/E 八个字符的
+/// 5 行定义，字符间以 1 列空格拼接。
 const ASCII_LOGO: &[&str] = &[
-    "██╗    ██╗ ██╗   ██╗      ██╗         ██████╗  ██████╗  ██████╗  ███████╗",
-    "██║    ██║ ╚██╗ ██╔╝      ██║        ██╔════╝ ██╔═══██╗ ██╔══██╗ ██╔════╝",
-    "██║ █╗ ██║  ╚████╔╝       ██║ █████╗ ██║      ██║   ██║ ██║  ██║ █████╗  ",
-    "██║███╗██║   ╚██╔╝   ██   ██║ ╚════╝ ██║      ██║   ██║ ██║  ██║ ██╔══╝  ",
-    "╚███╔███╔╝    ██║    ╚█████╔╝        ╚██████╗ ╚██████╔╝ ██████╔╝ ███████╗",
-    " ╚══╝╚══╝     ╚═╝     ╚════╝          ╚═════╝  ╚═════╝  ╚═════╝  ╚══════╝",
+    "\\ \\        /   \\ \\   /       |       _____|    ___|    _ \\   __ \\  ____| ",
+    " \\ \\  \\   /      \\   /         |      |         |        |   |  |   | __|   ",
+    "  \\ \\  \\ /     \\   |    \\   |  _____|  |        |        |   |  |   | |     ",
+    "   \\_/\\_/         _|        \\___| \\____|  \\____| \\___/  ____/  _____| _____| ",
+    "                                                                            ",
 ];
 
-/// 生成欢迎页所有 Line（含自动垂直居中？否——调用方负责垂直/水平定位）。
+/// 生成欢迎页所有 Line
 ///
 /// 布局（自上而下）：
-/// - 顶部 `TOP_BLANK_LINES` 行空行（视觉上把 logo 推到屏幕偏中偏下一点的位置）
-/// - 6 行 logo（橙色 + BOLD，**整体左缩进 `LOGO_INDENT`**）
-/// - `INTER_BLANK_LINES` 行空行
-/// - `欢迎回来`（dim，走 i18n，**左缩进 `GREETING_INDENT`**）
-pub fn render_welcome(_ctx: &WelcomeContext, _area_width: u16) -> Vec<Line<'static>> {
-    let total = TOP_BLANK_LINES + ASCII_LOGO.len() + INTER_BLANK_LINES + 1;
+/// - 顶部 `TOP_BLANK_LINES` 行留白
+/// - 5 行 logo（按列渐变橙→黄，整块中间色背景）
+/// - `LOGO_INFO_BLANK_LINES` 行间隔
+/// - 1 行 Profile/Model（左缩进 `INFO_INDENT`，dim 灰）
+/// - 1 行 CWD（左缩进 `INFO_INDENT`，dim 灰，‹ › 包裹）
+pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static>> {
+    let total = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
 
-    // 0) 顶部留白（让 logo 距聊天框顶 2 行）
+    // 0) 顶部留白（让 logo 落在聊天区上 1/3）
     for _ in 0..TOP_BLANK_LINES {
         lines.push(Line::from(""));
     }
 
-    // 1) logo 6 行（橙色 + BOLD，左缩进 LOGO_INDENT）
-    let logo_style = Style::default()
-        .fg(Theme::CLAUDE)
-        .add_modifier(Modifier::BOLD);
+    // 1) logo 5 行（按可用宽度截断 + 横向渐变 fg + BOLD）
+    let logo_width = ASCII_LOGO[0].chars().count();
+    let available = area_width as usize;
+    let visible_logo_width = logo_width.min(available);
+
     for row in ASCII_LOGO {
-        lines.push(Line::from(Span::styled(
-            format!("{LOGO_INDENT}{row}"),
-            logo_style,
-        )));
+        let spans = logo_line_spans(row, visible_logo_width);
+        lines.push(Line::from(spans));
     }
 
-    // 2) logo 与问候语之间空 INTER_BLANK_LINES 行
-    for _ in 0..INTER_BLANK_LINES {
+    // 2) logo 与信息行之间的间隔
+    for _ in 0..LOGO_INFO_BLANK_LINES {
         lines.push(Line::from(""));
     }
 
-    // 3) 「欢迎回来」/「Welcome back」（i18n），左缩进 GREETING_INDENT
+    // 3) Profile/Model 行（左缩进）
+    let profile_text = format_profile_line(&ctx.model, ctx.profile.as_deref());
     lines.push(Line::from(Span::styled(
-        format!("{GREETING_INDENT}{}", wyj_i18n::tr("welcome.greeting")),
+        format!("{INFO_INDENT}{}", profile_text),
+        Theme::dim(),
+    )));
+
+    // 4) CWD 行（左缩进，‹ › 包裹）
+    let cwd_text = shorten_cwd(&ctx.cwd);
+    lines.push(Line::from(Span::styled(
+        format!("{INFO_INDENT}‹ {cwd_text} ›"),
         Theme::dim(),
     )));
 
     lines
+}
+
+/// 计算 logo 第 `col` 列的 RGB 颜色（在 [START..END] 范围内线性插值）
+///
+/// `total_cols` 为 logo 实际可见列数（窄终端截断后的宽度），
+/// 渐变在可见宽度内均匀过渡，避免窄终端下渐变被压缩或截断。
+///
+/// 边界点（col=0 与 col=total_cols-1）直接返回 START/END 常量本身，
+/// 避免 f32 插值 + round 引入 ±1 误差导致测试断言失败。
+fn logo_color_at(col: usize, total_cols: usize) -> Color {
+    if total_cols <= 1 {
+        return Theme::WELCOME_LOGO_GRADIENT_MID;
+    }
+    if col == 0 {
+        return Theme::WELCOME_LOGO_GRADIENT_START;
+    }
+    if col == total_cols - 1 {
+        return Theme::WELCOME_LOGO_GRADIENT_END;
+    }
+
+    let (sr, sg, sb) = match Theme::WELCOME_LOGO_GRADIENT_START {
+        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+        _ => (215.0, 119.0, 87.0),
+    };
+    let (mr, mg, mb) = match Theme::WELCOME_LOGO_GRADIENT_MID {
+        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+        _ => (225.0, 160.0, 85.0),
+    };
+    let (er, eg, eb) = match Theme::WELCOME_LOGO_GRADIENT_END {
+        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+        _ => (240.0, 200.0, 80.0),
+    };
+    let t = col as f32 / (total_cols - 1) as f32;
+    // 两段线性插值：0..0.5 用 START→MID，0.5..1 用 MID→END
+    let (r, g, b) = if t <= 0.5 {
+        let k = t * 2.0;
+        (
+            sr + (mr - sr) * k,
+            sg + (mg - sg) * k,
+            sb + (mb - sb) * k,
+        )
+    } else {
+        let k = (t - 0.5) * 2.0;
+        (
+            mr + (er - mr) * k,
+            mg + (eg - mg) * k,
+            mb + (eb - mb) * k,
+        )
+    };
+    Color::Rgb(r.round() as u8, g.round() as u8, b.round() as u8)
+}
+
+/// 生成单行 logo 的 spans 列表（每非空字符一个 span，fg 横向渐变色 + BOLD）
+///
+/// 不再为整行添加背景色（避免亮色 fg 被亮色 bg 掩盖，导致艺术字看不清）。
+/// 空格字符也不带任何 style，沿用终端默认背景。
+///
+/// 窄终端截断：若 `available_width` < logo 列数，按可见宽度切分右侧字符。
+fn logo_line_spans(row: &str, available_width: usize) -> Vec<Span<'static>> {
+    let chars: Vec<char> = row.chars().collect();
+    let visible = chars.len().min(available_width.max(1));
+
+    // 计算参与渐变的总列数：取可见范围内最后一个非空格字符的列号 + 1。
+    // 若可见范围内全空（如 logo 第 5 行就是纯空格），渐变列数为 1（取中点即可）。
+    let last_non_space = chars
+        .iter()
+        .take(visible)
+        .rposition(|c| *c != ' ')
+        .unwrap_or(0);
+    let gradient_cols = last_non_space + 1;
+
+    chars
+        .into_iter()
+        .take(visible)
+        .enumerate()
+        .map(|(col, ch)| {
+            if ch == ' ' {
+                // 空格不带任何 style：默认 fg + 默认 bg（终端原色）
+                Span::raw(ch.to_string())
+            } else {
+                let fg = logo_color_at(col, gradient_cols);
+                Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(fg).add_modifier(Modifier::BOLD),
+                )
+            }
+        })
+        .collect()
+}
+
+/// 格式化 Profile/Model 行（profile 为 None 或 default 时省略 profile 段）
+fn format_profile_line(model: &str, profile: Option<&str>) -> String {
+    match profile {
+        Some(p) if p != DEFAULT_PROFILE => format!("{p} · {model}"),
+        _ => model.to_string(),
+    }
+}
+
+/// 缩短 CWD 路径：`/Users/foo/bar` → `~/bar`（如 `$HOME` 为 `/Users/foo`）
+fn shorten_cwd(cwd: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && cwd.starts_with(&home) {
+        format!("~{}", &cwd[home.len()..])
+    } else {
+        cwd.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +211,19 @@ mod tests {
     use super::*;
 
     fn sample_ctx() -> WelcomeContext {
-        WelcomeContext {}
+        WelcomeContext {
+            model: "claude-opus-4-8".to_string(),
+            cwd: "/Users/foo/projects/bar".to_string(),
+            profile: Some("default".to_string()),
+        }
+    }
+
+    fn sample_ctx_with_profile() -> WelcomeContext {
+        WelcomeContext {
+            model: "glm-5.2".to_string(),
+            cwd: "/Users/foo".to_string(),
+            profile: Some("glm-cheap".to_string()),
+        }
     }
 
     fn collect_text(line: &Line) -> String {
@@ -95,8 +231,21 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_first_line_is_blank_padding() {
-        // 顶部留白（logo 之上）——首行是空行，方便 ratatui 把 logo 推到聊天框中段
+    fn render_welcome_total_lines_is_fixed() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let expected = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2;
+        assert_eq!(
+            lines.len(),
+            expected,
+            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 间隔 {LOGO_INFO_BLANK_LINES} + 信息 2）",
+            expected,
+            ASCII_LOGO.len()
+        );
+    }
+
+    #[test]
+    fn render_welcome_first_lines_are_blank_padding() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
         for i in 0..TOP_BLANK_LINES {
@@ -110,78 +259,129 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_total_lines_is_top_pad_plus_logo_plus_inter_plus_greeting() {
-        // 顶部 2 行 + logo 6 行 + 中间 2 行 + 1 行问候 = 11 行
-        let ctx = sample_ctx();
-        let lines = render_welcome(&ctx, 120);
-        let expected = TOP_BLANK_LINES + ASCII_LOGO.len() + INTER_BLANK_LINES + 1;
-        assert_eq!(
-            lines.len(),
-            expected,
-            "欢迎页应固定 {} 行；实际 {} 行",
-            expected,
-            lines.len()
-        );
-    }
-
-    #[test]
-    fn render_welcome_logo_has_six_rows() {
+    fn render_welcome_logo_has_five_rows_with_consistent_width() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
         let start = TOP_BLANK_LINES;
         let end = start + ASCII_LOGO.len();
         let logo_lines = &lines[start..end];
-        assert_eq!(logo_lines.len(), 6, "logo 应为 6 行");
+        assert_eq!(logo_lines.len(), 5, "shadow 字体 logo 应为 5 行");
+
+        // 每行可见字符数应一致（figlet shadow 是固定宽字体）
+        let first_visible = logo_lines[0]
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
         for (i, line) in logo_lines.iter().enumerate() {
+            let visible = line
+                .spans
+                .iter()
+                .filter(|s| !s.content.is_empty())
+                .map(|s| s.content.chars().count())
+                .sum::<usize>();
             assert_eq!(
-                line.spans.len(),
-                1,
-                "logo 第 {} 行应为单 span；实际 {} 个",
+                visible, first_visible,
+                "logo 第 {} 行可见宽度应等于首行宽度 {}；实际 {}",
                 i + 1,
-                line.spans.len()
+                first_visible,
+                visible
             );
         }
     }
 
     #[test]
-    fn render_welcome_logo_first_row_starts_with_indent() {
-        // logo 整体左缩进 LOGO_INDENT（2 空格）；首字符应是块状字符 '█' 之外的空格
+    fn render_welcome_logo_has_no_background_fill() {
+        // 去掉整块背景后，logo 所有 span 的 bg 都应保持为 None，
+        // 避免亮色 fg 被亮色 bg 掩盖导致艺术字看不清。
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
         let first_logo_row = &lines[TOP_BLANK_LINES];
-        let content = &first_logo_row.spans[0].content;
-        assert!(
-            content.starts_with(LOGO_INDENT),
-            "logo 第 1 行应以 `{LOGO_INDENT}` 缩进起首；实际：{:?}",
-            content
-        );
+        for span in &first_logo_row.spans {
+            assert_eq!(
+                span.style.bg, None,
+                "logo span 不应填充背景色；content={:?}",
+                span.content
+            );
+        }
     }
 
     #[test]
-    fn render_welcome_logo_uses_claude_color() {
+    fn render_welcome_logo_uses_gradient_fg_on_non_blank_chars() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
+        // 用 logo 第 1 行做渐变起止验证——首字符 fg 应等于 START，
+        // 最后一个非空字符 fg 应等于 END
         let first_logo_row = &lines[TOP_BLANK_LINES];
+        let non_blank: Vec<&Span> = first_logo_row
+            .spans
+            .iter()
+            .filter(|s| {
+                // 过滤掉空格字符（Span::raw，无 style）
+                s.content.as_ref() != " " && s.style.fg.is_some()
+            })
+            .collect();
+        assert!(non_blank.len() >= 2, "logo 首行至少 2 个有渐变 fg 的字符");
         assert_eq!(
-            first_logo_row.spans[0].style.fg,
-            Some(Theme::CLAUDE),
-            "logo 应使用主题橙 CLAUDE"
+            non_blank.first().unwrap().style.fg,
+            Some(Theme::WELCOME_LOGO_GRADIENT_START),
+            "logo 首字符 fg 应等于渐变起点"
         );
-        assert!(
-            first_logo_row.spans[0]
-                .style
-                .add_modifier
-                .contains(Modifier::BOLD),
-            "logo 应为 BOLD"
+        assert_eq!(
+            non_blank.last().unwrap().style.fg,
+            Some(Theme::WELCOME_LOGO_GRADIENT_END),
+            "logo 末字符 fg 应等于渐变终点"
         );
     }
 
     #[test]
-    fn render_welcome_includes_two_blank_lines_between_logo_and_greeting() {
+    fn render_welcome_logo_mid_color_is_between_start_and_end() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let first_logo_row = &lines[TOP_BLANK_LINES];
+        let non_blank: Vec<&Span> = first_logo_row
+            .spans
+            .iter()
+            .filter(|s| s.content.as_ref() != " ")
+            .collect();
+        let mid = non_blank.len() / 2;
+        let mid_color = non_blank[mid].style.fg.expect("中点 span 应有 fg");
+        let (r, g, b) = match mid_color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("中点 fg 应为 RGB"),
+        };
+        let (sr, sg, sb) = match Theme::WELCOME_LOGO_GRADIENT_START {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => unreachable!(),
+        };
+        let (er, eg, eb) = match Theme::WELCOME_LOGO_GRADIENT_END {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => unreachable!(),
+        };
+        assert!(
+            r >= sr.min(er).saturating_sub(5) && r <= sr.max(er).saturating_add(5),
+            "中点 R {} 应在 [{}, {}] 范围内",
+            r, sr, er
+        );
+        assert!(
+            g >= sg.min(eg).saturating_sub(5) && g <= sg.max(eg).saturating_add(5),
+            "中点 G {} 应在 [{}, {}] 范围内",
+            g, sg, eg
+        );
+        assert!(
+            b >= sb.min(eb).saturating_sub(5) && b <= sb.max(eb).saturating_add(5),
+            "中点 B {} 应在 [{}, {}] 范围内",
+            b, sb, eb
+        );
+    }
+
+    #[test]
+    fn render_welcome_blank_line_between_logo_and_info() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
         let inter_start = TOP_BLANK_LINES + ASCII_LOGO.len();
-        for i in 0..INTER_BLANK_LINES {
+        for i in 0..LOGO_INFO_BLANK_LINES {
             let blank = &lines[inter_start + i];
             assert_eq!(
                 collect_text(blank),
@@ -193,54 +393,157 @@ mod tests {
     }
 
     #[test]
-    fn render_welcome_greeting_is_last_line_and_indented() {
-        let ctx = sample_ctx();
+    fn render_welcome_profile_line_uses_dim_style() {
+        let ctx = sample_ctx_with_profile();
         let lines = render_welcome(&ctx, 120);
-        let last = lines.last().expect("welcome 不能为空");
-        let content = &last.spans[0].content;
-        // 问候语左缩进 GREETING_INDENT（4 空格），紧跟一句本地化文案
-        assert!(
-            content.starts_with(GREETING_INDENT),
-            "问候行应以 `{GREETING_INDENT}` 缩进起首；实际：{:?}",
-            content
-        );
-        assert!(
-            content.len() > GREETING_INDENT.len(),
-            "问候行除缩进外还应有本地化文本；实际：{:?}",
-            content
-        );
-    }
-
-    #[test]
-    fn render_welcome_greeting_is_dim() {
-        let ctx = sample_ctx();
-        let lines = render_welcome(&ctx, 120);
-        let last = lines.last().expect("welcome 不能为空");
+        let profile_line = &lines[TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES];
         assert_eq!(
-            last.spans[0].style.fg,
+            profile_line.spans[0].style.fg,
             Some(Theme::INACTIVE),
-            "问候行应使用 dim 色（INACTIVE 灰）"
+            "Profile/Model 行应使用 dim 色（INACTIVE 灰）"
         );
     }
 
     #[test]
-    fn render_welcome_logo_lines_have_uniform_width() {
+    fn render_welcome_profile_line_omits_default_profile() {
+        let ctx = sample_ctx(); // profile = "default"
+        let lines = render_welcome(&ctx, 120);
+        let profile_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let text = collect_text(&lines[profile_line_idx]);
+        assert!(
+            !text.contains("default"),
+            "default profile 应被省略；实际：{:?}",
+            text
+        );
+        assert!(
+            text.contains("claude-opus-4-8"),
+            "model 名应保留；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_profile_line_includes_custom_profile() {
+        let ctx = sample_ctx_with_profile(); // profile = "glm-cheap"
+        let lines = render_welcome(&ctx, 120);
+        let profile_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let text = collect_text(&lines[profile_line_idx]);
+        assert!(
+            text.contains("glm-cheap") && text.contains("glm-5.2"),
+            "非默认 profile 应同时显示 profile 名与 model；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_cwd_line_uses_bracketed_format() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let start = TOP_BLANK_LINES;
-        let widths: Vec<usize> = (start..start + ASCII_LOGO.len())
-            .map(|i| collect_text(&lines[i]).chars().count())
-            .collect();
-        let first = widths[0];
-        for (i, w) in widths.iter().enumerate() {
-            assert_eq!(
-                *w,
-                first,
-                "logo 第 {} 行宽度应等于首行宽度 {}；实际 {}",
-                i + 1,
-                first,
-                w
-            );
-        }
+        let cwd_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 1;
+        let text = collect_text(&lines[cwd_line_idx]);
+        assert!(
+            text.contains("‹ ") && text.contains(" ›"),
+            "CWD 行应使用 ‹ › 包裹；实际：{:?}",
+            text
+        );
+        assert!(
+            text.contains("/Users/foo/projects/bar") || text.contains("~/projects/bar"),
+            "CWD 行应包含完整或缩短的路径；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_info_lines_are_left_indented() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let base = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let profile_text = collect_text(&lines[base]);
+        let cwd_text = collect_text(&lines[base + 1]);
+        assert!(
+            profile_text.starts_with(INFO_INDENT),
+            "Profile/Model 行应以 `{}` 缩进起首；实际：{:?}",
+            INFO_INDENT,
+            profile_text
+        );
+        assert!(
+            cwd_text.starts_with(INFO_INDENT),
+            "CWD 行应以 `{}` 缩进起首；实际：{:?}",
+            INFO_INDENT,
+            cwd_text
+        );
+    }
+
+    #[test]
+    fn render_welcome_narrows_logo_when_terminal_is_narrow() {
+        // 窄终端（width < 25）下 logo 应被截断，不溢出
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 10);
+        let first_logo_row = &lines[TOP_BLANK_LINES];
+        let visible: usize = first_logo_row
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .map(|s| s.content.chars().count())
+            .sum();
+        assert!(
+            visible <= 10,
+            "窄终端下 logo 可见宽度应 <= 10；实际：{}",
+            visible
+        );
+    }
+
+    #[test]
+    fn format_profile_line_omits_default() {
+        assert_eq!(format_profile_line("m1", Some("default")), "m1");
+        assert_eq!(format_profile_line("m1", None), "m1");
+        assert_eq!(
+            format_profile_line("m1", Some("glm-cheap")),
+            "glm-cheap · m1"
+        );
+    }
+
+    #[test]
+    fn shorten_cwd_replaces_home_with_tilde() {
+        std::env::set_var("HOME", "/Users/foo");
+        assert_eq!(
+            shorten_cwd("/Users/foo/projects/bar"),
+            "~/projects/bar"
+        );
+        assert_eq!(shorten_cwd("/Users/foo"), "~");
+        assert_eq!(
+            shorten_cwd("/tmp/somewhere"),
+            "/tmp/somewhere",
+            "非 HOME 下的路径不应被替换"
+        );
+    }
+
+    #[test]
+    fn logo_color_at_boundaries() {
+        // 边界条件：col=0 应返回 START，col=total_cols-1 应返回 END，total_cols<=1 取中点
+        assert_eq!(
+            logo_color_at(0, 10),
+            Theme::WELCOME_LOGO_GRADIENT_START
+        );
+        assert_eq!(
+            logo_color_at(9, 10),
+            Theme::WELCOME_LOGO_GRADIENT_END
+        );
+        let single = logo_color_at(0, 1);
+        let (r, g, b) = match single {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("单列应返回 RGB"),
+        };
+        let (mr, mg, mb) = match Theme::WELCOME_LOGO_GRADIENT_MID {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => unreachable!(),
+        };
+        assert!(
+            (r as i32 - mr as i32).abs() <= 5
+                && (g as i32 - mg as i32).abs() <= 5
+                && (b as i32 - mb as i32).abs() <= 5,
+            "单列 fallback 应取中点 RGB；实际 ({}, {}, {}) 期望接近 ({}, {}, {})",
+            r, g, b, mr, mg, mb
+        );
     }
 }
