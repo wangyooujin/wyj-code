@@ -4,7 +4,7 @@ use crate::app::{
     fmt_tokens, AppState, AskQuestionDialog, AskQuestionStage, Attachment, ExecModeConfirmDialog,
     InProgressAnswer, MemoryDialog, MemoryRow, MessageRole, PermissionDialog, PlanApprovalDialog,
     ProfileDialog, ProfileOverlay, SessionPickerState, SettingsDialog, SubAgentStatus,
-    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
+    TodoRuntimeStats, PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
     SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
@@ -17,10 +17,11 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
+use std::collections::HashMap;
 use wyj_config::AgentMode;
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::ClaudeMdSource;
-use wyj_tools::todo::TodoStatus;
+use wyj_tools::todo::{is_todo_collapsible, TodoStatus};
 
 /// 将 @token 渲染为青色高亮 Span，其余部分为普通文本
 fn highlight_at_refs(line: &str) -> Line<'static> {
@@ -164,7 +165,14 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         }
         BottomPanel::TodoList => {
             if let Some(items) = &state.current_todos {
-                draw_todo_panel(f, items, state.spinner_frame, chunks[1]);
+                draw_todo_panel(
+                    f,
+                    items,
+                    state.spinner_frame,
+                    state.todo_panel_expanded,
+                    &state.todo_stats,
+                    chunks[1],
+                );
             }
         }
     }
@@ -259,7 +267,12 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     }
     if let Some(items) = &state.current_todos {
         if !items.is_empty() {
-            let h = (items.len() as u16 + 2).min(area_height);
+            let collapsed = is_todo_collapsible(items) && !state.todo_panel_expanded;
+            let h = if collapsed {
+                2u16.min(area_height)
+            } else {
+                (items.len() as u16 + 2).min(area_height)
+            };
             return (h, BottomPanel::TodoList);
         }
     }
@@ -688,6 +701,8 @@ fn draw_todo_panel(
     f: &mut Frame,
     items: &[wyj_tools::todo::TodoItem],
     spinner_frame: usize,
+    expanded: bool,
+    todo_stats: &HashMap<String, TodoRuntimeStats>,
     area: Rect,
 ) {
     let total = items.len();
@@ -695,7 +710,34 @@ fn draw_todo_panel(
         .iter()
         .filter(|t| t.status == TodoStatus::Completed)
         .count();
-    let title = format!(" 任务列表 [{done}/{total}] ");
+    let collapsible = is_todo_collapsible(items);
+    let collapsed = collapsible && !expanded;
+    let all_done = total > 0 && done == total;
+
+    let total_elapsed: f64 = todo_stats.values().map(|s| s.elapsed_secs()).sum();
+    let total_in: u32 = todo_stats.values().map(|s| s.input_tokens).sum();
+    let total_out: u32 = todo_stats.values().map(|s| s.output_tokens).sum();
+    let stats_suffix = if todo_stats.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ⏱ {total_elapsed:.1}s ↑{} ↓{}",
+            fmt_tokens(total_in),
+            fmt_tokens(total_out)
+        )
+    };
+
+    let title = if collapsed {
+        if all_done {
+            format!(" ✓ 任务已完成 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
+        } else {
+            format!(" 任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
+        }
+    } else if collapsible {
+        format!(" 任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to collapse) ")
+    } else {
+        format!(" 任务列表 [{done}/{total}]{stats_suffix} ")
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -709,6 +751,10 @@ fn draw_todo_panel(
 
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    if collapsed {
+        return;
+    }
 
     let max_content_width = inner.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line<'static>> = vec![];
@@ -741,14 +787,26 @@ fn draw_todo_panel(
         let idx_str = format!("{}/{}", i + 1, total);
         let content = truncate_line(
             &format!("{prio_str}{}", item.content),
-            max_content_width.saturating_sub(10),
+            max_content_width.saturating_sub(24),
         );
 
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(format!("[{idx_str}] "), Theme::dim()),
             Span::styled(format!("{icon} "), item_style),
             Span::styled(content, item_style),
-        ]));
+        ];
+        if let Some(s) = todo_stats.get(&item.id) {
+            spans.push(Span::styled(
+                format!(
+                    " ⏱ {:.1}s ↑{} ↓{}",
+                    s.elapsed_secs(),
+                    fmt_tokens(s.input_tokens),
+                    fmt_tokens(s.output_tokens)
+                ),
+                Theme::dim(),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
 
     let para = Paragraph::new(Text::from(lines));
