@@ -61,7 +61,7 @@ pub trait ToolContext: Send + Sync {
     fn is_allowed(&self, name: &str, input: &Value) -> bool;
     /// 若当前处于工具白名单模式（如 Plan 模式），返回该白名单，供 SubAgent 等
     /// 派生的子 Agent 继承同样的限制；否则返回 None（不受限）。
-    fn allowed_tools(&self) -> Option<&std::collections::HashSet<String>> {
+    fn allowed_tools(&self) -> Option<std::collections::HashSet<String>> {
         None
     }
     /// 发起一次多题访谈并等待用户完成（TUI 模式下弹面板，headless 返回 None）。
