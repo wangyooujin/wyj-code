@@ -335,4 +335,5 @@ profile:
 
 welcome:
   placeholder: 'Try "fix this bug" or ask anything…'
-  greeting: 'Welcome back'
+  # 旧的 greeting key 已废弃，欢迎页改为展示 Profile/Model + cwd 两行信息看板
+  greeting: ''

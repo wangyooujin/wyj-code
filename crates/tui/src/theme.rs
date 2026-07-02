@@ -129,4 +129,12 @@ impl Theme {
     pub fn progress_empty() -> Style {
         Style::default().fg(Self::INACTIVE)
     }
+
+    // ── 欢迎页 logo 专用（橙→黄渐变 + 整块反色填充）───────────────────────────
+    /// 渐变起点：品牌橙（与 CLAUDE 同色，确保 logo 起始色与品牌一致）
+    pub const WELCOME_LOGO_GRADIENT_START: Color = Color::Rgb(215, 119, 87);
+    /// 渐变中点：橙黄过渡色（用于渐变插值 + 整块背景填充）
+    pub const WELCOME_LOGO_GRADIENT_MID: Color = Color::Rgb(225, 160, 85);
+    /// 渐变终点：暖黄
+    pub const WELCOME_LOGO_GRADIENT_END: Color = Color::Rgb(240, 200, 80);
 }
