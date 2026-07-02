@@ -227,7 +227,7 @@ impl Tool for SubAgentTool {
 
         // 组装 owned 执行环境后整体 spawn（子 Agent 的一切依赖均 'static）
         let cwd = ctx.cwd().to_path_buf();
-        let allowed = ctx.allowed_tools().cloned();
+        let allowed = ctx.allowed_tools();
         let prompt = inp.prompt;
         let semaphore = self.hub.semaphore();
         let hub_task = self.hub.clone();
@@ -243,11 +243,13 @@ impl Tool for SubAgentTool {
             let mut session = Session::new();
             session.push_user(prompt);
 
-            let mut sub_ctx = crate::ctx::ToolCtx::new(&cwd);
+            let sub_ctx = crate::ctx::ToolCtx::new(&cwd);
             // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
+            // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
+            // 独立的共享句柄（而非复用父 ctx 的 Arc）即可，避免父子间意外共享可变状态。
             if let Some(allowed) = allowed {
-                sub_ctx.permission_mode = crate::ctx::PermissionMode::Allowlist(allowed);
+                sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Allowlist(allowed));
             }
 
             let mut output_buf = String::new();

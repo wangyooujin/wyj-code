@@ -1995,6 +1995,10 @@ fn spawn_agent_turn(
     tx: mpsc::Sender<AgentEvent>,
     ctx_cwd: PathBuf,
     mode_arc: Arc<tokio::sync::Mutex<AgentMode>>,
+    // 与 mode_arc 同步更新的实时权限句柄：直接共享（而非拷贝值）给 ctx，
+    // 使得本轮运行期间的模式切换（如 Plan 审批、Shift+Tab）能立即影响
+    // 后续工具调用的权限判定，无需等待下一轮 spawn_agent_turn。
+    shared_permission: Arc<std::sync::RwLock<PermissionMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
     // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
     preface_reminders: Vec<String>,
@@ -2022,7 +2026,7 @@ fn spawn_agent_turn(
         }
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
-        ctx.permission_mode = mode_to_permission(&current_mode);
+        ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
         let turn_agent = plan_turn_agent(&agent_c, &current_mode);
         let tx2 = tx.clone();
@@ -2088,6 +2092,20 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
         AgentMode::Bypass => PermissionMode::AutoApprove,
         AgentMode::Normal => PermissionMode::Prompt,
     }
+}
+
+/// 统一的模式切换入口：同步更新 shared_mode 与 shared_permission，
+/// 确保任何切换途径（Plan 审批、Shift+Tab、/mode、/plan、resume 确认）
+/// 都不会遗漏 shared_permission 的更新。shared_permission 与正在运行的
+/// turn 共享同一个 Arc<RwLock<..>>，因此这里的写入对当轮剩余的工具调用
+/// 立即生效，无需等待下一轮 spawn_agent_turn。
+async fn switch_mode(
+    shared_mode: &Arc<tokio::sync::Mutex<AgentMode>>,
+    shared_permission: &Arc<std::sync::RwLock<PermissionMode>>,
+    new_mode: AgentMode,
+) {
+    *shared_mode.lock().await = new_mode.clone();
+    *shared_permission.write().unwrap() = mode_to_permission(&new_mode);
 }
 
 /// 扫描目录并按过滤词返回文件候选列表
@@ -2290,6 +2308,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     hub: Arc<wyj_tools::SubAgentHub>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
+    // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
+    // 顶部说明：解决"运行中切换模式对本轮已生效"的问题。
+    let shared_permission = Arc::new(std::sync::RwLock::new(mode_to_permission(&mode)));
     let mut state = AppState::new(
         cwd.clone(),
         model_name,
@@ -2434,6 +2455,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                 agent_tx.clone(),
                 cwd.clone(),
                 shared_mode.clone(),
+                shared_permission.clone(),
                 ui_ask_tx.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
             );
@@ -3322,9 +3344,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.plan_dialog.take() {
                                     let _ = dlg.response_tx.send(true);
-                                    // 切换至执行模式
+                                    // 切换至执行模式；switch_mode 同步更新 shared_permission，
+                                    // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
                                     let new_mode = AgentMode::Normal;
-                                    *shared_mode.lock().await = new_mode.clone();
+                                    switch_mode(&shared_mode, &shared_permission, new_mode.clone())
+                                        .await;
                                     state.mode = new_mode;
                                     state.messages.push(ChatMessage::system(
                                         "已批准计划，切换至执行模式。".to_string(),
@@ -3370,7 +3394,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.exec_mode_confirm.take() {
                                     let new_mode = AgentMode::Normal;
-                                    *shared_mode.lock().await = new_mode.clone();
+                                    switch_mode(&shared_mode, &shared_permission, new_mode.clone())
+                                        .await;
                                     state.mode = new_mode;
                                     state.messages.push(ChatMessage::system(
                                         "已切换至执行模式。".to_string(),
@@ -3394,6 +3419,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         agent_tx.clone(),
                                         cwd.clone(),
                                         shared_mode.clone(),
+                                        shared_permission.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
@@ -3422,6 +3448,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         agent_tx.clone(),
                                         cwd.clone(),
                                         shared_mode.clone(),
+                                        shared_permission.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
@@ -3635,7 +3662,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     if key.code == KeyCode::BackTab {
                         let new_mode = cycle_mode(&state.mode);
                         let label = new_mode.label();
-                        *shared_mode.lock().await = new_mode.clone();
+                        switch_mode(&shared_mode, &shared_permission, new_mode.clone()).await;
                         state.mode = new_mode;
                         state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
                             "mode.switched",
@@ -3712,7 +3739,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             // ── /plan 命令：直接切换至 plan 模式 ────────────
                             if trimmed == "/plan" {
                                 let new_mode = AgentMode::Plan;
-                                *shared_mode.lock().await = new_mode.clone();
+                                switch_mode(&shared_mode, &shared_permission, new_mode.clone())
+                                    .await;
                                 state.mode = new_mode;
                                 state.messages.push(ChatMessage::system(wyj_i18n::tr(
                                     "mode.switched_to_plan",
@@ -3735,7 +3763,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 match new_mode {
                                     Some(m) => {
                                         let label = m.label();
-                                        *shared_mode.lock().await = m.clone();
+                                        switch_mode(&shared_mode, &shared_permission, m.clone())
+                                            .await;
                                         state.mode = m;
                                         state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
                                             "mode.switched",
@@ -3927,6 +3956,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         let tx = agent_tx.clone();
                                         let ctx_cwd = cwd.clone();
                                         let mode_arc = shared_mode.clone();
+                                        let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
 
                                         let handle = tokio::spawn(async move {
@@ -3934,7 +3964,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             sess.push_user(prompt);
                                             let current_mode = mode_arc.lock().await.clone();
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
-                                            ctx.permission_mode = mode_to_permission(&current_mode);
+                                            ctx.permission_mode = shared_permission_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
                                                 plan_turn_agent(&agent_c, &current_mode);
@@ -4119,6 +4149,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         agent_tx.clone(),
                                         cwd.clone(),
                                         shared_mode.clone(),
+                                        shared_permission.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
