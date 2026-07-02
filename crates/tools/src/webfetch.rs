@@ -64,6 +64,11 @@ impl Tool for WebFetchTool {
         }
     }
 
+    /// WebFetch 是只读网络请求，无副作用，可安全并发执行。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
 

@@ -314,6 +314,7 @@ impl Provider for OpenAIProvider {
                                 return Some(Ok(StreamEvent::Usage {
                                     input_tokens: usage.prompt_tokens.unwrap_or(0),
                                     output_tokens: usage.completion_tokens.unwrap_or(0),
+                                    cache_read_input_tokens: 0,
                                 }));
                             }
                             return None;

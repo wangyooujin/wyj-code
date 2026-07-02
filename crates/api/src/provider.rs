@@ -38,6 +38,7 @@ pub trait Provider: Send + Sync {
         let mut stop_reason = StopReason::EndTurn;
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cache_read_input_tokens = 0u32;
 
         while let Some(event) = stream.next().await {
             match event? {
@@ -55,9 +56,11 @@ pub trait Provider: Send + Sync {
                 StreamEvent::Usage {
                     input_tokens: i,
                     output_tokens: o,
+                    cache_read_input_tokens: c,
                 } => {
                     input_tokens = i;
                     output_tokens = o;
+                    cache_read_input_tokens = c;
                 }
             }
         }
@@ -77,6 +80,7 @@ pub trait Provider: Send + Sync {
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_read_input_tokens,
         })
     }
 }
