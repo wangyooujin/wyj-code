@@ -323,3 +323,7 @@ profile:
     confirm_delete_body: "确定删除分组 '{name}' 吗？(y/Enter 确认，n/Esc 取消)"
     fetching_title: "拉取模型列表"
     models_title: "选择模型（↑↓ 选择，Enter 确认，Esc 取消）"
+
+welcome:
+  placeholder: '试试 "修复这个 bug" 或随便问点啥…'
+  greeting: '欢迎回来'
