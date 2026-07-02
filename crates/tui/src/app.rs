@@ -6,9 +6,9 @@ use crate::render;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -1863,7 +1863,6 @@ pub async fn run_tui(
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -1893,8 +1892,7 @@ pub async fn run_tui(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 
@@ -2033,11 +2031,7 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     }
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let path_buf = path.to_path_buf();
@@ -2047,11 +2041,7 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     .await;
 
     enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
     terminal.clear()?;
 
     match status {
@@ -2654,15 +2644,6 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         }
                     }
                 }
-                Event::Mouse(MouseEvent { kind, .. }) => match kind {
-                    MouseEventKind::ScrollUp => {
-                        state.scroll_offset = state.scroll_offset.saturating_add(3);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                    }
-                    _ => {}
-                },
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {
