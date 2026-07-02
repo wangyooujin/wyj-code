@@ -18,8 +18,62 @@ system_prompt:
     When you need to operate on the file system, run commands, or search code, proactively use tools to get the task done.
     Tool usage principle: Read before Write; Edit requires an exact match beforehand.
     Communicate with the user in clear, accurate English, and prioritize runnable code and concrete action steps.
+    When you need the user to choose among multiple candidate options, confirm an uncertain
+    decision point, or clarify an ambiguous requirement, you must call the AskQuestion tool to
+    ask a structured question so the user can pick an answer through the UI; do not write the
+    question and options as a plain-text paragraph in your reply and expect the user to type
+    back an answer like "Q1 A Q2 B" manually.
   plan_mode: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (read / glob / grep / web_fetch).\nYou must not write or edit files, or run shell commands.\nFocus on analyzing code, planning approaches, and explaining architecture."
   plan_turn: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (Read/Glob/Grep/WebFetch/Bash) and Write (only for writing the plan document).\nFirst analyze the code thoroughly, then write the complete plan to: `{path}`\nAfter writing it, call the `ExitPlanMode` tool to submit the plan and wait for user approval before executing.\nBash commands must be read-only (ls/find/cat/grep, etc.) — no write operations."
+  non_interactive: "## Current mode: non-interactive (headless / single-shot)\n\nThere is no UI for the user to interact with right now — any AskQuestion tool call will be automatically skipped and returned as \"cancelled\". When you hit a decision point that would normally need user clarification, do not call AskQuestion; instead state the most reasonable assumption based on the information available, explain it clearly in your reply, and continue the task."
+  subagent_general: |-
+    You are a sub-agent spawned by a main agent to complete a specific task independently.
+    Use the available tools proactively to accomplish the task described in the prompt.
+    Your final text output is returned to the main agent as the task result, so end with a
+    complete, self-contained summary of what you did and found — the main agent cannot see
+    your intermediate tool calls.
+  subagent_explore: |-
+    You are a read-only exploration sub-agent. Your job is to search and read code to answer
+    the question in the prompt. You can only use read-only tools (Read/Glob/Grep/WebFetch);
+    you must not modify anything.
+    Be efficient: read excerpts rather than whole files when possible. Your final text output
+    is returned to the main agent, so end with a complete, self-contained conclusion including
+    the relevant file paths (with line numbers where useful).
+  subagent_plan: |-
+    You are a software-architect sub-agent. Analyze the codebase with read-only tools
+    (Read/Glob/Grep/WebFetch) and design an implementation plan for the task in the prompt.
+    You must not modify anything.
+    Your final text output is returned to the main agent: produce a step-by-step plan that
+    names the critical files, reuses existing functions/utilities where possible, and notes
+    key trade-offs.
+
+subagent:
+  tool_desc: |-
+    Launch an independent sub-agent to complete a given task. The sub-agent has its own
+    context and tool set; its result is returned when it finishes. Suitable for complex
+    sub-tasks that need multi-step planning, parallel execution, or context isolation.
+    Available agent types (subagent_type):
+    {types}
+  type_line: "- {name}: {description}"
+  schema_type: "The agent type to use (defaults to general-purpose)"
+  schema_description: "A short (3-5 word) description of the task, shown in the UI"
+  schema_prompt: "The task for the sub-agent to perform"
+  schema_system: "Override the agent type's system prompt (optional)"
+  schema_background: "Run in background: returns immediately; the result is delivered to you via a system-reminder when done"
+  unknown_type: "Unknown agent type `{name}`. Available types: {available}"
+  create_failed: "Failed to create sub-agent: {err}"
+  run_failed: "Sub-agent execution failed: {err}"
+  interrupted: "The sub-agent was interrupted"
+  no_output: "The sub-agent produced no output"
+  bg_started: "Background agent {id} ({type}: {desc}) started. Its result will be delivered via a system-reminder when done; continue with your current task instead of waiting."
+  bg_done_reminder: "<system-reminder>Background agent {id} ({type}: {desc}) finished after {elapsed}s. Result:\n\n{result}</system-reminder>"
+  bg_done_notice: "Background agent {id} ({type}: {desc}) finished; result will be injected into the conversation"
+  waiting_bg: "Waiting for {count} background agent(s) to finish…"
+  panel_title: " Agents [{count} running] "
+  inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
+  builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
+  builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
+  builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
 
 claude_md:
   source:
@@ -61,7 +115,9 @@ help:
     /clear             Clear conversation history
     /compact [hint]    Manually compact context to reduce token usage
     /config            Open the configuration settings panel (log_level/language, global settings)
-    /cost              Show token usage and cost estimate for this session
+    /cost              Show token usage and cost estimate for this session (sub-agent usage listed separately)
+    /agents            List available subagent types (built-in general-purpose/Explore/Plan +
+                       custom *.md definitions under ~/.claude/agents and the project's .claude/agents)
     /doctor            Diagnose environment (API Key / config / memory)
     /memory            Open the CLAUDE.md memory panel (lists all files in effect, pick one
                        to open in your system editor; includes an auto-memory toggle and index)
@@ -110,6 +166,17 @@ cost:
   line_with_price: "  Input:  {input} tokens  (~${input_cost})\nOutput: {output} tokens  (~${output_cost})\nTotal:  {total} tokens  (~${total_cost})"
   line_no_price: "  Input:  {input} tokens\nOutput: {output} tokens\nTotal:  {total} tokens"
   context_line: "Context: {pct}% ({estimated} / {window} tokens)"
+  subagent_line: "Sub-agents: input {input} + output {output} = {total} tokens (tracked separately from the main session; cost not included in the estimate above)"
+
+agents:
+  desc: "List available subagent types (built-in + custom definition files)"
+  header: "Available agent types (the Agent tool's subagent_type parameter):"
+  model_line: "Model: profile `{profile}`"
+  tools_line: "Tools: {tools}"
+  tools_all: "all standard tools"
+  source_line: "Source: {source}"
+  builtin_tag: "built-in"
+  reload_note: "Custom definitions are read from *.md files under ~/.claude/agents/ and the project's .claude/agents/ (frontmatter: name/description/tools/model; model is a profile name). This list re-reads from disk, but the type list registered with the model is fixed at startup — restart after adding/changing definitions."
 
 memory:
   desc: "Open the CLAUDE.md memory panel"
@@ -201,7 +268,13 @@ dialog:
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once  [s] Allow for session  [p] Always allow  [n] Deny"
   ask_question_title: " ◆ Agent Question "
-  hint_select_confirm_cancel: "  ↑↓ Select  Enter Confirm  Esc Cancel"
+  ask_question_overview_title: " ◆ Interview Overview "
+  ask_question_other_label: "Other…"
+  ask_question_confirm_submit: "Confirm & Submit"
+  hint_single_select: "  ↑↓ Select  Enter Next  ←/Shift+Tab Prev  Esc Cancel"
+  hint_multi_select: "  ↑↓ Select  Space Toggle  Enter Next  ←/Shift+Tab Prev  Esc Cancel"
+  hint_freetext_submit_cancel: "  Type your answer  Enter Submit  Esc Back to options"
+  hint_overview: "  ↑↓ Select  Enter Edit/Submit  Esc Cancel"
   session_picker_title: " Sessions ({count}) "
   new_session_label: "+ New session"
   hint_nav_select_cancel: "  ↑↓ Navigate  Enter Select  Esc Cancel"

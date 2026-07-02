@@ -17,7 +17,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,9 +27,11 @@ use tokio::task::AbortHandle;
 use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
+use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::{
     discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent, DiscoveredFile,
-    HistoryEntry, HistoryStore, Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
+    HistoryEntry, HistoryStore, InjectionKind, Session, SessionFile, SessionMeta, SessionStore,
+    ToolEvent,
 };
 use wyj_tools::todo::TodoItem;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
@@ -70,6 +72,8 @@ pub struct ChatMessage {
     pub display_summary: String,
     /// 工具结果是否已展开（ToolResult 专用）
     pub expanded: bool,
+    /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
+    pub sub_agent_id: Option<u64>,
 }
 
 impl ChatMessage {
@@ -83,6 +87,7 @@ impl ChatMessage {
             tool_name: None,
             display_summary: String::new(),
             expanded: false,
+            sub_agent_id: None,
         }
     }
 
@@ -123,6 +128,7 @@ impl ChatMessage {
             tool_name: Some(name),
             display_summary: summary,
             expanded: false,
+            sub_agent_id: None,
         }
     }
 
@@ -136,6 +142,7 @@ impl ChatMessage {
             tool_name: None,
             display_summary: String::new(),
             expanded: false,
+            sub_agent_id: None,
         }
     }
 
@@ -154,7 +161,55 @@ impl ChatMessage {
     }
 }
 
-fn fmt_tokens(n: u32) -> String {
+/// 子 Agent 状态（TUI 展示用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubAgentStatus {
+    Running,
+    Done,
+    Failed,
+    Interrupted,
+}
+
+/// 子 Agent 内部单次工具调用的展示行（展开明细用）
+#[derive(Debug, Clone)]
+pub struct SubToolLine {
+    pub tool_name: String,
+    pub arg_summary: String,
+    pub is_error: bool,
+    /// None = 仍在执行
+    pub elapsed_secs: Option<f64>,
+}
+
+/// 单个子 Agent 的 TUI 实时状态（key 为 Hub 分配的 id）
+#[derive(Debug, Clone)]
+pub struct SubAgentUiState {
+    pub agent_type: String,
+    pub description: String,
+    pub background: bool,
+    pub status: SubAgentStatus,
+    pub started_at: Instant,
+    /// 完成/中断时定格的耗时；运行中用 started_at.elapsed() 实时算
+    pub final_elapsed: Option<f64>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub tool_calls: usize,
+    /// 当前正在执行的内部工具（"Grep(pattern)"）
+    pub current_tool: Option<String>,
+    /// 内部工具调用明细（展开查看）
+    pub tool_log: Vec<SubToolLine>,
+    /// 父 Agent 的 ToolResult 消息是否已生成（决定是否还要画动态 ⎿ 行）
+    pub has_result: bool,
+}
+
+impl SubAgentUiState {
+    /// 当前应展示的耗时秒数
+    pub fn elapsed_secs(&self) -> f64 {
+        self.final_elapsed
+            .unwrap_or_else(|| self.started_at.elapsed().as_secs_f64())
+    }
+}
+
+pub(crate) fn fmt_tokens(n: u32) -> String {
     if n >= 1_000_000 {
         format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
     } else if n >= 1000 {
@@ -172,12 +227,331 @@ pub struct PermissionDialog {
     pub tx_id: String,
 }
 
-/// AskQuestion 对话框状态
+/// 单题当前"进行中"的作答状态（未确认，随光标/勾选实时变化）
+#[derive(Clone)]
+pub enum InProgressAnswer {
+    /// 单选：当前高亮下标（`options.len()` 代表落在"其他"虚拟位上）
+    Single { cursor: usize },
+    /// 多选：当前高亮下标 + 已勾选集合（下标同样可能是"其他"虚拟位）
+    Multi {
+        cursor: usize,
+        checked: BTreeSet<usize>,
+    },
+    /// "其他"自由文本输入子模式：`prior` 记录进入子模式前的选择态，供 Esc 退回
+    FreeText {
+        prior: Box<InProgressAnswer>,
+        input: InputBox,
+    },
+}
+
+/// 由题目的 multi_select 决定该题的初始进行中作答态
+fn default_in_progress(spec: &AskQuestionSpec) -> InProgressAnswer {
+    if spec.multi_select {
+        InProgressAnswer::Multi {
+            cursor: 0,
+            checked: Default::default(),
+        }
+    } else {
+        InProgressAnswer::Single { cursor: 0 }
+    }
+}
+
+/// 一题已确认的最终答案，用于总览页展示 + 退回编辑时的状态恢复
+#[derive(Clone)]
+pub struct ConfirmedAnswer {
+    pub answer: QuestionAnswer,
+    restore: InProgressAnswer,
+}
+
+/// AskQuestion 面板所处阶段
+#[derive(Clone, Copy)]
+pub enum AskQuestionStage {
+    /// 逐题作答，index 指向 questions 中的当前题
+    Answering { index: usize },
+    /// 总览确认页，index 指向当前高亮的行（== questions.len() 代表"确认提交"虚拟行）
+    Overview { index: usize },
+}
+
+/// AskQuestion 对话框状态（多题交互式访谈）
 pub struct AskQuestionDialog {
-    pub question: String,
-    pub options: Vec<String>,
-    pub selected: usize,
-    pub response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    pub questions: Vec<AskQuestionSpec>,
+    pub stage: AskQuestionStage,
+    pub current: InProgressAnswer,
+    pub confirmed: Vec<Option<ConfirmedAnswer>>,
+    /// 标记当前是否是从总览页跳回来编辑某一题（确认后应回到总览页而不是继续往下一题走）
+    pub entered_from_overview: bool,
+    pub response_tx: tokio::sync::oneshot::Sender<Option<Vec<QuestionAnswer>>>,
+}
+
+/// 单次按键处理后，AskQuestion 面板要求外层（AppState）采取的动作
+pub enum AskQuestionKeyOutcome {
+    /// 面板内部状态已更新，继续展示
+    Continue,
+    /// 用户整体取消访谈
+    Cancel,
+    /// 用户在总览页确认提交，外层应 take() 面板并发送最终结果
+    Submit,
+}
+
+/// `confirm()` 内部计算出的"待执行动作"，用于避免在持有 `&self.current` 借用期间
+/// 直接调用需要 `&mut self` 的 `advance()`（先算出动作，再统一执行）
+enum ConfirmAction {
+    Ignore,
+    EnterFreeText(usize),
+    Advance(QuestionAnswer, InProgressAnswer),
+}
+
+impl AskQuestionDialog {
+    pub fn new(
+        questions: Vec<AskQuestionSpec>,
+        response_tx: tokio::sync::oneshot::Sender<Option<Vec<QuestionAnswer>>>,
+    ) -> Self {
+        let n = questions.len();
+        let current = default_in_progress(&questions[0]);
+        Self {
+            questions,
+            stage: AskQuestionStage::Answering { index: 0 },
+            current,
+            confirmed: vec![None; n],
+            entered_from_overview: false,
+            response_tx,
+        }
+    }
+
+    fn freetext_input_mut(&mut self) -> Option<&mut InputBox> {
+        if let InProgressAnswer::FreeText { input, .. } = &mut self.current {
+            Some(input)
+        } else {
+            None
+        }
+    }
+
+    /// 确认当前题目的答案，写入 confirmed 并推进到下一题/总览页
+    fn advance(&mut self, index: usize, answer: QuestionAnswer, restore: InProgressAnswer) {
+        self.confirmed[index] = Some(ConfirmedAnswer { answer, restore });
+        if self.entered_from_overview {
+            self.entered_from_overview = false;
+            self.stage = AskQuestionStage::Overview { index };
+        } else if index + 1 < self.questions.len() {
+            let next = index + 1;
+            self.current = default_in_progress(&self.questions[next]);
+            self.stage = AskQuestionStage::Answering { index: next };
+        } else {
+            self.stage = AskQuestionStage::Overview {
+                index: self.questions.len(),
+            };
+        }
+    }
+
+    /// Up(-1)/Down(+1)：Answering 阶段移动选项高亮（含"其他"虚拟位），
+    /// Overview 阶段移动题目行高亮（含"确认提交"虚拟行）
+    fn move_cursor(&mut self, delta: i32) {
+        match self.stage {
+            AskQuestionStage::Answering { index } => {
+                let max = self.questions[index].options.len();
+                if let InProgressAnswer::Single { cursor }
+                | InProgressAnswer::Multi { cursor, .. } = &mut self.current
+                {
+                    let new = *cursor as i32 + delta;
+                    if (0..=max as i32).contains(&new) {
+                        *cursor = new as usize;
+                    }
+                }
+            }
+            AskQuestionStage::Overview { index } => {
+                let max = self.questions.len();
+                let new = index as i32 + delta;
+                if (0..=max as i32).contains(&new) {
+                    self.stage = AskQuestionStage::Overview {
+                        index: new as usize,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Space：多选题里 toggle 高亮项的勾选状态；落在"其他"虚拟位上则切到自由文本子模式
+    fn toggle_check(&mut self) {
+        let index = match self.stage {
+            AskQuestionStage::Answering { index } => index,
+            AskQuestionStage::Overview { .. } => return,
+        };
+        let other = self.questions[index].options.len();
+        if let InProgressAnswer::Multi { cursor, checked } = &mut self.current {
+            if *cursor == other {
+                let prior = InProgressAnswer::Multi {
+                    cursor: *cursor,
+                    checked: checked.clone(),
+                };
+                self.current = InProgressAnswer::FreeText {
+                    prior: Box::new(prior),
+                    input: InputBox::new(),
+                };
+            } else {
+                let c = *cursor;
+                if !checked.remove(&c) {
+                    checked.insert(c);
+                }
+            }
+        }
+    }
+
+    /// BackTab：退回上一题，恢复该题之前确认过的作答状态
+    fn go_back(&mut self) {
+        if let AskQuestionStage::Answering { index } = self.stage {
+            if index > 0 {
+                let prev = index - 1;
+                if let Some(c) = &self.confirmed[prev] {
+                    self.current = c.restore.clone();
+                }
+                self.stage = AskQuestionStage::Answering { index: prev };
+            }
+        }
+    }
+
+    /// Enter：按当前 stage/current 分支处理，仅在总览页"确认提交"行且全部题目已作答时返回 Submit
+    fn confirm(&mut self) -> AskQuestionKeyOutcome {
+        match self.stage {
+            AskQuestionStage::Overview { index } => {
+                if index == self.questions.len() {
+                    if self.confirmed.iter().all(|c| c.is_some()) {
+                        AskQuestionKeyOutcome::Submit
+                    } else {
+                        AskQuestionKeyOutcome::Continue
+                    }
+                } else {
+                    self.entered_from_overview = true;
+                    if let Some(c) = &self.confirmed[index] {
+                        self.current = c.restore.clone();
+                    }
+                    self.stage = AskQuestionStage::Answering { index };
+                    AskQuestionKeyOutcome::Continue
+                }
+            }
+            AskQuestionStage::Answering { index } => {
+                let other = self.questions[index].options.len();
+                let action = match &self.current {
+                    InProgressAnswer::Single { cursor } => {
+                        let cursor = *cursor;
+                        if cursor == other {
+                            ConfirmAction::EnterFreeText(cursor)
+                        } else {
+                            ConfirmAction::Advance(
+                                QuestionAnswer::Selected(vec![cursor]),
+                                InProgressAnswer::Single { cursor },
+                            )
+                        }
+                    }
+                    InProgressAnswer::Multi { cursor, checked } => {
+                        if checked.is_empty() {
+                            ConfirmAction::Ignore
+                        } else {
+                            let cursor = *cursor;
+                            let checked = checked.clone();
+                            let indices: Vec<usize> = checked.iter().copied().collect();
+                            ConfirmAction::Advance(
+                                QuestionAnswer::Selected(indices),
+                                InProgressAnswer::Multi { cursor, checked },
+                            )
+                        }
+                    }
+                    InProgressAnswer::FreeText { prior, input } => {
+                        let text = input.lines.join("").trim().to_string();
+                        if text.is_empty() {
+                            ConfirmAction::Ignore
+                        } else {
+                            let answer = match prior.as_ref() {
+                                InProgressAnswer::Multi { checked, .. } if !checked.is_empty() => {
+                                    let indices: Vec<usize> = checked.iter().copied().collect();
+                                    QuestionAnswer::SelectedWithFreeText(indices, text)
+                                }
+                                _ => QuestionAnswer::FreeText(text),
+                            };
+                            ConfirmAction::Advance(answer, (**prior).clone())
+                        }
+                    }
+                };
+                match action {
+                    ConfirmAction::Ignore => {}
+                    ConfirmAction::EnterFreeText(cursor) => {
+                        self.current = InProgressAnswer::FreeText {
+                            prior: Box::new(InProgressAnswer::Single { cursor }),
+                            input: InputBox::new(),
+                        };
+                    }
+                    ConfirmAction::Advance(answer, restore) => {
+                        self.advance(index, answer, restore);
+                    }
+                }
+                AskQuestionKeyOutcome::Continue
+            }
+        }
+    }
+
+    /// 统一按键入口：返回 Continue/Cancel/Submit，外层（AppState）只需据此决定是否 take() 面板
+    pub fn handle_key(&mut self, code: KeyCode) -> AskQuestionKeyOutcome {
+        match code {
+            KeyCode::Esc => {
+                if let InProgressAnswer::FreeText { prior, .. } = &self.current {
+                    self.current = (**prior).clone();
+                    AskQuestionKeyOutcome::Continue
+                } else {
+                    AskQuestionKeyOutcome::Cancel
+                }
+            }
+            KeyCode::BackTab => {
+                self.go_back();
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Up => {
+                self.move_cursor(-1);
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Down => {
+                self.move_cursor(1);
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Char(c) => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.insert_char(c);
+                } else if c == ' ' {
+                    self.toggle_check();
+                }
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.backspace();
+                }
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Left => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.move_left();
+                }
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Right => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.move_right();
+                }
+                AskQuestionKeyOutcome::Continue
+            }
+            KeyCode::Enter => self.confirm(),
+            _ => AskQuestionKeyOutcome::Continue,
+        }
+    }
+
+    /// 总览页确认提交时调用：取出全部已确认答案（要求 confirmed 已全部 Some）
+    fn take_answers(&mut self) -> Vec<QuestionAnswer> {
+        std::mem::take(&mut self.confirmed)
+            .into_iter()
+            .map(|c| {
+                c.expect("take_answers 只应在 confirmed 全部就绪后调用")
+                    .answer
+            })
+            .collect()
+    }
 }
 
 /// ExitPlanMode 工具触发的计划批准对话框状态
@@ -814,6 +1188,11 @@ pub struct AppState {
     pub chat_height: u16,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    /// 当前会话实际上下文大小估算（`estimate_tokens(&session.messages)`），
+    /// 用于状态栏上下文占比显示。与 total_input_tokens（跨轮次累加的历史
+    /// 用量总和，用于 /cost 与单轮增量展示）是两个不同的量：后者只增不减，
+    /// 压缩后也不会反映真实上下文缩小，因此不能拿来算占比。
+    pub context_tokens: u32,
     pub cwd: PathBuf,
     pub should_quit: bool,
     pub turns: usize,
@@ -871,12 +1250,21 @@ pub struct AppState {
     /// 上次渲染的滚动条区域（保留字段供将来用）
     pub scrollbar_area: Rect,
     /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
-    pub injector: Option<mpsc::UnboundedSender<Vec<ContentBlock>>>,
+    pub injector: Option<mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>>,
     /// 排队中尚未被 Agent 消费的补充消息（文本 + 附件），用于状态栏提示计数、
     /// 消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
     pub pending_queue: Vec<(String, Vec<Attachment>)>,
     /// 当前生效的完整配置（/config 设置面板的数据来源与保存目标）
     pub config: Config,
+    /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
+    pub sub_agents: std::collections::BTreeMap<u64, SubAgentUiState>,
+    /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
+    pub pending_bg_reminders: Vec<String>,
+    /// 子 Agent 累计 token 用量（与主 session 分开统计，/cost 单列）
+    pub sub_input_tokens: u32,
+    pub sub_output_tokens: u32,
+    /// 子 Agent 生命周期管理中心（中断/退出清理用）
+    pub hub: Arc<wyj_tools::SubAgentHub>,
 }
 
 impl AppState {
@@ -886,6 +1274,7 @@ impl AppState {
         context_window: u32,
         mode: AgentMode,
         config: Config,
+        hub: Arc<wyj_tools::SubAgentHub>,
     ) -> Self {
         Self {
             messages: vec![],
@@ -899,6 +1288,7 @@ impl AppState {
             chat_height: 20,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            context_tokens: 0,
             cwd,
             should_quit: false,
             turns: 0,
@@ -935,13 +1325,35 @@ impl AppState {
             scrollbar_area: Rect::default(),
             injector: None,
             pending_queue: vec![],
+            sub_agents: std::collections::BTreeMap::new(),
+            pending_bg_reminders: vec![],
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            hub,
         }
+    }
+
+    /// 是否有仍在运行的子 Agent（驱动 spinner 与底部聚合面板）
+    pub fn has_running_sub_agents(&self) -> bool {
+        self.sub_agents
+            .values()
+            .any(|s| s.status == SubAgentStatus::Running)
     }
 
     /// 中断当前正在运行的 Agent，保留已输出内容并标记 [已中断]
     fn interrupt(&mut self) {
         if let Some(h) = self.current_task.take() {
             h.abort();
+        }
+        // 前台子 Agent 一并中断（后台任务不受影响，继续运行）
+        for id in self.hub.abort_foreground() {
+            if let Some(s) = self.sub_agents.get_mut(&id) {
+                if s.status == SubAgentStatus::Running {
+                    s.status = SubAgentStatus::Interrupted;
+                    s.final_elapsed = Some(s.started_at.elapsed().as_secs_f64());
+                    s.current_tool = None;
+                }
+            }
         }
         if self.is_thinking {
             if self.streaming_buf.is_empty() {
@@ -999,9 +1411,12 @@ impl AppState {
                     format!("{name}({arg})")
                 };
                 self.current_op = Some(display.clone());
-                self.tool_info.insert(id, (name, seq));
+                self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
-                self.messages.push(ChatMessage::tool_call(display, seq));
+                let mut msg = ChatMessage::tool_call(display, seq);
+                // ToolCall 也记录工具名，供 SubAgent Started 事件 FIFO 配对
+                msg.tool_name = Some(name);
+                self.messages.push(msg);
             }
 
             AgentEvent::ToolEnd {
@@ -1013,14 +1428,28 @@ impl AppState {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
-                self.messages.push(ChatMessage::tool_result(
-                    output,
-                    is_error,
-                    elapsed_secs,
-                    seq,
-                    name,
-                    summary,
-                ));
+                // Agent 工具：把 ToolCall 上绑定的子 Agent id 带到 ToolResult，
+                // 供展开时渲染内部工具调用明细
+                let sub_id = if name == "Agent" {
+                    self.messages
+                        .iter()
+                        .rev()
+                        .find(|m| {
+                            matches!(m.role, MessageRole::ToolCall) && m.sequence_no == Some(seq)
+                        })
+                        .and_then(|m| m.sub_agent_id)
+                } else {
+                    None
+                };
+                let mut msg =
+                    ChatMessage::tool_result(output, is_error, elapsed_secs, seq, name, summary);
+                msg.sub_agent_id = sub_id;
+                self.messages.push(msg);
+                if let Some(said) = sub_id {
+                    if let Some(s) = self.sub_agents.get_mut(&said) {
+                        s.has_result = true;
+                    }
+                }
             }
 
             AgentEvent::PermissionRequest {
@@ -1071,9 +1500,14 @@ impl AppState {
                 }
             }
 
-            AgentEvent::Usage { input, output } => {
+            AgentEvent::Usage {
+                input,
+                output,
+                context_tokens,
+            } => {
                 self.total_input_tokens = input;
                 self.total_output_tokens = output;
+                self.context_tokens = context_tokens;
             }
 
             AgentEvent::TodoUpdate(items) => {
@@ -1081,17 +1515,11 @@ impl AppState {
                 self.scroll_offset = 0; // 自动滚动到最新任务列表
             }
 
-            AgentEvent::AskQuestion {
-                question,
-                options,
+            AgentEvent::AskQuestions {
+                questions,
                 response_tx,
             } => {
-                self.ask_question_dialog = Some(AskQuestionDialog {
-                    question,
-                    options,
-                    selected: 0,
-                    response_tx,
-                });
+                self.ask_question_dialog = Some(AskQuestionDialog::new(questions, response_tx));
             }
 
             AgentEvent::BashResult {
@@ -1114,6 +1542,8 @@ impl AppState {
                     response_tx,
                 });
             }
+
+            AgentEvent::SubAgent(ev) => self.apply_sub_agent_event(ev),
 
             AgentEvent::ModelsFetched {
                 entry_idx,
@@ -1147,9 +1577,151 @@ impl AppState {
             }
         }
     }
+
+    /// 处理子 Agent 生命周期事件（更新 sub_agents 状态、绑定消息、路由后台结果）
+    fn apply_sub_agent_event(&mut self, ev: wyj_tools::SubAgentEvent) {
+        use wyj_tools::SubAgentEvent as E;
+        match ev {
+            E::Started {
+                id,
+                agent_type,
+                description,
+                background,
+            } => {
+                // FIFO 绑定最早一条未绑定的 Agent ToolCall 消息，并把内容改写为 类型(描述)
+                if let Some(msg) = self.messages.iter_mut().find(|m| {
+                    matches!(m.role, MessageRole::ToolCall)
+                        && m.tool_name.as_deref() == Some("Agent")
+                        && m.sub_agent_id.is_none()
+                }) {
+                    msg.sub_agent_id = Some(id);
+                    msg.content = format!("{agent_type}({description})");
+                }
+                self.sub_agents.insert(
+                    id,
+                    SubAgentUiState {
+                        agent_type,
+                        description,
+                        background,
+                        status: SubAgentStatus::Running,
+                        started_at: Instant::now(),
+                        final_elapsed: None,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tool_calls: 0,
+                        current_tool: None,
+                        tool_log: vec![],
+                        has_result: false,
+                    },
+                );
+            }
+            E::ToolStart {
+                id,
+                tool_name,
+                arg_summary,
+            } => {
+                if let Some(s) = self.sub_agents.get_mut(&id) {
+                    s.tool_calls += 1;
+                    s.current_tool = Some(if arg_summary.is_empty() {
+                        tool_name.clone()
+                    } else {
+                        format!("{tool_name}({arg_summary})")
+                    });
+                    s.tool_log.push(SubToolLine {
+                        tool_name,
+                        arg_summary,
+                        is_error: false,
+                        elapsed_secs: None,
+                    });
+                }
+            }
+            E::ToolEnd {
+                id,
+                tool_name,
+                is_error,
+                elapsed_secs,
+            } => {
+                if let Some(s) = self.sub_agents.get_mut(&id) {
+                    s.current_tool = None;
+                    if let Some(line) = s
+                        .tool_log
+                        .iter_mut()
+                        .rev()
+                        .find(|l| l.elapsed_secs.is_none() && l.tool_name == tool_name)
+                    {
+                        line.is_error = is_error;
+                        line.elapsed_secs = Some(elapsed_secs);
+                    }
+                }
+            }
+            E::Usage {
+                id,
+                input_tokens,
+                output_tokens,
+            } => {
+                self.sub_input_tokens += input_tokens;
+                self.sub_output_tokens += output_tokens;
+                if let Some(s) = self.sub_agents.get_mut(&id) {
+                    s.input_tokens += input_tokens;
+                    s.output_tokens += output_tokens;
+                }
+            }
+            E::Done {
+                id,
+                agent_type,
+                description,
+                result,
+                is_error,
+                elapsed_secs,
+                background,
+            } => {
+                if let Some(s) = self.sub_agents.get_mut(&id) {
+                    s.status = if is_error {
+                        SubAgentStatus::Failed
+                    } else {
+                        SubAgentStatus::Done
+                    };
+                    s.final_elapsed = Some(elapsed_secs);
+                    s.current_tool = None;
+                }
+                if background {
+                    // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
+                    // 送达；空闲则暂存，下一轮起手合并进 user 消息
+                    let reminder = wyj_i18n::tr_fmt(
+                        "subagent.bg_done_reminder",
+                        &[
+                            ("id", format!("a{id}").as_str()),
+                            ("type", &agent_type),
+                            ("desc", &description),
+                            ("elapsed", &format!("{elapsed_secs:.0}")),
+                            ("result", &result),
+                        ],
+                    );
+                    match &self.injector {
+                        Some(tx) => {
+                            let _ = tx.send((
+                                vec![ContentBlock::Text { text: reminder }],
+                                InjectionKind::SystemReminder,
+                            ));
+                        }
+                        None => self.pending_bg_reminders.push(reminder),
+                    }
+                    self.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                        "subagent.bg_done_notice",
+                        &[
+                            ("id", format!("a{id}").as_str()),
+                            ("type", &agent_type),
+                            ("desc", &description),
+                        ],
+                    )));
+                }
+            }
+        }
+    }
 }
 
 /// 启动 TUI 主界面
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
     agent: Agent,
     rebuild_fn: RebuildFn,
@@ -1167,6 +1739,8 @@ pub async fn run_tui(
     system_prompt_extra: String,
     // 当前生效的完整配置（供 /config 设置面板展示初始值、保存后重建 Agent 用）
     config: Config,
+    // 子 Agent 生命周期管理中心（注册事件回调、中断、退出清理）
+    hub: Arc<wyj_tools::SubAgentHub>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1194,6 +1768,7 @@ pub async fn run_tui(
         todo_store,
         system_prompt_extra,
         config,
+        hub,
     )
     .await;
 
@@ -1415,8 +1990,14 @@ fn spawn_agent_turn(
     ctx_cwd: PathBuf,
     mode_arc: Arc<tokio::sync::Mutex<AgentMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
-) -> (AbortHandle, mpsc::UnboundedSender<Vec<ContentBlock>>) {
-    let (inject_tx, mut inject_rx) = mpsc::unbounded_channel::<Vec<ContentBlock>>();
+    // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
+    preface_reminders: Vec<String>,
+) -> (
+    AbortHandle,
+    mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>,
+) {
+    let (inject_tx, mut inject_rx) =
+        mpsc::unbounded_channel::<(Vec<ContentBlock>, InjectionKind)>();
     let handle = tokio::spawn(async move {
         let mut sess = session_c.lock().await;
         if attachments.is_empty() {
@@ -1424,6 +2005,14 @@ fn spawn_agent_turn(
         } else {
             let blocks = build_user_blocks(text, attachments).await;
             sess.push_user_with_blocks(blocks);
+        }
+        if !preface_reminders.is_empty() {
+            sess.prepend_to_last_user(
+                preface_reminders
+                    .into_iter()
+                    .map(|text| ContentBlock::Text { text })
+                    .collect(),
+            );
         }
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
@@ -1435,8 +2024,12 @@ fn spawn_agent_turn(
             let _ = tx2.try_send(AgentEvent::TextDelta(d.to_string()));
         };
         let tx3 = tx.clone();
-        let on_inject = move || {
-            let _ = tx3.try_send(AgentEvent::Injected);
+        // 仅用户排队消息需要同步 UI（弹出 pending_queue 回放）；
+        // system-reminder 注入（如后台子 Agent 结果）对用户消息队列不可见。
+        let on_inject = move |kind: InjectionKind| {
+            if kind == InjectionKind::UserMessage {
+                let _ = tx3.try_send(AgentEvent::Injected);
+            }
         };
         match turn_agent
             .run_turn_with_injection(
@@ -1453,6 +2046,7 @@ fn spawn_agent_turn(
                     .send(AgentEvent::Usage {
                         input: sess.total_input_tokens,
                         output: sess.total_output_tokens,
+                        context_tokens: wyj_core::estimate_tokens(&sess.messages),
                     })
                     .await;
                 let _ = tx.send(AgentEvent::TurnDone).await;
@@ -1479,6 +2073,7 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "Bash",         // 只读命令，由 system prompt 约束
                 "ExitPlanMode", // 提交计划并请求批准
                 "TodoWrite",    // 任务追踪，plan 模式同样有用
+                "Agent",        // 子 Agent（继承同一白名单，不会绕过 plan 模式限制）
             ]
             .iter()
             .map(|s| s.to_string())
@@ -1671,6 +2266,7 @@ fn update_slash_completions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     agent: Agent,
@@ -1686,14 +2282,28 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
     system_prompt_extra: String,
     config: Config,
+    hub: Arc<wyj_tools::SubAgentHub>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
-    let mut state = AppState::new(cwd.clone(), model_name, context_window, mode, config);
+    let mut state = AppState::new(
+        cwd.clone(),
+        model_name,
+        context_window,
+        mode,
+        config,
+        hub.clone(),
+    );
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (ui_ask_tx, mut ui_ask_rx) = mpsc::channel::<UiAskRequest>(8);
+
+    // 子 Agent 事件走独立的无界通道（不丢事件、保序），主循环里排空
+    let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<wyj_tools::SubAgentEvent>();
+    hub.set_event_cb(move |ev| {
+        let _ = sub_tx.send(ev);
+    });
     let home_dir = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -1740,6 +2350,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let mut init_sess = Session::new();
     init_sess.messages = initial_messages;
     if has_initial {
+        state.context_tokens = wyj_core::estimate_tokens(&init_sess.messages);
         state.messages = reconstruct_display(&init_sess.messages);
         state.messages.push(ChatMessage::system(format!(
             "已恢复会话  共 {} 条消息",
@@ -1765,8 +2376,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             }
         }
 
-        // 推进 spinner 动画帧（每 ~80ms 一帧，与 Claude Code 节奏一致）
-        if state.is_thinking && last_spinner_advance.elapsed().as_millis() >= 80 {
+        // 推进 spinner 动画帧（每 ~80ms 一帧，与 Claude Code 节奏一致）；
+        // 后台子 Agent 运行期间即使主 Agent 空闲也要驱动动画
+        if (state.is_thinking || state.has_running_sub_agents())
+            && last_spinner_advance.elapsed().as_millis() >= 80
+        {
             state.spinner_frame = (state.spinner_frame + 1) % render::SPINNER_FRAMES.len();
             last_spinner_advance = Instant::now();
         }
@@ -1774,11 +2388,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         terminal.draw(|f| render::draw(f, &mut state, &input))?;
 
         // 清空 agent 事件队列
-        loop {
-            match agent_rx.try_recv() {
-                Ok(ev) => state.apply_agent_event(ev),
-                Err(_) => break,
-            }
+        while let Ok(ev) = agent_rx.try_recv() {
+            state.apply_agent_event(ev);
+        }
+
+        // 清空子 Agent 事件队列（在 agent 事件之后排空，保证父 ToolStart 先于 Started 应用）
+        while let Ok(ev) = sub_rx.try_recv() {
+            state.apply_agent_event(AgentEvent::SubAgent(ev));
         }
 
         // 竞态兜底：极小概率下，用户提交补充消息的时机恰好晚于 run_turn 最后一次
@@ -1814,6 +2430,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                 cwd.clone(),
                 shared_mode.clone(),
                 ui_ask_tx.clone(),
+                std::mem::take(&mut state.pending_bg_reminders),
             );
             state.current_task = Some(handle);
             state.injector = Some(injector);
@@ -1844,14 +2461,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         // 消费 ui_ask 请求，分发为对应 AgentEvent
         loop {
             match ui_ask_rx.try_recv() {
-                Ok(UiAskRequest::Question {
-                    question,
-                    options,
+                Ok(UiAskRequest::Questions {
+                    questions,
                     response_tx,
                 }) => {
-                    state.apply_agent_event(AgentEvent::AskQuestion {
-                        question,
-                        options,
+                    state.apply_agent_event(AgentEvent::AskQuestions {
+                        questions,
                         response_tx,
                     });
                 }
@@ -1971,6 +2586,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         state.messages.clear();
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
+                                        state.context_tokens = 0;
                                         state.turns = 0;
                                         state
                                             .messages
@@ -2007,6 +2623,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
                                                     sess.messages = file.messages;
+                                                    let context_tokens =
+                                                        wyj_core::estimate_tokens(&sess.messages);
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -2014,6 +2632,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
+                                                    state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
                                                     state.scroll_offset = 0;
                                                     state.messages.push(ChatMessage::system(
@@ -2748,6 +3367,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         ui_ask_tx.clone(),
+                                        std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -2775,6 +3395,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         ui_ask_tx.clone(),
+                                        std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -2792,33 +3413,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     }
 
                     // ② AskQuestion 对话框优先拦截全部按键
-                    if state.ask_question_dialog.is_some() {
-                        match key.code {
-                            KeyCode::Up => {
-                                if let Some(dlg) = &mut state.ask_question_dialog {
-                                    if dlg.selected > 0 {
-                                        dlg.selected -= 1;
-                                    }
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Some(dlg) = &mut state.ask_question_dialog {
-                                    if dlg.selected + 1 < dlg.options.len() {
-                                        dlg.selected += 1;
-                                    }
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(dlg) = state.ask_question_dialog.take() {
-                                    let _ = dlg.response_tx.send(Some(dlg.selected));
-                                }
-                            }
-                            KeyCode::Esc => {
+                    if let Some(dlg) = &mut state.ask_question_dialog {
+                        match dlg.handle_key(key.code) {
+                            AskQuestionKeyOutcome::Continue => {}
+                            AskQuestionKeyOutcome::Cancel => {
                                 if let Some(dlg) = state.ask_question_dialog.take() {
                                     let _ = dlg.response_tx.send(None);
                                 }
                             }
-                            _ => {}
+                            AskQuestionKeyOutcome::Submit => {
+                                if let Some(mut dlg) = state.ask_question_dialog.take() {
+                                    let answers = dlg.take_answers();
+                                    let _ = dlg.response_tx.send(Some(answers));
+                                }
+                            }
                         }
                         continue;
                     }
@@ -3132,6 +3740,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 home_dir: std::env::var("HOME")
                                     .map(std::path::PathBuf::from)
                                     .unwrap_or_default(),
+                                sub_input_tokens: state.sub_input_tokens,
+                                sub_output_tokens: state.sub_output_tokens,
                             };
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
@@ -3142,6 +3752,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         state.messages.clear();
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
+                                        state.context_tokens = 0;
                                         state.pending_attachments.clear();
                                         let mut sess = session.lock().await;
                                         *sess = Session::new();
@@ -3154,6 +3765,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         let mut sess = session.lock().await;
                                         match agent_c.compact_context(&mut sess).await {
                                             Ok(r) if r.messages_removed > 0 => {
+                                                state.context_tokens =
+                                                    wyj_core::estimate_tokens(&sess.messages);
                                                 state.messages.push(ChatMessage::assistant(
                                                     format!(
                                                         "已压缩：移除 {} 条消息，节省约 {} tokens",
@@ -3311,6 +3924,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                         .send(AgentEvent::Usage {
                                                             input: sess.total_input_tokens,
                                                             output: sess.total_output_tokens,
+                                                            context_tokens:
+                                                                wyj_core::estimate_tokens(
+                                                                    &sess.messages,
+                                                                ),
                                                         })
                                                         .await;
                                                     let _ = tx.send(AgentEvent::TurnDone).await;
@@ -3358,6 +3975,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
                                                     sess.messages = file.messages;
+                                                    let context_tokens =
+                                                        wyj_core::estimate_tokens(&sess.messages);
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -3365,6 +3984,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
+                                                    state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
                                                     state.scroll_offset = 0;
                                                     state.messages.push(ChatMessage::system(
@@ -3472,6 +4092,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         ui_ask_tx.clone(),
+                                        std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -3494,7 +4115,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             if let Some(tx) = &state.injector {
                                 let blocks =
                                     build_user_blocks(text.clone(), attachments.clone()).await;
-                                let _ = tx.send(blocks);
+                                let _ = tx.send((blocks, InjectionKind::UserMessage));
                                 state.pending_queue.push((text, attachments));
                             } else {
                                 // 理论上不应发生：is_thinking 但没有活跃任务，按普通消息兜底处理
@@ -3690,6 +4311,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         }
     }
 
+    // 退出前中断所有仍在运行的子 Agent（含后台任务，结果随进程退出丢弃）
+    hub.abort_all();
+
     // 退出时保存会话历史元数据
     if let Some(hs) = history_store {
         let _ = hs.append(&HistoryEntry {
@@ -3793,4 +4417,263 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod sub_agent_ui_tests {
+    use super::*;
+    use wyj_tools::{SubAgentEvent, SubAgentHub};
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(SubAgentHub::new()),
+        )
+    }
+
+    fn tool_start(state: &mut AppState, id: &str) {
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: id.to_string(),
+            name: "Agent".to_string(),
+            input_json: serde_json::json!({"prompt": "x", "description": "d"}),
+        });
+    }
+
+    fn started(state: &mut AppState, id: u64, desc: &str, background: bool) {
+        state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::Started {
+            id,
+            agent_type: "Explore".to_string(),
+            description: desc.to_string(),
+            background,
+        }));
+    }
+
+    #[test]
+    fn started_binds_agent_tool_calls_fifo() {
+        let mut state = make_state();
+        tool_start(&mut state, "call-1");
+        tool_start(&mut state, "call-2");
+        started(&mut state, 1, "第一个任务", false);
+        started(&mut state, 2, "第二个任务", false);
+
+        let bound: Vec<(Option<u64>, String)> = state
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::ToolCall))
+            .map(|m| (m.sub_agent_id, m.content.clone()))
+            .collect();
+        assert_eq!(bound.len(), 2);
+        // FIFO：先出现的 ToolCall 绑定先 Started 的 agent，内容改写为 类型(描述)
+        assert_eq!(bound[0], (Some(1), "Explore(第一个任务)".to_string()));
+        assert_eq!(bound[1], (Some(2), "Explore(第二个任务)".to_string()));
+    }
+
+    #[test]
+    fn bg_done_without_injector_stashes_reminder() {
+        let mut state = make_state();
+        tool_start(&mut state, "call-1");
+        started(&mut state, 1, "后台任务", true);
+        assert!(state.injector.is_none());
+        state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::Done {
+            id: 1,
+            agent_type: "Explore".to_string(),
+            description: "后台任务".to_string(),
+            result: "调查结论".to_string(),
+            is_error: false,
+            elapsed_secs: 1.2,
+            background: true,
+        }));
+        assert_eq!(state.pending_bg_reminders.len(), 1);
+        assert!(state.pending_bg_reminders[0].contains("调查结论"));
+        assert_eq!(
+            state.sub_agents.get(&1).unwrap().status,
+            SubAgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn tool_events_update_ui_state_and_log() {
+        let mut state = make_state();
+        tool_start(&mut state, "call-1");
+        started(&mut state, 1, "任务", false);
+        state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::ToolStart {
+            id: 1,
+            tool_name: "Grep".to_string(),
+            arg_summary: "foo".to_string(),
+        }));
+        {
+            let s = state.sub_agents.get(&1).unwrap();
+            assert_eq!(s.tool_calls, 1);
+            assert_eq!(s.current_tool.as_deref(), Some("Grep(foo)"));
+        }
+        state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::ToolEnd {
+            id: 1,
+            tool_name: "Grep".to_string(),
+            is_error: false,
+            elapsed_secs: 0.3,
+        }));
+        let s = state.sub_agents.get(&1).unwrap();
+        assert!(s.current_tool.is_none());
+        assert_eq!(s.tool_log.len(), 1);
+        assert_eq!(s.tool_log[0].elapsed_secs, Some(0.3));
+    }
+}
+
+#[cfg(test)]
+mod ask_question_dialog_tests {
+    use super::*;
+    use wyj_core::tool::AskQuestionOption;
+
+    fn opt(label: &str) -> AskQuestionOption {
+        AskQuestionOption {
+            label: label.to_string(),
+            description: None,
+        }
+    }
+
+    fn single_spec(question: &str) -> AskQuestionSpec {
+        AskQuestionSpec {
+            question: question.to_string(),
+            header: None,
+            multi_select: false,
+            options: vec![opt("A"), opt("B"), opt("C")],
+        }
+    }
+
+    fn multi_spec(question: &str) -> AskQuestionSpec {
+        AskQuestionSpec {
+            question: question.to_string(),
+            header: None,
+            multi_select: true,
+            options: vec![opt("A"), opt("B"), opt("C")],
+        }
+    }
+
+    fn make_dialog(
+        questions: Vec<AskQuestionSpec>,
+    ) -> (
+        AskQuestionDialog,
+        tokio::sync::oneshot::Receiver<Option<Vec<QuestionAnswer>>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (AskQuestionDialog::new(questions, tx), rx)
+    }
+
+    #[test]
+    fn single_select_enter_advances_to_next_question() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1"), single_spec("Q2")]);
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Down),
+            AskQuestionKeyOutcome::Continue
+        ));
+        let outcome = dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(outcome, AskQuestionKeyOutcome::Continue));
+        assert!(matches!(
+            dlg.stage,
+            AskQuestionStage::Answering { index: 1 }
+        ));
+        match &dlg.confirmed[0] {
+            Some(c) => assert!(matches!(&c.answer, QuestionAnswer::Selected(v) if v == &vec![1])),
+            None => panic!("第一题应已确认"),
+        }
+    }
+
+    #[test]
+    fn multi_select_enter_with_empty_checked_is_ignored() {
+        let (mut dlg, _rx) = make_dialog(vec![multi_spec("Q1")]);
+        dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            dlg.stage,
+            AskQuestionStage::Answering { index: 0 }
+        ));
+        assert!(dlg.confirmed[0].is_none());
+    }
+
+    #[test]
+    fn other_option_freetext_submit_and_esc_back() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1"), single_spec("Q2")]);
+        // 移动到"其他"虚拟位（options.len() == 3）
+        for _ in 0..3 {
+            dlg.handle_key(KeyCode::Down);
+        }
+        dlg.handle_key(KeyCode::Enter); // 进入 FreeText
+        assert!(matches!(dlg.current, InProgressAnswer::FreeText { .. }));
+
+        // Esc 应退回选项列表，而不是取消整个访谈
+        let outcome = dlg.handle_key(KeyCode::Esc);
+        assert!(matches!(outcome, AskQuestionKeyOutcome::Continue));
+        assert!(matches!(
+            dlg.current,
+            InProgressAnswer::Single { cursor: 3 }
+        ));
+
+        // 重新进入"其他"，输入文本并提交
+        dlg.handle_key(KeyCode::Enter);
+        dlg.handle_key(KeyCode::Char('嗨'));
+        let outcome = dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(outcome, AskQuestionKeyOutcome::Continue));
+        assert!(matches!(
+            dlg.stage,
+            AskQuestionStage::Answering { index: 1 }
+        ));
+        match &dlg.confirmed[0] {
+            Some(c) => assert!(matches!(&c.answer, QuestionAnswer::FreeText(t) if t == "嗨")),
+            None => panic!("第一题应已确认为自由文本"),
+        }
+    }
+
+    #[test]
+    fn overview_edit_then_confirm_returns_to_overview_not_next_question() {
+        let (mut dlg, _rx) = make_dialog(vec![
+            single_spec("Q1"),
+            single_spec("Q2"),
+            single_spec("Q3"),
+        ]);
+        for _ in 0..3 {
+            dlg.handle_key(KeyCode::Enter); // 三题都选中标下标 0
+        }
+        assert!(matches!(dlg.stage, AskQuestionStage::Overview { index: 3 }));
+
+        // 从"确认提交"行（index==3）Up 三次跳到 Q1 那一行（index==0）
+        dlg.handle_key(KeyCode::Up);
+        dlg.handle_key(KeyCode::Up);
+        dlg.handle_key(KeyCode::Up);
+        assert!(matches!(dlg.stage, AskQuestionStage::Overview { index: 0 }));
+
+        // Enter 进入编辑
+        dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(
+            dlg.stage,
+            AskQuestionStage::Answering { index: 0 }
+        ));
+
+        // 改选另一项后确认
+        dlg.handle_key(KeyCode::Down);
+        let outcome = dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(outcome, AskQuestionKeyOutcome::Continue));
+        // 应回到总览页而不是继续走到 Q2
+        assert!(matches!(dlg.stage, AskQuestionStage::Overview { index: 0 }));
+        match &dlg.confirmed[0] {
+            Some(c) => assert!(matches!(&c.answer, QuestionAnswer::Selected(v) if v == &vec![1])),
+            None => panic!("第一题应已被覆盖确认"),
+        }
+    }
+
+    #[tokio::test]
+    async fn overview_confirm_submit_sends_all_answers() {
+        let (mut dlg, rx) = make_dialog(vec![single_spec("Q1"), single_spec("Q2")]);
+        dlg.handle_key(KeyCode::Enter);
+        dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(dlg.stage, AskQuestionStage::Overview { index: 2 }));
+        let outcome = dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(outcome, AskQuestionKeyOutcome::Submit));
+        let answers = dlg.take_answers();
+        let _ = dlg.response_tx.send(Some(answers));
+        let received = rx.await.unwrap();
+        assert_eq!(received.map(|v| v.len()), Some(2));
+    }
 }
