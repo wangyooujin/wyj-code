@@ -298,9 +298,16 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let content_area = cols[0];
     let scrollbar_area = cols[1];
 
-    // 空白聊天区：渲染欢迎页（极简：WYJ-CODE 阴影块状艺术字 + 欢迎回来）
+    // 空白聊天区：渲染欢迎页（5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）
     if state.messages.is_empty() && state.streaming_buf.is_empty() {
-        let ctx = crate::welcome::WelcomeContext {};
+        let ctx = crate::welcome::WelcomeContext {
+            model: state.model_name.clone(),
+            cwd: shorten_home_path(&state.cwd.display().to_string()),
+            profile: {
+                let p = &state.config.active_profile;
+                if p == "default" { None } else { Some(p.clone()) }
+            },
+        };
         let lines = crate::welcome::render_welcome(&ctx, content_area.width);
         let para = Paragraph::new(Text::from(lines))
             .style(Theme::input_box())
@@ -727,11 +734,20 @@ fn draw_todo_panel(
         )
     };
 
+    // 折叠态下逐条任务的 spinner 不会被渲染（循环整体被跳过），用标题栏的
+    // spinner 前缀补上"仍在运行"的动感提示；全部完成/无进行中任务时不需要。
+    let has_in_progress = items.iter().any(|t| t.status == TodoStatus::InProgress);
+    let spinner_prefix = if collapsed && has_in_progress {
+        format!("{} ", SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()])
+    } else {
+        String::new()
+    };
+
     let title = if collapsed {
         if all_done {
             format!(" ✓ 任务已完成 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
         } else {
-            format!(" 任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
+            format!(" {spinner_prefix}任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
         }
     } else if collapsible {
         format!(" 任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to collapse) ")
@@ -1680,6 +1696,16 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
 }
 
 // ─── 语言选择器 ───────────────────────────────────────────────────────────────
+
+/// 把 `$HOME` 开头的路径缩短为 `~/...`（与状态栏同款）
+fn shorten_home_path(full: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() && full.starts_with(&home) {
+        format!("~{}", &full[home.len()..])
+    } else {
+        full.to_string()
+    }
+}
 
 /// api_key 打码展示：只保留前 8 位 + "..."
 fn mask_secret(s: &str) -> String {
