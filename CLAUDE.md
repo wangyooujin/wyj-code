@@ -59,6 +59,10 @@ context_window = 200000
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空自动检测系统 locale
 
+[subagent]
+default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组
+explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
+
 [[mcp_servers]]
 name = "my-server"
 transport = "stdio"
@@ -89,14 +93,14 @@ args = ["--flag"]
 ### 核心数据流
 
 1. **Tool trait**（`core::tool`）：所有工具实现 `async fn run(input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>`，由 `tools::ToolRegistry` 统一管理。
-2. **Agent 推理循环**（`core::agent::Agent::run_turn`）：流式接收 LLM 输出 → 累积工具调用 → 顺序执行（因 `ToolContext` 非 Send）→ 将结果追回 session → 继续直到 `stop_reason != tool_use`。
+2. **Agent 推理循环**（`core::agent::Agent::run_turn`）：流式接收 LLM 输出 → 累积工具调用 → 执行（`Tool::parallel_safe()` 为 true 的调用如 Agent 用 `join_all` 单任务内并发，其余相互保持顺序但与并发组同时进行，结果按原始下标保序回填，见 `exec_tool_call`）→ 将结果追回 session → 继续直到 `stop_reason != tool_use`。注意 `ToolContext` 是 `Send + Sync` 的（旧注释"非 Send"已过时）。
 3. **上下文压缩**（`core::compact`）：估算 token 数（字符数/3 粗略），当 `estimated > context_window - 40_000` 时调用 LLM 生成摘要替换旧消息，保留最近 6 条。
 4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
 5. **CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 CLAUDE.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
 6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
-7. **SubAgent**：`tools::SubAgentTool` 通过工厂函数创建拥有独立 provider 和工具集的子 Agent，顺序执行不嵌套并发。
-8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
+7. **SubAgent 多 agent 编排**（对齐 Claude Code）：类型体系 = 内置 general-purpose/Explore(只读)/Plan（`core::agent_def::builtin_defs`）+ 自定义定义文件（`~/.claude/agents/*.md` 与项目 `.claude/agents/*.md`，frontmatter: name/description/tools/model，model 引用 **Profile 名**，同名后者覆盖，`load_agent_defs`）。`tools::SubAgentTool`（工具名 "Agent"，参数 subagent_type/description/prompt/run_in_background）把每个子 Agent 整体 `tokio::spawn` 并登记进 `tools::agent_hub::SubAgentHub`（进程级单例：id 分配、`Semaphore` 并发上限 8、`abort_foreground`/`abort_all`/`wait_background`）；子 Agent 挂 `with_tool_callback`/`with_usage_callback` 把内部工具事件与 token 用量以 `SubAgentEvent` 汇入 Hub 的 event_cb。前台调用 await oneshot 结果；`run_in_background: true` 立即返回，完成结果包成 system-reminder 经注入通道（主 Agent 忙）或 `AppState.pending_bg_reminders`（空闲，下轮起手 merge）送达。TUI 展示：每个 agent 的 ToolCall 行绑定 sub_agent_id（Started 事件 FIFO 配对）并在运行期间画动态 ⎿ 状态行（耗时/tokens/工具数/当前工具），ToolResult 展开（Ctrl+O）时先列内部工具调用明细；有运行中 agent 时显示底部聚合面板（`render::draw_sub_agents_panel`）。ESC 中断只 abort 前台子 Agent，后台不受影响；TUI 退出时 `abort_all`，headless `-p` 结束前 `wait_background`。子 Agent 模型解析优先级：def.model(Profile 名) → `[subagent].explore_profile`(仅 Explore) → `[subagent].default_profile` → 主 Agent 当前分组（`cli::make_sub_agent_factory`）。子 Agent 一律不注册 Agent（防嵌套）/AskQuestion/ExitPlanMode/TodoWrite，并继承 Plan 白名单交集。`/agents` 列出全部类型；`/cost` 单列子 Agent 用量。
+8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。注入负载携带 `InjectionKind`（`UserMessage` 触发 UI 的 pending_queue 回放；`SystemReminder` 用于后台子 Agent 结果，对用户消息队列不可见）。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
 
 ### 权限模型（TUI）
 
-工具调用前通过 `mpsc` channel 发送 `AgentEvent::PermissionRequest`，TUI 渲染确认对话框，用户按 `y`/`n` 回复，Agent 协程阻塞等待。
+`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`；目前 `Prompt` 分支直接放行（`AgentEvent::PermissionRequest` 是无生产者的 stub，真正的逐调用确认对话框尚未实现）。工具与 TUI 的真实交互通道是 `ToolCtx.ui_ask_tx: mpsc::Sender<UiAskRequest>`（AskQuestion 多题面板、ExitPlanMode 计划批准走它）。Plan 模式通过 `Allowlist` 白名单限制工具，子 Agent 继承该白名单（与类型定义的工具集取交集），且子 Agent 的 ctx 不接 ui_ask_tx（也未注册需要 UI 交互的工具）。

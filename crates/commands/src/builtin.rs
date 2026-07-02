@@ -147,8 +147,77 @@ impl Command for CostCmd {
         );
 
         let header = tr("cost.header");
-        let text = format!("{header}\n{cost_line}\n\n{ctx_line}");
+        let mut text = format!("{header}\n{cost_line}\n\n{ctx_line}");
+
+        // 子 Agent 用量单列（有用量时才显示）
+        let sub_total = ctx.sub_input_tokens + ctx.sub_output_tokens;
+        if sub_total > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "cost.subagent_line",
+                &[
+                    ("input", &fmt_num(ctx.sub_input_tokens)),
+                    ("output", &fmt_num(ctx.sub_output_tokens)),
+                    ("total", &fmt_num(sub_total)),
+                ],
+            ));
+        }
         Ok(CommandResult::Output(text))
+    }
+}
+
+// ── /agents ───────────────────────────────────────────────────────────────────
+
+pub struct AgentsCmd;
+
+#[async_trait]
+impl Command for AgentsCmd {
+    fn name(&self) -> &str {
+        "agents"
+    }
+    fn description(&self) -> String {
+        tr("agents.desc")
+    }
+    fn usage(&self) -> String {
+        "/agents".to_string()
+    }
+    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        // 实时重读盘，方便验证新写的定义文件；但注册进模型的类型列表在
+        // 启动时已固定，新增/修改定义需重启才对模型生效（下方注明）。
+        let defs = wyj_core::load_agent_defs(&ctx.cwd);
+        let mut out = tr("agents.header");
+        for d in &defs {
+            out.push_str(&format!("\n● {} — {}\n", d.name, d.description));
+            if let Some(m) = &d.model {
+                out.push_str(&format!(
+                    "  {}\n",
+                    tr_fmt("agents.model_line", &[("profile", m)])
+                ));
+            }
+            let tools = d
+                .tools
+                .as_ref()
+                .map(|t| t.join(", "))
+                .unwrap_or_else(|| tr("agents.tools_all"));
+            out.push_str(&format!(
+                "  {}\n",
+                tr_fmt("agents.tools_line", &[("tools", &tools)])
+            ));
+            let source = if d.builtin {
+                tr("agents.builtin_tag")
+            } else {
+                d.source
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            };
+            out.push_str(&format!(
+                "  {}\n",
+                tr_fmt("agents.source_line", &[("source", &source)])
+            ));
+        }
+        out.push_str(&format!("\n{}", tr("agents.reload_note")));
+        Ok(CommandResult::Output(out))
     }
 }
 
@@ -484,6 +553,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
+    reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ModelCmd));
@@ -515,6 +585,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
+    reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ModelCmd));

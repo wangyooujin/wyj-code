@@ -49,7 +49,9 @@ pub async fn compact_session(
         anyhow::bail!("消息数量过少（{}条），无需压缩", total);
     }
 
-    let keep_from = total.saturating_sub(COMPACT_KEEP_RECENT);
+    let keep_from = safe_keep_from(&session.messages, COMPACT_KEEP_RECENT)
+        .ok_or_else(|| anyhow::anyhow!("找不到安全的压缩边界，暂不压缩"))?;
+
     let to_compact = &session.messages[..keep_from];
     let to_keep = session.messages[keep_from..].to_vec();
 
@@ -121,6 +123,35 @@ pub async fn compact_session(
     })
 }
 
+/// 判断消息是否为"真实用户发言"边界（而非工具结果回传）：
+/// 只有此类消息可以安全作为压缩截断点，否则会拆散 tool_use/tool_result 配对。
+fn is_user_turn_boundary(msg: &Message) -> bool {
+    matches!(msg.role, Role::User)
+        && !msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+}
+
+/// 从「保留最近 N 条」的朴素截断点回退到最近的真实用户发言边界：按固定条数
+/// 截断可能正好切在工具结果消息或助手消息上，这样拼接摘要
+/// （[User(摘要), Assistant(确认), ...保留部分]）时要么破坏 user/assistant
+/// 角色交替、要么拆散 tool_use/tool_result 配对，导致压缩后请求被 Provider
+/// 拒绝或模型上下文残缺——表现为"压缩后模型不知道该做什么"。
+/// 第一条消息必然是真实用户发言，故只要 messages 非空就不会返回 `None`
+/// （除非连第一条都不满足，理论上不可能发生）。
+fn safe_keep_from(messages: &[Message], keep_recent: usize) -> Option<usize> {
+    let total = messages.len();
+    let mut keep_from = total.saturating_sub(keep_recent);
+    while keep_from > 0 && !is_user_turn_boundary(&messages[keep_from]) {
+        keep_from -= 1;
+    }
+    if keep_from == 0 && !messages.is_empty() && !is_user_turn_boundary(&messages[0]) {
+        return None;
+    }
+    Some(keep_from)
+}
+
 fn messages_to_text(messages: &[Message]) -> String {
     messages
         .iter()
@@ -164,5 +195,89 @@ fn truncate_chars(s: &str, max: usize) -> String {
     } else {
         let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}…", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_text(s: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: s.to_string(),
+            }],
+        }
+    }
+
+    fn assistant_tool_use() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".to_string(),
+                name: "Read".to_string(),
+                input: serde_json::json!({}),
+            }],
+        }
+    }
+
+    fn user_tool_result() -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: ToolResultContent::text("ok"),
+                is_error: false,
+            }],
+        }
+    }
+
+    /// 朴素按固定条数截断会正好切在 assistant(tool_use) 之后、
+    /// user(tool_result) 之前——回退逻辑必须往前找到更早的真实用户发言，
+    /// 而不是把 keep_from 落在工具结果消息或助手消息上。
+    #[test]
+    fn safe_keep_from_backs_off_tool_result_boundary() {
+        let messages = vec![
+            user_text("请帮我读一下这个文件"), // 0: 真实用户边界
+            assistant_tool_use(),              // 1
+            user_tool_result(),                // 2
+            assistant_tool_use(),              // 3
+            user_tool_result(),                // 4
+            assistant_tool_use(),              // 5
+            user_tool_result(),                // 6
+        ];
+        // 朴素 keep_from = 7 - 3 = 4，正好落在 user_tool_result 上（idx 4）
+        let keep_from = safe_keep_from(&messages, 3).expect("应能找到安全边界");
+        assert!(
+            is_user_turn_boundary(&messages[keep_from]),
+            "回退后的截断点必须是真实用户发言，而非 tool_result 或 assistant 消息"
+        );
+        assert_eq!(keep_from, 0, "本例中只有 idx 0 是真实用户发言边界");
+    }
+
+    #[test]
+    fn safe_keep_from_keeps_naive_cut_when_already_a_boundary() {
+        let messages = vec![
+            user_text("第一条"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "好的".to_string(),
+                }],
+            },
+            user_text("第二条"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "收到".to_string(),
+                }],
+            },
+            user_text("第三条"),
+        ];
+        // 朴素 keep_from = 5 - 2 = 3，落在 assistant 消息上，需回退到 idx 2（第二条用户发言）
+        let keep_from = safe_keep_from(&messages, 2).expect("应能找到安全边界");
+        assert_eq!(keep_from, 2);
+        assert!(is_user_turn_boundary(&messages[keep_from]));
     }
 }

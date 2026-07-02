@@ -1,10 +1,11 @@
 //! 对话渲染与布局
 
 use crate::app::{
-    AppState, AskQuestionDialog, Attachment, ExecModeConfirmDialog, MemoryDialog, MemoryRow,
-    MessageRole, PermissionDialog, PlanApprovalDialog, ProfileDialog, ProfileOverlay,
-    SessionPickerState, SettingsDialog, PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS,
-    SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    fmt_tokens, AppState, AskQuestionDialog, AskQuestionStage, Attachment, ExecModeConfirmDialog,
+    InProgressAnswer, MemoryDialog, MemoryRow, MessageRole, PermissionDialog, PlanApprovalDialog,
+    ProfileDialog, ProfileOverlay, SessionPickerState, SettingsDialog, SubAgentStatus,
+    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
+    SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -17,6 +18,7 @@ use ratatui::{
     Frame,
 };
 use wyj_config::AgentMode;
+use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::ClaudeMdSource;
 use wyj_tools::todo::TodoStatus;
 
@@ -157,6 +159,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                 draw_ask_question_panel(f, dlg, chunks[1]);
             }
         }
+        BottomPanel::SubAgents => {
+            draw_sub_agents_panel(f, state, chunks[1]);
+        }
         BottomPanel::TodoList => {
             if let Some(items) = &state.current_todos {
                 draw_todo_panel(f, items, state.spinner_frame, chunks[1]);
@@ -206,6 +211,7 @@ enum BottomPanel {
     ExecModeConfirm,
     PlanApproval,
     AskQuestion,
+    SubAgents,
     TodoList,
 }
 
@@ -217,8 +223,34 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         return (5u16.min(area_height), BottomPanel::PlanApproval);
     }
     if let Some(dlg) = &state.ask_question_dialog {
-        let h = (dlg.options.len() as u16 + 6).min(area_height);
+        let h = match dlg.stage {
+            AskQuestionStage::Answering { index } => {
+                let spec = &dlg.questions[index];
+                let opts = spec.options.len();
+                let desc_lines = spec
+                    .options
+                    .iter()
+                    .filter(|o| o.description.is_some())
+                    .count();
+                // 题目行 + 分隔线 + (选项数+1个"其他"，每个描述再加一行) + 空行 + hint行 + 边框上下
+                (opts as u16 + desc_lines as u16 + 1 + 6).min(area_height)
+            }
+            AskQuestionStage::Overview { .. } => {
+                // 每题两行（题干+答案）+ 分隔线 + 确认提交行 + hint行 + 边框上下
+                (dlg.questions.len() as u16 * 2 + 6).min(area_height)
+            }
+        };
         return (h, BottomPanel::AskQuestion);
+    }
+    // 子 Agent 聚合面板：有运行中的子 Agent 即显示（优先于任务列表）
+    let running = state
+        .sub_agents
+        .values()
+        .filter(|s| s.status == SubAgentStatus::Running)
+        .count();
+    if running > 0 {
+        let h = (running as u16 + 2).min(area_height);
+        return (h, BottomPanel::SubAgents);
     }
     if let Some(items) = &state.current_todos {
         if !items.is_empty() {
@@ -308,6 +340,47 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                         Theme::tool_call(),
                     ),
                 ]));
+
+                // 子 Agent 调用：运行期间紧跟一条实时刷新的动态 ⎿ 状态行
+                if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
+                    match s.status {
+                        SubAgentStatus::Running => {
+                            let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
+                            let stats = wyj_i18n::tr_fmt(
+                                "subagent.inline_running",
+                                &[
+                                    ("elapsed", format!("{:.0}", s.elapsed_secs()).as_str()),
+                                    ("tokens", &fmt_tokens(s.output_tokens)),
+                                    ("count", &s.tool_calls.to_string()),
+                                ],
+                            );
+                            let mut spans = vec![
+                                Span::styled("    ⎿  ", Theme::dim()),
+                                Span::styled(
+                                    format!("{frame} {stats}"),
+                                    Style::default().fg(Color::Cyan),
+                                ),
+                            ];
+                            if let Some(cur) = &s.current_tool {
+                                spans.push(Span::styled(
+                                    format!(" · {}", truncate_line(cur, 40)),
+                                    Theme::dim(),
+                                ));
+                            }
+                            lines.push(Line::from(spans));
+                        }
+                        SubAgentStatus::Interrupted if !s.has_result => {
+                            lines.push(Line::from(vec![
+                                Span::styled("    ⎿  ", Theme::dim()),
+                                Span::styled(
+                                    format!("✗ {}", wyj_i18n::tr("subagent.interrupted")),
+                                    Theme::error(),
+                                ),
+                            ]));
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             // ─── ⎿  summary · elapsed  ────────────────────────────────────
@@ -361,6 +434,40 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                             format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
                             Theme::dim(),
                         )));
+                        // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
+                        if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
+                            for tl in &s.tool_log {
+                                let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
+                                    (None, _) => ("…".to_string(), Theme::dim()),
+                                    (Some(e), true) => (format!("✗ {e:.1}s"), Theme::error()),
+                                    (Some(e), false) => {
+                                        (format!("✓ {e:.1}s"), Style::default().fg(Color::Green))
+                                    }
+                                };
+                                let call = if tl.arg_summary.is_empty() {
+                                    tl.tool_name.clone()
+                                } else {
+                                    format!("{}({})", tl.tool_name, tl.arg_summary)
+                                };
+                                lines.push(Line::from(vec![
+                                    Span::styled("       ⏺ ", Theme::tool_call()),
+                                    Span::styled(
+                                        truncate_line(&call, max_content_width.saturating_sub(20)),
+                                        Theme::dim(),
+                                    ),
+                                    Span::styled(format!("  {mark}"), mark_style),
+                                ]));
+                            }
+                            if !s.tool_log.is_empty() {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "       {}",
+                                        "─".repeat(max_content_width.saturating_sub(8))
+                                    ),
+                                    Theme::dim(),
+                                )));
+                            }
+                        }
                         for l in &content_lines {
                             lines.push(Line::from(Span::styled(
                                 format!(
@@ -440,20 +547,11 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
 
     let text = Text::from(lines);
 
-    // 计算折行后的实际视觉行数（CJK/长行会比逻辑行数多）
+    // 用 ratatui 的渲染折行计数拿精确视觉行数：手工 ceil(width/cw) 估算与实际
+    // word-wrap 结果有偏差，长对话下会导致底部若干行永远滚不进视口。
     let cw = content_area.width.max(1);
-    let total_visual_lines: u16 = text
-        .lines
-        .iter()
-        .map(|line| {
-            let w = line.width() as u16;
-            if w == 0 {
-                1u16
-            } else {
-                (w + cw - 1) / cw
-            }
-        })
-        .sum();
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    let total_visual_lines = para.line_count(cw).min(u16::MAX as usize) as u16;
 
     let visible_height = content_area.height;
     state.chat_height = visible_height;
@@ -462,9 +560,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let clamped_offset = state.scroll_offset.min(max_scroll);
     let scroll = max_scroll.saturating_sub(clamped_offset);
 
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let para = para.scroll((scroll, 0));
     f.render_widget(para, content_area);
 
     // 记录滚动条区域供鼠标点击命中检测
@@ -505,6 +601,68 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             .collect();
         f.render_widget(Paragraph::new(Text::from(bar_lines)), scrollbar_area);
     }
+}
+
+/// 底部固定面板：运行中的子 Agent 总览（每行一个：spinner + 类型(描述) + 耗时/工具数/tokens）
+fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
+    let running: Vec<(&u64, &crate::app::SubAgentUiState)> = state
+        .sub_agents
+        .iter()
+        .filter(|(_, s)| s.status == SubAgentStatus::Running)
+        .collect();
+
+    let title = wyj_i18n::tr_fmt(
+        "subagent.panel_title",
+        &[("count", running.len().to_string().as_str())],
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::border())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_content_width = inner.width.saturating_sub(2) as usize;
+    let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
+    let mut lines: Vec<Line<'static>> = vec![];
+
+    for (id, s) in running {
+        let bg_tag = if s.background { " ◇bg" } else { "" };
+        let head = format!("a{id} {}({})", s.agent_type, s.description);
+        let stats = format!(
+            " · {:.0}s · {}⏺ · ↑{}{bg_tag}",
+            s.elapsed_secs(),
+            s.tool_calls,
+            fmt_tokens(s.output_tokens),
+        );
+        let mut spans = vec![
+            Span::styled(
+                format!(" {frame} "),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate_line(&head, max_content_width.saturating_sub(30)),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(stats, Theme::dim()),
+        ];
+        if let Some(cur) = &s.current_tool {
+            spans.push(Span::styled(
+                format!(" {}", truncate_line(cur, 30)),
+                Theme::dim(),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// 底部固定面板：任务列表
@@ -654,22 +812,26 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     } else {
         Theme::input_box()
     };
+    // 手动按显示宽度折行（而非交给 ratatui 的 Wrap）：必须和 InputBox::cursor_visual_pos
+    // 用同一套折行算法，否则光标计算出的坐标会和实际渲染的换行位置对不上，
+    // 导致换行后光标错位、看起来像输入内容错乱。
+    let wrap_width = inner.width as usize;
     let lines: Vec<Line> = if is_bang {
         input
             .display_lines()
             .iter()
-            .map(|l| Line::from(l.as_str()))
+            .flat_map(|l| InputBox::wrap_for_render(l, wrap_width))
+            .map(Line::from)
             .collect()
     } else {
         input
             .display_lines()
             .iter()
-            .map(|l| highlight_at_refs(l))
+            .flat_map(|l| InputBox::wrap_for_render(l, wrap_width))
+            .map(|seg| highlight_at_refs(&seg))
             .collect()
     };
-    let para = Paragraph::new(Text::from(lines))
-        .style(text_style)
-        .wrap(Wrap { trim: false });
+    let para = Paragraph::new(Text::from(lines)).style(text_style);
     f.render_widget(para, inner);
 
     // 光标位置：考虑长行折行后的视觉坐标
@@ -878,7 +1040,7 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
 // ─── 状态栏 ──────────────────────────────────────────────────────────────────
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let (used, total) = (state.total_input_tokens, state.context_window);
+    let (used, total) = (state.context_tokens, state.context_window);
     let pct = if total > 0 {
         (used as f64 / total as f64).min(1.0)
     } else {
@@ -1095,12 +1257,210 @@ fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmDialog, area
     f.render_widget(para, inner);
 }
 
+/// 把选项下标列表格式化为顿号分隔的 label 文本
+fn labels_for_ui(spec: &AskQuestionSpec, indices: &[usize]) -> String {
+    indices
+        .iter()
+        .filter_map(|&i| spec.options.get(i))
+        .map(|o| o.label.as_str())
+        .collect::<Vec<_>>()
+        .join("、")
+}
+
+/// 总览页里一题答案的展示文本
+fn format_confirmed_answer_ui(spec: &AskQuestionSpec, answer: &QuestionAnswer) -> String {
+    match answer {
+        QuestionAnswer::Selected(indices) => labels_for_ui(spec, indices),
+        QuestionAnswer::FreeText(text) => format!("其他: {text}"),
+        QuestionAnswer::SelectedWithFreeText(indices, text) => {
+            format!("{}、其他: {text}", labels_for_ui(spec, indices))
+        }
+    }
+}
+
+fn build_answering_lines(
+    dlg: &AskQuestionDialog,
+    index: usize,
+    max_w: usize,
+) -> Vec<Line<'static>> {
+    let spec = &dlg.questions[index];
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            truncate_line(&spec.question, max_w),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled("─".repeat(max_w), Theme::border())),
+    ];
+
+    if let InProgressAnswer::FreeText { input, .. } = &dlg.current {
+        let text = input.lines.first().map(|s| s.as_str()).unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            format!("> {}_", truncate_line(text, max_w.saturating_sub(2))),
+            Style::default().fg(Theme::CLAUDE),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr("dialog.hint_freetext_submit_cancel"),
+            Theme::dim(),
+        )));
+        return lines;
+    }
+
+    let (cursor, checked): (usize, Option<&std::collections::BTreeSet<usize>>) = match &dlg.current
+    {
+        InProgressAnswer::Single { cursor } => (*cursor, None),
+        InProgressAnswer::Multi { cursor, checked } => (*cursor, Some(checked)),
+        InProgressAnswer::FreeText { .. } => unreachable!(),
+    };
+
+    for (i, opt) in spec.options.iter().enumerate() {
+        let marker = match checked {
+            Some(set) if set.contains(&i) => "[x] ",
+            Some(_) => "[ ] ",
+            None => "",
+        };
+        let label = format!("{marker}{}", opt.label);
+        if i == cursor {
+            lines.push(Line::from(Span::styled(
+                format!("  ▶ {}", truncate_line(&label, max_w.saturating_sub(4))),
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", truncate_line(&label, max_w.saturating_sub(4))),
+                Style::default().fg(Color::White),
+            )));
+        }
+        if let Some(desc) = &opt.description {
+            lines.push(Line::from(Span::styled(
+                format!("      {}", truncate_line(desc, max_w.saturating_sub(6))),
+                Theme::dim(),
+            )));
+        }
+    }
+
+    // "其他"固定追加在选项末尾
+    let other_label = wyj_i18n::tr("dialog.ask_question_other_label");
+    if cursor == spec.options.len() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ▶ {}",
+                truncate_line(&other_label, max_w.saturating_sub(4))
+            ),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {}",
+                truncate_line(&other_label, max_w.saturating_sub(4))
+            ),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    let hint_key = if spec.multi_select {
+        "dialog.hint_multi_select"
+    } else {
+        "dialog.hint_single_select"
+    };
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr(hint_key),
+        Theme::dim(),
+    )));
+    lines
+}
+
+fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, spec) in dlg.questions.iter().enumerate() {
+        let header = spec
+            .header
+            .as_ref()
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("[{h}] "))
+            .unwrap_or_default();
+        let title = format!("Q{} {header}{}", i + 1, spec.question);
+        let style = if i == index {
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let prefix = if i == index { "▶ " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{}", truncate_line(&title, max_w.saturating_sub(2))),
+            style,
+        )));
+        let answer_text = dlg.confirmed[i]
+            .as_ref()
+            .map(|c| format_confirmed_answer_ui(spec, &c.answer))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "     → {}",
+                truncate_line(&answer_text, max_w.saturating_sub(6))
+            ),
+            Theme::dim(),
+        )));
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(max_w), Theme::border())));
+    let submit_label = wyj_i18n::tr("dialog.ask_question_confirm_submit");
+    let is_submit_row = index == dlg.questions.len();
+    let (prefix, style) = if is_submit_row {
+        (
+            "▶ ",
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  ", Style::default().fg(Color::White))
+    };
+    lines.push(Line::from(Span::styled(
+        format!("{prefix}{submit_label}"),
+        style,
+    )));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.hint_overview"),
+        Theme::dim(),
+    )));
+    lines
+}
+
 fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
+    let title = match dlg.stage {
+        AskQuestionStage::Answering { index } => {
+            let spec = &dlg.questions[index];
+            let header_suffix = match &spec.header {
+                Some(h) if !h.is_empty() => format!(" [{h}]"),
+                _ => String::new(),
+            };
+            format!(
+                "{} ({}/{}){header_suffix}",
+                wyj_i18n::tr("dialog.ask_question_title"),
+                index + 1,
+                dlg.questions.len()
+            )
+        }
+        AskQuestionStage::Overview { .. } => wyj_i18n::tr("dialog.ask_question_overview_title"),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::CLAUDE))
         .title(Span::styled(
-            wyj_i18n::tr("dialog.ask_question_title"),
+            title,
             Style::default()
                 .fg(Theme::CLAUDE)
                 .add_modifier(Modifier::BOLD),
@@ -1110,38 +1470,10 @@ fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
     f.render_widget(block, area);
 
     let max_w = inner.width as usize;
-
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(
-            truncate_line(&dlg.question, max_w),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled("─".repeat(max_w), Theme::border())),
-    ];
-
-    for (i, opt) in dlg.options.iter().enumerate() {
-        if i == dlg.selected {
-            lines.push(Line::from(Span::styled(
-                format!("  ▶ {}", truncate_line(opt, max_w.saturating_sub(4))),
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", truncate_line(opt, max_w.saturating_sub(4))),
-                Style::default().fg(Color::White),
-            )));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        wyj_i18n::tr("dialog.hint_select_confirm_cancel"),
-        Theme::dim(),
-    )));
+    let lines = match dlg.stage {
+        AskQuestionStage::Answering { index } => build_answering_lines(dlg, index, max_w),
+        AskQuestionStage::Overview { index } => build_overview_lines(dlg, index, max_w),
+    };
 
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);

@@ -15,6 +15,15 @@ use wyj_api::{
     types::{ContentBlock, StopReason, StreamEvent, ToolDefinition},
 };
 
+/// 注入内容的类别：用户在 Agent 忙碌期间排队的补充消息，或系统产生的
+/// 提醒（如后台子 Agent 完成结果）。调用方的 `on_inject` 回调据此区分
+/// 是否需要同步 UI 的用户消息队列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectionKind {
+    UserMessage,
+    SystemReminder,
+}
+
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）
 pub enum ToolEvent {
     Start {
@@ -47,6 +56,8 @@ pub struct Agent {
     claude_md: Option<Arc<ClaudeMdLoader>>,
     /// 可选的工具事件回调（Send + Sync，可跨线程）
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
+    /// 可选的 token 用量回调（子 Agent 向 Hub 汇报用量用）
+    usage_cb: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
 }
 
 impl Agent {
@@ -63,6 +74,7 @@ impl Agent {
             memory: None,
             claude_md: None,
             tool_cb: None,
+            usage_cb: None,
         }
     }
 
@@ -115,6 +127,12 @@ impl Agent {
         self
     }
 
+    /// 注册 token 用量回调（每收到一次流式 Usage 事件调用一次，参数为增量值）
+    pub fn with_usage_callback(mut self, cb: impl Fn(u32, u32) + Send + Sync + 'static) -> Self {
+        self.usage_cb = Some(Arc::new(cb));
+        self
+    }
+
     /// 注册工具（同时更新定义列表和实现映射）
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
         let def = tool.definition();
@@ -144,7 +162,7 @@ impl Agent {
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
     ) -> Result<()> {
-        self.run_turn_with_injection(session, ctx, on_text, None, || {})
+        self.run_turn_with_injection(session, ctx, on_text, None, |_| {})
             .await
     }
 
@@ -157,8 +175,10 @@ impl Agent {
         session: &mut Session,
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
-        mut inject_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<Vec<ContentBlock>>>,
-        mut on_inject: impl FnMut(),
+        mut inject_rx: Option<
+            &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<ContentBlock>, InjectionKind)>,
+        >,
+        mut on_inject: impl FnMut(InjectionKind),
     ) -> Result<()> {
         // 将记忆上下文追加到系统提示末尾
         let system = if let Some(mem) = &self.memory {
@@ -239,6 +259,9 @@ impl Agent {
                         output_tokens,
                     } => {
                         session.add_usage(input_tokens, output_tokens);
+                        if let Some(cb) = &self.usage_cb {
+                            cb(input_tokens, output_tokens);
+                        }
                     }
                 }
             }
@@ -262,58 +285,56 @@ impl Agent {
             let has_tool_calls = stop_reason == StopReason::ToolUse && !pending_tools.is_empty();
 
             if has_tool_calls {
-                // 顺序执行所有工具（ctx 不是 Send，不能并发）
-                let mut tool_results = vec![];
+                // 解析输入并收集 CLAUDE.md 触达目录（按原始调用顺序）
+                let calls: Vec<(String, String, serde_json::Value)> = pending_tools
+                    .into_iter()
+                    .map(|(id, name, json)| {
+                        let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                        (id, name, input)
+                    })
+                    .collect();
                 let mut touched_dirs: Vec<std::path::PathBuf> = vec![];
-                for (id, name, json) in pending_tools {
-                    let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-                    if self.claude_md.is_some() {
-                        if let Some(dir) = touched_dir(&name, &input, ctx.cwd()) {
+                if self.claude_md.is_some() {
+                    for (_, name, input) in &calls {
+                        if let Some(dir) = touched_dir(name, input, ctx.cwd()) {
                             touched_dirs.push(dir);
                         }
                     }
-                    let tool = self.tool_impls.get(&name).cloned();
-
-                    // 触发工具开始回调
-                    if let Some(cb) = &self.tool_cb {
-                        cb(ToolEvent::Start {
-                            id: id.clone(),
-                            name: name.clone(),
-                            input: input.clone(),
-                        });
-                    }
-                    let start = Instant::now();
-
-                    let result: (String, bool) = if let Some(t) = tool {
-                        if ctx.is_allowed(&name, &input) {
-                            match t.run(input, ctx).await {
-                                Ok(r) => (r.content, r.is_error),
-                                Err(e) => (format!("工具执行错误: {e}"), true),
-                            }
-                        } else {
-                            (format!("工具 `{name}` 在当前模式下不被允许"), true)
-                        }
-                    } else {
-                        (format!("工具 `{name}` 未注册"), true)
-                    };
-
-                    let elapsed_secs = start.elapsed().as_secs_f64();
-
-                    // 触发工具完成回调
-                    if let Some(cb) = &self.tool_cb {
-                        cb(ToolEvent::End {
-                            id: id.clone(),
-                            name: name.clone(),
-                            is_error: result.1,
-                            elapsed_secs,
-                            output: result.0.clone(),
-                        });
-                    }
-
-                    tool_results.push((id, name, result, elapsed_secs));
                 }
 
-                for (id, _name, (output, is_error), _elapsed) in tool_results {
+                // 分区执行：parallel_safe 的调用（如 SubAgent）各自并发，其余调用
+                // 保持相互顺序、但与并发组同时进行；结果按原始下标排序回填保序。
+                // 均为单任务内并发（join!），不要求 ctx 满足 Send/'static。
+                let total = calls.len();
+                let mut par_futs = vec![];
+                let mut seq_calls = vec![];
+                for (idx, (id, name, input)) in calls.into_iter().enumerate() {
+                    let is_par = self
+                        .tool_impls
+                        .get(&name)
+                        .map(|t| t.parallel_safe())
+                        .unwrap_or(false);
+                    if is_par && total > 1 {
+                        par_futs.push(async move {
+                            (idx, self.exec_tool_call(ctx, id, name, input).await)
+                        });
+                    } else {
+                        seq_calls.push((idx, id, name, input));
+                    }
+                }
+                let seq_fut = async {
+                    let mut out = vec![];
+                    for (idx, id, name, input) in seq_calls {
+                        out.push((idx, self.exec_tool_call(ctx, id, name, input).await));
+                    }
+                    out
+                };
+                let (par_results, seq_results) =
+                    tokio::join!(futures::future::join_all(par_futs), seq_fut);
+
+                let mut tool_results: Vec<_> = par_results.into_iter().chain(seq_results).collect();
+                tool_results.sort_by_key(|(idx, _)| *idx);
+                for (_, (id, output, is_error)) in tool_results {
                     session.push_tool_result(id, output, is_error);
                 }
 
@@ -337,10 +358,10 @@ impl Agent {
             // 或作为一条新的 user 消息续接对话（若本轮本要结束）。
             let mut got_injection = false;
             if let Some(rx) = inject_rx.as_deref_mut() {
-                while let Ok(blocks) = rx.try_recv() {
+                while let Ok((blocks, kind)) = rx.try_recv() {
                     session.push_user_blocks_merged(blocks);
                     got_injection = true;
-                    on_inject();
+                    on_inject(kind);
                 }
             }
 
@@ -361,12 +382,250 @@ impl Agent {
         Ok(())
     }
 
+    /// 执行单个工具调用：触发 Start/End 回调、权限检查、执行并计时。
+    /// 返回 (tool_use_id, 输出文本, 是否错误)。
+    async fn exec_tool_call(
+        &self,
+        ctx: &dyn ToolContext,
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    ) -> (String, String, bool) {
+        let tool = self.tool_impls.get(&name).cloned();
+
+        if let Some(cb) = &self.tool_cb {
+            cb(ToolEvent::Start {
+                id: id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            });
+        }
+        let start = Instant::now();
+
+        let (output, is_error): (String, bool) = if let Some(t) = tool {
+            if ctx.is_allowed(&name, &input) {
+                match t.run(input, ctx).await {
+                    Ok(r) => (r.content, r.is_error),
+                    Err(e) => (format!("工具执行错误: {e}"), true),
+                }
+            } else {
+                (format!("工具 `{name}` 在当前模式下不被允许"), true)
+            }
+        } else {
+            (format!("工具 `{name}` 未注册"), true)
+        };
+
+        let elapsed_secs = start.elapsed().as_secs_f64();
+
+        if let Some(cb) = &self.tool_cb {
+            cb(ToolEvent::End {
+                id: id.clone(),
+                name: name.clone(),
+                is_error,
+                elapsed_secs,
+                output: output.clone(),
+            });
+        }
+
+        (id, output, is_error)
+    }
+
     /// 手动触发上下文压缩（供 /compact 命令使用）
     pub async fn compact_context(
         &self,
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
         compact_session(session, self.provider.as_ref(), self.context_window).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{Tool, ToolContext, ToolResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wyj_api::provider::EventStream;
+    use wyj_api::types::{Message, StopReason, ToolResultContent};
+
+    struct FakeCtx;
+    #[async_trait::async_trait]
+    impl ToolContext for FakeCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
+    /// 第一轮返回两个 Sleep 工具调用，第二轮返回 EndTurn 文本
+    struct TwoToolProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for TwoToolProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n == 0 {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "t1".into(),
+                        name: "Sleep".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "t1".into(),
+                        json_delta: r#"{"ms":150,"tag":"first"}"#.into(),
+                    }),
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "t2".into(),
+                        name: "Sleep".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "t2".into(),
+                        json_delta: r#"{"ms":150,"tag":"second"}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 每轮都直接 EndTurn 的 provider（注入路由测试用）
+    struct EndTurnProvider;
+    #[async_trait::async_trait]
+    impl Provider for EndTurnProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 可并发的 mock 工具：睡 ms 毫秒后返回 tag
+    struct SleepTool;
+    #[async_trait::async_trait]
+    impl Tool for SleepTool {
+        fn name(&self) -> &str {
+            "Sleep"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "Sleep".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            let ms = input.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            let tag = input.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(ToolResult::ok(tag.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_tools_run_concurrently_and_keep_result_order() {
+        let mut agent = Agent::new(Arc::new(TwoToolProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(SleepTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let start = Instant::now();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+        // 两个 150ms 的 parallel_safe 工具应并发执行：总耗时远小于串行的 300ms
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(280),
+            "工具未并发执行，耗时 {:?}",
+            start.elapsed()
+        );
+
+        // 结果必须按原始调用顺序回填
+        let mut results = vec![];
+        for m in &session.messages {
+            for b in &m.content {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Text(text),
+                    ..
+                } = b
+                {
+                    results.push((tool_use_id.clone(), text.clone()));
+                }
+            }
+        }
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], ("t1".to_string(), "first".to_string()));
+        assert_eq!(results[1], ("t2".to_string(), "second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn injection_kind_routes_to_callback() {
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send((
+            vec![ContentBlock::Text {
+                text: "bg result".into(),
+            }],
+            InjectionKind::SystemReminder,
+        ))
+        .unwrap();
+
+        let mut kinds = vec![];
+        let mut session = Session::new();
+        session.push_user("hi");
+        agent
+            .run_turn_with_injection(&mut session, &FakeCtx, &mut |_| {}, Some(&mut rx), |k| {
+                kinds.push(k)
+            })
+            .await
+            .unwrap();
+        // SystemReminder 注入应回调对应 kind（TUI 据此不弹用户消息队列）
+        assert_eq!(kinds, vec![InjectionKind::SystemReminder]);
+        // 注入内容已合并进对话
+        let merged = session.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("bg result")))
+        });
+        assert!(merged);
     }
 }
 

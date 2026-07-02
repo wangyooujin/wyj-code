@@ -31,15 +31,20 @@ pub enum AgentEvent {
     TurnDone,
     /// Agent 出错
     Error(String),
-    /// Token 用量（覆盖式更新）
-    Usage { input: u32, output: u32 },
+    /// Token 用量（覆盖式更新）。`context_tokens` 是本轮结束时 session.messages 的
+    /// 实际大小估算（供状态栏占比显示），与 `input`（跨轮次累加的历史用量总和，
+    /// 供 /cost 与单轮增量展示）是不同的量。
+    Usage {
+        input: u32,
+        output: u32,
+        context_tokens: u32,
+    },
     /// TodoWrite 工具完成后推送任务列表快照
     TodoUpdate(Vec<wyj_tools::todo::TodoItem>),
-    /// AskQuestion 工具请求用户选择（含 oneshot 响应通道）
-    AskQuestion {
-        question: String,
-        options: Vec<String>,
-        response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    /// AskQuestion 工具请求用户完成多题访谈（含 oneshot 响应通道）
+    AskQuestions {
+        questions: Vec<wyj_core::tool::AskQuestionSpec>,
+        response_tx: tokio::sync::oneshot::Sender<Option<Vec<wyj_core::tool::QuestionAnswer>>>,
     },
     /// ! Bash 命令执行完成
     BashResult {
@@ -60,6 +65,8 @@ pub enum AgentEvent {
         field_idx: usize,
         result: Result<Vec<String>, String>,
     },
+    /// 子 Agent 生命周期事件（SubAgentHub 汇聚转发）
+    SubAgent(wyj_tools::SubAgentEvent),
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

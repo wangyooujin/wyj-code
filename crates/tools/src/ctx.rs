@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
-use wyj_core::tool::ToolContext;
+use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolContext};
 
 /// 权限模式
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,11 +20,10 @@ pub enum PermissionMode {
 
 /// 工具向 TUI 发送的交互请求
 pub enum UiAskRequest {
-    /// AskQuestion 工具的普通问答请求
-    Question {
-        question: String,
-        options: Vec<String>,
-        response_tx: tokio::sync::oneshot::Sender<Option<usize>>,
+    /// AskQuestion 工具的多题访谈请求
+    Questions {
+        questions: Vec<AskQuestionSpec>,
+        response_tx: tokio::sync::oneshot::Sender<Option<Vec<QuestionAnswer>>>,
     },
     /// ExitPlanMode 工具的计划批准请求
     ExitPlanMode {
@@ -64,12 +63,18 @@ impl ToolContext for ToolCtx {
         }
     }
 
-    async fn ask_user(&self, question: &str, options: &[String]) -> Option<usize> {
+    fn allowed_tools(&self) -> Option<&HashSet<String>> {
+        match &self.permission_mode {
+            PermissionMode::Allowlist(set) => Some(set),
+            _ => None,
+        }
+    }
+
+    async fn ask_questions(&self, questions: &[AskQuestionSpec]) -> Option<Vec<QuestionAnswer>> {
         let tx = self.ui_ask_tx.as_ref()?;
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let req = UiAskRequest::Question {
-            question: question.to_string(),
-            options: options.to_vec(),
+        let req = UiAskRequest::Questions {
+            questions: questions.to_vec(),
             response_tx,
         };
         tx.send(req).await.ok()?;
