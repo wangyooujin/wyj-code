@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolContext};
 
@@ -34,7 +35,10 @@ pub enum UiAskRequest {
 
 pub struct ToolCtx {
     pub cwd: PathBuf,
-    pub permission_mode: PermissionMode,
+    /// 运行期可实时更新的共享句柄：审批/模式切换发生在某轮工具调用循环
+    /// 进行中时（如 Plan 审批、Shift+Tab），需要立即影响同一轮剩余的
+    /// 权限判定，因此不能是每轮快照一次的普通值。
+    pub permission_mode: Arc<RwLock<PermissionMode>>,
     /// TUI 模式下注入此 sender，工具通过它向 TUI 发起交互
     pub ui_ask_tx: Option<mpsc::Sender<UiAskRequest>>,
 }
@@ -43,9 +47,14 @@ impl ToolCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
-            permission_mode: PermissionMode::AutoApprove,
+            permission_mode: Arc::new(RwLock::new(PermissionMode::AutoApprove)),
             ui_ask_tx: None,
         }
+    }
+
+    /// 就地替换权限模式的值（不改变共享句柄本身）。
+    pub fn set_permission_mode(&self, mode: PermissionMode) {
+        *self.permission_mode.write().unwrap() = mode;
     }
 }
 
@@ -56,16 +65,16 @@ impl ToolContext for ToolCtx {
     }
 
     fn is_allowed(&self, name: &str, _input: &Value) -> bool {
-        match &self.permission_mode {
+        match &*self.permission_mode.read().unwrap() {
             PermissionMode::AutoApprove => true,
             PermissionMode::Prompt => true, // UI 层会弹确认，此处放行
             PermissionMode::Allowlist(set) => set.contains(name),
         }
     }
 
-    fn allowed_tools(&self) -> Option<&HashSet<String>> {
-        match &self.permission_mode {
-            PermissionMode::Allowlist(set) => Some(set),
+    fn allowed_tools(&self) -> Option<HashSet<String>> {
+        match &*self.permission_mode.read().unwrap() {
+            PermissionMode::Allowlist(set) => Some(set.clone()),
             _ => None,
         }
     }

@@ -225,8 +225,8 @@ async fn main() -> Result<()> {
     let mut registry = ToolRegistry::standard();
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
-    let mut tool_ctx = ToolCtx::new(&cwd);
-    tool_ctx.permission_mode = match &mode {
+    let tool_ctx = ToolCtx::new(&cwd);
+    tool_ctx.set_permission_mode(match &mode {
         AgentMode::Plan => {
             let set: std::collections::HashSet<String> = [
                 "Read",
@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
         AgentMode::Normal => PermissionMode::Prompt,
-    };
+    });
 
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
     registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
