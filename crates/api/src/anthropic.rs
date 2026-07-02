@@ -42,15 +42,38 @@ impl AnthropicProvider {
 
 // ── 请求/响应类型 ────────────────────────────────────────────────────────────
 
+/// prompt 缓存标记。Anthropic API 支持 `cache_control: {type: "ephemeral"}`
+/// 标记 system / tools / 历史消息的前缀，命中后 input token 按 0.1x 计费。
+/// 详见 https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+#[derive(Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+const EPHEMERAL: CacheControl = CacheControl { kind: "ephemeral" };
+
 #[derive(Serialize)]
 struct ApiRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    /// system 字段用数组形式以支持 `cache_control` 标记，使 system prompt
+    /// 内容可被 prompt caching 缓存（首轮全价、后续轮次命中按 0.1x 计费）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    system: Vec<ApiSystemBlock<'a>>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool<'a>>,
     stream: bool,
+}
+
+#[derive(Serialize)]
+struct ApiSystemBlock<'a> {
+    #[serde(rename = "type")]
+    block_type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -64,16 +87,22 @@ struct ApiMessage {
 enum ApiContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolResult {
         tool_use_id: String,
         content: Value,
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     Image {
         source: ImageSource,
@@ -93,6 +122,8 @@ struct ApiTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<CacheControl>,
 }
 
 // SSE 事件负载
@@ -161,6 +192,12 @@ struct MessageDeltaData {
 struct UsageData {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
+    /// 命中 prompt 缓存的输入 token 数（按 0.1x 计费）
+    #[allow(dead_code)]
+    cache_read_input_tokens: Option<u32>,
+    /// 写入 prompt 缓存的输入 token 数（按 1.25x 计费）
+    #[allow(dead_code)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
@@ -177,11 +214,15 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                 .content
                 .iter()
                 .map(|b| match b {
-                    ContentBlock::Text { text } => ApiContentBlock::Text { text: text.clone() },
+                    ContentBlock::Text { text } => ApiContentBlock::Text {
+                        text: text.clone(),
+                        cache_control: None,
+                    },
                     ContentBlock::ToolUse { id, name, input } => ApiContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
+                        cache_control: None,
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
@@ -196,6 +237,7 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                             tool_use_id: tool_use_id.clone(),
                             content: val,
                             is_error: *is_error,
+                            cache_control: None,
                         }
                     }
                     ContentBlock::Image { media_type, data } => ApiContentBlock::Image {
@@ -233,19 +275,54 @@ impl Provider for AnthropicProvider {
         tools: &[ToolDefinition],
         max_tokens: u32,
     ) -> Result<EventStream> {
+        // ── 构建 system 块（带 cache_control，缓存 system prompt）──
+        let system_blocks = if system.is_empty() {
+            vec![]
+        } else {
+            vec![ApiSystemBlock {
+                block_type: "text",
+                text: system,
+                cache_control: Some(EPHEMERAL),
+            }]
+        };
+
+        // ── 构建 tools 块（最后一个工具打 cache_control，缓存全部工具定义）──
+        let tool_count = tools.len();
+        let api_tools: Vec<ApiTool> = tools
+            .iter()
+            .enumerate()
+            .map(|(i, t)| ApiTool {
+                name: &t.name,
+                description: &t.description,
+                input_schema: &t.input_schema,
+                cache_control: (tool_count > 0 && i == tool_count - 1).then_some(EPHEMERAL),
+            })
+            .collect();
+
+        // ── 构建消息历史，在最后一个内容块打 cache_control 断点 ──
+        // Anthropic 缓存按前缀匹配：把断点放在历史末尾，使「system + tools +
+        // 既有历史」整体被缓存，后续轮次只有新增的 user/assistant 内容按全价。
+        // 注意 breakpoint 总数上限为 4（system 1 + tools 1 + 历史 1 = 3，安全）。
+        let mut api_messages = to_api_messages(messages);
+        if let Some(last_msg) = api_messages.last_mut() {
+            if let Some(last_block) = last_msg.content.last_mut() {
+                match last_block {
+                    ApiContentBlock::Text { cache_control, .. }
+                    | ApiContentBlock::ToolUse { cache_control, .. }
+                    | ApiContentBlock::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(EPHEMERAL);
+                    }
+                    ApiContentBlock::Image { .. } => {}
+                }
+            }
+        }
+
         let body = ApiRequest {
             model: &self.model,
             max_tokens,
-            system,
-            messages: to_api_messages(messages),
-            tools: tools
-                .iter()
-                .map(|t| ApiTool {
-                    name: &t.name,
-                    description: &t.description,
-                    input_schema: &t.input_schema,
-                })
-                .collect(),
+            system: system_blocks,
+            messages: api_messages,
+            tools: api_tools,
             stream: true,
         };
         // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
@@ -257,6 +334,9 @@ impl Provider for AnthropicProvider {
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
+            // 启用 prompt caching：标记为 ephemeral 的 system/tools/历史前缀
+            // 命中缓存后按 0.1x 计费，显著降低多轮对话的 input token 成本。
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
             .header("content-type", "application/json")
             .json(&body_value)
             .send()
@@ -305,10 +385,12 @@ fn parse_sse_item(
             if let Some(usage) = message.usage {
                 let input = usage.input_tokens.unwrap_or(0);
                 let output = usage.output_tokens.unwrap_or(0);
-                if input > 0 || output > 0 {
+                let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+                if input > 0 || output > 0 || cache_read > 0 {
                     return vec![Ok(StreamEvent::Usage {
                         input_tokens: input,
                         output_tokens: output,
+                        cache_read_input_tokens: cache_read,
                     })];
                 }
             }
@@ -342,10 +424,12 @@ fn parse_sse_item(
             if let Some(u) = usage {
                 let input = u.input_tokens.unwrap_or(0);
                 let output = u.output_tokens.unwrap_or(0);
-                if input > 0 || output > 0 {
+                let cache_read = u.cache_read_input_tokens.unwrap_or(0);
+                if input > 0 || output > 0 || cache_read > 0 {
                     out.push(Ok(StreamEvent::Usage {
                         input_tokens: input,
                         output_tokens: output,
+                        cache_read_input_tokens: cache_read,
                     }));
                 }
             }

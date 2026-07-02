@@ -60,6 +60,11 @@ impl Tool for GrepTool {
         }
     }
 
+    /// Grep 是纯只读内容搜索，无副作用，可安全并发执行。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
         let case_sensitive = inp.case_sensitive.unwrap_or(true);
@@ -81,51 +86,59 @@ impl Tool for GrepTool {
         let include_glob = inp
             .include
             .as_deref()
-            .map(|g| globset::Glob::new(g).ok().map(|g| g.compile_matcher()))
-            .flatten();
+            .and_then(|g| globset::Glob::new(g).ok().map(|g| g.compile_matcher()));
 
-        let mut results = vec![];
-        let mut truncated = false;
+        // 将同步文件遍历 + 正则搜索放到 spawn_blocking 里执行，避免阻塞 tokio 异步运行时。
+        let result = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, bool)> {
+            let mut results = vec![];
+            let mut truncated = false;
 
-        let targets: Vec<_> = if root.is_file() {
-            vec![root.clone()]
-        } else {
-            WalkBuilder::new(&root)
-                .hidden(false)
-                .ignore(true)
-                .git_ignore(true)
-                .build()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_file())
-                .filter(|e| {
-                    include_glob.as_ref().map_or(true, |g| {
-                        e.path().file_name().map(|n| g.is_match(n)).unwrap_or(false)
+            let targets: Vec<_> = if root.is_file() {
+                vec![root.clone()]
+            } else {
+                WalkBuilder::new(&root)
+                    .hidden(false)
+                    .ignore(true)
+                    .git_ignore(true)
+                    .build()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_file())
+                    .filter(|e| {
+                        include_glob.as_ref().map_or(true, |g| {
+                            e.path().file_name().map(|n| g.is_match(n)).unwrap_or(false)
+                        })
                     })
-                })
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
-
-        'outer: for file in targets {
-            let content = match std::fs::read(&file) {
-                Ok(c) => c,
-                Err(_) => continue,
+                    .map(|e| e.path().to_path_buf())
+                    .collect()
             };
-            // 跳过二进制文件
-            if content.contains(&0u8) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(&content);
-            for (lineno, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    results.push(format!("{}:{}:{}", file.display(), lineno + 1, line));
-                    if results.len() >= MAX_MATCHES {
-                        truncated = true;
-                        break 'outer;
+
+            'outer: for file in targets {
+                let content = match std::fs::read(&file) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                // 跳过二进制文件
+                if content.contains(&0u8) {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&content);
+                for (lineno, line) in text.lines().enumerate() {
+                    if re.is_match(line) {
+                        results.push(format!("{}:{}:{}", file.display(), lineno + 1, line));
+                        if results.len() >= MAX_MATCHES {
+                            truncated = true;
+                            break 'outer;
+                        }
                     }
                 }
             }
-        }
+
+            Ok((results, truncated))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Grep 任务执行失败: {e}"))??;
+
+        let (results, truncated) = result;
 
         if results.is_empty() {
             return Ok(ToolResult::ok("未找到匹配内容"));

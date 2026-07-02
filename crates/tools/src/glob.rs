@@ -50,6 +50,11 @@ impl Tool for GlobTool {
         }
     }
 
+    /// Glob 是纯只读文件搜索，无副作用，可安全并发执行。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
         let root = match &inp.path {
@@ -66,31 +71,38 @@ impl Tool for GlobTool {
 
         let glob = Glob::new(&inp.pattern)?.compile_matcher();
 
-        let mut matches = vec![];
-        let walker = WalkBuilder::new(&root)
-            .hidden(false)
-            .ignore(true)
-            .git_ignore(true)
-            .build();
+        // 将同步目录遍历放到 spawn_blocking 里执行，避免阻塞 tokio 异步运行时。
+        let matches = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let mut matches = vec![];
+            let walker = WalkBuilder::new(&root)
+                .hidden(false)
+                .ignore(true)
+                .git_ignore(true)
+                .build();
 
-        for entry in walker {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                if glob.is_match(rel) {
-                    matches.push(path.display().to_string());
-                    if matches.len() >= MAX_RESULTS {
-                        break;
+            for entry in walker {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    let rel = path.strip_prefix(&root).unwrap_or(path);
+                    if glob.is_match(rel) {
+                        matches.push(path.display().to_string());
+                        if matches.len() >= MAX_RESULTS {
+                            break;
+                        }
                     }
                 }
             }
-        }
+            Ok(matches)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Glob 任务执行失败: {e}"))??;
 
         if matches.is_empty() {
             return Ok(ToolResult::ok("未找到匹配文件"));
         }
 
+        let mut matches = matches;
         matches.sort();
         let mut out = matches.join("\n");
         if matches.len() == MAX_RESULTS {
