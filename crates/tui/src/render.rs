@@ -390,7 +390,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                             let stats = wyj_i18n::tr_fmt(
                                 "subagent.inline_running",
                                 &[
-                                    ("elapsed", format!("{:.0}", s.elapsed_secs()).as_str()),
+                                    ("elapsed", format_hms(s.elapsed_secs()).as_str()),
                                     ("tokens", &fmt_tokens(s.output_tokens)),
                                     ("count", &s.tool_calls.to_string()),
                                 ],
@@ -429,7 +429,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                 let elapsed_str = msg
                     .elapsed_secs
                     .filter(|&s| s > 0.0)
-                    .map(|s| format!("  {s:.1}s"))
+                    .map(|s| format!("  {}", format_hms(s)))
                     .unwrap_or_default();
 
                 let (summary_style, prefix) = if msg.is_error {
@@ -480,10 +480,13 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                             for tl in &s.tool_log {
                                 let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
                                     (None, _) => ("…".to_string(), Theme::dim()),
-                                    (Some(e), true) => (format!("✗ {e:.1}s"), Theme::error()),
-                                    (Some(e), false) => {
-                                        (format!("✓ {e:.1}s"), Style::default().fg(Color::Green))
+                                    (Some(e), true) => {
+                                        (format!("✗ {}", format_hms(e)), Theme::error())
                                     }
+                                    (Some(e), false) => (
+                                        format!("✓ {}", format_hms(e)),
+                                        Style::default().fg(Color::Green),
+                                    ),
                                 };
                                 let call = if tl.arg_summary.is_empty() {
                                     tl.tool_name.clone()
@@ -540,7 +543,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                 let elapsed_str = msg
                     .elapsed_secs
                     .filter(|&s| s > 0.0)
-                    .map(|s| format!(" · {s:.1}s"))
+                    .map(|s| format!(" · {}", format_hms(s)))
                     .unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {} bash", icon), style),
@@ -676,8 +679,8 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
         let bg_tag = if s.background { " ◇bg" } else { "" };
         let head = format!("a{id} {}({})", s.agent_type, s.description);
         let stats = format!(
-            " · {:.0}s · {}⏺ · ↑{}{bg_tag}",
-            s.elapsed_secs(),
+            " · {} · {}⏺ · ↑{}{bg_tag}",
+            format_hms(s.elapsed_secs()),
             s.tool_calls,
             fmt_tokens(s.output_tokens),
         );
@@ -731,7 +734,8 @@ fn draw_todo_panel(
         String::new()
     } else {
         format!(
-            " ⏱ {total_elapsed:.1}s ↑{} ↓{}",
+            " ⏱ {} ↑{} ↓{}",
+            format_hms(total_elapsed),
             fmt_tokens(total_in),
             fmt_tokens(total_out)
         )
@@ -817,8 +821,8 @@ fn draw_todo_panel(
         if let Some(s) = todo_stats.get(&item.id) {
             spans.push(Span::styled(
                 format!(
-                    " ⏱ {:.1}s ↑{} ↓{}",
-                    s.elapsed_secs(),
+                    " ⏱ {} ↑{} ↓{}",
+                    format_hms(s.elapsed_secs()),
                     fmt_tokens(s.input_tokens),
                     fmt_tokens(s.output_tokens)
                 ),
