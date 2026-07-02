@@ -219,8 +219,13 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     if state.exec_mode_confirm.is_some() {
         return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
     }
-    if state.plan_dialog.is_some() {
-        return (5u16.min(area_height), BottomPanel::PlanApproval);
+    if let Some(dlg) = &state.plan_dialog {
+        // 计划正文可能很长：面板最多占用可用高度的 70%（保留聊天区/输入框可见），
+        // 内部通过滚动查看超出部分，见 draw_plan_approval_panel。
+        let content_lines = dlg.plan.lines().count().max(1) as u16;
+        let max_h = (area_height * 7 / 10).max(6);
+        let h = (content_lines + 3).clamp(6, max_h);
+        return (h, BottomPanel::PlanApproval);
     }
     if let Some(dlg) = &state.ask_question_dialog {
         let h = match dlg.stage {
@@ -802,11 +807,6 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if state.is_thinking {
-        // is_thinking 时不设置光标位置，ratatui 会自动隐藏终端光标
-        return;
-    }
-
     let text_style = if is_bang {
         Style::default().fg(Theme::SUCCESS)
     } else {
@@ -833,6 +833,11 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     };
     let para = Paragraph::new(Text::from(lines)).style(text_style);
     f.render_widget(para, inner);
+
+    if state.is_thinking {
+        // is_thinking 时不设置光标位置，ratatui 会自动隐藏终端光标（避免和 spinner 冲突）
+        return;
+    }
 
     // 光标位置：考虑长行折行后的视觉坐标
     let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
@@ -1208,24 +1213,37 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let max_w = inner.width as usize;
-    let file_line = if let Some(path) = &dlg.plan_path {
-        format!("文件：{}", truncate_line(path, max_w.saturating_sub(4)))
-    } else {
-        "（未写入计划文件）".to_string()
-    };
+    // 底部固定一行操作提示，其余空间展示计划正文（可滚动）
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let (content_area, hint_area) = (rows[0], rows[1]);
 
-    let lines = vec![
-        Line::from(Span::styled(file_line, Style::default().fg(Color::White))),
-        Line::from(Span::styled(
-            "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划",
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )),
-    ];
-    let para = Paragraph::new(Text::from(lines));
-    f.render_widget(para, inner);
+    let mut lines: Vec<Line<'static>> = vec![];
+    render_markdown(&mut lines, &dlg.plan, content_area.width as usize);
+    let text = Text::from(lines);
+
+    let cw = content_area.width.max(1);
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    let total_visual_lines = para.line_count(cw).min(u16::MAX as usize) as u16;
+    let visible_height = content_area.height;
+    let max_scroll = total_visual_lines.saturating_sub(visible_height);
+    let scroll = dlg.scroll.min(max_scroll);
+    f.render_widget(para.scroll((scroll, 0)), content_area);
+
+    let hint = if total_visual_lines > visible_height {
+        "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划   [↑/↓] 滚动查看完整计划"
+    } else {
+        "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划"
+    };
+    let hint_para = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(hint_para, hint_area);
 }
 
 fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmDialog, area: Rect) {

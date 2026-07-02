@@ -69,8 +69,9 @@ pub trait ToolContext: Send + Sync {
     async fn ask_questions(&self, _questions: &[AskQuestionSpec]) -> Option<Vec<QuestionAnswer>> {
         None
     }
-    /// 请求退出 plan 模式并等待用户批准（headless 自动批准返回 true）
-    async fn exit_plan_mode(&self, _plan_path: Option<&str>) -> bool {
+    /// 请求退出 plan 模式并等待用户批准，plan 为完整计划文本（Markdown）
+    /// （headless 自动批准返回 true）
+    async fn exit_plan_mode(&self, _plan: &str) -> bool {
         true
     }
 }

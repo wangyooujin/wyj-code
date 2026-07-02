@@ -52,9 +52,9 @@ pub enum AgentEvent {
         exit_code: i32,
         elapsed_secs: f64,
     },
-    /// ExitPlanMode 工具触发的计划批准请求
+    /// ExitPlanMode 工具触发的计划批准请求，plan 为完整计划文本（Markdown）
     PlanApprovalRequest {
-        plan_path: Option<String>,
+        plan: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
     /// Agent 忙碌期间排队的补充消息已被消费并合并进 session
