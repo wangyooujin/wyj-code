@@ -33,7 +33,7 @@ use wyj_core::{
     HistoryEntry, HistoryStore, InjectionKind, Session, SessionFile, SessionMeta, SessionStore,
     ToolEvent,
 };
-use wyj_tools::todo::TodoItem;
+use wyj_tools::todo::{is_todo_collapsible, TodoItem, TodoStatus};
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
 use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 
@@ -206,6 +206,27 @@ impl SubAgentUiState {
     pub fn elapsed_secs(&self) -> f64 {
         self.final_elapsed
             .unwrap_or_else(|| self.started_at.elapsed().as_secs_f64())
+    }
+}
+
+/// 单条任务的运行时统计（耗时 + token），与 TodoItem 分层存储，按 TodoItem.id 索引。
+/// 用 started_at 累加而非单段 final_elapsed，支持同一 id 理论上多次进出 in_progress
+/// 时耗时正确累加；没有条目 = 该任务从未进入过 in_progress。
+#[derive(Debug, Default)]
+pub struct TodoRuntimeStats {
+    started_at: Option<Instant>,
+    elapsed_secs: f64,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+impl TodoRuntimeStats {
+    pub fn elapsed_secs(&self) -> f64 {
+        self.elapsed_secs
+            + self
+                .started_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
     }
 }
 
@@ -658,6 +679,25 @@ fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
     } else {
         (current + len - 1) % len
     }
+}
+
+/// 判断新到达的任务列表是否属于"新一轮"（相对旧列表没有任何 (id, content) 都匹配的延续任务）。
+fn is_new_todo_round(old: Option<&[TodoItem]>, new: &[TodoItem]) -> bool {
+    let Some(old) = old else {
+        return true;
+    };
+    !new.iter()
+        .any(|n| old.iter().any(|o| o.id == n.id && o.content == n.content))
+}
+
+/// 将 total 均分给 n 份，各份之和严格等于 total（余数分给前几份）。
+fn split_evenly(total: u32, n: usize) -> Vec<u32> {
+    let n32 = n as u32;
+    let base = total / n32;
+    let rem = total % n32;
+    (0..n32)
+        .map(|i| if i < rem { base + 1 } else { base })
+        .collect()
 }
 
 /// 设置面板状态（/config 命令触发，现仅管理 log_level/language 两项全局设置）
@@ -1223,6 +1263,10 @@ pub struct AppState {
     pub session_allowed: HashSet<String>,
     /// 当前任务列表快照（TodoWrite 更新），用于底部固定面板渲染
     pub current_todos: Option<Vec<TodoItem>>,
+    /// 任务面板是否处于展开态（仅在 is_todo_collapsible 为真时生效）
+    pub todo_panel_expanded: bool,
+    /// 每条任务的运行时统计（耗时/token），按 TodoItem.id 索引
+    pub todo_stats: HashMap<String, TodoRuntimeStats>,
     /// 会话选择器（/sessions 命令触发时 Some）
     pub session_picker: Option<SessionPickerState>,
     /// 设置面板（/config 命令触发时 Some）
@@ -1310,6 +1354,8 @@ impl AppState {
             history_idx: None,
             session_allowed: HashSet::new(),
             current_todos: None,
+            todo_panel_expanded: false,
+            todo_stats: HashMap::new(),
             session_picker: None,
             settings_dialog: None,
             profile_dialog: None,
@@ -1512,7 +1558,76 @@ impl AppState {
                 self.context_tokens = context_tokens;
             }
 
+            AgentEvent::UsageDelta {
+                input_tokens,
+                output_tokens,
+            } => {
+                let active_ids: Vec<String> = self
+                    .current_todos
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|t| t.status == TodoStatus::InProgress)
+                    .map(|t| t.id.clone())
+                    .collect();
+                if !active_ids.is_empty() {
+                    let in_shares = split_evenly(input_tokens, active_ids.len());
+                    let out_shares = split_evenly(output_tokens, active_ids.len());
+                    for (i, id) in active_ids.iter().enumerate() {
+                        let s = self.todo_stats.entry(id.clone()).or_default();
+                        s.input_tokens += in_shares[i];
+                        s.output_tokens += out_shares[i];
+                    }
+                }
+                // active_ids 为空：没有任务处于 in_progress，静默丢弃，不计入任何任务
+            }
+
             AgentEvent::TodoUpdate(items) => {
+                let old_all_done = self.current_todos.as_ref().is_some_and(|old| {
+                    !old.is_empty() && old.iter().all(|t| t.status == TodoStatus::Completed)
+                });
+                let new_all_done =
+                    !items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed);
+                let is_new_round = is_new_todo_round(self.current_todos.as_deref(), &items);
+                if is_new_round || (new_all_done && !old_all_done) {
+                    // 新一轮任务开始，或本轮刚全部完成：重置为默认折叠态
+                    self.todo_panel_expanded = false;
+                }
+                if is_new_round {
+                    self.todo_stats.clear();
+                }
+
+                // 状态转换检测：新一轮时旧状态视为空表（所有任务都视为之前不是
+                // in_progress），否则用更新前的 current_todos 按 id 查旧状态。
+                let old_status: HashMap<&str, &TodoStatus> = if is_new_round {
+                    HashMap::new()
+                } else {
+                    self.current_todos
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .map(|t| (t.id.as_str(), &t.status))
+                        .collect()
+                };
+                for item in &items {
+                    let was_in_progress = old_status
+                        .get(item.id.as_str())
+                        .is_some_and(|s| **s == TodoStatus::InProgress);
+                    let is_in_progress = item.status == TodoStatus::InProgress;
+                    if is_in_progress && !was_in_progress {
+                        self.todo_stats
+                            .entry(item.id.clone())
+                            .or_default()
+                            .started_at = Some(Instant::now());
+                    } else if !is_in_progress && was_in_progress {
+                        if let Some(s) = self.todo_stats.get_mut(&item.id) {
+                            if let Some(start) = s.started_at.take() {
+                                s.elapsed_secs += start.elapsed().as_secs_f64();
+                            }
+                        }
+                    }
+                }
+
                 self.current_todos = Some(items);
                 self.scroll_offset = 0; // 自动滚动到最新任务列表
             }
@@ -1867,35 +1982,43 @@ fn wire_tool_callback(
     tool_tx: mpsc::Sender<AgentEvent>,
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
 ) -> Agent {
-    agent.with_tool_callback(move |event: ToolEvent| match event {
-        ToolEvent::Start { id, name, input } => {
-            let _ = tool_tx.try_send(AgentEvent::ToolStart {
+    let usage_tx = tool_tx.clone();
+    agent
+        .with_tool_callback(move |event: ToolEvent| match event {
+            ToolEvent::Start { id, name, input } => {
+                let _ = tool_tx.try_send(AgentEvent::ToolStart {
+                    id,
+                    name,
+                    input_json: input,
+                });
+            }
+            ToolEvent::End {
                 id,
                 name,
-                input_json: input,
-            });
-        }
-        ToolEvent::End {
-            id,
-            name,
-            is_error,
-            elapsed_secs,
-            output,
-        } => {
-            if name == "TodoWrite" && !is_error {
-                if let Ok(store) = todo_store.lock() {
-                    let items = store.items.clone();
-                    let _ = tool_tx.try_send(AgentEvent::TodoUpdate(items));
-                }
-            }
-            let _ = tool_tx.try_send(AgentEvent::ToolEnd {
-                id,
-                output,
                 is_error,
                 elapsed_secs,
+                output,
+            } => {
+                if name == "TodoWrite" && !is_error {
+                    if let Ok(store) = todo_store.lock() {
+                        let items = store.items.clone();
+                        let _ = tool_tx.try_send(AgentEvent::TodoUpdate(items));
+                    }
+                }
+                let _ = tool_tx.try_send(AgentEvent::ToolEnd {
+                    id,
+                    output,
+                    is_error,
+                    elapsed_secs,
+                });
+            }
+        })
+        .with_usage_callback(move |input_tokens, output_tokens| {
+            let _ = usage_tx.try_send(AgentEvent::UsageDelta {
+                input_tokens,
+                output_tokens,
             });
-        }
-    })
+        })
 }
 
 /// 挂起 TUI（离开 alternate screen + 关闭 raw mode），交给 $EDITOR（未设置回退 vi）
@@ -2335,38 +2458,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         .unwrap_or_default();
     let cmd_registry = standard_registry_with_skills(&home_dir, &cwd);
 
-    // 工具回调：ToolStart/ToolEnd → AgentEvent，同时拦截 TodoWrite 读取快照
-    let todo_store_cb = todo_store.clone();
-    let tool_tx = agent_tx.clone();
-    let agent = agent.with_tool_callback(move |event| match event {
-        ToolEvent::Start { id, name, input } => {
-            let _ = tool_tx.try_send(AgentEvent::ToolStart {
-                id,
-                name,
-                input_json: input,
-            });
-        }
-        ToolEvent::End {
-            id,
-            name,
-            is_error,
-            elapsed_secs,
-            output,
-        } => {
-            if name == "TodoWrite" && !is_error {
-                if let Ok(store) = todo_store_cb.lock() {
-                    let items = store.items.clone();
-                    let _ = tool_tx.try_send(AgentEvent::TodoUpdate(items));
-                }
-            }
-            let _ = tool_tx.try_send(AgentEvent::ToolEnd {
-                id,
-                output,
-                is_error,
-                elapsed_secs,
-            });
-        }
-    });
+    // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
+    let agent = wire_tool_callback(agent, agent_tx.clone(), todo_store.clone());
 
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
@@ -4318,6 +4411,14 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         last_tool.expanded = !last_tool.expanded;
                                     }
                                 }
+                                't' => {
+                                    // Ctrl+T — 折叠/展开任务列表面板（仅在满足折叠条件时生效）
+                                    if let Some(items) = &state.current_todos {
+                                        if is_todo_collapsible(items) {
+                                            state.todo_panel_expanded = !state.todo_panel_expanded;
+                                        }
+                                    }
+                                }
                                 'y' => {
                                     // Ctrl+Y — 复制最后一条 AI 回复到系统剪贴板
                                     if let Some(text) = state
@@ -4734,5 +4835,134 @@ mod ask_question_dialog_tests {
         let _ = dlg.response_tx.send(Some(answers));
         let received = rx.await.unwrap();
         assert_eq!(received.map(|v| v.len()), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod todo_stats_tests {
+    use super::*;
+    use wyj_tools::todo::{TodoItem, TodoStatus};
+    use wyj_tools::SubAgentHub;
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(SubAgentHub::new()),
+        )
+    }
+
+    fn todo(id: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: id.to_string(),
+            content: format!("task-{id}"),
+            status,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn split_evenly_sum_invariant_with_remainder() {
+        let shares = split_evenly(10, 3);
+        assert_eq!(shares.iter().sum::<u32>(), 10);
+        assert_eq!(shares, vec![4, 3, 3]);
+    }
+
+    #[test]
+    fn split_evenly_n_one_gets_all() {
+        assert_eq!(split_evenly(7, 1), vec![7]);
+    }
+
+    #[test]
+    fn split_evenly_zero_total() {
+        assert_eq!(split_evenly(0, 3), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn todo_update_then_usage_delta_attributes_to_in_progress_task() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::InProgress),
+            todo("b", TodoStatus::Pending),
+        ]));
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 100,
+            output_tokens: 50,
+        });
+        let s = state.todo_stats.get("a").unwrap();
+        assert_eq!(s.input_tokens, 100);
+        assert_eq!(s.output_tokens, 50);
+        assert!(!state.todo_stats.contains_key("b"));
+    }
+
+    #[test]
+    fn usage_delta_splits_evenly_across_multiple_in_progress_tasks() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::InProgress),
+            todo("b", TodoStatus::InProgress),
+        ]));
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 5,
+            output_tokens: 5,
+        });
+        let a = state.todo_stats.get("a").unwrap();
+        let b = state.todo_stats.get("b").unwrap();
+        assert_eq!(a.input_tokens + b.input_tokens, 5);
+        assert_eq!(a.output_tokens + b.output_tokens, 5);
+    }
+
+    #[test]
+    fn usage_delta_with_no_in_progress_task_is_dropped() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo("a", TodoStatus::Pending)]));
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 100,
+            output_tokens: 50,
+        });
+        assert!(state.todo_stats.is_empty());
+    }
+
+    #[test]
+    fn elapsed_freezes_when_task_leaves_in_progress() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::InProgress,
+        )]));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::Completed,
+        )]));
+        let frozen = state.todo_stats.get("a").unwrap().elapsed_secs();
+        assert!(frozen > 0.0);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let still = state.todo_stats.get("a").unwrap().elapsed_secs();
+        assert_eq!(frozen, still);
+    }
+
+    #[test]
+    fn new_round_clears_todo_stats() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::InProgress,
+        )]));
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 10,
+            output_tokens: 10,
+        });
+        assert!(!state.todo_stats.is_empty());
+
+        // 全新一轮：id/content 都不同
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "x1",
+            TodoStatus::Pending,
+        )]));
+        assert!(state.todo_stats.is_empty());
     }
 }

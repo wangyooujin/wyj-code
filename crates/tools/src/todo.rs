@@ -40,6 +40,12 @@ pub struct TodoStore {
     pub items: Vec<TodoItem>,
 }
 
+/// 任务面板是否应默认折叠：条数超过 3，或全部任务已完成。
+pub fn is_todo_collapsible(items: &[TodoItem]) -> bool {
+    items.len() > 3
+        || (!items.is_empty() && items.iter().all(|t| t.status == TodoStatus::Completed))
+}
+
 impl TodoStore {
     pub fn render_text(&self) -> String {
         if self.items.is_empty() {
@@ -348,6 +354,49 @@ mod tests {
             store.lock().unwrap().items[0].priority.as_deref(),
             Some("low")
         );
+    }
+
+    fn item(id: &str, status: TodoStatus) -> TodoItem {
+        TodoItem {
+            id: id.into(),
+            content: format!("task-{id}"),
+            status,
+            priority: None,
+        }
+    }
+
+    #[test]
+    fn is_todo_collapsible_false_for_few_incomplete_items() {
+        let items = vec![
+            item("a", TodoStatus::Pending),
+            item("b", TodoStatus::InProgress),
+        ];
+        assert!(!is_todo_collapsible(&items));
+    }
+
+    #[test]
+    fn is_todo_collapsible_true_when_more_than_three() {
+        let items = vec![
+            item("a", TodoStatus::Pending),
+            item("b", TodoStatus::Pending),
+            item("c", TodoStatus::Pending),
+            item("d", TodoStatus::Pending),
+        ];
+        assert!(is_todo_collapsible(&items));
+    }
+
+    #[test]
+    fn is_todo_collapsible_true_when_all_completed_even_if_few() {
+        let items = vec![
+            item("a", TodoStatus::Completed),
+            item("b", TodoStatus::Completed),
+        ];
+        assert!(is_todo_collapsible(&items));
+    }
+
+    #[test]
+    fn is_todo_collapsible_false_for_empty() {
+        assert!(!is_todo_collapsible(&[]));
     }
 
     #[test]

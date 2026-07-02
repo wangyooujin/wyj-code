@@ -131,6 +131,7 @@ help:
     Esc                中断当前任务
     Shift+Tab          循环切换模式 Normal → Plan → Bypass
     Ctrl+O             展开/折叠工具结果
+    Ctrl+T             折叠/展开任务列表
     Ctrl+L             清屏（保留对话历史）
     Ctrl+A / Ctrl+E    跳到行首 / 行尾
     Ctrl+K             删除光标到行尾
