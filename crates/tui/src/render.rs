@@ -1,11 +1,11 @@
 //! 对话渲染与布局
 
 use crate::app::{
-    fmt_tokens, AppState, AskQuestionDialog, AskQuestionStage, Attachment, ExecModeConfirmDialog,
-    InProgressAnswer, MemoryDialog, MemoryRow, MessageRole, PermissionDialog, PlanApprovalDialog,
-    ProfileDialog, ProfileOverlay, SessionPickerState, SettingsDialog, SubAgentStatus,
-    TodoRuntimeStats, PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
-    SETTINGS_FIELD_LABEL_KEYS,
+    fmt_tokens, format_hms, AppState, AskQuestionDialog, AskQuestionStage, Attachment,
+    ExecModeConfirmDialog, InProgressAnswer, MemoryDialog, MemoryRow, MessageRole,
+    PermissionDialog, PlanApprovalDialog, ProfileDialog, ProfileOverlay, SessionPickerState,
+    SettingsDialog, SubAgentStatus, TodoRuntimeStats, PROFILE_API_KEY_FIELD_IDX,
+    PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -308,7 +308,11 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             cwd: shorten_home_path(&state.cwd.display().to_string()),
             profile: {
                 let p = &state.config.active_profile;
-                if p == "default" { None } else { Some(p.clone()) }
+                if p == "default" {
+                    None
+                } else {
+                    Some(p.clone())
+                }
             },
         };
         let lines = crate::welcome::render_welcome(&ctx, content_area.width);
