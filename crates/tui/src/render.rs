@@ -11,7 +11,7 @@ use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -284,6 +284,19 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .split(inner);
     let content_area = cols[0];
     let scrollbar_area = cols[1];
+
+    // 空白聊天区：渲染欢迎页（极简：WYJ-CODE 阴影块状艺术字 + 欢迎回来）
+    if state.messages.is_empty() && state.streaming_buf.is_empty() {
+        let ctx = crate::welcome::WelcomeContext {};
+        let lines = crate::welcome::render_welcome(&ctx, content_area.width);
+        let para = Paragraph::new(Text::from(lines))
+            .style(Theme::input_box())
+            .alignment(Alignment::Left);
+        f.render_widget(para, content_area);
+        state.scrollbar_area = scrollbar_area;
+        state.chat_height = content_area.height;
+        return;
+    }
 
     let max_content_width = content_area.width.saturating_sub(2) as usize;
     let sep_width = content_area.width.saturating_sub(2) as usize;

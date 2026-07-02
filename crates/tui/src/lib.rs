@@ -6,6 +6,7 @@ pub mod input;
 pub mod markdown;
 pub mod render;
 pub mod theme;
+pub mod welcome;
 
 pub use app::{run_tui, RebuildFn};
 pub use wyj_config::AgentMode;
