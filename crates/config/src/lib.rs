@@ -116,6 +116,14 @@ pub struct Profile {
     pub max_tokens: u32,
     /// 模型最大上下文窗口 token 数（用于自动压缩触发判断）
     pub context_window: u32,
+    /// 模型是否支持图片输入（多模态）。false 时图片以占位文本发送，
+    /// 避免非多模态端点收到 image 块返回 400。默认 true。
+    #[serde(default = "default_vision")]
+    pub vision: bool,
+}
+
+fn default_vision() -> bool {
+    true
 }
 
 impl Default for Profile {
@@ -130,6 +138,7 @@ impl Default for Profile {
             api_key: None,
             max_tokens: 8192,
             context_window: 200_000,
+            vision: true,
         }
     }
 }
@@ -240,6 +249,7 @@ impl From<LegacyConfigV0> for Config {
                 api_key: legacy.api_key,
                 max_tokens: legacy.max_tokens,
                 context_window: legacy.context_window,
+                vision: true,
             }],
             log_level: legacy.log_level,
             language: legacy.language,

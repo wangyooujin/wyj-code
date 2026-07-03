@@ -67,17 +67,51 @@ pub enum ContentBlock {
     Image { media_type: String, data: String },
 }
 
-/// 工具结果内容（文本或结构化 JSON）
+/// 工具结果内容。`Parts` 为结构化多块内容（文本+图片，Anthropic 原生支持
+/// tool_result 内嵌 image block）；`Blocks` 为旧版原始 JSON 透传，仅保留
+/// 以兼容历史会话文件的反序列化（untagged 匹配顺序：Parts 有 type tag
+/// 结构可与 Blocks 区分，必须放在 Blocks 之前）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
+    Parts(Vec<ToolResultPart>),
     Blocks(Vec<serde_json::Value>),
+}
+
+/// 工具结果的单个内容块
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultPart {
+    Text {
+        text: String,
+    },
+    /// base64 图片（media_type 如 "image/png"）
+    Image {
+        media_type: String,
+        data: String,
+    },
 }
 
 impl ToolResultContent {
     pub fn text(s: impl Into<String>) -> Self {
         Self::Text(s.into())
+    }
+
+    /// 展示用文本：Parts 中的图片以占位符表示
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::Text(t) => t.clone(),
+            Self::Parts(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    ToolResultPart::Text { text } => text.clone(),
+                    ToolResultPart::Image { media_type, .. } => format!("[image: {media_type}]"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Blocks(b) => serde_json::to_string(b).unwrap_or_default(),
+        }
     }
 }
 
@@ -134,4 +168,50 @@ pub struct CompletionResult {
     pub output_tokens: u32,
     pub cache_read_input_tokens: u32,
     pub cache_creation_input_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_parts_roundtrip() {
+        let content = ToolResultContent::Parts(vec![
+            ToolResultPart::Text {
+                text: "看图".into(),
+            },
+            ToolResultPart::Image {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            },
+        ]);
+        let json = serde_json::to_string(&content).unwrap();
+        // 结构必须带 type tag，与 Anthropic tool_result content 数组一致
+        assert!(json.contains(r#""type":"text""#));
+        assert!(json.contains(r#""type":"image""#));
+        let back: ToolResultContent = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ToolResultContent::Parts(ref p) if p.len() == 2));
+    }
+
+    #[test]
+    fn tool_result_legacy_formats_still_deserialize() {
+        // 旧版纯文本
+        let back: ToolResultContent = serde_json::from_str(r#""plain text""#).unwrap();
+        assert!(matches!(back, ToolResultContent::Text(_)));
+        // 旧版 Blocks（无 type tag 的任意 JSON 数组），不能被 Parts 误吞
+        let back: ToolResultContent =
+            serde_json::from_str(r#"[{"foo": 1}, {"bar": "x"}]"#).unwrap();
+        assert!(matches!(back, ToolResultContent::Blocks(_)));
+    }
+
+    #[test]
+    fn parts_display_text_uses_placeholder_for_images() {
+        let content = ToolResultContent::Parts(vec![ToolResultPart::Image {
+            media_type: "image/png".into(),
+            data: "x".repeat(100_000),
+        }]);
+        let d = content.display_text();
+        assert!(d.contains("image/png"));
+        assert!(d.len() < 100);
+    }
 }

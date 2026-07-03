@@ -21,6 +21,9 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model: String,
+    /// 模型是否支持图片输入（Profile.vision）。false 时图片降级为占位文本，
+    /// 避免非多模态端点收到 image 块直接 400 打断整轮对话。
+    supports_vision: bool,
 }
 
 impl AnthropicProvider {
@@ -36,6 +39,7 @@ impl AnthropicProvider {
             api_key,
             base_url,
             model: model.to_string(),
+            supports_vision: cfg.active_profile().vision,
         })
     }
 }
@@ -200,7 +204,7 @@ struct UsageData {
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
 
-fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
+fn to_api_messages(messages: &[Message], vision: bool) -> Vec<ApiMessage> {
     messages
         .iter()
         .map(|m| {
@@ -229,6 +233,38 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                     } => {
                         let val = match content {
                             crate::types::ToolResultContent::Text(t) => Value::String(t.clone()),
+                            // 结构化多块内容：text 原样、image 转 Anthropic 原生
+                            // image source 结构（tool_result 内嵌图片块）；
+                            // 非多模态模型（Profile.vision=false）降级为占位文本
+                            crate::types::ToolResultContent::Parts(parts) => Value::Array(
+                                parts
+                                    .iter()
+                                    .map(|p| match p {
+                                        crate::types::ToolResultPart::Text { text } => {
+                                            serde_json::json!({"type": "text", "text": text})
+                                        }
+                                        crate::types::ToolResultPart::Image {
+                                            media_type,
+                                            data,
+                                        } if vision => serde_json::json!({
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": media_type,
+                                                "data": data,
+                                            }
+                                        }),
+                                        crate::types::ToolResultPart::Image {
+                                            media_type, ..
+                                        } => serde_json::json!({
+                                            "type": "text",
+                                            "text": format!(
+                                                "[image omitted: model does not support vision ({media_type})]"
+                                            )
+                                        }),
+                                    })
+                                    .collect(),
+                            ),
                             crate::types::ToolResultContent::Blocks(b) => Value::Array(b.clone()),
                         };
                         ApiContentBlock::ToolResult {
@@ -238,12 +274,18 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                             cache_control: None,
                         }
                     }
-                    ContentBlock::Image { media_type, data } => ApiContentBlock::Image {
+                    ContentBlock::Image { media_type, data } if vision => ApiContentBlock::Image {
                         source: ImageSource {
                             source_type: "base64",
                             media_type: media_type.clone(),
                             data: data.clone(),
                         },
+                    },
+                    ContentBlock::Image { media_type, .. } => ApiContentBlock::Text {
+                        text: format!(
+                            "[image omitted: model does not support vision ({media_type})]"
+                        ),
+                        cache_control: None,
                     },
                 })
                 .collect();
@@ -301,14 +343,17 @@ impl Provider for AnthropicProvider {
         // Anthropic 缓存按前缀匹配：把断点放在历史末尾，使「system + tools +
         // 既有历史」整体被缓存，后续轮次只有新增的 user/assistant 内容按全价。
         // 注意 breakpoint 总数上限为 4（system 1 + tools 1 + 历史 1 = 3，安全）。
-        let mut api_messages = to_api_messages(messages);
-        if let Some(last_msg) = api_messages.last_mut() {
-            if let Some(last_block) = last_msg.content.last_mut() {
-                match last_block {
+        let mut api_messages = to_api_messages(messages, self.supports_vision);
+        // 独立 Image 块不能承载 cache_control：从末尾向前回退到最近一个可打
+        // 断点的块（旧实现直接放弃断点，以图片结尾的轮次会丢失缓存写入）。
+        'breakpoint: for msg in api_messages.iter_mut().rev() {
+            for block in msg.content.iter_mut().rev() {
+                match block {
                     ApiContentBlock::Text { cache_control, .. }
                     | ApiContentBlock::ToolUse { cache_control, .. }
                     | ApiContentBlock::ToolResult { cache_control, .. } => {
                         *cache_control = Some(EPHEMERAL);
+                        break 'breakpoint;
                     }
                     ApiContentBlock::Image { .. } => {}
                 }
@@ -441,5 +486,57 @@ fn parse_sse_item(
         SseEvent::Error { error } => {
             vec![Err(anyhow::anyhow!("Anthropic 流式错误: {error}"))]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ToolResultContent, ToolResultPart};
+
+    fn image_tool_result_msg() -> Vec<Message> {
+        vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: ToolResultContent::Parts(vec![ToolResultPart::Image {
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }]),
+                is_error: false,
+            }],
+        }]
+    }
+
+    #[test]
+    fn parts_image_serializes_as_native_image_block() {
+        let api = to_api_messages(&image_tool_result_msg(), true);
+        let json = serde_json::to_string(&api).unwrap();
+        // tool_result.content 数组内嵌 Anthropic 原生 image source 结构
+        assert!(json.contains(r#""type":"image""#));
+        assert!(json.contains(r#""type":"base64""#));
+        assert!(json.contains(r#""media_type":"image/png""#));
+    }
+
+    #[test]
+    fn parts_image_degrades_to_text_without_vision() {
+        let api = to_api_messages(&image_tool_result_msg(), false);
+        let json = serde_json::to_string(&api).unwrap();
+        assert!(!json.contains(r#""type":"image""#));
+        assert!(json.contains("image omitted"));
+    }
+
+    #[test]
+    fn standalone_image_degrades_without_vision() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        }];
+        let json = serde_json::to_string(&to_api_messages(&msgs, false)).unwrap();
+        assert!(!json.contains(r#""type":"image""#));
+        assert!(json.contains("image omitted"));
     }
 }
