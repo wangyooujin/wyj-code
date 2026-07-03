@@ -154,6 +154,10 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…（已截断，原长 {} 字节）", &s[..max], s.len())
+        format!(
+            "{}…（已截断，原长 {} 字节）",
+            crate::textutil::truncate_str(s, max),
+            s.len()
+        )
     }
 }

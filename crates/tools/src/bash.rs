@@ -8,6 +8,8 @@ use tokio::process::Command;
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
+use crate::textutil::truncate_head_tail;
+
 const MAX_OUTPUT: usize = 30_000; // 输出截断阈值（字符）
 const TIMEOUT_SECS: u64 = 120;
 
@@ -85,14 +87,34 @@ impl Tool for BashTool {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let mut result = String::new();
 
+                // stdout/stderr 共享同一截断预算：先到先得，避免一路很长时
+                // 另一路为空而浪费一半配额。保头 60% + 尾 40%（报错几乎总在尾部）。
+                let stderr_budget = if stdout.is_empty() {
+                    MAX_OUTPUT
+                } else {
+                    MAX_OUTPUT.saturating_sub(stdout.len()).max(MAX_OUTPUT / 2)
+                };
+                let stdout_budget = if stderr.is_empty() {
+                    MAX_OUTPUT
+                } else {
+                    MAX_OUTPUT.saturating_sub(stderr.len()).max(MAX_OUTPUT / 2)
+                };
                 if !stdout.is_empty() {
-                    result.push_str(&truncate(&stdout, MAX_OUTPUT / 2));
+                    result.push_str(&truncate_head_tail(
+                        &stdout,
+                        stdout_budget * 6 / 10,
+                        stdout_budget * 4 / 10,
+                    ));
                 }
                 if !stderr.is_empty() {
                     if !result.is_empty() {
                         result.push_str("\n--- stderr ---\n");
                     }
-                    result.push_str(&truncate(&stderr, MAX_OUTPUT / 2));
+                    result.push_str(&truncate_head_tail(
+                        &stderr,
+                        stderr_budget * 6 / 10,
+                        stderr_budget * 4 / 10,
+                    ));
                 }
                 if result.is_empty() {
                     result.push_str("（无输出）");
@@ -109,11 +131,4 @@ impl Tool for BashTool {
             }
         }
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    format!("{}…（已截断，原长 {} 字节）", &s[..max], s.len())
 }

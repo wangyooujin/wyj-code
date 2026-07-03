@@ -34,6 +34,13 @@ pub struct MemoryStore {
     dir: PathBuf,
     /// 是否启用跨会话记忆自动提取（/memory 面板可切换，对应 Config.auto_memory_enabled）
     enabled: AtomicBool,
+    /// 会话级注入内容快照：首次 load 后固定，本会话内不再随磁盘变化。
+    /// 若每轮重新读盘，后台提取写入的新记忆会改变 system prompt 前缀，
+    /// 持续击穿 prompt 缓存（system 断点及其后的 messages 缓存全部失效）。
+    /// 新记忆下个会话生效即可——这正是"跨会话记忆"的本义。
+    context_snapshot: std::sync::OnceLock<String>,
+    /// 上次提取时的消息数（节流：避免每轮一次提取 LLM 调用）
+    last_extract_msg_count: std::sync::atomic::AtomicUsize,
 }
 
 impl MemoryStore {
@@ -45,7 +52,15 @@ impl MemoryStore {
         Ok(Self {
             dir,
             enabled: AtomicBool::new(true),
+            context_snapshot: std::sync::OnceLock::new(),
+            last_extract_msg_count: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// 会话级缓存版 `load_context`：首次调用读盘并快照，之后原样复用。
+    /// 供每轮 system prompt 组装使用，保证会话内 system 前缀字节级稳定。
+    pub fn load_context_cached(&self) -> &str {
+        self.context_snapshot.get_or_init(|| self.load_context())
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -118,6 +133,19 @@ impl MemoryStore {
             return Ok(());
         }
         if messages.len() < 4 {
+            return Ok(());
+        }
+        // 节流：距上次提取新增消息不足 8 条则跳过，省去每轮一次的 LLM 调用。
+        // compare_exchange 保证并发的后台提取任务只有一个通过。
+        let last = self.last_extract_msg_count.load(Ordering::Relaxed);
+        if messages.len() < last + 8 && last > 0 {
+            return Ok(());
+        }
+        if self
+            .last_extract_msg_count
+            .compare_exchange(last, messages.len(), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             return Ok(());
         }
 

@@ -12,7 +12,7 @@ pub mod tool;
 pub use agent::{Agent, InjectionKind, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};
 pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile};
-pub use compact::estimate_tokens;
+pub use compact::{compact_session, estimate_tokens};
 pub use history::{new_session_id, now_iso, HistoryEntry, HistoryStore};
 pub use memory::{project_id, MemoryStore};
 pub use session::Session;

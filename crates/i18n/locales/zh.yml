@@ -97,6 +97,7 @@ main:
   session_not_found: "未找到会话 {id}，将开始新会话。"
   session_resumed: "已恢复会话 {id}（{count} 条消息）"
   session_resumed_last: "已恢复上次会话 {id}（{count} 条消息）"
+  resume_compacted: "恢复的会话历史较长，已预压缩（移除 {count} 条旧消息）"
   no_session_history: "暂无历史会话，将开始新会话。"
   mode_info_plan: " [plan 模式：仅只读工具]"
   mode_info_bypass: " [bypass 模式：跳过权限确认]"
@@ -167,6 +168,7 @@ cost:
   line_with_price: "  输入:   {input} tokens  (~${input_cost})\n输出:   {output} tokens  (~${output_cost})\n合计:   {total} tokens  (~${total_cost})"
   line_no_price: "  输入:   {input} tokens\n输出:   {output} tokens\n合计:   {total} tokens"
   context_line: "上下文: {pct}% ({estimated} / {window} tokens)"
+  cache_line: "缓存:   命中 {read} + 写入 {write} tokens（相对全价输入节省约 {saved_pct}%，费用已计入上方合计）"
   subagent_line: "子 Agent: 输入 {input} + 输出 {output} = {total} tokens（独立于主会话统计，费用未计入上方估算）"
 
 agents:

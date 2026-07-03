@@ -114,7 +114,10 @@ impl Command for CostCmd {
         let cost_line = if let Some((ip, op)) = lookup_price(&ctx.model) {
             let input_cost = input as f64 / 1_000_000.0 * ip;
             let output_cost = output as f64 / 1_000_000.0 * op;
-            let total_cost = input_cost + output_cost;
+            // 缓存命中约 0.1x 输入价、缓存写入约 1.25x 输入价
+            let cache_read_cost = ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1;
+            let cache_write_cost = ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25;
+            let total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
             tr_fmt(
                 "cost.line_with_price",
                 &[
@@ -137,6 +140,33 @@ impl Command for CostCmd {
             )
         };
 
+        // 缓存用量单列（有缓存活动时才显示）：展示缓存收益与真实成本
+        let cache_line = if ctx.cache_read_tokens > 0 || ctx.cache_write_tokens > 0 {
+            let saved_pct = {
+                let full = ctx.cache_read_tokens as f64;
+                let all_input = input as f64 + full;
+                if all_input > 0.0 {
+                    // 命中部分按 0.1x 计，相对全价的节省比例
+                    full * 0.9 / all_input * 100.0
+                } else {
+                    0.0
+                }
+            };
+            format!(
+                "\n{}",
+                tr_fmt(
+                    "cost.cache_line",
+                    &[
+                        ("read", &fmt_num(ctx.cache_read_tokens)),
+                        ("write", &fmt_num(ctx.cache_write_tokens)),
+                        ("saved_pct", &format!("{saved_pct:.0}")),
+                    ],
+                )
+            )
+        } else {
+            String::new()
+        };
+
         let ctx_line = tr_fmt(
             "cost.context_line",
             &[
@@ -147,7 +177,7 @@ impl Command for CostCmd {
         );
 
         let header = tr("cost.header");
-        let mut text = format!("{header}\n{cost_line}\n\n{ctx_line}");
+        let mut text = format!("{header}\n{cost_line}{cache_line}\n\n{ctx_line}");
 
         // 子 Agent 用量单列（有用量时才显示）
         let sub_total = ctx.sub_input_tokens + ctx.sub_output_tokens;

@@ -261,7 +261,12 @@ impl Tool for SubAgentTool {
                     if output_buf.is_empty() {
                         (tr("subagent.no_output"), false)
                     } else {
-                        (output_buf, false)
+                        // 上限保护：超长输出会灌爆父 Agent 上下文。保头 20K + 尾 10K，
+                        // 结论按子 Agent system prompt 约定在尾部，必须保住。
+                        (
+                            crate::textutil::truncate_head_tail(&output_buf, 20_000, 10_000),
+                            false,
+                        )
                     }
                 }
                 Err(e) => (

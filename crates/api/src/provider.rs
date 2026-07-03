@@ -39,6 +39,7 @@ pub trait Provider: Send + Sync {
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
         let mut cache_read_input_tokens = 0u32;
+        let mut cache_creation_input_tokens = 0u32;
 
         while let Some(event) = stream.next().await {
             match event? {
@@ -57,10 +58,12 @@ pub trait Provider: Send + Sync {
                     input_tokens: i,
                     output_tokens: o,
                     cache_read_input_tokens: c,
+                    cache_creation_input_tokens: cw,
                 } => {
                     input_tokens = i;
                     output_tokens = o;
                     cache_read_input_tokens = c;
+                    cache_creation_input_tokens = cw;
                 }
             }
         }
@@ -81,6 +84,7 @@ pub trait Provider: Send + Sync {
             input_tokens,
             output_tokens,
             cache_read_input_tokens,
+            cache_creation_input_tokens,
         })
     }
 }
