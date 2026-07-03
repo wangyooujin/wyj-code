@@ -54,6 +54,7 @@ ignore = "0.4"
 similar = "2"
 # SSE 流式解析
 eventsource-stream = "0.2"
+httpdate = "1"
 # 其他工具
 futures = "0.3"
 bytes = "1"

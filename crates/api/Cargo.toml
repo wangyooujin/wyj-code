@@ -19,4 +19,5 @@ futures.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 eventsource-stream.workspace = true
+httpdate.workspace = true
 pin-project-lite.workspace = true

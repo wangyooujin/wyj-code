@@ -372,25 +372,23 @@ impl Provider for AnthropicProvider {
         let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
 
         let url = format!("{}/v1/messages", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            // 启用 prompt caching：标记为 ephemeral 的 system/tools/历史前缀
-            // 命中缓存后按 0.1x 计费，显著降低多轮对话的 input token 成本。
-            .header("anthropic-beta", "prompt-caching-2024-07-31")
-            .header("content-type", "application/json")
-            .json(&body_value)
-            .send()
-            .await
-            .context("发送 Anthropic 请求失败")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Anthropic API 错误 {status}: {err}");
-        }
+        // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
+        let resp = crate::retry::send_with_retry(
+            &crate::retry::RetryPolicy::default(),
+            "Anthropic",
+            || {
+                self.client
+                    .post(&url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+                    // 启用 prompt caching：标记为 ephemeral 的 system/tools/历史前缀
+                    // 命中缓存后按 0.1x 计费，显著降低多轮对话的 input token 成本。
+                    .header("anthropic-beta", "prompt-caching-2024-07-31")
+                    .header("content-type", "application/json")
+                    .json(&body_value)
+            },
+        )
+        .await?;
 
         let byte_stream = resp.bytes_stream();
         let sse = byte_stream.eventsource();
