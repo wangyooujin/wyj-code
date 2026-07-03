@@ -88,7 +88,7 @@ args = ["--flag"]
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session、HistoryStore、MemoryStore、ClaudeMdLoader、上下文压缩 |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
