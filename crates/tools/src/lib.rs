@@ -12,6 +12,7 @@ mod grep;
 mod read;
 pub mod registry;
 pub mod sub_agent;
+pub mod textutil;
 pub mod todo;
 mod webfetch;
 mod write;

@@ -221,6 +221,30 @@ async fn main() -> Result<()> {
 
     let provider = wyj_api::build_provider_with_model(&cfg, &model_name)?;
 
+    // 恢复的长会话预压缩：--resume/--continue 全量回放的历史若已占掉大半上下文，
+    // 恢复后首轮就会全价发送巨量旧消息（且很快再触发一次运行中压缩）。
+    // 这里在会话开始前主动压缩一次，恢复即瘦身。
+    let mut initial_messages = initial_messages;
+    {
+        let window = cfg.active_profile().context_window;
+        if !initial_messages.is_empty() && wyj_core::estimate_tokens(&initial_messages) > window / 2
+        {
+            let mut tmp = Session::new();
+            tmp.messages = std::mem::take(&mut initial_messages);
+            match wyj_core::compact_session(&mut tmp, provider.as_ref(), window).await {
+                Ok(r) => eprintln!(
+                    "{}",
+                    wyj_i18n::tr_fmt(
+                        "main.resume_compacted",
+                        &[("count", &r.messages_removed.to_string())]
+                    )
+                ),
+                Err(e) => tracing::warn!("恢复会话预压缩失败: {e}"),
+            }
+            initial_messages = tmp.messages;
+        }
+    }
+
     // 始终注册全部工具（模式过滤在运行时由 ToolCtx.permission_mode 负责，支持运行时切换）
     let mut registry = ToolRegistry::standard();
 
@@ -448,14 +472,14 @@ async fn main() -> Result<()> {
             .await?;
         println!();
         // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
-        // 供 benchmarks/run.sh 解析做改进前后对比。cache_write_tokens
-        // 待 cache_creation 统计链路落地后填真值，当前恒为 0。
+        // 供 benchmarks/run.sh 解析做改进前后对比。
         if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
             eprintln!(
-                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":0,\"api_calls\":{},\"duration_secs\":{:.1}}}",
+                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"api_calls\":{},\"duration_secs\":{:.1}}}",
                 session.total_input_tokens,
                 session.total_output_tokens,
                 session.total_cache_read_tokens,
+                session.total_cache_write_tokens,
                 session.api_calls,
                 started.elapsed().as_secs_f64()
             );
@@ -721,6 +745,8 @@ async fn repl(
             model: "".to_string(),
             input_tokens: session.total_input_tokens,
             output_tokens: session.total_output_tokens,
+            cache_read_tokens: session.total_cache_read_tokens,
+            cache_write_tokens: session.total_cache_write_tokens,
             context_window: 200_000,
             estimated_tokens: wyj_core::estimate_tokens(&session.messages),
             home_dir,

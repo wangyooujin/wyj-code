@@ -10,6 +10,9 @@ pub struct Session {
     /// 累计命中 prompt 缓存的输入 token 数（按约 0.1x 价格计费，不计入
     /// `total_input_tokens`，单独统计以便 /cost 展示缓存命中情况）
     pub total_cache_read_tokens: u32,
+    /// 累计写入 prompt 缓存的输入 token 数（按约 1.25x 价格计费，同样
+    /// 不计入 `total_input_tokens`；不统计会系统性低估成本）
+    pub total_cache_write_tokens: u32,
     /// 本会话累计发起的模型推理次数（每次 provider.stream 调用计 1），
     /// 供评测基准（WYJ_STATS_JSON）衡量任务完成所需的 API 往返数。
     pub api_calls: u32,
@@ -83,21 +86,8 @@ impl Session {
         self.total_output_tokens += output;
     }
 
-    pub fn add_cache_read(&mut self, cache_read: u32) {
+    pub fn add_cache_usage(&mut self, cache_read: u32, cache_write: u32) {
         self.total_cache_read_tokens += cache_read;
-    }
-
-    pub fn cost_summary(&self) -> String {
-        if self.total_cache_read_tokens > 0 {
-            format!(
-                "累计 tokens: 输入 {} (缓存命中 {}) / 输出 {}",
-                self.total_input_tokens, self.total_cache_read_tokens, self.total_output_tokens
-            )
-        } else {
-            format!(
-                "累计 tokens: 输入 {} / 输出 {}",
-                self.total_input_tokens, self.total_output_tokens
-            )
-        }
+        self.total_cache_write_tokens += cache_write;
     }
 }
