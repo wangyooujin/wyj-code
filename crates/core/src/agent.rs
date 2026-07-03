@@ -258,6 +258,7 @@ impl Agent {
                 }
             }
 
+            session.api_calls += 1;
             let mut stream = self
                 .provider
                 .stream(&system, &session.messages, &self.tools, self.max_tokens)

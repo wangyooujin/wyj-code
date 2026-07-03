@@ -439,6 +439,7 @@ async fn main() -> Result<()> {
         session.messages = initial_messages;
         session.push_user(prompt);
         let turns = session.messages.len();
+        let started = std::time::Instant::now();
         agent
             .run_turn(&mut session, &tool_ctx, &mut |d| {
                 print!("{d}");
@@ -446,6 +447,19 @@ async fn main() -> Result<()> {
             })
             .await?;
         println!();
+        // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
+        // 供 benchmarks/run.sh 解析做改进前后对比。cache_write_tokens
+        // 待 cache_creation 统计链路落地后填真值，当前恒为 0。
+        if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
+            eprintln!(
+                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":0,\"api_calls\":{},\"duration_secs\":{:.1}}}",
+                session.total_input_tokens,
+                session.total_output_tokens,
+                session.total_cache_read_tokens,
+                session.api_calls,
+                started.elapsed().as_secs_f64()
+            );
+        }
         // 结束前等待全部后台子 Agent 完成（结果由 Done 事件回调打印）
         let bg_count = sub_agent_hub.background_count();
         if bg_count > 0 {
