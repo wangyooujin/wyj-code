@@ -260,57 +260,102 @@ impl Agent {
                 }
             }
 
-            session.api_calls += 1;
-            let mut stream = self
-                .provider
-                .stream(&system, &session.messages, &self.tools, self.max_tokens)
-                .await?;
+            // 流式消费，带中断重试：流已消费一半时断开（网络重置、供应商
+            // overloaded 流内错误等），丢弃本次全部半成品缓冲、整轮重新生成。
+            // 不变量：半成品 assistant 消息绝不 push 进 session（流完整结束
+            // 才组装），故重试即重新生成，UI 可能出现重复文本片段但正确性无损。
+            // usage 事件同样缓冲到流成功后才入账，避免失败尝试的重复计数。
+            const MAX_STREAM_RETRIES: u32 = 2;
+            let mut stream_retries: u32 = 0;
+            let (text_buf, pending_tools, stop_reason) = loop {
+                session.api_calls += 1;
+                let mut stream = self
+                    .provider
+                    .stream(&system, &session.messages, &self.tools, self.max_tokens)
+                    .await?;
 
-            let mut text_buf = String::new();
-            let mut pending_tools: Vec<(String, String, String)> = vec![]; // (id, name, json)
-            let mut current_tool_idx: Option<usize> = None;
-            let mut stop_reason = StopReason::EndTurn;
+                let mut text_buf = String::new();
+                let mut pending_tools: Vec<(String, String, String)> = vec![]; // (id, name, json)
+                let mut current_tool_idx: Option<usize> = None;
+                let mut stop_reason = StopReason::EndTurn;
+                let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
+                let mut stream_err: Option<anyhow::Error> = None;
 
-            while let Some(event) = stream.next().await {
-                match event? {
-                    StreamEvent::TextDelta(delta) => {
-                        on_text(&delta);
-                        text_buf.push_str(&delta);
-                    }
-                    StreamEvent::ToolUseStart { id, name } => {
-                        let idx = pending_tools.len();
-                        pending_tools.push((id, name, String::new()));
-                        current_tool_idx = Some(idx);
-                    }
-                    StreamEvent::ToolUseDelta { id, json_delta } => {
-                        let idx = if id.is_empty() {
-                            current_tool_idx
-                        } else {
-                            pending_tools.iter().position(|(tid, _, _)| *tid == id)
-                        };
-                        if let Some(i) = idx {
-                            pending_tools[i].2.push_str(&json_delta);
+                while let Some(event) = stream.next().await {
+                    let event = match event {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            stream_err = Some(e);
+                            break;
                         }
-                    }
-                    StreamEvent::ToolUseEnd { .. } => {}
-                    StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
-                    StreamEvent::Usage {
-                        input_tokens,
-                        output_tokens,
-                        cache_read_input_tokens,
-                        cache_creation_input_tokens,
-                    } => {
-                        // 供应商返回的 input_tokens 仅含未命中缓存的（全价）部分，
-                        // 缓存命中（0.1x）与缓存写入（1.25x）单独累计用于 /cost 展示。
-                        session.add_usage(input_tokens, output_tokens);
-                        session
-                            .add_cache_usage(cache_read_input_tokens, cache_creation_input_tokens);
-                        if let Some(cb) = &self.usage_cb {
-                            cb(input_tokens, output_tokens);
+                    };
+                    match event {
+                        StreamEvent::TextDelta(delta) => {
+                            on_text(&delta);
+                            text_buf.push_str(&delta);
+                        }
+                        StreamEvent::ToolUseStart { id, name } => {
+                            let idx = pending_tools.len();
+                            pending_tools.push((id, name, String::new()));
+                            current_tool_idx = Some(idx);
+                        }
+                        StreamEvent::ToolUseDelta { id, json_delta } => {
+                            let idx = if id.is_empty() {
+                                current_tool_idx
+                            } else {
+                                pending_tools.iter().position(|(tid, _, _)| *tid == id)
+                            };
+                            if let Some(i) = idx {
+                                pending_tools[i].2.push_str(&json_delta);
+                            }
+                        }
+                        StreamEvent::ToolUseEnd { .. } => {}
+                        StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
+                        StreamEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_input_tokens,
+                            cache_creation_input_tokens,
+                        } => {
+                            pending_usage.push((
+                                input_tokens,
+                                output_tokens,
+                                cache_read_input_tokens,
+                                cache_creation_input_tokens,
+                            ));
                         }
                     }
                 }
-            }
+
+                match stream_err {
+                    Some(e) if stream_retries < MAX_STREAM_RETRIES => {
+                        stream_retries += 1;
+                        tracing::warn!("流中断（第 {stream_retries} 次重试）: {e}");
+                        on_text(&format!(
+                            "\n[连接中断，正在重试 {stream_retries}/{MAX_STREAM_RETRIES}...]\n"
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            1 << stream_retries.min(5),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Some(e) => return Err(e),
+                    None => {
+                        // 流完整结束：usage 一次性入账。供应商返回的 input_tokens
+                        // 仅含未命中缓存的（全价）部分，缓存命中（0.1x）与缓存
+                        // 写入（1.25x）单独累计用于 /cost 展示。
+                        for (input, output, cache_read, cache_write) in pending_usage {
+                            session.add_usage(input, output);
+                            session.add_cache_usage(cache_read, cache_write);
+                            if let Some(cb) = &self.usage_cb {
+                                cb(input, output);
+                            }
+                        }
+                        break (text_buf, pending_tools, stop_reason);
+                    }
+                }
+            };
 
             // 组装助手内容块
             let mut assistant_blocks = vec![];
@@ -703,6 +748,95 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("bg result")))
         });
         assert!(merged);
+    }
+
+    /// 首次流中途断开、第二次成功的 provider（流中断重试测试用）
+    struct FlakyProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for FlakyProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n == 0 {
+                vec![
+                    Ok(StreamEvent::TextDelta("半成品".into())),
+                    Err(anyhow::anyhow!("connection reset")),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("完整回复".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_interruption_retries_and_discards_partial() {
+        let agent = Agent::new(Arc::new(FlakyProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        let mut session = Session::new();
+        session.push_user("hi");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        // 半成品文本绝不进 session；最终 assistant 消息只含完整回复
+        let assistant_texts: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, wyj_api::types::Role::Assistant))
+            .map(|m| m.text())
+            .collect();
+        assert_eq!(assistant_texts.len(), 1);
+        assert_eq!(assistant_texts[0], "完整回复");
+        assert!(!assistant_texts[0].contains("半成品"));
+        // 两次 API 调用（首次失败 + 重试成功）
+        assert_eq!(session.api_calls, 2);
+    }
+
+    /// 永远流中断的 provider：耗尽重试后必须报错，且不留半成品消息
+    struct AlwaysBrokenProvider;
+    #[async_trait::async_trait]
+    impl Provider for AlwaysBrokenProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _max_tokens: u32,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = vec![Err(anyhow::anyhow!("connection reset"))];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_interruption_exhausts_retries_then_fails_clean() {
+        let agent = Agent::new(Arc::new(AlwaysBrokenProvider));
+        let mut session = Session::new();
+        session.push_user("hi");
+        let res = agent.run_turn(&mut session, &FakeCtx, &mut |_| {}).await;
+        assert!(res.is_err());
+        // 无半成品 assistant 消息残留
+        assert!(!session
+            .messages
+            .iter()
+            .any(|m| matches!(m.role, wyj_api::types::Role::Assistant)));
+        // 首次 + 2 次重试 = 3 次调用
+        assert_eq!(session.api_calls, 3);
     }
 }
 
