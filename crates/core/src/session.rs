@@ -10,6 +10,9 @@ pub struct Session {
     /// 累计命中 prompt 缓存的输入 token 数（按约 0.1x 价格计费，不计入
     /// `total_input_tokens`，单独统计以便 /cost 展示缓存命中情况）
     pub total_cache_read_tokens: u32,
+    /// 本会话累计发起的模型推理次数（每次 provider.stream 调用计 1），
+    /// 供评测基准（WYJ_STATS_JSON）衡量任务完成所需的 API 往返数。
+    pub api_calls: u32,
 }
 
 impl Session {
