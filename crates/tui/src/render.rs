@@ -407,7 +407,20 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                         )));
                     }
                 } else {
-                    render_markdown(&mut lines, &msg.content, max_content_width);
+                    // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
+                    // 全部历史重跑 markdown 解析（长对话下的主要渲染开销）
+                    let mut cache = msg.md_cache.borrow_mut();
+                    match cache.as_ref() {
+                        Some((w, cached)) if *w == max_content_width => {
+                            lines.extend(cached.iter().cloned());
+                        }
+                        _ => {
+                            let mut fresh: Vec<Line<'static>> = vec![];
+                            render_markdown(&mut fresh, &msg.content, max_content_width);
+                            lines.extend(fresh.iter().cloned());
+                            *cache = Some((max_content_width, fresh));
+                        }
+                    }
                 }
                 lines.push(Line::from(""));
             }

@@ -74,6 +74,10 @@ pub struct ChatMessage {
     pub expanded: bool,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
     pub sub_agent_id: Option<u64>,
+    /// Assistant 消息的 markdown 渲染缓存（宽度, 渲染行）。消息定稿后内容
+    /// 不再变化，缓存避免每帧（约 20fps）对全部历史重跑 markdown 解析，
+    /// 长对话下这是交互延迟的主要来源。宽度变化时自动失效。
+    pub md_cache: std::cell::RefCell<Option<(usize, Vec<ratatui::text::Line<'static>>)>>,
 }
 
 impl ChatMessage {
@@ -88,6 +92,7 @@ impl ChatMessage {
             display_summary: String::new(),
             expanded: false,
             sub_agent_id: None,
+            md_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -129,6 +134,7 @@ impl ChatMessage {
             display_summary: summary,
             expanded: false,
             sub_agent_id: None,
+            md_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -143,6 +149,7 @@ impl ChatMessage {
             display_summary: String::new(),
             expanded: false,
             sub_agent_id: None,
+            md_cache: std::cell::RefCell::new(None),
         }
     }
 
