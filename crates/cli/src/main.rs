@@ -485,8 +485,10 @@ async fn main() -> Result<()> {
             .await?;
         println!();
         // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
-        // 供 benchmarks/run.sh 解析做改进前后对比。
+        // 供 benchmarks/run.sh 解析做改进前后对比。先补一个换行：thinking
+        // 增量用 eprint!（无换行）输出，否则 JSON 会被拼接到思考文本尾部。
         if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
+            eprintln!();
             eprintln!(
                 "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"api_calls\":{},\"duration_secs\":{:.1}}}",
                 session.total_input_tokens,
