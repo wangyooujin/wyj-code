@@ -1,0 +1,1 @@
+在 stats 模块新增一个公开函数 `clamp(value: f64, lo: f64, hi: f64) -> f64`：把 value 限制在 [lo, hi] 区间内。同时在 report 模块的 `summarize` 输出中追加 ` max=<最大值>`（保留两位小数，空输入时 max=0.00），并为新增/修改的行为各写至少一个单元测试。完成后确认 cargo test 全部通过。

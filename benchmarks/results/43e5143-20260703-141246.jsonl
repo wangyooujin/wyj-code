@@ -1,0 +1,4 @@
+{"task":"01-fix-bug","success":true,"wall_secs":57,"input_tokens":3472,"output_tokens":1255,"cache_read_tokens":27520,"cache_write_tokens":0,"api_calls":8,"duration_secs":56.5}
+{"task":"02-add-feature","success":true,"wall_secs":79,"input_tokens":6543,"output_tokens":2931,"cache_read_tokens":46592,"cache_write_tokens":0,"api_calls":10,"duration_secs":78.8}
+{"task":"03-explore","success":true,"wall_secs":40,"input_tokens":2203,"output_tokens":1485,"cache_read_tokens":11840,"cache_write_tokens":0,"api_calls":4,"duration_secs":40.0}
+{"task":"04-refactor","success":true,"wall_secs":44,"input_tokens":6254,"output_tokens":1678,"cache_read_tokens":21184,"cache_write_tokens":0,"api_calls":5,"duration_secs":44.6}

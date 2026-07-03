@@ -1,0 +1,9 @@
+[package]
+name = "mathlib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# 独立于外层 wyj-code workspace（fixture 会被复制到临时目录单独构建）
+[workspace]
