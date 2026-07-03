@@ -150,19 +150,7 @@ impl MemoryStore {
         }
 
         let conv = messages_to_text(&messages);
-        let prompt = format!(
-            "从以下 AI 编程助手的对话中提取值得跨会话保存的关键信息。\n\n\
-            每条记忆单独一行 JSON（不要使用代码块标记），格式：\n\
-            {{\"type\":\"...\",\"name\":\"...\",\"description\":\"...\",\"body\":\"...\"}}\n\n\
-            type 取值：\n\
-            - user: 用户角色、技能水平、工作习惯\n\
-            - feedback: 用户对工作方式的明确偏好或纠正\n\
-            - project: 项目背景、技术决策、架构信息\n\
-            - reference: 重要资源位置（文件路径、仓库、文档）\n\n\
-            规则：只提取跨会话真正有价值的信息；忽略临时任务状态和一次性代码；\
-            没有可提取的内容时不输出任何内容。\n\n\
-            对话记录：\n{conv}"
-        );
+        let prompt = crate::prompts::memory_extract_prompt(&conv);
 
         let req = vec![Message {
             role: Role::User,
@@ -170,12 +158,7 @@ impl MemoryStore {
         }];
 
         let result = provider
-            .complete(
-                "你是记忆提取助手，从对话中识别值得长期保存的关键信息。",
-                &req,
-                &[],
-                4096,
-            )
+            .complete(crate::prompts::MEMORY_SYSTEM, &req, &[], 4096)
             .await?;
 
         let output: String = result

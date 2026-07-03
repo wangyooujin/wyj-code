@@ -32,28 +32,25 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "对文件进行精确的字符串替换。\
-                old_string 必须在文件中唯一出现（除非 replace_all=true）。\
-                替换前必须先用 Read 读取文件确认精确的缩进和内容。"
-                .to_string(),
+            description: crate::descriptions::EDIT.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "要编辑的文件绝对路径"
+                        "description": crate::descriptions::FIELD_FILE_PATH
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "要替换的原始字符串（必须与文件内容精确匹配，含缩进）"
+                        "description": crate::descriptions::FIELD_EDIT_OLD
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "替换后的新字符串"
+                        "description": crate::descriptions::FIELD_EDIT_NEW
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "是否替换所有出现（默认 false：仅允许出现一次）",
+                        "description": crate::descriptions::FIELD_EDIT_REPLACE_ALL,
                         "default": false
                     }
                 },

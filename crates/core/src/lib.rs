@@ -4,6 +4,7 @@ pub mod claude_md;
 pub mod compact;
 pub mod history;
 pub mod memory;
+pub mod prompts;
 pub mod session;
 pub mod session_store;
 pub mod summary;

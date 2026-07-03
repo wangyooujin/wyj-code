@@ -16,62 +16,21 @@ input:
   paste_image: "image {width}×{height}"
   paste_file: "file {name}"
   paste_text: "pasted {count} chars"
-system_prompt:
-  default: |-
-    You are a professional AI programming assistant, skilled at analyzing code, solving technical problems, and writing programs.
-    When you need to operate on the file system, run commands, or search code, proactively use tools to get the task done.
-    Tool usage principle: Read before Write; Edit requires an exact match beforehand.
-    Communicate with the user in clear, accurate English, and prioritize runnable code and concrete action steps.
-    When you need the user to choose among multiple candidate options, confirm an uncertain
-    decision point, or clarify an ambiguous requirement, you must call the AskQuestion tool to
-    ask a structured question so the user can pick an answer through the UI; do not write the
-    question and options as a plain-text paragraph in your reply and expect the user to type
-    back an answer like "Q1 A Q2 B" manually.
-  plan_mode: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (read / glob / grep / web_fetch).\nYou must not write or edit files, or run shell commands.\nFocus on analyzing code, planning approaches, and explaining architecture."
-  plan_turn: "## Current mode: Plan (planning & analysis)\n\nYou may only use read-only tools (Read/Glob/Grep/WebFetch/Bash). You must not write or edit any files.\nFirst analyze the code thoroughly, then call the `ExitPlanMode` tool with the complete plan (Markdown) as the `plan` argument to submit it for approval before executing.\nBash commands must be read-only (ls/find/cat/grep, etc.) — no write operations."
-  non_interactive: "## Current mode: non-interactive (headless / single-shot)\n\nThere is no UI for the user to interact with right now — any AskQuestion tool call will be automatically skipped and returned as \"cancelled\". When you hit a decision point that would normally need user clarification, do not call AskQuestion; instead state the most reasonable assumption based on the information available, explain it clearly in your reply, and continue the task."
-  subagent_general: |-
-    You are a sub-agent spawned by a main agent to complete a specific task independently.
-    Use the available tools proactively to accomplish the task described in the prompt.
-    Your final text output is returned to the main agent as the task result, so end with a
-    complete, self-contained summary of what you did and found — the main agent cannot see
-    your intermediate tool calls.
-  subagent_explore: |-
-    You are a read-only exploration sub-agent. Your job is to search and read code to answer
-    the question in the prompt. You can only use read-only tools (Read/Glob/Grep/WebFetch);
-    you must not modify anything.
-    Be efficient: read excerpts rather than whole files when possible. Your final text output
-    is returned to the main agent, so end with a complete, self-contained conclusion including
-    the relevant file paths (with line numbers where useful).
-  subagent_plan: |-
-    You are a software-architect sub-agent. Analyze the codebase with read-only tools
-    (Read/Glob/Grep/WebFetch) and design an implementation plan for the task in the prompt.
-    You must not modify anything.
-    Your final text output is returned to the main agent: produce a step-by-step plan that
-    names the critical files, reuses existing functions/utilities where possible, and notes
-    key trade-offs.
+# Model-facing prompts (system prompt / tool descriptions / sub-agent prompts /
+# reminder wrappers) moved to English constants in wyj-core::prompts and
+# wyj-tools::descriptions; they no longer go through i18n. Only user-visible
+# UI strings remain here.
 
 subagent:
-  tool_desc: |-
-    Launch an independent sub-agent to complete a given task. The sub-agent has its own
-    context and tool set; its result is returned when it finishes. Suitable for complex
-    sub-tasks that need multi-step planning, parallel execution, or context isolation.
-    Available agent types (subagent_type):
-    {types}
-  type_line: "- {name}: {description}"
-  schema_type: "The agent type to use (defaults to general-purpose)"
-  schema_description: "A short (3-5 word) description of the task, shown in the UI"
-  schema_prompt: "The task for the sub-agent to perform"
-  schema_system: "Override the agent type's system prompt (optional)"
-  schema_background: "Run in background: returns immediately; the result is delivered to you via a system-reminder when done"
   unknown_type: "Unknown agent type `{name}`. Available types: {available}"
   create_failed: "Failed to create sub-agent: {err}"
   run_failed: "Sub-agent execution failed: {err}"
   interrupted: "The sub-agent was interrupted"
   no_output: "The sub-agent produced no output"
-  bg_started: "Background agent {id} ({type}: {desc}) started. Its result will be delivered via a system-reminder when done; continue with your current task instead of waiting."
-  bg_done_reminder: "<system-reminder>Background agent {id} ({type}: {desc}) finished after {elapsed}s. Result:\n\n{result}</system-reminder>"
   bg_done_notice: "Background agent {id} ({type}: {desc}) finished; result will be injected into the conversation"
+  waiting_bg: "Waiting for {count} background agent(s) to finish…"
+  panel_title: " agents [{count}] "
+  inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
   panel_title: " agents [{count}] "
   inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
@@ -84,9 +43,6 @@ claude_md:
     global: "global"
     project: "project"
     subdir: "subdirectory"
-  reminder_intro: "Below is the content of the CLAUDE.md memory files that apply to this project. Follow the instructions within."
-  subdir_reminder_intro: "The directory you just accessed has additional CLAUDE.md notes — follow these as well:"
-  section_header: "Contents of {path} ({source}):\n\n"
 
 cli:
   about: "wyj-code — terminal AI coding assistant"
