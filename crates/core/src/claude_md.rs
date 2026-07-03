@@ -20,16 +20,6 @@ pub enum ClaudeMdSource {
     Subdir,
 }
 
-impl ClaudeMdSource {
-    fn label(self) -> String {
-        wyj_i18n::tr(match self {
-            ClaudeMdSource::Global => "claude_md.source.global",
-            ClaudeMdSource::Project => "claude_md.source.project",
-            ClaudeMdSource::Subdir => "claude_md.source.subdir",
-        })
-    }
-}
-
 /// 供 `/memory` 面板展示的候选文件（含尚不存在、可供创建的路径）
 pub struct DiscoveredFile {
     pub path: PathBuf,
