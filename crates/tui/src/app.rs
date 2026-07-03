@@ -843,6 +843,9 @@ pub struct ProfileEntryDraft {
     pub context_window: String,
     /// 是否支持图片输入（面板暂不暴露编辑入口，仅透传保留原值）
     pub vision: bool,
+    /// thinking 配置（面板暂不暴露编辑入口，仅透传保留原值）
+    pub thinking_budget: Option<u32>,
+    pub interleaved_thinking: bool,
 }
 
 impl ProfileEntryDraft {
@@ -861,6 +864,8 @@ impl ProfileEntryDraft {
             max_tokens: p.max_tokens.to_string(),
             context_window: p.context_window.to_string(),
             vision: p.vision,
+            thinking_budget: p.thinking_budget,
+            interleaved_thinking: p.interleaved_thinking,
         }
     }
 
@@ -885,6 +890,8 @@ impl ProfileEntryDraft {
             max_tokens: "8192".to_string(),
             context_window: "200000".to_string(),
             vision: true,
+            thinking_budget: None,
+            interleaved_thinking: true,
         }
     }
 
@@ -974,6 +981,8 @@ impl ProfileEntryDraft {
             max_tokens: self.max_tokens.trim().parse().unwrap_or(8192),
             context_window: self.context_window.trim().parse().unwrap_or(200_000),
             vision: self.vision,
+            thinking_budget: self.thinking_budget,
+            interleaved_thinking: self.interleaved_thinking,
         }
     }
 }
@@ -1260,6 +1269,9 @@ const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
     pub streaming_buf: String,
+    /// extended thinking 流式累积（正文开始时折叠为一行系统消息）
+    pub thinking_buf: String,
+    pub thinking_started: Option<std::time::Instant>,
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
     pub ask_question_dialog: Option<AskQuestionDialog>,
@@ -1378,6 +1390,8 @@ impl AppState {
         Self {
             messages: vec![],
             streaming_buf: String::new(),
+            thinking_buf: String::new(),
+            thinking_started: None,
             is_thinking: false,
             permission_dialog: None,
             ask_question_dialog: None,
@@ -1505,15 +1519,46 @@ impl AppState {
     }
 
     fn flush_streaming(&mut self) {
+        self.flush_thinking();
         if !self.streaming_buf.is_empty() {
             let text = std::mem::take(&mut self.streaming_buf);
             self.messages.push(ChatMessage::assistant(text));
         }
     }
 
+    /// 把累积的 thinking 内容折叠为一行系统消息（✻ 思考 Xs · N 行）
+    fn flush_thinking(&mut self) {
+        if !self.thinking_buf.is_empty() {
+            let lines = self.thinking_buf.lines().count();
+            let secs = self
+                .thinking_started
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            self.thinking_buf.clear();
+            self.thinking_started = None;
+            self.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                "thinking.done",
+                &[
+                    ("secs", &format!("{secs:.0}")),
+                    ("lines", &lines.to_string()),
+                ],
+            )));
+        }
+    }
+
     fn apply_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::TextDelta(d) => self.streaming_buf.push_str(&d),
+            AgentEvent::TextDelta(d) => {
+                // thinking 结束、正文开始：先折叠思考行
+                self.flush_thinking();
+                self.streaming_buf.push_str(&d);
+            }
+            AgentEvent::ThinkingDelta(d) => {
+                if self.thinking_buf.is_empty() {
+                    self.thinking_started = Some(std::time::Instant::now());
+                }
+                self.thinking_buf.push_str(&d);
+            }
 
             AgentEvent::ToolStart {
                 id,
@@ -2059,7 +2104,11 @@ fn wire_tool_callback(
 ) -> Agent {
     let usage_tx = tool_tx.clone();
     let title_tx = tool_tx.clone();
+    let thinking_tx = tool_tx.clone();
     agent
+        .with_thinking_callback(move |d| {
+            let _ = thinking_tx.try_send(AgentEvent::ThinkingDelta(d.to_string()));
+        })
         .with_tool_callback(move |event: ToolEvent| match event {
             ToolEvent::Start { id, name, input } => {
                 let _ = tool_tx.try_send(AgentEvent::ToolStart {
