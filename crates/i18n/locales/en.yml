@@ -38,6 +38,9 @@ subagent:
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
   builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
 
+thinking:
+  done: "✻ Thought for {secs}s ({lines} lines)"
+
 claude_md:
   source:
     global: "global"

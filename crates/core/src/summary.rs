@@ -65,7 +65,16 @@ impl SummaryGenerator {
             content: vec![ContentBlock::Text { text: prompt }],
         }];
 
-        let result = self.provider.complete(system, &req, &[], 256).await.ok()?;
+        let result = self
+            .provider
+            .complete(
+                system,
+                &req,
+                &[],
+                &wyj_api::provider::RequestOptions::text_only(256),
+            )
+            .await
+            .ok()?;
 
         let raw: String = result
             .content

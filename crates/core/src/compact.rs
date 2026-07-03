@@ -49,6 +49,9 @@ pub fn estimate_tokens(messages: &[Message]) -> u32 {
                 }
             },
             ContentBlock::Image { data, .. } => estimate_image_tokens(data.len()),
+            // thinking 输出不占后续请求的 input（回传不计费），但估算宁多勿少
+            ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking),
+            ContentBlock::RedactedThinking { data } => data.len() / 4,
         })
         .sum::<usize>() as u32
 }
@@ -124,7 +127,7 @@ pub async fn compact_session(
             crate::prompts::COMPACT_SYSTEM,
             &req,
             &[],
-            summary_max_tokens,
+            &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
         )
         .await?;
 
@@ -240,6 +243,8 @@ fn messages_to_text(messages: &[Message]) -> String {
                         Some(format!("{prefix} {text}"))
                     }
                     ContentBlock::Image { .. } => Some("[图片]".to_string()),
+                    // 思考内容不进摘要（内部推理，非对话事实）
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
                 })
                 .collect();
             format!("[{role}]: {}", parts.join(" | "))

@@ -69,6 +69,16 @@ struct ApiRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ApiTool<'a>>,
     stream: bool,
+    /// Extended thinking 配置（开启时携带）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingParam>,
+}
+
+#[derive(Serialize)]
+struct ThinkingParam {
+    #[serde(rename = "type")]
+    kind: &'static str, // "enabled"
+    budget_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -110,6 +120,14 @@ enum ApiContentBlock {
     },
     Image {
         source: ImageSource,
+    },
+    /// thinking 块回传（签名必须原样携带）；不可打 cache_control
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -178,6 +196,15 @@ enum ContentBlockStart {
         id: String,
         name: String,
     },
+    Thinking {
+        #[allow(dead_code)]
+        #[serde(default)]
+        thinking: String,
+    },
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
 }
 
 #[derive(Deserialize, Debug)]
@@ -185,6 +212,8 @@ enum ContentBlockStart {
 enum BlockDelta {
     TextDelta { text: String },
     InputJsonDelta { partial_json: String },
+    ThinkingDelta { thinking: String },
+    SignatureDelta { signature: String },
 }
 
 #[derive(Deserialize, Debug)]
@@ -287,6 +316,17 @@ fn to_api_messages(messages: &[Message], vision: bool) -> Vec<ApiMessage> {
                         ),
                         cache_control: None,
                     },
+                    // thinking 块必须原样（含 signature）回传，否则工具调用续轮被拒
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => ApiContentBlock::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                    },
+                    ContentBlock::RedactedThinking { data } => {
+                        ApiContentBlock::RedactedThinking { data: data.clone() }
+                    }
                 })
                 .collect();
             ApiMessage { role, content }
@@ -313,8 +353,21 @@ impl Provider for AnthropicProvider {
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-        max_tokens: u32,
+        opts: &crate::provider::RequestOptions,
     ) -> Result<EventStream> {
+        // ── thinking 配置：budget 必须小于 max_tokens，不足时自动抬高 ──
+        let thinking_budget = opts.thinking_budget.filter(|b| *b > 0);
+        let max_tokens = match thinking_budget {
+            Some(b) if opts.max_tokens <= b => {
+                tracing::warn!(
+                    "max_tokens ({}) <= thinking_budget ({b})，自动抬高到 budget+4096",
+                    opts.max_tokens
+                );
+                b + 4096
+            }
+            _ => opts.max_tokens,
+        };
+
         // ── 构建 system 块（带 cache_control，缓存 system prompt）──
         let system_blocks = if system.is_empty() {
             vec![]
@@ -355,7 +408,10 @@ impl Provider for AnthropicProvider {
                         *cache_control = Some(EPHEMERAL);
                         break 'breakpoint;
                     }
-                    ApiContentBlock::Image { .. } => {}
+                    // Image/Thinking 块不可承载 cache_control，继续向前找
+                    ApiContentBlock::Image { .. }
+                    | ApiContentBlock::Thinking { .. }
+                    | ApiContentBlock::RedactedThinking { .. } => {}
                 }
             }
         }
@@ -367,9 +423,20 @@ impl Provider for AnthropicProvider {
             messages: api_messages,
             tools: api_tools,
             stream: true,
+            thinking: thinking_budget.map(|b| ThinkingParam {
+                kind: "enabled",
+                budget_tokens: b,
+            }),
         };
         // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
         let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
+
+        // beta 头：prompt caching 恒开；interleaved thinking 仅在开启时追加
+        let beta_header = if thinking_budget.is_some() && opts.interleaved {
+            "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
+        } else {
+            "prompt-caching-2024-07-31"
+        };
 
         let url = format!("{}/v1/messages", self.base_url);
         // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
@@ -383,7 +450,7 @@ impl Provider for AnthropicProvider {
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     // 启用 prompt caching：标记为 ephemeral 的 system/tools/历史前缀
                     // 命中缓存后按 0.1x 计费，显著降低多轮对话的 input token 成本。
-                    .header("anthropic-beta", "prompt-caching-2024-07-31")
+                    .header("anthropic-beta", beta_header)
                     .header("content-type", "application/json")
                     .json(&body_value)
             },
@@ -444,6 +511,10 @@ fn parse_sse_item(
                 vec![Ok(StreamEvent::ToolUseStart { id, name })]
             }
             ContentBlockStart::Text { .. } => vec![],
+            ContentBlockStart::Thinking { .. } => vec![Ok(StreamEvent::ThinkingStart)],
+            ContentBlockStart::RedactedThinking { data } => {
+                vec![Ok(StreamEvent::RedactedThinking(data))]
+            }
         },
         SseEvent::ContentBlockDelta { delta, .. } => match delta {
             BlockDelta::TextDelta { text } => vec![Ok(StreamEvent::TextDelta(text))],
@@ -452,6 +523,12 @@ fn parse_sse_item(
                     id: String::new(),
                     json_delta: partial_json,
                 })]
+            }
+            BlockDelta::ThinkingDelta { thinking } => {
+                vec![Ok(StreamEvent::ThinkingDelta(thinking))]
+            }
+            BlockDelta::SignatureDelta { signature } => {
+                vec![Ok(StreamEvent::ThinkingSignatureDelta(signature))]
             }
         },
         SseEvent::ContentBlockStop { .. } => vec![],
@@ -536,5 +613,29 @@ mod tests {
         let json = serde_json::to_string(&to_api_messages(&msgs, false)).unwrap();
         assert!(!json.contains(r#""type":"image""#));
         assert!(json.contains("image omitted"));
+    }
+
+    #[test]
+    fn thinking_blocks_serialize_with_signature() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "hmm".into(),
+                    signature: "sig".into(),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque".into(),
+                },
+                ContentBlock::Text {
+                    text: "answer".into(),
+                },
+            ],
+        }];
+        let json = serde_json::to_string(&to_api_messages(&msgs, true)).unwrap();
+        assert!(json.contains(r#""type":"thinking""#));
+        assert!(json.contains(r#""signature":"sig""#));
+        assert!(json.contains(r#""type":"redacted_thinking""#));
+        assert!(json.contains(r#""data":"opaque""#));
     }
 }

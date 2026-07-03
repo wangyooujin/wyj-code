@@ -310,7 +310,11 @@ async fn main() -> Result<()> {
         .with_system(wyj_core::prompts::main_system_prompt(&env_info))
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
-        .with_context_window(cfg.active_profile().context_window);
+        .with_context_window(cfg.active_profile().context_window)
+        .with_thinking(
+            cfg.active_profile().thinking_budget,
+            cfg.active_profile().interleaved_thinking,
+        );
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前仅 Plan 模式
@@ -411,30 +415,35 @@ async fn main() -> Result<()> {
     }
 
     let agent = if cli.headless || cli.prompt.is_some() {
-        agent.with_tool_callback(|event| match event {
-            ToolEvent::Start {
-                id: _,
-                name,
-                input: _,
-            } => {
-                eprintln!("\x1b[38;2;215;119;87m⏺ {name}\x1b[0m");
-            }
-            ToolEvent::End {
-                id: _,
-                name,
-                is_error,
-                elapsed_secs,
-                output: _,
-            } => {
-                if is_error {
-                    // 红色 ✗
-                    eprintln!("\x1b[38;2;255;107;128m✗ {name} · {elapsed_secs:.1}s\x1b[0m");
-                } else {
-                    // 绿色 ✓
-                    eprintln!("\x1b[38;2;78;186;101m✓ {name} · {elapsed_secs:.1}s\x1b[0m");
+        agent
+            // thinking 以暗灰打到 stderr，不进 stdout（保持管道输出纯净）
+            .with_thinking_callback(|d| {
+                eprint!("\x1b[2;3m{d}\x1b[0m");
+            })
+            .with_tool_callback(|event| match event {
+                ToolEvent::Start {
+                    id: _,
+                    name,
+                    input: _,
+                } => {
+                    eprintln!("\x1b[38;2;215;119;87m⏺ {name}\x1b[0m");
                 }
-            }
-        })
+                ToolEvent::End {
+                    id: _,
+                    name,
+                    is_error,
+                    elapsed_secs,
+                    output: _,
+                } => {
+                    if is_error {
+                        // 红色 ✗
+                        eprintln!("\x1b[38;2;255;107;128m✗ {name} · {elapsed_secs:.1}s\x1b[0m");
+                    } else {
+                        // 绿色 ✓
+                        eprintln!("\x1b[38;2;78;186;101m✓ {name} · {elapsed_secs:.1}s\x1b[0m");
+                    }
+                }
+            })
     } else {
         agent
     };
@@ -551,6 +560,10 @@ async fn main() -> Result<()> {
                 .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
                 .with_max_tokens(cfg.active_profile().max_tokens)
                 .with_context_window(cfg.active_profile().context_window)
+                .with_thinking(
+                    cfg.active_profile().thinking_budget,
+                    cfg.active_profile().interleaved_thinking,
+                )
                 .with_claude_md(claude_md_for_rebuild.clone());
             if let Some(mem) = &memory_store_for_rebuild {
                 new_agent = new_agent.with_memory(mem.clone());
@@ -653,6 +666,7 @@ fn make_sub_agent_factory(
         let mut sub_agent = Agent::new(provider)
             .with_max_tokens(p.max_tokens)
             .with_context_window(p.context_window)
+            .with_thinking(p.thinking_budget, p.interleaved_thinking)
             .with_claude_md(claude_md.clone());
         if !def.system_prompt.is_empty() {
             sub_agent = sub_agent.with_system(def.system_prompt.clone());

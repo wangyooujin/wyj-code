@@ -57,6 +57,8 @@ base_url = ""                # 留空使用供应商默认端点
 max_tokens = 8192
 context_window = 200000
 vision = true                # 模型是否支持图片输入；false 时图片降级为占位文本（防非多模态端点 400）
+# thinking_budget = 8000     # extended thinking 预算 token；不写/0 = 关闭（思考计入 output 计费）
+# interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空自动检测系统 locale
 

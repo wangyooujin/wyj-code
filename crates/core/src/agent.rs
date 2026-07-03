@@ -68,6 +68,11 @@ pub struct Agent {
     /// 首轮注入首条 user 消息。不进 system prompt：git 状态每轮都可能变，
     /// 进 system 会击穿 prompt 缓存；进首轮消息则位于缓存前缀内、轮间稳定。
     git_snapshot: Option<String>,
+    /// Extended thinking 预算（None/0 = 关闭）与交错思考开关
+    thinking_budget: Option<u32>,
+    interleaved_thinking: bool,
+    /// thinking 文本增量回调（TUI 展示 / headless stderr 输出）
+    thinking_cb: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Agent {
@@ -89,12 +94,28 @@ impl Agent {
             session_id: None,
             title_cb: None,
             git_snapshot: None,
+            thinking_budget: None,
+            interleaved_thinking: true,
+            thinking_cb: None,
         }
     }
 
     /// 设置会话启动时的 git 状态快照（见 `git_snapshot` 字段说明）
     pub fn with_git_snapshot(mut self, snapshot: Option<String>) -> Self {
         self.git_snapshot = snapshot;
+        self
+    }
+
+    /// 配置 extended thinking（budget None/0 = 关闭）
+    pub fn with_thinking(mut self, budget: Option<u32>, interleaved: bool) -> Self {
+        self.thinking_budget = budget.filter(|b| *b > 0);
+        self.interleaved_thinking = interleaved;
+        self
+    }
+
+    /// 注册 thinking 文本增量回调
+    pub fn with_thinking_callback(mut self, cb: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.thinking_cb = Some(Arc::new(cb));
         self
     }
 
@@ -286,15 +307,33 @@ impl Agent {
             // usage 事件同样缓冲到流成功后才入账，避免失败尝试的重复计数。
             const MAX_STREAM_RETRIES: u32 = 2;
             let mut stream_retries: u32 = 0;
-            let (text_buf, pending_tools, stop_reason) = loop {
+            let opts = wyj_api::provider::RequestOptions {
+                max_tokens: self.max_tokens,
+                thinking_budget: self.thinking_budget,
+                interleaved: self.interleaved_thinking,
+            };
+            // 按到达顺序累积的内容块（thinking 可与 tool_use 交错，顺序必须保留）
+            enum StreamedBlock {
+                Text(String),
+                Thinking {
+                    text: String,
+                    signature: String,
+                },
+                Redacted(String),
+                ToolUse {
+                    id: String,
+                    name: String,
+                    json: String,
+                },
+            }
+            let (blocks, stop_reason) = loop {
                 session.api_calls += 1;
                 let mut stream = self
                     .provider
-                    .stream(&system, &session.messages, &self.tools, self.max_tokens)
+                    .stream(&system, &session.messages, &self.tools, &opts)
                     .await?;
 
-                let mut text_buf = String::new();
-                let mut pending_tools: Vec<(String, String, String)> = vec![]; // (id, name, json)
+                let mut blocks: Vec<StreamedBlock> = vec![];
                 let mut current_tool_idx: Option<usize> = None;
                 let mut stop_reason = StopReason::EndTurn;
                 let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
@@ -311,21 +350,59 @@ impl Agent {
                     match event {
                         StreamEvent::TextDelta(delta) => {
                             on_text(&delta);
-                            text_buf.push_str(&delta);
+                            match blocks.last_mut() {
+                                Some(StreamedBlock::Text(t)) => t.push_str(&delta),
+                                _ => blocks.push(StreamedBlock::Text(delta)),
+                            }
+                        }
+                        StreamEvent::ThinkingStart => {
+                            blocks.push(StreamedBlock::Thinking {
+                                text: String::new(),
+                                signature: String::new(),
+                            });
+                        }
+                        StreamEvent::ThinkingDelta(delta) => {
+                            if let Some(cb) = &self.thinking_cb {
+                                cb(&delta);
+                            }
+                            match blocks.last_mut() {
+                                Some(StreamedBlock::Thinking { text, .. }) => text.push_str(&delta),
+                                _ => blocks.push(StreamedBlock::Thinking {
+                                    text: delta,
+                                    signature: String::new(),
+                                }),
+                            }
+                        }
+                        StreamEvent::ThinkingSignatureDelta(sig) => {
+                            if let Some(StreamedBlock::Thinking { signature, .. }) =
+                                blocks.last_mut()
+                            {
+                                signature.push_str(&sig);
+                            }
+                        }
+                        StreamEvent::RedactedThinking(data) => {
+                            blocks.push(StreamedBlock::Redacted(data));
                         }
                         StreamEvent::ToolUseStart { id, name } => {
-                            let idx = pending_tools.len();
-                            pending_tools.push((id, name, String::new()));
-                            current_tool_idx = Some(idx);
+                            blocks.push(StreamedBlock::ToolUse {
+                                id,
+                                name,
+                                json: String::new(),
+                            });
+                            current_tool_idx = Some(blocks.len() - 1);
                         }
                         StreamEvent::ToolUseDelta { id, json_delta } => {
                             let idx = if id.is_empty() {
                                 current_tool_idx
                             } else {
-                                pending_tools.iter().position(|(tid, _, _)| *tid == id)
+                                blocks.iter().position(|b| {
+                                    matches!(b, StreamedBlock::ToolUse { id: tid, .. } if *tid == id)
+                                })
                             };
-                            if let Some(i) = idx {
-                                pending_tools[i].2.push_str(&json_delta);
+                            if let Some(StreamedBlock::ToolUse { json, .. }) =
+                                idx.and_then(|i| blocks.get_mut(i))
+                            {
+                                json.push_str(&json_delta);
                             }
                         }
                         StreamEvent::ToolUseEnd { .. } => {}
@@ -371,24 +448,43 @@ impl Agent {
                                 cb(input, output);
                             }
                         }
-                        break (text_buf, pending_tools, stop_reason);
+                        break (blocks, stop_reason);
                     }
                 }
             };
 
-            // 组装助手内容块
+            // 组装助手内容块（保持到达顺序；thinking 块含 signature 原样入历史，
+            // 工具调用续轮时回传给 API —— 缺失会被 Anthropic 拒绝）
             let mut assistant_blocks = vec![];
-            if !text_buf.is_empty() {
-                assistant_blocks.push(ContentBlock::Text { text: text_buf });
-            }
-            for (id, name, json) in &pending_tools {
-                let input = serde_json::from_str(json)
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                assistant_blocks.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input,
-                });
+            let mut pending_tools: Vec<(String, String, String)> = vec![]; // (id, name, json)
+            for b in &blocks {
+                match b {
+                    StreamedBlock::Text(t) => {
+                        if !t.is_empty() {
+                            assistant_blocks.push(ContentBlock::Text { text: t.clone() });
+                        }
+                    }
+                    StreamedBlock::Thinking { text, signature } => {
+                        assistant_blocks.push(ContentBlock::Thinking {
+                            thinking: text.clone(),
+                            signature: signature.clone(),
+                        });
+                    }
+                    StreamedBlock::Redacted(data) => {
+                        assistant_blocks
+                            .push(ContentBlock::RedactedThinking { data: data.clone() });
+                    }
+                    StreamedBlock::ToolUse { id, name, json } => {
+                        let input = serde_json::from_str(json)
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        assistant_blocks.push(ContentBlock::ToolUse {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input,
+                        });
+                        pending_tools.push((id.clone(), name.clone(), json.clone()));
+                    }
+                }
             }
             session.push_assistant(assistant_blocks);
 
@@ -610,7 +706,7 @@ mod tests {
             _system: &str,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-            _max_tokens: u32,
+            _opts: &wyj_api::provider::RequestOptions,
         ) -> Result<EventStream> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let events: Vec<Result<StreamEvent>> = if n == 0 {
@@ -656,7 +752,7 @@ mod tests {
             _system: &str,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-            _max_tokens: u32,
+            _opts: &wyj_api::provider::RequestOptions,
         ) -> Result<EventStream> {
             let events: Vec<Result<StreamEvent>> = vec![
                 Ok(StreamEvent::TextDelta("ok".into())),
@@ -780,7 +876,7 @@ mod tests {
             _system: &str,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-            _max_tokens: u32,
+            _opts: &wyj_api::provider::RequestOptions,
         ) -> Result<EventStream> {
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             let events: Vec<Result<StreamEvent>> = if n == 0 {
@@ -835,7 +931,7 @@ mod tests {
             _system: &str,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-            _max_tokens: u32,
+            _opts: &wyj_api::provider::RequestOptions,
         ) -> Result<EventStream> {
             let events: Vec<Result<StreamEvent>> = vec![Err(anyhow::anyhow!("connection reset"))];
             Ok(Box::pin(futures::stream::iter(events)))
@@ -856,6 +952,93 @@ mod tests {
             .any(|m| matches!(m.role, wyj_api::types::Role::Assistant)));
         // 首次 + 2 次重试 = 3 次调用
         assert_eq!(session.api_calls, 3);
+    }
+
+    /// 先吐 thinking 块（含 signature），再工具调用，再收尾的 provider
+    struct ThinkingProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for ThinkingProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n == 0 {
+                vec![
+                    Ok(StreamEvent::ThinkingStart),
+                    Ok(StreamEvent::ThinkingDelta("let me ".into())),
+                    Ok(StreamEvent::ThinkingDelta("think".into())),
+                    Ok(StreamEvent::ThinkingSignatureDelta("sig123".into())),
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "t1".into(),
+                        name: "Sleep".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "t1".into(),
+                        json_delta: r#"{"ms":1,"tag":"x"}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                // 续轮请求：历史里必须带有完整 thinking 块（含 signature），
+                // 顺序在 tool_use 之前 —— 真实 API 缺失会直接 4xx
+                let assistant = messages
+                    .iter()
+                    .find(|m| matches!(m.role, wyj_api::types::Role::Assistant))
+                    .expect("history must contain the assistant message");
+                match (&assistant.content[0], &assistant.content[1]) {
+                    (
+                        ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                        },
+                        ContentBlock::ToolUse { .. },
+                    ) => {
+                        assert_eq!(thinking, "let me think");
+                        assert_eq!(signature, "sig123");
+                    }
+                    other => panic!("unexpected block order: {other:?}"),
+                }
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_are_preserved_and_replayed_with_signature() {
+        let mut agent = Agent::new(Arc::new(ThinkingProvider {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_thinking(Some(1024), true);
+        agent.register_tool(Arc::new(SleepTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let mut thinking_seen = String::new();
+        let agent = agent.with_thinking_callback(move |_| {});
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |d| thinking_seen.push_str(d))
+            .await
+            .unwrap();
+        // 第二轮的断言在 ThinkingProvider 内部完成；此处确认最终回复正常
+        assert!(session
+            .messages
+            .last()
+            .map(|m| m.text().contains("done"))
+            .unwrap_or(false));
     }
 }
 

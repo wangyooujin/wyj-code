@@ -158,7 +158,12 @@ impl MemoryStore {
         }];
 
         let result = provider
-            .complete(crate::prompts::MEMORY_SYSTEM, &req, &[], 4096)
+            .complete(
+                crate::prompts::MEMORY_SYSTEM,
+                &req,
+                &[],
+                &wyj_api::provider::RequestOptions::text_only(4096),
+            )
             .await?;
 
         let output: String = result
@@ -284,6 +289,7 @@ fn messages_to_text(messages: &[Message]) -> String {
                         ToolResultContent::Blocks(_) => None,
                     },
                     ContentBlock::Image { .. } => None,
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
                 })
                 .collect();
             format!("[{role}]: {}", parts.join(" | "))

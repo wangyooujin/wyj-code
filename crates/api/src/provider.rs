@@ -8,6 +8,27 @@ use std::pin::Pin;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'static>>;
 
+/// 单次推理请求的选项（收敛为结构体，后续扩展不再破坏 trait 签名）
+#[derive(Debug, Clone, Default)]
+pub struct RequestOptions {
+    pub max_tokens: u32,
+    /// Extended thinking 预算 token 数；None/0 = 关闭
+    pub thinking_budget: Option<u32>,
+    /// 工具调用轮之间允许交错思考（仅 thinking 开启时生效）
+    pub interleaved: bool,
+}
+
+impl RequestOptions {
+    /// 纯文本请求（无 thinking），供 compact/memory/summary 等辅助调用使用
+    pub fn text_only(max_tokens: u32) -> Self {
+        Self {
+            max_tokens,
+            thinking_budget: None,
+            interleaved: false,
+        }
+    }
+}
+
 /// LLM 供应商抽象 — 所有供应商实现此 trait
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -17,7 +38,7 @@ pub trait Provider: Send + Sync {
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-        max_tokens: u32,
+        opts: &RequestOptions,
     ) -> Result<EventStream>;
 
     /// 发起非流式推理，等待完整结果（默认由 stream 实现，可覆盖以提升性能）
@@ -26,12 +47,12 @@ pub trait Provider: Send + Sync {
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-        max_tokens: u32,
+        opts: &RequestOptions,
     ) -> Result<CompletionResult> {
         use crate::types::{ContentBlock, StopReason};
         use futures::StreamExt;
 
-        let mut stream = self.stream(system, messages, tools, max_tokens).await?;
+        let mut stream = self.stream(system, messages, tools, opts).await?;
 
         let mut text_buf = String::new();
         let mut tool_bufs: Vec<(String, String, String)> = vec![]; // (id, name, json)
@@ -53,6 +74,11 @@ pub trait Provider: Send + Sync {
                     }
                 }
                 StreamEvent::ToolUseEnd { .. } => {}
+                // 非流式辅助调用（compact/memory/summary）不开 thinking，忽略
+                StreamEvent::ThinkingStart
+                | StreamEvent::ThinkingDelta(_)
+                | StreamEvent::ThinkingSignatureDelta(_)
+                | StreamEvent::RedactedThinking(_) => {}
                 StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
                 StreamEvent::Usage {
                     input_tokens: i,
