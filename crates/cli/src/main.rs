@@ -260,6 +260,7 @@ async fn main() -> Result<()> {
                 "AskQuestion",
                 "Write",
                 "Bash",
+                "BashOutput",
                 "ExitPlanMode",
                 "TodoWrite",
                 "Agent",
@@ -505,6 +506,8 @@ async fn main() -> Result<()> {
             );
         }
         sub_agent_hub.wait_background().await;
+        // 杀掉全部后台 Bash 任务的进程组，防止孤儿进程
+        wyj_tools::BashSessionManager::global().kill_all();
         // 升级版会话统计
         let in_tok = session.total_input_tokens;
         let out_tok = session.total_output_tokens;

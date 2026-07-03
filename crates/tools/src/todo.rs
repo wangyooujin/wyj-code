@@ -33,6 +33,9 @@ pub struct TodoItem {
     pub content: String,
     pub status: TodoStatus,
     pub priority: Option<String>,
+    /// 进行时文案（如 "Running tests"），in_progress 时 TUI 优先展示
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
 }
 
 #[derive(Default)]
@@ -88,6 +91,8 @@ struct TodoItemInput {
     status: TodoStatus,
     #[serde(default)]
     priority: Option<String>,
+    #[serde(default, rename = "activeForm")]
+    active_form: Option<String>,
 }
 
 #[async_trait]
@@ -119,6 +124,10 @@ impl Tool for TodoWriteTool {
                                 "priority": {
                                     "type": "string",
                                     "enum": ["high", "medium", "low"]
+                                },
+                                "activeForm": {
+                                    "type": "string",
+                                    "description": "Present-continuous form shown while in_progress, e.g. \"Running tests\""
                                 }
                             }
                         }
@@ -139,6 +148,7 @@ impl Tool for TodoWriteTool {
                 content: t.content,
                 status: t.status,
                 priority: t.priority,
+                active_form: t.active_form,
             })
             .collect();
 
@@ -225,6 +235,7 @@ mod tests {
                 content: "写文档".into(),
                 status: TodoStatus::Pending,
                 priority: Some("high".into()),
+                active_form: None,
             }],
         };
         let out = store.render_text();
@@ -359,6 +370,7 @@ mod tests {
             content: format!("task-{id}"),
             status,
             priority: None,
+            active_form: None,
         }
     }
 
