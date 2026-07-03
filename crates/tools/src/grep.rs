@@ -32,27 +32,25 @@ impl Tool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "在文件内容中搜索正则表达式匹配。\
-                返回匹配行及其行号。自动忽略二进制文件和 .gitignore 的内容。"
-                .to_string(),
+            description: crate::descriptions::GREP.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "正则表达式模式"
+                        "description": crate::descriptions::FIELD_GREP_PATTERN
                     },
                     "path": {
                         "type": "string",
-                        "description": "搜索目录或文件路径（默认当前目录）"
+                        "description": crate::descriptions::FIELD_GREP_PATH
                     },
                     "include": {
                         "type": "string",
-                        "description": "只搜索匹配此 glob 的文件，如 *.rs、*.{ts,tsx}"
+                        "description": "Only search files matching this glob, e.g. *.rs or *.{ts,tsx}"
                     },
                     "case_sensitive": {
                         "type": "boolean",
-                        "description": "是否大小写敏感（默认 true）"
+                        "description": "Case-sensitive matching (default true)"
                     }
                 },
                 "required": ["pattern"]

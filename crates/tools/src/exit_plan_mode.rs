@@ -17,15 +17,13 @@ impl Tool for ExitPlanModeTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "ExitPlanMode".to_string(),
-            description: "计划分析完毕后调用此工具，将完整计划内容（Markdown 格式）作为 plan \
-                参数提交给用户审批。用户批准后将自动切换至执行模式。"
-                .to_string(),
+            description: crate::descriptions::EXIT_PLAN_MODE.to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "plan": {
                         "type": "string",
-                        "description": "完整的计划内容（Markdown 格式），将原样展示给用户审批"
+                        "description": "The complete implementation plan (Markdown), shown to the user verbatim for approval. Write it in the user's language."
                     }
                 },
                 "required": ["plan"]
@@ -38,10 +36,12 @@ impl Tool for ExitPlanModeTool {
         let approved = ctx.exit_plan_mode(plan).await;
         if approved {
             Ok(ToolResult::ok(
-                "用户已批准计划，正在切换至执行模式。接下来可以开始实施。",
+                "User approved the plan. Execution mode is now enabled — proceed with the implementation.",
             ))
         } else {
-            Ok(ToolResult::ok("用户选择继续规划，保持 plan 模式。"))
+            Ok(ToolResult::ok(
+                "User chose to keep planning. Stay in plan mode and refine the plan.",
+            ))
         }
     }
 }

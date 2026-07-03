@@ -303,30 +303,33 @@ async fn main() -> Result<()> {
         }
     }
 
+    // 主 system prompt：英文静态提示 + <env> 环境块（会话内稳定字段，进缓存）。
+    // git 状态快照单独走首轮 user 消息注入（会变的字段进 system 会击穿缓存）。
+    let env_info = wyj_core::prompts::EnvInfo::collect(&cwd, &model_name);
     let mut agent = Agent::new(provider)
+        .with_system(wyj_core::prompts::main_system_prompt(&env_info))
+        .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window);
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
-    // 供 TUI 侧在运行时切换语言、需要用新语言重建 system prompt 时，能在新的
-    // default 提示词后原样拼回这些追加内容（目前仅 Plan 模式限制说明；CLAUDE.md
-    // 系文件不再焊死进 system prompt，而是每轮重新读盘注入对话历史，见 with_claude_md）。
+    // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前仅 Plan 模式
+    // 限制说明；CLAUDE.md 系文件不焊死进 system prompt，见 with_claude_md）。
     let mut system_prompt_extra = String::new();
 
     // Plan 模式在系统提示中说明只读约束
     if matches!(mode, AgentMode::Plan) {
-        let extra = wyj_i18n::tr("system_prompt.plan_mode");
-        agent = agent.append_system(extra.clone());
+        let extra = wyj_core::prompts::PLAN_MODE;
+        agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
-        system_prompt_extra.push_str(&extra);
+        system_prompt_extra.push_str(extra);
     }
 
     // headless/单次问答模式没有 UI 可交互，AskQuestion 会被自动取消：
     // 告知模型不要调用该工具，直接给出假设并继续（不写入 system_prompt_extra，
     // 因为该变量只服务于 TUI 运行时重建 Agent，headless/-p 路径不会触发重建）。
     if cli.headless || cli.prompt.is_some() {
-        let extra = wyj_i18n::tr("system_prompt.non_interactive");
-        agent = agent.append_system(extra);
+        agent = agent.append_system(wyj_core::prompts::NON_INTERACTIVE);
     }
 
     agent = agent.with_claude_md(claude_md_loader.clone());
@@ -539,9 +542,13 @@ async fn main() -> Result<()> {
         let hub_for_rebuild = sub_agent_hub.clone();
         let store_for_rebuild = session_store_arc.clone();
         let sid_for_rebuild = session_id.clone();
+        let cwd_for_rebuild = cwd.clone();
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
+            let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
             let mut new_agent = Agent::new(provider)
+                .with_system(wyj_core::prompts::main_system_prompt(&env_info))
+                .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
                 .with_max_tokens(cfg.active_profile().max_tokens)
                 .with_context_window(cfg.active_profile().context_window)
                 .with_claude_md(claude_md_for_rebuild.clone());

@@ -34,24 +34,21 @@ impl Tool for ReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description:
-                "读取文件内容，附带行号前缀。支持偏移量和行数限制，适合读取大文件的特定部分。\
-                对图片文件返回 base64 编码。"
-                    .to_string(),
+            description: crate::descriptions::READ.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "要读取的文件绝对路径"
+                        "description": crate::descriptions::FIELD_FILE_PATH
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "从第几行开始读取（0-indexed）"
+                        "description": crate::descriptions::FIELD_READ_OFFSET
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "最多读取行数"
+                        "description": crate::descriptions::FIELD_READ_LIMIT
                     }
                 },
                 "required": ["file_path"]

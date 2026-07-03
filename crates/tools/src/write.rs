@@ -62,20 +62,17 @@ impl Tool for WriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "将内容写入文件（覆盖现有内容）。\
-                写入已存在的文件前，必须先用 Read 读取该文件。\
-                父目录不存在时会自动创建。"
-                .to_string(),
+            description: crate::descriptions::WRITE.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "目标文件绝对路径"
+                        "description": crate::descriptions::FIELD_FILE_PATH
                     },
                     "content": {
                         "type": "string",
-                        "description": "要写入的完整内容"
+                        "description": crate::descriptions::FIELD_WRITE_CONTENT
                     }
                 },
                 "required": ["file_path", "content"]

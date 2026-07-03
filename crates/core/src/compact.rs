@@ -109,12 +109,7 @@ pub async fn compact_session(
     let to_keep = session.messages[keep_from..].to_vec();
 
     let conv_text = messages_to_text(to_compact);
-    let prompt = format!(
-        "请为以下 AI 编程助手与用户的对话生成一份详细的中文摘要。\n\
-        摘要需完整保留：已完成任务、关键技术决策、重要文件路径、\
-        代码变更要点、当前进度和待完成事项，使后续对话可以无缝继续。\n\n\
-        对话记录：\n{conv_text}"
-    );
+    let prompt = crate::prompts::compact_prompt(&conv_text);
 
     let req = vec![Message {
         role: Role::User,
@@ -126,7 +121,7 @@ pub async fn compact_session(
 
     let result = provider
         .complete(
-            "你是专业的技术对话摘要助手，输出结构清晰、信息完整的摘要。",
+            crate::prompts::COMPACT_SYSTEM,
             &req,
             &[],
             summary_max_tokens,
@@ -158,13 +153,13 @@ pub async fn compact_session(
         Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: format!("[历史对话摘要 — 已压缩 {messages_removed} 条消息]\n\n{summary}"),
+                text: crate::prompts::compact_summary_message(messages_removed, &summary),
             }],
         },
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
-                text: "已了解历史对话摘要，继续协助完成任务。".to_string(),
+                text: crate::prompts::COMPACT_ACK.to_string(),
             }],
         },
     ];

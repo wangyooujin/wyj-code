@@ -64,6 +64,10 @@ pub struct Agent {
     session_id: Option<String>,
     /// 标题生成完成回调（TUI 据此更新终端窗口标题）
     title_cb: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    /// 会话启动时采集的 git 状态快照（`<system-reminder>` 全文），仅在会话
+    /// 首轮注入首条 user 消息。不进 system prompt：git 状态每轮都可能变，
+    /// 进 system 会击穿 prompt 缓存；进首轮消息则位于缓存前缀内、轮间稳定。
+    git_snapshot: Option<String>,
 }
 
 impl Agent {
@@ -84,7 +88,14 @@ impl Agent {
             summary: None,
             session_id: None,
             title_cb: None,
+            git_snapshot: None,
         }
+    }
+
+    /// 设置会话启动时的 git 状态快照（见 `git_snapshot` 字段说明）
+    pub fn with_git_snapshot(mut self, snapshot: Option<String>) -> Self {
+        self.git_snapshot = snapshot;
+        self
     }
 
     pub fn with_system(mut self, prompt: impl Into<String>) -> Self {
@@ -237,6 +248,14 @@ impl Agent {
             if let Some(reminder) = loader.turn_reminder() {
                 system.push_str("\n\n");
                 system.push_str(&reminder);
+            }
+        }
+
+        // 会话首轮：把 git 状态快照前插进首条 user 消息（仅一次，之后随
+        // 历史持久化；resume 的会话历史里已带有当时的快照，不重复注入）
+        if let Some(snap) = &self.git_snapshot {
+            if session.messages.len() == 1 {
+                session.prepend_to_last_user(vec![ContentBlock::Text { text: snap.clone() }]);
             }
         }
 
@@ -841,7 +860,8 @@ mod tests {
 }
 
 fn default_system_prompt() -> String {
-    wyj_i18n::tr("system_prompt.default")
+    // 模型侧提示词统一英文原创措辞（见 prompts.rs 模块注释），不走 i18n
+    crate::prompts::MAIN.to_string()
 }
 
 /// 从工具调用输入里推导其触达的目录，供 CLAUDE.md 子目录动态加载判断。

@@ -16,55 +16,20 @@ input:
   paste_image: "图片 {width}×{height}"
   paste_file: "文件 {name}"
   paste_text: "已粘贴 {count} 字符"
-system_prompt:
-  default: |-
-    你是一个专业的 AI 编程助手，擅长分析代码、解决技术问题、编写程序。
-    当需要操作文件系统、执行命令或搜索代码时，你会主动使用工具完成任务。
-    工具使用原则：Read 后才能 Write；Edit 前必须精确匹配。
-    使用简洁、准确的中文与用户沟通，优先给出可运行的代码和具体的操作步骤。
-    当你需要用户在多个候选方案/选项中做选择、确认某个不确定的决策点，或者需求
-    含糊需要澄清时，必须调用 AskQuestion 工具发起结构化提问，让用户通过界面直
-    接选择；不要把问题和选项直接写成一段文字放在回复里，指望用户手动输入编号
-    或字母来回答。
-  plan_mode: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（read / glob / grep / web_fetch）。\n不得写入、编辑文件或执行 shell 命令。\n请专注于分析代码、规划方案、解释架构。"
-  plan_turn: "## 当前模式：Plan（规划分析）\n\n你只能使用只读工具（Read/Glob/Grep/WebFetch/Bash）。不得写入或编辑任何文件。\n请先充分分析代码，然后调用 `ExitPlanMode` 工具，将完整计划内容（Markdown 格式）作为 plan 参数提交，等待用户批准后才能执行。\nBash 命令只允许只读操作（ls/find/cat/grep 等），不得执行写入操作。"
-  non_interactive: "## 当前模式：非交互（headless/单次问答）\n\n当前没有可供用户实时交互的界面，AskQuestion 工具调用会被自动跳过并返回“已取消”。遇到需要用户澄清的决策点时，不要调用 AskQuestion，而是基于已有信息给出你认为最合理的假设，在回复中明确说明你做了哪些假设，然后继续完成任务。"
-  subagent_general: |-
-    你是由主 Agent 派生的子 Agent，独立完成指定的任务。
-    请主动使用可用工具完成 prompt 中描述的任务。
-    你的最终文本输出会作为任务结果返回给主 Agent——主 Agent 看不到你的中间工具调用，
-    所以结尾必须给出完整、自包含的总结，说明你做了什么、发现了什么。
-  subagent_explore: |-
-    你是只读探索子 Agent，职责是搜索和阅读代码来回答 prompt 中的问题。
-    你只能使用只读工具（Read/Glob/Grep/WebFetch），不得修改任何内容。
-    讲求效率：能读片段就不要读整个文件。你的最终文本输出会返回给主 Agent，
-    结尾必须给出完整、自包含的结论，附上相关文件路径（必要时带行号）。
-  subagent_plan: |-
-    你是软件架构师子 Agent。用只读工具（Read/Glob/Grep/WebFetch）分析代码库，
-    为 prompt 中的任务设计实施方案。不得修改任何内容。
-    你的最终文本输出会返回给主 Agent：请产出分步计划，指明关键文件、
-    尽量复用已有函数与工具，并说明重要取舍。
+# 模型侧提示词（system prompt / 工具描述 / 子 agent 提示 / reminder 包装）已迁至
+# wyj-core::prompts 与 wyj-tools::descriptions 的英文常量，不再走 i18n。
+# 此处仅保留用户可见的 UI 文案。
 
 subagent:
-  tool_desc: |-
-    启动一个独立的子 Agent 完成指定任务。子 Agent 拥有独立的上下文和工具集，完成后将结果返回。
-    适用于需要多步骤规划、并行执行或隔离上下文的复杂子任务。
-    可用的 agent 类型（subagent_type）：
-    {types}
-  type_line: "- {name}: {description}"
-  schema_type: "要使用的 agent 类型（缺省为 general-purpose）"
-  schema_description: "任务的简短描述（3-5 个词），用于界面展示"
-  schema_prompt: "子 Agent 的任务描述"
-  schema_system: "覆盖该类型默认的系统提示（可选）"
-  schema_background: "后台运行：立即返回，子 Agent 完成后其结果会以 system-reminder 通知你"
   unknown_type: "未知的 agent 类型 `{name}`。可用类型: {available}"
   create_failed: "创建子 Agent 失败: {err}"
   run_failed: "子 Agent 执行失败: {err}"
   interrupted: "子 Agent 已被中断"
   no_output: "子 Agent 未产生输出"
-  bg_started: "后台 agent {id}（{type}: {desc}）已启动。完成后其结果会以 system-reminder 通知你，请继续当前任务，不要等待。"
-  bg_done_reminder: "<system-reminder>后台 agent {id}（{type}: {desc}）已完成（耗时 {elapsed}s）。结果如下：\n\n{result}</system-reminder>"
   bg_done_notice: "后台 agent {id}（{type}: {desc}）已完成，结果将注入对话"
+  waiting_bg: "等待 {count} 个后台 agent 完成…"
+  panel_title: " agents [{count}] "
+  inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
   inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
@@ -77,9 +42,6 @@ claude_md:
     global: "全局"
     project: "项目"
     subdir: "子目录"
-  reminder_intro: "以下是适用于当前项目的 CLAUDE.md 记忆文件内容，请遵照其中的指示行事。"
-  subdir_reminder_intro: "你刚访问的目录下存在额外的 CLAUDE.md 说明，请一并遵照："
-  section_header: "Contents of {path} ({source}):\n\n"
 
 cli:
   about: "wyj-code — 终端 AI 编程助手"

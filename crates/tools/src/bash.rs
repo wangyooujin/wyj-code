@@ -31,26 +31,23 @@ impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "在系统 shell 中执行命令，并返回 stdout/stderr 输出。\
-                适合运行构建命令、测试、文件操作、查看日志等。\
-                长时间运行的命令会在超时后终止。"
-                .to_string(),
+            description: crate::descriptions::BASH.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "要执行的 shell 命令"
+                        "description": crate::descriptions::FIELD_BASH_COMMAND
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "超时秒数（默认 120）",
+                        "description": crate::descriptions::FIELD_BASH_TIMEOUT,
                         "minimum": 1,
                         "maximum": 600
                     },
                     "description": {
                         "type": "string",
-                        "description": "命令的简短描述，用于在 UI 中展示"
+                        "description": crate::descriptions::FIELD_BASH_DESCRIPTION
                     }
                 },
                 "required": ["command"]

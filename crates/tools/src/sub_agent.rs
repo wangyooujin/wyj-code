@@ -111,41 +111,36 @@ impl Tool for SubAgentTool {
         let types = self
             .defs
             .iter()
-            .map(|d| {
-                tr_fmt(
-                    "subagent.type_line",
-                    &[("name", d.name.as_str()), ("description", &d.description)],
-                )
-            })
+            .map(|d| format!("- {}: {}", d.name, d.description))
             .collect::<Vec<_>>()
             .join("\n");
         let type_names: Vec<&str> = self.defs.iter().map(|d| d.name.as_str()).collect();
         ToolDefinition {
             name: self.name().to_string(),
-            description: tr_fmt("subagent.tool_desc", &[("types", &types)]),
+            description: crate::descriptions::SUB_AGENT_TEMPLATE.replace("{types}", &types),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "subagent_type": {
                         "type": "string",
                         "enum": type_names,
-                        "description": tr("subagent.schema_type")
+                        "description": "Which agent type to spawn (default general-purpose)"
                     },
                     "description": {
                         "type": "string",
-                        "description": tr("subagent.schema_description")
+                        "description": "A short (3-5 word) description of the task, shown to the user"
                     },
                     "prompt": {
                         "type": "string",
-                        "description": tr("subagent.schema_prompt")
+                        "description": "The complete, self-contained task for the agent: what to investigate or do, all necessary context, and what the final report must contain"
                     },
                     "run_in_background": {
                         "type": "boolean",
-                        "description": tr("subagent.schema_background")
+                        "description": "Run in the background and return immediately; the result is injected into the conversation when ready (default false)"
                     },
                     "system": {
                         "type": "string",
-                        "description": tr("subagent.schema_system")
+                        "description": "Optional system-prompt override for the sub-agent"
                     }
                 },
                 "required": ["description", "prompt"]
@@ -295,13 +290,9 @@ impl Tool for SubAgentTool {
         self.hub.register(id, background, handle);
 
         if background {
-            Ok(ToolResult::ok(tr_fmt(
-                "subagent.bg_started",
-                &[
-                    ("id", &format!("a{id}")),
-                    ("type", &agent_type),
-                    ("desc", &description),
-                ],
+            // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_done_reminder）
+            Ok(ToolResult::ok(format!(
+                "Background agent a{id} ({agent_type}: {description}) started. Its result will arrive as a system-reminder when done — continue with your current work, do not wait."
             )))
         } else {
             match result_rx.await {

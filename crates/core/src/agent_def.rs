@@ -6,7 +6,6 @@
 //! `model` 引用 `~/.wyj-code/config.toml` 中的 Profile 名（而非模型 ID）。
 
 use std::path::{Path, PathBuf};
-use wyj_i18n::tr;
 
 /// 内置 Explore/Plan 类型的只读工具集
 pub const READONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep", "WebFetch"];
@@ -36,28 +35,28 @@ pub fn builtin_defs() -> Vec<AgentDefinition> {
     vec![
         AgentDefinition {
             name: "general-purpose".to_string(),
-            description: tr("subagent.builtin_general_desc"),
+            description: crate::prompts::SUBAGENT_GENERAL_DESC.to_string(),
             tools: None,
             model: None,
-            system_prompt: tr("system_prompt.subagent_general"),
+            system_prompt: crate::prompts::SUBAGENT_GENERAL.to_string(),
             builtin: true,
             source: None,
         },
         AgentDefinition {
             name: "Explore".to_string(),
-            description: tr("subagent.builtin_explore_desc"),
+            description: crate::prompts::SUBAGENT_EXPLORE_DESC.to_string(),
             tools: Some(readonly.clone()),
             model: None,
-            system_prompt: tr("system_prompt.subagent_explore"),
+            system_prompt: crate::prompts::SUBAGENT_EXPLORE.to_string(),
             builtin: true,
             source: None,
         },
         AgentDefinition {
             name: "Plan".to_string(),
-            description: tr("subagent.builtin_plan_desc"),
+            description: crate::prompts::SUBAGENT_PLAN_DESC.to_string(),
             tools: Some(readonly),
             model: None,
-            system_prompt: tr("system_prompt.subagent_plan"),
+            system_prompt: crate::prompts::SUBAGENT_PLAN.to_string(),
             builtin: true,
             source: None,
         },

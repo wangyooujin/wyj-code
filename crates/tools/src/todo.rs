@@ -99,16 +99,13 @@ impl Tool for TodoWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "创建或更新结构化任务列表。每次调用会覆盖整个列表。\
-                status 可为 pending、in_progress 或 completed。\
-                priority 可为 high、medium、low（可选）。"
-                .to_string(),
+            description: crate::descriptions::TODO_WRITE.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "完整的任务列表（覆盖式写入）",
+                        "description": "The complete task list (each call replaces the whole list)",
                         "items": {
                             "type": "object",
                             "required": ["id", "content", "status"],

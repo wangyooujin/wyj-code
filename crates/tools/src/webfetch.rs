@@ -43,20 +43,17 @@ impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "抓取网页内容并转换为纯文本（移除 HTML 标签）。\
-                适合读取文档、README、API 参考页面。\
-                不适合需要 JavaScript 渲染的页面。"
-                .to_string(),
+            description: crate::descriptions::WEBFETCH.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "要抓取的完整 URL"
+                        "description": crate::descriptions::FIELD_WEBFETCH_URL
                     },
                     "raw": {
                         "type": "boolean",
-                        "description": "true 则返回原始 HTML，false（默认）返回纯文本"
+                        "description": "Return raw HTML instead of extracted plain text (default false)"
                     }
                 },
                 "required": ["url"]
