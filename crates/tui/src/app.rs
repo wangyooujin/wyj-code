@@ -1881,15 +1881,12 @@ impl AppState {
                 if background {
                     // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
                     // 送达；空闲则暂存，下一轮起手合并进 user 消息
-                    let reminder = wyj_i18n::tr_fmt(
-                        "subagent.bg_done_reminder",
-                        &[
-                            ("id", format!("a{id}").as_str()),
-                            ("type", &agent_type),
-                            ("desc", &description),
-                            ("elapsed", &format_hms(elapsed_secs)),
-                            ("result", &result),
-                        ],
+                    let reminder = wyj_core::prompts::bg_agent_done_reminder(
+                        &format!("a{id}"),
+                        &agent_type,
+                        &description,
+                        &format_hms(elapsed_secs),
+                        &result,
                     );
                     match &self.injector {
                         Some(tx) => {
@@ -2032,7 +2029,8 @@ fn has_plan_approved(messages: &[Message]) -> bool {
             {
                 if tool_use_id == &target_id && !is_error {
                     if let ToolResultContent::Text(s) = content {
-                        return s.contains("已批准计划");
+                        // 新版英文结果 + 旧版中文结果（恢复历史会话时仍可能遇到）
+                        return s.contains("User approved the plan") || s.contains("已批准计划");
                     }
                 }
             }
@@ -2048,7 +2046,7 @@ fn plan_turn_agent(base: &Arc<Agent>, mode: &AgentMode) -> Arc<Agent> {
     }
     let mut a = (**base).clone();
     a.register_tool(Arc::new(ExitPlanModeTool));
-    let a = a.append_system(wyj_i18n::tr("system_prompt.plan_turn"));
+    let a = a.append_system(wyj_core::prompts::PLAN_TURN);
     Arc::new(a)
 }
 
@@ -3006,18 +3004,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     });
                                                 wyj_i18n::set_locale(&lang);
 
-                                                let mut new_prompt =
-                                                    wyj_i18n::tr("system_prompt.default");
-                                                new_prompt.push_str(&system_prompt_extra);
-
                                                 let model_for_mode = state
                                                     .config
                                                     .model_for_mode(&state.mode)
                                                     .to_string();
                                                 match rebuild_fn(&state.config, &model_for_mode) {
                                                     Ok(new_agent) => {
-                                                        let new_agent =
-                                                            new_agent.with_system(new_prompt);
+                                                        // rebuild_fn 已装配完整 system prompt
+                                                        //（英文主提示 + env 块），这里只拼回
+                                                        // 模式追加段（如 Plan 限制说明）
+                                                        let new_agent = new_agent.append_system(
+                                                            system_prompt_extra
+                                                                .trim_start()
+                                                                .to_string(),
+                                                        );
                                                         let new_agent = wire_tool_callback(
                                                             new_agent,
                                                             agent_tx.clone(),
@@ -3035,13 +3035,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                         ));
                                                     }
                                                     Err(e) => {
-                                                        let updated_agent =
-                                                            (*shared_agent.read().unwrap())
-                                                                .as_ref()
-                                                                .clone()
-                                                                .with_system(new_prompt);
-                                                        *shared_agent.write().unwrap() =
-                                                            Arc::new(updated_agent);
+                                                        // 提示词已不随 locale 变化，重建失败时
+                                                        // 保留原 Agent 即可，无需改 system prompt
                                                         state.messages.push(
                                                             ChatMessage::assistant_err(
                                                                 wyj_i18n::tr_fmt(
@@ -3541,11 +3536,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     .to_string();
                                                 match rebuild_fn(&state.config, &model_for_mode) {
                                                     Ok(new_agent) => {
-                                                        let mut new_prompt =
-                                                            wyj_i18n::tr("system_prompt.default");
-                                                        new_prompt.push_str(&system_prompt_extra);
-                                                        let new_agent =
-                                                            new_agent.with_system(new_prompt);
+                                                        // rebuild_fn 已装配完整 system prompt，
+                                                        // 只拼回模式追加段
+                                                        let new_agent = new_agent.append_system(
+                                                            system_prompt_extra
+                                                                .trim_start()
+                                                                .to_string(),
+                                                        );
                                                         let new_agent = wire_tool_callback(
                                                             new_agent,
                                                             agent_tx.clone(),

@@ -84,7 +84,10 @@ impl ClaudeMdLoader {
         if sections.is_empty() {
             return None;
         }
-        Some(wrap_reminder("claude_md.reminder_intro", &sections))
+        Some(wrap_reminder(
+            "The following CLAUDE.md memory files apply to the current project. Follow their instructions.",
+            &sections,
+        ))
     }
 
     /// 工具触达新目录时调用：若该目录此前未展示过且存在 CLAUDE.md 系文件，
@@ -100,7 +103,7 @@ impl ClaudeMdLoader {
         }
         let text = load_dir_files(&dir)?;
         Some(wrap_reminder(
-            "claude_md.subdir_reminder_intro",
+            "The directory you just accessed has additional CLAUDE.md instructions. Follow them as well:",
             &[(ClaudeMdSource::Subdir, dir, text)],
         ))
     }
@@ -283,16 +286,19 @@ fn resolve_import_path(token: &str, base_dir: &Path) -> Option<PathBuf> {
     Some(base_dir.join(p))
 }
 
-fn wrap_reminder(intro_key: &str, sections: &[(ClaudeMdSource, PathBuf, String)]) -> String {
-    let mut body = wyj_i18n::tr(intro_key);
+/// reminder 包装（模型侧文本，英文，不走 i18n）
+fn wrap_reminder(intro: &str, sections: &[(ClaudeMdSource, PathBuf, String)]) -> String {
+    let mut body = String::from(intro);
     body.push_str("\n\n");
     for (source, path, content) in sections {
-        body.push_str(&wyj_i18n::tr_fmt(
-            "claude_md.section_header",
-            &[
-                ("path", &path.display().to_string()),
-                ("source", &source.label()),
-            ],
+        let source_en = match source {
+            ClaudeMdSource::Global => "global",
+            ClaudeMdSource::Project => "project",
+            ClaudeMdSource::Subdir => "subdirectory",
+        };
+        body.push_str(&format!(
+            "Contents of {} ({source_en}):\n\n",
+            path.display()
         ));
         body.push_str(content.trim());
         body.push_str("\n\n");

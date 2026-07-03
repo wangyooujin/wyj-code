@@ -29,20 +29,17 @@ impl Tool for GlobTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "按 glob 模式搜索文件路径。\
-                自动忽略 .gitignore 中的文件。\
-                支持 **、? 等通配符。返回匹配文件的绝对路径列表。"
-                .to_string(),
+            description: crate::descriptions::GLOB.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "glob 匹配模式，如 **/*.rs、src/**/*.ts"
+                        "description": crate::descriptions::FIELD_GLOB_PATTERN
                     },
                     "path": {
                         "type": "string",
-                        "description": "搜索根目录（默认为当前工作目录）"
+                        "description": crate::descriptions::FIELD_GLOB_PATH
                     }
                 },
                 "required": ["pattern"]

@@ -144,16 +144,13 @@ impl Tool for AskQuestionTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "向用户发起结构化访谈（1-4 题，每题 2-4 选项）。\
-                          适用于需要用户明确决策的场景，不要用于你能自主判断的事。\
-                          每题自动追加「其他」选项供自由输入；用户确认后返回问答对文本，取消则返回 [已取消]。"
-                .to_string(),
+            description: crate::descriptions::ASK_QUESTION.to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "questions": {
                         "type": "array",
-                        "description": "1-4 个访谈问题，会依次向用户展示",
+                        "description": "1-4 questions shown to the user in order. Write them in the user's language.",
                         "minItems": 1,
                         "maxItems": 4,
                         "items": {
@@ -161,26 +158,26 @@ impl Tool for AskQuestionTool {
                             "properties": {
                                 "question": {
                                     "type": "string",
-                                    "description": "向用户展示的完整问题文本"
+                                    "description": "The full question text shown to the user"
                                 },
                                 "header": {
                                     "type": "string",
-                                    "description": "简短分类标签（建议不超过 12 个字符，如“技术栈”“范围”）"
+                                    "description": "Short category chip (max ~12 chars, e.g. \"Stack\", \"Scope\")"
                                 },
                                 "multiSelect": {
                                     "type": "boolean",
-                                    "description": "是否允许多选，默认 false（单选）"
+                                    "description": "Allow selecting multiple options (default false)"
                                 },
                                 "options": {
                                     "type": "array",
-                                    "description": "2-4 个选项（不含系统自动追加的“其他”选项）",
+                                    "description": "2-4 options (an \"Other\" free-text option is appended automatically)",
                                     "minItems": 2,
                                     "maxItems": 4,
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "label": { "type": "string", "description": "选项文字" },
-                                            "description": { "type": "string", "description": "可选，选项的补充说明" }
+                                            "label": { "type": "string", "description": "Option label" },
+                                            "description": { "type": "string", "description": "Optional explanation of the option" }
                                         },
                                         "required": ["label"]
                                     }
