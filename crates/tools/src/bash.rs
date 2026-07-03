@@ -127,6 +127,7 @@ impl Tool for BashTool {
                 Ok(ToolResult {
                     content: result,
                     is_error,
+                    parts: None,
                 })
             }
         }

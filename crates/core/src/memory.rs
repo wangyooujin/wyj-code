@@ -295,6 +295,9 @@ fn messages_to_text(messages: &[Message]) -> String {
                     ContentBlock::ToolUse { name, .. } => Some(format!("[调用: {name}]")),
                     ContentBlock::ToolResult { content, .. } => match content {
                         ToolResultContent::Text(t) => Some(truncate_chars(t, 200)),
+                        ToolResultContent::Parts(_) => {
+                            Some(truncate_chars(&content.display_text(), 200))
+                        }
                         ToolResultContent::Blocks(_) => None,
                     },
                     ContentBlock::Image { .. } => None,

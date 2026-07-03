@@ -2,13 +2,17 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as base64_engine;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
-use wyj_api::types::ToolDefinition;
+use wyj_api::types::{ToolDefinition, ToolResultPart};
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 200_000;
+/// 图片原始字节上限（Anthropic API 单图 base64 后约 5MB 限制）
+const MAX_IMAGE_BYTES: usize = 3_750_000;
 
 pub struct ReadTool;
 
@@ -79,7 +83,15 @@ impl Tool for ReadTool {
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
         ) {
             let bytes = tokio::fs::read(&path).await?;
-            let b64 = base64_encode(&bytes);
+            // API 图片上限 5MB（base64 后再膨胀 4/3），超限直接拒绝
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Ok(ToolResult::err(format!(
+                    "图片过大（{} 字节，上限 {} 字节）",
+                    bytes.len(),
+                    MAX_IMAGE_BYTES
+                )));
+            }
+            let b64 = base64_engine.encode(&bytes);
             let mime = match ext.as_str() {
                 "jpg" | "jpeg" => "image/jpeg",
                 "gif" => "image/gif",
@@ -87,7 +99,16 @@ impl Tool for ReadTool {
                 "bmp" => "image/bmp",
                 _ => "image/png",
             };
-            return Ok(ToolResult::ok(format!("data:{mime};base64,{b64}")));
+            // 以真正的 image content block 发给模型（旧实现把 base64 当纯文本
+            // 内联：模型看不到图，还平白消耗几十万字符的 token）
+            let display = format!("[image: {} KB {mime}]", bytes.len() / 1024);
+            return Ok(ToolResult::with_parts(
+                display,
+                vec![ToolResultPart::Image {
+                    media_type: mime.to_string(),
+                    data: b64,
+                }],
+            ));
         }
 
         let content = tokio::fs::read(&path).await?;
@@ -126,35 +147,4 @@ fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
     } else {
         cwd.join(pb)
     }
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = if chunk.len() > 1 {
-            chunk[1] as usize
-        } else {
-            0
-        };
-        let b2 = if chunk.len() > 2 {
-            chunk[2] as usize
-        } else {
-            0
-        };
-        out.push(TABLE[b0 >> 2] as char);
-        out.push(TABLE[((b0 & 3) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((b1 & 0xf) << 2) | (b2 >> 6)] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[b2 & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
 }

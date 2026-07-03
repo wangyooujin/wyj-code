@@ -42,11 +42,15 @@ impl Session {
         });
     }
 
-    pub fn push_tool_result(&mut self, tool_use_id: String, output: String, is_error: bool) {
-        use wyj_api::types::ToolResultContent;
+    pub fn push_tool_result(
+        &mut self,
+        tool_use_id: String,
+        content: wyj_api::types::ToolResultContent,
+        is_error: bool,
+    ) {
         let block = ContentBlock::ToolResult {
             tool_use_id,
-            content: ToolResultContent::text(output),
+            content,
             is_error,
         };
         self.push_user_blocks_merged(vec![block]);
