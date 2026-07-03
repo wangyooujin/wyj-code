@@ -9,11 +9,11 @@ pub const WRITE: &str = "Writes content to a file, replacing anything already th
 
 pub const EDIT: &str = "Performs an exact string replacement in a file. You MUST Read the file first — old_string has to match the current content exactly, including indentation and whitespace. old_string must be unique in the file, or set replace_all=true to replace every occurrence. If the match fails, re-Read the file and adjust. Prefer this over `sed -i` in Bash.";
 
-pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s). Output over 30KB is truncated keeping head and tail.";
+pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s); for processes meant to keep running (dev servers, watchers), set run_in_background=true and read output later with BashOutput. Output over 30KB is truncated keeping head and tail.";
 
 pub const GLOB: &str = "Finds files by glob pattern (`**/*.rs`, `src/**/*.test.ts`, ...). Respects .gitignore. Returns absolute paths. Use this instead of `find` in Bash. Can run in parallel with other read-only calls.";
 
-pub const GREP: &str = "Searches file contents with a regular expression. Respects .gitignore and skips binary files; returns matching lines with `path:line` prefixes (capped at 500 matches). Use this instead of `grep`/`rg` in Bash. Can run in parallel with other read-only calls.";
+pub const GREP: &str = "Searches file contents with a regular expression. Respects .gitignore and skips binary files. output_mode: files_with_matches (default, paths only), content (matching lines as `path:line:text`, supports -A/-B/-C context lines), or count (per-file match counts). Use this instead of `grep`/`rg` in Bash. Can run in parallel with other read-only calls.";
 
 pub const WEBFETCH: &str = "Fetches a URL and converts the page to plain text (HTML tags stripped, capped at 50KB). Good for docs, READMEs, and API references. Cannot execute JavaScript, so client-rendered pages may come back empty. Can run in parallel with other read-only calls.";
 

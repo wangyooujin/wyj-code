@@ -2323,6 +2323,7 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "WebFetch",
                 "AskQuestion",
                 "Bash",         // 只读命令，由 system prompt 约束
+                "BashOutput",   // 后台任务输出读取（纯读）
                 "ExitPlanMode", // 提交计划并请求批准（计划文本作为参数直传，不落盘）
                 "TodoWrite",    // 任务追踪，plan 模式同样有用
                 "Agent",        // 子 Agent（继承同一白名单，不会绕过 plan 模式限制）
@@ -4725,6 +4726,8 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
     // 退出前中断所有仍在运行的子 Agent（含后台任务，结果随进程退出丢弃）
     hub.abort_all();
+    // 杀掉全部后台 Bash 任务的进程组，防止孤儿进程
+    wyj_tools::BashSessionManager::global().kill_all();
 
     // 退出时保存会话历史元数据
     if let Some(hs) = history_store {
@@ -5136,6 +5139,7 @@ mod todo_stats_tests {
             content: format!("task-{id}"),
             status,
             priority: None,
+            active_form: None,
         }
     }
 

@@ -12,7 +12,15 @@ use crate::diff::make_diff;
 /// diff 输出行数上限（含上下文/增删行），避免超长 diff 撑爆输出
 const MAX_DIFF_LINES: usize = 200;
 
-pub struct EditTool;
+pub struct EditTool {
+    tracker: crate::write::ReadTracker,
+}
+
+impl EditTool {
+    pub fn new(tracker: crate::write::ReadTracker) -> Self {
+        Self { tracker }
+    }
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -69,6 +77,15 @@ impl Tool for EditTool {
 
         if !path.exists() {
             return Ok(ToolResult::err(format!("文件不存在: {}", path.display())));
+        }
+
+        // 与 Write 相同的安全约束：编辑前必须先 Read 过该文件
+        let path_str = path.to_string_lossy().to_string();
+        if !self.tracker.has_read(&path_str) {
+            return Ok(ToolResult::err(format!(
+                "安全检查失败：编辑 `{}` 前必须先用 Read 读取该文件",
+                path.display()
+            )));
         }
 
         let content = tokio::fs::read_to_string(&path).await?;

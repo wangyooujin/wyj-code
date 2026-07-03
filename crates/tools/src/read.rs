@@ -14,7 +14,15 @@ const MAX_BYTES: usize = 200_000;
 /// 图片原始字节上限（Anthropic API 单图 base64 后约 5MB 限制）
 const MAX_IMAGE_BYTES: usize = 3_750_000;
 
-pub struct ReadTool;
+pub struct ReadTool {
+    tracker: crate::write::ReadTracker,
+}
+
+impl ReadTool {
+    pub fn new(tracker: crate::write::ReadTracker) -> Self {
+        Self { tracker }
+    }
+}
 
 #[derive(Deserialize)]
 struct Input {
@@ -115,6 +123,9 @@ impl Tool for ReadTool {
                 content.len()
             )));
         }
+
+        // 标记为已读：Edit/Write 修改此文件前要求先 Read 过
+        self.tracker.mark_read(&path.to_string_lossy());
 
         let text = String::from_utf8_lossy(&content);
         let lines: Vec<&str> = text.lines().collect();
