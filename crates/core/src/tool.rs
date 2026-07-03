@@ -5,11 +5,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use wyj_api::types::ToolDefinition;
 
-/// 工具执行结果
+/// 工具执行结果。`content` 恒为展示/降级用文本（TUI 与不支持多模态的
+/// Provider 使用）；`parts` 存在时为发给模型的结构化内容（如图片块）。
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
     pub is_error: bool,
+    pub parts: Option<Vec<wyj_api::types::ToolResultPart>>,
 }
 
 impl ToolResult {
@@ -17,12 +19,25 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            parts: None,
         }
     }
     pub fn err(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
+            parts: None,
+        }
+    }
+    /// 结构化多块结果：content 为展示文本，parts 为发给模型的真实内容
+    pub fn with_parts(
+        content: impl Into<String>,
+        parts: Vec<wyj_api::types::ToolResultPart>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            parts: Some(parts),
         }
     }
 }

@@ -841,6 +841,8 @@ pub struct ProfileEntryDraft {
     pub api_key: String,
     pub max_tokens: String,
     pub context_window: String,
+    /// 是否支持图片输入（面板暂不暴露编辑入口，仅透传保留原值）
+    pub vision: bool,
 }
 
 impl ProfileEntryDraft {
@@ -858,6 +860,7 @@ impl ProfileEntryDraft {
             api_key: p.api_key.clone().unwrap_or_default(),
             max_tokens: p.max_tokens.to_string(),
             context_window: p.context_window.to_string(),
+            vision: p.vision,
         }
     }
 
@@ -881,6 +884,7 @@ impl ProfileEntryDraft {
             api_key: String::new(),
             max_tokens: "8192".to_string(),
             context_window: "200000".to_string(),
+            vision: true,
         }
     }
 
@@ -969,6 +973,7 @@ impl ProfileEntryDraft {
             },
             max_tokens: self.max_tokens.trim().parse().unwrap_or(8192),
             context_window: self.context_window.trim().parse().unwrap_or(200_000),
+            vision: self.vision,
         }
     }
 }
@@ -4740,6 +4745,7 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                         } => {
                             let text = match content {
                                 ToolResultContent::Text(s) => s.clone(),
+                                ToolResultContent::Parts(_) => content.display_text(),
                                 ToolResultContent::Blocks(v) => {
                                     serde_json::to_string_pretty(v).unwrap_or_default()
                                 }

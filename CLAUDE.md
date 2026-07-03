@@ -56,6 +56,7 @@ exec_model = ""              # Exec/Bypass 模式专用模型，留空则使用 
 base_url = ""                # 留空使用供应商默认端点
 max_tokens = 8192
 context_window = 200000
+vision = true                # 模型是否支持图片输入；false 时图片降级为占位文本（防非多模态端点 400）
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空自动检测系统 locale
 

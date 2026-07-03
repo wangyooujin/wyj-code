@@ -157,8 +157,11 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                             content,
                             ..
                         } => {
+                            // OpenAI 的 tool 消息不支持图片块：Parts 走
+                            // display_text 降级（图片以占位符表示），第一期接受此限制
                             let content_str = match content {
                                 crate::types::ToolResultContent::Text(t) => t.clone(),
+                                crate::types::ToolResultContent::Parts(_) => content.display_text(),
                                 crate::types::ToolResultContent::Blocks(b) => {
                                     serde_json::to_string(b).unwrap_or_default()
                                 }

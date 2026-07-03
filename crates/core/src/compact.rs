@@ -35,13 +35,29 @@ pub fn estimate_tokens(messages: &[Message]) -> u32 {
             }
             ContentBlock::ToolResult { content, .. } => match content {
                 ToolResultContent::Text(t) => estimate_text_tokens(t),
+                ToolResultContent::Parts(parts) => parts
+                    .iter()
+                    .map(|p| match p {
+                        wyj_api::types::ToolResultPart::Text { text } => estimate_text_tokens(text),
+                        wyj_api::types::ToolResultPart::Image { data, .. } => {
+                            estimate_image_tokens(data.len())
+                        }
+                    })
+                    .sum(),
                 ToolResultContent::Blocks(v) => {
                     v.iter().map(|x| estimate_text_tokens(&x.to_string())).sum()
                 }
             },
-            ContentBlock::Image { data, .. } => data.len() / 3,
+            ContentBlock::Image { data, .. } => estimate_image_tokens(data.len()),
         })
         .sum::<usize>() as u32
+}
+
+/// 图片 token 估算：Anthropic 按约 像素数/750 计 token。无尺寸信息时用解码
+/// 后字节数近似（base64 长度 × 3/4 ÷ 750），1600 封顶（API 对大图会缩放）。
+/// 旧公式 `data.len()/3` 对大图高估约百倍，会导致压缩过早触发。
+fn estimate_image_tokens(b64_len: usize) -> usize {
+    (b64_len * 3 / 4 / 750).min(1600)
 }
 
 /// 启发式 token 估算：CJK 字符按 1.5 token/字，其余按 0.25 token/字。
@@ -216,6 +232,9 @@ fn messages_to_text(messages: &[Message]) -> String {
                     } => {
                         let text = match content {
                             ToolResultContent::Text(t) => truncate_chars(t, 400),
+                            ToolResultContent::Parts(_) => {
+                                truncate_chars(&content.display_text(), 400)
+                            }
                             ToolResultContent::Blocks(_) => "[复杂内容]".to_string(),
                         };
                         let prefix = if *is_error {

@@ -445,14 +445,15 @@ impl Agent {
     }
 
     /// 执行单个工具调用：触发 Start/End 回调、权限检查、执行并计时。
-    /// 返回 (tool_use_id, 输出文本, 是否错误)。
+    /// 返回 (tool_use_id, 发给模型的内容, 是否错误)；End 回调携带展示用文本。
     async fn exec_tool_call(
         &self,
         ctx: &dyn ToolContext,
         id: String,
         name: String,
         input: serde_json::Value,
-    ) -> (String, String, bool) {
+    ) -> (String, wyj_api::types::ToolResultContent, bool) {
+        use wyj_api::types::ToolResultContent;
         let tool = self.tool_impls.get(&name).cloned();
 
         if let Some(cb) = &self.tool_cb {
@@ -464,17 +465,31 @@ impl Agent {
         }
         let start = Instant::now();
 
-        let (output, is_error): (String, bool) = if let Some(t) = tool {
+        let (display, content, is_error): (String, ToolResultContent, bool) = if let Some(t) = tool
+        {
             if ctx.is_allowed(&name, &input) {
                 match t.run(input, ctx).await {
-                    Ok(r) => (r.content, r.is_error),
-                    Err(e) => (format!("工具执行错误: {e}"), true),
+                    Ok(r) => match r.parts {
+                        // 结构化结果（如图片块）：display 用降级文本，模型收 Parts
+                        Some(parts) => (r.content, ToolResultContent::Parts(parts), r.is_error),
+                        None => (
+                            r.content.clone(),
+                            ToolResultContent::Text(r.content),
+                            r.is_error,
+                        ),
+                    },
+                    Err(e) => {
+                        let msg = format!("工具执行错误: {e}");
+                        (msg.clone(), ToolResultContent::Text(msg), true)
+                    }
                 }
             } else {
-                (format!("工具 `{name}` 在当前模式下不被允许"), true)
+                let msg = format!("工具 `{name}` 在当前模式下不被允许");
+                (msg.clone(), ToolResultContent::Text(msg), true)
             }
         } else {
-            (format!("工具 `{name}` 未注册"), true)
+            let msg = format!("工具 `{name}` 未注册");
+            (msg.clone(), ToolResultContent::Text(msg), true)
         };
 
         let elapsed_secs = start.elapsed().as_secs_f64();
@@ -485,11 +500,11 @@ impl Agent {
                 name: name.clone(),
                 is_error,
                 elapsed_secs,
-                output: output.clone(),
+                output: display,
             });
         }
 
-        (id, output, is_error)
+        (id, content, is_error)
     }
 
     /// 手动触发上下文压缩（供 /compact 命令使用）
