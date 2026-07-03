@@ -37,6 +37,9 @@ subagent:
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
   builtin_plan_desc: "规划 Agent：只读分析代码并产出分步实施计划"
 
+thinking:
+  done: "✻ 已思考 {secs}s（{lines} 行）"
+
 claude_md:
   source:
     global: "全局"

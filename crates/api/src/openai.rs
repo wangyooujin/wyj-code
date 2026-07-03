@@ -244,8 +244,10 @@ impl Provider for OpenAIProvider {
         system: &str,
         messages: &[Message],
         tools: &[ToolDefinition],
-        max_tokens: u32,
+        opts: &crate::provider::RequestOptions,
     ) -> Result<EventStream> {
+        // OpenAI 格式不支持 Anthropic 式 thinking 参数，忽略 opts.thinking_*
+        let max_tokens = opts.max_tokens;
         let mut api_messages = vec![ApiMessage {
             role: "system".to_string(),
             content: Some(Value::String(system.to_string())),

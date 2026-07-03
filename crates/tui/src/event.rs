@@ -8,6 +8,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum AgentEvent {
     /// 流式文本片段
     TextDelta(String),
+    /// extended thinking 文本增量（独立于正文流式展示）
+    ThinkingDelta(String),
     /// 工具调用开始（携带输入 JSON，用于提取展示参数）
     ToolStart {
         id: String,

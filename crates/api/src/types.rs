@@ -65,6 +65,11 @@ pub enum ContentBlock {
     },
     /// base64 图片
     Image { media_type: String, data: String },
+    /// Extended thinking 块（assistant 消息内）。工具调用续轮时必须携带
+    /// signature 原样回传给 API，否则请求会被拒绝。
+    Thinking { thinking: String, signature: String },
+    /// 被安全系统加密的思考块，同样必须原样回传
+    RedactedThinking { data: String },
 }
 
 /// 工具结果内容。`Parts` 为结构化多块内容（文本+图片，Anthropic 原生支持
@@ -146,6 +151,14 @@ pub enum StreamEvent {
     ToolUseDelta { id: String, json_delta: String },
     /// 工具调用结束
     ToolUseEnd { id: String },
+    /// thinking 块开始（extended thinking 开启时）
+    ThinkingStart,
+    /// thinking 文本增量
+    ThinkingDelta(String),
+    /// thinking 块签名增量（块结束前到达，需累积并随块回传历史）
+    ThinkingSignatureDelta(String),
+    /// 加密思考块（整块到达，原样保存回传）
+    RedactedThinking(String),
     /// 消息结束
     MessageStop { stop_reason: StopReason },
     /// 用量统计（可选）。`cache_read_input_tokens` 为命中 prompt 缓存

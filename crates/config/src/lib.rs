@@ -120,6 +120,14 @@ pub struct Profile {
     /// 避免非多模态端点收到 image 块返回 400。默认 true。
     #[serde(default = "default_vision")]
     pub vision: bool,
+    /// Extended thinking 预算 token 数。None/0 = 关闭（默认）。
+    /// 开启后请求携带 thinking 参数，思考内容计入 output token 计费。
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+    /// 工具调用轮之间是否允许交错思考（interleaved thinking beta，
+    /// 仅在 thinking_budget 开启时生效）。默认 true。
+    #[serde(default = "default_vision")]
+    pub interleaved_thinking: bool,
 }
 
 fn default_vision() -> bool {
@@ -139,6 +147,8 @@ impl Default for Profile {
             max_tokens: 8192,
             context_window: 200_000,
             vision: true,
+            thinking_budget: None,
+            interleaved_thinking: true,
         }
     }
 }
@@ -250,6 +260,8 @@ impl From<LegacyConfigV0> for Config {
                 max_tokens: legacy.max_tokens,
                 context_window: legacy.context_window,
                 vision: true,
+                thinking_budget: None,
+                interleaved_thinking: true,
             }],
             log_level: legacy.log_level,
             language: legacy.language,
