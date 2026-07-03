@@ -20,6 +20,8 @@ struct Input {
     command: String,
     #[serde(default)]
     timeout: Option<u64>,
+    #[serde(default)]
+    run_in_background: bool,
 }
 
 #[async_trait]
@@ -48,6 +50,10 @@ impl Tool for BashTool {
                     "description": {
                         "type": "string",
                         "description": crate::descriptions::FIELD_BASH_DESCRIPTION
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Run in the background and return a shell id immediately; read output later with BashOutput and stop it with KillShell. Use for long-running processes like dev servers or watchers (default false)"
                     }
                 },
                 "required": ["command"]
@@ -61,6 +67,19 @@ impl Tool for BashTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
+
+        // 后台执行：立即返回任务 id，输出经 BashOutput 增量读取
+        if inp.run_in_background {
+            return match crate::bash_session::BashSessionManager::global()
+                .spawn(&inp.command, ctx.cwd())
+            {
+                Ok(id) => Ok(ToolResult::ok(format!(
+                    "Started background shell {id}. Use BashOutput to read its output and KillShell to stop it."
+                ))),
+                Err(e) => Ok(ToolResult::err(format!("后台启动失败: {e}"))),
+            };
+        }
+
         let timeout = inp.timeout.unwrap_or(TIMEOUT_SECS);
 
         let output = tokio::time::timeout(

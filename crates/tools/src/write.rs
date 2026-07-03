@@ -32,18 +32,9 @@ pub struct WriteTool {
     tracker: ReadTracker,
 }
 
-impl Default for WriteTool {
-    fn default() -> Self {
-        Self {
-            tracker: ReadTracker::default(),
-        }
-    }
-}
-
 impl WriteTool {
-    #[allow(dead_code)]
-    pub fn tracker(&self) -> ReadTracker {
-        self.tracker.clone()
+    pub fn new(tracker: ReadTracker) -> Self {
+        Self { tracker }
     }
 }
 

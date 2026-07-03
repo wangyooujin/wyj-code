@@ -955,8 +955,14 @@ fn draw_todo_panel(
             .map(|p| format!("[{p}] "))
             .unwrap_or_default();
         let idx_str = format!("{}/{}", i + 1, total);
+        // 进行中的任务优先展示 activeForm 进行时文案（如 "Running tests"）
+        let display_text = if item.status == TodoStatus::InProgress {
+            item.active_form.as_deref().unwrap_or(&item.content)
+        } else {
+            &item.content
+        };
         let content = truncate_line(
-            &format!("{prio_str}{}", item.content),
+            &format!("{prio_str}{display_text}"),
             max_content_width.saturating_sub(24),
         );
 
