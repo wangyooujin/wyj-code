@@ -4,6 +4,7 @@ pub mod anthropic;
 pub mod models;
 pub mod openai;
 pub mod provider;
+pub mod retry;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;

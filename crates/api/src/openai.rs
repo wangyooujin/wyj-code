@@ -5,7 +5,7 @@ use crate::{
     provider::{EventStream, Provider},
     types::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -278,21 +278,16 @@ impl Provider for OpenAIProvider {
         };
 
         let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .context("发送 OpenAI 请求失败")?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API 错误 {status}: {err}");
-        }
+        // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
+        let resp =
+            crate::retry::send_with_retry(&crate::retry::RetryPolicy::default(), "OpenAI", || {
+                self.client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("content-type", "application/json")
+                    .json(&body)
+            })
+            .await?;
 
         let byte_stream = resp.bytes_stream();
         let sse = byte_stream.eventsource();
