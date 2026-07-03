@@ -115,11 +115,13 @@ pub enum StreamEvent {
     /// 消息结束
     MessageStop { stop_reason: StopReason },
     /// 用量统计（可选）。`cache_read_input_tokens` 为命中 prompt 缓存
-    /// 的输入 token 数（按约 1/10 价格计费），未启用缓存时为 0。
+    /// 的输入 token 数（按约 0.1x 价格计费）；`cache_creation_input_tokens`
+    /// 为写入缓存的输入 token 数（按约 1.25x 价格计费）。未启用缓存时均为 0。
     Usage {
         input_tokens: u32,
         output_tokens: u32,
         cache_read_input_tokens: u32,
+        cache_creation_input_tokens: u32,
     },
 }
 
@@ -131,4 +133,5 @@ pub struct CompletionResult {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cache_read_input_tokens: u32,
+    pub cache_creation_input_tokens: u32,
 }

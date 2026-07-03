@@ -225,10 +225,12 @@ impl Agent {
         // 子目录动态 reminder 在循环内追加到 system 末尾（只增不减，前缀仍可缓存）。
         let mut system = self.system_prompt.clone();
         if let Some(mem) = &self.memory {
-            let ctx_str = mem.load_context();
+            // 会话级快照：本会话内容固定，防止后台提取的新记忆改变 system
+            // 前缀而击穿 prompt 缓存；新记忆自然在下个会话生效。
+            let ctx_str = mem.load_context_cached();
             if !ctx_str.is_empty() {
                 system.push_str("\n\n");
-                system.push_str(&ctx_str);
+                system.push_str(ctx_str);
             }
         }
         if let Some(loader) = &self.claude_md {
@@ -296,11 +298,13 @@ impl Agent {
                         input_tokens,
                         output_tokens,
                         cache_read_input_tokens,
+                        cache_creation_input_tokens,
                     } => {
                         // 供应商返回的 input_tokens 仅含未命中缓存的（全价）部分，
-                        // 缓存命中的 cache_read_input_tokens 单独累计用于 /cost 展示。
+                        // 缓存命中（0.1x）与缓存写入（1.25x）单独累计用于 /cost 展示。
                         session.add_usage(input_tokens, output_tokens);
-                        session.add_cache_read(cache_read_input_tokens);
+                        session
+                            .add_cache_usage(cache_read_input_tokens, cache_creation_input_tokens);
                         if let Some(cb) = &self.usage_cb {
                             cb(input_tokens, output_tokens);
                         }

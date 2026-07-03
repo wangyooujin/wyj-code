@@ -40,6 +40,10 @@ pub struct CommandContext {
     pub model: String,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 命中 prompt 缓存的输入 token（0.1x 计费，不含在 input_tokens 内）
+    pub cache_read_tokens: u32,
+    /// 写入 prompt 缓存的输入 token（1.25x 计费，不含在 input_tokens 内）
+    pub cache_write_tokens: u32,
     pub context_window: u32,
     pub estimated_tokens: u32,
     pub home_dir: std::path::PathBuf,

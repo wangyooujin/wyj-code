@@ -4039,15 +4039,21 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
 
                             // ── 其他 slash 命令 ─────────────────────────────
-                            let estimated = {
+                            let (estimated, cache_read, cache_write) = {
                                 let sess = session.lock().await;
-                                wyj_core::estimate_tokens(&sess.messages)
+                                (
+                                    wyj_core::estimate_tokens(&sess.messages),
+                                    sess.total_cache_read_tokens,
+                                    sess.total_cache_write_tokens,
+                                )
                             };
                             let cmd_ctx = CommandContext {
                                 cwd: cwd.clone(),
                                 model: state.model_name.clone(),
                                 input_tokens: state.total_input_tokens,
                                 output_tokens: state.total_output_tokens,
+                                cache_read_tokens: cache_read,
+                                cache_write_tokens: cache_write,
                                 context_window,
                                 estimated_tokens: estimated,
                                 home_dir: std::env::var("HOME")

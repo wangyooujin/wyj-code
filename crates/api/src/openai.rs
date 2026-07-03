@@ -131,6 +131,13 @@ struct FunctionDelta {
 struct UsageData {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
+    /// OpenAI 服务端自动缓存的命中数（prompt_tokens 已包含它，需要扣减）
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u32>,
 }
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
@@ -311,10 +318,19 @@ impl Provider for OpenAIProvider {
 
                         if chunk.choices.is_empty() {
                             if let Some(usage) = chunk.usage {
+                                // OpenAI 的 prompt_tokens 含缓存命中部分，与 Anthropic
+                                // （input_tokens 不含缓存）语义对齐：扣减后单列 cache_read。
+                                let cached = usage
+                                    .prompt_tokens_details
+                                    .as_ref()
+                                    .and_then(|d| d.cached_tokens)
+                                    .unwrap_or(0);
+                                let prompt = usage.prompt_tokens.unwrap_or(0);
                                 return Some(Ok(StreamEvent::Usage {
-                                    input_tokens: usage.prompt_tokens.unwrap_or(0),
+                                    input_tokens: prompt.saturating_sub(cached),
                                     output_tokens: usage.completion_tokens.unwrap_or(0),
-                                    cache_read_input_tokens: 0,
+                                    cache_read_input_tokens: cached,
+                                    cache_creation_input_tokens: 0,
                                 }));
                             }
                             return None;

@@ -193,10 +193,8 @@ struct UsageData {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     /// 命中 prompt 缓存的输入 token 数（按 0.1x 计费）
-    #[allow(dead_code)]
     cache_read_input_tokens: Option<u32>,
     /// 写入 prompt 缓存的输入 token 数（按 1.25x 计费）
-    #[allow(dead_code)]
     cache_creation_input_tokens: Option<u32>,
 }
 
@@ -386,11 +384,13 @@ fn parse_sse_item(
                 let input = usage.input_tokens.unwrap_or(0);
                 let output = usage.output_tokens.unwrap_or(0);
                 let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-                if input > 0 || output > 0 || cache_read > 0 {
+                let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
+                if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
                     return vec![Ok(StreamEvent::Usage {
                         input_tokens: input,
                         output_tokens: output,
                         cache_read_input_tokens: cache_read,
+                        cache_creation_input_tokens: cache_write,
                     })];
                 }
             }
@@ -425,11 +425,13 @@ fn parse_sse_item(
                 let input = u.input_tokens.unwrap_or(0);
                 let output = u.output_tokens.unwrap_or(0);
                 let cache_read = u.cache_read_input_tokens.unwrap_or(0);
-                if input > 0 || output > 0 || cache_read > 0 {
+                let cache_write = u.cache_creation_input_tokens.unwrap_or(0);
+                if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
                     out.push(Ok(StreamEvent::Usage {
                         input_tokens: input,
                         output_tokens: output,
                         cache_read_input_tokens: cache_read,
+                        cache_creation_input_tokens: cache_write,
                     }));
                 }
             }

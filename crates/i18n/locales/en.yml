@@ -104,6 +104,7 @@ main:
   session_not_found: "Session {id} not found, starting a new session."
   session_resumed: "Resumed session {id} ({count} messages)"
   session_resumed_last: "Resumed last session {id} ({count} messages)"
+  resume_compacted: "Resumed history was long; pre-compacted ({count} old messages removed)"
   no_session_history: "No session history yet, starting a new session."
   mode_info_plan: " [plan mode: read-only tools only]"
   mode_info_bypass: " [bypass mode: skipping permission prompts]"
@@ -174,6 +175,7 @@ cost:
   line_with_price: "  Input:  {input} tokens  (~${input_cost})\nOutput: {output} tokens  (~${output_cost})\nTotal:  {total} tokens  (~${total_cost})"
   line_no_price: "  Input:  {input} tokens\nOutput: {output} tokens\nTotal:  {total} tokens"
   context_line: "Context: {pct}% ({estimated} / {window} tokens)"
+  cache_line: "Cache:  {read} read + {write} written tokens (~{saved_pct}% saved vs full-price input; cost included in the total above)"
   subagent_line: "Sub-agents: input {input} + output {output} = {total} tokens (tracked separately from the main session; cost not included in the estimate above)"
 
 agents:
