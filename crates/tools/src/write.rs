@@ -9,6 +9,11 @@ use std::sync::{Arc, Mutex};
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
+use crate::diff::{make_added, make_diff};
+
+/// diff 输出行数上限（含上下文/增删行），避免超长 diff 撑爆输出
+const MAX_DIFF_LINES: usize = 200;
+
 /// 跟踪已读取的文件路径（写前须已 Read）
 #[derive(Clone, Default)]
 pub struct ReadTracker(Arc<Mutex<HashSet<String>>>);
@@ -97,10 +102,20 @@ impl Tool for WriteTool {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+
+        // 写入前读取旧内容（若存在），用于生成 diff
+        let old_content = tokio::fs::read_to_string(&path).await.ok();
         tokio::fs::write(&path, inp.content.as_bytes()).await?;
         self.tracker.mark_read(&path_str);
 
-        Ok(ToolResult::ok(format!("已写入: {}", path.display())))
+        let detail = match &old_content {
+            Some(old) => make_diff(old, &inp.content, MAX_DIFF_LINES),
+            None => make_added(&inp.content, MAX_DIFF_LINES),
+        };
+        Ok(ToolResult::ok(format!(
+            "已写入: {}\n{detail}",
+            path.display()
+        )))
     }
 }
 

@@ -7,7 +7,7 @@ use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult}
 use wyj_config::{AgentMode, Config};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
-    MemoryStore, Session, SessionFile, SessionStore, ToolEvent,
+    MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator, ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
@@ -412,6 +412,26 @@ async fn main() -> Result<()> {
         agent
     };
 
+    // 配置会话标题生成器：持有 SessionStore 引用，首轮后后台生成标题写盘
+    let agent = if let Some(store) = &session_store_arc {
+        let provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
+            .unwrap_or_else(|e| {
+                tracing::warn!("标题生成器 provider 构建失败: {e}，回退到主 provider");
+                wyj_api::build_provider(&cfg).expect("主 provider 已在启动时构建成功")
+            });
+        let gen = Arc::new(SummaryGenerator::new(store.clone(), provider));
+        agent
+            .with_summary(gen)
+            .with_session_id(session_id.clone())
+            // headless 模式：标题生成后直接打印 OSC 0 设置终端窗口标题
+            .with_title_callback(|title| {
+                print!("\x1b]0;{}\x07", title);
+                let _ = io::stdout().flush();
+            })
+    } else {
+        agent
+    };
+
     let context_window = cfg.active_profile().context_window;
 
     if let Some(prompt) = cli.prompt {
@@ -461,6 +481,7 @@ async fn main() -> Result<()> {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 messages: session.messages.clone(),
+                title_generated: false,
             });
         }
     } else if cli.headless {
@@ -468,6 +489,7 @@ async fn main() -> Result<()> {
             agent,
             tool_ctx,
             history_store,
+            session_store_arc.clone(),
             session_id,
             cwd,
             initial_messages,
@@ -477,6 +499,8 @@ async fn main() -> Result<()> {
         let todo_store_for_rebuild = todo_store.clone();
         let agent_defs_for_rebuild = agent_defs.clone();
         let hub_for_rebuild = sub_agent_hub.clone();
+        let store_for_rebuild = session_store_arc.clone();
+        let sid_for_rebuild = session_id.clone();
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let mut new_agent = Agent::new(provider)
@@ -485,6 +509,19 @@ async fn main() -> Result<()> {
                 .with_claude_md(claude_md_for_rebuild.clone());
             if let Some(mem) = &memory_store_for_rebuild {
                 new_agent = new_agent.with_memory(mem.clone());
+            }
+            // 重建后保留会话标题生成能力
+            if let Some(store) = &store_for_rebuild {
+                let title_provider =
+                    wyj_api::build_provider_from_profile(cfg.active_profile(), None)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("重建后标题生成器 provider 构建失败: {e}");
+                            wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
+                        });
+                let gen = Arc::new(SummaryGenerator::new(store.clone(), title_provider));
+                new_agent = new_agent
+                    .with_summary(gen)
+                    .with_session_id(sid_for_rebuild.clone());
             }
             let mut reg = ToolRegistry::standard();
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
@@ -603,6 +640,7 @@ async fn repl(
     agent: Agent,
     ctx: ToolCtx,
     history_store: Option<HistoryStore>,
+    session_store: Option<Arc<SessionStore>>,
     session_id: String,
     cwd: std::path::PathBuf,
     initial_messages: Vec<wyj_api::types::Message>,
@@ -769,11 +807,26 @@ async fn repl(
     if let Some(hs) = &history_store {
         let _ = hs.append(&HistoryEntry {
             timestamp: now_iso(),
-            session_id,
+            session_id: session_id.clone(),
             input_tokens: session.total_input_tokens,
             output_tokens: session.total_output_tokens,
             turns,
             cwd: cwd.display().to_string(),
+        });
+    }
+    // 退出时保存 SessionFile，使 REPL 会话可通过 --resume 恢复
+    if let Some(store) = &session_store {
+        let _ = store.save(&SessionFile {
+            session_id,
+            title: extract_title(&session.messages),
+            last_preview: extract_preview(&session.messages),
+            cwd: cwd.display().to_string(),
+            timestamp: now_iso(),
+            turns,
+            input_tokens: session.total_input_tokens,
+            output_tokens: session.total_output_tokens,
+            messages: session.messages.clone(),
+            title_generated: false,
         });
     }
     println!("再见！");
