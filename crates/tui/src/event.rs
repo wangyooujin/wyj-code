@@ -73,6 +73,8 @@ pub enum AgentEvent {
     },
     /// 子 Agent 生命周期事件（SubAgentHub 汇聚转发）
     SubAgent(wyj_tools::SubAgentEvent),
+    /// 后台标题生成完成（首轮后 LLM 生成短标题，用于更新终端窗口标题）
+    TitleGenerated(String),
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

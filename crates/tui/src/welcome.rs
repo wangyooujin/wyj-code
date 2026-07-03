@@ -10,35 +10,71 @@
 //! - 1 行间隔
 //! - `Profile · Model`（左对齐，dim 灰）
 //! - `‹ cwd ›`（左对齐，dim 灰）
+//! - 1 行间隔
+//! - 💡 tip 行（进程启动时固定选定一条，dim 琥珀色）
+//! - 示例提问引导行（dim + 斜体）
+//! - 1 行间隔
+//! - 快捷键速查行（dim，窄终端下按优先级渐进丢弃）
 //!
 //! 渲染入口 [`render_welcome`]，由 `crates/tui/src/render.rs` 的
 //! `draw_chat` 在 `messages.is_empty() && streaming_buf.is_empty()` 时调用。
 
+use crate::render::{char_display_width, truncate_line};
 use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use wyj_i18n::tr;
 
 /// 欢迎页所需的运行时上下文（由调用方从 `AppState` 投影而来）
 ///
-/// 携带的字段刚好足够生成 Profile/Model + cwd 两行信息：
 /// - `model`：当前激活的 model 名称（已 fallback 到 profile 默认）
 /// - `cwd`：工作目录（建议调用方先缩短为 `~/...` 形式）
 /// - `profile`：当前激活的 Profile 名；为 None 或 `"default"` 时省略该段
+/// - `tip_index`：稳定的 tip 索引，由 `AppState::new()` 用 `pick_tip_index`
+///   在进程启动时生成一次并终身不变；`render_welcome` 内部对 `TIPS.len()`
+///   防御性取模，调用方传入任意值都不会 panic。
 pub struct WelcomeContext {
     pub model: String,
     pub cwd: String,
     pub profile: Option<String>,
+    pub tip_index: usize,
 }
 
 /// 顶部留白行数：让 logo 落在聊天区上 1/3 而不是几何中心。
 const TOP_BLANK_LINES: usize = 1;
 /// logo 与 Profile/Model 信息行之间的间隔行数。
 const LOGO_INFO_BLANK_LINES: usize = 1;
+/// Profile/CWD 信息行与 tip 行之间的间隔行数。
+const INFO_TIP_BLANK_LINES: usize = 1;
+/// tip/示例提问行与快捷键速查行之间的间隔行数。
+const TIP_SHORTCUT_BLANK_LINES: usize = 1;
 /// 信息行左缩进：与 logo 和下方信息行的左对齐基准一致，
 /// 让所有欢迎页元素在同一列起首（统一靠左）。
 const INFO_INDENT: &str = "  ";
 /// 隐藏默认 Profile 名：仅当 profile 名非空且不是 "default" 时才显示。
 const DEFAULT_PROFILE: &str = "default";
+
+/// 轮播 tips 的 i18n key 列表（文案见 `crates/i18n/locales/{zh,en}.yml` 的 `welcome.tip_*`）
+const TIPS: &[&str] = &[
+    "welcome.tip_0",
+    "welcome.tip_1",
+    "welcome.tip_2",
+    "welcome.tip_3",
+    "welcome.tip_4",
+];
+
+/// 快捷键速查行的 i18n key，按优先级从高到低排列（窄终端降级时从末尾开始丢弃）
+const SHORTCUT_HINTS: &[&str] = &[
+    "welcome.hint.help",
+    "welcome.hint.mode",
+    "welcome.hint.compact",
+    "welcome.hint.quit",
+];
+
+/// 根据外部熵值选取一个 tip 索引，纯函数、无副作用，便于单测。
+pub fn pick_tip_index(seed: u64) -> usize {
+    (seed as usize) % TIPS.len()
+}
 
 /// WYJ-CODE 艺术字（figlet standard 字体，6 行高 × 52 列宽）
 ///
@@ -61,8 +97,21 @@ const ASCII_LOGO: &[&str] = &[
 /// - `LOGO_INFO_BLANK_LINES` 行间隔
 /// - 1 行 Profile/Model（左缩进 `INFO_INDENT`，dim 灰）
 /// - 1 行 CWD（左缩进 `INFO_INDENT`，dim 灰，‹ › 包裹）
+/// - `INFO_TIP_BLANK_LINES` 行间隔
+/// - 1 行 tip（💡 + 轮播文案，dim 琥珀色）
+/// - 1 行示例提问引导（dim + 斜体）
+/// - `TIP_SHORTCUT_BLANK_LINES` 行间隔
+/// - 1 行快捷键速查（dim，窄终端下按优先级渐进丢弃 segment）
 pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static>> {
-    let total = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2;
+    let total = TOP_BLANK_LINES
+        + ASCII_LOGO.len()
+        + LOGO_INFO_BLANK_LINES
+        + 2
+        + INFO_TIP_BLANK_LINES
+        + 1
+        + 1
+        + TIP_SHORTCUT_BLANK_LINES
+        + 1;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
 
     // 0) 顶部留白（让 logo 落在聊天区上 1/3）
@@ -110,7 +159,55 @@ pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static
         Theme::dim(),
     )));
 
+    // 5) 信息行与 tip 行之间的间隔
+    for _ in 0..INFO_TIP_BLANK_LINES {
+        lines.push(Line::from(""));
+    }
+
+    // 6) tip 行（💡 + 轮播文案，越界索引防御性取模）
+    let available_width = (area_width as usize).saturating_sub(INFO_INDENT.len());
+    let tip_key = TIPS[ctx.tip_index % TIPS.len()];
+    let tip_text = truncate_line(&tr(tip_key), available_width.saturating_sub(2));
+    lines.push(Line::from(Span::styled(
+        format!("{INFO_INDENT}💡 {tip_text}"),
+        Theme::welcome_tip(),
+    )));
+
+    // 7) 示例提问引导行
+    let placeholder_text = truncate_line(&tr("welcome.placeholder"), available_width);
+    lines.push(Line::from(Span::styled(
+        format!("{INFO_INDENT}{placeholder_text}"),
+        Theme::welcome_suggestion(),
+    )));
+
+    // 8) tip/示例提问行与快捷键行之间的间隔
+    for _ in 0..TIP_SHORTCUT_BLANK_LINES {
+        lines.push(Line::from(""));
+    }
+
+    // 9) 快捷键速查行（窄终端下按优先级渐进丢弃 segment）
+    let shortcuts_text = shortcuts_line(available_width);
+    lines.push(Line::from(Span::styled(
+        format!("{INFO_INDENT}{shortcuts_text}"),
+        Theme::dim(),
+    )));
+
     lines
+}
+
+/// 生成快捷键速查行文本：按 `SHORTCUT_HINTS` 优先级从高到低尝试拼接，
+/// 放不下时从最低优先级（数组末尾）开始依次丢弃 segment；
+/// 若连 1 个 segment 都放不下，返回空字符串（该行整体空白占位）。
+fn shortcuts_line(available_width: usize) -> String {
+    let hints: Vec<String> = SHORTCUT_HINTS.iter().map(|key| tr(key)).collect();
+    for take in (1..=hints.len()).rev() {
+        let candidate = hints[..take].join(" · ");
+        let width: usize = candidate.chars().map(char_display_width).sum();
+        if width <= available_width {
+            return candidate;
+        }
+    }
+    String::new()
 }
 
 /// 计算 logo 第 `col` 列的 RGB 颜色（在 [START..END] 范围内线性插值）
@@ -220,6 +317,7 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             cwd: "/Users/foo/projects/bar".to_string(),
             profile: Some("default".to_string()),
+            tip_index: 0,
         }
     }
 
@@ -228,6 +326,7 @@ mod tests {
             model: "glm-5.2".to_string(),
             cwd: "/Users/foo".to_string(),
             profile: Some("glm-cheap".to_string()),
+            tip_index: 0,
         }
     }
 
@@ -239,11 +338,19 @@ mod tests {
     fn render_welcome_total_lines_is_fixed() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let expected = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2;
+        let expected = TOP_BLANK_LINES
+            + ASCII_LOGO.len()
+            + LOGO_INFO_BLANK_LINES
+            + 2
+            + INFO_TIP_BLANK_LINES
+            + 1
+            + 1
+            + TIP_SHORTCUT_BLANK_LINES
+            + 1;
         assert_eq!(
             lines.len(),
             expected,
-            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 间隔 {LOGO_INFO_BLANK_LINES} + 信息 2）",
+            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 间隔 {LOGO_INFO_BLANK_LINES} + 信息 2 + 间隔 {INFO_TIP_BLANK_LINES} + tip 1 + 示例 1 + 间隔 {TIP_SHORTCUT_BLANK_LINES} + 快捷键 1）",
             expected,
             ASCII_LOGO.len()
         );
@@ -552,5 +659,111 @@ mod tests {
             mg,
             mb
         );
+    }
+
+    fn tip_line_idx() -> usize {
+        TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2 + INFO_TIP_BLANK_LINES
+    }
+
+    fn placeholder_line_idx() -> usize {
+        tip_line_idx() + 1
+    }
+
+    fn shortcuts_line_idx() -> usize {
+        placeholder_line_idx() + 1 + TIP_SHORTCUT_BLANK_LINES
+    }
+
+    #[test]
+    fn render_welcome_tip_line_contains_selected_tip_text() {
+        let mut ctx = sample_ctx();
+        ctx.tip_index = 2;
+        let lines = render_welcome(&ctx, 120);
+        let text = collect_text(&lines[tip_line_idx()]);
+        assert!(
+            text.contains(&tr(TIPS[2])),
+            "tip 行应包含 tip_index=2 对应的文案；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_tip_index_wraps_out_of_range() {
+        let mut ctx = sample_ctx();
+        ctx.tip_index = 999;
+        let lines = render_welcome(&ctx, 120);
+        let text = collect_text(&lines[tip_line_idx()]);
+        let expected = tr(TIPS[999 % TIPS.len()]);
+        assert!(
+            text.contains(&expected),
+            "越界 tip_index 应对 TIPS.len() 取模；实际：{:?}，期望包含：{:?}",
+            text,
+            expected
+        );
+    }
+
+    #[test]
+    fn render_welcome_placeholder_suggestion_line_present() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let text = collect_text(&lines[placeholder_line_idx()]);
+        assert!(
+            text.contains(&tr("welcome.placeholder")),
+            "示例提问行应包含 welcome.placeholder 文案；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_shortcuts_row_present() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let text = collect_text(&lines[shortcuts_line_idx()]);
+        assert!(
+            text.contains(&tr("welcome.hint.help")),
+            "快捷键行应包含 help 提示；实际：{:?}",
+            text
+        );
+        assert!(
+            text.contains(&tr("welcome.hint.mode")),
+            "快捷键行应包含 mode 切换提示；实际：{:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn render_welcome_shortcuts_row_degrades_on_narrow_width() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 20);
+        let text = collect_text(&lines[shortcuts_line_idx()]);
+        let width: usize = text.chars().map(char_display_width).sum();
+        assert!(
+            width <= 20,
+            "极窄终端下快捷键行不应超宽；实际宽度 {}：{:?}",
+            width,
+            text
+        );
+    }
+
+    #[test]
+    fn pick_tip_index_always_in_bounds() {
+        for seed in [0u64, u64::MAX, 12345] {
+            assert!(pick_tip_index(seed) < TIPS.len());
+        }
+    }
+
+    #[test]
+    fn render_welcome_total_lines_stable_across_all_tips() {
+        let base_total = render_welcome(&sample_ctx(), 120).len();
+        for idx in 0..TIPS.len() {
+            let mut ctx = sample_ctx();
+            ctx.tip_index = idx;
+            let lines = render_welcome(&ctx, 120);
+            assert_eq!(
+                lines.len(),
+                base_total,
+                "tip_index={idx} 不应改变总行数；实际 {}",
+                lines.len()
+            );
+        }
     }
 }

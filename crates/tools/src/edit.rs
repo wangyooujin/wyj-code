@@ -7,6 +7,11 @@ use serde_json::Value;
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
+use crate::diff::make_diff;
+
+/// diff 输出行数上限（含上下文/增删行），避免超长 diff 撑爆输出
+const MAX_DIFF_LINES: usize = 200;
+
 pub struct EditTool;
 
 #[derive(Deserialize)]
@@ -93,8 +98,9 @@ impl Tool for EditTool {
         tokio::fs::write(&path, new_content.as_bytes()).await?;
 
         let replaced = if inp.replace_all { count } else { 1 };
+        let diff = make_diff(&content, &new_content, MAX_DIFF_LINES);
         Ok(ToolResult::ok(format!(
-            "已替换 {replaced} 处: {}",
+            "已替换 {replaced} 处: {}\n{diff}",
             path.display()
         )))
     }

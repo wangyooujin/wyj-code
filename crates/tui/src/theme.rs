@@ -137,4 +137,20 @@ impl Theme {
     pub const WELCOME_LOGO_GRADIENT_MID: Color = Color::Rgb(225, 160, 85);
     /// 渐变终点：暖黄
     pub const WELCOME_LOGO_GRADIENT_END: Color = Color::Rgb(240, 200, 80);
+
+    // ── 欢迎页新增元素（tips / 示例提问 / 快捷键）───────────────────────────
+    /// tips 提示行强调色：柔和琥珀黄，呼应 💡 图标，与 WARNING 语义色区分开
+    pub const WELCOME_TIP: Color = Color::Rgb(229, 192, 123);
+
+    /// tips 提示行样式
+    pub fn welcome_tip() -> Style {
+        Style::default().fg(Self::WELCOME_TIP)
+    }
+
+    /// 示例提问建议行样式：dim + 斜体，区别于输入框真实 placeholder
+    pub fn welcome_suggestion() -> Style {
+        Style::default()
+            .fg(Self::INACTIVE)
+            .add_modifier(Modifier::ITALIC)
+    }
 }
