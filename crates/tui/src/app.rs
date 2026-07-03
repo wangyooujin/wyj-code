@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,6 +199,8 @@ pub struct SubAgentUiState {
     pub tool_log: Vec<SubToolLine>,
     /// 父 Agent 的 ToolResult 消息是否已生成（决定是否还要画动态 ⎿ 行）
     pub has_result: bool,
+    /// 完成/中断时间；None 表示仍在运行，用于面板定格计时
+    pub finished_at: Option<Instant>,
 }
 
 impl SubAgentUiState {
@@ -1238,6 +1240,17 @@ fn try_resolve_path(s: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// 粘贴后在输入框光标处显示的瞬时提示
+#[derive(Debug, Clone)]
+pub(crate) struct PasteHint {
+    pub(crate) text: String,
+    pub(crate) expires_at: Instant,
+    pub(crate) cursor_row: usize,
+    pub(crate) cursor_col: usize,
+}
+
+const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
+
 /// 全局 UI 状态
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
@@ -1321,6 +1334,8 @@ pub struct AppState {
     pub scrollbar_area: Rect,
     /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
     pub injector: Option<mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>>,
+    /// 最近一次粘贴的瞬时提示（在输入框光标处显示）
+    pub(crate) paste_hint: Option<PasteHint>,
     /// 排队中尚未被 Agent 消费的补充消息（文本 + 附件），用于状态栏提示计数、
     /// 消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
     pub pending_queue: Vec<(String, Vec<Attachment>)>,
@@ -1335,6 +1350,8 @@ pub struct AppState {
     pub sub_output_tokens: u32,
     /// 子 Agent 生命周期管理中心（中断/退出清理用）
     pub hub: Arc<wyj_tools::SubAgentHub>,
+    /// 欢迎页 tip 轮播索引：进程启动时选定一次，本次生命周期内保持不变
+    pub welcome_tip_idx: usize,
 }
 
 impl AppState {
@@ -1346,6 +1363,13 @@ impl AppState {
         config: Config,
         hub: Arc<wyj_tools::SubAgentHub>,
     ) -> Self {
+        let welcome_tip_idx = {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64)
+                .unwrap_or(0);
+            crate::welcome::pick_tip_index(nanos ^ (std::process::id() as u64))
+        };
         Self {
             messages: vec![],
             streaming_buf: String::new(),
@@ -1396,12 +1420,14 @@ impl AppState {
             turn_start_output_tokens: 0,
             scrollbar_area: Rect::default(),
             injector: None,
+            paste_hint: None,
             pending_queue: vec![],
             sub_agents: std::collections::BTreeMap::new(),
             pending_bg_reminders: vec![],
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             hub,
+            welcome_tip_idx,
         }
     }
 
@@ -1410,6 +1436,20 @@ impl AppState {
         self.sub_agents
             .values()
             .any(|s| s.status == SubAgentStatus::Running)
+    }
+
+    /// 子 Agent 完成后在面板定格显示的时长
+    const SUB_AGENT_HOLD: Duration = Duration::from_secs(2);
+
+    /// 面板可见的子 Agent（Running + 完成 2s 内定格），按 BTreeMap 自然顺序（启动顺序）
+    pub fn visible_sub_agents(&self) -> Vec<(&u64, &SubAgentUiState)> {
+        self.sub_agents
+            .iter()
+            .filter(|(_, s)| match s.finished_at {
+                None => true, // Running
+                Some(t) => t.elapsed() < Self::SUB_AGENT_HOLD,
+            })
+            .collect()
     }
 
     /// 中断当前正在运行的 Agent，保留已输出内容并标记 [已中断]
@@ -1424,6 +1464,7 @@ impl AppState {
                     s.status = SubAgentStatus::Interrupted;
                     s.final_elapsed = Some(s.started_at.elapsed().as_secs_f64());
                     s.current_tool = None;
+                    s.finished_at = Some(Instant::now());
                 }
             }
         }
@@ -1684,6 +1725,13 @@ impl AppState {
 
             AgentEvent::SubAgent(ev) => self.apply_sub_agent_event(ev),
 
+            AgentEvent::TitleGenerated(title) => {
+                // 后台标题生成完成 → 更新终端窗口标题（OSC 0）
+                // 标题已由 SummaryGenerator 直接写盘，这里仅更新终端显示
+                let _ = write!(io::stdout(), "\x1b]0;{title}\x07");
+                let _ = io::stdout().flush();
+            }
+
             AgentEvent::ModelsFetched {
                 entry_idx,
                 field_idx,
@@ -1751,6 +1799,7 @@ impl AppState {
                         current_tool: None,
                         tool_log: vec![],
                         has_result: false,
+                        finished_at: None,
                     },
                 );
             }
@@ -1822,6 +1871,7 @@ impl AppState {
                     };
                     s.final_elapsed = Some(elapsed_secs);
                     s.current_tool = None;
+                    s.finished_at = Some(Instant::now());
                 }
                 if background {
                     // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
@@ -2005,6 +2055,7 @@ fn wire_tool_callback(
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
 ) -> Agent {
     let usage_tx = tool_tx.clone();
+    let title_tx = tool_tx.clone();
     agent
         .with_tool_callback(move |event: ToolEvent| match event {
             ToolEvent::Start { id, name, input } => {
@@ -2040,6 +2091,9 @@ fn wire_tool_callback(
                 input_tokens,
                 output_tokens,
             });
+        })
+        .with_title_callback(move |title: String| {
+            let _ = title_tx.try_send(AgentEvent::TitleGenerated(title));
         })
 }
 
@@ -2459,6 +2513,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
 
+    // 设置初始终端窗口标题（退出时恢复）
+    let _ = write!(io::stdout(), "\x1b]0;wyj-code\x07");
+    let _ = io::stdout().flush();
+
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (ui_ask_tx, mut ui_ask_rx) = mpsc::channel::<UiAskRequest>(8);
 
@@ -2473,6 +2531,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let cmd_registry = standard_registry_with_skills(&home_dir, &cwd);
 
     // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
+    // （title_cb 也在 wire_tool_callback 内部设置，确保 /model 重建后仍生效）
     let agent = wire_tool_callback(agent, agent_tx.clone(), todo_store.clone());
 
     // 用 RwLock 包装 agent，支持 /model 热切换
@@ -2530,6 +2589,21 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             state.apply_agent_event(AgentEvent::SubAgent(ev));
         }
 
+        // 移除定格超期的子 Agent 条目，防止 BTreeMap 无限增长
+        state.sub_agents.retain(|_, s| {
+            s.finished_at
+                .map_or(true, |t| t.elapsed() < AppState::SUB_AGENT_HOLD)
+        });
+
+        // 清除过期的粘贴提示
+        if state
+            .paste_hint
+            .as_ref()
+            .is_some_and(|h| h.expires_at <= Instant::now())
+        {
+            state.paste_hint = None;
+        }
+
         // 竞态兜底：极小概率下，用户提交补充消息的时机恰好晚于 run_turn 最后一次
         // 排空注入队列的检查，导致该轮 TurnDone/Error 已到达而消息仍留在
         // pending_queue 里未被消费。此时视同用户在轮次结束的瞬间正常发送。
@@ -2576,9 +2650,17 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             if let Some(store) = &session_store {
                 let sess = session.lock().await;
                 if !sess.messages.is_empty() {
+                    // 保留已有的 LLM 生成标题（若已生成则不覆盖为启发式 title）
+                    let (title, title_generated) = match session_store
+                        .as_ref()
+                        .and_then(|s| s.load(&current_session_id).ok())
+                    {
+                        Some(f) if f.title_generated => (f.title, true),
+                        _ => (extract_title(&sess.messages), false),
+                    };
                     let sf = SessionFile {
                         session_id: current_session_id.clone(),
-                        title: extract_title(&sess.messages),
+                        title,
                         last_preview: extract_preview(&sess.messages),
                         cwd: cwd.display().to_string(),
                         timestamp: now_iso(),
@@ -2586,6 +2668,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         input_tokens: sess.total_input_tokens,
                         output_tokens: sess.total_output_tokens,
                         messages: sess.messages.clone(),
+                        title_generated,
                     };
                     let _ = store.save(&sf);
                 }
@@ -2628,6 +2711,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         }
                     }
 
+                    let expires_at = Instant::now() + PASTE_HINT_DURATION;
+                    let mut hint: Option<PasteHint> = None;
+
                     // 优先检查剪贴板是否有图片
                     let has_image = match arboard::Clipboard::new() {
                         Ok(mut cb) => match cb.get_image() {
@@ -2647,6 +2733,22 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             data: b64,
                                             preview_label: label,
                                         });
+                                        let text = format!(
+                                            "[{}]",
+                                            wyj_i18n::tr_fmt(
+                                                "input.paste_image",
+                                                &[
+                                                    ("width", &img.width.to_string()),
+                                                    ("height", &img.height.to_string()),
+                                                ]
+                                            )
+                                        );
+                                        hint = Some(PasteHint {
+                                            text,
+                                            expires_at,
+                                            cursor_row: input.cursor_row,
+                                            cursor_col: input.cursor_col,
+                                        });
                                         true
                                     }
                                     Err(_) => false,
@@ -2660,15 +2762,49 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     if !has_image {
                         // 文件路径检测
                         if let Some(path) = try_resolve_path(pasted.trim()) {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
                             state.pending_attachments.push(Attachment::File { path });
+                            let text = format!(
+                                "[{}]",
+                                wyj_i18n::tr_fmt("input.paste_file", &[("name", &name)])
+                            );
+                            hint = Some(PasteHint {
+                                text,
+                                expires_at,
+                                cursor_row: input.cursor_row,
+                                cursor_col: input.cursor_col,
+                            });
                         } else {
                             // 普通文字粘贴
                             input.insert_text(&pasted);
                             update_slash_completions(&mut state, &input, &cmd_registry);
+                            if !pasted.is_empty() {
+                                let count = pasted.chars().count().to_string();
+                                let text = format!(
+                                    "[{}]",
+                                    wyj_i18n::tr_fmt("input.paste_text", &[("count", &count)])
+                                );
+                                hint = Some(PasteHint {
+                                    text,
+                                    expires_at,
+                                    cursor_row: input.cursor_row,
+                                    cursor_col: input.cursor_col,
+                                });
+                            }
                         }
+                    }
+
+                    if let Some(h) = hint {
+                        state.paste_hint = Some(h);
                     }
                 }
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    // 任意按键都清除粘贴提示（提示本就是瞬时的）
+                    state.paste_hint = None;
+
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {
                         match key.code {
@@ -2694,9 +2830,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                         if let Some(store) = &session_store {
                                             let sess = session.lock().await;
                                             if !sess.messages.is_empty() {
+                                                let (title, title_generated) = match store
+                                                    .load(&current_session_id)
+                                                    .ok()
+                                                {
+                                                    Some(f) if f.title_generated => (f.title, true),
+                                                    _ => (extract_title(&sess.messages), false),
+                                                };
                                                 let _ = store.save(&SessionFile {
                                                     session_id: current_session_id.clone(),
-                                                    title: extract_title(&sess.messages),
+                                                    title,
                                                     last_preview: extract_preview(&sess.messages),
                                                     cwd: cwd.display().to_string(),
                                                     timestamp: now_iso(),
@@ -2704,6 +2847,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     input_tokens: sess.total_input_tokens,
                                                     output_tokens: sess.total_output_tokens,
                                                     messages: sess.messages.clone(),
+                                                    title_generated,
                                                 });
                                             }
                                         }
@@ -2727,9 +2871,18 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             {
                                                 let sess = session.lock().await;
                                                 if !sess.messages.is_empty() {
+                                                    let (title, title_generated) = match store
+                                                        .load(&current_session_id)
+                                                        .ok()
+                                                    {
+                                                        Some(f) if f.title_generated => {
+                                                            (f.title, true)
+                                                        }
+                                                        _ => (extract_title(&sess.messages), false),
+                                                    };
                                                     let _ = store.save(&SessionFile {
                                                         session_id: current_session_id.clone(),
-                                                        title: extract_title(&sess.messages),
+                                                        title,
                                                         last_preview: extract_preview(
                                                             &sess.messages,
                                                         ),
@@ -2739,6 +2892,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                         input_tokens: sess.total_input_tokens,
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
+                                                        title_generated,
                                                     });
                                                 }
                                             }
@@ -3448,6 +3602,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
+                                    // PlanApprovalRequest 曾把 is_thinking 设为 false 以暂停
+                                    // spinner；批准后 Agent 会继续执行后续工具，必须恢复
+                                    // is_thinking，否则输入框 spinner 与 TaskList 图标都会冻结。
+                                    state.is_thinking = true;
                                     state.messages.push(ChatMessage::system(
                                         "已批准计划，切换至执行模式。".to_string(),
                                     ));
@@ -4107,9 +4265,18 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             {
                                                 let sess = session.lock().await;
                                                 if !sess.messages.is_empty() {
+                                                    let (title, title_generated) = match store
+                                                        .load(&current_session_id)
+                                                        .ok()
+                                                    {
+                                                        Some(f) if f.title_generated => {
+                                                            (f.title, true)
+                                                        }
+                                                        _ => (extract_title(&sess.messages), false),
+                                                    };
                                                     let _ = store.save(&SessionFile {
                                                         session_id: current_session_id.clone(),
-                                                        title: extract_title(&sess.messages),
+                                                        title,
                                                         last_preview: extract_preview(
                                                             &sess.messages,
                                                         ),
@@ -4119,6 +4286,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                         input_tokens: sess.total_input_tokens,
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
+                                                        title_generated,
                                                     });
                                                 }
                                             }
@@ -4406,12 +4574,34 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     state.scroll_offset = 0;
                                 }
                                 'o' => {
-                                    // Ctrl+O — 展开/折叠最后一条工具结果（对齐 Claude Code）
-                                    if let Some(last_tool) = state
-                                        .messages
-                                        .iter_mut()
-                                        .rev()
-                                        .find(|m| matches!(m.role, MessageRole::ToolResult))
+                                    // Ctrl+O — 展开/折叠最后一条「可折叠」工具结果（对齐 Claude Code）
+                                    // 可折叠 = ToolResult && 非 Edit/Write（永不折叠）&& 内容超 3 行。
+                                    // 与 render.rs 的 last_collapsible_idx 判定保持一致。
+                                    if let Some(last_tool) =
+                                        state.messages.iter_mut().rev().find(|m| {
+                                            if !matches!(m.role, MessageRole::ToolResult) {
+                                                return false;
+                                            }
+                                            if matches!(
+                                                m.tool_name.as_deref(),
+                                                Some("Edit") | Some("Write")
+                                            ) {
+                                                return false;
+                                            }
+                                            let summary = if m.display_summary.is_empty() {
+                                                m.content
+                                                    .lines()
+                                                    .next()
+                                                    .unwrap_or("done")
+                                                    .trim()
+                                                    .to_string()
+                                            } else {
+                                                m.display_summary.clone()
+                                            };
+                                            !m.content.is_empty()
+                                                && m.content != summary
+                                                && m.content.lines().count() > 3
+                                        })
                                     {
                                         last_tool.expanded = !last_tool.expanded;
                                     }
@@ -4496,9 +4686,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     if let Some(store) = &session_store {
         if let Ok(sess) = session.try_lock() {
             if !sess.messages.is_empty() {
+                let (title, title_generated) = match store.load(&current_session_id).ok() {
+                    Some(f) if f.title_generated => (f.title, true),
+                    _ => (extract_title(&sess.messages), false),
+                };
                 let _ = store.save(&SessionFile {
                     session_id: current_session_id.clone(),
-                    title: extract_title(&sess.messages),
+                    title,
                     last_preview: extract_preview(&sess.messages),
                     cwd: cwd.display().to_string(),
                     timestamp: now_iso(),
@@ -4506,11 +4700,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     input_tokens: sess.total_input_tokens,
                     output_tokens: sess.total_output_tokens,
                     messages: sess.messages.clone(),
+                    title_generated,
                 });
                 resumable_session_id = Some(current_session_id.clone());
             }
         }
     }
+
+    // 恢复终端窗口标题
+    let _ = write!(io::stdout(), "\x1b]0;\x07");
+    let _ = io::stdout().flush();
 
     Ok(resumable_session_id)
 }

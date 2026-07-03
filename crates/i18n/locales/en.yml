@@ -12,6 +12,10 @@ skill:
     desc: "Explain code or a concept in detail"
   commit:
     desc: "Generate a commit message and run git commit"
+input:
+  paste_image: "image {width}×{height}"
+  paste_file: "file {name}"
+  paste_text: "pasted {count} chars"
 system_prompt:
   default: |-
     You are a professional AI programming assistant, skilled at analyzing code, solving technical problems, and writing programs.
@@ -69,7 +73,7 @@ subagent:
   bg_done_reminder: "<system-reminder>Background agent {id} ({type}: {desc}) finished after {elapsed}s. Result:\n\n{result}</system-reminder>"
   bg_done_notice: "Background agent {id} ({type}: {desc}) finished; result will be injected into the conversation"
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
-  panel_title: " Agents [{count} running] "
+  panel_title: " agents [{count}] "
   inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
@@ -108,51 +112,54 @@ main:
 help:
   desc: "Show all available commands and keyboard shortcuts"
   body: |-
-    wyj-code v{version} — terminal AI coding assistant
+    # wyj-code v{version} — terminal AI coding assistant
 
-    Commands:
-    /help              Show this help
-    /clear             Clear conversation history
-    /compact [hint]    Manually compact context to reduce token usage
-    /config            Open the configuration settings panel (log_level/language, global settings)
-    /cost              Show token usage and cost estimate for this session (sub-agent usage listed separately)
-    /agents            List available subagent types (built-in general-purpose/Explore/Plan +
-                       custom *.md definitions under ~/.claude/agents and the project's .claude/agents)
-    /doctor            Diagnose environment (API Key / config / memory)
-    /memory            Open the CLAUDE.md memory panel (lists all files in effect, pick one
-                       to open in your system editor; includes an auto-memory toggle and index)
-    /model [profile]   Manage call profiles (provider/model/base_url/api_key, etc.):
-                       no arg opens the profile manager (new/edit/delete/switch);
-                       with a profile name, switches to it directly, e.g. /model glm-cheap
-    /plan              Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
-    /mode [mode]       Switch run mode (normal / plan / bypass)
-    /resume [id]       Resume a past session (no arg = picker, id = resume directly)
-    /sessions          View and switch between past sessions
-    /init              Have the Agent explore the project and generate/merge CLAUDE.md
-    /quit              Quit wyj-code
+    ## Commands
 
-    Keyboard shortcuts:
-    Enter              Send message
-    Shift+Enter        Insert newline
-    Ctrl+C             Interrupt current task (press twice to quit)
-    Esc                Interrupt current task
-    Shift+Tab          Cycle mode Normal → Plan → Bypass
-    Ctrl+O             Expand/collapse tool result
-    Ctrl+T             Expand/collapse task list
-    Ctrl+L             Clear screen (keeps conversation history)
-    Ctrl+A / Ctrl+E    Jump to start / end of line
-    Ctrl+K             Delete from cursor to end of line
-    Ctrl+U             Delete from cursor to start of line
-    Ctrl+W             Delete previous word
-    PageUp / PageDown  Scroll chat area
-    ↑ / ↓              Browse input history
-    /                  Command completion (Tab to confirm, Esc to cancel)
-    !<command>         Run a Bash command directly
+    - `/help` — Show this help
+    - `/clear` — Clear conversation history
+    - `/compact [hint]` — Manually compact context to reduce token usage
+    - `/config` — Open the configuration settings panel (log_level/language)
+    - `/cost` — Show token usage and cost estimate for this session (sub-agent usage listed separately)
+    - `/agents` — List available subagent types (built-in + custom *.md definitions)
+    - `/doctor` — Diagnose environment (API Key / config / memory)
+    - `/memory` — Open the CLAUDE.md memory panel
+    - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
+    - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
+    - `/mode [mode]` — Switch run mode (normal / plan / bypass)
+    - `/resume [id]` — Resume a past session (no arg = picker)
+    - `/sessions` — View and switch between past sessions
+    - `/init` — Have the Agent explore the project and generate/merge CLAUDE.md
+    - `/quit` — Quit wyj-code
 
-    Modes:
-    Normal    Default mode, shows a permission dialog before each tool call
-    Plan      Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
-    Bypass    Skips all permission prompts, auto-approves every tool call
+    ---
+
+    ## Keyboard shortcuts
+
+    - `Enter` — Send message
+    - `Shift+Enter` — Insert newline
+    - `Ctrl+C` — Interrupt current task (press twice to quit)
+    - `Esc` — Interrupt current task
+    - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
+    - `Ctrl+O` — Expand/collapse tool result
+    - `Ctrl+T` — Expand/collapse task list
+    - `Ctrl+L` — Clear screen (keeps conversation history)
+    - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
+    - `Ctrl+K` — Delete from cursor to end of line
+    - `Ctrl+U` — Delete from cursor to start of line
+    - `Ctrl+W` — Delete previous word
+    - `PageUp` / `PageDown` — Scroll chat area
+    - `↑` / `↓` — Browse input history
+    - `/` — Command completion (Tab to confirm, Esc to cancel)
+    - `!<command>` — Run a Bash command directly
+
+    ---
+
+    ## Modes
+
+    - `Normal` — Default mode, shows a permission dialog before each tool call
+    - `Plan` — Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
+    - `Bypass` — Skips all permission prompts, auto-approves every tool call
 
 clear:
   desc: "Clear the current conversation history"
@@ -337,3 +344,13 @@ welcome:
   placeholder: 'Try "fix this bug" or ask anything…'
   # 旧的 greeting key 已废弃，欢迎页改为展示 Profile/Model + cwd 两行信息看板
   greeting: ''
+  tip_0: '/compact manually compresses the context to save tokens'
+  tip_1: '/clear wipes the conversation to start a fresh task'
+  tip_2: 'Type @ in your message to quickly reference a file in the project'
+  tip_3: 'For complex tasks, ask the agent to spin up SubAgents to explore in parallel'
+  tip_4: '/memory views and manages cross-session memory (CLAUDE.md)'
+  hint:
+    help: '/help for help'
+    compact: '/compact to shrink context'
+    mode: 'Shift+Tab to switch mode'
+    quit: 'Ctrl+C to quit'

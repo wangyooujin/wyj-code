@@ -279,32 +279,42 @@ impl InputBox {
             .max(1)
     }
 
-    /// 光标的视觉位置 (visual_row, visual_col)，考虑折行
-    pub fn cursor_visual_pos(&self, width: usize) -> (usize, usize) {
+    /// 任意 (row, col) 的视觉位置 (visual_row, visual_col)，考虑折行
+    pub fn visual_pos_for(&self, row: usize, col: usize, width: usize) -> (usize, usize) {
         if width == 0 {
-            return (self.cursor_row, self.cursor_display_col());
+            let line = self.lines.get(row).unwrap_or(&self.lines[self.cursor_row]);
+            let col = col.min(line.chars().count());
+            let display_col = line.chars().take(col).map(char_width).sum();
+            return (row, display_col);
         }
-        let prev_vis_rows: usize = (0..self.cursor_row)
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let prev_vis_rows: usize = (0..row)
             .map(|r| Self::line_visual_rows(&self.lines[r], width))
             .sum();
-        let line = &self.lines[self.cursor_row];
+        let line = &self.lines[row];
+        let col = col.min(line.chars().count());
         let bounds = Self::wrap_boundaries(line, width);
-        let last_seg = bounds.len() - 2;
+        let last_seg = bounds.len().saturating_sub(2);
         let mut seg = last_seg;
         for (i, end) in bounds[1..].iter().enumerate() {
-            if self.cursor_col < *end || i == last_seg {
+            if col < *end || i == last_seg {
                 seg = i;
                 break;
             }
         }
         let seg_start = bounds[seg];
-        let col: usize = line
+        let display_col: usize = line
             .chars()
             .skip(seg_start)
-            .take(self.cursor_col.saturating_sub(seg_start))
+            .take(col.saturating_sub(seg_start))
             .map(char_width)
             .sum();
-        (prev_vis_rows + seg, col)
+        (prev_vis_rows + seg, display_col)
+    }
+
+    /// 光标的视觉位置 (visual_row, visual_col)，考虑折行
+    pub fn cursor_visual_pos(&self, width: usize) -> (usize, usize) {
+        self.visual_pos_for(self.cursor_row, self.cursor_col, width)
     }
 
     /// 按显示宽度手动折行，供渲染使用：必须与 [`cursor_visual_pos`] 用同一套算法，

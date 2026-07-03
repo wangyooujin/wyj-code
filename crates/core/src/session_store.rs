@@ -17,6 +17,9 @@ pub struct SessionFile {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub messages: Vec<Message>,
+    /// 是否已通过 LLM 生成过标题（首轮后生成一次，之后固定）
+    #[serde(default)]
+    pub title_generated: bool,
 }
 
 /// 会话摘要（不含消息体，用于列表展示）
@@ -30,6 +33,8 @@ pub struct SessionMeta {
     pub turns: usize,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub title_generated: bool,
 }
 
 impl From<SessionFile> for SessionMeta {
@@ -43,6 +48,7 @@ impl From<SessionFile> for SessionMeta {
             turns: f.turns,
             input_tokens: f.input_tokens,
             output_tokens: f.output_tokens,
+            title_generated: f.title_generated,
         }
     }
 }

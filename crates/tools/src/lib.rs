@@ -4,6 +4,7 @@ pub mod agent_hub;
 pub mod ask_question;
 mod bash;
 pub mod ctx;
+mod diff;
 mod edit;
 pub mod exit_plan_mode;
 mod glob;

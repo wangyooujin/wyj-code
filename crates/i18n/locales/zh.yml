@@ -12,6 +12,10 @@ skill:
     desc: "详细解释代码或概念"
   commit:
     desc: "生成提交信息并执行 git commit"
+input:
+  paste_image: "图片 {width}×{height}"
+  paste_file: "文件 {name}"
+  paste_text: "已粘贴 {count} 字符"
 system_prompt:
   default: |-
     你是一个专业的 AI 编程助手，擅长分析代码、解决技术问题、编写程序。
@@ -62,7 +66,7 @@ subagent:
   bg_done_reminder: "<system-reminder>后台 agent {id}（{type}: {desc}）已完成（耗时 {elapsed}s）。结果如下：\n\n{result}</system-reminder>"
   bg_done_notice: "后台 agent {id}（{type}: {desc}）已完成，结果将注入对话"
   waiting_bg: "等待 {count} 个后台 agent 完成…"
-  panel_title: " 子 Agent [{count} 运行中] "
+  panel_title: " agents [{count}] "
   inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
@@ -101,51 +105,54 @@ main:
 help:
   desc: "显示所有可用命令和快捷键"
   body: |-
-    wyj-code v{version} — 终端 AI 编程助手
+    # wyj-code v{version} — 终端 AI 编程助手
 
-    命令:
-    /help              显示此帮助
-    /clear             清空对话历史
-    /compact [提示]    手动压缩上下文，减少 token 消耗
-    /config            打开配置设置面板（log_level/language，全局设置）
-    /cost              显示本会话 token 用量与费用估算（含子 Agent 用量单列）
-    /agents            列出可用的 subagent 类型（内置 general-purpose/Explore/Plan +
-                       ~/.claude/agents 与项目 .claude/agents 下的自定义 *.md 定义）
-    /doctor            诊断环境（API Key / 配置 / 记忆）
-    /memory            打开 CLAUDE.md 记忆面板（列出全部生效文件，可选中打开系统编辑器
-                       编辑，含 auto-memory 开关与索引入口）
-    /model [分组名]    管理调用分组（provider/model/base_url/api_key 等）：
-                       无参数打开分组管理面板（新建/编辑/删除/切换）；
-                       带分组名直接切换到该分组，如 /model glm-cheap
-    /plan              切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
-    /mode [模式]       切换运行模式（normal / plan / bypass）
-    /resume [id]       恢复历史会话（无参数=选择器，有 id=直接恢复）
-    /sessions          查看和切换历史会话
-    /init              让 Agent 探索项目并生成/合并更新 CLAUDE.md
-    /quit              退出 wyj-code
+    ## 命令
 
-    快捷键:
-    Enter              发送消息
-    Shift+Enter        插入换行
-    Ctrl+C             中断当前任务（二次按下退出程序）
-    Esc                中断当前任务
-    Shift+Tab          循环切换模式 Normal → Plan → Bypass
-    Ctrl+O             展开/折叠工具结果
-    Ctrl+T             折叠/展开任务列表
-    Ctrl+L             清屏（保留对话历史）
-    Ctrl+A / Ctrl+E    跳到行首 / 行尾
-    Ctrl+K             删除光标到行尾
-    Ctrl+U             删除光标到行首
-    Ctrl+W             删除前一个词
-    PageUp / PageDown  滚动对话区
-    ↑ / ↓              浏览输入历史
-    /                  命令补全（Tab 确认，Esc 取消）
-    !<命令>            直接执行 Bash 命令
+    - `/help` — 显示此帮助
+    - `/clear` — 清空对话历史
+    - `/compact [提示]` — 手动压缩上下文，减少 token 消耗
+    - `/config` — 打开配置设置面板（log_level/language）
+    - `/cost` — 显示本会话 token 用量与费用估算（含子 Agent 用量单列）
+    - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
+    - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
+    - `/memory` — 打开 CLAUDE.md 记忆面板
+    - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
+    - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
+    - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
+    - `/resume [id]` — 恢复历史会话（无参数=选择器）
+    - `/sessions` — 查看和切换历史会话
+    - `/init` — 让 Agent 探索项目并生成/合并更新 CLAUDE.md
+    - `/quit` — 退出 wyj-code
 
-    模式:
-    Normal    默认模式，工具调用前弹出权限确认对话框
-    Plan      只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
-    Bypass    跳过所有权限确认，自动批准工具调用
+    ---
+
+    ## 快捷键
+
+    - `Enter` — 发送消息
+    - `Shift+Enter` — 插入换行
+    - `Ctrl+C` — 中断当前任务（二次按下退出程序）
+    - `Esc` — 中断当前任务
+    - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
+    - `Ctrl+O` — 展开/折叠工具结果
+    - `Ctrl+T` — 折叠/展开任务列表
+    - `Ctrl+L` — 清屏（保留对话历史）
+    - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
+    - `Ctrl+K` — 删除光标到行尾
+    - `Ctrl+U` — 删除光标到行首
+    - `Ctrl+W` — 删除前一个词
+    - `PageUp` / `PageDown` — 滚动对话区
+    - `↑` / `↓` — 浏览输入历史
+    - `/` — 命令补全（Tab 确认，Esc 取消）
+    - `!<命令>` — 直接执行 Bash 命令
+
+    ---
+
+    ## 模式
+
+    - `Normal` — 默认模式，工具调用前弹出权限确认对话框
+    - `Plan` — 只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
+    - `Bypass` — 跳过所有权限确认，自动批准工具调用
 
 clear:
   desc: "清空当前对话历史"
@@ -330,3 +337,13 @@ welcome:
   # 旧的 greeting key（~~欢迎回来~~ 删除线）已废弃，
   # 欢迎页改为展示 Profile/Model + cwd 两行信息看板
   greeting: ''
+  tip_0: '/compact 可以手动压缩对话上下文，减少 token 消耗'
+  tip_1: '/clear 清空当前对话历史，开始一个新任务'
+  tip_2: '在消息里输入 @ 可以快速引用项目里的文件'
+  tip_3: '复杂任务可以让 Agent 派生 SubAgent 并行探索，互不干扰主线程'
+  tip_4: '/memory 查看和管理跨会话记忆（CLAUDE.md）'
+  hint:
+    help: '/help 帮助'
+    compact: '/compact 压缩上下文'
+    mode: 'Shift+Tab 切换模式'
+    quit: 'Ctrl+C 退出'

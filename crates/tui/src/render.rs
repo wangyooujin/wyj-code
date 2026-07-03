@@ -18,6 +18,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::HashMap;
+use std::time::Instant;
 use wyj_config::AgentMode;
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::ClaudeMdSource;
@@ -51,7 +52,7 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
 }
 
 /// 字符显示宽度：CJK 全角 = 2，其余 = 1
-fn char_display_width(c: char) -> usize {
+pub(crate) fn char_display_width(c: char) -> usize {
     if c == '\t' {
         return 4;
     }
@@ -75,7 +76,7 @@ fn char_display_width(c: char) -> usize {
 }
 
 /// 截断超长字符串（按终端显示宽度，CJK 字符占 2 列）
-fn truncate_line(s: &str, max_cols: usize) -> String {
+pub(crate) fn truncate_line(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
@@ -255,14 +256,15 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         };
         return (h, BottomPanel::AskQuestion);
     }
-    // 子 Agent 聚合面板：有运行中的子 Agent 即显示（优先于任务列表）
-    let running = state
-        .sub_agents
-        .values()
-        .filter(|s| s.status == SubAgentStatus::Running)
-        .count();
-    if running > 0 {
-        let h = (running as u16 + 2).min(area_height);
+    // 子 Agent 聚合面板：有可见子 Agent 即显示（优先于任务列表）；
+    // >3 个时自动折叠为仅标题行
+    let visible = state.visible_sub_agents();
+    if !visible.is_empty() {
+        let h = if visible.len() > 3 {
+            2u16.min(area_height)
+        } else {
+            (visible.len() as u16 + 2).min(area_height)
+        };
         return (h, BottomPanel::SubAgents);
     }
     if let Some(items) = &state.current_todos {
@@ -314,6 +316,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                     Some(p.clone())
                 }
             },
+            tip_index: state.welcome_tip_idx,
         };
         let lines = crate::welcome::render_welcome(&ctx, content_area.width);
         let para = Paragraph::new(Text::from(lines))
@@ -330,7 +333,40 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let mut lines: Vec<Line<'static>> = vec![];
     let mut is_first_user = true;
 
-    for msg in &state.messages {
+    // 预扫描：找出最后一条「可折叠」的 ToolResult 索引。
+    // 可折叠 = ToolResult && 非 Edit/Write（Edit/Write 永不折叠）&& 内容超 3 行 && 未展开。
+    // 只有这一条会显示 "ctrl+o to expand/collapse" 文字提示，
+    // 其余可折叠的历史结果改用静默 ⋯N 标记，避免提示与快捷键行为错位。
+    let last_collapsible_idx: Option<usize> = state
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| {
+            if !matches!(m.role, MessageRole::ToolResult) {
+                return false;
+            }
+            if matches!(m.tool_name.as_deref(), Some("Edit") | Some("Write")) {
+                return false;
+            }
+            if m.expanded {
+                return false;
+            }
+            let summary = if m.display_summary.is_empty() {
+                m.content
+                    .lines()
+                    .next()
+                    .unwrap_or("done")
+                    .trim()
+                    .to_string()
+            } else {
+                m.display_summary.clone()
+            };
+            !m.content.is_empty() && m.content != summary && m.content.lines().count() > 3
+        })
+        .map(|(i, _)| i);
+
+    for (msg_idx, msg) in state.messages.iter().enumerate() {
         match msg.role {
             MessageRole::User => {
                 if !is_first_user {
@@ -468,13 +504,10 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                 // 展开/折叠详细内容（ctrl+o）
                 if !msg.content.is_empty() && msg.content != summary {
                     let content_lines: Vec<&str> = msg.content.lines().collect();
-                    let line_style = if msg.is_error {
-                        Theme::error()
-                    } else {
-                        Theme::tool_result()
-                    };
+                    let is_diff = matches!(msg.tool_name.as_deref(), Some("Edit") | Some("Write"));
 
-                    if msg.expanded {
+                    // Edit/Write：永不折叠，直接展开全部 diff，带 +/- 配色
+                    if is_diff {
                         lines.push(Line::from(Span::styled(
                             format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
                             Theme::dim(),
@@ -516,6 +549,82 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                                 )));
                             }
                         }
+                        // diff 行带配色：+ 绿、- 红、上下文 dim
+                        let max_lines = 60;
+                        for (i, l) in content_lines.iter().enumerate() {
+                            if i >= max_lines {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "       …({} more lines)",
+                                        content_lines.len() - max_lines
+                                    ),
+                                    Theme::dim(),
+                                )));
+                                break;
+                            }
+                            let style = if l.starts_with("+ ") {
+                                Style::default().fg(Color::Green)
+                            } else if l.starts_with("- ") {
+                                Theme::error()
+                            } else {
+                                Theme::dim()
+                            };
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "       {}",
+                                    truncate_line(l, max_content_width.saturating_sub(8))
+                                ),
+                                style,
+                            )));
+                        }
+                    } else if msg.expanded {
+                        // 已展开（非 Edit/Write）
+                        lines.push(Line::from(Span::styled(
+                            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
+                            Theme::dim(),
+                        )));
+                        // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
+                        if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
+                            for tl in &s.tool_log {
+                                let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
+                                    (None, _) => ("…".to_string(), Theme::dim()),
+                                    (Some(e), true) => {
+                                        (format!("✗ {}", format_hms(e)), Theme::error())
+                                    }
+                                    (Some(e), false) => (
+                                        format!("✓ {}", format_hms(e)),
+                                        Style::default().fg(Color::Green),
+                                    ),
+                                };
+                                let call = if tl.arg_summary.is_empty() {
+                                    tl.tool_name.clone()
+                                } else {
+                                    format!("{}({})", tl.tool_name, tl.arg_summary)
+                                };
+                                lines.push(Line::from(vec![
+                                    Span::styled("       ⏺ ", Theme::tool_call()),
+                                    Span::styled(
+                                        truncate_line(&call, max_content_width.saturating_sub(20)),
+                                        Theme::dim(),
+                                    ),
+                                    Span::styled(format!("  {mark}"), mark_style),
+                                ]));
+                            }
+                            if !s.tool_log.is_empty() {
+                                lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "       {}",
+                                        "─".repeat(max_content_width.saturating_sub(8))
+                                    ),
+                                    Theme::dim(),
+                                )));
+                            }
+                        }
+                        let line_style = if msg.is_error {
+                            Theme::error()
+                        } else {
+                            Theme::tool_result()
+                        };
                         for l in &content_lines {
                             lines.push(Line::from(Span::styled(
                                 format!(
@@ -525,15 +634,30 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                                 line_style,
                             )));
                         }
-                        lines.push(Line::from(Span::styled(
-                            "       [ctrl+o to collapse]".to_string(),
-                            Theme::dim(),
-                        )));
+                        // 只有「最后一条可折叠」且已展开才显示 collapse 提示
+                        if last_collapsible_idx == Some(msg_idx) {
+                            lines.push(Line::from(Span::styled(
+                                "       [ctrl+o to collapse]".to_string(),
+                                Theme::dim(),
+                            )));
+                        }
                     } else if content_lines.len() > 3 {
-                        lines.push(Line::from(Span::styled(
-                            format!("       …({} lines, ctrl+o to expand)", content_lines.len()),
-                            Theme::dim(),
-                        )));
+                        // 折叠态：只有最后一条可折叠的才显示快捷键提示
+                        if last_collapsible_idx == Some(msg_idx) {
+                            lines.push(Line::from(Span::styled(
+                                format!(
+                                    "       …({} lines, ctrl+o to expand)",
+                                    content_lines.len()
+                                ),
+                                Theme::dim(),
+                            )));
+                        } else {
+                            // 其余可折叠的历史结果：静默标记，不显示快捷键提示
+                            lines.push(Line::from(Span::styled(
+                                format!("       ⋯{}", content_lines.len()),
+                                Theme::dim(),
+                            )));
+                        }
                     }
                 }
             }
@@ -606,6 +730,9 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
 
     let max_scroll = total_visual_lines.saturating_sub(visible_height);
     let clamped_offset = state.scroll_offset.min(max_scroll);
+    // 把 clamp 后的值写回状态，防止滚轮/按键累加时 raw offset 超过 max_scroll，
+    // 导致到达顶部后再往下滚时视觉上卡住（必须按 PageDown 才能恢复）。
+    state.scroll_offset = clamped_offset;
     let scroll = max_scroll.saturating_sub(clamped_offset);
 
     let para = para.scroll((scroll, 0));
@@ -651,17 +778,15 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     }
 }
 
-/// 底部固定面板：运行中的子 Agent 总览（每行一个：spinner + 类型(描述) + 耗时/工具数/tokens）
+/// 底部固定面板：子 Agent 总览（每行一个，对齐任务列表风格）
+/// 标题 `agents [N]`；Running=spinner / Done=✓ / Failed=✗ / Interrupted=⊘；
+/// >3 个时自动折叠为仅标题行
 fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
-    let running: Vec<(&u64, &crate::app::SubAgentUiState)> = state
-        .sub_agents
-        .iter()
-        .filter(|(_, s)| s.status == SubAgentStatus::Running)
-        .collect();
+    let visible = state.visible_sub_agents();
 
     let title = wyj_i18n::tr_fmt(
         "subagent.panel_title",
-        &[("count", running.len().to_string().as_str())],
+        &[("count", visible.len().to_string().as_str())],
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -675,29 +800,47 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // >3 个时折叠为仅标题行
+    if visible.len() > 3 {
+        return;
+    }
+
     let max_content_width = inner.width.saturating_sub(2) as usize;
-    let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
     let mut lines: Vec<Line<'static>> = vec![];
 
-    for (id, s) in running {
-        let bg_tag = if s.background { " ◇bg" } else { "" };
-        let head = format!("a{id} {}({})", s.agent_type, s.description);
-        let stats = format!(
-            " · {} · {}⏺ · ↑{}{bg_tag}",
-            format_hms(s.elapsed_secs()),
-            s.tool_calls,
-            fmt_tokens(s.output_tokens),
-        );
-        let mut spans = vec![
-            Span::styled(
-                format!(" {frame} "),
+    for (id, s) in visible {
+        // 状态图标 + 内容配色（对齐任务列表的 ○/spinner/✓ 风格）
+        let (icon, item_style) = match s.status {
+            SubAgentStatus::Running => (
+                SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            SubAgentStatus::Done => (
+                "✓".to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+            SubAgentStatus::Failed => ("✗".to_string(), Theme::error()),
+            SubAgentStatus::Interrupted => ("⊘".to_string(), Theme::dim()),
+        };
+
+        let bg_tag = if s.background { " ◇bg" } else { "" };
+        let head = format!("a{} {}({})", id, s.agent_type, s.description);
+        let stats = format!(
+            " ⏱ {} ↑{} ↓{}{bg_tag}",
+            format_hms(s.elapsed_secs()),
+            fmt_tokens(s.input_tokens),
+            fmt_tokens(s.output_tokens),
+        );
+        let mut spans = vec![
+            Span::styled(format!(" a{id} "), Theme::dim()),
+            Span::styled(format!("{icon} "), item_style),
             Span::styled(
                 truncate_line(&head, max_content_width.saturating_sub(30)),
-                Style::default().fg(Color::White),
+                item_style,
             ),
             Span::styled(stats, Theme::dim()),
         ];
@@ -941,6 +1084,36 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
     let cursor_x = (inner.x + vis_col as u16).min(inner.x + inner.width.saturating_sub(1));
     let cursor_y = (inner.y + vis_row as u16).min(inner.y + inner.height.saturating_sub(1));
+
+    // 粘贴瞬时提示：在输入框光标/粘贴位置显示 1.5s，便于用户确认已粘贴图片/文件/文字
+    if let Some(hint) = &state.paste_hint {
+        if hint.expires_at > Instant::now() {
+            let (hint_row, hint_col) =
+                input.visual_pos_for(hint.cursor_row, hint.cursor_col, inner.width as usize);
+            if hint_row < inner.height as usize {
+                let max_w = inner.width.saturating_sub(hint_col as u16) as usize;
+                let text = if max_w == 0 {
+                    String::new()
+                } else {
+                    truncate_line(&hint.text, max_w)
+                };
+                if !text.is_empty() {
+                    let w = text.chars().map(char_display_width).sum::<usize>() as u16;
+                    let area =
+                        Rect::new(inner.x + hint_col as u16, inner.y + hint_row as u16, w, 1);
+                    let para = Paragraph::new(Line::from(Span::styled(
+                        text,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::REVERSED),
+                    )));
+                    f.render_widget(para, area);
+                }
+            }
+        }
+    }
+
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
