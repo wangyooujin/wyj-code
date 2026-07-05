@@ -12,6 +12,7 @@ members = [
     "crates/commands",
     "crates/mcp",
     "crates/i18n",
+    "crates/store",
 ]
 
 [workspace.package]
@@ -77,6 +78,8 @@ png = "0.17"
 unicode-width = "0.2"
 # 多语言（i18n）
 rust-i18n = "3"
+# 测试用临时目录
+tempfile = "3"
 
 # 内部 crate
 wyj-config = { path = "crates/config" }
@@ -87,6 +90,7 @@ wyj-tui = { path = "crates/tui" }
 wyj-commands = { path = "crates/commands" }
 wyj-mcp = { path = "crates/mcp" }
 wyj-i18n = { path = "crates/i18n" }
+wyj-store = { path = "crates/store" }
 
 [profile.release]
 opt-level = 3

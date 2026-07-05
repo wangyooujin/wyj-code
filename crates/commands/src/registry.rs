@@ -32,6 +32,12 @@ pub enum CommandResult {
     OpenSettingsDialog,
     /// 打开 CLAUDE.md 记忆面板（/memory 命令触发）
     OpenMemoryDialog,
+    /// 打开 MCP server 管理面板（/mcp 命令触发）
+    OpenMcpDialog,
+    /// 打开 Skill 管理面板（/skills 命令触发）
+    OpenSkillsDialog,
+    /// 打开插件管理面板（/plugins 命令触发）
+    OpenPluginsDialog,
 }
 
 /// 命令执行上下文
@@ -50,6 +56,14 @@ pub struct CommandContext {
     /// 子 Agent 累计 token 用量（与主会话分开统计，/cost 单列；headless 传 0）
     pub sub_input_tokens: u32,
     pub sub_output_tokens: u32,
+    /// 合并全局+项目配置、过滤禁用条目后实际会连接的 MCP server 数量
+    /// （由调用方用 `wyj_store::mcp_install::effective_mcp_servers` 算好传入，
+    /// `crates/commands` 本身不依赖 `wyj-store` 以保持 crate 边界干净）。
+    pub effective_mcp_count: usize,
+    /// 已启用插件贡献的 agent 定义文件/目录路径（同上，由调用方用
+    /// `wyj_store::plugin_install::enabled_plugin_agent_paths` 算好传入），
+    /// 供 `/agents` 展示时一并列出插件贡献的自定义 agent 类型。
+    pub plugin_agent_paths: Vec<std::path::PathBuf>,
 }
 
 /// Slash 命令 trait

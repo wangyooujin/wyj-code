@@ -1,5 +1,5 @@
 [package]
-name = "wyj-commands"
+name = "wyj-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,15 +7,15 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-wyj-core.workspace = true
 wyj-config.workspace = true
-wyj-i18n.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+chrono.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

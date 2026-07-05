@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use rmcp::service::RunningService;
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo},
-    transport::{child_process::ConfigureCommandExt, TokioChildProcess},
+    transport::TokioChildProcess,
     RoleClient, ServiceExt,
 };
 use serde_json::Value;
@@ -17,6 +17,19 @@ use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
 type McpHandle = RunningService<RoleClient, ClientInfo>;
+
+/// 单个 MCP server 连接尝试（子进程启动+握手+发现工具）的超时上限。子进程
+/// 启动（尤其 npx/uvx 首次拉包）或网络慢时可能耗时较久，调用方应始终用
+/// `tokio::time::timeout` 包一层，避免某个 server 卡住/无响应无限拖慢调用方。
+pub const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `-p`（单次问答）模式下等待 MCP server 连接的宽限期，远小于
+/// `MCP_CONNECT_TIMEOUT`。`-p` 是真正的单轮、进程跑完即退出，没有 TUI/
+/// `--headless` REPL 那种"后台连完之后还有很多轮对话可以补挂工具"的空间，
+/// 但也不能照抄 15s 全量等待——本地 stdio/已缓存的 npx/uvx 包通常能在几秒内
+/// 连完，只在"首次 npx/uvx 需要联网下载包"这种慢场景下才会触发宽限期截断
+/// （该场景本来就是 `-p` 单轮模式无法根治的已知局限）。
+pub const MCP_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// 桥接单个 MCP 工具 → wyj_core::Tool
 pub struct McpBridgeTool {
@@ -75,14 +88,20 @@ pub async fn connect_mcp_server(cfg: &McpServerConfig) -> Result<Vec<McpBridgeTo
         .ok_or_else(|| anyhow::anyhow!("stdio 传输需要 command 字段"))?;
 
     let mut command = Command::new(cmd);
-    for arg in &cfg.args {
-        command.arg(arg);
-    }
-    for (k, v) in &cfg.env {
-        command.env(k, v);
-    }
+    command.args(&cfg.args).envs(&cfg.env);
 
-    let transport = TokioChildProcess::new(command.configure(|_cmd| {}))
+    // MCP server 子进程默认继承父进程的 stderr——不管是 TUI 的 alternate screen
+    // 还是普通终端，子进程自己的日志/警告输出都会直接写穿到用户看到的画面上。
+    // 关键点：`rmcp::TokioChildProcess::new()` 内部固定用
+    // `TokioChildProcessBuilder`，其 stderr 默认值是 `Stdio::inherit()`，
+    // 且 `spawn()` 时会用这个默认值重新对 command 调一次 `.stderr(...)`——
+    // 这会覆盖任何在 `command.configure(...)` 闭包里直接设置的 stderr，
+    // 在这一层设置完全不生效。必须改用 `TokioChildProcess::builder(...)`
+    // 拿到 `TokioChildProcessBuilder`，在它上面显式调用 `.stderr(...)`
+    // 才是真正被 `spawn()` 采用的值。
+    let (transport, _stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| anyhow::anyhow!("启动 MCP 子进程失败: {e}"))?;
 
     let client_info = ClientInfo::default();

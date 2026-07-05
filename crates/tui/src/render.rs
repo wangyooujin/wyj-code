@@ -1,11 +1,14 @@
 //! 对话渲染与布局
 
 use crate::app::{
-    fmt_tokens, format_hms, AppState, AskQuestionDialog, AskQuestionStage, Attachment,
-    ExecModeConfirmDialog, InProgressAnswer, MemoryDialog, MemoryRow, MessageRole,
-    PermissionDialog, PlanApprovalDialog, ProfileDialog, ProfileOverlay, SessionPickerState,
-    SettingsDialog, SubAgentStatus, TodoRuntimeStats, PROFILE_API_KEY_FIELD_IDX,
-    PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    fmt_tokens, format_hms, ActionMenu, AppState, AskQuestionDialog, AskQuestionStage, Attachment,
+    ExecModeConfirmDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
+    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
+    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
+    ProfileInputField, ProfileOverlay, ProfileRow, SessionPickerState, SettingsDialog,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubToolLine, TodoRuntimeStats,
+    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
+    SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -205,12 +208,27 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 
     // 分组管理面板叠加在最顶层
     if let Some(dialog) = &state.profile_dialog {
-        draw_profile_dialog(f, dialog, area);
+        draw_profile_dialog(f, dialog, state.input_owner, area);
     }
 
     // CLAUDE.md 记忆面板叠加在最顶层
     if let Some(dialog) = &state.memory_dialog {
         draw_memory_dialog(f, dialog, area);
+    }
+
+    // MCP server 管理面板叠加在最顶层
+    if let Some(dialog) = &state.mcp_dialog {
+        draw_mcp_dialog(f, dialog, &state.mcp_connection_status, area);
+    }
+
+    // Skill 管理面板叠加在最顶层
+    if let Some(dialog) = &state.skills_dialog {
+        draw_skills_dialog(f, dialog, area);
+    }
+
+    // 插件管理面板叠加在最顶层
+    if let Some(dialog) = &state.plugins_dialog {
+        draw_plugins_dialog(f, dialog, area);
     }
 }
 
@@ -223,6 +241,11 @@ enum BottomPanel {
     SubAgents,
     TodoList,
 }
+
+/// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
+const SUB_AGENT_LIST_MAX: usize = 6;
+/// agents 面板详情区（工具流水 + 结果/状态提示）最多占用的行数（超出内部滚动）
+const SUB_AGENT_DETAIL_MAX: u16 = 12;
 
 fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     if state.exec_mode_confirm.is_some() {
@@ -257,15 +280,41 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         return (h, BottomPanel::AskQuestion);
     }
     // 子 Agent 聚合面板：有可见子 Agent 即显示（优先于任务列表）；
-    // >3 个时自动折叠为仅标题行
+    // 列表区固定行数上限 + 滚动窗口（本会话内全部保留，数量可能持续增长）；
+    // 详情展开时追加详情区所需行数，整体按可用高度 70% 封顶，避免聊天区被挤没。
     let visible = state.visible_sub_agents();
     if !visible.is_empty() {
-        let h = if visible.len() > 3 {
-            2u16.min(area_height)
+        let list_rows = visible.len().min(SUB_AGENT_LIST_MAX) as u16;
+        let detail_rows = if state.sub_agent_detail_open {
+            state
+                .selected_sub_agent
+                .and_then(|id| state.sub_agents.get(&id))
+                .map(|s| {
+                    // sizing 阶段没有宽度信息，只能用原始行数粗略估算；
+                    // 精确的可视行数在 draw_sub_agents_panel 渲染时用 Paragraph::line_count 重新计算并 clamp scroll。
+                    let tool_rows = if s.tool_log.is_empty() {
+                        0
+                    } else {
+                        s.tool_log.len() as u16 + 1 // +1 分隔线
+                    };
+                    let status_rows = match s.status {
+                        SubAgentStatus::Running | SubAgentStatus::Interrupted => 1,
+                        SubAgentStatus::Done | SubAgentStatus::Failed => s
+                            .final_result
+                            .as_deref()
+                            .map(|r| r.lines().count().max(1) as u16)
+                            .unwrap_or(1),
+                    };
+                    (tool_rows + status_rows).min(SUB_AGENT_DETAIL_MAX)
+                })
+                .unwrap_or(0)
         } else {
-            (visible.len() as u16 + 2).min(area_height)
+            0
         };
-        return (h, BottomPanel::SubAgents);
+        let content_rows = list_rows + detail_rows;
+        let max_h = (area_height * 7 / 10).max(list_rows + 2);
+        let h = (content_rows + 2).clamp(list_rows + 2, max_h);
+        return (h.min(area_height), BottomPanel::SubAgents);
     }
     if let Some(items) = &state.current_todos {
         if !items.is_empty() {
@@ -282,6 +331,44 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
 }
 
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
+
+/// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时），
+/// 供 ToolResult 展开区（Edit/Write diff 与普通展开两处）和 agents 面板详情区共用。
+fn push_sub_agent_tool_log(
+    lines: &mut Vec<Line<'static>>,
+    tool_log: &[SubToolLine],
+    max_content_width: usize,
+) {
+    for tl in tool_log {
+        let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
+            (None, _) => ("…".to_string(), Theme::dim()),
+            (Some(e), true) => (format!("✗ {}", format_hms(e)), Theme::error()),
+            (Some(e), false) => (
+                format!("✓ {}", format_hms(e)),
+                Style::default().fg(Color::Green),
+            ),
+        };
+        let call = if tl.arg_summary.is_empty() {
+            tl.tool_name.clone()
+        } else {
+            format!("{}({})", tl.tool_name, tl.arg_summary)
+        };
+        lines.push(Line::from(vec![
+            Span::styled("       ⏺ ", Theme::tool_call()),
+            Span::styled(
+                truncate_line(&call, max_content_width.saturating_sub(20)),
+                Theme::dim(),
+            ),
+            Span::styled(format!("  {mark}"), mark_style),
+        ]));
+    }
+    if !tool_log.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
+            Theme::dim(),
+        )));
+    }
+}
 
 fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let block = Block::default()
@@ -527,40 +614,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                         )));
                         // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
                         if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
-                            for tl in &s.tool_log {
-                                let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
-                                    (None, _) => ("…".to_string(), Theme::dim()),
-                                    (Some(e), true) => {
-                                        (format!("✗ {}", format_hms(e)), Theme::error())
-                                    }
-                                    (Some(e), false) => (
-                                        format!("✓ {}", format_hms(e)),
-                                        Style::default().fg(Color::Green),
-                                    ),
-                                };
-                                let call = if tl.arg_summary.is_empty() {
-                                    tl.tool_name.clone()
-                                } else {
-                                    format!("{}({})", tl.tool_name, tl.arg_summary)
-                                };
-                                lines.push(Line::from(vec![
-                                    Span::styled("       ⏺ ", Theme::tool_call()),
-                                    Span::styled(
-                                        truncate_line(&call, max_content_width.saturating_sub(20)),
-                                        Theme::dim(),
-                                    ),
-                                    Span::styled(format!("  {mark}"), mark_style),
-                                ]));
-                            }
-                            if !s.tool_log.is_empty() {
-                                lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "       {}",
-                                        "─".repeat(max_content_width.saturating_sub(8))
-                                    ),
-                                    Theme::dim(),
-                                )));
-                            }
+                            push_sub_agent_tool_log(&mut lines, &s.tool_log, max_content_width);
                         }
                         // diff 行带配色：+ 绿、- 红、上下文 dim
                         let max_lines = 60;
@@ -598,40 +652,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                         )));
                         // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
                         if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
-                            for tl in &s.tool_log {
-                                let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
-                                    (None, _) => ("…".to_string(), Theme::dim()),
-                                    (Some(e), true) => {
-                                        (format!("✗ {}", format_hms(e)), Theme::error())
-                                    }
-                                    (Some(e), false) => (
-                                        format!("✓ {}", format_hms(e)),
-                                        Style::default().fg(Color::Green),
-                                    ),
-                                };
-                                let call = if tl.arg_summary.is_empty() {
-                                    tl.tool_name.clone()
-                                } else {
-                                    format!("{}({})", tl.tool_name, tl.arg_summary)
-                                };
-                                lines.push(Line::from(vec![
-                                    Span::styled("       ⏺ ", Theme::tool_call()),
-                                    Span::styled(
-                                        truncate_line(&call, max_content_width.saturating_sub(20)),
-                                        Theme::dim(),
-                                    ),
-                                    Span::styled(format!("  {mark}"), mark_style),
-                                ]));
-                            }
-                            if !s.tool_log.is_empty() {
-                                lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "       {}",
-                                        "─".repeat(max_content_width.saturating_sub(8))
-                                    ),
-                                    Theme::dim(),
-                                )));
-                            }
+                            push_sub_agent_tool_log(&mut lines, &s.tool_log, max_content_width);
                         }
                         let line_style = if msg.is_error {
                             Theme::error()
@@ -709,9 +730,14 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             }
 
             MessageRole::System => {
+                let (marker, style) = if msg.is_error {
+                    ("  ⚠ ", Theme::warning())
+                } else {
+                    ("  ⚙ ", Style::default().fg(Color::Cyan))
+                };
                 lines.push(Line::from(vec![
-                    Span::styled("  ⚙ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(msg.content.clone(), Style::default().fg(Color::Cyan)),
+                    Span::styled(marker, style),
+                    Span::styled(msg.content.clone(), style),
                 ]));
                 lines.push(Line::from(""));
             }
@@ -791,15 +817,16 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     }
 }
 
-/// 底部固定面板：子 Agent 总览（每行一个，对齐任务列表风格）
+/// 底部固定面板：子 Agent 总览，支持上下选中 + 展开详情（工具流水 + 最终结果/状态）。
 /// 标题 `agents [N]`；Running=spinner / Done=✓ / Failed=✗ / Interrupted=⊘；
-/// >3 个时自动折叠为仅标题行
-fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
-    let visible = state.visible_sub_agents();
+/// 列表区固定行数上限（SUB_AGENT_LIST_MAX）+ 滚动窗口，本会话内全部保留不再自动清除。
+fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
+    // 按 id 升序（BTreeMap 天然启动顺序），用 owned Vec 避免和后面对 state 的可变借用冲突
+    let ids: Vec<u64> = state.sub_agents.keys().copied().collect();
 
     let title = wyj_i18n::tr_fmt(
         "subagent.panel_title",
-        &[("count", visible.len().to_string().as_str())],
+        &[("count", ids.len().to_string().as_str())],
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -813,15 +840,42 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // >3 个时折叠为仅标题行
-    if visible.len() > 3 {
-        return;
-    }
+    let selected_idx = state
+        .selected_sub_agent
+        .and_then(|id| ids.iter().position(|&i| i == id));
+    let detail_open = state.sub_agent_detail_open && selected_idx.is_some();
 
-    let max_content_width = inner.width.saturating_sub(2) as usize;
+    let list_rows = (ids.len().min(SUB_AGENT_LIST_MAX) as u16).min(inner.height);
+    let (list_area, detail_area) = if detail_open && inner.height > list_rows {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_rows), Constraint::Min(1)])
+            .split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    let max_content_width = list_area.width.saturating_sub(2) as usize;
+    let max_show = (list_area.height as usize).max(1);
+    let start = match selected_idx {
+        Some(idx) if idx >= max_show => idx - max_show + 1,
+        _ => 0,
+    };
+
     let mut lines: Vec<Line<'static>> = vec![];
+    for (row_i, id) in ids.iter().skip(start).take(max_show).enumerate() {
+        let Some(s) = state.sub_agents.get(id) else {
+            continue;
+        };
+        let is_selected = selected_idx == Some(start + row_i);
+        let sel_bg = |mut st: Style| -> Style {
+            if is_selected {
+                st = st.bg(Color::Blue);
+            }
+            st
+        };
 
-    for (id, s) in visible {
         // 状态图标 + 内容配色（对齐任务列表的 ○/spinner/✓ 风格）
         let (icon, item_style) = match s.status {
             SubAgentStatus::Running => (
@@ -849,24 +903,80 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &AppState, area: Rect) {
             fmt_tokens(s.output_tokens),
         );
         let mut spans = vec![
-            Span::styled(format!(" a{id} "), Theme::dim()),
-            Span::styled(format!("{icon} "), item_style),
+            Span::styled(format!(" a{id} "), sel_bg(Theme::dim())),
+            Span::styled(format!("{icon} "), sel_bg(item_style)),
             Span::styled(
                 truncate_line(&head, max_content_width.saturating_sub(30)),
-                item_style,
+                sel_bg(item_style),
             ),
-            Span::styled(stats, Theme::dim()),
+            Span::styled(stats, sel_bg(Theme::dim())),
         ];
         if let Some(cur) = &s.current_tool {
             spans.push(Span::styled(
                 format!(" {}", truncate_line(cur, 30)),
-                Theme::dim(),
+                sel_bg(Theme::dim()),
             ));
         }
         lines.push(Line::from(spans));
     }
+    f.render_widget(Paragraph::new(Text::from(lines)), list_area);
 
-    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+    // 详情区：先列工具调用流水，再按状态展示"运行中/已中断/最终结果"
+    if let (Some(detail_area), Some(idx)) = (detail_area, selected_idx) {
+        let id = ids[idx];
+        if let Some(s) = state.sub_agents.get(&id) {
+            let detail_width = detail_area.width.saturating_sub(2) as usize;
+            let mut detail_lines: Vec<Line<'static>> = vec![];
+            push_sub_agent_tool_log(&mut detail_lines, &s.tool_log, detail_width.max(20));
+            match s.status {
+                SubAgentStatus::Running => {
+                    let cur = s.current_tool.as_deref().unwrap_or("…");
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {}{}", wyj_i18n::tr("subagent.detail_running"), cur),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
+                SubAgentStatus::Interrupted => {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  ✗ {}", wyj_i18n::tr("subagent.interrupted")),
+                        Theme::error(),
+                    )));
+                }
+                SubAgentStatus::Done | SubAgentStatus::Failed => {
+                    let style = if s.status == SubAgentStatus::Failed {
+                        Theme::error()
+                    } else {
+                        Theme::tool_result()
+                    };
+                    if let Some(result) = &s.final_result {
+                        for l in result.lines() {
+                            detail_lines.push(Line::from(Span::styled(
+                                format!("  {}", truncate_line(l, detail_width.saturating_sub(2))),
+                                style,
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let text = Text::from(detail_lines);
+            let dw = detail_area.width.max(1);
+            let para = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+            let total = para.line_count(dw).min(u16::MAX as usize) as u16;
+            let visible_height = detail_area.height;
+            let max_scroll = total.saturating_sub(visible_height);
+            // clamp 后写回，防止按键累加超过 max_scroll 导致"到顶/底后要多按几次才生效"
+            let clamped = state.sub_agent_detail_scroll.min(max_scroll);
+            state.sub_agent_detail_scroll = clamped;
+            let scroll = max_scroll.saturating_sub(clamped);
+            f.render_widget(
+                Paragraph::new(text)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                detail_area,
+            );
+        }
+    }
 }
 
 /// 底部固定面板：任务列表
@@ -1005,6 +1115,41 @@ fn draw_todo_panel(
 // ─── 输入框 ──────────────────────────────────────────────────────────────────
 
 fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
+    // 主输入框被 /mcp /skills /plugins 面板借用做配置输入时（见 `InputOwner`），
+    // 整个函数改画 dialog 自己的 live_input 草稿，边框/标题变色 + 嵌入提示文字，
+    // 提交/取消后 `state.input_owner` 归 None，下一帧自动恢复聊天输入框外观。
+    if let Some(owner) = state.input_owner {
+        let borrowed = owner.live_input(state);
+        let (prompt, color) = owner.prompt();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color))
+            .title(Span::styled(
+                format!(" {prompt} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if let Some(ib) = borrowed {
+            let wrap_width = inner.width as usize;
+            let lines: Vec<Line> = ib
+                .display_lines()
+                .iter()
+                .flat_map(|l| InputBox::wrap_for_render(l, wrap_width))
+                .map(Line::from)
+                .collect();
+            f.render_widget(
+                Paragraph::new(Text::from(lines)).style(Theme::input_box()),
+                inner,
+            );
+            let (vis_row, vis_col) = ib.cursor_visual_pos(wrap_width);
+            let cursor_x = (inner.x + vis_col as u16).min(inner.x + inner.width.saturating_sub(1));
+            let cursor_y = (inner.y + vis_row as u16).min(inner.y + inner.height.saturating_sub(1));
+            f.set_cursor_position(Position::new(cursor_x, cursor_y));
+        }
+        return;
+    }
+
     // 检测 ! bash 模式：首行以 ! 开头且不在思考中
     let is_bang = !state.is_thinking
         && input
@@ -2079,8 +2224,804 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
     f.render_widget(para, inner);
 }
 
+// ── MCP server 管理面板渲染：/mcp 命令触发 ─────────────────────────────────────
+
+fn mcp_scope_label(scope: wyj_store::InstallScope) -> String {
+    wyj_i18n::tr(match scope {
+        wyj_store::InstallScope::Global => "mcp.dialog.scope_global",
+        wyj_store::InstallScope::Project => "mcp.dialog.scope_project",
+    })
+}
+
+fn mcp_package_command_preview(package: &wyj_store::mcp_install::PackageChoice) -> String {
+    match package {
+        wyj_store::mcp_install::PackageChoice::Npx { command, args, .. }
+        | wyj_store::mcp_install::PackageChoice::Uvx { command, args, .. } => {
+            format!("{command} {}", args.join(" "))
+        }
+        wyj_store::mcp_install::PackageChoice::Unsupported { .. } => String::new(),
+    }
+}
+
+/// 列表类面板一次最多渲染的行数：超出时按光标位置滚动，保证选中行与底部
+/// 分隔线/状态行/提示行始终可见，不会被过长的列表挤出屏幕。
+const MAX_LIST_VIEWPORT: usize = 12;
+
+/// 给定列表总行数、当前光标位置与可视窗口行数，计算滚动窗口起始下标
+/// （光标始终落在窗口内；无需在 dialog 状态里额外维护 scroll_offset，
+/// 每帧按光标位置重新计算即可）。
+fn scroll_window_start(total: usize, cursor: usize, visible: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    let cursor = cursor.min(total.saturating_sub(1));
+    if cursor < visible {
+        0
+    } else {
+        (cursor + 1 - visible).min(total.saturating_sub(visible))
+    }
+}
+
+fn draw_mcp_dialog(
+    f: &mut Frame,
+    dialog: &McpDialog,
+    conn_status: &HashMap<String, McpConnStatus>,
+    area: Rect,
+) {
+    let rows = dialog.rows();
+    let visible_rows = rows.len().clamp(1, MAX_LIST_VIEWPORT);
+    let extra_lines: u16 = 3; // 分隔线 + 状态行 + 提示行
+    let content_lines = visible_rows as u16 + extra_lines;
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let tab_label = wyj_i18n::tr(match dialog.tab {
+        McpDialogTab::Installed => "mcp.dialog.tab_installed",
+        McpDialogTab::Registries => "mcp.dialog.tab_registries",
+        McpDialogTab::Browse => "mcp.dialog.tab_browse",
+    });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} — {} ", wyj_i18n::tr("mcp.dialog.title"), tab_label),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        let empty_key = match dialog.tab {
+            McpDialogTab::Installed => "mcp.dialog.empty_installed",
+            McpDialogTab::Registries => "mcp.dialog.empty_registries",
+            McpDialogTab::Browse => "mcp.dialog.empty_browse",
+        };
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr(empty_key),
+            Theme::dim(),
+        )));
+    } else {
+        let start = scroll_window_start(rows.len(), dialog.cursor, visible_rows);
+        for (pos, row) in rows.iter().enumerate().skip(start).take(visible_rows) {
+            let selected = pos == dialog.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let text = match (dialog.tab, row) {
+                (McpDialogTab::Installed, FlatRow::Entry(idx)) => {
+                    let row = &dialog.installed[*idx];
+                    let enabled = row.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                    let enabled_marker = if enabled { "●" } else { "○" };
+                    let scope_label = mcp_scope_label(row.scope);
+                    let tag = if row.managed.as_ref().is_some_and(|m| m.is_managed()) {
+                        format!(
+                            "v{}",
+                            row.managed
+                                .as_ref()
+                                .and_then(|m| m.version.clone())
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        wyj_i18n::tr("mcp.dialog.unmanaged_tag")
+                    };
+                    let status_suffix = match conn_status.get(&row.config.name) {
+                        Some(McpConnStatus::Connecting) => {
+                            format!(" · {}", wyj_i18n::tr("mcp.status.connecting"))
+                        }
+                        Some(McpConnStatus::Connected { tool_count }) => format!(
+                            " · {}",
+                            wyj_i18n::tr_fmt(
+                                "mcp.status.connected",
+                                &[("count", &tool_count.to_string())]
+                            )
+                        ),
+                        Some(McpConnStatus::Failed) => {
+                            format!(" · {}", wyj_i18n::tr("mcp.status.failed"))
+                        }
+                        Some(McpConnStatus::TimedOut) => {
+                            format!(" · {}", wyj_i18n::tr("mcp.status.timed_out"))
+                        }
+                        None => String::new(),
+                    };
+                    format!(
+                        "{marker}{enabled_marker} {:<20} [{scope_label}] {tag}{status_suffix}",
+                        row.config.name
+                    )
+                }
+                (McpDialogTab::Registries, FlatRow::Entry(idx)) => {
+                    let source = &dialog.registries[*idx];
+                    let active_marker = if source.id == dialog.active_registry.id {
+                        "★"
+                    } else {
+                        " "
+                    };
+                    format!(
+                        "{marker}{active_marker} {} — {}",
+                        source.name, source.base_url
+                    )
+                }
+                (McpDialogTab::Registries, FlatRow::AddNew) => {
+                    format!("{marker}{}", wyj_i18n::tr("mcp.dialog.add_registry_row"))
+                }
+                (McpDialogTab::Browse, FlatRow::AddNew) => {
+                    let query = dialog.live_input.display_lines().join("");
+                    if query.is_empty() {
+                        format!(
+                            "{marker}{} [{}] {}",
+                            wyj_i18n::tr("mcp.dialog.search_label"),
+                            dialog.active_registry.name,
+                            wyj_i18n::tr("mcp.dialog.search_row_placeholder")
+                        )
+                    } else {
+                        format!(
+                            "{marker}{} [{}] {}",
+                            wyj_i18n::tr("mcp.dialog.search_label"),
+                            dialog.active_registry.name,
+                            query
+                        )
+                    }
+                }
+                (McpDialogTab::Browse, FlatRow::Entry(idx)) => {
+                    let server = &dialog.browse_results[*idx];
+                    format!("{marker}{} — {}", server.name, server.description)
+                }
+                // Installed 没有 AddNew 行（新增 MCP server 走 Browse+安装），
+                // rows() 保证不会产生这个组合，这里只是穷尽匹配。
+                (McpDialogTab::Installed, FlatRow::AddNew) => String::new(),
+            };
+            let text = truncate_line(&text, w);
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        if dialog.tab == McpDialogTab::Browse && matches!(dialog.overlay, McpOverlay::Searching) {
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("mcp.dialog.searching"),
+                Theme::dim(),
+            )));
+        }
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else if let Some(status) = &dialog.status {
+        lines.push(Line::from(Span::styled(
+            truncate_line(status, w),
+            Theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    let hint_key = match dialog.tab {
+        McpDialogTab::Installed => "mcp.dialog.hint_installed",
+        McpDialogTab::Registries => "mcp.dialog.hint_registries",
+        McpDialogTab::Browse => "mcp.dialog.hint_browse",
+    };
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr(hint_key),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(f, area, &wyj_i18n::tr("mcp.dialog.title"), menu);
+    } else {
+        draw_mcp_overlay(f, dialog, area);
+    }
+}
+
+fn draw_mcp_overlay(f: &mut Frame, dialog: &McpDialog, area: Rect) {
+    let overlay = &dialog.overlay;
+    let (title, lines): (String, Vec<Line<'static>>) = match overlay {
+        McpOverlay::None => return,
+        McpOverlay::Searching => (
+            wyj_i18n::tr("mcp.dialog.title"),
+            vec![Line::from(Span::styled(
+                wyj_i18n::tr("mcp.dialog.searching"),
+                Theme::dim(),
+            ))],
+        ),
+        McpOverlay::Upgrading { .. } => (
+            wyj_i18n::tr("mcp.dialog.title"),
+            vec![Line::from(Span::styled(
+                wyj_i18n::tr("mcp.upgrade.in_progress"),
+                Theme::dim(),
+            ))],
+        ),
+        McpOverlay::Detail { title, lines } => (
+            title.clone(),
+            lines
+                .iter()
+                .map(|l| Line::from(Span::raw(l.clone())))
+                .collect(),
+        ),
+        McpOverlay::InstallConfirm {
+            server,
+            package,
+            scope,
+        } => (
+            wyj_i18n::tr("mcp.install.confirm_title"),
+            vec![
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("mcp.install.name_label"), Theme::dim()),
+                    Span::raw(server.name.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("mcp.install.scope_label"), Theme::dim()),
+                    Span::raw(mcp_scope_label(*scope)),
+                ]),
+                Line::from(Span::styled(
+                    wyj_i18n::tr("mcp.install.command_label"),
+                    Theme::dim(),
+                )),
+                Line::from(format!("  {}", mcp_package_command_preview(package))),
+                Line::from(""),
+                Line::from(Span::styled(
+                    wyj_i18n::tr("mcp.install.confirm_warning"),
+                    Theme::warning(),
+                )),
+                Line::from(Span::styled(
+                    wyj_i18n::tr("mcp.install.confirm_hint"),
+                    Theme::highlight(),
+                )),
+            ],
+        ),
+        McpOverlay::AddRegistry => {
+            // 文本内容现在借用底部主输入框（`dialog.live_input`），此浮层
+            // 只保留提示文案，真正的输入渲染在底部输入框（借用态样式，见 draw_input）。
+            (
+                wyj_i18n::tr("mcp.registry.add_title"),
+                vec![Line::from(Span::styled(
+                    wyj_i18n::tr("mcp.registry.add_prompt"),
+                    Theme::dim(),
+                ))],
+            )
+        }
+    };
+
+    draw_confirm_box(f, &title, lines, area);
+}
+
+/// 通用居中确认弹框（安装/卸载/同步等 overlay 复用），布局对齐权限确认对话框风格。
+///
+/// 宽度/最小高度刻意与 `draw_mcp_dialog`/`draw_skills_dialog` 的基础面板保持一致的
+/// 尺寸公式：这是同一次渲染里叠加在基础面板之上的第二层浮层，若尺寸随内容长度
+/// 忽大忽小，上一帧遗留的边框/文字会在两者未重叠的区域露出（ratatui 按 Rect 增量
+/// 清屏，不会清到 Rect 之外的旧内容）。用与基础面板相同的宽度公式 + 足够大的
+/// 固定最小高度，确保浮层稳定覆盖住基础面板，切换 overlay 状态时也不会互相露底。
+fn draw_confirm_box(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, area: Rect) {
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+    let height = (lines.len() as u16 + 2)
+        .max(16)
+        .min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(title.to_string(), Theme::permission_dialog()));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    f.render_widget(para, inner);
+}
+
+// ── Skill 管理面板渲染：/skills 命令触发 ───────────────────────────────────────
+
+fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
+    let rows = dialog.rows();
+    let visible_rows = rows.len().clamp(1, MAX_LIST_VIEWPORT);
+    let content_lines = visible_rows as u16 + 3; // 分隔线 + 状态行 + 提示行
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let tab_label = wyj_i18n::tr(match dialog.tab {
+        SkillsDialogTab::Installed => "skills.dialog.tab_installed",
+        SkillsDialogTab::Marketplaces => "skills.dialog.tab_marketplaces",
+        SkillsDialogTab::Browse => "skills.dialog.tab_browse",
+    });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} — {} ", wyj_i18n::tr("skills.dialog.title"), tab_label),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        let empty_key = match dialog.tab {
+            SkillsDialogTab::Installed => "skills.dialog.empty_installed",
+            SkillsDialogTab::Marketplaces => "skills.dialog.empty_marketplaces",
+            SkillsDialogTab::Browse => "skills.dialog.empty_marketplace_entries",
+        };
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr(empty_key),
+            Theme::dim(),
+        )));
+    } else {
+        let start = scroll_window_start(rows.len(), dialog.cursor, visible_rows);
+        for (pos, row) in rows.iter().enumerate().skip(start).take(visible_rows) {
+            let selected = pos == dialog.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let text = match (dialog.tab, row) {
+                (SkillsDialogTab::Installed, FlatRow::Entry(idx)) => {
+                    let row = &dialog.installed[*idx];
+                    let enabled = row.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                    let enabled_marker = if enabled { "●" } else { "○" };
+                    let tag = if row.builtin {
+                        wyj_i18n::tr("agents.builtin_tag")
+                    } else if let Some(scope) = row.scope {
+                        let scope_label = mcp_scope_label(scope);
+                        if row.managed.as_ref().is_some_and(|m| m.is_managed()) {
+                            format!(
+                                "{scope_label} v{}",
+                                row.managed
+                                    .as_ref()
+                                    .and_then(|m| m.version.clone())
+                                    .unwrap_or_default()
+                            )
+                        } else {
+                            format!(
+                                "{scope_label} ({})",
+                                wyj_i18n::tr("skills.dialog.unmanaged_tag")
+                            )
+                        }
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{marker}{enabled_marker} {:<16} [{tag}] {}",
+                        row.name, row.description
+                    )
+                }
+                (SkillsDialogTab::Marketplaces, FlatRow::Entry(idx)) => {
+                    format!("{marker}{}", dialog.marketplaces[*idx].git_url)
+                }
+                (SkillsDialogTab::Marketplaces, FlatRow::AddNew) => {
+                    format!(
+                        "{marker}{}",
+                        wyj_i18n::tr("skills.dialog.add_marketplace_row")
+                    )
+                }
+                (SkillsDialogTab::Browse, FlatRow::Entry(idx)) => {
+                    let e = &dialog.browse_results[*idx];
+                    format!("{marker}{} v{} — {}", e.name, e.version, e.description)
+                }
+                (SkillsDialogTab::Installed, FlatRow::AddNew)
+                | (SkillsDialogTab::Browse, FlatRow::AddNew) => String::new(),
+            };
+            let text = truncate_line(&text, w);
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else if let Some(status) = &dialog.status {
+        lines.push(Line::from(Span::styled(
+            truncate_line(status, w),
+            Theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    let hint_key = match dialog.tab {
+        SkillsDialogTab::Installed => "skills.dialog.hint_installed",
+        SkillsDialogTab::Marketplaces => "skills.dialog.hint_marketplaces",
+        SkillsDialogTab::Browse => "skills.dialog.hint_browse",
+    };
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr(hint_key),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(f, area, &wyj_i18n::tr("skills.dialog.title"), menu);
+    } else {
+        draw_skills_overlay(f, &dialog.overlay, area);
+    }
+}
+
+fn draw_skills_overlay(f: &mut Frame, overlay: &SkillsOverlay, area: Rect) {
+    match overlay {
+        SkillsOverlay::None => {}
+        SkillsOverlay::AddMarketplace => {
+            // 文本内容现在借用底部主输入框（`dialog.live_input`），此浮层
+            // 只保留提示文案，真正的输入渲染在底部输入框（借用态样式，见 draw_input）。
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("skills.marketplace.add_prompt"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("skills.marketplace.add_title"),
+                lines,
+                area,
+            );
+        }
+        SkillsOverlay::Syncing { .. } => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("skills.dialog.syncing"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("skills.dialog.title"), lines, area);
+        }
+        SkillsOverlay::InstallConfirm { entry, scope, .. } => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.install.name_label"), Theme::dim()),
+                    Span::raw(entry.name.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.install.scope_label"), Theme::dim()),
+                    Span::raw(mcp_scope_label(*scope)),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.install.path_label"), Theme::dim()),
+                    Span::raw(entry.path.clone()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    wyj_i18n::tr("skills.install.confirm_hint"),
+                    Theme::highlight(),
+                )),
+            ];
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("skills.install.confirm_title"),
+                lines,
+                area,
+            );
+        }
+        SkillsOverlay::Upgrading { .. } => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("skills.upgrade.in_progress"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("skills.dialog.title"), lines, area);
+        }
+        SkillsOverlay::Detail { title, lines } => {
+            let lines = lines
+                .iter()
+                .map(|l| Line::from(Span::raw(l.clone())))
+                .collect();
+            draw_confirm_box(f, title, lines, area);
+        }
+    }
+}
+
+fn draw_plugins_dialog(f: &mut Frame, dialog: &PluginsDialog, area: Rect) {
+    let rows = dialog.rows();
+    let visible_rows = rows.len().clamp(1, MAX_LIST_VIEWPORT);
+    let content_lines = visible_rows as u16 + 3;
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let tab_label = wyj_i18n::tr(match dialog.tab {
+        PluginsDialogTab::Installed => "plugins.dialog.tab_installed",
+        PluginsDialogTab::Marketplaces => "plugins.dialog.tab_marketplaces",
+        PluginsDialogTab::Browse => "plugins.dialog.tab_browse",
+    });
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} — {} ", wyj_i18n::tr("plugins.dialog.title"), tab_label),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if rows.is_empty() {
+        let empty_key = match dialog.tab {
+            PluginsDialogTab::Installed => "plugins.dialog.empty_installed",
+            PluginsDialogTab::Marketplaces => "plugins.dialog.empty_marketplaces",
+            PluginsDialogTab::Browse => "plugins.dialog.empty_marketplace_entries",
+        };
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr(empty_key),
+            Theme::dim(),
+        )));
+    } else {
+        let start = scroll_window_start(rows.len(), dialog.cursor, visible_rows);
+        for (pos, row) in rows.iter().enumerate().skip(start).take(visible_rows) {
+            let selected = pos == dialog.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let text = match (dialog.tab, row) {
+                (PluginsDialogTab::Installed, FlatRow::Entry(idx)) => {
+                    let row = &dialog.installed[*idx];
+                    let enabled_marker = if row.enabled { "●" } else { "○" };
+                    let source_label = if row.is_local_dev {
+                        wyj_i18n::tr("plugins.dialog.local_dev_tag")
+                    } else {
+                        format!(
+                            "{} v{}",
+                            mcp_scope_label(row.scope),
+                            row.version.clone().unwrap_or_default()
+                        )
+                    };
+                    format!(
+                        "{marker}{enabled_marker} {:<20} [{source_label}] {}",
+                        row.name, row.resource_summary
+                    )
+                }
+                (PluginsDialogTab::Installed, FlatRow::AddNew) => {
+                    format!("{marker}{}", wyj_i18n::tr("plugins.dialog.add_local_row"))
+                }
+                (PluginsDialogTab::Marketplaces, FlatRow::Entry(idx)) => {
+                    let m = &dialog.marketplaces[*idx];
+                    let label = if m.display_name.is_empty() || m.display_name == m.location {
+                        m.location.clone()
+                    } else {
+                        format!("{} ({})", m.display_name, m.location)
+                    };
+                    format!("{marker}{label}")
+                }
+                (PluginsDialogTab::Marketplaces, FlatRow::AddNew) => {
+                    format!(
+                        "{marker}{}",
+                        wyj_i18n::tr("plugins.dialog.add_marketplace_row")
+                    )
+                }
+                (PluginsDialogTab::Browse, FlatRow::Entry(idx)) => {
+                    let e = &dialog.browse_results[*idx];
+                    let name = e.manifest.name.clone().unwrap_or_else(|| "?".to_string());
+                    let version = e.manifest.version.clone().unwrap_or_default();
+                    let description = e.manifest.description.clone().unwrap_or_default();
+                    format!("{marker}{name} v{version} — {description}")
+                }
+                (PluginsDialogTab::Browse, FlatRow::AddNew) => String::new(),
+            };
+            let text = truncate_line(&text, w);
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else if let Some(status) = &dialog.status {
+        lines.push(Line::from(Span::styled(
+            truncate_line(status, w),
+            Theme::dim(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    let hint_key = match dialog.tab {
+        PluginsDialogTab::Installed => "plugins.dialog.hint_installed",
+        PluginsDialogTab::Marketplaces => "plugins.dialog.hint_marketplaces",
+        PluginsDialogTab::Browse => "plugins.dialog.hint_browse",
+    };
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr(hint_key),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(f, area, &wyj_i18n::tr("plugins.dialog.title"), menu);
+    } else {
+        draw_plugins_overlay(f, &dialog.overlay, area);
+    }
+}
+
+fn draw_plugins_overlay(f: &mut Frame, overlay: &PluginOverlay, area: Rect) {
+    match overlay {
+        PluginOverlay::None => {}
+        PluginOverlay::AddMarketplace => {
+            // 文本内容现在借用底部主输入框（`dialog.live_input`），此浮层
+            // 只保留提示文案，真正的输入渲染在底部输入框（借用态样式，见 draw_input）。
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("plugins.marketplace.add_prompt"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("plugins.marketplace.add_title"),
+                lines,
+                area,
+            );
+        }
+        PluginOverlay::Syncing { .. } => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("plugins.dialog.syncing"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("plugins.dialog.title"), lines, area);
+        }
+        PluginOverlay::InstallConfirm { entry, scope, .. } => {
+            let name = entry
+                .manifest
+                .name
+                .clone()
+                .unwrap_or_else(|| "?".to_string());
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("plugins.install.name_label"), Theme::dim()),
+                    Span::raw(name),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("plugins.install.scope_label"), Theme::dim()),
+                    Span::raw(mcp_scope_label(*scope)),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    wyj_i18n::tr("plugins.install.confirm_hint"),
+                    Theme::highlight(),
+                )),
+            ];
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("plugins.install.confirm_title"),
+                lines,
+                area,
+            );
+        }
+        PluginOverlay::Installing => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("plugins.install.in_progress"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("plugins.dialog.title"), lines, area);
+        }
+        PluginOverlay::InstallReport { report } => {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("plugins.install.name_label"), Theme::dim()),
+                    Span::raw(report.name.clone()),
+                ]),
+                Line::from(wyj_i18n::tr_fmt(
+                    "plugins.install.resource_counts",
+                    &[
+                        ("cmd", &report.skill_count.to_string()),
+                        ("agent", &report.agent_count.to_string()),
+                        ("mcp", &report.mcp_count.to_string()),
+                    ],
+                )),
+            ];
+            if !report.skipped_capabilities.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    wyj_i18n::tr_fmt(
+                        "plugins.install.skipped_capabilities_label",
+                        &[
+                            ("count", &report.skipped_capabilities.len().to_string()),
+                            ("names", &report.skipped_capabilities.join(", ")),
+                        ],
+                    ),
+                    Theme::warning(),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("plugins.install.restart_required_hint"),
+                Theme::highlight(),
+            )));
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("plugins.install.report_title"),
+                lines,
+                area,
+            );
+        }
+        PluginOverlay::Upgrading { .. } => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("plugins.upgrade.in_progress"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("plugins.dialog.title"), lines, area);
+        }
+        PluginOverlay::AddLocalPlugin => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("plugins.local.add_prompt"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("plugins.local.add_title"), lines, area);
+        }
+        PluginOverlay::Detail { title, lines } => {
+            let lines = lines
+                .iter()
+                .map(|l| Line::from(Span::raw(l.clone())))
+                .collect();
+            draw_confirm_box(f, title, lines, area);
+        }
+    }
+}
+
 /// 分组管理面板渲染（/model 无参命令触发）
-fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
+fn draw_profile_dialog(
+    f: &mut Frame,
+    dialog: &ProfileDialog,
+    input_owner: Option<InputOwner>,
+    area: Rect,
+) {
     let rows = dialog.rows();
     let content_lines = rows.len() as u16 + 4; // 行列表 + 分隔线 + 错误行 + 提示两行
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
@@ -2107,14 +3048,27 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
     let w = inner.width as usize;
     let label_width = 18usize;
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (row_idx, (entry_idx, field_idx)) in rows.iter().enumerate() {
-        let entry = &dialog.entries[*entry_idx];
-        let selected_row = row_idx == dialog.cursor;
-        let editing = selected_row && dialog.editing.is_some();
+    // 当前哪一行正被借用（重命名/字段编辑），借用中的行不再显示实时输入内容——
+    // 真正的输入渲染在底部主输入框（`draw_input` 的借用态分支），这里只放占位提示。
+    let editing_row = match input_owner {
+        Some(InputOwner::Profile(ProfileInputField::Rename { entry_idx })) => {
+            Some(ProfileRow::Header(entry_idx))
+        }
+        Some(InputOwner::Profile(ProfileInputField::Field {
+            entry_idx,
+            field_idx,
+        })) => Some(ProfileRow::Field(entry_idx, field_idx)),
+        _ => None,
+    };
 
-        let text = match field_idx {
-            None => {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let selected_row = row_idx == dialog.cursor;
+        let editing = Some(*row) == editing_row;
+
+        let text = match row {
+            ProfileRow::Header(entry_idx) => {
+                let entry = &dialog.entries[*entry_idx];
                 let marker = if *entry_idx == dialog.active_idx {
                     "●"
                 } else {
@@ -2134,10 +3088,11 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
                 );
                 format!("{cursor} {expand_marker} {marker} {summary}")
             }
-            Some(f_idx) => {
+            ProfileRow::Field(entry_idx, f_idx) => {
+                let entry = &dialog.entries[*entry_idx];
                 let label = wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*f_idx]);
                 let value = if editing {
-                    dialog.editing.as_ref().unwrap().lines.join("")
+                    wyj_i18n::tr("profile.dialog.editing_placeholder")
                 } else if *f_idx == PROFILE_API_KEY_FIELD_IDX {
                     mask_secret(entry.text_value(*f_idx))
                 } else {
@@ -2145,6 +3100,10 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
                 };
                 let cursor = if selected_row { "▶" } else { " " };
                 format!("{cursor}     {label:<label_width$}{value}")
+            }
+            ProfileRow::AddNew => {
+                let cursor = if selected_row { "▶" } else { " " };
+                format!("{cursor} + {}", wyj_i18n::tr("profile.dialog.add_new_row"))
             }
         };
         let text = truncate_line(&text, w);
@@ -2182,25 +3141,15 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
 
-    if let Some(ib) = &dialog.editing {
-        let (_, vis_col) = ib.cursor_visual_pos(w.saturating_sub(7 + label_width));
-        let cursor_x = (inner.x + (7 + label_width + vis_col) as u16)
-            .min(inner.x + inner.width.saturating_sub(1));
-        let cursor_y =
-            (inner.y + dialog.cursor as u16).min(inner.y + inner.height.saturating_sub(1));
-        f.set_cursor_position(Position::new(cursor_x, cursor_y));
+    // 光标完全交给 draw_input 的借用态分支（借用中不在这里画光标）。
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(f, area, &wyj_i18n::tr("profile.title"), menu);
+        return;
     }
 
     match &dialog.overlay {
         ProfileOverlay::None => {}
-        ProfileOverlay::Renaming { input, .. } => {
-            draw_profile_text_overlay(
-                f,
-                area,
-                "profile.overlay.rename_title",
-                &input.lines.join(""),
-            );
-        }
         ProfileOverlay::TemplatePicker { selected } => {
             draw_profile_list_overlay(
                 f,
@@ -2219,15 +3168,6 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
                 *selected,
             );
         }
-        ProfileOverlay::ConfirmDelete { entry_idx } => {
-            let name = &dialog.entries[*entry_idx].name;
-            draw_profile_text_overlay(
-                f,
-                area,
-                "profile.overlay.confirm_delete_title",
-                &wyj_i18n::tr_fmt("profile.overlay.confirm_delete_body", &[("name", name)]),
-            );
-        }
         ProfileOverlay::FetchingModels { .. } => {
             draw_profile_text_overlay(
                 f,
@@ -2236,14 +3176,16 @@ fn draw_profile_dialog(f: &mut Frame, dialog: &ProfileDialog, area: Rect) {
                 &wyj_i18n::tr("profile.fetch.in_progress"),
             );
         }
-        ProfileOverlay::ModelsPicker {
-            models, selected, ..
-        } => {
+        ProfileOverlay::UnsavedChanges { selected } => {
             draw_profile_list_overlay(
                 f,
                 area,
-                "profile.overlay.models_title",
-                models.clone(),
+                "profile.overlay.unsaved_title",
+                vec![
+                    wyj_i18n::tr("profile.overlay.unsaved_save_close"),
+                    wyj_i18n::tr("profile.overlay.unsaved_discard_close"),
+                    wyj_i18n::tr("profile.overlay.unsaved_cancel"),
+                ],
                 *selected,
             );
         }
@@ -2319,6 +3261,114 @@ fn draw_profile_list_overlay(
             Line::from(Span::styled(text, style))
         })
         .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// 三个面板(`/mcp`/`/skills`/`/plugins`)共用的"操作菜单"浮层：选中某一行按 Enter
+/// 弹出，Up/Down 选、Enter 确认、Esc 逐级返回。居中定位而非贴边行——列表可能
+/// 滚动，行级定位在选中行贴近屏幕边缘时会被截断，故直接复用
+/// `draw_profile_list_overlay` 的居中 Block + 高亮手法。
+pub fn draw_action_menu<T, A: PartialEq>(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    menu: &ActionMenu<T, A>,
+) {
+    if let Some(confirming) = &menu.confirming {
+        let label = menu
+            .items
+            .iter()
+            .find(|it| &it.action == confirming)
+            .map(|it| it.label.as_str())
+            .unwrap_or("");
+        draw_confirm_overlay(f, area, title, label);
+        return;
+    }
+
+    let width = (area.width * 6 / 10).clamp(40, 90).min(area.width);
+    let height = ((menu.items.len() as u16) + 2)
+        .min(area.height.saturating_sub(2))
+        .max(4);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+    let w = inner.width as usize;
+
+    let lines: Vec<Line<'static>> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let marker = if i == menu.selected { "▶ " } else { "  " };
+            let mut text = format!("{marker}{}", item.label);
+            if item.disabled {
+                if let Some(reason) = &item.disabled_reason {
+                    text.push_str(&format!(" ({reason})"));
+                }
+            }
+            let text = truncate_line(&text, w);
+            let style = if item.disabled {
+                Theme::dim()
+            } else if i == menu.selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// `draw_action_menu` 里危险操作的二级确认子步骤："确定要 {label} 吗？"
+fn draw_confirm_overlay(f: &mut Frame, area: Rect, title: &str, action_label: &str) {
+    let width = (area.width * 6 / 10).clamp(40, 70).min(area.width);
+    let height = 4u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::WARNING))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(overlay_area);
+    f.render_widget(block, overlay_area);
+    let w = inner.width as usize;
+
+    let question = truncate_line(
+        &wyj_i18n::tr_fmt(
+            "dialog.action_menu.confirm_question",
+            &[("action", action_label)],
+        ),
+        w,
+    );
+    let hint = truncate_line(&wyj_i18n::tr("dialog.action_menu.confirm_hint"), w);
+    let lines = vec![
+        Line::from(Span::styled(question, Theme::warning())),
+        Line::from(Span::styled(hint, Theme::dim())),
+    ];
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 

@@ -77,6 +77,58 @@ pub enum AgentEvent {
     SubAgent(wyj_tools::SubAgentEvent),
     /// 后台标题生成完成（首轮后 LLM 生成短标题，用于更新终端窗口标题）
     TitleGenerated(String),
+    /// /mcp 面板 Browse tab 发起的 registry 搜索结果
+    McpRegistryFetched {
+        result: Result<Vec<wyj_store::registry::RegistryServerSummary>, String>,
+    },
+    /// /skills 面板对某个 marketplace 的 clone/pull + 清单解析结果
+    SkillMarketplaceSynced {
+        marketplace_id: String,
+        git_url: String,
+        result: Result<Vec<wyj_store::marketplace::MarketplaceSkillEntry>, String>,
+    },
+    /// /mcp 面板"升级"结果（row_idx 对应 McpDialog.installed 下标）
+    McpUpgraded {
+        row_idx: usize,
+        result: Result<wyj_store::UpgradeOutcome, String>,
+    },
+    /// /skills 面板"升级"结果（row_idx 对应 SkillsDialog.installed 下标）
+    SkillUpgraded {
+        row_idx: usize,
+        result: Result<wyj_store::UpgradeOutcome, String>,
+    },
+    /// 启动时后台连接某个 MCP server 成功——TUI 不再在界面打开前同步等待
+    /// MCP 连接（会拖慢启动），改为界面先打开、MCP 在后台连接，成功后把
+    /// 新工具注册进当前 agent 快照并原子替换回 shared_agent。
+    McpBackgroundConnected { name: String, tool_count: usize },
+    /// 启动时后台连接某个 MCP server 失败或超时——此前只写 `tracing::warn!`
+    /// 日志，用户在 TUI 里完全无感知；现在同时推一条可见提示 + 更新
+    /// `AppState.mcp_connection_status`，供 `/mcp` 面板逐行展示连接状态。
+    McpBackgroundFailed {
+        name: String,
+        reason: McpConnFailReason,
+    },
+    /// /plugins 面板对某个插件 marketplace 的 clone/pull + marketplace.json 解析结果
+    PluginMarketplaceSynced {
+        marketplace_id: String,
+        result: Result<wyj_store::plugin_manifest::PluginMarketplaceManifest, String>,
+    },
+    /// /plugins 面板安装结果
+    PluginInstalled {
+        result: Result<wyj_store::plugin_install::PluginInstallReport, String>,
+    },
+    /// /plugins 面板"升级"结果（row_idx 对应 PluginsDialog.installed 下标）
+    PluginUpgraded {
+        row_idx: usize,
+        result: Result<wyj_store::UpgradeOutcome, String>,
+    },
+}
+
+/// MCP server 后台连接失败的具体原因，供渲染层区分文案
+#[derive(Debug, Clone)]
+pub enum McpConnFailReason {
+    Error(String),
+    Timeout,
 }
 
 /// 来自 UI 的用户事件（保留定义，目前未使用）

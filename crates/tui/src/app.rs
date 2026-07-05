@@ -3,6 +3,7 @@
 use crate::event::{is_quit, AgentEvent};
 use crate::input::InputBox;
 use crate::render;
+use crate::theme::Theme;
 use anyhow::Result;
 use crossterm::{
     event::{
@@ -16,6 +17,7 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
+use ratatui::style::Color as UiColor;
 use ratatui::Terminal;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
@@ -208,6 +210,10 @@ pub struct SubAgentUiState {
     pub has_result: bool,
     /// 完成/中断时间；None 表示仍在运行，用于面板定格计时
     pub finished_at: Option<Instant>,
+    /// Done 事件里无条件填充的最终结果全文（前台/后台一致）。
+    /// 后台子 Agent 的 ToolResult 消息内容只是"已后台启动"占位文本，
+    /// 真实结果只经这个字段，供 agents 面板详情区展示。
+    pub final_result: Option<String>,
 }
 
 impl SubAgentUiState {
@@ -836,7 +842,7 @@ pub fn profile_field_kind(idx: usize) -> SettingsFieldKind {
 }
 
 /// 单个分组的编辑草稿
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ProfileEntryDraft {
     pub name: String,
     /// 0 = Anthropic, 1 = OpenAI
@@ -994,32 +1000,22 @@ impl ProfileEntryDraft {
     }
 }
 
-/// ProfileDialog 里当前展示的浮层
+/// ProfileDialog 里当前展示的浮层。重命名/删除确认/模型选择已分别迁移到
+/// `InputOwner::Profile` 借用与 `ActionMenu`（危险确认自带 `confirming` 二级
+/// 确认、模型选择复用 `dialog.menu`），不再需要专属浮层变体。
 pub enum ProfileOverlay {
     None,
-    /// 重命名 entries[entry_idx]
-    Renaming {
-        entry_idx: usize,
-        input: InputBox,
-    },
     /// 新建分组模板选择器
     TemplatePicker {
         selected: usize,
-    },
-    /// 删除二次确认
-    ConfirmDelete {
-        entry_idx: usize,
     },
     /// 拉取模型列表中（entry_idx 的 field_idx 字段）
     FetchingModels {
         entry_idx: usize,
         field_idx: usize,
     },
-    /// 模型列表拉取成功，供选择
-    ModelsPicker {
-        entry_idx: usize,
-        field_idx: usize,
-        models: Vec<String>,
+    /// Esc 关闭面板时存在未保存修改，三选一确认（保存并关闭/不保存关闭/取消）
+    UnsavedChanges {
         selected: usize,
     },
 }
@@ -1033,10 +1029,16 @@ pub struct ProfileDialog {
     pub cursor: usize,
     /// 当前展开显示字段的 entry 下标
     pub expanded: Option<usize>,
-    /// Some 表示当前字段正在行内文本编辑
-    pub editing: Option<InputBox>,
     pub overlay: ProfileOverlay,
     pub error: Option<String>,
+    /// 底部主输入框借用态下的草稿内容（`InputOwner::Profile(_)` 生效期间使用）
+    pub live_input: InputBox,
+    /// 选中列表条目回车后弹出的操作菜单；None = 未打开
+    pub menu: Option<ActionMenu<ProfileRow, ProfileMenuAction>>,
+    /// 拉取到的模型名列表，供 `ProfileMenuAction::ModelChoice(下标)` 按下标取值
+    pub pending_models: Vec<String>,
+    /// 打开面板时的快照，供 Esc 时判断"是否有未保存改动"
+    saved_snapshot: (Vec<ProfileEntryDraft>, usize),
 }
 
 impl ProfileDialog {
@@ -1051,34 +1053,47 @@ impl ProfileDialog {
             .iter()
             .position(|p| p.name == cfg.active_profile)
             .unwrap_or(0);
+        let saved_snapshot = (entries.clone(), active_idx);
         Self {
             entries,
             active_idx,
             cursor: 0,
             expanded: None,
-            editing: None,
             overlay: ProfileOverlay::None,
             error: None,
+            live_input: InputBox::new(),
+            menu: None,
+            pending_models: Vec::new(),
+            saved_snapshot,
         }
     }
 
-    /// 扁平化行列表：(entry_idx, field_idx)，field_idx = None 表示是 entry 头行
-    pub fn rows(&self) -> Vec<(usize, Option<usize>)> {
+    /// 是否存在未保存的修改（Esc 关闭前的脏检查）
+    fn is_dirty(&self) -> bool {
+        self.entries != self.saved_snapshot.0 || self.active_idx != self.saved_snapshot.1
+    }
+
+    /// 扁平化行列表：entry 头行 + 展开后的字段行 + 末尾固定"+ 新建分组"行。
+    pub fn rows(&self) -> Vec<ProfileRow> {
         let mut rows = Vec::new();
         for i in 0..self.entries.len() {
-            rows.push((i, None));
+            rows.push(ProfileRow::Header(i));
             if self.expanded == Some(i) {
                 for f in 0..PROFILE_FIELD_COUNT {
-                    rows.push((i, Some(f)));
+                    rows.push(ProfileRow::Field(i, f));
                 }
             }
         }
+        rows.push(ProfileRow::AddNew);
         rows
     }
 
-    /// 当前游标所在行对应的 (entry_idx, field_idx)
-    fn selected_row(&self) -> (usize, Option<usize>) {
-        self.rows().get(self.cursor).copied().unwrap_or((0, None))
+    /// 当前游标所在行
+    fn selected_row(&self) -> ProfileRow {
+        self.rows()
+            .get(self.cursor)
+            .copied()
+            .unwrap_or(ProfileRow::AddNew)
     }
 
     fn clamp_cursor(&mut self) {
@@ -1101,6 +1116,2240 @@ impl ProfileDialog {
             }
         }
         None
+    }
+
+    /// 选中条目回车后弹出的操作菜单。头行 → 展开/收起、设为当前、重命名、删除
+    /// 四项；model/plan_model/exec_model 字段行 → 手动编辑、从服务器拉取列表
+    /// 两项；其余行（非 model 字段、AddNew）不产生菜单。
+    pub fn build_menu(&self) -> Option<ActionMenu<ProfileRow, ProfileMenuAction>> {
+        let row = self.selected_row();
+        match row {
+            ProfileRow::Header(entry_idx) => {
+                let is_active = entry_idx == self.active_idx;
+                let expanded = self.expanded == Some(entry_idx);
+                let can_delete = self.entries.len() > 1 && !is_active;
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if expanded {
+                            "profile.menu.collapse"
+                        } else {
+                            "profile.menu.expand"
+                        }),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::ToggleExpand),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.activate"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::Activate),
+                        dangerous: false,
+                        disabled: is_active,
+                        disabled_reason: is_active
+                            .then(|| wyj_i18n::tr("profile.menu.already_active")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.rename"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::Rename),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.delete"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::Delete),
+                        dangerous: true,
+                        disabled: !can_delete,
+                        disabled_reason: (!can_delete).then(|| {
+                            wyj_i18n::tr(if self.entries.len() <= 1 {
+                                "profile.error.last_one"
+                            } else {
+                                "profile.error.delete_active"
+                            })
+                        }),
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            ProfileRow::Field(_, f) if PROFILE_MODEL_FIELD_IDXS.contains(&f) => {
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.manual_edit"),
+                        action: ProfileMenuAction::Field(ProfileFieldAction::ManualEdit),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.fetch_models"),
+                        action: ProfileMenuAction::Field(ProfileFieldAction::FetchFromServer),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            _ => None,
+        }
+    }
+}
+
+// ── 面板通用交互组件：InputOwner / FlatRow / ActionMenu ─────────────────────────
+//
+// 供 McpDialog/SkillsDialog/PluginsDialog 共享的"方向键菜单导航 + 底部主输入框
+// 借用"模式。不做成跨三个面板的泛型 dialog trait——三者的行 payload 形状完全
+// 不同，硬抽象只会牺牲可读性；这里只共享"输入借用去哪儿写"和"操作菜单长什么样"
+// 这两个真正通用的部分。
+
+/// 主输入框（屏幕底部、用户平时打字发消息那个）当前借给了谁。
+/// None = 属于聊天（默认）。Some(_) 时 `tui_main` 对 `Event::Key`/`Event::Paste`
+/// 的分发在最前面拦截，聊天草稿本身不受影响（用户输入到一半被打断也不丢）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InputOwner {
+    Mcp(McpInputField),
+    Skills(SkillsInputField),
+    Plugins(PluginsInputField),
+    Profile(ProfileInputField),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpInputField {
+    AddRegistryUrl,
+    BrowseSearch,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SkillsInputField {
+    AddMarketplaceUrl,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginsInputField {
+    AddMarketplaceUrl,
+    AddLocalPluginPath,
+}
+
+/// `/model` 面板字段编辑借用态：重命名分组只需 `entry_idx`；编辑具体字段
+/// 需要 `entry_idx` + `field_idx`（字段的 i18n label 可通过 `field_idx` 静态
+/// 查表 `PROFILE_FIELD_LABEL_KEYS` 得到，不需要访问 entry 名字或其它 state）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileInputField {
+    Rename { entry_idx: usize },
+    Field { entry_idx: usize, field_idx: usize },
+}
+
+impl InputOwner {
+    /// 借用期间输入框标题文案 + 主题色，如 "[MCP] 输入 registry URL (Enter 提交 / Esc 取消)"
+    pub fn prompt(&self) -> (String, UiColor) {
+        match self {
+            InputOwner::Mcp(McpInputField::AddRegistryUrl) => (
+                wyj_i18n::tr("dialog.input_owner.mcp_add_registry"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Mcp(McpInputField::BrowseSearch) => (
+                wyj_i18n::tr("dialog.input_owner.mcp_browse_search"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Skills(SkillsInputField::AddMarketplaceUrl) => (
+                wyj_i18n::tr("dialog.input_owner.skills_add_marketplace"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Plugins(PluginsInputField::AddMarketplaceUrl) => (
+                wyj_i18n::tr("dialog.input_owner.plugins_add_marketplace"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Plugins(PluginsInputField::AddLocalPluginPath) => (
+                wyj_i18n::tr("dialog.input_owner.plugins_add_local"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Profile(ProfileInputField::Rename { .. }) => (
+                wyj_i18n::tr("dialog.input_owner.profile_rename"),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Profile(ProfileInputField::Field { field_idx, .. }) => (
+                wyj_i18n::tr_fmt(
+                    "dialog.input_owner.profile_field",
+                    &[("field", &wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*field_idx]))],
+                ),
+                Theme::CLAUDE,
+            ),
+        }
+    }
+
+    /// 是否"边输入边驱动重算"（目前只有 Mcp::BrowseSearch 的实时过滤）；
+    /// false 则是"提交式"，仅在 Enter 时触发动作。
+    pub fn is_live_filter(&self) -> bool {
+        matches!(self, InputOwner::Mcp(McpInputField::BrowseSearch))
+    }
+
+    /// 取出该字段对应的可变草稿 InputBox —— 统一指向各 dialog 自己持有的
+    /// `live_input` 槽位（每个 dialog 只留一个槽位，当前被哪个字段占用由
+    /// `AppState.input_owner` 决定，不再各表单各开一份 InputBox）。
+    pub fn live_input_mut<'a>(&self, state: &'a mut AppState) -> Option<&'a mut InputBox> {
+        match self {
+            InputOwner::Mcp(_) => state.mcp_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Skills(_) => state.skills_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Plugins(_) => state.plugins_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Profile(_) => state.profile_dialog.as_mut().map(|d| &mut d.live_input),
+        }
+    }
+
+    /// 只读版本，供渲染层（`render::draw_input`）决定当前该画哪个 InputBox 使用。
+    pub fn live_input<'a>(&self, state: &'a AppState) -> Option<&'a InputBox> {
+        match self {
+            InputOwner::Mcp(_) => state.mcp_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Skills(_) => state.skills_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Plugins(_) => state.plugins_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Profile(_) => state.profile_dialog.as_ref().map(|d| &d.live_input),
+        }
+    }
+
+    /// 借用态下 Esc 取消时，清空对应 dialog 的 live_input 草稿。
+    pub fn clear_live_input(&self, state: &mut AppState) {
+        if let Some(ib) = self.live_input_mut(state) {
+            *ib = InputBox::new();
+        }
+    }
+}
+
+/// 三个面板的 `rows()` 都返回这个统一形状：当前 tab 下的条目下标，
+/// 或该 tab 末尾固定的"+ 添加"行。tab 头本身**不算进 rows()**——
+/// tab 头单独渲染，光标只在 rows() 范围内移动；Left/Right 切 tab 时
+/// rows() 整体替换、cursor 归零，Up/Down 走列表，两个维度完全正交。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FlatRow {
+    Entry(usize),
+    AddNew,
+}
+
+/// 三个面板共用的"选中条目后弹出的操作菜单"（Installed 行的启停/升级/卸载/
+/// 查看详情，Registries/Marketplaces 行的浏览/删除，等等）。
+///
+/// `target` 类型泛化为 `T`（而非硬编码 `FlatRow`）：Mcp/Skills/Plugins 是纯扁平
+/// 列表，一个 `FlatRow::Entry(usize)` 就够定位；但 ProfileDialog 是"entry 头行 +
+/// 展开字段行"两层结构，需要同时装下 entry_idx + field_idx，只能用专属的
+/// `ProfileRow` 作为 `T`。`draw_action_menu` 从不读取 `target`（只读
+/// `confirming`/`items`/`selected`），泛化对已有三面板是零风险的机械签名变更，
+/// 所有既有调用点靠类型推导自动落地 `T=FlatRow`，不需要改任何调用代码。
+pub struct ActionMenu<T, A> {
+    /// 菜单是对哪一行弹出的，用于标题里显示条目名 + 执行动作时定位数据
+    pub target: T,
+    pub items: Vec<ActionMenuItem<A>>,
+    pub selected: usize,
+    /// Some(a) 表示已选中 items 里的危险动作 a，进入"确定要 xxx 吗？[是/否]"二级确认
+    pub confirming: Option<A>,
+}
+
+pub struct ActionMenuItem<A> {
+    pub label: String,
+    pub action: A,
+    /// true：选中执行前先进 confirming 二级确认（卸载/删除源等破坏性操作）
+    pub dangerous: bool,
+    /// 置灰仍可见（如"手动配置的 server 不可升级"）
+    pub disabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+impl<T, A> ActionMenu<T, A> {
+    pub fn new(target: T, items: Vec<ActionMenuItem<A>>) -> Self {
+        Self {
+            target,
+            items,
+            selected: 0,
+            confirming: None,
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.confirming.is_none() {
+            self.selected = self.selected.saturating_sub(1);
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.confirming.is_none() {
+            let len = self.items.len();
+            self.selected = (self.selected + 1).min(len.saturating_sub(1));
+        }
+    }
+
+    /// 当前选中项，跳过永远不该越界的空菜单
+    pub fn selected_item(&self) -> Option<&ActionMenuItem<A>> {
+        self.items.get(self.selected)
+    }
+}
+
+/// `ProfileDialog`（`/model` 面板）专属的行类型：不同于 Mcp/Skills/Plugins 的纯
+/// 扁平列表，这里是"entry 头行 + 展开后最多 `PROFILE_FIELD_COUNT` 个字段行 +
+/// 末尾固定 1 个新建行"的两层结构，`FlatRow::Entry(usize)` 只有一个索引装不下
+/// entry_idx + field_idx 两个维度，因此单独定义一个平行类型。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileRow {
+    Header(usize),
+    Field(usize, usize),
+    AddNew,
+}
+
+/// 分组头行菜单动作（设为当前/重命名/删除 + "展开查看字段"这个原本是裸键
+/// Enter 直接触发、现在并入菜单的导航类动作）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileHeaderAction {
+    ToggleExpand,
+    Activate,
+    Rename,
+    Delete,
+}
+
+/// model/plan_model/exec_model 字段的小菜单动作（原 Ctrl+L 拉取模型列表并入此处）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFieldAction {
+    ManualEdit,
+    FetchFromServer,
+}
+
+/// 头行菜单 / 字段小菜单 / 拉取到的模型选择菜单，三者互斥，统一到
+/// `ProfileDialog.menu` 一个字段（对齐 `McpMenuAction::Installed(..)/Registries(..)`
+/// 的既有模式）。`ModelChoice` 只存下标而非模型名字符串——`ActionMenu<T, A>`
+/// 要求 `A: Copy`，`String` 不是 `Copy`，真正的字符串另存在
+/// `ProfileDialog.pending_models` 里，执行时按下标取值。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileMenuAction {
+    Header(ProfileHeaderAction),
+    Field(ProfileFieldAction),
+    ModelChoice(usize),
+}
+
+/// `/model` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
+fn profile_handle_menu_key(
+    state: &mut AppState,
+    code: KeyCode,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    enum Step {
+        None,
+        Close,
+        Cancel,
+        Confirm(ProfileMenuAction),
+        Execute(ProfileMenuAction, ProfileRow),
+    }
+
+    let step = {
+        let Some(dialog) = &mut state.profile_dialog else {
+            return;
+        };
+        let Some(menu) = &mut dialog.menu else {
+            return;
+        };
+        let target = menu.target;
+        if let Some(confirming) = menu.confirming {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
+                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
+                _ => Step::None,
+            }
+        } else {
+            match code {
+                KeyCode::Up => {
+                    menu.move_up();
+                    Step::None
+                }
+                KeyCode::Down => {
+                    menu.move_down();
+                    Step::None
+                }
+                KeyCode::Esc => Step::Close,
+                KeyCode::Enter => match menu.selected_item() {
+                    Some(item) if item.disabled => Step::None,
+                    Some(item) if item.dangerous => Step::Confirm(item.action),
+                    Some(item) => Step::Execute(item.action, target),
+                    None => Step::None,
+                },
+                _ => Step::None,
+            }
+        }
+    };
+
+    match step {
+        Step::None => {}
+        Step::Close => {
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.menu = None;
+            }
+        }
+        Step::Cancel => {
+            if let Some(dialog) = &mut state.profile_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = None;
+                }
+            }
+        }
+        Step::Confirm(action) => {
+            if let Some(dialog) = &mut state.profile_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = Some(action);
+                }
+            }
+        }
+        Step::Execute(action, target) => {
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.menu = None;
+            }
+            profile_execute_menu_action(state, action, target, agent_tx);
+        }
+    }
+}
+
+fn profile_execute_menu_action(
+    state: &mut AppState,
+    action: ProfileMenuAction,
+    target: ProfileRow,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    match action {
+        ProfileMenuAction::Header(ProfileHeaderAction::ToggleExpand) => {
+            let ProfileRow::Header(entry_idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.expanded = if dialog.expanded == Some(entry_idx) {
+                    None
+                } else {
+                    Some(entry_idx)
+                };
+                dialog.clamp_cursor();
+            }
+        }
+        ProfileMenuAction::Header(ProfileHeaderAction::Activate) => {
+            let ProfileRow::Header(entry_idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.active_idx = entry_idx;
+                dialog.error = None;
+            }
+        }
+        ProfileMenuAction::Header(ProfileHeaderAction::Rename) => {
+            let ProfileRow::Header(entry_idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                let name = dialog.entries[entry_idx].name.clone();
+                dialog.live_input = InputBox::new();
+                dialog.live_input.insert_text(&name);
+            }
+            state.input_owner = Some(InputOwner::Profile(ProfileInputField::Rename { entry_idx }));
+        }
+        ProfileMenuAction::Header(ProfileHeaderAction::Delete) => {
+            let ProfileRow::Header(entry_idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.entries.remove(entry_idx);
+                if dialog.active_idx > entry_idx {
+                    dialog.active_idx -= 1;
+                }
+                match dialog.expanded {
+                    Some(e) if e == entry_idx => dialog.expanded = None,
+                    Some(e) if e > entry_idx => dialog.expanded = Some(e - 1),
+                    _ => {}
+                }
+                dialog.clamp_cursor();
+            }
+        }
+        ProfileMenuAction::Field(ProfileFieldAction::ManualEdit) => {
+            let ProfileRow::Field(entry_idx, field_idx) = target else {
+                return;
+            };
+            let prefill = state
+                .profile_dialog
+                .as_ref()
+                .map(|d| d.entries[entry_idx].text_value(field_idx).to_string())
+                .unwrap_or_default();
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.live_input = InputBox::new();
+                dialog.live_input.insert_text(&prefill);
+            }
+            state.input_owner = Some(InputOwner::Profile(ProfileInputField::Field {
+                entry_idx,
+                field_idx,
+            }));
+        }
+        ProfileMenuAction::Field(ProfileFieldAction::FetchFromServer) => {
+            let ProfileRow::Field(entry_idx, field_idx) = target else {
+                return;
+            };
+            let Some(entry) = state
+                .profile_dialog
+                .as_ref()
+                .map(|d| d.entries[entry_idx].clone())
+            else {
+                return;
+            };
+            let api_key = entry.api_key.clone();
+            if api_key.trim().is_empty() {
+                if let Some(dialog) = &mut state.profile_dialog {
+                    dialog.error = Some(wyj_i18n::tr("profile.fetch.need_api_key"));
+                }
+                return;
+            }
+            let provider = entry.provider();
+            let base_url = if entry.base_url.trim().is_empty() {
+                match provider {
+                    wyj_config::Provider::Anthropic => "https://api.anthropic.com".to_string(),
+                    wyj_config::Provider::OpenAI => "https://api.openai.com/v1".to_string(),
+                }
+            } else {
+                entry.base_url.clone()
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                dialog.overlay = ProfileOverlay::FetchingModels {
+                    entry_idx,
+                    field_idx,
+                };
+            }
+            let tx = agent_tx.clone();
+            tokio::spawn(async move {
+                let result = wyj_api::fetch_model_ids(&provider, &base_url, &api_key)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx
+                    .send(AgentEvent::ModelsFetched {
+                        entry_idx,
+                        field_idx,
+                        result,
+                    })
+                    .await;
+            });
+        }
+        ProfileMenuAction::ModelChoice(i) => {
+            let ProfileRow::Field(entry_idx, field_idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.profile_dialog {
+                if let Some(name) = dialog.pending_models.get(i).cloned() {
+                    dialog.entries[entry_idx].set_text_value(field_idx, name);
+                }
+            }
+        }
+    }
+}
+
+/// Ctrl+S 与"保存并关闭"菜单选项共用的保存逻辑：校验 → 写盘 → 重建 agent。
+/// 返回 `true` 表示已成功保存（调用方据此决定是否关闭面板）。
+#[allow(clippy::too_many_arguments)]
+fn profile_try_save(
+    state: &mut AppState,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    rebuild_fn: &RebuildFn,
+    system_prompt_extra: &str,
+    todo_store: &Arc<std::sync::Mutex<TodoStore>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+) -> bool {
+    let mut saved = false;
+    if let Some(dialog) = &mut state.profile_dialog {
+        if let Some(err_key) = dialog.validate_names() {
+            dialog.error = Some(wyj_i18n::tr(err_key));
+        } else if let Some((bad_idx, err_key)) = dialog
+            .entries
+            .iter()
+            .enumerate()
+            .find_map(|(i, e)| e.validate().map(|k| (i, k)))
+        {
+            dialog.expanded = Some(bad_idx);
+            dialog.clamp_cursor();
+            dialog.error = Some(wyj_i18n::tr(err_key));
+        } else {
+            let mut new_cfg = state.config.clone();
+            new_cfg.profiles = dialog.entries.iter().map(|e| e.to_profile()).collect();
+            new_cfg.active_profile = dialog.entries[dialog.active_idx].name.clone();
+            match new_cfg.save() {
+                Ok(()) => {
+                    saved = true;
+                    state.config = new_cfg.clone();
+                    let model_for_mode = state.config.model_for_mode(&state.mode).to_string();
+                    match rebuild_fn(&state.config, &model_for_mode) {
+                        Ok(new_agent) => {
+                            // rebuild_fn 已装配完整 system prompt，只拼回模式追加段
+                            let new_agent = new_agent
+                                .append_system(system_prompt_extra.trim_start().to_string());
+                            let new_agent =
+                                wire_tool_callback(new_agent, agent_tx.clone(), todo_store.clone());
+                            *shared_agent.write().unwrap() = Arc::new(new_agent);
+                            state.model_name = model_for_mode;
+                            state.context_window = state.config.active_profile().context_window;
+                            state
+                                .messages
+                                .push(ChatMessage::system(wyj_i18n::tr("profile.saved")));
+                        }
+                        Err(e) => {
+                            state
+                                .messages
+                                .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
+                                    "settings.rebuild_failed",
+                                    &[("err", &e.to_string())],
+                                )));
+                        }
+                    }
+                }
+                Err(e) => {
+                    dialog.error = Some(wyj_i18n::tr_fmt(
+                        "settings.save_failed",
+                        &[("err", &e.to_string())],
+                    ));
+                }
+            }
+        }
+    }
+    saved
+}
+
+// ── MCP server 管理面板：/mcp 命令触发 ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpDialogTab {
+    Installed,
+    Registries,
+    Browse,
+}
+
+/// 后台启动连接一个配置的 MCP server 的实时状态（与 `/mcp` 面板是否打开无关）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpConnStatus {
+    Connecting,
+    Connected { tool_count: usize },
+    Failed,
+    TimedOut,
+}
+
+/// Installed tab 的一行：config 里的 server 条目 + 所在 scope + lockfile 纳管信息（None=未纳管/手动配置）
+pub struct McpInstalledRow {
+    pub config: wyj_config::McpServerConfig,
+    pub scope: wyj_store::InstallScope,
+    pub managed: Option<wyj_store::lockfile::InstalledMcpEntry>,
+}
+
+pub enum McpOverlay {
+    None,
+    Searching,
+    InstallConfirm {
+        server: Box<wyj_store::registry::RegistryServerSummary>,
+        package: wyj_store::mcp_install::PackageChoice,
+        scope: wyj_store::InstallScope,
+    },
+    Upgrading {
+        row_idx: usize,
+    },
+    /// 文本内容存在 `McpDialog.live_input`（借用底部主输入框，见 `InputOwner`）
+    AddRegistry,
+    /// 只读详情浮层（Installed 行菜单的"查看详情"），Enter/Esc 都直接关闭
+    Detail {
+        title: String,
+        lines: Vec<String>,
+    },
+}
+
+/// Installed 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpRowAction {
+    ToggleEnabled,
+    Upgrade,
+    Uninstall,
+    ViewDetail,
+}
+
+/// Registries 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpSourceAction {
+    OpenBrowse,
+    Remove,
+}
+
+/// Browse 结果行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpBrowseAction {
+    Install,
+}
+
+/// 三个 tab 各自的行菜单动作，用外层枚举包住（同一 dialog 不同 tab 菜单类型不同）
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum McpMenuAction {
+    Installed(McpRowAction),
+    Registries(McpSourceAction),
+    Browse(McpBrowseAction),
+}
+
+/// MCP server 管理面板状态（/mcp 命令触发）
+pub struct McpDialog {
+    pub tab: McpDialogTab,
+    pub installed: Vec<McpInstalledRow>,
+    /// 扁平化行游标，语义随当前 tab 变化（见 `rows()`），Left/Right 切 tab 时归零
+    pub cursor: usize,
+    /// 已添加的 registry 源（首次打开面板时自动预置官方源，见 `ensure_default_registry`）
+    pub registries: Vec<wyj_store::lockfile::McpRegistrySource>,
+    /// Browse tab 当前实际查询的源（Registries tab 里选中"浏览"菜单项切换）
+    pub active_registry: wyj_store::lockfile::McpRegistrySource,
+    pub browse_results: Vec<wyj_store::registry::RegistryServerSummary>,
+    pub overlay: McpOverlay,
+    /// 选中列表条目回车后弹出的操作菜单；None = 未打开
+    pub menu: Option<ActionMenu<FlatRow, McpMenuAction>>,
+    pub error: Option<String>,
+    pub status: Option<String>,
+    /// 底部主输入框借用态下的草稿内容（`InputOwner::Mcp(_)` 生效期间使用）
+    pub live_input: InputBox,
+}
+
+impl McpDialog {
+    fn new(cfg: &Config, cwd: &std::path::Path) -> Self {
+        let merged = wyj_config::merged_mcp_servers(cfg, cwd);
+        let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
+        let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
+        let project_names: std::collections::HashSet<String> = wyj_config::load_project_mcp(cwd)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
+        let installed = merged
+            .into_iter()
+            .map(|config| {
+                let scope = if project_names.contains(&config.name) {
+                    wyj_store::InstallScope::Project
+                } else {
+                    wyj_store::InstallScope::Global
+                };
+                let managed = match scope {
+                    wyj_store::InstallScope::Global => global_lock
+                        .mcp_servers
+                        .iter()
+                        .find(|e| e.name == config.name)
+                        .cloned(),
+                    wyj_store::InstallScope::Project => project_lock
+                        .mcp_servers
+                        .iter()
+                        .find(|e| e.name == config.name)
+                        .cloned(),
+                };
+                McpInstalledRow {
+                    config,
+                    scope,
+                    managed,
+                }
+            })
+            .collect();
+
+        let registries = wyj_store::registry::ensure_default_registry()
+            .unwrap_or_else(|_| vec![wyj_store::registry::official_registry_source()]);
+        let active_registry = registries
+            .first()
+            .cloned()
+            .unwrap_or_else(wyj_store::registry::official_registry_source);
+
+        Self {
+            tab: McpDialogTab::Installed,
+            installed,
+            cursor: 0,
+            registries,
+            active_registry,
+            live_input: InputBox::new(),
+            browse_results: Vec::new(),
+            overlay: McpOverlay::None,
+            menu: None,
+            error: None,
+            status: None,
+        }
+    }
+
+    fn refresh_installed(&mut self, cfg: &Config, cwd: &std::path::Path) {
+        let fresh = Self::new(cfg, cwd);
+        self.installed = fresh.installed;
+        self.clamp_cursor();
+    }
+
+    /// 增删 registry 源后重新读盘刷新列表；尽量保留当前选中的 `active_registry`
+    /// （按 id 匹配），若它被删除了则回退到列表第一项。
+    fn refresh_registries(&mut self) {
+        self.registries = wyj_store::registry::ensure_default_registry().unwrap_or_default();
+        self.clamp_cursor();
+        if !self
+            .registries
+            .iter()
+            .any(|r| r.id == self.active_registry.id)
+        {
+            if let Some(first) = self.registries.first() {
+                self.active_registry = first.clone();
+            }
+        }
+    }
+
+    /// 扁平化行列表：当前 tab 下的条目下标，或该 tab 的固定"+ 添加"/"搜索"行。
+    /// tab 头不算进 rows()，单独渲染；Installed 没有 AddNew（新增 MCP server
+    /// 走 Browse+安装，不是手工添加）。Browse 把"搜索"行固定放在最前面（下标
+    /// 0），复用 `FlatRow::AddNew` 这个"触发底部输入框借用"的通用语义。
+    pub fn rows(&self) -> Vec<FlatRow> {
+        match self.tab {
+            McpDialogTab::Installed => (0..self.installed.len()).map(FlatRow::Entry).collect(),
+            McpDialogTab::Registries => {
+                let mut r: Vec<_> = (0..self.registries.len()).map(FlatRow::Entry).collect();
+                r.push(FlatRow::AddNew);
+                r
+            }
+            McpDialogTab::Browse => {
+                let mut r = vec![FlatRow::AddNew];
+                r.extend((0..self.browse_results.len()).map(FlatRow::Entry));
+                r
+            }
+        }
+    }
+
+    pub fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    /// 选中条目回车后弹出的操作菜单，None 表示当前行不支持弹菜单（不应发生，
+    /// 调用方已确保 cursor 落在 Entry 行上）
+    pub fn build_menu(&self) -> Option<ActionMenu<FlatRow, McpMenuAction>> {
+        let row = *self.rows().get(self.cursor)?;
+        match (self.tab, row) {
+            (McpDialogTab::Installed, FlatRow::Entry(idx)) => {
+                let r = self.installed.get(idx)?;
+                let enabled = r.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                let can_upgrade = r.managed.as_ref().is_some_and(|m| m.is_managed());
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if enabled {
+                            "mcp.menu.disable"
+                        } else {
+                            "mcp.menu.enable"
+                        }),
+                        action: McpMenuAction::Installed(McpRowAction::ToggleEnabled),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("mcp.menu.upgrade"),
+                        action: McpMenuAction::Installed(McpRowAction::Upgrade),
+                        dangerous: false,
+                        disabled: !can_upgrade,
+                        disabled_reason: (!can_upgrade)
+                            .then(|| wyj_i18n::tr("mcp.error.manual_no_upgrade")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("mcp.menu.uninstall"),
+                        action: McpMenuAction::Installed(McpRowAction::Uninstall),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("mcp.menu.view_detail"),
+                        action: McpMenuAction::Installed(McpRowAction::ViewDetail),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (McpDialogTab::Registries, FlatRow::Entry(_)) => {
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("mcp.menu.browse_source"),
+                        action: McpMenuAction::Registries(McpSourceAction::OpenBrowse),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("mcp.menu.remove_source"),
+                        action: McpMenuAction::Registries(McpSourceAction::Remove),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (McpDialogTab::Browse, FlatRow::Entry(_)) => {
+                let items = vec![ActionMenuItem {
+                    label: wyj_i18n::tr("mcp.menu.install"),
+                    action: McpMenuAction::Browse(McpBrowseAction::Install),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }];
+                Some(ActionMenu::new(row, items))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `/mcp` 面板操作菜单的按键分发：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回。
+/// 危险操作（卸载/删除源）先进 `confirming` 二级确认，再次 Enter/y 才真正执行。
+fn mcp_handle_menu_key(
+    state: &mut AppState,
+    code: KeyCode,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    enum Step {
+        None,
+        Close,
+        Cancel,
+        Confirm(McpMenuAction),
+        Execute(McpMenuAction, FlatRow),
+    }
+
+    let step = {
+        let Some(dialog) = &mut state.mcp_dialog else {
+            return;
+        };
+        let Some(menu) = &mut dialog.menu else {
+            return;
+        };
+        let target = menu.target;
+        if let Some(confirming) = menu.confirming {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
+                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
+                _ => Step::None,
+            }
+        } else {
+            match code {
+                KeyCode::Up => {
+                    menu.move_up();
+                    Step::None
+                }
+                KeyCode::Down => {
+                    menu.move_down();
+                    Step::None
+                }
+                KeyCode::Esc => Step::Close,
+                KeyCode::Enter => match menu.selected_item() {
+                    Some(item) if item.disabled => Step::None,
+                    Some(item) if item.dangerous => Step::Confirm(item.action),
+                    Some(item) => Step::Execute(item.action, target),
+                    None => Step::None,
+                },
+                _ => Step::None,
+            }
+        }
+    };
+
+    match step {
+        Step::None => {}
+        Step::Close => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                dialog.menu = None;
+            }
+        }
+        Step::Cancel => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = None;
+                }
+            }
+        }
+        Step::Confirm(action) => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = Some(action);
+                }
+            }
+        }
+        Step::Execute(action, target) => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                dialog.menu = None;
+            }
+            mcp_execute_menu_action(state, action, target, agent_tx);
+        }
+    }
+}
+
+fn mcp_scope_label_text(scope: wyj_store::InstallScope) -> String {
+    wyj_i18n::tr(match scope {
+        wyj_store::InstallScope::Global => "mcp.dialog.scope_global",
+        wyj_store::InstallScope::Project => "mcp.dialog.scope_project",
+    })
+}
+
+/// 执行操作菜单选中项对应的动作（在按键分发之外单独拆出，便于危险操作走
+/// 二级确认后再调用同一套逻辑）。`target` 是菜单弹出时记录的目标行，用于
+/// 定位 `installed`/`registries`/`browse_results` 里具体是哪一条。
+fn mcp_execute_menu_action(
+    state: &mut AppState,
+    action: McpMenuAction,
+    target: FlatRow,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    let FlatRow::Entry(idx) = target else {
+        return;
+    };
+    match action {
+        McpMenuAction::Installed(McpRowAction::ToggleEnabled) => {
+            let info = state.mcp_dialog.as_ref().and_then(|d| {
+                d.installed.get(idx).map(|row| {
+                    let enabled = row.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                    (row.config.name.clone(), row.scope, enabled)
+                })
+            });
+            if let Some((name, scope, currently_enabled)) = info {
+                let result = wyj_store::mcp_install::set_mcp_enabled(
+                    &name,
+                    scope,
+                    &state.cwd,
+                    !currently_enabled,
+                );
+                if let Some(dialog) = &mut state.mcp_dialog {
+                    match result {
+                        Ok(()) => dialog.refresh_installed(&state.config, &state.cwd),
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        McpMenuAction::Installed(McpRowAction::Upgrade) => {
+            let info = state.mcp_dialog.as_ref().and_then(|d| {
+                d.installed.get(idx).and_then(|row| {
+                    row.managed
+                        .as_ref()
+                        .is_some_and(|m| m.is_managed())
+                        .then(|| (row.config.name.clone(), row.scope))
+                })
+            });
+            if let Some((name, scope)) = info {
+                if let Some(dialog) = &mut state.mcp_dialog {
+                    dialog.overlay = McpOverlay::Upgrading { row_idx: idx };
+                }
+                let tx = agent_tx.clone();
+                let cwd = state.cwd.clone();
+                tokio::spawn(async move {
+                    let result = wyj_store::mcp_install::upgrade_mcp_server(&name, scope, &cwd)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx
+                        .send(AgentEvent::McpUpgraded {
+                            row_idx: idx,
+                            result,
+                        })
+                        .await;
+                });
+            } else if let Some(dialog) = &mut state.mcp_dialog {
+                dialog.error = Some(wyj_i18n::tr("mcp.error.manual_no_upgrade"));
+            }
+        }
+        McpMenuAction::Installed(McpRowAction::Uninstall) => {
+            let info = state
+                .mcp_dialog
+                .as_ref()
+                .and_then(|d| d.installed.get(idx))
+                .map(|row| (row.config.name.clone(), row.scope));
+            if let Some((name, scope)) = info {
+                let result = wyj_store::mcp_install::uninstall_mcp_server(&name, scope, &state.cwd);
+                if let Some(dialog) = &mut state.mcp_dialog {
+                    match result {
+                        Ok(()) => {
+                            dialog.status = Some(wyj_i18n::tr("mcp.uninstall.done"));
+                            dialog.refresh_installed(&state.config, &state.cwd);
+                        }
+                        Err(e) => {
+                            dialog.error = Some(wyj_i18n::tr_fmt(
+                                "mcp.error.uninstall_failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        McpMenuAction::Installed(McpRowAction::ViewDetail) => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                if let Some(row) = dialog.installed.get(idx) {
+                    let mut lines = vec![
+                        wyj_i18n::tr_fmt("mcp.detail.name_line", &[("name", &row.config.name)]),
+                        wyj_i18n::tr_fmt(
+                            "mcp.detail.scope_line",
+                            &[("scope", &mcp_scope_label_text(row.scope))],
+                        ),
+                        wyj_i18n::tr_fmt(
+                            "mcp.detail.command_line",
+                            &[("command", row.config.command.as_deref().unwrap_or(""))],
+                        ),
+                    ];
+                    if !row.config.args.is_empty() {
+                        lines.push(wyj_i18n::tr_fmt(
+                            "mcp.detail.args_line",
+                            &[("args", &row.config.args.join(" "))],
+                        ));
+                    }
+                    if !row.config.env.is_empty() {
+                        let env_str = row
+                            .config
+                            .env
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        lines.push(wyj_i18n::tr_fmt(
+                            "mcp.detail.env_line",
+                            &[("env", &env_str)],
+                        ));
+                    }
+                    dialog.overlay = McpOverlay::Detail {
+                        title: wyj_i18n::tr("mcp.detail.title"),
+                        lines,
+                    };
+                }
+            }
+        }
+        McpMenuAction::Registries(McpSourceAction::OpenBrowse) => {
+            if let Some(dialog) = &mut state.mcp_dialog {
+                if let Some(source) = dialog.registries.get(idx).cloned() {
+                    dialog.active_registry = source;
+                    dialog.browse_results.clear();
+                    dialog.tab = McpDialogTab::Browse;
+                    dialog.cursor = 0;
+                }
+            }
+        }
+        McpMenuAction::Registries(McpSourceAction::Remove) => {
+            let id = state
+                .mcp_dialog
+                .as_ref()
+                .and_then(|d| d.registries.get(idx))
+                .map(|r| r.id.clone());
+            if let Some(id) = id {
+                let result = wyj_store::registry::remove_registry(&id);
+                if let Some(dialog) = &mut state.mcp_dialog {
+                    match result {
+                        Ok(()) => dialog.refresh_registries(),
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        McpMenuAction::Browse(McpBrowseAction::Install) => {
+            let server = state
+                .mcp_dialog
+                .as_ref()
+                .and_then(|d| d.browse_results.get(idx).cloned());
+            if let Some(server) = server {
+                let package = wyj_store::mcp_install::choose_package(&server.packages);
+                if let Some(dialog) = &mut state.mcp_dialog {
+                    if matches!(
+                        package,
+                        wyj_store::mcp_install::PackageChoice::Unsupported { .. }
+                    ) {
+                        dialog.error = Some(wyj_i18n::tr("mcp.install.unsupported_package"));
+                    } else {
+                        dialog.overlay = McpOverlay::InstallConfirm {
+                            server: Box::new(server),
+                            package,
+                            scope: wyj_store::InstallScope::Global,
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Skill 管理面板：/skills 命令触发 ───────────────────────────────────────────
+
+const BUILTIN_SKILL_NAMES: [&str; 5] = ["run", "review", "fix", "explain", "commit"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsDialogTab {
+    Installed,
+    Marketplaces,
+    Browse,
+}
+
+/// Installed tab 的一行：内置 skill / 全局或项目 skill 文件 + lockfile 纳管信息
+pub struct SkillInstalledRow {
+    pub name: String,
+    pub description: String,
+    /// None = 内置 skill
+    pub scope: Option<wyj_store::InstallScope>,
+    pub builtin: bool,
+    pub managed: Option<wyj_store::lockfile::InstalledSkillEntry>,
+}
+
+pub enum SkillsOverlay {
+    None,
+    /// 文本内容存在 `SkillsDialog.live_input`（借用底部主输入框，见 `InputOwner`）
+    AddMarketplace,
+    Syncing {
+        marketplace_id: String,
+        git_url: String,
+    },
+    InstallConfirm {
+        marketplace_id: String,
+        git_url: String,
+        entry: wyj_store::marketplace::MarketplaceSkillEntry,
+        scope: wyj_store::InstallScope,
+    },
+    Upgrading {
+        row_idx: usize,
+    },
+    /// 只读详情浮层（Installed 行菜单的"查看详情"），Enter/Esc 都直接关闭
+    Detail {
+        title: String,
+        lines: Vec<String>,
+    },
+}
+
+/// Installed 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SkillsRowAction {
+    ToggleEnabled,
+    Upgrade,
+    Uninstall,
+    ViewDetail,
+}
+
+/// Marketplaces 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SkillsSourceAction {
+    OpenBrowse,
+    Remove,
+}
+
+/// Browse 结果行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SkillsBrowseAction {
+    Install,
+}
+
+/// 三个 tab 各自的行菜单动作，用外层枚举包住
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SkillsMenuAction {
+    Installed(SkillsRowAction),
+    Marketplaces(SkillsSourceAction),
+    Browse(SkillsBrowseAction),
+}
+
+/// 扫描一个 skill 目录，返回 (name, description) 列表（description 取首个 `# 标题` 行）
+fn scan_skill_dir_for_display(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(name) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let description = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find_map(|l| l.strip_prefix("# ").map(|t| t.trim().to_string()))
+            })
+            .unwrap_or_else(|| name.clone());
+        out.push((name, description));
+    }
+    out
+}
+
+/// Skill 管理面板状态（/skills 命令触发）
+pub struct SkillsDialog {
+    pub tab: SkillsDialogTab,
+    pub installed: Vec<SkillInstalledRow>,
+    /// 扁平化行游标，语义随当前 tab 变化（见 `rows()`），Left/Right 切 tab 时归零
+    pub cursor: usize,
+    pub marketplaces: Vec<wyj_store::lockfile::MarketplaceSource>,
+    /// Browse tab 当前展示的条目来自哪个 marketplace（Marketplaces tab 里选中
+    /// "浏览"菜单项触发同步后记录，供后续安装该 tab 里条目时回填来源）
+    pub active_marketplace_id: String,
+    pub active_marketplace_git_url: String,
+    pub browse_results: Vec<wyj_store::marketplace::MarketplaceSkillEntry>,
+    pub overlay: SkillsOverlay,
+    /// 选中列表条目回车后弹出的操作菜单；None = 未打开
+    pub menu: Option<ActionMenu<FlatRow, SkillsMenuAction>>,
+    pub error: Option<String>,
+    pub status: Option<String>,
+    /// 底部主输入框借用态下的草稿内容（`InputOwner::Skills(_)` 生效期间使用）
+    pub live_input: InputBox,
+}
+
+impl SkillsDialog {
+    fn new(home: &std::path::Path, cwd: &std::path::Path) -> Self {
+        let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
+        let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
+
+        let mut installed = Vec::new();
+        for name in BUILTIN_SKILL_NAMES {
+            installed.push(SkillInstalledRow {
+                name: name.to_string(),
+                description: wyj_i18n::tr(&format!("skill.{name}.desc")),
+                scope: None,
+                builtin: true,
+                managed: None,
+            });
+        }
+        let global_dir = home.join(".wyj-code").join("skills");
+        for (name, description) in scan_skill_dir_for_display(&global_dir) {
+            let managed = global_lock.skills.iter().find(|e| e.name == name).cloned();
+            installed.push(SkillInstalledRow {
+                name,
+                description,
+                scope: Some(wyj_store::InstallScope::Global),
+                builtin: false,
+                managed,
+            });
+        }
+        let project_dir = cwd.join(".wyj").join("skills");
+        for (name, description) in scan_skill_dir_for_display(&project_dir) {
+            let managed = project_lock.skills.iter().find(|e| e.name == name).cloned();
+            installed.push(SkillInstalledRow {
+                name,
+                description,
+                scope: Some(wyj_store::InstallScope::Project),
+                builtin: false,
+                managed,
+            });
+        }
+
+        // 首次打开面板（全局 lockfile 里一条 marketplace 源都没有）时自动预置
+        // 默认源，逻辑与 McpDialog 的 `ensure_default_registry` 完全对应。
+        let marketplaces = wyj_store::marketplace::ensure_default_marketplace()
+            .unwrap_or_else(|_| global_lock.marketplaces.clone());
+
+        Self {
+            tab: SkillsDialogTab::Installed,
+            installed,
+            cursor: 0,
+            marketplaces,
+            active_marketplace_id: String::new(),
+            active_marketplace_git_url: String::new(),
+            browse_results: Vec::new(),
+            overlay: SkillsOverlay::None,
+            menu: None,
+            error: None,
+            status: None,
+            live_input: InputBox::new(),
+        }
+    }
+
+    fn refresh_installed(&mut self, home: &std::path::Path, cwd: &std::path::Path) {
+        let fresh = Self::new(home, cwd);
+        self.installed = fresh.installed;
+        self.marketplaces = fresh.marketplaces;
+        self.clamp_cursor();
+    }
+
+    /// 扁平化行列表：当前 tab 下的条目下标，或该 tab 的固定"+ 添加"行。
+    /// tab 头不算进 rows()，单独渲染；Installed/Browse 没有 AddNew。
+    pub fn rows(&self) -> Vec<FlatRow> {
+        match self.tab {
+            SkillsDialogTab::Installed => (0..self.installed.len()).map(FlatRow::Entry).collect(),
+            SkillsDialogTab::Marketplaces => {
+                let mut r: Vec<_> = (0..self.marketplaces.len()).map(FlatRow::Entry).collect();
+                r.push(FlatRow::AddNew);
+                r
+            }
+            SkillsDialogTab::Browse => (0..self.browse_results.len()).map(FlatRow::Entry).collect(),
+        }
+    }
+
+    pub fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    pub fn build_menu(&self) -> Option<ActionMenu<FlatRow, SkillsMenuAction>> {
+        let row = *self.rows().get(self.cursor)?;
+        match (self.tab, row) {
+            (SkillsDialogTab::Installed, FlatRow::Entry(idx)) => {
+                let r = self.installed.get(idx)?;
+                let enabled = r.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                let can_upgrade = r.managed.as_ref().is_some_and(|m| m.is_managed());
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if enabled {
+                            "skills.menu.disable"
+                        } else {
+                            "skills.menu.enable"
+                        }),
+                        action: SkillsMenuAction::Installed(SkillsRowAction::ToggleEnabled),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("skills.menu.upgrade"),
+                        action: SkillsMenuAction::Installed(SkillsRowAction::Upgrade),
+                        dangerous: false,
+                        disabled: !can_upgrade,
+                        disabled_reason: (!can_upgrade)
+                            .then(|| wyj_i18n::tr("skills.error.manual_no_upgrade")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("skills.menu.uninstall"),
+                        action: SkillsMenuAction::Installed(SkillsRowAction::Uninstall),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("skills.menu.view_detail"),
+                        action: SkillsMenuAction::Installed(SkillsRowAction::ViewDetail),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (SkillsDialogTab::Marketplaces, FlatRow::Entry(_)) => {
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("skills.menu.browse_source"),
+                        action: SkillsMenuAction::Marketplaces(SkillsSourceAction::OpenBrowse),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("skills.menu.remove_source"),
+                        action: SkillsMenuAction::Marketplaces(SkillsSourceAction::Remove),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (SkillsDialogTab::Browse, FlatRow::Entry(_)) => {
+                let items = vec![ActionMenuItem {
+                    label: wyj_i18n::tr("skills.menu.install"),
+                    action: SkillsMenuAction::Browse(SkillsBrowseAction::Install),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }];
+                Some(ActionMenu::new(row, items))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `/skills` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
+fn skills_handle_menu_key(
+    state: &mut AppState,
+    code: KeyCode,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    enum Step {
+        None,
+        Close,
+        Cancel,
+        Confirm(SkillsMenuAction),
+        Execute(SkillsMenuAction, FlatRow),
+    }
+
+    let step = {
+        let Some(dialog) = &mut state.skills_dialog else {
+            return;
+        };
+        let Some(menu) = &mut dialog.menu else {
+            return;
+        };
+        let target = menu.target;
+        if let Some(confirming) = menu.confirming {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
+                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
+                _ => Step::None,
+            }
+        } else {
+            match code {
+                KeyCode::Up => {
+                    menu.move_up();
+                    Step::None
+                }
+                KeyCode::Down => {
+                    menu.move_down();
+                    Step::None
+                }
+                KeyCode::Esc => Step::Close,
+                KeyCode::Enter => match menu.selected_item() {
+                    Some(item) if item.disabled => Step::None,
+                    Some(item) if item.dangerous => Step::Confirm(item.action),
+                    Some(item) => Step::Execute(item.action, target),
+                    None => Step::None,
+                },
+                _ => Step::None,
+            }
+        }
+    };
+
+    match step {
+        Step::None => {}
+        Step::Close => {
+            if let Some(dialog) = &mut state.skills_dialog {
+                dialog.menu = None;
+            }
+        }
+        Step::Cancel => {
+            if let Some(dialog) = &mut state.skills_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = None;
+                }
+            }
+        }
+        Step::Confirm(action) => {
+            if let Some(dialog) = &mut state.skills_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = Some(action);
+                }
+            }
+        }
+        Step::Execute(action, target) => {
+            if let Some(dialog) = &mut state.skills_dialog {
+                dialog.menu = None;
+            }
+            skills_execute_menu_action(state, action, target, agent_tx);
+        }
+    }
+}
+
+fn skills_execute_menu_action(
+    state: &mut AppState,
+    action: SkillsMenuAction,
+    target: FlatRow,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    let FlatRow::Entry(idx) = target else {
+        return;
+    };
+    let home = wyj_config::home_dir().unwrap_or_default();
+    match action {
+        SkillsMenuAction::Installed(SkillsRowAction::ToggleEnabled) => {
+            let info = state.skills_dialog.as_ref().and_then(|d| {
+                d.installed.get(idx).map(|row| {
+                    let enabled = row.managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                    (
+                        row.name.clone(),
+                        row.scope.unwrap_or(wyj_store::InstallScope::Global),
+                        enabled,
+                    )
+                })
+            });
+            if let Some((name, scope, currently_enabled)) = info {
+                let result = wyj_store::skill_install::set_skill_enabled(
+                    &name,
+                    scope,
+                    &state.cwd,
+                    !currently_enabled,
+                );
+                if let Some(dialog) = &mut state.skills_dialog {
+                    match result {
+                        Ok(()) => dialog.refresh_installed(&home, &state.cwd),
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        SkillsMenuAction::Installed(SkillsRowAction::Upgrade) => {
+            let info = state.skills_dialog.as_ref().and_then(|d| {
+                d.installed.get(idx).and_then(|row| {
+                    row.managed
+                        .as_ref()
+                        .is_some_and(|m| m.is_managed())
+                        .then(|| {
+                            (
+                                row.name.clone(),
+                                row.scope.unwrap_or(wyj_store::InstallScope::Global),
+                            )
+                        })
+                })
+            });
+            if let Some((name, scope)) = info {
+                if let Some(dialog) = &mut state.skills_dialog {
+                    dialog.overlay = SkillsOverlay::Upgrading { row_idx: idx };
+                }
+                let tx = agent_tx.clone();
+                let cwd = state.cwd.clone();
+                tokio::spawn(async move {
+                    let result = wyj_store::skill_install::upgrade_skill(&name, scope, &cwd)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx
+                        .send(AgentEvent::SkillUpgraded {
+                            row_idx: idx,
+                            result,
+                        })
+                        .await;
+                });
+            } else if let Some(dialog) = &mut state.skills_dialog {
+                dialog.error = Some(wyj_i18n::tr("skills.error.manual_no_upgrade"));
+            }
+        }
+        SkillsMenuAction::Installed(SkillsRowAction::Uninstall) => {
+            let info = state
+                .skills_dialog
+                .as_ref()
+                .and_then(|d| d.installed.get(idx))
+                .map(|row| {
+                    (
+                        row.name.clone(),
+                        row.scope.unwrap_or(wyj_store::InstallScope::Global),
+                    )
+                });
+            if let Some((name, scope)) = info {
+                let result = wyj_store::skill_install::uninstall_skill(&name, scope, &state.cwd);
+                if let Some(dialog) = &mut state.skills_dialog {
+                    match result {
+                        Ok(()) => {
+                            dialog.status = Some(wyj_i18n::tr("skills.uninstall.done"));
+                            dialog.refresh_installed(&home, &state.cwd);
+                        }
+                        Err(e) => {
+                            dialog.error = Some(wyj_i18n::tr_fmt(
+                                "skills.error.uninstall_failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        SkillsMenuAction::Installed(SkillsRowAction::ViewDetail) => {
+            if let Some(dialog) = &mut state.skills_dialog {
+                if let Some(row) = dialog.installed.get(idx) {
+                    let mut lines = vec![
+                        wyj_i18n::tr_fmt("skills.detail.name_line", &[("name", &row.name)]),
+                        wyj_i18n::tr_fmt(
+                            "skills.detail.description_line",
+                            &[("description", &row.description)],
+                        ),
+                    ];
+                    let scope_text = if row.builtin {
+                        wyj_i18n::tr("agents.builtin_tag")
+                    } else {
+                        row.scope.map(mcp_scope_label_text).unwrap_or_default()
+                    };
+                    lines.push(wyj_i18n::tr_fmt(
+                        "skills.detail.scope_line",
+                        &[("scope", &scope_text)],
+                    ));
+                    if let Some(version) = row.managed.as_ref().and_then(|m| m.version.clone()) {
+                        lines.push(wyj_i18n::tr_fmt(
+                            "skills.detail.version_line",
+                            &[("version", &version)],
+                        ));
+                    }
+                    dialog.overlay = SkillsOverlay::Detail {
+                        title: wyj_i18n::tr("skills.detail.title"),
+                        lines,
+                    };
+                }
+            }
+        }
+        SkillsMenuAction::Marketplaces(SkillsSourceAction::OpenBrowse) => {
+            let info = state
+                .skills_dialog
+                .as_ref()
+                .and_then(|d| d.marketplaces.get(idx))
+                .map(|m| (m.id.clone(), m.git_url.clone()));
+            if let Some((marketplace_id, git_url)) = info {
+                if let Some(dialog) = &mut state.skills_dialog {
+                    dialog.overlay = SkillsOverlay::Syncing {
+                        marketplace_id: marketplace_id.clone(),
+                        git_url: git_url.clone(),
+                    };
+                }
+                let tx = agent_tx.clone();
+                let git_url_for_task = git_url.clone();
+                tokio::spawn(async move {
+                    let result = wyj_store::marketplace::sync_marketplace(&git_url_for_task)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx
+                        .send(AgentEvent::SkillMarketplaceSynced {
+                            marketplace_id,
+                            git_url: git_url_for_task,
+                            result,
+                        })
+                        .await;
+                });
+            }
+        }
+        SkillsMenuAction::Marketplaces(SkillsSourceAction::Remove) => {
+            let id = state
+                .skills_dialog
+                .as_ref()
+                .and_then(|d| d.marketplaces.get(idx))
+                .map(|m| m.id.clone());
+            if let Some(id) = id {
+                let result = wyj_store::marketplace::remove_marketplace(&id);
+                if let Some(dialog) = &mut state.skills_dialog {
+                    match result {
+                        Ok(()) => dialog.refresh_installed(&home, &state.cwd),
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        SkillsMenuAction::Browse(SkillsBrowseAction::Install) => {
+            let entry = state
+                .skills_dialog
+                .as_ref()
+                .and_then(|d| d.browse_results.get(idx).cloned());
+            if let Some(entry) = entry {
+                if let Some(dialog) = &mut state.skills_dialog {
+                    dialog.overlay = SkillsOverlay::InstallConfirm {
+                        marketplace_id: dialog.active_marketplace_id.clone(),
+                        git_url: dialog.active_marketplace_git_url.clone(),
+                        entry,
+                        scope: wyj_store::InstallScope::Global,
+                    };
+                }
+            }
+        }
+    }
+}
+
+// ── 插件管理面板：/plugins 命令触发 ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginsDialogTab {
+    Installed,
+    Marketplaces,
+    Browse,
+}
+
+/// Installed tab 的一行：整体启用/禁用，不拆分内部 commands/agents/mcpServers。
+pub struct PluginInstalledRow {
+    pub name: String,
+    pub version: Option<String>,
+    pub scope: wyj_store::InstallScope,
+    pub enabled: bool,
+    pub is_local_dev: bool,
+    /// 如 "cmd:3 agent:1 mcp:2"，供展示用（不用 emoji，对齐全部面板的纯文字风格）
+    pub resource_summary: String,
+    pub entry: wyj_store::lockfile::InstalledPluginEntry,
+}
+
+pub enum PluginOverlay {
+    None,
+    /// 文本内容存在 `PluginsDialog.live_input`（借用底部主输入框，见 `InputOwner`）
+    AddMarketplace,
+    Syncing {
+        marketplace_id: String,
+    },
+    InstallConfirm {
+        marketplace_id: String,
+        location: String,
+        entry: Box<wyj_store::plugin_manifest::PluginMarketplaceEntry>,
+        scope: wyj_store::InstallScope,
+    },
+    Installing,
+    InstallReport {
+        report: wyj_store::plugin_install::PluginInstallReport,
+    },
+    Upgrading {
+        row_idx: usize,
+    },
+    /// 文本内容存在 `PluginsDialog.live_input`（借用底部主输入框，见 `InputOwner`）
+    AddLocalPlugin,
+    /// 只读详情浮层（Installed 行菜单的"查看详情"），Enter/Esc 都直接关闭
+    Detail {
+        title: String,
+        lines: Vec<String>,
+    },
+}
+
+/// Installed 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginsRowAction {
+    ToggleEnabled,
+    Upgrade,
+    Uninstall,
+    ViewDetail,
+}
+
+/// Marketplaces 行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginsSourceAction {
+    OpenBrowse,
+    Remove,
+}
+
+/// Browse 结果行菜单动作
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginsBrowseAction {
+    Install,
+}
+
+/// 三个 tab 各自的行菜单动作，用外层枚举包住
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PluginsMenuAction {
+    Installed(PluginsRowAction),
+    Marketplaces(PluginsSourceAction),
+    Browse(PluginsBrowseAction),
+}
+
+/// 插件管理面板状态（/plugins 命令触发）
+pub struct PluginsDialog {
+    pub tab: PluginsDialogTab,
+    pub installed: Vec<PluginInstalledRow>,
+    /// 扁平化行游标，语义随当前 tab 变化（见 `rows()`），Left/Right 切 tab 时归零
+    pub cursor: usize,
+    pub marketplaces: Vec<wyj_store::lockfile::PluginMarketplaceSource>,
+    /// Browse tab 当前展示的条目来自哪个 marketplace（Marketplaces tab 里选中
+    /// "浏览"菜单项触发同步后记录，供后续安装该 tab 里条目时回填来源）
+    pub active_marketplace_id: String,
+    pub active_marketplace_location: String,
+    pub browse_results: Vec<wyj_store::plugin_manifest::PluginMarketplaceEntry>,
+    pub overlay: PluginOverlay,
+    /// 选中列表条目回车后弹出的操作菜单；None = 未打开
+    pub menu: Option<ActionMenu<FlatRow, PluginsMenuAction>>,
+    pub error: Option<String>,
+    pub status: Option<String>,
+    /// 底部主输入框借用态下的草稿内容（`InputOwner::Plugins(_)` 生效期间使用）
+    pub live_input: InputBox,
+}
+
+impl PluginsDialog {
+    fn new(cwd: &std::path::Path) -> Self {
+        let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
+        let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
+
+        let mut installed = Vec::new();
+        for entry in global_lock
+            .plugins
+            .iter()
+            .chain(project_lock.plugins.iter())
+        {
+            installed.push(PluginInstalledRow {
+                name: entry.name.clone(),
+                version: entry.version.clone(),
+                scope: entry.scope,
+                enabled: entry.enabled,
+                is_local_dev: entry.is_local_dev(),
+                resource_summary: format!(
+                    "cmd:{} agent:{} mcp:{}",
+                    entry.contributes.skill_paths.len(),
+                    entry.contributes.agent_paths.len(),
+                    entry.contributes.mcp_servers.len(),
+                ),
+                entry: entry.clone(),
+            });
+        }
+
+        // 与 skill/mcp 不同：不预置默认插件市场源（没有已知稳定维护、遵循官方
+        // marketplace.json 格式的公开仓库可以放心硬编码），面板首次打开时可能
+        // 一个市场源都没有，需要用户自行通过"+ 添加"新增。
+        let marketplaces =
+            wyj_store::plugin_install::list_plugin_marketplaces().unwrap_or_default();
+
+        Self {
+            tab: PluginsDialogTab::Installed,
+            installed,
+            cursor: 0,
+            marketplaces,
+            active_marketplace_id: String::new(),
+            active_marketplace_location: String::new(),
+            browse_results: Vec::new(),
+            overlay: PluginOverlay::None,
+            menu: None,
+            error: None,
+            status: None,
+            live_input: InputBox::new(),
+        }
+    }
+
+    fn refresh_installed(&mut self, cwd: &std::path::Path) {
+        let fresh = Self::new(cwd);
+        self.installed = fresh.installed;
+        self.marketplaces = fresh.marketplaces;
+        self.clamp_cursor();
+    }
+
+    /// 扁平化行列表：当前 tab 下的条目下标，或该 tab 的固定"+ 添加"行。
+    /// tab 头不算进 rows()，单独渲染；Installed 的 AddNew 行语义是"添加本地
+    /// 插件"（不同于 Mcp/Skills 的"添加 source"，但落到同一个 FlatRow 形状上）；
+    /// Browse 没有 AddNew。
+    pub fn rows(&self) -> Vec<FlatRow> {
+        match self.tab {
+            PluginsDialogTab::Installed => {
+                let mut r: Vec<_> = (0..self.installed.len()).map(FlatRow::Entry).collect();
+                r.push(FlatRow::AddNew);
+                r
+            }
+            PluginsDialogTab::Marketplaces => {
+                let mut r: Vec<_> = (0..self.marketplaces.len()).map(FlatRow::Entry).collect();
+                r.push(FlatRow::AddNew);
+                r
+            }
+            PluginsDialogTab::Browse => {
+                (0..self.browse_results.len()).map(FlatRow::Entry).collect()
+            }
+        }
+    }
+
+    pub fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    pub fn build_menu(&self) -> Option<ActionMenu<FlatRow, PluginsMenuAction>> {
+        let row = *self.rows().get(self.cursor)?;
+        match (self.tab, row) {
+            (PluginsDialogTab::Installed, FlatRow::Entry(idx)) => {
+                let r = self.installed.get(idx)?;
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if r.enabled {
+                            "plugins.menu.disable"
+                        } else {
+                            "plugins.menu.enable"
+                        }),
+                        action: PluginsMenuAction::Installed(PluginsRowAction::ToggleEnabled),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("plugins.menu.upgrade"),
+                        action: PluginsMenuAction::Installed(PluginsRowAction::Upgrade),
+                        dangerous: false,
+                        disabled: r.is_local_dev,
+                        disabled_reason: r
+                            .is_local_dev
+                            .then(|| wyj_i18n::tr("plugins.error.local_no_upgrade")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("plugins.menu.uninstall"),
+                        action: PluginsMenuAction::Installed(PluginsRowAction::Uninstall),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("plugins.menu.view_detail"),
+                        action: PluginsMenuAction::Installed(PluginsRowAction::ViewDetail),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (PluginsDialogTab::Marketplaces, FlatRow::Entry(_)) => {
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("plugins.menu.browse_source"),
+                        action: PluginsMenuAction::Marketplaces(PluginsSourceAction::OpenBrowse),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("plugins.menu.remove_source"),
+                        action: PluginsMenuAction::Marketplaces(PluginsSourceAction::Remove),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            (PluginsDialogTab::Browse, FlatRow::Entry(_)) => {
+                let items = vec![ActionMenuItem {
+                    label: wyj_i18n::tr("plugins.menu.install"),
+                    action: PluginsMenuAction::Browse(PluginsBrowseAction::Install),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }];
+                Some(ActionMenu::new(row, items))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `/plugins` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
+fn plugins_handle_menu_key(
+    state: &mut AppState,
+    code: KeyCode,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    enum Step {
+        None,
+        Close,
+        Cancel,
+        Confirm(PluginsMenuAction),
+        Execute(PluginsMenuAction, FlatRow),
+    }
+
+    let step = {
+        let Some(dialog) = &mut state.plugins_dialog else {
+            return;
+        };
+        let Some(menu) = &mut dialog.menu else {
+            return;
+        };
+        let target = menu.target;
+        if let Some(confirming) = menu.confirming {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
+                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
+                _ => Step::None,
+            }
+        } else {
+            match code {
+                KeyCode::Up => {
+                    menu.move_up();
+                    Step::None
+                }
+                KeyCode::Down => {
+                    menu.move_down();
+                    Step::None
+                }
+                KeyCode::Esc => Step::Close,
+                KeyCode::Enter => match menu.selected_item() {
+                    Some(item) if item.disabled => Step::None,
+                    Some(item) if item.dangerous => Step::Confirm(item.action),
+                    Some(item) => Step::Execute(item.action, target),
+                    None => Step::None,
+                },
+                _ => Step::None,
+            }
+        }
+    };
+
+    match step {
+        Step::None => {}
+        Step::Close => {
+            if let Some(dialog) = &mut state.plugins_dialog {
+                dialog.menu = None;
+            }
+        }
+        Step::Cancel => {
+            if let Some(dialog) = &mut state.plugins_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = None;
+                }
+            }
+        }
+        Step::Confirm(action) => {
+            if let Some(dialog) = &mut state.plugins_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = Some(action);
+                }
+            }
+        }
+        Step::Execute(action, target) => {
+            if let Some(dialog) = &mut state.plugins_dialog {
+                dialog.menu = None;
+            }
+            plugins_execute_menu_action(state, action, target, agent_tx);
+        }
+    }
+}
+
+fn plugins_execute_menu_action(
+    state: &mut AppState,
+    action: PluginsMenuAction,
+    target: FlatRow,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+) {
+    let FlatRow::Entry(idx) = target else {
+        return;
+    };
+    match action {
+        PluginsMenuAction::Installed(PluginsRowAction::ToggleEnabled) => {
+            let info = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.installed.get(idx))
+                .map(|row| (row.name.clone(), row.scope, row.enabled));
+            if let Some((name, scope, enabled)) = info {
+                let result = wyj_store::plugin_install::set_plugin_enabled(
+                    &name, scope, &state.cwd, !enabled,
+                );
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    match result {
+                        Ok(()) => {
+                            dialog.status =
+                                Some(wyj_i18n::tr("plugins.toggle.restart_required_hint"));
+                            dialog.refresh_installed(&state.cwd);
+                        }
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        PluginsMenuAction::Installed(PluginsRowAction::Upgrade) => {
+            let info = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.installed.get(idx))
+                .filter(|row| !row.is_local_dev)
+                .map(|row| (row.name.clone(), row.scope));
+            if let Some((name, scope)) = info {
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    dialog.overlay = PluginOverlay::Upgrading { row_idx: idx };
+                }
+                let tx = agent_tx.clone();
+                let cwd = state.cwd.clone();
+                tokio::spawn(async move {
+                    let result = wyj_store::plugin_install::upgrade_plugin(&name, scope, &cwd)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx
+                        .send(AgentEvent::PluginUpgraded {
+                            row_idx: idx,
+                            result,
+                        })
+                        .await;
+                });
+            } else if let Some(dialog) = &mut state.plugins_dialog {
+                dialog.error = Some(wyj_i18n::tr("plugins.error.local_no_upgrade"));
+            }
+        }
+        PluginsMenuAction::Installed(PluginsRowAction::Uninstall) => {
+            let info = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.installed.get(idx))
+                .map(|row| (row.name.clone(), row.scope));
+            if let Some((name, scope)) = info {
+                let result = wyj_store::plugin_install::uninstall_plugin(&name, scope, &state.cwd);
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    match result {
+                        Ok(()) => {
+                            dialog.status = Some(wyj_i18n::tr("plugins.uninstall.done"));
+                            dialog.refresh_installed(&state.cwd);
+                        }
+                        Err(e) => {
+                            dialog.error = Some(wyj_i18n::tr_fmt(
+                                "plugins.error.uninstall_failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        PluginsMenuAction::Installed(PluginsRowAction::ViewDetail) => {
+            if let Some(dialog) = &mut state.plugins_dialog {
+                if let Some(row) = dialog.installed.get(idx) {
+                    let mut lines = vec![
+                        wyj_i18n::tr_fmt("plugins.detail.name_line", &[("name", &row.name)]),
+                        wyj_i18n::tr_fmt(
+                            "plugins.detail.scope_line",
+                            &[("scope", &mcp_scope_label_text(row.scope))],
+                        ),
+                    ];
+                    if let Some(version) = &row.version {
+                        lines.push(wyj_i18n::tr_fmt(
+                            "plugins.detail.version_line",
+                            &[("version", version)],
+                        ));
+                    }
+                    lines.push(wyj_i18n::tr_fmt(
+                        "plugins.detail.resources_line",
+                        &[("summary", &row.resource_summary)],
+                    ));
+                    lines.push(wyj_i18n::tr_fmt(
+                        "plugins.detail.path_line",
+                        &[("path", &row.entry.plugin_root.display().to_string())],
+                    ));
+                    dialog.overlay = PluginOverlay::Detail {
+                        title: wyj_i18n::tr("plugins.detail.title"),
+                        lines,
+                    };
+                }
+            }
+        }
+        PluginsMenuAction::Marketplaces(PluginsSourceAction::OpenBrowse) => {
+            let marketplace_id = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.marketplaces.get(idx))
+                .map(|m| m.id.clone());
+            if let Some(marketplace_id) = marketplace_id {
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    dialog.overlay = PluginOverlay::Syncing {
+                        marketplace_id: marketplace_id.clone(),
+                    };
+                }
+                let tx = agent_tx.clone();
+                let id_for_task = marketplace_id.clone();
+                tokio::spawn(async move {
+                    let result = wyj_store::plugin_install::sync_plugin_marketplace(&id_for_task)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx
+                        .send(AgentEvent::PluginMarketplaceSynced {
+                            marketplace_id,
+                            result,
+                        })
+                        .await;
+                });
+            }
+        }
+        PluginsMenuAction::Marketplaces(PluginsSourceAction::Remove) => {
+            let id = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.marketplaces.get(idx))
+                .map(|m| m.id.clone());
+            if let Some(id) = id {
+                let result = wyj_store::plugin_install::remove_plugin_marketplace(&id);
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    match result {
+                        Ok(()) => dialog.refresh_installed(&state.cwd),
+                        Err(e) => dialog.error = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        PluginsMenuAction::Browse(PluginsBrowseAction::Install) => {
+            let entry = state
+                .plugins_dialog
+                .as_ref()
+                .and_then(|d| d.browse_results.get(idx).cloned());
+            if let Some(entry) = entry {
+                if let Some(dialog) = &mut state.plugins_dialog {
+                    dialog.overlay = PluginOverlay::InstallConfirm {
+                        marketplace_id: dialog.active_marketplace_id.clone(),
+                        location: dialog.active_marketplace_location.clone(),
+                        entry: Box::new(entry),
+                        scope: wyj_store::InstallScope::Global,
+                    };
+                }
+            }
+        }
     }
 }
 
@@ -1336,6 +3585,12 @@ pub struct AppState {
     pub profile_dialog: Option<ProfileDialog>,
     /// CLAUDE.md 记忆面板（/memory 命令触发时 Some）
     pub memory_dialog: Option<MemoryDialog>,
+    /// MCP server 管理面板（/mcp 命令触发时 Some）
+    pub mcp_dialog: Option<McpDialog>,
+    /// Skill 管理面板（/skills 命令触发时 Some）
+    pub skills_dialog: Option<SkillsDialog>,
+    /// 插件管理面板（/plugins 命令触发时 Some）
+    pub plugins_dialog: Option<PluginsDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -1367,6 +3622,12 @@ pub struct AppState {
     pub config: Config,
     /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
     pub sub_agents: std::collections::BTreeMap<u64, SubAgentUiState>,
+    /// agents 面板当前选中项（按 id 而非 index，避免列表变动时错位）
+    pub selected_sub_agent: Option<u64>,
+    /// 选中项是否已展开详情（工具调用流水 + 最终结果）
+    pub sub_agent_detail_open: bool,
+    /// 详情内容的行级滚动偏移（渲染时按可视行数 clamp 并写回）
+    pub sub_agent_detail_scroll: u16,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
     /// 子 Agent 累计 token 用量（与主 session 分开统计，/cost 单列）
@@ -1376,6 +3637,11 @@ pub struct AppState {
     pub hub: Arc<wyj_tools::SubAgentHub>,
     /// 欢迎页 tip 轮播索引：进程启动时选定一次，本次生命周期内保持不变
     pub welcome_tip_idx: usize,
+    /// 主输入框当前借给了谁（None = 属于聊天），见 `InputOwner`
+    pub input_owner: Option<InputOwner>,
+    /// 每个已配置 MCP server 的后台连接状态，供 `/mcp` Installed tab 逐行展示；
+    /// 与 mcp_dialog 是否打开无关（面板打开前后台可能早已连完/连挂）
+    pub mcp_connection_status: HashMap<String, McpConnStatus>,
 }
 
 impl AppState {
@@ -1434,6 +3700,9 @@ impl AppState {
             settings_dialog: None,
             profile_dialog: None,
             memory_dialog: None,
+            mcp_dialog: None,
+            skills_dialog: None,
+            plugins_dialog: None,
             save_needed: false,
             config,
             pending_attachments: vec![],
@@ -1449,11 +3718,16 @@ impl AppState {
             paste_hint: None,
             pending_queue: vec![],
             sub_agents: std::collections::BTreeMap::new(),
+            selected_sub_agent: None,
+            sub_agent_detail_open: false,
+            sub_agent_detail_scroll: 0,
             pending_bg_reminders: vec![],
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             hub,
             welcome_tip_idx,
+            input_owner: None,
+            mcp_connection_status: HashMap::new(),
         }
     }
 
@@ -1464,18 +3738,10 @@ impl AppState {
             .any(|s| s.status == SubAgentStatus::Running)
     }
 
-    /// 子 Agent 完成后在面板定格显示的时长
-    const SUB_AGENT_HOLD: Duration = Duration::from_secs(2);
-
-    /// 面板可见的子 Agent（Running + 完成 2s 内定格），按 BTreeMap 自然顺序（启动顺序）
+    /// 面板可见的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
+    /// 按 BTreeMap 自然顺序（启动顺序）排列
     pub fn visible_sub_agents(&self) -> Vec<(&u64, &SubAgentUiState)> {
-        self.sub_agents
-            .iter()
-            .filter(|(_, s)| match s.finished_at {
-                None => true, // Running
-                Some(t) => t.elapsed() < Self::SUB_AGENT_HOLD,
-            })
-            .collect()
+        self.sub_agents.iter().collect()
     }
 
     /// 中断当前正在运行的 Agent，保留已输出内容并标记 [已中断]
@@ -1772,7 +4038,11 @@ impl AppState {
             }
 
             AgentEvent::PlanApprovalRequest { plan, response_tx } => {
-                self.is_thinking = false; // 暂停 spinner，等待用户操作
+                // 注意：不要在这里把 is_thinking 设为 false。Agent 此刻仍在
+                // `exit_plan_mode().await` 上挂起，TaskList / spinner 仍应继续
+                // 表示"调研中"。若预先清掉 is_thinking，弹窗期间主循环的
+                // `if state.is_thinking` 守卫会让 Ctrl+C 中断路径直接失效。
+                // 批准分支会显式写回 true；取消分支走 interrupt() 自行恢复。
                 self.plan_dialog = Some(PlanApprovalDialog {
                     plan,
                     scroll: 0,
@@ -1803,19 +4073,283 @@ impl AppState {
                         } if e == entry_idx && f == field_idx
                     );
                     if matches_pending {
-                        dialog.overlay = match result {
-                            Ok(models) => ProfileOverlay::ModelsPicker {
-                                entry_idx,
-                                field_idx,
-                                models,
-                                selected: 0,
-                            },
+                        dialog.overlay = ProfileOverlay::None;
+                        match result {
+                            Ok(models) if models.is_empty() => {
+                                dialog.error = Some(wyj_i18n::tr("profile.fetch.empty"));
+                            }
+                            Ok(models) => {
+                                let items = models
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, name)| ActionMenuItem {
+                                        label: name.clone(),
+                                        action: ProfileMenuAction::ModelChoice(i),
+                                        dangerous: false,
+                                        disabled: false,
+                                        disabled_reason: None,
+                                    })
+                                    .collect();
+                                dialog.pending_models = models;
+                                dialog.menu = Some(ActionMenu::new(
+                                    ProfileRow::Field(entry_idx, field_idx),
+                                    items,
+                                ));
+                            }
                             Err(e) => {
                                 dialog.error =
                                     Some(wyj_i18n::tr_fmt("profile.fetch.failed", &[("err", &e)]));
-                                ProfileOverlay::None
                             }
-                        };
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::McpRegistryFetched { result } => {
+                if let Some(dialog) = &mut self.mcp_dialog {
+                    if matches!(dialog.overlay, McpOverlay::Searching) {
+                        dialog.overlay = McpOverlay::None;
+                        match result {
+                            Ok(results) => {
+                                dialog.status = if results.is_empty() {
+                                    Some(wyj_i18n::tr("mcp.dialog.no_results"))
+                                } else {
+                                    None
+                                };
+                                dialog.browse_results = results;
+                                // rows() 里 Browse tab 的搜索行固定占位置 0，
+                                // 第一条真实结果落在位置 1；没有结果时留在搜索行。
+                                dialog.cursor = if dialog.browse_results.is_empty() {
+                                    0
+                                } else {
+                                    1
+                                };
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "mcp.error.search_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::SkillMarketplaceSynced {
+                marketplace_id,
+                git_url,
+                result,
+            } => {
+                if let Some(dialog) = &mut self.skills_dialog {
+                    let matches_pending = matches!(
+                        &dialog.overlay,
+                        SkillsOverlay::Syncing { marketplace_id: id, .. } if *id == marketplace_id
+                    );
+                    if matches_pending {
+                        dialog.overlay = SkillsOverlay::None;
+                        match result {
+                            Ok(entries) => {
+                                dialog.active_marketplace_id = marketplace_id;
+                                dialog.active_marketplace_git_url = git_url;
+                                dialog.browse_results = entries;
+                                dialog.tab = SkillsDialogTab::Browse;
+                                dialog.cursor = 0;
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "skills.error.sync_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::McpUpgraded { row_idx, result } => {
+                if let Some(dialog) = &mut self.mcp_dialog {
+                    let matches_pending = matches!(dialog.overlay, McpOverlay::Upgrading { row_idx: r } if r == row_idx);
+                    if matches_pending {
+                        dialog.overlay = McpOverlay::None;
+                        match result {
+                            Ok(wyj_store::UpgradeOutcome::Upgraded { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "mcp.upgrade.done",
+                                    &[("version", &version)],
+                                ));
+                                dialog.refresh_installed(&self.config, &self.cwd);
+                            }
+                            Ok(wyj_store::UpgradeOutcome::AlreadyLatest { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "mcp.upgrade.already_latest",
+                                    &[("version", &version)],
+                                ));
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "mcp.error.upgrade_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::SkillUpgraded { row_idx, result } => {
+                if let Some(dialog) = &mut self.skills_dialog {
+                    let matches_pending = matches!(
+                        dialog.overlay,
+                        SkillsOverlay::Upgrading { row_idx: r } if r == row_idx
+                    );
+                    if matches_pending {
+                        dialog.overlay = SkillsOverlay::None;
+                        match result {
+                            Ok(wyj_store::UpgradeOutcome::Upgraded { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "skills.upgrade.done",
+                                    &[("version", &version)],
+                                ));
+                                let home = wyj_config::home_dir().unwrap_or_default();
+                                dialog.refresh_installed(&home, &self.cwd);
+                            }
+                            Ok(wyj_store::UpgradeOutcome::AlreadyLatest { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "skills.upgrade.already_latest",
+                                    &[("version", &version)],
+                                ));
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "skills.error.upgrade_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::McpBackgroundConnected { name, tool_count } => {
+                self.mcp_connection_status
+                    .insert(name.clone(), McpConnStatus::Connected { tool_count });
+                self.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                    "mcp.background.connected",
+                    &[("name", &name), ("count", &tool_count.to_string())],
+                )));
+            }
+
+            AgentEvent::McpBackgroundFailed { name, reason } => {
+                let status = match &reason {
+                    crate::event::McpConnFailReason::Error(_) => McpConnStatus::Failed,
+                    crate::event::McpConnFailReason::Timeout => McpConnStatus::TimedOut,
+                };
+                self.mcp_connection_status.insert(name.clone(), status);
+                let key = match &reason {
+                    crate::event::McpConnFailReason::Error(_) => "mcp.background.failed_error",
+                    crate::event::McpConnFailReason::Timeout => "mcp.background.failed_timeout",
+                };
+                let err_text = match &reason {
+                    crate::event::McpConnFailReason::Error(e) => e.clone(),
+                    crate::event::McpConnFailReason::Timeout => String::new(),
+                };
+                let mut msg = ChatMessage::system(wyj_i18n::tr_fmt(
+                    key,
+                    &[("name", &name), ("err", &err_text)],
+                ));
+                msg.is_error = true;
+                self.messages.push(msg);
+            }
+
+            AgentEvent::PluginMarketplaceSynced {
+                marketplace_id,
+                result,
+            } => {
+                if let Some(dialog) = &mut self.plugins_dialog {
+                    let matches_pending = matches!(
+                        &dialog.overlay,
+                        PluginOverlay::Syncing { marketplace_id: id } if *id == marketplace_id
+                    );
+                    if matches_pending {
+                        dialog.overlay = PluginOverlay::None;
+                        match result {
+                            Ok(manifest) => {
+                                dialog.active_marketplace_id = marketplace_id.clone();
+                                dialog.active_marketplace_location = dialog
+                                    .marketplaces
+                                    .iter()
+                                    .find(|m| m.id == marketplace_id)
+                                    .map(|m| m.location.clone())
+                                    .unwrap_or_default();
+                                dialog.browse_results = manifest.plugins;
+                                dialog.tab = PluginsDialogTab::Browse;
+                                dialog.cursor = 0;
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "plugins.error.sync_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                        // sync 成功会更新 marketplace 的 display_name/owner_name/plugin_count，
+                        // 重新读盘刷新一下列表展示。
+                        dialog.marketplaces = wyj_store::plugin_install::list_plugin_marketplaces()
+                            .unwrap_or_default();
+                    }
+                }
+            }
+
+            AgentEvent::PluginInstalled { result } => {
+                if let Some(dialog) = &mut self.plugins_dialog {
+                    if matches!(dialog.overlay, PluginOverlay::Installing) {
+                        match result {
+                            Ok(report) => {
+                                dialog.refresh_installed(&self.cwd);
+                                dialog.overlay = PluginOverlay::InstallReport { report };
+                            }
+                            Err(e) => {
+                                dialog.overlay = PluginOverlay::None;
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "plugins.error.install_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::PluginUpgraded { row_idx, result } => {
+                if let Some(dialog) = &mut self.plugins_dialog {
+                    let matches_pending = matches!(
+                        dialog.overlay,
+                        PluginOverlay::Upgrading { row_idx: r } if r == row_idx
+                    );
+                    if matches_pending {
+                        dialog.overlay = PluginOverlay::None;
+                        match result {
+                            Ok(wyj_store::UpgradeOutcome::Upgraded { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "plugins.upgrade.done",
+                                    &[("version", &version)],
+                                ));
+                                dialog.refresh_installed(&self.cwd);
+                            }
+                            Ok(wyj_store::UpgradeOutcome::AlreadyLatest { version }) => {
+                                dialog.status = Some(wyj_i18n::tr_fmt(
+                                    "plugins.upgrade.already_latest",
+                                    &[("version", &version)],
+                                ));
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "plugins.error.upgrade_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1857,6 +4391,7 @@ impl AppState {
                         tool_log: vec![],
                         has_result: false,
                         finished_at: None,
+                        final_result: None,
                     },
                 );
             }
@@ -1929,6 +4464,7 @@ impl AppState {
                     s.final_elapsed = Some(elapsed_secs);
                     s.current_tool = None;
                     s.finished_at = Some(Instant::now());
+                    s.final_result = Some(result.clone());
                 }
                 if background {
                     // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
@@ -1984,6 +4520,8 @@ pub async fn run_tui(
     config: Config,
     // 子 Agent 生命周期管理中心（注册事件回调、中断、退出清理）
     hub: Arc<wyj_tools::SubAgentHub>,
+    // `--plugin-dir` 临时加载的本地开发插件贡献（不落盘、仅当次进程生效）
+    local_plugin: Option<wyj_store::lockfile::PluginContributions>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -2012,6 +4550,7 @@ pub async fn run_tui(
         system_prompt_extra,
         config,
         hub,
+        local_plugin,
     )
     .await;
 
@@ -2419,6 +4958,30 @@ fn scan_files(
 }
 
 /// 根据输入框光标前的 @ 触发词更新文件候选列表
+/// 在 agents 面板里按 delta(-1=Up/+1=Down) 移动选中项。
+/// 未选中时统一默认跳到最新（id 最大）一项；移动到边界后 clamp，不 wrap。
+fn move_sub_agent_selection(state: &mut AppState, delta: i32) {
+    let ids: Vec<u64> = state.sub_agents.keys().copied().collect();
+    if ids.is_empty() {
+        return;
+    }
+    let cur_idx = state
+        .selected_sub_agent
+        .and_then(|id| ids.iter().position(|&i| i == id));
+    let new_idx = match cur_idx {
+        None => ids.len() - 1,
+        Some(i) => {
+            if delta < 0 {
+                i.saturating_sub(1)
+            } else {
+                (i + 1).min(ids.len() - 1)
+            }
+        }
+    };
+    state.selected_sub_agent = Some(ids[new_idx]);
+    state.sub_agent_detail_scroll = 0;
+}
+
 fn update_file_completions(state: &mut AppState, input: &InputBox, cwd: &std::path::Path) {
     let line = input
         .lines
@@ -2557,6 +5120,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     system_prompt_extra: String,
     config: Config,
     hub: Arc<wyj_tools::SubAgentHub>,
+    local_plugin: Option<wyj_store::lockfile::PluginContributions>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -2588,7 +5152,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
     let home_dir = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let cmd_registry = standard_registry_with_skills(&home_dir, &cwd);
+    let disabled_skills = wyj_store::disabled_skill_names(&cwd);
+    let mut plugin_skill_sources = wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
+    if let Some(local) = &local_plugin {
+        plugin_skill_sources.extend(local.skill_paths.clone());
+    }
+    let cmd_registry =
+        standard_registry_with_skills(&home_dir, &cwd, &disabled_skills, &plugin_skill_sources);
 
     // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
     // （title_cb 也在 wire_tool_callback 内部设置，确保 /model 重建后仍生效）
@@ -2596,6 +5166,85 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
+
+    // 后台并发连接所有配置的 MCP server：不在界面打开前同步等待（npx/uvx
+    // 子进程启动+握手可能耗时数秒，会明显拖慢 TUI 打开速度），改为界面先
+    // 打开、MCP 在后台连接，每个连接成功后复用 /model 热切换同一套"克隆
+    // 当前 agent 快照 → register_tool → 换回 shared_agent"机制动态挂载新工具。
+    {
+        let shared_agent_for_mcp = shared_agent.clone();
+        let agent_tx_for_mcp = agent_tx.clone();
+        let cfg_for_mcp = state.config.clone();
+        let cwd_for_mcp = cwd.clone();
+        let local_plugin_mcp_servers = local_plugin
+            .as_ref()
+            .map(|p| p.mcp_servers.clone())
+            .unwrap_or_default();
+        let mut effective_for_status =
+            wyj_store::mcp_install::effective_mcp_servers(&cfg_for_mcp, &cwd_for_mcp);
+        effective_for_status.extend(local_plugin_mcp_servers.clone());
+        for mcp_cfg in &effective_for_status {
+            state
+                .mcp_connection_status
+                .insert(mcp_cfg.name.clone(), McpConnStatus::Connecting);
+        }
+        tokio::spawn(async move {
+            let mut effective =
+                wyj_store::mcp_install::effective_mcp_servers(&cfg_for_mcp, &cwd_for_mcp);
+            effective.extend(local_plugin_mcp_servers);
+            let mut tasks = tokio::task::JoinSet::new();
+            for mcp_cfg in effective {
+                tasks.spawn(async move {
+                    let result = tokio::time::timeout(
+                        wyj_mcp::bridge::MCP_CONNECT_TIMEOUT,
+                        wyj_mcp::bridge::connect_mcp_server(&mcp_cfg),
+                    )
+                    .await;
+                    (mcp_cfg.name, result)
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok((name, Ok(Ok(tools)))) => {
+                        let count = tools.len();
+                        let mut new_agent = (**shared_agent_for_mcp.read().unwrap()).clone();
+                        for tool in tools {
+                            new_agent.register_tool(Arc::new(tool));
+                        }
+                        *shared_agent_for_mcp.write().unwrap() = Arc::new(new_agent);
+                        let _ = agent_tx_for_mcp
+                            .send(AgentEvent::McpBackgroundConnected {
+                                name,
+                                tool_count: count,
+                            })
+                            .await;
+                    }
+                    Ok((name, Ok(Err(e)))) => {
+                        tracing::warn!("MCP [{name}] 连接失败: {e}");
+                        let _ = agent_tx_for_mcp
+                            .send(AgentEvent::McpBackgroundFailed {
+                                name,
+                                reason: crate::event::McpConnFailReason::Error(e.to_string()),
+                            })
+                            .await;
+                    }
+                    Ok((name, Err(_))) => {
+                        tracing::warn!(
+                            "MCP [{name}] 连接超时（>{}s），已跳过",
+                            wyj_mcp::bridge::MCP_CONNECT_TIMEOUT.as_secs()
+                        );
+                        let _ = agent_tx_for_mcp
+                            .send(AgentEvent::McpBackgroundFailed {
+                                name,
+                                reason: crate::event::McpConnFailReason::Timeout,
+                            })
+                            .await;
+                    }
+                    Err(e) => tracing::warn!("MCP 连接任务异常退出: {e}"),
+                }
+            }
+        });
+    }
 
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
     let has_initial = !initial_messages.is_empty();
@@ -2648,12 +5297,6 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         while let Ok(ev) = sub_rx.try_recv() {
             state.apply_agent_event(AgentEvent::SubAgent(ev));
         }
-
-        // 移除定格超期的子 Agent 条目，防止 BTreeMap 无限增长
-        state.sub_agents.retain(|_, s| {
-            s.finished_at
-                .map_or(true, |t| t.elapsed() < AppState::SUB_AGENT_HOLD)
-        });
 
         // 清除过期的粘贴提示
         if state
@@ -2758,17 +5401,15 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
             let ev = event::read()?;
             match ev {
                 Event::Paste(pasted) => {
-                    // 分组管理面板/设置面板正在编辑文本字段时，粘贴内容应进当前编辑的
-                    // 字段（如 API Key、Base URL、重命名输入框），而不是主聊天输入框。
-                    if let Some(dialog) = &mut state.profile_dialog {
-                        if let Some(ib) = dialog.editing.as_mut() {
+                    // /mcp /skills /plugins 面板借用主输入框做配置输入时（见
+                    // `InputOwner`），粘贴内容应进借用态草稿，而不是穿透到聊天
+                    // 输入框触发图片/文件/文字判定——此前这三个面板完全没有拦截
+                    // Event::Paste，是一个真实存在的 bug，而不只是缺功能。
+                    if let Some(owner) = state.input_owner {
+                        if let Some(ib) = owner.live_input_mut(&mut state) {
                             ib.insert_text(&pasted);
-                            continue;
                         }
-                        if let ProfileOverlay::Renaming { input, .. } = &mut dialog.overlay {
-                            input.insert_text(&pasted);
-                            continue;
-                        }
+                        continue;
                     }
 
                     let expires_at = Instant::now() + PASTE_HINT_DURATION;
@@ -3012,6 +5653,278 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
+                    // ⓪.1 主输入框借用态拦截（/mcp /skills /plugins 面板的配置输入，
+                    // 见 `InputOwner`）：Esc 取消并归还输入框、Enter 提交交给各字段
+                    // 自己的提交逻辑、其余按键转发进 dialog.live_input。
+                    if let Some(owner) = state.input_owner {
+                        match key.code {
+                            KeyCode::Esc => {
+                                owner.clear_live_input(&mut state);
+                                state.input_owner = None;
+                                match owner {
+                                    InputOwner::Mcp(_) => {
+                                        if let Some(dialog) = &mut state.mcp_dialog {
+                                            dialog.overlay = McpOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Skills(_) => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.overlay = SkillsOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Plugins(_) => {
+                                        if let Some(dialog) = &mut state.plugins_dialog {
+                                            dialog.overlay = PluginOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Profile(_) => {
+                                        // Profile 借用不对应任何需要重置的 overlay
+                                        // （重命名/字段编辑都是直接借用，不经过
+                                        // 独立浮层），Esc 只需清空 live_input +
+                                        // 归还 input_owner（上面已做）。
+                                    }
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let text = owner
+                                    .live_input_mut(&mut state)
+                                    .map(|ib| ib.display_lines().join("\n"));
+                                match owner {
+                                    InputOwner::Mcp(McpInputField::AddRegistryUrl) => {
+                                        let url = text.filter(|t| !t.trim().is_empty());
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if let Some(base_url) = url {
+                                            let result =
+                                                wyj_store::registry::add_registry(&base_url);
+                                            if let Some(dialog) = &mut state.mcp_dialog {
+                                                dialog.overlay = McpOverlay::None;
+                                                match result {
+                                                    Ok(_) => dialog.refresh_registries(),
+                                                    Err(e) => dialog.error = Some(e.to_string()),
+                                                }
+                                            }
+                                        } else if let Some(dialog) = &mut state.mcp_dialog {
+                                            dialog.overlay = McpOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Mcp(McpInputField::BrowseSearch) => {
+                                        let query = text.unwrap_or_default();
+                                        if !query.trim().is_empty() {
+                                            let base_url = state
+                                                .mcp_dialog
+                                                .as_ref()
+                                                .map(|d| d.active_registry.base_url.clone())
+                                                .unwrap_or_default();
+                                            state.input_owner = None;
+                                            if let Some(dialog) = &mut state.mcp_dialog {
+                                                dialog.overlay = McpOverlay::Searching;
+                                                dialog.error = None;
+                                            }
+                                            let tx = agent_tx.clone();
+                                            tokio::spawn(async move {
+                                                let client =
+                                                    wyj_store::registry::RegistryClient::new(
+                                                        base_url,
+                                                    );
+                                                let result = client
+                                                    .search_servers(&query)
+                                                    .await
+                                                    .map_err(|e| e.to_string());
+                                                let _ = tx
+                                                    .send(AgentEvent::McpRegistryFetched { result })
+                                                    .await;
+                                            });
+                                        }
+                                        // 查询关键字留在 live_input 里不清空，方便同一次会话里
+                                        // 再次微调关键字重新搜索（不像 AddRegistryUrl 提交后
+                                        // 就不再需要看到原文本）。
+                                    }
+                                    InputOwner::Skills(SkillsInputField::AddMarketplaceUrl) => {
+                                        let url = text.filter(|t| !t.trim().is_empty());
+                                        state.input_owner = None;
+                                        if let Some(git_url) = url {
+                                            let add_result =
+                                                wyj_store::marketplace::add_marketplace(&git_url);
+                                            match add_result {
+                                                Ok(source) => {
+                                                    let marketplace_id = source.id.clone();
+                                                    if let Some(dialog) = &mut state.skills_dialog {
+                                                        dialog.overlay = SkillsOverlay::Syncing {
+                                                            marketplace_id: marketplace_id.clone(),
+                                                            git_url: git_url.clone(),
+                                                        };
+                                                        dialog.marketplaces.push(source);
+                                                    }
+                                                    let tx = agent_tx.clone();
+                                                    let git_url_for_task = git_url.clone();
+                                                    tokio::spawn(async move {
+                                                        let result =
+                                                            wyj_store::marketplace::sync_marketplace(
+                                                                &git_url_for_task,
+                                                            )
+                                                            .await
+                                                            .map_err(|e| e.to_string());
+                                                        let _ = tx
+                                                            .send(AgentEvent::SkillMarketplaceSynced {
+                                                                marketplace_id,
+                                                                git_url: git_url_for_task,
+                                                                result,
+                                                            })
+                                                            .await;
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    if let Some(dialog) = &mut state.skills_dialog {
+                                                        dialog.error = Some(e.to_string());
+                                                        dialog.overlay = SkillsOverlay::None;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.overlay = SkillsOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Plugins(PluginsInputField::AddMarketplaceUrl) => {
+                                        let url = text.filter(|t| !t.trim().is_empty());
+                                        state.input_owner = None;
+                                        if let Some(location) = url {
+                                            let add_result =
+                                                wyj_store::plugin_install::add_plugin_marketplace(
+                                                    &location,
+                                                );
+                                            match add_result {
+                                                Ok(source) => {
+                                                    let marketplace_id = source.id.clone();
+                                                    if let Some(dialog) = &mut state.plugins_dialog
+                                                    {
+                                                        dialog.overlay = PluginOverlay::Syncing {
+                                                            marketplace_id: marketplace_id.clone(),
+                                                        };
+                                                        dialog.marketplaces.push(source);
+                                                    }
+                                                    let tx = agent_tx.clone();
+                                                    tokio::spawn(async move {
+                                                        let result = wyj_store::plugin_install::sync_plugin_marketplace(&marketplace_id)
+                                                            .await
+                                                            .map_err(|e| e.to_string());
+                                                        let _ = tx
+                                                            .send(AgentEvent::PluginMarketplaceSynced {
+                                                                marketplace_id,
+                                                                result,
+                                                            })
+                                                            .await;
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    if let Some(dialog) = &mut state.plugins_dialog
+                                                    {
+                                                        dialog.error = Some(e.to_string());
+                                                        dialog.overlay = PluginOverlay::None;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(dialog) = &mut state.plugins_dialog {
+                                            dialog.overlay = PluginOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Plugins(PluginsInputField::AddLocalPluginPath) => {
+                                        let path_text = text.filter(|t| !t.trim().is_empty());
+                                        state.input_owner = None;
+                                        if let Some(path_text) = path_text {
+                                            let path = std::path::PathBuf::from(path_text);
+                                            let result =
+                                                wyj_store::plugin_install::install_local_plugin(
+                                                    &path,
+                                                    wyj_store::InstallScope::Global,
+                                                    &state.cwd,
+                                                );
+                                            if let Some(dialog) = &mut state.plugins_dialog {
+                                                match result {
+                                                    Ok(report) => {
+                                                        dialog.refresh_installed(&state.cwd);
+                                                        dialog.overlay =
+                                                            PluginOverlay::InstallReport { report };
+                                                    }
+                                                    Err(e) => {
+                                                        dialog.overlay = PluginOverlay::None;
+                                                        dialog.error = Some(wyj_i18n::tr_fmt(
+                                                            "plugins.error.install_failed",
+                                                            &[("err", &e.to_string())],
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(dialog) = &mut state.plugins_dialog {
+                                            dialog.overlay = PluginOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Profile(ProfileInputField::Rename {
+                                        entry_idx,
+                                    }) => {
+                                        let name = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if !name.trim().is_empty() {
+                                            if let Some(dialog) = &mut state.profile_dialog {
+                                                dialog.entries[entry_idx].name = name;
+                                            }
+                                        }
+                                    }
+                                    InputOwner::Profile(ProfileInputField::Field {
+                                        entry_idx,
+                                        field_idx,
+                                    }) => {
+                                        let value = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if let Some(dialog) = &mut state.profile_dialog {
+                                            dialog.entries[entry_idx]
+                                                .set_text_value(field_idx, value);
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.backspace();
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.delete_char_forward();
+                                }
+                            }
+                            KeyCode::Left => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.move_left();
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.move_right();
+                                }
+                            }
+                            KeyCode::Home => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.move_to_start_of_line();
+                                }
+                            }
+                            KeyCode::End => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.move_to_end_of_line();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if let Some(ib) = owner.live_input_mut(&mut state) {
+                                    ib.insert_char(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // ⓪.5 设置面板拦截（/config 命令触发，现仅 log_level/language 两个枚举字段）
                     if state.settings_dialog.is_some() {
                         match key.code {
@@ -3208,213 +6121,749 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ⓪.6 分组管理面板拦截（/model 无参命令触发）
-                    if state.profile_dialog.is_some() {
-                        let is_editing = state
-                            .profile_dialog
-                            .as_ref()
-                            .map(|d| d.editing.is_some())
-                            .unwrap_or(false);
+                    // ⓪.6 MCP server 管理面板拦截（/mcp 命令触发）
+                    if state.mcp_dialog.is_some() {
+                        // AddRegistry/Browse 搜索的文本输入统一走上面的 ⓪.1 输入借用
+                        // 拦截（state.input_owner == Some(Mcp(_))），不会进入这里。
 
-                        if is_editing {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    if let Some(dialog) = &mut state.profile_dialog {
-                                        if let Some(mut ib) = dialog.editing.take() {
-                                            let text = ib.take();
-                                            if let (entry_idx, Some(field_idx)) =
-                                                dialog.selected_row()
+                        // ── 操作菜单已打开：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回
+                        if state.mcp_dialog.as_ref().unwrap().menu.is_some() {
+                            mcp_handle_menu_key(&mut state, key.code, &agent_tx);
+                            continue;
+                        }
+
+                        // ── 纯展示态（loading/详情）：吞掉按键，仅 Detail 支持 Enter/Esc 关闭
+                        match &state.mcp_dialog.as_ref().unwrap().overlay {
+                            McpOverlay::Searching | McpOverlay::Upgrading { .. } => {
+                                continue;
+                            }
+                            McpOverlay::Detail { .. } => {
+                                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                                    if let Some(dialog) = &mut state.mcp_dialog {
+                                        dialog.overlay = McpOverlay::None;
+                                    }
+                                }
+                                continue;
+                            }
+                            McpOverlay::AddRegistry => {
+                                // 正常情况下 input_owner 已在上面拦截；这里只是防御性兜底。
+                                continue;
+                            }
+                            McpOverlay::InstallConfirm { .. } => {
+                                match key.code {
+                                    KeyCode::Left | KeyCode::Right => {
+                                        if let Some(dialog) = &mut state.mcp_dialog {
+                                            if let McpOverlay::InstallConfirm { scope, .. } =
+                                                &mut dialog.overlay
                                             {
-                                                dialog.entries[entry_idx]
-                                                    .set_text_value(field_idx, text);
+                                                *scope = match scope {
+                                                    wyj_store::InstallScope::Global => {
+                                                        wyj_store::InstallScope::Project
+                                                    }
+                                                    wyj_store::InstallScope::Project => {
+                                                        wyj_store::InstallScope::Global
+                                                    }
+                                                };
                                             }
-                                            dialog.error = None;
                                         }
                                     }
+                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                        let to_install = state.mcp_dialog.as_ref().and_then(|d| {
+                                            if let McpOverlay::InstallConfirm {
+                                                server,
+                                                package,
+                                                scope,
+                                            } = &d.overlay
+                                            {
+                                                Some((
+                                                    server.clone(),
+                                                    package.clone(),
+                                                    *scope,
+                                                    d.active_registry.base_url.clone(),
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        if let Some((server, package, scope, registry_url)) =
+                                            to_install
+                                        {
+                                            let req = wyj_store::mcp_install::McpInstallRequest {
+                                                server: *server,
+                                                package,
+                                                scope,
+                                                name_override: None,
+                                                registry_url,
+                                            };
+                                            let result = wyj_store::mcp_install::install_mcp_server(
+                                                &req, &state.cwd,
+                                            );
+                                            if let Some(dialog) = &mut state.mcp_dialog {
+                                                dialog.overlay = McpOverlay::None;
+                                                match result {
+                                                    Ok(()) => {
+                                                        dialog.status =
+                                                            Some(wyj_i18n::tr("mcp.install.done"));
+                                                        dialog.refresh_installed(
+                                                            &state.config,
+                                                            &state.cwd,
+                                                        );
+                                                    }
+                                                    Err(e) => {
+                                                        dialog.error = Some(wyj_i18n::tr_fmt(
+                                                            "mcp.error.install_failed",
+                                                            &[("err", &e.to_string())],
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                        if let Some(dialog) = &mut state.mcp_dialog {
+                                            dialog.overlay = McpOverlay::None;
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                KeyCode::Esc => {
-                                    if let Some(dialog) = &mut state.profile_dialog {
-                                        dialog.editing = None;
+                                continue;
+                            }
+                            McpOverlay::None => {}
+                        }
+
+                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.mcp_dialog = None;
+                            }
+                            KeyCode::Left => {
+                                if let Some(dialog) = &mut state.mcp_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        McpDialogTab::Installed => McpDialogTab::Browse,
+                                        McpDialogTab::Registries => McpDialogTab::Installed,
+                                        McpDialogTab::Browse => McpDialogTab::Registries,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(dialog) = &mut state.mcp_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        McpDialogTab::Installed => McpDialogTab::Registries,
+                                        McpDialogTab::Registries => McpDialogTab::Browse,
+                                        McpDialogTab::Browse => McpDialogTab::Installed,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.mcp_dialog {
+                                    dialog.cursor = dialog.cursor.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.mcp_dialog {
+                                    let len = dialog.rows().len();
+                                    if dialog.cursor + 1 < len {
+                                        dialog.cursor += 1;
                                     }
                                 }
-                                KeyCode::Char(c) => {
-                                    if let Some(ib) = state
-                                        .profile_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.insert_char(c);
+                            }
+                            KeyCode::Enter => {
+                                let row = state
+                                    .mcp_dialog
+                                    .as_ref()
+                                    .and_then(|d| d.rows().get(d.cursor).copied());
+                                match row {
+                                    Some(FlatRow::AddNew) => {
+                                        let tab = state.mcp_dialog.as_ref().unwrap().tab;
+                                        match tab {
+                                            McpDialogTab::Registries => {
+                                                if let Some(dialog) = &mut state.mcp_dialog {
+                                                    dialog.overlay = McpOverlay::AddRegistry;
+                                                    dialog.live_input = InputBox::new();
+                                                }
+                                                state.input_owner = Some(InputOwner::Mcp(
+                                                    McpInputField::AddRegistryUrl,
+                                                ));
+                                            }
+                                            McpDialogTab::Browse => {
+                                                state.input_owner = Some(InputOwner::Mcp(
+                                                    McpInputField::BrowseSearch,
+                                                ));
+                                            }
+                                            McpDialogTab::Installed => {}
+                                        }
+                                    }
+                                    Some(FlatRow::Entry(_)) => {
+                                        if let Some(dialog) = &mut state.mcp_dialog {
+                                            dialog.menu = dialog.build_menu();
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.65 Skill 管理面板拦截（/skills 命令触发）
+                    if state.skills_dialog.is_some() {
+                        // AddMarketplace 的文本输入统一走上面的 ⓪.1 输入借用拦截
+                        // （state.input_owner == Some(Skills(_))），不会进入这里。
+
+                        // ── 操作菜单已打开：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回
+                        if state.skills_dialog.as_ref().unwrap().menu.is_some() {
+                            skills_handle_menu_key(&mut state, key.code, &agent_tx);
+                            continue;
+                        }
+
+                        // ── 纯展示态（loading/详情）：吞掉按键，仅 Detail 支持 Enter/Esc 关闭
+                        match &state.skills_dialog.as_ref().unwrap().overlay {
+                            SkillsOverlay::Syncing { .. } | SkillsOverlay::Upgrading { .. } => {
+                                continue;
+                            }
+                            SkillsOverlay::Detail { .. } => {
+                                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                                    if let Some(dialog) = &mut state.skills_dialog {
+                                        dialog.overlay = SkillsOverlay::None;
                                     }
                                 }
-                                KeyCode::Backspace => {
-                                    if let Some(ib) = state
-                                        .profile_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.backspace();
+                                continue;
+                            }
+                            SkillsOverlay::AddMarketplace => {
+                                // 正常情况下 input_owner 已在上面拦截；这里只是防御性兜底。
+                                continue;
+                            }
+                            SkillsOverlay::InstallConfirm { .. } => {
+                                match key.code {
+                                    KeyCode::Left | KeyCode::Right => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            if let SkillsOverlay::InstallConfirm { scope, .. } =
+                                                &mut dialog.overlay
+                                            {
+                                                *scope = match scope {
+                                                    wyj_store::InstallScope::Global => {
+                                                        wyj_store::InstallScope::Project
+                                                    }
+                                                    wyj_store::InstallScope::Project => {
+                                                        wyj_store::InstallScope::Global
+                                                    }
+                                                };
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                        let home = wyj_config::home_dir().unwrap_or_default();
+                                        let req = state.skills_dialog.as_ref().and_then(|d| {
+                                            if let SkillsOverlay::InstallConfirm {
+                                                marketplace_id,
+                                                git_url,
+                                                entry,
+                                                scope,
+                                            } = &d.overlay
+                                            {
+                                                Some(
+                                                    wyj_store::skill_install::SkillInstallRequest {
+                                                        marketplace_id: marketplace_id.clone(),
+                                                        marketplace_url: git_url.clone(),
+                                                        entry: entry.clone(),
+                                                        scope: *scope,
+                                                        name_override: None,
+                                                    },
+                                                )
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        if let Some(req) = req {
+                                            let result = wyj_store::skill_install::install_skill(
+                                                &req, &state.cwd,
+                                            );
+                                            if let Some(dialog) = &mut state.skills_dialog {
+                                                dialog.overlay = SkillsOverlay::None;
+                                                match result {
+                                                    Ok(()) => {
+                                                        dialog.status = Some(wyj_i18n::tr(
+                                                            "skills.install.done",
+                                                        ));
+                                                        dialog.refresh_installed(&home, &state.cwd);
+                                                    }
+                                                    Err(e) => {
+                                                        dialog.error = Some(wyj_i18n::tr_fmt(
+                                                            "skills.error.install_failed",
+                                                            &[("err", &e.to_string())],
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.overlay = SkillsOverlay::None;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            SkillsOverlay::None => {}
+                        }
+
+                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.skills_dialog = None;
+                            }
+                            KeyCode::Left => {
+                                if let Some(dialog) = &mut state.skills_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        SkillsDialogTab::Installed => SkillsDialogTab::Browse,
+                                        SkillsDialogTab::Marketplaces => SkillsDialogTab::Installed,
+                                        SkillsDialogTab::Browse => SkillsDialogTab::Marketplaces,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(dialog) = &mut state.skills_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        SkillsDialogTab::Installed => SkillsDialogTab::Marketplaces,
+                                        SkillsDialogTab::Marketplaces => SkillsDialogTab::Browse,
+                                        SkillsDialogTab::Browse => SkillsDialogTab::Installed,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.skills_dialog {
+                                    dialog.cursor = dialog.cursor.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.skills_dialog {
+                                    let len = dialog.rows().len();
+                                    if dialog.cursor + 1 < len {
+                                        dialog.cursor += 1;
                                     }
                                 }
-                                KeyCode::Left => {
-                                    if let Some(ib) = state
-                                        .profile_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.move_left();
+                            }
+                            KeyCode::Enter => {
+                                let row = state
+                                    .skills_dialog
+                                    .as_ref()
+                                    .and_then(|d| d.rows().get(d.cursor).copied());
+                                match row {
+                                    Some(FlatRow::AddNew) => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.overlay = SkillsOverlay::AddMarketplace;
+                                            dialog.live_input = InputBox::new();
+                                        }
+                                        state.input_owner = Some(InputOwner::Skills(
+                                            SkillsInputField::AddMarketplaceUrl,
+                                        ));
+                                    }
+                                    Some(FlatRow::Entry(_)) => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.menu = dialog.build_menu();
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.55 插件管理面板拦截（/plugins 命令触发）
+                    if state.plugins_dialog.is_some() {
+                        // AddMarketplace/AddLocalPlugin 的文本输入统一走上面的 ⓪.1 输入
+                        // 借用拦截（state.input_owner == Some(Plugins(_))），不会进入这里。
+
+                        // ── 操作菜单已打开：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回
+                        if state.plugins_dialog.as_ref().unwrap().menu.is_some() {
+                            plugins_handle_menu_key(&mut state, key.code, &agent_tx);
+                            continue;
+                        }
+
+                        // ── 纯展示态（loading/结果/详情）：吞掉按键，除 InstallReport/
+                        //    Detail 支持 Enter/Esc 关闭外都直接吞掉（无交互）
+                        match &state.plugins_dialog.as_ref().unwrap().overlay {
+                            PluginOverlay::Syncing { .. }
+                            | PluginOverlay::Installing
+                            | PluginOverlay::Upgrading { .. } => {
+                                continue;
+                            }
+                            PluginOverlay::InstallReport { .. } | PluginOverlay::Detail { .. } => {
+                                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                                    if let Some(dialog) = &mut state.plugins_dialog {
+                                        dialog.overlay = PluginOverlay::None;
                                     }
                                 }
-                                KeyCode::Right => {
-                                    if let Some(ib) = state
-                                        .profile_dialog
-                                        .as_mut()
-                                        .and_then(|d| d.editing.as_mut())
-                                    {
-                                        ib.move_right();
+                                continue;
+                            }
+                            PluginOverlay::AddMarketplace | PluginOverlay::AddLocalPlugin => {
+                                // 正常情况下 input_owner 已在上面拦截；这里只是防御性兜底。
+                                continue;
+                            }
+                            PluginOverlay::InstallConfirm { .. } => {
+                                match key.code {
+                                    KeyCode::Left | KeyCode::Right => {
+                                        if let Some(dialog) = &mut state.plugins_dialog {
+                                            if let PluginOverlay::InstallConfirm { scope, .. } =
+                                                &mut dialog.overlay
+                                            {
+                                                *scope = match scope {
+                                                    wyj_store::InstallScope::Global => {
+                                                        wyj_store::InstallScope::Project
+                                                    }
+                                                    wyj_store::InstallScope::Project => {
+                                                        wyj_store::InstallScope::Global
+                                                    }
+                                                };
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                        let install_args =
+                                            state.plugins_dialog.as_ref().and_then(|d| {
+                                                if let PluginOverlay::InstallConfirm {
+                                                    marketplace_id,
+                                                    location,
+                                                    entry,
+                                                    scope,
+                                                } = &d.overlay
+                                                {
+                                                    Some((
+                                                        marketplace_id.clone(),
+                                                        location.clone(),
+                                                        entry.clone(),
+                                                        *scope,
+                                                    ))
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                        if let Some((marketplace_id, location, entry, scope)) =
+                                            install_args
+                                        {
+                                            if let Some(dialog) = &mut state.plugins_dialog {
+                                                dialog.overlay = PluginOverlay::Installing;
+                                            }
+                                            let tx = agent_tx.clone();
+                                            let cwd = state.cwd.clone();
+                                            tokio::spawn(async move {
+                                                let result = wyj_store::plugin_install::resolve_and_install_from_marketplace(
+                                                    &marketplace_id,
+                                                    &location,
+                                                    &entry,
+                                                    scope,
+                                                    None,
+                                                    &cwd,
+                                                )
+                                                .await
+                                                .map_err(|e| e.to_string());
+                                                let _ = tx
+                                                    .send(AgentEvent::PluginInstalled { result })
+                                                    .await;
+                                            });
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                        if let Some(dialog) = &mut state.plugins_dialog {
+                                            dialog.overlay = PluginOverlay::None;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            PluginOverlay::None => {}
+                        }
+
+                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.plugins_dialog = None;
+                            }
+                            KeyCode::Left => {
+                                if let Some(dialog) = &mut state.plugins_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        PluginsDialogTab::Installed => PluginsDialogTab::Browse,
+                                        PluginsDialogTab::Marketplaces => {
+                                            PluginsDialogTab::Installed
+                                        }
+                                        PluginsDialogTab::Browse => PluginsDialogTab::Marketplaces,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(dialog) = &mut state.plugins_dialog {
+                                    dialog.tab = match dialog.tab {
+                                        PluginsDialogTab::Installed => {
+                                            PluginsDialogTab::Marketplaces
+                                        }
+                                        PluginsDialogTab::Marketplaces => PluginsDialogTab::Browse,
+                                        PluginsDialogTab::Browse => PluginsDialogTab::Installed,
+                                    };
+                                    dialog.cursor = 0;
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.plugins_dialog {
+                                    dialog.cursor = dialog.cursor.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.plugins_dialog {
+                                    let len = dialog.rows().len();
+                                    if dialog.cursor + 1 < len {
+                                        dialog.cursor += 1;
                                     }
                                 }
-                                _ => {}
+                            }
+                            KeyCode::Enter => {
+                                let row = state
+                                    .plugins_dialog
+                                    .as_ref()
+                                    .and_then(|d| d.rows().get(d.cursor).copied());
+                                match row {
+                                    Some(FlatRow::AddNew) => {
+                                        let tab = state.plugins_dialog.as_ref().unwrap().tab;
+                                        match tab {
+                                            PluginsDialogTab::Installed => {
+                                                if let Some(dialog) = &mut state.plugins_dialog {
+                                                    dialog.overlay = PluginOverlay::AddLocalPlugin;
+                                                    dialog.live_input = InputBox::new();
+                                                }
+                                                state.input_owner = Some(InputOwner::Plugins(
+                                                    PluginsInputField::AddLocalPluginPath,
+                                                ));
+                                            }
+                                            PluginsDialogTab::Marketplaces => {
+                                                if let Some(dialog) = &mut state.plugins_dialog {
+                                                    dialog.overlay = PluginOverlay::AddMarketplace;
+                                                    dialog.live_input = InputBox::new();
+                                                }
+                                                state.input_owner = Some(InputOwner::Plugins(
+                                                    PluginsInputField::AddMarketplaceUrl,
+                                                ));
+                                            }
+                                            PluginsDialogTab::Browse => {}
+                                        }
+                                    }
+                                    Some(FlatRow::Entry(_)) => {
+                                        if let Some(dialog) = &mut state.plugins_dialog {
+                                            dialog.menu = dialog.build_menu();
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.6 分组管理面板拦截（/model 无参命令触发）
+                    if state.profile_dialog.is_some() {
+                        // 字段编辑/重命名的文本输入统一走上面的 ⓪.1 输入借用拦截
+                        // （state.input_owner == Some(Profile(_))），不会进入这里。
+
+                        // ── 操作菜单已打开：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回
+                        if state.profile_dialog.as_ref().unwrap().menu.is_some() {
+                            profile_handle_menu_key(&mut state, key.code, &agent_tx);
+                            continue;
+                        }
+
+                        // ── 纯展示态（FetchingModels）：仅 Esc 可取消
+                        if matches!(
+                            state.profile_dialog.as_ref().unwrap().overlay,
+                            ProfileOverlay::FetchingModels { .. }
+                        ) {
+                            if key.code == KeyCode::Esc {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    dialog.overlay = ProfileOverlay::None;
+                                }
                             }
                             continue;
                         }
 
-                        let has_overlay = state
-                            .profile_dialog
-                            .as_ref()
-                            .map(|d| !matches!(d.overlay, ProfileOverlay::None))
-                            .unwrap_or(false);
-                        if has_overlay {
-                            let dialog = state.profile_dialog.as_mut().unwrap();
-                            match &mut dialog.overlay {
-                                ProfileOverlay::Renaming { entry_idx, input } => {
-                                    let entry_idx = *entry_idx;
+                        // ── 新建分组模板选择器（不是 ActionMenu：这是"选一个模板创建新
+                        // entry"，选中后触发的是"新增+进入重命名借用"的复合动作，不是
+                        // 对已有条目执行菜单项）
+                        if matches!(
+                            state.profile_dialog.as_ref().unwrap().overlay,
+                            ProfileOverlay::TemplatePicker { .. }
+                        ) {
+                            let mut pending_rename: Option<(usize, String)> = None;
+                            if let Some(dialog) = &mut state.profile_dialog {
+                                if let ProfileOverlay::TemplatePicker { selected } =
+                                    &mut dialog.overlay
+                                {
                                     match key.code {
+                                        KeyCode::Up => {
+                                            if *selected > 0 {
+                                                *selected -= 1;
+                                            }
+                                        }
+                                        KeyCode::Down => {
+                                            if *selected + 1 < wyj_api::PROFILE_TEMPLATES.len() {
+                                                *selected += 1;
+                                            }
+                                        }
                                         KeyCode::Enter => {
-                                            let new_name = input.take();
-                                            dialog.entries[entry_idx].name = new_name;
+                                            let idx = *selected;
+                                            let existing_names: Vec<String> = dialog
+                                                .entries
+                                                .iter()
+                                                .map(|e| e.name.clone())
+                                                .collect();
+                                            let template = &wyj_api::PROFILE_TEMPLATES[idx];
+                                            let new_entry = ProfileEntryDraft::from_template(
+                                                template,
+                                                &existing_names,
+                                            );
+                                            let suggested_name = new_entry.name.clone();
+                                            dialog.entries.push(new_entry);
+                                            let new_idx = dialog.entries.len() - 1;
+                                            dialog.expanded = Some(new_idx);
                                             dialog.overlay = ProfileOverlay::None;
+                                            // 不依赖行数算术反推新头行位置（加了固定
+                                            // AddNew 尾行后容易差 1），直接搜索。
+                                            dialog.cursor = dialog
+                                                .rows()
+                                                .iter()
+                                                .position(|r| *r == ProfileRow::Header(new_idx))
+                                                .unwrap_or(0);
+                                            pending_rename = Some((new_idx, suggested_name));
                                         }
                                         KeyCode::Esc => {
                                             dialog.overlay = ProfileOverlay::None;
                                         }
-                                        KeyCode::Char(c) => input.insert_char(c),
-                                        KeyCode::Backspace => input.backspace(),
-                                        KeyCode::Left => input.move_left(),
-                                        KeyCode::Right => input.move_right(),
                                         _ => {}
                                     }
                                 }
-                                ProfileOverlay::TemplatePicker { selected } => match key.code {
-                                    KeyCode::Up => {
-                                        if *selected > 0 {
-                                            *selected -= 1;
-                                        }
-                                    }
-                                    KeyCode::Down => {
-                                        if *selected + 1 < wyj_api::PROFILE_TEMPLATES.len() {
-                                            *selected += 1;
-                                        }
-                                    }
-                                    KeyCode::Enter => {
-                                        let idx = *selected;
-                                        let existing_names: Vec<String> =
-                                            dialog.entries.iter().map(|e| e.name.clone()).collect();
-                                        let template = &wyj_api::PROFILE_TEMPLATES[idx];
-                                        let new_entry = ProfileEntryDraft::from_template(
-                                            template,
-                                            &existing_names,
-                                        );
-                                        let suggested_name = new_entry.name.clone();
-                                        dialog.entries.push(new_entry);
-                                        let new_idx = dialog.entries.len() - 1;
-                                        dialog.expanded = Some(new_idx);
-                                        dialog.cursor = dialog
-                                            .rows()
-                                            .len()
-                                            .saturating_sub(PROFILE_FIELD_COUNT + 1);
-                                        // 新建后立即提示命名，而不是让用户自己发现 'r' 键
-                                        let mut ib = InputBox::new();
-                                        ib.insert_text(&suggested_name);
-                                        dialog.overlay = ProfileOverlay::Renaming {
-                                            entry_idx: new_idx,
-                                            input: ib,
-                                        };
-                                    }
-                                    KeyCode::Esc => {
-                                        dialog.overlay = ProfileOverlay::None;
-                                    }
-                                    _ => {}
-                                },
-                                ProfileOverlay::ConfirmDelete { entry_idx } => {
-                                    let entry_idx = *entry_idx;
-                                    match key.code {
-                                        KeyCode::Char('y')
-                                        | KeyCode::Char('Y')
-                                        | KeyCode::Enter => {
-                                            dialog.entries.remove(entry_idx);
-                                            if dialog.active_idx > entry_idx {
-                                                dialog.active_idx -= 1;
-                                            }
-                                            match dialog.expanded {
-                                                Some(e) if e == entry_idx => dialog.expanded = None,
-                                                Some(e) if e > entry_idx => {
-                                                    dialog.expanded = Some(e - 1)
-                                                }
-                                                _ => {}
-                                            }
-                                            dialog.overlay = ProfileOverlay::None;
-                                            dialog.clamp_cursor();
-                                        }
-                                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                            dialog.overlay = ProfileOverlay::None;
-                                        }
-                                        _ => {}
-                                    }
+                            }
+                            // 新建后立即进入重命名借用态，而不是让用户自己发现"重命名"
+                            // 菜单项——`dialog` 的可变借用已在上面的块内结束，这里才能
+                            // 安全地写 state.input_owner（同一时刻不能双重可变借用 state）。
+                            if let Some((new_idx, suggested_name)) = pending_rename {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    dialog.live_input = InputBox::new();
+                                    dialog.live_input.insert_text(&suggested_name);
                                 }
-                                ProfileOverlay::FetchingModels { .. } => {
-                                    if let KeyCode::Esc = key.code {
-                                        dialog.overlay = ProfileOverlay::None;
-                                    }
-                                }
-                                ProfileOverlay::ModelsPicker {
-                                    entry_idx,
-                                    field_idx,
-                                    models,
-                                    selected,
-                                } => match key.code {
-                                    KeyCode::Up => {
-                                        if *selected > 0 {
-                                            *selected -= 1;
-                                        }
-                                    }
-                                    KeyCode::Down => {
-                                        if *selected + 1 < models.len() {
-                                            *selected += 1;
-                                        }
-                                    }
-                                    KeyCode::Enter => {
-                                        let entry_idx = *entry_idx;
-                                        let field_idx = *field_idx;
-                                        let chosen = models[*selected].clone();
-                                        dialog.entries[entry_idx].set_text_value(field_idx, chosen);
-                                        dialog.overlay = ProfileOverlay::None;
-                                    }
-                                    KeyCode::Esc => {
-                                        dialog.overlay = ProfileOverlay::None;
-                                    }
-                                    _ => {}
-                                },
-                                ProfileOverlay::None => {}
+                                state.input_owner =
+                                    Some(InputOwner::Profile(ProfileInputField::Rename {
+                                        entry_idx: new_idx,
+                                    }));
                             }
                             continue;
                         }
 
+                        // ── Esc 未保存修改三选一确认
+                        if matches!(
+                            state.profile_dialog.as_ref().unwrap().overlay,
+                            ProfileOverlay::UnsavedChanges { .. }
+                        ) {
+                            enum Choice {
+                                None,
+                                SaveClose,
+                                DiscardClose,
+                                BackToPanel,
+                            }
+                            let mut choice = Choice::None;
+                            if let Some(dialog) = &mut state.profile_dialog {
+                                if let ProfileOverlay::UnsavedChanges { selected } =
+                                    &mut dialog.overlay
+                                {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            if *selected > 0 {
+                                                *selected -= 1;
+                                            }
+                                        }
+                                        KeyCode::Down => {
+                                            if *selected + 1 < 3 {
+                                                *selected += 1;
+                                            }
+                                        }
+                                        KeyCode::Enter => {
+                                            choice = match *selected {
+                                                0 => Choice::SaveClose,
+                                                1 => Choice::DiscardClose,
+                                                _ => Choice::BackToPanel,
+                                            };
+                                        }
+                                        // Esc 在这里的语义与面板内所有其它 overlay 完全
+                                        // 一致：只收起当前这一层浮层、回到面板本身，绝不
+                                        // 等同于"选中取消"再级联关闭整个面板——回到面板
+                                        // 后再按 Esc，is_dirty() 仍为真会再次弹出，这是
+                                        // 预期行为，不是死循环 bug。
+                                        KeyCode::Esc => {
+                                            dialog.overlay = ProfileOverlay::None;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            match choice {
+                                Choice::None => {}
+                                Choice::SaveClose => {
+                                    let saved = profile_try_save(
+                                        &mut state,
+                                        &agent_tx,
+                                        &rebuild_fn,
+                                        &system_prompt_extra,
+                                        &todo_store,
+                                        &shared_agent,
+                                    );
+                                    if saved {
+                                        state.input_owner = None;
+                                        state.profile_dialog = None;
+                                    } else if let Some(dialog) = &mut state.profile_dialog {
+                                        // 保存失败：回到面板展示 error，而不是卡在三选一
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                }
+                                Choice::DiscardClose => {
+                                    state.input_owner = None;
+                                    state.profile_dialog = None;
+                                }
+                                Choice::BackToPanel => {
+                                    if let Some(dialog) = &mut state.profile_dialog {
+                                        dialog.overlay = ProfileOverlay::None;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
                         match key.code {
+                            KeyCode::Esc => {
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    if dialog.is_dirty() {
+                                        dialog.overlay =
+                                            ProfileOverlay::UnsavedChanges { selected: 0 };
+                                    } else {
+                                        state.profile_dialog = None;
+                                    }
+                                }
+                            }
                             KeyCode::Up => {
                                 if let Some(dialog) = &mut state.profile_dialog {
-                                    if dialog.cursor > 0 {
-                                        dialog.cursor -= 1;
-                                    }
+                                    dialog.cursor = dialog.cursor.saturating_sub(1);
                                     dialog.error = None;
                                 }
                             }
@@ -3429,8 +6878,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                             KeyCode::Left => {
                                 if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, field_idx) = dialog.selected_row();
-                                    if let Some(f) = field_idx {
+                                    if let ProfileRow::Field(entry_idx, f) = dialog.selected_row() {
                                         if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
                                         {
                                             dialog.entries[entry_idx].cycle_provider(false);
@@ -3440,8 +6888,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                             KeyCode::Right => {
                                 if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, field_idx) = dialog.selected_row();
-                                    if let Some(f) = field_idx {
+                                    if let ProfileRow::Field(entry_idx, f) = dialog.selected_row() {
                                         if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
                                         {
                                             dialog.entries[entry_idx].cycle_provider(true);
@@ -3450,199 +6897,72 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 }
                             }
                             KeyCode::Enter => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, field_idx) = dialog.selected_row();
-                                    match field_idx {
-                                        None => {
-                                            dialog.expanded = if dialog.expanded == Some(entry_idx)
-                                            {
-                                                None
-                                            } else {
-                                                Some(entry_idx)
-                                            };
-                                            dialog.clamp_cursor();
+                                let row = state.profile_dialog.as_ref().map(|d| d.selected_row());
+                                match row {
+                                    Some(ProfileRow::Header(_)) => {
+                                        if let Some(dialog) = &mut state.profile_dialog {
+                                            dialog.menu = dialog.build_menu();
                                         }
-                                        Some(f) => match profile_field_kind(f) {
-                                            SettingsFieldKind::Enum => {
-                                                dialog.entries[entry_idx].cycle_provider(true)
-                                            }
-                                            SettingsFieldKind::Text => {
-                                                let mut ib = InputBox::new();
-                                                ib.insert_text(
-                                                    dialog.entries[entry_idx].text_value(f),
-                                                );
-                                                dialog.editing = Some(ib);
-                                            }
-                                        },
                                     }
-                                }
-                            }
-                            KeyCode::Char('a') => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, _) = dialog.selected_row();
-                                    dialog.active_idx = entry_idx;
-                                    dialog.error = None;
-                                }
-                            }
-                            KeyCode::Char('n') => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    dialog.overlay = ProfileOverlay::TemplatePicker { selected: 0 };
-                                }
-                            }
-                            KeyCode::Char('d') => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, _) = dialog.selected_row();
-                                    if dialog.entries.len() <= 1 {
-                                        dialog.error = Some(wyj_i18n::tr("profile.error.last_one"));
-                                    } else if entry_idx == dialog.active_idx {
-                                        dialog.error =
-                                            Some(wyj_i18n::tr("profile.error.delete_active"));
-                                    } else {
-                                        dialog.overlay =
-                                            ProfileOverlay::ConfirmDelete { entry_idx };
-                                    }
-                                }
-                            }
-                            KeyCode::Char('r') => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, _) = dialog.selected_row();
-                                    let mut ib = InputBox::new();
-                                    ib.insert_text(&dialog.entries[entry_idx].name);
-                                    dialog.overlay = ProfileOverlay::Renaming {
-                                        entry_idx,
-                                        input: ib,
-                                    };
-                                }
-                            }
-                            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    let (entry_idx, field_idx) = dialog.selected_row();
-                                    if let Some(f) = field_idx {
+                                    Some(ProfileRow::Field(entry_idx, f)) => {
                                         if PROFILE_MODEL_FIELD_IDXS.contains(&f) {
-                                            let entry = dialog.entries[entry_idx].clone();
-                                            let api_key = entry.api_key.clone();
-                                            if api_key.trim().is_empty() {
-                                                dialog.error = Some(wyj_i18n::tr(
-                                                    "profile.fetch.need_api_key",
-                                                ));
-                                            } else {
-                                                let provider = entry.provider();
-                                                let base_url = if entry.base_url.trim().is_empty() {
-                                                    match provider {
-                                                        wyj_config::Provider::Anthropic => {
-                                                            "https://api.anthropic.com".to_string()
-                                                        }
-                                                        wyj_config::Provider::OpenAI => {
-                                                            "https://api.openai.com/v1".to_string()
-                                                        }
-                                                    }
-                                                } else {
-                                                    entry.base_url.clone()
-                                                };
-                                                dialog.overlay = ProfileOverlay::FetchingModels {
+                                            // model/plan_model/exec_model：先弹"手动编辑 /
+                                            // 从服务器拉取列表"小菜单（原 Ctrl+L 并入此处）。
+                                            if let Some(dialog) = &mut state.profile_dialog {
+                                                dialog.menu = dialog.build_menu();
+                                            }
+                                        } else if matches!(
+                                            profile_field_kind(f),
+                                            SettingsFieldKind::Enum
+                                        ) {
+                                            // provider：Enter 循环切换，与 Left/Right 等价，
+                                            // 已经是方向键交互，不纳入菜单化/借用输入框。
+                                            if let Some(dialog) = &mut state.profile_dialog {
+                                                dialog.entries[entry_idx].cycle_provider(true);
+                                            }
+                                        } else {
+                                            // base_url/api_key/max_tokens/context_window：
+                                            // 直接借用底部输入框，不经过小菜单。
+                                            let prefill = state
+                                                .profile_dialog
+                                                .as_ref()
+                                                .map(|d| {
+                                                    d.entries[entry_idx].text_value(f).to_string()
+                                                })
+                                                .unwrap_or_default();
+                                            if let Some(dialog) = &mut state.profile_dialog {
+                                                dialog.live_input = InputBox::new();
+                                                dialog.live_input.insert_text(&prefill);
+                                            }
+                                            state.input_owner = Some(InputOwner::Profile(
+                                                ProfileInputField::Field {
                                                     entry_idx,
                                                     field_idx: f,
-                                                };
-                                                let tx = agent_tx.clone();
-                                                tokio::spawn(async move {
-                                                    let result = wyj_api::fetch_model_ids(
-                                                        &provider, &base_url, &api_key,
-                                                    )
-                                                    .await
-                                                    .map_err(|e| e.to_string());
-                                                    let _ = tx
-                                                        .send(AgentEvent::ModelsFetched {
-                                                            entry_idx,
-                                                            field_idx: f,
-                                                            result,
-                                                        })
-                                                        .await;
-                                                });
-                                            }
+                                                },
+                                            ));
                                         }
                                     }
+                                    Some(ProfileRow::AddNew) => {
+                                        if let Some(dialog) = &mut state.profile_dialog {
+                                            dialog.overlay =
+                                                ProfileOverlay::TemplatePicker { selected: 0 };
+                                        }
+                                    }
+                                    None => {}
                                 }
                             }
                             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let mut should_close = false;
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    if let Some(err_key) = dialog.validate_names() {
-                                        dialog.error = Some(wyj_i18n::tr(err_key));
-                                    } else if let Some((bad_idx, err_key)) = dialog
-                                        .entries
-                                        .iter()
-                                        .enumerate()
-                                        .find_map(|(i, e)| e.validate().map(|k| (i, k)))
-                                    {
-                                        dialog.expanded = Some(bad_idx);
-                                        dialog.clamp_cursor();
-                                        dialog.error = Some(wyj_i18n::tr(err_key));
-                                    } else {
-                                        let mut new_cfg = state.config.clone();
-                                        new_cfg.profiles =
-                                            dialog.entries.iter().map(|e| e.to_profile()).collect();
-                                        new_cfg.active_profile =
-                                            dialog.entries[dialog.active_idx].name.clone();
-                                        match new_cfg.save() {
-                                            Ok(()) => {
-                                                should_close = true;
-                                                state.config = new_cfg.clone();
-                                                let model_for_mode = state
-                                                    .config
-                                                    .model_for_mode(&state.mode)
-                                                    .to_string();
-                                                match rebuild_fn(&state.config, &model_for_mode) {
-                                                    Ok(new_agent) => {
-                                                        // rebuild_fn 已装配完整 system prompt，
-                                                        // 只拼回模式追加段
-                                                        let new_agent = new_agent.append_system(
-                                                            system_prompt_extra
-                                                                .trim_start()
-                                                                .to_string(),
-                                                        );
-                                                        let new_agent = wire_tool_callback(
-                                                            new_agent,
-                                                            agent_tx.clone(),
-                                                            todo_store.clone(),
-                                                        );
-                                                        *shared_agent.write().unwrap() =
-                                                            Arc::new(new_agent);
-                                                        state.model_name = model_for_mode;
-                                                        state.context_window = state
-                                                            .config
-                                                            .active_profile()
-                                                            .context_window;
-                                                        state.messages.push(ChatMessage::system(
-                                                            wyj_i18n::tr("profile.saved"),
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        state.messages.push(
-                                                            ChatMessage::assistant_err(
-                                                                wyj_i18n::tr_fmt(
-                                                                    "settings.rebuild_failed",
-                                                                    &[("err", &e.to_string())],
-                                                                ),
-                                                            ),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                dialog.error = Some(wyj_i18n::tr_fmt(
-                                                    "settings.save_failed",
-                                                    &[("err", &e.to_string())],
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                if should_close {
+                                let saved = profile_try_save(
+                                    &mut state,
+                                    &agent_tx,
+                                    &rebuild_fn,
+                                    &system_prompt_extra,
+                                    &todo_store,
+                                    &shared_agent,
+                                );
+                                if saved {
                                     state.profile_dialog = None;
                                 }
-                            }
-                            KeyCode::Esc => {
-                                state.profile_dialog = None;
                             }
                             _ => {}
                         }
@@ -3651,6 +6971,19 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
                     // ① plan 批准对话框最高优先级
                     if state.plan_dialog.is_some() {
+                        // Ctrl+C 在 plan 弹窗期间直接走 interrupt()。Agent 仍在
+                        // `exit_plan_mode().await` 上挂起（ExitPlanMode 工具阻塞等
+                        // 用户响应），弹窗分支以 `continue` 收尾会吞掉外层 Ctrl+C
+                        // 处理，因此必须在此处显式识别。
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some(dlg) = state.plan_dialog.take() {
+                                let _ = dlg.response_tx.send(false);
+                            }
+                            state.interrupt();
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.plan_dialog.take() {
@@ -3661,9 +6994,9 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
-                                    // PlanApprovalRequest 曾把 is_thinking 设为 false 以暂停
-                                    // spinner；批准后 Agent 会继续执行后续工具，必须恢复
-                                    // is_thinking，否则输入框 spinner 与 TaskList 图标都会冻结。
+                                    // Agent 会继续执行后续工具，恢复 spinner；批准分支
+                                    // 也负责把 is_thinking 写回 true（PlanApprovalRequest
+                                    // 阶段刻意不再预设 false，避免吞掉 Ctrl+C 中断路径）。
                                     state.is_thinking = true;
                                     state.messages.push(ChatMessage::system(
                                         "已批准计划，切换至执行模式。".to_string(),
@@ -3671,12 +7004,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 }
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                // 取消 = 中断当前计划调研。用户随后可在输入框补充新指令
+                                // 或修改方向；不再向 Agent 发送 "keep planning" 反馈让
+                                // 它再写一版。仅解 oneshot + abort current_task 即可。
                                 if let Some(dlg) = state.plan_dialog.take() {
                                     let _ = dlg.response_tx.send(false);
-                                    state.messages.push(ChatMessage::system(
-                                        "已取消，继续保持 plan 模式。".to_string(),
-                                    ));
                                 }
+                                state.interrupt();
+                                state.messages.push(ChatMessage::system(
+                                    "已中断当前计划调研，可补充指令后继续。".to_string(),
+                                ));
                             }
                             KeyCode::Up => {
                                 if let Some(dlg) = state.plan_dialog.as_mut() {
@@ -3953,6 +7290,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 
                     // ESC → 中断 Agent / 连按两次清空输入框
                     if key.code == KeyCode::Esc {
+                        // agents 面板选中态优先退出：先收起详情，再清空选中，
+                        // 都不命中才走原有的 interrupt / 双击清空逻辑
+                        if state.selected_sub_agent.is_some() {
+                            if state.sub_agent_detail_open {
+                                state.sub_agent_detail_open = false;
+                            } else {
+                                state.selected_sub_agent = None;
+                            }
+                            continue;
+                        }
                         if state.is_thinking {
                             state.interrupt();
                             state.last_esc = None;
@@ -3970,6 +7317,16 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 state.last_esc = Some(Instant::now());
                             }
                         }
+                        continue;
+                    }
+
+                    // Enter/Space → 展开/收起选中子 Agent 的详情（仅输入框为空且已选中时生效）
+                    if input.is_empty()
+                        && state.selected_sub_agent.is_some()
+                        && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
+                    {
+                        state.sub_agent_detail_open = !state.sub_agent_detail_open;
+                        state.sub_agent_detail_scroll = 0;
                         continue;
                     }
 
@@ -4120,6 +7477,23 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     .unwrap_or_default(),
                                 sub_input_tokens: state.sub_input_tokens,
                                 sub_output_tokens: state.sub_output_tokens,
+                                effective_mcp_count: wyj_store::mcp_install::effective_mcp_servers(
+                                    &state.config,
+                                    &cwd,
+                                )
+                                .len()
+                                    + local_plugin
+                                        .as_ref()
+                                        .map(|p| p.mcp_servers.len())
+                                        .unwrap_or(0),
+                                plugin_agent_paths: {
+                                    let mut paths =
+                                        wyj_store::plugin_install::enabled_plugin_agent_paths(&cwd);
+                                    if let Some(local) = &local_plugin {
+                                        paths.extend(local.agent_paths.clone());
+                                    }
+                                    paths
+                                },
                             };
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
@@ -4423,6 +7797,18 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             state.config.auto_memory_enabled,
                                         ));
                                     }
+                                    Ok(CommandResult::OpenMcpDialog) => {
+                                        state.mcp_dialog =
+                                            Some(McpDialog::new(&state.config, &state.cwd));
+                                    }
+                                    Ok(CommandResult::OpenSkillsDialog) => {
+                                        let home = wyj_config::home_dir().unwrap_or_default();
+                                        state.skills_dialog =
+                                            Some(SkillsDialog::new(&home, &state.cwd));
+                                    }
+                                    Ok(CommandResult::OpenPluginsDialog) => {
+                                        state.plugins_dialog = Some(PluginsDialog::new(&state.cwd));
+                                    }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;
                                     }
@@ -4532,9 +7918,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         // Ctrl+End：跳到最底（最新消息）
                         state.scroll_offset = 0;
                     } else if key.code == KeyCode::Up {
-                        // 输入框空 → 滚动聊天区（含鼠标滚轮上滚转来的 Up）
+                        // 输入框空 + 面板有子 Agent → 选中/滚动详情
+                        // 输入框空 + 面板无子 Agent → 滚动聊天区（含鼠标滚轮上滚转来的 Up）
                         // 输入框有内容 → 历史导航
-                        if input.is_empty() && state.slash_completions.is_empty() {
+                        if !state.sub_agents.is_empty()
+                            && input.is_empty()
+                            && state.slash_completions.is_empty()
+                        {
+                            if state.sub_agent_detail_open {
+                                state.sub_agent_detail_scroll =
+                                    state.sub_agent_detail_scroll.saturating_add(3);
+                            } else {
+                                move_sub_agent_selection(&mut state, -1);
+                            }
+                        } else if input.is_empty() && state.slash_completions.is_empty() {
                             state.scroll_offset = state.scroll_offset.saturating_add(3);
                         } else if !state.is_thinking && state.slash_completions.is_empty() {
                             let hist_len = state.input_history.len();
@@ -4556,9 +7953,20 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                         }
                     } else if key.code == KeyCode::Down {
-                        // 输入框空 → 滚动聊天区（含鼠标滚轮下滚转来的 Down）
+                        // 输入框空 + 面板有子 Agent → 选中/滚动详情
+                        // 输入框空 + 面板无子 Agent → 滚动聊天区（含鼠标滚轮下滚转来的 Down）
                         // 输入框有内容 → 历史导航
-                        if input.is_empty() && state.slash_completions.is_empty() {
+                        if !state.sub_agents.is_empty()
+                            && input.is_empty()
+                            && state.slash_completions.is_empty()
+                        {
+                            if state.sub_agent_detail_open {
+                                state.sub_agent_detail_scroll =
+                                    state.sub_agent_detail_scroll.saturating_sub(3);
+                            } else {
+                                move_sub_agent_selection(&mut state, 1);
+                            }
+                        } else if input.is_empty() && state.slash_completions.is_empty() {
                             state.scroll_offset = state.scroll_offset.saturating_sub(3);
                         } else if !state.is_thinking && state.slash_completions.is_empty() {
                             if let Some(idx) = state.history_idx {

@@ -63,37 +63,71 @@ pub fn builtin_defs() -> Vec<AgentDefinition> {
     ]
 }
 
-/// 加载全部 agent 定义：内置 → 全局 ~/.claude/agents → 项目 .claude/agents，同名后者覆盖。
-pub fn load_agent_defs(cwd: &Path) -> Vec<AgentDefinition> {
-    let mut defs = builtin_defs();
-    let mut dirs: Vec<PathBuf> = vec![];
-    if let Ok(home) = wyj_config::claude_home_dir() {
-        dirs.push(home.join("agents"));
-    }
-    dirs.push(cwd.join(".claude").join("agents"));
-
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+/// 从一个路径（文件或目录）读取全部 agent 定义文件。
+fn read_defs_from_path(path: &Path) -> Vec<AgentDefinition> {
+    let mut paths: Vec<PathBuf> = if path.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return Vec::new();
         };
-        let mut paths: Vec<PathBuf> = entries
+        entries
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
-            .collect();
-        paths.sort();
-        for path in paths {
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                tracing::warn!("读取 agent 定义失败: {}", path.display());
-                continue;
-            };
-            let def = parse_agent_file(&content, &path);
-            match defs.iter_mut().find(|d| d.name == def.name) {
-                Some(existing) => *existing = def,
-                None => defs.push(def),
-            }
+            .collect()
+    } else if path.is_file() {
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    paths.sort();
+
+    let mut defs = Vec::new();
+    for path in paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            tracing::warn!("读取 agent 定义失败: {}", path.display());
+            continue;
+        };
+        defs.push(parse_agent_file(&content, &path));
+    }
+    defs
+}
+
+fn upsert_overwrite(defs: &mut Vec<AgentDefinition>, def: AgentDefinition) {
+    match defs.iter_mut().find(|d| d.name == def.name) {
+        Some(existing) => *existing = def,
+        None => defs.push(def),
+    }
+}
+
+/// 加载全部 agent 定义：内置 → 全局 `~/.claude/agents`（覆盖内置）→ 已启用插件
+/// 贡献路径（按安装顺序，先到先得，跳过并警告同名冲突）→ 项目 `.claude/agents`
+/// （最高优先级，覆盖一切，包括插件）。
+pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<AgentDefinition> {
+    let mut defs = builtin_defs();
+
+    // 全局（覆盖内置，既有的"用户手动覆盖内置"能力，不属于插件冲突场景）
+    if let Ok(home) = wyj_config::claude_home_dir() {
+        for def in read_defs_from_path(&home.join("agents")) {
+            upsert_overwrite(&mut defs, def);
         }
     }
+
+    // 已启用插件贡献路径（先到先得，跳过并警告同名冲突）
+    for path in plugin_agent_sources {
+        for def in read_defs_from_path(path) {
+            if defs.iter().any(|d| d.name == def.name) {
+                tracing::warn!("插件贡献的 agent '{}' 与已有资源同名，已跳过", def.name);
+                continue;
+            }
+            defs.push(def);
+        }
+    }
+
+    // 项目（最高优先级，覆盖一切，包括插件）
+    for def in read_defs_from_path(&cwd.join(".claude").join("agents")) {
+        upsert_overwrite(&mut defs, def);
+    }
+
     defs
 }
 
@@ -260,12 +294,76 @@ mod tests {
             "---\nname: Explore\ndescription: 自定义覆盖\n---\n自定义提示词",
         )
         .unwrap();
-        let defs = load_agent_defs(&tmp);
+        let defs = load_agent_defs(&tmp, &[]);
         let explore = defs.iter().find(|d| d.name == "Explore").unwrap();
         assert_eq!(explore.description, "自定义覆盖");
         assert!(!explore.builtin);
         // 覆盖是替换而非追加
         assert_eq!(defs.iter().filter(|d| d.name == "Explore").count(), 1);
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn plugin_source_contributes_new_agent_definition() {
+        let cwd = std::env::temp_dir().join(format!("wyj-agentdef-plugin-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let plugin_dir = cwd.join("plugin-agents");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("reviewer.md"),
+            "---\nname: plugin-reviewer\ndescription: 插件提供的审查 agent\n---\n审查代码",
+        )
+        .unwrap();
+
+        let defs = load_agent_defs(&cwd, &[plugin_dir]);
+        let found = defs.iter().find(|d| d.name == "plugin-reviewer").unwrap();
+        assert_eq!(found.description, "插件提供的审查 agent");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn plugin_source_conflict_with_existing_name_is_skipped() {
+        let cwd =
+            std::env::temp_dir().join(format!("wyj-agentdef-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let plugin_dir = cwd.join("plugin-agents");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        // 与内置类型同名，插件贡献应被跳过（先到先得）。
+        std::fs::write(
+            plugin_dir.join("explore-clone.md"),
+            "---\nname: Explore\ndescription: 插件想覆盖内置 Explore\n---\nbody",
+        )
+        .unwrap();
+
+        let defs = load_agent_defs(&cwd, &[plugin_dir]);
+        let explore = defs.iter().find(|d| d.name == "Explore").unwrap();
+        assert!(explore.builtin); // 仍是内置版本，插件未能覆盖
+        assert_eq!(defs.iter().filter(|d| d.name == "Explore").count(), 1);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn project_dir_still_overrides_plugin_contribution() {
+        let cwd =
+            std::env::temp_dir().join(format!("wyj-agentdef-projoverride-{}", std::process::id()));
+        let project_agents_dir = cwd.join(".claude").join("agents");
+        std::fs::create_dir_all(&project_agents_dir).unwrap();
+        std::fs::write(
+            project_agents_dir.join("custom.md"),
+            "---\nname: custom\ndescription: 项目覆盖\n---\nbody",
+        )
+        .unwrap();
+        let plugin_dir = cwd.join("plugin-agents");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("custom.md"),
+            "---\nname: custom\ndescription: 插件版本\n---\nbody",
+        )
+        .unwrap();
+
+        let defs = load_agent_defs(&cwd, &[plugin_dir]);
+        let custom = defs.iter().find(|d| d.name == "custom").unwrap();
+        assert_eq!(custom.description, "项目覆盖");
+        std::fs::remove_dir_all(&cwd).ok();
     }
 }
