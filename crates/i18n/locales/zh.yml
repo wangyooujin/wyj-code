@@ -33,6 +33,7 @@ subagent:
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
   inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
+  detail_running: "运行中，当前动作："
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
   builtin_plan_desc: "规划 Agent：只读分析代码并产出分步实施计划"
@@ -57,6 +58,7 @@ cli:
   resume_help: "恢复指定会话 ID（如 sess-1719723000）"
   profile_help: "一次性指定本次运行使用的调用分组（不落盘、不改 active_profile）"
   profile_not_found: "未找到分组 '{name}'，请用 --config-status 查看已有分组"
+  plugin_dir_help: "加载本地插件目录用于开发调试（临时生效：仅当次运行有效，不落盘，不出现在 /plugins 已安装列表中）"
 
 main:
   session_not_found: "未找到会话 {id}，将开始新会话。"
@@ -84,6 +86,9 @@ help:
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/memory` — 打开 CLAUDE.md 记忆面板
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
+    - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
+    - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
+    - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
@@ -159,6 +164,198 @@ memory:
     auto_memory_index_empty: "（暂无内容）"
     hint: "↑↓ 选择   Enter 打开/切换   Esc 关闭"
     editor_failed: "打开编辑器失败: {err}"
+
+mcp:
+  desc: "管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）"
+  headless_unsupported: "[headless 模式不支持 /mcp 面板，请直接编辑 ~/.wyj-code/config.toml 的 [[mcp_servers]] 段或 .wyj/mcp.toml]"
+  background:
+    connected: "MCP [{name}] 已连接，注册 {count} 个工具"
+    failed_error: "MCP [{name}] 连接失败: {err}"
+    failed_timeout: "MCP [{name}] 连接超时，已跳过"
+  status:
+    connecting: "连接中…"
+    connected: "运行中（{count} 工具）"
+    failed: "连接失败"
+    timed_out: "超时未连接"
+  dialog:
+    title: "MCP Server"
+    tab_installed: "已安装"
+    tab_registries: "注册中心"
+    tab_browse: "浏览 Registry"
+    empty_installed: "（暂无已配置的 MCP server）"
+    empty_registries: "（暂无注册中心源，按 a 添加）"
+    empty_browse: "输入关键字后回车搜索"
+    no_results: "未找到匹配结果"
+    searching: "搜索中…"
+    search_label: "搜索:"
+    scope_global: "全局"
+    scope_project: "项目"
+    unmanaged_tag: "手动配置"
+    hint_installed: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
+    hint_registries: "  ↑↓ 选择  Enter 操作菜单/新增  ←→ 切换标签  Esc 关闭"
+    hint_browse: "  ↑↓ 选择  Enter 搜索/操作菜单  ←→ 切换标签  Esc 关闭"
+    add_registry_row: "+ 添加 registry"
+    search_row_placeholder: "(Enter 输入关键字搜索)"
+  menu:
+    enable: "启用"
+    disable: "禁用"
+    upgrade: "升级"
+    uninstall: "卸载"
+    view_detail: "查看详情"
+    browse_source: "浏览"
+    remove_source: "删除"
+    install: "安装"
+  detail:
+    title: " MCP Server 详情 "
+    name_line: "名称: {name}"
+    scope_line: "作用域: {scope}"
+    command_line: "命令: {command}"
+    args_line: "参数: {args}"
+    env_line: "环境变量: {env}"
+  registry:
+    add_title: " 添加 MCP Registry "
+    add_prompt: "输入 registry 的 base URL（同一开源 registry 软件的不同部署实例，如自建/私有实例）:"
+  install:
+    unsupported_package: "该 server 暂不支持自动安装（仅支持 stdio 型 npm/pypi 包），请手动编辑配置文件添加"
+    confirm_title: " 确认安装 MCP Server "
+    name_label: "名称: "
+    scope_label: "作用域: "
+    command_label: "即将写入命令:"
+    confirm_warning: "该命令会在以后每次启动 wyj-code 时自动执行。"
+    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    done: "安装成功，重启 wyj-code 后生效"
+  upgrade:
+    in_progress: "升级中…"
+    done: "已升级到 {version}"
+    already_latest: "已是最新版本（{version}）"
+  uninstall:
+    done: "已卸载，重启 wyj-code 后生效"
+  error:
+    search_failed: "搜索失败: {err}"
+    install_failed: "安装失败: {err}"
+    uninstall_failed: "卸载失败: {err}"
+    upgrade_failed: "升级失败: {err}"
+    manual_no_upgrade: "手动配置项没有版本信息，无法升级"
+
+skills:
+  desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
+  headless_unsupported: "[headless 模式不支持 /skills 面板，请直接在 ~/.wyj-code/skills/ 或 .wyj/skills/ 下增删 .md 文件]"
+  dialog:
+    title: "Skill"
+    tab_installed: "已安装"
+    tab_marketplaces: "Marketplace"
+    tab_browse: "浏览"
+    empty_installed: "（暂无 skill）"
+    empty_marketplaces: "（暂无 marketplace 源，按 Enter 添加）"
+    empty_marketplace_entries: "该 marketplace 未发现可安装的 skill"
+    unmanaged_tag: "手动配置"
+    syncing: "同步中…"
+    add_marketplace_row: "+ 添加 marketplace"
+    hint_installed: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
+    hint_marketplaces: "  ↑↓ 选择  Enter 操作菜单/新增  ←→ 切换标签  Esc 关闭"
+    hint_browse: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
+  menu:
+    enable: "启用"
+    disable: "禁用"
+    upgrade: "升级"
+    uninstall: "卸载"
+    view_detail: "查看详情"
+    browse_source: "浏览"
+    remove_source: "删除"
+    install: "安装"
+  detail:
+    title: " Skill 详情 "
+    name_line: "名称: {name}"
+    description_line: "描述: {description}"
+    scope_line: "作用域: {scope}"
+    version_line: "版本: {version}"
+  marketplace:
+    add_title: " 添加 Marketplace "
+    add_prompt: "输入 git 仓库 URL（本地路径可用 file:// 前缀）:"
+  install:
+    confirm_title: " 确认安装 Skill "
+    name_label: "名称: "
+    scope_label: "作用域: "
+    path_label: "来源路径: "
+    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    done: "安装成功，重启 wyj-code 后生效"
+  upgrade:
+    in_progress: "升级中…"
+    done: "已升级到 {version}"
+    already_latest: "已是最新版本（{version}）"
+  uninstall:
+    done: "已卸载，重启 wyj-code 后生效"
+  error:
+    sync_failed: "同步 marketplace 失败: {err}"
+    install_failed: "安装失败: {err}"
+    uninstall_failed: "卸载失败: {err}"
+    upgrade_failed: "升级失败: {err}"
+    manual_no_upgrade: "手动配置项没有版本信息，无法升级"
+
+plugins:
+  desc: "管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）"
+  headless_unsupported: "[headless 模式不支持 /plugins 面板，本地开发请用 --plugin-dir，或直接管理 ~/.wyj-code/plugins/ 目录]"
+  dialog:
+    title: "插件"
+    tab_installed: "已安装"
+    tab_marketplaces: "插件市场"
+    tab_browse: "浏览"
+    empty_installed: "（暂无插件，选中「+ 添加本地插件」回车添加）"
+    empty_marketplaces: "（暂无插件市场源，按 Enter 添加）"
+    empty_marketplace_entries: "该市场未发现可安装的插件"
+    local_dev_tag: "本地（开发）"
+    syncing: "同步中…"
+    add_local_row: "+ 添加本地插件"
+    add_marketplace_row: "+ 添加插件市场"
+    hint_installed: "  ↑↓ 选择  Enter 操作菜单/新增  ←→ 切换标签  Esc 关闭"
+    hint_marketplaces: "  ↑↓ 选择  Enter 操作菜单/新增  ←→ 切换标签  Esc 关闭"
+    hint_browse: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
+  menu:
+    enable: "启用"
+    disable: "禁用"
+    upgrade: "升级"
+    uninstall: "卸载"
+    view_detail: "查看详情"
+    browse_source: "浏览"
+    remove_source: "删除"
+    install: "安装"
+  detail:
+    title: " 插件详情 "
+    name_line: "名称: {name}"
+    scope_line: "作用域: {scope}"
+    version_line: "版本: {version}"
+    resources_line: "资源: {summary}"
+    path_line: "路径: {path}"
+  marketplace:
+    add_title: " 添加插件市场 "
+    add_prompt: "输入 git 仓库 URL 或本地目录路径:"
+  install:
+    confirm_title: " 确认安装插件 "
+    name_label: "名称: "
+    scope_label: "作用域: "
+    confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
+    in_progress: "安装中…"
+    report_title: " 插件安装成功 "
+    resource_counts: "已安装: {cmd} 个命令 / {agent} 个 agent / {mcp} 个 MCP server"
+    skipped_capabilities_label: "检测到 {count} 项当前版本不支持的能力，已跳过: {names}"
+    restart_required_hint: "部分变更需重启 wyj-code 生效"
+  upgrade:
+    in_progress: "升级中…"
+    done: "已升级到 {version}"
+    already_latest: "已是最新版本（{version}）"
+  uninstall:
+    done: "已卸载"
+  toggle:
+    restart_required_hint: "部分变更需重启 wyj-code 生效"
+  local:
+    add_title: " 添加本地插件 "
+    add_prompt: "输入本地插件目录路径（用于开发调试；与 --plugin-dir 不同，会持久化记录）:"
+  error:
+    sync_failed: "同步插件市场失败: {err}"
+    install_failed: "安装失败: {err}"
+    uninstall_failed: "卸载失败: {err}"
+    upgrade_failed: "升级失败: {err}"
+    local_no_upgrade: "本地开发插件没有版本信息，无法升级"
 
 doctor:
   desc: "诊断运行环境（API Key / 配置 / CLAUDE.md / 记忆）"
@@ -250,6 +447,17 @@ dialog:
   time_minutes_ago: "{n}分钟前"
   time_hours_ago: "{n}小时前"
   time_days_ago: "{n}天前"
+  input_owner:
+    mcp_add_registry: "[MCP] 输入 registry URL (Enter 提交 / Esc 取消)"
+    mcp_browse_search: "[MCP] 搜索 (Enter 提交 / Esc 取消)"
+    skills_add_marketplace: "[Skills] 输入 marketplace 地址 (Enter 提交 / Esc 取消)"
+    plugins_add_marketplace: "[Plugins] 输入 marketplace 地址 (Enter 提交 / Esc 取消)"
+    plugins_add_local: "[Plugins] 输入本地插件路径 (Enter 提交 / Esc 取消)"
+    profile_rename: "[Model] 重命名分组 (Enter 提交 / Esc 取消)"
+    profile_field: "[Model] 编辑 {field} (Enter 提交 / Esc 取消)"
+  action_menu:
+    confirm_question: "确定要「{action}」吗？"
+    confirm_hint: "Enter/y 确认   Esc/n 取消"
 
 settings:
   title: "配置设置"
@@ -280,8 +488,19 @@ profile:
   not_found: "未找到分组 '{name}'"
   headless_unsupported: "[headless 模式不支持 /model 管理分组，请在 TUI 模式下使用]"
   dialog:
-    hint1: "  ↑↓ 移动  Enter 展开/编辑  a 激活  n 新建  d 删除  r 重命名"
-    hint2: "  Ctrl+L 拉取模型列表  Ctrl+S 保存  Esc 取消"
+    hint1: "  ↑↓ 移动  Enter 操作菜单/编辑  ←→ 切换 Provider"
+    hint2: "  Ctrl+S 保存  Esc 关闭"
+    editing_placeholder: "编辑中，见下方输入框"
+    add_new_row: "新建分组"
+  menu:
+    expand: "展开查看字段"
+    collapse: "收起字段"
+    activate: "设为当前"
+    already_active: "已经是当前分组"
+    rename: "重命名"
+    delete: "删除"
+    manual_edit: "手动编辑"
+    fetch_models: "从服务器拉取列表"
   error:
     empty_name: "分组名称不能为空"
     duplicate_name: "分组名称重复，请改一个唯一的名字"
@@ -291,13 +510,14 @@ profile:
     need_api_key: "请先填写 API Key 再拉取模型列表"
     in_progress: "正在拉取模型列表…"
     failed: "拉取模型列表失败: {err}（可继续手动输入模型名）"
+    empty: "未拉取到任何模型，可继续手动输入模型名"
   overlay:
-    rename_title: "重命名分组"
     template_title: "选择新建分组模板"
-    confirm_delete_title: "确认删除"
-    confirm_delete_body: "确定删除分组 '{name}' 吗？(y/Enter 确认，n/Esc 取消)"
     fetching_title: "拉取模型列表"
-    models_title: "选择模型（↑↓ 选择，Enter 确认，Esc 取消）"
+    unsaved_title: "存在未保存的修改"
+    unsaved_save_close: "保存并关闭"
+    unsaved_discard_close: "不保存关闭"
+    unsaved_cancel: "取消"
 
 welcome:
   placeholder: '试试 "修复这个 bug" 或随便问点啥…'

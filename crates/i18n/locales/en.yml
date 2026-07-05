@@ -34,6 +34,7 @@ subagent:
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
   panel_title: " agents [{count}] "
   inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
+  detail_running: "running, current action:"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
   builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
@@ -58,6 +59,7 @@ cli:
   resume_help: "Resume a specific session ID (e.g. sess-1719723000)"
   profile_help: "One-shot override of which call profile to use this run (not persisted, doesn't change active_profile)"
   profile_not_found: "Profile '{name}' not found — run --config-status to see available profiles"
+  plugin_dir_help: "Load a local plugin directory for development (ephemeral: this run only, not persisted, not shown in /plugins Installed list)"
 
 main:
   session_not_found: "Session {id} not found, starting a new session."
@@ -85,6 +87,9 @@ help:
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/memory` — Open the CLAUDE.md memory panel
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
+    - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
+    - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
+    - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
     - `/mode [mode]` — Switch run mode (normal / plan / bypass)
     - `/resume [id]` — Resume a past session (no arg = picker)
@@ -160,6 +165,198 @@ memory:
     auto_memory_index_empty: "(no content yet)"
     hint: "↑↓ select   Enter open/toggle   Esc close"
     editor_failed: "Failed to open editor: {err}"
+
+mcp:
+  desc: "Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)"
+  headless_unsupported: "[headless mode doesn't support the /mcp panel — edit the [[mcp_servers]] section in ~/.wyj-code/config.toml or .wyj/mcp.toml directly]"
+  background:
+    connected: "MCP [{name}] connected, registered {count} tools"
+    failed_error: "MCP [{name}] failed to connect: {err}"
+    failed_timeout: "MCP [{name}] connection timed out, skipped"
+  status:
+    connecting: "connecting…"
+    connected: "running ({count} tools)"
+    failed: "connection failed"
+    timed_out: "timed out"
+  dialog:
+    title: "MCP Server"
+    tab_installed: "Installed"
+    tab_registries: "Registries"
+    tab_browse: "Browse Registry"
+    empty_installed: "(no MCP servers configured yet)"
+    empty_registries: "(no registry sources yet — press a to add one)"
+    empty_browse: "Type a keyword and press Enter to search"
+    no_results: "No matching results"
+    searching: "Searching…"
+    search_label: "Search:"
+    scope_global: "global"
+    scope_project: "project"
+    unmanaged_tag: "manual"
+    hint_installed: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
+    hint_registries: "  ↑↓ select  Enter action menu/add  ←→ switch tab  Esc close"
+    hint_browse: "  ↑↓ select  Enter search/action menu  ←→ switch tab  Esc close"
+    add_registry_row: "+ Add registry"
+    search_row_placeholder: "(Enter to type a keyword and search)"
+  menu:
+    enable: "Enable"
+    disable: "Disable"
+    upgrade: "Upgrade"
+    uninstall: "Uninstall"
+    view_detail: "View detail"
+    browse_source: "Browse"
+    remove_source: "Remove"
+    install: "Install"
+  detail:
+    title: " MCP Server Detail "
+    name_line: "Name: {name}"
+    scope_line: "Scope: {scope}"
+    command_line: "Command: {command}"
+    args_line: "Args: {args}"
+    env_line: "Env: {env}"
+  registry:
+    add_title: " Add MCP Registry "
+    add_prompt: "Enter the registry's base URL (another deployment instance of the same open-source registry software, e.g. self-hosted/private):"
+  install:
+    unsupported_package: "This server doesn't support automatic install yet (only stdio npm/pypi packages are supported) — add it manually by editing the config file"
+    confirm_title: " Confirm MCP Server Install "
+    name_label: "Name: "
+    scope_label: "Scope: "
+    command_label: "Command to be written:"
+    confirm_warning: "This command will run automatically every time wyj-code starts."
+    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    done: "Installed — restart wyj-code to take effect"
+  upgrade:
+    in_progress: "Upgrading…"
+    done: "Upgraded to {version}"
+    already_latest: "Already at the latest version ({version})"
+  uninstall:
+    done: "Uninstalled — restart wyj-code to take effect"
+  error:
+    search_failed: "Search failed: {err}"
+    install_failed: "Install failed: {err}"
+    uninstall_failed: "Uninstall failed: {err}"
+    upgrade_failed: "Upgrade failed: {err}"
+    manual_no_upgrade: "Manually configured entries have no version info and can't be upgraded"
+
+skills:
+  desc: "Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)"
+  headless_unsupported: "[headless mode doesn't support the /skills panel — add or remove .md files under ~/.wyj-code/skills/ or .wyj/skills/ directly]"
+  dialog:
+    title: "Skill"
+    tab_installed: "Installed"
+    tab_marketplaces: "Marketplaces"
+    tab_browse: "Browse"
+    empty_installed: "(no skills yet)"
+    empty_marketplaces: "(no marketplace sources yet — press Enter to add one)"
+    empty_marketplace_entries: "No installable skills found in this marketplace"
+    unmanaged_tag: "manual"
+    syncing: "Syncing…"
+    add_marketplace_row: "+ Add marketplace"
+    hint_installed: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
+    hint_marketplaces: "  ↑↓ select  Enter action menu/add  ←→ switch tab  Esc close"
+    hint_browse: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
+  menu:
+    enable: "Enable"
+    disable: "Disable"
+    upgrade: "Upgrade"
+    uninstall: "Uninstall"
+    view_detail: "View detail"
+    browse_source: "Browse"
+    remove_source: "Remove"
+    install: "Install"
+  detail:
+    title: " Skill Detail "
+    name_line: "Name: {name}"
+    description_line: "Description: {description}"
+    scope_line: "Scope: {scope}"
+    version_line: "Version: {version}"
+  marketplace:
+    add_title: " Add Marketplace "
+    add_prompt: "Enter a git repository URL (use a file:// prefix for local paths):"
+  install:
+    confirm_title: " Confirm Skill Install "
+    name_label: "Name: "
+    scope_label: "Scope: "
+    path_label: "Source path: "
+    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    done: "Installed — restart wyj-code to take effect"
+  upgrade:
+    in_progress: "Upgrading…"
+    done: "Upgraded to {version}"
+    already_latest: "Already at the latest version ({version})"
+  uninstall:
+    done: "Uninstalled — restart wyj-code to take effect"
+  error:
+    sync_failed: "Failed to sync marketplace: {err}"
+    install_failed: "Install failed: {err}"
+    uninstall_failed: "Uninstall failed: {err}"
+    upgrade_failed: "Upgrade failed: {err}"
+    manual_no_upgrade: "Manually configured entries have no version info and can't be upgraded"
+
+plugins:
+  desc: "Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)"
+  headless_unsupported: "[headless mode doesn't support the /plugins panel — use --plugin-dir for local development, or manage ~/.wyj-code/plugins/ directly]"
+  dialog:
+    title: "Plugin"
+    tab_installed: "Installed"
+    tab_marketplaces: "Marketplaces"
+    tab_browse: "Browse"
+    empty_installed: "(no plugins yet — select \"+ Add local plugin\" and press Enter)"
+    empty_marketplaces: "(no plugin marketplace sources yet — press Enter to add one)"
+    empty_marketplace_entries: "No installable plugins found in this marketplace"
+    local_dev_tag: "local (dev)"
+    syncing: "Syncing…"
+    add_local_row: "+ Add local plugin"
+    add_marketplace_row: "+ Add plugin marketplace"
+    hint_installed: "  ↑↓ select  Enter action menu/add  ←→ switch tab  Esc close"
+    hint_marketplaces: "  ↑↓ select  Enter action menu/add  ←→ switch tab  Esc close"
+    hint_browse: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
+  menu:
+    enable: "Enable"
+    disable: "Disable"
+    upgrade: "Upgrade"
+    uninstall: "Uninstall"
+    view_detail: "View detail"
+    browse_source: "Browse"
+    remove_source: "Remove"
+    install: "Install"
+  detail:
+    title: " Plugin Detail "
+    name_line: "Name: {name}"
+    scope_line: "Scope: {scope}"
+    version_line: "Version: {version}"
+    resources_line: "Resources: {summary}"
+    path_line: "Path: {path}"
+  marketplace:
+    add_title: " Add Plugin Marketplace "
+    add_prompt: "Enter a git repository URL or local directory path:"
+  install:
+    confirm_title: " Confirm Plugin Install "
+    name_label: "Name: "
+    scope_label: "Scope: "
+    confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
+    in_progress: "Installing…"
+    report_title: " Plugin Installed "
+    resource_counts: "Installed: {cmd} command(s) / {agent} agent(s) / {mcp} MCP server(s)"
+    skipped_capabilities_label: "Detected {count} capability/capabilities not supported by this version, skipped: {names}"
+    restart_required_hint: "Restart wyj-code for some changes to take effect"
+  upgrade:
+    in_progress: "Upgrading…"
+    done: "Upgraded to {version}"
+    already_latest: "Already at the latest version ({version})"
+  uninstall:
+    done: "Uninstalled"
+  toggle:
+    restart_required_hint: "Restart wyj-code for this change to take effect"
+  local:
+    add_title: " Add Local Plugin "
+    add_prompt: "Enter the local plugin directory path (for development; not persisted like --plugin-dir would be):"
+  error:
+    sync_failed: "Failed to sync marketplace: {err}"
+    install_failed: "Install failed: {err}"
+    uninstall_failed: "Uninstall failed: {err}"
+    upgrade_failed: "Upgrade failed: {err}"
+    local_no_upgrade: "Local development plugins have no version info and can't be upgraded"
 
 doctor:
   desc: "Diagnose the runtime environment (API Key / config / CLAUDE.md / memory)"
@@ -252,6 +449,17 @@ dialog:
   time_minutes_ago: "{n}m ago"
   time_hours_ago: "{n}h ago"
   time_days_ago: "{n}d ago"
+  input_owner:
+    mcp_add_registry: "[MCP] Enter registry URL (Enter to submit / Esc to cancel)"
+    mcp_browse_search: "[MCP] Search (Enter to submit / Esc to cancel)"
+    skills_add_marketplace: "[Skills] Enter marketplace URL (Enter to submit / Esc to cancel)"
+    plugins_add_marketplace: "[Plugins] Enter marketplace URL (Enter to submit / Esc to cancel)"
+    plugins_add_local: "[Plugins] Enter local plugin path (Enter to submit / Esc to cancel)"
+    profile_rename: "[Model] Rename profile (Enter to submit / Esc to cancel)"
+    profile_field: "[Model] Edit {field} (Enter to submit / Esc to cancel)"
+  action_menu:
+    confirm_question: "Are you sure you want to \"{action}\"?"
+    confirm_hint: "Enter/y confirm   Esc/n cancel"
 
 settings:
   title: "Settings"
@@ -282,8 +490,19 @@ profile:
   not_found: "Profile '{name}' not found"
   headless_unsupported: "[headless mode doesn't support /model profile management, use TUI mode instead]"
   dialog:
-    hint1: "  ↑↓ Move  Enter Expand/Edit  a Activate  n New  d Delete  r Rename"
-    hint2: "  Ctrl+L Fetch models  Ctrl+S Save  Esc Cancel"
+    hint1: "  ↑↓ Move  Enter Action menu/Edit  ←→ Toggle Provider"
+    hint2: "  Ctrl+S Save  Esc Close"
+    editing_placeholder: "Editing, see the input box below"
+    add_new_row: "New profile"
+  menu:
+    expand: "Expand fields"
+    collapse: "Collapse fields"
+    activate: "Set as active"
+    already_active: "Already the active profile"
+    rename: "Rename"
+    delete: "Delete"
+    manual_edit: "Manual edit"
+    fetch_models: "Fetch from server"
   error:
     empty_name: "Profile name cannot be empty"
     duplicate_name: "Duplicate profile name, please choose a unique one"
@@ -293,13 +512,14 @@ profile:
     need_api_key: "Fill in the API Key before fetching the model list"
     in_progress: "Fetching model list…"
     failed: "Failed to fetch model list: {err} (you can still type the model name manually)"
+    empty: "No models were returned, you can still type the model name manually"
   overlay:
-    rename_title: "Rename Profile"
     template_title: "Choose a Template"
-    confirm_delete_title: "Confirm Delete"
-    confirm_delete_body: "Delete profile '{name}'? (y/Enter to confirm, n/Esc to cancel)"
     fetching_title: "Fetching Models"
-    models_title: "Select a Model (↑↓ select, Enter confirm, Esc cancel)"
+    unsaved_title: "Unsaved changes"
+    unsaved_save_close: "Save and close"
+    unsaved_discard_close: "Discard and close"
+    unsaved_cancel: "Cancel"
 
 welcome:
   placeholder: 'Try "fix this bug" or ask anything…'
