@@ -196,6 +196,66 @@ impl Command for CostCmd {
     }
 }
 
+// ── /mcp ──────────────────────────────────────────────────────────────────────
+
+pub struct McpCmd;
+
+#[async_trait]
+impl Command for McpCmd {
+    fn name(&self) -> &str {
+        "mcp"
+    }
+    fn description(&self) -> String {
+        tr("mcp.desc")
+    }
+    fn usage(&self) -> String {
+        "/mcp".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenMcpDialog)
+    }
+}
+
+// ── /skills ───────────────────────────────────────────────────────────────────
+
+pub struct SkillsCmd;
+
+#[async_trait]
+impl Command for SkillsCmd {
+    fn name(&self) -> &str {
+        "skills"
+    }
+    fn description(&self) -> String {
+        tr("skills.desc")
+    }
+    fn usage(&self) -> String {
+        "/skills".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenSkillsDialog)
+    }
+}
+
+// ── /plugins ──────────────────────────────────────────────────────────────────
+
+pub struct PluginsCmd;
+
+#[async_trait]
+impl Command for PluginsCmd {
+    fn name(&self) -> &str {
+        "plugins"
+    }
+    fn description(&self) -> String {
+        tr("plugins.desc")
+    }
+    fn usage(&self) -> String {
+        "/plugins".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenPluginsDialog)
+    }
+}
+
 // ── /agents ───────────────────────────────────────────────────────────────────
 
 pub struct AgentsCmd;
@@ -214,7 +274,7 @@ impl Command for AgentsCmd {
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         // 实时重读盘，方便验证新写的定义文件；但注册进模型的类型列表在
         // 启动时已固定，新增/修改定义需重启才对模型生效（下方注明）。
-        let defs = wyj_core::load_agent_defs(&ctx.cwd);
+        let defs = wyj_core::load_agent_defs(&ctx.cwd, &ctx.plugin_agent_paths);
         let mut out = tr("agents.header");
         for d in &defs {
             out.push_str(&format!("\n● {} — {}\n", d.name, d.description));
@@ -382,8 +442,8 @@ impl Command for DoctorCmd {
             ));
         }
 
-        // MCP servers
-        let mcp_count = cfg.mcp_servers.len();
+        // MCP servers（合并全局+项目配置、过滤禁用条目后的有效数量）
+        let mcp_count = ctx.effective_mcp_count;
         if mcp_count > 0 {
             lines.push(tr_fmt(
                 "doctor.mcp_configured",
@@ -593,6 +653,9 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(SessionsCmd));
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
+    reg.register(Arc::new(McpCmd));
+    reg.register(Arc::new(SkillsCmd));
+    reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(QuitCmd));
     Arc::new(reg)
 }
@@ -602,11 +665,13 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
 pub fn standard_registry_with_skills(
     home: &std::path::Path,
     cwd: &std::path::Path,
+    disabled_skills: &std::collections::HashSet<String>,
+    plugin_skill_sources: &[std::path::PathBuf],
 ) -> Arc<CommandRegistry> {
     let mut reg = CommandRegistry::new();
 
     // 先注册 skill（优先级低）
-    for skill in crate::skill::load_skills(home, cwd) {
+    for skill in crate::skill::load_skills(home, cwd, disabled_skills, plugin_skill_sources) {
         reg.register(skill);
     }
 
@@ -625,6 +690,9 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(SessionsCmd));
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
+    reg.register(Arc::new(McpCmd));
+    reg.register(Arc::new(SkillsCmd));
+    reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(QuitCmd));
 
     Arc::new(reg)
