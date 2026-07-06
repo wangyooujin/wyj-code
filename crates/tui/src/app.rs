@@ -43,7 +43,7 @@ use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 pub type RebuildFn = Arc<dyn Fn(&Config, &str) -> anyhow::Result<Agent> + Send + Sync>;
 
 /// 消息角色
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
     User,
     Assistant,
@@ -3864,23 +3864,27 @@ impl AppState {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
+                // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
+                // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
+                // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
+                // 先聚在一起，之后所有 ⎿ 结果再聚在一起，无法一一对应。
+                let call_idx = self.messages.iter().rposition(|m| {
+                    matches!(m.role, MessageRole::ToolCall) && m.sequence_no == Some(seq)
+                });
                 // Agent 工具：把 ToolCall 上绑定的子 Agent id 带到 ToolResult，
                 // 供展开时渲染内部工具调用明细
                 let sub_id = if name == "Agent" {
-                    self.messages
-                        .iter()
-                        .rev()
-                        .find(|m| {
-                            matches!(m.role, MessageRole::ToolCall) && m.sequence_no == Some(seq)
-                        })
-                        .and_then(|m| m.sub_agent_id)
+                    call_idx.and_then(|i| self.messages[i].sub_agent_id)
                 } else {
                     None
                 };
                 let mut msg =
                     ChatMessage::tool_result(output, is_error, elapsed_secs, seq, name, summary);
                 msg.sub_agent_id = sub_id;
-                self.messages.push(msg);
+                match call_idx {
+                    Some(i) => self.messages.insert(i + 1, msg),
+                    None => self.messages.push(msg),
+                }
                 if let Some(said) = sub_id {
                     if let Some(s) = self.sub_agents.get_mut(&said) {
                         s.has_result = true;
@@ -8658,5 +8662,66 @@ mod todo_stats_tests {
             TodoStatus::Pending,
         )]));
         assert!(state.todo_stats.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tool_event_ordering_tests {
+    use super::*;
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    /// 同一轮内并发执行的多个工具调用，ToolEnd 到达顺序可能与 ToolStart 不同，
+    /// 但每条 ToolResult 都必须紧跟在自己的 ToolCall 后面，而不是全部堆到列表尾部。
+    #[test]
+    fn tool_end_out_of_order_still_pairs_with_its_own_call() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "a.rs"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-2".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "b.rs"}),
+        });
+        // call-2 先完成（乱序），call-1 后完成
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-2".to_string(),
+            output: "content-b".to_string(),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: "content-a".to_string(),
+            is_error: false,
+            elapsed_secs: 0.2,
+        });
+
+        let roles: Vec<_> = state.messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+            ]
+        );
+        // call-1 的结果紧跟 call-1 自己的调用（即使 call-2 先完成），
+        // call-2 的结果紧跟 call-2 自己的调用。
+        assert_eq!(state.messages[1].content, "content-a");
+        assert_eq!(state.messages[3].content, "content-b");
     }
 }

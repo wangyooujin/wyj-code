@@ -61,8 +61,7 @@ pub(crate) fn char_display_width(c: char) -> usize {
     }
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
-        || (0x2E80..=0x303E).contains(&cp)   // CJK Radicals
-        || (0x3041..=0x33FF).contains(&cp)   // Japanese
+        || (0x2E80..=0x9FFF).contains(&cp)   // CJK 部首/假名/统一表意文字等各区块
         || (0xAC00..=0xD7A3).contains(&cp)   // Hangul Syllables
         || (0xF900..=0xFAFF).contains(&cp)   // CJK Compatibility
         || (0xFE10..=0xFE6F).contains(&cp)   // CJK Compatibility Forms
