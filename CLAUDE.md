@@ -19,6 +19,7 @@ cargo run -- --resume <id>       # 恢复指定会话 ID
 ./build.sh                       # 等同 cargo build --release
 ./build.sh package               # 打包到 dist/<binary>-<version>-<platform>
 ./build.sh install               # 安装到 ~/.local/bin/wyj-code
+./build.sh uninstall             # 卸载二进制；加 --purge 二次确认后彻底删除 ~/.wyj-code/
 ./build.sh cross linux-x86_64    # 交叉编译（支持 linux-x86_64, linux-aarch64, macos-*）
 ```
 
@@ -77,7 +78,7 @@ args = ["--flag"]
 
 **模型侧提示词**（`core::prompts` + `tools::descriptions`）：主 system prompt、模式追加段（Plan/non-interactive）、子 agent 内置提示、compact 结构化摘要模板、记忆提取提示、全部工具描述均为**英文原创常量**，不走 i18n（模型行为不应随 locale 漂移；末尾 "reply in the user's language" 保证中文用户得到中文回复）。system prompt 结构 = 英文主提示 + `<env>` 环境块（cwd/平台/日期/model 等会话内稳定字段，进 prompt 缓存）+ 跨会话记忆快照 + CLAUDE.md reminder；**git 状态快照**（分支/porcelain/近 5 commit）走会话首轮 user 消息注入（`Agent::with_git_snapshot`），因其每轮可能变、进 system 会击穿缓存。
 
-**`/config`**：TUI 内 `/config` 打开交互式设置面板（`OpenSettingsDialog`），可直接编辑 `base_url`/`api_key`/`model`/`plan_model`/`exec_model`/`language` 并写回 `config.toml`；`language` 留空则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文。当前 i18n 仅覆盖用户可见 UI 文案（TUI 对话框、slash 命令输出、CLI --help/--config-status）；模型侧提示词（system prompt、工具描述等）为英文常量不走 i18n（见上方"模型侧提示词"节），工具内部错误消息等仍为中文，待后续阶段迁移。
+**`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`）已迁移到 `/model` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文。当前 i18n 仅覆盖用户可见 UI 文案（TUI 对话框、slash 命令输出、CLI --help/--config-status）；模型侧提示词（system prompt、工具描述等）为英文常量不走 i18n（见上方"模型侧提示词"节），工具内部错误消息等仍为中文，待后续阶段迁移。
 
 ## Architecture
 
@@ -92,6 +93,7 @@ args = ["--flag"]
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
+| `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置管理数据层：安装元数据 lockfile、MCP registry HTTP client、skill/plugin git marketplace client、install/upgrade/uninstall/enable 编排；只管配置写入（config.toml/`.wyj/mcp.toml`/lockfile），绝不 shell out 执行依赖安装（如 `npm install`）|
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框 |
 | `crates/cli` | 二进制入口 | 组装所有 crate，解析 CLI 参数，启动 TUI/REPL/单次模式 |
 
@@ -105,6 +107,7 @@ args = ["--flag"]
 6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
 7. **SubAgent 多 agent 编排**（对齐 Claude Code）：类型体系 = 内置 general-purpose/Explore(只读)/Plan（`core::agent_def::builtin_defs`）+ 自定义定义文件（`~/.claude/agents/*.md` 与项目 `.claude/agents/*.md`，frontmatter: name/description/tools/model，model 引用 **Profile 名**，同名后者覆盖，`load_agent_defs`）。`tools::SubAgentTool`（工具名 "Agent"，参数 subagent_type/description/prompt/run_in_background）把每个子 Agent 整体 `tokio::spawn` 并登记进 `tools::agent_hub::SubAgentHub`（进程级单例：id 分配、`Semaphore` 并发上限 8、`abort_foreground`/`abort_all`/`wait_background`）；子 Agent 挂 `with_tool_callback`/`with_usage_callback` 把内部工具事件与 token 用量以 `SubAgentEvent` 汇入 Hub 的 event_cb。前台调用 await oneshot 结果；`run_in_background: true` 立即返回，完成结果包成 system-reminder 经注入通道（主 Agent 忙）或 `AppState.pending_bg_reminders`（空闲，下轮起手 merge）送达。TUI 展示：每个 agent 的 ToolCall 行绑定 sub_agent_id（Started 事件 FIFO 配对）并在运行期间画动态 ⎿ 状态行（耗时/tokens/工具数/当前工具），ToolResult 展开（Ctrl+O）时先列内部工具调用明细；有运行中 agent 时显示底部聚合面板（`render::draw_sub_agents_panel`）。ESC 中断只 abort 前台子 Agent，后台不受影响；TUI 退出时 `abort_all`，headless `-p` 结束前 `wait_background`。子 Agent 模型解析优先级：def.model(Profile 名) → `[subagent].explore_profile`(仅 Explore) → `[subagent].default_profile` → 主 Agent 当前分组（`cli::make_sub_agent_factory`）。子 Agent 一律不注册 Agent（防嵌套）/AskQuestion/ExitPlanMode/TodoWrite，并继承 Plan 白名单交集。`/agents` 列出全部类型；`/cost` 单列子 Agent 用量。
 8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。注入负载携带 `InjectionKind`（`UserMessage` 触发 UI 的 pending_queue 回放；`SystemReminder` 用于后台子 Agent 结果，对用户消息队列不可见）。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
+9. **插件市场 / MCP / Skill 安装管理**（`wyj-store` + TUI `/plugins` `/mcp` `/skills` 面板）：`.claude-plugin` 清单解析（`store::plugin_manifest`）+ marketplace 安装编排（`store::plugin_install`）；`store::lockfile` 记录已安装 MCP/Skill/Plugin 及其启用状态（`InstalledPluginEntry` 等），`store::registry`/`store::marketplace` 分别对接 MCP registry HTTP 与 skill/plugin 的 git marketplace 拉取；三个面板均支持浏览/安装/升级/卸载/启用/禁用，变更需重启生效。`--plugin-dir <dir>` 可临时加载本地开发中的插件（不落盘、不经 lockfile，仅当次运行有效，不出现在 `/plugins` 已安装列表）。
 
 ### 权限模型（TUI）
 
