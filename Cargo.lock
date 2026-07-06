@@ -3583,6 +3583,7 @@ dependencies = [
  "futures",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "schemars 0.8.22",
