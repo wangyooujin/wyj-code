@@ -1,4 +1,4 @@
-//! TUI 欢迎页面（聊天区为空时显示）
+//! TUI 欢迎页面（会话尚无真实对话时显示，参见 [`render_welcome`] 文档）
 //!
 //! 整体布局（自上而下）：
 //!
@@ -17,7 +17,8 @@
 //! - 快捷键速查行（dim，窄终端下按优先级渐进丢弃）
 //!
 //! 渲染入口 [`render_welcome`]，由 `crates/tui/src/render.rs` 的
-//! `draw_chat` 在 `messages.is_empty() && streaming_buf.is_empty()` 时调用。
+//! `draw_chat` 在会话尚无真实对话（消息列表为空，或仅含 System 角色的系统提示，
+//! 如 MCP 连接通知）且未在流式输出时调用，行内容会被拼进消息列表顶部一起渲染。
 
 use crate::render::{char_display_width, truncate_line};
 use crate::theme::Theme;
