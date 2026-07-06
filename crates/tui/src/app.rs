@@ -3569,6 +3569,8 @@ pub struct AppState {
     pub input_history: Vec<String>,
     /// 当前历史导航索引（None = 未在导航模式）
     pub history_idx: Option<usize>,
+    /// 进入历史导航态之前用户正在编辑的草稿快照（Down 翻回最新之后恢复用）
+    pub history_draft: Option<String>,
     /// 本 Session 已授权的工具（按 s 键授权）
     pub session_allowed: HashSet<String>,
     /// 当前任务列表快照（TodoWrite 更新），用于底部固定面板渲染
@@ -3692,6 +3694,7 @@ impl AppState {
             slash_selected: 0,
             input_history: vec![],
             history_idx: None,
+            history_draft: None,
             session_allowed: HashSet::new(),
             current_todos: None,
             todo_panel_expanded: false,
@@ -7361,6 +7364,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             state.slash_completions.clear();
                             state.file_completions.clear();
                             state.history_idx = None;
+                            state.history_draft = None;
 
                             let trimmed = text.trim().to_string();
 
@@ -7886,6 +7890,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             state.slash_completions.clear();
                             state.file_completions.clear();
                             state.history_idx = None;
+                            state.history_draft = None;
                             expand_at_refs_to_attachments(
                                 &text,
                                 &cwd,
@@ -7922,9 +7927,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         // Ctrl+End：跳到最底（最新消息）
                         state.scroll_offset = 0;
                     } else if key.code == KeyCode::Up {
-                        // 输入框空 + 面板有子 Agent → 选中/滚动详情
-                        // 输入框空 + 面板无子 Agent → 滚动聊天区（含鼠标滚轮上滚转来的 Up）
-                        // 输入框有内容 → 历史导航
+                        // ① 输入框空 + 面板有子 Agent → 选中/滚动详情，优先级不变
+                        // ② 光标在首行（含空输入/单行）= 边界 → 历史导航整体替换
+                        // ③ 光标在多行内容非首行 → 纯光标移动
+                        // 注：不再开启 EnableMouseCapture（会导致终端原生鼠标选中/复制失效），
+                        // 鼠标滚轮在多数终端下会被翻译为方向键转发到这里，与上述规则一并处理。
                         if !state.sub_agents.is_empty()
                             && input.is_empty()
                             && state.slash_completions.is_empty()
@@ -7935,31 +7942,26 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             } else {
                                 move_sub_agent_selection(&mut state, -1);
                             }
-                        } else if input.is_empty() && state.slash_completions.is_empty() {
-                            state.scroll_offset = state.scroll_offset.saturating_add(3);
-                        } else if !state.is_thinking && state.slash_completions.is_empty() {
-                            let hist_len = state.input_history.len();
-                            if hist_len > 0 {
+                        } else if state.slash_completions.is_empty() && input.cursor_row == 0 {
+                            if !state.is_thinking && !state.input_history.is_empty() {
+                                if state.history_idx.is_none() {
+                                    state.history_draft = Some(input.lines.join("\n"));
+                                }
+                                let hist_len = state.input_history.len();
                                 let new_idx = match state.history_idx {
                                     None => hist_len - 1,
                                     Some(i) => i.saturating_sub(1),
                                 };
                                 state.history_idx = Some(new_idx);
                                 let recalled = state.input_history[new_idx].clone();
-                                input = InputBox::new();
-                                for c in recalled.chars() {
-                                    if c == '\n' {
-                                        input.insert_newline();
-                                    } else {
-                                        input.insert_char(c);
-                                    }
-                                }
+                                input.set_text(&recalled);
                             }
+                            // is_thinking 中或无历史记录 → 无操作，不 fallback 到滚动会话
+                        } else if state.slash_completions.is_empty() {
+                            input.move_cursor_up();
                         }
                     } else if key.code == KeyCode::Down {
-                        // 输入框空 + 面板有子 Agent → 选中/滚动详情
-                        // 输入框空 + 面板无子 Agent → 滚动聊天区（含鼠标滚轮下滚转来的 Down）
-                        // 输入框有内容 → 历史导航
+                        // 对称逻辑，见上方 Up 分支注释
                         if !state.sub_agents.is_empty()
                             && input.is_empty()
                             && state.slash_completions.is_empty()
@@ -7970,28 +7972,26 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             } else {
                                 move_sub_agent_selection(&mut state, 1);
                             }
-                        } else if input.is_empty() && state.slash_completions.is_empty() {
-                            state.scroll_offset = state.scroll_offset.saturating_sub(3);
-                        } else if !state.is_thinking && state.slash_completions.is_empty() {
-                            if let Some(idx) = state.history_idx {
-                                if idx + 1 < state.input_history.len() {
-                                    let new_idx = idx + 1;
-                                    state.history_idx = Some(new_idx);
-                                    let recalled = state.input_history[new_idx].clone();
-                                    input = InputBox::new();
-                                    for c in recalled.chars() {
-                                        if c == '\n' {
-                                            input.insert_newline();
-                                        } else {
-                                            input.insert_char(c);
-                                        }
+                        } else if state.slash_completions.is_empty()
+                            && input.cursor_row + 1 == input.lines.len()
+                        {
+                            if !state.is_thinking {
+                                if let Some(idx) = state.history_idx {
+                                    if idx + 1 < state.input_history.len() {
+                                        let new_idx = idx + 1;
+                                        state.history_idx = Some(new_idx);
+                                        let recalled = state.input_history[new_idx].clone();
+                                        input.set_text(&recalled);
+                                    } else {
+                                        // 超出历史末尾 → 退出导航态，恢复进入导航前的草稿
+                                        state.history_idx = None;
+                                        let draft = state.history_draft.take().unwrap_or_default();
+                                        input.set_text(&draft);
                                     }
-                                } else {
-                                    // 超出历史末尾，清空退出历史模式
-                                    state.history_idx = None;
-                                    input = InputBox::new();
                                 }
                             }
+                        } else if state.slash_completions.is_empty() {
+                            input.move_cursor_down();
                         }
                     } else if key.code == KeyCode::Backspace {
                         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -8052,17 +8052,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 }
                                 'o' => {
                                     // Ctrl+O — 展开/折叠最后一条「可折叠」工具结果（对齐 Claude Code）
-                                    // 可折叠 = ToolResult && 非 Edit/Write（永不折叠）&& 内容超 3 行。
-                                    // 与 render.rs 的 last_collapsible_idx 判定保持一致。
+                                    // 与 render.rs 的 last_collapsible_idx 共用同一判定函数，
+                                    // 但此处不额外过滤 `expanded`（要能在展开态下切回折叠）。
                                     if let Some(last_tool) =
                                         state.messages.iter_mut().rev().find(|m| {
                                             if !matches!(m.role, MessageRole::ToolResult) {
-                                                return false;
-                                            }
-                                            if matches!(
-                                                m.tool_name.as_deref(),
-                                                Some("Edit") | Some("Write")
-                                            ) {
                                                 return false;
                                             }
                                             let summary = if m.display_summary.is_empty() {
@@ -8075,9 +8069,11 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                             } else {
                                                 m.display_summary.clone()
                                             };
-                                            !m.content.is_empty()
-                                                && m.content != summary
-                                                && m.content.lines().count() > 3
+                                            crate::render::is_collapsible_tool_result_content(
+                                                &m.content,
+                                                m.tool_name.as_deref(),
+                                                &summary,
+                                            )
                                         })
                                     {
                                         last_tool.expanded = !last_tool.expanded;
@@ -8128,6 +8124,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                             }
                         } else {
                             state.history_idx = None;
+                            state.history_draft = None;
                             input.insert_char(c);
                             update_slash_completions(&mut state, &input, &cmd_registry);
                             update_file_completions(&mut state, &input, &cwd);

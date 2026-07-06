@@ -17,6 +17,28 @@ pub fn display_width(s: &str) -> usize {
     s.width()
 }
 
+/// 按显示宽度换行（不截断，不加省略号），供代码块正文使用，避免长行
+/// 被省略号裁剪导致内容丢失展示。
+fn wrap_dw(s: &str, max: usize) -> Vec<String> {
+    if max == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(1);
+        if w + cw > max && w > 0 {
+            out.push(std::mem::take(&mut cur));
+            w = 0;
+        }
+        cur.push(c);
+        w += cw;
+    }
+    out.push(cur);
+    out
+}
+
 /// 按显示宽度截断，超出后附 `…`（`…` 占 1 列）
 fn truncate_dw(s: &str, max: usize) -> String {
     if s.width() <= max {
@@ -536,17 +558,21 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
                 } else {
                     format!(" {lang_raw} ")
                 };
-                let dash = max_width.saturating_sub(lang_display.len() + 3);
+                // 前缀 "  ╭─" 占 4 个字符，末尾 "╮" 占 1 个字符，dash 补满剩余宽度，
+                // 使整行（含右上角）总长精确等于 max_width，右侧完整闭合。
+                let dash = max_width.saturating_sub(lang_display.len() + 5);
                 lines.push(Line::from(Span::styled(
-                    format!("  ╭─{lang_display}{}", "─".repeat(dash)),
+                    format!("  ╭─{lang_display}{}╮", "─".repeat(dash)),
                     Theme::dim(),
                 )));
             }
             Event::End(TagEnd::CodeBlock) => {
                 c.in_code_block = false;
                 c.code_lang.clear();
+                // 前缀 "  ╰" 占 3 个字符，末尾 "╯" 占 1 个字符，与上方开始边框总长一致
+                // （同为 max_width），右侧完整闭合。
                 lines.push(Line::from(Span::styled(
-                    format!("  ╰{}", "─".repeat(max_width.saturating_sub(4))),
+                    format!("  ╰{}╯", "─".repeat(max_width.saturating_sub(4))),
                     Theme::dim(),
                 )));
                 lines.push(Line::from(""));
@@ -654,20 +680,26 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
                 if c.in_code_block {
                     let max_line = max_width.saturating_sub(6);
                     for raw_line in text.lines() {
-                        let s = if display_width(raw_line) > max_line {
-                            truncate_dw(raw_line, max_line)
-                        } else {
-                            raw_line.to_string()
-                        };
-                        if c.code_lang.is_empty() {
-                            lines.push(Line::from(Span::styled(
-                                format!("  │ {s}"),
-                                Theme::code_body(),
-                            )));
-                        } else {
-                            let mut spans = vec![Span::styled("  │ ".to_string(), Theme::dim())];
-                            spans.extend(highlight_code_line(&s, &c.code_lang));
-                            lines.push(Line::from(spans));
+                        // 超宽的行换行展示全部内容，而不是截断加省略号丢失信息
+                        for s in wrap_dw(raw_line, max_line) {
+                            // 补齐到 max_line+1 宽度（含内容与至少 1 格右侧空隙）后接 "│"，
+                            // 使内容行与顶部/底部边框总长一致（均为 max_width），右侧闭合。
+                            if c.code_lang.is_empty() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  │ {}│", pad_dw(&s, max_line + 1, Alignment::Left)),
+                                    Theme::code_body(),
+                                )));
+                            } else {
+                                let pad = (max_line + 1).saturating_sub(display_width(&s));
+                                let mut spans =
+                                    vec![Span::styled("  │ ".to_string(), Theme::dim())];
+                                spans.extend(highlight_code_line(&s, &c.code_lang));
+                                spans.push(Span::styled(
+                                    format!("{}│", " ".repeat(pad)),
+                                    Theme::dim(),
+                                ));
+                                lines.push(Line::from(spans));
+                            }
                         }
                     }
                 } else {
@@ -693,4 +725,35 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
 
     // 刷新最后可能残留的内容
     c.flush(lines);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归测试：代码块内超宽行此前被 `truncate_dw` 截断加 "…"，导致长命令/长路径
+    /// 在渲染框内看似"隐藏"了一部分——现在应改为换行展示全部内容，不丢字符。
+    #[test]
+    fn code_block_wraps_long_lines_instead_of_truncating() {
+        let long_cmd = "0 8 * * * /usr/bin/env PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin /Users/foo/venv/bin/python /Users/foo/very/long/script/path/main.py";
+        let text = format!("```\n{long_cmd}\n```\n");
+        let mut lines = vec![];
+        render_markdown(&mut lines, &text, 40);
+
+        let rendered: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            !rendered.contains('…'),
+            "长行应换行完整展示，而不是截断加省略号: {rendered}"
+        );
+        for ch in long_cmd.chars() {
+            assert!(
+                rendered.contains(ch),
+                "换行后的渲染结果应包含原始字符 {ch}"
+            );
+        }
+    }
 }

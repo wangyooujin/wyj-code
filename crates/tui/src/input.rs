@@ -106,6 +106,26 @@ impl InputBox {
         }
     }
 
+    /// Up — 光标移到上一逻辑行相同列（跨行，与视觉折行无关）；已在首行时不做任何事
+    pub fn move_cursor_up(&mut self) {
+        if self.cursor_row == 0 {
+            return;
+        }
+        self.cursor_row -= 1;
+        let line_len = self.lines[self.cursor_row].chars().count();
+        self.cursor_col = self.cursor_col.min(line_len);
+    }
+
+    /// Down — 光标移到下一逻辑行相同列
+    pub fn move_cursor_down(&mut self) {
+        if self.cursor_row + 1 >= self.lines.len() {
+            return;
+        }
+        self.cursor_row += 1;
+        let line_len = self.lines[self.cursor_row].chars().count();
+        self.cursor_col = self.cursor_col.min(line_len);
+    }
+
     /// Ctrl+A / Home — 跳到行首
     pub fn move_to_start_of_line(&mut self) {
         self.cursor_col = 0;
@@ -217,6 +237,12 @@ impl InputBox {
         let content = self.lines.join("\n");
         *self = Self::new();
         content
+    }
+
+    /// 整体替换输入框内容（历史导航整体替换时用）：先清空再复用 insert_text 的换行/字符处理
+    pub fn set_text(&mut self, text: &str) {
+        *self = Self::new();
+        self.insert_text(text);
     }
 
     pub fn is_empty(&self) -> bool {

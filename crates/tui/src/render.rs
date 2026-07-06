@@ -14,7 +14,7 @@ use crate::input::InputBox;
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -96,6 +96,28 @@ pub(crate) fn truncate_line(s: &str, max_cols: usize) -> String {
     s.to_string()
 }
 
+/// 按显示宽度换行（不截断，不加省略号），CJK 宽字符不跨行拆分；
+/// 用于需要完整展示内容的场景（区别于 [`truncate_line`] 的省略号截断）。
+pub(crate) fn wrap_line(s: &str, max_cols: usize) -> Vec<String> {
+    if max_cols == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut col = 0usize;
+    for c in s.chars() {
+        let cw = char_display_width(c);
+        if col + cw > max_cols && col > 0 {
+            out.push(std::mem::take(&mut cur));
+            col = 0;
+        }
+        cur.push(c);
+        col += cw;
+    }
+    out.push(cur);
+    out
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars {
@@ -108,6 +130,47 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 /// Spinner 动画帧（braille，复刻 Claude Code 风格）
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// ToolResult 折叠阈值：内容行数超过此值才折叠，否则始终全量展示。
+pub const TOOL_RESULT_FOLD_LINES: usize = 5;
+
+/// 判断一条 ToolResult 的内容是否「可折叠」：非 Edit/Write（永不折叠，走独立 diff 渲染）
+/// 且正文非空、不等于摘要行、行数超过 [`TOOL_RESULT_FOLD_LINES`]。
+/// 纯函数不依赖 `ChatMessage`，调用方（render.rs 的 last_collapsible_idx 预扫描 /
+/// app.rs 的 Ctrl+O 处理）各自按需叠加 `!expanded` 等额外条件。
+pub fn is_collapsible_tool_result_content(
+    content: &str,
+    tool_name: Option<&str>,
+    summary: &str,
+) -> bool {
+    if matches!(tool_name, Some("Edit") | Some("Write")) {
+        return false;
+    }
+    !content.is_empty() && content != summary && content.lines().count() > TOOL_RESULT_FOLD_LINES
+}
+
+/// 渲染 ToolResult 正文行，`take` 为 `Some(n)` 时只取开头 n 行（折叠态预览），
+/// `None` 时全量渲染（展开态 / 短内容始终全量展示）。
+fn render_tool_result_body_lines(
+    lines: &mut Vec<Line<'static>>,
+    content_lines: &[&str],
+    take: Option<usize>,
+    line_style: Style,
+    max_content_width: usize,
+) {
+    let iter: Box<dyn Iterator<Item = &&str>> = match take {
+        Some(n) => Box::new(content_lines.iter().take(n)),
+        None => Box::new(content_lines.iter()),
+    };
+    for l in iter {
+        for wrapped in wrap_line(l, max_content_width.saturating_sub(8)) {
+            lines.push(Line::from(Span::styled(
+                format!("       {wrapped}"),
+                line_style,
+            )));
+        }
+    }
+}
 
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
@@ -389,8 +452,20 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let content_area = cols[0];
     let scrollbar_area = cols[1];
 
-    // 空白聊天区：渲染欢迎页（5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）
-    if state.messages.is_empty() && state.streaming_buf.is_empty() {
+    // 会话仍处于"只有系统消息（如 MCP 连接提示），还没有真实对话"的阶段：欢迎页
+    // （5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）作为消息列表顶部的
+    // 固定内容一起渲染，而不是与消息列表互斥——这样 MCP 连接提示会紧跟在欢迎页
+    // 后面显示，而不是把欢迎页顶替掉。
+    let show_welcome = state.streaming_buf.is_empty()
+        && state
+            .messages
+            .iter()
+            .all(|m| matches!(m.role, MessageRole::System));
+
+    let max_content_width = content_area.width.saturating_sub(2) as usize;
+    let sep_width = content_area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = vec![];
+    if show_welcome {
         let ctx = crate::welcome::WelcomeContext {
             model: state.model_name.clone(),
             cwd: shorten_home_path(&state.cwd.display().to_string()),
@@ -404,25 +479,15 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             },
             tip_index: state.welcome_tip_idx,
         };
-        let lines = crate::welcome::render_welcome(&ctx, content_area.width);
-        let para = Paragraph::new(Text::from(lines))
-            .style(Theme::input_box())
-            .alignment(Alignment::Left);
-        f.render_widget(para, content_area);
-        state.scrollbar_area = scrollbar_area;
-        state.chat_height = content_area.height;
-        return;
+        lines.extend(crate::welcome::render_welcome(&ctx, content_area.width));
     }
-
-    let max_content_width = content_area.width.saturating_sub(2) as usize;
-    let sep_width = content_area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = vec![];
     let mut is_first_user = true;
 
-    // 预扫描：找出最后一条「可折叠」的 ToolResult 索引。
-    // 可折叠 = ToolResult && 非 Edit/Write（Edit/Write 永不折叠）&& 内容超 3 行 && 未展开。
-    // 只有这一条会显示 "ctrl+o to expand/collapse" 文字提示，
-    // 其余可折叠的历史结果改用静默 ⋯N 标记，避免提示与快捷键行为错位。
+    // 预扫描：找出最后一条「可折叠」的 ToolResult 索引 —— 即 Ctrl+O 实际会切换的那一条
+    // （与 app.rs 的 Ctrl+O 处理用同一判定 is_collapsible_tool_result_content，不区分当前是否
+    // 已展开，这样无论该条目当前折叠还是展开，都能正确显示对应的 "ctrl+o to expand/collapse"
+    // 提示；若在此额外排除 m.expanded，会导致展开后立刻脱离该索引，"[ctrl+o to collapse]"
+    // 提示永远无法显示）。其余可折叠的历史结果改用静默 ⋯N 标记，避免提示与快捷键行为错位。
     let last_collapsible_idx: Option<usize> = state
         .messages
         .iter()
@@ -430,12 +495,6 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .rev()
         .find(|(_, m)| {
             if !matches!(m.role, MessageRole::ToolResult) {
-                return false;
-            }
-            if matches!(m.tool_name.as_deref(), Some("Edit") | Some("Write")) {
-                return false;
-            }
-            if m.expanded {
                 return false;
             }
             let summary = if m.display_summary.is_empty() {
@@ -448,7 +507,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             } else {
                 m.display_summary.clone()
             };
-            !m.content.is_empty() && m.content != summary && m.content.lines().count() > 3
+            is_collapsible_tool_result_content(&m.content, m.tool_name.as_deref(), &summary)
         })
         .map(|(i, _)| i);
 
@@ -643,8 +702,8 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                                 style,
                             )));
                         }
-                    } else if msg.expanded {
-                        // 已展开（非 Edit/Write）
+                    } else if msg.expanded || content_lines.len() <= TOOL_RESULT_FOLD_LINES {
+                        // 已展开，或内容行数 <= TOOL_RESULT_FOLD_LINES（始终全量展示，非 Edit/Write）
                         lines.push(Line::from(Span::styled(
                             format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
                             Theme::dim(),
@@ -658,36 +717,47 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
                         } else {
                             Theme::tool_result()
                         };
-                        for l in &content_lines {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "       {}",
-                                    truncate_line(l, max_content_width.saturating_sub(8))
-                                ),
-                                line_style,
-                            )));
-                        }
-                        // 只有「最后一条可折叠」且已展开才显示 collapse 提示
+                        render_tool_result_body_lines(
+                            &mut lines,
+                            &content_lines,
+                            None,
+                            line_style,
+                            max_content_width,
+                        );
+                        // 只有「最后一条可折叠」且已展开才显示 collapse 提示；短内容
+                        // （<= TOOL_RESULT_FOLD_LINES 行）永远不会被 last_collapsible_idx 选中
+                        // （其判定要求行数 > TOOL_RESULT_FOLD_LINES），这里天然不会误显示。
                         if last_collapsible_idx == Some(msg_idx) {
                             lines.push(Line::from(Span::styled(
                                 "       [ctrl+o to collapse]".to_string(),
                                 Theme::dim(),
                             )));
                         }
-                    } else if content_lines.len() > 3 {
+                    } else if content_lines.len() > TOOL_RESULT_FOLD_LINES {
+                        // 折叠态：展示开头 TOOL_RESULT_FOLD_LINES 行 + 剩余行数提示
+                        let line_style = if msg.is_error {
+                            Theme::error()
+                        } else {
+                            Theme::tool_result()
+                        };
+                        render_tool_result_body_lines(
+                            &mut lines,
+                            &content_lines,
+                            Some(TOOL_RESULT_FOLD_LINES),
+                            line_style,
+                            max_content_width,
+                        );
+                        let remaining = content_lines.len() - TOOL_RESULT_FOLD_LINES;
                         // 折叠态：只有最后一条可折叠的才显示快捷键提示
                         if last_collapsible_idx == Some(msg_idx) {
                             lines.push(Line::from(Span::styled(
-                                format!(
-                                    "       …({} lines, ctrl+o to expand)",
-                                    content_lines.len()
-                                ),
+                                format!("       …({remaining} more lines, ctrl+o to expand)"),
                                 Theme::dim(),
                             )));
                         } else {
                             // 其余可折叠的历史结果：静默标记，不显示快捷键提示
                             lines.push(Line::from(Span::styled(
-                                format!("       ⋯{}", content_lines.len()),
+                                format!("       ⋯{remaining}"),
                                 Theme::dim(),
                             )));
                         }
@@ -3425,4 +3495,82 @@ fn parse_iso_to_secs(s: &str) -> Option<u64> {
         .copied()
         .unwrap_or(0);
     Some((y_days + mo_days + day.saturating_sub(1)) * 86400 + h * 3600 + m * 60 + sec)
+}
+
+#[cfg(test)]
+mod tool_result_fold_tests {
+    use super::*;
+
+    fn lines_str(n: usize) -> String {
+        (0..n).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn empty_content_is_not_collapsible() {
+        assert!(!is_collapsible_tool_result_content("", None, ""));
+    }
+
+    #[test]
+    fn content_equal_to_summary_is_not_collapsible() {
+        let content = "only line";
+        assert!(!is_collapsible_tool_result_content(content, None, content));
+    }
+
+    #[test]
+    fn edit_write_is_never_collapsible_even_if_long() {
+        let content = lines_str(TOOL_RESULT_FOLD_LINES + 5);
+        assert!(!is_collapsible_tool_result_content(
+            &content,
+            Some("Edit"),
+            "summary"
+        ));
+        assert!(!is_collapsible_tool_result_content(
+            &content,
+            Some("Write"),
+            "summary"
+        ));
+    }
+
+    #[test]
+    fn content_at_threshold_is_not_collapsible() {
+        let content = lines_str(TOOL_RESULT_FOLD_LINES);
+        assert!(!is_collapsible_tool_result_content(
+            &content,
+            Some("Read"),
+            "summary"
+        ));
+    }
+
+    #[test]
+    fn content_over_threshold_is_collapsible() {
+        let content = lines_str(TOOL_RESULT_FOLD_LINES + 1);
+        assert!(is_collapsible_tool_result_content(
+            &content,
+            Some("Read"),
+            "summary"
+        ));
+    }
+
+    #[test]
+    fn wrap_line_splits_without_dropping_content() {
+        let s = "0 8 * * * /usr/bin/env PATH=/opt/homebrew/bin:/usr/local/bin/usr/bin:/bin /Users/foo/venv/bin/python /Users/foo/script.py";
+        let wrapped = wrap_line(s, 20);
+        assert!(wrapped.iter().all(|l| l.chars().map(char_display_width).sum::<usize>() <= 20));
+        assert_eq!(wrapped.join(""), s, "换行不应丢失或改变任何字符");
+    }
+
+    #[test]
+    fn wrap_line_short_string_stays_single_line() {
+        assert_eq!(wrap_line("short", 20), vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn wrap_line_never_splits_wide_char_across_lines() {
+        let s = "中".repeat(10);
+        let wrapped = wrap_line(&s, 5);
+        for l in &wrapped {
+            assert!(l.chars().map(char_display_width).sum::<usize>() <= 5);
+        }
+        assert_eq!(wrapped.join(""), s);
+    }
 }
