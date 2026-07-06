@@ -264,8 +264,10 @@ mod tests {
         let job = mgr.get(&id).unwrap();
         assert_eq!(job.status(), JobStatus::Running);
         assert!(mgr.kill(&id).await.unwrap());
-        // SIGTERM 后最多再等 1s 确认退出
-        for _ in 0..20 {
+        // kill() 内部已等过 2s（SIGTERM 兜底 SIGKILL），这里再多等最多 5s 确认进程被
+        // reap、状态翻转——繁忙/资源受限的 CI runner 上调度延迟可能明显长于本地开发机，
+        // 之前只多等 1s 在 GitHub Actions ubuntu-latest 上实测会偶发超时导致误报失败。
+        for _ in 0..100 {
             if job.status() != JobStatus::Running {
                 break;
             }
