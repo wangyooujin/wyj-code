@@ -216,7 +216,35 @@ enum PipeReader {
     Err(tokio::process::ChildStderr),
 }
 
-/// 对进程组发信号（kill -SIG -PGID）；用外部 kill 命令避免引入 libc 依赖
+/// 对进程组发信号（SIGTERM/SIGKILL）。
+///
+/// 之前用 `std::process::Command::new("kill")` fork 一个外部进程来发信号，
+/// 在同一进程里混用 tokio::process（内部靠 SIGCHLD + waitpid(-1, WNOHANG)
+/// 循环异步回收子进程）与 std::process 的同步阻塞 wait，属于 tokio 文档明确
+/// 提示过的危险用法：两套回收机制可能对同一批子进程产生竞争，谁先收割到
+/// 退出状态不确定。GitHub Actions 的 ubuntu-latest runner 上 `kill_terminates_
+/// process_group` 测试稳定复现失败（目标进程状态一直不翻转），本地 macOS
+/// 未必稳定命中同样的竞态窗口。直接调用 libc::kill 发系统调用，不再 fork
+/// 额外进程，从源头消除这个竞态，同时也不再依赖 PATH 里一定有 `kill` 这个
+/// 外部命令。
+#[cfg(unix)]
+fn signal_group(pgid: u32, sig: &str) {
+    if pgid == 0 {
+        return;
+    }
+    let signum = match sig {
+        "TERM" => libc::SIGTERM,
+        "KILL" => libc::SIGKILL,
+        _ => return,
+    };
+    // SAFETY: 对自己 fork 出的子进程所在的进程组发信号，pgid 非 0（已在上面检查），
+    // 传负值表示信号发给整个进程组而非单个进程，是 kill(2) 的标准用法。
+    unsafe {
+        libc::kill(-(pgid as i32), signum);
+    }
+}
+
+#[cfg(not(unix))]
 fn signal_group(pgid: u32, sig: &str) {
     if pgid == 0 {
         return;
