@@ -2,12 +2,12 @@
 
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AppState, AskQuestionDialog, AskQuestionStage, Attachment,
-    ExecModeConfirmDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
-    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
+    ChatMessage, ExecModeConfirmDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
+    McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
     ProfileInputField, ProfileOverlay, ProfileRow, SessionPickerState, SettingsDialog,
-    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubToolLine, TodoRuntimeStats,
-    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    TodoRuntimeStats, PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
     SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
@@ -118,6 +118,19 @@ pub(crate) fn wrap_line(s: &str, max_cols: usize) -> Vec<String> {
     out
 }
 
+/// 去掉 Read 工具结果每行开头的 "行号\t" 前缀（`crates/tools/src/read.rs` 为了让模型
+/// 能按行号精确编辑而加的），只影响人类可读的展示层——`msg.content` 本身不变，
+/// 发给模型的历史记录仍保留原始行号。不匹配 "数字\t" 格式的行（如末尾的
+/// "（共 N 行...）" 提示行）原样返回。
+fn strip_read_line_number(line: &str) -> &str {
+    match line.find('\t') {
+        Some(tab_idx) if line[..tab_idx].bytes().all(|b| b.is_ascii_digit()) && tab_idx > 0 => {
+            &line[tab_idx + 1..]
+        }
+        _ => line,
+    }
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars {
@@ -175,7 +188,7 @@ fn render_tool_result_body_lines(
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
     let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
-    let input_height = (input.visual_height(inner_width) as u16 + 2).max(3).min(10);
+    let input_height = (input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
 
     // 补全列表高度（@ 文件选取器优先于 slash 补全）
     let completion_height = if !state.file_completions.is_empty() {
@@ -211,6 +224,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     draw_chat(f, state, chunks[0]);
     match panel_kind {
         BottomPanel::None => {}
+        BottomPanel::Permission => {
+            if let Some(dlg) = &state.permission_dialog {
+                draw_permission_dialog(f, dlg, chunks[1]);
+            }
+        }
         BottomPanel::ExecModeConfirm => {
             if let Some(dlg) = &state.exec_mode_confirm {
                 draw_exec_mode_confirm_panel(f, dlg, chunks[1]);
@@ -253,11 +271,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     draw_input(f, state, input, chunks[4]);
     draw_status(f, state, chunks[5]);
 
-    // 权限对话框仍以浮层叠加（后渲染的在前）
-    if let Some(dlg) = &state.permission_dialog {
-        draw_permission_dialog(f, dlg, area);
-    }
-
     // 会话选择器叠加在最顶层
     if let Some(picker) = &state.session_picker {
         draw_session_picker(f, picker, area);
@@ -297,6 +310,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 /// 底部面板类型与高度
 enum BottomPanel {
     None,
+    Permission,
     ExecModeConfirm,
     PlanApproval,
     AskQuestion,
@@ -310,6 +324,12 @@ const SUB_AGENT_LIST_MAX: usize = 6;
 const SUB_AGENT_DETAIL_MAX: u16 = 12;
 
 fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
+    // 权限确认最优先：几乎每次 Edit/Write/Bash 调用都可能弹出，必须始终可立即
+    // 响应，不能被其他面板挡住；固定 11 行，完全放得进底部常驻区（对齐
+    // Claude Code Inline 模式——不再走全屏浮层，避免每次都触发全屏切换闪烁）。
+    if state.permission_dialog.is_some() {
+        return (11u16.min(area_height), BottomPanel::Permission);
+    }
     if state.exec_mode_confirm.is_some() {
         return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
     }
@@ -392,6 +412,53 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     (0, BottomPanel::None)
 }
 
+/// 主循环在决定 `Viewport::Inline` 高度前调用：计算除聊天区外、底部所有固定
+/// UI（权限确认/AskQuestion 等底部面板、补全列表、附件条、输入框、状态行）
+/// 加起来需要的总行数。必须和 [`draw`] 里的布局算法保持一致，否则 Inline
+/// 高度会和实际渲染需要的不一致，要么裁掉内容要么留出多余空白。
+pub(crate) fn fixed_footer_height(
+    state: &AppState,
+    input: &InputBox,
+    term_width: u16,
+    term_height: u16,
+) -> u16 {
+    let inner_width = term_width.saturating_sub(2) as usize;
+    let input_height = (input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
+    let completion_height = if !state.file_completions.is_empty() {
+        (state.file_completions.len() as u16 + 2).min(10)
+    } else if !state.slash_completions.is_empty() {
+        (state.slash_completions.len() as u16 + 2).min(8)
+    } else {
+        0u16
+    };
+    let attach_height: u16 = if state.pending_attachments.is_empty() {
+        0
+    } else {
+        3
+    };
+    let (panel_height, _) = bottom_panel_size(state, term_height);
+    panel_height + completion_height + attach_height + input_height + 1
+}
+
+/// 主循环在决定 `Viewport::Inline` 高度前调用：计算"待渲染聊天区"（欢迎页/
+/// 尚未冻结的消息尾部/流式文本）在给定终端宽度下实际需要的可视行数，用于
+/// 动态撑开/收缩 Inline viewport 的聊天区部分。
+///
+/// 按内容实际需要动态定高（而不是直接撑到终端整高）：实测 ratatui 在 tmux/
+/// 部分终端下构造一个接近整个屏幕高的 Inline viewport 时，内部依赖的终端
+/// 光标位置查询有相当概率出现结果与实际渲染不一致（构造时内部状态完全一致
+/// 但视觉结果时对时不对，且概率不低），表现不只是"贴不到底部"，更严重时
+/// 输入框里刚打的字会完全不可见（逻辑上已收到，只是没画出来）。这比"没有
+/// 贴底"这个外观问题严重得多，所以放弃"始终撑满终端高度"，改回按内容实际
+/// 需要动态定高——足够高的终端下输入框仍贴不到最底部，是已知的、暂时接受
+/// 的限制，而不是一个可以简单修掉的 bug。
+pub(crate) fn pending_chat_visual_height(state: &AppState, term_width: u16) -> u16 {
+    let max_content_width = term_width.saturating_sub(2) as usize;
+    let lines = build_pending_chat_lines(state, max_content_width);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    para.line_count(term_width.max(1)).min(u16::MAX as usize) as u16
+}
+
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
 
 /// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时），
@@ -432,64 +499,23 @@ fn push_sub_agent_tool_log(
     }
 }
 
-fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Theme::border())
-        .title(Span::styled(
-            format!(" wyj-code v{} ", env!("CARGO_PKG_VERSION")),
-            Theme::dim(),
-        ));
+/// `render_chat_message` 渲染单条消息时需要的跨消息共享只读上下文。
+struct ChatRenderCtx<'a> {
+    max_content_width: usize,
+    /// 最后一条「可折叠」ToolResult 的下标（Ctrl+O 实际会切换的那一条），
+    /// 见 [`last_collapsible_tool_result_idx`]。
+    last_collapsible_idx: Option<usize>,
+    sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
+    spinner_frame: usize,
+}
 
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // 右侧 1 列留给滚动条
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let content_area = cols[0];
-    let scrollbar_area = cols[1];
-
-    // 会话仍处于"只有系统消息（如 MCP 连接提示），还没有真实对话"的阶段：欢迎页
-    // （5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）作为消息列表顶部的
-    // 固定内容一起渲染，而不是与消息列表互斥——这样 MCP 连接提示会紧跟在欢迎页
-    // 后面显示，而不是把欢迎页顶替掉。
-    let show_welcome = state.streaming_buf.is_empty()
-        && state
-            .messages
-            .iter()
-            .all(|m| matches!(m.role, MessageRole::System));
-
-    let max_content_width = content_area.width.saturating_sub(2) as usize;
-    let sep_width = content_area.width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line<'static>> = vec![];
-    if show_welcome {
-        let ctx = crate::welcome::WelcomeContext {
-            model: state.model_name.clone(),
-            cwd: shorten_home_path(&state.cwd.display().to_string()),
-            profile: {
-                let p = &state.config.active_profile;
-                if p == "default" {
-                    None
-                } else {
-                    Some(p.clone())
-                }
-            },
-            tip_index: state.welcome_tip_idx,
-        };
-        lines.extend(crate::welcome::render_welcome(&ctx, content_area.width));
-    }
-    let mut is_first_user = true;
-
-    // 预扫描：找出最后一条「可折叠」的 ToolResult 索引 —— 即 Ctrl+O 实际会切换的那一条
-    // （与 app.rs 的 Ctrl+O 处理用同一判定 is_collapsible_tool_result_content，不区分当前是否
-    // 已展开，这样无论该条目当前折叠还是展开，都能正确显示对应的 "ctrl+o to expand/collapse"
-    // 提示；若在此额外排除 m.expanded，会导致展开后立刻脱离该索引，"[ctrl+o to collapse]"
-    // 提示永远无法显示）。其余可折叠的历史结果改用静默 ⋯N 标记，避免提示与快捷键行为错位。
-    let last_collapsible_idx: Option<usize> = state
-        .messages
+/// 找出最后一条「可折叠」的 ToolResult 索引 —— 即 Ctrl+O 实际会切换的那一条
+/// （与 app.rs 的 Ctrl+O 处理用同一判定 is_collapsible_tool_result_content，不区分当前是否
+/// 已展开，这样无论该条目当前折叠还是展开，都能正确显示对应的 "ctrl+o to expand/collapse"
+/// 提示；若在此额外排除 m.expanded，会导致展开后立刻脱离该索引，"[ctrl+o to collapse]"
+/// 提示永远无法显示）。其余可折叠的历史结果改用静默 ⋯N 标记，避免提示与快捷键行为错位。
+pub(crate) fn last_collapsible_tool_result_idx(messages: &[ChatMessage]) -> Option<usize> {
+    messages
         .iter()
         .enumerate()
         .rev()
@@ -509,381 +535,458 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
             };
             is_collapsible_tool_result_content(&m.content, m.tool_name.as_deref(), &summary)
         })
-        .map(|(i, _)| i);
+        .map(|(i, _)| i)
+}
 
-    for (msg_idx, msg) in state.messages.iter().enumerate() {
-        match msg.role {
-            MessageRole::User => {
-                if !is_first_user {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "─".repeat(sep_width.min(60)),
-                        Theme::dim(),
-                    )));
-                }
-                is_first_user = false;
-
-                let mut content_lines = msg.content.lines();
-                let first_line = content_lines.next().unwrap_or("");
-                lines.push(Line::from(vec![
-                    Span::styled("❯ ", Theme::user_prefix()),
-                    Span::styled(
-                        truncate_line(first_line, max_content_width),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                for l in content_lines {
-                    lines.push(Line::from(Span::raw(format!(
-                        "  {}",
-                        truncate_line(l, max_content_width)
-                    ))));
-                }
+/// 渲染单条消息（追加到 `lines`）。从 `draw_chat` 提炼出来，供"实时重绘的待定
+/// 消息尾部"与后续"一次性冻结进真实 scrollback 的历史消息前缀"两条路径共用，
+/// 保证两边渲染逻辑不会 drift。
+fn render_chat_message(
+    lines: &mut Vec<Line<'static>>,
+    msg: &ChatMessage,
+    msg_idx: usize,
+    is_first_user: &mut bool,
+    ctx: &ChatRenderCtx,
+) {
+    let max_content_width = ctx.max_content_width;
+    match msg.role {
+        MessageRole::User => {
+            if !*is_first_user {
                 lines.push(Line::from(""));
-            }
-
-            MessageRole::Assistant => {
-                if msg.is_error {
-                    for l in msg.content.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!("  ✗ {}", truncate_line(l, max_content_width)),
-                            Theme::error(),
-                        )));
-                    }
-                } else {
-                    // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
-                    // 全部历史重跑 markdown 解析（长对话下的主要渲染开销）
-                    let mut cache = msg.md_cache.borrow_mut();
-                    match cache.as_ref() {
-                        Some((w, cached)) if *w == max_content_width => {
-                            lines.extend(cached.iter().cloned());
-                        }
-                        _ => {
-                            let mut fresh: Vec<Line<'static>> = vec![];
-                            render_markdown(&mut fresh, &msg.content, max_content_width);
-                            lines.extend(fresh.iter().cloned());
-                            *cache = Some((max_content_width, fresh));
-                        }
-                    }
-                }
-                lines.push(Line::from(""));
-            }
-
-            // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
-            MessageRole::ToolCall => {
-                lines.push(Line::from(vec![
-                    Span::styled("  ⏺ ", Theme::tool_call()),
-                    Span::styled(
-                        truncate_line(&msg.content, max_content_width.saturating_sub(4)),
-                        Theme::tool_call(),
-                    ),
-                ]));
-
-                // 子 Agent 调用：运行期间紧跟一条实时刷新的动态 ⎿ 状态行
-                if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
-                    match s.status {
-                        SubAgentStatus::Running => {
-                            let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
-                            let stats = wyj_i18n::tr_fmt(
-                                "subagent.inline_running",
-                                &[
-                                    ("elapsed", format_hms(s.elapsed_secs()).as_str()),
-                                    ("tokens", &fmt_tokens(s.output_tokens)),
-                                    ("count", &s.tool_calls.to_string()),
-                                ],
-                            );
-                            let mut spans = vec![
-                                Span::styled("    ⎿  ", Theme::dim()),
-                                Span::styled(
-                                    format!("{frame} {stats}"),
-                                    Style::default().fg(Color::Cyan),
-                                ),
-                            ];
-                            if let Some(cur) = &s.current_tool {
-                                spans.push(Span::styled(
-                                    format!(" · {}", truncate_line(cur, 40)),
-                                    Theme::dim(),
-                                ));
-                            }
-                            lines.push(Line::from(spans));
-                        }
-                        SubAgentStatus::Interrupted if !s.has_result => {
-                            lines.push(Line::from(vec![
-                                Span::styled("    ⎿  ", Theme::dim()),
-                                Span::styled(
-                                    format!("✗ {}", wyj_i18n::tr("subagent.interrupted")),
-                                    Theme::error(),
-                                ),
-                            ]));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // ─── ⎿  summary · elapsed  ────────────────────────────────────
-            MessageRole::ToolResult => {
-                let elapsed_str = msg
-                    .elapsed_secs
-                    .filter(|&s| s > 0.0)
-                    .map(|s| format!("  {}", format_hms(s)))
-                    .unwrap_or_default();
-
-                let (summary_style, prefix) = if msg.is_error {
-                    (Theme::error(), "✗ ")
-                } else {
-                    (Theme::dim(), "")
-                };
-
-                let summary = if msg.display_summary.is_empty() {
-                    msg.content
-                        .lines()
-                        .next()
-                        .unwrap_or("done")
-                        .trim()
-                        .to_string()
-                } else {
-                    msg.display_summary.clone()
-                };
-
-                lines.push(Line::from(vec![
-                    Span::styled("    ⎿  ", Theme::dim()),
-                    Span::styled(
-                        format!(
-                            "{prefix}{}",
-                            truncate_line(&summary, max_content_width.saturating_sub(12))
-                        ),
-                        summary_style,
-                    ),
-                    Span::styled(elapsed_str, Theme::dim()),
-                ]));
-
-                // 展开/折叠详细内容（ctrl+o）
-                if !msg.content.is_empty() && msg.content != summary {
-                    let content_lines: Vec<&str> = msg.content.lines().collect();
-                    let is_diff = matches!(msg.tool_name.as_deref(), Some("Edit") | Some("Write"));
-
-                    // Edit/Write：永不折叠，直接展开全部 diff，带 +/- 配色
-                    if is_diff {
-                        lines.push(Line::from(Span::styled(
-                            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
-                            Theme::dim(),
-                        )));
-                        // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
-                        if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
-                            push_sub_agent_tool_log(&mut lines, &s.tool_log, max_content_width);
-                        }
-                        // diff 行带配色：+ 绿、- 红、上下文 dim
-                        let max_lines = 60;
-                        for (i, l) in content_lines.iter().enumerate() {
-                            if i >= max_lines {
-                                lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "       …({} more lines)",
-                                        content_lines.len() - max_lines
-                                    ),
-                                    Theme::dim(),
-                                )));
-                                break;
-                            }
-                            let style = if l.starts_with("+ ") {
-                                Style::default().fg(Color::Green)
-                            } else if l.starts_with("- ") {
-                                Theme::error()
-                            } else {
-                                Theme::dim()
-                            };
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "       {}",
-                                    truncate_line(l, max_content_width.saturating_sub(8))
-                                ),
-                                style,
-                            )));
-                        }
-                    } else if msg.expanded || content_lines.len() <= TOOL_RESULT_FOLD_LINES {
-                        // 已展开，或内容行数 <= TOOL_RESULT_FOLD_LINES（始终全量展示，非 Edit/Write）
-                        lines.push(Line::from(Span::styled(
-                            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
-                            Theme::dim(),
-                        )));
-                        // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
-                        if let Some(s) = msg.sub_agent_id.and_then(|id| state.sub_agents.get(&id)) {
-                            push_sub_agent_tool_log(&mut lines, &s.tool_log, max_content_width);
-                        }
-                        let line_style = if msg.is_error {
-                            Theme::error()
-                        } else {
-                            Theme::tool_result()
-                        };
-                        render_tool_result_body_lines(
-                            &mut lines,
-                            &content_lines,
-                            None,
-                            line_style,
-                            max_content_width,
-                        );
-                        // 只有「最后一条可折叠」且已展开才显示 collapse 提示；短内容
-                        // （<= TOOL_RESULT_FOLD_LINES 行）永远不会被 last_collapsible_idx 选中
-                        // （其判定要求行数 > TOOL_RESULT_FOLD_LINES），这里天然不会误显示。
-                        if last_collapsible_idx == Some(msg_idx) {
-                            lines.push(Line::from(Span::styled(
-                                "       [ctrl+o to collapse]".to_string(),
-                                Theme::dim(),
-                            )));
-                        }
-                    } else if content_lines.len() > TOOL_RESULT_FOLD_LINES {
-                        // 折叠态：展示开头 TOOL_RESULT_FOLD_LINES 行 + 剩余行数提示
-                        let line_style = if msg.is_error {
-                            Theme::error()
-                        } else {
-                            Theme::tool_result()
-                        };
-                        render_tool_result_body_lines(
-                            &mut lines,
-                            &content_lines,
-                            Some(TOOL_RESULT_FOLD_LINES),
-                            line_style,
-                            max_content_width,
-                        );
-                        let remaining = content_lines.len() - TOOL_RESULT_FOLD_LINES;
-                        // 折叠态：只有最后一条可折叠的才显示快捷键提示
-                        if last_collapsible_idx == Some(msg_idx) {
-                            lines.push(Line::from(Span::styled(
-                                format!("       …({remaining} more lines, ctrl+o to expand)"),
-                                Theme::dim(),
-                            )));
-                        } else {
-                            // 其余可折叠的历史结果：静默标记，不显示快捷键提示
-                            lines.push(Line::from(Span::styled(
-                                format!("       ⋯{remaining}"),
-                                Theme::dim(),
-                            )));
-                        }
-                    }
-                }
-            }
-
-            MessageRole::BashOutput => {
-                let (icon, style) = if msg.is_error {
-                    ("✗", Theme::error())
-                } else {
-                    ("$", Style::default().fg(Color::Green))
-                };
-                let elapsed_str = msg
-                    .elapsed_secs
-                    .filter(|&s| s > 0.0)
-                    .map(|s| format!(" · {}", format_hms(s)))
-                    .unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {} bash", icon), style),
-                    Span::styled(elapsed_str, Theme::dim()),
-                ]));
-                for l in msg.content.lines().take(20) {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "    {}",
-                            truncate_line(l, max_content_width.saturating_sub(2))
-                        ),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                let total = msg.content.lines().count();
-                if total > 20 {
-                    lines.push(Line::from(Span::styled(
-                        format!("    …（共 {} 行）", total),
-                        Theme::dim(),
-                    )));
-                }
-            }
-
-            MessageRole::System => {
-                let (marker, style) = if msg.is_error {
-                    ("  ⚠ ", Theme::warning())
-                } else {
-                    ("  ⚙ ", Style::default().fg(Color::Cyan))
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(marker, style),
-                    Span::styled(msg.content.clone(), style),
-                ]));
-                lines.push(Line::from(""));
-            }
-            MessageRole::TurnSummary => {
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  {}", msg.content),
+                lines.push(Line::from(Span::styled(
+                    "─".repeat(max_content_width.min(60)),
                     Theme::dim(),
-                )]));
-                lines.push(Line::from(""));
+                )));
+            }
+            *is_first_user = false;
+
+            let mut content_lines = msg.content.lines();
+            let first_line = content_lines.next().unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled("❯ ", Theme::user_prefix()),
+                Span::styled(
+                    truncate_line(first_line, max_content_width),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for l in content_lines {
+                lines.push(Line::from(Span::raw(format!(
+                    "  {}",
+                    truncate_line(l, max_content_width)
+                ))));
+            }
+            lines.push(Line::from(""));
+        }
+
+        MessageRole::Assistant => {
+            if msg.is_error {
+                for l in msg.content.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ✗ {}", truncate_line(l, max_content_width)),
+                        Theme::error(),
+                    )));
+                }
+            } else {
+                // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
+                // 全部历史重跑 markdown 解析（长对话下的主要渲染开销）
+                let mut cache = msg.md_cache.borrow_mut();
+                match cache.as_ref() {
+                    Some((w, cached)) if *w == max_content_width => {
+                        lines.extend(cached.iter().cloned());
+                    }
+                    _ => {
+                        let mut fresh: Vec<Line<'static>> = vec![];
+                        render_markdown(&mut fresh, &msg.content, max_content_width);
+                        lines.extend(fresh.iter().cloned());
+                        *cache = Some((max_content_width, fresh));
+                    }
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
+        MessageRole::ToolCall => {
+            lines.push(Line::from(vec![
+                Span::styled("  ⏺ ", Theme::tool_call()),
+                Span::styled(
+                    truncate_line(&msg.content, max_content_width.saturating_sub(4)),
+                    Theme::tool_call(),
+                ),
+            ]));
+
+            // 子 Agent 调用：运行期间紧跟一条实时刷新的动态 ⎿ 状态行
+            if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
+                match s.status {
+                    SubAgentStatus::Running => {
+                        let frame = SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()];
+                        let stats = wyj_i18n::tr_fmt(
+                            "subagent.inline_running",
+                            &[
+                                ("elapsed", format_hms(s.elapsed_secs()).as_str()),
+                                ("tokens", &fmt_tokens(s.output_tokens)),
+                                ("count", &s.tool_calls.to_string()),
+                            ],
+                        );
+                        let mut spans = vec![
+                            Span::styled("    ⎿  ", Theme::dim()),
+                            Span::styled(
+                                format!("{frame} {stats}"),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                        ];
+                        if let Some(cur) = &s.current_tool {
+                            spans.push(Span::styled(
+                                format!(" · {}", truncate_line(cur, 40)),
+                                Theme::dim(),
+                            ));
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                    SubAgentStatus::Interrupted if !s.has_result => {
+                        lines.push(Line::from(vec![
+                            Span::styled("    ⎿  ", Theme::dim()),
+                            Span::styled(
+                                format!("✗ {}", wyj_i18n::tr("subagent.interrupted")),
+                                Theme::error(),
+                            ),
+                        ]));
+                    }
+                    _ => {}
+                }
             }
         }
+
+        // ─── ⎿  summary · elapsed  ────────────────────────────────────
+        MessageRole::ToolResult => {
+            let elapsed_str = msg
+                .elapsed_secs
+                .filter(|&s| s > 0.0)
+                .map(|s| format!("  {}", format_hms(s)))
+                .unwrap_or_default();
+
+            let (summary_style, prefix) = if msg.is_error {
+                (Theme::error(), "✗ ")
+            } else {
+                (Theme::dim(), "")
+            };
+
+            let summary = if msg.display_summary.is_empty() {
+                msg.content
+                    .lines()
+                    .next()
+                    .unwrap_or("done")
+                    .trim()
+                    .to_string()
+            } else {
+                msg.display_summary.clone()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled("    ⎿  ", Theme::dim()),
+                Span::styled(
+                    format!(
+                        "{prefix}{}",
+                        truncate_line(&summary, max_content_width.saturating_sub(12))
+                    ),
+                    summary_style,
+                ),
+                Span::styled(elapsed_str, Theme::dim()),
+            ]));
+
+            // 展开/折叠详细内容（ctrl+o）
+            if !msg.content.is_empty() && msg.content != summary {
+                // Read 结果每行带 "行号\t" 前缀（供模型精确编辑用），人类展示层去掉，
+                // 不改 msg.content 本身，模型侧历史记录不受影响。
+                let is_read = msg.tool_name.as_deref() == Some("Read");
+                let content_lines: Vec<&str> = msg
+                    .content
+                    .lines()
+                    .map(|l| {
+                        if is_read {
+                            strip_read_line_number(l)
+                        } else {
+                            l
+                        }
+                    })
+                    .collect();
+                let is_diff = matches!(msg.tool_name.as_deref(), Some("Edit") | Some("Write"));
+
+                // Edit/Write：永不折叠，直接展开全部 diff，带 +/- 配色
+                if is_diff {
+                    lines.push(Line::from(Span::styled(
+                        format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
+                        Theme::dim(),
+                    )));
+                    // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
+                    if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
+                        push_sub_agent_tool_log(lines, &s.tool_log, max_content_width);
+                    }
+                    // diff 行带配色：+ 绿、- 红、上下文 dim
+                    let max_lines = 60;
+                    for (i, l) in content_lines.iter().enumerate() {
+                        if i >= max_lines {
+                            lines.push(Line::from(Span::styled(
+                                format!("       …({} more lines)", content_lines.len() - max_lines),
+                                Theme::dim(),
+                            )));
+                            break;
+                        }
+                        let style = if l.starts_with("+ ") {
+                            Style::default().fg(Color::Green)
+                        } else if l.starts_with("- ") {
+                            Theme::error()
+                        } else {
+                            Theme::dim()
+                        };
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "       {}",
+                                truncate_line(l, max_content_width.saturating_sub(8))
+                            ),
+                            style,
+                        )));
+                    }
+                } else if msg.expanded || content_lines.len() <= TOOL_RESULT_FOLD_LINES {
+                    // 已展开，或内容行数 <= TOOL_RESULT_FOLD_LINES（始终全量展示，非 Edit/Write）
+                    lines.push(Line::from(Span::styled(
+                        format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
+                        Theme::dim(),
+                    )));
+                    // 子 Agent 结果：先列出其内部工具调用明细，再展示最终文本
+                    if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
+                        push_sub_agent_tool_log(lines, &s.tool_log, max_content_width);
+                    }
+                    let line_style = if msg.is_error {
+                        Theme::error()
+                    } else {
+                        Theme::tool_result()
+                    };
+                    render_tool_result_body_lines(
+                        lines,
+                        &content_lines,
+                        None,
+                        line_style,
+                        max_content_width,
+                    );
+                    // 只有「最后一条可折叠」且已展开才显示 collapse 提示；短内容
+                    // （<= TOOL_RESULT_FOLD_LINES 行）永远不会被 last_collapsible_idx 选中
+                    // （其判定要求行数 > TOOL_RESULT_FOLD_LINES），这里天然不会误显示。
+                    if ctx.last_collapsible_idx == Some(msg_idx) {
+                        lines.push(Line::from(Span::styled(
+                            "       [ctrl+o to collapse]".to_string(),
+                            Theme::dim(),
+                        )));
+                    }
+                } else if content_lines.len() > TOOL_RESULT_FOLD_LINES {
+                    // 折叠态：展示开头 TOOL_RESULT_FOLD_LINES 行 + 剩余行数提示
+                    let line_style = if msg.is_error {
+                        Theme::error()
+                    } else {
+                        Theme::tool_result()
+                    };
+                    render_tool_result_body_lines(
+                        lines,
+                        &content_lines,
+                        Some(TOOL_RESULT_FOLD_LINES),
+                        line_style,
+                        max_content_width,
+                    );
+                    let remaining = content_lines.len() - TOOL_RESULT_FOLD_LINES;
+                    // 折叠态：只有最后一条可折叠的才显示快捷键提示
+                    if ctx.last_collapsible_idx == Some(msg_idx) {
+                        lines.push(Line::from(Span::styled(
+                            format!("       …({remaining} more lines, ctrl+o to expand)"),
+                            Theme::dim(),
+                        )));
+                    } else {
+                        // 其余可折叠的历史结果：静默标记，不显示快捷键提示
+                        lines.push(Line::from(Span::styled(
+                            format!("       ⋯{remaining}"),
+                            Theme::dim(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        MessageRole::BashOutput => {
+            let (icon, style) = if msg.is_error {
+                ("✗", Theme::error())
+            } else {
+                ("$", Style::default().fg(Color::Green))
+            };
+            let elapsed_str = msg
+                .elapsed_secs
+                .filter(|&s| s > 0.0)
+                .map(|s| format!(" · {}", format_hms(s)))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} bash", icon), style),
+                Span::styled(elapsed_str, Theme::dim()),
+            ]));
+            for l in msg.content.lines().take(20) {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {}",
+                        truncate_line(l, max_content_width.saturating_sub(2))
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            let total = msg.content.lines().count();
+            if total > 20 {
+                lines.push(Line::from(Span::styled(
+                    format!("    …（共 {} 行）", total),
+                    Theme::dim(),
+                )));
+            }
+        }
+
+        MessageRole::System => {
+            let (marker, style) = if msg.is_error {
+                ("  ⚠ ", Theme::warning())
+            } else {
+                ("  ⚙ ", Style::default().fg(Color::Cyan))
+            };
+            lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(msg.content.clone(), style),
+            ]));
+            lines.push(Line::from(""));
+        }
+        MessageRole::TurnSummary => {
+            lines.push(Line::from(vec![Span::styled(
+                format!("  {}", msg.content),
+                Theme::dim(),
+            )]));
+            lines.push(Line::from(""));
+        }
     }
+}
+
+/// 构建"待渲染"聊天内容：欢迎页（若适用）+ 尚未冻结进终端真实 scrollback 的
+/// 消息尾部（`state.messages[frozen_up_to..]`）+ 流式文本。已冻结的前缀已经
+/// 通过 `Terminal::insert_before` 永久写入真实 scrollback，不再参与这里的重建。
+///
+/// 供 [`draw_chat`] 渲染使用，也供主循环在决定 Inline viewport 高度前测量
+/// 所需可见行数（二者必须用同一份构建逻辑，否则高度估算和实际渲染会不一致）。
+pub(crate) fn build_pending_chat_lines(
+    state: &AppState,
+    max_content_width: usize,
+) -> Vec<Line<'static>> {
+    // 会话仍处于"只有系统消息（如 MCP 连接提示），还没有真实对话"的阶段：欢迎页
+    // （5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）作为消息列表顶部的
+    // 固定内容一起渲染，而不是与消息列表互斥——这样 MCP 连接提示会紧跟在欢迎页
+    // 后面显示，而不是把欢迎页顶替掉。一旦有任何消息被冻结进真实 scrollback，
+    // 说明欢迎页早已滚走，不能再重新显示。
+    let show_welcome = state.frozen_up_to == 0
+        && state.streaming_buf.is_empty()
+        && state
+            .messages
+            .iter()
+            .all(|m| matches!(m.role, MessageRole::System));
+
+    let mut lines: Vec<Line<'static>> = vec![];
+    if show_welcome {
+        let ctx = crate::welcome::WelcomeContext {
+            model: state.model_name.clone(),
+            cwd: shorten_home_path(&state.cwd.display().to_string()),
+            profile: {
+                let p = &state.config.active_profile;
+                if p == "default" {
+                    None
+                } else {
+                    Some(p.clone())
+                }
+            },
+            tip_index: state.welcome_tip_idx,
+        };
+        lines.extend(crate::welcome::render_welcome(
+            &ctx,
+            max_content_width as u16,
+        ));
+    }
+
+    // 只有当尚未冻结任何内容时，尾部第一条 User 消息才是"整场对话的第一条"，
+    // 不需要在它前面画分隔线；否则视觉上是接着已经滚入 scrollback 的历史继续，
+    // 必须照常画分隔线才不会显得突兀。
+    let mut is_first_user = state.frozen_up_to == 0;
+    lines.extend(render_message_range(
+        &state.messages,
+        state.frozen_up_to..state.messages.len(),
+        max_content_width,
+        &state.sub_agents,
+        state.spinner_frame,
+        &mut is_first_user,
+    ));
 
     // 流式文本（实时输出中）
     if !state.streaming_buf.is_empty() {
         render_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
-    let text = Text::from(lines);
+    lines
+}
 
-    // 用 ratatui 的渲染折行计数拿精确视觉行数：手工 ceil(width/cw) 估算与实际
-    // word-wrap 结果有偏差，长对话下会导致底部若干行永远滚不进视口。
-    let cw = content_area.width.max(1);
-    let para = Paragraph::new(text).wrap(Wrap { trim: false });
-    let total_visual_lines = para.line_count(cw).min(u16::MAX as usize) as u16;
-
-    let visible_height = content_area.height;
-    state.chat_height = visible_height;
-
-    let max_scroll = total_visual_lines.saturating_sub(visible_height);
-    let clamped_offset = state.scroll_offset.min(max_scroll);
-    // 把 clamp 后的值写回状态，防止滚轮/按键累加时 raw offset 超过 max_scroll，
-    // 导致到达顶部后再往下滚时视觉上卡住（必须按 PageDown 才能恢复）。
-    state.scroll_offset = clamped_offset;
-    let scroll = max_scroll.saturating_sub(clamped_offset);
-
-    let para = para.scroll((scroll, 0));
-    f.render_widget(para, content_area);
-
-    // 记录滚动条区域供鼠标点击命中检测
-    state.scrollbar_area = scrollbar_area;
-
-    // 滚动条（内容超出可视区时显示 ▲/▼ 箭头 + 拇指指示器）
-    let can_scroll_up = clamped_offset < max_scroll; // 还有更早内容
-    let can_scroll_down = clamped_offset > 0; // 还有更新内容
-    if total_visual_lines > visible_height && visible_height > 0 {
-        // 拇指在中间轨道（排除头尾各 1 行的箭头位置）
-        let track_height = visible_height.saturating_sub(2);
-        let thumb_row = if max_scroll > 0 && track_height > 0 {
-            let pct = clamped_offset as f32 / max_scroll as f32; // 0=底部 1=顶部
-            1 + (track_height.saturating_sub(1) as f32 * (1.0 - pct)) as u16
-        } else {
-            1
-        };
-        let bar_lines: Vec<Line<'static>> = (0..visible_height)
-            .map(|row| {
-                if row == 0 {
-                    if can_scroll_up {
-                        Line::from(Span::styled("▲", Style::default().fg(Color::DarkGray)))
-                    } else {
-                        Line::from(Span::styled("╷", Theme::dim()))
-                    }
-                } else if row == visible_height - 1 {
-                    if can_scroll_down {
-                        Line::from(Span::styled("▼", Style::default().fg(Color::DarkGray)))
-                    } else {
-                        Line::from(Span::styled("╵", Theme::dim()))
-                    }
-                } else if row == thumb_row {
-                    Line::from(Span::styled("█", Style::default().fg(Color::DarkGray)))
-                } else {
-                    Line::from(Span::styled("│", Theme::dim()))
-                }
-            })
-            .collect();
-        f.render_widget(Paragraph::new(Text::from(bar_lines)), scrollbar_area);
+/// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
+/// 出现过 User 消息"的状态（调用方按需初始化/复用），供 [`build_pending_chat_lines`]
+/// 渲染待定尾部、以及主循环冻结历史前缀写入真实 scrollback 时共用同一份逻辑。
+pub(crate) fn render_message_range(
+    messages: &[ChatMessage],
+    range: std::ops::Range<usize>,
+    max_content_width: usize,
+    sub_agents: &std::collections::BTreeMap<u64, SubAgentUiState>,
+    spinner_frame: usize,
+    is_first_user: &mut bool,
+) -> Vec<Line<'static>> {
+    // 找出最后一条「可折叠」的 ToolResult 索引 —— 即 Ctrl+O 实际会切换的那一条。
+    // 注意：始终基于完整 `messages` 扫描（而非仅 `range`），确保冻结历史前缀时
+    // 用的判定和渲染待定尾部/Ctrl+O 处理时完全一致。
+    let last_collapsible_idx = last_collapsible_tool_result_idx(messages);
+    let ctx = ChatRenderCtx {
+        max_content_width,
+        last_collapsible_idx,
+        sub_agents,
+        spinner_frame,
+    };
+    let mut lines = vec![];
+    for i in range {
+        render_chat_message(&mut lines, &messages[i], i, is_first_user, &ctx);
     }
+    lines
+}
+
+fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
+    // 不画外框——对齐 Claude Code 的朴素观感。之前每帧都在"当前存活区"外面
+    // 包一层 Block 边框，但存活区会随冻结/终端高度变化而移动、伸缩，边框
+    // 看起来像一个悬浮在屏幕中间、时断时续的盒子，很违和。
+    let max_content_width = area.width.saturating_sub(2) as usize;
+    let lines = build_pending_chat_lines(state, max_content_width);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+
+    // `area` 通常比实际内容需要的行数高得多——主循环把 Inline viewport 撑到
+    // 贴近终端底部，就是为了让输入框永远固定在屏幕最下方（对齐 Claude
+    // Code）。这里按内容实际需要的行数在 area 底部截出一块区域渲染，上面
+    // 留白，让内容显示为"贴着输入框往上长"而不是贴在屏幕顶部、下面一截
+    // 空白追不上屏幕底部。
+    let content_line_count = para.line_count(area.width.max(1)).min(u16::MAX as usize) as u16;
+    let content_height = content_line_count.min(area.height).max(1);
+    let content_area = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(content_height),
+        width: area.width,
+        height: content_height,
+    };
+
+    // 待定区（尚未冻结的消息尾部 + 流式输出）理论上应该放得下；但极长的单条
+    // 流式回复仍可能超出可用高度，此时不滚动会一直停留在内容开头、看不到
+    // 正在生成的最新内容——按尾部对齐，始终展示最新部分。
+    let scroll_y = content_line_count.saturating_sub(content_height);
+    let para = para.scroll((scroll_y, 0));
+    f.render_widget(para, content_area);
 }
 
 /// 底部固定面板：子 Agent 总览，支持上下选中 + 展开详情（工具流水 + 最终结果/状态）。
@@ -1658,15 +1761,11 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
 // ─── 权限对话框（分级授权） ────────────────────────────────────────────────────
 
+/// 权限确认框：Category A 底部常驻面板（对齐 Claude Code Inline 模式），
+/// 直接吃 `bottom_panel_size` 已经算好的 `area`（`chunks[1]`），不再自己居中
+/// 计算浮层 Rect、不再用 `Clear`——它高频出现在几乎每次 Edit/Write/Bash 调用，
+/// 走全屏浮层切换会非常闪烁。
 fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
-    let width = (area.width * 3 / 4).max(40).min(area.width);
-    let height = 11u16;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let dialog_area = Rect::new(x, y, width, height);
-
-    f.render_widget(Clear, dialog_area);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Theme::permission_dialog())
@@ -1675,8 +1774,8 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
             Theme::permission_dialog(),
         ));
 
-    let inner = block.inner(dialog_area);
-    f.render_widget(block, dialog_area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let preview = truncate_chars(&dlg.action_summary, (inner.width as usize * 3).max(80));
 
@@ -3511,6 +3610,25 @@ mod tool_result_fold_tests {
     #[test]
     fn empty_content_is_not_collapsible() {
         assert!(!is_collapsible_tool_result_content("", None, ""));
+    }
+
+    #[test]
+    fn strip_read_line_number_removes_numeric_tab_prefix() {
+        assert_eq!(strip_read_line_number("42\tfn main() {}"), "fn main() {}");
+        assert_eq!(strip_read_line_number("1\t"), "");
+    }
+
+    #[test]
+    fn strip_read_line_number_leaves_non_matching_lines_untouched() {
+        // read.rs 结尾追加的提示行不带 "数字\t" 前缀，不应被误伤
+        assert_eq!(
+            strip_read_line_number("（共 100 行，已显示 0–50）"),
+            "（共 100 行，已显示 0–50）"
+        );
+        // 没有 tab 的普通行
+        assert_eq!(strip_read_line_number("no tab here"), "no tab here");
+        // tab 前不是纯数字
+        assert_eq!(strip_read_line_number("a1\tcontent"), "a1\tcontent");
     }
 
     #[test]
