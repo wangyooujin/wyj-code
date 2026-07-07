@@ -18,14 +18,16 @@ pub mod sub_agent;
 pub mod textutil;
 pub mod todo;
 mod webfetch;
+mod websearch;
 mod write;
 
 pub use agent_hub::{SubAgentEvent, SubAgentHub, MAX_CONCURRENT_SUBAGENTS};
 pub use ask_question::AskQuestionTool;
 pub use bash_session::BashSessionManager;
-pub use ctx::{PermissionMode, ToolCtx, UiAskRequest};
+pub use ctx::{PermissionDecision, PermissionMode, ToolCtx, UiAskRequest};
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use registry::ToolRegistry;
 pub use sub_agent::{AgentFactory, SubAgentTool};
 pub use todo::{TodoStore, TodoWriteTool};
+pub use websearch::WebSearchTool;
 pub use wyj_core::tool::{Tool, ToolResult};

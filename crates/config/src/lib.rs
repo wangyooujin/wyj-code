@@ -190,10 +190,21 @@ pub struct Config {
     /// 子 Agent 模型配置（[subagent] 节）
     #[serde(default)]
     pub subagent: SubAgentCfg,
+    /// WebSearch 搜索 provider（目前支持 "tavily"）
+    #[serde(default = "default_search_provider")]
+    pub search_provider: String,
+    /// WebSearch API Key（优先从环境变量 WYJ_CODE_SEARCH_API_KEY 读取）。
+    /// 未配置时 WebSearch 工具不会注册，模型看不到该工具。
+    #[serde(default)]
+    pub search_api_key: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_search_provider() -> String {
+    "tavily".to_string()
 }
 
 impl Default for Config {
@@ -206,6 +217,8 @@ impl Default for Config {
             mcp_servers: vec![],
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            search_provider: default_search_provider(),
+            search_api_key: None,
         }
     }
 }
@@ -273,6 +286,8 @@ impl From<LegacyConfigV0> for Config {
             mcp_servers: legacy.mcp_servers,
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            search_provider: default_search_provider(),
+            search_api_key: None,
         }
     }
 }
@@ -354,6 +369,12 @@ impl Config {
         if let Ok(key) = std::env::var("WYJ_CODE_API_KEY") {
             if !key.is_empty() {
                 cfg.active_profile_mut().api_key = Some(key);
+            }
+        }
+        // WebSearch key：环境变量优先
+        if let Ok(key) = std::env::var("WYJ_CODE_SEARCH_API_KEY") {
+            if !key.is_empty() {
+                cfg.search_api_key = Some(key);
             }
         }
 

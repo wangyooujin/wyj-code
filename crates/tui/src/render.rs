@@ -1678,7 +1678,7 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
     let inner = block.inner(dialog_area);
     f.render_widget(block, dialog_area);
 
-    let preview = truncate_chars(&dlg.input_preview, (inner.width as usize * 3).max(80));
+    let preview = truncate_chars(&dlg.action_summary, (inner.width as usize * 3).max(80));
 
     let lines: Vec<Line<'static>> = vec![
         Line::from(vec![
@@ -3502,7 +3502,10 @@ mod tool_result_fold_tests {
     use super::*;
 
     fn lines_str(n: usize) -> String {
-        (0..n).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n")
+        (0..n)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -3555,7 +3558,9 @@ mod tool_result_fold_tests {
     fn wrap_line_splits_without_dropping_content() {
         let s = "0 8 * * * /usr/bin/env PATH=/opt/homebrew/bin:/usr/local/bin/usr/bin:/bin /Users/foo/venv/bin/python /Users/foo/script.py";
         let wrapped = wrap_line(s, 20);
-        assert!(wrapped.iter().all(|l| l.chars().map(char_display_width).sum::<usize>() <= 20));
+        assert!(wrapped
+            .iter()
+            .all(|l| l.chars().map(char_display_width).sum::<usize>() <= 20));
         assert_eq!(wrapped.join(""), s, "换行不应丢失或改变任何字符");
     }
 

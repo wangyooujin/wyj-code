@@ -627,7 +627,18 @@ impl Agent {
 
         let (display, content, is_error): (String, ToolResultContent, bool) = if let Some(t) = tool
         {
-            if ctx.is_allowed(&name, &input) {
+            if !ctx.is_allowed(&name, &input) {
+                let msg = format!("工具 `{name}` 在当前模式下不被允许");
+                (msg.clone(), ToolResultContent::Text(msg), true)
+            } else if t.needs_permission(&input)
+                && !ctx.confirm_tool(&name, &t.action_summary(&input)).await
+            {
+                // 逐调用权限确认：用户拒绝，将拒绝信息回灌给模型（模型据此改道）
+                let msg = format!(
+                    "用户拒绝执行工具 `{name}`。请不要重试该操作；改用其他方式，或先向用户询问原因。"
+                );
+                (msg.clone(), ToolResultContent::Text(msg), true)
+            } else {
                 match t.run(input, ctx).await {
                     Ok(r) => match r.parts {
                         // 结构化结果（如图片块）：display 用降级文本，模型收 Parts
@@ -643,9 +654,6 @@ impl Agent {
                         (msg.clone(), ToolResultContent::Text(msg), true)
                     }
                 }
-            } else {
-                let msg = format!("工具 `{name}` 在当前模式下不被允许");
-                (msg.clone(), ToolResultContent::Text(msg), true)
             }
         } else {
             let msg = format!("工具 `{name}` 未注册");

@@ -68,7 +68,7 @@ pub fn merged_mcp_servers(cfg: &Config, cwd: &Path) -> Vec<McpServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{McpTransport, Profile};
+    use crate::McpTransport;
 
     fn mcp(name: &str, command: &str) -> McpServerConfig {
         McpServerConfig {
@@ -82,13 +82,8 @@ mod tests {
 
     fn base_config(mcp_servers: Vec<McpServerConfig>) -> Config {
         Config {
-            active_profile: "default".to_string(),
-            profiles: vec![Profile::default()],
-            log_level: "warn".to_string(),
-            language: None,
             mcp_servers,
-            auto_memory_enabled: true,
-            subagent: Default::default(),
+            ..Default::default()
         }
     }
 

@@ -23,11 +23,11 @@ pub enum AgentEvent {
         is_error: bool,
         elapsed_secs: f64,
     },
-    /// 权限确认请求（stub，目前仅展示）
-    PermissionRequest {
+    /// 逐调用工具权限确认请求（含 oneshot 决策通道）
+    ToolPermissionRequest {
         tool_name: String,
-        input_preview: String,
-        tx_id: String,
+        action_summary: String,
+        response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
     },
     /// Agent 一轮完成
     TurnDone,
@@ -135,7 +135,6 @@ pub enum McpConnFailReason {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     Submit(String),
-    PermissionResponse { tx_id: String, approved: bool },
     ScrollUp,
     ScrollDown,
     Quit,

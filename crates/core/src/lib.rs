@@ -4,6 +4,7 @@ pub mod claude_md;
 pub mod compact;
 pub mod history;
 pub mod memory;
+pub mod project;
 pub mod prompts;
 pub mod session;
 pub mod session_store;
@@ -16,6 +17,7 @@ pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFi
 pub use compact::{compact_session, estimate_tokens};
 pub use history::{new_session_id, now_iso, HistoryEntry, HistoryStore};
 pub use memory::{project_id, MemoryStore};
+pub use project::{project_key, project_root, same_project};
 pub use session::Session;
 pub use session_store::{extract_preview, extract_title, SessionFile, SessionMeta, SessionStore};
 pub use summary::SummaryGenerator;

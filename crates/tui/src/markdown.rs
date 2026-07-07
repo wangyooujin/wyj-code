@@ -750,10 +750,7 @@ mod tests {
             "长行应换行完整展示，而不是截断加省略号: {rendered}"
         );
         for ch in long_cmd.chars() {
-            assert!(
-                rendered.contains(ch),
-                "换行后的渲染结果应包含原始字符 {ch}"
-            );
+            assert!(rendered.contains(ch), "换行后的渲染结果应包含原始字符 {ch}");
         }
     }
 }

@@ -62,6 +62,8 @@ vision = true                # 模型是否支持图片输入；false 时图片�
 # interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空自动检测系统 locale
+search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）
+search_api_key = ""          # WebSearch API Key，优先读环境变量 WYJ_CODE_SEARCH_API_KEY；未配置则 WebSearch 工具不注册（模型看不到）
 
 [subagent]
 default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组
@@ -89,7 +91,7 @@ args = ["--flag"]
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session、HistoryStore、MemoryStore、ClaudeMdLoader、上下文压缩 |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent；WebSearch 仅在配置 search_api_key 时注册；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
@@ -111,4 +113,4 @@ args = ["--flag"]
 
 ### 权限模型（TUI）
 
-`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`；目前 `Prompt` 分支直接放行（`AgentEvent::PermissionRequest` 是无生产者的 stub，真正的逐调用确认对话框尚未实现）。工具与 TUI 的真实交互通道是 `ToolCtx.ui_ask_tx: mpsc::Sender<UiAskRequest>`（AskQuestion 多题面板、ExitPlanMode 计划批准走它）。Plan 模式通过 `Allowlist` 白名单限制工具，子 Agent 继承该白名单（与类型定义的工具集取交集），且子 Agent 的 ctx 不接 ui_ask_tx（也未注册需要 UI 交互的工具）。
+`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`。**逐调用工具权限确认（v1.0.1 起）**：Normal 模式映射为 `Prompt`，`agent.rs::exec_tool_call` 在执行任一 `Tool::needs_permission()` 为 true 的工具（Edit/Write/Bash）前调用 `ToolContext::confirm_tool(name, summary)`；`ToolCtx` 的实现经 `ui_ask_tx` 发 `UiAskRequest::ToolPermission` 并 await `oneshot<PermissionDecision>`，TUI 弹 `PermissionDialog`（`draw_permission_dialog`），按键 y=AllowOnce / a=AllowAlways / d·Esc=Deny。`Deny` 把拒绝信息作为 `is_error` 工具结果回灌给模型；`AllowAlways` 把工具名写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`（`project_key` 按 git 仓库根派生，见 `core::project`）并跨会话生效——`ToolCtx::load_allowed_tools` 在每轮 ctx 装配时载入。`summary` 由 `Tool::action_summary()` 提供（Bash=命令、Edit/Write=文件路径）。需要确认的工具均非 `parallel_safe`，串行执行，同一时刻至多一个对话框。Bypass=`AutoApprove` 全放行；Plan=`Allowlist` 白名单限制。`ui_ask_tx` 同时承载 AskQuestion 多题面板与 ExitPlanMode 计划批准；子 Agent 的 ctx 不接 `ui_ask_tx`，`confirm_tool` 默认放行（不阻塞、不弹窗）。
