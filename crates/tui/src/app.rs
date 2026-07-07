@@ -16,9 +16,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Rect;
 use ratatui::style::Color as UiColor;
-use ratatui::Terminal;
+use ratatui::text::Text;
+use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -3399,7 +3400,10 @@ fn tool_display_arg(name: &str, input: &serde_json::Value) -> String {
         }
     };
 
-    match name {
+    // 工具注册名是 PascalCase（如 "Read"/"WebFetch"，见 crates/tools/src/*.rs 的
+    // Tool::name()），这里统一转小写后再匹配，否则下面的分支永远命中不了。
+    let name = name.to_lowercase();
+    match name.as_str() {
         "read" | "write" | "edit" => {
             let path = input
                 .get("file_path")
@@ -3420,7 +3424,7 @@ fn tool_display_arg(name: &str, input: &serde_json::Value) -> String {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             trunc(format!("{pat} in {}", shorten(path)), 50)
         }
-        "web_fetch" => {
+        "webfetch" => {
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             trunc(url.to_string(), 55)
         }
@@ -3443,7 +3447,9 @@ fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
         return trunc1(output.lines().next().unwrap_or(output));
     }
 
-    match name {
+    // 同上：工具注册名是 PascalCase，先转小写再匹配。
+    let name = name.to_lowercase();
+    match name.as_str() {
         "read" => {
             let n = output.lines().count();
             format!("read {n} lines")
@@ -3468,8 +3474,101 @@ fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
             let n = output.lines().filter(|l| !l.trim().is_empty()).count();
             format!("{n} files")
         }
-        "web_fetch" => format!("fetched {} bytes", output.len()),
+        "webfetch" => format!("fetched {} bytes", output.len()),
         _ => trunc1(output.lines().next().unwrap_or(output)),
+    }
+}
+
+#[cfg(test)]
+mod tool_summary_tests {
+    use super::*;
+
+    /// 回归测试：工具注册名是 PascalCase（Tool::name()），这两个函数曾用小写/下划线
+    /// 字符串匹配，导致真实调用（"Read"/"WebFetch" 等）永远落到兜底分支——
+    /// Read 的摘要变成"文件第一行内容"，和下面展开的详情第一行完全重复。
+    #[test]
+    fn tool_result_summary_matches_pascal_case_tool_names() {
+        let read_output = "1\tfirst line\n2\tsecond line\n";
+        assert_eq!(
+            tool_result_summary("Read", read_output, false),
+            "read 2 lines"
+        );
+        assert_ne!(
+            tool_result_summary("Read", read_output, false),
+            read_output.lines().next().unwrap()
+        );
+
+        assert_eq!(tool_result_summary("Grep", "a\nb\nc\n", false), "3 matches");
+        assert_eq!(tool_result_summary("Glob", "a\nb\n", false), "2 files");
+        assert_eq!(
+            tool_result_summary("WebFetch", "hello", false),
+            "fetched 5 bytes"
+        );
+    }
+
+    #[test]
+    fn tool_display_arg_matches_pascal_case_tool_names() {
+        let input = serde_json::json!({"file_path": "/tmp/x.rs"});
+        assert_eq!(tool_display_arg("Read", &input), "/tmp/x.rs");
+
+        let bash_input = serde_json::json!({"command": "ls -la"});
+        assert_eq!(tool_display_arg("Bash", &bash_input), "ls -la");
+
+        let fetch_input = serde_json::json!({"url": "https://example.com"});
+        assert_eq!(
+            tool_display_arg("WebFetch", &fetch_input),
+            "https://example.com"
+        );
+    }
+}
+
+#[cfg(test)]
+mod up_down_debounce_tests {
+    use super::*;
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    /// 回归测试：部分终端会把鼠标滚轮转译成方向键短时间内连续转发给应用，
+    /// 与真实按键在字节层面完全无法区分；第一下之后、防抖窗口内到达的
+    /// 后续按键必须被判定为"非用户主动"，否则会把输入框翻成历史召回态，
+    /// 干扰用户正在查看的内容。
+    #[test]
+    fn rapid_burst_after_first_press_is_not_deliberate() {
+        let mut state = make_state();
+        assert!(
+            state.is_deliberate_up_down_press(),
+            "第一下必须判定为用户主动按键"
+        );
+        assert!(
+            !state.is_deliberate_up_down_press(),
+            "紧随其后到达的按键应被判定为疑似滚轮转译，不算用户主动"
+        );
+        assert!(
+            !state.is_deliberate_up_down_press(),
+            "防抖窗口内持续到达的按键应持续被吞掉"
+        );
+    }
+
+    /// 间隔明显拉开（超过防抖阈值）后，下一次按键应恢复判定为用户主动。
+    #[test]
+    fn press_after_debounce_window_elapses_is_deliberate_again() {
+        let mut state = make_state();
+        assert!(state.is_deliberate_up_down_press());
+        // 手动把"上次生效时间"往回拨，模拟真实经过了防抖窗口
+        state.last_up_down_key = Some(Instant::now() - Duration::from_millis(200));
+        assert!(
+            state.is_deliberate_up_down_press(),
+            "间隔拉开后应恢复判定为用户主动按键"
+        );
     }
 }
 
@@ -3537,9 +3636,15 @@ pub struct AppState {
     pub plan_dialog: Option<PlanApprovalDialog>,
     /// 检测到计划已批准仍在 plan 模式发消息时的确认对话框
     pub exec_mode_confirm: Option<ExecModeConfirmDialog>,
-    pub scroll_offset: u16,
-    /// 上次渲染的聊天区可见行高（用于按页滚动）
-    pub chat_height: u16,
+    /// 已固化写入终端真实回滚缓冲区（`Terminal::insert_before`）的消息前缀长度：
+    /// `messages[..frozen_up_to]` 不再参与每帧重绘，交由终端原生 scrollback
+    /// 保存（鼠标滚轮/原生选中因此天然可用）。见 `compute_freezable_up_to`。
+    pub frozen_up_to: usize,
+    /// 上一次"聊天区 Up/Down 快捷键"（历史召回/子 Agent 面板导航/光标移动）
+    /// 生效的时间戳，用于防抖识别：部分终端会把鼠标滚轮转译成方向键转发给
+    /// 应用（尤其在打开全屏对话框、进入 alternate screen 时），与真实按键
+    /// 在字节层面完全无法区分。见 `AppState::is_deliberate_up_down_press`。
+    pub last_up_down_key: Option<Instant>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     /// 当前会话实际上下文大小估算（`estimate_tokens(&session.messages)`），
@@ -3611,8 +3716,6 @@ pub struct AppState {
     pub turn_start_input_tokens: u32,
     /// 本轮对话开始时的 output_tokens 快照
     pub turn_start_output_tokens: u32,
-    /// 上次渲染的滚动条区域（保留字段供将来用）
-    pub scrollbar_area: Rect,
     /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
     pub injector: Option<mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>>,
     /// 最近一次粘贴的瞬时提示（在输入框光标处显示）
@@ -3646,6 +3749,57 @@ pub struct AppState {
     pub mcp_connection_status: HashMap<String, McpConnStatus>,
 }
 
+/// 计算 `messages` 中从 `frozen_up_to` 起最多可以安全推进到的新冻结边界
+/// （`messages[..new_bound]` 可以整体 `insert_before` 写入终端真实 scrollback，
+/// 不再参与每帧重绘）。三条阻塞规则，任一命中就停在该位置（不含）：
+///
+/// 1. 该位置是 `ToolCall` 但其 `ToolResult` 尚未出现——并发工具调用可能乱序
+///    完成，`ToolEnd` 会把结果 `insert` 在这条 `ToolCall` 之后，未落定前这一位置
+///    之后的一切都可能被后续插入打乱，不能冻结。
+/// 2. `last_collapsible_tool_result_idx` 命中的位置（及其后）——Ctrl+O 仍需要
+///    能切换到它。
+/// 3. 该位置关联的子 Agent（`sub_agent_id`）仍处于 `Running`——对应 ToolCall/
+///    ToolResult 下面还在画实时状态行，不能冻结。
+///
+/// 返回值只增不减（`max(frozen_up_to)` 兜底），永远不会把已经冻结的内容
+/// "退冻"。
+fn compute_freezable_up_to(
+    messages: &[ChatMessage],
+    frozen_up_to: usize,
+    sub_agents: &std::collections::BTreeMap<u64, SubAgentUiState>,
+) -> usize {
+    let collapsible_bound =
+        crate::render::last_collapsible_tool_result_idx(messages).unwrap_or(messages.len());
+    let mut bound = messages.len().min(collapsible_bound);
+
+    for (i, m) in messages.iter().enumerate().skip(frozen_up_to) {
+        if i >= bound {
+            break;
+        }
+        let sub_agent_running = m
+            .sub_agent_id
+            .and_then(|id| sub_agents.get(&id))
+            .is_some_and(|s| s.status == SubAgentStatus::Running);
+        match m.role {
+            MessageRole::ToolCall => {
+                let resolved = messages[i + 1..].iter().any(|r| {
+                    matches!(r.role, MessageRole::ToolResult) && r.sequence_no == m.sequence_no
+                });
+                if !resolved || sub_agent_running {
+                    bound = bound.min(i);
+                    break;
+                }
+            }
+            MessageRole::ToolResult if sub_agent_running => {
+                bound = bound.min(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    bound.max(frozen_up_to)
+}
+
 impl AppState {
     fn new(
         cwd: PathBuf,
@@ -3672,8 +3826,8 @@ impl AppState {
             ask_question_dialog: None,
             plan_dialog: None,
             exec_mode_confirm: None,
-            scroll_offset: 0,
-            chat_height: 20,
+            frozen_up_to: 0,
+            last_up_down_key: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
             context_tokens: 0,
@@ -3715,7 +3869,6 @@ impl AppState {
             turn_start_time: None,
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
-            scrollbar_area: Rect::default(),
             injector: None,
             paste_hint: None,
             pending_queue: vec![],
@@ -3733,11 +3886,45 @@ impl AppState {
         }
     }
 
+    /// 聊天区 Up/Down 快捷键（历史召回/子 Agent 面板导航/输入框光标移动）的
+    /// 防抖识别：短时间内连续到达的 Up/Down 只让第一下生效，之后的静默吞掉，
+    /// 直到间隔重新拉开。
+    ///
+    /// 背景：部分终端会把鼠标滚轮转译成方向键转发给应用（尤其是打开全屏对话框、
+    /// 进入 alternate screen 期间），这类转译出的按键在字节层面和真实按键完全
+    /// 一样，应用层无法可靠区分。人手动连按的间隔一般明显长于这个阈值，而滚轮
+    /// 转译一次滚动通常连续触发好几下方向键，用这个差异做启发式过滤。
+    ///
+    /// 代价：极快速连按真实方向键（远快于正常手速）时，后续几下也会被吞掉；
+    /// 这是本启发式固有的取舍，不追求 100% 精确。
+    fn is_deliberate_up_down_press(&mut self) -> bool {
+        const DEBOUNCE: Duration = Duration::from_millis(80);
+        let now = Instant::now();
+        let deliberate = self
+            .last_up_down_key
+            .map_or(true, |t| now.duration_since(t) >= DEBOUNCE);
+        self.last_up_down_key = Some(now);
+        deliberate
+    }
+
     /// 是否有仍在运行的子 Agent（驱动 spinner 与底部聚合面板）
     pub fn has_running_sub_agents(&self) -> bool {
         self.sub_agents
             .values()
             .any(|s| s.status == SubAgentStatus::Running)
+    }
+
+    /// 是否有任意一个"重量级"管理对话框打开，需要切到全屏 alternate screen
+    /// 渲染（这些都是用户主动触发的低频 slash 命令，需要比 Inline 常驻区更大的
+    /// 空间；PermissionDialog 高频出现，已降级为底部常驻面板，不在此列）。
+    pub fn wants_fullscreen(&self) -> bool {
+        self.session_picker.is_some()
+            || self.settings_dialog.is_some()
+            || self.profile_dialog.is_some()
+            || self.memory_dialog.is_some()
+            || self.mcp_dialog.is_some()
+            || self.skills_dialog.is_some()
+            || self.plugins_dialog.is_some()
     }
 
     /// 面板可见的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
@@ -4025,7 +4212,6 @@ impl AppState {
                 }
 
                 self.current_todos = Some(items);
-                self.scroll_offset = 0; // 自动滚动到最新任务列表
             }
 
             AgentEvent::AskQuestions {
@@ -4042,7 +4228,6 @@ impl AppState {
             } => {
                 self.messages
                     .push(ChatMessage::bash_output(output, exit_code, elapsed_secs));
-                self.scroll_offset = 0;
             }
 
             AgentEvent::PlanApprovalRequest { plan, response_tx } => {
@@ -4507,6 +4692,11 @@ impl AppState {
     }
 }
 
+/// Inline viewport 初始高度的保守估计（首帧渲染前用，随后主循环每帧都会
+/// 按实际布局需要重新计算并按需重建 Terminal，见 `render::fixed_footer_height`
+/// + `render::pending_chat_visual_height`）。
+const INITIAL_INLINE_HEIGHT: u16 = 12;
+
 /// 启动 TUI 主界面
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
@@ -4535,12 +4725,22 @@ pub async fn run_tui(
     let mut stdout = io::stdout();
     execute!(
         stdout,
-        EnterAlternateScreen,
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
+    // Inline viewport：聊天历史走终端真实 scrollback（鼠标滚轮/原生选中复制
+    // 天然可用，无需 EnableMouseCapture），只有底部输入框+状态行等常驻区每帧
+    // 原地重绘。初始高度是保守估计，tui_main 主循环里每帧都会按实际布局
+    // 需要动态重建（见 INITIAL_INLINE_HEIGHT 的使用处）。Category B 重量级
+    // 管理对话框（/mcp /model 等）打开期间会临时切到 Fullscreen + alternate
+    // screen，关闭后再切回来，见 tui_main 内 wants_fullscreen 分支。
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(INITIAL_INLINE_HEIGHT),
+        },
+    )?;
 
     let result = tui_main(
         &mut terminal,
@@ -4563,6 +4763,9 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
+    // LeaveAlternateScreen 在正常路径下大多是无操作（tui_main 退出前若曾切到
+    // Fullscreen 早已切回 Inline）；退出时若恰好卡在某个 Category B 全屏对话框
+    // 里也是安全兜底——终端对"退出未进入过的 alternate screen"是无害的。
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
@@ -5117,8 +5320,8 @@ fn update_slash_completions(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
-    terminal: &mut Terminal<B>,
+async fn tui_main(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: Agent,
     rebuild_fn: RebuildFn,
     cwd: PathBuf,
@@ -5275,11 +5478,17 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                 "上轮会话计划已批准，继续输入时会提示切换执行模式".to_string(),
             ));
         }
-        state.scroll_offset = 0;
     }
     let session = Arc::new(Mutex::new(init_sess));
 
     let mut last_spinner_advance = Instant::now();
+    // 是否处于 Fullscreen + alternate screen 态（Category B 重量级管理对话框
+    // 打开期间）；ratatui 的 Terminal 没有原地切换 Viewport 变体的公开 API，
+    // 只能整个重建 Terminal，见下方 wants_fullscreen 分支。
+    let mut in_fullscreen = false;
+    // 当前 Inline viewport 高度（仅在 !in_fullscreen 时有意义），用于判断是否
+    // 需要因为布局变化（输入框增高、面板开关等）重建 Terminal。
+    let mut current_inline_height: u16 = INITIAL_INLINE_HEIGHT;
 
     loop {
         // Ctrl+C 首次按下超过 3 秒未确认则重置
@@ -5297,6 +5506,101 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
         {
             state.spinner_frame = (state.spinner_frame + 1) % render::SPINNER_FRAMES.len();
             last_spinner_advance = Instant::now();
+        }
+
+        // Category B 对话框开关转换：整个重建 Terminal 切到/切回 Fullscreen +
+        // alternate screen（复用现有 7 个大型管理面板的渲染代码，它们假设
+        // 拥有整个终端）。只在真正发生"打开/关闭"转换时才重建，避免每帧重建。
+        let wants_fs = state.wants_fullscreen();
+        if wants_fs != in_fullscreen {
+            // 重建前先清掉旧 Terminal 实例在真实终端上留下的内容：新 Terminal
+            // 是全新构造的结构体（`Terminal::with_options`/`Terminal::new`），
+            // 不知道旧视口在屏幕上的位置，直接重建会导致新旧画面重叠/重影。
+            terminal.clear()?;
+            if wants_fs {
+                execute!(io::stdout(), EnterAlternateScreen)?;
+                *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+            } else {
+                execute!(io::stdout(), LeaveAlternateScreen)?;
+                *terminal = Terminal::with_options(
+                    CrosstermBackend::new(io::stdout()),
+                    TerminalOptions {
+                        viewport: Viewport::Inline(current_inline_height),
+                    },
+                )?;
+            }
+            terminal.clear()?;
+            in_fullscreen = wants_fs;
+        }
+
+        if !in_fullscreen {
+            // 冻结已定型的消息前缀进终端真实 scrollback（鼠标滚轮/原生选中
+            // 复制因此天然可用），必须在本帧渲染前进行，这样 draw_chat 才不会
+            // 把刚冻结的这段又画一遍。见 compute_freezable_up_to 的三条阻塞规则。
+            //
+            // 每帧最多冻结 MAX_FLUSH_MESSAGES_PER_FRAME 条，而不是一把冻结到底：
+            // `Terminal::insert_before` 在 viewport 还没被推到屏幕底部前，内部按
+            // "屏幕剩余可推行数"分批写入终端，条数一多（典型场景：--resume/-c
+            // 恢复几十上百条历史消息）单次调用会阻塞主循环好几秒甚至更久，
+            // 表现为界面一直空白、像是卡死。分批处理让每帧只推进一小步，中间
+            // 照常 draw()+收事件，界面会连续可见地滚动而不是长时间无响应。
+            const MAX_FLUSH_MESSAGES_PER_FRAME: usize = 20;
+            let freezable =
+                compute_freezable_up_to(&state.messages, state.frozen_up_to, &state.sub_agents);
+            let freezable = freezable.min(state.frozen_up_to + MAX_FLUSH_MESSAGES_PER_FRAME);
+            if freezable > state.frozen_up_to {
+                let term_size = terminal.size()?;
+                let max_content_width = term_size.width.saturating_sub(4) as usize;
+                let mut is_first_user = state.frozen_up_to == 0;
+                let flush_lines = render::render_message_range(
+                    &state.messages,
+                    state.frozen_up_to..freezable,
+                    max_content_width,
+                    &state.sub_agents,
+                    state.spinner_frame,
+                    &mut is_first_user,
+                );
+                if !flush_lines.is_empty() {
+                    let n = flush_lines.len() as u16;
+                    terminal.insert_before(n, |buf| {
+                        Paragraph::new(Text::from(flush_lines))
+                            .wrap(Wrap { trim: false })
+                            .render(buf.area, buf);
+                    })?;
+                }
+                state.frozen_up_to = freezable;
+            }
+
+            // 按当前布局需要动态调整 Inline viewport 高度（输入框行数变化、
+            // 底部面板/补全列表开关、待渲染聊天尾部长度变化等都会触发）。
+            //
+            // 曾经尝试过让 Inline viewport 直接撑到贴近终端整高（让输入框永远
+            // 固定在屏幕最下方，对齐 Claude Code），但实测在构造一个接近整个
+            // 屏幕高的 Inline viewport 时，ratatui 内部依赖的终端光标位置查询
+            // 有相当概率（tmux 下实测经常超过一半）出现内部状态完全一致但
+            // 视觉渲染错位的情况——不只是贴不到底部，更严重时用户刚打的字会
+            // 整个不可见（逻辑上已正确收到并可以正常发送，只是没画出来），
+            // 这是比"没贴底"更严重的问题。已确认这不是本项目代码能修的 bug
+            // （用完全相同的输入在 ratatui+crossterm 的最小复现示例里也能独立
+            // 复现），所以退回按内容实际需要动态定高——牺牲"输入框始终贴住
+            // 终端最底部"这个视觉效果，换取稳定可靠的渲染。
+            let term_size = terminal.size()?;
+            let footer_fixed =
+                render::fixed_footer_height(&state, &input, term_size.width, term_size.height);
+            let chat_h = render::pending_chat_visual_height(&state, term_size.width)
+                .clamp(3, (term_size.height * 7 / 10).max(3));
+            let desired_height = (footer_fixed + chat_h).min(term_size.height).max(1);
+            if desired_height != current_inline_height {
+                // 重建前先清掉旧视口内容，避免新旧画面重叠。
+                terminal.clear()?;
+                *terminal = Terminal::with_options(
+                    CrosstermBackend::new(io::stdout()),
+                    TerminalOptions {
+                        viewport: Viewport::Inline(desired_height),
+                    },
+                )?;
+                current_inline_height = desired_height;
+            }
         }
 
         terminal.draw(|f| render::draw(f, &mut state, &input))?;
@@ -5641,7 +5945,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     state.total_output_tokens = file.output_tokens;
                                                     state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
-                                                    state.scroll_offset = 0;
+                                                    state.frozen_up_to = 0;
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已切换至会话 {}  共 {} 轮对话",
@@ -7362,7 +7666,6 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                     } else if key.code == KeyCode::Enter && !state.is_thinking {
                         if !input.is_empty() {
                             let text = input.take();
-                            state.scroll_offset = 0;
                             state.slash_completions.clear();
                             state.file_completions.clear();
                             state.history_idx = None;
@@ -7765,7 +8068,7 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                     state.total_output_tokens = file.output_tokens;
                                                     state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
-                                                    state.scroll_offset = 0;
+                                                    state.frozen_up_to = 0;
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已恢复会话 {}  共 {} 轮对话",
@@ -7918,88 +8221,79 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                 state.pending_attachments = attachments;
                             }
                         }
-                    } else if key.code == KeyCode::PageUp {
-                        let step = state.chat_height.max(3);
-                        state.scroll_offset = state.scroll_offset.saturating_add(step);
-                    } else if key.code == KeyCode::PageDown {
-                        let step = state.chat_height.max(3);
-                        state.scroll_offset = state.scroll_offset.saturating_sub(step);
-                    } else if key.code == KeyCode::Home
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        // Ctrl+Home：跳到最顶（render 内 clamp 到 max_scroll）
-                        state.scroll_offset = u16::MAX;
-                    } else if key.code == KeyCode::End
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        // Ctrl+End：跳到最底（最新消息）
-                        state.scroll_offset = 0;
                     } else if key.code == KeyCode::Up {
                         // ① 输入框空 + 面板有子 Agent → 选中/滚动详情，优先级不变
                         // ② 光标在首行（含空输入/单行）= 边界 → 历史导航整体替换
                         // ③ 光标在多行内容非首行 → 纯光标移动
-                        // 注：不再开启 EnableMouseCapture（会导致终端原生鼠标选中/复制失效），
-                        // 鼠标滚轮在多数终端下会被翻译为方向键转发到这里，与上述规则一并处理。
-                        if !state.sub_agents.is_empty()
-                            && input.is_empty()
-                            && state.slash_completions.is_empty()
-                        {
-                            if state.sub_agent_detail_open {
-                                state.sub_agent_detail_scroll =
-                                    state.sub_agent_detail_scroll.saturating_add(3);
-                            } else {
-                                move_sub_agent_selection(&mut state, -1);
-                            }
-                        } else if state.slash_completions.is_empty() && input.cursor_row == 0 {
-                            if !state.is_thinking && !state.input_history.is_empty() {
-                                if state.history_idx.is_none() {
-                                    state.history_draft = Some(input.lines.join("\n"));
+                        // 注：聊天历史翻页已交还给终端自身原生 scrollback（不再开
+                        // EnableMouseCapture，也不再截获 PageUp/PageDown/Ctrl+Home/End）；
+                        // 部分终端仍会把鼠标滚轮转译成方向键转发过来，短时间连续到达时
+                        // is_deliberate_up_down_press 会过滤掉，避免打断输入历史导航。
+                        if state.is_deliberate_up_down_press() {
+                            if !state.sub_agents.is_empty()
+                                && input.is_empty()
+                                && state.slash_completions.is_empty()
+                            {
+                                if state.sub_agent_detail_open {
+                                    state.sub_agent_detail_scroll =
+                                        state.sub_agent_detail_scroll.saturating_add(3);
+                                } else {
+                                    move_sub_agent_selection(&mut state, -1);
                                 }
-                                let hist_len = state.input_history.len();
-                                let new_idx = match state.history_idx {
-                                    None => hist_len - 1,
-                                    Some(i) => i.saturating_sub(1),
-                                };
-                                state.history_idx = Some(new_idx);
-                                let recalled = state.input_history[new_idx].clone();
-                                input.set_text(&recalled);
+                            } else if state.slash_completions.is_empty() && input.cursor_row == 0 {
+                                if !state.is_thinking && !state.input_history.is_empty() {
+                                    if state.history_idx.is_none() {
+                                        state.history_draft = Some(input.lines.join("\n"));
+                                    }
+                                    let hist_len = state.input_history.len();
+                                    let new_idx = match state.history_idx {
+                                        None => hist_len - 1,
+                                        Some(i) => i.saturating_sub(1),
+                                    };
+                                    state.history_idx = Some(new_idx);
+                                    let recalled = state.input_history[new_idx].clone();
+                                    input.set_text(&recalled);
+                                }
+                                // is_thinking 中或无历史记录 → 无操作，不 fallback 到滚动会话
+                            } else if state.slash_completions.is_empty() {
+                                input.move_cursor_up();
                             }
-                            // is_thinking 中或无历史记录 → 无操作，不 fallback 到滚动会话
-                        } else if state.slash_completions.is_empty() {
-                            input.move_cursor_up();
                         }
                     } else if key.code == KeyCode::Down {
                         // 对称逻辑，见上方 Up 分支注释
-                        if !state.sub_agents.is_empty()
-                            && input.is_empty()
-                            && state.slash_completions.is_empty()
-                        {
-                            if state.sub_agent_detail_open {
-                                state.sub_agent_detail_scroll =
-                                    state.sub_agent_detail_scroll.saturating_sub(3);
-                            } else {
-                                move_sub_agent_selection(&mut state, 1);
-                            }
-                        } else if state.slash_completions.is_empty()
-                            && input.cursor_row + 1 == input.lines.len()
-                        {
-                            if !state.is_thinking {
-                                if let Some(idx) = state.history_idx {
-                                    if idx + 1 < state.input_history.len() {
-                                        let new_idx = idx + 1;
-                                        state.history_idx = Some(new_idx);
-                                        let recalled = state.input_history[new_idx].clone();
-                                        input.set_text(&recalled);
-                                    } else {
-                                        // 超出历史末尾 → 退出导航态，恢复进入导航前的草稿
-                                        state.history_idx = None;
-                                        let draft = state.history_draft.take().unwrap_or_default();
-                                        input.set_text(&draft);
+                        if state.is_deliberate_up_down_press() {
+                            if !state.sub_agents.is_empty()
+                                && input.is_empty()
+                                && state.slash_completions.is_empty()
+                            {
+                                if state.sub_agent_detail_open {
+                                    state.sub_agent_detail_scroll =
+                                        state.sub_agent_detail_scroll.saturating_sub(3);
+                                } else {
+                                    move_sub_agent_selection(&mut state, 1);
+                                }
+                            } else if state.slash_completions.is_empty()
+                                && input.cursor_row + 1 == input.lines.len()
+                            {
+                                if !state.is_thinking {
+                                    if let Some(idx) = state.history_idx {
+                                        if idx + 1 < state.input_history.len() {
+                                            let new_idx = idx + 1;
+                                            state.history_idx = Some(new_idx);
+                                            let recalled = state.input_history[new_idx].clone();
+                                            input.set_text(&recalled);
+                                        } else {
+                                            // 超出历史末尾 → 退出导航态，恢复进入导航前的草稿
+                                            state.history_idx = None;
+                                            let draft =
+                                                state.history_draft.take().unwrap_or_default();
+                                            input.set_text(&draft);
+                                        }
                                     }
                                 }
+                            } else if state.slash_completions.is_empty() {
+                                input.move_cursor_down();
                             }
-                        } else if state.slash_completions.is_empty() {
-                            input.move_cursor_down();
                         }
                     } else if key.code == KeyCode::Backspace {
                         if key.modifiers.contains(KeyModifiers::ALT) {
@@ -8056,7 +8350,10 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                     update_file_completions(&mut state, &input, &cwd);
                                 }
                                 'l' => {
-                                    state.scroll_offset = 0;
+                                    // Ctrl+L：对齐大多数 shell/终端的"清屏重绘"语义
+                                    // （聊天历史现在住在终端真实 scrollback 里，不再有
+                                    // 应用内部的"滚到底部"概念）。
+                                    let _ = terminal.clear();
                                 }
                                 'o' => {
                                     // Ctrl+O — 展开/折叠最后一条「可折叠」工具结果（对齐 Claude Code）
@@ -8202,6 +8499,12 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
 fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
     let mut result = Vec::new();
     let mut tool_seq = 0usize;
+    // tool_use_id → 分配给该 ToolCall 的 seq，供同一助手回合内并行工具调用各自
+    // 找到自己的 ToolResult（不能像以前那样直接复用循环里"当前"的 tool_seq——
+    // 一个回合有多个并行调用时，所有 ToolResult 会被错误地全部对应到最后一个
+    // 调用的 seq，导致其余调用在 compute_freezable_up_to 眼里"永远没有结果"，
+    // 冻结进度卡死在那里，--resume/-c 恢复大会话时表现为界面长时间空白）。
+    let mut seq_by_tool_use_id: HashMap<String, usize> = HashMap::new();
 
     for msg in messages {
         match &msg.role {
@@ -8214,7 +8517,9 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                             has_text = true;
                         }
                         ContentBlock::ToolResult {
-                            content, is_error, ..
+                            tool_use_id,
+                            content,
+                            is_error,
                         } => {
                             let text = match content {
                                 ToolResultContent::Text(s) => s.clone(),
@@ -8228,11 +8533,12 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                                 .next()
                                 .map(|l| l.trim().to_string())
                                 .unwrap_or_default();
+                            let seq = seq_by_tool_use_id.get(tool_use_id).copied().unwrap_or(0);
                             result.push(ChatMessage::tool_result(
                                 text,
                                 *is_error,
                                 0.0,
-                                tool_seq,
+                                seq,
                                 String::new(),
                                 summary,
                             ));
@@ -8247,13 +8553,14 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } => text_buf.push_str(text),
-                        ContentBlock::ToolUse { name, .. } => {
+                        ContentBlock::ToolUse { id, name, .. } => {
                             if !text_buf.trim().is_empty() {
                                 result.push(ChatMessage::assistant(std::mem::take(&mut text_buf)));
                             } else {
                                 text_buf.clear();
                             }
                             tool_seq += 1;
+                            seq_by_tool_use_id.insert(id.clone(), tool_seq);
                             result.push(ChatMessage::tool_call(name.clone(), tool_seq));
                         }
                         _ => {}
@@ -8266,6 +8573,82 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod reconstruct_display_tests {
+    use super::*;
+
+    /// 回归测试：一个助手回合里有多个并行工具调用时，`reconstruct_display`
+    /// 曾经用循环里"当前"的 tool_seq 给所有 ToolResult 赋值——多个并行调用的
+    /// 结果会全部错误地对应到最后一个调用的 seq，导致除最后一个以外的
+    /// ToolCall 永远找不到自己的 ToolResult。这在 compute_freezable_up_to
+    /// 眼里等价于"工具调用永远未落定"，会让冻结进度永久卡在那里，
+    /// --resume/--continue 恢复带并行工具调用的历史会话时表现为界面卡住。
+    /// 现在改用 tool_use_id 精确配对，每个调用都应该找到自己的结果。
+    #[test]
+    fn parallel_tool_calls_get_distinct_matching_sequence_numbers() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::ToolUse {
+                        id: "call-a".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"file_path": "a.rs"}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call-b".to_string(),
+                        name: "Read".to_string(),
+                        input: serde_json::json!({"file_path": "b.rs"}),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call-a".to_string(),
+                        content: ToolResultContent::Text("content-a".to_string()),
+                        is_error: false,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "call-b".to_string(),
+                        content: ToolResultContent::Text("content-b".to_string()),
+                        is_error: false,
+                    },
+                ],
+            },
+        ];
+
+        let display = reconstruct_display(&messages);
+        let roles: Vec<_> = display.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                MessageRole::ToolCall,
+                MessageRole::ToolCall,
+                MessageRole::ToolResult,
+                MessageRole::ToolResult,
+            ]
+        );
+
+        // 每条 ToolResult 的 sequence_no 必须匹配它自己 ToolCall 的 sequence_no，
+        // 而不是两条结果都指向同一个（比如最后一个）调用的 seq。
+        let call_a_seq = display[0].sequence_no;
+        let call_b_seq = display[1].sequence_no;
+        assert_ne!(call_a_seq, call_b_seq, "两个并行调用必须分配不同的 seq");
+        assert_eq!(display[2].sequence_no, call_a_seq);
+        assert_eq!(display[2].content, "content-a");
+        assert_eq!(display[3].sequence_no, call_b_seq);
+        assert_eq!(display[3].content, "content-b");
+
+        // 用真正的冻结判定复演一遍：修复前这里会永久卡在下标 0（call-a 找不到
+        // 自己的结果），修复后应该能一路冻结到底。
+        let sub_agents = std::collections::BTreeMap::new();
+        let bound = compute_freezable_up_to(&display, 0, &sub_agents);
+        assert_eq!(bound, display.len());
+    }
 }
 
 #[cfg(test)]
@@ -8728,5 +9111,106 @@ mod tool_event_ordering_tests {
         // call-2 的结果紧跟 call-2 自己的调用。
         assert_eq!(state.messages[1].content, "content-a");
         assert_eq!(state.messages[3].content, "content-b");
+    }
+
+    /// 没有任何工具调用时，纯文本消息应该可以整体冻结（推进到列表末尾）。
+    #[test]
+    fn freezable_up_to_advances_past_plain_messages() {
+        let mut state = make_state();
+        state.messages.push(ChatMessage::user("hi".to_string()));
+        state
+            .messages
+            .push(ChatMessage::assistant("hello".to_string()));
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        assert_eq!(bound, 2);
+    }
+
+    /// 并发批次里只要还有一个 ToolCall 没等到自己的 ToolResult，冻结边界必须
+    /// 停在它这里，不能越过——否则乱序到达的 ToolResult 就没法再插到正确位置。
+    #[test]
+    fn freezable_up_to_stops_before_unresolved_tool_call() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "a.rs"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-2".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "b.rs"}),
+        });
+        // 只有 call-1 落定，call-2 仍未完成
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: "content-a".to_string(),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+        // messages = [ToolCall(call-1), ToolResult(call-1), ToolCall(call-2)]
+        // call-2 在下标 2，尚未落定，冻结边界必须停在 2。
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        assert_eq!(bound, 2);
+
+        // call-2 落定后，整批都可以冻结了
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-2".to_string(),
+            output: "content-b".to_string(),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        assert_eq!(bound, state.messages.len());
+    }
+
+    /// 关联的子 Agent 仍在 Running 状态时，其 ToolCall/ToolResult 不可冻结，
+    /// 即使工具调用本身已经"完成"（结果已经插入列表）。
+    #[test]
+    fn freezable_up_to_blocks_on_running_sub_agent() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Agent".to_string(),
+            input_json: serde_json::json!({"subagent_type": "general-purpose", "prompt": "do x"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: "started".to_string(),
+            is_error: false,
+            elapsed_secs: 0.0,
+        });
+        let call_idx = state
+            .messages
+            .iter()
+            .position(|m| matches!(m.role, MessageRole::ToolCall))
+            .unwrap();
+        state.messages[call_idx].sub_agent_id = Some(1);
+        state.sub_agents.insert(
+            1,
+            SubAgentUiState {
+                agent_type: "general-purpose".to_string(),
+                description: "do x".to_string(),
+                background: false,
+                status: SubAgentStatus::Running,
+                started_at: std::time::Instant::now(),
+                final_elapsed: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                tool_calls: 0,
+                current_tool: None,
+                tool_log: vec![],
+                has_result: false,
+                finished_at: None,
+                final_result: None,
+            },
+        );
+
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        assert_eq!(bound, call_idx);
+
+        // 子 Agent 结束后恢复可冻结
+        state.sub_agents.get_mut(&1).unwrap().status = SubAgentStatus::Done;
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        assert_eq!(bound, state.messages.len());
     }
 }
