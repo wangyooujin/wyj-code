@@ -75,6 +75,14 @@ impl Tool for WriteTool {
         true
     }
 
+    fn action_summary(&self, input: &Value) -> String {
+        input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
         let path = resolve_path(ctx.cwd(), &inp.file_path);

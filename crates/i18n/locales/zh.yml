@@ -94,6 +94,9 @@ help:
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
     - `/init` — 让 Agent 探索项目并生成/合并更新 CLAUDE.md
+    - `/bug [简述]` — 在浏览器打开本仓库 GitHub issue 页并预填环境信息（零依赖）
+    - `/review [PR编号]` — 拉取 PR diff 交给 Agent 审查（需已安装 gh CLI）
+    - `/pr-comments [PR编号]` — 查看指定 PR 的评论（需已安装 gh CLI）
     - `/quit` — 退出 wyj-code
 
     ---
@@ -424,13 +427,38 @@ resume:
 sessions:
   desc: "查看和切换历史会话"
 
+gh:
+  missing: "未检测到 gh (GitHub CLI)。请先安装：https://cli.github.com/ ，并运行 `gh auth login` 完成登录后重试。"
+
+bug:
+  desc: "在浏览器打开本仓库 GitHub issue 页并预填环境信息"
+  no_remote: "未找到 GitHub origin 远程仓库，无法定位 issue 页面。请确认当前目录是一个带 github.com origin 的 git 仓库。"
+  opened: "已在浏览器打开新建 issue 页面（已预填环境信息）。若未自动打开，可手动访问：\n{url}"
+  manual: "无法自动打开浏览器，请手动访问以下地址新建 issue：\n{url}"
+
+review:
+  desc: "拉取 PR diff 交给 Agent 审查（需 gh CLI）"
+  failed: "获取 PR diff 失败：{err}\n请确认当前分支已有对应 PR，或用 `/review <PR编号>` 指定。"
+  agent_prompt: |-
+    请以资深工程师的视角审查下面这个 Pull Request 的 diff。
+    重点关注：正确性缺陷、边界条件与错误处理、安全与性能问题、以及可维护性。
+    请按严重程度排序，给出具体到文件与行的、可执行的反馈；对确有问题处说明触发场景。
+
+    ```diff
+    {diff}
+    ```
+
+prcomments:
+  desc: "查看指定 PR 的评论（需 gh CLI）"
+  failed: "获取 PR 评论失败：{err}\n请确认当前分支已有对应 PR，或用 `/pr-comments <PR编号>` 指定。"
+
 quit:
   desc: "退出 wyj-code"
 
 dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
-  permission_hint: "  [y] 本次允许  [s] Session 允许  [p] 永久允许  [n] 拒绝"
+  permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "
   ask_question_other_label: "其他…"

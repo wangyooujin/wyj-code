@@ -283,8 +283,10 @@ pub(crate) fn format_hms(secs: f64) -> String {
 #[derive(Debug)]
 pub struct PermissionDialog {
     pub tool_name: String,
-    pub input_preview: String,
-    pub tx_id: String,
+    /// 操作摘要（bash 命令 / 目标文件），展示在对话框正文
+    pub action_summary: String,
+    /// 决策回传通道（AllowOnce / AllowAlways / Deny）
+    pub response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
 }
 
 /// 单题当前"进行中"的作答状态（未确认，随光标/勾选实时变化）
@@ -3571,8 +3573,6 @@ pub struct AppState {
     pub history_idx: Option<usize>,
     /// 进入历史导航态之前用户正在编辑的草稿快照（Down 翻回最新之后恢复用）
     pub history_draft: Option<String>,
-    /// 本 Session 已授权的工具（按 s 键授权）
-    pub session_allowed: HashSet<String>,
     /// 当前任务列表快照（TodoWrite 更新），用于底部固定面板渲染
     pub current_todos: Option<Vec<TodoItem>>,
     /// 任务面板是否处于展开态（仅在 is_todo_collapsible 为真时生效）
@@ -3695,7 +3695,6 @@ impl AppState {
             input_history: vec![],
             history_idx: None,
             history_draft: None,
-            session_allowed: HashSet::new(),
             current_todos: None,
             todo_panel_expanded: false,
             todo_stats: HashMap::new(),
@@ -3772,7 +3771,9 @@ impl AppState {
             self.flush_streaming();
             self.is_thinking = false;
         }
-        self.permission_dialog = None;
+        if let Some(dlg) = self.permission_dialog.take() {
+            let _ = dlg.response_tx.send(wyj_tools::PermissionDecision::Deny);
+        }
         if let Some(dlg) = self.ask_question_dialog.take() {
             let _ = dlg.response_tx.send(None);
         }
@@ -3895,15 +3896,15 @@ impl AppState {
                 }
             }
 
-            AgentEvent::PermissionRequest {
+            AgentEvent::ToolPermissionRequest {
                 tool_name,
-                input_preview,
-                tx_id,
+                action_summary,
+                response_tx,
             } => {
                 self.permission_dialog = Some(PermissionDialog {
                     tool_name,
-                    input_preview,
-                    tx_id,
+                    action_summary,
+                    response_tx,
                 });
             }
 
@@ -4824,6 +4825,10 @@ fn spawn_agent_turn(
         let mut ctx = ToolCtx::new(&ctx_cwd);
         ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+        // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
+        if let Ok(config_base) = wyj_config::config_dir() {
+            ctx.load_allowed_tools(&config_base);
+        }
         let turn_agent = plan_turn_agent(&agent_c, &current_mode);
         let tx2 = tx.clone();
         let mut on_text = move |d: &str| {
@@ -4874,6 +4879,7 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "Glob",
                 "Grep",
                 "WebFetch",
+                "WebSearch",
                 "AskQuestion",
                 "Bash",         // 只读命令，由 system prompt 约束
                 "BashOutput",   // 后台任务输出读取（纯读）
@@ -5399,6 +5405,17 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                 }
                 Ok(UiAskRequest::ExitPlanMode { plan, response_tx }) => {
                     state.apply_agent_event(AgentEvent::PlanApprovalRequest { plan, response_tx });
+                }
+                Ok(UiAskRequest::ToolPermission {
+                    tool_name,
+                    action_summary,
+                    response_tx,
+                }) => {
+                    state.apply_agent_event(AgentEvent::ToolPermissionRequest {
+                        tool_name,
+                        action_summary,
+                        response_tx,
+                    });
                 }
                 Err(_) => break,
             }
@@ -7145,53 +7162,38 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                         continue;
                     }
 
-                    // ③ 权限对话框拦截（分级授权）
+                    // ③ 逐调用工具权限确认拦截：y/Enter=允许一次，a=始终允许，
+                    //    d/Esc/其它=拒绝。决策经 oneshot 回传给挂起的 Agent 回合。
                     if state.permission_dialog.is_some() {
-                        match key.code {
+                        use wyj_tools::PermissionDecision;
+                        let decision = match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                let dlg = state.permission_dialog.take().unwrap();
-                                state.messages.push(ChatMessage::tool_result(
-                                    String::new(),
-                                    false,
-                                    0.0,
-                                    0,
-                                    dlg.tool_name.clone(),
-                                    format!("allowed {}", dlg.tool_name),
-                                ));
+                                Some(PermissionDecision::AllowOnce)
                             }
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
-                                let dlg = state.permission_dialog.take().unwrap();
-                                state.session_allowed.insert(dlg.tool_name.clone());
-                                state.messages.push(ChatMessage::tool_result(
-                                    String::new(),
-                                    false,
-                                    0.0,
-                                    0,
-                                    dlg.tool_name.clone(),
-                                    format!("allowed {} (session)", dlg.tool_name),
-                                ));
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                Some(PermissionDecision::AllowAlways)
                             }
-                            KeyCode::Char('p') | KeyCode::Char('P') => {
-                                let dlg = state.permission_dialog.take().unwrap();
-                                state.messages.push(ChatMessage::tool_result(
-                                    String::new(),
-                                    false,
-                                    0.0,
-                                    0,
-                                    dlg.tool_name.clone(),
-                                    format!("always allowed {}", dlg.tool_name),
-                                ));
-                            }
-                            _ => {
-                                let dlg = state.permission_dialog.take().unwrap();
-                                state.messages.push(ChatMessage::tool_result(
-                                    String::new(),
-                                    true,
-                                    0.0,
-                                    0,
-                                    dlg.tool_name.clone(),
-                                    format!("denied {}", dlg.tool_name),
-                                ));
+                            KeyCode::Char('d')
+                            | KeyCode::Char('D')
+                            | KeyCode::Char('n')
+                            | KeyCode::Char('N')
+                            | KeyCode::Esc => Some(PermissionDecision::Deny),
+                            _ => None,
+                        };
+                        if let Some(decision) = decision {
+                            if let Some(dlg) = state.permission_dialog.take() {
+                                let _ = dlg.response_tx.send(decision);
+                                if decision == PermissionDecision::AllowAlways {
+                                    state.messages.push(ChatMessage::system(format!(
+                                        "已始终允许工具 `{}`（已记入本项目）。",
+                                        dlg.tool_name
+                                    )));
+                                } else if decision == PermissionDecision::Deny {
+                                    state.messages.push(ChatMessage::system(format!(
+                                        "已拒绝工具 `{}` 的执行。",
+                                        dlg.tool_name
+                                    )));
+                                }
                             }
                         }
                         continue;
@@ -7623,7 +7625,13 @@ async fn tui_main<B: ratatui::backend::Backend + std::io::Write>(
                                                 "请等待当前任务完成后再切换会话。".to_string(),
                                             ));
                                         } else if let Some(store) = &session_store {
-                                            match store.list() {
+                                            // 按项目隔离：只列当前项目（git 仓库根）的会话
+                                            match store.list_for_project(&state.cwd) {
+                                                Ok(sessions) if sessions.is_empty() => {
+                                                    state.messages.push(ChatMessage::assistant(
+                                                        "当前项目还没有历史会话。".to_string(),
+                                                    ));
+                                                }
                                                 Ok(sessions) => {
                                                     state.session_picker =
                                                         Some(SessionPickerState {
