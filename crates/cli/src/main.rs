@@ -201,7 +201,10 @@ async fn main() -> Result<()> {
             (id.clone(), msgs)
         }
         (None, true) => {
-            let last = session_store.as_ref().and_then(|s| s.last().ok().flatten());
+            // 按项目隔离：-c 恢复「当前项目」最近会话，而非全局最新
+            let last = session_store
+                .as_ref()
+                .and_then(|s| s.last_for_project(&cwd).ok().flatten());
             match last {
                 Some(meta) => {
                     let msgs = session_store
@@ -299,6 +302,7 @@ async fn main() -> Result<()> {
                 "Glob",
                 "Grep",
                 "WebFetch",
+                "WebSearch",
                 "AskQuestion",
                 "Write",
                 "Bash",
@@ -319,6 +323,11 @@ async fn main() -> Result<()> {
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
     registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
     registry.register_arc(Arc::new(AskQuestionTool::new()));
+
+    // WebSearch：仅当配置了搜索 API Key 时注册（否则模型看不到该工具，避免误调）
+    if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
+        registry.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
+    }
 
     // --plugin-dir：临时加载本地开发插件（不落盘、不经过 marketplace/lockfile，
     // 仅当次进程生效），与 TUI「添加本地插件」的持久化路径是两条独立路径。
@@ -711,6 +720,9 @@ async fn main() -> Result<()> {
             let mut reg = ToolRegistry::standard();
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
             reg.register_arc(Arc::new(AskQuestionTool::new()));
+            if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
+                reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
+            }
             // 用重建时的最新配置构建子 Agent 工厂，保证 Profile 变更即时生效
             let sub_factory = make_sub_agent_factory(cfg.clone(), claude_md_for_rebuild.clone());
             reg.register_arc(Arc::new(SubAgentTool::new(

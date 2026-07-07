@@ -95,6 +95,9 @@ help:
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
     - `/init` — Have the Agent explore the project and generate/merge CLAUDE.md
+    - `/bug [summary]` — Open this repo's GitHub new-issue page prefilled with env info (no deps)
+    - `/review [PR#]` — Fetch a PR diff and have the Agent review it (requires gh CLI)
+    - `/pr-comments [PR#]` — View comments on a PR (requires gh CLI)
     - `/quit` — Quit wyj-code
 
     ---
@@ -426,13 +429,38 @@ resume:
 sessions:
   desc: "View and switch between past sessions"
 
+gh:
+  missing: "gh (GitHub CLI) not found. Install it from https://cli.github.com/ and run `gh auth login`, then retry."
+
+bug:
+  desc: "Open this repo's GitHub new-issue page prefilled with env info"
+  no_remote: "No GitHub origin remote found, cannot locate the issue page. Make sure this directory is a git repo with a github.com origin."
+  opened: "Opened the new-issue page in your browser (env info prefilled). If it didn't open, visit:\n{url}"
+  manual: "Could not open a browser automatically. Open this URL to file an issue:\n{url}"
+
+review:
+  desc: "Fetch a PR diff and have the Agent review it (requires gh CLI)"
+  failed: "Failed to fetch PR diff: {err}\nMake sure the current branch has a PR, or pass `/review <PR#>`."
+  agent_prompt: |-
+    Please review the following Pull Request diff as a senior engineer.
+    Focus on: correctness bugs, edge cases and error handling, security and performance, and maintainability.
+    Rank findings by severity and give concrete, actionable feedback down to file and line; for real issues, state the triggering scenario.
+
+    ```diff
+    {diff}
+    ```
+
+prcomments:
+  desc: "View comments on a PR (requires gh CLI)"
+  failed: "Failed to fetch PR comments: {err}\nMake sure the current branch has a PR, or pass `/pr-comments <PR#>`."
+
 quit:
   desc: "Quit wyj-code"
 
 dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
-  permission_hint: "  [y] Allow once  [s] Allow for session  [p] Always allow  [n] Deny"
+  permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "
   ask_question_other_label: "Other…"

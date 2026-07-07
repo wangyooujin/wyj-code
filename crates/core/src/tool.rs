@@ -89,6 +89,12 @@ pub trait ToolContext: Send + Sync {
     async fn exit_plan_mode(&self, _plan: &str) -> bool {
         true
     }
+    /// 逐调用工具权限确认：在执行一个 `needs_permission` 的工具前调用，
+    /// 返回 true 表示放行、false 表示用户拒绝。`summary` 为展示给用户的操作摘要
+    /// （如 bash 命令、目标文件）。默认放行（headless / 子 Agent 无 UI 时不阻塞）。
+    async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
+        true
+    }
 }
 
 /// 工具抽象
@@ -98,6 +104,11 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn needs_permission(&self, _input: &Value) -> bool {
         false
+    }
+    /// 权限确认对话框正文里展示的操作摘要（如 bash 命令、目标文件路径）。
+    /// 默认回工具名；`needs_permission` 为 true 的工具应覆盖以给出更具体的内容。
+    fn action_summary(&self, _input: &Value) -> String {
+        self.name().to_string()
     }
     /// 同一轮 assistant 消息里的多个此工具调用是否可以并发执行。
     /// 默认 false（顺序执行）；SubAgent 等自身即独立任务的工具返回 true。

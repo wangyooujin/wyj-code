@@ -17,6 +17,8 @@ pub const GREP: &str = "Searches file contents with a regular expression. Respec
 
 pub const WEBFETCH: &str = "Fetches a URL and converts the page to plain text (HTML tags stripped, capped at 50KB). Good for docs, READMEs, and API references. Cannot execute JavaScript, so client-rendered pages may come back empty. Can run in parallel with other read-only calls.";
 
+pub const WEBSEARCH: &str = "Searches the web and returns the top results (title, URL, and a short snippet) plus a synthesized answer when available. Use it for current events, up-to-date facts, library/API docs, or anything beyond your training cutoff; follow up with WebFetch to read a specific result in full. Can run in parallel with other read-only calls.";
+
 pub const TODO_WRITE: &str = "Creates or replaces the structured task list shown to the user. Call it for multi-step tasks (3+ steps): once up front to plan, then again on every status change. Each call replaces the whole list, so always pass every item. Keep exactly one item in_progress at a time; mark items completed immediately when done, never in batches. status: pending | in_progress | completed; priority (optional): high | medium | low.";
 
 pub const ASK_QUESTION: &str = "Presents the user a structured questionnaire (1-4 questions, each with 2-4 options) and waits for their answers. Use it only at genuine decision points — ambiguous requirements or choices only the user can make. Do not use it for anything you can resolve yourself from the code or sensible defaults. An \"Other\" free-text option is appended to every question automatically.";
@@ -48,3 +50,6 @@ pub const FIELD_GREP_PATTERN: &str = "Regular expression to search for";
 pub const FIELD_GREP_PATH: &str =
     "File or directory to search in (defaults to the working directory)";
 pub const FIELD_WEBFETCH_URL: &str = "The URL to fetch (http/https)";
+
+pub const FIELD_WEBSEARCH_QUERY: &str =
+    "The search query. Prefer specific, keyword-rich queries over full sentences.";

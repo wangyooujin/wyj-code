@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wyj_api::types::{ContentBlock, Message, Role};
 
 /// 持久化到磁盘的完整会话数据
@@ -100,6 +100,22 @@ impl SessionStore {
     pub fn last(&self) -> Result<Option<SessionMeta>> {
         Ok(self.list()?.into_iter().next())
     }
+
+    /// 列出属于 `cwd` 所在项目（git 仓库根，非 git 回退 cwd）的会话，时间倒序。
+    /// 会话按项目隔离：不同仓库互不可见，同仓库不同子目录视为同一项目。
+    pub fn list_for_project(&self, cwd: &Path) -> Result<Vec<SessionMeta>> {
+        let target = crate::project::project_key(cwd);
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|m| crate::project::project_key(Path::new(&m.cwd)) == target)
+            .collect())
+    }
+
+    /// 返回当前项目最近一次会话（供 `-c/--continue` 恢复当前项目而非全局最新）。
+    pub fn last_for_project(&self, cwd: &Path) -> Result<Option<SessionMeta>> {
+        Ok(self.list_for_project(cwd)?.into_iter().next())
+    }
 }
 
 /// 从消息列表中提取会话标题（第一条 user 文字消息，截取 60 字符）
@@ -144,4 +160,61 @@ pub fn extract_preview(messages: &[Message]) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_file(id: &str, cwd: &Path, ts: &str) -> SessionFile {
+        SessionFile {
+            session_id: id.to_string(),
+            title: id.to_string(),
+            last_preview: String::new(),
+            cwd: cwd.to_string_lossy().to_string(),
+            timestamp: ts.to_string(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            messages: vec![],
+            title_generated: false,
+        }
+    }
+
+    #[test]
+    fn list_for_project_filters_by_git_root() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-{}", std::process::id()));
+        let sessions = base.join("sessions");
+        let repo_a = base.join("repoA");
+        let repo_b = base.join("repoB");
+        std::fs::create_dir_all(repo_a.join("sub").join(".keep").parent().unwrap()).unwrap();
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+
+        let store = SessionStore::new(sessions).unwrap();
+        // repoA 会话（在子目录发起）、repoB 会话
+        store
+            .save(&mk_file("a1", &repo_a.join("sub"), "2026-07-06T10:00:00Z"))
+            .unwrap();
+        store
+            .save(&mk_file("b1", &repo_b, "2026-07-06T11:00:00Z"))
+            .unwrap();
+
+        let a = store.list_for_project(&repo_a).unwrap();
+        assert_eq!(a.len(), 1, "repoA 只应看到自己的会话");
+        assert_eq!(a[0].session_id, "a1");
+
+        let b = store.list_for_project(&repo_b).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].session_id, "b1");
+
+        // 全局 last() 是最新的 b1，但 repoA 的 last_for_project 应是 a1
+        assert_eq!(store.last().unwrap().unwrap().session_id, "b1");
+        assert_eq!(
+            store.last_for_project(&repo_a).unwrap().unwrap().session_id,
+            "a1"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

@@ -636,6 +636,216 @@ impl Command for QuitCmd {
     }
 }
 
+// ── GitHub 协作命令辅助 ────────────────────────────────────────────────────────
+
+/// 探测 `gh` CLI 是否可用
+async fn gh_available() -> bool {
+    tokio::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// 运行外部命令并捕获输出，返回 (是否成功, stdout, stderr)
+async fn run_capture(
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+) -> (bool, String, String) {
+    match tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        ),
+        Err(e) => (false, String::new(), e.to_string()),
+    }
+}
+
+/// 从 origin remote URL 解析 `owner/repo`（支持 https 与 ssh 形式）
+fn parse_github_slug(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let rest = rest
+        .strip_suffix(".git")
+        .unwrap_or(rest)
+        .trim_end_matches('/');
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("{owner}/{repo}"))
+}
+
+/// URL 查询参数百分号编码
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// 用系统默认浏览器打开 URL（best-effort），返回是否成功启动
+async fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let (prog, args): (&str, Vec<&str>) = ("open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let (prog, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (prog, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
+    tokio::process::Command::new(prog)
+        .args(&args)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+// ── /bug ──────────────────────────────────────────────────────────────────────
+
+pub struct BugCmd;
+
+#[async_trait]
+impl Command for BugCmd {
+    fn name(&self) -> &str {
+        "bug"
+    }
+    fn description(&self) -> String {
+        tr("bug.desc")
+    }
+    fn usage(&self) -> String {
+        "/bug [简述]".to_string()
+    }
+    async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        let (ok, stdout, _) = run_capture("git", &["remote", "get-url", "origin"], &ctx.cwd).await;
+        let Some(slug) = (if ok { parse_github_slug(&stdout) } else { None }) else {
+            return Ok(CommandResult::Output(tr("bug.no_remote")));
+        };
+        let title = args.trim();
+        let body = format!(
+            "## 环境\n- wyj-code: {ver}\n- OS: {os} ({arch})\n- Model: {model}\n\n\
+             ## 问题描述\n{desc}\n\n## 复现步骤\n1. \n\n## 期望行为\n",
+            ver = env!("CARGO_PKG_VERSION"),
+            os = std::env::consts::OS,
+            arch = std::env::consts::ARCH,
+            model = ctx.model,
+            desc = title,
+        );
+        let mut url = format!(
+            "https://github.com/{slug}/issues/new?body={}",
+            percent_encode(&body)
+        );
+        if !title.is_empty() {
+            url.push_str(&format!("&title={}", percent_encode(title)));
+        }
+        if open_browser(&url).await {
+            Ok(CommandResult::Output(tr_fmt(
+                "bug.opened",
+                &[("url", &url)],
+            )))
+        } else {
+            Ok(CommandResult::Output(tr_fmt(
+                "bug.manual",
+                &[("url", &url)],
+            )))
+        }
+    }
+}
+
+// ── /review ───────────────────────────────────────────────────────────────────
+
+pub struct ReviewCmd;
+
+#[async_trait]
+impl Command for ReviewCmd {
+    fn name(&self) -> &str {
+        "review"
+    }
+    fn description(&self) -> String {
+        tr("review.desc")
+    }
+    fn usage(&self) -> String {
+        "/review [PR编号]".to_string()
+    }
+    async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        if !gh_available().await {
+            return Ok(CommandResult::Output(tr("gh.missing")));
+        }
+        let pr = args.trim();
+        let mut diff_args = vec!["pr", "diff"];
+        if !pr.is_empty() {
+            diff_args.push(pr);
+        }
+        let (ok, stdout, stderr) = run_capture("gh", &diff_args, &ctx.cwd).await;
+        if !ok || stdout.trim().is_empty() {
+            let err = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            return Ok(CommandResult::Output(tr_fmt(
+                "review.failed",
+                &[("err", err.trim())],
+            )));
+        }
+        let prompt = tr_fmt("review.agent_prompt", &[("diff", &stdout)]);
+        Ok(CommandResult::RunPrompt(prompt))
+    }
+}
+
+// ── /pr-comments ──────────────────────────────────────────────────────────────
+
+pub struct PrCommentsCmd;
+
+#[async_trait]
+impl Command for PrCommentsCmd {
+    fn name(&self) -> &str {
+        "pr-comments"
+    }
+    fn description(&self) -> String {
+        tr("prcomments.desc")
+    }
+    fn usage(&self) -> String {
+        "/pr-comments [PR编号]".to_string()
+    }
+    async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        if !gh_available().await {
+            return Ok(CommandResult::Output(tr("gh.missing")));
+        }
+        let pr = args.trim();
+        let mut view_args = vec!["pr", "view"];
+        if !pr.is_empty() {
+            view_args.push(pr);
+        }
+        view_args.push("--comments");
+        let (ok, stdout, stderr) = run_capture("gh", &view_args, &ctx.cwd).await;
+        if ok {
+            Ok(CommandResult::Output(stdout))
+        } else {
+            Ok(CommandResult::Output(tr_fmt(
+                "prcomments.failed",
+                &[("err", stderr.trim())],
+            )))
+        }
+    }
+}
+
 /// 创建包含所有内置命令的注册表
 pub fn standard_registry() -> Arc<CommandRegistry> {
     let mut reg = CommandRegistry::new();
@@ -656,6 +866,9 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(McpCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
+    reg.register(Arc::new(BugCmd));
+    reg.register(Arc::new(ReviewCmd));
+    reg.register(Arc::new(PrCommentsCmd));
     reg.register(Arc::new(QuitCmd));
     Arc::new(reg)
 }
@@ -693,7 +906,46 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(McpCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
+    reg.register(Arc::new(BugCmd));
+    reg.register(Arc::new(ReviewCmd));
+    reg.register(Arc::new(PrCommentsCmd));
     reg.register(Arc::new(QuitCmd));
 
     Arc::new(reg)
+}
+
+#[cfg(test)]
+mod github_tests {
+    use super::{parse_github_slug, percent_encode};
+
+    #[test]
+    fn slug_parses_https_and_ssh_forms() {
+        assert_eq!(
+            parse_github_slug("https://github.com/wangyooujin/wyj-code.git").as_deref(),
+            Some("wangyooujin/wyj-code")
+        );
+        assert_eq!(
+            parse_github_slug("git@github.com:wangyooujin/wyj-code.git").as_deref(),
+            Some("wangyooujin/wyj-code")
+        );
+        assert_eq!(
+            parse_github_slug("https://github.com/owner/repo").as_deref(),
+            Some("owner/repo")
+        );
+        assert_eq!(
+            parse_github_slug("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("owner/repo")
+        );
+        // 非 GitHub 远程返回 None
+        assert_eq!(parse_github_slug("https://gitlab.com/o/r.git"), None);
+        assert_eq!(parse_github_slug("not-a-url"), None);
+    }
+
+    #[test]
+    fn percent_encode_escapes_reserved_chars() {
+        assert_eq!(percent_encode("a b"), "a%20b");
+        assert_eq!(percent_encode("x/y#z"), "x%2Fy%23z");
+        // 未保留字符保持原样
+        assert_eq!(percent_encode("Aa0-_.~"), "Aa0-_.~");
+    }
 }
