@@ -257,7 +257,10 @@ fn highlight_code_line(line: &str, lang: &str) -> Vec<Span<'static>> {
             let mut j = i + 1;
             while j < n {
                 if chars[j] == '\\' {
-                    j += 2;
+                    // 代码块按显示宽度逐行硬切（wrap_dw），转义反斜杠可能正好落在
+                    // 某个换行片段的最后一个字符上，它的"配对字符"已被切到下一段——
+                    // 不能假设 j+2 一定在界内，否则 chars[i..j] 越界 panic。
+                    j = (j + 2).min(n);
                     continue;
                 }
                 if chars[j] == q {
@@ -752,5 +755,15 @@ mod tests {
         for ch in long_cmd.chars() {
             assert!(rendered.contains(ch), "换行后的渲染结果应包含原始字符 {ch}");
         }
+    }
+
+    /// 回归测试：代码块内长行被 `wrap_dw` 按显示宽度硬切时，若切分点恰好落在字符串
+    /// 字面量转义反斜杠（如 `\n`）之后——即换行片段以孤立的 `\` 结尾、其配对字符被
+    /// 换到了下一段——`highlight_code_line` 曾因未做边界检查而越界 panic
+    /// （对应真实场景：终端较窄时显示一段含 `f"...\n"` 转义的长 Python 源码）。
+    #[test]
+    fn highlight_code_line_does_not_panic_on_trailing_escape_backslash() {
+        let seg = "            f\"[{i}] 来源:{it.get('source','')} | 时间:{pub}\\";
+        let _ = highlight_code_line(seg, "python");
     }
 }

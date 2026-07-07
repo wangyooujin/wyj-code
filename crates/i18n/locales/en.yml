@@ -116,7 +116,8 @@ help:
     - `Ctrl+K` — Delete from cursor to end of line
     - `Ctrl+U` — Delete from cursor to start of line
     - `Ctrl+W` — Delete previous word
-    - `PageUp` / `PageDown` — Scroll chat area
+    - Mouse wheel / native terminal scrollback — browse chat history (no
+      longer captured by the app, so native click-drag text selection works)
     - `↑` / `↓` — Browse input history
     - `/` — Command completion (Tab to confirm, Esc to cancel)
     - `!<command>` — Run a Bash command directly
