@@ -82,6 +82,14 @@ unicode-width = "0.2"
 rust-i18n = "3"
 # 测试用临时目录
 tempfile = "3"
+# 版本号比较（self-update）
+semver = "1"
+# 校验和（self-update）
+sha2 = "0.10"
+# 压缩包解压（self-update）
+flate2 = "1"
+tar = "0.4"
+zip = "2"
 
 # 内部 crate
 wyj-config = { path = "crates/config" }

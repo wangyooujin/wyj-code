@@ -21,6 +21,7 @@ cargo run -- --resume <id>       # 恢复指定会话 ID
 ./build.sh install               # 安装到 ~/.local/bin/wyj-code
 ./build.sh uninstall             # 卸载二进制；加 --purge 二次确认后彻底删除 ~/.wyj-code/
 ./build.sh cross linux-x86_64    # 交叉编译（支持 linux-x86_64, linux-aarch64, macos-*）
+./build.sh release               # 交互确认版本号后自动 bump Cargo.toml + commit + tag + push（触发 GitHub Actions Release）
 ```
 
 ## Test & Lint

@@ -6,6 +6,7 @@
 #   ./build.sh install            — 安装到 ~/.local/bin/（已安装则直接覆盖，即为升级）
 #   ./build.sh uninstall          — 卸载二进制，保留 ~/.wyj-code/ 下的配置与记忆
 #   ./build.sh uninstall --purge — 卸载二进制，并在二次确认后彻底删除 ~/.wyj-code/
+#   ./build.sh release            — 交互式确认版本号后自动 bump Cargo.toml + commit + tag + push，触发 GitHub Actions Release
 #
 # 交叉编译（需要对应工具链）:
 #   ./build.sh cross linux-x86_64
@@ -110,6 +111,75 @@ cross_compile() {
     echo "✓ $out"
 }
 
+release_version() {
+    # 阶段一：前置检查
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$current_branch" != "master" ]; then
+        echo "✗ 当前分支为 ${current_branch}，release 只能在 master 上执行"
+        exit 1
+    fi
+
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "✗ 工作区有未提交的改动，请先提交或 stash"
+        exit 1
+    fi
+
+    echo "运行 cargo test..."
+    cargo test --locked
+    echo "运行 cargo clippy..."
+    cargo clippy --all-targets --locked
+
+    # 阶段二：版本号建议 + 交互确认
+    local suggested_version
+    suggested_version=$(echo "$VERSION" | awk -F. '{print $1"."$2"."$3+1}')
+
+    echo ""
+    echo "当前版本: ${VERSION}"
+    echo "建议发布版本: ${suggested_version}"
+    echo ""
+    echo "确认发布流程："
+    echo "  1. 更新 Cargo.toml 版本号并提交 (chore: bump version to <version>)"
+    echo "  2. 打 tag v<version>"
+    echo "  3. push 当前分支 + push tag 到 origin（触发 GitHub Actions Release）"
+    echo ""
+    local reply
+    read -r -p "回车使用建议版本 ${suggested_version}，或输入自定义版本号（如 1.1.0），输入其他内容取消: " reply
+
+    local new_version
+    if [ -z "$reply" ]; then
+        new_version="$suggested_version"
+    elif [[ "$reply" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        new_version="$reply"
+    else
+        echo "已取消"
+        exit 0
+    fi
+
+    # 阶段三：版本号唯一性校验
+    if git rev-parse "v${new_version}" >/dev/null 2>&1; then
+        echo "✗ 本地已存在 tag v${new_version}"
+        exit 1
+    fi
+    if git ls-remote --exit-code --tags origin "refs/tags/v${new_version}" >/dev/null 2>&1; then
+        echo "✗ 远端已存在 tag v${new_version}"
+        exit 1
+    fi
+
+    # 阶段四：写入版本号 + 提交
+    sed -i.bak "s/^version = \".*\"/version = \"${new_version}\"/" Cargo.toml
+    rm -f Cargo.toml.bak
+    cargo check
+    git add Cargo.toml Cargo.lock
+    git commit -m "chore: bump version to ${new_version}"
+
+    # 阶段五：打 tag + push
+    git tag -a "v${new_version}" -m "v${new_version}"
+    git push origin "$current_branch"
+    git push origin "v${new_version}"
+    echo "✓ 已推送 v${new_version}，GitHub Actions Release workflow 即将触发"
+}
+
 CMD="${1:-build}"
 shift || true
 
@@ -119,8 +189,9 @@ case "$CMD" in
     install)   install_local ;;
     uninstall) uninstall_local "$@" ;;
     cross)     cross_compile "$@" ;;
+    release)   release_version ;;
     *)
-        echo "用法: $0 {build|package|install|uninstall [--purge]|cross <platform>}"
+        echo "用法: $0 {build|package|install|uninstall [--purge]|cross <platform>|release}"
         exit 1
         ;;
 esac

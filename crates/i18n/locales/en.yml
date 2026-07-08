@@ -60,6 +60,26 @@ cli:
   profile_help: "One-shot override of which call profile to use this run (not persisted, doesn't change active_profile)"
   profile_not_found: "Profile '{name}' not found — run --config-status to see available profiles"
   plugin_dir_help: "Load a local plugin directory for development (ephemeral: this run only, not persisted, not shown in /plugins Installed list)"
+  update_about: "Check for and update to the latest GitHub release"
+  update_yes_help: "Skip the confirmation prompt and update immediately (for scripting)"
+
+update:
+  checking: "Checking for the latest version…"
+  up_to_date: "Already on the latest version v{version}"
+  available: "New version available: v{current} → v{latest}"
+  release_notes_header: "Release notes:"
+  confirm_prompt: "Update now? [y/N] "
+  cancelled: "Update cancelled"
+  unsupported_platform: "Auto-update isn't supported on this platform ({os}/{arch}) — please download manually from GitHub Releases"
+  asset_not_found: "No release asset found for this platform ({target}) — please download manually from GitHub Releases"
+  downloading: "Downloading {name}…"
+  checksum_mismatch: "Download or verification failed, update aborted: {err}"
+  extracting: "Extracting…"
+  extract_error: "Failed to extract the release package: {err}"
+  replacing: "Replacing binary…"
+  success: "Updated to v{version} ({path}). Restart wyj-code to use the new version"
+  network_error: "Request failed: {err}"
+  permission_error: "Failed to replace binary: {err} (check install directory permissions, or reinstall with sudo)"
 
 main:
   session_not_found: "Session {id} not found, starting a new session."
