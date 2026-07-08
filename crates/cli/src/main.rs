@@ -7,7 +7,7 @@ use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult}
 use wyj_config::{AgentMode, Config};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
-    MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator, ToolEvent,
+    HookRunner, MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator, ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
@@ -41,6 +41,8 @@ struct Cli {
     profile: Option<String>,
     #[arg(long, help = wyj_i18n::tr("cli.plugin_dir_help"))]
     plugin_dir: Option<std::path::PathBuf>,
+    #[arg(long, help = wyj_i18n::tr("cli.no_hooks_help"))]
+    no_hooks: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -312,6 +314,19 @@ async fn main() -> Result<()> {
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let tool_ctx = ToolCtx::new(&cwd);
+
+    // Hooks 生命周期自动化：按 `~/.claude/settings.json` + 项目 `.claude/settings.json`
+    // + `.claude/settings.local.json` 三源合并加载。`--no-hooks` 时构造空 runner。
+    let hook_runner = Arc::new(HookRunner::load(&cwd, !cli.no_hooks));
+    if hook_runner.is_enabled() && hook_runner.has_any() {
+        eprintln!(
+            "{}",
+            wyj_i18n::tr_fmt(
+                "main.hooks_loaded_notice",
+                &[("count", &hook_runner.total_hook_count().to_string())]
+            )
+        );
+    }
     tool_ctx.set_permission_mode(match &mode {
         AgentMode::Plan => {
             let set: std::collections::HashSet<String> = [
@@ -483,7 +498,9 @@ async fn main() -> Result<()> {
         agent = agent.append_system(wyj_core::prompts::NON_INTERACTIVE);
     }
 
-    agent = agent.with_claude_md(claude_md_loader.clone());
+    agent = agent
+        .with_claude_md(claude_md_loader.clone())
+        .with_hooks(hook_runner.clone());
 
     if let Some(mem) = memory_store {
         agent = agent.with_memory(mem);
@@ -696,6 +713,7 @@ async fn main() -> Result<()> {
             initial_messages,
             cfg.clone(),
             local_plugin.clone(),
+            !cli.no_hooks,
         )
         .await?;
     } else {
@@ -705,6 +723,7 @@ async fn main() -> Result<()> {
         let store_for_rebuild = session_store_arc.clone();
         let sid_for_rebuild = session_id.clone();
         let cwd_for_rebuild = cwd.clone();
+        let hook_runner_for_rebuild = hook_runner.clone();
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
@@ -717,7 +736,8 @@ async fn main() -> Result<()> {
                     cfg.active_profile().thinking_budget,
                     cfg.active_profile().interleaved_thinking,
                 )
-                .with_claude_md(claude_md_for_rebuild.clone());
+                .with_claude_md(claude_md_for_rebuild.clone())
+                .with_hooks(hook_runner_for_rebuild.clone());
             if let Some(mem) = &memory_store_for_rebuild {
                 new_agent = new_agent.with_memory(mem.clone());
             }
@@ -892,6 +912,7 @@ async fn repl(
     initial_messages: Vec<wyj_api::types::Message>,
     cfg: Config,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
+    hooks_enabled: bool,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
@@ -1012,6 +1033,7 @@ async fn repl(
             sub_output_tokens: 0,
             effective_mcp_count,
             plugin_agent_paths: plugin_agent_paths.clone(),
+            hooks_enabled,
         };
         if let Some(result) = cmd_registry.dispatch(trimmed, &cmd_ctx).await {
             match result {

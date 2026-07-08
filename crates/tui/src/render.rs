@@ -914,6 +914,26 @@ fn render_chat_message(
     }
 }
 
+/// 渲染欢迎页所有行。供 [`build_pending_chat_lines`]（尚未冻结时的每帧重绘）
+/// 与 app.rs 主循环的冻结逻辑（欢迎页随第一批冻结内容一起 `insert_before`
+/// 写入真实 scrollback 时）共用，避免两处 `WelcomeContext` 构造 drift。
+pub(crate) fn welcome_lines(state: &AppState, max_content_width: usize) -> Vec<Line<'static>> {
+    let ctx = crate::welcome::WelcomeContext {
+        model: state.model_name.clone(),
+        cwd: shorten_home_path(&state.cwd.display().to_string()),
+        profile: {
+            let p = &state.config.active_profile;
+            if p == "default" {
+                None
+            } else {
+                Some(p.clone())
+            }
+        },
+        tip_index: state.welcome_tip_idx,
+    };
+    crate::welcome::render_welcome(&ctx, max_content_width as u16)
+}
+
 /// 构建"待渲染"聊天内容：欢迎页（若适用）+ 尚未冻结进终端真实 scrollback 的
 /// 消息尾部（`state.messages[frozen_up_to..]`）+ 流式文本。已冻结的前缀已经
 /// 通过 `Terminal::insert_before` 永久写入真实 scrollback，不再参与这里的重建。
@@ -928,33 +948,14 @@ pub(crate) fn build_pending_chat_lines(
     // （5 行 shadow logo 渐变 + Profile/Model + cwd 两行看板）作为消息列表顶部的
     // 固定内容一起渲染，而不是与消息列表互斥——这样 MCP 连接提示会紧跟在欢迎页
     // 后面显示，而不是把欢迎页顶替掉。一旦有任何消息被冻结进真实 scrollback，
-    // 说明欢迎页早已滚走，不能再重新显示。
-    let show_welcome = state.frozen_up_to == 0
-        && state.streaming_buf.is_empty()
-        && state
-            .messages
-            .iter()
-            .all(|m| matches!(m.role, MessageRole::System));
+    // 说明欢迎页早已滚走，不能再重新显示（此时它已经随第一批冻结内容一起被
+    // `insert_before` 写进了终端真实 scrollback，见 app.rs 主循环的冻结逻辑）。
+    let show_welcome =
+        state.frozen_up_to == 0 && !state.welcome_frozen && state.streaming_buf.is_empty();
 
     let mut lines: Vec<Line<'static>> = vec![];
     if show_welcome {
-        let ctx = crate::welcome::WelcomeContext {
-            model: state.model_name.clone(),
-            cwd: shorten_home_path(&state.cwd.display().to_string()),
-            profile: {
-                let p = &state.config.active_profile;
-                if p == "default" {
-                    None
-                } else {
-                    Some(p.clone())
-                }
-            },
-            tip_index: state.welcome_tip_idx,
-        };
-        lines.extend(crate::welcome::render_welcome(
-            &ctx,
-            max_content_width as u16,
-        ));
+        lines.extend(welcome_lines(state, max_content_width));
     }
 
     // 只有当尚未冻结任何内容时，尾部第一条 User 消息才是"整场对话的第一条"，

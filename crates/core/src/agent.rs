@@ -2,6 +2,7 @@
 
 use crate::claude_md::ClaudeMdLoader;
 use crate::compact::{compact_session, estimate_tokens, COMPACT_TRIGGER_BUFFER};
+use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
 use crate::tool::{Tool, ToolContext};
@@ -73,6 +74,8 @@ pub struct Agent {
     interleaved_thinking: bool,
     /// thinking 文本增量回调（TUI 展示 / headless stderr 输出）
     thinking_cb: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Hooks 生命周期自动化执行器（可选，子 Agent 不设置，避免嵌套 shell 副作用）
+    hook_runner: Option<Arc<HookRunner>>,
 }
 
 impl Agent {
@@ -97,6 +100,7 @@ impl Agent {
             thinking_budget: None,
             interleaved_thinking: true,
             thinking_cb: None,
+            hook_runner: None,
         }
     }
 
@@ -167,6 +171,17 @@ impl Agent {
 
     pub fn claude_md_ref(&self) -> Option<&Arc<ClaudeMdLoader>> {
         self.claude_md.as_ref()
+    }
+
+    /// 装配 Hooks 执行器（子 Agent 不调用此方法，`hook_runner` 保持 `None`）
+    pub fn with_hooks(mut self, runner: Arc<HookRunner>) -> Self {
+        self.hook_runner = Some(runner);
+        self
+    }
+
+    /// 获取当前 Hooks 执行器引用（TUI 侧据此给 `/hooks` 命令提供启用状态）。
+    pub fn hook_runner_ref(&self) -> Option<&Arc<HookRunner>> {
+        self.hook_runner.as_ref()
     }
 
     /// 注册工具事件回调（用于 headless 格式化输出或 TUI 事件推送）
@@ -277,6 +292,38 @@ impl Agent {
         if let Some(snap) = &self.git_snapshot {
             if session.messages.len() == 1 {
                 session.prepend_to_last_user(vec![ContentBlock::Text { text: snap.clone() }]);
+            }
+        }
+
+        // UserPromptSubmit：调用方已把本次用户提交 push 进 session（3 处调用点
+        // 各自 push_user/push_user_with_blocks），这里统一触发一次（每次调用
+        // run_turn_with_injection 即代表一次新提交，不随内部 turn 循环重复）。
+        if let Some(hr) = &self.hook_runner {
+            match hr
+                .run(
+                    "UserPromptSubmit",
+                    None,
+                    self.session_id.as_deref(),
+                    ctx.cwd(),
+                    None,
+                    None,
+                )
+                .await
+            {
+                HookOutcome::Block(reason) => {
+                    // Provider 要求角色严格交替（见 session.rs push_user_blocks_merged
+                    // 文档注释）：撤销刚 push 的这条 user 消息，回退到提交前状态，
+                    // 避免下次提交时连续两条 user 消息违反该不变量。
+                    session.messages.pop();
+                    on_text(&reason);
+                    return Ok(());
+                }
+                HookOutcome::Continue {
+                    context: Some(ctx_text),
+                } => {
+                    session.prepend_to_last_user(vec![ContentBlock::Text { text: ctx_text }]);
+                }
+                _ => {}
             }
         }
 
@@ -574,6 +621,37 @@ impl Agent {
             }
 
             if !has_tool_calls && !got_injection {
+                // Stop：本轮即将结束，给 hook 一次机会决定是否继续（追加一条
+                // user 消息并让循环再跑一轮，而非依赖注入 channel 的时序）。
+                if let Some(hr) = &self.hook_runner {
+                    let outcome = hr
+                        .run(
+                            "Stop",
+                            None,
+                            self.session_id.as_deref(),
+                            ctx.cwd(),
+                            None,
+                            None,
+                        )
+                        .await;
+                    match outcome {
+                        HookOutcome::Continue { context } => {
+                            session.push_user_blocks_merged(vec![ContentBlock::Text {
+                                text: context.unwrap_or_default(),
+                            }]);
+                            got_injection = true;
+                        }
+                        HookOutcome::Block(reason) => {
+                            session
+                                .push_user_blocks_merged(vec![ContentBlock::Text { text: reason }]);
+                            got_injection = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !has_tool_calls && !got_injection {
                 // 对话轮次结束，触发后台记忆提取
                 if let Some(mem) = self.memory.as_ref().cloned() {
                     let provider = self.provider.clone();
@@ -627,31 +705,41 @@ impl Agent {
 
         let (display, content, is_error): (String, ToolResultContent, bool) = if let Some(t) = tool
         {
-            if !ctx.is_allowed(&name, &input) {
-                let msg = format!("工具 `{name}` 在当前模式下不被允许");
-                (msg.clone(), ToolResultContent::Text(msg), true)
-            } else if t.needs_permission(&input)
-                && !ctx.confirm_tool(&name, &t.action_summary(&input)).await
-            {
-                // 逐调用权限确认：用户拒绝，将拒绝信息回灌给模型（模型据此改道）
-                let msg = format!(
-                    "用户拒绝执行工具 `{name}`。请不要重试该操作；改用其他方式，或先向用户询问原因。"
-                );
-                (msg.clone(), ToolResultContent::Text(msg), true)
+            let pre_outcome = if let Some(hr) = &self.hook_runner {
+                hr.run(
+                    "PreToolUse",
+                    Some(&name),
+                    self.session_id.as_deref(),
+                    ctx.cwd(),
+                    Some(&input),
+                    None,
+                )
+                .await
             } else {
-                match t.run(input, ctx).await {
-                    Ok(r) => match r.parts {
-                        // 结构化结果（如图片块）：display 用降级文本，模型收 Parts
-                        Some(parts) => (r.content, ToolResultContent::Parts(parts), r.is_error),
-                        None => (
-                            r.content.clone(),
-                            ToolResultContent::Text(r.content),
-                            r.is_error,
-                        ),
-                    },
-                    Err(e) => {
-                        let msg = format!("工具执行错误: {e}");
+                HookOutcome::Passthrough
+            };
+
+            match pre_outcome {
+                HookOutcome::Block(reason) => {
+                    let msg = format!("PreToolUse hook 拦截了工具 `{name}`：{reason}");
+                    (msg.clone(), ToolResultContent::Text(msg), true)
+                }
+                // approve：跳过 is_allowed / needs_permission+confirm_tool 两道闸门，直接执行
+                HookOutcome::Approve => run_tool(&t, input, ctx).await,
+                HookOutcome::Passthrough | HookOutcome::Continue { .. } => {
+                    if !ctx.is_allowed(&name, &input) {
+                        let msg = format!("工具 `{name}` 在当前模式下不被允许");
                         (msg.clone(), ToolResultContent::Text(msg), true)
+                    } else if t.needs_permission(&input)
+                        && !ctx.confirm_tool(&name, &t.action_summary(&input)).await
+                    {
+                        // 逐调用权限确认：用户拒绝，将拒绝信息回灌给模型（模型据此改道）
+                        let msg = format!(
+                            "用户拒绝执行工具 `{name}`。请不要重试该操作；改用其他方式，或先向用户询问原因。"
+                        );
+                        (msg.clone(), ToolResultContent::Text(msg), true)
+                    } else {
+                        run_tool(&t, input, ctx).await
                     }
                 }
             }
@@ -661,6 +749,37 @@ impl Agent {
         };
 
         let elapsed_secs = start.elapsed().as_secs_f64();
+
+        // PostToolUse：把 hook 返回的 Block/Continue 附加反馈追加进模型可见的
+        // content 与展示用 display，不改变 is_error（补充信息，不是把结果打成失败）。
+        let hook_feedback: Option<String> = if let Some(hr) = &self.hook_runner {
+            let tool_response = serde_json::json!({ "content": display, "is_error": is_error });
+            match hr
+                .run(
+                    "PostToolUse",
+                    Some(&name),
+                    self.session_id.as_deref(),
+                    ctx.cwd(),
+                    None,
+                    Some(&tool_response),
+                )
+                .await
+            {
+                HookOutcome::Block(reason) => Some(reason),
+                HookOutcome::Continue { context: Some(c) } => Some(c),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (display, content) = match hook_feedback {
+            Some(fb) => {
+                let suffix = format!("\n\n[PostToolUse hook] {fb}");
+                let content = append_hook_feedback(content, &suffix);
+                (format!("{display}{suffix}"), content)
+            }
+            None => (display, content),
+        };
 
         if let Some(cb) = &self.tool_cb {
             cb(ToolEvent::End {
@@ -681,6 +800,55 @@ impl Agent {
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
         compact_session(session, self.provider.as_ref(), self.context_window).await
+    }
+}
+
+/// 执行工具并组装 (display, content, is_error) 三元组，抽出复用于
+/// PreToolUse 的 `Approve`（跳过权限闸门）与常规放行两条路径。
+async fn run_tool(
+    t: &Arc<dyn Tool>,
+    input: serde_json::Value,
+    ctx: &dyn ToolContext,
+) -> (String, wyj_api::types::ToolResultContent, bool) {
+    use wyj_api::types::ToolResultContent;
+    match t.run(input, ctx).await {
+        Ok(r) => match r.parts {
+            // 结构化结果（如图片块）：display 用降级文本，模型收 Parts
+            Some(parts) => (r.content, ToolResultContent::Parts(parts), r.is_error),
+            None => (
+                r.content.clone(),
+                ToolResultContent::Text(r.content),
+                r.is_error,
+            ),
+        },
+        Err(e) => {
+            let msg = format!("工具执行错误: {e}");
+            (msg.clone(), ToolResultContent::Text(msg), true)
+        }
+    }
+}
+
+/// PostToolUse 反馈追加进工具结果内容（Text 追加后缀，Parts 追加一个 Text part）。
+fn append_hook_feedback(
+    content: wyj_api::types::ToolResultContent,
+    suffix: &str,
+) -> wyj_api::types::ToolResultContent {
+    use wyj_api::types::{ToolResultContent, ToolResultPart};
+    match content {
+        ToolResultContent::Text(mut s) => {
+            s.push_str(suffix);
+            ToolResultContent::Text(s)
+        }
+        ToolResultContent::Parts(mut parts) => {
+            parts.push(ToolResultPart::Text {
+                text: suffix.to_string(),
+            });
+            ToolResultContent::Parts(parts)
+        }
+        ToolResultContent::Blocks(mut blocks) => {
+            blocks.push(serde_json::json!({ "type": "text", "text": suffix }));
+            ToolResultContent::Blocks(blocks)
+        }
     }
 }
 
@@ -839,6 +1007,284 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], ("t1".to_string(), "first".to_string()));
         assert_eq!(results[1], ("t2".to_string(), "second".to_string()));
+    }
+
+    /// 记录被调用次数的 mock 工具，用于验证 PreToolUse Block 阻止了工具实际执行
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "Echo"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "Echo".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok("echoed".to_string()))
+        }
+    }
+
+    /// `is_allowed` 恒返回 false，用于验证 PreToolUse `Approve` 能绕过它
+    struct DenyAllCtx;
+    #[async_trait::async_trait]
+    impl ToolContext for DenyAllCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+            false
+        }
+    }
+
+    fn hooks_settings_with(
+        event: &str,
+        matcher: Option<&str>,
+        command: &str,
+    ) -> crate::hooks::HooksSettings {
+        use crate::hooks::{HookCommand, HookMatcherEntry, HooksSettings};
+        let mut hooks = HashMap::new();
+        hooks.insert(
+            event.to_string(),
+            vec![HookMatcherEntry {
+                matcher: matcher.map(|s| s.to_string()),
+                hooks: vec![HookCommand {
+                    hook_type: "command".into(),
+                    command: command.into(),
+                    timeout: Some(5),
+                }],
+            }],
+        );
+        HooksSettings { hooks }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_block_prevents_tool_execution() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        agent.register_tool(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+        let settings = hooks_settings_with(
+            "PreToolUse",
+            None,
+            r#"echo '{"decision":"block","reason":"nope"}'"#,
+        );
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+
+        let (id, content, is_error) = agent
+            .exec_tool_call(&FakeCtx, "1".into(), "Echo".into(), serde_json::json!({}))
+            .await;
+
+        assert_eq!(id, "1");
+        assert!(is_error);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "被 PreToolUse Block 的工具不应实际执行"
+        );
+        match content {
+            ToolResultContent::Text(t) => assert!(t.contains("nope")),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_approve_bypasses_is_allowed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        agent.register_tool(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+        let settings = hooks_settings_with("PreToolUse", None, r#"echo '{"decision":"approve"}'"#);
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+
+        let (_id, _content, is_error) = agent
+            .exec_tool_call(
+                &DenyAllCtx,
+                "1".into(),
+                "Echo".into(),
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "approve 应绕过 is_allowed 直接执行"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_block_appends_feedback_without_marking_error() {
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        agent.register_tool(Arc::new(CountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let settings = hooks_settings_with(
+            "PostToolUse",
+            None,
+            r#"echo '{"decision":"block","reason":"lint failed"}'"#,
+        );
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+
+        let (_id, content, is_error) = agent
+            .exec_tool_call(&FakeCtx, "1".into(), "Echo".into(), serde_json::json!({}))
+            .await;
+
+        assert!(!is_error, "PostToolUse 反馈不应把成功结果打成失败");
+        match content {
+            ToolResultContent::Text(t) => {
+                assert!(t.contains("echoed"));
+                assert!(t.contains("lint failed"));
+            }
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_hook_runner_behaves_exactly_as_before() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        agent.register_tool(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+
+        let (_id, _content, is_error) = agent
+            .exec_tool_call(&FakeCtx, "1".into(), "Echo".into(), serde_json::json!({}))
+            .await;
+
+        assert!(!is_error);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_block_pops_message_and_skips_model_call() {
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let settings = hooks_settings_with(
+            "UserPromptSubmit",
+            None,
+            r#"echo '{"decision":"block","reason":"denied"}'"#,
+        );
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+        let mut session = Session::new();
+        session.push_user("hello");
+
+        let mut out = String::new();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |t| out.push_str(t))
+            .await
+            .unwrap();
+
+        assert!(out.contains("denied"));
+        assert!(
+            session.messages.is_empty(),
+            "被 block 的 user 消息应回退，不留在 session 里"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_continue_prepends_context() {
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let settings = hooks_settings_with(
+            "UserPromptSubmit",
+            None,
+            r#"echo '{"additionalContext":"extra ctx"}'"#,
+        );
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+        let mut session = Session::new();
+        session.push_user("hello");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        let has_ctx = session.messages[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("extra ctx")));
+        assert!(has_ctx, "additionalContext 应被前插进首条 user 消息");
+    }
+
+    /// 每次调用都计数、恒 EndTurn 的 provider（Stop hook 续跑测试用）
+    struct CountingEndTurnProvider {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for CountingEndTurnProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_continue_makes_loop_run_again() {
+        // 用一个临时文件做进程外状态：第一次调用返回 continue:false（要求继续），
+        // 第二次（文件已存在）放行，让循环真正结束，避免死循环。
+        let flag_path =
+            std::env::temp_dir().join(format!("wyj-stop-hook-test-{}.flag", uuid::Uuid::new_v4()));
+        let flag = flag_path.display();
+        let command = format!(
+            "if [ -f {flag} ]; then echo '{{}}'; else touch {flag}; echo '{{\"continue\":false,\"reason\":\"once more\"}}'; fi"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::new(Arc::new(CountingEndTurnProvider {
+            calls: calls.clone(),
+        }));
+        let settings = hooks_settings_with("Stop", None, &command);
+        let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+            settings, true,
+        )));
+        let mut session = Session::new();
+        session.push_user("hello");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Stop 要求 continue 应让循环再跑一轮，模型应被调用两次"
+        );
+        std::fs::remove_file(&flag_path).ok();
     }
 
     #[tokio::test]

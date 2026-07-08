@@ -54,6 +54,7 @@ cli:
   headless_help: "强制使用 headless REPL 模式"
   plan_help: "Plan 模式：仅启用只读工具（read/glob/grep/web_fetch），适合规划分析"
   bypass_help: "Bypass 模式：自动允许所有工具调用，不弹权限确认对话框"
+  no_hooks_help: "禁用 Hooks 自动化系统（不执行 .claude/settings.json 中的 shell hook）"
   continue_help: "恢复上次会话（继续上次对话）"
   resume_help: "恢复指定会话 ID（如 sess-1719723000）"
   profile_help: "一次性指定本次运行使用的调用分组（不落盘、不改 active_profile）"
@@ -89,6 +90,7 @@ main:
   mode_info_plan: " [plan 模式：仅只读工具]"
   mode_info_bypass: " [bypass 模式：跳过权限确认]"
   session_stats: "会话统计"
+  hooks_loaded_notice: "⚠️ 检测到 {count} 条 Hooks 配置（.claude/settings.json），将在工具调用/对话生命周期中执行任意 shell 命令。如非预期，请检查配置或使用 --no-hooks 禁用。"
 
 help:
   desc: "显示所有可用命令和快捷键"
@@ -109,6 +111,7 @@ help:
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
+    - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
@@ -164,6 +167,16 @@ cost:
   context_line: "上下文: {pct}% ({estimated} / {window} tokens)"
   cache_line: "缓存:   命中 {read} + 写入 {write} tokens（相对全价输入节省约 {saved_pct}%，费用已计入上方合计）"
   subagent_line: "子 Agent: 输入 {input} + 输出 {output} = {total} tokens（独立于主会话统计，费用未计入上方估算）"
+
+hooks:
+  desc: "列出当前生效的 Hooks 配置（按事件分组）"
+  disabled_banner: "[Hooks 已被 --no-hooks 禁用]"
+  empty_note: "未找到任何 Hooks 配置。在 `~/.claude/settings.json` 或项目 `.claude/settings.json` 中定义 `hooks` 字段后生效。"
+  header: "当前生效的 Hooks："
+  event_line: "【{event}】"
+  matcher_line: "matcher: {matcher}"
+  matcher_any: "*（匹配全部工具）"
+  command_line: "({timeout}s) `{command}`"
 
 agents:
   desc: "列出可用的 subagent 类型（内置 + 自定义定义文件）"

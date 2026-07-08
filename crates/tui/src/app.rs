@@ -13,7 +13,10 @@ use crossterm::{
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Color as UiColor;
@@ -3816,6 +3819,10 @@ pub struct AppState {
     /// `messages[..frozen_up_to]` 不再参与每帧重绘，交由终端原生 scrollback
     /// 保存（鼠标滚轮/原生选中因此天然可用）。见 `compute_freezable_up_to`。
     pub frozen_up_to: usize,
+    /// 欢迎页是否已经被写入终端真实 scrollback（或已被显式抑制，如 /clear、
+    /// 会话切换/恢复）。为 true 后欢迎页永远不再显示，防止 `frozen_up_to`
+    /// 归零重来时（这些场景都会归零）重复出现或与真实历史消息混在一起。
+    pub welcome_frozen: bool,
     /// 上一次"聊天区 Up/Down 快捷键"（历史召回/子 Agent 面板导航/光标移动）
     /// 生效的时间戳，用于防抖识别：部分终端会把鼠标滚轮转译成方向键转发给
     /// 应用（尤其在打开全屏对话框、进入 alternate screen 时），与真实按键
@@ -3923,6 +3930,9 @@ pub struct AppState {
     /// 每个已配置 MCP server 的后台连接状态，供 `/mcp` Installed tab 逐行展示；
     /// 与 mcp_dialog 是否打开无关（面板打开前后台可能早已连完/连挂）
     pub mcp_connection_status: HashMap<String, McpConnStatus>,
+    /// 主 Agent 装配的 Hooks 执行器（子 Agent 不装配），供 `/hooks` 命令
+    /// 展示与状态栏判断。
+    pub hook_runner: Option<Arc<wyj_core::HookRunner>>,
 }
 
 /// 计算 `messages` 中从 `frozen_up_to` 起最多可以安全推进到的新冻结边界
@@ -4003,6 +4013,7 @@ impl AppState {
             plan_dialog: None,
             exec_mode_confirm: None,
             frozen_up_to: 0,
+            welcome_frozen: false,
             last_up_down_key: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -4059,6 +4070,7 @@ impl AppState {
             welcome_tip_idx,
             input_owner: None,
             mcp_connection_status: HashMap::new(),
+            hook_runner: None,
         }
     }
 
@@ -5533,6 +5545,7 @@ async fn tui_main(
         config,
         hub.clone(),
     );
+    state.hook_runner = agent.hook_runner_ref().cloned();
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
 
@@ -5735,14 +5748,23 @@ async fn tui_main(
                 let term_size = terminal.size()?;
                 let max_content_width = term_size.width.saturating_sub(4) as usize;
                 let mut is_first_user = state.frozen_up_to == 0;
-                let flush_lines = render::render_message_range(
+                let mut flush_lines = Vec::new();
+                // 欢迎页此前只在"待冻结"区域里每帧重绘，本身从未被真正写进
+                // scrollback；若第一批冻结在它还显示着的时候发生（例如 MCP
+                // 连接提示这类 System 消息很快就会被冻结），必须把欢迎页一并
+                // insert_before，否则它会在这一帧之后凭空消失，不会留在信息流里。
+                if state.frozen_up_to == 0 && !state.welcome_frozen {
+                    flush_lines.extend(render::welcome_lines(&state, max_content_width));
+                    state.welcome_frozen = true;
+                }
+                flush_lines.extend(render::render_message_range(
                     &state.messages,
                     state.frozen_up_to..freezable,
                     max_content_width,
                     &state.sub_agents,
                     state.spinner_frame,
                     &mut is_first_user,
-                );
+                ));
                 if !flush_lines.is_empty() {
                     let n = flush_lines.len() as u16;
                     terminal.insert_before(n, |buf| {
@@ -6129,6 +6151,7 @@ async fn tui_main(
                                                     state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
+                                                    state.welcome_frozen = true;
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已切换至会话 {}  共 {} 轮对话",
@@ -7981,6 +8004,10 @@ async fn tui_main(
                                     }
                                     paths
                                 },
+                                hooks_enabled: state
+                                    .hook_runner
+                                    .as_ref()
+                                    .is_some_and(|r| r.is_enabled()),
                             };
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
@@ -7993,6 +8020,30 @@ async fn tui_main(
                                         state.total_output_tokens = 0;
                                         state.context_tokens = 0;
                                         state.pending_attachments.clear();
+                                        state.turns = 0;
+                                        state.tool_call_count = 0;
+                                        state.tool_info.clear();
+                                        state.current_todos = None;
+                                        state.todo_stats.clear();
+                                        state.todo_panel_expanded = false;
+                                        state.sub_input_tokens = 0;
+                                        state.sub_output_tokens = 0;
+                                        state.pending_queue.clear();
+                                        state.pending_bg_reminders.clear();
+                                        state.streaming_buf.clear();
+                                        state.thinking_buf.clear();
+                                        state.thinking_started = None;
+                                        // 已冻结写入终端真实 scrollback 的历史消息（Inline
+                                        // viewport 架构下 insert_before 直接落进终端原生回
+                                        // 滚缓冲区，state.messages.clear() 管不到它）不额外
+                                        // Purge 的话 /clear 后终端里仍能翻到旧对话；这里连
+                                        // 带把 scrollback 真正清空，frozen_up_to 归零重来。
+                                        state.frozen_up_to = 0;
+                                        // /clear 不重新显示欢迎页（对齐 Claude Code：清空对话
+                                        // 不等于回到全新会话开屏），否则每次 /clear 都会在
+                                        // 下一次冻结时把欢迎页重新画一遍。
+                                        state.welcome_frozen = true;
+                                        execute!(io::stdout(), Clear(ClearType::Purge))?;
                                         let mut sess = session.lock().await;
                                         *sess = Session::new();
                                         state.messages.push(ChatMessage::assistant(
@@ -8243,6 +8294,7 @@ async fn tui_main(
                                                     state.context_tokens = context_tokens;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
+                                                    state.welcome_frozen = true;
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已恢复会话 {}  共 {} 轮对话",

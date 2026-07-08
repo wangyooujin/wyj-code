@@ -26,9 +26,11 @@
 - **Profile 分组配置** —— provider / model / base_url / api_key 以具名 Profile 组织，多套供应商配置并存切换，`/model` 面板管理。
 - **三模式 + 分模型** —— `normal` / `plan`(只读) / `bypass`(自动放行)，各模式可绑定不同模型。
 - **CLAUDE.md 记忆机制** —— 每轮重新读盘，全局 + 祖先链文件以 `<system-reminder>` 注入当轮 user 消息；工具触达新目录时动态加载；`@path` 递归导入。
+- **Hooks 生命周期自动化** —— 复用 `.claude/settings.json`，在 PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点挂任意 shell 脚本（拦截危险命令、保存即格式化、注入上下文、回合结束通知），`/hooks` 查看当前生效配置，`--no-hooks` 一键禁用。
 - **会话中消息注入** —— Agent 忙碌时新消息进队列不打断，在工具调用往返边界排空合并。
 - **i18n** —— 中 / 英双语，运行时切换，覆盖核心用户可见文案。
 - **会话持久化** —— 自动写入 `~/.wyj-code/`，`-c` 续上次、`--resume <id>` 恢复指定会话。
+- **自更新** —— `wyj-code update` 检查 GitHub Releases 并原地替换二进制。
 - **零遥测** —— 仅在显式 LLM / WebFetch / MCP 调用时出网。
 
 ## 目录结构
@@ -44,6 +46,20 @@ crates/
 ├── mcp/         # MCP 客户端（stdio / http）
 ├── tools/       # 内置工具 + SubAgent + AgentHub
 └── tui/         # ratatui 前端
+```
+
+## 安装
+
+**方式一：下载预编译产物**（macOS / Linux / Windows，见 [GitHub Releases](../../releases)）：
+下载对应平台压缩包，解压后把 `wyj-code` 放进 `PATH`。之后可用 `wyj-code update` 检查并
+自动升级到最新版本，无需重新下载。
+
+**方式二：从源码构建**：
+
+```bash
+git clone <本仓库地址>
+cd wyj-code
+./build.sh install              # 构建 release 并安装到 ~/.local/bin/wyj-code
 ```
 
 ## 快速开始
@@ -69,7 +85,22 @@ exec_model = ""                 # Normal/Bypass 专用，留空回退 model
 language   = ""                 # "en"/"zh"，留空自动检测系统 locale
 ```
 
-TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Agent、`/compact` 压缩、`/config` 设置面板。完整命令见 `/help`。
+TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Agent、`/compact` 压缩、`/config` 设置面板、`/hooks` 查看生命周期钩子。完整命令见 `/help`。
+
+Hooks 配置示例（`.claude/settings.json`，与真实 Claude Code 格式一致）：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "./scripts/guard.sh" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Edit|Write", "hooks": [{ "type": "command", "command": "cargo fmt" }] }
+    ]
+  }
+}
+```
 
 ## 设计决策
 
@@ -86,14 +117,25 @@ TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Age
 - **透明可控** —— Agent 循环、工具调用、权限确认全程实时展示，随时可打断。
 - **协议中立** —— 改一行 `provider` 即可切换供应商，不绑定任何一家。
 
+## 已知限制
+
+- **输入框不总是贴住终端最底部**：TUI 用 `ratatui::Viewport::Inline` 按内容实际高度动态定高，
+  而非撑满整个终端高度。曾尝试让 Inline viewport 撑到接近终端整高以让输入框固定贴底，但实测
+  在 tmux 下 ratatui + crossterm 的光标位置查询有相当概率与实际渲染错位（不仅贴不到底，严重时
+  刚输入的字符会不可见），且在最小复现示例中同样能独立复现，判断为 ratatui/crossterm 层面的
+  限制而非本项目代码可修的 bug，故保留当前动态定高方案。
+- **已冻结内容 resize 不会重新换行**：已写入终端原生 scrollback 的历史消息（`insert_before`）
+  脱离应用状态管辖，终端窗口 resize 后不会重排；历史回看长度由终端自身 scrollback 缓冲区大小
+  决定，应用内不再提供 PageUp/PageDown 等翻页快捷键（交还给终端原生处理）。
+
 ## 贡献
 
 ```bash
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-Fork → 特性分支 → PR，描述清楚动机与接口变化。
+Fork → 特性分支 → PR，描述清楚动机与接口变化。详细约定见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
 
 ## 许可证
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0，任选其一。见 [`LICENSE-MIT`](./LICENSE-MIT) / [`LICENSE-APACHE`](./LICENSE-APACHE)。

@@ -55,6 +55,7 @@ cli:
   headless_help: "Force headless REPL mode"
   plan_help: "Plan mode: enable only read-only tools (read/glob/grep/web_fetch), for planning and analysis"
   bypass_help: "Bypass mode: auto-approve every tool call, no permission prompts"
+  no_hooks_help: "Disable the Hooks automation system (do not run shell hooks from .claude/settings.json)"
   continue_help: "Resume the last session (continue the previous conversation)"
   resume_help: "Resume a specific session ID (e.g. sess-1719723000)"
   profile_help: "One-shot override of which call profile to use this run (not persisted, doesn't change active_profile)"
@@ -90,6 +91,7 @@ main:
   mode_info_plan: " [plan mode: read-only tools only]"
   mode_info_bypass: " [bypass mode: skipping permission prompts]"
   session_stats: "Session stats"
+  hooks_loaded_notice: "⚠️ {count} Hook(s) detected from .claude/settings.json. They will execute arbitrary shell commands during tool calls / the conversation lifecycle. If this is unexpected, review the file or use --no-hooks to disable them."
 
 help:
   desc: "Show all available commands and keyboard shortcuts"
@@ -110,6 +112,7 @@ help:
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
+    - `/hooks` — List currently active Hooks (grouped by event)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
     - `/mode [mode]` — Switch run mode (normal / plan / bypass)
     - `/resume [id]` — Resume a past session (no arg = picker)
@@ -165,6 +168,16 @@ cost:
   context_line: "Context: {pct}% ({estimated} / {window} tokens)"
   cache_line: "Cache:  {read} read + {write} written tokens (~{saved_pct}% saved vs full-price input; cost included in the total above)"
   subagent_line: "Sub-agents: input {input} + output {output} = {total} tokens (tracked separately from the main session; cost not included in the estimate above)"
+
+hooks:
+  desc: "List currently active Hooks (grouped by event)"
+  disabled_banner: "[Hooks disabled by --no-hooks]"
+  empty_note: "No Hooks configuration found. Define a `hooks` field in `~/.claude/settings.json` or the project's `.claude/settings.json` to enable them."
+  header: "Active Hooks:"
+  event_line: "[{event}]"
+  matcher_line: "matcher: {matcher}"
+  matcher_any: "* (matches all tools)"
+  command_line: "({timeout}s) `{command}`"
 
 agents:
   desc: "List available subagent types (built-in + custom definition files)"
