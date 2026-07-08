@@ -147,19 +147,43 @@ pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', 
 /// ToolResult 折叠阈值：内容行数超过此值才折叠，否则始终全量展示。
 pub const TOOL_RESULT_FOLD_LINES: usize = 5;
 
+/// 从正文行中去掉与 `⎿` 摘要行重复的第一条非空行——仅当 `summary_is_first_line`
+/// 为真（即摘要直接复用了正文首行原文，如 Bash 输出首行）时才需要去重；
+/// `read`/`grep`/`glob`/`webfetch` 等摘要是合成统计文案，不会与正文重复，原样保留。
+fn strip_summary_duplicate_line<'a>(
+    lines: &[&'a str],
+    summary_is_first_line: bool,
+) -> Vec<&'a str> {
+    if !summary_is_first_line {
+        return lines.to_vec();
+    }
+    match lines.iter().position(|l| !l.trim().is_empty()) {
+        Some(idx) => {
+            let mut v = lines.to_vec();
+            v.remove(idx);
+            v
+        }
+        None => lines.to_vec(),
+    }
+}
+
 /// 判断一条 ToolResult 的内容是否「可折叠」：非 Edit/Write（永不折叠，走独立 diff 渲染）
-/// 且正文非空、不等于摘要行、行数超过 [`TOOL_RESULT_FOLD_LINES`]。
+/// 且去重后（见 [`strip_summary_duplicate_line`]）正文行数超过 [`TOOL_RESULT_FOLD_LINES`]。
 /// 纯函数不依赖 `ChatMessage`，调用方（render.rs 的 last_collapsible_idx 预扫描 /
 /// app.rs 的 Ctrl+O 处理）各自按需叠加 `!expanded` 等额外条件。
 pub fn is_collapsible_tool_result_content(
     content: &str,
     tool_name: Option<&str>,
-    summary: &str,
+    summary_is_first_line: bool,
 ) -> bool {
     if matches!(tool_name, Some("Edit") | Some("Write")) {
         return false;
     }
-    !content.is_empty() && content != summary && content.lines().count() > TOOL_RESULT_FOLD_LINES
+    if content.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    strip_summary_duplicate_line(&lines, summary_is_first_line).len() > TOOL_RESULT_FOLD_LINES
 }
 
 /// 渲染 ToolResult 正文行，`take` 为 `Some(n)` 时只取开头 n 行（折叠态预览），
@@ -333,13 +357,10 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     if state.exec_mode_confirm.is_some() {
         return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
     }
-    if let Some(dlg) = &state.plan_dialog {
-        // 计划正文可能很长：面板最多占用可用高度的 70%（保留聊天区/输入框可见），
-        // 内部通过滚动查看超出部分，见 draw_plan_approval_panel。
-        let content_lines = dlg.plan.lines().count().max(1) as u16;
-        let max_h = (area_height * 7 / 10).max(6);
-        let h = (content_lines + 3).clamp(6, max_h);
-        return (h, BottomPanel::PlanApproval);
+    if state.plan_dialog.is_some() {
+        // 计划正文已作为普通消息并入聊天流（获得终端原生 scrollback 滚动），
+        // 这里只剩固定 3 行的三选一选择器，贴在输入框上方，宽度对齐 Permission。
+        return (5u16.min(area_height), BottomPanel::PlanApproval);
     }
     if let Some(dlg) = &state.ask_question_dialog {
         let h = match dlg.stage {
@@ -523,17 +544,11 @@ pub(crate) fn last_collapsible_tool_result_idx(messages: &[ChatMessage]) -> Opti
             if !matches!(m.role, MessageRole::ToolResult) {
                 return false;
             }
-            let summary = if m.display_summary.is_empty() {
-                m.content
-                    .lines()
-                    .next()
-                    .unwrap_or("done")
-                    .trim()
-                    .to_string()
-            } else {
-                m.display_summary.clone()
-            };
-            is_collapsible_tool_result_content(&m.content, m.tool_name.as_deref(), &summary)
+            is_collapsible_tool_result_content(
+                &m.content,
+                m.tool_name.as_deref(),
+                m.summary_is_first_line,
+            )
         })
         .map(|(i, _)| i)
 }
@@ -696,14 +711,17 @@ fn render_chat_message(
                 Span::styled(elapsed_str, Theme::dim()),
             ]));
 
-            // 展开/折叠详细内容（ctrl+o）
-            if !msg.content.is_empty() && msg.content != summary {
+            // 展开/折叠详细内容（ctrl+o）。去重：若 `⎿` 摘要行直接复用了正文首行原文
+            // （`summary_is_first_line`），正文渲染时跳过该行，避免重复展示同一行。
+            let raw_content_lines: Vec<&str> = msg.content.lines().collect();
+            let content_lines_deduped =
+                strip_summary_duplicate_line(&raw_content_lines, msg.summary_is_first_line);
+            if !content_lines_deduped.is_empty() {
                 // Read 结果每行带 "行号\t" 前缀（供模型精确编辑用），人类展示层去掉，
                 // 不改 msg.content 本身，模型侧历史记录不受影响。
                 let is_read = msg.tool_name.as_deref() == Some("Read");
-                let content_lines: Vec<&str> = msg
-                    .content
-                    .lines()
+                let content_lines: Vec<&str> = content_lines_deduped
+                    .into_iter()
                     .map(|l| {
                         if is_read {
                             strip_read_line_number(l)
@@ -862,6 +880,35 @@ fn render_chat_message(
                 format!("  {}", msg.content),
                 Theme::dim(),
             )]));
+            lines.push(Line::from(""));
+        }
+
+        // ─── 📋 计划正文  ────────────────────────────────────────────
+        // 并入正常消息流以获得终端原生 scrollback 滚动；批准/继续规划/手动输入
+        // 的交互留在贴底的 draw_plan_approval_selector。
+        MessageRole::PlanProposal => {
+            let divider = "─".repeat(max_content_width.saturating_sub(2));
+            lines.push(Line::from(Span::styled(
+                "  📋 计划",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  {divider}"),
+                Style::default().fg(Color::Blue),
+            )));
+            let mut body: Vec<Line<'static>> = vec![];
+            render_markdown(&mut body, &msg.content, max_content_width.saturating_sub(2));
+            for l in body {
+                let mut spans = vec![Span::raw("  ")];
+                spans.extend(l.spans);
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {divider}"),
+                Style::default().fg(Color::Blue),
+            )));
             lines.push(Line::from(""));
         }
     }
@@ -1802,51 +1849,62 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
 
 // ─── AskQuestion 底部面板 ─────────────────────────────────────────────────────
 
+/// 计划正文已经作为 `MessageRole::PlanProposal` 消息并入聊天流展示（见
+/// `render_chat_message`），这里只剩固定 3 行的三选一选择器：批准 / 继续规划 /
+/// 手动输入反馈，↑/↓ 选中 + Enter 确认，对齐 `draw_permission_dialog` 的贴底样式。
 fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue))
         .title(Span::styled(
-            " 📋 计划已就绪 ",
+            " 📋 计划已就绪 · ↑/↓ 选择 · Enter 确认 ",
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
         ));
-
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // 底部固定一行操作提示，其余空间展示计划正文（可滚动）
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let (content_area, hint_area) = (rows[0], rows[1]);
-
-    let mut lines: Vec<Line<'static>> = vec![];
-    render_markdown(&mut lines, &dlg.plan, content_area.width as usize);
-    let text = Text::from(lines);
-
-    let cw = content_area.width.max(1);
-    let para = Paragraph::new(text).wrap(Wrap { trim: false });
-    let total_visual_lines = para.line_count(cw).min(u16::MAX as usize) as u16;
-    let visible_height = content_area.height;
-    let max_scroll = total_visual_lines.saturating_sub(visible_height);
-    let scroll = dlg.scroll.min(max_scroll);
-    f.render_widget(para.scroll((scroll, 0)), content_area);
-
-    let hint = if total_visual_lines > visible_height {
-        "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划   [↑/↓] 滚动查看完整计划"
+    let cursor = dlg.cursor();
+    let max_w = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = vec![
+        plan_option_row(0, cursor, "批准并切换至执行模式", max_w),
+        plan_option_row(1, cursor, "继续规划", max_w),
+    ];
+    if let Some(input) = dlg.freetext_input() {
+        let text = input.lines.first().map(|s| s.as_str()).unwrap_or("");
+        lines.push(Line::from(Span::styled(
+            format!(
+                "❯ 手动输入： {}_",
+                truncate_line(text, max_w.saturating_sub(8))
+            ),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        )));
     } else {
-        "  [y/Enter] 批准并切换至执行模式   [n/Esc] 继续规划"
-    };
-    let hint_para = Paragraph::new(Line::from(Span::styled(
-        hint,
-        Style::default()
-            .fg(Color::Blue)
-            .add_modifier(Modifier::BOLD),
-    )));
-    f.render_widget(hint_para, hint_area);
+        lines.push(plan_option_row(2, cursor, "手动输入反馈…", max_w));
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// 三选一面板里的单行选项：高亮项用 "▶ label"（Claude 主题色加粗），
+/// 与 `build_answering_lines` 的 AskQuestion 单选样式保持一致。
+fn plan_option_row(idx: usize, cursor: usize, label: &str, max_w: usize) -> Line<'static> {
+    if idx == cursor {
+        Line::from(Span::styled(
+            format!("▶ {}", truncate_line(label, max_w.saturating_sub(2))),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(
+            format!("  {}", truncate_line(label, max_w.saturating_sub(2))),
+            Style::default().fg(Color::White),
+        ))
+    }
 }
 
 fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmDialog, area: Rect) {
@@ -3609,7 +3667,7 @@ mod tool_result_fold_tests {
 
     #[test]
     fn empty_content_is_not_collapsible() {
-        assert!(!is_collapsible_tool_result_content("", None, ""));
+        assert!(!is_collapsible_tool_result_content("", None, false));
     }
 
     #[test]
@@ -3632,9 +3690,11 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn content_equal_to_summary_is_not_collapsible() {
+    fn single_line_matching_summary_is_not_collapsible() {
+        // 单行输出且摘要复用了该行（summary_is_first_line=true）：去重后正文为空，
+        // 不应再判定为可折叠（也不应在展开态渲染出一条和摘要重复的正文）。
         let content = "only line";
-        assert!(!is_collapsible_tool_result_content(content, None, content));
+        assert!(!is_collapsible_tool_result_content(content, None, true));
     }
 
     #[test]
@@ -3643,12 +3703,12 @@ mod tool_result_fold_tests {
         assert!(!is_collapsible_tool_result_content(
             &content,
             Some("Edit"),
-            "summary"
+            true
         ));
         assert!(!is_collapsible_tool_result_content(
             &content,
             Some("Write"),
-            "summary"
+            true
         ));
     }
 
@@ -3658,7 +3718,7 @@ mod tool_result_fold_tests {
         assert!(!is_collapsible_tool_result_content(
             &content,
             Some("Read"),
-            "summary"
+            false
         ));
     }
 
@@ -3668,8 +3728,37 @@ mod tool_result_fold_tests {
         assert!(is_collapsible_tool_result_content(
             &content,
             Some("Read"),
-            "summary"
+            false
         ));
+    }
+
+    #[test]
+    fn duplicate_first_line_is_stripped_before_fold_threshold_check() {
+        // Bash 摘要复用了首行原文：总行数 FOLD_LINES+1，去重后恰好 FOLD_LINES 行，
+        // 不应判定为可折叠（修复前会把这条已在摘要展示过的首行也计入正文渲染）。
+        let content = lines_str(TOOL_RESULT_FOLD_LINES + 1);
+        assert!(!is_collapsible_tool_result_content(
+            &content,
+            Some("Bash"),
+            true
+        ));
+        // 再多一行，去重后超过阈值，才应判定为可折叠。
+        let content = lines_str(TOOL_RESULT_FOLD_LINES + 2);
+        assert!(is_collapsible_tool_result_content(
+            &content,
+            Some("Bash"),
+            true
+        ));
+    }
+
+    #[test]
+    fn strip_summary_duplicate_line_drops_only_first_nonempty_line() {
+        let lines = vec!["", "first", "second", "third"];
+        assert_eq!(
+            strip_summary_duplicate_line(&lines, true),
+            vec!["", "second", "third"]
+        );
+        assert_eq!(strip_summary_duplicate_line(&lines, false), lines);
     }
 
     #[test]

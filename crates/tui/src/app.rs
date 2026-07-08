@@ -56,6 +56,9 @@ pub enum MessageRole {
     System,
     /// 每轮结束后的耗时/token 摘要行
     TurnSummary,
+    /// ExitPlanMode 提交的计划正文——作为普通消息并入聊天流，天然获得终端原生
+    /// scrollback 滚动能力；批准/拒绝/手动输入的交互留在贴底的 `PlanApprovalDialog`。
+    PlanProposal,
 }
 
 /// 渲染用消息
@@ -73,6 +76,9 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     /// ToolResult 的一行摘要（Claude Code ⎿ 行）
     pub display_summary: String,
+    /// `display_summary` 是否直接复用了 `content` 的第一行原文（ToolResult 专用）。
+    /// 为真时，展开正文渲染需跳过第一行，避免摘要行与正文首行重复展示。
+    pub summary_is_first_line: bool,
     /// 工具结果是否已展开（ToolResult 专用）
     pub expanded: bool,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
@@ -93,6 +99,7 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
+            summary_is_first_line: false,
             expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
@@ -126,6 +133,7 @@ impl ChatMessage {
         seq: usize,
         name: String,
         summary: String,
+        summary_is_first_line: bool,
     ) -> Self {
         Self {
             role: MessageRole::ToolResult,
@@ -135,6 +143,7 @@ impl ChatMessage {
             sequence_no: Some(seq),
             tool_name: Some(name),
             display_summary: summary,
+            summary_is_first_line,
             expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
@@ -150,6 +159,7 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
+            summary_is_first_line: false,
             expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
@@ -168,6 +178,10 @@ impl ChatMessage {
             fmt_tokens(d_output),
         );
         Self::base(MessageRole::TurnSummary, content)
+    }
+
+    fn plan_proposal(plan: String) -> Self {
+        Self::base(MessageRole::PlanProposal, plan)
     }
 }
 
@@ -619,10 +633,136 @@ impl AskQuestionDialog {
 
 /// ExitPlanMode 工具触发的计划批准对话框状态
 pub struct PlanApprovalDialog {
-    pub plan: String,
-    /// 已向下滚动的行数（0 = 顶部）
-    pub scroll: u16,
+    /// 三选一高亮状态：复用 AskQuestion 的 `InProgressAnswer`——
+    /// `Single { cursor }` 里 0=批准 1=继续规划 2=手动输入（虚拟位）；
+    /// 落在虚拟位上回车后进入 `FreeText` 子模式就地输入反馈文本。
+    current: InProgressAnswer,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// [`PlanApprovalDialog::handle_key`] 处理完一次按键后，外层（AppState）要采取的动作
+pub enum PlanApprovalOutcome {
+    /// 面板内部状态已更新（移动高亮/编辑文本），继续展示
+    Continue,
+    /// 用户选中「批准」
+    Approve,
+    /// 用户选中「继续规划」（拒绝）
+    Reject,
+    /// 用户在「手动输入」子模式提交了反馈文本
+    Feedback(String),
+}
+
+impl PlanApprovalDialog {
+    pub fn new(response_tx: tokio::sync::oneshot::Sender<bool>) -> Self {
+        Self {
+            current: InProgressAnswer::Single { cursor: 0 },
+            response_tx,
+        }
+    }
+
+    /// 当前高亮的下标（0=批准 1=继续规划 2=手动输入），FreeText 子模式下取其 prior 的下标
+    pub fn cursor(&self) -> usize {
+        match &self.current {
+            InProgressAnswer::Single { cursor } => *cursor,
+            InProgressAnswer::FreeText { prior, .. } => match prior.as_ref() {
+                InProgressAnswer::Single { cursor } => *cursor,
+                _ => 2,
+            },
+            InProgressAnswer::Multi { .. } => 0,
+        }
+    }
+
+    /// 处于「手动输入」自由文本子模式时返回输入框，供渲染层就地展开
+    pub fn freetext_input(&self) -> Option<&InputBox> {
+        match &self.current {
+            InProgressAnswer::FreeText { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+
+    fn freetext_input_mut(&mut self) -> Option<&mut InputBox> {
+        match &mut self.current {
+            InProgressAnswer::FreeText { input, .. } => Some(input),
+            _ => None,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        if let InProgressAnswer::Single { cursor } = &mut self.current {
+            let new = *cursor as i32 + delta;
+            if (0..=2).contains(&new) {
+                *cursor = new as usize;
+            }
+        }
+    }
+
+    /// 统一按键入口：↑/↓ 移动高亮、Enter 确认当前项（手动输入位先展开文本框再提交）、
+    /// Esc 仅用于从 FreeText 子模式退回三选一（不再等价于拒绝计划）。
+    pub fn handle_key(&mut self, code: KeyCode) -> PlanApprovalOutcome {
+        match code {
+            KeyCode::Esc => {
+                if let InProgressAnswer::FreeText { prior, .. } = &self.current {
+                    self.current = (**prior).clone();
+                }
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Up => {
+                self.move_cursor(-1);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Down => {
+                self.move_cursor(1);
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Enter => match &self.current {
+                InProgressAnswer::Single { cursor: 0 } => PlanApprovalOutcome::Approve,
+                InProgressAnswer::Single { cursor: 1 } => PlanApprovalOutcome::Reject,
+                InProgressAnswer::Single { cursor: 2 } => {
+                    self.current = InProgressAnswer::FreeText {
+                        prior: Box::new(InProgressAnswer::Single { cursor: 2 }),
+                        input: InputBox::new(),
+                    };
+                    PlanApprovalOutcome::Continue
+                }
+                InProgressAnswer::FreeText { input, .. } => {
+                    let text = input.lines.join("").trim().to_string();
+                    if text.is_empty() {
+                        PlanApprovalOutcome::Continue
+                    } else {
+                        PlanApprovalOutcome::Feedback(text)
+                    }
+                }
+                InProgressAnswer::Single { .. } | InProgressAnswer::Multi { .. } => {
+                    PlanApprovalOutcome::Continue
+                }
+            },
+            KeyCode::Char(c) => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.insert_char(c);
+                }
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.backspace();
+                }
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Left => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.move_left();
+                }
+                PlanApprovalOutcome::Continue
+            }
+            KeyCode::Right => {
+                if let Some(input) = self.freetext_input_mut() {
+                    input.move_right();
+                }
+                PlanApprovalOutcome::Continue
+            }
+            _ => PlanApprovalOutcome::Continue,
+        }
+    }
 }
 
 /// 检测到"计划已批准但仍在 plan 模式"时弹出的确认对话框
@@ -3479,6 +3619,19 @@ fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
     }
 }
 
+/// 判断 [`tool_result_summary`] 对给定工具/结果是否直接复用了 `content` 的第一行原文
+/// （而非合成的统计文案，如 "read N lines"/"N matches"）。用于展开正文时跳过重复的首行，
+/// 必须与 `tool_result_summary` 的分支保持一致。
+fn summary_reuses_first_line(name: &str, is_error: bool) -> bool {
+    if is_error {
+        return true;
+    }
+    !matches!(
+        name.to_lowercase().as_str(),
+        "read" | "grep" | "glob" | "webfetch"
+    )
+}
+
 #[cfg(test)]
 mod tool_summary_tests {
     use super::*;
@@ -3503,6 +3656,29 @@ mod tool_summary_tests {
         assert_eq!(
             tool_result_summary("WebFetch", "hello", false),
             "fetched 5 bytes"
+        );
+    }
+
+    /// 回归测试：`summary_reuses_first_line` 必须与 `tool_result_summary` 的分支
+    /// 保持一致——合成统计文案（read/grep/glob/webfetch）不会与正文重复，无需去重；
+    /// 其余分支（含 is_error）都是直接复用正文首行，展开正文时必须跳过首行。
+    #[test]
+    fn summary_reuses_first_line_matches_tool_result_summary_branches() {
+        for name in ["Read", "Grep", "Glob", "WebFetch"] {
+            assert!(
+                !summary_reuses_first_line(name, false),
+                "{name} 的摘要是合成统计文案，不应判定为复用首行"
+            );
+        }
+        for name in ["Bash", "Edit", "Write", "SomeUnknownTool"] {
+            assert!(
+                summary_reuses_first_line(name, false),
+                "{name} 的摘要复用了正文首行原文"
+            );
+        }
+        assert!(
+            summary_reuses_first_line("Read", true),
+            "is_error 时摘要恒为正文首行，与工具名无关"
         );
     }
 
@@ -4055,6 +4231,7 @@ impl AppState {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
+                let summary_is_first_line = summary_reuses_first_line(&name, is_error);
                 // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
                 // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
                 // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
@@ -4069,8 +4246,15 @@ impl AppState {
                 } else {
                     None
                 };
-                let mut msg =
-                    ChatMessage::tool_result(output, is_error, elapsed_secs, seq, name, summary);
+                let mut msg = ChatMessage::tool_result(
+                    output,
+                    is_error,
+                    elapsed_secs,
+                    seq,
+                    name,
+                    summary,
+                    summary_is_first_line,
+                );
                 msg.sub_agent_id = sub_id;
                 match call_idx {
                     Some(i) => self.messages.insert(i + 1, msg),
@@ -4236,11 +4420,10 @@ impl AppState {
                 // 表示"调研中"。若预先清掉 is_thinking，弹窗期间主循环的
                 // `if state.is_thinking` 守卫会让 Ctrl+C 中断路径直接失效。
                 // 批准分支会显式写回 true；取消分支走 interrupt() 自行恢复。
-                self.plan_dialog = Some(PlanApprovalDialog {
-                    plan,
-                    scroll: 0,
-                    response_tx,
-                });
+                // 计划正文作为普通消息并入聊天流（天然获得终端原生 scrollback 滚动），
+                // plan_dialog 只保留贴底的三选一选择器状态。
+                self.messages.push(ChatMessage::plan_proposal(plan));
+                self.plan_dialog = Some(PlanApprovalDialog::new(response_tx));
             }
 
             AgentEvent::SubAgent(ev) => self.apply_sub_agent_event(ev),
@@ -7297,8 +7480,9 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ① plan 批准对话框最高优先级
-                    if state.plan_dialog.is_some() {
+                    // ① plan 批准对话框最高优先级：↑/↓ 选中 批准/继续规划/手动输入，
+                    // Enter 确认（手动输入位先展开文本框，再次 Enter 提交）。
+                    if let Some(dlg) = state.plan_dialog.as_mut() {
                         // Ctrl+C 在 plan 弹窗期间直接走 interrupt()。Agent 仍在
                         // `exit_plan_mode().await` 上挂起（ExitPlanMode 工具阻塞等
                         // 用户响应），弹窗分支以 `continue` 收尾会吞掉外层 Ctrl+C
@@ -7312,8 +7496,9 @@ async fn tui_main(
                             state.interrupt();
                             continue;
                         }
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        match dlg.handle_key(key.code) {
+                            PlanApprovalOutcome::Continue => {}
+                            PlanApprovalOutcome::Approve => {
                                 if let Some(dlg) = state.plan_dialog.take() {
                                     let _ = dlg.response_tx.send(true);
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
@@ -7331,8 +7516,8 @@ async fn tui_main(
                                     ));
                                 }
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                // 取消 = 中断当前计划调研。用户随后可在输入框补充新指令
+                            PlanApprovalOutcome::Reject => {
+                                // 拒绝 = 中断当前计划调研。用户随后可在输入框补充新指令
                                 // 或修改方向；不再向 Agent 发送 "keep planning" 反馈让
                                 // 它再写一版。仅解 oneshot + abort current_task 即可。
                                 if let Some(dlg) = state.plan_dialog.take() {
@@ -7343,27 +7528,16 @@ async fn tui_main(
                                     "已中断当前计划调研，可补充指令后继续。".to_string(),
                                 ));
                             }
-                            KeyCode::Up => {
-                                if let Some(dlg) = state.plan_dialog.as_mut() {
-                                    dlg.scroll = dlg.scroll.saturating_sub(1);
+                            PlanApprovalOutcome::Feedback(text) => {
+                                // 手动输入反馈：中断当前调研后，把反馈文本作为下一条用户
+                                // 消息推进 pending_queue——主循环里 !is_thinking 且队列非空
+                                // 的兜底分支会在下一帧自动发起新一轮对话（见该处理逻辑）。
+                                if let Some(dlg) = state.plan_dialog.take() {
+                                    let _ = dlg.response_tx.send(false);
                                 }
+                                state.interrupt();
+                                state.pending_queue.push((text, vec![]));
                             }
-                            KeyCode::Down => {
-                                if let Some(dlg) = state.plan_dialog.as_mut() {
-                                    dlg.scroll = dlg.scroll.saturating_add(1);
-                                }
-                            }
-                            KeyCode::PageUp => {
-                                if let Some(dlg) = state.plan_dialog.as_mut() {
-                                    dlg.scroll = dlg.scroll.saturating_sub(10);
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                if let Some(dlg) = state.plan_dialog.as_mut() {
-                                    dlg.scroll = dlg.scroll.saturating_add(10);
-                                }
-                            }
-                            _ => {}
                         }
                         continue;
                     }
@@ -8364,20 +8538,10 @@ async fn tui_main(
                                             if !matches!(m.role, MessageRole::ToolResult) {
                                                 return false;
                                             }
-                                            let summary = if m.display_summary.is_empty() {
-                                                m.content
-                                                    .lines()
-                                                    .next()
-                                                    .unwrap_or("done")
-                                                    .trim()
-                                                    .to_string()
-                                            } else {
-                                                m.display_summary.clone()
-                                            };
                                             crate::render::is_collapsible_tool_result_content(
                                                 &m.content,
                                                 m.tool_name.as_deref(),
-                                                &summary,
+                                                m.summary_is_first_line,
                                             )
                                         })
                                     {
@@ -8541,6 +8705,7 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                                 seq,
                                 String::new(),
                                 summary,
+                                true,
                             ));
                         }
                         _ => {}
@@ -8920,6 +9085,113 @@ mod ask_question_dialog_tests {
         let _ = dlg.response_tx.send(Some(answers));
         let received = rx.await.unwrap();
         assert_eq!(received.map(|v| v.len()), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod plan_approval_dialog_tests {
+    use super::*;
+
+    fn make_dialog() -> (PlanApprovalDialog, tokio::sync::oneshot::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (PlanApprovalDialog::new(tx), rx)
+    }
+
+    #[test]
+    fn starts_with_approve_highlighted() {
+        let (dlg, _rx) = make_dialog();
+        assert_eq!(dlg.cursor(), 0);
+    }
+
+    #[test]
+    fn down_moves_through_all_three_options_and_clamps() {
+        let (mut dlg, _rx) = make_dialog();
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Down),
+            PlanApprovalOutcome::Continue
+        ));
+        assert_eq!(dlg.cursor(), 1);
+        dlg.handle_key(KeyCode::Down);
+        assert_eq!(dlg.cursor(), 2);
+        // 已经在最后一项，继续按 Down 不应越界
+        dlg.handle_key(KeyCode::Down);
+        assert_eq!(dlg.cursor(), 2);
+        dlg.handle_key(KeyCode::Up);
+        assert_eq!(dlg.cursor(), 1);
+    }
+
+    #[test]
+    fn enter_on_first_option_approves() {
+        let (mut dlg, _rx) = make_dialog();
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Enter),
+            PlanApprovalOutcome::Approve
+        ));
+    }
+
+    #[test]
+    fn enter_on_second_option_rejects() {
+        let (mut dlg, _rx) = make_dialog();
+        dlg.handle_key(KeyCode::Down);
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Enter),
+            PlanApprovalOutcome::Reject
+        ));
+    }
+
+    #[test]
+    fn enter_on_third_option_opens_freetext_then_submits() {
+        let (mut dlg, _rx) = make_dialog();
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Down);
+        assert_eq!(dlg.cursor(), 2);
+        // 第一次 Enter：展开自由文本输入框，尚未提交
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Enter),
+            PlanApprovalOutcome::Continue
+        ));
+        assert!(dlg.freetext_input().is_some());
+        for c in "多加个错误处理".chars() {
+            dlg.handle_key(KeyCode::Char(c));
+        }
+        // 第二次 Enter：提交反馈文本
+        let PlanApprovalOutcome::Feedback(text) = dlg.handle_key(KeyCode::Enter) else {
+            panic!("expected Feedback outcome");
+        };
+        assert_eq!(text, "多加个错误处理");
+    }
+
+    #[test]
+    fn empty_freetext_submit_is_ignored() {
+        let (mut dlg, _rx) = make_dialog();
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Enter); // 进入自由文本子模式
+        assert!(matches!(
+            dlg.handle_key(KeyCode::Enter),
+            PlanApprovalOutcome::Continue
+        ));
+    }
+
+    #[test]
+    fn esc_in_freetext_returns_to_selector_without_rejecting() {
+        let (mut dlg, _rx) = make_dialog();
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Enter); // 进入自由文本子模式
+        assert!(dlg.freetext_input().is_some());
+        dlg.handle_key(KeyCode::Esc);
+        assert!(dlg.freetext_input().is_none());
+        assert_eq!(dlg.cursor(), 2);
+    }
+
+    #[tokio::test]
+    async fn approve_sends_true_via_response_tx() {
+        let (mut dlg, rx) = make_dialog();
+        let outcome = dlg.handle_key(KeyCode::Enter);
+        assert!(matches!(outcome, PlanApprovalOutcome::Approve));
+        let _ = dlg.response_tx.send(true);
+        assert!(rx.await.unwrap());
     }
 }
 
