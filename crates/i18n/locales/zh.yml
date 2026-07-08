@@ -59,6 +59,26 @@ cli:
   profile_help: "一次性指定本次运行使用的调用分组（不落盘、不改 active_profile）"
   profile_not_found: "未找到分组 '{name}'，请用 --config-status 查看已有分组"
   plugin_dir_help: "加载本地插件目录用于开发调试（临时生效：仅当次运行有效，不落盘，不出现在 /plugins 已安装列表中）"
+  update_about: "检查并更新到 GitHub 最新 release 版本"
+  update_yes_help: "跳过确认提示，直接更新（适合脚本调用）"
+
+update:
+  checking: "正在检查最新版本…"
+  up_to_date: "当前已是最新版本 v{version}"
+  available: "发现新版本：v{current} → v{latest}"
+  release_notes_header: "更新内容："
+  confirm_prompt: "是否更新？[y/N] "
+  cancelled: "已取消更新"
+  unsupported_platform: "当前平台（{os}/{arch}）暂不支持自动更新，请前往 GitHub Releases 页面手动下载"
+  asset_not_found: "未找到匹配当前平台（{target}）的安装包，请前往 GitHub Releases 页面手动下载"
+  downloading: "正在下载 {name}…"
+  checksum_mismatch: "下载或校验失败，已放弃更新：{err}"
+  extracting: "正在解压…"
+  extract_error: "解压安装包失败：{err}"
+  replacing: "正在替换二进制…"
+  success: "已更新到 v{version}（{path}），重启 wyj-code 生效"
+  network_error: "请求失败：{err}"
+  permission_error: "替换二进制失败：{err}（请检查安装目录权限，或改用 sudo 重新安装）"
 
 main:
   session_not_found: "未找到会话 {id}，将开始新会话。"

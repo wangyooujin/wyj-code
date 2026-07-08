@@ -22,6 +22,7 @@ wyj-i18n.workspace = true
 wyj-store.workspace = true
 tokio.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -13,6 +13,7 @@ pub mod mcp_install;
 pub mod plugin_install;
 pub mod plugin_manifest;
 pub mod registry;
+pub mod self_update;
 pub mod skill_install;
 
 pub use lockfile::{disabled_mcp_names, disabled_skill_names, InstallScope};
