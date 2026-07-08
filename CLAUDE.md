@@ -13,6 +13,7 @@ cargo run -- --config-status     # 查看当前配置和 API Key 状态
 cargo run -- --cwd <dir>         # 指定工作目录（默认当前目录）
 cargo run -- --plan              # 以 Plan 模式启动（仅只读工具）
 cargo run -- --bypass-permissions # 以 Bypass 模式启动（跳过权限确认）
+cargo run -- --no-hooks           # 禁用 Hooks 自动化系统
 cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
 
@@ -83,6 +84,8 @@ args = ["--flag"]
 
 **`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`）已迁移到 `/model` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文。当前 i18n 仅覆盖用户可见 UI 文案（TUI 对话框、slash 命令输出、CLI --help/--config-status）；模型侧提示词（system prompt、工具描述等）为英文常量不走 i18n（见上方"模型侧提示词"节），工具内部错误消息等仍为中文，待后续阶段迁移。
 
+**Hooks 自动化系统**（对齐真实 Claude Code 的 `.claude/settings.json` hooks）：生命周期钩子配置来源与 CLAUDE.md 同一哲学，复用 `~/.claude/` 与项目 `.claude/` 路径。三源合并顺序：`~/.claude/settings.json` → `<git-root>/.claude/settings.json` → `<git-root>/.claude/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
+
 ## Architecture
 
 这是一个 Rust workspace，单一 `wyj-code` 二进制，零遥测。各 crate 职责：
@@ -112,6 +115,7 @@ args = ["--flag"]
 8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。注入负载携带 `InjectionKind`（`UserMessage` 触发 UI 的 pending_queue 回放；`SystemReminder` 用于后台子 Agent 结果，对用户消息队列不可见）。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
 9. **插件市场 / MCP / Skill 安装管理**（`wyj-store` + TUI `/plugins` `/mcp` `/skills` 面板）：`.claude-plugin` 清单解析（`store::plugin_manifest`）+ marketplace 安装编排（`store::plugin_install`）；`store::lockfile` 记录已安装 MCP/Skill/Plugin 及其启用状态（`InstalledPluginEntry` 等），`store::registry`/`store::marketplace` 分别对接 MCP registry HTTP 与 skill/plugin 的 git marketplace 拉取；三个面板均支持浏览/安装/升级/卸载/启用/禁用，变更需重启生效。`--plugin-dir <dir>` 可临时加载本地开发中的插件（不落盘、不经 lockfile，仅当次运行有效，不出现在 `/plugins` 已安装列表）。
 10. **TUI 聊天区渲染**（对齐 Claude Code 鼠标体验）：主循环用 `ratatui::Viewport::Inline` 而非 alternate screen——已定型的消息一旦满足冻结条件就通过 `Terminal::insert_before` 一次性写入终端真实 scrollback（此后不再参与每帧重绘），鼠标滚轮翻页与原生点击拖拽选中复制因此天然可用，无需 `EnableMouseCapture`（那会让终端把鼠标事件整个交给应用，原生选中就没法用了，历史上这个取舍反复过好几次）。冻结判定 `app::compute_freezable_up_to` 三条阻塞规则：① 该位置是 `ToolCall` 但对应 `ToolResult` 未出现（`parallel_safe()` 工具并发乱序完成，结果可能 `insert` 在更早位置之后，未落定前不能冻结）；② `render::last_collapsible_tool_result_idx` 命中的位置及其后（Ctrl+O 仍需要能切换到它）；③ 关联子 Agent 仍 `Running`（对应位置还在画动态状态行）。冻结前缀之外的"待定尾部"（`AppState.frozen_up_to..`）+ 流式输出，每帧仍照常重绘，渲染逻辑通过 `render::render_message_range` 与冻结路径共用，避免两边 drift。`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/resume` 这 7 个重量级管理对话框（`AppState::wants_fullscreen`）打开期间临时整个重建 `Terminal` 切到 `Viewport::Fullscreen` + `EnterAlternateScreen`（复用原有整屏渲染代码不变），关闭后重建回 Inline；权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，改归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁。Inline viewport 高度由 `render::fixed_footer_height` + `render::pending_chat_visual_height` 每帧计算，变化时重建 Terminal（重建前必须先 `terminal.clear()`，否则新 Terminal 不知道旧视口在屏幕上的位置会导致画面重叠）。接受的取舍：已冻结内容 resize 不会重新换行、历史回看长度由终端自身 scrollback 缓冲区大小决定、不再有应用内 PageUp/PageDown/Ctrl+Home/End 翻页快捷键（交还给终端原生处理）。
+11. **Hooks 生命周期自动化**（v1.1）：详见 Configuration 节 "Hooks 自动化系统"。执行点：`core::agent::Agent::run_turn_with_injection`（`UserPromptSubmit` 在 `git_snapshot` 注入后、`turn` 循环前；`Stop` 在 `!has_tool_calls && !got_injection` 分支、`break` 前）、`core::agent::Agent::exec_tool_call`（`PreToolUse` 在 `is_allowed`/`confirm_tool` 前；`PostToolUse` 在结果组装后、回调 `ToolEvent::End` 前）。子 Agent 工厂 `cli::make_sub_agent_factory` 不装配 `HookRunner`，确保嵌套子任务不触发用户级 hooks。
 
 ### 权限模型（TUI）
 

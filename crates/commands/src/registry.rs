@@ -64,6 +64,8 @@ pub struct CommandContext {
     /// `wyj_store::plugin_install::enabled_plugin_agent_paths` 算好传入），
     /// 供 `/agents` 展示时一并列出插件贡献的自定义 agent 类型。
     pub plugin_agent_paths: Vec<std::path::PathBuf>,
+    /// 当前 Hooks 是否启用（来自 CLI `--no-hooks`）。
+    pub hooks_enabled: bool,
 }
 
 /// Slash 命令 trait
