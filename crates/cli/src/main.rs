@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
@@ -13,10 +13,14 @@ use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
 };
 
+mod update_cmd;
+
 #[derive(Parser, Debug)]
 #[command(name = "wyj-code", version = env!("CARGO_PKG_VERSION"),
           about = wyj_i18n::tr("cli.about"))]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
     #[arg(long)]
     config_status: bool,
     #[arg(short = 'p', long, help = wyj_i18n::tr("cli.prompt_help"))]
@@ -37,6 +41,15 @@ struct Cli {
     profile: Option<String>,
     #[arg(long, help = wyj_i18n::tr("cli.plugin_dir_help"))]
     plugin_dir: Option<std::path::PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    #[command(about = wyj_i18n::tr("cli.update_about"))]
+    Update {
+        #[arg(short = 'y', long, help = wyj_i18n::tr("cli.update_yes_help"))]
+        yes: bool,
+    },
 }
 
 /// TUI 模式下 tracing 日志的落盘位置：`~/.wyj-code/logs/wyj-code.log`（追加写入，
@@ -64,6 +77,10 @@ async fn main() -> Result<()> {
     wyj_i18n::set_locale(&lang);
 
     let mut cli = Cli::parse();
+
+    if let Some(Commands::Update { yes }) = cli.command.take() {
+        return update_cmd::run(yes).await;
+    }
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
