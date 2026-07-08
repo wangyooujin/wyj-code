@@ -296,7 +296,7 @@ fn wrap_reminder(intro: &str, sections: &[(ClaudeMdSource, PathBuf, String)]) ->
     format!("<system-reminder>\n{}\n</system-reminder>", body.trim_end())
 }
 
-fn find_git_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut dir = Some(start);
     while let Some(d) = dir {
         if d.join(".git").exists() {

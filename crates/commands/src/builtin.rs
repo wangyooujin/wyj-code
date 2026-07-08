@@ -323,6 +323,74 @@ fn fmt_num(n: u32) -> String {
     result.chars().rev().collect()
 }
 
+// ── /hooks ───────────────────────────────────────────────────────────────────
+
+pub struct HooksCmd;
+
+#[async_trait]
+impl Command for HooksCmd {
+    fn name(&self) -> &str {
+        "hooks"
+    }
+    fn description(&self) -> String {
+        tr("hooks.desc")
+    }
+    fn usage(&self) -> String {
+        "/hooks".to_string()
+    }
+    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        // 与 `/agents` 同一哲学：实时重新读盘，保证显示的是最新配置文件状态。
+        let settings = wyj_core::load_effective_hooks(&ctx.cwd);
+        let mut out = String::new();
+        if !ctx.hooks_enabled {
+            out.push_str(&tr("hooks.disabled_banner"));
+            out.push('\n');
+        }
+        if settings.hooks.is_empty() {
+            out.push_str(&tr("hooks.empty_note"));
+            return Ok(CommandResult::Output(out));
+        }
+        out.push_str(&tr("hooks.header"));
+
+        let mut events: Vec<&String> = settings.hooks.keys().collect();
+        events.sort();
+        for event in events {
+            let entries = &settings.hooks[event];
+            if entries.iter().all(|e| e.hooks.is_empty()) {
+                continue;
+            }
+            out.push_str(&format!(
+                "\n{}",
+                tr_fmt("hooks.event_line", &[("event", event)])
+            ));
+            for entry in entries {
+                if entry.hooks.is_empty() {
+                    continue;
+                }
+                let any_matcher = tr("hooks.matcher_any");
+                let matcher = entry.matcher.as_deref().unwrap_or(&any_matcher);
+                out.push_str(&format!(
+                    "\n  {}",
+                    tr_fmt("hooks.matcher_line", &[("matcher", matcher)])
+                ));
+                for cmd in &entry.hooks {
+                    out.push_str(&format!(
+                        "\n    {}",
+                        tr_fmt(
+                            "hooks.command_line",
+                            &[
+                                ("timeout", &cmd.timeout.unwrap_or(60).to_string()),
+                                ("command", &cmd.command)
+                            ]
+                        )
+                    ));
+                }
+            }
+        }
+        Ok(CommandResult::Output(out))
+    }
+}
+
 // ── /memory ───────────────────────────────────────────────────────────────────
 
 pub struct MemoryCmd;
@@ -854,6 +922,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
+    reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ModelCmd));
@@ -894,6 +963,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
+    reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ModelCmd));
