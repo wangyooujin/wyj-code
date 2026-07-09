@@ -103,23 +103,39 @@
           <span class="term-dot bg-[#28c840]"></span>
           <span class="ml-3 text-xs text-paper/35">wyj-code — zsh</span>
         </div>
-        <div class="p-5 text-[13px] leading-[1.75] text-paper/85 overflow-x-auto">
-<pre class="whitespace-pre-wrap"><span class="text-phosphor">❯</span> wyj-code
-<span class="text-paper/40">╭─ wyj-code v1.2.0 · claude-opus-4-8 ─────────────────────╮</span>
+        <div class="p-4 sm:p-5 text-[12px] leading-[1.55] text-paper/85 overflow-x-auto">
+          <div class="flex items-center gap-2 text-paper/45">
+            <span class="text-phosphor">❯</span><span>wyj-code</span>
+          </div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.2.0 · claude-opus-4-8</div>
 
-<span class="text-amber-400">You</span>  把 CLI 参数解析里 --resume 的边界情况补一下测试
+          <div class="mt-3 flex gap-2">
+            <span class="shrink-0 text-amber-400 font-semibold">You</span>
+            <span data-i18n="hero.term.user">把 CLI 参数解析里 <code class="text-paper">--resume</code> 的边界情况补一下测试</span>
+          </div>
 
-<span class="text-amber-400">●</span> 正在读取 crates/cli/src/main.rs...
-<span class="text-phosphor">  ⎿</span>  Read main.rs (238 lines)
+          <div class="mt-3">
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.read">正在读取 <span class="text-paper">crates/cli/src/main.rs</span>...</span></div>
+            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.readres">Read main.rs (238 lines)</span></div>
+          </div>
 
-<span class="text-amber-400">●</span> 调用工具 <span class="text-paper">Edit</span> — crates/cli/src/main.rs
-<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">┌─ 允许此次编辑？──────────────────┐</span>
-<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">│ [y] 允许一次  [a] 始终允许  [d] 拒绝 │</span>
-<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">└──────────────────────────────────┘</span>
-<span class="text-phosphor">  ⎿</span>  已写入 +18 -2
+          <div class="mt-3">
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.edit">调用工具 <span class="text-paper">Edit</span> — crates/cli/src/main.rs</span></div>
+            <div class="mt-2 ml-4 rounded-lg border border-white/[0.1] bg-ink-950/70 px-3 py-2 text-[11px] leading-relaxed">
+              <p class="text-paper/70" data-i18n="hero.term.confirm.title">允许此次编辑？</p>
+              <p class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-paper/45">
+                <span><span class="text-phosphor">[y]</span> <span data-i18n="hero.term.confirm.yes">允许一次</span></span>
+                <span><span class="text-phosphor">[a]</span> <span data-i18n="hero.term.confirm.always">始终允许</span></span>
+                <span><span class="text-paper/35">[d]</span> <span data-i18n="hero.term.confirm.deny">拒绝</span></span>
+              </p>
+            </div>
+            <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.written">已写入 <span class="text-phosphor">+18</span> <span class="text-[#ff8a8a]">-2</span></span></div>
+          </div>
 
-<span class="text-amber-400">●</span> 运行 <span class="text-paper">cargo test -p wyj-cli</span>
-<span class="text-phosphor">  ⎿</span>  test result: ok. 12 passed<span class="caret animate-blink"></span></pre>
+          <div class="mt-3">
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.run">运行 <span class="text-paper">cargo test -p wyj-cli</span></span></div>
+            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.testresult">test result: ok. 12 passed</span><span class="caret animate-blink"></span></div>
+          </div>
         </div>
       </div>
     </div>
