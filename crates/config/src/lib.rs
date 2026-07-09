@@ -159,13 +159,31 @@ impl Default for Profile {
 }
 
 /// [subagent] 节 — 子 Agent 全局模型配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SubAgentCfg {
     /// 子 Agent 默认使用的 Profile 名（留空则沿用主 Agent 当前分组与模型）
     pub default_profile: Option<String>,
     /// 内置 Explore 类型专用 Profile 名（留空则回退 default_profile）
     pub explore_profile: Option<String>,
+    /// 是否把子 Agent 完整执行轨迹（工具调用序列、全文 input/output、usage）
+    /// 落盘到 `~/.wyj-code/sessions/<session_id>.subagents/a<id>.jsonl`，供
+    /// `/resume`、`/subagents`、`subagent-trace` 子命令跨会话查看。默认开启。
+    pub trace_enabled: bool,
+    /// 单个子 Agent trace 文件的字节上限，超限后该子 Agent 的后续事件静默停写
+    /// （不影响其它子 Agent、不影响主流程）。默认 256KB。
+    pub trace_max_bytes_per_agent: u64,
+}
+
+impl Default for SubAgentCfg {
+    fn default() -> Self {
+        Self {
+            default_profile: None,
+            explore_profile: None,
+            trace_enabled: true,
+            trace_max_bytes_per_agent: 256 * 1024,
+        }
+    }
 }
 
 /// 主配置结构，对应 ~/.wyj-code/config.toml
@@ -444,4 +462,31 @@ pub fn claude_home_dir() -> Result<PathBuf> {
 pub fn home_dir() -> Result<PathBuf> {
     let user_dirs = UserDirs::new().ok_or_else(|| anyhow::anyhow!("无法获取用户主目录"))?;
     Ok(user_dirs.home_dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod subagent_cfg_tests {
+    use super::SubAgentCfg;
+
+    #[test]
+    fn defaults_enable_trace_with_256kb_cap() {
+        let cfg = SubAgentCfg::default();
+        assert!(cfg.trace_enabled);
+        assert_eq!(cfg.trace_max_bytes_per_agent, 256 * 1024);
+    }
+
+    #[test]
+    fn empty_toml_section_falls_back_to_defaults() {
+        let cfg: SubAgentCfg = toml::from_str("").unwrap();
+        assert!(cfg.trace_enabled);
+        assert_eq!(cfg.trace_max_bytes_per_agent, 256 * 1024);
+    }
+
+    #[test]
+    fn trace_enabled_can_be_turned_off_without_specifying_other_fields() {
+        let cfg: SubAgentCfg = toml::from_str("trace_enabled = false").unwrap();
+        assert!(!cfg.trace_enabled);
+        // 未显式指定的字段仍走默认值
+        assert_eq!(cfg.trace_max_bytes_per_agent, 256 * 1024);
+    }
 }

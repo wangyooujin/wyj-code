@@ -140,3 +140,57 @@ pub async fn connect_mcp_server(cfg: &McpServerConfig) -> Result<Vec<McpBridgeTo
     );
     Ok(bridges)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::McpServerConfig;
+
+    fn stdio_cfg(command: Option<&str>) -> McpServerConfig {
+        McpServerConfig {
+            name: "test-server".to_string(),
+            transport: McpTransport::Stdio,
+            command: command.map(str::to_string),
+            args: vec![],
+            env: Default::default(),
+        }
+    }
+
+    // `McpBridgeTool`（Ok 分支类型）不实现 Debug（内部持有 rmcp 的连接句柄），
+    // 用不到 Debug 的错误信息提取代替 `.unwrap_err()`。
+    async fn expect_err_containing(cfg: &McpServerConfig, needle: &str) {
+        match connect_mcp_server(cfg).await {
+            Ok(_) => panic!("expected connect_mcp_server to fail"),
+            Err(e) => assert!(
+                e.to_string().contains(needle),
+                "error message {:?} does not contain {needle:?}",
+                e.to_string()
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_server_rejects_non_stdio_transport() {
+        let cfg = McpServerConfig {
+            name: "http-server".to_string(),
+            transport: McpTransport::Http,
+            command: None,
+            args: vec![],
+            env: Default::default(),
+        };
+        expect_err_containing(&cfg, "stdio").await;
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_server_requires_command_for_stdio() {
+        expect_err_containing(&stdio_cfg(None), "command").await;
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_server_fails_fast_on_unspawnable_command() {
+        // 命令存在但不是可执行文件/不存在于 PATH，验证子进程启动失败会被
+        // 正确包装成 Err 而不是 panic，不依赖任何真实 MCP server。
+        let cfg = stdio_cfg(Some("wyj-code-definitely-not-a-real-binary-xyz"));
+        expect_err_containing(&cfg, "启动 MCP 子进程失败").await;
+    }
+}

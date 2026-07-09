@@ -52,6 +52,159 @@ enum Commands {
         #[arg(short = 'y', long, help = wyj_i18n::tr("cli.update_yes_help"))]
         yes: bool,
     },
+    /// 查看指定会话落盘的子 Agent 执行轨迹（`~/.wyj-code/sessions/<id>.subagents/`）。
+    /// 纯读、不影响任何运行中状态；对应 TUI 内 `/subagents` 命令的 headless 版本。
+    #[command(name = "subagent-trace", about = wyj_i18n::tr("cli.subagent_trace_about"))]
+    SubagentTrace {
+        #[arg(help = wyj_i18n::tr("cli.subagent_trace_session_id_help"))]
+        session_id: String,
+        #[arg(help = wyj_i18n::tr("cli.subagent_trace_sub_id_help"))]
+        sub_id: Option<u64>,
+        #[arg(long, help = wyj_i18n::tr("cli.subagent_trace_json_help"))]
+        json: bool,
+    },
+}
+
+/// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
+/// 打印落盘的子 Agent trace（见 `wyj_tools::trace`）。不带 sub_id 列出该会话
+/// 全部子 Agent 概览；带 sub_id 打印完整工具序列 + 全文 input/output + 最终结果，
+/// `--json` 直接吐原始 JSONL 供管道处理。
+fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> Result<()> {
+    use wyj_tools::trace::{list_trace_ids, read_trace, trace_file};
+
+    let sessions_dir = wyj_config::config_dir()?.join("sessions");
+
+    match sub_id {
+        None => {
+            let ids = list_trace_ids(&sessions_dir, session_id);
+            if ids.is_empty() {
+                println!(
+                    "{}",
+                    wyj_i18n::tr_fmt("subagent_trace.no_records", &[("session", session_id)])
+                );
+                return Ok(());
+            }
+            for id in ids {
+                let path = trace_file(&sessions_dir, session_id, id);
+                let events = read_trace(&path).unwrap_or_default();
+                print_subagent_trace_summary(id, &events);
+            }
+        }
+        Some(id) => {
+            let path = trace_file(&sessions_dir, session_id, id);
+            let events = read_trace(&path).unwrap_or_default();
+            if events.is_empty() {
+                println!(
+                    "{}",
+                    wyj_i18n::tr_fmt(
+                        "subagent_trace.not_found",
+                        &[("session", session_id), ("id", &id.to_string())]
+                    )
+                );
+                return Ok(());
+            }
+            if json {
+                print!("{}", std::fs::read_to_string(&path).unwrap_or_default());
+            } else {
+                print_subagent_trace_detail(id, &events);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_subagent_trace_summary(id: u64, events: &[wyj_tools::trace::TraceEvent]) {
+    use wyj_tools::trace::TraceEvent as TE;
+    let (mut agent_type, mut description) = (String::new(), String::new());
+    let mut status = "interrupted";
+    let mut elapsed = 0.0_f64;
+    let mut tool_calls = 0usize;
+    let (mut in_tok, mut out_tok) = (0u32, 0u32);
+    for ev in events {
+        match ev {
+            TE::Started {
+                agent_type: t,
+                description: d,
+                ..
+            } => {
+                agent_type = t.clone();
+                description = d.clone();
+            }
+            TE::ToolStart { .. } => tool_calls += 1,
+            TE::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                in_tok += input_tokens;
+                out_tok += output_tokens;
+            }
+            TE::Done {
+                is_error,
+                elapsed_secs,
+                ..
+            } => {
+                status = if *is_error { "failed" } else { "done" };
+                elapsed = *elapsed_secs;
+            }
+            TE::ToolEnd { .. } => {}
+        }
+    }
+    println!(
+        "a{id}  {agent_type}({description})  [{status}]  {elapsed:.1}s  {tool_calls} tool calls  ↑{in_tok} ↓{out_tok}"
+    );
+}
+
+fn print_subagent_trace_detail(id: u64, events: &[wyj_tools::trace::TraceEvent]) {
+    use wyj_tools::trace::TraceEvent as TE;
+    println!("=== a{id} ===");
+    for ev in events {
+        match ev {
+            TE::Started {
+                agent_type,
+                description,
+                background,
+                parent_tool_use_id,
+            } => {
+                println!(
+                    "[started] {agent_type}({description})  background={background}  parent_tool_use_id={}",
+                    parent_tool_use_id.as_deref().unwrap_or("-")
+                );
+            }
+            TE::ToolStart {
+                tool_name,
+                input_json,
+                truncated,
+            } => {
+                let mark = if *truncated { " [truncated]" } else { "" };
+                println!("  > {tool_name}{mark}\n    input: {input_json}");
+            }
+            TE::ToolEnd {
+                tool_name,
+                is_error,
+                elapsed_secs,
+                output,
+                truncated,
+            } => {
+                let ok = if *is_error { "✗" } else { "✓" };
+                let mark = if *truncated { " [truncated]" } else { "" };
+                println!("  {ok} {tool_name} ({elapsed_secs:.1}s){mark}\n    output: {output}");
+            }
+            TE::Usage {
+                input_tokens,
+                output_tokens,
+            } => {
+                println!("  usage: ↑{input_tokens} ↓{output_tokens}");
+            }
+            TE::Done {
+                result,
+                is_error,
+                elapsed_secs,
+            } => {
+                let ok = if *is_error { "✗" } else { "✓" };
+                println!("[done] {ok} {elapsed_secs:.1}s\n{result}");
+            }
+        }
+    }
 }
 
 /// TUI 模式下 tracing 日志的落盘位置：`~/.wyj-code/logs/wyj-code.log`（追加写入，
@@ -80,8 +233,15 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
 
-    if let Some(Commands::Update { yes }) = cli.command.take() {
-        return update_cmd::run(yes).await;
+    if let Some(cmd) = cli.command.take() {
+        match cmd {
+            Commands::Update { yes } => return update_cmd::run(yes).await,
+            Commands::SubagentTrace {
+                session_id,
+                sub_id,
+                json,
+            } => return run_subagent_trace_cmd(&session_id, sub_id, json),
+        }
     }
 
     let filter =
@@ -380,7 +540,17 @@ async fn main() -> Result<()> {
         plugin_agent_paths.extend(local.agent_paths.clone());
     }
     let agent_defs = Arc::new(wyj_core::load_agent_defs(&cwd, &plugin_agent_paths));
-    let sub_agent_hub = Arc::new(wyj_tools::SubAgentHub::new());
+    // 子 Agent 执行轨迹落盘（`SubAgentCfg::trace_enabled`，默认开启）：与
+    // TUI/headless 共用同一个 Hub，`emit()` 集中接入，两端自动获得持久化能力。
+    let sub_agent_hub = Arc::new(if cfg.subagent.trace_enabled {
+        wyj_tools::SubAgentHub::new().with_trace(
+            config_base.join("sessions"),
+            session_id.clone(),
+            cfg.subagent.trace_max_bytes_per_agent,
+        )
+    } else {
+        wyj_tools::SubAgentHub::new()
+    });
     let sub_agent_factory = make_sub_agent_factory(cfg.clone(), claude_md_loader.clone());
     registry.register_arc(Arc::new(SubAgentTool::new(
         agent_defs.clone(),
@@ -523,6 +693,7 @@ async fn main() -> Result<()> {
                     agent_type,
                     description,
                     background,
+                    ..
                 } => {
                     let bg = if background { " ◇bg" } else { "" };
                     eprintln!(
@@ -533,6 +704,7 @@ async fn main() -> Result<()> {
                     id,
                     tool_name,
                     arg_summary,
+                    ..
                 } => {
                     eprintln!(
                         "\x1b[38;2;150;150;150m  [a{id}] ⏺ {tool_name}({arg_summary})\x1b[0m"
@@ -1019,6 +1191,12 @@ async fn repl(
         let home_dir = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
+        let dynamic_commands: Vec<(String, String, String)> = cmd_registry
+            .list()
+            .iter()
+            .filter(|c| c.is_dynamic())
+            .map(|c| (c.name().to_string(), c.description(), c.usage()))
+            .collect();
         let cmd_ctx = CommandContext {
             cwd: cwd.clone(),
             model: "".to_string(),
@@ -1034,6 +1212,7 @@ async fn repl(
             effective_mcp_count,
             plugin_agent_paths: plugin_agent_paths.clone(),
             hooks_enabled,
+            dynamic_commands,
         };
         if let Some(result) = cmd_registry.dispatch(trimmed, &cmd_ctx).await {
             match result {
@@ -1071,6 +1250,41 @@ async fn repl(
                     let out_tok = session.total_output_tokens;
                     eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
                 }
+                Ok(CommandResult::RunPromptScoped {
+                    text,
+                    allowed_tools,
+                    profile: _,
+                }) => {
+                    // 带 allowed-tools 的自定义命令：临时把权限模式收紧为 Allowlist，
+                    // 跑完这一轮（无论成功失败）都还原快照，不影响 --plan/--bypass-permissions
+                    // 等其他模式设定的基线权限。`profile`（model: frontmatter 字段）本版本
+                    // 仅解析存储、不做运行期切换，此处忽略。
+                    session.push_user(text);
+                    turns += 1;
+                    println!();
+                    drain_mcp_connections(&mut mcp_rx, &shared_agent).await;
+                    let agent_snapshot = shared_agent.read().unwrap().clone();
+                    let prev_mode = ctx.permission_mode.read().unwrap().clone();
+                    if let Some(tools) = allowed_tools {
+                        ctx.set_permission_mode(PermissionMode::Allowlist(
+                            tools.into_iter().collect(),
+                        ));
+                    }
+                    let run_result = agent_snapshot
+                        .run_turn(&mut session, &ctx, &mut |d| {
+                            print!("{d}");
+                            let _ = io::stdout().flush();
+                        })
+                        .await;
+                    ctx.set_permission_mode(prev_mode);
+                    if let Err(e) = run_result {
+                        eprintln!("\n[错误] {e}");
+                    }
+                    println!();
+                    let in_tok = session.total_input_tokens;
+                    let out_tok = session.total_output_tokens;
+                    eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
+                }
                 Ok(CommandResult::OpenSessionPicker) => {
                     println!(
                         "[headless 模式不支持会话选择器，请用 --resume <session-id> 恢复指定会话]"
@@ -1095,6 +1309,9 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenPluginsDialog) => {
                     println!("{}", wyj_i18n::tr("plugins.headless_unsupported"));
+                }
+                Ok(CommandResult::OpenSubAgentsPanel(_)) => {
+                    println!("{}", wyj_i18n::tr("subagents.headless_unsupported"));
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),
@@ -1166,4 +1383,107 @@ async fn repl(
     }
     println!("再见！");
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn config_status_flag_parses() {
+        let cli = Cli::try_parse_from(["wyj-code", "--config-status"]).unwrap();
+        assert!(cli.config_status);
+        assert!(!cli.plan);
+        assert!(!cli.bypass_permissions);
+        assert!(!cli.no_hooks);
+    }
+
+    #[test]
+    fn no_hooks_flag_parses() {
+        let cli = Cli::try_parse_from(["wyj-code", "--no-hooks"]).unwrap();
+        assert!(cli.no_hooks);
+    }
+
+    #[test]
+    fn plan_flag_parses() {
+        let cli = Cli::try_parse_from(["wyj-code", "--plan"]).unwrap();
+        assert!(cli.plan);
+        assert!(!cli.bypass_permissions);
+    }
+
+    #[test]
+    fn bypass_permissions_flag_parses() {
+        let cli = Cli::try_parse_from(["wyj-code", "--bypass-permissions"]).unwrap();
+        assert!(cli.bypass_permissions);
+        assert!(!cli.plan);
+    }
+
+    #[test]
+    fn plan_and_bypass_are_mutually_settable_but_not_exclusive_at_parse_time() {
+        // clap 本身不互斥这两个 flag（互斥语义由运行时逻辑决定，不在 Cli 定义里
+        // 用 conflicts_with），这里只验证解析层面两者可以同时置位，不代表运行时
+        // 行为——冒烟测试覆盖的是"没有 panic、字段值符合预期"。
+        let cli = Cli::try_parse_from(["wyj-code", "--plan", "--bypass-permissions"]).unwrap();
+        assert!(cli.plan);
+        assert!(cli.bypass_permissions);
+    }
+
+    #[test]
+    fn no_flags_default_to_false() {
+        let cli = Cli::try_parse_from(["wyj-code"]).unwrap();
+        assert!(!cli.config_status);
+        assert!(!cli.plan);
+        assert!(!cli.bypass_permissions);
+        assert!(!cli.no_hooks);
+        assert!(cli.prompt.is_none());
+        assert!(cli.resume.is_none());
+    }
+
+    #[test]
+    fn prompt_and_resume_capture_their_values() {
+        let cli = Cli::try_parse_from(["wyj-code", "-p", "hello", "--resume", "abc123"]).unwrap();
+        assert_eq!(cli.prompt.as_deref(), Some("hello"));
+        assert_eq!(cli.resume.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn update_subcommand_parses_with_yes_flag() {
+        let cli = Cli::try_parse_from(["wyj-code", "update", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { yes }) => assert!(yes),
+            other => panic!("expected Update subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_trace_subcommand_parses_session_id_and_optional_sub_id() {
+        let cli = Cli::try_parse_from(["wyj-code", "subagent-trace", "sess-123"]).unwrap();
+        match cli.command {
+            Some(Commands::SubagentTrace {
+                session_id,
+                sub_id,
+                json,
+            }) => {
+                assert_eq!(session_id, "sess-123");
+                assert_eq!(sub_id, None);
+                assert!(!json);
+            }
+            other => panic!("expected SubagentTrace subcommand, got {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["wyj-code", "subagent-trace", "sess-123", "3", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::SubagentTrace {
+                session_id,
+                sub_id,
+                json,
+            }) => {
+                assert_eq!(session_id, "sess-123");
+                assert_eq!(sub_id, Some(3));
+                assert!(json);
+            }
+            other => panic!("expected SubagentTrace subcommand, got {other:?}"),
+        }
+    }
 }
