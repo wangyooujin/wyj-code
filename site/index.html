@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="zh-CN" class="overflow-x-hidden">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
+<meta name="description" content="wyj-code：单二进制、原生 TUI、双协议 LLM 适配、多 Agent 编排的终端 AI 编程助手。Rust 从零实现，12MB，~10ms 冷启动，零遥测。" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body class="relative overflow-x-hidden selection:bg-amber-500">
+
+<!-- icon sprite -->
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="13" height="13" rx="2"/><rect x="8" y="8" width="13" height="13" rx="2"/></symbol>
+  <symbol id="i-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><line x1="6" y1="6" x2="12" y2="18"/><line x1="18" y1="6" x2="12" y2="18"/><line x1="6" y1="6" x2="18" y2="6"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v6M16 2v6M6 8h12v4a6 6 0 0 1-12 0V8z"/><line x1="12" y1="18" x2="12" y2="22"/></symbol>
+  <symbol id="i-compress" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5a2 2 0 0 1 2-2h6v18H6a2 2 0 0 1-2-2V5z"/><path d="M20 5a2 2 0 0 0-2-2h-6v18h6a2 2 0 0 0 2-2V5z"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l4 3-4 3"/><line x1="13" y1="15" x2="17" y2="15"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="9" cy="6" r="2"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="7" cy="18" r="2"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h11l3 3v15H5V3z"/><rect x="8" y="3" width="7" height="5"/><rect x="7" y="13" width="10" height="7"/></symbol>
+  <symbol id="i-slash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><line x1="15" y1="7" x2="9" y2="17"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="3" y1="12" x2="21" y2="12"/><path d="M12 3c3 3.5 3 14.5 0 18M12 3c-3 3.5-3 14.5 0 18"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 3v6c0 5-3.5 8.5-8 11-4.5-2.5-8-6-8-11V5l8-3z"/><path d="M8.5 12l2.5 2.5L16 9"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-github" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.04 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.58.23 2.75.11 3.04.74.8 1.19 1.83 1.19 3.08 0 4.41-2.7 5.38-5.27 5.67.42.36.78 1.07.78 2.16 0 1.56-.01 2.82-.01 3.2 0 .31.2.66.79.55A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></symbol>
+</svg>
+
+<!-- background atmosphere -->
+<div class="fixed inset-0 -z-10 grid-layer"></div>
+<div class="fixed inset-0 -z-10 noise-layer pointer-events-none"></div>
+<div class="fixed -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[600px] -z-10 rounded-full blur-3xl opacity-[0.12]" style="background: radial-gradient(closest-side, #ffb454, transparent);"></div>
+
+<!-- NAV -->
+<header class="sticky top-0 z-40 backdrop-blur-md bg-ink-900/80 border-b border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 h-16 flex items-center justify-between">
+    <a href="#top" class="flex items-center gap-2.5 shrink-0">
+      <svg viewBox="0 0 64 64" class="w-7 h-7"><rect width="64" height="64" rx="14" fill="#14171a"/><path d="M14 22 L28 32 L14 42" fill="none" stroke="#ffb454" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="38" width="18" height="6" rx="2" fill="#ffb454"/></svg>
+      <span class="font-display font-bold tracking-tight text-lg">wyj-code</span>
+    </a>
+    <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
+      <a href="#features" class="hover:text-amber-500 transition-colors" data-i18n="nav.features">特性</a>
+      <a href="#architecture" class="hover:text-amber-500 transition-colors" data-i18n="nav.architecture">架构</a>
+      <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
+      <a href="#changelog" class="hover:text-amber-500 transition-colors" data-i18n="nav.changelog">更新日志</a>
+    </nav>
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-1 text-xs font-medium">
+        <button class="lang-btn px-1.5 py-1" data-lang="zh">中文</button>
+        <span class="text-paper/20">/</span>
+        <button class="lang-btn px-1.5 py-1" data-lang="en">EN</button>
+      </div>
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-ghost hidden sm:flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
+        <span data-i18n="nav.github">GitHub</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- HERO -->
+<section class="relative max-w-6xl mx-auto px-5 sm:px-8 pt-16 sm:pt-24 pb-20">
+  <div class="grid lg:grid-cols-[1.05fr_0.95fr] gap-14 items-center">
+    <div class="reveal min-w-0">
+      <div class="inline-flex items-center gap-2 badge-pill rounded-full px-3.5 py-1.5 text-xs mb-7">
+        <span class="w-1.5 h-1.5 rounded-full bg-phosphor"></span>
+        <span data-i18n="hero.kicker">个人工程作品 · Clean-room 实现 · 开源</span>
+      </div>
+      <h1 class="font-display font-extrabold leading-[0.95] tracking-tight text-5xl sm:text-6xl lg:text-[4.2rem]">
+        <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
+      </h1>
+      <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">单二进制、原生 TUI、双协议 LLM 适配（Anthropic / OpenAI）、多 Agent 编排、可插拔 MCP 工具链——在 shell 里直接与 AI 协作改代码，本地优先、全程透明可控、零遥测。</p>
+      <div class="mt-9 flex flex-wrap items-center gap-4">
+        <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
+          <span data-i18n="hero.cta.github">查看 GitHub 仓库</span>
+        </a>
+        <a href="#install" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="hero.cta.install">60 秒上手 →</a>
+      </div>
+      <div class="mt-9 flex flex-wrap gap-2.5">
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs">Rust 1.80+</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs">MIT OR Apache-2.0</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs">macOS · Linux · Windows</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs" data-i18n="hero.badge.telemetry">零遥测</span>
+      </div>
+    </div>
+
+    <div class="relative reveal min-w-0" style="transition-delay:120ms">
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.2.0</div>
+      <div class="term-window rounded-xl overflow-hidden">
+        <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
+          <span class="term-dot bg-[#ff5f57]"></span>
+          <span class="term-dot bg-[#febc2e]"></span>
+          <span class="term-dot bg-[#28c840]"></span>
+          <span class="ml-3 text-xs text-paper/35">wyj-code — zsh</span>
+        </div>
+        <div class="p-5 text-[13px] leading-[1.75] text-paper/85 overflow-x-auto">
+<pre class="whitespace-pre-wrap"><span class="text-phosphor">❯</span> wyj-code
+<span class="text-paper/40">╭─ wyj-code v1.2.0 · claude-opus-4-8 ─────────────────────╮</span>
+
+<span class="text-amber-400">You</span>  把 CLI 参数解析里 --resume 的边界情况补一下测试
+
+<span class="text-amber-400">●</span> 正在读取 crates/cli/src/main.rs...
+<span class="text-phosphor">  ⎿</span>  Read main.rs (238 lines)
+
+<span class="text-amber-400">●</span> 调用工具 <span class="text-paper">Edit</span> — crates/cli/src/main.rs
+<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">┌─ 允许此次编辑？──────────────────┐</span>
+<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">│ [y] 允许一次  [a] 始终允许  [d] 拒绝 │</span>
+<span class="text-phosphor">  ⎿</span>  <span class="text-ink-500">└──────────────────────────────────┘</span>
+<span class="text-phosphor">  ⎿</span>  已写入 +18 -2
+
+<span class="text-amber-400">●</span> 运行 <span class="text-paper">cargo test -p wyj-cli</span>
+<span class="text-phosphor">  ⎿</span>  test result: ok. 12 passed<span class="caret animate-blink"></span></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- STATS -->
+<section class="border-y border-white/[0.06] bg-ink-950/40">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-14 grid grid-cols-2 lg:grid-cols-4 gap-8">
+    <div class="reveal">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12<span class="text-amber-500">MB</span></div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.size">release 二进制体积（已 strip）</p>
+    </div>
+    <div class="reveal" style="transition-delay:80ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">~10<span class="text-amber-500">ms</span></div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.boot">稳态冷启动耗时</p>
+    </div>
+    <div class="reveal" style="transition-delay:160ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">10</div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.crates">workspace crate 数量</p>
+    </div>
+    <div class="reveal" style="transition-delay:240ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">0</div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.telemetry">遥测 / 埋点上报</p>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features" class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="features.kicker">Features</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="features.title">核心能力</h2>
+    <p class="mt-4 text-paper/55" data-i18n="features.desc">从推理循环到交互体验，每一层都是为终端场景重新设计的。</p>
+  </div>
+
+  <div class="mt-12 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-layers"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.provider.title">双协议 LLM 适配</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.provider.desc">Anthropic Messages 与 OpenAI Chat Completions 双格式原生支持，可混合配置：规划用一个模型，执行用另一个。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.agent.title">多 Agent 编排</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.agent.desc">内置 general-purpose / Explore / Plan 三类子 Agent，支持自定义定义，进程级 Hub 管理并发、前后台调度与中断。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-bolt"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.hooks.title">Hooks 生命周期自动化</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.hooks.desc">PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点可挂任意 shell 脚本，对齐真实 Claude Code。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-plug"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.mcp.title">可插拔 MCP</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.mcp.desc">内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并可桥接任意外部 MCP server。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-compress"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.compact.title">上下文自动压缩</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.compact.desc">token 数逼近窗口上限时自动生成摘要替换旧消息，长会话也不会突然断档。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-book"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.memory.title">CLAUDE.md 记忆机制</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.memory.desc">每轮重新读盘注入、子目录动态加载、@path 递归导入，跨会话记忆同样开箱即用。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-terminal"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.tui.title">原生 ratatui TUI</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.tui.desc">流式 markdown、语法高亮、工具调用实时展示、子 Agent 聚合面板，交互体验为终端而生。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-sliders"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.profile.title">Profile 分组配置</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.profile.desc">provider / model / base_url / api_key 具名分组，多供应商配置并存，随时切换。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-save"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.session.title">会话持久化</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.session.desc"><code class="text-amber-400">-c</code> 续上次会话，<code class="text-amber-400">--resume &lt;id&gt;</code> 恢复任意历史会话。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-slash"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.slash.title">自定义 Slash 命令</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.slash.desc">兼容 <code class="text-amber-400">~/.claude/commands/*.md</code> 与项目级命令，六层路径合并加载。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-globe"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.i18n.title">中 / 英双语</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.i18n.desc">界面文案运行时切换语言，自动检测系统 locale，也可在配置中显式指定。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">零遥测</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">仅在显式调用 LLM / WebFetch / MCP 时才出网，没有任何隐式埋点或崩溃上报。</p>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="arch.kicker">Architecture</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">10 个 crate 的 Rust workspace</h2>
+    <p class="mt-4 text-paper/55" data-i18n="arch.desc">单一 wyj-code 二进制，职责分层清晰：从上到下依次是入口、服务、核心、基础四层。</p>
+  </div>
+
+  <div class="mt-12 space-y-3">
+    <div class="reveal">
+      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.entry">入口层 · Entry</p>
+      <div class="grid sm:grid-cols-2 gap-3">
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/cli</p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.cli">二进制入口：组装全部 crate、解析 CLI 参数、启动 TUI / REPL / 单次问答模式</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tui <span class="text-paper/30">· wyj-tui</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tui">ratatui 终端渲染：输入框、权限确认对话框、子 Agent 面板</p></div>
+      </div>
+    </div>
+    <div class="reveal" style="transition-delay:40ms">
+      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.services">服务层 · Services</p>
+      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tools <span class="text-paper/30">· wyj-tools</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tools">Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite 等工具实现</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/commands <span class="text-paper/30">· wyj-commands</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.commands">Slash 命令注册表与内置命令（/help、/compact 等）</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/mcp <span class="text-paper/30">· wyj-mcp</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.mcp">MCP 客户端桥接（stdio / http 传输）</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/store <span class="text-paper/30">· wyj-store</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.store">MCP / Skill / Plugin 安装元数据与市场客户端</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/i18n <span class="text-paper/30">· wyj-i18n</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.i18n">多语言资源与运行时语言切换</p></div>
+      </div>
+    </div>
+    <div class="reveal" style="transition-delay:80ms">
+      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.core">核心层 · Core</p>
+      <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/core <span class="text-paper/30">· wyj-core</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.core">Agent 推理循环、Session、HistoryStore、MemoryStore、ClaudeMdLoader、上下文压缩</p></div>
+    </div>
+    <div class="reveal" style="transition-delay:120ms">
+      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.foundation">基础层 · Foundation</p>
+      <div class="grid sm:grid-cols-2 gap-3">
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/api <span class="text-paper/30">· wyj-api</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.api">LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/config <span class="text-paper/30">· wyj-config</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.config">配置加载（~/.wyj-code/config.toml）、MCP 配置结构</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section id="install" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="install.kicker">Install</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="install.title">60 秒上手</h2>
+    <p class="mt-4 text-paper/55" data-i18n="install.desc">克隆、构建、配置 API Key，直接开始对话。</p>
+  </div>
+
+  <div class="mt-10 reveal">
+    <div class="code-block rounded-xl relative">
+      <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-quickstart" aria-label="copy">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+      </button>
+      <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-quickstart"><span class="text-paper/35"># clone &amp; build</span>
+git clone https://github.com/wangyooujin/wyj-code.git &amp;&amp; cd wyj-code
+./build.sh install &amp;&amp; wyj-code --config-status
+
+<span class="text-paper/35"># set your API key</span>
+export WYJ_CODE_API_KEY=sk-...
+
+<span class="text-paper/35"># go</span>
+wyj-code</code></pre>
+    </div>
+  </div>
+
+  <div class="mt-14 reveal">
+    <div class="flex gap-6 border-b border-white/[0.08] text-sm">
+      <button class="tab-btn active pb-3 px-1" data-tab="prebuilt" data-i18n="install.tab.prebuilt">预编译安装包</button>
+      <button class="tab-btn pb-3 px-1" data-tab="source" data-i18n="install.tab.source">源码构建</button>
+      <button class="tab-btn pb-3 px-1" data-tab="dev" data-i18n="install.tab.dev">开发者模式</button>
+    </div>
+
+    <div class="mt-6" data-tab-panel="prebuilt">
+      <p class="text-sm text-paper/55 mb-3" data-i18n="install.prebuilt.desc">从 GitHub Releases 下载对应平台压缩包，解压后运行内置安装脚本，自动装入用户目录并配置 PATH，无需 sudo / 管理员权限。</p>
+      <div class="code-block rounded-xl relative">
+        <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-prebuilt" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-prebuilt" data-i18n="install.code.prebuilt"><span class="text-paper/35"># macOS / Linux</span>
+tar xzf wyj-code-*.tar.gz &amp;&amp; cd wyj-code-*/ &amp;&amp; ./install.sh
+
+<span class="text-paper/35"># Windows（在解压目录里）</span>
+install.bat
+
+<span class="text-paper/35"># 之后升级</span>
+wyj-code update</code></pre>
+      </div>
+      <a href="https://github.com/wangyooujin/wyj-code/releases" target="_blank" rel="noopener" class="inline-block mt-4 text-sm text-amber-500 hover:text-amber-400 transition-colors" data-i18n="install.prebuilt.link">前往 Releases 页面下载 →</a>
+    </div>
+
+    <div class="mt-6" data-tab-panel="source" hidden>
+      <p class="text-sm text-paper/55 mb-3" data-i18n="install.source.desc">需要 Rust 1.80+ 工具链，构建 release 二进制并安装到 <code class="text-amber-400">~/.local/bin</code>。</p>
+      <div class="code-block rounded-xl relative">
+        <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-source" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-source" data-i18n="install.code.source">git clone https://github.com/wangyooujin/wyj-code.git
+cd wyj-code
+./build.sh install
+
+<span class="text-paper/35"># 卸载</span>
+./build.sh uninstall</code></pre>
+      </div>
+    </div>
+
+    <div class="mt-6" data-tab-panel="dev" hidden>
+      <p class="text-sm text-paper/55 mb-3" data-i18n="install.dev.desc">直接用 cargo 跑起来，适合改代码调试。</p>
+      <div class="code-block rounded-xl relative">
+        <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-dev" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-dev" data-i18n="install.code.dev"><span class="text-paper/35"># TUI 模式</span>
+cargo run
+
+<span class="text-paper/35"># 单次问答</span>
+cargo run -- -p "你的问题"
+
+<span class="text-paper/35"># headless REPL</span>
+cargo run -- --headless
+
+<span class="text-paper/35"># 查看配置状态</span>
+cargo run -- --config-status</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PRINCIPLES -->
+<section class="border-t border-white/[0.06] bg-ink-950/40">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+    <div class="reveal max-w-2xl">
+      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="principles.kicker">Principles</p>
+      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="principles.title">设计原则</h2>
+    </div>
+    <div class="mt-12 grid sm:grid-cols-2 lg:grid-cols-4 gap-5">
+      <div class="reveal">
+        <div class="text-amber-500 font-display font-extrabold text-2xl">01</div>
+        <h3 class="mt-3 font-semibold" data-i18n="principle.local.title">本地优先</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.local.desc">没有隐式埋点、没有崩溃上报，配置与会话数据全部留在本机。</p>
+      </div>
+      <div class="reveal" style="transition-delay:40ms">
+        <div class="text-amber-500 font-display font-extrabold text-2xl">02</div>
+        <h3 class="mt-3 font-semibold" data-i18n="principle.transparent.title">透明可控</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.transparent.desc">每一次工具调用全程实时展示，敏感操作前弹权限确认，随时可以 ESC 打断。</p>
+      </div>
+      <div class="reveal" style="transition-delay:80ms">
+        <div class="text-amber-500 font-display font-extrabold text-2xl">03</div>
+        <h3 class="mt-3 font-semibold" data-i18n="principle.neutral.title">协议中立</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.neutral.desc">改一行 provider 配置即可在 Anthropic / OpenAI 之间切换，不锁定单一供应商。</p>
+      </div>
+      <div class="reveal" style="transition-delay:120ms">
+        <div class="text-amber-500 font-display font-extrabold text-2xl">04</div>
+        <h3 class="mt-3 font-semibold" data-i18n="principle.zero.title">零遥测</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.zero.desc">只有显式的 LLM / WebFetch / MCP 调用才会出网，没有任何后台上报。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CHANGELOG -->
+<section id="changelog" class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="changelog.kicker">Changelog</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="changelog.title">版本亮点</h2>
+  </div>
+
+  <div class="mt-12 space-y-0">
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.2.0</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v120">自定义 Slash 命令对齐真实 Claude Code（识别 <code class="text-amber-400">~/.claude/commands/*.md</code>）；性能实测（12MB / ~10ms）与依赖排查；预编译包新增一键安装脚本 install.sh / install.bat。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:40ms">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <span class="font-display font-bold text-paper/70">v1.1.0</span>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v110">新增 Hooks 生命周期自动化系统（PreToolUse / PostToolUse / UserPromptSubmit / Stop）；开源产品化基线（LICENSE、CONTRIBUTING、CHANGELOG）。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:80ms">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <span class="font-display font-bold text-paper/70">v1.0.2</span>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v102">新增 <code class="text-amber-400">wyj-code update</code> 自更新；ExitPlanMode 计划面板重构；<code class="text-amber-400">build.sh release</code> 一键发版脚本。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pl-8 relative min-w-0" style="transition-delay:120ms">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <span class="font-display font-bold text-paper/70">v1.0.0</span>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v100">首发：Agent 推理循环、双协议 LLM 适配、内置工具集、ratatui TUI、子 Agent、上下文压缩、跨会话记忆、MCP / Skill / Plugin 市场。</p>
+      </div>
+    </div>
+  </div>
+
+  <a href="https://github.com/wangyooujin/wyj-code/blob/master/CHANGELOG.md" target="_blank" rel="noopener" class="inline-block mt-4 text-sm text-amber-500 hover:text-amber-400 transition-colors" data-i18n="changelog.link">查看完整更新日志 →</a>
+</section>
+
+<!-- CTA -->
+<section class="border-t border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24 text-center reveal">
+    <h2 class="font-display font-bold text-3xl sm:text-4xl" data-i18n="cta.title">在你的终端里试一下</h2>
+    <p class="mt-4 text-paper/55 max-w-lg mx-auto" data-i18n="cta.desc">开源、单二进制、零遥测——克隆下来跑起来只要 60 秒。</p>
+    <div class="mt-8 flex flex-wrap justify-center gap-4">
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
+        <span data-i18n="cta.github">前往 GitHub</span>
+      </a>
+      <a href="#install" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="cta.install">查看安装步骤</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- FOOTER -->
+<footer class="border-t border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-10 flex flex-col sm:flex-row gap-6 sm:items-center sm:justify-between">
+    <div class="flex items-center gap-2.5">
+      <svg viewBox="0 0 64 64" class="w-5 h-5"><rect width="64" height="64" rx="14" fill="#14171a"/><path d="M14 22 L28 32 L14 42" fill="none" stroke="#ffb454" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="38" width="18" height="6" rx="2" fill="#ffb454"/></svg>
+      <span class="text-sm text-paper/50">wyj-code © 2026 owen</span>
+    </div>
+    <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-paper/50">
+      <a href="https://github.com/wangyooujin/wyj-code/blob/master/LICENSE-MIT" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">MIT</a>
+      <a href="https://github.com/wangyooujin/wyj-code/blob/master/LICENSE-APACHE" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">Apache-2.0</a>
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">GitHub</a>
+    </div>
+  </div>
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 pb-10 text-xs text-paper/35 leading-relaxed" data-i18n="footer.disclaimer">
+    个人技术作品集项目，基于公开的 Anthropic Messages API、OpenAI Chat Completions API 与 MCP 规范 clean-room 实现，不含任何第三方专有 prompt 或品牌资产，与 Anthropic / OpenAI 官方产品无关联。
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
