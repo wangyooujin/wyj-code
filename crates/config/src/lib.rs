@@ -133,6 +133,12 @@ pub struct Profile {
     /// 仅在 thinking_budget 开启时生效）。默认 true。
     #[serde(default = "default_vision")]
     pub interleaved_thinking: bool,
+    /// Anthropic 协议 prompt caching 能力。None = 按 base_url/provider 自动判断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<bool>,
+    /// OpenAI 协议 stream_options.include_usage 能力。None = 按 base_url/provider 自动判断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_stream_options: Option<bool>,
 }
 
 fn default_vision() -> bool {
@@ -154,7 +160,27 @@ impl Default for Profile {
             vision: true,
             thinking_budget: None,
             interleaved_thinking: true,
+            prompt_cache: None,
+            openai_stream_options: None,
         }
+    }
+}
+
+impl Profile {
+    pub fn effective_prompt_cache(&self) -> bool {
+        self.prompt_cache.unwrap_or_else(|| {
+            self.provider == Provider::Anthropic
+                && (self.base_url.trim().is_empty()
+                    || self.base_url.trim_end_matches('/') == "https://api.anthropic.com")
+        })
+    }
+
+    pub fn effective_openai_stream_options(&self) -> bool {
+        self.openai_stream_options.unwrap_or_else(|| {
+            self.provider == Provider::OpenAI
+                && (self.base_url.trim().is_empty()
+                    || self.base_url.trim_end_matches('/') == "https://api.openai.com/v1")
+        })
     }
 }
 
@@ -298,6 +324,8 @@ impl From<LegacyConfigV0> for Config {
                 vision: true,
                 thinking_budget: None,
                 interleaved_thinking: true,
+                prompt_cache: None,
+                openai_stream_options: None,
             }],
             log_level: legacy.log_level,
             language: legacy.language,
@@ -466,7 +494,7 @@ pub fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod subagent_cfg_tests {
-    use super::SubAgentCfg;
+    use super::{Profile, Provider, SubAgentCfg};
 
     #[test]
     fn defaults_enable_trace_with_256kb_cap() {
@@ -488,5 +516,55 @@ mod subagent_cfg_tests {
         assert!(!cfg.trace_enabled);
         // 未显式指定的字段仍走默认值
         assert_eq!(cfg.trace_max_bytes_per_agent, 256 * 1024);
+    }
+
+    #[test]
+    fn official_endpoints_enable_native_optimizations_by_default() {
+        let mut p = Profile {
+            provider: Provider::Anthropic,
+            base_url: String::new(),
+            ..Profile::default()
+        };
+        assert!(p.effective_prompt_cache());
+
+        p.provider = Provider::OpenAI;
+        p.base_url.clear();
+        assert!(p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn compatible_third_party_endpoints_disable_native_optimizations_by_default() {
+        let p = Profile {
+            provider: Provider::Anthropic,
+            base_url: "https://open.bigmodel.cn/api/anthropic".to_string(),
+            ..Profile::default()
+        };
+        assert!(!p.effective_prompt_cache());
+
+        let p = Profile {
+            provider: Provider::OpenAI,
+            base_url: "https://api.minimaxi.com/v1".to_string(),
+            ..Profile::default()
+        };
+        assert!(!p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn explicit_compatibility_switches_win_over_endpoint_defaults() {
+        let p = Profile {
+            provider: Provider::Anthropic,
+            base_url: String::new(),
+            prompt_cache: Some(false),
+            ..Profile::default()
+        };
+        assert!(!p.effective_prompt_cache());
+
+        let p = Profile {
+            provider: Provider::OpenAI,
+            base_url: "https://api.minimaxi.com/v1".to_string(),
+            openai_stream_options: Some(true),
+            ..Profile::default()
+        };
+        assert!(p.effective_openai_stream_options());
     }
 }

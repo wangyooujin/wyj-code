@@ -24,6 +24,7 @@ pub struct AnthropicProvider {
     /// 模型是否支持图片输入（Profile.vision）。false 时图片降级为占位文本，
     /// 避免非多模态端点收到 image 块直接 400 打断整轮对话。
     supports_vision: bool,
+    prompt_cache: bool,
 }
 
 impl AnthropicProvider {
@@ -40,6 +41,7 @@ impl AnthropicProvider {
             base_url,
             model: model.to_string(),
             supports_vision: cfg.active_profile().vision,
+            prompt_cache: cfg.active_profile().effective_prompt_cache(),
         })
     }
 }
@@ -375,7 +377,7 @@ impl Provider for AnthropicProvider {
             vec![ApiSystemBlock {
                 block_type: "text",
                 text: system,
-                cache_control: Some(EPHEMERAL),
+                cache_control: self.prompt_cache.then_some(EPHEMERAL),
             }]
         };
 
@@ -388,7 +390,8 @@ impl Provider for AnthropicProvider {
                 name: &t.name,
                 description: &t.description,
                 input_schema: &t.input_schema,
-                cache_control: (tool_count > 0 && i == tool_count - 1).then_some(EPHEMERAL),
+                cache_control: (self.prompt_cache && tool_count > 0 && i == tool_count - 1)
+                    .then_some(EPHEMERAL),
             })
             .collect();
 
@@ -399,19 +402,21 @@ impl Provider for AnthropicProvider {
         let mut api_messages = to_api_messages(messages, self.supports_vision);
         // 独立 Image 块不能承载 cache_control：从末尾向前回退到最近一个可打
         // 断点的块（旧实现直接放弃断点，以图片结尾的轮次会丢失缓存写入）。
-        'breakpoint: for msg in api_messages.iter_mut().rev() {
-            for block in msg.content.iter_mut().rev() {
-                match block {
-                    ApiContentBlock::Text { cache_control, .. }
-                    | ApiContentBlock::ToolUse { cache_control, .. }
-                    | ApiContentBlock::ToolResult { cache_control, .. } => {
-                        *cache_control = Some(EPHEMERAL);
-                        break 'breakpoint;
+        if self.prompt_cache {
+            'breakpoint: for msg in api_messages.iter_mut().rev() {
+                for block in msg.content.iter_mut().rev() {
+                    match block {
+                        ApiContentBlock::Text { cache_control, .. }
+                        | ApiContentBlock::ToolUse { cache_control, .. }
+                        | ApiContentBlock::ToolResult { cache_control, .. } => {
+                            *cache_control = Some(EPHEMERAL);
+                            break 'breakpoint;
+                        }
+                        // Image/Thinking 块不可承载 cache_control，继续向前找
+                        ApiContentBlock::Image { .. }
+                        | ApiContentBlock::Thinking { .. }
+                        | ApiContentBlock::RedactedThinking { .. } => {}
                     }
-                    // Image/Thinking 块不可承载 cache_control，继续向前找
-                    ApiContentBlock::Image { .. }
-                    | ApiContentBlock::Thinking { .. }
-                    | ApiContentBlock::RedactedThinking { .. } => {}
                 }
             }
         }
@@ -432,10 +437,15 @@ impl Provider for AnthropicProvider {
         let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
 
         // beta 头：prompt caching 恒开；interleaved thinking 仅在开启时追加
-        let beta_header = if thinking_budget.is_some() && opts.interleaved {
-            "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14"
-        } else {
-            "prompt-caching-2024-07-31"
+        let beta_header = {
+            let mut betas = vec![];
+            if self.prompt_cache {
+                betas.push("prompt-caching-2024-07-31");
+            }
+            if thinking_budget.is_some() && opts.interleaved {
+                betas.push("interleaved-thinking-2025-05-14");
+            }
+            (!betas.is_empty()).then(|| betas.join(","))
         };
 
         let url = format!("{}/v1/messages", self.base_url);
@@ -444,15 +454,16 @@ impl Provider for AnthropicProvider {
             &crate::retry::RetryPolicy::default(),
             "Anthropic",
             || {
-                self.client
+                let mut req = self
+                    .client
                     .post(&url)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
-                    // 启用 prompt caching：标记为 ephemeral 的 system/tools/历史前缀
-                    // 命中缓存后按 0.1x 计费，显著降低多轮对话的 input token 成本。
-                    .header("anthropic-beta", beta_header)
-                    .header("content-type", "application/json")
-                    .json(&body_value)
+                    .header("content-type", "application/json");
+                if let Some(beta) = &beta_header {
+                    req = req.header("anthropic-beta", beta);
+                }
+                req.json(&body_value)
             },
         )
         .await?;

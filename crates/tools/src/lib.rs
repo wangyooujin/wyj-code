@@ -33,3 +33,8 @@ pub use todo::{TodoStore, TodoWriteTool};
 pub use trace::{TraceEvent, TraceWriter};
 pub use websearch::WebSearchTool;
 pub use wyj_core::tool::{Tool, ToolResult};
+
+/// 当前已连接成功的 MCP 桥接工具快照，供子 Agent 工厂 / `/model` 重建等
+/// 多个消费点共享读取；三种运行模式（`-p`/`--headless`/TUI）各自在 MCP
+/// 连接成功时把工具 push 进来。
+pub type SharedMcpTools = std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<dyn Tool>>>>;

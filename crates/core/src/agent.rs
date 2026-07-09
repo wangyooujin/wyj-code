@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_session, estimate_tokens, COMPACT_TRIGGER_BUFFER};
+use crate::compact::{compact_session, compact_trigger_buffer, estimate_tokens};
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
@@ -336,7 +336,9 @@ impl Agent {
 
             // 检查 token 预算，超限时触发自动压缩
             let estimated = estimate_tokens(&session.messages);
-            let compact_threshold = self.context_window.saturating_sub(COMPACT_TRIGGER_BUFFER);
+            let compact_threshold = self
+                .context_window
+                .saturating_sub(compact_trigger_buffer(self.context_window));
             if estimated > compact_threshold {
                 match compact_session(session, self.provider.as_ref(), self.context_window).await {
                     Ok(r) => on_text(&format!(

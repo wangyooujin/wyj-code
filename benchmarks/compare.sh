@@ -20,7 +20,8 @@ def load(path):
 
 base, cand = load(sys.argv[1]), load(sys.argv[2])
 cols = ["success", "input_tokens", "output_tokens", "cache_read_tokens",
-        "cache_write_tokens", "api_calls", "duration_secs"]
+        "cache_write_tokens", "full_input_tokens", "cache_hit_ratio",
+        "context_tokens", "context_window", "api_calls", "duration_secs"]
 
 def delta(b, c):
     if isinstance(b, bool):

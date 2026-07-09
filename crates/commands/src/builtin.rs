@@ -149,6 +149,24 @@ impl Command for CostCmd {
         };
 
         // 缓存用量单列（有缓存活动时才显示）：展示缓存收益与真实成本
+        let full_input = input + ctx.cache_read_tokens + ctx.cache_write_tokens;
+        let hit_ratio = if full_input > 0 {
+            ctx.cache_read_tokens as f64 / full_input as f64 * 100.0
+        } else {
+            0.0
+        };
+        let input_detail_line = format!(
+            "\n{}",
+            tr_fmt(
+                "cost.input_detail_line",
+                &[
+                    ("full", &fmt_num(full_input)),
+                    ("uncached", &fmt_num(input)),
+                    ("hit_ratio", &format!("{hit_ratio:.0}")),
+                ],
+            )
+        );
+
         let cache_line = if ctx.cache_read_tokens > 0 || ctx.cache_write_tokens > 0 {
             let saved_pct = {
                 let full = ctx.cache_read_tokens as f64;
@@ -185,7 +203,8 @@ impl Command for CostCmd {
         );
 
         let header = tr("cost.header");
-        let mut text = format!("{header}\n{cost_line}{cache_line}\n\n{ctx_line}");
+        let mut text =
+            format!("{header}\n{cost_line}{input_detail_line}{cache_line}\n\n{ctx_line}");
 
         // 子 Agent 用量单列（有用量时才显示）
         let sub_total = ctx.sub_input_tokens + ctx.sub_output_tokens;
@@ -268,6 +287,42 @@ impl Command for PluginsCmd {
 
 pub struct AgentsCmd;
 
+pub fn format_agents_text(defs: &[wyj_core::AgentDefinition]) -> String {
+    let mut out = tr("agents.header");
+    for d in defs {
+        out.push_str(&format!("\n● {} — {}\n", d.name, d.description));
+        if let Some(m) = &d.model {
+            out.push_str(&format!(
+                "  {}\n",
+                tr_fmt("agents.model_line", &[("profile", m)])
+            ));
+        }
+        let tools = d
+            .tools
+            .as_ref()
+            .map(|t| t.join(", "))
+            .unwrap_or_else(|| tr("agents.tools_all"));
+        out.push_str(&format!(
+            "  {}\n",
+            tr_fmt("agents.tools_line", &[("tools", &tools)])
+        ));
+        let source = if d.builtin {
+            tr("agents.builtin_tag")
+        } else {
+            d.source
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        out.push_str(&format!(
+            "  {}\n",
+            tr_fmt("agents.source_line", &[("source", &source)])
+        ));
+    }
+    out.push_str(&format!("\n{}", tr("agents.reload_note")));
+    out
+}
+
 #[async_trait]
 impl Command for AgentsCmd {
     fn name(&self) -> &str {
@@ -283,39 +338,11 @@ impl Command for AgentsCmd {
         // 实时重读盘，方便验证新写的定义文件；但注册进模型的类型列表在
         // 启动时已固定，新增/修改定义需重启才对模型生效（下方注明）。
         let defs = wyj_core::load_agent_defs(&ctx.cwd, &ctx.plugin_agent_paths);
-        let mut out = tr("agents.header");
-        for d in &defs {
-            out.push_str(&format!("\n● {} — {}\n", d.name, d.description));
-            if let Some(m) = &d.model {
-                out.push_str(&format!(
-                    "  {}\n",
-                    tr_fmt("agents.model_line", &[("profile", m)])
-                ));
-            }
-            let tools = d
-                .tools
-                .as_ref()
-                .map(|t| t.join(", "))
-                .unwrap_or_else(|| tr("agents.tools_all"));
-            out.push_str(&format!(
-                "  {}\n",
-                tr_fmt("agents.tools_line", &[("tools", &tools)])
-            ));
-            let source = if d.builtin {
-                tr("agents.builtin_tag")
-            } else {
-                d.source
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            };
-            out.push_str(&format!(
-                "  {}\n",
-                tr_fmt("agents.source_line", &[("source", &source)])
-            ));
-        }
-        out.push_str(&format!("\n{}", tr("agents.reload_note")));
-        Ok(CommandResult::Output(out))
+        let fallback_text = format_agents_text(&defs);
+        Ok(CommandResult::OpenAgentsDialog {
+            defs,
+            fallback_text,
+        })
     }
 }
 
@@ -1079,6 +1106,45 @@ mod help_tests {
             panic!("expected Output");
         };
         assert!(text.contains("/subagents"));
+    }
+}
+
+#[cfg(test)]
+mod agents_tests {
+    use super::*;
+
+    fn empty_ctx() -> CommandContext {
+        CommandContext {
+            cwd: std::path::PathBuf::new(),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_window: 0,
+            estimated_tokens: 0,
+            home_dir: std::path::PathBuf::new(),
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            effective_mcp_count: 0,
+            plugin_agent_paths: vec![],
+            hooks_enabled: false,
+            dynamic_commands: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn agents_command_returns_dialog_data_with_text_fallback() {
+        let result = AgentsCmd.run("", &empty_ctx()).await.unwrap();
+        let CommandResult::OpenAgentsDialog {
+            defs,
+            fallback_text,
+        } = result
+        else {
+            panic!("expected OpenAgentsDialog");
+        };
+        assert!(defs.iter().any(|d| d.name == "general-purpose"));
+        assert!(fallback_text.contains("general-purpose"));
     }
 }
 

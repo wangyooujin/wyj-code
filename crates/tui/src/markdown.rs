@@ -530,7 +530,6 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
             }
             Event::End(TagEnd::Heading(_)) => {
                 c.flush(lines);
-                lines.push(Line::from(""));
                 c.heading = None;
             }
 
@@ -538,7 +537,6 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
             Event::Start(Tag::Paragraph) => {}
             Event::End(TagEnd::Paragraph) => {
                 c.flush(lines);
-                lines.push(Line::from(""));
             }
 
             // ─── 块引用 ─────────────────────────────────────────────────────
@@ -578,7 +576,6 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
                     format!("  ╰{}╯", "─".repeat(max_width.saturating_sub(4))),
                     Theme::dim(),
                 )));
-                lines.push(Line::from(""));
             }
 
             // ─── 列表 ───────────────────────────────────────────────────────
@@ -628,7 +625,6 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
                     }
                 }
                 c.emit_table(lines);
-                lines.push(Line::from(""));
                 c.in_table = false;
                 c.is_table_head = false;
             }
@@ -765,5 +761,27 @@ mod tests {
     fn highlight_code_line_does_not_panic_on_trailing_escape_backslash() {
         let seg = "            f\"[{i}] 来源:{it.get('source','')} | 时间:{pub}\\";
         let _ = highlight_code_line(seg, "python");
+    }
+
+    #[test]
+    fn paragraphs_render_compact_without_forced_blank_lines() {
+        let mut lines = vec![];
+        render_markdown(&mut lines, "第一段\n\n第二段\n\n## 标题\n\n正文", 80);
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().all(|line| !line.trim().is_empty()));
+        assert_eq!(rendered.len(), 4);
+        assert!(rendered[0].contains("第一段"));
+        assert!(rendered[1].contains("第二段"));
+        assert!(rendered[2].contains("标题"));
+        assert!(rendered[3].contains("正文"));
     }
 }

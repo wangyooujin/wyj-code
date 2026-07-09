@@ -19,6 +19,9 @@ pub struct ProfileTemplate {
     pub example_model: &'static str,
     /// 供应商特殊说明，展示在模板选择器里
     pub note: &'static str,
+    pub vision: bool,
+    pub prompt_cache: Option<bool>,
+    pub openai_stream_options: Option<bool>,
 }
 
 pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
@@ -27,8 +30,11 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         label: "GLM（智谱/Z.ai Coding Plan）",
         provider: Provider::Anthropic,
         base_url: "https://open.bigmodel.cn/api/anthropic",
-        example_model: "glm-4.6",
+        example_model: "glm-5.2",
         note: "",
+        vision: false,
+        prompt_cache: Some(false),
+        openai_stream_options: None,
     },
     ProfileTemplate {
         key: "volcengine",
@@ -37,6 +43,9 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         base_url: "https://ark.cn-beijing.volces.com/api/v3",
         example_model: "doubao-seed-1-6",
         note: "模型名通常是控制台创建的推理接入点 ID（形如 ep-xxxxxxxx-xxxxx），非固定模型名",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(false),
     },
     ProfileTemplate {
         key: "minimax",
@@ -45,6 +54,9 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         base_url: "https://api.minimaxi.com/v1",
         example_model: "MiniMax-M2",
         note: "",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(false),
     },
     ProfileTemplate {
         key: "kimi",
@@ -53,6 +65,9 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         base_url: "https://api.moonshot.cn/anthropic",
         example_model: "kimi-k2-turbo-preview",
         note: "",
+        vision: false,
+        prompt_cache: Some(false),
+        openai_stream_options: None,
     },
     ProfileTemplate {
         key: "deepseek",
@@ -62,6 +77,9 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         example_model: "deepseek-chat",
         note:
             "deepseek-chat/deepseek-reasoner 后续会作为新模型的兼容别名，供应商公告后可能需要改名",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(false),
     },
     ProfileTemplate {
         key: "custom",
@@ -70,6 +88,9 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         base_url: "",
         example_model: "",
         note: "",
+        vision: true,
+        prompt_cache: None,
+        openai_stream_options: None,
     },
 ];
 
