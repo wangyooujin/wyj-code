@@ -1,0 +1,39 @@
+name: Deploy Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Tailwind CSS
+        working-directory: site
+        run: npx --yes tailwindcss@3 -i ./src/input.css -o ./dist/style.css --minify
+
+      - name: Assemble site
+        working-directory: site
+        run: |
+          cp index.html script.js favicon.svg dist/
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: site/dist
+          publish_branch: gh-pages
