@@ -25,6 +25,10 @@ cargo run -- --resume <id>       # 恢复指定会话 ID
 ./build.sh release               # 交互确认版本号后自动 bump Cargo.toml + commit + tag + push（触发 GitHub Actions Release）
 ```
 
+GitHub Release 压缩包（`.github/workflows/release.yml` 产出的 tar.gz/zip，不同于 `./build.sh package`
+产出的裸二进制）额外内置 `install.sh`/`install.bat`（仓库根目录）两个一键安装脚本，解压后运行即可
+装到当前用户目录并自动配置 PATH，无需 sudo/管理员权限。
+
 ## Test & Lint
 
 ```bash
