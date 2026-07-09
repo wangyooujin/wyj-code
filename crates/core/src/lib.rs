@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_def;
 pub mod claude_md;
 pub mod compact;
+pub mod frontmatter;
 pub mod history;
 pub mod hooks;
 pub mod memory;

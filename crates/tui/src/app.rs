@@ -3823,6 +3823,14 @@ pub struct AppState {
     /// 会话切换/恢复）。为 true 后欢迎页永远不再显示，防止 `frozen_up_to`
     /// 归零重来时（这些场景都会归零）重复出现或与真实历史消息混在一起。
     pub welcome_frozen: bool,
+    /// 本轮循环 draw() 之前（drain agent_rx/sub_rx 之前）计算出的"当前最后一条
+    /// 可折叠 ToolResult"的 `sequence_no`。`compute_freezable_up_to` 的冻结天花板
+    /// 与 Ctrl+O 处理必须读同一个值，而不是各自独立重新扫描——否则多 Agent 并发
+    /// 场景下，drain 期间新插入的 ToolResult 会让"最后一条可折叠"发生漂移，导致
+    /// 用户在屏幕上看到的展开提示和 Ctrl+O 实际翻转的目标不一致。用 `sequence_no`
+    /// 而非下标：`ToolEnd` 用 `insert()` 而非 `push()`，并发场景下下标会漂移，
+    /// `sequence_no` 不受影响。
+    pub last_collapsible_seq: Option<usize>,
     /// 上一次"聊天区 Up/Down 快捷键"（历史召回/子 Agent 面板导航/光标移动）
     /// 生效的时间戳，用于防抖识别：部分终端会把鼠标滚轮转译成方向键转发给
     /// 应用（尤其在打开全屏对话框、进入 alternate screen 时），与真实按键
@@ -3942,10 +3950,16 @@ pub struct AppState {
 /// 1. 该位置是 `ToolCall` 但其 `ToolResult` 尚未出现——并发工具调用可能乱序
 ///    完成，`ToolEnd` 会把结果 `insert` 在这条 `ToolCall` 之后，未落定前这一位置
 ///    之后的一切都可能被后续插入打乱，不能冻结。
-/// 2. `last_collapsible_tool_result_idx` 命中的位置（及其后）——Ctrl+O 仍需要
-///    能切换到它。
+/// 2. `collapsible_idx` 命中的位置（及其后）——Ctrl+O 仍需要能切换到它。
 /// 3. 该位置关联的子 Agent（`sub_agent_id`）仍处于 `Running`——对应 ToolCall/
 ///    ToolResult 下面还在画实时状态行，不能冻结。
+///
+/// `collapsible_idx` 必须由调用方在 draw() 之前、drain agent_rx/sub_rx 之前算好
+/// 传入（`render::last_collapsible_tool_result_idx` 的结果），不在这里自行重新
+/// 扫描——多 Agent 并发场景下，若各处独立扫描，drain 期间新插入的 ToolResult
+/// 会让"最后一条可折叠"发生跨帧漂移，导致规则②在两次调用之间保护到不同的
+/// 位置。调用方需要保证这个下标与 Ctrl+O 实际读取的目标（`AppState.
+/// last_collapsible_seq`）来自同一次扫描结果。
 ///
 /// 返回值只增不减（`max(frozen_up_to)` 兜底），永远不会把已经冻结的内容
 /// "退冻"。
@@ -3953,9 +3967,9 @@ fn compute_freezable_up_to(
     messages: &[ChatMessage],
     frozen_up_to: usize,
     sub_agents: &std::collections::BTreeMap<u64, SubAgentUiState>,
+    collapsible_idx: Option<usize>,
 ) -> usize {
-    let collapsible_bound =
-        crate::render::last_collapsible_tool_result_idx(messages).unwrap_or(messages.len());
+    let collapsible_bound = collapsible_idx.unwrap_or(messages.len());
     let mut bound = messages.len().min(collapsible_bound);
 
     for (i, m) in messages.iter().enumerate().skip(frozen_up_to) {
@@ -3986,6 +4000,20 @@ fn compute_freezable_up_to(
     bound.max(frozen_up_to)
 }
 
+/// Ctrl+O 的实际翻转逻辑：按 `sequence_no`（而非下标，见 `AppState.
+/// last_collapsible_seq` 字段文档）精确定位目标 `ToolResult` 并翻转其
+/// `expanded`。`seq` 为 `None`，或消息数组里找不到匹配的 `ToolResult`
+/// （防御性场景，正常不会触发）时 no-op，不 panic、不误翻转其他消息。
+fn toggle_last_collapsible(messages: &mut [ChatMessage], seq: Option<usize>) {
+    let Some(seq) = seq else { return };
+    if let Some(m) = messages
+        .iter_mut()
+        .find(|m| matches!(m.role, MessageRole::ToolResult) && m.sequence_no == Some(seq))
+    {
+        m.expanded = !m.expanded;
+    }
+}
+
 impl AppState {
     fn new(
         cwd: PathBuf,
@@ -4014,6 +4042,7 @@ impl AppState {
             exec_mode_confirm: None,
             frozen_up_to: 0,
             welcome_frozen: false,
+            last_collapsible_seq: None,
             last_up_down_key: None,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -4753,6 +4782,8 @@ impl AppState {
                 agent_type,
                 description,
                 background,
+                // 落盘 trace 关联用，TUI 内存态摘要不需要
+                parent_tool_use_id: _,
             } => {
                 // FIFO 绑定最早一条未绑定的 Agent ToolCall 消息，并把内容改写为 类型(描述)
                 if let Some(msg) = self.messages.iter_mut().find(|m| {
@@ -4787,6 +4818,9 @@ impl AppState {
                 id,
                 tool_name,
                 arg_summary,
+                // 完整 input 只落盘（trace.rs），TUI 内存态摘要不保留全文（见
+                // CLAUDE.md/plan：避免长会话下常驻全文内存暴涨）
+                input: _,
             } => {
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.tool_calls += 1;
@@ -4808,6 +4842,8 @@ impl AppState {
                 tool_name,
                 is_error,
                 elapsed_secs,
+                // 完整 output 只落盘（trace.rs），TUI 内存态摘要不保留全文
+                output: _,
             } => {
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.current_tool = None;
@@ -5268,6 +5304,20 @@ fn spawn_agent_turn(
     (handle.abort_handle(), inject_tx)
 }
 
+/// RunPromptScoped（自定义命令 allowed-tools）临时收紧 permission_mode 的 RAII 兜底还原。
+/// 正常跑完当轮或 ESC 中断（tokio task 被 abort，future 直接 drop）都会触发 `Drop::drop`，
+/// 保证不会把权限模式永久卡在临时收紧的 Allowlist 上。
+struct RestorePermissionOnDrop {
+    handle: Arc<std::sync::RwLock<PermissionMode>>,
+    prev: PermissionMode,
+}
+
+impl Drop for RestorePermissionOnDrop {
+    fn drop(&mut self) {
+        *self.handle.write().unwrap() = self.prev.clone();
+    }
+}
+
 /// 根据 AgentMode 构建对应的 PermissionMode
 fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
     match mode {
@@ -5371,6 +5421,151 @@ fn scan_files(
 /// 根据输入框光标前的 @ 触发词更新文件候选列表
 /// 在 agents 面板里按 delta(-1=Up/+1=Down) 移动选中项。
 /// 未选中时统一默认跳到最新（id 最大）一项；移动到边界后 clamp，不 wrap。
+/// 把某会话落盘的子 Agent trace（`wyj_tools::trace`）重建为 `SubAgentUiState`
+/// 摘要，回灌进 `sub_agents`——复用现有 `draw_sub_agents_panel`，跨会话查看
+/// 不需要专门的展示代码路径。全文 input/output 只留在磁盘（避免长会话下
+/// 常驻内存暴涨），这里只截断出与实时 `arg_summary` 观感一致的摘要行。
+/// trace 目录不存在（新会话，或该会话从未跑过子 Agent）时返回空 map。
+fn reload_persisted_sub_agents(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+) -> std::collections::BTreeMap<u64, SubAgentUiState> {
+    use wyj_tools::trace::{list_trace_ids, read_trace, trace_file, TraceEvent};
+
+    let mut out = std::collections::BTreeMap::new();
+    for id in list_trace_ids(sessions_dir, session_id) {
+        let path = trace_file(sessions_dir, session_id, id);
+        let Ok(events) = read_trace(&path) else {
+            continue;
+        };
+        let mut reconstructed: Option<SubAgentUiState> = None;
+        for ev in events {
+            match ev {
+                TraceEvent::Started {
+                    agent_type,
+                    description,
+                    background,
+                    ..
+                } => {
+                    reconstructed = Some(SubAgentUiState {
+                        agent_type,
+                        description,
+                        background,
+                        // 兜底态：没有 Done 事件（如进程被强杀）时保持"已中断"，
+                        // 下面 Done 分支命中时会覆盖为 Done/Failed。
+                        status: SubAgentStatus::Interrupted,
+                        started_at: Instant::now(),
+                        final_elapsed: None,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tool_calls: 0,
+                        current_tool: None,
+                        tool_log: vec![],
+                        has_result: false,
+                        finished_at: Some(Instant::now()),
+                        final_result: None,
+                    });
+                }
+                TraceEvent::ToolStart {
+                    tool_name,
+                    input_json,
+                    ..
+                } => {
+                    if let Some(s) = &mut reconstructed {
+                        s.tool_calls += 1;
+                        s.tool_log.push(SubToolLine {
+                            tool_name,
+                            arg_summary: wyj_tools::textutil::truncate_str(&input_json, 60)
+                                .to_string(),
+                            is_error: false,
+                            elapsed_secs: None,
+                        });
+                    }
+                }
+                TraceEvent::ToolEnd {
+                    tool_name,
+                    is_error,
+                    elapsed_secs,
+                    ..
+                } => {
+                    if let Some(s) = &mut reconstructed {
+                        if let Some(line) = s
+                            .tool_log
+                            .iter_mut()
+                            .rev()
+                            .find(|l| l.elapsed_secs.is_none() && l.tool_name == tool_name)
+                        {
+                            line.is_error = is_error;
+                            line.elapsed_secs = Some(elapsed_secs);
+                        }
+                    }
+                }
+                TraceEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    if let Some(s) = &mut reconstructed {
+                        s.input_tokens += input_tokens;
+                        s.output_tokens += output_tokens;
+                    }
+                }
+                TraceEvent::Done {
+                    result,
+                    is_error,
+                    elapsed_secs,
+                } => {
+                    if let Some(s) = &mut reconstructed {
+                        s.status = if is_error {
+                            SubAgentStatus::Failed
+                        } else {
+                            SubAgentStatus::Done
+                        };
+                        s.final_elapsed = Some(elapsed_secs);
+                        s.has_result = true;
+                        s.final_result = Some(result);
+                    }
+                }
+            }
+        }
+        if let Some(s) = reconstructed {
+            out.insert(id, s);
+        }
+    }
+    out
+}
+
+/// `/subagents [id]` 命令：无参数时定位到最近一个子 Agent 并展开详情
+/// （本会话历史子 Agent 已在启动/`/resume` 时由 `reload_persisted_sub_agents`
+/// 回灌进 `state.sub_agents`，故这里天然覆盖跨会话查看）；带 id 时校验存在性。
+fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
+    if state.sub_agents.is_empty() {
+        state
+            .messages
+            .push(ChatMessage::system(wyj_i18n::tr("subagents.empty")));
+        return;
+    }
+    match target_id {
+        Some(id) if state.sub_agents.contains_key(&id) => {
+            state.selected_sub_agent = Some(id);
+            state.sub_agent_detail_open = true;
+            state.sub_agent_detail_scroll = 0;
+        }
+        Some(id) => {
+            state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                "subagents.not_found",
+                &[("id", id.to_string().as_str())],
+            )));
+        }
+        None => {
+            if let Some(&last_id) = state.sub_agents.keys().next_back() {
+                state.selected_sub_agent = Some(last_id);
+                state.sub_agent_detail_open = true;
+                state.sub_agent_detail_scroll = 0;
+            }
+        }
+    }
+}
+
 fn move_sub_agent_selection(state: &mut AppState, delta: i32) {
     let ids: Vec<u64> = state.sub_agents.keys().copied().collect();
     if ids.is_empty() {
@@ -5548,6 +5743,13 @@ async fn tui_main(
     state.hook_runner = agent.hook_runner_ref().cloned();
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
+
+    // 启动/`-c`/`--resume` 统一路径：把落盘的子 Agent trace（若存在）回灌进
+    // 面板，使跨会话查看无需区分新会话/恢复会话——新会话的 trace 目录尚不
+    // 存在，`reload_persisted_sub_agents` 天然返回空 map，是个 no-op。
+    if let Some(store) = &session_store {
+        state.sub_agents = reload_persisted_sub_agents(store.dir(), &current_session_id);
+    }
 
     // 设置初始终端窗口标题（退出时恢复）
     let _ = write!(io::stdout(), "\x1b]0;wyj-code\x07");
@@ -5741,12 +5943,28 @@ async fn tui_main(
             // 表现为界面一直空白、像是卡死。分批处理让每帧只推进一小步，中间
             // 照常 draw()+收事件，界面会连续可见地滚动而不是长时间无响应。
             const MAX_FLUSH_MESSAGES_PER_FRAME: usize = 20;
-            let freezable =
-                compute_freezable_up_to(&state.messages, state.frozen_up_to, &state.sub_agents);
+            // 在 draw()（下方）和 drain agent_rx/sub_rx（draw 之后）之前算好本轮的
+            // "最后一条可折叠 ToolResult"下标并缓存进 state：compute_freezable_up_to
+            // 的冻结天花板与 Ctrl+O 处理都必须读这同一个值，否则多 Agent 并发场景下
+            // drain 期间新插入的消息会让目标在同一轮循环内漂移，导致用户在屏幕上
+            // 看到的展开提示与 Ctrl+O 实际翻转的目标不一致（见 last_collapsible_seq
+            // 字段文档）。
+            let last_collapsible_idx = render::last_collapsible_tool_result_idx(&state.messages);
+            state.last_collapsible_seq =
+                last_collapsible_idx.and_then(|i| state.messages[i].sequence_no);
+            let freezable = compute_freezable_up_to(
+                &state.messages,
+                state.frozen_up_to,
+                &state.sub_agents,
+                last_collapsible_idx,
+            );
             let freezable = freezable.min(state.frozen_up_to + MAX_FLUSH_MESSAGES_PER_FRAME);
-            if freezable > state.frozen_up_to {
+            // 本轮是否发生了 insert_before：若是，下面的 viewport resize 本轮要跳过
+            // （见下方判断），不能和 insert_before 挤在同一轮循环里——见 H2 说明。
+            let froze_this_frame = freezable > state.frozen_up_to;
+            if froze_this_frame {
                 let term_size = terminal.size()?;
-                let max_content_width = term_size.width.saturating_sub(4) as usize;
+                let max_content_width = term_size.width.saturating_sub(2) as usize;
                 let mut is_first_user = state.frozen_up_to == 0;
                 let mut flush_lines = Vec::new();
                 // 欢迎页此前只在"待冻结"区域里每帧重绘，本身从未被真正写进
@@ -5766,11 +5984,14 @@ async fn tui_main(
                     &mut is_first_user,
                 ));
                 if !flush_lines.is_empty() {
-                    let n = flush_lines.len() as u16;
+                    let flush_text = Text::from(flush_lines);
+                    let para = Paragraph::new(flush_text).wrap(Wrap { trim: false });
+                    let n = para
+                        .line_count(term_size.width.max(1))
+                        .min(u16::MAX as usize) as u16;
+                    let n = n.max(1);
                     terminal.insert_before(n, |buf| {
-                        Paragraph::new(Text::from(flush_lines))
-                            .wrap(Wrap { trim: false })
-                            .render(buf.area, buf);
+                        para.render(buf.area, buf);
                     })?;
                 }
                 state.frozen_up_to = freezable;
@@ -5789,22 +6010,34 @@ async fn tui_main(
             // （用完全相同的输入在 ratatui+crossterm 的最小复现示例里也能独立
             // 复现），所以退回按内容实际需要动态定高——牺牲"输入框始终贴住
             // 终端最底部"这个视觉效果，换取稳定可靠的渲染。
-            let term_size = terminal.size()?;
-            let footer_fixed =
-                render::fixed_footer_height(&state, &input, term_size.width, term_size.height);
-            let chat_h = render::pending_chat_visual_height(&state, term_size.width)
-                .clamp(3, (term_size.height * 7 / 10).max(3));
-            let desired_height = (footer_fixed + chat_h).min(term_size.height).max(1);
-            if desired_height != current_inline_height {
-                // 重建前先清掉旧视口内容，避免新旧画面重叠。
-                terminal.clear()?;
-                *terminal = Terminal::with_options(
-                    CrosstermBackend::new(io::stdout()),
-                    TerminalOptions {
-                        viewport: Viewport::Inline(desired_height),
-                    },
-                )?;
-                current_inline_height = desired_height;
+            //
+            // 本轮若已经 insert_before 过（froze_this_frame），resize 推迟到下一轮：
+            // "insert_before 刚写完→立刻 clear()+重建 Terminal"这个序列背靠背执行
+            // 时，Ctrl+O 展开/收起（几行→几十/上百行的高度跳变）叠加多 Agent 面板
+            // 自身的高度抖动，会让这个序列被高频触发，是截图里 box-drawing 字符
+            // 错位、新旧内容重叠这类终端绘制层面撕裂的直接成因（H2）。下一轮顶部
+            // 会用最新状态重新算 desired_height，届时没有 insert_before 在同一帧
+            // 内干扰，resize 更安全；代价是极端场景下（连续多轮都在冻结，如
+            // --resume 恢复大量历史）resize 会推迟数十毫秒，与既有的"分批冻结、
+            // 接受多帧过渡"取舍是同一类权衡。
+            if !froze_this_frame {
+                let term_size = terminal.size()?;
+                let footer_fixed =
+                    render::fixed_footer_height(&state, &input, term_size.width, term_size.height);
+                let chat_h = render::pending_chat_visual_height(&state, term_size.width)
+                    .clamp(3, (term_size.height * 7 / 10).max(3));
+                let desired_height = (footer_fixed + chat_h).min(term_size.height).max(1);
+                if desired_height != current_inline_height {
+                    // 重建前先清掉旧视口内容，避免新旧画面重叠。
+                    terminal.clear()?;
+                    *terminal = Terminal::with_options(
+                        CrosstermBackend::new(io::stdout()),
+                        TerminalOptions {
+                            viewport: Viewport::Inline(desired_height),
+                        },
+                    )?;
+                    current_inline_height = desired_height;
+                }
             }
         }
 
@@ -8008,6 +8241,12 @@ async fn tui_main(
                                     .hook_runner
                                     .as_ref()
                                     .is_some_and(|r| r.is_enabled()),
+                                dynamic_commands: cmd_registry
+                                    .list()
+                                    .iter()
+                                    .filter(|c| c.is_dynamic())
+                                    .map(|c| (c.name().to_string(), c.description(), c.usage()))
+                                    .collect(),
                             };
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
@@ -8238,6 +8477,89 @@ async fn tui_main(
                                         });
                                         state.current_task = Some(handle.abort_handle());
                                     }
+                                    Ok(CommandResult::RunPromptScoped {
+                                        text,
+                                        allowed_tools,
+                                        profile: _,
+                                    }) => {
+                                        // 带 allowed-tools 的自定义命令：临时把 permission_mode
+                                        // 收紧为 Allowlist，这一轮跑完（含 ESC 中断的场景，靠
+                                        // RestorePermissionOnDrop 的 Drop 兜底）自动还原快照；
+                                        // 不改 shared_mode，状态栏 Normal/Plan/Bypass 显示不受
+                                        // 影响。`profile`（model: frontmatter）本版本仅解析存储、
+                                        // 不做运行期切换，此处忽略。
+                                        state.push_user(text.clone());
+                                        state.is_thinking = true;
+                                        state.spinner_frame = 0;
+                                        state.turn_start_time = Some(Instant::now());
+                                        state.turn_start_input_tokens = state.total_input_tokens;
+                                        state.turn_start_output_tokens = state.total_output_tokens;
+
+                                        let agent_c = shared_agent.read().unwrap().clone();
+                                        let session_c = session.clone();
+                                        let tx = agent_tx.clone();
+                                        let ctx_cwd = cwd.clone();
+                                        let mode_arc = shared_mode.clone();
+                                        let shared_permission_c = shared_permission.clone();
+                                        let ui_ask_tx_clone = ui_ask_tx.clone();
+
+                                        let handle = tokio::spawn(async move {
+                                            let mut sess = session_c.lock().await;
+                                            sess.push_user(text);
+                                            let current_mode = mode_arc.lock().await.clone();
+                                            let mut ctx = ToolCtx::new(&ctx_cwd);
+                                            ctx.permission_mode = shared_permission_c.clone();
+                                            ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+                                            let turn_agent =
+                                                plan_turn_agent(&agent_c, &current_mode);
+
+                                            // 临时收紧 + RAII 兜底还原（ESC 中断会直接 drop 这个
+                                            // future，只有 Drop 才保证一定跑到，plain 的
+                                            // "跑完再还原" 在中断路径下不会执行）。
+                                            let _restore_guard = allowed_tools.map(|tools| {
+                                                let prev =
+                                                    shared_permission_c.read().unwrap().clone();
+                                                *shared_permission_c.write().unwrap() =
+                                                    PermissionMode::Allowlist(
+                                                        tools.into_iter().collect(),
+                                                    );
+                                                RestorePermissionOnDrop {
+                                                    handle: shared_permission_c.clone(),
+                                                    prev,
+                                                }
+                                            });
+
+                                            let tx2 = tx.clone();
+                                            let mut on_text = move |d: &str| {
+                                                let _ = tx2
+                                                    .try_send(AgentEvent::TextDelta(d.to_string()));
+                                            };
+                                            match turn_agent
+                                                .run_turn(&mut sess, &ctx, &mut on_text)
+                                                .await
+                                            {
+                                                Ok(_) => {
+                                                    let _ = tx
+                                                        .send(AgentEvent::Usage {
+                                                            input: sess.total_input_tokens,
+                                                            output: sess.total_output_tokens,
+                                                            context_tokens:
+                                                                wyj_core::estimate_tokens(
+                                                                    &sess.messages,
+                                                                ),
+                                                        })
+                                                        .await;
+                                                    let _ = tx.send(AgentEvent::TurnDone).await;
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx
+                                                        .send(AgentEvent::Error(e.to_string()))
+                                                        .await;
+                                                }
+                                            }
+                                        });
+                                        state.current_task = Some(handle.abort_handle());
+                                    }
                                     Ok(CommandResult::ResumeSession(id)) => {
                                         if state.is_thinking {
                                             state.messages.push(ChatMessage::assistant(
@@ -8353,6 +8675,9 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::OpenPluginsDialog) => {
                                         state.plugins_dialog = Some(PluginsDialog::new(&state.cwd));
+                                    }
+                                    Ok(CommandResult::OpenSubAgentsPanel(target_id)) => {
+                                        apply_open_subagents_panel(&mut state, target_id);
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;
@@ -8582,23 +8907,16 @@ async fn tui_main(
                                     let _ = terminal.clear();
                                 }
                                 'o' => {
-                                    // Ctrl+O — 展开/折叠最后一条「可折叠」工具结果（对齐 Claude Code）
-                                    // 与 render.rs 的 last_collapsible_idx 共用同一判定函数，
-                                    // 但此处不额外过滤 `expanded`（要能在展开态下切回折叠）。
-                                    if let Some(last_tool) =
-                                        state.messages.iter_mut().rev().find(|m| {
-                                            if !matches!(m.role, MessageRole::ToolResult) {
-                                                return false;
-                                            }
-                                            crate::render::is_collapsible_tool_result_content(
-                                                &m.content,
-                                                m.tool_name.as_deref(),
-                                                m.summary_is_first_line,
-                                            )
-                                        })
-                                    {
-                                        last_tool.expanded = !last_tool.expanded;
-                                    }
+                                    // Ctrl+O — 展开/折叠最后一条「可折叠」工具结果（对齐 Claude Code）。
+                                    // 必须读 state.last_collapsible_seq（本轮循环顶部、draw()/drain
+                                    // agent_rx/sub_rx 之前算好的缓存值），而不是在这里独立重新扫描
+                                    // state.messages——多 Agent 并发场景下，drain 期间新插入的
+                                    // ToolResult 会让"最后一条可折叠"发生漂移，若在此处重新扫描，
+                                    // 翻转的就不是用户在屏幕上实际看到提示的那一条。
+                                    toggle_last_collapsible(
+                                        &mut state.messages,
+                                        state.last_collapsible_seq,
+                                    );
                                 }
                                 't' => {
                                     // Ctrl+T — 折叠/展开任务列表面板（仅在满足折叠条件时生效）
@@ -8863,7 +9181,12 @@ mod reconstruct_display_tests {
         // 用真正的冻结判定复演一遍：修复前这里会永久卡在下标 0（call-a 找不到
         // 自己的结果），修复后应该能一路冻结到底。
         let sub_agents = std::collections::BTreeMap::new();
-        let bound = compute_freezable_up_to(&display, 0, &sub_agents);
+        let bound = compute_freezable_up_to(
+            &display,
+            0,
+            &sub_agents,
+            render::last_collapsible_tool_result_idx(&display),
+        );
         assert_eq!(bound, display.len());
     }
 }
@@ -8898,6 +9221,7 @@ mod sub_agent_ui_tests {
             agent_type: "Explore".to_string(),
             description: desc.to_string(),
             background,
+            parent_tool_use_id: None,
         }));
     }
 
@@ -8966,6 +9290,7 @@ mod sub_agent_ui_tests {
             id: 1,
             tool_name: "Grep".to_string(),
             arg_summary: "foo".to_string(),
+            input: serde_json::json!({"pattern": "foo"}),
         }));
         {
             let s = state.sub_agents.get(&1).unwrap();
@@ -8977,11 +9302,227 @@ mod sub_agent_ui_tests {
             tool_name: "Grep".to_string(),
             is_error: false,
             elapsed_secs: 0.3,
+            output: "1 match".to_string(),
         }));
         let s = state.sub_agents.get(&1).unwrap();
         assert!(s.current_tool.is_none());
         assert_eq!(s.tool_log.len(), 1);
         assert_eq!(s.tool_log[0].elapsed_secs, Some(0.3));
+    }
+}
+
+#[cfg(test)]
+mod cross_session_subagents_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use wyj_tools::trace::{trace_dir, TraceEvent};
+    use wyj_tools::SubAgentHub;
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(SubAgentHub::new()),
+        )
+    }
+
+    fn unique_tmp_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("wyj-tui-subagents-test-{label}-{nanos}-{n}"))
+    }
+
+    fn write_trace(
+        sessions_dir: &std::path::Path,
+        session_id: &str,
+        id: u64,
+        events: &[TraceEvent],
+    ) {
+        let dir = trace_dir(sessions_dir, session_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut content = String::new();
+        for ev in events {
+            content.push_str(&serde_json::to_string(ev).unwrap());
+            content.push('\n');
+        }
+        std::fs::write(dir.join(format!("a{id}.jsonl")), content).unwrap();
+    }
+
+    #[test]
+    fn reload_reconstructs_completed_agent_with_tool_log() {
+        let tmp = unique_tmp_dir("basic");
+        let session_id = "sess-reload";
+        write_trace(
+            &tmp,
+            session_id,
+            1,
+            &[
+                TraceEvent::Started {
+                    agent_type: "general-purpose".into(),
+                    description: "找 bug".into(),
+                    background: false,
+                    parent_tool_use_id: Some("toolu_1".into()),
+                },
+                TraceEvent::ToolStart {
+                    tool_name: "Bash".into(),
+                    input_json: "{\"command\":\"echo hi\"}".into(),
+                    truncated: false,
+                },
+                TraceEvent::ToolEnd {
+                    tool_name: "Bash".into(),
+                    is_error: false,
+                    elapsed_secs: 0.2,
+                    output: "hi\n".into(),
+                    truncated: false,
+                },
+                TraceEvent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                },
+                TraceEvent::Done {
+                    result: "done".into(),
+                    is_error: false,
+                    elapsed_secs: 3.5,
+                },
+            ],
+        );
+
+        let reloaded = reload_persisted_sub_agents(&tmp, session_id);
+        let s = reloaded.get(&1).expect("id 1 should be reconstructed");
+        assert_eq!(s.agent_type, "general-purpose");
+        assert_eq!(s.status, SubAgentStatus::Done);
+        assert_eq!(s.final_result.as_deref(), Some("done"));
+        assert_eq!(s.input_tokens, 100);
+        assert_eq!(s.output_tokens, 20);
+        assert_eq!(s.tool_log.len(), 1);
+        assert_eq!(s.tool_log[0].tool_name, "Bash");
+        assert_eq!(s.tool_log[0].elapsed_secs, Some(0.2));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reload_marks_missing_done_event_as_interrupted() {
+        let tmp = unique_tmp_dir("crashed");
+        let session_id = "sess-crashed";
+        write_trace(
+            &tmp,
+            session_id,
+            1,
+            &[TraceEvent::Started {
+                agent_type: "general-purpose".into(),
+                description: "被强杀".into(),
+                background: false,
+                parent_tool_use_id: None,
+            }],
+        );
+
+        let reloaded = reload_persisted_sub_agents(&tmp, session_id);
+        let s = reloaded.get(&1).unwrap();
+        assert_eq!(s.status, SubAgentStatus::Interrupted);
+        assert!(s.final_result.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reload_on_nonexistent_dir_returns_empty() {
+        let tmp = unique_tmp_dir("missing");
+        let reloaded = reload_persisted_sub_agents(&tmp, "sess-none");
+        assert!(reloaded.is_empty());
+    }
+
+    #[test]
+    fn open_panel_without_id_selects_most_recent_and_opens_detail() {
+        let mut state = make_state();
+        state.sub_agents.insert(
+            1,
+            SubAgentUiState {
+                agent_type: "t".into(),
+                description: "d".into(),
+                background: false,
+                status: SubAgentStatus::Done,
+                started_at: Instant::now(),
+                final_elapsed: Some(1.0),
+                input_tokens: 0,
+                output_tokens: 0,
+                tool_calls: 0,
+                current_tool: None,
+                tool_log: vec![],
+                has_result: true,
+                finished_at: Some(Instant::now()),
+                final_result: Some("r1".into()),
+            },
+        );
+        state.sub_agents.insert(
+            2,
+            SubAgentUiState {
+                agent_type: "t".into(),
+                description: "d2".into(),
+                background: false,
+                status: SubAgentStatus::Done,
+                started_at: Instant::now(),
+                final_elapsed: Some(1.0),
+                input_tokens: 0,
+                output_tokens: 0,
+                tool_calls: 0,
+                current_tool: None,
+                tool_log: vec![],
+                has_result: true,
+                finished_at: Some(Instant::now()),
+                final_result: Some("r2".into()),
+            },
+        );
+
+        apply_open_subagents_panel(&mut state, None);
+        assert_eq!(state.selected_sub_agent, Some(2));
+        assert!(state.sub_agent_detail_open);
+    }
+
+    #[test]
+    fn open_panel_with_missing_id_reports_error_without_panic() {
+        let mut state = make_state();
+        state.sub_agents.insert(
+            1,
+            SubAgentUiState {
+                agent_type: "t".into(),
+                description: "d".into(),
+                background: false,
+                status: SubAgentStatus::Done,
+                started_at: Instant::now(),
+                final_elapsed: Some(1.0),
+                input_tokens: 0,
+                output_tokens: 0,
+                tool_calls: 0,
+                current_tool: None,
+                tool_log: vec![],
+                has_result: true,
+                finished_at: Some(Instant::now()),
+                final_result: Some("r1".into()),
+            },
+        );
+        apply_open_subagents_panel(&mut state, Some(99));
+        assert!(state
+            .messages
+            .iter()
+            .any(|m| m.content.contains("99") || m.content.contains("a99")));
+        // 请求不存在的 id 不应误改当前选中项
+        assert_eq!(state.selected_sub_agent, None);
+    }
+
+    #[test]
+    fn open_panel_on_empty_session_reports_empty_message() {
+        let mut state = make_state();
+        apply_open_subagents_panel(&mut state, None);
+        assert_eq!(state.selected_sub_agent, None);
+        assert!(!state.messages.is_empty());
     }
 }
 
@@ -9445,7 +9986,12 @@ mod tool_event_ordering_tests {
         state
             .messages
             .push(ChatMessage::assistant("hello".to_string()));
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        let bound = compute_freezable_up_to(
+            &state.messages,
+            0,
+            &state.sub_agents,
+            render::last_collapsible_tool_result_idx(&state.messages),
+        );
         assert_eq!(bound, 2);
     }
 
@@ -9473,7 +10019,12 @@ mod tool_event_ordering_tests {
         });
         // messages = [ToolCall(call-1), ToolResult(call-1), ToolCall(call-2)]
         // call-2 在下标 2，尚未落定，冻结边界必须停在 2。
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        let bound = compute_freezable_up_to(
+            &state.messages,
+            0,
+            &state.sub_agents,
+            render::last_collapsible_tool_result_idx(&state.messages),
+        );
         assert_eq!(bound, 2);
 
         // call-2 落定后，整批都可以冻结了
@@ -9483,7 +10034,12 @@ mod tool_event_ordering_tests {
             is_error: false,
             elapsed_secs: 0.1,
         });
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        let bound = compute_freezable_up_to(
+            &state.messages,
+            0,
+            &state.sub_agents,
+            render::last_collapsible_tool_result_idx(&state.messages),
+        );
         assert_eq!(bound, state.messages.len());
     }
 
@@ -9529,12 +10085,132 @@ mod tool_event_ordering_tests {
             },
         );
 
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        let bound = compute_freezable_up_to(
+            &state.messages,
+            0,
+            &state.sub_agents,
+            render::last_collapsible_tool_result_idx(&state.messages),
+        );
         assert_eq!(bound, call_idx);
 
         // 子 Agent 结束后恢复可冻结
         state.sub_agents.get_mut(&1).unwrap().status = SubAgentStatus::Done;
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents);
+        let bound = compute_freezable_up_to(
+            &state.messages,
+            0,
+            &state.sub_agents,
+            render::last_collapsible_tool_result_idx(&state.messages),
+        );
         assert_eq!(bound, state.messages.len());
+    }
+
+    fn long_output(label: &str) -> String {
+        // > TOOL_RESULT_FOLD_LINES(5) 行，触发 is_collapsible_tool_result_content。
+        (1..=7)
+            .map(|i| format!("{label}-line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 多 Agent 并发下的核心回归：主循环顶部缓存的 last_collapsible_seq 一旦算出，
+    /// 之后（同一轮循环内）drain 出的新 ToolResult 不能让 Ctrl+O 的翻转目标发生
+    /// 漂移——用旧缓存值查找，命中的必须始终是缓存时刻的那一条，而不是新插入的。
+    #[test]
+    fn cached_collapsible_seq_is_immune_to_later_insertions_in_same_frame() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "a.rs"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: long_output("first"),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+
+        // 模拟主循环顶部：draw() 之前、drain 之前算好本轮缓存值。
+        let last_idx = render::last_collapsible_tool_result_idx(&state.messages);
+        let cached_seq = last_idx.and_then(|i| state.messages[i].sequence_no);
+        let first_result_seq = state.messages[1].sequence_no;
+        assert_eq!(cached_seq, first_result_seq);
+
+        // 模拟同一轮循环内、draw 之后 drain agent_rx 插入了另一个并发子 Agent
+        // 刚完成的、下标更靠后且同样可折叠的 ToolResult。
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-2".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "b.rs"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-2".to_string(),
+            output: long_output("second"),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+
+        // 如果此刻重新扫描，"最后一条可折叠"已经变成新插入的那条——修复前的 bug
+        // 正是在这里：Ctrl+O 处理独立重新扫描会命中它，而不是用户屏幕上看到的那条。
+        let rescanned = render::last_collapsible_tool_result_idx(&state.messages);
+        assert_ne!(rescanned, last_idx, "前置条件：确实发生了漂移");
+
+        // 用本轮开始时缓存的旧值翻转，必须命中第一条，不是新插入的那条。
+        toggle_last_collapsible(&mut state.messages, cached_seq);
+        assert!(state.messages[1].expanded, "缓存目标（第一条）应被翻转");
+        let second_result = state
+            .messages
+            .iter()
+            .find(|m| m.sequence_no == state.messages[3].sequence_no)
+            .unwrap();
+        assert!(!second_result.expanded, "新插入的那条不应被误翻转");
+    }
+
+    /// `compute_freezable_up_to` 必须真正使用外部传入的 `collapsible_idx`，而不是
+    /// 内部又独立扫描一遍——传入一个人为更早的下标，冻结边界必须被它限制住。
+    #[test]
+    fn compute_freezable_up_to_is_bounded_by_passed_in_collapsible_idx() {
+        let mut state = make_state();
+        state.messages.push(ChatMessage::user("hi".to_string()));
+        state
+            .messages
+            .push(ChatMessage::assistant("hello".to_string()));
+        state
+            .messages
+            .push(ChatMessage::assistant("world".to_string()));
+
+        // 真实场景下这里没有任何可折叠 ToolResult，天花板本应是 messages.len()；
+        // 故意传入一个更早的下标，验证返回值确实被它卡住，而不是无视它、按内部
+        // 重新扫描的结果（那样会得到 messages.len()）。
+        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents, Some(1));
+        assert_eq!(bound, 1);
+    }
+
+    /// 防御性回归：`toggle_last_collapsible` 面对不存在的 `sequence_no`（理论上不
+    /// 会发生，见 last_collapsible_seq 字段文档）必须是无操作，不 panic、不误翻转
+    /// 任何消息。
+    #[test]
+    fn toggle_last_collapsible_no_op_when_seq_not_found() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "a.rs"}),
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: long_output("only"),
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+        let before: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
+
+        toggle_last_collapsible(&mut state.messages, Some(999_999));
+        let after: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
+        assert_eq!(before, after);
+
+        toggle_last_collapsible(&mut state.messages, None);
+        let after_none: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
+        assert_eq!(before, after_none);
     }
 }

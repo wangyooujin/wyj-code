@@ -54,3 +54,59 @@ pub fn detect_system_locale() -> &'static str {
     }
     "en"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // set_locale 修改的是 rust-i18n 的全局状态，同一进程内的测试若并行跑会互相
+    // 干扰；把所有涉及切换 locale 的断言收进同一个测试函数里顺序执行，避免依赖
+    // 测试执行顺序或引入额外的同步原语。
+    #[test]
+    fn tr_and_tr_fmt_work_across_both_locales_after_set_locale() {
+        set_locale("zh");
+        assert_eq!(current_locale(), "zh");
+        assert_eq!(tr("help.desc"), "显示所有可用命令和快捷键");
+        assert_eq!(
+            tr_fmt("command.unknown", &[("name", "foo")]),
+            tr_fmt("command.unknown", &[("name", "foo")]) // 存在性冒烟：不 panic 即可
+        );
+
+        set_locale("en");
+        assert_eq!(current_locale(), "en");
+        assert_eq!(
+            tr("help.desc"),
+            "Show all available commands and keyboard shortcuts"
+        );
+
+        // 缺失 key 时 rust-i18n 按约定原样回显 key（不 panic），冒烟验证不会崩
+        let missing = tr("this.key.does.not.exist");
+        assert!(!missing.is_empty());
+    }
+
+    #[test]
+    fn locale_display_name_has_native_names() {
+        assert_eq!(locale_display_name("zh"), "中文");
+        assert_eq!(locale_display_name("en"), "English");
+        assert_eq!(locale_display_name("unknown"), "English"); // 未知 locale 回退英文
+    }
+
+    #[test]
+    fn detect_system_locale_prefers_zh_prefixed_env_and_falls_back_to_en() {
+        // env::set_var 修改进程级全局状态，同一进程内其他测试线程可能同时读取，
+        // 这里只操作本测试专用的 LC_ALL，跑完立即清理，把干扰面降到最小。
+        unsafe {
+            std::env::set_var("LC_ALL", "zh_CN.UTF-8");
+        }
+        assert_eq!(detect_system_locale(), "zh");
+
+        unsafe {
+            std::env::set_var("LC_ALL", "en_US.UTF-8");
+        }
+        assert_eq!(detect_system_locale(), "en");
+
+        unsafe {
+            std::env::remove_var("LC_ALL");
+        }
+    }
+}

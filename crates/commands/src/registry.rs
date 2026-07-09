@@ -24,6 +24,15 @@ pub enum CommandResult {
     None,
     /// Skill 执行结果：包含展开后的 prompt，由调用方转发给 agent
     RunPrompt(String),
+    /// 带执行期限定的 Skill/自定义命令结果：`allowed_tools` 非空时，调用方需在跑这一轮
+    /// 之前临时把 `PermissionMode` 收紧为 `Allowlist(allowed_tools)`，跑完（无论成功失败）
+    /// 都要还原为原值；不修改 `AgentMode`（Normal/Plan/Bypass）本身。`profile` 为
+    /// `model:` frontmatter 字段的解析结果，本版本仅保留字段、暂不消费。
+    RunPromptScoped {
+        text: String,
+        allowed_tools: Option<Vec<String>>,
+        profile: Option<String>,
+    },
     /// 打开会话选择器
     OpenSessionPicker,
     /// 直接恢复指定 session（session-id）
@@ -38,6 +47,10 @@ pub enum CommandResult {
     OpenSkillsDialog,
     /// 打开插件管理面板（/plugins 命令触发）
     OpenPluginsDialog,
+    /// 打开/定位子 Agent 聚合面板（/subagents 命令触发）。
+    /// `Some(id)` 直接选中并展开该 id 的详情；`None` 只是请求打开面板
+    /// （TUI 侧据此决定默认选中项；headless 不支持，提示改用 `subagent-trace` 子命令）。
+    OpenSubAgentsPanel(Option<u64>),
 }
 
 /// 命令执行上下文
@@ -66,6 +79,10 @@ pub struct CommandContext {
     pub plugin_agent_paths: Vec<std::path::PathBuf>,
     /// 当前 Hooks 是否启用（来自 CLI `--no-hooks`）。
     pub hooks_enabled: bool,
+    /// 运行时发现的动态命令（Skill / `.claude/commands`），供 `/help` 追加展示为
+    /// "自定义命令"分组。`(name, description, usage)`，由调用方在构造本结构体前用
+    /// `cmd_registry.list()` 过滤 `is_dynamic()` 算好传入。
+    pub dynamic_commands: Vec<(String, String, String)>,
 }
 
 /// Slash 命令 trait
@@ -74,6 +91,11 @@ pub trait Command: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> String;
     fn usage(&self) -> String;
+    /// 是否为运行时动态发现的命令（Skill / `.claude/commands`），而非内置静态命令。
+    /// 默认 false；仅动态命令实现（如 `SkillCommand`）覆盖为 true。
+    fn is_dynamic(&self) -> bool {
+        false
+    }
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult>;
 }
 

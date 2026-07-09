@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use wyj_api::types::ToolDefinition;
 use wyj_core::{
-    tool::{Tool, ToolContext, ToolResult},
+    tool::{Tool, ToolCallMeta, ToolContext, ToolResult},
     Agent, AgentDefinition, Session, ToolEvent,
 };
 use wyj_i18n::{tr, tr_fmt};
@@ -149,6 +149,29 @@ impl Tool for SubAgentTool {
     }
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
+        self.run_impl(input, ctx, None).await
+    }
+
+    /// 携带 `tool_use_id`：填入落盘 trace 的 `Started.parent_tool_use_id`，
+    /// 供跨会话时把落盘的子 Agent trace 反查回具体是哪一次 Agent 工具调用。
+    async fn run_with_meta(
+        &self,
+        input: Value,
+        ctx: &dyn ToolContext,
+        meta: &ToolCallMeta,
+    ) -> Result<ToolResult> {
+        self.run_impl(input, ctx, Some(meta.tool_use_id.clone()))
+            .await
+    }
+}
+
+impl SubAgentTool {
+    async fn run_impl(
+        &self,
+        input: Value,
+        ctx: &dyn ToolContext,
+        parent_tool_use_id: Option<String>,
+    ) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
 
         let type_name = inp.subagent_type.as_deref().unwrap_or("general-purpose");
@@ -188,6 +211,7 @@ impl Tool for SubAgentTool {
             agent_type: agent_type.clone(),
             description: description.clone(),
             background,
+            parent_tool_use_id,
         });
 
         // 挂内部事件回调：工具事件与 token 用量汇入 Hub
@@ -199,17 +223,20 @@ impl Tool for SubAgentTool {
                     id,
                     tool_name: name,
                     arg_summary: summarize_input(&input),
+                    input,
                 }),
                 ToolEvent::End {
                     name,
                     is_error,
                     elapsed_secs,
+                    output,
                     ..
                 } => hub_tool.emit(SubAgentEvent::ToolEnd {
                     id,
                     tool_name: name,
                     is_error,
                     elapsed_secs,
+                    output,
                 }),
             })
             .with_usage_callback(move |input_tokens, output_tokens| {

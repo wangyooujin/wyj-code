@@ -68,6 +68,12 @@ impl SessionStore {
         self.dir.join(format!("{session_id}.json"))
     }
 
+    /// 会话文件所在目录（`~/.wyj-code/sessions/`），供旁路存储（如子 Agent
+    /// trace，见 `wyj_tools::trace`）按同一根目录 + `session_id` 定位文件。
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn save(&self, file: &SessionFile) -> Result<()> {
         let json = serde_json::to_string(file)?;
         std::fs::write(self.path(&file.session_id), json)?;

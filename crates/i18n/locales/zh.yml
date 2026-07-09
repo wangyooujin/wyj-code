@@ -38,6 +38,17 @@ subagent:
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
   builtin_plan_desc: "规划 Agent：只读分析代码并产出分步实施计划"
 
+subagents:
+  desc: "打开子 Agent 聚合面板，查看本会话（含 /resume 恢复的历史会话）每个子 Agent 的完整执行详情"
+  bad_id: "无效的子 Agent id: `{arg}`（应为形如 a3 或 3）"
+  not_found: "未找到子 Agent a{id}（本会话不存在该 id）"
+  empty: "本会话暂无子 Agent 记录"
+  headless_unsupported: "[headless 模式不支持 /subagents 面板，请用 `wyj-code subagent-trace <session-id> [id]` 查看落盘的执行轨迹]"
+
+subagent_trace:
+  no_records: "会话 {session} 没有落盘的子 Agent 记录（未跑过子 Agent，或 trace_enabled=false）"
+  not_found: "会话 {session} 中未找到子 Agent 记录 a{id}"
+
 thinking:
   done: "✻ 已思考 {secs}s（{lines} 行）"
 
@@ -62,6 +73,10 @@ cli:
   plugin_dir_help: "加载本地插件目录用于开发调试（临时生效：仅当次运行有效，不落盘，不出现在 /plugins 已安装列表中）"
   update_about: "检查并更新到 GitHub 最新 release 版本"
   update_yes_help: "跳过确认提示，直接更新（适合脚本调用）"
+  subagent_trace_about: "查看指定会话落盘的子 Agent 执行轨迹（工具调用序列/全文 input/output/最终结果），不带 id 时列出该会话全部子 Agent"
+  subagent_trace_session_id_help: "会话 id（如 sess-1719723000）"
+  subagent_trace_sub_id_help: "子 Agent id（Hub 分配的数字，如 3；留空则列出该会话全部子 Agent 概览）"
+  subagent_trace_json_help: "直接输出原始 JSONL（供管道处理），仅在指定了子 Agent id 时生效"
 
 update:
   checking: "正在检查最新版本…"
@@ -105,6 +120,7 @@ help:
     - `/config` — 打开配置设置面板（log_level/language）
     - `/cost` — 显示本会话 token 用量与费用估算（含子 Agent 用量单列）
     - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
+    - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/memory` — 打开 CLAUDE.md 记忆面板
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
@@ -151,6 +167,7 @@ help:
     - `Normal` — 默认模式，工具调用前弹出权限确认对话框
     - `Plan` — 只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
     - `Bypass` — 跳过所有权限确认，自动批准工具调用
+  custom_commands_header: "自定义命令"
 
 clear:
   desc: "清空当前对话历史"
