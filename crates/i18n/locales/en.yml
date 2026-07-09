@@ -149,15 +149,14 @@ help:
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
     - `Ctrl+O` — Expand/collapse tool result
-    - `Ctrl+T` — Expand/collapse task list
+    - `Ctrl+T` — Focus the task list; expand/collapse it when already focused
     - `Ctrl+L` — Clear screen (keeps conversation history)
     - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
     - `Ctrl+K` — Delete from cursor to end of line
     - `Ctrl+U` — Delete from cursor to start of line
     - `Ctrl+W` — Delete previous word
-    - Mouse wheel / native terminal scrollback — browse chat history (no
-      longer captured by the app, so native click-drag text selection works)
-    - `↑` / `↓` — Browse input history
+    - `↑` / `↓` — Select within the focused list/summary messages when input is empty; otherwise move the cursor or browse input history
+    - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
     - `/` — Command completion (Tab to confirm, Esc to cancel)
     - `!<command>` — Run a Bash command directly
 
@@ -183,6 +182,7 @@ cost:
   line_with_price: "  Input:  {input} tokens  (~${input_cost})\nOutput: {output} tokens  (~${output_cost})\nTotal:  {total} tokens  (~${total_cost})"
   line_no_price: "  Input:  {input} tokens\nOutput: {output} tokens\nTotal:  {total} tokens"
   context_line: "Context: {pct}% ({estimated} / {window} tokens)"
+  input_detail_line: "Input detail: full {full} / uncached {uncached} / cache hit {hit_ratio}%"
   cache_line: "Cache:  {read} read + {write} written tokens (~{saved_pct}% saved vs full-price input; cost included in the total above)"
   subagent_line: "Sub-agents: input {input} + output {output} = {total} tokens (tracked separately from the main session; cost not included in the estimate above)"
 
@@ -197,7 +197,7 @@ hooks:
   command_line: "({timeout}s) `{command}`"
 
 agents:
-  desc: "List available subagent types (built-in + custom definition files)"
+  desc: "Open the Agent type catalog (built-in + custom definition files)"
   header: "Available agent types (the Agent tool's subagent_type parameter):"
   model_line: "Model: profile `{profile}`"
   tools_line: "Tools: {tools}"
@@ -205,6 +205,11 @@ agents:
   source_line: "Source: {source}"
   builtin_tag: "built-in"
   reload_note: "Custom definitions are read from *.md files under ~/.claude/agents/ and the project's .claude/agents/ (frontmatter: name/description/tools/model; model is a profile name). This list re-reads from disk, but the type list registered with the model is fixed at startup — restart after adding/changing definitions."
+  dialog:
+    title: "Agent Types"
+    empty: "No agent types available"
+    hint: "↑↓ select and view detail   Enter/Space expand   Esc close"
+    hint_detail: "↑↓ select   PageUp/PageDown scroll detail   Enter/Space collapse   Esc close"
 
 memory:
   desc: "Open the CLAUDE.md memory panel"

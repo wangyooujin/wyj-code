@@ -19,6 +19,7 @@ pub struct OpenAIProvider {
     api_key: String,
     base_url: String,
     model: String,
+    stream_options: bool,
 }
 
 impl OpenAIProvider {
@@ -34,6 +35,7 @@ impl OpenAIProvider {
             api_key,
             base_url,
             model: model.to_string(),
+            stream_options: cfg.active_profile().effective_openai_stream_options(),
         })
     }
 }
@@ -48,7 +50,8 @@ struct ApiRequest {
     tools: Vec<ApiTool>,
     max_tokens: u32,
     stream: bool,
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
 }
 
 #[derive(Serialize)]
@@ -138,6 +141,13 @@ struct UsageData {
 #[derive(Deserialize, Debug)]
 struct PromptTokensDetails {
     cached_tokens: Option<u32>,
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    started: bool,
 }
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
@@ -274,9 +284,9 @@ impl Provider for OpenAIProvider {
             tools: api_tools,
             max_tokens,
             stream: true,
-            stream_options: StreamOptions {
+            stream_options: self.stream_options.then_some(StreamOptions {
                 include_usage: true,
-            },
+            }),
         };
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -298,8 +308,8 @@ impl Provider for OpenAIProvider {
         // filter_map 剥掉内层 None（跳过无关帧）
         let stream = sse
             .scan(
-                std::collections::HashMap::<usize, String>::new(),
-                |tool_id_map, item| {
+                std::collections::HashMap::<usize, PendingToolCall>::new(),
+                |tool_map, item| {
                     let result: Option<Result<StreamEvent>> = (|| {
                         let event = match item {
                             Ok(e) => e,
@@ -353,17 +363,29 @@ impl Provider for OpenAIProvider {
                         if let Some(tcs) = choice.delta.tool_calls {
                             for tc in tcs {
                                 let idx = tc.index;
+                                let pending = tool_map.entry(idx).or_default();
+                                if let Some(id) = tc.id {
+                                    pending.id = Some(id);
+                                }
                                 if let Some(func) = tc.function {
-                                    if let (Some(id), Some(name)) =
-                                        (tc.id.clone(), func.name.clone())
-                                    {
-                                        tool_id_map.insert(idx, id.clone());
-                                        return Some(Ok(StreamEvent::ToolUseStart { id, name }));
+                                    if let Some(name) = func.name {
+                                        pending.name = Some(name);
+                                    }
+                                    if !pending.started {
+                                        if let (Some(id), Some(name)) =
+                                            (pending.id.clone(), pending.name.clone())
+                                        {
+                                            pending.started = true;
+                                            return Some(Ok(StreamEvent::ToolUseStart {
+                                                id,
+                                                name,
+                                            }));
+                                        }
                                     }
                                     if let Some(args) = func.arguments {
-                                        if let Some(id) = tool_id_map.get(&idx) {
+                                        if let Some(id) = pending.id.clone() {
                                             return Some(Ok(StreamEvent::ToolUseDelta {
-                                                id: id.clone(),
+                                                id,
                                                 json_delta: args,
                                             }));
                                         }
@@ -377,7 +399,7 @@ impl Provider for OpenAIProvider {
                     futures::future::ready(Some(result))
                 },
             )
-            .filter_map(|x| futures::future::ready(x));
+            .filter_map(futures::future::ready);
 
         Ok(Box::pin(stream))
     }

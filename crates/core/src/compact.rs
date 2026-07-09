@@ -13,6 +13,10 @@ pub const COMPACT_TRIGGER_BUFFER: u32 = 40_000;
 /// 保留最近 N 条消息不压缩，确保上下文连续性
 const COMPACT_KEEP_RECENT: usize = 6;
 
+pub fn compact_trigger_buffer(context_window: u32) -> u32 {
+    40_000.min((context_window / 5).max(4_000))
+}
+
 pub struct CompactResult {
     pub messages_removed: usize,
     pub tokens_saved_estimate: u32,
@@ -273,6 +277,13 @@ mod tests {
                 text: s.to_string(),
             }],
         }
+    }
+
+    #[test]
+    fn compact_trigger_buffer_scales_with_context_window() {
+        assert_eq!(compact_trigger_buffer(200_000), 40_000);
+        assert_eq!(compact_trigger_buffer(32_000), 6_400);
+        assert_eq!(compact_trigger_buffer(8_000), 4_000);
     }
 
     fn assistant_tool_use() -> Message {
