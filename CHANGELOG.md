@@ -2,6 +2,13 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.2.0]
+
+- **预编译压缩包新增一键安装脚本**：`install.sh`（macOS/Linux）与 `install.bat`（Windows）随
+  GitHub Release 压缩包分发，解压后运行即可把二进制装到当前用户目录（`~/.local/bin` /
+  `%USERPROFILE%\.wyj-code\bin`）并自动配置 PATH，全程无需 sudo/管理员权限；重复运行幂等，
+  不会重复追加 PATH 配置。
+
 ## [1.1.0]
 
 - **新增 Hooks 生命周期自动化系统**：支持在 `.claude/settings.json`（用户级 → 项目级 →

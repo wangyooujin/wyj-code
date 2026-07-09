@@ -51,8 +51,11 @@ crates/
 ## 安装
 
 **方式一：下载预编译产物**（macOS / Linux / Windows，见 [GitHub Releases](../../releases)）：
-下载对应平台压缩包，解压后把 `wyj-code` 放进 `PATH`。之后可用 `wyj-code update` 检查并
-自动升级到最新版本，无需重新下载。
+下载对应平台压缩包并解压，压缩包内自带一键安装脚本——macOS/Linux 执行 `./install.sh`，
+Windows 双击（或在终端运行）`install.bat`。脚本会把 `wyj-code` 装进当前用户目录（`~/.local/bin`
+或 `%USERPROFILE%\.wyj-code\bin`）并自动配置 PATH，全程无需 sudo/管理员权限。之后可用
+`wyj-code update` 检查并自动升级到最新版本，无需重新下载。如果不想让脚本改动 shell 配置文件/
+用户 PATH 注册表项，也可以跳过脚本，手动把 `wyj-code` 放进自己的 `PATH`。
 
 **方式二：从源码构建**：
 
