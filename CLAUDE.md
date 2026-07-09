@@ -16,6 +16,7 @@ cargo run -- --bypass-permissions # 以 Bypass 模式启动（跳过权限确认
 cargo run -- --no-hooks           # 禁用 Hooks 自动化系统
 cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
+cargo run -- subagent-trace <session_id> [<sub_id>] [--json]  # 查看落盘的子 Agent 执行轨迹（无 sub_id 列出概览）
 
 ./build.sh                       # 等同 cargo build --release
 ./build.sh package               # 打包到 dist/<binary>-<version>-<platform>
@@ -50,6 +51,8 @@ cargo clippy                     # lint
 - 注册位置：`/help` 的输出由 `crates/commands/src/builtin.rs` 中 `HelpCmd` 读取的 i18n 模板 `help.body` 渲染（**不是**动态枚举注册表），因此新增命令时必须同步在 `crates/i18n/locales/{en,zh}.yml` 的 `help.body` 模板里追加该命令的说明行，保持与现有条目相同的格式与缩进。
 - 同步要求：新增命令的 PR/提交里就应包含对应的 `/help` 条目，不要留到后续补；若临时不希望暴露（如调试命令），应在 `/help` 中显式标注「内部/调试」而非直接省略。
 - 命令文案需走 i18n（`tr()` key），与 `/help` 其余条目一致，不可硬编码中文。
+- **动态命令（Skill / `.claude/commands`）是上述约定的例外**：这类命令运行时从磁盘发现、因人而异，不可能写死进静态 `help.body` 模板。`Command` trait 的 `is_dynamic()` 默认方法（仅 `SkillCommand` 覆盖为 `true`）标记这类命令，`CommandContext.dynamic_commands` 由调用方在构造 ctx 前用 `cmd_registry.list()` 过滤好传入，`HelpCmd` 渲染完静态模板后在末尾追加一个「自定义命令」分组（i18n key: `help.custom_commands_header`）。两者互不冲突，新增静态内置命令仍必须遵守上面的硬性约定。
+- **Skill / 自定义命令加载**（`commands::skill::load_skills`）：六层合并链，同作用域内真实 Claude Code 路径覆盖 wyj-code 自造路径——`内置 → 全局 ~/.wyj-code/skills → 全局真 CC ~/.claude/commands → 已启用插件贡献路径(先到先得) → 项目 .wyj/skills → 项目真 CC .claude/commands`（最高优先级）。frontmatter 支持 `description`/`argument-hint`/`allowed-tools`/`model` 四字段（复用 `core::frontmatter::parse`，与 `agent_def.rs` 共用同一套轻量 `key: value` 解析器）；`allowed-tools` 执行期通过 `CommandResult::RunPromptScoped` 让调用方把 `PermissionMode` 临时收紧为 `Allowlist`，跑完这一轮（含 ESC 中断，TUI 侧靠 `RestorePermissionOnDrop` 的 RAII 兜底）自动还原，不修改 `AgentMode` 本身；`model` 字段目前仅解析存储，运行期不生效。仅扫顶层 `*.md`，不递归子目录——真 CC 的 `/namespace:cmd` 命名空间推迟到 v1.3。
 
 ## Configuration
 
@@ -74,6 +77,8 @@ search_api_key = ""          # WebSearch API Key，优先读环境变量 WYJ_COD
 [subagent]
 default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组
 explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
+trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
+trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
 
 [[mcp_servers]]
 name = "my-server"
@@ -116,9 +121,11 @@ args = ["--flag"]
 5. **CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 CLAUDE.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
 6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
 7. **SubAgent 多 agent 编排**（对齐 Claude Code）：类型体系 = 内置 general-purpose/Explore(只读)/Plan（`core::agent_def::builtin_defs`）+ 自定义定义文件（`~/.claude/agents/*.md` 与项目 `.claude/agents/*.md`，frontmatter: name/description/tools/model，model 引用 **Profile 名**，同名后者覆盖，`load_agent_defs`）。`tools::SubAgentTool`（工具名 "Agent"，参数 subagent_type/description/prompt/run_in_background）把每个子 Agent 整体 `tokio::spawn` 并登记进 `tools::agent_hub::SubAgentHub`（进程级单例：id 分配、`Semaphore` 并发上限 8、`abort_foreground`/`abort_all`/`wait_background`）；子 Agent 挂 `with_tool_callback`/`with_usage_callback` 把内部工具事件与 token 用量以 `SubAgentEvent` 汇入 Hub 的 event_cb。前台调用 await oneshot 结果；`run_in_background: true` 立即返回，完成结果包成 system-reminder 经注入通道（主 Agent 忙）或 `AppState.pending_bg_reminders`（空闲，下轮起手 merge）送达。TUI 展示：每个 agent 的 ToolCall 行绑定 sub_agent_id（Started 事件 FIFO 配对）并在运行期间画动态 ⎿ 状态行（耗时/tokens/工具数/当前工具），ToolResult 展开（Ctrl+O）时先列内部工具调用明细；有运行中 agent 时显示底部聚合面板（`render::draw_sub_agents_panel`）。ESC 中断只 abort 前台子 Agent，后台不受影响；TUI 退出时 `abort_all`，headless `-p` 结束前 `wait_background`。子 Agent 模型解析优先级：def.model(Profile 名) → `[subagent].explore_profile`(仅 Explore) → `[subagent].default_profile` → 主 Agent 当前分组（`cli::make_sub_agent_factory`）。子 Agent 一律不注册 Agent（防嵌套）/AskQuestion/ExitPlanMode/TodoWrite，并继承 Plan 白名单交集。`/agents` 列出全部类型；`/cost` 单列子 Agent 用量。
+
+    **子 Agent 执行轨迹持久化**（v1.2）：`SubAgentHub::emit()` 是 TUI/headless 唯一汇聚点，`with_trace(sessions_dir, session_id, max_bytes_per_agent)`（`SubAgentCfg::trace_enabled` 默认开启）在此接入一个专职后台写手（`tools::trace::TraceWriter`，内部 mpsc channel 串行 append，调用方零阻塞），把 `SubAgentEvent` 转成落盘用 `TraceEvent`（`ToolStart`/`ToolEnd` 补全完整 input JSON / output 全文，`textutil::truncate_str`/`truncate_head_tail` 截断，超过 `trace_max_bytes_per_agent`（默认 256KB）静默停写）写入 JSONL：`~/.wyj-code/sessions/<session_id>.subagents/a<id>.jsonl`（与 `SessionFile` 不共享结构，不污染 `api::types::Message`/`ContentBlock`）。`Started` 事件带 `parent_tool_use_id`（经 `Tool::run_with_meta`/`ToolCallMeta` 从 `exec_tool_call` 的 `tool_use_id` 透传，仅 `SubAgentTool` override，其余工具零改动）关联回会话消息里的 `ContentBlock::ToolUse.id`。TUI 启动/`-c`/`--resume` 统一路径下 `app::reload_persisted_sub_agents` 扫描该目录回灌 `AppState.sub_agents`（只填摘要级字段，全文仍留在磁盘，避免长会话常驻内存暴涨），天然复用现有面板与 `/subagents [id]` 命令（无参数定位最近一个，带 id 直接跳转，`headless_unsupported` 提示改用 CLI 子命令）。headless 侧 `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`（`cli::run_subagent_trace_cmd`）纯读打印落盘内容，无 sub_id 列出该会话全部子 Agent 概览。
 8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在每轮工具调用往返边界排空注入队列、合并进当前或续接的 user 回合。注入负载携带 `InjectionKind`（`UserMessage` 触发 UI 的 pending_queue 回放；`SystemReminder` 用于后台子 Agent 结果，对用户消息队列不可见）。headless/`-p` 单次模式仍走普通 `run_turn`，不支持中途注入。
 9. **插件市场 / MCP / Skill 安装管理**（`wyj-store` + TUI `/plugins` `/mcp` `/skills` 面板）：`.claude-plugin` 清单解析（`store::plugin_manifest`）+ marketplace 安装编排（`store::plugin_install`）；`store::lockfile` 记录已安装 MCP/Skill/Plugin 及其启用状态（`InstalledPluginEntry` 等），`store::registry`/`store::marketplace` 分别对接 MCP registry HTTP 与 skill/plugin 的 git marketplace 拉取；三个面板均支持浏览/安装/升级/卸载/启用/禁用，变更需重启生效。`--plugin-dir <dir>` 可临时加载本地开发中的插件（不落盘、不经 lockfile，仅当次运行有效，不出现在 `/plugins` 已安装列表）。
-10. **TUI 聊天区渲染**（对齐 Claude Code 鼠标体验）：主循环用 `ratatui::Viewport::Inline` 而非 alternate screen——已定型的消息一旦满足冻结条件就通过 `Terminal::insert_before` 一次性写入终端真实 scrollback（此后不再参与每帧重绘），鼠标滚轮翻页与原生点击拖拽选中复制因此天然可用，无需 `EnableMouseCapture`（那会让终端把鼠标事件整个交给应用，原生选中就没法用了，历史上这个取舍反复过好几次）。冻结判定 `app::compute_freezable_up_to` 三条阻塞规则：① 该位置是 `ToolCall` 但对应 `ToolResult` 未出现（`parallel_safe()` 工具并发乱序完成，结果可能 `insert` 在更早位置之后，未落定前不能冻结）；② `render::last_collapsible_tool_result_idx` 命中的位置及其后（Ctrl+O 仍需要能切换到它）；③ 关联子 Agent 仍 `Running`（对应位置还在画动态状态行）。冻结前缀之外的"待定尾部"（`AppState.frozen_up_to..`）+ 流式输出，每帧仍照常重绘，渲染逻辑通过 `render::render_message_range` 与冻结路径共用，避免两边 drift。`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/resume` 这 7 个重量级管理对话框（`AppState::wants_fullscreen`）打开期间临时整个重建 `Terminal` 切到 `Viewport::Fullscreen` + `EnterAlternateScreen`（复用原有整屏渲染代码不变），关闭后重建回 Inline；权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，改归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁。Inline viewport 高度由 `render::fixed_footer_height` + `render::pending_chat_visual_height` 每帧计算，变化时重建 Terminal（重建前必须先 `terminal.clear()`，否则新 Terminal 不知道旧视口在屏幕上的位置会导致画面重叠）。接受的取舍：已冻结内容 resize 不会重新换行、历史回看长度由终端自身 scrollback 缓冲区大小决定、不再有应用内 PageUp/PageDown/Ctrl+Home/End 翻页快捷键（交还给终端原生处理）。
+10. **TUI 聊天区渲染**：详见 `crates/tui/CLAUDE.md`（对齐 Claude Code 鼠标体验的 `Viewport::Inline` 冻结/重建机制，仅在触达 `crates/tui/` 下文件时按需加载）。
 11. **Hooks 生命周期自动化**（v1.1）：详见 Configuration 节 "Hooks 自动化系统"。执行点：`core::agent::Agent::run_turn_with_injection`（`UserPromptSubmit` 在 `git_snapshot` 注入后、`turn` 循环前；`Stop` 在 `!has_tool_calls && !got_injection` 分支、`break` 前）、`core::agent::Agent::exec_tool_call`（`PreToolUse` 在 `is_allowed`/`confirm_tool` 前；`PostToolUse` 在结果组装后、回调 `ToolEvent::End` 前）。子 Agent 工厂 `cli::make_sub_agent_factory` 不装配 `HookRunner`，确保嵌套子任务不触发用户级 hooks。
 
 ### 权限模型（TUI）

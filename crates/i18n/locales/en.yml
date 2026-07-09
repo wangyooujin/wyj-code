@@ -39,6 +39,17 @@ subagent:
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
   builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
 
+subagents:
+  desc: "Open the sub-agent panel to inspect each sub-agent's full execution detail in this session (including sessions restored via /resume)"
+  bad_id: "Invalid sub-agent id: `{arg}` (expected something like a3 or 3)"
+  not_found: "Sub-agent a{id} not found (no such id in this session)"
+  empty: "No sub-agent records in this session"
+  headless_unsupported: "[headless mode does not support the /subagents panel; use `wyj-code subagent-trace <session-id> [id]` to inspect the persisted trace instead]"
+
+subagent_trace:
+  no_records: "No persisted sub-agent records for session {session} (none ran yet, or trace_enabled=false)"
+  not_found: "No sub-agent record a{id} found in session {session}"
+
 thinking:
   done: "✻ Thought for {secs}s ({lines} lines)"
 
@@ -63,6 +74,10 @@ cli:
   plugin_dir_help: "Load a local plugin directory for development (ephemeral: this run only, not persisted, not shown in /plugins Installed list)"
   update_about: "Check for and update to the latest GitHub release"
   update_yes_help: "Skip the confirmation prompt and update immediately (for scripting)"
+  subagent_trace_about: "Inspect a session's persisted sub-agent execution trace (tool call sequence / full input-output / final result); lists all sub-agents in the session when no id is given"
+  subagent_trace_session_id_help: "Session id (e.g. sess-1719723000)"
+  subagent_trace_sub_id_help: "Sub-agent id (the number the Hub assigned, e.g. 3); omit to list all sub-agents in the session"
+  subagent_trace_json_help: "Print the raw JSONL (for piping); only takes effect when a sub-agent id is given"
 
 update:
   checking: "Checking for the latest version…"
@@ -106,6 +121,7 @@ help:
     - `/config` — Open the configuration settings panel (log_level/language)
     - `/cost` — Show token usage and cost estimate for this session (sub-agent usage listed separately)
     - `/agents` — List available subagent types (built-in + custom *.md definitions)
+    - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/memory` — Open the CLAUDE.md memory panel
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
@@ -152,6 +168,7 @@ help:
     - `Normal` — Default mode, shows a permission dialog before each tool call
     - `Plan` — Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
     - `Bypass` — Skips all permission prompts, auto-approves every tool call
+  custom_commands_header: "Custom Commands"
 
 clear:
   desc: "Clear the current conversation history"

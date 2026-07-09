@@ -5,7 +5,7 @@ use crate::compact::{compact_session, estimate_tokens, COMPACT_TRIGGER_BUFFER};
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
-use crate::tool::{Tool, ToolContext};
+use crate::tool::{Tool, ToolCallMeta, ToolContext};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -719,13 +719,16 @@ impl Agent {
                 HookOutcome::Passthrough
             };
 
+            let meta = ToolCallMeta {
+                tool_use_id: id.clone(),
+            };
             match pre_outcome {
                 HookOutcome::Block(reason) => {
                     let msg = format!("PreToolUse hook 拦截了工具 `{name}`：{reason}");
                     (msg.clone(), ToolResultContent::Text(msg), true)
                 }
                 // approve：跳过 is_allowed / needs_permission+confirm_tool 两道闸门，直接执行
-                HookOutcome::Approve => run_tool(&t, input, ctx).await,
+                HookOutcome::Approve => run_tool(&t, input, ctx, &meta).await,
                 HookOutcome::Passthrough | HookOutcome::Continue { .. } => {
                     if !ctx.is_allowed(&name, &input) {
                         let msg = format!("工具 `{name}` 在当前模式下不被允许");
@@ -739,7 +742,7 @@ impl Agent {
                         );
                         (msg.clone(), ToolResultContent::Text(msg), true)
                     } else {
-                        run_tool(&t, input, ctx).await
+                        run_tool(&t, input, ctx, &meta).await
                     }
                 }
             }
@@ -809,9 +812,10 @@ async fn run_tool(
     t: &Arc<dyn Tool>,
     input: serde_json::Value,
     ctx: &dyn ToolContext,
+    meta: &ToolCallMeta,
 ) -> (String, wyj_api::types::ToolResultContent, bool) {
     use wyj_api::types::ToolResultContent;
-    match t.run(input, ctx).await {
+    match t.run_with_meta(input, ctx, meta).await {
         Ok(r) => match r.parts {
             // 结构化结果（如图片块）：display 用降级文本，模型收 Parts
             Some(parts) => (r.content, ToolResultContent::Parts(parts), r.is_error),
@@ -1493,6 +1497,63 @@ mod tests {
             .last()
             .map(|m| m.text().contains("done"))
             .unwrap_or(false));
+    }
+
+    /// override `run_with_meta` 记录收到的 `tool_use_id`，验证 `exec_tool_call`
+    /// 正确把 id 透传进 `ToolCallMeta`（供 SubAgent 落盘 trace 关联使用）。
+    struct MetaCapturingTool {
+        seen_tool_use_id: Arc<std::sync::Mutex<Option<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for MetaCapturingTool {
+        fn name(&self) -> &str {
+            "Echo"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "Echo".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            panic!("run() 不应被直接调用，应走 run_with_meta");
+        }
+        async fn run_with_meta(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+            meta: &crate::tool::ToolCallMeta,
+        ) -> Result<ToolResult> {
+            *self.seen_tool_use_id.lock().unwrap() = Some(meta.tool_use_id.clone());
+            Ok(ToolResult::ok("echoed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_tool_call_passes_tool_use_id_via_meta() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        agent.register_tool(Arc::new(MetaCapturingTool {
+            seen_tool_use_id: seen.clone(),
+        }));
+
+        let (id, _content, is_error) = agent
+            .exec_tool_call(
+                &FakeCtx,
+                "toolu_42".into(),
+                "Echo".into(),
+                serde_json::json!({}),
+            )
+            .await;
+
+        assert_eq!(id, "toolu_42");
+        assert!(!is_error);
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("toolu_42"));
     }
 }
 

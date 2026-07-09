@@ -27,6 +27,7 @@
 - **三模式 + 分模型** —— `normal` / `plan`(只读) / `bypass`(自动放行)，各模式可绑定不同模型。
 - **CLAUDE.md 记忆机制** —— 每轮重新读盘，全局 + 祖先链文件以 `<system-reminder>` 注入当轮 user 消息；工具触达新目录时动态加载；`@path` 递归导入。
 - **Hooks 生命周期自动化** —— 复用 `.claude/settings.json`，在 PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点挂任意 shell 脚本（拦截危险命令、保存即格式化、注入上下文、回合结束通知），`/hooks` 查看当前生效配置，`--no-hooks` 一键禁用。
+- **自定义 slash 命令** —— 识别真实 Claude Code 的 `~/.claude/commands/*.md` 与 `.claude/commands/*.md`（与 wyj-code 自造的 `~/.wyj-code/skills`/`.wyj/skills` 并存，同作用域内真 CC 路径优先），frontmatter 支持 `description`/`argument-hint`/`allowed-tools`，`/help` 末尾动态列出全部自定义命令。
 - **会话中消息注入** —— Agent 忙碌时新消息进队列不打断，在工具调用往返边界排空合并。
 - **i18n** —— 中 / 英双语，运行时切换，覆盖核心用户可见文案。
 - **会话持久化** —— 自动写入 `~/.wyj-code/`，`-c` 续上次、`--resume <id>` 恢复指定会话。
@@ -46,6 +47,22 @@ crates/
 ├── mcp/         # MCP 客户端（stdio / http）
 ├── tools/       # 内置工具 + SubAgent + AgentHub
 └── tui/         # ratatui 前端
+```
+
+## Demo
+
+<!-- TODO: 用 asciinema 录一段真实 TUI 操作（问答 + 工具调用 + 权限确认弹窗的完整一轮），
+     发布到 asciinema.org 后把下面这行换成实际的录屏链接/embed。 -->
+> 📺 录屏演示占位——建议录一段完整的问答 + 工具调用 + 权限确认弹窗流程，替换本段为
+> `[![asciinema](链接)](链接)` 形式的嵌入。
+
+**60 秒上手**：
+
+```bash
+git clone <本仓库地址> && cd wyj-code
+./build.sh install && wyj-code --config-status   # 装好后先看一眼配置状态
+export WYJ_CODE_API_KEY=sk-...                    # 或写进 ~/.wyj-code/config.toml
+wyj-code                                          # 启动 TUI，开始对话
 ```
 
 ## 安装
@@ -119,6 +136,39 @@ Hooks 配置示例（`.claude/settings.json`，与真实 Claude Code 格式一�
 - **本地优先** —— 源码、配置、历史只属于你，无任何隐式埋点或崩溃上报。
 - **透明可控** —— Agent 循环、工具调用、权限确认全程实时展示，随时可打断。
 - **协议中立** —— 改一行 `provider` 即可切换供应商，不绑定任何一家。
+
+## 性能
+
+v1.2 对"体积大不大、启动慢不慢"做了一次实测，而不是凭感觉判断：
+
+| 指标 | 数值 |
+|---|---|
+| release 二进制体积（已 strip） | 12 MB |
+| debug 二进制体积（`cargo run` 默认） | 64 MB（未 strip/未优化，编译换速度，属预期行为） |
+| 稳态冷启动（`--config-status`，无 TUI 无网络） | ~10ms |
+| 换新二进制后首次执行 | 数十 ms ~ 1s 量级（操作系统把可执行文件页面读入缓存的一次性开销，非程序问题） |
+
+release 构建已开启 `opt-level = 3` + `lto = "thin"` + `codegen-units = 1` + `strip = true`，
+`reqwest` 已选 `rustls-tls` 而非 native-tls/OpenSSL（规避最常见的"体积陡增"陷阱）。12MB 对一个
+自带 TUI、异步运行时、HTTP 客户端、MCP 客户端的 Rust 单二进制来说属正常区间，未发现需要大动干戈
+优化的问题。
+
+**依赖去重排查**（`cargo tree --duplicates`）：发现 `bitflags`(1.3/2.13)、`getrandom`(0.2/0.3/0.4)、
+`hashbrown`(0.15/0.17)、`itertools`(0.11/0.13)、`rustix`(0.38/1.1)、`schemars`(0.8/1.2)、
+`unicode-width`(0.1/0.2) 多版本共存。逐条排查后如实记录：均不属于"改一下我们自己的版本号就能收敛"
+的情况——`schemars` 0.8→1.x 需要跟着其 derive 宏的 breaking API 迁移 `crates/tools` 里的用法，是
+一次独立的、有真实回归风险的升级，不适合塞进一次轻量收尾；`unicode-width` 我们自己已经在用更新的
+0.2，0.1 版本来自 `ratatui`（经 `unicode-truncate`）的传递依赖锁定；其余几项均为不同上游库
+（`ratatui`/`crossterm`/`arboard`/`rmcp`/`scraper` 等）各自独立锁定的版本，不在本项目控制范围内。
+
+**`panic = "abort"` 评估后明确不采用**：能省一些体积（去掉 unwind 表），但项目大量使用
+`tokio::spawn`（后台记忆提取、子 Agent、bash 后台会话）——目前某个 spawned task panic 只会让那个
+task 失败，不影响主进程；切到 `panic = "abort"` 后任意线程 panic 会让整个进程（包括用户正在用的
+TUI 会话）立即退出，这个行为回归对交互式工具不可接受，体积收益不足以抵消。
+
+**已确认为必要成本而非可砍功能**：TUI 剪贴板粘贴图片依赖 `arboard` 的 `image-data` feature（间接
+带入 `image`/`tiff`/`zune-jpeg` 等图像解码库），这是真实功能（粘贴图片喂给支持 vision 的模型）的
+必需依赖，不建议为了体积砍掉。
 
 ## 已知限制
 

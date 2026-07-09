@@ -230,7 +230,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         3
     };
 
-    // 底部面板高度：AskQuestion 优先，否则 TaskList，否则 0
+    // 底部面板高度：只保留真正需要固定拦截输入的控制面板。
+    // TaskList / AskQuestion 作为实时信息流附加到聊天区尾部，避免互相遮挡。
     let (panel_height, panel_kind) = bottom_panel_size(state, area.height);
 
     let chunks = Layout::default()
@@ -263,25 +264,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                 draw_plan_approval_panel(f, dlg, chunks[1]);
             }
         }
-        BottomPanel::AskQuestion => {
-            if let Some(dlg) = &state.ask_question_dialog {
-                draw_ask_question_panel(f, dlg, chunks[1]);
-            }
-        }
         BottomPanel::SubAgents => {
             draw_sub_agents_panel(f, state, chunks[1]);
-        }
-        BottomPanel::TodoList => {
-            if let Some(items) = &state.current_todos {
-                draw_todo_panel(
-                    f,
-                    items,
-                    state.spinner_frame,
-                    state.todo_panel_expanded,
-                    &state.todo_stats,
-                    chunks[1],
-                );
-            }
         }
     }
     if !state.file_completions.is_empty() {
@@ -337,9 +321,7 @@ enum BottomPanel {
     Permission,
     ExecModeConfirm,
     PlanApproval,
-    AskQuestion,
     SubAgents,
-    TodoList,
 }
 
 /// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
@@ -361,26 +343,6 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         // 计划正文已作为普通消息并入聊天流（获得终端原生 scrollback 滚动），
         // 这里只剩固定 3 行的三选一选择器，贴在输入框上方，宽度对齐 Permission。
         return (5u16.min(area_height), BottomPanel::PlanApproval);
-    }
-    if let Some(dlg) = &state.ask_question_dialog {
-        let h = match dlg.stage {
-            AskQuestionStage::Answering { index } => {
-                let spec = &dlg.questions[index];
-                let opts = spec.options.len();
-                let desc_lines = spec
-                    .options
-                    .iter()
-                    .filter(|o| o.description.is_some())
-                    .count();
-                // 题目行 + 分隔线 + (选项数+1个"其他"，每个描述再加一行) + 空行 + hint行 + 边框上下
-                (opts as u16 + desc_lines as u16 + 1 + 6).min(area_height)
-            }
-            AskQuestionStage::Overview { .. } => {
-                // 每题两行（题干+答案）+ 分隔线 + 确认提交行 + hint行 + 边框上下
-                (dlg.questions.len() as u16 * 2 + 6).min(area_height)
-            }
-        };
-        return (h, BottomPanel::AskQuestion);
     }
     // 子 Agent 聚合面板：有可见子 Agent 即显示（优先于任务列表）；
     // 列表区固定行数上限 + 滚动窗口（本会话内全部保留，数量可能持续增长）；
@@ -419,22 +381,11 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         let h = (content_rows + 2).clamp(list_rows + 2, max_h);
         return (h.min(area_height), BottomPanel::SubAgents);
     }
-    if let Some(items) = &state.current_todos {
-        if !items.is_empty() {
-            let collapsed = is_todo_collapsible(items) && !state.todo_panel_expanded;
-            let h = if collapsed {
-                2u16.min(area_height)
-            } else {
-                (items.len() as u16 + 2).min(area_height)
-            };
-            return (h, BottomPanel::TodoList);
-        }
-    }
     (0, BottomPanel::None)
 }
 
 /// 主循环在决定 `Viewport::Inline` 高度前调用：计算除聊天区外、底部所有固定
-/// UI（权限确认/AskQuestion 等底部面板、补全列表、附件条、输入框、状态行）
+/// UI（权限确认等底部面板、补全列表、附件条、输入框、状态行）
 /// 加起来需要的总行数。必须和 [`draw`] 里的布局算法保持一致，否则 Inline
 /// 高度会和实际渲染需要的不一致，要么裁掉内容要么留出多余空白。
 pub(crate) fn fixed_footer_height(
@@ -976,7 +927,215 @@ pub(crate) fn build_pending_chat_lines(
         render_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
+    if let Some(items) = &state.current_todos {
+        push_inline_todo_lines(
+            &mut lines,
+            items,
+            state.spinner_frame,
+            state.todo_panel_expanded,
+            &state.todo_stats,
+            max_content_width,
+        );
+    }
+
+    if let Some(dlg) = &state.ask_question_dialog {
+        push_inline_ask_question_lines(&mut lines, dlg, max_content_width);
+    }
+
     lines
+}
+
+fn push_prefixed_lines(
+    lines: &mut Vec<Line<'static>>,
+    body: Vec<Line<'static>>,
+    prefix: &'static str,
+) {
+    for line in body {
+        let mut spans = vec![Span::raw(prefix)];
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+}
+
+fn push_inline_todo_lines(
+    lines: &mut Vec<Line<'static>>,
+    items: &[wyj_tools::todo::TodoItem],
+    spinner_frame: usize,
+    expanded: bool,
+    todo_stats: &HashMap<String, TodoRuntimeStats>,
+    max_content_width: usize,
+) {
+    if items.is_empty() {
+        return;
+    }
+
+    let total = items.len();
+    let done = items
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let collapsible = is_todo_collapsible(items);
+    let collapsed = collapsible && !expanded;
+    let all_done = total > 0 && done == total;
+
+    let total_elapsed: f64 = todo_stats.values().map(|s| s.elapsed_secs()).sum();
+    let total_in: u32 = todo_stats.values().map(|s| s.input_tokens).sum();
+    let total_out: u32 = todo_stats.values().map(|s| s.output_tokens).sum();
+    let stats_suffix = if todo_stats.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ⏱ {} ↑{} ↓{}",
+            format_hms(total_elapsed),
+            fmt_tokens(total_in),
+            fmt_tokens(total_out)
+        )
+    };
+
+    let has_in_progress = items.iter().any(|t| t.status == TodoStatus::InProgress);
+    let spinner_prefix = if has_in_progress {
+        format!("{} ", SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()])
+    } else {
+        String::new()
+    };
+    let title = if all_done {
+        format!("任务已完成 [{done}/{total}]{stats_suffix}")
+    } else {
+        format!("{spinner_prefix}任务列表 [{done}/{total}]{stats_suffix}")
+    };
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  TodoWrite", Theme::tool_call()),
+        Span::styled("  ", Theme::dim()),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        if collapsible {
+            Span::styled(
+                if collapsed {
+                    "  (ctrl+t to expand)"
+                } else {
+                    "  (ctrl+t to collapse)"
+                },
+                Theme::dim(),
+            )
+        } else {
+            Span::raw("")
+        },
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
+        Theme::border(),
+    )));
+
+    if collapsed {
+        return;
+    }
+
+    let max_item_width = max_content_width.saturating_sub(10);
+    for (i, item) in items.iter().enumerate() {
+        let (icon, item_style) = match item.status {
+            TodoStatus::Pending => ("○".to_string(), Style::default().fg(Color::DarkGray)),
+            TodoStatus::InProgress => {
+                let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+                (
+                    frame.to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+            TodoStatus::Completed => (
+                "✓".to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+        };
+
+        let prio_str = item
+            .priority
+            .as_deref()
+            .map(|p| format!("[{p}] "))
+            .unwrap_or_default();
+        let display_text = if item.status == TodoStatus::InProgress {
+            item.active_form.as_deref().unwrap_or(&item.content)
+        } else {
+            &item.content
+        };
+        let content = truncate_line(
+            &format!("{prio_str}{display_text}"),
+            max_item_width.saturating_sub(24),
+        );
+
+        let mut spans = vec![
+            Span::styled(format!("  [{}/{}] ", i + 1, total), Theme::dim()),
+            Span::styled(format!("{icon} "), item_style),
+            Span::styled(content, item_style),
+        ];
+        if let Some(s) = todo_stats.get(&item.id) {
+            spans.push(Span::styled(
+                format!(
+                    " ⏱ {} ↑{} ↓{}",
+                    format_hms(s.elapsed_secs()),
+                    fmt_tokens(s.input_tokens),
+                    fmt_tokens(s.output_tokens)
+                ),
+                Theme::dim(),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+}
+
+fn push_inline_ask_question_lines(
+    lines: &mut Vec<Line<'static>>,
+    dlg: &AskQuestionDialog,
+    max_content_width: usize,
+) {
+    let title = match dlg.stage {
+        AskQuestionStage::Answering { index } => {
+            let spec = &dlg.questions[index];
+            let header_suffix = match &spec.header {
+                Some(h) if !h.is_empty() => format!(" [{h}]"),
+                _ => String::new(),
+            };
+            format!(
+                "{} ({}/{}){header_suffix}",
+                wyj_i18n::tr("dialog.ask_question_title"),
+                index + 1,
+                dlg.questions.len()
+            )
+        }
+        AskQuestionStage::Overview { .. } => wyj_i18n::tr("dialog.ask_question_overview_title"),
+    };
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  AskQuestion", Style::default().fg(Theme::CLAUDE)),
+        Span::styled("  ", Theme::dim()),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
+        Theme::border(),
+    )));
+
+    let body_width = max_content_width.saturating_sub(4).max(1);
+    let body = match dlg.stage {
+        AskQuestionStage::Answering { index } => build_answering_lines(dlg, index, body_width),
+        AskQuestionStage::Overview { index } => build_overview_lines(dlg, index, body_width),
+    };
+    push_prefixed_lines(lines, body, "  ");
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -1197,139 +1356,6 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             );
         }
     }
-}
-
-/// 底部固定面板：任务列表
-fn draw_todo_panel(
-    f: &mut Frame,
-    items: &[wyj_tools::todo::TodoItem],
-    spinner_frame: usize,
-    expanded: bool,
-    todo_stats: &HashMap<String, TodoRuntimeStats>,
-    area: Rect,
-) {
-    let total = items.len();
-    let done = items
-        .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
-        .count();
-    let collapsible = is_todo_collapsible(items);
-    let collapsed = collapsible && !expanded;
-    let all_done = total > 0 && done == total;
-
-    let total_elapsed: f64 = todo_stats.values().map(|s| s.elapsed_secs()).sum();
-    let total_in: u32 = todo_stats.values().map(|s| s.input_tokens).sum();
-    let total_out: u32 = todo_stats.values().map(|s| s.output_tokens).sum();
-    let stats_suffix = if todo_stats.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " ⏱ {} ↑{} ↓{}",
-            format_hms(total_elapsed),
-            fmt_tokens(total_in),
-            fmt_tokens(total_out)
-        )
-    };
-
-    // 折叠态下逐条任务的 spinner 不会被渲染（循环整体被跳过），用标题栏的
-    // spinner 前缀补上"仍在运行"的动感提示；全部完成/无进行中任务时不需要。
-    let has_in_progress = items.iter().any(|t| t.status == TodoStatus::InProgress);
-    let spinner_prefix = if collapsed && has_in_progress {
-        format!("{} ", SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()])
-    } else {
-        String::new()
-    };
-
-    let title = if collapsed {
-        if all_done {
-            format!(" ✓ 任务已完成 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
-        } else {
-            format!(" {spinner_prefix}任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to expand) ")
-        }
-    } else if collapsible {
-        format!(" 任务列表 [{done}/{total}]{stats_suffix} (ctrl+t to collapse) ")
-    } else {
-        format!(" 任务列表 [{done}/{total}]{stats_suffix} ")
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Theme::border())
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Theme::CLAUDE)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if collapsed {
-        return;
-    }
-
-    let max_content_width = inner.width.saturating_sub(4) as usize;
-    let mut lines: Vec<Line<'static>> = vec![];
-
-    for (i, item) in items.iter().enumerate() {
-        let (icon, item_style) = match item.status {
-            TodoStatus::Pending => ("○".to_string(), Style::default().fg(Color::DarkGray)),
-            TodoStatus::InProgress => {
-                let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
-                (
-                    frame.to_string(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }
-            TodoStatus::Completed => (
-                "✓".to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ),
-        };
-
-        let prio_str = item
-            .priority
-            .as_deref()
-            .map(|p| format!("[{p}] "))
-            .unwrap_or_default();
-        let idx_str = format!("{}/{}", i + 1, total);
-        // 进行中的任务优先展示 activeForm 进行时文案（如 "Running tests"）
-        let display_text = if item.status == TodoStatus::InProgress {
-            item.active_form.as_deref().unwrap_or(&item.content)
-        } else {
-            &item.content
-        };
-        let content = truncate_line(
-            &format!("{prio_str}{display_text}"),
-            max_content_width.saturating_sub(24),
-        );
-
-        let mut spans = vec![
-            Span::styled(format!("[{idx_str}] "), Theme::dim()),
-            Span::styled(format!("{icon} "), item_style),
-            Span::styled(content, item_style),
-        ];
-        if let Some(s) = todo_stats.get(&item.id) {
-            spans.push(Span::styled(
-                format!(
-                    " ⏱ {} ↑{} ↓{}",
-                    format_hms(s.elapsed_secs()),
-                    fmt_tokens(s.input_tokens),
-                    fmt_tokens(s.output_tokens)
-                ),
-                Theme::dim(),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let para = Paragraph::new(Text::from(lines));
-    f.render_widget(para, inner);
 }
 
 // ─── 输入框 ──────────────────────────────────────────────────────────────────
@@ -2117,46 +2143,6 @@ fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> 
         Theme::dim(),
     )));
     lines
-}
-
-fn draw_ask_question_panel(f: &mut Frame, dlg: &AskQuestionDialog, area: Rect) {
-    let title = match dlg.stage {
-        AskQuestionStage::Answering { index } => {
-            let spec = &dlg.questions[index];
-            let header_suffix = match &spec.header {
-                Some(h) if !h.is_empty() => format!(" [{h}]"),
-                _ => String::new(),
-            };
-            format!(
-                "{} ({}/{}){header_suffix}",
-                wyj_i18n::tr("dialog.ask_question_title"),
-                index + 1,
-                dlg.questions.len()
-            )
-        }
-        AskQuestionStage::Overview { .. } => wyj_i18n::tr("dialog.ask_question_overview_title"),
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Theme::CLAUDE)
-                .add_modifier(Modifier::BOLD),
-        ));
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let max_w = inner.width as usize;
-    let lines = match dlg.stage {
-        AskQuestionStage::Answering { index } => build_answering_lines(dlg, index, max_w),
-        AskQuestionStage::Overview { index } => build_overview_lines(dlg, index, max_w),
-    };
-
-    let para = Paragraph::new(Text::from(lines));
-    f.render_widget(para, inner);
 }
 
 // ─── 会话选择器 ───────────────────────────────────────────────────────────────

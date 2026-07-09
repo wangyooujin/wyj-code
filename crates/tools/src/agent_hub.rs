@@ -4,10 +4,13 @@
 //! 分配 id、上报事件）与 TUI/headless 前端（注册事件回调、中断、等待后台任务）。
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
+
+use crate::trace::{TraceEvent, TraceWriter};
 
 /// 同时运行的子 Agent 数量上限（超限的在 UI 上显示为排队等待）
 pub const MAX_CONCURRENT_SUBAGENTS: usize = 8;
@@ -21,12 +24,17 @@ pub enum SubAgentEvent {
         agent_type: String,
         description: String,
         background: bool,
+        /// 发起该子 Agent 的父级工具调用 id（`ContentBlock::ToolUse.id`），
+        /// 供落盘 trace 反查关联；UI 展示不使用该字段。
+        parent_tool_use_id: Option<String>,
     },
     /// 子 Agent 内部工具调用开始
     ToolStart {
         id: u64,
         tool_name: String,
         arg_summary: String,
+        /// 完整 input（供落盘 trace 记录全文；UI 摘要仍用 `arg_summary`）
+        input: serde_json::Value,
     },
     /// 子 Agent 内部工具调用结束
     ToolEnd {
@@ -34,6 +42,8 @@ pub enum SubAgentEvent {
         tool_name: String,
         is_error: bool,
         elapsed_secs: f64,
+        /// 完整 output 全文（供落盘 trace 记录；UI 内存态不保留，只统计状态/耗时）
+        output: String,
     },
     /// 子 Agent 的 token 用量增量
     Usage {
@@ -53,6 +63,80 @@ pub enum SubAgentEvent {
     },
 }
 
+impl SubAgentEvent {
+    fn id(&self) -> u64 {
+        match self {
+            SubAgentEvent::Started { id, .. }
+            | SubAgentEvent::ToolStart { id, .. }
+            | SubAgentEvent::ToolEnd { id, .. }
+            | SubAgentEvent::Usage { id, .. }
+            | SubAgentEvent::Done { id, .. } => *id,
+        }
+    }
+
+    /// 转为落盘用的 [`TraceEvent`]（截断全文、丢弃纯 UI 字段如 `arg_summary`）。
+    fn to_trace_event(&self) -> TraceEvent {
+        match self {
+            SubAgentEvent::Started {
+                agent_type,
+                description,
+                background,
+                parent_tool_use_id,
+                ..
+            } => TraceEvent::Started {
+                agent_type: agent_type.clone(),
+                description: description.clone(),
+                background: *background,
+                parent_tool_use_id: parent_tool_use_id.clone(),
+            },
+            SubAgentEvent::ToolStart {
+                tool_name, input, ..
+            } => {
+                let (input_json, truncated) = crate::trace::truncate_input(input);
+                TraceEvent::ToolStart {
+                    tool_name: tool_name.clone(),
+                    input_json,
+                    truncated,
+                }
+            }
+            SubAgentEvent::ToolEnd {
+                tool_name,
+                is_error,
+                elapsed_secs,
+                output,
+                ..
+            } => {
+                let (output, truncated) = crate::trace::truncate_output(output);
+                TraceEvent::ToolEnd {
+                    tool_name: tool_name.clone(),
+                    is_error: *is_error,
+                    elapsed_secs: *elapsed_secs,
+                    output,
+                    truncated,
+                }
+            }
+            SubAgentEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => TraceEvent::Usage {
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+            },
+            SubAgentEvent::Done {
+                result,
+                is_error,
+                elapsed_secs,
+                ..
+            } => TraceEvent::Done {
+                result: result.clone(),
+                is_error: *is_error,
+                elapsed_secs: *elapsed_secs,
+            },
+        }
+    }
+}
+
 struct RunningEntry {
     background: bool,
     handle: JoinHandle<()>,
@@ -66,6 +150,7 @@ pub struct SubAgentHub {
     event_cb: RwLock<Option<SubAgentEventCb>>,
     running: Mutex<HashMap<u64, RunningEntry>>,
     semaphore: Arc<Semaphore>,
+    trace: Option<TraceWriter>,
 }
 
 impl SubAgentHub {
@@ -75,7 +160,26 @@ impl SubAgentHub {
             event_cb: RwLock::new(None),
             running: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBAGENTS)),
+            trace: None,
         }
+    }
+
+    /// 开启子 Agent 执行轨迹落盘（builder 风格；不调用则 `emit()` 只走内存回调，
+    /// 行为与之前完全一致）。`sessions_dir` 为 `~/.wyj-code/sessions`，
+    /// 落盘路径为 `<sessions_dir>/<session_id>.subagents/a<id>.jsonl`。
+    #[must_use]
+    pub fn with_trace(
+        mut self,
+        sessions_dir: PathBuf,
+        session_id: String,
+        max_bytes_per_agent: u64,
+    ) -> Self {
+        self.trace = Some(TraceWriter::spawn(
+            sessions_dir,
+            session_id,
+            max_bytes_per_agent,
+        ));
+        self
     }
 
     /// 注册事件回调（TUI 转发进事件通道，headless 打印纯文本行）
@@ -88,8 +192,12 @@ impl SubAgentHub {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// 向前端发送事件（未注册回调时静默丢弃）
+    /// 向前端发送事件（未注册回调时前端部分静默丢弃）；若已开启 trace 落盘
+    /// （见 [`Self::with_trace`]），同时把全文事件投递给后台写手，两者互不影响。
     pub fn emit(&self, ev: SubAgentEvent) {
+        if let Some(tw) = &self.trace {
+            tw.send(ev.id(), ev.to_trace_event());
+        }
         let cb = self.event_cb.read().unwrap().clone();
         if let Some(cb) = cb {
             cb(ev);

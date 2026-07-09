@@ -133,7 +133,7 @@ pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<Agen
 
 /// 解析单个 agent 定义文件（frontmatter + markdown 正文）
 fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
-    let (fields, body) = parse_frontmatter(content);
+    let (fields, body) = crate::frontmatter::parse(content);
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -176,37 +176,6 @@ fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
         }
     }
     def
-}
-
-/// 解析 markdown 文件头部的 `---` frontmatter 块。
-/// 返回 (key-value 对列表, 正文)。无 frontmatter 时字段列表为空、整个内容作为正文。
-fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, &str) {
-    let Some(rest) = content
-        .strip_prefix("---\n")
-        .or_else(|| content.strip_prefix("---\r\n"))
-    else {
-        return (vec![], content);
-    };
-    // 找到关闭的 --- 行
-    let mut fields = vec![];
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed.trim() == "---" {
-            let body = &rest[offset + line.len()..];
-            return (fields, body);
-        }
-        if let Some((key, value)) = trimmed.split_once(':') {
-            let key = key.trim().to_string();
-            let value = value.trim().to_string();
-            if !key.is_empty() {
-                fields.push((key, value));
-            }
-        }
-        offset += line.len();
-    }
-    // 没有关闭的 ---：视作无 frontmatter，整个内容当正文
-    (vec![], content)
 }
 
 #[cfg(test)]

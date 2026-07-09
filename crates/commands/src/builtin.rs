@@ -21,9 +21,17 @@ impl Command for HelpCmd {
     fn usage(&self) -> String {
         "/help".to_string()
     }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         let version = env!("CARGO_PKG_VERSION");
-        let text = tr_fmt("help.body", &[("version", version)]);
+        let mut text = tr_fmt("help.body", &[("version", version)]);
+        // 运行时动态发现的命令（Skill / .claude/commands）因人而异，不进静态
+        // help.body 模板，在此追加为独立分组（见 CLAUDE.md「Slash 命令约定」）。
+        if !ctx.dynamic_commands.is_empty() {
+            text.push_str(&format!("\n\n## {}\n\n", tr("help.custom_commands_header")));
+            for (_name, desc, usage) in &ctx.dynamic_commands {
+                text.push_str(&format!("- `{usage}` — {desc}\n"));
+            }
+        }
         Ok(CommandResult::Output(text))
     }
 }
@@ -308,6 +316,36 @@ impl Command for AgentsCmd {
         }
         out.push_str(&format!("\n{}", tr("agents.reload_note")));
         Ok(CommandResult::Output(out))
+    }
+}
+
+/// 打开/定位子 Agent 聚合面板；`args` 可选，形如 `a3` 或 `3`（Hub 分配的 id）。
+pub struct SubAgentsCmd;
+
+#[async_trait]
+impl Command for SubAgentsCmd {
+    fn name(&self) -> &str {
+        "subagents"
+    }
+    fn description(&self) -> String {
+        tr("subagents.desc")
+    }
+    fn usage(&self) -> String {
+        "/subagents [id]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let arg = args.trim();
+        if arg.is_empty() {
+            return Ok(CommandResult::OpenSubAgentsPanel(None));
+        }
+        let digits = arg.strip_prefix(['a', 'A']).unwrap_or(arg);
+        match digits.parse::<u64>() {
+            Ok(id) => Ok(CommandResult::OpenSubAgentsPanel(Some(id))),
+            Err(_) => Ok(CommandResult::Output(tr_fmt(
+                "subagents.bad_id",
+                &[("arg", arg)],
+            ))),
+        }
     }
 }
 
@@ -922,6 +960,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
+    reg.register(Arc::new(SubAgentsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
@@ -963,6 +1002,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(CompactCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
+    reg.register(Arc::new(SubAgentsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
@@ -982,6 +1022,123 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(QuitCmd));
 
     Arc::new(reg)
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    fn ctx_with_dynamic(dynamic_commands: Vec<(String, String, String)>) -> CommandContext {
+        CommandContext {
+            cwd: std::path::PathBuf::new(),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_window: 0,
+            estimated_tokens: 0,
+            home_dir: std::path::PathBuf::new(),
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            effective_mcp_count: 0,
+            plugin_agent_paths: vec![],
+            hooks_enabled: false,
+            dynamic_commands,
+        }
+    }
+
+    #[tokio::test]
+    async fn help_appends_custom_commands_section_when_dynamic_commands_present() {
+        let ctx = ctx_with_dynamic(vec![(
+            "fix-issue".to_string(),
+            "修复一个 issue".to_string(),
+            "/fix-issue <issue-number>".to_string(),
+        )]);
+        let CommandResult::Output(text) = HelpCmd.run("", &ctx).await.unwrap() else {
+            panic!("expected Output");
+        };
+        assert!(text.contains(&tr("help.custom_commands_header")));
+        assert!(text.contains("/fix-issue <issue-number>"));
+        assert!(text.contains("修复一个 issue"));
+    }
+
+    #[tokio::test]
+    async fn help_omits_custom_commands_section_when_none_dynamic() {
+        let ctx = ctx_with_dynamic(vec![]);
+        let CommandResult::Output(text) = HelpCmd.run("", &ctx).await.unwrap() else {
+            panic!("expected Output");
+        };
+        assert!(!text.contains(&tr("help.custom_commands_header")));
+    }
+
+    #[tokio::test]
+    async fn help_body_documents_subagents_command() {
+        let ctx = ctx_with_dynamic(vec![]);
+        let CommandResult::Output(text) = HelpCmd.run("", &ctx).await.unwrap() else {
+            panic!("expected Output");
+        };
+        assert!(text.contains("/subagents"));
+    }
+}
+
+#[cfg(test)]
+mod subagents_tests {
+    use super::*;
+
+    fn empty_ctx() -> CommandContext {
+        CommandContext {
+            cwd: std::path::PathBuf::new(),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            context_window: 0,
+            estimated_tokens: 0,
+            home_dir: std::path::PathBuf::new(),
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            effective_mcp_count: 0,
+            plugin_agent_paths: vec![],
+            hooks_enabled: false,
+            dynamic_commands: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn no_args_opens_panel_without_target_id() {
+        let ctx = empty_ctx();
+        let result = SubAgentsCmd.run("", &ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::OpenSubAgentsPanel(None)));
+    }
+
+    #[tokio::test]
+    async fn numeric_arg_parses_to_target_id() {
+        let ctx = empty_ctx();
+        let result = SubAgentsCmd.run("3", &ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::OpenSubAgentsPanel(Some(3))));
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_arg_parses_to_target_id() {
+        let ctx = empty_ctx();
+        let result = SubAgentsCmd.run("a12", &ctx).await.unwrap();
+        assert!(matches!(
+            result,
+            CommandResult::OpenSubAgentsPanel(Some(12))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbage_arg_reports_error_instead_of_opening_panel() {
+        let ctx = empty_ctx();
+        let result = SubAgentsCmd.run("not-a-number", &ctx).await.unwrap();
+        match result {
+            CommandResult::Output(text) => assert!(text.contains("not-a-number")),
+            other => panic!("expected Output error text, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

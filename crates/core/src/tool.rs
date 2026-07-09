@@ -97,6 +97,13 @@ pub trait ToolContext: Send + Sync {
     }
 }
 
+/// 单次工具调用的元信息（供需要关联 `tool_use_id` 的工具使用，如 SubAgent
+/// 落盘 trace 时把 `Started` 事件与会话消息里的 `ContentBlock::ToolUse.id` 对上）。
+#[derive(Debug, Clone)]
+pub struct ToolCallMeta {
+    pub tool_use_id: String,
+}
+
 /// 工具抽象
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -116,4 +123,15 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>;
+    /// 携带调用元信息（如 `tool_use_id`）的执行入口。默认转发到 `run`，
+    /// 绝大多数工具不需要 override；仅 SubAgentTool 需要拿 `tool_use_id`
+    /// 关联落盘 trace 文件。
+    async fn run_with_meta(
+        &self,
+        input: Value,
+        ctx: &dyn ToolContext,
+        _meta: &ToolCallMeta,
+    ) -> Result<ToolResult> {
+        self.run(input, ctx).await
+    }
 }
