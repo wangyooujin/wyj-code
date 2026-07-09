@@ -101,6 +101,8 @@ jobs:
           mkdir "$STAGE"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "$STAGE/"
           cp README.md "$STAGE/" 2>/dev/null || true
+          cp install.sh "$STAGE/"
+          chmod +x "$STAGE/install.sh"
           tar czf "${STAGE}.tar.gz" "$STAGE"
           shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
 
@@ -113,6 +115,7 @@ jobs:
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" -Destination $stage
           if (Test-Path README.md) { Copy-Item README.md -Destination $stage }
+          Copy-Item install.bat -Destination $stage
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
