@@ -54,7 +54,7 @@ for task_dir in "$ROOT"/tasks/*/; do
     # 不锚定行首：stderr 里 thinking 增量可能不带换行结尾，JSON 会接在其后
     stats=$(grep -oE '\{"input_tokens".*\}' "$stderr_file" | tail -1)
     if [ -z "$stats" ]; then
-        stats='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"api_calls":0,"duration_secs":0.0}'
+        stats='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"full_input_tokens":0,"cache_hit_ratio":0.0,"context_tokens":0,"context_window":0,"api_calls":0,"duration_secs":0.0}'
     fi
 
     ok=false

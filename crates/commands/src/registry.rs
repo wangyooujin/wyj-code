@@ -47,6 +47,12 @@ pub enum CommandResult {
     OpenSkillsDialog,
     /// 打开插件管理面板（/plugins 命令触发）
     OpenPluginsDialog,
+    /// 打开可用 Agent 类型交互面板（/agents 命令触发）。
+    /// TUI 使用 `defs` 渲染列表与详情；headless 使用 `fallback_text` 保持纯文本输出。
+    OpenAgentsDialog {
+        defs: Vec<wyj_core::AgentDefinition>,
+        fallback_text: String,
+    },
     /// 打开/定位子 Agent 聚合面板（/subagents 命令触发）。
     /// `Some(id)` 直接选中并展开该 id 的详情；`None` 只是请求打开面板
     /// （TUI 侧据此决定默认选中项；headless 不支持，提示改用 `subagent-trace` 子命令）。

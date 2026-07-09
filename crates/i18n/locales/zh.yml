@@ -148,15 +148,14 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+O` — 展开/折叠工具结果
-    - `Ctrl+T` — 折叠/展开任务列表
+    - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
     - `Ctrl+U` — 删除光标到行首
     - `Ctrl+W` — 删除前一个词
-    - 鼠标滚轮 / 终端原生 scrollback — 翻看历史对话（不再由应用接管，可直接
-      鼠标拖拽原生选中复制文字）
-    - `↑` / `↓` — 浏览输入历史
+    - `↑` / `↓` — 输入框为空时选择当前焦点列表/概要消息；有输入时移动光标或浏览输入历史
+    - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
     - `/` — 命令补全（Tab 确认，Esc 取消）
     - `!<命令>` — 直接执行 Bash 命令
 
@@ -182,6 +181,7 @@ cost:
   line_with_price: "  输入:   {input} tokens  (~${input_cost})\n输出:   {output} tokens  (~${output_cost})\n合计:   {total} tokens  (~${total_cost})"
   line_no_price: "  输入:   {input} tokens\n输出:   {output} tokens\n合计:   {total} tokens"
   context_line: "上下文: {pct}% ({estimated} / {window} tokens)"
+  input_detail_line: "输入明细: full {full} / 未缓存 {uncached} / 缓存命中率 {hit_ratio}%"
   cache_line: "缓存:   命中 {read} + 写入 {write} tokens（相对全价输入节省约 {saved_pct}%，费用已计入上方合计）"
   subagent_line: "子 Agent: 输入 {input} + 输出 {output} = {total} tokens（独立于主会话统计，费用未计入上方估算）"
 
@@ -196,7 +196,7 @@ hooks:
   command_line: "({timeout}s) `{command}`"
 
 agents:
-  desc: "列出可用的 subagent 类型（内置 + 自定义定义文件）"
+  desc: "打开 Agent 类型目录（内置 + 自定义定义文件）"
   header: "可用的 agent 类型（Agent 工具的 subagent_type 参数）："
   model_line: "模型: Profile `{profile}`"
   tools_line: "工具: {tools}"
@@ -204,6 +204,11 @@ agents:
   source_line: "来源: {source}"
   builtin_tag: "内置"
   reload_note: "自定义定义读取自 ~/.claude/agents/ 与项目 .claude/agents/ 下的 *.md（frontmatter: name/description/tools/model，model 填 Profile 名）。此列表实时读盘，但注册给模型的类型列表在启动时固定——新增/修改定义后需重启生效。"
+  dialog:
+    title: "Agent 类型"
+    empty: "暂无可用 Agent 类型"
+    hint: "↑↓ 选择并查看详情   Enter/Space 展开   Esc 关闭"
+    hint_detail: "↑↓ 选择   PageUp/PageDown 滚动详情   Enter/Space 收起   Esc 关闭"
 
 memory:
   desc: "打开 CLAUDE.md 记忆面板"

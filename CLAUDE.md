@@ -67,6 +67,8 @@ base_url = ""                # 留空使用供应商默认端点
 max_tokens = 8192
 context_window = 200000
 vision = true                # 模型是否支持图片输入；false 时图片降级为占位文本（防非多模态端点 400）
+# prompt_cache = false       # Anthropic-compatible 第三方端点可显式关闭 cache_control / beta header
+# openai_stream_options = false # OpenAI-compatible 第三方端点可显式关闭 stream_options.include_usage
 # thinking_budget = 8000     # extended thinking 预算 token；不写/0 = 关闭（思考计入 output 计费）
 # interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
 log_level = "warn"           # 调试时设为 "debug"
@@ -116,7 +118,7 @@ args = ["--flag"]
 
 1. **Tool trait**（`core::tool`）：所有工具实现 `async fn run(input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>`，由 `tools::ToolRegistry` 统一管理。
 2. **Agent 推理循环**（`core::agent::Agent::run_turn`）：流式接收 LLM 输出 → 累积工具调用 → 执行（`Tool::parallel_safe()` 为 true 的调用如 Agent 用 `join_all` 单任务内并发，其余相互保持顺序但与并发组同时进行，结果按原始下标保序回填，见 `exec_tool_call`）→ 将结果追回 session → 继续直到 `stop_reason != tool_use`。注意 `ToolContext` 是 `Send + Sync` 的（旧注释"非 Send"已过时）。
-3. **上下文压缩**（`core::compact`）：估算 token 数（字符数/3 粗略），当 `estimated > context_window - 40_000` 时调用 LLM 生成摘要替换旧消息，保留最近 6 条。
+3. **上下文压缩**（`core::compact`）：估算 token 数按 CJK/非 CJK/图片分别启发式计算；触发缓冲为 `min(40000, max(4000, context_window / 5))`，当 `estimated > context_window - buffer` 时调用 LLM 生成摘要替换旧消息，保留最近 6 条。
 4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
 5. **CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 CLAUDE.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
 6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。

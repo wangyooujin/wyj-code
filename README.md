@@ -22,7 +22,7 @@
 - **可插拔 MCP** —— 内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并桥接任意外部 MCP server。
 
 **交互与配置**
-- **原生 ratatui TUI** —— 流式 markdown、语法高亮、多行编辑、工具调用实时展示、子 Agent 聚合面板、Ctrl+O 展开明细。
+- **原生 ratatui TUI** —— 流式 markdown、语法高亮、多行编辑、工具调用实时展示、子 Agent 聚合面板、完整消息流内选择概要项并用 Ctrl+O 展开明细。
 - **Profile 分组配置** —— provider / model / base_url / api_key 以具名 Profile 组织，多套供应商配置并存切换，`/model` 面板管理。
 - **三模式 + 分模型** —— `normal` / `plan`(只读) / `bypass`(自动放行)，各模式可绑定不同模型。
 - **CLAUDE.md 记忆机制** —— 每轮重新读盘，全局 + 祖先链文件以 `<system-reminder>` 注入当轮 user 消息；工具触达新目录时动态加载；`@path` 递归导入。
@@ -177,9 +177,8 @@ TUI 会话）立即退出，这个行为回归对交互式工具不可接受，�
   在 tmux 下 ratatui + crossterm 的光标位置查询有相当概率与实际渲染错位（不仅贴不到底，严重时
   刚输入的字符会不可见），且在最小复现示例中同样能独立复现，判断为 ratatui/crossterm 层面的
   限制而非本项目代码可修的 bug，故保留当前动态定高方案。
-- **已冻结内容 resize 不会重新换行**：已写入终端原生 scrollback 的历史消息（`insert_before`）
-  脱离应用状态管辖，终端窗口 resize 后不会重排；历史回看长度由终端自身 scrollback 缓冲区大小
-  决定，应用内不再提供 PageUp/PageDown 等翻页快捷键（交还给终端原生处理）。
+- **聊天历史由应用内消息流管理**：为支持任意历史工具结果选中、展开和收起，TUI 不再把聊天前缀
+  固化写入终端原生 scrollback；历史浏览以鼠标滚轮、Up/Down、Command+Up/Command+Down 导航为主。
 
 ## 贡献
 

@@ -551,7 +551,12 @@ async fn main() -> Result<()> {
     } else {
         wyj_tools::SubAgentHub::new()
     });
-    let sub_agent_factory = make_sub_agent_factory(cfg.clone(), claude_md_loader.clone());
+    // 当前已连接 MCP 工具的共享快照：`-p`/`--headless`/TUI 三种模式各自的
+    // MCP 连接时机不同，但都在工具注册成功时 push 进这个句柄，供子 Agent
+    // 工厂与 `/model` 重建共同读取（子 Agent 只能看到 spawn 时刻已连好的）。
+    let mcp_tools: wyj_tools::SharedMcpTools = Arc::new(std::sync::RwLock::new(Vec::new()));
+    let sub_agent_factory =
+        make_sub_agent_factory(cfg.clone(), claude_md_loader.clone(), mcp_tools.clone());
     registry.register_arc(Arc::new(SubAgentTool::new(
         agent_defs.clone(),
         sub_agent_hub.clone(),
@@ -602,7 +607,9 @@ async fn main() -> Result<()> {
                             pending_names.remove(&name);
                             let count = tools.len();
                             for tool in tools {
-                                registry.register_arc(Arc::new(tool));
+                                let t: Arc<dyn wyj_tools::Tool> = Arc::new(tool);
+                                mcp_tools.write().unwrap().push(t.clone());
+                                registry.register_arc(t);
                             }
                             tracing::info!("MCP [{name}] 连接成功，注册 {count} 个工具");
                         }
@@ -823,13 +830,27 @@ async fn main() -> Result<()> {
         // 供 benchmarks/run.sh 解析做改进前后对比。先补一个换行：thinking
         // 增量用 eprint!（无换行）输出，否则 JSON 会被拼接到思考文本尾部。
         if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
+            let full_input = session
+                .total_input_tokens
+                .saturating_add(session.total_cache_read_tokens)
+                .saturating_add(session.total_cache_write_tokens);
+            let cache_hit_ratio = if full_input > 0 {
+                session.total_cache_read_tokens as f64 / full_input as f64
+            } else {
+                0.0
+            };
+            let context_tokens = wyj_core::estimate_tokens(&session.messages);
             eprintln!();
             eprintln!(
-                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"api_calls\":{},\"duration_secs\":{:.1}}}",
+                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"duration_secs\":{:.1}}}",
                 session.total_input_tokens,
                 session.total_output_tokens,
                 session.total_cache_read_tokens,
                 session.total_cache_write_tokens,
+                full_input,
+                cache_hit_ratio,
+                context_tokens,
+                context_window,
                 session.api_calls,
                 started.elapsed().as_secs_f64()
             );
@@ -886,6 +907,7 @@ async fn main() -> Result<()> {
             cfg.clone(),
             local_plugin.clone(),
             !cli.no_hooks,
+            mcp_tools.clone(),
         )
         .await?;
     } else {
@@ -896,6 +918,7 @@ async fn main() -> Result<()> {
         let sid_for_rebuild = session_id.clone();
         let cwd_for_rebuild = cwd.clone();
         let hook_runner_for_rebuild = hook_runner.clone();
+        let mcp_tools_for_rebuild = mcp_tools.clone();
         let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
             let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
             let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
@@ -932,8 +955,17 @@ async fn main() -> Result<()> {
             if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
                 reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
             }
+            // 重建前已连接的 MCP 工具不应丢失（此前的 bug：/model 切换会清空
+            // 后台连好的 MCP 工具，因为这里总是从空的 ToolRegistry::standard() 重建）
+            for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
+                reg.register_arc(tool.clone());
+            }
             // 用重建时的最新配置构建子 Agent 工厂，保证 Profile 变更即时生效
-            let sub_factory = make_sub_agent_factory(cfg.clone(), claude_md_for_rebuild.clone());
+            let sub_factory = make_sub_agent_factory(
+                cfg.clone(),
+                claude_md_for_rebuild.clone(),
+                mcp_tools_for_rebuild.clone(),
+            );
             reg.register_arc(Arc::new(SubAgentTool::new(
                 agent_defs_for_rebuild.clone(),
                 hub_for_rebuild.clone(),
@@ -962,10 +994,29 @@ async fn main() -> Result<()> {
             cfg,
             sub_agent_hub.clone(),
             local_plugin.clone(),
+            mcp_tools.clone(),
         )
         .await?;
     }
     Ok(())
+}
+
+/// 按 agent 定义的 `tools` 白名单（`None` 表示不限制）从给定 registry 里选出
+/// 允许该子 Agent 使用的工具集。纯函数，便于脱离 Provider/网络构建单测。
+fn select_sub_agent_tools(
+    def: &wyj_core::AgentDefinition,
+    registry: &ToolRegistry,
+) -> Vec<Arc<dyn wyj_tools::Tool>> {
+    registry
+        .definitions()
+        .into_iter()
+        .filter(|tdef| {
+            def.tools
+                .as_ref()
+                .map_or(true, |list| list.iter().any(|n| n == &tdef.name))
+        })
+        .filter_map(|tdef| registry.get(&tdef.name))
+        .collect()
 }
 
 /// 构建子 Agent 工厂：按 agent 定义解析 Profile 与模型，注册按定义过滤后的工具集。
@@ -974,6 +1025,7 @@ async fn main() -> Result<()> {
 fn make_sub_agent_factory(
     cfg: Config,
     claude_md: Arc<wyj_core::ClaudeMdLoader>,
+    mcp_tools: wyj_tools::SharedMcpTools,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
         let mut profile = None;
@@ -1021,17 +1073,19 @@ fn make_sub_agent_factory(
             sub_agent = sub_agent.with_system(def.system_prompt.clone());
         }
 
-        let sub_registry = ToolRegistry::standard();
-        for tdef in sub_registry.definitions() {
-            let allowed = def
-                .tools
-                .as_ref()
-                .map_or(true, |list| list.iter().any(|n| n == &tdef.name));
-            if allowed {
-                if let Some(t) = sub_registry.get(&tdef.name) {
-                    sub_agent.register_tool(t);
-                }
-            }
+        let mut sub_registry = ToolRegistry::standard();
+        // WebSearch：与主 Agent 同样的"仅配置了 search_api_key 才注册"语义，
+        // 让子 Agent 类型定义（如 general-purpose 的 tools: None）能拿到它。
+        if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
+            sub_registry.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
+        }
+        // MCP：读取 spawn 此刻已连接成功的快照；此后才连完的 server，本次
+        // 创建的子 Agent 看不到（与主 Agent「界面先开、后台陆续补」同款权衡）。
+        for tool in mcp_tools.read().unwrap().iter() {
+            sub_registry.register_arc(tool.clone());
+        }
+        for t in select_sub_agent_tools(def, &sub_registry) {
+            sub_agent.register_tool(t);
         }
         if let Some(list) = &def.tools {
             for n in list {
@@ -1054,6 +1108,7 @@ async fn drain_mcp_connections(
         Result<Vec<wyj_mcp::bridge::McpBridgeTool>, String>,
     )>,
     shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    mcp_tools: &wyj_tools::SharedMcpTools,
 ) {
     while let Ok((name, result)) = mcp_rx.try_recv() {
         match result {
@@ -1061,7 +1116,9 @@ async fn drain_mcp_connections(
                 let count = tools.len();
                 let mut new_agent = (**shared_agent.read().unwrap()).clone();
                 for tool in tools {
-                    new_agent.register_tool(Arc::new(tool));
+                    let t: Arc<dyn wyj_tools::Tool> = Arc::new(tool);
+                    mcp_tools.write().unwrap().push(t.clone());
+                    new_agent.register_tool(t);
                 }
                 *shared_agent.write().unwrap() = Arc::new(new_agent);
                 println!("[MCP {name}] 已连接，{count} 个工具已就绪");
@@ -1085,6 +1142,7 @@ async fn repl(
     cfg: Config,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     hooks_enabled: bool,
+    mcp_tools: wyj_tools::SharedMcpTools,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
@@ -1234,7 +1292,7 @@ async fn repl(
                     session.push_user(prompt);
                     turns += 1;
                     println!();
-                    drain_mcp_connections(&mut mcp_rx, &shared_agent).await;
+                    drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
                     let agent_snapshot = shared_agent.read().unwrap().clone();
                     if let Err(e) = agent_snapshot
                         .run_turn(&mut session, &ctx, &mut |d| {
@@ -1262,7 +1320,7 @@ async fn repl(
                     session.push_user(text);
                     turns += 1;
                     println!();
-                    drain_mcp_connections(&mut mcp_rx, &shared_agent).await;
+                    drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
                     let agent_snapshot = shared_agent.read().unwrap().clone();
                     let prev_mode = ctx.permission_mode.read().unwrap().clone();
                     if let Some(tools) = allowed_tools {
@@ -1310,6 +1368,9 @@ async fn repl(
                 Ok(CommandResult::OpenPluginsDialog) => {
                     println!("{}", wyj_i18n::tr("plugins.headless_unsupported"));
                 }
+                Ok(CommandResult::OpenAgentsDialog { fallback_text, .. }) => {
+                    println!("{fallback_text}");
+                }
                 Ok(CommandResult::OpenSubAgentsPanel(_)) => {
                     println!("{}", wyj_i18n::tr("subagents.headless_unsupported"));
                 }
@@ -1339,7 +1400,7 @@ async fn repl(
         session.push_user(trimmed);
         turns += 1;
         println!();
-        drain_mcp_connections(&mut mcp_rx, &shared_agent).await;
+        drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
         let agent_snapshot = shared_agent.read().unwrap().clone();
         if let Err(e) = agent_snapshot
             .run_turn(&mut session, &ctx, &mut |d| {
@@ -1484,6 +1545,108 @@ mod cli_tests {
                 assert!(json);
             }
             other => panic!("expected SubagentTrace subcommand, got {other:?}"),
+        }
+    }
+
+    // ── select_sub_agent_tools：子 Agent 是否能拿到 WebSearch/MCP 工具 ──────
+
+    struct FakeMcpTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl wyj_tools::Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn definition(&self) -> wyj_api::types::ToolDefinition {
+            wyj_api::types::ToolDefinition {
+                name: self.0.to_string(),
+                description: "fake mcp tool for tests".to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn wyj_core::tool::ToolContext,
+        ) -> Result<wyj_tools::ToolResult> {
+            Ok(wyj_tools::ToolResult::ok(String::new()))
+        }
+    }
+
+    fn registry_with_mcp_and_websearch() -> ToolRegistry {
+        let mut r = ToolRegistry::standard();
+        r.register_arc(Arc::new(wyj_tools::WebSearchTool::new("dummy-key")));
+        r.register_arc(Arc::new(FakeMcpTool("mcp_echo")));
+        r
+    }
+
+    #[test]
+    fn general_purpose_gets_websearch_and_mcp() {
+        let defs = wyj_core::builtin_defs();
+        let general = defs.iter().find(|d| d.name == "general-purpose").unwrap();
+        let registry = registry_with_mcp_and_websearch();
+        let names: Vec<String> = select_sub_agent_tools(general, &registry)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "WebSearch"));
+        assert!(names.iter().any(|n| n == "mcp_echo"));
+    }
+
+    #[test]
+    fn explore_excludes_websearch_and_mcp() {
+        let defs = wyj_core::builtin_defs();
+        let explore = defs.iter().find(|d| d.name == "Explore").unwrap();
+        let registry = registry_with_mcp_and_websearch();
+        let names: Vec<String> = select_sub_agent_tools(explore, &registry)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "WebSearch"));
+        assert!(!names.iter().any(|n| n == "mcp_echo"));
+        let expected: std::collections::HashSet<&str> = wyj_core::agent_def::READONLY_TOOLS
+            .iter()
+            .copied()
+            .collect();
+        let actual: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn custom_whitelist_matches_mcp_tool_by_exact_name() {
+        let def = wyj_core::AgentDefinition {
+            name: "custom".to_string(),
+            description: String::new(),
+            tools: Some(vec!["Read".to_string(), "mcp_echo".to_string()]),
+            model: None,
+            system_prompt: String::new(),
+            builtin: false,
+            source: None,
+        };
+        let registry = registry_with_mcp_and_websearch();
+        let names: Vec<String> = select_sub_agent_tools(&def, &registry)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "mcp_echo"));
+        assert!(!names.iter().any(|n| n == "WebSearch"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn selected_tools_never_include_agent_or_todo_or_ask_question() {
+        // 防嵌套回归守护：即便 registry 里混入了 WebSearch/MCP，select_sub_agent_tools
+        // 也不该产出 Agent/TodoWrite/AskQuestion/ExitPlanMode —— 这些工具本就
+        // 从不进入子 Agent 用的 sub_registry（standard() 不含它们）。
+        let defs = wyj_core::builtin_defs();
+        let general = defs.iter().find(|d| d.name == "general-purpose").unwrap();
+        let registry = registry_with_mcp_and_websearch();
+        let names: Vec<String> = select_sub_agent_tools(general, &registry)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        for forbidden in ["Agent", "TodoWrite", "AskQuestion", "ExitPlanMode"] {
+            assert!(!names.iter().any(|n| n == forbidden));
         }
     }
 }
