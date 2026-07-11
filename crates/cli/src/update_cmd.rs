@@ -91,12 +91,9 @@ pub async fn run(yes: bool) -> Result<()> {
         }
     };
 
-    let (archive_name, sha256_name) = self_update::asset_names(remote_version, target);
-    let archive_asset = release.asset(&archive_name);
-    let sha256_asset = release.asset(&sha256_name);
-    let (archive_asset, sha256_asset) = match (archive_asset, sha256_asset) {
-        (Some(a), Some(s)) => (a, s),
-        _ => {
+    let assets = match self_update::release_assets(&release, remote_version, target) {
+        Some(assets) => assets,
+        None => {
             eprintln!(
                 "{}",
                 wyj_i18n::tr_fmt("update.asset_not_found", &[("target", target)])
@@ -107,12 +104,13 @@ pub async fn run(yes: bool) -> Result<()> {
 
     println!(
         "{}",
-        wyj_i18n::tr_fmt("update.downloading", &[("name", &archive_asset.name)])
+        wyj_i18n::tr_fmt("update.downloading", &[("name", &assets.archive.name)])
     );
     let archive_bytes = match self_update::download_and_verify(
         &client,
-        &archive_asset.browser_download_url,
-        &sha256_asset.browser_download_url,
+        &assets.archive.browser_download_url,
+        &assets.checksum.browser_download_url,
+        &assets.archive.name,
     )
     .await
     {

@@ -152,5 +152,7 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
             artifacts/*.zip
+            artifacts/*.zip.sha256
             artifacts/SHA256SUMS

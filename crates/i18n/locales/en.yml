@@ -87,7 +87,7 @@ update:
   confirm_prompt: "Update now? [y/N] "
   cancelled: "Update cancelled"
   unsupported_platform: "Auto-update isn't supported on this platform ({os}/{arch}) — please download manually from GitHub Releases"
-  asset_not_found: "No release asset found for this platform ({target}) — please download manually from GitHub Releases"
+  asset_not_found: "No release package or checksum found for this platform ({target}) — please download manually from GitHub Releases"
   downloading: "Downloading {name}…"
   checksum_mismatch: "Download or verification failed, update aborted: {err}"
   extracting: "Extracting…"

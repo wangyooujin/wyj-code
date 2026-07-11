@@ -40,6 +40,12 @@ impl ReleaseInfo {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseAssets<'a> {
+    pub archive: &'a ReleaseAsset,
+    pub checksum: &'a ReleaseAsset,
+}
+
 /// 查询 GitHub 最新正式 Release（`/releases/latest` 已自动排除 draft/prerelease）。
 pub async fn fetch_latest_release(client: &reqwest::Client) -> Result<ReleaseInfo> {
     let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
@@ -101,11 +107,27 @@ pub fn asset_names(version: &str, target: &str) -> (String, String) {
     (archive, sha256)
 }
 
-/// 下载归档 + `.sha256` sidecar，校验一致后返回归档原始字节。
+/// 找到当前平台的安装包与校验和资产。新 release 会上传独立 `.sha256`
+/// sidecar；为兼容已经只上传 `SHA256SUMS` 的 release，也接受合并校验和文件。
+pub fn release_assets<'a>(
+    release: &'a ReleaseInfo,
+    version: &str,
+    target: &str,
+) -> Option<ReleaseAssets<'a>> {
+    let (archive_name, sha256_name) = asset_names(version, target);
+    let archive = release.asset(&archive_name)?;
+    let checksum = release
+        .asset(&sha256_name)
+        .or_else(|| release.asset("SHA256SUMS"))?;
+    Some(ReleaseAssets { archive, checksum })
+}
+
+/// 下载归档 + 校验和文件，校验一致后返回归档原始字节。
 pub async fn download_and_verify(
     client: &reqwest::Client,
     archive_url: &str,
     sha256_url: &str,
+    archive_name: &str,
 ) -> Result<Vec<u8>> {
     let archive_bytes = client
         .get(archive_url)
@@ -129,17 +151,13 @@ pub async fn download_and_verify(
         .await
         .with_context(|| format!("读取校验和文件内容失败: {sha256_url}"))?;
 
-    verify_sha256(&archive_bytes, &sha256_text)?;
+    verify_sha256(&archive_bytes, &sha256_text, archive_name)?;
     Ok(archive_bytes.to_vec())
 }
 
-/// `sha256_text` 格式为 `<hex hash>  <filename>`（`shasum -a 256`/`Get-FileHash` 输出）。
-fn verify_sha256(bytes: &[u8], sha256_text: &str) -> Result<()> {
-    let expected = sha256_text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("校验和文件内容为空或格式不正确"))?
-        .to_lowercase();
+/// `sha256_text` 可以是独立 sidecar，也可以是包含多平台条目的 `SHA256SUMS`。
+fn verify_sha256(bytes: &[u8], sha256_text: &str, archive_name: &str) -> Result<()> {
+    let expected = expected_sha256(sha256_text, archive_name)?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let actual = hex_encode(&hasher.finalize());
@@ -147,6 +165,53 @@ fn verify_sha256(bytes: &[u8], sha256_text: &str) -> Result<()> {
         bail!("校验和不匹配：期望 {expected}，实际 {actual}");
     }
     Ok(())
+}
+
+fn expected_sha256(sha256_text: &str, archive_name: &str) -> Result<String> {
+    let mut bare_single_hash = None;
+    let mut nonempty_count = 0usize;
+
+    for line in sha256_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        nonempty_count += 1;
+
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let filename = parts.next();
+        match filename {
+            Some(name) if checksum_filename_matches(name, archive_name) => {
+                return Ok(hash.to_lowercase());
+            }
+            Some(_) => {}
+            None => {
+                bare_single_hash = Some(hash.to_lowercase());
+            }
+        }
+    }
+
+    if nonempty_count == 1 {
+        if let Some(hash) = bare_single_hash {
+            return Ok(hash);
+        }
+    }
+
+    if nonempty_count == 0 {
+        bail!("校验和文件内容为空或格式不正确");
+    }
+    bail!("校验和文件未包含 {archive_name}")
+}
+
+fn checksum_filename_matches(name: &str, archive_name: &str) -> bool {
+    let name = name.trim_start_matches('*');
+    Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == archive_name)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -330,10 +395,77 @@ mod tests {
         hasher.update(bytes);
         let hex = hex_encode(&hasher.finalize());
         let sidecar = format!("{hex}  wyj-code-1.0.1-x86_64-apple-darwin.tar.gz\n");
-        assert!(verify_sha256(bytes, &sidecar).is_ok());
+        assert!(
+            verify_sha256(bytes, &sidecar, "wyj-code-1.0.1-x86_64-apple-darwin.tar.gz").is_ok()
+        );
 
         let bad_sidecar = format!("{}  wyj-code.tar.gz\n", "0".repeat(64));
-        assert!(verify_sha256(bytes, &bad_sidecar).is_err());
+        assert!(verify_sha256(
+            bytes,
+            &bad_sidecar,
+            "wyj-code-1.0.1-x86_64-apple-darwin.tar.gz"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verify_sha256_selects_matching_entry_from_combined_file() {
+        let bytes = b"hello wyj-code";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let hex = hex_encode(&hasher.finalize());
+        let sums = format!(
+            "{}  wyj-code-1.0.1-x86_64-unknown-linux-musl.tar.gz\n{hex}  wyj-code-1.0.1-aarch64-apple-darwin.tar.gz\n",
+            "0".repeat(64)
+        );
+
+        assert!(verify_sha256(bytes, &sums, "wyj-code-1.0.1-aarch64-apple-darwin.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn release_assets_falls_back_to_combined_checksums() {
+        let archive = ReleaseAsset {
+            name: "wyj-code-1.0.1-aarch64-apple-darwin.tar.gz".to_string(),
+            browser_download_url: "https://example.com/archive".to_string(),
+        };
+        let sums = ReleaseAsset {
+            name: "SHA256SUMS".to_string(),
+            browser_download_url: "https://example.com/SHA256SUMS".to_string(),
+        };
+        let release = ReleaseInfo {
+            tag_name: "v1.0.1".to_string(),
+            body: String::new(),
+            assets: vec![archive.clone(), sums.clone()],
+        };
+
+        let assets = release_assets(&release, "1.0.1", "aarch64-apple-darwin").unwrap();
+        assert_eq!(assets.archive.name, archive.name);
+        assert_eq!(assets.checksum.name, sums.name);
+    }
+
+    #[test]
+    fn release_assets_prefers_sidecar_checksum() {
+        let archive = ReleaseAsset {
+            name: "wyj-code-1.0.1-aarch64-apple-darwin.tar.gz".to_string(),
+            browser_download_url: "https://example.com/archive".to_string(),
+        };
+        let sidecar = ReleaseAsset {
+            name: "wyj-code-1.0.1-aarch64-apple-darwin.tar.gz.sha256".to_string(),
+            browser_download_url: "https://example.com/sidecar".to_string(),
+        };
+        let sums = ReleaseAsset {
+            name: "SHA256SUMS".to_string(),
+            browser_download_url: "https://example.com/SHA256SUMS".to_string(),
+        };
+        let release = ReleaseInfo {
+            tag_name: "v1.0.1".to_string(),
+            body: String::new(),
+            assets: vec![archive.clone(), sums, sidecar.clone()],
+        };
+
+        let assets = release_assets(&release, "1.0.1", "aarch64-apple-darwin").unwrap();
+        assert_eq!(assets.archive.name, archive.name);
+        assert_eq!(assets.checksum.name, sidecar.name);
     }
 
     #[test]
