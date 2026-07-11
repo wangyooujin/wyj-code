@@ -86,7 +86,7 @@ update:
   confirm_prompt: "是否更新？[y/N] "
   cancelled: "已取消更新"
   unsupported_platform: "当前平台（{os}/{arch}）暂不支持自动更新，请前往 GitHub Releases 页面手动下载"
-  asset_not_found: "未找到匹配当前平台（{target}）的安装包，请前往 GitHub Releases 页面手动下载"
+  asset_not_found: "未找到匹配当前平台（{target}）的安装包或校验和，请前往 GitHub Releases 页面手动下载"
   downloading: "正在下载 {name}…"
   checksum_mismatch: "下载或校验失败，已放弃更新：{err}"
   extracting: "正在解压…"

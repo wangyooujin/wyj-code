@@ -29,7 +29,7 @@ jobs:
       - name: Assemble site
         working-directory: site
         run: |
-          cp index.html script.js favicon.svg dist/
+          cp index.html script.js favicon.svg install.sh install.ps1 dist/
 
       - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4

@@ -86,6 +86,18 @@
         </a>
         <a href="#install" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="hero.cta.install">60 秒上手 →</a>
       </div>
+
+      <div class="mt-6 reveal" style="transition-delay:60ms">
+        <p class="text-xs text-paper/40 mb-2" data-i18n="hero.oneliner.label">一键安装（macOS / Linux）：</p>
+        <div class="code-block rounded-lg relative max-w-md">
+          <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-hero-oneliner" aria-label="copy">
+            <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
+          </button>
+          <pre class="px-4 py-3 pr-12 text-[12px] leading-[1.6] overflow-x-auto"><code id="code-hero-oneliner"><span class="text-phosphor">❯</span> curl -fsSL https://wangyooujin.github.io/wyj-code/install.sh | sh</code></pre>
+        </div>
+        <p class="mt-2 text-xs text-paper/35" data-i18n="hero.oneliner.windows">Windows：<a href="#install" class="underline hover:text-paper/60">PowerShell 命令见下方 →</a></p>
+      </div>
+
       <div class="mt-9 flex flex-wrap gap-2.5">
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">Rust 1.80+</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">MIT OR Apache-2.0</span>
@@ -281,25 +293,30 @@
   <div class="reveal max-w-2xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="install.kicker">Install</p>
     <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="install.title">60 秒上手</h2>
-    <p class="mt-4 text-paper/55" data-i18n="install.desc">克隆、构建、配置 API Key，直接开始对话。</p>
+    <p class="mt-4 text-paper/55" data-i18n="install.desc">一条命令完成下载、安装、配置 PATH，无需 sudo / 管理员权限。</p>
   </div>
 
-  <div class="mt-10 reveal">
-    <div class="code-block rounded-xl relative">
-      <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-quickstart" aria-label="copy">
-        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
-      </button>
-      <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-quickstart"><span class="text-paper/35"># clone &amp; build</span>
-git clone https://github.com/wangyooujin/wyj-code.git &amp;&amp; cd wyj-code
-./build.sh install &amp;&amp; wyj-code --config-status
-
-<span class="text-paper/35"># set your API key</span>
-export WYJ_CODE_API_KEY=sk-...
-
-<span class="text-paper/35"># go</span>
-wyj-code</code></pre>
+  <div class="mt-10 reveal grid sm:grid-cols-2 gap-4">
+    <div>
+      <p class="text-xs text-paper/40 mb-2" data-i18n="install.oneliner.unix">macOS / Linux</p>
+      <div class="code-block rounded-xl relative">
+        <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-install-unix" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-install-unix">curl -fsSL https://wangyooujin.github.io/wyj-code/install.sh | sh</code></pre>
+      </div>
+    </div>
+    <div>
+      <p class="text-xs text-paper/40 mb-2" data-i18n="install.oneliner.win">Windows (PowerShell)</p>
+      <div class="code-block rounded-xl relative">
+        <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-install-win" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-install-win">irm https://wangyooujin.github.io/wyj-code/install.ps1 | iex</code></pre>
+      </div>
     </div>
   </div>
+  <p class="mt-4 text-xs text-paper/35 reveal" data-i18n="install.oneliner.note">脚本自动识别平台架构、拉取 GitHub 最新 Release、校验 sha256 后装入用户目录；之后可用 <code class="text-amber-400">wyj-code update</code> 升级。</p>
 
   <div class="mt-14 reveal">
     <div class="flex gap-6 border-b border-white/[0.08] text-sm">
@@ -309,7 +326,7 @@ wyj-code</code></pre>
     </div>
 
     <div class="mt-6" data-tab-panel="prebuilt">
-      <p class="text-sm text-paper/55 mb-3" data-i18n="install.prebuilt.desc">从 GitHub Releases 下载对应平台压缩包，解压后运行内置安装脚本，自动装入用户目录并配置 PATH，无需 sudo / 管理员权限。</p>
+      <p class="text-sm text-paper/55 mb-3" data-i18n="install.prebuilt.desc">手动从 GitHub Releases 下载对应平台压缩包，解压后运行内置安装脚本——这正是上面一键脚本在背后做的事，适合不想执行 curl | sh 的场景。</p>
       <div class="code-block rounded-xl relative">
         <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-prebuilt" aria-label="copy">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>

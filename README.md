@@ -67,6 +67,19 @@ wyj-code                                          # 启动 TUI，开始对话
 
 ## 安装
 
+**方式零：一键安装脚本**（macOS / Linux / Windows）：脚本会自动识别平台架构、拉取
+GitHub 最新 Release、校验 sha256 后装入用户目录并配置 PATH，全程无需 sudo/管理员权限：
+
+```bash
+# macOS / Linux
+curl -fsSL https://wangyooujin.github.io/wyj-code/install.sh | sh
+
+# Windows（PowerShell）
+irm https://wangyooujin.github.io/wyj-code/install.ps1 | iex
+```
+
+之后可用 `wyj-code update` 检查并自动升级到最新版本，无需重新执行脚本。
+
 **方式一：下载预编译产物**（macOS / Linux / Windows，见 [GitHub Releases](../../releases)）：
 下载对应平台压缩包并解压，压缩包内自带一键安装脚本——macOS/Linux 执行 `./install.sh`，
 Windows 双击（或在终端运行）`install.bat`。脚本会把 `wyj-code` 装进当前用户目录（`~/.local/bin`
