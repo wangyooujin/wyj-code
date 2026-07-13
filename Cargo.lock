@@ -2202,9 +2202,43 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "reqwest"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+dependencies = [
+ "base64",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "js-sys",
+ "log",
+ "percent-encoding",
+ "pin-project-lite",
+ "serde",
+ "serde_json",
+ "sync_wrapper",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
+ "web-sys",
 ]
 
 [[package]]
@@ -2231,13 +2265,16 @@ dependencies = [
  "base64",
  "chrono",
  "futures",
+ "http",
  "pastey",
  "pin-project-lite",
  "process-wrap",
+ "reqwest 0.13.4",
  "rmcp-macros",
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2700,6 +2737,19 @@ checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39f24a9b78c40b90817bbcd1821c74ddfd74916aadd29403d001532a9195532d"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
 ]
 
 [[package]]
@@ -3386,6 +3436,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3741,7 +3804,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wyj-api"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3750,7 +3813,7 @@ dependencies = [
  "futures",
  "httpdate",
  "pin-project-lite",
- "reqwest",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3761,12 +3824,12 @@ dependencies = [
 
 [[package]]
 name = "wyj-code"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
  "clap",
- "reqwest",
+ "reqwest 0.12.28",
  "serde_json",
  "tokio",
  "tracing",
@@ -3784,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-commands"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3800,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-config"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "directories",
@@ -3814,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-core"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3833,17 +3896,18 @@ dependencies = [
 
 [[package]]
 name = "wyj-i18n"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "rust-i18n",
 ]
 
 [[package]]
 name = "wyj-mcp"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "http",
  "rmcp",
  "serde",
  "serde_json",
@@ -3856,12 +3920,12 @@ dependencies = [
 
 [[package]]
 name = "wyj-store"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "chrono",
  "flate2",
- "reqwest",
+ "reqwest 0.12.28",
  "semver",
  "serde",
  "serde_json",
@@ -3877,7 +3941,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-tools"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3888,7 +3952,7 @@ dependencies = [
  "ignore",
  "libc",
  "regex",
- "reqwest",
+ "reqwest 0.12.28",
  "schemars 0.8.22",
  "scraper",
  "serde",
@@ -3904,7 +3968,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-tui"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "anyhow",
  "arboard",

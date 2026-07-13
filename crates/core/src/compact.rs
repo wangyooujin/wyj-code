@@ -3,7 +3,7 @@
 use anyhow::Result;
 use wyj_api::{
     provider::Provider,
-    types::{ContentBlock, Message, Role, ToolResultContent},
+    types::{ContentBlock, Message, Role, ToolDefinition, ToolResultContent},
 };
 
 use crate::session::Session;
@@ -20,6 +20,39 @@ pub fn compact_trigger_buffer(context_window: u32) -> u32 {
 pub struct CompactResult {
     pub messages_removed: usize,
     pub tokens_saved_estimate: u32,
+}
+
+/// 估算一整次模型请求占用的上下文，而不是只看会话历史。
+///
+/// 自动压缩的目标是避免下一次 `Provider::stream` 超出模型窗口；该请求实际还会
+/// 携带 system prompt、工具定义，并要为输出预留 `max_tokens`。所有供应商的分词
+/// 器和消息包装开销并不相同，因此这仍是保守估算，但覆盖面比只估 messages 完整。
+pub fn estimate_request_tokens(
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+    max_output_tokens: u32,
+) -> u32 {
+    const REQUEST_OVERHEAD_TOKENS: u32 = 64;
+    const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
+
+    let system_tokens = estimate_text_tokens(system) as u32;
+    let message_overhead = (messages.len() as u32).saturating_mul(MESSAGE_OVERHEAD_TOKENS);
+    let tool_tokens = tools.iter().fold(0u32, |total, tool| {
+        let schema = tool.input_schema.to_string();
+        total.saturating_add(
+            (estimate_text_tokens(&tool.name)
+                + estimate_text_tokens(&tool.description)
+                + estimate_text_tokens(&schema)) as u32,
+        )
+    });
+
+    estimate_tokens(messages)
+        .saturating_add(system_tokens)
+        .saturating_add(tool_tokens)
+        .saturating_add(message_overhead)
+        .saturating_add(REQUEST_OVERHEAD_TOKENS)
+        .saturating_add(max_output_tokens)
 }
 
 /// 粗略估算消息列表的 token 数。
@@ -112,8 +145,21 @@ pub async fn compact_session(
     let keep_from = safe_keep_from(&session.messages, COMPACT_KEEP_RECENT)
         .ok_or_else(|| anyhow::anyhow!("找不到安全的压缩边界，暂不压缩"))?;
 
-    let to_compact = &session.messages[..keep_from];
-    let to_keep = session.messages[keep_from..].to_vec();
+    // 工具密集型单回合的消息序列通常只有首条是真实 user 消息：
+    // user → assistant(tool_use) → user(tool_result) → ...。此时安全边界会回退
+    // 到 0。旧逻辑仍对空前缀生成摘要，再追加一对 user/assistant 确认消息，历史
+    // 不但没变短，还会额外增长两条消息。退化为单条 user 摘要可保留角色合法性，
+    // 也让下一次请求从一个可继续的 assistant 回合开始。
+    let reset_entire_session = keep_from == 0;
+    let (to_compact, to_keep) = if reset_entire_session {
+        (&session.messages[..], Vec::new())
+    } else {
+        (
+            &session.messages[..keep_from],
+            session.messages[keep_from..].to_vec(),
+        )
+    };
+    let before_tokens = estimate_tokens(&session.messages);
 
     let conv_text = messages_to_text(to_compact);
     let prompt = crate::prompts::compact_prompt(&conv_text);
@@ -153,24 +199,34 @@ pub async fn compact_session(
         anyhow::bail!("摘要生成失败：模型返回空输出");
     }
 
-    let tokens_saved = estimate_tokens(to_compact);
     let messages_removed = to_compact.len();
 
-    session.messages = vec![
-        Message {
+    if reset_entire_session {
+        session.messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
                 text: crate::prompts::compact_summary_message(messages_removed, &summary),
             }],
-        },
-        Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: crate::prompts::COMPACT_ACK.to_string(),
-            }],
-        },
-    ];
-    session.messages.extend(to_keep);
+        }];
+    } else {
+        session.messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: crate::prompts::compact_summary_message(messages_removed, &summary),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: crate::prompts::COMPACT_ACK.to_string(),
+                }],
+            },
+        ];
+        session.messages.extend(to_keep);
+    }
+
+    let tokens_saved = before_tokens.saturating_sub(estimate_tokens(&session.messages));
 
     Ok(CompactResult {
         messages_removed,
@@ -306,6 +362,118 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    struct StaticSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for StaticSummaryProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::provider::EventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn complete(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::types::CompletionResult> {
+            Ok(wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text {
+                    text: "## Task & Intent\n继续完成当前任务。".to_string(),
+                }],
+                stop_reason: wyj_api::types::StopReason::EndTurn,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    #[test]
+    fn request_estimate_includes_system_tools_and_output_reserve() {
+        let messages = vec![user_text(&"x".repeat(400))];
+        let tools = vec![ToolDefinition {
+            name: "Read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({"path": {"type": "string"}}),
+        }];
+
+        let message_only = estimate_tokens(&messages);
+        let full_request = estimate_request_tokens(
+            "system instruction ".repeat(40).as_str(),
+            &messages,
+            &tools,
+            1024,
+        );
+
+        assert!(full_request >= message_only + 1024);
+        assert!(full_request > message_only + 1200);
+    }
+
+    #[tokio::test]
+    async fn compact_session_resets_a_tool_only_turn_instead_of_emitting_zero_compaction() {
+        let mut session = Session::new();
+        session.messages.push(user_text("请持续检查并修复问题"));
+        for _ in 0..4 {
+            session.messages.push(assistant_tool_use());
+            session.messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: ToolResultContent::text("x".repeat(2_000)),
+                    is_error: false,
+                }],
+            });
+        }
+        let original_len = session.messages.len();
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000)
+            .await
+            .expect("tool-only turn should compact safely");
+
+        assert_eq!(result.messages_removed, original_len);
+        assert!(result.tokens_saved_estimate > 0);
+        assert_eq!(session.messages.len(), 1);
+        assert!(matches!(session.messages[0].role, Role::User));
+        assert!(session.messages[0]
+            .text()
+            .starts_with("[Conversation summary — 9 earlier messages"));
+        assert!(!session.messages[0]
+            .text()
+            .contains(crate::prompts::COMPACT_ACK));
+    }
+
+    #[tokio::test]
+    async fn compact_session_reports_the_actual_post_compaction_token_reduction() {
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let before = estimate_tokens(&session.messages);
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000)
+            .await
+            .expect("normal multi-turn session should compact");
+        let after = estimate_tokens(&session.messages);
+
+        assert_eq!(result.tokens_saved_estimate, before - after);
+        assert!(result.messages_removed > 0);
+        assert!(after < before);
     }
 
     /// 朴素按固定条数截断会正好切在 assistant(tool_use) 之后、

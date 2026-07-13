@@ -127,6 +127,7 @@ help:
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
+    - `/extensions` — 统一查看并诊断 Skill / MCP / Plugin 资源
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
@@ -226,7 +227,7 @@ memory:
 
 mcp:
   desc: "管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）"
-  headless_unsupported: "[headless 模式不支持 /mcp 面板，请直接编辑 ~/.wyj-code/config.toml 的 [[mcp_servers]] 段或 .wyj/mcp.toml]"
+  headless_unsupported: "[headless 模式不支持 /mcp 面板，请使用 `wyj-code extensions` 管理 MCP]"
   background:
     connected: "MCP [{name}] 已连接，注册 {count} 个工具"
     failed_error: "MCP [{name}] 连接失败: {err}"
@@ -282,13 +283,13 @@ mcp:
     command_label: "即将写入命令:"
     confirm_warning: "该命令会在以后每次启动 wyj-code 时自动执行。"
     confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
-    done: "安装成功，重启 wyj-code 后生效"
+    done: "安装成功，将在下一次 Agent 回合边界应用"
   upgrade:
     in_progress: "升级中…"
     done: "已升级到 {version}"
     already_latest: "已是最新版本（{version}）"
   uninstall:
-    done: "已卸载，重启 wyj-code 后生效"
+    done: "已卸载，将在下一次 Agent 回合边界应用"
   error:
     search_failed: "搜索失败: {err}"
     install_failed: "安装失败: {err}"
@@ -298,7 +299,7 @@ mcp:
 
 skills:
   desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
-  headless_unsupported: "[headless 模式不支持 /skills 面板，请直接在 ~/.wyj-code/skills/ 或 .wyj/skills/ 下增删 .md 文件]"
+  headless_unsupported: "[headless 模式不支持 /skills 面板，请使用 `wyj-code extensions` 管理 Skill]"
   dialog:
     title: "Skill"
     tab_installed: "已安装"
@@ -337,13 +338,13 @@ skills:
     scope_label: "作用域: "
     path_label: "来源路径: "
     confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
-    done: "安装成功，重启 wyj-code 后生效"
+    done: "安装成功，将在下一次 Agent 回合边界应用"
   upgrade:
     in_progress: "升级中…"
     done: "已升级到 {version}"
     already_latest: "已是最新版本（{version}）"
   uninstall:
-    done: "已卸载，重启 wyj-code 后生效"
+    done: "已卸载，将在下一次 Agent 回合边界应用"
   error:
     sync_failed: "同步 marketplace 失败: {err}"
     install_failed: "安装失败: {err}"
@@ -353,7 +354,7 @@ skills:
 
 plugins:
   desc: "管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）"
-  headless_unsupported: "[headless 模式不支持 /plugins 面板，本地开发请用 --plugin-dir，或直接管理 ~/.wyj-code/plugins/ 目录]"
+  headless_unsupported: "[headless 模式不支持 /plugins 面板，请使用 `wyj-code extensions` 管理 Plugin]"
   dialog:
     title: "插件"
     tab_installed: "已安装"

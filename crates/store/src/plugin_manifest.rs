@@ -92,8 +92,7 @@ pub enum PluginMcpServersField {
     Map(HashMap<String, PluginMcpServerDef>),
 }
 
-/// 唯一实际驱动安装的变体是 `Stdio`（`crates/mcp/src/bridge.rs` 只支持 stdio 传输）；
-/// Sse/Http/Ws 能解析通过，但安装时会被跳过并计入 `skipped_capabilities`。
+/// Stdio 和 Streamable HTTP 会进入运行时；SSE/WS 仍保留为可诊断的未支持能力。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PluginMcpServerDef {

@@ -2,6 +2,8 @@
 
 pub mod bridge;
 pub mod config;
+pub mod runtime;
 
 pub use bridge::McpBridgeTool;
 pub use config::McpServerConfig;
+pub use runtime::{McpRuntime, McpRuntimeEvent};

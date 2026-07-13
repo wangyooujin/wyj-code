@@ -3,8 +3,8 @@
 #
 # 与仓库根目录的 install.sh 不是同一个文件：那个脚本随 release 压缩包分发，假定
 # wyj-code 二进制已经和它解压在同一目录，只负责"装到 ~/.local/bin + 配置 PATH"。
-# 这个脚本运行在用户还什么都没有的机器上，只做前置工作——探测平台、向 GitHub
-# Releases API 查最新版本、下载对应压缩包、校验 sha256、解压——解压完成后直接
+# 这个脚本运行在用户还什么都没有的机器上，只做前置工作——探测平台、从 GitHub
+# Releases 重定向解析最新版本、下载对应压缩包、校验 sha256、解压——解压完成后直接
 # exec 执行包内那个 install.sh，把安装这一步完全交给它，不重复实现一遍。
 #
 # 用 POSIX sh 语法编写（不能假设 curl | sh 时解释器是 bash）。
@@ -66,10 +66,23 @@ if [ -n "${WYJ_CODE_VERSION:-}" ]; then
     log "==> 使用指定版本：${version}（来自 WYJ_CODE_VERSION）"
 else
     log "==> 查询最新版本..."
-    api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
-    release_json="$(curl -fsSL "$api_url")" || fail "查询最新 release 失败：$api_url"
-    tag="$(printf '%s' "$release_json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
-    [ -n "$tag" ] || fail "无法解析最新 release 的 tag_name（可能触发了 GitHub API 匿名限流，请稍后重试或改用 WYJ_CODE_VERSION 指定版本）"
+    latest_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+    latest_location="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$latest_url")" \
+        || fail "查询最新 release 失败：$latest_url"
+    case "$latest_location" in
+        */releases/tag/*)
+            tag="${latest_location##*/releases/tag/}"
+            tag="${tag%%\?*}"
+            tag="${tag%%#*}"
+            ;;
+        *)
+            fail "无法从 GitHub Releases 重定向地址解析版本：$latest_location"
+            ;;
+    esac
+    case "$tag" in
+        v[0-9]*) ;;
+        *) fail "GitHub Releases 返回了无效版本 tag：$tag" ;;
+    esac
     version="${tag#v}"
     log "==> 最新版本：${version}"
 fi

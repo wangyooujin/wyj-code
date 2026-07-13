@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use rmcp::service::RunningService;
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo},
-    transport::TokioChildProcess,
+    transport::{
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+        TokioChildProcess,
+    },
     RoleClient, ServiceExt,
 };
 use serde_json::Value;
@@ -34,6 +37,7 @@ pub const MCP_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// 桥接单个 MCP 工具 → wyj_core::Tool
 pub struct McpBridgeTool {
     tool_name: String,
+    remote_tool_name: String,
     definition: ToolDefinition,
     client: Arc<Mutex<McpHandle>>,
 }
@@ -53,7 +57,7 @@ impl Tool for McpBridgeTool {
             Some(m) => m.clone(),
             None => serde_json::Map::new(),
         };
-        let params = CallToolRequestParams::new(self.tool_name.clone()).with_arguments(args);
+        let params = CallToolRequestParams::new(self.remote_tool_name.clone()).with_arguments(args);
 
         let guard = self.client.lock().await;
         let result = guard
@@ -79,37 +83,61 @@ impl Tool for McpBridgeTool {
 
 /// 连接 MCP server 并发现所有工具，返回桥接工具列表
 pub async fn connect_mcp_server(cfg: &McpServerConfig) -> Result<Vec<McpBridgeTool>> {
-    if cfg.transport != McpTransport::Stdio {
-        anyhow::bail!("当前仅支持 stdio 传输类型");
-    }
-    let cmd = cfg
-        .command
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("stdio 传输需要 command 字段"))?;
-
-    let mut command = Command::new(cmd);
-    command.args(&cfg.args).envs(&cfg.env);
-
-    // MCP server 子进程默认继承父进程的 stderr——不管是 TUI 的 alternate screen
-    // 还是普通终端，子进程自己的日志/警告输出都会直接写穿到用户看到的画面上。
-    // 关键点：`rmcp::TokioChildProcess::new()` 内部固定用
-    // `TokioChildProcessBuilder`，其 stderr 默认值是 `Stdio::inherit()`，
-    // 且 `spawn()` 时会用这个默认值重新对 command 调一次 `.stderr(...)`——
-    // 这会覆盖任何在 `command.configure(...)` 闭包里直接设置的 stderr，
-    // 在这一层设置完全不生效。必须改用 `TokioChildProcess::builder(...)`
-    // 拿到 `TokioChildProcessBuilder`，在它上面显式调用 `.stderr(...)`
-    // 才是真正被 `spawn()` 采用的值。
-    let (transport, _stderr) = TokioChildProcess::builder(command)
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("启动 MCP 子进程失败: {e}"))?;
-
     let client_info = ClientInfo::default();
-    let client: McpHandle = client_info
-        .serve(transport)
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP 初始化失败: {e}"))?;
+    let client: McpHandle = match cfg.transport {
+        McpTransport::Stdio => {
+            let cmd = cfg
+                .command
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("stdio 传输需要 command 字段"))?;
+            let mut command = Command::new(cmd);
+            command.args(&cfg.args).envs(&cfg.env);
 
+            // 子进程 stderr 必须隔离，避免污染 TUI。
+            let (transport, _stderr) = TokioChildProcess::builder(command)
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("启动 MCP 子进程失败: {e}"))?;
+            client_info
+                .serve(transport)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP 初始化失败: {e}"))?
+        }
+        McpTransport::StreamableHttp => {
+            let url = cfg
+                .url
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("streamable_http 传输需要 url 字段"))?;
+            let mut custom_headers = std::collections::HashMap::new();
+            for (name, value) in &cfg.headers {
+                let header_name = http::HeaderName::try_from(name)
+                    .map_err(|e| anyhow::anyhow!("MCP HTTP header 名非法 {name}: {e}"))?;
+                let header_value = http::HeaderValue::try_from(resolve_env_reference(value))
+                    .map_err(|e| anyhow::anyhow!("MCP HTTP header {name} 值非法: {e}"))?;
+                custom_headers.insert(header_name, header_value);
+            }
+            let transport = StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(url.to_string())
+                    .custom_headers(custom_headers),
+            );
+            client_info
+                .serve(transport)
+                .await
+                .map_err(|e| anyhow::anyhow!("MCP HTTP 初始化失败: {e}"))?
+        }
+    };
+
+    build_bridges(client, &cfg.name).await
+}
+
+fn resolve_env_reference(value: &str) -> String {
+    if let Some(name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        return std::env::var(name).unwrap_or_default();
+    }
+    value.to_string()
+}
+
+async fn build_bridges(client: McpHandle, server_name: &str) -> Result<Vec<McpBridgeTool>> {
     let tools_result = client
         .list_all_tools()
         .await
@@ -119,15 +147,22 @@ pub async fn connect_mcp_server(cfg: &McpServerConfig) -> Result<Vec<McpBridgeTo
     let mut bridges = vec![];
 
     for mcp_tool in tools_result {
+        let remote_tool_name = mcp_tool.name.to_string();
+        let tool_name = format!(
+            "mcp__{}__{}",
+            sanitize_server_name(server_name),
+            remote_tool_name
+        );
         let schema = serde_json::to_value(&mcp_tool.input_schema)
             .unwrap_or(Value::Object(Default::default()));
         let def = ToolDefinition {
-            name: mcp_tool.name.to_string(),
+            name: tool_name.clone(),
             description: mcp_tool.description.as_deref().unwrap_or("").to_string(),
             input_schema: schema,
         };
         bridges.push(McpBridgeTool {
-            tool_name: mcp_tool.name.to_string(),
+            tool_name,
+            remote_tool_name,
             definition: def,
             client: client.clone(),
         });
@@ -135,10 +170,22 @@ pub async fn connect_mcp_server(cfg: &McpServerConfig) -> Result<Vec<McpBridgeTo
 
     tracing::info!(
         "MCP server {} 连接成功，发现 {} 个工具",
-        cfg.name,
+        server_name,
         bridges.len()
     );
     Ok(bridges)
+}
+
+fn sanitize_server_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -153,6 +200,8 @@ mod tests {
             command: command.map(str::to_string),
             args: vec![],
             env: Default::default(),
+            url: None,
+            headers: Default::default(),
         }
     }
 
@@ -173,12 +222,14 @@ mod tests {
     async fn connect_mcp_server_rejects_non_stdio_transport() {
         let cfg = McpServerConfig {
             name: "http-server".to_string(),
-            transport: McpTransport::Http,
+            transport: McpTransport::StreamableHttp,
             command: None,
             args: vec![],
             env: Default::default(),
+            url: None,
+            headers: Default::default(),
         };
-        expect_err_containing(&cfg, "stdio").await;
+        expect_err_containing(&cfg, "url").await;
     }
 
     #[tokio::test]

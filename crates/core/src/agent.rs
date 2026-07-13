@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_session, compact_trigger_buffer, estimate_tokens};
+use crate::compact::{compact_session, compact_trigger_buffer, estimate_request_tokens};
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
@@ -73,6 +73,7 @@ pub struct Agent {
     thinking_budget: Option<u32>,
     interleaved_thinking: bool,
     /// thinking 文本增量回调（TUI 展示 / headless stderr 输出）
+    #[allow(clippy::type_complexity)]
     thinking_cb: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// Hooks 生命周期自动化执行器（可选，子 Agent 不设置，避免嵌套 shell 副作用）
     hook_runner: Option<Arc<HookRunner>>,
@@ -227,6 +228,31 @@ impl Agent {
         self.tool_impls.insert(tool.name().to_string(), tool);
     }
 
+    /// Remove tools whose names satisfy `predicate`.
+    ///
+    /// Runtime-managed integrations (currently MCP) are attached to an Agent
+    /// snapshot after it has been constructed.  Rebuilding that snapshot must
+    /// be able to remove integrations as well as add them; otherwise a disabled
+    /// server would remain callable until the process restarted.
+    pub fn remove_tools_where(&mut self, mut predicate: impl FnMut(&str) -> bool) {
+        self.tools.retain(|definition| !predicate(&definition.name));
+        self.tool_impls.retain(|name, _| !predicate(name));
+    }
+
+    /// Re-read definitions from runtime-mutable Tool implementations.
+    ///
+    /// This is primarily used by the `Agent` tool: its advertised enum of
+    /// sub-agent types is derived from enabled plugin/user definitions and can
+    /// change while the process is alive.
+    pub fn refresh_tool_definitions(&mut self) {
+        for (name, tool) in &self.tool_impls {
+            let definition = tool.definition();
+            if let Some(existing) = self.tools.iter_mut().find(|d| d.name == *name) {
+                *existing = definition;
+            }
+        }
+    }
+
     /// 追加单个工具（用于 per-turn 动态注册，如 ExitPlanMode）
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.register_tool(tool);
@@ -334,8 +360,17 @@ impl Agent {
                 anyhow::bail!("超过最大推理轮数 {}", self.max_turns);
             }
 
-            // 检查 token 预算，超限时触发自动压缩
-            let estimated = estimate_tokens(&session.messages);
+            let opts = wyj_api::provider::RequestOptions {
+                max_tokens: self.max_tokens,
+                thinking_budget: self.thinking_budget,
+                interleaved: self.interleaved_thinking,
+            };
+
+            // 检查下一次完整请求的 token 预算，超限时触发自动压缩。不能只看
+            // messages：system（含记忆/CLAUDE.md）、工具 schema 和输出预留都会
+            // 占用模型上下文窗口。
+            let estimated =
+                estimate_request_tokens(&system, &session.messages, &self.tools, opts.max_tokens);
             let compact_threshold = self
                 .context_window
                 .saturating_sub(compact_trigger_buffer(self.context_window));
@@ -356,11 +391,6 @@ impl Agent {
             // usage 事件同样缓冲到流成功后才入账，避免失败尝试的重复计数。
             const MAX_STREAM_RETRIES: u32 = 2;
             let mut stream_retries: u32 = 0;
-            let opts = wyj_api::provider::RequestOptions {
-                max_tokens: self.max_tokens,
-                thinking_budget: self.thinking_budget,
-                interleaved: self.interleaved_thinking,
-            };
             // 按到达顺序累积的内容块（thinking 可与 tool_use 交错，顺序必须保留）
             enum StreamedBlock {
                 Text(String),
@@ -859,6 +889,7 @@ fn append_hook_feedback(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use crate::tool::{Tool, ToolContext, ToolResult};

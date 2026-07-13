@@ -6,6 +6,7 @@
 use crate::{Config, McpServerConfig};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -32,6 +33,69 @@ pub fn load_project_mcp(cwd: &Path) -> Result<Vec<McpServerConfig>> {
     Ok(parsed.mcp_servers)
 }
 
+/// Read Claude Code's native `{ "mcpServers": { ... } }` shape without mutating
+/// the source file. This is used as a compatibility layer; wyj-code writes its
+/// canonical TOML representation separately.
+pub fn load_native_mcp(path: &Path) -> Result<Vec<McpServerConfig>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("读取原生 MCP 配置失败: {}", path.display()))?;
+    let value: Value = serde_json::from_str(&content)
+        .with_context(|| format!("解析原生 MCP 配置失败: {}", path.display()))?;
+    let servers = value
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("原生 MCP 配置缺少 mcpServers 对象"))?;
+    let mut result = Vec::new();
+    for (name, raw) in servers {
+        let url = raw.get("url").and_then(Value::as_str).map(str::to_string);
+        let transport = if url.is_some() {
+            crate::McpTransport::StreamableHttp
+        } else {
+            crate::McpTransport::Stdio
+        };
+        let args = raw
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        result.push(McpServerConfig {
+            name: name.clone(),
+            transport,
+            command: raw
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            args,
+            env: json_string_map(raw.get("env")),
+            url,
+            headers: json_string_map(raw.get("headers")),
+        });
+    }
+    Ok(result)
+}
+
+fn json_string_map(value: Option<&Value>) -> std::collections::HashMap<String, String> {
+    value
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 保存项目级 MCP server 列表（会自动创建 `.wyj/` 目录）。
 pub fn save_project_mcp(cwd: &Path, servers: &[McpServerConfig]) -> Result<()> {
     let path = project_mcp_path(cwd);
@@ -43,7 +107,7 @@ pub fn save_project_mcp(cwd: &Path, servers: &[McpServerConfig]) -> Result<()> {
         mcp_servers: servers.to_vec(),
     };
     let content = toml::to_string_pretty(&cfg).context("序列化项目级 MCP 配置失败")?;
-    std::fs::write(&path, content)
+    super::write_atomic(&path, &content)
         .with_context(|| format!("写入项目级 MCP 配置失败: {}", path.display()))
 }
 
@@ -62,6 +126,17 @@ pub fn merged_mcp_servers(cfg: &Config, cwd: &Path) -> Vec<McpServerConfig> {
             merged.push(project_server);
         }
     }
+    let native_path = cwd.join(".mcp.json");
+    for native_server in load_native_mcp(&native_path).unwrap_or_else(|e| {
+        tracing::warn!("加载原生项目 MCP 配置失败，忽略: {e}");
+        Vec::new()
+    }) {
+        if let Some(existing) = merged.iter_mut().find(|s| s.name == native_server.name) {
+            *existing = native_server;
+        } else {
+            merged.push(native_server);
+        }
+    }
     merged
 }
 
@@ -77,6 +152,8 @@ mod tests {
             command: Some(command.to_string()),
             args: vec![],
             env: Default::default(),
+            url: None,
+            headers: Default::default(),
         }
     }
 
@@ -113,6 +190,22 @@ mod tests {
         let merged = merged_mcp_servers(&cfg, dir.path());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].command.as_deref(), Some("project-cmd"));
+    }
+
+    #[test]
+    fn native_project_mcp_overrides_legacy_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = base_config(vec![mcp("postgres", "global-cmd")]);
+        save_project_mcp(dir.path(), &[mcp("postgres", "legacy-project-cmd")]).unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers":{"postgres":{"command":"native-project-cmd"}}}"#,
+        )
+        .unwrap();
+
+        let merged = merged_mcp_servers(&cfg, dir.path());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].command.as_deref(), Some("native-project-cmd"));
     }
 
     #[test]
