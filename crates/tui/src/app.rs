@@ -3644,21 +3644,41 @@ fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
             format!("{n} files")
         }
         "webfetch" => format!("fetched {} bytes", output.len()),
-        _ => trunc1(output.lines().next().unwrap_or(output)),
+        _ => trunc1(
+            first_informative_line(output)
+                .or_else(|| output.lines().next())
+                .unwrap_or(output),
+        ),
     }
+}
+
+/// 兜底摘要用：跳过无信息量的结构性行（JSON/数组输出的 `{`、`[` 等），
+/// 取第一条含字母/数字/CJK 的行。全都是结构行时返回 None（由调用方回退首行）。
+fn first_informative_line(output: &str) -> Option<&str> {
+    output.lines().find(|l| {
+        let t = l.trim();
+        !t.is_empty() && t.chars().any(|c| c.is_alphanumeric())
+    })
 }
 
 /// 判断 [`tool_result_summary`] 对给定工具/结果是否直接复用了 `content` 的第一行原文
 /// （而非合成的统计文案，如 "read N lines"/"N matches"）。用于展开正文时跳过重复的首行，
-/// 必须与 `tool_result_summary` 的分支保持一致。
-fn summary_reuses_first_line(name: &str, is_error: bool) -> bool {
+/// 必须与 `tool_result_summary` 的分支保持一致——兜底分支跳过结构性首行取更有信息量
+/// 的行时（此时摘要不等于首行），同样不做去重。
+fn summary_reuses_first_line(name: &str, output: &str, is_error: bool) -> bool {
     if is_error {
         return true;
     }
-    !matches!(
-        name.to_lowercase().as_str(),
-        "read" | "grep" | "glob" | "webfetch"
-    )
+    match name.to_lowercase().as_str() {
+        "read" | "grep" | "glob" | "webfetch" => false,
+        _ => {
+            let first_nonempty = output.lines().find(|l| !l.trim().is_empty());
+            match (first_nonempty, first_informative_line(output)) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3693,22 +3713,43 @@ mod tool_summary_tests {
     /// 其余分支（含 is_error）都是直接复用正文首行，展开正文时必须跳过首行。
     #[test]
     fn summary_reuses_first_line_matches_tool_result_summary_branches() {
+        let plain = "first line\nsecond line\n";
         for name in ["Read", "Grep", "Glob", "WebFetch"] {
             assert!(
-                !summary_reuses_first_line(name, false),
+                !summary_reuses_first_line(name, plain, false),
                 "{name} 的摘要是合成统计文案，不应判定为复用首行"
             );
         }
         for name in ["Bash", "Edit", "Write", "SomeUnknownTool"] {
             assert!(
-                summary_reuses_first_line(name, false),
+                summary_reuses_first_line(name, plain, false),
                 "{name} 的摘要复用了正文首行原文"
             );
         }
         assert!(
-            summary_reuses_first_line("Read", true),
+            summary_reuses_first_line("Read", plain, true),
             "is_error 时摘要恒为正文首行，与工具名无关"
         );
+    }
+
+    /// MCP/JSON 输出的首行往往是无信息量的 `{`：兜底摘要必须跳过结构性行取
+    /// 第一条有内容的行，且此时不做展开去重（摘要不等于正文首行）。
+    #[test]
+    fn fallback_summary_skips_structural_first_line() {
+        let json = "{\n  \"code\": 0,\n  \"data\": []\n}\n";
+        assert_eq!(
+            tool_result_summary("mcp__a-stock__get_quote", json, false),
+            "\"code\": 0,"
+        );
+        assert!(
+            !summary_reuses_first_line("mcp__a-stock__get_quote", json, false),
+            "摘要取的不是首行原文，展开正文不应再去重"
+        );
+
+        // 纯结构输出（不含任何字母数字）回退到首行，仍按复用首行去重
+        let braces = "{\n}\n";
+        assert_eq!(tool_result_summary("SomeUnknownTool", braces, false), "{");
+        assert!(summary_reuses_first_line("SomeUnknownTool", braces, false));
     }
 
     #[test]
@@ -5231,7 +5272,7 @@ impl AppState {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
-                let summary_is_first_line = summary_reuses_first_line(&name, is_error);
+                let summary_is_first_line = summary_reuses_first_line(&name, &output, is_error);
                 // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
                 // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
                 // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
@@ -6104,20 +6145,36 @@ fn has_plan_approved(messages: &[Message]) -> bool {
     false
 }
 
+/// Inline viewport 中聊天区的可视高度上限（终端高度的 70%，理由见
+/// `render::pending_chat_visual_height` 文档）。主循环的 desired_height 计算
+/// 与冻结豁免判定共用，保证"显示得下/显示不下"的判断口径一致。
+fn chat_viewport_cap(term_height: u16) -> u16 {
+    (term_height * 7 / 10).max(3)
+}
+
 /// 冻结判定用的"最后可折叠 ToolResult"封顶（`compute_freezable_up_to` 的
-/// `collapsible_idx` 参数）。AskQuestion 面板打开期间豁免该封顶：面板拦截
-/// 全部按键，用户本就无法选中/展开 ToolResult，保留封顶只会把面板之前的
-/// 长正文（模型提问前输出的分析等）一起困在 Inline viewport 里，超出可视
-/// 高度的部分既不在屏幕上也不在终端 scrollback 里，彻底不可见。豁免后这些
-/// 内容冻结进 scrollback（可用鼠标滚轮回看），待定尾部只剩未完成的
-/// AskQuestion ToolCall 行 + 面板本身——规则①仍保证冻结边界不越过该 ToolCall。
-/// 代价：作答完成后这些更早的 ToolResult 成为静态历史，不能再展开/收起。
-fn freeze_collapsible_bound(state: &AppState) -> Option<usize> {
+/// `collapsible_idx` 参数）。保留封顶的目的是让用户还能对最后一条 ToolResult
+/// Ctrl+O 展开/收起，但它会把该 ToolResult 之后的全部内容（如模型输出的长
+/// markdown 正文）一起困在 Inline viewport 的待定尾部——尾部一旦超过聊天区
+/// 可视上限，超出部分既不在屏幕上也不在终端 scrollback 里，用户完全看不到。
+/// 因此**可见性优先**，以下两种情况豁免封顶、放行冻结进 scrollback（此后可
+/// 用鼠标滚轮回看，代价是这些消息成为静态历史、不能再展开/收起）：
+/// - 待定尾部实际渲染高度超过 `chat_viewport_cap`（本帧注定显示不全）；
+/// - AskQuestion 面板打开期间（面板拦截全部按键，Ctrl+O 本就不可用）。
+///
+/// 未完成 ToolCall / 运行中子 Agent 的冻结阻塞（规则①③）不受此豁免影响。
+fn freeze_collapsible_bound(
+    state: &mut AppState,
+    term_width: u16,
+    term_height: u16,
+) -> Option<usize> {
     if state.ask_question_dialog.is_some() {
-        None
-    } else {
-        render::last_collapsible_tool_result_idx(&state.messages)
+        return None;
     }
+    if render::pending_chat_visual_height(state, term_width) > chat_viewport_cap(term_height) {
+        return None;
+    }
+    render::last_collapsible_tool_result_idx(&state.messages)
 }
 
 fn freeze_ready_scrollback(
@@ -6132,17 +6189,18 @@ fn freeze_ready_scrollback(
     }
 
     state.frozen_up_to = state.frozen_up_to.min(state.messages.len());
+    let term_size = terminal.size()?;
+    let collapsible_bound = freeze_collapsible_bound(state, term_size.width, term_size.height);
     let new_bound = compute_freezable_up_to(
         &state.messages,
         state.frozen_up_to,
         &state.sub_agents,
-        freeze_collapsible_bound(state),
+        collapsible_bound,
     );
     if new_bound <= state.frozen_up_to {
         return Ok(false);
     }
 
-    let term_size = terminal.size()?;
     let max_content_width = term_size.width.saturating_sub(2) as usize;
     let lines = render::build_frozen_chat_lines(state, new_bound, max_content_width);
     if lines.is_empty() {
@@ -7065,7 +7123,7 @@ async fn tui_main(
             let footer_fixed =
                 render::fixed_footer_height(&state, &input, term_size.width, term_size.height);
             let chat_h = render::pending_chat_visual_height(&mut state, term_size.width)
-                .clamp(3, (term_size.height * 7 / 10).max(3));
+                .clamp(3, chat_viewport_cap(term_size.height));
             let desired_height = (footer_fixed + chat_h).min(term_size.height).max(1);
             if desired_height != current_inline_height {
                 terminal.clear()?;
@@ -11104,12 +11162,7 @@ mod ask_question_dialog_tests {
         assert!(state.selected_message_anchor.is_none());
     }
 
-    /// AskQuestion 面板打开期间豁免"最后可折叠 ToolResult"对冻结边界的封顶，
-    /// 让面板之前的长正文得以冻结进终端 scrollback（规则①仍会把边界卡在
-    /// 未完成的 AskQuestion ToolCall 上）；面板关闭后封顶恢复。
-    #[test]
-    fn freeze_collapsible_bound_exempted_while_dialog_open() {
-        let mut state = make_state();
+    fn push_call_result_pair(state: &mut AppState) {
         state.push_message(ChatMessage::tool_call("Read(x)".to_string(), 1));
         state.push_message(ChatMessage::tool_result(
             (1..=10)
@@ -11123,16 +11176,47 @@ mod ask_question_dialog_tests {
             "line-1".to_string(),
             false,
         ));
-        state.push_message(ChatMessage::assistant("提问前的长分析正文".to_string()));
+    }
 
-        assert_eq!(freeze_collapsible_bound(&state), Some(1));
+    /// AskQuestion 面板打开期间豁免"最后可折叠 ToolResult"对冻结边界的封顶，
+    /// 让面板之前的长正文得以冻结进终端 scrollback（规则①仍会把边界卡在
+    /// 未完成的 AskQuestion ToolCall 上）；面板关闭后封顶恢复。
+    #[test]
+    fn freeze_collapsible_bound_exempted_while_dialog_open() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        push_call_result_pair(&mut state);
+        state.push_message(ChatMessage::assistant("提问前的短正文".to_string()));
+
+        // 120x60 → 聊天区上限 42 行，十几行内容显示得下，封顶保留
+        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), Some(1));
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state.ask_question_dialog = Some(AskQuestionDialog::new(vec![single_spec("Q1")], tx));
-        assert_eq!(freeze_collapsible_bound(&state), None);
+        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), None);
 
         state.ask_question_dialog = None;
-        assert_eq!(freeze_collapsible_bound(&state), Some(1));
+        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), Some(1));
+    }
+
+    /// 待定尾部实际渲染高度超过聊天区可视上限时豁免封顶（可见性优先）：
+    /// 长 markdown 正文不再被"最后可折叠 ToolResult"困在 Inline viewport
+    /// 里裁掉——冻结进终端 scrollback 后可用鼠标滚轮回看。
+    #[test]
+    fn freeze_collapsible_bound_exempted_when_pending_tail_overflows() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        push_call_result_pair(&mut state);
+        let long_md = (1..=40)
+            .map(|i| format!("第 {i} 节：很长的分析正文"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        state.push_message(ChatMessage::assistant(long_md));
+
+        // 120x24 → 上限 16 行，约 90 行内容注定显示不全 → 豁免封顶
+        assert_eq!(freeze_collapsible_bound(&mut state, 120, 24), None);
+        // 120x300 → 上限 210 行，显示得下 → 封顶保留（Ctrl+O 交互不牺牲）
+        assert_eq!(freeze_collapsible_bound(&mut state, 120, 300), Some(1));
     }
 }
 
