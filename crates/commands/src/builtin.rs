@@ -283,6 +283,26 @@ impl Command for PluginsCmd {
     }
 }
 
+// ── /extensions ───────────────────────────────────────────────────────────────
+
+pub struct ExtensionsCmd;
+
+#[async_trait]
+impl Command for ExtensionsCmd {
+    fn name(&self) -> &str {
+        "extensions"
+    }
+    fn description(&self) -> String {
+        "统一查看和诊断 Skill / MCP / Plugin 资源".to_string()
+    }
+    fn usage(&self) -> String {
+        "/extensions".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenExtensionsDialog)
+    }
+}
+
 // ── /agents ───────────────────────────────────────────────────────────────────
 
 pub struct AgentsCmd;
@@ -1001,6 +1021,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(McpCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
+    reg.register(Arc::new(ExtensionsCmd));
     reg.register(Arc::new(BugCmd));
     reg.register(Arc::new(ReviewCmd));
     reg.register(Arc::new(PrCommentsCmd));

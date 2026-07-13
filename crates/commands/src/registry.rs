@@ -47,6 +47,8 @@ pub enum CommandResult {
     OpenSkillsDialog,
     /// 打开插件管理面板（/plugins 命令触发）
     OpenPluginsDialog,
+    /// 打开统一资源中心（/extensions 命令触发）
+    OpenExtensionsDialog,
     /// 打开可用 Agent 类型交互面板（/agents 命令触发）。
     /// TUI 使用 `defs` 渲染列表与详情；headless 使用 `fallback_text` 保持纯文本输出。
     OpenAgentsDialog {

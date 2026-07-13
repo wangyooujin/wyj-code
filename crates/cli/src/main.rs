@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
-use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
+use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistry, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
@@ -13,6 +13,7 @@ use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
 };
 
+mod extensions_cmd;
 mod update_cmd;
 
 #[derive(Parser, Debug)]
@@ -62,6 +63,11 @@ enum Commands {
         sub_id: Option<u64>,
         #[arg(long, help = wyj_i18n::tr("cli.subagent_trace_json_help"))]
         json: bool,
+    },
+    #[command(name = "extensions", about = "Manage Skill, MCP and Plugin resources")]
+    Extensions {
+        #[command(subcommand)]
+        command: extensions_cmd::ExtensionCommand,
     },
 }
 
@@ -241,6 +247,10 @@ async fn main() -> Result<()> {
                 sub_id,
                 json,
             } => return run_subagent_trace_cmd(&session_id, sub_id, json),
+            Commands::Extensions { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return extensions_cmd::run(command, &cwd).await;
+            }
         }
     }
 
@@ -540,6 +550,8 @@ async fn main() -> Result<()> {
         plugin_agent_paths.extend(local.agent_paths.clone());
     }
     let agent_defs = Arc::new(wyj_core::load_agent_defs(&cwd, &plugin_agent_paths));
+    let shared_agent_defs: wyj_tools::SharedAgentDefinitions =
+        Arc::new(std::sync::RwLock::new((*agent_defs).clone()));
     // 子 Agent 执行轨迹落盘（`SubAgentCfg::trace_enabled`，默认开启）：与
     // TUI/headless 共用同一个 Hub，`emit()` 集中接入，两端自动获得持久化能力。
     let sub_agent_hub = Arc::new(if cfg.subagent.trace_enabled {
@@ -557,8 +569,8 @@ async fn main() -> Result<()> {
     let mcp_tools: wyj_tools::SharedMcpTools = Arc::new(std::sync::RwLock::new(Vec::new()));
     let sub_agent_factory =
         make_sub_agent_factory(cfg.clone(), claude_md_loader.clone(), mcp_tools.clone());
-    registry.register_arc(Arc::new(SubAgentTool::new(
-        agent_defs.clone(),
+    registry.register_arc(Arc::new(SubAgentTool::new_shared(
+        shared_agent_defs.clone(),
         sub_agent_hub.clone(),
         {
             let f = sub_agent_factory.clone();
@@ -813,6 +825,73 @@ async fn main() -> Result<()> {
 
     let context_window = cfg.active_profile().context_window;
 
+    // Shared rebuild path for TUI profile switching and headless Skill
+    // `model:` frontmatter.  It deliberately reuses the current MCP snapshot,
+    // so a scoped Skill Agent sees exactly the same tools as the next normal
+    // turn without changing the session's active profile.
+    let todo_store_for_rebuild = todo_store.clone();
+    let agent_defs_for_rebuild = shared_agent_defs.clone();
+    let hub_for_rebuild = sub_agent_hub.clone();
+    let store_for_rebuild = session_store_arc.clone();
+    let sid_for_rebuild = session_id.clone();
+    let cwd_for_rebuild = cwd.clone();
+    let hook_runner_for_rebuild = hook_runner.clone();
+    let mcp_tools_for_rebuild = mcp_tools.clone();
+    let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
+        let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
+        let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
+        let mut new_agent = Agent::new(provider)
+            .with_system(wyj_core::prompts::main_system_prompt(&env_info))
+            .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
+            .with_max_tokens(cfg.active_profile().max_tokens)
+            .with_context_window(cfg.active_profile().context_window)
+            .with_thinking(
+                cfg.active_profile().thinking_budget,
+                cfg.active_profile().interleaved_thinking,
+            )
+            .with_claude_md(claude_md_for_rebuild.clone())
+            .with_hooks(hook_runner_for_rebuild.clone());
+        if let Some(mem) = &memory_store_for_rebuild {
+            new_agent = new_agent.with_memory(mem.clone());
+        }
+        if let Some(store) = &store_for_rebuild {
+            let title_provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("重建后标题生成器 provider 构建失败: {e}");
+                    wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
+                });
+            let gen = Arc::new(SummaryGenerator::new(store.clone(), title_provider));
+            new_agent = new_agent
+                .with_summary(gen)
+                .with_session_id(sid_for_rebuild.clone());
+        }
+        let mut reg = ToolRegistry::standard();
+        reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
+        reg.register_arc(Arc::new(AskQuestionTool::new()));
+        if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
+            reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
+        }
+        for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
+            reg.register_arc(tool.clone());
+        }
+        let sub_factory = make_sub_agent_factory(
+            cfg.clone(),
+            claude_md_for_rebuild.clone(),
+            mcp_tools_for_rebuild.clone(),
+        );
+        reg.register_arc(Arc::new(SubAgentTool::new_shared(
+            agent_defs_for_rebuild.clone(),
+            hub_for_rebuild.clone(),
+            move |def| sub_factory(def),
+        )));
+        for def in reg.definitions() {
+            if let Some(t) = reg.get(&def.name) {
+                new_agent.register_tool(t);
+            }
+        }
+        Ok(new_agent)
+    });
+
     if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
         session.messages = initial_messages;
@@ -898,6 +977,7 @@ async fn main() -> Result<()> {
     } else if cli.headless {
         repl(
             agent,
+            rebuild_fn.clone(),
             tool_ctx,
             history_store,
             session_store_arc.clone(),
@@ -905,79 +985,14 @@ async fn main() -> Result<()> {
             cwd,
             initial_messages,
             cfg.clone(),
+            mode.clone(),
+            shared_agent_defs.clone(),
             local_plugin.clone(),
             !cli.no_hooks,
             mcp_tools.clone(),
         )
         .await?;
     } else {
-        let todo_store_for_rebuild = todo_store.clone();
-        let agent_defs_for_rebuild = agent_defs.clone();
-        let hub_for_rebuild = sub_agent_hub.clone();
-        let store_for_rebuild = session_store_arc.clone();
-        let sid_for_rebuild = session_id.clone();
-        let cwd_for_rebuild = cwd.clone();
-        let hook_runner_for_rebuild = hook_runner.clone();
-        let mcp_tools_for_rebuild = mcp_tools.clone();
-        let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
-            let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
-            let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
-            let mut new_agent = Agent::new(provider)
-                .with_system(wyj_core::prompts::main_system_prompt(&env_info))
-                .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
-                .with_max_tokens(cfg.active_profile().max_tokens)
-                .with_context_window(cfg.active_profile().context_window)
-                .with_thinking(
-                    cfg.active_profile().thinking_budget,
-                    cfg.active_profile().interleaved_thinking,
-                )
-                .with_claude_md(claude_md_for_rebuild.clone())
-                .with_hooks(hook_runner_for_rebuild.clone());
-            if let Some(mem) = &memory_store_for_rebuild {
-                new_agent = new_agent.with_memory(mem.clone());
-            }
-            // 重建后保留会话标题生成能力
-            if let Some(store) = &store_for_rebuild {
-                let title_provider =
-                    wyj_api::build_provider_from_profile(cfg.active_profile(), None)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!("重建后标题生成器 provider 构建失败: {e}");
-                            wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
-                        });
-                let gen = Arc::new(SummaryGenerator::new(store.clone(), title_provider));
-                new_agent = new_agent
-                    .with_summary(gen)
-                    .with_session_id(sid_for_rebuild.clone());
-            }
-            let mut reg = ToolRegistry::standard();
-            reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
-            reg.register_arc(Arc::new(AskQuestionTool::new()));
-            if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
-                reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
-            }
-            // 重建前已连接的 MCP 工具不应丢失（此前的 bug：/model 切换会清空
-            // 后台连好的 MCP 工具，因为这里总是从空的 ToolRegistry::standard() 重建）
-            for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
-                reg.register_arc(tool.clone());
-            }
-            // 用重建时的最新配置构建子 Agent 工厂，保证 Profile 变更即时生效
-            let sub_factory = make_sub_agent_factory(
-                cfg.clone(),
-                claude_md_for_rebuild.clone(),
-                mcp_tools_for_rebuild.clone(),
-            );
-            reg.register_arc(Arc::new(SubAgentTool::new(
-                agent_defs_for_rebuild.clone(),
-                hub_for_rebuild.clone(),
-                move |def| sub_factory(def),
-            )));
-            for def in reg.definitions() {
-                if let Some(t) = reg.get(&def.name) {
-                    new_agent.register_tool(t);
-                }
-            }
-            Ok(new_agent)
-        });
         wyj_tui::run_tui(
             agent,
             rebuild_fn,
@@ -995,6 +1010,7 @@ async fn main() -> Result<()> {
             sub_agent_hub.clone(),
             local_plugin.clone(),
             mcp_tools.clone(),
+            shared_agent_defs,
         )
         .await?;
     }
@@ -1098,41 +1114,111 @@ fn make_sub_agent_factory(
     })
 }
 
-/// `--headless` REPL 每轮开始前非阻塞排空一次后台 MCP 连接结果（`try_recv`
-/// 而非 `recv`，队列为空时立即返回，不拖慢当前轮次）。成功的连接克隆当前
-/// Agent 快照、注册新工具、原子换回 `shared_agent`，与 TUI `tui_main` 里
-/// `/model` 热切换同一套手法一致。
-async fn drain_mcp_connections(
-    mcp_rx: &mut tokio::sync::mpsc::Receiver<(
-        String,
-        Result<Vec<wyj_mcp::bridge::McpBridgeTool>, String>,
-    )>,
-    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
-    mcp_tools: &wyj_tools::SharedMcpTools,
-) {
-    while let Ok((name, result)) = mcp_rx.try_recv() {
-        match result {
-            Ok(tools) => {
-                let count = tools.len();
-                let mut new_agent = (**shared_agent.read().unwrap()).clone();
-                for tool in tools {
-                    let t: Arc<dyn wyj_tools::Tool> = Arc::new(tool);
-                    mcp_tools.write().unwrap().push(t.clone());
-                    new_agent.register_tool(t);
-                }
-                *shared_agent.write().unwrap() = Arc::new(new_agent);
-                println!("[MCP {name}] 已连接，{count} 个工具已就绪");
-            }
-            Err(e) => {
-                eprintln!("[MCP {name}] 连接失败: {e}");
+/// 返回当前进程应当使用的 MCP 配置。项目配置和启用插件贡献在每个 Agent
+/// 边界重新读取，因此 `/extensions enable|disable|remove` 不需要重启进程。
+fn effective_mcp_servers_for_runtime(
+    cfg: &Config,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) -> Vec<wyj_config::McpServerConfig> {
+    let mut servers = wyj_store::mcp_install::effective_mcp_servers(cfg, cwd);
+    if let Some(local) = local_plugin {
+        let mut names: std::collections::HashSet<String> =
+            servers.iter().map(|server| server.name.clone()).collect();
+        for server in &local.mcp_servers {
+            if names.insert(server.name.clone()) {
+                servers.push(server.clone());
             }
         }
     }
+    servers
+}
+
+fn refresh_agent_definitions(
+    shared_defs: &wyj_tools::SharedAgentDefinitions,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) {
+    let mut sources = wyj_store::plugin_install::enabled_plugin_agent_paths(cwd);
+    if let Some(local) = local_plugin {
+        sources.extend(local.agent_paths.clone());
+    }
+    let defs = wyj_core::load_agent_defs(cwd, &sources);
+    if let Ok(mut current) = shared_defs.write() {
+        *current = defs;
+    }
+    let mut agent = (**shared_agent.read().unwrap()).clone();
+    agent.refresh_tool_definitions();
+    *shared_agent.write().unwrap() = Arc::new(agent);
+}
+
+/// 在安全 Agent 边界原子替换 MCP 工具快照。
+///
+/// `Agent` 是按回合读取的不可变快照：正在执行的旧快照可以安全完成，下一回合
+/// 读取到的新快照则只包含 runtime 当前仍然连接且启用的 server。共享给子 Agent
+/// 工厂和 profile 重建的工具列表也同步替换，避免出现主 Agent 与子 Agent 看到的
+/// MCP 集合不一致。
+fn apply_mcp_runtime_snapshot(
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    mcp_tools: &wyj_tools::SharedMcpTools,
+) {
+    let tools = runtime_tools(mcp_tools);
+    let mut new_agent = (**shared_agent.read().unwrap()).clone();
+    new_agent.remove_tools_where(|name| name.starts_with("mcp__"));
+    for tool in &tools {
+        new_agent.register_tool(tool.clone());
+    }
+    *shared_agent.write().unwrap() = Arc::new(new_agent);
+}
+
+fn runtime_tools(mcp_tools: &wyj_tools::SharedMcpTools) -> Vec<Arc<dyn wyj_tools::Tool>> {
+    mcp_tools.read().unwrap().clone()
+}
+
+fn refresh_mcp_runtime(
+    runtime: &mut wyj_mcp::McpRuntime,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    mcp_tools: &wyj_tools::SharedMcpTools,
+    fallback_cfg: &Config,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) {
+    let live_cfg = wyj_config::Config::load().unwrap_or_else(|e| {
+        tracing::debug!("读取运行时配置失败，继续使用启动配置: {e}");
+        fallback_cfg.clone()
+    });
+    let servers = effective_mcp_servers_for_runtime(&live_cfg, cwd, local_plugin);
+    for event in runtime.reconcile(&servers) {
+        if let wyj_mcp::McpRuntimeEvent::Removed { name } = event {
+            println!("[MCP {name}] 已从下一回合工具快照移除");
+        }
+    }
+    for event in runtime.drain() {
+        match event {
+            wyj_mcp::McpRuntimeEvent::Connected { name, tool_count } => {
+                println!("[MCP {name}] 已连接，{tool_count} 个工具已就绪");
+            }
+            wyj_mcp::McpRuntimeEvent::Failed { name, reason } => {
+                eprintln!("[MCP {name}] 连接失败: {reason}");
+            }
+            wyj_mcp::McpRuntimeEvent::Removed { name } => {
+                println!("[MCP {name}] 已从下一回合工具快照移除");
+            }
+        }
+    }
+    let snapshot = runtime.tools();
+    {
+        let mut shared = mcp_tools.write().unwrap();
+        *shared = snapshot;
+    }
+    apply_mcp_runtime_snapshot(shared_agent, mcp_tools);
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn repl(
     agent: Agent,
+    rebuild_fn: wyj_tui::RebuildFn,
     ctx: ToolCtx,
     history_store: Option<HistoryStore>,
     session_store: Option<Arc<SessionStore>>,
@@ -1140,6 +1226,8 @@ async fn repl(
     cwd: std::path::PathBuf,
     initial_messages: Vec<wyj_api::types::Message>,
     cfg: Config,
+    mode: AgentMode,
+    shared_agent_defs: wyj_tools::SharedAgentDefinitions,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     hooks_enabled: bool,
     mcp_tools: wyj_tools::SharedMcpTools,
@@ -1156,17 +1244,9 @@ async fn repl(
     let repl_home = std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
-    let disabled_skills = wyj_store::disabled_skill_names(&cwd);
-    let mut plugin_skill_sources = wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
-    let mut plugin_agent_paths = wyj_store::plugin_install::enabled_plugin_agent_paths(&cwd);
-    let mut effective_mcp_count = wyj_store::mcp_install::effective_mcp_servers(&cfg, &cwd).len();
-    if let Some(local) = &local_plugin {
-        plugin_skill_sources.extend(local.skill_paths.clone());
-        plugin_agent_paths.extend(local.agent_paths.clone());
-        effective_mcp_count += local.mcp_servers.len();
-    }
-    let cmd_registry =
-        standard_registry_with_skills(&repl_home, &cwd, &disabled_skills, &plugin_skill_sources);
+    let mut plugin_agent_paths: Vec<std::path::PathBuf>;
+    let mut effective_mcp_count: usize;
+    let mut cmd_registry: Arc<CommandRegistry>;
 
     // `--headless` 多轮 REPL 对称于 TUI 的 MCP 连接方案：不在启动时同步等待
     // （那是 -p 单轮模式的做法，见上方 main() 里的宽限期逻辑），而是后台连接、
@@ -1175,36 +1255,12 @@ async fn repl(
     // 决定了"本轮开始后新连上的工具在这一轮不生效，下一轮才可见"——这是 TUI
     // 架构本来就有、已被接受的行为，此处对称搬过来，不重新设计。
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
-    let (mcp_tx, mut mcp_rx) = tokio::sync::mpsc::channel::<(
-        String,
-        Result<Vec<wyj_mcp::bridge::McpBridgeTool>, String>,
-    )>(16);
-    {
-        let mut effective_mcp_servers = wyj_store::mcp_install::effective_mcp_servers(&cfg, &cwd);
-        if let Some(local) = &local_plugin {
-            effective_mcp_servers.extend(local.mcp_servers.clone());
-        }
-        for mcp_cfg in effective_mcp_servers {
-            let tx = mcp_tx.clone();
-            tokio::spawn(async move {
-                let name = mcp_cfg.name.clone();
-                let result = tokio::time::timeout(
-                    wyj_mcp::bridge::MCP_CONNECT_TIMEOUT,
-                    wyj_mcp::bridge::connect_mcp_server(&mcp_cfg),
-                )
-                .await;
-                let mapped = match result {
-                    Ok(Ok(tools)) => Ok(tools),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(format!(
-                        "连接超时（>{}s）",
-                        wyj_mcp::bridge::MCP_CONNECT_TIMEOUT.as_secs()
-                    )),
-                };
-                let _ = tx.send((name, mapped)).await;
-            });
-        }
-    }
+    let mut mcp_runtime = wyj_mcp::McpRuntime::new();
+    mcp_runtime.reconcile(&effective_mcp_servers_for_runtime(
+        &cfg,
+        &cwd,
+        local_plugin.as_ref(),
+    ));
 
     loop {
         print!("\n> ");
@@ -1249,6 +1305,43 @@ async fn repl(
         let home_dir = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
+        // Resource mutations are observed here, immediately before command
+        // dispatch.  This is the safe boundary between two Agent turns.
+        refresh_mcp_runtime(
+            &mut mcp_runtime,
+            &shared_agent,
+            &mcp_tools,
+            &cfg,
+            &cwd,
+            local_plugin.as_ref(),
+        );
+        refresh_agent_definitions(
+            &shared_agent_defs,
+            &shared_agent,
+            &cwd,
+            local_plugin.as_ref(),
+        );
+        plugin_agent_paths = wyj_store::plugin_install::enabled_plugin_agent_paths(&cwd);
+        if let Some(local) = &local_plugin {
+            plugin_agent_paths.extend(local.agent_paths.clone());
+        }
+        let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());
+        effective_mcp_count =
+            effective_mcp_servers_for_runtime(&live_cfg, &cwd, local_plugin.as_ref()).len();
+        // Reload dynamic Skill/Plugin command sources at every input boundary. This
+        // makes enable/disable and edits visible in the next command without a restart.
+        let disabled_skills = wyj_store::disabled_skill_names(&cwd);
+        let mut current_plugin_skill_sources =
+            wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
+        if let Some(local) = &local_plugin {
+            current_plugin_skill_sources.extend(local.skill_paths.clone());
+        }
+        cmd_registry = standard_registry_with_skills(
+            &repl_home,
+            &cwd,
+            &disabled_skills,
+            &current_plugin_skill_sources,
+        );
         let dynamic_commands: Vec<(String, String, String)> = cmd_registry
             .list()
             .iter()
@@ -1292,7 +1385,6 @@ async fn repl(
                     session.push_user(prompt);
                     turns += 1;
                     println!();
-                    drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
                     let agent_snapshot = shared_agent.read().unwrap().clone();
                     if let Err(e) = agent_snapshot
                         .run_turn(&mut session, &ctx, &mut |d| {
@@ -1311,17 +1403,34 @@ async fn repl(
                 Ok(CommandResult::RunPromptScoped {
                     text,
                     allowed_tools,
-                    profile: _,
+                    profile,
                 }) => {
                     // 带 allowed-tools 的自定义命令：临时把权限模式收紧为 Allowlist，
                     // 跑完这一轮（无论成功失败）都还原快照，不影响 --plan/--bypass-permissions
-                    // 等其他模式设定的基线权限。`profile`（model: frontmatter 字段）本版本
-                    // 仅解析存储、不做运行期切换，此处忽略。
+                    // 等其他模式设定的基线权限。`model:` 只影响这一轮，不改变当前会话
+                    // 的 active profile。
+                    let agent_snapshot = if let Some(profile_name) = profile {
+                        let mut scoped_cfg =
+                            wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());
+                        if scoped_cfg.profile_by_name(&profile_name).is_none() {
+                            eprintln!("[skill] 未找到 Profile: {profile_name}");
+                            continue;
+                        }
+                        scoped_cfg.active_profile = profile_name;
+                        let scoped_model = scoped_cfg.model_for_mode(&mode).to_string();
+                        match rebuild_fn(&scoped_cfg, &scoped_model) {
+                            Ok(agent) => Arc::new(agent),
+                            Err(e) => {
+                                eprintln!("[skill] 构造临时 Profile Agent 失败: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        shared_agent.read().unwrap().clone()
+                    };
                     session.push_user(text);
                     turns += 1;
                     println!();
-                    drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
-                    let agent_snapshot = shared_agent.read().unwrap().clone();
                     let prev_mode = ctx.permission_mode.read().unwrap().clone();
                     if let Some(tools) = allowed_tools {
                         ctx.set_permission_mode(PermissionMode::Allowlist(
@@ -1368,6 +1477,12 @@ async fn repl(
                 Ok(CommandResult::OpenPluginsDialog) => {
                     println!("{}", wyj_i18n::tr("plugins.headless_unsupported"));
                 }
+                Ok(CommandResult::OpenExtensionsDialog) => {
+                    match wyj_store::extensions::doctor(&cwd) {
+                        Ok(report) => println!("{}", serde_json::to_string_pretty(&report)?),
+                        Err(e) => eprintln!("[extensions] {e}"),
+                    }
+                }
                 Ok(CommandResult::OpenAgentsDialog { fallback_text, .. }) => {
                     println!("{fallback_text}");
                 }
@@ -1400,7 +1515,6 @@ async fn repl(
         session.push_user(trimmed);
         turns += 1;
         println!();
-        drain_mcp_connections(&mut mcp_rx, &shared_agent, &mcp_tools).await;
         let agent_snapshot = shared_agent.read().unwrap().clone();
         if let Err(e) = agent_snapshot
             .run_turn(&mut session, &ctx, &mut |d| {

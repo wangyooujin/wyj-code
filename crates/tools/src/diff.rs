@@ -18,9 +18,9 @@ pub fn make_diff(old: &str, new: &str, max_lines: usize) -> String {
     let mut out = String::new();
     let mut emitted = 0usize;
 
-    for change in diff.iter_all_changes() {
+    for (emitted_idx, change) in diff.iter_all_changes().enumerate() {
         if emitted >= max_lines {
-            let rest = diff.iter_all_changes().count().saturating_sub(emitted);
+            let rest = diff.iter_all_changes().count().saturating_sub(emitted_idx);
             out.push_str(&format!("…(truncated, {rest} more lines)\n"));
             break;
         }
@@ -36,7 +36,7 @@ pub fn make_diff(old: &str, new: &str, max_lines: usize) -> String {
         if !value.ends_with('\n') {
             out.push('\n');
         }
-        emitted += 1;
+        emitted = emitted_idx + 1;
     }
 
     // 移除末尾多余换行
@@ -52,16 +52,16 @@ pub fn make_added(content: &str, max_lines: usize) -> String {
     let mut emitted = 0usize;
     let total = content.lines().count();
 
-    for line in content.lines() {
+    for (emitted_idx, line) in content.lines().enumerate() {
         if emitted >= max_lines {
-            let rest = total.saturating_sub(emitted);
+            let rest = total.saturating_sub(emitted_idx);
             out.push_str(&format!("…(truncated, {rest} more lines)\n"));
             break;
         }
         out.push_str("+ ");
         out.push_str(line);
         out.push('\n');
-        emitted += 1;
+        emitted = emitted_idx + 1;
     }
 
     if out.ends_with('\n') {

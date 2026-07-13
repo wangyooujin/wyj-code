@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["owen"]
@@ -59,6 +59,7 @@ httpdate = "1"
 # 其他工具
 futures = "0.3"
 bytes = "1"
+http = "1"
 # 进程组信号（BashSessionManager kill）
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }

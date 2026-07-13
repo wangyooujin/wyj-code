@@ -11,7 +11,39 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use wyj_config::McpServerConfig;
 
-pub const LOCKFILE_VERSION: u32 = 1;
+pub const LOCKFILE_VERSION: u32 = 2;
+
+/// 统一资源类型。旧版的 mcp_servers/skills/plugins 数组继续保留，供兼容读取；
+/// 新代码可以用 `extensions` 做跨类型查询和诊断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionKind {
+    Skill,
+    Agent,
+    Mcp,
+    Plugin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtensionLockEntry {
+    pub id: String,
+    pub kind: ExtensionKind,
+    pub scope: InstallScope,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    pub installed_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +68,9 @@ pub struct InstalledManifest {
     pub plugins: Vec<InstalledPluginEntry>,
     /// 仅全局 lockfile 使用；插件 marketplace 源不区分 scope。
     pub plugin_marketplaces: Vec<PluginMarketplaceSource>,
+    /// v2 统一资源索引。旧数组仍然是配置/运行时的兼容来源，迁移完成后由
+    /// extensions 模块逐步补齐此索引。
+    pub extensions: Vec<ExtensionLockEntry>,
 }
 
 impl InstalledManifest {
@@ -48,6 +83,7 @@ impl InstalledManifest {
             mcp_registries: Vec::new(),
             plugins: Vec::new(),
             plugin_marketplaces: Vec::new(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -218,8 +254,10 @@ fn load_from(path: &Path) -> Result<InstalledManifest> {
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取 lockfile 失败: {}", path.display()))?;
-    let manifest: InstalledManifest = serde_json::from_str(&content)
+    let mut manifest: InstalledManifest = serde_json::from_str(&content)
         .with_context(|| format!("解析 lockfile 失败: {}", path.display()))?;
+    // v1 文件缺少统一 extensions 数组；保留所有旧字段并在下次写入时升级。
+    manifest.version = LOCKFILE_VERSION;
     Ok(manifest)
 }
 
@@ -229,7 +267,33 @@ fn save_to(path: &Path, manifest: &InstalledManifest) -> Result<()> {
             .with_context(|| format!("创建 lockfile 目录失败: {}", parent.display()))?;
     }
     let content = serde_json::to_string_pretty(manifest).context("序列化 lockfile 失败")?;
-    std::fs::write(path, content).with_context(|| format!("写入 lockfile 失败: {}", path.display()))
+    // Write beside the destination and rename only after the complete JSON is
+    // on disk.  A killed process or a full volume must never leave a truncated
+    // installed.json that makes every extension appear missing on next start.
+    let nonce = format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let tmp = path.with_file_name(format!(
+        "{}.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("installed.json"),
+        nonce
+    ));
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("写入 lockfile 失败: {}", path.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("替换 lockfile 失败: {}", path.display()));
+    }
+    Ok(())
 }
 
 pub fn load_global() -> Result<InstalledManifest> {
@@ -328,6 +392,18 @@ pub fn save_scope(scope: InstallScope, cwd: &Path, manifest: &InstalledManifest)
     }
 }
 
+pub fn upsert_extension(manifest: &mut InstalledManifest, entry: ExtensionLockEntry) {
+    if let Some(existing) = manifest.extensions.iter_mut().find(|x| x.id == entry.id) {
+        *existing = entry;
+    } else {
+        manifest.extensions.push(entry);
+    }
+}
+
+pub fn remove_extension(manifest: &mut InstalledManifest, id: &str) {
+    manifest.extensions.retain(|x| x.id != id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +456,19 @@ mod tests {
             installed_at: Utc::now(),
             updated_at: Utc::now(),
         });
+        manifest.extensions.push(ExtensionLockEntry {
+            id: "mcp:postgres".to_string(),
+            kind: ExtensionKind::Mcp,
+            scope: InstallScope::Global,
+            source: Some("registry".to_string()),
+            version: Some("1.2.3".to_string()),
+            commit: None,
+            digest: None,
+            enabled: true,
+            dependencies: vec![],
+            installed_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
         save_to(&path, &manifest).unwrap();
 
         let loaded = load_from(&path).unwrap();
@@ -387,6 +476,7 @@ mod tests {
         assert_eq!(loaded.mcp_servers[0].name, "postgres");
         assert_eq!(loaded.mcp_servers[0].version.as_deref(), Some("1.2.3"));
         assert!(loaded.mcp_servers[0].is_managed());
+        assert_eq!(loaded.extensions[0].id, "mcp:postgres");
     }
 
     #[test]

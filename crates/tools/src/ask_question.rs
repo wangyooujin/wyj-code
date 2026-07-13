@@ -10,6 +10,12 @@ use wyj_core::tool::{
 
 pub struct AskQuestionTool;
 
+impl Default for AskQuestionTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AskQuestionTool {
     pub fn new() -> Self {
         Self

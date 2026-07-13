@@ -17,8 +17,9 @@ use wyj_api::{
 
 const MEMORY_INDEX: &str = "MEMORY.md";
 const MAX_INDEX_ENTRIES: usize = 200;
-/// 注入 system prompt 的记忆正文总字符上限，超限截断（避免 system prompt 臃肿）。
-const MAX_CONTEXT_CHARS: usize = 8_000;
+/// 注入 system prompt 的记忆正文总字节上限，超限时在 UTF-8 字符边界截断。
+const MAX_CONTEXT_BYTES: usize = 8_000;
+const TRUNCATION_NOTICE: &str = "\n\n（记忆已截断，仅显示部分）";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MemoryItem {
@@ -82,14 +83,14 @@ impl MemoryStore {
             _ => return String::new(),
         };
 
-        let mut file_bodies: Vec<String> = vec![];
+        let mut file_bodies: Vec<(String, String)> = vec![];
         for line in index.lines() {
             if let Some(fname) = md_link_target(line) {
                 let fpath = self.dir.join(&fname);
                 if let Ok(content) = std::fs::read_to_string(&fpath) {
                     let body = strip_frontmatter(&content);
                     if !body.trim().is_empty() {
-                        file_bodies.push(body.trim().to_string());
+                        file_bodies.push((fname, body.trim().to_string()));
                     }
                 }
             }
@@ -99,21 +100,38 @@ impl MemoryStore {
             return String::new();
         }
 
-        // 拼接时限制总字符数，超限截断（避免 system prompt 臃肿影响缓存命中率）
+        // 用户明确偏好与反馈必须优先于一般项目/参考信息；旧实现按文件名字母序
+        // 截断，记忆积累后 `user_*` 会稳定排在末尾而永远不被注入。
+        file_bodies.sort_by(|(a, _), (b, _)| {
+            memory_priority(a)
+                .cmp(&memory_priority(b))
+                .then_with(|| a.cmp(b))
+        });
+
+        // 拼接时限制总字节数，避免 system prompt 臃肿影响缓存命中率。
         let mut joined = String::new();
         let header = "## 项目记忆（来自历史会话）\n\n";
         joined.push_str(header);
-        for (i, body) in file_bodies.iter().enumerate() {
+        for (i, (_, body)) in file_bodies.iter().enumerate() {
             let sep = if i > 0 { "\n\n---\n\n" } else { "" };
-            if joined.len() + sep.len() + body.len() > MAX_CONTEXT_CHARS {
-                let remaining = MAX_CONTEXT_CHARS.saturating_sub(joined.len() + sep.len());
-                if remaining > 20 {
+            if joined.len() + sep.len() + body.len() > MAX_CONTEXT_BYTES {
+                // 给截断提示及省略号预留空间，并按 UTF-8 边界裁切，不能把 byte
+                // 数直接当字符数传给 `chars().take()`，否则中文会突破预算。
+                let remaining = MAX_CONTEXT_BYTES
+                    .saturating_sub(joined.len())
+                    .saturating_sub(TRUNCATION_NOTICE.len());
+                if remaining > sep.len() + '…'.len_utf8() {
                     joined.push_str(sep);
-                    let body_chars: Vec<char> = body.chars().take(remaining).collect();
-                    joined.extend(body_chars);
-                    joined.push_str("…");
+                    let body_budget = remaining - sep.len() - '…'.len_utf8();
+                    let partial = truncate_utf8_to_bytes(body, body_budget);
+                    if !partial.is_empty() {
+                        joined.push_str(partial);
+                        joined.push('…');
+                    }
                 }
-                joined.push_str("\n\n（记忆已截断，仅显示部分）");
+                if joined.len() + TRUNCATION_NOTICE.len() <= MAX_CONTEXT_BYTES {
+                    joined.push_str(TRUNCATION_NOTICE);
+                }
                 break;
             }
             joined.push_str(sep);
@@ -214,7 +232,15 @@ impl MemoryStore {
                 s.ends_with(".md") && s != MEMORY_INDEX
             })
             .collect();
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by(|a, b| {
+            let a_name = a.file_name();
+            let b_name = b.file_name();
+            let a_name = a_name.to_string_lossy();
+            let b_name = b_name.to_string_lossy();
+            memory_priority(&a_name)
+                .cmp(&memory_priority(&b_name))
+                .then_with(|| a_name.cmp(&b_name))
+        });
 
         let lines: Vec<String> = entries
             .iter()
@@ -260,6 +286,22 @@ fn parse_items(output: &str) -> Vec<MemoryItem> {
                 )
         })
         .collect()
+}
+
+/// 注入预算有限时，显式的工作偏好最重要，其次是用户画像、项目事实和参考路径。
+/// 同一类内仍按文件名稳定排序，使同一个记忆目录的 prompt 前缀可复现并利于缓存。
+fn memory_priority(filename: &str) -> u8 {
+    if filename.starts_with("feedback_") {
+        0
+    } else if filename.starts_with("user_") {
+        1
+    } else if filename.starts_with("project_") {
+        2
+    } else if filename.starts_with("reference_") {
+        3
+    } else {
+        4
+    }
 }
 
 fn messages_to_text(messages: &[Message]) -> String {
@@ -377,5 +419,73 @@ fn truncate_chars(s: &str, max: usize) -> String {
     } else {
         let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
         format!("{}…", &s[..end])
+    }
+}
+
+/// 返回不超过 `max_bytes` 的 UTF-8 前缀，保证不在多字节字符中间截断。
+fn truncate_utf8_to_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_priority_keeps_feedback_and_user_facts_before_project_notes() {
+        assert!(memory_priority("feedback_style.md") < memory_priority("user_role.md"));
+        assert!(memory_priority("user_role.md") < memory_priority("project_arch.md"));
+        assert!(memory_priority("project_arch.md") < memory_priority("reference_repo.md"));
+    }
+
+    #[test]
+    fn utf8_byte_truncation_never_splits_a_multibyte_character() {
+        let text = "中文abc";
+        assert_eq!(truncate_utf8_to_bytes(text, 5), "中");
+        assert_eq!(truncate_utf8_to_bytes(text, 6), "中文");
+        assert_eq!(truncate_utf8_to_bytes(text, 7), "中文a");
+    }
+
+    #[test]
+    fn load_context_prioritizes_user_facts_over_earlier_large_project_notes() {
+        let unique = format!(
+            "wyj-core-memory-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(unique);
+        let cwd = base.join("project");
+        let store = MemoryStore::new(&base, &cwd).expect("temporary memory store should open");
+
+        let project = format!(
+            "---\nname: large-project\ndescription: large project note\n---\n\n{}\n",
+            "p".repeat(MAX_CONTEXT_BYTES)
+        );
+        let user = "---\nname: user-style\ndescription: user preference\n---\n\nUSER_PREFERENCE: concise Chinese replies\n";
+        std::fs::write(store.dir.join("project_large.md"), project)
+            .expect("project memory should be written");
+        std::fs::write(store.dir.join("user_style.md"), user)
+            .expect("user memory should be written");
+        std::fs::write(
+            store.dir.join(MEMORY_INDEX),
+            "- [project](project_large.md)\n- [user](user_style.md)\n",
+        )
+        .expect("memory index should be written");
+
+        let context = store.load_context();
+        assert!(context.contains("USER_PREFERENCE: concise Chinese replies"));
+        assert!(context.len() <= MAX_CONTEXT_BYTES);
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

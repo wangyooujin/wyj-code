@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 pub mod project_mcp;
 pub use project_mcp::{
-    load_project_mcp, merged_mcp_servers, project_mcp_path, save_project_mcp, ProjectMcpConfig,
+    load_native_mcp, load_project_mcp, merged_mcp_servers, project_mcp_path, save_project_mcp,
+    ProjectMcpConfig,
 };
 
 // ── MCP Server 配置 ───────────────────────────────────────────────────────────
@@ -18,7 +19,9 @@ pub use project_mcp::{
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     Stdio,
-    Http,
+    /// Streamable HTTP transport. The legacy `http` spelling is accepted.
+    #[serde(rename = "streamable_http", alias = "http")]
+    StreamableHttp,
 }
 
 /// 单个 MCP server 配置（在 ~/.wyj-code/config.toml 的 [[mcp_servers]] 段声明）
@@ -37,6 +40,12 @@ pub struct McpServerConfig {
     /// stdio: 附加环境变量
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// streamable_http: remote MCP endpoint
+    #[serde(default)]
+    pub url: Option<String>,
+    /// streamable_http: additional headers. Values may be `${ENV_VAR}` references.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 }
 
 /// Agent 运行模式
@@ -136,7 +145,7 @@ pub struct Profile {
     /// Anthropic 协议 prompt caching 能力。None = 按 base_url/provider 自动判断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache: Option<bool>,
-    /// OpenAI 协议 stream_options.include_usage 能力。None = 按 base_url/provider 自动判断。
+    /// OpenAI 协议 stream_options.include_usage 能力。None = 按 base_url/provider/model 自动判断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_stream_options: Option<bool>,
 }
@@ -175,12 +184,35 @@ impl Profile {
         })
     }
 
-    pub fn effective_openai_stream_options(&self) -> bool {
+    /// 指定模型是否必须请求供应商返回 usage，作为精确 token 账本来源。
+    ///
+    /// MiniMax、GLM、DeepSeek 的 tokenizer/聊天模板会随模型版本变化；不以
+    /// `chars/token` 之类的本地猜测冒充精确值，而是使用供应商对实际请求（含
+    /// system、tool schema 与消息包装）返回的 usage。显式配置
+    /// `openai_stream_options = false` 仍优先，以兼容不支持该字段的私有代理。
+    pub fn uses_provider_exact_token_usage_for_model(&self, model: &str) -> bool {
+        let model = model.to_ascii_lowercase();
+        let base_url = self.base_url.to_ascii_lowercase();
+        model.contains("minimax")
+            || model.contains("glm")
+            || model.contains("deepseek")
+            || base_url.contains("minimaxi.com")
+            || base_url.contains("bigmodel.cn")
+            || base_url.contains("z.ai")
+            || base_url.contains("deepseek.com")
+    }
+
+    pub fn effective_openai_stream_options_for_model(&self, model: &str) -> bool {
         self.openai_stream_options.unwrap_or_else(|| {
             self.provider == Provider::OpenAI
                 && (self.base_url.trim().is_empty()
-                    || self.base_url.trim_end_matches('/') == "https://api.openai.com/v1")
+                    || self.base_url.trim_end_matches('/') == "https://api.openai.com/v1"
+                    || self.uses_provider_exact_token_usage_for_model(model))
         })
+    }
+
+    pub fn effective_openai_stream_options(&self) -> bool {
+        self.effective_openai_stream_options_for_model(&self.model)
     }
 }
 
@@ -411,6 +443,23 @@ impl Config {
             cfg.active_profile = cfg.profiles[0].name.clone();
         }
 
+        // Claude Code's global native MCP file has higher precedence than the
+        // legacy wyj global TOML, while remaining read-only until explicit migrate.
+        if let Ok(home) = home_dir() {
+            let native_path = home.join(".claude.json");
+            if let Ok(native_servers) = load_native_mcp(&native_path) {
+                for server in native_servers {
+                    if let Some(existing) =
+                        cfg.mcp_servers.iter_mut().find(|s| s.name == server.name)
+                    {
+                        *existing = server;
+                    } else {
+                        cfg.mcp_servers.push(server);
+                    }
+                }
+            }
+        }
+
         // 环境变量优先，覆盖到激活分组
         if let Ok(key) = std::env::var("WYJ_CODE_API_KEY") {
             if !key.is_empty() {
@@ -457,9 +506,36 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         let config_path = config_file_path()?;
         let content = toml::to_string_pretty(self).context("序列化配置失败")?;
-        std::fs::write(&config_path, content)
+        write_atomic(&config_path, &content)
             .with_context(|| format!("写入配置文件失败: {}", config_path.display()))
     }
+}
+
+pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> {
+    let nonce = format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    let tmp = path.with_file_name(format!(
+        "{}.{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
+        nonce
+    ));
+    if let Err(e) = std::fs::write(&tmp, content) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// 返回配置目录路径（~/.wyj-code），若不存在则创建。
@@ -533,7 +609,7 @@ mod subagent_cfg_tests {
     }
 
     #[test]
-    fn compatible_third_party_endpoints_disable_native_optimizations_by_default() {
+    fn compatible_third_party_endpoints_keep_unrelated_optimizations_disabled() {
         let p = Profile {
             provider: Provider::Anthropic,
             base_url: "https://open.bigmodel.cn/api/anthropic".to_string(),
@@ -543,10 +619,28 @@ mod subagent_cfg_tests {
 
         let p = Profile {
             provider: Provider::OpenAI,
-            base_url: "https://api.minimaxi.com/v1".to_string(),
+            base_url: "https://compatible.example/v1".to_string(),
             ..Profile::default()
         };
         assert!(!p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn domestic_models_enable_usage_streams_for_exact_token_accounting() {
+        for (base_url, model) in [
+            ("https://api.minimaxi.com/v1", "MiniMax-M2"),
+            ("https://api.deepseek.com", "deepseek-chat"),
+            ("https://ark.cn-beijing.volces.com/api/v3", "glm-5.2"),
+        ] {
+            let p = Profile {
+                provider: Provider::OpenAI,
+                base_url: base_url.to_string(),
+                model: model.to_string(),
+                ..Profile::default()
+            };
+            assert!(p.uses_provider_exact_token_usage_for_model(model));
+            assert!(p.effective_openai_stream_options_for_model(model));
+        }
     }
 
     #[test]
@@ -566,5 +660,14 @@ mod subagent_cfg_tests {
             ..Profile::default()
         };
         assert!(p.effective_openai_stream_options());
+
+        let p = Profile {
+            provider: Provider::OpenAI,
+            model: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            openai_stream_options: Some(false),
+            ..Profile::default()
+        };
+        assert!(!p.effective_openai_stream_options());
     }
 }

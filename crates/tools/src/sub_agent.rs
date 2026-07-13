@@ -21,9 +21,10 @@ use crate::agent_hub::{SubAgentEvent, SubAgentHub};
 
 /// 按 agent 定义创建子 Agent（持有 provider 和按定义过滤后的工具集）
 pub type AgentFactory = Arc<dyn Fn(&AgentDefinition) -> Result<Agent> + Send + Sync>;
+pub type SharedAgentDefinitions = Arc<std::sync::RwLock<Vec<AgentDefinition>>>;
 
 pub struct SubAgentTool {
-    defs: Arc<Vec<AgentDefinition>>,
+    defs: SharedAgentDefinitions,
     hub: Arc<SubAgentHub>,
     factory: AgentFactory,
 }
@@ -35,22 +36,43 @@ impl SubAgentTool {
         factory: impl Fn(&AgentDefinition) -> Result<Agent> + Send + Sync + 'static,
     ) -> Self {
         Self {
+            defs: Arc::new(std::sync::RwLock::new((*defs).clone())),
+            hub,
+            factory: Arc::new(factory),
+        }
+    }
+
+    pub fn new_shared(
+        defs: SharedAgentDefinitions,
+        hub: Arc<SubAgentHub>,
+        factory: impl Fn(&AgentDefinition) -> Result<Agent> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
             defs,
             hub,
             factory: Arc::new(factory),
         }
     }
 
-    fn find_def(&self, type_name: &str) -> Option<&AgentDefinition> {
-        self.defs.iter().find(|d| d.name == type_name)
+    fn find_def(&self, type_name: &str) -> Option<AgentDefinition> {
+        self.defs
+            .read()
+            .ok()?
+            .iter()
+            .find(|d| d.name == type_name)
+            .cloned()
     }
 
     fn available_types(&self) -> String {
         self.defs
-            .iter()
-            .map(|d| d.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
+            .read()
+            .map(|defs| {
+                defs.iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -108,13 +130,17 @@ impl Tool for SubAgentTool {
     }
 
     fn definition(&self) -> ToolDefinition {
-        let types = self
+        let defs = self
             .defs
+            .read()
+            .map(|defs| defs.clone())
+            .unwrap_or_default();
+        let types = defs
             .iter()
             .map(|d| format!("- {}: {}", d.name, d.description))
             .collect::<Vec<_>>()
             .join("\n");
-        let type_names: Vec<&str> = self.defs.iter().map(|d| d.name.as_str()).collect();
+        let type_names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         ToolDefinition {
             name: self.name().to_string(),
             description: crate::descriptions::SUB_AGENT_TEMPLATE.replace("{types}", &types),
@@ -182,7 +208,7 @@ impl SubAgentTool {
             )));
         };
 
-        let agent = match (self.factory)(def) {
+        let agent = match (self.factory)(&def) {
             Ok(a) => a,
             Err(e) => {
                 return Ok(ToolResult::err(tr_fmt(

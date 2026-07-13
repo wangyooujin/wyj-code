@@ -19,7 +19,8 @@
 - **双协议 LLM 适配** —— Anthropic Messages 与 OpenAI Chat Completions 双格式，混合配置（规划用 GPT、执行用 Claude）开箱即用。
 - **多 Agent 编排** —— 内置 `general-purpose` / `Explore`(只读) / `Plan` 三类子 Agent，支持自定义定义文件；`parallel_safe` 工具单回合内并发、其余保序回填；进程级 Hub 管理并发上限、前后台调度、ESC 中断。
 - **上下文压缩** —— 估算 token 数接近窗口上限时自动摘要替换旧消息，保留最近若干条。
-- **可插拔 MCP** —— 内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并桥接任意外部 MCP server。
+- **统一 Extensions 资源平台** —— `/extensions` 与 `wyj-code extensions` 统一管理 Skill、MCP、Plugin；支持 lockfile v2、原生 Claude MCP 迁移、stdio/Streamable HTTP 和下一回合边界应用。
+- **可插拔 MCP** —— 内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并桥接 stdio 或 Streamable HTTP MCP server。
 
 **交互与配置**
 - **原生 ratatui TUI** —— 流式 markdown、语法高亮、多行编辑、工具调用实时展示、子 Agent 聚合面板、完整消息流内选择概要项并用 Ctrl+O 展开明细。
@@ -119,6 +120,15 @@ language   = ""                 # "en"/"zh"，留空自动检测系统 locale
 ```
 
 TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Agent、`/compact` 压缩、`/config` 设置面板、`/hooks` 查看生命周期钩子。完整命令见 `/help`。
+
+资源管理也可以完全在 headless/CI 中执行：
+
+```bash
+wyj-code extensions list --json
+wyj-code extensions doctor
+wyj-code extensions migrate
+wyj-code extensions enable mcp:postgres --scope project
+```
 
 Hooks 配置示例（`.claude/settings.json`，与真实 Claude Code 格式一致）：
 
