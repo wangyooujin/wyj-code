@@ -2,8 +2,8 @@
 #
 # 与仓库根目录的 install.bat 不是同一个文件：那个脚本随 release 压缩包分发，假定
 # wyj-code.exe 已经和它解压在同一目录，只负责"装到 %USERPROFILE%\.wyj-code\bin +
-# 配置用户级 PATH"。这个脚本运行在用户还什么都没有的机器上，只做前置工作——向
-# GitHub Releases API 查最新版本、下载对应压缩包、校验 sha256、解压——解压完成后
+# 配置用户级 PATH"。这个脚本运行在用户还什么都没有的机器上，只做前置工作——从
+# GitHub Releases 重定向解析最新版本、下载对应压缩包、校验 sha256、解压——解压完成后
 # 直接调用包内那个 install.bat，把安装这一步完全交给它，不重复实现一遍。
 
 $ErrorActionPreference = "Stop"
@@ -31,13 +31,17 @@ if ($env:WYJ_CODE_VERSION) {
     Write-Host "==> 使用指定版本：$Version（来自 WYJ_CODE_VERSION）"
 } else {
     Write-Host "==> 查询最新版本..."
+    $latestUrl = "https://github.com/$RepoOwner/$RepoName/releases/latest"
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
+        $latestResponse = Invoke-WebRequest -Uri $latestUrl -MaximumRedirection 10 -UseBasicParsing
+        $latestLocation = $latestResponse.BaseResponse.ResponseUri.AbsoluteUri
     } catch {
-        Fail "查询最新 release 失败：$($_.Exception.Message)"
+        Fail "查询最新 release 失败：$latestUrl（$($_.Exception.Message)）"
     }
-    $Tag = $release.tag_name
-    if (-not $Tag) { Fail "无法解析最新 release 的 tag_name（可能触发了 GitHub API 匿名限流，请稍后重试或改用 WYJ_CODE_VERSION 指定版本）" }
+    $tagMatch = [regex]::Match($latestLocation, '/releases/tag/([^/?#]+)')
+    if (-not $tagMatch.Success) { Fail "无法从 GitHub Releases 重定向地址解析版本：$latestLocation" }
+    $Tag = $tagMatch.Groups[1].Value
+    if ($Tag -notmatch '^v[0-9]') { Fail "GitHub Releases 返回了无效版本 tag：$Tag" }
     $Version = $Tag -replace '^v', ''
     Write-Host "==> 最新版本：$Version"
 }
