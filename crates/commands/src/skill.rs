@@ -17,7 +17,7 @@ pub struct SkillCommand {
     argument_hint: Option<String>,
     /// `allowed-tools` frontmatter 字段：该命令执行期间临时收紧的工具白名单。
     allowed_tools: Option<Vec<String>>,
-    /// `model` frontmatter 字段：引用的 Profile 名。本版本仅解析存储，运行期不生效。
+    /// `model` frontmatter 字段：引用的 Profile 名；TUI scoped execution 会在本轮使用它。
     #[allow(dead_code)]
     model: Option<String>,
 }
@@ -50,7 +50,7 @@ impl Command for SkillCommand {
             Ok(CommandResult::RunPromptScoped {
                 text,
                 allowed_tools: self.allowed_tools.clone(),
-                profile: None,
+                profile: self.model.clone(),
             })
         } else {
             Ok(CommandResult::RunPrompt(text))
@@ -189,14 +189,7 @@ fn parse_skill_file(name: &str, content: &str) -> SkillCommand {
 }
 
 /// 从单个文件读取并插入（覆盖式，同名直接替换）。
-fn load_file_overwrite(path: &Path, skills: &mut HashMap<String, SkillCommand>) {
-    let Some(name) = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(str::to_string)
-    else {
-        return;
-    };
+fn load_file_overwrite_as(path: &Path, name: String, skills: &mut HashMap<String, SkillCommand>) {
     match std::fs::read_to_string(path) {
         Ok(content) => {
             skills.insert(name.clone(), parse_skill_file(&name, &content));
@@ -205,18 +198,50 @@ fn load_file_overwrite(path: &Path, skills: &mut HashMap<String, SkillCommand>) 
     }
 }
 
-fn load_from_dir(dir: &Path, skills: &mut HashMap<String, SkillCommand>) {
+fn load_file_overwrite(path: &Path, skills: &mut HashMap<String, SkillCommand>) {
+    let Some(name) = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    load_file_overwrite_as(path, name, skills);
+}
+
+fn load_from_dir_with_namespace(
+    dir: &Path,
+    namespace: Option<&str>,
+    skills: &mut HashMap<String, SkillCommand>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         tracing::warn!("读取 skill 目录失败: {}", dir.display());
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
+        if path.is_dir() {
+            let Some(segment) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let next_namespace = namespace
+                .map(|ns| format!("{ns}:{segment}"))
+                .unwrap_or_else(|| segment.to_string());
+            load_from_dir_with_namespace(&path, Some(&next_namespace), skills);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let name = namespace
+                .map(|ns| format!("{ns}:{stem}"))
+                .unwrap_or_else(|| stem.to_string());
+            load_file_overwrite_as(&path, name, skills);
         }
-        load_file_overwrite(&path, skills);
     }
+}
+
+fn load_from_dir(dir: &Path, skills: &mut HashMap<String, SkillCommand>) {
+    load_from_dir_with_namespace(dir, None, skills);
 }
 
 /// 同时支持文件路径与目录路径（插件的 `skills`/`commands` 字段可能指向单个
@@ -258,7 +283,7 @@ fn load_from_path_if_absent(
 /// 5. 项目 wyj-code：`.wyj/skills/*.md`
 /// 6. 项目真 CC：`.claude/commands/*.md`（覆盖 #1-#5 同名条目，最高优先级）
 ///
-/// 仅扫顶层 `*.md`，不递归子目录（真 CC 的命名空间子目录本版本不支持，静默不加载）。
+/// 递归扫描 `*.md`，子目录映射为 Claude Code 风格的 `namespace:name` 命令名。
 /// `disabled` 由上层调用方传入(汇总全局+项目 lockfile 里 `enabled == false` 的
 /// skill 名)，用于过滤掉被 /skills 面板禁用的条目。
 pub fn load_skills(
@@ -414,6 +439,38 @@ mod tests {
         assert_eq!(skill.model.as_deref(), Some("haiku-profile"));
     }
 
+    #[tokio::test]
+    async fn model_field_is_forwarded_to_scoped_execution() {
+        let content = "---\nmodel: haiku-profile\nallowed-tools: Read\n---\nbody";
+        let skill = parse_skill_file("x", content);
+        let result = skill
+            .run(
+                "",
+                &CommandContext {
+                    cwd: PathBuf::new(),
+                    model: String::new(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    context_window: 0,
+                    estimated_tokens: 0,
+                    home_dir: PathBuf::new(),
+                    sub_input_tokens: 0,
+                    sub_output_tokens: 0,
+                    effective_mcp_count: 0,
+                    plugin_agent_paths: vec![],
+                    hooks_enabled: false,
+                    dynamic_commands: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, CommandResult::RunPromptScoped { profile: Some(ref p), .. } if p == "haiku-profile")
+        );
+    }
+
     fn names(cmds: &[Arc<dyn Command>]) -> HashSet<String> {
         cmds.iter().map(|c| c.name().to_string()).collect()
     }
@@ -455,6 +512,17 @@ mod tests {
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &sources);
         let review = cmds.iter().find(|c| c.name() == "review").unwrap();
         assert_eq!(review.description(), "User Review"); // 先到先得，插件被跳过
+    }
+
+    #[test]
+    fn nested_command_directory_becomes_namespace() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let nested = cwd.path().join(".claude").join("commands").join("backend");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("review.md"), "# Review\nbody").unwrap();
+        let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
+        assert!(names(&cmds).contains("backend:review"));
     }
 
     #[test]

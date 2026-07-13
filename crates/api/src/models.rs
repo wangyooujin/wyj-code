@@ -56,7 +56,7 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         note: "",
         vision: false,
         prompt_cache: None,
-        openai_stream_options: Some(false),
+        openai_stream_options: Some(true),
     },
     ProfileTemplate {
         key: "kimi",
@@ -79,7 +79,7 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
             "deepseek-chat/deepseek-reasoner 后续会作为新模型的兼容别名，供应商公告后可能需要改名",
         vision: false,
         prompt_cache: None,
-        openai_stream_options: Some(false),
+        openai_stream_options: Some(true),
     },
     ProfileTemplate {
         key: "custom",

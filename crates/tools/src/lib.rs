@@ -28,7 +28,7 @@ pub use bash_session::BashSessionManager;
 pub use ctx::{PermissionDecision, PermissionMode, ToolCtx, UiAskRequest};
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use registry::ToolRegistry;
-pub use sub_agent::{AgentFactory, SubAgentTool};
+pub use sub_agent::{AgentFactory, SharedAgentDefinitions, SubAgentTool};
 pub use todo::{TodoStore, TodoWriteTool};
 pub use trace::{TraceEvent, TraceWriter};
 pub use websearch::WebSearchTool;

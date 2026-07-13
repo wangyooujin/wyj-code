@@ -25,7 +25,9 @@ use crate::plugin_manifest::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use tokio::process::Command;
 use wyj_config::{McpServerConfig, McpTransport};
@@ -358,6 +360,17 @@ fn to_mcp_server_config(name: &str, def: &PluginMcpServerDef) -> Option<McpServe
             command: Some(command.clone()),
             args: args.clone(),
             env: env.clone(),
+            url: None,
+            headers: Default::default(),
+        }),
+        PluginMcpServerDef::Http { url, headers, .. } => Some(McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::StreamableHttp,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: Some(url.clone()),
+            headers: headers.clone(),
         }),
         _ => None,
     }
@@ -474,15 +487,36 @@ fn upsert_plugin_entry(manifest: &mut InstalledManifest, entry: InstalledPluginE
     }
 }
 
+fn pinned_source_commit(source: &PluginSource, plugin_root: &Path) -> Option<String> {
+    let declared = match source {
+        PluginSource::Github { sha, .. }
+        | PluginSource::GitUrl { sha, .. }
+        | PluginSource::GitSubdir { sha, .. } => sha.clone(),
+        PluginSource::LocalPath(_) | PluginSource::NpmUnsupported { .. } => None,
+    };
+    declared.or_else(|| {
+        let output = std::process::Command::new("git")
+            .args(["-C", &plugin_root.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
+}
+
 fn finalize_plugin_install(
     name: &str,
     manifest: &PluginManifest,
     plugin_root: PathBuf,
+    source: &PluginSource,
     origin: PluginInstallOrigin,
     scope: InstallScope,
     cwd: &Path,
 ) -> Result<PluginInstallReport> {
     let contributes = resolve_contributions(manifest, &plugin_root);
+    let pinned_commit = pinned_source_commit(source, &plugin_root);
 
     let mut manifest_lock = lockfile::load_scope(scope, cwd)?;
     let now = Utc::now();
@@ -491,6 +525,12 @@ fn finalize_plugin_install(
         .iter()
         .find(|e| e.name == name)
         .map(|e| e.installed_at);
+    let extension_source = format!("{origin:?}");
+    let extension_dependencies = manifest
+        .dependencies
+        .iter()
+        .map(|dependency| format!("plugin:{}", dependency.parse().0))
+        .collect();
     upsert_plugin_entry(
         &mut manifest_lock,
         InstalledPluginEntry {
@@ -503,6 +543,22 @@ fn finalize_plugin_install(
             updated_at: now,
             plugin_root,
             contributes: contributes.clone(),
+        },
+    );
+    lockfile::upsert_extension(
+        &mut manifest_lock,
+        lockfile::ExtensionLockEntry {
+            id: format!("plugin:{name}"),
+            kind: lockfile::ExtensionKind::Plugin,
+            scope,
+            source: Some(extension_source),
+            version: manifest.version.clone(),
+            commit: pinned_commit,
+            digest: None,
+            enabled: true,
+            dependencies: extension_dependencies,
+            installed_at: existing_installed_at.unwrap_or(now),
+            updated_at: now,
         },
     );
     lockfile::save_scope(scope, cwd, &manifest_lock)?;
@@ -549,7 +605,15 @@ async fn install_plugin_under(
         marketplace_id,
         marketplace_location: req.marketplace_location.clone().unwrap_or_default(),
     };
-    finalize_plugin_install(&name, &req.manifest, plugin_root, origin, req.scope, cwd)
+    finalize_plugin_install(
+        &name,
+        &req.manifest,
+        plugin_root,
+        &req.source,
+        origin,
+        req.scope,
+        cwd,
+    )
 }
 
 /// 安装（首次写入）或"覆盖式重装"（同 scope 同名已存在直接覆盖）。要求
@@ -571,54 +635,218 @@ pub async fn resolve_and_install_from_marketplace(
     name_override: Option<String>,
     cwd: &Path,
 ) -> Result<PluginInstallReport> {
-    let marketplace_cache_dir = if Path::new(marketplace_location).exists() {
-        PathBuf::from(marketplace_location)
-    } else {
-        plugin_marketplace_cache_dir(marketplace_location)?
-    };
-
-    let staging_name = name_override
-        .clone()
-        .or_else(|| entry.manifest.name.clone())
-        .or_else(|| source_name_hint(&entry.source))
-        .ok_or_else(|| {
-            anyhow::anyhow!("无法确定插件名：marketplace 条目未提供 name 也无法从 source 推断")
-        })?;
-
-    let root = plugins_root()?;
-    let mut plugin_root = materialize_plugin_source_under(
-        &root,
-        &entry.source,
+    let mut visiting = Vec::new();
+    let mut installed = std::collections::HashSet::new();
+    resolve_and_install_from_marketplace_inner(
         marketplace_id,
-        Some(marketplace_cache_dir.as_path()),
-        &staging_name,
+        marketplace_location,
+        entry,
+        scope,
+        name_override,
+        cwd,
+        &mut visiting,
+        &mut installed,
     )
-    .await?;
+    .await
+}
 
-    let own = read_own_plugin_manifest(&plugin_root, entry.strict, &staging_name)?;
-    let manifest = merge_manifest_override(own, &entry.manifest);
-    let final_name = name_override.unwrap_or_else(|| manifest.name.clone());
+#[allow(clippy::too_many_arguments)]
+fn resolve_and_install_from_marketplace_inner<'a>(
+    marketplace_id: &'a str,
+    marketplace_location: &'a str,
+    entry: &'a PluginMarketplaceEntry,
+    scope: InstallScope,
+    name_override: Option<String>,
+    cwd: &'a Path,
+    visiting: &'a mut Vec<String>,
+    installed: &'a mut std::collections::HashSet<String>,
+) -> Pin<Box<dyn Future<Output = Result<PluginInstallReport>> + Send + 'a>> {
+    Box::pin(async move {
+        let marketplace_cache_dir = if Path::new(marketplace_location).exists() {
+            PathBuf::from(marketplace_location)
+        } else {
+            plugin_marketplace_cache_dir(marketplace_location)?
+        };
 
-    if final_name != staging_name {
-        let renamed = plugin_repo_dir_under(&root, marketplace_id, &final_name);
-        if renamed.exists() {
-            std::fs::remove_dir_all(&renamed).ok();
+        let staging_name = name_override
+            .clone()
+            .or_else(|| entry.manifest.name.clone())
+            .or_else(|| source_name_hint(&entry.source))
+            .ok_or_else(|| {
+                anyhow::anyhow!("无法确定插件名：marketplace 条目未提供 name 也无法从 source 推断")
+            })?;
+
+        if visiting.iter().any(|name| name == &staging_name) {
+            let mut cycle = visiting.clone();
+            cycle.push(staging_name.clone());
+            anyhow::bail!("检测到插件依赖循环: {}", cycle.join(" -> "));
         }
-        std::fs::rename(&plugin_root, &renamed).with_context(|| {
-            format!(
-                "重命名插件目录失败: {} -> {}",
-                plugin_root.display(),
-                renamed.display()
+        if installed.contains(&staging_name) {
+            return Err(anyhow::anyhow!(
+                "内部错误：插件依赖 {} 被重复解析",
+                staging_name
+            ));
+        }
+        visiting.push(staging_name.clone());
+
+        let root = plugins_root()?;
+        let mut plugin_root = materialize_plugin_source_under(
+            &root,
+            &entry.source,
+            marketplace_id,
+            Some(marketplace_cache_dir.as_path()),
+            &staging_name,
+        )
+        .await?;
+
+        let own = read_own_plugin_manifest(&plugin_root, entry.strict, &staging_name)?;
+        let manifest = merge_manifest_override(own, &entry.manifest);
+        let final_name = name_override.unwrap_or_else(|| manifest.name.clone());
+
+        for dependency in &manifest.dependencies {
+            let (dependency_name, dependency_marketplace, version_req) = dependency.parse();
+            if dependency_name.is_empty() {
+                anyhow::bail!("插件 {} 声明了空依赖", final_name);
+            }
+            let (dependency_marketplace_id, dependency_marketplace_location) =
+                dependency_marketplace_location(
+                    marketplace_id,
+                    marketplace_location,
+                    dependency_marketplace.as_deref(),
+                )?;
+            if plugin_dependency_satisfied(cwd, &dependency_name, version_req.as_deref()) {
+                continue;
+            }
+            let marketplace_manifest = sync_plugin_marketplace(&dependency_marketplace_id).await?;
+            let dependency_entry = marketplace_manifest
+                .plugins
+                .iter()
+                .find(|candidate| {
+                    candidate.manifest.name.as_deref() == Some(dependency_name.as_str())
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "插件 {} 缺少依赖 {}{}",
+                        final_name,
+                        dependency_name,
+                        version_req
+                            .as_deref()
+                            .map(|req| format!("@{req}"))
+                            .unwrap_or_default()
+                    )
+                })?;
+            resolve_and_install_from_marketplace_inner(
+                &dependency_marketplace_id,
+                &dependency_marketplace_location,
+                &dependency_entry,
+                scope,
+                None,
+                cwd,
+                visiting,
+                installed,
+            )
+            .await?;
+        }
+
+        if final_name != staging_name {
+            let renamed = plugin_repo_dir_under(&root, marketplace_id, &final_name);
+            if renamed.exists() {
+                std::fs::remove_dir_all(&renamed).ok();
+            }
+            std::fs::rename(&plugin_root, &renamed).with_context(|| {
+                format!(
+                    "重命名插件目录失败: {} -> {}",
+                    plugin_root.display(),
+                    renamed.display()
+                )
+            })?;
+            plugin_root = renamed;
+        }
+
+        let origin = PluginInstallOrigin::Marketplace {
+            marketplace_id: marketplace_id.to_string(),
+            marketplace_location: marketplace_location.to_string(),
+        };
+        let report = finalize_plugin_install(
+            &final_name,
+            &manifest,
+            plugin_root,
+            &entry.source,
+            origin,
+            scope,
+            cwd,
+        )?;
+        visiting.pop();
+        installed.insert(final_name);
+        Ok(report)
+    })
+}
+
+fn dependency_marketplace_location(
+    current_id: &str,
+    current_location: &str,
+    requested: Option<&str>,
+) -> Result<(String, String)> {
+    let Some(requested) = requested else {
+        return Ok((current_id.to_string(), current_location.to_string()));
+    };
+    if requested == current_id || requested == current_location {
+        return Ok((current_id.to_string(), current_location.to_string()));
+    }
+    let manifest = lockfile::load_global()?;
+    let source = manifest
+        .plugin_marketplaces
+        .into_iter()
+        .find(|source| {
+            source.id == requested
+                || source.location == requested
+                || source.display_name == requested
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "未找到插件依赖所需的 marketplace `{requested}`，请先在 /plugins 中添加该源"
             )
         })?;
-        plugin_root = renamed;
-    }
+    Ok((source.id, source.location))
+}
 
-    let origin = PluginInstallOrigin::Marketplace {
-        marketplace_id: marketplace_id.to_string(),
-        marketplace_location: marketplace_location.to_string(),
+fn plugin_dependency_satisfied(cwd: &Path, name: &str, version_req: Option<&str>) -> bool {
+    let mut entries = Vec::new();
+    if let Ok(project) = lockfile::load_project(cwd) {
+        entries.extend(
+            project
+                .plugins
+                .into_iter()
+                .filter(|entry| entry.name == name),
+        );
+    }
+    if let Ok(global) = lockfile::load_global() {
+        entries.extend(
+            global
+                .plugins
+                .into_iter()
+                .filter(|entry| entry.name == name),
+        );
+    }
+    let Some(entry) = entries.into_iter().find(|entry| entry.enabled) else {
+        return false;
     };
-    finalize_plugin_install(&final_name, &manifest, plugin_root, origin, scope, cwd)
+    let Some(req) = version_req else {
+        return true;
+    };
+    let Some(version) = entry.version.as_deref() else {
+        return false;
+    };
+    let Ok(req) = semver::VersionReq::parse(req) else {
+        // A non-semver dependency string is treated as an exact version.  This
+        // keeps common marketplace data such as `1.2.3` predictable while still
+        // rejecting an actually different installed version.
+        return version == req;
+    };
+    semver::Version::parse(version)
+        .map(|version| req.matches(&version))
+        .unwrap_or(false)
 }
 
 /// 升级：对 marketplace 来源重新 sync marketplace + 重新物化插件目录（覆盖式，
@@ -680,6 +908,7 @@ pub fn uninstall_plugin(name: &str, scope: InstallScope, cwd: &Path) -> Result<(
         return Ok(());
     };
     let entry = manifest.plugins.remove(pos);
+    lockfile::remove_extension(&mut manifest, &format!("plugin:{name}"));
     lockfile::save_scope(scope, cwd, &manifest)?;
 
     if !entry.is_local_dev() && entry.plugin_root.exists() {
@@ -704,6 +933,14 @@ pub fn set_plugin_enabled(
         .ok_or_else(|| anyhow::anyhow!("未找到已安装的插件: {name}"))?;
     entry.enabled = enabled;
     entry.updated_at = Utc::now();
+    if let Some(extension) = manifest
+        .extensions
+        .iter_mut()
+        .find(|e| e.id == format!("plugin:{name}"))
+    {
+        extension.enabled = enabled;
+        extension.updated_at = Utc::now();
+    }
     lockfile::save_scope(scope, cwd, &manifest)
 }
 
@@ -876,6 +1113,7 @@ pub fn install_local_plugin(
         &manifest.name.clone(),
         &manifest,
         path.to_path_buf(),
+        &PluginSource::LocalPath(path.display().to_string()),
         origin,
         scope,
         cwd,
@@ -1186,6 +1424,8 @@ mod tests {
                     command: Some("node".to_string()),
                     args: vec![],
                     env: HashMap::new(),
+                    url: None,
+                    headers: HashMap::new(),
                 }],
                 skipped_capabilities: vec![],
             },

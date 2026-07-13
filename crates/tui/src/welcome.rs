@@ -361,13 +361,8 @@ mod tests {
     fn render_welcome_first_lines_are_blank_padding() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        for i in 0..TOP_BLANK_LINES {
-            assert_eq!(
-                collect_text(&lines[i]),
-                "",
-                "顶部第 {} 行应为留白空行",
-                i + 1
-            );
+        for (i, line) in lines.iter().enumerate().take(TOP_BLANK_LINES) {
+            assert_eq!(collect_text(line), "", "顶部第 {} 行应为留白空行", i + 1);
         }
     }
 

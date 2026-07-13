@@ -24,7 +24,7 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -4134,6 +4134,76 @@ impl AgentsDialog {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionAction {
+    Enable,
+    Disable,
+    Remove,
+}
+
+/// Unified Skill/MCP/Plugin inventory panel.  The specialized `/mcp`,
+/// `/skills`, and `/plugins` panels remain available for marketplace browsing;
+/// this panel is the fast daily-use surface for seeing the effective resource
+/// set and applying enable/disable/remove actions consistently.
+pub struct ExtensionsDialog {
+    pub records: Vec<wyj_store::extensions::ExtensionRecord>,
+    pub selected: usize,
+    pub detail_open: bool,
+    pub detail_scroll: u16,
+    pub confirm: Option<ExtensionAction>,
+    pub error: Option<String>,
+}
+
+impl ExtensionsDialog {
+    pub fn new(cwd: &Path) -> Self {
+        let mut dialog = Self {
+            records: Vec::new(),
+            selected: 0,
+            detail_open: true,
+            detail_scroll: 0,
+            confirm: None,
+            error: None,
+        };
+        dialog.refresh(cwd);
+        dialog
+    }
+
+    pub fn refresh(&mut self, cwd: &Path) {
+        match wyj_store::extensions::list(cwd) {
+            Ok(mut records) => {
+                records.sort_by(|a, b| a.id.cmp(&b.id));
+                self.records = records;
+                self.selected = self.selected.min(self.records.len().saturating_sub(1));
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        self.detail_scroll = 0;
+    }
+
+    pub fn selected_record(&self) -> Option<&wyj_store::extensions::ExtensionRecord> {
+        self.records.get(self.selected)
+    }
+
+    pub fn move_selected(&mut self, delta: i32) {
+        if self.records.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let next = self.selected as i32 + delta;
+        self.selected = next.clamp(0, self.records.len() as i32 - 1) as usize;
+        self.detail_scroll = 0;
+    }
+
+    pub fn action_label(action: ExtensionAction) -> &'static str {
+        match action {
+            ExtensionAction::Enable => "enable",
+            ExtensionAction::Disable => "disable",
+            ExtensionAction::Remove => "remove",
+        }
+    }
+}
+
 /// 全局 UI 状态
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
@@ -4238,6 +4308,8 @@ pub struct AppState {
     pub plugins_dialog: Option<PluginsDialog>,
     /// 可用 Agent 类型面板（/agents 命令触发时 Some）
     pub agents_dialog: Option<AgentsDialog>,
+    /// 统一 Skill/MCP/Plugin 资源面板（/extensions 命令触发时 Some）
+    pub extensions_dialog: Option<ExtensionsDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -4464,6 +4536,7 @@ impl AppState {
             skills_dialog: None,
             plugins_dialog: None,
             agents_dialog: None,
+            extensions_dialog: None,
             save_needed: false,
             config,
             pending_attachments: vec![],
@@ -4535,6 +4608,7 @@ impl AppState {
         self.todo_stats.clear();
         self.todo_execution_logs.clear();
         self.agents_dialog = None;
+        self.extensions_dialog = None;
         self.pending_attachments.clear();
         self.current_op = None;
         self.turn_start_time = None;
@@ -5022,6 +5096,7 @@ impl AppState {
             || self.mcp_dialog.is_some()
             || self.skills_dialog.is_some()
             || self.plugins_dialog.is_some()
+            || self.extensions_dialog.is_some()
             || self.agents_dialog.is_some()
     }
 
@@ -5343,6 +5418,15 @@ impl AppState {
                 questions,
                 response_tx,
             } => {
+                // 面板打开后拦截全部按键，用户不再有任何滚动手段；若沿用此前
+                // 上滚/选中留下的视口位置，附加在聊天区尾部的选项区会被裁出
+                // 可视范围且无法找回。这里强制回到贴底跟随并清掉选中锚点，
+                // 保证选项与操作提示立即可见（同时满足 freeze_ready_scrollback
+                // 的冻结前置条件，配合其面板期间的 collapsible 豁免生效）。
+                self.chat_follow_tail = true;
+                self.unseen_messages = false;
+                self.selected_message_id = None;
+                self.selected_message_anchor = None;
                 self.ask_question_dialog = Some(AskQuestionDialog::new(questions, response_tx));
             }
 
@@ -5901,6 +5985,7 @@ pub async fn run_tui(
     // 当前已连接 MCP 工具的共享快照：后台连接成功时 push 进来，供子 Agent
     // 工厂与 `/model` 重建读取（见 `wyj-cli` 侧 `make_sub_agent_factory`）
     mcp_tools: wyj_tools::SharedMcpTools,
+    shared_agent_defs: wyj_tools::SharedAgentDefinitions,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -5936,6 +6021,7 @@ pub async fn run_tui(
         hub,
         local_plugin,
         mcp_tools,
+        shared_agent_defs,
     )
     .await;
 
@@ -6018,6 +6104,22 @@ fn has_plan_approved(messages: &[Message]) -> bool {
     false
 }
 
+/// 冻结判定用的"最后可折叠 ToolResult"封顶（`compute_freezable_up_to` 的
+/// `collapsible_idx` 参数）。AskQuestion 面板打开期间豁免该封顶：面板拦截
+/// 全部按键，用户本就无法选中/展开 ToolResult，保留封顶只会把面板之前的
+/// 长正文（模型提问前输出的分析等）一起困在 Inline viewport 里，超出可视
+/// 高度的部分既不在屏幕上也不在终端 scrollback 里，彻底不可见。豁免后这些
+/// 内容冻结进 scrollback（可用鼠标滚轮回看），待定尾部只剩未完成的
+/// AskQuestion ToolCall 行 + 面板本身——规则①仍保证冻结边界不越过该 ToolCall。
+/// 代价：作答完成后这些更早的 ToolResult 成为静态历史，不能再展开/收起。
+fn freeze_collapsible_bound(state: &AppState) -> Option<usize> {
+    if state.ask_question_dialog.is_some() {
+        None
+    } else {
+        render::last_collapsible_tool_result_idx(&state.messages)
+    }
+}
+
 fn freeze_ready_scrollback(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
@@ -6034,7 +6136,7 @@ fn freeze_ready_scrollback(
         &state.messages,
         state.frozen_up_to,
         &state.sub_agents,
-        render::last_collapsible_tool_result_idx(&state.messages),
+        freeze_collapsible_bound(state),
     );
     if new_bound <= state.frozen_up_to {
         return Ok(false);
@@ -6683,6 +6785,117 @@ fn update_slash_completions(
     }
 }
 
+fn effective_mcp_servers_for_runtime(
+    cfg: &wyj_config::Config,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) -> Vec<wyj_config::McpServerConfig> {
+    let mut servers = wyj_store::mcp_install::effective_mcp_servers(cfg, cwd);
+    if let Some(local) = local_plugin {
+        let mut names: std::collections::HashSet<String> =
+            servers.iter().map(|server| server.name.clone()).collect();
+        for server in &local.mcp_servers {
+            if names.insert(server.name.clone()) {
+                servers.push(server.clone());
+            }
+        }
+    }
+    servers
+}
+
+fn refresh_tui_agent_definitions(
+    shared_defs: &wyj_tools::SharedAgentDefinitions,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    cwd: &Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) {
+    let mut sources = wyj_store::plugin_install::enabled_plugin_agent_paths(cwd);
+    if let Some(local) = local_plugin {
+        sources.extend(local.agent_paths.clone());
+    }
+    let defs = wyj_core::load_agent_defs(cwd, &sources);
+    if let Ok(mut current) = shared_defs.write() {
+        *current = defs;
+    }
+    let mut agent = (**shared_agent.read().unwrap()).clone();
+    agent.refresh_tool_definitions();
+    *shared_agent.write().unwrap() = Arc::new(agent);
+}
+
+/// Reconcile external MCP resources only at an Agent turn boundary.  The
+/// runtime itself is always allowed to finish/abort connection work in the
+/// background, but an active turn keeps its immutable Agent snapshot.  This is
+/// what makes disable/uninstall safe even when a tool call is currently in
+/// flight.
+fn refresh_tui_mcp_runtime(
+    runtime: &mut wyj_mcp::McpRuntime,
+    state: &mut AppState,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    mcp_tools: &wyj_tools::SharedMcpTools,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) {
+    let live_cfg = wyj_config::Config::load().unwrap_or_else(|e| {
+        tracing::debug!("读取运行时配置失败，继续使用当前配置: {e}");
+        state.config.clone()
+    });
+    let servers = effective_mcp_servers_for_runtime(&live_cfg, cwd, local_plugin);
+    for server in &servers {
+        state
+            .mcp_connection_status
+            .entry(server.name.clone())
+            .or_insert(McpConnStatus::Connecting);
+    }
+    for name in runtime.connected_names() {
+        if !servers.iter().any(|server| server.name == name) {
+            state.mcp_connection_status.remove(&name);
+        }
+    }
+
+    let mut events = runtime.reconcile(&servers);
+    events.extend(runtime.drain());
+    for event in events {
+        match event {
+            wyj_mcp::McpRuntimeEvent::Connected { name, tool_count } => {
+                state
+                    .mcp_connection_status
+                    .insert(name.clone(), McpConnStatus::Connected { tool_count });
+                state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                    "mcp.background.connected",
+                    &[("name", &name), ("count", &tool_count.to_string())],
+                )));
+            }
+            wyj_mcp::McpRuntimeEvent::Failed { name, reason } => {
+                state
+                    .mcp_connection_status
+                    .insert(name.clone(), McpConnStatus::Failed);
+                let mut msg = ChatMessage::system(format!("[MCP {name}] 连接失败: {reason}"));
+                msg.is_error = true;
+                state.messages.push(msg);
+            }
+            wyj_mcp::McpRuntimeEvent::Removed { name } => {
+                state.mcp_connection_status.remove(&name);
+                state.messages.push(ChatMessage::system(format!(
+                    "[MCP {name}] 已从下一回合工具快照移除"
+                )));
+            }
+        }
+    }
+
+    let snapshot = runtime.tools();
+    {
+        let mut shared = mcp_tools.write().unwrap();
+        *shared = snapshot;
+    }
+    let tools = mcp_tools.read().unwrap().clone();
+    let mut new_agent = (**shared_agent.read().unwrap()).clone();
+    new_agent.remove_tools_where(|name| name.starts_with("mcp__"));
+    for tool in tools {
+        new_agent.register_tool(tool);
+    }
+    *shared_agent.write().unwrap() = Arc::new(new_agent);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn tui_main(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -6702,6 +6915,7 @@ async fn tui_main(
     hub: Arc<wyj_tools::SubAgentHub>,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     mcp_tools: wyj_tools::SharedMcpTools,
+    shared_agent_defs: wyj_tools::SharedAgentDefinitions,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -6748,7 +6962,7 @@ async fn tui_main(
     if let Some(local) = &local_plugin {
         plugin_skill_sources.extend(local.skill_paths.clone());
     }
-    let cmd_registry =
+    let mut cmd_registry =
         standard_registry_with_skills(&home_dir, &cwd, &disabled_skills, &plugin_skill_sources);
 
     // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
@@ -6758,87 +6972,15 @@ async fn tui_main(
     // 用 RwLock 包装 agent，支持 /model 热切换
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
 
-    // 后台并发连接所有配置的 MCP server：不在界面打开前同步等待（npx/uvx
-    // 子进程启动+握手可能耗时数秒，会明显拖慢 TUI 打开速度），改为界面先
-    // 打开、MCP 在后台连接，每个连接成功后复用 /model 热切换同一套"克隆
-    // 当前 agent 快照 → register_tool → 换回 shared_agent"机制动态挂载新工具。
-    {
-        let shared_agent_for_mcp = shared_agent.clone();
-        let mcp_tools_for_mcp = mcp_tools.clone();
-        let agent_tx_for_mcp = agent_tx.clone();
-        let cfg_for_mcp = state.config.clone();
-        let cwd_for_mcp = cwd.clone();
-        let local_plugin_mcp_servers = local_plugin
-            .as_ref()
-            .map(|p| p.mcp_servers.clone())
-            .unwrap_or_default();
-        let mut effective_for_status =
-            wyj_store::mcp_install::effective_mcp_servers(&cfg_for_mcp, &cwd_for_mcp);
-        effective_for_status.extend(local_plugin_mcp_servers.clone());
-        for mcp_cfg in &effective_for_status {
-            state
-                .mcp_connection_status
-                .insert(mcp_cfg.name.clone(), McpConnStatus::Connecting);
-        }
-        tokio::spawn(async move {
-            let mut effective =
-                wyj_store::mcp_install::effective_mcp_servers(&cfg_for_mcp, &cwd_for_mcp);
-            effective.extend(local_plugin_mcp_servers);
-            let mut tasks = tokio::task::JoinSet::new();
-            for mcp_cfg in effective {
-                tasks.spawn(async move {
-                    let result = tokio::time::timeout(
-                        wyj_mcp::bridge::MCP_CONNECT_TIMEOUT,
-                        wyj_mcp::bridge::connect_mcp_server(&mcp_cfg),
-                    )
-                    .await;
-                    (mcp_cfg.name, result)
-                });
-            }
-            while let Some(joined) = tasks.join_next().await {
-                match joined {
-                    Ok((name, Ok(Ok(tools)))) => {
-                        let count = tools.len();
-                        let mut new_agent = (**shared_agent_for_mcp.read().unwrap()).clone();
-                        for tool in tools {
-                            let t: Arc<dyn wyj_tools::Tool> = Arc::new(tool);
-                            mcp_tools_for_mcp.write().unwrap().push(t.clone());
-                            new_agent.register_tool(t);
-                        }
-                        *shared_agent_for_mcp.write().unwrap() = Arc::new(new_agent);
-                        let _ = agent_tx_for_mcp
-                            .send(AgentEvent::McpBackgroundConnected {
-                                name,
-                                tool_count: count,
-                            })
-                            .await;
-                    }
-                    Ok((name, Ok(Err(e)))) => {
-                        tracing::warn!("MCP [{name}] 连接失败: {e}");
-                        let _ = agent_tx_for_mcp
-                            .send(AgentEvent::McpBackgroundFailed {
-                                name,
-                                reason: crate::event::McpConnFailReason::Error(e.to_string()),
-                            })
-                            .await;
-                    }
-                    Ok((name, Err(_))) => {
-                        tracing::warn!(
-                            "MCP [{name}] 连接超时（>{}s），已跳过",
-                            wyj_mcp::bridge::MCP_CONNECT_TIMEOUT.as_secs()
-                        );
-                        let _ = agent_tx_for_mcp
-                            .send(AgentEvent::McpBackgroundFailed {
-                                name,
-                                reason: crate::event::McpConnFailReason::Timeout,
-                            })
-                            .await;
-                    }
-                    Err(e) => tracing::warn!("MCP 连接任务异常退出: {e}"),
-                }
-            }
-        });
+    let mut mcp_runtime = wyj_mcp::McpRuntime::new();
+    let initial_mcp_servers =
+        effective_mcp_servers_for_runtime(&state.config, &cwd, local_plugin.as_ref());
+    for mcp_cfg in &initial_mcp_servers {
+        state
+            .mcp_connection_status
+            .insert(mcp_cfg.name.clone(), McpConnStatus::Connecting);
     }
+    mcp_runtime.reconcile(&initial_mcp_servers);
 
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
     let has_initial = !initial_messages.is_empty();
@@ -6947,6 +7089,26 @@ async fn tui_main(
         // 清空子 Agent 事件队列（在 agent 事件之后排空，保证父 ToolStart 先于 Started 应用）
         while let Ok(ev) = sub_rx.try_recv() {
             state.apply_agent_event(AgentEvent::SubAgent(ev));
+        }
+
+        // Resource mutations are applied only after the previous Agent turn is
+        // no longer active. The current turn keeps its immutable snapshot; the
+        // next turn gets the reconciled MCP set atomically.
+        if !state.is_thinking {
+            refresh_tui_agent_definitions(
+                &shared_agent_defs,
+                &shared_agent,
+                &cwd,
+                local_plugin.as_ref(),
+            );
+            refresh_tui_mcp_runtime(
+                &mut mcp_runtime,
+                &mut state,
+                &shared_agent,
+                &mcp_tools,
+                &cwd,
+                local_plugin.as_ref(),
+            );
         }
 
         // 清除过期的粘贴提示
@@ -8362,6 +8524,123 @@ async fn tui_main(
                     }
 
                     // ⓪.58 可用 Agent 类型面板拦截（/agents 命令触发）
+                    if state.extensions_dialog.is_some() {
+                        let pending_action = state
+                            .extensions_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.confirm);
+                        if let Some(action) = pending_action {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Enter => {
+                                    let target = state
+                                        .extensions_dialog
+                                        .as_ref()
+                                        .and_then(|dialog| dialog.selected_record())
+                                        .map(|record| (record.id.clone(), record.scope));
+                                    if let Some((id, scope)) = target {
+                                        let cwd = state.cwd.clone();
+                                        let result = match action {
+                                            ExtensionAction::Enable => {
+                                                wyj_store::extensions::set_enabled(
+                                                    &id, scope, &cwd, true,
+                                                )
+                                            }
+                                            ExtensionAction::Disable => {
+                                                wyj_store::extensions::set_enabled(
+                                                    &id, scope, &cwd, false,
+                                                )
+                                            }
+                                            ExtensionAction::Remove => {
+                                                wyj_store::extensions::remove(&id, scope, &cwd)
+                                            }
+                                        };
+                                        if let Some(dialog) = &mut state.extensions_dialog {
+                                            dialog.confirm = None;
+                                            match result {
+                                                Ok(()) => {
+                                                    dialog.refresh(&cwd);
+                                                    state.messages.push(ChatMessage::system(
+                                                        format!(
+                                                            "{} {id} — applies at the next Agent boundary",
+                                                            ExtensionsDialog::action_label(action)
+                                                        ),
+                                                    ));
+                                                }
+                                                Err(e) => dialog.error = Some(e.to_string()),
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.confirm = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => state.extensions_dialog = None,
+                                KeyCode::Up => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.move_selected(-1);
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.move_selected(1);
+                                    }
+                                }
+                                KeyCode::PageUp => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.detail_scroll =
+                                            dialog.detail_scroll.saturating_sub(8);
+                                    }
+                                }
+                                KeyCode::PageDown => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.detail_scroll =
+                                            dialog.detail_scroll.saturating_add(8);
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.detail_open = !dialog.detail_open;
+                                        dialog.detail_scroll = 0;
+                                    }
+                                }
+                                KeyCode::Char('e') | KeyCode::Char('d') | KeyCode::Char('x') => {
+                                    let action = match key.code {
+                                        KeyCode::Char('e') => ExtensionAction::Enable,
+                                        KeyCode::Char('d') => ExtensionAction::Disable,
+                                        _ => ExtensionAction::Remove,
+                                    };
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        if action == ExtensionAction::Remove
+                                            || dialog.selected_record().is_some_and(|record| {
+                                                (action == ExtensionAction::Enable
+                                                    && !record.enabled)
+                                                    || (action == ExtensionAction::Disable
+                                                        && record.enabled)
+                                            })
+                                        {
+                                            dialog.confirm = Some(action);
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('r') => {
+                                    let cwd = state.cwd.clone();
+                                    if let Some(dialog) = &mut state.extensions_dialog {
+                                        dialog.refresh(&cwd);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+
+                    // ⓪.58 可用 Agent 类型面板拦截（/agents 命令触发）
                     if state.agents_dialog.is_some() {
                         state.ui_focus = UiFocus::AgentsCatalog;
                         match key.code {
@@ -9160,6 +9439,23 @@ async fn tui_main(
                             }
 
                             // ── 其他 slash 命令 ─────────────────────────────
+                            // Skill/Plugin 文件和 lockfile 可能刚刚由 `/extensions`、
+                            // `/skills` 或 `/plugins` 修改；在每次 slash dispatch 前重建
+                            // 轻量命令注册表，使下一次命令立即看到新资源，不要求重启。
+                            let disabled_skills = wyj_store::disabled_skill_names(&cwd);
+                            let mut current_plugin_skill_sources =
+                                wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
+                            if let Some(local) = &local_plugin {
+                                current_plugin_skill_sources.extend(local.skill_paths.clone());
+                            }
+                            cmd_registry = standard_registry_with_skills(
+                                &std::env::var("HOME")
+                                    .map(std::path::PathBuf::from)
+                                    .unwrap_or_default(),
+                                &cwd,
+                                &disabled_skills,
+                                &current_plugin_skill_sources,
+                            );
                             let (estimated, cache_read, cache_write) = {
                                 let sess = session.lock().await;
                                 (
@@ -9453,14 +9749,14 @@ async fn tui_main(
                                     Ok(CommandResult::RunPromptScoped {
                                         text,
                                         allowed_tools,
-                                        profile: _,
+                                        profile,
                                     }) => {
                                         // 带 allowed-tools 的自定义命令：临时把 permission_mode
                                         // 收紧为 Allowlist，这一轮跑完（含 ESC 中断的场景，靠
                                         // RestorePermissionOnDrop 的 Drop 兜底）自动还原快照；
                                         // 不改 shared_mode，状态栏 Normal/Plan/Bypass 显示不受
-                                        // 影响。`profile`（model: frontmatter）本版本仅解析存储、
-                                        // 不做运行期切换，此处忽略。
+                                        // 影响。`profile` 若存在，则只为这一轮构造一个临时
+                                        // Agent；主会话 active profile 不会被修改。
                                         state.push_user(text.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
@@ -9468,7 +9764,33 @@ async fn tui_main(
                                         state.turn_start_input_tokens = state.total_input_tokens;
                                         state.turn_start_output_tokens = state.total_output_tokens;
 
-                                        let agent_c = shared_agent.read().unwrap().clone();
+                                        let agent_c = if let Some(profile_name) = profile {
+                                            let mut scoped_cfg = state.config.clone();
+                                            if scoped_cfg.profile_by_name(&profile_name).is_none() {
+                                                state.messages.push(ChatMessage::assistant_err(
+                                                    format!(
+                                                        "[skill] 未找到 Profile: {profile_name}"
+                                                    ),
+                                                ));
+                                                continue;
+                                            }
+                                            scoped_cfg.active_profile = profile_name;
+                                            let scoped_model =
+                                                scoped_cfg.model_for_mode(&state.mode).to_string();
+                                            match rebuild_fn(&scoped_cfg, &scoped_model) {
+                                                Ok(agent) => Arc::new(agent),
+                                                Err(e) => {
+                                                    state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                        "[skill] 构造临时 Profile Agent 失败: {e}"
+                                                    )),
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            shared_agent.read().unwrap().clone()
+                                        };
                                         let session_c = session.clone();
                                         let tx = agent_tx.clone();
                                         let ctx_cwd = cwd.clone();
@@ -9669,6 +9991,10 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::OpenPluginsDialog) => {
                                         state.plugins_dialog = Some(PluginsDialog::new(&state.cwd));
+                                    }
+                                    Ok(CommandResult::OpenExtensionsDialog) => {
+                                        state.extensions_dialog =
+                                            Some(ExtensionsDialog::new(&state.cwd));
                                     }
                                     Ok(CommandResult::OpenAgentsDialog { defs, .. }) => {
                                         state.agents_dialog = Some(AgentsDialog::new(defs));
@@ -10741,6 +11067,72 @@ mod ask_question_dialog_tests {
         let _ = dlg.response_tx.send(Some(answers));
         let received = rx.await.unwrap();
         assert_eq!(received.map(|v| v.len()), Some(2));
+    }
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    /// 面板打开后拦截全部按键，用户不再有滚动手段：打开时必须强制回到贴底
+    /// 跟随并清掉选中锚点，否则此前上滚/选中留下的视口位置会把附加在聊天区
+    /// 尾部的选项区裁出可视范围且无法找回（遮挡回归，见 AskQuestions 事件处理）。
+    #[test]
+    fn ask_questions_event_forces_follow_tail_and_clears_selection() {
+        let mut state = make_state();
+        state.chat_follow_tail = false;
+        state.unseen_messages = true;
+        state.selected_message_id = Some(7);
+        state.selected_message_anchor = Some(ChatSelectionAnchor::Top);
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.apply_agent_event(AgentEvent::AskQuestions {
+            questions: vec![single_spec("Q1")],
+            response_tx: tx,
+        });
+
+        assert!(state.ask_question_dialog.is_some());
+        assert!(state.chat_follow_tail);
+        assert!(!state.unseen_messages);
+        assert_eq!(state.selected_message_id, None);
+        assert!(state.selected_message_anchor.is_none());
+    }
+
+    /// AskQuestion 面板打开期间豁免"最后可折叠 ToolResult"对冻结边界的封顶，
+    /// 让面板之前的长正文得以冻结进终端 scrollback（规则①仍会把边界卡在
+    /// 未完成的 AskQuestion ToolCall 上）；面板关闭后封顶恢复。
+    #[test]
+    fn freeze_collapsible_bound_exempted_while_dialog_open() {
+        let mut state = make_state();
+        state.push_message(ChatMessage::tool_call("Read(x)".to_string(), 1));
+        state.push_message(ChatMessage::tool_result(
+            (1..=10)
+                .map(|i| format!("line-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            false,
+            0.1,
+            1,
+            "Read".to_string(),
+            "line-1".to_string(),
+            false,
+        ));
+        state.push_message(ChatMessage::assistant("提问前的长分析正文".to_string()));
+
+        assert_eq!(freeze_collapsible_bound(&state), Some(1));
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.ask_question_dialog = Some(AskQuestionDialog::new(vec![single_spec("Q1")], tx));
+        assert_eq!(freeze_collapsible_bound(&state), None);
+
+        state.ask_question_dialog = None;
+        assert_eq!(freeze_collapsible_bound(&state), Some(1));
     }
 }
 

@@ -100,9 +100,9 @@ impl Tool for EditTool {
 
         let count = content.matches(&inp.old_string as &str).count();
         if count == 0 {
-            return Ok(ToolResult::err(format!(
-                "未找到目标字符串。请确认内容与文件精确匹配（含缩进、换行）。"
-            )));
+            return Ok(ToolResult::err(
+                "未找到目标字符串。请确认内容与文件精确匹配（含缩进、换行）。".to_string(),
+            ));
         }
         if count > 1 && !inp.replace_all {
             return Ok(ToolResult::err(format!(

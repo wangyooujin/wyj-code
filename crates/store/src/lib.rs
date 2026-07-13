@@ -7,6 +7,7 @@
 //! 配置信息写入本地文件（config.toml、`.wyj/mcp.toml`、`.md`、lockfile），绝不
 //! shell out 执行 `npm install`/`pip install` 之类的依赖安装命令。
 
+pub mod extensions;
 pub mod lockfile;
 pub mod marketplace;
 pub mod mcp_install;

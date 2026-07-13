@@ -113,6 +113,7 @@
       'changelog.kicker': 'Changelog',
       'changelog.title': '版本亮点',
       'changelog.latest': '最新',
+      'changelog.v122': '统一 Extensions 中心管理 Skill / MCP / Plugin，支持热应用、诊断与兼容迁移；安装、锁定与回滚更可靠；上下文压缩更稳，MiniMax / GLM / DeepSeek 已完成请求采用供应商精确 usage 账务。',
       'changelog.v121': 'TUI 消息流重构（thinking / 工具块 / Ctrl+O 展开应用内滚动）；Profile 新增 prompt_cache / openai_stream_options 兼容开关，GLM / Kimi / DeepSeek 等国内模型官方开箱即用；/cost 与 stats JSON 补全 full input / 缓存命中率 / context 指标。',
       'changelog.v120': '自定义 Slash 命令对齐真实 Claude Code（识别 <code class="text-amber-400">~/.claude/commands/*.md</code>）；性能实测（12MB / ~10ms）与依赖排查；预编译包新增一键安装脚本 install.sh / install.bat。',
       'changelog.v110': '新增 Hooks 生命周期自动化系统（PreToolUse / PostToolUse / UserPromptSubmit / Stop）；开源产品化基线（LICENSE、CONTRIBUTING、CHANGELOG）。',
@@ -241,6 +242,7 @@
       'changelog.kicker': 'Changelog',
       'changelog.title': 'Release highlights',
       'changelog.latest': 'Latest',
+      'changelog.v122': 'A unified Extensions center manages Skills, MCP servers, and Plugins with hot apply, diagnostics, and compatibility migration; installation, locking, and rollback are more reliable; context compaction is safer, while completed MiniMax / GLM / DeepSeek requests use provider-reported usage for exact accounting.',
       'changelog.v121': 'TUI message stream refactor (thinking inline, tool blocks, Ctrl+O expand with in-app scrolling); Profile gained prompt_cache / openai_stream_options compatibility switches so GLM / Kimi / DeepSeek and other Chinese models work out of the box; /cost and stats JSON now expose full input / cache-hit ratio / context metrics.',
       'changelog.v120': 'Custom slash commands aligned with real Claude Code (discovers <code class="text-amber-400">~/.claude/commands/*.md</code>); measured performance (12MB / ~10ms) with a dependency audit; prebuilt archives now bundle one-shot install.sh / install.bat.',
       'changelog.v110': 'Added the Hooks lifecycle automation system (PreToolUse / PostToolUse / UserPromptSubmit / Stop); open-source productization baseline (LICENSE, CONTRIBUTING, CHANGELOG).',
@@ -318,7 +320,11 @@
       if (!codeEl) return;
       var originalIcon = btn.innerHTML;
       btn.addEventListener('click', function () {
-        var text = codeEl.textContent;
+        // Some snippets render a shell prompt for visual context. Copy an
+        // explicit command when provided so the prompt is never executable
+        // input accidentally.
+        var explicitText = btn.getAttribute('data-copy-text');
+        var text = explicitText !== null ? explicitText : codeEl.textContent;
         var done = function () {
           btn.innerHTML = '<svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-check"/></svg>';
           setTimeout(function () { btn.innerHTML = originalIcon; }, 1600);

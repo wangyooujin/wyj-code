@@ -211,6 +211,7 @@ enum ContentBlockStart {
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 enum BlockDelta {
     TextDelta { text: String },
     InputJsonDelta { partial_json: String },
@@ -481,6 +482,22 @@ impl Provider for AnthropicProvider {
     }
 }
 
+/// Anthropic 兼容供应商返回的 usage 是其对已序列化请求的实际计数。GLM 与
+/// MiniMax 的兼容端点可能把它放在 `message_start` 或 `message_delta`，统一在
+/// 此处转换，避免两个分支的语义漂移。
+fn usage_event(usage: UsageData) -> Option<StreamEvent> {
+    let input = usage.input_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+    let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
+    (input > 0 || output > 0 || cache_read > 0 || cache_write > 0).then_some(StreamEvent::Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_write,
+    })
+}
+
 /// 将单个 SSE 原始事件解析为零或多个 StreamEvent
 fn parse_sse_item(
     item: Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>,
@@ -500,23 +517,10 @@ fn parse_sse_item(
         }
     };
     match parsed {
-        SseEvent::MessageStart { message } => {
-            if let Some(usage) = message.usage {
-                let input = usage.input_tokens.unwrap_or(0);
-                let output = usage.output_tokens.unwrap_or(0);
-                let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
-                let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
-                if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
-                    return vec![Ok(StreamEvent::Usage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_write,
-                    })];
-                }
-            }
-            vec![]
-        }
+        SseEvent::MessageStart { message } => message
+            .usage
+            .and_then(usage_event)
+            .map_or_else(Vec::new, |event| vec![Ok(event)]),
         SseEvent::ContentBlockStart { content_block, .. } => match content_block {
             ContentBlockStart::ToolUse { id, name } => {
                 vec![Ok(StreamEvent::ToolUseStart { id, name })]
@@ -552,19 +556,8 @@ fn parse_sse_item(
             let mut out = vec![Ok(StreamEvent::MessageStop { stop_reason })];
             // message_delta.usage 携带本次调用的真实 input+output token 数
             // MiniMax 等供应商只在此处给出实际计数，message_start 里均为 0
-            if let Some(u) = usage {
-                let input = u.input_tokens.unwrap_or(0);
-                let output = u.output_tokens.unwrap_or(0);
-                let cache_read = u.cache_read_input_tokens.unwrap_or(0);
-                let cache_write = u.cache_creation_input_tokens.unwrap_or(0);
-                if input > 0 || output > 0 || cache_read > 0 || cache_write > 0 {
-                    out.push(Ok(StreamEvent::Usage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_input_tokens: cache_read,
-                        cache_creation_input_tokens: cache_write,
-                    }));
-                }
+            if let Some(event) = usage.and_then(usage_event) {
+                out.push(Ok(event));
             }
             out
         }
@@ -648,5 +641,25 @@ mod tests {
         assert!(json.contains(r#""signature":"sig""#));
         assert!(json.contains(r#""type":"redacted_thinking""#));
         assert!(json.contains(r#""data":"opaque""#));
+    }
+
+    #[test]
+    fn anthropic_compatible_usage_is_preserved_as_exact_token_usage() {
+        let event = usage_event(UsageData {
+            input_tokens: Some(1_024),
+            output_tokens: Some(256),
+            cache_read_input_tokens: Some(128),
+            cache_creation_input_tokens: Some(64),
+        })
+        .expect("non-empty provider usage should produce an event");
+        assert!(matches!(
+            event,
+            StreamEvent::Usage {
+                input_tokens: 1_024,
+                output_tokens: 256,
+                cache_read_input_tokens: 128,
+                cache_creation_input_tokens: 64,
+            }
+        ));
     }
 }

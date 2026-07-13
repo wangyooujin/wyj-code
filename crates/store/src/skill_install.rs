@@ -55,6 +55,7 @@ fn install_skill_from_cache(cache_dir: &Path, req: &SkillInstallRequest, cwd: &P
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("创建 skill 目录失败: {}", dest_dir.display()))?;
     let dest_path = dest_dir.join(format!("{name}.md"));
+    let previous_content = std::fs::read(&dest_path).ok();
     std::fs::write(&dest_path, content)
         .with_context(|| format!("写入 skill 文件失败: {}", dest_path.display()))?;
 
@@ -65,6 +66,8 @@ fn install_skill_from_cache(cache_dir: &Path, req: &SkillInstallRequest, cwd: &P
         .iter()
         .find(|e| e.name == name)
         .map(|e| e.installed_at);
+    let extension_id = format!("skill:{name}");
+    let marketplace_commit = marketplace::git_head_short(cache_dir);
     upsert_skill_entry(
         &mut manifest,
         InstalledSkillEntry {
@@ -81,7 +84,34 @@ fn install_skill_from_cache(cache_dir: &Path, req: &SkillInstallRequest, cwd: &P
             updated_at: now,
         },
     );
-    lockfile::save_scope(req.scope, cwd, &manifest)
+    lockfile::upsert_extension(
+        &mut manifest,
+        lockfile::ExtensionLockEntry {
+            id: extension_id,
+            kind: lockfile::ExtensionKind::Skill,
+            scope: req.scope,
+            source: Some(req.marketplace_url.clone()),
+            version: Some(req.entry.version.clone()),
+            commit: marketplace_commit,
+            digest: None,
+            enabled: true,
+            dependencies: Vec::new(),
+            installed_at: existing_installed_at.unwrap_or(now),
+            updated_at: now,
+        },
+    );
+    if let Err(error) = lockfile::save_scope(req.scope, cwd, &manifest) {
+        match previous_content {
+            Some(content) => {
+                let _ = std::fs::write(&dest_path, content);
+            }
+            None => {
+                let _ = std::fs::remove_file(&dest_path);
+            }
+        }
+        return Err(error).context("写入 skill lockfile 失败，已回滚 skill 文件");
+    }
+    Ok(())
 }
 
 /// 升级：重新 sync 该 skill 所属 marketplace 拿最新版本，若版本变化则重新拷贝内容
@@ -140,6 +170,7 @@ pub fn uninstall_skill(name: &str, scope: InstallScope, cwd: &Path) -> Result<()
     }
     let mut manifest = lockfile::load_scope(scope, cwd)?;
     manifest.skills.retain(|e| e.name != name);
+    lockfile::remove_extension(&mut manifest, &format!("skill:{name}"));
     lockfile::save_scope(scope, cwd, &manifest)
 }
 
@@ -161,6 +192,28 @@ pub fn set_skill_enabled(name: &str, scope: InstallScope, cwd: &Path, enabled: b
             installed_at: now,
             updated_at: now,
         });
+    }
+    let id = format!("skill:{name}");
+    if let Some(existing) = manifest.extensions.iter_mut().find(|e| e.id == id) {
+        existing.enabled = enabled;
+        existing.updated_at = now;
+    } else {
+        lockfile::upsert_extension(
+            &mut manifest,
+            lockfile::ExtensionLockEntry {
+                id,
+                kind: lockfile::ExtensionKind::Skill,
+                scope,
+                source: None,
+                version: None,
+                commit: None,
+                digest: None,
+                enabled,
+                dependencies: Vec::new(),
+                installed_at: now,
+                updated_at: now,
+            },
+        );
     }
     lockfile::save_scope(scope, cwd, &manifest)
 }

@@ -131,7 +131,7 @@ fn auto_discover_skills(dir: &Path) -> Result<Vec<MarketplaceSkillEntry>> {
     Ok(entries)
 }
 
-fn git_head_short(dir: &Path) -> Option<String> {
+pub fn git_head_short(dir: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["-C", &dir.to_string_lossy(), "rev-parse", "--short", "HEAD"])
         .output()

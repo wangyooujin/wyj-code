@@ -35,7 +35,9 @@ impl OpenAIProvider {
             api_key,
             base_url,
             model: model.to_string(),
-            stream_options: cfg.active_profile().effective_openai_stream_options(),
+            stream_options: cfg
+                .active_profile()
+                .effective_openai_stream_options_for_model(model),
         })
     }
 }
@@ -245,6 +247,80 @@ fn parse_stop_reason(s: &str) -> StopReason {
     }
 }
 
+/// 将供应商返回的 usage 原样转换为内部账本事件。`prompt_tokens` 是供应商针对
+/// 实际序列化请求计算的值，包含 system、tool schema 与消息包装，因此它比本地
+/// 启发式估算更适合作为 MiniMax / GLM / DeepSeek 的精确用量来源。
+fn usage_event(usage: UsageData) -> StreamEvent {
+    // OpenAI 兼容 API 的 prompt_tokens 含缓存命中部分；内部账本沿用 Anthropic
+    // 语义，把未缓存输入与 cache read 分开存，但两者之和仍是精确 prompt token 数。
+    let cached = usage
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|d| d.cached_tokens)
+        .unwrap_or(0);
+    let prompt = usage.prompt_tokens.unwrap_or(0);
+    StreamEvent::Usage {
+        input_tokens: prompt.saturating_sub(cached),
+        output_tokens: usage.completion_tokens.unwrap_or(0),
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: 0,
+    }
+}
+
+/// 一个 SSE chunk 可能同时携带 finish_reason 与 usage。旧实现只在 choices 为空
+/// 时读取 usage，导致部分 OpenAI 兼容服务的精确 token 被静默丢弃。
+fn stream_events_from_chunk(
+    tool_map: &mut std::collections::HashMap<usize, PendingToolCall>,
+    chunk: SseChunk,
+) -> Vec<StreamEvent> {
+    let mut events = vec![];
+
+    if let Some(choice) = chunk.choices.into_iter().next() {
+        if let Some(fr) = choice.finish_reason {
+            events.push(StreamEvent::MessageStop {
+                stop_reason: parse_stop_reason(&fr),
+            });
+        } else if let Some(text) = choice.delta.content {
+            if !text.is_empty() {
+                events.push(StreamEvent::TextDelta(text));
+            }
+        } else if let Some(tcs) = choice.delta.tool_calls {
+            for tc in tcs {
+                let idx = tc.index;
+                let pending = tool_map.entry(idx).or_default();
+                if let Some(id) = tc.id {
+                    pending.id = Some(id);
+                }
+                if let Some(func) = tc.function {
+                    if let Some(name) = func.name {
+                        pending.name = Some(name);
+                    }
+                    if !pending.started {
+                        if let (Some(id), Some(name)) = (pending.id.clone(), pending.name.clone()) {
+                            pending.started = true;
+                            events.push(StreamEvent::ToolUseStart { id, name });
+                        }
+                    }
+                    if let Some(args) = func.arguments {
+                        if let Some(id) = pending.id.clone() {
+                            events.push(StreamEvent::ToolUseDelta {
+                                id,
+                                json_delta: args,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(usage) = chunk.usage {
+        events.push(usage_event(usage));
+    }
+
+    events
+}
+
 // ── Provider 实现 ─────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -304,103 +380,104 @@ impl Provider for OpenAIProvider {
         let byte_stream = resp.bytes_stream();
         let sse = byte_stream.eventsource();
 
-        // scan 维护 tool_id_map 状态：闭包始终返回 Some(Option<Event>) 防止提前终止流
-        // filter_map 剥掉内层 None（跳过无关帧）
+        // scan 维护 tool_id_map；一个 SSE chunk 可拆成多个内部事件（例如终止原因
+        // 与精确 usage 同时出现），随后 flat_map 按原顺序输出。
         let stream = sse
             .scan(
                 std::collections::HashMap::<usize, PendingToolCall>::new(),
                 |tool_map, item| {
-                    let result: Option<Result<StreamEvent>> = (|| {
-                        let event = match item {
-                            Ok(e) => e,
-                            Err(e) => return Some(Err(anyhow::anyhow!("SSE 读取失败: {e}"))),
-                        };
-                        if event.data == "[DONE]" {
-                            return None;
-                        }
-                        let chunk: SseChunk = match serde_json::from_str(&event.data) {
-                            Ok(v) => v,
+                    let events: Option<Vec<Result<StreamEvent>>> = match item {
+                        Ok(event) if event.data == "[DONE]" => None,
+                        Ok(event) => match serde_json::from_str::<SseChunk>(&event.data) {
+                            Ok(chunk) => Some(
+                                stream_events_from_chunk(tool_map, chunk)
+                                    .into_iter()
+                                    .map(Ok)
+                                    .collect(),
+                            ),
                             Err(e) => {
                                 tracing::debug!("OpenAI SSE 跳过: {e}");
-                                return None;
+                                Some(vec![])
                             }
-                        };
-
-                        if chunk.choices.is_empty() {
-                            if let Some(usage) = chunk.usage {
-                                // OpenAI 的 prompt_tokens 含缓存命中部分，与 Anthropic
-                                // （input_tokens 不含缓存）语义对齐：扣减后单列 cache_read。
-                                let cached = usage
-                                    .prompt_tokens_details
-                                    .as_ref()
-                                    .and_then(|d| d.cached_tokens)
-                                    .unwrap_or(0);
-                                let prompt = usage.prompt_tokens.unwrap_or(0);
-                                return Some(Ok(StreamEvent::Usage {
-                                    input_tokens: prompt.saturating_sub(cached),
-                                    output_tokens: usage.completion_tokens.unwrap_or(0),
-                                    cache_read_input_tokens: cached,
-                                    cache_creation_input_tokens: 0,
-                                }));
-                            }
-                            return None;
-                        }
-
-                        let choice = chunk.choices.into_iter().next()?;
-
-                        if let Some(fr) = choice.finish_reason {
-                            return Some(Ok(StreamEvent::MessageStop {
-                                stop_reason: parse_stop_reason(&fr),
-                            }));
-                        }
-
-                        if let Some(text) = choice.delta.content {
-                            if !text.is_empty() {
-                                return Some(Ok(StreamEvent::TextDelta(text)));
-                            }
-                        }
-
-                        if let Some(tcs) = choice.delta.tool_calls {
-                            for tc in tcs {
-                                let idx = tc.index;
-                                let pending = tool_map.entry(idx).or_default();
-                                if let Some(id) = tc.id {
-                                    pending.id = Some(id);
-                                }
-                                if let Some(func) = tc.function {
-                                    if let Some(name) = func.name {
-                                        pending.name = Some(name);
-                                    }
-                                    if !pending.started {
-                                        if let (Some(id), Some(name)) =
-                                            (pending.id.clone(), pending.name.clone())
-                                        {
-                                            pending.started = true;
-                                            return Some(Ok(StreamEvent::ToolUseStart {
-                                                id,
-                                                name,
-                                            }));
-                                        }
-                                    }
-                                    if let Some(args) = func.arguments {
-                                        if let Some(id) = pending.id.clone() {
-                                            return Some(Ok(StreamEvent::ToolUseDelta {
-                                                id,
-                                                json_delta: args,
-                                            }));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })();
-                    // 始终返回 Some(...) 确保 scan 不提前终止流
-                    futures::future::ready(Some(result))
+                        },
+                        Err(e) => Some(vec![Err(anyhow::anyhow!("SSE 读取失败: {e}"))]),
+                    };
+                    futures::future::ready(events)
                 },
             )
-            .filter_map(futures::future::ready);
+            .flat_map(futures::stream::iter);
 
         Ok(Box::pin(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_chunk_keeps_usage_for_exact_token_accounting() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta::default(),
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: Some(UsageData {
+                prompt_tokens: Some(120),
+                completion_tokens: Some(30),
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(40),
+                }),
+            }),
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert!(matches!(
+            events[0],
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            StreamEvent::Usage {
+                input_tokens: 80,
+                output_tokens: 30,
+                cache_read_input_tokens: 40,
+                cache_creation_input_tokens: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn one_chunk_can_emit_tool_start_and_arguments() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".to_string()),
+                        function: Some(FunctionDelta {
+                            name: Some("Read".to_string()),
+                            arguments: Some(r#"{"path":"Cargo.toml"}"#.to_string()),
+                        }),
+                    }]),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert!(matches!(
+            events[0],
+            StreamEvent::ToolUseStart { ref id, ref name } if id == "call_1" && name == "Read"
+        ));
+        assert!(matches!(
+            events[1],
+            StreamEvent::ToolUseDelta { ref id, ref json_delta }
+                if id == "call_1" && json_delta == r#"{"path":"Cargo.toml"}"#
+        ));
     }
 }

@@ -10,6 +10,7 @@ use crate::plugin_install;
 use crate::registry::{RegistryClient, RegistryPackage, RegistryServerSummary};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use wyj_config::{Config, McpServerConfig, McpTransport};
@@ -173,6 +174,17 @@ fn resolve_package(package: &PackageChoice) -> Result<ResolvedPackage> {
     }
 }
 
+fn package_digest(package: &ResolvedPackage) -> String {
+    let canonical = format!(
+        "{}:{}@{}:{}",
+        package.package_registry_type,
+        package.package_identifier,
+        package.package_version,
+        package.args.join("\u{1f}")
+    );
+    format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
 fn upsert_by_name(list: &mut Vec<McpServerConfig>, item: McpServerConfig) {
     if let Some(existing) = list.iter_mut().find(|s| s.name == item.name) {
         *existing = item;
@@ -191,6 +203,32 @@ fn upsert_mcp_config(mcp_config: McpServerConfig, scope: InstallScope, cwd: &Pat
         InstallScope::Project => {
             let mut servers = wyj_config::load_project_mcp(cwd)?;
             upsert_by_name(&mut servers, mcp_config);
+            wyj_config::save_project_mcp(cwd, &servers)
+        }
+    }
+}
+
+fn restore_mcp_config(
+    name: &str,
+    previous: Option<McpServerConfig>,
+    scope: InstallScope,
+    cwd: &Path,
+) -> Result<()> {
+    match scope {
+        InstallScope::Global => {
+            let mut cfg = Config::load()?;
+            cfg.mcp_servers.retain(|server| server.name != name);
+            if let Some(previous) = previous {
+                cfg.mcp_servers.push(previous);
+            }
+            cfg.save()
+        }
+        InstallScope::Project => {
+            let mut servers = wyj_config::load_project_mcp(cwd)?;
+            servers.retain(|server| server.name != name);
+            if let Some(previous) = previous {
+                servers.push(previous);
+            }
             wyj_config::save_project_mcp(cwd, &servers)
         }
     }
@@ -215,6 +253,19 @@ pub fn install_mcp_server(req: &McpInstallRequest, cwd: &Path) -> Result<()> {
         .name_override
         .clone()
         .unwrap_or_else(|| default_server_short_name(&req.server.name));
+    let extension_id = format!("mcp:{name}");
+    let package_version = resolved.package_version.clone();
+    let package_digest = package_digest(&resolved);
+
+    let previous_config = match req.scope {
+        InstallScope::Global => Config::load()?
+            .mcp_servers
+            .into_iter()
+            .find(|server| server.name == name),
+        InstallScope::Project => wyj_config::load_project_mcp(cwd)?
+            .into_iter()
+            .find(|server| server.name == name),
+    };
 
     let mcp_config = McpServerConfig {
         name: name.clone(),
@@ -222,6 +273,8 @@ pub fn install_mcp_server(req: &McpInstallRequest, cwd: &Path) -> Result<()> {
         command: Some(resolved.command),
         args: resolved.args,
         env: resolved.env,
+        url: None,
+        headers: Default::default(),
     };
     upsert_mcp_config(mcp_config, req.scope, cwd).context("写入 MCP server 配置失败")?;
 
@@ -235,7 +288,7 @@ pub fn install_mcp_server(req: &McpInstallRequest, cwd: &Path) -> Result<()> {
     upsert_lockfile_entry(
         &mut manifest,
         InstalledMcpEntry {
-            name,
+            name: name.clone(),
             version: Some(resolved.package_version),
             source: Some(McpSource::Registry {
                 registry_url: req.registry_url.clone(),
@@ -248,7 +301,31 @@ pub fn install_mcp_server(req: &McpInstallRequest, cwd: &Path) -> Result<()> {
             updated_at: now,
         },
     );
-    lockfile::save_scope(req.scope, cwd, &manifest).context("写入 lockfile 失败")
+    lockfile::upsert_extension(
+        &mut manifest,
+        lockfile::ExtensionLockEntry {
+            id: extension_id,
+            kind: lockfile::ExtensionKind::Mcp,
+            scope: req.scope,
+            source: Some(req.registry_url.clone()),
+            version: Some(package_version),
+            commit: None,
+            digest: Some(package_digest),
+            enabled: true,
+            dependencies: Vec::new(),
+            installed_at: existing_installed_at.unwrap_or(now),
+            updated_at: now,
+        },
+    );
+    if let Err(error) = lockfile::save_scope(req.scope, cwd, &manifest) {
+        if let Err(rollback_error) = restore_mcp_config(&name, previous_config, req.scope, cwd) {
+            return Err(error).context(format!(
+                "写入 lockfile 失败，配置回滚也失败: {rollback_error}"
+            ));
+        }
+        return Err(error).context("写入 lockfile 失败，已回滚 MCP 配置");
+    }
+    Ok(())
 }
 
 /// 升级：重新从该条目当初安装时记录的 registry 源（而非用户当前在面板里选中
@@ -325,6 +402,7 @@ pub fn uninstall_mcp_server(name: &str, scope: InstallScope, cwd: &Path) -> Resu
 
     let mut manifest = lockfile::load_scope(scope, cwd)?;
     manifest.mcp_servers.retain(|e| e.name != name);
+    lockfile::remove_extension(&mut manifest, &format!("mcp:{name}"));
     lockfile::save_scope(scope, cwd, &manifest)
 }
 
@@ -345,6 +423,28 @@ pub fn set_mcp_enabled(name: &str, scope: InstallScope, cwd: &Path, enabled: boo
             installed_at: now,
             updated_at: now,
         });
+    }
+    let id = format!("mcp:{name}");
+    if let Some(existing) = manifest.extensions.iter_mut().find(|e| e.id == id) {
+        existing.enabled = enabled;
+        existing.updated_at = now;
+    } else {
+        lockfile::upsert_extension(
+            &mut manifest,
+            lockfile::ExtensionLockEntry {
+                id,
+                kind: lockfile::ExtensionKind::Mcp,
+                scope,
+                source: None,
+                version: None,
+                commit: None,
+                digest: None,
+                enabled,
+                dependencies: Vec::new(),
+                installed_at: now,
+                updated_at: now,
+            },
+        );
     }
     lockfile::save_scope(scope, cwd, &manifest)
 }
@@ -567,6 +667,8 @@ mod tests {
                 command: Some("npx".to_string()),
                 args: vec![],
                 env: Default::default(),
+                url: None,
+                headers: Default::default(),
             }],
         ));
         lockfile::save_project(dir.path(), &manifest).unwrap();
@@ -586,6 +688,8 @@ mod tests {
                 command: Some("user-configured".to_string()),
                 args: vec![],
                 env: Default::default(),
+                url: None,
+                headers: Default::default(),
             }],
             ..wyj_config::Config::default()
         };
@@ -599,6 +703,8 @@ mod tests {
                 command: Some("plugin-provided".to_string()),
                 args: vec![],
                 env: Default::default(),
+                url: None,
+                headers: Default::default(),
             }],
         ));
         lockfile::save_project(dir.path(), &manifest).unwrap();

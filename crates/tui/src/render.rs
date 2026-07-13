@@ -2,14 +2,14 @@
 
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, ChatSelectionAnchor, ExecModeConfirmDialog, FlatRow,
-    InProgressAnswer, InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog,
-    MemoryRow, MessageRole, PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog,
-    PluginsDialogTab, ProfileDialog, ProfileInputField, ProfileOverlay, ProfileRow,
-    SessionPickerState, SettingsDialog, SkillsDialog, SkillsDialogTab, SkillsOverlay,
-    SubAgentStatus, SubAgentUiState, SubToolLine, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
-    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT,
-    SETTINGS_FIELD_LABEL_KEYS,
+    AskQuestionStage, Attachment, ChatMessage, ChatSelectionAnchor, ExecModeConfirmDialog,
+    ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
+    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
+    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
+    ProfileInputField, ProfileOverlay, ProfileRow, SessionPickerState, SettingsDialog,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
+    PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -324,6 +324,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     if let Some(dialog) = &mut state.agents_dialog {
         draw_agents_dialog(f, dialog, area);
     }
+
+    if let Some(dialog) = &mut state.extensions_dialog {
+        draw_extensions_dialog(f, dialog, area);
+    }
 }
 
 /// 底部面板类型与高度
@@ -552,6 +556,7 @@ fn clean_thinking_lines(content: &str) -> Vec<&str> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     msg_id: u64,
@@ -1264,6 +1269,7 @@ pub(crate) fn build_frozen_chat_lines(
     lines
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_inline_todo_lines(
     lines: &mut Vec<Line<'static>>,
     items: &[wyj_tools::todo::TodoItem],
@@ -1443,6 +1449,7 @@ fn push_inline_todo_lines(
     next_scroll
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_todo_detail_lines(
     lines: &mut Vec<Line<'static>>,
     item: &wyj_tools::todo::TodoItem,
@@ -1781,7 +1788,7 @@ fn push_wrapped_detail_line(
         let line_prefix = if idx == 0 {
             prefix.clone()
         } else {
-            "  ".repeat(1) + &" ".repeat(label.len() + 2)
+            "  ".to_string() + &" ".repeat(label.len() + 2)
         };
         lines.push(Line::from(Span::styled(
             format!("{line_prefix}{wrapped}"),
@@ -3141,8 +3148,12 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
     let label_width = 18usize;
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for idx in 0..SETTINGS_FIELD_COUNT {
-        let label = wyj_i18n::tr(SETTINGS_FIELD_LABEL_KEYS[idx]);
+    for (idx, key) in SETTINGS_FIELD_LABEL_KEYS
+        .iter()
+        .enumerate()
+        .take(SETTINGS_FIELD_COUNT)
+    {
+        let label = wyj_i18n::tr(key);
         let selected = idx == dialog.selected;
         let value = dialog.draft.display_value(idx);
 
@@ -4220,6 +4231,177 @@ fn draw_agents_dialog(f: &mut Frame, dialog: &mut AgentsDialog, area: Rect) {
             Theme::dim(),
         )),
     ];
+    f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+}
+
+fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Rect) {
+    let list_rows = dialog.records.len().clamp(1, MAX_LIST_VIEWPORT);
+    let detail_rows = if dialog.detail_open { 10 } else { 0 };
+    let footer_rows = if dialog.confirm.is_some() { 3 } else { 2 };
+    let content_lines = list_rows as u16 + detail_rows + footer_rows + 1;
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 9 / 10).clamp(72, 140).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            " Extensions ",
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(list_rows as u16),
+            Constraint::Min(1),
+            Constraint::Length(footer_rows),
+        ])
+        .split(inner);
+
+    let list_area = chunks[0];
+    let mut lines = Vec::new();
+    if dialog.records.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No managed or configured extensions found.",
+            Theme::dim(),
+        )));
+    } else {
+        let start = scroll_window_start(dialog.records.len(), dialog.selected, list_rows);
+        for (pos, record) in dialog
+            .records
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(list_rows)
+        {
+            let selected = pos == dialog.selected;
+            let marker = if selected { "▶ " } else { "  " };
+            let status = if !record.enabled {
+                "disabled"
+            } else if record.effective {
+                "active"
+            } else {
+                "inactive"
+            };
+            let version = record.version.as_deref().unwrap_or("-");
+            let text = truncate_line(
+                &format!(
+                    "{marker}{:<30} {:<7} {:<8} {:<12} v{}",
+                    record.id,
+                    format!("{:?}", record.scope).to_lowercase(),
+                    status,
+                    record.health,
+                    version
+                ),
+                list_area.width as usize,
+            );
+            let style = if selected {
+                Style::default()
+                    .fg(Theme::CLAUDE)
+                    .add_modifier(Modifier::BOLD)
+            } else if !record.enabled {
+                Theme::dim()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), list_area);
+
+    if dialog.detail_open {
+        if let Some(record) = dialog.selected_record() {
+            let detail_area = chunks[1];
+            let width = detail_area.width.saturating_sub(2) as usize;
+            let mut detail_lines = Vec::new();
+            let mut fields = vec![
+                format!("id: {}", record.id),
+                format!("kind: {:?}", record.kind),
+                format!("scope: {:?}", record.scope),
+                format!("health: {}", record.health),
+                format!(
+                    "enabled: {}  effective: {}",
+                    record.enabled, record.effective
+                ),
+                format!("version: {}", record.version.as_deref().unwrap_or("-")),
+                format!("source: {}", record.source.as_deref().unwrap_or("-")),
+                format!(
+                    "commit: {}  digest: {}",
+                    record.commit.as_deref().unwrap_or("-"),
+                    record.digest.as_deref().unwrap_or("-")
+                ),
+            ];
+            if !record.dependencies.is_empty() {
+                fields.push(format!("dependencies: {}", record.dependencies.join(", ")));
+            }
+            for (key, value) in &record.details {
+                fields.push(format!("{key}: {value}"));
+            }
+            for field in fields {
+                for wrapped in wrap_line(&field, width.max(1)) {
+                    detail_lines.push(Line::from(Span::styled(
+                        format!("  {wrapped}"),
+                        Theme::dim(),
+                    )));
+                }
+            }
+            let total = Paragraph::new(Text::from(detail_lines.clone()))
+                .line_count(detail_area.width.max(1));
+            let max_scroll = total.saturating_sub(detail_area.height as usize);
+            dialog.detail_scroll = (dialog.detail_scroll as usize).min(max_scroll) as u16;
+            f.render_widget(
+                Paragraph::new(Text::from(detail_lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((dialog.detail_scroll, 0)),
+                detail_area,
+            );
+        }
+    } else if let Some(error) = &dialog.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(error.clone(), Theme::error())).wrap(Wrap { trim: true }),
+            chunks[1],
+        );
+    }
+
+    let footer_area = chunks[2];
+    let mut footer = vec![Line::from(Span::styled(
+        "─".repeat(footer_area.width as usize),
+        Theme::border(),
+    ))];
+    if let Some(action) = dialog.confirm {
+        let id = dialog
+            .selected_record()
+            .map(|record| record.id.as_str())
+            .unwrap_or("selected resource");
+        footer.push(Line::from(Span::styled(
+            truncate_line(
+                &format!(
+                    "Confirm {} {}? [y/Enter] yes · [n/Esc] cancel",
+                    ExtensionsDialog::action_label(action),
+                    id
+                ),
+                footer_area.width as usize,
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    } else {
+        footer.push(Line::from(Span::styled(
+            truncate_line(
+                "↑/↓ select · Enter detail · e enable · d disable · x remove · r refresh · Esc close",
+                footer_area.width as usize,
+            ),
+            Theme::dim(),
+        )));
+    }
     f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
 }
 
