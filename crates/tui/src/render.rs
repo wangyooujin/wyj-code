@@ -339,11 +339,13 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         // 这里只剩固定 3 行的三选一选择器，贴在输入框上方，宽度对齐 Permission。
         return (5u16.min(area_height), BottomPanel::PlanApproval);
     }
-    // 子 Agent 聚合面板：有可见子 Agent 即显示（优先于任务列表）；
+    // 子 Agent 聚合面板：运行期间自动显示，全部结束后自动收起；用户通过
+    // `/subagents` 或方向键主动进入面板焦点时仍可查看本会话历史详情。
     // 列表区固定行数上限 + 滚动窗口（本会话内全部保留，数量可能持续增长）；
     // 详情展开时追加详情区所需行数，整体按可用高度 70% 封顶，避免聊天区被挤没。
     let visible = state.visible_sub_agents();
-    if !visible.is_empty() {
+    let show_sub_agents = state.has_running_sub_agents() || state.ui_focus == UiFocus::SubAgents;
+    if show_sub_agents && !visible.is_empty() {
         let list_rows = visible.len().min(SUB_AGENT_LIST_MAX) as u16;
         let detail_rows = if state.sub_agent_detail_open {
             state
@@ -1800,7 +1802,8 @@ fn push_sub_agent_trace_lines(
 
 /// 底部固定面板：子 Agent 总览，支持上下选中 + 展开详情（工具流水 + 最终结果/状态）。
 /// 标题 `agents [N]`；Running=spinner / Done=✓ / Failed=✗ / Interrupted=⊘；
-/// 列表区固定行数上限（SUB_AGENT_LIST_MAX）+ 滚动窗口，本会话内全部保留不再自动清除。
+/// 列表区固定行数上限（SUB_AGENT_LIST_MAX）+ 滚动窗口；运行期间自动显示，
+/// 全部完成后自动收起，历史详情仍可通过 `/subagents` 主动打开。
 fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
     // 按 id 升序（BTreeMap 天然启动顺序），用 owned Vec 避免和后面对 state 的可变借用冲突
     let ids: Vec<u64> = state.sub_agents.keys().copied().collect();
@@ -4684,6 +4687,62 @@ mod tool_result_fold_tests {
             wyj_config::Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
+    }
+
+    fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
+        SubAgentUiState {
+            agent_type: "general-purpose".to_string(),
+            description: "test task".to_string(),
+            background: false,
+            status,
+            started_at: Instant::now(),
+            final_elapsed: (status != SubAgentStatus::Running).then_some(1.0),
+            input_tokens: 10,
+            output_tokens: 5,
+            tool_calls: 0,
+            current_tool: None,
+            tool_log: vec![],
+            has_result: status != SubAgentStatus::Running,
+            finished_at: (status != SubAgentStatus::Running).then(Instant::now),
+            final_result: (status == SubAgentStatus::Done).then(|| "done".to_string()),
+        }
+    }
+
+    #[test]
+    fn completed_sub_agents_do_not_keep_passive_panel_visible() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert_eq!(height, 0);
+        assert!(matches!(panel, BottomPanel::None));
+    }
+
+    #[test]
+    fn running_sub_agents_keep_automatic_panel_visible() {
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, sub_agent(SubAgentStatus::Running));
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0);
+        assert!(matches!(panel, BottomPanel::SubAgents));
+    }
+
+    #[test]
+    fn completed_sub_agents_remain_available_when_panel_is_opened_explicitly() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+        state.selected_sub_agent = Some(1);
+        state.ui_focus = UiFocus::SubAgents;
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0);
+        assert!(matches!(panel, BottomPanel::SubAgents));
     }
 
     #[test]
