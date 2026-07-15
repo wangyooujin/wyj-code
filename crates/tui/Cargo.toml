@@ -29,3 +29,6 @@ base64.workspace = true
 png.workspace = true
 ignore.workspace = true
 unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
