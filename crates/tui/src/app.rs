@@ -2249,6 +2249,23 @@ fn mcp_scope_label_text(scope: wyj_store::InstallScope) -> String {
     })
 }
 
+/// Global-scope 的 MCP install/uninstall/upgrade 直接读写磁盘上的
+/// `~/.wyj-code/config.toml`（`wyj_store::mcp_install` 内部各自 `Config::load()`
+/// 后原地 `save()`），完全绕过 `AppState.config` 这份进程启动时加载、此后只在
+/// `/model` `/config` 面板保存时才会更新的内存快照。`McpDialog::new`/
+/// `refresh_installed` 却是拿 `&state.config` 当参数构建"已安装"列表——Project
+/// scope 那部分没事（`merged_mcp_servers` 内部对项目配置本来就是每次现读盘），
+/// 但 Global scope 那部分永远读的是这份过期快照，于是卸载/安装/升级全局 MCP
+/// server 在磁盘上明明已经成功，`/mcp` 面板却像没生效一样（条目卸载不掉、装
+/// 不上、升级后版本号不刷新），用户体感就是"无法正常卸载"。这里在每次这类
+/// 操作成功后把内存快照拉回最新，读盘失败（罕见）时保留旧值，不让偶发 IO
+/// 错误打断整个面板。
+fn reload_config_into_state(state: &mut AppState) {
+    if let Ok(fresh) = Config::load() {
+        state.config = fresh;
+    }
+}
+
 /// 执行操作菜单选中项对应的动作（在按键分发之外单独拆出，便于危险操作走
 /// 二级确认后再调用同一套逻辑）。`target` 是菜单弹出时记录的目标行，用于
 /// 定位 `installed`/`registries`/`browse_results` 里具体是哪一条。
@@ -2322,6 +2339,9 @@ fn mcp_execute_menu_action(
                 .map(|row| (row.config.name.clone(), row.scope));
             if let Some((name, scope)) = info {
                 let result = wyj_store::mcp_install::uninstall_mcp_server(&name, scope, &state.cwd);
+                if result.is_ok() {
+                    reload_config_into_state(state);
+                }
                 if let Some(dialog) = &mut state.mcp_dialog {
                     match result {
                         Ok(()) => {
@@ -5052,8 +5072,9 @@ impl AppState {
             .any(|s| s.status == SubAgentStatus::Running)
     }
 
-    /// 面板可见的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
-    /// 按 BTreeMap 自然顺序（启动顺序）排列
+    /// 可供面板展示的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
+    /// 按 BTreeMap 自然顺序（启动顺序）排列。面板是否自动显示由渲染层根据
+    /// “仍有运行中 Agent / 用户主动打开面板”决定。
     pub fn visible_sub_agents(&self) -> Vec<(&u64, &SubAgentUiState)> {
         self.sub_agents.iter().collect()
     }
@@ -5523,6 +5544,7 @@ impl AppState {
             }
 
             AgentEvent::McpUpgraded { row_idx, result } => {
+                let mut upgraded = false;
                 if let Some(dialog) = &mut self.mcp_dialog {
                     let matches_pending = matches!(dialog.overlay, McpOverlay::Upgrading { row_idx: r } if r == row_idx);
                     if matches_pending {
@@ -5533,7 +5555,7 @@ impl AppState {
                                     "mcp.upgrade.done",
                                     &[("version", &version)],
                                 ));
-                                dialog.refresh_installed(&self.config, &self.cwd);
+                                upgraded = true;
                             }
                             Ok(wyj_store::UpgradeOutcome::AlreadyLatest { version }) => {
                                 dialog.status = Some(wyj_i18n::tr_fmt(
@@ -5548,6 +5570,15 @@ impl AppState {
                                 ));
                             }
                         }
+                    }
+                }
+                if upgraded {
+                    // 见 reload_config_into_state 文档：Global scope 的 upgrade 同样
+                    // 直接改磁盘 config.toml，不刷新这份内存快照的话，面板会一直显示
+                    // 升级前的版本号，看起来像“升级了但没生效”。
+                    reload_config_into_state(self);
+                    if let Some(dialog) = &mut self.mcp_dialog {
+                        dialog.refresh_installed(&self.config, &self.cwd);
                     }
                 }
             }
@@ -7869,6 +7900,9 @@ async fn tui_main(
                                             let result = wyj_store::mcp_install::install_mcp_server(
                                                 &req, &state.cwd,
                                             );
+                                            if result.is_ok() {
+                                                reload_config_into_state(&mut state);
+                                            }
                                             if let Some(dialog) = &mut state.mcp_dialog {
                                                 dialog.overlay = McpOverlay::None;
                                                 match result {
