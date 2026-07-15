@@ -148,6 +148,33 @@ pub const PLAN_TURN: &str = r#"Plan mode is active. Investigate the task with re
 /// headless 单次问答（-p）：AskQuestion 不可用
 pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user cannot answer questions. Do not call AskQuestion; make reasonable assumptions, state them briefly, and proceed.";
 
+/// computer-use 工具已注册时追加：launching apps via GUI hunting (Spotlight/
+/// Start menu/desktop icons) is slow and unreliable — the model otherwise
+/// tends to take one screenshot, see an empty desktop, and give up instead of
+/// launching the app itself. Bash is always available alongside `computer`
+/// (see `<env>` for the platform), so tell it to prefer that. Also spells out
+/// that per-action confirmation already happens via a dialog — no need to ask
+/// the user for permission in chat first, which is a second common failure
+/// mode (model waits for a chat "yes" instead of just attempting the action).
+/// Third: nudge toward `zoom` before reporting fine-grained data read off a
+/// screenshot — full-desktop screenshots are downscaled and dense text/number
+/// tables become genuinely hard to read correctly at that resolution, a
+/// reported real-world failure mode (misread stock prices/tickers). `zoom`
+/// is safe to mention for native mode too: the model constructs the tool_use
+/// input freely and we interpret it client-side, so a custom action name we
+/// invented doesn't conflict with anything Anthropic validates server-side
+/// for a client-executed tool. Fourth: a reported real-world failure mode
+/// where the model declines "check what X said in <app>"-style requests,
+/// reasoning that it would need direct API access to read another app's data
+/// and that doing so risks exposing the user's own private information back
+/// to... the same user who asked. Both premises are wrong for this tool:
+/// screenshot/zoom already read anything rendered on screen (no API needed),
+/// and it's the user's own device/accounts, asked directly by that same
+/// user — there is no third party whose privacy is at stake. The hint
+/// spells this out explicitly so the model attempts the task instead of
+/// refusing and redirecting the user to do it by hand.
+pub const COMPUTER_USE_HINT: &str = "You have a `computer` tool that takes screenshots and controls this machine's mouse/keyboard (see the `<env>` platform field for the OS). To open an application, use Bash to launch it directly instead of hunting for it through the GUI — it's far more reliable. macOS: `open -a \"App Name\"` (fuzzy-matches installed apps). Windows: try `start \"\" \"App Name\"`, or locate the executable first if that fails. After launching, wait briefly for it to load, then take a screenshot before interacting with it — do not assume the launch succeeded instantly. Every computer action that changes system state (click/type/key/scroll/drag) already prompts the user for confirmation automatically before it runs; you do not need to ask the user's permission in chat first — just attempt the action and let the confirmation dialog handle it. If the user denies an action, its result will tell you so. Full-desktop screenshots are downscaled and small/dense text (prices, tables, labels) can be hard to read accurately at that resolution — before reporting any such data back to the user, use the `zoom` action (region: [x0, y0, x1, y1] in the screenshot's coordinate space) to get a higher-fidelity crop of that area and read from that instead of guessing. Reading on-screen content — messages in a chat app, an email, a document, a notification — needs no API: screenshot/zoom the app just like any other, then read the text off the image. This is the user's own device and their own logged-in accounts, and they are asking you directly, so there's no privacy boundary to protect them from — treat \"check what X said in <app>\" or \"see if I got a reply\" as an ordinary task to carry out, not one to decline or hand back to the user to do manually.";
+
 // ── 子 Agent 内置提示 ─────────────────────────────────────────────────────────
 
 pub const SUBAGENT_GENERAL: &str = r#"You are a sub-agent spawned by a main agent to complete one specific task independently. The main agent sees NONE of your intermediate tool calls — only your final text message is returned as the task result. Therefore your final message must be complete and self-contained: state what you did, what you found, and include relevant file paths with line numbers. You cannot ask follow-up questions; if the task is ambiguous, pick the most reasonable interpretation and note the assumption in your result."#;

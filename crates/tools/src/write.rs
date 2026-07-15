@@ -68,6 +68,7 @@ impl Tool for WriteTool {
                 },
                 "required": ["file_path", "content"]
             }),
+            native: None,
         }
     }
 

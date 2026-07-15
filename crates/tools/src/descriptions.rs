@@ -28,6 +28,29 @@ pub const EXIT_PLAN_MODE: &str = "Call this when you are in plan mode and have f
 /// SubAgent 工具描述模板：`{types}` 处由运行时替换为可用类型列表。
 pub const SUB_AGENT_TEMPLATE: &str = "Spawns an independent sub-agent to complete a task, optionally in the background (run_in_background=true returns immediately; the result is injected into the conversation when ready). Sub-agents are STATELESS and ONE-SHOT: they see only your prompt — not this conversation — and you cannot send follow-ups, so the prompt must be a complete, self-contained task description stating exactly what to investigate or do and what the final report must contain. Use them for multi-step subtasks worth isolating, or broad codebase research; do NOT spawn one when you already know the two or three files to read. Multiple Agent calls in one response run concurrently.\n\nAvailable agent types:\n{types}";
 
+/// computer-use 工具描述：作为 Anthropic 原生工具（`native` 字段非空）注册，
+/// 实际发给模型的 schema 由 Anthropic 内置，不使用这里的 description/
+/// input_schema；两者仅供本地工具列表/详情展示（如 `/tools`、TUI 面板）使用。
+pub const COMPUTER: &str = "Anthropic's native computer-use tool: takes screenshots of the primary display and synthesizes mouse clicks/drags/scrolls and keyboard input to control this machine's GUI. Actions: screenshot, zoom, cursor_position, mouse_move, left_click, right_click, middle_click, double_click, left_click_drag, key, type, scroll, wait. The action schema is built into the model by Anthropic; this description is for local display only and is not sent to the model.";
+
+/// computer-use 工具描述模板（custom 工具模式，`{width}`/`{height}` 由
+/// `computer_custom_description()` 在运行时替换为实际下采样目标分辨率）。
+///
+/// 这段文字**会**发给模型，且是模型理解该工具调用约定的唯一来源——不像
+/// Anthropic 原生 computer 工具那样有 Claude 训练时习得的隐式调用约定兜底
+/// （第三方 Anthropic 协议兼容端点，如 MiniMax/GLM/Kimi，说的是 Anthropic
+/// 协议但没有这层训练），因此必须完整列出每个 action 需要哪些字段、坐标
+/// 系是什么、以及"先截图再行动、行动后再截图核实"的基本工作流，不能依赖
+/// 模型自行猜测。
+const COMPUTER_CUSTOM_TEMPLATE: &str = "Controls this machine's desktop: takes screenshots and synthesizes mouse/keyboard input. Screenshots are returned at {width}x{height} pixels — every coordinate you pass (`coordinate`/`start_coordinate`/`region`) MUST be within that space; it is automatically rescaled to the real screen resolution before execution. Call `screenshot` first to see the current state, and again after any action that changes what's on screen before acting further — never assume an action succeeded without checking.\n\nThe full-desktop screenshot is downscaled and can make small text (numbers, table cells, labels) illegible or easy to misread. Whenever you need to read specific text/numbers precisely — not just locate a general area — call `zoom` on that region first and read from the zoomed image instead of guessing from the full screenshot. Do this before reporting any data you're not fully confident you read correctly; a wrong number is worse than one extra tool call.\n\nTo open an application that isn't already visible, use the Bash tool to launch it directly (e.g. macOS: `open -a \"App Name\"`) instead of hunting for it through this tool's GUI actions — it's far more reliable. Wait briefly after launching, then `screenshot` to confirm it loaded before interacting with it. Every action below except screenshot/zoom/cursor_position/wait changes system state and already prompts the user for confirmation before it runs — attempt the action directly, don't ask the user's permission in chat first.\n\nReading on-screen content — messages in a chat app, an email, a document, a notification — needs no API: open the app, screenshot/zoom it like anything else, and read the text off the image. This is the user's own device and their own logged-in accounts, and they are asking you directly, so there's no privacy boundary to protect them from — treat requests like \"check what X said in <app>\" as an ordinary task to carry out with this tool, not one to decline or hand back to the user to do manually.\n\nSet `action` to one of these (extra required/optional fields per action):\n- `screenshot`: capture the desktop. No other fields.\n- `zoom`: capture a cropped region at much higher effective resolution than the full screenshot, for reading small/dense text accurately. Requires `region: [x0, y0, x1, y1]` (top-left and bottom-right corners, in the {width}x{height} space) — pick a region a bit larger than the text you need, a small margin is added automatically.\n- `cursor_position`: report the current cursor location as [x, y] in the {width}x{height} space. No other fields.\n- `wait`: pause. Optional `duration` (seconds, default 1, max 5).\n- `mouse_move`: move the cursor without clicking. Requires `coordinate: [x, y]`.\n- `left_click` / `right_click` / `middle_click` / `double_click`: click. Optional `coordinate: [x, y]` (omit to click at the current cursor position). Optional `text` to hold a modifier key combination during the click (e.g. \"shift\" for shift-click multi-select, \"cmd\" for cmd-click) — same syntax as `key`, released automatically right after the click.\n- `left_click_drag`: drag. Requires `coordinate: [x, y]` (the drag end point); optional `start_coordinate: [x, y]` (omit to start from the current cursor position).\n- `key`: press a key or key combination, e.g. \"Return\", \"Escape\", \"Tab\", \"ctrl+c\", \"cmd+shift+s\". Requires `text`.\n- `type`: type a string of text. Requires `text`.\n- `scroll`: scroll. Requires `scroll_direction` (one of up/down/left/right); optional `coordinate: [x, y]` (omit for current cursor position) and `scroll_amount` (default 1).";
+
+/// 按当前截图目标分辨率渲染 [`COMPUTER_CUSTOM_TEMPLATE`]。
+pub fn computer_custom_description(target_width: u32, target_height: u32) -> String {
+    COMPUTER_CUSTOM_TEMPLATE
+        .replace("{width}", &target_width.to_string())
+        .replace("{height}", &target_height.to_string())
+}
+
 // ── schema 字段描述（各工具 input_schema 里复用的英文文案）──────────────────
 
 pub const FIELD_BASH_COMMAND: &str = "The shell command to execute";

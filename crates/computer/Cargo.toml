@@ -1,0 +1,23 @@
+[package]
+name = "wyj-computer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "跨平台屏幕截图 + 鼠标/键盘输入合成（computer-use 工具的系统层实现，仅 macOS/Windows）"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+# 截图 + 输入合成：这两个 crate 自身已按平台内部分派 macOS/Windows 实现，
+# 因此本 crate 无需再手写一套 platform #[cfg] 后端——只需把整体依赖和
+# 编译目标限定在 macOS/Windows（Linux 首版不支持，见 doc/plan/v1.3.0-plan.md）。
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+xcap = "0.9"
+enigo = "0.6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
