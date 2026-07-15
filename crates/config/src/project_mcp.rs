@@ -140,6 +140,29 @@ pub fn merged_mcp_servers(cfg: &Config, cwd: &Path) -> Vec<McpServerConfig> {
     merged
 }
 
+/// 当前生效的 MCP server 里，哪些名字来自"原生"配置文件——全局
+/// `~/.claude.json` 的 `mcpServers`，或项目级 `<cwd>/.mcp.json`——而不是
+/// wyj-code 自己的 `config.toml`/`.wyj/mcp.toml`。
+///
+/// `Config::load()` 每次都会把 `~/.claude.json` 的 `mcpServers` 重新合并进
+/// `cfg.mcp_servers`（见该函数文档："higher precedence...remaining
+/// read-only until explicit migrate"）——这两个原生文件本来就是 Claude Code
+/// 自己的，wyj-code 无权也不应该去改它们。所以对这些名字调用"卸载"，唯一
+/// 站得住脚的语义是"禁用"（阻止 wyj-code 连接它），而不是真的从磁盘删掉那
+/// 一行；调用方用这个集合区分"可以真删"和"只能禁用"两种情况。
+pub fn native_mcp_names(cwd: &Path) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    if let Ok(home) = crate::home_dir() {
+        if let Ok(servers) = load_native_mcp(&home.join(".claude.json")) {
+            names.extend(servers.into_iter().map(|s| s.name));
+        }
+    }
+    if let Ok(servers) = load_native_mcp(&cwd.join(".mcp.json")) {
+        names.extend(servers.into_iter().map(|s| s.name));
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

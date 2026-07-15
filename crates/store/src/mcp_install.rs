@@ -386,7 +386,22 @@ pub async fn upgrade_mcp_server(
 
 /// 卸载：从 config（对应 scope）删除该条目 + 从 lockfile 删除对应 entry。
 /// 手动条目（lockfile 无记录）同样支持删除 config 条目。
+///
+/// **原生来源（`~/.claude.json`/`.mcp.json`）例外**：`wyj_config::Config::load()`
+/// 每次都会把 `~/.claude.json` 的 `mcpServers` 重新合并回 `cfg.mcp_servers`
+/// （项目级同理，见 `merged_mcp_servers` 对 `.mcp.json` 的处理），这两个文件是
+/// Claude Code 自己的，wyj-code 不应该也没法去改它们。如果照常删 config 条目 +
+/// 清空 lockfile 记录，下一次任何代码路径调用 `Config::load()`（本函数的调用方
+/// 几乎都会紧接着刷新一次）都会把它原样合并回来，且因为 lockfile 记录被清空、
+/// `managed` 变成 `None`，UI 上 enabled 状态默认还是"启用"——卸载在磁盘上其实
+/// 从没生效过，服务器会立刻又出现在列表里、继续被连接，用户看到的就是"卸载
+/// 了但没反应"。对这类名字，唯一能持久化的动作是"禁用"（写一条
+/// `enabled: false` 的 lockfile 记录，`effective_mcp_servers` 据此把它排除在
+/// 运行时连接列表外），因此改为委托给 `set_mcp_enabled`；调用方（TUI 面板）
+/// 再把"原生来源 + 已禁用"的条目从"已安装"列表里过滤掉，视觉上等价于卸载。
 pub fn uninstall_mcp_server(name: &str, scope: InstallScope, cwd: &Path) -> Result<()> {
+    let is_native = wyj_config::native_mcp_names(cwd).contains(name);
+
     match scope {
         InstallScope::Global => {
             let mut cfg = Config::load()?;
@@ -398,6 +413,10 @@ pub fn uninstall_mcp_server(name: &str, scope: InstallScope, cwd: &Path) -> Resu
             servers.retain(|s| s.name != name);
             wyj_config::save_project_mcp(cwd, &servers)?;
         }
+    }
+
+    if is_native {
+        return set_mcp_enabled(name, scope, cwd, false);
     }
 
     let mut manifest = lockfile::load_scope(scope, cwd)?;
@@ -617,6 +636,45 @@ mod tests {
         assert!(servers.is_empty());
         let manifest = lockfile::load_project(dir.path()).unwrap();
         assert!(manifest.mcp_servers.is_empty());
+    }
+
+    /// 回归测试：`.mcp.json`（原生 Claude Code 项目配置）里的 server 不是
+    /// wyj-code 自己的文件，"卸载"删不掉磁盘上那一行——`merged_mcp_servers`
+    /// 每次都会把它重新合并回来。之前的实现直接清空 lockfile 记录，导致
+    /// `managed` 变回 `None`、UI 默认按"启用"处理，卸载形同虚设，用户反复
+    /// 点卸载它还是在运行。现在应该改为落一条禁用记录，让
+    /// `effective_mcp_servers`（真正决定连接哪些 server 的入口）把它排除在外，
+    /// 同时不去碰 `.mcp.json` 本身。
+    #[test]
+    fn uninstall_native_origin_server_disables_instead_of_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mcp_json = dir.path().join(".mcp.json");
+        std::fs::write(
+            &mcp_json,
+            r#"{"mcpServers": {"native-srv": {"command": "npx", "args": ["-y", "native-srv-mcp"]}}}"#,
+        )
+        .unwrap();
+        assert!(wyj_config::native_mcp_names(dir.path()).contains("native-srv"));
+
+        uninstall_mcp_server("native-srv", InstallScope::Project, dir.path()).unwrap();
+
+        // .mcp.json 本身不是 wyj-code 的文件，不应该被改动。
+        let raw = std::fs::read_to_string(&mcp_json).unwrap();
+        assert!(raw.contains("native-srv"));
+
+        // 但 lockfile 应该落一条禁用记录……
+        let manifest = lockfile::load_project(dir.path()).unwrap();
+        let entry = manifest
+            .mcp_servers
+            .iter()
+            .find(|e| e.name == "native-srv")
+            .expect("应写入一条 enabled=false 的 shadow 记录");
+        assert!(!entry.enabled);
+
+        // ……真正决定运行时连接哪些 server 的 effective_mcp_servers 因此把它排除在外。
+        let cfg = wyj_config::Config::default();
+        let effective = effective_mcp_servers(&cfg, dir.path());
+        assert!(!effective.iter().any(|s| s.name == "native-srv"));
     }
 
     #[test]

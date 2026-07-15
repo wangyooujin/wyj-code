@@ -1974,15 +1974,31 @@ impl McpDialog {
         let merged = wyj_config::merged_mcp_servers(cfg, cwd);
         let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
         let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
+        // `.mcp.json` 和 `.wyj/mcp.toml` 都是项目级文件（都挂在 cwd 下），
+        // 两者任一命中都应该算 Project scope——只查 load_project_mcp 会把
+        // `.mcp.json` 里的条目错误分类成 Global，卸载时就会把"禁用"记录写进
+        // 全局 lockfile 而不是项目 lockfile，下次刷新用项目 lockfile 再查一遍
+        // 就对不上，条目又变回"启用"。
         let project_names: std::collections::HashSet<String> = wyj_config::load_project_mcp(cwd)
             .unwrap_or_default()
             .into_iter()
             .map(|s| s.name)
+            .chain(
+                wyj_config::load_native_mcp(&cwd.join(".mcp.json"))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| s.name),
+            )
             .collect();
+        // `~/.claude.json`/`.mcp.json` 原生条目卸载不掉磁盘上那一行（不是
+        // wyj-code 自己的文件），`uninstall_mcp_server` 对这类名字只能落成
+        // "禁用"；这里把"原生 + 已禁用"的条目从已安装列表里过滤掉，让卸载在
+        // 用户看来和真删除没有区别（见 `native_mcp_names` 文档）。
+        let native_names = wyj_config::native_mcp_names(cwd);
 
         let installed = merged
             .into_iter()
-            .map(|config| {
+            .filter_map(|config| {
                 let scope = if project_names.contains(&config.name) {
                     wyj_store::InstallScope::Project
                 } else {
@@ -2000,11 +2016,21 @@ impl McpDialog {
                         .find(|e| e.name == config.name)
                         .cloned(),
                 };
-                McpInstalledRow {
+                let enabled = managed.as_ref().map(|m| m.enabled).unwrap_or(true);
+                // 只隐藏"原生来源 + 已禁用 + 非真正受管理"的条目：如果这个名字
+                // 恰好同时是 wyj 自己 registry 安装过的（`is_managed()`），说明
+                // 用户是在对一个真实受管理的 server 走正常的禁用/启用流程，不
+                // 能把它当成"卸载不掉、只能藏起来"的原生条目一并隐藏——否则会
+                // 把一个可以正常重新启用的 server 藏得找不回来。
+                let is_managed = managed.as_ref().is_some_and(|m| m.is_managed());
+                if native_names.contains(&config.name) && !enabled && !is_managed {
+                    return None;
+                }
+                Some(McpInstalledRow {
                     config,
                     scope,
                     managed,
-                }
+                })
             })
             .collect();
 
@@ -11284,5 +11310,106 @@ mod tool_event_ordering_tests {
         // call-2 的结果紧跟 call-2 自己的调用。
         assert_eq!(state.messages[1].content, "content-a");
         assert_eq!(state.messages[3].content, "content-b");
+    }
+}
+
+#[cfg(test)]
+mod mcp_dialog_tests {
+    use super::*;
+
+    /// 回归测试：`.mcp.json` 原生来源的 server 被"卸载"后（内部落成禁用，见
+    /// `wyj_store::mcp_install::uninstall_mcp_server` 文档——wyj-code 没法删
+    /// 掉不属于自己的 `.mcp.json` 那一行），应该从 `/mcp` 面板"已安装"列表里
+    /// 消失，用户看不出跟真正卸载有什么区别。修复前：uninstall 只是清空
+    /// lockfile 记录，`managed` 变回 `None` 后 UI 默认按"启用"处理，
+    /// `merged_mcp_servers` 又会把它从 `.mcp.json` 重新合并回来，条目卡在
+    /// 列表里赶不走。
+    #[test]
+    fn uninstalled_native_server_disappears_from_installed_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"native-srv": {"command": "npx", "args": ["-y", "native-srv-mcp"]}}}"#,
+        )
+        .unwrap();
+
+        let cfg = Config::default();
+        let dialog = McpDialog::new(&cfg, dir.path());
+        assert!(dialog
+            .installed
+            .iter()
+            .any(|r| r.config.name == "native-srv"));
+
+        wyj_store::mcp_install::uninstall_mcp_server(
+            "native-srv",
+            wyj_store::InstallScope::Project,
+            dir.path(),
+        )
+        .unwrap();
+
+        let dialog = McpDialog::new(&cfg, dir.path());
+        assert!(!dialog
+            .installed
+            .iter()
+            .any(|r| r.config.name == "native-srv"));
+    }
+
+    /// 回归测试：真正 wyj 自己 registry 安装、受 lockfile 管理的 server，
+    /// 即使名字恰好和 `.mcp.json`/`~/.claude.json` 里的原生条目撞名，禁用后
+    /// 也不应该被当成"卸载不掉的原生条目"一起从列表里隐藏——否则用户没法
+    /// 再找到它重新启用。区分点是 `managed.is_managed()`：原生 shadow 记录
+    /// 永远不是 managed，真正 registry 安装的记录永远是。
+    #[test]
+    fn disabling_managed_server_stays_visible_even_if_name_collides_with_native() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".mcp.json"),
+            r#"{"mcpServers": {"shared-name": {"command": "npx", "args": []}}}"#,
+        )
+        .unwrap();
+
+        let server = wyj_store::registry::RegistryServerSummary {
+            name: "io.modelcontextprotocol/shared-name".to_string(),
+            description: "test".to_string(),
+            version: "1.0.0".to_string(),
+            packages: vec![wyj_store::registry::RegistryPackage {
+                registry_type: "npm".to_string(),
+                identifier: "shared-name-mcp".to_string(),
+                version: "1.0.0".to_string(),
+                registry_base_url: None,
+                runtime_hint: Some("npx".to_string()),
+                package_arguments: vec![],
+                runtime_arguments: vec![],
+                environment_variables: vec![],
+            }],
+            remotes: vec![],
+        };
+        let package = wyj_store::mcp_install::choose_package(&server.packages);
+        let req = wyj_store::mcp_install::McpInstallRequest {
+            server,
+            package,
+            scope: wyj_store::InstallScope::Project,
+            name_override: Some("shared-name".to_string()),
+            registry_url: "https://registry.modelcontextprotocol.io".to_string(),
+        };
+        wyj_store::mcp_install::install_mcp_server(&req, dir.path()).unwrap();
+
+        wyj_store::mcp_install::set_mcp_enabled(
+            "shared-name",
+            wyj_store::InstallScope::Project,
+            dir.path(),
+            false,
+        )
+        .unwrap();
+
+        let cfg = Config::default();
+        let dialog = McpDialog::new(&cfg, dir.path());
+        let row = dialog
+            .installed
+            .iter()
+            .find(|r| r.config.name == "shared-name")
+            .expect("受管理的 server 禁用后仍应留在已安装列表里");
+        assert!(row.managed.as_ref().is_some_and(|m| m.is_managed()));
+        assert!(!row.managed.as_ref().unwrap().enabled);
     }
 }

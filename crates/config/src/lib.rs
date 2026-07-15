@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 pub mod project_mcp;
 pub use project_mcp::{
-    load_native_mcp, load_project_mcp, merged_mcp_servers, project_mcp_path, save_project_mcp,
-    ProjectMcpConfig,
+    load_native_mcp, load_project_mcp, merged_mcp_servers, native_mcp_names, project_mcp_path,
+    save_project_mcp, ProjectMcpConfig,
 };
 
 // ── MCP Server 配置 ───────────────────────────────────────────────────────────
