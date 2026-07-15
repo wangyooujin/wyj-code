@@ -126,6 +126,25 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// 原生工具规格（如 Anthropic computer-use）。为 `Some` 时 provider 层按
+    /// `{"type": tool_type, "name": name, ...extra}` 序列化，忽略
+    /// description/input_schema（原生工具的调用 schema 由供应商内置，不接受
+    /// 自定义 schema）；`None` 时走现状的 custom JSON-schema 工具序列化。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeToolSpec>,
+}
+
+/// Anthropic 原生工具规格（如 `computer_20251124`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeToolSpec {
+    /// 供应商工具类型标识，如 `"computer_20251124"`
+    pub tool_type: String,
+    /// 除 `type`/`name` 外的额外顶层字段（如 display_width_px/
+    /// display_height_px/display_number），序列化时展开合并进工具定义顶层。
+    /// 必须是 JSON object。
+    pub extra: serde_json::Value,
+    /// 对应需要的 `anthropic-beta` header 值，如 `"computer-use-2025-11-24"`
+    pub beta: String,
 }
 
 /// 停止原因

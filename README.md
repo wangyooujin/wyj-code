@@ -195,13 +195,15 @@ TUI 会话）立即退出，这个行为回归对交互式工具不可接受，�
 
 ## 已知限制
 
-- **输入框不总是贴住终端最底部**：TUI 用 `ratatui::Viewport::Inline` 按内容实际高度动态定高，
-  而非撑满整个终端高度。曾尝试让 Inline viewport 撑到接近终端整高以让输入框固定贴底，但实测
-  在 tmux 下 ratatui + crossterm 的光标位置查询有相当概率与实际渲染错位（不仅贴不到底，严重时
-  刚输入的字符会不可见），且在最小复现示例中同样能独立复现，判断为 ratatui/crossterm 层面的
-  限制而非本项目代码可修的 bug，故保留当前动态定高方案。
-- **聊天历史由应用内消息流管理**：为支持任意历史工具结果选中、展开和收起，TUI 不再把聊天前缀
-  固化写入终端原生 scrollback；历史浏览以鼠标滚轮、Up/Down、Command+Up/Command+Down 导航为主。
+- **无终端原生鼠标选中/scrollback**：TUI 主界面运行在 `ratatui::Viewport::Fullscreen`（alternate
+  screen）+ 鼠标捕获，以此换取输入框永远贴住终端窗口底部、不留空白。代价是终端原生的鼠标拖拽
+  选中/复制聊天文字、终端自身的 scrollback 缓冲区都不可用（多数终端可用 Option/Shift+拖拽 之类
+  修饰键强制原生选中作为退路）；历史消息改为应用内滚动——PageUp/PageDown、鼠标滚轮、Ctrl+O 展开
+  单条消息详情，复制最后一条 AI 回复用 Ctrl+Y。曾经尝试过在 `ratatui::Viewport::Inline`（终端原生
+  scrollback 模式）下把 viewport 撑到接近终端整高来实现贴底，但实测在 tmux/部分终端下 ratatui +
+  crossterm 的光标位置查询存在渲染竞态（不仅贴不到底，严重时刚输入的字符会不可见、状态栏文字
+  错位重叠），两次独立尝试都复现了同一类问题，判断为该模式下的结构性限制，因此改为不依赖光标
+  位置查询的 Fullscreen 方案。
 
 ## 贡献
 

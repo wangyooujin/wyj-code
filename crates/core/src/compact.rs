@@ -405,6 +405,7 @@ mod tests {
             name: "Read".to_string(),
             description: "Read a file".to_string(),
             input_schema: serde_json::json!({"path": {"type": "string"}}),
+            native: None,
         }];
 
         let message_only = estimate_tokens(&messages);

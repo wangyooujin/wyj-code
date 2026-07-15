@@ -342,8 +342,12 @@ impl Provider for OpenAIProvider {
         }];
         api_messages.extend(to_api_messages(messages));
 
+        // 原生工具（如 Anthropic computer-use）无 description/input_schema，
+        // 且 OpenAI Chat Completions 不支持该调用形态：过滤掉。这类工具只在
+        // Anthropic profile 下注册，此处仅作防御性兜底。
         let api_tools: Vec<ApiTool> = tools
             .iter()
+            .filter(|t| t.native.is_none())
             .map(|t| ApiTool {
                 tool_type: "function",
                 function: ApiFunctionDef {

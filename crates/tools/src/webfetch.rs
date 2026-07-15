@@ -58,6 +58,7 @@ impl Tool for WebFetchTool {
                 },
                 "required": ["url"]
             }),
+            native: None,
         }
     }
 

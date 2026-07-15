@@ -171,6 +171,7 @@ impl Tool for SubAgentTool {
                 },
                 "required": ["description", "prompt"]
             }),
+            native: None,
         }
     }
 

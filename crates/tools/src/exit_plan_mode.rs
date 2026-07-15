@@ -28,6 +28,7 @@ impl Tool for ExitPlanModeTool {
                 },
                 "required": ["plan"]
             }),
+            native: None,
         }
     }
 

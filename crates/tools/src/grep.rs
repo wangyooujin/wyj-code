@@ -96,6 +96,7 @@ impl Tool for GrepTool {
                 },
                 "required": ["pattern"]
             }),
+            native: None,
         }
     }
 

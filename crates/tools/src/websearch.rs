@@ -83,6 +83,7 @@ impl Tool for WebSearchTool {
                 },
                 "required": ["query"]
             }),
+            native: None,
         }
     }
 

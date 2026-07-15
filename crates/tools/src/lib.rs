@@ -5,6 +5,8 @@ pub mod ask_question;
 mod bash;
 mod bash_output;
 pub mod bash_session;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod computer;
 pub mod ctx;
 pub mod descriptions;
 mod diff;
@@ -25,6 +27,8 @@ mod write;
 pub use agent_hub::{SubAgentEvent, SubAgentHub, MAX_CONCURRENT_SUBAGENTS};
 pub use ask_question::AskQuestionTool;
 pub use bash_session::BashSessionManager;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use computer::ComputerTool;
 pub use ctx::{PermissionDecision, PermissionMode, ToolCtx, UiAskRequest};
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use registry::ToolRegistry;

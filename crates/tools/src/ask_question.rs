@@ -195,6 +195,7 @@ impl Tool for AskQuestionTool {
                 },
                 "required": ["questions"]
             }),
+            native: None,
         }
     }
 

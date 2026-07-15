@@ -61,6 +61,7 @@ impl Tool for ReadTool {
                 },
                 "required": ["file_path"]
             }),
+            native: None,
         }
     }
 

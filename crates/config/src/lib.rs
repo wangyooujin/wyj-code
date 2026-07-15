@@ -176,12 +176,21 @@ impl Default for Profile {
 }
 
 impl Profile {
+    /// 当前 profile 是否指向真正的 Anthropic 官方端点，而非仅仅"说 Anthropic
+    /// 协议"的第三方兼容服务（MiniMax/GLM/Kimi 等常以 `provider = "anthropic"`
+    /// 搭配自定义 `base_url` 接入）。只有官方端点才认得 Anthropic 专属扩展
+    /// ——prompt caching beta、原生 computer-use 工具（`computer_20251124`）等；
+    /// 第三方端点收到这些会直接 400，不是优雅降级，因此调用方必须显式检查
+    /// 这个信号，不能只判断 `provider == Anthropic`。
+    pub fn is_official_anthropic_endpoint(&self) -> bool {
+        self.provider == Provider::Anthropic
+            && (self.base_url.trim().is_empty()
+                || self.base_url.trim_end_matches('/') == "https://api.anthropic.com")
+    }
+
     pub fn effective_prompt_cache(&self) -> bool {
-        self.prompt_cache.unwrap_or_else(|| {
-            self.provider == Provider::Anthropic
-                && (self.base_url.trim().is_empty()
-                    || self.base_url.trim_end_matches('/') == "https://api.anthropic.com")
-        })
+        self.prompt_cache
+            .unwrap_or_else(|| self.is_official_anthropic_endpoint())
     }
 
     /// 指定模型是否必须请求供应商返回 usage，作为精确 token 账本来源。
@@ -606,6 +615,40 @@ mod subagent_cfg_tests {
         p.provider = Provider::OpenAI;
         p.base_url.clear();
         assert!(p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn is_official_anthropic_endpoint_distinguishes_real_api_from_compatible_proxies() {
+        // 真官方端点：留空 base_url 或显式填官方地址
+        let official_blank = Profile {
+            provider: Provider::Anthropic,
+            base_url: String::new(),
+            ..Profile::default()
+        };
+        assert!(official_blank.is_official_anthropic_endpoint());
+        let official_explicit = Profile {
+            provider: Provider::Anthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            ..Profile::default()
+        };
+        assert!(official_explicit.is_official_anthropic_endpoint());
+
+        // 第三方 Anthropic 协议兼容端点（如 MiniMax/GLM 走 provider="anthropic"
+        // 但 base_url 指向自己的域名）：不是官方端点，不能发原生扩展
+        let minimax_via_anthropic_protocol = Profile {
+            provider: Provider::Anthropic,
+            base_url: "https://api.minimaxi.com/anthropic".to_string(),
+            ..Profile::default()
+        };
+        assert!(!minimax_via_anthropic_protocol.is_official_anthropic_endpoint());
+
+        // provider=OpenAI 一律不是官方 Anthropic 端点，即便 base_url 恰好留空
+        let openai = Profile {
+            provider: Provider::OpenAI,
+            base_url: String::new(),
+            ..Profile::default()
+        };
+        assert!(!openai.is_official_anthropic_endpoint());
     }
 
     #[test]

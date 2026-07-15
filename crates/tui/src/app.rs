@@ -7,8 +7,8 @@ use crate::theme::Theme;
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-        KeyEventKind, KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -19,9 +19,7 @@ use crossterm::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::Color as UiColor;
-use ratatui::text::Text;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::Terminal;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -4419,67 +4417,6 @@ pub struct AppState {
     pub hook_runner: Option<Arc<wyj_core::HookRunner>>,
 }
 
-/// 计算 `messages` 中从 `frozen_up_to` 起最多可以安全推进到的新冻结边界
-/// （`messages[..new_bound]` 可以整体 `insert_before` 写入终端真实 scrollback，
-/// 不再参与每帧重绘）。三条阻塞规则，任一命中就停在该位置（不含）：
-///
-/// 1. 该位置是 `ToolCall` 但其 `ToolResult` 尚未出现——并发工具调用可能乱序
-///    完成，`ToolEnd` 会把结果 `insert` 在这条 `ToolCall` 之后，未落定前这一位置
-///    之后的一切都可能被后续插入打乱，不能冻结。
-/// 2. `collapsible_idx` 命中的位置（及其后）——Ctrl+O 仍需要能切换到它。
-/// 3. 该位置关联的子 Agent（`sub_agent_id`）仍处于 `Running`——对应 ToolCall/
-///    ToolResult 下面还在画实时状态行，不能冻结。
-///
-/// `collapsible_idx` 必须由调用方在 draw() 之前、drain agent_rx/sub_rx 之前算好
-/// 传入（`render::last_collapsible_tool_result_idx` 的结果），不在这里自行重新
-/// 扫描——多 Agent 并发场景下，若各处独立扫描，drain 期间新插入的 ToolResult
-/// 会让"最后一条可折叠"发生跨帧漂移，导致规则②在两次调用之间保护到不同的
-/// 位置。调用方需要保证这个下标与 Ctrl+O 实际读取的目标（`AppState.
-/// last_collapsible_seq`）来自同一次扫描结果。
-///
-/// 返回值只增不减（`max(frozen_up_to)` 兜底），永远不会把已经冻结的内容
-/// "退冻"。
-fn compute_freezable_up_to(
-    messages: &[ChatMessage],
-    frozen_up_to: usize,
-    sub_agents: &BTreeMap<u64, SubAgentUiState>,
-    collapsible_idx: Option<usize>,
-) -> usize {
-    let collapsible_bound = collapsible_idx.unwrap_or(messages.len());
-    let mut bound = messages.len().min(collapsible_bound);
-
-    for (i, m) in messages.iter().enumerate().skip(frozen_up_to) {
-        if i >= bound {
-            break;
-        }
-        let sub_agent_running = m
-            .sub_agent_id
-            .and_then(|id| sub_agents.get(&id))
-            .is_some_and(|s| s.status == SubAgentStatus::Running);
-        match m.role {
-            MessageRole::ToolCall => {
-                let resolved = messages[i + 1..].iter().any(|r| {
-                    matches!(r.role, MessageRole::ToolResult) && r.sequence_no == m.sequence_no
-                });
-                if !resolved || sub_agent_running {
-                    bound = bound.min(i);
-                    break;
-                }
-            }
-            MessageRole::ToolResult if sub_agent_running => {
-                bound = bound.min(i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    bound.max(frozen_up_to)
-}
-
-/// Ctrl+O 的实际翻转逻辑：按 `sequence_no`（而非下标，见 `AppState.
-/// last_collapsible_seq` 字段文档）精确定位目标 `ToolResult` 并翻转其
-/// `expanded`。`seq` 为 `None`，或消息数组里找不到匹配的 `ToolResult`
-/// （防御性场景，正常不会触发）时 no-op，不 panic、不误翻转其他消息。
 fn is_selectable_message(_msg: &ChatMessage) -> bool {
     true
 }
@@ -4489,17 +4426,6 @@ fn is_expandable_message(msg: &ChatMessage) -> bool {
         msg.role,
         MessageRole::Thinking | MessageRole::ToolResult | MessageRole::BashOutput
     )
-}
-
-#[cfg(test)]
-fn toggle_last_collapsible(messages: &mut [ChatMessage], seq: Option<usize>) {
-    let Some(seq) = seq else { return };
-    if let Some(m) = messages
-        .iter_mut()
-        .find(|m| matches!(m.role, MessageRole::ToolResult) && m.sequence_no == Some(seq))
-    {
-        m.expanded = !m.expanded;
-    }
 }
 
 impl AppState {
@@ -5126,21 +5052,6 @@ impl AppState {
             .any(|s| s.status == SubAgentStatus::Running)
     }
 
-    /// 是否有任意一个"重量级"管理对话框打开，需要切到全屏 alternate screen
-    /// 渲染（这些都是用户主动触发的低频 slash 命令，需要比 Inline 常驻区更大的
-    /// 空间；PermissionDialog 高频出现，已降级为底部常驻面板，不在此列）。
-    pub fn wants_fullscreen(&self) -> bool {
-        self.session_picker.is_some()
-            || self.settings_dialog.is_some()
-            || self.profile_dialog.is_some()
-            || self.memory_dialog.is_some()
-            || self.mcp_dialog.is_some()
-            || self.skills_dialog.is_some()
-            || self.plugins_dialog.is_some()
-            || self.extensions_dialog.is_some()
-            || self.agents_dialog.is_some()
-    }
-
     /// 面板可见的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
     /// 按 BTreeMap 自然顺序（启动顺序）排列
     pub fn visible_sub_agents(&self) -> Vec<(&u64, &SubAgentUiState)> {
@@ -5462,8 +5373,7 @@ impl AppState {
                 // 面板打开后拦截全部按键，用户不再有任何滚动手段；若沿用此前
                 // 上滚/选中留下的视口位置，附加在聊天区尾部的选项区会被裁出
                 // 可视范围且无法找回。这里强制回到贴底跟随并清掉选中锚点，
-                // 保证选项与操作提示立即可见（同时满足 freeze_ready_scrollback
-                // 的冻结前置条件，配合其面板期间的 collapsible 豁免生效）。
+                // 保证选项与操作提示立即可见。
                 self.chat_follow_tail = true;
                 self.unseen_messages = false;
                 self.selected_message_id = None;
@@ -5995,11 +5905,6 @@ impl AppState {
     }
 }
 
-/// Inline viewport 初始高度的保守估计（首帧渲染前用，随后主循环每帧都会
-/// 按实际布局需要重新计算并按需重建 Terminal，见 `render::fixed_footer_height`
-/// + `render::pending_chat_visual_height`）。
-const INITIAL_INLINE_HEIGHT: u16 = 12;
-
 /// 启动 TUI 主界面
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
@@ -6030,19 +5935,18 @@ pub async fn run_tui(
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnableBracketedPaste, DisableMouseCapture)?;
-    // Inline viewport：稳定历史通过 Terminal::insert_before 写入终端真实
-    // scrollback，鼠标选择/滚轮滚动交给终端；TUI 只重绘未冻结尾部和底部
-    // 交互区。Category B 重量级管理对话框（/mcp /model 等）打开期间会
-    // 临时切到 Fullscreen + alternate screen，关闭后再切回来，见
-    // tui_main 内 wants_fullscreen 分支。
+    // 全程 Fullscreen + alternate screen（不再有 Inline viewport）：`Viewport::
+    // Fullscreen` 的构造路径不查询终端光标位置（`(area, Position::ORIGIN)`），
+    // 结构上不会撞上 Inline 撑满高度时那个 tmux/部分终端下的光标查询竞态
+    // （历史教训见 crates/tui/CLAUDE.md）。聊天区因此天然贴着窗口顶部铺开、
+    // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
+    // 代价是放弃终端原生 scrollback 与鼠标原生选中——改为 EnableMouseCapture
+    // 接管鼠标滚轮驱动应用内翻页（`Event::Mouse` 分支），历史消息永远留在
+    // `AppState.messages` 里用 PageUp/PageDown/滚轮/Ctrl+O 翻看。
+    execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(INITIAL_INLINE_HEIGHT),
-        },
-    )?;
+    let mut terminal = Terminal::new(backend)?;
 
     let result = tui_main(
         &mut terminal,
@@ -6067,9 +5971,8 @@ pub async fn run_tui(
     .await;
 
     disable_raw_mode()?;
-    // LeaveAlternateScreen 在正常路径下大多是无操作（tui_main 退出前若曾切到
-    // Fullscreen 早已切回 Inline）；退出时若恰好卡在某个 Category B 全屏对话框
-    // 里也是安全兜底——终端对"退出未进入过的 alternate screen"是无害的。
+    // 全程都在 alternate screen + 鼠标捕获里，退出时统一还原（不再有"是否曾经
+    // 进入过 Fullscreen"的分支判断——从启动到这里全程都在）。
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -6143,87 +6046,6 @@ fn has_plan_approved(messages: &[Message]) -> bool {
         }
     }
     false
-}
-
-/// Inline viewport 中聊天区的可视高度上限（终端高度的 70%，理由见
-/// `render::pending_chat_visual_height` 文档）。主循环的 desired_height 计算
-/// 与冻结豁免判定共用，保证"显示得下/显示不下"的判断口径一致。
-fn chat_viewport_cap(term_height: u16) -> u16 {
-    (term_height * 7 / 10).max(3)
-}
-
-/// 冻结判定用的"最后可折叠 ToolResult"封顶（`compute_freezable_up_to` 的
-/// `collapsible_idx` 参数）。保留封顶的目的是让用户还能对最后一条 ToolResult
-/// Ctrl+O 展开/收起，但它会把该 ToolResult 之后的全部内容（如模型输出的长
-/// markdown 正文）一起困在 Inline viewport 的待定尾部——尾部一旦超过聊天区
-/// 可视上限，超出部分既不在屏幕上也不在终端 scrollback 里，用户完全看不到。
-/// 因此**可见性优先**，以下两种情况豁免封顶、放行冻结进 scrollback（此后可
-/// 用鼠标滚轮回看，代价是这些消息成为静态历史、不能再展开/收起）：
-/// - 待定尾部实际渲染高度超过 `chat_viewport_cap`（本帧注定显示不全）；
-/// - AskQuestion 面板打开期间（面板拦截全部按键，Ctrl+O 本就不可用）。
-///
-/// 未完成 ToolCall / 运行中子 Agent 的冻结阻塞（规则①③）不受此豁免影响。
-fn freeze_collapsible_bound(
-    state: &mut AppState,
-    term_width: u16,
-    term_height: u16,
-) -> Option<usize> {
-    if state.ask_question_dialog.is_some() {
-        return None;
-    }
-    if render::pending_chat_visual_height(state, term_width) > chat_viewport_cap(term_height) {
-        return None;
-    }
-    render::last_collapsible_tool_result_idx(&state.messages)
-}
-
-fn freeze_ready_scrollback(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &mut AppState,
-) -> Result<bool> {
-    // Do not move content out from under the user's keyboard selection/detail
-    // view. Once they return to the tail, stable content can enter native
-    // scrollback again.
-    if !state.chat_follow_tail || state.selected_message_id.is_some() {
-        return Ok(false);
-    }
-
-    state.frozen_up_to = state.frozen_up_to.min(state.messages.len());
-    let term_size = terminal.size()?;
-    let collapsible_bound = freeze_collapsible_bound(state, term_size.width, term_size.height);
-    let new_bound = compute_freezable_up_to(
-        &state.messages,
-        state.frozen_up_to,
-        &state.sub_agents,
-        collapsible_bound,
-    );
-    if new_bound <= state.frozen_up_to {
-        return Ok(false);
-    }
-
-    let max_content_width = term_size.width.saturating_sub(2) as usize;
-    let lines = render::build_frozen_chat_lines(state, new_bound, max_content_width);
-    if lines.is_empty() {
-        state.frozen_up_to = new_bound;
-        return Ok(false);
-    }
-
-    let width = term_size.width.max(1);
-    let height = Paragraph::new(Text::from(lines.clone()))
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .min(u16::MAX as usize) as u16;
-    terminal.insert_before(height.max(1), |buf| {
-        Paragraph::new(Text::from(lines))
-            .wrap(Wrap { trim: false })
-            .render(buf.area, buf);
-    })?;
-
-    state.frozen_up_to = new_bound;
-    state.welcome_frozen = true;
-    state.chat_scroll = 0;
-    state.chat_max_scroll = 0;
-    Ok(true)
 }
 
 /// plan 模式下返回注入了 ExitPlanMode 工具和 system prompt 的 agent 副本，否则直接 Arc::clone
@@ -7061,13 +6883,6 @@ async fn tui_main(
     let session = Arc::new(Mutex::new(init_sess));
 
     let mut last_spinner_advance = Instant::now();
-    // 是否处于 Fullscreen + alternate screen 态（Category B 重量级管理对话框
-    // 打开期间）；ratatui 的 Terminal 没有原地切换 Viewport 变体的公开 API，
-    // 只能整个重建 Terminal，见下方 wants_fullscreen 分支。
-    let mut in_fullscreen = false;
-    // 当前 Inline viewport 高度（仅在 !in_fullscreen 时有意义），用于判断是否
-    // 需要因为布局变化（输入框增高、面板开关等）重建 Terminal。
-    let mut current_inline_height: u16 = INITIAL_INLINE_HEIGHT;
 
     loop {
         // Ctrl+C 首次按下超过 3 秒未确认则重置
@@ -7085,56 +6900,6 @@ async fn tui_main(
         {
             state.spinner_frame = (state.spinner_frame + 1) % render::SPINNER_FRAMES.len();
             last_spinner_advance = Instant::now();
-        }
-
-        // Category B 对话框开关转换：整个重建 Terminal 切到/切回 Fullscreen +
-        // alternate screen（复用现有 7 个大型管理面板的渲染代码，它们假设
-        // 拥有整个终端）。只在真正发生"打开/关闭"转换时才重建，避免每帧重建。
-        let wants_fs = state.wants_fullscreen();
-        if wants_fs != in_fullscreen {
-            // 重建前先清掉旧 Terminal 实例在真实终端上留下的内容：新 Terminal
-            // 是全新构造的结构体（`Terminal::with_options`/`Terminal::new`），
-            // 不知道旧视口在屏幕上的位置，直接重建会导致新旧画面重叠/重影。
-            terminal.clear()?;
-            if wants_fs {
-                execute!(io::stdout(), EnterAlternateScreen)?;
-                *terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-            } else {
-                execute!(io::stdout(), LeaveAlternateScreen)?;
-                *terminal = Terminal::with_options(
-                    CrosstermBackend::new(io::stdout()),
-                    TerminalOptions {
-                        viewport: Viewport::Inline(current_inline_height),
-                    },
-                )?;
-            }
-            terminal.clear()?;
-            in_fullscreen = wants_fs;
-        }
-
-        let froze_this_frame = if !in_fullscreen {
-            freeze_ready_scrollback(terminal, &mut state)?
-        } else {
-            false
-        };
-
-        if !in_fullscreen && !froze_this_frame {
-            let term_size = terminal.size()?;
-            let footer_fixed =
-                render::fixed_footer_height(&state, &input, term_size.width, term_size.height);
-            let chat_h = render::pending_chat_visual_height(&mut state, term_size.width)
-                .clamp(3, chat_viewport_cap(term_size.height));
-            let desired_height = (footer_fixed + chat_h).min(term_size.height).max(1);
-            if desired_height != current_inline_height {
-                terminal.clear()?;
-                *terminal = Terminal::with_options(
-                    CrosstermBackend::new(io::stdout()),
-                    TerminalOptions {
-                        viewport: Viewport::Inline(desired_height),
-                    },
-                )?;
-                current_inline_height = desired_height;
-            }
         }
 
         terminal.draw(|f| render::draw(f, &mut state, &input))?;
@@ -10425,8 +10190,8 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
     // tool_use_id → 分配给该 ToolCall 的 seq，供同一助手回合内并行工具调用各自
     // 找到自己的 ToolResult（不能像以前那样直接复用循环里"当前"的 tool_seq——
     // 一个回合有多个并行调用时，所有 ToolResult 会被错误地全部对应到最后一个
-    // 调用的 seq，导致其余调用在 compute_freezable_up_to 眼里"永远没有结果"，
-    // 冻结进度卡死在那里，--resume/-c 恢复大会话时表现为界面长时间空白）。
+    // 调用的 seq，导致其余调用永远配不上自己的结果，Ctrl+O/工具调用配对等
+    // 依赖 sequence_no 的逻辑全部错位）。
     let mut seq_by_tool_use_id: HashMap<String, usize> = HashMap::new();
 
     for msg in messages {
@@ -10506,10 +10271,9 @@ mod reconstruct_display_tests {
     /// 回归测试：一个助手回合里有多个并行工具调用时，`reconstruct_display`
     /// 曾经用循环里"当前"的 tool_seq 给所有 ToolResult 赋值——多个并行调用的
     /// 结果会全部错误地对应到最后一个调用的 seq，导致除最后一个以外的
-    /// ToolCall 永远找不到自己的 ToolResult。这在 compute_freezable_up_to
-    /// 眼里等价于"工具调用永远未落定"，会让冻结进度永久卡在那里，
-    /// --resume/--continue 恢复带并行工具调用的历史会话时表现为界面卡住。
-    /// 现在改用 tool_use_id 精确配对，每个调用都应该找到自己的结果。
+    /// ToolCall 永远找不到自己的 ToolResult，Ctrl+O 等按 sequence_no 配对的
+    /// 逻辑全部错位。现在改用 tool_use_id 精确配对，每个调用都应该找到自己
+    /// 的结果。
     #[test]
     fn parallel_tool_calls_get_distinct_matching_sequence_numbers() {
         let messages = vec![
@@ -10566,17 +10330,6 @@ mod reconstruct_display_tests {
         assert_eq!(display[2].content, "content-a");
         assert_eq!(display[3].sequence_no, call_b_seq);
         assert_eq!(display[3].content, "content-b");
-
-        // 用真正的冻结判定复演一遍：修复前这里会永久卡在下标 0（call-a 找不到
-        // 自己的结果），修复后应该能一路冻结到底。
-        let sub_agents = std::collections::BTreeMap::new();
-        let bound = compute_freezable_up_to(
-            &display,
-            0,
-            &sub_agents,
-            render::last_collapsible_tool_result_idx(&display),
-        );
-        assert_eq!(bound, display.len());
     }
 }
 
@@ -11161,63 +10914,6 @@ mod ask_question_dialog_tests {
         assert_eq!(state.selected_message_id, None);
         assert!(state.selected_message_anchor.is_none());
     }
-
-    fn push_call_result_pair(state: &mut AppState) {
-        state.push_message(ChatMessage::tool_call("Read(x)".to_string(), 1));
-        state.push_message(ChatMessage::tool_result(
-            (1..=10)
-                .map(|i| format!("line-{i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            false,
-            0.1,
-            1,
-            "Read".to_string(),
-            "line-1".to_string(),
-            false,
-        ));
-    }
-
-    /// AskQuestion 面板打开期间豁免"最后可折叠 ToolResult"对冻结边界的封顶，
-    /// 让面板之前的长正文得以冻结进终端 scrollback（规则①仍会把边界卡在
-    /// 未完成的 AskQuestion ToolCall 上）；面板关闭后封顶恢复。
-    #[test]
-    fn freeze_collapsible_bound_exempted_while_dialog_open() {
-        let mut state = make_state();
-        state.welcome_frozen = true;
-        push_call_result_pair(&mut state);
-        state.push_message(ChatMessage::assistant("提问前的短正文".to_string()));
-
-        // 120x60 → 聊天区上限 42 行，十几行内容显示得下，封顶保留
-        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), Some(1));
-
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        state.ask_question_dialog = Some(AskQuestionDialog::new(vec![single_spec("Q1")], tx));
-        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), None);
-
-        state.ask_question_dialog = None;
-        assert_eq!(freeze_collapsible_bound(&mut state, 120, 60), Some(1));
-    }
-
-    /// 待定尾部实际渲染高度超过聊天区可视上限时豁免封顶（可见性优先）：
-    /// 长 markdown 正文不再被"最后可折叠 ToolResult"困在 Inline viewport
-    /// 里裁掉——冻结进终端 scrollback 后可用鼠标滚轮回看。
-    #[test]
-    fn freeze_collapsible_bound_exempted_when_pending_tail_overflows() {
-        let mut state = make_state();
-        state.welcome_frozen = true;
-        push_call_result_pair(&mut state);
-        let long_md = (1..=40)
-            .map(|i| format!("第 {i} 节：很长的分析正文"))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        state.push_message(ChatMessage::assistant(long_md));
-
-        // 120x24 → 上限 16 行，约 90 行内容注定显示不全 → 豁免封顶
-        assert_eq!(freeze_collapsible_bound(&mut state, 120, 24), None);
-        // 120x300 → 上限 210 行，显示得下 → 封顶保留（Ctrl+O 交互不牺牲）
-        assert_eq!(freeze_collapsible_bound(&mut state, 120, 300), Some(1));
-    }
 }
 
 #[cfg(test)]
@@ -11554,241 +11250,5 @@ mod tool_event_ordering_tests {
         // call-2 的结果紧跟 call-2 自己的调用。
         assert_eq!(state.messages[1].content, "content-a");
         assert_eq!(state.messages[3].content, "content-b");
-    }
-
-    /// 没有任何工具调用时，纯文本消息应该可以整体冻结（推进到列表末尾）。
-    #[test]
-    fn freezable_up_to_advances_past_plain_messages() {
-        let mut state = make_state();
-        state.messages.push(ChatMessage::user("hi".to_string()));
-        state
-            .messages
-            .push(ChatMessage::assistant("hello".to_string()));
-        let bound = compute_freezable_up_to(
-            &state.messages,
-            0,
-            &state.sub_agents,
-            render::last_collapsible_tool_result_idx(&state.messages),
-        );
-        assert_eq!(bound, 2);
-    }
-
-    /// 并发批次里只要还有一个 ToolCall 没等到自己的 ToolResult，冻结边界必须
-    /// 停在它这里，不能越过——否则乱序到达的 ToolResult 就没法再插到正确位置。
-    #[test]
-    fn freezable_up_to_stops_before_unresolved_tool_call() {
-        let mut state = make_state();
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-1".to_string(),
-            name: "Read".to_string(),
-            input_json: serde_json::json!({"file_path": "a.rs"}),
-        });
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-2".to_string(),
-            name: "Read".to_string(),
-            input_json: serde_json::json!({"file_path": "b.rs"}),
-        });
-        // 只有 call-1 落定，call-2 仍未完成
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-1".to_string(),
-            output: "content-a".to_string(),
-            is_error: false,
-            elapsed_secs: 0.1,
-        });
-        // messages = [ToolCall(call-1), ToolResult(call-1), ToolCall(call-2)]
-        // call-2 在下标 2，尚未落定，冻结边界必须停在 2。
-        let bound = compute_freezable_up_to(
-            &state.messages,
-            0,
-            &state.sub_agents,
-            render::last_collapsible_tool_result_idx(&state.messages),
-        );
-        assert_eq!(bound, 2);
-
-        // call-2 落定后，整批都可以冻结了
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-2".to_string(),
-            output: "content-b".to_string(),
-            is_error: false,
-            elapsed_secs: 0.1,
-        });
-        let bound = compute_freezable_up_to(
-            &state.messages,
-            0,
-            &state.sub_agents,
-            render::last_collapsible_tool_result_idx(&state.messages),
-        );
-        assert_eq!(bound, state.messages.len());
-    }
-
-    /// 关联的子 Agent 仍在 Running 状态时，其 ToolCall/ToolResult 不可冻结，
-    /// 即使工具调用本身已经"完成"（结果已经插入列表）。
-    #[test]
-    fn freezable_up_to_blocks_on_running_sub_agent() {
-        let mut state = make_state();
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-1".to_string(),
-            name: "Agent".to_string(),
-            input_json: serde_json::json!({"subagent_type": "general-purpose", "prompt": "do x"}),
-        });
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-1".to_string(),
-            output: "started".to_string(),
-            is_error: false,
-            elapsed_secs: 0.0,
-        });
-        let call_idx = state
-            .messages
-            .iter()
-            .position(|m| matches!(m.role, MessageRole::ToolCall))
-            .unwrap();
-        state.messages[call_idx].sub_agent_id = Some(1);
-        state.sub_agents.insert(
-            1,
-            SubAgentUiState {
-                agent_type: "general-purpose".to_string(),
-                description: "do x".to_string(),
-                background: false,
-                status: SubAgentStatus::Running,
-                started_at: std::time::Instant::now(),
-                final_elapsed: None,
-                input_tokens: 0,
-                output_tokens: 0,
-                tool_calls: 0,
-                current_tool: None,
-                tool_log: vec![],
-                has_result: false,
-                finished_at: None,
-                final_result: None,
-            },
-        );
-
-        let bound = compute_freezable_up_to(
-            &state.messages,
-            0,
-            &state.sub_agents,
-            render::last_collapsible_tool_result_idx(&state.messages),
-        );
-        assert_eq!(bound, call_idx);
-
-        // 子 Agent 结束后恢复可冻结
-        state.sub_agents.get_mut(&1).unwrap().status = SubAgentStatus::Done;
-        let bound = compute_freezable_up_to(
-            &state.messages,
-            0,
-            &state.sub_agents,
-            render::last_collapsible_tool_result_idx(&state.messages),
-        );
-        assert_eq!(bound, state.messages.len());
-    }
-
-    fn long_output(label: &str) -> String {
-        // > TOOL_RESULT_FOLD_LINES(5) 行，触发 is_collapsible_tool_result_content。
-        (1..=7)
-            .map(|i| format!("{label}-line-{i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// 多 Agent 并发下的核心回归：主循环顶部缓存的 last_collapsible_seq 一旦算出，
-    /// 之后（同一轮循环内）drain 出的新 ToolResult 不能让 Ctrl+O 的翻转目标发生
-    /// 漂移——用旧缓存值查找，命中的必须始终是缓存时刻的那一条，而不是新插入的。
-    #[test]
-    fn cached_collapsible_seq_is_immune_to_later_insertions_in_same_frame() {
-        let mut state = make_state();
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-1".to_string(),
-            name: "Read".to_string(),
-            input_json: serde_json::json!({"file_path": "a.rs"}),
-        });
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-1".to_string(),
-            output: long_output("first"),
-            is_error: false,
-            elapsed_secs: 0.1,
-        });
-
-        // 模拟主循环顶部：draw() 之前、drain 之前算好本轮缓存值。
-        let last_idx = render::last_collapsible_tool_result_idx(&state.messages);
-        let cached_seq = last_idx.and_then(|i| state.messages[i].sequence_no);
-        let first_result_seq = state.messages[1].sequence_no;
-        assert_eq!(cached_seq, first_result_seq);
-
-        // 模拟同一轮循环内、draw 之后 drain agent_rx 插入了另一个并发子 Agent
-        // 刚完成的、下标更靠后且同样可折叠的 ToolResult。
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-2".to_string(),
-            name: "Read".to_string(),
-            input_json: serde_json::json!({"file_path": "b.rs"}),
-        });
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-2".to_string(),
-            output: long_output("second"),
-            is_error: false,
-            elapsed_secs: 0.1,
-        });
-
-        // 如果此刻重新扫描，"最后一条可折叠"已经变成新插入的那条——修复前的 bug
-        // 正是在这里：Ctrl+O 处理独立重新扫描会命中它，而不是用户屏幕上看到的那条。
-        let rescanned = render::last_collapsible_tool_result_idx(&state.messages);
-        assert_ne!(rescanned, last_idx, "前置条件：确实发生了漂移");
-
-        // 用本轮开始时缓存的旧值翻转，必须命中第一条，不是新插入的那条。
-        toggle_last_collapsible(&mut state.messages, cached_seq);
-        assert!(state.messages[1].expanded, "缓存目标（第一条）应被翻转");
-        let second_result = state
-            .messages
-            .iter()
-            .find(|m| m.sequence_no == state.messages[3].sequence_no)
-            .unwrap();
-        assert!(!second_result.expanded, "新插入的那条不应被误翻转");
-    }
-
-    /// `compute_freezable_up_to` 必须真正使用外部传入的 `collapsible_idx`，而不是
-    /// 内部又独立扫描一遍——传入一个人为更早的下标，冻结边界必须被它限制住。
-    #[test]
-    fn compute_freezable_up_to_is_bounded_by_passed_in_collapsible_idx() {
-        let mut state = make_state();
-        state.messages.push(ChatMessage::user("hi".to_string()));
-        state
-            .messages
-            .push(ChatMessage::assistant("hello".to_string()));
-        state
-            .messages
-            .push(ChatMessage::assistant("world".to_string()));
-
-        // 真实场景下这里没有任何可折叠 ToolResult，天花板本应是 messages.len()；
-        // 故意传入一个更早的下标，验证返回值确实被它卡住，而不是无视它、按内部
-        // 重新扫描的结果（那样会得到 messages.len()）。
-        let bound = compute_freezable_up_to(&state.messages, 0, &state.sub_agents, Some(1));
-        assert_eq!(bound, 1);
-    }
-
-    /// 防御性回归：`toggle_last_collapsible` 面对不存在的 `sequence_no`（理论上不
-    /// 会发生，见 last_collapsible_seq 字段文档）必须是无操作，不 panic、不误翻转
-    /// 任何消息。
-    #[test]
-    fn toggle_last_collapsible_no_op_when_seq_not_found() {
-        let mut state = make_state();
-        state.apply_agent_event(AgentEvent::ToolStart {
-            id: "call-1".to_string(),
-            name: "Read".to_string(),
-            input_json: serde_json::json!({"file_path": "a.rs"}),
-        });
-        state.apply_agent_event(AgentEvent::ToolEnd {
-            id: "call-1".to_string(),
-            output: long_output("only"),
-            is_error: false,
-            elapsed_secs: 0.1,
-        });
-        let before: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
-
-        toggle_last_collapsible(&mut state.messages, Some(999_999));
-        let after: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
-        assert_eq!(before, after);
-
-        toggle_last_collapsible(&mut state.messages, None);
-        let after_none: Vec<bool> = state.messages.iter().map(|m| m.expanded).collect();
-        assert_eq!(before, after_none);
     }
 }

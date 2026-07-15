@@ -19,6 +19,17 @@ pub enum PermissionDecision {
     Deny,
 }
 
+/// 「始终允许」时只在当前会话内存内放行、不写 `allowed_tools.json` 的工具名单。
+/// computer-use 控制的是整机鼠标/键盘，风险面与 Bash/Edit 不对等——跨会话
+/// 永久放行意味着以后每次启动都对这台机器有无人值守的控制权，因此其
+/// 「始终允许」只在本会话生效，重开会话需重新确认。
+pub const SESSION_SCOPED_TOOLS: &[&str] = &["computer"];
+
+/// `name` 的「始终允许」是否应仅本会话生效（不落盘）。
+pub fn is_session_scoped_tool(name: &str) -> bool {
+    SESSION_SCOPED_TOOLS.contains(&name)
+}
+
 /// 权限模式
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
@@ -64,6 +75,9 @@ pub struct ToolCtx {
     /// 「始终允许」持久化文件路径（`~/.wyj-code/projects/<project_key>/allowed_tools.json`）；
     /// None 时不持久化（如 headless 未启用）。
     pub allowed_tools_path: Option<PathBuf>,
+    /// [`SESSION_SCOPED_TOOLS`] 的「始终允许」放行集合：只存在于内存，随
+    /// `ToolCtx`（进程/会话）一起销毁，永不写盘、不跨会话生效。
+    pub session_allowed: RwLock<HashSet<String>>,
 }
 
 impl ToolCtx {
@@ -74,6 +88,7 @@ impl ToolCtx {
             ui_ask_tx: None,
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
+            session_allowed: RwLock::new(HashSet::new()),
         }
     }
 
@@ -178,8 +193,10 @@ impl ToolContext for ToolCtx {
                 return true;
             }
         }
-        // 已「始终允许」的工具直接放行
-        if self.always_allowed.read().unwrap().contains(name) {
+        // 已「始终允许」的工具直接放行（跨会话持久化的，或本会话内存放行的）
+        if self.always_allowed.read().unwrap().contains(name)
+            || self.session_allowed.read().unwrap().contains(name)
+        {
             return true;
         }
         // 无 UI 通道（headless / 子 Agent）：不阻塞，放行
@@ -199,11 +216,19 @@ impl ToolContext for ToolCtx {
         match response_rx.await {
             Ok(PermissionDecision::AllowOnce) => true,
             Ok(PermissionDecision::AllowAlways) => {
-                self.always_allowed
-                    .write()
-                    .unwrap()
-                    .insert(name.to_string());
-                self.persist_allowed_tools();
+                if is_session_scoped_tool(name) {
+                    // 不落盘：computer-use 的「始终允许」只在本会话内存有效
+                    self.session_allowed
+                        .write()
+                        .unwrap()
+                        .insert(name.to_string());
+                } else {
+                    self.always_allowed
+                        .write()
+                        .unwrap()
+                        .insert(name.to_string());
+                    self.persist_allowed_tools();
+                }
                 true
             }
             Ok(PermissionDecision::Deny) | Err(_) => false,
@@ -273,6 +298,27 @@ mod tests {
         assert!(ctx.always_allowed.read().unwrap().contains("Bash"));
         // 第二次同名工具无需再问，直接放行（不再触发 responder）
         assert!(ctx.confirm_tool("Bash", "ls -la").await);
+    }
+
+    #[tokio::test]
+    async fn confirm_tool_allow_always_for_session_scoped_tool_does_not_persist() {
+        assert!(is_session_scoped_tool("computer"));
+        let mut ctx = ToolCtx::new("/tmp");
+        ctx.set_permission_mode(PermissionMode::Prompt);
+        let (tx, mut rx) = mpsc::channel(8);
+        ctx.ui_ask_tx = Some(tx);
+        let responder = tokio::spawn(async move {
+            if let Some(UiAskRequest::ToolPermission { response_tx, .. }) = rx.recv().await {
+                let _ = response_tx.send(PermissionDecision::AllowAlways);
+            }
+        });
+        assert!(ctx.confirm_tool("computer", "screenshot").await);
+        responder.await.unwrap();
+        // 进了会话内存放行集合，而不是跨会话持久化集合
+        assert!(ctx.session_allowed.read().unwrap().contains("computer"));
+        assert!(!ctx.always_allowed.read().unwrap().contains("computer"));
+        // 第二次同名工具无需再问，直接放行（不再触发 responder）
+        assert!(ctx.confirm_tool("computer", "left_click at (1, 2)").await);
     }
 
     #[tokio::test]

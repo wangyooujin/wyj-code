@@ -147,7 +147,6 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// ToolResult 折叠阈值：内容行数超过此值才折叠，否则始终全量展示。
-pub const TOOL_RESULT_FOLD_LINES: usize = 5;
 const THINKING_FOLD_LINES: usize = 5;
 const MESSAGE_DETAIL_MIN_ROWS: usize = 8;
 const MESSAGE_DETAIL_MAX_ROWS: usize = 18;
@@ -171,25 +170,6 @@ fn strip_summary_duplicate_line<'a>(
         }
         None => lines.to_vec(),
     }
-}
-
-/// 判断一条 ToolResult 的内容是否「可折叠」：非 Edit/Write（永不折叠，走独立 diff 渲染）
-/// 且去重后（见 [`strip_summary_duplicate_line`]）正文行数超过 [`TOOL_RESULT_FOLD_LINES`]。
-/// 纯函数不依赖 `ChatMessage`，调用方（render.rs 的 last_collapsible_idx 预扫描 /
-/// app.rs 的 Ctrl+O 处理）各自按需叠加 `!expanded` 等额外条件。
-pub fn is_collapsible_tool_result_content(
-    content: &str,
-    tool_name: Option<&str>,
-    summary_is_first_line: bool,
-) -> bool {
-    if matches!(tool_name, Some("Edit") | Some("Write")) {
-        return false;
-    }
-    if content.is_empty() {
-        return false;
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    strip_summary_duplicate_line(&lines, summary_is_first_line).len() > TOOL_RESULT_FOLD_LINES
 }
 
 /// 渲染 ToolResult 正文行，`take` 为 `Some(n)` 时只取开头 n 行（折叠态预览），
@@ -399,53 +379,6 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     (0, BottomPanel::None)
 }
 
-/// 主循环在决定 `Viewport::Inline` 高度前调用：计算除聊天区外、底部所有固定
-/// UI（权限确认等底部面板、补全列表、附件条、输入框、状态行）
-/// 加起来需要的总行数。必须和 [`draw`] 里的布局算法保持一致，否则 Inline
-/// 高度会和实际渲染需要的不一致，要么裁掉内容要么留出多余空白。
-pub(crate) fn fixed_footer_height(
-    state: &AppState,
-    input: &InputBox,
-    term_width: u16,
-    term_height: u16,
-) -> u16 {
-    let inner_width = term_width.saturating_sub(2) as usize;
-    let input_height = (input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
-    let completion_height = if !state.file_completions.is_empty() {
-        (state.file_completions.len() as u16 + 2).min(10)
-    } else if !state.slash_completions.is_empty() {
-        (state.slash_completions.len() as u16 + 2).min(8)
-    } else {
-        0u16
-    };
-    let attach_height: u16 = if state.pending_attachments.is_empty() {
-        0
-    } else {
-        3
-    };
-    let (panel_height, _) = bottom_panel_size(state, term_height);
-    panel_height + completion_height + attach_height + input_height + 1
-}
-
-/// 主循环在决定 `Viewport::Inline` 高度前调用：计算"待渲染聊天区"（欢迎页/
-/// 完整消息流/流式文本）在给定终端宽度下实际需要的可视行数，用于动态撑开/
-/// 收缩 Inline viewport 的聊天区部分。
-///
-/// 按内容实际需要动态定高（而不是直接撑到终端整高）：实测 ratatui 在 tmux/
-/// 部分终端下构造一个接近整个屏幕高的 Inline viewport 时，内部依赖的终端
-/// 光标位置查询有相当概率出现结果与实际渲染不一致（构造时内部状态完全一致
-/// 但视觉结果时对时不对，且概率不低），表现不只是"贴不到底部"，更严重时
-/// 输入框里刚打的字会完全不可见（逻辑上已收到，只是没画出来）。这比"没有
-/// 贴底"这个外观问题严重得多，所以放弃"始终撑满终端高度"，改回按内容实际
-/// 需要动态定高——足够高的终端下输入框仍贴不到最底部，是已知的、暂时接受
-/// 的限制，而不是一个可以简单修掉的 bug。
-pub(crate) fn pending_chat_visual_height(state: &mut AppState, term_width: u16) -> u16 {
-    let max_content_width = term_width.saturating_sub(2) as usize;
-    let lines = build_pending_chat_lines(state, max_content_width);
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    para.line_count(term_width.max(1)).min(u16::MAX as usize) as u16
-}
-
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
 
 /// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时），
@@ -632,25 +565,6 @@ fn render_thinking_block(
             )));
         }
     }
-}
-
-/// 找出最后一条可折叠 ToolResult，冻结策略需要把它留在活跃尾部。
-pub(crate) fn last_collapsible_tool_result_idx(messages: &[ChatMessage]) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, m)| {
-            if !matches!(m.role, MessageRole::ToolResult) {
-                return false;
-            }
-            is_collapsible_tool_result_content(
-                &m.content,
-                m.tool_name.as_deref(),
-                m.summary_is_first_line,
-            )
-        })
-        .map(|(i, _)| i)
 }
 
 /// 渲染单条消息（追加到 `lines`）。从 `draw_chat` 提炼出来，保证完整消息流、
@@ -1150,9 +1064,9 @@ fn should_show_welcome(state: &AppState) -> bool {
 }
 
 /// 构建"待渲染"聊天内容：欢迎页（若适用）+ 完整消息流 + thinking/answer 流式文本。
-///
-/// 供 [`draw_chat`] 渲染使用，也供主循环在决定 Inline viewport 高度前测量
-/// 所需可见行数（二者必须用同一份构建逻辑，否则高度估算和实际渲染会不一致）。
+/// 主循环永久运行在 `Viewport::Fullscreen`、不再有冻结机制（`state.frozen_up_to`
+/// 永远是 0），因此这里覆盖的是**整个会话历史**，供 [`draw_chat`] 每帧渲染，
+/// 超出可视高度的部分由 `AppState.chat_scroll` 驱动的应用内滚动展示。
 pub(crate) fn build_pending_chat_lines(
     state: &mut AppState,
     max_content_width: usize,
@@ -1230,42 +1144,6 @@ pub(crate) fn build_pending_chat_lines(
         push_inline_ask_question_lines(&mut lines, dlg, max_content_width);
     }
 
-    lines
-}
-
-/// 构建将要写入终端真实 scrollback 的稳定前缀。
-pub(crate) fn build_frozen_chat_lines(
-    state: &mut AppState,
-    end: usize,
-    max_content_width: usize,
-) -> Vec<Line<'static>> {
-    state.ensure_message_ids();
-    let start = state.frozen_up_to.min(state.messages.len());
-    let end = end.min(state.messages.len()).max(start);
-    let mut lines: Vec<Line<'static>> = vec![];
-    if should_show_welcome(state) {
-        lines.extend(welcome_lines(state, max_content_width));
-    }
-    let mut is_first_user = !state
-        .messages
-        .iter()
-        .take(start)
-        .any(|m| matches!(m.role, MessageRole::User));
-    let mut selected_line = None;
-    lines.extend(render_message_range(
-        MessageRangeRenderArgs {
-            messages: &state.messages,
-            range: start..end,
-            max_content_width,
-            sub_agents: &state.sub_agents,
-            spinner_frame: state.spinner_frame,
-            selected_message_id: None,
-            message_detail_scroll: &state.message_detail_scroll,
-            detail_viewport_rows: detail_viewport_rows(state.chat_view_height),
-        },
-        &mut selected_line,
-        &mut is_first_user,
-    ));
     lines
 }
 
@@ -2527,39 +2405,8 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
 // ─── 状态栏 ──────────────────────────────────────────────────────────────────
 
 fn interaction_usage_text(state: &AppState) -> String {
-    let (label, elapsed, input, output) = if let Some(start) = state.turn_start_time {
-        (
-            "turn",
-            Some(start.elapsed().as_secs_f64()),
-            state
-                .total_input_tokens
-                .saturating_sub(state.turn_start_input_tokens),
-            state
-                .total_output_tokens
-                .saturating_sub(state.turn_start_output_tokens),
-        )
-    } else {
-        (
-            "last",
-            state.last_turn_elapsed_secs,
-            state.last_turn_input_tokens,
-            state.last_turn_output_tokens,
-        )
-    };
-
-    let turn = if let Some(elapsed) = elapsed {
-        format!(
-            "{label} {} ↑{} ↓{}",
-            format_hms(elapsed),
-            fmt_tokens(input),
-            fmt_tokens(output)
-        )
-    } else {
-        "last -- ↑0 ↓0".to_string()
-    };
-
     format!(
-        "{turn} · total ↑{} ↓{}",
+        "total ↑{} ↓{}",
         fmt_tokens(state.total_input_tokens),
         fmt_tokens(state.total_output_tokens)
     )
@@ -2708,7 +2555,11 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
         Line::from(Span::raw(preview)),
         Line::from(""),
         Line::from(Span::styled(
-            wyj_i18n::tr("dialog.permission_hint"),
+            if wyj_tools::ctx::is_session_scoped_tool(&dlg.tool_name) {
+                wyj_i18n::tr("dialog.permission_hint_session_scoped")
+            } else {
+                wyj_i18n::tr("dialog.permission_hint")
+            },
             Theme::highlight(),
         )),
     ];
@@ -4835,18 +4686,6 @@ mod tool_result_fold_tests {
         )
     }
 
-    fn lines_str(n: usize) -> String {
-        (0..n)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn empty_content_is_not_collapsible() {
-        assert!(!is_collapsible_tool_result_content("", None, false));
-    }
-
     #[test]
     fn welcome_still_shows_before_startup_system_messages() {
         let mut state = make_state();
@@ -4979,52 +4818,6 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn frozen_chat_lines_include_welcome_once_with_first_frozen_batch() {
-        let mut state = make_state();
-        let mut user = ChatMessage::system("hello".to_string());
-        user.role = MessageRole::User;
-        state.messages.push(user);
-
-        let frozen = build_frozen_chat_lines(&mut state, 1, 100)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-
-        let welcome_idx = frozen
-            .iter()
-            .position(|line| line.contains("test-model"))
-            .expect("welcome model line should be frozen with the first batch");
-        let user_idx = frozen
-            .iter()
-            .position(|line| line.contains("hello"))
-            .expect("first user message should be frozen");
-        assert!(welcome_idx < user_idx);
-        assert!(frozen.iter().any(|line| line.contains("hello")));
-
-        state.frozen_up_to = 1;
-        state.welcome_frozen = true;
-        let mut assistant = ChatMessage::system("next".to_string());
-        assistant.role = MessageRole::Assistant;
-        state.messages.push(assistant);
-        let frozen = build_frozen_chat_lines(&mut state, 2, 100)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert!(!frozen.iter().any(|line| line.contains("test-model")));
-        assert!(frozen.iter().any(|line| line.contains("next")));
-    }
-
-    #[test]
     fn thinking_status_label_uses_tool_context_and_rotates_idle_copy() {
         let mut state = make_state();
         assert_eq!(thinking_status_label(&state), "大象装进冰箱");
@@ -5079,7 +4872,7 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn interaction_usage_text_shows_last_and_session_totals() {
+    fn interaction_usage_text_shows_session_totals_only() {
         let mut state = make_state();
         state.total_input_tokens = 12_345;
         state.total_output_tokens = 678;
@@ -5088,12 +4881,11 @@ mod tool_result_fold_tests {
         state.last_turn_output_tokens = 200;
 
         let text = interaction_usage_text(&state);
-        assert!(text.contains("last 12s ↑1,000 ↓200"));
-        assert!(text.contains("total ↑12,345 ↓678"));
+        assert_eq!(text, "total ↑12,345 ↓678");
     }
 
     #[test]
-    fn interaction_usage_text_shows_running_turn_delta() {
+    fn interaction_usage_text_ignores_running_turn_delta() {
         let mut state = make_state();
         state.total_input_tokens = 150;
         state.total_output_tokens = 40;
@@ -5102,8 +4894,7 @@ mod tool_result_fold_tests {
         state.turn_start_output_tokens = 10;
 
         let text = interaction_usage_text(&state);
-        assert!(text.contains("turn 0.0s ↑50 ↓30"));
-        assert!(text.contains("total ↑150 ↓40"));
+        assert_eq!(text, "total ↑150 ↓40");
     }
 
     #[test]
@@ -5123,68 +4914,6 @@ mod tool_result_fold_tests {
         assert_eq!(strip_read_line_number("no tab here"), "no tab here");
         // tab 前不是纯数字
         assert_eq!(strip_read_line_number("a1\tcontent"), "a1\tcontent");
-    }
-
-    #[test]
-    fn single_line_matching_summary_is_not_collapsible() {
-        // 单行输出且摘要复用了该行（summary_is_first_line=true）：去重后正文为空，
-        // 不应再判定为可折叠（也不应在展开态渲染出一条和摘要重复的正文）。
-        let content = "only line";
-        assert!(!is_collapsible_tool_result_content(content, None, true));
-    }
-
-    #[test]
-    fn edit_write_is_never_collapsible_even_if_long() {
-        let content = lines_str(TOOL_RESULT_FOLD_LINES + 5);
-        assert!(!is_collapsible_tool_result_content(
-            &content,
-            Some("Edit"),
-            true
-        ));
-        assert!(!is_collapsible_tool_result_content(
-            &content,
-            Some("Write"),
-            true
-        ));
-    }
-
-    #[test]
-    fn content_at_threshold_is_not_collapsible() {
-        let content = lines_str(TOOL_RESULT_FOLD_LINES);
-        assert!(!is_collapsible_tool_result_content(
-            &content,
-            Some("Read"),
-            false
-        ));
-    }
-
-    #[test]
-    fn content_over_threshold_is_collapsible() {
-        let content = lines_str(TOOL_RESULT_FOLD_LINES + 1);
-        assert!(is_collapsible_tool_result_content(
-            &content,
-            Some("Read"),
-            false
-        ));
-    }
-
-    #[test]
-    fn duplicate_first_line_is_stripped_before_fold_threshold_check() {
-        // Bash 摘要复用了首行原文：总行数 FOLD_LINES+1，去重后恰好 FOLD_LINES 行，
-        // 不应判定为可折叠（修复前会把这条已在摘要展示过的首行也计入正文渲染）。
-        let content = lines_str(TOOL_RESULT_FOLD_LINES + 1);
-        assert!(!is_collapsible_tool_result_content(
-            &content,
-            Some("Bash"),
-            true
-        ));
-        // 再多一行，去重后超过阈值，才应判定为可折叠。
-        let content = lines_str(TOOL_RESULT_FOLD_LINES + 2);
-        assert!(is_collapsible_tool_result_content(
-            &content,
-            Some("Bash"),
-            true
-        ));
     }
 
     #[test]

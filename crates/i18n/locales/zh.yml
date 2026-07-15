@@ -122,6 +122,7 @@ help:
     - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
+    - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开 CLAUDE.md 记忆面板
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
@@ -433,6 +434,24 @@ doctor:
   mcp_configured: "  ✓  MCP 服务    {count} 个已配置"
   mcp_none: "  -  MCP 服务    未配置"
 
+computer:
+  desc: "诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限"
+  header: "wyj-code computer-use 诊断\n"
+  platform_supported: "  ✓  平台        {os}（支持）"
+  platform_unsupported: "  ✗  平台        {os}（不支持，仅 macOS/Windows 提供实现）"
+  not_registered_platform: "  ✗  工具注册    未启用（当前平台不支持）"
+  not_registered_vision: "  ✗  工具注册    未启用（当前分组 vision=false，需在 /model 中开启图片输入支持）"
+  not_registered_provider: "  ✗  工具注册    未启用（当前 provider={provider}，computer-use 仅在 Anthropic 协议下可用）"
+  mode_native: "  ✓  工具注册    已启用（原生模式，官方 Anthropic 端点）"
+  mode_custom: "  ✓  工具注册    已启用（custom 模式，第三方 Anthropic 协议兼容端点，如 MiniMax/GLM/Kimi）"
+  display_ok: "  ✓  主屏尺寸    {pw}x{ph} 物理像素 -> {tw}x{th} 目标分辨率"
+  display_err: "  ✗  主屏尺寸    探测失败: {err}"
+  screenshot_ok: "  ✓  截图自检    成功（{bytes} 字节，缩略到 64px）"
+  screenshot_err: "  ✗  截图自检    失败: {err}（macOS 需在 系统设置 → 隐私与安全性 → 屏幕录制 中为本程序授权）"
+  input_ok: "  ✓  输入自检    成功（当前光标位置 ({x}, {y})）"
+  input_err: "  ✗  输入自检    失败: {err}"
+  accessibility_hint: "  ℹ️  提示：以上「输入自检」只验证读取光标位置成功，不代表点击/按键一定生效。macOS 上「辅助功能」权限未授权时，鼠标/键盘合成事件常被系统静默丢弃且不报错——若截图正常但操作无反应，请检查 系统设置 → 隐私与安全性 → 辅助功能。"
+
 status:
   api_key_ok: "  ✓  API Key      {prefix}... (已配置)"
   active_profile: "激活分组: {name}"
@@ -516,6 +535,7 @@ dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
   permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
+  permission_hint_session_scoped: "  [y] 允许一次   [a] 始终允许（仅本会话）   [d] 拒绝并说明   (Esc 拒绝)"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "
   ask_question_other_label: "其他…"

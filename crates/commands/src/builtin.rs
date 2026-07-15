@@ -610,6 +610,107 @@ impl Command for DoctorCmd {
     }
 }
 
+// ── /computer ─────────────────────────────────────────────────────────────────
+
+pub struct ComputerCmd;
+
+#[async_trait]
+impl Command for ComputerCmd {
+    fn name(&self) -> &str {
+        "computer"
+    }
+    fn description(&self) -> String {
+        tr("computer.desc")
+    }
+    fn usage(&self) -> String {
+        "/computer".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        use wyj_config::{Config, Provider};
+
+        let mut lines = vec![tr("computer.header")];
+
+        let os = std::env::consts::OS;
+        if wyj_computer::SUPPORTED {
+            lines.push(tr_fmt("computer.platform_supported", &[("os", os)]));
+        } else {
+            lines.push(tr_fmt("computer.platform_unsupported", &[("os", os)]));
+        }
+
+        // 门控逻辑需与 `cli::register_computer_tool_if_enabled` 的真实注册条件
+        // 保持一致（平台 → vision → provider），否则诊断结果会跟实际是否
+        // 注册该工具对不上。
+        let cfg = Config::load()?;
+        let profile = cfg.active_profile();
+
+        if !wyj_computer::SUPPORTED {
+            lines.push(tr("computer.not_registered_platform"));
+        } else if !profile.vision {
+            lines.push(tr("computer.not_registered_vision"));
+        } else if !matches!(profile.provider, Provider::Anthropic) {
+            lines.push(tr_fmt(
+                "computer.not_registered_provider",
+                &[("provider", &profile.provider.to_string())],
+            ));
+        } else if profile.is_official_anthropic_endpoint() {
+            lines.push(tr("computer.mode_native"));
+        } else {
+            lines.push(tr("computer.mode_custom"));
+        }
+
+        // 实时探测（截图/光标）即使工具未注册也照跑：既能帮用户提前定位权限
+        // 问题（先解决系统权限，再切换 profile 满足注册条件），也不需要
+        // 真的注册一份 ComputerTool 才能自检。
+        if wyj_computer::SUPPORTED {
+            match wyj_computer::primary_display_size() {
+                Ok(d) => {
+                    let (tw, th) = wyj_computer::scale::fit_within(
+                        d.physical_width,
+                        d.physical_height,
+                        wyj_computer::DEFAULT_MAX_DIM,
+                    );
+                    lines.push(tr_fmt(
+                        "computer.display_ok",
+                        &[
+                            ("pw", &d.physical_width.to_string()),
+                            ("ph", &d.physical_height.to_string()),
+                            ("tw", &tw.to_string()),
+                            ("th", &th.to_string()),
+                        ],
+                    ));
+                }
+                Err(e) => lines.push(tr_fmt("computer.display_err", &[("err", &e.to_string())])),
+            }
+
+            match wyj_computer::capture_primary(64) {
+                Ok(cap) => lines.push(tr_fmt(
+                    "computer.screenshot_ok",
+                    &[("bytes", &cap.png.len().to_string())],
+                )),
+                Err(e) => lines.push(tr_fmt(
+                    "computer.screenshot_err",
+                    &[("err", &e.to_string())],
+                )),
+            }
+
+            match wyj_computer::cursor_location() {
+                Ok((x, y)) => lines.push(tr_fmt(
+                    "computer.input_ok",
+                    &[("x", &x.to_string()), ("y", &y.to_string())],
+                )),
+                Err(e) => lines.push(tr_fmt("computer.input_err", &[("err", &e.to_string())])),
+            }
+
+            // 光标位置读取成功不代表输入合成一定生效：macOS 未授权「辅助功能」
+            // 时 Enigo::new() 往往仍会成功，点击/按键被系统静默丢弃、不报错，
+            // 这种失败模式没有错误可捕获，只能靠固定提醒兜底。
+            lines.push(tr("computer.accessibility_hint"));
+        }
+
+        Ok(CommandResult::Output(lines.join("\n")))
+    }
+}
+
 // ── /model ────────────────────────────────────────────────────────────────────
 
 pub struct ModelCmd;
@@ -1011,6 +1112,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
+    reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
@@ -1054,6 +1156,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(DoctorCmd));
+    reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));

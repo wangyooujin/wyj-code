@@ -2,6 +2,25 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.3.0]
+
+- **Computer-use（桌面 GUI 控制，macOS/Windows）**：对接 Anthropic 原生 `computer_20251124` 工具——模型截图观察桌面、合成鼠标点击/拖拽/滚动与键盘输入操控本机 GUI。
+  - 新增 `crates/computer`（`wyj-computer`）：`xcap` 截图 + `enigo` 输入合成（两者内部已各自处理 macOS/Windows 差异，无需再手写一套平台分支），坐标缩放数学独立成模块、平台无关可测；仅 macOS/Windows 拉取真实依赖，其余平台编译进桩实现，Linux 首版不支持。
+  - `wyj_api::types::ToolDefinition` 新增 `native: Option<NativeToolSpec>`：为 `Some` 时 provider 层按 Anthropic 原生工具格式（`{type, name, ...extra}`，无 description/input_schema）序列化并自动追加所需 `anthropic-beta` header；OpenAI 供应商防御性跳过原生工具。
+  - **双模式，兼容 MiniMax/GLM/Kimi 等国内 Anthropic 协议兼容端点**：官方 api.anthropic.com 用原生 `computer_20251124` 工具（体验最优，依赖 Claude 内置训练的调用约定）；第三方 Anthropic 协议兼容端点（`provider = "anthropic"` + 自定义 `base_url`，如 MiniMax）自动退化为普通 custom 工具（带完整 description + input_schema，动态嵌入实际截图分辨率），任何具备基本工具调用能力的模型都能正常使用，不再因为发了无 schema 的原生工具类型而 400 或不可用。
+  - 权限模型：截图/查光标/等待只读放行；点击/拖拽/按键/输入/滚动等变更类动作逐个走既有确认弹窗。「始终允许」对 computer 只在**当前会话内存**放行，不写入跨会话的 `allowed_tools.json`（整机控制权限风险面与 Bash/Edit 不对等）。
+  - 安全兜底：鼠标物理坐标落入屏幕任一角落附近时视为「失控角」信号，立即中止变更动作；连续变更动作数超过阈值仍未截图核实进度时自动暂停并提示模型截图或停下确认。
+  - 注册门控：仅当平台支持 + 当前 Profile `vision=true` + provider 为 Anthropic（Messages API 协议本身才支持 tool_result 内嵌图片回传，OpenAI Chat Completions 的 tool 消息不支持图片）时注册；子 Agent 不注册（与 `Agent`/`AskQuestion` 一致）。
+  - **新增系统提示**：computer-use 注册成功时自动追加一段使用说明，教模型"打开应用优先用 Bash 直接启动（如 macOS `open -a`），不要在 GUI 里瞎找"，以及"变更动作已有逐次确认弹窗、不必先在聊天里问用户'允许'"——此前模型（尤其第三方模型）截一张空桌面的图就直接放弃，转而等用户手动打开软件或在聊天里明确说"允许"。
+  - **新增 `zoom` 动作，提升识别准确率**：全屏截图会下采样，密集数字表格/小字容易被模型看错或看不清。`zoom` 裁剪一块区域后尽量不下采样地重新编码，有效分辨率远高于同一块内容在全屏缩略图里的样子。参考 2025-2026 GUI agent 研究（动态裁剪放大可带来两位数百分点的识别准确率提升）与 Anthropic 官方指导（按需请求细节而非一味提高全屏分辨率），系统提示与 custom 工具描述都会提醒模型"读数字前先 zoom，别猜"。只读动作，无需权限确认，和 `screenshot` 一样会重置连续动作计数。
+  - **新增点击类动作的修饰键支持**：`left_click`/`right_click`/`middle_click`/`double_click` 现支持通过 `text` 字段传入要按住的修饰键组合（如 `"shift"`、`"cmd"`，语法与 `key` 动作一致），对齐官方调用约定，支持 shift-click 多选、cmd-click 等场景；`wyj-computer` 新增 `key_down`/`key_up` 系统层原语，点击失败时仍保证修饰键被释放，不残留状态。
+  - **新增 `/computer` 诊断命令**：只读展示 computer-use 是否受当前平台/Profile 支持、原生还是 custom 模式、主屏物理/目标分辨率，并做一次真实截图 + 光标读取自检，附带 macOS「辅助功能」权限的静默失效提醒（未授权时点击/按键常被系统静默丢弃且不报错，读光标位置成功不代表输入真的生效）。
+  - **修复模型误拒"帮我看看某 App 里的消息"类请求**：用户反馈让模型打开聊天软件看某联系人发的消息时，模型以"需要调用该软件 API"+"不该看你的隐私"为由拒绝并让用户自己去看——两点都站不住脚：截图/`zoom` 读的是屏幕渲染内容，不需要任何 API；这是用户自己的设备和已登录账号，用户本人直接发起的请求，没有第三方隐私可言。系统提示与 custom 工具描述都补充了这段说明，模型现在会把这类请求当成普通任务直接执行。
+  - 已知限制：`provider = "openai"` 的 MiniMax/DeepSeek 等配置暂不支持 computer-use（截图无法以图片形式回传，见上）；终端 TUI 无法渲染截图像素（纯文本终端），仅模型可见画面；scroll 的像素步长部分按键组合语义、以及 TCC/DPI 主动引导授权（区别于 `/computer` 的按需诊断）待真机手测校准。
+- **TUI 主界面改为永久 Fullscreen，输入框永远贴住窗口底部**：此前聊天区按内容动态定高（`Viewport::Inline`），内容较短时输入框下方会留一段正常但显眼的终端空白。现在主循环全程运行在 `Viewport::Fullscreen` + alternate screen，聊天区自动撑满可用空间、输入框/状态栏贴着窗口最底部，不再有这块空白。
+  - **有意的取舍**：为了让鼠标滚轮驱动应用内翻页，同时开启了 `EnableMouseCapture`，代价是终端原生鼠标选中/拖拽复制聊天记录、终端原生 scrollback 缓冲区不再可用（多数终端可用 Option/Shift+拖拽 强制原生选中作为退路）；改为应用内滚动——PageUp/PageDown、鼠标滚轮、Ctrl+O 展开单条消息，历史消息永远留在应用状态里，理论上不会丢。复制最后一条 AI 回复用 Ctrl+Y（不受影响）。
+  - **技术依据**：此前两次尝试在 `Viewport::Inline` 模式下"撑满终端高度"实现贴底（`b5729c5` 与本版本内一次收窄重试）都在真实终端上复现了画面撕裂/输入不可见，根因是 Inline 构造/resize 依赖的终端光标位置查询在部分终端下存在竞态。`Viewport::Fullscreen` 的构造路径不查询光标位置，结构上避开了这个问题。
+
 ## [1.2.2]
 
 - **统一 Extensions 资源平台**：新增 `wyj-code extensions` CLI 和 `/extensions` 入口，统一查看、诊断、迁移、安装、升级、启用、禁用和卸载 Skill / MCP / Plugin。

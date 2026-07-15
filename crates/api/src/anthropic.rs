@@ -69,7 +69,7 @@ struct ApiRequest<'a> {
     system: Vec<ApiSystemBlock<'a>>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<ApiTool<'a>>,
+    tools: Vec<Value>,
     stream: bool,
     /// Extended thinking 配置（开启时携带）
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,13 +141,40 @@ struct ImageSource {
     data: String,
 }
 
-#[derive(Serialize)]
-struct ApiTool<'a> {
-    name: &'a str,
-    description: &'a str,
-    input_schema: &'a Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<CacheControl>,
+/// 把中立 `ToolDefinition` 序列化为 Anthropic 请求体里的单个工具条目。
+/// 原生工具（`native = Some`）按 `{"type", "name", ...extra}` 展开，不带
+/// description/input_schema；普通工具沿用 `{name, description, input_schema}`。
+fn build_api_tool(t: &ToolDefinition, cache_control: Option<CacheControl>) -> Value {
+    let mut obj = match &t.native {
+        Some(native) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".to_string(), Value::String(native.tool_type.clone()));
+            obj.insert("name".to_string(), Value::String(t.name.clone()));
+            if let Value::Object(extra) = &native.extra {
+                for (k, v) in extra {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            obj
+        }
+        None => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".to_string(), Value::String(t.name.clone()));
+            obj.insert(
+                "description".to_string(),
+                Value::String(t.description.clone()),
+            );
+            obj.insert("input_schema".to_string(), t.input_schema.clone());
+            obj
+        }
+    };
+    if let Some(cc) = cache_control {
+        obj.insert(
+            "cache_control".to_string(),
+            serde_json::json!({"type": cc.kind}),
+        );
+    }
+    Value::Object(obj)
 }
 
 // SSE 事件负载
@@ -337,6 +364,31 @@ fn to_api_messages(messages: &[Message], vision: bool) -> Vec<ApiMessage> {
         .collect()
 }
 
+/// 汇总本次请求需要的 `anthropic-beta` header 值（逗号分隔，去重）。
+/// `prompt_cache`/`interleaved_thinking` 对应固定 beta；每个原生工具
+/// （`ToolDefinition.native`）各自携带所需 beta，按声明顺序去重追加。
+fn collect_beta_header(
+    prompt_cache: bool,
+    interleaved_thinking: bool,
+    tools: &[ToolDefinition],
+) -> Option<String> {
+    let mut betas: Vec<&str> = vec![];
+    if prompt_cache {
+        betas.push("prompt-caching-2024-07-31");
+    }
+    if interleaved_thinking {
+        betas.push("interleaved-thinking-2025-05-14");
+    }
+    for t in tools {
+        if let Some(native) = &t.native {
+            if !betas.contains(&native.beta.as_str()) {
+                betas.push(native.beta.as_str());
+            }
+        }
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
+}
+
 fn parse_stop_reason(s: &str) -> StopReason {
     match s {
         "end_turn" => StopReason::EndTurn,
@@ -384,15 +436,13 @@ impl Provider for AnthropicProvider {
 
         // ── 构建 tools 块（最后一个工具打 cache_control，缓存全部工具定义）──
         let tool_count = tools.len();
-        let api_tools: Vec<ApiTool> = tools
+        let api_tools: Vec<Value> = tools
             .iter()
             .enumerate()
-            .map(|(i, t)| ApiTool {
-                name: &t.name,
-                description: &t.description,
-                input_schema: &t.input_schema,
-                cache_control: (self.prompt_cache && tool_count > 0 && i == tool_count - 1)
-                    .then_some(EPHEMERAL),
+            .map(|(i, t)| {
+                let cc = (self.prompt_cache && tool_count > 0 && i == tool_count - 1)
+                    .then_some(EPHEMERAL);
+                build_api_tool(t, cc)
             })
             .collect();
 
@@ -437,17 +487,13 @@ impl Provider for AnthropicProvider {
         // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
         let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
 
-        // beta 头：prompt caching 恒开；interleaved thinking 仅在开启时追加
-        let beta_header = {
-            let mut betas = vec![];
-            if self.prompt_cache {
-                betas.push("prompt-caching-2024-07-31");
-            }
-            if thinking_budget.is_some() && opts.interleaved {
-                betas.push("interleaved-thinking-2025-05-14");
-            }
-            (!betas.is_empty()).then(|| betas.join(","))
-        };
+        // beta 头：prompt caching 恒开；interleaved thinking 仅在开启时追加；
+        // 原生工具（如 computer-use）各自携带所需 beta，按需去重追加
+        let beta_header = collect_beta_header(
+            self.prompt_cache,
+            thinking_budget.is_some() && opts.interleaved,
+            tools,
+        );
 
         let url = format!("{}/v1/messages", self.base_url);
         // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
@@ -661,5 +707,89 @@ mod tests {
                 cache_creation_input_tokens: 64,
             }
         ));
+    }
+
+    fn computer_tool_def() -> ToolDefinition {
+        ToolDefinition {
+            name: "computer".to_string(),
+            description: "ignored for native tools".to_string(),
+            input_schema: serde_json::json!({"ignored": true}),
+            native: Some(crate::types::NativeToolSpec {
+                tool_type: "computer_20251124".to_string(),
+                extra: serde_json::json!({
+                    "display_width_px": 1280,
+                    "display_height_px": 800,
+                }),
+                beta: "computer-use-2025-11-24".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn native_tool_serializes_without_description_or_input_schema() {
+        let value = build_api_tool(&computer_tool_def(), None);
+        let obj = value
+            .as_object()
+            .expect("native tool must serialize as object");
+        assert_eq!(
+            obj.get("type").and_then(|v| v.as_str()),
+            Some("computer_20251124")
+        );
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("computer"));
+        assert_eq!(
+            obj.get("display_width_px").and_then(|v| v.as_i64()),
+            Some(1280)
+        );
+        assert_eq!(
+            obj.get("display_height_px").and_then(|v| v.as_i64()),
+            Some(800)
+        );
+        // 原生工具不携带 description/input_schema —— schema 由供应商内置
+        assert!(!obj.contains_key("description"));
+        assert!(!obj.contains_key("input_schema"));
+    }
+
+    #[test]
+    fn native_tool_carries_cache_control_when_requested() {
+        let value = build_api_tool(&computer_tool_def(), Some(EPHEMERAL));
+        let obj = value.as_object().unwrap();
+        assert_eq!(
+            obj.get("cache_control")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("ephemeral")
+        );
+    }
+
+    #[test]
+    fn custom_tool_serializes_with_name_description_input_schema() {
+        let def = ToolDefinition {
+            name: "Read".to_string(),
+            description: "read a file".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            native: None,
+        };
+        let value = build_api_tool(&def, None);
+        let obj = value.as_object().unwrap();
+        assert_eq!(obj.get("name").and_then(|v| v.as_str()), Some("Read"));
+        assert_eq!(
+            obj.get("description").and_then(|v| v.as_str()),
+            Some("read a file")
+        );
+        assert!(obj.contains_key("input_schema"));
+        // 普通工具不带 type 字段（那是原生工具专属）
+        assert!(!obj.contains_key("type"));
+    }
+
+    #[test]
+    fn beta_header_appends_native_tool_beta_and_dedupes() {
+        let tools = vec![computer_tool_def(), computer_tool_def()];
+        let header = collect_beta_header(true, false, &tools).unwrap();
+        assert_eq!(header, "prompt-caching-2024-07-31,computer-use-2025-11-24");
+    }
+
+    #[test]
+    fn beta_header_is_none_without_any_beta_source() {
+        assert_eq!(collect_beta_header(false, false, &[]), None);
     }
 }

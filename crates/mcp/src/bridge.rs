@@ -159,6 +159,7 @@ async fn build_bridges(client: McpHandle, server_name: &str) -> Result<Vec<McpBr
             name: tool_name.clone(),
             description: mcp_tool.description.as_deref().unwrap_or("").to_string(),
             input_schema: schema,
+            native: None,
         };
         bridges.push(McpBridgeTool {
             tool_name,

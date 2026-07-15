@@ -58,6 +58,7 @@ impl Tool for BashTool {
                 },
                 "required": ["command"]
             }),
+            native: None,
         }
     }
 
