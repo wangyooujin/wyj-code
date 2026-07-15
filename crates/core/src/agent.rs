@@ -989,6 +989,7 @@ mod tests {
                 name: "Sleep".into(),
                 description: String::new(),
                 input_schema: serde_json::json!({"type": "object"}),
+                native: None,
             }
         }
         fn parallel_safe(&self) -> bool {
@@ -1060,6 +1061,7 @@ mod tests {
                 name: "Echo".into(),
                 description: String::new(),
                 input_schema: serde_json::json!({"type": "object"}),
+                native: None,
             }
         }
         async fn run(
@@ -1547,6 +1549,7 @@ mod tests {
                 name: "Echo".into(),
                 description: String::new(),
                 input_schema: serde_json::json!({"type": "object"}),
+                native: None,
             }
         }
         async fn run(

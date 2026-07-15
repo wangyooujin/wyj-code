@@ -135,6 +135,7 @@ impl Tool for TodoWriteTool {
                 },
                 "required": ["todos"]
             }),
+            native: None,
         }
     }
 

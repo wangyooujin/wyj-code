@@ -43,6 +43,7 @@ impl Tool for BashOutputTool {
                 },
                 "required": ["bash_id"]
             }),
+            native: None,
         }
     }
 
@@ -121,6 +122,7 @@ impl Tool for KillShellTool {
                 },
                 "required": ["shell_id"]
             }),
+            native: None,
         }
     }
 

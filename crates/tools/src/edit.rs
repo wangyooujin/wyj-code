@@ -64,6 +64,7 @@ impl Tool for EditTool {
                 },
                 "required": ["file_path", "old_string", "new_string"]
             }),
+            native: None,
         }
     }
 

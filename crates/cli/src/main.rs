@@ -530,6 +530,9 @@ async fn main() -> Result<()> {
     if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
         registry.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
     }
+    // computer-use：仅 macOS/Windows + vision profile + Anthropic provider；
+    // 返回值决定下面是否追加 COMPUTER_USE_HINT（教模型用 Bash 启动应用）
+    let computer_use_enabled = register_computer_tool_if_enabled(&mut registry, &cfg);
 
     // --plugin-dir：临时加载本地开发插件（不落盘、不经过 marketplace/lockfile，
     // 仅当次进程生效），与 TUI「添加本地插件」的持久化路径是两条独立路径。
@@ -668,13 +671,23 @@ async fn main() -> Result<()> {
         );
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
-    // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前仅 Plan 模式
-    // 限制说明；CLAUDE.md 系文件不焊死进 system prompt，见 with_claude_md）。
+    // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前含 Plan 模式
+    // 限制说明与 computer-use 使用提示；CLAUDE.md 系文件不焊死进 system prompt，
+    // 见 with_claude_md）。
     let mut system_prompt_extra = String::new();
 
     // Plan 模式在系统提示中说明只读约束
     if matches!(mode, AgentMode::Plan) {
         let extra = wyj_core::prompts::PLAN_MODE;
+        agent = agent.append_system(extra);
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(extra);
+    }
+
+    // computer-use 已注册：教模型优先用 Bash 启动应用（而非在 GUI 里瞎找），
+    // 且每个变更动作已有独立确认弹窗、无需先在聊天里问用户"允许"
+    if computer_use_enabled {
+        let extra = wyj_core::prompts::COMPUTER_USE_HINT;
         agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
@@ -871,6 +884,7 @@ async fn main() -> Result<()> {
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
             reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
         }
+        register_computer_tool_if_enabled(&mut reg, cfg);
         for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
             reg.register_arc(tool.clone());
         }
@@ -1033,6 +1047,52 @@ fn select_sub_agent_tools(
         })
         .filter_map(|tdef| registry.get(&tdef.name))
         .collect()
+}
+
+/// computer-use 是否应当注册并按需注册：仅 macOS/Windows 编译进 `wyj-tools`
+/// （其余平台该 crate 内 `computer` 模块整体不存在，见 wyj-tools/src/lib.rs），
+/// 且需要当前 profile 支持 vision（截图靠 image content block 回传）+
+/// `provider == Anthropic`（Anthropic Messages API 协议本身——tool_result 内
+/// 嵌原生 image block——才有截图回传给模型的通路；OpenAI Chat Completions 的
+/// `tool` 角色消息不支持图片，`crates/api/src/openai.rs` 会把截图降级成纯
+/// 文本占位符，模型看不到画面，computer-use 名存实亡，因此 provider=OpenAI
+/// 时不注册）。
+///
+/// 是否用**原生**工具声明由 `Profile::is_official_anthropic_endpoint()` 决定：
+/// - 官方 api.anthropic.com：注册为原生 `computer_20251124` 工具（无 description/
+///   input_schema）——Claude 训练时习得了这个空 schema 工具的调用约定。
+/// - 第三方 Anthropic 协议兼容端点（MiniMax/GLM/Kimi 等，常见于
+///   `provider = "anthropic"` + 自定义 `base_url`）：说的是同一套 Messages API
+///   协议、截图回传通路一样打通，但没有 Claude 那层专属训练，收到无 schema
+///   的原生工具类型会因为不知道怎么调用而报错。这类端点改注册为**普通 custom
+///   工具**（带完整 description + input_schema，`ComputerTool::new(_, false)`），
+///   任何具备基本工具调用能力的模型都能按标准协议使用。`run()` 的动作分派逻辑
+///   两种模式完全一致，只是对外声明方式不同。
+///
+/// 子 Agent 工厂（`make_sub_agent_factory`）不调用本函数——与 Agent/AskQuestion
+/// 一致，默认不给子 Agent。
+///
+/// 返回值：是否实际注册了。调用方据此决定要不要追加
+/// `wyj_core::prompts::COMPUTER_USE_HINT`（教模型用 Bash 直接启动应用、不必在
+/// 聊天里先问用户"允许"再动手——没有这条提示，模型倾向于截一张图看见空
+/// 桌面就放弃，或者在聊天里等用户显式说"允许"，而不是直接尝试动作走既有的
+/// 逐动作确认弹窗）。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
+    let profile = cfg.active_profile();
+    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
+        return false;
+    }
+    let native = profile.is_official_anthropic_endpoint();
+    registry.register_arc(Arc::new(wyj_tools::computer::ComputerTool::new(
+        wyj_tools::computer::DEFAULT_MAX_DIM,
+        native,
+    )));
+    true
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) -> bool {
+    false
 }
 
 /// 构建子 Agent 工厂：按 agent 定义解析 Profile 与模型，注册按定义过滤后的工具集。
@@ -1676,6 +1736,7 @@ mod cli_tests {
                 name: self.0.to_string(),
                 description: "fake mcp tool for tests".to_string(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                native: None,
             }
         }
         async fn run(

@@ -123,6 +123,7 @@ help:
     - `/agents` — List available subagent types (built-in + custom *.md definitions)
     - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/doctor` — Diagnose environment (API Key / config / memory)
+    - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the CLAUDE.md memory panel
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
@@ -434,6 +435,24 @@ doctor:
   mcp_configured: "  ✓  MCP servers  {count} configured"
   mcp_none: "  -  MCP servers  not configured"
 
+computer:
+  desc: "Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions"
+  header: "wyj-code computer-use diagnostics\n"
+  platform_supported: "  ✓  Platform     {os} (supported)"
+  platform_unsupported: "  ✗  Platform     {os} (unsupported, only macOS/Windows have an implementation)"
+  not_registered_platform: "  ✗  Registration not enabled (current platform is unsupported)"
+  not_registered_vision: "  ✗  Registration not enabled (active profile has vision=false; enable image input in /model)"
+  not_registered_provider: "  ✗  Registration not enabled (provider={provider}; computer-use only works over the Anthropic protocol)"
+  mode_native: "  ✓  Registration enabled (native mode, official Anthropic endpoint)"
+  mode_custom: "  ✓  Registration enabled (custom mode, third-party Anthropic-compatible endpoint, e.g. MiniMax/GLM/Kimi)"
+  display_ok: "  ✓  Display      {pw}x{ph} physical px -> {tw}x{th} target resolution"
+  display_err: "  ✗  Display      probe failed: {err}"
+  screenshot_ok: "  ✓  Screenshot   ok ({bytes} bytes, downscaled to 64px)"
+  screenshot_err: "  ✗  Screenshot   failed: {err} (macOS: grant Screen Recording in System Settings → Privacy & Security)"
+  input_ok: "  ✓  Input        ok (cursor at ({x}, {y}))"
+  input_err: "  ✗  Input        failed: {err}"
+  accessibility_hint: "  ℹ️  Note: the input self-test above only confirms reading the cursor position works — it does not guarantee clicks/keystrokes actually take effect. On macOS, without Accessibility permission granted, synthesized mouse/keyboard events are often silently dropped by the system with no error. If screenshots work but actions have no effect, check System Settings → Privacy & Security → Accessibility."
+
 status:
   api_key_ok: "  ✓  API Key      {prefix}... (configured)"
   active_profile: "Active profile: {name}"
@@ -518,6 +537,7 @@ dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
+  permission_hint_session_scoped: "  [y] Allow once   [a] Always allow (this session only)   [d] Deny   (Esc to deny)"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "
   ask_question_other_label: "Other…"
