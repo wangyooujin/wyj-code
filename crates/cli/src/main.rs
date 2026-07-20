@@ -14,6 +14,7 @@ use wyj_tools::{
 };
 
 mod extensions_cmd;
+mod schedule_cmd;
 mod update_cmd;
 
 #[derive(Parser, Debug)]
@@ -68,6 +69,13 @@ enum Commands {
     Extensions {
         #[command(subcommand)]
         command: extensions_cmd::ExtensionCommand,
+    },
+    /// 管理定时任务（增删改查 + 同步系统 crontab）；`schedule run <id>` 是真正
+    /// 被 crontab 调用的执行入口，对应 TUI 内 `/schedule` 面板的 headless 版本。
+    #[command(name = "schedule", about = "Manage scheduled tasks (cron-triggered)")]
+    Schedule {
+        #[command(subcommand)]
+        command: schedule_cmd::ScheduleCommand,
     },
 }
 
@@ -250,6 +258,10 @@ async fn main() -> Result<()> {
             Commands::Extensions { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return extensions_cmd::run(command, &cwd).await;
+            }
+            Commands::Schedule { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return schedule_cmd::run(command, &cwd).await;
             }
         }
     }
@@ -1543,11 +1555,17 @@ async fn repl(
                         Err(e) => eprintln!("[extensions] {e}"),
                     }
                 }
+                Ok(CommandResult::OpenImportDialog) => {
+                    println!("{}", wyj_i18n::tr("import.headless_unsupported"));
+                }
                 Ok(CommandResult::OpenAgentsDialog { fallback_text, .. }) => {
                     println!("{fallback_text}");
                 }
                 Ok(CommandResult::OpenSubAgentsPanel(_)) => {
                     println!("{}", wyj_i18n::tr("subagents.headless_unsupported"));
+                }
+                Ok(CommandResult::OpenScheduleDialog) => {
+                    println!("{}", wyj_i18n::tr("schedule.headless_unsupported"));
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),

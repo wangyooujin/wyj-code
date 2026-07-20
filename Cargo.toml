@@ -88,6 +88,8 @@ tempfile = "3"
 semver = "1"
 # 校验和（self-update）
 sha2 = "0.10"
+# cron 表达式解析与下次触发时间计算（定时任务面板）
+cron = { version = "0.17", features = ["serde"] }
 # 压缩包解压（self-update）
 flate2 = "1"
 tar = "0.4"

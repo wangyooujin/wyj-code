@@ -49,6 +49,10 @@ pub enum CommandResult {
     OpenPluginsDialog,
     /// 打开统一资源中心（/extensions 命令触发）
     OpenExtensionsDialog,
+    /// 打开一键导入面板（/import 命令触发）：扫描 Codex / Claude Code 配置，
+    /// 勾选确认后物化为 wyj 自管配置。headless 不支持，提示改用
+    /// `wyj-code extensions migrate`。
+    OpenImportDialog,
     /// 打开可用 Agent 类型交互面板（/agents 命令触发）。
     /// TUI 使用 `defs` 渲染列表与详情；headless 使用 `fallback_text` 保持纯文本输出。
     OpenAgentsDialog {
@@ -59,6 +63,9 @@ pub enum CommandResult {
     /// `Some(id)` 直接选中并展开该 id 的详情；`None` 只是请求打开面板
     /// （TUI 侧据此决定默认选中项；headless 不支持，提示改用 `subagent-trace` 子命令）。
     OpenSubAgentsPanel(Option<u64>),
+    /// 打开定时任务面板（/schedule 命令触发）。headless 不支持，提示改用
+    /// `wyj-code schedule` CLI 子命令。
+    OpenScheduleDialog,
 }
 
 /// 命令执行上下文

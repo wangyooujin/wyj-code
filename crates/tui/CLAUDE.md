@@ -6,7 +6,7 @@
 
 **为什么这次不会重蹈 Inline 撑满高度的覆辙**：`Viewport::Fullscreen` 的构造路径是 `(area, Position::ORIGIN)`（`ratatui-0.29.0/src/terminal/terminal.rs`），完全不查询终端光标位置；而 `Viewport::Inline` 构造/resize 时（`compute_inline_size`）必须靠 crossterm 查询光标当前行才能决定往终端 scrollback 里写多少行——这个查询在 tmux/部分终端下存在渲染竞态（内部状态一致但视觉结果不稳定，严重时输入内容不可见、状态栏文字错位重叠）。这个问题已经在 Inline 方案上验证过两次都无法安全绕开：`b5729c5`（TUI 改用 Inline scrollback 那次重构）最早试过让 Inline viewport 始终撑满终端高度以消除底部空白，评估后放弃；2026-07 又按"只在空闲态才撑满"的收窄方案重试过一次，依然在用户的真实终端上复现了同一类画面撕裂，当场回退。这两次教训是"不要指望在 Inline 模式下解决贴底问题"，而不是"贴底本身做不到"——换成 `Viewport::Fullscreen` 从根上避开了那个查询，是结构性的差异，不是同一条路子换个参数再试一次。**如果以后又有人想在 Inline 模式下做贴底，先看这一段——那条路已经证明走不通。**
 
-**Fullscreen 全程接管后，原本的 9 个"重量级管理对话框"（`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/resume` `/agents` `/extensions`）不再需要临时切换 Terminal 变体**：它们本来就已经假设拥有整个终端来渲染，现在始终身处 Fullscreen，直接作为 `draw()` 尾部的浮层覆盖在 chat/footer 之上即可，不再有任何 `Terminal::with_options`/`clear()` 重建。权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁——这条不受本次改动影响。
+**Fullscreen 全程接管后，原本的 10 个"重量级管理对话框"（`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/resume` `/agents` `/extensions` `/import`）不再需要临时切换 Terminal 变体**：它们本来就已经假设拥有整个终端来渲染，现在始终身处 Fullscreen，直接作为 `draw()` 尾部的浮层覆盖在 chat/footer 之上即可，不再有任何 `Terminal::with_options`/`clear()` 重建。权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁——这条不受本次改动影响。
 
 **`open_path_in_editor`**（`/memory` 面板"用 $EDITOR 打开"）挂起 TUI 时无条件 `LeaveAlternateScreen` + `disable_raw_mode`、编辑完成后 `EnterAlternateScreen` + `enable_raw_mode` + `terminal.clear()`——这个函数写的时候就已经假设调用时处于 alternate screen（原先只在 Fullscreen 对话框打开期间才会被调用），现在全程都在 alternate screen，前置假设依然成立，不需要改。
 

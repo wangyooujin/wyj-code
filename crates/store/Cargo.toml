@@ -22,5 +22,7 @@ sha2.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+uuid.workspace = true
+cron.workspace = true
 
 [dev-dependencies]

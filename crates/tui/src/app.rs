@@ -1381,6 +1381,7 @@ pub enum InputOwner {
     Skills(SkillsInputField),
     Plugins(PluginsInputField),
     Profile(ProfileInputField),
+    Schedule(ScheduleInputField),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1444,6 +1445,25 @@ impl InputOwner {
                 ),
                 Theme::CLAUDE,
             ),
+            InputOwner::Schedule(ScheduleInputField::Field { field_idx, .. }) => (
+                wyj_i18n::tr_fmt(
+                    "dialog.input_owner.schedule_field",
+                    &[(
+                        "field",
+                        &wyj_i18n::tr(SCHEDULE_FIELD_LABEL_KEYS[*field_idx]),
+                    )],
+                ),
+                Theme::CLAUDE,
+            ),
+            InputOwner::Schedule(ScheduleInputField::Frequency { kind, .. }) => (
+                wyj_i18n::tr(match kind {
+                    ScheduleFrequencyKind::Daily => "dialog.input_owner.schedule_freq_daily",
+                    ScheduleFrequencyKind::Hourly => "dialog.input_owner.schedule_freq_hourly",
+                    ScheduleFrequencyKind::Weekly => "dialog.input_owner.schedule_freq_weekly",
+                    ScheduleFrequencyKind::Custom => "dialog.input_owner.schedule_freq_custom",
+                }),
+                Theme::CLAUDE,
+            ),
         }
     }
 
@@ -1462,6 +1482,7 @@ impl InputOwner {
             InputOwner::Skills(_) => state.skills_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Plugins(_) => state.plugins_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Schedule(_) => state.schedule_dialog.as_mut().map(|d| &mut d.live_input),
         }
     }
 
@@ -1472,6 +1493,7 @@ impl InputOwner {
             InputOwner::Skills(_) => state.skills_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Plugins(_) => state.plugins_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Schedule(_) => state.schedule_dialog.as_ref().map(|d| &d.live_input),
         }
     }
 
@@ -1874,6 +1896,664 @@ fn profile_try_save(
     saved
 }
 
+// ── 定时任务面板：/schedule 命令触发 ─────────────────────────────────────────
+//
+// 与 ProfileDialog 同一套"批量编辑 + Ctrl+S/Esc 三选一保存"模型：面板内的增删
+// 改都只改内存里的 `tasks` 草稿，直到显式保存才一次性写盘（`schedule::save`）
+// 并同步系统 crontab（`cron_sync::sync_crontab`）。字段编辑统一先弹一个只有
+// 1 项（Name/Prompt/Cwd 的"编辑"）或多项（Cron 的频率预设/NotifyOnFailure 的
+// 切换）的小菜单再决定是否借用输入框，比 ProfileDialog 对不同字段类型各自特判
+// 简单，代价是多一次 Enter，可接受。
+
+pub const SCHEDULE_FIELD_COUNT: usize = 5;
+const SCHEDULE_FIELD_NAME: usize = 0;
+const SCHEDULE_FIELD_PROMPT: usize = 1;
+const SCHEDULE_FIELD_CRON: usize = 2;
+const SCHEDULE_FIELD_CWD: usize = 3;
+pub const SCHEDULE_FIELD_NOTIFY: usize = 4;
+
+pub const SCHEDULE_FIELD_LABEL_KEYS: [&str; SCHEDULE_FIELD_COUNT] = [
+    "schedule.field.name",
+    "schedule.field.prompt",
+    "schedule.field.cron",
+    "schedule.field.cwd",
+    "schedule.field.notify_on_failure",
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleRow {
+    Header(usize),
+    Field(usize, usize),
+    AddNew,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleHeaderAction {
+    ToggleExpand,
+    ToggleEnabled,
+    RunNow,
+    Delete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleFrequencyKind {
+    Daily,
+    Hourly,
+    Weekly,
+    Custom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleFieldAction {
+    ManualEdit,
+    Freq(ScheduleFrequencyKind),
+    ToggleNotify,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleAddAction {
+    NewBlank,
+    NewFromSession,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleMenuAction {
+    Header(ScheduleHeaderAction),
+    Field(ScheduleFieldAction),
+    Add(ScheduleAddAction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleInputField {
+    Field {
+        task_idx: usize,
+        field_idx: usize,
+    },
+    Frequency {
+        task_idx: usize,
+        kind: ScheduleFrequencyKind,
+    },
+}
+
+/// `ScheduleDialog` 里当前展示的浮层。危险操作（删除任务）的二次确认复用
+/// `ActionMenu.confirming`（同 ProfileDialog 的 Delete），不需要专属 overlay。
+pub enum ScheduleOverlay {
+    None,
+    /// Esc 关闭面板时存在未保存修改，三选一确认（保存并关闭/不保存关闭/取消）
+    UnsavedChanges {
+        selected: usize,
+    },
+    /// 保存成功但同步系统 crontab 失败：数据已落盘，仅提示用户手动重试
+    SyncError {
+        message: String,
+    },
+}
+
+/// 定时任务面板状态（/schedule 无参命令触发）
+pub struct ScheduleDialog {
+    pub tasks: Vec<wyj_store::schedule::ScheduleTask>,
+    pub cursor: usize,
+    pub expanded: Option<usize>,
+    pub overlay: ScheduleOverlay,
+    pub error: Option<String>,
+    pub live_input: InputBox,
+    pub menu: Option<ActionMenu<ScheduleRow, ScheduleMenuAction>>,
+    default_cwd: std::path::PathBuf,
+    /// 当前会话最近一条用户消息，供"从当前对话固化为模板"预填 prompt 草稿。
+    last_user_prompt: Option<String>,
+    /// 打开面板时的快照，供 Esc 时判断"是否有未保存改动"。
+    saved_snapshot: Vec<wyj_store::schedule::ScheduleTask>,
+}
+
+impl ScheduleDialog {
+    fn new(cwd: &std::path::Path, last_user_prompt: Option<String>) -> Self {
+        let tasks = wyj_store::schedule::load()
+            .map(|m| m.tasks)
+            .unwrap_or_default();
+        Self {
+            saved_snapshot: tasks.clone(),
+            tasks,
+            cursor: 0,
+            expanded: None,
+            overlay: ScheduleOverlay::None,
+            error: None,
+            live_input: InputBox::new(),
+            menu: None,
+            default_cwd: cwd.to_path_buf(),
+            last_user_prompt,
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.tasks != self.saved_snapshot
+    }
+
+    pub fn rows(&self) -> Vec<ScheduleRow> {
+        let mut rows = Vec::new();
+        for i in 0..self.tasks.len() {
+            rows.push(ScheduleRow::Header(i));
+            if self.expanded == Some(i) {
+                for f in 0..SCHEDULE_FIELD_COUNT {
+                    rows.push(ScheduleRow::Field(i, f));
+                }
+            }
+        }
+        rows.push(ScheduleRow::AddNew);
+        rows
+    }
+
+    fn selected_row(&self) -> ScheduleRow {
+        self.rows()
+            .get(self.cursor)
+            .copied()
+            .unwrap_or(ScheduleRow::AddNew)
+    }
+
+    fn clamp_cursor(&mut self) {
+        let len = self.rows().len();
+        if len == 0 {
+            self.cursor = 0;
+        } else if self.cursor >= len {
+            self.cursor = len - 1;
+        }
+    }
+
+    pub fn field_text(&self, task_idx: usize, field_idx: usize) -> String {
+        let t = &self.tasks[task_idx];
+        match field_idx {
+            SCHEDULE_FIELD_NAME => t.name.clone(),
+            SCHEDULE_FIELD_PROMPT => t.prompt.clone(),
+            SCHEDULE_FIELD_CRON => t.cron.clone(),
+            SCHEDULE_FIELD_CWD => t.cwd.display().to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn set_field_text(&mut self, task_idx: usize, field_idx: usize, value: String) {
+        let t = &mut self.tasks[task_idx];
+        match field_idx {
+            SCHEDULE_FIELD_NAME => t.name = value,
+            SCHEDULE_FIELD_PROMPT => t.prompt = value,
+            SCHEDULE_FIELD_CRON => t.cron = value,
+            SCHEDULE_FIELD_CWD => t.cwd = std::path::PathBuf::from(value),
+            _ => {}
+        }
+    }
+
+    /// 校验全部任务，返回第一个不合法任务的下标 + 错误文案。
+    fn validate(&self) -> Option<(usize, String)> {
+        for (i, t) in self.tasks.iter().enumerate() {
+            if t.name.trim().is_empty() {
+                return Some((i, wyj_i18n::tr("schedule.error.empty_name")));
+            }
+            if t.prompt.trim().is_empty() {
+                return Some((i, wyj_i18n::tr("schedule.error.empty_prompt")));
+            }
+            if t.cwd.as_os_str().is_empty() {
+                return Some((i, wyj_i18n::tr("schedule.error.empty_cwd")));
+            }
+            if let Err(e) = wyj_store::cron_sync::validate_cron(&t.cron) {
+                return Some((
+                    i,
+                    wyj_i18n::tr_fmt("schedule.error.invalid_cron", &[("err", &e.to_string())]),
+                ));
+            }
+        }
+        None
+    }
+
+    /// 选中条目回车后弹出的操作菜单。头行 → 展开/收起、启用/停用、立即运行、删除；
+    /// Cron 字段 → 频率预设四选一；NotifyOnFailure 字段 → 切换；其余字段 → 编辑；
+    /// AddNew → 新建空白/从当前对话固化为模板（后者仅当会话内有过用户消息时展示）。
+    fn build_menu(&self) -> Option<ActionMenu<ScheduleRow, ScheduleMenuAction>> {
+        let row = self.selected_row();
+        match row {
+            ScheduleRow::Header(task_idx) => {
+                let expanded = self.expanded == Some(task_idx);
+                let task = &self.tasks[task_idx];
+                let saved = self.saved_snapshot.iter().find(|t| t.id == task.id);
+                let run_disabled = saved != Some(task);
+                let items = vec![
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if expanded {
+                            "schedule.menu.collapse"
+                        } else {
+                            "schedule.menu.expand"
+                        }),
+                        action: ScheduleMenuAction::Header(ScheduleHeaderAction::ToggleExpand),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr(if task.enabled {
+                            "schedule.menu.disable"
+                        } else {
+                            "schedule.menu.enable"
+                        }),
+                        action: ScheduleMenuAction::Header(ScheduleHeaderAction::ToggleEnabled),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("schedule.menu.run_now"),
+                        action: ScheduleMenuAction::Header(ScheduleHeaderAction::RunNow),
+                        dangerous: false,
+                        disabled: run_disabled,
+                        disabled_reason: run_disabled
+                            .then(|| wyj_i18n::tr("schedule.menu.run_now_needs_save")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("schedule.menu.delete"),
+                        action: ScheduleMenuAction::Header(ScheduleHeaderAction::Delete),
+                        dangerous: true,
+                        disabled: false,
+                        disabled_reason: None,
+                    },
+                ];
+                Some(ActionMenu::new(row, items))
+            }
+            ScheduleRow::Field(_, SCHEDULE_FIELD_NOTIFY) => Some(ActionMenu::new(
+                row,
+                vec![ActionMenuItem {
+                    label: wyj_i18n::tr("schedule.menu.toggle"),
+                    action: ScheduleMenuAction::Field(ScheduleFieldAction::ToggleNotify),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }],
+            )),
+            ScheduleRow::Field(_, SCHEDULE_FIELD_CRON) => {
+                let mk = |label_key: &str, kind: ScheduleFrequencyKind| ActionMenuItem {
+                    label: wyj_i18n::tr(label_key),
+                    action: ScheduleMenuAction::Field(ScheduleFieldAction::Freq(kind)),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                };
+                Some(ActionMenu::new(
+                    row,
+                    vec![
+                        mk("schedule.menu.freq_daily", ScheduleFrequencyKind::Daily),
+                        mk("schedule.menu.freq_hourly", ScheduleFrequencyKind::Hourly),
+                        mk("schedule.menu.freq_weekly", ScheduleFrequencyKind::Weekly),
+                        mk("schedule.menu.freq_custom", ScheduleFrequencyKind::Custom),
+                    ],
+                ))
+            }
+            ScheduleRow::Field(..) => Some(ActionMenu::new(
+                row,
+                vec![ActionMenuItem {
+                    label: wyj_i18n::tr("schedule.menu.edit"),
+                    action: ScheduleMenuAction::Field(ScheduleFieldAction::ManualEdit),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }],
+            )),
+            ScheduleRow::AddNew => {
+                let mut items = vec![ActionMenuItem {
+                    label: wyj_i18n::tr("schedule.menu.new_blank"),
+                    action: ScheduleMenuAction::Add(ScheduleAddAction::NewBlank),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }];
+                if self.last_user_prompt.is_some() {
+                    items.push(ActionMenuItem {
+                        label: wyj_i18n::tr("schedule.menu.new_from_session"),
+                        action: ScheduleMenuAction::Add(ScheduleAddAction::NewFromSession),
+                        dangerous: false,
+                        disabled: false,
+                        disabled_reason: None,
+                    });
+                }
+                Some(ActionMenu::new(row, items))
+            }
+        }
+    }
+}
+
+/// `/schedule` 面板操作菜单的按键分发，结构与 `profile_handle_menu_key` 完全对称。
+fn schedule_handle_menu_key(state: &mut AppState, code: KeyCode) {
+    enum Step {
+        None,
+        Close,
+        Cancel,
+        Confirm(ScheduleMenuAction),
+        Execute(ScheduleMenuAction, ScheduleRow),
+    }
+
+    let step = {
+        let Some(dialog) = &mut state.schedule_dialog else {
+            return;
+        };
+        let Some(menu) = &mut dialog.menu else {
+            return;
+        };
+        let target = menu.target;
+        if let Some(confirming) = menu.confirming {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') => Step::Execute(confirming, target),
+                KeyCode::Esc | KeyCode::Char('n') => Step::Cancel,
+                _ => Step::None,
+            }
+        } else {
+            match code {
+                KeyCode::Up => {
+                    menu.move_up();
+                    Step::None
+                }
+                KeyCode::Down => {
+                    menu.move_down();
+                    Step::None
+                }
+                KeyCode::Esc => Step::Close,
+                KeyCode::Enter => match menu.selected_item() {
+                    Some(item) if item.disabled => Step::None,
+                    Some(item) if item.dangerous => Step::Confirm(item.action),
+                    Some(item) => Step::Execute(item.action, target),
+                    None => Step::None,
+                },
+                _ => Step::None,
+            }
+        }
+    };
+
+    match step {
+        Step::None => {}
+        Step::Close => {
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.menu = None;
+            }
+        }
+        Step::Cancel => {
+            if let Some(dialog) = &mut state.schedule_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = None;
+                }
+            }
+        }
+        Step::Confirm(action) => {
+            if let Some(dialog) = &mut state.schedule_dialog {
+                if let Some(menu) = &mut dialog.menu {
+                    menu.confirming = Some(action);
+                }
+            }
+        }
+        Step::Execute(action, target) => {
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.menu = None;
+            }
+            schedule_execute_menu_action(state, action, target);
+        }
+    }
+}
+
+fn schedule_add_new_task(state: &mut AppState, prefill_prompt: Option<String>) {
+    let Some(dialog) = &mut state.schedule_dialog else {
+        return;
+    };
+    let now = chrono::Utc::now();
+    let task = wyj_store::schedule::ScheduleTask {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: wyj_i18n::tr("schedule.new_task_default_name"),
+        prompt: prefill_prompt.unwrap_or_default(),
+        cron: "0 8 * * *".to_string(),
+        cwd: dialog.default_cwd.clone(),
+        enabled: true,
+        notify_on_failure: false,
+        created_at: now,
+        updated_at: now,
+        last_run: None,
+    };
+    dialog.tasks.push(task);
+    let new_idx = dialog.tasks.len() - 1;
+    dialog.expanded = Some(new_idx);
+    dialog.cursor = dialog
+        .rows()
+        .iter()
+        .position(|r| *r == ScheduleRow::Header(new_idx))
+        .unwrap_or(0);
+}
+
+fn schedule_execute_menu_action(
+    state: &mut AppState,
+    action: ScheduleMenuAction,
+    target: ScheduleRow,
+) {
+    match action {
+        ScheduleMenuAction::Header(ScheduleHeaderAction::ToggleExpand) => {
+            let ScheduleRow::Header(idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.expanded = if dialog.expanded == Some(idx) {
+                    None
+                } else {
+                    Some(idx)
+                };
+                dialog.clamp_cursor();
+            }
+        }
+        ScheduleMenuAction::Header(ScheduleHeaderAction::ToggleEnabled) => {
+            let ScheduleRow::Header(idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.tasks[idx].enabled = !dialog.tasks[idx].enabled;
+            }
+        }
+        ScheduleMenuAction::Header(ScheduleHeaderAction::RunNow) => {
+            let ScheduleRow::Header(idx) = target else {
+                return;
+            };
+            // 只对"已保存、未脏"的任务生效（菜单项在脏态下已 disabled，这里再兜底一次），
+            // 直接以子进程调用自身 `schedule run <id>`——与系统 crontab 触发路径完全
+            // 一致，不在 TUI 进程内重新装配 Agent。
+            let id = state
+                .schedule_dialog
+                .as_ref()
+                .and_then(|d| d.tasks.get(idx))
+                .map(|t| t.id.clone());
+            if let Some(id) = id {
+                if let Ok(exe) = std::env::current_exe() {
+                    tokio::spawn(async move {
+                        let _ = tokio::process::Command::new(exe)
+                            .arg("schedule")
+                            .arg("run")
+                            .arg(&id)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                    });
+                }
+            }
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.error = Some(wyj_i18n::tr("schedule.run_now.triggered"));
+            }
+        }
+        ScheduleMenuAction::Header(ScheduleHeaderAction::Delete) => {
+            let ScheduleRow::Header(idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.tasks.remove(idx);
+                match dialog.expanded {
+                    Some(e) if e == idx => dialog.expanded = None,
+                    Some(e) if e > idx => dialog.expanded = Some(e - 1),
+                    _ => {}
+                }
+                dialog.clamp_cursor();
+            }
+        }
+        ScheduleMenuAction::Field(ScheduleFieldAction::ManualEdit) => {
+            let ScheduleRow::Field(task_idx, field_idx) = target else {
+                return;
+            };
+            let prefill = state
+                .schedule_dialog
+                .as_ref()
+                .map(|d| d.field_text(task_idx, field_idx))
+                .unwrap_or_default();
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.live_input = InputBox::new();
+                dialog.live_input.insert_text(&prefill);
+            }
+            state.input_owner = Some(InputOwner::Schedule(ScheduleInputField::Field {
+                task_idx,
+                field_idx,
+            }));
+        }
+        ScheduleMenuAction::Field(ScheduleFieldAction::ToggleNotify) => {
+            let ScheduleRow::Field(task_idx, _) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.tasks[task_idx].notify_on_failure =
+                    !dialog.tasks[task_idx].notify_on_failure;
+            }
+        }
+        ScheduleMenuAction::Field(ScheduleFieldAction::Freq(kind)) => {
+            let ScheduleRow::Field(task_idx, _) = target else {
+                return;
+            };
+            let prefill = if matches!(kind, ScheduleFrequencyKind::Custom) {
+                state
+                    .schedule_dialog
+                    .as_ref()
+                    .map(|d| d.tasks[task_idx].cron.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.live_input = InputBox::new();
+                dialog.live_input.insert_text(&prefill);
+            }
+            state.input_owner = Some(InputOwner::Schedule(ScheduleInputField::Frequency {
+                task_idx,
+                kind,
+            }));
+        }
+        ScheduleMenuAction::Add(ScheduleAddAction::NewBlank) => {
+            schedule_add_new_task(state, None);
+        }
+        ScheduleMenuAction::Add(ScheduleAddAction::NewFromSession) => {
+            let prompt = state
+                .schedule_dialog
+                .as_ref()
+                .and_then(|d| d.last_user_prompt.clone());
+            schedule_add_new_task(state, prompt);
+        }
+    }
+}
+
+fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
+    let (h, m) = s.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+/// 频率预设的结构化文本输入解析：Daily 期望 "HH:MM"，Hourly 期望 "MM"，
+/// Weekly 期望 "D HH:MM"（D=0..6，0=周日），Custom 直接校验为标准 5 段 cron。
+fn schedule_parse_frequency_input(
+    kind: ScheduleFrequencyKind,
+    text: &str,
+) -> Result<String, String> {
+    let text = text.trim();
+    match kind {
+        ScheduleFrequencyKind::Daily => {
+            let (h, m) =
+                parse_hh_mm(text).ok_or_else(|| wyj_i18n::tr("schedule.error.bad_time_format"))?;
+            Ok(wyj_store::cron_sync::frequency_to_cron(
+                &wyj_store::cron_sync::Frequency::Daily { hour: h, minute: m },
+            ))
+        }
+        ScheduleFrequencyKind::Hourly => {
+            let m: u32 = text
+                .parse()
+                .map_err(|_| wyj_i18n::tr("schedule.error.bad_minute_format"))?;
+            if m > 59 {
+                return Err(wyj_i18n::tr("schedule.error.bad_minute_format"));
+            }
+            Ok(wyj_store::cron_sync::frequency_to_cron(
+                &wyj_store::cron_sync::Frequency::Hourly { minute: m },
+            ))
+        }
+        ScheduleFrequencyKind::Weekly => {
+            let mut parts = text.splitn(2, char::is_whitespace);
+            let day = parts.next().unwrap_or_default();
+            let time = parts.next().unwrap_or_default().trim();
+            let weekday: u32 = day
+                .parse()
+                .map_err(|_| wyj_i18n::tr("schedule.error.bad_weekly_format"))?;
+            if weekday > 6 {
+                return Err(wyj_i18n::tr("schedule.error.bad_weekly_format"));
+            }
+            let (h, m) = parse_hh_mm(time)
+                .ok_or_else(|| wyj_i18n::tr("schedule.error.bad_weekly_format"))?;
+            Ok(wyj_store::cron_sync::frequency_to_cron(
+                &wyj_store::cron_sync::Frequency::Weekly {
+                    weekday,
+                    hour: h,
+                    minute: m,
+                },
+            ))
+        }
+        ScheduleFrequencyKind::Custom => {
+            wyj_store::cron_sync::validate_cron(text).map_err(|e| e.to_string())?;
+            Ok(text.to_string())
+        }
+    }
+}
+
+/// Ctrl+S 与"保存并关闭"菜单选项共用的保存逻辑：校验 → 整份写盘 → 同步系统
+/// crontab。与 `profile_try_save` 不同，这里不需要重建 Agent（定时任务不影响
+/// 当前会话的模型/工具配置）。返回 `true` 表示任务数据已成功落盘（即使随后的
+/// crontab 同步失败，也视为"保存成功"——数据本身没有丢，调用方据此决定是否
+/// 关闭面板：crontab 同步失败时会转入 `ScheduleOverlay::SyncError` 停留在面板上）。
+fn schedule_try_save(state: &mut AppState) -> bool {
+    let mut saved = false;
+    if let Some(dialog) = &mut state.schedule_dialog {
+        if let Some((bad_idx, msg)) = dialog.validate() {
+            dialog.expanded = Some(bad_idx);
+            dialog.clamp_cursor();
+            dialog.error = Some(msg);
+        } else {
+            let manifest = wyj_store::schedule::ScheduleManifest {
+                version: wyj_store::schedule::SCHEDULE_VERSION,
+                tasks: dialog.tasks.clone(),
+            };
+            match wyj_store::schedule::save(&manifest) {
+                Ok(()) => {
+                    saved = true;
+                    dialog.saved_snapshot = dialog.tasks.clone();
+                    dialog.error = None;
+                    if let Err(e) = wyj_store::cron_sync::sync_crontab(&manifest.tasks) {
+                        dialog.overlay = ScheduleOverlay::SyncError {
+                            message: e.to_string(),
+                        };
+                    }
+                }
+                Err(e) => {
+                    dialog.error = Some(wyj_i18n::tr_fmt(
+                        "schedule.error.save_failed",
+                        &[("err", &e.to_string())],
+                    ));
+                }
+            }
+        }
+    }
+    saved
+}
+
 // ── MCP server 管理面板：/mcp 命令触发 ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1974,7 +2654,7 @@ impl McpDialog {
         let merged = wyj_config::merged_mcp_servers(cfg, cwd);
         let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
         let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
-        // `.mcp.json` 和 `.wyj/mcp.toml` 都是项目级文件（都挂在 cwd 下），
+        // `.mcp.json` 和 `.wyj-code/mcp.toml` 都是项目级文件（都挂在 cwd 下），
         // 两者任一命中都应该算 Project scope——只查 load_project_mcp 会把
         // `.mcp.json` 里的条目错误分类成 Global，卸载时就会把"禁用"记录写进
         // 全局 lockfile 而不是项目 lockfile，下次刷新用项目 lockfile 再查一遍
@@ -2618,7 +3298,7 @@ impl SkillsDialog {
                 managed: None,
             });
         }
-        let global_dir = home.join(".wyj-code").join("skills");
+        let global_dir = wyj_config::global_config_dir_in(home).join("skills");
         for (name, description) in scan_skill_dir_for_display(&global_dir) {
             let managed = global_lock.skills.iter().find(|e| e.name == name).cloned();
             installed.push(SkillInstalledRow {
@@ -2629,7 +3309,7 @@ impl SkillsDialog {
                 managed,
             });
         }
-        let project_dir = cwd.join(".wyj").join("skills");
+        let project_dir = wyj_config::project_config_dir(cwd).join("skills");
         for (name, description) in scan_skill_dir_for_display(&project_dir) {
             let managed = project_lock.skills.iter().find(|e| e.name == name).cloned();
             installed.push(SkillInstalledRow {
@@ -4015,6 +4695,71 @@ mod navigation_focus_tests {
     }
 
     #[test]
+    fn todo_detail_scroll_falls_back_to_chat_when_content_fits_viewport() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::Todos;
+        state.todo_detail_open = true;
+        // 面板内容不超过一屏时，渲染层会把 max_scroll 写回为 0（本次 bug 的核心场景）。
+        state.todo_detail_scroll = 0;
+        state.todo_detail_max_scroll = 0;
+        state.chat_scroll = 10;
+        state.chat_max_scroll = 20;
+
+        state.scroll_focus_lines(3);
+
+        assert_eq!(state.todo_detail_scroll, 0);
+        assert_eq!(state.chat_scroll, 13);
+    }
+
+    #[test]
+    fn todo_detail_scroll_stays_internal_when_room_remains() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::Todos;
+        state.todo_detail_open = true;
+        state.todo_detail_scroll = 5;
+        state.todo_detail_max_scroll = 20;
+        state.chat_scroll = 10;
+        state.chat_max_scroll = 20;
+
+        state.scroll_focus_lines(3);
+
+        assert_eq!(state.todo_detail_scroll, 8);
+        assert_eq!(state.chat_scroll, 10);
+    }
+
+    #[test]
+    fn sub_agent_detail_scroll_falls_back_to_chat_when_content_fits_viewport() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+        state.sub_agent_detail_scroll = 0;
+        state.sub_agent_detail_max_scroll = 0;
+        state.chat_scroll = 10;
+        state.chat_max_scroll = 20;
+
+        state.scroll_focus_lines(3);
+
+        assert_eq!(state.sub_agent_detail_scroll, 0);
+        assert_eq!(state.chat_scroll, 13);
+    }
+
+    #[test]
+    fn sub_agent_detail_scroll_stays_internal_when_room_remains() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+        state.sub_agent_detail_scroll = 5;
+        state.sub_agent_detail_max_scroll = 20;
+        state.chat_scroll = 10;
+        state.chat_max_scroll = 20;
+
+        state.scroll_focus_lines(3);
+
+        assert_eq!(state.sub_agent_detail_scroll, 8);
+        assert_eq!(state.chat_scroll, 10);
+    }
+
+    #[test]
     fn explicit_conversation_jump_sets_selection_anchor() {
         let mut state = make_state();
         state
@@ -4289,6 +5034,110 @@ impl ExtensionsDialog {
     }
 }
 
+/// `/import` 面板阶段：勾选中 → 已应用（展示结果报告）。
+pub enum ImportStage {
+    Selecting,
+    Report(wyj_store::import::ImportOutcome),
+}
+
+/// 一键导入面板（/import）：扫描 Codex / Claude Code 配置 → 勾选 → 写入。
+/// 多选交互照 `AskQuestionDialog` 的 Multi 模式（Space 勾选，`checked` 存下标）。
+pub struct ImportDialog {
+    targets: wyj_store::import::ImportTargets,
+    pub candidates: Vec<wyj_store::import::ImportCandidate>,
+    pub scan_errors: Vec<String>,
+    pub cursor: usize,
+    pub checked: BTreeSet<usize>,
+    pub stage: ImportStage,
+    pub error: Option<String>,
+}
+
+impl ImportDialog {
+    pub fn new(cwd: &Path) -> Self {
+        let mut dialog = Self {
+            targets: wyj_store::import::ImportTargets {
+                home: PathBuf::new(),
+                global_config_path: PathBuf::new(),
+                global_skills_dir: PathBuf::new(),
+                global_agents_dir: PathBuf::new(),
+                cwd: cwd.to_path_buf(),
+            },
+            candidates: Vec::new(),
+            scan_errors: Vec::new(),
+            cursor: 0,
+            checked: BTreeSet::new(),
+            stage: ImportStage::Selecting,
+            error: None,
+        };
+        match wyj_store::import::ImportTargets::from_real_home(cwd) {
+            Ok(targets) => dialog.targets = targets,
+            Err(e) => {
+                dialog.error = Some(e.to_string());
+                return dialog;
+            }
+        }
+        match wyj_store::import::scan_importable(
+            &dialog.targets,
+            wyj_store::import::ImportFilter::All,
+        ) {
+            Ok(scan) => {
+                dialog.candidates = scan.candidates;
+                dialog.scan_errors = scan.errors;
+                // 默认勾选全部无冲突项；冲突项（勾选即覆盖）需用户显式选中
+                dialog.checked = dialog
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.conflict.is_none())
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+            Err(e) => dialog.error = Some(e.to_string()),
+        }
+        dialog
+    }
+
+    pub fn move_cursor(&mut self, delta: i32) {
+        if self.candidates.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as i32 + delta;
+        self.cursor = next.clamp(0, self.candidates.len() as i32 - 1) as usize;
+    }
+
+    pub fn toggle(&mut self) {
+        if self.candidates.is_empty() {
+            return;
+        }
+        if !self.checked.remove(&self.cursor) {
+            self.checked.insert(self.cursor);
+        }
+    }
+
+    /// `a`：已全选则清空，否则全选。
+    pub fn toggle_all(&mut self) {
+        if self.checked.len() == self.candidates.len() {
+            self.checked.clear();
+        } else {
+            self.checked = (0..self.candidates.len()).collect();
+        }
+    }
+
+    /// Enter：把勾选项写入 wyj 配置，进入报告阶段。
+    pub fn apply(&mut self) {
+        let selected: Vec<wyj_store::import::ImportCandidate> = self
+            .checked
+            .iter()
+            .filter_map(|&i| self.candidates.get(i).cloned())
+            .collect();
+        match wyj_store::import::apply_import(&self.targets, &selected) {
+            Ok(outcome) => self.stage = ImportStage::Report(outcome),
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
+}
+
 /// 全局 UI 状态
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
@@ -4373,6 +5222,8 @@ pub struct AppState {
     pub todo_detail_open: bool,
     /// 任务详情滚动偏移（预留给长详情，渲染层按需 clamp）
     pub todo_detail_scroll: u16,
+    /// 任务详情面板上一帧渲染算出的内部可滚动上限，供 scroll_focus_lines 判断是否已到边界并转发给聊天区
+    pub todo_detail_max_scroll: u16,
     /// 每条任务的运行时统计（耗时/token），按 TodoItem.id 索引
     pub todo_stats: HashMap<String, TodoRuntimeStats>,
     /// 每条任务执行期间产生的消息流事件，按 TodoItem.id 索引。
@@ -4395,6 +5246,10 @@ pub struct AppState {
     pub agents_dialog: Option<AgentsDialog>,
     /// 统一 Skill/MCP/Plugin 资源面板（/extensions 命令触发时 Some）
     pub extensions_dialog: Option<ExtensionsDialog>,
+    /// 一键导入面板（/import 命令触发时 Some）
+    pub import_dialog: Option<ImportDialog>,
+    /// 定时任务面板（/schedule 命令触发时 Some）
+    pub schedule_dialog: Option<ScheduleDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -4442,6 +5297,8 @@ pub struct AppState {
     pub sub_agent_detail_open: bool,
     /// 详情内容的行级滚动偏移（渲染时按可视行数 clamp 并写回）
     pub sub_agent_detail_scroll: u16,
+    /// 详情面板上一帧渲染算出的内部可滚动上限，供 scroll_focus_lines 判断是否已到边界并转发给聊天区
+    pub sub_agent_detail_max_scroll: u16,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
     /// 子 Agent 累计 token 用量（与主 session 分开统计，/cost 单列）
@@ -4539,6 +5396,7 @@ impl AppState {
             selected_todo_id: None,
             todo_detail_open: false,
             todo_detail_scroll: 0,
+            todo_detail_max_scroll: 0,
             todo_stats: HashMap::new(),
             todo_execution_logs: HashMap::new(),
             session_picker: None,
@@ -4550,6 +5408,8 @@ impl AppState {
             plugins_dialog: None,
             agents_dialog: None,
             extensions_dialog: None,
+            import_dialog: None,
+            schedule_dialog: None,
             save_needed: false,
             config,
             pending_attachments: vec![],
@@ -4573,6 +5433,7 @@ impl AppState {
             selected_sub_agent: None,
             sub_agent_detail_open: false,
             sub_agent_detail_scroll: 0,
+            sub_agent_detail_max_scroll: 0,
             pending_bg_reminders: vec![],
             sub_input_tokens: 0,
             sub_output_tokens: 0,
@@ -4622,6 +5483,7 @@ impl AppState {
         self.todo_execution_logs.clear();
         self.agents_dialog = None;
         self.extensions_dialog = None;
+        self.import_dialog = None;
         self.pending_attachments.clear();
         self.current_op = None;
         self.turn_start_time = None;
@@ -4809,6 +5671,19 @@ impl AppState {
         }
     }
 
+    /// 在 [0, max] 范围内调整 value；若调整前后（均先按 max clamp）数值相同，
+    /// 说明这次滚动已经被面板内部边界"吞掉"（含 max == 0 即内容根本不需要滚动
+    /// 的情况），返回 false，调用方应把这次滚动量转发给别处（聊天区），而不是
+    /// 让滚轮事件消失得无声无息。
+    fn adjust_bounded_u16_scroll(value: &mut u16, delta: i32, max: u16) -> bool {
+        let before = (*value).min(max);
+        *value = before;
+        Self::adjust_u16_scroll(value, delta);
+        let after = (*value).min(max);
+        *value = after;
+        before != after
+    }
+
     fn move_focus_selection(&mut self, delta: i32) {
         match self.ui_focus {
             UiFocus::Todos => self.move_selected_todo(delta),
@@ -4848,10 +5723,22 @@ impl AppState {
                 }
             }
             UiFocus::Todos if self.todo_detail_open => {
-                Self::adjust_u16_scroll(&mut self.todo_detail_scroll, delta);
+                if !Self::adjust_bounded_u16_scroll(
+                    &mut self.todo_detail_scroll,
+                    delta,
+                    self.todo_detail_max_scroll,
+                ) {
+                    self.scroll_chat_lines(delta);
+                }
             }
             UiFocus::SubAgents if self.sub_agent_detail_open => {
-                Self::adjust_u16_scroll(&mut self.sub_agent_detail_scroll, delta);
+                if !Self::adjust_bounded_u16_scroll(
+                    &mut self.sub_agent_detail_scroll,
+                    delta,
+                    self.sub_agent_detail_max_scroll,
+                ) {
+                    self.scroll_chat_lines(delta);
+                }
             }
             UiFocus::Chat => {
                 if !self.scroll_selected_message_detail(delta) {
@@ -7411,6 +8298,10 @@ async fn tui_main(
                                         // 独立浮层），Esc 只需清空 live_input +
                                         // 归还 input_owner（上面已做）。
                                     }
+                                    InputOwner::Schedule(_) => {
+                                        // Schedule 借用同 Profile，不对应任何需要
+                                        // 重置的 overlay。
+                                    }
                                 }
                             }
                             KeyCode::Enter => {
@@ -7609,6 +8500,39 @@ async fn tui_main(
                                         if let Some(dialog) = &mut state.profile_dialog {
                                             dialog.entries[entry_idx]
                                                 .set_text_value(field_idx, value);
+                                        }
+                                    }
+                                    InputOwner::Schedule(ScheduleInputField::Field {
+                                        task_idx,
+                                        field_idx,
+                                    }) => {
+                                        let value = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if let Some(dialog) = &mut state.schedule_dialog {
+                                            dialog.set_field_text(task_idx, field_idx, value);
+                                            dialog.error = None;
+                                        }
+                                    }
+                                    InputOwner::Schedule(ScheduleInputField::Frequency {
+                                        task_idx,
+                                        kind,
+                                    }) => {
+                                        let value = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        match schedule_parse_frequency_input(kind, &value) {
+                                            Ok(cron_expr) => {
+                                                if let Some(dialog) = &mut state.schedule_dialog {
+                                                    dialog.tasks[task_idx].cron = cron_expr;
+                                                    dialog.error = None;
+                                                }
+                                            }
+                                            Err(msg) => {
+                                                if let Some(dialog) = &mut state.schedule_dialog {
+                                                    dialog.error = Some(msg);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -8523,6 +9447,42 @@ async fn tui_main(
                         continue;
                     }
 
+                    // ⓪.59 一键导入面板拦截（/import 命令触发）
+                    if let Some(dialog) = &mut state.import_dialog {
+                        let in_report = matches!(dialog.stage, ImportStage::Report(_));
+                        match key.code {
+                            KeyCode::Esc => state.import_dialog = None,
+                            _ if in_report => {
+                                // 报告阶段：任意确认键关闭
+                                if matches!(key.code, KeyCode::Enter | KeyCode::Char('q')) {
+                                    state.import_dialog = None;
+                                }
+                            }
+                            KeyCode::Up => dialog.move_cursor(-1),
+                            KeyCode::Down => dialog.move_cursor(1),
+                            KeyCode::Char(' ') => dialog.toggle(),
+                            KeyCode::Char('a') => dialog.toggle_all(),
+                            KeyCode::Enter => {
+                                if !dialog.checked.is_empty() {
+                                    let count = dialog.checked.len();
+                                    dialog.apply();
+                                    if matches!(dialog.stage, ImportStage::Report(_)) {
+                                        // 写入成功：刷新内存配置，提示生效边界
+                                        if let Ok(cfg) = Config::load() {
+                                            state.config = cfg;
+                                        }
+                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                            "import.applied_notice",
+                                            &[("count", &count.to_string())],
+                                        )));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // ⓪.58 可用 Agent 类型面板拦截（/agents 命令触发）
                     if state.agents_dialog.is_some() {
                         state.ui_focus = UiFocus::AgentsCatalog;
@@ -8835,6 +9795,147 @@ async fn tui_main(
                                 );
                                 if saved {
                                     state.profile_dialog = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.61 定时任务面板拦截（/schedule 命令触发）
+                    if state.schedule_dialog.is_some() {
+                        // 字段编辑/频率输入的文本输入统一走上面的 ⓪.1 输入借用拦截
+                        // （state.input_owner == Some(Schedule(_))），不会进入这里。
+
+                        if state.schedule_dialog.as_ref().unwrap().menu.is_some() {
+                            schedule_handle_menu_key(&mut state, key.code);
+                            continue;
+                        }
+
+                        // ── 保存成功但 crontab 同步失败：纯提示，Esc/Enter 收起
+                        if matches!(
+                            state.schedule_dialog.as_ref().unwrap().overlay,
+                            ScheduleOverlay::SyncError { .. }
+                        ) {
+                            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                                if let Some(dialog) = &mut state.schedule_dialog {
+                                    dialog.overlay = ScheduleOverlay::None;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ── Esc 未保存修改三选一确认
+                        if matches!(
+                            state.schedule_dialog.as_ref().unwrap().overlay,
+                            ScheduleOverlay::UnsavedChanges { .. }
+                        ) {
+                            enum Choice {
+                                None,
+                                SaveClose,
+                                DiscardClose,
+                                BackToPanel,
+                            }
+                            let mut choice = Choice::None;
+                            if let Some(dialog) = &mut state.schedule_dialog {
+                                if let ScheduleOverlay::UnsavedChanges { selected } =
+                                    &mut dialog.overlay
+                                {
+                                    match key.code {
+                                        KeyCode::Up => {
+                                            if *selected > 0 {
+                                                *selected -= 1;
+                                            }
+                                        }
+                                        KeyCode::Down => {
+                                            if *selected + 1 < 3 {
+                                                *selected += 1;
+                                            }
+                                        }
+                                        KeyCode::Enter => {
+                                            choice = match *selected {
+                                                0 => Choice::SaveClose,
+                                                1 => Choice::DiscardClose,
+                                                _ => Choice::BackToPanel,
+                                            };
+                                        }
+                                        KeyCode::Esc => {
+                                            dialog.overlay = ScheduleOverlay::None;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            match choice {
+                                Choice::None => {}
+                                Choice::SaveClose => {
+                                    let saved = schedule_try_save(&mut state);
+                                    let sync_failed = matches!(
+                                        state.schedule_dialog.as_ref().map(|d| &d.overlay),
+                                        Some(ScheduleOverlay::SyncError { .. })
+                                    );
+                                    if saved && !sync_failed {
+                                        state.input_owner = None;
+                                        state.schedule_dialog = None;
+                                    } else if let Some(dialog) = &mut state.schedule_dialog {
+                                        if !sync_failed {
+                                            dialog.overlay = ScheduleOverlay::None;
+                                        }
+                                    }
+                                }
+                                Choice::DiscardClose => {
+                                    state.input_owner = None;
+                                    state.schedule_dialog = None;
+                                }
+                                Choice::BackToPanel => {
+                                    if let Some(dialog) = &mut state.schedule_dialog {
+                                        dialog.overlay = ScheduleOverlay::None;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
+                        match key.code {
+                            KeyCode::Esc => {
+                                if let Some(dialog) = &mut state.schedule_dialog {
+                                    if dialog.is_dirty() {
+                                        dialog.overlay =
+                                            ScheduleOverlay::UnsavedChanges { selected: 0 };
+                                    } else {
+                                        state.schedule_dialog = None;
+                                    }
+                                }
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.schedule_dialog {
+                                    dialog.cursor = dialog.cursor.saturating_sub(1);
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.schedule_dialog {
+                                    let len = dialog.rows().len();
+                                    if dialog.cursor + 1 < len {
+                                        dialog.cursor += 1;
+                                    }
+                                    dialog.error = None;
+                                }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(dialog) = &mut state.schedule_dialog {
+                                    dialog.menu = dialog.build_menu();
+                                }
+                            }
+                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let saved = schedule_try_save(&mut state);
+                                let sync_failed = matches!(
+                                    state.schedule_dialog.as_ref().map(|d| &d.overlay),
+                                    Some(ScheduleOverlay::SyncError { .. })
+                                );
+                                if saved && !sync_failed {
+                                    state.schedule_dialog = None;
                                 }
                             }
                             _ => {}
@@ -9851,9 +10952,8 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::OpenMemoryDialog) => {
                                         let pid = wyj_core::project_id(&state.cwd);
-                                        let index_path = wyj_config::home_dir()
+                                        let index_path = wyj_config::config_dir()
                                             .unwrap_or_default()
-                                            .join(".wyj-code")
                                             .join("memory")
                                             .join(pid)
                                             .join("MEMORY.md");
@@ -9879,12 +10979,25 @@ async fn tui_main(
                                         state.extensions_dialog =
                                             Some(ExtensionsDialog::new(&state.cwd));
                                     }
+                                    Ok(CommandResult::OpenImportDialog) => {
+                                        state.import_dialog = Some(ImportDialog::new(&state.cwd));
+                                    }
                                     Ok(CommandResult::OpenAgentsDialog { defs, .. }) => {
                                         state.agents_dialog = Some(AgentsDialog::new(defs));
                                         state.ui_focus = UiFocus::AgentsCatalog;
                                     }
                                     Ok(CommandResult::OpenSubAgentsPanel(target_id)) => {
                                         apply_open_subagents_panel(&mut state, target_id);
+                                    }
+                                    Ok(CommandResult::OpenScheduleDialog) => {
+                                        let last_user_prompt = state
+                                            .messages
+                                            .iter()
+                                            .rev()
+                                            .find(|m| matches!(m.role, MessageRole::User))
+                                            .map(|m| m.content.clone());
+                                        state.schedule_dialog =
+                                            Some(ScheduleDialog::new(&state.cwd, last_user_prompt));
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;

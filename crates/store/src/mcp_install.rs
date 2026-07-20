@@ -1,7 +1,7 @@
 //! MCP server 安装编排：包选择策略 + install/upgrade/uninstall/enable + 启动时生效列表
 //!
 //! 严格遵守"只管配置，不碰依赖安装"：这里只负责把 command/args/env/version 写入
-//! config(全局 config.toml 或项目 .wyj/mcp.toml) + lockfile，绝不 shell out 执行
+//! config(全局 config.toml 或项目 .wyj-code/mcp.toml) + lockfile，绝不 shell out 执行
 //! `npm install`/`pip install`。MCP server 走 npx/uvx 这类运行时自动拉取的启动
 //! 方式规避依赖安装问题。
 
