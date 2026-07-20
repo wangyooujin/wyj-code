@@ -28,7 +28,9 @@
 - **三模式 + 分模型** —— `normal` / `plan`(只读) / `bypass`(自动放行)，各模式可绑定不同模型。
 - **CLAUDE.md 记忆机制** —— 每轮重新读盘，全局 + 祖先链文件以 `<system-reminder>` 注入当轮 user 消息；工具触达新目录时动态加载；`@path` 递归导入。
 - **Hooks 生命周期自动化** —— 复用 `.claude/settings.json`，在 PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点挂任意 shell 脚本（拦截危险命令、保存即格式化、注入上下文、回合结束通知），`/hooks` 查看当前生效配置，`--no-hooks` 一键禁用。
-- **自定义 slash 命令** —— 识别真实 Claude Code 的 `~/.claude/commands/*.md` 与 `.claude/commands/*.md`（与 wyj-code 自造的 `~/.wyj-code/skills`/`.wyj/skills` 并存，同作用域内真 CC 路径优先），frontmatter 支持 `description`/`argument-hint`/`allowed-tools`，`/help` 末尾动态列出全部自定义命令。
+- **自定义 slash 命令** —— 识别真实 Claude Code 的 `~/.claude/commands/*.md` 与 `.claude/commands/*.md`（与 wyj-code 自造的 `~/.wyj-code/skills`/`.wyj-code/skills` 并存，同作用域内真 CC 路径优先），frontmatter 支持 `description`/`argument-hint`/`allowed-tools`，`/help` 末尾动态列出全部自定义命令。
+- **一键导入 Codex / Claude Code 配置** —— `/import` 面板扫描 `~/.codex/`（MCP server、prompts）与 Claude Code（`~/.claude.json`/`.mcp.json`、commands、agents）配置，勾选确认后物化为 wyj-code 自管配置；CLI 对应 `wyj-code extensions migrate --from codex|claude|all [--dry-run]`。
+- **定时任务** —— `/schedule` 面板管理 cron 触发的任务（一句话 prompt 或固化当前对话），保存后自动同步进系统 crontab（macOS/Linux），到点以 headless 会话执行，失败可选 macOS 系统通知；CLI 对应 `wyj-code schedule {list,add,remove,enable,disable,sync,run}`。
 - **会话中消息注入** —— Agent 忙碌时新消息进队列不打断，在工具调用往返边界排空合并。
 - **i18n** —— 中 / 英双语，运行时切换，覆盖核心用户可见文案。
 - **会话持久化** —— 自动写入 `~/.wyj-code/`，`-c` 续上次、`--resume <id>` 恢复指定会话。

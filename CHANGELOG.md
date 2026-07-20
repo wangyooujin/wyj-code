@@ -2,6 +2,24 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.3.3]
+
+- **新增 `/schedule` 定时任务系统**（TUI 面板 + CLI `wyj-code schedule {list,add,remove,enable,disable,sync,run}`，详见 `doc/plan/v1.3.3-plan.md`）：
+  - 一句话 prompt 或"把当前对话固化为模板"即可生成到点自动执行的任务；wyj-code 本身没有常驻后台进程，定时能力完全依赖系统级 `crontab`（v1 仅 macOS/Linux）唤起 headless 执行，`wyj-code schedule run <id>` 以子进程方式调用自身 `-p "<prompt>" --cwd <dir>` 入口，与手动配置 crontab 完全等价。
+  - 面板保存后立即自动同步进系统 crontab，只替换 `# BEGIN/END wyj-code schedule` 标记的区块，不触碰用户其他 cron 条目，首次同步前自动备份原始 crontab。
+  - 每个任务独立绑定工作目录；失败不重试，记录失败原因，可选 macOS 系统通知；跨天业务状态（如候选池）由任务 prompt 自行读写文件，框架不做业务状态管理。
+- **新增 `/import` 一键导入 Codex / Claude Code 配置**（TUI 面板 + CLI `wyj-code extensions migrate --from codex|claude|all [--dry-run]`，底层共用 `wyj-store::import` 的 scan/apply）：
+  - 扫描来源：Codex `~/.codex/config.toml` 的 `[mcp_servers.*]`（新增 TOML 解析器，未知字段宽容忽略）与 `~/.codex/prompts/*.md`；Claude Code `~/.claude.json`/`.mcp.json` 的 `mcpServers`、`~/.claude/commands`/`.claude/commands`（递归保留 namespace）、`~/.claude/agents`/`.claude/agents`。
+  - TUI 交互：列表标注来源/scope/冲突/遮蔽，默认勾选全部无冲突项，Space 勾选、`a` 全选/清空、Enter 写入并展示结果报告；来源文件永远只读保留。
+  - 幂等与冲突语义：与目标内容完全相同的候选不再列出（重复运行列表自然收敛）；同名不同内容标 conflict、默认不勾选、勾选即覆盖（CLI 非交互一律跳过冲突项并列出）。
+  - 遮蔽提示：从 Claude commands/agents 目录导入的副本在原文件删除前被在线原文件遮蔽（合并链真 CC 路径优先），报告逐条提示。
+- **BREAKING：项目级配置目录从 `.wyj/` 更名为 `./.wyj-code/`**（与全局 `~/.wyj-code/` 命名对称），承载 `skills/`、`agents/`、`mcp.toml`、`installed.json`。**不做旧目录兼容读取**——已有项目里的 `.wyj/` 配置会静默失效，手工执行 `mv .wyj .wyj-code` 即可迁移。路径拼接统一收敛到 `wyj_config::project_config_dir(cwd)` / `global_config_dir_in(home)` 两个辅助函数，消灭各 crate 内联硬编码。
+- **子 Agent 定义新增 wyj 自有目录加载源**：`load_agent_defs` 扩成六层链 `内置 → ~/.wyj-code/agents → ~/.claude/agents → 插件 → ./.wyj-code/agents → .claude/agents`，与 skill 链哲学对齐，`/import` 导入的 agent 定义落在 wyj 目录。
+- **UI：列表选中态背景色统一为深灰**：Todo 列表、子 Agent 面板、会话选择器、斜杠命令补全此前用饱和蓝色背景，Profile/Mcp/Skills/Plugins/Extensions/Import/Schedule/Agents 等管理面板此前完全没有背景色（只靠文字加粗+箭头），两套不一致的视觉语言统一收敛为同一个 `Theme::selected_row()`（深灰背景 + 品牌橙文字 + 加粗），更方便一眼辨识当前选中项。
+- **修复 Todo / 子 Agent 详情面板滚动上限计算错误**：详情内容较短、完全在可视区域内时，PageUp/PageDown 此前会被面板滚动逻辑吞掉而不穿透到聊天区；根因是详情渲染函数未把实际内容行数回传给滚动上限状态，现在改为返回 `(scroll, max_scroll)` 二元组即时同步。
+- **修复 `extensions migrate` 冲突检测 bug**：旧实现用 `Config::load()`（会合并 `~/.claude.json`）做去重，导致全局原生 server 全量误报 skipped、且合并结果被误物化写进 config.toml；新实现改用 `Config::load_file_only()` 裸读 config.toml 做冲突检测与写回。
+- **修复 TUI 里 `/extensions` 不可用**：`ExtensionsCmd` 此前只注册在 `standard_registry()`，TUI 实际使用的 `standard_registry_with_skills()` 漏注册。
+
 ## [1.3.0]
 
 - **Computer-use（桌面 GUI 控制，macOS/Windows）**：对接 Anthropic 原生 `computer_20251124` 工具——模型截图观察桌面、合成鼠标点击/拖拽/滚动与键盘输入操控本机 GUI。

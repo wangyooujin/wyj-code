@@ -1,7 +1,7 @@
-//! 安装元数据 lockfile：`~/.wyj-code/installed.json`（全局）+ `<cwd>/.wyj/installed.json`（项目）
+//! 安装元数据 lockfile：`~/.wyj-code/installed.json`（全局）+ `<cwd>/.wyj-code/installed.json`（项目）
 //!
 //! 只记录"通过 /mcp、/skills 面板安装"的条目的版本/来源/启用状态，不改动
-//! `McpServerConfig`/`SKILL.md` 本身的格式。config.toml、`.wyj/mcp.toml`、
+//! `McpServerConfig`/`SKILL.md` 本身的格式。config.toml、`.wyj-code/mcp.toml`、
 //! skill 目录里存在但这里找不到同名记录的条目，视为"未纳管/手动配置"。
 
 use anyhow::{Context, Result};
@@ -245,7 +245,7 @@ pub fn global_lockfile_path() -> Result<PathBuf> {
 }
 
 pub fn project_lockfile_path(cwd: &Path) -> PathBuf {
-    cwd.join(".wyj").join("installed.json")
+    wyj_config::project_config_dir(cwd).join("installed.json")
 }
 
 fn load_from(path: &Path) -> Result<InstalledManifest> {

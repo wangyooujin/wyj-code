@@ -3,13 +3,15 @@
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
     AskQuestionStage, Attachment, ChatMessage, ChatSelectionAnchor, ExecModeConfirmDialog,
-    ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
-    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
-    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
-    ProfileInputField, ProfileOverlay, ProfileRow, SessionPickerState, SettingsDialog,
+    ExtensionsDialog, FlatRow, ImportDialog, ImportStage, InProgressAnswer, InputOwner,
+    McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole,
+    PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
+    ProfileDialog, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
+    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog,
     SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
-    PROFILE_FIELD_LABEL_KEYS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
+    SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -233,6 +235,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         .split(area);
 
     draw_chat(f, state, chunks[0]);
+    // 防御性清零：只有 BottomPanel::SubAgents 分支里真正画出详情区时才会重新写入
+    // 准确值，避免面板本帧未展示详情区（终端太矮/未展开/无选中）时残留上一帧的旧值。
+    state.sub_agent_detail_max_scroll = 0;
     match panel_kind {
         BottomPanel::None => {}
         BottomPanel::Permission => {
@@ -307,6 +312,16 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 
     if let Some(dialog) = &mut state.extensions_dialog {
         draw_extensions_dialog(f, dialog, area);
+    }
+
+    // 一键导入面板叠加在最顶层
+    if let Some(dialog) = &state.import_dialog {
+        draw_import_dialog(f, dialog, area);
+    }
+
+    // 定时任务面板叠加在最顶层
+    if let Some(dialog) = &state.schedule_dialog {
+        draw_schedule_dialog(f, dialog, state.input_owner, area);
     }
 }
 
@@ -1124,7 +1139,7 @@ pub(crate) fn build_pending_chat_lines(
     }
 
     if let Some(items) = state.current_todos.clone() {
-        let next_scroll = push_inline_todo_lines(
+        let (next_scroll, next_max_scroll) = push_inline_todo_lines(
             &mut lines,
             &items,
             &state.messages,
@@ -1140,6 +1155,9 @@ pub(crate) fn build_pending_chat_lines(
             max_content_width,
         );
         state.todo_detail_scroll = next_scroll;
+        state.todo_detail_max_scroll = next_max_scroll;
+    } else {
+        state.todo_detail_max_scroll = 0;
     }
 
     if let Some(dlg) = &state.ask_question_dialog {
@@ -1164,9 +1182,9 @@ fn push_inline_todo_lines(
     detail_scroll: u16,
     todo_stats: &HashMap<String, TodoRuntimeStats>,
     max_content_width: usize,
-) -> u16 {
+) -> (u16, u16) {
     if items.is_empty() {
-        return detail_scroll;
+        return (detail_scroll, 0);
     }
 
     let total = items.len();
@@ -1233,7 +1251,7 @@ fn push_inline_todo_lines(
     )));
 
     if collapsed {
-        return detail_scroll;
+        return (detail_scroll, 0);
     }
 
     let max_item_width = max_content_width.saturating_sub(10);
@@ -1245,7 +1263,7 @@ fn push_inline_todo_lines(
         }
         let selected_style = |st: Style| -> Style {
             if is_selected {
-                st.bg(Color::Blue).add_modifier(Modifier::BOLD)
+                st.bg(Theme::SELECTED_BG).add_modifier(Modifier::BOLD)
             } else {
                 st
             }
@@ -1309,11 +1327,12 @@ fn push_inline_todo_lines(
     }
 
     let mut next_scroll = detail_scroll;
+    let mut next_max_scroll: u16 = 0;
     if focused && detail_open {
         if let Some(item) = selected_item
             .or_else(|| selected_todo_id.and_then(|id| items.iter().find(|item| item.id == id)))
         {
-            next_scroll = push_todo_detail_lines(
+            (next_scroll, next_max_scroll) = push_todo_detail_lines(
                 lines,
                 item,
                 messages,
@@ -1326,7 +1345,7 @@ fn push_inline_todo_lines(
         }
     }
 
-    next_scroll
+    (next_scroll, next_max_scroll)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1339,7 +1358,7 @@ fn push_todo_detail_lines(
     stats: Option<&TodoRuntimeStats>,
     detail_scroll: u16,
     max_content_width: usize,
-) -> u16 {
+) -> (u16, u16) {
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
         Theme::border(),
@@ -1441,7 +1460,7 @@ fn push_todo_detail_lines(
     for line in detail_lines.into_iter().skip(scroll).take(viewport) {
         lines.push(line);
     }
-    scroll as u16
+    (scroll as u16, max_scroll.min(u16::MAX as usize) as u16)
 }
 
 fn push_prefixed_lines(
@@ -1855,7 +1874,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         let is_selected = selected_idx == Some(start + row_i);
         let sel_bg = |mut st: Style| -> Style {
             if is_selected {
-                st = st.bg(Color::Blue);
+                st = st.bg(Theme::SELECTED_BG);
             }
             st
         };
@@ -1957,6 +1976,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             let total = para.line_count(dw).min(u16::MAX as usize) as u16;
             let visible_height = detail_area.height;
             let max_scroll = total.saturating_sub(visible_height);
+            state.sub_agent_detail_max_scroll = max_scroll;
             // clamp 后写回，防止按键累加超过 max_scroll 导致"到顶/底后要多按几次才生效"
             let clamped = state.sub_agent_detail_scroll.min(max_scroll);
             state.sub_agent_detail_scroll = clamped;
@@ -2381,14 +2401,14 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(
                         name_pad,
                         Style::default()
-                            .bg(Color::Blue)
+                            .bg(Theme::SELECTED_BG)
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         desc_str,
                         Style::default()
-                            .bg(Color::Blue)
+                            .bg(Theme::SELECTED_BG)
                             .fg(Color::Rgb(180, 200, 255)),
                     ),
                 ])
@@ -2933,7 +2953,7 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
                 lines.push(Line::from(Span::styled(
                     line_str,
                     Style::default()
-                        .bg(Color::Blue)
+                        .bg(Theme::SELECTED_BG)
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 )));
@@ -3016,9 +3036,7 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
         let text = truncate_line(&text, w);
 
         let style = if selected {
-            Style::default()
-                .fg(Theme::CLAUDE)
-                .add_modifier(Modifier::BOLD)
+            Theme::selected_row()
         } else {
             Style::default().fg(Color::White)
         };
@@ -3111,9 +3129,7 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
         let text = truncate_line(&text, w);
 
         let style = if selected {
-            Style::default()
-                .fg(Theme::CLAUDE)
-                .add_modifier(Modifier::BOLD)
+            Theme::selected_row()
         } else {
             Style::default().fg(Color::White)
         };
@@ -3229,9 +3245,7 @@ fn draw_mcp_dialog(
             let selected = pos == dialog.cursor;
             let marker = if selected { "▶ " } else { "  " };
             let style = if selected {
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD)
+                Theme::selected_row()
             } else {
                 Style::default().fg(Color::White)
             };
@@ -3510,9 +3524,7 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
             let selected = pos == dialog.cursor;
             let marker = if selected { "▶ " } else { "  " };
             let style = if selected {
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD)
+                Theme::selected_row()
             } else {
                 Style::default().fg(Color::White)
             };
@@ -3717,9 +3729,7 @@ fn draw_plugins_dialog(f: &mut Frame, dialog: &PluginsDialog, area: Rect) {
             let selected = pos == dialog.cursor;
             let marker = if selected { "▶ " } else { "  " };
             let style = if selected {
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD)
+                Theme::selected_row()
             } else {
                 Style::default().fg(Color::White)
             };
@@ -3999,9 +4009,7 @@ fn draw_agents_dialog(f: &mut Frame, dialog: &mut AgentsDialog, area: Rect) {
                 w,
             );
             let style = if selected {
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD)
+                Theme::selected_row()
             } else {
                 Style::default().fg(Color::White)
             };
@@ -4159,9 +4167,7 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
                 list_area.width as usize,
             );
             let style = if selected {
-                Style::default()
-                    .fg(Theme::CLAUDE)
-                    .add_modifier(Modifier::BOLD)
+                Theme::selected_row()
             } else if !record.enabled {
                 Theme::dim()
             } else {
@@ -4256,6 +4262,186 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
             Theme::dim(),
         )));
     }
+    f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
+}
+
+/// 一键导入面板渲染（/import 命令触发）
+fn draw_import_dialog(f: &mut Frame, dialog: &ImportDialog, area: Rect) {
+    let is_report = matches!(dialog.stage, ImportStage::Report(_));
+    let body_rows = if is_report {
+        let ImportStage::Report(outcome) = &dialog.stage else {
+            unreachable!()
+        };
+        (outcome.applied.len()
+            + outcome.overwritten.len()
+            + outcome.shadow_warnings.len()
+            + outcome.errors.len()
+            + 6)
+        .clamp(3, 20)
+    } else {
+        dialog.candidates.len().clamp(1, MAX_LIST_VIEWPORT)
+    };
+    let error_rows = (!dialog.scan_errors.is_empty() || dialog.error.is_some()) as usize;
+    let height = ((body_rows + error_rows + 4) as u16).min(area.height.saturating_sub(2));
+    let width = (area.width * 9 / 10).clamp(72, 132).min(area.width);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr("import.dialog.title")),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    let body_area = chunks[0];
+    let mut lines = Vec::new();
+
+    if let ImportStage::Report(outcome) = &dialog.stage {
+        if !outcome.applied.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} ({})",
+                    wyj_i18n::tr("import.report.applied"),
+                    outcome.applied.len()
+                ),
+                Style::default().fg(Color::Green),
+            )));
+            for item in &outcome.applied {
+                lines.push(Line::from(Span::raw(format!("  ✓ {item}"))));
+            }
+        }
+        if !outcome.overwritten.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} ({})",
+                    wyj_i18n::tr("import.report.overwritten"),
+                    outcome.overwritten.len()
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+            for item in &outcome.overwritten {
+                lines.push(Line::from(Span::raw(format!("  ↻ {item}"))));
+            }
+        }
+        if !outcome.shadow_warnings.is_empty() {
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("import.report.shadowed_note"),
+                Style::default().fg(Color::Yellow),
+            )));
+            for item in &outcome.shadow_warnings {
+                lines.push(Line::from(Span::styled(
+                    truncate_line(&format!("  ≫ {item}"), body_area.width as usize),
+                    Theme::dim(),
+                )));
+            }
+        }
+        if !outcome.errors.is_empty() {
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("import.report.errors"),
+                Theme::error(),
+            )));
+            for item in &outcome.errors {
+                lines.push(Line::from(Span::styled(
+                    truncate_line(&format!("  ✗ {item}"), body_area.width as usize),
+                    Theme::error(),
+                )));
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("import.report.nothing"),
+                Theme::dim(),
+            )));
+        }
+    } else if dialog.candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr("import.dialog.empty"),
+            Theme::dim(),
+        )));
+    } else {
+        let visible = dialog.candidates.len().clamp(1, MAX_LIST_VIEWPORT);
+        let start = scroll_window_start(dialog.candidates.len(), dialog.cursor, visible);
+        for (pos, candidate) in dialog
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+        {
+            let selected = pos == dialog.cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let checkbox = if dialog.checked.contains(&pos) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let source = match candidate.source_app {
+                wyj_store::import::ImportSourceApp::Codex => "codex",
+                wyj_store::import::ImportSourceApp::Claude => "claude",
+            };
+            let mut flags = Vec::new();
+            if candidate.conflict.is_some() {
+                flags.push(wyj_i18n::tr("import.label.conflict"));
+            }
+            if candidate.shadowed {
+                flags.push(wyj_i18n::tr("import.label.shadowed"));
+            }
+            let text = truncate_line(
+                &format!(
+                    "{marker}{checkbox} {:<6} {:<32} {source:<6} → {:<7} {}",
+                    candidate.kind.as_str(),
+                    candidate.name,
+                    format!("{:?}", candidate.scope).to_lowercase(),
+                    flags.join(" ")
+                ),
+                body_area.width as usize,
+            );
+            let style = if selected {
+                Theme::selected_row()
+            } else if candidate.conflict.is_some() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+    }
+    for err in dialog.scan_errors.iter().chain(dialog.error.iter()) {
+        lines.push(Line::from(Span::styled(
+            truncate_line(&format!("! {err}"), body_area.width as usize),
+            Theme::error(),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), body_area);
+
+    let footer_area = chunks[1];
+    let hint = if is_report {
+        wyj_i18n::tr("import.report.hint")
+    } else {
+        wyj_i18n::tr("import.dialog.hint")
+    };
+    let footer = vec![
+        Line::from(Span::styled(
+            "─".repeat(footer_area.width as usize),
+            Theme::border(),
+        )),
+        Line::from(Span::styled(
+            truncate_line(&hint, footer_area.width as usize),
+            Theme::dim(),
+        )),
+    ];
     f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
 }
 
@@ -4355,9 +4541,7 @@ fn draw_profile_dialog(
         let style = if editing {
             Style::default().fg(Color::Black).bg(Theme::CLAUDE)
         } else if selected_row {
-            Style::default()
-                .fg(Theme::CLAUDE)
-                .add_modifier(Modifier::BOLD)
+            Theme::selected_row()
         } else {
             Style::default().fg(Color::White)
         };
@@ -4432,6 +4616,163 @@ fn draw_profile_dialog(
                 ],
                 *selected,
             );
+        }
+    }
+}
+
+/// 布局与字段渲染逻辑同 `draw_profile_dialog`：Header 行汇总名字/cron/下次触发
+/// 时间/最近一次运行状态，展开后逐字段列出，菜单/未保存确认/同步失败提示复用
+/// `draw_action_menu`/`draw_profile_list_overlay`/`draw_profile_text_overlay`
+/// 这三个已经与 Profile 无关的通用浮层绘制函数。
+fn draw_schedule_dialog(
+    f: &mut Frame,
+    dialog: &ScheduleDialog,
+    input_owner: Option<InputOwner>,
+    area: Rect,
+) {
+    let rows = dialog.rows();
+    let content_lines = rows.len() as u16 + 4;
+    let height = (content_lines + 2).min(area.height.saturating_sub(2));
+    let width = (area.width * 8 / 10).clamp(60, 110).min(area.width);
+
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::CLAUDE))
+        .title(Span::styled(
+            format!(" {} ", wyj_i18n::tr("schedule.title")),
+            Style::default()
+                .fg(Theme::CLAUDE)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let w = inner.width as usize;
+    let label_width = 18usize;
+
+    let editing_row = match input_owner {
+        Some(InputOwner::Schedule(ScheduleInputField::Field {
+            task_idx,
+            field_idx,
+        })) => Some(ScheduleRow::Field(task_idx, field_idx)),
+        Some(InputOwner::Schedule(ScheduleInputField::Frequency { task_idx, .. })) => {
+            Some(ScheduleRow::Field(task_idx, 2))
+        }
+        _ => None,
+    };
+
+    let now = chrono::Utc::now();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let selected_row = row_idx == dialog.cursor;
+        let editing = Some(*row) == editing_row;
+
+        let text = match row {
+            ScheduleRow::Header(task_idx) => {
+                let task = &dialog.tasks[*task_idx];
+                let marker = if task.enabled { "●" } else { "○" };
+                let expand_marker = if dialog.expanded == Some(*task_idx) {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let cursor = if selected_row { "▶" } else { " " };
+                let next_run = wyj_store::cron_sync::next_run_after(&task.cron, now)
+                    .ok()
+                    .flatten()
+                    .map(|t| t.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| wyj_i18n::tr("schedule.dialog.invalid_cron_short"));
+                let status = task
+                    .last_run
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.status))
+                    .unwrap_or_else(|| "-".to_string());
+                format!(
+                    "{cursor} {expand_marker} {marker} {}  [{}]  next:{next_run}  last:{status}",
+                    task.name, task.cron
+                )
+            }
+            ScheduleRow::Field(task_idx, f_idx) => {
+                let label = wyj_i18n::tr(SCHEDULE_FIELD_LABEL_KEYS[*f_idx]);
+                let value = if editing {
+                    wyj_i18n::tr("schedule.dialog.editing_placeholder")
+                } else if *f_idx == SCHEDULE_FIELD_NOTIFY {
+                    wyj_i18n::tr(if dialog.tasks[*task_idx].notify_on_failure {
+                        "schedule.dialog.on"
+                    } else {
+                        "schedule.dialog.off"
+                    })
+                } else {
+                    dialog.field_text(*task_idx, *f_idx)
+                };
+                let cursor = if selected_row { "▶" } else { " " };
+                format!("{cursor}     {label:<label_width$}{value}")
+            }
+            ScheduleRow::AddNew => {
+                let cursor = if selected_row { "▶" } else { " " };
+                format!("{cursor} + {}", wyj_i18n::tr("schedule.dialog.add_new_row"))
+            }
+        };
+        let text = truncate_line(&text, w);
+
+        let style = if editing {
+            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
+        } else if selected_row {
+            Theme::selected_row()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
+    if let Some(err) = &dialog.error {
+        lines.push(Line::from(Span::styled(
+            truncate_line(err, w),
+            Theme::warning(),
+        )));
+    } else {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate_line(&wyj_i18n::tr("schedule.dialog.hint1"), w),
+        Theme::dim(),
+    )));
+    lines.push(Line::from(Span::styled(
+        truncate_line(&wyj_i18n::tr("schedule.dialog.hint2"), w),
+        Theme::dim(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines));
+    f.render_widget(para, inner);
+
+    if let Some(menu) = &dialog.menu {
+        draw_action_menu(f, area, &wyj_i18n::tr("schedule.title"), menu);
+        return;
+    }
+
+    match &dialog.overlay {
+        ScheduleOverlay::None => {}
+        ScheduleOverlay::UnsavedChanges { selected } => {
+            draw_profile_list_overlay(
+                f,
+                area,
+                "profile.overlay.unsaved_title",
+                vec![
+                    wyj_i18n::tr("profile.overlay.unsaved_save_close"),
+                    wyj_i18n::tr("profile.overlay.unsaved_discard_close"),
+                    wyj_i18n::tr("profile.overlay.unsaved_cancel"),
+                ],
+                *selected,
+            );
+        }
+        ScheduleOverlay::SyncError { message } => {
+            draw_profile_text_overlay(f, area, "schedule.overlay.sync_error_title", message);
         }
     }
 }
@@ -4743,6 +5084,28 @@ mod tool_result_fold_tests {
 
         assert!(height > 0);
         assert!(matches!(panel, BottomPanel::SubAgents));
+    }
+
+    #[test]
+    fn rendering_short_todo_detail_writes_back_zero_max_scroll() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
+            id: "a".to_string(),
+            content: "short task".to_string(),
+            status: wyj_tools::todo::TodoStatus::InProgress,
+            priority: None,
+            active_form: None,
+        }]);
+        state.selected_todo_id = Some("a".to_string());
+        state.ui_focus = UiFocus::Todos;
+        state.todo_detail_open = true;
+        state.todo_detail_scroll = 0;
+        // 未渲染前先塞一个陈旧的非零值，验证渲染层确实会重新计算并回写。
+        state.todo_detail_max_scroll = 99;
+
+        let _ = build_pending_chat_lines(&mut state, 100);
+
+        assert_eq!(state.todo_detail_max_scroll, 0);
     }
 
     #[test]

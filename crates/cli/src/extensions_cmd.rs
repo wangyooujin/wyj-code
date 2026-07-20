@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 use std::path::Path;
 use wyj_store::extensions;
+use wyj_store::import;
 use wyj_store::InstallScope;
 
 #[derive(Subcommand, Debug)]
@@ -39,8 +40,15 @@ pub enum ExtensionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Import Claude-style MCP configuration without deleting the source files.
+    /// Import Codex / Claude Code configuration (MCP servers, custom commands,
+    /// agents) into wyj-code without deleting the source files.
     Migrate {
+        /// Source app to import from: codex | claude | all.
+        #[arg(long, default_value = "all")]
+        from: String,
+        /// Scan and list importable items without writing anything.
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -232,22 +240,90 @@ pub async fn run(command: ExtensionCommand, cwd: &Path) -> Result<()> {
                 println!("{id}: {:?}", outcome);
             }
         }
-        ExtensionCommand::Migrate { json } => {
-            let report = extensions::migrate(cwd)?;
+        ExtensionCommand::Migrate {
+            from,
+            dry_run,
+            json,
+        } => {
+            let filter = match from.to_ascii_lowercase().as_str() {
+                "codex" => import::ImportFilter::Codex,
+                "claude" => import::ImportFilter::Claude,
+                "all" => import::ImportFilter::All,
+                _ => anyhow::bail!("--from must be codex, claude or all, got {from}"),
+            };
+            let targets = import::ImportTargets::from_real_home(cwd)?;
+            let scan = import::scan_importable(&targets, filter)?;
+            if dry_run {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&scan)?);
+                } else if scan.candidates.is_empty() {
+                    println!("Nothing to import.");
+                } else {
+                    for c in &scan.candidates {
+                        let mut flags = Vec::new();
+                        if c.conflict.is_some() {
+                            flags.push("conflict");
+                        }
+                        if c.shadowed {
+                            flags.push("shadowed");
+                        }
+                        println!(
+                            "{:<8} {:<32} {:<8} {:<24} {}",
+                            c.kind.as_str(),
+                            c.name,
+                            format!("{:?}", c.scope).to_lowercase(),
+                            flags.join(","),
+                            c.source_path.display()
+                        );
+                    }
+                }
+                for error in &scan.errors {
+                    eprintln!("Scan error: {error}");
+                }
+                return Ok(());
+            }
+            // 非交互语义：同名冲突项一律跳过并列出，想覆盖请去 TUI /import 勾选。
+            let (selected, skipped): (Vec<_>, Vec<_>) = scan
+                .candidates
+                .into_iter()
+                .partition(|c| c.conflict.is_none());
+            let outcome = import::apply_import(&targets, &selected)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let skipped_labels: Vec<String> = skipped
+                    .iter()
+                    .map(|c| format!("{}:{}", c.kind.as_str(), c.name))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "outcome": outcome,
+                        "skipped_conflicts": skipped_labels,
+                        "scan_errors": scan.errors,
+                        "runtime_apply": "next_agent_boundary"
+                    })
+                );
             } else {
-                println!("Imported files: {}", report.imported_files.len());
-                println!("Imported servers: {}", report.imported_servers.join(", "));
-                if !report.skipped_servers.is_empty() {
+                println!("Imported: {}", outcome.applied.join(", "));
+                if !skipped.is_empty() {
                     println!(
-                        "Skipped existing servers: {}",
-                        report.skipped_servers.join(", ")
+                        "Skipped conflicting items (use TUI /import to overwrite): {}",
+                        skipped
+                            .iter()
+                            .map(|c| format!("{}:{}", c.kind.as_str(), c.name))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
-                for error in report.errors {
+                if !outcome.shadow_warnings.is_empty() {
+                    println!("Shadowed by live Claude Code files (imported copy takes effect only after the original is removed):");
+                    for warning in &outcome.shadow_warnings {
+                        println!("  {warning}");
+                    }
+                }
+                for error in scan.errors.iter().chain(outcome.errors.iter()) {
                     eprintln!("Migration error: {error}");
                 }
+                println!("Changes apply at the next agent boundary.");
             }
         }
         ExtensionCommand::Enable { id, scope, json } => {

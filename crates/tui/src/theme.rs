@@ -16,6 +16,11 @@ impl Theme {
     pub const BORDER: Color = Color::Rgb(102, 102, 102); // 深灰边框
     pub const STATUS_BG: Color = Color::Rgb(30, 30, 30); // 状态栏背景
     pub const CODE_FG: Color = Color::Rgb(147, 165, 255); // 代码块内容浅蓝
+    /// 列表/管理面板里"当前选中行"的通用背景色：中深灰，与 STATUS_BG(30,30,30) 拉开
+    /// 足够对比度，在黑色/深色终端背景下能清楚看到选中条，同时不像饱和色（原先
+    /// 部分面板用的 Color::Blue）那样过于刺眼。全应用统一用这一个值（而非各面板
+    /// 各自选色），是 v1.3.3 为解决"选中态视觉语言不一致导致不好辨认"问题引入的。
+    pub const SELECTED_BG: Color = Color::Rgb(66, 66, 66);
 
     // ── 样式方法 ─────────────────────────────────────────────────────────────
 
@@ -61,6 +66,17 @@ impl Theme {
     /// 淡化（不活跃内容、截断提示）
     pub fn dim() -> Style {
         Style::default().fg(Self::INACTIVE)
+    }
+
+    /// 列表/管理面板里"当前选中行"的通用样式（品牌橙前景 + 深灰背景 + 加粗）。
+    /// Todo 列表、子 Agent 面板、会话选择器、斜杠命令补全、Profile/Mcp/Skills/
+    /// Plugins/Extensions/Import/Schedule/Agents 等全部管理面板的列表行选中态
+    /// 统一走这一个函数，避免各处各自定义颜色导致视觉语言不一致。
+    pub fn selected_row() -> Style {
+        Style::default()
+            .fg(Self::CLAUDE)
+            .bg(Self::SELECTED_BG)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// 边框

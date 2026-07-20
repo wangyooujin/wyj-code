@@ -280,7 +280,7 @@ fn load_from_path_if_absent(
 /// 2. 全局 wyj-code：`~/.wyj-code/skills/*.md`
 /// 3. 全局真 CC：`~/.claude/commands/*.md`（覆盖 #2 同名条目）
 /// 4. 已启用插件贡献路径（先到先得，跳过并警告同名冲突，不变）
-/// 5. 项目 wyj-code：`.wyj/skills/*.md`
+/// 5. 项目 wyj-code：`.wyj-code/skills/*.md`
 /// 6. 项目真 CC：`.claude/commands/*.md`（覆盖 #1-#5 同名条目，最高优先级）
 ///
 /// 递归扫描 `*.md`，子目录映射为 Claude Code 风格的 `namespace:name` 命令名。
@@ -312,7 +312,7 @@ pub fn load_skills(
 
     // 2. 全局用户 skill：~/.wyj-code/skills/*.md（覆盖内置，这是既有的"用户手动
     // 覆盖内置"能力，不属于插件冲突场景）
-    let global_wyj_dir = home.join(".wyj-code").join("skills");
+    let global_wyj_dir = wyj_config::global_config_dir_in(home).join("skills");
     if global_wyj_dir.exists() {
         load_from_dir(&global_wyj_dir, &mut skills);
     }
@@ -328,8 +328,8 @@ pub fn load_skills(
         load_from_path_if_absent(path, "plugin", &mut skills);
     }
 
-    // 5. 项目 skill：.wyj/skills/*.md（覆盖 #1-#4 同名条目）
-    let project_wyj_dir = cwd.join(".wyj").join("skills");
+    // 5. 项目 skill：.wyj-code/skills/*.md（覆盖 #1-#4 同名条目）
+    let project_wyj_dir = wyj_config::project_config_dir(cwd).join("skills");
     if project_wyj_dir.exists() {
         load_from_dir(&project_wyj_dir, &mut skills);
     }
@@ -529,7 +529,7 @@ mod tests {
     fn load_skills_project_dir_still_overrides_plugin_contribution() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let project_dir = cwd.path().join(".wyj").join("skills");
+        let project_dir = cwd.path().join(".wyj-code").join("skills");
         std::fs::create_dir_all(&project_dir).unwrap();
         std::fs::write(
             project_dir.join("custom.md"),
@@ -590,7 +590,7 @@ mod tests {
         std::fs::create_dir_all(&global_cc_dir).unwrap();
         std::fs::write(global_cc_dir.join("custom.md"), "# Global CC\nglobal").unwrap();
 
-        let project_wyj_dir = cwd.path().join(".wyj").join("skills");
+        let project_wyj_dir = cwd.path().join(".wyj-code").join("skills");
         std::fs::create_dir_all(&project_wyj_dir).unwrap();
         std::fs::write(
             project_wyj_dir.join("custom.md"),
@@ -616,7 +616,7 @@ mod tests {
         std::fs::create_dir_all(&global_cc_dir).unwrap();
         std::fs::write(global_cc_dir.join("custom.md"), "# Global CC\nglobal").unwrap();
 
-        let project_wyj_dir = cwd.path().join(".wyj").join("skills");
+        let project_wyj_dir = cwd.path().join(".wyj-code").join("skills");
         std::fs::create_dir_all(&project_wyj_dir).unwrap();
         std::fs::write(
             project_wyj_dir.join("custom.md"),

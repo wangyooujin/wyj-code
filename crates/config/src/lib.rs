@@ -4,9 +4,11 @@
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+pub mod codex;
 pub mod project_mcp;
+pub use codex::{codex_home_dir, load_codex_mcp};
 pub use project_mcp::{
     load_native_mcp, load_project_mcp, merged_mcp_servers, native_mcp_names, project_mcp_path,
     save_project_mcp, ProjectMcpConfig,
@@ -25,7 +27,7 @@ pub enum McpTransport {
 }
 
 /// 单个 MCP server 配置（在 ~/.wyj-code/config.toml 的 [[mcp_servers]] 段声明）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpServerConfig {
     /// 服务名称（用于日志区分）
     pub name: String,
@@ -419,38 +421,10 @@ impl Config {
 }
 
 impl Config {
-    /// 加载配置：先读文件（含旧格式一次性迁移），再用环境变量覆盖激活分组的 api_key。
+    /// 加载配置：先读文件（含旧格式一次性迁移），再合并 `~/.claude.json` 的原生
+    /// MCP 配置，最后用环境变量覆盖激活分组的 api_key。
     pub fn load() -> Result<Self> {
-        let config_path = config_file_path()?;
-        let mut cfg: Config = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
-            let value: toml::Value = toml::from_str(&content)
-                .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?;
-            if value.get("profiles").is_some() {
-                toml::from_str(&content)
-                    .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?
-            } else {
-                let legacy: LegacyConfigV0 = toml::from_str(&content)
-                    .with_context(|| format!("解析旧版配置文件失败: {}", config_path.display()))?;
-                let migrated: Config = legacy.into();
-                migrated.save().context("迁移旧版配置文件失败")?;
-                tracing::info!(
-                    "已将旧版配置迁移为分组结构，默认分组名为 default: {}",
-                    config_path.display()
-                );
-                migrated
-            }
-        } else {
-            Config::default()
-        };
-
-        if cfg.profiles.is_empty() {
-            cfg.profiles.push(Profile::default());
-        }
-        if !cfg.profiles.iter().any(|p| p.name == cfg.active_profile) {
-            cfg.active_profile = cfg.profiles[0].name.clone();
-        }
+        let mut cfg = Self::load_file_only()?;
 
         // Claude Code's global native MCP file has higher precedence than the
         // legacy wyj global TOML, while remaining read-only until explicit migrate.
@@ -485,6 +459,50 @@ impl Config {
         Ok(cfg)
     }
 
+    /// 只读 `config.toml` 文件本体（含旧格式一次性迁移）：不合并 `~/.claude.json`
+    /// 的原生 MCP、不吃环境变量。`/import` 等"要把结果写回 config.toml"的路径必须
+    /// 用这个入口做冲突检测与写回，否则会把只读的原生 server 误物化进文件。
+    pub fn load_file_only() -> Result<Self> {
+        Self::load_file_only_at(&config_file_path()?)
+    }
+
+    /// `load_file_only` 的路径注入版（测试、`/import` 的 `ImportTargets` 使用）。
+    pub fn load_file_only_at(config_path: &Path) -> Result<Self> {
+        let mut cfg: Config = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)
+                .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
+            let value: toml::Value = toml::from_str(&content)
+                .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?;
+            if value.get("profiles").is_some() {
+                toml::from_str(&content)
+                    .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?
+            } else {
+                let legacy: LegacyConfigV0 = toml::from_str(&content)
+                    .with_context(|| format!("解析旧版配置文件失败: {}", config_path.display()))?;
+                let migrated: Config = legacy.into();
+                migrated
+                    .save_to(config_path)
+                    .context("迁移旧版配置文件失败")?;
+                tracing::info!(
+                    "已将旧版配置迁移为分组结构，默认分组名为 default: {}",
+                    config_path.display()
+                );
+                migrated
+            }
+        } else {
+            Config::default()
+        };
+
+        if cfg.profiles.is_empty() {
+            cfg.profiles.push(Profile::default());
+        }
+        if !cfg.profiles.iter().any(|p| p.name == cfg.active_profile) {
+            cfg.active_profile = cfg.profiles[0].name.clone();
+        }
+
+        Ok(cfg)
+    }
+
     /// 返回激活分组的有效 API Key，若无则报错。
     pub fn api_key(&self) -> Result<&str> {
         self.active_profile()
@@ -513,10 +531,14 @@ impl Config {
 
     /// 将当前配置写入文件。
     pub fn save(&self) -> Result<()> {
-        let config_path = config_file_path()?;
+        self.save_to(&config_file_path()?)
+    }
+
+    /// 将当前配置写入指定路径（供 `/import` 等需要注入目标路径的调用方与测试使用）。
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         let content = toml::to_string_pretty(self).context("序列化配置失败")?;
-        write_atomic(&config_path, &content)
-            .with_context(|| format!("写入配置文件失败: {}", config_path.display()))
+        write_atomic(path, &content)
+            .with_context(|| format!("写入配置文件失败: {}", path.display()))
     }
 }
 
@@ -550,13 +572,26 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> 
 /// 返回配置目录路径（~/.wyj-code），若不存在则创建。
 pub fn config_dir() -> Result<PathBuf> {
     let user_dirs = UserDirs::new().ok_or_else(|| anyhow::anyhow!("无法获取用户主目录"))?;
-    let dir = user_dirs.home_dir().join(".wyj-code");
+    let dir = global_config_dir_in(user_dirs.home_dir());
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
         tracing::info!("初始化配置目录: {}", dir.display());
     }
     Ok(dir)
+}
+
+/// 给定 home 下的全局配置目录（`<home>/.wyj-code`）。纯路径拼接、不创建目录、
+/// 不查真实主目录，供 `load_skills` 等以 home 为注入参数的 API 使用。
+pub fn global_config_dir_in(home: &Path) -> PathBuf {
+    home.join(".wyj-code")
+}
+
+/// 项目级配置目录（`<cwd>/.wyj-code`），承载 `skills/`、`agents/`、`mcp.toml`、
+/// `installed.json`。只拼路径、不创建（只读操作不应污染用户项目目录），由各
+/// 写入方在落盘前自行 `create_dir_all`。
+pub fn project_config_dir(cwd: &Path) -> PathBuf {
+    cwd.join(".wyj-code")
 }
 
 /// 返回主配置文件路径（~/.wyj-code/config.toml）。

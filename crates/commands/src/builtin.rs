@@ -243,6 +243,26 @@ impl Command for McpCmd {
     }
 }
 
+// ── /schedule ─────────────────────────────────────────────────────────────────
+
+pub struct ScheduleCmd;
+
+#[async_trait]
+impl Command for ScheduleCmd {
+    fn name(&self) -> &str {
+        "schedule"
+    }
+    fn description(&self) -> String {
+        tr("schedule.desc")
+    }
+    fn usage(&self) -> String {
+        "/schedule".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenScheduleDialog)
+    }
+}
+
 // ── /skills ───────────────────────────────────────────────────────────────────
 
 pub struct SkillsCmd;
@@ -300,6 +320,26 @@ impl Command for ExtensionsCmd {
     }
     async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
         Ok(CommandResult::OpenExtensionsDialog)
+    }
+}
+
+// ── /import ───────────────────────────────────────────────────────────────────
+
+pub struct ImportCmd;
+
+#[async_trait]
+impl Command for ImportCmd {
+    fn name(&self) -> &str {
+        "import"
+    }
+    fn description(&self) -> String {
+        tr("import.desc")
+    }
+    fn usage(&self) -> String {
+        "/import".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenImportDialog)
     }
 }
 
@@ -573,7 +613,9 @@ impl Command for DoctorCmd {
 
         // 记忆目录
         let pid = wyj_core::project_id(&ctx.cwd);
-        let mem_dir = ctx.home_dir.join(".wyj-code").join("memory").join(&pid);
+        let mem_dir = wyj_config::global_config_dir_in(&ctx.home_dir)
+            .join("memory")
+            .join(&pid);
         let index_path = mem_dir.join("MEMORY.md");
         if index_path.exists() {
             let entry_count = std::fs::read_to_string(&index_path)
@@ -1121,9 +1163,11 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(McpCmd));
+    reg.register(Arc::new(ScheduleCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(ExtensionsCmd));
+    reg.register(Arc::new(ImportCmd));
     reg.register(Arc::new(BugCmd));
     reg.register(Arc::new(ReviewCmd));
     reg.register(Arc::new(PrCommentsCmd));
@@ -1165,8 +1209,11 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(McpCmd));
+    reg.register(Arc::new(ScheduleCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
+    reg.register(Arc::new(ExtensionsCmd));
+    reg.register(Arc::new(ImportCmd));
     reg.register(Arc::new(BugCmd));
     reg.register(Arc::new(ReviewCmd));
     reg.register(Arc::new(PrCommentsCmd));

@@ -8,7 +8,6 @@ use crate::lockfile::{self, ExtensionKind, InstallScope};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use wyj_config::{Config, McpServerConfig, McpTransport};
@@ -46,15 +45,6 @@ pub struct DoctorReport {
     pub lockfile_versions: BTreeMap<String, u32>,
     pub records: Vec<ExtensionRecord>,
     pub issues: Vec<DoctorIssue>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MigrationReport {
-    pub schema_version: u32,
-    pub imported_files: Vec<String>,
-    pub imported_servers: Vec<String>,
-    pub skipped_servers: Vec<String>,
-    pub errors: Vec<String>,
 }
 
 /// Enumerate managed resources from both global and project lockfiles.
@@ -384,69 +374,6 @@ fn parse_id(id: &str) -> Result<(ExtensionKind, &str)> {
     Ok((kind, name))
 }
 
-/// Import Claude-style `mcpServers` JSON into the existing project/global TOML
-/// configuration without deleting or rewriting the native source file.
-pub fn migrate(cwd: &Path) -> Result<MigrationReport> {
-    let mut report = MigrationReport {
-        schema_version: EXTENSIONS_SCHEMA_VERSION,
-        ..Default::default()
-    };
-    let project_file = cwd.join(".mcp.json");
-    if project_file.exists() {
-        match read_native_mcp(&project_file) {
-            Ok(servers) => {
-                let mut existing = wyj_config::load_project_mcp(cwd)?;
-                let mut names: HashSet<String> = existing.iter().map(|s| s.name.clone()).collect();
-                for server in servers {
-                    if names.insert(server.name.clone()) {
-                        report.imported_servers.push(server.name.clone());
-                        existing.push(server);
-                    } else {
-                        report.skipped_servers.push(server.name);
-                    }
-                }
-                wyj_config::save_project_mcp(cwd, &existing)?;
-                report
-                    .imported_files
-                    .push(project_file.display().to_string());
-            }
-            Err(e) => report
-                .errors
-                .push(format!("{}: {e}", project_file.display())),
-        }
-    }
-
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(home) = home {
-        let global_file = home.join(".claude.json");
-        if global_file.exists() {
-            match read_native_mcp(&global_file) {
-                Ok(servers) => {
-                    let mut cfg = Config::load()?;
-                    let mut names: HashSet<String> =
-                        cfg.mcp_servers.iter().map(|s| s.name.clone()).collect();
-                    for server in servers {
-                        if names.insert(server.name.clone()) {
-                            report.imported_servers.push(server.name.clone());
-                            cfg.mcp_servers.push(server);
-                        } else {
-                            report.skipped_servers.push(server.name);
-                        }
-                    }
-                    cfg.save()?;
-                    report
-                        .imported_files
-                        .push(global_file.display().to_string());
-                }
-                Err(e) => report
-                    .errors
-                    .push(format!("{}: {e}", global_file.display())),
-            }
-        }
-    }
-    Ok(report)
-}
-
 fn configured_mcp_servers(cwd: &Path) -> Result<Vec<(InstallScope, McpServerConfig)>> {
     let mut servers = Vec::new();
     let cfg = Config::load()?;
@@ -465,67 +392,10 @@ fn configured_mcp_servers(cwd: &Path) -> Result<Vec<(InstallScope, McpServerConf
 
 fn native_mcp_candidates(cwd: &Path) -> Vec<PathBuf> {
     let mut paths = vec![cwd.join(".mcp.json")];
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".claude.json"));
+    if let Ok(home) = wyj_config::home_dir() {
+        paths.push(home.join(".claude.json"));
     }
     paths
-}
-
-fn read_native_mcp(path: &Path) -> Result<Vec<McpServerConfig>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("读取原生 MCP 配置失败: {}", path.display()))?;
-    let value: Value = serde_json::from_str(&content)
-        .with_context(|| format!("解析原生 MCP 配置失败: {}", path.display()))?;
-    let servers = value
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("配置中缺少 mcpServers 对象"))?;
-    let mut out = Vec::new();
-    for (name, raw) in servers {
-        let command = raw
-            .get("command")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let args = raw
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|xs| {
-                xs.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let env = string_map(raw.get("env"));
-        let url = raw.get("url").and_then(Value::as_str).map(str::to_string);
-        let headers = string_map(raw.get("headers"));
-        let transport = if url.is_some() {
-            McpTransport::StreamableHttp
-        } else {
-            McpTransport::Stdio
-        };
-        out.push(McpServerConfig {
-            name: name.clone(),
-            transport,
-            command,
-            args,
-            env,
-            url,
-            headers,
-        });
-    }
-    Ok(out)
-}
-
-fn string_map(value: Option<&Value>) -> std::collections::HashMap<String, String> {
-    value
-        .and_then(Value::as_object)
-        .map(|map| {
-            map.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub fn now() -> chrono::DateTime<Utc> {
@@ -552,7 +422,7 @@ mod tests {
             r#"{"mcpServers":{"local":{"command":"node","args":["server.js"]},"remote":{"url":"https://example.test/mcp","headers":{"Authorization":"${TOKEN}"}}}}"#,
         )
         .unwrap();
-        let servers = read_native_mcp(&path).unwrap();
+        let servers = wyj_config::load_native_mcp(&path).unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].transport, McpTransport::Stdio);
         assert_eq!(servers[1].transport, McpTransport::StreamableHttp);

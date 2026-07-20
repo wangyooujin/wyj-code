@@ -20,7 +20,7 @@ pub struct SkillInstallRequest {
 fn skill_dir(scope: InstallScope, cwd: &Path) -> Result<PathBuf> {
     match scope {
         InstallScope::Global => Ok(wyj_config::config_dir()?.join("skills")),
-        InstallScope::Project => Ok(cwd.join(".wyj").join("skills")),
+        InstallScope::Project => Ok(wyj_config::project_config_dir(cwd).join("skills")),
     }
 }
 
@@ -33,7 +33,7 @@ fn upsert_skill_entry(manifest: &mut InstalledManifest, entry: InstalledSkillEnt
 }
 
 /// 从 marketplace 缓存目录读取 `entry.path` 对应 `.md` 内容，原样写入
-/// `~/.wyj-code/skills/<name>.md`（Global）或 `<cwd>/.wyj/skills/<name>.md`（Project），
+/// `~/.wyj-code/skills/<name>.md`（Global）或 `<cwd>/.wyj-code/skills/<name>.md`（Project），
 /// 同时写对应 scope 的 lockfile（同名视为"覆盖式升级"）。
 pub fn install_skill(req: &SkillInstallRequest, cwd: &Path) -> Result<()> {
     let cache_dir = marketplace::marketplace_cache_dir(&req.marketplace_url)?;
@@ -293,7 +293,7 @@ mod tests {
 
         let dest_path = project_dir
             .path()
-            .join(".wyj")
+            .join(".wyj-code")
             .join("skills")
             .join("hello.md");
         assert!(dest_path.exists());

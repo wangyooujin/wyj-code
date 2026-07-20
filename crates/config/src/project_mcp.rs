@@ -1,7 +1,7 @@
-//! 项目级 MCP 配置：`<cwd>/.wyj/mcp.toml`
+//! 项目级 MCP 配置：`<cwd>/.wyj-code/mcp.toml`
 //!
 //! 格式与全局 `config.toml` 的 `[[mcp_servers]]` 段一致，同名 server 覆盖全局配置，
-//! 不同名则追加。不做祖先目录 walk，与现有 Skill 项目目录（`.wyj/skills/`）约定一致。
+//! 不同名则追加。不做祖先目录 walk，与现有 Skill 项目目录（`.wyj-code/skills/`）约定一致。
 
 use crate::{Config, McpServerConfig};
 use anyhow::{Context, Result};
@@ -15,9 +15,9 @@ pub struct ProjectMcpConfig {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-/// 返回项目级 MCP 配置文件路径（`<cwd>/.wyj/mcp.toml`）。
+/// 返回项目级 MCP 配置文件路径（`<cwd>/.wyj-code/mcp.toml`）。
 pub fn project_mcp_path(cwd: &Path) -> PathBuf {
-    cwd.join(".wyj").join("mcp.toml")
+    crate::project_config_dir(cwd).join("mcp.toml")
 }
 
 /// 加载项目级 MCP server 列表；文件不存在则返回空列表。
@@ -96,7 +96,7 @@ fn json_string_map(value: Option<&Value>) -> std::collections::HashMap<String, S
         .unwrap_or_default()
 }
 
-/// 保存项目级 MCP server 列表（会自动创建 `.wyj/` 目录）。
+/// 保存项目级 MCP server 列表（会自动创建 `.wyj-code/` 目录）。
 pub fn save_project_mcp(cwd: &Path, servers: &[McpServerConfig]) -> Result<()> {
     let path = project_mcp_path(cwd);
     if let Some(parent) = path.parent() {
@@ -142,7 +142,7 @@ pub fn merged_mcp_servers(cfg: &Config, cwd: &Path) -> Vec<McpServerConfig> {
 
 /// 当前生效的 MCP server 里，哪些名字来自"原生"配置文件——全局
 /// `~/.claude.json` 的 `mcpServers`，或项目级 `<cwd>/.mcp.json`——而不是
-/// wyj-code 自己的 `config.toml`/`.wyj/mcp.toml`。
+/// wyj-code 自己的 `config.toml`/`.wyj-code/mcp.toml`。
 ///
 /// `Config::load()` 每次都会把 `~/.claude.json` 的 `mcpServers` 重新合并进
 /// `cfg.mcp_servers`（见该函数文档："higher precedence...remaining

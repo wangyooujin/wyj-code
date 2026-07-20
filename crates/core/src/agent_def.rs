@@ -1,7 +1,9 @@
 //! Agent 定义 — 内置 subagent 类型 + 用户自定义 agent（markdown frontmatter）加载
 //!
-//! 自定义 agent 定义文件复用真实 Claude Code 的目录约定：
-//! 全局 `~/.claude/agents/*.md` + 项目 `{cwd}/.claude/agents/*.md`，同名后者覆盖前者。
+//! 自定义 agent 定义文件来源与 skill 链同一哲学（同作用域内真实 Claude Code
+//! 路径覆盖 wyj-code 自造路径，项目覆盖全局）：全局 `~/.wyj-code/agents/*.md`
+//! → 全局 `~/.claude/agents/*.md` → 项目 `{cwd}/.wyj-code/agents/*.md` → 项目
+//! `{cwd}/.claude/agents/*.md`，同名后者覆盖前者。
 //! frontmatter 支持 name/description/tools/model 四个字段，未识别字段静默忽略；
 //! `model` 引用 `~/.wyj-code/config.toml` 中的 Profile 名（而非模型 ID）。
 
@@ -99,13 +101,23 @@ fn upsert_overwrite(defs: &mut Vec<AgentDefinition>, def: AgentDefinition) {
     }
 }
 
-/// 加载全部 agent 定义：内置 → 全局 `~/.claude/agents`（覆盖内置）→ 已启用插件
-/// 贡献路径（按安装顺序，先到先得，跳过并警告同名冲突）→ 项目 `.claude/agents`
+/// 加载全部 agent 定义，六层合并链（与 skill 链哲学一致：同作用域内真实 CC
+/// 路径覆盖 wyj 路径，项目覆盖全局）：内置 → 全局 `~/.wyj-code/agents` → 全局
+/// `~/.claude/agents`（覆盖前者同名）→ 已启用插件贡献路径（按安装顺序，先到
+/// 先得，跳过并警告同名冲突）→ 项目 `.wyj-code/agents` → 项目 `.claude/agents`
 /// （最高优先级，覆盖一切，包括插件）。
 pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<AgentDefinition> {
     let mut defs = builtin_defs();
 
-    // 全局（覆盖内置，既有的"用户手动覆盖内置"能力，不属于插件冲突场景）
+    // 全局 wyj 自有目录（覆盖内置；`/import` 导入的 agent 落在这里）
+    if let Ok(home) = wyj_config::home_dir() {
+        let global_wyj = wyj_config::global_config_dir_in(&home).join("agents");
+        for def in read_defs_from_path(&global_wyj) {
+            upsert_overwrite(&mut defs, def);
+        }
+    }
+
+    // 全局真 CC（覆盖以上，既有的"用户手动覆盖内置"能力，不属于插件冲突场景）
     if let Ok(home) = wyj_config::claude_home_dir() {
         for def in read_defs_from_path(&home.join("agents")) {
             upsert_overwrite(&mut defs, def);
@@ -123,7 +135,12 @@ pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<Agen
         }
     }
 
-    // 项目（最高优先级，覆盖一切，包括插件）
+    // 项目 wyj 自有目录（覆盖全局与插件）
+    for def in read_defs_from_path(&wyj_config::project_config_dir(cwd).join("agents")) {
+        upsert_overwrite(&mut defs, def);
+    }
+
+    // 项目真 CC（最高优先级，覆盖一切，包括插件）
     for def in read_defs_from_path(&cwd.join(".claude").join("agents")) {
         upsert_overwrite(&mut defs, def);
     }
@@ -333,6 +350,50 @@ mod tests {
         let defs = load_agent_defs(&cwd, &[plugin_dir]);
         let custom = defs.iter().find(|d| d.name == "custom").unwrap();
         assert_eq!(custom.description, "项目覆盖");
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn project_wyj_agents_dir_overrides_builtin() {
+        let cwd = std::env::temp_dir().join(format!("wyj-agentdef-wyjdir-{}", std::process::id()));
+        let wyj_agents_dir = cwd.join(".wyj-code").join("agents");
+        std::fs::create_dir_all(&wyj_agents_dir).unwrap();
+        std::fs::write(
+            wyj_agents_dir.join("explore.md"),
+            "---\nname: Explore\ndescription: wyj 目录覆盖\n---\nbody",
+        )
+        .unwrap();
+
+        let defs = load_agent_defs(&cwd, &[]);
+        let explore = defs.iter().find(|d| d.name == "Explore").unwrap();
+        assert_eq!(explore.description, "wyj 目录覆盖");
+        assert!(!explore.builtin);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn project_claude_agents_shadow_project_wyj_agents() {
+        let cwd = std::env::temp_dir().join(format!("wyj-agentdef-shadow-{}", std::process::id()));
+        let wyj_agents_dir = cwd.join(".wyj-code").join("agents");
+        std::fs::create_dir_all(&wyj_agents_dir).unwrap();
+        std::fs::write(
+            wyj_agents_dir.join("custom.md"),
+            "---\nname: custom\ndescription: wyj 版本\n---\nbody",
+        )
+        .unwrap();
+        let claude_agents_dir = cwd.join(".claude").join("agents");
+        std::fs::create_dir_all(&claude_agents_dir).unwrap();
+        std::fs::write(
+            claude_agents_dir.join("custom.md"),
+            "---\nname: custom\ndescription: 真 CC 版本\n---\nbody",
+        )
+        .unwrap();
+
+        // 同作用域内真实 CC 路径覆盖 wyj 路径（与 skill 链方向一致）
+        let defs = load_agent_defs(&cwd, &[]);
+        let custom = defs.iter().find(|d| d.name == "custom").unwrap();
+        assert_eq!(custom.description, "真 CC 版本");
+        assert_eq!(defs.iter().filter(|d| d.name == "custom").count(), 1);
         std::fs::remove_dir_all(&cwd).ok();
     }
 }

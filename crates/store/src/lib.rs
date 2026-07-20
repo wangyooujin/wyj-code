@@ -4,16 +4,19 @@
 //! client、MCP/Skill 的 install/upgrade/uninstall/enable 编排逻辑。
 //!
 //! 严格遵守"只管配置，不碰依赖安装"：这里只负责把 command/args/env/version 等
-//! 配置信息写入本地文件（config.toml、`.wyj/mcp.toml`、`.md`、lockfile），绝不
+//! 配置信息写入本地文件（config.toml、`.wyj-code/mcp.toml`、`.md`、lockfile），绝不
 //! shell out 执行 `npm install`/`pip install` 之类的依赖安装命令。
 
+pub mod cron_sync;
 pub mod extensions;
+pub mod import;
 pub mod lockfile;
 pub mod marketplace;
 pub mod mcp_install;
 pub mod plugin_install;
 pub mod plugin_manifest;
 pub mod registry;
+pub mod schedule;
 pub mod self_update;
 pub mod skill_install;
 
