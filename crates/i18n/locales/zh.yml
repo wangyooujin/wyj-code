@@ -129,6 +129,8 @@ help:
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
     - `/extensions` — 统一查看并诊断 Skill / MCP / Plugin 资源
+    - `/import` — 扫描 Codex / Claude Code 配置（MCP server、自定义命令、agent），勾选后一键导入 wyj-code
+    - `/schedule` — 管理定时任务（cron 触发的 prompt），macOS/Linux 下保存后自动同步进系统 crontab
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
@@ -297,6 +299,74 @@ mcp:
     uninstall_failed: "卸载失败: {err}"
     upgrade_failed: "升级失败: {err}"
     manual_no_upgrade: "手动配置项没有版本信息，无法升级"
+
+schedule:
+  desc: "管理定时任务（cron 触发的 prompt，比如每日新闻摘要或交易复盘）"
+  headless_unsupported: "[headless 模式不支持 /schedule 面板，请改用 `wyj-code schedule` CLI 子命令]"
+  title: "定时任务"
+  new_task_default_name: "新任务"
+  run_now:
+    triggered: "已触发立即执行，可稍后回面板查看运行结果（状态/关联 session）"
+  field:
+    name: "名称"
+    prompt: "Prompt"
+    cron: "Cron 表达式"
+    cwd: "工作目录"
+    notify_on_failure: "失败时通知"
+  dialog:
+    hint1: "  ↑↓ 移动  Enter 操作菜单  Ctrl+S 保存"
+    hint2: "  Esc 关闭"
+    editing_placeholder: "编辑中，见下方输入框"
+    add_new_row: "新建任务"
+    "on": "开"
+    "off": "关"
+    invalid_cron_short: "cron 非法"
+  menu:
+    expand: "展开字段"
+    collapse: "收起字段"
+    enable: "启用"
+    disable: "停用"
+    run_now: "立即运行一次"
+    run_now_needs_save: "请先保存该任务的改动再运行"
+    delete: "删除"
+    edit: "编辑"
+    toggle: "切换"
+    freq_daily: "每天固定时间"
+    freq_hourly: "每小时固定分钟"
+    freq_weekly: "每周固定星期与时间"
+    freq_custom: "自定义 cron 表达式（高级）"
+    new_blank: "新建空白任务"
+    new_from_session: "从当前对话固化为模板"
+  error:
+    empty_name: "任务名称不能为空"
+    empty_prompt: "Prompt 不能为空"
+    empty_cwd: "工作目录不能为空"
+    invalid_cron: "非法 cron 表达式：{err}"
+    save_failed: "保存定时任务失败：{err}"
+    bad_time_format: "格式应为 HH:MM，如 08:00"
+    bad_minute_format: "应输入 0-59 之间的分钟数"
+    bad_weekly_format: "格式应为「<星期 0-6> HH:MM」，如 \"1 20:30\"（0=周日）"
+  overlay:
+    sync_error_title: "同步 crontab 失败"
+
+import:
+  desc: "扫描 Codex / Claude Code 配置（MCP server、自定义命令、agent），勾选后一键导入 wyj-code"
+  headless_unsupported: "[headless 模式不支持 /import 面板，请使用 `wyj-code extensions migrate --from codex|claude|all`]"
+  applied_notice: "已导入 {count} 项 — MCP 连接与 skill 注册在下一轮 Agent 回合边界生效"
+  dialog:
+    title: "从 Codex / Claude Code 导入"
+    hint: "↑↓ 选择 · Space 勾选 · a 全选/清空 · Enter 导入勾选项 · Esc 关闭"
+    empty: "没有可导入项 — 未发现 Codex/Claude Code 配置，或已全部导入过"
+  label:
+    conflict: "[冲突: 导入将覆盖既有配置]"
+    shadowed: "[被遮蔽]"
+  report:
+    applied: "已导入"
+    overwritten: "已覆盖"
+    shadowed_note: "被遮蔽项：Claude Code 原文件仍优先生效，删除原文件后导入副本才会接管"
+    errors: "错误"
+    nothing: "没有导入任何内容"
+    hint: "Enter/Esc 关闭"
 
 skills:
   desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
@@ -560,6 +630,11 @@ dialog:
     plugins_add_local: "[Plugins] 输入本地插件路径 (Enter 提交 / Esc 取消)"
     profile_rename: "[Model] 重命名分组 (Enter 提交 / Esc 取消)"
     profile_field: "[Model] 编辑 {field} (Enter 提交 / Esc 取消)"
+    schedule_field: "[定时任务] 编辑 {field} (Enter 提交 / Esc 取消)"
+    schedule_freq_daily: "[定时任务] 输入时间 HH:MM (Enter 提交 / Esc 取消)"
+    schedule_freq_hourly: "[定时任务] 输入分钟 0-59 (Enter 提交 / Esc 取消)"
+    schedule_freq_weekly: "[定时任务] 输入「<星期 0-6> HH:MM」，0=周日 (Enter 提交 / Esc 取消)"
+    schedule_freq_custom: "[定时任务] 输入标准 5 段 cron 表达式 (Enter 提交 / Esc 取消)"
   action_menu:
     confirm_question: "确定要「{action}」吗？"
     confirm_hint: "Enter/y 确认   Esc/n 取消"

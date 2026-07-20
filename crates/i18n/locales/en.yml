@@ -130,6 +130,8 @@ help:
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
     - `/extensions` — Inspect and diagnose Skill / MCP / Plugin resources
+    - `/import` — Scan Codex / Claude Code configs (MCP servers, custom commands, agents) and import selected items into wyj-code
+    - `/schedule` — Manage scheduled tasks (cron-triggered prompts); auto-syncs into the system crontab on macOS/Linux
     - `/hooks` — List currently active Hooks (grouped by event)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
     - `/mode [mode]` — Switch run mode (normal / plan / bypass)
@@ -298,6 +300,74 @@ mcp:
     uninstall_failed: "Uninstall failed: {err}"
     upgrade_failed: "Upgrade failed: {err}"
     manual_no_upgrade: "Manually configured entries have no version info and can't be upgraded"
+
+schedule:
+  desc: "Manage scheduled tasks (cron-triggered prompts, e.g. a daily news digest or trading review)"
+  headless_unsupported: "[headless mode doesn't support the /schedule panel — use `wyj-code schedule` CLI subcommands instead]"
+  title: "Scheduled Tasks"
+  new_task_default_name: "New task"
+  run_now:
+    triggered: "Triggered — check back later for the result (last run status/session)"
+  field:
+    name: "Name"
+    prompt: "Prompt"
+    cron: "Cron"
+    cwd: "Working dir"
+    notify_on_failure: "Notify on failure"
+  dialog:
+    hint1: "  ↑↓ Move  Enter Action menu  Ctrl+S Save"
+    hint2: "  Esc Close"
+    editing_placeholder: "Editing, see the input box below"
+    add_new_row: "New task"
+    "on": "on"
+    "off": "off"
+    invalid_cron_short: "invalid cron"
+  menu:
+    expand: "Expand fields"
+    collapse: "Collapse fields"
+    enable: "Enable"
+    disable: "Disable"
+    run_now: "Run now"
+    run_now_needs_save: "Save changes to this task before running it"
+    delete: "Delete"
+    edit: "Edit"
+    toggle: "Toggle"
+    freq_daily: "Daily at a fixed time"
+    freq_hourly: "Every hour at a fixed minute"
+    freq_weekly: "Weekly on a fixed day/time"
+    freq_custom: "Custom cron expression (advanced)"
+    new_blank: "New blank task"
+    new_from_session: "New task from the current conversation"
+  error:
+    empty_name: "Task name cannot be empty"
+    empty_prompt: "Prompt cannot be empty"
+    empty_cwd: "Working directory cannot be empty"
+    invalid_cron: "Invalid cron expression: {err}"
+    save_failed: "Failed to save schedule tasks: {err}"
+    bad_time_format: "Expected HH:MM, e.g. 08:00"
+    bad_minute_format: "Expected a minute number 0-59"
+    bad_weekly_format: "Expected \"<weekday 0-6> HH:MM\", e.g. \"1 20:30\" (0=Sunday)"
+  overlay:
+    sync_error_title: "Crontab sync failed"
+
+import:
+  desc: "Scan Codex / Claude Code configs (MCP servers, custom commands, agents) and import selected items into wyj-code"
+  headless_unsupported: "[headless mode doesn't support the /import panel — use `wyj-code extensions migrate --from codex|claude|all`]"
+  applied_notice: "Imported {count} item(s) — MCP connections and skill registration apply at the next agent turn boundary"
+  dialog:
+    title: "Import from Codex / Claude Code"
+    hint: "↑↓ select · Space toggle · a all/none · Enter import checked · Esc close"
+    empty: "Nothing to import — no Codex/Claude Code configs found, or everything is already imported"
+  label:
+    conflict: "[conflict: overwrites existing]"
+    shadowed: "[shadowed]"
+  report:
+    applied: "Imported"
+    overwritten: "Overwritten"
+    shadowed_note: "Shadowed items: the original Claude Code file still takes precedence; the imported copy takes effect only after the original is removed"
+    errors: "Errors"
+    nothing: "Nothing was imported"
+    hint: "Enter/Esc close"
 
 skills:
   desc: "Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)"
@@ -562,6 +632,11 @@ dialog:
     plugins_add_local: "[Plugins] Enter local plugin path (Enter to submit / Esc to cancel)"
     profile_rename: "[Model] Rename profile (Enter to submit / Esc to cancel)"
     profile_field: "[Model] Edit {field} (Enter to submit / Esc to cancel)"
+    schedule_field: "[Schedule] Edit {field} (Enter to submit / Esc to cancel)"
+    schedule_freq_daily: "[Schedule] Enter time as HH:MM (Enter to submit / Esc to cancel)"
+    schedule_freq_hourly: "[Schedule] Enter minute 0-59 (Enter to submit / Esc to cancel)"
+    schedule_freq_weekly: "[Schedule] Enter \"<weekday 0-6> HH:MM\", 0=Sunday (Enter to submit / Esc to cancel)"
+    schedule_freq_custom: "[Schedule] Enter a standard 5-field cron expression (Enter to submit / Esc to cancel)"
   action_menu:
     confirm_question: "Are you sure you want to \"{action}\"?"
     confirm_hint: "Enter/y confirm   Esc/n cancel"
