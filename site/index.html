@@ -108,7 +108,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.3.0</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.3.3</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -120,7 +120,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.3.0 · claude-opus-4-8</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.3.3 · claude-opus-4-8</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -431,48 +431,55 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.3.0</span>
+          <span class="font-display font-bold text-amber-500">v1.3.3</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新</span>
         </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v130">新增 Computer-use 桌面 GUI 控制（macOS / Windows）：模型截图观察桌面、合成鼠标键盘操作，官方端点用原生工具、第三方 Anthropic 协议兼容端点自动退化为 custom 工具；TUI 主界面改为永久 Fullscreen，输入框/状态栏始终贴住窗口底部，不再有留白。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v133">新增 <code class="text-amber-400">/schedule</code> 定时任务面板：一句话 prompt 或固化当前对话即可生成到点自动执行的任务，保存后自动同步进系统 crontab（macOS / Linux），失败可选 macOS 系统通知；新增 <code class="text-amber-400">/import</code> 一键导入 Codex / Claude Code 的 MCP、自定义命令与 Agent 配置；全应用列表选中态背景色统一为深灰，告别忽蓝忽无色的不一致观感。</p>
       </div>
     </div>
     <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:40ms">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <span class="font-display font-bold text-paper/70">v1.3.0</span>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v130">新增 Computer-use 桌面 GUI 控制（macOS / Windows）：模型截图观察桌面、合成鼠标键盘操作，官方端点用原生工具、第三方 Anthropic 协议兼容端点自动退化为 custom 工具；TUI 主界面改为永久 Fullscreen，输入框/状态栏始终贴住窗口底部，不再有留白。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:80ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.2.2</span>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v122">统一 Extensions 中心管理 Skill / MCP / Plugin，支持热应用、诊断与兼容迁移；安装、锁定与回滚更可靠；上下文压缩更稳，MiniMax / GLM / DeepSeek 已完成请求采用供应商精确 usage 账务。</p>
       </div>
     </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:80ms">
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:120ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.2.1</span>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v121">TUI 消息流重构（thinking / 工具块 / Ctrl+O 展开应用内滚动）；Profile 新增 prompt_cache / openai_stream_options 兼容开关，GLM / Kimi / DeepSeek 等国内模型官方开箱即用；/cost 与 stats JSON 补全 full input / 缓存命中率 / context 指标。</p>
       </div>
     </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:120ms">
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:160ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.2.0</span>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v120">自定义 Slash 命令对齐真实 Claude Code（识别 <code class="text-amber-400">~/.claude/commands/*.md</code>）；性能实测（12MB / ~10ms）与依赖排查；预编译包新增一键安装脚本 install.sh / install.bat。</p>
       </div>
     </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:160ms">
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:200ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.1.0</span>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v110">新增 Hooks 生命周期自动化系统（PreToolUse / PostToolUse / UserPromptSubmit / Stop）；开源产品化基线（LICENSE、CONTRIBUTING、CHANGELOG）。</p>
       </div>
     </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:200ms">
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:240ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.0.2</span>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v102">新增 <code class="text-amber-400">wyj-code update</code> 自更新；ExitPlanMode 计划面板重构；<code class="text-amber-400">build.sh release</code> 一键发版脚本。</p>
       </div>
     </div>
-    <div class="reveal flex gap-6 pl-8 relative min-w-0" style="transition-delay:240ms">
+    <div class="reveal flex gap-6 pl-8 relative min-w-0" style="transition-delay:280ms">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <span class="font-display font-bold text-paper/70">v1.0.0</span>
