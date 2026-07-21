@@ -11,7 +11,7 @@ use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolContext};
 /// 逐调用权限确认的用户决策
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
-    /// 仅本次允许
+    /// 仅本次允许（computer-use 工具会把首次批准记为项目级授权）
     AllowOnce,
     /// 始终允许此类工具（写入项目级持久化，跨会话生效）
     AllowAlways,
@@ -19,15 +19,15 @@ pub enum PermissionDecision {
     Deny,
 }
 
-/// 「始终允许」时只在当前会话内存内放行、不写 `allowed_tools.json` 的工具名单。
-/// computer-use 控制的是整机鼠标/键盘，风险面与 Bash/Edit 不对等——跨会话
-/// 永久放行意味着以后每次启动都对这台机器有无人值守的控制权，因此其
-/// 「始终允许」只在本会话生效，重开会话需重新确认。
-pub const SESSION_SCOPED_TOOLS: &[&str] = &["computer"];
+/// 首次批准后即按项目记住授权的 computer-use 工具。
+///
+/// 这两个名字分别对应旧前台兼容路径和 v1.4 后台目标化路径。它们仍各自
+/// 独立授权，避免批准后台语义操作时隐式扩大到风险更高的前台全局输入。
+pub const PROJECT_APPROVE_ONCE_TOOLS: &[&str] = &["computer", "app_computer"];
 
-/// `name` 的「始终允许」是否应仅本会话生效（不落盘）。
-pub fn is_session_scoped_tool(name: &str) -> bool {
-    SESSION_SCOPED_TOOLS.contains(&name)
+/// `name` 是否应在首次批准（AllowOnce 或 AllowAlways）后写入项目级授权。
+pub fn is_project_approve_once_tool(name: &str) -> bool {
+    PROJECT_APPROVE_ONCE_TOOLS.contains(&name)
 }
 
 /// 权限模式
@@ -69,15 +69,12 @@ pub struct ToolCtx {
     pub permission_mode: Arc<RwLock<PermissionMode>>,
     /// TUI 模式下注入此 sender，工具通过它向 TUI 发起交互
     pub ui_ask_tx: Option<mpsc::Sender<UiAskRequest>>,
-    /// 「始终允许」过的工具名集合（逐调用权限确认），启动时从项目级文件载入，
-    /// AllowAlways 时就地插入并写盘。用 RwLock 提供 &self 下的内部可变性。
+    /// 已获项目级授权的工具名集合，启动时从项目级文件载入；AllowAlways，或
+    /// computer-use 首次 AllowOnce 时就地插入并写盘。用 RwLock 支持 &self 修改。
     pub always_allowed: RwLock<HashSet<String>>,
     /// 「始终允许」持久化文件路径（`~/.wyj-code/projects/<project_key>/allowed_tools.json`）；
     /// None 时不持久化（如 headless 未启用）。
     pub allowed_tools_path: Option<PathBuf>,
-    /// [`SESSION_SCOPED_TOOLS`] 的「始终允许」放行集合：只存在于内存，随
-    /// `ToolCtx`（进程/会话）一起销毁，永不写盘、不跨会话生效。
-    pub session_allowed: RwLock<HashSet<String>>,
 }
 
 impl ToolCtx {
@@ -88,7 +85,6 @@ impl ToolCtx {
             ui_ask_tx: None,
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
-            session_allowed: RwLock::new(HashSet::new()),
         }
     }
 
@@ -134,6 +130,15 @@ impl ToolCtx {
             Err(e) => tracing::warn!("序列化 allowed_tools 失败: {e}"),
         }
     }
+
+    /// 记住当前项目对某工具的授权，并立即 best-effort 落盘。
+    fn allow_for_project(&self, name: &str) {
+        self.always_allowed
+            .write()
+            .unwrap()
+            .insert(name.to_string());
+        self.persist_allowed_tools();
+    }
 }
 
 #[async_trait]
@@ -155,6 +160,10 @@ impl ToolContext for ToolCtx {
             PermissionMode::Allowlist(set) => Some(set.clone()),
             _ => None,
         }
+    }
+
+    fn supports_interactive_confirmation(&self) -> bool {
+        self.ui_ask_tx.is_some()
     }
 
     async fn ask_questions(&self, questions: &[AskQuestionSpec]) -> Option<Vec<QuestionAnswer>> {
@@ -193,10 +202,8 @@ impl ToolContext for ToolCtx {
                 return true;
             }
         }
-        // 已「始终允许」的工具直接放行（跨会话持久化的，或本会话内存放行的）
-        if self.always_allowed.read().unwrap().contains(name)
-            || self.session_allowed.read().unwrap().contains(name)
-        {
+        // 已获当前项目授权的工具直接放行。
+        if self.always_allowed.read().unwrap().contains(name) {
             return true;
         }
         // 无 UI 通道（headless / 子 Agent）：不阻塞，放行
@@ -214,21 +221,13 @@ impl ToolContext for ToolCtx {
             return false;
         }
         match response_rx.await {
+            Ok(PermissionDecision::AllowOnce) if is_project_approve_once_tool(name) => {
+                self.allow_for_project(name);
+                true
+            }
             Ok(PermissionDecision::AllowOnce) => true,
             Ok(PermissionDecision::AllowAlways) => {
-                if is_session_scoped_tool(name) {
-                    // 不落盘：computer-use 的「始终允许」只在本会话内存有效
-                    self.session_allowed
-                        .write()
-                        .unwrap()
-                        .insert(name.to_string());
-                } else {
-                    self.always_allowed
-                        .write()
-                        .unwrap()
-                        .insert(name.to_string());
-                    self.persist_allowed_tools();
-                }
+                self.allow_for_project(name);
                 true
             }
             Ok(PermissionDecision::Deny) | Err(_) => false,
@@ -240,6 +239,25 @@ impl ToolContext for ToolCtx {
 mod tests {
     use super::*;
     use wyj_core::tool::ToolContext;
+
+    async fn confirm_with_decision(
+        ctx: &ToolCtx,
+        rx: &mut mpsc::Receiver<UiAskRequest>,
+        name: &str,
+        summary: &str,
+        decision: PermissionDecision,
+    ) -> bool {
+        let respond = async {
+            match rx.recv().await {
+                Some(UiAskRequest::ToolPermission { response_tx, .. }) => {
+                    let _ = response_tx.send(decision);
+                }
+                _ => panic!("expected tool permission request"),
+            }
+        };
+        let (allowed, ()) = tokio::join!(ctx.confirm_tool(name, summary), respond);
+        allowed
+    }
 
     fn tmp_base() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -301,24 +319,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_tool_allow_always_for_session_scoped_tool_does_not_persist() {
-        assert!(is_session_scoped_tool("computer"));
+    async fn computer_tools_allow_once_persists_for_same_project() {
+        for name in PROJECT_APPROVE_ONCE_TOOLS {
+            assert!(is_project_approve_once_tool(name));
+            let base = tmp_base();
+            let cwd = base.join("project");
+            std::fs::create_dir_all(&cwd).unwrap();
+
+            let mut ctx = ToolCtx::new(&cwd);
+            ctx.load_allowed_tools(&base);
+            ctx.set_permission_mode(PermissionMode::Prompt);
+            let (tx, mut rx) = mpsc::channel(8);
+            ctx.ui_ask_tx = Some(tx);
+
+            assert!(
+                confirm_with_decision(
+                    &ctx,
+                    &mut rx,
+                    name,
+                    "mutating action",
+                    PermissionDecision::AllowOnce,
+                )
+                .await
+            );
+            assert!(ctx.always_allowed.read().unwrap().contains(*name));
+            let persisted: Vec<String> = serde_json::from_str(
+                &std::fs::read_to_string(ctx.allowed_tools_path.as_ref().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert!(persisted.iter().any(|tool| tool == name));
+
+            // 当前会话后续动作不再请求 UI。接收端已关闭，若仍发送会返回 false。
+            drop(rx);
+            assert!(ctx.confirm_tool(name, "another mutating action").await);
+
+            // 重建同一项目的 ToolCtx 后仍直接放行。
+            let mut reloaded = ToolCtx::new(&cwd);
+            reloaded.load_allowed_tools(&base);
+            reloaded.set_permission_mode(PermissionMode::Prompt);
+            let (tx, rx) = mpsc::channel(1);
+            reloaded.ui_ask_tx = Some(tx);
+            drop(rx);
+            assert!(reloaded.confirm_tool(name, "after restart").await);
+
+            std::fs::remove_dir_all(&base).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn computer_project_approval_does_not_leak_to_another_project() {
+        let base = tmp_base();
+        let project_a = base.join("project-a");
+        let project_b = base.join("project-b");
+        std::fs::create_dir_all(&project_a).unwrap();
+        std::fs::create_dir_all(&project_b).unwrap();
+
+        let mut approved = ToolCtx::new(&project_a);
+        approved.load_allowed_tools(&base);
+        approved.set_permission_mode(PermissionMode::Prompt);
+        let (tx, mut rx) = mpsc::channel(1);
+        approved.ui_ask_tx = Some(tx);
+        assert!(
+            confirm_with_decision(
+                &approved,
+                &mut rx,
+                "app_computer",
+                "click",
+                PermissionDecision::AllowOnce,
+            )
+            .await
+        );
+
+        let mut isolated = ToolCtx::new(&project_b);
+        isolated.load_allowed_tools(&base);
+        isolated.set_permission_mode(PermissionMode::Prompt);
+        let (tx, mut rx) = mpsc::channel(1);
+        isolated.ui_ask_tx = Some(tx);
+        assert!(
+            !confirm_with_decision(
+                &isolated,
+                &mut rx,
+                "app_computer",
+                "click",
+                PermissionDecision::Deny,
+            )
+            .await
+        );
+        assert!(!isolated
+            .always_allowed
+            .read()
+            .unwrap()
+            .contains("app_computer"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn computer_deny_does_not_persist() {
+        let base = tmp_base();
+        let cwd = base.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut ctx = ToolCtx::new(&cwd);
+        ctx.load_allowed_tools(&base);
+        ctx.set_permission_mode(PermissionMode::Prompt);
+        let (tx, mut rx) = mpsc::channel(1);
+        ctx.ui_ask_tx = Some(tx);
+        assert!(
+            !confirm_with_decision(
+                &ctx,
+                &mut rx,
+                "computer",
+                "left click",
+                PermissionDecision::Deny,
+            )
+            .await
+        );
+        assert!(!ctx.always_allowed.read().unwrap().contains("computer"));
+        assert!(!ctx.allowed_tools_path.as_ref().unwrap().exists());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_tool_allow_once_remains_one_shot() {
         let mut ctx = ToolCtx::new("/tmp");
         ctx.set_permission_mode(PermissionMode::Prompt);
-        let (tx, mut rx) = mpsc::channel(8);
+        let (tx, mut rx) = mpsc::channel(2);
         ctx.ui_ask_tx = Some(tx);
-        let responder = tokio::spawn(async move {
-            if let Some(UiAskRequest::ToolPermission { response_tx, .. }) = rx.recv().await {
-                let _ = response_tx.send(PermissionDecision::AllowAlways);
-            }
-        });
-        assert!(ctx.confirm_tool("computer", "screenshot").await);
-        responder.await.unwrap();
-        // 进了会话内存放行集合，而不是跨会话持久化集合
-        assert!(ctx.session_allowed.read().unwrap().contains("computer"));
-        assert!(!ctx.always_allowed.read().unwrap().contains("computer"));
-        // 第二次同名工具无需再问，直接放行（不再触发 responder）
-        assert!(ctx.confirm_tool("computer", "left_click at (1, 2)").await);
+
+        assert!(
+            confirm_with_decision(&ctx, &mut rx, "Bash", "ls", PermissionDecision::AllowOnce,)
+                .await
+        );
+        assert!(!ctx.always_allowed.read().unwrap().contains("Bash"));
+        assert!(
+            !confirm_with_decision(&ctx, &mut rx, "Bash", "ls -la", PermissionDecision::Deny,)
+                .await
+        );
     }
 
     #[tokio::test]

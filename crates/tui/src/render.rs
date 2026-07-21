@@ -245,6 +245,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                 draw_permission_dialog(f, dlg, chunks[1]);
             }
         }
+        BottomPanel::ProjectTrust => {
+            if let Some(servers) = &state.pending_mcp_trust {
+                draw_project_trust_panel(f, servers, chunks[1]);
+            }
+        }
         BottomPanel::ExecModeConfirm => {
             if let Some(dlg) = &state.exec_mode_confirm {
                 draw_exec_mode_confirm_panel(f, dlg, chunks[1]);
@@ -329,6 +334,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 enum BottomPanel {
     None,
     Permission,
+    ProjectTrust,
     ExecModeConfirm,
     PlanApproval,
     SubAgents,
@@ -345,6 +351,13 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     // Claude Code Inline 模式——不再走全屏浮层，避免每次都触发全屏切换闪烁）。
     if state.permission_dialog.is_some() {
         return (11u16.min(area_height), BottomPanel::Permission);
+    }
+    // 项目级 MCP server 信任确认：只在启动时出现一次，优先级次于逐调用权限
+    // 确认（后者可能在一轮工具调用中途弹出，必须绝对优先响应），但高于其余
+    // 面板——这是"要不要允许仓库自带的任意命令执行"的安全门槛，不应被
+    // ExecModeConfirm/PlanApproval 这类流程性面板挡住。
+    if state.pending_mcp_trust.is_some() {
+        return (11u16.min(area_height), BottomPanel::ProjectTrust);
     }
     if state.exec_mode_confirm.is_some() {
         return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
@@ -2578,14 +2591,60 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
         Line::from(Span::raw(preview)),
         Line::from(""),
         Line::from(Span::styled(
-            if wyj_tools::ctx::is_session_scoped_tool(&dlg.tool_name) {
-                wyj_i18n::tr("dialog.permission_hint_session_scoped")
+            if wyj_tools::ctx::is_project_approve_once_tool(&dlg.tool_name) {
+                wyj_i18n::tr("dialog.permission_hint_project_once")
             } else {
                 wyj_i18n::tr("dialog.permission_hint")
             },
             Theme::highlight(),
         )),
     ];
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    f.render_widget(para, inner);
+}
+
+/// 项目级 MCP server 信任确认面板：只在 TUI 启动后台连接阶段检测到未信任的
+/// `.wyj-code/mcp.toml`/`.mcp.json` server 时出现一次，样式对齐
+/// `draw_permission_dialog`（同为安全相关确认）。
+fn draw_project_trust_panel(f: &mut Frame, servers: &[wyj_config::McpServerConfig], area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(
+            wyj_i18n::tr("dialog.project_trust_title"),
+            Theme::permission_dialog(),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::raw(wyj_i18n::tr(
+        "dialog.project_trust_intro",
+    )))];
+    for server in servers {
+        let target = server
+            .command
+            .as_deref()
+            .map(|c| {
+                if server.args.is_empty() {
+                    c.to_string()
+                } else {
+                    format!("{c} {}", server.args.join(" "))
+                }
+            })
+            .or_else(|| server.url.clone())
+            .unwrap_or_default();
+        lines.push(Line::from(Span::raw(truncate_chars(
+            &format!("  · {}: {target}", server.name),
+            inner.width as usize,
+        ))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.project_trust_hint"),
+        Theme::highlight(),
+    )));
 
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
     f.render_widget(para, inner);
@@ -5071,6 +5130,41 @@ mod tool_result_fold_tests {
 
         assert!(height > 0);
         assert!(matches!(panel, BottomPanel::SubAgents));
+    }
+
+    #[test]
+    fn pending_mcp_trust_shows_project_trust_panel() {
+        let mut state = make_state();
+        state.pending_mcp_trust = Some(vec![wyj_config::McpServerConfig {
+            name: "postgres".to_string(),
+            transport: wyj_config::McpTransport::Stdio,
+            command: Some("npx".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+        }]);
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0);
+        assert!(matches!(panel, BottomPanel::ProjectTrust));
+    }
+
+    #[test]
+    fn permission_dialog_outranks_pending_mcp_trust() {
+        let mut state = make_state();
+        state.pending_mcp_trust = Some(vec![]);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.permission_dialog = Some(PermissionDialog {
+            tool_name: "Bash".to_string(),
+            action_summary: "ls".to_string(),
+            response_tx: tx,
+        });
+
+        let (_, panel) = bottom_panel_size(&state, 40);
+
+        assert!(matches!(panel, BottomPanel::Permission));
     }
 
     #[test]

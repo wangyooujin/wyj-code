@@ -78,6 +78,7 @@ cli:
   subagent_trace_session_id_help: "Session id (e.g. sess-1719723000)"
   subagent_trace_sub_id_help: "Sub-agent id (the number the Hub assigned, e.g. 3); omit to list all sub-agents in the session"
   subagent_trace_json_help: "Print the raw JSONL (for piping); only takes effect when a sub-agent id is given"
+  trust_mcp_about: "Approve trust for the current project's project-scoped MCP servers (.wyj-code/mcp.toml/.mcp.json); run this before setting up scheduled tasks"
 
 update:
   checking: "Checking for the latest version…"
@@ -137,7 +138,7 @@ help:
     - `/mode [mode]` — Switch run mode (normal / plan / bypass)
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
-    - `/init` — Have the Agent explore the project and generate/merge CLAUDE.md
+    - `/init` — Have the Agent explore the project and generate/merge CLAUDE.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists
     - `/bug [summary]` — Open this repo's GitHub new-issue page prefilled with env info (no deps)
     - `/review [PR#]` — Fetch a PR diff and have the Agent review it (requires gh CLI)
     - `/pr-comments [PR#]` — View comments on a PR (requires gh CLI)
@@ -515,6 +516,17 @@ computer:
   not_registered_provider: "  ✗  Registration not enabled (provider={provider}; computer-use only works over the Anthropic protocol)"
   mode_native: "  ✓  Registration enabled (native mode, official Anthropic endpoint)"
   mode_custom: "  ✓  Registration enabled (custom mode, third-party Anthropic-compatible endpoint, e.g. MiniMax/GLM/Kimi)"
+  background_supported: "  ✓  Background   app_computer available (stable window + macOS Accessibility/target PID)"
+  background_unavailable: "  ℹ️  Background   app_computer is not implemented on this platform; no silent foreground fallback"
+  ax_trusted: "  ✓  Accessibility authorized for background AX semantic actions"
+  ax_untrusted: "  ✗  Accessibility not authorized; enable wyj-code in System Settings → Privacy & Security → Accessibility"
+  foreground_policy: "  ℹ️  Foreground   {policy} (quiet period {quiet_ms}ms, max defer {max_defer}s)"
+  input_monitor: "  ℹ️  Input arbiter {status} (external idle {idle}s, event seq {seq})"
+  input_monitor_error: "  ✗  Input arbiter {err}"
+  window_count: "  ✓  Window target enumeration ok ({count} visible windows)"
+  window_error: "  ✗  Window target enumeration failed: {err}"
+  telemetry_paths: "  ℹ️  Local paths   background={background}, targeted_pid={targeted}, foreground={foreground}, automatic_fallback={auto_fallback}"
+  telemetry_guards: "  ℹ️  Safety guards preempted={preempted}, target_changed={changed}, takeover_required={requires}, focus_fuses={fuses}"
   display_ok: "  ✓  Display      {pw}x{ph} physical px -> {tw}x{th} target resolution"
   display_err: "  ✗  Display      probe failed: {err}"
   screenshot_ok: "  ✓  Screenshot   ok ({bytes} bytes, downscaled to 64px)"
@@ -550,7 +562,7 @@ cwd:
   body: "Working directory: {cwd}"
 
 init:
-  desc: "Have the Agent explore the project and generate/merge CLAUDE.md"
+  desc: "Have the Agent explore the project and generate/merge CLAUDE.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists"
   agent_prompt: |-
     Generate or update the CLAUDE.md memory file for the current project (working directory: {cwd}).
 
@@ -607,7 +619,10 @@ dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
-  permission_hint_session_scoped: "  [y] Allow once   [a] Always allow (this session only)   [d] Deny   (Esc to deny)"
+  permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
+  project_trust_title: " ⚠ Project MCP Servers Need Trust "
+  project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"
+  project_trust_hint: "  [y] Trust and connect   [n/Esc] Skip for now (asked again on next launch)"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "
   ask_question_other_label: "Other…"

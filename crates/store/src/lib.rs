@@ -15,12 +15,14 @@ pub mod marketplace;
 pub mod mcp_install;
 pub mod plugin_install;
 pub mod plugin_manifest;
+pub mod project_trust;
 pub mod registry;
 pub mod schedule;
 pub mod self_update;
 pub mod skill_install;
 
 pub use lockfile::{disabled_mcp_names, disabled_skill_names, InstallScope};
+pub use project_trust::{compute_project_mcp_fingerprint, TrustStatus};
 
 /// `upgrade_mcp_server`/`upgrade_skill` 的结果：区分"确实拉到了新版本并覆盖安装"
 /// 和"registry/marketplace 上已经是当前版本，未做任何改动"，供 UI 展示不同文案。

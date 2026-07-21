@@ -64,7 +64,14 @@ pub enum ScheduleCommand {
     },
     /// Execute one task immediately. This is the command the system crontab
     /// actually invokes; not meant for interactive use.
-    Run { id: String },
+    Run {
+        id: String,
+        /// Retained for CLI compatibility with v1.4 prereleases. Foreground
+        /// computer-use is now fail-closed in every headless/scheduled run,
+        /// while background app_computer may safely run alongside the user.
+        #[arg(long)]
+        manual: bool,
+    },
 }
 
 pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
@@ -146,7 +153,7 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
                 );
             }
         }
-        ScheduleCommand::Run { id } => run_task(&id).await?,
+        ScheduleCommand::Run { id, manual } => run_task(&id, manual).await?,
     }
     Ok(())
 }
@@ -170,7 +177,7 @@ fn sync_and_warn() -> Result<()> {
     Ok(())
 }
 
-async fn run_task(id: &str) -> Result<()> {
+async fn run_task(id: &str, _manual: bool) -> Result<()> {
     let manifest = schedule::load()?;
     let task = manifest
         .tasks
@@ -181,7 +188,6 @@ async fn run_task(id: &str) -> Result<()> {
         eprintln!("定时任务 {id} 已禁用，跳过执行");
         return Ok(());
     }
-
     let task_name = task.name.clone();
     let prompt = task.prompt.clone();
     let task_cwd = task.cwd.clone();
