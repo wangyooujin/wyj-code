@@ -8,10 +8,14 @@ use std::path::{Path, PathBuf};
 
 pub mod codex;
 pub mod project_mcp;
+pub mod project_settings;
 pub use codex::{codex_home_dir, load_codex_mcp};
 pub use project_mcp::{
     load_native_mcp, load_project_mcp, merged_mcp_servers, native_mcp_names, project_mcp_path,
     save_project_mcp, ProjectMcpConfig,
+};
+pub use project_settings::{
+    load_project_settings, project_settings_path, save_project_settings, ProjectSettings,
 };
 
 // ── MCP Server 配置 ───────────────────────────────────────────────────────────
@@ -255,6 +259,47 @@ impl Default for SubAgentCfg {
     }
 }
 
+/// 旧版全局 `computer` 工具需要占用前台鼠标/键盘时的回退策略。
+///
+/// v1.4 起后台 `app_computer` 是默认路径；前台接管必须显式配置，不能在
+/// 后台动作不支持时悄悄降级，否则仍会和人类用户争夺焦点与输入设备。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForegroundFallback {
+    /// 完全禁用前台接管（默认）。
+    #[default]
+    Disabled,
+    /// 每次接管仍走现有工具权限确认，并等待输入仲裁器确认安静窗口。
+    Ask,
+    /// 不额外询问，但只在用户持续空闲时执行；超过最大等待时间即放弃。
+    IdleOnly,
+}
+
+/// `[computer_use]` 节 — computer-use 人机互不干扰策略。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerUseCfg {
+    /// 旧版 `computer` 前台兼容工具的启用策略。
+    pub foreground_fallback: ForegroundFallback,
+    /// 获得前台输入租约前，必须连续没有外部输入的时长。
+    pub quiet_period_ms: u64,
+    /// 等待用户空闲的最长时间；到期后失败关闭，不强行执行。
+    pub max_defer_secs: u64,
+    /// 前台兼容动作结束后是否尝试恢复原观察上下文。
+    pub restore_context: bool,
+}
+
+impl Default for ComputerUseCfg {
+    fn default() -> Self {
+        Self {
+            foreground_fallback: ForegroundFallback::Disabled,
+            quiet_period_ms: 2_000,
+            max_defer_secs: 30,
+            restore_context: true,
+        }
+    }
+}
+
 /// 主配置结构，对应 ~/.wyj-code/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -277,6 +322,9 @@ pub struct Config {
     /// 子 Agent 模型配置（[subagent] 节）
     #[serde(default)]
     pub subagent: SubAgentCfg,
+    /// computer-use 后台优先与前台回退策略（[computer_use] 节）
+    #[serde(default)]
+    pub computer_use: ComputerUseCfg,
     /// WebSearch 搜索 provider（目前支持 "tavily"）
     #[serde(default = "default_search_provider")]
     pub search_provider: String,
@@ -304,6 +352,7 @@ impl Default for Config {
             mcp_servers: vec![],
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
         }
@@ -375,6 +424,7 @@ impl From<LegacyConfigV0> for Config {
             mcp_servers: legacy.mcp_servers,
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
         }
@@ -587,11 +637,28 @@ pub fn global_config_dir_in(home: &Path) -> PathBuf {
     home.join(".wyj-code")
 }
 
-/// 项目级配置目录（`<cwd>/.wyj-code`），承载 `skills/`、`agents/`、`mcp.toml`、
-/// `installed.json`。只拼路径、不创建（只读操作不应污染用户项目目录），由各
-/// 写入方在落盘前自行 `create_dir_all`。
+/// 返回 `cwd` 所属项目的根目录：优先向上查找 Git 仓库根；找不到 `.git` 时
+/// 回退到规范化后的 `cwd` 本身。这里只检查文件系统标记，不执行 git 命令，
+/// 避免项目配置发现进入启动性能关键路径。
+pub fn project_root(cwd: &Path) -> PathBuf {
+    let mut dir = Some(cwd);
+    while let Some(candidate) = dir {
+        if candidate.join(".git").exists() {
+            return candidate.to_path_buf();
+        }
+        dir = candidate.parent();
+    }
+    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
+/// 项目级配置目录（`<git-root>/.wyj-code`），承载 `skills/`、`agents/`、
+/// `mcp.toml`、`settings.toml`、`installed.json`。只解析路径、不创建（只读操作
+/// 不应污染用户项目目录），由各写入方在落盘前自行 `create_dir_all`。
+///
+/// 从仓库任意子目录启动时都会指向同一个目录，保证 Skill/MCP/settings/agent
+/// 的读取、安装和禁用状态不会随当前子目录漂移。
 pub fn project_config_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".wyj-code")
+    project_root(cwd).join(".wyj-code")
 }
 
 /// 返回主配置文件路径（~/.wyj-code/config.toml）。
@@ -613,8 +680,49 @@ pub fn home_dir() -> Result<PathBuf> {
 }
 
 #[cfg(test)]
+mod project_path_tests {
+    use super::*;
+
+    #[test]
+    fn project_config_dir_walks_to_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let nested = repo.path().join("crates").join("demo").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(project_root(&nested), repo.path());
+        assert_eq!(project_config_dir(&nested), repo.path().join(".wyj-code"));
+    }
+
+    #[test]
+    fn project_config_dir_falls_back_to_non_git_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(project_root(dir.path()), canonical);
+        assert_eq!(project_config_dir(dir.path()), canonical.join(".wyj-code"));
+    }
+}
+
+#[cfg(test)]
 mod subagent_cfg_tests {
-    use super::{Profile, Provider, SubAgentCfg};
+    use super::{ComputerUseCfg, ForegroundFallback, Profile, Provider, SubAgentCfg};
+
+    #[test]
+    fn computer_use_defaults_fail_closed_for_foreground_takeover() {
+        let cfg = ComputerUseCfg::default();
+        assert_eq!(cfg.foreground_fallback, ForegroundFallback::Disabled);
+        assert_eq!(cfg.quiet_period_ms, 2_000);
+        assert_eq!(cfg.max_defer_secs, 30);
+        assert!(cfg.restore_context);
+    }
+
+    #[test]
+    fn partial_computer_use_section_keeps_safe_defaults() {
+        let cfg: ComputerUseCfg = toml::from_str("foreground_fallback = \"idle_only\"").unwrap();
+        assert_eq!(cfg.foreground_fallback, ForegroundFallback::IdleOnly);
+        assert_eq!(cfg.quiet_period_ms, 2_000);
+        assert_eq!(cfg.max_defer_secs, 30);
+    }
 
     #[test]
     fn defaults_enable_trace_with_256kb_cap() {

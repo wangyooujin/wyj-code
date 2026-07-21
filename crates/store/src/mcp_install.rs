@@ -496,6 +496,38 @@ pub fn effective_mcp_servers(cfg: &Config, cwd: &Path) -> Vec<McpServerConfig> {
     result
 }
 
+/// 在 `effective_mcp_servers` 基础上，按 `project_trust::trust_status` 把
+/// "属于项目级来源但未信任"的 server 拆分到 pending；其余（全局 server +
+/// 已信任的项目级 server）放进 trusted。调用方对 trusted 照常连接，对
+/// pending 一律不连接——具体如何提示用户（TUI 弹窗 / CLI 打印一行提示）
+/// 由各调用点自己决定，这里只负责拆分。
+pub fn effective_mcp_servers_trust_split(
+    cfg: &Config,
+    cwd: &Path,
+) -> (Vec<McpServerConfig>, Vec<McpServerConfig>) {
+    let all = effective_mcp_servers(cfg, cwd);
+    let pending_names: HashSet<String> = match crate::project_trust::trust_status(cwd) {
+        crate::project_trust::TrustStatus::Pending(servers) => {
+            servers.into_iter().map(|s| s.name).collect()
+        }
+        crate::project_trust::TrustStatus::NoProjectServers
+        | crate::project_trust::TrustStatus::Trusted => HashSet::new(),
+    };
+    if pending_names.is_empty() {
+        return (all, Vec::new());
+    }
+    let mut trusted = Vec::new();
+    let mut pending = Vec::new();
+    for server in all {
+        if pending_names.contains(&server.name) {
+            pending.push(server);
+        } else {
+            trusted.push(server);
+        }
+    }
+    (trusted, pending)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,5 +803,56 @@ mod tests {
         // 用户已有配置优先，插件同名条目被跳过，不覆盖。
         assert_eq!(effective.len(), 1);
         assert_eq!(effective[0].command.as_deref(), Some("user-configured"));
+    }
+
+    fn stdio_server(name: &str, command: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            transport: McpTransport::Stdio,
+            command: Some(command.to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn trust_split_puts_global_server_in_trusted_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wyj_config::Config {
+            mcp_servers: vec![stdio_server("global-tool", "npx")],
+            ..wyj_config::Config::default()
+        };
+        // 全局配置来源的 server 不受项目级信任门槛约束。
+        let (trusted, pending) = effective_mcp_servers_trust_split(&cfg, dir.path());
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[0].name, "global-tool");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn trust_split_puts_unapproved_project_server_in_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wyj_config::Config::default();
+        wyj_config::save_project_mcp(dir.path(), &[stdio_server("project-tool", "npx")]).unwrap();
+
+        let (trusted, pending) = effective_mcp_servers_trust_split(&cfg, dir.path());
+        assert!(trusted.is_empty());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "project-tool");
+    }
+
+    #[test]
+    fn trust_split_moves_project_server_to_trusted_after_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = wyj_config::Config::default();
+        wyj_config::save_project_mcp(dir.path(), &[stdio_server("project-tool", "npx")]).unwrap();
+        crate::project_trust::approve(dir.path()).unwrap();
+
+        let (trusted, pending) = effective_mcp_servers_trust_split(&cfg, dir.path());
+        assert_eq!(trusted.len(), 1);
+        assert_eq!(trusted[0].name, "project-tool");
+        assert!(pending.is_empty());
     }
 }

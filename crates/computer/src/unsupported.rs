@@ -20,6 +20,10 @@ pub fn capture_region(_x0: i32, _y0: i32, _x1: i32, _y1: i32, _max_dim: u32) -> 
     unsupported()
 }
 
+pub fn capture_window_by_name(_query: &str, _max_dim: u32) -> Result<Capture> {
+    unsupported()
+}
+
 pub fn cursor_location() -> Result<(i32, i32)> {
     unsupported()
 }

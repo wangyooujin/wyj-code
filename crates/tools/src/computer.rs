@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use wyj_api::types::{NativeToolSpec, ToolDefinition, ToolResultPart};
 use wyj_computer::scale::CoordScaler;
 use wyj_computer::MouseButton;
@@ -34,6 +35,32 @@ const SCROLL_STEP_PX: i32 = 40;
 /// 外扩），防止模型给出的框贴得太紧、把目标内容边缘切掉。
 const ZOOM_PADDING_RATIO: f64 = 0.12;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundFallbackPolicy {
+    Disabled,
+    Ask,
+    IdleOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForegroundPolicy {
+    pub fallback: ForegroundFallbackPolicy,
+    pub quiet_period: Duration,
+    pub max_defer: Duration,
+    pub restore_context: bool,
+}
+
+impl Default for ForegroundPolicy {
+    fn default() -> Self {
+        Self {
+            fallback: ForegroundFallbackPolicy::Disabled,
+            quiet_period: Duration::from_secs(2),
+            max_defer: Duration::from_secs(30),
+            restore_context: true,
+        }
+    }
+}
+
 pub struct ComputerTool {
     max_dim: u32,
     /// true：向模型声明为 Anthropic 原生 `computer_20251124` 工具（无 description/
@@ -51,6 +78,10 @@ pub struct ComputerTool {
     target_width: u32,
     target_height: u32,
     action_count: AtomicUsize,
+    foreground_policy: ForegroundPolicy,
+    /// 最近一次全屏 screenshot 对应的精确前台窗口。任何变更动作后清空；
+    /// 下一步动作必须重新截图，避免在窗口/焦点变化后沿用旧坐标。
+    foreground_observation: std::sync::Mutex<Option<wyj_computer::target::WindowTarget>>,
 }
 
 impl ComputerTool {
@@ -58,6 +89,14 @@ impl ComputerTool {
     /// macOS 尚未授权屏幕录制）退回一个保守兜底尺寸，工具仍可注册，实际
     /// 调用截图/输入时会把探测失败的原因作为工具错误返回给模型。
     pub fn new(max_dim: u32, native: bool) -> Self {
+        Self::new_with_policy(max_dim, native, ForegroundPolicy::default())
+    }
+
+    pub fn new_with_policy(
+        max_dim: u32,
+        native: bool,
+        foreground_policy: ForegroundPolicy,
+    ) -> Self {
         let (physical_width, physical_height) = match wyj_computer::primary_display_size() {
             Ok(d) => (d.physical_width, d.physical_height),
             Err(e) => {
@@ -75,6 +114,8 @@ impl ComputerTool {
             target_width,
             target_height,
             action_count: AtomicUsize::new(0),
+            foreground_policy,
+            foreground_observation: std::sync::Mutex::new(None),
         }
     }
 
@@ -87,16 +128,103 @@ impl ComputerTool {
         )
     }
 
+    async fn acquire_foreground_lease(
+        &self,
+        ctx: &dyn ToolContext,
+    ) -> Result<wyj_computer::activity::InputLease> {
+        if self.foreground_policy.fallback == ForegroundFallbackPolicy::Disabled {
+            bail!(
+                "requires_foreground_takeover: legacy computer mutations are disabled; use app_computer"
+            );
+        }
+        if !ctx.supports_interactive_confirmation() {
+            bail!(
+                "requires_foreground_takeover: headless/scheduled execution may not take over the foreground desktop"
+            );
+        }
+
+        let started_at = Instant::now();
+        let deadline = started_at
+            .checked_add(self.foreground_policy.max_defer)
+            .unwrap_or(started_at);
+        loop {
+            match wyj_computer::activity::acquire_lease(self.foreground_policy.quiet_period) {
+                Ok(lease) => return Ok(lease),
+                Err(error) => {
+                    let message = error.to_string();
+                    if !message.contains("user_active")
+                        && !message.contains("input_monitor_unavailable: exact external-input attribution is required (starting)")
+                    {
+                        return Err(error);
+                    }
+                    if Instant::now() >= deadline {
+                        bail!(
+                            "user_active: foreground takeover deferred for {}s and timed out; do not retry automatically",
+                            self.foreground_policy.max_defer.as_secs()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn current_focused_window() -> Option<wyj_computer::target::WindowTarget> {
+        wyj_computer::target::list_windows()
+            .ok()?
+            .into_iter()
+            .find(|window| window.focused)
+    }
+
+    fn validate_foreground_observation(&self) -> Result<wyj_computer::target::WindowTarget> {
+        let observed = self
+            .foreground_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .ok_or_else(|| {
+                anyhow!("target_changed: take a new screenshot before a foreground action")
+            })?;
+        let current = Self::current_focused_window()
+            .ok_or_else(|| anyhow!("target_changed: no focused window is available"))?;
+        anyhow::ensure!(
+            current.window_id == observed.window_id
+                && current.pid == observed.pid
+                && current.generation == observed.generation,
+            "target_changed: the focused window changed since the last screenshot; take a new screenshot"
+        );
+        Ok(current)
+    }
+
     fn do_screenshot(&self) -> Result<ToolResult> {
         self.action_count.store(0, Ordering::SeqCst);
+        let before = Self::current_focused_window();
         let capture = wyj_computer::capture_primary(self.max_dim)?;
+        let after = Self::current_focused_window();
+        let stable = before
+            .as_ref()
+            .zip(after.as_ref())
+            .filter(|(before, after)| {
+                before.window_id == after.window_id
+                    && before.pid == after.pid
+                    && before.generation == after.generation
+            })
+            .map(|(_, after)| after.clone());
+        *self
+            .foreground_observation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stable.clone();
         let display = format!(
-            "[screenshot: {}x{} -> {}x{}, {} KB]",
+            "[foreground compatibility screenshot: {}x{} -> {}x{}, {} KB; observed_window={}]",
             capture.physical_width,
             capture.physical_height,
             capture.target_width,
             capture.target_height,
-            capture.png.len() / 1024
+            capture.png.len() / 1024,
+            stable
+                .as_ref()
+                .map(|window| format!("{}:{}:{}", window.window_id, window.pid, window.generation))
+                .unwrap_or_else(|| "unstable".to_string())
         );
         let data = capture.png_base64();
         Ok(ToolResult::with_parts(
@@ -222,13 +350,23 @@ impl ComputerTool {
         Ok(ToolResult::ok(format!("pressed {text}")))
     }
 
-    fn do_type(&self, input: &Value) -> Result<ToolResult> {
+    fn do_type_with_lease(
+        &self,
+        input: &Value,
+        lease: &wyj_computer::activity::InputLease,
+    ) -> Result<ToolResult> {
         let text = required_str(input, "text")?;
-        wyj_computer::type_text(text)?;
-        Ok(ToolResult::ok(format!(
-            "typed {} chars",
-            text.chars().count()
-        )))
+        let chars: Vec<char> = text.chars().collect();
+        for chunk in chars.chunks(8) {
+            if !wyj_computer::activity::lease_is_valid(lease) {
+                bail!(
+                    "preempted_by_user: external input arrived while typing; remaining text was not sent"
+                );
+            }
+            let chunk: String = chunk.iter().collect();
+            wyj_computer::type_text(&chunk)?;
+        }
+        Ok(ToolResult::ok(format!("typed {} chars", chars.len())))
     }
 
     fn do_scroll(&self, input: &Value) -> Result<ToolResult> {
@@ -453,9 +591,11 @@ impl Tool for ComputerTool {
     }
 
     fn needs_permission(&self, input: &Value) -> bool {
-        match input.get("action").and_then(Value::as_str) {
+        matches!(
+            self.foreground_policy.fallback,
+            ForegroundFallbackPolicy::Ask
+        ) && match input.get("action").and_then(Value::as_str) {
             Some(action) => !is_read_only_action(action),
-            // 无法识别的 action：保守起见按需要确认处理
             None => true,
         }
     }
@@ -464,7 +604,7 @@ impl Tool for ComputerTool {
         summarize_action(input)
     }
 
-    async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
+    async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let action = input
             .get("action")
             .and_then(Value::as_str)
@@ -481,7 +621,21 @@ impl Tool for ComputerTool {
             };
         }
 
-        // 变更类动作：先查失控角，再查连续动作上限，都通过才真正执行
+        let lease = match self.acquire_foreground_lease(ctx).await {
+            Ok(lease) => lease,
+            Err(error) => return Ok(foreground_error(error)),
+        };
+        let foreground_before = match self.validate_foreground_observation() {
+            Ok(window) => window,
+            Err(error) => return Ok(foreground_error(error)),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let _ = &foreground_before;
+        if !wyj_computer::activity::lease_is_valid(&lease) {
+            return Ok(foreground_error(anyhow!(
+                "preempted_by_user: external input arrived before the foreground action"
+            )));
+        }
         if let Ok((cx, cy)) = wyj_computer::cursor_location() {
             if in_dead_corner(cx, cy, self.physical_width, self.physical_height) {
                 return Ok(ToolResult::err(
@@ -499,25 +653,123 @@ impl Tool for ComputerTool {
             )));
         }
 
-        match action.as_str() {
+        let restore_pointer = (self.foreground_policy.restore_context
+            && matches!(
+                action.as_str(),
+                "left_click"
+                    | "right_click"
+                    | "middle_click"
+                    | "double_click"
+                    | "left_click_drag"
+                    | "scroll"
+            ))
+        .then(|| wyj_computer::cursor_location().ok())
+        .flatten();
+        let result = match action.as_str() {
             "mouse_move" => self.do_mouse_move(&input),
             "left_click" | "right_click" | "middle_click" | "double_click" => {
                 self.do_click(&action, &input)
             }
             "left_click_drag" => self.do_drag(&input),
             "key" => self.do_key(&input),
-            "type" => self.do_type(&input),
+            "type" => self.do_type_with_lease(&input, &lease),
             "scroll" => self.do_scroll(&input),
             other => Ok(ToolResult::err(format!(
                 "unsupported computer action: {other}"
             ))),
+        };
+        wyj_computer::telemetry::record_foreground_action();
+        if !wyj_computer::activity::lease_is_valid(&lease) {
+            return Ok(foreground_error(anyhow!(
+                "preempted_by_user: external input arrived during foreground action; do not retry automatically"
+            )));
         }
+        #[cfg(target_os = "macos")]
+        if self.foreground_policy.restore_context {
+            match wyj_computer::accessibility::frontmost_pid() {
+                Ok(pid) if pid != foreground_before.pid => {
+                    if let Err(error) =
+                        wyj_computer::accessibility::activate_application(foreground_before.pid)
+                    {
+                        return Ok(foreground_error(anyhow!(
+                            "foreground_context_restore_failed: {error}"
+                        )));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Ok(foreground_error(anyhow!(
+                        "foreground_context_restore_failed: {error}"
+                    )))
+                }
+            }
+        }
+        if let Some((x, y)) = restore_pointer {
+            if let Err(error) = wyj_computer::move_mouse(x, y) {
+                return Ok(foreground_error(anyhow!(
+                    "foreground_context_restore_failed: {error}"
+                )));
+            }
+        }
+        if !wyj_computer::activity::lease_is_valid(&lease) {
+            return Ok(foreground_error(anyhow!(
+                "preempted_by_user: external input arrived while restoring foreground context"
+            )));
+        }
+        result
     }
+}
+
+fn foreground_error(error: impl std::fmt::Display) -> ToolResult {
+    let message = error.to_string();
+    wyj_computer::telemetry::record_error_message(&message);
+    let code = [
+        "requires_foreground_takeover",
+        "target_changed",
+        "preempted_by_user",
+        "user_active",
+        "screen_locked",
+        "input_monitor_unavailable",
+        "foreground_context_restore_failed",
+    ]
+    .into_iter()
+    .find(|code| message.contains(code))
+    .unwrap_or("foreground_computer_failed");
+    ToolResult::err(
+        serde_json::to_string_pretty(&serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message,
+                "automatic_retry": false,
+                "mode": "foreground_compatibility"
+            }
+        }))
+        .unwrap_or(message),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestContext {
+        interactive: bool,
+    }
+
+    #[async_trait]
+    impl ToolContext for TestContext {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new(".")
+        }
+
+        fn is_allowed(&self, _name: &str, _input: &Value) -> bool {
+            true
+        }
+
+        fn supports_interactive_confirmation(&self) -> bool {
+            self.interactive
+        }
+    }
 
     #[test]
     fn read_only_actions_do_not_need_permission() {
@@ -623,7 +875,14 @@ mod tests {
 
     #[test]
     fn needs_permission_defaults_to_true_for_unknown_action() {
-        let tool = ComputerTool::new(DEFAULT_MAX_DIM, true);
+        let tool = ComputerTool::new_with_policy(
+            DEFAULT_MAX_DIM,
+            true,
+            ForegroundPolicy {
+                fallback: ForegroundFallbackPolicy::Ask,
+                ..ForegroundPolicy::default()
+            },
+        );
         let input = serde_json::json!({});
         assert!(tool.needs_permission(&input));
     }
@@ -644,9 +903,56 @@ mod tests {
 
     #[test]
     fn needs_permission_is_true_for_left_click() {
-        let tool = ComputerTool::new(DEFAULT_MAX_DIM, true);
+        let tool = ComputerTool::new_with_policy(
+            DEFAULT_MAX_DIM,
+            true,
+            ForegroundPolicy {
+                fallback: ForegroundFallbackPolicy::Ask,
+                ..ForegroundPolicy::default()
+            },
+        );
         let input = serde_json::json!({"action": "left_click", "coordinate": [1, 2]});
         assert!(tool.needs_permission(&input));
+    }
+
+    #[test]
+    fn default_policy_disables_foreground_mutation_without_prompt() {
+        let tool = ComputerTool::new(DEFAULT_MAX_DIM, true);
+        assert!(!tool.needs_permission(&serde_json::json!({
+            "action": "left_click",
+            "coordinate": [1, 2]
+        })));
+        assert_eq!(
+            tool.foreground_policy.fallback,
+            ForegroundFallbackPolicy::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_takeover_fails_closed_without_interactive_channel() {
+        let tool = ComputerTool::new_with_policy(
+            DEFAULT_MAX_DIM,
+            false,
+            ForegroundPolicy {
+                fallback: ForegroundFallbackPolicy::Ask,
+                ..ForegroundPolicy::default()
+            },
+        );
+        let error = tool
+            .acquire_foreground_lease(&TestContext { interactive: false })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("headless/scheduled"));
+    }
+
+    #[tokio::test]
+    async fn disabled_foreground_takeover_fails_before_monitor_probe() {
+        let tool = ComputerTool::new(DEFAULT_MAX_DIM, false);
+        let error = tool
+            .acquire_foreground_lease(&TestContext { interactive: true })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("mutations are disabled"));
     }
 
     #[test]

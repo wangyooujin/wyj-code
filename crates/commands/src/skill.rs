@@ -214,6 +214,17 @@ fn load_from_dir_with_namespace(
     namespace: Option<&str>,
     skills: &mut HashMap<String, SkillCommand>,
 ) {
+    // 标准目录式 Skill：`<name>/SKILL.md`。目录名（含上层 namespace）就是
+    // 命令名；该目录内部的 references/assets/*.md 是 Skill 私有资源，不应
+    // 被递归误注册成额外 slash command。
+    if let Some(name) = namespace {
+        let entrypoint = dir.join("SKILL.md");
+        if entrypoint.is_file() {
+            load_file_overwrite_as(&entrypoint, name.to_string(), skills);
+            return;
+        }
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         tracing::warn!("读取 skill 目录失败: {}", dir.display());
         return;
@@ -248,7 +259,14 @@ fn load_from_dir(dir: &Path, skills: &mut HashMap<String, SkillCommand>) {
 /// `.md` 文件而不是整个目录）。覆盖式写入（同名直接替换），供全局/项目目录使用。
 fn load_from_path_overwrite(path: &Path, skills: &mut HashMap<String, SkillCommand>) {
     if path.is_dir() {
-        load_from_dir(path, skills);
+        let entrypoint = path.join("SKILL.md");
+        if entrypoint.is_file() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                load_file_overwrite_as(&entrypoint, name.to_string(), skills);
+            }
+        } else {
+            load_from_dir(path, skills);
+        }
     } else if path.is_file() {
         load_file_overwrite(path, skills);
     }
@@ -280,7 +298,8 @@ fn load_from_path_if_absent(
 /// 2. 全局 wyj-code：`~/.wyj-code/skills/*.md`
 /// 3. 全局真 CC：`~/.claude/commands/*.md`（覆盖 #2 同名条目）
 /// 4. 已启用插件贡献路径（先到先得，跳过并警告同名冲突，不变）
-/// 5. 项目 wyj-code：`.wyj-code/skills/*.md`
+/// 5. 项目 wyj-code：`<git-root>/.wyj-code/skills`（支持 `name.md` 与
+///    `name/SKILL.md`）
 /// 6. 项目真 CC：`.claude/commands/*.md`（覆盖 #1-#5 同名条目，最高优先级）
 ///
 /// 递归扫描 `*.md`，子目录映射为 Claude Code 风格的 `namespace:name` 命令名。
@@ -328,7 +347,7 @@ pub fn load_skills(
         load_from_path_if_absent(path, "plugin", &mut skills);
     }
 
-    // 5. 项目 skill：.wyj-code/skills/*.md（覆盖 #1-#4 同名条目）
+    // 5. 项目 Skill：<git-root>/.wyj-code/skills（单文件或目录式，覆盖 #1-#4）
     let project_wyj_dir = wyj_config::project_config_dir(cwd).join("skills");
     if project_wyj_dir.exists() {
         load_from_dir(&project_wyj_dir, &mut skills);
@@ -485,12 +504,20 @@ mod tests {
         let plugin_skills_dir = plugin_root.path().join("skills");
         std::fs::create_dir_all(&plugin_skills_dir).unwrap();
         std::fs::write(plugin_skills_dir.join("dir-one.md"), "# Dir One\nhi").unwrap();
+        let standard_skill_dir = plugin_root.path().join("standard-skill");
+        std::fs::create_dir_all(&standard_skill_dir).unwrap();
+        std::fs::write(standard_skill_dir.join("SKILL.md"), "# Standard Skill\nhi").unwrap();
 
-        let sources = vec![plugin_root.path().join("single.md"), plugin_skills_dir];
+        let sources = vec![
+            plugin_root.path().join("single.md"),
+            plugin_skills_dir,
+            standard_skill_dir,
+        ];
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &sources);
         let found = names(&cmds);
         assert!(found.contains("single"));
         assert!(found.contains("dir-one"));
+        assert!(found.contains("standard-skill"));
     }
 
     #[test]
@@ -548,6 +575,32 @@ mod tests {
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &sources);
         let custom = cmds.iter().find(|c| c.name() == "custom").unwrap();
         assert_eq!(custom.description(), "Project Override"); // 项目级仍能覆盖插件
+    }
+
+    #[test]
+    fn nested_cwd_loads_directory_skill_from_git_root() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let skill_dir = repo.path().join(".wyj-code").join("skills").join("release");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Project Release\nrelease instructions",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("references").join("notes.md"),
+            "# Internal Notes\nnot a command",
+        )
+        .unwrap();
+        let nested = repo.path().join("crates").join("cli");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let cmds = load_skills(home.path(), &nested, &HashSet::new(), &[]);
+        let release = cmds.iter().find(|c| c.name() == "release").unwrap();
+        assert_eq!(release.description(), "Project Release");
+        assert!(!names(&cmds).contains("release:references:notes"));
     }
 
     #[test]

@@ -123,6 +123,25 @@ language   = ""                 # "en"/"zh"，留空自动检测系统 locale
 
 TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Agent、`/compact` 压缩、`/config` 设置面板、`/hooks` 查看生命周期钩子。完整命令见 `/help`。
 
+项目级资源会从 Git 仓库根目录的 `.wyj-code/` 自动发现；即使在 `src/`、
+`crates/foo/` 等子目录启动，也会使用同一份项目配置：
+
+```text
+.wyj-code/
+├── settings.toml          # 本项目禁用的 Skill / MCP 名称
+├── mcp.toml               # 项目 MCP server；首次连接需确认信任
+├── skills/
+│   ├── review.md          # /review
+│   └── release/SKILL.md   # /release（标准目录式 Skill）
+├── agents/                # 项目 SubAgent 定义
+└── installed.json         # 项目 Extensions lockfile
+```
+
+Skill 在启动及下一次命令边界自动重载，MCP 在安全回合边界连接/断开。
+仓库内的 `settings.toml` 只接受安全的项目开关；模型 Profile、API Key 和全局网络
+端点仍只从 `~/.wyj-code/config.toml`/环境变量读取，避免仓库文件注入凭证或悄悄
+改写供应商配置。
+
 资源管理也可以完全在 headless/CI 中执行：
 
 ```bash

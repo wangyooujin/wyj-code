@@ -1,7 +1,8 @@
-//! 项目级 MCP 配置：`<cwd>/.wyj-code/mcp.toml`
+//! 项目级 MCP 配置：`<git-root>/.wyj-code/mcp.toml`
 //!
 //! 格式与全局 `config.toml` 的 `[[mcp_servers]]` 段一致，同名 server 覆盖全局配置，
-//! 不同名则追加。不做祖先目录 walk，与现有 Skill 项目目录（`.wyj-code/skills/`）约定一致。
+//! 不同名则追加。项目根由 `project_config_dir` 统一解析，因此从仓库子目录启动
+//! 仍会读取仓库根配置，与 Skill/settings/agent/lockfile 的项目边界一致。
 
 use crate::{Config, McpServerConfig};
 use anyhow::{Context, Result};
@@ -15,7 +16,7 @@ pub struct ProjectMcpConfig {
     pub mcp_servers: Vec<McpServerConfig>,
 }
 
-/// 返回项目级 MCP 配置文件路径（`<cwd>/.wyj-code/mcp.toml`）。
+/// 返回项目级 MCP 配置文件路径（`<git-root>/.wyj-code/mcp.toml`）。
 pub fn project_mcp_path(cwd: &Path) -> PathBuf {
     crate::project_config_dir(cwd).join("mcp.toml")
 }
@@ -202,6 +203,19 @@ mod tests {
         let loaded = load_project_mcp(dir.path()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "postgres");
+    }
+
+    #[test]
+    fn nested_cwd_loads_mcp_from_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let nested = repo.path().join("crates").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        save_project_mcp(repo.path(), &[mcp("postgres", "project-cmd")]).unwrap();
+        let loaded = load_project_mcp(&nested).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command.as_deref(), Some("project-cmd"));
     }
 
     #[test]

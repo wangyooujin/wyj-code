@@ -15,6 +15,7 @@ use wyj_tools::{
 
 mod extensions_cmd;
 mod schedule_cmd;
+mod trust_cmd;
 mod update_cmd;
 
 #[derive(Parser, Debug)]
@@ -77,6 +78,11 @@ enum Commands {
         #[command(subcommand)]
         command: schedule_cmd::ScheduleCommand,
     },
+    /// 批准当前项目级 MCP server（`.wyj-code/mcp.toml`/`.mcp.json`）的信任确认。
+    /// 无 UI 通道的场景（`-p`/`--headless`/`schedule run`）会跳过未批准的
+    /// 项目级 server 而不连接，配 cron 任务前先用这个命令批准一次。
+    #[command(name = "trust-mcp", about = wyj_i18n::tr("cli.trust_mcp_about"))]
+    TrustMcp,
 }
 
 /// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
@@ -262,6 +268,10 @@ async fn main() -> Result<()> {
             Commands::Schedule { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return schedule_cmd::run(command, &cwd).await;
+            }
+            Commands::TrustMcp => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return trust_cmd::run(&cwd).await;
             }
         }
     }
@@ -545,6 +555,10 @@ async fn main() -> Result<()> {
     // computer-use：仅 macOS/Windows + vision profile + Anthropic provider；
     // 返回值决定下面是否追加 COMPUTER_USE_HINT（教模型用 Bash 启动应用）
     let computer_use_enabled = register_computer_tool_if_enabled(&mut registry, &cfg);
+    // WindowCapture：独立工具，注册门槛与 computer-use 完全一致（同样要把
+    // 截图作为 image block 塞进 tool_result），见该函数文档。
+    register_window_capture_tool_if_enabled(&mut registry, &cfg);
+    register_app_computer_tool_if_enabled(&mut registry, &cfg);
 
     // --plugin-dir：临时加载本地开发插件（不落盘、不经过 marketplace/lockfile，
     // 仅当次进程生效），与 TUI「添加本地插件」的持久化路径是两条独立路径。
@@ -604,7 +618,20 @@ async fn main() -> Result<()> {
     // 排空结果"方案（见 repl() 内 shared_agent 部分），不阻塞任何一轮。
     // TUI 交互模式同样不在这里连接，交给 tui_main 在界面已经可用之后于后台连接。
     if cli.prompt.is_some() {
-        let mut effective_mcp_servers = wyj_store::mcp_install::effective_mcp_servers(&cfg, &cwd);
+        // 未信任的项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）在这里一律
+        // 跳过、不连接：`-p` 常被脚本/cron 无 TTY 调用，没有交互通道可以弹窗
+        // 确认，静默放行等于让克隆到的陌生仓库能无感执行任意命令。用户需要
+        // 先在 TUI 里批准一次，或运行 `wyj-code trust-mcp` 批准。
+        let (mut effective_mcp_servers, untrusted_servers) =
+            wyj_store::mcp_install::effective_mcp_servers_trust_split(&cfg, &cwd);
+        if !untrusted_servers.is_empty() {
+            let mut names: Vec<_> = untrusted_servers.iter().map(|s| s.name.clone()).collect();
+            names.sort();
+            eprintln!(
+                "[以下项目级 MCP server 尚未信任批准，本次未连接: {}；运行 `wyj-code trust-mcp` 批准]",
+                names.join(", ")
+            );
+        }
         if let Some(local) = &local_plugin {
             effective_mcp_servers.extend(local.mcp_servers.clone());
         }
@@ -897,6 +924,8 @@ async fn main() -> Result<()> {
             reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
         }
         register_computer_tool_if_enabled(&mut reg, cfg);
+        register_window_capture_tool_if_enabled(&mut reg, cfg);
+        register_app_computer_tool_if_enabled(&mut reg, cfg);
         for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
             reg.register_arc(tool.clone());
         }
@@ -1085,10 +1114,8 @@ fn select_sub_agent_tools(
 /// 一致，默认不给子 Agent。
 ///
 /// 返回值：是否实际注册了。调用方据此决定要不要追加
-/// `wyj_core::prompts::COMPUTER_USE_HINT`（教模型用 Bash 直接启动应用、不必在
-/// 聊天里先问用户"允许"再动手——没有这条提示，模型倾向于截一张图看见空
-/// 桌面就放弃，或者在聊天里等用户显式说"允许"，而不是直接尝试动作走既有的
-/// 逐动作确认弹窗）。
+/// `wyj_core::prompts::COMPUTER_USE_HINT`（教模型优先走稳定窗口后台路径、用
+/// Bash 直接启动应用，并把旧 `computer` 视为显式前台兼容能力）。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
     let profile = cfg.active_profile();
@@ -1096,16 +1123,71 @@ fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) 
         return false;
     }
     let native = profile.is_official_anthropic_endpoint();
-    registry.register_arc(Arc::new(wyj_tools::computer::ComputerTool::new(
-        wyj_tools::computer::DEFAULT_MAX_DIM,
-        native,
-    )));
+    let fallback = match cfg.computer_use.foreground_fallback {
+        wyj_config::ForegroundFallback::Disabled => {
+            wyj_tools::computer::ForegroundFallbackPolicy::Disabled
+        }
+        wyj_config::ForegroundFallback::Ask => wyj_tools::computer::ForegroundFallbackPolicy::Ask,
+        wyj_config::ForegroundFallback::IdleOnly => {
+            wyj_tools::computer::ForegroundFallbackPolicy::IdleOnly
+        }
+    };
+    registry.register_arc(Arc::new(
+        wyj_tools::computer::ComputerTool::new_with_policy(
+            wyj_tools::computer::DEFAULT_MAX_DIM,
+            native,
+            wyj_tools::computer::ForegroundPolicy {
+                fallback,
+                quiet_period: std::time::Duration::from_millis(cfg.computer_use.quiet_period_ms),
+                max_defer: std::time::Duration::from_secs(cfg.computer_use.max_defer_secs),
+                restore_context: cfg.computer_use.restore_context,
+            },
+        ),
+    ));
+    wyj_computer::activity::ensure_monitor();
     true
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) -> bool {
     false
 }
+
+/// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v1.4，见
+/// `tools::window_capture::WindowCaptureTool` 文档），注册门槛与
+/// `register_computer_tool_if_enabled` 完全一致（同样需要把截图作为 image
+/// block 塞进 tool_result，因此同样要求 vision + Anthropic provider）。
+/// 刻意复刻同一段短门控，保持此工具可独立演进。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn register_window_capture_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) {
+    let profile = cfg.active_profile();
+    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
+        return;
+    }
+    registry.register_arc(Arc::new(wyj_tools::window_capture::WindowCaptureTool::new(
+        wyj_tools::computer::DEFAULT_MAX_DIM,
+    )));
+}
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn register_window_capture_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) {}
+
+/// macOS 后台优先 computer-use：按稳定窗口目标截图，用 Accessibility/目标 PID
+/// 事件执行，不移动全局光标、不激活应用。Windows 在 v1.4 先保持安全边界，
+/// 只提供稳定窗口截图和默认关闭的前台兼容工具。
+#[cfg(target_os = "macos")]
+fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) {
+    let profile = cfg.active_profile();
+    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
+        return;
+    }
+    wyj_computer::activity::ensure_monitor();
+    registry.register_arc(Arc::new(wyj_tools::app_computer::AppComputerTool::new(
+        wyj_tools::computer::DEFAULT_MAX_DIM,
+        std::time::Duration::from_millis(cfg.computer_use.quiet_period_ms),
+    )));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_app_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) {}
 
 /// 构建子 Agent 工厂：按 agent 定义解析 Profile 与模型，注册按定义过滤后的工具集。
 /// 模型解析优先级：定义的 model 字段（Profile 名）→ [subagent].explore_profile（仅
@@ -1188,12 +1270,17 @@ fn make_sub_agent_factory(
 
 /// 返回当前进程应当使用的 MCP 配置。项目配置和启用插件贡献在每个 Agent
 /// 边界重新读取，因此 `/extensions enable|disable|remove` 不需要重启进程。
+/// 未信任的项目级 server 被静默排除在外（每次调用都重新查信任状态，
+/// 因此用户在另一个终端跑 `wyj-code trust-mcp` 批准后，下一轮 reconcile
+/// 会自动捡起，不需要重启这个 REPL 进程）；调用方如需提示用户"有 server
+/// 待批准"，另行调用 `wyj_store::project_trust::trust_status(cwd)`。
 fn effective_mcp_servers_for_runtime(
     cfg: &Config,
     cwd: &std::path::Path,
     local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
 ) -> Vec<wyj_config::McpServerConfig> {
-    let mut servers = wyj_store::mcp_install::effective_mcp_servers(cfg, cwd);
+    let (mut servers, _pending) =
+        wyj_store::mcp_install::effective_mcp_servers_trust_split(cfg, cwd);
     if let Some(local) = local_plugin {
         let mut names: std::collections::HashSet<String> =
             servers.iter().map(|server| server.name.clone()).collect();
@@ -1326,6 +1413,18 @@ async fn repl(
     // 的手法动态挂载新工具。已知局限：`run_turn` 开始时对 Agent 的只读快照
     // 决定了"本轮开始后新连上的工具在这一轮不生效，下一轮才可见"——这是 TUI
     // 架构本来就有、已被接受的行为，此处对称搬过来，不重新设计。
+    // 与 `-p` 单次模式一致：未信任的项目级 MCP server 只提示一次，不在每轮
+    // reconcile 时重复刷屏（`effective_mcp_servers_for_runtime` 本身已经在
+    // 每轮静默排除它们，这里只是让用户知道"为什么少了几个工具"）。
+    if let wyj_store::TrustStatus::Pending(servers) = wyj_store::project_trust::trust_status(&cwd) {
+        let mut names: Vec<_> = servers.iter().map(|s| s.name.clone()).collect();
+        names.sort();
+        eprintln!(
+            "[以下项目级 MCP server 尚未信任批准，本次未连接: {}；运行 `wyj-code trust-mcp` 批准]",
+            names.join(", ")
+        );
+    }
+
     let shared_agent = Arc::new(std::sync::RwLock::new(Arc::new(agent)));
     let mut mcp_runtime = wyj_mcp::McpRuntime::new();
     mcp_runtime.reconcile(&effective_mcp_servers_for_runtime(
