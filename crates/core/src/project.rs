@@ -4,17 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// 返回给定路径所属的「项目根」：从该路径向上查找含 `.git` 的目录；
-/// 找不到则回退到规范化后的路径本身（规范化失败再回退原路径）。
+/// 返回给定路径所属的「项目根」。与 `wyj_config::project_config_dir` 共用同一
+/// 根解析，保证会话、权限、MCP 信任和 `.wyj-code` 资源始终按同一项目分组。
 pub fn project_root(path: &Path) -> PathBuf {
-    let mut dir = Some(path);
-    while let Some(d) = dir {
-        if d.join(".git").exists() {
-            return d.to_path_buf();
-        }
-        dir = d.parent();
-    }
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    wyj_config::project_root(path)
 }
 
 /// 项目的稳定标识：项目根目录名 + 路径哈希，可用作目录名或分组键。

@@ -2,6 +2,17 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.4.0]
+
+- **v1.4 computer-use 人机互不干扰架构**：默认改为稳定窗口目标 + macOS Accessibility/目标 PID 后台动作，不移动物理光标、不主动切换前台 App；旧全局 `computer` 降级为默认关闭的 foreground compatibility 工具，禁止从后台失败静默回退。
+- 新增 marker-based `InputArbiter`：精确排除自身合成事件，前台租约被人类输入立即撤销；后台动作按事件类型与目标窗口区域识别冲突，因此用户可持续在其它 App 输入/移动鼠标，只有碰到 Agent 目标窗口时才抢占。Event Tap、权限、锁屏或事件历史异常时失败关闭。
+- 新增 `window_capture list/capture`、`app_computer`、结构化安全错误、前台 PID 前后校验与会话内不兼容动作熔断；删除动作级“检测到用户输入，是否继续”暂停弹窗，headless/cron/子 Agent 无条件禁止旧前台接管。
+- `/computer` 扩展为完整只读诊断：AX/Input Monitoring、稳定窗口枚举、前台回退配置和本地路径/抢占/熔断计数，其中自动前台回退计数是恒零安全不变量。
+- computer-use 权限确认改为**项目级首次批准即记住**：`computer`/`app_computer` 首次按 y、Enter 或 a 后分别写入当前项目的 `allowed_tools.json`，同项目后续动作及重新打开项目不再弹窗，不同项目仍需独立确认；拒绝不落盘，普通工具的“允许一次”语义不变。
+- 项目 `.wyj-code/` 资源统一按 Git 仓库根自动发现：从任意子目录启动都能加载根目录的 `settings.toml`、`mcp.toml`、`skills/`、`agents/` 和 `installed.json`；Skill 同时支持 `name.md` 与标准 `name/SKILL.md`，目录式 Skill 内的 references/assets Markdown 不会误注册为额外命令。
+- 新增**项目级 MCP server 信任确认**：`.wyj-code/mcp.toml`/`.mcp.json` 里的 server 会被当子进程执行，随仓库 clone 落地即可能静默跑任意命令，因此改为按内容指纹首次需人工批准；批准记录落在仓库控制不到的 `~/.wyj-code/projects/<key>/`，TUI 面板确认，`wyj-code trust-mcp` 提供无 UI 场景下的手动批准入口，`-p`/headless/`schedule run` 未批准时静默跳过并提示。
+- `.wyj-code/settings.toml` 新增 `disabled_skills`/`disabled_mcp_servers`，按名字禁用 Skill/MCP（不限来源，覆盖六层合并链任意一层），与 lockfile 的 `enabled: false`（仅覆盖 `/extensions install` 装入的条目）互补。
+
 ## [1.3.3]
 
 - **新增 `/schedule` 定时任务系统**（TUI 面板 + CLI `wyj-code schedule {list,add,remove,enable,disable,sync,run}`，详见 `doc/plan/v1.3.3-plan.md`）：

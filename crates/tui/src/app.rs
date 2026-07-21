@@ -2360,10 +2360,13 @@ fn schedule_execute_menu_action(
             if let Some(id) = id {
                 if let Ok(exe) = std::env::current_exe() {
                     tokio::spawn(async move {
+                        // --manual 仅为兼容 v1.4 预发布 CLI；headless 前台接管
+                        // 已统一失败关闭，后台 app_computer 可与用户并行。
                         let _ = tokio::process::Command::new(exe)
                             .arg("schedule")
                             .arg("run")
                             .arg(&id)
+                            .arg("--manual")
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .status()
@@ -5149,6 +5152,11 @@ pub struct AppState {
     pub thinking_started: Option<std::time::Instant>,
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
+    /// 项目级 MCP server 信任确认：TUI 启动后台连接阶段检测到未信任的
+    /// `.wyj-code/mcp.toml`/`.mcp.json` server 时设置，只出现一次（不像
+    /// `PermissionDialog` 那样逐工具调用触发，因此不需要 oneshot 回传通道，
+    /// 直接在按键处理里调用 `wyj_store::project_trust::approve` 即可）。
+    pub pending_mcp_trust: Option<Vec<wyj_config::McpServerConfig>>,
     pub ask_question_dialog: Option<AskQuestionDialog>,
     /// ExitPlanMode 触发的计划批准对话框
     pub plan_dialog: Option<PlanApprovalDialog>,
@@ -5355,6 +5363,7 @@ impl AppState {
             thinking_started: None,
             is_thinking: false,
             permission_dialog: None,
+            pending_mcp_trust: None,
             ask_question_dialog: None,
             plan_dialog: None,
             exec_mode_confirm: None,
@@ -7609,12 +7618,17 @@ fn update_slash_completions(
     }
 }
 
+/// 未信任的项目级 server 被静默排除在外——一旦用户在信任确认面板里批准
+/// （`wyj_store::project_trust::approve`），下一次调用就会自然把它纳入
+/// desired 集合，`refresh_tui_mcp_runtime` 每帧都会调用这个函数，所以批准后
+/// 不需要额外触发重连，下一帧自动生效。
 fn effective_mcp_servers_for_runtime(
     cfg: &wyj_config::Config,
     cwd: &std::path::Path,
     local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
 ) -> Vec<wyj_config::McpServerConfig> {
-    let mut servers = wyj_store::mcp_install::effective_mcp_servers(cfg, cwd);
+    let (mut servers, _pending) =
+        wyj_store::mcp_install::effective_mcp_servers_trust_split(cfg, cwd);
     if let Some(local) = local_plugin {
         let mut names: std::collections::HashSet<String> =
             servers.iter().map(|server| server.name.clone()).collect();
@@ -7805,6 +7819,12 @@ async fn tui_main(
             .insert(mcp_cfg.name.clone(), McpConnStatus::Connecting);
     }
     mcp_runtime.reconcile(&initial_mcp_servers);
+
+    // 项目级 MCP server 首次信任确认：只在启动时检查一次（不像 MCP 连接状态
+    // 那样每帧刷新），弹窗见 render::draw_project_trust_panel + 下方按键处理。
+    if let wyj_store::TrustStatus::Pending(servers) = wyj_store::project_trust::trust_status(&cwd) {
+        state.pending_mcp_trust = Some(servers);
+    }
 
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
     let has_initial = !initial_messages.is_empty();
@@ -10103,7 +10123,8 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ③ 逐调用工具权限确认拦截：y/Enter=允许一次，a=始终允许，
+                    // ③ 工具权限确认拦截：一般工具 y/Enter=允许一次、a=始终允许；
+                    //    computer-use 的 y/Enter/a 均由 ToolCtx 记为项目级授权；
                     //    d/Esc/其它=拒绝。决策经 oneshot 回传给挂起的 Agent 回合。
                     if state.permission_dialog.is_some() {
                         use wyj_tools::PermissionDecision;
@@ -10136,6 +10157,36 @@ async fn tui_main(
                                     )));
                                 }
                             }
+                        }
+                        continue;
+                    }
+
+                    // 项目级 MCP server 信任确认拦截：y/Enter=信任并连接（写盘
+                    // 批准记录，下一帧 refresh_tui_mcp_runtime 会自动纳入并连接）；
+                    // n/Esc/其它=本次跳过（不写盘，下次启动会重新询问）。
+                    if state.pending_mcp_trust.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                if let Err(e) = wyj_store::project_trust::approve(&cwd) {
+                                    tracing::warn!("写入项目级 MCP 信任记录失败: {e}");
+                                }
+                                state.pending_mcp_trust = None;
+                                state.messages.push(ChatMessage::system(
+                                    "已信任并开始连接项目级 MCP server。".to_string(),
+                                ));
+                            }
+                            KeyCode::Char('n')
+                            | KeyCode::Char('N')
+                            | KeyCode::Esc
+                            | KeyCode::Char('d')
+                            | KeyCode::Char('D') => {
+                                state.pending_mcp_trust = None;
+                                state.messages.push(ChatMessage::system(
+                                    "已跳过，这些 server 本次不会连接（下次启动会重新询问）。"
+                                        .to_string(),
+                                ));
+                            }
+                            _ => {}
                         }
                         continue;
                     }

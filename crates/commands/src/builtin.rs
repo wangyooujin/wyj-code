@@ -668,7 +668,7 @@ impl Command for ComputerCmd {
         "/computer".to_string()
     }
     async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        use wyj_config::{Config, Provider};
+        use wyj_config::{Config, ForegroundFallback, Provider};
 
         let mut lines = vec![tr("computer.header")];
 
@@ -700,10 +700,104 @@ impl Command for ComputerCmd {
             lines.push(tr("computer.mode_custom"));
         }
 
+        let fallback = match cfg.computer_use.foreground_fallback {
+            ForegroundFallback::Disabled => "disabled",
+            ForegroundFallback::Ask => "ask",
+            ForegroundFallback::IdleOnly => "idle_only",
+        };
+        lines.push(tr_fmt(
+            "computer.foreground_policy",
+            &[
+                ("policy", fallback),
+                ("quiet_ms", &cfg.computer_use.quiet_period_ms.to_string()),
+                ("max_defer", &cfg.computer_use.max_defer_secs.to_string()),
+            ],
+        ));
+
+        #[cfg(target_os = "macos")]
+        {
+            lines.push(tr("computer.background_supported"));
+            if wyj_computer::accessibility::is_process_trusted() {
+                lines.push(tr("computer.ax_trusted"));
+            } else {
+                lines.push(tr("computer.ax_untrusted"));
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        lines.push(tr("computer.background_unavailable"));
+
         // 实时探测（截图/光标）即使工具未注册也照跑：既能帮用户提前定位权限
         // 问题（先解决系统权限，再切换 profile 满足注册条件），也不需要
         // 真的注册一份 ComputerTool 才能自检。
         if wyj_computer::SUPPORTED {
+            let initial_status = wyj_computer::activity::ensure_monitor();
+            if initial_status == wyj_computer::activity::InputMonitorStatus::Starting {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            match wyj_computer::activity::snapshot() {
+                Ok(snapshot) => {
+                    let idle = snapshot
+                        .external_idle_secs
+                        .map(|idle| format!("{idle:.2}"))
+                        .unwrap_or_else(|| "n/a".to_string());
+                    lines.push(tr_fmt(
+                        "computer.input_monitor",
+                        &[
+                            ("status", snapshot.monitor_status.label()),
+                            ("idle", &idle),
+                            (
+                                "seq",
+                                &snapshot
+                                    .external_event_seq
+                                    .map(|seq| seq.to_string())
+                                    .unwrap_or_else(|| "n/a".to_string()),
+                            ),
+                        ],
+                    ));
+                    if let Some(error) = snapshot.monitor_error {
+                        lines.push(tr_fmt("computer.input_monitor_error", &[("err", &error)]));
+                    }
+                }
+                Err(error) => lines.push(tr_fmt(
+                    "computer.input_monitor_error",
+                    &[("err", &error.to_string())],
+                )),
+            }
+
+            match wyj_computer::target::list_windows() {
+                Ok(windows) => lines.push(tr_fmt(
+                    "computer.window_count",
+                    &[("count", &windows.len().to_string())],
+                )),
+                Err(error) => lines.push(tr_fmt(
+                    "computer.window_error",
+                    &[("err", &error.to_string())],
+                )),
+            }
+
+            let metrics = wyj_computer::telemetry::snapshot();
+            lines.push(tr_fmt(
+                "computer.telemetry_paths",
+                &[
+                    ("background", &metrics.background_actions.to_string()),
+                    ("targeted", &metrics.targeted_pid_events.to_string()),
+                    ("foreground", &metrics.foreground_actions.to_string()),
+                    (
+                        "auto_fallback",
+                        &metrics.automatic_foreground_fallbacks.to_string(),
+                    ),
+                ],
+            ));
+            lines.push(tr_fmt(
+                "computer.telemetry_guards",
+                &[
+                    ("preempted", &metrics.preempted_by_user.to_string()),
+                    ("changed", &metrics.target_changed.to_string()),
+                    ("requires", &metrics.requires_foreground.to_string()),
+                    ("fuses", &metrics.background_focus_fuses.to_string()),
+                ],
+            ));
+
             match wyj_computer::primary_display_size() {
                 Ok(d) => {
                     let (tw, th) = wyj_computer::scale::fit_within(
@@ -836,6 +930,13 @@ impl Command for InitCmd {
         "/init".to_string()
     }
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        // 骨架创建是确定性代码，不依赖 LLM：先确保 .wyj-code/ 目录 + 带注释的
+        // 空 mcp.toml/settings.toml 模板存在（已存在则不动，防止覆盖用户已填
+        // 内容），再触发 agent 回合生成/合并 CLAUDE.md。失败按 best-effort
+        // 处理——骨架初始化是锦上添花，不应该让 /init 的核心功能（生成
+        // CLAUDE.md）因为这一步失败而整体失败。
+        ensure_project_config_skeleton(&ctx.cwd);
+
         // 对齐真实 Claude Code：/init 不是静态模板写文件，而是触发一次真正的 agent
         // 回合，让它自己去探索项目（Cargo.toml/package.json/README/目录结构等）
         // 生成或合并改进 CLAUDE.md。已存在则要求读取后合并而非整体覆盖。
@@ -844,6 +945,115 @@ impl Command for InitCmd {
             &[("cwd", &ctx.cwd.display().to_string())],
         );
         Ok(CommandResult::RunPrompt(prompt))
+    }
+}
+
+const PROJECT_MCP_TEMPLATE: &str = r#"# 项目级 MCP server 定义（随仓库共享，团队成员克隆后自动生效）。
+# 格式与全局 ~/.wyj-code/config.toml 的 [[mcp_servers]] 段一致，同名覆盖全局配置。
+# 首次连接前需要在 TUI 里确认信任（防止克隆到陌生仓库时静默执行任意命令）。
+#
+# [[mcp_servers]]
+# name = "postgres"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-postgres"]
+
+mcp_servers = []
+"#;
+
+const PROJECT_SETTINGS_TEMPLATE: &str = r#"# 项目级开关：控制本项目禁用哪些 skill / MCP server（按名字禁用，无论
+# 条目来源——六层合并链任意一层、手写进 mcp.toml 的条目均适用）。
+# 不影响 skill 文件内容或 mcp.toml 里的 server 定义本身，只是一层开关。
+#
+# disabled_skills = ["some-skill-name"]
+# disabled_mcp_servers = ["some-server-name"]
+
+disabled_skills = []
+disabled_mcp_servers = []
+"#;
+
+/// 确保 `<git-root>/.wyj-code/` 目录 + 带注释的空 `mcp.toml`/`settings.toml` 模板存在。
+/// 幂等：已存在的文件不覆盖。不预建空的 `skills/`/`agents/` 子目录——Git 不
+/// 追踪空目录，预建了也不会随 `/init` 一起被提交，等真正需要时由既有的
+/// `skill_install.rs` 等惰性 `create_dir_all` 即可。
+fn ensure_project_config_skeleton(cwd: &std::path::Path) {
+    let dir = wyj_config::project_config_dir(cwd);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("创建项目配置目录失败: {e}");
+        return;
+    }
+    let mcp_path = dir.join("mcp.toml");
+    if !mcp_path.exists() {
+        if let Err(e) = std::fs::write(&mcp_path, PROJECT_MCP_TEMPLATE) {
+            tracing::warn!("写入 mcp.toml 模板失败: {e}");
+        }
+    }
+    let settings_path = dir.join("settings.toml");
+    if !settings_path.exists() {
+        if let Err(e) = std::fs::write(&settings_path, PROJECT_SETTINGS_TEMPLATE) {
+            tracing::warn!("写入 settings.toml 模板失败: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn creates_skeleton_files_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_project_config_skeleton(dir.path());
+
+        let mcp_path = dir.path().join(".wyj-code").join("mcp.toml");
+        let settings_path = dir.path().join(".wyj-code").join("settings.toml");
+        assert!(mcp_path.exists());
+        assert!(settings_path.exists());
+
+        // 生成的模板必须是合法可解析的 TOML，且是空配置（不预设任何 server/开关）。
+        let servers = wyj_config::load_project_mcp(dir.path()).unwrap();
+        assert!(servers.is_empty());
+        let settings = wyj_config::load_project_settings(dir.path()).unwrap();
+        assert!(settings.disabled_skills.is_empty());
+        assert!(settings.disabled_mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn does_not_overwrite_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        wyj_config::save_project_mcp(
+            dir.path(),
+            &[wyj_config::McpServerConfig {
+                name: "existing".to_string(),
+                transport: wyj_config::McpTransport::Stdio,
+                command: Some("npx".to_string()),
+                args: vec![],
+                env: Default::default(),
+                url: None,
+                headers: Default::default(),
+            }],
+        )
+        .unwrap();
+
+        ensure_project_config_skeleton(dir.path());
+
+        let servers = wyj_config::load_project_mcp(dir.path()).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "existing");
+    }
+
+    #[test]
+    fn init_from_nested_cwd_creates_skeleton_at_git_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let nested = repo.path().join("crates").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        ensure_project_config_skeleton(&nested);
+
+        assert!(repo.path().join(".wyj-code").join("mcp.toml").exists());
+        assert!(repo.path().join(".wyj-code").join("settings.toml").exists());
+        assert!(!nested.join(".wyj-code").exists());
     }
 }
 

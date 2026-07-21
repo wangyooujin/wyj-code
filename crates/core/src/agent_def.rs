@@ -372,6 +372,33 @@ mod tests {
     }
 
     #[test]
+    fn nested_cwd_loads_project_agent_from_git_root() {
+        let repo = std::env::temp_dir().join(format!(
+            "wyj-agentdef-nested-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let agents_dir = repo.join(".wyj-code").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("auditor.md"),
+            "---\nname: auditor\ndescription: 项目审计 Agent\n---\nbody",
+        )
+        .unwrap();
+        let nested = repo.join("crates").join("core");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let defs = load_agent_defs(&nested, &[]);
+        let auditor = defs.iter().find(|d| d.name == "auditor").unwrap();
+        assert_eq!(auditor.description, "项目审计 Agent");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
     fn project_claude_agents_shadow_project_wyj_agents() {
         let cwd = std::env::temp_dir().join(format!("wyj-agentdef-shadow-{}", std::process::id()));
         let wyj_agents_dir = cwd.join(".wyj-code").join("agents");

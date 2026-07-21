@@ -40,6 +40,43 @@ pub fn clamp_region(
     (cx0, cy0, cx1 - cx0, cy1 - cy0)
 }
 
+/// 把一个已经在"点"（逻辑坐标系，即 `Monitor::width()/height()` 这类 macOS
+/// API 报告的单位）下钳制好的裁剪矩形，按 `logical_dim -> pixel_dim` 的比例
+/// 换算成"像素"坐标系（即截图实际拿到的原生 `RgbaImage` 尺寸）下的裁剪矩形，
+/// 并再钳一次到真实像素图边界内（防止四舍五入把裁剪框推出边界）。
+///
+/// **背景**：Retina/HiDPI 显示器上 macOS 的 `CGDisplayBounds`（`Monitor::
+/// width()/height()`）报告的是"点"，通常是原生像素的一半（2x scale）；而
+/// `CGWindowListCreateImage` 截到的图像是原生像素分辨率。点击坐标系统一
+/// 用"点"（`enigo`/`CGEvent` 全局光标坐标系本就是"点"，这部分是对的，不用
+/// 改），但如果直接拿"点"坐标去裁剪"像素"图，只会裁到真实区域的一部分
+/// （scale_factor=2 时仅裁到 1/4 面积），造成截图内容缺失——这正是
+/// `capture_region`（zoom 动作）需要这层换算的原因。
+pub fn scale_region_to_pixels(
+    region: (u32, u32, u32, u32),
+    logical_size: (u32, u32),
+    pixel_size: (u32, u32),
+) -> (u32, u32, u32, u32) {
+    let (cx0, cy0, crop_w, crop_h) = region;
+    let (logical_width, logical_height) = logical_size;
+    let (pixel_width, pixel_height) = pixel_size;
+    if logical_width == 0 || logical_height == 0 || pixel_width == 0 || pixel_height == 0 {
+        // 无法换算比例：原样返回，调用方对真实图像再钳一次边界，不会 panic。
+        return (cx0, cy0, crop_w.max(1), crop_h.max(1));
+    }
+    let sx = pixel_width as f64 / logical_width as f64;
+    let sy = pixel_height as f64 / logical_height as f64;
+    let px_x0 = ((cx0 as f64 * sx).round() as u32).min(pixel_width.saturating_sub(1));
+    let px_y0 = ((cy0 as f64 * sy).round() as u32).min(pixel_height.saturating_sub(1));
+    let px_w = ((crop_w as f64 * sx).round().max(1.0) as u32)
+        .min(pixel_width.saturating_sub(px_x0))
+        .max(1);
+    let px_h = ((crop_h as f64 * sy).round().max(1.0) as u32)
+        .min(pixel_height.saturating_sub(px_y0))
+        .max(1);
+    (px_x0, px_y0, px_w, px_h)
+}
+
 /// 物理像素坐标 ↔ 目标（下采样后，发给模型的）坐标空间换算器。
 #[derive(Debug, Clone, Copy)]
 pub struct CoordScaler {
@@ -129,6 +166,57 @@ mod tests {
         assert_eq!(fit_within(0, 600, 1280), (0, 600));
         assert_eq!(fit_within(800, 0, 1280), (800, 0));
         assert_eq!(fit_within(800, 600, 0), (800, 600));
+    }
+
+    #[test]
+    fn scale_region_to_pixels_is_identity_at_scale_factor_one() {
+        // 非 Retina 外接显示器（点=像素，scale_factor=1）：坐标原样通过。
+        assert_eq!(
+            scale_region_to_pixels((100, 200, 300, 300), (1920, 1080), (1920, 1080)),
+            (100, 200, 300, 300)
+        );
+    }
+
+    #[test]
+    fn scale_region_to_pixels_doubles_at_retina_scale_factor() {
+        // 复现真实 bug 场景：2x Retina 屏，点分辨率 1512x982，像素分辨率
+        // 3024x1964。请求"全屏"区域（点坐标系下 0,0 到 1512,982）必须换算
+        // 到完整的像素图范围 3024x1964，而不是被误当成像素坐标直接使用
+        // （那样只会裁到左上角 1512x982 像素，即真实区域的 1/4 面积）。
+        assert_eq!(
+            scale_region_to_pixels((0, 0, 1512, 982), (1512, 982), (3024, 1964)),
+            (0, 0, 3024, 1964)
+        );
+    }
+
+    #[test]
+    fn scale_region_to_pixels_scales_a_partial_region_proportionally() {
+        // 点坐标系下的一个 200x150 局部区域，起点 (100,100)，2x 缩放后应变成
+        // 像素坐标系下起点 (200,200)、尺寸 400x300——而不是原样的 200x150
+        // （原样使用正是 bug：只截到应有面积的 1/4）。
+        assert_eq!(
+            scale_region_to_pixels((100, 100, 200, 150), (1512, 982), (3024, 1964)),
+            (200, 200, 400, 300)
+        );
+    }
+
+    #[test]
+    fn scale_region_to_pixels_clamps_rounding_overshoot_to_pixel_bounds() {
+        // 起点贴着点坐标系右下边界时，四舍五入换算不能把裁剪框推出真实像素
+        // 图边界（会导致 crop_imm 越界 panic）。
+        let (x, y, w, h) = scale_region_to_pixels((1511, 981, 1, 1), (1512, 982), (3024, 1964));
+        assert!(x + w <= 3024);
+        assert!(y + h <= 1964);
+    }
+
+    #[test]
+    fn scale_region_to_pixels_falls_back_to_input_when_logical_dim_is_zero() {
+        // 无法换算比例（点分辨率读取失败/为 0）时原样返回，调用方对真实像素图
+        // 再钳一次边界即可安全兜底，不应在这里 panic 或产生 0 宽/高矩形。
+        assert_eq!(
+            scale_region_to_pixels((10, 10, 50, 50), (0, 0), (3024, 1964)),
+            (10, 10, 50, 50)
+        );
     }
 
     #[test]

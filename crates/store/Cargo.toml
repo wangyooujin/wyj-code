@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 wyj-config.workspace = true
+wyj-core.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -5,7 +5,14 @@
 //! （含 Linux，v1.3.0 不支持）编译进 [`unsupported`] 桩实现，保证 workspace
 //! 整体可跨平台编译。详见 doc/plan/v1.3.0-plan.md。
 
+#[cfg(target_os = "macos")]
+pub mod accessibility;
+pub mod activity;
 pub mod scale;
+pub mod target;
+#[cfg(target_os = "macos")]
+pub mod targeted_event;
+pub mod telemetry;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod backend;
@@ -87,6 +94,13 @@ pub fn capture_primary(max_dim: u32) -> Result<Capture> {
 /// 裁剪区域通常远小于整屏，因此能拿到比全屏缩略图高得多的有效分辨率。
 pub fn capture_region(x0: i32, y0: i32, x1: i32, y1: i32, max_dim: u32) -> Result<Capture> {
     imp::capture_region(x0, y0, x1, y1, max_dim)
+}
+
+/// 按窗口标题/所属 App 名称（不区分大小写，包含匹配）查找一个未最小化的
+/// 窗口并截图，不要求该窗口在前台——只解决截图侧的免打扰问题（"只读观察"
+/// 场景），不解决点击/输入，见 `tools::window_capture::WindowCaptureTool`。
+pub fn capture_window_by_name(query: &str, max_dim: u32) -> Result<Capture> {
+    imp::capture_window_by_name(query, max_dim)
 }
 
 /// 当前鼠标位置（物理像素坐标系；用于失控角检测）。

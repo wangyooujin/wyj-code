@@ -95,6 +95,11 @@ pub trait ToolContext: Send + Sync {
     async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
         true
     }
+    /// 当前上下文是否有真实人类交互通道。前台 computer-use 接管必须依赖
+    /// 这个信号；headless/cron/子 Agent 默认 false，不得把无 UI 当成批准。
+    fn supports_interactive_confirmation(&self) -> bool {
+        false
+    }
 }
 
 /// 单次工具调用的元信息（供需要关联 `tool_use_id` 的工具使用，如 SubAgent

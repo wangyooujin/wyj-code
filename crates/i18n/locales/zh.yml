@@ -77,6 +77,7 @@ cli:
   subagent_trace_session_id_help: "会话 id（如 sess-1719723000）"
   subagent_trace_sub_id_help: "子 Agent id（Hub 分配的数字，如 3；留空则列出该会话全部子 Agent 概览）"
   subagent_trace_json_help: "直接输出原始 JSONL（供管道处理），仅在指定了子 Agent id 时生效"
+  trust_mcp_about: "批准当前项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）的信任确认，供配置定时任务前手动批准"
 
 update:
   checking: "正在检查最新版本…"
@@ -136,7 +137,7 @@ help:
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
-    - `/init` — 让 Agent 探索项目并生成/合并更新 CLAUDE.md
+    - `/init` — 让 Agent 探索项目并生成/合并更新 CLAUDE.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
     - `/bug [简述]` — 在浏览器打开本仓库 GitHub issue 页并预填环境信息（零依赖）
     - `/review [PR编号]` — 拉取 PR diff 交给 Agent 审查（需已安装 gh CLI）
     - `/pr-comments [PR编号]` — 查看指定 PR 的评论（需已安装 gh CLI）
@@ -514,6 +515,17 @@ computer:
   not_registered_provider: "  ✗  工具注册    未启用（当前 provider={provider}，computer-use 仅在 Anthropic 协议下可用）"
   mode_native: "  ✓  工具注册    已启用（原生模式，官方 Anthropic 端点）"
   mode_custom: "  ✓  工具注册    已启用（custom 模式，第三方 Anthropic 协议兼容端点，如 MiniMax/GLM/Kimi）"
+  background_supported: "  ✓  后台操作    app_computer 可用（稳定窗口 + macOS Accessibility/目标 PID）"
+  background_unavailable: "  ℹ️  后台操作    当前平台尚未实现 app_computer；不会静默回退前台"
+  ax_trusted: "  ✓  辅助功能    已授权，可执行后台 AX 语义动作"
+  ax_untrusted: "  ✗  辅助功能    未授权；请在 系统设置 → 隐私与安全性 → 辅助功能 中启用 wyj-code"
+  foreground_policy: "  ℹ️  前台回退    {policy}（安静期 {quiet_ms}ms，最长等待 {max_defer}s）"
+  input_monitor: "  ℹ️  输入仲裁    {status}（外部输入空闲 {idle}s，事件序号 {seq}）"
+  input_monitor_error: "  ✗  输入仲裁    {err}"
+  window_count: "  ✓  稳定窗口    枚举成功（{count} 个可见窗口）"
+  window_error: "  ✗  稳定窗口    枚举失败: {err}"
+  telemetry_paths: "  ℹ️  本地路径计数 后台={background}，目标PID={targeted}，前台={foreground}，自动回退={auto_fallback}"
+  telemetry_guards: "  ℹ️  安全边界计数 用户抢占={preempted}，目标变化={changed}，需接管={requires}，焦点熔断={fuses}"
   display_ok: "  ✓  主屏尺寸    {pw}x{ph} 物理像素 -> {tw}x{th} 目标分辨率"
   display_err: "  ✗  主屏尺寸    探测失败: {err}"
   screenshot_ok: "  ✓  截图自检    成功（{bytes} 字节，缩略到 64px）"
@@ -549,7 +561,7 @@ cwd:
   body: "工作目录: {cwd}"
 
 init:
-  desc: "让 Agent 探索项目并生成/合并更新 CLAUDE.md"
+  desc: "让 Agent 探索项目并生成/合并更新 CLAUDE.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在"
   agent_prompt: |-
     请为当前项目生成或更新 CLAUDE.md 记忆文件（工作目录：{cwd}）。
 
@@ -605,7 +617,10 @@ dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
   permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
-  permission_hint_session_scoped: "  [y] 允许一次   [a] 始终允许（仅本会话）   [d] 拒绝并说明   (Esc 拒绝)"
+  permission_hint_project_once: "  [y/a] 允许本项目（后续不再询问）   [d] 拒绝并说明   (Esc 拒绝)"
+  project_trust_title: " ⚠ 项目级 MCP server 待信任确认 "
+  project_trust_intro: "以下项目级 MCP server 会被当作子进程执行，请确认信任后再连接："
+  project_trust_hint: "  [y] 信任并连接   [n/Esc] 本次跳过（下次启动会再次询问）"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "
   ask_question_other_label: "其他…"

@@ -312,8 +312,10 @@ pub fn save_project(cwd: &Path, manifest: &InstalledManifest) -> Result<()> {
     save_to(&project_lockfile_path(cwd), manifest)
 }
 
-/// 汇总全局 + 项目 lockfile 里 `enabled == false` 的 skill 名称，供
-/// `crates/commands::skill::load_skills` 过滤禁用项。
+/// 汇总全局 + 项目 lockfile 里 `enabled == false` 的 skill 名称，再 union
+/// 项目级 `.wyj-code/settings.toml` 的 `disabled_skills`（按名字禁用，无论
+/// 条目来源——手动丢进 `.wyj-code/skills/` 的文件没有 lockfile 记录，只能
+/// 靠这层开关禁用），供 `crates/commands::skill::load_skills` 过滤禁用项。
 pub fn disabled_skill_names(cwd: &Path) -> HashSet<String> {
     let mut disabled = HashSet::new();
     if let Ok(global) = load_global() {
@@ -334,10 +336,15 @@ pub fn disabled_skill_names(cwd: &Path) -> HashSet<String> {
                 .map(|s| s.name.clone()),
         );
     }
+    if let Ok(settings) = wyj_config::load_project_settings(cwd) {
+        disabled.extend(settings.disabled_skills);
+    }
     disabled
 }
 
-/// 汇总全局 + 项目 lockfile 里 `enabled == false` 的 MCP server 名称，供
+/// 汇总全局 + 项目 lockfile 里 `enabled == false` 的 MCP server 名称，再
+/// union 项目级 `.wyj-code/settings.toml` 的 `disabled_mcp_servers`（同上，
+/// 覆盖手写进 `mcp.toml` 而未经 `/extensions install` 的条目），供
 /// `mcp_install::effective_mcp_servers` 过滤禁用项。
 pub fn disabled_mcp_names(cwd: &Path) -> HashSet<String> {
     let mut disabled = HashSet::new();
@@ -358,6 +365,9 @@ pub fn disabled_mcp_names(cwd: &Path) -> HashSet<String> {
                 .filter(|s| !s.enabled)
                 .map(|s| s.name.clone()),
         );
+    }
+    if let Ok(settings) = wyj_config::load_project_settings(cwd) {
+        disabled.extend(settings.disabled_mcp_servers);
     }
     disabled
 }
@@ -523,6 +533,28 @@ mod tests {
         assert_eq!(disabled.len(), 1);
         assert!(disabled.contains("disabled-skill"));
         assert!(!disabled.contains("enabled-skill"));
+    }
+
+    /// `disabled_skill_names`/`disabled_mcp_names` 也读全局 lockfile（真实
+    /// `~/.wyj-code/installed.json`），断言用 `contains` 而非 `len`/`==`，
+    /// 避免受运行测试的机器上已有全局条目影响而变得不确定。
+    #[test]
+    fn disabled_names_union_project_settings_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        wyj_config::save_project_settings(
+            dir.path(),
+            &wyj_config::ProjectSettings {
+                disabled_skills: vec!["hand-dropped-skill".to_string()],
+                disabled_mcp_servers: vec!["hand-written-server".to_string()],
+            },
+        )
+        .unwrap();
+
+        let disabled_skills = disabled_skill_names(dir.path());
+        assert!(disabled_skills.contains("hand-dropped-skill"));
+
+        let disabled_mcp = disabled_mcp_names(dir.path());
+        assert!(disabled_mcp.contains("hand-written-server"));
     }
 
     #[test]
