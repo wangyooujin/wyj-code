@@ -11,7 +11,10 @@
 fn main() -> anyhow::Result<()> {
     let windows = wyj_computer::target::list_windows()?;
     for w in windows {
-        println!("app={:?} title={:?} focused={}", w.app_name, w.title, w.focused);
+        println!(
+            "app={:?} title={:?} focused={}",
+            w.app_name, w.title, w.focused
+        );
     }
     Ok(())
 }

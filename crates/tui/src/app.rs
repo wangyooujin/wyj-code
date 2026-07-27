@@ -8,7 +8,7 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -4885,6 +4885,66 @@ fn encode_rgba_to_png(bytes: &[u8], width: u32, height: u32) -> anyhow::Result<V
     Ok(buf)
 }
 
+#[derive(Debug)]
+enum ClipboardPaste {
+    Image {
+        data: String,
+        width: usize,
+        height: usize,
+    },
+    Text(String),
+}
+
+/// 直接读取系统剪贴板。
+///
+/// 终端的 bracketed paste 只会为文本产生 `Event::Paste`；纯图片剪贴板不会触发
+/// 该事件，因此 Ctrl+V 必须由应用主动读取剪贴板。图片优先，和原有
+/// `Event::Paste` 路径保持一致。
+fn read_system_clipboard() -> Option<ClipboardPaste> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+
+    if let Ok(image) = clipboard.get_image() {
+        let png_bytes =
+            encode_rgba_to_png(&image.bytes, image.width as u32, image.height as u32).ok()?;
+        use base64::Engine as _;
+        return Some(ClipboardPaste::Image {
+            data: base64::engine::general_purpose::STANDARD.encode(png_bytes),
+            width: image.width,
+            height: image.height,
+        });
+    }
+
+    clipboard
+        .get_text()
+        .ok()
+        .filter(|text| !text.is_empty())
+        .map(ClipboardPaste::Text)
+}
+
+/// bracketed paste 已经携带可靠的文本内容；这里只额外探测同一剪贴板是否为图片。
+fn read_clipboard_image() -> Option<ClipboardPaste> {
+    match read_system_clipboard() {
+        image @ Some(ClipboardPaste::Image { .. }) => image,
+        Some(ClipboardPaste::Text(_)) | None => None,
+    }
+}
+
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok().filter(|text| !text.is_empty())
+}
+
+fn is_clipboard_paste_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('v' | 'V'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::SUPER))
+}
+
+/// 单行文字直接留在输入框即可；只有真正包含换行的批量粘贴才需要瞬时提示。
+fn pasted_text_needs_hint(text: &str) -> bool {
+    text.contains('\n')
+}
+
 /// 判断粘贴文本是否像文件路径（绝对路径或以 ~/ ./ 开头，单行）
 fn looks_like_file_path(s: &str) -> bool {
     let s = s.trim();
@@ -4920,6 +4980,209 @@ pub(crate) struct PasteHint {
 }
 
 const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
+
+fn apply_clipboard_paste(
+    state: &mut AppState,
+    input: &mut InputBox,
+    paste: ClipboardPaste,
+) -> Option<PasteHint> {
+    let expires_at = Instant::now() + PASTE_HINT_DURATION;
+    match paste {
+        ClipboardPaste::Image {
+            data,
+            width,
+            height,
+        } => {
+            let already_attached = state.pending_attachments.iter().any(|attachment| {
+                matches!(attachment, Attachment::Image { data: existing, .. } if existing == &data)
+            });
+            if !already_attached {
+                state.pending_attachments.push(Attachment::Image {
+                    media_type: "image/png".to_string(),
+                    data,
+                    preview_label: format!("{width}×{height}"),
+                });
+            }
+            // 图片会以持久的 `[Image]` 占位显示在输入框里，不再叠加瞬时提示。
+            None
+        }
+        ClipboardPaste::Text(pasted) => {
+            if let Some(path) = try_resolve_path(pasted.trim()) {
+                let already_attached = state.pending_attachments.iter().any(
+                    |attachment| matches!(attachment, Attachment::File { path: existing } if existing == &path),
+                );
+                if !already_attached {
+                    state.pending_attachments.push(Attachment::File { path });
+                }
+                // 文件也由输入框内的持久占位符确认，不需要瞬时提示。
+                None
+            } else {
+                input.insert_text(&pasted);
+                pasted_text_needs_hint(&pasted).then(|| PasteHint {
+                    text: format!(
+                        "[{}]",
+                        wyj_i18n::tr_fmt(
+                            "input.paste_text",
+                            &[("count", &pasted.chars().count().to_string())]
+                        )
+                    ),
+                    expires_at,
+                    cursor_row: input.cursor_row,
+                    cursor_col: input.cursor_col,
+                })
+            }
+        }
+    }
+}
+
+fn composer_has_content(state: &AppState, input: &InputBox) -> bool {
+    !input.is_empty() || !state.pending_attachments.is_empty()
+}
+
+fn clear_composer(state: &mut AppState, input: &mut InputBox) {
+    *input = InputBox::new();
+    state.pending_attachments.clear();
+    state.paste_hint = None;
+    state.slash_completions.clear();
+    state.file_completions.clear();
+    state.history_idx = None;
+    state.history_draft = None;
+}
+
+#[cfg(test)]
+mod clipboard_paste_tests {
+    use super::*;
+    use wyj_tools::SubAgentHub;
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(SubAgentHub::new()),
+        )
+    }
+
+    #[test]
+    fn ctrl_or_super_v_is_an_explicit_clipboard_paste() {
+        assert!(is_clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert!(is_clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::SUPER,
+        )));
+        assert!(!is_clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!is_clipboard_paste_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+    }
+
+    #[test]
+    fn text_paste_hint_is_only_created_for_multiple_lines() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+
+        let hint = apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Text("单行文字".to_string()),
+        );
+        assert!(hint.is_none());
+        assert_eq!(input.display_lines(), &["单行文字"]);
+
+        let hint = apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Text("\n第二行".to_string()),
+        );
+        assert!(hint.is_some());
+        assert_eq!(input.display_lines(), &["单行文字", "第二行"]);
+    }
+
+    #[test]
+    fn image_paste_creates_an_in_memory_attachment() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+
+        let hint = apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "encoded-png".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+
+        assert!(hint.is_none());
+        assert!(matches!(
+            state.pending_attachments.as_slice(),
+            [Attachment::Image {
+                media_type,
+                data,
+                preview_label,
+            }] if media_type == "image/png"
+                && data == "encoded-png"
+                && preview_label == "320×180"
+        ));
+
+        let duplicate_hint = apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "encoded-png".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+        assert!(duplicate_hint.is_none());
+        assert_eq!(state.pending_attachments.len(), 1);
+    }
+
+    #[test]
+    fn clearing_composer_removes_text_and_attachments_together() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("draft");
+        state.pending_attachments.push(Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded-png".to_string(),
+            preview_label: "320×180".to_string(),
+        });
+
+        assert!(composer_has_content(&state, &input));
+        clear_composer(&mut state, &mut input);
+
+        assert!(input.is_empty());
+        assert!(state.pending_attachments.is_empty());
+        assert!(!composer_has_content(&state, &input));
+    }
+
+    #[test]
+    fn attachment_only_composer_is_sendable() {
+        let mut state = make_state();
+        let input = InputBox::new();
+        state.pending_attachments.push(Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded-png".to_string(),
+            preview_label: "320×180".to_string(),
+        });
+
+        assert!(composer_has_content(&state, &input));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatSelectionAnchor {
@@ -5209,7 +5472,6 @@ pub struct AppState {
     pub current_task: Option<AbortHandle>,
     pub ctrl_c_pressed: bool,
     pub last_ctrl_c: Option<Instant>,
-    pub last_esc: Option<Instant>,
     /// Slash 命令补全候选列表（命令名, 描述）
     pub slash_completions: Vec<(String, String)>,
     /// 当前选中的补全项索引
@@ -5394,7 +5656,6 @@ impl AppState {
             current_task: None,
             ctrl_c_pressed: false,
             last_ctrl_c: None,
-            last_esc: None,
             slash_completions: vec![],
             slash_selected: 0,
             input_history: vec![],
@@ -8023,95 +8284,12 @@ async fn tui_main(
                         continue;
                     }
 
-                    let expires_at = Instant::now() + PASTE_HINT_DURATION;
-                    let mut hint: Option<PasteHint> = None;
-
-                    // 优先检查剪贴板是否有图片
-                    let has_image = match arboard::Clipboard::new() {
-                        Ok(mut cb) => match cb.get_image() {
-                            Ok(img) => {
-                                match encode_rgba_to_png(
-                                    &img.bytes,
-                                    img.width as u32,
-                                    img.height as u32,
-                                ) {
-                                    Ok(png_bytes) => {
-                                        use base64::Engine as _;
-                                        let b64 = base64::engine::general_purpose::STANDARD
-                                            .encode(&png_bytes);
-                                        let label = format!("{}×{}", img.width, img.height);
-                                        state.pending_attachments.push(Attachment::Image {
-                                            media_type: "image/png".to_string(),
-                                            data: b64,
-                                            preview_label: label,
-                                        });
-                                        let text = format!(
-                                            "[{}]",
-                                            wyj_i18n::tr_fmt(
-                                                "input.paste_image",
-                                                &[
-                                                    ("width", &img.width.to_string()),
-                                                    ("height", &img.height.to_string()),
-                                                ]
-                                            )
-                                        );
-                                        hint = Some(PasteHint {
-                                            text,
-                                            expires_at,
-                                            cursor_row: input.cursor_row,
-                                            cursor_col: input.cursor_col,
-                                        });
-                                        true
-                                    }
-                                    Err(_) => false,
-                                }
-                            }
-                            Err(_) => false,
-                        },
-                        Err(_) => false,
-                    };
-
-                    if !has_image {
-                        // 文件路径检测
-                        if let Some(path) = try_resolve_path(pasted.trim()) {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| path.display().to_string());
-                            state.pending_attachments.push(Attachment::File { path });
-                            let text = format!(
-                                "[{}]",
-                                wyj_i18n::tr_fmt("input.paste_file", &[("name", &name)])
-                            );
-                            hint = Some(PasteHint {
-                                text,
-                                expires_at,
-                                cursor_row: input.cursor_row,
-                                cursor_col: input.cursor_col,
-                            });
-                        } else {
-                            // 普通文字粘贴
-                            input.insert_text(&pasted);
-                            update_slash_completions(&mut state, &input, &cmd_registry);
-                            if !pasted.is_empty() {
-                                let count = pasted.chars().count().to_string();
-                                let text = format!(
-                                    "[{}]",
-                                    wyj_i18n::tr_fmt("input.paste_text", &[("count", &count)])
-                                );
-                                hint = Some(PasteHint {
-                                    text,
-                                    expires_at,
-                                    cursor_row: input.cursor_row,
-                                    cursor_col: input.cursor_col,
-                                });
-                            }
-                        }
-                    }
-
-                    if let Some(h) = hint {
-                        state.paste_hint = Some(h);
-                    }
+                    // 文本 bracketed paste 和应用直读 Ctrl+V 共用同一套附件/文字逻辑。
+                    // 这里仍优先探测图片，以兼容同时暴露图片与文本 flavor 的剪贴板。
+                    let paste = read_clipboard_image().unwrap_or(ClipboardPaste::Text(pasted));
+                    state.paste_hint = apply_clipboard_paste(&mut state, &mut input, paste);
+                    update_slash_completions(&mut state, &input, &cmd_registry);
+                    update_file_completions(&mut state, &input, &cwd);
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_focus_lines(-3),
@@ -8585,6 +8763,15 @@ async fn tui_main(
                             KeyCode::End => {
                                 if let Some(ib) = owner.live_input_mut(&mut state) {
                                     ib.move_to_end_of_line();
+                                }
+                            }
+                            _ if is_clipboard_paste_key(key) => {
+                                // 配置输入框不接受图片附件，但 Ctrl+V 仍应粘贴文字，
+                                // 不能像此前那样把快捷键误写成一个字面量 `v`。
+                                if let Some(text) = read_clipboard_text() {
+                                    if let Some(ib) = owner.live_input_mut(&mut state) {
+                                        ib.insert_text(&text);
+                                    }
                                 }
                             }
                             KeyCode::Char(c) => {
@@ -10274,10 +10461,8 @@ async fn tui_main(
                     {
                         if state.is_thinking {
                             state.interrupt();
-                        } else if !input.is_empty() {
-                            input = InputBox::new();
-                            state.slash_completions.clear();
-                            state.file_completions.clear();
+                        } else if composer_has_content(&state, &input) {
+                            clear_composer(&mut state, &mut input);
                             state.ctrl_c_pressed = false;
                             state.last_ctrl_c = None;
                         } else if state.ctrl_c_pressed {
@@ -10289,27 +10474,15 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ESC → 中断 Agent / 连按两次清空输入框
+                    // ESC → 中断 Agent / 空闲时一次清空当前输入草稿（文字 + 附件）
                     if key.code == KeyCode::Esc {
                         if state.close_panel_focus() {
                             continue;
                         }
                         if state.is_thinking {
                             state.interrupt();
-                            state.last_esc = None;
-                        } else {
-                            let double_esc = state
-                                .last_esc
-                                .map(|t| t.elapsed() < Duration::from_millis(500))
-                                .unwrap_or(false);
-                            if double_esc && !input.is_empty() {
-                                input = InputBox::new();
-                                state.slash_completions.clear();
-                                state.file_completions.clear();
-                                state.last_esc = None;
-                            } else {
-                                state.last_esc = Some(Instant::now());
-                            }
+                        } else if composer_has_content(&state, &input) {
+                            clear_composer(&mut state, &mut input);
                         }
                         continue;
                     }
@@ -10370,7 +10543,7 @@ async fn tui_main(
                         input.insert_newline();
                         state.slash_completions.clear();
                     } else if key.code == KeyCode::Enter && !state.is_thinking {
-                        if !input.is_empty() {
+                        if composer_has_content(&state, &input) {
                             let text = input.take();
                             state.slash_completions.clear();
                             state.file_completions.clear();
@@ -11258,6 +11431,14 @@ async fn tui_main(
                             input.move_word_forward();
                         } else {
                             input.move_right();
+                        }
+                    } else if is_clipboard_paste_key(key) {
+                        // 纯图片剪贴板不会让终端产生 Event::Paste；应用必须在收到
+                        // Ctrl+V（部分终端为 Super+V）时主动读取系统剪贴板。
+                        if let Some(paste) = read_system_clipboard() {
+                            state.paste_hint = apply_clipboard_paste(&mut state, &mut input, paste);
+                            update_slash_completions(&mut state, &input, &cmd_registry);
+                            update_file_completions(&mut state, &input, &cwd);
                         }
                     } else if let KeyCode::Char(c) = key.code {
                         // Ctrl 组合键

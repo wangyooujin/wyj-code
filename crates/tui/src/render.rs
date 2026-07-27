@@ -58,6 +58,86 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// 将待发送附件投影为输入框内的只读占位符。
+///
+/// 占位符只参与渲染和光标定位，不写入真实 `InputBox`，因此发送给模型的文本不会
+/// 混入 `[Image]` / `[File: ...]`。
+fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachment]) -> InputBox {
+    if attachments.is_empty() {
+        return input.clone();
+    }
+
+    let mut prefix = String::new();
+    for attachment in attachments {
+        match attachment {
+            Attachment::Image { .. } => prefix.push_str("[Image] "),
+            Attachment::File { path } => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                prefix.push_str(&format!("[File: {name}] "));
+            }
+        }
+    }
+
+    let prefix_chars = prefix.chars().count();
+    let mut display = input.clone();
+    if display.lines.is_empty() {
+        display.lines.push(prefix);
+    } else {
+        display.lines[0].insert_str(0, &prefix);
+    }
+    if display.cursor_row == 0 {
+        display.cursor_col += prefix_chars;
+    }
+    display
+}
+
+#[cfg(test)]
+mod attachment_input_tests {
+    use super::*;
+
+    #[test]
+    fn image_is_rendered_as_inline_placeholder_without_mutating_real_input() {
+        let mut input = InputBox::new();
+        input.insert_text("describe this");
+        let attachments = vec![Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded".to_string(),
+            preview_label: "320×180".to_string(),
+        }];
+
+        let display = input_with_attachment_placeholders(&input, &attachments);
+
+        assert_eq!(display.display_lines(), &["[Image] describe this"]);
+        assert_eq!(display.cursor_col, "[Image] describe this".chars().count());
+        assert_eq!(input.display_lines(), &["describe this"]);
+    }
+
+    #[test]
+    fn multiple_images_have_compact_individual_placeholders() {
+        let input = InputBox::new();
+        let attachments = vec![
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "first".to_string(),
+                preview_label: "1×1".to_string(),
+            },
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "second".to_string(),
+                preview_label: "2×2".to_string(),
+            },
+        ];
+
+        let display = input_with_attachment_placeholders(&input, &attachments);
+
+        assert_eq!(display.display_lines(), &["[Image] [Image] "]);
+        assert_eq!(display.cursor_col, "[Image] [Image] ".chars().count());
+    }
+}
+
 /// 字符显示宽度：CJK 全角 = 2，其余 = 1
 pub(crate) fn char_display_width(c: char) -> usize {
     if c == '\t' {
@@ -200,7 +280,12 @@ fn render_tool_result_body_lines(
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
     let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
-    let input_height = (input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
+    let display_input = if state.input_owner.is_none() {
+        input_with_attachment_placeholders(input, &state.pending_attachments)
+    } else {
+        input.clone()
+    };
+    let input_height = (display_input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
 
     // 补全列表高度（@ 文件选取器优先于 slash 补全）
     let completion_height = if !state.file_completions.is_empty() {
@@ -209,13 +294,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         (state.slash_completions.len() as u16 + 2).min(8)
     } else {
         0u16
-    };
-
-    // 附件预览条高度（有附件时显示）
-    let attach_height: u16 = if state.pending_attachments.is_empty() {
-        0
-    } else {
-        3
     };
 
     // 底部面板高度：只保留真正需要固定拦截输入的控制面板。
@@ -228,7 +306,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
             Constraint::Min(3),
             Constraint::Length(panel_height),
             Constraint::Length(completion_height),
-            Constraint::Length(attach_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
@@ -269,11 +346,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     } else if !state.slash_completions.is_empty() {
         draw_slash_completions(f, state, chunks[2]);
     }
-    if !state.pending_attachments.is_empty() {
-        draw_attachments(f, state, chunks[3]);
-    }
-    draw_input(f, state, input, chunks[4]);
-    draw_status(f, state, chunks[5]);
+    draw_input(f, state, &display_input, chunks[3]);
+    draw_status(f, state, chunks[4]);
 
     // 会话选择器叠加在最顶层
     if let Some(picker) = &state.session_picker {
@@ -2210,7 +2284,7 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     let cursor_x = (inner.x + vis_col as u16).min(inner.x + inner.width.saturating_sub(1));
     let cursor_y = (inner.y + vis_row as u16).min(inner.y + inner.height.saturating_sub(1));
 
-    // 粘贴瞬时提示：在输入框光标/粘贴位置显示 1.5s，便于用户确认已粘贴图片/文件/文字
+    // 多行文字粘贴的瞬时提示。图片/文件使用输入框内持久占位符，不再叠加提示。
     if let Some(hint) = &state.paste_hint {
         if hint.expires_at > Instant::now() {
             let (hint_row, hint_col) =
@@ -2240,48 +2314,6 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     }
 
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
-}
-
-// ─── 附件预览条 ───────────────────────────────────────────────────────────────
-
-fn draw_attachments(f: &mut Frame, state: &AppState, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            " 附件 · Enter 发送 · ESC 中断清空 ",
-            Style::default().fg(Color::Cyan),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut spans: Vec<Span> = vec![];
-    for att in &state.pending_attachments {
-        match att {
-            Attachment::Image { preview_label, .. } => {
-                spans.push(Span::styled(
-                    format!(" [图片 {preview_label}] "),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            Attachment::File { path } => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                spans.push(Span::styled(
-                    format!(" [文件 {name}] "),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-        }
-        spans.push(Span::raw("  "));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 // ─── @ 文件选取器下拉 ─────────────────────────────────────────────────────────

@@ -170,18 +170,30 @@ impl ComputerTool {
     }
 
     fn current_focused_window() -> Option<wyj_computer::target::WindowTarget> {
-        wyj_computer::target::list_windows()
-            .ok()?
-            .into_iter()
-            .find(|window| window.focused)
+        // `list_windows()` re-sorts for display and would pick an arbitrary
+        // same-app window when several are on screen (see
+        // `wyj_computer::target::frontmost_window` doc for the real incident
+        // this caused). `frontmost_window()` preserves z-order instead.
+        wyj_computer::target::frontmost_window().ok()?
     }
 
+    /// 校验"距上次截图前台窗口是否仍是同一个"，但**不消费**这份观察——`.clone()`
+    /// 而非 `.take()`。之前用 `.take()` 会导致每次变更类动作后观察被立即清空，
+    /// 下一次变更（哪怕焦点完全没变，比如刚点完输入框紧接着 `type`）必然先撞见
+    /// "take a new screenshot before a foreground action"，等价于强制"每个动作
+    /// 前都必须重新截图一次"——这与 `MAX_ACTIONS_WITHOUT_SCREENSHOT = 20`
+    /// 明确设计的"至多 20 个动作才需要重新截图"互相矛盾，且让最基础的
+    /// "点击输入框→输入文字"两步操作在旧版 computer 工具下永远走不通（真实
+    /// 故障：点击成功，紧接着 type 必然失败）。现在观察只在真正重新截图
+    /// （`do_screenshot` 覆盖写入）或触发 `MAX_ACTIONS_WITHOUT_SCREENSHOT`
+    /// 上限时才失效；每次变更前仍会用 `current_focused_window()` 重新核实
+    /// 焦点窗口是否真的变了，真实的前台切换依然会被正确拦截。
     fn validate_foreground_observation(&self) -> Result<wyj_computer::target::WindowTarget> {
         let observed = self
             .foreground_observation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .clone()
             .ok_or_else(|| {
                 anyhow!("target_changed: take a new screenshot before a foreground action")
             })?;
