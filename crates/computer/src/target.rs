@@ -126,8 +126,11 @@ mod imp {
             .collect())
     }
 
-    pub fn list_windows() -> Result<Vec<WindowTarget>> {
-        let mut targets: Vec<_> = visible_windows()?
+    /// 按 `Window::all()` 原始顺序收集（macOS/Windows 均为从顶层到最底层的
+    /// z-order），供 [`list_windows`]（展示用，重排序）和
+    /// [`frontmost_window`]（找真正的前台窗口，必须保留 z-order）共用。
+    fn collect_targets_in_z_order() -> Result<Vec<WindowTarget>> {
+        Ok(visible_windows()?
             .iter()
             .filter_map(|window| match to_target(window) {
                 Ok(target) => Some(target),
@@ -136,9 +139,38 @@ mod imp {
                     None
                 }
             })
-            .collect();
+            .collect())
+    }
+
+    pub fn list_windows() -> Result<Vec<WindowTarget>> {
+        let mut targets = collect_targets_in_z_order()?;
         targets.sort_by_key(|target| (!target.focused, target.app_name.clone(), target.window_id));
         Ok(targets)
+    }
+
+    /// 真正的"当前前台窗口"，唯一一个。
+    ///
+    /// 不能直接用 `list_windows().find(|w| w.focused)`：`WindowTarget::focused`
+    /// 来自 xcap 的 `Window::is_focused()`，macOS 后端实现是
+    /// `NSWorkspace.activeApplication().pid == self.pid()`——**应用级**判断，
+    /// 同一个前台 App 的所有可见窗口都会为 `true`（同花顺这类多窗口交易软件，
+    /// 主界面+行情浮窗+提醒弹窗可能同时存在）。`list_windows()` 又会按
+    /// `(app_name, window_id)` 重排序（纯展示排序，与 z-order 无关），于是
+    /// `.find(focused)` 实际选中的是"该 App 里 window_id 最小的可见窗口"——
+    /// 一个和真实前台状态无关的量，只要该 App 弹出/关闭任意一个小窗口（提醒、
+    /// 提示气泡）就可能变化，导致旧版 `computer` 工具在截图和下一次点击之间
+    /// 把同一个真实前台窗口误判成"变了"，报出规律性的 `target_changed`（这是
+    /// 一次真实故障的根因：同花顺弹出通知后连续点击全部失败)。
+    ///
+    /// 正确做法：不重排序，直接在 `Window::all()` 保留的原始 z-order（从顶层
+    /// 到最底层）里取第一个 `focused` 窗口——同一前台 App 的多个窗口中，
+    /// 排最前面的就是真正接收输入的那个。Windows 后端的 `is_focused()` 本就是
+    /// 精确的单窗口判断（`GetForegroundWindow() == hwnd`），这里的改动对它是
+    /// 无操作（最多一个候选）。
+    pub fn frontmost_window() -> Result<Option<WindowTarget>> {
+        Ok(collect_targets_in_z_order()?
+            .into_iter()
+            .find(|target| target.focused))
     }
 
     pub fn find_window_by_id(window_id: u32) -> Result<WindowTarget> {
@@ -210,6 +242,9 @@ mod imp {
     pub fn list_windows() -> Result<Vec<WindowTarget>> {
         unsupported()
     }
+    pub fn frontmost_window() -> Result<Option<WindowTarget>> {
+        unsupported()
+    }
     pub fn find_window_by_id(_window_id: u32) -> Result<WindowTarget> {
         unsupported()
     }
@@ -226,6 +261,13 @@ mod imp {
 
 pub fn list_windows() -> Result<Vec<WindowTarget>> {
     imp::list_windows()
+}
+
+/// 真正唯一的当前前台窗口（z-order 意义上），供旧版 `computer` 前台兼容工具
+/// 判断"距上次截图前台窗口是否变化"。不要用 `list_windows().find(focused)`
+/// 代替——见 [`imp::frontmost_window`] 文档。
+pub fn frontmost_window() -> Result<Option<WindowTarget>> {
+    imp::frontmost_window()
 }
 
 pub fn find_window_by_id(window_id: u32) -> Result<WindowTarget> {
