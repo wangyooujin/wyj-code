@@ -153,14 +153,14 @@ help:
     - `Ctrl+C` — Interrupt current task (press twice to quit)
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
-    - `Ctrl+O` — Expand/collapse tool result
     - `Ctrl+T` — Focus the task list; expand/collapse it when already focused
     - `Ctrl+L` — Clear screen (keeps conversation history)
     - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
     - `Ctrl+K` — Delete from cursor to end of line
     - `Ctrl+U` — Delete from cursor to start of line
     - `Ctrl+W` — Delete previous word
-    - `↑` / `↓` — Select within the focused list/summary messages when input is empty; otherwise move the cursor or browse input history
+    - `↑` / `↓` — Browse input history; in multiline input, move the cursor first and cross into history only at the first/last line
+    - `Shift+↑` — Move focus from the composer into content; ↑/↓ navigates across chat, tasks, and SubAgents, Enter/Space opens task/SubAgent detail, and Esc steps back
     - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
     - `/` — Command completion (Tab to confirm, Esc to cancel)
     - `!<command>` — Run a Bash command directly
@@ -200,6 +200,10 @@ hooks:
   matcher_line: "matcher: {matcher}"
   matcher_any: "* (matches all tools)"
   command_line: "({timeout}s) `{command}`"
+
+todo:
+  focus_hint: "↑↓ select and cross sections   Enter/Space view detail   Esc return to composer"
+  detail_hint: "↑↓ scroll line by line   PageUp/PageDown page   Enter/Space or Esc return to task list"
 
 agents:
   desc: "Open the Agent type catalog (built-in + custom definition files)"

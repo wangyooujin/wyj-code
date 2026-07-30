@@ -81,11 +81,6 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     /// ToolResult 的一行摘要（Claude Code ⎿ 行）
     pub display_summary: String,
-    /// `display_summary` 是否直接复用了 `content` 的第一行原文（ToolResult 专用）。
-    /// 为真时，展开正文渲染需跳过第一行，避免摘要行与正文首行重复展示。
-    pub summary_is_first_line: bool,
-    /// 工具结果是否已展开（ToolResult 专用）
-    pub expanded: bool,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
     pub sub_agent_id: Option<u64>,
     /// Assistant 消息的 markdown 渲染缓存（宽度, 渲染行）。消息定稿后内容
@@ -105,8 +100,6 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
         }
@@ -143,7 +136,6 @@ impl ChatMessage {
         seq: usize,
         name: String,
         summary: String,
-        summary_is_first_line: bool,
     ) -> Self {
         Self {
             id: 0,
@@ -154,8 +146,6 @@ impl ChatMessage {
             sequence_no: Some(seq),
             tool_name: Some(name),
             display_summary: summary,
-            summary_is_first_line,
-            expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
         }
@@ -171,8 +161,6 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
             sub_agent_id: None,
             md_cache: std::cell::RefCell::new(None),
         }
@@ -4388,26 +4376,6 @@ fn first_informative_line(output: &str) -> Option<&str> {
     })
 }
 
-/// 判断 [`tool_result_summary`] 对给定工具/结果是否直接复用了 `content` 的第一行原文
-/// （而非合成的统计文案，如 "read N lines"/"N matches"）。用于展开正文时跳过重复的首行，
-/// 必须与 `tool_result_summary` 的分支保持一致——兜底分支跳过结构性首行取更有信息量
-/// 的行时（此时摘要不等于首行），同样不做去重。
-fn summary_reuses_first_line(name: &str, output: &str, is_error: bool) -> bool {
-    if is_error {
-        return true;
-    }
-    match name.to_lowercase().as_str() {
-        "read" | "grep" | "glob" | "webfetch" => false,
-        _ => {
-            let first_nonempty = output.lines().find(|l| !l.trim().is_empty());
-            match (first_nonempty, first_informative_line(output)) {
-                (Some(a), Some(b)) => a == b,
-                _ => true,
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tool_summary_tests {
     use super::*;
@@ -4435,32 +4403,8 @@ mod tool_summary_tests {
         );
     }
 
-    /// 回归测试：`summary_reuses_first_line` 必须与 `tool_result_summary` 的分支
-    /// 保持一致——合成统计文案（read/grep/glob/webfetch）不会与正文重复，无需去重；
-    /// 其余分支（含 is_error）都是直接复用正文首行，展开正文时必须跳过首行。
-    #[test]
-    fn summary_reuses_first_line_matches_tool_result_summary_branches() {
-        let plain = "first line\nsecond line\n";
-        for name in ["Read", "Grep", "Glob", "WebFetch"] {
-            assert!(
-                !summary_reuses_first_line(name, plain, false),
-                "{name} 的摘要是合成统计文案，不应判定为复用首行"
-            );
-        }
-        for name in ["Bash", "Edit", "Write", "SomeUnknownTool"] {
-            assert!(
-                summary_reuses_first_line(name, plain, false),
-                "{name} 的摘要复用了正文首行原文"
-            );
-        }
-        assert!(
-            summary_reuses_first_line("Read", plain, true),
-            "is_error 时摘要恒为正文首行，与工具名无关"
-        );
-    }
-
     /// MCP/JSON 输出的首行往往是无信息量的 `{`：兜底摘要必须跳过结构性行取
-    /// 第一条有内容的行，且此时不做展开去重（摘要不等于正文首行）。
+    /// 第一条有内容的行。
     #[test]
     fn fallback_summary_skips_structural_first_line() {
         let json = "{\n  \"code\": 0,\n  \"data\": []\n}\n";
@@ -4468,15 +4412,9 @@ mod tool_summary_tests {
             tool_result_summary("mcp__a-stock__get_quote", json, false),
             "\"code\": 0,"
         );
-        assert!(
-            !summary_reuses_first_line("mcp__a-stock__get_quote", json, false),
-            "摘要取的不是首行原文，展开正文不应再去重"
-        );
-
-        // 纯结构输出（不含任何字母数字）回退到首行，仍按复用首行去重
+        // 纯结构输出（不含任何字母数字）回退到首行。
         let braces = "{\n}\n";
         assert_eq!(tool_result_summary("SomeUnknownTool", braces, false), "{");
-        assert!(summary_reuses_first_line("SomeUnknownTool", braces, false));
     }
 
     #[test]
@@ -4511,104 +4449,178 @@ mod navigation_focus_tests {
     }
 
     #[test]
-    fn repeated_direction_keys_move_selection_without_debounce() {
-        let mut state = make_state();
-        state.messages.push(ChatMessage::user("one".to_string()));
-        state
-            .messages
-            .push(ChatMessage::assistant("two".to_string()));
-        state
-            .messages
-            .push(ChatMessage::system("three".to_string()));
+    fn only_shift_up_is_the_explicit_content_focus_shortcut() {
+        assert!(is_content_focus_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!is_content_focus_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        )));
+        assert!(!is_content_focus_key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!is_content_focus_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::CONTROL,
+        )));
+    }
 
-        state.move_focus_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[0].id));
+    fn todo(id: &str, status: TodoStatus) -> wyj_tools::todo::TodoItem {
+        wyj_tools::todo::TodoItem {
+            id: id.to_string(),
+            content: format!("todo-{id}"),
+            status,
+            priority: None,
+            active_form: None,
+        }
+    }
 
-        state.move_focus_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[1].id));
-
-        state.move_focus_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[2].id));
+    fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
+        SubAgentUiState {
+            agent_type: "general-purpose".to_string(),
+            description: "test".to_string(),
+            background: false,
+            status,
+            started_at: Instant::now(),
+            final_elapsed: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            tool_calls: 0,
+            current_tool: None,
+            tool_log: vec![],
+            has_result: false,
+            finished_at: None,
+            final_result: None,
+        }
     }
 
     #[test]
-    fn message_selection_and_toggle_targets_current_summary() {
+    fn ordinary_arrows_round_trip_input_history_and_restore_draft() {
         let mut state = make_state();
-        state.messages.push(ChatMessage::tool_result(
-            "first\nbody".to_string(),
-            false,
-            0.1,
-            1,
-            "Read".to_string(),
-            "read 2 lines".to_string(),
-            false,
-        ));
-        state.messages.push(ChatMessage::tool_result(
-            "second\nbody".to_string(),
-            false,
-            0.2,
-            2,
-            "Bash".to_string(),
-            "second".to_string(),
-            true,
-        ));
+        state.input_history = vec!["first".to_string(), "second".to_string()];
+        state.pending_attachments.push(Attachment::File {
+            path: PathBuf::from("/tmp/context.txt"),
+        });
+        let mut input = InputBox::new();
+        input.set_text("unsent draft");
 
-        state.move_message_selection(1);
-        let first_id = state.selected_message_id;
-        state.toggle_selected_message();
-        assert!(state.messages[0].expanded);
-        assert!(!state.messages[1].expanded);
+        assert!(state.navigate_input_or_history(&mut input, -1));
+        assert_eq!(input.display_lines(), &["second"]);
+        assert_eq!(state.history_idx, Some(1));
 
-        state.move_message_selection(1);
-        assert_ne!(state.selected_message_id, first_id);
-        state.toggle_selected_message();
-        assert!(state.messages[0].expanded);
-        assert!(state.messages[1].expanded);
+        assert!(state.navigate_input_or_history(&mut input, -1));
+        assert_eq!(input.display_lines(), &["first"]);
+        assert_eq!(state.history_idx, Some(0));
+
+        assert!(state.navigate_input_or_history(&mut input, 1));
+        assert_eq!(input.display_lines(), &["second"]);
+
+        assert!(state.navigate_input_or_history(&mut input, 1));
+        assert_eq!(input.display_lines(), &["unsent draft"]);
+        assert_eq!(state.history_idx, None);
+        assert_eq!(state.pending_attachments.len(), 1);
     }
 
     #[test]
-    fn message_selection_visits_plain_messages_without_toggling_them() {
+    fn multiline_input_moves_cursor_before_crossing_into_history() {
         let mut state = make_state();
-        state.messages.push(ChatMessage::user("hi".to_string()));
-        state
-            .messages
-            .push(ChatMessage::assistant("hello".to_string()));
-        state
-            .messages
-            .push(ChatMessage::system("system notice".to_string()));
+        state.input_history = vec!["older".to_string()];
+        let mut input = InputBox::new();
+        input.set_text("line one\nline two");
+        assert_eq!(input.cursor_row, 1);
 
-        state.move_message_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[0].id));
+        assert!(state.navigate_input_or_history(&mut input, -1));
+        assert_eq!(input.cursor_row, 0);
+        assert_eq!(input.display_lines(), &["line one", "line two"]);
+        assert_eq!(state.history_idx, None);
 
-        state.toggle_selected_message();
-        assert_eq!(state.selected_message_id, Some(state.messages[0].id));
-        assert_eq!(state.last_toggled_message_id, None);
+        assert!(state.navigate_input_or_history(&mut input, -1));
+        assert_eq!(input.display_lines(), &["older"]);
+        assert_eq!(state.history_idx, Some(0));
 
-        state.move_message_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[1].id));
-        state.move_message_selection(1);
-        assert_eq!(state.selected_message_id, Some(state.messages[2].id));
+        assert!(state.navigate_input_or_history(&mut input, 1));
+        assert_eq!(input.display_lines(), &["line one", "line two"]);
+        assert_eq!(input.cursor_row, 1);
     }
 
     #[test]
-    fn selected_expanded_message_detail_scrolls_independently() {
+    fn history_navigation_remains_available_while_agent_is_running() {
         let mut state = make_state();
-        let id = state.push_message(ChatMessage::bash_output(
-            (1..=30)
-                .map(|i| format!("line-{i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            0,
-            0.2,
-        ));
-        state.selected_message_id = Some(id);
-        state.messages[0].expanded = true;
+        state.is_thinking = true;
+        state.input_history = vec!["reusable prompt".to_string()];
+        let mut input = InputBox::new();
 
-        assert!(state.scroll_selected_message_detail(8));
-        assert_eq!(state.message_detail_scroll.get(&id), Some(&8));
+        assert!(state.navigate_input_or_history(&mut input, -1));
+        assert_eq!(input.display_lines(), &["reusable prompt"]);
+    }
 
-        assert!(state.scroll_selected_message_detail(-3));
-        assert_eq!(state.message_detail_scroll.get(&id), Some(&5));
+    #[test]
+    fn shift_up_content_entry_prefers_running_subagents_then_todos_then_chat() {
+        let mut state = make_state();
+        state
+            .messages
+            .push(ChatMessage::user("message".to_string()));
+        state.current_todos = Some(vec![todo("todo", TodoStatus::InProgress)]);
+        state
+            .sub_agents
+            .insert(7, sub_agent(SubAgentStatus::Running));
+
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::SubAgents);
+        assert_eq!(state.selected_sub_agent, Some(7));
+
+        assert!(state.leave_content_focus());
+        state.sub_agents.get_mut(&7).unwrap().status = SubAgentStatus::Done;
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("todo"));
+        assert!(state.todo_panel_expanded);
+
+        assert!(state.leave_content_focus());
+        state.current_todos = None;
+        state.chat_scroll = 4;
+        state.chat_max_scroll = 4;
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::Chat);
+        assert_eq!(state.chat_scroll, 4);
+        assert!(state.chat_follow_tail);
+    }
+
+    #[test]
+    fn escape_from_content_focus_returns_to_composer_without_touching_draft() {
+        let mut state = make_state();
+        state
+            .messages
+            .push(ChatMessage::assistant("answer".to_string()));
+        let mut input = InputBox::new();
+        input.set_text("keep this draft");
+
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::Chat);
+        assert!(state.close_panel_focus());
+        assert_eq!(state.ui_focus, UiFocus::Composer);
+        assert_eq!(input.display_lines(), &["keep this draft"]);
+    }
+
+    #[test]
+    fn repeated_direction_keys_scroll_chat_by_visual_line() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::Chat;
+        state.chat_scroll = 3;
+        state.chat_max_scroll = 5;
+        state.chat_follow_tail = false;
+
+        state.move_focus_selection(-1);
+        assert_eq!(state.chat_scroll, 2);
+
+        state.move_focus_selection(1);
+        assert_eq!(state.chat_scroll, 3);
+
+        state.move_focus_selection(1);
+        assert_eq!(state.chat_scroll, 4);
     }
 
     #[test]
@@ -4617,12 +4629,10 @@ mod navigation_focus_tests {
         state.chat_scroll = 10;
         state.chat_max_scroll = 20;
         state.chat_follow_tail = true;
-        state.selected_message_id = Some(42);
 
         state.scroll_chat_lines(-3);
         assert_eq!(state.chat_scroll, 7);
         assert!(!state.chat_follow_tail);
-        assert_eq!(state.selected_message_id, None);
 
         state.unseen_messages = true;
         state.scroll_chat_lines(50);
@@ -4632,25 +4642,15 @@ mod navigation_focus_tests {
     }
 
     #[test]
-    fn scroll_focus_routes_to_selected_message_detail_before_chat() {
+    fn scroll_focus_routes_directly_to_chat_lines() {
         let mut state = make_state();
-        let id = state.push_message(ChatMessage::bash_output(
-            (1..=30)
-                .map(|i| format!("line-{i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            0,
-            0.2,
-        ));
-        state.messages[0].expanded = true;
-        state.selected_message_id = Some(id);
+        state.ui_focus = UiFocus::Chat;
         state.chat_scroll = 10;
         state.chat_max_scroll = 20;
 
         state.scroll_focus_lines(3);
 
-        assert_eq!(state.message_detail_scroll.get(&id), Some(&3));
-        assert_eq!(state.chat_scroll, 10);
+        assert_eq!(state.chat_scroll, 13);
     }
 
     #[test]
@@ -4682,6 +4682,77 @@ mod navigation_focus_tests {
     }
 
     #[test]
+    fn content_navigation_crosses_chat_todos_and_subagents_at_boundaries() {
+        let mut state = make_state();
+        state
+            .messages
+            .push(ChatMessage::user("first message".to_string()));
+        state
+            .messages
+            .push(ChatMessage::assistant("last message".to_string()));
+        state.current_todos = Some(vec![
+            todo("a", TodoStatus::Pending),
+            todo("b", TodoStatus::Pending),
+        ]);
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+        state.sub_agents.insert(2, sub_agent(SubAgentStatus::Done));
+        state.chat_scroll = 6;
+        state.chat_max_scroll = 6;
+
+        assert!(state.focus_chat_edge(false));
+        assert_eq!(state.chat_scroll, 6);
+        assert!(state.chat_follow_tail);
+
+        state.move_focus_selection(1);
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("a"));
+
+        state.move_focus_selection(1);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("b"));
+        state.move_focus_selection(1);
+        assert_eq!(state.ui_focus, UiFocus::SubAgents);
+        assert_eq!(state.selected_sub_agent, Some(1));
+
+        state.move_focus_selection(-1);
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("b"));
+        state.move_focus_selection(-1);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("a"));
+        state.move_focus_selection(-1);
+        assert_eq!(state.ui_focus, UiFocus::Chat);
+        assert_eq!(state.chat_scroll, 6);
+        assert!(state.chat_follow_tail);
+    }
+
+    #[test]
+    fn todo_detail_is_a_nested_focus_with_independent_navigation_and_escape() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::InProgress)]);
+
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        state.toggle_focused_content_detail();
+        assert_eq!(state.ui_focus, UiFocus::TodoDetail);
+        assert!(state.todo_detail_open);
+        assert!(state.chat_follow_tail);
+
+        state.todo_detail_max_scroll = 20;
+        state.move_focus_selection(1);
+        assert_eq!(state.todo_detail_scroll, 1);
+        state.scroll_focus_lines(8);
+        assert_eq!(state.todo_detail_scroll, 9);
+
+        assert!(state.close_panel_focus());
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("a"));
+        assert!(!state.todo_detail_open);
+
+        assert!(state.close_panel_focus());
+        assert_eq!(state.ui_focus, UiFocus::Composer);
+        assert_eq!(state.selected_todo_id, None);
+    }
+
+    #[test]
     fn focus_selection_and_scroll_routes_to_agents_catalog() {
         let mut state = make_state();
         state.agents_dialog = Some(AgentsDialog::new(wyj_core::builtin_defs()));
@@ -4698,11 +4769,11 @@ mod navigation_focus_tests {
     }
 
     #[test]
-    fn todo_detail_scroll_falls_back_to_chat_when_content_fits_viewport() {
+    fn todo_detail_scroll_does_not_leak_to_chat_when_content_fits_viewport() {
         let mut state = make_state();
-        state.ui_focus = UiFocus::Todos;
+        state.ui_focus = UiFocus::TodoDetail;
         state.todo_detail_open = true;
-        // 面板内容不超过一屏时，渲染层会把 max_scroll 写回为 0（本次 bug 的核心场景）。
+        // 详情是独立焦点；即便内容不足一屏，也不能把滚动泄漏给聊天区。
         state.todo_detail_scroll = 0;
         state.todo_detail_max_scroll = 0;
         state.chat_scroll = 10;
@@ -4711,13 +4782,13 @@ mod navigation_focus_tests {
         state.scroll_focus_lines(3);
 
         assert_eq!(state.todo_detail_scroll, 0);
-        assert_eq!(state.chat_scroll, 13);
+        assert_eq!(state.chat_scroll, 10);
     }
 
     #[test]
     fn todo_detail_scroll_stays_internal_when_room_remains() {
         let mut state = make_state();
-        state.ui_focus = UiFocus::Todos;
+        state.ui_focus = UiFocus::TodoDetail;
         state.todo_detail_open = true;
         state.todo_detail_scroll = 5;
         state.todo_detail_max_scroll = 20;
@@ -4728,6 +4799,25 @@ mod navigation_focus_tests {
 
         assert_eq!(state.todo_detail_scroll, 8);
         assert_eq!(state.chat_scroll, 10);
+    }
+
+    #[test]
+    fn todo_detail_live_updates_follow_only_when_reader_was_at_tail() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::InProgress)]);
+        state.selected_todo_id = Some("a".to_string());
+        state.ui_focus = UiFocus::TodoDetail;
+        state.todo_detail_open = true;
+        state.todo_detail_scroll = 4;
+        state.todo_detail_max_scroll = 4;
+
+        state.push_tracked_message(ChatMessage::assistant("new tail event".to_string()));
+        assert_eq!(state.todo_detail_scroll, u16::MAX);
+
+        state.todo_detail_scroll = 2;
+        state.todo_detail_max_scroll = 4;
+        state.push_tracked_message(ChatMessage::assistant("another event".to_string()));
+        assert_eq!(state.todo_detail_scroll, 2);
     }
 
     #[test]
@@ -4763,64 +4853,61 @@ mod navigation_focus_tests {
     }
 
     #[test]
-    fn explicit_conversation_jump_sets_selection_anchor() {
+    fn explicit_conversation_jump_moves_to_top_and_bottom() {
         let mut state = make_state();
         state
             .messages
             .push(ChatMessage::thinking("a\nb\nc".to_string()));
-        state.messages.push(ChatMessage::tool_result(
-            "result".to_string(),
-            false,
-            0.1,
-            1,
-            "Read".to_string(),
-            "read".to_string(),
-            false,
-        ));
+        state.chat_scroll = 7;
+        state.chat_max_scroll = 12;
 
         state.select_conversation_start();
-        assert_eq!(
-            state.selected_message_anchor,
-            Some(ChatSelectionAnchor::Top)
-        );
-        assert_eq!(state.selected_message_id, Some(state.messages[0].id));
+        assert_eq!(state.chat_scroll, 0);
+        assert!(!state.chat_follow_tail);
 
         state.select_conversation_end();
-        assert_eq!(
-            state.selected_message_anchor,
-            Some(ChatSelectionAnchor::Bottom)
-        );
-        assert_eq!(state.selected_message_id, Some(state.messages[1].id));
-        assert!(!state.chat_follow_tail);
+        assert_eq!(state.chat_scroll, 12);
+        assert!(state.chat_follow_tail);
     }
 
     #[test]
-    fn toggle_returns_to_last_toggled_message_after_selection_is_cleared() {
+    fn new_chat_content_preserves_upscrolled_reader_and_marks_unseen() {
         let mut state = make_state();
-        state.messages.push(ChatMessage::tool_result(
-            "result\nbody".to_string(),
-            false,
-            0.1,
-            1,
-            "Read".to_string(),
-            "read".to_string(),
-            false,
-        ));
+        state.chat_scroll = 4;
+        state.chat_max_scroll = 10;
+        state.chat_follow_tail = false;
 
-        state.move_message_selection(1);
-        let id = state.selected_message_id;
-        state.toggle_selected_message();
-        assert!(state.messages[0].expanded);
-        assert_eq!(state.last_toggled_message_id, id);
+        state.push_message(ChatMessage::assistant("new content".to_string()));
 
-        state.selected_message_id = None;
-        state.toggle_selected_message();
-        assert!(!state.messages[0].expanded);
-        assert_eq!(state.selected_message_id, id);
-        assert_eq!(
-            state.selected_message_anchor,
-            Some(ChatSelectionAnchor::Top)
-        );
+        assert_eq!(state.chat_scroll, 4);
+        assert!(!state.chat_follow_tail);
+        assert!(state.unseen_messages);
+    }
+
+    #[test]
+    fn new_chat_content_keeps_tail_following_when_already_at_bottom() {
+        let mut state = make_state();
+        state.chat_scroll = 10;
+        state.chat_max_scroll = 10;
+        state.chat_follow_tail = true;
+
+        state.push_message(ChatMessage::assistant("new content".to_string()));
+
+        assert!(state.chat_follow_tail);
+        assert!(!state.unseen_messages);
+    }
+
+    #[test]
+    fn streaming_delta_marks_unseen_without_changing_scroll() {
+        let mut state = make_state();
+        state.chat_scroll = 4;
+        state.chat_max_scroll = 10;
+        state.chat_follow_tail = false;
+
+        state.apply_agent_event(AgentEvent::TextDelta("token".to_string()));
+
+        assert_eq!(state.chat_scroll, 4);
+        assert!(state.unseen_messages);
     }
 
     #[test]
@@ -4938,6 +5025,10 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('v' | 'V'))
         && (key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::SUPER))
+}
+
+fn is_content_focus_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Up && key.modifiers == KeyModifiers::SHIFT
 }
 
 /// 单行文字直接留在输入框即可；只有真正包含换行的批量粘贴才需要瞬时提示。
@@ -5185,15 +5276,11 @@ mod clipboard_paste_tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatSelectionAnchor {
-    Top,
-    Bottom,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiFocus {
+    Composer,
     Chat,
     Todos,
+    TodoDetail,
     AgentsCatalog,
     SubAgents,
 }
@@ -5430,24 +5517,14 @@ pub struct AppState {
     pub frozen_up_to: usize,
     /// 欢迎页是否已被显式抑制，如 /clear、会话切换/恢复。
     pub welcome_frozen: bool,
-    /// 当前选中的可展开概要消息 id。
-    pub selected_message_id: Option<u64>,
     /// 应用内消息流纵向滚动偏移。
     pub chat_scroll: usize,
-    /// 当前聊天区可视行数，由渲染层每帧回写，供活跃尾部滚动/选中定位使用。
+    /// 当前聊天区可视行数，由渲染层每帧回写。
     pub chat_view_height: usize,
     /// 当前聊天区最大滚动偏移，由渲染层每帧回写。
     pub chat_max_scroll: usize,
-    /// 是否跟随最新消息到底部。用户选中历史消息后置 false。
+    /// 是否跟随最新消息到底部。用户主动上滚后置 false。
     pub chat_follow_tail: bool,
-    /// 渲染时记录的选中消息起始行，用于保持选中项可见。
-    pub selected_message_line: Option<usize>,
-    /// 选中消息的滚动锚点。Home/End 在输入框为空时使用它把选中项贴到首/末行。
-    pub selected_message_anchor: Option<ChatSelectionAnchor>,
-    /// 最近一次展开/收起的消息。展开后若用户滚走，下一次 Enter 仍可回到该块并收起。
-    pub last_toggled_message_id: Option<u64>,
-    /// 每条可展开消息的详情区滚动偏移，按消息 id 保存。
-    pub message_detail_scroll: HashMap<u64, u16>,
     /// 是否有新消息在用户查看历史时到达。
     pub unseen_messages: bool,
     pub total_input_tokens: u32,
@@ -5488,7 +5565,7 @@ pub struct AppState {
     pub todo_panel_expanded: bool,
     /// 任务列表当前选中项（按 id 而非 index，避免列表变动时错位）
     pub selected_todo_id: Option<String>,
-    /// 选中任务详情是否展开
+    /// 选中任务详情是否展开；正常情况下仅在 `UiFocus::TodoDetail` 时为 true。
     pub todo_detail_open: bool,
     /// 任务详情滚动偏移（预留给长详情，渲染层按需 clamp）
     pub todo_detail_scroll: u16,
@@ -5590,17 +5667,6 @@ pub struct AppState {
     pub hook_runner: Option<Arc<wyj_core::HookRunner>>,
 }
 
-fn is_selectable_message(_msg: &ChatMessage) -> bool {
-    true
-}
-
-fn is_expandable_message(msg: &ChatMessage) -> bool {
-    matches!(
-        msg.role,
-        MessageRole::Thinking | MessageRole::ToolResult | MessageRole::BashOutput
-    )
-}
-
 impl AppState {
     pub(crate) fn new(
         cwd: PathBuf,
@@ -5631,15 +5697,10 @@ impl AppState {
             exec_mode_confirm: None,
             frozen_up_to: 0,
             welcome_frozen: false,
-            selected_message_id: None,
             chat_scroll: 0,
             chat_view_height: 0,
             chat_max_scroll: 0,
             chat_follow_tail: true,
-            selected_message_line: None,
-            selected_message_anchor: None,
-            last_toggled_message_id: None,
-            message_detail_scroll: HashMap::new(),
             unseen_messages: false,
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -5709,7 +5770,7 @@ impl AppState {
             sub_output_tokens: 0,
             hub,
             welcome_tip_idx,
-            ui_focus: UiFocus::Chat,
+            ui_focus: UiFocus::Composer,
             input_owner: None,
             mcp_connection_status: HashMap::new(),
             hook_runner: None,
@@ -5727,14 +5788,9 @@ impl AppState {
         // Historical sessions and /clear intentionally freeze the welcome screen;
         // a new session must return to the opening state instead of inheriting it.
         self.welcome_frozen = false;
-        self.selected_message_id = None;
         self.chat_scroll = 0;
         self.chat_max_scroll = 0;
         self.chat_follow_tail = true;
-        self.selected_message_line = None;
-        self.selected_message_anchor = None;
-        self.last_toggled_message_id = None;
-        self.message_detail_scroll.clear();
         self.unseen_messages = false;
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
@@ -5772,109 +5828,52 @@ impl AppState {
         self.pending_bg_reminders.clear();
         self.sub_input_tokens = 0;
         self.sub_output_tokens = 0;
-        self.ui_focus = UiFocus::Chat;
+        self.ui_focus = UiFocus::Composer;
         self.input_owner = None;
     }
 
     pub fn ensure_message_ids(&mut self) {
-        let mut inserted = false;
         for msg in &mut self.messages {
             if msg.id == 0 {
                 msg.id = self.next_message_id;
                 self.next_message_id += 1;
-                inserted = true;
-            }
-        }
-        if inserted && !self.chat_follow_tail {
-            self.unseen_messages = true;
-        }
-        if let Some(id) = self.selected_message_id {
-            let still_exists = self.selectable_message_ids().into_iter().any(|x| x == id);
-            if !still_exists {
-                self.selected_message_id = self.last_selectable_message_id();
             }
         }
     }
 
-    fn selectable_message_ids(&self) -> Vec<u64> {
-        let mut ids = Vec::new();
-        let start = self.frozen_up_to.min(self.messages.len());
-        let mut i = start;
-        while i < self.messages.len() {
-            let msg = &self.messages[i];
-            if matches!(msg.role, MessageRole::ToolCall)
-                && self.messages.get(i + 1).is_some_and(|next| {
-                    matches!(next.role, MessageRole::ToolResult)
-                        && next.sequence_no == msg.sequence_no
-                })
-            {
-                i += 1;
-                continue;
-            }
-            if is_selectable_message(msg) {
-                ids.push(msg.id);
-            }
-            i += 1;
-        }
-        ids
-    }
-
-    fn first_selectable_message_id(&self) -> Option<u64> {
-        self.selectable_message_ids().into_iter().next()
-    }
-
-    fn last_selectable_message_id(&self) -> Option<u64> {
-        self.selectable_message_ids().into_iter().last()
-    }
-
-    fn last_expandable_message_id(&self) -> Option<u64> {
-        self.messages
-            .iter()
-            .skip(self.frozen_up_to.min(self.messages.len()))
-            .rev()
-            .find(|m| is_expandable_message(m))
-            .map(|m| m.id)
-    }
-
-    fn move_message_selection(&mut self, delta: i32) {
+    fn focus_chat_edge(&mut self, first: bool) -> bool {
         self.ensure_message_ids();
-        let ids = self.selectable_message_ids();
-        if ids.is_empty() {
-            self.selected_message_id = None;
-            return;
+        let start = self.frozen_up_to.min(self.messages.len());
+        let has_chat_content = start < self.messages.len()
+            || !self.thinking_buf.is_empty()
+            || !self.streaming_buf.is_empty();
+        if !has_chat_content {
+            return false;
         }
-        let current = self
-            .selected_message_id
-            .and_then(|id| ids.iter().position(|x| *x == id));
-        let idx = match (current, delta.cmp(&0)) {
-            (Some(i), std::cmp::Ordering::Less) => i.saturating_sub(1),
-            (Some(i), std::cmp::Ordering::Greater) => (i + 1).min(ids.len() - 1),
-            (Some(i), _) => i,
-            (None, std::cmp::Ordering::Less) => ids.len() - 1,
-            (None, _) => 0,
-        };
-        self.selected_message_id = Some(ids[idx]);
-        self.selected_message_anchor = None;
-        self.chat_follow_tail = false;
-        self.unseen_messages = false;
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.selected_sub_agent = None;
+        self.sub_agent_detail_open = false;
+        self.sub_agent_detail_scroll = 0;
+        self.ui_focus = UiFocus::Chat;
+        if first {
+            self.chat_scroll = 0;
+            self.chat_follow_tail = false;
+        } else {
+            self.chat_scroll = self.chat_max_scroll;
+            self.chat_follow_tail = true;
+            self.unseen_messages = false;
+        }
+        true
     }
 
     fn select_conversation_start(&mut self) {
-        self.ensure_message_ids();
-        self.selected_message_id = self.first_selectable_message_id();
-        self.selected_message_anchor = Some(ChatSelectionAnchor::Top);
-        self.chat_scroll = 0;
-        self.chat_follow_tail = false;
-        self.unseen_messages = false;
+        let _ = self.focus_chat_edge(true);
     }
 
     fn select_conversation_end(&mut self) {
-        self.ensure_message_ids();
-        self.selected_message_id = self.last_selectable_message_id();
-        self.selected_message_anchor = Some(ChatSelectionAnchor::Bottom);
-        self.chat_follow_tail = false;
-        self.chat_scroll = self.chat_max_scroll;
-        self.unseen_messages = false;
+        let _ = self.focus_chat_edge(false);
     }
 
     fn scroll_chat_lines(&mut self, delta: i32) {
@@ -5882,11 +5881,12 @@ impl AppState {
         if amount == 0 {
             return;
         }
-        self.selected_message_id = None;
-        self.selected_message_anchor = None;
         if delta < 0 {
-            self.chat_scroll = self.chat_scroll.saturating_sub(amount);
-            self.chat_follow_tail = false;
+            let before = self.chat_scroll;
+            self.chat_scroll = before.saturating_sub(amount);
+            if self.chat_scroll < before {
+                self.chat_follow_tail = false;
+            }
         } else {
             self.chat_scroll = self
                 .chat_scroll
@@ -5899,34 +5899,6 @@ impl AppState {
                 self.chat_follow_tail = false;
             }
         }
-    }
-
-    fn scroll_selected_message_detail(&mut self, delta: i32) -> bool {
-        let Some(id) = self.selected_message_id else {
-            return false;
-        };
-        let Some(msg) = self
-            .messages
-            .iter()
-            .skip(self.frozen_up_to.min(self.messages.len()))
-            .find(|m| m.id == id && is_expandable_message(m) && m.expanded)
-        else {
-            return false;
-        };
-        let amount = delta.unsigned_abs() as u16;
-        if amount == 0 {
-            return true;
-        }
-        let entry = self.message_detail_scroll.entry(msg.id).or_insert(0);
-        if delta < 0 {
-            *entry = entry.saturating_sub(amount);
-        } else {
-            *entry = entry.saturating_add(amount);
-        }
-        self.selected_message_anchor = Some(ChatSelectionAnchor::Top);
-        self.chat_follow_tail = false;
-        self.unseen_messages = false;
-        true
     }
 
     fn adjust_u16_scroll(value: &mut u16, delta: i32) {
@@ -5955,23 +5927,52 @@ impl AppState {
     }
 
     fn move_focus_selection(&mut self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
         match self.ui_focus {
-            UiFocus::Todos => self.move_selected_todo(delta),
+            UiFocus::Composer => {}
+            UiFocus::Chat => {
+                if delta < 0 {
+                    if self.chat_scroll > 0 {
+                        self.scroll_chat_lines(-1);
+                    }
+                } else if self.chat_scroll < self.chat_max_scroll {
+                    self.scroll_chat_lines(1);
+                } else if !self.focus_todo_edge(true) {
+                    self.focus_sub_agent_edge(true);
+                }
+            }
+            UiFocus::Todos => {
+                if !self.move_selected_todo(delta) {
+                    if delta < 0 {
+                        self.focus_chat_edge(false);
+                    } else {
+                        self.focus_sub_agent_edge(true);
+                    }
+                }
+            }
+            UiFocus::TodoDetail => {
+                let _ = Self::adjust_bounded_u16_scroll(
+                    &mut self.todo_detail_scroll,
+                    delta,
+                    self.todo_detail_max_scroll,
+                );
+            }
             UiFocus::AgentsCatalog => {
                 if let Some(dialog) = &mut self.agents_dialog {
                     dialog.move_selected(delta);
                 } else {
-                    self.ui_focus = UiFocus::Chat;
-                    self.move_message_selection(delta);
+                    self.ui_focus = UiFocus::Composer;
                 }
             }
             UiFocus::SubAgents if !self.sub_agents.is_empty() => {
-                self.move_selected_sub_agent(delta);
+                if !self.move_selected_sub_agent(delta) && delta < 0 && !self.focus_todo_edge(false)
+                {
+                    self.focus_chat_edge(false);
+                }
             }
-            _ if self.should_enter_sub_agent_focus_from_arrows() => {
-                self.move_selected_sub_agent(delta);
-            }
-            _ => self.move_message_selection(delta),
+            UiFocus::SubAgents => self.ui_focus = UiFocus::Composer,
         }
     }
 
@@ -5988,18 +5989,16 @@ impl AppState {
                         dialog.move_selected(delta);
                     }
                 } else {
-                    self.ui_focus = UiFocus::Chat;
+                    self.ui_focus = UiFocus::Composer;
                     self.scroll_chat_lines(delta);
                 }
             }
-            UiFocus::Todos if self.todo_detail_open => {
-                if !Self::adjust_bounded_u16_scroll(
+            UiFocus::TodoDetail => {
+                let _ = Self::adjust_bounded_u16_scroll(
                     &mut self.todo_detail_scroll,
                     delta,
                     self.todo_detail_max_scroll,
-                ) {
-                    self.scroll_chat_lines(delta);
-                }
+                );
             }
             UiFocus::SubAgents if self.sub_agent_detail_open => {
                 if !Self::adjust_bounded_u16_scroll(
@@ -6010,12 +6009,63 @@ impl AppState {
                     self.scroll_chat_lines(delta);
                 }
             }
-            UiFocus::Chat => {
-                if !self.scroll_selected_message_detail(delta) {
-                    self.scroll_chat_lines(delta);
-                }
-            }
+            UiFocus::Chat => self.scroll_chat_lines(delta),
+            UiFocus::Composer => self.scroll_chat_lines(delta),
             UiFocus::Todos | UiFocus::SubAgents => self.scroll_chat_lines(delta),
+        }
+    }
+
+    fn recall_older_input(&mut self, input: &mut InputBox) -> bool {
+        if self.input_history.is_empty() {
+            return false;
+        }
+        if self.history_idx.is_none() {
+            self.history_draft = Some(input.lines.join("\n"));
+        }
+        let next = match self.history_idx {
+            None => self.input_history.len() - 1,
+            Some(idx) => idx.saturating_sub(1),
+        };
+        self.history_idx = Some(next);
+        input.set_text(&self.input_history[next]);
+        true
+    }
+
+    fn recall_newer_input(&mut self, input: &mut InputBox) -> bool {
+        let Some(idx) = self.history_idx else {
+            return false;
+        };
+        if idx + 1 < self.input_history.len() {
+            let next = idx + 1;
+            self.history_idx = Some(next);
+            input.set_text(&self.input_history[next]);
+        } else {
+            self.history_idx = None;
+            input.set_text(&self.history_draft.take().unwrap_or_default());
+        }
+        true
+    }
+
+    /// 普通 ↑/↓ 永远属于输入框：多行草稿先移动逻辑行，只有到达首/末行后才
+    /// 进入输入历史。该逻辑不依赖 `is_thinking`，Agent 工作期间也可复用历史
+    /// 并排队发送；附件存放在 `pending_attachments`，不会被历史文字替换影响。
+    fn navigate_input_or_history(&mut self, input: &mut InputBox, delta: i32) -> bool {
+        if delta < 0 {
+            if input.cursor_row > 0 {
+                input.move_cursor_up();
+                true
+            } else {
+                self.recall_older_input(input)
+            }
+        } else if delta > 0 {
+            if input.cursor_row + 1 < input.lines.len() {
+                input.move_cursor_down();
+                true
+            } else {
+                self.recall_newer_input(input)
+            }
+        } else {
+            false
         }
     }
 
@@ -6026,10 +6076,17 @@ impl AppState {
         }
     }
 
+    fn note_new_chat_content(&mut self) {
+        if !self.chat_follow_tail {
+            self.unseen_messages = true;
+        }
+    }
+
     fn push_message(&mut self, mut msg: ChatMessage) -> u64 {
         self.assign_message_id(&mut msg);
         let id = msg.id;
         self.messages.push(msg);
+        self.note_new_chat_content();
         id
     }
 
@@ -6037,6 +6094,7 @@ impl AppState {
         self.assign_message_id(&mut msg);
         let id = msg.id;
         self.messages.insert(idx + 1, msg);
+        self.note_new_chat_content();
         id
     }
 
@@ -6052,10 +6110,18 @@ impl AppState {
 
     fn link_message_to_active_todos(&mut self, message_id: u64) {
         for todo_id in self.active_todo_ids() {
+            let follow_detail_tail = self.ui_focus == UiFocus::TodoDetail
+                && self.selected_todo_id.as_deref() == Some(todo_id.as_str())
+                && self.todo_detail_scroll >= self.todo_detail_max_scroll;
             self.todo_execution_logs
                 .entry(todo_id)
                 .or_default()
                 .push(TodoExecutionEntry::Message(message_id));
+            if follow_detail_tail {
+                // 下一帧渲染会按新的 max_scroll clamp 到真实尾部；这样只有原本
+                // 已经位于详情底部的用户才继续跟随，向上阅读时保持当前位置。
+                self.todo_detail_scroll = u16::MAX;
+            }
         }
     }
 
@@ -6086,6 +6152,10 @@ impl AppState {
             self.selected_todo_id = None;
             self.todo_detail_open = false;
             self.todo_detail_scroll = 0;
+            self.todo_detail_max_scroll = 0;
+            if self.ui_focus == UiFocus::TodoDetail {
+                self.ui_focus = UiFocus::Todos;
+            }
             return;
         };
         let selected_valid = self
@@ -6094,158 +6164,247 @@ impl AppState {
             .is_some_and(|id| items.iter().any(|t| t.id == id));
         if !selected_valid {
             self.selected_todo_id = self.default_todo_id();
+            self.todo_detail_open = false;
             self.todo_detail_scroll = 0;
+            self.todo_detail_max_scroll = 0;
+            if self.ui_focus == UiFocus::TodoDetail {
+                self.ui_focus = UiFocus::Todos;
+            }
         }
     }
 
-    fn move_selected_todo(&mut self, delta: i32) {
-        self.ensure_selected_todo();
-        let Some(items) = self.current_todos.as_deref() else {
-            return;
+    fn focus_todo_edge(&mut self, first: bool) -> bool {
+        let id = self.current_todos.as_deref().and_then(|items| {
+            if first {
+                items.first()
+            } else {
+                items.last()
+            }
+        });
+        let Some(id) = id.map(|item| item.id.clone()) else {
+            return false;
         };
-        if items.is_empty() {
+        self.selected_todo_id = Some(id);
+        self.todo_panel_expanded = true;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.selected_sub_agent = None;
+        self.sub_agent_detail_open = false;
+        self.sub_agent_detail_scroll = 0;
+        self.ui_focus = UiFocus::Todos;
+        self.chat_follow_tail = true;
+        self.unseen_messages = false;
+        true
+    }
+
+    /// 在任务列表内部移动；到达边界时返回 false，交给上层跨区域导航。
+    fn move_selected_todo(&mut self, delta: i32) -> bool {
+        let ids: Vec<String> = self
+            .current_todos
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        if ids.is_empty() {
             self.selected_todo_id = None;
-            return;
+            return false;
         }
-        let current = self
+        let Some(current) = self
             .selected_todo_id
             .as_deref()
-            .and_then(|id| items.iter().position(|t| t.id == id))
-            .unwrap_or(0);
-        let next = (current as i32 + delta).clamp(0, items.len() as i32 - 1) as usize;
-        self.selected_todo_id = Some(items[next].id.clone());
+            .and_then(|id| ids.iter().position(|item_id| item_id == id))
+        else {
+            self.ensure_selected_todo();
+            return self.selected_todo_id.is_some();
+        };
+        let next = current as i32 + delta;
+        if next < 0 || next >= ids.len() as i32 {
+            return false;
+        }
+        self.selected_todo_id = Some(ids[next as usize].clone());
         self.todo_detail_scroll = 0;
         self.chat_follow_tail = true;
         self.unseen_messages = false;
+        true
     }
 
-    fn toggle_todo_detail(&mut self) {
+    fn enter_todo_detail(&mut self) -> bool {
         self.ensure_selected_todo();
-        if self.selected_todo_id.is_some() {
-            self.todo_detail_open = !self.todo_detail_open;
-            self.todo_detail_scroll = 0;
-            self.ui_focus = UiFocus::Todos;
+        if self.selected_todo_id.is_none() {
+            return false;
+        }
+        self.todo_detail_open = true;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.ui_focus = UiFocus::TodoDetail;
+        // Todo 详情追加在聊天流尾部；进入时主动贴底，确保新增的详情 viewport
+        // 立即出现在屏幕内。内部 scroll=0 仍表示从详情开头开始阅读。
+        self.chat_follow_tail = true;
+        self.unseen_messages = false;
+        true
+    }
+
+    fn leave_todo_detail(&mut self) -> bool {
+        if self.ui_focus != UiFocus::TodoDetail {
+            return false;
+        }
+        self.ui_focus = UiFocus::Todos;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.chat_follow_tail = true;
+        self.unseen_messages = false;
+        true
+    }
+
+    fn content_focus_active(&self) -> bool {
+        matches!(
+            self.ui_focus,
+            UiFocus::Chat | UiFocus::Todos | UiFocus::TodoDetail | UiFocus::SubAgents
+        )
+    }
+
+    /// Shift+↑ 从输入框显式进入内容区。优先选择离输入框最近且当前可见的运行中
+    /// SubAgent 面板，其次是内联 Todo，最后是聊天区底部。
+    fn enter_content_focus(&mut self) -> bool {
+        if self.content_focus_active() {
+            return true;
+        }
+
+        if self.has_running_sub_agents() {
+            if let Some(last_id) = self.sub_agents.keys().next_back().copied() {
+                self.selected_todo_id = None;
+                self.selected_sub_agent = Some(last_id);
+                self.todo_detail_open = false;
+                self.sub_agent_detail_scroll = 0;
+                self.ui_focus = UiFocus::SubAgents;
+                return true;
+            }
+        }
+
+        if self
+            .current_todos
+            .as_deref()
+            .is_some_and(|items| !items.is_empty())
+        {
+            self.selected_sub_agent = None;
+            self.todo_panel_expanded = true;
+            self.todo_detail_open = false;
+            self.ensure_selected_todo();
+            if self.selected_todo_id.is_some() {
+                self.todo_detail_scroll = 0;
+                self.ui_focus = UiFocus::Todos;
+                self.chat_follow_tail = true;
+                self.unseen_messages = false;
+                return true;
+            }
+        }
+
+        self.focus_chat_edge(false)
+    }
+
+    fn leave_content_focus(&mut self) -> bool {
+        if !self.content_focus_active() {
+            return false;
+        }
+        self.ui_focus = UiFocus::Composer;
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.selected_sub_agent = None;
+        self.sub_agent_detail_open = false;
+        self.sub_agent_detail_scroll = 0;
+        true
+    }
+
+    fn toggle_focused_content_detail(&mut self) {
+        match self.ui_focus {
+            UiFocus::Todos => {
+                let _ = self.enter_todo_detail();
+            }
+            UiFocus::TodoDetail => {
+                let _ = self.leave_todo_detail();
+            }
+            UiFocus::SubAgents if self.selected_sub_agent.is_some() => {
+                self.sub_agent_detail_open = !self.sub_agent_detail_open;
+                self.sub_agent_detail_scroll = 0;
+            }
+            UiFocus::Composer | UiFocus::Chat | UiFocus::AgentsCatalog | UiFocus::SubAgents => {}
         }
     }
 
     fn close_panel_focus(&mut self) -> bool {
+        if self.leave_todo_detail() {
+            return true;
+        }
+        if self.leave_content_focus() {
+            return true;
+        }
         match self.ui_focus {
-            UiFocus::Todos => {
-                if self.todo_detail_open {
-                    self.todo_detail_open = false;
-                } else {
-                    self.ui_focus = UiFocus::Chat;
-                    self.selected_todo_id = None;
-                }
-                true
-            }
             UiFocus::AgentsCatalog => {
                 if let Some(dialog) = &mut self.agents_dialog {
                     if dialog.detail_open {
                         dialog.detail_open = false;
                     } else {
                         self.agents_dialog = None;
-                        self.ui_focus = UiFocus::Chat;
+                        self.ui_focus = UiFocus::Composer;
                     }
                 } else {
-                    self.ui_focus = UiFocus::Chat;
+                    self.ui_focus = UiFocus::Composer;
                 }
                 true
             }
-            UiFocus::SubAgents => {
-                if self.selected_sub_agent.is_some() {
-                    if self.sub_agent_detail_open {
-                        self.sub_agent_detail_open = false;
-                    } else {
-                        self.selected_sub_agent = None;
-                        self.ui_focus = UiFocus::Chat;
-                    }
-                    true
-                } else {
-                    self.ui_focus = UiFocus::Chat;
-                    false
-                }
-            }
-            UiFocus::Chat => false,
+            UiFocus::Composer
+            | UiFocus::Chat
+            | UiFocus::Todos
+            | UiFocus::TodoDetail
+            | UiFocus::SubAgents => false,
         }
     }
 
-    fn move_selected_sub_agent(&mut self, delta: i32) {
+    fn focus_sub_agent_edge(&mut self, first: bool) -> bool {
+        let id = if first {
+            self.sub_agents.keys().next().copied()
+        } else {
+            self.sub_agents.keys().next_back().copied()
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.selected_sub_agent = Some(id);
+        self.sub_agent_detail_scroll = 0;
+        self.ui_focus = UiFocus::SubAgents;
+        true
+    }
+
+    /// 在 SubAgent 列表内部移动；到达边界时返回 false，交给上层跨区域导航。
+    fn move_selected_sub_agent(&mut self, delta: i32) -> bool {
         let ids: Vec<u64> = self.sub_agents.keys().copied().collect();
         if ids.is_empty() {
             self.selected_sub_agent = None;
-            return;
-        }
-        let current = self
-            .selected_sub_agent
-            .and_then(|id| ids.iter().position(|x| *x == id))
-            .unwrap_or_else(|| ids.len().saturating_sub(1));
-        let next = (current as i32 + delta).clamp(0, ids.len() as i32 - 1) as usize;
-        self.selected_sub_agent = Some(ids[next]);
-        self.sub_agent_detail_scroll = 0;
-        self.ui_focus = UiFocus::SubAgents;
-    }
-
-    fn should_enter_sub_agent_focus_from_arrows(&self) -> bool {
-        !self.sub_agents.is_empty()
-            && self.ui_focus == UiFocus::Chat
-            && self.selected_message_id.is_none()
-            && self.selectable_message_ids().is_empty()
-    }
-
-    fn has_message_toggle_target(&mut self) -> bool {
-        self.ensure_message_ids();
-        if let Some(id) = self.selected_message_id {
-            if self
-                .messages
-                .iter()
-                .skip(self.frozen_up_to.min(self.messages.len()))
-                .any(|m| m.id == id && is_expandable_message(m))
-            {
-                return true;
-            }
             return false;
         }
-        if let Some(id) = self.last_toggled_message_id {
-            return self
-                .messages
-                .iter()
-                .skip(self.frozen_up_to.min(self.messages.len()))
-                .any(|m| m.id == id && is_expandable_message(m));
-        }
-        self.last_expandable_message_id().is_some()
-    }
-
-    fn toggle_selected_message(&mut self) {
-        self.ensure_message_ids();
-        if self.selected_message_id.is_none() {
-            self.selected_message_id = self.last_toggled_message_id.and_then(|id| {
-                self.messages
-                    .iter()
-                    .skip(self.frozen_up_to.min(self.messages.len()))
-                    .any(|m| m.id == id && is_expandable_message(m))
-                    .then_some(id)
-            });
-        }
-        if self.selected_message_id.is_none() {
-            self.selected_message_id = self.last_expandable_message_id();
-        }
-        let Some(id) = self.selected_message_id else {
-            return;
+        let Some(current) = self
+            .selected_sub_agent
+            .and_then(|id| ids.iter().position(|x| *x == id))
+        else {
+            return self.focus_sub_agent_edge(delta >= 0);
         };
-        if let Some(msg) = self
-            .messages
-            .iter_mut()
-            .skip(self.frozen_up_to)
-            .find(|m| m.id == id && is_expandable_message(m))
-        {
-            msg.expanded = !msg.expanded;
-            self.last_toggled_message_id = Some(id);
-            self.message_detail_scroll.insert(id, 0);
-            self.selected_message_anchor = Some(ChatSelectionAnchor::Top);
-            self.chat_follow_tail = false;
-            self.unseen_messages = false;
+        let next = current as i32 + delta;
+        if next < 0 || next >= ids.len() as i32 {
+            return false;
         }
+        self.selected_sub_agent = Some(ids[next as usize]);
+        self.sub_agent_detail_scroll = 0;
+        self.ui_focus = UiFocus::SubAgents;
+        true
     }
 
     /// 是否有仍在运行的子 Agent（驱动 spinner 与底部聚合面板）
@@ -6348,12 +6507,14 @@ impl AppState {
                 // thinking 结束、正文开始：先折叠思考行
                 self.flush_thinking();
                 self.streaming_buf.push_str(&d);
+                self.note_new_chat_content();
             }
             AgentEvent::ThinkingDelta(d) => {
                 if self.thinking_buf.is_empty() {
                     self.thinking_started = Some(std::time::Instant::now());
                 }
                 self.thinking_buf.push_str(&d);
+                self.note_new_chat_content();
             }
 
             AgentEvent::ToolStart {
@@ -6387,7 +6548,6 @@ impl AppState {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 let summary = tool_result_summary(&name, &output, is_error);
-                let summary_is_first_line = summary_reuses_first_line(&name, &output, is_error);
                 // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
                 // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
                 // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
@@ -6402,15 +6562,8 @@ impl AppState {
                 } else {
                     None
                 };
-                let mut msg = ChatMessage::tool_result(
-                    output,
-                    is_error,
-                    elapsed_secs,
-                    seq,
-                    name,
-                    summary,
-                    summary_is_first_line,
-                );
+                let mut msg =
+                    ChatMessage::tool_result(output, is_error, elapsed_secs, seq, name, summary);
                 msg.sub_agent_id = sub_id;
                 match call_idx {
                     Some(i) => {
@@ -6575,13 +6728,10 @@ impl AppState {
                 response_tx,
             } => {
                 // 面板打开后拦截全部按键，用户不再有任何滚动手段；若沿用此前
-                // 上滚/选中留下的视口位置，附加在聊天区尾部的选项区会被裁出
-                // 可视范围且无法找回。这里强制回到贴底跟随并清掉选中锚点，
-                // 保证选项与操作提示立即可见。
+                // 上滚留下的视口位置，附加在聊天区尾部的选项区会被裁出可视范围。
+                // 这里强制回到贴底跟随，保证选项与操作提示立即可见。
                 self.chat_follow_tail = true;
                 self.unseen_messages = false;
-                self.selected_message_id = None;
-                self.selected_message_anchor = None;
                 self.ask_question_dialog = Some(AskQuestionDialog::new(questions, response_tx));
             }
 
@@ -7156,7 +7306,7 @@ pub async fn run_tui(
     // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
     // 代价是放弃终端原生 scrollback 与鼠标原生选中——改为 EnableMouseCapture
     // 接管鼠标滚轮驱动应用内翻页（`Event::Mouse` 分支），历史消息永远留在
-    // `AppState.messages` 里用 PageUp/PageDown/滚轮/Ctrl+O 翻看。
+    // `AppState.messages` 里用 PageUp/PageDown/滚轮翻看。
     execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
@@ -8412,10 +8562,6 @@ async fn tui_main(
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;
-                                                    state.selected_message_id = None;
-                                                    state.selected_message_anchor = None;
-                                                    state.last_toggled_message_id = None;
-                                                    state.message_detail_scroll.clear();
                                                     state.current_todos = None;
                                                     state.todo_stats.clear();
                                                     state.todo_execution_logs.clear();
@@ -9696,7 +9842,7 @@ async fn tui_main(
                         match key.code {
                             KeyCode::Esc => {
                                 state.agents_dialog = None;
-                                state.ui_focus = UiFocus::Chat;
+                                state.ui_focus = UiFocus::Composer;
                             }
                             KeyCode::Up => state.move_focus_selection(-1),
                             KeyCode::Down => state.move_focus_selection(1),
@@ -10449,6 +10595,56 @@ async fn tui_main(
                         }
                     }
 
+                    // Shift+↑ 是输入框 → 内容区的唯一显式入口。补全列表、配置输入框
+                    // 和各类模态面板都在更高优先级已经拦截，因此不会被这里抢键。
+                    let shift_up = is_content_focus_key(key);
+                    if shift_up && !state.content_focus_active() {
+                        let _ = state.enter_content_focus();
+                        continue;
+                    }
+
+                    // 内容区获得焦点后，普通 ↑/↓ 用于连续导航：Chat、Todo、
+                    // SubAgent 在各自边界自然跨区；TodoDetail 内则改为逐行滚动。
+                    // Esc 按“详情 → 列表 → 输入框”逐级返回并始终保留草稿。
+                    if state.content_focus_active() {
+                        match key.code {
+                            KeyCode::Up => {
+                                state.move_focus_selection(-1);
+                                continue;
+                            }
+                            KeyCode::Down => {
+                                state.move_focus_selection(1);
+                                continue;
+                            }
+                            KeyCode::PageUp => {
+                                state.scroll_focus_lines(-8);
+                                continue;
+                            }
+                            KeyCode::PageDown => {
+                                state.scroll_focus_lines(8);
+                                continue;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ')
+                                if key.modifiers.is_empty()
+                                    && !matches!(state.ui_focus, UiFocus::Chat) =>
+                            {
+                                state.toggle_focused_content_detail();
+                                continue;
+                            }
+                            KeyCode::Esc => {
+                                state.close_panel_focus();
+                                continue;
+                            }
+                            // Ctrl+T 自己负责聚焦/折叠 Todo；保持当前焦点让它能判断
+                            // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
+                            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            }
+                            _ => {
+                                state.leave_content_focus();
+                            }
+                        }
+                    }
+
                     // Ctrl+D → 立即退出
                     if is_quit(&key) {
                         state.should_quit = true;
@@ -10487,27 +10683,6 @@ async fn tui_main(
                         continue;
                     }
 
-                    // Enter/Space → 展开/收起当前列表焦点的详情（仅输入框为空时生效）
-                    if input.is_empty()
-                        && state.slash_completions.is_empty()
-                        && state.file_completions.is_empty()
-                        && state.input_owner.is_none()
-                        && matches!(key.code, KeyCode::Enter | KeyCode::Char(' '))
-                    {
-                        match state.ui_focus {
-                            UiFocus::Todos => {
-                                state.toggle_todo_detail();
-                                continue;
-                            }
-                            UiFocus::SubAgents if state.selected_sub_agent.is_some() => {
-                                state.sub_agent_detail_open = !state.sub_agent_detail_open;
-                                state.sub_agent_detail_scroll = 0;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-
                     // Shift+Tab → 循环切换模式
                     if key.code == KeyCode::BackTab {
                         let new_mode = cycle_mode(&state.mode);
@@ -10518,20 +10693,6 @@ async fn tui_main(
                             "mode.switched",
                             &[("mode", label)],
                         )));
-                        continue;
-                    }
-
-                    // Enter → 展开/收起当前选中的消息流概要项。若展开后用户滚走，
-                    // 仍可再次 Enter 回到最近展开的块并收起。
-                    if key.code == KeyCode::Enter
-                        && key.modifiers.is_empty()
-                        && input.is_empty()
-                        && state.slash_completions.is_empty()
-                        && state.file_completions.is_empty()
-                        && state.input_owner.is_none()
-                        && state.has_message_toggle_target()
-                    {
-                        state.toggle_selected_message();
                         continue;
                     }
 
@@ -10728,10 +10889,6 @@ async fn tui_main(
                                         state.turns = 0;
                                         state.tool_call_count = 0;
                                         state.tool_info.clear();
-                                        state.selected_message_id = None;
-                                        state.selected_message_anchor = None;
-                                        state.last_toggled_message_id = None;
-                                        state.message_detail_scroll.clear();
                                         state.current_todos = None;
                                         state.todo_stats.clear();
                                         state.todo_execution_logs.clear();
@@ -10740,7 +10897,7 @@ async fn tui_main(
                                         state.todo_detail_open = false;
                                         state.todo_detail_scroll = 0;
                                         state.agents_dialog = None;
-                                        state.ui_focus = UiFocus::Chat;
+                                        state.ui_focus = UiFocus::Composer;
                                         state.sub_input_tokens = 0;
                                         state.sub_output_tokens = 0;
                                         state.sub_agent_trace_cache.clear();
@@ -11122,10 +11279,6 @@ async fn tui_main(
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;
-                                                    state.selected_message_id = None;
-                                                    state.selected_message_anchor = None;
-                                                    state.last_toggled_message_id = None;
-                                                    state.message_detail_scroll.clear();
                                                     state.current_todos = None;
                                                     state.todo_stats.clear();
                                                     state.todo_execution_logs.clear();
@@ -11316,59 +11469,10 @@ async fn tui_main(
                                 state.pending_attachments = attachments;
                             }
                         }
-                    } else if key.code == KeyCode::Up {
-                        if input.is_empty()
-                            && state.slash_completions.is_empty()
-                            && state.file_completions.is_empty()
-                            && state.input_owner.is_none()
-                        {
-                            state.move_focus_selection(-1);
-                        } else if state.slash_completions.is_empty() && input.cursor_row == 0 {
-                            if !state.is_thinking && !state.input_history.is_empty() {
-                                if state.history_idx.is_none() {
-                                    state.history_draft = Some(input.lines.join("\n"));
-                                }
-                                let hist_len = state.input_history.len();
-                                let new_idx = match state.history_idx {
-                                    None => hist_len - 1,
-                                    Some(i) => i.saturating_sub(1),
-                                };
-                                state.history_idx = Some(new_idx);
-                                let recalled = state.input_history[new_idx].clone();
-                                input.set_text(&recalled);
-                            }
-                            // is_thinking 中或无历史记录 → 无操作，不 fallback 到滚动会话
-                        } else if state.slash_completions.is_empty() {
-                            input.move_cursor_up();
-                        }
-                    } else if key.code == KeyCode::Down {
-                        if input.is_empty()
-                            && state.slash_completions.is_empty()
-                            && state.file_completions.is_empty()
-                            && state.input_owner.is_none()
-                        {
-                            state.move_focus_selection(1);
-                        } else if state.slash_completions.is_empty()
-                            && input.cursor_row + 1 == input.lines.len()
-                        {
-                            if !state.is_thinking {
-                                if let Some(idx) = state.history_idx {
-                                    if idx + 1 < state.input_history.len() {
-                                        let new_idx = idx + 1;
-                                        state.history_idx = Some(new_idx);
-                                        let recalled = state.input_history[new_idx].clone();
-                                        input.set_text(&recalled);
-                                    } else {
-                                        // 超出历史末尾 → 退出导航态，恢复进入导航前的草稿
-                                        state.history_idx = None;
-                                        let draft = state.history_draft.take().unwrap_or_default();
-                                        input.set_text(&draft);
-                                    }
-                                }
-                            }
-                        } else if state.slash_completions.is_empty() {
-                            input.move_cursor_down();
-                        }
+                    } else if key.code == KeyCode::Up && key.modifiers.is_empty() {
+                        state.navigate_input_or_history(&mut input, -1);
+                    } else if key.code == KeyCode::Down && key.modifiers.is_empty() {
+                        state.navigate_input_or_history(&mut input, 1);
                     } else if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
                         if input.is_empty()
                             && state.slash_completions.is_empty()
@@ -11465,9 +11569,6 @@ async fn tui_main(
                                     // Ctrl+L：对齐大多数 shell/终端的"清屏重绘"语义。
                                     let _ = terminal.clear();
                                 }
-                                'o' => {
-                                    state.toggle_selected_message();
-                                }
                                 't' => {
                                     // Ctrl+T — 进入任务列表焦点，并保留原折叠/展开语义
                                     if let Some(items) = state.current_todos.as_deref() {
@@ -11479,6 +11580,10 @@ async fn tui_main(
                                         }
                                         state.ensure_selected_todo();
                                         if state.selected_todo_id.is_some() {
+                                            state.selected_sub_agent = None;
+                                            state.todo_detail_open = false;
+                                            state.todo_detail_scroll = 0;
+                                            state.todo_detail_max_scroll = 0;
                                             state.ui_focus = UiFocus::Todos;
                                             state.chat_follow_tail = true;
                                             state.unseen_messages = false;
@@ -11592,12 +11697,11 @@ async fn tui_main(
 fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
     let mut result = Vec::new();
     let mut tool_seq = 0usize;
-    // tool_use_id → 分配给该 ToolCall 的 seq，供同一助手回合内并行工具调用各自
-    // 找到自己的 ToolResult（不能像以前那样直接复用循环里"当前"的 tool_seq——
-    // 一个回合有多个并行调用时，所有 ToolResult 会被错误地全部对应到最后一个
-    // 调用的 seq，导致其余调用永远配不上自己的结果，Ctrl+O/工具调用配对等
-    // 依赖 sequence_no 的逻辑全部错位）。
-    let mut seq_by_tool_use_id: HashMap<String, usize> = HashMap::new();
+    // tool_use_id → (seq, tool name)，供同一助手回合内并行工具调用各自找到自己
+    // 的 ToolResult，并让恢复后的 Edit/Write 结果仍能识别为 diff（不能像以前那样
+    // 直接复用循环里"当前"的 tool_seq——一个回合有多个并行调用时，所有结果会
+    // 错误地对应到最后一个调用，工具调用配对逻辑全部错位）。
+    let mut tool_by_use_id: HashMap<String, (usize, String)> = HashMap::new();
 
     for msg in messages {
         match &msg.role {
@@ -11626,15 +11730,10 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                                 .next()
                                 .map(|l| l.trim().to_string())
                                 .unwrap_or_default();
-                            let seq = seq_by_tool_use_id.get(tool_use_id).copied().unwrap_or(0);
+                            let (seq, name) =
+                                tool_by_use_id.get(tool_use_id).cloned().unwrap_or_default();
                             result.push(ChatMessage::tool_result(
-                                text,
-                                *is_error,
-                                0.0,
-                                seq,
-                                String::new(),
-                                summary,
-                                true,
+                                text, *is_error, 0.0, seq, name, summary,
                             ));
                         }
                         _ => {}
@@ -11654,7 +11753,7 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                                 text_buf.clear();
                             }
                             tool_seq += 1;
-                            seq_by_tool_use_id.insert(id.clone(), tool_seq);
+                            tool_by_use_id.insert(id.clone(), (tool_seq, name.clone()));
                             result.push(ChatMessage::tool_call(name.clone(), tool_seq));
                         }
                         _ => {}
@@ -11676,8 +11775,8 @@ mod reconstruct_display_tests {
     /// 回归测试：一个助手回合里有多个并行工具调用时，`reconstruct_display`
     /// 曾经用循环里"当前"的 tool_seq 给所有 ToolResult 赋值——多个并行调用的
     /// 结果会全部错误地对应到最后一个调用的 seq，导致除最后一个以外的
-    /// ToolCall 永远找不到自己的 ToolResult，Ctrl+O 等按 sequence_no 配对的
-    /// 逻辑全部错位。现在改用 tool_use_id 精确配对，每个调用都应该找到自己
+    /// ToolCall 永远找不到自己的 ToolResult，所有按 sequence_no 配对的逻辑
+    /// 都会错位。现在改用 tool_use_id 精确配对，每个调用都应该找到自己
     /// 的结果。
     #[test]
     fn parallel_tool_calls_get_distinct_matching_sequence_numbers() {
@@ -11692,7 +11791,7 @@ mod reconstruct_display_tests {
                     },
                     ContentBlock::ToolUse {
                         id: "call-b".to_string(),
-                        name: "Read".to_string(),
+                        name: "Edit".to_string(),
                         input: serde_json::json!({"file_path": "b.rs"}),
                     },
                 ],
@@ -11733,8 +11832,10 @@ mod reconstruct_display_tests {
         assert_ne!(call_a_seq, call_b_seq, "两个并行调用必须分配不同的 seq");
         assert_eq!(display[2].sequence_no, call_a_seq);
         assert_eq!(display[2].content, "content-a");
+        assert_eq!(display[2].tool_name.as_deref(), Some("Read"));
         assert_eq!(display[3].sequence_no, call_b_seq);
         assert_eq!(display[3].content, "content-b");
+        assert_eq!(display[3].tool_name.as_deref(), Some("Edit"));
     }
 }
 
@@ -11868,15 +11969,17 @@ mod sub_agent_ui_tests {
     }
 
     #[test]
-    fn arrows_do_not_steal_focus_when_timeline_has_messages() {
+    fn content_focus_requires_explicit_entry_and_prefers_visible_subagents() {
         let mut state = make_state();
         tool_start(&mut state, "call-1");
         started(&mut state, 1, "任务", false);
 
-        assert_eq!(state.ui_focus, UiFocus::Chat);
-        assert!(!state.should_enter_sub_agent_focus_from_arrows());
+        assert_eq!(state.ui_focus, UiFocus::Composer);
+        state.move_focus_selection(1);
+        assert_eq!(state.ui_focus, UiFocus::Composer);
+        assert_eq!(state.selected_sub_agent, None);
 
-        state.move_selected_sub_agent(1);
+        assert!(state.enter_content_focus());
 
         assert_eq!(state.ui_focus, UiFocus::SubAgents);
         assert_eq!(state.selected_sub_agent, Some(1));
@@ -12296,16 +12399,13 @@ mod ask_question_dialog_tests {
         )
     }
 
-    /// 面板打开后拦截全部按键，用户不再有滚动手段：打开时必须强制回到贴底
-    /// 跟随并清掉选中锚点，否则此前上滚/选中留下的视口位置会把附加在聊天区
-    /// 尾部的选项区裁出可视范围且无法找回（遮挡回归，见 AskQuestions 事件处理）。
+    /// 面板打开后拦截全部按键，用户不再有滚动手段：打开时必须强制回到贴底，
+    /// 否则此前上滚留下的视口位置会把尾部选项区裁出可视范围且无法找回。
     #[test]
-    fn ask_questions_event_forces_follow_tail_and_clears_selection() {
+    fn ask_questions_event_forces_follow_tail() {
         let mut state = make_state();
         state.chat_follow_tail = false;
         state.unseen_messages = true;
-        state.selected_message_id = Some(7);
-        state.selected_message_anchor = Some(ChatSelectionAnchor::Top);
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
         state.apply_agent_event(AgentEvent::AskQuestions {
@@ -12316,8 +12416,6 @@ mod ask_question_dialog_tests {
         assert!(state.ask_question_dialog.is_some());
         assert!(state.chat_follow_tail);
         assert!(!state.unseen_messages);
-        assert_eq!(state.selected_message_id, None);
-        assert!(state.selected_message_anchor.is_none());
     }
 }
 

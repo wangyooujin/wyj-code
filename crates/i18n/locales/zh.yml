@@ -152,14 +152,14 @@ help:
     - `Ctrl+C` — 中断当前任务（二次按下退出程序）
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
-    - `Ctrl+O` — 展开/折叠工具结果
     - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
     - `Ctrl+U` — 删除光标到行首
     - `Ctrl+W` — 删除前一个词
-    - `↑` / `↓` — 输入框为空时选择当前焦点列表/概要消息；有输入时移动光标或浏览输入历史
+    - `↑` / `↓` — 浏览输入历史；多行输入中先移动光标，到首行/末行后切换历史
+    - `Shift+↑` — 从输入框进入内容区；↑/↓ 在聊天、任务、SubAgent 间连续导航，Enter/Space 进入任务/SubAgent 详情，Esc 逐级返回
     - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
     - `/` — 命令补全（Tab 确认，Esc 取消）
     - `!<命令>` — 直接执行 Bash 命令
@@ -199,6 +199,10 @@ hooks:
   matcher_line: "matcher: {matcher}"
   matcher_any: "*（匹配全部工具）"
   command_line: "({timeout}s) `{command}`"
+
+todo:
+  focus_hint: "↑↓ 选择并跨区   Enter/Space 查看详情   Esc 返回输入框"
+  detail_hint: "↑↓ 逐行滚动   PageUp/PageDown 翻页   Enter/Space 或 Esc 返回任务列表"
 
 agents:
   desc: "打开 Agent 类型目录（内置 + 自定义定义文件）"
