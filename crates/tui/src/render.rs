@@ -2,13 +2,13 @@
 
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, ChatSelectionAnchor, ExecModeConfirmDialog,
-    ExtensionsDialog, FlatRow, ImportDialog, ImportStage, InProgressAnswer, InputOwner,
-    McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole,
-    PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
-    ProfileDialog, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
-    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog,
-    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    AskQuestionStage, Attachment, ChatMessage, ExecModeConfirmDialog, ExtensionsDialog, FlatRow,
+    ImportDialog, ImportStage, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
+    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
+    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
+    ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
+    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsDialog,
+    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
     SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
@@ -228,52 +228,21 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Spinner 动画帧（braille，复刻 Claude Code 风格）
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// ToolResult 折叠阈值：内容行数超过此值才折叠，否则始终全量展示。
-const THINKING_FOLD_LINES: usize = 5;
-const MESSAGE_DETAIL_MIN_ROWS: usize = 8;
-const MESSAGE_DETAIL_MAX_ROWS: usize = 18;
-const MESSAGE_DETAIL_DEFAULT_ROWS: usize = 12;
+/// Codex 风格静态工具预览：标题不计入，正文最多展示三个终端视觉行。
+const TASK_PREVIEW_MAX_ROWS: usize = 3;
 
-/// 从正文行中去掉与 `⎿` 摘要行重复的第一条非空行——仅当 `summary_is_first_line`
-/// 为真（即摘要直接复用了正文首行原文，如 Bash 输出首行）时才需要去重；
-/// `read`/`grep`/`glob`/`webfetch` 等摘要是合成统计文案，不会与正文重复，原样保留。
-fn strip_summary_duplicate_line<'a>(
-    lines: &[&'a str],
-    summary_is_first_line: bool,
-) -> Vec<&'a str> {
-    if !summary_is_first_line {
-        return lines.to_vec();
-    }
-    match lines.iter().position(|l| !l.trim().is_empty()) {
-        Some(idx) => {
-            let mut v = lines.to_vec();
-            v.remove(idx);
-            v
-        }
-        None => lines.to_vec(),
-    }
-}
-
-/// 渲染 ToolResult 正文行，`take` 为 `Some(n)` 时只取开头 n 行（折叠态预览），
-/// `None` 时全量渲染（展开态 / 短内容始终全量展示）。
-fn render_tool_result_body_lines(
+fn push_capped_preview_lines(
     lines: &mut Vec<Line<'static>>,
-    content_lines: &[&str],
-    take: Option<usize>,
-    line_style: Style,
-    max_content_width: usize,
+    preview: Vec<Line<'static>>,
+    ellipsis_prefix: &str,
 ) {
-    let iter: Box<dyn Iterator<Item = &&str>> = match take {
-        Some(n) => Box::new(content_lines.iter().take(n)),
-        None => Box::new(content_lines.iter()),
-    };
-    for l in iter {
-        for wrapped in wrap_line(l, max_content_width.saturating_sub(8)) {
-            lines.push(Line::from(Span::styled(
-                format!("       {wrapped}"),
-                line_style,
-            )));
-        }
+    let truncated = preview.len() > TASK_PREVIEW_MAX_ROWS;
+    lines.extend(preview.into_iter().take(TASK_PREVIEW_MAX_ROWS));
+    if truncated {
+        lines.push(Line::from(Span::styled(
+            format!("{ellipsis_prefix}..."),
+            Theme::dim(),
+        )));
     }
 }
 
@@ -526,63 +495,8 @@ fn push_sub_agent_tool_log(
 /// `render_chat_message` 渲染单条消息时需要的跨消息共享只读上下文。
 struct ChatRenderCtx<'a> {
     max_content_width: usize,
-    selected_message_id: Option<u64>,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
-    message_detail_scroll: &'a HashMap<u64, u16>,
-    detail_viewport_rows: usize,
-}
-
-fn detail_viewport_rows(chat_view_height: usize) -> usize {
-    if chat_view_height == 0 {
-        return MESSAGE_DETAIL_DEFAULT_ROWS;
-    }
-    ((chat_view_height * 4).div_ceil(10)).clamp(MESSAGE_DETAIL_MIN_ROWS, MESSAGE_DETAIL_MAX_ROWS)
-}
-
-fn selected_line_style(
-    line: Line<'static>,
-    selected_style: &dyn Fn(Style) -> Style,
-) -> Line<'static> {
-    if line.spans.is_empty() {
-        return line;
-    }
-    let spans = line
-        .spans
-        .into_iter()
-        .map(|span| Span::styled(span.content.into_owned(), selected_style(span.style)))
-        .collect::<Vec<_>>();
-    Line::from(spans)
-}
-
-fn push_detail_viewport_lines(
-    lines: &mut Vec<Line<'static>>,
-    detail_lines: Vec<Line<'static>>,
-    detail_scroll: u16,
-    viewport_rows: usize,
-    hint_prefix: &str,
-) {
-    if detail_lines.is_empty() {
-        return;
-    }
-    let viewport = detail_lines.len().min(viewport_rows.max(1));
-    let max_scroll = detail_lines.len().saturating_sub(viewport);
-    let scroll = (detail_scroll as usize).min(max_scroll);
-    for line in detail_lines.into_iter().skip(scroll).take(viewport) {
-        lines.push(line);
-    }
-    if max_scroll > 0 {
-        let below = max_scroll.saturating_sub(scroll);
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{hint_prefix}… detail {}/{} · {} below · pgup/pgdn",
-                scroll + 1,
-                max_scroll + 1,
-                below
-            ),
-            Theme::dim(),
-        )));
-    }
 }
 
 fn clean_thinking_lines(content: &str) -> Vec<&str> {
@@ -593,82 +507,29 @@ fn clean_thinking_lines(content: &str) -> Vec<&str> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_thinking_block(
-    lines: &mut Vec<Line<'static>>,
-    msg_id: u64,
-    content: &str,
-    expanded: bool,
-    selected: bool,
-    max_content_width: usize,
-    detail_scroll: u16,
-    detail_viewport_rows: usize,
-) {
-    let selected_style = |st: Style| -> Style {
-        if selected {
-            st.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            st
-        }
-    };
+fn render_thinking_block(lines: &mut Vec<Line<'static>>, content: &str, max_content_width: usize) {
     let clean_lines = clean_thinking_lines(content);
     let total = clean_lines.len();
-    let action = if selected && total > THINKING_FOLD_LINES {
-        if expanded {
-            "  [ctrl+o collapse]"
-        } else {
-            "  [ctrl+o expand]"
-        }
-    } else {
-        ""
-    };
-    let folded = if total > THINKING_FOLD_LINES {
+    let folded = if total > TASK_PREVIEW_MAX_ROWS {
         format!(" · {total} lines")
     } else {
         String::new()
     };
-    let marker = if selected {
-        "  ▶ ✻ thinking"
-    } else {
-        "  ✻ thinking"
-    };
     lines.push(Line::from(vec![
-        Span::styled(marker, selected_style(Style::default().fg(Color::Cyan))),
+        Span::styled("  ✻ thinking", Style::default().fg(Color::Cyan)),
         Span::styled(folded, Theme::dim()),
-        Span::styled(action, Theme::dim()),
     ]));
-    if expanded {
-        let detail_lines = clean_lines
-            .into_iter()
-            .map(|line| {
-                Line::from(Span::styled(
-                    format!(
-                        "    {}",
-                        truncate_line(line, max_content_width.saturating_sub(4))
-                    ),
-                    Theme::dim(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        let _ = msg_id;
-        push_detail_viewport_lines(
-            lines,
-            detail_lines,
-            detail_scroll,
-            detail_viewport_rows,
-            "    ",
-        );
-    } else {
-        for line in clean_lines.into_iter().take(THINKING_FOLD_LINES) {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "    {}",
-                    truncate_line(line, max_content_width.saturating_sub(4))
-                ),
+
+    let mut preview = Vec::new();
+    for line in clean_lines {
+        for wrapped in wrap_line(line, max_content_width.saturating_sub(4).max(1)) {
+            preview.push(Line::from(Span::styled(
+                format!("    {wrapped}"),
                 Theme::dim(),
             )));
         }
     }
+    push_capped_preview_lines(lines, preview, "    ");
 }
 
 /// 渲染单条消息（追加到 `lines`）。从 `draw_chat` 提炼出来，保证完整消息流、
@@ -681,14 +542,6 @@ fn render_chat_message(
     ctx: &ChatRenderCtx,
 ) {
     let max_content_width = ctx.max_content_width;
-    let selected = ctx.selected_message_id == Some(msg.id);
-    let selected_style = |st: Style| -> Style {
-        if selected {
-            st.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-        } else {
-            st
-        }
-    };
     match msg.role {
         MessageRole::User => {
             if !*is_first_user {
@@ -701,38 +554,42 @@ fn render_chat_message(
 
             let mut content_lines = msg.content.lines();
             let first_line = content_lines.next().unwrap_or("");
-            let marker = if selected { "▶ ❯ " } else { "❯ " };
-            lines.push(Line::from(vec![
-                Span::styled(marker, selected_style(Theme::user_prefix())),
-                Span::styled(
-                    truncate_line(first_line, max_content_width),
-                    selected_style(
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ),
-            ]));
+            let first_style = Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD);
+            for (idx, wrapped) in wrap_line(first_line, max_content_width.saturating_sub(2).max(1))
+                .into_iter()
+                .enumerate()
+            {
+                let prefix = if idx == 0 { "❯ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Theme::user_prefix()),
+                    Span::styled(wrapped, first_style),
+                ]));
+            }
             for l in content_lines {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", truncate_line(l, max_content_width)),
-                    selected_style(Style::default()),
-                )));
+                for wrapped in wrap_line(l, max_content_width.saturating_sub(2).max(1)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {wrapped}"),
+                        Style::default(),
+                    )));
+                }
             }
         }
 
         MessageRole::Assistant => {
             if msg.is_error {
-                for (idx, l) in msg.content.lines().enumerate() {
-                    let prefix = if selected && idx == 0 {
-                        "  ▶ ✗ "
-                    } else {
-                        "  ✗ "
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("{prefix}{}", truncate_line(l, max_content_width)),
-                        selected_style(Theme::error()),
-                    )));
+                for l in msg.content.lines() {
+                    for (idx, wrapped) in wrap_line(l, max_content_width.saturating_sub(4).max(1))
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let prefix = if idx == 0 { "  ✗ " } else { "    " };
+                        lines.push(Line::from(Span::styled(
+                            format!("{prefix}{wrapped}"),
+                            Theme::error(),
+                        )));
+                    }
                 }
             } else {
                 // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
@@ -747,49 +604,21 @@ fn render_chat_message(
                         cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
                     }
                 };
-                if selected {
-                    if let Some(first) = rendered.first_mut() {
-                        first
-                            .spans
-                            .insert(0, Span::styled("  ▶ ", selected_style(Theme::dim())));
-                    } else {
-                        rendered.push(Line::from(Span::styled(
-                            "  ▶ assistant",
-                            selected_style(Theme::dim()),
-                        )));
-                    }
-                    lines.extend(
-                        rendered
-                            .into_iter()
-                            .map(|line| selected_line_style(line, &selected_style)),
-                    );
-                } else {
-                    lines.extend(rendered);
-                }
+                lines.append(&mut rendered);
             }
         }
 
         MessageRole::Thinking => {
-            render_thinking_block(
-                lines,
-                msg.id,
-                &msg.content,
-                msg.expanded,
-                selected,
-                max_content_width,
-                ctx.message_detail_scroll.get(&msg.id).copied().unwrap_or(0),
-                ctx.detail_viewport_rows,
-            );
+            render_thinking_block(lines, &msg.content, max_content_width);
         }
 
         // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
         MessageRole::ToolCall => {
-            let marker = if selected { "  ▶ ⏺ " } else { "  ⏺ " };
             lines.push(Line::from(vec![
-                Span::styled(marker, selected_style(Theme::tool_call())),
+                Span::styled("  ⏺ ", Theme::tool_call()),
                 Span::styled(
                     truncate_line(&msg.content, max_content_width.saturating_sub(4)),
-                    selected_style(Theme::tool_call()),
+                    Theme::tool_call(),
                 ),
             ]));
 
@@ -837,7 +666,7 @@ fn render_chat_message(
 
         // ─── ⎿  summary · elapsed  ────────────────────────────────────
         MessageRole::ToolResult => {
-            render_tool_result_block(lines, None, msg, selected, &selected_style, ctx);
+            render_tool_result_block(lines, None, msg, ctx);
         }
 
         MessageRole::BashOutput => {
@@ -852,19 +681,8 @@ fn render_chat_message(
                 .map(|s| format!(" · {}", format_hms(s)))
                 .unwrap_or_default();
             let total = msg.content.lines().count();
-            let first = msg
-                .content
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("(no output)");
-            let marker = if selected { "  ▶ " } else { "  " };
-            let action = if msg.expanded {
-                "  [ctrl+o collapse]"
-            } else {
-                "  [ctrl+o expand]"
-            };
             lines.push(Line::from(vec![
-                Span::styled(format!("{marker}{icon} bash"), selected_style(style)),
+                Span::styled(format!("  {icon} bash"), style),
                 Span::styled(elapsed_str, Theme::dim()),
                 Span::styled(
                     if total > 0 {
@@ -874,38 +692,30 @@ fn render_chat_message(
                     },
                     Theme::dim(),
                 ),
-                Span::styled(
-                    format!(
-                        " · {}",
-                        truncate_line(first, max_content_width.saturating_sub(18))
-                    ),
-                    selected_style(Theme::dim()),
-                ),
-                Span::styled(if selected { action } else { "" }, Theme::dim()),
             ]));
-            if msg.expanded {
-                let detail_lines = msg
-                    .content
-                    .lines()
-                    .map(|l| {
-                        Line::from(Span::styled(
-                            format!(
-                                "    {}",
-                                truncate_line(l, max_content_width.saturating_sub(2))
-                            ),
-                            Style::default().fg(Color::DarkGray),
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                let detail_scroll = ctx.message_detail_scroll.get(&msg.id).copied().unwrap_or(0);
-                push_detail_viewport_lines(
-                    lines,
-                    detail_lines,
-                    detail_scroll,
-                    ctx.detail_viewport_rows,
-                    "    ",
-                );
+            let body_style = if msg.is_error {
+                Theme::error()
+            } else {
+                Theme::tool_result()
+            };
+            let mut preview = Vec::new();
+            let source = if msg.content.trim().is_empty() {
+                vec!["(no output)"]
+            } else {
+                msg.content.lines().collect::<Vec<_>>()
+            };
+            let mut first = true;
+            for raw in source {
+                for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
+                    let prefix = if first { "    ⎿ " } else { "       " };
+                    preview.push(Line::from(Span::styled(
+                        format!("{prefix}{wrapped}"),
+                        body_style,
+                    )));
+                    first = false;
+                }
             }
+            push_capped_preview_lines(lines, preview, "       ");
         }
 
         MessageRole::System => {
@@ -914,24 +724,15 @@ fn render_chat_message(
             } else {
                 ("  ⚙ ", Style::default().fg(Color::Cyan))
             };
-            let marker = if selected {
-                format!("  ▶{}", marker.trim_start())
-            } else {
-                marker.to_string()
-            };
             lines.push(Line::from(vec![
-                Span::styled(marker, selected_style(style)),
-                Span::styled(msg.content.clone(), selected_style(style)),
+                Span::styled(marker, style),
+                Span::styled(msg.content.clone(), style),
             ]));
         }
         MessageRole::TurnSummary => {
             lines.push(Line::from(vec![Span::styled(
-                if selected {
-                    format!("  ▶ {}", msg.content)
-                } else {
-                    format!("  {}", msg.content)
-                },
-                selected_style(Theme::dim()),
+                format!("  {}", msg.content),
+                Theme::dim(),
             )]));
         }
 
@@ -941,36 +742,25 @@ fn render_chat_message(
         MessageRole::PlanProposal => {
             let divider = "─".repeat(max_content_width.saturating_sub(2));
             lines.push(Line::from(Span::styled(
-                if selected {
-                    "  ▶ 📋 计划"
-                } else {
-                    "  📋 计划"
-                },
-                selected_style(
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                "  📋 计划",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
                 format!("  {divider}"),
-                selected_style(Style::default().fg(Color::Blue)),
+                Style::default().fg(Color::Blue),
             )));
             let mut body: Vec<Line<'static>> = vec![];
             render_markdown(&mut body, &msg.content, max_content_width.saturating_sub(2));
             for l in body {
                 let mut spans = vec![Span::raw("  ")];
                 spans.extend(l.spans);
-                let line = Line::from(spans);
-                if selected {
-                    lines.push(selected_line_style(line, &selected_style));
-                } else {
-                    lines.push(line);
-                }
+                lines.push(Line::from(spans));
             }
             lines.push(Line::from(Span::styled(
                 format!("  {divider}"),
-                selected_style(Style::default().fg(Color::Blue)),
+                Style::default().fg(Color::Blue),
             )));
         }
     }
@@ -996,11 +786,31 @@ fn message_summary(msg: &ChatMessage) -> String {
 }
 
 fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
-    let raw_content_lines: Vec<&str> = msg.content.lines().collect();
-    let content_lines_deduped =
-        strip_summary_duplicate_line(&raw_content_lines, msg.summary_is_first_line);
-    let is_read = msg.tool_name.as_deref() == Some("Read");
-    content_lines_deduped
+    let raw = msg.content.lines().collect::<Vec<_>>();
+    let is_diff = !msg.is_error
+        && msg
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| matches!(name, "Edit" | "Write"));
+    let content = if is_diff {
+        raw.iter()
+            .position(|line| {
+                line.starts_with("+ ")
+                    || line.starts_with("- ")
+                    || line.starts_with("  ")
+                    || line.starts_with("...(truncated")
+                    || line.starts_with("…(truncated")
+            })
+            .map(|idx| raw[idx..].to_vec())
+            .unwrap_or(raw)
+    } else {
+        raw
+    };
+    let is_read = msg
+        .tool_name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("Read"));
+    content
         .into_iter()
         .map(|l| {
             if is_read {
@@ -1012,72 +822,62 @@ fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
         .collect()
 }
 
-fn render_tool_result_details(
+fn render_tool_result_preview(
     lines: &mut Vec<Line<'static>>,
     msg: &ChatMessage,
-    content_lines: &[&str],
     ctx: &ChatRenderCtx,
 ) {
-    if content_lines.is_empty() || !msg.expanded {
-        return;
-    }
     let max_content_width = ctx.max_content_width;
-    let is_diff = matches!(msg.tool_name.as_deref(), Some("Edit") | Some("Write"));
-    lines.push(Line::from(Span::styled(
-        format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
-        Theme::dim(),
-    )));
-    let mut detail_lines: Vec<Line<'static>> = Vec::new();
-    if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
-        push_sub_agent_tool_log(&mut detail_lines, &s.tool_log, max_content_width);
-    }
-    if is_diff {
-        for l in content_lines.iter() {
-            let style = if l.starts_with("+ ") {
+    let is_diff = !msg.is_error
+        && msg
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| matches!(name, "Edit" | "Write"));
+    let content_lines = tool_result_content_lines(msg);
+    let fallback = message_summary(msg);
+    let source = if content_lines.is_empty() {
+        vec![fallback.as_str()]
+    } else {
+        content_lines
+    };
+    let mut preview = Vec::new();
+    let mut first = true;
+    for raw in source {
+        let style = if msg.is_error {
+            Theme::error()
+        } else if is_diff {
+            if raw.starts_with("+ ") {
                 Style::default().fg(Color::Green)
-            } else if l.starts_with("- ") {
+            } else if raw.starts_with("- ") {
                 Theme::error()
             } else {
                 Theme::dim()
-            };
-            detail_lines.push(Line::from(Span::styled(
-                format!(
-                    "       {}",
-                    truncate_line(l, max_content_width.saturating_sub(8))
-                ),
-                style,
-            )));
-        }
-    } else {
-        let line_style = if msg.is_error {
-            Theme::error()
+            }
         } else {
             Theme::tool_result()
         };
-        render_tool_result_body_lines(
-            &mut detail_lines,
-            content_lines,
-            None,
-            line_style,
-            max_content_width,
-        );
+        for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
+            let prefix = if is_diff {
+                "    "
+            } else if first {
+                "    ⎿ "
+            } else {
+                "       "
+            };
+            preview.push(Line::from(Span::styled(
+                format!("{prefix}{wrapped}"),
+                style,
+            )));
+            first = false;
+        }
     }
-    let detail_scroll = ctx.message_detail_scroll.get(&msg.id).copied().unwrap_or(0);
-    push_detail_viewport_lines(
-        lines,
-        detail_lines,
-        detail_scroll,
-        ctx.detail_viewport_rows,
-        "       ",
-    );
+    push_capped_preview_lines(lines, preview, if is_diff { "    " } else { "       " });
 }
 
 fn render_tool_result_block(
     lines: &mut Vec<Line<'static>>,
     call: Option<&ChatMessage>,
     result: &ChatMessage,
-    selected: bool,
-    selected_style: &dyn Fn(Style) -> Style,
     ctx: &ChatRenderCtx,
 ) {
     let max_content_width = ctx.max_content_width;
@@ -1086,62 +886,28 @@ fn render_tool_result_block(
         .filter(|&s| s > 0.0)
         .map(|s| format!(" · {}", format_hms(s)))
         .unwrap_or_default();
-    let (summary_style, prefix) = if result.is_error {
-        (Theme::error(), "✗ ")
-    } else {
-        (Theme::dim(), "")
-    };
-    let summary = message_summary(result);
-    let action = if result.expanded {
-        "  [ctrl+o collapse]"
-    } else {
-        "  [ctrl+o expand]"
-    };
 
     if let Some(call) = call {
-        let marker = if selected { "  ▶ ⏺ " } else { "  ⏺ " };
-        let call_max = (max_content_width / 3).clamp(12, 48);
-        let fixed = marker.chars().map(char_display_width).sum::<usize>()
-            + call_max.min(call.content.chars().map(char_display_width).sum::<usize>())
-            + 5
-            + elapsed_str.chars().map(char_display_width).sum::<usize>()
-            + if selected { action.len() } else { 0 };
-        let summary_max = max_content_width.saturating_sub(fixed).max(12);
         lines.push(Line::from(vec![
-            Span::styled(marker, selected_style(Theme::tool_call())),
+            Span::styled("  ⏺ ", Theme::tool_call()),
             Span::styled(
-                truncate_line(&call.content, call_max),
-                selected_style(Theme::tool_call()),
-            ),
-            Span::styled("  ⎿ ", selected_style(Theme::dim())),
-            Span::styled(
-                format!("{prefix}{}", truncate_line(&summary, summary_max)),
-                selected_style(summary_style),
+                truncate_line(&call.content, max_content_width.saturating_sub(16)),
+                Theme::tool_call(),
             ),
             Span::styled(elapsed_str, Theme::dim()),
-            Span::styled(if selected { action } else { "" }, Theme::dim()),
+            if result.is_error {
+                Span::styled(" · failed", Theme::error())
+            } else {
+                Span::raw("")
+            },
         ]));
     } else {
-        let marker = if selected { "  ▶ ⎿  " } else { "    ⎿  " };
-        let fixed = marker.chars().map(char_display_width).sum::<usize>()
-            + elapsed_str.chars().map(char_display_width).sum::<usize>()
-            + if selected { action.len() } else { 0 };
         lines.push(Line::from(vec![
-            Span::styled(marker, selected_style(Theme::dim())),
-            Span::styled(
-                format!(
-                    "{prefix}{}",
-                    truncate_line(&summary, max_content_width.saturating_sub(fixed).max(12))
-                ),
-                selected_style(summary_style),
-            ),
+            Span::styled("  ⎿ result", Theme::dim()),
             Span::styled(elapsed_str, Theme::dim()),
-            Span::styled(if selected { action } else { "" }, Theme::dim()),
         ]));
     }
-
-    let content_lines = tool_result_content_lines(result);
-    render_tool_result_details(lines, result, &content_lines, ctx);
+    render_tool_result_preview(lines, result, ctx);
 }
 
 /// 渲染欢迎页所有行。供 [`build_pending_chat_lines`] 与高度测量复用，避免两处
@@ -1176,7 +942,6 @@ pub(crate) fn build_pending_chat_lines(
     max_content_width: usize,
 ) -> Vec<Line<'static>> {
     state.ensure_message_ids();
-    state.selected_message_line = None;
     // 新空会话的欢迎页是消息流顶部的固定头部，真实消息和流式输出都紧接其后。
     // 会话恢复、切换和 /clear 会显式抑制欢迎页，防止它混进已有历史。
     let mut lines: Vec<Line<'static>> = vec![];
@@ -1190,7 +955,6 @@ pub(crate) fn build_pending_chat_lines(
         .iter()
         .take(start)
         .any(|m| matches!(m.role, MessageRole::User));
-    let mut selected_line = None;
     lines.extend(render_message_range(
         MessageRangeRenderArgs {
             messages: &state.messages,
@@ -1198,26 +962,12 @@ pub(crate) fn build_pending_chat_lines(
             max_content_width,
             sub_agents: &state.sub_agents,
             spinner_frame: state.spinner_frame,
-            selected_message_id: state.selected_message_id,
-            message_detail_scroll: &state.message_detail_scroll,
-            detail_viewport_rows: detail_viewport_rows(state.chat_view_height),
         },
-        &mut selected_line,
         &mut is_first_user,
     ));
-    state.selected_message_line = selected_line;
 
     if !state.thinking_buf.is_empty() {
-        render_thinking_block(
-            &mut lines,
-            0,
-            &state.thinking_buf,
-            false,
-            false,
-            max_content_width,
-            0,
-            detail_viewport_rows(state.chat_view_height),
-        );
+        render_thinking_block(&mut lines, &state.thinking_buf, max_content_width);
     }
 
     // 流式文本（实时输出中）
@@ -1234,7 +984,7 @@ pub(crate) fn build_pending_chat_lines(
             &state.todo_execution_logs,
             state.spinner_frame,
             state.todo_panel_expanded,
-            state.ui_focus == UiFocus::Todos,
+            matches!(state.ui_focus, UiFocus::Todos | UiFocus::TodoDetail),
             state.selected_todo_id.as_deref(),
             state.todo_detail_open,
             state.todo_detail_scroll,
@@ -1413,6 +1163,13 @@ fn push_inline_todo_lines(
         lines.push(Line::from(spans));
     }
 
+    if focused && !detail_open {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", wyj_i18n::tr("todo.focus_hint")),
+            Theme::dim(),
+        )));
+    }
+
     let mut next_scroll = detail_scroll;
     let mut next_max_scroll: u16 = 0;
     if focused && detail_open {
@@ -1504,31 +1261,18 @@ fn push_todo_detail_lines(
             Theme::dim(),
         )));
     } else {
-        let empty_detail_scroll = HashMap::new();
         let ctx = ChatRenderCtx {
             max_content_width: detail_width,
-            selected_message_id: None,
             sub_agents,
             spinner_frame: 0,
-            message_detail_scroll: &empty_detail_scroll,
-            detail_viewport_rows: MESSAGE_DETAIL_DEFAULT_ROWS,
         };
         for entry in log {
             match entry {
                 TodoExecutionEntry::Message(id) => {
                     if let Some(msg) = messages.iter().find(|m| m.id == *id) {
-                        let mut msg = msg.clone();
-                        if matches!(
-                            msg.role,
-                            MessageRole::Thinking
-                                | MessageRole::ToolResult
-                                | MessageRole::BashOutput
-                        ) {
-                            msg.expanded = true;
-                        }
                         let mut msg_lines = Vec::new();
                         let mut is_first_user = true;
-                        render_chat_message(&mut msg_lines, &msg, 0, &mut is_first_user, &ctx);
+                        render_chat_message(&mut msg_lines, msg, 0, &mut is_first_user, &ctx);
                         push_prefixed_lines(&mut detail_lines, msg_lines, "  ");
                     }
                 }
@@ -1547,6 +1291,10 @@ fn push_todo_detail_lines(
     for line in detail_lines.into_iter().skip(scroll).take(viewport) {
         lines.push(line);
     }
+    lines.push(Line::from(Span::styled(
+        format!("  {}", wyj_i18n::tr("todo.detail_hint")),
+        Theme::dim(),
+    )));
     (scroll as u16, max_scroll.min(u16::MAX as usize) as u16)
 }
 
@@ -1614,16 +1362,12 @@ struct MessageRangeRenderArgs<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
-    selected_message_id: Option<u64>,
-    message_detail_scroll: &'a HashMap<u64, u16>,
-    detail_viewport_rows: usize,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
 /// 出现过 User 消息"的状态，供完整消息流与流式尾部共用同一份逻辑。
 fn render_message_range(
     args: MessageRangeRenderArgs<'_>,
-    selected_line: &mut Option<usize>,
     is_first_user: &mut bool,
 ) -> Vec<Line<'static>> {
     let MessageRangeRenderArgs {
@@ -1632,17 +1376,11 @@ fn render_message_range(
         max_content_width,
         sub_agents,
         spinner_frame,
-        selected_message_id,
-        message_detail_scroll,
-        detail_viewport_rows,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
-        selected_message_id,
         sub_agents,
         spinner_frame,
-        message_detail_scroll,
-        detail_viewport_rows,
     };
     let mut lines = vec![];
     let mut i = range.start;
@@ -1650,7 +1388,6 @@ fn render_message_range(
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        let before = lines.len();
         let msg = &messages[i];
         if matches!(msg.role, MessageRole::ToolCall) {
             if let Some(next) = messages.get(i + 1) {
@@ -1658,26 +1395,8 @@ fn render_message_range(
                     && matches!(next.role, MessageRole::ToolResult)
                     && next.sequence_no == msg.sequence_no
                 {
-                    let selected = selected_message_id == Some(next.id);
-                    let selected_style = |st: Style| -> Style {
-                        if selected {
-                            st.bg(Color::DarkGray).add_modifier(Modifier::BOLD)
-                        } else {
-                            st
-                        }
-                    };
-                    render_tool_result_block(
-                        &mut lines,
-                        Some(msg),
-                        next,
-                        selected,
-                        &selected_style,
-                        &ctx,
-                    );
+                    render_tool_result_block(&mut lines, Some(msg), next, &ctx);
                     trim_trailing_blank_lines(&mut lines);
-                    if selected {
-                        *selected_line = Some(before);
-                    }
                     i += 2;
                     continue;
                 }
@@ -1685,9 +1404,6 @@ fn render_message_range(
         }
         render_chat_message(&mut lines, msg, i, is_first_user, &ctx);
         trim_trailing_blank_lines(&mut lines);
-        if selected_message_id == Some(msg.id) {
-            *selected_line = Some(before);
-        }
         i += 1;
     }
     lines
@@ -1712,26 +1428,6 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     state.chat_max_scroll = max_scroll;
     if state.chat_follow_tail {
         state.chat_scroll = max_scroll;
-    } else if let Some(line) = state.selected_message_line {
-        let height = content_height as usize;
-        match state.selected_message_anchor {
-            Some(ChatSelectionAnchor::Top) => {
-                state.chat_scroll = line.min(max_scroll);
-            }
-            Some(ChatSelectionAnchor::Bottom) => {
-                state.chat_scroll = line
-                    .saturating_sub(height.saturating_sub(1))
-                    .min(max_scroll);
-            }
-            None => {
-                if line < state.chat_scroll {
-                    state.chat_scroll = line;
-                } else if line >= state.chat_scroll + height {
-                    state.chat_scroll = line.saturating_sub(height.saturating_sub(1));
-                }
-            }
-        }
-        state.chat_scroll = state.chat_scroll.min(max_scroll);
     } else {
         state.chat_scroll = state.chat_scroll.min(max_scroll);
     }
@@ -2209,20 +1905,21 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     } else {
         match &state.mode {
             AgentMode::Plan => (
-                " [plan] Enter to send · Shift+Tab to switch mode ".to_string(),
+                " [plan] Enter to send · ↑↓ history · Shift+↑ content · Shift+Tab mode "
+                    .to_string(),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ),
             AgentMode::Bypass => (
-                " [bypass] Enter to send · Shift+Tab to switch mode ".to_string(),
+                " [bypass] Enter to send · ↑↓ history · Shift+↑ content · Shift+Tab mode "
+                    .to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             AgentMode::Normal => (
-                " Enter to send · Shift+Enter newline · / commands · ! bash · Shift+Tab mode "
-                    .to_string(),
+                " Enter to send · Shift+Enter newline · ↑↓ history · Shift+↑ content · / commands · ! bash · Shift+Tab mode ".to_string(),
                 Theme::dim(),
             ),
         }
@@ -5121,6 +4818,47 @@ mod tool_result_fold_tests {
         )
     }
 
+    fn message(role: MessageRole, content: &str) -> ChatMessage {
+        ChatMessage {
+            id: 1,
+            role,
+            content: content.to_string(),
+            is_error: false,
+            elapsed_secs: None,
+            sequence_no: None,
+            tool_name: None,
+            display_summary: String::new(),
+            sub_agent_id: None,
+            md_cache: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn rendered_text(lines: Vec<Line<'static>>) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render_messages(messages: &[ChatMessage], width: usize) -> Vec<String> {
+        let mut is_first_user = true;
+        rendered_text(render_message_range(
+            MessageRangeRenderArgs {
+                messages,
+                range: 0..messages.len(),
+                max_content_width: width,
+                sub_agents: &std::collections::BTreeMap::new(),
+                spinner_frame: 0,
+            },
+            &mut is_first_user,
+        ))
+    }
+
     fn sub_agent(status: SubAgentStatus) -> SubAgentUiState {
         SubAgentUiState {
             agent_type: "general-purpose".to_string(),
@@ -5223,15 +4961,27 @@ mod tool_result_fold_tests {
             active_form: None,
         }]);
         state.selected_todo_id = Some("a".to_string());
-        state.ui_focus = UiFocus::Todos;
+        state.ui_focus = UiFocus::TodoDetail;
         state.todo_detail_open = true;
         state.todo_detail_scroll = 0;
         // 未渲染前先塞一个陈旧的非零值，验证渲染层确实会重新计算并回写。
         state.todo_detail_max_scroll = 99;
 
-        let _ = build_pending_chat_lines(&mut state, 100);
+        let rendered = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(state.todo_detail_max_scroll, 0);
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("task: short task")));
+        assert!(rendered.iter().any(|line| line.contains("PageUp/PageDown")));
     }
 
     #[test]
@@ -5465,16 +5215,6 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn strip_summary_duplicate_line_drops_only_first_nonempty_line() {
-        let lines = vec!["", "first", "second", "third"];
-        assert_eq!(
-            strip_summary_duplicate_line(&lines, true),
-            vec!["", "second", "third"]
-        );
-        assert_eq!(strip_summary_duplicate_line(&lines, false), lines);
-    }
-
-    #[test]
     fn wrap_line_splits_without_dropping_content() {
         let s = "0 8 * * * /usr/bin/env PATH=/opt/homebrew/bin:/usr/local/bin/usr/bin:/bin /Users/foo/venv/bin/python /Users/foo/script.py";
         let wrapped = wrap_line(s, 20);
@@ -5501,303 +5241,154 @@ mod tool_result_fold_tests {
 
     #[test]
     fn completed_tool_call_and_result_render_as_single_compact_block() {
-        let call = ChatMessage {
-            id: 1,
-            role: MessageRole::ToolCall,
-            content: "Read(crates/tui/src/render.rs)".to_string(),
-            is_error: false,
-            elapsed_secs: None,
-            sequence_no: Some(1),
-            tool_name: Some("Read".to_string()),
-            display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
-        let result = ChatMessage {
-            id: 2,
-            role: MessageRole::ToolResult,
-            content: "1\tfirst\n2\tsecond\n3\tthird".to_string(),
-            is_error: false,
-            elapsed_secs: Some(0.2),
-            sequence_no: Some(1),
-            tool_name: Some("Read".to_string()),
-            display_summary: "read 3 lines".to_string(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
+        let mut call = message(MessageRole::ToolCall, "Read(crates/tui/src/render.rs)");
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Read".to_string());
+        let mut result = message(MessageRole::ToolResult, "1\tfirst\n2\tsecond\n3\tthird");
+        result.id = 2;
+        result.elapsed_secs = Some(0.2);
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Read".to_string());
+        result.display_summary = "read 3 lines".to_string();
         let messages = vec![call, result];
-        let mut selected_line = None;
-        let mut is_first_user = true;
-        let empty_detail_scroll = HashMap::new();
-        let rendered = render_message_range(
-            MessageRangeRenderArgs {
-                messages: &messages,
-                range: 0..messages.len(),
-                max_content_width: 100,
-                sub_agents: &std::collections::BTreeMap::new(),
-                spinner_frame: 0,
-                selected_message_id: Some(2),
-                message_detail_scroll: &empty_detail_scroll,
-                detail_viewport_rows: MESSAGE_DETAIL_DEFAULT_ROWS,
-            },
-            &mut selected_line,
-            &mut is_first_user,
-        );
-        let rendered_text = rendered
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered_text.len(), 1);
-        assert!(rendered_text[0].contains("Read("));
-        assert!(rendered_text[0].contains("⎿ read 3 lines"));
-        assert!(rendered_text[0].contains("ctrl+o expand"));
-        assert_eq!(selected_line, Some(0));
+        assert_eq!(rendered.len(), 4);
+        assert!(rendered[0].contains("⏺ Read("));
+        assert_eq!(rendered[1], "    ⎿ first");
+        assert_eq!(rendered[2], "       second");
+        assert_eq!(rendered[3], "       third");
+        assert!(rendered
+            .iter()
+            .all(|line| !line.contains("ctrl+o") && !line.contains('▶')));
     }
 
     #[test]
     fn message_blocks_have_one_blank_line_between_them() {
-        let messages = vec![
-            ChatMessage {
-                id: 1,
-                role: MessageRole::Assistant,
-                content: "first response".to_string(),
-                is_error: false,
-                elapsed_secs: None,
-                sequence_no: None,
-                tool_name: None,
-                display_summary: String::new(),
-                summary_is_first_line: false,
-                expanded: false,
-                sub_agent_id: None,
-                md_cache: std::cell::RefCell::new(None),
-            },
-            ChatMessage {
-                id: 2,
-                role: MessageRole::Assistant,
-                content: "second response".to_string(),
-                is_error: false,
-                elapsed_secs: None,
-                sequence_no: None,
-                tool_name: None,
-                display_summary: String::new(),
-                summary_is_first_line: false,
-                expanded: false,
-                sub_agent_id: None,
-                md_cache: std::cell::RefCell::new(None),
-            },
-        ];
-        let mut selected_line = None;
-        let mut is_first_user = true;
-        let empty_detail_scroll = HashMap::new();
-        let rendered = render_message_range(
-            MessageRangeRenderArgs {
-                messages: &messages,
-                range: 0..messages.len(),
-                max_content_width: 100,
-                sub_agents: &std::collections::BTreeMap::new(),
-                spinner_frame: 0,
-                selected_message_id: Some(2),
-                message_detail_scroll: &empty_detail_scroll,
-                detail_viewport_rows: MESSAGE_DETAIL_DEFAULT_ROWS,
-            },
-            &mut selected_line,
-            &mut is_first_user,
-        );
-        let rendered_text = rendered
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let mut second = message(MessageRole::Assistant, "second response");
+        second.id = 2;
+        let messages = vec![message(MessageRole::Assistant, "first response"), second];
+        let rendered = render_messages(&messages, 100);
 
-        assert_eq!(
-            rendered_text,
-            vec!["  first response", "", "  ▶   second response"]
-        );
-        assert_eq!(selected_line, Some(2));
+        assert_eq!(rendered, vec!["  first response", "", "  second response"]);
     }
 
     #[test]
     fn completed_tool_call_pair_stays_compact_before_next_block_separator() {
-        let call = ChatMessage {
-            id: 1,
-            role: MessageRole::ToolCall,
-            content: "Read(crates/tui/src/render.rs)".to_string(),
-            is_error: false,
-            elapsed_secs: None,
-            sequence_no: Some(1),
-            tool_name: Some("Read".to_string()),
-            display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
-        let result = ChatMessage {
-            id: 2,
-            role: MessageRole::ToolResult,
-            content: "1\tfirst\n2\tsecond".to_string(),
-            is_error: false,
-            elapsed_secs: Some(0.2),
-            sequence_no: Some(1),
-            tool_name: Some("Read".to_string()),
-            display_summary: "read 2 lines".to_string(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
-        let next = ChatMessage {
-            id: 3,
-            role: MessageRole::Assistant,
-            content: "after tool".to_string(),
-            is_error: false,
-            elapsed_secs: None,
-            sequence_no: None,
-            tool_name: None,
-            display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
+        let mut call = message(MessageRole::ToolCall, "Read(crates/tui/src/render.rs)");
+        call.sequence_no = Some(1);
+        let mut result = message(MessageRole::ToolResult, "1\tfirst\n2\tsecond");
+        result.id = 2;
+        result.elapsed_secs = Some(0.2);
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Read".to_string());
+        let mut next = message(MessageRole::Assistant, "after tool");
+        next.id = 3;
         let messages = vec![call, result, next];
-        let mut selected_line = None;
-        let mut is_first_user = true;
-        let empty_detail_scroll = HashMap::new();
-        let rendered = render_message_range(
-            MessageRangeRenderArgs {
-                messages: &messages,
-                range: 0..messages.len(),
-                max_content_width: 100,
-                sub_agents: &std::collections::BTreeMap::new(),
-                spinner_frame: 0,
-                selected_message_id: None,
-                message_detail_scroll: &empty_detail_scroll,
-                detail_viewport_rows: MESSAGE_DETAIL_DEFAULT_ROWS,
-            },
-            &mut selected_line,
-            &mut is_first_user,
-        );
-        let rendered_text = rendered
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered_text.len(), 3);
-        assert!(rendered_text[0].contains("Read("));
-        assert!(rendered_text[0].contains("⎿ read 2 lines"));
-        assert!(rendered_text[1].trim().is_empty());
-        assert_eq!(rendered_text[2], "  after tool");
+        assert_eq!(rendered.len(), 5);
+        assert!(rendered[0].contains("Read("));
+        assert_eq!(rendered[1], "    ⎿ first");
+        assert_eq!(rendered[2], "       second");
+        assert!(rendered[3].trim().is_empty());
+        assert_eq!(rendered[4], "  after tool");
     }
 
     #[test]
-    fn thinking_is_cleaned_and_folded_to_five_lines() {
-        let thinking = ChatMessage {
-            id: 1,
-            role: MessageRole::Thinking,
-            content: "\n\none\n\ntwo\nthree\n\nfour\nfive\nsix\nseven\n".to_string(),
-            is_error: false,
-            elapsed_secs: None,
-            sequence_no: None,
-            tool_name: None,
-            display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: false,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        };
+    fn thinking_is_cleaned_and_capped_to_three_visual_lines() {
+        let thinking = message(
+            MessageRole::Thinking,
+            "\n\none\n\ntwo\nthree\n\nfour\nfive\nsix\nseven\n",
+        );
         let messages = vec![thinking];
-        let mut selected_line = None;
-        let mut is_first_user = true;
-        let empty_detail_scroll = HashMap::new();
-        let rendered = render_message_range(
-            MessageRangeRenderArgs {
-                messages: &messages,
-                range: 0..messages.len(),
-                max_content_width: 100,
-                sub_agents: &std::collections::BTreeMap::new(),
-                spinner_frame: 0,
-                selected_message_id: Some(1),
-                message_detail_scroll: &empty_detail_scroll,
-                detail_viewport_rows: MESSAGE_DETAIL_DEFAULT_ROWS,
-            },
-            &mut selected_line,
-            &mut is_first_user,
-        );
-        let rendered_text = rendered
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered_text.len(), 6);
-        assert!(rendered_text[0].contains("thinking · 7 lines"));
-        assert!(rendered_text[0].contains("ctrl+o expand"));
-        assert!(rendered_text.iter().any(|line| line.contains("one")));
-        assert!(rendered_text.iter().any(|line| line.contains("five")));
-        assert!(!rendered_text.iter().any(|line| line.contains("six")));
-        assert!(rendered_text.iter().all(|line| !line.trim().is_empty()));
-        assert_eq!(selected_line, Some(0));
+        assert_eq!(rendered.len(), 5);
+        assert!(rendered[0].contains("thinking · 7 lines"));
+        assert_eq!(rendered[1], "    one");
+        assert_eq!(rendered[2], "    two");
+        assert_eq!(rendered[3], "    three");
+        assert_eq!(rendered[4], "    ...");
+        assert!(rendered
+            .iter()
+            .all(|line| !line.contains("ctrl+o") && !line.contains('▶')));
     }
 
     #[test]
-    fn expanded_bash_output_uses_detail_viewport() {
-        let mut state = make_state();
-        state.chat_view_height = 30;
-        state.messages.push(ChatMessage {
-            id: 1,
-            role: MessageRole::BashOutput,
-            content: (1..=30)
-                .map(|i| format!("line-{i}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            is_error: false,
-            elapsed_secs: Some(0.2),
-            sequence_no: None,
-            tool_name: None,
-            display_summary: String::new(),
-            summary_is_first_line: false,
-            expanded: true,
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        });
-        state.message_detail_scroll.insert(1, 0);
+    fn long_single_line_tool_result_is_capped_after_wrapping() {
+        let mut result = message(
+            MessageRole::ToolResult,
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+        );
+        result.tool_name = Some("Grep".to_string());
+        let rendered = render_messages(&[result], 14);
 
-        let rendered = build_pending_chat_lines(&mut state, 100)
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(rendered.len(), 5);
+        assert_eq!(rendered.last().map(String::as_str), Some("       ..."));
+    }
 
-        assert!(rendered.iter().any(|line| line.contains("line-12")));
-        assert!(!rendered.iter().any(|line| line.contains("line-20")));
-        assert!(rendered.iter().any(|line| line.contains("pgup/pgdn")));
+    #[test]
+    fn edit_result_automatically_renders_colored_diff_preview() {
+        let mut result = message(
+            MessageRole::ToolResult,
+            "Updated file successfully\n- old content\n+ new content\n  context",
+        );
+        result.tool_name = Some("Edit".to_string());
+        let mut is_first_user = true;
+        let lines = render_message_range(
+            MessageRangeRenderArgs {
+                messages: &[result],
+                range: 0..1,
+                max_content_width: 100,
+                sub_agents: &std::collections::BTreeMap::new(),
+                spinner_frame: 0,
+            },
+            &mut is_first_user,
+        );
+        let rendered = rendered_text(lines.clone());
+
+        assert_eq!(rendered[0], "  ⎿ result");
+        assert_eq!(rendered[1], "    - old content");
+        assert_eq!(rendered[2], "    + new content");
+        assert_eq!(rendered[3], "      context");
+        assert_eq!(lines[1].spans[0].style, Theme::error());
+        assert_eq!(lines[2].spans[0].style, Style::default().fg(Color::Green));
+        assert_eq!(lines[3].spans[0].style, Theme::dim());
+        assert!(!rendered.iter().any(|line| line.contains("Updated file")));
+    }
+
+    #[test]
+    fn long_edit_diff_is_capped_with_ascii_ellipsis() {
+        let mut result = message(
+            MessageRole::ToolResult,
+            "Updated file successfully\n- old one\n+ new one\n  context\n+ another",
+        );
+        result.tool_name = Some("Edit".to_string());
+        let rendered = render_messages(&[result], 100);
+
+        assert_eq!(rendered.len(), 5);
+        assert_eq!(rendered.last().map(String::as_str), Some("    ..."));
+    }
+
+    #[test]
+    fn user_and_assistant_messages_are_not_preview_capped() {
+        let user = message(
+            MessageRole::User,
+            "u1-long-content-that-must-wrap-without-loss\nu2\nu3\nu4\nu5",
+        );
+        let mut assistant = message(MessageRole::Assistant, "a1\na2\na3\na4\na5");
+        assistant.id = 2;
+        let rendered = render_messages(&[user, assistant], 18);
+        let user_joined = rendered
+            .iter()
+            .take_while(|line| !line.trim().is_empty())
+            .map(|line| line.trim_start_matches(['❯', ' ']))
+            .collect::<String>();
+
+        assert!(user_joined.contains("u1-long-content-that-must-wrap-without-loss"));
+        assert!(rendered.iter().any(|line| line.contains("u5")));
+        assert!(rendered.iter().any(|line| line.contains("a5")));
+        assert!(!rendered.iter().any(|line| line.trim() == "..."));
     }
 }
