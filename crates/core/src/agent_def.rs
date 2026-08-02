@@ -183,11 +183,7 @@ fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
                     def.tools = Some(list);
                 }
             }
-            "model" => {
-                if !value.is_empty() {
-                    def.model = Some(value);
-                }
-            }
+            "model" if !value.is_empty() => def.model = Some(value),
             // 未识别字段（如真实 Claude Code 的其他 frontmatter key）静默忽略
             _ => {}
         }

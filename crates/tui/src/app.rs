@@ -10373,20 +10373,18 @@ async fn tui_main(
                             KeyCode::Down => dialog.move_cursor(1),
                             KeyCode::Char(' ') => dialog.toggle(),
                             KeyCode::Char('a') => dialog.toggle_all(),
-                            KeyCode::Enter => {
-                                if !dialog.checked.is_empty() {
-                                    let count = dialog.checked.len();
-                                    dialog.apply();
-                                    if matches!(dialog.stage, ImportStage::Report(_)) {
-                                        // 写入成功：刷新内存配置，提示生效边界
-                                        if let Ok(cfg) = Config::load() {
-                                            state.config = cfg;
-                                        }
-                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
-                                            "import.applied_notice",
-                                            &[("count", &count.to_string())],
-                                        )));
+                            KeyCode::Enter if !dialog.checked.is_empty() => {
+                                let count = dialog.checked.len();
+                                dialog.apply();
+                                if matches!(dialog.stage, ImportStage::Report(_)) {
+                                    // 写入成功：刷新内存配置，提示生效边界
+                                    if let Ok(cfg) = Config::load() {
+                                        state.config = cfg;
                                     }
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                        "import.applied_notice",
+                                        &[("count", &count.to_string())],
+                                    )));
                                 }
                             }
                             _ => {}

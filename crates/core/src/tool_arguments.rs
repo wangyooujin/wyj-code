@@ -340,11 +340,9 @@ fn extract_unique_json_object(input: &str) -> Option<&str> {
                     }
                 }
             }
-            b']' if !stack.is_empty() => {
-                if stack.pop() != Some(b'[') {
-                    stack.clear();
-                    start = None;
-                }
+            b']' if !stack.is_empty() && stack.pop() != Some(b'[') => {
+                stack.clear();
+                start = None;
             }
             _ => {}
         }

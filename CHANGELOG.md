@@ -2,11 +2,18 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.2]
+
+- **ToolSearch 核心执行面保底**：lazy schema 在大工具集下始终保留 Read/Glob/Grep/CodeSearch、Bash/Edit/Write、AskQuestion/TodoWrite、Agent/ExitPlanMode 等已注册核心工具，只延迟暴露可选集成；避免国内模型只看到搜索入口却看不到完成编码任务所需的执行工具。Plan/只读子 Agent 仍只暴露其实际注册和授权的子集。
+- **Rust 1.96 严格门禁兼容**：修复 Rust/Clippy 1.96 新增的 `collapsible_match` 与 `unnecessary_sort_by` 告警，覆盖 Agent/Skill frontmatter、工具参数对象提取、MCP 工具稳定排序和 TUI import 确认路径；行为保持不变。
+- **可复现 CI 工具链**：Release 的 Test/Lint 与五平台 Build、Review Action 都固定 Rust `1.96.0`，不再让可变的 `stable` 在 tag 推送后引入未本地复现的新 lint。发布前同时用 Linux Rust 1.96.1 容器执行全 workspace/all-targets 严格 Clippy。
+- **不可移动发布边界**：`v1.5.1` 的 workspace tests 通过，但远端 `stable` 已升级到 Clippy 1.96，新增 lint 使其 Release Action 失败且未生成资产；`v1.5.2` 作为新的补丁版本接替发布，`v1.4.4`、`v1.5.0`、`v1.5.1` 均保持不可移动。
+
 ## [1.5.1]
 
 - **国内模型多工具调用兼容修复**：保守能力目录仍可声明 `max_tools_per_turn = 1` 和禁止并行，但模型若已经在一个完整响应中返回多个合法 `tool_use`，执行器会按能力声明受控串行执行并逐个回填 `tool_result`，不再把额外调用伪装成参数错误，也不会因连续完整多调用响应误触“参数重试耗尽”。工具原始 schema、权限与 sandbox 校验继续逐项生效。
 - **Release CI 跨平台修复**：修复 Linux `detect_backend` 的 `clippy::needless_return`，并按实际使用平台/测试条件编译 computer-use 窗口 generation helper；本机与 Linux/Rust 1.94 的 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均作为发布门禁。
-- **发布边界**：`v1.5.0` annotated tag 已公开且其首轮 Release Action 在 Test & Lint 阶段失败，因此保持不可移动；本补丁以 `v1.5.1` 重新完成五平台 Release 与 Pages 发布，不改写 `v1.4.4` 或 `v1.5.0` 历史。
+- **发布边界**：`v1.5.0` annotated tag 已公开且其首轮 Release Action 在 Test & Lint 阶段失败，因此保持不可移动；`v1.5.1` 随后也因 CI 的可变 `stable` 升级到 Clippy 1.96 而未生成 Release 资产，最终发布修复迁移到 `v1.5.2`。
 
 ## [1.5.0]
 
