@@ -621,7 +621,7 @@ impl Agent {
         }
 
         let mut turn = 0;
-        let mut invalid_tool_rounds = 0usize;
+        let mut invalid_argument_rounds = 0usize;
         loop {
             turn += 1;
             if turn > self.max_turns {
@@ -946,12 +946,18 @@ impl Agent {
 
             // 组装助手内容块（保持到达顺序；thinking 块含 signature 原样入历史，
             // 工具调用续轮时回传给 API —— 缺失会被 Anthropic 拒绝）
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            enum ToolCallRejectionKind {
+                SchemaNotExposed,
+                InvalidArguments,
+            }
             enum PendingToolCall {
                 Valid(ValidatedToolCall),
-                Invalid {
+                Rejected {
                     id: String,
                     name: String,
                     feedback: String,
+                    kind: ToolCallRejectionKind,
                 },
             }
             let mut assistant_blocks = vec![];
@@ -998,10 +1004,11 @@ impl Agent {
                                     "_wyj_code_tool_schema_not_exposed": true
                                 }),
                             });
-                            pending_tools.push(PendingToolCall::Invalid {
+                            pending_tools.push(PendingToolCall::Rejected {
                                 id: id.clone(),
                                 name: name.clone(),
                                 feedback,
+                                kind: ToolCallRejectionKind::SchemaNotExposed,
                             });
                             continue;
                         }
@@ -1009,28 +1016,6 @@ impl Agent {
                             state.mark_used(name);
                         }
                         seen_tool_calls += 1;
-                        if seen_tool_calls > max_tools_this_turn {
-                            let feedback = serde_json::json!({
-                                "error": "tool_limit_exceeded",
-                                "tool": name,
-                                "max_tools_per_turn": max_tools_this_turn,
-                                "instruction": "Regenerate only one tool call in the next response."
-                            })
-                            .to_string();
-                            assistant_blocks.push(ContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: serde_json::json!({
-                                    "_wyj_code_tool_limit_exceeded": true
-                                }),
-                            });
-                            pending_tools.push(PendingToolCall::Invalid {
-                                id: id.clone(),
-                                name: name.clone(),
-                                feedback,
-                            });
-                            continue;
-                        }
                         let raw_call = wyj_api::types::RawToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -1067,15 +1052,29 @@ impl Agent {
                                         "_wyj_code_invalid_arguments": true
                                     }),
                                 });
-                                pending_tools.push(PendingToolCall::Invalid {
+                                pending_tools.push(PendingToolCall::Rejected {
                                     id: id.clone(),
                                     name: name.clone(),
                                     feedback,
+                                    kind: ToolCallRejectionKind::InvalidArguments,
                                 });
                             }
                         }
                     }
                 }
+            }
+            if seen_tool_calls > max_tools_this_turn {
+                // max_tools_per_turn 是模型生成侧的保守能力提示，不是执行器的
+                // fail-closed 边界。模型已经返回多个完整 tool_use 时，协议续轮
+                // 仍要求逐个回填 tool_result；拒绝超额调用会诱发模型重复生成，
+                // 并把本可安全执行的任务拖进纠错死循环。执行阶段继续做原始
+                // schema、权限与 sandbox 校验，并由 parallel_tool_calls 决定
+                // 并发或顺序执行。
+                tracing::warn!(
+                    emitted = seen_tool_calls,
+                    declared_max = max_tools_this_turn,
+                    "模型返回的工具数超过能力声明，降级为受控执行"
+                );
             }
             session.push_assistant(assistant_blocks);
 
@@ -1087,14 +1086,21 @@ impl Agent {
                 let total = pending_tools.len();
                 let mut calls = Vec::new();
                 let mut tool_results = Vec::new();
-                let mut invalid_count = 0usize;
+                let mut invalid_argument_count = 0usize;
                 for (idx, pending) in pending_tools.into_iter().enumerate() {
                     match pending {
                         PendingToolCall::Valid(call) => {
                             calls.push((idx, call.id, call.name, call.input));
                         }
-                        PendingToolCall::Invalid { id, name, feedback } => {
-                            invalid_count += 1;
+                        PendingToolCall::Rejected {
+                            id,
+                            name,
+                            feedback,
+                            kind,
+                        } => {
+                            if kind == ToolCallRejectionKind::InvalidArguments {
+                                invalid_argument_count += 1;
+                            }
                             if let Some(cb) = &self.tool_cb {
                                 cb(ToolEvent::End {
                                     id: id.clone(),
@@ -1205,13 +1211,13 @@ impl Agent {
                     .await;
                 }
 
-                if invalid_count > 0 {
-                    invalid_tool_rounds += 1;
-                    if invalid_tool_rounds > 2 {
+                if invalid_argument_count > 0 {
+                    invalid_argument_rounds += 1;
+                    if invalid_argument_rounds > 2 {
                         anyhow::bail!("工具参数连续校验失败，已停止执行以避免无界重试");
                     }
                 } else {
-                    invalid_tool_rounds = 0;
+                    invalid_argument_rounds = 0;
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
@@ -1683,6 +1689,51 @@ mod tests {
         assert_eq!(results[1], ("t2".to_string(), "second".to_string()));
     }
 
+    #[tokio::test]
+    async fn single_tool_capability_serializes_complete_multi_call_response() {
+        let capabilities = wyj_api::ModelCapabilities::conservative(64_000, 8_192);
+        assert_eq!(capabilities.max_tools_per_turn, 1);
+        assert!(!capabilities.parallel_tool_calls.value);
+
+        let mut agent = Agent::new(Arc::new(TwoToolProvider {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_model_capabilities(capabilities);
+        agent.register_tool(Arc::new(SleepTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let start = Instant::now();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(280),
+            "单工具兼容模式应串行执行已返回的完整调用，实际耗时 {:?}",
+            start.elapsed()
+        );
+        let results: Vec<_> = session
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Text(text),
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), text.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("t1", "first", false), ("t2", "second", false)]
+        );
+    }
+
     /// 记录被调用次数的 mock 工具，用于验证 PreToolUse Block 阻止了工具实际执行
     struct CountingTool {
         calls: Arc<AtomicUsize>,
@@ -1708,6 +1759,89 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolResult::ok("echoed".to_string()))
         }
+    }
+
+    struct RepeatedTwoToolProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RepeatedTwoToolProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n < 3 {
+                let first_id = format!("round-{n}-first");
+                let second_id = format!("round-{n}-second");
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: first_id.clone(),
+                        name: "Echo".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: first_id,
+                        json_delta: "{}".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseStart {
+                        id: second_id.clone(),
+                        name: "Echo".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: second_id,
+                        json_delta: "{}".into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_multi_call_responses_do_not_trip_argument_retry_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capabilities = wyj_api::ModelCapabilities::conservative(64_000, 8_192);
+        let mut agent = Agent::new(Arc::new(RepeatedTwoToolProvider {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_model_capabilities(capabilities);
+        agent.register_tool(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert!(!session.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        content: ToolResultContent::Text(text),
+                        ..
+                    } if text.contains("tool_limit_exceeded")
+                )
+            })
+        }));
     }
 
     struct RequiredCountingTool {

@@ -52,6 +52,7 @@ impl WindowTarget {
 }
 
 /// FNV-1a 64-bit：不依赖进程随机种子，便于工具调用间稳定校验。
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn generation_for(
     window_id: u32,
     pid: u32,
