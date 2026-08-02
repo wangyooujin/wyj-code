@@ -60,12 +60,12 @@ claude_md:
     subdir: "subdirectory"
 
 cli:
-  about: "wyj-code — terminal AI coding assistant"
+  about: "wyj-code — Chinese-model-first terminal coding agent with fail-closed execution"
   prompt_help: "One-shot Q&A (does not start the TUI)"
   cwd_help: "Working directory (defaults to the current directory)"
   headless_help: "Force headless REPL mode"
-  plan_help: "Plan mode: enable only read-only tools (read/glob/grep/web_fetch), for planning and analysis"
-  bypass_help: "Bypass mode: auto-approve every tool call, no permission prompts"
+  plan_help: "Plan mode: read-only analysis plus restricted plan-document writes; source, scripts, config, and Bash writes remain denied"
+  bypass_help: "Bypass mode: skip ordinary prompts without disabling the OS sandbox or protected denies"
   no_hooks_help: "Disable the Hooks automation system (do not run shell hooks from .claude/settings.json)"
   continue_help: "Resume the last session (continue the previous conversation)"
   resume_help: "Resume a specific session ID (e.g. sess-1719723000)"
@@ -319,6 +319,10 @@ schedule:
     cron: "Cron"
     cwd: "Working dir"
     notify_on_failure: "Notify on failure"
+    allowed_tools: "Allowed tools"
+    allow_write: "Write roots"
+    allowed_domains: "Network domains"
+    require_sandbox: "Require sandbox"
   dialog:
     hint1: "  ↑↓ Move  Enter Action menu  Ctrl+S Save"
     hint2: "  Esc Close"
@@ -334,6 +338,8 @@ schedule:
     disable: "Disable"
     run_now: "Run now"
     run_now_needs_save: "Save changes to this task before running it"
+    review_permissions: "Confirm permission manifest"
+    permissions_reviewed: "Permissions already reviewed"
     delete: "Delete"
     edit: "Edit"
     toggle: "Toggle"
@@ -343,6 +349,8 @@ schedule:
     freq_custom: "Custom cron expression (advanced)"
     new_blank: "New blank task"
     new_from_session: "New task from the current conversation"
+  permissions:
+    review_complete: "Permission manifest confirmed; the task remains disabled until you explicitly enable it."
   error:
     empty_name: "Task name cannot be empty"
     empty_prompt: "Prompt cannot be empty"
@@ -623,6 +631,7 @@ dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
+  permission_hint_once: "  [y] Run unsandboxed once   [d] Deny   (cannot be persisted)"
   permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"

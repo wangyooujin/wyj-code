@@ -1,6 +1,8 @@
 //! 内置 Slash 命令
 
-use crate::registry::{Command, CommandContext, CommandRegistry, CommandResult};
+use crate::registry::{
+    Command, CommandContext, CommandRegistry, CommandResult, SubAgentControlAction,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -73,6 +75,137 @@ impl Command for CompactCmd {
     }
     async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
         Ok(CommandResult::CompactHistory)
+    }
+}
+
+// ── /checkpoint /rewind /branch ──────────────────────────────────────────────
+
+pub struct CheckpointCmd;
+
+#[async_trait]
+impl Command for CheckpointCmd {
+    fn name(&self) -> &str {
+        "checkpoint"
+    }
+    fn description(&self) -> String {
+        "Create or list recoverable conversation/workspace checkpoints".to_string()
+    }
+    fn usage(&self) -> String {
+        "/checkpoint [list|name]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let args = args.trim();
+        Ok(CommandResult::CreateCheckpoint {
+            list: args.eq_ignore_ascii_case("list"),
+            name: (!args.is_empty() && !args.eq_ignore_ascii_case("list"))
+                .then(|| args.to_string()),
+        })
+    }
+}
+
+pub struct RewindCmd;
+
+#[async_trait]
+impl Command for RewindCmd {
+    fn name(&self) -> &str {
+        "rewind"
+    }
+    fn description(&self) -> String {
+        "Preview or restore conversation/files from a checkpoint".to_string()
+    }
+    fn usage(&self) -> String {
+        "/rewind [checkpoint-id|latest] [conversation|files|both] [--confirm]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let mut checkpoint_id = None;
+        let mut scope = wyj_core::RewindScope::Both;
+        let mut confirmed = false;
+        for token in args.split_whitespace() {
+            match token.to_ascii_lowercase().as_str() {
+                "latest" => checkpoint_id = None,
+                "conversation" => scope = wyj_core::RewindScope::Conversation,
+                "files" => scope = wyj_core::RewindScope::Files,
+                "both" => scope = wyj_core::RewindScope::Both,
+                "--confirm" => confirmed = true,
+                _ if checkpoint_id.is_none() => checkpoint_id = Some(token.to_string()),
+                _ => anyhow::bail!("usage: {}", self.usage()),
+            }
+        }
+        Ok(CommandResult::Rewind {
+            checkpoint_id,
+            scope,
+            confirmed,
+        })
+    }
+}
+
+pub struct BranchCmd;
+
+#[async_trait]
+impl Command for BranchCmd {
+    fn name(&self) -> &str {
+        "branch"
+    }
+    fn description(&self) -> String {
+        "Create a new session from a checkpoint without changing the original".to_string()
+    }
+    fn usage(&self) -> String {
+        "/branch [checkpoint-id|latest] [--restore-files] [--confirm]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let mut checkpoint_id = None;
+        let mut restore_files = false;
+        let mut confirmed = false;
+        for token in args.split_whitespace() {
+            match token.to_ascii_lowercase().as_str() {
+                "latest" => checkpoint_id = None,
+                "--restore-files" => restore_files = true,
+                "--confirm" => confirmed = true,
+                _ if checkpoint_id.is_none() => checkpoint_id = Some(token.to_string()),
+                _ => anyhow::bail!("usage: {}", self.usage()),
+            }
+        }
+        Ok(CommandResult::BranchSession {
+            checkpoint_id,
+            restore_files,
+            confirmed,
+        })
+    }
+}
+
+pub struct AgentControlCmd;
+
+#[async_trait]
+impl Command for AgentControlCmd {
+    fn name(&self) -> &str {
+        "agent-control"
+    }
+    fn description(&self) -> String {
+        "Send follow-up, interrupt or retry to a running sub-agent".to_string()
+    }
+    fn usage(&self) -> String {
+        "/agent-control <id> <follow-up text|interrupt|retry>".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let mut parts = args.trim().splitn(3, char::is_whitespace);
+        let id = parts
+            .next()
+            .and_then(|value| value.trim_start_matches('a').parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("usage: {}", self.usage()))?;
+        let action = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("usage: {}", self.usage()))?;
+        let action = match action {
+            "interrupt" => SubAgentControlAction::Interrupt,
+            "retry" | "retry-last" => SubAgentControlAction::RetryLast,
+            "follow-up" | "followup" => {
+                let text = parts.next().unwrap_or_default().trim();
+                anyhow::ensure!(!text.is_empty(), "follow-up text is required");
+                SubAgentControlAction::FollowUp(text.to_string())
+            }
+            _ => anyhow::bail!("usage: {}", self.usage()),
+        };
+        Ok(CommandResult::ControlSubAgent { id, action })
     }
 }
 
@@ -562,9 +695,9 @@ impl Command for DoctorCmd {
 
         // API Key
         match cfg.api_key() {
-            Ok(k) => lines.push(tr_fmt(
+            Ok(_) => lines.push(tr_fmt(
                 "status.api_key_ok",
-                &[("prefix", &k[..k.len().min(8)])],
+                &[("prefix", &cfg.redacted_api_key().unwrap_or_default())],
             )),
             Err(_) => lines.push(tr("doctor.api_key_missing")),
         }
@@ -860,13 +993,37 @@ impl Command for ModelCmd {
         tr("model.desc")
     }
     fn usage(&self) -> String {
-        "/model [profile-name]".to_string()
+        "/model [profile-name] | /model doctor [profile-name]".to_string()
     }
     async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
         if args.trim().is_empty() {
             return Ok(CommandResult::OpenProfileDialog);
         }
+        let mut parts = args.split_whitespace();
+        if parts.next() == Some("doctor") {
+            return Ok(CommandResult::ModelDoctor(parts.next().map(str::to_string)));
+        }
         Ok(CommandResult::SwitchProfile(args.trim().to_string()))
+    }
+}
+
+// ── /sandbox ─────────────────────────────────────────────────────────────────
+
+pub struct SandboxCmd;
+
+#[async_trait]
+impl Command for SandboxCmd {
+    fn name(&self) -> &str {
+        "sandbox"
+    }
+    fn description(&self) -> String {
+        "Inspect OS sandbox mode, boundaries, dependencies and fallback policy".to_string()
+    }
+    fn usage(&self) -> String {
+        "/sandbox".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::SandboxStatus)
     }
 }
 
@@ -1358,6 +1515,10 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(CheckpointCmd));
+    reg.register(Arc::new(RewindCmd));
+    reg.register(Arc::new(BranchCmd));
+    reg.register(Arc::new(AgentControlCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(SubAgentsCmd));
@@ -1366,6 +1527,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
+    reg.register(Arc::new(SandboxCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
@@ -1404,6 +1566,10 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(CheckpointCmd));
+    reg.register(Arc::new(RewindCmd));
+    reg.register(Arc::new(BranchCmd));
+    reg.register(Arc::new(AgentControlCmd));
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(SubAgentsCmd));
@@ -1412,6 +1578,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
+    reg.register(Arc::new(SandboxCmd));
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));

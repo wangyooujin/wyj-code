@@ -6,7 +6,8 @@
 [![Zero Telemetry](https://img.shields.io/badge/telemetry-none-green.svg)](#设计原则)
 
 一个用 **Rust** 从零实现的终端 AI 编程助手——单二进制、原生 TUI、双协议 LLM 适配、
-多 Agent 编排、可插拔 MCP 工具链。在 shell 里直接与 Claude / GPT 协作改代码。
+多 Agent 协作、可插拔 MCP 工具链和 OS 级安全执行。重点适配 GLM、MiniMax、Kimi、
+DeepSeek、Qwen/百炼、豆包/火山等国内模型，也支持 Claude、OpenAI 与本地兼容端点。
 
 > **定位说明**：这是个人工程作品集项目，用于展示 AI 系统的工程实现能力，非商业产品。
 > 依据公开的 Anthropic Messages API、OpenAI Chat Completions API、MCP 公开规范
@@ -16,21 +17,30 @@
 
 **核心引擎**
 - **Agent 推理循环** —— 流式 SSE 解析 → 累积工具调用 → 并发执行 → 结果回填，按 `stop_reason` 续接直到完成。
-- **双协议 LLM 适配** —— Anthropic Messages 与 OpenAI Chat Completions 双格式，混合配置（规划用 GPT、执行用 Claude）开箱即用。
-- **多 Agent 编排** —— 内置 `general-purpose` / `Explore`(只读) / `Plan` 三类子 Agent，支持自定义定义文件；`parallel_safe` 工具单回合内并发、其余保序回填；进程级 Hub 管理并发上限、前后台调度、ESC 中断。
+- **国内模型可信运行时** —— vendor 与 wire protocol 分离，能力值带来源/置信度/cache；静态目录覆盖 GLM、MiniMax、Kimi、DeepSeek、Qwen、豆包，并为 Ollama/vLLM/自定义兼容端点保留保守降级。
+- **双协议 Provider** —— Anthropic Messages 与 OpenAI Chat Completions 双格式；工具 JSON 有限修复 + schema 校验，Provider 错误类型化，同角色 fallback 只在可恢复错误和完整消息边界发生。
+- **多 Agent 协作** —— 内置 `general-purpose` / `Explore`(只读) / `Plan` 三类子 Agent，支持自定义定义文件；进程级 Hub 管理并发、前后台调度、follow-up、interrupt、retry-last 和落盘 trace。
+- **ToolSearch / lazy schema** —— 工具数超过阈值后只发送核心与 sticky schema，按本地词法搜索加载其余工具；状态栏和 `WYJ_STATS_JSON` 展示 schema token 发送量与节省量。
 - **上下文压缩** —— 估算 token 数接近窗口上限时自动摘要替换旧消息，保留最近若干条。
+- **Checkpoint / Rewind / Branch** —— 在不改用户真实 Git index 的前提下保存对话与文件状态，支持 conversation/files/both 恢复和从 checkpoint 创建新 session。
 - **统一 Extensions 资源平台** —— `/extensions` 与 `wyj-code extensions` 统一管理 Skill、MCP、Plugin；支持 lockfile v2、原生 Claude MCP 迁移、stdio/Streamable HTTP 和下一回合边界应用。
 - **可插拔 MCP** —— 内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并桥接 stdio 或 Streamable HTTP MCP server。
 
+**安全执行**
+- **默认 fail-closed** —— headless、单次 `-p`、schedule 与 SubAgent 没有真实 UI 时不会隐式批准副作用工具；`bypass` 只跳过普通交互确认，不会静默关闭 OS sandbox。
+- **Plan 文档写入** —— Plan 模式可直接维护 `doc/plan/**`、`docs/plan/**`、`.wyj-code/plans/**`；其他文档需逐路径授权，源码、脚本、配置与 shell 绕过始终拒绝。
+- **统一 Bash sandbox** —— 前台、后台和 TUI `!command` 走同一 runner；macOS 使用 Seatbelt + 受控域名代理，Linux 使用 bubblewrap 并在域名桥接不可验证时失败关闭，常见凭证目录默认拒读。
+- **一次性降级** —— 只有交互式 TUI 可明确批准一次 unsandboxed fallback，授权不能持久化；headless、schedule、SubAgent 始终拒绝。
+
 **交互与配置**
-- **原生 ratatui TUI** —— 流式 markdown、语法高亮、多行编辑、工具调用实时展示、子 Agent 聚合面板、完整消息流内选择概要项并用 Ctrl+O 展开明细。
-- **Profile 分组配置** —— provider / model / base_url / api_key 以具名 Profile 组织，多套供应商配置并存切换，`/model` 面板管理。
-- **三模式 + 分模型** —— `normal` / `plan`(只读) / `bypass`(自动放行)，各模式可绑定不同模型。
+- **原生 ratatui TUI** —— 流式 markdown、语法高亮、多行编辑、工具调用静态执行流、彩色 diff、Todo/SubAgent 列表与详情；终端可直接鼠标拖选复制，普通 `↑/↓` 始终留给输入框。
+- **Profile 分组配置** —— provider / vendor / wire protocol / model / base_url / `api_key_env` 以具名 Profile 组织，多套供应商配置并存切换，`/model` 面板管理。
+- **三模式 + 分模型** —— `normal` / `plan` / `bypass` 各自可绑定模型；权限策略与 sandbox 独立生效，模式切换不能扩大底层安全边界。
 - **CLAUDE.md 记忆机制** —— 每轮重新读盘，全局 + 祖先链文件以 `<system-reminder>` 注入当轮 user 消息；工具触达新目录时动态加载；`@path` 递归导入。
 - **Hooks 生命周期自动化** —— 复用 `.claude/settings.json`，在 PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点挂任意 shell 脚本（拦截危险命令、保存即格式化、注入上下文、回合结束通知），`/hooks` 查看当前生效配置，`--no-hooks` 一键禁用。
 - **自定义 slash 命令** —— 识别真实 Claude Code 的 `~/.claude/commands/*.md` 与 `.claude/commands/*.md`（与 wyj-code 自造的 `~/.wyj-code/skills`/`.wyj-code/skills` 并存，同作用域内真 CC 路径优先），frontmatter 支持 `description`/`argument-hint`/`allowed-tools`，`/help` 末尾动态列出全部自定义命令。
 - **一键导入 Codex / Claude Code 配置** —— `/import` 面板扫描 `~/.codex/`（MCP server、prompts）与 Claude Code（`~/.claude.json`/`.mcp.json`、commands、agents）配置，勾选确认后物化为 wyj-code 自管配置；CLI 对应 `wyj-code extensions migrate --from codex|claude|all [--dry-run]`。
-- **定时任务** —— `/schedule` 面板管理 cron 触发的任务（一句话 prompt 或固化当前对话），保存后自动同步进系统 crontab（macOS/Linux），到点以 headless 会话执行，失败可选 macOS 系统通知；CLI 对应 `wyj-code schedule {list,add,remove,enable,disable,sync,run}`。
+- **定时任务** —— `/schedule` 面板管理 cron 触发的任务及其 allowed tools、write roots、allowed domains、require sandbox 权限清单；旧任务升级后自动禁用并要求复核，复核后仍需再次显式启用。
 - **会话中消息注入** —— Agent 忙碌时新消息进队列不打断，在工具调用往返边界排空合并。
 - **i18n** —— 中 / 英双语，运行时切换，覆盖核心用户可见文案。
 - **会话持久化** —— 自动写入 `~/.wyj-code/`，`-c` 续上次、`--resume <id>` 恢复指定会话。
@@ -41,13 +51,14 @@
 
 ```text
 crates/
-├── api/         # Anthropic / OpenAI 协议适配、SSE 流式解析
+├── api/         # Provider、国内模型能力目录/doctor、SSE 流式解析
 ├── cli/         # 二进制入口、参数解析
 ├── commands/    # Slash 命令系统（/help /model /agents /compact …）
 ├── config/      # Profile 分组配置加载
-├── core/        # Agent 循环、Session、Tool trait、压缩、CLAUDE.md、Memory
+├── core/        # Agent、权限、ToolSearch、checkpoint、评测与 P2 接口
 ├── i18n/        # 中英双语资源
 ├── mcp/         # MCP 客户端（stdio / http）
+├── sandbox/     # macOS Seatbelt / Linux bubblewrap 隔离
 ├── tools/       # 内置工具 + SubAgent + AgentHub
 └── tui/         # ratatui 前端
 ```
@@ -108,20 +119,48 @@ cargo run -- --headless         # REPL 模式
 cargo run -- --config-status    # 查看配置状态
 ```
 
-配置文件 `~/.wyj-code/config.toml`，API Key 优先读环境变量 `WYJ_CODE_API_KEY`：
+配置文件 `~/.wyj-code/config.toml`。推荐用 `api_key_env` 只保存环境变量名；兼容变量
+`WYJ_CODE_API_KEY` 仍可覆盖当前 Profile，但运行时 secret 不会因打开设置面板后保存而写回文件：
 
 ```toml
-[profiles.default]
-provider = "anthropic"          # 或 "openai"
-model    = "claude-opus-4-8"
-# base_url / api_key 可选，留空用默认
+active_profile = "minimax"
+language = "zh"
 
-plan_model = ""                 # Plan 模式专用，留空回退 model
-exec_model = ""                 # Normal/Bypass 专用，留空回退 model
-language   = ""                 # "en"/"zh"，留空自动检测系统 locale
+[[profiles]]
+name = "minimax"
+provider = "openai"
+vendor = "minimax"
+wire_protocol = "open_ai_chat_completions"
+model = "MiniMax-M2"
+base_url = "https://api.minimaxi.com/v1"
+api_key_env = "MINIMAX_API_KEY"
+max_tokens = 8192
+context_window = 200000
+
+[model_runtime]
+probe_mode = "explicit"
+tool_argument_retries = 2
+lazy_tools_threshold = 12
+lazy_tools_top_k = 8
+lazy_tools_sticky_turns = 3
+
+[sandbox]
+enabled = true
+allow_unsandboxed_commands = true
+fail_if_unavailable = false
+
+[sandbox.network]
+allowed_domains = []
 ```
 
-TUI 内 `/model` 管理 Profile、`/mode` 切换模式、`/agents` 查看子 Agent、`/compact` 压缩、`/config` 设置面板、`/hooks` 查看生命周期钩子。完整命令见 `/help`。
+TUI 内可用 `/model doctor`、`/sandbox`、`/checkpoint`、`/rewind`、`/branch`、
+`/agent-control`；CLI 对应 `wyj-code model doctor`、`wyj-code sandbox` 和
+`wyj-code session {checkpoint,checkpoints,rewind,branch}`。完整命令见 `/help` 和
+`wyj-code --help`。
+
+模型诊断默认免费且不联网。只有显式 `--probe basic|full` 才发请求，并且只读取独立的
+`WYJ_CODE_PROBE_API_KEY`；不会扫描或复用配置中的 Profile Key。没有真实 probe 证据时，
+国内模型只显示 `static_only` / protocol-compatible，不能视为 live verified。
 
 项目级资源会从 Git 仓库根目录的 `.wyj-code/` 自动发现；即使在 `src/`、
 `crates/foo/` 等子目录启动，也会使用同一份项目配置：
@@ -172,14 +211,16 @@ Hooks 配置示例（`.claude/settings.json`，与真实 Claude Code 格式一�
 
 - **Profile 分组而非扁平字段**：真实场景下一套配置不够——主力 Claude、备援 OpenAI、本地 Ollama 往往并存。把 provider/model/base_url/api_key 收进具名 Profile，`/model` 面板增删改查，比官方工具的单一配置模型更贴近多供应商实际用法。
 - **消息注入而非打断轮次**：用户在 Agent 思考中途补充信息是高频需求。直接打断会丢失中间状态；改成 `pending_queue` + `InjectionKind`，在工具调用往返边界排空合并进当前或续接的 user 回合，对用户透明、对 LLM 无感。
-- **子 Agent 进程级 Hub**：多 agent 真正的难点是调度与回收，不是 spawn。用单例 Hub 统一分配 id、`Semaphore` 限并发、前台 oneshot / 后台经 system-reminder 通道回注、ESC 只 abort 前台、退出 `abort_all`——把生命周期管理做成一等公民。
+- **子 Agent 进程级 Hub**：多 agent 真正的难点是调度与回收，不是 spawn。用单例 Hub 统一分配 id、`Semaphore` 限并发、前台 oneshot / 后台经 system-reminder 通道回注、控制消息只在安全边界注入、ESC 只 abort 前台、退出 `abort_all`——把生命周期管理做成一等公民。
+- **权限与 sandbox 分层**：权限策略回答“是否批准”，OS sandbox 回答“批准后最多能触达哪里”。二者分离后，`bypass`、项目配置、模型提示和持久化的 Allow 都不能覆盖 protected deny，也不能把 sandbox 失败变成自动直连。
+- **静态兼容不冒充真实验证**：国内端点变化快，模型名推断只能提供保守默认。目录、用户 override 和显式 probe 按可信度合并；没有轮换 Key 和 live 证据就保持 `static_only`，发布材料不扩大结论。
 - **Rust + async + workspace**：选 Rust 不是赶时髦，是这个场景天然契合——流式解析、并发工具执行、零运行时依赖的单二进制分发。八个 crate 的切分让职责边界在编译期就强制清晰。
 
 ## 设计原则
 
 - **本地优先** —— 源码、配置、历史只属于你，无任何隐式埋点或崩溃上报。
 - **透明可控** —— Agent 循环、工具调用、权限确认全程实时展示，随时可打断。
-- **协议中立** —— 改一行 `provider` 即可切换供应商，不绑定任何一家。
+- **协议中立** —— vendor 与 wire protocol 分离，同一兼容协议可服务不同厂商，不把模型名称猜测当成最终事实。
 
 ## 性能
 
@@ -216,15 +257,13 @@ TUI 会话）立即退出，这个行为回归对交互式工具不可接受，�
 
 ## 已知限制
 
-- **无终端原生鼠标选中/scrollback**：TUI 主界面运行在 `ratatui::Viewport::Fullscreen`（alternate
-  screen）+ 鼠标捕获，以此换取输入框永远贴住终端窗口底部、不留空白。代价是终端原生的鼠标拖拽
-  选中/复制聊天文字、终端自身的 scrollback 缓冲区都不可用（多数终端可用 Option/Shift+拖拽 之类
-  修饰键强制原生选中作为退路）；历史消息改为应用内滚动——PageUp/PageDown、鼠标滚轮、Ctrl+O 展开
-  单条消息详情，复制最后一条 AI 回复用 Ctrl+Y。曾经尝试过在 `ratatui::Viewport::Inline`（终端原生
-  scrollback 模式）下把 viewport 撑到接近终端整高来实现贴底，但实测在 tmux/部分终端下 ratatui +
-  crossterm 的光标位置查询存在渲染竞态（不仅贴不到底，严重时刚输入的字符会不可见、状态栏文字
-  错位重叠），两次独立尝试都复现了同一类问题，判断为该模式下的结构性限制，因此改为不依赖光标
-  位置查询的 Fullscreen 方案。
+- MiniMax、GLM、Kimi、DeepSeek、Qwen、豆包在没有独立轮换 Key 的情况下只完成静态目录和协议 fixture，当前不宣称 live verified。
+- macOS 已提供 Seatbelt 文件边界和域名级受控代理；Linux bubblewrap 已提供文件系统与网络 namespace 隔离，但域名 allowlist 在缺少可验证 namespace-to-proxy 桥接时会拒绝访问，不冒充“已允许”。
+- 原生 Windows 暂无 Seatbelt/bubblewrap 同等级 OS sandbox；需要严格边界时建议在 WSL2 中运行并检查 `wyj-code sandbox` 输出。
+- macOS 为兼容编译器/系统库读取，当前是全局只读 + 常见凭证路径 deny-read，并非“整个 home 完全不可遍历”；工作区和显式 write roots 才可写。
+- Checkpoint 只能恢复会话和文件，不能撤销网络请求、数据库、已发送消息、外部应用或其他非文件副作用；自动 checkpoint 在大仓库中的 Git 扫描成本仍需继续优化。
+- v1.4.4 只冻结 `ExecutionWorkspace`、workflow/DAG、ACP/daemon 事件流和 `CodeIndex` 接口，尚未交付自动 worktree、完整 Agent Teams、IDE daemon 或语义索引。
+- TUI 已恢复终端原生鼠标拖选；聊天历史仍由应用内 PageUp/PageDown 等键盘路径浏览，不把 alternate-screen 的终端 scrollback 宣称为已恢复。
 
 ## 贡献
 

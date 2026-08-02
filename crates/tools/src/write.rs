@@ -86,7 +86,10 @@ impl Tool for WriteTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
-        let path = resolve_path(ctx.cwd(), &inp.file_path);
+        let path = match ctx.resolve_write_target(&inp.file_path) {
+            Ok(path) => path,
+            Err(reason) => return Ok(ToolResult::err(format!("安全检查失败：{reason}"))),
+        };
         let path_str = path.to_string_lossy().to_string();
 
         if !self.tracker.has_read(&path_str) {
@@ -113,14 +116,5 @@ impl Tool for WriteTool {
             "已写入: {}\n{detail}",
             path.display()
         )))
-    }
-}
-
-fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
-    let pb = std::path::Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        cwd.join(pb)
     }
 }

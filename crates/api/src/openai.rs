@@ -404,7 +404,12 @@ impl Provider for OpenAIProvider {
                                 Some(vec![])
                             }
                         },
-                        Err(e) => Some(vec![Err(anyhow::anyhow!("SSE 读取失败: {e}"))]),
+                        Err(_) => Some(vec![Err(anyhow::Error::new(
+                            crate::error::ProviderError::new(
+                                crate::error::ProviderErrorKind::StreamTruncated,
+                                "provider SSE stream ended unexpectedly",
+                            ),
+                        ))]),
                     };
                     futures::future::ready(events)
                 },

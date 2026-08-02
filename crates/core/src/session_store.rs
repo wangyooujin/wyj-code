@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use wyj_api::types::{ContentBlock, Message, Role};
 
+use crate::session::RoutingEvent;
+
 /// 持久化到磁盘的完整会话数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
@@ -17,6 +19,14 @@ pub struct SessionFile {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub messages: Vec<Message>,
+    #[serde(default)]
+    pub routing_events: Vec<RoutingEvent>,
+    #[serde(default)]
+    pub current_checkpoint_id: Option<String>,
+    #[serde(default)]
+    pub branch_parent_session_id: Option<String>,
+    #[serde(default)]
+    pub branch_parent_checkpoint_id: Option<String>,
     /// 是否已通过 LLM 生成过标题（首轮后生成一次，之后固定）
     #[serde(default)]
     pub title_generated: bool,
@@ -35,6 +45,10 @@ pub struct SessionMeta {
     pub output_tokens: u32,
     #[serde(default)]
     pub title_generated: bool,
+    #[serde(default)]
+    pub branch_parent_session_id: Option<String>,
+    #[serde(default)]
+    pub branch_parent_checkpoint_id: Option<String>,
 }
 
 impl From<SessionFile> for SessionMeta {
@@ -49,6 +63,8 @@ impl From<SessionFile> for SessionMeta {
             input_tokens: f.input_tokens,
             output_tokens: f.output_tokens,
             title_generated: f.title_generated,
+            branch_parent_session_id: f.branch_parent_session_id,
+            branch_parent_checkpoint_id: f.branch_parent_checkpoint_id,
         }
     }
 }
@@ -76,7 +92,10 @@ impl SessionStore {
 
     pub fn save(&self, file: &SessionFile) -> Result<()> {
         let json = serde_json::to_string(file)?;
-        std::fs::write(self.path(&file.session_id), json)?;
+        std::fs::write(
+            self.path(&file.session_id),
+            crate::secret::redact_sensitive_text(&json),
+        )?;
         Ok(())
     }
 
@@ -121,6 +140,36 @@ impl SessionStore {
     /// 返回当前项目最近一次会话（供 `-c/--continue` 恢复当前项目而非全局最新）。
     pub fn last_for_project(&self, cwd: &Path) -> Result<Option<SessionMeta>> {
         Ok(self.list_for_project(cwd)?.into_iter().next())
+    }
+
+    pub fn branch_from_checkpoint(
+        &self,
+        parent_session_id: &str,
+        checkpoint: &crate::checkpoint::Checkpoint,
+    ) -> Result<SessionFile> {
+        let session_id = crate::history::new_session_id();
+        let file = SessionFile {
+            session_id,
+            title: extract_title(&checkpoint.messages),
+            last_preview: extract_preview(&checkpoint.messages),
+            cwd: checkpoint.workspace_root().display().to_string(),
+            timestamp: crate::history::now_iso(),
+            turns: checkpoint
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count(),
+            input_tokens: 0,
+            output_tokens: 0,
+            messages: checkpoint.messages.clone(),
+            routing_events: vec![],
+            current_checkpoint_id: Some(checkpoint.id.clone()),
+            branch_parent_session_id: Some(parent_session_id.to_string()),
+            branch_parent_checkpoint_id: Some(checkpoint.id.clone()),
+            title_generated: false,
+        };
+        self.save(&file)?;
+        Ok(file)
     }
 }
 
@@ -183,6 +232,10 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             messages: vec![],
+            routing_events: vec![],
+            current_checkpoint_id: None,
+            branch_parent_session_id: None,
+            branch_parent_checkpoint_id: None,
             title_generated: false,
         }
     }
@@ -222,5 +275,86 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn branch_from_checkpoint_keeps_parent_unchanged_and_records_lineage() {
+        let base = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("file.txt"), "one").unwrap();
+        let store = SessionStore::new(base.path().join("sessions")).unwrap();
+        let parent = SessionFile {
+            session_id: "parent".to_string(),
+            title: "parent".to_string(),
+            last_preview: String::new(),
+            cwd: workspace.path().display().to_string(),
+            timestamp: "2026-08-02T00:00:00Z".to_string(),
+            turns: 2,
+            input_tokens: 10,
+            output_tokens: 20,
+            messages: vec![Message::user("first"), Message::assistant_text("answer")],
+            routing_events: vec![],
+            current_checkpoint_id: None,
+            branch_parent_session_id: None,
+            branch_parent_checkpoint_id: None,
+            title_generated: false,
+        };
+        store.save(&parent).unwrap();
+        let checkpoints = crate::checkpoint::CheckpointStore::new(store.dir(), "parent").unwrap();
+        let summary = checkpoints
+            .create(
+                workspace.path(),
+                &parent.messages[..1],
+                crate::checkpoint::CheckpointKind::Manual,
+                Some("branch point".to_string()),
+            )
+            .unwrap();
+        let checkpoint = checkpoints.load(&summary.id).unwrap();
+        let branch = store.branch_from_checkpoint("parent", &checkpoint).unwrap();
+
+        assert_ne!(branch.session_id, parent.session_id);
+        assert_eq!(
+            serde_json::to_value(&branch.messages).unwrap(),
+            serde_json::to_value(&parent.messages[..1]).unwrap()
+        );
+        assert_eq!(branch.branch_parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            branch.branch_parent_checkpoint_id.as_deref(),
+            Some(summary.id.as_str())
+        );
+        assert_eq!(
+            serde_json::to_value(&store.load("parent").unwrap().messages).unwrap(),
+            serde_json::to_value(&parent.messages).unwrap()
+        );
+    }
+
+    #[test]
+    fn persisted_sessions_redact_secret_like_user_text() {
+        let base = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(base.path().join("sessions")).unwrap();
+        let secret = format!("{}{}", "sk-test-", "D".repeat(24));
+        let file = SessionFile {
+            session_id: "secret-session".to_string(),
+            title: "secret".to_string(),
+            last_preview: secret.clone(),
+            cwd: base.path().display().to_string(),
+            timestamp: "2026-08-02T00:00:00Z".to_string(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            messages: vec![Message::user(format!("credential: {secret}"))],
+            routing_events: Vec::new(),
+            current_checkpoint_id: None,
+            branch_parent_session_id: None,
+            branch_parent_checkpoint_id: None,
+            title_generated: false,
+        };
+        store.save(&file).unwrap();
+        let raw = std::fs::read_to_string(store.path("secret-session")).unwrap();
+        assert!(!raw.contains(&secret));
+        assert!(raw.contains(crate::secret::REDACTED_SECRET));
+        assert!(store.load("secret-session").unwrap().messages[0]
+            .text()
+            .contains(crate::secret::REDACTED_SECRET));
     }
 }

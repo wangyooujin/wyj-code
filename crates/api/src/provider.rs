@@ -27,6 +27,18 @@ impl RequestOptions {
             interleaved: false,
         }
     }
+
+    pub fn from_request_plan(plan: &crate::request_plan::RequestPlan) -> Self {
+        let thinking_budget = match plan.reasoning {
+            crate::request_plan::ReasoningRequest::BudgetTokens(budget) => Some(budget),
+            _ => None,
+        };
+        Self {
+            max_tokens: plan.max_tokens,
+            thinking_budget,
+            interleaved: thinking_budget.is_some(),
+        }
+    }
 }
 
 /// LLM 供应商抽象 — 所有供应商实现此 trait
@@ -99,8 +111,16 @@ pub trait Provider: Send + Sync {
             content.push(ContentBlock::Text { text: text_buf });
         }
         for (id, name, json) in tool_bufs {
-            let input: serde_json::Value =
-                serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+            let input: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+                anyhow::anyhow!(
+                    "provider returned malformed arguments for tool `{}`: {}",
+                    name,
+                    error
+                )
+            })?;
+            if !input.is_object() {
+                anyhow::bail!("provider returned non-object arguments for tool `{}`", name);
+            }
             content.push(ContentBlock::ToolUse { id, name, input });
         }
 

@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
-use wyj_config::Provider;
+use wyj_config::{Provider, WireProtocol};
 
 /// 新建分组时可选的内置模板。
 pub struct ProfileTemplate {
@@ -15,6 +15,8 @@ pub struct ProfileTemplate {
     /// 展示名称
     pub label: &'static str,
     pub provider: Provider,
+    pub vendor: &'static str,
+    pub wire_protocol: WireProtocol,
     pub base_url: &'static str,
     pub example_model: &'static str,
     /// 供应商特殊说明，展示在模板选择器里
@@ -29,6 +31,8 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         key: "glm",
         label: "GLM（智谱/Z.ai Coding Plan）",
         provider: Provider::Anthropic,
+        vendor: "zhipu",
+        wire_protocol: WireProtocol::AnthropicMessages,
         base_url: "https://open.bigmodel.cn/api/anthropic",
         example_model: "glm-5.2",
         note: "",
@@ -40,6 +44,8 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         key: "volcengine",
         label: "火山引擎（Ark Agent 计划）",
         provider: Provider::OpenAI,
+        vendor: "volcengine",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
         base_url: "https://ark.cn-beijing.volces.com/api/v3",
         example_model: "doubao-seed-1-6",
         note: "模型名通常是控制台创建的推理接入点 ID（形如 ep-xxxxxxxx-xxxxx），非固定模型名",
@@ -51,6 +57,8 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         key: "minimax",
         label: "MiniMax（Coding Plan）",
         provider: Provider::OpenAI,
+        vendor: "minimax",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
         base_url: "https://api.minimaxi.com/v1",
         example_model: "MiniMax-M2",
         note: "",
@@ -62,6 +70,8 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         key: "kimi",
         label: "Kimi（Moonshot Coding Plan）",
         provider: Provider::Anthropic,
+        vendor: "moonshot",
+        wire_protocol: WireProtocol::AnthropicMessages,
         base_url: "https://api.moonshot.cn/anthropic",
         example_model: "kimi-k2-turbo-preview",
         note: "",
@@ -73,6 +83,8 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         key: "deepseek",
         label: "DeepSeek（官方计费 API）",
         provider: Provider::OpenAI,
+        vendor: "deepseek",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
         base_url: "https://api.deepseek.com",
         example_model: "deepseek-chat",
         note:
@@ -82,9 +94,50 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         openai_stream_options: Some(true),
     },
     ProfileTemplate {
+        key: "qwen-bailian",
+        label: "通义千问（阿里云百炼）",
+        provider: Provider::OpenAI,
+        vendor: "alibaba",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
+        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        example_model: "qwen3-coder-plus",
+        note: "静态兼容模板；请以百炼控制台当前可用模型为准",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(true),
+    },
+    ProfileTemplate {
+        key: "ollama",
+        label: "Ollama（实验性 OpenAI 兼容）",
+        provider: Provider::OpenAI,
+        vendor: "ollama",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
+        base_url: "http://127.0.0.1:11434/v1",
+        example_model: "qwen3-coder",
+        note: "能力取决于本地模型；创建后请运行 model doctor probe",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(false),
+    },
+    ProfileTemplate {
+        key: "vllm",
+        label: "vLLM（实验性 OpenAI 兼容）",
+        provider: Provider::OpenAI,
+        vendor: "vllm",
+        wire_protocol: WireProtocol::OpenAiChatCompletions,
+        base_url: "http://127.0.0.1:8000/v1",
+        example_model: "",
+        note: "能力取决于 served model 和启动参数；创建后请运行 model doctor probe",
+        vision: false,
+        prompt_cache: None,
+        openai_stream_options: Some(false),
+    },
+    ProfileTemplate {
         key: "custom",
         label: "自定义",
         provider: Provider::Anthropic,
+        vendor: "custom",
+        wire_protocol: WireProtocol::AnthropicMessages,
         base_url: "",
         example_model: "",
         note: "",
