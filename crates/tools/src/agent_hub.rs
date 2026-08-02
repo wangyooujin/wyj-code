@@ -23,6 +23,8 @@ pub enum SubAgentEvent {
     /// 子 Agent 已创建并开始（在父工具调用返回前同步发出，供前端与 ToolCall 消息配对）
     Started {
         id: u64,
+        /// Parent agent id for nested spawns. Root sub-agents use `None`.
+        parent_id: Option<u64>,
         agent_type: String,
         description: String,
         background: bool,
@@ -155,6 +157,10 @@ impl SubAgentEvent {
 #[derive(Debug, Clone)]
 pub enum AgentControl {
     FollowUp(Vec<ContentBlock>),
+    PeerMessage {
+        from_id: u64,
+        content: Vec<ContentBlock>,
+    },
     Interrupt,
     RetryLast,
 }
@@ -273,6 +279,48 @@ impl SubAgentHub {
             return AgentControlResult::InvalidContent;
         }
         self.send_control(id, AgentControl::FollowUp(content), "follow_up")
+    }
+
+    /// Send a message between running agents in the same parent/child tree.  The message is
+    /// consumed at the receiver's next safe model boundary, exactly like a human follow-up.
+    pub fn send_peer_message(
+        &self,
+        from_id: u64,
+        to_id: u64,
+        content: Vec<ContentBlock>,
+    ) -> AgentControlResult {
+        if from_id == to_id || !valid_message_content(&content) {
+            return AgentControlResult::InvalidContent;
+        }
+        let running = self.running.lock().unwrap();
+        if !running.contains_key(&from_id) || !running.contains_key(&to_id) {
+            drop(running);
+            return AgentControlResult::NotFound;
+        }
+        if root_id(&running, from_id) != root_id(&running, to_id) {
+            drop(running);
+            self.emit(SubAgentEvent::Control {
+                id: to_id,
+                action: format!("message_from_a{from_id}"),
+                accepted: false,
+            });
+            return AgentControlResult::InvalidContent;
+        }
+        let sent = running[&to_id]
+            .control_tx
+            .send(AgentControl::PeerMessage { from_id, content })
+            .is_ok();
+        drop(running);
+        self.emit(SubAgentEvent::Control {
+            id: to_id,
+            action: format!("message_from_a{from_id}"),
+            accepted: sent,
+        });
+        if sent {
+            AgentControlResult::Accepted
+        } else {
+            AgentControlResult::ChannelClosed
+        }
     }
 
     pub fn retry_last(&self, id: u64) -> AgentControlResult {
@@ -412,6 +460,27 @@ impl SubAgentHub {
     }
 }
 
+fn valid_message_content(content: &[ContentBlock]) -> bool {
+    !content.is_empty()
+        && content.iter().all(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { .. } | ContentBlock::Image { .. }
+            )
+        })
+}
+
+fn root_id(running: &HashMap<u64, RunningEntry>, mut id: u64) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(id) {
+        match running.get(&id).and_then(|entry| entry.parent_id) {
+            Some(parent) => id = parent,
+            None => break,
+        }
+    }
+    id
+}
+
 impl Default for SubAgentHub {
     fn default() -> Self {
         Self::new()
@@ -532,6 +601,76 @@ mod tests {
             }],
         );
         assert_eq!(result, AgentControlResult::InvalidContent);
+    }
+
+    #[tokio::test]
+    async fn peer_messages_are_delivered_within_one_agent_tree() {
+        let hub = SubAgentHub::new();
+        let (root_tx, _root_rx) = mpsc::unbounded_channel();
+        let (left_tx, _left_rx) = mpsc::unbounded_channel();
+        let (right_tx, mut right_rx) = mpsc::unbounded_channel();
+        hub.register(1, true, None, root_tx, tokio::spawn(std::future::pending()));
+        hub.register(
+            2,
+            true,
+            Some(1),
+            left_tx,
+            tokio::spawn(std::future::pending()),
+        );
+        hub.register(
+            3,
+            true,
+            Some(1),
+            right_tx,
+            tokio::spawn(std::future::pending()),
+        );
+        assert_eq!(
+            hub.send_peer_message(
+                2,
+                3,
+                vec![ContentBlock::Text {
+                    text: "review this".to_string(),
+                }],
+            ),
+            AgentControlResult::Accepted
+        );
+        assert!(matches!(
+            right_rx.recv().await,
+            Some(AgentControl::PeerMessage { from_id: 2, .. })
+        ));
+        hub.abort_all();
+    }
+
+    #[tokio::test]
+    async fn peer_messages_are_rejected_across_agent_trees() {
+        let hub = SubAgentHub::new();
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let (second_tx, _second_rx) = mpsc::unbounded_channel();
+        hub.register(
+            1,
+            true,
+            None,
+            first_tx,
+            tokio::spawn(std::future::pending()),
+        );
+        hub.register(
+            2,
+            true,
+            None,
+            second_tx,
+            tokio::spawn(std::future::pending()),
+        );
+        assert_eq!(
+            hub.send_peer_message(
+                1,
+                2,
+                vec![ContentBlock::Text {
+                    text: "cross-tree".to_string(),
+                }],
+            ),
+            AgentControlResult::InvalidContent
+        );
+        hub.abort_all();
     }
 
     #[tokio::test]

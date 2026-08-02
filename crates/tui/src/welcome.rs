@@ -220,24 +220,24 @@ fn shortcuts_line(available_width: usize) -> String {
 /// 避免 f32 插值 + round 引入 ±1 误差导致测试断言失败。
 fn logo_color_at(col: usize, total_cols: usize) -> Color {
     if total_cols <= 1 {
-        return Theme::WELCOME_LOGO_GRADIENT_MID;
+        return Theme::welcome_logo_gradient_mid_color();
     }
     if col == 0 {
-        return Theme::WELCOME_LOGO_GRADIENT_START;
+        return Theme::welcome_logo_gradient_start_color();
     }
     if col == total_cols - 1 {
-        return Theme::WELCOME_LOGO_GRADIENT_END;
+        return Theme::welcome_logo_gradient_end_color();
     }
 
-    let (sr, sg, sb) = match Theme::WELCOME_LOGO_GRADIENT_START {
+    let (sr, sg, sb) = match Theme::welcome_logo_gradient_start_color() {
         Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
         _ => (215.0, 119.0, 87.0),
     };
-    let (mr, mg, mb) = match Theme::WELCOME_LOGO_GRADIENT_MID {
+    let (mr, mg, mb) = match Theme::welcome_logo_gradient_mid_color() {
         Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
         _ => (225.0, 160.0, 85.0),
     };
-    let (er, eg, eb) = match Theme::WELCOME_LOGO_GRADIENT_END {
+    let (er, eg, eb) = match Theme::welcome_logo_gradient_end_color() {
         Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
         _ => (240.0, 200.0, 80.0),
     };
@@ -438,12 +438,12 @@ mod tests {
         assert!(non_blank.len() >= 2, "logo 首行至少 2 个有渐变 fg 的字符");
         assert_eq!(
             non_blank.first().unwrap().style.fg,
-            Some(Theme::WELCOME_LOGO_GRADIENT_START),
+            Some(Theme::welcome_logo_gradient_start_color()),
             "logo 首字符 fg 应等于渐变起点"
         );
         assert_eq!(
             non_blank.last().unwrap().style.fg,
-            Some(Theme::WELCOME_LOGO_GRADIENT_END),
+            Some(Theme::welcome_logo_gradient_end_color()),
             "logo 末字符 fg 应等于渐变终点"
         );
     }
@@ -464,11 +464,11 @@ mod tests {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => panic!("中点 fg 应为 RGB"),
         };
-        let (sr, sg, sb) = match Theme::WELCOME_LOGO_GRADIENT_START {
+        let (sr, sg, sb) = match Theme::welcome_logo_gradient_start_color() {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => unreachable!(),
         };
-        let (er, eg, eb) = match Theme::WELCOME_LOGO_GRADIENT_END {
+        let (er, eg, eb) = match Theme::welcome_logo_gradient_end_color() {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => unreachable!(),
         };
@@ -513,7 +513,7 @@ mod tests {
         let profile_line = &lines[TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES];
         assert_eq!(
             profile_line.spans[0].style.fg,
-            Some(Theme::INACTIVE),
+            Some(Theme::inactive_color()),
             "Profile/Model 行应使用 dim 色（INACTIVE 灰）"
         );
     }
@@ -632,14 +632,20 @@ mod tests {
     #[test]
     fn logo_color_at_boundaries() {
         // 边界条件：col=0 应返回 START，col=total_cols-1 应返回 END，total_cols<=1 取中点
-        assert_eq!(logo_color_at(0, 10), Theme::WELCOME_LOGO_GRADIENT_START);
-        assert_eq!(logo_color_at(9, 10), Theme::WELCOME_LOGO_GRADIENT_END);
+        assert_eq!(
+            logo_color_at(0, 10),
+            Theme::welcome_logo_gradient_start_color()
+        );
+        assert_eq!(
+            logo_color_at(9, 10),
+            Theme::welcome_logo_gradient_end_color()
+        );
         let single = logo_color_at(0, 1);
         let (r, g, b) = match single {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => panic!("单列应返回 RGB"),
         };
-        let (mr, mg, mb) = match Theme::WELCOME_LOGO_GRADIENT_MID {
+        let (mr, mg, mb) = match Theme::welcome_logo_gradient_mid_color() {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => unreachable!(),
         };

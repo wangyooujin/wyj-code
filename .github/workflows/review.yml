@@ -1,0 +1,102 @@
+name: Review Evidence
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  review:
+    name: Test, lint and review diff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build review command
+        run: cargo build --bin wyj-code --locked
+
+      - name: Generate machine-readable review evidence
+        id: evidence
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          BASE_SHA="$PR_BASE_SHA"
+          HEAD_SHA="$PR_HEAD_SHA"
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA=$(git rev-parse HEAD^)
+          fi
+          if [ -z "$HEAD_SHA" ]; then
+            HEAD_SHA=$(git rev-parse HEAD)
+          fi
+          set +e
+          target/debug/wyj-code review run \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --output artifacts/review-evidence.json \
+            --json \
+            --fail-on critical > artifacts/review-stdout.json
+          REVIEW_EXIT=$?
+          set -e
+          echo "$REVIEW_EXIT" > artifacts/review-exit-code.txt
+
+      - name: Write job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f artifacts/review-evidence.json ]; then
+            echo "## Review evidence unavailable" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## wyj-code review evidence" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '
+            "- Diff: \(.diff.changed_files) files, +\(.diff.insertions) -\(.diff.deletions)",
+            "- Findings: \(.findings | length)",
+            "- Patch SHA256: `\(.patch_sha256)`",
+            "",
+            "| Severity | Rule | Location | Message |",
+            "|---|---|---|---|",
+            (.findings[]? | "| \(.severity) | `\(.rule_id)` | `\(.path):\(.line)` | \(.message) |")
+          ' artifacts/review-evidence.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload review evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-evidence
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce critical finding gate
+        if: always()
+        shell: bash
+        run: |
+          test -f artifacts/review-exit-code.txt
+          test "$(cat artifacts/review-exit-code.txt)" = "0"

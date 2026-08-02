@@ -1,14 +1,15 @@
 //! TUI 应用主循环
 
 use crate::event::{is_quit, AgentEvent};
+use crate::hyperlink::{open_target, HyperlinkBackend, HyperlinkRegistry};
 use crate::input::InputBox;
 use crate::render;
 use crate::theme::Theme;
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -17,7 +18,6 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::style::Color as UiColor;
 use ratatui::Terminal;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1418,34 +1418,34 @@ impl InputOwner {
         match self {
             InputOwner::Mcp(McpInputField::AddRegistryUrl) => (
                 wyj_i18n::tr("dialog.input_owner.mcp_add_registry"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Mcp(McpInputField::BrowseSearch) => (
                 wyj_i18n::tr("dialog.input_owner.mcp_browse_search"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Skills(SkillsInputField::AddMarketplaceUrl) => (
                 wyj_i18n::tr("dialog.input_owner.skills_add_marketplace"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Plugins(PluginsInputField::AddMarketplaceUrl) => (
                 wyj_i18n::tr("dialog.input_owner.plugins_add_marketplace"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Plugins(PluginsInputField::AddLocalPluginPath) => (
                 wyj_i18n::tr("dialog.input_owner.plugins_add_local"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Profile(ProfileInputField::Rename { .. }) => (
                 wyj_i18n::tr("dialog.input_owner.profile_rename"),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Profile(ProfileInputField::Field { field_idx, .. }) => (
                 wyj_i18n::tr_fmt(
                     "dialog.input_owner.profile_field",
                     &[("field", &wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*field_idx]))],
                 ),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Schedule(ScheduleInputField::Field { field_idx, .. }) => (
                 wyj_i18n::tr_fmt(
@@ -1455,7 +1455,7 @@ impl InputOwner {
                         &wyj_i18n::tr(SCHEDULE_FIELD_LABEL_KEYS[*field_idx]),
                     )],
                 ),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
             InputOwner::Schedule(ScheduleInputField::Frequency { kind, .. }) => (
                 wyj_i18n::tr(match kind {
@@ -1464,7 +1464,7 @@ impl InputOwner {
                     ScheduleFrequencyKind::Weekly => "dialog.input_owner.schedule_freq_weekly",
                     ScheduleFrequencyKind::Custom => "dialog.input_owner.schedule_freq_custom",
                 }),
-                Theme::CLAUDE,
+                Theme::claude_color(),
             ),
         }
     }
@@ -5711,6 +5711,9 @@ pub struct AppState {
     pub tool_schema_tokens: u32,
     pub tool_schema_tokens_saved: u32,
     pub cwd: PathBuf,
+    /// 最终渲染帧中可点击链接的屏幕坐标。与自定义 backend 共享，用于 OSC 8
+    /// 输出以及终端继续上报 Ctrl/Command+点击时的应用侧兜底打开。
+    pub(crate) hyperlink_registry: HyperlinkRegistry,
     pub should_quit: bool,
     pub turns: usize,
     /// 当前 spinner 动画帧索引
@@ -5884,6 +5887,7 @@ impl AppState {
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
             cwd,
+            hyperlink_registry: HyperlinkRegistry::default(),
             should_quit: false,
             turns: 0,
             spinner_frame: 0,
@@ -6446,8 +6450,8 @@ impl AppState {
         )
     }
 
-    /// Shift+↑ 从输入框显式进入内容区。优先选择离输入框最近且当前可见的运行中
-    /// SubAgent 面板，其次是内联 Todo，最后是聊天区底部。
+    /// 从输入框显式进入内容区。优先选择离输入框最近且当前可见的运行中 SubAgent
+    /// 面板，其次是内联 Todo，最后是聊天区底部。
     fn enter_content_focus(&mut self) -> bool {
         if self.content_focus_active() {
             return true;
@@ -7268,6 +7272,7 @@ impl AppState {
                 agent_type,
                 description,
                 background,
+                parent_id: _,
                 // 落盘 trace 关联用，TUI 内存态摘要不需要
                 parent_tool_use_id,
             } => {
@@ -7473,6 +7478,53 @@ impl AppState {
     }
 }
 
+/// 进入全屏 TUI，但明确关闭鼠标捕获：鼠标由终端原生处理，用户可直接拖选文字，
+/// 不需要按住 Shift/Option，松开修饰键后选区也不会被应用鼠标事件立即冲掉。
+fn enter_terminal_screen<W: Write>(writer: &mut W) -> io::Result<()> {
+    execute!(writer, EnableBracketedPaste, DisableMouseCapture)?;
+    execute!(writer, EnterAlternateScreen)
+}
+
+#[cfg(test)]
+mod terminal_screen_tests {
+    use super::*;
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn startup_disables_mouse_capture_for_direct_terminal_selection() {
+        let mut output = Vec::new();
+        enter_terminal_screen(&mut output).unwrap();
+
+        for disabled_mode in [
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1002l".as_slice(),
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+        ] {
+            assert!(
+                contains_bytes(&output, disabled_mode),
+                "启动序列必须关闭全部鼠标报告模式: {output:?}"
+            );
+        }
+        for enabled_mode in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?1002h".as_slice(),
+            b"\x1b[?1003h".as_slice(),
+            b"\x1b[?1006h".as_slice(),
+        ] {
+            assert!(
+                !contains_bytes(&output, enabled_mode),
+                "启动序列不得重新开启鼠标捕获: {output:?}"
+            );
+        }
+    }
+}
+
 /// 启动 TUI 主界面
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tui(
@@ -7500,6 +7552,7 @@ pub async fn run_tui(
     // 工厂与 `/model` 重建读取（见 `wyj-code` CLI 侧 `make_sub_agent_factory`）
     mcp_tools: wyj_tools::SharedMcpTools,
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
+    plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -7508,12 +7561,13 @@ pub async fn run_tui(
     // 结构上不会撞上 Inline 撑满高度时那个 tmux/部分终端下的光标查询竞态
     // （历史教训见 crates/tui/CLAUDE.md）。聊天区因此天然贴着窗口顶部铺开、
     // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
-    // 代价是放弃终端原生 scrollback 与鼠标原生选中——改为 EnableMouseCapture
-    // 接管鼠标滚轮驱动应用内翻页（`Event::Mouse` 分支），历史消息永远留在
-    // `AppState.messages` 里用 PageUp/PageDown/滚轮翻看。
-    execute!(stdout, EnableBracketedPaste, EnableMouseCapture)?;
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    // 历史消息永远留在 `AppState.messages`，用 PageUp/PageDown 等键盘入口翻看。
+    // 鼠标捕获必须保持关闭，让终端原生拖选/复制无需 Shift 且选区能在松键后保留。
+    // 回复链接继续通过 OSC 8 交给终端处理 Command/Ctrl+点击；事件分支只作为某些
+    // 终端仍主动上报修饰键点击时的防御性兜底，不为此开启鼠标报告模式。
+    enter_terminal_screen(&mut stdout)?;
+    let hyperlink_registry = HyperlinkRegistry::default();
+    let backend = HyperlinkBackend::new(stdout, hyperlink_registry.clone());
     let mut terminal = Terminal::new(backend)?;
 
     let result = tui_main(
@@ -7535,12 +7589,14 @@ pub async fn run_tui(
         local_plugin,
         mcp_tools,
         shared_agent_defs,
+        hyperlink_registry,
+        plugin_runtime,
     )
     .await;
 
     disable_raw_mode()?;
-    // 全程都在 alternate screen + 鼠标捕获里，退出时统一还原（不再有"是否曾经
-    // 进入过 Fullscreen"的分支判断——从启动到这里全程都在）。
+    // 全程都在 alternate screen，退出时统一还原；再次发送 DisableMouseCapture
+    // 可防御外部组件或异常路径意外开启鼠标报告模式。
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -7778,6 +7834,7 @@ fn spawn_agent_turn(
     sandbox_config: wyj_config::SandboxCfg,
     // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
     preface_reminders: Vec<String>,
+    plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> (
     AbortHandle,
     mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>,
@@ -7823,7 +7880,7 @@ fn spawn_agent_turn(
                 let _ = tx3.try_send(AgentEvent::Injected);
             }
         };
-        match turn_agent
+        let turn_result = turn_agent
             .run_turn_with_injection(
                 &mut sess,
                 &ctx,
@@ -7831,8 +7888,25 @@ fn spawn_agent_turn(
                 Some(&mut inject_rx),
                 on_inject,
             )
-            .await
-        {
+            .await;
+        let event = if turn_result.is_ok() {
+            "turn_finished"
+        } else {
+            "turn_error"
+        };
+        emit_plugin_event_background(
+            plugin_runtime,
+            event,
+            serde_json::json!({
+                "cwd": ctx_cwd,
+                "input_tokens": sess.total_input_tokens,
+                "output_tokens": sess.total_output_tokens,
+                "tool_schema_tokens": sess.tool_schema_tokens,
+                "tool_schema_tokens_saved": sess.tool_schema_tokens_saved,
+                "error": turn_result.as_ref().err().map(ToString::to_string),
+            }),
+        );
+        match turn_result {
             Ok(_) => {
                 let _ = tx
                     .send(AgentEvent::Usage {
@@ -7851,6 +7925,20 @@ fn spawn_agent_turn(
         }
     });
     (handle.abort_handle(), inject_tx)
+}
+
+fn emit_plugin_event_background(
+    runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    event: &'static str,
+    payload: serde_json::Value,
+) {
+    tokio::spawn(async move {
+        for result in runtime.emit_channel_event(event, &payload).await {
+            if !result.success {
+                tracing::warn!("plugin channel {} failed: {}", result.name, result.output);
+            }
+        }
+    });
 }
 
 /// RunPromptScoped（自定义命令 allowed-tools）临时收紧 permission_mode 的 RAII 兜底还原。
@@ -7875,6 +7963,7 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "Read",
                 "Glob",
                 "Grep",
+                "CodeSearch",
                 "WebFetch",
                 "WebSearch",
                 "AskQuestion",
@@ -8533,7 +8622,7 @@ fn refresh_tui_mcp_runtime(
 
 #[allow(clippy::too_many_arguments)]
 async fn tui_main(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<HyperlinkBackend<io::Stdout>>,
     agent: Agent,
     rebuild_fn: RebuildFn,
     cwd: PathBuf,
@@ -8551,6 +8640,8 @@ async fn tui_main(
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     mcp_tools: wyj_tools::SharedMcpTools,
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
+    hyperlink_registry: HyperlinkRegistry,
+    plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -8564,6 +8655,7 @@ async fn tui_main(
         config,
         hub.clone(),
     );
+    state.hyperlink_registry = hyperlink_registry;
     state.hook_runner = agent.hook_runner_ref().cloned();
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
@@ -8753,6 +8845,7 @@ async fn tui_main(
                 ui_ask_tx.clone(),
                 state.config.sandbox.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
+                plugin_runtime.clone(),
             );
             state.current_task = Some(handle);
             state.injector = Some(injector);
@@ -8846,6 +8939,24 @@ async fn tui_main(
                     update_file_completions(&mut state, &input, &cwd);
                 }
                 Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META,
+                        ) =>
+                    {
+                        if let Some(target) =
+                            state.hyperlink_registry.target_at(mouse.column, mouse.row)
+                        {
+                            if let Err(error) = open_target(&target) {
+                                state.push_tracked_message(ChatMessage::assistant_err(
+                                    wyj_i18n::tr_fmt(
+                                        "hyperlink.open_failed",
+                                        &[("error", error.to_string().as_str())],
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     MouseEventKind::ScrollUp => state.scroll_focus_lines(-3),
                     MouseEventKind::ScrollDown => state.scroll_focus_lines(3),
                     _ => {}
@@ -10876,6 +10987,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
+                                        plugin_runtime.clone(),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -10906,6 +11018,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
+                                        plugin_runtime.clone(),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -11084,8 +11197,8 @@ async fn tui_main(
                         }
                     }
 
-                    // Shift+↑ 是输入框 → 内容区的唯一显式入口。补全列表、配置输入框
-                    // 和各类模态面板都在更高优先级已经拦截，因此不会被这里抢键。
+                    // 输入框 → 内容区的显式入口。补全列表、配置输入框和各类模态面板
+                    // 都在更高优先级已经拦截，因此不会被这里抢键。
                     let shift_up = is_content_focus_key(key);
                     if shift_up && !state.content_focus_active() {
                         let _ = state.enter_content_focus();
@@ -11873,6 +11986,7 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let sandbox_config = state.config.sandbox.clone();
+                                        let plugin_runtime_c = plugin_runtime.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let mut sess = session_c.lock().await;
@@ -11892,10 +12006,24 @@ async fn tui_main(
                                                 let _ = tx2
                                                     .try_send(AgentEvent::TextDelta(d.to_string()));
                                             };
-                                            match turn_agent
+                                            let run_result = turn_agent
                                                 .run_turn(&mut sess, &ctx, &mut on_text)
-                                                .await
-                                            {
+                                                .await;
+                                            emit_plugin_event_background(
+                                                plugin_runtime_c,
+                                                if run_result.is_ok() {
+                                                    "turn_finished"
+                                                } else {
+                                                    "turn_error"
+                                                },
+                                                serde_json::json!({
+                                                    "cwd": ctx_cwd,
+                                                    "input_tokens": sess.total_input_tokens,
+                                                    "output_tokens": sess.total_output_tokens,
+                                                    "error": run_result.as_ref().err().map(ToString::to_string),
+                                                }),
+                                            );
+                                            match run_result {
                                                 Ok(_) => {
                                                     let _ = tx
                                                         .send(AgentEvent::Usage {
@@ -11978,6 +12106,7 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let sandbox_config = state.config.sandbox.clone();
+                                        let plugin_runtime_c = plugin_runtime.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let mut sess = session_c.lock().await;
@@ -12017,10 +12146,24 @@ async fn tui_main(
                                                 let _ = tx2
                                                     .try_send(AgentEvent::TextDelta(d.to_string()));
                                             };
-                                            match turn_agent
+                                            let run_result = turn_agent
                                                 .run_turn(&mut sess, &ctx, &mut on_text)
-                                                .await
-                                            {
+                                                .await;
+                                            emit_plugin_event_background(
+                                                plugin_runtime_c,
+                                                if run_result.is_ok() {
+                                                    "turn_finished"
+                                                } else {
+                                                    "turn_error"
+                                                },
+                                                serde_json::json!({
+                                                    "cwd": ctx_cwd,
+                                                    "input_tokens": sess.total_input_tokens,
+                                                    "output_tokens": sess.total_output_tokens,
+                                                    "error": run_result.as_ref().err().map(ToString::to_string),
+                                                }),
+                                            );
+                                            match run_result {
                                                 Ok(_) => {
                                                     let _ = tx
                                                         .send(AgentEvent::Usage {
@@ -12287,6 +12430,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
+                                        plugin_runtime.clone(),
                                     );
                                     state.current_task = Some(handle);
                                     state.injector = Some(injector);
@@ -12721,6 +12865,7 @@ mod sub_agent_ui_tests {
     fn started(state: &mut AppState, id: u64, desc: &str, background: bool) {
         state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::Started {
             id,
+            parent_id: None,
             agent_type: "Explore".to_string(),
             description: desc.to_string(),
             background,

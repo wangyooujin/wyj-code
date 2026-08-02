@@ -2,6 +2,19 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.0]
+
+- **Workflow 自动隔离编码节点**：`wyj-code workflow validate/run/status/control` 已交付 DAG runtime、并发上限、token budget、human approval、pause/resume/retry/skip/cancel 和持久化状态。拥有 Write/Edit/Bash 且配置 `write_roots` 的 Agent/Review 节点会从当前脏工作区 checkpoint 自动创建独立 managed Git worktree；成功和失败现场都保留，结果返回 diff/review/accept 命令，不自动覆盖父 checkout。
+- **Managed Worktree 完整生命周期**：`wyj-code workspace create/list/diff/accept/dispose` 支持 binary-capable diff、遗漏路径提示和选择性接受；接受前防御 symlink 逃逸、父 checkout HEAD 前进、用户并发修改与 binary 漏应用，强制清理必须显式 `--force`。
+- **ACP 与全局 daemon session**：新增 stdio ACP adapter 和本地 TCP daemon。daemon 使用进程级 session registry，连接断开不再终止活动 session，新连接可 `session/load` attach，并通过 `_wyj/session/list` / `_wyj/session/control` 跨连接列出、提交、打断、rewind、branch、控制 workflow 或关闭 session；Rewind/Branch 文件恢复先 preview，确认后执行并创建保护 checkpoint。接口 schema 升级为 version 2。
+- **前端无关事件流**：统一发出 text/thinking/tool/usage/error/turn finished，以及 PermissionRequested、DiffAvailable、CheckpointChanged、AgentStateChanged，供 ACP/IDE 客户端消费；stdio 连接仍在结束时清理自己的 session，daemon session 则全局存活。
+- **CodeIndex 与真实 Plugin LSP 查询**：本地词法/符号索引带 ignore-aware direct-scan fallback；插件 LSP 完成 `Content-Length` framing、initialize/initialized 和 `workspace/symbol`，解析 file URI、symbol kind、container/path/line 后与本地结果合并、去重、排序。LSP 故障保持 fail-soft，不影响本地搜索。
+- **Plugin Runtime 事务式激活**：已启用插件可贡献 hooks、output styles、themes、channels、LSP servers、monitors、settings schema 与 userConfig；任一 runtime contribution 无效时整插件回滚，不再留下半激活状态，名称冲突保持先到先得并记录 warning。
+- **Review 与执行安全收口**：新增 `wyj-code review run` 和 GitHub Review Action，扫描 rename、空格路径、binary numstat，并对 secret evidence 脱敏；headless REPL 的 `!command` 统一走 SandboxRunner，不再通过 `sh -c` 绕过隔离。Release CI 强制执行 workspace 全量测试与 `clippy -D warnings`。
+- **整合 TUI 交互改进**：纳入 Markdown 表格/timeline 物理行网格、终端原生鼠标拖选、OSC 8 文件/网页超链接、稠密渲染、welcome/theme 调整，并保持普通 `↑/↓` 留在 Composer，已退休的 `Shift+↑ content` 文案不再恢复。
+- **国内模型边界不夸大**：未读取或使用此前暴露的 MiniMax Key；live probe 仍只接受独立 `WYJ_CODE_PROBE_API_KEY`。MiniMax 和其他无独立轮换 Key 的国内模型继续标记为 `static_only` / protocol-compatible。
+- **版本**：工作区版本升级到 `1.5.0`；已发布的 annotated tag `v1.4.4` 保持不可移动。
+
 ## [1.4.4]
 
 - **国内模型可信运行时**：新增 vendor / wire protocol 分离的 `ModelCapabilities`、能力来源与置信度、静态模型目录和 TTL cache；覆盖 GLM、MiniMax、Kimi、DeepSeek、Qwen/百炼、豆包/火山，以及 Ollama/vLLM/OpenAI-compatible 兼容端点。`wyj-code model doctor` 与 `/model doctor` 默认只做静态诊断，显式 live probe 只读取独立的 `WYJ_CODE_PROBE_API_KEY`。
@@ -16,7 +29,8 @@
 
 ## [1.4.2]
 
-- **显式内容区焦点与连续键盘导航**：普通 `↑/↓` 始终保留给输入框和输入历史，`Shift+↑` 作为唯一显式内容入口；内容焦点可在聊天、Todo 与 SubAgent 间连续移动，Todo 支持进入单任务详情逐行阅读，`Esc` 按详情 → 列表 → 输入框逐级返回并保留草稿。
+- **恢复终端原生鼠标选中**：TUI 启动时显式关闭 mouse capture，聊天内容可直接用鼠标拖选复制，不再要求 Shift/Option；松开修饰键后应用也不会立即用鼠标事件冲掉选区。应用内历史继续通过 PageUp/PageDown 等键盘入口浏览，OSC 8 文件与网页链接仍由终端原生 Command/Ctrl+点击打开。
+- **内容区连续键盘导航**：普通 `↑/↓` 始终保留给输入框和输入历史；Todo 与 SubAgent 支持键盘选择和单任务详情逐行阅读，`Esc` 按详情 → 列表 → 输入框逐级返回并保留草稿。
 - **Codex 风格静态执行流**：移除聊天消息选中、高亮、`▶`、展开/折叠、详情滚动和 `Ctrl+O`；Thinking、ToolResult 与 BashOutput 标题下最多展示 3 个终端视觉行，超出以 ASCII `...` 收束，用户输入和 AI 最终回答保持完整展示并自然换行。
 - **Edit/Write 自动 diff 预览**：编辑和写入结果直接展示红色删除、绿色新增、灰色上下文，不再需要手动展开；长 diff 同样遵守三视觉行上限，历史会话恢复后仍保留工具名并正确识别 diff。
 - **稳定的尾部跟随语义**：默认视口跟随内容最后一行；用户主动上滚后保持阅读位置并显示新消息提示，流式 token、工具结果和新消息不会抢走视口，滚回底部后自动恢复跟随。

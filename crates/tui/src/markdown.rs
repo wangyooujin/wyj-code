@@ -17,8 +17,8 @@ pub fn display_width(s: &str) -> usize {
     s.width()
 }
 
-/// 按显示宽度换行（不截断，不加省略号），供代码块正文使用，避免长行
-/// 被省略号裁剪导致内容丢失展示。
+/// 按显示宽度换行（不截断，不加省略号），供代码块和表格单元格使用，
+/// 避免长内容被裁剪导致展示不完整。
 fn wrap_dw(s: &str, max: usize) -> Vec<String> {
     if max == 0 {
         return vec![s.to_string()];
@@ -36,27 +36,6 @@ fn wrap_dw(s: &str, max: usize) -> Vec<String> {
         w += cw;
     }
     out.push(cur);
-    out
-}
-
-/// 按显示宽度截断，超出后附 `…`（`…` 占 1 列）
-fn truncate_dw(s: &str, max: usize) -> String {
-    if s.width() <= max {
-        return s.to_string();
-    }
-    // 为 `…` 留出 1 列
-    let target = max.saturating_sub(1);
-    let mut w = 0usize;
-    let mut out = String::new();
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(1);
-        if w + cw > target {
-            break;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out.push('…');
     out
 }
 
@@ -91,22 +70,210 @@ fn table_border(widths: &[usize], l: char, m: char, r: char, f: char) -> String 
     s
 }
 
-fn table_row_str(cells: &[String], widths: &[usize], aligns: &[Alignment]) -> String {
-    let mut s = String::from("│");
-    for (i, &w) in widths.iter().enumerate() {
-        let raw = cells.get(i).map(String::as_str).unwrap_or("");
-        let cell = if display_width(raw) > w {
-            truncate_dw(raw, w)
-        } else {
-            raw.to_string()
-        };
-        let align = aligns.get(i).cloned().unwrap_or(Alignment::Left);
-        s.push(' ');
-        s.push_str(&pad_dw(&cell, w, align));
-        s.push(' ');
-        s.push('│');
+fn table_cell_width(cell: &str) -> usize {
+    cell.split('\n').map(display_width).max().unwrap_or(0)
+}
+
+/// 将列宽压进可用宽度。优先保留窄列，把剩余空间分配给真正需要的宽列，
+/// 避免旧实现按平均值一刀切后浪费空间、再被 `Paragraph` 二次折行。
+fn fit_table_widths(widths: &mut [usize], max_width: usize) {
+    if widths.is_empty() {
+        return;
     }
-    s
+
+    // 每列左右各 1 个空格，另有 n + 1 根竖线。
+    let frame_width = widths.len() * 3 + 1;
+    let content_budget = max_width.saturating_sub(frame_width);
+    let natural_total = widths.iter().sum::<usize>();
+    if natural_total <= content_budget {
+        return;
+    }
+
+    // 正常窗口尽量给每列至少 4 列；极窄窗口则均分已有空间。
+    let min_width = if content_budget >= widths.len() * 4 {
+        4
+    } else {
+        (content_budget / widths.len()).max(1)
+    };
+    let wanted = widths
+        .iter()
+        .map(|width| (*width).max(min_width))
+        .collect::<Vec<_>>();
+
+    // 找出最大的公平列宽上限，使总宽仍不超过预算。
+    let mut low = min_width;
+    let mut high = wanted.iter().copied().max().unwrap_or(min_width);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let used = wanted.iter().map(|width| (*width).min(mid)).sum::<usize>();
+        if used <= content_budget {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    for (width, wanted) in widths.iter_mut().zip(&wanted) {
+        *width = (*wanted).min(low);
+    }
+
+    // 二分上限可能留下少量余宽，按列补回，尽量用满而不越界。
+    let mut remaining = content_budget.saturating_sub(widths.iter().sum::<usize>());
+    while remaining > 0 {
+        let mut changed = false;
+        for (width, wanted) in widths.iter_mut().zip(&wanted) {
+            if *width < *wanted {
+                *width += 1;
+                remaining -= 1;
+                changed = true;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn wrap_table_cell(cell: &str, width: usize) -> Vec<String> {
+    let mut lines = cell
+        .split('\n')
+        .flat_map(|line| wrap_dw(line, width))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// 一条 Markdown 表格记录可能因为列宽不足而占多条终端物理行。
+/// 边框与正文拆成不同 Span，避免竖线和正文一样亮、视觉上喧宾夺主。
+fn table_row_lines(
+    cells: &[String],
+    widths: &[usize],
+    aligns: &[Alignment],
+    cell_styles: &[Style],
+) -> Vec<Line<'static>> {
+    let wrapped = widths
+        .iter()
+        .enumerate()
+        .map(|(i, width)| wrap_table_cell(cells.get(i).map(String::as_str).unwrap_or(""), *width))
+        .collect::<Vec<_>>();
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+
+    (0..row_height)
+        .map(|line_idx| {
+            let mut spans = Vec::with_capacity(widths.len() * 2 + 1);
+            for (i, width) in widths.iter().copied().enumerate() {
+                spans.push(Span::styled(
+                    if i == 0 { "│ " } else { " │ " },
+                    Theme::border(),
+                ));
+                let text = wrapped[i].get(line_idx).map(String::as_str).unwrap_or("");
+                let align = aligns.get(i).cloned().unwrap_or(Alignment::Left);
+                let style = cell_styles.get(i).cloned().unwrap_or_default();
+                spans.push(Span::styled(pad_dw(text, width, align), style));
+            }
+            spans.push(Span::styled(" │", Theme::border()));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Markdown 表格与可识别的结构化文本共用同一套网格，保证边框颜色、
+/// 行间横线、列宽收缩和单元格换行规则完全一致。
+fn emit_grid_table(
+    lines: &mut Vec<Line<'static>>,
+    header: Option<&[String]>,
+    rows: &[Vec<String>],
+    aligns: &[Alignment],
+    body_styles: &[Style],
+    max_width: usize,
+) {
+    let ncols = header
+        .map(<[String]>::len)
+        .unwrap_or_else(|| rows.iter().map(Vec::len).max().unwrap_or(0));
+    if ncols == 0 {
+        return;
+    }
+
+    let mut col_w = vec![0; ncols];
+    if let Some(header) = header {
+        for (i, cell) in header.iter().take(ncols).enumerate() {
+            col_w[i] = table_cell_width(cell);
+        }
+    }
+    for row in rows {
+        for (i, cell) in row.iter().take(ncols).enumerate() {
+            col_w[i] = col_w[i].max(table_cell_width(cell));
+        }
+    }
+    fit_table_widths(&mut col_w, max_width);
+
+    lines.push(Line::from(Span::styled(
+        table_border(&col_w, '┌', '┬', '┐', '─'),
+        Theme::border(),
+    )));
+
+    if let Some(header) = header {
+        let header_styles = vec![Style::default().add_modifier(Modifier::BOLD); ncols];
+        lines.extend(table_row_lines(header, &col_w, aligns, &header_styles));
+        lines.push(Line::from(Span::styled(
+            table_border(&col_w, '├', '┼', '┤', '─'),
+            Theme::border(),
+        )));
+    }
+
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(Span::styled(
+                table_border(&col_w, '├', '┼', '┤', '─'),
+                Theme::border(),
+            )));
+        }
+        lines.extend(table_row_lines(row, &col_w, aligns, body_styles));
+    }
+
+    lines.push(Line::from(Span::styled(
+        table_border(&col_w, '└', '┴', '┘', '─'),
+        Theme::border(),
+    )));
+}
+
+/// 模型有时会把时间线放进无语言代码围栏。它本质上是两列结构化数据，
+/// 若至少三行都满足 `HH:MM  内容`，就按统一表格样式渲染，而不是伪装成代码。
+fn parse_timeline_rows(text: &str) -> Option<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() < 8
+            || !bytes[0].is_ascii_digit()
+            || !bytes[1].is_ascii_digit()
+            || bytes[2] != b':'
+            || !bytes[3].is_ascii_digit()
+            || !bytes[4].is_ascii_digit()
+        {
+            return None;
+        }
+
+        let hour = line[..2].parse::<u8>().ok()?;
+        let minute = line[3..5].parse::<u8>().ok()?;
+        let rest = &line[5..];
+        let separator_len = rest.chars().take_while(|ch| ch.is_whitespace()).count();
+        let content = rest.trim_start();
+        if hour > 23 || minute > 59 || separator_len < 2 || content.is_empty() {
+            return None;
+        }
+        rows.push(vec![line[..5].to_string(), content.to_string()]);
+    }
+
+    (rows.len() >= 3).then_some(rows)
 }
 
 // ── 语法高亮 ──────────────────────────────────────────────────────────────────
@@ -334,6 +501,8 @@ struct Ctx {
     in_code_block: bool,
     /// 当前代码块语言标签（如 "rust", "python"）
     code_lang: String,
+    /// 代码块完整正文；在结束事件统一判断普通代码或结构化时间线。
+    code_buf: String,
     /// 表格状态
     in_table: bool,
     is_table_head: bool,
@@ -359,6 +528,7 @@ impl Ctx {
             blockquote: 0,
             in_code_block: false,
             code_lang: String::new(),
+            code_buf: String::new(),
             in_table: false,
             is_table_head: false,
             table_aligns: vec![],
@@ -372,16 +542,16 @@ impl Ctx {
     fn cur_style(&self) -> Style {
         let mut s = Style::default();
         if self.code_span {
-            return s.fg(Theme::CODE_FG);
+            return s.fg(Theme::code_fg_color());
         }
         if let Some(lvl) = self.heading {
             s = match lvl {
-                1 => s.fg(Theme::CLAUDE).add_modifier(Modifier::BOLD),
-                2 => s.fg(Theme::TEXT).add_modifier(Modifier::BOLD),
-                _ => s.fg(Theme::INACTIVE).add_modifier(Modifier::BOLD),
+                1 => s.fg(Theme::claude_color()).add_modifier(Modifier::BOLD),
+                2 => s.fg(Theme::text_color()).add_modifier(Modifier::BOLD),
+                _ => s.fg(Theme::inactive_color()).add_modifier(Modifier::BOLD),
             };
         } else if self.blockquote > 0 {
-            s = s.fg(Theme::INACTIVE);
+            s = s.fg(Theme::inactive_color());
         }
         if self.strong > 0 {
             s = s.add_modifier(Modifier::BOLD);
@@ -441,6 +611,54 @@ impl Ctx {
         lines.push(Line::from(spans));
     }
 
+    fn emit_code_block(&self, lines: &mut Vec<Line<'static>>) {
+        if self.code_lang.is_empty() {
+            if let Some(rows) = parse_timeline_rows(&self.code_buf) {
+                let aligns = [Alignment::Left, Alignment::Left];
+                let body_styles = [Theme::code_body(), Style::default()];
+                emit_grid_table(lines, None, &rows, &aligns, &body_styles, self.max_width);
+                return;
+            }
+        }
+
+        let lang_display = if self.code_lang.is_empty() {
+            String::new()
+        } else {
+            format!(" {} ", self.code_lang)
+        };
+        // 前缀 "  ╭─" 占 4 列，右上角占 1 列；边框统一使用深灰色。
+        let dash = self
+            .max_width
+            .saturating_sub(display_width(&lang_display) + 5);
+        lines.push(Line::from(Span::styled(
+            format!("  ╭─{lang_display}{}╮", "─".repeat(dash)),
+            Theme::border(),
+        )));
+
+        let max_line = self.max_width.saturating_sub(6);
+        for raw_line in self.code_buf.lines() {
+            for text in wrap_dw(raw_line, max_line) {
+                let pad = (max_line + 1).saturating_sub(display_width(&text));
+                let mut spans = vec![Span::styled("  │ ", Theme::border())];
+                if self.code_lang.is_empty() {
+                    spans.push(Span::styled(text, Theme::code_body()));
+                } else {
+                    spans.extend(highlight_code_line(&text, &self.code_lang));
+                }
+                spans.push(Span::styled(
+                    format!("{}│", " ".repeat(pad)),
+                    Theme::border(),
+                ));
+                lines.push(Line::from(spans));
+            }
+        }
+
+        lines.push(Line::from(Span::styled(
+            format!("  ╰{}╯", "─".repeat(self.max_width.saturating_sub(4))),
+            Theme::border(),
+        )));
+    }
+
     /// 渲染整个表格（在 End(Table) 时调用）
     fn emit_table(&self, lines: &mut Vec<Line<'static>>) {
         if self.table_header.is_empty() {
@@ -450,55 +668,14 @@ impl Ctx {
         let aligns: Vec<Alignment> = (0..ncols)
             .map(|i| self.table_aligns.get(i).cloned().unwrap_or(Alignment::Left))
             .collect();
-
-        // 每列最小宽 = 表头/数据中最大的显示宽度
-        let mut col_w: Vec<usize> = self.table_header.iter().map(|h| display_width(h)).collect();
-        col_w.resize(ncols, 0);
-
-        for row in &self.table_rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < ncols {
-                    col_w[i] = col_w[i].max(display_width(cell));
-                }
-            }
-        }
-
-        // 若表格超出可用宽度，只压缩宽列（保留窄列，最小 4）
-        let total = col_w.iter().sum::<usize>() + ncols * 3 + 1;
-        if total > self.max_width && ncols > 0 {
-            let avail = self.max_width.saturating_sub(ncols * 3 + 1);
-            let max_col = (avail / ncols).max(4);
-            for w in &mut col_w {
-                if *w > max_col {
-                    *w = max_col;
-                }
-            }
-        }
-
-        // 顶边框
-        lines.push(Line::from(Span::styled(
-            table_border(&col_w, '┌', '┬', '┐', '─'),
-            Theme::dim(),
-        )));
-        // 表头（加粗）
-        lines.push(Line::from(Span::styled(
-            table_row_str(&self.table_header, &col_w, &aligns),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        // 分隔线
-        lines.push(Line::from(Span::styled(
-            table_border(&col_w, '├', '┼', '┤', '─'),
-            Theme::dim(),
-        )));
-        // 数据行
-        for row in &self.table_rows {
-            lines.push(Line::from(Span::raw(table_row_str(row, &col_w, &aligns))));
-        }
-        // 底边框
-        lines.push(Line::from(Span::styled(
-            table_border(&col_w, '└', '┴', '┘', '─'),
-            Theme::dim(),
-        )));
+        emit_grid_table(
+            lines,
+            Some(&self.table_header),
+            &self.table_rows,
+            &aligns,
+            &[],
+            self.max_width,
+        );
     }
 }
 
@@ -506,7 +683,7 @@ impl Ctx {
 
 /// 将 Markdown 字符串渲染为 ratatui `Line<'static>` 列表。
 ///
-/// `max_width`：可用字符宽度（用于截断和表格列宽计算）。
+/// `max_width`：可用字符宽度（用于内容换行和表格列宽计算）。
 pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: usize) {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
     let parser = Parser::new_ext(text, opts);
@@ -549,33 +726,18 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
             // ─── 代码块 ─────────────────────────────────────────────────────
             Event::Start(Tag::CodeBlock(kind)) => {
                 c.in_code_block = true;
+                c.code_buf.clear();
                 let lang_raw = match &kind {
                     CodeBlockKind::Fenced(l) if !l.is_empty() => l.to_string(),
                     _ => String::new(),
                 };
                 c.code_lang = lang_raw.to_lowercase();
-                let lang_display = if lang_raw.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {lang_raw} ")
-                };
-                // 前缀 "  ╭─" 占 4 个字符，末尾 "╮" 占 1 个字符，dash 补满剩余宽度，
-                // 使整行（含右上角）总长精确等于 max_width，右侧完整闭合。
-                let dash = max_width.saturating_sub(lang_display.len() + 5);
-                lines.push(Line::from(Span::styled(
-                    format!("  ╭─{lang_display}{}╮", "─".repeat(dash)),
-                    Theme::dim(),
-                )));
             }
             Event::End(TagEnd::CodeBlock) => {
+                c.emit_code_block(lines);
                 c.in_code_block = false;
                 c.code_lang.clear();
-                // 前缀 "  ╰" 占 3 个字符，末尾 "╯" 占 1 个字符，与上方开始边框总长一致
-                // （同为 max_width），右侧完整闭合。
-                lines.push(Line::from(Span::styled(
-                    format!("  ╰{}╯", "─".repeat(max_width.saturating_sub(4))),
-                    Theme::dim(),
-                )));
+                c.code_buf.clear();
             }
 
             // ─── 列表 ───────────────────────────────────────────────────────
@@ -670,44 +832,25 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
             Event::End(TagEnd::Emphasis) => c.em = c.em.saturating_sub(1),
             Event::Code(text) => {
                 // 行内代码：用 ` 包裹显示
-                let style = Style::default().fg(Theme::CODE_FG);
+                let style = Style::default().fg(Theme::code_fg_color());
                 c.cur.push((format!("`{text}`"), style));
             }
 
             // ─── 文本内容 ───────────────────────────────────────────────────
             Event::Text(text) => {
                 if c.in_code_block {
-                    let max_line = max_width.saturating_sub(6);
-                    for raw_line in text.lines() {
-                        // 超宽的行换行展示全部内容，而不是截断加省略号丢失信息
-                        for s in wrap_dw(raw_line, max_line) {
-                            // 补齐到 max_line+1 宽度（含内容与至少 1 格右侧空隙）后接 "│"，
-                            // 使内容行与顶部/底部边框总长一致（均为 max_width），右侧闭合。
-                            if c.code_lang.is_empty() {
-                                lines.push(Line::from(Span::styled(
-                                    format!("  │ {}│", pad_dw(&s, max_line + 1, Alignment::Left)),
-                                    Theme::code_body(),
-                                )));
-                            } else {
-                                let pad = (max_line + 1).saturating_sub(display_width(&s));
-                                let mut spans =
-                                    vec![Span::styled("  │ ".to_string(), Theme::dim())];
-                                spans.extend(highlight_code_line(&s, &c.code_lang));
-                                spans.push(Span::styled(
-                                    format!("{}│", " ".repeat(pad)),
-                                    Theme::dim(),
-                                ));
-                                lines.push(Line::from(spans));
-                            }
-                        }
-                    }
+                    c.code_buf.push_str(&text);
                 } else {
                     c.push_text(&text);
                 }
             }
             Event::SoftBreak => c.push_text(" "),
             Event::HardBreak => {
-                c.flush(lines);
+                if c.in_table {
+                    c.cur_cell.push('\n');
+                } else {
+                    c.flush(lines);
+                }
             }
 
             // ─── 水平分隔线 ─────────────────────────────────────────────────
@@ -753,6 +896,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn plain_code_block_keeps_border_color_separate_from_body_color() {
+        let mut lines = vec![];
+        render_markdown(&mut lines, "```\nplain text\n```", 40);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].spans[0].style, Theme::border());
+        assert_eq!(lines[1].spans[1].style, Theme::code_body());
+        assert_eq!(lines[1].spans.last().unwrap().style, Theme::border());
+        assert_ne!(Theme::border(), Theme::code_body());
+    }
+
+    #[test]
+    fn fenced_timeline_uses_the_same_grid_and_row_separators_as_tables() {
+        let text =
+            "```\n09:00  半导体能不能追？\n09:15  苏州招商能不能建？\n09:30  海康能不能加仓？\n```";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 80);
+        let rendered = rendered_text(&lines);
+
+        assert_eq!(rendered.len(), 7, "顶线/3 行/2 行间线/底线");
+        assert!(rendered[0].starts_with('┌') && rendered[0].contains('┬'));
+        for index in [2, 4] {
+            assert!(rendered[index].starts_with('├'));
+            assert!(rendered[index].contains('┼'));
+            assert!(rendered[index].ends_with('┤'));
+        }
+        assert!(rendered[6].starts_with('└') && rendered[6].contains('┴'));
+
+        let first_row = &lines[1];
+        assert_eq!(first_row.spans[0].style, Theme::border());
+        assert_eq!(first_row.spans[1].style, Theme::code_body());
+        assert_eq!(first_row.spans[2].style, Theme::border());
+        assert_eq!(first_row.spans[3].style, Style::default());
+        assert_eq!(first_row.spans.last().unwrap().style, Theme::border());
+    }
+
     /// 回归测试：代码块内长行被 `wrap_dw` 按显示宽度硬切时，若切分点恰好落在字符串
     /// 字面量转义反斜杠（如 `\n`）之后——即换行片段以孤立的 `\` 结尾、其配对字符被
     /// 换到了下一段——`highlight_code_line` 曾因未做边界检查而越界 panic
@@ -783,5 +963,94 @@ mod tests {
         assert!(rendered[1].contains("第二段"));
         assert!(rendered[2].contains("标题"));
         assert!(rendered[3].contains("正文"));
+    }
+
+    fn rendered_text(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn table_draws_horizontal_separators_between_body_rows() {
+        let text = "| 标的 | 现持仓 |\n| --- | ---: |\n| 兴蓉 | 800 股 |\n| 海康 | 200 股 |\n| 总仓位 | 18.8% |";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 80);
+        let rendered = rendered_text(&lines);
+
+        assert_eq!(rendered.len(), 9, "顶/表头/表头线/3 行/2 行间线/底");
+        for index in [2, 4, 6] {
+            assert!(
+                rendered[index].starts_with('├') && rendered[index].ends_with('┤'),
+                "表头和每条正文记录之间都应有完整横线: {}",
+                rendered[index]
+            );
+            assert!(rendered[index].contains('┼'));
+        }
+    }
+
+    #[test]
+    fn table_uses_subdued_borders_without_dimming_cell_content() {
+        let mut lines = vec![];
+        render_markdown(
+            &mut lines,
+            "| 标的 | 仓位 |\n| --- | --- |\n| 兴蓉 | 800 |",
+            80,
+        );
+
+        let body = &lines[3];
+        assert_eq!(body.spans[0].style, Theme::border());
+        assert_eq!(body.spans[1].style, Style::default());
+        assert_eq!(body.spans.last().unwrap().style, Theme::border());
+    }
+
+    #[test]
+    fn narrow_table_wraps_inside_cells_without_losing_grid_shape() {
+        let text =
+            "| 检查项 | 动作 |\n| --- | --- |\n| 半导体指数是否守住五个点 | 守住则继续持有 |";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 24);
+        let rendered = rendered_text(&lines);
+
+        for line in &rendered {
+            assert!(
+                display_width(line) <= 24,
+                "表格应在单元格内换行，不应触发终端二次折行: {line}"
+            );
+            if line.starts_with('│') {
+                assert_eq!(
+                    line.chars().filter(|ch| *ch == '│').count(),
+                    3,
+                    "两列表格每个物理行只应有 3 根必要的竖线: {line}"
+                );
+            }
+        }
+        let content = rendered.join("");
+        assert!(!content.contains('…'), "狭表格不应截断内容");
+
+        let body_lines = rendered
+            .iter()
+            .skip(3)
+            .take_while(|line| !line.starts_with('└'))
+            .filter(|line| line.starts_with('│'))
+            .collect::<Vec<_>>();
+        let first_cell = body_lines
+            .iter()
+            .filter_map(|line| line.split('│').nth(1))
+            .map(str::trim)
+            .collect::<String>();
+        let second_cell = body_lines
+            .iter()
+            .filter_map(|line| line.split('│').nth(2))
+            .map(str::trim)
+            .collect::<String>();
+        assert_eq!(first_cell, "半导体指数是否守住五个点");
+        assert_eq!(second_cell, "守住则继续持有");
     }
 }
