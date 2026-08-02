@@ -28,7 +28,9 @@ mod websearch;
 pub mod window_capture;
 mod write;
 
-pub use agent_hub::{SubAgentEvent, SubAgentHub, MAX_CONCURRENT_SUBAGENTS};
+pub use agent_hub::{
+    AgentControl, AgentControlResult, SubAgentEvent, SubAgentHub, MAX_CONCURRENT_SUBAGENTS,
+};
 #[cfg(target_os = "macos")]
 pub use app_computer::AppComputerTool;
 pub use ask_question::AskQuestionTool;

@@ -134,6 +134,15 @@ pub struct ToolDefinition {
     pub native: Option<NativeToolSpec>,
 }
 
+/// 供应商流中完整保留的原始工具调用。它不是可执行对象；只有经过参数解析、
+/// 有限语法修复和原始 JSON Schema 校验后才能转为 `ContentBlock::ToolUse`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawToolCall {
+    pub id: String,
+    pub name: String,
+    pub raw_arguments: String,
+}
+
 /// Anthropic 原生工具规格（如 `computer_20251124`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeToolSpec {

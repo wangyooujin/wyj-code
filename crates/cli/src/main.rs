@@ -1,13 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistry, CommandResult};
-use wyj_config::{AgentMode, Config};
+use wyj_config::{AgentMode, Config, RoutingRole};
 use wyj_core::{
-    extract_preview, extract_title, new_session_id, now_iso, Agent, HistoryEntry, HistoryStore,
-    HookRunner, MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator, ToolEvent,
+    extract_preview, extract_title, new_session_id, now_iso, Agent, ExecutionSurface, HistoryEntry,
+    HistoryStore, HookRunner, MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator,
+    ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
@@ -36,6 +38,21 @@ struct Cli {
     plan: bool,
     #[arg(long, help = wyj_i18n::tr("cli.bypass_help"))]
     bypass_permissions: bool,
+    /// 本次进程允许调用的工具名；逗号分隔。仅工具名不会自动授权写入范围。
+    #[arg(long, value_delimiter = ',')]
+    allowed_tools: Vec<String>,
+    /// 本次进程允许写入的目录，可重复指定。
+    #[arg(long = "allow-write")]
+    allow_write: Vec<std::path::PathBuf>,
+    /// 本次进程允许访问的网络域名，可重复指定。
+    #[arg(long = "allow-network")]
+    allow_network: Vec<String>,
+    /// Plan 模式本轮额外允许修改的单个文档路径，可重复指定。
+    #[arg(long = "allow-plan-write")]
+    allow_plan_write: Vec<std::path::PathBuf>,
+    /// Bash/Agent 等进程工具没有 sandbox 时直接拒绝。
+    #[arg(long)]
+    require_sandbox: bool,
     #[arg(short = 'c', long = "continue", help = wyj_i18n::tr("cli.continue_help"))]
     continue_session: bool,
     #[arg(long, help = wyj_i18n::tr("cli.resume_help"))]
@@ -83,6 +100,68 @@ enum Commands {
     /// 项目级 server 而不连接，配 cron 任务前先用这个命令批准一次。
     #[command(name = "trust-mcp", about = wyj_i18n::tr("cli.trust_mcp_about"))]
     TrustMcp,
+    /// Inspect model identity, capabilities and optional live compatibility probes.
+    #[command(name = "model")]
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+    /// Manage persisted session checkpoints, rewind and branches.
+    #[command(name = "session")]
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Inspect the effective OS sandbox and network-isolation capabilities.
+    #[command(name = "sandbox")]
+    Sandbox {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommand {
+    /// Static diagnosis is free; --probe uses only WYJ_CODE_PROBE_API_KEY.
+    Doctor {
+        profile: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_parser = ["basic", "full"])]
+        probe: Option<String>,
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCommand {
+    Checkpoint {
+        session_id: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Checkpoints {
+        session_id: String,
+    },
+    Rewind {
+        session_id: String,
+        checkpoint_id: String,
+        #[arg(long, default_value = "both", value_parser = ["conversation", "files", "both"])]
+        scope: String,
+        /// Required before any file is overwritten or removed.
+        #[arg(long)]
+        force: bool,
+    },
+    Branch {
+        session_id: String,
+        checkpoint_id: String,
+        #[arg(long)]
+        restore_files: bool,
+        /// Required with --restore-files when the workspace differs.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
@@ -166,7 +245,7 @@ fn print_subagent_trace_summary(id: u64, events: &[wyj_tools::trace::TraceEvent]
                 status = if *is_error { "failed" } else { "done" };
                 elapsed = *elapsed_secs;
             }
-            TE::ToolEnd { .. } => {}
+            TE::ToolEnd { .. } | TE::Control { .. } => {}
         }
     }
     println!(
@@ -215,6 +294,9 @@ fn print_subagent_trace_detail(id: u64, events: &[wyj_tools::trace::TraceEvent])
             } => {
                 println!("  usage: ↑{input_tokens} ↓{output_tokens}");
             }
+            TE::Control { action, accepted } => {
+                println!("  control: {action} accepted={accepted}");
+            }
             TE::Done {
                 result,
                 is_error,
@@ -240,6 +322,363 @@ fn open_tui_log_file() -> std::io::Result<std::fs::File> {
         .open(log_dir.join("wyj-code.log"))
 }
 
+async fn run_model_command(command: ModelCommand, cfg: &Config) -> Result<()> {
+    match command {
+        ModelCommand::Doctor {
+            profile,
+            json,
+            probe,
+            refresh,
+        } => {
+            let selected = match profile {
+                Some(name) => cfg
+                    .profile_by_name(&name)
+                    .ok_or_else(|| anyhow::anyhow!("未找到 Profile: {name}"))?,
+                None => cfg.active_profile(),
+            };
+            let config_base = wyj_config::config_dir()?;
+            let cache = wyj_api::CapabilityCache::new(&config_base);
+            if let Some(level) = probe.as_deref() {
+                let requests = if level == "full" { 4 } else { 2 };
+                eprintln!(
+                    "model doctor probe={level}: will send up to {requests} minimal request(s); no file, shell, MCP or computer tools are exposed"
+                );
+                let capabilities = run_model_probe(selected, level).await?;
+                let identity = wyj_api::ModelCatalog::resolve(selected, None).identity;
+                cache.store(identity, capabilities)?;
+            }
+            let report = wyj_api::ModelDoctorReport::static_report(
+                selected,
+                if refresh && probe.is_none() {
+                    None
+                } else {
+                    Some(&cache)
+                },
+            );
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_model_doctor_report(&report);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_model_probe(
+    profile: &wyj_config::Profile,
+    level: &str,
+) -> Result<wyj_api::ModelCapabilities> {
+    use wyj_api::types::{ContentBlock, Message, ToolDefinition};
+    use wyj_api::{Capability, CapabilitySource, Confidence};
+
+    // 安全边界：live probe 绝不读取配置文件里可能已暴露/陈旧的 key，只接受
+    // 用户为本次诊断显式注入的独立环境变量。
+    let probe_key = std::env::var("WYJ_CODE_PROBE_API_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "live probe requires a rotated key in WYJ_CODE_PROBE_API_KEY; configured profile keys are intentionally ignored"
+        )
+    })?;
+    if probe_key.trim().is_empty() {
+        anyhow::bail!("WYJ_CODE_PROBE_API_KEY is empty");
+    }
+    let mut probe_profile = profile.clone();
+    probe_profile.api_key_env = None;
+    probe_profile.api_key = Some(probe_key);
+    let provider = wyj_api::build_provider_from_profile(&probe_profile, None)?;
+    let static_resolution = wyj_api::ModelCatalog::resolve(&probe_profile, None);
+    let mut capabilities = static_resolution.capabilities;
+
+    let text_result = provider
+        .complete(
+            "You are a compatibility probe. Reply with exactly OK.",
+            &[Message::user("Reply OK")],
+            &[],
+            &wyj_api::provider::RequestOptions::text_only(32),
+        )
+        .await?;
+    if text_result
+        .content
+        .iter()
+        .all(|block| !matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()))
+    {
+        anyhow::bail!("basic text probe returned no text");
+    }
+    capabilities.stream_usage = Capability::new(
+        text_result.input_tokens > 0 || text_result.output_tokens > 0,
+        CapabilitySource::LiveProbe,
+        Confidence::Verified,
+    );
+
+    let echo = ToolDefinition {
+        name: "probe_echo".to_string(),
+        description: "Side-effect-free compatibility probe".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "required": ["value"],
+            "properties": {"value": {"type": "string", "enum": ["ok"]}},
+            "additionalProperties": false
+        }),
+        native: None,
+    };
+    let tool_result = provider
+        .complete(
+            "Call probe_echo exactly once with value set to ok. Do not answer with text.",
+            &[Message::user("Run the echo compatibility probe")],
+            std::slice::from_ref(&echo),
+            &wyj_api::provider::RequestOptions::text_only(128),
+        )
+        .await?;
+    let valid_echo = tool_result.content.iter().any(|block| {
+        matches!(
+            block,
+            ContentBlock::ToolUse { name, input, .. }
+                if name == "probe_echo" && input.get("value").and_then(|v| v.as_str()) == Some("ok")
+        )
+    });
+    if !valid_echo {
+        anyhow::bail!("tool probe did not produce the required schema-compliant echo call");
+    }
+    capabilities.tool_calling =
+        Capability::new(true, CapabilitySource::LiveProbe, Confidence::Verified);
+    capabilities.strict_tool_schema =
+        Capability::new(true, CapabilitySource::LiveProbe, Confidence::Verified);
+
+    if level == "full" {
+        let parallel = provider
+            .complete(
+                "Call probe_echo twice in one response, each with value ok. Do not answer with text.",
+                &[Message::user("Run the parallel tool compatibility probe")],
+                std::slice::from_ref(&echo),
+                &wyj_api::provider::RequestOptions::text_only(192),
+            )
+            .await?;
+        let valid_count = parallel
+            .content
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { name, input, .. }
+                        if name == "probe_echo" && input.get("value").and_then(|v| v.as_str()) == Some("ok")
+                )
+            })
+            .count();
+        capabilities.parallel_tool_calls = Capability::new(
+            valid_count >= 2,
+            CapabilitySource::LiveProbe,
+            Confidence::Verified,
+        );
+
+        if let Some(budget) = profile.thinking_budget.filter(|budget| *budget > 0) {
+            provider
+                .complete(
+                    "Reply with exactly OK.",
+                    &[Message::user(
+                        "Run the configured reasoning parameter probe",
+                    )],
+                    &[],
+                    &wyj_api::provider::RequestOptions {
+                        max_tokens: budget.saturating_add(32),
+                        thinking_budget: Some(budget),
+                        interleaved: profile.interleaved_thinking,
+                    },
+                )
+                .await?;
+            capabilities.thinking = Capability::new(
+                wyj_api::ThinkingMode::BudgetTokens,
+                CapabilitySource::LiveProbe,
+                Confidence::Verified,
+            );
+        }
+    }
+    Ok(capabilities)
+}
+
+fn print_model_doctor_report(report: &wyj_api::ModelDoctorReport) {
+    println!("profile: {}", report.profile);
+    println!("vendor: {}", report.identity.vendor);
+    println!("model: {}", report.identity.model);
+    println!("wire protocol: {}", report.identity.wire_protocol);
+    println!("base url: {}", report.identity.base_url);
+    println!("endpoint: {}", report.endpoint_type);
+    println!("verification: {:?}", report.verification_status);
+    println!("probe: {}", report.probe_status);
+    if let Some(probed_at) = &report.probed_at {
+        println!("probed at: {probed_at}");
+    }
+    println!(
+        "context/output: {}/{}",
+        report.capabilities.context_window, report.capabilities.max_output_tokens
+    );
+    println!(
+        "vision={} thinking={:?} cache={:?} stream_usage={}",
+        report.capabilities.vision.value,
+        report.capabilities.thinking.value,
+        report.capabilities.prompt_cache.value,
+        report.capabilities.stream_usage.value
+    );
+    println!(
+        "tools={} parallel={} strict_schema={} max_tools_per_turn={}",
+        report.capabilities.tool_calling.value,
+        report.capabilities.parallel_tool_calls.value,
+        report.capabilities.strict_tool_schema.value,
+        report.capabilities.max_tools_per_turn
+    );
+    for degradation in &report.known_degradations {
+        println!("degradation: {degradation}");
+    }
+}
+
+fn sandbox_report(config: &wyj_config::SandboxCfg) -> serde_json::Value {
+    let status = wyj_sandbox::SandboxRunner::detect().status();
+    serde_json::json!({
+        "mode": if config.enabled { "enforce" } else { "disabled" },
+        "backend": status.backend,
+        "available": status.available,
+        "filesystem_isolation": status.filesystem_isolation,
+        "domain_network_isolation": status.domain_network_isolation,
+        "network": if config.network.allowed_domains.is_empty() {
+            serde_json::json!({"policy": "deny"})
+        } else {
+            serde_json::json!({"policy": "allowed_domains", "domains": config.network.allowed_domains})
+        },
+        "filesystem": {
+            "allow_read": config.filesystem.allow_read,
+            "allow_write": config.filesystem.allow_write,
+            "deny_read": config.filesystem.deny_read,
+            "deny_write": config.filesystem.deny_write,
+        },
+        "unsandboxed_fallback": {
+            "tui_once": config.enabled && config.allow_unsandboxed_commands,
+            "headless": false,
+            "schedule": false,
+            "sub_agent": false,
+        },
+        "fail_if_unavailable": config.fail_if_unavailable,
+        "dependencies": status.dependencies,
+        "detail": status.detail,
+    })
+}
+
+fn print_sandbox_report(config: &wyj_config::SandboxCfg, json: bool) -> Result<()> {
+    let report = sandbox_report(config);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!("Sandbox");
+    println!("  mode: {}", report["mode"].as_str().unwrap_or("unknown"));
+    println!(
+        "  backend: {} (available={})",
+        report["backend"].as_str().unwrap_or("unknown"),
+        report["available"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  filesystem isolation: {}",
+        report["filesystem_isolation"].as_bool().unwrap_or(false)
+    );
+    println!(
+        "  domain network isolation: {}",
+        report["domain_network_isolation"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!("  network: {}", report["network"]);
+    println!("  overrides: {}", report["filesystem"]);
+    println!(
+        "  unsandboxed fallback: TUI one-shot={} · headless/schedule/sub-agent=false",
+        report["unsandboxed_fallback"]["tui_once"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    println!(
+        "  fail if unavailable: {}",
+        report["fail_if_unavailable"].as_bool().unwrap_or(false)
+    );
+    if let Some(dependencies) = report["dependencies"].as_array() {
+        for dependency in dependencies {
+            println!("  dependency: {}", dependency.as_str().unwrap_or("unknown"));
+        }
+    }
+    println!("  detail: {}", report["detail"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+fn model_for_routing_role(profile: &wyj_config::Profile, role: RoutingRole) -> String {
+    match role {
+        RoutingRole::Plan => profile
+            .plan_model
+            .as_deref()
+            .unwrap_or(&profile.model)
+            .to_string(),
+        RoutingRole::Execute => profile
+            .exec_model
+            .as_deref()
+            .unwrap_or(&profile.model)
+            .to_string(),
+        RoutingRole::Explore | RoutingRole::Review => profile.model.clone(),
+    }
+}
+
+fn configured_route_names(cfg: &Config, role: RoutingRole) -> Vec<String> {
+    let mut names = Vec::new();
+    for name in cfg.routing.roles.for_role(role) {
+        if cfg.profile_by_name(name).is_none() {
+            tracing::warn!("routing profile `{name}` does not exist; skipped");
+            continue;
+        }
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn build_fallback_routes(
+    cfg: &Config,
+    role: RoutingRole,
+    primary_profile: &str,
+) -> Vec<wyj_core::AgentRoute> {
+    let primary_resolution = wyj_api::ModelCatalog::resolve(
+        cfg.profile_by_name(primary_profile)
+            .unwrap_or_else(|| cfg.active_profile()),
+        None,
+    );
+    configured_route_names(cfg, role)
+        .into_iter()
+        .filter(|name| name != primary_profile)
+        .filter_map(|name| {
+            let profile = cfg.profile_by_name(&name)?;
+            let model = model_for_routing_role(profile, role);
+            let resolution = wyj_api::ModelCatalog::resolve(profile, Some(&model));
+            if !cfg.routing.cross_provider_fallback
+                && resolution.identity.vendor != primary_resolution.identity.vendor
+            {
+                tracing::warn!(
+                    "routing fallback `{name}` skipped: vendor {} differs from primary {}",
+                    resolution.identity.vendor,
+                    primary_resolution.identity.vendor
+                );
+                return None;
+            }
+            let provider = match wyj_api::build_provider_from_profile(profile, Some(&model)) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!("routing fallback `{name}` unavailable: {error}");
+                    return None;
+                }
+            };
+            Some(
+                wyj_core::AgentRoute::new(name, resolution.identity.vendor, model, provider)
+                    .with_capabilities(resolution.capabilities)
+                    .with_limits(profile.max_tokens, profile.context_window)
+                    .with_thinking(profile.thinking_budget, profile.interleaved_thinking),
+            )
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
@@ -252,6 +691,7 @@ async fn main() -> Result<()> {
     wyj_i18n::set_locale(&lang);
 
     let mut cli = Cli::parse();
+    let profile_was_explicit = cli.profile.is_some();
 
     if let Some(cmd) = cli.command.take() {
         match cmd {
@@ -273,6 +713,9 @@ async fn main() -> Result<()> {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return trust_cmd::run(&cwd).await;
             }
+            Commands::Model { command } => return run_model_command(command, &cfg).await,
+            Commands::Session { command } => return run_session_command(command),
+            Commands::Sandbox { json } => return print_sandbox_report(&cfg.sandbox, json),
         }
     }
 
@@ -345,11 +788,11 @@ async fn main() -> Result<()> {
             wyj_i18n::tr_fmt("status.endpoint", &[("url", cfg.resolved_base_url())])
         );
         match cfg.api_key() {
-            Ok(k) => println!(
+            Ok(_) => println!(
                 "{}",
                 wyj_i18n::tr_fmt(
                     "status.api_key_configured",
-                    &[("prefix", &k[..k.len().min(8)])]
+                    &[("prefix", &cfg.redacted_api_key().unwrap_or_default())]
                 )
             ),
             Err(e) => println!(
@@ -446,6 +889,10 @@ async fn main() -> Result<()> {
     };
 
     let session_store_arc = session_store.map(std::sync::Arc::new);
+    let checkpoint_store = session_store_arc
+        .as_ref()
+        .and_then(|store| wyj_core::CheckpointStore::new(store.dir(), session_id.clone()).ok())
+        .map(Arc::new);
 
     let memory_store = MemoryStore::new(&config_base, &cwd)
         .map(|m| {
@@ -472,8 +919,22 @@ async fn main() -> Result<()> {
         AgentMode::Normal
     };
 
+    let routing_role = if matches!(mode, AgentMode::Plan) {
+        RoutingRole::Plan
+    } else {
+        RoutingRole::Execute
+    };
+    if !profile_was_explicit {
+        if let Some(primary) = configured_route_names(&cfg, routing_role)
+            .into_iter()
+            .next()
+        {
+            cfg.active_profile = primary;
+        }
+    }
+
     // 按模式选择模型
-    let model_name = cfg.model_for_mode(&mode).to_string();
+    let model_name = model_for_routing_role(cfg.active_profile(), routing_role);
 
     let provider = wyj_api::build_provider_with_model(&cfg, &model_name)?;
 
@@ -506,6 +967,32 @@ async fn main() -> Result<()> {
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let tool_ctx = ToolCtx::new(&cwd);
+    tool_ctx
+        .apply_sandbox_config(&cfg.sandbox)
+        .map_err(|error| anyhow::anyhow!("sandbox config: {error}"))?;
+    tool_ctx.set_execution_surface(if cli.prompt.is_some() {
+        ExecutionSurface::SinglePrompt
+    } else if cli.headless {
+        ExecutionSurface::HeadlessRepl
+    } else {
+        ExecutionSurface::TuiInteractive
+    });
+    tool_ctx.require_sandbox(cli.require_sandbox || cfg.sandbox.fail_if_unavailable);
+    for path in &cli.allow_write {
+        let resolved = tool_ctx
+            .allow_write_root(path)
+            .map_err(|error| anyhow::anyhow!("--allow-write {}: {error}", path.display()))?;
+        eprintln!("allow-write: {}", resolved.display());
+    }
+    for path in &cli.allow_plan_write {
+        let resolved = tool_ctx
+            .allow_plan_document(path)
+            .map_err(|error| anyhow::anyhow!("--allow-plan-write {}: {error}", path.display()))?;
+        eprintln!("allow-plan-write: {}", resolved.display());
+    }
+    for domain in &cli.allow_network {
+        tool_ctx.allow_network_domain(domain.clone());
+    }
 
     // Hooks 生命周期自动化：按 `~/.claude/settings.json` + 项目 `.claude/settings.json`
     // + `.claude/settings.local.json` 三源合并加载。`--no-hooks` 时构造空 runner。
@@ -519,7 +1006,7 @@ async fn main() -> Result<()> {
             )
         );
     }
-    tool_ctx.set_permission_mode(match &mode {
+    let mut initial_permission = match &mode {
         AgentMode::Plan => {
             let set: std::collections::HashSet<String> = [
                 "Read",
@@ -529,6 +1016,7 @@ async fn main() -> Result<()> {
                 "WebSearch",
                 "AskQuestion",
                 "Write",
+                "Edit",
                 "Bash",
                 "BashOutput",
                 "ExitPlanMode",
@@ -538,11 +1026,22 @@ async fn main() -> Result<()> {
             .iter()
             .map(|s| s.to_string())
             .collect();
-            PermissionMode::Allowlist(set)
+            PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
         AgentMode::Normal => PermissionMode::Prompt,
-    });
+    };
+    if !cli.allowed_tools.is_empty() {
+        let explicit: std::collections::HashSet<String> =
+            cli.allowed_tools.iter().cloned().collect();
+        initial_permission = match initial_permission {
+            PermissionMode::Plan(base) => {
+                PermissionMode::Plan(base.intersection(&explicit).cloned().collect())
+            }
+            _ => PermissionMode::Allowlist(explicit),
+        };
+    }
+    tool_ctx.set_permission_mode(initial_permission);
 
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
     registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
@@ -699,11 +1198,22 @@ async fn main() -> Result<()> {
     // 主 system prompt：英文静态提示 + <env> 环境块（会话内稳定字段，进缓存）。
     // git 状态快照单独走首轮 user 消息注入（会变的字段进 system 会击穿缓存）。
     let env_info = wyj_core::prompts::EnvInfo::collect(&cwd, &model_name);
+    let model_resolution = wyj_api::ModelCatalog::resolve(cfg.active_profile(), Some(&model_name));
+    let model_capabilities = model_resolution.capabilities.clone();
+    let fallback_routes = build_fallback_routes(&cfg, routing_role, &cfg.active_profile().name);
+    let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
     let mut agent = Agent::new(provider)
         .with_system(wyj_core::prompts::main_system_prompt(&env_info))
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window)
+        .with_model_capabilities(model_capabilities)
+        .with_route_identity(
+            cfg.active_profile().name.clone(),
+            model_resolution.identity.vendor,
+            model_name.clone(),
+        )
+        .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
         .with_thinking(
             cfg.active_profile().thinking_budget,
             cfg.active_profile().interleaved_thinking,
@@ -743,6 +1253,10 @@ async fn main() -> Result<()> {
         .with_claude_md(claude_md_loader.clone())
         .with_hooks(hook_runner.clone());
 
+    if let Some(store) = &checkpoint_store {
+        agent = agent.with_checkpoint_store(store.clone());
+    }
+
     if let Some(mem) = memory_store {
         agent = agent.with_memory(mem);
     }
@@ -752,6 +1266,16 @@ async fn main() -> Result<()> {
         if let Some(t) = registry.get(&name) {
             agent.register_tool(t);
         }
+    }
+    if enable_lazy_tool_schemas {
+        agent.enable_lazy_tools(
+            ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite"]
+                .into_iter()
+                .map(str::to_string),
+            cfg.model_runtime.lazy_tools_threshold,
+            cfg.model_runtime.lazy_tools_top_k,
+            cfg.model_runtime.lazy_tools_sticky_turns,
+        );
     }
 
     // headless/single-shot 模式：子 Agent 进度以纯文本行打印到 stderr
@@ -782,6 +1306,13 @@ async fn main() -> Result<()> {
                     );
                 }
                 E::ToolEnd { .. } | E::Usage { .. } => {}
+                E::Control {
+                    id,
+                    action,
+                    accepted,
+                } => {
+                    eprintln!("  [a{id}] control {action} accepted={accepted}");
+                }
                 E::Done {
                     id,
                     agent_type,
@@ -888,21 +1419,42 @@ async fn main() -> Result<()> {
     let sid_for_rebuild = session_id.clone();
     let cwd_for_rebuild = cwd.clone();
     let hook_runner_for_rebuild = hook_runner.clone();
+    let checkpoint_store_for_rebuild = checkpoint_store.clone();
     let mcp_tools_for_rebuild = mcp_tools.clone();
     let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
         let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
+        let routing_role = if cfg.active_profile().plan_model.as_deref() == Some(new_model) {
+            RoutingRole::Plan
+        } else {
+            RoutingRole::Execute
+        };
+        let model_resolution =
+            wyj_api::ModelCatalog::resolve(cfg.active_profile(), Some(new_model));
+        let model_capabilities = model_resolution.capabilities.clone();
+        let fallback_routes = build_fallback_routes(cfg, routing_role, &cfg.active_profile().name);
+        let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
         let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
         let mut new_agent = Agent::new(provider)
             .with_system(wyj_core::prompts::main_system_prompt(&env_info))
             .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
             .with_max_tokens(cfg.active_profile().max_tokens)
             .with_context_window(cfg.active_profile().context_window)
+            .with_model_capabilities(model_capabilities)
+            .with_route_identity(
+                cfg.active_profile().name.clone(),
+                model_resolution.identity.vendor,
+                new_model.to_string(),
+            )
+            .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(
                 cfg.active_profile().thinking_budget,
                 cfg.active_profile().interleaved_thinking,
             )
             .with_claude_md(claude_md_for_rebuild.clone())
             .with_hooks(hook_runner_for_rebuild.clone());
+        if let Some(store) = &checkpoint_store_for_rebuild {
+            new_agent = new_agent.with_checkpoint_store(store.clone());
+        }
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
@@ -944,11 +1496,32 @@ async fn main() -> Result<()> {
                 new_agent.register_tool(t);
             }
         }
+        if enable_lazy_tool_schemas {
+            new_agent.enable_lazy_tools(
+                ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite"]
+                    .into_iter()
+                    .map(str::to_string),
+                cfg.model_runtime.lazy_tools_threshold,
+                cfg.model_runtime.lazy_tools_top_k,
+                cfg.model_runtime.lazy_tools_sticky_turns,
+            );
+        }
         Ok(new_agent)
     });
 
     if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
+        if let Some(file) = session_store_arc
+            .as_ref()
+            .and_then(|store| store.load(&session_id).ok())
+        {
+            session.total_input_tokens = file.input_tokens;
+            session.total_output_tokens = file.output_tokens;
+            session.routing_events = file.routing_events;
+            session.current_checkpoint_id = file.current_checkpoint_id;
+            session.branch_parent_session_id = file.branch_parent_session_id;
+            session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+        }
         session.messages = initial_messages;
         session.push_user(prompt);
         let turns = session.messages.len();
@@ -976,7 +1549,7 @@ async fn main() -> Result<()> {
             let context_tokens = wyj_core::estimate_tokens(&session.messages);
             eprintln!();
             eprintln!(
-                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"duration_secs\":{:.1}}}",
+                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"tool_schema_tokens\":{},\"tool_schema_tokens_saved\":{},\"duration_secs\":{:.1}}}",
                 session.total_input_tokens,
                 session.total_output_tokens,
                 session.total_cache_read_tokens,
@@ -986,6 +1559,8 @@ async fn main() -> Result<()> {
                 context_tokens,
                 context_window,
                 session.api_calls,
+                session.tool_schema_tokens,
+                session.tool_schema_tokens_saved,
                 started.elapsed().as_secs_f64()
             );
         }
@@ -1026,6 +1601,10 @@ async fn main() -> Result<()> {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
                 messages: session.messages.clone(),
+                routing_events: session.routing_events.clone(),
+                current_checkpoint_id: session.current_checkpoint_id.clone(),
+                branch_parent_session_id: session.branch_parent_session_id.clone(),
+                branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
                 title_generated: false,
             });
         }
@@ -1045,6 +1624,7 @@ async fn main() -> Result<()> {
             local_plugin.clone(),
             !cli.no_hooks,
             mcp_tools.clone(),
+            sub_agent_hub.clone(),
         )
         .await?;
     } else {
@@ -1198,7 +1778,15 @@ fn make_sub_agent_factory(
     mcp_tools: wyj_tools::SharedMcpTools,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
+        let routing_role = if def.name.eq_ignore_ascii_case("explore") {
+            RoutingRole::Explore
+        } else if def.name.to_ascii_lowercase().contains("review") {
+            RoutingRole::Review
+        } else {
+            RoutingRole::Execute
+        };
         let mut profile = None;
+        let mut routing_enabled = false;
         if let Some(name) = &def.model {
             profile = cfg.profile_by_name(name);
             if profile.is_none() {
@@ -1207,6 +1795,15 @@ fn make_sub_agent_factory(
                     def.name,
                     name
                 );
+            }
+        }
+        if profile.is_none() {
+            if let Some(name) = configured_route_names(&cfg, routing_role)
+                .into_iter()
+                .next()
+            {
+                profile = cfg.profile_by_name(&name);
+                routing_enabled = profile.is_some();
             }
         }
         if profile.is_none() && def.name == "Explore" {
@@ -1226,17 +1823,28 @@ fn make_sub_agent_factory(
             }
         }
         let (p, model) = match profile {
-            Some(p) => (p, p.model.clone()),
+            Some(p) => (p, model_for_routing_role(p, routing_role)),
             None => (
                 cfg.active_profile(),
                 cfg.model_for_mode(&AgentMode::Normal).to_string(),
             ),
         };
         let provider = wyj_api::build_provider_from_profile(p, Some(&model))?;
+        let model_resolution = wyj_api::ModelCatalog::resolve(p, Some(&model));
+        let model_capabilities = model_resolution.capabilities.clone();
+        let fallback_routes = if routing_enabled {
+            build_fallback_routes(&cfg, routing_role, &p.name)
+        } else {
+            Vec::new()
+        };
+        let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
 
         let mut sub_agent = Agent::new(provider)
             .with_max_tokens(p.max_tokens)
             .with_context_window(p.context_window)
+            .with_model_capabilities(model_capabilities)
+            .with_route_identity(p.name.clone(), model_resolution.identity.vendor, model)
+            .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(p.thinking_budget, p.interleaved_thinking)
             .with_claude_md(claude_md.clone());
         if !def.system_prompt.is_empty() {
@@ -1256,6 +1864,14 @@ fn make_sub_agent_factory(
         }
         for t in select_sub_agent_tools(def, &sub_registry) {
             sub_agent.register_tool(t);
+        }
+        if enable_lazy_tool_schemas {
+            sub_agent.enable_lazy_tools(
+                ["Read", "Glob", "Grep"].into_iter().map(str::to_string),
+                cfg.model_runtime.lazy_tools_threshold,
+                cfg.model_runtime.lazy_tools_top_k,
+                cfg.model_runtime.lazy_tools_sticky_turns,
+            );
         }
         if let Some(list) = &def.tools {
             for n in list {
@@ -1310,6 +1926,180 @@ fn refresh_agent_definitions(
     let mut agent = (**shared_agent.read().unwrap()).clone();
     agent.refresh_tool_definitions();
     *shared_agent.write().unwrap() = Arc::new(agent);
+}
+
+fn resolve_checkpoint_id(
+    store: &wyj_core::CheckpointStore,
+    requested: Option<String>,
+) -> Result<String> {
+    match requested {
+        Some(id) => Ok(id),
+        None => store
+            .latest()?
+            .map(|checkpoint| checkpoint.id)
+            .ok_or_else(|| anyhow::anyhow!("当前会话还没有 checkpoint")),
+    }
+}
+
+fn checkpoint_list_text(store: &wyj_core::CheckpointStore) -> Result<String> {
+    let checkpoints = store.list()?;
+    if checkpoints.is_empty() {
+        return Ok("当前会话还没有 checkpoint。".to_string());
+    }
+    Ok(checkpoints
+        .into_iter()
+        .rev()
+        .map(|checkpoint| {
+            format!(
+                "{}  {:?}  {}  {} messages",
+                checkpoint.id,
+                checkpoint.kind,
+                checkpoint.name.as_deref().unwrap_or("-"),
+                checkpoint.message_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn rewind_preview_text(preview: &wyj_core::RewindPreview) -> String {
+    let mut lines = vec![format!(
+        "checkpoint {} affects {} file(s)",
+        preview.checkpoint_id,
+        preview.affected_files.len()
+    )];
+    lines.extend(
+        preview
+            .affected_files
+            .iter()
+            .take(50)
+            .map(|path| format!("- {}", path.display())),
+    );
+    if preview.affected_files.len() > 50 {
+        lines.push(format!(
+            "- ... and {} more",
+            preview.affected_files.len() - 50
+        ));
+    }
+    if let Some(note) = &preview.note {
+        lines.push(format!("note: {note}"));
+    }
+    lines.join("\n")
+}
+
+fn parse_rewind_scope(scope: &str) -> wyj_core::RewindScope {
+    match scope {
+        "conversation" => wyj_core::RewindScope::Conversation,
+        "files" => wyj_core::RewindScope::Files,
+        _ => wyj_core::RewindScope::Both,
+    }
+}
+
+fn run_session_command(command: SessionCommand) -> Result<()> {
+    let sessions = SessionStore::new(wyj_config::config_dir()?.join("sessions"))?;
+    match command {
+        SessionCommand::Checkpoint { session_id, name } => {
+            let file = sessions.load(&session_id)?;
+            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            let checkpoint = store.create(
+                Path::new(&file.cwd),
+                &file.messages,
+                wyj_core::CheckpointKind::Manual,
+                name,
+            )?;
+            println!("{}", checkpoint.id);
+        }
+        SessionCommand::Checkpoints { session_id } => {
+            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            println!("{}", checkpoint_list_text(&store)?);
+        }
+        SessionCommand::Rewind {
+            session_id,
+            checkpoint_id,
+            scope,
+            force,
+        } => {
+            let mut file = sessions.load(&session_id)?;
+            let cwd = PathBuf::from(&file.cwd);
+            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            let checkpoint = store.load(&checkpoint_id)?;
+            let scope = parse_rewind_scope(&scope);
+            if matches!(
+                scope,
+                wyj_core::RewindScope::Files | wyj_core::RewindScope::Both
+            ) {
+                let preview = store.preview_files(&checkpoint_id, &cwd)?;
+                println!("{}", rewind_preview_text(&preview));
+                if preview.requires_confirmation && !force {
+                    anyhow::bail!("file rewind requires --force after reviewing the preview");
+                }
+            }
+            let protection = store.create(
+                &cwd,
+                &file.messages,
+                wyj_core::CheckpointKind::PreRewind,
+                Some(format!("before rewind {checkpoint_id}")),
+            )?;
+            if matches!(
+                scope,
+                wyj_core::RewindScope::Files | wyj_core::RewindScope::Both
+            ) {
+                store.restore_files(&checkpoint_id, &cwd, force)?;
+            }
+            if matches!(
+                scope,
+                wyj_core::RewindScope::Conversation | wyj_core::RewindScope::Both
+            ) {
+                file.messages = checkpoint.messages;
+                file.turns = file
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message.role, wyj_api::types::Role::User))
+                    .count();
+                file.title = extract_title(&file.messages);
+                file.last_preview = extract_preview(&file.messages);
+                file.timestamp = now_iso();
+                file.title_generated = false;
+            }
+            file.current_checkpoint_id = Some(checkpoint_id.clone());
+            file.timestamp = now_iso();
+            sessions.save(&file)?;
+            println!(
+                "rewound to {checkpoint_id}; protection checkpoint {}",
+                protection.id
+            );
+        }
+        SessionCommand::Branch {
+            session_id,
+            checkpoint_id,
+            restore_files,
+            force,
+        } => {
+            let file = sessions.load(&session_id)?;
+            let cwd = PathBuf::from(&file.cwd);
+            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id.clone())?;
+            let checkpoint = store.load(&checkpoint_id)?;
+            if restore_files {
+                let preview = store.preview_files(&checkpoint_id, &cwd)?;
+                println!("{}", rewind_preview_text(&preview));
+                if preview.requires_confirmation && !force {
+                    anyhow::bail!(
+                        "branch file restore requires --force after reviewing the preview"
+                    );
+                }
+                store.create(
+                    &cwd,
+                    &file.messages,
+                    wyj_core::CheckpointKind::PreRewind,
+                    Some(format!("before branch restore {checkpoint_id}")),
+                )?;
+                store.restore_files(&checkpoint_id, &cwd, force)?;
+            }
+            let branch = sessions.branch_from_checkpoint(&session_id, &checkpoint)?;
+            println!("{}", branch.session_id);
+        }
+    }
+    Ok(())
 }
 
 /// 在安全 Agent 边界原子替换 MCP 工具快照。
@@ -1390,13 +2180,30 @@ async fn repl(
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     hooks_enabled: bool,
     mcp_tools: wyj_tools::SharedMcpTools,
+    sub_agent_hub: Arc<wyj_tools::SubAgentHub>,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
         "wyj-code v{} — 输入问题回车发送，/quit 退出，Ctrl-D 退出",
         env!("CARGO_PKG_VERSION")
     );
+    let mut session_id = session_id;
+    let mut checkpoint_store = session_store
+        .as_ref()
+        .and_then(|store| wyj_core::CheckpointStore::new(store.dir(), session_id.clone()).ok())
+        .map(Arc::new);
     let mut session = Session::new();
+    if let Some(file) = session_store
+        .as_ref()
+        .and_then(|store| store.load(&session_id).ok())
+    {
+        session.total_input_tokens = file.input_tokens;
+        session.total_output_tokens = file.output_tokens;
+        session.routing_events = file.routing_events;
+        session.current_checkpoint_id = file.current_checkpoint_id;
+        session.branch_parent_session_id = file.branch_parent_session_id;
+        session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+    }
     session.messages = initial_messages;
     let stdin = io::stdin();
     let mut turns = 0usize;
@@ -1542,14 +2349,179 @@ async fn repl(
                     println!("{out}");
                 }
                 Ok(CommandResult::ClearHistory) => {
-                    session = Session::new();
+                    session.clear_conversation();
                     println!("对话已清空。");
                 }
                 Ok(CommandResult::CompactHistory) => {
                     println!("[headless 模式不支持 /compact]");
                 }
+                Ok(CommandResult::CreateCheckpoint { name, list }) => match &checkpoint_store {
+                    Some(store) if list => println!("{}", checkpoint_list_text(store)?),
+                    Some(store) => {
+                        let checkpoint = store.create(
+                            &cwd,
+                            &session.messages,
+                            wyj_core::CheckpointKind::Manual,
+                            name,
+                        )?;
+                        session.current_checkpoint_id = Some(checkpoint.id.clone());
+                        println!("checkpoint created: {}", checkpoint.id);
+                    }
+                    None => println!("checkpoint storage is unavailable"),
+                },
+                Ok(CommandResult::Rewind {
+                    checkpoint_id,
+                    scope,
+                    confirmed,
+                }) => {
+                    let Some(store) = checkpoint_store.as_ref() else {
+                        println!("checkpoint storage is unavailable");
+                        continue;
+                    };
+                    let id = resolve_checkpoint_id(store, checkpoint_id)?;
+                    let checkpoint = store.load(&id)?;
+                    if matches!(
+                        scope,
+                        wyj_core::RewindScope::Files | wyj_core::RewindScope::Both
+                    ) {
+                        let preview = store.preview_files(&id, &cwd)?;
+                        if preview.requires_confirmation && !confirmed {
+                            println!("{}", rewind_preview_text(&preview));
+                            println!("re-run with `--confirm` to restore these files");
+                            continue;
+                        }
+                    }
+                    let protection = store.create(
+                        &cwd,
+                        &session.messages,
+                        wyj_core::CheckpointKind::PreRewind,
+                        Some(format!("before rewind {id}")),
+                    )?;
+                    if matches!(
+                        scope,
+                        wyj_core::RewindScope::Files | wyj_core::RewindScope::Both
+                    ) {
+                        let preview = store.restore_files(&id, &cwd, confirmed)?;
+                        println!("{}", rewind_preview_text(&preview));
+                    }
+                    if matches!(
+                        scope,
+                        wyj_core::RewindScope::Conversation | wyj_core::RewindScope::Both
+                    ) {
+                        session.messages = checkpoint.messages;
+                        session.current_checkpoint_id = Some(id.clone());
+                        turns = session
+                            .messages
+                            .iter()
+                            .filter(|message| matches!(message.role, wyj_api::types::Role::User))
+                            .count();
+                    }
+                    println!(
+                        "rewound to {id}; safety checkpoint before rewind: {}",
+                        protection.id
+                    );
+                }
+                Ok(CommandResult::BranchSession {
+                    checkpoint_id,
+                    restore_files,
+                    confirmed,
+                }) => {
+                    let (Some(store), Some(session_files)) =
+                        (checkpoint_store.as_ref(), session_store.as_ref())
+                    else {
+                        println!("session/checkpoint storage is unavailable");
+                        continue;
+                    };
+                    let id = resolve_checkpoint_id(store, checkpoint_id)?;
+                    let checkpoint = store.load(&id)?;
+                    if restore_files {
+                        let preview = store.preview_files(&id, &cwd)?;
+                        if preview.requires_confirmation && !confirmed {
+                            println!("{}", rewind_preview_text(&preview));
+                            println!(
+                                "re-run with `--restore-files --confirm` to restore files and branch"
+                            );
+                            continue;
+                        }
+                        store.create(
+                            &cwd,
+                            &session.messages,
+                            wyj_core::CheckpointKind::PreRewind,
+                            Some(format!("before branch restore {id}")),
+                        )?;
+                        store.restore_files(&id, &cwd, confirmed)?;
+                    }
+                    session_files.save(&SessionFile {
+                        session_id: session_id.clone(),
+                        title: extract_title(&session.messages),
+                        last_preview: extract_preview(&session.messages),
+                        cwd: cwd.display().to_string(),
+                        timestamp: now_iso(),
+                        turns,
+                        input_tokens: session.total_input_tokens,
+                        output_tokens: session.total_output_tokens,
+                        messages: session.messages.clone(),
+                        routing_events: session.routing_events.clone(),
+                        current_checkpoint_id: session.current_checkpoint_id.clone(),
+                        branch_parent_session_id: session.branch_parent_session_id.clone(),
+                        branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
+                        title_generated: false,
+                    })?;
+                    let branch = session_files.branch_from_checkpoint(&session_id, &checkpoint)?;
+                    session_id = branch.session_id.clone();
+                    session = Session::new();
+                    session.messages = branch.messages;
+                    session.current_checkpoint_id = branch.current_checkpoint_id;
+                    session.branch_parent_session_id = branch.branch_parent_session_id;
+                    session.branch_parent_checkpoint_id = branch.branch_parent_checkpoint_id;
+                    turns = branch.turns;
+                    let new_store = Arc::new(wyj_core::CheckpointStore::new(
+                        session_files.dir(),
+                        session_id.clone(),
+                    )?);
+                    checkpoint_store = Some(new_store.clone());
+                    let mut updated_agent = (**shared_agent.read().unwrap()).clone();
+                    updated_agent.set_session_id(session_id.clone());
+                    updated_agent.set_checkpoint_store(new_store);
+                    *shared_agent.write().unwrap() = Arc::new(updated_agent);
+                    println!("created and switched to branch session {session_id} from {id}");
+                }
+                Ok(CommandResult::ControlSubAgent { id, action }) => {
+                    let result = match action {
+                        wyj_commands::registry::SubAgentControlAction::FollowUp(text) => {
+                            sub_agent_hub.send_follow_up(
+                                id,
+                                vec![wyj_api::types::ContentBlock::Text { text }],
+                            )
+                        }
+                        wyj_commands::registry::SubAgentControlAction::Interrupt => {
+                            sub_agent_hub.interrupt(id)
+                        }
+                        wyj_commands::registry::SubAgentControlAction::RetryLast => {
+                            sub_agent_hub.retry_last(id)
+                        }
+                    };
+                    println!("sub-agent a{id} control result: {result:?}");
+                }
                 Ok(CommandResult::OpenProfileDialog) | Ok(CommandResult::SwitchProfile(_)) => {
                     println!("{}", wyj_i18n::tr("profile.headless_unsupported"));
+                }
+                Ok(CommandResult::ModelDoctor(profile_name)) => {
+                    let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());
+                    let selected = profile_name
+                        .as_deref()
+                        .and_then(|name| live_cfg.profile_by_name(name))
+                        .unwrap_or_else(|| live_cfg.active_profile());
+                    let cache = wyj_config::config_dir()
+                        .ok()
+                        .map(|base| wyj_api::CapabilityCache::new(&base));
+                    let report =
+                        wyj_api::ModelDoctorReport::static_report(selected, cache.as_ref());
+                    print_model_doctor_report(&report);
+                }
+                Ok(CommandResult::SandboxStatus) => {
+                    let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());
+                    print_sandbox_report(&live_cfg.sandbox, false)?;
                 }
                 Ok(CommandResult::RunPrompt(prompt)) => {
                     // Skill 展开后的 prompt → 当作用户消息发给 agent
@@ -1604,9 +2576,12 @@ async fn repl(
                     println!();
                     let prev_mode = ctx.permission_mode.read().unwrap().clone();
                     if let Some(tools) = allowed_tools {
-                        ctx.set_permission_mode(PermissionMode::Allowlist(
-                            tools.into_iter().collect(),
-                        ));
+                        let scoped = tools.into_iter().collect();
+                        ctx.set_permission_mode(if matches!(mode, AgentMode::Plan) {
+                            PermissionMode::Plan(scoped)
+                        } else {
+                            PermissionMode::Allowlist(scoped)
+                        });
                     }
                     let run_result = agent_snapshot
                         .run_turn(&mut session, &ctx, &mut |d| {
@@ -1730,6 +2705,10 @@ async fn repl(
             input_tokens: session.total_input_tokens,
             output_tokens: session.total_output_tokens,
             messages: session.messages.clone(),
+            routing_events: session.routing_events.clone(),
+            current_checkpoint_id: session.current_checkpoint_id.clone(),
+            branch_parent_session_id: session.branch_parent_session_id.clone(),
+            branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
             title_generated: false,
         });
     }
@@ -1837,6 +2816,42 @@ mod cli_tests {
             }
             other => panic!("expected SubagentTrace subcommand, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn model_doctor_and_sandbox_subcommands_parse_without_live_probe() {
+        let cli = Cli::try_parse_from([
+            "wyj-code",
+            "model",
+            "doctor",
+            "minimax",
+            "--json",
+            "--refresh",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Model {
+                command:
+                    ModelCommand::Doctor {
+                        profile,
+                        json,
+                        probe,
+                        refresh,
+                    },
+            }) => {
+                assert_eq!(profile.as_deref(), Some("minimax"));
+                assert!(json);
+                assert!(probe.is_none());
+                assert!(refresh);
+            }
+            other => panic!("expected model doctor, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["wyj-code", "sandbox", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox { json: true })
+        ));
     }
 
     // ── select_sub_agent_tools：子 Agent 是否能拿到 WebSearch/MCP 工具 ──────

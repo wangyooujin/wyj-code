@@ -79,7 +79,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">单二进制、原生 TUI、双协议 LLM 适配（Anthropic / OpenAI）、多 Agent 编排、可插拔 MCP 工具链——在 shell 里直接与 AI 协作改代码，本地优先、全程透明可控、零遥测。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">单二进制、原生 TUI、国内模型可信运行时、OS 级安全执行与多 Agent 协作——重点适配 GLM、MiniMax、Kimi、DeepSeek、Qwen 和豆包，同时兼容 Claude、OpenAI 与本地端点。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -108,7 +108,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.4.2</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.4.4</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -120,7 +120,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.4.2 · claude-opus-4-8</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.4.4 · MiniMax-M2 · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -146,7 +146,7 @@
           </div>
 
           <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.run">运行 <span class="text-paper">cargo test -p wyj-cli</span></span></div>
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.run">运行 <span class="text-paper">cargo test -p wyj-code</span></span></div>
             <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.testresult">test result: ok. 12 passed</span><span class="caret animate-blink"></span></div>
           </div>
         </div>
@@ -167,7 +167,7 @@
       <p class="mt-2 text-sm text-paper/50" data-i18n="stats.boot">稳态冷启动耗时</p>
     </div>
     <div class="reveal" style="transition-delay:160ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">11</div>
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12</div>
       <p class="mt-2 text-sm text-paper/50" data-i18n="stats.crates">workspace crate 数量</p>
     </div>
     <div class="reveal" style="transition-delay:240ms">
@@ -188,13 +188,13 @@
   <div class="mt-12 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-layers"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.provider.title">双协议 LLM 适配</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.provider.desc">Anthropic Messages 与 OpenAI Chat Completions 双格式原生支持，可混合配置：规划用一个模型，执行用另一个。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.provider.title">国内模型可信运行时</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.provider.desc">GLM、MiniMax、Kimi、DeepSeek、Qwen、豆包按能力来源和置信度适配；静态兼容与 live verified 明确分开。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.agent.title">多 Agent 编排</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.agent.desc">内置 general-purpose / Explore / Plan 三类子 Agent，支持自定义定义，进程级 Hub 管理并发、前后台调度与中断。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.agent.title">可控的多 Agent 协作</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.agent.desc">进程级 Hub 管理并发、前后台调度、follow-up、interrupt、retry-last 与落盘 trace，控制消息只在安全边界注入。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-bolt"/></svg>
@@ -223,13 +223,13 @@
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-sliders"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.profile.title">Profile 分组配置</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.profile.desc">provider / model / base_url / api_key 具名分组，多供应商配置并存，随时切换。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.profile.title">能力诊断与安全 Key 引用</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.profile.desc"><code class="text-amber-400">model doctor</code> 展示 vendor/protocol/能力来源；<code class="text-amber-400">api_key_env</code> 避免运行时 secret 被写回配置。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-save"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.session.title">会话持久化</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.session.desc"><code class="text-amber-400">-c</code> 续上次会话，<code class="text-amber-400">--resume &lt;id&gt;</code> 恢复任意历史会话。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.session.title">Checkpoint / Rewind / Branch</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.session.desc">保留真实 Git index，按 conversation/files/both 恢复，并从任意 checkpoint 创建不影响原会话的新分支。</p>
     </div>
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-slash"/></svg>
@@ -243,8 +243,8 @@
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">零遥测</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">仅在显式调用 LLM / WebFetch / MCP 时才出网，没有任何隐式埋点或崩溃上报。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">Fail-closed OS Sandbox</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">macOS Seatbelt + 受控域名代理、Linux bubblewrap；headless、schedule 与 SubAgent 无 UI 时拒绝隐式放行。</p>
     </div>
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-monitor"/></svg>
@@ -258,7 +258,7 @@
 <section id="architecture" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-2xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="arch.kicker">Architecture</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">11 个 crate 的 Rust workspace</h2>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">12 个 crate 的 Rust workspace</h2>
     <p class="mt-4 text-paper/55" data-i18n="arch.desc">单一 wyj-code 二进制，职责分层清晰：从上到下依次是入口、服务、核心、基础四层。</p>
   </div>
 
@@ -287,9 +287,10 @@
     </div>
     <div class="reveal" style="transition-delay:120ms">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.foundation">基础层 · Foundation</p>
-      <div class="grid sm:grid-cols-2 gap-3">
+      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/api <span class="text-paper/30">· wyj-api</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.api">LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/config <span class="text-paper/30">· wyj-config</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.config">配置加载（~/.wyj-code/config.toml）、MCP 配置结构</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/sandbox <span class="text-paper/30">· wyj-sandbox</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.sandbox">Seatbelt / bubblewrap 命令隔离、凭证 deny-read 与域名级网络边界</p></div>
       </div>
     </div>
   </div>
@@ -408,7 +409,7 @@ cargo run -- --config-status</code></pre>
       <div class="reveal" style="transition-delay:80ms">
         <div class="text-amber-500 font-display font-extrabold text-2xl">03</div>
         <h3 class="mt-3 font-semibold" data-i18n="principle.neutral.title">协议中立</h3>
-        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.neutral.desc">改一行 provider 配置即可在 Anthropic / OpenAI 之间切换，不锁定单一供应商。</p>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.neutral.desc">vendor 与 wire protocol 分离，同一兼容协议可服务不同厂商，不把模型名称猜测当成最终事实。</p>
       </div>
       <div class="reveal" style="transition-delay:120ms">
         <div class="text-amber-500 font-display font-extrabold text-2xl">04</div>
@@ -431,9 +432,16 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.4.2</span>
+          <span class="font-display font-bold text-amber-500">v1.4.4</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新</span>
         </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v144">国内模型可信运行时与安全执行：能力目录/doctor、工具参数修复校验、同角色 fallback、ToolSearch lazy schema、checkpoint/rewind/branch、SubAgent 控制协议，以及 macOS Seatbelt / Linux bubblewrap sandbox。未使用已暴露的 MiniMax Key，国内模型当前保持 static_only，不冒充 live verified。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3"><span class="font-display font-bold text-paper/70">v1.4.2</span></div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v142">TUI 对齐 Codex 静态执行流：Thinking、工具结果和 Bash 输出默认最多显示 3 个视觉行，Edit/Write 自动展示彩色 diff；移除聊天消息选中、展开与 Ctrl+O，新增 Shift+↑ 显式进入内容区、聊天逐行滚动、Todo 单任务详情，以及上滚阅读时不抢视口的新消息提示。</p>
       </div>
     </div>

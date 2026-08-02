@@ -60,9 +60,9 @@ pub enum AgentMode {
     /// 正常模式：全部工具可用，TUI 下工具调用前弹确认
     #[default]
     Normal,
-    /// Plan 模式：仅允许只读工具（read / glob / grep / web_fetch），适合规划分析
+    /// Plan 模式：允许只读工具与受限规划文档写入；执行层仍按路径和命令复核。
     Plan,
-    /// Bypass 模式：自动允许所有工具调用，不弹确认对话框
+    /// Bypass 模式：跳过普通交互确认，但不覆盖 protected deny 或 OS sandbox。
     Bypass,
 }
 
@@ -75,7 +75,7 @@ impl AgentMode {
         }
     }
 
-    /// Plan 模式下允许的只读工具集
+    /// Plan 模式下进入执行层复核的工具集；Write/Bash 不代表任意写入获批。
     pub fn allowed_tools(&self) -> Option<&'static [&'static str]> {
         match self {
             AgentMode::Plan => Some(&[
@@ -102,6 +102,32 @@ pub enum Provider {
     OpenAI,
 }
 
+/// 模型端点使用的线协议。`Provider` 保留旧配置中的二分法并负责选择现有
+/// 客户端实现；`WireProtocol` 则描述端点实际接受的请求格式，避免把模型厂商
+/// 与兼容协议混为一谈。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WireProtocol {
+    AnthropicMessages,
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    QwenNative,
+    Gemini,
+}
+
+impl std::fmt::Display for WireProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiChatCompletions => "open_ai_chat_completions",
+            Self::OpenAiResponses => "open_ai_responses",
+            Self::QwenNative => "qwen_native",
+            Self::Gemini => "gemini",
+        };
+        f.write_str(value)
+    }
+}
+
 impl std::fmt::Display for Provider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -118,6 +144,13 @@ pub struct Profile {
     pub name: String,
     /// LLM 供应商格式（anthropic 或 openai）
     pub provider: Provider,
+    /// 模型厂商或部署平台，例如 anthropic、minimax、zhipu、moonshot。
+    /// 旧配置缺失时由模型目录和端点推导；不影响旧 provider 的客户端选择。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// 端点实际使用的线协议。缺失时与旧 provider 保持一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_protocol: Option<WireProtocol>,
     /// 默认模型名称
     pub model: String,
     /// Plan 模式专用模型（留空则使用 model）
@@ -132,6 +165,9 @@ pub struct Profile {
     /// API Key（优先从环境变量 WYJ_CODE_API_KEY 读取，覆盖到激活分组）
     #[serde(default)]
     pub api_key: Option<String>,
+    /// 推荐的 secret reference：运行时从该环境变量读取，不把真实值写回配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     /// 最大 token 预算（每轮）
     pub max_tokens: u32,
     /// 模型最大上下文窗口 token 数（用于自动压缩触发判断）
@@ -165,11 +201,14 @@ impl Default for Profile {
         Self {
             name: "default".to_string(),
             provider: Provider::Anthropic,
+            vendor: None,
+            wire_protocol: None,
             model: "claude-opus-4-8".to_string(),
             plan_model: None,
             exec_model: None,
             base_url: String::new(),
             api_key: None,
+            api_key_env: None,
             max_tokens: 8192,
             context_window: 200_000,
             vision: true,
@@ -182,6 +221,14 @@ impl Default for Profile {
 }
 
 impl Profile {
+    /// 在不改变旧配置行为的前提下得到有效线协议。
+    pub fn effective_wire_protocol(&self) -> WireProtocol {
+        self.wire_protocol.clone().unwrap_or(match self.provider {
+            Provider::Anthropic => WireProtocol::AnthropicMessages,
+            Provider::OpenAI => WireProtocol::OpenAiChatCompletions,
+        })
+    }
+
     /// 当前 profile 是否指向真正的 Anthropic 官方端点，而非仅仅"说 Anthropic
     /// 协议"的第三方兼容服务（MiniMax/GLM/Kimi 等常以 `provider = "anthropic"`
     /// 搭配自定义 `base_url` 接入）。只有官方端点才认得 Anthropic 专属扩展
@@ -248,6 +295,46 @@ pub struct SubAgentCfg {
     pub trace_max_bytes_per_agent: u64,
 }
 
+/// `[routing]` 节 — 按角色选择模型 Profile，并在可恢复供应商故障时按顺序切换。
+///
+/// Profile 名称而不是裸模型 id 是路由单元：这样每个候选都能携带自己的 vendor、
+/// wire protocol、endpoint 与能力配置。默认禁止跨 vendor fallback，避免把同一份
+/// 对话在用户未授权的情况下发送给另一家供应商。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingCfg {
+    pub cross_provider_fallback: bool,
+    pub roles: RoutingRoles,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoutingRoles {
+    pub explore: Vec<String>,
+    pub plan: Vec<String>,
+    pub execute: Vec<String>,
+    pub review: Vec<String>,
+}
+
+impl RoutingRoles {
+    pub fn for_role(&self, role: RoutingRole) -> &[String] {
+        match role {
+            RoutingRole::Explore => &self.explore,
+            RoutingRole::Plan => &self.plan,
+            RoutingRole::Execute => &self.execute,
+            RoutingRole::Review => &self.review,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingRole {
+    Explore,
+    Plan,
+    Execute,
+    Review,
+}
+
 impl Default for SubAgentCfg {
     fn default() -> Self {
         Self {
@@ -289,6 +376,72 @@ pub struct ComputerUseCfg {
     pub restore_context: bool,
 }
 
+/// `[model_runtime]`：国内模型工具协议与能力探测的保守默认值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRuntimeCfg {
+    pub probe_mode: String,
+    pub probe_ttl_hours: u64,
+    pub tool_argument_retries: usize,
+    pub lazy_tools_threshold: usize,
+    pub lazy_tools_top_k: usize,
+    pub lazy_tools_sticky_turns: u64,
+}
+
+impl Default for ModelRuntimeCfg {
+    fn default() -> Self {
+        Self {
+            probe_mode: "explicit".to_string(),
+            probe_ttl_hours: 168,
+            tool_argument_retries: 2,
+            lazy_tools_threshold: 12,
+            lazy_tools_top_k: 8,
+            lazy_tools_sticky_turns: 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SandboxFilesystemCfg {
+    pub allow_read: Vec<PathBuf>,
+    pub allow_write: Vec<PathBuf>,
+    pub deny_read: Vec<PathBuf>,
+    pub deny_write: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SandboxNetworkCfg {
+    pub allowed_domains: Vec<String>,
+    pub allow_local_binding: bool,
+    pub allow_unix_sockets: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxCfg {
+    pub enabled: bool,
+    pub auto_allow_sandboxed: bool,
+    pub allow_unsandboxed_commands: bool,
+    pub fail_if_unavailable: bool,
+    pub filesystem: SandboxFilesystemCfg,
+    pub network: SandboxNetworkCfg,
+}
+
+impl Default for SandboxCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_allow_sandboxed: false,
+            allow_unsandboxed_commands: true,
+            fail_if_unavailable: false,
+            filesystem: SandboxFilesystemCfg::default(),
+            network: SandboxNetworkCfg::default(),
+        }
+    }
+}
+
 impl Default for ComputerUseCfg {
     fn default() -> Self {
         Self {
@@ -322,6 +475,15 @@ pub struct Config {
     /// 子 Agent 模型配置（[subagent] 节）
     #[serde(default)]
     pub subagent: SubAgentCfg,
+    /// 同角色模型路由与可恢复错误 fallback。
+    #[serde(default)]
+    pub routing: RoutingCfg,
+    /// 国内模型能力、工具参数恢复与 lazy schema 策略。
+    #[serde(default)]
+    pub model_runtime: ModelRuntimeCfg,
+    /// OS sandbox 文件系统、网络和降级策略。
+    #[serde(default)]
+    pub sandbox: SandboxCfg,
     /// computer-use 后台优先与前台回退策略（[computer_use] 节）
     #[serde(default)]
     pub computer_use: ComputerUseCfg,
@@ -332,6 +494,9 @@ pub struct Config {
     /// 未配置时 WebSearch 工具不会注册，模型看不到该工具。
     #[serde(default)]
     pub search_api_key: Option<String>,
+    /// 仅运行期存在的 API Key；serde 永不读写，避免环境变量被设置面板落盘。
+    #[serde(skip)]
+    pub runtime_api_key: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -340,6 +505,13 @@ fn default_true() -> bool {
 
 fn default_search_provider() -> String {
     "tavily".to_string()
+}
+
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_uppercase() || (index > 0 && byte.is_ascii_digit())
+        })
 }
 
 impl Default for Config {
@@ -352,9 +524,13 @@ impl Default for Config {
             mcp_servers: vec![],
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            routing: RoutingCfg::default(),
+            model_runtime: ModelRuntimeCfg::default(),
+            sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
+            runtime_api_key: None,
         }
     }
 }
@@ -406,11 +582,14 @@ impl From<LegacyConfigV0> for Config {
             profiles: vec![Profile {
                 name: "default".to_string(),
                 provider: legacy.provider,
+                vendor: None,
+                wire_protocol: None,
                 model: legacy.model,
                 plan_model: legacy.plan_model,
                 exec_model: legacy.exec_model,
                 base_url: legacy.base_url,
                 api_key: legacy.api_key,
+                api_key_env: None,
                 max_tokens: legacy.max_tokens,
                 context_window: legacy.context_window,
                 vision: true,
@@ -424,9 +603,13 @@ impl From<LegacyConfigV0> for Config {
             mcp_servers: legacy.mcp_servers,
             auto_memory_enabled: true,
             subagent: SubAgentCfg::default(),
+            routing: RoutingCfg::default(),
+            model_runtime: ModelRuntimeCfg::default(),
+            sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
+            runtime_api_key: None,
         }
     }
 }
@@ -493,12 +676,20 @@ impl Config {
             }
         }
 
-        // 环境变量优先，覆盖到激活分组
-        if let Ok(key) = std::env::var("WYJ_CODE_API_KEY") {
-            if !key.is_empty() {
-                cfg.active_profile_mut().api_key = Some(key);
-            }
-        }
+        // 环境变量只写入 serde 跳过的运行期槽位，绝不能因为打开设置面板并保存
+        // 就把 secret 物化进 config.toml。全局兼容变量优先，其次 profile 的
+        // `api_key_env` 引用，最后才由 `api_key()` 回退到显式 api_key 字段。
+        cfg.runtime_api_key = std::env::var("WYJ_CODE_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .or_else(|| {
+                cfg.active_profile()
+                    .api_key_env
+                    .as_deref()
+                    .filter(|name| valid_env_name(name))
+                    .and_then(|name| std::env::var(name).ok())
+                    .filter(|key| !key.is_empty())
+            });
         // WebSearch key：环境变量优先
         if let Ok(key) = std::env::var("WYJ_CODE_SEARCH_API_KEY") {
             if !key.is_empty() {
@@ -555,15 +746,31 @@ impl Config {
 
     /// 返回激活分组的有效 API Key，若无则报错。
     pub fn api_key(&self) -> Result<&str> {
-        self.active_profile()
+        self.runtime_api_key
+            .as_deref()
+            .or_else(|| self.active_profile()
             .api_key
             .as_deref()
-            .filter(|k| !k.is_empty())
+            .filter(|k| !k.is_empty()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "未找到 API Key。请设置环境变量 WYJ_CODE_API_KEY 或在配置文件中设置 api_key。"
+                    "未找到 API Key。请设置 WYJ_CODE_API_KEY、profile.api_key_env，或兼容字段 api_key。"
                 )
             })
+    }
+
+    pub fn redacted_api_key(&self) -> Option<String> {
+        self.api_key().ok().map(|key| {
+            let tail: String = key
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("••••{tail}")
+        })
     }
 
     /// 返回激活分组的 base_url（若配置为空则用供应商默认值）。
@@ -705,7 +912,43 @@ mod project_path_tests {
 
 #[cfg(test)]
 mod subagent_cfg_tests {
-    use super::{ComputerUseCfg, ForegroundFallback, Profile, Provider, SubAgentCfg};
+    use super::{
+        ComputerUseCfg, Config, ForegroundFallback, Profile, Provider, RoutingRole, SubAgentCfg,
+        WireProtocol,
+    };
+
+    #[test]
+    fn routing_roles_parse_and_cross_provider_defaults_closed() {
+        let cfg: Config = toml::from_str(
+            r#"
+active_profile = "main"
+
+[routing.roles]
+execute = ["main", "backup"]
+plan = ["planner"]
+
+[[profiles]]
+name = "main"
+provider = "openai"
+model = "main-model"
+base_url = "https://example.invalid/v1"
+api_key = "placeholder"
+max_tokens = 4096
+context_window = 32000
+"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.routing.cross_provider_fallback);
+        assert_eq!(
+            cfg.routing.roles.for_role(RoutingRole::Execute),
+            &["main".to_string(), "backup".to_string()]
+        );
+        assert_eq!(
+            cfg.routing.roles.for_role(RoutingRole::Plan),
+            &["planner".to_string()]
+        );
+    }
 
     #[test]
     fn computer_use_defaults_fail_closed_for_foreground_takeover() {
@@ -758,6 +1001,48 @@ mod subagent_cfg_tests {
         p.provider = Provider::OpenAI;
         p.base_url.clear();
         assert!(p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn old_profile_without_vendor_or_wire_protocol_remains_compatible() {
+        let p: Profile = toml::from_str(
+            r#"
+name = "legacy"
+provider = "openai"
+model = "deepseek-chat"
+base_url = "https://api.deepseek.com"
+max_tokens = 8192
+context_window = 64000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(p.vendor, None);
+        assert_eq!(p.wire_protocol, None);
+        assert_eq!(
+            p.effective_wire_protocol(),
+            WireProtocol::OpenAiChatCompletions
+        );
+    }
+
+    #[test]
+    fn explicit_wire_protocol_takes_precedence_over_legacy_provider() {
+        let p: Profile = toml::from_str(
+            r#"
+name = "dual-protocol"
+provider = "openai"
+vendor = "minimax"
+wire_protocol = "anthropic_messages"
+model = "MiniMax-M2"
+base_url = "https://example.invalid/anthropic"
+max_tokens = 8192
+context_window = 200000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(p.vendor.as_deref(), Some("minimax"));
+        assert_eq!(p.effective_wire_protocol(), WireProtocol::AnthropicMessages);
     }
 
     #[test]
@@ -855,5 +1140,20 @@ mod subagent_cfg_tests {
             ..Profile::default()
         };
         assert!(!p.effective_openai_stream_options());
+    }
+
+    #[test]
+    fn runtime_and_referenced_secrets_are_not_materialized_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config {
+            runtime_api_key: Some("runtime-secret-value".to_string()),
+            ..Config::default()
+        };
+        config.active_profile_mut().api_key_env = Some("MINIMAX_API_KEY".to_string());
+        config.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(path).unwrap();
+        assert!(!saved.contains("runtime-secret-value"));
+        assert!(saved.contains("api_key_env = \"MINIMAX_API_KEY\""));
     }
 }

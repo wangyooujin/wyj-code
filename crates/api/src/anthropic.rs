@@ -205,7 +205,8 @@ enum SseEvent {
     MessageStop,
     Ping,
     Error {
-        error: Value,
+        #[serde(rename = "error")]
+        _error: Value,
     },
 }
 
@@ -550,7 +551,12 @@ fn parse_sse_item(
 ) -> Vec<Result<StreamEvent>> {
     let event = match item {
         Ok(e) => e,
-        Err(e) => return vec![Err(anyhow::anyhow!("SSE 读取失败: {e}"))],
+        Err(_) => {
+            return vec![Err(anyhow::Error::new(crate::error::ProviderError::new(
+                crate::error::ProviderErrorKind::StreamTruncated,
+                "provider SSE stream ended unexpectedly",
+            )))];
+        }
     };
     if event.data == "[DONE]" {
         return vec![];
@@ -608,8 +614,11 @@ fn parse_sse_item(
             out
         }
         SseEvent::MessageStop | SseEvent::Ping => vec![],
-        SseEvent::Error { error } => {
-            vec![Err(anyhow::anyhow!("Anthropic 流式错误: {error}"))]
+        SseEvent::Error { _error: _ } => {
+            vec![Err(anyhow::Error::new(crate::error::ProviderError::new(
+                crate::error::ProviderErrorKind::StreamTruncated,
+                "provider emitted a stream error event",
+            )))]
         }
     }
 }

@@ -40,6 +40,8 @@ pub enum AgentEvent {
         input: u32,
         output: u32,
         context_tokens: u32,
+        tool_schema_tokens: u32,
+        tool_schema_tokens_saved: u32,
     },
     /// 单次 LLM 流式返回的增量 token 用量（非累计），用于把 token 消耗实时归因到
     /// 当前 in_progress 的任务（与 `Usage` 的覆盖式总量不同）。

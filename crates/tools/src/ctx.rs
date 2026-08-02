@@ -6,6 +6,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+pub use wyj_core::permission::PermissionMode;
+use wyj_core::permission::{
+    safe_resolve_write_target, ExecutionSurface, PermissionPolicy, PermissionRequest,
+    PermissionVerdict,
+};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolContext};
 
 /// 逐调用权限确认的用户决策
@@ -28,17 +33,6 @@ pub const PROJECT_APPROVE_ONCE_TOOLS: &[&str] = &["computer", "app_computer"];
 /// `name` 是否应在首次批准（AllowOnce 或 AllowAlways）后写入项目级授权。
 pub fn is_project_approve_once_tool(name: &str) -> bool {
     PROJECT_APPROVE_ONCE_TOOLS.contains(&name)
-}
-
-/// 权限模式
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PermissionMode {
-    /// 需要用户逐个确认
-    Prompt,
-    /// 自动允许全部
-    AutoApprove,
-    /// 白名单模式（仅允许列出的工具）
-    Allowlist(HashSet<String>),
 }
 
 /// 工具向 TUI 发送的交互请求
@@ -67,6 +61,16 @@ pub struct ToolCtx {
     /// 进行中时（如 Plan 审批、Shift+Tab），需要立即影响同一轮剩余的
     /// 权限判定，因此不能是每轮快照一次的普通值。
     pub permission_mode: Arc<RwLock<PermissionMode>>,
+    /// 运行表面决定 Prompt 是否真的具备人类审批通道。
+    pub execution_surface: Arc<RwLock<ExecutionSurface>>,
+    /// 路径、网络、sandbox 等范围授权。与 permission_mode 分离，确保 bypass
+    /// 也不能关闭受保护路径或 require-sandbox。
+    pub permission_policy: Arc<RwLock<PermissionPolicy>>,
+    pub sandbox_available: Arc<RwLock<bool>>,
+    pub sandbox_policy: Arc<RwLock<wyj_sandbox::SandboxPolicy>>,
+    /// 是否允许真实交互表面在 sandbox 构造失败后请求一次性直连审批。
+    /// 该开关不影响 headless/schedule/SubAgent，它们始终 fail-closed。
+    pub allow_unsandboxed_fallback: Arc<RwLock<bool>>,
     /// TUI 模式下注入此 sender，工具通过它向 TUI 发起交互
     pub ui_ask_tx: Option<mpsc::Sender<UiAskRequest>>,
     /// 已获项目级授权的工具名集合，启动时从项目级文件载入；AllowAlways，或
@@ -79,9 +83,18 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
+        let cwd = cwd.into();
+        let sandbox_available = wyj_sandbox::SandboxRunner::detect().is_available();
         Self {
-            cwd: cwd.into(),
-            permission_mode: Arc::new(RwLock::new(PermissionMode::AutoApprove)),
+            sandbox_policy: Arc::new(RwLock::new(wyj_sandbox::SandboxPolicy::enforced_workspace(
+                &cwd,
+            ))),
+            cwd,
+            permission_mode: Arc::new(RwLock::new(PermissionMode::Prompt)),
+            execution_surface: Arc::new(RwLock::new(ExecutionSurface::HeadlessRepl)),
+            permission_policy: Arc::new(RwLock::new(PermissionPolicy::default())),
+            sandbox_available: Arc::new(RwLock::new(sandbox_available)),
+            allow_unsandboxed_fallback: Arc::new(RwLock::new(true)),
             ui_ask_tx: None,
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
@@ -91,6 +104,106 @@ impl ToolCtx {
     /// 就地替换权限模式的值（不改变共享句柄本身）。
     pub fn set_permission_mode(&self, mode: PermissionMode) {
         *self.permission_mode.write().unwrap() = mode;
+    }
+
+    pub fn set_execution_surface(&self, surface: ExecutionSurface) {
+        *self.execution_surface.write().unwrap() = surface;
+    }
+
+    pub fn set_sandbox_available(&self, available: bool) {
+        *self.sandbox_available.write().unwrap() = available;
+    }
+
+    pub fn set_sandbox_mode(&self, mode: wyj_sandbox::SandboxMode) {
+        self.sandbox_policy.write().unwrap().mode = mode;
+    }
+
+    pub fn require_sandbox(&self, required: bool) {
+        self.permission_policy.write().unwrap().require_sandbox = required;
+    }
+
+    pub fn allow_unsandboxed_fallback(&self, allowed: bool) {
+        *self.allow_unsandboxed_fallback.write().unwrap() = allowed;
+    }
+
+    pub fn apply_sandbox_config(&self, config: &wyj_config::SandboxCfg) -> Result<(), String> {
+        self.allow_unsandboxed_fallback(config.enabled && config.allow_unsandboxed_commands);
+        self.require_sandbox(config.enabled && config.fail_if_unavailable);
+        if !config.enabled {
+            self.set_sandbox_mode(wyj_sandbox::SandboxMode::Disabled);
+            return Ok(());
+        }
+
+        let resolve = |path: &PathBuf| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                self.cwd.join(path)
+            }
+        };
+        let mut policy = wyj_sandbox::SandboxPolicy::enforced_workspace(&self.cwd);
+        for path in &config.filesystem.allow_read {
+            policy.add_read_root(resolve(path));
+        }
+        for path in &config.filesystem.allow_write {
+            policy.add_write_root(resolve(path));
+        }
+        for path in &config.filesystem.deny_read {
+            policy.add_deny_read_root(resolve(path));
+        }
+        for path in &config.filesystem.deny_write {
+            policy.add_deny_write_root(resolve(path));
+        }
+        if !config.network.allowed_domains.is_empty() {
+            policy.network =
+                wyj_sandbox::NetworkPolicy::AllowedDomains(config.network.allowed_domains.clone());
+        }
+        *self.sandbox_policy.write().unwrap() = policy;
+        Ok(())
+    }
+
+    pub fn replace_sandbox_policy(&self, policy: wyj_sandbox::SandboxPolicy) {
+        *self.sandbox_policy.write().unwrap() = policy;
+    }
+
+    pub fn allow_write_root(&self, path: &Path) -> Result<PathBuf, String> {
+        self.permission_policy
+            .write()
+            .unwrap()
+            .add_allowed_write_root(&self.cwd, path)
+            .inspect(|resolved| {
+                self.sandbox_policy
+                    .write()
+                    .unwrap()
+                    .add_write_root(resolved.clone());
+            })
+            .map_err(|reason| reason.message)
+    }
+
+    pub fn allow_plan_document(&self, path: &Path) -> Result<PathBuf, String> {
+        self.permission_policy
+            .write()
+            .unwrap()
+            .add_plan_document_grant(&self.cwd, path)
+            .map_err(|reason| reason.message)
+    }
+
+    pub fn allow_network_domain(&self, domain: impl Into<String>) {
+        let domain = domain.into().to_ascii_lowercase();
+        self.permission_policy
+            .write()
+            .unwrap()
+            .allowed_domains
+            .insert(domain.clone());
+        let mut sandbox = self.sandbox_policy.write().unwrap();
+        match &mut sandbox.network {
+            wyj_sandbox::NetworkPolicy::AllowedDomains(domains) => {
+                if !domains.contains(&domain) {
+                    domains.push(domain);
+                }
+            }
+            _ => sandbox.network = wyj_sandbox::NetworkPolicy::AllowedDomains(vec![domain]),
+        }
     }
 
     /// 按当前 cwd 所属项目（git 仓库根）载入「始终允许」列表并设定持久化路径。
@@ -147,17 +260,27 @@ impl ToolContext for ToolCtx {
         &self.cwd
     }
 
-    fn is_allowed(&self, name: &str, _input: &Value) -> bool {
-        match &*self.permission_mode.read().unwrap() {
-            PermissionMode::AutoApprove => true,
-            PermissionMode::Prompt => true, // UI 层会弹确认，此处放行
-            PermissionMode::Allowlist(set) => set.contains(name),
+    fn is_allowed(&self, name: &str, input: &Value) -> bool {
+        let request = PermissionRequest {
+            mode: self.permission_mode.read().unwrap().clone(),
+            surface: *self.execution_surface.read().unwrap(),
+            tool_name: name.to_string(),
+            input: input.clone(),
+            cwd: self.cwd.clone(),
+            sandbox_available: *self.sandbox_available.read().unwrap(),
+        };
+        match self.permission_policy.read().unwrap().evaluate(&request) {
+            PermissionVerdict::Allow | PermissionVerdict::Ask(_) => true,
+            PermissionVerdict::Deny(reason) => {
+                tracing::warn!(tool = %name, code = reason.code, "{}", reason.message);
+                false
+            }
         }
     }
 
     fn allowed_tools(&self) -> Option<HashSet<String>> {
         match &*self.permission_mode.read().unwrap() {
-            PermissionMode::Allowlist(set) => Some(set.clone()),
+            PermissionMode::Allowlist(set) | PermissionMode::Plan(set) => Some(set.clone()),
             _ => None,
         }
     }
@@ -180,7 +303,7 @@ impl ToolContext for ToolCtx {
     async fn exit_plan_mode(&self, plan: &str) -> bool {
         let tx = match &self.ui_ask_tx {
             Some(t) => t,
-            None => return true, // headless：自动批准
+            None => return false,
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let req = UiAskRequest::ExitPlanMode {
@@ -206,10 +329,10 @@ impl ToolContext for ToolCtx {
         if self.always_allowed.read().unwrap().contains(name) {
             return true;
         }
-        // 无 UI 通道（headless / 子 Agent）：不阻塞，放行
+        // 无 UI 通道（headless / 子 Agent）：fail-closed。
         let tx = match &self.ui_ask_tx {
             Some(t) => t,
-            None => return true,
+            None => return false,
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let req = UiAskRequest::ToolPermission {
@@ -221,6 +344,14 @@ impl ToolContext for ToolCtx {
             return false;
         }
         match response_rx.await {
+            Ok(PermissionDecision::AllowOnce | PermissionDecision::AllowAlways)
+                if matches!(
+                    &*self.permission_mode.read().unwrap(),
+                    PermissionMode::Plan(_)
+                ) && matches!(name, "Write" | "Edit") =>
+            {
+                self.allow_plan_document(Path::new(summary)).is_ok()
+            }
             Ok(PermissionDecision::AllowOnce) if is_project_approve_once_tool(name) => {
                 self.allow_for_project(name);
                 true
@@ -232,6 +363,45 @@ impl ToolContext for ToolCtx {
             }
             Ok(PermissionDecision::Deny) | Err(_) => false,
         }
+    }
+
+    async fn confirm_unsandboxed_fallback(&self, command: &str, reason: &str) -> bool {
+        if !self.execution_surface.read().unwrap().is_interactive()
+            || !*self.allow_unsandboxed_fallback.read().unwrap()
+        {
+            return false;
+        }
+        let tx = match &self.ui_ask_tx {
+            Some(tx) => tx,
+            None => return false,
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let req = UiAskRequest::ToolPermission {
+            tool_name: "Bash (unsandboxed fallback)".to_string(),
+            action_summary: format!(
+                "Sandbox 无法建立隔离边界：{reason}\n\n仅本次直连执行：\n{command}"
+            ),
+            response_tx,
+        };
+        if tx.send(req).await.is_err() {
+            return false;
+        }
+        matches!(response_rx.await, Ok(PermissionDecision::AllowOnce))
+    }
+
+    fn is_plan_mode(&self) -> bool {
+        matches!(
+            &*self.permission_mode.read().unwrap(),
+            PermissionMode::Plan(_)
+        )
+    }
+
+    fn resolve_write_target(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        safe_resolve_write_target(&self.cwd, raw).map_err(|reason| reason.message)
+    }
+
+    fn sandbox_policy(&self) -> wyj_sandbox::SandboxPolicy {
+        self.sandbox_policy.read().unwrap().clone()
     }
 }
 
@@ -473,5 +643,62 @@ mod tests {
         assert!(!ctx.confirm_tool("Bash", "rm -rf /").await);
         responder.await.unwrap();
         assert!(!ctx.always_allowed.read().unwrap().contains("Bash"));
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_fallback_is_tui_only_and_one_shot() {
+        let mut headless = ToolCtx::new("/tmp");
+        headless.set_execution_surface(ExecutionSurface::HeadlessRepl);
+        let (tx, _rx) = mpsc::channel(1);
+        headless.ui_ask_tx = Some(tx);
+        assert!(
+            !headless
+                .confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
+                .await
+        );
+
+        let mut tui = ToolCtx::new("/tmp");
+        tui.set_execution_surface(ExecutionSurface::TuiInteractive);
+        let (tx, mut rx) = mpsc::channel(1);
+        tui.ui_ask_tx = Some(tx);
+        let responder = tokio::spawn(async move {
+            if let Some(UiAskRequest::ToolPermission {
+                tool_name,
+                response_tx,
+                ..
+            }) = rx.recv().await
+            {
+                assert_eq!(tool_name, "Bash (unsandboxed fallback)");
+                let _ = response_tx.send(PermissionDecision::AllowOnce);
+            }
+        });
+        assert!(
+            tui.confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
+                .await
+        );
+        responder.await.unwrap();
+        assert!(!tui
+            .always_allowed
+            .read()
+            .unwrap()
+            .contains("Bash (unsandboxed fallback)"));
+    }
+
+    #[tokio::test]
+    async fn unsandboxed_fallback_cannot_be_persisted_with_allow_always() {
+        let mut tui = ToolCtx::new("/tmp");
+        tui.set_execution_surface(ExecutionSurface::TuiInteractive);
+        let (tx, mut rx) = mpsc::channel(1);
+        tui.ui_ask_tx = Some(tx);
+        let responder = tokio::spawn(async move {
+            if let Some(UiAskRequest::ToolPermission { response_tx, .. }) = rx.recv().await {
+                let _ = response_tx.send(PermissionDecision::AllowAlways);
+            }
+        });
+        assert!(
+            !tui.confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
+                .await
+        );
+        responder.await.unwrap();
     }
 }

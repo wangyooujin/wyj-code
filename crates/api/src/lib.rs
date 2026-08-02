@@ -1,16 +1,30 @@
 //! wyj-api — LLM 供应商客户端（Anthropic / OpenAI 双格式）
 
 pub mod anthropic;
+pub mod capabilities;
+pub mod capability_cache;
+pub mod doctor;
+pub mod error;
+pub mod model_catalog;
 pub mod models;
 pub mod openai;
+pub mod prompt_policy;
 pub mod provider;
+pub mod request_plan;
 pub mod retry;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;
+pub use capabilities::*;
+pub use capability_cache::{CapabilityCache, CapabilityCacheRecord, PROBE_VERSION};
+pub use doctor::ModelDoctorReport;
+pub use error::{ProviderError, ProviderErrorKind};
+pub use model_catalog::{CatalogResolution, ModelCatalog, VerificationStatus};
 pub use models::{fetch_model_ids, ProfileTemplate, PROFILE_TEMPLATES};
 pub use openai::OpenAIProvider;
+pub use prompt_policy::PromptPolicy;
 pub use provider::Provider;
+pub use request_plan::*;
 pub use types::*;
 
 use anyhow::Result;
@@ -36,9 +50,15 @@ pub fn build_provider_from_profile(
     profile: &wyj_config::Profile,
     model_override: Option<&str>,
 ) -> Result<Arc<dyn Provider>> {
+    let runtime_api_key = profile
+        .api_key_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok())
+        .filter(|key| !key.is_empty());
     let cfg = Config {
         active_profile: profile.name.clone(),
         profiles: vec![profile.clone()],
+        runtime_api_key,
         ..Config::default()
     };
     let model = model_override.unwrap_or(&profile.model).to_string();

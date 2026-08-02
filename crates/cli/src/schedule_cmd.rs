@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use wyj_store::cron_sync;
-use wyj_store::schedule::{self, RunStatus};
+use wyj_store::schedule::{self, RunStatus, SchedulePermissions};
 
 #[derive(Subcommand, Debug)]
 pub enum ScheduleCommand {
@@ -36,6 +36,16 @@ pub enum ScheduleCommand {
         /// Send a macOS notification when this task fails.
         #[arg(long)]
         notify_on_failure: bool,
+        /// Explicit tool allowlist. Defaults to read-only tools.
+        #[arg(long, value_delimiter = ',')]
+        allowed_tools: Vec<String>,
+        #[arg(long = "allow-write")]
+        allow_write: Vec<PathBuf>,
+        #[arg(long = "allow-network")]
+        allow_network: Vec<String>,
+        /// Explicitly permit process tools when no sandbox backend is available.
+        #[arg(long)]
+        allow_unsandboxed: bool,
         #[arg(long)]
         json: bool,
     },
@@ -54,6 +64,22 @@ pub enum ScheduleCommand {
     /// Disable a schedule task (removes it from the system crontab, keeps the record).
     Disable {
         id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review and replace a task's explicit permissions; optionally enable it.
+    Review {
+        id: String,
+        #[arg(long, value_delimiter = ',')]
+        allowed_tools: Vec<String>,
+        #[arg(long = "allow-write")]
+        allow_write: Vec<PathBuf>,
+        #[arg(long = "allow-network")]
+        allow_network: Vec<String>,
+        #[arg(long)]
+        allow_unsandboxed: bool,
+        #[arg(long)]
+        enable: bool,
         #[arg(long)]
         json: bool,
     },
@@ -94,7 +120,13 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
                         task.id,
                         task.name,
                         task.cron,
-                        if task.enabled { "enabled" } else { "disabled" },
+                        if task.needs_permission_review {
+                            "review"
+                        } else if task.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
                         status
                     );
                 }
@@ -106,15 +138,22 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
             cron,
             cwd: task_cwd,
             notify_on_failure,
+            allowed_tools,
+            allow_write,
+            allow_network,
+            allow_unsandboxed,
             json,
         } => {
             cron_sync::validate_cron(&cron)?;
+            let permissions =
+                schedule_permissions(allowed_tools, allow_write, allow_network, allow_unsandboxed);
             let task = schedule::create_task(schedule::NewTask {
                 name,
                 prompt,
                 cron,
                 cwd: task_cwd.unwrap_or_else(|| cwd.to_path_buf()),
                 notify_on_failure,
+                permissions,
             })?;
             sync_and_warn()?;
             if json {
@@ -137,6 +176,29 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
             schedule::set_enabled(&id, false)?;
             sync_and_warn()?;
             emit_mutation("disabled", &id, json)?;
+        }
+        ScheduleCommand::Review {
+            id,
+            allowed_tools,
+            allow_write,
+            allow_network,
+            allow_unsandboxed,
+            enable,
+            json,
+        } => {
+            let permissions =
+                schedule_permissions(allowed_tools, allow_write, allow_network, allow_unsandboxed);
+            let task = schedule::review_permissions(&id, permissions, enable)?;
+            sync_and_warn()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&task)?);
+            } else {
+                println!(
+                    "reviewed {} ({})",
+                    id,
+                    if task.enabled { "enabled" } else { "disabled" }
+                );
+            }
         }
         ScheduleCommand::Sync { json } => {
             let manifest = schedule::load()?;
@@ -167,6 +229,22 @@ fn emit_mutation(action: &str, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn schedule_permissions(
+    allowed_tools: Vec<String>,
+    allow_write: Vec<PathBuf>,
+    allowed_domains: Vec<String>,
+    allow_unsandboxed: bool,
+) -> SchedulePermissions {
+    let mut permissions = SchedulePermissions::default();
+    if !allowed_tools.is_empty() {
+        permissions.allowed_tools = allowed_tools;
+    }
+    permissions.allow_write = allow_write;
+    permissions.allowed_domains = allowed_domains;
+    permissions.require_sandbox = !allow_unsandboxed;
+    permissions
+}
+
 /// crontab 同步失败不影响任务数据本身已经落盘成功；只打印警告，不让整条 CLI
 /// 命令因为系统 crontab 不可用（如 Windows）而失败退出。
 fn sync_and_warn() -> Result<()> {
@@ -188,10 +266,14 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
         eprintln!("定时任务 {id} 已禁用，跳过执行");
         return Ok(());
     }
+    if task.needs_permission_review {
+        anyhow::bail!("定时任务 {id} 尚未完成权限审查，拒绝运行");
+    }
     let task_name = task.name.clone();
     let prompt = task.prompt.clone();
     let task_cwd = task.cwd.clone();
     let notify_on_failure = task.notify_on_failure;
+    let permissions = task.permissions.clone();
 
     schedule::record_run_start(id)?;
 
@@ -208,7 +290,7 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
     };
 
     let exe = std::env::current_exe().context("无法定位 wyj-code 可执行文件路径")?;
-    let spawn_result = spawn_headless(&exe, &prompt, &task_cwd, &log_path).await;
+    let spawn_result = spawn_headless(&exe, &prompt, &task_cwd, &log_path, &permissions).await;
 
     let session_id = latest_session_id_for(&task_cwd);
 
@@ -256,14 +338,28 @@ async fn spawn_headless(
     prompt: &str,
     task_cwd: &Path,
     log_path: &Path,
+    permissions: &SchedulePermissions,
 ) -> Result<std::process::ExitStatus> {
     let stdout_file = std::fs::File::create(log_path).context("创建日志文件失败")?;
     let stderr_file = stdout_file.try_clone().context("克隆日志文件句柄失败")?;
-    let status = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("-p")
         .arg(prompt)
         .arg("--cwd")
         .arg(task_cwd)
+        .arg("--allowed-tools")
+        .arg(permissions.allowed_tools.join(","));
+    for path in &permissions.allow_write {
+        command.arg("--allow-write").arg(path);
+    }
+    for domain in &permissions.allowed_domains {
+        command.arg("--allow-network").arg(domain);
+    }
+    if permissions.require_sandbox {
+        command.arg("--require-sandbox");
+    }
+    let status = command
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
         .status()

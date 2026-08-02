@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 wyj-core.workspace = true
 wyj-tools.workspace = true
+wyj-sandbox.workspace = true
 wyj-api.workspace = true
 wyj-commands.workspace = true
 wyj-config.workspace = true

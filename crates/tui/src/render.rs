@@ -11,7 +11,7 @@ use crate::app::{
     SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
-    SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    SCHEDULE_FIELD_REQUIRE_SANDBOX, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::InputBox;
 use crate::markdown::render_markdown;
@@ -1573,6 +1573,19 @@ fn push_sub_agent_trace_lines(
                     detail_width,
                 );
             }
+            TraceEvent::Control { action, accepted } => {
+                push_wrapped_detail_line(
+                    lines,
+                    "control",
+                    &format!("{action} · accepted={accepted}"),
+                    if *accepted {
+                        Theme::dim()
+                    } else {
+                        Theme::error()
+                    },
+                    detail_width,
+                );
+            }
             TraceEvent::Done {
                 result,
                 is_error,
@@ -2170,11 +2183,19 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
 // ─── 状态栏 ──────────────────────────────────────────────────────────────────
 
 fn interaction_usage_text(state: &AppState) -> String {
-    format!(
+    let mut text = format!(
         "total ↑{} ↓{}",
         fmt_tokens(state.total_input_tokens),
         fmt_tokens(state.total_output_tokens)
-    )
+    );
+    if state.tool_schema_tokens_saved > 0 {
+        text.push_str(&format!(
+            " · schema {} sent/{} saved",
+            fmt_tokens(state.tool_schema_tokens),
+            fmt_tokens(state.tool_schema_tokens_saved)
+        ));
+    }
+    text
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
@@ -2320,7 +2341,9 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
         Line::from(Span::raw(preview)),
         Line::from(""),
         Line::from(Span::styled(
-            if wyj_tools::ctx::is_project_approve_once_tool(&dlg.tool_name) {
+            if dlg.tool_name == "Bash (unsandboxed fallback)" {
+                wyj_i18n::tr("dialog.permission_hint_once")
+            } else if wyj_tools::ctx::is_project_approve_once_tool(&dlg.tool_name) {
                 wyj_i18n::tr("dialog.permission_hint_project_once")
             } else {
                 wyj_i18n::tr("dialog.permission_hint")
@@ -4480,8 +4503,13 @@ fn draw_schedule_dialog(
                     .as_ref()
                     .map(|r| format!("{:?}", r.status))
                     .unwrap_or_else(|| "-".to_string());
+                let review = if task.needs_permission_review {
+                    "  [permission review required]"
+                } else {
+                    ""
+                };
                 format!(
-                    "{cursor} {expand_marker} {marker} {}  [{}]  next:{next_run}  last:{status}",
+                    "{cursor} {expand_marker} {marker} {}  [{}]  next:{next_run}  last:{status}{review}",
                     task.name, task.cron
                 )
             }
@@ -4491,6 +4519,12 @@ fn draw_schedule_dialog(
                     wyj_i18n::tr("schedule.dialog.editing_placeholder")
                 } else if *f_idx == SCHEDULE_FIELD_NOTIFY {
                     wyj_i18n::tr(if dialog.tasks[*task_idx].notify_on_failure {
+                        "schedule.dialog.on"
+                    } else {
+                        "schedule.dialog.off"
+                    })
+                } else if *f_idx == SCHEDULE_FIELD_REQUIRE_SANDBOX {
+                    wyj_i18n::tr(if dialog.tasks[*task_idx].permissions.require_sandbox {
                         "schedule.dialog.on"
                     } else {
                         "schedule.dialog.off"

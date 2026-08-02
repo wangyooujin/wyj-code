@@ -82,7 +82,10 @@ impl Tool for EditTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
-        let path = resolve_path(ctx.cwd(), &inp.file_path);
+        let path = match ctx.resolve_write_target(&inp.file_path) {
+            Ok(path) => path,
+            Err(reason) => return Ok(ToolResult::err(format!("安全检查失败：{reason}"))),
+        };
 
         if !path.exists() {
             return Ok(ToolResult::err(format!("文件不存在: {}", path.display())));
@@ -126,14 +129,5 @@ impl Tool for EditTool {
             "已替换 {replaced} 处: {}\n{diff}",
             path.display()
         )))
-    }
-}
-
-fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
-    let pb = std::path::Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        cwd.join(pb)
     }
 }

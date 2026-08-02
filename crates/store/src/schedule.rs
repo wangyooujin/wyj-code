@@ -11,7 +11,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SCHEDULE_VERSION: u32 = 1;
+pub const SCHEDULE_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulePermissions {
+    pub allowed_tools: Vec<String>,
+    pub allow_write: Vec<PathBuf>,
+    pub allowed_domains: Vec<String>,
+    pub require_sandbox: bool,
+}
+
+impl Default for SchedulePermissions {
+    fn default() -> Self {
+        Self {
+            allowed_tools: ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            allow_write: Vec::new(),
+            allowed_domains: Vec::new(),
+            require_sandbox: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +65,11 @@ pub struct ScheduleTask {
     pub cron: String,
     pub cwd: PathBuf,
     pub enabled: bool,
+    /// v1 任务升级后必须人工确认权限；未确认的任务会自动禁用且拒绝运行。
+    #[serde(default)]
+    pub needs_permission_review: bool,
+    #[serde(default)]
+    pub permissions: SchedulePermissions,
     #[serde(default)]
     pub notify_on_failure: bool,
     pub created_at: DateTime<Utc>,
@@ -82,7 +110,18 @@ fn load_from(path: &Path) -> Result<ScheduleManifest> {
         .with_context(|| format!("读取定时任务文件失败: {}", path.display()))?;
     let mut manifest: ScheduleManifest = serde_json::from_str(&content)
         .with_context(|| format!("解析定时任务文件失败: {}", path.display()))?;
+    let migrated = manifest.version < SCHEDULE_VERSION;
+    if migrated {
+        for task in &mut manifest.tasks {
+            task.enabled = false;
+            task.needs_permission_review = true;
+            task.permissions = SchedulePermissions::default();
+        }
+    }
     manifest.version = SCHEDULE_VERSION;
+    if migrated {
+        save_to(path, &manifest)?;
+    }
     Ok(manifest)
 }
 
@@ -132,6 +171,7 @@ pub struct NewTask {
     pub cron: String,
     pub cwd: PathBuf,
     pub notify_on_failure: bool,
+    pub permissions: SchedulePermissions,
 }
 
 /// 新建任务并落盘，返回生成的完整 `ScheduleTask`（含分配的 id）。
@@ -152,6 +192,8 @@ fn create_task_at(path: &Path, req: NewTask) -> Result<ScheduleTask> {
         cron: req.cron,
         cwd: req.cwd,
         enabled: true,
+        needs_permission_review: false,
+        permissions: req.permissions,
         notify_on_failure: req.notify_on_failure,
         created_at: now,
         updated_at: now,
@@ -200,7 +242,30 @@ fn delete_task_at(path: &Path, id: &str) -> Result<()> {
 }
 
 pub fn set_enabled(id: &str, enabled: bool) -> Result<ScheduleTask> {
+    if enabled {
+        let manifest = load()?;
+        let task = manifest
+            .tasks
+            .iter()
+            .find(|task| task.id == id)
+            .ok_or_else(|| anyhow::anyhow!("未找到定时任务: {id}"))?;
+        if task.needs_permission_review {
+            anyhow::bail!("定时任务 {id} 尚未完成权限审查，不能启用");
+        }
+    }
     update_task(id, |t| t.enabled = enabled)
+}
+
+pub fn review_permissions(
+    id: &str,
+    permissions: SchedulePermissions,
+    enable: bool,
+) -> Result<ScheduleTask> {
+    update_task(id, |task| {
+        task.permissions = permissions;
+        task.needs_permission_review = false;
+        task.enabled = enable;
+    })
 }
 
 pub fn record_run_start(id: &str) -> Result<()> {
@@ -250,6 +315,7 @@ mod tests {
             cron: "0 8 * * *".to_string(),
             cwd: cwd.to_path_buf(),
             notify_on_failure: false,
+            permissions: SchedulePermissions::default(),
         }
     }
 
@@ -266,6 +332,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tasks.json");
         let mut manifest = ScheduleManifest::new();
+        let permissions = SchedulePermissions {
+            allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
+            allow_write: vec![dir.path().join("reports")],
+            allowed_domains: vec!["example.com".to_string()],
+            require_sandbox: false,
+        };
         manifest.tasks.push(ScheduleTask {
             id: "abc".to_string(),
             name: "复盘".to_string(),
@@ -273,6 +345,8 @@ mod tests {
             cron: "0 20 * * *".to_string(),
             cwd: PathBuf::from("/tmp/trading"),
             enabled: true,
+            needs_permission_review: false,
+            permissions: permissions.clone(),
             notify_on_failure: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -284,15 +358,26 @@ mod tests {
         assert_eq!(loaded.tasks.len(), 1);
         assert_eq!(loaded.tasks[0].id, "abc");
         assert_eq!(loaded.tasks[0].cron, "0 20 * * *");
+        assert_eq!(loaded.tasks[0].permissions, permissions);
     }
 
     #[test]
     fn old_file_without_new_fields_parses_with_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tasks.json");
-        std::fs::write(&path, r#"{"version":1,"tasks":[]}"#).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"tasks":[{{"id":"old","name":"old","prompt":"x","cron":"0 1 * * *","cwd":"{}","enabled":true,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}]}}"#,
+                dir.path().display()
+            ),
+        )
+        .unwrap();
         let manifest = load_from(&path).unwrap();
-        assert!(manifest.tasks.is_empty());
+        assert_eq!(manifest.tasks.len(), 1);
+        assert!(!manifest.tasks[0].enabled);
+        assert!(manifest.tasks[0].needs_permission_review);
+        assert!(manifest.tasks[0].permissions.require_sandbox);
     }
 
     #[test]
