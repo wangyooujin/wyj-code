@@ -136,11 +136,7 @@ fn parse_skill_file(name: &str, content: &str) -> SkillCommand {
                     allowed_tools = Some(list);
                 }
             }
-            "model" => {
-                if !value.is_empty() {
-                    model = Some(value);
-                }
-            }
+            "model" if !value.is_empty() => model = Some(value),
             // 未识别字段（如真实 Claude Code 的其他 frontmatter key）静默忽略
             _ => {}
         }

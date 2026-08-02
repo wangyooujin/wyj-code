@@ -34,6 +34,27 @@ fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
     ((bytes.saturating_add(3)) / 4).min(u32::MAX as usize) as u32
 }
 
+/// 主提示词和基础工作流会直接引用这些工具；lazy schema 只能隐藏可选集成，
+/// 不能把正常编码所需的执行面从模型目录中移除。未注册的名字不会产生 schema，
+/// 因此同一列表也可安全用于只读子 Agent 和 Plan 模式。
+const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "CodeSearch",
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Edit",
+    "Write",
+    "WebFetch",
+    "WebSearch",
+    "AskQuestion",
+    "TodoWrite",
+    "Agent",
+    "ExitPlanMode",
+];
+
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）
 pub enum ToolEvent {
     Start {
@@ -463,7 +484,13 @@ impl Agent {
         if self.tools.len() <= threshold {
             return false;
         }
-        let state = crate::tool_search::LazyToolState::new(core_tools, top_k, sticky_turns);
+        let mut core: HashSet<String> = core_tools.into_iter().collect();
+        core.extend(
+            ALWAYS_VISIBLE_TOOL_SCHEMAS
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+        let state = crate::tool_search::LazyToolState::new(core, top_k, sticky_turns);
         for definition in &self.tools {
             state.upsert(definition.clone());
         }
@@ -1848,6 +1875,32 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.0.to_string(),
+                description: format!("{} test tool", self.0),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            }
+        }
+
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            Ok(ToolResult::ok(self.0.to_string()))
+        }
+    }
+
     #[test]
     fn lazy_tools_only_activate_above_the_configured_threshold() {
         let mut small = Agent::new(Arc::new(EndTurnProvider));
@@ -1871,6 +1924,41 @@ mod tests {
             .tools
             .iter()
             .any(|definition| definition.name == "ToolSearch"));
+    }
+
+    #[test]
+    fn lazy_tools_never_hide_the_core_execution_surface() {
+        let mut agent = Agent::new(Arc::new(EndTurnProvider));
+        for name in [
+            "Read",
+            "Bash",
+            "BashOutput",
+            "Edit",
+            "Write",
+            "Agent",
+            "ExitPlanMode",
+            "mcp__optional__lookup",
+        ] {
+            agent.register_tool(Arc::new(NamedTool(name)));
+        }
+
+        assert!(agent.enable_lazy_tools(["Read".to_string()], 0, 8, 3));
+        let state = agent.lazy_tool_state.as_ref().unwrap();
+        for name in [
+            "Read",
+            "Bash",
+            "BashOutput",
+            "Edit",
+            "Write",
+            "Agent",
+            "ExitPlanMode",
+        ] {
+            assert!(
+                state.visible(name),
+                "核心工具 {name} 不应被 lazy schema 隐藏"
+            );
+        }
+        assert!(!state.visible("mcp__optional__lookup"));
     }
 
     #[async_trait::async_trait]

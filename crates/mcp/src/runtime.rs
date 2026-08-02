@@ -205,7 +205,7 @@ impl McpRuntime {
     /// Flatten the currently connected tools in stable server/name order.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
         let mut servers: Vec<_> = self.connected.iter().collect();
-        servers.sort_by(|(a, _), (b, _)| a.cmp(b));
+        servers.sort_by_key(|(name, _)| *name);
         let mut tools = Vec::new();
         for (_, server) in servers {
             let mut server_tools = server.tools.clone();
