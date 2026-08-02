@@ -2,6 +2,12 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.1]
+
+- **国内模型多工具调用兼容修复**：保守能力目录仍可声明 `max_tools_per_turn = 1` 和禁止并行，但模型若已经在一个完整响应中返回多个合法 `tool_use`，执行器会按能力声明受控串行执行并逐个回填 `tool_result`，不再把额外调用伪装成参数错误，也不会因连续完整多调用响应误触“参数重试耗尽”。工具原始 schema、权限与 sandbox 校验继续逐项生效。
+- **Release CI 跨平台修复**：修复 Linux `detect_backend` 的 `clippy::needless_return`，并按实际使用平台/测试条件编译 computer-use 窗口 generation helper；本机与 Linux/Rust 1.94 的 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均作为发布门禁。
+- **发布边界**：`v1.5.0` annotated tag 已公开且其首轮 Release Action 在 Test & Lint 阶段失败，因此保持不可移动；本补丁以 `v1.5.1` 重新完成五平台 Release 与 Pages 发布，不改写 `v1.4.4` 或 `v1.5.0` 历史。
+
 ## [1.5.0]
 
 - **Workflow 自动隔离编码节点**：`wyj-code workflow validate/run/status/control` 已交付 DAG runtime、并发上限、token budget、human approval、pause/resume/retry/skip/cancel 和持久化状态。拥有 Write/Edit/Bash 且配置 `write_roots` 的 Agent/Review 节点会从当前脏工作区 checkpoint 自动创建独立 managed Git worktree；成功和失败现场都保留，结果返回 diff/review/accept 命令，不自动覆盖父 checkout。

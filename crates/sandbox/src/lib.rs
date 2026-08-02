@@ -340,9 +340,9 @@ fn detect_backend() -> SandboxBackend {
                     .to_string(),
             };
         }
-        return SandboxBackend::Unavailable {
+        SandboxBackend::Unavailable {
             reason: "bubblewrap (bwrap) is not installed".to_string(),
-        };
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
