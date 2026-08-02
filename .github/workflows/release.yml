@@ -120,7 +120,11 @@ jobs:
           Copy-Item install.bat -Destination $stage
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
           $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+          [System.IO.File]::WriteAllText(
+            "$stage.zip.sha256",
+            "$hash  $stage.zip`n",
+            [System.Text.Encoding]::ASCII
+          )
 
       - uses: actions/upload-artifact@v4
         with:
@@ -144,9 +148,11 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Build combined checksums file
+      - name: Build and verify combined checksums file
         working-directory: artifacts
-        run: cat *.sha256 > SHA256SUMS
+        run: |
+          sed 's/\r$//' *.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:

@@ -35,8 +35,8 @@ fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
 }
 
 /// 主提示词和基础工作流会直接引用这些工具；lazy schema 只能隐藏可选集成，
-/// 不能把正常编码所需的执行面从模型目录中移除。未注册的名字不会产生 schema，
-/// 因此同一列表也可安全用于只读子 Agent 和 Plan 模式。
+/// 不能把正常编码和 computer-use 所需的执行面从模型目录中移除。未注册的名字
+/// 不会产生 schema，因此同一列表也可安全用于只读子 Agent 和 Plan 模式。
 const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "Read",
     "Glob",
@@ -53,6 +53,12 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "TodoWrite",
     "Agent",
     "ExitPlanMode",
+    // COMPUTER_USE_HINT 要求模型直接从稳定窗口发现开始，再走后台动作。
+    // 如果这三个 schema 被 ToolSearch 隐藏，国内模型可能把“当前不可见”误判为
+    // “本会话未注册”，从而在没有发起任何工具调用时直接拒绝 GUI 任务。
+    "window_capture",
+    "app_computer",
+    "computer",
 ];
 
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）
@@ -1937,6 +1943,9 @@ mod tests {
             "Write",
             "Agent",
             "ExitPlanMode",
+            "window_capture",
+            "app_computer",
+            "computer",
             "mcp__optional__lookup",
         ] {
             agent.register_tool(Arc::new(NamedTool(name)));
@@ -1952,6 +1961,9 @@ mod tests {
             "Write",
             "Agent",
             "ExitPlanMode",
+            "window_capture",
+            "app_computer",
+            "computer",
         ] {
             assert!(
                 state.visible(name),
