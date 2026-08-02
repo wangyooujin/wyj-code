@@ -164,7 +164,7 @@ TUI 内可用 `/model doctor`、`/sandbox`、`/checkpoint`、`/rewind`、`/branc
 `wyj-code session {checkpoint,checkpoints,rewind,branch}`。完整命令见 `/help` 和
 `wyj-code --help`。
 
-v1.5.0 的隔离执行、Workflow、ACP daemon 与本地 Review 都是 CLI 控制面：
+v1.5.x 的隔离执行、Workflow、ACP daemon 与本地 Review 都是 CLI 控制面：
 
 ```bash
 wyj-code workspace create --base HEAD --purpose "isolated fix"
