@@ -108,7 +108,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.4.4</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.0</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -120,7 +120,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.4.4 · MiniMax-M2 · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.0 · MiniMax-M2 · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -251,6 +251,26 @@
       <h3 class="mt-4 font-semibold" data-i18n="feature.computer.title">Computer-use 桌面控制</h3>
       <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型截图观察桌面、合成鼠标点击拖拽与键盘输入操控本机 GUI（macOS / Windows），官方端点与第三方 Anthropic 协议兼容端点均可用。</p>
     </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.workflow.title">Workflow + 隔离 Worktree</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.workflow.desc">DAG 支持并行、预算、审批、暂停、重试与取消；有写权限的编码节点从脏工作区 checkpoint 自动创建独立 worktree，变更需显式 review/accept。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-terminal"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.acp.title">ACP / daemon 控制面</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.acp.desc">stdio ACP 与本地 TCP daemon 共享前端无关事件协议；daemon session 跨连接存活，可重连、列出、提交、打断、rewind、branch 和关闭。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-plug"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.plugin.title">Plugin Runtime + LSP</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.plugin.desc">插件可事务式贡献 hooks、styles、themes、channels、LSP、monitors 与 settings；真实 <code class="text-amber-400">workspace/symbol</code> 与本地索引合并。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.review.title">本地 Review 证据</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.review.desc"><code class="text-amber-400">review run</code> 对 commit/PR diff 生成可审计 JSON，处理 rename、空格路径和 binary，并对 secret evidence 脱敏。</p>
+    </div>
   </div>
 </section>
 
@@ -266,7 +286,7 @@
     <div class="reveal">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.entry">入口层 · Entry</p>
       <div class="grid sm:grid-cols-2 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/cli</p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.cli">二进制入口：组装全部 crate、解析 CLI 参数、启动 TUI / REPL / 单次问答模式</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/cli</p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.cli">二进制入口：组装全部 crate、解析 CLI 参数，启动 TUI / REPL / Workflow / ACP / daemon / Review</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tui <span class="text-paper/30">· wyj-tui</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tui">ratatui 终端渲染：输入框、权限确认对话框、子 Agent 面板</p></div>
       </div>
     </div>
@@ -277,13 +297,13 @@
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/computer <span class="text-paper/30">· wyj-computer</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.computer">Computer-use 系统层：截图 + 鼠标键盘输入合成，坐标缩放数学独立可测</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/commands <span class="text-paper/30">· wyj-commands</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.commands">Slash 命令注册表与内置命令（/help、/compact 等）</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/mcp <span class="text-paper/30">· wyj-mcp</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.mcp">MCP 客户端桥接（stdio / http 传输）</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/store <span class="text-paper/30">· wyj-store</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.store">MCP / Skill / Plugin 安装元数据与市场客户端</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/store <span class="text-paper/30">· wyj-store</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.store">Extension 安装与 lockfile、Plugin runtime 事务激活、持久 LSP client、schedule</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/i18n <span class="text-paper/30">· wyj-i18n</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.i18n">多语言资源与运行时语言切换</p></div>
       </div>
     </div>
     <div class="reveal" style="transition-delay:80ms">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.core">核心层 · Core</p>
-      <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/core <span class="text-paper/30">· wyj-core</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.core">Agent 推理循环、Session、HistoryStore、MemoryStore、ClaudeMdLoader、上下文压缩</p></div>
+      <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/core <span class="text-paper/30">· wyj-core</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.core">Agent、Session runtime/events、权限、checkpoint、workspace/workflow 接口与本地 CodeIndex</p></div>
     </div>
     <div class="reveal" style="transition-delay:120ms">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.foundation">基础层 · Foundation</p>
@@ -432,8 +452,17 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.4.4</span>
+          <span class="font-display font-bold text-amber-500">v1.5.0</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v150">完整交付 P2：Workflow 编码节点从当前脏工作区 checkpoint 自动进入 managed worktree；新增 workspace review/accept 生命周期、schema v2 ACP/daemon 全局 session、真实 Plugin LSP workspace/symbol、事务式 Plugin runtime、本地 Review/CI，并整合 Markdown 网格、终端原生拖选与 OSC 8 超链接。国内模型无独立 probe Key 时仍保持 static_only。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-paper/70">v1.4.4</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v144">国内模型可信运行时与安全执行：能力目录/doctor、工具参数修复校验、同角色 fallback、ToolSearch lazy schema、checkpoint/rewind/branch、SubAgent 控制协议，以及 macOS Seatbelt / Linux bubblewrap sandbox。未使用已暴露的 MiniMax Key，国内模型当前保持 static_only，不冒充 live verified。</p>
       </div>
@@ -442,7 +471,7 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3"><span class="font-display font-bold text-paper/70">v1.4.2</span></div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v142">TUI 对齐 Codex 静态执行流：Thinking、工具结果和 Bash 输出默认最多显示 3 个视觉行，Edit/Write 自动展示彩色 diff；移除聊天消息选中、展开与 Ctrl+O，新增 Shift+↑ 显式进入内容区、聊天逐行滚动、Todo 单任务详情，以及上滚阅读时不抢视口的新消息提示。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v142">TUI 对齐 Codex 静态执行流：Thinking、工具结果和 Bash 输出默认最多显示 3 个视觉行，Edit/Write 自动展示彩色 diff；鼠标可直接拖选复制文字，无需 Shift；并新增聊天逐行滚动、Todo 单任务详情，以及上滚阅读时不抢视口的新消息提示。</p>
       </div>
     </div>
     <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:40ms">

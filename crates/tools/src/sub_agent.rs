@@ -27,6 +27,9 @@ pub struct SubAgentTool {
     defs: SharedAgentDefinitions,
     hub: Arc<SubAgentHub>,
     factory: AgentFactory,
+    caller_id: Option<u64>,
+    depth: usize,
+    max_depth: usize,
 }
 
 impl SubAgentTool {
@@ -39,6 +42,9 @@ impl SubAgentTool {
             defs: Arc::new(std::sync::RwLock::new((*defs).clone())),
             hub,
             factory: Arc::new(factory),
+            caller_id: None,
+            depth: 0,
+            max_depth: 3,
         }
     }
 
@@ -51,6 +57,9 @@ impl SubAgentTool {
             defs,
             hub,
             factory: Arc::new(factory),
+            caller_id: None,
+            depth: 0,
+            max_depth: 3,
         }
     }
 
@@ -78,6 +87,9 @@ impl SubAgentTool {
 
 #[derive(Deserialize)]
 struct Input {
+    #[serde(default = "default_action")]
+    action: String,
+    #[serde(default)]
     prompt: String,
     #[serde(default)]
     subagent_type: Option<String>,
@@ -90,6 +102,13 @@ struct Input {
     /// 覆盖类型定义的系统提示（可选，向后兼容旧调用格式）
     #[serde(default)]
     system: Option<String>,
+    /// message/interrupt/retry target.
+    #[serde(default)]
+    target_id: Option<u64>,
+}
+
+fn default_action() -> String {
+    "spawn".to_string()
 }
 
 /// 提取工具输入的主参数做一行摘要（UI 的"当前工具"展示用）
@@ -147,6 +166,11 @@ impl Tool for SubAgentTool {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["spawn", "message", "interrupt", "retry"],
+                        "default": "spawn"
+                    },
                     "subagent_type": {
                         "type": "string",
                         "enum": type_names,
@@ -167,9 +191,19 @@ impl Tool for SubAgentTool {
                     "system": {
                         "type": "string",
                         "description": "Optional system-prompt override for the sub-agent"
+                    },
+                    "target_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Target running agent id for message/interrupt/retry"
                     }
                 },
-                "required": ["description", "prompt"]
+                "anyOf": [
+                    {"required": ["description", "prompt"]},
+                    {"properties": {"action": {"const": "message"}}, "required": ["action", "target_id", "prompt"]},
+                    {"properties": {"action": {"enum": ["interrupt", "retry"]}}, "required": ["action", "target_id"]}
+                ],
+                "additionalProperties": false
             }),
             native: None,
         }
@@ -201,6 +235,26 @@ impl SubAgentTool {
     ) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
 
+        if inp.action != "spawn" {
+            return Ok(self.run_control(&inp));
+        }
+        if inp.prompt.trim().is_empty()
+            || inp
+                .description
+                .as_deref()
+                .map_or(true, |description| description.is_empty())
+        {
+            return Ok(ToolResult::err(
+                "Agent spawn requires non-empty description and prompt".to_string(),
+            ));
+        }
+        if self.depth >= self.max_depth {
+            return Ok(ToolResult::err(format!(
+                "Nested Agent depth limit ({}) reached",
+                self.max_depth
+            )));
+        }
+
         let type_name = inp.subagent_type.as_deref().unwrap_or("general-purpose");
         let Some(def) = self.find_def(type_name) else {
             return Ok(ToolResult::err(tr_fmt(
@@ -209,7 +263,7 @@ impl SubAgentTool {
             )));
         };
 
-        let agent = match (self.factory)(&def) {
+        let mut agent = match (self.factory)(&def) {
             Ok(a) => a,
             Err(e) => {
                 return Ok(ToolResult::err(tr_fmt(
@@ -218,13 +272,27 @@ impl SubAgentTool {
                 )))
             }
         };
-        let agent = match inp.system {
+        agent = match inp.system {
             Some(sys) => agent.with_system(sys),
             None => agent,
         };
 
         let background = inp.run_in_background.unwrap_or(false);
         let id = self.hub.alloc_id();
+        if def
+            .tools
+            .as_ref()
+            .map_or(true, |tools| tools.iter().any(|tool| tool == "Agent"))
+        {
+            agent.register_tool(Arc::new(Self {
+                defs: self.defs.clone(),
+                hub: self.hub.clone(),
+                factory: self.factory.clone(),
+                caller_id: Some(id),
+                depth: self.depth + 1,
+                max_depth: self.max_depth,
+            }));
+        }
         let agent_type = def.name.clone();
         let description = inp
             .description
@@ -235,6 +303,7 @@ impl SubAgentTool {
         // 与父 Agent 的 ToolStart 顺序一致（FIFO 配对的前提）。
         self.hub.emit(SubAgentEvent::Started {
             id,
+            parent_id: self.caller_id,
             agent_type: agent_type.clone(),
             description: description.clone(),
             background,
@@ -281,6 +350,7 @@ impl SubAgentTool {
         let parent_sandbox = ctx.sandbox_policy();
         let prompt = inp.prompt;
         let semaphore = self.hub.semaphore();
+        let parent_id = self.caller_id;
         let hub_task = self.hub.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<ToolResult>();
         let task_type = agent_type.clone();
@@ -290,7 +360,13 @@ impl SubAgentTool {
         let handle = tokio::spawn(async move {
             let start = Instant::now();
             // 并发上限：超限时在此排队（UI 期间显示为等待中）
-            let _permit = semaphore.acquire_owned().await;
+            // Root agents count against the global limit. Nested agents are bounded by depth and
+            // do not take another permit, preventing a parent-waits-for-child semaphore deadlock.
+            let _permit = if parent_id.is_none() {
+                semaphore.acquire_owned().await.ok()
+            } else {
+                None
+            };
 
             let mut session = Session::new();
             let mut next_input = Some(vec![ContentBlock::Text { text: prompt }]);
@@ -360,6 +436,19 @@ impl SubAgentTool {
                         AgentControl::FollowUp(content) => {
                             next_input.get_or_insert_with(Vec::new).extend(content);
                         }
+                        AgentControl::PeerMessage { from_id, content } => {
+                            next_input
+                                .get_or_insert_with(Vec::new)
+                                .push(ContentBlock::Text {
+                                    text: format!("<agent-message from=\"a{from_id}\">"),
+                                });
+                            next_input.get_or_insert_with(Vec::new).extend(content);
+                            next_input
+                                .get_or_insert_with(Vec::new)
+                                .push(ContentBlock::Text {
+                                    text: "</agent-message>".to_string(),
+                                });
+                        }
                         AgentControl::RetryLast => {
                             next_input
                                 .get_or_insert_with(Vec::new)
@@ -399,7 +488,8 @@ impl SubAgentTool {
             };
             let _ = result_tx.send(result);
         });
-        self.hub.register(id, background, None, control_tx, handle);
+        self.hub
+            .register(id, background, self.caller_id, control_tx, handle);
 
         if background {
             // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_done_reminder）
@@ -412,6 +502,45 @@ impl SubAgentTool {
                 // 任务被 abort（如用户 ESC 中断）：sender 被丢弃
                 Err(_) => Ok(ToolResult::err(tr("subagent.interrupted"))),
             }
+        }
+    }
+
+    fn run_control(&self, input: &Input) -> ToolResult {
+        let Some(target_id) = input.target_id else {
+            return ToolResult::err("Agent control action requires target_id".to_string());
+        };
+        let result = match input.action.as_str() {
+            "message" => {
+                let Some(from_id) = self.caller_id else {
+                    return ToolResult::err(
+                        "The root agent should use /agent-control follow-up; peer messaging is for running sub-agents"
+                            .to_string(),
+                    );
+                };
+                if input.prompt.trim().is_empty() {
+                    return ToolResult::err("Agent message requires prompt".to_string());
+                }
+                self.hub.send_peer_message(
+                    from_id,
+                    target_id,
+                    vec![ContentBlock::Text {
+                        text: input.prompt.clone(),
+                    }],
+                )
+            }
+            "interrupt" => self.hub.interrupt(target_id),
+            "retry" => self.hub.retry_last(target_id),
+            other => return ToolResult::err(format!("Unknown Agent action: {other}")),
+        };
+        match result {
+            crate::agent_hub::AgentControlResult::Accepted => ToolResult::ok(format!(
+                "Agent action {} accepted for a{}",
+                input.action, target_id
+            )),
+            other => ToolResult::err(format!(
+                "Agent action {} for a{} failed: {:?}",
+                input.action, target_id, other
+            )),
         }
     }
 }
@@ -441,6 +570,80 @@ mod tests {
     struct DelayedFollowUpProvider {
         calls: Arc<AtomicUsize>,
         observed_follow_up: Arc<AtomicBool>,
+    }
+
+    struct SpawnChildProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SpawnChildProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "nested-1".to_string(),
+                        name: "Agent".to_string(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "nested-1".to_string(),
+                        json_delta: serde_json::json!({
+                            "subagent_type": "child",
+                            "description": "nested child",
+                            "prompt": "finish child"
+                        })
+                        .to_string(),
+                    }),
+                    Ok(StreamEvent::ToolUseEnd {
+                        id: "nested-1".to_string(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ])))
+            } else {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("outer done".to_string())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ])))
+            }
+        }
+    }
+
+    struct EndProvider {
+        saw_agent_tool: Option<Arc<AtomicBool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for EndProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            if let Some(observed) = &self.saw_agent_tool {
+                observed.store(
+                    tools.iter().any(|tool| tool.name == "Agent"),
+                    Ordering::SeqCst,
+                );
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("child done".to_string())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])))
+        }
     }
 
     #[async_trait::async_trait]
@@ -541,5 +744,141 @@ mod tests {
         assert!(done.contains("turn-1"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(observed_follow_up.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn nested_agents_do_not_deadlock_when_all_root_permits_are_occupied() {
+        let defs = Arc::new(vec![
+            AgentDefinition {
+                name: "outer".to_string(),
+                description: "spawns a child".to_string(),
+                tools: Some(vec!["Agent".to_string()]),
+                model: None,
+                system_prompt: "outer".to_string(),
+                builtin: true,
+                source: None,
+            },
+            AgentDefinition {
+                name: "child".to_string(),
+                description: "leaf".to_string(),
+                tools: Some(Vec::new()),
+                model: None,
+                system_prompt: "child".to_string(),
+                builtin: true,
+                source: None,
+            },
+        ]);
+        let hub = Arc::new(SubAgentHub::new());
+        let tool = SubAgentTool::new(defs, hub.clone(), move |definition| {
+            if definition.name == "outer" {
+                Ok(Agent::new(Arc::new(SpawnChildProvider {
+                    calls: AtomicUsize::new(0),
+                })))
+            } else {
+                Ok(Agent::new(Arc::new(EndProvider {
+                    saw_agent_tool: None,
+                })))
+            }
+        });
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::ToolCtx::new(cwd.path());
+        let runs = (0..crate::agent_hub::MAX_CONCURRENT_SUBAGENTS).map(|index| {
+            tool.run(
+                serde_json::json!({
+                    "subagent_type": "outer",
+                    "description": format!("outer {index}"),
+                    "prompt": "spawn child"
+                }),
+                &ctx,
+            )
+        });
+        let results = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            futures::future::join_all(runs),
+        )
+        .await
+        .expect("nested sub-agents deadlocked while roots held all permits");
+        assert!(results
+            .into_iter()
+            .all(|result| result.is_ok_and(|result| !result.is_error)));
+        assert_eq!(hub.background_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_tool_is_not_injected_when_definition_whitelist_excludes_it() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let provider_observed = observed.clone();
+        let tool = SubAgentTool::new(
+            Arc::new(vec![AgentDefinition {
+                name: "leaf".to_string(),
+                description: "leaf".to_string(),
+                tools: Some(vec!["Read".to_string()]),
+                model: None,
+                system_prompt: "leaf".to_string(),
+                builtin: true,
+                source: None,
+            }]),
+            Arc::new(SubAgentHub::new()),
+            move |_| {
+                Ok(Agent::new(Arc::new(EndProvider {
+                    saw_agent_tool: Some(provider_observed.clone()),
+                })))
+            },
+        );
+        let cwd = tempfile::tempdir().unwrap();
+        let result = tool
+            .run(
+                serde_json::json!({
+                    "subagent_type": "leaf",
+                    "description": "leaf task",
+                    "prompt": "finish"
+                }),
+                &crate::ctx::ToolCtx::new(cwd.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert!(!observed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn nested_spawn_stops_at_the_configured_depth_limit() {
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let calls = factory_calls.clone();
+        let tool = SubAgentTool {
+            defs: Arc::new(std::sync::RwLock::new(vec![AgentDefinition {
+                name: "general-purpose".to_string(),
+                description: "test".to_string(),
+                tools: None,
+                model: None,
+                system_prompt: "test".to_string(),
+                builtin: true,
+                source: None,
+            }])),
+            hub: Arc::new(SubAgentHub::new()),
+            factory: Arc::new(move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Agent::new(Arc::new(EndProvider {
+                    saw_agent_tool: None,
+                })))
+            }),
+            caller_id: Some(7),
+            depth: 3,
+            max_depth: 3,
+        };
+        let cwd = tempfile::tempdir().unwrap();
+        let result = tool
+            .run(
+                serde_json::json!({
+                    "description": "too deep",
+                    "prompt": "spawn"
+                }),
+                &crate::ctx::ToolCtx::new(cwd.path()),
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains("depth limit"));
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.4.4"
+version = "1.5.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["owen"]
@@ -26,7 +26,7 @@ rust-version = "1.80"
 
 [workspace.dependencies]
 # 异步运行时
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "net", "sync", "time", "signal"] }
 # HTTP + SSE
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # 序列化

@@ -15,10 +15,14 @@ use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
 };
 
+mod acp;
 mod extensions_cmd;
+mod review_cmd;
 mod schedule_cmd;
 mod trust_cmd;
 mod update_cmd;
+mod workflow_cmd;
+mod workspace_cmd;
 
 #[derive(Parser, Debug)]
 #[command(name = "wyj-code", version = env!("CARGO_PKG_VERSION"),
@@ -67,6 +71,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run an Agent Client Protocol v1 adapter over stdin/stdout.
+    #[command(name = "acp")]
+    Acp,
+    /// Run the ACP session daemon over a local TCP listener.
+    #[command(name = "daemon")]
+    Daemon {
+        #[arg(long, default_value = "127.0.0.1:61337")]
+        listen: String,
+    },
     #[command(about = wyj_i18n::tr("cli.update_about"))]
     Update {
         #[arg(short = 'y', long, help = wyj_i18n::tr("cli.update_yes_help"))]
@@ -118,6 +131,31 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage isolated Git worktrees used by coding agents.
+    #[command(name = "workspace")]
+    Workspace {
+        #[command(subcommand)]
+        command: workspace_cmd::WorkspaceCommand,
+    },
+    /// Validate, run, inspect and control dynamic Agent workflows.
+    #[command(name = "workflow")]
+    Workflow {
+        #[command(subcommand)]
+        command: workflow_cmd::WorkflowCommand,
+    },
+    /// Produce local, machine-readable review evidence for a commit or PR diff.
+    #[command(name = "review")]
+    Review {
+        #[command(subcommand)]
+        command: review_cmd::ReviewCommand,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeCommand {
+    Acp,
+    Daemon { listen: String },
+    WorkflowRun { file: PathBuf, json: bool },
 }
 
 #[derive(Subcommand, Debug)]
@@ -679,6 +717,74 @@ fn build_fallback_routes(
         .collect()
 }
 
+fn workflow_parent_ceiling_from_args(
+    cwd: &Path,
+    allowed_tools: &[String],
+    write_roots: &[PathBuf],
+    allowed_domains: &[String],
+    require_sandbox: bool,
+) -> Result<wyj_core::WorkflowPermissionCeiling> {
+    let mut tools = if allowed_tools.is_empty() {
+        let registry = ToolRegistry::standard();
+        registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>()
+    } else {
+        allowed_tools.to_vec()
+    };
+    for name in ["CodeSearch", "AskQuestion", "TodoWrite", "Agent"] {
+        if allowed_tools.is_empty() && !tools.iter().any(|tool| tool == name) {
+            tools.push(name.to_string());
+        }
+    }
+    tools.sort();
+    tools.dedup();
+    let context = ToolCtx::new(cwd);
+    for root in write_roots {
+        context
+            .allow_write_root(root)
+            .map_err(|error| anyhow::anyhow!("--allow-write {}: {error}", root.display()))?;
+    }
+    let policy = context.permission_policy.read().unwrap();
+    Ok(wyj_core::WorkflowPermissionCeiling {
+        allowed_tools: tools,
+        write_roots: policy.allowed_write_roots.clone(),
+        allowed_domains: allowed_domains.to_vec(),
+        require_sandbox,
+    })
+}
+
+fn workflow_parent_ceiling(
+    registry: &ToolRegistry,
+    context: &ToolCtx,
+) -> wyj_core::WorkflowPermissionCeiling {
+    let mode = context.permission_mode.read().unwrap().clone();
+    let mut allowed_tools: Vec<String> = registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .filter(|name| match &mode {
+            PermissionMode::Allowlist(allowed) | PermissionMode::Plan(allowed) => {
+                allowed.contains(name)
+            }
+            PermissionMode::Prompt | PermissionMode::AutoApprove => true,
+        })
+        .collect();
+    allowed_tools.sort();
+    allowed_tools.dedup();
+    let policy = context.permission_policy.read().unwrap();
+    let mut allowed_domains: Vec<String> = policy.allowed_domains.iter().cloned().collect();
+    allowed_domains.sort();
+    wyj_core::WorkflowPermissionCeiling {
+        allowed_tools,
+        write_roots: policy.allowed_write_roots.clone(),
+        allowed_domains,
+        require_sandbox: policy.require_sandbox,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
@@ -692,9 +798,14 @@ async fn main() -> Result<()> {
 
     let mut cli = Cli::parse();
     let profile_was_explicit = cli.profile.is_some();
+    let mut runtime_command = None;
 
     if let Some(cmd) = cli.command.take() {
         match cmd {
+            Commands::Acp => runtime_command = Some(RuntimeCommand::Acp),
+            Commands::Daemon { listen } => {
+                runtime_command = Some(RuntimeCommand::Daemon { listen })
+            }
             Commands::Update { yes } => return update_cmd::run(yes).await,
             Commands::SubagentTrace {
                 session_id,
@@ -716,6 +827,29 @@ async fn main() -> Result<()> {
             Commands::Model { command } => return run_model_command(command, &cfg).await,
             Commands::Session { command } => return run_session_command(command),
             Commands::Sandbox { json } => return print_sandbox_report(&cfg.sandbox, json),
+            Commands::Workspace { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return workspace_cmd::run(command, &cwd);
+            }
+            Commands::Workflow { command } if workflow_cmd::is_run(&command) => {
+                let (file, json) = workflow_cmd::run_args(command)?;
+                runtime_command = Some(RuntimeCommand::WorkflowRun { file, json });
+            }
+            Commands::Workflow { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                let parent = workflow_parent_ceiling_from_args(
+                    &cwd,
+                    &cli.allowed_tools,
+                    &cli.allow_write,
+                    &cli.allow_network,
+                    cli.require_sandbox,
+                )?;
+                return workflow_cmd::run_offline(command, &cwd, &parent);
+            }
+            Commands::Review { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return review_cmd::run(command, &cwd);
+            }
         }
     }
 
@@ -727,7 +861,13 @@ async fn main() -> Result<()> {
     // ratatui 的绘制 diff 范围内，后续帧不会自动清除这些残留字符，导致画面持续
     // 错乱、键盘输入看起来毫无反应（实际是渲染状态错位，不是真的卡死）。
     // headless/-p/--config-status 没有 alternate screen，继续写 stdout 没有这个问题。
-    let is_tui_mode = !cli.headless && cli.prompt.is_none() && !cli.config_status;
+    let is_protocol_mode = matches!(
+        &runtime_command,
+        Some(RuntimeCommand::Acp | RuntimeCommand::Daemon { .. })
+    );
+    let is_runtime_mode = runtime_command.is_some();
+    let is_tui_mode =
+        !is_runtime_mode && !cli.headless && cli.prompt.is_none() && !cli.config_status;
     let log_writer = if is_tui_mode {
         match open_tui_log_file() {
             Ok(file) => tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || {
@@ -735,6 +875,8 @@ async fn main() -> Result<()> {
             }),
             Err(_) => tracing_subscriber::fmt::writer::BoxMakeWriter::new(io::sink),
         }
+    } else if is_runtime_mode {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(io::stderr)
     } else {
         tracing_subscriber::fmt::writer::BoxMakeWriter::new(io::stdout)
     };
@@ -826,6 +968,51 @@ async fn main() -> Result<()> {
 
     let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
     let config_base = wyj_config::config_dir()?;
+
+    // --plugin-dir is an explicit, process-local development plugin. Runtime contributions use
+    // the same activation path as installed plugins but are never persisted.
+    let local_plugin: Option<wyj_store::lockfile::PluginContributions> = match &cli.plugin_dir {
+        Some(path) => {
+            let manifest = wyj_store::plugin_install::load_local_plugin(path)?;
+            Some(wyj_store::plugin_install::resolve_contributions(
+                &manifest, path,
+            ))
+        }
+        None => None,
+    };
+    let local_runtime = cli
+        .plugin_dir
+        .as_deref()
+        .zip(local_plugin.as_ref())
+        .map(|(root, contributions)| ("local-dev", root, contributions));
+    let plugin_runtime = Arc::new(
+        wyj_store::plugin_runtime::PluginRuntimeCatalog::load_with_local(&cwd, local_runtime),
+    );
+    for warning in &plugin_runtime.warnings {
+        eprintln!("[plugin] {warning}");
+    }
+    if let Some(theme) = plugin_runtime.active_theme() {
+        if let Err(error) = wyj_tui::apply_theme_json(&theme.palette) {
+            eprintln!("[plugin {} theme {}] {error}", theme.plugin, theme.name);
+        }
+    }
+    let plugin_processes = Arc::new(wyj_store::plugin_runtime::PluginProcessSupervisor::start(
+        &plugin_runtime,
+    ));
+
+    let base_code_index: Arc<dyn wyj_core::CodeIndex> = Arc::new(wyj_core::ProjectCodeIndex::new(
+        &cwd,
+        config_base
+            .join("indexes")
+            .join(wyj_core::project_id(&cwd))
+            .join("lexical-v1.json"),
+    )?);
+    let code_index: Arc<dyn wyj_core::CodeIndex> =
+        Arc::new(wyj_store::plugin_runtime::PluginCodeIndex::new(
+            base_code_index,
+            plugin_runtime.clone(),
+            plugin_processes.clone(),
+        ));
 
     let history_store = HistoryStore::new(config_base.join("history")).ok();
     let session_store = SessionStore::new(config_base.join("sessions")).ok();
@@ -964,6 +1151,7 @@ async fn main() -> Result<()> {
 
     // 始终注册全部工具（模式过滤在运行时由 ToolCtx.permission_mode 负责，支持运行时切换）
     let mut registry = ToolRegistry::standard();
+    registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let tool_ctx = ToolCtx::new(&cwd);
@@ -972,6 +1160,10 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow::anyhow!("sandbox config: {error}"))?;
     tool_ctx.set_execution_surface(if cli.prompt.is_some() {
         ExecutionSurface::SinglePrompt
+    } else if is_protocol_mode {
+        ExecutionSurface::AcpClient
+    } else if is_runtime_mode {
+        ExecutionSurface::SubAgent
     } else if cli.headless {
         ExecutionSurface::HeadlessRepl
     } else {
@@ -996,7 +1188,11 @@ async fn main() -> Result<()> {
 
     // Hooks 生命周期自动化：按 `~/.claude/settings.json` + 项目 `.claude/settings.json`
     // + `.claude/settings.local.json` 三源合并加载。`--no-hooks` 时构造空 runner。
-    let hook_runner = Arc::new(HookRunner::load(&cwd, !cli.no_hooks));
+    let hook_runner = Arc::new(HookRunner::load_with_additional(
+        &cwd,
+        !cli.no_hooks,
+        [plugin_runtime.hooks.clone()],
+    ));
     if hook_runner.is_enabled() && hook_runner.has_any() {
         eprintln!(
             "{}",
@@ -1012,6 +1208,7 @@ async fn main() -> Result<()> {
                 "Read",
                 "Glob",
                 "Grep",
+                "CodeSearch",
                 "WebFetch",
                 "WebSearch",
                 "AskQuestion",
@@ -1059,18 +1256,6 @@ async fn main() -> Result<()> {
     register_window_capture_tool_if_enabled(&mut registry, &cfg);
     register_app_computer_tool_if_enabled(&mut registry, &cfg);
 
-    // --plugin-dir：临时加载本地开发插件（不落盘、不经过 marketplace/lockfile，
-    // 仅当次进程生效），与 TUI「添加本地插件」的持久化路径是两条独立路径。
-    let local_plugin: Option<wyj_store::lockfile::PluginContributions> = match &cli.plugin_dir {
-        Some(path) => {
-            let manifest = wyj_store::plugin_install::load_local_plugin(path)?;
-            Some(wyj_store::plugin_install::resolve_contributions(
-                &manifest, path,
-            ))
-        }
-        None => None,
-    };
-
     // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
     // + 已启用插件贡献的 agent 定义 + --plugin-dir 临时加载的 agent 定义
     let mut plugin_agent_paths = wyj_store::plugin_install::enabled_plugin_agent_paths(&cwd);
@@ -1095,8 +1280,12 @@ async fn main() -> Result<()> {
     // MCP 连接时机不同，但都在工具注册成功时 push 进这个句柄，供子 Agent
     // 工厂与 `/model` 重建共同读取（子 Agent 只能看到 spawn 时刻已连好的）。
     let mcp_tools: wyj_tools::SharedMcpTools = Arc::new(std::sync::RwLock::new(Vec::new()));
-    let sub_agent_factory =
-        make_sub_agent_factory(cfg.clone(), claude_md_loader.clone(), mcp_tools.clone());
+    let sub_agent_factory = make_sub_agent_factory(
+        cfg.clone(),
+        claude_md_loader.clone(),
+        mcp_tools.clone(),
+        code_index.clone(),
+    );
     registry.register_arc(Arc::new(SubAgentTool::new_shared(
         shared_agent_defs.clone(),
         sub_agent_hub.clone(),
@@ -1240,6 +1429,19 @@ async fn main() -> Result<()> {
         agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
+    }
+
+    // Active plugin output style is a model-facing instruction, independent of UI locale. Keep
+    // it out of `system_prompt_extra`: rebuild_fn installs it directly so scoped/headless model
+    // switches receive the same style without the TUI appending it twice.
+    let plugin_output_style = plugin_runtime.active_output_style().map(|style| {
+        format!(
+            "<plugin-output-style plugin=\"{}\" name=\"{}\">\n{}\n</plugin-output-style>",
+            style.plugin, style.name, style.content
+        )
+    });
+    if let Some(style) = &plugin_output_style {
+        agent = agent.append_system(style.clone());
     }
 
     // headless/单次问答模式没有 UI 可交互，AskQuestion 会被自动取消：
@@ -1421,6 +1623,8 @@ async fn main() -> Result<()> {
     let hook_runner_for_rebuild = hook_runner.clone();
     let checkpoint_store_for_rebuild = checkpoint_store.clone();
     let mcp_tools_for_rebuild = mcp_tools.clone();
+    let code_index_for_rebuild = code_index.clone();
+    let plugin_output_style_for_rebuild = plugin_output_style.clone();
     let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
         let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
         let routing_role = if cfg.active_profile().plan_model.as_deref() == Some(new_model) {
@@ -1452,6 +1656,9 @@ async fn main() -> Result<()> {
             )
             .with_claude_md(claude_md_for_rebuild.clone())
             .with_hooks(hook_runner_for_rebuild.clone());
+        if let Some(style) = &plugin_output_style_for_rebuild {
+            new_agent = new_agent.append_system(style.clone());
+        }
         if let Some(store) = &checkpoint_store_for_rebuild {
             new_agent = new_agent.with_checkpoint_store(store.clone());
         }
@@ -1470,6 +1677,9 @@ async fn main() -> Result<()> {
                 .with_session_id(sid_for_rebuild.clone());
         }
         let mut reg = ToolRegistry::standard();
+        reg.register_arc(Arc::new(wyj_core::CodeSearchTool::new(
+            code_index_for_rebuild.clone(),
+        )));
         reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
         reg.register_arc(Arc::new(AskQuestionTool::new()));
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -1485,6 +1695,7 @@ async fn main() -> Result<()> {
             cfg.clone(),
             claude_md_for_rebuild.clone(),
             mcp_tools_for_rebuild.clone(),
+            code_index_for_rebuild.clone(),
         );
         reg.register_arc(Arc::new(SubAgentTool::new_shared(
             agent_defs_for_rebuild.clone(),
@@ -1509,7 +1720,46 @@ async fn main() -> Result<()> {
         Ok(new_agent)
     });
 
-    if let Some(prompt) = cli.prompt {
+    let run_result = if let Some(command) = runtime_command {
+        match command {
+            RuntimeCommand::Acp => {
+                acp::run_stdio(
+                    agent,
+                    tool_ctx,
+                    cwd,
+                    session_store_arc.clone(),
+                    plugin_runtime.clone(),
+                )
+                .await
+            }
+            RuntimeCommand::Daemon { listen } => {
+                acp::run_daemon(
+                    &listen,
+                    agent,
+                    tool_ctx,
+                    cwd,
+                    session_store_arc.clone(),
+                    plugin_runtime.clone(),
+                )
+                .await
+            }
+            RuntimeCommand::WorkflowRun { file, json } => {
+                let parent = workflow_parent_ceiling(&registry, &tool_ctx);
+                workflow_cmd::run_workflow(
+                    file,
+                    json,
+                    cwd,
+                    parent,
+                    tool_ctx,
+                    sub_agent_factory.clone(),
+                    shared_agent_defs.clone(),
+                    code_index.clone(),
+                    plugin_output_style.clone(),
+                )
+                .await
+            }
+        }
+    } else if let Some(prompt) = cli.prompt {
         let mut session = Session::new();
         if let Some(file) = session_store_arc
             .as_ref()
@@ -1526,12 +1776,26 @@ async fn main() -> Result<()> {
         session.push_user(prompt);
         let turns = session.messages.len();
         let started = std::time::Instant::now();
-        agent
+        let turn_result = agent
             .run_turn(&mut session, &tool_ctx, &mut |d| {
                 print!("{d}");
                 let _ = io::stdout().flush();
             })
-            .await?;
+            .await;
+        emit_plugin_turn_event(
+            &plugin_runtime,
+            if turn_result.is_ok() {
+                "turn_finished"
+            } else {
+                "turn_error"
+            },
+            &session_id,
+            &cwd,
+            &session,
+            turn_result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
+        turn_result?;
         println!();
         // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
         // 供 benchmarks/run.sh 解析做改进前后对比。先补一个换行：thinking
@@ -1608,6 +1872,7 @@ async fn main() -> Result<()> {
                 title_generated: false,
             });
         }
+        Ok(())
     } else if cli.headless {
         repl(
             agent,
@@ -1625,8 +1890,9 @@ async fn main() -> Result<()> {
             !cli.no_hooks,
             mcp_tools.clone(),
             sub_agent_hub.clone(),
+            plugin_runtime.clone(),
         )
-        .await?;
+        .await
     } else {
         wyj_tui::run_tui(
             agent,
@@ -1646,10 +1912,12 @@ async fn main() -> Result<()> {
             local_plugin.clone(),
             mcp_tools.clone(),
             shared_agent_defs,
+            plugin_runtime.clone(),
         )
-        .await?;
-    }
-    Ok(())
+        .await
+    };
+    plugin_processes.shutdown();
+    run_result
 }
 
 /// 按 agent 定义的 `tools` 白名单（`None` 表示不限制）从给定 registry 里选出
@@ -1776,6 +2044,7 @@ fn make_sub_agent_factory(
     cfg: Config,
     claude_md: Arc<wyj_core::ClaudeMdLoader>,
     mcp_tools: wyj_tools::SharedMcpTools,
+    code_index: Arc<dyn wyj_core::CodeIndex>,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
         let routing_role = if def.name.eq_ignore_ascii_case("explore") {
@@ -1852,6 +2121,7 @@ fn make_sub_agent_factory(
         }
 
         let mut sub_registry = ToolRegistry::standard();
+        sub_registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
         // WebSearch：与主 Agent 同样的"仅配置了 search_api_key 才注册"语义，
         // 让子 Agent 类型定义（如 general-purpose 的 tools: None）能拿到它。
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -2164,6 +2434,30 @@ fn refresh_mcp_runtime(
     apply_mcp_runtime_snapshot(shared_agent, mcp_tools);
 }
 
+async fn emit_plugin_turn_event(
+    runtime: &wyj_store::plugin_runtime::PluginRuntimeCatalog,
+    event: &str,
+    session_id: &str,
+    cwd: &Path,
+    session: &Session,
+    error: Option<String>,
+) {
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "input_tokens": session.total_input_tokens,
+        "output_tokens": session.total_output_tokens,
+        "tool_schema_tokens": session.tool_schema_tokens,
+        "tool_schema_tokens_saved": session.tool_schema_tokens_saved,
+        "error": error,
+    });
+    for result in runtime.emit_channel_event(event, &payload).await {
+        if !result.success {
+            tracing::warn!("plugin channel {} failed: {}", result.name, result.output);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn repl(
     agent: Agent,
@@ -2181,6 +2475,7 @@ async fn repl(
     hooks_enabled: bool,
     mcp_tools: wyj_tools::SharedMcpTools,
     sub_agent_hub: Arc<wyj_tools::SubAgentHub>,
+    plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
@@ -2260,22 +2555,28 @@ async fn repl(
         // ── ! Bash 内联执行 ──────────────────────────────────────────────────
         if let Some(cmd_str) = trimmed.strip_prefix('!') {
             let cmd_str = cmd_str.trim();
-            use std::process::Command;
-            match Command::new("sh").arg("-c").arg(cmd_str).output() {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    if !stdout.is_empty() {
-                        print!("{stdout}");
+            let sandbox_policy = ctx.sandbox_policy.read().unwrap().clone();
+            match wyj_sandbox::SandboxRunner::detect().shell_command(cmd_str, &cwd, &sandbox_policy)
+            {
+                Ok(mut command) => match command.output() {
+                    Ok(out) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        if !stdout.is_empty() {
+                            print!("{stdout}");
+                        }
+                        if !stderr.is_empty() {
+                            eprint!("{stderr}");
+                        }
+                        if !out.status.success() {
+                            eprintln!("[exit {}]", out.status.code().unwrap_or(-1));
+                        }
                     }
-                    if !stderr.is_empty() {
-                        eprint!("{stderr}");
-                    }
-                    if !out.status.success() {
-                        eprintln!("[exit {}]", out.status.code().unwrap_or(-1));
-                    }
+                    Err(error) => eprintln!("执行失败: {error}"),
+                },
+                Err(error) => {
+                    eprintln!("Sandbox 拒绝内联命令：{error}；headless 不提供无隔离降级审批");
                 }
-                Err(e) => eprintln!("执行失败: {e}"),
             }
             continue;
         }
@@ -2529,13 +2830,26 @@ async fn repl(
                     turns += 1;
                     println!();
                     let agent_snapshot = shared_agent.read().unwrap().clone();
-                    if let Err(e) = agent_snapshot
+                    let run_result = agent_snapshot
                         .run_turn(&mut session, &ctx, &mut |d| {
                             print!("{d}");
                             let _ = io::stdout().flush();
                         })
-                        .await
-                    {
+                        .await;
+                    emit_plugin_turn_event(
+                        &plugin_runtime,
+                        if run_result.is_ok() {
+                            "turn_finished"
+                        } else {
+                            "turn_error"
+                        },
+                        &session_id,
+                        &cwd,
+                        &session,
+                        run_result.as_ref().err().map(ToString::to_string),
+                    )
+                    .await;
+                    if let Err(e) = run_result {
                         eprintln!("\n[错误] {e}");
                     }
                     println!();
@@ -2590,6 +2904,19 @@ async fn repl(
                         })
                         .await;
                     ctx.set_permission_mode(prev_mode);
+                    emit_plugin_turn_event(
+                        &plugin_runtime,
+                        if run_result.is_ok() {
+                            "turn_finished"
+                        } else {
+                            "turn_error"
+                        },
+                        &session_id,
+                        &cwd,
+                        &session,
+                        run_result.as_ref().err().map(ToString::to_string),
+                    )
+                    .await;
                     if let Err(e) = run_result {
                         eprintln!("\n[错误] {e}");
                     }
@@ -2668,13 +2995,26 @@ async fn repl(
         turns += 1;
         println!();
         let agent_snapshot = shared_agent.read().unwrap().clone();
-        if let Err(e) = agent_snapshot
+        let run_result = agent_snapshot
             .run_turn(&mut session, &ctx, &mut |d| {
                 print!("{d}");
                 let _ = io::stdout().flush();
             })
-            .await
-        {
+            .await;
+        emit_plugin_turn_event(
+            &plugin_runtime,
+            if run_result.is_ok() {
+                "turn_finished"
+            } else {
+                "turn_error"
+            },
+            &session_id,
+            &cwd,
+            &session,
+            run_result.as_ref().err().map(ToString::to_string),
+        )
+        .await;
+        if let Err(e) = run_result {
             eprintln!("\n[错误] {e}");
         }
         println!();

@@ -159,8 +159,10 @@ help:
     - `Ctrl+U` — 删除光标到行首
     - `Ctrl+W` — 删除前一个词
     - `↑` / `↓` — 浏览输入历史；多行输入中先移动光标，到首行/末行后切换历史
-    - `Shift+↑` — 从输入框进入内容区；↑/↓ 在聊天、任务、SubAgent 间连续导航，Enter/Space 进入任务/SubAgent 详情，Esc 逐级返回
+    - `PageUp` / `PageDown` — 上下翻阅当前会话内容
+    - `鼠标拖拽` — 直接选中终端文字，无需按住 Shift
     - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
+    - `Command+点击` / `Ctrl+点击` — 打开回复中的本地文件路径或网页链接
     - `/` — 命令补全（Tab 确认，Esc 取消）
     - `!<命令>` — 直接执行 Bash 命令
 
@@ -172,6 +174,9 @@ help:
     - `Plan` — 只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
     - `Bypass` — 跳过所有权限确认，自动批准工具调用
   custom_commands_header: "自定义命令"
+
+hyperlink:
+  open_failed: "打开链接失败：{error}"
 
 clear:
   desc: "清空当前对话历史"

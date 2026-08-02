@@ -371,6 +371,15 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     if let Some(dialog) = &state.schedule_dialog {
         draw_schedule_dialog(f, dialog, state.input_owner, area);
     }
+
+    // 所有浮层都完成后再扫描最终 Buffer，避免被面板覆盖的聊天链接仍落在坐标表中。
+    // backend 会在 Buffer diff 之后注入 OSC 8，不影响这里的宽度与换行计算。
+    crate::hyperlink::linkify_buffer(
+        f.buffer_mut(),
+        chunks[0],
+        &state.cwd,
+        &state.hyperlink_registry,
+    );
 }
 
 /// 底部面板类型与高度
@@ -1066,7 +1075,7 @@ fn push_inline_todo_lines(
         Span::styled(
             title,
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ),
         if collapsible {
@@ -1100,7 +1109,8 @@ fn push_inline_todo_lines(
         }
         let selected_style = |st: Style| -> Style {
             if is_selected {
-                st.bg(Theme::SELECTED_BG).add_modifier(Modifier::BOLD)
+                st.bg(Theme::selected_bg_color())
+                    .add_modifier(Modifier::BOLD)
             } else {
                 st
             }
@@ -1251,7 +1261,7 @@ fn push_todo_detail_lines(
     detail_lines.push(Line::from(Span::styled(
         "  execution",
         Style::default()
-            .fg(Theme::CLAUDE)
+            .fg(Theme::claude_color())
             .add_modifier(Modifier::BOLD),
     )));
 
@@ -1334,12 +1344,12 @@ fn push_inline_ask_question_lines(
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  AskQuestion", Style::default().fg(Theme::CLAUDE)),
+        Span::styled("  AskQuestion", Style::default().fg(Theme::claude_color())),
         Span::styled("  ", Theme::dim()),
         Span::styled(
             title,
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1633,7 +1643,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         .title(Span::styled(
             title,
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -1670,7 +1680,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         let is_selected = selected_idx == Some(start + row_i);
         let sel_bg = |mut st: Style| -> Style {
             if is_selected {
-                st = st.bg(Theme::SELECTED_BG);
+                st = st.bg(Theme::selected_bg_color());
             }
             st
         };
@@ -1906,33 +1916,31 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
         let suffix = thinking_status_suffix(state);
         (
             format!(" {frame} {op}{suffix} · esc to interrupt "),
-            Style::default().fg(Theme::CLAUDE),
+            Style::default().fg(Theme::claude_color()),
         )
     } else if is_bang {
         (
             " $ bash · Enter to run ".to_string(),
             Style::default()
-                .fg(Theme::SUCCESS)
+                .fg(Theme::success_color())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         match &state.mode {
             AgentMode::Plan => (
-                " [plan] Enter to send · ↑↓ history · Shift+↑ content · Shift+Tab mode "
-                    .to_string(),
+                " [plan] Enter to send · ↑↓ history · Shift+Tab mode ".to_string(),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ),
             AgentMode::Bypass => (
-                " [bypass] Enter to send · ↑↓ history · Shift+↑ content · Shift+Tab mode "
-                    .to_string(),
+                " [bypass] Enter to send · ↑↓ history · Shift+Tab mode ".to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
             AgentMode::Normal => (
-                " Enter to send · Shift+Enter newline · ↑↓ history · Shift+↑ content · / commands · ! bash · Shift+Tab mode ".to_string(),
+                " Enter to send · Shift+Enter newline · ↑↓ history · / commands · ! bash · Shift+Tab mode ".to_string(),
                 Theme::dim(),
             ),
         }
@@ -1940,7 +1948,7 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     title_content = truncate_line(&title_content, area.width.saturating_sub(2) as usize);
 
     let border_style = if is_bang {
-        Style::default().fg(Theme::SUCCESS)
+        Style::default().fg(Theme::success_color())
     } else {
         match &state.mode {
             AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
@@ -1958,7 +1966,7 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     f.render_widget(block, area);
 
     let text_style = if is_bang {
-        Style::default().fg(Theme::SUCCESS)
+        Style::default().fg(Theme::success_color())
     } else {
         Theme::input_box()
     };
@@ -2156,14 +2164,14 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(
                         name_pad,
                         Style::default()
-                            .bg(Theme::SELECTED_BG)
+                            .bg(Theme::selected_bg_color())
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         desc_str,
                         Style::default()
-                            .bg(Theme::SELECTED_BG)
+                            .bg(Theme::selected_bg_color())
                             .fg(Color::Rgb(180, 200, 255)),
                     ),
                 ])
@@ -2285,7 +2293,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         Span::styled(
             " ◆ ",
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(state.model_name.clone(), Theme::dim()),
@@ -2434,7 +2442,7 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
                 truncate_line(text, max_w.saturating_sub(8))
             ),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
@@ -2451,7 +2459,7 @@ fn plan_option_row(idx: usize, cursor: usize, label: &str, max_w: usize) -> Line
         Line::from(Span::styled(
             format!("▶ {}", truncate_line(label, max_w.saturating_sub(2))),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -2532,7 +2540,7 @@ fn build_answering_lines(
         let text = input.lines.first().map(|s| s.as_str()).unwrap_or("");
         lines.push(Line::from(Span::styled(
             format!("> {}_", truncate_line(text, max_w.saturating_sub(2))),
-            Style::default().fg(Theme::CLAUDE),
+            Style::default().fg(Theme::claude_color()),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -2560,7 +2568,7 @@ fn build_answering_lines(
             lines.push(Line::from(Span::styled(
                 format!("  ▶ {}", truncate_line(&label, max_w.saturating_sub(4))),
                 Style::default()
-                    .fg(Theme::CLAUDE)
+                    .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
@@ -2586,7 +2594,7 @@ fn build_answering_lines(
                 truncate_line(&other_label, max_w.saturating_sub(4))
             ),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
@@ -2624,7 +2632,7 @@ fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> 
         let title = format!("Q{} {header}{}", i + 1, spec.question);
         let style = if i == index {
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
@@ -2654,7 +2662,7 @@ fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> 
         (
             "▶ ",
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -2689,14 +2697,14 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             wyj_i18n::tr_fmt(
                 "dialog.session_picker_title",
                 &[("count", &n_sessions.to_string())],
             ),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -2764,7 +2772,7 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
                 lines.push(Line::from(Span::styled(
                     line_str,
                     Style::default()
-                        .bg(Theme::SELECTED_BG)
+                        .bg(Theme::selected_bg_color())
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 )));
@@ -2819,11 +2827,11 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr("settings.title")),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -2886,11 +2894,11 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             wyj_i18n::tr("memory.dialog.title"),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -3028,11 +3036,11 @@ fn draw_mcp_dialog(
     });
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} — {} ", wyj_i18n::tr("mcp.dialog.title"), tab_label),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -3307,11 +3315,11 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
     });
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} — {} ", wyj_i18n::tr("skills.dialog.title"), tab_label),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -3512,11 +3520,11 @@ fn draw_plugins_dialog(f: &mut Frame, dialog: &PluginsDialog, area: Rect) {
     });
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} — {} ", wyj_i18n::tr("plugins.dialog.title"), tab_label),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -3764,11 +3772,11 @@ fn draw_agents_dialog(f: &mut Frame, dialog: &mut AgentsDialog, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr("agents.dialog.title")),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -3921,11 +3929,11 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
     f.render_widget(Clear, dialog_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             " Extensions ",
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -4102,11 +4110,11 @@ fn draw_import_dialog(f: &mut Frame, dialog: &ImportDialog, area: Rect) {
     f.render_widget(Clear, dialog_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr("import.dialog.title")),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -4276,11 +4284,11 @@ fn draw_profile_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr("profile.title")),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -4350,7 +4358,7 @@ fn draw_profile_dialog(
         let text = truncate_line(&text, w);
 
         let style = if editing {
-            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
+            Style::default().fg(Color::Black).bg(Theme::claude_color())
         } else if selected_row {
             Theme::selected_row()
         } else {
@@ -4454,11 +4462,11 @@ fn draw_schedule_dialog(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr("schedule.title")),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(dialog_area);
@@ -4543,7 +4551,7 @@ fn draw_schedule_dialog(
         let text = truncate_line(&text, w);
 
         let style = if editing {
-            Style::default().fg(Color::Black).bg(Theme::CLAUDE)
+            Style::default().fg(Color::Black).bg(Theme::claude_color())
         } else if selected_row {
             Theme::selected_row()
         } else {
@@ -4609,11 +4617,11 @@ fn draw_profile_text_overlay(f: &mut Frame, area: Rect, title_key: &str, body: &
     f.render_widget(Clear, overlay_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr(title_key)),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -4641,11 +4649,11 @@ fn draw_profile_list_overlay(
     f.render_widget(Clear, overlay_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {} ", wyj_i18n::tr(title_key)),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -4660,7 +4668,7 @@ fn draw_profile_list_overlay(
             let text = truncate_line(&format!("{marker}{item}"), w);
             let style = if i == selected {
                 Style::default()
-                    .fg(Theme::CLAUDE)
+                    .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -4703,11 +4711,11 @@ pub fn draw_action_menu<T, A: PartialEq>(
     f.render_widget(Clear, overlay_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::CLAUDE))
+        .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(Theme::CLAUDE)
+                .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);
@@ -4731,7 +4739,7 @@ pub fn draw_action_menu<T, A: PartialEq>(
                 Theme::dim()
             } else if i == menu.selected {
                 Style::default()
-                    .fg(Theme::CLAUDE)
+                    .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -4753,11 +4761,11 @@ fn draw_confirm_overlay(f: &mut Frame, area: Rect, title: &str, action_label: &s
     f.render_widget(Clear, overlay_area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::WARNING))
+        .border_style(Style::default().fg(Theme::warning_color()))
         .title(Span::styled(
             format!(" {title} "),
             Style::default()
-                .fg(Theme::WARNING)
+                .fg(Theme::warning_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(overlay_area);

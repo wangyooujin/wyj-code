@@ -2,10 +2,10 @@
 //!
 //! 尽量贴近官方 schema（`https://www.schemastore.org/claude-code-plugin-manifest.json`
 //! 与 `claude-code-marketplace.json`），使真实存在的社区插件仓库能被直接解析浏览。
-//! 但 v1 只让 commands/agents/skills/mcpServers（仅 stdio 传输）四类资源真正生效；
-//! hooks/lspServers/themes/outputStyles/monitors/channels/settings/userConfig 等字段
-//! 能被 serde 解析通过（不会因未知字段报错），但不实现对应功能，仅用于安装报告里
-//! 提示"检测到 N 项当前版本不支持的能力，已跳过"。
+//! commands/agents/skills/mcpServers 与 runtime contributions 都会进入统一安装记录；
+//! hooks/lspServers/themes/outputStyles/monitors/channels/settings/userConfig 由
+//! `plugin_runtime` 在启动时事务式激活。单个插件任一 runtime contribution 无效时，
+//! 该插件的全部 runtime contribution 都不会部分生效，并给出可诊断 warning。
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -384,9 +384,8 @@ pub struct PluginManifest {
 }
 
 impl PluginManifest {
-    /// 返回该 manifest 里出现的、wyj-code 当前版本不实现功能的能力字段名，
-    /// 供安装报告提示"检测到 N 项当前版本不支持的能力，已跳过"使用。
-    pub fn unsupported_capability_names(&self) -> Vec<&'static str> {
+    /// Runtime capability families declared by this plugin.
+    pub fn runtime_capability_names(&self) -> Vec<&'static str> {
         let mut caps = Vec::new();
         if is_present(&self.hooks) {
             caps.push("hooks");
@@ -413,6 +412,13 @@ impl PluginManifest {
             caps.push("userConfig");
         }
         caps
+    }
+
+    /// Kept for source compatibility with older callers. All currently parsed runtime
+    /// capability families are implemented; transport/path failures are reported while resolving
+    /// contributions instead of being classified as globally unsupported.
+    pub fn unsupported_capability_names(&self) -> Vec<&'static str> {
+        Vec::new()
     }
 }
 
@@ -706,10 +712,11 @@ mod tests {
         }"#;
         let manifest: PluginManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.name, "my-plugin");
-        let caps = manifest.unsupported_capability_names();
+        let caps = manifest.runtime_capability_names();
         assert!(caps.contains(&"hooks"));
         assert!(caps.contains(&"themes"));
         assert!(!caps.contains(&"lspServers"));
+        assert!(manifest.unsupported_capability_names().is_empty());
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub enum PermissionMode {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionSurface {
     TuiInteractive,
+    /// ACP client with a real `session/request_permission` round trip.
+    AcpClient,
     SinglePrompt,
     HeadlessRepl,
     Schedule,
@@ -31,7 +33,7 @@ pub enum ExecutionSurface {
 
 impl ExecutionSurface {
     pub fn is_interactive(self) -> bool {
-        matches!(self, Self::TuiInteractive)
+        matches!(self, Self::TuiInteractive | Self::AcpClient)
     }
 }
 

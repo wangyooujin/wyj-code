@@ -15,6 +15,7 @@ pub mod marketplace;
 pub mod mcp_install;
 pub mod plugin_install;
 pub mod plugin_manifest;
+pub mod plugin_runtime;
 pub mod project_trust;
 pub mod registry;
 pub mod schedule;

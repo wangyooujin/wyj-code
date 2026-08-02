@@ -101,6 +101,27 @@ impl ToolCtx {
         }
     }
 
+    /// Create an independent session context with the same effective policy. Runtime permission
+    /// mutations and ACP request channels do not leak between daemon-managed sessions.
+    pub fn fork_for_surface(&self, surface: ExecutionSurface) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            permission_mode: Arc::new(RwLock::new(self.permission_mode.read().unwrap().clone())),
+            execution_surface: Arc::new(RwLock::new(surface)),
+            permission_policy: Arc::new(RwLock::new(
+                self.permission_policy.read().unwrap().clone(),
+            )),
+            sandbox_available: Arc::new(RwLock::new(*self.sandbox_available.read().unwrap())),
+            sandbox_policy: Arc::new(RwLock::new(self.sandbox_policy.read().unwrap().clone())),
+            allow_unsandboxed_fallback: Arc::new(RwLock::new(
+                *self.allow_unsandboxed_fallback.read().unwrap(),
+            )),
+            ui_ask_tx: None,
+            always_allowed: RwLock::new(self.always_allowed.read().unwrap().clone()),
+            allowed_tools_path: self.allowed_tools_path.clone(),
+        }
+    }
+
     /// 就地替换权限模式的值（不改变共享句柄本身）。
     pub fn set_permission_mode(&self, mode: PermissionMode) {
         *self.permission_mode.write().unwrap() = mode;
