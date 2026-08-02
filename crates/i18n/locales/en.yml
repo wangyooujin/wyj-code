@@ -160,8 +160,10 @@ help:
     - `Ctrl+U` — Delete from cursor to start of line
     - `Ctrl+W` — Delete previous word
     - `↑` / `↓` — Browse input history; in multiline input, move the cursor first and cross into history only at the first/last line
-    - `Shift+↑` — Move focus from the composer into content; ↑/↓ navigates across chat, tasks, and SubAgents, Enter/Space opens task/SubAgent detail, and Esc steps back
+    - `PageUp` / `PageDown` — Page through the current conversation
+    - `Mouse drag` — Select terminal text directly; Shift is not required
     - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
+    - `Command+Click` / `Ctrl+Click` — Open local file paths or web links in responses
     - `/` — Command completion (Tab to confirm, Esc to cancel)
     - `!<command>` — Run a Bash command directly
 
@@ -173,6 +175,9 @@ help:
     - `Plan` — Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
     - `Bypass` — Skips all permission prompts, auto-approves every tool call
   custom_commands_header: "Custom Commands"
+
+hyperlink:
+  open_failed: "Failed to open link: {error}"
 
 clear:
   desc: "Clear the current conversation history"

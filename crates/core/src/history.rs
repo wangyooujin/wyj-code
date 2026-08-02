@@ -66,9 +66,25 @@ pub fn new_session_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("sess-{ts}")
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    format!("sess-{ts}-{}", &unique[..12])
 }
 
 pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_ids_are_unique_under_concurrent_creation() {
+        let ids: std::collections::HashSet<String> = (0..256)
+            .map(|_| std::thread::spawn(new_session_id))
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 256);
+        assert!(ids.iter().all(|id| id.starts_with("sess-")));
+    }
 }

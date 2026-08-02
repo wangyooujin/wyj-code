@@ -124,6 +124,8 @@ pub struct Agent {
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
     /// 可选的 token 用量回调（子 Agent 向 Hub 汇报用量用）
     usage_cb: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+    /// 前端无关事件流：TUI、daemon 与 ACP adapter 共享同一 Agent runtime。
+    session_event_cb: Option<Arc<dyn Fn(crate::SessionEvent) + Send + Sync>>,
     /// 会话标题生成器（可选，仅主 Agent 设置，子 Agent 不设置）
     summary: Option<Arc<crate::summary::SummaryGenerator>>,
     /// 当前会话 ID（用于标题生成，子 Agent 不设置）
@@ -168,6 +170,7 @@ impl Agent {
             claude_md: None,
             tool_cb: None,
             usage_cb: None,
+            session_event_cb: None,
             summary: None,
             session_id: None,
             title_cb: None,
@@ -314,7 +317,13 @@ impl Agent {
         };
         let cwd = cwd.to_path_buf();
         match tokio::task::spawn_blocking(move || store.create(&cwd, &messages, kind, name)).await {
-            Ok(Ok(summary)) => session.current_checkpoint_id = Some(summary.id),
+            Ok(Ok(summary)) => {
+                session.current_checkpoint_id = Some(summary.id.clone());
+                self.emit_session_event(crate::SessionEvent::CheckpointChanged {
+                    checkpoint_id: summary.id,
+                    label: summary.name,
+                });
+            }
             Ok(Err(error)) => tracing::warn!("创建 checkpoint 失败: {error}"),
             Err(error) => tracing::warn!("checkpoint 任务异常退出: {error}"),
         }
@@ -335,6 +344,20 @@ impl Agent {
     pub fn with_usage_callback(mut self, cb: impl Fn(u32, u32) + Send + Sync + 'static) -> Self {
         self.usage_cb = Some(Arc::new(cb));
         self
+    }
+
+    pub fn with_session_event_callback(
+        mut self,
+        cb: impl Fn(crate::SessionEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.session_event_cb = Some(Arc::new(cb));
+        self
+    }
+
+    fn emit_session_event(&self, event: crate::SessionEvent) {
+        if let Some(callback) = &self.session_event_cb {
+            callback(event);
+        }
     }
 
     /// 设置会话标题生成器（仅主 Agent 设置，子 Agent 不设置）
@@ -781,6 +804,9 @@ impl Agent {
                         match event {
                             StreamEvent::TextDelta(delta) => {
                                 on_text(&delta);
+                                self.emit_session_event(crate::SessionEvent::TextDelta {
+                                    text: delta.clone(),
+                                });
                                 match blocks.last_mut() {
                                     Some(StreamedBlock::Text(t)) => t.push_str(&delta),
                                     _ => blocks.push(StreamedBlock::Text(delta)),
@@ -796,6 +822,9 @@ impl Agent {
                                 if let Some(cb) = &self.thinking_cb {
                                     cb(&delta);
                                 }
+                                self.emit_session_event(crate::SessionEvent::ThinkingDelta {
+                                    text: delta.clone(),
+                                });
                                 match blocks.last_mut() {
                                     Some(StreamedBlock::Thinking { text, .. }) => {
                                         text.push_str(&delta)
@@ -880,6 +909,13 @@ impl Agent {
                                 if let Some(cb) = &self.usage_cb {
                                     cb(input, output);
                                 }
+                                self.emit_session_event(crate::SessionEvent::Usage {
+                                    input_tokens: input as u64,
+                                    output_tokens: output as u64,
+                                    tool_schema_tokens: session.tool_schema_tokens as u64,
+                                    tool_schema_tokens_saved: session.tool_schema_tokens_saved
+                                        as u64,
+                                });
                             }
                             break Ok((blocks, stop_reason));
                         }
@@ -1062,10 +1098,23 @@ impl Agent {
                             if let Some(cb) = &self.tool_cb {
                                 cb(ToolEvent::End {
                                     id: id.clone(),
-                                    name,
+                                    name: name.clone(),
                                     is_error: true,
                                     elapsed_secs: 0.0,
                                     output: feedback.clone(),
+                                });
+                            }
+                            self.emit_session_event(crate::SessionEvent::ToolFinished {
+                                call_id: id.clone(),
+                                output: feedback.clone(),
+                                is_error: true,
+                                elapsed_ms: 0,
+                            });
+                            if name == "Agent" {
+                                self.emit_session_event(crate::SessionEvent::AgentStateChanged {
+                                    agent_id: session_agent_event_id(&id),
+                                    parent_id: None,
+                                    state: "failed".to_string(),
                                 });
                             }
                             tool_results.push((
@@ -1253,6 +1302,7 @@ impl Agent {
                 break;
             }
         }
+        self.emit_session_event(crate::SessionEvent::TurnFinished);
         Ok(())
     }
 
@@ -1273,6 +1323,18 @@ impl Agent {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
+            });
+        }
+        self.emit_session_event(crate::SessionEvent::ToolStarted {
+            call_id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        });
+        if name == "Agent" {
+            self.emit_session_event(crate::SessionEvent::AgentStateChanged {
+                agent_id: session_agent_event_id(&id),
+                parent_id: None,
+                state: "running".to_string(),
             });
         }
         let start = Instant::now();
@@ -1373,7 +1435,20 @@ impl Agent {
                 name: name.clone(),
                 is_error,
                 elapsed_secs,
-                output: display,
+                output: display.clone(),
+            });
+        }
+        self.emit_session_event(crate::SessionEvent::ToolFinished {
+            call_id: id.clone(),
+            output: display,
+            is_error,
+            elapsed_ms: (elapsed_secs * 1000.0).round().max(0.0) as u64,
+        });
+        if name == "Agent" {
+            self.emit_session_event(crate::SessionEvent::AgentStateChanged {
+                agent_id: session_agent_event_id(&id),
+                parent_id: None,
+                state: if is_error { "failed" } else { "completed" }.to_string(),
             });
         }
 
@@ -1388,6 +1463,15 @@ impl Agent {
         let route = self.route_at(self.active_route_index());
         compact_session(session, route.provider.as_ref(), route.context_window).await
     }
+}
+
+fn session_agent_event_id(call_id: &str) -> u64 {
+    call_id
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 /// 执行工具并组装 (display, content, is_error) 三元组，抽出复用于

@@ -23,7 +23,11 @@ DeepSeek、Qwen/百炼、豆包/火山等国内模型，也支持 Claude、OpenA
 - **ToolSearch / lazy schema** —— 工具数超过阈值后只发送核心与 sticky schema，按本地词法搜索加载其余工具；状态栏和 `WYJ_STATS_JSON` 展示 schema token 发送量与节省量。
 - **上下文压缩** —— 估算 token 数接近窗口上限时自动摘要替换旧消息，保留最近若干条。
 - **Checkpoint / Rewind / Branch** —— 在不改用户真实 Git index 的前提下保存对话与文件状态，支持 conversation/files/both 恢复和从 checkpoint 创建新 session。
-- **统一 Extensions 资源平台** —— `/extensions` 与 `wyj-code extensions` 统一管理 Skill、MCP、Plugin；支持 lockfile v2、原生 Claude MCP 迁移、stdio/Streamable HTTP 和下一回合边界应用。
+- **Workflow + 隔离 Worktree** —— `workflow validate/run/status/control` 提供 DAG 校验、并行执行、暂停/恢复/重试/跳过/审批/取消与 token budget；拥有写权限的 Agent/Review 节点从当前脏工作区 checkpoint 自动创建独立 managed worktree，结果需显式 review/accept。
+- **ACP / daemon 控制面** —— 支持 stdio ACP adapter 和本地 TCP daemon；daemon 使用进程级 session registry，客户端断线后 session 继续存在，新连接可 load、列出、提交、打断、rewind、branch、控制 workflow 或关闭 session。
+- **本地 CodeIndex + Plugin LSP** —— 词法/符号索引失败时自动退化为 ignore-aware direct scan；已启用插件可提供真实 LSP `workspace/symbol`，结果与本地索引合并、去重和排序。
+- **统一 Extensions 资源平台** —— `/extensions` 与 `wyj-code extensions` 统一管理 Skill、MCP、Plugin；支持 lockfile v2、原生 Claude MCP 迁移、stdio/Streamable HTTP，以及插件 hooks、output styles、themes、channels、LSP、monitors、settings schema 与 userConfig 的事务式运行时激活。
+- **本地 Review 证据** —— `wyj-code review run` 对 commit/PR diff 生成可审计 JSON，覆盖 rename、空格路径、binary numstat 与 secret evidence 脱敏；GitHub Action 在 CI 中执行同一扫描器。
 - **可插拔 MCP** —— 内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并桥接 stdio 或 Streamable HTTP MCP server。
 
 **安全执行**
@@ -54,11 +58,13 @@ crates/
 ├── api/         # Provider、国内模型能力目录/doctor、SSE 流式解析
 ├── cli/         # 二进制入口、参数解析
 ├── commands/    # Slash 命令系统（/help /model /agents /compact …）
+├── computer/    # Computer-use 截图、目标窗口和输入合成
 ├── config/      # Profile 分组配置加载
-├── core/        # Agent、权限、ToolSearch、checkpoint、评测与 P2 接口
+├── core/        # Agent、权限、ToolSearch、checkpoint、workspace/workflow/ACP 接口与 CodeIndex
 ├── i18n/        # 中英双语资源
 ├── mcp/         # MCP 客户端（stdio / http）
 ├── sandbox/     # macOS Seatbelt / Linux bubblewrap 隔离
+├── store/       # Extension/Plugin runtime、schedule、安装与 lockfile
 ├── tools/       # 内置工具 + SubAgent + AgentHub
 └── tui/         # ratatui 前端
 ```
@@ -158,6 +164,28 @@ TUI 内可用 `/model doctor`、`/sandbox`、`/checkpoint`、`/rewind`、`/branc
 `wyj-code session {checkpoint,checkpoints,rewind,branch}`。完整命令见 `/help` 和
 `wyj-code --help`。
 
+v1.5.0 的隔离执行、Workflow、ACP daemon 与本地 Review 都是 CLI 控制面：
+
+```bash
+wyj-code workspace create --base HEAD --purpose "isolated fix"
+wyj-code workspace list
+wyj-code workspace diff <workspace-id>
+wyj-code workspace accept <workspace-id> path/to/file
+
+wyj-code workflow validate workflow.json
+wyj-code workflow run workflow.json
+wyj-code workflow status <workflow-id>
+wyj-code workflow control <workflow-id> pause
+
+wyj-code acp                              # stdin/stdout ACP adapter
+wyj-code daemon --listen 127.0.0.1:61337 # 跨连接共享 session 的本地 daemon
+wyj-code review run --base HEAD^ --head HEAD --json
+```
+
+Workflow 仅对显式拥有 Write/Edit/Bash 且配置了 `write_roots` 的 Agent/Review 节点自动创建
+worktree；成功后不会自动合并或删除，而是在结果中返回 `workspace diff` / `workspace accept`
+命令。失败现场同样保留，便于复核。
+
 模型诊断默认免费且不联网。只有显式 `--probe basic|full` 才发请求，并且只读取独立的
 `WYJ_CODE_PROBE_API_KEY`；不会扫描或复用配置中的 Profile Key。没有真实 probe 证据时，
 国内模型只显示 `static_only` / protocol-compatible，不能视为 live verified。
@@ -214,7 +242,7 @@ Hooks 配置示例（`.claude/settings.json`，与真实 Claude Code 格式一�
 - **子 Agent 进程级 Hub**：多 agent 真正的难点是调度与回收，不是 spawn。用单例 Hub 统一分配 id、`Semaphore` 限并发、前台 oneshot / 后台经 system-reminder 通道回注、控制消息只在安全边界注入、ESC 只 abort 前台、退出 `abort_all`——把生命周期管理做成一等公民。
 - **权限与 sandbox 分层**：权限策略回答“是否批准”，OS sandbox 回答“批准后最多能触达哪里”。二者分离后，`bypass`、项目配置、模型提示和持久化的 Allow 都不能覆盖 protected deny，也不能把 sandbox 失败变成自动直连。
 - **静态兼容不冒充真实验证**：国内端点变化快，模型名推断只能提供保守默认。目录、用户 override 和显式 probe 按可信度合并；没有轮换 Key 和 live 证据就保持 `static_only`，发布材料不扩大结论。
-- **Rust + async + workspace**：选 Rust 不是赶时髦，是这个场景天然契合——流式解析、并发工具执行、零运行时依赖的单二进制分发。八个 crate 的切分让职责边界在编译期就强制清晰。
+- **Rust + async + workspace**：选 Rust 不是赶时髦，是这个场景天然契合——流式解析、并发工具执行、零运行时依赖的单二进制分发。12 个 crate 的切分让职责边界在编译期就强制清晰。
 
 ## 设计原则
 
@@ -262,7 +290,9 @@ TUI 会话）立即退出，这个行为回归对交互式工具不可接受，�
 - 原生 Windows 暂无 Seatbelt/bubblewrap 同等级 OS sandbox；需要严格边界时建议在 WSL2 中运行并检查 `wyj-code sandbox` 输出。
 - macOS 为兼容编译器/系统库读取，当前是全局只读 + 常见凭证路径 deny-read，并非“整个 home 完全不可遍历”；工作区和显式 write roots 才可写。
 - Checkpoint 只能恢复会话和文件，不能撤销网络请求、数据库、已发送消息、外部应用或其他非文件副作用；自动 checkpoint 在大仓库中的 Git 扫描成本仍需继续优化。
-- v1.4.4 只冻结 `ExecutionWorkspace`、workflow/DAG、ACP/daemon 事件流和 `CodeIndex` 接口，尚未交付自动 worktree、完整 Agent Teams、IDE daemon 或语义索引。
+- 自动 worktree 当前只覆盖 Workflow 中拥有写工具且配置 `write_roots` 的 Agent/Review 节点；普通 TUI 对话与独立 SubAgent 不会被静默迁入 worktree，接受和清理仍需显式操作。
+- CodeIndex 当前是本地词法/符号索引 + plugin LSP `workspace/symbol`，并非 embedding/vector 语义检索；LSP 启动或协议失败时会保留本地索引和 direct-scan fallback。
+- ACP daemon 默认监听本机回环地址且不提供公网鉴权层；如修改监听地址，调用方必须自行提供进程隔离、访问控制与传输保护。
 - TUI 已恢复终端原生鼠标拖选；聊天历史仍由应用内 PageUp/PageDown 等键盘路径浏览，不把 alternate-screen 的终端 scrollback 宣称为已恢复。
 
 ## 贡献

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use wyj_api::types::ToolDefinition;
 
@@ -17,12 +17,78 @@ pub struct LazyToolState {
 }
 
 struct LazyToolInner {
-    catalog: HashMap<String, ToolDefinition>,
+    catalog: HashMap<String, ToolCatalogEntry>,
     core: HashSet<String>,
     sticky: HashMap<String, u64>,
     current_turn: u64,
     top_k: usize,
     sticky_turns: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCatalogEntry {
+    #[serde(skip)]
+    pub definition: ToolDefinition,
+    pub summary: String,
+    pub tags: Vec<String>,
+    pub source: String,
+    pub read_only: bool,
+    pub required_capabilities: Vec<String>,
+}
+
+impl ToolCatalogEntry {
+    pub fn inferred(definition: ToolDefinition) -> Self {
+        let source = definition
+            .name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split("__").next())
+            .map(|server| format!("mcp:{server}"))
+            .unwrap_or_else(|| "builtin".to_string());
+        let name = definition.name.to_ascii_lowercase();
+        let description = definition.description.to_ascii_lowercase();
+        let read_only = matches!(
+            name.as_str(),
+            "read" | "glob" | "grep" | "codesearch" | "webfetch" | "websearch" | "toolsearch"
+        ) || description.contains("read-only");
+        let mut tags = vec![if read_only { "read" } else { "side-effect" }.to_string()];
+        for (needle, tag) in [
+            ("code", "code"),
+            ("file", "filesystem"),
+            ("shell", "shell"),
+            ("web", "network"),
+            ("search", "search"),
+            ("agent", "agent"),
+            ("index", "index"),
+        ] {
+            if name.contains(needle) || description.contains(needle) {
+                tags.push(tag.to_string());
+            }
+        }
+        tags.sort();
+        tags.dedup();
+        let required_capabilities = definition
+            .native
+            .as_ref()
+            .map(|native| vec![format!("native_tool:{}", native.tool_type)])
+            .unwrap_or_default();
+        let summary = definition
+            .description
+            .split(['.', '\n'])
+            .next()
+            .unwrap_or(&definition.description)
+            .trim()
+            .chars()
+            .take(180)
+            .collect();
+        Self {
+            definition,
+            summary,
+            tags,
+            source,
+            read_only,
+            required_capabilities,
+        }
+    }
 }
 
 impl LazyToolState {
@@ -40,11 +106,15 @@ impl LazyToolState {
     }
 
     pub fn upsert(&self, definition: ToolDefinition) {
+        self.upsert_entry(ToolCatalogEntry::inferred(definition));
+    }
+
+    pub fn upsert_entry(&self, entry: ToolCatalogEntry) {
         self.inner
             .write()
             .unwrap()
             .catalog
-            .insert(definition.name.clone(), definition);
+            .insert(entry.definition.name.clone(), entry);
     }
 
     pub fn remove(&self, name: &str) {
@@ -76,18 +146,40 @@ impl LazyToolState {
         inner.core.contains(name) || inner.sticky.contains_key(name) || name == "ToolSearch"
     }
 
-    fn search(&self, query: &str, limit: usize) -> Vec<ToolDefinition> {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        source: Option<&str>,
+        tags: &[String],
+        read_only: Option<bool>,
+    ) -> Vec<ToolCatalogEntry> {
         let query = query.trim().to_ascii_lowercase();
         let terms: Vec<&str> = query.split_whitespace().collect();
         let mut inner = self.inner.write().unwrap();
-        let mut ranked: Vec<(i32, ToolDefinition)> = inner
+        let mut ranked: Vec<(i32, ToolCatalogEntry)> = inner
             .catalog
             .values()
-            .filter(|definition| definition.name != "ToolSearch")
-            .filter_map(|definition| {
-                let name = definition.name.to_ascii_lowercase();
-                let description = definition.description.to_ascii_lowercase();
+            .filter(|entry| entry.definition.name != "ToolSearch")
+            .filter(|entry| source.map_or(true, |source| entry.source.eq_ignore_ascii_case(source)))
+            .filter(|entry| read_only.map_or(true, |read_only| entry.read_only == read_only))
+            .filter(|entry| {
+                tags.iter().all(|tag| {
+                    entry
+                        .tags
+                        .iter()
+                        .any(|candidate| candidate.eq_ignore_ascii_case(tag))
+                })
+            })
+            .filter_map(|entry| {
+                let name = entry.definition.name.to_ascii_lowercase();
+                let description = entry.definition.description.to_ascii_lowercase();
+                let tag_text = entry.tags.join(" ").to_ascii_lowercase();
+                let source_text = entry.source.to_ascii_lowercase();
                 let mut score = 0;
+                if inner.sticky.contains_key(&entry.definition.name) {
+                    score += 15;
+                }
                 if name == query {
                     score += 100;
                 } else if name.starts_with(&query) {
@@ -102,27 +194,34 @@ impl LazyToolState {
                     if description.contains(term) {
                         score += 5;
                     }
+                    if tag_text.contains(term) {
+                        score += 12;
+                    }
+                    if source_text.contains(term) {
+                        score += 8;
+                    }
                 }
-                (score > 0).then(|| (score, definition.clone()))
+                (score > 0 || (!tags.is_empty() || source.is_some() || read_only.is_some()))
+                    .then(|| (score, entry.clone()))
             })
             .collect();
-        ranked.sort_by(|(score_a, def_a), (score_b, def_b)| {
+        ranked.sort_by(|(score_a, entry_a), (score_b, entry_b)| {
             score_b
                 .cmp(score_a)
-                .then_with(|| def_a.name.cmp(&def_b.name))
+                .then_with(|| entry_a.definition.name.cmp(&entry_b.definition.name))
         });
-        let definitions: Vec<ToolDefinition> = ranked
+        let entries: Vec<ToolCatalogEntry> = ranked
             .into_iter()
             .take(limit.clamp(1, inner.top_k))
-            .map(|(_, definition)| definition)
+            .map(|(_, entry)| entry)
             .collect();
         let current = inner.current_turn;
         inner.sticky.extend(
-            definitions
+            entries
                 .iter()
-                .map(|definition| (definition.name.clone(), current)),
+                .map(|entry| (entry.definition.name.clone(), current)),
         );
-        definitions
+        entries
     }
 }
 
@@ -141,6 +240,12 @@ struct SearchInput {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
 }
 
 #[async_trait]
@@ -158,7 +263,10 @@ impl Tool for ToolSearchTool {
                 "required": ["query"],
                 "properties": {
                     "query": {"type": "string", "minLength": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 12}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "source": {"type": "string", "description": "Optional exact source such as builtin or mcp:server"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 8},
+                    "read_only": {"type": "boolean"}
                 },
                 "additionalProperties": false
             }),
@@ -168,9 +276,13 @@ impl Tool for ToolSearchTool {
 
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let input: SearchInput = serde_json::from_value(input)?;
-        let matches = self
-            .state
-            .search(&input.query, input.limit.unwrap_or(usize::MAX));
+        let matches = self.state.search(
+            &input.query,
+            input.limit.unwrap_or(usize::MAX),
+            input.source.as_deref(),
+            &input.tags,
+            input.read_only,
+        );
         if matches.is_empty() {
             return Ok(ToolResult::ok(
                 "No matching tools. Refine the capability query; do not guess a hidden tool name."
@@ -179,10 +291,14 @@ impl Tool for ToolSearchTool {
         }
         let compact: Vec<Value> = matches
             .into_iter()
-            .map(|definition| {
+            .map(|entry| {
                 serde_json::json!({
-                    "name": definition.name,
-                    "description": definition.description,
+                    "name": entry.definition.name,
+                    "summary": entry.summary,
+                    "tags": entry.tags,
+                    "source": entry.source,
+                    "read_only": entry.read_only,
+                    "required_capabilities": entry.required_capabilities,
                     "available_next_turn": true
                 })
             })
@@ -212,8 +328,8 @@ mod tests {
         }
         assert!(state.visible("Read"));
         assert!(!state.visible("Bash"));
-        let found = state.search("shell command", 3);
-        assert_eq!(found[0].name, "Bash");
+        let found = state.search("shell command", 3, None, &[], None);
+        assert_eq!(found[0].definition.name, "Bash");
         assert!(state.visible("Bash"));
         assert!(!state.visible("WebFetch"));
     }
@@ -230,7 +346,7 @@ mod tests {
             });
         }
         state.begin_task_turn();
-        state.search("Bash", 8);
+        state.search("Bash", 8, None, &[], None);
         assert!(state.visible("Bash"));
         state.begin_task_turn();
         state.mark_used("Bash");
@@ -240,7 +356,7 @@ mod tests {
         state.begin_task_turn();
         assert!(!state.visible("Bash"));
 
-        state.search("WebFetch", 8);
+        state.search("WebFetch", 8, None, &[], None);
         assert!(state.visible("WebFetch"));
         state.remove("WebFetch");
         assert!(!state.visible("WebFetch"));

@@ -386,16 +386,12 @@ fn load_mcp_json_file(path: &Path) -> Result<HashMap<String, PluginMcpServerDef>
         .with_context(|| format!("解析 mcpServers 内容失败: {}", path.display()))
 }
 
-/// 从 manifest + 已物化的 plugin_root 解析出 skill_paths/agent_paths/mcp_servers，
-/// 并统计 skipped_capabilities（不支持的能力字段 + 非 stdio 传输的 mcp server）。
+/// 从 manifest + 已物化的 plugin_root 解析出 skill_paths/agent_paths/mcp_servers 与
+/// runtime 能力快照，并统计真正无法解析的能力（例如未知 MCP transport）。
 /// 注意：不做同名冲突检测——冲突判定发生在消费方（load_skills/load_agent_defs/
 /// effective_mcp_servers），这里只产出原始贡献快照。
 pub fn resolve_contributions(manifest: &PluginManifest, plugin_root: &Path) -> PluginContributions {
-    let mut skipped: Vec<String> = manifest
-        .unsupported_capability_names()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut skipped: Vec<String> = Vec::new();
 
     let mut skill_paths: Vec<PathBuf> = manifest
         .skills
@@ -473,6 +469,16 @@ pub fn resolve_contributions(manifest: &PluginManifest, plugin_root: &Path) -> P
         skill_paths,
         agent_paths,
         mcp_servers,
+        runtime: crate::lockfile::PluginRuntimeContributions {
+            hooks: manifest.hooks.clone(),
+            output_styles: manifest.output_styles.clone(),
+            themes: manifest.themes.clone(),
+            channels: manifest.channels.clone(),
+            lsp_servers: manifest.lsp_servers.clone(),
+            monitors: manifest.monitors.clone(),
+            settings: manifest.settings.clone(),
+            user_config: manifest.user_config.clone(),
+        },
         skipped_capabilities: skipped,
     }
 }
@@ -1188,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_contributions_skips_unsupported_capabilities_and_transports() {
+    fn resolve_contributions_snapshots_runtime_capabilities_and_skips_bad_transports() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("skills")).unwrap();
         std::fs::create_dir_all(dir.path().join("agents")).unwrap();
@@ -1220,12 +1226,14 @@ mod tests {
         assert_eq!(contributes.agent_paths.len(), 1);
         assert_eq!(contributes.mcp_servers.len(), 1);
         assert_eq!(contributes.mcp_servers[0].name, "local-tool");
-        assert!(contributes
-            .skipped_capabilities
-            .contains(&"hooks".to_string()));
-        assert!(contributes
-            .skipped_capabilities
-            .contains(&"themes".to_string()));
+        assert_eq!(
+            contributes.runtime.hooks,
+            Some(serde_json::json!({"PreToolUse": []}))
+        );
+        assert_eq!(
+            contributes.runtime.themes,
+            Some(serde_json::json!(["dark"]))
+        );
         assert!(contributes
             .skipped_capabilities
             .iter()
@@ -1427,6 +1435,7 @@ mod tests {
                     url: None,
                     headers: HashMap::new(),
                 }],
+                runtime: Default::default(),
                 skipped_capabilities: vec![],
             },
         }

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_def;
 pub mod checkpoint;
 pub mod claude_md;
+pub mod code_index;
 pub mod compact;
 pub mod eval;
 pub mod frontmatter;
@@ -14,11 +15,14 @@ pub mod project;
 pub mod prompts;
 pub mod secret;
 pub mod session;
+pub mod session_runtime;
 pub mod session_store;
 pub mod summary;
 pub mod tool;
 pub mod tool_arguments;
 pub mod tool_search;
+pub mod workflow;
+pub mod workspace;
 
 pub use agent::{Agent, AgentRoute, InjectionKind, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};
@@ -27,6 +31,7 @@ pub use checkpoint::{
     WorkspaceSnapshot,
 };
 pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile};
+pub use code_index::{CodeSearchTool, ProjectCodeIndex};
 pub use compact::{
     compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_tokens,
 };
@@ -38,8 +43,9 @@ pub use hooks::{
 pub use interfaces::{
     CodeIndex, CodeIndexStatus, CodeMatch, CodeQuery, ExecutionWorkspace, ExecutionWorkspaceKind,
     ExecutionWorkspaceManager, ExecutionWorkspaceRequest, SessionControl, SessionEvent,
-    SessionEventEnvelope, WorkflowControl, WorkflowNodeKind, WorkflowNodeSpec,
-    WorkflowPermissionCeiling, WorkflowSpec, WorkspaceDiffSummary, INTERFACE_SCHEMA_VERSION,
+    SessionEventEnvelope, WorkflowControl, WorkflowNodeKind, WorkflowNodeSpec, WorkflowNodeState,
+    WorkflowPermissionCeiling, WorkflowSpec, WorkspaceAcceptResult, WorkspaceDiff,
+    WorkspaceDiffSummary, INTERFACE_SCHEMA_VERSION,
 };
 pub use memory::{project_id, MemoryStore};
 pub use permission::{
@@ -49,6 +55,7 @@ pub use permission::{
 pub use project::{project_key, project_root, same_project};
 pub use secret::{redact_sensitive_text, REDACTED_SECRET};
 pub use session::{RoutingEvent, Session};
+pub use session_runtime::{AgentSessionRuntime, SessionEventEmitter, TurnOutcome};
 pub use session_store::{extract_preview, extract_title, SessionFile, SessionMeta, SessionStore};
 pub use summary::SummaryGenerator;
 pub use tool::{Tool, ToolResult};
@@ -56,4 +63,9 @@ pub use tool_arguments::{
     simplified_tool_definition, ToolArgumentError, ToolArgumentErrorKind, ToolArgumentIssue,
     ToolArgumentPipeline, ValidatedToolCall,
 };
-pub use tool_search::{LazyToolState, ToolSearchTool};
+pub use tool_search::{LazyToolState, ToolCatalogEntry, ToolSearchTool};
+pub use workflow::{
+    validate_workflow, WorkflowEvent, WorkflowHandle, WorkflowNodeContext, WorkflowNodeExecutor,
+    WorkflowNodeOutput, WorkflowNodeRecord, WorkflowRuntime, WorkflowSnapshot,
+};
+pub use workspace::GitWorktreeManager;

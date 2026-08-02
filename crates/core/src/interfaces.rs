@@ -1,14 +1,14 @@
-//! v1.4.4 冻结的后续扩展接口。
+//! 前端无关的 workspace、workflow、daemon/ACP 与代码索引契约。
 //!
-//! 本模块只定义 worktree、workflow、daemon/ACP 与代码索引后续实现共同依赖的
-//! 前端无关契约，不代表这些 P2 产品能力已经交付。新增字段应保持 serde 向后
-//! 兼容；破坏性变更必须提升 [`INTERFACE_SCHEMA_VERSION`]。
+//! schema version 2 在 v1.5.0 把原先只冻结的 P2 接口扩展为可执行 runtime：
+//! worktree 支持 review/选择性接受，workflow 节点有稳定状态，session 控制覆盖
+//! workflow 与关闭语义。新增字段继续使用 serde 默认值保持旧数据可读取。
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const INTERFACE_SCHEMA_VERSION: u32 = 1;
+pub const INTERFACE_SCHEMA_VERSION: u32 = 2;
 
 // ── Execution workspace / worktree ──────────────────────────────────────────
 
@@ -46,11 +46,34 @@ pub struct WorkspaceDiffSummary {
     pub paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDiff {
+    pub summary: WorkspaceDiffSummary,
+    /// `git diff --binary` 兼容补丁。未跟踪文本文件也会以 `/dev/null` 补丁呈现；
+    /// 超限或二进制未跟踪文件只保留在 summary 中，避免把任意大文件灌入前端。
+    pub patch: String,
+    #[serde(default)]
+    pub omitted_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAcceptResult {
+    pub accepted: Vec<PathBuf>,
+    pub deleted: Vec<PathBuf>,
+    pub rejected: Vec<PathBuf>,
+}
+
 /// P2 worktree manager 的最小稳定边界。实现必须保护当前 checkout 的用户修改，
 /// 且 dispose 只能处理由同一 manager 创建并标记为 disposable 的 workspace。
 pub trait ExecutionWorkspaceManager: Send + Sync {
     fn create(&self, request: &ExecutionWorkspaceRequest) -> anyhow::Result<ExecutionWorkspace>;
     fn diff_summary(&self, workspace: &ExecutionWorkspace) -> anyhow::Result<WorkspaceDiffSummary>;
+    fn review(&self, workspace: &ExecutionWorkspace) -> anyhow::Result<WorkspaceDiff>;
+    fn accept(
+        &self,
+        workspace: &ExecutionWorkspace,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<WorkspaceAcceptResult>;
     fn dispose(&self, workspace: &ExecutionWorkspace) -> anyhow::Result<()>;
 }
 
@@ -137,6 +160,11 @@ pub enum SessionControl {
         checkpoint_id: String,
         restore_files: bool,
     },
+    Workflow {
+        workflow_id: String,
+        control: WorkflowControl,
+    },
+    Close,
 }
 
 // ── Dynamic workflow / DAG ──────────────────────────────────────────────────
@@ -147,6 +175,19 @@ pub enum WorkflowNodeKind {
     Agent,
     Review,
     HumanApproval,
+    Index,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+    Cancelled,
+    WaitingApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +223,7 @@ pub struct WorkflowSpec {
 pub enum WorkflowControl {
     Pause,
     Resume,
+    ApproveNode { node_id: String },
     RetryNode { node_id: String },
     SkipNode { node_id: String },
     Cancel,

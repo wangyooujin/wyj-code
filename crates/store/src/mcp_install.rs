@@ -738,6 +738,7 @@ mod tests {
                 skill_paths: vec![],
                 agent_paths: vec![],
                 mcp_servers: servers,
+                runtime: Default::default(),
                 skipped_capabilities: vec![],
             },
         }

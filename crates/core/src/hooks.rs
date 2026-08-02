@@ -27,9 +27,18 @@ fn default_hook_type() -> String {
 
 /// 一份 `.claude/settings.json` 里 `hooks` 键的解析结果，key 为事件名
 /// （`"PreToolUse"`/`"PostToolUse"`/`"UserPromptSubmit"`/`"Stop"`）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HooksSettings {
     pub hooks: HashMap<String, Vec<HookMatcherEntry>>,
+}
+
+impl HooksSettings {
+    /// Append another source without replacing earlier user/project hooks.
+    pub fn append(&mut self, incoming: HooksSettings) {
+        for (event, mut entries) in incoming.hooks {
+            self.hooks.entry(event).or_default().append(&mut entries);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +112,20 @@ impl HookRunner {
             settings: load_effective_hooks(cwd),
             enabled,
         }
+    }
+
+    /// Load Claude-compatible settings and append trusted plugin hook contributions.
+    /// Plugin hooks never replace user/project hooks; they run afterwards in catalog order.
+    pub fn load_with_additional(
+        cwd: &Path,
+        enabled: bool,
+        additional: impl IntoIterator<Item = HooksSettings>,
+    ) -> Self {
+        let mut settings = load_effective_hooks(cwd);
+        for incoming in additional {
+            settings.append(incoming);
+        }
+        Self { settings, enabled }
     }
 
     /// 直接从已有 `HooksSettings` 构造，跳过磁盘读取（供 `agent.rs` 等上层
@@ -353,6 +376,31 @@ mod tests {
             settings: HooksSettings { hooks },
             enabled: true,
         }
+    }
+
+    #[test]
+    fn append_preserves_user_project_then_plugin_order() {
+        let mut settings = HooksSettings {
+            hooks: HashMap::from([(
+                "PreToolUse".to_string(),
+                vec![
+                    entry(None, vec![cmd("user")]),
+                    entry(None, vec![cmd("project")]),
+                ],
+            )]),
+        };
+        settings.append(HooksSettings {
+            hooks: HashMap::from([(
+                "PreToolUse".to_string(),
+                vec![entry(None, vec![cmd("plugin")])],
+            )]),
+        });
+        let commands: Vec<&str> = settings.hooks["PreToolUse"]
+            .iter()
+            .flat_map(|entry| entry.hooks.iter())
+            .map(|hook| hook.command.as_str())
+            .collect();
+        assert_eq!(commands, vec!["user", "project", "plugin"]);
     }
 
     #[tokio::test]

@@ -212,9 +212,33 @@ pub struct PluginContributions {
     /// config.toml/mcp.toml，只存在于这份快照里，由
     /// `mcp_install::effective_mcp_servers` 在合并时读取。
     pub mcp_servers: Vec<McpServerConfig>,
-    /// 因当前版本不支持（如 hooks/themes）或名字冲突而被跳过的能力/资源名，
-    /// 如 `["hooks", "themes", "sse-mcp:some-server", "skill-conflict:review"]`。
+    /// Executable/runtime plugin capabilities. Raw manifest values are snapshotted at install
+    /// time and resolved relative to `InstalledPluginEntry::plugin_root` when activated.
+    #[serde(default)]
+    pub runtime: PluginRuntimeContributions,
+    /// 因传输仍不支持或名字冲突而被跳过的能力/资源名，
+    /// 如 `["ws-mcp:some-server", "skill-conflict:review"]`。
     pub skipped_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginRuntimeContributions {
+    #[serde(default)]
+    pub hooks: Option<serde_json::Value>,
+    #[serde(default)]
+    pub output_styles: Option<serde_json::Value>,
+    #[serde(default)]
+    pub themes: Option<serde_json::Value>,
+    #[serde(default)]
+    pub channels: Option<serde_json::Value>,
+    #[serde(default)]
+    pub lsp_servers: Option<serde_json::Value>,
+    #[serde(default)]
+    pub monitors: Option<serde_json::Value>,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +602,7 @@ mod tests {
                 skill_paths: vec![PathBuf::from("plugins/repos/abc123/code-reviewer/skills")],
                 agent_paths: vec![],
                 mcp_servers: vec![],
+                runtime: Default::default(),
                 skipped_capabilities: vec!["hooks".to_string()],
             },
         });
