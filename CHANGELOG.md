@@ -2,6 +2,13 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.3]
+
+- **Computer-use lazy schema 保底**：ToolSearch 在工具集很大时仍保留已注册的 `window_capture`、`app_computer` 与兼容 `computer` schema，避免国内模型把“当前未展示”误判成“本会话不支持 GUI”；工具是否注册、foreground compatibility 开关、权限与 sandbox 限制均不扩张。
+- **跨平台 checksum 可移植性**：Windows 打包不再用产生 CRLF 的 `Out-File` 写 sidecar，而是显式写入 ASCII + LF；`SHA256SUMS` 聚合时同时防御性移除行尾 `\r`，因此 Unix `sha256sum/shasum` 不会把 Windows 文件名解析为带回车字符。
+- **发布前实物校验**：Publish Release 在上传前对五个平台归档执行 `sha256sum --check SHA256SUMS`，任一 archive、sidecar 或聚合内容不一致都会阻断 Release，不再把 checksum 可下载误当成 checksum 可用。
+- **不可移动边界**：v1.5.2 的 Test/Lint、五平台 Build 与 Publish Release 均成功，但发布后实物验收发现 Windows checksum CRLF 缺陷；v1.5.3 以新 tag 修复，所有历史 tag 保持不变。
+
 ## [1.5.2]
 
 - **ToolSearch 核心执行面保底**：lazy schema 在大工具集下始终保留 Read/Glob/Grep/CodeSearch、Bash/Edit/Write、AskQuestion/TodoWrite、Agent/ExitPlanMode 等已注册核心工具，只延迟暴露可选集成；避免国内模型只看到搜索入口却看不到完成编码任务所需的执行工具。Plan/只读子 Agent 仍只暴露其实际注册和授权的子集。
