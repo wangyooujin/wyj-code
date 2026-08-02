@@ -34,6 +34,11 @@ impl Tool for ExitPlanModeTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let plan = input["plan"].as_str().unwrap_or_default();
+        if !ctx.supports_interactive_confirmation() {
+            return Ok(ToolResult::ok(
+                "No interactive approval channel is available. Do not switch to execution mode. Present the completed plan to the user and end this run.",
+            ));
+        }
         let approved = ctx.exit_plan_mode(plan).await;
         if approved {
             Ok(ToolResult::ok(

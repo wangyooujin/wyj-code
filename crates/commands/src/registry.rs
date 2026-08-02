@@ -14,10 +14,31 @@ pub enum CommandResult {
     ClearHistory,
     /// 打开分组（Profile）管理面板（/model 无参触发）
     OpenProfileDialog,
+    ModelDoctor(Option<String>),
+    /// 展示当前 sandbox backend、边界、配置覆盖和 fail-closed 语义。
+    SandboxStatus,
     /// 按名切换激活分组（/model <name> 触发）
     SwitchProfile(String),
     /// 手动触发上下文压缩
     CompactHistory,
+    CreateCheckpoint {
+        name: Option<String>,
+        list: bool,
+    },
+    Rewind {
+        checkpoint_id: Option<String>,
+        scope: wyj_core::RewindScope,
+        confirmed: bool,
+    },
+    BranchSession {
+        checkpoint_id: Option<String>,
+        restore_files: bool,
+        confirmed: bool,
+    },
+    ControlSubAgent {
+        id: u64,
+        action: SubAgentControlAction,
+    },
     /// 退出应用
     Quit,
     /// 无动作（静默成功）
@@ -66,6 +87,13 @@ pub enum CommandResult {
     /// 打开定时任务面板（/schedule 命令触发）。headless 不支持，提示改用
     /// `wyj-code schedule` CLI 子命令。
     OpenScheduleDialog,
+}
+
+#[derive(Debug, Clone)]
+pub enum SubAgentControlAction {
+    FollowUp(String),
+    Interrupt,
+    RetryLast,
 }
 
 /// 命令执行上下文

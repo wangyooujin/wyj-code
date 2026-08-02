@@ -84,7 +84,9 @@ pub async fn send_with_retry(
             // 连接层错误（DNS/超时/连接重置）：可重试
             Err(e) => {
                 if !can_retry {
-                    return Err(anyhow::anyhow!("发送 {provider_name} 请求失败: {e}"));
+                    return Err(anyhow::Error::new(
+                        crate::error::ProviderError::from_transport(&e),
+                    ));
                 }
                 let delay = backoff_delay(policy, attempt);
                 tracing::warn!(
@@ -100,16 +102,24 @@ pub async fn send_with_retry(
                 }
                 let retryable = is_retryable_status(status.as_u16());
                 if !retryable || !can_retry {
+                    let headers = resp.headers().clone();
                     let err = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("{provider_name} API 错误 {status}: {err}");
+                    return Err(anyhow::Error::new(crate::error::ProviderError::from_http(
+                        status, &headers, &err,
+                    )));
                 }
                 // 429/529 优先尊重 Retry-After；超过上限则不傻等，直接失败
                 let delay = match parse_retry_after(resp.headers()) {
                     Some(ra) if ra > policy.retry_after_cap => {
+                        let headers = resp.headers().clone();
                         let err = resp.text().await.unwrap_or_default();
-                        anyhow::bail!(
-                            "{provider_name} API 错误 {status}（Retry-After {ra:?} 超过等待上限）: {err}"
+                        let mut provider_error =
+                            crate::error::ProviderError::from_http(status, &headers, &err);
+                        provider_error.redacted_message = format!(
+                            "{}; Retry-After {ra:?} exceeds configured wait cap",
+                            provider_error.redacted_message
                         );
+                        return Err(anyhow::Error::new(provider_error));
                     }
                     Some(ra) => ra,
                     None => backoff_delay(policy, attempt),

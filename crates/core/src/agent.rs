@@ -6,9 +6,11 @@ use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
 use crate::tool::{Tool, ToolCallMeta, ToolContext};
+use crate::tool_arguments::{ToolArgumentPipeline, ValidatedToolCall};
 use anyhow::Result;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use wyj_api::{
@@ -23,6 +25,13 @@ use wyj_api::{
 pub enum InjectionKind {
     UserMessage,
     SystemReminder,
+}
+
+fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
+    let bytes = serde_json::to_vec(tools)
+        .map(|value| value.len())
+        .unwrap_or(0);
+    ((bytes.saturating_add(3)) / 4).min(u32::MAX as usize) as u32
 }
 
 /// 工具执行事件（供回调使用，例如 headless 格式化输出或 TUI 事件推送）
@@ -41,12 +50,68 @@ pub enum ToolEvent {
     },
 }
 
+/// 同一角色的一个可切换模型目标。每个目标携带自己的能力快照和请求预算，
+/// 避免 fallback 到国内兼容端点后仍发送上一模型才支持的 schema/参数。
+#[derive(Clone)]
+pub struct AgentRoute {
+    pub profile_name: String,
+    pub vendor: String,
+    pub model: String,
+    pub provider: Arc<dyn Provider>,
+    pub capabilities: Option<wyj_api::ModelCapabilities>,
+    pub max_tokens: u32,
+    pub context_window: u32,
+    pub thinking_budget: Option<u32>,
+    pub interleaved_thinking: bool,
+}
+
+impl AgentRoute {
+    pub fn new(
+        profile_name: impl Into<String>,
+        vendor: impl Into<String>,
+        model: impl Into<String>,
+        provider: Arc<dyn Provider>,
+    ) -> Self {
+        Self {
+            profile_name: profile_name.into(),
+            vendor: vendor.into(),
+            model: model.into(),
+            provider,
+            capabilities: None,
+            max_tokens: 8192,
+            context_window: 200_000,
+            thinking_budget: None,
+            interleaved_thinking: true,
+        }
+    }
+
+    pub fn with_capabilities(mut self, capabilities: wyj_api::ModelCapabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_limits(mut self, max_tokens: u32, context_window: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self.context_window = context_window;
+        self
+    }
+
+    pub fn with_thinking(mut self, budget: Option<u32>, interleaved: bool) -> Self {
+        self.thinking_budget = budget.filter(|value| *value > 0);
+        self.interleaved_thinking = interleaved;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn Provider>,
     system_prompt: String,
     tools: Vec<ToolDefinition>,
     tool_impls: HashMap<String, Arc<dyn Tool>>,
+    tool_argument_pipeline: ToolArgumentPipeline,
+    model_capabilities: Option<wyj_api::ModelCapabilities>,
+    lazy_tool_state: Option<crate::tool_search::LazyToolState>,
     max_tokens: u32,
     max_turns: usize,
     /// 模型最大上下文窗口（token 数），用于触发自动压缩
@@ -72,11 +137,17 @@ pub struct Agent {
     /// Extended thinking 预算（None/0 = 关闭）与交错思考开关
     thinking_budget: Option<u32>,
     interleaved_thinking: bool,
+    route_profile_name: String,
+    route_vendor: String,
+    route_model: String,
+    fallback_routes: Vec<AgentRoute>,
+    active_route: Arc<AtomicUsize>,
     /// thinking 文本增量回调（TUI 展示 / headless stderr 输出）
     #[allow(clippy::type_complexity)]
     thinking_cb: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// Hooks 生命周期自动化执行器（可选，子 Agent 不设置，避免嵌套 shell 副作用）
     hook_runner: Option<Arc<HookRunner>>,
+    checkpoint_store: Option<Arc<crate::checkpoint::CheckpointStore>>,
 }
 
 impl Agent {
@@ -86,6 +157,9 @@ impl Agent {
             system_prompt: default_system_prompt(),
             tools: vec![],
             tool_impls: HashMap::new(),
+            tool_argument_pipeline: ToolArgumentPipeline::default(),
+            model_capabilities: None,
+            lazy_tool_state: None,
             max_tokens: 8192,
             // 真正的成本/时长上限由每轮 token 预算触发的自动压缩承担；这里仅防止模型死循环
             max_turns: 200,
@@ -100,8 +174,14 @@ impl Agent {
             git_snapshot: None,
             thinking_budget: None,
             interleaved_thinking: true,
+            route_profile_name: "active".to_string(),
+            route_vendor: "unknown".to_string(),
+            route_model: "unknown".to_string(),
+            fallback_routes: Vec::new(),
+            active_route: Arc::new(AtomicUsize::new(0)),
             thinking_cb: None,
             hook_runner: None,
+            checkpoint_store: None,
         }
     }
 
@@ -115,6 +195,38 @@ impl Agent {
     pub fn with_thinking(mut self, budget: Option<u32>, interleaved: bool) -> Self {
         self.thinking_budget = budget.filter(|b| *b > 0);
         self.interleaved_thinking = interleaved;
+        self
+    }
+
+    pub fn with_model_capabilities(mut self, capabilities: wyj_api::ModelCapabilities) -> Self {
+        self.model_capabilities = Some(capabilities);
+        self
+    }
+
+    pub fn with_route_identity(
+        mut self,
+        profile_name: impl Into<String>,
+        vendor: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.route_profile_name = profile_name.into();
+        self.route_vendor = vendor.into();
+        self.route_model = model.into();
+        self
+    }
+
+    /// 注册同角色 fallback。调用方负责按配置顺序传入；这里再次执行 vendor
+    /// 边界过滤，防止未来新增调用点意外绕过 `cross_provider_fallback = false`。
+    pub fn with_fallback_routes(
+        mut self,
+        routes: Vec<AgentRoute>,
+        cross_provider_fallback: bool,
+    ) -> Self {
+        let primary_vendor = self.route_vendor.clone();
+        self.fallback_routes = routes
+            .into_iter()
+            .filter(|route| cross_provider_fallback || route.vendor == primary_vendor)
+            .collect();
         self
     }
 
@@ -180,6 +292,34 @@ impl Agent {
         self
     }
 
+    pub fn with_checkpoint_store(mut self, store: Arc<crate::checkpoint::CheckpointStore>) -> Self {
+        self.checkpoint_store = Some(store);
+        self
+    }
+
+    pub fn set_checkpoint_store(&mut self, store: Arc<crate::checkpoint::CheckpointStore>) {
+        self.checkpoint_store = Some(store);
+    }
+
+    async fn create_checkpoint(
+        &self,
+        session: &mut Session,
+        cwd: &std::path::Path,
+        messages: Vec<wyj_api::types::Message>,
+        kind: crate::checkpoint::CheckpointKind,
+        name: Option<String>,
+    ) {
+        let Some(store) = self.checkpoint_store.as_ref().cloned() else {
+            return;
+        };
+        let cwd = cwd.to_path_buf();
+        match tokio::task::spawn_blocking(move || store.create(&cwd, &messages, kind, name)).await {
+            Ok(Ok(summary)) => session.current_checkpoint_id = Some(summary.id),
+            Ok(Err(error)) => tracing::warn!("创建 checkpoint 失败: {error}"),
+            Err(error) => tracing::warn!("checkpoint 任务异常退出: {error}"),
+        }
+    }
+
     /// 获取当前 Hooks 执行器引用（TUI 侧据此给 `/hooks` 命令提供启用状态）。
     pub fn hook_runner_ref(&self) -> Option<&Arc<HookRunner>> {
         self.hook_runner.as_ref()
@@ -224,6 +364,10 @@ impl Agent {
     pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
         let def = tool.definition();
         self.tools.retain(|d| d.name != def.name);
+        self.tool_argument_pipeline.register(&def);
+        if let Some(state) = &self.lazy_tool_state {
+            state.upsert(def.clone());
+        }
         self.tools.push(def);
         self.tool_impls.insert(tool.name().to_string(), tool);
     }
@@ -235,8 +379,22 @@ impl Agent {
     /// be able to remove integrations as well as add them; otherwise a disabled
     /// server would remain callable until the process restarted.
     pub fn remove_tools_where(&mut self, mut predicate: impl FnMut(&str) -> bool) {
-        self.tools.retain(|definition| !predicate(&definition.name));
-        self.tool_impls.retain(|name, _| !predicate(name));
+        let removed: HashSet<String> = self
+            .tools
+            .iter()
+            .filter(|definition| predicate(&definition.name))
+            .map(|definition| definition.name.clone())
+            .collect();
+        self.tools
+            .retain(|definition| !removed.contains(&definition.name));
+        self.tool_impls.retain(|name, _| !removed.contains(name));
+        self.tool_argument_pipeline
+            .remove_where(|name| removed.contains(name));
+        if let Some(state) = &self.lazy_tool_state {
+            for name in &removed {
+                state.remove(name);
+            }
+        }
     }
 
     /// Re-read definitions from runtime-mutable Tool implementations.
@@ -248,7 +406,11 @@ impl Agent {
         for (name, tool) in &self.tool_impls {
             let definition = tool.definition();
             if let Some(existing) = self.tools.iter_mut().find(|d| d.name == *name) {
-                *existing = definition;
+                *existing = definition.clone();
+            }
+            self.tool_argument_pipeline.register(&definition);
+            if let Some(state) = &self.lazy_tool_state {
+                state.upsert(definition);
             }
         }
     }
@@ -265,6 +427,71 @@ impl Agent {
             self.register_tool(t);
         }
         self
+    }
+
+    /// 仅暴露核心工具 schema；其他工具通过 ToolSearch 命中后按会话 sticky。
+    pub fn enable_lazy_tools(
+        &mut self,
+        core_tools: impl IntoIterator<Item = String>,
+        threshold: usize,
+        top_k: usize,
+        sticky_turns: u64,
+    ) -> bool {
+        if self.tools.len() <= threshold {
+            return false;
+        }
+        let state = crate::tool_search::LazyToolState::new(core_tools, top_k, sticky_turns);
+        for definition in &self.tools {
+            state.upsert(definition.clone());
+        }
+        self.lazy_tool_state = Some(state.clone());
+        self.register_tool(Arc::new(crate::tool_search::ToolSearchTool::new(state)));
+        true
+    }
+
+    fn route_at(&self, index: usize) -> AgentRoute {
+        if index == 0 {
+            AgentRoute {
+                profile_name: self.route_profile_name.clone(),
+                vendor: self.route_vendor.clone(),
+                model: self.route_model.clone(),
+                provider: self.provider.clone(),
+                capabilities: self.model_capabilities.clone(),
+                max_tokens: self.max_tokens,
+                context_window: self.context_window,
+                thinking_budget: self.thinking_budget,
+                interleaved_thinking: self.interleaved_thinking,
+            }
+        } else {
+            self.fallback_routes[index - 1].clone()
+        }
+    }
+
+    fn active_route_index(&self) -> usize {
+        self.active_route
+            .load(Ordering::Acquire)
+            .min(self.fallback_routes.len())
+    }
+
+    fn fallback_error_kind(error: &anyhow::Error) -> Option<wyj_api::ProviderErrorKind> {
+        error
+            .downcast_ref::<wyj_api::ProviderError>()
+            .filter(|provider_error| provider_error.retryable)
+            .map(|provider_error| provider_error.kind)
+    }
+
+    fn advance_route(
+        &self,
+        current_index: usize,
+        error: &anyhow::Error,
+    ) -> Option<(AgentRoute, wyj_api::ProviderErrorKind)> {
+        let kind = Self::fallback_error_kind(error)?;
+        let next_index = current_index + 1;
+        if next_index > self.fallback_routes.len() {
+            return None;
+        }
+        self.active_route.store(next_index, Ordering::Release);
+        Some((self.route_at(next_index), kind))
     }
 
     /// 执行一轮用户消息，流式回调文本，处理工具调用循环。
@@ -292,6 +519,9 @@ impl Agent {
         >,
         mut on_inject: impl FnMut(InjectionKind),
     ) -> Result<()> {
+        if let Some(state) = &self.lazy_tool_state {
+            state.begin_task_turn();
+        }
         // 构建 system prompt 基础部分：默认提示 + 跨会话记忆 + CLAUDE.md 祖先链。
         // CLAUDE.md 内容拼进 system prompt（而非注入 user 消息），配合 prompt caching
         // 使其首轮全价、后续轮次命中缓存按 0.1x 计费，避免跨轮线性累积。
@@ -311,6 +541,20 @@ impl Agent {
                 system.push_str("\n\n");
                 system.push_str(&reminder);
             }
+        }
+
+        // 调用方在进入 run_turn 前已 push 本次真实用户消息；checkpoint 保存其
+        // 之前的完整对话与当前工作树，确保 /rewind 可以回到提交前边界。
+        if !session.messages.is_empty() {
+            let previous_messages = session.messages[..session.messages.len() - 1].to_vec();
+            self.create_checkpoint(
+                session,
+                ctx.cwd(),
+                previous_messages,
+                crate::checkpoint::CheckpointKind::AutoUser,
+                None,
+            )
+            .await;
         }
 
         // 会话首轮：把 git 状态快照前插进首条 user 消息（仅一次，之后随
@@ -354,34 +598,11 @@ impl Agent {
         }
 
         let mut turn = 0;
+        let mut invalid_tool_rounds = 0usize;
         loop {
             turn += 1;
             if turn > self.max_turns {
                 anyhow::bail!("超过最大推理轮数 {}", self.max_turns);
-            }
-
-            let opts = wyj_api::provider::RequestOptions {
-                max_tokens: self.max_tokens,
-                thinking_budget: self.thinking_budget,
-                interleaved: self.interleaved_thinking,
-            };
-
-            // 检查下一次完整请求的 token 预算，超限时触发自动压缩。不能只看
-            // messages：system（含记忆/CLAUDE.md）、工具 schema 和输出预留都会
-            // 占用模型上下文窗口。
-            let estimated =
-                estimate_request_tokens(&system, &session.messages, &self.tools, opts.max_tokens);
-            let compact_threshold = self
-                .context_window
-                .saturating_sub(compact_trigger_buffer(self.context_window));
-            if estimated > compact_threshold {
-                match compact_session(session, self.provider.as_ref(), self.context_window).await {
-                    Ok(r) => on_text(&format!(
-                        "\n[已压缩对话历史：移除 {} 条消息，节省约 {} tokens]\n",
-                        r.messages_removed, r.tokens_saved_estimate
-                    )),
-                    Err(e) => tracing::warn!("上下文压缩失败: {e}"),
-                }
             }
 
             // 流式消费，带中断重试：流已消费一半时断开（网络重置、供应商
@@ -389,8 +610,6 @@ impl Agent {
             // 不变量：半成品 assistant 消息绝不 push 进 session（流完整结束
             // 才组装），故重试即重新生成，UI 可能出现重复文本片段但正确性无损。
             // usage 事件同样缓冲到流成功后才入账，避免失败尝试的重复计数。
-            const MAX_STREAM_RETRIES: u32 = 2;
-            let mut stream_retries: u32 = 0;
             // 按到达顺序累积的内容块（thinking 可与 tool_use 交错，顺序必须保留）
             enum StreamedBlock {
                 Text(String),
@@ -405,137 +624,308 @@ impl Agent {
                     json: String,
                 },
             }
-            let (blocks, stop_reason) = loop {
-                session.api_calls += 1;
-                let mut stream = self
-                    .provider
-                    .stream(&system, &session.messages, &self.tools, &opts)
-                    .await?;
+            let mut route_index = self.active_route_index();
+            let (blocks, stop_reason, used_route) = 'route_attempt: loop {
+                let route = self.route_at(route_index);
+                let mut request_system = system.clone();
+                if let Some(capabilities) = &route.capabilities {
+                    let suffix = wyj_api::PromptPolicy::compatibility_suffix(capabilities);
+                    if !suffix.is_empty() {
+                        request_system.push_str("\n\n");
+                        request_system.push_str(suffix);
+                    }
+                }
+                let opts = if let Some(capabilities) = &route.capabilities {
+                    wyj_api::provider::RequestOptions {
+                        max_tokens: route.max_tokens.min(capabilities.max_output_tokens),
+                        thinking_budget: route.thinking_budget.filter(|_| {
+                            matches!(
+                                capabilities.thinking.value,
+                                wyj_api::ThinkingMode::BudgetTokens
+                            )
+                        }),
+                        interleaved: route.interleaved_thinking
+                            && capabilities.interleaved_thinking.value,
+                    }
+                } else {
+                    wyj_api::provider::RequestOptions {
+                        max_tokens: route.max_tokens,
+                        thinking_budget: route.thinking_budget,
+                        interleaved: route.interleaved_thinking,
+                    }
+                };
+                let candidate_tools: Vec<ToolDefinition> = match &route.capabilities {
+                    Some(capabilities) if !capabilities.tool_calling.value => Vec::new(),
+                    Some(capabilities) if !capabilities.strict_tool_schema.value => self
+                        .tools
+                        .iter()
+                        .map(crate::tool_arguments::simplified_tool_definition)
+                        .collect(),
+                    _ => self.tools.clone(),
+                };
+                let all_schema_tokens = estimate_tool_schema_tokens(&candidate_tools);
+                let request_tools: Vec<ToolDefinition> = candidate_tools
+                    .into_iter()
+                    .filter(|definition| {
+                        self.lazy_tool_state
+                            .as_ref()
+                            .map(|state| state.visible(&definition.name))
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
+                session.tool_schema_tokens = session
+                    .tool_schema_tokens
+                    .saturating_add(sent_schema_tokens);
+                session.tool_schema_tokens_saved = session
+                    .tool_schema_tokens_saved
+                    .saturating_add(all_schema_tokens.saturating_sub(sent_schema_tokens));
 
-                let mut blocks: Vec<StreamedBlock> = vec![];
-                let mut current_tool_idx: Option<usize> = None;
-                let mut stop_reason = StopReason::EndTurn;
-                let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
-                let mut stream_err: Option<anyhow::Error> = None;
+                // 按当前路由目标的真实窗口与能力估算；fallback 模型可能比主模型
+                // 上下文更小，不能复用主模型预算。
+                let estimated = estimate_request_tokens(
+                    &request_system,
+                    &session.messages,
+                    &request_tools,
+                    opts.max_tokens,
+                );
+                let compact_threshold = route
+                    .context_window
+                    .saturating_sub(compact_trigger_buffer(route.context_window));
+                if estimated > compact_threshold {
+                    match compact_session(session, route.provider.as_ref(), route.context_window)
+                        .await
+                    {
+                        Ok(result) => on_text(&format!(
+                            "\n[已压缩对话历史：移除 {} 条消息，节省约 {} tokens]\n",
+                            result.messages_removed, result.tokens_saved_estimate
+                        )),
+                        Err(error) => tracing::warn!("上下文压缩失败: {error}"),
+                    }
+                }
 
-                while let Some(event) = stream.next().await {
-                    let event = match event {
-                        Ok(ev) => ev,
-                        Err(e) => {
-                            stream_err = Some(e);
-                            break;
+                const MAX_STREAM_RETRIES: u32 = 2;
+                let mut stream_retries: u32 = 0;
+                let mut effective_opts = opts;
+                let mut parameter_degraded = false;
+                let result = loop {
+                    session.api_calls += 1;
+                    let mut stream = match route
+                        .provider
+                        .stream(
+                            &request_system,
+                            &session.messages,
+                            &request_tools,
+                            &effective_opts,
+                        )
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            let safe_parameter = error
+                                .downcast_ref::<wyj_api::ProviderError>()
+                                .filter(|provider_error| {
+                                    provider_error.kind
+                                        == wyj_api::ProviderErrorKind::UnsupportedParameter
+                                })
+                                .and_then(|provider_error| provider_error.parameter.as_deref())
+                                .filter(|parameter| {
+                                    matches!(
+                                        *parameter,
+                                        "thinking" | "thinking_budget" | "interleaved_thinking"
+                                    )
+                                });
+                            if !parameter_degraded && safe_parameter.is_some() {
+                                let parameter = safe_parameter.unwrap_or("thinking");
+                                parameter_degraded = true;
+                                effective_opts.thinking_budget = None;
+                                effective_opts.interleaved = false;
+                                on_text(&format!(
+                                    "\n[模型端点不支持参数 `{parameter}`，已安全移除后重试一次]\n"
+                                ));
+                                continue;
+                            }
+                            if let Some((next, kind)) = self.advance_route(route_index, &error) {
+                                session.routing_events.push(crate::session::RoutingEvent {
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    from_profile: route.profile_name.clone(),
+                                    to_profile: next.profile_name.clone(),
+                                    error_kind: kind,
+                                    boundary: "before_assistant_commit".to_string(),
+                                });
+                                on_text(&format!(
+                                    "\n[模型 `{}` 暂时不可用（{:?}），已在完整消息边界切换到同角色 `{}`]\n",
+                                    route.profile_name, kind, next.profile_name
+                                ));
+                                route_index += 1;
+                                continue 'route_attempt;
+                            }
+                            return Err(error);
                         }
                     };
-                    match event {
-                        StreamEvent::TextDelta(delta) => {
-                            on_text(&delta);
-                            match blocks.last_mut() {
-                                Some(StreamedBlock::Text(t)) => t.push_str(&delta),
-                                _ => blocks.push(StreamedBlock::Text(delta)),
+
+                    let mut blocks: Vec<StreamedBlock> = vec![];
+                    let mut current_tool_idx: Option<usize> = None;
+                    let mut stop_reason = StopReason::EndTurn;
+                    let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
+                    let mut stream_err: Option<anyhow::Error> = None;
+
+                    while let Some(event) = stream.next().await {
+                        let event = match event {
+                            Ok(ev) => ev,
+                            Err(e) => {
+                                stream_err = Some(e);
+                                break;
                             }
-                        }
-                        StreamEvent::ThinkingStart => {
-                            blocks.push(StreamedBlock::Thinking {
-                                text: String::new(),
-                                signature: String::new(),
-                            });
-                        }
-                        StreamEvent::ThinkingDelta(delta) => {
-                            if let Some(cb) = &self.thinking_cb {
-                                cb(&delta);
+                        };
+                        match event {
+                            StreamEvent::TextDelta(delta) => {
+                                on_text(&delta);
+                                match blocks.last_mut() {
+                                    Some(StreamedBlock::Text(t)) => t.push_str(&delta),
+                                    _ => blocks.push(StreamedBlock::Text(delta)),
+                                }
                             }
-                            match blocks.last_mut() {
-                                Some(StreamedBlock::Thinking { text, .. }) => text.push_str(&delta),
-                                _ => blocks.push(StreamedBlock::Thinking {
-                                    text: delta,
+                            StreamEvent::ThinkingStart => {
+                                blocks.push(StreamedBlock::Thinking {
+                                    text: String::new(),
                                     signature: String::new(),
-                                }),
+                                });
                             }
-                        }
-                        StreamEvent::ThinkingSignatureDelta(sig) => {
-                            if let Some(StreamedBlock::Thinking { signature, .. }) =
-                                blocks.last_mut()
-                            {
-                                signature.push_str(&sig);
+                            StreamEvent::ThinkingDelta(delta) => {
+                                if let Some(cb) = &self.thinking_cb {
+                                    cb(&delta);
+                                }
+                                match blocks.last_mut() {
+                                    Some(StreamedBlock::Thinking { text, .. }) => {
+                                        text.push_str(&delta)
+                                    }
+                                    _ => blocks.push(StreamedBlock::Thinking {
+                                        text: delta,
+                                        signature: String::new(),
+                                    }),
+                                }
                             }
-                        }
-                        StreamEvent::RedactedThinking(data) => {
-                            blocks.push(StreamedBlock::Redacted(data));
-                        }
-                        StreamEvent::ToolUseStart { id, name } => {
-                            blocks.push(StreamedBlock::ToolUse {
-                                id,
-                                name,
-                                json: String::new(),
-                            });
-                            current_tool_idx = Some(blocks.len() - 1);
-                        }
-                        StreamEvent::ToolUseDelta { id, json_delta } => {
-                            let idx = if id.is_empty() {
-                                current_tool_idx
-                            } else {
-                                blocks.iter().position(|b| {
+                            StreamEvent::ThinkingSignatureDelta(sig) => {
+                                if let Some(StreamedBlock::Thinking { signature, .. }) =
+                                    blocks.last_mut()
+                                {
+                                    signature.push_str(&sig);
+                                }
+                            }
+                            StreamEvent::RedactedThinking(data) => {
+                                blocks.push(StreamedBlock::Redacted(data));
+                            }
+                            StreamEvent::ToolUseStart { id, name } => {
+                                blocks.push(StreamedBlock::ToolUse {
+                                    id,
+                                    name,
+                                    json: String::new(),
+                                });
+                                current_tool_idx = Some(blocks.len() - 1);
+                            }
+                            StreamEvent::ToolUseDelta { id, json_delta } => {
+                                let idx = if id.is_empty() {
+                                    current_tool_idx
+                                } else {
+                                    blocks.iter().position(|b| {
                                     matches!(b, StreamedBlock::ToolUse { id: tid, .. } if *tid == id)
                                 })
-                            };
-                            if let Some(StreamedBlock::ToolUse { json, .. }) =
-                                idx.and_then(|i| blocks.get_mut(i))
-                            {
-                                json.push_str(&json_delta);
+                                };
+                                if let Some(StreamedBlock::ToolUse { json, .. }) =
+                                    idx.and_then(|i| blocks.get_mut(i))
+                                {
+                                    json.push_str(&json_delta);
+                                }
                             }
-                        }
-                        StreamEvent::ToolUseEnd { .. } => {}
-                        StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
-                        StreamEvent::Usage {
-                            input_tokens,
-                            output_tokens,
-                            cache_read_input_tokens,
-                            cache_creation_input_tokens,
-                        } => {
-                            pending_usage.push((
+                            StreamEvent::ToolUseEnd { .. } => {}
+                            StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
+                            StreamEvent::Usage {
                                 input_tokens,
                                 output_tokens,
                                 cache_read_input_tokens,
                                 cache_creation_input_tokens,
-                            ));
-                        }
-                    }
-                }
-
-                match stream_err {
-                    Some(e) if stream_retries < MAX_STREAM_RETRIES => {
-                        stream_retries += 1;
-                        tracing::warn!("流中断（第 {stream_retries} 次重试）: {e}");
-                        on_text(&format!(
-                            "\n[连接中断，正在重试 {stream_retries}/{MAX_STREAM_RETRIES}...]\n"
-                        ));
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            1 << stream_retries.min(5),
-                        ))
-                        .await;
-                        continue;
-                    }
-                    Some(e) => return Err(e),
-                    None => {
-                        // 流完整结束：usage 一次性入账。供应商返回的 input_tokens
-                        // 仅含未命中缓存的（全价）部分，缓存命中（0.1x）与缓存
-                        // 写入（1.25x）单独累计用于 /cost 展示。
-                        for (input, output, cache_read, cache_write) in pending_usage {
-                            session.add_usage(input, output);
-                            session.add_cache_usage(cache_read, cache_write);
-                            if let Some(cb) = &self.usage_cb {
-                                cb(input, output);
+                            } => {
+                                pending_usage.push((
+                                    input_tokens,
+                                    output_tokens,
+                                    cache_read_input_tokens,
+                                    cache_creation_input_tokens,
+                                ));
                             }
                         }
-                        break (blocks, stop_reason);
+                    }
+
+                    match stream_err {
+                        Some(error) if stream_retries < MAX_STREAM_RETRIES => {
+                            stream_retries += 1;
+                            tracing::warn!("流中断（第 {stream_retries} 次重试）: {error}");
+                            on_text(&format!(
+                                "\n[连接中断，正在重试 {stream_retries}/{MAX_STREAM_RETRIES}...]\n"
+                            ));
+                            tokio::time::sleep(std::time::Duration::from_secs(
+                                1 << stream_retries.min(5),
+                            ))
+                            .await;
+                            continue;
+                        }
+                        Some(error) => break Err(error),
+                        None => {
+                            // 流完整结束：usage 一次性入账。供应商返回的 input_tokens
+                            // 仅含未命中缓存的（全价）部分，缓存命中（0.1x）与缓存
+                            // 写入（1.25x）单独累计用于 /cost 展示。
+                            for (input, output, cache_read, cache_write) in pending_usage {
+                                session.add_usage(input, output);
+                                session.add_cache_usage(cache_read, cache_write);
+                                if let Some(cb) = &self.usage_cb {
+                                    cb(input, output);
+                                }
+                            }
+                            break Ok((blocks, stop_reason));
+                        }
+                    }
+                };
+                match result {
+                    Ok((blocks, stop_reason)) => break 'route_attempt (blocks, stop_reason, route),
+                    Err(error) => {
+                        if let Some((next, kind)) = self.advance_route(route_index, &error) {
+                            session.routing_events.push(crate::session::RoutingEvent {
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                from_profile: route.profile_name.clone(),
+                                to_profile: next.profile_name.clone(),
+                                error_kind: kind,
+                                boundary: "before_assistant_commit".to_string(),
+                            });
+                            on_text(&format!(
+                                "\n[模型 `{}` 的未完成输出已丢弃（{:?}），已在完整消息边界切换到同角色 `{}`]\n",
+                                route.profile_name, kind, next.profile_name
+                            ));
+                            route_index += 1;
+                            continue 'route_attempt;
+                        }
+                        return Err(error);
                     }
                 }
             };
 
             // 组装助手内容块（保持到达顺序；thinking 块含 signature 原样入历史，
             // 工具调用续轮时回传给 API —— 缺失会被 Anthropic 拒绝）
+            enum PendingToolCall {
+                Valid(ValidatedToolCall),
+                Invalid {
+                    id: String,
+                    name: String,
+                    feedback: String,
+                },
+            }
             let mut assistant_blocks = vec![];
-            let mut pending_tools: Vec<(String, String, String)> = vec![]; // (id, name, json)
+            let mut pending_tools: Vec<PendingToolCall> = vec![];
+            let max_tools_this_turn = used_route
+                .capabilities
+                .as_ref()
+                .map(|capabilities| capabilities.max_tools_per_turn.max(1))
+                .unwrap_or(usize::MAX);
+            let mut seen_tool_calls = 0usize;
             for b in &blocks {
                 match b {
                     StreamedBlock::Text(t) => {
@@ -554,14 +944,100 @@ impl Agent {
                             .push(ContentBlock::RedactedThinking { data: data.clone() });
                     }
                     StreamedBlock::ToolUse { id, name, json } => {
-                        let input = serde_json::from_str(json)
-                            .unwrap_or(serde_json::Value::Object(Default::default()));
-                        assistant_blocks.push(ContentBlock::ToolUse {
+                        if self
+                            .lazy_tool_state
+                            .as_ref()
+                            .is_some_and(|state| !state.visible(name))
+                        {
+                            let feedback = serde_json::json!({
+                                "error": "tool_schema_not_exposed",
+                                "tool": name,
+                                "instruction": "Call ToolSearch for the needed capability, then retry on the next turn."
+                            })
+                            .to_string();
+                            assistant_blocks.push(ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({
+                                    "_wyj_code_tool_schema_not_exposed": true
+                                }),
+                            });
+                            pending_tools.push(PendingToolCall::Invalid {
+                                id: id.clone(),
+                                name: name.clone(),
+                                feedback,
+                            });
+                            continue;
+                        }
+                        if let Some(state) = &self.lazy_tool_state {
+                            state.mark_used(name);
+                        }
+                        seen_tool_calls += 1;
+                        if seen_tool_calls > max_tools_this_turn {
+                            let feedback = serde_json::json!({
+                                "error": "tool_limit_exceeded",
+                                "tool": name,
+                                "max_tools_per_turn": max_tools_this_turn,
+                                "instruction": "Regenerate only one tool call in the next response."
+                            })
+                            .to_string();
+                            assistant_blocks.push(ContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::json!({
+                                    "_wyj_code_tool_limit_exceeded": true
+                                }),
+                            });
+                            pending_tools.push(PendingToolCall::Invalid {
+                                id: id.clone(),
+                                name: name.clone(),
+                                feedback,
+                            });
+                            continue;
+                        }
+                        let raw_call = wyj_api::types::RawToolCall {
                             id: id.clone(),
                             name: name.clone(),
-                            input,
-                        });
-                        pending_tools.push((id.clone(), name.clone(), json.clone()));
+                            raw_arguments: json.clone(),
+                        };
+                        match self.tool_argument_pipeline.process(raw_call) {
+                            Ok(call) => {
+                                if call.syntax_repaired {
+                                    on_text(&format!(
+                                        "\n[已对工具 `{}` 的参数应用安全语法修复]\n",
+                                        call.name
+                                    ));
+                                }
+                                assistant_blocks.push(ContentBlock::ToolUse {
+                                    id: call.id.clone(),
+                                    name: call.name.clone(),
+                                    input: call.input.clone(),
+                                });
+                                pending_tools.push(PendingToolCall::Valid(call));
+                            }
+                            Err(error) => {
+                                let feedback = error.feedback_json();
+                                tracing::warn!(
+                                    tool = %name,
+                                    kind = ?error.kind,
+                                    "拒绝执行无效工具参数"
+                                );
+                                // 协议续轮要求 assistant tool_use 与 tool_result 成对。
+                                // 这里只保存不可执行标记，绝不把解析失败降级成 {} / null。
+                                assistant_blocks.push(ContentBlock::ToolUse {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    input: serde_json::json!({
+                                        "_wyj_code_invalid_arguments": true
+                                    }),
+                                });
+                                pending_tools.push(PendingToolCall::Invalid {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                    feedback,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -570,36 +1046,82 @@ impl Agent {
             let has_tool_calls = stop_reason == StopReason::ToolUse && !pending_tools.is_empty();
 
             if has_tool_calls {
-                // 解析输入并收集 CLAUDE.md 触达目录（按原始调用顺序）
-                let calls: Vec<(String, String, serde_json::Value)> = pending_tools
-                    .into_iter()
-                    .map(|(id, name, json)| {
-                        let input = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
-                        (id, name, input)
-                    })
-                    .collect();
+                // 参数已由 ToolArgumentPipeline 严格解析并按原始 schema 校验。
+                // 无效调用只生成机器可读错误，绝不进入 exec_tool_call。
+                let total = pending_tools.len();
+                let mut calls = Vec::new();
+                let mut tool_results = Vec::new();
+                let mut invalid_count = 0usize;
+                for (idx, pending) in pending_tools.into_iter().enumerate() {
+                    match pending {
+                        PendingToolCall::Valid(call) => {
+                            calls.push((idx, call.id, call.name, call.input));
+                        }
+                        PendingToolCall::Invalid { id, name, feedback } => {
+                            invalid_count += 1;
+                            if let Some(cb) = &self.tool_cb {
+                                cb(ToolEvent::End {
+                                    id: id.clone(),
+                                    name,
+                                    is_error: true,
+                                    elapsed_secs: 0.0,
+                                    output: feedback.clone(),
+                                });
+                            }
+                            tool_results.push((
+                                idx,
+                                (id, wyj_api::types::ToolResultContent::Text(feedback), true),
+                            ));
+                        }
+                    }
+                }
                 let mut touched_dirs: Vec<std::path::PathBuf> = vec![];
                 if self.claude_md.is_some() {
-                    for (_, name, input) in &calls {
+                    for (_, _, name, input) in &calls {
                         if let Some(dir) = touched_dir(name, input, ctx.cwd()) {
                             touched_dirs.push(dir);
                         }
                     }
                 }
+                let has_side_effect = calls.iter().any(|(_, _, name, input)| {
+                    self.tool_impls
+                        .get(name)
+                        .map(|tool| tool.needs_permission(input))
+                        .unwrap_or(false)
+                });
+                if has_side_effect {
+                    let pre_tool_messages = session
+                        .messages
+                        .get(..session.messages.len().saturating_sub(1))
+                        .unwrap_or_default()
+                        .to_vec();
+                    self.create_checkpoint(
+                        session,
+                        ctx.cwd(),
+                        pre_tool_messages,
+                        crate::checkpoint::CheckpointKind::PreTool,
+                        None,
+                    )
+                    .await;
+                }
 
                 // 分区执行：parallel_safe 的调用（如 SubAgent）各自并发，其余调用
                 // 保持相互顺序、但与并发组同时进行；结果按原始下标排序回填保序。
                 // 均为单任务内并发（join!），不要求 ctx 满足 Send/'static。
-                let total = calls.len();
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
-                for (idx, (id, name, input)) in calls.into_iter().enumerate() {
+                for (idx, id, name, input) in calls {
                     let is_par = self
                         .tool_impls
                         .get(&name)
                         .map(|t| t.parallel_safe())
                         .unwrap_or(false);
-                    if is_par && total > 1 {
+                    let model_allows_parallel = used_route
+                        .capabilities
+                        .as_ref()
+                        .map(|capabilities| capabilities.parallel_tool_calls.value)
+                        .unwrap_or(true);
+                    if is_par && total > 1 && model_allows_parallel {
                         par_futs.push(async move {
                             (idx, self.exec_tool_call(ctx, id, name, input).await)
                         });
@@ -617,10 +1139,30 @@ impl Agent {
                 let (par_results, seq_results) =
                     tokio::join!(futures::future::join_all(par_futs), seq_fut);
 
-                let mut tool_results: Vec<_> = par_results.into_iter().chain(seq_results).collect();
+                tool_results.extend(par_results.into_iter().chain(seq_results));
                 tool_results.sort_by_key(|(idx, _)| *idx);
                 for (_, (id, output, is_error)) in tool_results {
                     session.push_tool_result(id, output, is_error);
+                }
+                if has_side_effect {
+                    let post_tool_messages = session.messages.clone();
+                    self.create_checkpoint(
+                        session,
+                        ctx.cwd(),
+                        post_tool_messages,
+                        crate::checkpoint::CheckpointKind::PostTool,
+                        None,
+                    )
+                    .await;
+                }
+
+                if invalid_count > 0 {
+                    invalid_tool_rounds += 1;
+                    if invalid_tool_rounds > 2 {
+                        anyhow::bail!("工具参数连续校验失败，已停止执行以避免无界重试");
+                    }
+                } else {
+                    invalid_tool_rounds = 0;
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
@@ -686,7 +1228,7 @@ impl Agent {
             if !has_tool_calls && !got_injection {
                 // 对话轮次结束，触发后台记忆提取
                 if let Some(mem) = self.memory.as_ref().cloned() {
-                    let provider = self.provider.clone();
+                    let provider = self.route_at(self.active_route_index()).provider;
                     let msgs = session.messages.clone();
                     tokio::spawn(async move {
                         if let Err(e) = mem.extract_and_save(msgs, provider).await {
@@ -759,8 +1301,17 @@ impl Agent {
                     let msg = format!("PreToolUse hook 拦截了工具 `{name}`：{reason}");
                     (msg.clone(), ToolResultContent::Text(msg), true)
                 }
-                // approve：跳过 is_allowed / needs_permission+confirm_tool 两道闸门，直接执行
-                HookOutcome::Approve => run_tool(&t, input, ctx, &meta).await,
+                // approve 只能替代交互确认，不能绕过模式白名单、路径范围、
+                // protected path 或 require-sandbox 等强制策略。
+                HookOutcome::Approve => {
+                    if !ctx.is_allowed(&name, &input) {
+                        let msg =
+                            format!("工具 `{name}` 被强制权限策略拒绝；hook approve 无权绕过");
+                        (msg.clone(), ToolResultContent::Text(msg), true)
+                    } else {
+                        run_tool(&t, input, ctx, &meta).await
+                    }
+                }
                 HookOutcome::Passthrough | HookOutcome::Continue { .. } => {
                     if !ctx.is_allowed(&name, &input) {
                         let msg = format!("工具 `{name}` 在当前模式下不被允许");
@@ -834,7 +1385,8 @@ impl Agent {
         &self,
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
-        compact_session(session, self.provider.as_ref(), self.context_window).await
+        let route = self.route_at(self.active_route_index());
+        compact_session(session, route.provider.as_ref(), route.context_window).await
     }
 }
 
@@ -1074,7 +1626,204 @@ mod tests {
         }
     }
 
-    /// `is_allowed` 恒返回 false，用于验证 PreToolUse `Approve` 能绕过它
+    struct RequiredCountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn lazy_tools_only_activate_above_the_configured_threshold() {
+        let mut small = Agent::new(Arc::new(EndTurnProvider));
+        small.register_tool(Arc::new(CountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert!(!small.enable_lazy_tools(Vec::<String>::new(), 1, 8, 3));
+        assert!(small.lazy_tool_state.is_none());
+        assert!(!small
+            .tools
+            .iter()
+            .any(|definition| definition.name == "ToolSearch"));
+
+        let mut large = Agent::new(Arc::new(EndTurnProvider));
+        large.register_tool(Arc::new(CountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        assert!(large.enable_lazy_tools(Vec::<String>::new(), 0, 8, 3));
+        assert!(large.lazy_tool_state.is_some());
+        assert!(large
+            .tools
+            .iter()
+            .any(|definition| definition.name == "ToolSearch"));
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RequiredCountingTool {
+        fn name(&self) -> &str {
+            "RequiredEcho"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "RequiredEcho".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["value"],
+                    "properties": {"value": {"type": "string"}},
+                    "additionalProperties": false
+                }),
+                native: None,
+            }
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok("echoed".to_string()))
+        }
+    }
+
+    struct MalformedThenTextProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for MalformedThenTextProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = if self.calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "bad-1".into(),
+                        name: "Echo".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "bad-1".into(),
+                        json_delta: r#"{"command":"unterminated"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("recovered".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_are_reported_but_never_executed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(MalformedThenTextProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(CountingTool {
+            calls: calls.clone(),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(session.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult { content: ToolResultContent::Text(text), is_error: true, .. }
+                        if text.contains("tool_arguments_invalid")
+                )
+            })
+        }));
+    }
+
+    struct InvalidSchemaThenCorrectProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for InvalidSchemaThenCorrectProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = match n {
+                0 => vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "schema-bad".into(),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "schema-bad".into(),
+                        json_delta: "{}".into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ],
+                1 => vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "schema-good".into(),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "schema-good".into(),
+                        json_delta: r#"{"value":"ok"}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ],
+                _ => vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_error_is_targeted_and_corrected_call_executes_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(InvalidSchemaThenCorrectProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(RequiredCountingTool {
+            calls: calls.clone(),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(session.api_calls >= 3);
+    }
+
+    /// `is_allowed` 恒返回 false，用于验证 PreToolUse `Approve` 不能绕过强制策略。
     struct DenyAllCtx;
     #[async_trait::async_trait]
     impl ToolContext for DenyAllCtx {
@@ -1141,7 +1890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_tool_use_approve_bypasses_is_allowed() {
+    async fn pre_tool_use_approve_cannot_bypass_is_allowed() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mut agent = Agent::new(Arc::new(EndTurnProvider));
         agent.register_tool(Arc::new(CountingTool {
@@ -1161,11 +1910,11 @@ mod tests {
             )
             .await;
 
-        assert!(!is_error);
+        assert!(is_error);
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "approve 应绕过 is_allowed 直接执行"
+            0,
+            "hook approve 只能跳过交互询问，不能绕过强制权限策略"
         );
     }
 
@@ -1362,6 +2111,156 @@ mod tests {
     struct FlakyProvider {
         calls: AtomicUsize,
     }
+
+    struct UnsupportedThinkingThenSuccessProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for UnsupportedThinkingThenSuccessProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut error = wyj_api::ProviderError::new(
+                    wyj_api::ProviderErrorKind::UnsupportedParameter,
+                    "thinking is unsupported",
+                );
+                error.parameter = Some("thinking".to_string());
+                return Err(anyhow::Error::new(error));
+            }
+            assert_eq!(opts.thinking_budget, None);
+            assert!(!opts.interleaved);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_safe_parameter_is_removed_once_and_reported() {
+        let agent = Agent::new(Arc::new(UnsupportedThinkingThenSuccessProvider {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_thinking(Some(1024), true);
+        let mut session = Session::new();
+        session.push_user("hi");
+        let mut visible = String::new();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+            .await
+            .unwrap();
+        assert!(visible.contains("已安全移除后重试一次"));
+        assert_eq!(session.api_calls, 2);
+    }
+
+    struct TypedFailureProvider {
+        kind: wyj_api::ProviderErrorKind,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for TypedFailureProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(wyj_api::ProviderError::new(
+                self.kind,
+                "typed test failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_switches_route_once_at_message_boundary() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup = AgentRoute::new(
+            "backup",
+            "minimax",
+            "backup-model",
+            Arc::new(CountingEndTurnProvider {
+                calls: backup_calls.clone(),
+            }),
+        );
+        let agent = Agent::new(Arc::new(TypedFailureProvider {
+            kind: wyj_api::ProviderErrorKind::RateLimited,
+            calls: primary_calls.clone(),
+        }))
+        .with_route_identity("primary", "minimax", "primary-model")
+        .with_fallback_routes(vec![backup], false);
+        let mut session = Session::new();
+        session.push_user("hi");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.routing_events.len(), 1);
+        assert_eq!(session.routing_events[0].from_profile, "primary");
+        assert_eq!(session.routing_events[0].to_profile, "backup");
+        assert_eq!(
+            session.routing_events[0].boundary,
+            "before_assistant_commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_failure_never_falls_back() {
+        let backup_calls = Arc::new(AtomicUsize::new(0));
+        let backup = AgentRoute::new(
+            "backup",
+            "minimax",
+            "backup-model",
+            Arc::new(CountingEndTurnProvider {
+                calls: backup_calls.clone(),
+            }),
+        );
+        let agent = Agent::new(Arc::new(TypedFailureProvider {
+            kind: wyj_api::ProviderErrorKind::Authentication,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }))
+        .with_route_identity("primary", "minimax", "primary-model")
+        .with_fallback_routes(vec![backup], false);
+        let mut session = Session::new();
+        session.push_user("hi");
+
+        assert!(agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .is_err());
+        assert_eq!(backup_calls.load(Ordering::SeqCst), 0);
+        assert!(session.routing_events.is_empty());
+    }
+
+    #[test]
+    fn cross_vendor_fallback_is_filtered_by_default() {
+        let backup = AgentRoute::new(
+            "backup",
+            "another-vendor",
+            "backup-model",
+            Arc::new(EndTurnProvider),
+        );
+        let agent = Agent::new(Arc::new(EndTurnProvider))
+            .with_route_identity("primary", "minimax", "primary-model")
+            .with_fallback_routes(vec![backup], false);
+        assert!(agent.fallback_routes.is_empty());
+    }
+
     #[async_trait::async_trait]
     impl Provider for FlakyProvider {
         async fn stream(

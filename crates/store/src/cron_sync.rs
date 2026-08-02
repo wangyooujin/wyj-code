@@ -235,6 +235,8 @@ mod tests {
             cron: cron.to_string(),
             cwd: PathBuf::from("/tmp"),
             enabled,
+            needs_permission_review: false,
+            permissions: crate::schedule::SchedulePermissions::default(),
             notify_on_failure: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),

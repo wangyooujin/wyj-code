@@ -59,12 +59,12 @@ claude_md:
     subdir: "子目录"
 
 cli:
-  about: "wyj-code — 终端 AI 编程助手"
+  about: "wyj-code — 国内模型优先、默认安全失败关闭的终端 AI 编程助手"
   prompt_help: "单次问答（不启动 TUI）"
   cwd_help: "工作目录（默认当前目录）"
   headless_help: "强制使用 headless REPL 模式"
-  plan_help: "Plan 模式：仅启用只读工具（read/glob/grep/web_fetch），适合规划分析"
-  bypass_help: "Bypass 模式：自动允许所有工具调用，不弹权限确认对话框"
+  plan_help: "Plan 模式：允许只读分析和受限规划文档写入，源码/脚本/配置与 Bash 写入继续拒绝"
+  bypass_help: "Bypass 模式：跳过普通工具确认，但不会关闭 OS sandbox 或覆盖 protected deny"
   no_hooks_help: "禁用 Hooks 自动化系统（不执行 .claude/settings.json 中的 shell hook）"
   continue_help: "恢复上次会话（继续上次对话）"
   resume_help: "恢复指定会话 ID（如 sess-1719723000）"
@@ -318,6 +318,10 @@ schedule:
     cron: "Cron 表达式"
     cwd: "工作目录"
     notify_on_failure: "失败时通知"
+    allowed_tools: "允许工具"
+    allow_write: "写入目录"
+    allowed_domains: "网络域名"
+    require_sandbox: "强制 Sandbox"
   dialog:
     hint1: "  ↑↓ 移动  Enter 操作菜单  Ctrl+S 保存"
     hint2: "  Esc 关闭"
@@ -333,6 +337,8 @@ schedule:
     disable: "停用"
     run_now: "立即运行一次"
     run_now_needs_save: "请先保存该任务的改动再运行"
+    review_permissions: "确认当前权限清单"
+    permissions_reviewed: "权限清单已审查"
     delete: "删除"
     edit: "编辑"
     toggle: "切换"
@@ -342,6 +348,8 @@ schedule:
     freq_custom: "自定义 cron 表达式（高级）"
     new_blank: "新建空白任务"
     new_from_session: "从当前对话固化为模板"
+  permissions:
+    review_complete: "权限清单已确认；任务保持禁用，请检查后再显式启用。"
   error:
     empty_name: "任务名称不能为空"
     empty_prompt: "Prompt 不能为空"
@@ -621,6 +629,7 @@ dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
   permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
+  permission_hint_once: "  [y] 仅本次无隔离执行   [d] 拒绝   (不可持久授权)"
   permission_hint_project_once: "  [y/a] 允许本项目（后续不再询问）   [d] 拒绝并说明   (Esc 拒绝)"
   project_trust_title: " ⚠ 项目级 MCP server 待信任确认 "
   project_trust_intro: "以下项目级 MCP server 会被当作子进程执行，请确认信任后再连接："

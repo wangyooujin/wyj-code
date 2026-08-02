@@ -4,7 +4,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::process::Command;
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
@@ -76,12 +75,23 @@ impl Tool for BashTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
+        let sandbox_policy = ctx.sandbox_policy();
 
         // 后台执行：立即返回任务 id，输出经 BashOutput 增量读取
         if inp.run_in_background {
-            return match crate::bash_session::BashSessionManager::global()
-                .spawn(&inp.command, ctx.cwd())
-            {
+            let manager = crate::bash_session::BashSessionManager::global();
+            let result = match manager.spawn(&inp.command, ctx.cwd(), &sandbox_policy) {
+                Ok(id) => Ok(id),
+                Err(error)
+                    if ctx
+                        .confirm_unsandboxed_fallback(&inp.command, &error.to_string())
+                        .await =>
+                {
+                    manager.spawn_unsandboxed(&inp.command, ctx.cwd())
+                }
+                Err(error) => Err(error),
+            };
+            return match result {
                 Ok(id) => Ok(ToolResult::ok(format!(
                     "Started background shell {id}. Use BashOutput to read its output and KillShell to stop it."
                 ))),
@@ -90,16 +100,22 @@ impl Tool for BashTool {
         }
 
         let timeout = inp.timeout.unwrap_or(TIMEOUT_SECS);
+        let runner = wyj_sandbox::SandboxRunner::detect();
+        let command = match runner.shell_command(&inp.command, ctx.cwd(), &sandbox_policy) {
+            Ok(command) => command,
+            Err(error)
+                if ctx
+                    .confirm_unsandboxed_fallback(&inp.command, &error.to_string())
+                    .await =>
+            {
+                runner.unsandboxed_shell_command(&inp.command, ctx.cwd())
+            }
+            Err(error) => return Ok(ToolResult::err(format!("Sandbox 拒绝启动命令：{error}"))),
+        };
+        let mut command = tokio::process::Command::from(command);
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout),
-            Command::new("bash")
-                .arg("-c")
-                .arg(&inp.command)
-                .current_dir(ctx.cwd())
-                .output(),
-        )
-        .await;
+        let output =
+            tokio::time::timeout(std::time::Duration::from_secs(timeout), command.output()).await;
 
         match output {
             Err(_) => Ok(ToolResult::err(format!(

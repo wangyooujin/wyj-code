@@ -49,6 +49,10 @@ pub enum TraceEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    Control {
+        action: String,
+        accepted: bool,
+    },
     Done {
         result: String,
         is_error: bool,
@@ -146,6 +150,7 @@ impl TraceWriter {
                 let Ok(mut line) = serde_json::to_string(&ev) else {
                     continue;
                 };
+                line = wyj_core::redact_sensitive_text(&line);
                 line.push('\n');
                 let used = written_bytes.entry(id).or_insert(0);
                 if *used + line.len() as u64 > max_bytes_per_agent {
@@ -340,5 +345,38 @@ mod tests {
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         assert!(bytes <= 200, "trace file exceeded cap: {bytes} bytes");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn writer_redacts_secret_like_trace_content() {
+        let tmp = unique_tmp_dir("secret");
+        let session_id = "sess-secret".to_string();
+        let writer = TraceWriter::spawn(
+            tmp.clone(),
+            session_id.clone(),
+            DEFAULT_MAX_TRACE_FILE_BYTES,
+        );
+        let secret = format!("{}{}", "sk-test-", "F".repeat(24));
+        writer.send(
+            1,
+            TraceEvent::Done {
+                result: format!("credential: {secret}"),
+                is_error: false,
+                elapsed_secs: 0.1,
+            },
+        );
+        let path = trace_file(&tmp, &session_id, 1);
+        for _ in 0..100 {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if raw.contains(wyj_core::REDACTED_SECRET) {
+                    assert!(!raw.contains(&secret));
+                    let _ = std::fs::remove_dir_all(&tmp);
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+        panic!("redacted trace did not reach disk");
     }
 }

@@ -10,14 +10,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
-use wyj_api::types::ToolDefinition;
+use wyj_api::types::{ContentBlock, ToolDefinition};
 use wyj_core::{
     tool::{Tool, ToolCallMeta, ToolContext, ToolResult},
     Agent, AgentDefinition, Session, ToolEvent,
 };
 use wyj_i18n::{tr, tr_fmt};
 
-use crate::agent_hub::{SubAgentEvent, SubAgentHub};
+use crate::agent_hub::{AgentControl, SubAgentEvent, SubAgentHub};
 
 /// 按 agent 定义创建子 Agent（持有 provider 和按定义过滤后的工具集）
 pub type AgentFactory = Arc<dyn Fn(&AgentDefinition) -> Result<Agent> + Send + Sync>;
@@ -277,12 +277,15 @@ impl SubAgentTool {
         // 组装 owned 执行环境后整体 spawn（子 Agent 的一切依赖均 'static）
         let cwd = ctx.cwd().to_path_buf();
         let allowed = ctx.allowed_tools();
+        let parent_is_plan = ctx.is_plan_mode();
+        let parent_sandbox = ctx.sandbox_policy();
         let prompt = inp.prompt;
         let semaphore = self.hub.semaphore();
         let hub_task = self.hub.clone();
         let (result_tx, result_rx) = tokio::sync::oneshot::channel::<ToolResult>();
         let task_type = agent_type.clone();
         let task_desc = description.clone();
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<AgentControl>();
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -290,39 +293,94 @@ impl SubAgentTool {
             let _permit = semaphore.acquire_owned().await;
 
             let mut session = Session::new();
-            session.push_user(prompt);
+            let mut next_input = Some(vec![ContentBlock::Text { text: prompt }]);
 
             let sub_ctx = crate::ctx::ToolCtx::new(&cwd);
+            sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+            sub_ctx.replace_sandbox_policy(parent_sandbox);
+            sub_ctx.allow_unsandboxed_fallback(false);
             // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
             // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
             // 独立的共享句柄（而非复用父 ctx 的 Arc）即可，避免父子间意外共享可变状态。
             if let Some(allowed) = allowed {
-                sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Allowlist(allowed));
+                if parent_is_plan {
+                    let read_only = allowed
+                        .into_iter()
+                        .filter(|name| {
+                            !matches!(
+                                name.as_str(),
+                                "Write"
+                                    | "Edit"
+                                    | "Agent"
+                                    | "computer"
+                                    | "app_computer"
+                                    | "ExitPlanMode"
+                            )
+                        })
+                        .collect();
+                    sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Plan(read_only));
+                } else {
+                    sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Allowlist(allowed));
+                }
             }
 
-            let mut output_buf = String::new();
-            let run_res = agent
-                .run_turn(&mut session, &sub_ctx, &mut |d| output_buf.push_str(d))
-                .await;
-            let (content, is_error) = match run_res {
-                Ok(()) => {
-                    if output_buf.is_empty() {
-                        (tr("subagent.no_output"), false)
-                    } else {
-                        // 上限保护：超长输出会灌爆父 Agent 上下文。保头 20K + 尾 10K，
-                        // 结论按子 Agent system prompt 约定在尾部，必须保住。
-                        (
-                            crate::textutil::truncate_head_tail(&output_buf, 20_000, 10_000),
-                            false,
-                        )
+            let mut outputs = Vec::new();
+            let mut is_error = false;
+            let mut interrupted = false;
+            while let Some(input) = next_input.take() {
+                let retry_input = input.clone();
+                session.push_user_with_blocks(input);
+                let mut output_buf = String::new();
+                let run_res = agent
+                    .run_turn(&mut session, &sub_ctx, &mut |delta| {
+                        output_buf.push_str(delta)
+                    })
+                    .await;
+                match run_res {
+                    Ok(()) if output_buf.is_empty() => outputs.push(tr("subagent.no_output")),
+                    Ok(()) => outputs.push(crate::textutil::truncate_head_tail(
+                        &output_buf,
+                        20_000,
+                        10_000,
+                    )),
+                    Err(error) => {
+                        outputs.push(tr_fmt(
+                            "subagent.run_failed",
+                            &[("err", &error.to_string())],
+                        ));
+                        is_error = true;
                     }
                 }
-                Err(e) => (
-                    tr_fmt("subagent.run_failed", &[("err", &e.to_string())]),
-                    true,
-                ),
+
+                // FollowUp/Retry 只在完整模型消息与工具往返结束后消费。它们复用
+                // 原 sub_ctx，不能增加工具白名单、写根、网络或 sandbox 权限。
+                while let Ok(control) = control_rx.try_recv() {
+                    match control {
+                        AgentControl::FollowUp(content) => {
+                            next_input.get_or_insert_with(Vec::new).extend(content);
+                        }
+                        AgentControl::RetryLast => {
+                            next_input
+                                .get_or_insert_with(Vec::new)
+                                .extend(retry_input.clone());
+                        }
+                        AgentControl::Interrupt => {
+                            interrupted = true;
+                            break;
+                        }
+                    }
+                }
+                if interrupted {
+                    break;
+                }
+            }
+            let content = if interrupted {
+                tr("subagent.interrupted")
+            } else {
+                outputs.join("\n\n")
             };
+            is_error |= interrupted;
 
             hub_task.emit(SubAgentEvent::Done {
                 id,
@@ -341,7 +399,7 @@ impl SubAgentTool {
             };
             let _ = result_tx.send(result);
         });
-        self.hub.register(id, background, handle);
+        self.hub.register(id, background, None, control_tx, handle);
 
         if background {
             // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_done_reminder）
@@ -361,6 +419,9 @@ impl SubAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use wyj_api::provider::{EventStream, Provider};
+    use wyj_api::types::{Message, StopReason, StreamEvent};
 
     #[test]
     fn summarize_prefers_primary_arg() {
@@ -375,5 +436,110 @@ mod tests {
         let s = summarize_input(&v);
         assert_eq!(s.chars().count(), 61); // 60 + 省略号
         assert!(s.ends_with('…'));
+    }
+
+    struct DelayedFollowUpProvider {
+        calls: Arc<AtomicUsize>,
+        observed_follow_up: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for DelayedFollowUpProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let turn = self.calls.fetch_add(1, Ordering::SeqCst);
+            if turn > 0
+                && messages.iter().any(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { text } if text == "more"))
+                })
+            {
+                self.observed_follow_up.store(true, Ordering::SeqCst);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(format!("turn-{turn}"))),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn background_follow_up_runs_on_the_next_safe_model_boundary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_follow_up = Arc::new(AtomicBool::new(false));
+        let provider_calls = calls.clone();
+        let provider_observed = observed_follow_up.clone();
+        let hub = Arc::new(SubAgentHub::new());
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        hub.set_event_cb(move |event| {
+            let _ = event_tx.send(event);
+        });
+        let tool = SubAgentTool::new(
+            Arc::new(vec![AgentDefinition {
+                name: "general-purpose".to_string(),
+                description: "test".to_string(),
+                tools: None,
+                model: None,
+                system_prompt: "test".to_string(),
+                builtin: true,
+                source: None,
+            }]),
+            hub.clone(),
+            move |_| {
+                Ok(Agent::new(Arc::new(DelayedFollowUpProvider {
+                    calls: provider_calls.clone(),
+                    observed_follow_up: provider_observed.clone(),
+                })))
+            },
+        );
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::ToolCtx::new(cwd.path());
+
+        let started = tool
+            .run(
+                serde_json::json!({
+                    "subagent_type": "general-purpose",
+                    "description": "follow-up test",
+                    "prompt": "first",
+                    "run_in_background": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!started.is_error);
+        assert_eq!(
+            hub.send_follow_up(
+                1,
+                vec![ContentBlock::Text {
+                    text: "more".to_string(),
+                }],
+            ),
+            crate::agent_hub::AgentControlResult::Accepted
+        );
+
+        let done = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(SubAgentEvent::Done { result, .. }) = event_rx.recv().await {
+                    break result;
+                }
+            }
+        })
+        .await
+        .expect("sub-agent follow-up did not finish");
+        assert!(done.contains("turn-0"));
+        assert!(done.contains("turn-1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(observed_follow_up.load(Ordering::SeqCst));
     }
 }

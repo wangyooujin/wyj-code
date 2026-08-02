@@ -125,16 +125,22 @@ impl Tool for ReadTool {
             )));
         }
 
-        // 标记为已读：Edit/Write 修改此文件前要求先 Read 过
-        self.tracker.mark_read(&path.to_string_lossy());
-
         let text = String::from_utf8_lossy(&content);
         let lines: Vec<&str> = text.lines().collect();
         let total = lines.len();
 
         let start = inp.offset.unwrap_or(0);
         let count = inp.limit.unwrap_or(MAX_LINES).min(MAX_LINES);
-        let end = (start + count).min(total);
+        if start > total {
+            return Ok(ToolResult::err(format!(
+                "读取范围超出文件：offset {start}（从 0 开始），文件共 {total} 行"
+            )));
+        }
+        let end = start.saturating_add(count).min(total);
+
+        // 只有模型实际请求了文件内的有效范围，才允许后续 Edit/Write 通过“已读”检查。
+        // 越界请求虽然完成了底层 I/O，但模型没有看到文件内容，不能视为已读。
+        self.tracker.mark_read(&path.to_string_lossy());
 
         let mut out = String::new();
         for (i, line) in lines[start..end].iter().enumerate() {
@@ -155,5 +161,88 @@ fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
         pb.to_path_buf()
     } else {
         cwd.join(pb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    struct TestContext {
+        cwd: PathBuf,
+    }
+
+    #[async_trait]
+    impl ToolContext for TestContext {
+        fn cwd(&self) -> &Path {
+            &self.cwd
+        }
+
+        fn is_allowed(&self, _name: &str, _input: &Value) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_range_offset_returns_tool_error_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let content = (1..=152)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(&path, content).await.unwrap();
+
+        let tracker = crate::write::ReadTracker::default();
+        let tool = ReadTool::new(tracker.clone());
+        let result = tool
+            .run(
+                serde_json::json!({
+                    "file_path": path,
+                    "offset": 160,
+                    "limit": 60
+                }),
+                &TestContext {
+                    cwd: dir.path().to_path_buf(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_error);
+        assert!(result.content.contains("offset 160"));
+        assert!(result.content.contains("152 行"));
+        assert!(
+            !tracker.has_read(&path.to_string_lossy()),
+            "越界请求没有向模型返回文件内容，不应解锁后续 Edit/Write"
+        );
+    }
+
+    #[tokio::test]
+    async fn offset_at_end_of_file_returns_an_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        tokio::fs::write(&path, "one\ntwo\n").await.unwrap();
+
+        let tracker = crate::write::ReadTracker::default();
+        let tool = ReadTool::new(tracker.clone());
+        let result = tool
+            .run(
+                serde_json::json!({
+                    "file_path": path,
+                    "offset": 2,
+                    "limit": usize::MAX
+                }),
+                &TestContext {
+                    cwd: dir.path().to_path_buf(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert!(result.content.is_empty());
+        assert!(tracker.has_read(&path.to_string_lossy()));
     }
 }

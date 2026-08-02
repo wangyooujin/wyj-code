@@ -15,6 +15,7 @@ wyj-config.workspace = true
 wyj-api.workspace = true
 wyj-core.workspace = true
 wyj-tools.workspace = true
+wyj-sandbox.workspace = true
 wyj-computer.workspace = true
 wyj-tui.workspace = true
 wyj-mcp.workspace = true

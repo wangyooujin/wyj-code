@@ -2,6 +2,18 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.4.4]
+
+- **国内模型可信运行时**：新增 vendor / wire protocol 分离的 `ModelCapabilities`、能力来源与置信度、静态模型目录和 TTL cache；覆盖 GLM、MiniMax、Kimi、DeepSeek、Qwen/百炼、豆包/火山，以及 Ollama/vLLM/OpenAI-compatible 兼容端点。`wyj-code model doctor` 与 `/model doctor` 默认只做静态诊断，显式 live probe 只读取独立的 `WYJ_CODE_PROBE_API_KEY`。
+- **工具调用不再带病执行**：原始工具参数先经过有限 JSON 语法修复，再按原始 schema 校验；缺少必填字段或语义不明时把精确错误回灌给模型定向重试，重试耗尽后停止，禁止退化为空对象或 `null` 执行。Provider 错误统一分类，安全参数可见降级，同厂商/同角色 fallback 只在完整消息边界和可恢复错误上发生。
+- **权限默认失败关闭**：无 UI 的 headless、单次 `-p`、schedule 与 SubAgent 不再把“无法询问”当成批准；Plan 模式只允许在 `doc/plan/**`、`docs/plan/**`、`.wyj-code/plans/**` 写规划文档，额外文档必须逐路径授权，源码、脚本、配置和 Bash 写入绕过继续拒绝。
+- **Claude Code 式 OS sandbox**：前台/后台 Bash 和 TUI `!command` 统一进入同一 runner。macOS 使用 Seatbelt，并通过 sandbox 外的 host/port 校验代理执行域名级网络授权；Linux 使用 bubblewrap 文件系统/网络 namespace，域名代理桥接尚不可验证时明确失败关闭。凭证目录默认拒读；只有交互式 TUI 可批准一次性、不可持久化的无隔离降级。
+- **效率与恢复基础**：大工具集启用 `ToolSearch` + lazy schema，小工具集保持全量 schema；sticky 生命周期、top-K 与阈值可配置，状态栏和 `WYJ_STATS_JSON` 显示 schema sent/saved。新增 checkpoint、conversation/files/both rewind、session branch，并保留分支血缘和用户真实 Git index。
+- **SubAgent 与 schedule 收口**：SubAgentHub 新增 follow-up、interrupt、retry-last、父子元数据和控制事件 trace；follow-up 只在完整模型/工具边界注入。旧 schedule 自动禁用并要求权限复核，TUI 可编辑 allowed tools、write roots、allowed domains 与 require sandbox，复核后仍需用户再次显式启用。
+- **Secret 与后续接口**：Profile 支持 `api_key_env`，运行时 Key 不会因设置面板保存而物化进 `config.toml`，doctor/config-status 只显示末尾掩码；冻结 `ExecutionWorkspace`、workflow/DAG、前端无关 `SessionEvent`/ACP 和 `CodeIndex` 的 P2 接口，但不宣称已交付完整 worktree、daemon、workflow 或语义索引。
+- **验证状态说明**：本版本没有使用用户此前暴露的 MiniMax Key；MiniMax 与其他未提供轮换 Key 的国内模型保持 `static_only` / protocol-compatible，不宣称 live verified。Linux 域名 allowlist、原生 Windows 同等级 sandbox 仍是明确边界。
+- **版本**：工作区版本升级到 `1.4.4`。
+
 ## [1.4.2]
 
 - **显式内容区焦点与连续键盘导航**：普通 `↑/↓` 始终保留给输入框和输入历史，`Shift+↑` 作为唯一显式内容入口；内容焦点可在聊天、Todo 与 SubAgent 间连续移动，Todo 支持进入单任务详情逐行阅读，`Esc` 按详情 → 列表 → 输入框逐级返回并保留草稿。

@@ -4,7 +4,7 @@ use crate::event::{is_quit, AgentEvent};
 use crate::input::InputBox;
 use crate::render;
 use crate::theme::Theme;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -997,11 +997,16 @@ pub struct ProfileEntryDraft {
     pub name: String,
     /// 0 = Anthropic, 1 = OpenAI
     pub provider_idx: usize,
+    /// v1.4.4 能力运行时字段；设置面板尚未暴露编辑入口，仅透传保留。
+    pub vendor: Option<String>,
+    pub wire_protocol: Option<wyj_config::WireProtocol>,
     pub model: String,
     pub plan_model: String,
     pub exec_model: String,
     pub base_url: String,
     pub api_key: String,
+    /// 设置面板不读取或展示环境变量值，只透传 secret reference 名称。
+    pub api_key_env: Option<String>,
     pub max_tokens: String,
     pub context_window: String,
     /// 是否支持图片输入（面板暂不暴露编辑入口，仅透传保留原值）
@@ -1021,11 +1026,14 @@ impl ProfileEntryDraft {
                 wyj_config::Provider::Anthropic => 0,
                 wyj_config::Provider::OpenAI => 1,
             },
+            vendor: p.vendor.clone(),
+            wire_protocol: p.wire_protocol.clone(),
             model: p.model.clone(),
             plan_model: p.plan_model.clone().unwrap_or_default(),
             exec_model: p.exec_model.clone().unwrap_or_default(),
             base_url: p.base_url.clone(),
             api_key: p.api_key.clone().unwrap_or_default(),
+            api_key_env: p.api_key_env.clone(),
             max_tokens: p.max_tokens.to_string(),
             context_window: p.context_window.to_string(),
             vision: p.vision,
@@ -1049,11 +1057,14 @@ impl ProfileEntryDraft {
                 wyj_config::Provider::Anthropic => 0,
                 wyj_config::Provider::OpenAI => 1,
             },
+            vendor: Some(t.vendor.to_string()),
+            wire_protocol: Some(t.wire_protocol.clone()),
             model: t.example_model.to_string(),
             plan_model: String::new(),
             exec_model: String::new(),
             base_url: t.base_url.to_string(),
             api_key: String::new(),
+            api_key_env: None,
             max_tokens: "8192".to_string(),
             context_window: "200000".to_string(),
             vision: t.vision,
@@ -1130,6 +1141,8 @@ impl ProfileEntryDraft {
         wyj_config::Profile {
             name: self.name.clone(),
             provider: self.provider(),
+            vendor: self.vendor.clone(),
+            wire_protocol: self.wire_protocol.clone(),
             model: self.model.clone(),
             plan_model: if self.plan_model.trim().is_empty() {
                 None
@@ -1147,6 +1160,7 @@ impl ProfileEntryDraft {
             } else {
                 Some(self.api_key.clone())
             },
+            api_key_env: self.api_key_env.clone(),
             max_tokens: self.max_tokens.trim().parse().unwrap_or(8192),
             context_window: self.context_window.trim().parse().unwrap_or(200_000),
             vision: self.vision,
@@ -1825,6 +1839,8 @@ fn profile_try_save(
     system_prompt_extra: &str,
     todo_store: &Arc<std::sync::Mutex<TodoStore>>,
     shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_store: Option<&Arc<SessionStore>>,
+    current_session_id: &str,
 ) -> bool {
     let mut saved = false;
     if let Some(dialog) = &mut state.profile_dialog {
@@ -1853,6 +1869,8 @@ fn profile_try_save(
                             // rebuild_fn 已装配完整 system prompt，只拼回模式追加段
                             let new_agent = new_agent
                                 .append_system(system_prompt_extra.trim_start().to_string());
+                            let new_agent =
+                                attach_agent_session(new_agent, session_store, current_session_id);
                             let new_agent =
                                 wire_tool_callback(new_agent, agent_tx.clone(), todo_store.clone());
                             *shared_agent.write().unwrap() = Arc::new(new_agent);
@@ -1893,12 +1911,16 @@ fn profile_try_save(
 // 切换）的小菜单再决定是否借用输入框，比 ProfileDialog 对不同字段类型各自特判
 // 简单，代价是多一次 Enter，可接受。
 
-pub const SCHEDULE_FIELD_COUNT: usize = 5;
+pub const SCHEDULE_FIELD_COUNT: usize = 9;
 const SCHEDULE_FIELD_NAME: usize = 0;
 const SCHEDULE_FIELD_PROMPT: usize = 1;
 const SCHEDULE_FIELD_CRON: usize = 2;
 const SCHEDULE_FIELD_CWD: usize = 3;
 pub const SCHEDULE_FIELD_NOTIFY: usize = 4;
+const SCHEDULE_FIELD_ALLOWED_TOOLS: usize = 5;
+const SCHEDULE_FIELD_ALLOW_WRITE: usize = 6;
+const SCHEDULE_FIELD_ALLOWED_DOMAINS: usize = 7;
+pub const SCHEDULE_FIELD_REQUIRE_SANDBOX: usize = 8;
 
 pub const SCHEDULE_FIELD_LABEL_KEYS: [&str; SCHEDULE_FIELD_COUNT] = [
     "schedule.field.name",
@@ -1906,6 +1928,10 @@ pub const SCHEDULE_FIELD_LABEL_KEYS: [&str; SCHEDULE_FIELD_COUNT] = [
     "schedule.field.cron",
     "schedule.field.cwd",
     "schedule.field.notify_on_failure",
+    "schedule.field.allowed_tools",
+    "schedule.field.allow_write",
+    "schedule.field.allowed_domains",
+    "schedule.field.require_sandbox",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1920,6 +1946,7 @@ pub enum ScheduleHeaderAction {
     ToggleExpand,
     ToggleEnabled,
     RunNow,
+    ReviewPermissions,
     Delete,
 }
 
@@ -1936,6 +1963,7 @@ pub enum ScheduleFieldAction {
     ManualEdit,
     Freq(ScheduleFrequencyKind),
     ToggleNotify,
+    ToggleRequireSandbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2053,6 +2081,15 @@ impl ScheduleDialog {
             SCHEDULE_FIELD_PROMPT => t.prompt.clone(),
             SCHEDULE_FIELD_CRON => t.cron.clone(),
             SCHEDULE_FIELD_CWD => t.cwd.display().to_string(),
+            SCHEDULE_FIELD_ALLOWED_TOOLS => t.permissions.allowed_tools.join(","),
+            SCHEDULE_FIELD_ALLOW_WRITE => t
+                .permissions
+                .allow_write
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            SCHEDULE_FIELD_ALLOWED_DOMAINS => t.permissions.allowed_domains.join(","),
             _ => String::new(),
         }
     }
@@ -2064,6 +2101,21 @@ impl ScheduleDialog {
             SCHEDULE_FIELD_PROMPT => t.prompt = value,
             SCHEDULE_FIELD_CRON => t.cron = value,
             SCHEDULE_FIELD_CWD => t.cwd = std::path::PathBuf::from(value),
+            SCHEDULE_FIELD_ALLOWED_TOOLS => {
+                t.permissions.allowed_tools = comma_values(&value);
+            }
+            SCHEDULE_FIELD_ALLOW_WRITE => {
+                t.permissions.allow_write = comma_values(&value)
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
+            }
+            SCHEDULE_FIELD_ALLOWED_DOMAINS => {
+                t.permissions.allowed_domains = comma_values(&value)
+                    .into_iter()
+                    .map(|domain| domain.to_ascii_lowercase())
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -2100,7 +2152,7 @@ impl ScheduleDialog {
                 let expanded = self.expanded == Some(task_idx);
                 let task = &self.tasks[task_idx];
                 let saved = self.saved_snapshot.iter().find(|t| t.id == task.id);
-                let run_disabled = saved != Some(task);
+                let run_disabled = saved != Some(task) || task.needs_permission_review;
                 let items = vec![
                     ActionMenuItem {
                         label: wyj_i18n::tr(if expanded {
@@ -2133,6 +2185,14 @@ impl ScheduleDialog {
                             .then(|| wyj_i18n::tr("schedule.menu.run_now_needs_save")),
                     },
                     ActionMenuItem {
+                        label: wyj_i18n::tr("schedule.menu.review_permissions"),
+                        action: ScheduleMenuAction::Header(ScheduleHeaderAction::ReviewPermissions),
+                        dangerous: true,
+                        disabled: !task.needs_permission_review,
+                        disabled_reason: (!task.needs_permission_review)
+                            .then(|| wyj_i18n::tr("schedule.menu.permissions_reviewed")),
+                    },
+                    ActionMenuItem {
                         label: wyj_i18n::tr("schedule.menu.delete"),
                         action: ScheduleMenuAction::Header(ScheduleHeaderAction::Delete),
                         dangerous: true,
@@ -2147,6 +2207,16 @@ impl ScheduleDialog {
                 vec![ActionMenuItem {
                     label: wyj_i18n::tr("schedule.menu.toggle"),
                     action: ScheduleMenuAction::Field(ScheduleFieldAction::ToggleNotify),
+                    dangerous: false,
+                    disabled: false,
+                    disabled_reason: None,
+                }],
+            )),
+            ScheduleRow::Field(_, SCHEDULE_FIELD_REQUIRE_SANDBOX) => Some(ActionMenu::new(
+                row,
+                vec![ActionMenuItem {
+                    label: wyj_i18n::tr("schedule.menu.toggle"),
+                    action: ScheduleMenuAction::Field(ScheduleFieldAction::ToggleRequireSandbox),
                     dangerous: false,
                     disabled: false,
                     disabled_reason: None,
@@ -2291,6 +2361,8 @@ fn schedule_add_new_task(state: &mut AppState, prefill_prompt: Option<String>) {
         cron: "0 8 * * *".to_string(),
         cwd: dialog.default_cwd.clone(),
         enabled: true,
+        needs_permission_review: false,
+        permissions: wyj_store::schedule::SchedulePermissions::default(),
         notify_on_failure: false,
         created_at: now,
         updated_at: now,
@@ -2330,7 +2402,14 @@ fn schedule_execute_menu_action(
                 return;
             };
             if let Some(dialog) = &mut state.schedule_dialog {
-                dialog.tasks[idx].enabled = !dialog.tasks[idx].enabled;
+                if dialog.tasks[idx].needs_permission_review {
+                    dialog.error = Some(
+                        "该任务由旧版本迁移而来，需先执行 `wyj-code schedule review <id> ...` 完成权限审查"
+                            .to_string(),
+                    );
+                } else {
+                    dialog.tasks[idx].enabled = !dialog.tasks[idx].enabled;
+                }
             }
         }
         ScheduleMenuAction::Header(ScheduleHeaderAction::RunNow) => {
@@ -2364,6 +2443,17 @@ fn schedule_execute_menu_action(
             }
             if let Some(dialog) = &mut state.schedule_dialog {
                 dialog.error = Some(wyj_i18n::tr("schedule.run_now.triggered"));
+            }
+        }
+        ScheduleMenuAction::Header(ScheduleHeaderAction::ReviewPermissions) => {
+            let ScheduleRow::Header(idx) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                let task = &mut dialog.tasks[idx];
+                task.needs_permission_review = false;
+                task.enabled = false;
+                dialog.error = Some(wyj_i18n::tr("schedule.permissions.review_complete"));
             }
         }
         ScheduleMenuAction::Header(ScheduleHeaderAction::Delete) => {
@@ -2407,6 +2497,15 @@ fn schedule_execute_menu_action(
                     !dialog.tasks[task_idx].notify_on_failure;
             }
         }
+        ScheduleMenuAction::Field(ScheduleFieldAction::ToggleRequireSandbox) => {
+            let ScheduleRow::Field(task_idx, _) = target else {
+                return;
+            };
+            if let Some(dialog) = &mut state.schedule_dialog {
+                dialog.tasks[task_idx].permissions.require_sandbox =
+                    !dialog.tasks[task_idx].permissions.require_sandbox;
+            }
+        }
         ScheduleMenuAction::Field(ScheduleFieldAction::Freq(kind)) => {
             let ScheduleRow::Field(task_idx, _) = target else {
                 return;
@@ -2442,6 +2541,72 @@ fn schedule_execute_menu_action(
     }
 }
 
+#[cfg(test)]
+mod schedule_permissions_tests {
+    use super::*;
+
+    fn migrated_task(cwd: &std::path::Path) -> wyj_store::schedule::ScheduleTask {
+        let now = chrono::Utc::now();
+        wyj_store::schedule::ScheduleTask {
+            id: "legacy".to_string(),
+            name: "legacy".to_string(),
+            prompt: "review me".to_string(),
+            cron: "0 8 * * *".to_string(),
+            cwd: cwd.to_path_buf(),
+            enabled: false,
+            needs_permission_review: true,
+            permissions: wyj_store::schedule::SchedulePermissions {
+                allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
+                allow_write: vec![cwd.join("reports")],
+                allowed_domains: vec!["example.com".to_string()],
+                require_sandbox: true,
+            },
+            notify_on_failure: false,
+            created_at: now,
+            updated_at: now,
+            last_run: None,
+        }
+    }
+
+    #[test]
+    fn reviewing_migrated_permissions_keeps_task_disabled_and_preserves_manifest() {
+        let cwd = tempfile::tempdir().unwrap();
+        let task = migrated_task(cwd.path());
+        let expected_permissions = task.permissions.clone();
+        let mut state = AppState::new(
+            cwd.path().to_path_buf(),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        );
+        state.schedule_dialog = Some(ScheduleDialog {
+            tasks: vec![task.clone()],
+            cursor: 0,
+            expanded: None,
+            overlay: ScheduleOverlay::None,
+            error: None,
+            live_input: InputBox::new(),
+            menu: None,
+            default_cwd: cwd.path().to_path_buf(),
+            last_user_prompt: None,
+            saved_snapshot: vec![task],
+        });
+
+        schedule_execute_menu_action(
+            &mut state,
+            ScheduleMenuAction::Header(ScheduleHeaderAction::ReviewPermissions),
+            ScheduleRow::Header(0),
+        );
+
+        let reviewed = &state.schedule_dialog.as_ref().unwrap().tasks[0];
+        assert!(!reviewed.needs_permission_review);
+        assert!(!reviewed.enabled);
+        assert_eq!(reviewed.permissions, expected_permissions);
+    }
+}
+
 fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
     let (h, m) = s.split_once(':')?;
     let h: u32 = h.trim().parse().ok()?;
@@ -2450,6 +2615,15 @@ fn parse_hh_mm(s: &str) -> Option<(u32, u32)> {
         return None;
     }
     Some((h, m))
+}
+
+fn comma_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// 频率预设的结构化文本输入解析：Daily 期望 "HH:MM"，Hourly 期望 "MM"，
@@ -5534,6 +5708,8 @@ pub struct AppState {
     /// 用量总和，用于 /cost 与单轮增量展示）是两个不同的量：后者只增不减，
     /// 压缩后也不会反映真实上下文缩小，因此不能拿来算占比。
     pub context_tokens: u32,
+    pub tool_schema_tokens: u32,
+    pub tool_schema_tokens_saved: u32,
     pub cwd: PathBuf,
     pub should_quit: bool,
     pub turns: usize,
@@ -5705,6 +5881,8 @@ impl AppState {
             total_input_tokens: 0,
             total_output_tokens: 0,
             context_tokens: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
             cwd,
             should_quit: false,
             turns: 0,
@@ -5795,6 +5973,8 @@ impl AppState {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
         self.context_tokens = 0;
+        self.tool_schema_tokens = 0;
+        self.tool_schema_tokens_saved = 0;
         self.turns = 0;
         self.tool_call_count = 0;
         self.tool_info.clear();
@@ -6642,10 +6822,14 @@ impl AppState {
                 input,
                 output,
                 context_tokens,
+                tool_schema_tokens,
+                tool_schema_tokens_saved,
             } => {
                 self.total_input_tokens = input;
                 self.total_output_tokens = output;
                 self.context_tokens = context_tokens;
+                self.tool_schema_tokens = tool_schema_tokens;
+                self.tool_schema_tokens_saved = tool_schema_tokens_saved;
             }
 
             AgentEvent::UsageDelta {
@@ -7208,6 +7392,26 @@ impl AppState {
                     s.output_tokens += output_tokens;
                 }
             }
+            E::Control {
+                id,
+                action,
+                accepted,
+            } => {
+                self.sub_agent_trace_cache
+                    .entry(id)
+                    .or_default()
+                    .push(TraceEvent::Control {
+                        action: action.clone(),
+                        accepted,
+                    });
+                if accepted && action == "interrupt" {
+                    if let Some(agent) = self.sub_agents.get_mut(&id) {
+                        agent.status = SubAgentStatus::Interrupted;
+                        agent.current_tool = None;
+                        agent.finished_at = Some(Instant::now());
+                    }
+                }
+            }
             E::Done {
                 id,
                 agent_type,
@@ -7293,7 +7497,7 @@ pub async fn run_tui(
     // `--plugin-dir` 临时加载的本地开发插件贡献（不落盘、仅当次进程生效）
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     // 当前已连接 MCP 工具的共享快照：后台连接成功时 push 进来，供子 Agent
-    // 工厂与 `/model` 重建读取（见 `wyj-cli` 侧 `make_sub_agent_factory`）
+    // 工厂与 `/model` 重建读取（见 `wyj-code` CLI 侧 `make_sub_agent_factory`）
     mcp_tools: wyj_tools::SharedMcpTools,
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
 ) -> Result<()> {
@@ -7571,6 +7775,7 @@ fn spawn_agent_turn(
     // 后续工具调用的权限判定，无需等待下一轮 spawn_agent_turn。
     shared_permission: Arc<std::sync::RwLock<PermissionMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
+    sandbox_config: wyj_config::SandboxCfg,
     // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
     preface_reminders: Vec<String>,
 ) -> (
@@ -7597,6 +7802,8 @@ fn spawn_agent_turn(
         }
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
+        let _ = ctx.apply_sandbox_config(&sandbox_config);
+        ctx.set_execution_surface(wyj_core::ExecutionSurface::TuiInteractive);
         ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
         // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
@@ -7632,6 +7839,8 @@ fn spawn_agent_turn(
                         input: sess.total_input_tokens,
                         output: sess.total_output_tokens,
                         context_tokens: wyj_core::estimate_tokens(&sess.messages),
+                        tool_schema_tokens: sess.tool_schema_tokens,
+                        tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
                     })
                     .await;
                 let _ = tx.send(AgentEvent::TurnDone).await;
@@ -7669,7 +7878,9 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
                 "WebFetch",
                 "WebSearch",
                 "AskQuestion",
-                "Bash",         // 只读命令，由 system prompt 约束
+                "Write",        // 仅 doc/plan、docs/plan、.wyj-code/plans 或本轮授权文档
+                "Edit",         // 与 Write 使用同一执行层路径策略
+                "Bash",         // 只读命令由 PermissionPolicy 强制判定
                 "BashOutput",   // 后台任务输出读取（纯读）
                 "ExitPlanMode", // 提交计划并请求批准（计划文本作为参数直传，不落盘）
                 "TodoWrite",    // 任务追踪，plan 模式同样有用
@@ -7678,11 +7889,177 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
             .iter()
             .map(|s| s.to_string())
             .collect();
-            PermissionMode::Allowlist(set)
+            PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
         AgentMode::Normal => PermissionMode::Prompt,
     }
+}
+
+fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
+    let mut lines = vec![
+        format!("Model doctor · {}", report.profile),
+        format!(
+            "{} / {} · {} · {:?}",
+            report.identity.vendor,
+            report.identity.model,
+            report.identity.wire_protocol,
+            report.verification_status
+        ),
+        format!(
+            "context {} · output {} · vision {} · thinking {:?}",
+            report.capabilities.context_window,
+            report.capabilities.max_output_tokens,
+            report.capabilities.vision.value,
+            report.capabilities.thinking.value
+        ),
+        format!(
+            "tools {} · parallel {} · strict schema {} · stream usage {}",
+            report.capabilities.tool_calling.value,
+            report.capabilities.parallel_tool_calls.value,
+            report.capabilities.strict_tool_schema.value,
+            report.capabilities.stream_usage.value
+        ),
+        format!("probe: {}", report.probe_status),
+    ];
+    lines.extend(
+        report
+            .known_degradations
+            .iter()
+            .map(|degradation| format!("- {degradation}")),
+    );
+    lines.join("\n")
+}
+
+fn format_tui_sandbox(config: &wyj_config::SandboxCfg) -> String {
+    let status = wyj_sandbox::SandboxRunner::detect().status();
+    let network = if config.network.allowed_domains.is_empty() {
+        "deny".to_string()
+    } else {
+        format!("allow {}", config.network.allowed_domains.join(", "))
+    };
+    let mut lines = vec![
+        "Sandbox · Mode / Overrides / Config".to_string(),
+        format!(
+            "mode: {} · backend: {} · available: {}",
+            if config.enabled {
+                "enforce"
+            } else {
+                "disabled"
+            },
+            status.backend,
+            status.available
+        ),
+        format!(
+            "filesystem: isolated={} · allow-write={} · deny-read={}",
+            status.filesystem_isolation,
+            config.filesystem.allow_write.len(),
+            config.filesystem.deny_read.len()
+        ),
+        format!(
+            "network: {network} · domain isolation={}",
+            status.domain_network_isolation
+        ),
+        format!(
+            "unsandboxed fallback: TUI one-shot={} · headless/schedule/sub-agent=false",
+            config.enabled && config.allow_unsandboxed_commands
+        ),
+        format!("fail-if-unavailable: {}", config.fail_if_unavailable),
+    ];
+    lines.extend(
+        status
+            .dependencies
+            .into_iter()
+            .map(|dependency| format!("dependency: {dependency}")),
+    );
+    lines.push(status.detail);
+    lines.join("\n")
+}
+
+fn resolve_tui_checkpoint_id(
+    store: &wyj_core::CheckpointStore,
+    requested: Option<String>,
+) -> anyhow::Result<String> {
+    match requested {
+        Some(id) => Ok(id),
+        None => store
+            .latest()?
+            .map(|checkpoint| checkpoint.id)
+            .ok_or_else(|| anyhow::anyhow!("当前会话还没有 checkpoint")),
+    }
+}
+
+fn format_checkpoint_list(store: &wyj_core::CheckpointStore) -> anyhow::Result<String> {
+    let checkpoints = store.list()?;
+    if checkpoints.is_empty() {
+        return Ok("当前会话还没有 checkpoint。".to_string());
+    }
+    Ok(checkpoints
+        .into_iter()
+        .rev()
+        .map(|checkpoint| {
+            format!(
+                "{}  {:?}  {}  {} messages",
+                checkpoint.id,
+                checkpoint.kind,
+                checkpoint.name.as_deref().unwrap_or("-"),
+                checkpoint.message_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn format_rewind_preview(preview: &wyj_core::RewindPreview) -> String {
+    let mut lines = vec![format!(
+        "checkpoint {} 将影响 {} 个文件：",
+        preview.checkpoint_id,
+        preview.affected_files.len()
+    )];
+    lines.extend(
+        preview
+            .affected_files
+            .iter()
+            .take(50)
+            .map(|path| format!("- {}", path.display())),
+    );
+    if preview.affected_files.len() > 50 {
+        lines.push(format!(
+            "- ……另有 {} 个文件",
+            preview.affected_files.len() - 50
+        ));
+    }
+    if let Some(note) = &preview.note {
+        lines.push(format!("说明：{note}"));
+    }
+    lines.join("\n")
+}
+
+fn retarget_agent_session(
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    sessions: Option<&Arc<SessionStore>>,
+    session_id: &str,
+) {
+    let updated = attach_agent_session(
+        (**shared_agent.read().unwrap()).clone(),
+        sessions,
+        session_id,
+    );
+    *shared_agent.write().unwrap() = Arc::new(updated);
+}
+
+fn attach_agent_session(
+    mut agent: Agent,
+    sessions: Option<&Arc<SessionStore>>,
+    session_id: &str,
+) -> Agent {
+    agent.set_session_id(session_id.to_string());
+    if let Some(sessions) = sessions {
+        if let Ok(store) = wyj_core::CheckpointStore::new(sessions.dir(), session_id.to_string()) {
+            agent.set_checkpoint_store(Arc::new(store));
+        }
+    }
+    agent
 }
 
 /// 统一的模式切换入口：同步更新 shared_mode 与 shared_permission，
@@ -7847,6 +8224,15 @@ fn reload_persisted_sub_agents(
                     if let Some(s) = &mut reconstructed {
                         s.input_tokens += input_tokens;
                         s.output_tokens += output_tokens;
+                    }
+                }
+                TraceEvent::Control { action, accepted } => {
+                    if let Some(s) = &mut reconstructed {
+                        if accepted && action == "interrupt" {
+                            s.status = SubAgentStatus::Interrupted;
+                            s.current_tool = None;
+                            s.finished_at = Some(Instant::now());
+                        }
                     }
                 }
                 TraceEvent::Done {
@@ -8240,8 +8626,21 @@ async fn tui_main(
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
     let has_initial = !initial_messages.is_empty();
     let mut init_sess = Session::new();
+    if let Some(file) = session_store
+        .as_ref()
+        .and_then(|store| store.load(&current_session_id).ok())
+    {
+        init_sess.total_input_tokens = file.input_tokens;
+        init_sess.total_output_tokens = file.output_tokens;
+        init_sess.routing_events = file.routing_events;
+        init_sess.current_checkpoint_id = file.current_checkpoint_id;
+        init_sess.branch_parent_session_id = file.branch_parent_session_id;
+        init_sess.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+    }
     init_sess.messages = initial_messages;
     if has_initial {
+        state.total_input_tokens = init_sess.total_input_tokens;
+        state.total_output_tokens = init_sess.total_output_tokens;
         state.welcome_frozen = true;
         state.context_tokens = wyj_core::estimate_tokens(&init_sess.messages);
         state.messages = reconstruct_display(&init_sess.messages);
@@ -8352,6 +8751,7 @@ async fn tui_main(
                 shared_mode.clone(),
                 shared_permission.clone(),
                 ui_ask_tx.clone(),
+                state.config.sandbox.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
             );
             state.current_task = Some(handle);
@@ -8382,6 +8782,10 @@ async fn tui_main(
                         input_tokens: sess.total_input_tokens,
                         output_tokens: sess.total_output_tokens,
                         messages: sess.messages.clone(),
+                        routing_events: sess.routing_events.clone(),
+                        current_checkpoint_id: sess.current_checkpoint_id.clone(),
+                        branch_parent_session_id: sess.branch_parent_session_id.clone(),
+                        branch_parent_checkpoint_id: sess.branch_parent_checkpoint_id.clone(),
                         title_generated,
                     };
                     let _ = store.save(&sf);
@@ -8492,6 +8896,16 @@ async fn tui_main(
                                                     input_tokens: sess.total_input_tokens,
                                                     output_tokens: sess.total_output_tokens,
                                                     messages: sess.messages.clone(),
+                                                    routing_events: sess.routing_events.clone(),
+                                                    current_checkpoint_id: sess
+                                                        .current_checkpoint_id
+                                                        .clone(),
+                                                    branch_parent_session_id: sess
+                                                        .branch_parent_session_id
+                                                        .clone(),
+                                                    branch_parent_checkpoint_id: sess
+                                                        .branch_parent_checkpoint_id
+                                                        .clone(),
                                                     title_generated,
                                                 });
                                             }
@@ -8502,6 +8916,11 @@ async fn tui_main(
                                         current_session_id = new_session_id();
                                         state.reset_for_new_session();
                                         state.current_session_id = current_session_id.clone();
+                                        retarget_agent_session(
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                        );
                                         state
                                             .messages
                                             .push(ChatMessage::system("已开始新会话".to_string()));
@@ -8534,6 +8953,16 @@ async fn tui_main(
                                                         input_tokens: sess.total_input_tokens,
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
+                                                        routing_events: sess.routing_events.clone(),
+                                                        current_checkpoint_id: sess
+                                                            .current_checkpoint_id
+                                                            .clone(),
+                                                        branch_parent_session_id: sess
+                                                            .branch_parent_session_id
+                                                            .clone(),
+                                                        branch_parent_checkpoint_id: sess
+                                                            .branch_parent_checkpoint_id
+                                                            .clone(),
                                                         title_generated,
                                                     });
                                                 }
@@ -8546,6 +8975,14 @@ async fn tui_main(
                                                     let mut sess = session.lock().await;
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
+                                                    sess.routing_events =
+                                                        file.routing_events.clone();
+                                                    sess.current_checkpoint_id =
+                                                        file.current_checkpoint_id.clone();
+                                                    sess.branch_parent_session_id =
+                                                        file.branch_parent_session_id.clone();
+                                                    sess.branch_parent_checkpoint_id =
+                                                        file.branch_parent_checkpoint_id.clone();
                                                     sess.messages = file.messages;
                                                     let context_tokens =
                                                         wyj_core::estimate_tokens(&sess.messages);
@@ -8555,6 +8992,11 @@ async fn tui_main(
                                                     current_session_id = file.session_id.clone();
                                                     state.current_session_id =
                                                         current_session_id.clone();
+                                                    retarget_agent_session(
+                                                        &shared_agent,
+                                                        session_store.as_ref(),
+                                                        &current_session_id,
+                                                    );
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
@@ -8992,6 +9434,11 @@ async fn tui_main(
                                                             system_prompt_extra
                                                                 .trim_start()
                                                                 .to_string(),
+                                                        );
+                                                        let new_agent = attach_agent_session(
+                                                            new_agent,
+                                                            session_store.as_ref(),
+                                                            &current_session_id,
                                                         );
                                                         let new_agent = wire_tool_callback(
                                                             new_agent,
@@ -10013,6 +10460,8 @@ async fn tui_main(
                                         &system_prompt_extra,
                                         &todo_store,
                                         &shared_agent,
+                                        session_store.as_ref(),
+                                        &current_session_id,
                                     );
                                     if saved {
                                         state.input_owner = None;
@@ -10145,6 +10594,8 @@ async fn tui_main(
                                     &system_prompt_extra,
                                     &todo_store,
                                     &shared_agent,
+                                    session_store.as_ref(),
+                                    &current_session_id,
                                 );
                                 if saved {
                                     state.profile_dialog = None;
@@ -10316,6 +10767,22 @@ async fn tui_main(
                             PlanApprovalOutcome::Continue => {}
                             PlanApprovalOutcome::Approve => {
                                 if let Some(dlg) = state.plan_dialog.take() {
+                                    if let Some(sessions) = &session_store {
+                                        if let Ok(store) = wyj_core::CheckpointStore::new(
+                                            sessions.dir(),
+                                            current_session_id.clone(),
+                                        ) {
+                                            let mut sess = session.lock().await;
+                                            if let Ok(checkpoint) = store.create(
+                                                &cwd,
+                                                &sess.messages,
+                                                wyj_core::CheckpointKind::PlanApproval,
+                                                Some("before plan approval".to_string()),
+                                            ) {
+                                                sess.current_checkpoint_id = Some(checkpoint.id);
+                                            }
+                                        }
+                                    }
                                     let _ = dlg.response_tx.send(true);
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
@@ -10363,6 +10830,22 @@ async fn tui_main(
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.exec_mode_confirm.take() {
+                                    if let Some(sessions) = &session_store {
+                                        if let Ok(store) = wyj_core::CheckpointStore::new(
+                                            sessions.dir(),
+                                            current_session_id.clone(),
+                                        ) {
+                                            let mut sess = session.lock().await;
+                                            if let Ok(checkpoint) = store.create(
+                                                &cwd,
+                                                &sess.messages,
+                                                wyj_core::CheckpointKind::PlanApproval,
+                                                Some("before plan approval".to_string()),
+                                            ) {
+                                                sess.current_checkpoint_id = Some(checkpoint.id);
+                                            }
+                                        }
+                                    }
                                     let new_mode = AgentMode::Normal;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
@@ -10391,6 +10874,7 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
+                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
@@ -10420,6 +10904,7 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
+                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
@@ -10461,11 +10946,15 @@ async fn tui_main(
                     //    d/Esc/其它=拒绝。决策经 oneshot 回传给挂起的 Agent 回合。
                     if state.permission_dialog.is_some() {
                         use wyj_tools::PermissionDecision;
+                        let one_shot_only =
+                            state.permission_dialog.as_ref().is_some_and(|dialog| {
+                                dialog.tool_name == "Bash (unsandboxed fallback)"
+                            });
                         let decision = match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 Some(PermissionDecision::AllowOnce)
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                            KeyCode::Char('a') | KeyCode::Char('A') if !one_shot_only => {
                                 Some(PermissionDecision::AllowAlways)
                             }
                             KeyCode::Char('d')
@@ -10720,12 +11209,17 @@ async fn tui_main(
                                 state.input_history.push(text);
                                 let tx = agent_tx.clone();
                                 let start = Instant::now();
+                                let inline_ctx = ToolCtx::new(&cwd);
+                                let _ = inline_ctx.apply_sandbox_config(&state.config.sandbox);
+                                let inline_policy =
+                                    inline_ctx.sandbox_policy.read().unwrap().clone();
+                                let inline_cwd = cwd.clone();
                                 tokio::spawn(async move {
                                     let elapsed;
-                                    let (output, exit_code) =
-                                        match tokio::process::Command::new("sh")
-                                            .arg("-c")
-                                            .arg(&cmd_str)
+                                    let prepared = wyj_sandbox::SandboxRunner::detect()
+                                        .shell_command(&cmd_str, &inline_cwd, &inline_policy);
+                                    let (output, exit_code) = match prepared {
+                                        Ok(command) => match tokio::process::Command::from(command)
                                             .output()
                                             .await
                                         {
@@ -10749,7 +11243,17 @@ async fn tui_main(
                                                 elapsed = start.elapsed().as_secs_f64();
                                                 (format!("执行失败: {e}"), -1)
                                             }
-                                        };
+                                        },
+                                        Err(error) => {
+                                            elapsed = start.elapsed().as_secs_f64();
+                                            (
+                                                format!(
+                                                    "Sandbox 拒绝内联命令：{error}\n如确需无隔离执行，请让 Agent 调用 Bash 并在一次性降级面板中批准。"
+                                                ),
+                                                -1,
+                                            )
+                                        }
+                                    };
                                     let _ = tx
                                         .send(AgentEvent::BashResult {
                                             output,
@@ -10885,6 +11389,8 @@ async fn tui_main(
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
                                         state.context_tokens = 0;
+                                        state.tool_schema_tokens = 0;
+                                        state.tool_schema_tokens_saved = 0;
                                         state.pending_attachments.clear();
                                         state.turns = 0;
                                         state.tool_call_count = 0;
@@ -10918,7 +11424,7 @@ async fn tui_main(
                                         state.welcome_frozen = true;
                                         execute!(io::stdout(), Clear(ClearType::Purge))?;
                                         let mut sess = session.lock().await;
-                                        *sess = Session::new();
+                                        sess.clear_conversation();
                                         state.messages.push(ChatMessage::assistant(
                                             "对话已清空。".to_string(),
                                         ));
@@ -10949,9 +11455,300 @@ async fn tui_main(
                                             }
                                         }
                                     }
+                                    Ok(CommandResult::CreateCheckpoint { name, list }) => {
+                                        match session_store.as_ref().and_then(|sessions| {
+                                            wyj_core::CheckpointStore::new(
+                                                sessions.dir(),
+                                                current_session_id.clone(),
+                                            )
+                                            .ok()
+                                        }) {
+                                            Some(store) if list => {
+                                                match format_checkpoint_list(&store) {
+                                                    Ok(text) => state
+                                                        .messages
+                                                        .push(ChatMessage::assistant(text)),
+                                                    Err(error) => state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                            "[checkpoint 列表失败] {error}"
+                                                        )),
+                                                    ),
+                                                }
+                                            }
+                                            Some(store) => {
+                                                let sess = session.lock().await;
+                                                match store.create(
+                                                    &cwd,
+                                                    &sess.messages,
+                                                    wyj_core::CheckpointKind::Manual,
+                                                    name,
+                                                ) {
+                                                    Ok(checkpoint) => {
+                                                        drop(sess);
+                                                        session
+                                                            .lock()
+                                                            .await
+                                                            .current_checkpoint_id =
+                                                            Some(checkpoint.id.clone());
+                                                        state.messages.push(
+                                                            ChatMessage::assistant(format!(
+                                                                "已创建 checkpoint {}",
+                                                                checkpoint.id
+                                                            )),
+                                                        );
+                                                    }
+                                                    Err(error) => state.messages.push(
+                                                        ChatMessage::assistant_err(format!(
+                                                            "[checkpoint 创建失败] {error}"
+                                                        )),
+                                                    ),
+                                                }
+                                            }
+                                            None => {
+                                                state.messages.push(ChatMessage::assistant_err(
+                                                    "checkpoint 存储不可用".to_string(),
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    Ok(CommandResult::Rewind {
+                                        checkpoint_id,
+                                        scope,
+                                        confirmed,
+                                    }) => {
+                                        let result: anyhow::Result<String> = async {
+                                            let sessions = session_store
+                                                .as_ref()
+                                                .context("session 存储不可用")?;
+                                            let store = wyj_core::CheckpointStore::new(
+                                                sessions.dir(),
+                                                current_session_id.clone(),
+                                            )?;
+                                            let id = resolve_tui_checkpoint_id(
+                                                &store,
+                                                checkpoint_id,
+                                            )?;
+                                            let checkpoint = store.load(&id)?;
+                                            if matches!(
+                                                scope,
+                                                wyj_core::RewindScope::Files
+                                                    | wyj_core::RewindScope::Both
+                                            ) {
+                                                let preview = store.preview_files(&id, &cwd)?;
+                                                if preview.requires_confirmation && !confirmed {
+                                                    return Ok(format!(
+                                                        "{}\n\n确认后请重新执行：`/rewind {} {:?} --confirm`",
+                                                        format_rewind_preview(&preview),
+                                                        id,
+                                                        scope
+                                                    ));
+                                                }
+                                            }
+                                            let current_messages =
+                                                session.lock().await.messages.clone();
+                                            let protection = store.create(
+                                                &cwd,
+                                                &current_messages,
+                                                wyj_core::CheckpointKind::PreRewind,
+                                                Some(format!("before rewind {id}")),
+                                            )?;
+                                            let mut file_text = String::new();
+                                            if matches!(
+                                                scope,
+                                                wyj_core::RewindScope::Files
+                                                    | wyj_core::RewindScope::Both
+                                            ) {
+                                                let preview =
+                                                    store.restore_files(&id, &cwd, confirmed)?;
+                                                file_text = format!(
+                                                    "\n{}",
+                                                    format_rewind_preview(&preview)
+                                                );
+                                            }
+                                            session.lock().await.current_checkpoint_id =
+                                                Some(id.clone());
+                                            if matches!(
+                                                scope,
+                                                wyj_core::RewindScope::Conversation
+                                                    | wyj_core::RewindScope::Both
+                                            ) {
+                                                let mut sess = session.lock().await;
+                                                sess.messages = checkpoint.messages;
+                                                sess.current_checkpoint_id = Some(id.clone());
+                                                state.messages = reconstruct_display(&sess.messages);
+                                                state.context_tokens =
+                                                    wyj_core::estimate_tokens(&sess.messages);
+                                                state.turns = sess
+                                                    .messages
+                                                    .iter()
+                                                    .filter(|message| {
+                                                        matches!(
+                                                            message.role,
+                                                            wyj_api::types::Role::User
+                                                        )
+                                                    })
+                                                    .count();
+                                                state.welcome_frozen = true;
+                                                state.frozen_up_to = 0;
+                                            }
+                                            state.save_needed = true;
+                                            Ok(format!(
+                                                "已回退到 {id}；回退前保护 checkpoint：{}{}",
+                                                protection.id, file_text
+                                            ))
+                                        }
+                                        .await;
+                                        match result {
+                                            Ok(text) => {
+                                                state.messages.push(ChatMessage::assistant(text))
+                                            }
+                                            Err(error) => {
+                                                state.messages.push(ChatMessage::assistant_err(
+                                                    format!("[rewind 失败] {error}"),
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    Ok(CommandResult::BranchSession {
+                                        checkpoint_id,
+                                        restore_files,
+                                        confirmed,
+                                    }) => {
+                                        let result: anyhow::Result<(SessionFile, String)> = async {
+                                            let sessions = session_store
+                                                .as_ref()
+                                                .context("session 存储不可用")?;
+                                            let store = wyj_core::CheckpointStore::new(
+                                                sessions.dir(),
+                                                current_session_id.clone(),
+                                            )?;
+                                            let id = resolve_tui_checkpoint_id(
+                                                &store,
+                                                checkpoint_id,
+                                            )?;
+                                            let checkpoint = store.load(&id)?;
+                                            if restore_files {
+                                                let preview = store.preview_files(&id, &cwd)?;
+                                                if preview.requires_confirmation && !confirmed {
+                                                    anyhow::bail!(
+                                                        "{}\n\n确认后请重新执行：/branch {} --restore-files --confirm",
+                                                        format_rewind_preview(&preview),
+                                                        id
+                                                    );
+                                                }
+                                                let current_messages =
+                                                    session.lock().await.messages.clone();
+                                                store.create(
+                                                    &cwd,
+                                                    &current_messages,
+                                                    wyj_core::CheckpointKind::PreRewind,
+                                                    Some(format!(
+                                                        "before branch restore {id}"
+                                                    )),
+                                                )?;
+                                                store.restore_files(&id, &cwd, confirmed)?;
+                                            }
+                                            let branch = sessions.branch_from_checkpoint(
+                                                &current_session_id,
+                                                &checkpoint,
+                                            )?;
+                                            Ok((branch, id))
+                                        }
+                                        .await;
+                                        match result {
+                                            Ok((branch, checkpoint_id)) => {
+                                                current_session_id = branch.session_id.clone();
+                                                state.current_session_id =
+                                                    current_session_id.clone();
+                                                let mut sess = session.lock().await;
+                                                *sess = Session::new();
+                                                sess.messages = branch.messages;
+                                                sess.current_checkpoint_id =
+                                                    branch.current_checkpoint_id;
+                                                sess.branch_parent_session_id =
+                                                    branch.branch_parent_session_id;
+                                                sess.branch_parent_checkpoint_id =
+                                                    branch.branch_parent_checkpoint_id;
+                                                state.messages =
+                                                    reconstruct_display(&sess.messages);
+                                                state.context_tokens =
+                                                    wyj_core::estimate_tokens(&sess.messages);
+                                                state.turns = branch.turns;
+                                                state.total_input_tokens = 0;
+                                                state.total_output_tokens = 0;
+                                                state.frozen_up_to = 0;
+                                                state.welcome_frozen = true;
+                                                drop(sess);
+                                                retarget_agent_session(
+                                                    &shared_agent,
+                                                    session_store.as_ref(),
+                                                    &current_session_id,
+                                                );
+                                                state.messages.push(ChatMessage::assistant(
+                                                    format!(
+                                                    "已从 checkpoint {} 创建并切换到分支会话 {}",
+                                                    checkpoint_id, current_session_id
+                                                ),
+                                                ));
+                                                state.save_needed = true;
+                                            }
+                                            Err(error) => {
+                                                state.messages.push(ChatMessage::assistant_err(
+                                                    format!("[branch 失败] {error}"),
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    Ok(CommandResult::ControlSubAgent { id, action }) => {
+                                        let result = match action {
+                                            wyj_commands::registry::SubAgentControlAction::FollowUp(
+                                                text,
+                                            ) => hub.send_follow_up(
+                                                id,
+                                                vec![ContentBlock::Text { text }],
+                                            ),
+                                            wyj_commands::registry::SubAgentControlAction::Interrupt => {
+                                                hub.interrupt(id)
+                                            }
+                                            wyj_commands::registry::SubAgentControlAction::RetryLast => {
+                                                hub.retry_last(id)
+                                            }
+                                        };
+                                        state.messages.push(ChatMessage::assistant(format!(
+                                            "子 Agent a{id} 控制结果：{result:?}"
+                                        )));
+                                    }
                                     Ok(CommandResult::OpenProfileDialog) => {
                                         state.profile_dialog =
                                             Some(ProfileDialog::new(&state.config));
+                                    }
+                                    Ok(CommandResult::ModelDoctor(profile_name)) => {
+                                        let selected = match profile_name.as_deref() {
+                                            Some(name) => state.config.profile_by_name(name),
+                                            None => Some(state.config.active_profile()),
+                                        };
+                                        if let Some(profile) = selected {
+                                            let cache = wyj_config::config_dir()
+                                                .ok()
+                                                .map(|base| wyj_api::CapabilityCache::new(&base));
+                                            let report = wyj_api::ModelDoctorReport::static_report(
+                                                profile,
+                                                cache.as_ref(),
+                                            );
+                                            state.messages.push(ChatMessage::assistant(
+                                                format_tui_model_doctor(&report),
+                                            ));
+                                        } else {
+                                            let name = profile_name.unwrap_or_default();
+                                            state.messages.push(ChatMessage::assistant_err(
+                                                format!("未找到 Profile: {name}"),
+                                            ));
+                                        }
+                                    }
+                                    Ok(CommandResult::SandboxStatus) => {
+                                        state.messages.push(ChatMessage::assistant(
+                                            format_tui_sandbox(&state.config.sandbox),
+                                        ));
                                     }
                                     Ok(CommandResult::SwitchProfile(name)) => {
                                         if !state.config.profiles.iter().any(|p| p.name == name) {
@@ -10974,6 +11771,11 @@ async fn tui_main(
                                                     match rebuild_fn(&state.config, &model_for_mode)
                                                     {
                                                         Ok(new_agent) => {
+                                                            let new_agent = attach_agent_session(
+                                                                new_agent,
+                                                                session_store.as_ref(),
+                                                                &current_session_id,
+                                                            );
                                                             let new_agent = wire_tool_callback(
                                                                 new_agent,
                                                                 agent_tx.clone(),
@@ -11070,12 +11872,17 @@ async fn tui_main(
                                         let mode_arc = shared_mode.clone();
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
+                                        let sandbox_config = state.config.sandbox.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let mut sess = session_c.lock().await;
                                             sess.push_user(prompt);
                                             let current_mode = mode_arc.lock().await.clone();
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
+                                            let _ = ctx.apply_sandbox_config(&sandbox_config);
+                                            ctx.set_execution_surface(
+                                                wyj_core::ExecutionSurface::TuiInteractive,
+                                            );
                                             ctx.permission_mode = shared_permission_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
@@ -11098,6 +11905,10 @@ async fn tui_main(
                                                                 wyj_core::estimate_tokens(
                                                                     &sess.messages,
                                                                 ),
+                                                            tool_schema_tokens: sess
+                                                                .tool_schema_tokens,
+                                                            tool_schema_tokens_saved: sess
+                                                                .tool_schema_tokens_saved,
                                                         })
                                                         .await;
                                                     let _ = tx.send(AgentEvent::TurnDone).await;
@@ -11143,7 +11954,11 @@ async fn tui_main(
                                             let scoped_model =
                                                 scoped_cfg.model_for_mode(&state.mode).to_string();
                                             match rebuild_fn(&scoped_cfg, &scoped_model) {
-                                                Ok(agent) => Arc::new(agent),
+                                                Ok(agent) => Arc::new(attach_agent_session(
+                                                    agent,
+                                                    session_store.as_ref(),
+                                                    &current_session_id,
+                                                )),
                                                 Err(e) => {
                                                     state.messages.push(
                                                         ChatMessage::assistant_err(format!(
@@ -11162,12 +11977,17 @@ async fn tui_main(
                                         let mode_arc = shared_mode.clone();
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
+                                        let sandbox_config = state.config.sandbox.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let mut sess = session_c.lock().await;
                                             sess.push_user(text);
                                             let current_mode = mode_arc.lock().await.clone();
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
+                                            let _ = ctx.apply_sandbox_config(&sandbox_config);
+                                            ctx.set_execution_surface(
+                                                wyj_core::ExecutionSurface::TuiInteractive,
+                                            );
                                             ctx.permission_mode = shared_permission_c.clone();
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
@@ -11179,10 +11999,13 @@ async fn tui_main(
                                             let _restore_guard = allowed_tools.map(|tools| {
                                                 let prev =
                                                     shared_permission_c.read().unwrap().clone();
+                                                let scoped = tools.into_iter().collect();
                                                 *shared_permission_c.write().unwrap() =
-                                                    PermissionMode::Allowlist(
-                                                        tools.into_iter().collect(),
-                                                    );
+                                                    if matches!(current_mode, AgentMode::Plan) {
+                                                        PermissionMode::Plan(scoped)
+                                                    } else {
+                                                        PermissionMode::Allowlist(scoped)
+                                                    };
                                                 RestorePermissionOnDrop {
                                                     handle: shared_permission_c.clone(),
                                                     prev,
@@ -11207,6 +12030,10 @@ async fn tui_main(
                                                                 wyj_core::estimate_tokens(
                                                                     &sess.messages,
                                                                 ),
+                                                            tool_schema_tokens: sess
+                                                                .tool_schema_tokens,
+                                                            tool_schema_tokens_saved: sess
+                                                                .tool_schema_tokens_saved,
                                                         })
                                                         .await;
                                                     let _ = tx.send(AgentEvent::TurnDone).await;
@@ -11251,6 +12078,16 @@ async fn tui_main(
                                                         input_tokens: sess.total_input_tokens,
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
+                                                        routing_events: sess.routing_events.clone(),
+                                                        current_checkpoint_id: sess
+                                                            .current_checkpoint_id
+                                                            .clone(),
+                                                        branch_parent_session_id: sess
+                                                            .branch_parent_session_id
+                                                            .clone(),
+                                                        branch_parent_checkpoint_id: sess
+                                                            .branch_parent_checkpoint_id
+                                                            .clone(),
                                                         title_generated,
                                                     });
                                                 }
@@ -11263,6 +12100,14 @@ async fn tui_main(
                                                     let mut sess = session.lock().await;
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
+                                                    sess.routing_events =
+                                                        file.routing_events.clone();
+                                                    sess.current_checkpoint_id =
+                                                        file.current_checkpoint_id.clone();
+                                                    sess.branch_parent_session_id =
+                                                        file.branch_parent_session_id.clone();
+                                                    sess.branch_parent_checkpoint_id =
+                                                        file.branch_parent_checkpoint_id.clone();
                                                     sess.messages = file.messages;
                                                     let context_tokens =
                                                         wyj_core::estimate_tokens(&sess.messages);
@@ -11272,6 +12117,11 @@ async fn tui_main(
                                                     current_session_id = file.session_id.clone();
                                                     state.current_session_id =
                                                         current_session_id.clone();
+                                                    retarget_agent_session(
+                                                        &shared_agent,
+                                                        session_store.as_ref(),
+                                                        &current_session_id,
+                                                    );
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
@@ -11435,6 +12285,7 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
+                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                     );
                                     state.current_task = Some(handle);
@@ -11679,6 +12530,10 @@ async fn tui_main(
                     input_tokens: sess.total_input_tokens,
                     output_tokens: sess.total_output_tokens,
                     messages: sess.messages.clone(),
+                    routing_events: sess.routing_events.clone(),
+                    current_checkpoint_id: sess.current_checkpoint_id.clone(),
+                    branch_parent_session_id: sess.branch_parent_session_id.clone(),
+                    branch_parent_checkpoint_id: sess.branch_parent_checkpoint_id.clone(),
                     title_generated,
                 });
                 resumable_session_id = Some(current_session_id.clone());
