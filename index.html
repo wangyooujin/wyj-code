@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code：单二进制、原生 TUI、双协议 LLM 适配、多 Agent 编排的终端 AI 编程助手。Rust 从零实现，12MB，~10ms 冷启动，零遥测。" />
+<meta name="description" content="wyj-code v1.5.4：P0/P1/P2 全部交付，重点适配国内模型，提供原生 TUI、隔离 Worktree/Workflow、ACP daemon、Plugin LSP 与 fail-closed OS sandbox。Rust 单二进制，零遥测。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -46,6 +46,7 @@
       <span class="font-display font-bold tracking-tight text-lg">wyj-code</span>
     </a>
     <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
+      <a href="#delivery" class="hover:text-amber-500 transition-colors" data-i18n="nav.delivery">交付状态</a>
       <a href="#features" class="hover:text-amber-500 transition-colors" data-i18n="nav.features">特性</a>
       <a href="#architecture" class="hover:text-amber-500 transition-colors" data-i18n="nav.architecture">架构</a>
       <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
@@ -79,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">单二进制、原生 TUI、国内模型可信运行时、OS 级安全执行与多 Agent 协作——重点适配 GLM、MiniMax、Kimi、DeepSeek、Qwen 和豆包，同时兼容 Claude、OpenAI 与本地端点。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.4 已完整交付 P0/P1/P2：单二进制、原生 TUI、国内模型可信运行时、OS 级安全执行、隔离 Workflow 与多 Agent 协作，同时兼容 Claude、OpenAI 与本地端点。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -177,6 +178,71 @@
   </div>
 </section>
 
+<!-- DELIVERY STATUS -->
+<section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.4 · P0 / P1 / P2 全部交付</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">从 v1.4.4 的可信执行基线到 v1.5.x 的完整工程控制面，原计划能力已全部进入公开版本；历史 tag 保持不可移动，后续修复通过新版本交付。</p>
+  </div>
+
+  <div class="mt-10 grid md:grid-cols-3 gap-4">
+    <div class="card reveal rounded-xl p-6">
+      <div class="flex items-center justify-between gap-3">
+        <h3 class="font-semibold" data-i18n="delivery.p0.title">P0 · 可信执行</h3>
+        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
+      </div>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p0.desc">国内模型能力目录与 doctor、工具参数修复/schema 校验、Provider 错误分类、权限 fail-closed、Plan 文档写策略与 OS sandbox。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
+      <div class="flex items-center justify-between gap-3">
+        <h3 class="font-semibold" data-i18n="delivery.p1.title">P1 · 效率与恢复</h3>
+        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
+      </div>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p1.desc">ToolSearch/lazy schema、同角色 fallback、checkpoint/rewind/branch、SubAgent 控制，以及 TUI/Markdown/终端交互整合。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
+      <div class="flex items-center justify-between gap-3">
+        <h3 class="font-semibold" data-i18n="delivery.p2.title">P2 · 工程控制面</h3>
+        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
+      </div>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p2.desc">Managed Worktree、Workflow DAG、ACP/daemon、跨连接 session、CodeIndex/LSP、Plugin runtime、本地 Review 与严格 Release CI。</p>
+    </div>
+  </div>
+
+  <div class="mt-5 reveal rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-6 sm:p-7">
+    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
+      <div class="max-w-3xl">
+        <h3 class="font-semibold text-amber-400" data-i18n="delivery.domestic.title">国内模型专项收口</h3>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
+      </div>
+      <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.4" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.4 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/v1.5.4-release-fix.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <div class="arch-node reveal rounded-lg p-4">
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">672 + 1</p>
+      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
+    </div>
+    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.clippy.value">0 warning</p>
+      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.clippy.label">macOS + Linux Rust 1.96.0 / 1.96.1</p>
+    </div>
+    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:60ms">
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.platforms.value">5 / 5</p>
+      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.platforms.label">macOS · Linux musl · Windows</p>
+    </div>
+    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:90ms">
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.assets.value">11 assets</p>
+      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.assets.label">5 归档 + 5 sidecar + SHA256SUMS</p>
+    </div>
+  </div>
+</section>
+
 <!-- FEATURES -->
 <section id="features" class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
   <div class="reveal max-w-2xl">
@@ -249,7 +315,7 @@
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-monitor"/></svg>
       <h3 class="mt-4 font-semibold" data-i18n="feature.computer.title">Computer-use 桌面控制</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型截图观察桌面、合成鼠标点击拖拽与键盘输入操控本机 GUI（macOS / Windows），官方端点与第三方 Anthropic 协议兼容端点均可用。</p>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型可观察并操控本机 GUI（macOS / Windows）；v1.5.4 允许 headless/daemon 安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
