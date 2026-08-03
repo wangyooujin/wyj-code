@@ -185,7 +185,7 @@ impl PermissionPolicy {
             }
             PermissionMode::AutoApprove => PermissionVerdict::Allow,
             PermissionMode::Prompt => {
-                if is_side_effect_tool(&request.tool_name) {
+                if is_side_effect_tool(&request.tool_name, &request.input) {
                     if request.surface.is_interactive() {
                         PermissionVerdict::Ask(PermissionPrompt {
                             reason: "该工具可能产生外部副作用，需要用户确认".to_string(),
@@ -383,12 +383,25 @@ fn is_process_tool(name: &str) -> bool {
     matches!(name, "Bash" | "BashOutput" | "KillShell" | "Agent")
 }
 
-fn is_side_effect_tool(name: &str) -> bool {
-    is_file_write_tool(name)
-        || matches!(
-            name,
-            "Bash" | "KillShell" | "Agent" | "computer" | "app_computer" | "ExitPlanMode"
-        )
+fn is_side_effect_tool(name: &str, input: &Value) -> bool {
+    if is_file_write_tool(name) {
+        return true;
+    }
+    match name {
+        "Bash" | "KillShell" | "Agent" | "ExitPlanMode" => true,
+        // PermissionPolicy runs before Tool::needs_permission. Keep the same
+        // read-only boundary here so headless surfaces can observe/inspect the
+        // desktop while mutations still fail closed without an approval UI.
+        "computer" => !matches!(
+            input.get("action").and_then(Value::as_str),
+            Some("screenshot" | "zoom" | "cursor_position" | "wait")
+        ),
+        "app_computer" => !matches!(
+            input.get("action").and_then(Value::as_str),
+            Some("list_windows" | "screenshot" | "inspect_element")
+        ),
+        _ => false,
+    }
 }
 
 fn network_domain(tool_name: &str, input: &Value) -> Option<String> {
@@ -545,6 +558,66 @@ mod tests {
                 json!({"command": "ls"})
             )),
             PermissionVerdict::Deny(_)
+        ));
+        for (tool, input) in [
+            ("computer", json!({"action": "screenshot"})),
+            ("computer", json!({"action": "zoom"})),
+            ("computer", json!({"action": "cursor_position"})),
+            ("computer", json!({"action": "wait"})),
+            ("app_computer", json!({"action": "list_windows"})),
+            ("app_computer", json!({"action": "screenshot"})),
+            ("app_computer", json!({"action": "inspect_element"})),
+        ] {
+            assert!(
+                matches!(
+                    policy.evaluate(&request(PermissionMode::Prompt, &cwd, tool, input)),
+                    PermissionVerdict::Allow
+                ),
+                "只读 computer-use 动作 {tool} 不应要求 headless 交互审批"
+            );
+        }
+        for (tool, input) in [
+            ("computer", json!({"action": "left_click"})),
+            ("computer", json!({"action": "unknown"})),
+            ("computer", json!({})),
+            ("app_computer", json!({"action": "click"})),
+            ("app_computer", json!({"action": "set_text"})),
+            ("app_computer", json!({"action": "unknown"})),
+            ("app_computer", json!({})),
+        ] {
+            assert!(
+                matches!(
+                    policy.evaluate(&request(PermissionMode::Prompt, &cwd, tool, input)),
+                    PermissionVerdict::Deny(_)
+                ),
+                "有副作用的 computer-use 动作 {tool} 在 headless 下必须 fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_prompt_only_asks_for_mutating_computer_actions() {
+        let policy = PermissionPolicy::default();
+        let cwd = std::env::temp_dir();
+        let mut read = request(
+            PermissionMode::Prompt,
+            &cwd,
+            "app_computer",
+            json!({"action": "inspect_element"}),
+        );
+        read.surface = ExecutionSurface::TuiInteractive;
+        assert!(matches!(policy.evaluate(&read), PermissionVerdict::Allow));
+
+        let mut mutation = request(
+            PermissionMode::Prompt,
+            &cwd,
+            "app_computer",
+            json!({"action": "click"}),
+        );
+        mutation.surface = ExecutionSurface::TuiInteractive;
+        assert!(matches!(
+            policy.evaluate(&mutation),
+            PermissionVerdict::Ask(_)
         ));
     }
 
