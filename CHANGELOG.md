@@ -2,6 +2,12 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.4]
+
+- **Computer-use 只读权限与工具语义对齐**：统一权限策略现在按 `action` 区分 `computer` / `app_computer` 的只读观察与变更操作。`screenshot`、`zoom`、`cursor_position`、`wait`、`list_windows`、`inspect_element` 可在 headless/daemon 的 Prompt 模式下执行，不再因为缺少交互审批通道被整类工具误拒。
+- **变更操作继续失败关闭**：点击、输入、滚动及未知/缺失 action 在无 UI 表面仍拒绝；交互表面仍返回逐调用审批，AutoApprove、Allowlist、Plan、sandbox、foreground compatibility 与项目级授权边界均未扩大。
+- **不可移动发布边界**：v1.5.3 已完成五平台 Release、11 个资产和 Pages 发布，因此保持原 tag 不变；该发布后发现的权限前置判断缺口以 v1.5.4 新补丁交付。
+
 ## [1.5.3]
 
 - **Computer-use lazy schema 保底**：ToolSearch 在工具集很大时仍保留已注册的 `window_capture`、`app_computer` 与兼容 `computer` schema，避免国内模型把“当前未展示”误判成“本会话不支持 GUI”；工具是否注册、foreground compatibility 开关、权限与 sandbox 限制均不扩张。
