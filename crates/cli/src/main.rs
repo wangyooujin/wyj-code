@@ -576,10 +576,17 @@ fn sandbox_report(config: &wyj_config::SandboxCfg) -> serde_json::Value {
         "available": status.available,
         "filesystem_isolation": status.filesystem_isolation,
         "domain_network_isolation": status.domain_network_isolation,
-        "network": if config.network.allowed_domains.is_empty() {
+        "network": if config.network.allow_all {
+            serde_json::json!({"policy": "allow_all"})
+        } else if config.network.allowed_domains.is_empty() {
             serde_json::json!({"policy": "deny"})
         } else {
             serde_json::json!({"policy": "allowed_domains", "domains": config.network.allowed_domains})
+        },
+        "environment": {
+            "inherit": config.environment.inherit,
+            "allow": config.environment.allow,
+            "deny": config.environment.deny,
         },
         "filesystem": {
             "allow_read": config.filesystem.allow_read,
@@ -623,6 +630,7 @@ fn print_sandbox_report(config: &wyj_config::SandboxCfg, json: bool) -> Result<(
             .unwrap_or(false)
     );
     println!("  network: {}", report["network"]);
+    println!("  environment: {}", report["environment"]);
     println!("  overrides: {}", report["filesystem"]);
     println!(
         "  unsandboxed fallback: TUI one-shot={} · headless/schedule/sub-agent=false",

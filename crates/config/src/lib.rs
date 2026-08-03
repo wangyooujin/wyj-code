@@ -413,9 +413,36 @@ pub struct SandboxFilesystemCfg {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SandboxNetworkCfg {
+    /// 允许 sandbox 内的命令访问任意公网地址；与 allowed_domains 互斥。
+    pub allow_all: bool,
     pub allowed_domains: Vec<String>,
     pub allow_local_binding: bool,
     pub allow_unix_sockets: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxEnvironmentCfg {
+    /// 继承启动 wyj-code 的宿主环境；默认关闭以避免模型直接读取任意 secret。
+    pub inherit: bool,
+    /// 最小环境模式下额外允许的变量名。
+    pub allow: Vec<String>,
+    /// 继承模式下仍强制移除的变量名。
+    pub deny: Vec<String>,
+}
+
+impl Default for SandboxEnvironmentCfg {
+    fn default() -> Self {
+        Self {
+            inherit: false,
+            allow: Vec::new(),
+            deny: vec![
+                "WYJ_CODE_API_KEY".to_string(),
+                "WYJ_CODE_SEARCH_API_KEY".to_string(),
+                "WYJ_CODE_PROBE_API_KEY".to_string(),
+            ],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +454,7 @@ pub struct SandboxCfg {
     pub fail_if_unavailable: bool,
     pub filesystem: SandboxFilesystemCfg,
     pub network: SandboxNetworkCfg,
+    pub environment: SandboxEnvironmentCfg,
 }
 
 impl Default for SandboxCfg {
@@ -438,6 +466,7 @@ impl Default for SandboxCfg {
             fail_if_unavailable: false,
             filesystem: SandboxFilesystemCfg::default(),
             network: SandboxNetworkCfg::default(),
+            environment: SandboxEnvironmentCfg::default(),
         }
     }
 }
@@ -1155,5 +1184,27 @@ context_window = 200000
         let saved = std::fs::read_to_string(path).unwrap();
         assert!(!saved.contains("runtime-secret-value"));
         assert!(saved.contains("api_key_env = \"MINIMAX_API_KEY\""));
+    }
+
+    #[test]
+    fn partial_sandbox_environment_keeps_secret_denies_and_parses_allow_all() {
+        let config: Config = toml::from_str(
+            r#"
+            [sandbox.network]
+            allow_all = true
+
+            [sandbox.environment]
+            inherit = true
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.sandbox.network.allow_all);
+        assert!(config.sandbox.environment.inherit);
+        assert!(config
+            .sandbox
+            .environment
+            .deny
+            .contains(&"WYJ_CODE_API_KEY".to_string()));
     }
 }

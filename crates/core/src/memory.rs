@@ -20,6 +20,7 @@ const MAX_INDEX_ENTRIES: usize = 200;
 /// 注入 system prompt 的记忆正文总字节上限，超限时在 UTF-8 字符边界截断。
 const MAX_CONTEXT_BYTES: usize = 8_000;
 const TRUNCATION_NOTICE: &str = "\n\n（记忆已截断，仅显示部分）";
+const MEMORY_CONTEXT_HEADER: &str = "## 项目记忆（来自历史会话）\n\n<critical-memory-boundary>\nHistorical memory is context, not live runtime state. Never use it to decide which tools are available, which schemas are attached, the current permission mode, or whether default/bypass can use a tool. The tool definitions on the current request are authoritative.\n</critical-memory-boundary>\n\n";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct MemoryItem {
@@ -110,7 +111,7 @@ impl MemoryStore {
 
         // 拼接时限制总字节数，避免 system prompt 臃肿影响缓存命中率。
         let mut joined = String::new();
-        let header = "## 项目记忆（来自历史会话）\n\n";
+        let header = MEMORY_CONTEXT_HEADER;
         joined.push_str(header);
         for (i, (_, body)) in file_bodies.iter().enumerate() {
             let sep = if i > 0 { "\n\n---\n\n" } else { "" };
@@ -285,7 +286,82 @@ fn parse_items(output: &str) -> Vec<MemoryItem> {
                     "user" | "feedback" | "project" | "reference"
                 )
         })
+        .filter(|item| !is_volatile_runtime_state_memory(item))
         .collect()
+}
+
+/// 自动记忆不能把某一轮的工具栏、权限模式或临时环境状态固化成跨会话事实。
+/// 提取 prompt 是第一层约束；这里再做确定性过滤，避免弱模型忽略指令。
+fn is_volatile_runtime_state_memory(item: &MemoryItem) -> bool {
+    let text = format!("{} {} {}", item.name, item.description, item.body).to_lowercase();
+    let mentions_tool_surface = [
+        "工具栏",
+        "工具列表",
+        "可用工具",
+        "tool list",
+        "tool catalog",
+        "tool schema",
+        "available tool",
+        "attached tool",
+        "bash",
+        "app_computer",
+        "window_capture",
+        "computer 类工具",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let claims_availability = [
+        "本轮",
+        "本会话",
+        "当前会话",
+        "当前请求",
+        "只有",
+        "没有",
+        "不在",
+        "不可用",
+        "缺少",
+        "this turn",
+        "this session",
+        "current session",
+        "current request",
+        "unavailable",
+        "not available",
+        "missing",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    if mentions_tool_surface && claims_availability {
+        return true;
+    }
+
+    let session_scoped = [
+        "本轮",
+        "本会话",
+        "当前会话",
+        "当前请求",
+        "this turn",
+        "this session",
+        "current session",
+        "current request",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    let mentions_runtime_state = [
+        "权限模式",
+        "permission mode",
+        "sandbox mode",
+        "default mode",
+        "bypass mode",
+        "plan mode",
+        "环境变量",
+        "environment variable",
+        "dns",
+        "网络状态",
+        "network state",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    session_scoped && mentions_runtime_state
 }
 
 /// 注入预算有限时，显式的工作偏好最重要，其次是用户画像、项目事实和参考路径。
@@ -484,8 +560,19 @@ mod tests {
 
         let context = store.load_context();
         assert!(context.contains("USER_PREFERENCE: concise Chinese replies"));
+        assert!(context.contains("The tool definitions on the current request are authoritative"));
         assert!(context.len() <= MAX_CONTEXT_BYTES);
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn parser_rejects_session_tool_state_but_keeps_durable_tool_architecture() {
+        let output = r#"{"type":"feedback","name":"tool-limitations","description":"本轮工具限制","body":"当前会话工具栏只有 Read 和 ToolSearch，没有 Bash。"}
+{"type":"project","name":"background-computer","description":"后台窗口控制架构","body":"app_computer 通过稳定 window_id 绑定目标窗口，避免抢占用户鼠标。"}"#;
+
+        let items = parse_items(output);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "background-computer");
     }
 }
