@@ -729,6 +729,14 @@ impl Agent {
                             .unwrap_or(true)
                     })
                     .collect();
+                let attached_tool_names = request_tools
+                    .iter()
+                    .map(|definition| definition.name.as_str())
+                    .collect::<Vec<_>>();
+                request_system.push_str("\n\n");
+                request_system.push_str(&crate::prompts::current_tool_availability_block(
+                    &attached_tool_names,
+                ));
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 session.tool_schema_tokens = session
                     .tool_schema_tokens

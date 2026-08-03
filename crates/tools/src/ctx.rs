@@ -150,8 +150,28 @@ impl ToolCtx {
     pub fn apply_sandbox_config(&self, config: &wyj_config::SandboxCfg) -> Result<(), String> {
         self.allow_unsandboxed_fallback(config.enabled && config.allow_unsandboxed_commands);
         self.require_sandbox(config.enabled && config.fail_if_unavailable);
+        if config.network.allow_all && !config.network.allowed_domains.is_empty() {
+            return Err("sandbox.network.allow_all 与 allowed_domains 不能同时启用".to_string());
+        }
+        for name in config
+            .environment
+            .allow
+            .iter()
+            .chain(&config.environment.deny)
+        {
+            if name.is_empty() || name.bytes().any(|byte| matches!(byte, b'=' | b'\0')) {
+                return Err(format!("无效的 sandbox 环境变量名：{name:?}"));
+            }
+        }
+        let environment = wyj_sandbox::EnvironmentPolicy {
+            inherit: config.environment.inherit,
+            allow: config.environment.allow.clone(),
+            deny: config.environment.deny.clone(),
+        };
         if !config.enabled {
-            self.set_sandbox_mode(wyj_sandbox::SandboxMode::Disabled);
+            let mut policy = wyj_sandbox::SandboxPolicy::disabled();
+            policy.environment = environment;
+            *self.sandbox_policy.write().unwrap() = policy;
             return Ok(());
         }
 
@@ -175,10 +195,13 @@ impl ToolCtx {
         for path in &config.filesystem.deny_write {
             policy.add_deny_write_root(resolve(path));
         }
-        if !config.network.allowed_domains.is_empty() {
+        if config.network.allow_all {
+            policy.network = wyj_sandbox::NetworkPolicy::AllowAll;
+        } else if !config.network.allowed_domains.is_empty() {
             policy.network =
                 wyj_sandbox::NetworkPolicy::AllowedDomains(config.network.allowed_domains.clone());
         }
+        policy.environment = environment;
         *self.sandbox_policy.write().unwrap() = policy;
         Ok(())
     }
@@ -481,6 +504,61 @@ mod tests {
         assert!(ctx2.always_allowed.read().unwrap().contains("Bash"));
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sandbox_config_can_enable_host_environment_and_unrestricted_network() {
+        let ctx = ToolCtx::new("/tmp");
+        let mut config = wyj_config::SandboxCfg::default();
+        config.network.allow_all = true;
+        config.environment.inherit = true;
+        config.environment.allow.push("JAVA_HOME".to_string());
+        config.environment.deny.push("PRIVATE_TOKEN".to_string());
+
+        ctx.apply_sandbox_config(&config).unwrap();
+        let policy = ctx.sandbox_policy.read().unwrap();
+        assert_eq!(policy.network, wyj_sandbox::NetworkPolicy::AllowAll);
+        assert!(policy.environment.inherit);
+        assert!(policy.environment.allow.contains(&"JAVA_HOME".to_string()));
+        assert!(policy
+            .environment
+            .deny
+            .contains(&"PRIVATE_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn sandbox_config_rejects_ambiguous_network_policy() {
+        let ctx = ToolCtx::new("/tmp");
+        let mut config = wyj_config::SandboxCfg::default();
+        config.network.allow_all = true;
+        config
+            .network
+            .allowed_domains
+            .push("example.com".to_string());
+        assert!(ctx.apply_sandbox_config(&config).is_err());
+    }
+
+    #[test]
+    fn sandbox_config_rejects_invalid_environment_names() {
+        let ctx = ToolCtx::new("/tmp");
+        let mut config = wyj_config::SandboxCfg::default();
+        config.environment.allow.push("BAD=NAME".to_string());
+        assert!(ctx.apply_sandbox_config(&config).is_err());
+    }
+
+    #[test]
+    fn disabled_sandbox_still_applies_environment_policy() {
+        let ctx = ToolCtx::new("/tmp");
+        let mut config = wyj_config::SandboxCfg {
+            enabled: false,
+            ..wyj_config::SandboxCfg::default()
+        };
+        config.environment.inherit = true;
+
+        ctx.apply_sandbox_config(&config).unwrap();
+        let policy = ctx.sandbox_policy.read().unwrap();
+        assert_eq!(policy.mode, wyj_sandbox::SandboxMode::Disabled);
+        assert!(policy.environment.inherit);
     }
 
     #[tokio::test]

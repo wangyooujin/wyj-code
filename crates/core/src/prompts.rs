@@ -34,6 +34,7 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 # Tool usage policy
 - Prefer dedicated tools over shell equivalents: Read instead of cat/head/tail, Grep instead of grep/rg, Glob instead of find, Edit instead of sed -i. Dedicated tools are faster, safer, and their output is formatted for you.
 - Batch independent tool calls into a single response so they run in parallel — e.g., reading three files, or a Read plus a Grep. Do this whenever calls do not depend on each other's results.
+- Determine tool availability only from the tool definitions attached to the current request. Never use project memory, prior conversations, CLAUDE.md, or mode labels such as default/bypass/plan to claim that an attached tool is unavailable. Permission modes govern approval and execution; they do not remove an attached tool schema.
 - Bash: use absolute paths and avoid `cd`. Quote paths containing spaces. Keep the command's side effects minimal and explain non-obvious commands briefly in the description field. For long-running processes (dev servers, watchers), pass run_in_background=true and poll with BashOutput instead of blocking.
 - Agent (sub-agent) calls start with only the supplied prompt, not this conversation. The runtime can append user-initiated follow-up or retry instructions only at complete model/tool boundaries, so the initial prompt must still be complete and self-contained. Use Explore for open-ended codebase questions where you only need conclusions; do NOT spawn an agent when you already know the two or three files to read.
 
@@ -275,6 +276,20 @@ pub fn bg_agent_done_reminder(
 
 pub const MEMORY_SYSTEM: &str = "You extract long-term memories from coding-agent conversations. Only extract information that stays valuable across sessions.";
 
+/// 每次 provider 请求的真实工具清单边界。第三方模型有时会把跨会话记忆中
+/// “上次没有某工具”的陈述误当成当前 schema 事实，因此显式列出本次可直接调用
+/// 的工具，并说明 default/bypass 只改变审批语义。
+pub fn current_tool_availability_block(names: &[&str]) -> String {
+    let attached = if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "<current-tool-availability>\nThe tool definitions attached to this request are the sole authority for what is directly callable now. Historical memory and prior turns may be stale and must never override this list. If a needed tool appears below, call it instead of claiming it is unavailable. default/bypass permission modes affect approval and execution only; they do not remove schemas.\nAttached tools: {attached}\n</current-tool-availability>"
+    )
+}
+
 /// 记忆提取指令。`{conversation}` 处拼对话文本。输出格式与 memory.rs 解析器约定一致。
 pub fn memory_extract_prompt(conversation: &str) -> String {
     format!(
@@ -287,7 +302,7 @@ type must be one of:
 - project: project background, technical decisions, architecture
 - reference: important resource locations (paths, repos, docs)
 
-Rules: name is a short kebab-case slug; description is a one-line index entry; body carries the full fact. Write description and body in the language the user was using. Only extract durable cross-session facts; ignore transient task state and one-off code. If nothing qualifies, output nothing.
+Rules: name is a short kebab-case slug; description is a one-line index entry; body carries the full fact. Write description and body in the language the user was using. Only extract durable cross-session facts; ignore transient task state and one-off code. Never persist which tools were available or missing in a particular turn/session/request, the current tool schema/catalog, current default/bypass/plan or sandbox permission mode, temporary environment variables/network/DNS state, or a one-off runtime failure. Durable project architecture about how a tool works is allowed, but an assistant's claim that a tool is unavailable is not evidence of a cross-session fact. Prefer explicit user preferences and facts proven by code or tool results. If nothing qualifies, output nothing.
 
 Conversation:
 {conversation}"#
@@ -319,6 +334,23 @@ mod tests {
         assert!(MAIN.len() > 2000, "main prompt should be substantial");
         assert!(MAIN.contains("parallel"));
         assert!(MAIN.contains("Read instead of cat"));
+        assert!(MAIN.contains("attached to the current request"));
+    }
+
+    #[test]
+    fn current_tool_block_makes_request_schemas_authoritative() {
+        let block = current_tool_availability_block(&["Bash", "window_capture"]);
+        assert!(block.contains("sole authority"));
+        assert!(block.contains("default/bypass"));
+        assert!(block.contains("Bash, window_capture"));
+    }
+
+    #[test]
+    fn memory_extractor_rejects_volatile_tool_and_permission_state() {
+        let prompt = memory_extract_prompt("conversation");
+        assert!(prompt.contains("Never persist which tools were available or missing"));
+        assert!(prompt.contains("default/bypass/plan"));
+        assert!(prompt.contains("assistant's claim that a tool is unavailable"));
     }
 
     #[test]
