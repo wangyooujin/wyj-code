@@ -1,6 +1,7 @@
 # wyj-code
 
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Release](https://img.shields.io/badge/release-v1.5.4-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.4)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#快速开始)
 [![Zero Telemetry](https://img.shields.io/badge/telemetry-none-green.svg)](#设计原则)
@@ -12,6 +13,33 @@ DeepSeek、Qwen/百炼、豆包/火山等国内模型，也支持 Claude、OpenA
 > **定位说明**：这是个人工程作品集项目，用于展示 AI 系统的工程实现能力，非商业产品。
 > 依据公开的 Anthropic Messages API、OpenAI Chat Completions API、MCP 公开规范
 > clean-room 实现，不含任何第三方专有 prompt 或品牌资产，所有文案均为原创。
+
+## 当前版本与交付状态
+
+最新公开版本为 **[v1.5.4](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.4)**。
+从 v1.4.4 建立的国内模型可信运行时与安全执行基线，到 v1.5.x 的工程化控制面，原计划中的
+P0、P1、P2 已全部实现并进入公开版本；已发布 tag 保持不可移动，后续修复通过新版本交付。
+
+| 优先级 | 已交付范围 | 状态 |
+|---|---|---|
+| P0 | 国内模型能力目录/doctor、工具参数有限修复与原始 schema 校验、Provider 错误标准化、权限 fail-closed、Plan 文档写策略、macOS Seatbelt / Linux bubblewrap sandbox | 已交付 |
+| P1 | ToolSearch/lazy schema、同角色 fallback、checkpoint/rewind/branch、SubAgent follow-up/interrupt/retry、TUI/Markdown/终端交互整合 | 已交付 |
+| P2 | Managed Git Worktree、Workflow DAG、ACP stdio 与跨连接 daemon session、CodeIndex + Plugin LSP、Plugin runtime 事务激活、本地 Review 与严格 Release CI | 已交付 |
+
+**国内模型专项适配**：
+
+- MiniMax、GLM、Kimi、DeepSeek、Qwen/百炼、豆包/火山按 vendor、wire protocol、能力来源和置信度建模；没有独立 live probe 证据时保持 `static_only` / protocol-compatible，不夸大为 live verified。
+- 国内模型即使在保守能力目录中声明单工具调用，但一次返回多个完整合法的 `tool_use`，执行器也会受控串行执行并逐项回填，不再误判为参数错误或触发重试熔断。
+- ToolSearch 在大工具集下始终保留 Read/Bash/Edit/Write/Agent/ExitPlanMode，以及已注册的 `window_capture`、`app_computer`、兼容 `computer` 等核心执行 schema，避免“当前未展示”被误解为“不支持”。
+- v1.5.4 进一步按 action 对齐 computer-use 权限：headless/daemon 可执行截图、窗口枚举和元素检查等只读动作；点击、输入、滚动、未知或缺失 action 仍然失败关闭。
+
+**v1.5.4 发布验证**：
+
+- `cargo test --workspace --locked`：672 passed、1 ignored、0 failed；唯一默认 ignored 的公网 sandbox 测试已单独显式执行并通过。
+- macOS 本机，以及 Linux Docker Rust 1.96.0 / 1.96.1 的 workspace/all-targets strict Clippy 均为 0 warning。
+- Release CI 的 Test/Lint、五个平台构建和 Publish Release 全部成功；公开 Release 包含 5 个归档、5 个 sidecar checksum 和 `SHA256SUMS`，共 11 个资产。
+- 五个平台归档独立 SHA256 校验全部通过，sidecar 与聚合文件逐项一致且使用纯 LF；[项目 Pages](https://wangyooujin.github.io/wyj-code/) 已部署 v1.5.4。
+- 发布验证未使用用户提供的模型凭证，Review scanner 对最终发布提交返回 `findings: []`。
 
 ## 特性
 
