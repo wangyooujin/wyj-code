@@ -29,6 +29,31 @@ pub enum NetworkPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvironmentPolicy {
+    /// 继承启动 wyj-code 的宿主进程环境。关闭时仅保留最小运行变量和 allow 列表。
+    pub inherit: bool,
+    /// 在最小环境模式下额外透传的变量名。
+    pub allow: Vec<String>,
+    /// 无论是否继承都必须从 Bash 子进程移除的变量名。
+    pub deny: Vec<String>,
+}
+
+impl Default for EnvironmentPolicy {
+    fn default() -> Self {
+        Self {
+            inherit: false,
+            allow: Vec::new(),
+            deny: vec![
+                "WYJ_CODE_API_KEY".to_string(),
+                "WYJ_CODE_SEARCH_API_KEY".to_string(),
+                "WYJ_CODE_PROBE_API_KEY".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxPolicy {
     pub mode: SandboxMode,
     pub read_roots: Vec<PathBuf>,
@@ -36,6 +61,8 @@ pub struct SandboxPolicy {
     pub deny_read_roots: Vec<PathBuf>,
     pub deny_write_roots: Vec<PathBuf>,
     pub network: NetworkPolicy,
+    #[serde(default)]
+    pub environment: EnvironmentPolicy,
 }
 
 impl SandboxPolicy {
@@ -47,6 +74,7 @@ impl SandboxPolicy {
             deny_read_roots: default_credential_paths(),
             deny_write_roots: Vec::new(),
             network: NetworkPolicy::Deny,
+            environment: EnvironmentPolicy::default(),
         };
         policy.add_write_root(sandbox_temp_dir());
         policy
@@ -60,6 +88,7 @@ impl SandboxPolicy {
             deny_read_roots: Vec::new(),
             deny_write_roots: Vec::new(),
             network: NetworkPolicy::Deny,
+            environment: EnvironmentPolicy::default(),
         }
     }
 
@@ -190,7 +219,7 @@ impl SandboxRunner {
         }
     }
 
-    /// 构造已清理环境变量的 shell 进程。调用方可继续设置 stdio/process group，
+    /// 按策略构造 shell 进程及其环境。调用方可继续设置 stdio/process group，
     /// 但不得替换 program/args 绕过 runner。
     pub fn shell_command(
         &self,
@@ -199,7 +228,7 @@ impl SandboxRunner {
         policy: &SandboxPolicy,
     ) -> Result<Command, SandboxError> {
         if policy.mode == SandboxMode::Disabled {
-            return Ok(direct_shell(shell_command, cwd));
+            return Ok(direct_shell(shell_command, cwd, &policy.environment));
         }
 
         // `Permissive` 仅表示交互表面可以在调用方弹出一次性降级审批；runner
@@ -220,7 +249,11 @@ impl SandboxRunner {
     /// 仅供已经完成显式人类审批的交互调用方使用。不要在 headless、schedule
     /// 或 SubAgent 中调用；这些表面必须保留 fail-closed 语义。
     pub fn unsandboxed_shell_command(&self, shell_command: &str, cwd: &Path) -> Command {
-        direct_shell(shell_command, cwd)
+        let environment = EnvironmentPolicy {
+            inherit: true,
+            ..EnvironmentPolicy::default()
+        };
+        direct_shell(shell_command, cwd, &environment)
     }
 
     fn macos_command(
@@ -244,7 +277,7 @@ impl SandboxRunner {
             .arg("-c")
             .arg(shell_command)
             .current_dir(cwd);
-        sanitize_environment(&mut command);
+        configure_environment(&mut command, &policy.environment);
         if let Some(port) = proxy_port {
             configure_proxy_environment(&mut command, port);
         }
@@ -302,7 +335,7 @@ impl SandboxRunner {
             .arg("/bin/bash")
             .arg("-c")
             .arg(shell_command);
-        sanitize_environment(&mut command);
+        configure_environment(&mut command, &policy.environment);
         Ok(command)
     }
 }
@@ -355,15 +388,15 @@ fn detect_backend() -> SandboxBackend {
     }
 }
 
-fn direct_shell(shell_command: &str, cwd: &Path) -> Command {
+fn direct_shell(shell_command: &str, cwd: &Path, environment: &EnvironmentPolicy) -> Command {
     let mut command = Command::new(if cfg!(windows) { "bash" } else { "/bin/bash" });
     command.arg("-c").arg(shell_command).current_dir(cwd);
-    sanitize_environment(&mut command);
+    configure_environment(&mut command, environment);
     command
 }
 
-fn sanitize_environment(command: &mut Command) {
-    const ALLOWED_ENV: &[&str] = &[
+fn configure_environment(command: &mut Command, policy: &EnvironmentPolicy) {
+    const BASE_ENV: &[&str] = &[
         "PATH",
         "HOME",
         "LANG",
@@ -375,12 +408,37 @@ fn sanitize_environment(command: &mut Command) {
         "RUSTUP_HOME",
         "TMPDIR",
     ];
-    let values: Vec<(OsString, OsString)> = ALLOWED_ENV
+
+    if policy.inherit {
+        for name in policy
+            .deny
+            .iter()
+            .filter(|name| valid_environment_name(name))
+        {
+            command.env_remove(name);
+        }
+        return;
+    }
+
+    let denied: std::collections::HashSet<&str> = policy.deny.iter().map(String::as_str).collect();
+    let mut names = BASE_ENV
         .iter()
+        .copied()
+        .chain(policy.allow.iter().map(String::as_str))
+        .filter(|name| !denied.contains(name))
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    let values: Vec<(OsString, OsString)> = names
+        .into_iter()
+        .filter(|name| valid_environment_name(name))
         .filter_map(|name| std::env::var_os(name).map(|value| (OsString::from(name), value)))
         .collect();
-    command.env_clear();
-    command.envs(values);
+    command.env_clear().envs(values);
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    !name.is_empty() && !name.bytes().any(|byte| matches!(byte, b'=' | b'\0'))
 }
 
 fn validate_roots(policy: &SandboxPolicy) -> Result<(), SandboxError> {
@@ -762,15 +820,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_mode_builds_direct_shell_and_scrubs_provider_keys() {
+    fn disabled_mode_builds_direct_shell_with_host_environment() {
         let dir = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy::disabled();
+        policy.environment.inherit = true;
         let command = SandboxRunner::detect()
-            .shell_command("pwd", dir.path(), &SandboxPolicy::disabled())
+            .shell_command("pwd", dir.path(), &policy)
             .unwrap();
         assert!(command.get_args().any(|arg| arg == "-c"));
-        assert!(!command
+        assert!(command
             .get_envs()
-            .any(|(name, _)| name == "WYJ_CODE_API_KEY"));
+            .any(|(name, value)| name == "WYJ_CODE_API_KEY" && value.is_none()));
+    }
+
+    #[test]
+    fn minimal_environment_hides_non_baseline_variables() {
+        let Some((name, _)) = inherited_test_variable() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::enforced_workspace(dir.path());
+        let shell = format!("printf %s \"${{{name}-unset}}\"");
+        let output = SandboxRunner::detect()
+            .shell_command(&shell, dir.path(), &policy)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+    }
+
+    #[test]
+    fn inherited_environment_preserves_host_variables_and_denies_secrets() {
+        let Some((name, value)) = inherited_test_variable() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy = SandboxPolicy::enforced_workspace(dir.path());
+        policy.environment.inherit = true;
+        let shell = format!("printf %s \"${{{name}-unset}}\"");
+        let output = SandboxRunner::detect()
+            .shell_command(&shell, dir.path(), &policy)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), value);
+
+        policy.environment.deny.push(name.to_string());
+        let output = SandboxRunner::detect()
+            .shell_command(&shell, dir.path(), &policy)
+            .unwrap()
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset");
+    }
+
+    fn inherited_test_variable() -> Option<(&'static str, String)> {
+        ["USER", "SHELL", "TERM_PROGRAM"]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok().map(|value| (name, value)))
     }
 
     #[test]

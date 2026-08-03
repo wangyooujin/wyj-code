@@ -184,7 +184,13 @@ allow_unsandboxed_commands = true
 fail_if_unavailable = false
 
 [sandbox.network]
+allow_all = false             # 本地交互需要完整联网时设为 true；与 allowed_domains 互斥
 allowed_domains = []
+
+[sandbox.environment]
+inherit = false               # 继承启动 wyj-code 的宿主环境；内部 provider key 仍默认拒绝
+allow = []                    # inherit=false 时额外透传，例如 ["JAVA_HOME", "GOPATH"]
+deny = ["WYJ_CODE_API_KEY", "WYJ_CODE_SEARCH_API_KEY", "WYJ_CODE_PROBE_API_KEY"]
 ```
 
 TUI 内可用 `/model doctor`、`/sandbox`、`/checkpoint`、`/rewind`、`/branch`、
