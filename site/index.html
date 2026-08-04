@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.4：P0/P1/P2 全部交付，重点适配国内模型，提供原生 TUI、隔离 Worktree/Workflow、ACP daemon、Plugin LSP 与 fail-closed OS sandbox。Rust 单二进制，零遥测。" />
+<meta name="description" content="wyj-code v1.5.5：证据化自进化、/evolve 治理中心、多图片 Composer 与终端滚轮隔离。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.4 已完整交付 P0/P1/P2：单二进制、原生 TUI、国内模型可信运行时、OS 级安全执行、隔离 Workflow 与多 Agent 协作，同时兼容 Claude、OpenAI 与本地端点。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.5 已公开发布：新增证据化自进化、/evolve 治理中心、多图片 Composer 与终端滚轮隔离；安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.4</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.5</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.4 · MiniMax-M2 · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.5 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.4 · P0 / P1 / P2 全部交付</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">从 v1.4.4 的可信执行基线到 v1.5.x 的完整工程控制面，原计划能力已全部进入公开版本；历史 tag 保持不可移动，后续修复通过新版本交付。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.5 · Evidence-backed Evolution</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.5 已公开交付 TUI 可靠性收口与证据化自进化 L0-L3；历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -210,6 +210,16 @@
     </div>
   </div>
 
+  <div class="mt-5 reveal rounded-xl border border-phosphor/20 bg-phosphor/[0.04] p-6 sm:p-7">
+    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
+      <div class="max-w-3xl">
+        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.5 · Evidence-backed Evolution</h3>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">按目标记录 Episode，以测试、Review、Git、工具结果和反馈形成证据；Memory 带 scope/citation/TTL/冲突与相关性检索；Rule 和 Skill 候选必须人工批准。当前 Skill eval 是结构化边界用例与历史证据，不冒充完整 Agent replay 或 benchmark。</p>
+      </div>
+      <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/v1.5.5-plan.md" target="_blank" rel="noopener" class="text-phosphor hover:text-paper transition-colors text-sm shrink-0" data-i18n="delivery.evolution.plan">查看 v1.5.5 实施计划 →</a>
+    </div>
+  </div>
+
   <div class="mt-5 reveal rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-6 sm:p-7">
     <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
       <div class="max-w-3xl">
@@ -217,20 +227,20 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.4" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.4 Release →</a>
-        <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/v1.5.4-release-fix.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.5" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.5 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/v1.5.5-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
   </div>
 
   <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="arch-node reveal rounded-lg p-4">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">672 + 1</p>
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">712 + 1</p>
       <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
     </div>
     <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
       <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.clippy.value">0 warning</p>
-      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.clippy.label">macOS + Linux Rust 1.96.0 / 1.96.1</p>
+      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.clippy.label">workspace · all targets · Rust 1.96.0</p>
     </div>
     <div class="arch-node reveal rounded-lg p-4" style="transition-delay:60ms">
       <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.platforms.value">5 / 5</p>
@@ -283,6 +293,11 @@
       <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.memory.desc">每轮重新读盘注入、子目录动态加载、@path 递归导入，跨会话记忆同样开箱即用。</p>
     </div>
     <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-layers"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.evolution.title">证据化自进化</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.evolution.desc">v1.5.5 用 Episode、可验证 Memory、人工审批 Rule/Skill 候选和原子回滚形成透明闭环；Web/MCP 外部上下文默认隔离。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-terminal"/></svg>
       <h3 class="mt-4 font-semibold" data-i18n="feature.tui.title">原生 ratatui TUI</h3>
       <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.tui.desc">流式 markdown、语法高亮、工具调用实时展示、子 Agent 聚合面板，交互体验为终端而生。</p>
@@ -315,7 +330,7 @@
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-monitor"/></svg>
       <h3 class="mt-4 font-semibold" data-i18n="feature.computer.title">Computer-use 桌面控制</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型可观察并操控本机 GUI（macOS / Windows）；v1.5.4 允许 headless/daemon 安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型可观察并操控本机 GUI（macOS / Windows）；v1.5.5 允许 headless/daemon 安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
@@ -515,11 +530,21 @@ cargo run -- --config-status</code></pre>
 
   <div class="mt-12 space-y-0">
     <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-phosphor">v1.5.5</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v155">新增证据化 Evolution store、/evolve 四视图与完整 CLI、相关性 Memory 注入、外部上下文隔离、人工审批 Rule/Skill 候选、结构化 Skill eval、原子安装回滚；同时纳入多图片 Composer 与 Ghostty 滚轮/方向键隔离。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
           <span class="font-display font-bold text-amber-500">v1.5.4</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v154">按 action 对齐 computer-use 的统一权限与工具权限语义：headless/daemon 可安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
       </div>

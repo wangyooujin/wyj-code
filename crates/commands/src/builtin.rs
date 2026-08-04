@@ -671,6 +671,26 @@ impl Command for MemoryCmd {
     }
 }
 
+// ── /evolve ──────────────────────────────────────────────────────────────────
+
+pub struct EvolveCmd;
+
+#[async_trait]
+impl Command for EvolveCmd {
+    fn name(&self) -> &str {
+        "evolve"
+    }
+    fn description(&self) -> String {
+        tr("evolve.desc")
+    }
+    fn usage(&self) -> String {
+        "/evolve".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::OpenEvolutionDialog)
+    }
+}
+
 // ── /doctor ───────────────────────────────────────────────────────────────────
 
 pub struct DoctorCmd;
@@ -1524,6 +1544,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(SubAgentsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
+    reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
@@ -1575,6 +1596,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(SubAgentsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
+    reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
@@ -1654,6 +1676,22 @@ mod help_tests {
             panic!("expected Output");
         };
         assert!(text.contains("/subagents"));
+    }
+
+    #[tokio::test]
+    async fn evolve_is_registered_and_documented_in_help() {
+        let registry = standard_registry();
+        let command = registry.get("evolve").expect("/evolve is registered");
+        assert_eq!(command.usage(), "/evolve");
+
+        let ctx = ctx_with_dynamic(vec![]);
+        let CommandResult::Output(text) = HelpCmd.run("", &ctx).await.unwrap() else {
+            panic!("expected Output");
+        };
+        assert!(text.contains("/evolve"));
+
+        let result = registry.dispatch("/evolve", &ctx).await.unwrap().unwrap();
+        assert!(matches!(result, CommandResult::OpenEvolutionDialog));
     }
 }
 
