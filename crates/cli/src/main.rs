@@ -7,15 +7,16 @@ use tracing_subscriber::EnvFilter;
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistry, CommandResult};
 use wyj_config::{AgentMode, Config, RoutingRole};
 use wyj_core::{
-    extract_preview, extract_title, new_session_id, now_iso, Agent, ExecutionSurface, HistoryEntry,
-    HistoryStore, HookRunner, MemoryStore, Session, SessionFile, SessionStore, SummaryGenerator,
-    ToolEvent,
+    extract_preview, extract_title, new_session_id, now_iso, Agent, EvolutionStore,
+    ExecutionSurface, HistoryEntry, HistoryStore, HookRunner, MemoryStore, Session, SessionFile,
+    SessionStore, SummaryGenerator, ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
 };
 
 mod acp;
+mod evolve_cmd;
 mod extensions_cmd;
 mod review_cmd;
 mod schedule_cmd;
@@ -100,6 +101,14 @@ enum Commands {
     Extensions {
         #[command(subcommand)]
         command: extensions_cmd::ExtensionCommand,
+    },
+    /// Inspect and govern local evidence-backed Agent evolution.
+    #[command(name = "evolve")]
+    Evolve {
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: evolve_cmd::EvolveCommand,
     },
     /// 管理定时任务（增删改查 + 同步系统 crontab）；`schedule run <id>` 是真正
     /// 被 crontab 调用的执行入口，对应 TUI 内 `/schedule` 面板的 headless 版本。
@@ -824,6 +833,10 @@ async fn main() -> Result<()> {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return extensions_cmd::run(command, &cwd).await;
             }
+            Commands::Evolve { command, json } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return evolve_cmd::run(command, json, &cwd, &cfg).await;
+            }
             Commands::Schedule { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return schedule_cmd::run(command, &cwd).await;
@@ -1096,6 +1109,14 @@ async fn main() -> Result<()> {
         })
         .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
         .ok();
+    let evolution_store = if cfg.evolution.enabled {
+        EvolutionStore::new(&config_base, &cwd, cfg.evolution.clone())
+            .map(Arc::new)
+            .map_err(|error| tracing::warn!("Evolution 存储初始化失败: {error}"))
+            .ok()
+    } else {
+        None
+    };
 
     // CLAUDE.md 系记忆文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
     // （共享子目录动态加载去重状态）。
@@ -1103,6 +1124,7 @@ async fn main() -> Result<()> {
 
     // 供 TUI 语言/模型切换重建 Agent 时复用（避免重建后丢失记忆能力）
     let memory_store_for_rebuild = memory_store.clone();
+    let evolution_store_for_rebuild = evolution_store.clone();
     let claude_md_for_rebuild = claude_md_loader.clone();
 
     // 确定当前运行模式
@@ -1293,15 +1315,15 @@ async fn main() -> Result<()> {
         claude_md_loader.clone(),
         mcp_tools.clone(),
         code_index.clone(),
+        evolution_store.clone(),
     );
-    registry.register_arc(Arc::new(SubAgentTool::new_shared(
-        shared_agent_defs.clone(),
-        sub_agent_hub.clone(),
-        {
+    registry.register_arc(Arc::new(
+        SubAgentTool::new_shared(shared_agent_defs.clone(), sub_agent_hub.clone(), {
             let f = sub_agent_factory.clone();
             move |def| f(def)
-        },
-    )));
+        })
+        .with_session_id(session_id.clone()),
+    ));
 
     // -p（单次问答）模式：仍在启动时连接 MCP server，但只等一个远小于
     // `MCP_CONNECT_TIMEOUT` 的宽限期（见 `MCP_STARTUP_GRACE`）——`-p` 是真正的
@@ -1469,6 +1491,9 @@ async fn main() -> Result<()> {
 
     if let Some(mem) = memory_store {
         agent = agent.with_memory(mem);
+    }
+    if let Some(evolution) = evolution_store {
+        agent = agent.with_evolution(evolution);
     }
 
     for def in registry.definitions() {
@@ -1673,6 +1698,9 @@ async fn main() -> Result<()> {
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
+        if let Some(evolution) = &evolution_store_for_rebuild {
+            new_agent = new_agent.with_evolution(evolution.clone());
+        }
         if let Some(store) = &store_for_rebuild {
             let title_provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
                 .unwrap_or_else(|e| {
@@ -1704,12 +1732,16 @@ async fn main() -> Result<()> {
             claude_md_for_rebuild.clone(),
             mcp_tools_for_rebuild.clone(),
             code_index_for_rebuild.clone(),
+            evolution_store_for_rebuild.clone(),
         );
-        reg.register_arc(Arc::new(SubAgentTool::new_shared(
-            agent_defs_for_rebuild.clone(),
-            hub_for_rebuild.clone(),
-            move |def| sub_factory(def),
-        )));
+        reg.register_arc(Arc::new(
+            SubAgentTool::new_shared(
+                agent_defs_for_rebuild.clone(),
+                hub_for_rebuild.clone(),
+                move |def| sub_factory(def),
+            )
+            .with_session_id(sid_for_rebuild.clone()),
+        ));
         for def in reg.definitions() {
             if let Some(t) = reg.get(&def.name) {
                 new_agent.register_tool(t);
@@ -2053,6 +2085,7 @@ fn make_sub_agent_factory(
     claude_md: Arc<wyj_core::ClaudeMdLoader>,
     mcp_tools: wyj_tools::SharedMcpTools,
     code_index: Arc<dyn wyj_core::CodeIndex>,
+    evolution: Option<Arc<wyj_core::EvolutionStore>>,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
         let routing_role = if def.name.eq_ignore_ascii_case("explore") {
@@ -2124,6 +2157,9 @@ fn make_sub_agent_factory(
             .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(p.thinking_budget, p.interleaved_thinking)
             .with_claude_md(claude_md.clone());
+        if let Some(store) = &evolution {
+            sub_agent = sub_agent.with_evolution(store.clone());
+        }
         if !def.system_prompt.is_empty() {
             sub_agent = sub_agent.with_system(def.system_prompt.clone());
         }
@@ -2948,6 +2984,15 @@ async fn repl(
                     println!(
                         "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
                     );
+                }
+                Ok(CommandResult::OpenEvolutionDialog) => {
+                    let evolution = shared_agent.read().unwrap().evolution_ref().cloned();
+                    match evolution.and_then(|store| store.status().ok()) {
+                        Some(status) => println!("{}", serde_json::to_string_pretty(&status)?),
+                        None => println!(
+                            "[Evolution 不可用；请检查 [evolution].enabled，或使用 `wyj-code evolve doctor`]"
+                        ),
+                    }
                 }
                 Ok(CommandResult::OpenMcpDialog) => {
                     println!("{}", wyj_i18n::tr("mcp.headless_unsupported"));

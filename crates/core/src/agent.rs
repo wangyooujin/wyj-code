@@ -2,6 +2,7 @@
 
 use crate::claude_md::ClaudeMdLoader;
 use crate::compact::{compact_session, compact_trigger_buffer, estimate_request_tokens};
+use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
 use crate::session::Session;
@@ -145,6 +146,9 @@ pub struct Agent {
     context_window: u32,
     /// 跨会话记忆存储（可选）
     memory: Option<Arc<MemoryStore>>,
+    /// 证据化自进化存储（可选）。启用时接管跨会话经验注入与提取；旧
+    /// MemoryStore 仍保留给兼容面板和显式迁移使用。
+    evolution: Option<Arc<EvolutionStore>>,
     /// CLAUDE.md 系记忆文件加载器（可选）
     claude_md: Option<Arc<ClaudeMdLoader>>,
     /// 可选的工具事件回调（Send + Sync，可跨线程）
@@ -179,6 +183,21 @@ pub struct Agent {
     checkpoint_store: Option<Arc<crate::checkpoint::CheckpointStore>>,
 }
 
+struct EvolutionEpisodeGuard {
+    store: Arc<EvolutionStore>,
+    capture: Option<crate::evolution::EpisodeCapture>,
+}
+
+impl Drop for EvolutionEpisodeGuard {
+    fn drop(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            if let Err(error) = self.store.cancel_episode(capture) {
+                tracing::warn!("记录 cancelled Evolution Episode 失败: {error}");
+            }
+        }
+    }
+}
+
 impl Agent {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
         Self {
@@ -194,6 +213,7 @@ impl Agent {
             max_turns: 200,
             context_window: 200_000,
             memory: None,
+            evolution: None,
             claude_md: None,
             tool_cb: None,
             usage_cb: None,
@@ -305,6 +325,15 @@ impl Agent {
 
     pub fn memory_ref(&self) -> Option<&Arc<MemoryStore>> {
         self.memory.as_ref()
+    }
+
+    pub fn with_evolution(mut self, evolution: Arc<EvolutionStore>) -> Self {
+        self.evolution = Some(evolution);
+        self
+    }
+
+    pub fn evolution_ref(&self) -> Option<&Arc<EvolutionStore>> {
+        self.evolution.as_ref()
     }
 
     pub fn with_claude_md(mut self, loader: Arc<ClaudeMdLoader>) -> Self {
@@ -570,6 +599,55 @@ impl Agent {
         session: &mut Session,
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
+        inject_rx: Option<
+            &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<ContentBlock>, InjectionKind)>,
+        >,
+        on_inject: impl FnMut(InjectionKind),
+    ) -> Result<()> {
+        let mut evolution_guard = self.evolution.as_ref().map(|evolution| {
+            let route = self.route_at(self.active_route_index());
+            evolution.schedule_pending_analysis(route.provider.clone());
+            EvolutionEpisodeGuard {
+                store: evolution.clone(),
+                capture: Some(
+                    evolution.begin_episode(
+                        self.session_id
+                            .clone()
+                            .unwrap_or_else(|| "unsaved-session".to_string()),
+                        session,
+                        &last_user_goal(session),
+                        route.profile_name,
+                        route.vendor,
+                        route.model,
+                    ),
+                ),
+            }
+        });
+        let result = self
+            .run_turn_with_injection_inner(session, ctx, on_text, inject_rx, on_inject)
+            .await;
+        if let Some(guard) = evolution_guard.as_mut() {
+            let capture = guard
+                .capture
+                .take()
+                .expect("Evolution capture exists until normal turn completion");
+            let evolution = guard.store.clone();
+            match evolution.finish_episode(capture, session, &result) {
+                Ok(episode) => {
+                    let provider = self.route_at(self.active_route_index()).provider;
+                    evolution.schedule_analysis(episode, provider);
+                }
+                Err(error) => tracing::warn!("记录 Evolution Episode 失败: {error}"),
+            }
+        }
+        result
+    }
+
+    async fn run_turn_with_injection_inner(
+        &self,
+        session: &mut Session,
+        ctx: &dyn ToolContext,
+        on_text: &mut impl FnMut(&str),
         mut inject_rx: Option<
             &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<ContentBlock>, InjectionKind)>,
         >,
@@ -583,7 +661,13 @@ impl Agent {
         // 使其首轮全价、后续轮次命中缓存按 0.1x 计费，避免跨轮线性累积。
         // 子目录动态 reminder 在循环内追加到 system 末尾（只增不减，前缀仍可缓存）。
         let mut system = self.system_prompt.clone();
-        if let Some(mem) = &self.memory {
+        if let Some(evolution) = &self.evolution {
+            let snapshot = evolution.context_snapshot(&last_user_goal(session));
+            if !snapshot.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(&snapshot);
+            }
+        } else if let Some(mem) = &self.memory {
             // 会话级快照：本会话内容固定，防止后台提取的新记忆改变 system
             // 前缀而击穿 prompt 缓存；新记忆自然在下个会话生效。
             let ctx_str = mem.load_context_cached();
@@ -1323,14 +1407,16 @@ impl Agent {
 
             if !has_tool_calls && !got_injection {
                 // 对话轮次结束，触发后台记忆提取
-                if let Some(mem) = self.memory.as_ref().cloned() {
-                    let provider = self.route_at(self.active_route_index()).provider;
-                    let msgs = session.messages.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = mem.extract_and_save(msgs, provider).await {
-                            tracing::debug!("记忆提取失败: {e}");
-                        }
-                    });
+                if self.evolution.is_none() {
+                    if let Some(mem) = self.memory.as_ref().cloned() {
+                        let provider = self.route_at(self.active_route_index()).provider;
+                        let msgs = session.messages.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = mem.extract_and_save(msgs, provider).await {
+                                tracing::debug!("记忆提取失败: {e}");
+                            }
+                        });
+                    }
                 }
                 // 首轮后触发后台标题生成（若已配置 SummaryGenerator 且有 session_id）
                 if let Some(gen) = self.summary.as_ref().cloned() {
@@ -1519,6 +1605,32 @@ fn session_agent_event_id(call_id: &str) -> u64 {
         .fold(0xcbf29ce484222325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         })
+}
+
+fn last_user_goal(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == wyj_api::types::Role::User)
+        .map(|message| {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.trim()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if text.is_empty() {
+                "attachment-only user goal".to_string()
+            } else {
+                text
+            }
+        })
+        .unwrap_or_else(|| "unknown user goal".to_string())
 }
 
 /// 执行工具并组装 (display, content, is_error) 三元组，抽出复用于
@@ -2815,6 +2927,44 @@ mod tests {
         assert_eq!(id, "toolu_42");
         assert!(!is_error);
         assert_eq!(seen.lock().unwrap().as_deref(), Some("toolu_42"));
+    }
+
+    #[test]
+    fn dropping_episode_guard_persists_cancelled_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let store = Arc::new(
+            EvolutionStore::new(dir.path(), &repo, wyj_config::EvolutionCfg::default()).unwrap(),
+        );
+        let mut session = Session::new();
+        session.push_user("cancel this turn");
+        let capture = store.begin_episode(
+            "session-abort",
+            &session,
+            "cancel this turn",
+            "default",
+            "test-vendor",
+            "test-model",
+        );
+
+        drop(EvolutionEpisodeGuard {
+            store: store.clone(),
+            capture: Some(capture),
+        });
+
+        let episodes = store.list_episodes(10).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(
+            episodes[0].outcome,
+            crate::evolution::EpisodeOutcome::Cancelled
+        );
+        assert_eq!(episodes[0].evidence[0].label, "turn_cancelled");
     }
 }
 

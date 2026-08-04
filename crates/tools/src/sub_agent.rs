@@ -27,6 +27,7 @@ pub struct SubAgentTool {
     defs: SharedAgentDefinitions,
     hub: Arc<SubAgentHub>,
     factory: AgentFactory,
+    root_session_id: Option<String>,
     caller_id: Option<u64>,
     depth: usize,
     max_depth: usize,
@@ -42,6 +43,7 @@ impl SubAgentTool {
             defs: Arc::new(std::sync::RwLock::new((*defs).clone())),
             hub,
             factory: Arc::new(factory),
+            root_session_id: None,
             caller_id: None,
             depth: 0,
             max_depth: 3,
@@ -57,10 +59,19 @@ impl SubAgentTool {
             defs,
             hub,
             factory: Arc::new(factory),
+            root_session_id: None,
             caller_id: None,
             depth: 0,
             max_depth: 3,
         }
+    }
+
+    /// Bind sub-agent Episodes to the root conversation. All descendants reuse
+    /// this id so several sub-agents from one user session do not masquerade as
+    /// independent sessions when Evolution evaluates promotion thresholds.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.root_session_id = Some(session_id.into());
+        self
     }
 
     fn find_def(&self, type_name: &str) -> Option<AgentDefinition> {
@@ -279,6 +290,9 @@ impl SubAgentTool {
 
         let background = inp.run_in_background.unwrap_or(false);
         let id = self.hub.alloc_id();
+        if let Some(session_id) = &self.root_session_id {
+            agent.set_session_id(session_id.clone());
+        }
         if def
             .tools
             .as_ref()
@@ -288,6 +302,7 @@ impl SubAgentTool {
                 defs: self.defs.clone(),
                 hub: self.hub.clone(),
                 factory: self.factory.clone(),
+                root_session_id: self.root_session_id.clone(),
                 caller_id: Some(id),
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
@@ -842,6 +857,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sub_agent_episode_reuses_the_root_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let evolution_cfg = wyj_config::EvolutionCfg {
+            generate_experiences: false,
+            ..wyj_config::EvolutionCfg::default()
+        };
+        let evolution =
+            Arc::new(wyj_core::EvolutionStore::new(dir.path(), &repo, evolution_cfg).unwrap());
+        let evolution_for_factory = evolution.clone();
+        let tool = SubAgentTool::new(
+            Arc::new(vec![AgentDefinition {
+                name: "general-purpose".to_string(),
+                description: "test".to_string(),
+                tools: None,
+                model: None,
+                system_prompt: "test".to_string(),
+                builtin: true,
+                source: None,
+            }]),
+            Arc::new(SubAgentHub::new()),
+            move |_| {
+                Ok(Agent::new(Arc::new(EndProvider {
+                    saw_agent_tool: None,
+                }))
+                .with_evolution(evolution_for_factory.clone()))
+            },
+        )
+        .with_session_id("root-session");
+
+        let result = tool
+            .run(
+                serde_json::json!({
+                    "subagent_type": "general-purpose",
+                    "description": "record an episode",
+                    "prompt": "finish the delegated task"
+                }),
+                &crate::ctx::ToolCtx::new(&repo),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        let episodes = evolution.list_episodes(10).unwrap();
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].session_id, "root-session");
+        assert_eq!(episodes[0].goal_summary, "finish the delegated task");
+    }
+
+    #[tokio::test]
     async fn nested_spawn_stops_at_the_configured_depth_limit() {
         let factory_calls = Arc::new(AtomicUsize::new(0));
         let calls = factory_calls.clone();
@@ -862,6 +933,7 @@ mod tests {
                     saw_agent_tool: None,
                 })))
             }),
+            root_session_id: None,
             caller_id: Some(7),
             depth: 3,
             max_depth: 3,

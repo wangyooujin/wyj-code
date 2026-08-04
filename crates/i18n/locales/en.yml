@@ -126,6 +126,7 @@ help:
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the CLAUDE.md memory panel
+    - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
@@ -175,6 +176,12 @@ help:
     - `Plan` — Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
     - `Bypass` — Skips all permission prompts, auto-approves every tool call
   custom_commands_header: "Custom Commands"
+
+evolve:
+  desc: "Open evidence-backed local evolution governance to approve, reject, roll back, or forget experience"
+  title: " Evolution Governance "
+  hint: "←/→ views  ↑/↓ select  a approve  r reject  p pin  f forget  b rollback  Esc close"
+  unavailable: "Evolution is disabled or failed to initialize"
 
 hyperlink:
   open_failed: "Failed to open link: {error}"

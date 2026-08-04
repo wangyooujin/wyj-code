@@ -125,6 +125,7 @@ help:
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开 CLAUDE.md 记忆面板
+    - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
@@ -174,6 +175,12 @@ help:
     - `Plan` — 只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
     - `Bypass` — 跳过所有权限确认，自动批准工具调用
   custom_commands_header: "自定义命令"
+
+evolve:
+  desc: "打开证据化自进化治理中心，查看并批准、拒绝、回滚或遗忘本地经验"
+  title: " 自进化治理中心 "
+  hint: "←/→ 切换视图  ↑/↓ 选择  a 批准  r 拒绝  p pin  f 遗忘  b 回滚  Esc 关闭"
+  unavailable: "Evolution 未启用或初始化失败"
 
 hyperlink:
   open_failed: "打开链接失败：{error}"

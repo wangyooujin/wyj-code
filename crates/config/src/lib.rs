@@ -482,6 +482,88 @@ impl Default for ComputerUseCfg {
     }
 }
 
+/// 自进化保留与容量策略。不同证据类型的有效期不同，避免用一个统一 TTL
+/// 同时误删明确用户偏好、又让仓库事实永久陈旧。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvolutionRetentionCfg {
+    pub repository_fact_stale_days: u32,
+    pub workflow_stale_days: u32,
+    pub user_preference_review_days: u32,
+    pub failed_episode_days: u32,
+    pub candidate_days: u32,
+    pub audit_days: u32,
+}
+
+impl Default for EvolutionRetentionCfg {
+    fn default() -> Self {
+        Self {
+            repository_fact_stale_days: 28,
+            workflow_stale_days: 60,
+            user_preference_review_days: 180,
+            failed_episode_days: 30,
+            candidate_days: 90,
+            audit_days: 180,
+        }
+    }
+}
+
+/// 本地、自包含的 Agent 经验闭环。自动化默认只覆盖有硬证据的普通 Memory；
+/// Rule/Skill 与核心代码修改始终保持人工批准或关闭。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EvolutionCfg {
+    pub enabled: bool,
+    pub use_experiences: bool,
+    pub generate_experiences: bool,
+    pub suggest_rules: bool,
+    pub suggest_skills: bool,
+    pub auto_activate_memories: bool,
+    pub auto_activate_rules: bool,
+    pub auto_install_skills: bool,
+    pub allow_self_code_experiments: bool,
+    pub exclude_external_context: bool,
+    pub infer_feedback: bool,
+    pub skill_candidate_min_successes: u32,
+    pub skill_candidate_min_sessions: u32,
+    pub idle_delay_secs: u64,
+    pub max_background_workers: u32,
+    pub max_context_bytes: usize,
+    pub max_daily_tokens: u32,
+    pub max_daily_wall_secs: u64,
+    pub max_project_store_bytes: u64,
+    pub evolution_profile: String,
+    pub retention: EvolutionRetentionCfg,
+}
+
+impl Default for EvolutionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            use_experiences: true,
+            generate_experiences: true,
+            suggest_rules: true,
+            suggest_skills: true,
+            auto_activate_memories: true,
+            auto_activate_rules: false,
+            auto_install_skills: false,
+            allow_self_code_experiments: false,
+            exclude_external_context: true,
+            infer_feedback: true,
+            skill_candidate_min_successes: 3,
+            skill_candidate_min_sessions: 2,
+            idle_delay_secs: 300,
+            max_background_workers: 1,
+            max_context_bytes: 8_000,
+            max_daily_tokens: 50_000,
+            max_daily_wall_secs: 30 * 60,
+            max_project_store_bytes: 100 * 1024 * 1024,
+            evolution_profile: String::new(),
+            retention: EvolutionRetentionCfg::default(),
+        }
+    }
+}
+
 /// 主配置结构，对应 ~/.wyj-code/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -501,6 +583,9 @@ pub struct Config {
     /// 是否启用跨会话记忆自动提取（/memory 面板可切换，默认开启）
     #[serde(default = "default_true")]
     pub auto_memory_enabled: bool,
+    /// 基于真实 Episode、证据化 Memory 与人工批准候选的本地自进化配置。
+    #[serde(default)]
+    pub evolution: EvolutionCfg,
     /// 子 Agent 模型配置（[subagent] 节）
     #[serde(default)]
     pub subagent: SubAgentCfg,
@@ -552,6 +637,7 @@ impl Default for Config {
             language: None,
             mcp_servers: vec![],
             auto_memory_enabled: true,
+            evolution: EvolutionCfg::default(),
             subagent: SubAgentCfg::default(),
             routing: RoutingCfg::default(),
             model_runtime: ModelRuntimeCfg::default(),
@@ -631,6 +717,7 @@ impl From<LegacyConfigV0> for Config {
             language: legacy.language,
             mcp_servers: legacy.mcp_servers,
             auto_memory_enabled: true,
+            evolution: EvolutionCfg::default(),
             subagent: SubAgentCfg::default(),
             routing: RoutingCfg::default(),
             model_runtime: ModelRuntimeCfg::default(),
@@ -942,8 +1029,8 @@ mod project_path_tests {
 #[cfg(test)]
 mod subagent_cfg_tests {
     use super::{
-        ComputerUseCfg, Config, ForegroundFallback, Profile, Provider, RoutingRole, SubAgentCfg,
-        WireProtocol,
+        ComputerUseCfg, Config, EvolutionCfg, ForegroundFallback, Profile, Provider, RoutingRole,
+        SubAgentCfg, WireProtocol,
     };
 
     #[test]
@@ -1206,5 +1293,44 @@ context_window = 200000
             .environment
             .deny
             .contains(&"WYJ_CODE_API_KEY".to_string()));
+    }
+
+    #[test]
+    fn evolution_defaults_keep_high_risk_promotion_manual_and_bounded() {
+        let evolution = EvolutionCfg::default();
+        assert!(evolution.enabled);
+        assert!(evolution.use_experiences);
+        assert!(evolution.generate_experiences);
+        assert!(evolution.auto_activate_memories);
+        assert!(!evolution.auto_activate_rules);
+        assert!(!evolution.auto_install_skills);
+        assert!(!evolution.allow_self_code_experiments);
+        assert!(evolution.exclude_external_context);
+        assert_eq!(evolution.skill_candidate_min_successes, 3);
+        assert_eq!(evolution.skill_candidate_min_sessions, 2);
+        assert_eq!(evolution.idle_delay_secs, 300);
+        assert_eq!(evolution.max_background_workers, 1);
+        assert_eq!(evolution.max_context_bytes, 8_000);
+        assert_eq!(evolution.max_daily_tokens, 50_000);
+        assert_eq!(evolution.max_daily_wall_secs, 1_800);
+        assert_eq!(evolution.max_project_store_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn partial_evolution_config_inherits_safe_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+            [evolution]
+            enabled = false
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.evolution.enabled);
+        assert!(!config.evolution.auto_activate_rules);
+        assert!(!config.evolution.auto_install_skills);
+        assert!(!config.evolution.allow_self_code_experiments);
+        assert!(config.evolution.exclude_external_context);
+        assert_eq!(config.evolution.max_background_workers, 1);
     }
 }

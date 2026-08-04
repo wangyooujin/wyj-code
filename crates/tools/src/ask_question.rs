@@ -113,7 +113,7 @@ fn labels_for(spec: &AskQuestionSpec, indices: &[usize]) -> String {
 
 /// 把访谈结果序列化成回传给 LLM 的固定协议文本（不走 i18n）
 fn render_answers(questions: &[AskQuestionSpec], answers: &[QuestionAnswer]) -> String {
-    let mut out = String::from("访谈已完成，用户作答如下：\n\n");
+    let mut out = String::from("访谈已完成，用户作答如下：\n");
     for (i, (spec, answer)) in questions.iter().zip(answers.iter()).enumerate() {
         let n = i + 1;
         match &spec.header {
@@ -133,9 +133,6 @@ fn render_answers(questions: &[AskQuestionSpec], answers: &[QuestionAnswer]) -> 
                     labels_for(spec, indices)
                 ));
             }
-        }
-        if n != questions.len() {
-            out.push('\n');
         }
     }
     out
@@ -317,10 +314,14 @@ mod tests {
             QuestionAnswer::FreeText("自定义文本".to_string()),
         ];
         let text = render_answers(&questions, &answers);
-        assert!(text.contains("Q1（能力）: 支持哪些能力？"));
-        assert!(text.contains("→ 用户选择: 缓存、队列"));
-        assert!(text.contains("Q2: 还有什么补充？"));
-        assert!(text.contains("→ 用户输入（其他）: 自定义文本"));
+        assert_eq!(
+            text,
+            "访谈已完成，用户作答如下：\n\
+Q1（能力）: 支持哪些能力？\n\
+→ 用户选择: 缓存、队列\n\
+Q2: 还有什么补充？\n\
+→ 用户输入（其他）: 自定义文本\n"
+        );
     }
 
     #[tokio::test]
