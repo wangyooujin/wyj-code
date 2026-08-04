@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "要重新验证并发布的既有 annotated tag（例如 v1.5.5）"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -11,6 +21,7 @@ permissions:
 env:
   BINARY_NAME: wyj-code
   CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   test:
@@ -18,11 +29,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Verify annotated tag matches checkout and Cargo.toml version
         run: |
           set -euo pipefail
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::无效 release tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+          if [ "$(git cat-file -t "$RELEASE_TAG")" != "tag" ]; then
+            echo "::error::${RELEASE_TAG} 必须是 annotated tag，不能是 lightweight tag 或分支。"
+            exit 1
+          fi
+          TAG_COMMIT=$(git rev-parse "${RELEASE_TAG}^{}")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "::error::checkout (${HEAD_COMMIT}) 与 tag (${TAG_COMMIT}) 不一致。"
+            exit 1
+          fi
+          TAG_VERSION="${RELEASE_TAG#v}"
           CARGO_VERSION=$(cargo metadata --no-deps --format-version=1 \
             | jq -r '.packages[] | select(.name=="wyj-code") | .version')
           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
@@ -37,6 +65,11 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux sandbox dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
 
       - name: cargo test
         run: cargo test --workspace --locked
@@ -69,6 +102,9 @@ jobs:
             use_cross: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,7 +134,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           STAGE="${BINARY_NAME}-${VERSION}-${{ matrix.target }}"
           mkdir "$STAGE"
           cp "target/${{ matrix.target }}/release/${BINARY_NAME}" "$STAGE/"
@@ -112,7 +148,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "${env:GITHUB_REF_NAME}" -replace '^v',''
+          $version = "${env:RELEASE_TAG}" -replace '^v',''
           $stage = "${env:BINARY_NAME}-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/${env:BINARY_NAME}.exe" -Destination $stage
@@ -156,7 +192,7 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
