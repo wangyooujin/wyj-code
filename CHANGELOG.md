@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-08-04
+
+- **证据化本地自进化 L0-L3**：每个用户目标落盘为独立 Episode，并按用户反馈、确定性测试、Review、工具结果和取消状态形成可审计 outcome；从成功/失败证据提炼带 scope、citation、TTL、冲突和当前分支验证的 Memory v2，按当前目标相关性和 8KB 预算选择性注入。Web/MCP/ToolSearch Episode 默认隔离，只有显式 include 后才允许形成仓库级候选。
+- **Rule / Skill 候选与人工治理**：重复工作流和失败模式可生成 Rule/Skill 候选，Skill 自动构造直接、间接、信息不全、负向和安全边界共至少 8 个结构化 eval，并展示历史成功 Episode/Session 证据；当前不执行逐例 Agent replay、安装前后成功率对照或完整 benchmark。Rule 和 Skill 均不会自动激活。新增 `/evolve` 四视图治理中心与 `wyj-code evolve {status,list,review,feedback,skillize,approve,reject,rollback,forget,run,include,migrate,export,doctor}`，批准 Skill 前创建保护 checkpoint，项目/全局安装通过原子文件与 lockfile 写入，支持跨进程恢复旧内容。
+- **本地、限额、可迁移**：Evolution 默认空闲 5 分钟、单 worker、每日 50,000 token / 30 分钟、每项目 100 MB；连续可恢复错误最多三次退避，三次失败后在 Health 暴露。旧 Markdown Memory 先 preview、再原子迁移并保留带时间戳备份；L4 核心代码自修改明确延后 v1.6.0，v1.5.5 不包含无人监督的自改代码。
+- **TUI 多图片编辑修复**：输入框内图片占位符按顺序显示为 `[Image #1]` / `[Image #2]`；支持连续粘贴多张不同图片，并可在真实文本起点用 Backspace 从右向左逐个删除图片/文件附件，占位符仍只用于渲染，不会混入发送给模型的正文。
+- **TUI 鼠标滚轮不再翻动输入历史**：根因是 Ghostty 在 alternate screen 且应用关闭 mouse capture 时，DEC mode 1007 会把滚轮转译为无修饰 `Up/Down`，随后被 Composer 的 `navigate_input_or_history` 误当真实键盘。Ghostty 直连路径现通过 Kitty 键盘 release/repeat 事件区分两者，滚轮只滚动内容区，真实 `↑/↓` 仍保留输入光标/历史语义；其它终端及 tmux/zellij 路径会成对保存、关闭、恢复 mode 1007，防止伪方向键污染输入。全程仍保持 `DisableMouseCapture`，不回退无需 Shift/Option 的终端原生拖选复制。
 - **本地 Bash 环境与联网修复**：sandbox 新增 `network.allow_all` 以及 `environment.inherit/allow/deny` 配置，解决宿主网络正常时 Bash 仍表现为 DNS 解析失败、以及自定义环境变量被 `env_clear()` 无差别清空的问题；默认严格边界不变，启用继承时仍默认隔离 wyj-code 自身 provider/search/probe key。
 - **computer-use 跨会话记忆污染修复**：当前请求显式注入真实工具清单并声明其高于历史记忆，`default/bypass` 仅影响审批而不移除 schema；自动记忆提取与解析同时拒绝保存“本轮/本会话缺少 Bash 或 computer-use”等瞬时运行状态。
 

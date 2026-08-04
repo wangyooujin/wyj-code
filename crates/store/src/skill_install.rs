@@ -7,6 +7,8 @@ use crate::lockfile::{self, InstallScope, InstalledManifest, InstalledSkillEntry
 use crate::marketplace::{self, MarketplaceSkillEntry};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 pub struct SkillInstallRequest {
@@ -15,6 +17,20 @@ pub struct SkillInstallRequest {
     pub entry: MarketplaceSkillEntry,
     pub scope: InstallScope,
     pub name_override: Option<String>,
+}
+
+pub struct GeneratedSkillInstallRequest<'a> {
+    pub name: &'a str,
+    pub content: &'a str,
+    pub scope: InstallScope,
+    pub source_id: &'a str,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GeneratedSkillBackup {
+    previous_skill: Option<InstalledSkillEntry>,
+    previous_extension: Option<lockfile::ExtensionLockEntry>,
+    had_previous_content: bool,
 }
 
 fn skill_dir(scope: InstallScope, cwd: &Path) -> Result<PathBuf> {
@@ -30,6 +46,186 @@ fn upsert_skill_entry(manifest: &mut InstalledManifest, entry: InstalledSkillEnt
     } else {
         manifest.skills.push(entry);
     }
+}
+
+fn validate_generated_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "generated Skill name is empty");
+    anyhow::ensure!(
+        name.chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')),
+        "generated Skill name may only contain ASCII letters, digits, '-' or '_'"
+    );
+    Ok(())
+}
+
+fn generated_backup_paths(dest_path: &Path, source_id: &str) -> (PathBuf, PathBuf) {
+    let digest = format!("{:x}", Sha256::digest(source_id.as_bytes()));
+    let stem = dest_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("skill");
+    let prefix = format!(".{stem}.evolution-{}", &digest[..12]);
+    let parent = dest_path.parent().unwrap_or_else(|| Path::new("."));
+    (
+        parent.join(format!("{prefix}.content.bak")),
+        parent.join(format!("{prefix}.json")),
+    )
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    if let Err(error) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// 安装由 Evolution 生成且已经人工批准的 Skill。Skill 文件、回滚 sidecar 与
+/// lockfile 都采用原子替换；任一步失败都会恢复安装前内容。
+pub fn install_generated_skill(
+    req: &GeneratedSkillInstallRequest<'_>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    validate_generated_name(req.name)?;
+    anyhow::ensure!(
+        req.content.contains("---") && req.content.contains("name:"),
+        "generated Skill is missing required frontmatter"
+    );
+    let dest_dir = skill_dir(req.scope, cwd)?;
+    std::fs::create_dir_all(&dest_dir)?;
+    let dest_path = dest_dir.join(format!("{}.md", req.name));
+    let (content_backup, metadata_backup) = generated_backup_paths(&dest_path, req.source_id);
+    let previous_content = std::fs::read(&dest_path).ok();
+    let mut manifest = lockfile::load_scope(req.scope, cwd)?;
+    let extension_id = format!("skill:{}", req.name);
+    let previous_skill = manifest
+        .skills
+        .iter()
+        .find(|entry| entry.name == req.name)
+        .cloned();
+    let previous_extension = manifest
+        .extensions
+        .iter()
+        .find(|entry| entry.id == extension_id)
+        .cloned();
+    let backup = GeneratedSkillBackup {
+        previous_skill,
+        previous_extension,
+        had_previous_content: previous_content.is_some(),
+    };
+    if let Some(bytes) = &previous_content {
+        write_atomic(&content_backup, bytes)?;
+    }
+    write_atomic(&metadata_backup, &serde_json::to_vec_pretty(&backup)?)?;
+    if let Err(error) = write_atomic(&dest_path, req.content.as_bytes()) {
+        let _ = std::fs::remove_file(&content_backup);
+        let _ = std::fs::remove_file(&metadata_backup);
+        return Err(error).context("write generated Skill");
+    }
+
+    let now = Utc::now();
+    let installed_at = backup
+        .previous_skill
+        .as_ref()
+        .map(|entry| entry.installed_at)
+        .unwrap_or(now);
+    upsert_skill_entry(
+        &mut manifest,
+        InstalledSkillEntry {
+            name: req.name.to_string(),
+            version: Some("evolution-v1".to_string()),
+            scope: req.scope,
+            source: None,
+            enabled: true,
+            installed_at,
+            updated_at: now,
+        },
+    );
+    lockfile::upsert_extension(
+        &mut manifest,
+        lockfile::ExtensionLockEntry {
+            id: extension_id,
+            kind: lockfile::ExtensionKind::Skill,
+            scope: req.scope,
+            source: Some(format!("evolution:{}", req.source_id)),
+            version: Some("evolution-v1".to_string()),
+            commit: None,
+            digest: Some(format!("{:x}", Sha256::digest(req.content.as_bytes()))),
+            enabled: true,
+            dependencies: Vec::new(),
+            installed_at,
+            updated_at: now,
+        },
+    );
+    if let Err(error) = lockfile::save_scope(req.scope, cwd, &manifest) {
+        match previous_content {
+            Some(bytes) => {
+                let _ = write_atomic(&dest_path, &bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&dest_path);
+            }
+        }
+        let _ = std::fs::remove_file(&content_backup);
+        let _ = std::fs::remove_file(&metadata_backup);
+        return Err(error).context("write generated Skill lockfile; installation rolled back");
+    }
+    Ok(dest_path)
+}
+
+/// 回滚指定 Evolution candidate 安装的 Skill，并恢复它覆盖前的文件与 lockfile
+/// 条目。sidecar 不存在时拒绝操作，避免误删用户手工维护的同名 Skill。
+pub fn rollback_generated_skill(
+    name: &str,
+    source_id: &str,
+    scope: InstallScope,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    validate_generated_name(name)?;
+    let dest_path = skill_dir(scope, cwd)?.join(format!("{name}.md"));
+    let (content_backup, metadata_backup) = generated_backup_paths(&dest_path, source_id);
+    let backup: GeneratedSkillBackup =
+        serde_json::from_slice(&std::fs::read(&metadata_backup).with_context(|| {
+            format!(
+                "missing Evolution rollback metadata: {}",
+                metadata_backup.display()
+            )
+        })?)?;
+    let current_content = std::fs::read(&dest_path).ok();
+    let mut manifest = lockfile::load_scope(scope, cwd)?;
+    manifest.skills.retain(|entry| entry.name != name);
+    lockfile::remove_extension(&mut manifest, &format!("skill:{name}"));
+    if let Some(entry) = backup.previous_skill.clone() {
+        upsert_skill_entry(&mut manifest, entry);
+    }
+    if let Some(entry) = backup.previous_extension.clone() {
+        lockfile::upsert_extension(&mut manifest, entry);
+    }
+    if backup.had_previous_content {
+        write_atomic(
+            &dest_path,
+            &std::fs::read(&content_backup).context("read generated Skill content backup")?,
+        )?;
+    } else if dest_path.exists() {
+        std::fs::remove_file(&dest_path)?;
+    }
+    if let Err(error) = lockfile::save_scope(scope, cwd, &manifest) {
+        if let Some(bytes) = current_content {
+            let _ = write_atomic(&dest_path, &bytes);
+        }
+        return Err(error).context("restore generated Skill lockfile");
+    }
+    let _ = std::fs::remove_file(content_backup);
+    let _ = std::fs::remove_file(metadata_backup);
+    Ok(dest_path)
 }
 
 /// 从 marketplace 缓存目录读取 `entry.path` 对应 `.md` 内容，原样写入
@@ -321,5 +517,41 @@ mod tests {
         assert_eq!(manifest.skills.len(), 1);
         assert!(!manifest.skills[0].enabled);
         assert!(!manifest.skills[0].is_managed());
+    }
+
+    #[test]
+    fn generated_skill_install_and_rollback_restore_previous_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".wyj-code").join("skills");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("release.md");
+        std::fs::write(&path, "old skill").unwrap();
+        set_skill_enabled("release", InstallScope::Project, dir.path(), false).unwrap();
+
+        let content = "---\nname: release\ndescription: \"release safely\"\n---\n\nRun checks.\n";
+        install_generated_skill(
+            &GeneratedSkillInstallRequest {
+                name: "release",
+                content,
+                scope: InstallScope::Project,
+                source_id: "cand-skill-1",
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        let installed = lockfile::load_project(dir.path()).unwrap();
+        assert!(installed.skills[0].enabled);
+        assert_eq!(
+            installed.extensions[0].source.as_deref(),
+            Some("evolution:cand-skill-1")
+        );
+
+        rollback_generated_skill("release", "cand-skill-1", InstallScope::Project, dir.path())
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old skill");
+        let restored = lockfile::load_project(dir.path()).unwrap();
+        assert!(!restored.skills[0].enabled);
+        assert!(restored.extensions[0].source.is_none());
     }
 }

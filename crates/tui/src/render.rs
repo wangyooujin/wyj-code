@@ -2,13 +2,13 @@
 
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, ExecModeConfirmDialog, ExtensionsDialog, FlatRow,
-    ImportDialog, ImportStage, InProgressAnswer, InputOwner, McpConnStatus, McpDialog,
-    McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
-    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
-    ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
-    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsDialog,
-    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    AskQuestionStage, Attachment, ChatMessage, EvolutionDialog, EvolutionRow,
+    ExecModeConfirmDialog, ExtensionsDialog, FlatRow, ImportDialog, ImportStage, InProgressAnswer,
+    InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow,
+    MessageRole, PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog,
+    PluginsDialogTab, ProfileDialog, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
+    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
     SCHEDULE_FIELD_REQUIRE_SANDBOX, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
@@ -61,16 +61,20 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
 /// 将待发送附件投影为输入框内的只读占位符。
 ///
 /// 占位符只参与渲染和光标定位，不写入真实 `InputBox`，因此发送给模型的文本不会
-/// 混入 `[Image]` / `[File: ...]`。
+/// 混入 `[Image #n]` / `[File: ...]`。
 fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachment]) -> InputBox {
     if attachments.is_empty() {
         return input.clone();
     }
 
     let mut prefix = String::new();
+    let mut image_number = 0usize;
     for attachment in attachments {
         match attachment {
-            Attachment::Image { .. } => prefix.push_str("[Image] "),
+            Attachment::Image { .. } => {
+                image_number += 1;
+                prefix.push_str(&format!("[Image #{image_number}] "));
+            }
             Attachment::File { path } => {
                 let name = path
                     .file_name()
@@ -110,8 +114,11 @@ mod attachment_input_tests {
 
         let display = input_with_attachment_placeholders(&input, &attachments);
 
-        assert_eq!(display.display_lines(), &["[Image] describe this"]);
-        assert_eq!(display.cursor_col, "[Image] describe this".chars().count());
+        assert_eq!(display.display_lines(), &["[Image #1] describe this"]);
+        assert_eq!(
+            display.cursor_col,
+            "[Image #1] describe this".chars().count()
+        );
         assert_eq!(input.display_lines(), &["describe this"]);
     }
 
@@ -133,8 +140,35 @@ mod attachment_input_tests {
 
         let display = input_with_attachment_placeholders(&input, &attachments);
 
-        assert_eq!(display.display_lines(), &["[Image] [Image] "]);
-        assert_eq!(display.cursor_col, "[Image] [Image] ".chars().count());
+        assert_eq!(display.display_lines(), &["[Image #1] [Image #2] "]);
+        assert_eq!(display.cursor_col, "[Image #1] [Image #2] ".chars().count());
+    }
+
+    #[test]
+    fn image_numbers_ignore_file_attachments() {
+        let input = InputBox::new();
+        let attachments = vec![
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "first".to_string(),
+                preview_label: "1×1".to_string(),
+            },
+            Attachment::File {
+                path: std::path::PathBuf::from("notes.txt"),
+            },
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "second".to_string(),
+                preview_label: "2×2".to_string(),
+            },
+        ];
+
+        let display = input_with_attachment_placeholders(&input, &attachments);
+
+        assert_eq!(
+            display.display_lines(),
+            &["[Image #1] [File: notes.txt] [Image #2] "]
+        );
     }
 }
 
@@ -336,6 +370,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // CLAUDE.md 记忆面板叠加在最顶层
     if let Some(dialog) = &state.memory_dialog {
         draw_memory_dialog(f, dialog, area);
+    }
+
+    if let Some(dialog) = &state.evolution_dialog {
+        draw_evolution_dialog(f, dialog, area);
     }
 
     // MCP server 管理面板叠加在最顶层
@@ -844,10 +882,17 @@ fn render_tool_result_preview(
             .is_some_and(|name| matches!(name, "Edit" | "Write"));
     let content_lines = tool_result_content_lines(msg);
     let fallback = message_summary(msg);
-    let source = if content_lines.is_empty() {
+    // ToolResult 只有 3 个视觉预览行：空行不应被当成有效内容，
+    // 否则 AskQuestion 这类结构化结果会把名额浪费在纯空白上。Diff 中的
+    // 空上下文行仍保留，避免改变 Edit/Write 预览的补丁结构。
+    let compact_content = content_lines
+        .into_iter()
+        .filter(|line| is_diff || !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    let source = if compact_content.is_empty() {
         vec![fallback.as_str()]
     } else {
-        content_lines
+        compact_content
     };
     let mut preview = Vec::new();
     let mut first = true;
@@ -2971,6 +3016,208 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
 
     let para = Paragraph::new(Text::from(lines));
     f.render_widget(para, inner);
+}
+
+fn draw_evolution_dialog(f: &mut Frame, dialog: &EvolutionDialog, area: Rect) {
+    let width = (area.width * 9 / 10).clamp(72, 140).min(area.width);
+    let height = (area.height * 8 / 10).clamp(18, 46).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let dialog_area = Rect::new(x, y, width, height);
+    f.render_widget(Clear, dialog_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::claude_color()))
+        .title(Span::styled(
+            wyj_i18n::tr("evolve.title"),
+            Style::default()
+                .fg(Theme::claude_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(dialog_area);
+    f.render_widget(block, dialog_area);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let tabs = crate::app::EvolutionView::ALL
+        .iter()
+        .map(|view| {
+            let selected = *view == dialog.view;
+            Span::styled(
+                format!(" {} ", view.label()),
+                if selected {
+                    Theme::selected_row().add_modifier(Modifier::BOLD)
+                } else {
+                    Theme::dim()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(Paragraph::new(Line::from(tabs)), vertical[0]);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(vertical[1]);
+    let mut list_lines = Vec::new();
+    if dialog.rows.is_empty() {
+        list_lines.push(Line::from(Span::styled("  No items", Theme::dim())));
+    }
+    for (index, row) in dialog.rows.iter().enumerate() {
+        let marker = if index == dialog.selected {
+            "▶ "
+        } else {
+            "  "
+        };
+        let label = match row {
+            EvolutionRow::Memory(memory) => format!(
+                "{marker}[M/{:?}/{:?}] {}",
+                memory.kind, memory.status, memory.summary
+            ),
+            EvolutionRow::Candidate(candidate) => format!(
+                "{marker}[C/{:?}/{:?}] {}",
+                candidate.kind, candidate.status, candidate.title
+            ),
+            EvolutionRow::Episode(episode) => {
+                format!("{marker}[E/{:?}] {}", episode.outcome, episode.goal_summary)
+            }
+            EvolutionRow::Health { label, value } => format!("{marker}{label}: {value}"),
+        };
+        list_lines.push(Line::from(Span::styled(
+            truncate_line(&label, columns[0].width.saturating_sub(2) as usize),
+            if index == dialog.selected {
+                Theme::selected_row()
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(Text::from(list_lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Theme::border())
+                .title(" Items "),
+        ),
+        columns[0],
+    );
+
+    let detail = dialog
+        .rows
+        .get(dialog.selected)
+        .map(|row| match row {
+            EvolutionRow::Memory(memory) => format!(
+                "{}\n\nid: {}\nkind: {:?}\nstatus: {:?}\nscope: {}:{}\nconfidence: {}\npinned: {}\nepisodes: {}\nsessions: {}\ncitations: {}\n\n{}",
+                memory.summary,
+                memory.id,
+                memory.kind,
+                memory.status,
+                memory.scope.level,
+                memory.scope.value,
+                memory.confidence,
+                memory.pinned,
+                memory.evidence_episode_ids.len(),
+                memory.evidence_session_ids.len(),
+                memory.citations.len(),
+                memory.body
+            ),
+            EvolutionRow::Candidate(candidate) => {
+                let payload = match &candidate.payload {
+                    wyj_core::CandidatePayload::Rule {
+                        rule_text,
+                        suggested_target,
+                    } => format!("target: {suggested_target}\n\n{rule_text}"),
+                    wyj_core::CandidatePayload::Skill {
+                        skill_name,
+                        eval,
+                        skill_md,
+                        ..
+                    } => format!(
+                        "skill: {skill_name}\neval: pass={} cases={} historical_successes={} sessions={}\n\n{}",
+                        eval.structural_pass,
+                        eval.cases.len(),
+                        eval.historical_successes,
+                        eval.distinct_sessions,
+                        skill_md
+                    ),
+                };
+                format!(
+                    "{}\n\nid: {}\nkind: {:?}\nstatus: {:?}\nrisk: {}\nepisodes: {}\nsessions: {}\nactivated: {}\n\n{}",
+                    candidate.summary,
+                    candidate.id,
+                    candidate.kind,
+                    candidate.status,
+                    candidate.risk,
+                    candidate.evidence_episode_ids.len(),
+                    candidate.evidence_session_ids.len(),
+                    candidate
+                        .activated_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    payload
+                )
+            }
+            EvolutionRow::Episode(episode) => format!(
+                "{}\n\nid: {}\nsession: {}\noutcome: {:?}\nconfidence: {}\nmodel: {}/{}\ntokens: ↑{} ↓{}\nduration: {} ms\nexternal context: {}\nmanual include: {}\nchanged paths: {}\n\nEvidence:\n{}",
+                episode.goal_summary,
+                episode.id,
+                episode.session_id,
+                episode.outcome,
+                episode.confidence,
+                episode.vendor,
+                episode.model,
+                episode.input_tokens,
+                episode.output_tokens,
+                episode.duration_ms,
+                episode.external_context,
+                episode.included_by_user,
+                episode.changed_paths.len(),
+                episode
+                    .evidence
+                    .iter()
+                    .map(|evidence| format!("- {:?} {} success={:?}: {}", evidence.kind, evidence.label, evidence.success, evidence.detail))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            EvolutionRow::Health { label, value } => format!("{label}\n\n{value}"),
+        })
+        .unwrap_or_else(|| "No selected item".to_string());
+    f.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .scroll((dialog.detail_scroll, 0))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Theme::border())
+                    .title(" Evidence / Detail "),
+            ),
+        columns[1],
+    );
+
+    let footer = if let Some(action) = &dialog.confirm {
+        format!("Confirm {:?}?  Enter confirm · Esc cancel", action)
+    } else if let Some(error) = &dialog.error {
+        error.clone()
+    } else {
+        wyj_i18n::tr("evolve.hint")
+    };
+    f.render_widget(
+        Paragraph::new(truncate_line(&footer, vertical[2].width as usize)).style(
+            if dialog.confirm.is_some() {
+                Theme::warning()
+            } else {
+                Theme::dim()
+            },
+        ),
+        vertical[2],
+    );
 }
 
 // ── MCP server 管理面板渲染：/mcp 命令触发 ─────────────────────────────────────
@@ -5303,6 +5550,30 @@ mod tool_result_fold_tests {
         assert!(rendered
             .iter()
             .all(|line| !line.contains("ctrl+o") && !line.contains('▶')));
+    }
+
+    #[test]
+    fn ask_question_preview_skips_blank_protocol_lines() {
+        let mut call = message(MessageRole::ToolCall, "AskQuestion");
+        call.sequence_no = Some(1);
+        call.tool_name = Some("AskQuestion".to_string());
+        let mut result = message(
+            MessageRole::ToolResult,
+            "访谈已完成，用户作答如下：\n\nQ1（粒度）: 扫描后如何处理？\n→ 用户选择: 立即执行\n\nQ2: 是否继续？",
+        );
+        result.id = 2;
+        result.sequence_no = Some(1);
+        result.tool_name = Some("AskQuestion".to_string());
+
+        let rendered = render_messages(&[call, result], 100);
+
+        assert_eq!(rendered.len(), 5);
+        assert!(rendered[0].contains("AskQuestion"));
+        assert_eq!(rendered[1], "    ⎿ 访谈已完成，用户作答如下：");
+        assert_eq!(rendered[2], "       Q1（粒度）: 扫描后如何处理？");
+        assert_eq!(rendered[3], "       → 用户选择: 立即执行");
+        assert_eq!(rendered[4], "       ...");
+        assert!(rendered.iter().all(|line| !line.trim().is_empty()));
     }
 
     #[test]

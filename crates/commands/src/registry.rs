@@ -62,6 +62,8 @@ pub enum CommandResult {
     OpenSettingsDialog,
     /// 打开 CLAUDE.md 记忆面板（/memory 命令触发）
     OpenMemoryDialog,
+    /// 打开证据化自进化治理中心（/evolve 命令触发）。
+    OpenEvolutionDialog,
     /// 打开 MCP server 管理面板（/mcp 命令触发）
     OpenMcpDialog,
     /// 打开 Skill 管理面板（/skills 命令触发）

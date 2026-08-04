@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -20,7 +21,7 @@ use crossterm::{
 };
 use ratatui::style::Color as UiColor;
 use ratatui::Terminal;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,8 +34,9 @@ use wyj_config::{AgentMode, Config};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::{
     discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent,
-    AgentDefinition, DiscoveredFile, HistoryEntry, HistoryStore, InjectionKind, Session,
-    SessionFile, SessionMeta, SessionStore, ToolEvent,
+    AgentDefinition, CandidatePayload, CandidateStatus, DiscoveredFile, Episode,
+    EvolutionCandidate, EvolutionMemory, EvolutionStore, HistoryEntry, HistoryStore, InjectionKind,
+    MemoryStatus, Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
 };
 use wyj_tools::todo::{is_todo_collapsible, TodoItem, TodoStatus};
 use wyj_tools::trace::TraceEvent;
@@ -944,6 +946,299 @@ impl MemoryDialog {
             selected: 0,
             auto_memory_enabled,
             error: None,
+        }
+    }
+}
+
+// ── 证据化自进化治理中心：/evolve ────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvolutionView {
+    Active,
+    Candidates,
+    Episodes,
+    Health,
+}
+
+impl EvolutionView {
+    pub const ALL: [Self; 4] = [Self::Active, Self::Candidates, Self::Episodes, Self::Health];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Candidates => "Candidates",
+            Self::Episodes => "Episodes",
+            Self::Health => "Health",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum EvolutionRow {
+    Memory(EvolutionMemory),
+    Candidate(EvolutionCandidate),
+    Episode(Episode),
+    Health { label: String, value: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum EvolutionConfirmAction {
+    ApproveMemory(String),
+    ApproveCandidate(String),
+    RejectCandidate(String),
+    ForgetMemory(String),
+    RollbackCandidate(String),
+}
+
+pub struct EvolutionDialog {
+    pub store: Arc<EvolutionStore>,
+    pub view: EvolutionView,
+    pub rows: Vec<EvolutionRow>,
+    pub selected: usize,
+    pub detail_scroll: u16,
+    pub error: Option<String>,
+    pub confirm: Option<EvolutionConfirmAction>,
+}
+
+impl EvolutionDialog {
+    fn new(store: Arc<EvolutionStore>) -> Self {
+        let mut dialog = Self {
+            store,
+            view: EvolutionView::Active,
+            rows: Vec::new(),
+            selected: 0,
+            detail_scroll: 0,
+            error: None,
+            confirm: None,
+        };
+        dialog.reload();
+        dialog
+    }
+
+    fn reload(&mut self) {
+        let loaded: anyhow::Result<Vec<EvolutionRow>> = match self.view {
+            EvolutionView::Active => self.store.list_memories().map(|memories| {
+                let mut rows = memories
+                    .into_iter()
+                    .filter(|memory| memory.status == MemoryStatus::Active)
+                    .map(EvolutionRow::Memory)
+                    .collect::<Vec<_>>();
+                rows.extend(
+                    self.store
+                        .list_candidates()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|candidate| candidate.status == CandidateStatus::Active)
+                        .map(EvolutionRow::Candidate),
+                );
+                rows
+            }),
+            EvolutionView::Candidates => self.store.list_memories().map(|memories| {
+                let mut rows = memories
+                    .into_iter()
+                    .filter(|memory| {
+                        matches!(
+                            memory.status,
+                            MemoryStatus::Proposed | MemoryStatus::Conflict
+                        )
+                    })
+                    .map(EvolutionRow::Memory)
+                    .collect::<Vec<_>>();
+                rows.extend(
+                    self.store
+                        .list_candidates()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|candidate| candidate.status != CandidateStatus::Active)
+                        .map(EvolutionRow::Candidate),
+                );
+                rows
+            }),
+            EvolutionView::Episodes => self
+                .store
+                .list_episodes(200)
+                .map(|episodes| episodes.into_iter().map(EvolutionRow::Episode).collect()),
+            EvolutionView::Health => self.store.status().map(|status| {
+                vec![
+                    EvolutionRow::Health {
+                        label: "project".into(),
+                        value: status.project_id,
+                    },
+                    EvolutionRow::Health {
+                        label: "store".into(),
+                        value: status.directory.display().to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "episodes".into(),
+                        value: status.episodes.to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "active memories".into(),
+                        value: status.active_memories.to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "pending candidates".into(),
+                        value: status.pending_candidates.to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "store bytes".into(),
+                        value: status.store_bytes.to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "consecutive failures".into(),
+                        value: status.health.consecutive_failures.to_string(),
+                    },
+                    EvolutionRow::Health {
+                        label: "last error".into(),
+                        value: status.health.last_error.unwrap_or_else(|| "none".into()),
+                    },
+                ]
+            }),
+        };
+        match loaded {
+            Ok(rows) => {
+                self.rows = rows;
+                self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+                self.error = None;
+            }
+            Err(error) => {
+                self.rows.clear();
+                self.selected = 0;
+                self.error = Some(error.to_string());
+            }
+        }
+        self.detail_scroll = 0;
+    }
+
+    fn cycle_view(&mut self, forward: bool) {
+        let index = EvolutionView::ALL
+            .iter()
+            .position(|view| *view == self.view)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % EvolutionView::ALL.len()
+        } else {
+            (index + EvolutionView::ALL.len() - 1) % EvolutionView::ALL.len()
+        };
+        self.view = EvolutionView::ALL[next];
+        self.selected = 0;
+        self.confirm = None;
+        self.reload();
+    }
+}
+
+fn generated_skill_scope(path: &Path, cwd: &Path) -> anyhow::Result<wyj_store::InstallScope> {
+    let global = wyj_config::config_dir()?.join("skills");
+    if path.starts_with(global) {
+        Ok(wyj_store::InstallScope::Global)
+    } else if path.starts_with(wyj_config::project_config_dir(cwd).join("skills")) {
+        Ok(wyj_store::InstallScope::Project)
+    } else {
+        anyhow::bail!("Skill activation path is outside managed directories")
+    }
+}
+
+async fn execute_evolution_action(
+    action: EvolutionConfirmAction,
+    store: Arc<EvolutionStore>,
+    cwd: &Path,
+    session_store: Option<&Arc<SessionStore>>,
+    session_id: &str,
+    session: &Arc<Mutex<Session>>,
+) -> anyhow::Result<String> {
+    match action {
+        EvolutionConfirmAction::ApproveMemory(id) => {
+            store.activate_memory(&id)?;
+            Ok(format!("Memory {id} 已激活，将在下一回合生效"))
+        }
+        EvolutionConfirmAction::ApproveCandidate(id) => {
+            let candidate = store
+                .list_candidates()?
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .with_context(|| format!("candidate not found: {id}"))?;
+            anyhow::ensure!(
+                matches!(
+                    candidate.status,
+                    CandidateStatus::Proposed | CandidateStatus::Validated
+                ),
+                "candidate is not ready for approval"
+            );
+            let sessions = session_store.context("checkpoint storage unavailable")?;
+            let checkpoint_store =
+                wyj_core::CheckpointStore::new(sessions.dir(), session_id.to_string())?;
+            let messages = session.lock().await.messages.clone();
+            let checkpoint = checkpoint_store.create(
+                cwd,
+                &messages,
+                wyj_core::CheckpointKind::Manual,
+                Some(format!("before Evolution approval {id}")),
+            )?;
+            let activated_path = match &candidate.payload {
+                CandidatePayload::Rule { .. } => None,
+                CandidatePayload::Skill {
+                    skill_name,
+                    skill_md,
+                    eval,
+                    ..
+                } => {
+                    anyhow::ensure!(eval.structural_pass, "Skill eval did not pass");
+                    Some(wyj_store::skill_install::install_generated_skill(
+                        &wyj_store::skill_install::GeneratedSkillInstallRequest {
+                            name: skill_name,
+                            content: skill_md,
+                            scope: wyj_store::InstallScope::Project,
+                            source_id: &id,
+                        },
+                        cwd,
+                    )?)
+                }
+            };
+            if let Err(error) = store.mark_candidate_active(&id, activated_path.clone()) {
+                if let (CandidatePayload::Skill { skill_name, .. }, Some(path)) =
+                    (&candidate.payload, activated_path.as_deref())
+                {
+                    if let Ok(scope) = generated_skill_scope(path, cwd) {
+                        let _ = wyj_store::skill_install::rollback_generated_skill(
+                            skill_name, &id, scope, cwd,
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            Ok(format!(
+                "Candidate {id} 已激活（checkpoint {}），下一回合生效",
+                checkpoint.id
+            ))
+        }
+        EvolutionConfirmAction::RejectCandidate(id) => {
+            store.reject_candidate(&id, Some("rejected from /evolve".into()))?;
+            Ok(format!("Candidate {id} 已拒绝"))
+        }
+        EvolutionConfirmAction::ForgetMemory(id) => {
+            store.forget_memory(&id)?;
+            Ok(format!("Memory {id} 已遗忘"))
+        }
+        EvolutionConfirmAction::RollbackCandidate(id) => {
+            let candidate = store
+                .list_candidates()?
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .with_context(|| format!("candidate not found: {id}"))?;
+            anyhow::ensure!(
+                candidate.status == CandidateStatus::Active,
+                "candidate is not active"
+            );
+            if let CandidatePayload::Skill { skill_name, .. } = &candidate.payload {
+                let path = candidate
+                    .activated_path
+                    .as_deref()
+                    .context("active Skill candidate has no activation path")?;
+                let scope = generated_skill_scope(path, cwd)?;
+                wyj_store::skill_install::rollback_generated_skill(skill_name, &id, scope, cwd)?;
+            }
+            store.rollback_candidate(&id)?;
+            Ok(format!("Candidate {id} 已回滚，下一回合生效"))
         }
     }
 }
@@ -5268,7 +5563,7 @@ fn apply_clipboard_paste(
                     preview_label: format!("{width}×{height}"),
                 });
             }
-            // 图片会以持久的 `[Image]` 占位显示在输入框里，不再叠加瞬时提示。
+            // 图片会以持久的 `[Image #n]` 占位显示在输入框里，不再叠加瞬时提示。
             None
         }
         ClipboardPaste::Text(pasted) => {
@@ -5302,6 +5597,15 @@ fn apply_clipboard_paste(
 
 fn composer_has_content(state: &AppState, input: &InputBox) -> bool {
     !input.is_empty() || !state.pending_attachments.is_empty()
+}
+
+/// 删除输入框光标左侧的内容。附件作为位于真实文本之前的只读原子占位符：
+/// 当光标已在真实输入起点时，Backspace 删除最靠近光标的最后一个附件。
+fn backspace_composer(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
+    if input.cursor_row == 0 && input.cursor_col == 0 && attachments.pop().is_some() {
+        return;
+    }
+    input.backspace();
 }
 
 fn clear_composer(state: &mut AppState, input: &mut InputBox) {
@@ -5417,6 +5721,64 @@ mod clipboard_paste_tests {
     }
 
     #[test]
+    fn multiple_distinct_image_pastes_are_kept_in_order() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+
+        for (data, width, height) in [("first", 320, 180), ("second", 640, 480)] {
+            let hint = apply_clipboard_paste(
+                &mut state,
+                &mut input,
+                ClipboardPaste::Image {
+                    data: data.to_string(),
+                    width,
+                    height,
+                },
+            );
+            assert!(hint.is_none());
+        }
+
+        assert!(matches!(
+            state.pending_attachments.as_slice(),
+            [
+                Attachment::Image { data: first, .. },
+                Attachment::Image { data: second, .. },
+            ] if first == "first" && second == "second"
+        ));
+    }
+
+    #[test]
+    fn backspace_deletes_text_then_attachments_from_the_right() {
+        let mut input = InputBox::new();
+        input.insert_text("x");
+        let mut attachments = vec![
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "first".to_string(),
+                preview_label: "1×1".to_string(),
+            },
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "second".to_string(),
+                preview_label: "2×2".to_string(),
+            },
+        ];
+
+        backspace_composer(&mut input, &mut attachments);
+        assert!(input.is_empty());
+        assert_eq!(attachments.len(), 2);
+
+        backspace_composer(&mut input, &mut attachments);
+        assert!(matches!(
+            attachments.as_slice(),
+            [Attachment::Image { data, .. }] if data == "first"
+        ));
+
+        backspace_composer(&mut input, &mut attachments);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
     fn clearing_composer_removes_text_and_attachments_together() {
         let mut state = make_state();
         let mut input = InputBox::new();
@@ -5446,6 +5808,43 @@ mod clipboard_paste_tests {
         });
 
         assert!(composer_has_content(&state, &input));
+    }
+
+    #[tokio::test]
+    async fn multiple_images_are_sent_as_ordered_content_blocks() {
+        let attachments = vec![
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "first".to_string(),
+                preview_label: "1×1".to_string(),
+            },
+            Attachment::Image {
+                media_type: "image/jpeg".to_string(),
+                data: "second".to_string(),
+                preview_label: "2×2".to_string(),
+            },
+        ];
+
+        let blocks = build_user_blocks("compare".to_string(), attachments).await;
+
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                ContentBlock::Text { text },
+                ContentBlock::Image {
+                    media_type: first_type,
+                    data: first,
+                },
+                ContentBlock::Image {
+                    media_type: second_type,
+                    data: second,
+                },
+            ] if text == "compare"
+                && first_type == "image/png"
+                && first == "first"
+                && second_type == "image/jpeg"
+                && second == "second"
+        ));
     }
 }
 
@@ -5762,6 +6161,8 @@ pub struct AppState {
     pub profile_dialog: Option<ProfileDialog>,
     /// CLAUDE.md 记忆面板（/memory 命令触发时 Some）
     pub memory_dialog: Option<MemoryDialog>,
+    /// 证据化自进化治理中心（/evolve 命令触发时 Some）
+    pub evolution_dialog: Option<EvolutionDialog>,
     /// MCP server 管理面板（/mcp 命令触发时 Some）
     pub mcp_dialog: Option<McpDialog>,
     /// Skill 管理面板（/skills 命令触发时 Some）
@@ -5916,6 +6317,7 @@ impl AppState {
             settings_dialog: None,
             profile_dialog: None,
             memory_dialog: None,
+            evolution_dialog: None,
             mcp_dialog: None,
             skills_dialog: None,
             plugins_dialog: None,
@@ -7478,11 +7880,231 @@ impl AppState {
     }
 }
 
+const SAVE_AND_DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007s\x1b[?1007l";
+const RESTORE_ALTERNATE_SCROLL: &str = "\x1b[?1007r";
+
+/// Fullscreen + `DisableMouseCapture` 下的滚轮路由。
+///
+/// Ghostty 的 mode 1007 会把 alternate screen 中的滚轮转为普通方向键序列；
+/// 开启 Kitty 键盘协议的 release/repeat 事件后，可以用“真实按键有 release，
+/// 滚轮伪方向键只有 press”来分流，同时保留终端原生鼠标选择。
+/// 其它或经过多路复用器的终端无法证明会透传 release 事件，因此直接
+/// 关闭 mode 1007：可以保证滚轮不再污染输入历史，但不伪造“已可应用内滚动”。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalWheelRouting {
+    GhosttyKeyReleases,
+    SuppressSyntheticArrows,
+}
+
+impl TerminalWheelRouting {
+    fn from_environment(term_program: Option<&str>, in_multiplexer: bool) -> Self {
+        if term_program.is_some_and(|value| value.eq_ignore_ascii_case("ghostty"))
+            && !in_multiplexer
+        {
+            Self::GhosttyKeyReleases
+        } else {
+            Self::SuppressSyntheticArrows
+        }
+    }
+
+    fn detect() -> Self {
+        let term_program = std::env::var("TERM_PROGRAM").ok();
+        let in_multiplexer =
+            std::env::var_os("TMUX").is_some() || std::env::var_os("ZELLIJ").is_some();
+        Self::from_environment(term_program.as_deref(), in_multiplexer)
+    }
+
+    fn distinguishes_synthetic_arrows(self) -> bool {
+        self == Self::GhosttyKeyReleases
+    }
+}
+
 /// 进入全屏 TUI，但明确关闭鼠标捕获：鼠标由终端原生处理，用户可直接拖选文字，
 /// 不需要按住 Shift/Option，松开修饰键后选区也不会被应用鼠标事件立即冲掉。
-fn enter_terminal_screen<W: Write>(writer: &mut W) -> io::Result<()> {
-    execute!(writer, EnableBracketedPaste, DisableMouseCapture)?;
-    execute!(writer, EnterAlternateScreen)
+fn enter_terminal_screen<W: Write>(
+    writer: &mut W,
+    wheel_routing: TerminalWheelRouting,
+) -> io::Result<()> {
+    execute!(
+        writer,
+        EnableBracketedPaste,
+        DisableMouseCapture,
+        EnterAlternateScreen
+    )?;
+    match wheel_routing {
+        TerminalWheelRouting::GhosttyKeyReleases => execute!(
+            writer,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
+        ),
+        TerminalWheelRouting::SuppressSyntheticArrows => {
+            execute!(writer, Print(SAVE_AND_DISABLE_ALTERNATE_SCROLL))
+        }
+    }
+}
+
+fn leave_terminal_screen<W: Write>(
+    writer: &mut W,
+    wheel_routing: TerminalWheelRouting,
+) -> io::Result<()> {
+    match wheel_routing {
+        TerminalWheelRouting::GhosttyKeyReleases => execute!(writer, PopKeyboardEnhancementFlags)?,
+        TerminalWheelRouting::SuppressSyntheticArrows => {
+            execute!(writer, Print(RESTORE_ALTERNATE_SCROLL))?
+        }
+    }
+    execute!(
+        writer,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrowRoutingAction {
+    Pass,
+    Defer,
+    QueuePhysical { code: KeyCode, count: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArrowRoutingResult {
+    scroll_lines: i32,
+    action: ArrowRoutingAction,
+}
+
+/// 区分 Ghostty mode 1007 产生的滚轮伪方向键与真实方向键。
+///
+/// 真实按键在 `REPORT_EVENT_TYPES` 下会产生 release/repeat；Ghostty 的滚轮
+/// 转译路径则直接写入传统 `ESC[A` / `ESC[B`，crossterm 只能看到 press。
+/// 第一个无修饰方向键先暂存：收到 release/repeat 就回放为真实键盘事件；
+/// 收到第二个连续 press 就将整串路由到聊天内容滚动，绝不触碰输入历史。
+#[derive(Debug, Default)]
+struct GhosttyArrowRouter {
+    pending: Option<KeyCode>,
+    physical_down: Option<KeyCode>,
+    wheel_burst: Option<(KeyCode, Instant)>,
+}
+
+impl GhosttyArrowRouter {
+    const WHEEL_BURST_GAP: Duration = Duration::from_millis(40);
+
+    fn route(&mut self, key: KeyEvent) -> ArrowRoutingResult {
+        self.route_at(key, Instant::now())
+    }
+
+    fn route_at(&mut self, key: KeyEvent, now: Instant) -> ArrowRoutingResult {
+        if self
+            .wheel_burst
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) > Self::WHEEL_BURST_GAP)
+        {
+            self.wheel_burst = None;
+        }
+
+        let mut scroll_lines = 0;
+        if let Some(pending) = self.pending {
+            let continues_pending = key.code == pending
+                && key.modifiers.is_empty()
+                && matches!(
+                    key.kind,
+                    KeyEventKind::Press | KeyEventKind::Repeat | KeyEventKind::Release
+                );
+            if !continues_pending {
+                scroll_lines += arrow_scroll_delta(pending);
+                self.pending = None;
+                self.wheel_burst = None;
+            }
+        }
+
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) || !key.modifiers.is_empty() {
+            return ArrowRoutingResult {
+                scroll_lines,
+                action: ArrowRoutingAction::Pass,
+            };
+        }
+
+        match key.kind {
+            KeyEventKind::Release => {
+                if self.pending == Some(key.code) {
+                    self.pending = None;
+                    self.physical_down = None;
+                    self.wheel_burst = None;
+                    ArrowRoutingResult {
+                        scroll_lines,
+                        action: ArrowRoutingAction::QueuePhysical {
+                            code: key.code,
+                            count: 1,
+                        },
+                    }
+                } else {
+                    if self.physical_down == Some(key.code) {
+                        self.physical_down = None;
+                    }
+                    ArrowRoutingResult {
+                        scroll_lines,
+                        action: ArrowRoutingAction::Defer,
+                    }
+                }
+            }
+            KeyEventKind::Repeat => {
+                let count = if self.pending == Some(key.code) {
+                    self.pending = None;
+                    2
+                } else {
+                    1
+                };
+                self.physical_down = Some(key.code);
+                self.wheel_burst = None;
+                ArrowRoutingResult {
+                    scroll_lines,
+                    action: ArrowRoutingAction::QueuePhysical {
+                        code: key.code,
+                        count,
+                    },
+                }
+            }
+            KeyEventKind::Press => {
+                if self.physical_down == Some(key.code) {
+                    return ArrowRoutingResult {
+                        scroll_lines,
+                        action: ArrowRoutingAction::QueuePhysical {
+                            code: key.code,
+                            count: 1,
+                        },
+                    };
+                }
+
+                if self.pending == Some(key.code) {
+                    self.pending = None;
+                    self.wheel_burst = Some((key.code, now));
+                    scroll_lines += arrow_scroll_delta(key.code) * 2;
+                } else if self.wheel_burst.is_some_and(|(code, at)| {
+                    code == key.code && now.saturating_duration_since(at) <= Self::WHEEL_BURST_GAP
+                }) {
+                    self.wheel_burst = Some((key.code, now));
+                    scroll_lines += arrow_scroll_delta(key.code);
+                } else {
+                    self.pending = Some(key.code);
+                    self.wheel_burst = None;
+                }
+                ArrowRoutingResult {
+                    scroll_lines,
+                    action: ArrowRoutingAction::Defer,
+                }
+            }
+        }
+    }
+}
+
+const fn arrow_scroll_delta(code: KeyCode) -> i32 {
+    match code {
+        KeyCode::Up => -1,
+        KeyCode::Down => 1,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -7498,7 +8120,7 @@ mod terminal_screen_tests {
     #[test]
     fn startup_disables_mouse_capture_for_direct_terminal_selection() {
         let mut output = Vec::new();
-        enter_terminal_screen(&mut output).unwrap();
+        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
 
         for disabled_mode in [
             b"\x1b[?1000l".as_slice(),
@@ -7522,6 +8144,153 @@ mod terminal_screen_tests {
                 "启动序列不得重新开启鼠标捕获: {output:?}"
             );
         }
+        assert!(
+            contains_bytes(&output, b"\x1b[>3u"),
+            "Ghostty 路径必须请求 press/repeat/release 键盘事件: {output:?}"
+        );
+        assert!(
+            !contains_bytes(&output, b"\x1b[?1007l"),
+            "Ghostty 路径需保留 mode 1007，再由应用区分滚轮伪方向键: {output:?}"
+        );
+
+        output.clear();
+        leave_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
+        assert!(
+            contains_bytes(&output, b"\x1b[<1u"),
+            "退出时必须弹出启动时压入的 Kitty 键盘增强标志: {output:?}"
+        );
+        assert!(contains_bytes(&output, b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn unsupported_terminal_suppresses_alternate_scroll_arrow_translation() {
+        let mut output = Vec::new();
+        enter_terminal_screen(&mut output, TerminalWheelRouting::SuppressSyntheticArrows).unwrap();
+        assert!(contains_bytes(
+            &output,
+            SAVE_AND_DISABLE_ALTERNATE_SCROLL.as_bytes()
+        ));
+        assert!(!contains_bytes(&output, b"\x1b[>3u"));
+
+        output.clear();
+        leave_terminal_screen(&mut output, TerminalWheelRouting::SuppressSyntheticArrows).unwrap();
+        assert!(contains_bytes(&output, RESTORE_ALTERNATE_SCROLL.as_bytes()));
+        assert!(contains_bytes(&output, b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn ghostty_routing_requires_a_direct_terminal_connection() {
+        assert_eq!(
+            TerminalWheelRouting::from_environment(Some("ghostty"), false),
+            TerminalWheelRouting::GhosttyKeyReleases
+        );
+        assert_eq!(
+            TerminalWheelRouting::from_environment(Some("Ghostty"), true),
+            TerminalWheelRouting::SuppressSyntheticArrows
+        );
+        assert_eq!(
+            TerminalWheelRouting::from_environment(Some("Apple_Terminal"), false),
+            TerminalWheelRouting::SuppressSyntheticArrows
+        );
+    }
+}
+
+#[cfg(test)]
+mod ghostty_arrow_router_tests {
+    use super::*;
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+    }
+
+    #[test]
+    fn real_arrow_is_replayed_only_after_release() {
+        let mut router = GhosttyArrowRouter::default();
+        let now = Instant::now();
+        assert_eq!(
+            router.route_at(key(KeyCode::Up, KeyEventKind::Press), now),
+            ArrowRoutingResult {
+                scroll_lines: 0,
+                action: ArrowRoutingAction::Defer,
+            }
+        );
+        assert_eq!(
+            router.route_at(
+                key(KeyCode::Up, KeyEventKind::Release),
+                now + Duration::from_millis(80)
+            ),
+            ArrowRoutingResult {
+                scroll_lines: 0,
+                action: ArrowRoutingAction::QueuePhysical {
+                    code: KeyCode::Up,
+                    count: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn wheel_arrow_burst_scrolls_content_without_replaying_keyboard_input() {
+        let mut router = GhosttyArrowRouter::default();
+        let now = Instant::now();
+        let _ = router.route_at(key(KeyCode::Up, KeyEventKind::Press), now);
+        assert_eq!(
+            router.route_at(
+                key(KeyCode::Up, KeyEventKind::Press),
+                now + Duration::from_millis(2)
+            ),
+            ArrowRoutingResult {
+                scroll_lines: -2,
+                action: ArrowRoutingAction::Defer,
+            }
+        );
+        assert_eq!(
+            router.route_at(
+                key(KeyCode::Up, KeyEventKind::Press),
+                now + Duration::from_millis(4)
+            ),
+            ArrowRoutingResult {
+                scroll_lines: -1,
+                action: ArrowRoutingAction::Defer,
+            }
+        );
+    }
+
+    #[test]
+    fn physical_repeat_replays_initial_press_and_repeat() {
+        let mut router = GhosttyArrowRouter::default();
+        let now = Instant::now();
+        let _ = router.route_at(key(KeyCode::Down, KeyEventKind::Press), now);
+        assert_eq!(
+            router.route_at(
+                key(KeyCode::Down, KeyEventKind::Repeat),
+                now + Duration::from_millis(300)
+            ),
+            ArrowRoutingResult {
+                scroll_lines: 0,
+                action: ArrowRoutingAction::QueuePhysical {
+                    code: KeyCode::Down,
+                    count: 2,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn lone_wheel_arrow_is_flushed_to_content_before_the_next_key() {
+        let mut router = GhosttyArrowRouter::default();
+        let now = Instant::now();
+        let _ = router.route_at(key(KeyCode::Down, KeyEventKind::Press), now);
+        assert_eq!(
+            router.route_at(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                now + Duration::from_millis(10)
+            ),
+            ArrowRoutingResult {
+                scroll_lines: 1,
+                action: ArrowRoutingAction::Pass,
+            }
+        );
     }
 }
 
@@ -7561,11 +8330,13 @@ pub async fn run_tui(
     // 结构上不会撞上 Inline 撑满高度时那个 tmux/部分终端下的光标查询竞态
     // （历史教训见 crates/tui/CLAUDE.md）。聊天区因此天然贴着窗口顶部铺开、
     // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
-    // 历史消息永远留在 `AppState.messages`，用 PageUp/PageDown 等键盘入口翻看。
+    // 历史消息永远留在 `AppState.messages`，由 PageUp/PageDown 与终端滚轮分流
+    // 后的内容滚动入口翻看；滚轮绝不得进入 Composer 输入历史。
     // 鼠标捕获必须保持关闭，让终端原生拖选/复制无需 Shift 且选区能在松键后保留。
     // 回复链接继续通过 OSC 8 交给终端处理 Command/Ctrl+点击；事件分支只作为某些
     // 终端仍主动上报修饰键点击时的防御性兜底，不为此开启鼠标报告模式。
-    enter_terminal_screen(&mut stdout)?;
+    let wheel_routing = TerminalWheelRouting::detect();
+    enter_terminal_screen(&mut stdout, wheel_routing)?;
     let hyperlink_registry = HyperlinkRegistry::default();
     let backend = HyperlinkBackend::new(stdout, hyperlink_registry.clone());
     let mut terminal = Terminal::new(backend)?;
@@ -7591,18 +8362,14 @@ pub async fn run_tui(
         shared_agent_defs,
         hyperlink_registry,
         plugin_runtime,
+        wheel_routing.distinguishes_synthetic_arrows(),
     )
     .await;
 
     disable_raw_mode()?;
     // 全程都在 alternate screen，退出时统一还原；再次发送 DisableMouseCapture
     // 可防御外部组件或异常路径意外开启鼠标报告模式。
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
+    leave_terminal_screen(terminal.backend_mut(), wheel_routing)?;
     terminal.show_cursor()?;
 
     match result {
@@ -8642,6 +9409,7 @@ async fn tui_main(
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
     hyperlink_registry: HyperlinkRegistry,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    distinguish_ghostty_wheel: bool,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -8749,6 +9517,8 @@ async fn tui_main(
     let session = Arc::new(Mutex::new(init_sess));
 
     let mut last_spinner_advance = Instant::now();
+    let mut ghostty_arrow_router = GhosttyArrowRouter::default();
+    let mut classified_arrow_keys = VecDeque::<KeyEvent>::new();
 
     loop {
         // Ctrl+C 首次按下超过 3 秒未确认则重置
@@ -8916,8 +9686,33 @@ async fn tui_main(
             }
         }
 
-        if event::poll(std::time::Duration::from_millis(50))? {
-            let ev = event::read()?;
+        let classified_arrow_key = classified_arrow_keys.pop_front();
+        if classified_arrow_key.is_some() || event::poll(std::time::Duration::from_millis(50))? {
+            let arrow_was_classified = classified_arrow_key.is_some();
+            let ev = match classified_arrow_key {
+                Some(key) => Event::Key(key),
+                None => event::read()?,
+            };
+
+            if distinguish_ghostty_wheel && !arrow_was_classified {
+                if let Event::Key(key) = &ev {
+                    let routed = ghostty_arrow_router.route(*key);
+                    if routed.scroll_lines != 0 {
+                        state.scroll_focus_lines(routed.scroll_lines);
+                    }
+                    match routed.action {
+                        ArrowRoutingAction::Pass => {}
+                        ArrowRoutingAction::Defer => continue,
+                        ArrowRoutingAction::QueuePhysical { code, count } => {
+                            classified_arrow_keys.extend(
+                                (0..count).map(|_| KeyEvent::new(code, KeyModifiers::NONE)),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
             match ev {
                 Event::Paste(pasted) => {
                     // /mcp /skills /plugins 面板借用主输入框做配置输入时（见
@@ -8961,7 +9756,9 @@ async fn tui_main(
                     MouseEventKind::ScrollDown => state.scroll_focus_lines(3),
                     _ => {}
                 },
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
                     // 任意按键都清除粘贴提示（提示本就是瞬时的）
                     state.paste_hint = None;
 
@@ -9596,6 +10393,233 @@ async fn tui_main(
                             }
                             KeyCode::Esc => {
                                 state.settings_dialog = None;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.54 证据化自进化治理中心（/evolve 命令触发）
+                    if state.evolution_dialog.is_some() {
+                        let pending_confirmation = state
+                            .evolution_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.confirm.clone());
+                        if let Some(action) = pending_confirmation {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let store = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .clone();
+                                    let result = execute_evolution_action(
+                                        action,
+                                        store,
+                                        &cwd,
+                                        session_store.as_ref(),
+                                        &current_session_id,
+                                        &session,
+                                    )
+                                    .await;
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.confirm = None;
+                                        match result {
+                                            Ok(message) => {
+                                                dialog.reload();
+                                                dialog.error = Some(message);
+                                            }
+                                            Err(error) => dialog.error = Some(error.to_string()),
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.confirm = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
+                        let row = state
+                            .evolution_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.rows.get(dialog.selected))
+                            .cloned();
+                        match key.code {
+                            KeyCode::Left | KeyCode::BackTab => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.cycle_view(false);
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Tab => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.cycle_view(true);
+                                }
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.selected = dialog.selected.saturating_sub(1);
+                                    dialog.detail_scroll = 0;
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    if dialog.selected + 1 < dialog.rows.len() {
+                                        dialog.selected += 1;
+                                    }
+                                    dialog.detail_scroll = 0;
+                                }
+                            }
+                            KeyCode::PageUp => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.detail_scroll = dialog.detail_scroll.saturating_sub(5);
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.detail_scroll = dialog.detail_scroll.saturating_add(5);
+                                }
+                            }
+                            KeyCode::Char('a') => {
+                                let action = match row {
+                                    Some(EvolutionRow::Memory(memory))
+                                        if memory.status != MemoryStatus::Active =>
+                                    {
+                                        Some(EvolutionConfirmAction::ApproveMemory(memory.id))
+                                    }
+                                    Some(EvolutionRow::Candidate(candidate))
+                                        if candidate.status != CandidateStatus::Active =>
+                                    {
+                                        Some(EvolutionConfirmAction::ApproveCandidate(candidate.id))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(dialog) = &mut state.evolution_dialog {
+                                    dialog.confirm = action;
+                                }
+                            }
+                            KeyCode::Char('r') => {
+                                if let Some(EvolutionRow::Candidate(candidate)) = row {
+                                    if candidate.status != CandidateStatus::Active {
+                                        if let Some(dialog) = &mut state.evolution_dialog {
+                                            dialog.confirm =
+                                                Some(EvolutionConfirmAction::RejectCandidate(
+                                                    candidate.id,
+                                                ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('f') => {
+                                if let Some(EvolutionRow::Memory(memory)) = row {
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.confirm =
+                                            Some(EvolutionConfirmAction::ForgetMemory(memory.id));
+                                    }
+                                }
+                            }
+                            KeyCode::Char('b') => {
+                                if let Some(EvolutionRow::Candidate(candidate)) = row {
+                                    if candidate.status == CandidateStatus::Active {
+                                        if let Some(dialog) = &mut state.evolution_dialog {
+                                            dialog.confirm =
+                                                Some(EvolutionConfirmAction::RollbackCandidate(
+                                                    candidate.id,
+                                                ));
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('p') => {
+                                if let Some(EvolutionRow::Memory(memory)) = row {
+                                    let result = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .pin_memory(&memory.id, !memory.pinned);
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.reload();
+                                        dialog.error = result.err().map(|error| error.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('+') | KeyCode::Char('=') => {
+                                if let Some(EvolutionRow::Episode(episode)) = row {
+                                    let result = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .feedback_episode(
+                                            &episode.id,
+                                            true,
+                                            Some("accepted from /evolve".into()),
+                                            true,
+                                        );
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.reload();
+                                        dialog.error = result.err().map(|error| error.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('-') => {
+                                if let Some(EvolutionRow::Episode(episode)) = row {
+                                    let result = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .feedback_episode(
+                                            &episode.id,
+                                            false,
+                                            Some("rejected from /evolve".into()),
+                                            true,
+                                        );
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.reload();
+                                        dialog.error = result.err().map(|error| error.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('i') => {
+                                if let Some(EvolutionRow::Episode(episode)) = row {
+                                    let result = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .include_episode(&episode.id);
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        dialog.reload();
+                                        dialog.error = result.err().map(|error| error.to_string());
+                                    }
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                if let Some(EvolutionRow::Episode(episode)) = row {
+                                    let result = state
+                                        .evolution_dialog
+                                        .as_ref()
+                                        .expect("Evolution dialog exists")
+                                        .store
+                                        .create_skill_candidate_from_episode(&episode.id);
+                                    if let Some(dialog) = &mut state.evolution_dialog {
+                                        let message = match result {
+                                            Ok(id) => Some(format!("已生成 Skill 候选 {id}")),
+                                            Err(error) => Some(error.to_string()),
+                                        };
+                                        dialog.reload();
+                                        dialog.error = message;
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                state.evolution_dialog = None;
                             }
                             _ => {}
                         }
@@ -12331,6 +13355,18 @@ async fn tui_main(
                                             state.config.auto_memory_enabled,
                                         ));
                                     }
+                                    Ok(CommandResult::OpenEvolutionDialog) => {
+                                        let evolution =
+                                            shared_agent.read().unwrap().evolution_ref().cloned();
+                                        if let Some(store) = evolution {
+                                            state.evolution_dialog =
+                                                Some(EvolutionDialog::new(store));
+                                        } else {
+                                            state.messages.push(ChatMessage::assistant_err(
+                                                wyj_i18n::tr("evolve.unavailable"),
+                                            ));
+                                        }
+                                    }
                                     Ok(CommandResult::OpenMcpDialog) => {
                                         state.mcp_dialog =
                                             Some(McpDialog::new(&state.config, &state.cwd));
@@ -12485,7 +13521,7 @@ async fn tui_main(
                             // Alt+Backspace — 删词
                             input.delete_word_backward();
                         } else {
-                            input.backspace();
+                            backspace_composer(&mut input, &mut state.pending_attachments);
                         }
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
@@ -13751,6 +14787,66 @@ mod tool_event_ordering_tests {
         // call-2 的结果紧跟 call-2 自己的调用。
         assert_eq!(state.messages[1].content, "content-a");
         assert_eq!(state.messages[3].content, "content-b");
+    }
+}
+
+#[cfg(test)]
+mod evolution_dialog_tests {
+    use super::*;
+
+    fn test_store() -> (tempfile::TempDir, Arc<EvolutionStore>) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        let store = Arc::new(
+            EvolutionStore::new(dir.path(), &repo, wyj_config::EvolutionCfg::default()).unwrap(),
+        );
+        (dir, store)
+    }
+
+    #[test]
+    fn dialog_cycles_all_four_views_and_clears_confirmation() {
+        let (_dir, store) = test_store();
+        let mut session = wyj_core::Session::new();
+        session.push_user("cancelled goal");
+        let capture = store.begin_episode(
+            "dialog-session",
+            &session,
+            "cancelled goal",
+            "default",
+            "test-vendor",
+            "test-model",
+        );
+        store.cancel_episode(capture).unwrap();
+
+        let mut dialog = EvolutionDialog::new(store);
+        assert_eq!(dialog.view.label(), "Active");
+        dialog.confirm = Some(EvolutionConfirmAction::ForgetMemory("memory-1".into()));
+
+        dialog.cycle_view(true);
+        assert_eq!(dialog.view.label(), "Candidates");
+        assert!(dialog.confirm.is_none());
+        dialog.cycle_view(true);
+        assert_eq!(dialog.view.label(), "Episodes");
+        assert!(matches!(
+            dialog.rows.first(),
+            Some(EvolutionRow::Episode(_))
+        ));
+        dialog.cycle_view(true);
+        assert_eq!(dialog.view.label(), "Health");
+        assert!(dialog
+            .rows
+            .iter()
+            .any(|row| matches!(row, EvolutionRow::Health { label, .. } if label == "project")));
+        dialog.cycle_view(true);
+        assert_eq!(dialog.view.label(), "Active");
+        dialog.cycle_view(false);
+        assert_eq!(dialog.view.label(), "Health");
     }
 }
 

@@ -5,6 +5,7 @@ pub mod claude_md;
 pub mod code_index;
 pub mod compact;
 pub mod eval;
+pub mod evolution;
 pub mod frontmatter;
 pub mod history;
 pub mod hooks;
@@ -36,6 +37,12 @@ pub use compact::{
     compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_tokens,
 };
 pub use eval::{EvalCaseResult, EvalRunMetadata, EvalSummary, EvalTaskCategory};
+pub use evolution::{
+    CandidateKind, CandidatePayload, CandidateStatus, Episode, EpisodeCapture, EpisodeEvidence,
+    EpisodeOutcome, EvidenceKind, EvolutionCandidate, EvolutionFeedback, EvolutionHealth,
+    EvolutionMemory, EvolutionStatus, EvolutionStore, MemoryKind, MemoryScope, MemoryStatus,
+    MigrationPreview, RepositoryCitation, SkillEvalCase, SkillEvalReport, EVOLUTION_SCHEMA_VERSION,
+};
 pub use history::{new_session_id, now_iso, HistoryEntry, HistoryStore};
 pub use hooks::{
     load_effective_hooks, HookCommand, HookMatcherEntry, HookOutcome, HookRunner, HooksSettings,
