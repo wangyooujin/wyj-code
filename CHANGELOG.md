@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+- **Release CI 可恢复发布**：Release workflow 现在支持从默认分支手动选择并严格校验既有 annotated tag，checkout、tag dereference 与 `HEAD` 必须一致后才允许测试和打包；用于修复 CI 基础设施时无需移动已公开 tag，也不会把 tag 之后的产品代码混入旧版本资产。
+- **Linux sandbox 发布门禁**：GitHub Ubuntu Runner 显式安装 bubblewrap；若 Ubuntu 24.04 AppArmor 启用了 `kernel.apparmor_restrict_unprivileged_userns`，只在临时 Runner 内解除限制并执行 bwrap 预检，确保 Linux 环境隔离测试验证真实 sandbox，而不是因 runner 缺少依赖或 namespace 权限误失败。
+
 ## [1.5.5] - 2026-08-04
 
 - **证据化本地自进化 L0-L3**：每个用户目标落盘为独立 Episode，并按用户反馈、确定性测试、Review、工具结果和取消状态形成可审计 outcome；从成功/失败证据提炼带 scope、citation、TTL、冲突和当前分支验证的 Memory v2，按当前目标相关性和 8KB 预算选择性注入。Web/MCP/ToolSearch Episode 默认隔离，只有显式 include 后才允许形成仓库级候选。
