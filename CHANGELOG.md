@@ -2,16 +2,12 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
-## [Unreleased]
+## [1.5.6] - 2026-08-22
 
-- **Memory v3 单一普通记忆数据面**：新增 global/project/workspace claim 存储、中文 n-gram 与实体检索、来源/观察时间/TTL、supersede/forget、secret redaction、耐久提取队列、统一 `Memory` 工具、`wyj-code memory` CLI、非 Git `.wyj-code/project.toml` 项目身份和 `--project-root`。Agent 只注入少量相关 claim，让模型自主搜索、阅读、写入和探索；启用 v3 时 Evolution 仍保存 Episode 并积累需人工审批的 Rule/Skill 候选，但不再后台双写普通 Memory v2。
-- **macOS App 启动走一次性宿主审批**：定位 `open -a` 的 LaunchServices `-54` 为 Seatbelt 专用 `lsopen` 权限缺失；通用 Bash profile 继续不授予该外部副作用，避免任意沙箱命令无提示启动 App、打开 URL/文件。Bash 新增 `run_outside_sandbox=true` 显式越界请求，仅非 Plan 的 TUI/ACP 可逐次批准且不可持久化，plan、headless、schedule、hook、SubAgent 继续 fail-closed；模型侧 GUI 指引同步要求使用该受控路径，并对旧 `-54` 输出给出可执行诊断。
-- **TUI 图片占位符跟随粘贴位置**：图片/文件附件改为输入编辑序列中的结构化原子，`[Image #n]` / `[File: ...]` 会显示在实际粘贴光标处，之后输入的文字保留在占位符之后；Backspace/Delete 可在对应位置删除附件，内部标记不会进入历史或 Provider 正文。
-- **畸形 Markdown 表格恢复**：当模型把标题与紧随其后的表头错误连成同一行、但下一行仍是同列数分隔行时，TUI 会在解析前安全补回换行，使持仓快照等表格恢复为网格展示；合法 Markdown 与普通标题竖线保持原行为。
-- **Sandbox 联网根因修复**：`allow_all` 与域名白名单现在统一通过宿主侧回环代理解析远端域名，优先使用固定 IP 启动且证书校验的 DNS-over-HTTPS，并把系统 DNS 仅作为后备，解决网关 DNS 间歇 `SERVFAIL` 或返回 TCP 可连但 TLS 重置的错误地址时 Bash 仍表现为“沙箱不能联网”的问题；公网访问已在 macOS Seatbelt 内实测 HTTP 200，未授权域名仍 fail-closed。每次模型请求同时注入当前 sandbox 网络策略，压缩摘要与历史 `CLAUDE.md` 不再能把旧网络错误固化为当前能力；TUI `/sandbox` 也会正确显示 `allow_all`。
-- **状态栏降噪**：底部状态栏移除 `schema … sent/… saved` 文案，只保留本次进程的输入/输出 token 总量；schema 统计仍保留在底层会话与诊断数据中。
-- **Release CI 可恢复发布**：Release workflow 现在支持从默认分支手动选择并严格校验既有 annotated tag，checkout、tag dereference 与 `HEAD` 必须一致后才允许测试和打包；用于修复 CI 基础设施时无需移动已公开 tag，也不会把 tag 之后的产品代码混入旧版本资产。
-- **Linux sandbox 发布门禁**：GitHub Ubuntu Runner 显式安装 bubblewrap；若 Ubuntu 24.04 AppArmor 启用了 `kernel.apparmor_restrict_unprivileged_userns`，只在临时 Runner 内解除限制并执行 bwrap 预检，确保 Linux 环境隔离测试验证真实 sandbox，而不是因 runner 缺少依赖或 namespace 权限误失败。
+- **Memory v3 最终设计落地**：把 v3 收敛为 Global / Project 两层（删除共享 Workspace scope 与自动迁移旧数据），AI 自动管理项目记忆、Project 覆盖 Global 冲突、reference 不进入 Brief；Global 背景提取走 `PendingGlobalCandidate`，由模型用 `Memory` 工具 `list_pending_global_candidates / confirm_global_candidate / reject_global_candidate` 三步自然语言确认，reject 后的 `(scope,kind,title,content_fingerprint)` 写入 `rejected_history.json`，重复提议同一指纹会被立即拒绝。Evolution 收敛到 `GovernanceOnly`：`EvolutionStore::new` 不再 `create_dir_all("memories")`，普通 Memory 数据层只保留兼容桩，cfg 删除 `auto_activate_memories` / `generate_experiences` 字段，普通 Memory 不再被注入也不再自动生成。
+- **Task 类型 + Project Brief + "继续" 语义**：新增 `MemoryClaimKind::Task` + `TaskStatus { InProgress, Completed, Cancelled, Blocked }` + `TaskStep[]` + `blocked_reason`；同 title + InProgress 的新写入自动 supersede 旧 InProgress 任务。`MemoryV3Store::project_brief` 动态生成 Project Brief（Open Tasks 含 next step + blocked_reason、Latest Mutable State、Recent Important Events、Top Relevant Project/Global Claims，reference 类型不出现），不写盘避免与结构化记忆双写漂移。Agent 在用户输入 `继续 / 接着 / continue / resume / 再来 / go on` 时自动注入最近 InProgress Task 详情 + 全部 Open Tasks 概览；无开放任务走 `memory.continuation.no_open_tasks` i18n key。
+- **`/memory clear-all` 一键清空重建**：TUI `/memory` 面板新增 `ClearAll` 行 + 二级确认（Enter 进确认态、y 真正执行、Esc/n 取消），CLI `wyj-code memory clear-all [--yes]`（未带 `--yes` 直接 hard-bail）。`MemoryV3Store::clear_all` 把 `records/jobs/audit` 全部 `fs::rename` 到 `backups/<ts>/`、写 `manifest.json`、落 `reset_marker.json`，**保留 `rejected_history.json`**（用户曾拒绝的指纹不可遗忘），重建目录后 `active_records == 0`。Memory 工具收到 `action=clear_all` 立即 `ToolResult::err` 拒绝 AI 直调，与"AI 不允许静默触发清空"原则对齐。
+- **Evolution 普通 Memory 死代码清理**：与 v3 数据面收敛同步，删除 `EvolutionStore` 内不再可达的 9 个普通 Memory 治理 helpers（`memory_relevance` / `is_relevance_stopword` / `should_activate_memory` / `detect_memory_conflicts` / `refresh_memory_statuses` / `repository_identity` / `memory_status_rank` / `memory_injection_priority` / `dedupe_memories`）、2 个 candidate 写入函数（`upsert_skill_candidate_unlocked` / `upsert_rule_candidate_unlocked`）、`MemoryIndex` 结构与 `MEMORY_INDEX_FILE` / `CONTEXT_HEADER` 常量、`AnalysisItem.explicit_user_statement` / `user_quote` 死字段、`resolve_legacy` 兼容方法；`cargo clippy --workspace --all-targets` 零警告零错误，775 个测试全绿。
 
 ## [1.5.5] - 2026-08-04
 
@@ -21,7 +17,17 @@
 - **TUI 多图片编辑修复**：输入框内图片占位符按顺序显示为 `[Image #1]` / `[Image #2]`；支持连续粘贴多张不同图片，并可在真实文本起点用 Backspace 从右向左逐个删除图片/文件附件，占位符仍只用于渲染，不会混入发送给模型的正文。
 - **TUI 鼠标滚轮不再翻动输入历史**：根因是 Ghostty 在 alternate screen 且应用关闭 mouse capture 时，DEC mode 1007 会把滚轮转译为无修饰 `Up/Down`，随后被 Composer 的 `navigate_input_or_history` 误当真实键盘。Ghostty 直连路径现通过 Kitty 键盘 release/repeat 事件区分两者，滚轮只滚动内容区，真实 `↑/↓` 仍保留输入光标/历史语义；其它终端及 tmux/zellij 路径会成对保存、关闭、恢复 mode 1007，防止伪方向键污染输入。全程仍保持 `DisableMouseCapture`，不回退无需 Shift/Option 的终端原生拖选复制。
 - **本地 Bash 环境与联网修复**：sandbox 新增 `network.allow_all` 以及 `environment.inherit/allow/deny` 配置，解决宿主网络正常时 Bash 仍表现为 DNS 解析失败、以及自定义环境变量被 `env_clear()` 无差别清空的问题；默认严格边界不变，启用继承时仍默认隔离 wyj-code 自身 provider/search/probe key。
-- **computer-use 跨会话记忆污染修复**：当前请求显式注入真实工具清单并声明其高于历史记忆，`default/bypass` 仅影响审批而不移除 schema；自动记忆提取与解析同时拒绝保存“本轮/本会话缺少 Bash 或 computer-use”等瞬时运行状态。
+- **computer-use 跨会话记忆污染修复**：当前请求显式注入真实工具清单并声明其高于历史记忆，`default/bypass` 仅影响审批而不移除 schema；自动记忆提取与解析同时拒绝保存"本轮/本会话缺少 Bash 或 computer-use"等瞬时运行状态。
+
+### 1.5.5 发布后追溯补录（功能随 v1.5.5 同期 ship，但条目最初漏记在 CHANGELOG 中；本次 v1.5.6 文档整理时一并补全）
+
+- **macOS App 启动走一次性宿主审批**：定位 `open -a` 的 LaunchServices `-54` 为 Seatbelt 专用 `lsopen` 权限缺失；通用 Bash profile 继续不授予该外部副作用，避免任意沙箱命令无提示启动 App、打开 URL/文件。Bash 新增 `run_outside_sandbox=true` 显式越界请求，仅非 Plan 的 TUI/ACP 可逐次批准且不可持久化，plan、headless、schedule、hook、SubAgent 继续 fail-closed；模型侧 GUI 指引同步要求使用该受控路径，并对旧 `-54` 输出给出可执行诊断。
+- **TUI 图片占位符跟随粘贴位置**：图片/文件附件改为输入编辑序列中的结构化原子，`[Image #n]` / `[File: ...]` 会显示在实际粘贴光标处，之后输入的文字保留在占位符之后；Backspace/Delete 可在对应位置删除附件，内部标记不会进入历史或 Provider 正文。
+- **畸形 Markdown 表格恢复**：当模型把标题与紧随其后的表头错误连成同一行、但下一行仍是同列数分隔行时，TUI 会在解析前安全补回换行，使持仓快照等表格恢复为网格展示；合法 Markdown 与普通标题竖线保持原行为。
+- **Sandbox 联网根因修复**：`allow_all` 与域名白名单现在统一通过宿主侧回环代理解析远端域名，优先使用固定 IP 启动且证书校验的 DNS-over-HTTPS，并把系统 DNS 仅作为后备，解决网关 DNS 间歇 `SERVFAIL` 或返回 TCP 可连但 TLS 重置的错误地址时 Bash 仍表现为"沙箱不能联网"的问题；公网访问已在 macOS Seatbelt 内实测 HTTP 200，未授权域名仍 fail-closed。每次模型请求同时注入当前 sandbox 网络策略，压缩摘要与历史 `CLAUDE.md` 不再能把旧网络错误固化为当前能力；TUI `/sandbox` 也会正确显示 `allow_all`。
+- **状态栏降噪**：底部状态栏移除 `schema … sent/… saved` 文案，只保留本次进程的输入/输出 token 总量；schema 统计仍保留在底层会话与诊断数据中。
+- **Release CI 可恢复发布**：Release workflow 现在支持从默认分支手动选择并严格校验既有 annotated tag，checkout、tag dereference 与 `HEAD` 必须一致后才允许测试和打包；用于修复 CI 基础设施时无需移动已公开 tag，也不会把 tag 之后的产品代码混入旧版本资产。
+- **Linux sandbox 发布门禁**：GitHub Ubuntu Runner 显式安装 bubblewrap；若 Ubuntu 24.04 AppArmor 启用了 `kernel.apparmor_restrict_unprivileged_userns`，只在临时 Runner 内解除限制并执行 bwrap 预检，确保 Linux 环境隔离测试验证真实 sandbox，而不是因 runner 缺少依赖或 namespace 权限误失败。
 
 ## [1.5.4]
 
