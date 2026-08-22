@@ -1,7 +1,7 @@
 # wyj-code
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Release](https://img.shields.io/badge/release-v1.5.5-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.5)
+[![Release](https://img.shields.io/badge/release-v1.5.6-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
 [![Pages](https://img.shields.io/badge/Pages-在线主页-22c55e.svg)](https://wangyooujin.github.io/wyj-code/)
@@ -20,7 +20,7 @@ Qwen/百炼、豆包/火山以及其他协议兼容端点。
 [贡献指南](./CONTRIBUTING.md)
 
 > **版本状态**：最新公开版本是
-> [v1.5.5](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.5)。历史 tag 保持不可移动，
+> [v1.5.6](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6)。历史 tag 保持不可移动，
 > 一键安装脚本始终下载 GitHub 最新公开 Release。
 
 ## 项目介绍
@@ -41,6 +41,10 @@ wyj-code 希望把 AI coding 的核心能力放进一个可审计、可扩展、
 - **证据化自进化**：v1.5.5 可以按用户目标记录 Episode，生成带证据的 Memory、
   Rule 和 Skill 候选；Rule/Skill 必须人工批准，完整边界见
   [v1.5.5 计划](./doc/plan/v1.5.5-plan.md)。
+- **Memory v3 单一数据面**：v1.5.6 收敛为 Global / Project 两层作用域，
+  AI 自动管理项目记忆，Global 候选走 Pending + 自然语言确认；
+  新增 Task 类型 + 动态 Project Brief，裸"继续"自动恢复最近未完成任务；
+  `/memory clear-all` 一键清空重建，保留用户曾拒绝的指纹。
 
 国内模型在没有独立 live probe 证据时只标记为 `static_only` 或 protocol-compatible；
 协议兼容不等于每个模型、端点和工具组合都已经在线验证。可通过 `wyj-code model doctor`
