@@ -916,10 +916,18 @@ impl SettingsDialog {
 // ── CLAUDE.md 记忆面板：/memory 命令触发 ──────────────────────────────────────
 
 /// 记忆面板里的一行：CLAUDE.md 系候选文件 / auto-memory 开关 / auto-memory 索引入口
+/// / Memory v3 clear-all 一键清空入口（按 y 二次确认执行）。
 pub enum MemoryRow {
     File(DiscoveredFile),
     AutoMemoryToggle,
-    AutoMemoryIndex { path: PathBuf, exists: bool },
+    AutoMemoryIndex {
+        path: PathBuf,
+        exists: bool,
+    },
+    ClearAll {
+        active_count: usize,
+        superseded_count: usize,
+    },
 }
 
 pub struct MemoryDialog {
@@ -927,10 +935,20 @@ pub struct MemoryDialog {
     pub selected: usize,
     pub auto_memory_enabled: bool,
     pub error: Option<String>,
+    /// 用户在 ClearAll 行上按 Enter 一次后置 Some，再按 y/Enter 才真正执行
+    /// store.clear_all()；按 Esc/n 关闭。这与最终设计 §11 "AI 不能静默触发" 一致：
+    /// 用户必须显式二次确认才执行破坏性批操作。
+    pub pending_clear_all: bool,
 }
 
 impl MemoryDialog {
-    fn new(cwd: &std::path::Path, memory_index_path: PathBuf, auto_memory_enabled: bool) -> Self {
+    fn new(
+        cwd: &std::path::Path,
+        memory_index_path: PathBuf,
+        auto_memory_enabled: bool,
+        active_count: usize,
+        superseded_count: usize,
+    ) -> Self {
         let mut rows: Vec<MemoryRow> = discover_files(cwd)
             .into_iter()
             .map(MemoryRow::File)
@@ -941,11 +959,54 @@ impl MemoryDialog {
             path: memory_index_path,
             exists,
         });
+        rows.push(MemoryRow::ClearAll {
+            active_count,
+            superseded_count,
+        });
         Self {
             rows,
             selected: 0,
             auto_memory_enabled,
             error: None,
+            pending_clear_all: false,
+        }
+    }
+}
+
+/// 真正执行 Memory v3 clear_all：把对话框关闭、把执行结果以系统消息形式
+/// 提示用户（成功则带上备份目录，失败则带上错误）。AI 不能触发此函数，
+/// 仅 TUI key handler 在用户完成二次确认后调用。
+fn execute_memory_clear_all(
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    state: &mut AppState,
+) {
+    state.memory_dialog = None;
+    // 先克隆 Arc 让 RwLock guard 尽早释放，避免 borrow 与消息推送路径打架。
+    let memory_arc: Option<Arc<wyj_core::MemoryV3Store>> = {
+        let agent_guard = shared_agent.read().unwrap();
+        agent_guard.memory_v3_ref().cloned()
+    };
+    let memory: Arc<wyj_core::MemoryV3Store> = match memory_arc {
+        Some(m) => m,
+        None => {
+            state.messages.push(ChatMessage::assistant_err(wyj_i18n::tr(
+                "memory.headless_unsupported",
+            )));
+            return;
+        }
+    };
+    match memory.clear_all() {
+        Ok(report) => {
+            let dir = report.backup_dir.display().to_string();
+            state.messages.push(ChatMessage::assistant(wyj_i18n::tr_fmt(
+                "memory.dialog.clear_all_done",
+                &[("dir", &dir)],
+            )));
+        }
+        Err(error) => {
+            state.messages.push(ChatMessage::assistant_err(format!(
+                "Memory v3 clear_all 失败: {error}"
+            )));
         }
     }
 }
@@ -1073,8 +1134,8 @@ impl EvolutionDialog {
                         value: status.episodes.to_string(),
                     },
                     EvolutionRow::Health {
-                        label: "active memories".into(),
-                        value: status.active_memories.to_string(),
+                        label: "pending candidates".into(),
+                        value: status.pending_candidates.to_string(),
                     },
                     EvolutionRow::Health {
                         label: "pending candidates".into(),
@@ -5557,11 +5618,17 @@ fn apply_clipboard_paste(
                 matches!(attachment, Attachment::Image { data: existing, .. } if existing == &data)
             });
             if !already_attached {
-                state.pending_attachments.push(Attachment::Image {
-                    media_type: "image/png".to_string(),
-                    data,
-                    preview_label: format!("{width}×{height}"),
-                });
+                input.reconcile_attachment_markers(state.pending_attachments.len());
+                let insertion_index = input.attachment_insertion_index();
+                state.pending_attachments.insert(
+                    insertion_index,
+                    Attachment::Image {
+                        media_type: "image/png".to_string(),
+                        data,
+                        preview_label: format!("{width}×{height}"),
+                    },
+                );
+                input.insert_attachment_marker();
             }
             // 图片会以持久的 `[Image #n]` 占位显示在输入框里，不再叠加瞬时提示。
             None
@@ -5572,7 +5639,12 @@ fn apply_clipboard_paste(
                     |attachment| matches!(attachment, Attachment::File { path: existing } if existing == &path),
                 );
                 if !already_attached {
-                    state.pending_attachments.push(Attachment::File { path });
+                    input.reconcile_attachment_markers(state.pending_attachments.len());
+                    let insertion_index = input.attachment_insertion_index();
+                    state
+                        .pending_attachments
+                        .insert(insertion_index, Attachment::File { path });
+                    input.insert_attachment_marker();
                 }
                 // 文件也由输入框内的持久占位符确认，不需要瞬时提示。
                 None
@@ -5599,13 +5671,35 @@ fn composer_has_content(state: &AppState, input: &InputBox) -> bool {
     !input.is_empty() || !state.pending_attachments.is_empty()
 }
 
-/// 删除输入框光标左侧的内容。附件作为位于真实文本之前的只读原子占位符：
-/// 当光标已在真实输入起点时，Backspace 删除最靠近光标的最后一个附件。
+/// 删除输入框光标左侧的内容。若紧邻光标的是附件原子，则同步删除对应结构化附件；
+/// 否则保持普通文本 Backspace 语义。
 fn backspace_composer(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
-    if input.cursor_row == 0 && input.cursor_col == 0 && attachments.pop().is_some() {
+    input.reconcile_attachment_markers(attachments.len());
+    if let Some(index) = input.attachment_marker_before_cursor() {
+        input.backspace();
+        attachments.remove(index);
         return;
     }
     input.backspace();
+}
+
+fn delete_composer_forward(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
+    input.reconcile_attachment_markers(attachments.len());
+    if let Some(index) = input.attachment_marker_at_cursor() {
+        input.delete_char_forward();
+        attachments.remove(index);
+        return;
+    }
+    input.delete_char_forward();
+}
+
+fn delete_word_backward_composer(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
+    input.reconcile_attachment_markers(attachments.len());
+    if input.attachment_marker_before_cursor().is_some() {
+        backspace_composer(input, attachments);
+    } else {
+        input.delete_word_backward();
+    }
 }
 
 fn clear_composer(state: &mut AppState, input: &mut InputBox) {
@@ -5748,6 +5842,40 @@ mod clipboard_paste_tests {
     }
 
     #[test]
+    fn image_pasted_before_existing_marker_is_inserted_before_it() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("右侧");
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "right".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+        input.move_to_start_of_line();
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "left".to_string(),
+                width: 640,
+                height: 480,
+            },
+        );
+
+        assert!(matches!(
+            state.pending_attachments.as_slice(),
+            [
+                Attachment::Image { data: left, .. },
+                Attachment::Image { data: right, .. },
+            ] if left == "left" && right == "right"
+        ));
+    }
+
+    #[test]
     fn backspace_deletes_text_then_attachments_from_the_right() {
         let mut input = InputBox::new();
         input.insert_text("x");
@@ -5776,6 +5904,73 @@ mod clipboard_paste_tests {
 
         backspace_composer(&mut input, &mut attachments);
         assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn inline_image_is_deleted_only_when_backspace_reaches_its_position() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("前");
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "encoded-png".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+        input.insert_text("后");
+
+        backspace_composer(&mut input, &mut state.pending_attachments);
+        assert_eq!(input.text(), "前");
+        assert_eq!(state.pending_attachments.len(), 1);
+
+        backspace_composer(&mut input, &mut state.pending_attachments);
+        assert_eq!(input.text(), "前");
+        assert!(state.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn delete_key_removes_an_inline_image_at_the_cursor() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("前");
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "encoded-png".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+        input.move_left();
+
+        delete_composer_forward(&mut input, &mut state.pending_attachments);
+
+        assert_eq!(input.text(), "前");
+        assert!(state.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn sending_filters_internal_attachment_markers_from_text() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("请看");
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "encoded-png".to_string(),
+                width: 320,
+                height: 180,
+            },
+        );
+        input.insert_text("这张图");
+
+        assert_eq!(input.take(), "请看这张图");
+        assert_eq!(state.pending_attachments.len(), 1);
     }
 
     #[test]
@@ -6606,7 +6801,7 @@ impl AppState {
             return false;
         }
         if self.history_idx.is_none() {
-            self.history_draft = Some(input.lines.join("\n"));
+            self.history_draft = Some(input.text());
         }
         let next = match self.history_idx {
             None => self.input_history.len() - 1,
@@ -8163,6 +8358,24 @@ mod terminal_screen_tests {
     }
 
     #[test]
+    fn external_editor_handoff_pops_and_restores_tui_keyboard_protocols() {
+        let mut output = Vec::new();
+        leave_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
+        let resume_at = output.len();
+        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
+
+        let suspended = &output[..resume_at];
+        assert!(contains_bytes(suspended, b"\x1b[<1u"));
+        assert!(contains_bytes(suspended, b"\x1b[?2004l"));
+        assert!(contains_bytes(suspended, b"\x1b[?1049l"));
+
+        let resumed = &output[resume_at..];
+        assert!(contains_bytes(resumed, b"\x1b[?2004h"));
+        assert!(contains_bytes(resumed, b"\x1b[?1049h"));
+        assert!(contains_bytes(resumed, b"\x1b[>3u"));
+    }
+
+    #[test]
     fn unsupported_terminal_suppresses_alternate_scroll_arrow_translation() {
         let mut output = Vec::new();
         enter_terminal_screen(&mut output, TerminalWheelRouting::SuppressSyntheticArrows).unwrap();
@@ -8362,7 +8575,7 @@ pub async fn run_tui(
         shared_agent_defs,
         hyperlink_registry,
         plugin_runtime,
-        wheel_routing.distinguishes_synthetic_arrows(),
+        wheel_routing,
     )
     .await;
 
@@ -8504,19 +8717,22 @@ fn wire_tool_callback(
         })
 }
 
-/// 挂起 TUI（离开 alternate screen + 关闭 raw mode），交给 $EDITOR（未设置回退 vi）
-/// 打开指定文件，编辑完成后恢复 TUI 并强制整屏重绘。文件父目录若不存在会先创建，
-/// 方便直接对着尚不存在的候选路径按 Enter 新建。
+/// 挂起 TUI，交给 $EDITOR（未设置回退 vi）打开指定文件，编辑完成后恢复 TUI
+/// 并强制整屏重绘。除了 raw mode / alternate screen，还必须成对撤销并恢复
+/// Kitty 键盘增强、bracketed paste 和滚轮路由；否则外部编辑器会收到 TUI 请求的
+/// press/repeat/release 编码，把一次普通按键解析成多个字符。文件父目录若不存在会
+/// 先创建，方便直接对着尚不存在的候选路径按 Enter 新建。
 async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     path: &std::path::Path,
+    wheel_routing: TerminalWheelRouting,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    leave_terminal_screen(terminal.backend_mut(), wheel_routing)?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let path_buf = path.to_path_buf();
@@ -8526,7 +8742,7 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     .await;
 
     enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    enter_terminal_screen(terminal.backend_mut(), wheel_routing)?;
     terminal.clear()?;
 
     match status {
@@ -8789,7 +9005,11 @@ fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
 
 fn format_tui_sandbox(config: &wyj_config::SandboxCfg) -> String {
     let status = wyj_sandbox::SandboxRunner::detect().status();
-    let network = if config.network.allowed_domains.is_empty() {
+    let network = if !config.enabled {
+        "host network (sandbox disabled)".to_string()
+    } else if config.network.allow_all {
+        "allow all".to_string()
+    } else if config.network.allowed_domains.is_empty() {
         "deny".to_string()
     } else {
         format!("allow {}", config.network.allowed_domains.join(", "))
@@ -8817,7 +9037,7 @@ fn format_tui_sandbox(config: &wyj_config::SandboxCfg) -> String {
             status.domain_network_isolation
         ),
         format!(
-            "unsandboxed fallback: TUI one-shot={} · headless/schedule/sub-agent=false",
+            "unsandboxed fallback: TUI one-shot={} · plan/headless/schedule/hook/sub-agent=false",
             config.enabled && config.allow_unsandboxed_commands
         ),
         format!("fail-if-unavailable: {}", config.fail_if_unavailable),
@@ -8830,6 +9050,21 @@ fn format_tui_sandbox(config: &wyj_config::SandboxCfg) -> String {
     );
     lines.push(status.detail);
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod sandbox_status_tests {
+    use super::*;
+
+    #[test]
+    fn tui_sandbox_status_reports_allow_all() {
+        let mut config = wyj_config::SandboxCfg::default();
+        config.network.allow_all = true;
+
+        let text = format_tui_sandbox(&config);
+        assert!(text.contains("network: allow all"));
+        assert!(!text.contains("network: deny"));
+    }
 }
 
 fn resolve_tui_checkpoint_id(
@@ -9409,7 +9644,7 @@ async fn tui_main(
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
     hyperlink_registry: HyperlinkRegistry,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
-    distinguish_ghostty_wheel: bool,
+    wheel_routing: TerminalWheelRouting,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -9694,7 +9929,7 @@ async fn tui_main(
                 None => event::read()?,
             };
 
-            if distinguish_ghostty_wheel && !arrow_was_classified {
+            if wheel_routing.distinguishes_synthetic_arrows() && !arrow_was_classified {
                 if let Event::Key(key) = &ev {
                     let routed = ghostty_arrow_router.route(*key);
                     if routed.scroll_lines != 0 {
@@ -10649,8 +10884,23 @@ async fn tui_main(
                                 enum MemoryRowAction {
                                     Open(PathBuf),
                                     Toggle,
+                                    ClearAll,
                                     None,
                                 }
+                                // 已处于二次确认态：Enter/Space 直接执行 clear_all。
+                                let pending = state
+                                    .memory_dialog
+                                    .as_ref()
+                                    .map(|d| d.pending_clear_all)
+                                    .unwrap_or(false);
+                                if pending {
+                                    if let Some(dialog) = &mut state.memory_dialog {
+                                        dialog.pending_clear_all = false;
+                                    }
+                                    execute_memory_clear_all(&shared_agent, &mut state);
+                                    continue;
+                                }
+
                                 let action = match state
                                     .memory_dialog
                                     .as_ref()
@@ -10663,11 +10913,14 @@ async fn tui_main(
                                         MemoryRowAction::Open(path.clone())
                                     }
                                     Some(MemoryRow::AutoMemoryToggle) => MemoryRowAction::Toggle,
+                                    Some(MemoryRow::ClearAll { .. }) => MemoryRowAction::ClearAll,
                                     _ => MemoryRowAction::None,
                                 };
                                 match action {
                                     MemoryRowAction::Open(path) => {
-                                        let result = open_path_in_editor(terminal, &path).await;
+                                        let result =
+                                            open_path_in_editor(terminal, &path, wheel_routing)
+                                                .await;
                                         if let Some(dialog) = &mut state.memory_dialog {
                                             match result {
                                                 Ok(()) => dialog.error = None,
@@ -10688,6 +10941,11 @@ async fn tui_main(
                                             .unwrap_or(true);
                                         state.config.auto_memory_enabled = new_value;
                                         let save_result = state.config.save();
+                                        if let Some(memory) =
+                                            shared_agent.read().unwrap().memory_v3_ref()
+                                        {
+                                            memory.set_enabled(new_value);
+                                        }
                                         if let Some(mem) = shared_agent.read().unwrap().memory_ref()
                                         {
                                             mem.set_enabled(new_value);
@@ -10697,10 +10955,56 @@ async fn tui_main(
                                             dialog.error = save_result.err().map(|e| e.to_string());
                                         }
                                     }
+                                    MemoryRowAction::ClearAll => {
+                                        // 进入二次确认态，等待用户再次按 y/Enter 才执行。
+                                        if let Some(dialog) = &mut state.memory_dialog {
+                                            dialog.pending_clear_all = true;
+                                            dialog.error = None;
+                                        }
+                                    }
                                     MemoryRowAction::None => {}
                                 }
                             }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                // 与 Enter 行为一致：进入二次确认态或执行。
+                                let pending = state
+                                    .memory_dialog
+                                    .as_ref()
+                                    .map(|d| d.pending_clear_all)
+                                    .unwrap_or(false);
+                                if pending {
+                                    if let Some(dialog) = &mut state.memory_dialog {
+                                        dialog.pending_clear_all = false;
+                                    }
+                                    execute_memory_clear_all(&shared_agent, &mut state);
+                                } else if let Some(dialog) = &mut state.memory_dialog {
+                                    if let Some(MemoryRow::ClearAll { .. }) =
+                                        dialog.rows.get(dialog.selected)
+                                    {
+                                        dialog.pending_clear_all = true;
+                                        dialog.error = None;
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                // 二次确认态下按 n 视为取消（与 Esc 等价）。
+                                if let Some(dialog) = &mut state.memory_dialog {
+                                    if dialog.pending_clear_all {
+                                        dialog.pending_clear_all = false;
+                                        dialog.error = None;
+                                    }
+                                }
+                            }
                             KeyCode::Esc => {
+                                // 二次确认态下 Esc 仅清 pending，不关闭面板；
+                                // 让用户能直接再选别的行。
+                                if let Some(dialog) = &mut state.memory_dialog {
+                                    if dialog.pending_clear_all {
+                                        dialog.pending_clear_all = false;
+                                        dialog.error = None;
+                                        continue;
+                                    }
+                                }
                                 state.memory_dialog = None;
                             }
                             _ => {}
@@ -13343,17 +13647,67 @@ async fn tui_main(
                                             Some(SettingsDialog::new(&state.config));
                                     }
                                     Ok(CommandResult::OpenMemoryDialog) => {
-                                        let pid = wyj_core::project_id(&state.cwd);
-                                        let index_path = wyj_config::config_dir()
-                                            .unwrap_or_default()
-                                            .join("memory")
-                                            .join(pid)
-                                            .join("MEMORY.md");
+                                        let agent_guard = shared_agent.read().unwrap();
+                                        let memory_ref = agent_guard.memory_v3_ref();
+                                        let index_path = memory_ref
+                                            .map(|memory| memory.project_index_path())
+                                            .unwrap_or_else(|| {
+                                                let pid = wyj_core::project_id(&state.cwd);
+                                                wyj_config::config_dir()
+                                                    .unwrap_or_default()
+                                                    .join("memory")
+                                                    .join(pid)
+                                                    .join("MEMORY.md")
+                                            });
+                                        let (active, superseded) = memory_ref
+                                            .map(|m| {
+                                                let s = m.status().unwrap_or_default();
+                                                (s.active_records, s.superseded_records)
+                                            })
+                                            .unwrap_or((0, 0));
+                                        drop(agent_guard);
                                         state.memory_dialog = Some(MemoryDialog::new(
                                             &state.cwd,
                                             index_path,
                                             state.config.auto_memory_enabled,
+                                            active,
+                                            superseded,
                                         ));
+                                    }
+                                    Ok(CommandResult::OpenMemoryClearAllConfirm { .. }) => {
+                                        // 直接打开面板并预跳到 ClearAll 行 + pending 二次确认。
+                                        let agent_guard = shared_agent.read().unwrap();
+                                        let memory_ref = agent_guard.memory_v3_ref();
+                                        let index_path = memory_ref
+                                            .map(|memory| memory.project_index_path())
+                                            .unwrap_or_else(|| {
+                                                let pid = wyj_core::project_id(&state.cwd);
+                                                wyj_config::config_dir()
+                                                    .unwrap_or_default()
+                                                    .join("memory")
+                                                    .join(pid)
+                                                    .join("MEMORY.md")
+                                            });
+                                        let (active, superseded) = memory_ref
+                                            .map(|m| {
+                                                let s = m.status().unwrap_or_default();
+                                                (s.active_records, s.superseded_records)
+                                            })
+                                            .unwrap_or((0, 0));
+                                        drop(agent_guard);
+                                        let mut dialog = MemoryDialog::new(
+                                            &state.cwd,
+                                            index_path,
+                                            state.config.auto_memory_enabled,
+                                            active,
+                                            superseded,
+                                        );
+                                        // 把光标移到 ClearAll 行（最后一行）。
+                                        if let Some(last) = dialog.rows.len().checked_sub(1) {
+                                            dialog.selected = last;
+                                        }
+                                        dialog.pending_clear_all = true;
+                                        state.memory_dialog = Some(dialog);
                                     }
                                     Ok(CommandResult::OpenEvolutionDialog) => {
                                         let evolution =
@@ -13519,14 +13873,17 @@ async fn tui_main(
                     } else if key.code == KeyCode::Backspace {
                         if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Backspace — 删词
-                            input.delete_word_backward();
+                            delete_word_backward_composer(
+                                &mut input,
+                                &mut state.pending_attachments,
+                            );
                         } else {
                             backspace_composer(&mut input, &mut state.pending_attachments);
                         }
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Delete {
-                        input.delete_char_forward();
+                        delete_composer_forward(&mut input, &mut state.pending_attachments);
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Home {
@@ -13590,7 +13947,10 @@ async fn tui_main(
                                     update_file_completions(&mut state, &input, &cwd);
                                 }
                                 'w' => {
-                                    input.delete_word_backward();
+                                    delete_word_backward_composer(
+                                        &mut input,
+                                        &mut state.pending_attachments,
+                                    );
                                     update_slash_completions(&mut state, &input, &cmd_registry);
                                     update_file_completions(&mut state, &input, &cwd);
                                 }

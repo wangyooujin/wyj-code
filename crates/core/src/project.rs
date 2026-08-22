@@ -49,7 +49,7 @@ mod tests {
         let sub = tmp.join("a").join("b");
         std::fs::create_dir_all(sub.join(".gitkeep").parent().unwrap()).unwrap();
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
-        assert_eq!(project_root(&sub), tmp);
+        assert_eq!(project_root(&sub), tmp.canonicalize().unwrap());
         // 子目录与仓库根属于同一项目
         assert!(same_project(&sub, &tmp));
         assert_eq!(project_key(&sub), project_key(&tmp));

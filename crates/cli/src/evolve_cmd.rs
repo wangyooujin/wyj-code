@@ -105,12 +105,10 @@ fn infer_install_scope(path: &Path, cwd: &Path) -> Result<InstallScope> {
 fn status_text(store: &EvolutionStore) -> Result<String> {
     let status = store.status()?;
     Ok(format!(
-        "Evolution project={}\nstore={}\nepisodes={} active_memories={} proposed_memories={} pending_candidates={} active_candidates={}\nsize={} bytes\nhealth: failures={} last_error={} last_success={}",
+        "Evolution project={}\nstore={}\nepisodes={} pending_candidates={} active_candidates={}\nsize={} bytes\nhealth: failures={} last_error={} last_success={}",
         status.project_id,
         status.directory.display(),
         status.episodes,
-        status.active_memories,
-        status.proposed_memories,
         status.pending_candidates,
         status.active_candidates,
         status.store_bytes,
@@ -414,8 +412,6 @@ pub async fn run(command: EvolveCommand, json: bool, cwd: &Path, cfg: &Config) -
             let report = serde_json::json!({
                 "enabled": cfg.evolution.enabled,
                 "use_experiences": cfg.evolution.use_experiences,
-                "generate_experiences": cfg.evolution.generate_experiences,
-                "auto_activate_memories": cfg.evolution.auto_activate_memories,
                 "auto_activate_rules": cfg.evolution.auto_activate_rules,
                 "auto_install_skills": cfg.evolution.auto_install_skills,
                 "allow_self_code_experiments": cfg.evolution.allow_self_code_experiments,

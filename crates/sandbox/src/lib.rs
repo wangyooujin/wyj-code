@@ -7,8 +7,9 @@ use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -264,11 +265,16 @@ impl SandboxRunner {
         policy: &SandboxPolicy,
     ) -> Result<Command, SandboxError> {
         validate_roots(policy)?;
-        let proxy_port = match &policy.network {
-            NetworkPolicy::AllowedDomains(domains) => Some(controlled_proxy(domains)?),
+        let proxy = match &policy.network {
+            NetworkPolicy::AllowedDomains(domains) => {
+                Some((network_proxy(ProxyAccess::scoped(domains)?)?, false))
+            }
+            NetworkPolicy::AllowAll if !effective_host_proxy_configured(&policy.environment) => {
+                Some((network_proxy(ProxyAccess::AllowAll)?, true))
+            }
             _ => None,
         };
-        let profile = seatbelt_profile(policy, proxy_port);
+        let profile = seatbelt_profile(policy, proxy.map(|(port, _)| port));
         let mut command = Command::new(executable);
         command
             .arg("-p")
@@ -278,8 +284,8 @@ impl SandboxRunner {
             .arg(shell_command)
             .current_dir(cwd);
         configure_environment(&mut command, &policy.environment);
-        if let Some(port) = proxy_port {
-            configure_proxy_environment(&mut command, port);
+        if let Some((port, allow_local_bypass)) = proxy {
+            configure_proxy_environment(&mut command, port, allow_local_bypass);
         }
         Ok(command)
     }
@@ -311,6 +317,13 @@ impl SandboxRunner {
             .arg("/proc")
             .arg("--dev")
             .arg("/dev");
+        let proxy = if matches!(policy.network, NetworkPolicy::AllowAll)
+            && !effective_host_proxy_configured(&policy.environment)
+        {
+            Some(network_proxy(ProxyAccess::AllowAll)?)
+        } else {
+            None
+        };
         if matches!(policy.network, NetworkPolicy::AllowAll) {
             command.arg("--share-net");
         }
@@ -336,6 +349,9 @@ impl SandboxRunner {
             .arg("-c")
             .arg(shell_command);
         configure_environment(&mut command, &policy.environment);
+        if let Some(port) = proxy {
+            configure_proxy_environment(&mut command, port, true);
+        }
         Ok(command)
     }
 }
@@ -392,6 +408,11 @@ fn direct_shell(shell_command: &str, cwd: &Path, environment: &EnvironmentPolicy
     let mut command = Command::new(if cfg!(windows) { "bash" } else { "/bin/bash" });
     command.arg("-c").arg(shell_command).current_dir(cwd);
     configure_environment(&mut command, environment);
+    if !effective_host_proxy_configured(environment) {
+        if let Ok(port) = network_proxy(ProxyAccess::AllowAll) {
+            configure_proxy_environment(&mut command, port, true);
+        }
+    }
     command
 }
 
@@ -482,12 +503,41 @@ fn seatbelt_profile(policy: &SandboxPolicy, proxy_port: Option<u16>) -> String {
     profile
 }
 
-fn configure_proxy_environment(command: &mut Command, port: u16) {
+fn effective_host_proxy_configured(policy: &EnvironmentPolicy) -> bool {
+    const PROXY_NAMES: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ];
+    let denied = |name: &str| policy.deny.iter().any(|denied| denied == name);
+    PROXY_NAMES.iter().copied().any(|name| {
+        !denied(name)
+            && (policy.inherit || policy.allow.iter().any(|allowed| allowed == name))
+            && std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn configure_proxy_environment(command: &mut Command, port: u16, allow_local_bypass: bool) {
     let proxy = format!("http://127.0.0.1:{port}");
-    for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
         command.env(name, &proxy);
     }
-    command.env("NO_PROXY", "").env("no_proxy", "");
+    let no_proxy = if allow_local_bypass {
+        "localhost,127.0.0.1,::1"
+    } else {
+        ""
+    };
+    command.env("NO_PROXY", no_proxy).env("no_proxy", no_proxy);
 }
 
 fn sandbox_temp_dir() -> PathBuf {
@@ -528,6 +578,42 @@ fn default_credential_paths() -> Vec<PathBuf> {
 struct NetworkRule {
     host: String,
     port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProxyAccess {
+    AllowAll,
+    Scoped(Vec<NetworkRule>),
+}
+
+impl ProxyAccess {
+    fn scoped(domains: &[String]) -> Result<Self, SandboxError> {
+        let mut rules = domains
+            .iter()
+            .map(|domain| NetworkRule::parse(domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        rules.sort_by(|a, b| a.host.cmp(&b.host).then(a.port.cmp(&b.port)));
+        rules.dedup();
+        if rules.is_empty() {
+            return Err(SandboxError::InvalidNetworkRule(
+                "allowed domain list is empty".to_string(),
+            ));
+        }
+        Ok(Self::Scoped(rules))
+    }
+
+    fn allows(&self, host: &str, port: u16) -> bool {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return matches!(self, Self::AllowAll) && public_ip(ip);
+        }
+        if !valid_domain(host) {
+            return false;
+        }
+        match self {
+            Self::AllowAll => true,
+            Self::Scoped(rules) => rules.iter().any(|rule| rule.allows(host, port)),
+        }
+    }
 }
 
 impl NetworkRule {
@@ -586,25 +672,13 @@ fn valid_domain(host: &str) -> bool {
         })
 }
 
-fn controlled_proxy(domains: &[String]) -> Result<u16, SandboxError> {
-    let mut rules = domains
-        .iter()
-        .map(|domain| NetworkRule::parse(domain))
-        .collect::<Result<Vec<_>, _>>()?;
-    rules.sort_by(|a, b| a.host.cmp(&b.host).then(a.port.cmp(&b.port)));
-    rules.dedup();
-    if rules.is_empty() {
-        return Err(SandboxError::InvalidNetworkRule(
-            "allowed domain list is empty".to_string(),
-        ));
-    }
-
-    static PROXIES: OnceLock<Mutex<HashMap<Vec<NetworkRule>, u16>>> = OnceLock::new();
+fn network_proxy(access: ProxyAccess) -> Result<u16, SandboxError> {
+    static PROXIES: OnceLock<Mutex<HashMap<ProxyAccess, u16>>> = OnceLock::new();
     let proxies = PROXIES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut proxies = proxies
         .lock()
-        .map_err(|_| SandboxError::Proxy("proxy registry lock poisoned".to_string()))?;
-    if let Some(port) = proxies.get(&rules) {
+        .map_err(|_| SandboxError::Proxy("network proxy registry lock poisoned".to_string()))?;
+    if let Some(port) = proxies.get(&access) {
         return Ok(*port);
     }
 
@@ -614,25 +688,25 @@ fn controlled_proxy(domains: &[String]) -> Result<u16, SandboxError> {
         .local_addr()
         .map_err(|error| SandboxError::Proxy(error.to_string()))?
         .port();
-    let thread_rules = rules.clone();
+    let thread_access = access.clone();
     std::thread::Builder::new()
         .name(format!("wyj-domain-proxy-{port}"))
         .spawn(move || {
             for stream in listener.incoming().flatten() {
-                let rules = thread_rules.clone();
+                let access = thread_access.clone();
                 let _ = std::thread::Builder::new()
                     .name("wyj-domain-proxy-conn".to_string())
                     .spawn(move || {
-                        let _ = handle_proxy_connection(stream, &rules);
+                        let _ = handle_proxy_connection(stream, &access);
                     });
             }
         })
         .map_err(|error| SandboxError::Proxy(error.to_string()))?;
-    proxies.insert(rules, port);
+    proxies.insert(access, port);
     Ok(port)
 }
 
-fn handle_proxy_connection(mut client: TcpStream, rules: &[NetworkRule]) -> std::io::Result<()> {
+fn handle_proxy_connection(mut client: TcpStream, access: &ProxyAccess) -> std::io::Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(15)))?;
     client.set_write_timeout(Some(Duration::from_secs(15)))?;
     let mut request = Vec::with_capacity(4096);
@@ -666,7 +740,7 @@ fn handle_proxy_connection(mut client: TcpStream, rules: &[NetworkRule]) -> std:
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_authority(target, 443)?;
-        if !rules.iter().any(|rule| rule.allows(&host, port)) {
+        if !access.allows(&host, port) {
             client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
             return Ok(());
         }
@@ -693,7 +767,7 @@ fn handle_proxy_connection(mut client: TcpStream, rules: &[NetworkRule]) -> std:
             })?
             .to_ascii_lowercase();
         let port = parsed.port_or_known_default().unwrap_or(80);
-        if !rules.iter().any(|rule| rule.allows(&host, port)) {
+        if !access.allows(&host, port) {
             client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
             return Ok(());
         }
@@ -731,30 +805,146 @@ fn parse_authority(authority: &str, default_port: u16) -> std::io::Result<(Strin
         ),
         _ => (authority, default_port),
     };
-    if !valid_domain(host) {
+    if !valid_domain(host) && host.parse::<IpAddr>().is_err() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "IP literals, localhost and invalid domains are not allowed",
+            "localhost and invalid proxy targets are not allowed",
         ));
     }
     Ok((host.to_ascii_lowercase(), port))
 }
 
 fn connect_public(host: &str, port: u16) -> std::io::Result<TcpStream> {
-    let addresses = (host, port).to_socket_addrs()?;
+    let mut addresses = Vec::new();
+    let mut resolution_error = None;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        addresses.push(std::net::SocketAddr::new(ip, port));
+    } else {
+        match resolve_public_doh(host) {
+            Ok(resolved) => addresses.extend(
+                resolved
+                    .into_iter()
+                    .filter(|ip| public_ip(*ip))
+                    .map(|ip| std::net::SocketAddr::new(ip, port)),
+            ),
+            Err(error) => resolution_error = Some(error),
+        }
+        match (host, port).to_socket_addrs() {
+            Ok(resolved) => {
+                for address in resolved.filter(|address| public_ip(address.ip())) {
+                    if !addresses.contains(&address) {
+                        addresses.push(address);
+                    }
+                }
+            }
+            Err(error) if resolution_error.is_none() => resolution_error = Some(error),
+            Err(_) => {}
+        }
+    }
     let mut last_error = None;
-    for address in addresses.filter(|address| public_ip(address.ip())) {
+    for address in addresses
+        .into_iter()
+        .filter(|address| public_ip(address.ip()))
+    {
         match TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
             Ok(stream) => return Ok(stream),
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| {
+    Err(last_error.or(resolution_error).unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "domain resolved only to private, local or reserved addresses",
         )
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct DohResponse {
+    #[serde(rename = "Status")]
+    status: u16,
+    #[serde(rename = "Answer", default)]
+    answers: Vec<DohAnswer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DohAnswer {
+    data: String,
+}
+
+type DnsCache = Mutex<HashMap<String, (Instant, Vec<IpAddr>)>>;
+
+fn resolve_public_doh(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    static CACHE: OnceLock<DnsCache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some((resolved_at, addresses)) = cache.get(host) {
+            if resolved_at.elapsed() < Duration::from_secs(60) {
+                return Ok(addresses.clone());
+            }
+        }
+    }
+
+    static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(8))
+                .resolve(
+                    "cloudflare-dns.com",
+                    "1.1.1.1:443".parse().expect("valid Cloudflare DoH address"),
+                )
+                .resolve(
+                    "dns.google",
+                    "8.8.8.8:443".parse().expect("valid Google DoH address"),
+                )
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| std::io::Error::other(error.clone()))?;
+
+    let endpoints = [
+        "https://cloudflare-dns.com/dns-query",
+        "https://dns.google/resolve",
+    ];
+    let mut last_error = None;
+    for endpoint in endpoints {
+        let result = client
+            .get(endpoint)
+            .query(&[("name", host), ("type", "A")])
+            .header("accept", "application/dns-json")
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::json::<DohResponse>);
+        match result {
+            Ok(response) if response.status == 0 => {
+                let addresses = response
+                    .answers
+                    .into_iter()
+                    .filter_map(|answer| answer.data.parse::<IpAddr>().ok())
+                    .collect::<Vec<_>>();
+                if !addresses.is_empty() {
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.insert(host.to_string(), (Instant::now(), addresses.clone()));
+                    }
+                    return Ok(addresses);
+                }
+                last_error = Some(format!("{endpoint} returned no IP addresses"));
+            }
+            Ok(response) => {
+                last_error = Some(format!(
+                    "{endpoint} returned DNS status {}",
+                    response.status
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(std::io::Error::other(last_error.unwrap_or_else(|| {
+        "DNS-over-HTTPS resolution failed".to_string()
+    })))
 }
 
 fn public_ip(ip: IpAddr) -> bool {
@@ -904,6 +1094,58 @@ mod tests {
         assert!(!exact.allows("api.example.com", 443));
         assert!(NetworkRule::parse("127.0.0.1:8080").is_err());
         assert!(NetworkRule::parse("localhost").is_err());
+    }
+
+    #[test]
+    fn general_macos_profile_does_not_auto_allow_launchservices_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::enforced_workspace(dir.path());
+        let profile = seatbelt_profile(&policy, None);
+        assert!(!profile.contains("(allow lsopen)"));
+    }
+
+    #[test]
+    fn unrestricted_proxy_accepts_only_public_targets() {
+        let access = ProxyAccess::AllowAll;
+        assert!(access.allows("github.com", 443));
+        assert!(access.allows("1.1.1.1", 443));
+        assert!(!access.allows("127.0.0.1", 443));
+        assert!(!access.allows("192.168.5.2", 443));
+
+        let scoped = ProxyAccess::scoped(&["github.com".to_string()]).unwrap();
+        assert!(scoped.allows("api.github.com", 443));
+        assert!(!scoped.allows("example.com", 443));
+        assert!(!scoped.allows("1.1.1.1", 443));
+    }
+
+    #[test]
+    fn proxy_environment_delegates_remote_dns_and_bypasses_loopback() {
+        let mut command = Command::new("true");
+        configure_proxy_environment(&mut command, 43123, true);
+        let env = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                value.map(|value| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:43123")
+        );
+        assert_eq!(
+            env.get("ALL_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:43123")
+        );
+        assert_eq!(
+            env.get("NO_PROXY").map(String::as_str),
+            Some("localhost,127.0.0.1,::1")
+        );
     }
 
     #[test]

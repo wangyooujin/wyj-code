@@ -126,6 +126,7 @@ help:
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the CLAUDE.md memory panel
+    - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
     - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
@@ -235,6 +236,9 @@ agents:
 memory:
   desc: "Open the CLAUDE.md memory panel"
   headless_unsupported: "[headless mode doesn't support the /memory panel — edit CLAUDE.md or the files under ~/.wyj-code/memory/ directly]"
+  continuation:
+    no_open_tasks: "No open tasks in this project. Please describe the new task you want to start."
+  clear_all_help: "/memory clear-all — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation. CLI: `wyj-code memory clear-all --yes`."
   dialog:
     title: " ◆ CLAUDE.md Memory "
     not_found: "(not created yet, press Enter to create)"
@@ -245,6 +249,10 @@ memory:
     auto_memory_index_empty: "(no content yet)"
     hint: "↑↓ select   Enter open/toggle   Esc close"
     editor_failed: "Failed to open editor: {err}"
+    clear_all_label: "[Clear Memory v3] currently {active} active, {superseded} superseded (press y to confirm, Esc to cancel)"
+    clear_all_hint: "This will move all Global / Project claims, jobs, audit to backups/<ts>/; rejected_history.json is preserved. Cannot be undone."
+    clear_all_confirm: "Press y/Enter again to confirm, Esc/n to cancel."
+    clear_all_done: "Memory v3 cleared, backed up to {dir}."
 
 mcp:
   desc: "Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)"

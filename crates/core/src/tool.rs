@@ -95,8 +95,9 @@ pub trait ToolContext: Send + Sync {
     async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
         false
     }
-    /// Sandbox 无法为本次命令建立边界时，请求一次性、不可持久化的直连审批。
-    /// 只有真实交互表面可以返回 true；headless/schedule/SubAgent 默认拒绝。
+    /// 命令无法在 Sandbox 内表达，或显式请求宿主 OS 集成时，请求一次性、
+    /// 不可持久化的越界审批。只有真实交互表面可以返回 true；
+    /// headless/schedule/Hook/SubAgent 默认拒绝。
     async fn confirm_unsandboxed_fallback(&self, _command: &str, _reason: &str) -> bool {
         false
     }

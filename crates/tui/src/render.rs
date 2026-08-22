@@ -13,7 +13,7 @@ use crate::app::{
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
     SCHEDULE_FIELD_REQUIRE_SANDBOX, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
-use crate::input::InputBox;
+use crate::input::{InputBox, ATTACHMENT_MARKER};
 use crate::markdown::render_markdown;
 use crate::theme::Theme;
 use ratatui::{
@@ -58,42 +58,83 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// 将待发送附件投影为输入框内的只读占位符。
+/// 将待发送附件的内部原子标记投影为输入框内的只读占位符。
 ///
-/// 占位符只参与渲染和光标定位，不写入真实 `InputBox`，因此发送给模型的文本不会
-/// 混入 `[Image #n]` / `[File: ...]`。
+/// InputBox 只保存不可见的单字符标记，发送正文时会过滤；这里按标记在编辑序列
+/// 中的真实位置展开图片/文件标签，所以占位符会跟随粘贴位置，而不是堆到首行行首。
 fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachment]) -> InputBox {
-    if attachments.is_empty() {
-        return input.clone();
-    }
-
-    let mut prefix = String::new();
+    let mut placeholders = Vec::with_capacity(attachments.len());
     let mut image_number = 0usize;
     for attachment in attachments {
         match attachment {
             Attachment::Image { .. } => {
                 image_number += 1;
-                prefix.push_str(&format!("[Image #{image_number}] "));
+                placeholders.push(format!("[Image #{image_number}]"));
             }
             Attachment::File { path } => {
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                prefix.push_str(&format!("[File: {name}] "));
+                placeholders.push(format!("[File: {name}]"));
             }
         }
     }
 
-    let prefix_chars = prefix.chars().count();
     let mut display = input.clone();
-    if display.lines.is_empty() {
-        display.lines.push(prefix);
-    } else {
-        display.lines[0].insert_str(0, &prefix);
+    let mut attachment_idx = 0usize;
+    for (row, source) in input.lines.iter().enumerate() {
+        let chars = source.chars().collect::<Vec<_>>();
+        let mut rendered = String::new();
+        let mut mapped_cursor = None;
+
+        for col in 0..=chars.len() {
+            if row == input.cursor_row && col == input.cursor_col {
+                mapped_cursor = Some(rendered.chars().count());
+            }
+            if col == chars.len() {
+                break;
+            }
+
+            let ch = chars[col];
+            if ch != ATTACHMENT_MARKER {
+                rendered.push(ch);
+                continue;
+            }
+
+            if let Some(placeholder) = placeholders.get(attachment_idx) {
+                if rendered
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| !ch.is_whitespace())
+                {
+                    rendered.push(' ');
+                }
+                rendered.push_str(placeholder);
+                let next = chars.get(col + 1).copied();
+                if next.is_none()
+                    || next == Some(ATTACHMENT_MARKER)
+                    || next.is_some_and(|ch| !ch.is_whitespace())
+                {
+                    rendered.push(' ');
+                }
+            }
+            attachment_idx += 1;
+        }
+
+        display.lines[row] = rendered;
+        if let Some(cursor_col) = mapped_cursor {
+            display.cursor_col = cursor_col;
+        }
     }
-    if display.cursor_row == 0 {
-        display.cursor_col += prefix_chars;
+
+    // 兼容升级前已存在但没有编辑器标记的瞬时附件状态；新粘贴路径不会进入这里。
+    if attachment_idx < placeholders.len() {
+        let prefix = format!("{} ", placeholders[attachment_idx..].join(" "));
+        display.lines[0].insert_str(0, &prefix);
+        if display.cursor_row == 0 {
+            display.cursor_col += prefix.chars().count();
+        }
     }
     display
 }
@@ -103,9 +144,10 @@ mod attachment_input_tests {
     use super::*;
 
     #[test]
-    fn image_is_rendered_as_inline_placeholder_without_mutating_real_input() {
+    fn image_placeholder_is_rendered_at_the_paste_position() {
         let mut input = InputBox::new();
         input.insert_text("describe this");
+        input.insert_attachment_marker();
         let attachments = vec![Attachment::Image {
             media_type: "image/png".to_string(),
             data: "encoded".to_string(),
@@ -114,17 +156,63 @@ mod attachment_input_tests {
 
         let display = input_with_attachment_placeholders(&input, &attachments);
 
-        assert_eq!(display.display_lines(), &["[Image #1] describe this"]);
+        assert_eq!(display.display_lines(), &["describe this [Image #1] "]);
         assert_eq!(
             display.cursor_col,
-            "[Image #1] describe this".chars().count()
+            "describe this [Image #1] ".chars().count()
         );
-        assert_eq!(input.display_lines(), &["describe this"]);
+        assert_eq!(input.text(), "describe this");
+    }
+
+    #[test]
+    fn text_typed_after_an_image_stays_after_its_placeholder() {
+        let mut input = InputBox::new();
+        input.insert_text("请看");
+        input.insert_attachment_marker();
+        input.insert_text("这张图");
+        let attachments = vec![Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded".to_string(),
+            preview_label: "320×180".to_string(),
+        }];
+
+        let display = input_with_attachment_placeholders(&input, &attachments);
+
+        assert_eq!(display.display_lines(), &["请看 [Image #1] 这张图"]);
+        assert_eq!(display.cursor_col, "请看 [Image #1] 这张图".chars().count());
+        assert_eq!(input.text(), "请看这张图");
+    }
+
+    #[test]
+    fn images_pasted_at_different_cursor_positions_render_in_visual_order() {
+        let mut input = InputBox::new();
+        input.insert_text("右侧");
+        input.insert_attachment_marker();
+        input.move_to_start_of_line();
+        input.insert_attachment_marker();
+        let attachments = vec![
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "left".to_string(),
+                preview_label: "1×1".to_string(),
+            },
+            Attachment::Image {
+                media_type: "image/png".to_string(),
+                data: "right".to_string(),
+                preview_label: "2×2".to_string(),
+            },
+        ];
+
+        let display = input_with_attachment_placeholders(&input, &attachments);
+
+        assert_eq!(display.display_lines(), &["[Image #1] 右侧 [Image #2] "]);
     }
 
     #[test]
     fn multiple_images_have_compact_individual_placeholders() {
-        let input = InputBox::new();
+        let mut input = InputBox::new();
+        input.insert_attachment_marker();
+        input.insert_attachment_marker();
         let attachments = vec![
             Attachment::Image {
                 media_type: "image/png".to_string(),
@@ -146,7 +234,10 @@ mod attachment_input_tests {
 
     #[test]
     fn image_numbers_ignore_file_attachments() {
-        let input = InputBox::new();
+        let mut input = InputBox::new();
+        input.insert_attachment_marker();
+        input.insert_attachment_marker();
+        input.insert_attachment_marker();
         let attachments = vec![
             Attachment::Image {
                 media_type: "image/png".to_string(),
@@ -283,11 +374,23 @@ fn push_capped_preview_lines(
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     let area = f.area();
     let inner_width = area.width.saturating_sub(2) as usize; // -2 for borders
-    let display_input = if state.input_owner.is_none() {
-        input_with_attachment_placeholders(input, &state.pending_attachments)
+    let display_attachments = if state.input_owner.is_none() {
+        state.pending_attachments.as_slice()
     } else {
-        input.clone()
+        &[]
     };
+    let display_input = input_with_attachment_placeholders(input, display_attachments);
+    let paste_hint_position = state.paste_hint.as_ref().map(|hint| {
+        let mut hint_input = input.clone();
+        hint_input.cursor_row = hint
+            .cursor_row
+            .min(hint_input.lines.len().saturating_sub(1));
+        hint_input.cursor_col = hint
+            .cursor_col
+            .min(hint_input.lines[hint_input.cursor_row].chars().count());
+        let projected = input_with_attachment_placeholders(&hint_input, display_attachments);
+        (projected.cursor_row, projected.cursor_col)
+    });
     let input_height = (display_input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
 
     // 补全列表高度（@ 文件选取器优先于 slash 补全）
@@ -349,7 +452,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     } else if !state.slash_completions.is_empty() {
         draw_slash_completions(f, state, chunks[2]);
     }
-    draw_input(f, state, &display_input, chunks[3]);
+    draw_input(f, state, &display_input, chunks[3], paste_hint_position);
     draw_status(f, state, chunks[4]);
 
     // 会话选择器叠加在最顶层
@@ -1911,7 +2014,13 @@ fn thinking_status_suffix(state: &AppState) -> &'static str {
     }
 }
 
-fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
+fn draw_input(
+    f: &mut Frame,
+    state: &AppState,
+    input: &InputBox,
+    area: Rect,
+    paste_hint_position: Option<(usize, usize)>,
+) {
     // 主输入框被 /mcp /skills /plugins 面板借用做配置输入时（见 `InputOwner`），
     // 整个函数改画 dialog 自己的 live_input 草稿，边框/标题变色 + 嵌入提示文字，
     // 提交/取消后 `state.input_owner` 归 None，下一帧自动恢复聊天输入框外观。
@@ -2050,8 +2159,10 @@ fn draw_input(f: &mut Frame, state: &AppState, input: &InputBox, area: Rect) {
     // 多行文字粘贴的瞬时提示。图片/文件使用输入框内持久占位符，不再叠加提示。
     if let Some(hint) = &state.paste_hint {
         if hint.expires_at > Instant::now() {
+            let (source_row, source_col) =
+                paste_hint_position.unwrap_or((hint.cursor_row, hint.cursor_col));
             let (hint_row, hint_col) =
-                input.visual_pos_for(hint.cursor_row, hint.cursor_col, inner.width as usize);
+                input.visual_pos_for(source_row, source_col, inner.width as usize);
             if hint_row < inner.height as usize {
                 let max_w = inner.width.saturating_sub(hint_col as u16) as usize;
                 let text = if max_w == 0 {
@@ -2236,19 +2347,11 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
 // ─── 状态栏 ──────────────────────────────────────────────────────────────────
 
 fn interaction_usage_text(state: &AppState) -> String {
-    let mut text = format!(
+    format!(
         "total ↑{} ↓{}",
         fmt_tokens(state.total_input_tokens),
         fmt_tokens(state.total_output_tokens)
-    );
-    if state.tool_schema_tokens_saved > 0 {
-        text.push_str(&format!(
-            " · schema {} sent/{} saved",
-            fmt_tokens(state.tool_schema_tokens),
-            fmt_tokens(state.tool_schema_tokens_saved)
-        ));
-    }
-    text
+    )
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
@@ -2989,6 +3092,16 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
                 };
                 format!("{marker}{label:<label_width$}{value}")
             }
+            MemoryRow::ClearAll {
+                active_count,
+                superseded_count,
+            } => wyj_i18n::tr_fmt(
+                "memory.dialog.clear_all_label",
+                &[
+                    ("active", &active_count.to_string()),
+                    ("superseded", &superseded_count.to_string()),
+                ],
+            ),
         };
         let text = truncate_line(&text, w);
 
@@ -3001,7 +3114,16 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
     }
 
     lines.push(Line::from(Span::styled("─".repeat(w), Theme::border())));
-    if let Some(err) = &dialog.error {
+    if dialog.pending_clear_all {
+        lines.push(Line::from(Span::styled(
+            truncate_line(&wyj_i18n::tr("memory.dialog.clear_all_hint"), w),
+            Theme::warning(),
+        )));
+        lines.push(Line::from(Span::styled(
+            truncate_line(&wyj_i18n::tr("memory.dialog.clear_all_confirm"), w),
+            Theme::warning(),
+        )));
+    } else if let Some(err) = &dialog.error {
         lines.push(Line::from(Span::styled(
             truncate_line(err, w),
             Theme::warning(),
@@ -5463,6 +5585,8 @@ mod tool_result_fold_tests {
         let mut state = make_state();
         state.total_input_tokens = 12_345;
         state.total_output_tokens = 678;
+        state.tool_schema_tokens = 1_100_000;
+        state.tool_schema_tokens_saved = 235_761;
         state.last_turn_elapsed_secs = Some(12.0);
         state.last_turn_input_tokens = 1_000;
         state.last_turn_output_tokens = 200;

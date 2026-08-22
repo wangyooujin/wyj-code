@@ -8,6 +8,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use std::borrow::Cow;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── 字符宽度 ──────────────────────────────────────────────────────────────────
@@ -681,12 +682,95 @@ impl Ctx {
 
 // ── 公开入口 ──────────────────────────────────────────────────────────────────
 
+fn table_delimiter_columns(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let cells = trimmed
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if cells.len() < 2 {
+        return None;
+    }
+    cells
+        .iter()
+        .all(|cell| {
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.chars().all(|ch| ch == '-')
+        })
+        .then_some(cells.len())
+}
+
+fn table_header_columns(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    (trimmed.starts_with('|') && trimmed.contains('|')).then(|| {
+        trimmed
+            .trim_start_matches('|')
+            .trim_end_matches('|')
+            .split('|')
+            .count()
+    })
+}
+
+/// 模型偶尔会把 ATX 标题和紧随其后的表头连成同一逻辑行，例如
+/// "### 4. 仓位规划| 标的 | 仓位 |"。下一行虽是合法分隔行，CommonMark 仍会把整行
+/// 当标题，表格自然无法成立。这里只在下一行确实是同列数分隔行时补回丢失的换行，
+/// 避免把普通标题中的竖线误判成表格。
+fn normalize_malformed_heading_tables(text: &str) -> Cow<'_, str> {
+    let source = text.lines().collect::<Vec<_>>();
+    let mut normalized = Vec::with_capacity(source.len() + 1);
+    let mut changed = false;
+
+    for (index, line) in source.iter().copied().enumerate() {
+        let trimmed = line.trim_start();
+        let heading_marks = trimmed.chars().take_while(|ch| *ch == '#').count();
+        let is_heading = (1..=6).contains(&heading_marks)
+            && trimmed
+                .chars()
+                .nth(heading_marks)
+                .is_some_and(char::is_whitespace);
+        let next_columns = source
+            .get(index + 1)
+            .and_then(|next| table_delimiter_columns(next));
+
+        if is_heading {
+            if let (Some(pipe), Some(delimiter_columns)) = (line.find('|'), next_columns) {
+                let heading = line[..pipe].trim_end();
+                let header = &line[pipe..];
+                if !heading.trim_end_matches('#').trim().is_empty()
+                    && table_header_columns(header) == Some(delimiter_columns)
+                {
+                    normalized.push(heading.to_string());
+                    normalized.push(header.to_string());
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        normalized.push(line.to_string());
+    }
+
+    if !changed {
+        return Cow::Borrowed(text);
+    }
+    let mut output = normalized.join("\n");
+    if text.ends_with('\n') {
+        output.push('\n');
+    }
+    Cow::Owned(output)
+}
+
 /// 将 Markdown 字符串渲染为 ratatui `Line<'static>` 列表。
 ///
 /// `max_width`：可用字符宽度（用于内容换行和表格列宽计算）。
 pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: usize) {
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    let parser = Parser::new_ext(text, opts);
+    let normalized = normalize_malformed_heading_tables(text);
+    let parser = Parser::new_ext(normalized.as_ref(), opts);
     let mut c = Ctx::new(max_width);
 
     for event in parser {
@@ -975,6 +1059,41 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn heading_joined_to_table_header_is_recovered() {
+        let text = "## 📌 当前持仓快照| 标的 | 数量 | 均价 | 现价 | 浮盈 | 风险敞口 | 触发红线 |\n|---|---|---|---|---|---|---|\n| 海康威视 | 200 | 36.635 | 36.37 | **-¥53** | ¥541 (0.78%) | 亏损方向加仓 ✗ |";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 160);
+        let rendered = rendered_text(&lines);
+
+        assert!(rendered[0].contains("📌 当前持仓快照"));
+        assert!(!rendered[0].contains("| 标的"));
+        assert!(rendered[1].starts_with('┌'));
+        assert!(rendered[2].starts_with('│') && rendered[2].contains("标的"));
+        assert!(rendered[3].starts_with('├') && rendered[3].contains('┼'));
+        assert!(rendered.iter().any(|line| line.contains("海康威视")));
+        assert!(
+            rendered.iter().all(|line| !line.contains("|---|")),
+            "分隔行不应作为原始 Markdown 文本显示"
+        );
+    }
+
+    #[test]
+    fn numbered_section_heading_joined_to_table_header_is_recovered() {
+        let text = "### 4. 本周总体仓位规划| 标的 | 建议仓位 | 理由 |\n|---|---|---|\n| 华天科技 | 20-25% | 主线，进攻仓位 |\n| **现金** | **35-60%** | 当前0仓，留弹药 |";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 120);
+        let rendered = rendered_text(&lines);
+
+        assert!(rendered[0].contains("4. 本周总体仓位规划"));
+        assert!(!rendered[0].contains("| 标的"));
+        assert!(rendered[1].starts_with('┌'));
+        assert!(rendered[2].starts_with('│') && rendered[2].contains("建议仓位"));
+        assert!(rendered.iter().any(|line| line.contains("华天科技")));
+        assert!(rendered.iter().any(|line| line.contains("35-60%")));
+        assert!(rendered.iter().all(|line| !line.contains("|---|")));
     }
 
     #[test]

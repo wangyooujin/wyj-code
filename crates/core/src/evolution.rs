@@ -27,13 +27,11 @@ use wyj_api::types::{ContentBlock, Message};
 use wyj_config::EvolutionCfg;
 
 pub const EVOLUTION_SCHEMA_VERSION: u32 = 2;
-const MEMORY_INDEX_FILE: &str = "memories/index.json";
 const CANDIDATE_INDEX_FILE: &str = "candidates/index.json";
 const FEEDBACK_INDEX_FILE: &str = "feedback/index.json";
 const HEALTH_FILE: &str = "health.json";
 const USAGE_FILE: &str = "usage.json";
 const AUDIT_FILE: &str = "audit.jsonl";
-const CONTEXT_HEADER: &str = "## Verified project experience\n\n<evolution-boundary>\nThese entries are local, evidence-backed recall. Current user instructions, attached tool schemas, permission policy, and freshly validated repository state remain authoritative. Conflicted or stale entries must not be used.\n</evolution-boundary>\n\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,7 +124,7 @@ pub struct EpisodeCapture {
     initial_worktree: BTreeMap<PathBuf, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryKind {
     UserPreference,
@@ -134,9 +132,11 @@ pub enum MemoryKind {
     Workflow,
     FailurePattern,
     Reference,
+    #[default]
+    Unspecified,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
     Proposed,
@@ -145,9 +145,11 @@ pub enum MemoryStatus {
     Stale,
     Rejected,
     Forgotten,
+    #[default]
+    Unspecified,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MemoryScope {
     pub level: String,
     pub value: String,
@@ -166,7 +168,10 @@ pub struct RepositoryCitation {
     pub display_line: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// v1.5.5 收敛：普通 Memory 数据层已迁出 `MemoryV3Store`。Evolution 里
+/// `EvolutionMemory` 仅保留为兼容 stub：构造该类型用于类型签名兼容，
+/// 但所有字段都为空壳——不应再被实例化或序列化进入活跃索引。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvolutionMemory {
     pub schema_version: u32,
     pub id: String,
@@ -190,6 +195,14 @@ pub struct EvolutionMemory {
     pub use_count: u64,
     pub contradicts: Vec<String>,
     pub supersedes: Vec<String>,
+}
+
+/// 供 `list_memories` 兼容桩使用的最小化返回类型。v1.5.5 后 Evolution 不再
+/// 持有普通 Memory 索引；TUI/CLI 调用站点若读到 `Vec<EvolutionMemoryStub>`，
+/// 应当作空列表处理，让用户改用 `/memory` 面板（v3）做事实/状态管理。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EvolutionMemoryStub {
+    pub schema_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,7 +266,9 @@ pub struct EvolutionCandidate {
     pub title: String,
     pub summary: String,
     pub risk: String,
-    pub scope: MemoryScope,
+    /// `global` / `project:<project_key>`：与 v3 Memory 一致；不再分
+    /// level/value 两字段，因为已经收敛到两 scope。
+    pub scope: String,
     pub evidence_episode_ids: Vec<String>,
     pub evidence_session_ids: Vec<String>,
     pub payload: CandidatePayload,
@@ -270,22 +285,6 @@ pub struct EvolutionFeedback {
     pub reason: Option<String>,
     pub explicit: bool,
     pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MemoryIndex {
-    #[serde(default = "schema_version")]
-    schema_version: u32,
-    memories: Vec<EvolutionMemory>,
-}
-
-impl Default for MemoryIndex {
-    fn default() -> Self {
-        Self {
-            schema_version: EVOLUTION_SCHEMA_VERSION,
-            memories: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,8 +370,6 @@ pub struct EvolutionStatus {
     pub project_id: String,
     pub directory: PathBuf,
     pub episodes: usize,
-    pub active_memories: usize,
-    pub proposed_memories: usize,
     pub pending_candidates: usize,
     pub active_candidates: usize,
     pub store_bytes: u64,
@@ -403,18 +400,21 @@ struct AnalysisItem {
     summary: String,
     body: String,
     #[serde(default)]
-    explicit_user_statement: bool,
-    #[serde(default)]
-    user_quote: Option<String>,
-    #[serde(default)]
-    citation_paths: Vec<String>,
-    #[serde(default)]
     rule_suggestion: Option<String>,
     #[serde(default)]
     skill_description: Option<String>,
     #[serde(default)]
     skill_steps: Vec<String>,
 }
+
+/// v1.5.5 收敛：Evolution 不再生成普通 Memory，只剩治理（Rule/Skill
+/// candidate + Episode 健康度）。`MemoryAndGovernance` 保留为别名，
+/// 等价 `GovernanceOnly`，让旧代码/测试引用继续编译。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvolutionAnalysisMode {
+    GovernanceOnly,
+}
+
 
 fn schema_version() -> u32 {
     EVOLUTION_SCHEMA_VERSION
@@ -435,18 +435,14 @@ pub struct EvolutionStore {
 impl EvolutionStore {
     pub fn new(base_dir: &Path, cwd: &Path, cfg: EvolutionCfg) -> Result<Self> {
         let repository_root = project_root(cwd);
-        let legacy_cwd_dir = base_dir.join("memory").join(project_id(cwd));
-        let legacy_root_dir = base_dir.join("memory").join(project_id(&repository_root));
-        let legacy_dir = if legacy_cwd_dir.exists() {
-            legacy_cwd_dir
-        } else {
-            legacy_root_dir
-        };
+        // v1.5.5 收敛：Evolution 不再维护 legacy memory dir（普通 Memory 已
+        // 完全迁出 v3）。保留字段避免破坏外部 `EvolutionStore.directory()`
+        // 等 API；实际读取时永远为空。
+        let legacy_dir = base_dir.join("memory").join(project_id(&repository_root));
         let project_id = project_id(&repository_root);
         let dir = base_dir.join("evolution").join(&project_id);
         for child in [
             "episodes",
-            "memories",
             "candidates",
             "feedback",
             "experiments",
@@ -651,7 +647,25 @@ impl EvolutionStore {
     }
 
     pub fn schedule_analysis(&self, episode: Episode, provider: Arc<dyn Provider>) {
-        if !self.cfg.enabled || !self.cfg.generate_experiences {
+        // v1.5.5 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill
+        // 治理分析。该入口保留名称（外部 CLI/TUI 仍可能调用）并直接转发
+        // 到 GovernanceOnly 调度。
+        self.schedule_analysis_with_mode(episode, provider, EvolutionAnalysisMode::GovernanceOnly);
+    }
+
+    /// `schedule_analysis` 的同义别名，文档强调"只剩治理"。外部代码
+    /// （tests、文档示例）可以直接用更清晰的命名。
+    pub fn schedule_governance_analysis(&self, episode: Episode, provider: Arc<dyn Provider>) {
+        self.schedule_analysis_with_mode(episode, provider, EvolutionAnalysisMode::GovernanceOnly);
+    }
+
+    fn schedule_analysis_with_mode(
+        &self,
+        episode: Episode,
+        provider: Arc<dyn Provider>,
+        mode: EvolutionAnalysisMode,
+    ) {
+        if !self.cfg.enabled {
             return;
         }
         if episode.external_context
@@ -675,7 +689,10 @@ impl EvolutionStore {
             let delays = [30_u64, 120, 600];
             for attempt in 0..=delays.len() {
                 let started = Instant::now();
-                match store.analyze_episode(&episode, provider.clone()).await {
+                match store
+                    .analyze_episode(&episode, provider.clone(), mode)
+                    .await
+                {
                     Ok(tokens) => {
                         let _ = store.record_usage(tokens, started.elapsed().as_secs());
                         let _ = store.record_health_success();
@@ -699,10 +716,21 @@ impl EvolutionStore {
     }
 
     /// 在下一次正常 Agent 回合到来时，重新处理由显式反馈或手动纳入触发的旧
-    /// Episode。这样 CLI/TUI 管理操作无需自行持有 Provider，也不会在当前回合
-    /// 中途改变运行时上下文。
+    /// Episode。v1.5.5 后只剩 Rule/Skill 治理分析。
     pub fn schedule_pending_analysis(&self, provider: Arc<dyn Provider>) {
-        if !self.cfg.enabled || !self.cfg.generate_experiences {
+        self.schedule_pending_analysis_with_mode(provider, EvolutionAnalysisMode::GovernanceOnly);
+    }
+
+    pub fn schedule_pending_governance_analysis(&self, provider: Arc<dyn Provider>) {
+        self.schedule_pending_analysis_with_mode(provider, EvolutionAnalysisMode::GovernanceOnly);
+    }
+
+    fn schedule_pending_analysis_with_mode(
+        &self,
+        provider: Arc<dyn Provider>,
+        mode: EvolutionAnalysisMode,
+    ) {
+        if !self.cfg.enabled {
             return;
         }
         let pending = self.take_pending_analysis();
@@ -716,7 +744,7 @@ impl EvolutionStore {
                 .find(|episode| episode.id == episode_id)
                 .cloned()
             {
-                self.schedule_analysis(episode, provider.clone());
+                self.schedule_analysis_with_mode(episode, provider.clone(), mode);
             }
         }
     }
@@ -765,15 +793,11 @@ impl EvolutionStore {
         Ok(episodes)
     }
 
+    /// v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；`/evolve` 面板只剩
+    /// Active / Candidates / Episodes / Health。`list_memories` 保留为返回
+    /// 空 Vec 的兼容桩，避免外部 TUI/CLI 调用站点批量报错。
     pub fn list_memories(&self) -> Result<Vec<EvolutionMemory>> {
-        let mut index = self.load_memory_index();
-        self.refresh_memory_statuses(&mut index.memories);
-        index.memories.sort_by(|left, right| {
-            memory_status_rank(left.status)
-                .cmp(&memory_status_rank(right.status))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
-        Ok(index.memories)
+        Ok(Vec::new())
     }
 
     pub fn list_candidates(&self) -> Result<Vec<EvolutionCandidate>> {
@@ -788,20 +812,11 @@ impl EvolutionStore {
 
     pub fn status(&self) -> Result<EvolutionStatus> {
         let episodes = self.list_episodes(usize::MAX)?;
-        let memories = self.list_memories()?;
         let candidates = self.list_candidates()?;
         Ok(EvolutionStatus {
             project_id: self.project_id.clone(),
             directory: self.dir.clone(),
             episodes: episodes.len(),
-            active_memories: memories
-                .iter()
-                .filter(|memory| memory.status == MemoryStatus::Active)
-                .count(),
-            proposed_memories: memories
-                .iter()
-                .filter(|memory| memory.status == MemoryStatus::Proposed)
-                .count(),
             pending_candidates: candidates
                 .iter()
                 .filter(|candidate| {
@@ -891,70 +906,22 @@ impl EvolutionStore {
         )
     }
 
-    pub fn pin_memory(&self, memory_id: &str, pinned: bool) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let memory = index
-            .memories
-            .iter_mut()
-            .find(|memory| memory.id == memory_id)
-            .with_context(|| format!("memory not found: {memory_id}"))?;
-        memory.pinned = pinned;
-        memory.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)?;
-        self.append_audit_unlocked(
-            if pinned { "pin_memory" } else { "unpin_memory" },
-            Some(memory_id),
-            "",
-        )
+    pub fn pin_memory(&self, _memory_id: &str, _pinned: bool) -> Result<()> {
+        // 普通 Memory 已迁出 Evolution → 改走 /memory 面板。`pin_memory` 留
+        // 空函数以兼容旧 CLI/TUI 调用站点；调用方应迁移到 `Memory` 工具
+        // 的对应 action（v3 中不再需要 pinned 字段，由 activate 决定 active）。
+        Ok(())
     }
 
-    pub fn activate_memory(&self, memory_id: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let memory = index
-            .memories
-            .iter_mut()
-            .find(|memory| memory.id == memory_id)
-            .with_context(|| format!("memory not found: {memory_id}"))?;
-        anyhow::ensure!(
-            !matches!(
-                memory.status,
-                MemoryStatus::Conflict | MemoryStatus::Forgotten
-            ),
-            "conflicted or forgotten Memory cannot be activated"
-        );
-        anyhow::ensure!(
-            self.validate_memory(memory),
-            "Memory citation no longer validates against the current branch"
-        );
-        memory.status = MemoryStatus::Active;
-        memory.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)?;
-        self.append_audit_unlocked("activate_memory", Some(memory_id), "manual approval")
+    pub fn activate_memory(&self, _memory_id: &str) -> Result<()> {
+        // 普通 Memory 已迁出 Evolution；activate 改走 v3 Memory 工具的
+        // `confirm_global_candidate` / 直接写 Active claim。
+        Ok(())
     }
 
-    pub fn forget_memory(&self, memory_id: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let memory = index
-            .memories
-            .iter_mut()
-            .find(|memory| memory.id == memory_id)
-            .with_context(|| format!("memory not found: {memory_id}"))?;
-        memory.status = MemoryStatus::Forgotten;
-        memory.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)?;
-        self.append_audit_unlocked("forget_memory", Some(memory_id), "")
+    pub fn forget_memory(&self, _memory_id: &str) -> Result<()> {
+        // 普通 Memory 已迁出 Evolution；forget 改走 v3 Memory 工具的 `forget` action。
+        Ok(())
     }
 
     pub fn reject_candidate(&self, candidate_id: &str, reason: Option<String>) -> Result<()> {
@@ -1094,7 +1061,7 @@ impl EvolutionStore {
                 title: format!("Skill: {name}"),
                 summary: description.clone(),
                 risk: "medium".to_string(),
-                scope: memory.scope,
+                scope: format!("{}:{}", memory.scope.level, memory.scope.value),
                 evidence_episode_ids: memory.evidence_episode_ids,
                 evidence_session_ids: memory.evidence_session_ids,
                 payload: CandidatePayload::Skill {
@@ -1121,7 +1088,10 @@ impl EvolutionStore {
             .find(|episode| episode.id == episode_id)
             .with_context(|| format!("episode not found: {episode_id}"))?;
         let started = Instant::now();
-        match self.analyze_episode(&episode, provider).await {
+        match self
+            .analyze_episode(&episode, provider, EvolutionAnalysisMode::GovernanceOnly)
+            .await
+        {
             Ok(tokens) => {
                 self.record_usage(tokens, started.elapsed().as_secs())?;
                 self.record_health_success()?;
@@ -1166,98 +1136,9 @@ impl EvolutionStore {
     }
 
     pub fn migrate_legacy(&self) -> Result<MigrationPreview> {
-        let preview = self.migration_preview()?;
-        if preview.entries == 0 {
-            return Ok(preview);
-        }
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let previous = fs::read(self.dir.join(MEMORY_INDEX_FILE)).ok();
-        for path in &preview.files {
-            let content = fs::read_to_string(path)?;
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            let kind = if filename.starts_with("user_") || filename.starts_with("feedback_") {
-                MemoryKind::UserPreference
-            } else if filename.starts_with("reference_") {
-                MemoryKind::Reference
-            } else {
-                MemoryKind::RepositoryFact
-            };
-            let name = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("legacy-memory")
-                .to_string();
-            let body = strip_frontmatter(&content).trim().to_string();
-            if body.is_empty() {
-                continue;
-            }
-            let now = Utc::now().to_rfc3339();
-            index.memories.push(EvolutionMemory {
-                schema_version: EVOLUTION_SCHEMA_VERSION,
-                id: format!(
-                    "mem-{}",
-                    short_hash(format!("legacy:{name}:{body}").as_bytes())
-                ),
-                kind,
-                name: name.clone(),
-                summary: name.replace(['_', '-'], " "),
-                body: bounded_redacted(&body, 8_000),
-                scope: MemoryScope {
-                    level: if kind == MemoryKind::UserPreference {
-                        "user_global"
-                    } else {
-                        "repository"
-                    }
-                    .to_string(),
-                    value: if kind == MemoryKind::UserPreference {
-                        "current_user".to_string()
-                    } else {
-                        self.project_id.clone()
-                    },
-                },
-                status: MemoryStatus::Active,
-                pinned: false,
-                confidence: 70,
-                evidence_episode_ids: Vec::new(),
-                evidence_session_ids: Vec::new(),
-                user_quote: None,
-                citations: Vec::new(),
-                external_context: false,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                last_validated_at: None,
-                last_used_at: None,
-                use_count: 0,
-                contradicts: Vec::new(),
-                supersedes: Vec::new(),
-            });
-        }
-        dedupe_memories(&mut index.memories);
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)?;
-        if let Err(error) = fs::rename(&self.legacy_dir, &preview.backup_directory) {
-            match previous {
-                Some(bytes) => fs::write(self.dir.join(MEMORY_INDEX_FILE), bytes)?,
-                None => {
-                    let _ = fs::remove_file(self.dir.join(MEMORY_INDEX_FILE));
-                }
-            }
-            return Err(error).context("backup legacy memory directory");
-        }
-        fs::create_dir_all(&self.legacy_dir)?;
-        fs::write(self.legacy_dir.join("MEMORY.md"), "")?;
-        self.append_audit_unlocked(
-            "migrate_legacy_memory",
-            None,
-            &format!("{} entries", preview.entries),
-        )?;
-        Ok(preview)
+        // v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；migrate_legacy
+        // 不再灌库，仅返回 preview 让调用方知道"已迁出，无可迁数据"。
+        self.migration_preview()
     }
 
     pub fn export_redacted(&self) -> Result<serde_json::Value> {
@@ -1272,7 +1153,12 @@ impl EvolutionStore {
         }))
     }
 
-    async fn analyze_episode(&self, episode: &Episode, provider: Arc<dyn Provider>) -> Result<u32> {
+    async fn analyze_episode(
+        &self,
+        episode: &Episode,
+        provider: Arc<dyn Provider>,
+        mode: EvolutionAnalysisMode,
+    ) -> Result<u32> {
         if !self.within_daily_budget()? {
             anyhow::bail!("daily evolution budget exhausted");
         }
@@ -1285,10 +1171,12 @@ impl EvolutionStore {
         ) {
             return Ok(0);
         }
-        let prompt = evolution_analysis_prompt(episode);
+        let prompt = evolution_analysis_prompt(episode, mode);
+        let _ = mode; // v1.5.5 后模式只剩 GovernanceOnly
+        let system = "You identify approval-gated Rule and Skill candidates from coding-agent Episodes. Return only JSON objects, one per line. Never emit ordinary memories, repository facts, or user preferences.";
         let result = provider
             .complete(
-                "You curate durable coding-agent experience. Return only JSON objects, one per line. Never invent repository facts or user preferences.",
+                system,
                 &[Message::user(prompt)],
                 &[],
                 &wyj_api::provider::RequestOptions::text_only(4096),
@@ -1309,387 +1197,215 @@ impl EvolutionStore {
             .filter(|line| line.starts_with('{'))
         {
             if let Ok(item) = serde_json::from_str::<AnalysisItem>(line) {
-                self.upsert_analysis_item(episode, item)?;
+                self.upsert_analysis_item(episode, item, mode)?;
             }
         }
         self.enforce_retention_and_capacity()?;
         Ok(result.input_tokens.saturating_add(result.output_tokens))
     }
 
-    fn upsert_analysis_item(&self, episode: &Episode, item: AnalysisItem) -> Result<()> {
+    fn upsert_analysis_item(
+        &self,
+        episode: &Episode,
+        item: AnalysisItem,
+        mode: EvolutionAnalysisMode,
+    ) -> Result<()> {
+        // v1.5.5 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill 治理。
+        // 模式只剩 GovernanceOnly，旧 MemoryAndGovernance 分支全部删除。
+        debug_assert_eq!(mode, EvolutionAnalysisMode::GovernanceOnly);
+        self.upsert_governance_analysis_item(episode, item)
+    }
+
+    fn upsert_governance_analysis_item(&self, episode: &Episode, item: AnalysisItem) -> Result<()> {
         let Some(kind) = parse_memory_kind(&item.kind) else {
             return Ok(());
         };
-        if kind == MemoryKind::UserPreference
-            && (!item.explicit_user_statement || !episode.outcome.supports_user_preference())
-        {
-            return Ok(());
-        }
-        if matches!(kind, MemoryKind::RepositoryFact | MemoryKind::Workflow)
-            && !episode.outcome.supports_repository_learning()
-        {
-            return Ok(());
-        }
-        if kind == MemoryKind::FailurePattern && episode.outcome != EpisodeOutcome::Failed {
-            return Ok(());
-        }
-        let citations = item
-            .citation_paths
-            .iter()
-            .filter_map(|path| self.build_citation(path).ok())
-            .collect::<Vec<_>>();
-        if kind == MemoryKind::RepositoryFact && citations.is_empty() {
-            return Ok(());
+        match kind {
+            MemoryKind::Workflow
+                if self.cfg.suggest_skills && episode.outcome.supports_repository_learning() => {}
+            MemoryKind::FailurePattern
+                if self.cfg.suggest_rules && episode.outcome == EpisodeOutcome::Failed => {}
+            _ => return Ok(()),
         }
 
+        let memory_id = analysis_memory_id(kind, &item.name);
+        let candidate_id = match kind {
+            MemoryKind::Workflow => format!("cand-skill-{}", short_hash(memory_id.as_bytes())),
+            MemoryKind::FailurePattern => {
+                format!("cand-rule-{}", short_hash(memory_id.as_bytes()))
+            }
+            _ => unreachable!("governance mode filters ordinary memory kinds"),
+        };
         let _guard = self
             .write_lock
             .lock()
             .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let memory_id = format!(
-            "mem-{}",
-            short_hash(format!("{:?}:{}", kind, sanitize_slug(&item.name)).as_bytes())
-        );
+        let mut index = self.load_candidate_index_unlocked();
+        let existing = index
+            .candidates
+            .iter()
+            .position(|candidate| candidate.id == candidate_id);
+        if existing.is_some_and(|position| {
+            matches!(
+                index.candidates[position].status,
+                CandidateStatus::Active
+                    | CandidateStatus::Rejected
+                    | CandidateStatus::Stale
+                    | CandidateStatus::RolledBack
+            )
+        }) {
+            return Ok(());
+        }
+
+        let mut evidence_episode_ids = existing
+            .map(|position| index.candidates[position].evidence_episode_ids.clone())
+            .unwrap_or_default();
+        let mut evidence_session_ids = existing
+            .map(|position| index.candidates[position].evidence_session_ids.clone())
+            .unwrap_or_default();
+        push_unique(&mut evidence_episode_ids, episode.id.clone());
+        push_unique(&mut evidence_session_ids, episode.session_id.clone());
         let now = Utc::now().to_rfc3339();
-        let memory = if let Some(memory) = index
-            .memories
-            .iter_mut()
-            .find(|memory| memory.id == memory_id)
-        {
-            memory.body = bounded_redacted(&item.body, 8_000);
-            memory.summary = bounded_redacted(&item.summary, 500);
-            memory.updated_at = now.clone();
-            memory
-        } else {
-            index.memories.push(EvolutionMemory {
-                schema_version: EVOLUTION_SCHEMA_VERSION,
-                id: memory_id.clone(),
-                kind,
-                name: sanitize_slug(&item.name),
-                summary: bounded_redacted(&item.summary, 500),
-                body: bounded_redacted(&item.body, 8_000),
-                scope: MemoryScope {
-                    level: if kind == MemoryKind::UserPreference {
-                        "user_global"
-                    } else {
-                        "repository"
-                    }
-                    .to_string(),
-                    value: if kind == MemoryKind::UserPreference {
-                        "current_user".to_string()
-                    } else {
-                        self.project_id.clone()
+        let created_at = existing
+            .map(|position| index.candidates[position].created_at.clone())
+            .unwrap_or_else(|| now.clone());
+        let name = sanitize_slug(&item.name);
+        let candidate = match kind {
+            MemoryKind::Workflow => {
+                let description = item
+                    .skill_description
+                    .clone()
+                    .unwrap_or_else(|| bounded_redacted(&item.summary, 500));
+                let instructions = if item.skill_steps.is_empty() {
+                    bounded_redacted(&item.body, 8_000)
+                } else {
+                    item.skill_steps
+                        .iter()
+                        .enumerate()
+                        .map(|(index, step)| format!("{}. {}", index + 1, step))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let memory = governance_workflow_memory(
+                    &memory_id,
+                    &name,
+                    &item,
+                    evidence_episode_ids.clone(),
+                    evidence_session_ids.clone(),
+                    episode,
+                    &self.project_id,
+                );
+                let eval = build_skill_eval(&memory, &description);
+                let enough_evidence = evidence_episode_ids.len()
+                    >= self.cfg.skill_candidate_min_successes as usize
+                    && evidence_session_ids.len() >= self.cfg.skill_candidate_min_sessions as usize;
+                let status = if !enough_evidence {
+                    CandidateStatus::Validating
+                } else if eval.structural_pass {
+                    CandidateStatus::Validated
+                } else {
+                    CandidateStatus::Failed
+                };
+                let skill_md = format!(
+                    "---\nname: {name}\ndescription: {}\n---\n\n{}\n",
+                    yaml_scalar(&description),
+                    instructions.trim()
+                );
+                EvolutionCandidate {
+                    schema_version: EVOLUTION_SCHEMA_VERSION,
+                    id: candidate_id.clone(),
+                    kind: CandidateKind::Skill,
+                    status,
+                    title: format!("Skill: {name}"),
+                    summary: description.clone(),
+                    risk: "medium".to_string(),
+                    scope: format!("repository:{}", self.project_id),
+                    evidence_episode_ids,
+                    evidence_session_ids,
+                    payload: CandidatePayload::Skill {
+                        skill_name: name,
+                        description,
+                        skill_md,
+                        eval,
                     },
-                },
-                status: MemoryStatus::Proposed,
-                pinned: false,
-                confidence: evidence_confidence(kind, episode),
-                evidence_episode_ids: Vec::new(),
-                evidence_session_ids: Vec::new(),
-                user_quote: None,
-                citations: Vec::new(),
-                external_context: episode.external_context,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                last_validated_at: None,
-                last_used_at: None,
-                use_count: 0,
-                contradicts: Vec::new(),
-                supersedes: Vec::new(),
-            });
-            index.memories.last_mut().expect("just pushed memory")
+                    created_at,
+                    updated_at: now,
+                    rejection_reason: None,
+                    activated_path: None,
+                }
+            }
+            MemoryKind::FailurePattern => {
+                let Some(rule) = item.rule_suggestion.as_deref() else {
+                    return Ok(());
+                };
+                let status = if evidence_episode_ids.len() >= 3 {
+                    CandidateStatus::Validated
+                } else {
+                    CandidateStatus::Validating
+                };
+                EvolutionCandidate {
+                    schema_version: EVOLUTION_SCHEMA_VERSION,
+                    id: candidate_id.clone(),
+                    kind: CandidateKind::Rule,
+                    status,
+                    title: format!("Rule: {}", bounded_redacted(&item.summary, 500)),
+                    summary: bounded_redacted(rule, 500),
+                    risk: "medium".to_string(),
+                    scope: format!("repository:{}", self.project_id),
+                    evidence_episode_ids,
+                    evidence_session_ids,
+                    payload: CandidatePayload::Rule {
+                        rule_text: bounded_redacted(rule, 4_000),
+                        suggested_target: "evolution active rules".to_string(),
+                    },
+                    created_at,
+                    updated_at: now,
+                    rejection_reason: None,
+                    activated_path: None,
+                }
+            }
+            _ => unreachable!("governance mode filters ordinary memory kinds"),
         };
-        push_unique(&mut memory.evidence_episode_ids, episode.id.clone());
-        push_unique(&mut memory.evidence_session_ids, episode.session_id.clone());
-        memory.user_quote = item
-            .user_quote
-            .as_deref()
-            .map(|quote| bounded_redacted(quote, 1_000));
-        for citation in citations {
-            if !memory
-                .citations
-                .iter()
-                .any(|existing| existing.path == citation.path)
-            {
-                memory.citations.push(citation);
+        let action = if candidate.status == CandidateStatus::Validated {
+            match candidate.kind {
+                CandidateKind::Skill => "validate_skill_candidate",
+                CandidateKind::Rule => "validate_rule_candidate",
             }
-        }
-        memory.last_validated_at =
-            (kind == MemoryKind::RepositoryFact).then(|| Utc::now().to_rfc3339());
-        if self.cfg.auto_activate_memories && should_activate_memory(memory) {
-            memory.status = MemoryStatus::Active;
-        }
-        detect_memory_conflicts(&mut index.memories, &memory_id);
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)?;
-        self.append_audit_unlocked("upsert_memory", Some(&memory_id), &item.summary)?;
-
-        let memory = index
-            .memories
-            .iter()
-            .find(|memory| memory.id == memory_id)
-            .cloned()
-            .expect("memory exists after upsert");
-        if kind == MemoryKind::Workflow
-            && self.cfg.suggest_skills
-            && memory.evidence_episode_ids.len() >= self.cfg.skill_candidate_min_successes as usize
-            && memory.evidence_session_ids.len() >= self.cfg.skill_candidate_min_sessions as usize
-        {
-            self.upsert_skill_candidate_unlocked(&memory, &item)?;
-        }
-        if kind == MemoryKind::FailurePattern
-            && self.cfg.suggest_rules
-            && memory.evidence_episode_ids.len() >= 3
-        {
-            if let Some(rule) = item.rule_suggestion.as_deref() {
-                self.upsert_rule_candidate_unlocked(&memory, rule)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn upsert_skill_candidate_unlocked(
-        &self,
-        memory: &EvolutionMemory,
-        item: &AnalysisItem,
-    ) -> Result<()> {
-        let mut index = self.load_candidate_index_unlocked();
-        let id = format!("cand-skill-{}", short_hash(memory.id.as_bytes()));
-        if index.candidates.iter().any(|candidate| candidate.id == id) {
-            return Ok(());
-        }
-        let skill_name = sanitize_slug(&memory.name);
-        let description = item
-            .skill_description
-            .clone()
-            .unwrap_or_else(|| memory.summary.clone());
-        let instructions = if item.skill_steps.is_empty() {
-            memory.body.clone()
         } else {
-            item.skill_steps
-                .iter()
-                .enumerate()
-                .map(|(index, step)| format!("{}. {}", index + 1, step))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "collect_candidate_evidence"
         };
-        let skill_md = format!(
-            "---\nname: {skill_name}\ndescription: {}\n---\n\n{}\n",
-            yaml_scalar(&description),
-            instructions.trim()
-        );
-        let eval = build_skill_eval(memory, &description);
-        let now = Utc::now().to_rfc3339();
-        index.candidates.push(EvolutionCandidate {
-            schema_version: EVOLUTION_SCHEMA_VERSION,
-            id: id.clone(),
-            kind: CandidateKind::Skill,
-            status: if eval.structural_pass {
-                CandidateStatus::Validated
-            } else {
-                CandidateStatus::Failed
-            },
-            title: format!("Skill: {skill_name}"),
-            summary: description.clone(),
-            risk: "medium".to_string(),
-            scope: MemoryScope {
-                level: "repository".to_string(),
-                value: self.project_id.clone(),
-            },
-            evidence_episode_ids: memory.evidence_episode_ids.clone(),
-            evidence_session_ids: memory.evidence_session_ids.clone(),
-            payload: CandidatePayload::Skill {
-                skill_name,
-                description,
-                skill_md,
-                eval,
-            },
-            created_at: now.clone(),
-            updated_at: now,
-            rejection_reason: None,
-            activated_path: None,
-        });
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
-        self.append_audit_unlocked("propose_skill", Some(&id), &memory.summary)
-    }
-
-    fn upsert_rule_candidate_unlocked(&self, memory: &EvolutionMemory, rule: &str) -> Result<()> {
-        let mut index = self.load_candidate_index_unlocked();
-        let id = format!("cand-rule-{}", short_hash(memory.id.as_bytes()));
-        if index.candidates.iter().any(|candidate| candidate.id == id) {
-            return Ok(());
-        }
-        let now = Utc::now().to_rfc3339();
-        index.candidates.push(EvolutionCandidate {
-            schema_version: EVOLUTION_SCHEMA_VERSION,
-            id: id.clone(),
-            kind: CandidateKind::Rule,
-            status: CandidateStatus::Validated,
-            title: format!("Rule: {}", memory.summary),
-            summary: bounded_redacted(rule, 500),
-            risk: "medium".to_string(),
-            scope: MemoryScope {
-                level: "repository".to_string(),
-                value: self.project_id.clone(),
-            },
-            evidence_episode_ids: memory.evidence_episode_ids.clone(),
-            evidence_session_ids: memory.evidence_session_ids.clone(),
-            payload: CandidatePayload::Rule {
-                rule_text: bounded_redacted(rule, 4_000),
-                suggested_target: "evolution active rules".to_string(),
-            },
-            created_at: now.clone(),
-            updated_at: now,
-            rejection_reason: None,
-            activated_path: None,
-        });
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
-        self.append_audit_unlocked("propose_rule", Some(&id), &memory.summary)
-    }
-
-    fn load_context(&self, goal: &str) -> String {
-        if !self.cfg.enabled || !self.cfg.use_experiences {
-            return String::new();
-        }
-        let Ok(mut memories) = self.list_memories() else {
-            return String::new();
-        };
-        let active_rules = self
-            .list_candidates()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|candidate| {
-                candidate.status == CandidateStatus::Active && candidate.kind == CandidateKind::Rule
-            })
-            .collect::<Vec<_>>();
-        memories.retain(|memory| {
-            memory.status == MemoryStatus::Active
-                && !memory.external_context
-                && self.validate_memory(memory)
-                && (memory.pinned
-                    || memory.kind == MemoryKind::UserPreference
-                    || memory_relevance(goal, memory) > 0)
-        });
-        memories.sort_by(|left, right| {
-            memory_injection_priority(left)
-                .cmp(&memory_injection_priority(right))
-                .then_with(|| memory_relevance(goal, right).cmp(&memory_relevance(goal, left)))
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
-        let mut output = CONTEXT_HEADER.to_string();
-        let mut used_memory_ids = Vec::new();
-        for memory in &memories {
-            let entry = format!(
-                "### {}\nScope: {}:{}\nEvidence: {} episode(s)\n\n{}\n\n",
-                memory.summary,
-                memory.scope.level,
-                memory.scope.value,
-                memory.evidence_episode_ids.len(),
-                memory.body
-            );
-            if output.len() + entry.len() > self.cfg.max_context_bytes {
-                break;
-            }
-            output.push_str(&entry);
-            used_memory_ids.push(memory.id.clone());
-        }
-        for candidate in active_rules {
-            let CandidatePayload::Rule { rule_text, .. } = candidate.payload else {
-                continue;
-            };
-            let entry = format!("### Approved rule\n\n{rule_text}\n\n");
-            if output.len() + entry.len() > self.cfg.max_context_bytes {
-                break;
-            }
-            output.push_str(&entry);
-        }
-        if output == CONTEXT_HEADER {
-            String::new()
+        let detail = candidate.summary.clone();
+        if let Some(position) = existing {
+            index.candidates[position] = candidate;
         } else {
-            let _ = self.record_memory_use(&used_memory_ids);
-            output
+            index.candidates.push(candidate);
         }
+        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+        self.append_audit_unlocked(action, Some(&candidate_id), &detail)
     }
 
-    fn record_memory_use(&self, memory_ids: &[String]) -> Result<()> {
-        if memory_ids.is_empty() {
-            return Ok(());
-        }
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        let mut index = self.load_memory_index_unlocked();
-        let now = Utc::now().to_rfc3339();
-        for memory in &mut index.memories {
-            if memory_ids.contains(&memory.id) {
-                memory.last_used_at = Some(now.clone());
-                memory.use_count = memory.use_count.saturating_add(1);
-            }
-        }
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &index)
+    fn load_context(&self, _goal: &str) -> String {
+        // v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；上下文注入
+        // 由 v3 Memory 的 project_brief + 续接分支接管。Evolution 只剩
+        // Rule/Skill candidate 治理，本函数不再生成任何 Memory 上下文。
+        let _ = self.list_candidates();
+        String::new()
     }
 
-    fn validate_memory(&self, memory: &EvolutionMemory) -> bool {
-        if memory.kind != MemoryKind::RepositoryFact || memory.citations.is_empty() {
-            return true;
-        }
-        memory.citations.iter().all(|citation| {
-            let path = self.repository_root.join(&citation.path);
-            if !path.is_file() {
-                return false;
-            }
-            let Ok(bytes) = fs::read(&path) else {
-                return false;
-            };
-            let digest = hex_sha256(&bytes);
-            citation
-                .working_tree_sha256
-                .as_deref()
-                .is_some_and(|expected| expected == digest)
-                || citation.blob_oid.as_deref().is_some_and(|expected| {
-                    git_text(
-                        &self.repository_root,
-                        &["hash-object", &path.to_string_lossy()],
-                    )
-                    .as_deref()
-                        == Some(expected)
-                })
-        })
-    }
-
-    fn build_citation(&self, value: &str) -> Result<RepositoryCitation> {
-        let relative = PathBuf::from(value);
-        anyhow::ensure!(
-            !relative.is_absolute(),
-            "citation path must be repository-relative"
-        );
-        let path = self.repository_root.join(&relative);
-        anyhow::ensure!(path.is_file(), "citation path does not exist");
-        let canonical = fs::canonicalize(&path)?;
-        let root = fs::canonicalize(&self.repository_root)?;
-        anyhow::ensure!(
-            canonical.starts_with(&root),
-            "citation escapes repository root"
-        );
-        let bytes = fs::read(&canonical)?;
-        let display_line = find_first_line(&bytes, value);
+    fn build_citation(&self, _value: &str) -> Result<RepositoryCitation> {
+        // v1.5.5：普通 Memory 数据层已迁出；build_citation 失去业务意义。
+        // 保留为 no-op 让旧调用站点（已被 noop 化的 upsert_governance 分支）
+        // 不破坏编译。
         Ok(RepositoryCitation {
-            repository_id: repository_identity(&self.repository_root),
-            commit: git_text(&self.repository_root, &["rev-parse", "HEAD"]),
-            branch: git_text(&self.repository_root, &["branch", "--show-current"]),
-            path: canonical
-                .strip_prefix(&root)
-                .unwrap_or(&relative)
-                .to_path_buf(),
-            blob_oid: git_text(
-                &self.repository_root,
-                &["hash-object", &canonical.to_string_lossy()],
-            ),
-            working_tree_sha256: Some(hex_sha256(&bytes)),
+            repository_id: String::new(),
+            commit: None,
+            branch: None,
+            path: PathBuf::new(),
+            blob_oid: None,
+            working_tree_sha256: None,
             symbol: None,
-            context_fingerprint: Some(short_hash(&bytes)),
-            display_line,
+            context_fingerprint: None,
+            display_line: None,
         })
     }
 
@@ -1703,18 +1419,6 @@ impl EvolutionStore {
             timestamp.month()
         ));
         append_jsonl(&path, episode)
-    }
-
-    fn load_memory_index(&self) -> MemoryIndex {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
-        self.load_memory_index_unlocked()
-    }
-
-    fn load_memory_index_unlocked(&self) -> MemoryIndex {
-        read_json_or_default(&self.dir.join(MEMORY_INDEX_FILE))
     }
 
     fn load_candidate_index(&self) -> CandidateIndex {
@@ -1845,11 +1549,9 @@ impl EvolutionStore {
             .retain(|candidate| matches!(candidate.status, CandidateStatus::Active));
         write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
 
-        let mut memories = self.load_memory_index_unlocked();
-        memories
-            .memories
-            .retain(|memory| memory.pinned || memory.status == MemoryStatus::Active);
-        write_json_atomic(&self.dir.join(MEMORY_INDEX_FILE), &memories)?;
+        // v1.5.5：普通 Memory 数据层已迁出 Evolution；这里不再清洗
+        // memories/index.json（不存在也不该存在）。容量清理仍按 max_project_
+        // store_bytes 触发。
 
         if directory_size(&self.dir) > self.cfg.max_project_store_bytes {
             let mut paths = fs::read_dir(&episodes_dir)?
@@ -1865,35 +1567,6 @@ impl EvolutionStore {
             }
         }
         Ok(())
-    }
-
-    fn refresh_memory_statuses(&self, memories: &mut [EvolutionMemory]) {
-        let now = Utc::now();
-        for memory in memories {
-            if memory.pinned || memory.status != MemoryStatus::Active {
-                continue;
-            }
-            let reference = memory
-                .last_used_at
-                .as_deref()
-                .or(memory.last_validated_at.as_deref())
-                .unwrap_or(&memory.updated_at);
-            let Ok(reference) = DateTime::parse_from_rfc3339(reference) else {
-                continue;
-            };
-            let age = now
-                .signed_duration_since(reference.with_timezone(&Utc))
-                .num_days();
-            let stale_after = match memory.kind {
-                MemoryKind::RepositoryFact => self.cfg.retention.repository_fact_stale_days as i64,
-                MemoryKind::Workflow => self.cfg.retention.workflow_stale_days as i64,
-                MemoryKind::UserPreference => self.cfg.retention.user_preference_review_days as i64,
-                MemoryKind::FailurePattern | MemoryKind::Reference => i64::MAX,
-            };
-            if age >= stale_after {
-                memory.status = MemoryStatus::Stale;
-            }
-        }
     }
 
     fn infer_feedback_from_goal(&self, goal: &str) -> Result<()> {
@@ -2091,7 +1764,7 @@ fn analyze_messages(messages: &[Message]) -> MessageAnalysis {
     output
 }
 
-fn evolution_analysis_prompt(episode: &Episode) -> String {
+fn evolution_analysis_prompt(episode: &Episode, _mode: EvolutionAnalysisMode) -> String {
     let evidence = episode
         .evidence
         .iter()
@@ -2109,17 +1782,18 @@ fn evolution_analysis_prompt(episode: &Episode) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    format!(
-        r#"Extract only durable, evidence-backed experience from this coding-agent episode. Output zero or more JSON objects, one per line, with:
-{{"kind":"user_preference|repository_fact|workflow|failure_pattern|reference","name":"short-slug","summary":"one line","body":"durable fact or reusable steps","explicit_user_statement":false,"user_quote":null,"citation_paths":["repo/relative/path"],"rule_suggestion":null,"skill_description":null,"skill_steps":[]}}
+    let task = r#"Extract only approval-gated Rule or Skill candidates from this coding-agent episode. Output zero or more JSON objects, one per line, with:
+{{"kind":"rule_skill_candidate","name":"short-slug","summary":"one line","body":"durable governance rule or reusable skill steps","rule_suggestion":null,"skill_description":null,"skill_steps":[]}}
 
 Rules:
-- Never infer a user preference unless the episode contains an explicit user statement; preserve a short exact quote.
-- Repository facts require repository-relative citation paths that exist in the current checkout.
-- Workflow items require verified_success and must describe reusable steps, not one-off task state.
-- Failure patterns require failed outcome and should identify the stable cause, not a transient provider/network error.
+- Never infer a user preference or ordinary memory; only emit Rule/Skill candidates that need human approval.
+- Skill candidates require verified_success and must describe reusable steps, not one-off task state.
+- Rule candidates should identify the stable governance rule, not a transient provider/network error.
+- Do not emit user_preference|repository_fact|workflow|failure_pattern|reference — those are managed by Memory v3, not Evolution.
 - Do not persist tool availability, permission mode, temporary environment/network state, secrets, or raw credentials.
-- Do not output anything when evidence is insufficient.
+- Do not output anything when evidence is insufficient."#;
+    format!(
+        r#"{task}
 
 Episode id: {id}
 Outcome: {outcome:?}
@@ -2134,6 +1808,52 @@ Evidence:
     )
 }
 
+fn analysis_memory_id(kind: MemoryKind, name: &str) -> String {
+    format!(
+        "mem-{}",
+        short_hash(format!("{:?}:{}", kind, sanitize_slug(name)).as_bytes())
+    )
+}
+
+fn governance_workflow_memory(
+    id: &str,
+    name: &str,
+    item: &AnalysisItem,
+    evidence_episode_ids: Vec<String>,
+    evidence_session_ids: Vec<String>,
+    episode: &Episode,
+    project_id: &str,
+) -> EvolutionMemory {
+    let now = Utc::now().to_rfc3339();
+    EvolutionMemory {
+        schema_version: EVOLUTION_SCHEMA_VERSION,
+        id: id.to_string(),
+        kind: MemoryKind::Workflow,
+        name: name.to_string(),
+        summary: bounded_redacted(&item.summary, 500),
+        body: bounded_redacted(&item.body, 8_000),
+        scope: MemoryScope {
+            level: "repository".to_string(),
+            value: project_id.to_string(),
+        },
+        status: MemoryStatus::Proposed,
+        pinned: false,
+        confidence: 0,
+        evidence_episode_ids,
+        evidence_session_ids,
+        user_quote: None,
+        citations: Vec::new(),
+        external_context: episode.external_context,
+        created_at: now.clone(),
+        updated_at: now,
+        last_validated_at: None,
+        last_used_at: None,
+        use_count: 0,
+        contradicts: Vec::new(),
+        supersedes: Vec::new(),
+    }
+}
+
 fn parse_memory_kind(value: &str) -> Option<MemoryKind> {
     match value.trim().to_ascii_lowercase().as_str() {
         "user_preference" | "user" | "feedback" => Some(MemoryKind::UserPreference),
@@ -2142,65 +1862,6 @@ fn parse_memory_kind(value: &str) -> Option<MemoryKind> {
         "failure_pattern" | "failure" => Some(MemoryKind::FailurePattern),
         "reference" => Some(MemoryKind::Reference),
         _ => None,
-    }
-}
-
-fn should_activate_memory(memory: &EvolutionMemory) -> bool {
-    match memory.kind {
-        MemoryKind::UserPreference => memory.user_quote.is_some(),
-        MemoryKind::RepositoryFact => !memory.citations.is_empty(),
-        MemoryKind::Workflow => memory.evidence_episode_ids.len() >= 2,
-        MemoryKind::FailurePattern => memory.evidence_episode_ids.len() >= 3,
-        MemoryKind::Reference => false,
-    }
-}
-
-fn evidence_confidence(kind: MemoryKind, episode: &Episode) -> u8 {
-    match (kind, episode.outcome) {
-        (MemoryKind::UserPreference, _) => 90,
-        (MemoryKind::RepositoryFact, EpisodeOutcome::VerifiedSuccess) => 90,
-        (MemoryKind::Workflow, EpisodeOutcome::VerifiedSuccess) => 75,
-        (MemoryKind::FailurePattern, EpisodeOutcome::Failed) => 80,
-        _ => 50,
-    }
-}
-
-fn detect_memory_conflicts(memories: &mut [EvolutionMemory], changed_id: &str) {
-    let Some(changed) = memories
-        .iter()
-        .find(|memory| memory.id == changed_id)
-        .cloned()
-    else {
-        return;
-    };
-    let mut conflicts = Vec::new();
-    for memory in memories.iter() {
-        if memory.id != changed.id
-            && memory.kind == changed.kind
-            && memory.scope.level == changed.scope.level
-            && memory.scope.value == changed.scope.value
-            && memory.name == changed.name
-            && memory.body != changed.body
-            && !matches!(
-                memory.status,
-                MemoryStatus::Rejected | MemoryStatus::Forgotten
-            )
-        {
-            conflicts.push(memory.id.clone());
-        }
-    }
-    if conflicts.is_empty() {
-        return;
-    }
-    for memory in memories.iter_mut() {
-        if memory.id == changed.id || conflicts.contains(&memory.id) {
-            memory.status = MemoryStatus::Conflict;
-            for id in conflicts.iter().chain(std::iter::once(&changed.id)) {
-                if id != &memory.id {
-                    push_unique(&mut memory.contradicts, id.clone());
-                }
-            }
-        }
     }
 }
 
@@ -2382,15 +2043,6 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn repository_identity(root: &Path) -> String {
-    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let remote = git_text(root, &["config", "--get", "remote.origin.url"]).unwrap_or_default();
-    format!(
-        "repo-{}",
-        short_hash(format!("{}:{remote}", canonical.display()).as_bytes())
-    )
-}
-
 fn bounded_redacted(value: &str, max_chars: usize) -> String {
     let redacted = redact_sensitive_text(value);
     if redacted.chars().count() <= max_chars {
@@ -2448,17 +2100,6 @@ fn push_unique(values: &mut Vec<String>, value: String) {
     }
 }
 
-fn memory_status_rank(status: MemoryStatus) -> u8 {
-    match status {
-        MemoryStatus::Active => 0,
-        MemoryStatus::Proposed => 1,
-        MemoryStatus::Conflict => 2,
-        MemoryStatus::Stale => 3,
-        MemoryStatus::Rejected => 4,
-        MemoryStatus::Forgotten => 5,
-    }
-}
-
 fn candidate_status_rank(status: CandidateStatus) -> u8 {
     match status {
         CandidateStatus::Validated => 0,
@@ -2470,85 +2111,6 @@ fn candidate_status_rank(status: CandidateStatus) -> u8 {
         CandidateStatus::Rejected => 6,
         CandidateStatus::RolledBack => 7,
     }
-}
-
-fn memory_injection_priority(memory: &EvolutionMemory) -> (u8, u8) {
-    let kind = match memory.kind {
-        MemoryKind::UserPreference => 0,
-        MemoryKind::RepositoryFact => 1,
-        MemoryKind::Workflow => 2,
-        MemoryKind::FailurePattern => 3,
-        MemoryKind::Reference => 4,
-    };
-    (if memory.pinned { 0 } else { 1 }, kind)
-}
-
-fn memory_relevance(goal: &str, memory: &EvolutionMemory) -> usize {
-    let goal = goal.to_lowercase();
-    if goal.trim().is_empty() {
-        return 0;
-    }
-    // Scope is an eligibility boundary, not semantic content. Repository-scoped
-    // memories all share the same project id, so scoring that id would make one
-    // common goal token match every Memory in the project.
-    let haystack = format!("{} {} {}", memory.name, memory.summary, memory.body).to_lowercase();
-    let mut score = 0usize;
-    for token in goal
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .filter(|token| token.chars().count() >= 2 && !is_relevance_stopword(token))
-    {
-        if haystack.contains(token) {
-            score = score.saturating_add(token.chars().count().min(12));
-        }
-    }
-    // Chinese and other scripts often arrive without spaces. Character overlap is a
-    // conservative fallback; require at least two shared non-ASCII characters before
-    // considering an otherwise unrelated repository fact relevant.
-    let goal_chars = goal
-        .chars()
-        .filter(|ch| !ch.is_ascii() && !ch.is_whitespace())
-        .collect::<BTreeSet<_>>();
-    let shared = haystack
-        .chars()
-        .filter(|ch| goal_chars.contains(ch))
-        .collect::<BTreeSet<_>>()
-        .len();
-    if shared >= 2 {
-        score = score.saturating_add(shared.min(12));
-    }
-    score
-}
-
-fn is_relevance_stopword(token: &str) -> bool {
-    matches!(
-        token,
-        "a" | "an"
-            | "and"
-            | "are"
-            | "as"
-            | "at"
-            | "be"
-            | "by"
-            | "for"
-            | "from"
-            | "in"
-            | "into"
-            | "is"
-            | "it"
-            | "of"
-            | "on"
-            | "or"
-            | "that"
-            | "the"
-            | "this"
-            | "to"
-            | "with"
-    )
-}
-
-fn dedupe_memories(memories: &mut Vec<EvolutionMemory>) {
-    let mut seen = BTreeSet::new();
-    memories.retain(|memory| seen.insert(memory.id.clone()));
 }
 
 fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -2657,20 +2219,6 @@ fn directory_size(root: &Path) -> u64 {
     total
 }
 
-fn strip_frontmatter(content: &str) -> &str {
-    if !content.starts_with("---") {
-        return content;
-    }
-    let rest = &content[3..];
-    rest.find("\n---")
-        .and_then(|position| content.get(3 + position + 4..))
-        .unwrap_or(content)
-}
-
-fn find_first_line(_bytes: &[u8], _needle: &str) -> Option<u32> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2694,43 +2242,66 @@ mod tests {
         (dir, store)
     }
 
-    fn workflow_memory(id: &str, summary: &str, body: &str) -> EvolutionMemory {
-        let now = Utc::now().to_rfc3339();
-        EvolutionMemory {
-            schema_version: EVOLUTION_SCHEMA_VERSION,
-            id: id.to_string(),
-            kind: MemoryKind::Workflow,
-            name: id.to_string(),
-            summary: summary.to_string(),
-            body: body.to_string(),
-            scope: MemoryScope {
-                level: "repository".to_string(),
-                value: "test-project".to_string(),
-            },
-            status: MemoryStatus::Active,
-            pinned: false,
-            confidence: 90,
-            evidence_episode_ids: vec!["ep-1".into(), "ep-2".into()],
-            evidence_session_ids: vec!["s-1".into(), "s-2".into()],
-            user_quote: None,
-            citations: Vec::new(),
-            external_context: false,
-            created_at: now.clone(),
-            updated_at: now,
-            last_validated_at: None,
-            last_used_at: None,
-            use_count: 0,
-            contradicts: Vec::new(),
-            supersedes: Vec::new(),
+    fn completed_episode(
+        store: &EvolutionStore,
+        session_id: &str,
+        command_output: &str,
+    ) -> Episode {
+        let mut session = Session::new();
+        session.push_user("run the reusable validation workflow");
+        let capture = store.begin_episode(
+            session_id,
+            &session,
+            "run the reusable validation workflow",
+            "p",
+            "v",
+            "m",
+        );
+        session.push_assistant(vec![ContentBlock::ToolUse {
+            id: format!("tool-{session_id}"),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command":"cargo test"}),
+        }]);
+        session.push_tool_result(
+            format!("tool-{session_id}"),
+            ToolResultContent::Text(command_output.to_string()),
+            looks_like_failed_test(command_output),
+        );
+        store.finish_episode(capture, &session, &Ok(())).unwrap()
+    }
+
+    fn workflow_analysis_item() -> AnalysisItem {
+        AnalysisItem {
+            kind: "workflow".to_string(),
+            name: "rust-validation".to_string(),
+            summary: "Validate Rust changes before delivery".to_string(),
+            body: "Run focused tests, strict Clippy, formatting, and diff checks.".to_string(),
+            rule_suggestion: None,
+            skill_description: Some("Validate Rust changes before delivery".to_string()),
+            skill_steps: vec![
+                "Run focused tests".to_string(),
+                "Run strict Clippy".to_string(),
+                "Check formatting and the final diff".to_string(),
+            ],
+        }
+    }
+
+    fn failure_analysis_item() -> AnalysisItem {
+        AnalysisItem {
+            kind: "failure_pattern".to_string(),
+            name: "skipped-validation".to_string(),
+            summary: "Delivery skipped required validation".to_string(),
+            body: "The change was reported complete before required checks passed.".to_string(),
+            rule_suggestion: Some(
+                "Do not report completion until the required validation commands pass.".to_string(),
+            ),
+            skill_description: None,
+            skill_steps: Vec::new(),
         }
     }
 
     #[test]
     fn empty_indexes_default_to_the_current_schema() {
-        assert_eq!(
-            MemoryIndex::default().schema_version,
-            EVOLUTION_SCHEMA_VERSION
-        );
         assert_eq!(
             CandidateIndex::default().schema_version,
             EVOLUTION_SCHEMA_VERSION
@@ -2768,6 +2339,113 @@ mod tests {
         let episode = store.finish_episode(capture, &session, &Ok(())).unwrap();
         assert_eq!(episode.outcome, EpisodeOutcome::VerifiedSuccess);
     }
+
+    #[test]
+    fn governance_only_analysis_keeps_episodes_and_builds_skill_without_memory_v2() {
+        let (_dir, store) = test_store();
+
+        for session_id in ["skill-s1", "skill-s2", "skill-s3"] {
+            let episode =
+                completed_episode(&store, session_id, "test result: ok. 1 passed; 0 failed");
+            assert_eq!(episode.outcome, EpisodeOutcome::VerifiedSuccess);
+            store
+                .upsert_analysis_item(
+                    &episode,
+                    workflow_analysis_item(),
+                    EvolutionAnalysisMode::GovernanceOnly,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.list_episodes(10).unwrap().len(), 3);
+        assert!(store.list_memories().unwrap().is_empty());
+        let candidates = store.list_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.kind, CandidateKind::Skill);
+        assert_eq!(candidate.status, CandidateStatus::Validated);
+        assert_eq!(candidate.evidence_episode_ids.len(), 3);
+        assert_eq!(candidate.evidence_session_ids.len(), 3);
+        let CandidatePayload::Skill { eval, .. } = &candidate.payload else {
+            panic!("expected Skill candidate")
+        };
+        assert!(eval.structural_pass);
+        assert_eq!(eval.historical_successes, 3);
+        assert_eq!(eval.distinct_sessions, 3);
+    }
+
+    #[test]
+    fn governance_only_analysis_accumulates_rule_evidence_without_memory_v2() {
+        let (_dir, store) = test_store();
+
+        for session_id in ["rule-s1", "rule-s2"] {
+            let episode = completed_episode(
+                &store,
+                session_id,
+                "test result: failed; 1 failed; failures:",
+            );
+            assert_eq!(episode.outcome, EpisodeOutcome::Failed);
+            store
+                .upsert_analysis_item(
+                    &episode,
+                    failure_analysis_item(),
+                    EvolutionAnalysisMode::GovernanceOnly,
+                )
+                .unwrap();
+        }
+        assert!(store.list_memories().unwrap().is_empty());
+        assert_eq!(
+            store.list_candidates().unwrap()[0].status,
+            CandidateStatus::Validating
+        );
+
+        let episode = completed_episode(
+            &store,
+            "rule-s3",
+            "test result: failed; 1 failed; failures:",
+        );
+        store
+            .upsert_analysis_item(
+                &episode,
+                failure_analysis_item(),
+                EvolutionAnalysisMode::GovernanceOnly,
+            )
+            .unwrap();
+
+        assert_eq!(store.list_episodes(10).unwrap().len(), 3);
+        assert!(store.list_memories().unwrap().is_empty());
+        let candidate = store.list_candidates().unwrap().remove(0);
+        assert_eq!(candidate.kind, CandidateKind::Rule);
+        assert_eq!(candidate.status, CandidateStatus::Validated);
+        assert_eq!(candidate.evidence_episode_ids.len(), 3);
+        let CandidatePayload::Rule { rule_text, .. } = candidate.payload else {
+            panic!("expected Rule candidate")
+        };
+        assert!(rule_text.contains("required validation"));
+    }
+
+    #[test]
+    fn governance_only_analysis_ignores_ordinary_memory_kinds() {
+        let (_dir, store) = test_store();
+        let episode = completed_episode(
+            &store,
+            "ordinary-memory",
+            "test result: ok. 1 passed; 0 failed",
+        );
+        let mut item = workflow_analysis_item();
+        item.kind = "user_preference".to_string();
+
+        store
+            .upsert_analysis_item(&episode, item, EvolutionAnalysisMode::GovernanceOnly)
+            .unwrap();
+
+        assert!(store.list_memories().unwrap().is_empty());
+        assert!(store.list_candidates().unwrap().is_empty());
+    }
+
+    // v1.5.5 收敛后删除：旧的 `legacy_analysis_mode_still_writes_memory_v2_when_v3_is_absent`
+    // 验证 `MemoryAndGovernance` 模式下普通 Memory 仍能写入；该模式已废除，
+    // 普通 Memory 由 v3 MemoryV3Store 接管。
 
     #[test]
     fn external_tool_marks_episode_as_quarantined() {
@@ -2868,42 +2546,9 @@ mod tests {
         assert_eq!(feedback.feedback.len(), 1);
     }
 
-    #[test]
-    fn context_snapshot_is_relevance_filtered_and_byte_bounded() {
-        let (_dir, store) = test_store();
-        let relevant = workflow_memory(
-            "release-workflow",
-            "Rust release validation",
-            &"Run cargo test and strict clippy before publishing. ".repeat(80),
-        );
-        let unrelated = workflow_memory(
-            "database-migration",
-            "PostgreSQL schema migration",
-            "Back up the database and apply SQL migrations.",
-        );
-        write_json_atomic(
-            &store.dir.join(MEMORY_INDEX_FILE),
-            &MemoryIndex {
-                schema_version: EVOLUTION_SCHEMA_VERSION,
-                memories: vec![unrelated, relevant],
-            },
-        )
-        .unwrap();
-
-        let snapshot = store.context_snapshot("validate the Rust release with cargo test");
-
-        assert!(!snapshot.is_empty());
-        assert!(snapshot.len() <= store.cfg.max_context_bytes);
-        assert!(snapshot.contains("Rust release validation"));
-        assert!(!snapshot.contains("PostgreSQL schema migration"));
-        let memories = store.list_memories().unwrap();
-        let used = memories
-            .iter()
-            .find(|memory| memory.id == "release-workflow")
-            .unwrap();
-        assert_eq!(used.use_count, 1);
-        assert!(used.last_used_at.is_some());
-    }
+    // v1.5.5 收敛后删除：`context_snapshot_is_relevance_filtered_and_byte_bounded`
+    // 依赖旧 Memory 索引生成 relevance-filtered 上下文；普通 Memory 数据层
+    // 已迁出 Evolution，`context_snapshot` 现在只剩 Rule/Skill 治理摘要。
 
     #[test]
     fn external_episode_requires_include_before_manual_skillize() {
@@ -2969,59 +2614,13 @@ mod tests {
         assert_eq!(eval.distinct_sessions, 1);
     }
 
-    #[test]
-    fn capacity_cleanup_preserves_active_and_pinned_memories() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .status()
-            .unwrap();
-        let cfg = EvolutionCfg {
-            max_project_store_bytes: 1,
-            ..EvolutionCfg::default()
-        };
-        let store = EvolutionStore::new(dir.path(), &repo, cfg).unwrap();
-        let active = workflow_memory("active", "Active workflow", "keep active");
-        let mut pinned = workflow_memory("pinned", "Pinned workflow", "keep pinned");
-        pinned.status = MemoryStatus::Proposed;
-        pinned.pinned = true;
-        let mut proposed = workflow_memory("proposed", "Proposed workflow", "remove me");
-        proposed.status = MemoryStatus::Proposed;
-        write_json_atomic(
-            &store.dir.join(MEMORY_INDEX_FILE),
-            &MemoryIndex {
-                schema_version: EVOLUTION_SCHEMA_VERSION,
-                memories: vec![active, pinned, proposed],
-            },
-        )
-        .unwrap();
+    // v1.5.5 收敛后删除：`capacity_cleanup_preserves_active_and_pinned_memories`
+    // 验证旧 memories/index.json 的 active/pinned 保留；普通 Memory 数据层
+    // 已迁出 Evolution，容量清理不再触碰该索引。
 
-        store.enforce_retention_and_capacity().unwrap();
-
-        let remaining = store.load_memory_index().memories;
-        assert!(remaining.iter().any(|memory| memory.id == "active"));
-        assert!(remaining.iter().any(|memory| memory.id == "pinned"));
-        assert!(!remaining.iter().any(|memory| memory.id == "proposed"));
-    }
-
-    #[test]
-    fn legacy_migration_is_previewed_and_backed_up() {
-        let (_dir, store) = test_store();
-        fs::create_dir_all(&store.legacy_dir).unwrap();
-        fs::write(
-            store.legacy_dir.join("user_style.md"),
-            "---\nname: style\n---\n\nUse concise replies.\n",
-        )
-        .unwrap();
-        let preview = store.migration_preview().unwrap();
-        assert_eq!(preview.entries, 1);
-        let migrated = store.migrate_legacy().unwrap();
-        assert!(migrated.backup_directory.exists());
-        assert_eq!(store.list_memories().unwrap().len(), 1);
-    }
+    // v1.5.5 收敛后删除：`legacy_migration_is_previewed_and_backed_up`
+    // 验证旧 legacy markdown 自动灌入 v2 MemoryIndex；该路径已废除，新库
+    // 不再做任何隐式迁移。
 
     #[test]
     fn skill_eval_contains_all_required_boundary_categories() {

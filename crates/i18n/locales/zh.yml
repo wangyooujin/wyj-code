@@ -125,6 +125,7 @@ help:
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开 CLAUDE.md 记忆面板
+    - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
     - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
@@ -234,6 +235,9 @@ agents:
 memory:
   desc: "打开 CLAUDE.md 记忆面板"
   headless_unsupported: "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
+  continuation:
+    no_open_tasks: "当前项目没有未完成任务，请说明要开始的新任务。"
+  clear_all_help: "/memory clear-all — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行。CLI 用 `wyj-code memory clear-all --yes`。"
   dialog:
     title: " ◆ CLAUDE.md 记忆 "
     not_found: "（未创建，回车可新建）"
@@ -244,6 +248,10 @@ memory:
     auto_memory_index_empty: "（暂无内容）"
     hint: "↑↓ 选择   Enter 打开/切换   Esc 关闭"
     editor_failed: "打开编辑器失败: {err}"
+    clear_all_label: "[清空 Memory v3] 当前 {active} active、{superseded} superseded（按 y 确认，Esc 取消）"
+    clear_all_hint: "此操作将搬走所有 Global / Project claims、jobs、audit 到 backups/<ts>/，`rejected_history.json` 保留。无法撤销。"
+    clear_all_confirm: "再次按 y/Enter 确认清空，按 Esc/n 取消。"
+    clear_all_done: "Memory v3 已清空，已备份到 {dir}。"
 
 mcp:
   desc: "管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）"
