@@ -9,7 +9,7 @@ pub const WRITE: &str = "Writes content to a file, replacing anything already th
 
 pub const EDIT: &str = "Performs an exact string replacement in a file. You MUST Read the file first — old_string has to match the current content exactly, including indentation and whitespace. old_string must be unique in the file, or set replace_all=true to replace every occurrence. If the match fails, re-Read the file and adjust. Prefer this over `sed -i` in Bash.";
 
-pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s); for processes meant to keep running (dev servers, watchers), set run_in_background=true and read output later with BashOutput. Output over 30KB is truncated keeping head and tail.";
+pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s); for processes meant to keep running (dev servers, watchers), set run_in_background=true and read output later with BashOutput. Commands run inside the OS sandbox by default. For a host integration the sandbox intentionally cannot express — for example macOS `open -a` or Windows `start` to launch a desktop application — set run_outside_sandbox=true. That path requires a separate one-shot interactive approval, cannot be persisted, and fails closed in plan mode, headless, scheduled, hook, and sub-agent execution. Never use it merely to bypass an unexplained command failure or after the user denies approval. Output over 30KB is truncated keeping head and tail.";
 
 pub const GLOB: &str = "Finds files by glob pattern (`**/*.rs`, `src/**/*.test.ts`, ...). Respects .gitignore. Returns absolute paths. Use this instead of `find` in Bash. Can run in parallel with other read-only calls.";
 
@@ -54,6 +54,14 @@ pub fn computer_custom_description(target_width: u32, target_height: u32) -> Str
     COMPUTER_CUSTOM_TEMPLATE
         .replace("{width}", &target_width.to_string())
         .replace("{height}", &target_height.to_string())
+        .replace(
+            "(re-activate it, e.g. `open -a \"App Name\"`)",
+            "(re-activate it with Bash, e.g. `open -a \"App Name\"` plus `run_outside_sandbox=true`)",
+        )
+        .replace(
+            "To open an application, prefer Bash and then observe it.",
+            "App launch is a host OS side effect: use Bash with `run_outside_sandbox=true`, accept only its separate one-shot approval, and stop if that approval is unavailable or denied; then observe the app.",
+        )
 }
 
 // ── schema 字段描述（各工具 input_schema 里复用的英文文案）──────────────────
@@ -81,3 +89,16 @@ pub const FIELD_WEBFETCH_URL: &str = "The URL to fetch (http/https)";
 
 pub const FIELD_WEBSEARCH_QUERY: &str =
     "The search query. Prefer specific, keyword-rich queries over full sentences.";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computer_hint_routes_app_launch_through_one_shot_host_approval() {
+        let description = computer_custom_description(1280, 720);
+        assert!(description.contains("run_outside_sandbox=true"));
+        assert!(description.contains("separate one-shot approval"));
+        assert!(!description.contains("To open an application, prefer Bash and then observe it."));
+    }
+}

@@ -11,6 +11,7 @@ pub mod history;
 pub mod hooks;
 pub mod interfaces;
 pub mod memory;
+pub mod memory_v3;
 pub mod permission;
 pub mod project;
 pub mod prompts;
@@ -55,6 +56,12 @@ pub use interfaces::{
     WorkspaceDiffSummary, INTERFACE_SCHEMA_VERSION,
 };
 pub use memory::{project_id, MemoryStore};
+pub use memory_v3::{
+    ClearAllReport, MemoryClaimKind, MemoryClaimScope, MemoryClaimStatus, MemoryEvidence,
+    MemoryJob, MemoryJobStatus, MemoryRecord, MemorySearchHit, MemorySource, MemorySourceKind,
+    MemoryV3Status, MemoryV3Store, MemoryWriteRequest, MovedFile, ResetMarker, TaskStatus,
+    TaskStep, MEMORY_V3_SCHEMA_VERSION,
+};
 pub use permission::{
     safe_resolve_write_target, DenyReason, ExecutionSurface, PermissionMode, PermissionPolicy,
     PermissionPrompt, PermissionRequest, PermissionVerdict,

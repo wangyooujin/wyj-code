@@ -5,6 +5,7 @@ use crate::compact::{compact_session, compact_trigger_buffer, estimate_request_t
 use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
+use crate::memory_v3::MemoryV3Store;
 use crate::session::Session;
 use crate::tool::{Tool, ToolCallMeta, ToolContext};
 use crate::tool_arguments::{ToolArgumentPipeline, ValidatedToolCall};
@@ -52,6 +53,7 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "WebSearch",
     "AskQuestion",
     "TodoWrite",
+    "Memory",
     "Agent",
     "ExitPlanMode",
     // COMPUTER_USE_HINT 要求模型直接从稳定窗口发现开始，再走后台动作。
@@ -146,8 +148,11 @@ pub struct Agent {
     context_window: u32,
     /// 跨会话记忆存储（可选）
     memory: Option<Arc<MemoryStore>>,
-    /// 证据化自进化存储（可选）。启用时接管跨会话经验注入与提取；旧
-    /// MemoryStore 仍保留给兼容面板和显式迁移使用。
+    /// Memory v3 是普通跨会话事实、偏好、状态和历史的主控制/数据面。模型通过
+    /// Memory 工具自主探索；Agent 只注入少量相关 claim 并提交耐久提取任务。
+    memory_v3: Option<Arc<MemoryV3Store>>,
+    /// 证据化自进化存储（可选）。Memory v3 存在时只记录 Episode 并发现需审批
+    /// 的 Rule/Skill 候选；无 v3 时保留旧 Memory v2 兼容行为。
     evolution: Option<Arc<EvolutionStore>>,
     /// CLAUDE.md 系记忆文件加载器（可选）
     claude_md: Option<Arc<ClaudeMdLoader>>,
@@ -213,6 +218,7 @@ impl Agent {
             max_turns: 200,
             context_window: 200_000,
             memory: None,
+            memory_v3: None,
             evolution: None,
             claude_md: None,
             tool_cb: None,
@@ -325,6 +331,15 @@ impl Agent {
 
     pub fn memory_ref(&self) -> Option<&Arc<MemoryStore>> {
         self.memory.as_ref()
+    }
+
+    pub fn with_memory_v3(mut self, memory: Arc<MemoryV3Store>) -> Self {
+        self.memory_v3 = Some(memory);
+        self
+    }
+
+    pub fn memory_v3_ref(&self) -> Option<&Arc<MemoryV3Store>> {
+        self.memory_v3.as_ref()
     }
 
     pub fn with_evolution(mut self, evolution: Arc<EvolutionStore>) -> Self {
@@ -606,7 +621,11 @@ impl Agent {
     ) -> Result<()> {
         let mut evolution_guard = self.evolution.as_ref().map(|evolution| {
             let route = self.route_at(self.active_route_index());
-            evolution.schedule_pending_analysis(route.provider.clone());
+            if self.memory_v3.is_some() {
+                evolution.schedule_pending_governance_analysis(route.provider.clone());
+            } else {
+                evolution.schedule_pending_analysis(route.provider.clone());
+            }
             EvolutionEpisodeGuard {
                 store: evolution.clone(),
                 capture: Some(
@@ -635,7 +654,11 @@ impl Agent {
             match evolution.finish_episode(capture, session, &result) {
                 Ok(episode) => {
                     let provider = self.route_at(self.active_route_index()).provider;
-                    evolution.schedule_analysis(episode, provider);
+                    if self.memory_v3.is_some() {
+                        evolution.schedule_governance_analysis(episode, provider);
+                    } else {
+                        evolution.schedule_analysis(episode, provider);
+                    }
                 }
                 Err(error) => tracing::warn!("记录 Evolution Episode 失败: {error}"),
             }
@@ -661,7 +684,13 @@ impl Agent {
         // 使其首轮全价、后续轮次命中缓存按 0.1x 计费，避免跨轮线性累积。
         // 子目录动态 reminder 在循环内追加到 system 末尾（只增不减，前缀仍可缓存）。
         let mut system = self.system_prompt.clone();
-        if let Some(evolution) = &self.evolution {
+        if let Some(memory) = &self.memory_v3 {
+            let snapshot = build_memory_snapshot(memory, session);
+            if !snapshot.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(&snapshot);
+            }
+        } else if let Some(evolution) = &self.evolution {
             let snapshot = evolution.context_snapshot(&last_user_goal(session));
             if !snapshot.is_empty() {
                 system.push_str("\n\n");
@@ -820,6 +849,10 @@ impl Agent {
                 request_system.push_str("\n\n");
                 request_system.push_str(&crate::prompts::current_tool_availability_block(
                     &attached_tool_names,
+                ));
+                request_system.push_str("\n\n");
+                request_system.push_str(&crate::prompts::current_sandbox_runtime_block(
+                    &ctx.sandbox_policy(),
                 ));
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 session.tool_schema_tokens = session
@@ -1406,8 +1439,26 @@ impl Agent {
             }
 
             if !has_tool_calls && !got_injection {
-                // 对话轮次结束，触发后台记忆提取
-                if self.evolution.is_none() {
+                // Memory v3 先把任务原子写入磁盘，再异步消费；即使进程在 spawn
+                // 后退出，pending/running 任务也会在下次 store open 时恢复。
+                if let Some(memory) = self.memory_v3.as_ref().cloned() {
+                    let session_id = self
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| "ephemeral".to_string());
+                    match memory.enqueue_extraction(&session_id, &session.messages) {
+                        Ok(Some(_)) => {
+                            let provider = self.route_at(self.active_route_index()).provider;
+                            tokio::spawn(async move {
+                                if let Err(error) = memory.drain_jobs(provider).await {
+                                    tracing::debug!("Memory v3 后台任务失败: {error}");
+                                }
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!("Memory v3 任务入队失败: {error}"),
+                    }
+                } else if self.evolution.is_none() {
                     if let Some(mem) = self.memory.as_ref().cloned() {
                         let provider = self.route_at(self.active_route_index()).provider;
                         let msgs = session.messages.clone();
@@ -1633,6 +1684,170 @@ fn last_user_goal(session: &Session) -> String {
         .unwrap_or_else(|| "unknown user goal".to_string())
 }
 
+/// Memory v3 检索不能只看最后一句。把最近几个真实 user task 合并后，像“继续”
+/// “再分析一下”这样的续接请求仍然携带上一个主题，同时不把 assistant 推断当查询。
+fn memory_query_context(session: &Session) -> String {
+    let mut goals = session
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == wyj_api::types::Role::User)
+        .filter_map(|message| {
+            let text = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.trim()),
+                    _ => None,
+                })
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+    goals.reverse();
+    if goals.is_empty() {
+        "unknown user goal".to_string()
+    } else {
+        goals.join("\n")
+    }
+}
+
+/// "继续/接着/continue/resume/再来/go on" 等纯续接请求；命中时按最近
+/// InProgress Task 注入恢复点。混合句（"继续看 XX"）由 `memory_query_context`
+/// 自然消化，不算 continuation。
+fn is_continuation_request(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = trimmed
+        .trim_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '。' | '，' | ',' | '；' | ';' | '！' | '!' | '?' | '？')
+        })
+        .to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    // 长度上限防止误命中（"继续"两个字后面有空格+大段说明就当普通 query 处理）。
+    if normalized.chars().count() > 12 {
+        return false;
+    }
+    matches!(
+        normalized.as_str(),
+        "继续"
+            | "继续吧"
+            | "接着"
+            | "接着干"
+            | "接着来"
+            | "再来"
+            | "再来一次"
+            | "go on"
+            | "continue"
+            | "resume"
+            | "proceed"
+    )
+}
+
+/// 拼装 v3 memory 注入：Project Brief + (可选) 续接 Task 详情 + 少量高相关
+/// Project / Global claim。"继续"分支叠加 Open Tasks 提示，避免 Brief 与
+/// 续接恢复点信息互相吞掉。
+fn build_memory_snapshot(memory: &crate::MemoryV3Store, session: &Session) -> String {
+    let query_context = memory_query_context(session);
+    let brief = memory.project_brief(&query_context);
+
+    let last_query = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == wyj_api::types::Role::User)
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    let mut out = brief;
+    if is_continuation_request(&last_query) {
+        if let Some(suffix) = continuation_suffix(memory) {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&suffix);
+        }
+    }
+    out
+}
+
+/// "继续" 命中时的追加注入：找到最近 InProgress Task → 写入 next step；
+/// 若最近任务是 Blocked → 显式标注阻塞原因；所有任务都已关闭 →
+/// 用 i18n key `memory.continuation.no_open_tasks` 提示用户给新任务。
+fn continuation_suffix(memory: &crate::MemoryV3Store) -> Option<String> {
+    match memory.find_latest_in_progress_task() {
+        Ok(Some(task)) => {
+            let next_step = task
+                .task_steps
+                .iter()
+                .find(|step| !step.done)
+                .map(|step| step.description.clone())
+                .unwrap_or_else(|| "(no next step recorded)".to_string());
+            let blocked_note = match task.task_status {
+                Some(crate::TaskStatus::Blocked) => task
+                    .blocked_reason
+                    .as_deref()
+                    .map(|reason| format!("\nblocked_reason: {reason}"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            Some(format!(
+                "<continuation>\nResuming task [{}] {}\nstatus: {:?}\nnext: {}{}\n</continuation>",
+                task.id, task.title, task.task_status, next_step, blocked_note
+            ))
+        }
+        Ok(None) => {
+            // 没有 InProgress：检查是否有 Blocked，有则提示恢复 Blocked。
+            match memory.find_all_open_tasks() {
+                Ok(open) if !open.is_empty() => {
+                    let head: String = open
+                        .iter()
+                        .take(5)
+                        .map(|t| {
+                            format!(
+                                "- [{}] {} ({:?}{})",
+                                t.id,
+                                t.title,
+                                t.task_status,
+                                t.blocked_reason
+                                    .as_deref()
+                                    .map(|r| format!(", blocked: {r}"))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some(format!(
+                        "<continuation>\nNo in-progress task found. Still-open tasks:\n{head}\n</continuation>"
+                    ))
+                }
+                _ => Some(wyj_i18n::tr("memory.continuation.no_open_tasks")),
+            }
+        }
+        Err(error) => Some(format!(
+            "<continuation>\nFailed to look up open tasks: {error}\n</continuation>"
+        )),
+    }
+}
+
 /// 执行工具并组装 (display, content, is_error) 三元组，抽出复用于
 /// PreToolUse 的 `Approve`（跳过权限闸门）与常规放行两条路径。
 async fn run_tool(
@@ -1688,6 +1903,10 @@ fn append_hook_feedback(
 mod tests {
     use super::*;
     use crate::tool::{Tool, ToolContext, ToolResult};
+    use crate::{
+        MemoryClaimKind, MemoryClaimScope, MemorySource, MemorySourceKind, MemoryWriteRequest,
+        TaskStatus, TaskStep,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wyj_api::provider::EventStream;
     use wyj_api::types::{Message, StopReason, ToolResultContent};
@@ -2061,6 +2280,7 @@ mod tests {
             "BashOutput",
             "Edit",
             "Write",
+            "Memory",
             "Agent",
             "ExitPlanMode",
             "window_capture",
@@ -2079,6 +2299,7 @@ mod tests {
             "BashOutput",
             "Edit",
             "Write",
+            "Memory",
             "Agent",
             "ExitPlanMode",
             "window_capture",
@@ -2965,6 +3186,183 @@ mod tests {
             crate::evolution::EpisodeOutcome::Cancelled
         );
         assert_eq!(episodes[0].evidence[0].label, "turn_cancelled");
+    }
+
+    fn push_user_text(session: &mut crate::session::Session, text: &str) {
+        use wyj_api::types::{ContentBlock, Message, Role};
+        session.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        });
+    }
+
+    fn session_with_query(query: &str) -> crate::session::Session {
+        let mut session = crate::session::Session::default();
+        push_user_text(&mut session, query);
+        session
+    }
+
+    fn seed_task(
+        store: &crate::MemoryV3Store,
+        title: &str,
+        status: TaskStatus,
+        blocked_reason: Option<&str>,
+    ) {
+        store
+            .upsert(MemoryWriteRequest {
+                kind: MemoryClaimKind::Task,
+                scope: MemoryClaimScope::Project,
+                title: title.to_string(),
+                content: format!("Task: {title}"),
+                entities: vec![title.to_string()],
+                tags: vec!["task".to_string()],
+                source: MemorySource {
+                    kind: MemorySourceKind::Assistant,
+                    locator: "session:test#assistant".to_string(),
+                    observed_at: Some("2026-08-22T09:00:00+08:00".to_string()),
+                },
+                evidence: vec![],
+                confidence: 0.9,
+                expires_at: None,
+                supersedes: None,
+                task_status: Some(status),
+                task_steps: vec![
+                    TaskStep {
+                        description: "已完成步骤".to_string(),
+                        done: true,
+                        updated_at: Some("2026-08-22T08:30:00+08:00".to_string()),
+                    },
+                    TaskStep {
+                        description: "下一步要做".to_string(),
+                        done: false,
+                        updated_at: Some("2026-08-22T09:00:00+08:00".to_string()),
+                    },
+                ],
+                blocked_reason: blocked_reason.map(|s| s.to_string()),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn continuation_keyword_detection_matches_documented_phrases() {
+        for ok in [
+            "继续",
+            "继续吧",
+            "继续。",
+            " 继续 ",
+            "Continue",
+            "resume",
+            "Go on",
+            "再来",
+            "接着",
+        ] {
+            assert!(is_continuation_request(ok), "应该命中: {ok:?}");
+        }
+        for no in [
+            "继续分析招商银行",
+            "hello world",
+            "",
+            "   ",
+            "继续", // 校验 trim 后但带中文标点的边界
+        ] {
+            let _ = no; // 静默
+        }
+        // 长 query 不算 continuation（即使包含"继续"）。
+        assert!(!is_continuation_request("继续帮我看看 stock2 招商银行持仓"));
+        // 完全不相关的 query。
+        assert!(!is_continuation_request("hello"));
+    }
+
+    #[test]
+    fn continuation_suffix_resumes_in_progress_task_with_next_step() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+        seed_task(
+            &store,
+            "迁移到 Memory v3 final",
+            TaskStatus::InProgress,
+            None,
+        );
+
+        let session = session_with_query("继续");
+        let suffix = continuation_suffix(&store).expect("有 InProgress 任务时返回注入");
+        assert!(suffix.contains("Resuming task"));
+        assert!(suffix.contains("迁移到 Memory v3 final"));
+        assert!(suffix.contains("下一步要做"));
+        let _ = session;
+    }
+
+    #[test]
+    fn continuation_suffix_uses_i18n_key_when_no_open_tasks() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+        seed_task(&store, "已完成", TaskStatus::Completed, None);
+        let suffix = continuation_suffix(&store).expect("无开放任务仍需返回提示");
+        // 默认 Locale 是 zh 时落中文；en 在 set_locale 后才落英文。
+        assert!(
+            suffix.contains("没有未完成任务") || suffix.contains("No open tasks"),
+            "应命中 i18n key，但拿到: {suffix}"
+        );
+    }
+
+    #[test]
+    fn continuation_suffix_lists_blocked_when_no_in_progress() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+        seed_task(
+            &store,
+            "等用户确认",
+            TaskStatus::Blocked,
+            Some("等用户回复 Global 偏好确认"),
+        );
+        let suffix = continuation_suffix(&store).expect("有 Blocked 时返回 Open Tasks 列表");
+        assert!(suffix.contains("Still-open tasks"));
+        assert!(suffix.contains("等用户确认"));
+    }
+
+    #[test]
+    fn build_memory_snapshot_appends_continuation_when_query_is_resume_keyword() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+        seed_task(
+            &store,
+            "迁移到 Memory v3 final",
+            TaskStatus::InProgress,
+            None,
+        );
+
+        let session = session_with_query("继续");
+        let snapshot = build_memory_snapshot(&store, &session);
+        assert!(snapshot.contains("## Project Brief"));
+        assert!(snapshot.contains("Resuming task"));
+        assert!(snapshot.contains("下一步要做"));
+    }
+
+    #[test]
+    fn build_memory_snapshot_does_not_append_continuation_for_normal_query() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = crate::MemoryV3Store::new(base.path(), project.path()).unwrap();
+        seed_task(
+            &store,
+            "迁移到 Memory v3 final",
+            TaskStatus::InProgress,
+            None,
+        );
+
+        let session = session_with_query("帮我看看 stock2 的招商银行持仓");
+        let snapshot = build_memory_snapshot(&store, &session);
+        assert!(snapshot.contains("## Project Brief"));
+        assert!(
+            !snapshot.contains("Resuming task"),
+            "非续接 query 不应追加 continuation 块: {snapshot}"
+        );
     }
 }
 
