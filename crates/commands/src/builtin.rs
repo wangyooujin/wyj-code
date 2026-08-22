@@ -662,11 +662,19 @@ impl Command for MemoryCmd {
         tr("memory.desc")
     }
     fn usage(&self) -> String {
-        "/memory".to_string()
+        "/memory [clear-all]".to_string()
     }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        // 面板本体（列出当前会话适用的 CLAUDE.md 系文件 + auto-memory 开关/索引）
-        // 由 TUI 侧构建，此处只负责触发打开。
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        // 子命令：`clear-all` → TUI 弹二级确认面板；
+        // 其它（含空 args / 任意未知子命令）→ 打开正常 Memory 面板。
+        let trimmed = args.trim();
+        if trimmed.eq_ignore_ascii_case("clear-all") || trimmed.eq_ignore_ascii_case("clear_all") {
+            // 当前 active / superseded 数由 TUI 从 store.status() 取，命令层不依赖具体数。
+            return Ok(CommandResult::OpenMemoryClearAllConfirm {
+                active_count: 0,
+                superseded_count: 0,
+            });
+        }
         Ok(CommandResult::OpenMemoryDialog)
     }
 }

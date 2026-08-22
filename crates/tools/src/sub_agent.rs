@@ -867,7 +867,7 @@ mod tests {
             .status()
             .unwrap();
         let evolution_cfg = wyj_config::EvolutionCfg {
-            generate_experiences: false,
+            use_experiences: false,
             ..wyj_config::EvolutionCfg::default()
         };
         let evolution =

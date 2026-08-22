@@ -1,5 +1,12 @@
 //! 多行输入框状态
 
+/// 结构化附件在编辑器里的内部原子标记。
+///
+/// 它不会直接渲染，也不会进入发送给模型的正文；渲染层会按附件类型把它替换成
+/// [Image #n] / [File: ...]。把标记放进真实编辑序列，才能让占位符跟随粘贴时
+/// 的光标位置，并自然参与左右移动、换行和普通文字插入。
+pub(crate) const ATTACHMENT_MARKER: char = '\u{fffc}';
+
 /// 终端列宽：CJK 全角字符=2，其余=1
 pub fn char_width(c: char) -> usize {
     let cp = c as u32;
@@ -64,6 +71,109 @@ impl InputBox {
                 c => self.insert_char(c),
             }
         }
+    }
+
+    /// 在当前光标处插入一个结构化附件原子。
+    pub(crate) fn insert_attachment_marker(&mut self) {
+        self.insert_char(ATTACHMENT_MARKER);
+    }
+
+    fn attachment_marker_count(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+            .sum()
+    }
+
+    /// 清理附件列表已经移除后遗留的内部标记，并为旧状态中缺少标记的附件补一个
+    /// 行首兼容锚点。正常的新粘贴路径始终是一份附件对应一个标记。
+    pub(crate) fn reconcile_attachment_markers(&mut self, attachment_count: usize) {
+        while self.attachment_marker_count() > attachment_count {
+            self.remove_attachment_marker(attachment_count);
+        }
+
+        let missing = attachment_count.saturating_sub(self.attachment_marker_count());
+        for _ in 0..missing {
+            self.lines[0].insert(0, ATTACHMENT_MARKER);
+            if self.cursor_row == 0 {
+                self.cursor_col += 1;
+            }
+        }
+    }
+
+    fn attachment_marker_ordinal_at(&self, row: usize, col: usize) -> Option<usize> {
+        let marker = self.lines.get(row)?.chars().nth(col)?;
+        if marker != ATTACHMENT_MARKER {
+            return None;
+        }
+
+        Some(
+            self.lines[..row]
+                .iter()
+                .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+                .sum::<usize>()
+                + self.lines[row]
+                    .chars()
+                    .take(col)
+                    .filter(|ch| *ch == ATTACHMENT_MARKER)
+                    .count(),
+        )
+    }
+
+    pub(crate) fn attachment_marker_before_cursor(&self) -> Option<usize> {
+        (self.cursor_col > 0)
+            .then(|| self.attachment_marker_ordinal_at(self.cursor_row, self.cursor_col - 1))
+            .flatten()
+    }
+
+    pub(crate) fn attachment_marker_at_cursor(&self) -> Option<usize> {
+        self.attachment_marker_ordinal_at(self.cursor_row, self.cursor_col)
+    }
+
+    /// 新附件应插入结构化附件向量的位置。顺序按编辑器中的可视位置计算，而不是
+    /// 一律追加到末尾，保证用户把光标移到前文后再粘贴时，标记、编号、删除和发送
+    /// 顺序仍指向同一个附件。
+    pub(crate) fn attachment_insertion_index(&self) -> usize {
+        self.lines[..self.cursor_row]
+            .iter()
+            .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+            .sum::<usize>()
+            + self.lines[self.cursor_row]
+                .chars()
+                .take(self.cursor_col)
+                .filter(|ch| *ch == ATTACHMENT_MARKER)
+                .count()
+    }
+
+    fn remove_attachment_marker(&mut self, ordinal: usize) -> bool {
+        let mut seen = 0usize;
+        for row in 0..self.lines.len() {
+            let marker_col = self.lines[row].chars().enumerate().find_map(|(col, ch)| {
+                if ch != ATTACHMENT_MARKER {
+                    return None;
+                }
+                if seen == ordinal {
+                    Some(col)
+                } else {
+                    seen += 1;
+                    None
+                }
+            });
+            let Some(col) = marker_col else {
+                continue;
+            };
+            let byte = self.lines[row]
+                .char_indices()
+                .nth(col)
+                .map(|(byte, _)| byte)
+                .unwrap_or(self.lines[row].len());
+            self.lines[row].remove(byte);
+            if self.cursor_row == row && self.cursor_col > col {
+                self.cursor_col -= 1;
+            }
+            return true;
+        }
+        false
     }
 
     pub fn insert_newline(&mut self) {
@@ -147,8 +257,12 @@ impl InputBox {
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
         let mut pos = self.cursor_col;
-        while pos > 0 && !chars[pos - 1].is_alphanumeric() {
+        while pos > 0 && chars[pos - 1] != ATTACHMENT_MARKER && !chars[pos - 1].is_alphanumeric() {
             pos -= 1;
+        }
+        if pos > 0 && chars[pos - 1] == ATTACHMENT_MARKER {
+            self.cursor_col = pos;
+            return;
         }
         while pos > 0 && chars[pos - 1].is_alphanumeric() {
             pos -= 1;
@@ -168,8 +282,13 @@ impl InputBox {
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
         let mut pos = self.cursor_col;
-        while pos < chars.len() && !chars[pos].is_alphanumeric() {
+        while pos < chars.len() && chars[pos] != ATTACHMENT_MARKER && !chars[pos].is_alphanumeric()
+        {
             pos += 1;
+        }
+        if pos < chars.len() && chars[pos] == ATTACHMENT_MARKER {
+            self.cursor_col = pos;
+            return;
         }
         while pos < chars.len() && chars[pos].is_alphanumeric() {
             pos += 1;
@@ -206,7 +325,12 @@ impl InputBox {
             return;
         }
         let byte = self.cursor_byte_offset();
+        let markers = self.lines[self.cursor_row][byte..]
+            .chars()
+            .filter(|ch| *ch == ATTACHMENT_MARKER)
+            .collect::<String>();
         self.lines[self.cursor_row].truncate(byte);
+        self.lines[self.cursor_row].push_str(&markers);
     }
 
     /// Ctrl+U — 删掉行首到光标
@@ -215,9 +339,13 @@ impl InputBox {
             return;
         }
         let byte = self.cursor_byte_offset();
+        let markers = self.lines[self.cursor_row][..byte]
+            .chars()
+            .filter(|ch| *ch == ATTACHMENT_MARKER)
+            .collect::<String>();
         let rest = self.lines[self.cursor_row].split_off(byte);
-        self.lines[self.cursor_row] = rest;
-        self.cursor_col = 0;
+        self.lines[self.cursor_row] = format!("{markers}{rest}");
+        self.cursor_col = markers.chars().count();
     }
 
     /// Delete 键 — 向前删一个字符（已在行尾则合并下一行）
@@ -234,19 +362,82 @@ impl InputBox {
 
     /// 取出内容并重置
     pub fn take(&mut self) -> String {
-        let content = self.lines.join("\n");
+        let content = self.text();
         *self = Self::new();
         content
     }
 
     /// 整体替换输入框内容（历史导航整体替换时用）：先清空再复用 insert_text 的换行/字符处理
     pub fn set_text(&mut self, text: &str) {
+        let anchors = self.attachment_marker_positions();
         *self = Self::new();
-        self.insert_text(text);
+        self.insert_text(
+            &text
+                .chars()
+                .filter(|ch| *ch != ATTACHMENT_MARKER)
+                .collect::<String>(),
+        );
+        for (row, col) in anchors {
+            self.insert_attachment_marker_at_text_position(row, col);
+        }
+        self.cursor_row = self.lines.len().saturating_sub(1);
+        self.cursor_col = self.lines[self.cursor_row].chars().count();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lines.iter().all(|l| l.is_empty())
+        self.lines
+            .iter()
+            .all(|line| line.chars().all(|ch| ch == ATTACHMENT_MARKER))
+    }
+
+    /// 返回纯文字内容；内部附件原子永远不会泄漏到历史记录或 Provider 正文。
+    pub(crate) fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .filter(|ch| *ch != ATTACHMENT_MARKER)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn attachment_marker_positions(&self) -> Vec<(usize, usize)> {
+        let mut positions = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let mut text_col = 0usize;
+            for ch in line.chars() {
+                if ch == ATTACHMENT_MARKER {
+                    positions.push((row, text_col));
+                } else {
+                    text_col += 1;
+                }
+            }
+        }
+        positions
+    }
+
+    fn insert_attachment_marker_at_text_position(&mut self, row: usize, col: usize) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        let text_len = self.lines[row]
+            .chars()
+            .filter(|ch| *ch != ATTACHMENT_MARKER)
+            .count();
+        let target = col.min(text_len);
+        let mut text_col = 0usize;
+        let mut byte = self.lines[row].len();
+        for (offset, ch) in self.lines[row].char_indices() {
+            if ch == ATTACHMENT_MARKER {
+                continue;
+            }
+            if text_col == target {
+                byte = offset;
+                break;
+            }
+            text_col += 1;
+        }
+        self.lines[row].insert(byte, ATTACHMENT_MARKER);
     }
 
     /// 返回光标相对于输入框的绝对显示列偏移（用于渲染光标）

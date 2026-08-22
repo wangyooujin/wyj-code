@@ -39,7 +39,7 @@ pub struct ClaudeMdLoader {
 impl ClaudeMdLoader {
     pub fn new(cwd: &Path) -> Self {
         let global_dir = wyj_config::claude_home_dir().ok();
-        let root = find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        let root = wyj_config::project_root(cwd);
         let chain_dirs = collect_chain(&root, cwd);
 
         let mut seen = HashSet::new();
@@ -105,7 +105,7 @@ pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
     if let Ok(g) = wyj_config::claude_home_dir() {
         push_dir_candidates(&mut out, &g, ClaudeMdSource::Global);
     }
-    let root = find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let root = wyj_config::project_root(cwd);
     for d in collect_chain(&root, cwd) {
         push_dir_candidates(&mut out, &d, ClaudeMdSource::Project);
     }

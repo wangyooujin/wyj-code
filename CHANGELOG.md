@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+- **Memory v3 单一普通记忆数据面**：新增 global/project/workspace claim 存储、中文 n-gram 与实体检索、来源/观察时间/TTL、supersede/forget、secret redaction、耐久提取队列、统一 `Memory` 工具、`wyj-code memory` CLI、非 Git `.wyj-code/project.toml` 项目身份和 `--project-root`。Agent 只注入少量相关 claim，让模型自主搜索、阅读、写入和探索；启用 v3 时 Evolution 仍保存 Episode 并积累需人工审批的 Rule/Skill 候选，但不再后台双写普通 Memory v2。
+- **macOS App 启动走一次性宿主审批**：定位 `open -a` 的 LaunchServices `-54` 为 Seatbelt 专用 `lsopen` 权限缺失；通用 Bash profile 继续不授予该外部副作用，避免任意沙箱命令无提示启动 App、打开 URL/文件。Bash 新增 `run_outside_sandbox=true` 显式越界请求，仅非 Plan 的 TUI/ACP 可逐次批准且不可持久化，plan、headless、schedule、hook、SubAgent 继续 fail-closed；模型侧 GUI 指引同步要求使用该受控路径，并对旧 `-54` 输出给出可执行诊断。
+- **TUI 图片占位符跟随粘贴位置**：图片/文件附件改为输入编辑序列中的结构化原子，`[Image #n]` / `[File: ...]` 会显示在实际粘贴光标处，之后输入的文字保留在占位符之后；Backspace/Delete 可在对应位置删除附件，内部标记不会进入历史或 Provider 正文。
+- **畸形 Markdown 表格恢复**：当模型把标题与紧随其后的表头错误连成同一行、但下一行仍是同列数分隔行时，TUI 会在解析前安全补回换行，使持仓快照等表格恢复为网格展示；合法 Markdown 与普通标题竖线保持原行为。
+- **Sandbox 联网根因修复**：`allow_all` 与域名白名单现在统一通过宿主侧回环代理解析远端域名，优先使用固定 IP 启动且证书校验的 DNS-over-HTTPS，并把系统 DNS 仅作为后备，解决网关 DNS 间歇 `SERVFAIL` 或返回 TCP 可连但 TLS 重置的错误地址时 Bash 仍表现为“沙箱不能联网”的问题；公网访问已在 macOS Seatbelt 内实测 HTTP 200，未授权域名仍 fail-closed。每次模型请求同时注入当前 sandbox 网络策略，压缩摘要与历史 `CLAUDE.md` 不再能把旧网络错误固化为当前能力；TUI `/sandbox` 也会正确显示 `allow_all`。
+- **状态栏降噪**：底部状态栏移除 `schema … sent/… saved` 文案，只保留本次进程的输入/输出 token 总量；schema 统计仍保留在底层会话与诊断数据中。
 - **Release CI 可恢复发布**：Release workflow 现在支持从默认分支手动选择并严格校验既有 annotated tag，checkout、tag dereference 与 `HEAD` 必须一致后才允许测试和打包；用于修复 CI 基础设施时无需移动已公开 tag，也不会把 tag 之后的产品代码混入旧版本资产。
 - **Linux sandbox 发布门禁**：GitHub Ubuntu Runner 显式安装 bubblewrap；若 Ubuntu 24.04 AppArmor 启用了 `kernel.apparmor_restrict_unprivileged_userns`，只在临时 Runner 内解除限制并执行 bwrap 预检，确保 Linux 环境隔离测试验证真实 sandbox，而不是因 runner 缺少依赖或 namespace 权限误失败。
 

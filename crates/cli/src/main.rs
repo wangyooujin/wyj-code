@@ -8,16 +8,18 @@ use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistr
 use wyj_config::{AgentMode, Config, RoutingRole};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, EvolutionStore,
-    ExecutionSurface, HistoryEntry, HistoryStore, HookRunner, MemoryStore, Session, SessionFile,
-    SessionStore, SummaryGenerator, ToolEvent,
+    ExecutionSurface, HistoryEntry, HistoryStore, HookRunner, MemoryStore, MemoryV3Store, Session,
+    SessionFile, SessionStore, SummaryGenerator, ToolEvent,
 };
 use wyj_tools::{
-    AskQuestionTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx, ToolRegistry,
+    AskQuestionTool, MemoryTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx,
+    ToolRegistry,
 };
 
 mod acp;
 mod evolve_cmd;
 mod extensions_cmd;
+mod memory_cmd;
 mod review_cmd;
 mod schedule_cmd;
 mod trust_cmd;
@@ -37,6 +39,9 @@ struct Cli {
     prompt: Option<String>,
     #[arg(long, help = wyj_i18n::tr("cli.cwd_help"))]
     cwd: Option<std::path::PathBuf>,
+    /// 显式指定本进程的项目根；主要用于没有 Git 的项目。
+    #[arg(long)]
+    project_root: Option<std::path::PathBuf>,
     #[arg(long, help = wyj_i18n::tr("cli.headless_help"))]
     headless: bool,
     #[arg(long, help = wyj_i18n::tr("cli.plan_help"))]
@@ -109,6 +114,12 @@ enum Commands {
         json: bool,
         #[command(subcommand)]
         command: evolve_cmd::EvolveCommand,
+    },
+    /// Inspect, search and correct Memory v3 claims.
+    #[command(name = "memory")]
+    Memory {
+        #[command(subcommand)]
+        command: memory_cmd::MemoryCommand,
     },
     /// 管理定时任务（增删改查 + 同步系统 crontab）；`schedule run <id>` 是真正
     /// 被 crontab 调用的执行入口，对应 TUI 内 `/schedule` 面板的 headless 版本。
@@ -605,8 +616,12 @@ fn sandbox_report(config: &wyj_config::SandboxCfg) -> serde_json::Value {
         },
         "unsandboxed_fallback": {
             "tui_once": config.enabled && config.allow_unsandboxed_commands,
+            "acp_once": config.enabled && config.allow_unsandboxed_commands,
+            "plan": false,
+            "single_prompt": false,
             "headless": false,
             "schedule": false,
+            "hook": false,
             "sub_agent": false,
         },
         "fail_if_unavailable": config.fail_if_unavailable,
@@ -642,7 +657,7 @@ fn print_sandbox_report(config: &wyj_config::SandboxCfg, json: bool) -> Result<(
     println!("  environment: {}", report["environment"]);
     println!("  overrides: {}", report["filesystem"]);
     println!(
-        "  unsandboxed fallback: TUI one-shot={} · headless/schedule/sub-agent=false",
+        "  unsandboxed fallback: TUI/ACP one-shot={} · plan/single-prompt/headless/schedule/hook/sub-agent=false",
         report["unsandboxed_fallback"]["tui_once"]
             .as_bool()
             .unwrap_or(false)
@@ -814,6 +829,9 @@ async fn main() -> Result<()> {
     wyj_i18n::set_locale(&lang);
 
     let mut cli = Cli::parse();
+    if let Some(root) = cli.project_root.clone() {
+        wyj_config::set_process_project_root_override(Some(root))?;
+    }
     let profile_was_explicit = cli.profile.is_some();
     let mut runtime_command = None;
 
@@ -836,6 +854,10 @@ async fn main() -> Result<()> {
             Commands::Evolve { command, json } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return evolve_cmd::run(command, json, &cwd, &cfg).await;
+            }
+            Commands::Memory { command } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return memory_cmd::run(command, &cwd, cfg.auto_memory_enabled);
             }
             Commands::Schedule { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -1109,6 +1131,13 @@ async fn main() -> Result<()> {
         })
         .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
         .ok();
+    let memory_v3_store = MemoryV3Store::new(&config_base, &cwd)
+        .map(|store| {
+            store.set_enabled(cfg.auto_memory_enabled);
+            Arc::new(store)
+        })
+        .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
+        .ok();
     let evolution_store = if cfg.evolution.enabled {
         EvolutionStore::new(&config_base, &cwd, cfg.evolution.clone())
             .map(Arc::new)
@@ -1124,6 +1153,7 @@ async fn main() -> Result<()> {
 
     // 供 TUI 语言/模型切换重建 Agent 时复用（避免重建后丢失记忆能力）
     let memory_store_for_rebuild = memory_store.clone();
+    let memory_v3_for_rebuild = memory_v3_store.clone();
     let evolution_store_for_rebuild = evolution_store.clone();
     let claude_md_for_rebuild = claude_md_loader.clone();
 
@@ -1182,6 +1212,9 @@ async fn main() -> Result<()> {
     // 始终注册全部工具（模式过滤在运行时由 ToolCtx.permission_mode 负责，支持运行时切换）
     let mut registry = ToolRegistry::standard();
     registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
+    if let Some(memory) = &memory_v3_store {
+        registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+    }
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let tool_ctx = ToolCtx::new(&cwd);
@@ -1248,6 +1281,7 @@ async fn main() -> Result<()> {
                 "BashOutput",
                 "ExitPlanMode",
                 "TodoWrite",
+                "Memory",
                 "Agent",
             ]
             .iter()
@@ -1315,6 +1349,7 @@ async fn main() -> Result<()> {
         claude_md_loader.clone(),
         mcp_tools.clone(),
         code_index.clone(),
+        memory_v3_store.clone(),
         evolution_store.clone(),
     );
     registry.register_arc(Arc::new(
@@ -1492,6 +1527,9 @@ async fn main() -> Result<()> {
     if let Some(mem) = memory_store {
         agent = agent.with_memory(mem);
     }
+    if let Some(memory) = memory_v3_store {
+        agent = agent.with_memory_v3(memory);
+    }
     if let Some(evolution) = evolution_store {
         agent = agent.with_evolution(evolution);
     }
@@ -1504,7 +1542,7 @@ async fn main() -> Result<()> {
     }
     if enable_lazy_tool_schemas {
         agent.enable_lazy_tools(
-            ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite"]
+            ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite", "Memory"]
                 .into_iter()
                 .map(str::to_string),
             cfg.model_runtime.lazy_tools_threshold,
@@ -1698,6 +1736,9 @@ async fn main() -> Result<()> {
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
+        if let Some(memory) = &memory_v3_for_rebuild {
+            new_agent = new_agent.with_memory_v3(memory.clone());
+        }
         if let Some(evolution) = &evolution_store_for_rebuild {
             new_agent = new_agent.with_evolution(evolution.clone());
         }
@@ -1718,6 +1759,9 @@ async fn main() -> Result<()> {
         )));
         reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
         reg.register_arc(Arc::new(AskQuestionTool::new()));
+        if let Some(memory) = &memory_v3_for_rebuild {
+            reg.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+        }
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
             reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
         }
@@ -1732,6 +1776,7 @@ async fn main() -> Result<()> {
             claude_md_for_rebuild.clone(),
             mcp_tools_for_rebuild.clone(),
             code_index_for_rebuild.clone(),
+            memory_v3_for_rebuild.clone(),
             evolution_store_for_rebuild.clone(),
         );
         reg.register_arc(Arc::new(
@@ -1749,7 +1794,7 @@ async fn main() -> Result<()> {
         }
         if enable_lazy_tool_schemas {
             new_agent.enable_lazy_tools(
-                ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite"]
+                ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite", "Memory"]
                     .into_iter()
                     .map(str::to_string),
                 cfg.model_runtime.lazy_tools_threshold,
@@ -2085,6 +2130,7 @@ fn make_sub_agent_factory(
     claude_md: Arc<wyj_core::ClaudeMdLoader>,
     mcp_tools: wyj_tools::SharedMcpTools,
     code_index: Arc<dyn wyj_core::CodeIndex>,
+    memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
     evolution: Option<Arc<wyj_core::EvolutionStore>>,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
@@ -2160,12 +2206,18 @@ fn make_sub_agent_factory(
         if let Some(store) = &evolution {
             sub_agent = sub_agent.with_evolution(store.clone());
         }
+        if let Some(memory) = &memory_v3 {
+            sub_agent = sub_agent.with_memory_v3(memory.clone());
+        }
         if !def.system_prompt.is_empty() {
             sub_agent = sub_agent.with_system(def.system_prompt.clone());
         }
 
         let mut sub_registry = ToolRegistry::standard();
         sub_registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
+        if let Some(memory) = &memory_v3 {
+            sub_registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+        }
         // WebSearch：与主 Agent 同样的"仅配置了 search_api_key 才注册"语义，
         // 让子 Agent 类型定义（如 general-purpose 的 tools: None）能拿到它。
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -2181,7 +2233,9 @@ fn make_sub_agent_factory(
         }
         if enable_lazy_tool_schemas {
             sub_agent.enable_lazy_tools(
-                ["Read", "Glob", "Grep"].into_iter().map(str::to_string),
+                ["Read", "Glob", "Grep", "Memory"]
+                    .into_iter()
+                    .map(str::to_string),
                 cfg.model_runtime.lazy_tools_threshold,
                 cfg.model_runtime.lazy_tools_top_k,
                 cfg.model_runtime.lazy_tools_sticky_turns,
@@ -2985,6 +3039,11 @@ async fn repl(
                         "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
                     );
                 }
+                Ok(CommandResult::OpenMemoryClearAllConfirm { .. }) => {
+                    println!(
+                        "[headless 模式不支持 /memory clear-all 二次确认面板；改用 `wyj-code memory clear-all --yes`]"
+                    );
+                }
                 Ok(CommandResult::OpenEvolutionDialog) => {
                     let evolution = shared_agent.read().unwrap().evolution_ref().cloned();
                     match evolution.and_then(|store| store.status().ok()) {
@@ -3161,6 +3220,24 @@ mod cli_tests {
         assert!(!cli.no_hooks);
         assert!(cli.prompt.is_none());
         assert!(cli.resume.is_none());
+    }
+
+    #[test]
+    fn sandbox_report_exposes_one_shot_host_execution_boundaries() {
+        let report = sandbox_report(&wyj_config::SandboxCfg::default());
+        let fallback = &report["unsandboxed_fallback"];
+        assert_eq!(fallback["tui_once"], true);
+        assert_eq!(fallback["acp_once"], true);
+        for surface in [
+            "plan",
+            "single_prompt",
+            "headless",
+            "schedule",
+            "hook",
+            "sub_agent",
+        ] {
+            assert_eq!(fallback[surface], false, "surface {surface}");
+        }
     }
 
     #[test]

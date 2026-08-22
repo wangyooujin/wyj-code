@@ -508,17 +508,16 @@ impl Default for EvolutionRetentionCfg {
     }
 }
 
-/// 本地、自包含的 Agent 经验闭环。自动化默认只覆盖有硬证据的普通 Memory；
-/// Rule/Skill 与核心代码修改始终保持人工批准或关闭。
+/// 本地、自包含的 Agent 经验闭环。v1.5.5 收敛后只剩 Rule/Skill 治理；
+/// 普通 Memory 数据层迁出 Evolution 后 `generate_experiences` /
+/// `auto_activate_memories` 不再有业务含义，已删除（serde 默认忽略旧字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EvolutionCfg {
     pub enabled: bool,
     pub use_experiences: bool,
-    pub generate_experiences: bool,
     pub suggest_rules: bool,
     pub suggest_skills: bool,
-    pub auto_activate_memories: bool,
     pub auto_activate_rules: bool,
     pub auto_install_skills: bool,
     pub allow_self_code_experiments: bool,
@@ -541,10 +540,8 @@ impl Default for EvolutionCfg {
         Self {
             enabled: true,
             use_experiences: true,
-            generate_experiences: true,
             suggest_rules: true,
             suggest_skills: true,
-            auto_activate_memories: true,
             auto_activate_rules: false,
             auto_install_skills: false,
             allow_self_code_experiments: false,
@@ -960,18 +957,64 @@ pub fn global_config_dir_in(home: &Path) -> PathBuf {
     home.join(".wyj-code")
 }
 
-/// 返回 `cwd` 所属项目的根目录：优先向上查找 Git 仓库根；找不到 `.git` 时
-/// 回退到规范化后的 `cwd` 本身。这里只检查文件系统标记，不执行 git 命令，
-/// 避免项目配置发现进入启动性能关键路径。
+/// 返回当前进程的项目根：显式 override 优先，否则从 `cwd` 向上查找项目清单或
+/// Git 仓库根，最后回退到规范化后的 `cwd`。这里只检查文件系统标记，不执行
+/// git 命令，避免项目配置发现进入启动性能关键路径。
+static PROCESS_PROJECT_ROOT_OVERRIDE: std::sync::OnceLock<std::sync::RwLock<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
+
+/// 为当前进程显式指定项目根。CLI 的 `--project-root` 在解析其他项目级资源前
+/// 调用；显式值是本进程所有项目级资源的权威身份，允许从项目外目录管理非 Git
+/// 项目，同时由独立的 `--cwd` 决定实际工具工作目录。
+pub fn set_process_project_root_override(root: Option<PathBuf>) -> Result<()> {
+    let normalized = match root {
+        Some(path) => {
+            let canonical = path
+                .canonicalize()
+                .with_context(|| format!("项目根不存在或不可访问: {}", path.display()))?;
+            if !canonical.is_dir() {
+                anyhow::bail!("项目根不是目录: {}", canonical.display());
+            }
+            Some(canonical)
+        }
+        None => None,
+    };
+    *PROCESS_PROJECT_ROOT_OVERRIDE
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .write()
+        .unwrap() = normalized;
+    Ok(())
+}
+
+/// 项目清单目前不承载任何全局可共享的 Memory 字段。如未来需要项目级声明，
+/// 应先在 `ProjectManifest` 增字段并在本处提供对应的 reader；目前故意不读取
+/// 任何 `[memory]` 段，以避免类似“跨项目共享 workspace”的语义再次悄然落地。
 pub fn project_root(cwd: &Path) -> PathBuf {
-    let mut dir = Some(cwd);
+    let normalized_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let override_root = PROCESS_PROJECT_ROOT_OVERRIDE
+        .get_or_init(|| std::sync::RwLock::new(None))
+        .read()
+        .unwrap()
+        .clone();
+    resolve_project_root(&normalized_cwd, override_root.as_deref())
+}
+
+fn resolve_project_root(normalized_cwd: &Path, override_root: Option<&Path>) -> PathBuf {
+    if let Some(root) = override_root {
+        return root.to_path_buf();
+    }
+    let mut dir = Some(normalized_cwd);
     while let Some(candidate) = dir {
+        // 非 Git 项目可用一个显式、可提交或本地维护的清单稳定项目身份。
+        if candidate.join(".wyj-code/project.toml").is_file() {
+            return candidate.to_path_buf();
+        }
         if candidate.join(".git").exists() {
             return candidate.to_path_buf();
         }
         dir = candidate.parent();
     }
-    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+    normalized_cwd.to_path_buf()
 }
 
 /// 项目级配置目录（`<git-root>/.wyj-code`），承载 `skills/`、`agents/`、
@@ -1013,8 +1056,9 @@ mod project_path_tests {
         let nested = repo.path().join("crates").join("demo").join("src");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(project_root(&nested), repo.path());
-        assert_eq!(project_config_dir(&nested), repo.path().join(".wyj-code"));
+        let canonical = repo.path().canonicalize().unwrap();
+        assert_eq!(project_root(&nested), canonical);
+        assert_eq!(project_config_dir(&nested), canonical.join(".wyj-code"));
     }
 
     #[test]
@@ -1023,6 +1067,33 @@ mod project_path_tests {
         let canonical = dir.path().canonicalize().unwrap();
         assert_eq!(project_root(dir.path()), canonical);
         assert_eq!(project_config_dir(dir.path()), canonical.join(".wyj-code"));
+    }
+
+    #[test]
+    fn project_manifest_does_not_expose_legacy_workspaces_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("analysis/daily");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(dir.path().join(".wyj-code")).unwrap();
+        // 即便遗留的旧 project.toml 里写了 [memory].workspaces，新解析路径
+        // 也不应暴露 workspace 列表：两层作用域重构后只能拿到空集。
+        std::fs::write(
+            dir.path().join(".wyj-code/project.toml"),
+            "[memory]\nworkspaces = [\"a-share\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(project_root(&nested), dir.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn explicit_project_root_is_authoritative_outside_the_working_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let project = project.path().canonicalize().unwrap();
+        let unrelated = unrelated.path().canonicalize().unwrap();
+
+        assert_eq!(resolve_project_root(&unrelated, Some(&project)), project);
     }
 }
 
@@ -1300,8 +1371,6 @@ context_window = 200000
         let evolution = EvolutionCfg::default();
         assert!(evolution.enabled);
         assert!(evolution.use_experiences);
-        assert!(evolution.generate_experiences);
-        assert!(evolution.auto_activate_memories);
         assert!(!evolution.auto_activate_rules);
         assert!(!evolution.auto_install_skills);
         assert!(!evolution.allow_self_code_experiments);

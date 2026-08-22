@@ -410,7 +410,10 @@ impl ToolContext for ToolCtx {
     }
 
     async fn confirm_unsandboxed_fallback(&self, command: &str, reason: &str) -> bool {
-        if !self.execution_surface.read().unwrap().is_interactive()
+        if matches!(
+            &*self.permission_mode.read().unwrap(),
+            PermissionMode::Plan(_)
+        ) || !self.execution_surface.read().unwrap().is_interactive()
             || !*self.allow_unsandboxed_fallback.read().unwrap()
         {
             return false;
@@ -423,7 +426,7 @@ impl ToolContext for ToolCtx {
         let req = UiAskRequest::ToolPermission {
             tool_name: "Bash (unsandboxed fallback)".to_string(),
             action_summary: format!(
-                "Sandbox 无法建立隔离边界：{reason}\n\n仅本次直连执行：\n{command}"
+                "该命令需要越过 Bash sandbox 边界：{reason}\n\n仅本次在宿主执行：\n{command}"
             ),
             response_tx,
         };
@@ -756,6 +759,19 @@ mod tests {
                 .await
         );
 
+        let mut plan = ToolCtx::new("/tmp");
+        plan.set_execution_surface(ExecutionSurface::TuiInteractive);
+        plan.set_permission_mode(PermissionMode::Plan(
+            ["Bash".to_string()].into_iter().collect(),
+        ));
+        let (tx, _rx) = mpsc::channel(1);
+        plan.ui_ask_tx = Some(tx);
+        assert!(
+            !plan
+                .confirm_unsandboxed_fallback("pwd", "explicit host execution")
+                .await
+        );
+
         let mut tui = ToolCtx::new("/tmp");
         tui.set_execution_surface(ExecutionSurface::TuiInteractive);
         let (tx, mut rx) = mpsc::channel(1);
@@ -763,11 +779,14 @@ mod tests {
         let responder = tokio::spawn(async move {
             if let Some(UiAskRequest::ToolPermission {
                 tool_name,
+                action_summary,
                 response_tx,
                 ..
             }) = rx.recv().await
             {
                 assert_eq!(tool_name, "Bash (unsandboxed fallback)");
+                assert!(action_summary.contains("越过 Bash sandbox 边界"));
+                assert!(action_summary.contains("仅本次在宿主执行"));
                 let _ = response_tx.send(PermissionDecision::AllowOnce);
             }
         });

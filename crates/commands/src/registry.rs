@@ -62,6 +62,12 @@ pub enum CommandResult {
     OpenSettingsDialog,
     /// 打开 CLAUDE.md 记忆面板（/memory 命令触发）
     OpenMemoryDialog,
+    /// 打开 Memory v3 clear-all 二级确认对话框（/memory clear-all 触发）。
+    /// 与 `OpenMemoryDialog` 区分：用户必须再按 y/Enter 才执行清空，避免误操作。
+    OpenMemoryClearAllConfirm {
+        active_count: usize,
+        superseded_count: usize,
+    },
     /// 打开证据化自进化治理中心（/evolve 命令触发）。
     OpenEvolutionDialog,
     /// 打开 MCP server 管理面板（/mcp 命令触发）
