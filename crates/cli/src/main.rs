@@ -189,6 +189,8 @@ enum ModelCommand {
         probe: Option<String>,
         #[arg(long)]
         refresh: bool,
+        #[arg(long)]
+        clear_cache: bool,
     },
 }
 
@@ -387,7 +389,19 @@ async fn run_model_command(command: ModelCommand, cfg: &Config) -> Result<()> {
             json,
             probe,
             refresh,
+            clear_cache,
         } => {
+            if clear_cache {
+                let config_base = wyj_config::config_dir()?;
+                let cache = wyj_api::CapabilityCache::new(&config_base);
+                let removed = cache.clear()?;
+                if json {
+                    println!("{}", serde_json::json!({ "cleared": removed }));
+                } else {
+                    println!("已清空能力缓存：{removed} 条");
+                }
+                return Ok(());
+            }
             let selected = match profile {
                 Some(name) => cfg
                     .profile_by_name(&name)
@@ -539,6 +553,8 @@ async fn run_model_probe(
                     &wyj_api::provider::RequestOptions {
                         max_tokens: budget.saturating_add(32),
                         thinking_budget: Some(budget),
+                        reasoning_effort: profile.reasoning_effort.clone(),
+                        thinking_switch: profile.thinking_switch.clone(),
                         interleaved: profile.interleaved_thinking,
                     },
                 )
@@ -1533,6 +1549,8 @@ async fn main() -> Result<()> {
     if let Some(evolution) = evolution_store {
         agent = agent.with_evolution(evolution);
     }
+    agent =
+        agent.with_capability_cache(Some(Arc::new(wyj_api::CapabilityCache::new(&config_base))));
 
     for def in registry.definitions() {
         let name = def.name.clone();
@@ -3307,12 +3325,14 @@ mod cli_tests {
                         json,
                         probe,
                         refresh,
+                        clear_cache,
                     },
             }) => {
                 assert_eq!(profile.as_deref(), Some("minimax"));
                 assert!(json);
                 assert!(probe.is_none());
                 assert!(refresh);
+                assert!(!clear_cache);
             }
             other => panic!("expected model doctor, got {other:?}"),
         }

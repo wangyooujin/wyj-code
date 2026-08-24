@@ -62,16 +62,29 @@ impl RequestPlan {
         profile: &Profile,
     ) -> Self {
         let mut dropped_parameters = Vec::new();
-        let reasoning = match (
-            profile.thinking_budget.filter(|budget| *budget > 0),
-            capabilities.thinking.value,
-        ) {
-            (Some(budget), ThinkingMode::BudgetTokens) => ReasoningRequest::BudgetTokens(budget),
-            (Some(_), _) => {
+        // 优先级：profile.thinking_budget > profile.effective_reasoning_effort > Disabled
+        // （OpenAI-vendor 的 effort 与 Anthropic 协议的 budget 是两种 reasoning）
+        let budget = profile.thinking_budget.filter(|budget| *budget > 0);
+        let effort = profile.effective_reasoning_effort();
+        let reasoning = match (budget, effort.as_deref(), capabilities.thinking.value) {
+            (Some(b), _, ThinkingMode::BudgetTokens) => ReasoningRequest::BudgetTokens(b),
+            (Some(_), _, _) => {
                 dropped_parameters.push(DroppedParameter {
                     name: "thinking_budget".to_string(),
                     reason: "model capability does not support token-budget reasoning".to_string(),
                 });
+                ReasoningRequest::Disabled
+            }
+            (None, Some(effort_str), ThinkingMode::Effort) => {
+                ReasoningRequest::Effort(effort_str.to_string())
+            }
+            (None, Some(effort_str), _) => {
+                // 用户指定 effort 但 vendor 不认：降级为 Disabled + dropped
+                dropped_parameters.push(DroppedParameter {
+                    name: "reasoning_effort".to_string(),
+                    reason: "model capability does not support effort-based reasoning".to_string(),
+                });
+                let _ = effort_str;
                 ReasoningRequest::Disabled
             }
             _ => ReasoningRequest::Disabled,

@@ -12,6 +12,7 @@ pub mod prompt_policy;
 pub mod provider;
 pub mod request_plan;
 pub mod retry;
+pub mod thinking;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;
@@ -25,6 +26,10 @@ pub use openai::OpenAIProvider;
 pub use prompt_policy::PromptPolicy;
 pub use provider::Provider;
 pub use request_plan::*;
+pub use thinking::{
+    adapter_for, apply_thinking_to_openai_body, should_emit_interleaved_beta, ReasoningEffort,
+    ThinkingAdapter, ThinkingControl, ThinkingResponseFields, ThinkingSpec,
+};
 pub use types::*;
 
 use anyhow::Result;
