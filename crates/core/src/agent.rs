@@ -186,6 +186,9 @@ pub struct Agent {
     /// Hooks 生命周期自动化执行器（可选，子 Agent 不设置，避免嵌套 shell 副作用）
     hook_runner: Option<Arc<HookRunner>>,
     checkpoint_store: Option<Arc<crate::checkpoint::CheckpointStore>>,
+    /// 最近 N 次工具调用的 (name, fnv_hash(input)) 队列,用于 loop detection。
+    /// 跨调用共享 state 需要内部可变性 + Clone 兼容,故用 Arc<Mutex<...>>。
+    loop_guard: Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
 }
 
 struct EvolutionEpisodeGuard {
@@ -238,6 +241,7 @@ impl Agent {
             thinking_cb: None,
             hook_runner: None,
             checkpoint_store: None,
+            loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -312,6 +316,15 @@ impl Agent {
     pub fn with_max_turns(mut self, n: usize) -> Self {
         self.max_turns = n;
         self
+    }
+
+    /// 根据当前路由的模型标识推导实际生效的最大推理轮数。
+    /// Reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking
+    /// 等）在工具循环中容易陷入 reasoning-token 黑洞：每轮 reasoning 块
+    /// 计入 output tokens 但不一定推进工具调用决策。给它们一个保守的
+    /// 32 轮硬上限，普通模型保留 self.max_turns 默认值。
+    fn max_turns_for_route(&self, model: &str) -> usize {
+        max_turns_for_model(self.max_turns, model)
     }
 
     /// 在默认系统提示末尾追加额外内容（如 Plan 模式限制说明）
@@ -766,12 +779,19 @@ impl Agent {
             }
         }
 
+        // 国产 reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking
+        // 等）在工具循环中可能陷入 reasoning-token 黑洞：每轮 thinking 块会
+        // 计入 output tokens，但 reasoning 不一定推进工具调用决策。给它们
+        // 一个保守的 32 轮硬上限，普通模型保留 self.max_turns（默认 200）
+        // 兜底。
+        let max_turns = self.max_turns_for_route(&self.route_model);
+
         let mut turn = 0;
         let mut invalid_argument_rounds = 0usize;
         loop {
             turn += 1;
-            if turn > self.max_turns {
-                anyhow::bail!("超过最大推理轮数 {}", self.max_turns);
+            if turn > max_turns {
+                anyhow::bail!("超过最大推理轮数 {}", max_turns);
             }
 
             // 流式消费，带中断重试：流已消费一半时断开（网络重置、供应商
@@ -948,14 +968,26 @@ impl Agent {
                     let mut blocks: Vec<StreamedBlock> = vec![];
                     let mut current_tool_idx: Option<usize> = None;
                     let mut stop_reason = StopReason::EndTurn;
+                    // seen_completion 用来区分 eventsource_stream 流末尾的良性
+                    // TCP-EOF Err 和真正的半路网络中断。供应商正常关闭流后,eventsource
+                    // 仍可能多调一次 next() 返回 Err(底层的 reqwest reader EOF),这是
+                    // crate 已知行为而非真正的中断;若此时本轮已收到 MessageStop 或
+                    // Usage,把它当作流正常结束,否则保留 stream_err 走原重试路径。
+                    let mut seen_completion = false;
                     let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
                     let mut stream_err: Option<anyhow::Error> = None;
 
                     while let Some(event) = stream.next().await {
                         let event = match event {
                             Ok(ev) => ev,
-                            Err(e) => {
-                                stream_err = Some(e);
+                            Err(error) => {
+                                if seen_completion {
+                                    tracing::debug!(
+                                        "流末尾 EOF (seen_completion=true), 已忽略: {error}"
+                                    );
+                                    break;
+                                }
+                                stream_err = Some(error);
                                 break;
                             }
                         };
@@ -1026,7 +1058,10 @@ impl Agent {
                                 }
                             }
                             StreamEvent::ToolUseEnd { .. } => {}
-                            StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
+                            StreamEvent::MessageStop { stop_reason: sr } => {
+                                stop_reason = sr;
+                                seen_completion = true;
+                            }
                             StreamEvent::Usage {
                                 input_tokens,
                                 output_tokens,
@@ -1039,6 +1074,7 @@ impl Agent {
                                     cache_read_input_tokens,
                                     cache_creation_input_tokens,
                                 ));
+                                seen_completion = true;
                             }
                         }
                     }
@@ -1523,8 +1559,30 @@ impl Agent {
         }
         let start = Instant::now();
 
+        // ── Loop detection 准备 ────────────────────────────────────────
+        // 同 (tool_name, fnv_hash(input)) 在最近 5 次调用里命中 ≥3 次视为
+        // 死循环,跳过本次执行并把循环提示回灌给模型,让它换工具或换参数。
+        // call_hash 在函数顶部计算一次,既给 loop 命中分支用,也给末尾 push 用。
+        let call_hash = fnv_hash_value(&input);
+
         let (display, content, is_error): (String, ToolResultContent, bool) = if let Some(t) = tool
         {
+            let detected_loop = {
+                let guard = self.loop_guard.lock().expect("loop_guard poisoned");
+                detect_loop(&guard, &name, call_hash)
+            };
+            if detected_loop {
+                let msg = format!(
+                    "[loop detection] 工具 `{name}` 在最近 {LOOP_GUARD_WINDOW} 次调用中以相同参数重复 {LOOP_GUARD_THRESHOLD} 次,已跳过本次执行。请换一个工具或调整参数(例如不同的文件路径)。"
+                );
+                // 仍记录本次 (name, hash),但 push 之前不增加窗口——避免"持续跳过"被永远纳入历史。
+                let mut guard = self.loop_guard.lock().expect("loop_guard poisoned");
+                if guard.len() >= LOOP_GUARD_CAPACITY {
+                    guard.pop_front();
+                }
+                guard.push_back((name.clone(), call_hash));
+                return (id, ToolResultContent::Text(msg), true);
+            }
             let pre_outcome = if let Some(hr) = &self.hook_runner {
                 hr.run(
                     "PreToolUse",
@@ -1636,6 +1694,17 @@ impl Agent {
             });
         }
 
+        // Loop detection 记录：把本次 (name, hash) push 到最近 N 次队列,
+        // 容量满了弹出最旧。loop 命中分支已在函数入口提前 return,
+        // 此处不需要再次判断。
+        {
+            let mut guard = self.loop_guard.lock().expect("loop_guard poisoned");
+            if guard.len() >= LOOP_GUARD_CAPACITY {
+                guard.pop_front();
+            }
+            guard.push_back((name.clone(), call_hash));
+        }
+
         (id, content, is_error)
     }
 
@@ -1656,6 +1725,75 @@ fn session_agent_event_id(call_id: &str) -> u64 {
         .fold(0xcbf29ce484222325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
         })
+}
+
+/// Reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking、R1
+/// 蒸馏系列 `-r1` 后缀）在工具循环中容易陷入 reasoning-token 黑洞：每轮
+/// reasoning 块计入 output tokens 但不一定推进工具调用决策。给它们一个
+/// 保守的 32 轮硬上限，普通模型保留调用方传入的默认值。
+///
+/// 抽成 free function 以便单测覆盖（不必构造完整 Agent）。
+fn max_turns_for_model(default_max_turns: usize, model: &str) -> usize {
+    const REASONING_MAX_TURNS: usize = 32;
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("reasoner") || lower.contains("-r1") {
+        REASONING_MAX_TURNS
+    } else {
+        default_max_turns
+    }
+}
+
+/// 对 `serde_json::Value` 做规范化后做 FNV-1a 64-bit 哈希。Object 的 key
+/// 递归排序、数组保留原序,Primitive 直接序列化。这样哈希在 schema 字段
+/// 顺序变化、空白差异等情况下保持稳定,适合 loop detection 用。
+///
+/// 注：抽成 free function 便于单测覆盖 hash 稳定性。
+fn fnv_hash_value(value: &serde_json::Value) -> u64 {
+    let normalized = normalize_for_hash(value);
+    let bytes = serde_json::to_vec(&normalized).unwrap_or_default();
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// 把 Object 的 key 递归排序,数组与 Primitive 保持原样。让同一份语义 JSON
+/// 在 key 顺序打乱后仍产生相同 hash。
+fn normalize_for_hash(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let mut out = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                out.insert(k.clone(), normalize_for_hash(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_for_hash).collect()),
+        other => other.clone(),
+    }
+}
+
+/// LoopGuard 容量上限。每次 exec 后保留最近 N 条 (name, hash),超过则
+/// 弹出最旧的,避免无界增长。
+const LOOP_GUARD_CAPACITY: usize = 16;
+/// 触发跳过的同 name+hash 命中阈值。最近 N 条里命中 ≥ K 次视为死循环。
+const LOOP_GUARD_WINDOW: usize = 5;
+const LOOP_GUARD_THRESHOLD: usize = 3;
+
+/// 检查 (name, hash) 是否已经在最近 LOOP_GUARD_WINDOW 次调用中命中
+/// LOOP_GUARD_THRESHOLD 次以上。是则返回 true 表示模型陷入循环,应跳过本次执行。
+///
+/// 抽成 free function 便于单测覆盖。
+fn detect_loop(window: &std::collections::VecDeque<(String, u64)>, name: &str, hash: u64) -> bool {
+    window
+        .iter()
+        .rev()
+        .take(LOOP_GUARD_WINDOW)
+        .filter(|(n, h)| n == name && *h == hash)
+        .count()
+        >= LOOP_GUARD_THRESHOLD
 }
 
 fn last_user_goal(session: &Session) -> String {
@@ -1922,6 +2060,70 @@ mod tests {
         }
     }
 
+    /// DeepSeek `deepseek-reasoner` 应触发 reasoning 模型熔断,降到 32 轮。
+    #[test]
+    fn max_turns_caps_reasoner_model_at_32() {
+        assert_eq!(max_turns_for_model(200, "deepseek-reasoner"), 32);
+        assert_eq!(max_turns_for_model(200, "DeepSeek-Reasoner"), 32);
+        assert_eq!(max_turns_for_model(200, "deepseek-R1"), 32);
+        assert_eq!(max_turns_for_model(200, "deepseek-r1-distill-qwen-7b"), 32);
+    }
+
+    /// 普通模型保留调用方传入的默认值,不受熔断影响。
+    #[test]
+    fn max_turns_keeps_default_for_normal_models() {
+        assert_eq!(max_turns_for_model(200, "deepseek-chat"), 200);
+        assert_eq!(max_turns_for_model(200, "claude-opus-4-5"), 200);
+        assert_eq!(max_turns_for_model(64, "qwen3-coder-plus"), 64);
+    }
+
+    /// fnv_hash_value 对 Object 的 key 顺序不敏感,数组保持原序。
+    /// 同语义不同 JSON 序列化顺序应产出相同 hash,避免误伤正常重试。
+    #[test]
+    fn fnv_hash_is_stable_across_key_order() {
+        let a = serde_json::json!({"path": "Cargo.toml", "limit": 10});
+        let b = serde_json::json!({"limit": 10, "path": "Cargo.toml"});
+        assert_eq!(fnv_hash_value(&a), fnv_hash_value(&b));
+
+        let arr_a = serde_json::json!({"items": [1, 2, 3]});
+        let arr_b = serde_json::json!({"items": [3, 2, 1]});
+        assert_ne!(fnv_hash_value(&arr_a), fnv_hash_value(&arr_b));
+    }
+
+    /// 5 条历史里有 3 条同 (name, hash) 视为循环。
+    #[test]
+    fn detect_loop_fires_at_threshold() {
+        let mut window = std::collections::VecDeque::new();
+        let h = fnv_hash_value(&serde_json::json!({"path": "foo"}));
+        // 注入 3 次相同 (Read, h),窗口容量 5
+        for _ in 0..3 {
+            window.push_back(("Read".to_string(), h));
+        }
+        // 不同参数不算循环
+        let h2 = fnv_hash_value(&serde_json::json!({"path": "bar"}));
+        window.push_back(("Read".to_string(), h2));
+        window.push_back(("Edit".to_string(), h));
+
+        assert!(detect_loop(&window, "Read", h));
+        assert!(!detect_loop(&window, "Read", h2));
+        assert!(!detect_loop(&window, "Edit", h));
+    }
+
+    /// 命中计数只在最近 LOOP_GUARD_WINDOW (5) 条里数,更早的不算。
+    #[test]
+    fn detect_loop_ignores_old_entries() {
+        let mut window = std::collections::VecDeque::new();
+        let h = fnv_hash_value(&serde_json::json!({"path": "foo"}));
+        // 8 条历史,前 5 条相同 + 后 3 条不同 — 但窗口只看最近 5,所以不算循环
+        for _ in 0..5 {
+            window.push_back(("Read".to_string(), h));
+        }
+        for _ in 0..3 {
+            window.push_back(("Edit".to_string(), h));
+        }
+        assert!(!detect_loop(&window, "Read", h));
+    }
+
     /// 第一轮返回两个 Sleep 工具调用，第二轮返回 EndTurn 文本
     struct TwoToolProvider {
         calls: AtomicUsize,
@@ -2150,6 +2352,11 @@ mod tests {
             let events: Vec<Result<StreamEvent>> = if n < 3 {
                 let first_id = format!("round-{n}-first");
                 let second_id = format!("round-{n}-second");
+                // 每次给 input 加个 round 标识,让 fnv_hash 不重复,避免
+                // loop detection(最近 5 次相同 input 命中 3 次触发)误伤
+                // 这个测 argument retry guard 的本意。
+                let first_args = format!(r#"{{"round":{n}}}"#);
+                let second_args = format!(r#"{{"round":{n},"slot":2}}"#);
                 vec![
                     Ok(StreamEvent::ToolUseStart {
                         id: first_id.clone(),
@@ -2157,7 +2364,7 @@ mod tests {
                     }),
                     Ok(StreamEvent::ToolUseDelta {
                         id: first_id,
-                        json_delta: "{}".into(),
+                        json_delta: first_args,
                     }),
                     Ok(StreamEvent::ToolUseStart {
                         id: second_id.clone(),
@@ -2165,7 +2372,7 @@ mod tests {
                     }),
                     Ok(StreamEvent::ToolUseDelta {
                         id: second_id,
-                        json_delta: "{}".into(),
+                        json_delta: second_args,
                     }),
                     Ok(StreamEvent::MessageStop {
                         stop_reason: StopReason::ToolUse,
@@ -2971,6 +3178,67 @@ mod tests {
         assert!(!assistant_texts[0].contains("半成品"));
         // 两次 API 调用（首次失败 + 重试成功）
         assert_eq!(session.api_calls, 2);
+    }
+
+    /// 流已正常结束（收到 MessageStop + Usage），但 eventsource_stream 在末尾
+    /// 又多调一次 next() 返回 Err（这是 crate 对 TCP EOF 的已知行为，不是真正的
+    /// 网络中断）。Agent 必须把这种"良性末尾 EOF"忽略，绝不能丢弃已累积的完整
+    /// 文本，也绝不触发整轮重试。
+    struct EofAfterCompletionProvider;
+    #[async_trait::async_trait]
+    impl Provider for EofAfterCompletionProvider {
+        async fn stream(
+            &self,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("完整回复（中途不丢字）".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+                Ok(StreamEvent::Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                }),
+                Err(anyhow::anyhow!("EOF after completion")),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_eof_after_completion_is_ignored_not_retried() {
+        let agent = Agent::new(Arc::new(EofAfterCompletionProvider));
+        let mut session = Session::new();
+        session.push_user("hi");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        // 整段回复完整保留，没有任何重试
+        let assistant_texts: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, wyj_api::types::Role::Assistant))
+            .map(|m| m.text())
+            .collect();
+        assert_eq!(assistant_texts.len(), 1);
+        assert_eq!(assistant_texts[0], "完整回复（中途不丢字）");
+        // 关键断言：只调了一次 API,没有触发流中断重试
+        assert_eq!(
+            session.api_calls, 1,
+            "末尾 EOF 不应触发重试,实际 API 调用次数 {}",
+            session.api_calls
+        );
+        // 用量应已正常入账
+        assert_eq!(session.total_input_tokens, 100);
+        assert_eq!(session.total_output_tokens, 50);
     }
 
     /// 永远流中断的 provider：耗尽重试后必须报错，且不留半成品消息

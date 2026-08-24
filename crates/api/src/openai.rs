@@ -20,6 +20,11 @@ pub struct OpenAIProvider {
     base_url: String,
     model: String,
     stream_options: bool,
+    /// 是否把 user message 中的 `ContentBlock::Image` 序列化为 OpenAI 的
+    /// `image_url` 块（OpenAI Chat Completions 标准格式）。
+    /// 当 `Profile.vision=false` 时走纯字符串降级，避免第三方兼容端点
+    /// 对未知 content 数组字段返回 400。
+    supports_vision: bool,
 }
 
 impl OpenAIProvider {
@@ -30,14 +35,14 @@ impl OpenAIProvider {
     pub fn with_model(cfg: &Config, model: &str) -> Result<Self> {
         let api_key = cfg.api_key()?.to_string();
         let base_url = cfg.resolved_base_url().trim_end_matches('/').to_string();
+        let profile = cfg.active_profile();
         Ok(Self {
             client: Client::new(),
             api_key,
             base_url,
             model: model.to_string(),
-            stream_options: cfg
-                .active_profile()
-                .effective_openai_stream_options_for_model(model),
+            stream_options: profile.effective_openai_stream_options_for_model(model),
+            supports_vision: profile.vision,
         })
     }
 }
@@ -116,6 +121,11 @@ struct Choice {
 #[derive(Deserialize, Debug, Default)]
 struct Delta {
     content: Option<String>,
+    /// DeepSeek `deepseek-reasoner` 等 reasoning 模型在流式响应里通过
+    /// `delta.reasoning_content` 字段返回推理过程。OpenAI Chat Completions
+    /// 标准无此字段，serde 默认忽略未知字段；国产 reasoning 模型会回填。
+    #[serde(default)]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -154,16 +164,29 @@ struct PendingToolCall {
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
 
-fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
+fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessage> {
     let mut out = vec![];
     for m in messages {
         match m.role {
             Role::User => {
-                let mut text_parts = vec![];
+                let mut text_parts: Vec<String> = vec![];
+                let mut image_parts: Vec<Value> = vec![];
                 let mut tool_results = vec![];
                 for block in &m.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
+                        ContentBlock::Image { media_type, data } => {
+                            // 仅当 supports_vision=true 时序列化 image_url；
+                            // 否则丢弃（与原 `_ => {}` 行为一致）。
+                            if supports_vision {
+                                image_parts.push(serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{};base64,{}", media_type, data),
+                                    }
+                                }));
+                            }
+                        }
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
@@ -190,7 +213,21 @@ fn to_api_messages(messages: &[Message]) -> Vec<ApiMessage> {
                 }
                 if !tool_results.is_empty() {
                     out.extend(tool_results);
+                } else if supports_vision && !image_parts.is_empty() {
+                    // vision 模式：content 是 [{type:"text",...}, {type:"image_url",...}] 数组
+                    let mut content_parts: Vec<Value> = text_parts
+                        .into_iter()
+                        .map(|t| serde_json::json!({"type": "text", "text": t}))
+                        .collect();
+                    content_parts.extend(image_parts);
+                    out.push(ApiMessage {
+                        role: "user".to_string(),
+                        content: Some(Value::Array(content_parts)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
                 } else {
+                    // 普通文本 user 消息：content 是纯字符串
                     out.push(ApiMessage {
                         role: "user".to_string(),
                         content: Some(Value::String(text_parts.join(""))),
@@ -269,6 +306,10 @@ fn usage_event(usage: UsageData) -> StreamEvent {
 
 /// 一个 SSE chunk 可能同时携带 finish_reason 与 usage。旧实现只在 choices 为空
 /// 时读取 usage，导致部分 OpenAI 兼容服务的精确 token 被静默丢弃。
+///
+/// reasoning_content（DeepSeek `deepseek-reasoner` 等）独立于 finish_reason /
+/// content / tool_calls，因为它常与 content 在同一 chunk 出现，且 reasoning
+/// 应在 content 之前上屏以模拟 Claude 原生 thinking 体验。
 fn stream_events_from_chunk(
     tool_map: &mut std::collections::HashMap<usize, PendingToolCall>,
     chunk: SseChunk,
@@ -276,6 +317,15 @@ fn stream_events_from_chunk(
     let mut events = vec![];
 
     if let Some(choice) = chunk.choices.into_iter().next() {
+        // 1. reasoning_content 独立分支（DeepSeek 等 reasoning 模型）。
+        //    若与 content 同 chunk，优先 reasoning 后 content，模拟 thinking-then-text。
+        if let Some(text) = choice.delta.reasoning_content {
+            if !text.is_empty() {
+                events.push(StreamEvent::ThinkingDelta(text));
+            }
+        }
+
+        // 2. finish_reason / content / tool_calls 走原互斥逻辑。
         if let Some(fr) = choice.finish_reason {
             events.push(StreamEvent::MessageStop {
                 stop_reason: parse_stop_reason(&fr),
@@ -314,6 +364,7 @@ fn stream_events_from_chunk(
         }
     }
 
+    // 3. usage 最后发：精确账本永远跟随 message stop 之后。
     if let Some(usage) = chunk.usage {
         events.push(usage_event(usage));
     }
@@ -340,7 +391,7 @@ impl Provider for OpenAIProvider {
             tool_calls: None,
             tool_call_id: None,
         }];
-        api_messages.extend(to_api_messages(messages));
+        api_messages.extend(to_api_messages(messages, self.supports_vision));
 
         // 原生工具（如 Anthropic computer-use）无 description/input_schema，
         // 且 OpenAI Chat Completions 不支持该调用形态：过滤掉。这类工具只在
@@ -464,6 +515,7 @@ mod tests {
             choices: vec![Choice {
                 delta: Delta {
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index: 0,
                         id: Some("call_1".to_string()),
@@ -488,5 +540,144 @@ mod tests {
             StreamEvent::ToolUseDelta { ref id, ref json_delta }
                 if id == "call_1" && json_delta == r#"{"path":"Cargo.toml"}"#
         ));
+    }
+
+    /// DeepSeek `deepseek-reasoner` 等 reasoning 模型通过 `delta.reasoning_content`
+    /// 字段返回推理过程。当前实现把它当作 `ThinkingDelta` 事件，让 reasoning
+    /// 能落盘到 `ContentBlock::Thinking` 并上屏，与 Anthropic thinking 行为对齐。
+    #[test]
+    fn reasoning_chunk_emits_thinking_delta() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: None,
+                    reasoning_content: Some("Step 1: read Cargo.toml".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ThinkingDelta(t) if t == "Step 1: read Cargo.toml"
+        ));
+    }
+
+    /// reasoning_content 与 content 可在同一 chunk 出现（DeepSeek 边界）。
+    /// 实现要求：reasoning 在前，content 在后，模拟 thinking-then-text 体验。
+    #[test]
+    fn reasoning_and_content_in_same_chunk() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: Some("Answer: 42".to_string()),
+                    reasoning_content: Some("Compute 6*7".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::ThinkingDelta(t) if t == "Compute 6*7"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(t) if t == "Answer: 42"));
+    }
+
+    /// reasoning_content 为空字符串时不 emit（避免上屏空 thinking）。
+    #[test]
+    fn empty_reasoning_content_is_skipped() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: Some("hi".to_string()),
+                    reasoning_content: Some(String::new()),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "hi"));
+    }
+
+    /// 当 supports_vision=true 时,user message 中的 Image 块应序列化为
+    /// OpenAI Chat Completions 标准的 `image_url` 数组,与文本混合成
+    /// `[{type:"text",...},{type:"image_url",...}]` 形式。
+    #[test]
+    fn vision_true_serializes_image_blocks_as_image_url() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "describe this image".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                },
+            ],
+        }];
+
+        let api = to_api_messages(&msgs, true);
+        assert_eq!(api.len(), 1);
+        let content = api[0].content.as_ref().expect("user content");
+        let parts = content.as_array().expect("content must be an array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "describe this image");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    /// 当 supports_vision=false 时,Image 块走纯字符串降级（原 `_ => {}` 行为）。
+    /// 这是 Profile.vision=false 时所有 OpenAI 兼容端点必须走的路径，避免
+    /// 第三方代理对未知 content 数组字段返回 400。
+    #[test]
+    fn vision_false_drops_image_blocks_to_plain_string() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "hi".to_string(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    data: "ignored".to_string(),
+                },
+            ],
+        }];
+
+        let api = to_api_messages(&msgs, false);
+        assert_eq!(api.len(), 1);
+        let content = api[0].content.as_ref().expect("user content");
+        // 纯字符串，内容只包含文本段
+        assert_eq!(content.as_str(), Some("hi"));
+    }
+
+    /// 无 Image 块时,即使 supports_vision=true 也走纯字符串路径（向后兼容）。
+    #[test]
+    fn vision_true_without_image_keeps_plain_string() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        }];
+
+        let api = to_api_messages(&msgs, true);
+        assert_eq!(api.len(), 1);
+        assert_eq!(api[0].content.as_ref().unwrap().as_str(), Some("hello"));
     }
 }

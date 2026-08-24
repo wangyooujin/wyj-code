@@ -176,6 +176,12 @@ help:
     - `Normal` — Default mode, shows a permission dialog before each tool call
     - `Plan` — Read-only mode, allows read/glob/grep/web_fetch/bash/write(plan file)/ExitPlanMode
     - `Bypass` — Skips all permission prompts, auto-approves every tool call
+
+    ---
+
+    ## Reports
+
+    Domestic model compatibility analysis (DeepSeek/GLM/Kimi/Qwen/Doubao/MiniMax vs Claude Code/Codex) with pitfalls and best practices: [doc/analysis/domestic-models-vs-claude-code.md](https://github.com/wangyooujin/wyj-code/blob/master/doc/analysis/domestic-models-vs-claude-code.md)
   custom_commands_header: "Custom Commands"
 
 evolve:

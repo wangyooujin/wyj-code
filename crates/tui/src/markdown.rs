@@ -482,14 +482,41 @@ fn highlight_code_line(line: &str, lang: &str) -> Vec<Span<'static>> {
 
 // ── 渲染器内部状态 ────────────────────────────────────────────────────────────
 
+/// 单层 list 的渲染状态。
+///
+/// `leader` 是这一层 Item bullet 的起始列宽:
+/// - 顶层 list = 2(对应原 indent=1 的 2 空格基础缩进,与 User 消息视觉对齐)
+/// - 嵌套 list = 父层 leader + 父层 bullet 宽度 + 1(空格),保证子层 bullet 起点
+///   始终落在父层文字起点之后,且不论同层用的是 `•`(2 列)、`1.`(3 列)还是
+///   `10.`(4 列),文字起始列在同层内保持一致,跨嵌套时按父 bullet 宽度自适应。
+struct ListState {
+    is_ordered: bool,
+    next_n: usize,
+    leader: usize,
+}
+
+impl ListState {
+    /// 当前层下一项的 bullet 文本(用于让父层知道"如果再加嵌套层,leader 应该
+    /// 推多少列")。这只是个 hint,真正的 bullet 在 Item start 时计算并存到
+    /// `Ctx.cur_bullet`,以保证序号递增的方向与显示一致。
+    fn sample_bullet(&self) -> String {
+        if self.is_ordered {
+            format!("{}. ", self.next_n)
+        } else {
+            "• ".to_string()
+        }
+    }
+}
+
 struct Ctx {
     max_width: usize,
     /// 当前行待输出的 (文本, 样式)
     cur: Vec<(String, Style)>,
-    /// 列表栈：(有序?, 下一序号)
-    list_stack: Vec<(bool, usize)>,
-    /// 缩进层数（每层 2 空格）
-    indent: usize,
+    /// 当前 Item 的 bullet 文本。在 Item start 时设置,Item end flush 后清空。
+    /// flush 时把它放在 leader 位置前缀 spans 里,而不是塞到 cur 里被连续 push。
+    cur_bullet: Option<String>,
+    /// 列表栈,每项含 is_ordered / 下一序号 / 当前层 leader(文字起始列宽)
+    list_stack: Vec<ListState>,
     /// 行内样式计数
     strong: usize,
     em: usize,
@@ -520,8 +547,8 @@ impl Ctx {
         Self {
             max_width,
             cur: vec![],
+            cur_bullet: None,
             list_stack: vec![],
-            indent: 0,
             strong: 0,
             em: 0,
             code_span: false,
@@ -584,7 +611,7 @@ impl Ctx {
 
     /// 将累积 span 合并成一行，推入 lines
     fn flush(&mut self, lines: &mut Vec<Line<'static>>) {
-        if self.cur.is_empty() {
+        if self.cur.is_empty() && self.cur_bullet.is_none() {
             return;
         }
         let mut spans: Vec<Span<'static>> = vec![];
@@ -594,11 +621,28 @@ impl Ctx {
             spans.push(Span::styled("│ ", Theme::dim()));
         }
 
-        // 列表/段落缩进
-        if self.indent > 0 {
-            spans.push(Span::raw("  ".repeat(self.indent)));
+        // 列表 leader(嵌套累积:每层 = 父层 leader + 父层 bullet 宽度 + 1 空格)
+        // leader 含义是"这一层 bullet 起点列宽",所以前缀空格直接 = leader。
+        // 没有 bullet 的纯段落/标题不加 leader,改用下方"普通段落对齐"。
+        if let Some(bullet) = self.cur_bullet.take() {
+            let leader = self
+                .list_stack
+                .last()
+                .map(|state| state.leader)
+                .unwrap_or(0);
+            if leader > 0 {
+                spans.push(Span::raw(" ".repeat(leader)));
+            }
+            spans.push(Span::styled(bullet, Theme::assistant_prefix()));
+        } else if let Some(state) = self.list_stack.last() {
+            // list 内的纯段落(无 Item 包装的 loose 内容)按当前层 leader 缩进
+            if state.leader > 0 {
+                spans.push(Span::raw(" ".repeat(state.leader)));
+            } else if self.heading.is_none() {
+                spans.push(Span::raw("  "));
+            }
         } else if self.heading.is_none() && self.blockquote == 0 {
-            // 普通段落/列表条目加 2 空格（与 User 消息视觉对齐）
+            // 普通段落(无 list 包裹)加 2 空格与 User 消息视觉对齐
             spans.push(Span::raw("  "));
         }
 
@@ -826,19 +870,39 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
 
             // ─── 列表 ───────────────────────────────────────────────────────
             Event::Start(Tag::List(start)) => {
-                c.list_stack
-                    .push((start.is_some(), start.unwrap_or(1) as usize));
-                c.indent += 1;
+                // 进新 list 层前先把上一层的"半成品"cur flush 掉,避免上层 Item
+                // 内容被带进新层的 bullet 之后再渲染(典型症状:父 Item 文本
+                // "盘中观察" 和嵌套子项 bullet "• " 拼到一行)。同一 list 内嵌套
+                // 也是 Item 结束就会 flush,但这里覆盖 list end 之外的另一种顺序。
+                c.flush(lines);
+                // 新层 leader = 父层 leader + 父层 bullet 宽度 + 1(空格)。
+                // 顶层 list 父层为空时 leader = 2(等同原 indent=1 的 2 空格缩进)。
+                // 这样保证:同层不同 bullet 宽度(•/1./10.)的文字列对齐;嵌套
+                // 子层 bullet 起点落在父层文字起点之后,而不是按嵌套层数 ×2。
+                let leader = match c.list_stack.last() {
+                    Some(parent) => {
+                        let sample = parent.sample_bullet();
+                        parent.leader + display_width(&sample) + 1
+                    }
+                    None => 2,
+                };
+                c.list_stack.push(ListState {
+                    is_ordered: start.is_some(),
+                    next_n: start.unwrap_or(1) as usize,
+                    leader,
+                });
             }
             Event::End(TagEnd::List(_)) => {
+                // 出 list 时先把最后一个 Item 的 cur flush,然后再 pop,
+                // 否则 Item 内容会留在 cur 里被下次 flush 带错位置。
+                c.flush(lines);
                 c.list_stack.pop();
-                c.indent = c.indent.saturating_sub(1);
             }
             Event::Start(Tag::Item) => {
-                let bullet = if let Some((ordered, ref mut n)) = c.list_stack.last_mut() {
-                    if *ordered {
-                        let s = format!("{}. ", n);
-                        *n += 1;
+                let bullet = if let Some(state) = c.list_stack.last_mut() {
+                    if state.is_ordered {
+                        let s = format!("{}. ", state.next_n);
+                        state.next_n += 1;
                         s
                     } else {
                         "• ".to_string()
@@ -846,7 +910,7 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
                 } else {
                     "• ".to_string()
                 };
-                c.cur.push((bullet, Theme::assistant_prefix()));
+                c.cur_bullet = Some(bullet);
             }
             Event::End(TagEnd::Item) => {
                 c.flush(lines);
@@ -1171,5 +1235,95 @@ mod tests {
             .collect::<String>();
         assert_eq!(first_cell, "半导体指数是否守住五个点");
         assert_eq!(second_cell, "守住则继续持有");
+    }
+
+    /// 嵌套 list 对齐回归：bullet 宽度可变（`•` 2 列、`1.` 3 列、`10.` 4 列），
+    /// 子层 bullet 起始位置应对齐到父层文字起始列之后,而不是按嵌套层数 ×2。
+    ///
+    /// 修复前:
+    ///   - 嵌套 unordered 子项 bullet 起点错位 1 列,与兄弟项视觉不齐;
+    ///   - List start 时没 flush 上层 Item 内容,导致父项文本和子项 bullet 拼到一行
+    ///     ("      • 盘中观察子项 A")。
+    ///
+    /// 修复后:每层 leader = 父层 leader + 父层 bullet 宽度 + 1,
+    /// 嵌套 list 父项 / 子项 / 后续兄弟项 各自独立一行。
+    #[test]
+    fn nested_list_text_columns_align_across_bullet_widths() {
+        let text = "1. 🟢 开盘前准备\n2. 盘中观察\n   - 子项 A\n   - 子项 B\n3. 收盘";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 80);
+        let rendered = rendered_text(&lines);
+
+        // L1 ordered "1. "/ "2. "/ "3. " 宽 3 列,前缀 2 空格缩进。
+        assert!(
+            rendered[0].starts_with("  1. "),
+            "L1 ordered 第 1 项应有 2 空格缩进 + '1. ': {:?}",
+            rendered[0]
+        );
+        assert!(rendered[0].contains("开盘前准备"));
+        assert!(
+            rendered[1].starts_with("  2. "),
+            "L1 ordered 第 2 项不应被嵌套 list 吞掉: {:?}",
+            rendered[1]
+        );
+        assert!(rendered[1].contains("盘中观察"));
+        assert!(
+            rendered.last().unwrap().starts_with("  3. "),
+            "L1 ordered 第 3 项('收盘')应独立一行: {:?}",
+            rendered
+        );
+
+        // L2 unordered 子项 bullet 起点列 = L1 leader(2) + L1 bullet 宽(3) + 1
+        // = 6,文字起始列 = 6 + 2 = 8。
+        let l2_lines: Vec<&String> = rendered
+            .iter()
+            .filter(|line| line.contains("子项"))
+            .collect();
+        assert_eq!(
+            l2_lines.len(),
+            2,
+            "嵌套子项不应与父项合并,实际行: {:?}",
+            rendered
+        );
+        for line in &l2_lines {
+            let leader_cols: usize = line.chars().take_while(|c| *c == ' ').count();
+            assert_eq!(
+                leader_cols, 6,
+                "L2 子项 bullet 应在列 6(= 父 leader 2 + 父 bullet 宽 3 + 1): {:?}",
+                line
+            );
+        }
+    }
+
+    /// 多级嵌套时 leader 逐层累积。L2 子层嵌套一个 L3 unordered 子层,
+    /// L3 bullet 起点 = L2 leader + L2 bullet 宽 + 1 = 6 + 2 + 1 = 9。
+    /// 验证连续嵌套下 leader 公式正确,不会丢失任何一级缩进。
+    #[test]
+    fn triple_nested_list_leader_accumulates_per_level() {
+        let text = "1. L1-A\n   - L2-A\n     - L3-A\n2. L1-B";
+        let mut lines = vec![];
+        render_markdown(&mut lines, text, 100);
+        let rendered = rendered_text(&lines);
+
+        assert!(rendered
+            .iter()
+            .any(|l| l.starts_with("  1. ") && l.contains("L1-A")));
+        assert!(rendered
+            .iter()
+            .any(|l| l.starts_with("      ") && l.contains("L2-A")));
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.starts_with("         ") && l.contains("L3-A")),
+            "L3 bullet 应在列 9(= 6 + 2 + 1),实际行: {:?}",
+            rendered
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.starts_with("  2. ") && l.contains("L1-B")),
+            "L1-B 应独立一行,实际行: {:?}",
+            rendered
+        );
     }
 }

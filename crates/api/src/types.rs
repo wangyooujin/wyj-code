@@ -103,7 +103,10 @@ impl ToolResultContent {
         Self::Text(s.into())
     }
 
-    /// 展示用文本：Parts 中的图片以占位符表示
+    /// 展示用文本：Parts 中的图片降级为可识别占位（带 media_type 与
+    /// 基于 base64 data 长度的近似 KB），让模型明确感知这是降级标记
+    /// 而非真实文本内容。OpenAI Chat Completions 的 `role: tool` 消息
+    /// 不支持内嵌图片（参见 openai.rs:171-179），这是它的 fallback 表现。
     pub fn display_text(&self) -> String {
         match self {
             Self::Text(t) => t.clone(),
@@ -111,7 +114,11 @@ impl ToolResultContent {
                 .iter()
                 .map(|p| match p {
                     ToolResultPart::Text { text } => text.clone(),
-                    ToolResultPart::Image { media_type, .. } => format!("[image: {media_type}]"),
+                    ToolResultPart::Image { media_type, data } => {
+                        // base64 → 字节 ≈ data.len() * 3 / 4
+                        let kb = data.len().saturating_mul(3) / 4 / 1024;
+                        format!("[image omitted: media_type={}, ~{}KB]", media_type, kb)
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
