@@ -13,8 +13,16 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + '
 pub struct RequestOptions {
     pub max_tokens: u32,
     /// Extended thinking 预算 token 数；None/0 = 关闭
+    /// Anthropic 原生 / Qwen / Doubao 等支持 budget_tokens 的 vendor 走这里
     pub thinking_budget: Option<u32>,
-    /// 工具调用轮之间允许交错思考（仅 thinking 开启时生效）
+    /// OpenAI-vendor `reasoning_effort` 档位（low/medium/high/max/xhigh/auto），
+    /// DeepSeek/Qwen 互斥分支/Moonshot k3 等走这里
+    pub reasoning_effort: Option<String>,
+    /// OpenAI-vendor `thinking.type` 字符串（enabled/disabled/auto/adaptive）。
+    /// 由 profile.thinking_switch 直接透传，agent 层负责拼装；adapter 内部决定
+    /// 是否真的写到 body
+    pub thinking_switch: Option<String>,
+    /// 工具调用轮之间允许交错思考（仅 Anthropic 协议 + thinking_budget 开启时生效）
     pub interleaved: bool,
 }
 
@@ -24,19 +32,26 @@ impl RequestOptions {
         Self {
             max_tokens,
             thinking_budget: None,
+            reasoning_effort: None,
+            thinking_switch: None,
             interleaved: false,
         }
     }
 
     pub fn from_request_plan(plan: &crate::request_plan::RequestPlan) -> Self {
-        let thinking_budget = match plan.reasoning {
-            crate::request_plan::ReasoningRequest::BudgetTokens(budget) => Some(budget),
-            _ => None,
+        let (thinking_budget, reasoning_effort) = match &plan.reasoning {
+            crate::request_plan::ReasoningRequest::BudgetTokens(budget) => (Some(*budget), None),
+            crate::request_plan::ReasoningRequest::Effort(effort) => (None, Some(effort.clone())),
+            crate::request_plan::ReasoningRequest::Disabled
+            | crate::request_plan::ReasoningRequest::ProviderNative => (None, None),
         };
+        let active = thinking_budget.is_some() || reasoning_effort.is_some();
         Self {
             max_tokens: plan.max_tokens,
             thinking_budget,
-            interleaved: thinking_budget.is_some(),
+            reasoning_effort,
+            thinking_switch: None,
+            interleaved: active,
         }
     }
 }
@@ -90,6 +105,7 @@ pub trait Provider: Send + Sync {
                 StreamEvent::ThinkingStart
                 | StreamEvent::ThinkingDelta(_)
                 | StreamEvent::ThinkingSignatureDelta(_)
+                | StreamEvent::ThinkingDetailsDelta(_)
                 | StreamEvent::RedactedThinking(_) => {}
                 StreamEvent::MessageStop { stop_reason: sr } => stop_reason = sr,
                 StreamEvent::Usage {

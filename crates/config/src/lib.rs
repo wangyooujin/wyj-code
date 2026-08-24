@@ -190,6 +190,17 @@ pub struct Profile {
     /// OpenAI 协议 stream_options.include_usage 能力。None = 按 base_url/provider/model 自动判断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_stream_options: Option<bool>,
+    /// OpenAI-vendor `reasoning_effort` 档位（low/medium/high/max/xhigh/adaptive）。
+    /// 与 `thinking_budget` 互斥：同时设置时按 adapter 决定取舍（Qwen 强制互斥，
+    /// DeepSeek/Moonshot k3 仅 effort，Doubao/GLM 仅 switch）。
+    /// env var `WYJ_CODE_THINKING_EFFORT` 优先（runtime override，不写盘）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// OpenAI-vendor `thinking.type` 字符串显式覆盖（enabled/disabled/auto/adaptive）。
+    /// None = 让 adapter 按模型默认决定；Some 强制覆盖（含 MiniMax M2.x 等
+    /// vendor 默认 adaptive 也允许显式关）。env var `WYJ_CODE_THINKING_SWITCH` 优先。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_switch: Option<String>,
 }
 
 fn default_vision() -> bool {
@@ -216,6 +227,8 @@ impl Default for Profile {
             interleaved_thinking: true,
             prompt_cache: None,
             openai_stream_options: None,
+            reasoning_effort: None,
+            thinking_switch: None,
         }
     }
 }
@@ -275,6 +288,29 @@ impl Profile {
 
     pub fn effective_openai_stream_options(&self) -> bool {
         self.effective_openai_stream_options_for_model(&self.model)
+    }
+
+    /// 有效 `reasoning_effort`：env var `WYJ_CODE_THINKING_EFFORT` 优先，否则 profile。
+    /// 返回 owned String 以避免静态借用泄漏；调用方（agent 构造 opts 时）按需 clone 一次。
+    pub fn effective_reasoning_effort(&self) -> Option<String> {
+        match std::env::var("WYJ_CODE_THINKING_EFFORT")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(value),
+            None => self.reasoning_effort.clone(),
+        }
+    }
+
+    /// 有效 `thinking_switch`：env var `WYJ_CODE_THINKING_SWITCH` 优先，否则 profile。
+    pub fn effective_thinking_switch(&self) -> Option<String> {
+        match std::env::var("WYJ_CODE_THINKING_SWITCH")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(value),
+            None => self.thinking_switch.clone(),
+        }
     }
 }
 
@@ -709,6 +745,8 @@ impl From<LegacyConfigV0> for Config {
                 interleaved_thinking: true,
                 prompt_cache: None,
                 openai_stream_options: None,
+                reasoning_effort: None,
+                thinking_switch: None,
             }],
             log_level: legacy.log_level,
             language: legacy.language,

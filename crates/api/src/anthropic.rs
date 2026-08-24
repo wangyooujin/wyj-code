@@ -2,7 +2,9 @@
 //! 协议依据：https://docs.anthropic.com/en/api/messages
 
 use crate::{
+    capabilities::ModelIdentity,
     provider::{EventStream, Provider},
+    thinking::should_emit_interleaved_beta,
     types::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition},
 };
 use anyhow::{Context, Result};
@@ -12,7 +14,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use wyj_config::Config;
+use wyj_config::{Config, WireProtocol};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -25,6 +27,15 @@ pub struct AnthropicProvider {
     /// 避免非多模态端点收到 image 块直接 400 打断整轮对话。
     supports_vision: bool,
     prompt_cache: bool,
+    /// vendor 名（anthropic / zhipu / minimax / moonshot / 等）。用于 thinking adapter
+    /// dispatch，决定是否发 interleaved-thinking beta header。
+    vendor: String,
+    /// 是否官方 Anthropic 端点（profile.provider == Anthropic + base_url 为 api.anthropic.com）。
+    /// 第三方兼容端点（GLM/MiniMax/Moonshot 的 /anthropic 路径）按"无 beta"对待。
+    is_official_anthropic_endpoint: bool,
+    /// Profile 与 catalog 能力对比后被静默丢弃的参数（如用户给 thinking_budget 但
+    /// spec 不支持 budget_tokens）。stream() 入口 logging 一次，避免静默降级。
+    dropped_parameters: Vec<crate::request_plan::DroppedParameter>,
 }
 
 impl AnthropicProvider {
@@ -35,15 +46,56 @@ impl AnthropicProvider {
     pub fn with_model(cfg: &Config, model: &str) -> Result<Self> {
         let api_key = cfg.api_key()?.to_string();
         let base_url = cfg.resolved_base_url().trim_end_matches('/').to_string();
+        let profile = cfg.active_profile();
+        let vendor = profile
+            .vendor
+            .clone()
+            .unwrap_or_else(|| infer_vendor(&profile.base_url, model).to_string());
+        let dropped_parameters =
+            crate::request_plan::RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
         Ok(Self {
             client: Client::new(),
             api_key,
             base_url,
             model: model.to_string(),
-            supports_vision: cfg.active_profile().vision,
-            prompt_cache: cfg.active_profile().effective_prompt_cache(),
+            supports_vision: profile.vision,
+            prompt_cache: profile.effective_prompt_cache(),
+            vendor,
+            is_official_anthropic_endpoint: profile.is_official_anthropic_endpoint(),
+            dropped_parameters,
         })
     }
+
+    fn identity(&self) -> ModelIdentity {
+        ModelIdentity {
+            vendor: self.vendor.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            wire_protocol: WireProtocol::AnthropicMessages,
+        }
+    }
+}
+
+/// vendor 推导（fallback）。当 profile 没声明 vendor 时按 base_url + model 名粗略回退。
+fn infer_vendor(base_url: &str, model: &str) -> &'static str {
+    let base_url = base_url.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    let haystack = format!("{} {}", base_url, model);
+    for (needle, vendor) in [
+        ("api.anthropic.com", "anthropic"),
+        ("bigmodel", "zhipu"),
+        ("z.ai", "zhipu"),
+        ("glm", "zhipu"),
+        ("minimax", "minimax"),
+        ("minimaxi.com", "minimax"),
+        ("moonshot", "moonshot"),
+        ("kimi", "moonshot"),
+    ] {
+        if haystack.contains(needle) {
+            return vendor;
+        }
+    }
+    "anthropic" // 协议是 anthropic 但 vendor 未知
 }
 
 // ── 请求/响应类型 ────────────────────────────────────────────────────────────
@@ -351,6 +403,7 @@ fn to_api_messages(messages: &[Message], vision: bool) -> Vec<ApiMessage> {
                     ContentBlock::Thinking {
                         thinking,
                         signature,
+                        ..
                     } => ApiContentBlock::Thinking {
                         thinking: thinking.clone(),
                         signature: signature.clone(),
@@ -411,6 +464,17 @@ impl Provider for AnthropicProvider {
         tools: &[ToolDefinition],
         opts: &crate::provider::RequestOptions,
     ) -> Result<EventStream> {
+        if !self.dropped_parameters.is_empty() {
+            for dropped in &self.dropped_parameters {
+                tracing::info!(
+                    vendor = %self.vendor,
+                    model = %self.model,
+                    parameter = %dropped.name,
+                    reason = %dropped.reason,
+                    "Profile 参数在当前 vendor/model 下被静默丢弃（catalog 阶段判定）"
+                );
+            }
+        }
         // ── thinking 配置：budget 必须小于 max_tokens，不足时自动抬高 ──
         let thinking_budget = opts.thinking_budget.filter(|b| *b > 0);
         let max_tokens = match thinking_budget {
@@ -488,13 +552,16 @@ impl Provider for AnthropicProvider {
         // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
         let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
 
-        // beta 头：prompt caching 恒开；interleaved thinking 仅在开启时追加；
-        // 原生工具（如 computer-use）各自携带所需 beta，按需去重追加
-        let beta_header = collect_beta_header(
-            self.prompt_cache,
-            thinking_budget.is_some() && opts.interleaved,
-            tools,
-        );
+        // beta 头：prompt caching 恒开；interleaved thinking 仅在 thinking 开启
+        // 且 adapter 允许时追加——第三方 Anthropic 兼容端点（GLM/MiniMax/Moonshot
+        // 的 /anthropic 路径）默认不发 interleaved-thinking beta header，因为该
+        // header 不在它们的兼容范围内。原生工具（如 computer-use）各自携带
+        // 所需 beta，按需去重追加。
+        let identity = self.identity();
+        let interleaved_enabled = thinking_budget.is_some()
+            && opts.interleaved
+            && should_emit_interleaved_beta(&identity, self.is_official_anthropic_endpoint);
+        let beta_header = collect_beta_header(self.prompt_cache, interleaved_enabled, tools);
 
         let url = format!("{}/v1/messages", self.base_url);
         // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
@@ -682,6 +749,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: "sig".into(),
+                    reasoning_details: None,
                 },
                 ContentBlock::RedactedThinking {
                     data: "opaque".into(),

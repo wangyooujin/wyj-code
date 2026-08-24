@@ -66,8 +66,15 @@ pub enum ContentBlock {
     /// base64 图片
     Image { media_type: String, data: String },
     /// Extended thinking 块（assistant 消息内）。工具调用续轮时必须携带
-    /// signature 原样回传给 API，否则请求会被拒绝。
-    Thinking { thinking: String, signature: String },
+    /// signature 原样回传给 API，否则请求会被拒绝。`reasoning_details` 用于
+    /// 承载 MiniMax `delta.reasoning_details` 之类的结构化 reasoning 块——
+    /// 国产模型多轮工具调用场景需把 reasoning_details 拼回 messages。
+    Thinking {
+        thinking: String,
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_details: Option<Vec<serde_json::Value>>,
+    },
     /// 被安全系统加密的思考块，同样必须原样回传
     RedactedThinking { data: String },
 }
@@ -192,6 +199,10 @@ pub enum StreamEvent {
     ThinkingDelta(String),
     /// thinking 块签名增量（块结束前到达，需累积并随块回传历史）
     ThinkingSignatureDelta(String),
+    /// thinking 结构化详情片段（MiniMax `delta.reasoning_details` 数组项）。
+    /// 每项是一个 JSON 对象（`{type, text, id}` 等），由 agent 层累积后在
+    /// `ContentBlock::Thinking` 的 metadata 里原样回传给模型。
+    ThinkingDetailsDelta(serde_json::Value),
     /// 加密思考块（整块到达，原样保存回传）
     RedactedThinking(String),
     /// 消息结束

@@ -87,12 +87,20 @@ pub struct AgentRoute {
     pub profile_name: String,
     pub vendor: String,
     pub model: String,
+    /// base_url（不含密钥），用于 capability_cache.record_rejection 推导 fingerprint
+    pub base_url: String,
+    /// wire_protocol，决定 cache fingerprint 的 vendor-specific 分桶
+    pub wire_protocol: wyj_config::WireProtocol,
     pub provider: Arc<dyn Provider>,
     pub capabilities: Option<wyj_api::ModelCapabilities>,
     pub max_tokens: u32,
     pub context_window: u32,
     pub thinking_budget: Option<u32>,
     pub interleaved_thinking: bool,
+    /// OpenAI-vendor reasoning_effort 档位（low/medium/high/max/xhigh/adaptive）
+    pub reasoning_effort: Option<String>,
+    /// OpenAI-vendor thinking.type 字符串（enabled/disabled/auto/adaptive）
+    pub thinking_switch: Option<String>,
 }
 
 impl AgentRoute {
@@ -106,12 +114,16 @@ impl AgentRoute {
             profile_name: profile_name.into(),
             vendor: vendor.into(),
             model: model.into(),
+            base_url: String::new(),
+            wire_protocol: wyj_config::WireProtocol::OpenAiChatCompletions,
             provider,
             capabilities: None,
             max_tokens: 8192,
             context_window: 200_000,
             thinking_budget: None,
             interleaved_thinking: true,
+            reasoning_effort: None,
+            thinking_switch: None,
         }
     }
 
@@ -129,6 +141,29 @@ impl AgentRoute {
     pub fn with_thinking(mut self, budget: Option<u32>, interleaved: bool) -> Self {
         self.thinking_budget = budget.filter(|value| *value > 0);
         self.interleaved_thinking = interleaved;
+        self
+    }
+
+    /// OpenAI-vendor reasoning_effort 档位透传
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort.filter(|value| !value.is_empty());
+        self
+    }
+
+    /// OpenAI-vendor thinking.type 字符串透传
+    pub fn with_thinking_switch(mut self, switch: Option<String>) -> Self {
+        self.thinking_switch = switch.filter(|value| !value.is_empty());
+        self
+    }
+
+    /// 设置 base_url 与 wire_protocol（capability_cache fingerprint 推导需要）
+    pub fn with_identity(
+        mut self,
+        base_url: impl Into<String>,
+        wire_protocol: wyj_config::WireProtocol,
+    ) -> Self {
+        self.base_url = base_url.into();
+        self.wire_protocol = wire_protocol;
         self
     }
 }
@@ -175,9 +210,16 @@ pub struct Agent {
     /// Extended thinking 预算（None/0 = 关闭）与交错思考开关
     thinking_budget: Option<u32>,
     interleaved_thinking: bool,
+    /// OpenAI-vendor reasoning_effort 档位（low/medium/high/max/xhigh/adaptive）
+    reasoning_effort: Option<String>,
+    /// OpenAI-vendor thinking.type 字符串（enabled/disabled/auto/adaptive）
+    thinking_switch: Option<String>,
     route_profile_name: String,
     route_vendor: String,
     route_model: String,
+    /// 当前 route 的 base_url（不含密钥），用于 capability_cache 指纹推导。
+    route_base_url: String,
+    route_wire_protocol: wyj_config::WireProtocol,
     fallback_routes: Vec<AgentRoute>,
     active_route: Arc<AtomicUsize>,
     /// thinking 文本增量回调（TUI 展示 / headless stderr 输出）
@@ -189,6 +231,11 @@ pub struct Agent {
     /// 最近 N 次工具调用的 (name, fnv_hash(input)) 队列,用于 loop detection。
     /// 跨调用共享 state 需要内部可变性 + Clone 兼容,故用 Arc<Mutex<...>>。
     loop_guard: Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
+    /// CapabilityCache（可选）。Agent 在 `parameter_degraded` 撤掉端点不认的
+    /// 参数重试成功后调 `record_rejection`；下次同 fingerprint
+    /// `ModelCatalog::resolve_with_cache` 会让 capabilities.thinking=Unsupported。
+    /// 子 Agent 不设置，避免嵌套路径写文件。
+    capability_cache: Option<Arc<wyj_api::CapabilityCache>>,
 }
 
 struct EvolutionEpisodeGuard {
@@ -233,16 +280,29 @@ impl Agent {
             git_snapshot: None,
             thinking_budget: None,
             interleaved_thinking: true,
+            reasoning_effort: None,
+            thinking_switch: None,
             route_profile_name: "active".to_string(),
             route_vendor: "unknown".to_string(),
             route_model: "unknown".to_string(),
+            route_base_url: String::new(),
+            route_wire_protocol: wyj_config::WireProtocol::OpenAiChatCompletions,
             fallback_routes: Vec::new(),
             active_route: Arc::new(AtomicUsize::new(0)),
             thinking_cb: None,
             hook_runner: None,
             checkpoint_store: None,
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            capability_cache: None,
         }
+    }
+
+    /// 注入能力缓存：Agent 在 `parameter_degraded` 撤掉端点不认的参数重试
+    /// 成功后调 `record_rejection`，下次同 fingerprint load 时
+    /// `ModelCatalog::resolve_with_cache` 强制 capabilities.thinking=Unsupported。
+    pub fn with_capability_cache(mut self, cache: Option<Arc<wyj_api::CapabilityCache>>) -> Self {
+        self.capability_cache = cache;
+        self
     }
 
     /// 设置会话启动时的 git 状态快照（见 `git_snapshot` 字段说明）
@@ -255,6 +315,18 @@ impl Agent {
     pub fn with_thinking(mut self, budget: Option<u32>, interleaved: bool) -> Self {
         self.thinking_budget = budget.filter(|b| *b > 0);
         self.interleaved_thinking = interleaved;
+        self
+    }
+
+    /// OpenAI-vendor `reasoning_effort` 档位（low/medium/high/max/xhigh/adaptive）
+    pub fn with_reasoning_effort(mut self, effort: Option<String>) -> Self {
+        self.reasoning_effort = effort.filter(|e| !e.is_empty());
+        self
+    }
+
+    /// OpenAI-vendor `thinking.type` 字符串（enabled/disabled/auto/adaptive）
+    pub fn with_thinking_switch(mut self, switch: Option<String>) -> Self {
+        self.thinking_switch = switch.filter(|s| !s.is_empty());
         self
     }
 
@@ -568,12 +640,16 @@ impl Agent {
                 profile_name: self.route_profile_name.clone(),
                 vendor: self.route_vendor.clone(),
                 model: self.route_model.clone(),
+                base_url: self.route_base_url.clone(),
+                wire_protocol: self.route_wire_protocol.clone(),
                 provider: self.provider.clone(),
                 capabilities: self.model_capabilities.clone(),
                 max_tokens: self.max_tokens,
                 context_window: self.context_window,
                 thinking_budget: self.thinking_budget,
                 interleaved_thinking: self.interleaved_thinking,
+                reasoning_effort: self.reasoning_effort.clone(),
+                thinking_switch: self.thinking_switch.clone(),
             }
         } else {
             self.fallback_routes[index - 1].clone()
@@ -805,6 +881,10 @@ impl Agent {
                 Thinking {
                     text: String,
                     signature: String,
+                    /// MiniMax `delta.reasoning_details` 数组项累积。多轮工具调用
+                    /// 场景必须把 reasoning_details 拼回 messages 才能让 reasoning
+                    /// 完整保留；国产 reasoning 模型通用。
+                    details: Vec<serde_json::Value>,
                 },
                 Redacted(String),
                 ToolUse {
@@ -833,6 +913,10 @@ impl Agent {
                                 wyj_api::ThinkingMode::BudgetTokens
                             )
                         }),
+                        reasoning_effort: route.reasoning_effort.clone().filter(|_| {
+                            matches!(capabilities.thinking.value, wyj_api::ThinkingMode::Effort)
+                        }),
+                        thinking_switch: route.thinking_switch.clone(),
                         interleaved: route.interleaved_thinking
                             && capabilities.interleaved_thinking.value,
                     }
@@ -840,6 +924,8 @@ impl Agent {
                     wyj_api::provider::RequestOptions {
                         max_tokens: route.max_tokens,
                         thinking_budget: route.thinking_budget,
+                        reasoning_effort: route.reasoning_effort.clone(),
+                        thinking_switch: route.thinking_switch.clone(),
                         interleaved: route.interleaved_thinking,
                     }
                 };
@@ -941,9 +1027,27 @@ impl Agent {
                                 parameter_degraded = true;
                                 effective_opts.thinking_budget = None;
                                 effective_opts.interleaved = false;
-                                on_text(&format!(
-                                    "\n[模型端点不支持参数 `{parameter}`，已安全移除后重试一次]\n"
+                                on_text(&wyj_i18n::tr_fmt(
+                                    "agent.degraded.parameter_removed",
+                                    &[("name", parameter)],
                                 ));
+                                // 持久化拒绝记录：下次同 fingerprint resolve 时
+                                // 直接 capabilities.thinking=Unsupported，不再触发 400。
+                                if let Some(cache) = &self.capability_cache {
+                                    let identity = wyj_api::ModelIdentity {
+                                        vendor: route.vendor.clone(),
+                                        model: route.model.clone(),
+                                        base_url: wyj_api::capabilities::sanitized_base_url(
+                                            &route.base_url,
+                                        ),
+                                        wire_protocol: route.wire_protocol.clone(),
+                                    };
+                                    cache.record_rejection(
+                                        &identity,
+                                        parameter,
+                                        "endpoint returned 4xx for unsafe parameter",
+                                    );
+                                }
                                 continue;
                             }
                             if let Some((next, kind)) = self.advance_route(route_index, &error) {
@@ -1006,6 +1110,7 @@ impl Agent {
                                 blocks.push(StreamedBlock::Thinking {
                                     text: String::new(),
                                     signature: String::new(),
+                                    details: Vec::new(),
                                 });
                             }
                             StreamEvent::ThinkingDelta(delta) => {
@@ -1022,6 +1127,7 @@ impl Agent {
                                     _ => blocks.push(StreamedBlock::Thinking {
                                         text: delta,
                                         signature: String::new(),
+                                        details: Vec::new(),
                                     }),
                                 }
                             }
@@ -1030,6 +1136,20 @@ impl Agent {
                                     blocks.last_mut()
                                 {
                                     signature.push_str(&sig);
+                                }
+                            }
+                            StreamEvent::ThinkingDetailsDelta(item) => {
+                                // MiniMax reasoning_details 累积到当前 thinking 块；
+                                // 不存在 thinking 块时新建一个空 text 块附带 details。
+                                match blocks.last_mut() {
+                                    Some(StreamedBlock::Thinking { details, .. }) => {
+                                        details.push(item);
+                                    }
+                                    _ => blocks.push(StreamedBlock::Thinking {
+                                        text: String::new(),
+                                        signature: String::new(),
+                                        details: vec![item],
+                                    }),
                                 }
                             }
                             StreamEvent::RedactedThinking(data) => {
@@ -1169,10 +1289,20 @@ impl Agent {
                             assistant_blocks.push(ContentBlock::Text { text: t.clone() });
                         }
                     }
-                    StreamedBlock::Thinking { text, signature } => {
+                    StreamedBlock::Thinking {
+                        text,
+                        signature,
+                        details,
+                    } => {
+                        let reasoning_details = if details.is_empty() {
+                            None
+                        } else {
+                            Some(details.clone())
+                        };
                         assistant_blocks.push(ContentBlock::Thinking {
                             thinking: text.clone(),
                             signature: signature.clone(),
+                            reasoning_details,
                         });
                     }
                     StreamedBlock::Redacted(data) => {
@@ -3022,7 +3152,9 @@ mod tests {
             .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
             .await
             .unwrap();
-        assert!(visible.contains("已安全移除后重试一次"));
+        // i18n: agent.degraded.parameter_removed。中文翻译：模型端点不支持参数 `{name}`，已安全移除后重试一次
+        let msg = wyj_i18n::tr_fmt("agent.degraded.parameter_removed", &[("name", "thinking")]);
+        assert!(visible.contains(&msg), "expected {msg:?} in {visible:?}");
         assert_eq!(session.api_calls, 2);
     }
 
@@ -3317,6 +3449,7 @@ mod tests {
                         ContentBlock::Thinking {
                             thinking,
                             signature,
+                            ..
                         },
                         ContentBlock::ToolUse { .. },
                     ) => {
