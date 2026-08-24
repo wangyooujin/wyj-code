@@ -415,7 +415,6 @@ enum EvolutionAnalysisMode {
     GovernanceOnly,
 }
 
-
 fn schema_version() -> u32 {
     EVOLUTION_SCHEMA_VERSION
 }

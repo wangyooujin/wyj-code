@@ -19,6 +19,8 @@ Qwen/百炼、豆包/火山以及其他协议兼容端点。
 [更新日志](./CHANGELOG.md) ·
 [贡献指南](./CONTRIBUTING.md)
 
+[国产模型适配体验对比报告](./doc/analysis/domestic-models-vs-claude-code.md) — DeepSeek / GLM / Kimi / Qwen / 豆包 / MiniMax 与 Claude Code / Codex 的能力对照、踩坑与最佳实践。
+
 > **版本状态**：最新公开版本是
 > [v1.5.6](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6)。历史 tag 保持不可移动，
 > 一键安装脚本始终下载 GitHub 最新公开 Release。

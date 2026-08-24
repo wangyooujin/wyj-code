@@ -175,6 +175,12 @@ help:
     - `Normal` — 默认模式，工具调用前弹出权限确认对话框
     - `Plan` — 只读模式，允许 read/glob/grep/web_fetch/bash/write(计划文件)/ExitPlanMode
     - `Bypass` — 跳过所有权限确认，自动批准工具调用
+
+    ---
+
+    ## 报告
+
+    国产模型适配体验对比、踩坑与最佳实践（DeepSeek/GLM/Kimi/Qwen/豆包/MiniMax vs Claude Code/Codex）：[doc/analysis/domestic-models-vs-claude-code.md](https://github.com/wangyooujin/wyj-code/blob/master/doc/analysis/domestic-models-vs-claude-code.md)
   custom_commands_header: "自定义命令"
 
 evolve:

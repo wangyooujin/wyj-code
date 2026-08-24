@@ -8994,6 +8994,24 @@ fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
         ),
         format!("probe: {}", report.probe_status),
     ];
+    // v1.5.7 国产配置体检:把 profile 原始字段 + 推导后的 effective 值并列显示,
+    // 让用户一眼能看出当前 provider/base_url/字段是否与协议匹配。
+    lines.push(format!(
+        "profile: thinking_budget={} · prompt_cache={:?}→effective={} · stream_options={:?}→effective={} · vision={} · base_url={}",
+        report
+            .profile_thinking_budget
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "None".to_string()),
+        report.profile_prompt_cache,
+        report.effective_prompt_cache,
+        report.profile_openai_stream_options,
+        report.effective_stream_options,
+        report.profile_vision,
+        report.profile_base_url,
+    ));
+    if report.requires_supplier_usage {
+        lines.push("usage: 依赖供应商返回精确 token 数(message_delta / 最终 chunk)".to_string());
+    }
     lines.extend(
         report
             .known_degradations
