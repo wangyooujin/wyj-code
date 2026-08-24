@@ -1319,8 +1319,9 @@ pub fn settings_field_kind(_idx: usize) -> SettingsFieldKind {
 
 // ── 分组（Profile）管理面板：/model 命令触发 ──────────────────────────────────
 
-/// 单个分组的可编辑字段数（provider/model/plan_model/exec_model/base_url/api_key/max_tokens/context_window）
-pub const PROFILE_FIELD_COUNT: usize = 8;
+/// 单个分组的可编辑字段数（provider/model/plan_model/exec_model/base_url/api_key/
+/// max_tokens/context_window/reasoning_effort/thinking_switch）
+pub const PROFILE_FIELD_COUNT: usize = 10;
 
 /// 分组字段对应的 i18n label key，复用 /config 时代已有的 settings.field.* key
 pub const PROFILE_FIELD_LABEL_KEYS: [&str; PROFILE_FIELD_COUNT] = [
@@ -1332,6 +1333,8 @@ pub const PROFILE_FIELD_LABEL_KEYS: [&str; PROFILE_FIELD_COUNT] = [
     "settings.field.api_key",
     "settings.field.max_tokens",
     "settings.field.context_window",
+    "settings.field.reasoning_effort",
+    "settings.field.thinking_switch",
 ];
 
 /// api_key 字段索引（渲染时需要打码）
@@ -1372,6 +1375,10 @@ pub struct ProfileEntryDraft {
     pub interleaved_thinking: bool,
     pub prompt_cache: Option<bool>,
     pub openai_stream_options: Option<bool>,
+    /// OpenAI-vendor reasoning_effort 档位（low/medium/high/max/xhigh/adaptive）
+    pub reasoning_effort: String,
+    /// OpenAI-vendor thinking.type 字符串（enabled/disabled/auto/adaptive）
+    pub thinking_switch: String,
 }
 
 impl ProfileEntryDraft {
@@ -1397,6 +1404,8 @@ impl ProfileEntryDraft {
             interleaved_thinking: p.interleaved_thinking,
             prompt_cache: p.prompt_cache,
             openai_stream_options: p.openai_stream_options,
+            reasoning_effort: p.reasoning_effort.clone().unwrap_or_default(),
+            thinking_switch: p.thinking_switch.clone().unwrap_or_default(),
         }
     }
 
@@ -1428,6 +1437,8 @@ impl ProfileEntryDraft {
             interleaved_thinking: true,
             prompt_cache: t.prompt_cache,
             openai_stream_options: t.openai_stream_options,
+            reasoning_effort: String::new(),
+            thinking_switch: String::new(),
         }
     }
 
@@ -1448,6 +1459,8 @@ impl ProfileEntryDraft {
             5 => &self.api_key,
             6 => &self.max_tokens,
             7 => &self.context_window,
+            8 => &self.reasoning_effort,
+            9 => &self.thinking_switch,
             _ => "",
         }
     }
@@ -1461,6 +1474,8 @@ impl ProfileEntryDraft {
             5 => self.api_key = value,
             6 => self.max_tokens = value,
             7 => self.context_window = value,
+            8 => self.reasoning_effort = value,
+            9 => self.thinking_switch = value,
             _ => {}
         }
     }
@@ -1524,6 +1539,16 @@ impl ProfileEntryDraft {
             interleaved_thinking: self.interleaved_thinking,
             prompt_cache: self.prompt_cache,
             openai_stream_options: self.openai_stream_options,
+            reasoning_effort: if self.reasoning_effort.trim().is_empty() {
+                None
+            } else {
+                Some(self.reasoning_effort.trim().to_string())
+            },
+            thinking_switch: if self.thinking_switch.trim().is_empty() {
+                None
+            } else {
+                Some(self.thinking_switch.trim().to_string())
+            },
         }
     }
 }

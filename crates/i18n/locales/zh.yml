@@ -51,6 +51,17 @@ subagent_trace:
 
 thinking:
   done: "✻ 已思考 {secs}s（{lines} 行）"
+  status:
+    budget: "🧠 budget={n}"
+    effort: "🧠 effort={e}"
+    disabled: "🧠 off"
+    locked: "🧠 forced (vendor={v})"
+    dropped: "⚠ dropped: {params}"
+  dropped:
+    parameter: "已忽略 reasoning 参数 `{name}`：{reason}"
+agent:
+  degraded:
+    parameter_removed: "[模型端点不支持参数 `{name}`，已安全移除后重试一次]"
 
 claude_md:
   source:

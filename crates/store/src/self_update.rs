@@ -123,36 +123,87 @@ pub fn release_assets<'a>(
 }
 
 /// 下载归档 + 校验和文件，校验一致后返回归档原始字节。
+///
+/// `softprops/action-gh-release` 在所有 asset upload 完成前就会 publish
+/// release metadata,所以刚 release 完跑 `wyj-code update` 经常撞上
+/// "release 已存在但 archive / sha256 还没出现"的窗口,GitHub 返回 404。
+/// 这里对 archive 和 sha256 都做指数退避 retry(5s / 10s / 20s),覆盖 CI
+/// 收尾的最后阶段;非 4xx/5xx 的瞬时网络错误也复用同一条 retry 路径。
 pub async fn download_and_verify(
     client: &reqwest::Client,
     archive_url: &str,
     sha256_url: &str,
     archive_name: &str,
 ) -> Result<Vec<u8>> {
-    let archive_bytes = client
-        .get(archive_url)
-        .send()
-        .await
-        .with_context(|| format!("下载安装包失败: {archive_url}"))?
-        .error_for_status()
-        .with_context(|| format!("下载安装包返回错误状态: {archive_url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("读取安装包内容失败: {archive_url}"))?;
+    const MAX_RETRIES: u32 = 3;
+    const INITIAL_BACKOFF_SECS: u64 = 5;
+    let archive_bytes = download_with_retry(
+        client,
+        archive_url,
+        MAX_RETRIES,
+        INITIAL_BACKOFF_SECS,
+        "下载安装包",
+    )
+    .await?;
+    let sha256_text = download_with_retry(
+        client,
+        sha256_url,
+        MAX_RETRIES,
+        INITIAL_BACKOFF_SECS,
+        "下载校验和文件",
+    )
+    .await?;
 
-    let sha256_text = client
-        .get(sha256_url)
-        .send()
-        .await
-        .with_context(|| format!("下载校验和文件失败: {sha256_url}"))?
-        .error_for_status()
-        .with_context(|| format!("下载校验和文件返回错误状态: {sha256_url}"))?
-        .text()
-        .await
-        .with_context(|| format!("读取校验和文件内容失败: {sha256_url}"))?;
-
-    verify_sha256(&archive_bytes, &sha256_text, archive_name)?;
+    let sha256_text = std::str::from_utf8(&sha256_text)
+        .with_context(|| format!("下载校验和文件不是合法 UTF-8: {sha256_url}"))?;
+    verify_sha256(&archive_bytes, sha256_text, archive_name)?;
     Ok(archive_bytes.to_vec())
+}
+
+/// 下载一个文件并把字节/文本返回。404 / 429 / 5xx 走指数退避 retry,
+/// 其它 HTTP 错误一次性报错。`action_label` 用于错误文案(如"下载安装包")。
+/// `initial_backoff_secs` 暴露出来便于测试用 0 跳过等待,prod 固定 5s 起步。
+async fn download_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    max_retries: u32,
+    initial_backoff_secs: u64,
+    action_label: &str,
+) -> Result<Vec<u8>> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            let delay_secs = initial_backoff_secs << (attempt - 1);
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
+        let resp = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err =
+                    Some(anyhow::Error::new(e).context(format!("{action_label} 网络错误: {url}")));
+                continue;
+            }
+        };
+        let status = resp.status();
+        // 404 / 429 / 5xx 视为可重试;其它 4xx 直接报错。
+        if status.as_u16() == 404 || status.as_u16() == 429 || status.is_server_error() {
+            last_err = Some(anyhow!(
+                "{action_label} 返回可重试状态 {status}: {url} (第 {}/{} 次)",
+                attempt + 1,
+                max_retries
+            ));
+            continue;
+        }
+        if !status.is_success() {
+            return Err(anyhow!("{action_label} 返回错误状态 {status}: {url}"));
+        }
+        return resp
+            .bytes()
+            .await
+            .map(|b| b.to_vec())
+            .with_context(|| format!("读取 {action_label} 内容失败: {url}"));
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("{action_label} 失败,已重试 {max_retries} 次: {url}")))
 }
 
 /// `sha256_text` 可以是独立 sidecar，也可以是包含多平台条目的 `SHA256SUMS`。
@@ -529,5 +580,142 @@ mod tests {
             assets: vec![],
         };
         assert_eq!(info.version(), "1.2.3");
+    }
+
+    /// 404 是 `softprops/action-gh-release` 在 release metadata 已 publish 但
+    /// archive / sha256 还没 upload 完成时 GitHub 返回的状态。retry 必须吃掉这个
+    /// race window,最终成功。`initial_backoff_secs=0` 让测试不需要等 5s。
+    #[tokio::test]
+    async fn download_with_retry_succeeds_after_initial_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let n = hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = if n == 0 {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 256];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/archive.tar.gz");
+        let bytes = download_with_retry(&client, &url, 3, 0, "test")
+            .await
+            .expect("404 后第二次返回 200 应最终成功");
+        assert_eq!(bytes, b"hello");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "应恰好 2 次 HTTP 请求:首次 404,重试 200"
+        );
+        server.abort();
+    }
+
+    /// 持续 404 / 5xx 时,retry 耗尽应报错,而不是无限循环。
+    #[tokio::test]
+    async fn download_with_retry_gives_up_after_max_retries() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 256];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/archive.tar.gz");
+        let err = download_with_retry(&client, &url, 3, 0, "test")
+            .await
+            .expect_err("持续 404 必须失败");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("第 3/3") || msg.contains("第 2/3"),
+            "错误信息应反映已重试到第 N 次: {msg}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "应恰好 3 次 HTTP 请求(MAX_RETRIES=3)"
+        );
+        server.abort();
+    }
+
+    /// 端到端：download_and_verify 内部已经分别调 download_with_retry
+    /// 处理 archive 和 sha256。我们用 listener 直接 mock 一对 HTTP endpoint,
+    /// 第一次 GET /archive 返回 404、第二次返回真实 tar 字节(校验和不匹配的
+    /// archive 应被 verify_sha256 拒绝);sha256 第一次就返回正确 sidecar,
+    /// 验证整体流程在 archive retry 后能拉到正确内容并通过校验。
+    /// 这里不直接调用 download_and_verify(因为它 hardcode 5s backoff),
+    /// 而是分别验证 archive 与 sha256 各自的 retry 行为已通过上面两个
+    /// download_with_retry 测试覆盖,验证 sha256 单点路径(没有 retry 触发)。
+    #[tokio::test]
+    async fn download_with_retry_returns_sha256_sidecar_on_first_try() {
+        let sidecar = "abc123  wyj-code-1.5.7.tar.gz\n";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sidecar_clone = sidecar.to_string();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                hits_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = sidecar_clone.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 256];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/archive.tar.gz.sha256");
+        let bytes = download_with_retry(&client, &url, 3, 0, "test")
+            .await
+            .expect("首次 200 应直接成功");
+        assert_eq!(bytes, sidecar.as_bytes());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
     }
 }

@@ -10,6 +10,8 @@ use crate::capabilities::{
     sanitized_base_url, Capability, CapabilitySource, Confidence, ModelCapabilities, ModelIdentity,
     ModelQuirk, PromptCacheMode, PromptDialect, ThinkingMode,
 };
+use crate::capability_cache::CapabilityCache;
+use crate::thinking::{ThinkingControl, ThinkingSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +38,17 @@ pub struct ModelCatalog;
 
 impl ModelCatalog {
     pub fn resolve(profile: &Profile, model_override: Option<&str>) -> CatalogResolution {
+        Self::resolve_with_cache(profile, model_override, None)
+    }
+
+    /// 带 capability cache 的 resolve 版本。`cache` 为 Some 且命中时，把
+    /// `rejected_parameters` 里出现过的 thinking 系列参数强制标 Unsupported，
+    /// 避免下次 stream() 又发端点已确认不认的字段。
+    pub fn resolve_with_cache(
+        profile: &Profile,
+        model_override: Option<&str>,
+        cache: Option<&CapabilityCache>,
+    ) -> CatalogResolution {
         let model = model_override.unwrap_or(&profile.model);
         let vendor = profile
             .vendor
@@ -51,6 +64,9 @@ impl ModelCatalog {
         };
 
         let mut capabilities = base_capabilities(profile, model, &vendor, &wire_protocol);
+        if let Some(cache) = cache {
+            apply_rejected_parameters(cache, &identity, &mut capabilities);
+        }
         let (endpoint_type, verification_status, known_degradations, documentation_url) =
             catalog_metadata(profile, &vendor);
 
@@ -73,6 +89,38 @@ impl ModelCatalog {
     }
 }
 
+/// 把 cache 里 `rejected_parameters` 中的 thinking 系列参数反映到 capabilities：
+/// 强制 `capabilities.thinking` 为 `Unsupported` 并把 source 标为 `UserOverride`
+/// （端点运行时拒绝 = 用户实际不能开）。幂等：多次调用无副作用。
+fn apply_rejected_parameters(
+    cache: &CapabilityCache,
+    identity: &ModelIdentity,
+    capabilities: &mut ModelCapabilities,
+) {
+    let Ok(Some(record)) = cache.load(identity) else {
+        return;
+    };
+    let blocked = record.rejected_parameters.iter().any(|r| {
+        matches!(
+            r.parameter.as_str(),
+            "thinking"
+                | "thinking_budget"
+                | "interleaved_thinking"
+                | "reasoning_effort"
+                | "thinking_switch"
+        )
+    });
+    if blocked {
+        capabilities.thinking = Capability::new(
+            ThinkingMode::Unsupported,
+            CapabilitySource::UserOverride,
+            Confidence::High,
+        );
+        capabilities.interleaved_thinking =
+            Capability::new(false, CapabilitySource::UserOverride, Confidence::High);
+    }
+}
+
 fn base_capabilities(
     profile: &Profile,
     model: &str,
@@ -83,14 +131,35 @@ fn base_capabilities(
     let is_local = matches!(vendor, "ollama" | "vllm");
     let tool_calling = !is_local || model.to_ascii_lowercase().contains("tool");
     let parallel_tools = is_reference;
-    let thinking = if profile.thinking_budget.unwrap_or(0) > 0 {
-        Capability::new(
+    let thinking = match ThinkingSpec::for_vendor(vendor, wire_protocol, model).control {
+        ThinkingControl::Disabled => protocol_cap(ThinkingMode::Unsupported),
+        ThinkingControl::BudgetOnly => Capability::new(
             ThinkingMode::BudgetTokens,
-            CapabilitySource::UserOverride,
-            Confidence::High,
-        )
-    } else {
-        protocol_cap(ThinkingMode::Unsupported)
+            CapabilitySource::VerifiedCatalog,
+            Confidence::Medium,
+        ),
+        ThinkingControl::SwitchPlusBudget => {
+            if ThinkingSpec::for_vendor(vendor, wire_protocol, model).budget_tokens_supported {
+                Capability::new(
+                    ThinkingMode::BudgetTokens,
+                    CapabilitySource::VerifiedCatalog,
+                    Confidence::Medium,
+                )
+            } else {
+                Capability::new(
+                    ThinkingMode::Effort,
+                    CapabilitySource::VerifiedCatalog,
+                    Confidence::Medium,
+                )
+            }
+        }
+        ThinkingControl::SwitchPlusEffort
+        | ThinkingControl::EffortOnly
+        | ThinkingControl::SwitchOnly => Capability::new(
+            ThinkingMode::Effort,
+            CapabilitySource::VerifiedCatalog,
+            Confidence::Medium,
+        ),
     };
     let prompt_cache = if profile.effective_prompt_cache() {
         static_cap(PromptCacheMode::ExplicitBreakpoints)
@@ -265,48 +334,55 @@ mod tests {
 
     #[test]
     fn resolves_all_required_model_families_without_claiming_live_verification() {
-        for (base_url, model, vendor, status) in [
+        for (base_url, model, vendor, status, expected_thinking) in [
             (
                 "https://open.bigmodel.cn/api/anthropic",
                 "glm-5.2",
                 "zhipu",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::Effort,
             ),
             (
                 "https://api.minimaxi.com/v1",
                 "MiniMax-M2",
                 "minimax",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::Effort,
             ),
             (
                 "https://api.moonshot.cn/anthropic",
                 "kimi-k2",
                 "moonshot",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::Effort,
             ),
             (
                 "https://api.deepseek.com",
                 "deepseek-chat",
                 "deepseek",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::Effort,
             ),
             (
                 "https://dashscope.aliyuncs.com/compatible-mode/v1",
                 "qwen3-coder-plus",
                 "alibaba",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::BudgetTokens,
             ),
             (
                 "https://ark.cn-beijing.volces.com/api/v3",
                 "doubao-seed-code",
                 "volcengine",
                 VerificationStatus::StaticOnly,
+                ThinkingMode::BudgetTokens,
             ),
             (
                 "http://127.0.0.1:11434/v1",
                 "qwen3-coder",
                 "ollama",
                 VerificationStatus::Experimental,
+                ThinkingMode::Unsupported,
             ),
         ] {
             let profile = Profile {
@@ -318,7 +394,85 @@ mod tests {
             let resolution = ModelCatalog::resolve(&profile, None);
             assert_eq!(resolution.identity.vendor, vendor);
             assert_eq!(resolution.verification_status, status);
+            assert_eq!(
+                resolution.capabilities.thinking.value, expected_thinking,
+                "vendor={vendor} model={model} expected {expected_thinking:?}, got {:?}",
+                resolution.capabilities.thinking.value
+            );
         }
+    }
+
+    /// 阶段 3：能力目录按 vendor 准确标注 thinking 形态。
+    /// 核心契约：catalog 阶段 ThinkingSpec 是唯一真值，不再由 profile.thinking_budget
+    /// 一刀切决定。profile 没有 budget 时 capabilities.thinking 仍按 vendor 表达，
+    /// 这样 RequestPlan.from_capabilities 能正确翻译 ReasoningRequest。
+    #[test]
+    fn thinking_capability_follows_vendor_spec_not_profile_budget() {
+        // Anthropic 官方端点 → BudgetTokens
+        let profile = Profile {
+            provider: Provider::Anthropic,
+            vendor: Some("anthropic".to_string()),
+            model: "claude-opus-4-8".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::BudgetTokens);
+
+        // Qwen SwitchPlusBudget + budget_tokens_supported=true → BudgetTokens
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("alibaba".to_string()),
+            model: "qwen3-coder-plus".to_string(),
+            base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::BudgetTokens);
+
+        // DeepSeek SwitchPlusEffort → Effort
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("deepseek".to_string()),
+            model: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::Effort);
+
+        // GLM SwitchOnly → Effort
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("zhipu".to_string()),
+            model: "glm-4.6".to_string(),
+            base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::Effort);
+
+        // Ollama 非 think 模型 → Unsupported
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("ollama".to_string()),
+            model: "llama3".to_string(),
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::Unsupported);
+
+        // MiniMax M3 SwitchOnly → Effort
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("minimax".to_string()),
+            model: "MiniMax-M3".to_string(),
+            base_url: "https://api.minimaxi.com/v1".to_string(),
+            ..Profile::default()
+        };
+        let res = ModelCatalog::resolve(&profile, None);
+        assert_eq!(res.capabilities.thinking.value, ThinkingMode::Effort);
     }
 
     #[test]

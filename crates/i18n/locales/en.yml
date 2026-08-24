@@ -52,6 +52,17 @@ subagent_trace:
 
 thinking:
   done: "✻ Thought for {secs}s ({lines} lines)"
+  status:
+    budget: "🧠 budget={n}"
+    effort: "🧠 effort={e}"
+    disabled: "🧠 off"
+    locked: "🧠 forced (vendor={v})"
+    dropped: "⚠ dropped: {params}"
+  dropped:
+    parameter: "Ignored reasoning parameter `{name}`: {reason}"
+agent:
+  degraded:
+    parameter_removed: "[Model endpoint does not support parameter `{name}`; safely removed and retrying]"
 
 claude_md:
   source:
