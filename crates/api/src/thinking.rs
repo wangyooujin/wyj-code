@@ -872,6 +872,108 @@ mod tests {
             "MiniMax-M3",
         );
         assert!(spec.user_can_disable);
+        assert_eq!(spec.control, ThinkingControl::SwitchOnly);
+        // M3 spec 没有 effort 档位——adapter 必然不会写 reasoning_effort，
+        // 即便用户在 Profile 里配了 effort（RequestPlan::from_capabilities 也会
+        // 因为 capabilities.thinking != Effort 而把 effort 标记为 dropped，
+        // 不会进入 opts.reasoning_effort）。
+        assert!(spec.effort_levels.is_empty());
+        assert!(!spec.budget_tokens_supported);
+    }
+
+    /// M3 路径：spec 是 SwitchOnly，adapter 即便收到 `reasoning_effort` 也不上送。
+    /// 这是 v1.5.9 回归保护——以后误改 adapter 引入 effort 分支立刻在这里爆。
+    #[test]
+    fn minimax_m3_apply_does_not_emit_reasoning_effort() {
+        let id = identity(
+            "minimax",
+            WireProtocol::OpenAiChatCompletions,
+            "MiniMax-M3",
+        );
+        let adapter = adapter_for(&id);
+
+        // 显式打开 switch + 显式配 effort——两者都给，验证 effort 被无视。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("high".to_string()),
+            thinking_switch: Some("enabled".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "MiniMax M3 SwitchOnly 不应上送 reasoning_effort: {body:?}"
+        );
+
+        // 只配 effort、不配 switch：effective_switch_type 会因为 effort 非空而
+        // 回落到默认 "enabled"，body 写 thinking + reasoning_split；
+        // 但 SwitchOnly 仍不上送 effort 本身。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// M3 + `thinking_switch = "disabled"`：body 写 thinking.type="disabled"，
+    /// 按当前 adapter 实现同时写 reasoning_split=true（关掉也写，
+    /// 让服务端回包时仍走分字段路径；这是当前代码事实，不是建议）。
+    /// 该测试冻结这个行为，避免后续静默改动。
+    #[test]
+    fn minimax_m3_disabled_switch_writes_disabled_type_and_split() {
+        let adapter = adapter_for(&identity(
+            "minimax",
+            WireProtocol::OpenAiChatCompletions,
+            "MiniMax-M3",
+        ));
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            thinking_switch: Some("disabled".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+    }
+
+    /// M3 + 完全没设任何开关：effective_switch_type 返回 None，body 不动。
+    /// 这是 SwitchOnly vendor 的"用户没说就什么都不发"基线。
+    #[test]
+    fn minimax_m3_no_switch_leaves_body_untouched() {
+        let adapter = adapter_for(&identity(
+            "minimax",
+            WireProtocol::OpenAiChatCompletions,
+            "MiniMax-M3",
+        ));
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert!(body.is_empty(), "不应写入任何 thinking 字段: {body:?}");
+    }
+
+    /// MiniMax 走 OpenAI 协议——interleaved-thinking beta 永远不发，
+    /// 即便 base_url 指向官方 Anthropic 兼容端点也不发。
+    #[test]
+    fn minimax_never_emits_interleaved_beta() {
+        let adapter = adapter_for(&identity(
+            "minimax",
+            WireProtocol::OpenAiChatCompletions,
+            "MiniMax-M3",
+        ));
+        assert!(!adapter.emit_interleaved_beta(false));
+        assert!(!adapter.emit_interleaved_beta(true));
     }
 
     #[test]

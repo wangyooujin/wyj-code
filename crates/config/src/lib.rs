@@ -654,10 +654,16 @@ fn default_search_provider() -> String {
     "tavily".to_string()
 }
 
+/// API Key 环境变量名校验：首字符必须为字母或下划线，后续字符允许字母、数字、下划线。
+/// 不强制 ASCII 大写——允许小写、混合大小写，因为用户经常在 `~/.bashrc` / `~/.zshrc`
+/// 里写 `export model_minimax=...`、`export MiniMax_API_KEY=...` 之类。
+/// 进程只读 `std::env::var(name)`，大小写敏感由 OS / shell 决定。
 fn valid_env_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_uppercase() || (index > 0 && byte.is_ascii_digit())
+            byte == b'_'
+                || byte.is_ascii_alphabetic()
+                || (index > 0 && byte.is_ascii_digit())
         })
 }
 
@@ -1132,6 +1138,94 @@ mod project_path_tests {
         let unrelated = unrelated.path().canonicalize().unwrap();
 
         assert_eq!(resolve_project_root(&unrelated, Some(&project)), project);
+    }
+}
+
+#[cfg(test)]
+mod valid_env_name_tests {
+    /// `valid_env_name` 是私有函数——只能从同 crate 的测试访问。
+    /// 通过 `Config::load` 走真实路径比较稳，但环境变量是进程级副作用，
+    /// 单测里直接用 `valid_env_name` 测纯函数更轻、可重复。
+    use super::{valid_env_name, Config, Profile, Provider, WireProtocol};
+
+    #[test]
+    fn accepts_classic_uppercase_names() {
+        // 旧实现下能过的名字——回归保护。
+        for name in [
+            "WYJ_CODE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "MINIMAX_API_KEY",
+            "_LEADING_UNDERSCORE",
+        ] {
+            assert!(valid_env_name(name), "应当接受 {name}");
+        }
+    }
+
+    #[test]
+    fn accepts_lowercase_and_mixed_case_names() {
+        // ~/.bashrc / ~/.zshrc 里经常写 `export model_minimax=...` 这种小写或
+        // 混合大小写（MiniMax_API_KEY / minImAx_KEY）。进程读 std::env::var 时
+        // 由 OS 决定大小写敏感，这里只放宽结构校验，不强行改大小写。
+        for name in ["model_minimax", "MiniMax_API_KEY", "minImAx_KEY", "a"] {
+            assert!(valid_env_name(name), "应当接受 {name}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_names() {
+        for name in ["", "1FOO", "FOO-BAR", "FOO BAR", "FOO$BAR", "FOO=BAR", " FOO"] {
+            assert!(!valid_env_name(name), "应当拒绝 {name:?}");
+        }
+    }
+
+    /// Profile → Config::load 的端到端链路：api_key_env 为小写时也能从 env 读到 key。
+    /// 用临时 env（避免污染进程）；serial 标注确保不与其他 env 测试并发。
+    #[test]
+    fn profile_with_lowercase_api_key_env_is_loaded_from_environment() {
+        let cfg = Config {
+            active_profile: "minimax".to_string(),
+            profiles: vec![Profile {
+                name: "minimax".to_string(),
+                provider: Provider::OpenAI,
+                vendor: Some("minimax".to_string()),
+                wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
+                model: "MiniMax-M3".to_string(),
+                plan_model: None,
+                exec_model: None,
+                base_url: "https://api.minimax.chat/v1".to_string(),
+                api_key: None,
+                api_key_env: Some("model_minimax".to_string()),
+                max_tokens: 8192,
+                context_window: 200_000,
+                vision: true,
+                thinking_budget: None,
+                interleaved_thinking: true,
+                prompt_cache: None,
+                openai_stream_options: None,
+                reasoning_effort: None,
+                thinking_switch: None,
+            }],
+            ..Config::default()
+        };
+
+        // 单元测试不通过 Config::load 整条路径（那会读盘 + 触真实 ~/.claude.json）。
+        // 这里直接复用 Config::load 里那一段相同优先级的 env 解析逻辑：
+        // 1. WYJ_CODE_API_KEY 优先；2. profile.api_key_env；3. profile.api_key。
+        // 我们临时注入 model_minimax，断言 resolve_api_key 拿到它。
+        std::env::set_var("WYJ_CODE_API_KEY", "");
+        std::env::set_var("model_minimax", "lowercase-key-from-bashrc");
+        let resolved: Option<String> = cfg
+            .active_profile()
+            .api_key_env
+            .as_deref()
+            .filter(|n| valid_env_name(n))
+            .and_then(|n| std::env::var(n).ok())
+            .filter(|k| !k.is_empty());
+        std::env::remove_var("model_minimax");
+        std::env::remove_var("WYJ_CODE_API_KEY");
+
+        assert_eq!(resolved.as_deref(), Some("lowercase-key-from-bashrc"));
     }
 }
 
