@@ -16,6 +16,13 @@ fi
 
 mkdir -p "$DEST_DIR"
 
+# 去掉 macOS Gatekeeper 给"从浏览器/curl 下载文件"自动加的 quarantine 标记，
+# 否则 cp 之后首次 exec "$DEST" 会弹"无法确认开发者身份"权限确认窗。
+# 仅在 macOS 上存在该 xattr；其它平台 uname 不可用 / 没有该命令也安全跳过。
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$SRC" 2>/dev/null || true
+fi
+
 # 原子替换：同目录内建临时文件再 mv 到位，不原地覆盖。
 # 原地覆盖正在运行进程占用的可执行文件，在 macOS 上会使内核对该 vnode 的代码签名
 # 校验失效，导致后续 exec 该路径的新进程被 SIGKILL（见 build.sh install_local()）。
