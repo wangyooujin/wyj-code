@@ -20,6 +20,10 @@ pub enum ProviderErrorKind {
     Timeout,
     Network,
     SafetyBlocked,
+    /// 首次启动 + `~/.wyj-code` 缺失 + 用户尚未填入 API Key 的特殊状态。
+    /// 只有 `MissingKeyProvider` 占位实现会返回这个 kind;TUI 通过它拦截
+    /// 引导用户填写 Profile,而非抛普通 Authentication 错误。
+    MissingApiKey,
     Unknown,
 }
 

@@ -10,6 +10,8 @@
 
 **Fullscreen 全程接管后，原本的 11 个"重量级管理对话框"（`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/evolve` `/resume` `/agents` `/extensions` `/import`）不再需要临时切换 Terminal 变体**：它们本来就已经假设拥有整个终端来渲染，现在始终身处 Fullscreen，直接作为 `draw()` 尾部的浮层覆盖在 chat/footer 之上即可，不再有任何 `Terminal::with_options`/`clear()` 重建。权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁——这条不受本次改动影响。
 
+**ProfileDialog 还兼任首次启动缺 API Key 的 onboarding 入口**：`wyj-code` 在 `~/.wyj-code` 缺失时通过 `ProfileDialog::new_for_onboarding` 自动打开（焦点预置到 `PROFILE_API_KEY_FIELD_IDX = 5`），用户填写后 `profile_try_save` 经 `rebuild_fn` 重建 agent，无需重启。详见 `crates/cli/CLAUDE.md` "首次启动缺 API Key 的处理"。
+
 **`/evolve` 治理中心**：`EvolutionDialog` 固定提供 Active / Candidates / Episodes / Health 四视图，Tab/Shift+Tab 循环，列表与右侧 evidence/detail 保持独立滚动，PageUp/PageDown 只移动详情。Approve、Reject、Forget、Rollback 都必须先进入 `EvolutionConfirmAction` 二次确认；切换视图、Esc 或完成动作后清空确认状态，避免旧确认落到新选中项。Episode 的 good/bad feedback、external include 与 manual skillize 可以直接执行，但必须在面板中展示成功或错误结果；Skill 批准前先创建 checkpoint，默认只安装到 project scope，任何 Skill/lockfile/candidate 状态写入失败都调用生成 Skill 回滚。对话框 reload 只能刷新下一次视图快照，不能改变正在执行的 Agent 回合 Evolution context。
 
 **`open_path_in_editor`**（`/memory` 面板"用 $EDITOR 打开"）挂起 TUI 时无条件 `LeaveAlternateScreen` + `disable_raw_mode`、编辑完成后 `EnterAlternateScreen` + `enable_raw_mode` + `terminal.clear()`——这个函数写的时候就已经假设调用时处于 alternate screen（原先只在 Fullscreen 对话框打开期间才会被调用），现在全程都在 alternate screen，前置假设依然成立，不需要改。

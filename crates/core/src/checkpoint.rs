@@ -130,6 +130,8 @@ pub struct RewindPreview {
 pub struct CheckpointStore {
     session_id: String,
     dir: PathBuf,
+    /// 单 session checkpoint 上限(builder 注入;0 = 不限)。
+    max_per_session: usize,
 }
 
 impl CheckpointStore {
@@ -138,7 +140,18 @@ impl CheckpointStore {
         let dir = sessions_dir.join(format!("{session_id}.checkpoints"));
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create checkpoint directory {}", dir.display()))?;
-        Ok(Self { session_id, dir })
+        Ok(Self {
+            session_id,
+            dir,
+            max_per_session: 0,
+        })
+    }
+
+    /// 注入单 session checkpoint 上限(0 = 不限)。`create()` 末尾会自动调
+    /// `enforce_retention()` 淘汰超限最老 checkpoint + 同步 manifest。
+    pub fn with_max_per_session(mut self, max: usize) -> Self {
+        self.max_per_session = max;
+        self
     }
 
     pub fn dir(&self) -> &Path {
@@ -164,7 +177,18 @@ impl CheckpointStore {
             name: name.clone(),
             kind: kind.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            messages: messages.to_vec(),
+            messages: {
+                // 落盘前做持久化截断(tool_result / thinking / tool_use.input)
+                let mut owned = messages.to_vec();
+                if let Some(cfg) = current_checkpoint_persist_cap() {
+                    for msg in &mut owned {
+                        for block in &mut msg.content {
+                            crate::serialize::truncate_content_block(block, &cfg);
+                        }
+                    }
+                }
+                owned
+            },
             workspace: capture_workspace(cwd)?,
         };
         write_json_atomic(&self.checkpoint_path(&id), &checkpoint)?;
@@ -179,7 +203,40 @@ impl CheckpointStore {
         let mut manifest = self.load_manifest().unwrap_or_default();
         manifest.checkpoints.push(summary.clone());
         write_json_atomic(&self.manifest_path(), &manifest)?;
+        if let Err(error) = self.enforce_retention() {
+            tracing::warn!("Checkpoint retention 失败: {error}");
+        }
         Ok(summary)
+    }
+
+    /// 按 manifest 中 timestamp 升序淘汰最老 checkpoint + 同步 manifest。
+    /// `max_per_session == 0` 时跳过。失败仅 `tracing::warn`,不污染主流程。
+    pub fn enforce_retention(&self) -> Result<()> {
+        if self.max_per_session == 0 {
+            return Ok(());
+        }
+        let mut manifest = self.load_manifest().unwrap_or_default();
+        if manifest.checkpoints.len() <= self.max_per_session {
+            return Ok(());
+        }
+        // 按 timestamp 升序,保留后 N 条(最新)
+        manifest
+            .checkpoints
+            .sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        let to_remove: Vec<String> = manifest
+            .checkpoints
+            .drain(..manifest.checkpoints.len() - self.max_per_session)
+            .map(|c| c.id)
+            .collect();
+        for id in &to_remove {
+            validate_checkpoint_id(id)?;
+            let path = self.checkpoint_path(id);
+            if let Err(error) = std::fs::remove_file(&path) {
+                tracing::warn!("删除旧 checkpoint 失败 {}: {error}", path.display());
+            }
+        }
+        write_json_atomic(&self.manifest_path(), &manifest)?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<CheckpointSummary>> {
@@ -686,6 +743,20 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
         return Err(error.into());
     }
     Ok(())
+}
+
+/// 进程内全局 `PersistCapCfg` —— 由 CLI 装配阶段 `set_checkpoint_persist_cap`
+/// 注入,`CheckpointStore::create` 落盘前对 `messages` 做截断。
+static CHECKPOINT_PERSIST_CAP: std::sync::OnceLock<wyj_config::PersistCapCfg> =
+    std::sync::OnceLock::new();
+
+fn current_checkpoint_persist_cap() -> Option<wyj_config::PersistCapCfg> {
+    CHECKPOINT_PERSIST_CAP.get().cloned()
+}
+
+/// CLI 装配阶段调用一次,注入当前用户的 `cfg.persist_cap`。
+pub fn set_checkpoint_persist_cap(cfg: wyj_config::PersistCapCfg) {
+    let _ = CHECKPOINT_PERSIST_CAP.set(cfg);
 }
 
 #[cfg(test)]
