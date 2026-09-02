@@ -43,6 +43,8 @@ pub struct MemoryStore {
     context_snapshot: std::sync::OnceLock<String>,
     /// 上次提取时的消息数（节流：避免每轮一次提取 LLM 调用）
     last_extract_msg_count: std::sync::atomic::AtomicUsize,
+    /// Retention 配置（builder 模式注入；None 时 enforce_retention 跳过）
+    storage_cfg: std::sync::RwLock<Option<wyj_config::StorageRetentionCfg>>,
 }
 
 impl MemoryStore {
@@ -56,7 +58,15 @@ impl MemoryStore {
             enabled: AtomicBool::new(true),
             context_snapshot: std::sync::OnceLock::new(),
             last_extract_msg_count: std::sync::atomic::AtomicUsize::new(0),
+            storage_cfg: std::sync::RwLock::new(None),
         })
+    }
+
+    /// 注入 retention 配置（CLI 装配阶段调用一次）。后续 `extract_and_save`
+    /// 末尾会自动调 `enforce_retention(cfg.memory_v2_md_per_kind)`。
+    pub fn with_storage_retention(self, cfg: wyj_config::StorageRetentionCfg) -> Self {
+        *self.storage_cfg.write().expect("storage_cfg lock poisoned") = Some(cfg);
+        self
     }
 
     /// 会话级缓存版 `load_context`：首次调用读盘并快照，之后原样复用。
@@ -207,7 +217,61 @@ impl MemoryStore {
             self.write_item(item)?;
         }
         self.rebuild_index()?;
+        if let Some(cfg) = self
+            .storage_cfg
+            .read()
+            .expect("storage_cfg lock poisoned")
+            .clone()
+        {
+            if let Err(error) = self.enforce_retention(cfg.memory_v2_md_per_kind) {
+                tracing::warn!("Memory v2 retention 失败: {error}");
+            }
+        }
         tracing::debug!("记忆已写入 {} 条 → {}", items.len(), self.dir.display());
+        Ok(())
+    }
+
+    /// 每个 kind（feedback / tool / project / reference 等）的 `.md` 文件
+    /// 保留最近 `max_per_kind` 个，按文件 mtime 升序淘汰最老条目。
+    /// `max_per_kind == 0` 时跳过（保留全部）。
+    ///
+    /// 写在 `rebuild_index` 之后调用；不影响 index 内容（index 本来就只取
+    /// `MAX_INDEX_ENTRIES=200`），只物理删除超限文件。
+    pub fn enforce_retention(&self, max_per_kind: usize) -> Result<()> {
+        if max_per_kind == 0 {
+            return Ok(());
+        }
+        use std::collections::BTreeMap;
+        let mut groups: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for entry in std::fs::read_dir(&self.dir)?.filter_map(|e| e.ok()) {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            if !fname.ends_with(".md") || fname == MEMORY_INDEX {
+                continue;
+            }
+            // kind 是文件名前缀（`feedback_xxx.md` -> "feedback"）
+            let kind = fname.split('_').next().unwrap_or("").to_string();
+            if kind.is_empty() {
+                continue;
+            }
+            groups.entry(kind).or_default().push(entry.path());
+        }
+        for (_, mut paths) in groups {
+            if paths.len() <= max_per_kind {
+                continue;
+            }
+            // 按 mtime 升序，删最老
+            paths.sort_by_key(|p| {
+                std::fs::metadata(p)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            });
+            let excess = paths.len() - max_per_kind;
+            for old in &paths[..excess] {
+                if let Err(error) = std::fs::remove_file(old) {
+                    tracing::warn!("删除 Memory v2 旧条目失败 {}: {error}", old.display());
+                }
+            }
+        }
         Ok(())
     }
 

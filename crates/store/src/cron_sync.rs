@@ -204,20 +204,58 @@ fn ensure_backup(state_dir: &Path, existing: &str) -> Result<()> {
 
 /// 把 `tasks` 里 `enabled == true` 的任务同步进系统 crontab，仅替换本工具
 /// 管理的标记区块，不触碰用户其他 cron 条目。
-pub fn sync_crontab(tasks: &[ScheduleTask]) -> Result<()> {
+///
+/// `cfg` 来自调用方的 `StorageRetentionCfg`,控制 `run.log` 的 rotate 行为
+/// (`schedule_run_log_size_bytes` / `schedule_run_log_rotations`)。
+pub fn sync_crontab(tasks: &[ScheduleTask], cfg: &wyj_config::StorageRetentionCfg) -> Result<()> {
     let state_dir = crate::schedule::schedule_dir()?;
-    sync_crontab_in(&SystemCrontabIo, &state_dir, tasks)
+    sync_crontab_in(&SystemCrontabIo, &state_dir, tasks, cfg)
 }
 
 /// `sync_crontab` 的可测试核心：`io`/`state_dir` 均可注入，测试用临时目录 +
 /// 假 `CrontabIo`，不触碰真实用户 crontab 或 `~/.wyj-code`。
-pub fn sync_crontab_in(io: &dyn CrontabIo, state_dir: &Path, tasks: &[ScheduleTask]) -> Result<()> {
+pub fn sync_crontab_in(
+    io: &dyn CrontabIo,
+    state_dir: &Path,
+    tasks: &[ScheduleTask],
+    cfg: &wyj_config::StorageRetentionCfg,
+) -> Result<()> {
     let exe = std::env::current_exe().context("无法定位 wyj-code 可执行文件路径")?;
     let log_path = state_dir.join("run.log");
+    rotate_run_log(&log_path, cfg)?;
     let existing = io.read()?;
     ensure_backup(state_dir, &existing)?;
     let content = build_crontab_content(&existing, tasks, &exe, &log_path);
     io.write(&content)
+}
+
+/// 共享 `run.log` 超过 `schedule_run_log_size_bytes` 时按
+/// `schedule_run_log_rotations` 切副本：`run.log` → `run.log.1` → ... →
+///// `run.log.N`,超出的最老副本丢弃。`size_bytes == 0` 时跳过。
+fn rotate_run_log(path: &Path, cfg: &wyj_config::StorageRetentionCfg) -> Result<()> {
+    if cfg.schedule_run_log_size_bytes == 0 {
+        return Ok(());
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if meta.len() <= cfg.schedule_run_log_size_bytes {
+        return Ok(());
+    }
+    let rotations = cfg.schedule_run_log_rotations.max(1);
+    // 从最老副本开始往后挪,避免覆盖
+    let oldest = path.with_extension(format!("log.{rotations}"));
+    let _ = std::fs::remove_file(&oldest);
+    for i in (1..rotations).rev() {
+        let from = path.with_extension(format!("log.{i}"));
+        let to = path.with_extension(format!("log.{}", i + 1));
+        if from.exists() {
+            let _ = std::fs::rename(&from, &to);
+        }
+    }
+    let first = path.with_extension("log.1");
+    let _ = std::fs::rename(path, &first);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -362,7 +400,13 @@ mod tests {
         };
         let state_dir = tempfile::tempdir().unwrap();
         let tasks = vec![fake_task("id1", "0 8 * * *", true)];
-        sync_crontab_in(&io, state_dir.path(), &tasks).unwrap();
+        sync_crontab_in(
+            &io,
+            state_dir.path(),
+            &tasks,
+            &wyj_config::StorageRetentionCfg::default(),
+        )
+        .unwrap();
         let written = io.content.borrow().clone();
         assert!(written.contains("/usr/bin/backup.sh"));
         assert!(written.contains("wyj-code:schedule:id1"));
@@ -376,7 +420,13 @@ mod tests {
         };
         let state_dir = tempfile::tempdir().unwrap();
         let tasks = vec![fake_task("id1", "0 8 * * *", true)];
-        sync_crontab_in(&io, state_dir.path(), &tasks).unwrap();
+        sync_crontab_in(
+            &io,
+            state_dir.path(),
+            &tasks,
+            &wyj_config::StorageRetentionCfg::default(),
+        )
+        .unwrap();
         let backups_after_first: Vec<_> = std::fs::read_dir(state_dir.path())
             .unwrap()
             .filter(|e| {
@@ -387,7 +437,13 @@ mod tests {
                     .starts_with("crontab.backup.2")
             })
             .collect();
-        sync_crontab_in(&io, state_dir.path(), &tasks).unwrap();
+        sync_crontab_in(
+            &io,
+            state_dir.path(),
+            &tasks,
+            &wyj_config::StorageRetentionCfg::default(),
+        )
+        .unwrap();
         let backups_after_second: Vec<_> = std::fs::read_dir(state_dir.path())
             .unwrap()
             .filter(|e| {

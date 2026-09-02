@@ -91,7 +91,19 @@ impl SessionStore {
     }
 
     pub fn save(&self, file: &SessionFile) -> Result<()> {
-        let json = serde_json::to_string(file)?;
+        // 落盘前做持久化截断(tool_result / thinking / tool_use.input 等),
+        // 见 `serialize::truncate_session_for_persistence` 与
+        // `PersistCapCfg` —— 任意字段为 0 即关闭对应截断,保持旧行为。
+        //
+        // 这里走 `clone` 而非原地 mutate,是因为 `&SessionFile` 借用不允
+        // 许 truncate 调用原地改 messages。`SessionFile::clone` 主要成本在
+        // `Vec<Message>`,而 truncate 正是要削减其体积;序列化前 clone 比
+        // 序列化完整 messages 仍便宜得多。
+        let mut owned = file.clone();
+        if let Some(cfg) = current_persist_cap() {
+            crate::serialize::truncate_session_for_persistence(&mut owned, &cfg);
+        }
+        let json = serde_json::to_string(&owned)?;
         std::fs::write(
             self.path(&file.session_id),
             crate::secret::redact_sensitive_text(&json),
@@ -217,6 +229,23 @@ pub fn extract_preview(messages: &[Message]) -> String {
     String::new()
 }
 
+/// 进程内全局 `PersistCapCfg` —— 由 CLI 装配阶段 `set_session_persist_cap`
+/// 注入,`SessionStore::save` 落盘前读。`None` 时不做截断(等价于 cfg 全 0)。
+///
+/// 用 `OnceLock` 而非 `Mutex<Option>` 是因为 cfg 在启动后只设置一次,
+/// `save` 路径读多写少,`get`/clone 比每次 lock 更便宜。
+static SESSION_PERSIST_CAP: std::sync::OnceLock<wyj_config::PersistCapCfg> =
+    std::sync::OnceLock::new();
+
+fn current_persist_cap() -> Option<wyj_config::PersistCapCfg> {
+    SESSION_PERSIST_CAP.get().cloned()
+}
+
+/// CLI 装配阶段(主进程 `main` 入口)调用一次,把当前用户的
+/// `cfg.persist_cap` 注入到 `SessionStore` 的全局。
+pub fn set_session_persist_cap(cfg: wyj_config::PersistCapCfg) {
+    let _ = SESSION_PERSIST_CAP.set(cfg);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

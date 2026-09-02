@@ -544,6 +544,103 @@ impl Default for EvolutionRetentionCfg {
     }
 }
 
+/// 持久化前的 `ContentBlock` 字节上限。设为 0 关闭对应字段截断。
+///
+/// `SessionStore::save` / `CheckpointStore::create` 都会在落盘前调用
+/// `wyj_core::serialize::truncate_session_for_persistence`,按本配置对
+/// `ToolResult` 文本、`Thinking`、`ToolUse.input` 等做 UTF-8 安全的截断。
+///
+/// 仅影响磁盘序列化字节,**不影响运行时消息体** —— 内存中完整 messages
+/// 仍可用于下一次 LLM 请求,只在下一次 `save()` 时再截断。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PersistCapCfg {
+    /// `ToolResult` 文本部分(head)字节上限。0 = 不截断。
+    pub tool_result_head_bytes: usize,
+    /// `ToolResult` 文本部分(tail)字节上限。0 = 不截断。
+    pub tool_result_tail_bytes: usize,
+    /// `Thinking.thinking` 字符串字节上限。0 = 不截断。
+    pub thinking_bytes: usize,
+    /// `Thinking.reasoning_details` 每项 `text` 字段字节上限。0 = 不截断。
+    pub reasoning_details_bytes: usize,
+    /// `ToolUse.input` JSON 字符串字节上限。0 = 不截断。
+    pub tool_use_input_bytes: usize,
+}
+
+impl Default for PersistCapCfg {
+    fn default() -> Self {
+        Self {
+            tool_result_head_bytes: 20 * 1024,
+            tool_result_tail_bytes: 10 * 1024,
+            thinking_bytes: 8 * 1024,
+            reasoning_details_bytes: 8 * 1024,
+            tool_use_input_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// `~/.wyj-code` 各子系统 retention / cap / rotation 配置。
+///
+/// 全部字段都是 opt-out:设为 0 即关闭对应清理逻辑,保持旧行为不变。
+///
+/// 默认值在 `Default for StorageRetentionCfg` 里集中声明,CLAUDE.md 的
+/// "Storage caps (defaults)" 表格与之一一对应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageRetentionCfg {
+    /// 单个 session 的 checkpoint 上限(0 = 不限,旧行为)。
+    pub checkpoints_per_session: usize,
+
+    /// Memory v2 `.md` 文件每个 kind(feedback/tool/...)上限(0 = 不限)。
+    pub memory_v2_md_per_kind: usize,
+
+    /// Memory v3 `records.json` 单文件条目上限(0 = 不限)。Superseded
+    /// 状态永远保留,只对 Active/Pending 做截断。
+    pub memory_v3_records_max: usize,
+
+    /// Memory v3 `jobs.json` pending 队列上限(0 = 不限)。
+    pub memory_v3_jobs_max: usize,
+
+    /// Memory v3 `rejected_history.json` 保留条数(0 = 不限)。
+    pub memory_v3_rejected_history_max: usize,
+
+    /// 调度任务日志每个 task 保留文件数(0 = 不限)。
+    pub schedule_logs_per_task: usize,
+
+    /// 共享 `run.log` rotate 触发阈值(0 = 不限)。
+    pub schedule_run_log_size_bytes: u64,
+
+    /// 共享 `run.log` rotate 副本数。
+    pub schedule_run_log_rotations: usize,
+
+    /// 插件 `.git` 做 `git gc --prune=now` 的间隔天数(0 = 关闭)。
+    pub plugin_gc_interval_days: u32,
+
+    /// workspace worktree 自动 prune 的过期天数(0 = 仅 dispose 时清理)。
+    pub workspace_worktree_max_age_days: u32,
+
+    /// 启动期 `disk_usage::warn_if_over_budget` 阈值(0 = 关闭)。
+    pub disk_usage_warn_bytes: u64,
+}
+
+impl Default for StorageRetentionCfg {
+    fn default() -> Self {
+        Self {
+            checkpoints_per_session: 20,
+            memory_v2_md_per_kind: 200,
+            memory_v3_records_max: 5_000,
+            memory_v3_jobs_max: 32,
+            memory_v3_rejected_history_max: 500,
+            schedule_logs_per_task: 50,
+            schedule_run_log_size_bytes: 10 * 1024 * 1024,
+            schedule_run_log_rotations: 3,
+            plugin_gc_interval_days: 7,
+            workspace_worktree_max_age_days: 30,
+            disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// 本地、自包含的 Agent 经验闭环。v1.5.5 收敛后只剩 Rule/Skill 治理；
 /// 普通 Memory 数据层迁出 Evolution 后 `generate_experiences` /
 /// `auto_activate_memories` 不再有业务含义，已删除（serde 默认忽略旧字段）。
@@ -644,6 +741,14 @@ pub struct Config {
     /// 仅运行期存在的 API Key；serde 永不读写，避免环境变量被设置面板落盘。
     #[serde(skip)]
     pub runtime_api_key: Option<String>,
+    /// 各子系统 retention / cap / rotation 配置(`[storage]` 节)。
+    /// 全部字段 opt-out,0 = 关闭。
+    #[serde(default)]
+    pub storage: StorageRetentionCfg,
+    /// 持久化前 `ContentBlock` 字节截断配置(`[persist_cap]` 节)。
+    /// 全部字段 opt-out,0 = 不截断。
+    #[serde(default)]
+    pub persist_cap: PersistCapCfg,
 }
 
 fn default_true() -> bool {
@@ -661,9 +766,7 @@ fn default_search_provider() -> String {
 fn valid_env_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_'
-                || byte.is_ascii_alphabetic()
-                || (index > 0 && byte.is_ascii_digit())
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
         })
 }
 
@@ -685,6 +788,8 @@ impl Default for Config {
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
+            storage: StorageRetentionCfg::default(),
+            persist_cap: PersistCapCfg::default(),
         }
     }
 }
@@ -767,6 +872,8 @@ impl From<LegacyConfigV0> for Config {
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
+            storage: StorageRetentionCfg::default(),
+            persist_cap: PersistCapCfg::default(),
         }
     }
 }
@@ -980,6 +1087,13 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> 
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
+    // 配置文件通常包含 API Key 等敏感字段,落盘后默认收紧到仅当前用户
+    // 可读写。Windows 上没有等价模式,跳过。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -1174,7 +1288,9 @@ mod valid_env_name_tests {
 
     #[test]
     fn rejects_invalid_names() {
-        for name in ["", "1FOO", "FOO-BAR", "FOO BAR", "FOO$BAR", "FOO=BAR", " FOO"] {
+        for name in [
+            "", "1FOO", "FOO-BAR", "FOO BAR", "FOO$BAR", "FOO=BAR", " FOO",
+        ] {
             assert!(!valid_env_name(name), "应当拒绝 {name:?}");
         }
     }
@@ -1533,5 +1649,27 @@ context_window = 200000
         assert!(!config.evolution.allow_self_code_experiments);
         assert!(config.evolution.exclude_external_context);
         assert_eq!(config.evolution.max_background_workers, 1);
+    }
+}
+
+// `~/.wyj-code/config.toml` 含 API Key 等敏感字段,
+// `write_atomic` rename 后应默认收紧到 0o600 (Unix only).
+#[cfg(all(test, unix))]
+mod write_atomic_permissions_tests {
+    use super::*;
+
+    #[test]
+    fn save_to_sets_0o600_permissions_on_unix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let cfg = Config::default();
+        cfg.save_to(&path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "config.toml 应仅当前用户可读写"
+        );
     }
 }

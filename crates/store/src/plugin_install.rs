@@ -109,6 +109,7 @@ async fn clone_repo(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()>
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    maybe_run_git_gc(dest);
     Ok(())
 }
 
@@ -129,8 +130,64 @@ async fn pull_repo(dir: &Path) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    maybe_run_git_gc(dir);
     Ok(())
 }
+
+/// 周期 gc 插件 `.git`,减少 reflog / object pack 历史累积。
+/// `cfg.plugin_gc_interval_days == 0` 时跳过。gc 仅在距上次 gc 满 interval 后
+/// 才执行,避免每次 pull 都跑 gc。
+fn maybe_run_git_gc(dir: &Path) {
+    let Some(cfg) = current_plugin_storage_cfg() else {
+        return;
+    };
+    if cfg.plugin_gc_interval_days == 0 {
+        return;
+    }
+    let marker = dir.join(".last_gc_epoch_secs");
+    let now = chrono::Utc::now().timestamp();
+    let last = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if (now - last) < (cfg.plugin_gc_interval_days as i64) * 86_400 {
+        return;
+    }
+    let Some(dir_str) = dir.to_str() else { return };
+    let Ok(output) = std::process::Command::new("git")
+        .args(["-C", dir_str, "gc", "--prune=now", "--quiet"])
+        .output()
+    else {
+        return;
+    };
+    if output.status.success() {
+        let _ = std::fs::write(&marker, now.to_string());
+    }
+}
+
+fn current_plugin_storage_cfg() -> Option<wyj_config::StorageRetentionCfg> {
+    PLUGIN_STORAGE_CFG
+        .read()
+        .expect("plugin storage cfg lock poisoned")
+        .clone()
+}
+
+fn plugin_storage_cfg_from_config() -> wyj_config::StorageRetentionCfg {
+    wyj_config::Config::load()
+        .map(|cfg| cfg.storage)
+        .unwrap_or_default()
+}
+
+/// CLI 装配阶段调用一次:把当前用户 storage 配置注入到 plugin 路径,供
+/// `clone_repo` / `pull_repo` 末尾的 gc 决策使用。
+pub fn set_plugin_storage_cfg(cfg: wyj_config::StorageRetentionCfg) {
+    *PLUGIN_STORAGE_CFG
+        .write()
+        .expect("plugin storage cfg lock poisoned") = Some(cfg);
+}
+
+static PLUGIN_STORAGE_CFG: std::sync::RwLock<Option<wyj_config::StorageRetentionCfg>> =
+    std::sync::RwLock::new(None);
 
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     if !src.exists() {
@@ -584,6 +641,7 @@ async fn install_plugin_under(
     req: &PluginInstallRequest,
     cwd: &Path,
 ) -> Result<PluginInstallReport> {
+    set_plugin_storage_cfg(plugin_storage_cfg_from_config());
     let name = req
         .name_override
         .clone()
