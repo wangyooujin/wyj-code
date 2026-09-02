@@ -110,6 +110,10 @@ update:
   permission_error: "Failed to replace binary: {err} (check install directory permissions, or reinstall with sudo)"
 
 main:
+  # Non-TUI entry (headless REPL / `-p` / ACP stdio / daemon TCP) error
+  # prefix when API Key is missing. Full message = prefix + status.
+  # api_key_missing_onboarding_headless hint.
+  api_key_missing_for: "{entry} mode requires an API key:"
   session_not_found: "Session {id} not found, starting a new session."
   session_resumed: "Resumed session {id} ({count} messages)"
   session_resumed_last: "Resumed last session {id} ({count} messages)"
@@ -596,6 +600,10 @@ status:
   api_key_error: "API Key: {err}"
   other_profiles: "Other profiles: {names}"
   mcp_servers: "MCP servers: {count}"
+  # headless REPL / `-p` / ACP stdio / daemon TCP exit hint when API Key
+  # is missing: point users at the TUI onboarding flow or env var fallback.
+  api_key_missing_onboarding_headless: |-
+    Run `wyj-code` to open the interactive setup, fill in your API key in the /model panel, then press Ctrl+S to save (no restart required). Alternatively, set the `WYJ_CODE_API_KEY` environment variable and retry.
 
 model:
   desc: "Manage call profiles: /model opens the profile manager, /model <name> switches directly"
@@ -729,6 +737,12 @@ settings:
 
 profile:
   title: "Call Profiles"
+  # First-launch onboarding: TUI top title / hint shown when ~/.wyj-code is
+  # missing, guiding users to focus on the api_key field.
+  onboarding:
+    title: "First-time setup — enter your API key"
+    hint: "Cursor is on the API Key field — paste and press Ctrl+S to save. Other fields can also be tweaked."
+    success: "API key saved. Model: {provider} / {model}. You can start chatting now."
   saved: "Profile saved"
   switched: "Switched to profile {name}"
   switch_failed: "[Switch failed] {err}"
@@ -753,6 +767,9 @@ profile:
     duplicate_name: "Duplicate profile name, please choose a unique one"
     last_one: "At least one profile must remain"
     delete_active: "Switch to another profile first before deleting the active one"
+    # First-launch onboarding guard: prevent saving a profile with no
+    # api_key and no api_key_env, which would just re-trigger onboarding.
+    api_key_required: "API key cannot be empty: paste a key, or set the WYJ_CODE_API_KEY environment variable"
   fetch:
     need_api_key: "Fill in the API Key before fetching the model list"
     in_progress: "Fetching model list…"

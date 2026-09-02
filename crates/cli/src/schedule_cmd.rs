@@ -13,6 +13,15 @@ use tokio::process::Command;
 use wyj_store::cron_sync;
 use wyj_store::schedule::{self, RunStatus, SchedulePermissions};
 
+/// 读取当前用户 storage 配置(失败回退 default,避免阻塞 schedule 执行)。
+/// schedule run 由系统 crontab 触发,headless 环境下不应因 config 解析失败
+/// 而拒绝跑任务。
+fn storage_cfg() -> wyj_config::StorageRetentionCfg {
+    wyj_config::Config::load()
+        .map(|cfg| cfg.storage)
+        .unwrap_or_default()
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ScheduleCommand {
     /// List all schedule tasks.
@@ -202,7 +211,7 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
         }
         ScheduleCommand::Sync { json } => {
             let manifest = schedule::load()?;
-            cron_sync::sync_crontab(&manifest.tasks)?;
+            cron_sync::sync_crontab(&manifest.tasks, &storage_cfg())?;
             if json {
                 println!(
                     "{}",
@@ -249,7 +258,8 @@ fn schedule_permissions(
 /// 命令因为系统 crontab 不可用（如 Windows）而失败退出。
 fn sync_and_warn() -> Result<()> {
     let manifest = schedule::load()?;
-    if let Err(e) = cron_sync::sync_crontab(&manifest.tasks) {
+    let cfg = storage_cfg();
+    if let Err(e) = cron_sync::sync_crontab(&manifest.tasks, &cfg) {
         eprintln!("警告：任务已保存，但同步系统 crontab 失败：{e}");
     }
     Ok(())
@@ -277,7 +287,8 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
 
     schedule::record_run_start(id)?;
 
-    let log_path = match prepare_log_file(id) {
+    let cfg = storage_cfg();
+    let log_path = match prepare_log_file(id, &cfg) {
         Ok(path) => path,
         Err(e) => {
             let msg = format!("无法创建日志文件: {e}");
@@ -323,14 +334,42 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
     Ok(())
 }
 
-fn prepare_log_file(id: &str) -> Result<PathBuf> {
+fn prepare_log_file(id: &str, cfg: &wyj_config::StorageRetentionCfg) -> Result<PathBuf> {
     let log_dir = schedule::schedule_dir()?.join("logs").join(id);
     std::fs::create_dir_all(&log_dir).context("创建定时任务日志目录失败")?;
+    prune_old_logs(&log_dir, cfg.schedule_logs_per_task)?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     Ok(log_dir.join(format!("{ts}.log")))
+}
+
+/// 按 mtime 升序,保留最近 `keep` 个文件,删除其余。
+/// `keep == 0` 时跳过(保留全部)。失败仅 `tracing::warn`,不污染主流程。
+fn prune_old_logs(dir: &std::path::Path, keep: usize) -> Result<()> {
+    if keep == 0 {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .with_context(|| format!("读取日志目录失败 {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    if entries.len() <= keep {
+        return Ok(());
+    }
+    entries.sort_by_key(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    let excess = entries.len() - keep;
+    for old in &entries[..excess] {
+        if let Err(error) = std::fs::remove_file(old.path()) {
+            tracing::warn!("删除定时任务旧日志失败 {}: {error}", old.path().display());
+        }
+    }
+    Ok(())
 }
 
 async fn spawn_headless(

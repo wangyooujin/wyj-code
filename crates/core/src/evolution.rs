@@ -440,13 +440,7 @@ impl EvolutionStore {
         let legacy_dir = base_dir.join("memory").join(project_id(&repository_root));
         let project_id = project_id(&repository_root);
         let dir = base_dir.join("evolution").join(&project_id);
-        for child in [
-            "episodes",
-            "candidates",
-            "feedback",
-            "experiments",
-            "active",
-        ] {
+        for child in ["episodes", "candidates", "feedback"] {
             fs::create_dir_all(dir.join(child))?;
         }
         Ok(Self {
@@ -1966,6 +1960,9 @@ fn looks_like_failed_test(output: &str) -> bool {
 }
 
 fn git_worktree_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
+    // 不传 `-uno`,让 untracked 也进入 snapshot:`changed_since` 需要比较 untracked
+    // 的指纹识别新增/修改的文件(如 `node_modules/`、`target/` 等)。对 untracked
+    // 大文件(>= 1 MiB)用 mtime+size 替代全文 SHA-256,避免 IO 放大。
     let Ok(output) = Command::new("git")
         .args(["status", "--porcelain", "-z"])
         .current_dir(root)
@@ -1983,11 +1980,31 @@ fn git_worktree_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
             if entry.len() < 4 {
                 return None;
             }
-            let status = String::from_utf8_lossy(&entry[..2]);
-            let path = String::from_utf8_lossy(&entry[3..]).to_string();
-            let path = PathBuf::from(path.rsplit(" -> ").next().unwrap_or(&path));
+            let status = String::from_utf8_lossy(&entry[..2]).to_string();
+            let raw_path = String::from_utf8_lossy(&entry[3..]).to_string();
+            let path = PathBuf::from(raw_path.rsplit(" -> ").next().unwrap_or(&raw_path));
             let absolute = root.join(&path);
-            let digest = if absolute.is_file() {
+            // untracked (`??`) 且 >= 1 MiB 的文件用 mtime+size 作轻量指纹;
+            // 其余(is_file())读全文哈希。Episode "改了哪些文件" 的语义对
+            // untracked 只关心"是否被改过",mtime+size 变化即触发变更。
+            let is_untracked = entry[0] == b'?' && entry[1] == b'?';
+            let is_large_untracked = is_untracked
+                && fs::metadata(&absolute)
+                    .map(|m| m.len() >= UNTRACKED_LARGE_FILE_BYTES)
+                    .unwrap_or(false);
+            let digest = if is_large_untracked {
+                fs::metadata(&absolute)
+                    .map(|m| {
+                        let mtime = m
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        format!("mtime:{mtime};size:{}", m.len())
+                    })
+                    .unwrap_or_else(|_| "unreadable".to_string())
+            } else if absolute.is_file() {
                 fs::read(&absolute)
                     .map(|bytes| hex_sha256(&bytes))
                     .unwrap_or_else(|_| "unreadable".to_string())
@@ -1998,6 +2015,10 @@ fn git_worktree_snapshot(root: &Path) -> BTreeMap<PathBuf, String> {
         })
         .collect()
 }
+
+/// untracked 大文件阈值(1 MiB)。达到此大小的 `node_modules/`/`target/` 等
+/// 未追踪目录不会被全文读 SHA-256,改用 mtime+size 指纹。
+const UNTRACKED_LARGE_FILE_BYTES: u64 = 1024 * 1024;
 
 fn changed_since(
     before: &BTreeMap<PathBuf, String>,

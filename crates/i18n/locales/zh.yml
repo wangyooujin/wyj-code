@@ -109,6 +109,10 @@ update:
   permission_error: "替换二进制失败：{err}（请检查安装目录权限，或改用 sudo 重新安装）"
 
 main:
+  # 非 TUI 入口(headless REPL / `-p` / ACP stdio / daemon TCP)缺 Key 时
+  # `require_provider` 抛出的错误前缀。完整文案 = 这个前缀 + status.
+  # api_key_missing_onboarding_headless 双行 hint。
+  api_key_missing_for: "{entry} 模式需要 API Key:"
   session_not_found: "未找到会话 {id}，将开始新会话。"
   session_resumed: "已恢复会话 {id}（{count} 条消息）"
   session_resumed_last: "已恢复上次会话 {id}（{count} 条消息）"
@@ -595,6 +599,10 @@ status:
   api_key_error: "API Key: {err}"
   other_profiles: "其他分组: {names}"
   mcp_servers: "MCP servers: {count}"
+  # headless REPL / `-p` / ACP stdio / daemon TCP 四个非 UI 入口在缺 Key 时
+  # 退出的附加提示:引导用户去 TUI 完成首次配置,或设置环境变量后重试。
+  api_key_missing_onboarding_headless: |-
+    运行 `wyj-code` 打开交互界面,在 /model 面板里填写 API Key,Ctrl+S 保存即可生效,无需重启。也可设置环境变量 `WYJ_CODE_API_KEY` 后重试。
 
 model:
   desc: "管理调用分组：/model 打开分组管理面板，/model <分组名> 直接切换"
@@ -727,6 +735,12 @@ settings:
 
 profile:
   title: "调用分组管理"
+  # 首次启动 + `~/.wyj-code` 缺失时 TUI 顶部 title / hint,
+  # 引导用户聚焦到 api_key 字段填写。
+  onboarding:
+    title: "首次启动 — 请填写 API Key"
+    hint: "光标已停在 API Key,粘贴后 Ctrl+S 保存即可。其它字段也可顺手调整。"
+    success: "API Key 已保存,模型: {provider} / {model}。现在可以开始对话。"
   saved: "分组已保存"
   switched: "已切换至分组 {name}"
   switch_failed: "[切换失败] {err}"
@@ -751,6 +765,9 @@ profile:
     duplicate_name: "分组名称重复，请改一个唯一的名字"
     last_one: "至少保留一个分组"
     delete_active: "请先切换到其他分组，再删除当前激活的分组"
+    # 首次启动引导场景:ProfileDialog 提交时 active profile 既没有 api_key
+    # 也没有 api_key_env,要求用户至少填一个,避免写盘后再启动仍进引导循环。
+    api_key_required: "API Key 不能为空:请填入 Key,或设置环境变量 WYJ_CODE_API_KEY"
   fetch:
     need_api_key: "请先填写 API Key 再拉取模型列表"
     in_progress: "正在拉取模型列表…"

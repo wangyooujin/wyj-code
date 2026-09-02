@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
+use wyj_api::{MissingKeyProvider, Provider};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistry, CommandResult};
 use wyj_config::{AgentMode, Config, RoutingRole};
 use wyj_core::{
@@ -176,6 +177,29 @@ enum RuntimeCommand {
     Acp,
     Daemon { listen: String },
     WorkflowRun { file: PathBuf, json: bool },
+}
+
+/// 启动期 `wyj_api::build_provider_with_model` 的结果。
+/// `MissingApiKey` 是缺 API Key + TUI 默认入口的特殊可恢复路径,
+/// 由 `tui_main` 内的 `ProfileDialog` 引导用户填写;其它 4 个入口
+/// (headless REPL / `-p` / ACP stdio / daemon TCP) 在 `require_provider`
+/// guard 处仍以非零状态退出。
+enum InitialProvider {
+    Ready(Arc<dyn Provider>),
+    MissingApiKey,
+}
+
+/// headless / `-p` / ACP / daemon 四个非 UI 入口的 guard:确认已就绪,缺失时
+/// 返回"指向 TUI 完成首次配置 + env 命令"的友好错误。
+fn require_provider(initial: &InitialProvider, entry_label: &str) -> Result<()> {
+    match initial {
+        InitialProvider::Ready(_) => Ok(()),
+        InitialProvider::MissingApiKey => Err(anyhow::anyhow!(
+            "{}\n\n{}",
+            wyj_i18n::tr_fmt("main.api_key_missing_for", &[("entry", entry_label)]),
+            wyj_i18n::tr("status.api_key_missing_onboarding_headless"),
+        )),
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -1028,6 +1052,10 @@ async fn main() -> Result<()> {
     let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
     let config_base = wyj_config::config_dir()?;
 
+    // 启动期一次性磁盘占用提示。`OnceLock` 保证进程内只触发一次,
+    // 避免每个 LLM 回合都打日志污染终端。
+    wyj_core::disk_usage::warn_if_over_budget(&config_base, cfg.storage.disk_usage_warn_bytes);
+
     // --plugin-dir is an explicit, process-local development plugin. Runtime contributions use
     // the same activation path as installed plugins but are never persisted.
     let local_plugin: Option<wyj_store::lockfile::PluginContributions> = match &cli.plugin_dir {
@@ -1137,21 +1165,32 @@ async fn main() -> Result<()> {
     let session_store_arc = session_store.map(std::sync::Arc::new);
     let checkpoint_store = session_store_arc
         .as_ref()
-        .and_then(|store| wyj_core::CheckpointStore::new(store.dir(), session_id.clone()).ok())
+        .and_then(|store| {
+            wyj_core::CheckpointStore::new(store.dir(), session_id.clone())
+                .map(|s| s.with_max_per_session(cfg.storage.checkpoints_per_session))
+                .ok()
+        })
         .map(Arc::new);
+
+    // 把 cfg.persist_cap 注入 SessionStore + CheckpointStore 落盘前截断全局。
+    // 用 OnceLock 全局而非 builder 模式,是为了不改 14+ 个 caller 签名。
+    wyj_core::session_store::set_session_persist_cap(cfg.persist_cap.clone());
+    wyj_core::checkpoint::set_checkpoint_persist_cap(cfg.persist_cap.clone());
 
     let memory_store = MemoryStore::new(&config_base, &cwd)
         .map(|m| {
             m.set_enabled(cfg.auto_memory_enabled);
-            Arc::new(m)
+            m.with_storage_retention(cfg.storage.clone())
         })
+        .map(Arc::new)
         .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
         .ok();
     let memory_v3_store = MemoryV3Store::new(&config_base, &cwd)
         .map(|store| {
             store.set_enabled(cfg.auto_memory_enabled);
-            Arc::new(store)
+            store.with_storage_retention(cfg.storage.clone())
         })
+        .map(Arc::new)
         .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
         .ok();
     let evolution_store = if cfg.evolution.enabled {
@@ -1199,7 +1238,42 @@ async fn main() -> Result<()> {
     // 按模式选择模型
     let model_name = model_for_routing_role(cfg.active_profile(), routing_role);
 
-    let provider = wyj_api::build_provider_with_model(&cfg, &model_name)?;
+    // 启动期 Provider 构建:缺 API Key 时不再 fatal 退出,而是按入口类型分支。
+    // - TUI 默认入口:`MissingApiKey` 路径,ProfileDialog 引导用户填写,
+    //   `rebuild_fn` 在保存后注入真 Provider,无需重启。
+    // - headless REPL / `-p` / ACP stdio / daemon TCP:无 UI 通道,
+    //   `require_provider` guard 在四个入口处统一报错退出,文案指向 TUI。
+    let initial_provider = match wyj_api::build_provider_with_model(&cfg, &model_name) {
+        Ok(p) => InitialProvider::Ready(p),
+        Err(_e) if is_tui_mode && cfg.api_key().is_err() => InitialProvider::MissingApiKey,
+        Err(_e) if cfg.api_key().is_err() => {
+            // 非 TUI 入口(headless / `-p` / ACP / daemon)缺 Key 时,改抛带
+            // "运行 wyj-code 完成首次配置 + env 命令" 的友好文案,而不是
+            // 把 Config::api_key 内部的中文错误原样透传给用户。
+            return Err(anyhow::anyhow!(
+                "{}\n\n{}",
+                wyj_i18n::tr_fmt(
+                    "main.api_key_missing_for",
+                    &[(
+                        "entry",
+                        if cli.prompt.is_some() {
+                            "single prompt (-p)"
+                        } else if cli.headless {
+                            "headless REPL"
+                        } else {
+                            "non-TUI entry"
+                        }
+                    )],
+                ),
+                wyj_i18n::tr("status.api_key_missing_onboarding_headless"),
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let provider_arc: Arc<dyn Provider> = match &initial_provider {
+        InitialProvider::Ready(p) => p.clone(),
+        InitialProvider::MissingApiKey => Arc::new(MissingKeyProvider),
+    };
 
     // 恢复的长会话预压缩：--resume/--continue 全量回放的历史若已占掉大半上下文，
     // 恢复后首轮就会全价发送巨量旧消息（且很快再触发一次运行中压缩）。
@@ -1211,15 +1285,19 @@ async fn main() -> Result<()> {
         {
             let mut tmp = Session::new();
             tmp.messages = std::mem::take(&mut initial_messages);
-            match wyj_core::compact_session(&mut tmp, provider.as_ref(), window).await {
-                Ok(r) => eprintln!(
-                    "{}",
-                    wyj_i18n::tr_fmt(
-                        "main.resume_compacted",
-                        &[("count", &r.messages_removed.to_string())]
-                    )
-                ),
-                Err(e) => tracing::warn!("恢复会话预压缩失败: {e}"),
+            // `MissingApiKey` 占位 provider 不能跑 compact;直接跳过,让用户
+            // 走完 ProfileDialog 后再触发 on-demand 压缩即可。
+            if let InitialProvider::Ready(p) = &initial_provider {
+                match wyj_core::compact_session(&mut tmp, p.as_ref(), window).await {
+                    Ok(r) => eprintln!(
+                        "{}",
+                        wyj_i18n::tr_fmt(
+                            "main.resume_compacted",
+                            &[("count", &r.messages_removed.to_string())]
+                        )
+                    ),
+                    Err(e) => tracing::warn!("恢复会话预压缩失败: {e}"),
+                }
             }
             initial_messages = tmp.messages;
         }
@@ -1472,7 +1550,7 @@ async fn main() -> Result<()> {
     let model_capabilities = model_resolution.capabilities.clone();
     let fallback_routes = build_fallback_routes(&cfg, routing_role, &cfg.active_profile().name);
     let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
-    let mut agent = Agent::new(provider)
+    let mut agent = Agent::new(provider_arc.clone())
         .with_system(wyj_core::prompts::main_system_prompt(&env_info))
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
@@ -1679,11 +1757,21 @@ async fn main() -> Result<()> {
 
     // 配置会话标题生成器：持有 SessionStore 引用，首轮后后台生成标题写盘
     let agent = if let Some(store) = &session_store_arc {
-        let provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
-            .unwrap_or_else(|e| {
-                tracing::warn!("标题生成器 provider 构建失败: {e}，回退到主 provider");
-                wyj_api::build_provider(&cfg).expect("主 provider 已在启动时构建成功")
-            });
+        // 首次启动缺 API Key 的引导路径:cfg 里仍无 Key,SummaryGenerator
+        // 构造的二次 build_provider() 必然 Err,与其 expect 炸 panic,不如
+        // 干脆跳过 SummaryGenerator 装配 —— ProfileDialog 保存并 rebuild
+        // 后用户进入 chat,首轮仍会自动触发标题生成路径,届时 API Key 已就位。
+        let provider = match &initial_provider {
+            InitialProvider::MissingApiKey => provider_arc.clone(),
+            InitialProvider::Ready(_) => {
+                wyj_api::build_provider_from_profile(cfg.active_profile(), None).unwrap_or_else(
+                    |e| {
+                        tracing::warn!("标题生成器 provider 构建失败: {e}，回退到主 provider");
+                        wyj_api::build_provider(&cfg).expect("主 provider 已在启动时构建成功")
+                    },
+                )
+            }
+        };
         let gen = Arc::new(SummaryGenerator::new(store.clone(), provider));
         agent
             .with_summary(gen)
@@ -1826,6 +1914,7 @@ async fn main() -> Result<()> {
     let run_result = if let Some(command) = runtime_command {
         match command {
             RuntimeCommand::Acp => {
+                require_provider(&initial_provider, "acp")?;
                 acp::run_stdio(
                     agent,
                     tool_ctx,
@@ -1836,6 +1925,7 @@ async fn main() -> Result<()> {
                 .await
             }
             RuntimeCommand::Daemon { listen } => {
+                require_provider(&initial_provider, "daemon")?;
                 acp::run_daemon(
                     &listen,
                     agent,
@@ -1847,6 +1937,8 @@ async fn main() -> Result<()> {
                 .await
             }
             RuntimeCommand::WorkflowRun { file, json } => {
+                // workflow run 也走 ACP/daemon 同一条 non-TUI 路径,要求 API Key
+                require_provider(&initial_provider, "workflow run")?;
                 let parent = workflow_parent_ceiling(&registry, &tool_ctx);
                 workflow_cmd::run_workflow(
                     file,
@@ -1863,6 +1955,7 @@ async fn main() -> Result<()> {
             }
         }
     } else if let Some(prompt) = cli.prompt {
+        require_provider(&initial_provider, "single prompt (-p)")?;
         let mut session = Session::new();
         if let Some(file) = session_store_arc
             .as_ref()
@@ -1977,6 +2070,7 @@ async fn main() -> Result<()> {
         }
         Ok(())
     } else if cli.headless {
+        require_provider(&initial_provider, "headless REPL")?;
         repl(
             agent,
             rebuild_fn.clone(),
@@ -2016,6 +2110,7 @@ async fn main() -> Result<()> {
             mcp_tools.clone(),
             shared_agent_defs,
             plugin_runtime.clone(),
+            matches!(initial_provider, InitialProvider::MissingApiKey),
         )
         .await
     };

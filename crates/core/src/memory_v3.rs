@@ -307,6 +307,8 @@ pub struct MemoryV3Store {
     enabled: Arc<AtomicBool>,
     write_lock: Arc<Mutex<()>>,
     worker_running: Arc<AtomicBool>,
+    /// Retention 配置（builder 模式注入；None 时 run_gc 跳过）。
+    storage_cfg: Arc<std::sync::RwLock<Option<wyj_config::StorageRetentionCfg>>>,
 }
 
 impl MemoryV3Store {
@@ -320,11 +322,123 @@ impl MemoryV3Store {
             enabled: Arc::new(AtomicBool::new(true)),
             write_lock: Arc::new(Mutex::new(())),
             worker_running: Arc::new(AtomicBool::new(false)),
+            storage_cfg: Arc::new(std::sync::RwLock::new(None)),
         };
         fs::create_dir_all(store.base_dir.join("global"))?;
         fs::create_dir_all(store.project_dir())?;
         store.recover_interrupted_jobs()?;
         Ok(store)
+    }
+
+    /// 注入 retention 配置（CLI 装配阶段调用一次）。后续 `upsert` /
+    /// `enqueue_extraction` / `drain_jobs` 会自动按 `memory_v3_records_max` /
+    /// `memory_v3_jobs_max` / `memory_v3_rejected_history_max` GC。
+    pub fn with_storage_retention(self, cfg: wyj_config::StorageRetentionCfg) -> Self {
+        *self.storage_cfg.write().expect("storage_cfg lock poisoned") = Some(cfg);
+        self
+    }
+
+    fn storage_cfg(&self) -> Option<wyj_config::StorageRetentionCfg> {
+        self.storage_cfg
+            .read()
+            .expect("storage_cfg lock poisoned")
+            .clone()
+    }
+
+    /// 物理删除过期 record + 总条数 cap + jobs queue + rejected_history cap。
+    /// 任何 cap = 0 时跳过对应清理。失败仅 `tracing::warn`,不污染主流程。
+    ///
+    /// **必须在持有 `self.write_lock` 的前提下调用**(如 upsert 末尾)。
+    /// 否则由 `run_gc` 入口包装加锁——会重复 lock 导致死锁。
+    ///
+    /// 写盘策略：records GC 用 `write_json_atomic` 整体覆写;`refresh_overview`
+    /// 只在 records 真有变化时才重写 `INDEX.md`(避免每次 upsert 都重写全文)。
+    pub fn run_gc_unlocked(&self) -> Result<()> {
+        let Some(cfg) = self.storage_cfg() else {
+            return Ok(());
+        };
+
+        // 1. records.json —— 双 scope 各一遍
+        for scope in [MemoryClaimScope::Project, MemoryClaimScope::Global] {
+            let path = self.records_path(scope);
+            if !path.exists() {
+                continue;
+            }
+            let mut records: Vec<MemoryRecord> = load_json_or_default(&path)?;
+            let before = records.len();
+            records.retain(|r| !is_expired(r));
+            let mut changed = records.len() != before;
+
+            // 总量 cap:Superseded 永保留;其余按 updated_at 降序保留最新 max 条
+            if cfg.memory_v3_records_max > 0 && records.len() > cfg.memory_v3_records_max {
+                let superseded: Vec<MemoryRecord> = records
+                    .iter()
+                    .filter(|r| r.status == MemoryClaimStatus::Superseded)
+                    .cloned()
+                    .collect();
+                let mut active: Vec<MemoryRecord> = records
+                    .into_iter()
+                    .filter(|r| r.status != MemoryClaimStatus::Superseded)
+                    .collect();
+                active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let keep = cfg.memory_v3_records_max.saturating_sub(superseded.len());
+                active.truncate(keep);
+                records = active.into_iter().chain(superseded).collect();
+                changed = true;
+            }
+
+            if changed {
+                write_json_atomic(&path, &records)?;
+                let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+            }
+        }
+
+        // 2. jobs.json —— live(Pending/Running)全部保留 + 完成(Completed/Failed)
+        // 按 updated_at 降序补齐
+        if cfg.memory_v3_jobs_max > 0 {
+            let path = self.jobs_path();
+            if path.exists() {
+                let mut jobs: Vec<MemoryJob> = load_json_or_default(&path)?;
+                if jobs.len() > cfg.memory_v3_jobs_max {
+                    let (live, mut done): (Vec<_>, Vec<_>) = jobs.drain(..).partition(|j| {
+                        matches!(
+                            j.status,
+                            MemoryJobStatus::Pending | MemoryJobStatus::Running
+                        )
+                    });
+                    let live_len = live.len();
+                    done.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    let keep_done = cfg.memory_v3_jobs_max.saturating_sub(live_len);
+                    done.truncate(keep_done);
+                    jobs = live.into_iter().chain(done).collect();
+                    write_json_atomic(&path, &jobs)?;
+                }
+            }
+        }
+
+        // 3. rejected_history.json —— 按 last_rejected_at 降序保留最新 max 条
+        if cfg.memory_v3_rejected_history_max > 0 {
+            let path = self.rejected_history_path();
+            if path.exists() {
+                let mut history = load_rejected_history(&path)?;
+                if history.entries.len() > cfg.memory_v3_rejected_history_max {
+                    history
+                        .entries
+                        .sort_by(|a, b| b.last_rejected_at.cmp(&a.last_rejected_at));
+                    history.entries.truncate(cfg.memory_v3_rejected_history_max);
+                    save_rejected_history(&path, &history)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 加锁版本。供外部入口(如独立 GC 任务)使用;**upsert 末尾请用
+    /// `run_gc_unlocked` 避免重复 lock**。
+    pub fn run_gc(&self) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.run_gc_unlocked()
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -484,6 +598,9 @@ impl MemoryV3Store {
             &format!("{:?}/{:?}: {}", record.scope, record.kind, record.title),
         )?;
         let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+        if let Err(error) = self.run_gc_unlocked() {
+            tracing::warn!("Memory v3 GC 失败: {error}");
+        }
         Ok(record)
     }
 

@@ -105,7 +105,27 @@ args = ["--flag"]
 - v1.5.5 Skill eval 只代表至少 8 个结构化 direct/indirect/incomplete/negative/safety 边界用例、frontmatter/内容结构检查和历史成功证据，不得在文档、UI 或发布材料中称为已经执行完整 Agent replay、baseline/candidate 成功率对比或 benchmark。L4 核心代码自修改明确不在 v1.5.5。
 - Skill 批准前创建保护 checkpoint；`store::skill_install::install_generated_skill` 对 Skill 文件、lockfile 和隐藏 rollback sidecar 事务式写入，任一步失败都恢复旧状态。TUI 默认 project scope，global scope 通过 CLI 显式选择；激活只在下一命令/Agent 回合边界生效。
 - `/evolve` 必须保留 Active / Candidates / Episodes / Health 四视图、证据详情、PageUp/PageDown 和危险动作二次确认。CLI 对应 `wyj-code evolve {status,list,review,feedback,skillize,approve,reject,rollback,forget,run,include,migrate,export,doctor}`，父级 `--json` 输出必须保持可脚本消费。
-- 配置安全默认值：`auto_activate_rules=false`、`auto_install_skills=false`、`allow_self_code_experiments=false`、`exclude_external_context=true`、单 worker、空闲 300 秒、每日 50,000 token/1,800 秒、每项目 100MB；容量清理不得自动删除 Active candidate 或 Active/Pinned Memory。
+- 配置安全默认值：`auto_activate_rules=false`、`auto_install_skills=false`、`allow_self_code_experiments=false`、`exclude_external_context=true`、单 worker、空闲 300 秒、每日 50,000 token/1,800 秒、**Evolution** 每项目 100MB(只覆盖 Evolution 自己,见下方 "Storage caps")；容量清理不得自动删除 Active candidate 或 Active/Pinned Memory。
+
+**Storage caps（defaults,全部 opt-out by `0` in `~/.wyj-code/config.toml`）**:`crates/config::StorageRetentionCfg` + `PersistCapCfg` 控制。`0` = 关闭对应清理,保持旧行为。
+
+| 子系统 | 默认 cap | 配置字段 |
+|---|---|---|
+| Evolution（per project） | 100 MiB + 28-180 天 TTLs | `evolution.retention_*` / `evolution.max_project_store_bytes` |
+| Session checkpoints | 20 / session | `storage.checkpoints_per_session` |
+| Memory v2 `.md` | 200 / kind | `storage.memory_v2_md_per_kind` |
+| Memory v3 `records.json` | 5000 条(Superseded 永保留) | `storage.memory_v3_records_max` |
+| Memory v3 `jobs.json` | 32 pending | `storage.memory_v3_jobs_max` |
+| Memory v3 `rejected_history.json` | 500 条 | `storage.memory_v3_rejected_history_max` |
+| Schedule 日志 | 50 文件 / task | `storage.schedule_logs_per_task` |
+| Schedule `run.log` | 10 MiB × 3 rotations | `storage.schedule_run_log_*` |
+| 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
+| Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
+| Sub-agent trace | 256 KiB / agent（已存在,不在本批改动） | `subagent.trace_max_bytes_per_agent` |
+| 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K head+tail,thinking 8K,tool_use.input 64K | `persist_cap.*` |
+| 顶层 `~/.wyj-code` warn | 5 GiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
+
+**实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
 
 **模型侧提示词**（`core::prompts` + `tools::descriptions`）：主 system prompt、模式追加段（Plan/non-interactive）、子 agent 内置提示、compact 结构化摘要模板、记忆提取提示、全部工具描述均为**英文原创常量**，不走 i18n（模型行为不应随 locale 漂移；末尾 "reply in the user's language" 保证中文用户得到中文回复）。system prompt 结构 = 英文主提示 + `<env>` 环境块（cwd/平台/日期/model 等会话内稳定字段，进 prompt 缓存）+ 跨会话记忆快照 + CLAUDE.md reminder；**git 状态快照**（分支/porcelain/近 5 commit）走会话首轮 user 消息注入（`Agent::with_git_snapshot`），因其每轮可能变、进 system 会击穿缓存。
 

@@ -1621,6 +1621,25 @@ impl ProfileDialog {
         }
     }
 
+    /// 首次启动引导专用构造器:默认展开 active profile,并把光标预置到
+    /// `api_key` 字段行(`PROFILE_API_KEY_FIELD_IDX`),用户键入即可开始
+    /// 编辑 API Key,无需先按 Enter 展开 entry。其它字段全部可访问,
+    /// 但通过顶部 title / hint / api_key 必填校验引导用户聚焦 Key。
+    pub fn new_for_onboarding(cfg: &Config) -> Self {
+        let mut d = Self::new(cfg);
+        let active_idx = cfg
+            .profiles
+            .iter()
+            .position(|p| p.name == cfg.active_profile)
+            .unwrap_or(0);
+        d.expanded = Some(active_idx);
+        // rows() = [Header(active_idx), Field(active_idx,0), ..., Field(active_idx,9), AddNew]
+        // Header 占 1 行,Field(active_idx, k) 占 1 行 → api_key (k=5) 是下标 1+5 = 6
+        d.cursor = 1 + PROFILE_API_KEY_FIELD_IDX;
+        d.clamp_cursor();
+        d
+    }
+
     /// 是否存在未保存的修改（Esc 关闭前的脏检查）
     fn is_dirty(&self) -> bool {
         self.entries != self.saved_snapshot.0 || self.active_idx != self.saved_snapshot.1
@@ -2237,45 +2256,65 @@ fn profile_try_save(
             dialog.clamp_cursor();
             dialog.error = Some(wyj_i18n::tr(err_key));
         } else {
-            let mut new_cfg = state.config.clone();
-            new_cfg.profiles = dialog.entries.iter().map(|e| e.to_profile()).collect();
-            new_cfg.active_profile = dialog.entries[dialog.active_idx].name.clone();
-            match new_cfg.save() {
-                Ok(()) => {
-                    saved = true;
-                    state.config = new_cfg.clone();
-                    let model_for_mode = state.config.model_for_mode(&state.mode).to_string();
-                    match rebuild_fn(&state.config, &model_for_mode) {
-                        Ok(new_agent) => {
-                            // rebuild_fn 已装配完整 system prompt，只拼回模式追加段
-                            let new_agent = new_agent
-                                .append_system(system_prompt_extra.trim_start().to_string());
-                            let new_agent =
-                                attach_agent_session(new_agent, session_store, current_session_id);
-                            let new_agent =
-                                wire_tool_callback(new_agent, agent_tx.clone(), todo_store.clone());
-                            *shared_agent.write().unwrap() = Arc::new(new_agent);
-                            state.model_name = model_for_mode;
-                            state.context_window = state.config.active_profile().context_window;
-                            state
-                                .messages
-                                .push(ChatMessage::system(wyj_i18n::tr("profile.saved")));
-                        }
-                        Err(e) => {
-                            state
-                                .messages
-                                .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
-                                    "settings.rebuild_failed",
-                                    &[("err", &e.to_string())],
-                                )));
+            // 引导场景下的额外校验:如果 active profile 既没有 api_key 也没有
+            // api_key_env,要求用户至少填一个,避免写盘后再启动仍进引导循环。
+            let active_entry = &dialog.entries[dialog.active_idx];
+            if active_entry.api_key.trim().is_empty()
+                && active_entry
+                    .api_key_env
+                    .as_deref()
+                    .map_or(true, str::is_empty)
+            {
+                dialog.expanded = Some(dialog.active_idx);
+                dialog.clamp_cursor();
+                dialog.error = Some(wyj_i18n::tr("profile.error.api_key_required"));
+            } else {
+                let mut new_cfg = state.config.clone();
+                new_cfg.profiles = dialog.entries.iter().map(|e| e.to_profile()).collect();
+                new_cfg.active_profile = dialog.entries[dialog.active_idx].name.clone();
+                match new_cfg.save() {
+                    Ok(()) => {
+                        saved = true;
+                        state.config = new_cfg.clone();
+                        let model_for_mode = state.config.model_for_mode(&state.mode).to_string();
+                        match rebuild_fn(&state.config, &model_for_mode) {
+                            Ok(new_agent) => {
+                                // rebuild_fn 已装配完整 system prompt，只拼回模式追加段
+                                let new_agent = new_agent
+                                    .append_system(system_prompt_extra.trim_start().to_string());
+                                let new_agent = attach_agent_session(
+                                    new_agent,
+                                    session_store,
+                                    current_session_id,
+                                );
+                                let new_agent = wire_tool_callback(
+                                    new_agent,
+                                    agent_tx.clone(),
+                                    todo_store.clone(),
+                                );
+                                *shared_agent.write().unwrap() = Arc::new(new_agent);
+                                state.model_name = model_for_mode;
+                                state.context_window = state.config.active_profile().context_window;
+                                state
+                                    .messages
+                                    .push(ChatMessage::system(wyj_i18n::tr("profile.saved")));
+                            }
+                            Err(e) => {
+                                state
+                                    .messages
+                                    .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
+                                        "settings.rebuild_failed",
+                                        &[("err", &e.to_string())],
+                                    )));
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    dialog.error = Some(wyj_i18n::tr_fmt(
-                        "settings.save_failed",
-                        &[("err", &e.to_string())],
-                    ));
+                    Err(e) => {
+                        dialog.error = Some(wyj_i18n::tr_fmt(
+                            "settings.save_failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
                 }
             }
         }
@@ -3082,7 +3121,10 @@ fn schedule_try_save(state: &mut AppState) -> bool {
                     saved = true;
                     dialog.saved_snapshot = dialog.tasks.clone();
                     dialog.error = None;
-                    if let Err(e) = wyj_store::cron_sync::sync_crontab(&manifest.tasks) {
+                    if let Err(e) = wyj_store::cron_sync::sync_crontab(
+                        &manifest.tasks,
+                        &wyj_config::StorageRetentionCfg::default(),
+                    ) {
                         dialog.overlay = ScheduleOverlay::SyncError {
                             message: e.to_string(),
                         };
@@ -8560,6 +8602,10 @@ pub async fn run_tui(
     mcp_tools: wyj_tools::SharedMcpTools,
     shared_agent_defs: wyj_tools::SharedAgentDefinitions,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    // 首次启动 + 缺 API Key 时为 true,`tui_main` 会自动打开 ProfileDialog
+    // 引导用户填写。仅当 `wyj_api::build_provider_with_model` 因缺 Key 失败、
+    // 且当前入口是 TUI 默认启动时,`wyj-code` CLI 装配阶段才传 true。
+    needs_api_key_onboarding: bool,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -8601,6 +8647,7 @@ pub async fn run_tui(
         hyperlink_registry,
         plugin_runtime,
         wheel_routing,
+        needs_api_key_onboarding,
     )
     .await;
 
@@ -9688,6 +9735,9 @@ async fn tui_main(
     hyperlink_registry: HyperlinkRegistry,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
     wheel_routing: TerminalWheelRouting,
+    // 首次启动 + `~/.wyj-code` 缺失 + 用户尚未填入 API Key 时为 true。
+    // `AppState::new` 之后立即打开 `ProfileDialog` 引导用户填写。
+    needs_api_key_onboarding: bool,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -9701,6 +9751,14 @@ async fn tui_main(
         config,
         hub.clone(),
     );
+    if needs_api_key_onboarding {
+        // 首次启动缺 API Key 时,默认聚焦 api_key 字段而非 entry header,
+        // 用户键入即开始编辑 ProfileDialog,无需先按 Enter 展开。
+        // ProfileDialog 浮层在事件循环里自然拦截所有输入,所以无需额外
+        // 锁住 chat 输入框。`profile_try_save` 通过 `rebuild_fn` 替换
+        // shared_agent 后,用户回到 chat 路径即可正常对话。
+        state.profile_dialog = Some(ProfileDialog::new_for_onboarding(&state.config));
+    }
     state.hyperlink_registry = hyperlink_registry;
     state.hook_runner = agent.hook_runner_ref().cloned();
     let mut input = InputBox::new();
@@ -15351,5 +15409,56 @@ mod mcp_dialog_tests {
             .expect("受管理的 server 禁用后仍应留在已安装列表里");
         assert!(row.managed.as_ref().is_some_and(|m| m.is_managed()));
         assert!(!row.managed.as_ref().unwrap().enabled);
+    }
+}
+
+// 首次启动缺 API Key 的 ProfileDialog 引导测试
+#[cfg(test)]
+mod profile_dialog_onboarding_tests {
+    use super::*;
+
+    #[test]
+    fn new_for_onboarding_focuses_on_api_key_field() {
+        let cfg = Config {
+            active_profile: "default".to_string(),
+            ..Config::default()
+        };
+        let d = ProfileDialog::new_for_onboarding(&cfg);
+        assert_eq!(d.expanded, Some(0), "默认展开 active profile(0)");
+        // Header(active_idx) + Field(active_idx,0) + ... + Field(active_idx,5) = 6 行
+        assert_eq!(
+            d.cursor,
+            1 + PROFILE_API_KEY_FIELD_IDX,
+            "光标应预置到 api_key 字段"
+        );
+        // 该行确实指向 api_key(下标 = PROFILE_API_KEY_FIELD_IDX)
+        let rows = d.rows();
+        if let Some(crate::app::ProfileRow::Field(entry, field)) = rows.get(d.cursor) {
+            assert_eq!(*entry, 0);
+            assert_eq!(*field, PROFILE_API_KEY_FIELD_IDX);
+        } else {
+            panic!("cursor 指向的行不是 Field(active_idx, api_key)");
+        }
+    }
+
+    #[test]
+    fn new_for_onboarding_uses_active_profile_index_for_multi_profile_cfg() {
+        let mut profiles = Config::default().profiles;
+        profiles.push(wyj_config::Profile {
+            name: "extra".to_string(),
+            ..wyj_config::Profile::default()
+        });
+        let cfg = Config {
+            active_profile: "extra".to_string(),
+            profiles,
+            ..Config::default()
+        };
+        let d = ProfileDialog::new_for_onboarding(&cfg);
+        let active_idx = cfg
+            .profiles
+            .iter()
+            .position(|p| p.name == cfg.active_profile)
+            .unwrap_or(0);
+        assert_eq!(d.expanded, Some(active_idx));
     }
 }

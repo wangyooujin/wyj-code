@@ -26,6 +26,8 @@ const UNTRACKED_PATCH_LIMIT: u64 = 256 * 1024;
 #[derive(Debug, Clone)]
 pub struct GitWorktreeManager {
     state_root: PathBuf,
+    /// worktree 自动 prune 的过期天数(builder 注入;0 = 仅 dispose 时清理)。
+    max_age_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,7 +43,17 @@ impl GitWorktreeManager {
         let state_root = state_root.into();
         fs::create_dir_all(state_root.join("worktrees"))?;
         fs::create_dir_all(state_root.join("manifests"))?;
-        Ok(Self { state_root })
+        Ok(Self {
+            state_root,
+            max_age_days: 0,
+        })
+    }
+
+    /// 注入 worktree 自动 prune 过期天数(0 = 不 prune)。`create()` 末尾
+    /// 会调 `git worktree prune --expire=<N days>` 清理过期条目。
+    pub fn with_storage_retention(mut self, max_age_days: u32) -> Self {
+        self.max_age_days = max_age_days;
+        self
     }
 
     pub fn state_root(&self) -> &Path {
@@ -227,13 +239,25 @@ impl ExecutionWorkspaceManager for GitWorktreeManager {
         let manifest = WorkspaceManifest {
             schema_version: crate::INTERFACE_SCHEMA_VERSION,
             workspace: workspace.clone(),
-            repository_root,
+            repository_root: repository_root.clone(),
             created_at: Utc::now().to_rfc3339(),
         };
         fs::write(
             self.manifest_path(&id),
             serde_json::to_vec_pretty(&manifest)?,
         )?;
+        // 周期 prune 过期 worktree 引用;只动 git metadata,不删 worktree 目录
+        if self.max_age_days > 0 {
+            let _ = git(
+                &repository_root,
+                [
+                    OsStr::new("worktree"),
+                    OsStr::new("prune"),
+                    OsStr::new("--expire"),
+                    OsStr::new(&format!("{}.days ago", self.max_age_days)),
+                ],
+            );
+        }
         Ok(workspace)
     }
 
