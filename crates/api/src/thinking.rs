@@ -333,19 +333,42 @@ impl ThinkingSpec {
     }
 
     fn minimax(model: &str) -> Self {
-        let force_on = model.contains("m2") && !model.contains("m3");
-        Self {
-            control: ThinkingControl::SwitchOnly,
-            user_can_disable: !force_on,
-            lock_sampling_params: false,
-            budget_tokens_supported: false,
-            effort_levels: &[],
-            response_fields: ThinkingResponseFields {
-                reasoning_content: true,
-                reasoning_details: true,
-                echo_back_in_messages: true,
-            },
-            ignore_disabled_when_forced: force_on,
+        // M2.x 强制思考（`thinking.type=adaptive`，忽略 user disabled）；
+        // M3 起允许显式关闭、并支持 effort 档位（low / high / max，
+        // 对齐 Moonshot k3 的档位集合，避开 server 端可能不认的 xhigh/adaptive）。
+        let is_m2 = model.contains("m2") && !model.contains("m3");
+        if is_m2 {
+            Self {
+                control: ThinkingControl::SwitchOnly,
+                user_can_disable: false,
+                lock_sampling_params: false,
+                budget_tokens_supported: false,
+                effort_levels: &[],
+                response_fields: ThinkingResponseFields {
+                    reasoning_content: true,
+                    reasoning_details: true,
+                    echo_back_in_messages: true,
+                },
+                ignore_disabled_when_forced: true,
+            }
+        } else {
+            Self {
+                control: ThinkingControl::SwitchPlusEffort,
+                user_can_disable: true,
+                lock_sampling_params: false,
+                budget_tokens_supported: false,
+                effort_levels: &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ],
+                response_fields: ThinkingResponseFields {
+                    reasoning_content: true,
+                    reasoning_details: true,
+                    echo_back_in_messages: true,
+                },
+                ignore_disabled_when_forced: false,
+            }
         }
     }
 
@@ -448,7 +471,18 @@ pub fn adapter_for(identity: &ModelIdentity) -> &'static dyn ThinkingAdapter {
         (WireProtocol::OpenAiChatCompletions, "zhipu") => &ZhipuOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, "volcengine") => &VolcengineOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, "moonshot") => &MoonshotOpenAiAdapter,
-        (WireProtocol::OpenAiChatCompletions, "minimax") => &MinimaxOpenAiAdapter,
+        (WireProtocol::OpenAiChatCompletions, "minimax") => {
+            // M3 起支持 reasoning_effort；M2.x 仍走 SwitchOnly。spec.effort_levels
+            // 是否为空决定了是否能上送 effort，但 &'static adapter 拿不到 model
+            // 信息，所以这里按 model 名分派到 MinimaxAdapter::M2 / M3。
+            if identity.model.to_ascii_lowercase().contains("m3") {
+                static M3_ADAPTER: MinimaxAdapter = MinimaxAdapter::M3;
+                &M3_ADAPTER
+            } else {
+                static M2_ADAPTER: MinimaxAdapter = MinimaxAdapter::M2;
+                &M2_ADAPTER
+            }
+        }
         (WireProtocol::OpenAiChatCompletions, "ollama") => &OllamaOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, _) => &GenericOpenAiAdapter,
         _ => &GenericOpenAiAdapter,
@@ -610,14 +644,51 @@ impl ThinkingAdapter for MoonshotOpenAiAdapter {
 }
 
 /// MiniMax：`thinking.type`（M2.x 强制 adaptive；M3 接受 enabled/disabled）。
-struct MinimaxOpenAiAdapter;
+/// M3 同时支持顶层 `reasoning_effort`（low / high / max），与 switch 分支独立
+/// 写入：user 既可以单独配 effort（adapter 默认 `thinking.type=enabled`），
+/// 也可以单独配 switch（effort 不上送）。
+///
+/// M2.x 与 M3 形态差异显著：M2 SwitchOnly 强制开且**不**支持 effort（M2 服务端
+/// 不认顶层 `reasoning_effort`，发出去会 400）；M3 SwitchPlusEffort 支持 effort
+/// 但仅限 spec.effort_levels = [Low, High, Max] 列出的档位（其它如 xhigh、
+/// adaptive 被 parse 后仍需过滤，避免 server 端不认）。
+///
+/// 单个 `&'static` adapter 实例无法携带 model 信息，因此拆成 enum 两个分支，
+/// `adapter_for` 按 model 名（含 m3）分派到对应 `&'static MinimaxAdapter`。
+enum MinimaxAdapter {
+    M2,
+    M3,
+}
 
-impl ThinkingAdapter for MinimaxOpenAiAdapter {
+impl ThinkingAdapter for MinimaxAdapter {
     fn apply_openai(&self, body: &mut Map<String, Value>, opts: &RequestOptions) {
         if let Some(switch_type) = effective_switch_type(opts, "enabled") {
             body.insert("thinking".to_string(), json!({ "type": switch_type }));
             // MiniMax 启用 reasoning_split 让 thinking 与 content 分字段返回
             body.insert("reasoning_split".to_string(), Value::Bool(true));
+        }
+        // 只在 M3 路径上送 reasoning_effort，且必须命中 spec.effort_levels：
+        //   MINIMAX_M3_EFFORT_LEVELS = [Low, High, Max]（对齐 Moonshot k3）
+        // 其它已识别档位（xhigh / adaptive 等）即使 parse 成功也丢弃，
+        // 避免 server 端不认返回 400。
+        if matches!(self, Self::M3) {
+            if let Some(effort) = opts
+                .reasoning_effort
+                .as_deref()
+                .and_then(ReasoningEffort::parse)
+            {
+                const MINIMAX_M3_EFFORT_LEVELS: &[ReasoningEffort] = &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ];
+                if MINIMAX_M3_EFFORT_LEVELS.contains(&effort) {
+                    body.insert(
+                        "reasoning_effort".to_string(),
+                        Value::String(effort.as_str().to_string()),
+                    );
+                }
+            }
         }
     }
 
@@ -872,27 +943,108 @@ mod tests {
             "MiniMax-M3",
         );
         assert!(spec.user_can_disable);
-        assert_eq!(spec.control, ThinkingControl::SwitchOnly);
-        // M3 spec 没有 effort 档位——adapter 必然不会写 reasoning_effort，
-        // 即便用户在 Profile 里配了 effort（RequestPlan::from_capabilities 也会
-        // 因为 capabilities.thinking != Effort 而把 effort 标记为 dropped，
-        // 不会进入 opts.reasoning_effort）。
-        assert!(spec.effort_levels.is_empty());
+        // M3 从 v1.5.9 起走 SwitchPlusEffort：保留 thinking.type 开关同时
+        // 接受 reasoning_effort 档位（low/high/max，对齐 Moonshot k3）。
+        assert_eq!(spec.control, ThinkingControl::SwitchPlusEffort);
+        assert_eq!(
+            spec.effort_levels,
+            &[
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max
+            ][..]
+        );
         assert!(!spec.budget_tokens_supported);
+        assert!(!spec.ignore_disabled_when_forced);
+        assert!(spec.response_fields.reasoning_details);
     }
 
-    /// M3 路径：spec 是 SwitchOnly，adapter 即便收到 `reasoning_effort` 也不上送。
-    /// 这是 v1.5.9 回归保护——以后误改 adapter 引入 effort 分支立刻在这里爆。
+    /// M3 路径：switch + effort 两条字段独立写入 body。user 既可以单独配 switch、
+    /// 也可以单独配 effort（adapter 因 effort 非空回落到默认 enabled），也可以两者
+    /// 都配。M3 从 v1.5.9 起走 SwitchPlusEffort（与 DeepSeek / Moonshot k3 同形态）。
     #[test]
-    fn minimax_m3_apply_does_not_emit_reasoning_effort() {
-        let id = identity(
+    fn minimax_m3_emits_switch_and_effort_independently() {
+        let id = identity("minimax", WireProtocol::OpenAiChatCompletions, "MiniMax-M3");
+        let adapter = adapter_for(&id);
+
+        // switch + effort 同时配：两条字段独立写入。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("high".to_string()),
+            thinking_switch: Some("enabled".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // 只配 effort：effective_switch_type 因 effort 非空回落到 "enabled"，
+        // body 同时含 thinking + reasoning_split + reasoning_effort。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("max".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+        assert_eq!(body["reasoning_effort"], "max");
+
+        // 只配 switch：effort 不上送（保持 switch 与 effort 独立）。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            thinking_switch: Some("enabled".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_split"], Value::Bool(true));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// M3 effort 档位必须能被 ReasoningEffort::parse 识别；非法字符串（不在
+    /// spec.effort_levels 内的）被 and_then(parse) 静默丢弃，避免 400。
+    #[test]
+    fn minimax_m3_effort_levels_round_trip() {
+        let adapter = adapter_for(&identity(
             "minimax",
             WireProtocol::OpenAiChatCompletions,
             "MiniMax-M3",
+        ));
+        for effort in ["low", "high", "max"] {
+            let mut body = Map::new();
+            let opts = RequestOptions {
+                max_tokens: 1024,
+                reasoning_effort: Some(effort.to_string()),
+                ..Default::default()
+            };
+            adapter.apply_openai(&mut body, &opts);
+            assert_eq!(body["reasoning_effort"], effort, "档位 {effort} 应原样上送");
+        }
+        // 非法档位（xhigh 不在 M3 档位列表里）：parse 失败，adapter 不上送。
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        adapter.apply_openai(&mut body, &opts);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "xhigh 不在 M3 档位列表，应被 parse 过滤: {body:?}"
         );
-        let adapter = adapter_for(&id);
+    }
 
-        // 显式打开 switch + 显式配 effort——两者都给，验证 effort 被无视。
+    /// M2.x 仍是 SwitchOnly 强制开；adapter 不上送 reasoning_effort——
+    /// 冻结当前 M2 行为，避免 M2 误支持 effort（M2 服务端若不认 effort 字段会 400）。
+    #[test]
+    fn minimax_m2_apply_does_not_emit_effort() {
+        let id = identity("minimax", WireProtocol::OpenAiChatCompletions, "MiniMax-M2");
+        let adapter = adapter_for(&id);
         let mut body = Map::new();
         let opts = RequestOptions {
             max_tokens: 1024,
@@ -905,22 +1057,8 @@ mod tests {
         assert_eq!(body["reasoning_split"], Value::Bool(true));
         assert!(
             body.get("reasoning_effort").is_none(),
-            "MiniMax M3 SwitchOnly 不应上送 reasoning_effort: {body:?}"
+            "M2 SwitchOnly 不应上送 reasoning_effort: {body:?}"
         );
-
-        // 只配 effort、不配 switch：effective_switch_type 会因为 effort 非空而
-        // 回落到默认 "enabled"，body 写 thinking + reasoning_split；
-        // 但 SwitchOnly 仍不上送 effort 本身。
-        let mut body = Map::new();
-        let opts = RequestOptions {
-            max_tokens: 1024,
-            reasoning_effort: Some("high".to_string()),
-            ..Default::default()
-        };
-        adapter.apply_openai(&mut body, &opts);
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["reasoning_split"], Value::Bool(true));
-        assert!(body.get("reasoning_effort").is_none());
     }
 
     /// M3 + `thinking_switch = "disabled"`：body 写 thinking.type="disabled"，
