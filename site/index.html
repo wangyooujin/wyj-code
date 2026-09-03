@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.6：Memory v3 收敛为 Global/Project 两层、AI 自动管理项目记忆、Task 续接与“继续”语义、/memory clear-all 一键清空重建。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.11：Session 存储 CAS+Delta 重构（单 checkpoint 从 11MB 降至 ~100KB）、/new 一键开新会话、`wyj-code storage status` 占用诊断。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.6 已公开发布：Memory v3 收敛为 Global/Project 两层、AI 自动管理项目记忆、Task 续接与"继续"语义、/memory clear-all 一键清空重建；安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.11 已公开发布：Session 存储 CAS+Delta 重构（单 checkpoint 从 11MB 降至 ~100KB、整体会话占用降 ~99%）、/new 一键开新会话对齐 Claude Code 语义、`wyj-code storage status` 占用诊断；安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.6</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.11</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.6 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.11 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.6 · Memory v3 最终设计</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.6 已公开交付 Memory v3 收敛为 Global/Project 两层、AI 自动管理项目记忆、Task 续接与"继续"语义、`/memory clear-all` 一键清空重建；历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.11 · Session 存储 CAS 重构 + /new 命令</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.11 公开交付 Session 存储重构：sha256 内容寻址 CAS Blob Pool 把 256 文件 ×21 checkpoint = 5376 份冗余压缩为 256 份真实内容（单 checkpoint 从 11MB → ~100KB）；同 cwd 相邻 checkpoint 自动写 Delta 快照，父链最长 20 层；超大 base64 image / 长 thinking 自动外置到 CAS，session.json 同步瘦身。新增 `/new` slash 命令对齐 Claude Code 新会话语义——自动保存当前会话后分配新 session_id、清空 TUI 状态、无二次确认弹窗；新增 `wyj-code storage {status,doctor,prune}` 占用治理子命令。历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -213,8 +213,8 @@
   <div class="mt-5 reveal rounded-xl border border-phosphor/20 bg-phosphor/[0.04] p-6 sm:p-7">
     <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
       <div class="max-w-3xl">
-        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.6 · Memory v3 单一数据面</h3>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">v3 收敛为 Global/Project 两层（删除共享 Workspace scope），AI 自动管理项目记忆、Project 覆盖 Global 冲突；Global 背景提取走 Pending 候选，需模型用工具三步自然语言确认；新增 Task 类型 + 动态 Project Brief，"继续/接着/resume/go on" 命中即恢复最近 InProgress Task；`/memory clear-all` 一键清空重建，旧记录保留时间戳备份。Evolution 收敛到 GovernanceOnly，普通 Memory 数据层不再被注入也不再自动生成。</p>
+        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.11 · Session 存储重构 (CAS + Delta)</h3>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">新增 `crates/core/src/workspace_cas.rs` 提供 sha256 内容寻址 Blob Pool：`intern()/get()/release()/gc()/stats()`，CAS 路径 `~/.wyj-code/cas/sha256/aa/bb/<hash>.blob + .meta.json`。`FileEntry { hash, inline_bytes, size, sha256 }` 替代内联字节，serde 用 `#[serde(default, alias = "bytes")]` 兼容旧 v1.5.10 落盘。`WorkspaceSnapshot::Delta(DeltaSnapshot)` 同 cwd 自动 fold 父链（最多 20 层），跨 cwd 强制 baseline。`externalize_block_with` 把 >32KB image 与 >16KB thinking 外置，`cas://<hash>` 引用 + `materialize_block_with` 在 resume 时还原。`gc()` 用 `last_ref_at` LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：长会话从 1.15GB 降至 ~3MB（~99.5% 压缩率）。</p>
       </div>
       <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-phosphor hover:text-paper transition-colors text-sm shrink-0" data-i18n="delivery.evolution.plan">查看 Memory v3 实施计划 →</a>
     </div>
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.6 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.11" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.11 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -235,7 +235,7 @@
 
   <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="arch-node reveal rounded-lg p-4">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">775</p>
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">869</p>
       <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
     </div>
     <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
@@ -533,8 +533,28 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.6</span>
+          <span class="font-display font-bold text-phosphor">v1.5.11</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1511">Session 存储重构（M1-M4）：新增 <code class="text-amber-400">crates/core/src/workspace_cas.rs</code> 提供 sha256 内容寻址 Blob Pool（<code class="text-amber-400">intern/get/release/gc/stats</code>），<code class="text-amber-400">FileEntry { hash, inline_bytes, size, sha256 }</code> 替代内联字节 + <code class="text-amber-400">#[serde(default, alias = "bytes")]</code> 兼容旧 v1.5.10 checkpoint；<code class="text-amber-400">WorkspaceSnapshot::Delta</code> 同 cwd 自动 fold 父链（20 层上限），跨 cwd 强制 baseline；<code class="text-amber-400">externalize_block_with</code> 把 &gt;32KB image 与 &gt;16KB thinking 外置到 CAS（<code class="text-amber-400">cas://&lt;hash&gt;</code> 引用，<code class="text-amber-400">materialize_block_with</code> 在 resume 时还原）；<code class="text-amber-400">gc()</code> 用 <code class="text-amber-400">last_ref_at</code> LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。新增 <code class="text-amber-400">/new</code> slash 命令对齐 Claude Code 新会话语义：自动保存当前会话 + 分配新 session_id + 清空 TUI 状态 + 无二次确认弹窗。新增 <code class="text-amber-400">wyj-code storage {status,doctor,prune}</code> 占用治理子命令，<code class="text-amber-400">status --json</code> 可脚本消费。869 workspace 测试 + clippy clean。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.10</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1510">50GB 级磁盘占用默认 cap：Evolution per-project 100MiB + 28–180 天 TTL；Session checkpoint 20/session、Memory v2/v3 records/Superseded 单独计数；Schedule 日志 50 文件 + run.log 10MiB×3 轮转；plugin .git 7 天 <code class="text-amber-400">git gc</code>；workspace worktree 30 天 prune；持久化前 content 截断（tool_result 20K+10K、thinking 8K、tool_use.input 64K）；顶层 <code class="text-amber-400">~/.wyj-code</code> 达 5GiB 启动一次性 warn；全部 opt-out by <code class="text-amber-400">0</code> in config。首次启动 <code class="text-amber-400">~/.wyj-code</code> 缺失时 TUI 自动打开 /model 引导用户填写 API Key（焦点预置 api_key 字段），写盘后 chmod 0600 自动重建 agent，无需重启；headless / -p / ACP / daemon 无 UI 时继续报错但给出指向 TUI 与 <code class="text-amber-400">WYJ_CODE_API_KEY</code> 的可复制 hint。MiniMax M3 thinking 按 <code class="text-amber-400">effort_levels</code> 拆出 <code class="text-amber-400">ReasoningEffort</code>，与 M2 协议并行走不同 vendor dispatch 与 capability 路径。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.6</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v156">Memory v3 收敛为 Global/Project 两层（删除共享 Workspace scope），AI 自动管理项目记忆、Project 覆盖 Global 冲突；Global 背景提取走 Pending 候选，由 Memory 工具三步自然语言确认；新增 Task 类型（InProgress/Completed/Cancelled/Blocked）+ 动态 Project Brief，"继续/接着/resume/go on" 命中即恢复最近未完成任务；`/memory clear-all` 一键清空重建。Evolution 收敛到 GovernanceOnly，普通 Memory 数据层不再注入也不再自动生成。</p>
       </div>
