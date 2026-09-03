@@ -95,12 +95,6 @@ pub trait ToolContext: Send + Sync {
     async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
         false
     }
-    /// 命令无法在 Sandbox 内表达，或显式请求宿主 OS 集成时，请求一次性、
-    /// 不可持久化的越界审批。只有真实交互表面可以返回 true；
-    /// headless/schedule/Hook/SubAgent 默认拒绝。
-    async fn confirm_unsandboxed_fallback(&self, _command: &str, _reason: &str) -> bool {
-        false
-    }
     /// 当前上下文是否有真实人类交互通道。前台 computer-use 接管必须依赖
     /// 这个信号；headless/cron/子 Agent 默认 false，不得把无 UI 当成批准。
     fn supports_interactive_confirmation(&self) -> bool {
@@ -114,11 +108,6 @@ pub trait ToolContext: Send + Sync {
     /// 权限检查中解析一次后被路径或 symlink 竞态绕过。
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<std::path::PathBuf, String> {
         Err(format!("当前工具上下文未授权写入目标：{raw}"))
-    }
-    /// Bash 前后台共用的 OS 隔离策略。自定义测试上下文默认禁用；生产 ToolCtx
-    /// 必须显式返回 enforce/permissive 策略。
-    fn sandbox_policy(&self) -> wyj_sandbox::SandboxPolicy {
-        wyj_sandbox::SandboxPolicy::disabled()
     }
 }
 

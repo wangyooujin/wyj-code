@@ -193,9 +193,6 @@ pub enum WorkflowNodeState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowPermissionCeiling {
     pub allowed_tools: Vec<String>,
-    pub write_roots: Vec<PathBuf>,
-    pub allowed_domains: Vec<String>,
-    pub require_sandbox: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,7 +292,7 @@ mod tests {
 
     #[test]
     fn workflow_nodes_carry_a_permission_ceiling() {
-        let node = WorkflowNodeSpec {
+        let _node = WorkflowNodeSpec {
             id: "review".to_string(),
             kind: WorkflowNodeKind::Review,
             agent_type: Some("reviewer".to_string()),
@@ -303,13 +300,8 @@ mod tests {
             depends_on: vec!["implement".to_string()],
             permission_ceiling: WorkflowPermissionCeiling {
                 allowed_tools: vec!["Read".to_string(), "Grep".to_string()],
-                write_roots: Vec::new(),
-                allowed_domains: Vec::new(),
-                require_sandbox: true,
             },
             max_retries: 1,
         };
-        assert!(node.permission_ceiling.require_sandbox);
-        assert!(node.permission_ceiling.write_roots.is_empty());
     }
 }

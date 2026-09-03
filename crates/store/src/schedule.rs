@@ -17,9 +17,6 @@ pub const SCHEDULE_VERSION: u32 = 2;
 #[serde(default)]
 pub struct SchedulePermissions {
     pub allowed_tools: Vec<String>,
-    pub allow_write: Vec<PathBuf>,
-    pub allowed_domains: Vec<String>,
-    pub require_sandbox: bool,
 }
 
 impl Default for SchedulePermissions {
@@ -29,9 +26,6 @@ impl Default for SchedulePermissions {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            allow_write: Vec::new(),
-            allowed_domains: Vec::new(),
-            require_sandbox: true,
         }
     }
 }
@@ -334,9 +328,6 @@ mod tests {
         let mut manifest = ScheduleManifest::new();
         let permissions = SchedulePermissions {
             allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
-            allow_write: vec![dir.path().join("reports")],
-            allowed_domains: vec!["example.com".to_string()],
-            require_sandbox: false,
         };
         manifest.tasks.push(ScheduleTask {
             id: "abc".to_string(),
@@ -377,7 +368,6 @@ mod tests {
         assert_eq!(manifest.tasks.len(), 1);
         assert!(!manifest.tasks[0].enabled);
         assert!(manifest.tasks[0].needs_permission_review);
-        assert!(manifest.tasks[0].permissions.require_sandbox);
     }
 
     #[test]

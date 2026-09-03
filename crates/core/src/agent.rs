@@ -956,10 +956,6 @@ impl Agent {
                 request_system.push_str(&crate::prompts::current_tool_availability_block(
                     &attached_tool_names,
                 ));
-                request_system.push_str("\n\n");
-                request_system.push_str(&crate::prompts::current_sandbox_runtime_block(
-                    &ctx.sandbox_policy(),
-                ));
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 session.tool_schema_tokens = session
                     .tool_schema_tokens
@@ -1392,7 +1388,7 @@ impl Agent {
                 // fail-closed 边界。模型已经返回多个完整 tool_use 时，协议续轮
                 // 仍要求逐个回填 tool_result；拒绝超额调用会诱发模型重复生成，
                 // 并把本可安全执行的任务拖进纠错死循环。执行阶段继续做原始
-                // schema、权限与 sandbox 校验，并由 parallel_tool_calls 决定
+                // schema、权限校验，并由 parallel_tool_calls 决定
                 // 并发或顺序执行。
                 tracing::warn!(
                     emitted = seen_tool_calls,
@@ -1736,7 +1732,7 @@ impl Agent {
                     (msg.clone(), ToolResultContent::Text(msg), true)
                 }
                 // approve 只能替代交互确认，不能绕过模式白名单、路径范围、
-                // protected path 或 require-sandbox 等强制策略。
+                // protected path 等强制策略。
                 HookOutcome::Approve => {
                     if !ctx.is_allowed(&name, &input) {
                         let msg =

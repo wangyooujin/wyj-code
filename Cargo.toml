@@ -14,7 +14,6 @@ members = [
     "crates/i18n",
     "crates/store",
     "crates/computer",
-    "crates/sandbox",
 ]
 
 [workspace.package]
@@ -109,7 +108,6 @@ wyj-mcp = { path = "crates/mcp" }
 wyj-i18n = { path = "crates/i18n" }
 wyj-store = { path = "crates/store" }
 wyj-computer = { path = "crates/computer" }
-wyj-sandbox = { path = "crates/sandbox" }
 
 [profile.release]
 opt-level = 3

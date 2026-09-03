@@ -159,7 +159,7 @@ pub async fn run_workflow(
     json: bool,
     cwd: PathBuf,
     parent: WorkflowPermissionCeiling,
-    context_template: ToolCtx,
+    _context_template: ToolCtx,
     factory: AgentFactory,
     definitions: wyj_tools::SharedAgentDefinitions,
     code_index: Arc<dyn CodeIndex>,
@@ -173,7 +173,6 @@ pub async fn run_workflow(
 
     let executor = Arc::new(CliWorkflowExecutor {
         cwd: cwd.clone(),
-        context_template,
         factory,
         definitions,
         code_index,
@@ -262,7 +261,6 @@ pub async fn run_workflow(
 
 struct CliWorkflowExecutor {
     cwd: PathBuf,
-    context_template: ToolCtx,
     factory: AgentFactory,
     definitions: wyj_tools::SharedAgentDefinitions,
     code_index: Arc<dyn CodeIndex>,
@@ -405,34 +403,7 @@ impl CliWorkflowExecutor {
 
         let ctx = ToolCtx::new(&execution_cwd);
         ctx.set_execution_surface(ExecutionSurface::SubAgent);
-        ctx.set_sandbox_available(*self.context_template.sandbox_available.read().unwrap());
-        ctx.allow_unsandboxed_fallback(false);
-        {
-            let parent_sandbox = self.context_template.sandbox_policy.read().unwrap();
-            let mut sandbox = ctx.sandbox_policy.write().unwrap();
-            sandbox.mode = parent_sandbox.mode;
-            sandbox.read_roots = parent_sandbox.read_roots.clone();
-            sandbox.deny_read_roots = parent_sandbox.deny_read_roots.clone();
-            sandbox.deny_write_roots = parent_sandbox.deny_write_roots.clone();
-        }
         ctx.set_permission_mode(PermissionMode::Allowlist(allowed));
-        {
-            let mut policy = ctx.permission_policy.write().unwrap();
-            policy.allowed_write_roots.clear();
-            policy.allowed_domains.clear();
-            policy.require_sandbox = context.node.permission_ceiling.require_sandbox;
-        }
-        for root in &context.node.permission_ceiling.write_roots {
-            let root = isolated_workspace
-                .as_ref()
-                .and_then(|workspace| remap_workspace_path(&workspace.root, &self.cwd, root))
-                .unwrap_or_else(|| root.clone());
-            ctx.allow_write_root(&root)
-                .map_err(|error| anyhow::anyhow!("workflow write root: {error}"))?;
-        }
-        for domain in &context.node.permission_ceiling.allowed_domains {
-            ctx.allow_network_domain(domain.clone());
-        }
 
         let dependencies = serde_json::to_string_pretty(&context.dependencies)?;
         let prompt = format!(
@@ -536,24 +507,10 @@ fn prepare_workflow_workspace_at(
 }
 
 fn node_can_modify_workspace(node: &wyj_core::WorkflowNodeSpec) -> bool {
-    !node.permission_ceiling.write_roots.is_empty()
-        && node
-            .permission_ceiling
-            .allowed_tools
-            .iter()
-            .any(|tool| matches!(tool.as_str(), "Write" | "Edit" | "Bash"))
-}
-
-fn remap_workspace_path(worktree: &Path, repository_root: &Path, path: &Path) -> Option<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        repository_root.join(path)
-    };
-    absolute
-        .strip_prefix(repository_root)
-        .ok()
-        .map(|relative| worktree.join(relative))
+    node.permission_ceiling
+        .allowed_tools
+        .iter()
+        .any(|tool| matches!(tool.as_str(), "Write" | "Edit" | "Bash"))
 }
 
 fn last_assistant_text(session: &Session) -> String {
@@ -690,9 +647,6 @@ mod tests {
             depends_on: Vec::new(),
             permission_ceiling: WorkflowPermissionCeiling {
                 allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
-                write_roots: vec![PathBuf::from("src")],
-                allowed_domains: Vec::new(),
-                require_sandbox: true,
             },
             max_retries: 0,
         }
@@ -735,19 +689,5 @@ mod tests {
         );
         assert!(execution.parent_checkpoint_id.is_some());
         workspace.manager.dispose(&execution).unwrap();
-    }
-
-    #[test]
-    fn worktree_path_mapping_only_rebases_repository_paths() {
-        let repo = Path::new("/repo");
-        let worktree = Path::new("/managed/worktree");
-        assert_eq!(
-            remap_workspace_path(worktree, repo, Path::new("src/lib.rs")),
-            Some(PathBuf::from("/managed/worktree/src/lib.rs"))
-        );
-        assert_eq!(
-            remap_workspace_path(worktree, repo, Path::new("/outside/file")),
-            None
-        );
     }
 }

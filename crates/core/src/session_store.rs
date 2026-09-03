@@ -95,6 +95,9 @@ impl SessionStore {
         // 见 `serialize::truncate_session_for_persistence` 与
         // `PersistCapCfg` —— 任意字段为 0 即关闭对应截断,保持旧行为。
         //
+        // Phase 3:再调 `externalize_block` 把超大 image data / thinking
+        // 移到 CAS blob pool,避免 base64 大字段膨胀 session.json。
+        //
         // 这里走 `clone` 而非原地 mutate,是因为 `&SessionFile` 借用不允
         // 许 truncate 调用原地改 messages。`SessionFile::clone` 主要成本在
         // `Vec<Message>`,而 truncate 正是要削减其体积;序列化前 clone 比
@@ -102,6 +105,11 @@ impl SessionStore {
         let mut owned = file.clone();
         if let Some(cfg) = current_persist_cap() {
             crate::serialize::truncate_session_for_persistence(&mut owned, &cfg);
+        }
+        for msg in &mut owned.messages {
+            for block in &mut msg.content {
+                crate::serialize::externalize_block(block);
+            }
         }
         let json = serde_json::to_string(&owned)?;
         std::fs::write(

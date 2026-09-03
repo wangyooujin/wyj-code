@@ -3249,7 +3249,6 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -5247,7 +5246,6 @@ dependencies = [
  "wyj-core",
  "wyj-i18n",
  "wyj-mcp",
- "wyj-sandbox",
  "wyj-store",
  "wyj-tools",
  "wyj-tui",
@@ -5307,6 +5305,7 @@ version = "1.5.10"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "futures",
  "ignore",
@@ -5323,7 +5322,6 @@ dependencies = [
  "wyj-api",
  "wyj-config",
  "wyj-i18n",
- "wyj-sandbox",
 ]
 
 [[package]]
@@ -5348,17 +5346,6 @@ dependencies = [
  "wyj-api",
  "wyj-config",
  "wyj-core",
-]
-
-[[package]]
-name = "wyj-sandbox"
-version = "1.5.10"
-dependencies = [
- "reqwest 0.12.28",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "url",
 ]
 
 [[package]]
@@ -5415,7 +5402,6 @@ dependencies = [
  "wyj-config",
  "wyj-core",
  "wyj-i18n",
- "wyj-sandbox",
 ]
 
 [[package]]
@@ -5445,7 +5431,6 @@ dependencies = [
  "wyj-core",
  "wyj-i18n",
  "wyj-mcp",
- "wyj-sandbox",
  "wyj-store",
  "wyj-tools",
 ]

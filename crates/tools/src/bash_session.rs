@@ -84,34 +84,16 @@ impl BashSessionManager {
     }
 
     /// 启动后台命令，返回任务 id（如 "bash_1"）
-    pub fn spawn(
-        &self,
-        command: &str,
-        cwd: &std::path::Path,
-        sandbox_policy: &wyj_sandbox::SandboxPolicy,
-    ) -> anyhow::Result<String> {
-        let prepared =
-            wyj_sandbox::SandboxRunner::detect().shell_command(command, cwd, sandbox_policy)?;
-        self.spawn_prepared(command, prepared)
+    pub fn spawn(&self, command: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+        self.spawn_prepared(command, cwd)
     }
 
-    /// 仅在 `ToolContext::confirm_unsandboxed_fallback` 已返回 true 后调用。
-    pub fn spawn_unsandboxed(
-        &self,
-        command: &str,
-        cwd: &std::path::Path,
-    ) -> anyhow::Result<String> {
-        let prepared = wyj_sandbox::SandboxRunner::detect().unsandboxed_shell_command(command, cwd);
-        self.spawn_prepared(command, prepared)
-    }
-
-    fn spawn_prepared(
-        &self,
-        command: &str,
-        prepared: std::process::Command,
-    ) -> anyhow::Result<String> {
-        let mut cmd = tokio::process::Command::from(prepared);
-        cmd.stdin(std::process::Stdio::null())
+    fn spawn_prepared(&self, command: &str, cwd: &std::path::Path) -> anyhow::Result<String> {
+        let mut cmd = tokio::process::Command::new("/bin/bash");
+        cmd.arg("-c")
+            .arg(command)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         #[cfg(unix)]
@@ -288,7 +270,6 @@ mod tests {
             .spawn(
                 "echo hello; sleep 0.2; echo done",
                 std::path::Path::new("/tmp"),
-                &wyj_sandbox::SandboxPolicy::disabled(),
             )
             .unwrap();
         let job = mgr.get(&id).unwrap();
@@ -311,13 +292,7 @@ mod tests {
     #[tokio::test]
     async fn kill_terminates_process_group() {
         let mgr = BashSessionManager::default();
-        let id = mgr
-            .spawn(
-                "sleep 30",
-                std::path::Path::new("/tmp"),
-                &wyj_sandbox::SandboxPolicy::disabled(),
-            )
-            .unwrap();
+        let id = mgr.spawn("sleep 30", std::path::Path::new("/tmp")).unwrap();
         let job = mgr.get(&id).unwrap();
         assert_eq!(job.status(), JobStatus::Running);
         assert!(mgr.kill(&id).await.unwrap());

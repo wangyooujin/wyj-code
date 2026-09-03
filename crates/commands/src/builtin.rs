@@ -78,6 +78,27 @@ impl Command for CompactCmd {
     }
 }
 
+// ── /new ────────────────────────────────────────────────────────────────────
+// 对齐 Claude Code `/new`：开启新会话，自动保存当前会话历史到磁盘后分配新
+// session_id、清空 TUI 内存状态。无二次确认弹窗（用户已经明确输入了命令名）。
+pub struct NewCmd;
+
+#[async_trait]
+impl Command for NewCmd {
+    fn name(&self) -> &str {
+        "new"
+    }
+    fn description(&self) -> String {
+        tr("new.desc")
+    }
+    fn usage(&self) -> String {
+        tr("new.usage")
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::StartNewSession)
+    }
+}
+
 // ── /checkpoint /rewind /branch ──────────────────────────────────────────────
 
 pub struct CheckpointCmd;
@@ -1035,26 +1056,6 @@ impl Command for ModelCmd {
     }
 }
 
-// ── /sandbox ─────────────────────────────────────────────────────────────────
-
-pub struct SandboxCmd;
-
-#[async_trait]
-impl Command for SandboxCmd {
-    fn name(&self) -> &str {
-        "sandbox"
-    }
-    fn description(&self) -> String {
-        "Inspect OS sandbox mode, boundaries, dependencies and fallback policy".to_string()
-    }
-    fn usage(&self) -> String {
-        "/sandbox".to_string()
-    }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        Ok(CommandResult::SandboxStatus)
-    }
-}
-
 // ── /mode (占位，实际由 app.rs 硬编码拦截) ────────────────────────────────────
 
 pub struct ModeCmd;
@@ -1543,6 +1544,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(NewCmd));
     reg.register(Arc::new(CheckpointCmd));
     reg.register(Arc::new(RewindCmd));
     reg.register(Arc::new(BranchCmd));
@@ -1556,7 +1558,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
-    reg.register(Arc::new(SandboxCmd));
+    // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
@@ -1595,6 +1597,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(NewCmd));
     reg.register(Arc::new(CheckpointCmd));
     reg.register(Arc::new(RewindCmd));
     reg.register(Arc::new(BranchCmd));
@@ -1608,7 +1611,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ModelCmd));
-    reg.register(Arc::new(SandboxCmd));
+    // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));

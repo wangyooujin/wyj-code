@@ -15,8 +15,6 @@ pub enum CommandResult {
     /// 打开分组（Profile）管理面板（/model 无参触发）
     OpenProfileDialog,
     ModelDoctor(Option<String>),
-    /// 展示当前 sandbox backend、边界、配置覆盖和 fail-closed 语义。
-    SandboxStatus,
     /// 按名切换激活分组（/model <name> 触发）
     SwitchProfile(String),
     /// 手动触发上下文压缩
@@ -56,6 +54,9 @@ pub enum CommandResult {
     },
     /// 打开会话选择器
     OpenSessionPicker,
+    /// 开启全新会话：自动保存当前会话到磁盘、分配新 session_id、清空内存状态。
+    /// 对齐 Claude Code `/new` 语义：无二次确认弹窗（不阻塞用户）。
+    StartNewSession,
     /// 直接恢复指定 session（session-id）
     ResumeSession(String),
     /// 打开配置设置面板（/config 命令触发）

@@ -75,7 +75,7 @@ cli:
   cwd_help: "工作目录（默认当前目录）"
   headless_help: "强制使用 headless REPL 模式"
   plan_help: "Plan 模式：允许只读分析和受限规划文档写入，源码/脚本/配置与 Bash 写入继续拒绝"
-  bypass_help: "Bypass 模式：跳过普通工具确认，但不会关闭 OS sandbox 或覆盖 protected deny"
+  bypass_help: "Bypass 模式：跳过普通工具确认，但不会覆盖 protected deny"
   no_hooks_help: "禁用 Hooks 自动化系统（不执行 .claude/settings.json 中的 shell hook）"
   continue_help: "恢复上次会话（继续上次对话）"
   resume_help: "恢复指定会话 ID（如 sess-1719723000）"
@@ -132,6 +132,7 @@ help:
 
     - `/help` — 显示此帮助
     - `/clear` — 清空对话历史
+    - `/new` — 开启新会话：自动保存当前会话历史到磁盘，分配新 session_id 并清空 TUI 状态（对齐 Claude Code `/new`，无二次确认弹窗）
     - `/compact [提示]` — 手动压缩上下文，减少 token 消耗
     - `/config` — 打开配置设置面板（log_level/language）
     - `/cost` — 显示本会话 token 用量与费用估算（含子 Agent 用量单列）
@@ -209,6 +210,11 @@ hyperlink:
 
 clear:
   desc: "清空当前对话历史"
+
+new:
+  desc: "开启新会话（自动保存当前会话历史到磁盘并分配新 session_id）"
+  usage: "/new"
+  started: "已开始新会话。"
 
 compact:
   desc: "手动压缩对话上下文，减少 token 消耗"
@@ -360,9 +366,6 @@ schedule:
     cwd: "工作目录"
     notify_on_failure: "失败时通知"
     allowed_tools: "允许工具"
-    allow_write: "写入目录"
-    allowed_domains: "网络域名"
-    require_sandbox: "强制 Sandbox"
   dialog:
     hint1: "  ↑↓ 移动  Enter 操作菜单  Ctrl+S 保存"
     hint2: "  Esc 关闭"

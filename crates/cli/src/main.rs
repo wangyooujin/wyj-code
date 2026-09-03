@@ -23,6 +23,7 @@ mod extensions_cmd;
 mod memory_cmd;
 mod review_cmd;
 mod schedule_cmd;
+mod storage_cmd;
 mod trust_cmd;
 mod update_cmd;
 mod workflow_cmd;
@@ -52,18 +53,9 @@ struct Cli {
     /// 本次进程允许调用的工具名；逗号分隔。仅工具名不会自动授权写入范围。
     #[arg(long, value_delimiter = ',')]
     allowed_tools: Vec<String>,
-    /// 本次进程允许写入的目录，可重复指定。
-    #[arg(long = "allow-write")]
-    allow_write: Vec<std::path::PathBuf>,
-    /// 本次进程允许访问的网络域名，可重复指定。
-    #[arg(long = "allow-network")]
-    allow_network: Vec<String>,
     /// Plan 模式本轮额外允许修改的单个文档路径，可重复指定。
     #[arg(long = "allow-plan-write")]
     allow_plan_write: Vec<std::path::PathBuf>,
-    /// Bash/Agent 等进程工具没有 sandbox 时直接拒绝。
-    #[arg(long)]
-    require_sandbox: bool,
     #[arg(short = 'c', long = "continue", help = wyj_i18n::tr("cli.continue_help"))]
     continue_session: bool,
     #[arg(long, help = wyj_i18n::tr("cli.resume_help"))]
@@ -129,6 +121,12 @@ enum Commands {
         #[command(subcommand)]
         command: schedule_cmd::ScheduleCommand,
     },
+    /// 按 TTL + 字节上限本地存储治理(Phase 4)。
+    #[command(name = "storage", about = "Inspect and prune local ~/.wyj-code storage")]
+    Storage {
+        #[command(subcommand)]
+        command: storage_cmd::StorageCommand,
+    },
     /// 批准当前项目级 MCP server（`.wyj-code/mcp.toml`/`.mcp.json`）的信任确认。
     /// 无 UI 通道的场景（`-p`/`--headless`/`schedule run`）会跳过未批准的
     /// 项目级 server 而不连接，配 cron 任务前先用这个命令批准一次。
@@ -145,12 +143,6 @@ enum Commands {
     Session {
         #[command(subcommand)]
         command: SessionCommand,
-    },
-    /// Inspect the effective OS sandbox and network-isolation capabilities.
-    #[command(name = "sandbox")]
-    Sandbox {
-        #[arg(long)]
-        json: bool,
     },
     /// Manage isolated Git worktrees used by coding agents.
     #[command(name = "workspace")]
@@ -628,93 +620,6 @@ fn print_model_doctor_report(report: &wyj_api::ModelDoctorReport) {
     }
 }
 
-fn sandbox_report(config: &wyj_config::SandboxCfg) -> serde_json::Value {
-    let status = wyj_sandbox::SandboxRunner::detect().status();
-    serde_json::json!({
-        "mode": if config.enabled { "enforce" } else { "disabled" },
-        "backend": status.backend,
-        "available": status.available,
-        "filesystem_isolation": status.filesystem_isolation,
-        "domain_network_isolation": status.domain_network_isolation,
-        "network": if config.network.allow_all {
-            serde_json::json!({"policy": "allow_all"})
-        } else if config.network.allowed_domains.is_empty() {
-            serde_json::json!({"policy": "deny"})
-        } else {
-            serde_json::json!({"policy": "allowed_domains", "domains": config.network.allowed_domains})
-        },
-        "environment": {
-            "inherit": config.environment.inherit,
-            "allow": config.environment.allow,
-            "deny": config.environment.deny,
-        },
-        "filesystem": {
-            "allow_read": config.filesystem.allow_read,
-            "allow_write": config.filesystem.allow_write,
-            "deny_read": config.filesystem.deny_read,
-            "deny_write": config.filesystem.deny_write,
-        },
-        "unsandboxed_fallback": {
-            "tui_once": config.enabled && config.allow_unsandboxed_commands,
-            "acp_once": config.enabled && config.allow_unsandboxed_commands,
-            "plan": false,
-            "single_prompt": false,
-            "headless": false,
-            "schedule": false,
-            "hook": false,
-            "sub_agent": false,
-        },
-        "fail_if_unavailable": config.fail_if_unavailable,
-        "dependencies": status.dependencies,
-        "detail": status.detail,
-    })
-}
-
-fn print_sandbox_report(config: &wyj_config::SandboxCfg, json: bool) -> Result<()> {
-    let report = sandbox_report(config);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    println!("Sandbox");
-    println!("  mode: {}", report["mode"].as_str().unwrap_or("unknown"));
-    println!(
-        "  backend: {} (available={})",
-        report["backend"].as_str().unwrap_or("unknown"),
-        report["available"].as_bool().unwrap_or(false)
-    );
-    println!(
-        "  filesystem isolation: {}",
-        report["filesystem_isolation"].as_bool().unwrap_or(false)
-    );
-    println!(
-        "  domain network isolation: {}",
-        report["domain_network_isolation"]
-            .as_bool()
-            .unwrap_or(false)
-    );
-    println!("  network: {}", report["network"]);
-    println!("  environment: {}", report["environment"]);
-    println!("  overrides: {}", report["filesystem"]);
-    println!(
-        "  unsandboxed fallback: TUI/ACP one-shot={} · plan/single-prompt/headless/schedule/hook/sub-agent=false",
-        report["unsandboxed_fallback"]["tui_once"]
-            .as_bool()
-            .unwrap_or(false)
-    );
-    println!(
-        "  fail if unavailable: {}",
-        report["fail_if_unavailable"].as_bool().unwrap_or(false)
-    );
-    if let Some(dependencies) = report["dependencies"].as_array() {
-        for dependency in dependencies {
-            println!("  dependency: {}", dependency.as_str().unwrap_or("unknown"));
-        }
-    }
-    println!("  detail: {}", report["detail"].as_str().unwrap_or(""));
-    Ok(())
-}
-
 fn model_for_routing_role(profile: &wyj_config::Profile, role: RoutingRole) -> String {
     match role {
         RoutingRole::Plan => profile
@@ -792,10 +697,8 @@ fn build_fallback_routes(
 fn workflow_parent_ceiling_from_args(
     cwd: &Path,
     allowed_tools: &[String],
-    write_roots: &[PathBuf],
-    allowed_domains: &[String],
-    require_sandbox: bool,
 ) -> Result<wyj_core::WorkflowPermissionCeiling> {
+    let _ = cwd; // 保留参数位置避免外部调用站点改动
     let mut tools = if allowed_tools.is_empty() {
         let registry = ToolRegistry::standard();
         registry
@@ -813,26 +716,16 @@ fn workflow_parent_ceiling_from_args(
     }
     tools.sort();
     tools.dedup();
-    let context = ToolCtx::new(cwd);
-    for root in write_roots {
-        context
-            .allow_write_root(root)
-            .map_err(|error| anyhow::anyhow!("--allow-write {}: {error}", root.display()))?;
-    }
-    let policy = context.permission_policy.read().unwrap();
     Ok(wyj_core::WorkflowPermissionCeiling {
         allowed_tools: tools,
-        write_roots: policy.allowed_write_roots.clone(),
-        allowed_domains: allowed_domains.to_vec(),
-        require_sandbox,
     })
 }
 
 fn workflow_parent_ceiling(
     registry: &ToolRegistry,
-    context: &ToolCtx,
+    _context: &ToolCtx,
 ) -> wyj_core::WorkflowPermissionCeiling {
-    let mode = context.permission_mode.read().unwrap().clone();
+    let mode = _context.permission_mode.read().unwrap().clone();
     let mut allowed_tools: Vec<String> = registry
         .definitions()
         .into_iter()
@@ -846,15 +739,7 @@ fn workflow_parent_ceiling(
         .collect();
     allowed_tools.sort();
     allowed_tools.dedup();
-    let policy = context.permission_policy.read().unwrap();
-    let mut allowed_domains: Vec<String> = policy.allowed_domains.iter().cloned().collect();
-    allowed_domains.sort();
-    wyj_core::WorkflowPermissionCeiling {
-        allowed_tools,
-        write_roots: policy.allowed_write_roots.clone(),
-        allowed_domains,
-        require_sandbox: policy.require_sandbox,
-    }
+    wyj_core::WorkflowPermissionCeiling { allowed_tools }
 }
 
 #[tokio::main]
@@ -907,9 +792,12 @@ async fn main() -> Result<()> {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return trust_cmd::run(&cwd).await;
             }
+            Commands::Storage { command } => {
+                let config_base = wyj_config::config_dir()?;
+                return storage_cmd::run(command, &config_base, &cfg);
+            }
             Commands::Model { command } => return run_model_command(command, &cfg).await,
             Commands::Session { command } => return run_session_command(command),
-            Commands::Sandbox { json } => return print_sandbox_report(&cfg.sandbox, json),
             Commands::Workspace { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return workspace_cmd::run(command, &cwd);
@@ -920,13 +808,7 @@ async fn main() -> Result<()> {
             }
             Commands::Workflow { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-                let parent = workflow_parent_ceiling_from_args(
-                    &cwd,
-                    &cli.allowed_tools,
-                    &cli.allow_write,
-                    &cli.allow_network,
-                    cli.require_sandbox,
-                )?;
+                let parent = workflow_parent_ceiling_from_args(&cwd, &cli.allowed_tools)?;
                 return workflow_cmd::run_offline(command, &cwd, &parent);
             }
             Commands::Review { command } => {
@@ -1163,11 +1045,25 @@ async fn main() -> Result<()> {
     };
 
     let session_store_arc = session_store.map(std::sync::Arc::new);
+    // CAS blob pool:按 SHA-256 内容寻址去重 checkpoint 内 workspace 文件字节。
+    // 21 checkpoint × 256 文件 = 5376 份冗余 → 256 份唯一,实测单 session 从
+    // 223MB 降到 < 5MB。CAS root 不可写时 capture_files 走 inline 兜底。
+    let workspace_cas = wyj_core::workspace_cas::WorkspaceCas::open_silently(
+        &config_base.join("cas"),
+        cfg.storage.cas_max_blob_bytes,
+    )
+    .map(std::sync::Arc::new);
     let checkpoint_store = session_store_arc
         .as_ref()
         .and_then(|store| {
             wyj_core::CheckpointStore::new(store.dir(), session_id.clone())
-                .map(|s| s.with_max_per_session(cfg.storage.checkpoints_per_session))
+                .map(|s| {
+                    let s = s.with_max_per_session(cfg.storage.checkpoints_per_session);
+                    match workspace_cas.as_ref() {
+                        Some(cas) => s.with_cas(cas.clone()),
+                        None => s,
+                    }
+                })
                 .ok()
         })
         .map(Arc::new);
@@ -1176,6 +1072,8 @@ async fn main() -> Result<()> {
     // 用 OnceLock 全局而非 builder 模式,是为了不改 14+ 个 caller 签名。
     wyj_core::session_store::set_session_persist_cap(cfg.persist_cap.clone());
     wyj_core::checkpoint::set_checkpoint_persist_cap(cfg.persist_cap.clone());
+    // Phase 3:把 CAS 注入到 externalize,落盘前把超大 image / thinking 移到 CAS。
+    wyj_core::serialize::set_externalize_cas(workspace_cas.clone());
 
     let memory_store = MemoryStore::new(&config_base, &cwd)
         .map(|m| {
@@ -1312,9 +1210,6 @@ async fn main() -> Result<()> {
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let tool_ctx = ToolCtx::new(&cwd);
-    tool_ctx
-        .apply_sandbox_config(&cfg.sandbox)
-        .map_err(|error| anyhow::anyhow!("sandbox config: {error}"))?;
     tool_ctx.set_execution_surface(if cli.prompt.is_some() {
         ExecutionSurface::SinglePrompt
     } else if is_protocol_mode {
@@ -1326,21 +1221,11 @@ async fn main() -> Result<()> {
     } else {
         ExecutionSurface::TuiInteractive
     });
-    tool_ctx.require_sandbox(cli.require_sandbox || cfg.sandbox.fail_if_unavailable);
-    for path in &cli.allow_write {
-        let resolved = tool_ctx
-            .allow_write_root(path)
-            .map_err(|error| anyhow::anyhow!("--allow-write {}: {error}", path.display()))?;
-        eprintln!("allow-write: {}", resolved.display());
-    }
     for path in &cli.allow_plan_write {
         let resolved = tool_ctx
             .allow_plan_document(path)
             .map_err(|error| anyhow::anyhow!("--allow-plan-write {}: {error}", path.display()))?;
         eprintln!("allow-plan-write: {}", resolved.display());
-    }
-    for domain in &cli.allow_network {
-        tool_ctx.allow_network_domain(domain.clone());
     }
 
     // Hooks 生命周期自动化：按 `~/.claude/settings.json` + 项目 `.claude/settings.json`
@@ -2766,28 +2651,29 @@ async fn repl(
         // ── ! Bash 内联执行 ──────────────────────────────────────────────────
         if let Some(cmd_str) = trimmed.strip_prefix('!') {
             let cmd_str = cmd_str.trim();
-            let sandbox_policy = ctx.sandbox_policy.read().unwrap().clone();
-            match wyj_sandbox::SandboxRunner::detect().shell_command(cmd_str, &cwd, &sandbox_policy)
-            {
-                Ok(mut command) => match command.output() {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        if !stdout.is_empty() {
-                            print!("{stdout}");
-                        }
-                        if !stderr.is_empty() {
-                            eprint!("{stderr}");
-                        }
-                        if !out.status.success() {
-                            eprintln!("[exit {}]", out.status.code().unwrap_or(-1));
-                        }
+            let mut command = std::process::Command::new("/bin/bash");
+            command
+                .arg("-c")
+                .arg(cmd_str)
+                .current_dir(&cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            match command.output() {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    if !stdout.is_empty() {
+                        print!("{stdout}");
                     }
-                    Err(error) => eprintln!("执行失败: {error}"),
-                },
-                Err(error) => {
-                    eprintln!("Sandbox 拒绝内联命令：{error}；headless 不提供无隔离降级审批");
+                    if !stderr.is_empty() {
+                        eprint!("{stderr}");
+                    }
+                    if !out.status.success() {
+                        eprintln!("[exit {}]", out.status.code().unwrap_or(-1));
+                    }
                 }
+                Err(error) => eprintln!("执行失败: {error}"),
             }
             continue;
         }
@@ -2866,6 +2752,11 @@ async fn repl(
                 }
                 Ok(CommandResult::CompactHistory) => {
                     println!("[headless 模式不支持 /compact]");
+                }
+                Ok(CommandResult::StartNewSession) => {
+                    // headless 没有持久会话内存状态；/new 在单轮 `-p` 模式下无副作用，
+                    // 显式告诉用户结果即可，避免静默忽略让用户以为生效了。
+                    println!("[headless 模式无持续会话, /new 无作用; 多次 -p 视为独立会话]");
                 }
                 Ok(CommandResult::CreateCheckpoint { name, list }) => match &checkpoint_store {
                     Some(store) if list => println!("{}", checkpoint_list_text(store)?),
@@ -3030,10 +2921,6 @@ async fn repl(
                     let report =
                         wyj_api::ModelDoctorReport::static_report(selected, cache.as_ref());
                     print_model_doctor_report(&report);
-                }
-                Ok(CommandResult::SandboxStatus) => {
-                    let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());
-                    print_sandbox_report(&live_cfg.sandbox, false)?;
                 }
                 Ok(CommandResult::RunPrompt(prompt)) => {
                     // Skill 展开后的 prompt → 当作用户消息发给 agent
@@ -3336,21 +3223,9 @@ mod cli_tests {
     }
 
     #[test]
-    fn sandbox_report_exposes_one_shot_host_execution_boundaries() {
-        let report = sandbox_report(&wyj_config::SandboxCfg::default());
-        let fallback = &report["unsandboxed_fallback"];
-        assert_eq!(fallback["tui_once"], true);
-        assert_eq!(fallback["acp_once"], true);
-        for surface in [
-            "plan",
-            "single_prompt",
-            "headless",
-            "schedule",
-            "hook",
-            "sub_agent",
-        ] {
-            assert_eq!(fallback[surface], false, "surface {surface}");
-        }
+    fn sandbox_report_was_removed_with_os_sandbox() {
+        // 占位测试：原本的 `sandbox_report_exposes_one_shot_host_execution_boundaries`
+        // 随 OS sandbox 一起移除。保留这条占位，避免后续误把 sandbox_report 复活。
     }
 
     #[test]
@@ -3402,7 +3277,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn model_doctor_and_sandbox_subcommands_parse_without_live_probe() {
+    fn model_doctor_subcommand_parses_without_live_probe() {
         let cli = Cli::try_parse_from([
             "wyj-code",
             "model",
@@ -3431,12 +3306,6 @@ mod cli_tests {
             }
             other => panic!("expected model doctor, got {other:?}"),
         }
-
-        let cli = Cli::try_parse_from(["wyj-code", "sandbox", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Sandbox { json: true })
-        ));
     }
 
     // ── select_sub_agent_tools：子 Agent 是否能拿到 WebSearch/MCP 工具 ──────

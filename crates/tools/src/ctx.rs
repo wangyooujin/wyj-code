@@ -63,14 +63,9 @@ pub struct ToolCtx {
     pub permission_mode: Arc<RwLock<PermissionMode>>,
     /// 运行表面决定 Prompt 是否真的具备人类审批通道。
     pub execution_surface: Arc<RwLock<ExecutionSurface>>,
-    /// 路径、网络、sandbox 等范围授权。与 permission_mode 分离，确保 bypass
-    /// 也不能关闭受保护路径或 require-sandbox。
+    /// 路径受保护 deny 等范围授权。与 permission_mode 分离，确保 bypass
+    /// 也不能关闭受保护路径。
     pub permission_policy: Arc<RwLock<PermissionPolicy>>,
-    pub sandbox_available: Arc<RwLock<bool>>,
-    pub sandbox_policy: Arc<RwLock<wyj_sandbox::SandboxPolicy>>,
-    /// 是否允许真实交互表面在 sandbox 构造失败后请求一次性直连审批。
-    /// 该开关不影响 headless/schedule/SubAgent，它们始终 fail-closed。
-    pub allow_unsandboxed_fallback: Arc<RwLock<bool>>,
     /// TUI 模式下注入此 sender，工具通过它向 TUI 发起交互
     pub ui_ask_tx: Option<mpsc::Sender<UiAskRequest>>,
     /// 已获项目级授权的工具名集合，启动时从项目级文件载入；AllowAlways，或
@@ -83,18 +78,11 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
-        let cwd = cwd.into();
-        let sandbox_available = wyj_sandbox::SandboxRunner::detect().is_available();
         Self {
-            sandbox_policy: Arc::new(RwLock::new(wyj_sandbox::SandboxPolicy::enforced_workspace(
-                &cwd,
-            ))),
-            cwd,
+            cwd: cwd.into(),
             permission_mode: Arc::new(RwLock::new(PermissionMode::Prompt)),
             execution_surface: Arc::new(RwLock::new(ExecutionSurface::HeadlessRepl)),
             permission_policy: Arc::new(RwLock::new(PermissionPolicy::default())),
-            sandbox_available: Arc::new(RwLock::new(sandbox_available)),
-            allow_unsandboxed_fallback: Arc::new(RwLock::new(true)),
             ui_ask_tx: None,
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
@@ -111,11 +99,6 @@ impl ToolCtx {
             permission_policy: Arc::new(RwLock::new(
                 self.permission_policy.read().unwrap().clone(),
             )),
-            sandbox_available: Arc::new(RwLock::new(*self.sandbox_available.read().unwrap())),
-            sandbox_policy: Arc::new(RwLock::new(self.sandbox_policy.read().unwrap().clone())),
-            allow_unsandboxed_fallback: Arc::new(RwLock::new(
-                *self.allow_unsandboxed_fallback.read().unwrap(),
-            )),
             ui_ask_tx: None,
             always_allowed: RwLock::new(self.always_allowed.read().unwrap().clone()),
             allowed_tools_path: self.allowed_tools_path.clone(),
@@ -131,123 +114,12 @@ impl ToolCtx {
         *self.execution_surface.write().unwrap() = surface;
     }
 
-    pub fn set_sandbox_available(&self, available: bool) {
-        *self.sandbox_available.write().unwrap() = available;
-    }
-
-    pub fn set_sandbox_mode(&self, mode: wyj_sandbox::SandboxMode) {
-        self.sandbox_policy.write().unwrap().mode = mode;
-    }
-
-    pub fn require_sandbox(&self, required: bool) {
-        self.permission_policy.write().unwrap().require_sandbox = required;
-    }
-
-    pub fn allow_unsandboxed_fallback(&self, allowed: bool) {
-        *self.allow_unsandboxed_fallback.write().unwrap() = allowed;
-    }
-
-    pub fn apply_sandbox_config(&self, config: &wyj_config::SandboxCfg) -> Result<(), String> {
-        self.allow_unsandboxed_fallback(config.enabled && config.allow_unsandboxed_commands);
-        self.require_sandbox(config.enabled && config.fail_if_unavailable);
-        if config.network.allow_all && !config.network.allowed_domains.is_empty() {
-            return Err("sandbox.network.allow_all 与 allowed_domains 不能同时启用".to_string());
-        }
-        for name in config
-            .environment
-            .allow
-            .iter()
-            .chain(&config.environment.deny)
-        {
-            if name.is_empty() || name.bytes().any(|byte| matches!(byte, b'=' | b'\0')) {
-                return Err(format!("无效的 sandbox 环境变量名：{name:?}"));
-            }
-        }
-        let environment = wyj_sandbox::EnvironmentPolicy {
-            inherit: config.environment.inherit,
-            allow: config.environment.allow.clone(),
-            deny: config.environment.deny.clone(),
-        };
-        if !config.enabled {
-            let mut policy = wyj_sandbox::SandboxPolicy::disabled();
-            policy.environment = environment;
-            *self.sandbox_policy.write().unwrap() = policy;
-            return Ok(());
-        }
-
-        let resolve = |path: &PathBuf| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                self.cwd.join(path)
-            }
-        };
-        let mut policy = wyj_sandbox::SandboxPolicy::enforced_workspace(&self.cwd);
-        for path in &config.filesystem.allow_read {
-            policy.add_read_root(resolve(path));
-        }
-        for path in &config.filesystem.allow_write {
-            policy.add_write_root(resolve(path));
-        }
-        for path in &config.filesystem.deny_read {
-            policy.add_deny_read_root(resolve(path));
-        }
-        for path in &config.filesystem.deny_write {
-            policy.add_deny_write_root(resolve(path));
-        }
-        if config.network.allow_all {
-            policy.network = wyj_sandbox::NetworkPolicy::AllowAll;
-        } else if !config.network.allowed_domains.is_empty() {
-            policy.network =
-                wyj_sandbox::NetworkPolicy::AllowedDomains(config.network.allowed_domains.clone());
-        }
-        policy.environment = environment;
-        *self.sandbox_policy.write().unwrap() = policy;
-        Ok(())
-    }
-
-    pub fn replace_sandbox_policy(&self, policy: wyj_sandbox::SandboxPolicy) {
-        *self.sandbox_policy.write().unwrap() = policy;
-    }
-
-    pub fn allow_write_root(&self, path: &Path) -> Result<PathBuf, String> {
-        self.permission_policy
-            .write()
-            .unwrap()
-            .add_allowed_write_root(&self.cwd, path)
-            .inspect(|resolved| {
-                self.sandbox_policy
-                    .write()
-                    .unwrap()
-                    .add_write_root(resolved.clone());
-            })
-            .map_err(|reason| reason.message)
-    }
-
     pub fn allow_plan_document(&self, path: &Path) -> Result<PathBuf, String> {
         self.permission_policy
             .write()
             .unwrap()
             .add_plan_document_grant(&self.cwd, path)
             .map_err(|reason| reason.message)
-    }
-
-    pub fn allow_network_domain(&self, domain: impl Into<String>) {
-        let domain = domain.into().to_ascii_lowercase();
-        self.permission_policy
-            .write()
-            .unwrap()
-            .allowed_domains
-            .insert(domain.clone());
-        let mut sandbox = self.sandbox_policy.write().unwrap();
-        match &mut sandbox.network {
-            wyj_sandbox::NetworkPolicy::AllowedDomains(domains) => {
-                if !domains.contains(&domain) {
-                    domains.push(domain);
-                }
-            }
-            _ => sandbox.network = wyj_sandbox::NetworkPolicy::AllowedDomains(vec![domain]),
-        }
     }
 
     /// 按当前 cwd 所属项目（git 仓库根）载入「始终允许」列表并设定持久化路径。
@@ -311,7 +183,6 @@ impl ToolContext for ToolCtx {
             tool_name: name.to_string(),
             input: input.clone(),
             cwd: self.cwd.clone(),
-            sandbox_available: *self.sandbox_available.read().unwrap(),
         };
         match self.permission_policy.read().unwrap().evaluate(&request) {
             PermissionVerdict::Allow | PermissionVerdict::Ask(_) => true,
@@ -409,33 +280,6 @@ impl ToolContext for ToolCtx {
         }
     }
 
-    async fn confirm_unsandboxed_fallback(&self, command: &str, reason: &str) -> bool {
-        if matches!(
-            &*self.permission_mode.read().unwrap(),
-            PermissionMode::Plan(_)
-        ) || !self.execution_surface.read().unwrap().is_interactive()
-            || !*self.allow_unsandboxed_fallback.read().unwrap()
-        {
-            return false;
-        }
-        let tx = match &self.ui_ask_tx {
-            Some(tx) => tx,
-            None => return false,
-        };
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let req = UiAskRequest::ToolPermission {
-            tool_name: "Bash (unsandboxed fallback)".to_string(),
-            action_summary: format!(
-                "该命令需要越过 Bash sandbox 边界：{reason}\n\n仅本次在宿主执行：\n{command}"
-            ),
-            response_tx,
-        };
-        if tx.send(req).await.is_err() {
-            return false;
-        }
-        matches!(response_rx.await, Ok(PermissionDecision::AllowOnce))
-    }
-
     fn is_plan_mode(&self) -> bool {
         matches!(
             &*self.permission_mode.read().unwrap(),
@@ -445,10 +289,6 @@ impl ToolContext for ToolCtx {
 
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         safe_resolve_write_target(&self.cwd, raw).map_err(|reason| reason.message)
-    }
-
-    fn sandbox_policy(&self) -> wyj_sandbox::SandboxPolicy {
-        self.sandbox_policy.read().unwrap().clone()
     }
 }
 
@@ -507,61 +347,6 @@ mod tests {
         assert!(ctx2.always_allowed.read().unwrap().contains("Bash"));
 
         std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn sandbox_config_can_enable_host_environment_and_unrestricted_network() {
-        let ctx = ToolCtx::new("/tmp");
-        let mut config = wyj_config::SandboxCfg::default();
-        config.network.allow_all = true;
-        config.environment.inherit = true;
-        config.environment.allow.push("JAVA_HOME".to_string());
-        config.environment.deny.push("PRIVATE_TOKEN".to_string());
-
-        ctx.apply_sandbox_config(&config).unwrap();
-        let policy = ctx.sandbox_policy.read().unwrap();
-        assert_eq!(policy.network, wyj_sandbox::NetworkPolicy::AllowAll);
-        assert!(policy.environment.inherit);
-        assert!(policy.environment.allow.contains(&"JAVA_HOME".to_string()));
-        assert!(policy
-            .environment
-            .deny
-            .contains(&"PRIVATE_TOKEN".to_string()));
-    }
-
-    #[test]
-    fn sandbox_config_rejects_ambiguous_network_policy() {
-        let ctx = ToolCtx::new("/tmp");
-        let mut config = wyj_config::SandboxCfg::default();
-        config.network.allow_all = true;
-        config
-            .network
-            .allowed_domains
-            .push("example.com".to_string());
-        assert!(ctx.apply_sandbox_config(&config).is_err());
-    }
-
-    #[test]
-    fn sandbox_config_rejects_invalid_environment_names() {
-        let ctx = ToolCtx::new("/tmp");
-        let mut config = wyj_config::SandboxCfg::default();
-        config.environment.allow.push("BAD=NAME".to_string());
-        assert!(ctx.apply_sandbox_config(&config).is_err());
-    }
-
-    #[test]
-    fn disabled_sandbox_still_applies_environment_policy() {
-        let ctx = ToolCtx::new("/tmp");
-        let mut config = wyj_config::SandboxCfg {
-            enabled: false,
-            ..wyj_config::SandboxCfg::default()
-        };
-        config.environment.inherit = true;
-
-        ctx.apply_sandbox_config(&config).unwrap();
-        let policy = ctx.sandbox_policy.read().unwrap();
-        assert_eq!(policy.mode, wyj_sandbox::SandboxMode::Disabled);
-        assert!(policy.environment.inherit);
     }
 
     #[tokio::test]
@@ -745,78 +530,5 @@ mod tests {
         assert!(!ctx.confirm_tool("Bash", "rm -rf /").await);
         responder.await.unwrap();
         assert!(!ctx.always_allowed.read().unwrap().contains("Bash"));
-    }
-
-    #[tokio::test]
-    async fn unsandboxed_fallback_is_tui_only_and_one_shot() {
-        let mut headless = ToolCtx::new("/tmp");
-        headless.set_execution_surface(ExecutionSurface::HeadlessRepl);
-        let (tx, _rx) = mpsc::channel(1);
-        headless.ui_ask_tx = Some(tx);
-        assert!(
-            !headless
-                .confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
-                .await
-        );
-
-        let mut plan = ToolCtx::new("/tmp");
-        plan.set_execution_surface(ExecutionSurface::TuiInteractive);
-        plan.set_permission_mode(PermissionMode::Plan(
-            ["Bash".to_string()].into_iter().collect(),
-        ));
-        let (tx, _rx) = mpsc::channel(1);
-        plan.ui_ask_tx = Some(tx);
-        assert!(
-            !plan
-                .confirm_unsandboxed_fallback("pwd", "explicit host execution")
-                .await
-        );
-
-        let mut tui = ToolCtx::new("/tmp");
-        tui.set_execution_surface(ExecutionSurface::TuiInteractive);
-        let (tx, mut rx) = mpsc::channel(1);
-        tui.ui_ask_tx = Some(tx);
-        let responder = tokio::spawn(async move {
-            if let Some(UiAskRequest::ToolPermission {
-                tool_name,
-                action_summary,
-                response_tx,
-                ..
-            }) = rx.recv().await
-            {
-                assert_eq!(tool_name, "Bash (unsandboxed fallback)");
-                assert!(action_summary.contains("越过 Bash sandbox 边界"));
-                assert!(action_summary.contains("仅本次在宿主执行"));
-                let _ = response_tx.send(PermissionDecision::AllowOnce);
-            }
-        });
-        assert!(
-            tui.confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
-                .await
-        );
-        responder.await.unwrap();
-        assert!(!tui
-            .always_allowed
-            .read()
-            .unwrap()
-            .contains("Bash (unsandboxed fallback)"));
-    }
-
-    #[tokio::test]
-    async fn unsandboxed_fallback_cannot_be_persisted_with_allow_always() {
-        let mut tui = ToolCtx::new("/tmp");
-        tui.set_execution_surface(ExecutionSurface::TuiInteractive);
-        let (tx, mut rx) = mpsc::channel(1);
-        tui.ui_ask_tx = Some(tx);
-        let responder = tokio::spawn(async move {
-            if let Some(UiAskRequest::ToolPermission { response_tx, .. }) = rx.recv().await {
-                let _ = response_tx.send(PermissionDecision::AllowAlways);
-            }
-        });
-        assert!(
-            !tui.confirm_unsandboxed_fallback("pwd", "sandbox unavailable")
-                .await
-        );
-        responder.await.unwrap();
     }
 }
