@@ -14,6 +14,8 @@
 //! 产生同样的"头 100 字节 + `[truncated N bytes]` + 尾 100 字节"。
 
 use crate::session_store::SessionFile;
+use crate::workspace_cas::WorkspaceCas;
+use std::sync::{Arc, Mutex};
 use wyj_api::types::{ContentBlock as ApiContentBlock, Message, ToolResultContent, ToolResultPart};
 use wyj_config::PersistCapCfg;
 
@@ -167,6 +169,146 @@ fn truncate_tool_result(content: &mut ToolResultContent, cfg: &PersistCapCfg) {
     }
 }
 
+// ==================== Phase 3: ContentBlock 外部化到 CAS ====================
+
+/// 全局 CAS 引用,供 `externalize_block` 在落盘前把 image / 长 thinking 数据
+/// 移到 CAS blob pool。None 时 externalize 跳过(等价于旧行为)。
+/// 由 CLI 装配阶段注入(参考 `set_session_persist_cap`)。生产代码 set 一次,
+/// 内部用 Mutex 是为了允许单测重置(OnceLock 只能 set 一次,不够灵活)。
+static EXTERNALIZE_CAS: Mutex<Option<Arc<WorkspaceCas>>> = Mutex::new(None);
+
+pub fn set_externalize_cas(cas: Option<Arc<WorkspaceCas>>) {
+    *EXTERNALIZE_CAS.lock().expect("EXTERNALIZE_CAS poisoned") = cas;
+}
+
+fn current_externalize_cas() -> Option<Arc<WorkspaceCas>> {
+    EXTERNALIZE_CAS
+        .lock()
+        .expect("EXTERNALIZE_CAS poisoned")
+        .clone()
+}
+
+/// CAS 引用占位符前缀。`ToolResultPart::Image.data == "cas://<hash>..."` 表示
+/// 真实 base64 数据已存入 CAS,调用方(agent 读 session)需 `cas.get()` 还原。
+pub const CAS_URI_PREFIX: &str = "cas://";
+
+/// 落盘前对超大字段(image / thinking)做 CAS 外部化。
+/// 失败时返回原 block 不变(不阻断序列化)。
+/// 阈值:base64 image > 32KB 或 thinking > 16KB 时外置。
+/// `cas == None` 时不外置,等价于旧行为。`Some(cas)` 时用传入的 CAS,
+/// 不读 global 状态 —— 避免测试并发跑时 global 互相覆盖。
+pub fn externalize_block_with(block: &mut ApiContentBlock, cas: Option<&WorkspaceCas>) {
+    let Some(cas) = cas else {
+        return;
+    };
+    match block {
+        ApiContentBlock::ToolResult {
+            content: ToolResultContent::Parts(parts),
+            ..
+        } => {
+            for part in parts.iter_mut() {
+                if let ToolResultPart::Image { data, .. } = part {
+                    if data.len() <= 32 * 1024 {
+                        continue; // 阈值下不外置
+                    }
+                    match cas.intern(data.as_bytes()) {
+                        Ok(hash) => {
+                            *data = format!("{CAS_URI_PREFIX}{hash}");
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "CAS image externalize 失败 ({} bytes): {error}",
+                                data.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        ApiContentBlock::ToolResult { .. } => {}
+        ApiContentBlock::Thinking { thinking, .. } => {
+            if thinking.len() <= 16 * 1024 {
+                return;
+            }
+            let original_len = thinking.len();
+            match cas.intern(thinking.as_bytes()) {
+                Ok(hash) => {
+                    *thinking = format!(
+                        "[externalized to cas://{}, {} bytes]",
+                        &hash[..12],
+                        original_len
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "CAS thinking externalize 失败 ({} bytes): {error}",
+                        original_len
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 兼容 wrapper:从 global CAS 读取(生产代码使用)。
+pub fn externalize_block(block: &mut ApiContentBlock) {
+    externalize_block_with(block, current_externalize_cas().as_deref());
+}
+
+/// 把 externalize 过的 block 还原(in-memory,resume 时用)。
+/// `cas == None` 时不还原(等价于保持原样)。
+pub fn materialize_block_with(block: &mut ApiContentBlock, cas: Option<&WorkspaceCas>) {
+    let Some(cas) = cas else {
+        return;
+    };
+    match block {
+        ApiContentBlock::ToolResult {
+            content: ToolResultContent::Parts(parts),
+            ..
+        } => {
+            for part in parts.iter_mut() {
+                if let ToolResultPart::Image { data, .. } = part {
+                    if let Some(hash) = data.strip_prefix(CAS_URI_PREFIX) {
+                        match cas.get(hash) {
+                            Ok(bytes) => {
+                                // 假定 data 是 base64 字符串;把原始字节重新 base64 编码
+                                use base64::engine::general_purpose::STANDARD;
+                                use base64::Engine as _;
+                                *data = STANDARD.encode(&bytes);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "CAS image materialize 失败 (hash={hash}): {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ApiContentBlock::ToolResult { .. } => {}
+        ApiContentBlock::Thinking { thinking, .. } => {
+            if let Some(rest) = thinking.strip_prefix("[externalized to cas://") {
+                if let Some(hash_end) = rest.find(',') {
+                    let hash = &rest[..hash_end];
+                    if let Ok(bytes) = cas.get(hash) {
+                        if let Ok(text) = String::from_utf8(bytes) {
+                            *thinking = text;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 兼容 wrapper:从 global CAS 读取(生产代码使用)。
+pub fn materialize_block(block: &mut ApiContentBlock) {
+    materialize_block_with(block, current_externalize_cas().as_deref());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +348,159 @@ mod tests {
         assert!(out.contains("[truncated"));
         assert!(out.starts_with('中'));
         assert!(out.ends_with('中'));
+    }
+
+    // ==================== Phase 3 externalize tests ====================
+
+    use super::{externalize_block_with, materialize_block_with};
+    use crate::workspace_cas::WorkspaceCas;
+    use wyj_api::types::{ContentBlock, ToolResultContent, ToolResultPart};
+
+    fn make_test_cas() -> (tempfile::TempDir, std::sync::Arc<WorkspaceCas>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(WorkspaceCas::open(dir.path(), 1024 * 1024).unwrap());
+        (dir, cas)
+    }
+
+    #[test]
+    fn externalize_image_above_threshold_to_cas() {
+        let (_dir, cas) = make_test_cas();
+        let big_data = "A".repeat(64 * 1024); // 64KB,超过 32KB 阈值
+        let mut block = ContentBlock::ToolResult {
+            tool_use_id: "t1".to_string(),
+            content: ToolResultContent::Parts(vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: big_data.clone(),
+            }]),
+            is_error: false,
+        };
+        externalize_block_with(&mut block, Some(cas.as_ref()));
+        let ContentBlock::ToolResult { content, .. } = &block else {
+            panic!()
+        };
+        let ToolResultContent::Parts(parts) = content else {
+            panic!()
+        };
+        let ToolResultPart::Image { data, .. } = &parts[0] else {
+            panic!()
+        };
+        assert!(data.starts_with("cas://"), "data 应该是 cas:// 引用: {data}");
+        let hash = &data[6..];
+        assert_eq!(hash.len(), 64);
+        // CAS 应有 1 个 blob
+        let stats = cas.stats().unwrap();
+        assert_eq!(stats.total_blobs, 1);
+        assert_eq!(stats.total_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn externalize_image_below_threshold_keeps_inline() {
+        let (_dir, cas) = make_test_cas();
+        let small_data = "B".repeat(1024); // 1KB,低于 32KB 阈值
+        let mut block = ContentBlock::ToolResult {
+            tool_use_id: "t2".to_string(),
+            content: ToolResultContent::Parts(vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: small_data.clone(),
+            }]),
+            is_error: false,
+        };
+        externalize_block_with(&mut block, Some(cas.as_ref()));
+        let ContentBlock::ToolResult { content, .. } = &block else {
+            panic!()
+        };
+        let ToolResultContent::Parts(parts) = content else {
+            panic!()
+        };
+        let ToolResultPart::Image { data, .. } = &parts[0] else {
+            panic!()
+        };
+        assert_eq!(data, &small_data, "阈值下不外置,保持 inline");
+    }
+
+    #[test]
+    fn externalize_thinking_above_threshold_to_cas() {
+        let (_dir, cas) = make_test_cas();
+        let long = "X".repeat(20 * 1024); // 20KB,超过 16KB
+        let mut block = ContentBlock::Thinking {
+            thinking: long.clone(),
+            signature: String::new(),
+            reasoning_details: None,
+        };
+        externalize_block_with(&mut block, Some(cas.as_ref()));
+        let ContentBlock::Thinking { thinking, .. } = &block else {
+            panic!()
+        };
+        assert!(
+            thinking.starts_with("[externalized to cas://"),
+            "thinking 应被外置,实际: {thinking}"
+        );
+    }
+
+    #[test]
+    fn materialize_roundtrip_restores_image() {
+        let (_dir, cas) = make_test_cas();
+        let original_data = "P".repeat(64 * 1024);
+        let original_bytes = original_data.as_bytes().to_vec();
+        let mut block = ContentBlock::ToolResult {
+            tool_use_id: "t3".to_string(),
+            content: ToolResultContent::Parts(vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: original_data.clone(),
+            }]),
+            is_error: false,
+        };
+        externalize_block_with(&mut block, Some(cas.as_ref()));
+        // 此时 data 是 cas://<hash>
+        let ContentBlock::ToolResult { content, .. } = block.clone() else {
+            panic!()
+        };
+        let ToolResultContent::Parts(parts) = content else {
+            panic!()
+        };
+        let ToolResultPart::Image { data, .. } = &parts[0] else {
+            panic!()
+        };
+        assert!(data.starts_with("cas://"));
+        // materialize 应从 CAS 还原
+        materialize_block_with(&mut block, Some(cas.as_ref()));
+        let ContentBlock::ToolResult { content, .. } = &block else {
+            panic!()
+        };
+        let ToolResultContent::Parts(parts) = content else {
+            panic!()
+        };
+        let ToolResultPart::Image { data: restored, .. } = &parts[0] else {
+            panic!()
+        };
+        // 还原后是 base64 编码
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let decoded = STANDARD.decode(restored).unwrap();
+        assert_eq!(decoded, original_bytes);
+    }
+
+    #[test]
+    fn externalize_without_cas_is_noop() {
+        // 传 None → externalize 跳过,保持 inline
+        let mut block = ContentBlock::ToolResult {
+            tool_use_id: "t4".to_string(),
+            content: ToolResultContent::Parts(vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: "Z".repeat(64 * 1024),
+            }]),
+            is_error: false,
+        };
+        externalize_block_with(&mut block, None);
+        let ContentBlock::ToolResult { content, .. } = &block else {
+            panic!()
+        };
+        let ToolResultContent::Parts(parts) = content else {
+            panic!()
+        };
+        let ToolResultPart::Image { data, .. } = &parts[0] else {
+            panic!()
+        };
+        assert!(!data.starts_with("cas://"));
     }
 }

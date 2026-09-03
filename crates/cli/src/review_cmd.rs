@@ -346,16 +346,6 @@ fn scan_added_line(path: &Path, line: u32, added: &str) -> Vec<ReviewFinding> {
             "checkout persists repository credentials",
         ),
         (
-            "permission.sandbox_disabled",
-            "require_sandbox = false", // review-rule-definition
-            "sandbox requirement is explicitly disabled",
-        ),
-        (
-            "permission.unsandboxed_default",
-            "allow_unsandboxed_fallback = true", // review-rule-definition
-            "unsandboxed fallback is enabled by default",
-        ),
-        (
             "permission.bypass_default",
             "bypass_permissions = true", // review-rule-definition
             "permission bypass is enabled by default",

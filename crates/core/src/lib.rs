@@ -27,6 +27,7 @@ pub mod tool_arguments;
 pub mod tool_search;
 pub mod workflow;
 pub mod workspace;
+pub mod workspace_cas;
 
 pub use agent::{Agent, AgentRoute, InjectionKind, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};

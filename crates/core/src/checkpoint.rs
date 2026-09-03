@@ -7,7 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use wyj_api::types::Message;
+
+use crate::workspace_cas::WorkspaceCas;
 
 const CHECKPOINT_VERSION: u32 = 1;
 const NON_GIT_MAX_FILES: usize = 256;
@@ -49,6 +52,7 @@ impl Checkpoint {
         match &self.workspace {
             WorkspaceSnapshot::Git(snapshot) => &snapshot.repo_root,
             WorkspaceSnapshot::Files(snapshot) => &snapshot.root,
+            WorkspaceSnapshot::Delta(snapshot) => &snapshot.root,
         }
     }
 }
@@ -57,7 +61,50 @@ impl Checkpoint {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkspaceSnapshot {
     Git(GitSnapshot),
+    /// 完整 snapshot(baseline 节点 / 切换 cwd 后第一个 checkpoint)
     Files(FileSnapshot),
+    /// 相对父 checkpoint 的 structural diff(Phase 2 优化)。
+    /// restore 时沿 parent_id 链向上折叠直至 baseline。
+    Delta(DeltaSnapshot),
+}
+
+/// Delta snapshot:只存相对父 checkpoint 的文件级 diff(Added/Removed/Modified)。
+/// Unchanged 不入 ops。restore 时通过 `resolve_snapshot_chain` 沿父链折叠。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaSnapshot {
+    pub root: PathBuf,
+    /// 父 checkpoint id;链上直到 baseline。
+    pub parent_checkpoint_id: String,
+    /// path -> op;用 BTreeMap 便于 deterministic 序列化。
+    pub ops: BTreeMap<PathBuf, DeltaOp>,
+    pub captured_bytes: u64,
+    pub skipped_files: usize,
+    #[serde(default)]
+    pub sensitive_files_skipped: usize,
+    /// baseline 后该 chain 的实际文件总数(用于完整性判定)。
+    pub baseline_file_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum DeltaOp {
+    Added {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline: Vec<u8>,
+        size: u64,
+        sha256: String,
+    },
+    Removed,
+    Modified {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline: Vec<u8>,
+        size: u64,
+        sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +136,19 @@ pub struct FileSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
-    pub bytes: Vec<u8>,
+    /// CAS 内容寻址哈希(SHA-256 hex)。None 表示 inline_bytes 路径(空文件 /
+    /// 超阈值文件 / CAS root 不可写 fallback)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// 仅 hash == None 时使用:超阈值的内联字节或空文件。
+    /// 老 v1 文件直接含 `bytes: Vec<u8>` 字段,通过 `#[serde(default, alias)]` 兼容读。
+    #[serde(default, alias = "bytes", skip_serializing_if = "Vec::is_empty")]
+    pub inline_bytes: Vec<u8>,
+    #[serde(default)]
+    pub size: u64,
+    /// SHA-256 hex —— 沿用旧字段供 `changed_file_paths` 做 structural diff
+    /// (Phase 2 delta 用),不重新计算。
+    #[serde(default)]
     pub sha256: String,
 }
 
@@ -100,6 +159,13 @@ pub struct CheckpointSummary {
     pub kind: CheckpointKind,
     pub timestamp: String,
     pub message_count: usize,
+    /// Phase 2:cwd canonicalize 后的绝对路径,用于 pick_baseline 同 cwd 优先
+    #[serde(default)]
+    pub cwd_root: String,
+    /// Phase 2:若本 checkpoint 是 Delta 形式,指向其父 baseline checkpoint id;
+    /// baseline 节点或 Git snapshot 时为 None。
+    #[serde(default)]
+    pub baseline_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +198,9 @@ pub struct CheckpointStore {
     dir: PathBuf,
     /// 单 session checkpoint 上限(builder 注入;0 = 不限)。
     max_per_session: usize,
+    /// 可选 CAS 池。capture_files / restore_files_snapshot 走 CAS 减少 checkpoint 体积。
+    /// None 表示不接 CAS(测试或回滚场景),全部 inline_bytes。
+    cas: Option<Arc<WorkspaceCas>>,
 }
 
 impl CheckpointStore {
@@ -144,6 +213,7 @@ impl CheckpointStore {
             session_id,
             dir,
             max_per_session: 0,
+            cas: None,
         })
     }
 
@@ -152,6 +222,17 @@ impl CheckpointStore {
     pub fn with_max_per_session(mut self, max: usize) -> Self {
         self.max_per_session = max;
         self
+    }
+
+    /// 注入 CAS 池(builder 模式)。CAS root 不可用时 capture_files 走 inline 兜底,
+    /// 不阻断 checkpoint 写入。
+    pub fn with_cas(mut self, cas: Arc<WorkspaceCas>) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    pub fn cas(&self) -> Option<&WorkspaceCas> {
+        self.cas.as_deref()
     }
 
     pub fn dir(&self) -> &Path {
@@ -170,6 +251,24 @@ impl CheckpointStore {
             chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ"),
             &uuid::Uuid::new_v4().simple().to_string()[..8]
         );
+        let cwd_root = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .display()
+            .to_string();
+        let truncated_messages: Vec<Message> = {
+            // 落盘前做持久化截断(tool_result / thinking / tool_use.input)
+            let mut owned = messages.to_vec();
+            if let Some(cfg) = current_checkpoint_persist_cap() {
+                for msg in &mut owned {
+                    for block in &mut msg.content {
+                        crate::serialize::truncate_content_block(block, &cfg);
+                    }
+                }
+            }
+            owned
+        };
+        let workspace = self.capture_workspace_with_delta(&cwd_root, cwd)?;
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
             id: id.clone(),
@@ -177,28 +276,23 @@ impl CheckpointStore {
             name: name.clone(),
             kind: kind.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            messages: {
-                // 落盘前做持久化截断(tool_result / thinking / tool_use.input)
-                let mut owned = messages.to_vec();
-                if let Some(cfg) = current_checkpoint_persist_cap() {
-                    for msg in &mut owned {
-                        for block in &mut msg.content {
-                            crate::serialize::truncate_content_block(block, &cfg);
-                        }
-                    }
-                }
-                owned
-            },
-            workspace: capture_workspace(cwd)?,
+            messages: truncated_messages,
+            workspace,
         };
         write_json_atomic(&self.checkpoint_path(&id), &checkpoint)?;
 
+        let baseline_id = match &checkpoint.workspace {
+            WorkspaceSnapshot::Delta(delta) => Some(delta.parent_checkpoint_id.clone()),
+            _ => None,
+        };
         let summary = CheckpointSummary {
             id,
             name,
             kind,
             timestamp: checkpoint.timestamp,
             message_count: checkpoint.messages.len(),
+            cwd_root,
+            baseline_id,
         };
         let mut manifest = self.load_manifest().unwrap_or_default();
         manifest.checkpoints.push(summary.clone());
@@ -207,6 +301,60 @@ impl CheckpointStore {
             tracing::warn!("Checkpoint retention 失败: {error}");
         }
         Ok(summary)
+    }
+
+    /// Phase 2:capture 完整 snapshot → 查 manifest 选 baseline → 写 Delta
+    /// 或 Files。Git 路径总是写 Git snapshot(已是最优,无需 delta)。
+    fn capture_workspace_with_delta(
+        &self,
+        cwd_root: &str,
+        cwd: &Path,
+    ) -> Result<WorkspaceSnapshot> {
+        let snapshot = capture_workspace(cwd, self.cas.as_deref())?;
+        // Git snapshot 永远全量(轻量,object_id 引用)
+        if matches!(snapshot, WorkspaceSnapshot::Git(_)) {
+            return Ok(snapshot);
+        }
+        let WorkspaceSnapshot::Files(after) = snapshot else {
+            unreachable!("non-Git capture_workspace must yield Files")
+        };
+        // 尝试 Delta:选同 cwd 的最近 baseline 节点
+        let manifest = self.load_manifest().unwrap_or_default();
+        let Some(parent_id) = pick_baseline(&manifest, cwd_root) else {
+            // 无祖先 baseline → 写完整 Files snapshot
+            return Ok(WorkspaceSnapshot::Files(after));
+        };
+        // 加载父 checkpoint 的完整 file snapshot
+        let parent_cp = match self.load(&parent_id) {
+            Ok(cp) => cp,
+            Err(error) => {
+                tracing::warn!(
+                    "parent baseline checkpoint {} 加载失败: {error} —— 降级为完整 snapshot",
+                    parent_id
+                );
+                return Ok(WorkspaceSnapshot::Files(after));
+            }
+        };
+        let before = match resolve_to_files_caller(&self.dir, &parent_cp) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::warn!(
+                    "parent checkpoint {} 沿父链折叠失败: {error} —— 降级为完整 snapshot",
+                    parent_id
+                );
+                return Ok(WorkspaceSnapshot::Files(after));
+            }
+        };
+        let ops = diff_files(&before, &after);
+        Ok(WorkspaceSnapshot::Delta(DeltaSnapshot {
+            root: after.root.clone(),
+            parent_checkpoint_id: parent_id,
+            ops,
+            captured_bytes: after.captured_bytes,
+            skipped_files: after.skipped_files,
+            sensitive_files_skipped: after.sensitive_files_skipped,
+            baseline_file_count: after.files.len(),
+        }))
     }
 
     /// 按 manifest 中 timestamp 升序淘汰最老 checkpoint + 同步 manifest。
@@ -263,7 +411,7 @@ impl CheckpointStore {
 
     pub fn preview_files(&self, checkpoint_id: &str, cwd: &Path) -> Result<RewindPreview> {
         let checkpoint = self.load(checkpoint_id)?;
-        preview_workspace(&checkpoint, cwd)
+        preview_workspace(&checkpoint, cwd, self.cas.as_deref(), &self.dir)
     }
 
     /// 写回 checkpoint 文件状态。调用方必须先展示 [`RewindPreview`]，只有用户
@@ -275,7 +423,7 @@ impl CheckpointStore {
         confirmed: bool,
     ) -> Result<RewindPreview> {
         let checkpoint = self.load(checkpoint_id)?;
-        let preview = preview_workspace(&checkpoint, cwd)?;
+        let preview = preview_workspace(&checkpoint, cwd, self.cas.as_deref(), &self.dir)?;
         if preview.requires_confirmation && !confirmed {
             anyhow::bail!(
                 "rewind affects {} file(s); explicit confirmation required",
@@ -285,7 +433,12 @@ impl CheckpointStore {
         match &checkpoint.workspace {
             WorkspaceSnapshot::Git(snapshot) => restore_git(snapshot, &preview.affected_files)?,
             WorkspaceSnapshot::Files(snapshot) => {
-                restore_files_snapshot(snapshot, &preview.affected_files)?
+                restore_files_snapshot(snapshot, &preview.affected_files, self.cas.as_deref())?
+            }
+            WorkspaceSnapshot::Delta(_) => {
+                // Delta:折叠到完整 snapshot 再 restore
+                let resolved = resolve_to_files_caller(&self.dir, &checkpoint)?;
+                restore_files_snapshot(&resolved, &preview.affected_files, self.cas.as_deref())?
             }
         }
         Ok(preview)
@@ -319,11 +472,11 @@ fn validate_checkpoint_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn capture_workspace(cwd: &Path) -> Result<WorkspaceSnapshot> {
+fn capture_workspace(cwd: &Path, cas: Option<&WorkspaceCas>) -> Result<WorkspaceSnapshot> {
     if let Some(root) = git_root(cwd) {
         return Ok(WorkspaceSnapshot::Git(capture_git(&root)?));
     }
-    Ok(WorkspaceSnapshot::Files(capture_files(cwd)?))
+    Ok(WorkspaceSnapshot::Files(capture_files(cwd, cas)?))
 }
 
 fn git_root(cwd: &Path) -> Option<PathBuf> {
@@ -439,7 +592,12 @@ fn git_tree_entries(root: &Path, commit: &str) -> Result<BTreeMap<PathBuf, GitFi
     Ok(entries)
 }
 
-fn preview_workspace(checkpoint: &Checkpoint, cwd: &Path) -> Result<RewindPreview> {
+fn preview_workspace(
+    checkpoint: &Checkpoint,
+    cwd: &Path,
+    cas: Option<&WorkspaceCas>,
+    self_dir: &Path,
+) -> Result<RewindPreview> {
     match &checkpoint.workspace {
         WorkspaceSnapshot::Git(snapshot) => {
             let current_root =
@@ -478,7 +636,7 @@ fn preview_workspace(checkpoint: &Checkpoint, cwd: &Path) -> Result<RewindPrevie
             })
         }
         WorkspaceSnapshot::Files(snapshot) => {
-            let current = capture_files(&snapshot.root)?;
+            let current = capture_files(&snapshot.root, cas)?;
             let affected_files = changed_file_paths(snapshot, &current);
             Ok(RewindPreview {
                 checkpoint_id: checkpoint.id.clone(),
@@ -495,6 +653,20 @@ fn preview_workspace(checkpoint: &Checkpoint, cwd: &Path) -> Result<RewindPrevie
                         "non-git snapshot exceeded limits; rewind covers captured files only".into()
                     }
                 }),
+            })
+        }
+        WorkspaceSnapshot::Delta(_delta) => {
+            // Delta checkpoint 的 preview:沿父链折叠到完整 snapshot 后再 diff
+            // 当前 live 状态。注意折叠已读盘 N 次,O(N) 延迟。
+            let resolved = resolve_to_files_caller(self_dir, checkpoint)?;
+            let current = capture_files(&resolved.root, cas)?;
+            let affected_files = changed_file_paths(&resolved, &current);
+            Ok(RewindPreview {
+                checkpoint_id: checkpoint.id.clone(),
+                requires_confirmation: !affected_files.is_empty(),
+                affected_files,
+                snapshot_complete: resolved.complete,
+                note: Some("delta snapshot resolved across parent chain".into()),
             })
         }
     }
@@ -532,12 +704,13 @@ fn restore_git(snapshot: &GitSnapshot, affected: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn capture_files(root: &Path) -> Result<FileSnapshot> {
+fn capture_files(root: &Path, cas: Option<&WorkspaceCas>) -> Result<FileSnapshot> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let mut files = BTreeMap::new();
     let mut captured_bytes = 0u64;
     let mut skipped_files = 0usize;
     let mut sensitive_files_skipped = 0usize;
+    let max_blob = cas.map(|c| c.max_blob_bytes()).unwrap_or(0);
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .git_ignore(true)
@@ -565,11 +738,32 @@ fn capture_files(root: &Path) -> Result<FileSnapshot> {
             continue;
         }
         captured_bytes += bytes.len() as u64;
+        let sha = sha256(&bytes);
+        let size = bytes.len() as u64;
+        // CAS 路径:空文件 / 超阈值文件走 inline_bytes;其余走 cas.intern。
+        // CAS root 不可用(cas == None)时全部走 inline 兜底,不阻断 checkpoint。
+        let (hash, inline) = match cas {
+            None => (None, bytes),
+            Some(_) if bytes.is_empty() || size > max_blob => (None, bytes),
+            Some(c) => match c.intern(&bytes) {
+                Ok(h) => (Some(h), Vec::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        "CAS intern 失败({}),文件 {} 走 inline 路径: {error}",
+                        c.root().display(),
+                        relative.display()
+                    );
+                    (None, bytes)
+                }
+            },
+        };
         files.insert(
             relative,
             FileEntry {
-                sha256: sha256(&bytes),
-                bytes,
+                hash,
+                inline_bytes: inline,
+                size,
+                sha256: sha,
             },
         );
     }
@@ -630,7 +824,128 @@ fn changed_file_paths(before: &FileSnapshot, after: &FileSnapshot) -> Vec<PathBu
         .collect()
 }
 
-fn restore_files_snapshot(snapshot: &FileSnapshot, affected: &[PathBuf]) -> Result<()> {
+/// Phase 2:从 manifest 中选祖先 baseline 节点。
+/// 优先同 cwd 的最近 checkpoint;切换 cwd 强制写完整 snapshot。
+/// 仅选择本身是 baseline(baseline_id == None)且 cwd 匹配的节点。
+fn pick_baseline(manifest: &CheckpointManifest, cwd_root: &str) -> Option<String> {
+    manifest
+        .checkpoints
+        .iter()
+        .rev() // 最新优先
+        .find(|c| c.cwd_root == cwd_root && c.baseline_id.is_none())
+        .map(|c| c.id.clone())
+}
+
+/// Phase 2:沿 parent_checkpoint_id 链向上折叠 Delta 直至 baseline(Files)。
+/// 用于 restore / preview 时的 on-demand 重建。
+/// 限制最多向上追 20 层(防止祖先链被删导致的链爆炸)。
+/// `self_dir` 是 CheckpointStore 的 dir(),用于定位父 checkpoint JSON 文件。
+pub(crate) fn resolve_to_files_caller(
+    self_dir: &Path,
+    checkpoint: &Checkpoint,
+) -> Result<FileSnapshot> {
+    const MAX_CHAIN_DEPTH: usize = 20;
+    let mut current = checkpoint.clone();
+    let mut chain: Vec<DeltaSnapshot> = Vec::new();
+    for _ in 0..MAX_CHAIN_DEPTH {
+        match &current.workspace {
+            WorkspaceSnapshot::Files(files) => {
+                let mut result = files.clone();
+                for delta in chain.iter().rev() {
+                    apply_delta(&mut result, delta)?;
+                }
+                return Ok(result);
+            }
+            WorkspaceSnapshot::Delta(delta) => {
+                let parent_id = delta.parent_checkpoint_id.clone();
+                chain.push(delta.clone());
+                let path = self_dir.join(format!("{parent_id}.json"));
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("read parent checkpoint {}", path.display()))?;
+                let cp: Checkpoint = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse parent checkpoint {}", path.display()))?;
+                current = cp;
+            }
+            WorkspaceSnapshot::Git(_) => {
+                anyhow::bail!("cannot resolve Delta chain ending at Git snapshot");
+            }
+        }
+    }
+    anyhow::bail!("Delta chain exceeds {MAX_CHAIN_DEPTH} levels")
+}
+
+/// 把 `DeltaSnapshot.ops` 应用到 `files` 视图上,返回该 delta 时刻的完整快照。
+fn apply_delta(files: &mut FileSnapshot, delta: &DeltaSnapshot) -> Result<()> {
+    files.captured_bytes = delta.captured_bytes;
+    files.skipped_files = delta.skipped_files;
+    files.sensitive_files_skipped = delta.sensitive_files_skipped;
+    for (path, op) in &delta.ops {
+        match op {
+            DeltaOp::Added { hash, inline, size, sha256 } | DeltaOp::Modified { hash, inline, size, sha256 } => {
+                files.files.insert(
+                    path.clone(),
+                    FileEntry {
+                        hash: hash.clone(),
+                        inline_bytes: inline.clone(),
+                        size: *size,
+                        sha256: sha256.clone(),
+                    },
+                );
+            }
+            DeltaOp::Removed => {
+                files.files.remove(path);
+            }
+        }
+    }
+    Ok(())
+}
+/// Unchanged 不入 ops(由 restore 时继承父状态)。
+fn diff_files(
+    before: &FileSnapshot,
+    after: &FileSnapshot,
+) -> BTreeMap<PathBuf, DeltaOp> {
+    let mut ops = BTreeMap::new();
+    let all: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
+    for path in all {
+        let b = before.files.get(path);
+        let a = after.files.get(path);
+        match (b, a) {
+            (None, Some(e)) => {
+                ops.insert(
+                    path.clone(),
+                    DeltaOp::Added {
+                        hash: e.hash.clone(),
+                        inline: e.inline_bytes.clone(),
+                        size: e.size,
+                        sha256: e.sha256.clone(),
+                    },
+                );
+            }
+            (Some(_), None) => {
+                ops.insert(path.clone(), DeltaOp::Removed);
+            }
+            (Some(be), Some(ae)) if be.sha256 != ae.sha256 => {
+                ops.insert(
+                    path.clone(),
+                    DeltaOp::Modified {
+                        hash: ae.hash.clone(),
+                        inline: ae.inline_bytes.clone(),
+                        size: ae.size,
+                        sha256: ae.sha256.clone(),
+                    },
+                );
+            }
+            _ => {} // Unchanged:由 restore 时继承
+        }
+    }
+    ops
+}
+
+fn restore_files_snapshot(
+    snapshot: &FileSnapshot,
+    affected: &[PathBuf],
+    cas: Option<&WorkspaceCas>,
+) -> Result<()> {
     for relative in affected {
         anyhow::ensure!(safe_relative(relative), "unsafe checkpoint path");
         let target = snapshot.root.join(relative);
@@ -640,10 +955,24 @@ fn restore_files_snapshot(snapshot: &FileSnapshot, affected: &[PathBuf]) -> Resu
         );
         match snapshot.files.get(relative) {
             Some(entry) => {
+                // CAS 路径:优先 hash 走 cas.get;fallback 到 inline_bytes(兼容老 v1
+                // 直接含 bytes 的 checkpoint)。
+                let bytes = match (&entry.hash, cas) {
+                    (Some(hash), Some(c)) => match c.get(hash) {
+                        Ok(b) => b,
+                        Err(error) => {
+                            tracing::warn!(
+                                "CAS get 失败 (hash={hash}): {error} —— 跳过此文件恢复"
+                            );
+                            continue;
+                        }
+                    },
+                    _ => entry.inline_bytes.clone(),
+                };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(target, &entry.bytes)?;
+                std::fs::write(target, &bytes)?;
             }
             None if target.is_symlink() || target.is_file() => std::fs::remove_file(target)?,
             None if target.is_dir() => std::fs::remove_dir_all(target)?,
@@ -919,5 +1248,323 @@ mod tests {
         assert!(!snapshot.files.contains_key(Path::new(".ssh/id_ed25519")));
         assert_eq!(snapshot.sensitive_files_skipped, 2);
         assert!(!snapshot.complete);
+    }
+
+    /// M1 验证:CAS 路径下,200 个相同内容文件的 checkpoint JSON 体积应 < 50KB,
+    /// 老 inline_bytes 路径下应是几 MB 量级。证明内容寻址去重生效。
+    #[test]
+    fn cas_dedupe_dramatically_reduces_checkpoint_size() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_root = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
+                .unwrap(),
+        );
+
+        // 构造 200 个文件,每个 5KB 唯一内容(但全部相同) → 1 MB 总
+        let payload = vec![b'x'; 5 * 1024];
+        for i in 0..200 {
+            std::fs::write(root.path().join(format!("file_{i:03}.txt")), &payload).unwrap();
+        }
+
+        let store = CheckpointStore::new(sessions.path(), "cas-test")
+            .unwrap()
+            .with_cas(cas.clone());
+        let summary = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+
+        let cp_path = store.checkpoint_path(&summary.id);
+        let size = std::fs::metadata(&cp_path).unwrap().len();
+
+        // CAS 去重后,checkpoint JSON 应该只含 hash + size + sha256,200 文件应 < 50KB
+        // (实际: 200 * (64 + 20 + 64) ≈ 30KB)
+        assert!(
+            size < 50_000,
+            "CAS checkpoint 应该 < 50KB,实际 {size} bytes (说明 CAS 没生效)"
+        );
+
+        // CAS 应只有 1 个 blob(ref_count=200)
+        let stats = cas.stats().unwrap();
+        assert_eq!(stats.total_blobs, 1, "CAS 应去重到 1 个 blob");
+        assert_eq!(stats.total_bytes, 5 * 1024);
+        assert_eq!(stats.orphan_blobs, 0);
+    }
+
+    /// M1 验证:不接 CAS 时,checkpoint 仍走 inline 路径(向后兼容旧 build)。
+    #[test]
+    fn no_cas_path_keeps_inline_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+        let store = CheckpointStore::new(sessions.path(), "inline-test").unwrap();
+        let summary = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let checkpoint = store.load(&summary.id).unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!("expected Files snapshot");
+        };
+        let entry = snapshot.files.get(Path::new("a.txt")).unwrap();
+        assert!(entry.hash.is_none(), "无 CAS 时 hash 应为 None");
+        assert_eq!(entry.inline_bytes, b"hello");
+        assert_eq!(entry.size, 5);
+    }
+
+    /// M1 兼容验证:老 v1.5.10 checkpoint JSON(含顶层 `bytes: Vec<u8>` 字段)
+    /// 仍能加载,且 `inline_bytes` 字段被填充。
+    #[test]
+    fn load_legacy_v1_checkpoint_with_bytes_field() {
+        let sessions = tempfile::tempdir().unwrap();
+        let dir = sessions.path().join("legacy-sess.checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 手工写一份 v1.5.10 格式的 checkpoint(顶层 FileEntry.bytes)
+        let legacy_json = r#"{
+            "version": 1,
+            "id": "legacy-cp",
+            "session_id": "legacy-sess",
+            "name": null,
+            "kind": "manual",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "messages": [],
+            "workspace": {
+                "kind": "files",
+                "root": "/tmp",
+                "files": {
+                    "file.txt": {
+                        "bytes": [104, 105],
+                        "sha256": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+                    }
+                },
+                "complete": true,
+                "skipped_files": 0,
+                "sensitive_files_skipped": 0,
+                "captured_bytes": 2
+            }
+        }"#;
+        std::fs::write(dir.join("legacy-cp.json"), legacy_json).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"version":1,"checkpoints":[{"id":"legacy-cp","name":null,"kind":"manual","timestamp":"2026-09-01T00:00:00Z","message_count":0}]}"#,
+        )
+        .unwrap();
+
+        let store = CheckpointStore::new(sessions.path(), "legacy-sess").unwrap();
+        let checkpoint = store.load("legacy-cp").unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!("expected Files snapshot");
+        };
+        let entry = snapshot.files.get(Path::new("file.txt")).unwrap();
+        assert!(entry.hash.is_none());
+        assert_eq!(entry.inline_bytes, vec![104, 105]); // "hi"
+        assert_eq!(entry.size, 0); // 老字段没 size,新结构默认 0
+        assert_eq!(entry.sha256, "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4");
+    }
+
+    /// M2 验证:相邻 checkpoint 自动写 Delta 形式,且 Delta 体积 << 完整 Files。
+    #[test]
+    fn adjacent_checkpoints_write_delta_form() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_root = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
+                .unwrap(),
+        );
+        // 100 文件 baseline 内容
+        for i in 0..100 {
+            std::fs::write(
+                root.path().join(format!("f{i:03}.txt")),
+                format!("baseline content for file {i}"),
+            )
+            .unwrap();
+        }
+        let store = CheckpointStore::new(sessions.path(), "delta-test")
+            .unwrap()
+            .with_cas(cas);
+        // 第一个:必须是 Files (baseline)
+        let s1 = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let cp1 = store.load(&s1.id).unwrap();
+        assert!(matches!(cp1.workspace, WorkspaceSnapshot::Files(_)));
+        // 改 1 个文件 → 第二个应是 Delta
+        std::fs::write(
+            root.path().join("f005.txt"),
+            "MODIFIED content for file 5",
+        )
+        .unwrap();
+        let s2 = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let cp2 = store.load(&s2.id).unwrap();
+        let WorkspaceSnapshot::Delta(delta) = &cp2.workspace else {
+            panic!("expected Delta, got {:?}", std::mem::discriminant(&cp2.workspace));
+        };
+        assert_eq!(delta.parent_checkpoint_id, s1.id);
+        // 改动只有 1 个,ops 应只 1 项
+        assert_eq!(delta.ops.len(), 1, "只改 1 文件,ops 应只 1 项");
+        assert!(matches!(
+            delta.ops.values().next().unwrap(),
+            DeltaOp::Modified { .. }
+        ));
+    }
+
+    /// M2 验证:Delta 链可被 resolve_to_files_caller 折叠回完整 FileSnapshot。
+    #[test]
+    fn delta_chain_resolves_to_full_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_root = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
+                .unwrap(),
+        );
+        for i in 0..50 {
+            std::fs::write(
+                root.path().join(format!("x{i:03}.txt")),
+                format!("v0 content {i}"),
+            )
+            .unwrap();
+        }
+        let store = CheckpointStore::new(sessions.path(), "delta-resolve")
+            .unwrap()
+            .with_cas(cas);
+        // baseline
+        let s0 = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        // 3 次连续小改动 → 3 个 delta
+        for round in 1..=3 {
+            for i in 0..3 {
+                std::fs::write(
+                    root.path().join(format!("x{i:03}.txt")),
+                    format!("v{round} content {i}"),
+                )
+                .unwrap();
+            }
+            store
+                .create(root.path(), &[], CheckpointKind::Manual, None)
+                .unwrap();
+        }
+        // 拿最后(第 4 个)checkpoint,应能 resolve 到完整 snapshot
+        let manifest_entries = store.list().unwrap();
+        let last = manifest_entries.last().unwrap();
+        let last_cp = store.load(&last.id).unwrap();
+        let resolved = resolve_to_files_caller(&store.dir, &last_cp).unwrap();
+        // 应有 50 个文件,内容为 v3
+        assert_eq!(resolved.files.len(), 50);
+        let entry = resolved.files.get(Path::new("x000.txt")).unwrap();
+        assert_eq!(entry.sha256, sha256(b"v3 content 0"));
+        // 路径一致性
+        assert!(!s0.id.is_empty()); // 防 unused warning
+    }
+
+    /// M2 验证:切 cwd 后第一个 checkpoint 必须写完整 Files(baseline),
+    /// 不会跨 cwd 共享 delta 链。
+    #[test]
+    fn cwd_change_writes_fresh_baseline() {
+        let sessions = tempfile::tempdir().unwrap();
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        std::fs::write(root_a.path().join("a.txt"), "alpha").unwrap();
+        std::fs::write(root_b.path().join("b.txt"), "beta").unwrap();
+        let store = CheckpointStore::new(sessions.path(), "cwd-test").unwrap();
+        let s_a = store
+            .create(root_a.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        assert!(matches!(
+            store.load(&s_a.id).unwrap().workspace,
+            WorkspaceSnapshot::Files(_)
+        ));
+        // 切到 root_b
+        let s_b = store
+            .create(root_b.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        assert!(
+            matches!(store.load(&s_b.id).unwrap().workspace, WorkspaceSnapshot::Files(_)),
+            "切换 cwd 后必须写 Files (baseline),不允许跨 cwd delta"
+        );
+    }
+
+    /// M2 验证:Delta 形式的 restore 仍能正确还原文件。
+    /// 注意 Files/Delta 分支的 preview 用的是 `snapshot.root`(创建 checkpoint 时的根),
+    /// 不是 `cwd`。所以测试用同一个目录作"工作区",在第二个 create 之前
+    /// 改一个文件,Delta 应能记录这一改动,restore 走 CAS.get 还原。
+    #[test]
+    fn delta_restore_files_works_end_to_end() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_root = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
+                .unwrap(),
+        );
+        for i in 0..10 {
+            std::fs::write(
+                root.path().join(format!("d{i:02}.txt")),
+                format!("delta content {i}"),
+            )
+            .unwrap();
+        }
+        let store = CheckpointStore::new(sessions.path(), "delta-restore")
+            .unwrap()
+            .with_cas(cas);
+        // 1) baseline
+        let _s1 = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        // 2) 改 d03.txt 触发 Delta
+        std::fs::write(
+            root.path().join("d03.txt"),
+            "delta content 3 MODIFIED",
+        )
+        .unwrap();
+        let s2 = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        // 3) 把 d03.txt 改成"非 MODIFIED 的脏内容",然后 preview 应识别差异
+        std::fs::write(root.path().join("d03.txt"), "USER_DIRTY").unwrap();
+        let preview = store.preview_files(&s2.id, root.path()).unwrap();
+        assert!(
+            preview.affected_files.iter().any(|p| p.to_str() == Some("d03.txt")),
+            "preview 必须识别 d03.txt 的脏内容"
+        );
+        // 4) restore:confirmed=true 跳过确认,验证 d03.txt 还原成 MODIFIED
+        store
+            .restore_files(&s2.id, root.path(), true)
+            .unwrap();
+        let restored = std::fs::read_to_string(root.path().join("d03.txt")).unwrap();
+        assert_eq!(restored, "delta content 3 MODIFIED");
+    }
+
+    /// M1 验证:大文件 (>max_blob_bytes) 走 inline 而不进 CAS。
+    #[test]
+    fn cas_inline_above_threshold() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_root = tempfile::tempdir().unwrap();
+        // max_blob = 1KB
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 1024).unwrap(),
+        );
+        // 2KB 文件 > 1KB 阈值 → 走 inline
+        std::fs::write(root.path().join("big.txt"), vec![b'y'; 2048]).unwrap();
+        let store = CheckpointStore::new(sessions.path(), "threshold-test")
+            .unwrap()
+            .with_cas(cas.clone());
+        let summary = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let checkpoint = store.load(&summary.id).unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!();
+        };
+        let entry = snapshot.files.get(Path::new("big.txt")).unwrap();
+        assert!(entry.hash.is_none(), "超阈值文件 hash 应为 None");
+        assert_eq!(entry.inline_bytes.len(), 2048);
+        let stats = cas.stats().unwrap();
+        assert_eq!(stats.total_blobs, 0, "超阈值不应进 CAS");
     }
 }

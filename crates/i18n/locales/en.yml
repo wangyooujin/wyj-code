@@ -76,7 +76,7 @@ cli:
   cwd_help: "Working directory (defaults to the current directory)"
   headless_help: "Force headless REPL mode"
   plan_help: "Plan mode: read-only analysis plus restricted plan-document writes; source, scripts, config, and Bash writes remain denied"
-  bypass_help: "Bypass mode: skip ordinary prompts without disabling the OS sandbox or protected denies"
+  bypass_help: "Bypass mode: skip ordinary prompts without disabling protected denies"
   no_hooks_help: "Disable the Hooks automation system (do not run shell hooks from .claude/settings.json)"
   continue_help: "Resume the last session (continue the previous conversation)"
   resume_help: "Resume a specific session ID (e.g. sess-1719723000)"
@@ -133,6 +133,7 @@ help:
 
     - `/help` — Show this help
     - `/clear` — Clear conversation history
+    - `/new` — Start a new session: auto-save the current session to disk, allocate a new session_id, and clear TUI state (parity with Claude Code `/new`, no second confirmation prompt)
     - `/compact [hint]` — Manually compact context to reduce token usage
     - `/config` — Open the configuration settings panel (log_level/language)
     - `/cost` — Show token usage and cost estimate for this session (sub-agent usage listed separately)
@@ -210,6 +211,11 @@ hyperlink:
 
 clear:
   desc: "Clear the current conversation history"
+
+new:
+  desc: "Start a new session (auto-saves the current session to disk and allocates a new session_id)"
+  usage: "/new"
+  started: "New session started."
 
 compact:
   desc: "Manually compact conversation context to reduce token usage"
@@ -361,9 +367,6 @@ schedule:
     cwd: "Working dir"
     notify_on_failure: "Notify on failure"
     allowed_tools: "Allowed tools"
-    allow_write: "Write roots"
-    allowed_domains: "Network domains"
-    require_sandbox: "Require sandbox"
   dialog:
     hint1: "  ↑↓ Move  Enter Action menu  Ctrl+S Save"
     hint2: "  Esc Close"
@@ -676,7 +679,6 @@ dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
-  permission_hint_once: "  [y] Run unsandboxed once   [d] Deny   (cannot be persisted)"
   permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"
