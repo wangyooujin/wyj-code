@@ -1,7 +1,7 @@
 # wyj-code
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Release](https://img.shields.io/badge/release-v1.5.6-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6)
+[![Release](https://img.shields.io/badge/release-v1.5.11-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.11)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
 [![Pages](https://img.shields.io/badge/Pages-在线主页-22c55e.svg)](https://wangyooujin.github.io/wyj-code/)
@@ -22,7 +22,7 @@ Qwen/百炼、豆包/火山以及其他协议兼容端点。
 [国产模型适配体验对比报告](./doc/analysis/domestic-models-vs-claude-code.md) — DeepSeek / GLM / Kimi / Qwen / 豆包 / MiniMax 与 Claude Code / Codex 的能力对照、踩坑与最佳实践。
 
 > **版本状态**：最新公开版本是
-> [v1.5.6](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.6)。历史 tag 保持不可移动，
+> [v1.5.11](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.11)。历史 tag 保持不可移动，
 > 一键安装脚本始终下载 GitHub 最新公开 Release。
 
 ## 项目介绍
@@ -47,6 +47,16 @@ wyj-code 希望把 AI coding 的核心能力放进一个可审计、可扩展、
   AI 自动管理项目记忆，Global 候选走 Pending + 自然语言确认；
   新增 Task 类型 + 动态 Project Brief，裸"继续"自动恢复最近未完成任务；
   `/memory clear-all` 一键清空重建，保留用户曾拒绝的指纹。
+- **Session 存储 CAS + Delta 重构**：v1.5.11 把 `~/.wyj-code/sessions/` 的
+  workspace snapshot 从每 checkpoint 内联 256 文件字节（~11MB/checkpoint）
+  改为 sha256 内容寻址 CAS Blob Pool + 同 cwd 相邻 checkpoint Delta 链，
+  实测长会话占用从 1.15GB 降至 ~3MB（~99% 压缩）；超大 base64 image 与
+  长 thinking 自动外置到 CAS（`cas://<hash>` 引用，`materialize_block_with`
+  在 resume 时还原）；新增 `wyj-code storage {status,doctor,prune}` 子命令
+  做占用诊断与 GC。
+- **`/new` slash 命令**：v1.5.11 新增 `/new`，对齐 Claude Code 开启新会话
+  语义——自动保存当前会话历史后分配新 session_id、清空 TUI 状态，
+  无二次确认弹窗；与 `/clear` 区分（清空 ≠ 全新会话）。
 
 国内模型在没有独立 live probe 证据时只标记为 `static_only` 或 protocol-compatible；
 协议兼容不等于每个模型、端点和工具组合都已经在线验证。可通过 `wyj-code model doctor`
