@@ -148,7 +148,6 @@ args = ["--flag"]
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
 | `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置与安装数据层；`plugin_runtime` 事务式激活 hooks/styles/themes/channels/LSP/monitors/settings/userConfig，持久 LSP client 提供 `workspace/symbol`；`import`、schedule/cron_sync、lockfile 与 marketplace 同样在此 |
-| `crates/sandbox` | `wyj-sandbox` | macOS Seatbelt / Linux bubblewrap 的文件、凭证与网络边界；交互与 headless 共用同一 SandboxRunner |
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框 |
 | `crates/cli` | 二进制入口 | 组装所有 crate，解析 CLI 参数，启动 TUI/REPL/单次模式 |
 

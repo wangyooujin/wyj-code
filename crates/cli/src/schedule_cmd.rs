@@ -48,13 +48,6 @@ pub enum ScheduleCommand {
         /// Explicit tool allowlist. Defaults to read-only tools.
         #[arg(long, value_delimiter = ',')]
         allowed_tools: Vec<String>,
-        #[arg(long = "allow-write")]
-        allow_write: Vec<PathBuf>,
-        #[arg(long = "allow-network")]
-        allow_network: Vec<String>,
-        /// Explicitly permit process tools when no sandbox backend is available.
-        #[arg(long)]
-        allow_unsandboxed: bool,
         #[arg(long)]
         json: bool,
     },
@@ -81,12 +74,6 @@ pub enum ScheduleCommand {
         id: String,
         #[arg(long, value_delimiter = ',')]
         allowed_tools: Vec<String>,
-        #[arg(long = "allow-write")]
-        allow_write: Vec<PathBuf>,
-        #[arg(long = "allow-network")]
-        allow_network: Vec<String>,
-        #[arg(long)]
-        allow_unsandboxed: bool,
         #[arg(long)]
         enable: bool,
         #[arg(long)]
@@ -148,14 +135,10 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
             cwd: task_cwd,
             notify_on_failure,
             allowed_tools,
-            allow_write,
-            allow_network,
-            allow_unsandboxed,
             json,
         } => {
             cron_sync::validate_cron(&cron)?;
-            let permissions =
-                schedule_permissions(allowed_tools, allow_write, allow_network, allow_unsandboxed);
+            let permissions = schedule_permissions(allowed_tools);
             let task = schedule::create_task(schedule::NewTask {
                 name,
                 prompt,
@@ -189,14 +172,10 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
         ScheduleCommand::Review {
             id,
             allowed_tools,
-            allow_write,
-            allow_network,
-            allow_unsandboxed,
             enable,
             json,
         } => {
-            let permissions =
-                schedule_permissions(allowed_tools, allow_write, allow_network, allow_unsandboxed);
+            let permissions = schedule_permissions(allowed_tools);
             let task = schedule::review_permissions(&id, permissions, enable)?;
             sync_and_warn()?;
             if json {
@@ -238,19 +217,11 @@ fn emit_mutation(action: &str, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn schedule_permissions(
-    allowed_tools: Vec<String>,
-    allow_write: Vec<PathBuf>,
-    allowed_domains: Vec<String>,
-    allow_unsandboxed: bool,
-) -> SchedulePermissions {
+fn schedule_permissions(allowed_tools: Vec<String>) -> SchedulePermissions {
     let mut permissions = SchedulePermissions::default();
     if !allowed_tools.is_empty() {
         permissions.allowed_tools = allowed_tools;
     }
-    permissions.allow_write = allow_write;
-    permissions.allowed_domains = allowed_domains;
-    permissions.require_sandbox = !allow_unsandboxed;
     permissions
 }
 
@@ -389,15 +360,6 @@ async fn spawn_headless(
         .arg(task_cwd)
         .arg("--allowed-tools")
         .arg(permissions.allowed_tools.join(","));
-    for path in &permissions.allow_write {
-        command.arg("--allow-write").arg(path);
-    }
-    for domain in &permissions.allowed_domains {
-        command.arg("--allow-network").arg(domain);
-    }
-    if permissions.require_sandbox {
-        command.arg("--require-sandbox");
-    }
     let status = command
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))

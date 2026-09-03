@@ -6,7 +6,6 @@
 //! permissive than the parent ceiling before anything is scheduled.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
@@ -260,61 +259,7 @@ fn validate_ceiling(
     {
         bail!("allowed_tools expands the parent permission ceiling")
     }
-    if parent.require_sandbox && !child.require_sandbox {
-        bail!("require_sandbox cannot be relaxed")
-    }
-    for root in &child.write_roots {
-        if !parent
-            .write_roots
-            .iter()
-            .any(|parent_root| lexical_is_within(root, parent_root))
-        {
-            bail!(
-                "write root {} is outside the parent ceiling",
-                root.display()
-            )
-        }
-    }
-    for domain in &child.allowed_domains {
-        if !parent
-            .allowed_domains
-            .iter()
-            .any(|allowed| domain_allowed(domain, allowed))
-        {
-            bail!("network domain {domain} is outside the parent ceiling")
-        }
-    }
     Ok(())
-}
-
-fn lexical_is_within(path: &Path, root: &Path) -> bool {
-    fn clean(path: &Path) -> Option<PathBuf> {
-        let mut result = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Prefix(value) => result.push(value.as_os_str()),
-                Component::RootDir => result.push(Path::new("/")),
-                Component::CurDir => {}
-                Component::Normal(value) => result.push(value),
-                Component::ParentDir => {
-                    if !result.pop() {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some(result)
-    }
-    match (clean(path), clean(root)) {
-        (Some(path), Some(root)) => path.starts_with(&root),
-        _ => false,
-    }
-}
-
-fn domain_allowed(domain: &str, allowed: &str) -> bool {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    let allowed = allowed.trim().trim_end_matches('.').to_ascii_lowercase();
-    domain == allowed || domain.ends_with(&format!(".{allowed}"))
 }
 
 fn visit(
@@ -736,9 +681,6 @@ mod tests {
     fn ceiling() -> WorkflowPermissionCeiling {
         WorkflowPermissionCeiling {
             allowed_tools: vec!["Read".to_string(), "Grep".to_string(), "Edit".to_string()],
-            write_roots: vec![PathBuf::from("/repo")],
-            allowed_domains: vec!["example.com".to_string()],
-            require_sandbox: true,
         }
     }
 
@@ -751,9 +693,6 @@ mod tests {
             depends_on: deps.iter().map(|v| (*v).to_string()).collect(),
             permission_ceiling: WorkflowPermissionCeiling {
                 allowed_tools: vec!["Read".to_string()],
-                write_roots: Vec::new(),
-                allowed_domains: Vec::new(),
-                require_sandbox: true,
             },
             max_retries: 1,
         }

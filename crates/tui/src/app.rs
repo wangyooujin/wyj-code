@@ -2331,16 +2331,13 @@ fn profile_try_save(
 // 切换）的小菜单再决定是否借用输入框，比 ProfileDialog 对不同字段类型各自特判
 // 简单，代价是多一次 Enter，可接受。
 
-pub const SCHEDULE_FIELD_COUNT: usize = 9;
+pub const SCHEDULE_FIELD_COUNT: usize = 6;
 const SCHEDULE_FIELD_NAME: usize = 0;
 const SCHEDULE_FIELD_PROMPT: usize = 1;
 const SCHEDULE_FIELD_CRON: usize = 2;
 const SCHEDULE_FIELD_CWD: usize = 3;
 pub const SCHEDULE_FIELD_NOTIFY: usize = 4;
 const SCHEDULE_FIELD_ALLOWED_TOOLS: usize = 5;
-const SCHEDULE_FIELD_ALLOW_WRITE: usize = 6;
-const SCHEDULE_FIELD_ALLOWED_DOMAINS: usize = 7;
-pub const SCHEDULE_FIELD_REQUIRE_SANDBOX: usize = 8;
 
 pub const SCHEDULE_FIELD_LABEL_KEYS: [&str; SCHEDULE_FIELD_COUNT] = [
     "schedule.field.name",
@@ -2349,9 +2346,6 @@ pub const SCHEDULE_FIELD_LABEL_KEYS: [&str; SCHEDULE_FIELD_COUNT] = [
     "schedule.field.cwd",
     "schedule.field.notify_on_failure",
     "schedule.field.allowed_tools",
-    "schedule.field.allow_write",
-    "schedule.field.allowed_domains",
-    "schedule.field.require_sandbox",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2383,7 +2377,6 @@ pub enum ScheduleFieldAction {
     ManualEdit,
     Freq(ScheduleFrequencyKind),
     ToggleNotify,
-    ToggleRequireSandbox,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2502,14 +2495,6 @@ impl ScheduleDialog {
             SCHEDULE_FIELD_CRON => t.cron.clone(),
             SCHEDULE_FIELD_CWD => t.cwd.display().to_string(),
             SCHEDULE_FIELD_ALLOWED_TOOLS => t.permissions.allowed_tools.join(","),
-            SCHEDULE_FIELD_ALLOW_WRITE => t
-                .permissions
-                .allow_write
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-            SCHEDULE_FIELD_ALLOWED_DOMAINS => t.permissions.allowed_domains.join(","),
             _ => String::new(),
         }
     }
@@ -2523,18 +2508,6 @@ impl ScheduleDialog {
             SCHEDULE_FIELD_CWD => t.cwd = std::path::PathBuf::from(value),
             SCHEDULE_FIELD_ALLOWED_TOOLS => {
                 t.permissions.allowed_tools = comma_values(&value);
-            }
-            SCHEDULE_FIELD_ALLOW_WRITE => {
-                t.permissions.allow_write = comma_values(&value)
-                    .into_iter()
-                    .map(std::path::PathBuf::from)
-                    .collect();
-            }
-            SCHEDULE_FIELD_ALLOWED_DOMAINS => {
-                t.permissions.allowed_domains = comma_values(&value)
-                    .into_iter()
-                    .map(|domain| domain.to_ascii_lowercase())
-                    .collect();
             }
             _ => {}
         }
@@ -2627,16 +2600,6 @@ impl ScheduleDialog {
                 vec![ActionMenuItem {
                     label: wyj_i18n::tr("schedule.menu.toggle"),
                     action: ScheduleMenuAction::Field(ScheduleFieldAction::ToggleNotify),
-                    dangerous: false,
-                    disabled: false,
-                    disabled_reason: None,
-                }],
-            )),
-            ScheduleRow::Field(_, SCHEDULE_FIELD_REQUIRE_SANDBOX) => Some(ActionMenu::new(
-                row,
-                vec![ActionMenuItem {
-                    label: wyj_i18n::tr("schedule.menu.toggle"),
-                    action: ScheduleMenuAction::Field(ScheduleFieldAction::ToggleRequireSandbox),
                     dangerous: false,
                     disabled: false,
                     disabled_reason: None,
@@ -2917,15 +2880,6 @@ fn schedule_execute_menu_action(
                     !dialog.tasks[task_idx].notify_on_failure;
             }
         }
-        ScheduleMenuAction::Field(ScheduleFieldAction::ToggleRequireSandbox) => {
-            let ScheduleRow::Field(task_idx, _) = target else {
-                return;
-            };
-            if let Some(dialog) = &mut state.schedule_dialog {
-                dialog.tasks[task_idx].permissions.require_sandbox =
-                    !dialog.tasks[task_idx].permissions.require_sandbox;
-            }
-        }
         ScheduleMenuAction::Field(ScheduleFieldAction::Freq(kind)) => {
             let ScheduleRow::Field(task_idx, _) = target else {
                 return;
@@ -2977,9 +2931,6 @@ mod schedule_permissions_tests {
             needs_permission_review: true,
             permissions: wyj_store::schedule::SchedulePermissions {
                 allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
-                allow_write: vec![cwd.join("reports")],
-                allowed_domains: vec!["example.com".to_string()],
-                require_sandbox: true,
             },
             notify_on_failure: false,
             created_at: now,
@@ -8886,7 +8837,6 @@ fn spawn_agent_turn(
     // 后续工具调用的权限判定，无需等待下一轮 spawn_agent_turn。
     shared_permission: Arc<std::sync::RwLock<PermissionMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
-    sandbox_config: wyj_config::SandboxCfg,
     // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
     preface_reminders: Vec<String>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
@@ -8914,7 +8864,6 @@ fn spawn_agent_turn(
         }
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
-        let _ = ctx.apply_sandbox_config(&sandbox_config);
         ctx.set_execution_surface(wyj_core::ExecutionSurface::TuiInteractive);
         ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
@@ -9091,70 +9040,6 @@ fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
             .map(|degradation| format!("- {degradation}")),
     );
     lines.join("\n")
-}
-
-fn format_tui_sandbox(config: &wyj_config::SandboxCfg) -> String {
-    let status = wyj_sandbox::SandboxRunner::detect().status();
-    let network = if !config.enabled {
-        "host network (sandbox disabled)".to_string()
-    } else if config.network.allow_all {
-        "allow all".to_string()
-    } else if config.network.allowed_domains.is_empty() {
-        "deny".to_string()
-    } else {
-        format!("allow {}", config.network.allowed_domains.join(", "))
-    };
-    let mut lines = vec![
-        "Sandbox · Mode / Overrides / Config".to_string(),
-        format!(
-            "mode: {} · backend: {} · available: {}",
-            if config.enabled {
-                "enforce"
-            } else {
-                "disabled"
-            },
-            status.backend,
-            status.available
-        ),
-        format!(
-            "filesystem: isolated={} · allow-write={} · deny-read={}",
-            status.filesystem_isolation,
-            config.filesystem.allow_write.len(),
-            config.filesystem.deny_read.len()
-        ),
-        format!(
-            "network: {network} · domain isolation={}",
-            status.domain_network_isolation
-        ),
-        format!(
-            "unsandboxed fallback: TUI one-shot={} · plan/headless/schedule/hook/sub-agent=false",
-            config.enabled && config.allow_unsandboxed_commands
-        ),
-        format!("fail-if-unavailable: {}", config.fail_if_unavailable),
-    ];
-    lines.extend(
-        status
-            .dependencies
-            .into_iter()
-            .map(|dependency| format!("dependency: {dependency}")),
-    );
-    lines.push(status.detail);
-    lines.join("\n")
-}
-
-#[cfg(test)]
-mod sandbox_status_tests {
-    use super::*;
-
-    #[test]
-    fn tui_sandbox_status_reports_allow_all() {
-        let mut config = wyj_config::SandboxCfg::default();
-        config.network.allow_all = true;
-
-        let text = format_tui_sandbox(&config);
-        assert!(text.contains("network: allow all"));
-        assert!(!text.contains("network: deny"));
-    }
 }
 
 fn resolve_tui_checkpoint_id(
@@ -9949,7 +9834,6 @@ async fn tui_main(
                 shared_mode.clone(),
                 shared_permission.clone(),
                 ui_ask_tx.clone(),
-                state.config.sandbox.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
                 plugin_runtime.clone(),
             );
@@ -12412,7 +12296,6 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
-                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );
@@ -12443,7 +12326,6 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
-                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );
@@ -12486,15 +12368,11 @@ async fn tui_main(
                     //    d/Esc/其它=拒绝。决策经 oneshot 回传给挂起的 Agent 回合。
                     if state.permission_dialog.is_some() {
                         use wyj_tools::PermissionDecision;
-                        let one_shot_only =
-                            state.permission_dialog.as_ref().is_some_and(|dialog| {
-                                dialog.tool_name == "Bash (unsandboxed fallback)"
-                            });
                         let decision = match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 Some(PermissionDecision::AllowOnce)
                             }
-                            KeyCode::Char('a') | KeyCode::Char('A') if !one_shot_only => {
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
                                 Some(PermissionDecision::AllowAlways)
                             }
                             KeyCode::Char('d')
@@ -12749,17 +12627,17 @@ async fn tui_main(
                                 state.input_history.push(text);
                                 let tx = agent_tx.clone();
                                 let start = Instant::now();
-                                let inline_ctx = ToolCtx::new(&cwd);
-                                let _ = inline_ctx.apply_sandbox_config(&state.config.sandbox);
-                                let inline_policy =
-                                    inline_ctx.sandbox_policy.read().unwrap().clone();
                                 let inline_cwd = cwd.clone();
                                 tokio::spawn(async move {
                                     let elapsed;
-                                    let prepared = wyj_sandbox::SandboxRunner::detect()
-                                        .shell_command(&cmd_str, &inline_cwd, &inline_policy);
-                                    let (output, exit_code) = match prepared {
-                                        Ok(command) => match tokio::process::Command::from(command)
+                                    let (output, exit_code) =
+                                        match tokio::process::Command::new("/bin/bash")
+                                            .arg("-c")
+                                            .arg(&cmd_str)
+                                            .current_dir(&inline_cwd)
+                                            .stdin(std::process::Stdio::null())
+                                            .stdout(std::process::Stdio::piped())
+                                            .stderr(std::process::Stdio::piped())
                                             .output()
                                             .await
                                         {
@@ -12783,17 +12661,7 @@ async fn tui_main(
                                                 elapsed = start.elapsed().as_secs_f64();
                                                 (format!("执行失败: {e}"), -1)
                                             }
-                                        },
-                                        Err(error) => {
-                                            elapsed = start.elapsed().as_secs_f64();
-                                            (
-                                                format!(
-                                                    "Sandbox 拒绝内联命令：{error}\n如确需无隔离执行，请让 Agent 调用 Bash 并在一次性降级面板中批准。"
-                                                ),
-                                                -1,
-                                            )
-                                        }
-                                    };
+                                        };
                                     let _ = tx
                                         .send(AgentEvent::BashResult {
                                             output,
@@ -12993,6 +12861,70 @@ async fn tui_main(
                                                     format!("[压缩失败] {e}"),
                                                 ));
                                             }
+                                        }
+                                    }
+                                    Ok(CommandResult::StartNewSession) => {
+                                        // 对齐 Claude Code `/new`：开启全新会话，保存当前会话
+                                        // 后分配新 id、清空 TUI 内存状态。无二次确认弹窗。
+                                        if state.is_thinking {
+                                            state.messages.push(ChatMessage::assistant(
+                                                "请等待当前任务完成后再开新会话。".to_string(),
+                                            ));
+                                        } else {
+                                            if let Some(store) = &session_store {
+                                                let sess = session.lock().await;
+                                                if !sess.messages.is_empty() {
+                                                    let (title, title_generated) =
+                                                        match store.load(&current_session_id).ok() {
+                                                            Some(f) if f.title_generated => {
+                                                                (f.title, true)
+                                                            }
+                                                            _ => (
+                                                                extract_title(&sess.messages),
+                                                                false,
+                                                            ),
+                                                        };
+                                                    let _ = store.save(&SessionFile {
+                                                        session_id: current_session_id.clone(),
+                                                        title,
+                                                        last_preview: extract_preview(
+                                                            &sess.messages,
+                                                        ),
+                                                        cwd: cwd.display().to_string(),
+                                                        timestamp: now_iso(),
+                                                        turns: state.turns,
+                                                        input_tokens: sess.total_input_tokens,
+                                                        output_tokens: sess.total_output_tokens,
+                                                        messages: sess.messages.clone(),
+                                                        routing_events: sess.routing_events.clone(),
+                                                        current_checkpoint_id: sess
+                                                            .current_checkpoint_id
+                                                            .clone(),
+                                                        branch_parent_session_id: sess
+                                                            .branch_parent_session_id
+                                                            .clone(),
+                                                        branch_parent_checkpoint_id: sess
+                                                            .branch_parent_checkpoint_id
+                                                            .clone(),
+                                                        title_generated,
+                                                    });
+                                                }
+                                            }
+                                            {
+                                                let mut sess = session.lock().await;
+                                                *sess = Session::new();
+                                            }
+                                            current_session_id = new_session_id();
+                                            state.reset_for_new_session();
+                                            state.current_session_id = current_session_id.clone();
+                                            retarget_agent_session(
+                                                &shared_agent,
+                                                session_store.as_ref(),
+                                                &current_session_id,
+                                            );
+                                            state.messages.push(ChatMessage::system(
+                                                wyj_i18n::tr("new.started").to_string(),
+                                            ));
                                         }
                                     }
                                     Ok(CommandResult::CreateCheckpoint { name, list }) => {
@@ -13285,11 +13217,6 @@ async fn tui_main(
                                             ));
                                         }
                                     }
-                                    Ok(CommandResult::SandboxStatus) => {
-                                        state.messages.push(ChatMessage::assistant(
-                                            format_tui_sandbox(&state.config.sandbox),
-                                        ));
-                                    }
                                     Ok(CommandResult::SwitchProfile(name)) => {
                                         if !state.config.profiles.iter().any(|p| p.name == name) {
                                             state.messages.push(ChatMessage::assistant_err(
@@ -13412,7 +13339,6 @@ async fn tui_main(
                                         let mode_arc = shared_mode.clone();
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
-                                        let sandbox_config = state.config.sandbox.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
 
                                         let handle = tokio::spawn(async move {
@@ -13420,7 +13346,6 @@ async fn tui_main(
                                             sess.push_user(prompt);
                                             let current_mode = mode_arc.lock().await.clone();
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
-                                            let _ = ctx.apply_sandbox_config(&sandbox_config);
                                             ctx.set_execution_surface(
                                                 wyj_core::ExecutionSurface::TuiInteractive,
                                             );
@@ -13532,7 +13457,6 @@ async fn tui_main(
                                         let mode_arc = shared_mode.clone();
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
-                                        let sandbox_config = state.config.sandbox.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
 
                                         let handle = tokio::spawn(async move {
@@ -13540,7 +13464,6 @@ async fn tui_main(
                                             sess.push_user(text);
                                             let current_mode = mode_arc.lock().await.clone();
                                             let mut ctx = ToolCtx::new(&ctx_cwd);
-                                            let _ = ctx.apply_sandbox_config(&sandbox_config);
                                             ctx.set_execution_surface(
                                                 wyj_core::ExecutionSurface::TuiInteractive,
                                             );
@@ -13917,7 +13840,6 @@ async fn tui_main(
                                         shared_mode.clone(),
                                         shared_permission.clone(),
                                         ui_ask_tx.clone(),
-                                        state.config.sandbox.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );

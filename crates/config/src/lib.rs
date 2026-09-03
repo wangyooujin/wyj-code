@@ -437,7 +437,11 @@ impl Default for ModelRuntimeCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// `crates/sandbox/` 已删除，下方所有 `Sandbox*Cfg` 字段仍保留只为兼容
+/// `~/.wyj-code/config.toml` 历史配置文件（旧 block 不会被 serde 报错），
+/// 运行时整块忽略，不再映射到任何 ToolCtx 状态。读取后会在 Config::load
+/// 里检测到非默认值时打印一次 deprecation warning。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct SandboxFilesystemCfg {
     pub allow_read: Vec<PathBuf>,
@@ -446,17 +450,17 @@ pub struct SandboxFilesystemCfg {
     pub deny_write: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct SandboxNetworkCfg {
-    /// 允许 sandbox 内的命令访问任意公网地址；与 allowed_domains 互斥。
+    /// 已废弃：保留只为 `config.toml` 兼容。
     pub allow_all: bool,
     pub allowed_domains: Vec<String>,
     pub allow_local_binding: bool,
     pub allow_unix_sockets: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SandboxEnvironmentCfg {
     /// 继承启动 wyj-code 的宿主环境；默认关闭以避免模型直接读取任意 secret。
@@ -481,7 +485,7 @@ impl Default for SandboxEnvironmentCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct SandboxCfg {
     pub enabled: bool,
@@ -621,6 +625,23 @@ pub struct StorageRetentionCfg {
 
     /// 启动期 `disk_usage::warn_if_over_budget` 阈值(0 = 关闭)。
     pub disk_usage_warn_bytes: u64,
+
+    /// CAS blob pool 单 blob 字节上限(0 = 关闭 CAS,沿用旧 inline 行为)。
+    /// 超此值的文件不进 CAS,直接 inline 进 checkpoint JSON。
+    pub cas_max_blob_bytes: u64,
+
+    /// Phase 4:单 session checkpoint 字节上限(0 = 不限,沿用数量上限)。
+    /// 超限时按 timestamp 升序淘汰最老 checkpoint。
+    pub checkpoint_bytes_per_session: u64,
+
+    /// Phase 4:CAS blob pool 总字节上限(0 = 不限)。超限清理 ref_count=0 + TTL 过期实体。
+    pub cas_total_bytes: u64,
+
+    /// Phase 4:CAS GC 启动时启用(首启跳过避免误删老 hash)。
+    pub cas_gc_on_start: bool,
+
+    /// Phase 4:checkpoint 寿命 TTL(按 timestamp;0 = 永久保留)。
+    pub checkpoint_ttl_days: u32,
 }
 
 impl Default for StorageRetentionCfg {
@@ -637,6 +658,11 @@ impl Default for StorageRetentionCfg {
             plugin_gc_interval_days: 7,
             workspace_worktree_max_age_days: 30,
             disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
+            cas_max_blob_bytes: 16 * 1024 * 1024,
+            checkpoint_bytes_per_session: 200 * 1024 * 1024,
+            cas_total_bytes: 5 * 1024 * 1024 * 1024,
+            cas_gc_on_start: true,
+            checkpoint_ttl_days: 30,
         }
     }
 }
@@ -922,6 +948,15 @@ impl Config {
     /// MCP 配置，最后用环境变量覆盖激活分组的 api_key。
     pub fn load() -> Result<Self> {
         let mut cfg = Self::load_file_only()?;
+
+        // 一次性 deprecation：用户保留 [sandbox] 块时打印一次警告。
+        // `crates/sandbox/` 已删除，所有 sandbox 字段已不再生效。
+        if cfg.sandbox != SandboxCfg::default() {
+            tracing::warn!(
+                "[sandbox] 配置块已废弃（crates/sandbox crate 已移除）；Bash 命令直接继承宿主 PATH/USER/SHELL。\
+                 请从 ~/.wyj-code/config.toml 删除 [sandbox] 块以消除本警告。"
+            );
+        }
 
         // Claude Code's global native MCP file has higher precedence than the
         // legacy wyj global TOML, while remaining read-only until explicit migrate.

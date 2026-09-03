@@ -362,7 +362,6 @@ impl SubAgentTool {
         let cwd = ctx.cwd().to_path_buf();
         let allowed = ctx.allowed_tools();
         let parent_is_plan = ctx.is_plan_mode();
-        let parent_sandbox = ctx.sandbox_policy();
         let prompt = inp.prompt;
         let semaphore = self.hub.semaphore();
         let parent_id = self.caller_id;
@@ -388,8 +387,6 @@ impl SubAgentTool {
 
             let sub_ctx = crate::ctx::ToolCtx::new(&cwd);
             sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
-            sub_ctx.replace_sandbox_policy(parent_sandbox);
-            sub_ctx.allow_unsandboxed_fallback(false);
             // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
             // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
@@ -445,7 +442,7 @@ impl SubAgentTool {
                 }
 
                 // FollowUp/Retry 只在完整模型消息与工具往返结束后消费。它们复用
-                // 原 sub_ctx，不能增加工具白名单、写根、网络或 sandbox 权限。
+                // 原 sub_ctx，不能增加工具白名单或写权限。
                 while let Ok(control) = control_rx.try_recv() {
                     match control {
                         AgentControl::FollowUp(content) => {

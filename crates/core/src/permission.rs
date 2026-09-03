@@ -10,7 +10,7 @@ use serde_json::Value;
 pub enum PermissionMode {
     /// 交互表面逐次询问；无交互表面 fail-closed。
     Prompt,
-    /// 显式 bypass。跳过询问，但不绕过受保护路径和 sandbox 要求。
+    /// 显式 bypass。跳过询问，但不绕过受保护路径。
     AutoApprove,
     /// Headless/schedule 的显式工具白名单。
     Allowlist(HashSet<String>),
@@ -44,7 +44,6 @@ pub struct PermissionRequest {
     pub tool_name: String,
     pub input: Value,
     pub cwd: PathBuf,
-    pub sandbox_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,22 +75,11 @@ impl DenyReason {
 
 #[derive(Debug, Clone, Default)]
 pub struct PermissionPolicy {
-    pub allowed_write_roots: Vec<PathBuf>,
-    pub allowed_domains: HashSet<String>,
     pub plan_document_grants: HashSet<PathBuf>,
-    pub require_sandbox: bool,
 }
 
 impl PermissionPolicy {
     pub fn evaluate(&self, request: &PermissionRequest) -> PermissionVerdict {
-        if self.require_sandbox && is_process_tool(&request.tool_name) && !request.sandbox_available
-        {
-            return PermissionVerdict::Deny(DenyReason::new(
-                "sandbox_required",
-                "该工具要求 sandbox，但当前平台没有可用的隔离后端",
-            ));
-        }
-
         let write_target = if is_file_write_tool(&request.tool_name) {
             match request.input.get("file_path").and_then(Value::as_str) {
                 Some(raw) => match safe_resolve_write_target(&request.cwd, raw) {
@@ -157,30 +145,6 @@ impl PermissionPolicy {
                         format!("工具 `{}` 未被本次进程显式授权", request.tool_name),
                     ));
                 }
-                if let Some(target) = write_target.as_deref() {
-                    if !self
-                        .allowed_write_roots
-                        .iter()
-                        .any(|root| path_is_within(target, root))
-                    {
-                        return PermissionVerdict::Deny(DenyReason::new(
-                            "write_root_not_allowlisted",
-                            format!("写入目标不在 --allow-write 授权范围：{}", target.display()),
-                        ));
-                    }
-                }
-                if let Some(domain) = network_domain(&request.tool_name, &request.input) {
-                    if !self
-                        .allowed_domains
-                        .iter()
-                        .any(|allowed| domain_matches(&domain, allowed))
-                    {
-                        return PermissionVerdict::Deny(DenyReason::new(
-                            "network_domain_not_allowlisted",
-                            format!("网络目标未被 --allow-network 授权：{domain}"),
-                        ));
-                    }
-                }
                 PermissionVerdict::Allow
             }
             PermissionMode::AutoApprove => PermissionVerdict::Allow,
@@ -204,17 +168,6 @@ impl PermissionPolicy {
                 }
             }
         }
-    }
-
-    pub fn add_allowed_write_root(
-        &mut self,
-        cwd: &Path,
-        raw: &Path,
-    ) -> Result<PathBuf, DenyReason> {
-        let raw = raw.to_string_lossy();
-        let resolved = safe_resolve_write_target(cwd, &raw)?;
-        self.allowed_write_roots.push(resolved.clone());
-        Ok(resolved)
     }
 
     pub fn add_plan_document_grant(
@@ -379,10 +332,6 @@ fn is_file_write_tool(name: &str) -> bool {
     matches!(name, "Write" | "Edit")
 }
 
-fn is_process_tool(name: &str) -> bool {
-    matches!(name, "Bash" | "BashOutput" | "KillShell" | "Agent")
-}
-
 fn is_side_effect_tool(name: &str, input: &Value) -> bool {
     if is_file_write_tool(name) {
         return true;
@@ -402,29 +351,6 @@ fn is_side_effect_tool(name: &str, input: &Value) -> bool {
         ),
         _ => false,
     }
-}
-
-fn network_domain(tool_name: &str, input: &Value) -> Option<String> {
-    match tool_name {
-        "WebFetch" => input
-            .get("url")
-            .and_then(Value::as_str)
-            .and_then(|raw| url::Url::parse(raw).ok())
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase)),
-        "WebSearch" => Some("api.tavily.com".to_string()),
-        _ => None,
-    }
-}
-
-fn domain_matches(domain: &str, allowed: &str) -> bool {
-    let allowed = allowed
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches('.')
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    !allowed.is_empty() && (domain == allowed || domain.ends_with(&format!(".{allowed}")))
 }
 
 pub fn validate_plan_read_only_command(command: &str) -> Result<(), String> {
@@ -538,7 +464,6 @@ mod tests {
             tool_name: tool.to_string(),
             input,
             cwd: cwd.to_path_buf(),
-            sandbox_available: true,
         }
     }
 
@@ -712,22 +637,6 @@ mod tests {
                 "{command}"
             );
         }
-    }
-
-    #[test]
-    fn headless_network_requires_domain_scope_in_addition_to_tool_name() {
-        let cwd = std::env::temp_dir();
-        let allowed: HashSet<String> = ["WebFetch"].into_iter().map(str::to_string).collect();
-        let mut policy = PermissionPolicy::default();
-        let req = request(
-            PermissionMode::Allowlist(allowed.clone()),
-            &cwd,
-            "WebFetch",
-            json!({"url": "https://docs.example.com/page"}),
-        );
-        assert!(matches!(policy.evaluate(&req), PermissionVerdict::Deny(_)));
-        policy.allowed_domains.insert("example.com".to_string());
-        assert!(matches!(policy.evaluate(&req), PermissionVerdict::Allow));
     }
 
     #[cfg(unix)]
