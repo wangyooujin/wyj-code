@@ -22,6 +22,7 @@ pub mod session;
 pub mod session_runtime;
 pub mod session_store;
 pub mod summary;
+pub mod textutil;
 pub mod tool;
 pub mod tool_arguments;
 pub mod tool_search;

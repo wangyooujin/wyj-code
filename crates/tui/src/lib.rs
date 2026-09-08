@@ -5,6 +5,7 @@ pub mod event;
 mod hyperlink;
 pub mod input;
 pub mod markdown;
+pub mod panic_guard;
 pub mod render;
 pub mod theme;
 pub mod welcome;
