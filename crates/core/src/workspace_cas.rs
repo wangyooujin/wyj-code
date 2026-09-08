@@ -127,9 +127,8 @@ impl WorkspaceCas {
 
         // 不存在:写入 .blob + 创建 .meta.json
         if let Some(parent) = blob.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("create CAS dir {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create CAS dir {}", parent.display()))?;
         }
         // write-then-rename 原子性
         let tmp_blob = blob.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
@@ -162,12 +161,10 @@ impl WorkspaceCas {
         let path = self.blob_path(hash);
         match std::fs::read(&path) {
             Ok(bytes) => Ok(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Err(anyhow::anyhow!(
-                    "CAS blob not found: hash={hash}, path={}",
-                    path.display()
-                ))
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(anyhow::anyhow!(
+                "CAS blob not found: hash={hash}, path={}",
+                path.display()
+            )),
             Err(error) => Err(error.into()),
         }
     }
@@ -408,7 +405,9 @@ mod tests {
     fn digest_is_64_lowercase_hex() {
         let h = WorkspaceCas::digest(b"hello");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -439,8 +438,16 @@ mod tests {
         let h = cas.intern(b"data").unwrap();
         let blob = cas.blob_path(&h);
         let meta = cas.meta_path(&h);
-        assert!(blob.exists(), "blob file should exist at {}", blob.display());
-        assert!(meta.exists(), "meta file should exist at {}", meta.display());
+        assert!(
+            blob.exists(),
+            "blob file should exist at {}",
+            blob.display()
+        );
+        assert!(
+            meta.exists(),
+            "meta file should exist at {}",
+            meta.display()
+        );
         assert_eq!(std::fs::read(&blob).unwrap(), b"data");
     }
 

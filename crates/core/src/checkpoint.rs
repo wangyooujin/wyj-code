@@ -881,7 +881,18 @@ fn apply_delta(files: &mut FileSnapshot, delta: &DeltaSnapshot) -> Result<()> {
     files.sensitive_files_skipped = delta.sensitive_files_skipped;
     for (path, op) in &delta.ops {
         match op {
-            DeltaOp::Added { hash, inline, size, sha256 } | DeltaOp::Modified { hash, inline, size, sha256 } => {
+            DeltaOp::Added {
+                hash,
+                inline,
+                size,
+                sha256,
+            }
+            | DeltaOp::Modified {
+                hash,
+                inline,
+                size,
+                sha256,
+            } => {
                 files.files.insert(
                     path.clone(),
                     FileEntry {
@@ -900,10 +911,7 @@ fn apply_delta(files: &mut FileSnapshot, delta: &DeltaSnapshot) -> Result<()> {
     Ok(())
 }
 /// Unchanged 不入 ops(由 restore 时继承父状态)。
-fn diff_files(
-    before: &FileSnapshot,
-    after: &FileSnapshot,
-) -> BTreeMap<PathBuf, DeltaOp> {
+fn diff_files(before: &FileSnapshot, after: &FileSnapshot) -> BTreeMap<PathBuf, DeltaOp> {
     let mut ops = BTreeMap::new();
     let all: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
     for path in all {
@@ -961,9 +969,7 @@ fn restore_files_snapshot(
                     (Some(hash), Some(c)) => match c.get(hash) {
                         Ok(b) => b,
                         Err(error) => {
-                            tracing::warn!(
-                                "CAS get 失败 (hash={hash}): {error} —— 跳过此文件恢复"
-                            );
+                            tracing::warn!("CAS get 失败 (hash={hash}): {error} —— 跳过此文件恢复");
                             continue;
                         }
                     },
@@ -1258,8 +1264,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let cas_root = tempfile::tempdir().unwrap();
         let cas = std::sync::Arc::new(
-            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
-                .unwrap(),
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024).unwrap(),
         );
 
         // 构造 200 个文件,每个 5KB 唯一内容(但全部相同) → 1 MB 总
@@ -1359,7 +1364,10 @@ mod tests {
         assert!(entry.hash.is_none());
         assert_eq!(entry.inline_bytes, vec![104, 105]); // "hi"
         assert_eq!(entry.size, 0); // 老字段没 size,新结构默认 0
-        assert_eq!(entry.sha256, "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4");
+        assert_eq!(
+            entry.sha256,
+            "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"
+        );
     }
 
     /// M2 验证:相邻 checkpoint 自动写 Delta 形式,且 Delta 体积 << 完整 Files。
@@ -1369,8 +1377,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let cas_root = tempfile::tempdir().unwrap();
         let cas = std::sync::Arc::new(
-            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
-                .unwrap(),
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024).unwrap(),
         );
         // 100 文件 baseline 内容
         for i in 0..100 {
@@ -1390,17 +1397,16 @@ mod tests {
         let cp1 = store.load(&s1.id).unwrap();
         assert!(matches!(cp1.workspace, WorkspaceSnapshot::Files(_)));
         // 改 1 个文件 → 第二个应是 Delta
-        std::fs::write(
-            root.path().join("f005.txt"),
-            "MODIFIED content for file 5",
-        )
-        .unwrap();
+        std::fs::write(root.path().join("f005.txt"), "MODIFIED content for file 5").unwrap();
         let s2 = store
             .create(root.path(), &[], CheckpointKind::Manual, None)
             .unwrap();
         let cp2 = store.load(&s2.id).unwrap();
         let WorkspaceSnapshot::Delta(delta) = &cp2.workspace else {
-            panic!("expected Delta, got {:?}", std::mem::discriminant(&cp2.workspace));
+            panic!(
+                "expected Delta, got {:?}",
+                std::mem::discriminant(&cp2.workspace)
+            );
         };
         assert_eq!(delta.parent_checkpoint_id, s1.id);
         // 改动只有 1 个,ops 应只 1 项
@@ -1418,8 +1424,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let cas_root = tempfile::tempdir().unwrap();
         let cas = std::sync::Arc::new(
-            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
-                .unwrap(),
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024).unwrap(),
         );
         for i in 0..50 {
             std::fs::write(
@@ -1483,7 +1488,10 @@ mod tests {
             .create(root_b.path(), &[], CheckpointKind::Manual, None)
             .unwrap();
         assert!(
-            matches!(store.load(&s_b.id).unwrap().workspace, WorkspaceSnapshot::Files(_)),
+            matches!(
+                store.load(&s_b.id).unwrap().workspace,
+                WorkspaceSnapshot::Files(_)
+            ),
             "切换 cwd 后必须写 Files (baseline),不允许跨 cwd delta"
         );
     }
@@ -1498,8 +1506,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let cas_root = tempfile::tempdir().unwrap();
         let cas = std::sync::Arc::new(
-            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024)
-                .unwrap(),
+            crate::workspace_cas::WorkspaceCas::open(cas_root.path(), 16 * 1024 * 1024).unwrap(),
         );
         for i in 0..10 {
             std::fs::write(
@@ -1516,11 +1523,7 @@ mod tests {
             .create(root.path(), &[], CheckpointKind::Manual, None)
             .unwrap();
         // 2) 改 d03.txt 触发 Delta
-        std::fs::write(
-            root.path().join("d03.txt"),
-            "delta content 3 MODIFIED",
-        )
-        .unwrap();
+        std::fs::write(root.path().join("d03.txt"), "delta content 3 MODIFIED").unwrap();
         let s2 = store
             .create(root.path(), &[], CheckpointKind::Manual, None)
             .unwrap();
@@ -1528,13 +1531,14 @@ mod tests {
         std::fs::write(root.path().join("d03.txt"), "USER_DIRTY").unwrap();
         let preview = store.preview_files(&s2.id, root.path()).unwrap();
         assert!(
-            preview.affected_files.iter().any(|p| p.to_str() == Some("d03.txt")),
+            preview
+                .affected_files
+                .iter()
+                .any(|p| p.to_str() == Some("d03.txt")),
             "preview 必须识别 d03.txt 的脏内容"
         );
         // 4) restore:confirmed=true 跳过确认,验证 d03.txt 还原成 MODIFIED
-        store
-            .restore_files(&s2.id, root.path(), true)
-            .unwrap();
+        store.restore_files(&s2.id, root.path(), true).unwrap();
         let restored = std::fs::read_to_string(root.path().join("d03.txt")).unwrap();
         assert_eq!(restored, "delta content 3 MODIFIED");
     }

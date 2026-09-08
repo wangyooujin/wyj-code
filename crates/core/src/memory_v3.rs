@@ -974,7 +974,10 @@ impl MemoryV3Store {
         }
 
         if out.len() > MAX_CONTEXT_BYTES {
-            out.truncate(MAX_CONTEXT_BYTES);
+            // MAX_CONTEXT_BYTES 按字节计；CJK / emoji 落在中间会触发
+            // `String::truncate` 的 is_char_boundary panic，先回退到最近 boundary。
+            let keep = crate::textutil::floor_char_boundary(&out, MAX_CONTEXT_BYTES);
+            out.truncate(keep);
             out.push_str("\n... (truncated)");
         }
         out

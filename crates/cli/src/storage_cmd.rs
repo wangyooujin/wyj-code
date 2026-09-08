@@ -79,9 +79,7 @@ fn run_status(config_base: &Path, _cfg: &Config, json: bool) -> Result<()> {
         for entry in report.top_sessions.iter().take(5) {
             println!(
                 "  {:>10}  {}/{}",
-                entry.bytes,
-                entry.id,
-                entry.checkpoint_count
+                entry.bytes, entry.id, entry.checkpoint_count
             );
         }
     }
@@ -145,10 +143,7 @@ fn collect_status(config_base: &Path) -> Result<StatusReport> {
                     .map(|d| {
                         d.flatten()
                             .filter(|e| {
-                                e.path()
-                                    .extension()
-                                    .and_then(|x| x.to_str())
-                                    == Some("json")
+                                e.path().extension().and_then(|x| x.to_str()) == Some("json")
                             })
                             .count() as u64
                     })

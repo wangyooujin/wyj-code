@@ -278,9 +278,7 @@ pub fn materialize_block_with(block: &mut ApiContentBlock, cas: Option<&Workspac
                                 *data = STANDARD.encode(&bytes);
                             }
                             Err(error) => {
-                                tracing::warn!(
-                                    "CAS image materialize 失败 (hash={hash}): {error}"
-                                );
+                                tracing::warn!("CAS image materialize 失败 (hash={hash}): {error}");
                             }
                         }
                     }
@@ -384,7 +382,10 @@ mod tests {
         let ToolResultPart::Image { data, .. } = &parts[0] else {
             panic!()
         };
-        assert!(data.starts_with("cas://"), "data 应该是 cas:// 引用: {data}");
+        assert!(
+            data.starts_with("cas://"),
+            "data 应该是 cas:// 引用: {data}"
+        );
         let hash = &data[6..];
         assert_eq!(hash.len(), 64);
         // CAS 应有 1 个 blob
