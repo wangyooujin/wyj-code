@@ -2,6 +2,30 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.12] - 2026-09-08
+
+- **TUI 终端 panic 兜底还原**：新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`，`cli::main()` 入口最前 `wyj_tui::panic_guard::install()`（`take_hook` 链式保留前一个 hook），`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()` / `mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时若 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。告别"TUI 进程 panic 后终端卡死在 raw mode + alternate screen 残留 frame + panic 写 stderr 覆盖 ratatui cell 造成画面撕裂"的复合失败模式。
+- **CJK / emoji 字符串截断安全**：新增 `wyj_core::textutil::floor_char_boundary(&str, usize) -> usize`，按字节切字符串时先回退到最近 char boundary 再 `String::truncate`，治本 `memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时撞 CJK/emoji char boundary 触发的 `is_char_boundary` assertion panic（2026-09 用户跑 `stock_fenxi` 项目时实触发）。与 `wyj-tools::textutil::truncate_str` 分工：这里是 `usize` 索引版本，配合 `String::truncate` 做原地截断避免重复分配。
+- **TUI 标题栏 / 状态栏文案精简**：`thinking_status_label` 改回单层优先级静态字符串（InProgress TodoItem 的 `active_form` / `content` → current_op 映射 `Reading file / Running command / Editing file / Updating todos / Delegating task / Browsing / Preparing plan / Running <Tool>` → permission_dialog → plan_dialog → pending_queue → fallback `Thinking`），砍掉旧的"大象装进冰箱"4 秒旋转短语（多语言干扰、跨平台兼容性差）。`draw_input` 标题栏只在 thinking 态保留 `⠋ {label}{suffix}`（spinner + label + animated dots）+ 加粗品牌橙；非 thinking 态 Plan/Bypass/Normal 三种模式标题栏分别精简为 `[plan] Enter to send` / `[bypass] Enter to send` / `Enter to send`，把 `↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode` 等长串提示砍掉（这些在顶部 `/help` 与 docs 里有完整说明）。状态栏（`draw_status`）默认右侧不再放 `ctrl+d or ctrl+c twice to exit  /help`，留给左侧"模型 / 进度 / 用量 / cwd"；thinking 指示器单点（标题栏）而非上下两处同闪烁。
+- **修复 TUI 思考时光标卡死的回归**：删除 `draw_input` 在 `is_thinking=true` 时提前 `return` 的旧逻辑——那个 `return` 跳过了末尾 `f.set_cursor_position(...)`，crossterm 硬件光标永远停在"上次成功提交瞬间"的位置、用户主观感觉光标卡住/错位。现在 thinking 态仍调 `set_cursor_position` 让硬件光标跟随用户实际操作，配套新增两个 `TestBackend` 回归测试（`draw_input_keeps_cursor_visible_while_thinking` + `draw_input_title_shows_thinking_spinner_when_thinking`）防止再次回归。
+
+## [1.5.11] - 2026-09-05
+
+- **Session 存储 CAS + Delta 重构（M1-M4）**：新增 `crates/core/src/workspace_cas.rs` 提供 sha256 内容寻址 Blob Pool（`intern / get / release / gc / stats`），CAS 路径 `~/.wyj-code/cas/sha256/aa/bb/<hash>.blob + .meta.json`。`FileEntry { hash, inline_bytes, size, sha256 }` 替代内联字节，serde 用 `#[serde(default, alias = "bytes")]` 兼容旧 v1.5.10 checkpoint。`WorkspaceSnapshot::Delta(DeltaSnapshot)` 同 cwd 自动 fold 父链（最多 20 层），跨 cwd 强制 baseline。`externalize_block_with` 把 >32KB image 与 >16KB thinking 外置，`cas://<hash>` 引用 + `materialize_block_with` 在 resume 时还原。`gc()` 用 `last_ref_at` LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。
+- **`/new` slash 命令**：对齐 Claude Code 新会话语义——自动保存当前会话历史后分配新 session_id、清空 TUI 状态、无二次确认弹窗；与 `/clear` 区分（清空 ≠ 全新会话）。
+- **`wyj-code storage {status,doctor,prune}` 子命令**：占用诊断与 GC 治理，`status --json` 可脚本消费。
+- 869 workspace 测试 + clippy clean。
+
+## [1.5.10] - 2026-08-31
+
+- 50GB 级磁盘占用默认 cap：Evolution per-project 100MiB + 28–180 天 TTL；Session checkpoint 20/session、Memory v2/v3 records/Superseded 单独计数；Schedule 日志 50 文件 + run.log 10MiB×3 轮转；plugin .git 7 天 `git gc`；workspace worktree 30 天 prune；持久化前 content 截断（tool_result 20K+10K、thinking 8K、tool_use.input 64K）；顶层 `~/.wyj-code` 达 5GiB 启动一次性 warn；全部 opt-out by `0` in config。
+- 首次启动 `~/.wyj-code` 缺失时 TUI 自动打开 /model 引导用户填写 API Key（焦点预置 api_key 字段），写盘后 chmod 0600 自动重建 agent，无需重启；headless / -p / ACP / daemon 无 UI 时继续报错但给出指向 TUI 与 `WYJ_CODE_API_KEY` 的可复制 hint。
+- MiniMax M3 thinking 按 `effort_levels` 拆出 `ReasoningEffort`，与 M2 协议并行走不同 vendor dispatch 与 capability 路径。
+
+## [1.5.7] - 2026-08-26
+
+- v1.5.7 国产模型适配 8 项收口：reasoning_content 落盘 / image_url / tool_result 降级 / R1 max_iterations / loop detection / doctor。详见对应 plan。
+
 ## [1.5.6] - 2026-08-22
 
 - **Memory v3 最终设计落地**：把 v3 收敛为 Global / Project 两层（删除共享 Workspace scope 与自动迁移旧数据），AI 自动管理项目记忆、Project 覆盖 Global 冲突、reference 不进入 Brief；Global 背景提取走 `PendingGlobalCandidate`，由模型用 `Memory` 工具 `list_pending_global_candidates / confirm_global_candidate / reject_global_candidate` 三步自然语言确认，reject 后的 `(scope,kind,title,content_fingerprint)` 写入 `rejected_history.json`，重复提议同一指纹会被立即拒绝。Evolution 收敛到 `GovernanceOnly`：`EvolutionStore::new` 不再 `create_dir_all("memories")`，普通 Memory 数据层只保留兼容桩，cfg 删除 `auto_activate_memories` / `generate_experiences` 字段，普通 Memory 不再被注入也不再自动生成。
