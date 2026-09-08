@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.11：Session 存储 CAS+Delta 重构（单 checkpoint 从 11MB 降至 ~100KB）、/new 一键开新会话、`wyj-code storage status` 占用诊断。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.12：TUI 终端 panic 兜底还原、CJK/emoji 字符串截断安全（floor_char_boundary）、输入框标题栏/状态栏精简。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.11 已公开发布：Session 存储 CAS+Delta 重构（单 checkpoint 从 11MB 降至 ~100KB、整体会话占用降 ~99%）、/new 一键开新会话对齐 Claude Code 语义、`wyj-code storage status` 占用诊断；安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.12 已公开发布：TUI 终端 panic 兜底还原（panic 时自动还原 raw mode + alternate screen）、CJK/emoji 字符串截断安全（`wyj_core::textutil::floor_char_boundary` 治本 memory_v3 撞 char boundary panic）、输入框标题栏/状态栏精简；安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.11</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.12</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.11 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.12 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.11 · Session 存储 CAS 重构 + /new 命令</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.11 公开交付 Session 存储重构：sha256 内容寻址 CAS Blob Pool 把 256 文件 ×21 checkpoint = 5376 份冗余压缩为 256 份真实内容（单 checkpoint 从 11MB → ~100KB）；同 cwd 相邻 checkpoint 自动写 Delta 快照，父链最长 20 层；超大 base64 image / 长 thinking 自动外置到 CAS，session.json 同步瘦身。新增 `/new` slash 命令对齐 Claude Code 新会话语义——自动保存当前会话后分配新 session_id、清空 TUI 状态、无二次确认弹窗；新增 `wyj-code storage {status,doctor,prune}` 占用治理子命令。历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.12 · TUI 终端 panic 还原 + char-boundary 安全工具</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.12 公开交付三条 TUI 健壮性修复：(1) 新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`，`cli::main()` 入口最前 `install()`、`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()/mark_inactive()`，panic 触发时若 active 则 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`），告别"TUI 进程 panic 后终端卡死 + alternate screen 残留 frame + panic 写 stderr 覆盖 ratatui cell 造成撕裂"。(2) 新增 `crates/core/src/textutil.rs::floor_char_boundary` 治本 `memory_v3.rs` 拼装 Active Memory 上下文超 `MAX_CONTEXT_BYTES` 时撞 CJK/emoji char boundary 触发的 `is_char_boundary` assertion panic，按字节切字符串前回退到最近 char boundary 再 `String::truncate`。(3) `thinking_status_label` 改回单层优先级静态字符串、标题栏仅 thinking 态保留 spinner、删除 `draw_input` 在 `is_thinking=true` 时跳过 `set_cursor_position` 致光标卡死的回归、状态栏默认不再放长串快捷键提示。历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -213,8 +213,8 @@
   <div class="mt-5 reveal rounded-xl border border-phosphor/20 bg-phosphor/[0.04] p-6 sm:p-7">
     <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
       <div class="max-w-3xl">
-        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.11 · Session 存储重构 (CAS + Delta)</h3>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">新增 `crates/core/src/workspace_cas.rs` 提供 sha256 内容寻址 Blob Pool：`intern()/get()/release()/gc()/stats()`，CAS 路径 `~/.wyj-code/cas/sha256/aa/bb/<hash>.blob + .meta.json`。`FileEntry { hash, inline_bytes, size, sha256 }` 替代内联字节，serde 用 `#[serde(default, alias = "bytes")]` 兼容旧 v1.5.10 落盘。`WorkspaceSnapshot::Delta(DeltaSnapshot)` 同 cwd 自动 fold 父链（最多 20 层），跨 cwd 强制 baseline。`externalize_block_with` 把 >32KB image 与 >16KB thinking 外置，`cas://<hash>` 引用 + `materialize_block_with` 在 resume 时还原。`gc()` 用 `last_ref_at` LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：长会话从 1.15GB 降至 ~3MB（~99.5% 压缩率）。</p>
+        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.12 · TUI 终端 panic 还原 + char-boundary 安全</h3>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`：`cli::main()` 入口最前 `wyj_tui::panic_guard::install()`（`take_hook` 链式保留前一个 hook），`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()/mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时 hook 检查到 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。新增 `crates/core/src/textutil.rs::floor_char_boundary(&str, usize) -> usize`：按字节切字符串时先回退到最近 char boundary 再 `String::truncate`，治本 `memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时撞 CJK/emoji char boundary 触发的 `is_char_boundary` assertion panic。配套新增 `TestBackend` 回归测试 `draw_input_keeps_cursor_visible_while_thinking` 与 `draw_input_title_shows_thinking_spinner_when_thinking` 防止"is_thinking 时跳过 `set_cursor_position` 致光标卡死"再次回归。</p>
       </div>
       <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-phosphor hover:text-paper transition-colors text-sm shrink-0" data-i18n="delivery.evolution.plan">查看 Memory v3 实施计划 →</a>
     </div>
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.11" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.11 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.12" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.12 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -533,8 +533,18 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.11</span>
+          <span class="font-display font-bold text-phosphor">v1.5.12</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1512">TUI 终端 panic 兜底还原 + char-boundary 安全工具 + 标题栏/状态栏精简：新增 <code class="text-amber-400">crates/tui/src/panic_guard.rs</code> 进程级 <code class="text-amber-400">panic::set_hook</code>（<code class="text-amber-400">cli::main()</code> 入口最前 <code class="text-amber-400">install()</code>，<code class="text-amber-400">run_tui</code> 在 <code class="text-amber-400">enter/leave_terminal_screen</code> 配对 <code class="text-amber-400">mark_active/mark_inactive</code>），panic 触发时若 active 则 best-effort 还原终端（<code class="text-amber-400">DisableMouseCapture</code> → <code class="text-amber-400">LeaveAlternateScreen</code> → <code class="text-amber-400">disable_raw_mode</code> → <code class="text-amber-400">Show</code>）。新增 <code class="text-amber-400">wyj_core::textutil::floor_char_boundary</code> 治本 <code class="text-amber-400">memory_v3.rs</code> 拼装 Active Memory 上下文超 <code class="text-amber-400">MAX_CONTEXT_BYTES</code> 时撞 CJK/emoji char boundary 的 <code class="text-amber-400">is_char_boundary</code> assertion panic。<code class="text-amber-400">thinking_status_label</code> 改回单层优先级静态字符串（去掉旧的"大象装进冰箱"4 秒旋转短语）；<code class="text-amber-400">draw_input</code> 标题栏仅 thinking 态保留 spinner，三模式 Plan/Bypass/Normal 非思考态只留最简洁 <code class="text-amber-400">[plan/bypass] Enter to send</code> / <code class="text-amber-400">Enter to send</code>；状态栏默认右侧不再放快捷键提示；删除 <code class="text-amber-400">draw_input</code> 在 <code class="text-amber-400">is_thinking=true</code> 时提前 <code class="text-amber-400">return</code> 致光标卡死的回归，配套新增两个 <code class="text-amber-400">TestBackend</code> 回归测试防再次复发。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.11</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1511">Session 存储重构（M1-M4）：新增 <code class="text-amber-400">crates/core/src/workspace_cas.rs</code> 提供 sha256 内容寻址 Blob Pool（<code class="text-amber-400">intern/get/release/gc/stats</code>），<code class="text-amber-400">FileEntry { hash, inline_bytes, size, sha256 }</code> 替代内联字节 + <code class="text-amber-400">#[serde(default, alias = "bytes")]</code> 兼容旧 v1.5.10 checkpoint；<code class="text-amber-400">WorkspaceSnapshot::Delta</code> 同 cwd 自动 fold 父链（20 层上限），跨 cwd 强制 baseline；<code class="text-amber-400">externalize_block_with</code> 把 &gt;32KB image 与 &gt;16KB thinking 外置到 CAS（<code class="text-amber-400">cas://&lt;hash&gt;</code> 引用，<code class="text-amber-400">materialize_block_with</code> 在 resume 时还原）；<code class="text-amber-400">gc()</code> 用 <code class="text-amber-400">last_ref_at</code> LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。新增 <code class="text-amber-400">/new</code> slash 命令对齐 Claude Code 新会话语义：自动保存当前会话 + 分配新 session_id + 清空 TUI 状态 + 无二次确认弹窗。新增 <code class="text-amber-400">wyj-code storage {status,doctor,prune}</code> 占用治理子命令，<code class="text-amber-400">status --json</code> 可脚本消费。869 workspace 测试 + clippy clean。</p>
       </div>
