@@ -122,7 +122,10 @@ enum Commands {
         command: schedule_cmd::ScheduleCommand,
     },
     /// 按 TTL + 字节上限本地存储治理(Phase 4)。
-    #[command(name = "storage", about = "Inspect and prune local ~/.wyj-code storage")]
+    #[command(
+        name = "storage",
+        about = "Inspect and prune local ~/.wyj-code storage"
+    )]
     Storage {
         #[command(subcommand)]
         command: storage_cmd::StorageCommand,
@@ -744,6 +747,14 @@ fn workflow_parent_ceiling(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 注册 panic hook：TUI 路径下,run_tui 配对的 disable_raw_mode +
+    // LeaveAlternateScreen + DisableMouseCapture 在进程 panic 时不会跑,
+    // 导致终端卡在 raw mode + alternate screen,且 panic 信息写 stderr
+    // 会直接覆盖 ratatui cell(画面撕裂)。hook 仅在主线程 panic 且
+    // TUI_SCREEN_ACTIVE=true 时 best-effort 还原终端。必须在
+    // Config::load / 任何可能 panic 的代码之前注册。
+    wyj_tui::panic_guard::install();
+
     // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
     // --help 文本、以及后续所有输出都使用正确的语言。
     let mut cfg = Config::load()?;

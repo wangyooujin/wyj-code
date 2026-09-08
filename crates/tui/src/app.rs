@@ -8572,6 +8572,9 @@ pub async fn run_tui(
     // 终端仍主动上报修饰键点击时的防御性兜底，不为此开启鼠标报告模式。
     let wheel_routing = TerminalWheelRouting::detect();
     enter_terminal_screen(&mut stdout, wheel_routing)?;
+    // 标记已进入 alternate screen：panic hook 据此决定是否还原终端。
+    // 见 `crates/tui/src/panic_guard.rs`。
+    crate::panic_guard::mark_active();
     let hyperlink_registry = HyperlinkRegistry::default();
     let backend = HyperlinkBackend::new(stdout, hyperlink_registry.clone());
     let mut terminal = Terminal::new(backend)?;
@@ -8606,6 +8609,9 @@ pub async fn run_tui(
     // 全程都在 alternate screen，退出时统一还原；再次发送 DisableMouseCapture
     // 可防御外部组件或异常路径意外开启鼠标报告模式。
     leave_terminal_screen(terminal.backend_mut(), wheel_routing)?;
+    // 标记已离开 alternate screen：panic hook 不再还原终端。
+    // 必须放在 leave 成功之后,确保 leave 失败时 hook 仍会兜底还原一次。
+    crate::panic_guard::mark_inactive();
     terminal.show_cursor()?;
 
     match result {
@@ -12874,16 +12880,15 @@ async fn tui_main(
                                             if let Some(store) = &session_store {
                                                 let sess = session.lock().await;
                                                 if !sess.messages.is_empty() {
-                                                    let (title, title_generated) =
-                                                        match store.load(&current_session_id).ok() {
-                                                            Some(f) if f.title_generated => {
-                                                                (f.title, true)
-                                                            }
-                                                            _ => (
-                                                                extract_title(&sess.messages),
-                                                                false,
-                                                            ),
-                                                        };
+                                                    let (title, title_generated) = match store
+                                                        .load(&current_session_id)
+                                                        .ok()
+                                                    {
+                                                        Some(f) if f.title_generated => {
+                                                            (f.title, true)
+                                                        }
+                                                        _ => (extract_title(&sess.messages), false),
+                                                    };
                                                     let _ = store.save(&SessionFile {
                                                         session_id: current_session_id.clone(),
                                                         title,

@@ -1954,6 +1954,18 @@ fn thinking_elapsed_secs(state: &AppState) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// 输入框标题栏 thinking 指示器的基础文案（不含 spinner 帧与 animated dots）。
+///
+/// 优先级（从最具辨识度到默认）：
+///   1. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
+///   2. `current_op`（如 `"Read(crates/tui/src/render.rs)"`）拆分出的工具名
+///      → "Reading file" / "Running command" 等固定短语
+///   3. `permission_dialog` → "Waiting for approval"
+///   4. `plan_dialog`      → "Reviewing plan"
+///   5. `pending_queue`    → "Queuing message"
+///   6. fallback           → "Thinking"
+///
+/// 由 `draw_input` 标题栏调用，格式化为 `⠋ {label}{suffix}`（spinner + label + animated dots）。
 fn thinking_status_label(state: &AppState) -> String {
     if let Some(task) = state
         .current_todos
@@ -1994,15 +2006,7 @@ fn thinking_status_label(state: &AppState) -> String {
         return "Queuing message".to_string();
     }
 
-    const PHRASES: &[&str] = &[
-        "大象装进冰箱",
-        "先打开冰箱门",
-        "把大象装进去",
-        "关上冰箱门",
-        "大象装进冰箱了",
-    ];
-    let phase = (thinking_elapsed_secs(state) / 4.0) as usize;
-    PHRASES[phase % PHRASES.len()].to_string()
+    "Thinking".to_string()
 }
 
 fn thinking_status_suffix(state: &AppState) -> &'static str {
@@ -2065,12 +2069,17 @@ fn draw_input(
             .unwrap_or(false);
 
     let (mut title_content, title_style) = if state.is_thinking {
+        // AI 思考中：标题栏只放 `⠋ Thinking..` 一个核心指示，spinner 帧 + label +
+        // animated dots 与状态栏里同源（`thinking_status_label` / `_suffix`），
+        // 但本帧 spin 在标题栏渲染，颜色用品牌橙 + 加粗作为视觉锚点。
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
-        let op = thinking_status_label(state);
+        let label = thinking_status_label(state);
         let suffix = thinking_status_suffix(state);
         (
-            format!(" {frame} {op}{suffix} · esc to interrupt "),
-            Style::default().fg(Theme::claude_color()),
+            format!(" {frame} {label}{suffix} "),
+            Style::default()
+                .fg(Theme::claude_color())
+                .add_modifier(Modifier::BOLD),
         )
     } else if is_bang {
         (
@@ -2080,23 +2089,24 @@ fn draw_input(
                 .add_modifier(Modifier::BOLD),
         )
     } else {
+        // 非思考态：标题栏只保留"Enter to send"一个最简洁锚点，按模式着色，
+        // 把 "↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode"
+        // 等历史提示全部砍掉（这些在 TUI 顶部 /help 与 docs 里有完整说明，
+        // 在标题栏塞一长串会让底部看起来很拥挤）。
         match &state.mode {
             AgentMode::Plan => (
-                " [plan] Enter to send · ↑↓ history · Shift+Tab mode ".to_string(),
+                " [plan] Enter to send ".to_string(),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ),
             AgentMode::Bypass => (
-                " [bypass] Enter to send · ↑↓ history · Shift+Tab mode ".to_string(),
+                " [bypass] Enter to send ".to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            AgentMode::Normal => (
-                " Enter to send · Shift+Enter newline · ↑↓ history · / commands · ! bash · Shift+Tab mode ".to_string(),
-                Theme::dim(),
-            ),
+            AgentMode::Normal => (" Enter to send ".to_string(), Theme::dim()),
         }
     };
     title_content = truncate_line(&title_content, area.width.saturating_sub(2) as usize);
@@ -2146,10 +2156,13 @@ fn draw_input(
     let para = Paragraph::new(Text::from(lines)).style(text_style);
     f.render_widget(para, inner);
 
-    if state.is_thinking {
-        // is_thinking 时不设置光标位置，ratatui 会自动隐藏终端光标（避免和 spinner 冲突）
-        return;
-    }
+    // is_thinking 时仍然调用末尾的 `f.set_cursor_position`：用户在 AI 思考中向
+    // 输入框继续打字 / 移动光标 / 删字，硬件光标必须跟随用户实际操作。
+    // spinner 动画与"esc to interrupt"提示已迁到状态栏（`draw_status`），
+    // 主输入框标题栏也不再画 braille spinner，所以这里不再有"光标 vs spinner
+    // 字符位置打架"的顾虑。原有 `if is_thinking { return; }` 注释误以为
+    // ratatui 会隐藏光标，实际上只是不调 `set_cursor_position`、让终端光标
+    // 停留在上一次成功位置不动，导致用户主观感觉"光标卡住/错位"。
 
     // 光标位置：考虑长行折行后的视觉坐标
     let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
@@ -2403,10 +2416,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        (
-            "ctrl+d or ctrl+c twice to exit  /help".to_string(),
-            Theme::dim(),
-        )
+        // 默认状态：状态栏右侧不再放 "ctrl+d / ctrl+c twice / /help" 提示，
+        // 这些快捷键 /help 命令的入口在顶部 /help 命令里有完整说明，底部状态栏
+        // 留给左侧更重要的"模型 / 进度 / 用量 / cwd"信息，整体更简洁。
+        (String::new(), Theme::dim())
     };
 
     let mode_span = match &state.mode {
@@ -2437,15 +2450,17 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let right_len = right_help.chars().count();
     let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
 
-    let mut spans = vec![
-        Span::styled(
-            " ◆ ",
-            Style::default()
-                .fg(Theme::claude_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(state.model_name.clone(), Theme::dim()),
-    ];
+    // thinking 指示器已迁回 `draw_input` 标题栏（"⠋ Thinking.." 紧贴用户输入框），
+    // 状态栏保持单一职责：左侧"模型 + 进度 + 用量 + cwd"，右侧在按 Ctrl+C / 排队时
+    // 给出对应提示；不再额外画 spinner，避免上下两处同时闪烁 + 与标题栏文字打架。
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        " ◆ ",
+        Style::default()
+            .fg(Theme::claude_color())
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(state.model_name.clone(), Theme::dim()));
     if let Some(ms) = mode_span {
         spans.push(ms);
     }
@@ -5519,23 +5534,32 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_label_uses_tool_context_and_rotates_idle_copy() {
+    fn thinking_status_suffix_animates_per_half_second() {
+        // `thinking_status_label` 与 `thinking_status_suffix` 都由输入框标题栏
+        // thinking 指示器组合使用：`⠋ {label}{suffix}`。这里只测 suffix 自身的节奏；
+        // label 各分支的优先级由下面四个测试保护。
         let mut state = make_state();
-        assert_eq!(thinking_status_label(&state), "大象装进冰箱");
+        // 0..550ms 还在第一档
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(100));
+        assert_eq!(thinking_status_suffix(&state), "");
 
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(9));
-        assert_eq!(thinking_status_label(&state), "把大象装进去");
+        // 550..1100ms 第二档
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(700));
+        assert_eq!(thinking_status_suffix(&state), ".");
 
-        state.current_op = Some("Read(crates/tui/src/render.rs)".to_string());
-        assert_eq!(thinking_status_label(&state), "Reading file");
+        // 1100..1650ms 第三档
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(1300));
+        assert_eq!(thinking_status_suffix(&state), "..");
 
-        state.current_op = Some("Bash(cargo test)".to_string());
-        assert_eq!(thinking_status_label(&state), "Running command");
+        // 1650ms+ 第四档
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(2000));
+        assert_eq!(thinking_status_suffix(&state), "...");
     }
 
     #[test]
-    fn thinking_status_label_prefers_active_todo_name() {
+    fn thinking_status_label_prefers_active_todo_active_form_then_content() {
         let mut state = make_state();
+        // 同时设 current_op 验证 todo active_form 优先级最高
         state.current_op = Some("Read(crates/tui/src/render.rs)".to_string());
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
@@ -5546,30 +5570,63 @@ mod tool_result_fold_tests {
         }]);
 
         assert_eq!(thinking_status_label(&state), "正在检查交互焦点");
+
+        // 没有 active_form 时回退到 content
+        state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
+            id: "b".to_string(),
+            content: "检查 fallback".to_string(),
+            status: TodoStatus::InProgress,
+            priority: None,
+            active_form: None,
+        }]);
+        assert_eq!(thinking_status_label(&state), "检查 fallback");
+
+        // 非 InProgress 状态的 todo 不参与优先级
+        state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
+            id: "c".to_string(),
+            content: "已完成".to_string(),
+            status: TodoStatus::Completed,
+            priority: None,
+            active_form: Some("不应被选中".to_string()),
+        }]);
+        // InProgress 没了 → current_op 接管
+        assert_eq!(thinking_status_label(&state), "Reading file");
     }
 
     #[test]
-    fn thinking_status_label_changes_slowly_not_per_spinner_frame() {
-        let mut state = make_state();
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(900));
-        let first = thinking_status_label(&state);
-
-        state.spinner_frame = 8;
-        assert_eq!(thinking_status_label(&state), first);
-
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(5));
-        assert_ne!(thinking_status_label(&state), first);
+    fn thinking_status_label_maps_current_op_to_tool_label() {
+        let cases = [
+            ("Read(crates/tui/src/render.rs)", "Reading file"),
+            ("Grep(render.rs)", "Searching code"),
+            ("Glob(**/*.rs)", "Searching code"),
+            ("Bash(cargo test)", "Running command"),
+            ("Edit(src/lib.rs)", "Editing file"),
+            ("MultiEdit([..])", "Editing file"),
+            ("Write(src/lib.rs)", "Editing file"),
+            ("TodoWrite", "Updating todos"),
+            ("Agent(general-purpose)", "Delegating task"),
+            ("WebFetch(https://example.com)", "Browsing"),
+            ("WebSearch(query)", "Browsing"),
+            ("ExitPlanMode", "Preparing plan"),
+            ("UnknownTool", "Running UnknownTool"), // other 分支
+        ];
+        for (op, expected) in cases {
+            let mut state = make_state();
+            state.current_op = Some(op.to_string());
+            assert_eq!(thinking_status_label(&state), expected, "current_op={op}");
+        }
     }
 
     #[test]
-    fn thinking_status_suffix_animates_independently_from_label() {
+    fn thinking_status_label_falls_back_to_thinking() {
         let mut state = make_state();
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(100));
-        assert_eq!(thinking_status_suffix(&state), "");
+        // 无 todo / current_op / permission / plan / queue 时返回静态 "Thinking"
+        assert_eq!(thinking_status_label(&state), "Thinking");
 
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(700));
-        assert_eq!(thinking_status_label(&state), "大象装进冰箱");
-        assert_eq!(thinking_status_suffix(&state), ".");
+        // turn_start_time / spinner_frame 都不影响 label（label 与时间/动画无关）
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(60));
+        state.spinner_frame = 9;
+        assert_eq!(thinking_status_label(&state), "Thinking");
     }
 
     #[test]
@@ -5819,5 +5876,157 @@ mod tool_result_fold_tests {
         assert!(rendered.iter().any(|line| line.contains("u5")));
         assert!(rendered.iter().any(|line| line.contains("a5")));
         assert!(!rendered.iter().any(|line| line.trim() == "..."));
+    }
+
+    /// 回归测试：AI 思考期间用户继续在主输入框打字 / 移动光标时，硬件光标
+    /// 必须跟随用户实际操作，不能停在"上一条消息提交瞬间"的位置。
+    ///
+    /// 旧实现（修复前）的 `draw_input` 在 `state.is_thinking` 时直接 `return`，
+    /// 跳过了末尾的 `f.set_cursor_position(...)`，导致 crossterm 的硬件光标
+    /// 永远保留上一次成功调用时的位置——用户主观感觉"光标卡住 / 错位"。
+    ///
+    /// 这个测试用 ratatui 的 `TestBackend` 跑一帧 `is_thinking=true` 状态下的
+    /// `draw`，断言 `get_cursor_position()` 返回 `Some(...)`，任何未来重新
+    /// 在 `draw_input` 里加 `if is_thinking { return; }` 屏蔽光标的回归都会
+    /// 让这里失败（因为后续 `set_cursor_position` 永远不会被调用）。
+    #[test]
+    fn draw_input_keeps_cursor_visible_while_thinking() {
+        use ratatui::backend::{Backend, TestBackend};
+        use ratatui::Terminal;
+
+        // 120x10 给足横向空间，is_thinking 时输入框标题栏放"⠋ Thinking..."
+        // 指示器（spinner + label + animated dots），状态栏保持简洁——
+        // 只显示模型/进度/用量/cwd。高度 10 容下 chat/输入框/状态栏。
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = true;
+        let mut input = InputBox::new();
+        input.insert_text("abc 测试");
+        input.move_left(); // 光标停在 "abc 测|" 之后
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let cursor = terminal.backend_mut().get_cursor_position();
+        assert!(
+            cursor.is_ok(),
+            "is_thinking 时 draw_input 必须调用 set_cursor_position，\
+             bug 复发会让 crossterm cursor 永远停在旧位置或返回错误"
+        );
+    }
+
+    /// 输入框标题栏在 is_thinking=true 时必须显示 spinner + label + animated dots，
+    /// 不再画旧的"esc to interrupt"硬编码提示。
+    ///
+    /// 这个测试用例同时覆盖两件事:
+    ///   1. 标题栏文案以 "⠋ " 开头的 spinner 帧打头(SPINNER_FRAMES[0] 是 ⠋)
+    ///   2. 文案包含 label 的最小 fallback "Thinking" 或更具体文案（如 "Reading file"）
+    ///   3. 文案以 animated dots 结尾（每 550ms 一档 "."/".."/"..."）
+    ///
+    /// 任何未来误把 spinner 重新迁回状态栏、或把标题栏改回"esc to interrupt"的回归
+    /// 都会让这条断言失败，避免悄悄削弱用户对"AI 在思考"的核心视觉锚点。
+    #[test]
+    fn draw_input_title_shows_thinking_spinner_when_thinking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // 120x10 同上
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(3));
+        let input = InputBox::new();
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        // 把 ratatui buffer 里的整张图 dump 成字符串，找到输入框第一行(标题栏)
+        let buffer = terminal.backend().buffer().clone();
+        let mut rendered = Vec::new();
+        for y in 0..buffer.area.height {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            if !line.trim().is_empty() {
+                rendered.push(line);
+            }
+        }
+        let title_line = rendered
+            .iter()
+            .rev()
+            .find(|l| l.contains("Thinking") || l.contains("⠋"))
+            .expect("is_thinking 时标题栏必须出现 Thinking 文字 + ⠋ spinner");
+
+        // 标题栏必须以 spinner 帧(当前 SPINNER_FRAMES[0] = ⠋)开头
+        assert!(
+            title_line.contains('⠋'),
+            "is_thinking 时标题栏应包含 ⠋ spinner 帧，实际行: {title_line:?}"
+        );
+        // 必须包含 label 文字(默认 fallback 是 "Thinking",Todo/current_op 时会被覆盖)
+        assert!(
+            title_line.contains("Thinking") || title_line.contains("Reading"),
+            "is_thinking 时标题栏应包含 label 文字(Thinking 或具体 task), 实际行: {title_line:?}"
+        );
+        // 不应再包含旧的"esc to interrupt"提示文案(已迁到主输入框光标区注释)
+        assert!(
+            !title_line.contains("esc to interrupt"),
+            "标题栏不应再出现旧的 'esc to interrupt' 硬编码文案, 实际行: {title_line:?}"
+        );
+    }
+
+    /// 状态栏(is_thinking=false)必须不再出现 "ctrl+d or ctrl+c twice to exit" 文案,
+    /// 与右侧 "/help" 提示一并删除；这些信息已经在 /help 命令里有完整说明, 底部状态栏
+    /// 留给"模型 / 进度 / 用量 / cwd"等更重要的运行时信息。
+    #[test]
+    fn draw_status_hides_ctrl_d_exit_hint_by_default() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = false;
+        state.ctrl_c_pressed = false;
+        state.pending_queue.clear();
+        let input = InputBox::new();
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut merged = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                merged.push_str(buffer[(x, y)].symbol());
+            }
+        }
+
+        assert!(
+            !merged.contains("ctrl+d"),
+            "默认状态不应再渲染 'ctrl+d or ctrl+c twice to exit' 提示, 实际渲染包含 ctrl+d 字串"
+        );
+        assert!(
+            !merged.contains("ctrl+c twice"),
+            "默认状态不应再渲染 'ctrl+c twice to exit' 提示"
+        );
+        // /help 本身在内部 register 内是正常出现字串的, 这里只检查底部状态栏,
+        // 用 ratatui buffer 提取最后一行(状态栏高度=1)做严格断言
+        let last_line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
+            .collect();
+        assert!(
+            !last_line.contains("/help"),
+            "状态栏最末行不应再渲染 /help 入口提示, 实际: {last_line:?}"
+        );
     }
 }
