@@ -265,10 +265,14 @@ impl Theme {
     }
 
     /// 状态栏
+    ///
+    /// 不再显式设置背景：之前用 `Rgb(30, 30, 30)` 让状态栏在终端默认黑底上呈现
+    /// 一条深灰带，与上方聊天区、输入框标题栏在视觉上显得割裂（"输入框上面
+    /// 显示 Enter to send 那行" 也是黑底，凑在一起像两块不同的色块）。
+    /// 现在完全透传终端默认底色，文字仍用 `inactive` 灰色保持低调，
+    /// 整体与聊天区融为一体。
     pub fn status_bar() -> Style {
-        Style::default()
-            .bg(Self::status_bg_color())
-            .fg(Self::inactive_color())
+        Style::default().fg(Self::inactive_color())
     }
 
     /// 输入框文字

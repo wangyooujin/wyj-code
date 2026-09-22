@@ -6029,4 +6029,99 @@ mod tool_result_fold_tests {
             "状态栏最末行不应再渲染 /help 入口提示, 实际: {last_line:?}"
         );
     }
+
+    /// 状态栏不应再设置显式背景色（之前 `Theme::status_bar()` 用 `Rgb(30, 30, 30)`
+    /// 让最末行在终端默认黑底上呈现深灰带，与上方标题栏/聊天区割裂）。这里断言
+    /// 最后一行的所有非空 cell 都没有 `STATUS_BG` 这条深灰背景，防止后续误改回
+    /// `bg(Self::status_bg_color())` 又把这条黑条加回来。
+    #[test]
+    fn draw_status_does_not_set_explicit_background() {
+        use crate::theme::Theme;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = false;
+        state.ctrl_c_pressed = false;
+        state.pending_queue.clear();
+        let input = InputBox::new();
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let buffer = terminal.backend().buffer().clone();
+        let status_row = buffer.area.height - 1;
+        let expected_bg = Some(Theme::status_bg_color());
+
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, status_row)];
+            let symbol = cell.symbol();
+            if symbol.is_empty() || symbol.chars().all(|c| c == ' ') {
+                // 状态栏尾部 padding 可能没有渲染符号，跳过避免误报
+                continue;
+            }
+            assert_ne!(
+                cell.style().bg,
+                expected_bg,
+                "状态栏最末行的 cell ({x},{status_row}) 背景仍是 STATUS_BG={expected_bg:?}, \
+                 不应再显式设置背景；恢复透传终端默认底色更协调"
+            );
+        }
+    }
+
+    /// 标题栏(尤其 is_thinking 时的 `⠋ Thinking...` 动态指示)所有 cell 必须
+    /// 维持 `bg = Color::Reset`(即"无显式背景色")，最终视觉上透传终端默认底色。
+    /// 之前状态栏那条 `Rgb(30,30,30)` 黑带已经移除；这里把标题栏也一并钉死，
+    /// 防止后续误给 thinking 状态加 `bg(Color::Black)` 之类的样式，让标题栏
+    /// 又退化成"一块独立的黑条"。Status bar 那条测试已经覆盖了最末行；
+    /// 这里专门盯标题栏那行（`⠋ Thinking...` 落点）。
+    #[test]
+    fn draw_input_title_bar_keeps_no_explicit_background() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(3));
+        let input = InputBox::new();
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let buffer = terminal.backend().buffer().clone();
+        // 找到包含 '⠋' spinner 那一行（输入框标题栏）。
+        let title_row = (0..buffer.area.height)
+            .find(|&y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "⠋"))
+            .expect("is_thinking 时 buffer 里必须出现 ⠋ spinner 那一行");
+
+        let is_forbidden_black = |bg: Option<Color>| -> bool {
+            matches!(
+                bg,
+                Some(Color::Black) | Some(Color::Rgb(0, 0, 0)) | Some(Color::Rgb(30, 30, 30))
+            )
+        };
+
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, title_row)];
+            let symbol = cell.symbol();
+            if symbol.is_empty() || symbol.chars().all(|c| c == ' ') {
+                // padding cell 可以不渲染符号，跳过避免误报
+                continue;
+            }
+            assert!(
+                !is_forbidden_black(cell.style().bg),
+                "标题栏 cell ({x},{title_row}) sym={symbol:?} 不应带显式黑色背景 bg={:?}, \
+                 必须是 Color::Reset（透传终端默认底色）",
+                cell.style().bg
+            );
+        }
+    }
 }
