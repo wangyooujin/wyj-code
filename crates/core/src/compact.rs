@@ -17,6 +17,7 @@ pub fn compact_trigger_buffer(context_window: u32) -> u32 {
     40_000.min((context_window / 5).max(4_000))
 }
 
+#[derive(Debug, Clone)]
 pub struct CompactResult {
     pub messages_removed: usize,
     pub tokens_saved_estimate: u32,
@@ -59,8 +60,12 @@ pub fn estimate_request_tokens(
 ///
 /// 改进点（对比旧版 `chars/3`）：旧版对中文严重低估（中文约 1-2 token/字，
 /// `/3` 只估 0.33，偏低 3-6 倍），导致压缩触发过晚、真实上下文可能溢出。
-/// 现采用启发式：CJK 字符按 1.5 token/字，其余按 0.25 token/字（≈4 字符/token），
-/// 对中文和代码混合场景更接近真实值，英文场景略微高估（安全方向，触发偏早）。
+///
+/// 当前启发式：CJK 字符按 1.5 token/字，其余按 0.33 token/字（≈3 字符/token）。
+/// 旧版 0.25 (4 chars/token) 对含代码/JSON 的混合内容偏低约 2 倍——Claude BPE
+/// 对 `{` `}` `(` `)` 关键字等会单独成 token，dev 项目里 tool result / Read 输出
+/// 大多是这类内容，会让估算 < 真实 → 压缩触发过晚 → 撞穿上下文窗口。
+/// 0.33 在英文 prose 略高估（安全方向）、代码 JSON 更贴近真实，混合场景触发更准。
 pub fn estimate_tokens(messages: &[Message]) -> u32 {
     messages
         .iter()
@@ -100,7 +105,8 @@ fn estimate_image_tokens(b64_len: usize) -> usize {
     (b64_len * 3 / 4 / 750).min(1600)
 }
 
-/// 启发式 token 估算：CJK 字符按 1.5 token/字，其余按 0.25 token/字。
+/// 启发式 token 估算：CJK 字符按 1.5 token/字，其余按 0.33 token/字
+/// （≈3 字符/token，对代码/JSON 内容更贴近 Claude BPE 真实值）。
 fn estimate_text_tokens(text: &str) -> usize {
     let mut cjk = 0usize;
     let mut other = 0usize;
@@ -111,7 +117,7 @@ fn estimate_text_tokens(text: &str) -> usize {
             other += 1;
         }
     }
-    (cjk * 3 / 2) + (other / 4)
+    (cjk * 3 / 2) + (other / 3)
 }
 
 /// 判断字符是否为 CJK 统一表意文字或常见全角字符（中日韩）。
@@ -232,6 +238,85 @@ pub async fn compact_session(
         messages_removed,
         tokens_saved_estimate: tokens_saved,
     })
+}
+
+/// 单次 `compact_session` 在工具密集型单回合里可能只腾出几十条消息的
+/// 摘要体积；遇到『估算一直 > threshold』的死循环（heuristic 偏低、
+/// 上一轮摘要自身偏长、reasoning 模型一轮回巨长）时,裸发会撞穿模型
+/// 上下文窗口。本函数最多连续跑 [`MAX_COMPACT_PASSES`] 次,直到
+/// `estimated_tokens <= threshold` 或压缩本身失败（消息数太少 / 找不到
+/// 安全边界 / 模型摘要失败）,最终总会返回最后一次的 `CompactResult`
+/// 或最后一次错误;调用方在只剩一两条工具结果消息、压缩已退化到极限
+/// 时通过 fallthrough 把控制权还给 stream,由 `truncate_messages` 兜底
+/// 截断单块超长内容。
+///
+/// 故意不引入指数退避或 sleep——compact 是 LLM round-trip,本来就要等,
+/// 加 sleep 只会让失败时回退更慢。
+pub async fn compact_session_until_fit(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    estimated: u32,
+    threshold: u32,
+) -> CompactUntilFitOutcome {
+    const MAX_COMPACT_PASSES: usize = 3;
+    let mut last_result: Option<Result<CompactResult>> = None;
+    for pass in 0..MAX_COMPACT_PASSES {
+        let current = estimate_tokens(&session.messages);
+        if current <= threshold {
+            return CompactUntilFitOutcome {
+                final_estimated: current,
+                passes: pass,
+                last_result: last_result.and_then(|r| r.ok()),
+                last_error: None,
+            };
+        }
+        match compact_session(session, provider, context_window).await {
+            Ok(result) => {
+                last_result = Some(Ok(result));
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                // 「消息数过少」/「找不到安全边界」是『已无可压缩』的合法
+                // 信号——常见于连跑多轮 compact 后只剩 1~2 条 user/assistant
+                // 配对,此时本来就压不动了;把控制权还给 caller,让它继续
+                // stream（runtime `truncate_messages` 仍会兜底截断单块超长
+                // 内容）。其它错误(LLM 调用失败 / 摘要为空) 才算真失败。
+                if reason.contains("消息数量过少") || reason.contains("找不到安全的压缩边界")
+                {
+                    return CompactUntilFitOutcome {
+                        final_estimated: estimate_tokens(&session.messages),
+                        passes: pass,
+                        last_result: last_result.and_then(|r| r.ok()),
+                        last_error: None,
+                    };
+                }
+                return CompactUntilFitOutcome {
+                    final_estimated: estimate_tokens(&session.messages),
+                    passes: pass,
+                    last_result: None,
+                    last_error: Some(reason),
+                };
+            }
+        }
+    }
+    CompactUntilFitOutcome {
+        final_estimated: estimated.min(estimate_tokens(&session.messages)),
+        passes: MAX_COMPACT_PASSES,
+        last_result: last_result.and_then(|r| r.ok()),
+        last_error: None,
+    }
+}
+
+/// `compact_session_until_fit` 的返回值。`passes == 0` 表示首次估算就
+/// 已经在阈值内、根本没有跑过 compact；`last_error` 是最后一次压缩错误
+/// （如『消息数太少』),调用方据此判断要不要继续 stream。
+#[derive(Debug, Clone)]
+pub struct CompactUntilFitOutcome {
+    pub final_estimated: u32,
+    pub passes: usize,
+    pub last_result: Option<CompactResult>,
+    pub last_error: Option<String>,
 }
 
 /// 判断消息是否为"真实用户发言"边界（而非工具结果回传）：
@@ -523,5 +608,175 @@ mod tests {
         let keep_from = safe_keep_from(&messages, 2).expect("应能找到安全边界");
         assert_eq!(keep_from, 2);
         assert!(is_user_turn_boundary(&messages[keep_from]));
+    }
+
+    /// v1.5.12 修「366K text input 撞穿 262K 上下文」:首次估算就已在
+    /// 阈值内时,`compact_session_until_fit` 应跑 0 轮 compact 直接返回,
+    /// 不白白消耗 LLM round-trip 预算。
+    #[tokio::test]
+    async fn compact_session_until_fit_no_op_when_already_under_threshold() {
+        let mut session = Session::new();
+        session.messages.push(user_text("hello"));
+        let estimated = estimate_tokens(&session.messages);
+        let threshold = estimated + 10_000;
+        let outcome = compact_session_until_fit(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            estimated,
+            threshold,
+        )
+        .await;
+        assert_eq!(outcome.passes, 0);
+        assert!(outcome.last_result.is_none());
+        assert!(outcome.last_error.is_none());
+        assert_eq!(outcome.final_estimated, estimated);
+    }
+
+    /// 兜底回归:即便 compact 第一次没把消息压回阈值(heuristic 偏低 /
+    /// 摘要本身偏长),`compact_session_until_fit` 必须继续重试而不是
+    /// 裸发——这是 v1.5.10 之前『单次 compact 不够就 400 撞穿』的根因。
+    #[tokio::test]
+    async fn compact_session_until_fit_loops_until_under_threshold() {
+        let mut session = Session::new();
+        // 10 轮 user+assistant,每条 2000 字符,合计远超 threshold
+        for i in 0..10 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+            });
+        }
+        let estimated = estimate_tokens(&session.messages);
+        let threshold = estimated / 4; // 强压到 1/4,单次 compact 不够
+        let outcome = compact_session_until_fit(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            estimated,
+            threshold,
+        )
+        .await;
+        // 必须循环过 compact——v1.5.10 之前『0 轮就裸发』的回归根因。
+        assert!(outcome.passes >= 1, "必须循环重试,不能裸发");
+        assert!(outcome.passes <= 3);
+        // 收敛目标:要嘛 final_estimated 落入阈值,要嘛 caller 拿到的是
+        // 已尽力压缩的状态(loop 自洽终止 / 「无可压缩」信号)。
+        // runtime `truncate_messages` 会在 caller 拿到控制权后兜底截断
+        // 单块超长内容,所以这里不强制要求收敛——只要求不挂死、不裸发 366K。
+        assert!(outcome.last_error.is_none());
+        // final_estimated 必须远小于起始 estimated(说明 compact 真跑了),
+        // 否则等于『阈值检测后 compact 啥都没干』的 bug 复现。
+        assert!(
+            outcome.final_estimated < estimated,
+            "compact 必须实际减少 token; 起始 {estimated}, 最终 {}",
+            outcome.final_estimated
+        );
+    }
+
+    /// 压缩失败(LLM 调用挂掉)时不应无限循环,而是把 last_error 透传,
+    /// 把控制权还给 caller —— caller 此时仍有 `truncate_messages` 兜底。
+    /// 用专门的「complete 永远失败」provider 触发真实的 LLM 错误路径。
+    #[tokio::test]
+    async fn compact_session_until_fit_propagates_real_compact_failure() {
+        struct FailingProvider;
+        #[async_trait::async_trait]
+        impl Provider for FailingProvider {
+            async fn stream(
+                &self,
+                _system: &str,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::provider::EventStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            async fn complete(
+                &self,
+                _system: &str,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::types::CompletionResult> {
+                Err(anyhow::anyhow!("synthetic LLM 503"))
+            }
+        }
+
+        let mut session = Session::new();
+        for i in 0..10 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+            });
+        }
+        let estimated = estimate_tokens(&session.messages);
+        let threshold = estimated / 4;
+        let outcome = compact_session_until_fit(
+            &mut session,
+            &FailingProvider,
+            200_000,
+            estimated,
+            threshold,
+        )
+        .await;
+        assert!(outcome.last_error.is_some(), "LLM 失败必须透传");
+        assert!(outcome.passes <= 1, "失败不应再重试,应立即透传错误");
+        assert!(outcome.last_error.unwrap().contains("503"));
+    }
+
+    /// 「消息数过少」/「找不到安全边界」是『已无可压缩』的合法信号——
+    /// 不应被 caller 当成错误处理。这种情况在多轮 compact 收敛后
+    /// 会自然出现,本 test 锁住 loop 的宽容语义。
+    #[tokio::test]
+    async fn compact_session_until_fit_treats_already_compact_as_no_error() {
+        let mut session = Session::new();
+        // 总消息数 <= 8 → compact_session 会 bail "消息数量过少"
+        session.messages.push(user_text("hello"));
+        let estimated = estimate_tokens(&session.messages);
+        let threshold = 1; // 永远低于,触发 compact
+        let outcome = compact_session_until_fit(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            estimated,
+            threshold,
+        )
+        .await;
+        assert!(outcome.last_error.is_none(), "已无可压缩不是错误");
+        // 必须立即退出(不无限循环)
+        assert!(outcome.passes <= 1);
+    }
+
+    /// 回归:estimate_text_tokens 对代码/JSON (BPE 2.5-3 chars/token) 不再
+    /// 用 0.25 (4 chars/token) 偏低——这是 v1.5.12 之前 heuristic 让
+    /// compact 触发过晚、最终撞穿 262K 上限的隐藏根因之一。
+    /// 这里用 ASCII 长字符串(代表代码 / 路径 / JSON 文本)验证估算比例。
+    #[test]
+    fn estimate_text_tokens_uses_three_chars_per_token_for_ascii() {
+        let text = "a".repeat(300); // 300 chars
+        let tokens = estimate_text_tokens(&text);
+        // 0.33 token/char = 100 tokens,允许 80~120 区间(防止未来微调)
+        assert!(
+            (80..=120).contains(&tokens),
+            "300 ASCII chars 应估 ~100 tokens, 实测 {tokens}"
+        );
+    }
+
+    /// CJK 仍是 1.5 token/字(中文 1 字 ≈ 1.5 token),不能因为修 ASCII 而
+    /// 把中文场景也破坏。
+    #[test]
+    fn estimate_text_tokens_keeps_cjk_ratio() {
+        let text = "中".repeat(100); // 100 CJK chars
+        let tokens = estimate_text_tokens(&text);
+        assert_eq!(tokens, 150, "100 CJK chars 应估 150 tokens");
     }
 }

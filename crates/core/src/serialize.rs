@@ -1,8 +1,10 @@
 //! 持久化前的 `ContentBlock` 字节截断与脱敏工具。
 //!
 //! 目标:在不破坏 `SessionFile` / `Checkpoint` struct 与 branch/rewind/resume
-//! 协议的前提下,**仅减小磁盘序列化字节**;内存中完整 messages 仍可用于下
-//! 一次 LLM 请求,只在下一次 `save()` / `create()` 时再截断。
+//! 协议的前提下,**同时约束磁盘序列化字节与运行时 LLM 请求体积**——
+//! `truncate_messages` 是三条路径(磁盘 save、内存 runtime、resume load)
+//! 共用的入口,避免长 `ContentBlock::Text` / `ToolResult` / `Thinking` 在
+//! 任何路径上无界累积、撞穿模型上下文窗口。
 //!
 //! 截断策略:`wyj_config::PersistCapCfg` 任意字段 = 0 即关闭对应截断,
 //! 保持旧行为(向后兼容)。
@@ -53,29 +55,43 @@ fn truncate_head_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
 /// **再**调本函数截断 messages。这样 title/preview 仍是完整内容,
 /// resume/branch 协议稳定。
 pub fn truncate_session_for_persistence(file: &mut SessionFile, cfg: &PersistCapCfg) {
-    if cfg.tool_result_head_bytes == 0
-        && cfg.tool_result_tail_bytes == 0
-        && cfg.thinking_bytes == 0
-        && cfg.reasoning_details_bytes == 0
-        && cfg.tool_use_input_bytes == 0
-    {
+    truncate_messages(&mut file.messages, cfg);
+}
+
+/// 对任意 `Vec<Message>` / slice 复用同一截断实现。运行时 API 发送路径
+/// (`Agent::run_turn_with_injection_inner`) 与 `SessionStore::load` 都通过
+/// 本入口走同一条截断链,与 `truncate_session_for_persistence` 行为完全
+/// 一致——保证 disk / runtime / resume 三条路径共用同一上限。
+pub fn truncate_messages(messages: &mut [Message], cfg: &PersistCapCfg) {
+    if !is_persist_cap_active(cfg) {
         return;
     }
-    for msg in &mut file.messages {
-        truncate_message(msg, cfg);
+    for msg in messages {
+        for block in &mut msg.content {
+            truncate_content_block(block, cfg);
+        }
     }
 }
 
-fn truncate_message(msg: &mut Message, cfg: &PersistCapCfg) {
-    for block in &mut msg.content {
-        truncate_content_block(block, cfg);
-    }
+fn is_persist_cap_active(cfg: &PersistCapCfg) -> bool {
+    cfg.tool_result_head_bytes != 0
+        || cfg.tool_result_tail_bytes != 0
+        || cfg.thinking_bytes != 0
+        || cfg.reasoning_details_bytes != 0
+        || cfg.tool_use_input_bytes != 0
+        || cfg.text_head_bytes != 0
+        || cfg.text_tail_bytes != 0
 }
 
 pub fn truncate_content_block(block: &mut ApiContentBlock, cfg: &PersistCapCfg) {
     match block {
         ApiContentBlock::ToolResult { content, .. } => {
             truncate_tool_result(content, cfg);
+        }
+        ApiContentBlock::Text { text } => {
+            if cfg.text_head_bytes > 0 || cfg.text_tail_bytes > 0 {
+                *text = truncate_head_tail(text, cfg.text_head_bytes, cfg.text_tail_bytes);
+            }
         }
         ApiContentBlock::Thinking {
             thinking,
@@ -116,9 +132,7 @@ pub fn truncate_content_block(block: &mut ApiContentBlock, cfg: &PersistCapCfg) 
                 }
             }
         }
-        ApiContentBlock::Text { .. }
-        | ApiContentBlock::Image { .. }
-        | ApiContentBlock::RedactedThinking { .. } => {}
+        ApiContentBlock::Image { .. } | ApiContentBlock::RedactedThinking { .. } => {}
     }
 }
 
@@ -337,6 +351,112 @@ mod tests {
         assert!(out.starts_with("AAAA"));
         assert!(out.ends_with(&"Z".repeat(40)));
         assert!(out.contains("[truncated"));
+    }
+
+    /// 回归 v1.5.12 修的「366K text input 撞穿 262K 上下文窗口」bug。
+    /// 长 assistant 总结、用户粘贴日志在 `ContentBlock::Text` 里无界累积
+    /// 是直接根因——这条 test 锁住 `truncate_content_block` 对 Text 块做
+    /// head+tail 截断的行为,确保未来不会因为重构把 Text 重新漏出。
+    #[test]
+    fn truncate_text_block_applies_head_and_tail() {
+        let mut block = ApiContentBlock::Text {
+            text: "A".repeat(20_000) + &"Z".repeat(20_000),
+        };
+        let cfg = PersistCapCfg {
+            tool_result_head_bytes: 0,
+            tool_result_tail_bytes: 0,
+            thinking_bytes: 0,
+            reasoning_details_bytes: 0,
+            tool_use_input_bytes: 0,
+            text_head_bytes: 100,
+            text_tail_bytes: 50,
+        };
+        truncate_content_block(&mut block, &cfg);
+        match block {
+            ApiContentBlock::Text { text } => {
+                assert!(text.starts_with(&"A".repeat(100)));
+                assert!(text.ends_with(&"Z".repeat(50)));
+                assert!(text.contains("[truncated"));
+                assert!(text.len() < 40_000, "Text 块必须被实际截断");
+            }
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    /// opt-out 行为:任一字段 = 0 即关闭对应截断(向后兼容)。
+    /// 用户把 `text_head_bytes = 0` 时,长 Text 块必须原样保留——与
+    /// v1.5.10 之前的行为完全一致,不破坏老用户的运行预期。
+    #[test]
+    fn truncate_text_block_skipped_when_caps_are_zero() {
+        let original = "x".repeat(50_000);
+        let mut block = ApiContentBlock::Text {
+            text: original.clone(),
+        };
+        let cfg = PersistCapCfg {
+            tool_result_head_bytes: 0,
+            tool_result_tail_bytes: 0,
+            thinking_bytes: 0,
+            reasoning_details_bytes: 0,
+            tool_use_input_bytes: 0,
+            text_head_bytes: 0,
+            text_tail_bytes: 0,
+        };
+        truncate_content_block(&mut block, &cfg);
+        match block {
+            ApiContentBlock::Text { text } => assert_eq!(text.len(), original.len()),
+            _ => panic!("expected Text block"),
+        }
+    }
+
+    /// `truncate_messages` (新增的 slice 入口) 与
+    /// `truncate_session_for_persistence` 必须行为完全一致——disk /
+    /// runtime / resume 三条路径共用同一上限的安全契约。
+    #[test]
+    fn truncate_messages_matches_session_path() {
+        let mut session_file = SessionFile {
+            session_id: "test".to_string(),
+            title: "测试".to_string(),
+            last_preview: "preview".to_string(),
+            cwd: "/tmp".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            messages: vec![Message {
+                role: wyj_api::types::Role::User,
+                content: vec![ApiContentBlock::Text {
+                    text: "Y".repeat(30_000),
+                }],
+            }],
+            routing_events: vec![],
+            current_checkpoint_id: None,
+            branch_parent_session_id: None,
+            branch_parent_checkpoint_id: None,
+            title_generated: false,
+        };
+        let mut messages = session_file.messages.clone();
+        let cfg = PersistCapCfg {
+            tool_result_head_bytes: 0,
+            tool_result_tail_bytes: 0,
+            thinking_bytes: 0,
+            reasoning_details_bytes: 0,
+            tool_use_input_bytes: 0,
+            text_head_bytes: 64,
+            text_tail_bytes: 32,
+        };
+        truncate_session_for_persistence(&mut session_file, &cfg);
+        truncate_messages(&mut messages, &cfg);
+        // 两条路径必须产出等价长度(head+tail+truncated marker 拼接)
+        let from_file = match &session_file.messages[0].content[0] {
+            ApiContentBlock::Text { text } => text.len(),
+            _ => panic!(),
+        };
+        let from_slice = match &messages[0].content[0] {
+            ApiContentBlock::Text { text } => text.len(),
+            _ => panic!(),
+        };
+        assert_eq!(from_file, from_slice);
+        assert!(from_file < 30_000);
     }
 
     #[test]
