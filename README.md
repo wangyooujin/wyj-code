@@ -1,7 +1,7 @@
 # wyj-code
 
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Release](https://img.shields.io/badge/release-v1.5.12-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.12)
+[![Release](https://img.shields.io/badge/release-v1.5.13-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.13)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
 [![Pages](https://img.shields.io/badge/Pages-在线主页-22c55e.svg)](https://wangyooujin.github.io/wyj-code/)
@@ -22,7 +22,7 @@ Qwen/百炼、豆包/火山以及其他协议兼容端点。
 [国产模型适配体验对比报告](./doc/analysis/domestic-models-vs-claude-code.md) — DeepSeek / GLM / Kimi / Qwen / 豆包 / MiniMax 与 Claude Code / Codex 的能力对照、踩坑与最佳实践。
 
 > **版本状态**：最新公开版本是
-> [v1.5.12](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.12)。历史 tag 保持不可移动，
+> [v1.5.13](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.13)。历史 tag 保持不可移动，
 > 一键安装脚本始终下载 GitHub 最新公开 Release。
 
 ## 项目介绍
@@ -78,6 +78,28 @@ wyj-code 希望把 AI coding 的核心能力放进一个可审计、可扩展、
   `[plan/bypass] Enter to send` / `Enter to send`；状态栏默认右侧不再放
   `ctrl+d or ctrl+c twice to exit  /help`；删除 `draw_input` 在 `is_thinking=true`
   时提前 `return` 跳过 `set_cursor_position` 导致光标卡死的回归。
+- **TypeSafe Jev 决策 API 接入（v1.5.13）**：新增 `crates/tools/src/jev.rs`
+  的 `JevTool`（POST `https://api.typesafe.ai/v1/systemone`，三种 primitive：
+  choice / score / noul，每个 answer 自带 `confidence` + `probabilities`），
+  与 `JevBudget` 进程级日预算计数器（micro-cent 精度，输入 $0.042/M、
+  输出免费）。`Config.tools.jev` 子块 + `Config::resolve_jev_api_key()` env
+  / 字段合并（沿用 `runtime_api_key` 的 serde skip 语义，绝不把 env 值物化
+  进 config.toml）。客户端三层硬封顶：`max_state_chars`（按 char boundary
+  安全截断，治本 `String::truncate` 在 CJK/emoji 多字节字符中间 panic 的同类
+  风险）/ `max_questions` / `daily_budget_usd`（`0` 关闭）。`cli::register_jev_tool_if_enabled`
+  仿 `register_computer_tool_if_enabled` 的门控模式（仅 enabled + API Key
+  可解析时注册），同时驱动 `core::prompts::JEV_HINT` 仅在已注册时拼到
+  system prompt，避免未注册时还教模型用。`/decision [ping|ask <问题>]` slash
+  命令（i18n key 前缀 `decision.*`，zh/en.yml `/help.body` 已同步注册）做
+  连通性诊断 + 快速问答。Jev 与 chat 模型完全不同——无 stream / 无 multi-turn
+  / 无 tool calling 协议——**不**新增 `WireProtocol` 变体、**不**改
+  `Provider` trait，避免污染 routing/capability_cache 分桶。子 Agent 工厂
+  `make_sub_agent_factory` 不注册（与 Computer/SubAgent/AskQuestion/ExitPlanMode/
+  TodoWrite 同款白名单策略）。13 项 jev 单元测试覆盖 client-side validation、
+  happy path、三 primitive 端到端、HTTP 错误归一（401/422/429/529）、429
+  重试、state 截断、budget 硬封顶；7 项 config 测试覆盖 jev 默认值 / partial
+  段解析 / base URL trim / api key 解析；workspace 全量回归 + clippy
+  `-D warnings` 全绿。
 
 国内模型在没有独立 live probe 证据时只标记为 `static_only` 或 protocol-compatible；
 协议兼容不等于每个模型、端点和工具组合都已经在线验证。可通过 `wyj-code model doctor`
