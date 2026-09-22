@@ -121,7 +121,17 @@ impl SessionStore {
 
     pub fn load(&self, session_id: &str) -> Result<SessionFile> {
         let content = std::fs::read_to_string(self.path(session_id))?;
-        Ok(serde_json::from_str(&content)?)
+        let mut file: SessionFile = serde_json::from_str(&content)?;
+        // Resume 路径也走 persist_cap:v1.5.10 之前落盘的 session 没有
+        // text/tool_result/thinking 等任何上限;若不在 load 后重 cap,resume
+        // 出来的 in-memory messages 会把运行时单次 LLM 请求撑爆。
+        // 与 save() 同源(`truncate_session_for_persistence` 内部委托
+        // `truncate_messages`),保证 disk / runtime / resume 三条路径共用
+        // 同一上限。
+        if let Some(cfg) = current_persist_cap() {
+            crate::serialize::truncate_session_for_persistence(&mut file, &cfg);
+        }
+        Ok(file)
     }
 
     /// 列出所有会话，按时间戳倒序排列（最新在前）

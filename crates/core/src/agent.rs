@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_session, compact_trigger_buffer, estimate_request_tokens};
+use crate::compact::{compact_session_until_fit, compact_trigger_buffer, estimate_request_tokens};
 use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
@@ -236,6 +236,13 @@ pub struct Agent {
     /// `ModelCatalog::resolve_with_cache` 会让 capabilities.thinking=Unsupported。
     /// 子 Agent 不设置，避免嵌套路径写文件。
     capability_cache: Option<Arc<wyj_api::CapabilityCache>>,
+    /// 运行时 `ContentBlock` 字节截断配置(由 CLI/TUI 装配时注入),作用:
+    /// 在 `run_turn_with_injection_inner` 调用 `provider.stream()` 之前对
+    /// `session.messages` 做与磁盘 save 路径等价的截断,避免长
+    /// `ContentBlock::Text` / `ToolResult` / `Thinking` 撞穿模型上下文窗口。
+    /// `None` 表示关闭 runtime 截断(磁盘路径仍由 `SessionStore::save` 自身的
+    /// `current_persist_cap()` 全局兜底)。
+    persist_cap: Option<wyj_config::PersistCapCfg>,
 }
 
 struct EvolutionEpisodeGuard {
@@ -294,6 +301,7 @@ impl Agent {
             checkpoint_store: None,
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             capability_cache: None,
+            persist_cap: None,
         }
     }
 
@@ -302,6 +310,17 @@ impl Agent {
     /// `ModelCatalog::resolve_with_cache` 强制 capabilities.thinking=Unsupported。
     pub fn with_capability_cache(mut self, cache: Option<Arc<wyj_api::CapabilityCache>>) -> Self {
         self.capability_cache = cache;
+        self
+    }
+
+    /// 配置运行时 `ContentBlock` 字节截断上限（与 `SessionStore::save` /
+    /// `SessionStore::load` 共用同一份 `PersistCapCfg`）。None 关闭 runtime
+    /// 截断；非 None 时 `run_turn_with_injection_inner` 在每次
+    /// `provider.stream()` 之前对 `session.messages` 调
+    /// `serialize::truncate_messages`,防止长 user/assistant 纯文本块撞穿
+    /// 模型上下文窗口。
+    pub fn with_persist_cap(mut self, cap: Option<wyj_config::PersistCapCfg>) -> Self {
+        self.persist_cap = cap;
         self
     }
 
@@ -976,15 +995,48 @@ impl Agent {
                     .context_window
                     .saturating_sub(compact_trigger_buffer(route.context_window));
                 if estimated > compact_threshold {
-                    match compact_session(session, route.provider.as_ref(), route.context_window)
-                        .await
-                    {
-                        Ok(result) => on_text(&format!(
-                            "\n[已压缩对话历史：移除 {} 条消息，节省约 {} tokens]\n",
-                            result.messages_removed, result.tokens_saved_estimate
-                        )),
-                        Err(error) => tracing::warn!("上下文压缩失败: {error}"),
+                    // 循环压缩：单次 compact 不一定够（heuristic 偏低 /
+                    // reasoning 模型一轮回巨长 / 上次摘要本身偏长）；
+                    // `compact_session_until_fit` 最多跑 3 次直到估算
+                    // 落入阈值或 compact 自身失败,把硬上限（撞穿模型
+                    // 上下文窗口）的风险从『靠运气不撞』降到『最多 3 轮
+                    // LLM round-trip 收敛』。
+                    let outcome = compact_session_until_fit(
+                        session,
+                        route.provider.as_ref(),
+                        route.context_window,
+                        estimated,
+                        compact_threshold,
+                    )
+                    .await;
+                    if let Some(error) = outcome.last_error {
+                        tracing::warn!("上下文压缩失败: {error}");
+                    } else if outcome.passes > 0 {
+                        if let Some(result) = outcome.last_result {
+                            on_text(&format!(
+                                "\n[已压缩对话历史：移除 {} 条消息，节省约 {} tokens]\n",
+                                result.messages_removed, result.tokens_saved_estimate
+                            ));
+                        }
+                        if outcome.passes > 1 {
+                            tracing::warn!(
+                                "上下文压缩连续跑了 {} 轮,最终估算 {} tokens (阈值 {}); \
+                                 历史里可能含超大不可压缩块,见 persist_cap.text_*",
+                                outcome.passes,
+                                outcome.final_estimated,
+                                compact_threshold
+                            );
+                        }
                     }
+                }
+
+                // Runtime 截断兜底:即便 compact 已经跑过,单条 assistant/user
+                // 纯文本块（长总结、粘贴日志）也可能单独超过单请求窗口。
+                // persist_cap 的 text_* 字段对每块独立做 head+tail 截断,
+                // 与 save()/load() 共用同一上限,确保本轮 stream 不会撞穿
+                // 262K / 200K 之类 endpoint 硬上限。
+                if let Some(cfg) = self.persist_cap.as_ref() {
+                    crate::serialize::truncate_messages(&mut session.messages, cfg);
                 }
 
                 const MAX_STREAM_RETRIES: u32 = 2;
@@ -1839,6 +1891,7 @@ impl Agent {
         &self,
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
+        use crate::compact::compact_session;
         let route = self.route_at(self.active_route_index());
         compact_session(session, route.provider.as_ref(), route.context_window).await
     }
