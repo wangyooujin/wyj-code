@@ -2,6 +2,11 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.13] - 2026-09-22
+
+- **TypeSafe Jev 决策 API 接入**：`crates/tools/src/jev.rs` 新增 `JevTool`（POST `https://api.typesafe.ai/v1/systemone`，三种 primitive：choice / score / noul），与 `JevBudget` 进程级日预算计数器（micro-cent 精度，输入 $0.042/M、输出免费）。`Config.tools.jev` 子块 + `Config::resolve_jev_api_key()` env/字段合并（与 `runtime_api_key` 同款"serde skip"语义，绝不把 env 值物化进 config.toml）。客户端三层硬封顶：`max_state_chars`（按 char boundary 安全截断，治本 `String::truncate` 在 CJK/emoji 多字节字符中间 panic 的同类风险）/ `max_questions` / `daily_budget_usd`（`0` 关闭）。`cli::register_jev_tool_if_enabled` 仿 `register_computer_tool_if_enabled` 的门控模式（仅 enabled + API Key 可解析时注册），同时驱动 `core::prompts::JEV_HINT` 仅在已注册时拼到 system prompt，避免未注册时还教模型用。`/decision [ping|ask <问题>]` slash 命令（i18n key 前缀 `decision.*`，已在 zh/en.yml `/help.body` 同步注册）做连通性诊断 + 快速问答；命令不通过 ToolRegistry 转发、直接走 reqwest，避免 Tool 路径上重复 HTTP 逻辑。Jev 与 chat 模型完全不同——无 stream / 无 multi-turn / 无 tool calling 协议——**不**新增 `WireProtocol` 变体，**不**改 `Provider` trait，避免污染 routing/capability_cache 分桶。子 Agent 工厂 `make_sub_agent_factory` 不注册（与 Computer/SubAgent/AskQuestion/ExitPlanMode/TodoWrite 同款白名单策略）。
+- 13 项 jev 单元测试覆盖 client-side validation / happy path / 三 primitive 端到端 / HTTP 错误归一（401/422/429/529）/ 429 重试 / state 截断 / budget 硬封顶；7 项 config 测试覆盖 jev 默认值 / partial 段解析 / base URL trim / api key 解析 / TOML 反向兼容；workspace 全量回归 + clippy -D warnings 全绿。
+
 ## [1.5.12] - 2026-09-08
 
 - **TUI 终端 panic 兜底还原**：新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`，`cli::main()` 入口最前 `wyj_tui::panic_guard::install()`（`take_hook` 链式保留前一个 hook），`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()` / `mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时若 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。告别"TUI 进程 panic 后终端卡死在 raw mode + alternate screen 残留 frame + panic 写 stderr 覆盖 ratatui cell 造成画面撕裂"的复合失败模式。

@@ -1029,6 +1029,92 @@ impl Command for ComputerCmd {
     }
 }
 
+// ── /decision ─────────────────────────────────────────────────────────────────
+
+/// `/decision [ping | ask <text>]` —— TypeSafe Jev 决策 API 入口。
+///
+/// - `/decision` (无参): 打印帮助 + 当前 `[tools.jev]` 注册状态。
+/// - `/decision ping`: 发最小 noul question 验证 API Key + 网络。
+/// - `/decision ask <text>`: 把 `<text>` 包装成单个 noul question，
+///   state="" + 仅 model 走默认 `jev-latest`，快速拿 yes/no 概率。
+///
+/// HTTP 路径与 `JevTool` 复用同一份（`wyj_tools::jev::dispatch_noul`），
+/// 不在 commands 层重新引入 reqwest。
+pub struct DecisionCmd;
+
+async fn jev_dispatch(
+    state: &str,
+    instructions: &str,
+    cfg: &wyj_config::Config,
+) -> Result<CommandResult> {
+    use wyj_tools::DispatchOutcome;
+    match wyj_tools::dispatch_noul(state, instructions, cfg).await {
+        DispatchOutcome::NoKey => Ok(CommandResult::Output(tr("decision.no_key"))),
+        DispatchOutcome::Network(err) => Ok(CommandResult::Output(tr_fmt(
+            "decision.network_error",
+            &[("err", &err)],
+        ))),
+        DispatchOutcome::Http { status, body } => Ok(CommandResult::Output(tr_fmt(
+            "decision.http_error",
+            &[("status", &status.to_string()), ("body", body.trim())],
+        ))),
+        DispatchOutcome::Parse(err) => Ok(CommandResult::Output(tr_fmt(
+            "decision.parse_error",
+            &[("err", &err)],
+        ))),
+        DispatchOutcome::Success { noul, pretty } => {
+            // 优先展示 `answers.answer.noul`（ping 路径），其它情况回退到原始 JSON。
+            if let Some(n) = noul {
+                Ok(CommandResult::Output(tr_fmt(
+                    "decision.ping_success",
+                    &[("noul", &format!("{n:.3}"))],
+                )))
+            } else {
+                Ok(CommandResult::Output(pretty))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Command for DecisionCmd {
+    fn name(&self) -> &str {
+        "decision"
+    }
+    fn description(&self) -> String {
+        tr("decision.desc")
+    }
+    fn usage(&self) -> String {
+        tr("decision.usage")
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let cfg = wyj_config::Config::load()?;
+        let mut rest = args.trim();
+        let sub = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !sub.is_empty() {
+            // 消耗掉子命令词
+            rest = rest[sub.len()..].trim_start();
+        }
+
+        match sub.as_str() {
+            "" => Ok(CommandResult::Output(tr("decision.help"))),
+            "ping" => jev_dispatch("", "is the connection alive", &cfg).await,
+            "ask" => {
+                let question = rest;
+                if question.is_empty() {
+                    return Ok(CommandResult::Output(tr("decision.help")));
+                }
+                jev_dispatch("", question, &cfg).await
+            }
+            _ => Ok(CommandResult::Output(tr("decision.help"))),
+        }
+    }
+}
+
 // ── /model ────────────────────────────────────────────────────────────────────
 
 pub struct ModelCmd;
@@ -1557,6 +1643,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
+    reg.register(Arc::new(DecisionCmd));
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
@@ -1610,6 +1697,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
+    reg.register(Arc::new(DecisionCmd));
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));

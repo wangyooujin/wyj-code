@@ -1309,6 +1309,9 @@ async fn main() -> Result<()> {
     // 截图作为 image block 塞进 tool_result），见该函数文档。
     register_window_capture_tool_if_enabled(&mut registry, &cfg);
     register_app_computer_tool_if_enabled(&mut registry, &cfg);
+    // Jev 决策 API（typesafe.ai System One）：门控 = enabled + API Key 可解析。
+    // 返回值决定下面是否追加 JEV_HINT（教模型在多路决策场景主动调用）。
+    let jev_enabled = register_jev_tool_if_enabled(&mut registry, &cfg);
 
     // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
     // + 已启用插件贡献的 agent 定义 + --plugin-dir 临时加载的 agent 定义
@@ -1486,6 +1489,15 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str(extra);
     }
 
+    // Jev 已注册：教模型在多路决策/分类/guardrails 场景主动调用，拿到结构化
+    // answers + confidence 而不是凭直觉猜。
+    if jev_enabled {
+        let extra = wyj_core::prompts::JEV_HINT;
+        agent = agent.append_system(extra);
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(extra);
+    }
+
     // Active plugin output style is a model-facing instruction, independent of UI locale. Keep
     // it out of `system_prompt_extra`: rebuild_fn installs it directly so scoped/headless model
     // switches receive the same style without the TUI appending it twice.
@@ -1525,6 +1537,11 @@ async fn main() -> Result<()> {
     }
     agent =
         agent.with_capability_cache(Some(Arc::new(wyj_api::CapabilityCache::new(&config_base))));
+    // runtime ContentBlock 截断兜底：把 `cfg.persist_cap` 注入 Agent，
+    // 在每次 `provider.stream()` 之前按同一上限（与 `SessionStore::save`
+    // / `SessionStore::load` 共用）对 `session.messages` 做截断，防止长
+    // `ContentBlock::Text` / `ToolResult` 撞穿模型上下文窗口。
+    agent = agent.with_persist_cap(Some(cfg.persist_cap.clone()));
 
     for def in registry.definitions() {
         let name = def.name.clone();
@@ -1735,6 +1752,10 @@ async fn main() -> Result<()> {
         if let Some(store) = &checkpoint_store_for_rebuild {
             new_agent = new_agent.with_checkpoint_store(store.clone());
         }
+        // runtime ContentBlock 截断兜底：`/model` 重建 agent 时同样把
+        // `cfg.persist_cap` 注入,确保切换 Profile 后仍按同一上限守住
+        // 单次 stream 不会撞穿模型上下文窗口。
+        new_agent = new_agent.with_persist_cap(Some(cfg.persist_cap.clone()));
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
@@ -2092,6 +2113,54 @@ fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) -> bool {
     false
+}
+
+/// Jev 决策 API（typesafe.ai System One）的注册门控。
+///
+/// 注册条件：`Config.tools.jev.enabled=true` 且 `Config::resolve_jev_api_key()`
+/// 返回 Some。API Key 优先 `TYPESAFE_API_KEY` env，回退到 `[tools.jev].api_key`
+/// 字段；都为空时仅打印一次性 info 提示后跳过注册（不报错——避免无 key
+/// 用户被噪声干扰）。
+///
+/// 返回 `true` 表示已注册；调用方据此决定是否在 system prompt 末尾追加
+/// `wyj_core::prompts::JEV_HINT`，与 `register_computer_tool_if_enabled` 同款
+/// 模式。Budget 计数器随 Tool 一起走 process-wide（不持久化），与 plan 中
+/// "日 = 进程生命周期累计"语义一致。
+fn register_jev_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
+    if !cfg.tools.jev.enabled {
+        return false;
+    }
+    let api_key = match cfg.resolve_jev_api_key() {
+        Some(k) => k,
+        None => {
+            tracing::info!(
+                "[tools.jev] enabled=true 但未找到 API Key（设置 TYPESAFE_API_KEY 或 [tools.jev].api_key），跳过注册"
+            );
+            return false;
+        }
+    };
+    let base_url = cfg.resolve_jev_base_url();
+    let model = cfg.tools.jev.model.clone();
+    let max_questions = cfg.tools.jev.max_questions;
+    let max_state_chars = cfg.tools.jev.max_state_chars;
+    let max_retries = cfg.tools.jev.max_retries;
+    let budget = Arc::new(wyj_tools::JevBudget::new(cfg.tools.jev.daily_budget_usd));
+    registry.register_arc(Arc::new(wyj_tools::JevTool::new(
+        api_key,
+        base_url,
+        model,
+        max_questions,
+        max_state_chars,
+        max_retries,
+        budget,
+    )));
+    tracing::info!(
+        "[tools.jev] registered (base_url={}, model={}, daily_budget_usd={})",
+        cfg.resolve_jev_base_url(),
+        cfg.tools.jev.model,
+        cfg.tools.jev.daily_budget_usd,
+    );
+    true
 }
 
 /// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v1.4，见

@@ -552,10 +552,11 @@ impl Default for EvolutionRetentionCfg {
 ///
 /// `SessionStore::save` / `CheckpointStore::create` 都会在落盘前调用
 /// `wyj_core::serialize::truncate_session_for_persistence`,按本配置对
-/// `ToolResult` 文本、`Thinking`、`ToolUse.input` 等做 UTF-8 安全的截断。
-///
-/// 仅影响磁盘序列化字节,**不影响运行时消息体** —— 内存中完整 messages
-/// 仍可用于下一次 LLM 请求,只在下一次 `save()` 时再截断。
+/// `ToolResult` 文本、`Thinking`、`ToolUse.input`、`Text` 等做 UTF-8 安全的
+/// 截断。**同样作用于 `Agent::run_turn_with_injection_inner` 的运行时
+/// LLM 发送路径与 `SessionStore::load` 的 resume 路径**,确保 disk /
+/// runtime / resume 三条路径共用同一上限——避免长 `ContentBlock::Text`
+/// (assistant 总结 / 用户粘贴日志) 在内存里无界累积、撞穿模型上下文窗口。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PersistCapCfg {
@@ -569,6 +570,13 @@ pub struct PersistCapCfg {
     pub reasoning_details_bytes: usize,
     /// `ToolUse.input` JSON 字符串字节上限。0 = 不截断。
     pub tool_use_input_bytes: usize,
+    /// `ContentBlock::Text` (user / assistant 纯文本) head 字节上限。
+    /// 0 = 不截断。长 assistant 总结、用户粘贴日志在 `Text` 块里无界累积
+    /// 会让单次请求撞穿模型上下文窗口;runtime / resume / save 三条路径
+    /// 都按此上限收敛。
+    pub text_head_bytes: usize,
+    /// `ContentBlock::Text` tail 字节上限。0 = 不截断。
+    pub text_tail_bytes: usize,
 }
 
 impl Default for PersistCapCfg {
@@ -579,6 +587,12 @@ impl Default for PersistCapCfg {
             thinking_bytes: 8 * 1024,
             reasoning_details_bytes: 8 * 1024,
             tool_use_input_bytes: 64 * 1024,
+            // Text 信息密度低于 tool_result (常含 markdown / 长 reasoning 解释),
+            // 默认 head+tail 24K 比 tool_result 30K 更紧;长上下文先撞上限,
+            // 触发 compact,而不是先撞死模型上下文窗口。reasoning 模型一轮
+            // 可能回得更多,故保留 head 16K 比 thinking 8K 宽。
+            text_head_bytes: 16 * 1024,
+            text_tail_bytes: 8 * 1024,
         }
     }
 }
@@ -775,6 +789,79 @@ pub struct Config {
     /// 全部字段 opt-out,0 = 不截断。
     #[serde(default)]
     pub persist_cap: PersistCapCfg,
+    /// 可选/付费工具的注册门控（`[tools.jev]` 等子块）。Jev 是
+    /// stateless 决策 API（typesafe.ai System One），不能作为 chat 模型
+    /// 替代主 Agent；这里集中配置其注册门槛、限速与预算，避免污染
+    /// `[profiles]` 的 chat 协议语义。
+    #[serde(default)]
+    pub tools: ToolsCfg,
+}
+
+/// `[tools]` 节：可选/付费工具的注册门控。每项独立配置、各自带
+/// 默认安全值，未配置时一律不注册对应工具，模型看不到该工具。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsCfg {
+    /// Jev（typesafe.ai System One）决策工具。
+    pub jev: ToolsJevCfg,
+}
+
+/// `[tools.jev]` 节：Jev 决策 API（typesafe.ai System One）的注册门槛。
+///
+/// Jev 与 chat 模型完全不同：无 stream、无 multi-turn、无 tool calling 协议，
+/// 它是 stateless 决策 API（POST `/v1/systemone`），输出结构化 answers +
+/// probabilities + confidence，作为独立工具暴露给主 Agent 在歧义场景
+/// 主动调用（意图路由/分类/guardrails/置信度标注）。主模型仍是 Claude/GPT，
+/// 这里只控制 Jev 工具的注册与限速。
+///
+/// 默认全部安全收紧：`enabled=false`（不注册，模型看不到），
+/// API Key 优先从 `TYPESAFE_API_KEY` env 读取，env 与 `api_key` 字段都为空
+/// 时不注册；`daily_budget_usd = 0` 关闭 budget 维度（仅受 size 上限保护）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsJevCfg {
+    /// 总开关。默认 false——Jev 是付费 API，不主动启用。
+    pub enabled: bool,
+    /// API Key；空字符串或 None 时回退到环境变量 `TYPESAFE_API_KEY`，
+    /// 都为空则工具不注册。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// 端点 base URL；空字符串使用 `https://api.typesafe.ai`。
+    #[serde(default)]
+    pub base_url: String,
+    /// 默认模型名；仅在 tool input 没显式给 `model` 时使用。
+    /// 当前官方 `jev-latest` 与 `jev-preview` 都指向 `jev-1.13.0`。
+    #[serde(default = "default_jev_model")]
+    pub model: String,
+    /// 单次调用最多 questions 数量（client-side validate，缺超则拒）。
+    pub max_questions: usize,
+    /// `state` 文本字符上限（超则按 char boundary 截断）。
+    pub max_state_chars: usize,
+    /// 429/5xx 客户端重试上限。
+    pub max_retries: u32,
+    /// 进程级日预算（USD）；0 = 关闭 budget 维度，仍受 size 上限保护。
+    /// 输出 token 官方免费（$0/M），只有输入侧按 $0.042/M 计费。
+    pub daily_budget_usd: f64,
+}
+
+impl Default for ToolsJevCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            base_url: String::new(),
+            model: default_jev_model(),
+            max_questions: 32,
+            max_state_chars: 32_000,
+            max_retries: 2,
+            daily_budget_usd: 5.0,
+        }
+    }
+}
+
+/// serde 字段级默认值（与 `Default::default` 同源）。
+fn default_jev_model() -> String {
+    "jev-latest".to_string()
 }
 
 fn default_true() -> bool {
@@ -816,6 +903,7 @@ impl Default for Config {
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
+            tools: ToolsCfg::default(),
         }
     }
 }
@@ -900,6 +988,7 @@ impl From<LegacyConfigV0> for Config {
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
+            tools: ToolsCfg::default(),
         }
     }
 }
@@ -939,6 +1028,33 @@ impl Config {
         match mode {
             AgentMode::Plan => p.plan_model.as_deref().unwrap_or(&p.model),
             AgentMode::Normal | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
+        }
+    }
+
+    /// 解析 Jev 决策工具的 API Key：优先 `TYPESAFE_API_KEY` env，回退到
+    /// `[tools.jev].api_key` 字段；都为空返回 None（调用方应跳过注册）。
+    /// 与 `runtime_api_key` 同样**不**回写到 `tools.jev.api_key`，
+    /// env 与字段的合并始终在运行时由本方法完成。
+    pub fn resolve_jev_api_key(&self) -> Option<String> {
+        if let Ok(value) = std::env::var("TYPESAFE_API_KEY") {
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+        self.tools
+            .jev
+            .api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 解析 Jev 工具的 base URL：留空用官方 `https://api.typesafe.ai`。
+    pub fn resolve_jev_base_url(&self) -> String {
+        if self.tools.jev.base_url.trim().is_empty() {
+            "https://api.typesafe.ai".to_string()
+        } else {
+            self.tools.jev.base_url.trim_end_matches('/').to_string()
         }
     }
 }
@@ -995,6 +1111,10 @@ impl Config {
                 cfg.search_api_key = Some(key);
             }
         }
+        // Jev（typesafe.ai）key：env 与 `[tools.jev].api_key` 字段的合并
+        // 由 `Config::resolve_jev_api_key()` 处理，**不**在这里写回 cfg
+        // 字段（与 `runtime_api_key` 同款 serde-skip 语义：避免 `/config`
+        // 等面板保存时把 env 值物化进 config.toml）。
 
         Ok(cfg)
     }
@@ -1684,6 +1804,84 @@ context_window = 200000
         assert!(!config.evolution.allow_self_code_experiments);
         assert!(config.evolution.exclude_external_context);
         assert_eq!(config.evolution.max_background_workers, 1);
+    }
+
+    #[test]
+    fn jev_defaults_are_off_and_safe() {
+        let cfg = super::ToolsJevCfg::default();
+        assert!(!cfg.enabled, "Jev 默认禁用，避免无意中暴露付费工具");
+        assert!(cfg.api_key.is_none());
+        assert!(cfg.base_url.is_empty());
+        assert_eq!(cfg.model, "jev-latest");
+        assert_eq!(cfg.max_questions, 32);
+        assert_eq!(cfg.max_state_chars, 32_000);
+        assert_eq!(cfg.max_retries, 2);
+        assert!((cfg.daily_budget_usd - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn partial_jev_section_keeps_safe_defaults() {
+        let cfg: super::ToolsJevCfg = toml::from_str(r#"enabled = true"#).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.model, "jev-latest");
+        assert_eq!(cfg.max_questions, 32);
+        assert_eq!(cfg.daily_budget_usd, 5.0);
+    }
+
+    #[test]
+    fn resolve_jev_base_url_defaults_to_official_endpoint() {
+        let cfg = Config::default();
+        assert_eq!(cfg.resolve_jev_base_url(), "https://api.typesafe.ai");
+
+        let mut cfg2 = Config::default();
+        cfg2.tools.jev.base_url = "https://api.example.com/v1/".to_string();
+        assert_eq!(
+            cfg2.resolve_jev_base_url(),
+            "https://api.example.com/v1",
+            "末尾 / 应被 trim，避免与 /v1/systemone 拼成 //"
+        );
+    }
+
+    #[test]
+    fn resolve_jev_api_key_prefers_field_over_env_when_both_set() {
+        // 不依赖外部 env：默认 env 未设置，验证字段路径。
+        let mut cfg = Config::default();
+        cfg.tools.jev.api_key = Some("from-field".to_string());
+        assert_eq!(cfg.resolve_jev_api_key().as_deref(), Some("from-field"));
+    }
+
+    #[test]
+    fn resolve_jev_api_key_treats_empty_field_as_unset() {
+        let mut cfg = Config::default();
+        cfg.tools.jev.api_key = Some(String::new());
+        // 默认无 TYPESAFE_API_KEY env，应返回 None（不返回空串）
+        if std::env::var("TYPESAFE_API_KEY").is_err() {
+            assert_eq!(cfg.resolve_jev_api_key(), None);
+        }
+    }
+
+    #[test]
+    fn config_serializes_with_new_tools_section() {
+        // 反向兼容：旧 config.toml 无 [tools] 段时仍能加载（serde default）
+        let cfg: Config = toml::from_str(
+            r#"
+active_profile = "default"
+
+[[profiles]]
+name = "default"
+provider = "anthropic"
+model = "claude-opus-4-8"
+base_url = "https://api.anthropic.com"
+api_key = "sk-test"
+max_tokens = 8192
+context_window = 200000
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.tools.jev.enabled);
+        // 序列化为 TOML 后应包含 [tools] 段
+        let s = toml::to_string(&cfg).unwrap();
+        assert!(s.contains("[tools.jev]"));
     }
 }
 
