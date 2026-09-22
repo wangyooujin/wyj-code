@@ -90,6 +90,26 @@ pub const FIELD_WEBFETCH_URL: &str = "The URL to fetch (http/https)";
 pub const FIELD_WEBSEARCH_QUERY: &str =
     "The search query. Prefer specific, keyword-rich queries over full sentences.";
 
+/// Jev 决策工具描述（typesafe.ai System One）。
+/// Jev 不是 chat 模型——无 stream / 无 multi-turn / 无 tool calling，
+/// 它是 stateless 决策 API（POST /v1/systemone），输出结构化 answers +
+/// confidence + probabilities。教主模型在歧义场景主动调用。
+pub const JEV_DESCRIPTION: &str = "Jev(decision): call TypeSafe Jev (System One) for structured decisions with calibrated confidence. Input: `state` (context text) + `questions` map (each question is one of choice/score/noul with explicit criteria). Output: typed `answers` with per-answer `confidence` and `probabilities`.\n\nUse when you need:\n  - disambiguate user intent before routing (confidence > 0.8 = safe action)\n  - classify an unknown file / commit / log line into a closed set\n  - guardrails: classify whether a tool output looks unsafe or off-spec\n  - score relevance on a 0..N rubric\n\nDo NOT use for:\n  - open-ended generation (use your main LLM)\n  - streaming, multi-turn dialogue (Jev is stateless single-shot)\n  - any time you would normally call AskQuestion — Jev returns decisions, the user does not see its questions";
+
+// Jev input_schema 字段描述
+pub const FIELD_JEV_STATE: &str =
+    "Context text the model will reason over (e.g. a tool output, file excerpt, user message)";
+pub const FIELD_JEV_MODEL: &str =
+    "Jev model alias (default jev-latest; current alias points to jev-1.13.0)";
+pub const FIELD_JEV_QUESTION_TYPE: &str =
+    "Question primitive: `choice` (pick one of `criteria` keys), `score` (rate 0..N against `criteria` list), or `noul` (yes/no probability)";
+pub const FIELD_JEV_INSTRUCTIONS: &str =
+    "Plain-English description of what this question is asking";
+pub const FIELD_JEV_CRITERIA_CHOICE: &str =
+    "Object mapping each allowed answer key to a one-line description; Jev picks the most fitting key";
+pub const FIELD_JEV_CRITERIA_SCORE: &str =
+    "Ordered list of mutually exclusive rubric levels (e.g. [\"calm\",\"frustrated\",\"angry\"]); length must be >= 2";
+
 #[cfg(test)]
 mod tests {
     use super::*;
