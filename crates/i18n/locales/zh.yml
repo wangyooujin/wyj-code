@@ -140,6 +140,7 @@ help:
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
+    - `/decision [ping|ask <问题>]` — 通过 TypeSafe Jev 决策 API 获取结构化判断；用于意图路由/分类/置信度标注，需要 [tools.jev].enabled=true 且 TYPESAFE_API_KEY 或 api_key 已配置
     - `/memory` — 打开 CLAUDE.md 记忆面板
     - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
     - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
@@ -589,6 +590,25 @@ computer:
   input_ok: "  ✓  输入自检    成功（当前光标位置 ({x}, {y})）"
   input_err: "  ✗  输入自检    失败: {err}"
   accessibility_hint: "  ℹ️  提示：以上「输入自检」只验证读取光标位置成功，不代表点击/按键一定生效。macOS 上「辅助功能」权限未授权时，鼠标/键盘合成事件常被系统静默丢弃且不报错——若截图正常但操作无反应，请检查 系统设置 → 隐私与安全性 → 辅助功能。"
+
+decision:
+  desc: "通过 TypeSafe Jev 决策 API（System One）获取结构化判断与置信度；常用于意图路由/分类/置信度标注"
+  usage: "/decision [ping | ask <问题>]"
+  help: |-
+    用法: /decision [ping | ask <问题>]
+
+    - /decision          显示本帮助
+    - /decision ping     发最小 noul question 验证 API Key + 网络连通性
+    - /decision ask <文本>  把文本包装成单个 noul question 拿到 0..1 概率
+
+    前提: 在 ~/.wyj-code/config.toml 设置 [tools.jev].enabled=true 并
+    提供 TYPESAFE_API_KEY（env）或 [tools.jev].api_key。Jev 与 chat 模型
+    完全不同——无 stream / 无 multi-turn，仅作主 Agent 主动调用的决策工具。
+  ping_success: "  ✓  连通       noul={noul}（置信度已收到）"
+  network_error: "  ✗  网络错误   {err}"
+  http_error: "  ✗  HTTP {status}   {body}"
+  parse_error: "  ✗  解析失败   {err}"
+  no_key: "  ✗  未配置     设置 TYPESAFE_API_KEY 或 [tools.jev].api_key 后重试"
 
 status:
   api_key_ok: "  ✓  API Key      {prefix}... (已配置)"

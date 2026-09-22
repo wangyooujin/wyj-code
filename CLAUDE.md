@@ -82,6 +82,18 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）
 search_api_key = ""          # WebSearch API Key，优先读环境变量 WYJ_CODE_SEARCH_API_KEY；未配置则 WebSearch 工具不注册（模型看不到）
 
+[tools.jev]                  # TypeSafe Jev 决策 API（https://typesafe.ai/，System One 模型）
+                              # Jev 不是 chat 模型——无 stream / 无 multi-turn，仅作主 Agent 主动调用的决策工具
+                              # 用于意图路由 / 分类 / guardrails / 置信度标注，输出结构化 answers + confidence
+enabled = false              # 默认禁用：Jev 是付费 API，显式开启才注册到 ToolRegistry
+api_key = ""                 # 留空读环境变量 TYPESAFE_API_KEY；都为空则工具不注册（与 runtime_api_key 同款"serde skip"语义）
+base_url = ""                # 留空用 https://api.typesafe.ai
+model = "jev-latest"         # 默认 jev-latest（当前 alias 指向 jev-1.13.0）；可在 tool input 中覆盖
+max_questions = 32           # 单次最多 questions 数量（client-side validate，超限直接拒）
+max_state_chars = 32000      # state 字符上限（按 char boundary 安全截断，避免 String::truncate panic）
+max_retries = 2              # 429/5xx 客户端重试上限
+daily_budget_usd = 5.0       # 进程级日预算（输入侧 $0.042/M，输出免费）；0 = 关闭 budget 维度（仍受 size 上限）
+
 [subagent]
 default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组
 explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
@@ -142,7 +154,7 @@ args = ["--flag"]
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session runtime/events、HistoryStore、MemoryStore、权限、checkpoint、workspace/workflow 接口与本地 CodeIndex |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer；WebSearch 仅在配置 search_api_key 时注册，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer/Jev；WebSearch 仅在配置 search_api_key 时注册，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile，Jev 仅在 `[tools.jev].enabled=true` 且 API Key 可解析时注册；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例、jev.rs 决策 API 客户端 + Budget 硬封顶）|
 | `crates/computer` | `wyj-computer` | computer-use 系统层：`xcap` 截图 + `enigo` 输入合成（两者内部已各自分派 macOS/Windows，本 crate 不再手写 target_os 分支），坐标缩放数学（`scale` 模块，平台无关可测）；仅 `[target.'cfg(any(macos, windows))']` 拉取真实依赖，其余平台编译进桩实现 |
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|

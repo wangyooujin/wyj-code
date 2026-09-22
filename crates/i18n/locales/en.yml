@@ -141,6 +141,7 @@ help:
     - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
+    - `/decision [ping|ask <question>]` — Call TypeSafe Jev decision API for structured judgment; used for intent routing / classification / confidence annotation. Requires [tools.jev].enabled=true and TYPESAFE_API_KEY or api_key configured.
     - `/memory` — Open the CLAUDE.md memory panel
     - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
     - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
@@ -590,6 +591,26 @@ computer:
   input_ok: "  ✓  Input        ok (cursor at ({x}, {y}))"
   input_err: "  ✗  Input        failed: {err}"
   accessibility_hint: "  ℹ️  Note: the input self-test above only confirms reading the cursor position works — it does not guarantee clicks/keystrokes actually take effect. On macOS, without Accessibility permission granted, synthesized mouse/keyboard events are often silently dropped by the system with no error. If screenshots work but actions have no effect, check System Settings → Privacy & Security → Accessibility."
+
+decision:
+  desc: "Call TypeSafe Jev decision API (System One) for structured judgment with calibrated confidence; typically used for intent routing / classification / confidence annotation"
+  usage: "/decision [ping | ask <question>]"
+  help: |-
+    Usage: /decision [ping | ask <question>]
+
+    - /decision          Show this help
+    - /decision ping     Send a minimal noul question to verify API Key + network
+    - /decision ask <text>  Wrap <text> as a single noul question, get a 0..1 probability
+
+    Prerequisites: set [tools.jev].enabled=true in ~/.wyj-code/config.toml
+    and provide TYPESAFE_API_KEY (env) or [tools.jev].api_key. Jev is not a
+    chat model — no stream / no multi-turn — only a decision tool the main
+    Agent calls when a structured answer is wanted.
+  ping_success: "  ✓  reachable   noul={noul} (confidence received)"
+  network_error: "  ✗  network     {err}"
+  http_error: "  ✗  HTTP {status}   {body}"
+  parse_error: "  ✗  parse       {err}"
+  no_key: "  ✗  no key      set TYPESAFE_API_KEY or [tools.jev].api_key and retry"
 
 status:
   api_key_ok: "  ✓  API Key      {prefix}... (configured)"
