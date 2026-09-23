@@ -158,7 +158,7 @@ fn collect_status(config_base: &Path) -> Result<StatusReport> {
                 });
             }
         }
-        report.top_sessions.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        report.top_sessions.sort_by_key(|b| std::cmp::Reverse(b.bytes));
     }
     let cas_root = config_base.join("cas/sha256");
     if cas_root.is_dir() {
