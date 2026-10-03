@@ -301,6 +301,11 @@ fn load_from_path_if_absent(
 /// 递归扫描 `*.md`，子目录映射为 Claude Code 风格的 `namespace:name` 命令名。
 /// `disabled` 由上层调用方传入(汇总全局+项目 lockfile 里 `enabled == false` 的
 /// skill 名)，用于过滤掉被 /skills 面板禁用的条目。
+///
+/// **合并链（v1.5.15 起由 6 层简化到 4 层）**：内置 → `~/.wyj-code/skills` →
+/// 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。
+/// 不再读取 `~/.claude/commands/` 与 `<cwd>/.claude/commands/` 等外部源——
+/// wyj-code 只信任 `.wyj-code/` 下用户自己写下的条目。
 pub fn load_skills(
     home: &Path,
     cwd: &Path,
@@ -332,27 +337,15 @@ pub fn load_skills(
         load_from_dir(&global_wyj_dir, &mut skills);
     }
 
-    // 3. 全局真 CC 自定义命令：~/.claude/commands/*.md（覆盖 #2 同名条目）
-    let global_claude_dir = home.join(".claude").join("commands");
-    if global_claude_dir.exists() {
-        load_from_dir(&global_claude_dir, &mut skills);
-    }
-
-    // 4. 已启用插件贡献路径（按安装顺序，先到先得，跳过并警告同名冲突）
+    // 3. 已启用插件贡献路径（按安装顺序，先到先得，跳过并警告同名冲突）
     for path in plugin_skill_sources {
         load_from_path_if_absent(path, "plugin", &mut skills);
     }
 
-    // 5. 项目 Skill：<git-root>/.wyj-code/skills（单文件或目录式，覆盖 #1-#4）
+    // 4. 项目 Skill：<git-root>/.wyj-code/skills（单文件或目录式，覆盖 #1-#3，最高优先级）
     let project_wyj_dir = wyj_config::project_config_dir(cwd).join("skills");
     if project_wyj_dir.exists() {
         load_from_dir(&project_wyj_dir, &mut skills);
-    }
-
-    // 6. 项目真 CC 自定义命令：.claude/commands/*.md（覆盖以上全部，最高优先级）
-    let project_claude_dir = cwd.join(".claude").join("commands");
-    if project_claude_dir.exists() {
-        load_from_dir(&project_claude_dir, &mut skills);
     }
 
     skills
@@ -541,7 +534,7 @@ mod tests {
     fn nested_command_directory_becomes_namespace() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let nested = cwd.path().join(".claude").join("commands").join("backend");
+        let nested = cwd.path().join(".wyj-code").join("skills").join("backend");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("review.md"), "# Review\nbody").unwrap();
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
@@ -600,12 +593,13 @@ mod tests {
     }
 
     #[test]
-    fn global_real_cc_commands_dir_is_loaded() {
+    fn global_wyj_skills_dir_is_loaded() {
+        // v1.5.15 起只读 `~/.wyj-code/skills/`，`~/.claude/commands/` 不再被读取。
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let commands_dir = home.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&commands_dir).unwrap();
-        std::fs::write(commands_dir.join("hello.md"), "# Hello\nhi from real cc").unwrap();
+        let skills_dir = home.path().join(".wyj-code").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("hello.md"), "# Hello\nhi from wyj").unwrap();
 
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
         let hello = cmds.iter().find(|c| c.name() == "hello").unwrap();
@@ -613,69 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn global_real_cc_commands_override_global_wyj_skills_same_scope() {
+    fn project_wyj_skills_override_global_wyj_skills() {
+        // v1.5.15 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
+        // `~/.claude/commands/` 不再被读取。项目级 `~/.wyj-code/skills/` 覆盖
+        // 全局级同名条目（作用域优先级 = 全局 < 项目）。
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
 
-        let wyj_dir = home.path().join(".wyj-code").join("skills");
-        std::fs::create_dir_all(&wyj_dir).unwrap();
-        std::fs::write(wyj_dir.join("review.md"), "# WYJ Review\nwyj version").unwrap();
+        let global_dir = home.path().join(".wyj-code").join("skills");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(global_dir.join("review.md"), "# Global WYJ\nglobal wyj").unwrap();
 
-        let cc_dir = home.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&cc_dir).unwrap();
-        std::fs::write(cc_dir.join("review.md"), "# Real CC Review\ncc version").unwrap();
+        let project_dir = cwd.path().join(".wyj-code").join("skills");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("review.md"), "# Project WYJ\nproject wyj").unwrap();
 
         let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
         let review = cmds.iter().find(|c| c.name() == "review").unwrap();
-        assert_eq!(review.description(), "Real CC Review"); // 同作用域内真 CC 路径胜出
-    }
-
-    #[test]
-    fn project_real_cc_commands_override_everything() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-
-        let global_cc_dir = home.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&global_cc_dir).unwrap();
-        std::fs::write(global_cc_dir.join("custom.md"), "# Global CC\nglobal").unwrap();
-
-        let project_wyj_dir = cwd.path().join(".wyj-code").join("skills");
-        std::fs::create_dir_all(&project_wyj_dir).unwrap();
-        std::fs::write(
-            project_wyj_dir.join("custom.md"),
-            "# Project WYJ\nproject wyj",
-        )
-        .unwrap();
-
-        let project_cc_dir = cwd.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&project_cc_dir).unwrap();
-        std::fs::write(project_cc_dir.join("custom.md"), "# Project CC\nproject cc").unwrap();
-
-        let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
-        let custom = cmds.iter().find(|c| c.name() == "custom").unwrap();
-        assert_eq!(custom.description(), "Project CC"); // 项目真 CC 路径最高优先级
-    }
-
-    #[test]
-    fn project_wyj_skills_still_override_global_real_cc() {
-        let home = tempfile::tempdir().unwrap();
-        let cwd = tempfile::tempdir().unwrap();
-
-        let global_cc_dir = home.path().join(".claude").join("commands");
-        std::fs::create_dir_all(&global_cc_dir).unwrap();
-        std::fs::write(global_cc_dir.join("custom.md"), "# Global CC\nglobal").unwrap();
-
-        let project_wyj_dir = cwd.path().join(".wyj-code").join("skills");
-        std::fs::create_dir_all(&project_wyj_dir).unwrap();
-        std::fs::write(
-            project_wyj_dir.join("custom.md"),
-            "# Project WYJ\nproject wyj",
-        )
-        .unwrap();
-
-        let cmds = load_skills(home.path(), cwd.path(), &HashSet::new(), &[]);
-        let custom = cmds.iter().find(|c| c.name() == "custom").unwrap();
-        // 作用域优先级（全局 < 项目）不受"同作用域内真 CC 胜出"规则影响
-        assert_eq!(custom.description(), "Project WYJ");
+        assert_eq!(review.description(), "Project WYJ");
     }
 }

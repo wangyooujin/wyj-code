@@ -9,7 +9,6 @@
 
 pub mod cron_sync;
 pub mod extensions;
-pub mod import;
 pub mod lockfile;
 pub mod marketplace;
 pub mod mcp_install;

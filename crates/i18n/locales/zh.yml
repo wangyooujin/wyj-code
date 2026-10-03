@@ -149,7 +149,6 @@ help:
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
     - `/extensions` — 统一查看并诊断 Skill / MCP / Plugin 资源
-    - `/import` — 扫描 Codex / Claude Code 配置（MCP server、自定义命令、agent），勾选后一键导入 wyj-code
     - `/schedule` — 管理定时任务（cron 触发的 prompt），macOS/Linux 下保存后自动同步进系统 crontab
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
@@ -408,25 +407,6 @@ schedule:
     sync_error_title: "同步 crontab 失败"
 
 import:
-  desc: "扫描 Codex / Claude Code 配置（MCP server、自定义命令、agent），勾选后一键导入 wyj-code"
-  headless_unsupported: "[headless 模式不支持 /import 面板，请使用 `wyj-code extensions migrate --from codex|claude|all`]"
-  applied_notice: "已导入 {count} 项 — MCP 连接与 skill 注册在下一轮 Agent 回合边界生效"
-  dialog:
-    title: "从 Codex / Claude Code 导入"
-    hint: "↑↓ 选择 · Space 勾选 · a 全选/清空 · Enter 导入勾选项 · Esc 关闭"
-    empty: "没有可导入项 — 未发现 Codex/Claude Code 配置，或已全部导入过"
-  label:
-    conflict: "[冲突: 导入将覆盖既有配置]"
-    shadowed: "[被遮蔽]"
-  report:
-    applied: "已导入"
-    overwritten: "已覆盖"
-    shadowed_note: "被遮蔽项：Claude Code 原文件仍优先生效，删除原文件后导入副本才会接管"
-    errors: "错误"
-    nothing: "没有导入任何内容"
-    hint: "Enter/Esc 关闭"
-
-skills:
   desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
   headless_unsupported: "[headless 模式不支持 /skills 面板，请使用 `wyj-code extensions` 管理 Skill]"
   dialog:
