@@ -31,6 +31,7 @@ use tokio::task::AbortHandle;
 use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
+use wyj_core::notify::{emit as notify_emit, NotificationEvent};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::{
     discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent,
@@ -7410,6 +7411,18 @@ impl AppState {
                     self.last_turn_input_tokens = d_in;
                     self.last_turn_output_tokens = d_out;
                     self.push_tracked_message(ChatMessage::turn_summary(elapsed, d_in, d_out));
+                    // 统一通知：主回合正常完成
+                    let summary = format!("{d_in}↑ {d_out}↓");
+                    let summary = truncate_notify_body(&summary);
+                    notify_emit(NotificationEvent::TurnFinished {
+                        duration_ms: (elapsed * 1000.0) as u64,
+                        summary,
+                        session_id: if self.current_session_id.is_empty() {
+                            None
+                        } else {
+                            Some(self.current_session_id.clone())
+                        },
+                    });
                 }
             }
 
@@ -7427,6 +7440,15 @@ impl AppState {
                 self.is_thinking = false;
                 self.injector = None;
                 self.push_tracked_message(ChatMessage::assistant_err(format!("[错误] {e}")));
+                // 统一通知：主回合出错
+                notify_emit(NotificationEvent::TurnError {
+                    error: truncate_notify_body(&e),
+                    session_id: if self.current_session_id.is_empty() {
+                        None
+                    } else {
+                        Some(self.current_session_id.clone())
+                    },
+                });
             }
 
             AgentEvent::Injected => {
@@ -8061,6 +8083,13 @@ impl AppState {
                     s.final_result = Some(result.clone());
                 }
                 if background {
+                    // 统一通知：后台子 Agent 完成（前台调用不通知，避免和主回合
+                    // TurnFinished 在同一面板里重复提示）
+                    let summary = format!("{agent_type} ({:.1}s)", elapsed_secs);
+                    notify_emit(NotificationEvent::SubAgentDone {
+                        agent_id: format!("a{id}"),
+                        summary: truncate_notify_body(&summary),
+                    });
                     // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
                     // 送达；空闲则暂存，下一轮起手合并进 user 消息
                     let reminder = wyj_core::prompts::bg_agent_done_reminder(
@@ -8095,6 +8124,17 @@ impl AppState {
 
 const SAVE_AND_DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007s\x1b[?1007l";
 const RESTORE_ALTERNATE_SCROLL: &str = "\x1b[?1007r";
+
+/// 统一通知通道的 body 截断：与 `wyj_core::notify` 内部 200 字符上限保持一致，
+/// 把换行变空格，防止 system-reminder / Notification Center 标题区被
+/// 多行内容污染。仅 TUI 三处触发点共用，避免每处重复写截断逻辑。
+fn truncate_notify_body(s: &str) -> String {
+    const MAX_BODY: usize = 200;
+    if s.len() <= MAX_BODY {
+        return s.replace('\n', " ");
+    }
+    s.chars().take(MAX_BODY).collect::<String>().replace('\n', " ")
+}
 
 /// Fullscreen + `DisableMouseCapture` 下的滚轮路由。
 ///
