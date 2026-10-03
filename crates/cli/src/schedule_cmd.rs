@@ -13,6 +13,8 @@ use tokio::process::Command;
 use wyj_store::cron_sync;
 use wyj_store::schedule::{self, RunStatus, SchedulePermissions};
 
+use crate::notify::{emit as notify_emit, NotificationEvent};
+
 /// 读取当前用户 storage 配置(失败回退 default,避免阻塞 schedule 执行)。
 /// schedule run 由系统 crontab 触发,headless 环境下不应因 config 解析失败
 /// 而拒绝跑任务。
@@ -237,6 +239,9 @@ fn sync_and_warn() -> Result<()> {
 }
 
 async fn run_task(id: &str, _manual: bool) -> Result<()> {
+    // schedule 子进程可能被系统 crontab 直接唤起，绕过 main.rs 的 init 路径。
+    // init 是幂等的（OnceLock first-wins），所以重复调用安全。
+    notify_emit_init_default_if_needed();
     let manifest = schedule::load()?;
     let task = manifest
         .tasks
@@ -265,7 +270,10 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
             let msg = format!("无法创建日志文件: {e}");
             schedule::record_run_result(id, RunStatus::Failed, None, Some(msg.clone()))?;
             if notify_on_failure {
-                notify_failure(&task_name, &msg);
+                notify_emit(NotificationEvent::ScheduleFailed {
+                    task_name: task_name.clone(),
+                    error: truncate_notify_body(&msg),
+                });
             }
             return Err(e);
         }
@@ -290,19 +298,40 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
             );
             schedule::record_run_result(id, RunStatus::Failed, session_id, Some(err_msg.clone()))?;
             if notify_on_failure {
-                notify_failure(&task_name, &err_msg);
+                notify_emit(NotificationEvent::ScheduleFailed {
+                    task_name: task_name.clone(),
+                    error: truncate_notify_body(&err_msg),
+                });
             }
         }
         Err(e) => {
             let err_msg = format!("启动子进程失败: {e}");
             schedule::record_run_result(id, RunStatus::Failed, session_id, Some(err_msg.clone()))?;
             if notify_on_failure {
-                notify_failure(&task_name, &err_msg);
+                notify_emit(NotificationEvent::ScheduleFailed {
+                    task_name: task_name.clone(),
+                    error: truncate_notify_body(&err_msg),
+                });
             }
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// 把通知 body 截断到 200 字符并把换行变空格——与 `notify::macos_send` 之前的
+/// `schedule_cmd.rs` 半成品实现保持一致；现在集中到这里便于单测。
+fn truncate_notify_body(msg: &str) -> String {
+    msg.chars().take(200).collect::<String>().replace('\n', " ")
+}
+
+/// schedule 路径专用 init：被系统 crontab 唤起时绕过 main.rs，所以需要兜底。
+/// `notify::init` 内部使用 `OnceLock` first-wins，重复调用安全。
+fn notify_emit_init_default_if_needed() {
+    if std::env::var("WYJ_CODE_NOTIFY_OFF").ok().as_deref() == Some("1") {
+        return;
+    }
+    crate::notify::init(&crate::notify::NotifyCfg::default());
 }
 
 fn prepare_log_file(id: &str, cfg: &wyj_config::StorageRetentionCfg) -> Result<PathBuf> {
@@ -387,34 +416,6 @@ fn read_log_tail(path: &Path, max_bytes: usize) -> String {
         }
         Err(_) => String::new(),
     }
-}
-
-#[cfg(target_os = "macos")]
-fn notify_failure(task_name: &str, message: &str) {
-    let short: String = message
-        .chars()
-        .take(200)
-        .collect::<String>()
-        .replace('\n', " ");
-    let script = format!(
-        "display notification {} with title {}",
-        applescript_quote(&short),
-        applescript_quote(&format!("wyj-code 定时任务失败: {task_name}"))
-    );
-    let _ = std::process::Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .status();
-}
-
-#[cfg(target_os = "macos")]
-fn applescript_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn notify_failure(_task_name: &str, _message: &str) {
-    tracing::warn!("当前平台不支持系统通知，定时任务失败信息已记录到 last_run");
 }
 
 #[cfg(test)]
