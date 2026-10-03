@@ -925,9 +925,9 @@ impl Default for NotifyCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            bell: NotifyBellCfg::default(),  // enabled: false
-            desktop: NotifyDesktopCfg::default(),  // enabled: true
-            events: NotifyEventsCfg::default(),  // 全 true
+            bell: NotifyBellCfg::default(),       // enabled: false
+            desktop: NotifyDesktopCfg::default(), // enabled: true
+            events: NotifyEventsCfg::default(),   // 全 true
             rate_limit_seconds: 30,
             include_session_id: false,
         }

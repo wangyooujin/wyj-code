@@ -8133,7 +8133,10 @@ fn truncate_notify_body(s: &str) -> String {
     if s.len() <= MAX_BODY {
         return s.replace('\n', " ");
     }
-    s.chars().take(MAX_BODY).collect::<String>().replace('\n', " ")
+    s.chars()
+        .take(MAX_BODY)
+        .collect::<String>()
+        .replace('\n', " ")
 }
 
 /// Fullscreen + `DisableMouseCapture` 下的滚轮路由。

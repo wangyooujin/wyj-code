@@ -819,3 +819,15 @@ welcome:
     compact: '/compact 压缩上下文'
     mode: 'Shift+Tab 切换模式'
     quit: 'Ctrl+C 退出'
+
+notify:
+  title:
+    turn_finished: "wyj-code 回合完成"
+    turn_error: "wyj-code 回合出错"
+    subagent_done: "wyj-code 子 Agent 完成"
+    schedule_failed: "wyj-code 定时任务失败"
+  body:
+    turn_finished: "耗时 {duration_ms} 毫秒。{summary}"
+    turn_error: "{error}"
+    subagent_done: "子 Agent {agent_id}。{summary}"
+    schedule_failed: "任务 {task_name}。{error}"

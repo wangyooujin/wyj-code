@@ -100,6 +100,33 @@ explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便�
 trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
 
+[notify]                      # 统一通知通道（v1.5.14+）：TUI/CLI 回合完成 / 错误、
+                              # 后台子 Agent 完成、cron schedule 失败统一派发到
+                              # 终端响铃（stderr \x07）与桌面通知（macOS osascript /
+                              # Linux notify-send / Windows PowerShell BurntToast）。
+                              # 零新第三方依赖。详见 `wyj_core::notify` 模块文档。
+enabled = true               # master 开关（opt-out 默认开）
+rate_limit_seconds = 30      # 同类事件最小间隔去重；0 = 关闭
+
+[notify.bell]
+enabled = false              # 终端响铃 opt-in 默认关（TUI 共享场景避免扰民）
+
+[notify.desktop]
+enabled = true               # 桌面通知 opt-out 默认开（后台子 Agent / cron 失败场景必须通知）
+
+[notify.events]
+turn_finished = true         # CLI `-p` / REPL / TUI 回合正常完成
+turn_error = true            # 主回合出错
+subagent_done = true         # 后台子 Agent 完成（run_in_background: true）；前台调用不通知
+schedule_failure = true      # cron schedule 任务失败
+
+# include_session_id = false   # body 末尾追加 `[session:<id>]`，默认关闭（body 短）
+
+# env override（init 阶段读取，绝不写回 cfg）：
+#   WYJ_CODE_NOTIFY_OFF=1      全关（最高优先级）
+#   WYJ_CODE_NOTIFY_BELL=0/1   覆盖 notify.bell.enabled
+#   WYJ_CODE_NOTIFY_DESKTOP=0/1 覆盖 notify.desktop.enabled
+
 [[mcp_servers]]
 name = "my-server"
 transport = "stdio"
@@ -214,6 +241,14 @@ args = ["--flag"]
     - **`crates/tui/src/panic_guard.rs`** 新增进程级 `panic::set_hook`：在 `cli::main()` 入口最前 `wyj_tui::panic_guard::install()` 注册（`take_hook` 链式保留前一个 hook），`run_tui` 内 `enter_terminal_screen` 成功后 `mark_active()`、`leave_terminal_screen` 成功后 `mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时 hook 检查到 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。背景：TUI 进入 alternate screen + raw mode 后若进程 panic，会跳过 `run_tui` 末尾清理，导致终端卡死 + 下次启动画面残留 frame + panic 写 stderr 覆盖 ratatui cell 造成画面撕裂。代价是后台 tokio worker 线程 panic 也会触发（worker 无 TTY，crossterm 命令会失败但错误吞掉，可接受）。
     - **`crates/core/src/textutil.rs` 新增 `floor_char_boundary(&str, usize) -> usize`**：按字节切字符串时（如 `String::truncate(MAX)`），先把上限回退到最近的 char boundary 再 truncate，避免 `String::truncate` 在 CJK / emoji 多字节字符中间触发 `is_char_boundary` assertion panic。`memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时接入；与 `wyj-tools::textutil::truncate_str`（返回 `&str`）分工——这里是 `usize` 索引版本，配合 `String::truncate` 做原地截断避免重复分配。
     - **TUI 标题栏 / 状态栏文案简化（v1.5.12）**：`thinking_status_label` 改回单层优先级静态字符串（InProgress TodoItem 的 `active_form` 或 `content` → current_op 映射 `Reading file / Running command / Editing file / Updating todos / Delegating task / Browsing / Preparing plan / Running <Tool>` → permission_dialog → plan_dialog → pending_queue → fallback `Thinking`），砍掉旧的"大象装进冰箱"4 秒旋转短语——非功能性、多语言干扰、跨平台兼容性差。`draw_input` 标题栏只在 thinking 态保留 `⠋ {label}{suffix}`（spinner + label + animated dots）+ 加粗品牌橙；非 thinking 态 Plan/Bypass/Normal 三种模式标题栏分别精简为 `[plan] Enter to send` / `[bypass] Enter to send` / `Enter to send`，把 `↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode` 等长串提示砍掉（这些在顶部 `/help` 与 docs 里有完整说明）。状态栏（`draw_status`）默认右侧不再放 `ctrl+d or ctrl+c twice to exit  /help`，留给左侧"模型 / 进度 / 用量 / cwd"；thinking 指示器单点（标题栏）而非上下两处同闪烁。删除旧 `draw_input` 在 `is_thinking=true` 时提前 `return` 的逻辑——那个 `return` 跳过了末尾 `f.set_cursor_position`，crossterm 硬件光标永远停在"上次成功提交"位置、用户感觉光标卡死；现实现里 thinking 态仍调 `set_cursor_position` 让光标跟随用户实际操作，配套新增两个 `TestBackend` 回归测试（`draw_input_keeps_cursor_visible_while_thinking` + `draw_input_title_shows_thinking_spinner_when_thinking`）防止再次回归。
+
+19. **统一通知通道（v1.5.14+）**：`wyj_core::notify`（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免 `wyj-cli`/`wyj-tui` 之间的反向依赖循环）覆盖 4 类事件 × 2 类 sink：
+    - **事件源**：`TurnFinished` / `TurnError` / `SubAgentDone`（仅后台 `run_in_background: true`）/ `ScheduleFailed`；ACP/daemon 长跑后端故意不接通知（`crates/cli/src/acp.rs` `SessionEvent::TurnFinished => {}` 注释里写明原因）。
+    - **触发点（7 sites 实际用 6 + daemon 故意跳过 1）**：(a) TUI `apply_agent_event(TurnDone)` 与 (b) `apply_agent_event(Error)` 在 `crates/tui/src/app.rs`，(c) 后台子 Agent 完成（`background=true` 分支），(d) CLI `-p` 单回合完成 与 (e) CLI `--headless` REPL 回合在 `crates/cli/src/main.rs`，(f) cron schedule 任务失败三处在 `crates/cli/src/schedule_cmd.rs`。TUI 与 CLI 共用同一份 dispatcher（`DISPATCHER: Mutex<Option<NotifyDispatcher>>`，`init` 走 first-wins 保护、env override 阶段读取），同一 root session 派生路径天然继承同一份 cfg。
+    - **Sink**：`BellSink` 写 stderr `\x07`（raw mode 只影响 stdin line discipline，stderr 不在 alt-screen 范围，跨平台通用）；`DesktopSink` 三平台 `cfg(target_os)` 分支：macOS `osascript -e 'display notification ... with title ...'`、Linux `notify-send --app-name=wyj-code`、Windows PowerShell BurntToast（缺失模块静默 fallback）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。
+    - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done,schedule_failure}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::resolve_jev_api_key` 模式）。
+    - **i18n**：title + body 模板统一走 `wyj_i18n::tr("notify.title.*")` / `tr_fmt("notify.body.*")`，模型/工具侧提示词仍为英文常量（CLAUDE.md 「模型侧提示词」节），通知 UI 文案与现有 i18n key 体系一致；`include_session_id=true` 时 body 末尾追加 `[session:<id>]`，总长被 200 字符上限收口（`append_session_id` 内部按 `chars().take(N)` 安全截断）。
+    - **进程级初始化路径**：`cli::main()` 构造 `Config` 后立刻 `wyj_core::notify::init(&cfg.notify)`，TUI/CLI -p/REPL 共享这条；`wyj-code schedule run <id>` 子进程路径在 `schedule_cmd::notify_emit_init_default_if_needed()` 用 `NotifyCfg::default()` 兜底 init（cron 触发不在 `main()` 装配链路里，但因主开关 + desktop 默认开，行为对用户透明）。
 
 ### 权限模型（TUI）
 
