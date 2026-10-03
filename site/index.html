@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.14：统一通知通道（终端响铃 + 桌面通知）。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.15：配置加载收敛到 .wyj-code/。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.14 已公开发布：统一通知通道（终端响铃 + 桌面通知 4 类事件 × 2 类 sink × 7 触发点，TUI/CLI/cron 任务完成与后台子 Agent 完成首次能在 Notification Center 拿到提示）；安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.15 已公开发布：配置加载收敛到 .wyj-code/（全局 + 项目级），不再读取 ~/.claude/、~/.claude.json、&lt;cwd&gt;/.mcp.json、~/.codex/ 等外部源；/import 子命令与 Codex 兼容层同步下线。安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.14</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.15</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.14 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.15 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.14 · 统一通知通道</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.14 首次接入系统级通知：把"任务完成 / 错误 / 后台子 Agent 完成 / cron schedule 失败"4 类事件统一派发到终端响铃（stderr `\x07`）与桌面通知（macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast），用户离开终端时也能在 Notification Center 拿到带项目上下文的提示。新增 `wyj_core::notify` 模块（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免反向依赖循环），覆盖 4 类事件 × 2 类 sink × 7 触发点（实际接入 6 个，ACP/daemon 长跑后端无人类会话上下文故不接）。Config 新增顶层 `[notify]` block（master / bell / desktop / events / rate_limit / include_session_id 全字段 opt-out 默认开，仅 `bell.enabled` opt-in 默认关避扰民；rate_limit 30s 同类事件最小间隔防滥用，0 = 关闭）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`（env 在 init 阶段读取，绝不写回 cfg）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。零新第三方依赖。9 项 notify 单测 + 3 项 config 单测全绿。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.15 · 配置加载收敛到 .wyj-code</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.15 是首个 BREAKING 版本——配置加载路径从"兼容外部"隐性向"独立产品"收敛。wyj-code 自 v1.5.15 起<strong>只</strong>读写 `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级）两个目录，不再读取 `~/.claude/commands/`、`~/.claude/agents/`、`~/.claude.json`、`<cwd>/.mcp.json`、`~/.codex/config.toml` 等任何外部源。Skill 加载链由 6 层裁为 4 层（内置 → `~/.wyj-code/skills` → 插件贡献 → 项目 `~/.wyj-code/skills`），SubAgent 类型链同方向 6 层裁为 4 层；MCP 全局配置 `Config::load()` 不再合并 `~/.claude.json`、项目级 `merged_mcp_servers` 不再读 `<cwd>/.mcp.json`、`uninstall_mcp_server` 删"原生来源 → 落禁用记录"分支统一走"从来源文件删行 + lockfile 移除"路径。<code>/import</code> slash 命令 + TUI `ImportDialog` + `ExtensionCommand::Migrate` + `crates/store/src/import.rs`（700+ 行）+ `crates/config/src/codex.rs`（Codex 兼容层 150+ 行 + 5 个测试）整链路下线——用户跨来源导入需求改为手工复制粘贴到 `.wyj-code/`。同步修复 master 上 pre-existing 的 `resolve_jev_api_key_prefers_field_over_env_when_both_set` 测试失败（拆 3 个测试 + 进程级 `JEV_ENV_LOCK: Mutex<()>` 串行化）；TUI `AgentEvent::TurnDone` 分支增加清扫，把任何遗留 InProgress 的 todo 自动收口为 Completed，根治"AI 已回复但任务列表还显示进行中"的 UI 割裂。CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。1099 个 workspace 测试 + clippy `-D warnings` 全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.14" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.14 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.15" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.15 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -538,8 +538,18 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.14</span>
+          <span class="font-display font-bold text-phosphor">v1.5.15</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1515"><strong class="text-amber-400">配置加载收敛到 .wyj-code/（BREAKING）</strong>：wyj-code 自 v1.5.15 起<strong>只</strong>读写 <code class="text-amber-400">~/.wyj-code/</code>（全局）与 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/</code>（项目级），不再读取 <code class="text-amber-400">~/.claude/commands/</code> / <code class="text-amber-400">~/.claude/agents/</code> / <code class="text-amber-400">~/.claude.json</code> / <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code> / <code class="text-amber-400">~/.codex/</code> 等任何外部源。Skill 加载链由 6 层裁为 4 层（内置 → <code class="text-amber-400">~/.wyj-code/skills</code> → 插件贡献 → 项目 <code class="text-amber-400">~/.wyj-code/skills</code>），SubAgent 类型链同方向 6 层裁为 4 层；MCP 全局 <code class="text-amber-400">Config::load()</code> 不再合并 <code class="text-amber-400">~/.claude.json</code>、项目级 <code class="text-amber-400">merged_mcp_servers</code> 不再读 <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code>、<code class="text-amber-400">uninstall_mcp_server</code> 删"原生来源 → 落禁用记录"分支统一走"从来源文件删行 + lockfile 移除"。<code class="text-amber-400">/import</code> slash 命令 + TUI <code class="text-amber-400">ImportDialog</code> + <code class="text-amber-400">ExtensionCommand::Migrate</code> + <code class="text-amber-400">crates/store/src/import.rs</code>（700+ 行）+ <code class="text-amber-400">crates/config/src/codex.rs</code>（Codex 兼容层 150+ 行 + 5 个测试）整链路下线——用户跨来源导入需求改为手工复制粘贴到 <code class="text-amber-400">.wyj-code/</code>。同步修复 master 上 pre-existing 的 <code class="text-amber-400">resolve_jev_api_key_prefers_field_over_env_when_both_set</code> 测试失败（拆 3 个测试 + 进程级 <code class="text-amber-400">JEV_ENV_LOCK: Mutex&lt;()&gt;</code> 串行化）；TUI <code class="text-amber-400">AgentEvent::TurnDone</code> 分支增加清扫，把任何遗留 InProgress 的 todo 自动收口为 Completed，根治"AI 已回复但任务列表还显示进行中"的 UI 割裂。CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。1099 个 workspace 测试 + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.14</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1514"><strong class="text-amber-400">统一通知通道</strong>：新增 <code class="text-amber-400">wyj_core::notify</code>（从 <code class="text-amber-400">wyj_cli::notify</code> 上迁到 <code class="text-amber-400">wyj_core</code> 供 TUI + CLI 双向共用，避免 <code class="text-amber-400">wyj-cli</code>/<code class="text-amber-400">wyj-tui</code> 之间的反向依赖循环），覆盖 4 类事件（<code class="text-amber-400">TurnFinished</code>/<code class="text-amber-400">TurnError</code>/<code class="text-amber-400">SubAgentDone</code>/<code class="text-amber-400">ScheduleFailed</code>）× 2 类 sink（<code class="text-amber-400">BellSink</code> stderr <code class="text-amber-400">\x07</code> 跨平台通用 / <code class="text-amber-400">DesktopSink</code> macOS <code class="text-amber-400">osascript</code> + Linux <code class="text-amber-400">notify-send</code> + Windows PowerShell BurntToast），6/7 触发点已接入（TUI TurnDone / TUI Error / TUI 后台 SubAgentDone / CLI <code class="text-amber-400">-p</code> / CLI <code class="text-amber-400">--headless</code> REPL / cron schedule 失败；ACP/daemon 长跑后端无人类会话上下文故故意不接）。Config 顶层 <code class="text-amber-400">[notify]</code> block（<code class="text-amber-400">enabled</code>/<code class="text-amber-400">bell.enabled</code>/<code class="text-amber-400">desktop.enabled</code>/<code class="text-amber-400">events.*</code>/<code class="text-amber-400">rate_limit_seconds</code>/<code class="text-amber-400">include_session_id</code>，<code class="text-amber-400">bell.enabled</code> opt-in 默认关避扰民其余全部 opt-out 默认开，<code class="text-amber-400">rate_limit_seconds=30</code> 同类事件最小间隔防滥用）。env override 最小集 <code class="text-amber-400">WYJ_CODE_NOTIFY_OFF/BELL/DESKTOP</code>——env 在 init 阶段读取，<strong>绝不</strong>写回 cfg（沿用 <code class="text-amber-400">Config::resolve_jev_api_key</code> 模式）。所有 sink 失败 swallow + 首次失败 <code class="text-amber-400">tracing::debug!</code> 一次（<code class="text-amber-400">OnceLock</code> 防洪水）。<code class="text-amber-400">include_session_id=true</code> 时 body 末尾追加 <code class="text-amber-400">[session:&lt;id&gt;]</code>，总长被 200 字符上限收口。零新第三方依赖。9 项 notify 单测 + 3 项 config 单测全绿。</p>
       </div>
