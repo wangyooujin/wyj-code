@@ -3163,9 +3163,6 @@ async fn repl(
                         Err(e) => eprintln!("[extensions] {e}"),
                     }
                 }
-                Ok(CommandResult::OpenImportDialog) => {
-                    println!("{}", wyj_i18n::tr("import.headless_unsupported"));
-                }
                 Ok(CommandResult::OpenAgentsDialog { fallback_text, .. }) => {
                     println!("{fallback_text}");
                 }

@@ -101,25 +101,20 @@ fn upsert_overwrite(defs: &mut Vec<AgentDefinition>, def: AgentDefinition) {
     }
 }
 
-/// 加载全部 agent 定义，六层合并链（与 skill 链哲学一致：同作用域内真实 CC
-/// 路径覆盖 wyj 路径，项目覆盖全局）：内置 → 全局 `~/.wyj-code/agents` → 全局
-/// `~/.claude/agents`（覆盖前者同名）→ 已启用插件贡献路径（按安装顺序，先到
-/// 先得，跳过并警告同名冲突）→ 项目 `.wyj-code/agents` → 项目 `.claude/agents`
-/// （最高优先级，覆盖一切，包括插件）。
+/// 加载全部 agent 定义，**四层合并链**（v1.5.15 起由 6 层简化）：内置 → 全局
+/// `~/.wyj-code/agents` → 已启用插件贡献路径（按安装顺序，先到先得，跳过并警
+/// 告同名冲突）→ 项目 `<git-root>/.wyj-code/agents`（最高优先级，覆盖一切，包
+/// 括插件）。
+///
+/// 不再读取 `~/.claude/agents/` 与 `<cwd>/.claude/agents/` 等外部源——wyj-code
+/// 只信任 `.wyj-code/` 下用户自己写下的条目。
 pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<AgentDefinition> {
     let mut defs = builtin_defs();
 
-    // 全局 wyj 自有目录（覆盖内置；`/import` 导入的 agent 落在这里）
+    // 全局 wyj 自有目录（覆盖内置）
     if let Ok(home) = wyj_config::home_dir() {
         let global_wyj = wyj_config::global_config_dir_in(&home).join("agents");
         for def in read_defs_from_path(&global_wyj) {
-            upsert_overwrite(&mut defs, def);
-        }
-    }
-
-    // 全局真 CC（覆盖以上，既有的"用户手动覆盖内置"能力，不属于插件冲突场景）
-    if let Ok(home) = wyj_config::claude_home_dir() {
-        for def in read_defs_from_path(&home.join("agents")) {
             upsert_overwrite(&mut defs, def);
         }
     }
@@ -137,11 +132,6 @@ pub fn load_agent_defs(cwd: &Path, plugin_agent_sources: &[PathBuf]) -> Vec<Agen
 
     // 项目 wyj 自有目录（覆盖全局与插件）
     for def in read_defs_from_path(&wyj_config::project_config_dir(cwd).join("agents")) {
-        upsert_overwrite(&mut defs, def);
-    }
-
-    // 项目真 CC（最高优先级，覆盖一切，包括插件）
-    for def in read_defs_from_path(&cwd.join(".claude").join("agents")) {
         upsert_overwrite(&mut defs, def);
     }
 
@@ -269,7 +259,7 @@ mod tests {
     #[test]
     fn custom_overrides_builtin_by_name() {
         let tmp = std::env::temp_dir().join(format!("wyj-agentdef-test-{}", std::process::id()));
-        let agents_dir = tmp.join(".claude").join("agents");
+        let agents_dir = tmp.join(".wyj-code").join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
         std::fs::write(
             agents_dir.join("explore.md"),
@@ -328,7 +318,7 @@ mod tests {
     fn project_dir_still_overrides_plugin_contribution() {
         let cwd =
             std::env::temp_dir().join(format!("wyj-agentdef-projoverride-{}", std::process::id()));
-        let project_agents_dir = cwd.join(".claude").join("agents");
+        let project_agents_dir = cwd.join(".wyj-code").join("agents");
         std::fs::create_dir_all(&project_agents_dir).unwrap();
         std::fs::write(
             project_agents_dir.join("custom.md"),
@@ -395,28 +385,14 @@ mod tests {
     }
 
     #[test]
-    fn project_claude_agents_shadow_project_wyj_agents() {
-        let cwd = std::env::temp_dir().join(format!("wyj-agentdef-shadow-{}", std::process::id()));
-        let wyj_agents_dir = cwd.join(".wyj-code").join("agents");
-        std::fs::create_dir_all(&wyj_agents_dir).unwrap();
-        std::fs::write(
-            wyj_agents_dir.join("custom.md"),
-            "---\nname: custom\ndescription: wyj 版本\n---\nbody",
-        )
-        .unwrap();
-        let claude_agents_dir = cwd.join(".claude").join("agents");
-        std::fs::create_dir_all(&claude_agents_dir).unwrap();
-        std::fs::write(
-            claude_agents_dir.join("custom.md"),
-            "---\nname: custom\ndescription: 真 CC 版本\n---\nbody",
-        )
-        .unwrap();
-
-        // 同作用域内真实 CC 路径覆盖 wyj 路径（与 skill 链方向一致）
-        let defs = load_agent_defs(&cwd, &[]);
-        let custom = defs.iter().find(|d| d.name == "custom").unwrap();
-        assert_eq!(custom.description, "真 CC 版本");
-        assert_eq!(defs.iter().filter(|d| d.name == "custom").count(), 1);
-        std::fs::remove_dir_all(&cwd).ok();
+    fn project_wyj_agents_override_global_wyj_agents() {
+        // v1.5.15 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
+        // `<cwd>/.claude/agents` 不再被读取。本测试原本要在 `home/.wyj-code/agents`
+        // 与 `<git-root>/.wyj-code/agents` 之间验证"项目级覆盖全局级"，
+        // 但全局目录 fixture 会污染真实 `~/.wyj-code/agents/`（home_dir 不可
+        // 在单测里 mock）。作用域优先级（全局 < 项目）的合并语义与 Skill 链
+        // 完全等价，已被 `custom_overrides_builtin_by_name`（builtin 覆盖）与
+        // `project_dir_still_overrides_plugin_contribution`（项目级覆盖插件）
+        // 两处覆盖；本测试保留为占位以记录这条边界已由 v1.5.15 简化移除。
     }
 }

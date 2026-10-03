@@ -3194,27 +3194,14 @@ impl McpDialog {
         let merged = wyj_config::merged_mcp_servers(cfg, cwd);
         let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
         let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
-        // `.mcp.json` 和 `.wyj-code/mcp.toml` 都是项目级文件（都挂在 cwd 下），
-        // 两者任一命中都应该算 Project scope——只查 load_project_mcp 会把
-        // `.mcp.json` 里的条目错误分类成 Global，卸载时就会把"禁用"记录写进
-        // 全局 lockfile 而不是项目 lockfile，下次刷新用项目 lockfile 再查一遍
-        // 就对不上，条目又变回"启用"。
+        // 项目级来源只剩 `<git-root>/.wyj-code/mcp.toml` 一个（v1.5.15 起不再
+        // 读取 `<cwd>/.mcp.json`），所以 Project scope 直接由 `load_project_mcp`
+        // 判定。
         let project_names: std::collections::HashSet<String> = wyj_config::load_project_mcp(cwd)
             .unwrap_or_default()
             .into_iter()
             .map(|s| s.name)
-            .chain(
-                wyj_config::load_native_mcp(&cwd.join(".mcp.json"))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| s.name),
-            )
             .collect();
-        // `~/.claude.json`/`.mcp.json` 原生条目卸载不掉磁盘上那一行（不是
-        // wyj-code 自己的文件），`uninstall_mcp_server` 对这类名字只能落成
-        // "禁用"；这里把"原生 + 已禁用"的条目从已安装列表里过滤掉，让卸载在
-        // 用户看来和真删除没有区别（见 `native_mcp_names` 文档）。
-        let native_names = wyj_config::native_mcp_names(cwd);
 
         let installed = merged
             .into_iter()
@@ -3237,13 +3224,11 @@ impl McpDialog {
                         .cloned(),
                 };
                 let enabled = managed.as_ref().map(|m| m.enabled).unwrap_or(true);
-                // 只隐藏"原生来源 + 已禁用 + 非真正受管理"的条目：如果这个名字
-                // 恰好同时是 wyj 自己 registry 安装过的（`is_managed()`），说明
-                // 用户是在对一个真实受管理的 server 走正常的禁用/启用流程，不
-                // 能把它当成"卸载不掉、只能藏起来"的原生条目一并隐藏——否则会
-                // 把一个可以正常重新启用的 server 藏得找不回来。
+                // 隐藏"已禁用 + 非真正受管理"的条目：受管理的 server
+                // （`is_managed()`）走正常禁用/启用流程要能在列表里找回，
+                // 不能被一并隐藏。
                 let is_managed = managed.as_ref().is_some_and(|m| m.is_managed());
-                if native_names.contains(&config.name) && !enabled && !is_managed {
+                if !enabled && !is_managed {
                     return None;
                 }
                 Some(McpInstalledRow {
@@ -6174,110 +6159,6 @@ impl ExtensionsDialog {
     }
 }
 
-/// `/import` 面板阶段：勾选中 → 已应用（展示结果报告）。
-pub enum ImportStage {
-    Selecting,
-    Report(wyj_store::import::ImportOutcome),
-}
-
-/// 一键导入面板（/import）：扫描 Codex / Claude Code 配置 → 勾选 → 写入。
-/// 多选交互照 `AskQuestionDialog` 的 Multi 模式（Space 勾选，`checked` 存下标）。
-pub struct ImportDialog {
-    targets: wyj_store::import::ImportTargets,
-    pub candidates: Vec<wyj_store::import::ImportCandidate>,
-    pub scan_errors: Vec<String>,
-    pub cursor: usize,
-    pub checked: BTreeSet<usize>,
-    pub stage: ImportStage,
-    pub error: Option<String>,
-}
-
-impl ImportDialog {
-    pub fn new(cwd: &Path) -> Self {
-        let mut dialog = Self {
-            targets: wyj_store::import::ImportTargets {
-                home: PathBuf::new(),
-                global_config_path: PathBuf::new(),
-                global_skills_dir: PathBuf::new(),
-                global_agents_dir: PathBuf::new(),
-                cwd: cwd.to_path_buf(),
-            },
-            candidates: Vec::new(),
-            scan_errors: Vec::new(),
-            cursor: 0,
-            checked: BTreeSet::new(),
-            stage: ImportStage::Selecting,
-            error: None,
-        };
-        match wyj_store::import::ImportTargets::from_real_home(cwd) {
-            Ok(targets) => dialog.targets = targets,
-            Err(e) => {
-                dialog.error = Some(e.to_string());
-                return dialog;
-            }
-        }
-        match wyj_store::import::scan_importable(
-            &dialog.targets,
-            wyj_store::import::ImportFilter::All,
-        ) {
-            Ok(scan) => {
-                dialog.candidates = scan.candidates;
-                dialog.scan_errors = scan.errors;
-                // 默认勾选全部无冲突项；冲突项（勾选即覆盖）需用户显式选中
-                dialog.checked = dialog
-                    .candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| c.conflict.is_none())
-                    .map(|(i, _)| i)
-                    .collect();
-            }
-            Err(e) => dialog.error = Some(e.to_string()),
-        }
-        dialog
-    }
-
-    pub fn move_cursor(&mut self, delta: i32) {
-        if self.candidates.is_empty() {
-            self.cursor = 0;
-            return;
-        }
-        let next = self.cursor as i32 + delta;
-        self.cursor = next.clamp(0, self.candidates.len() as i32 - 1) as usize;
-    }
-
-    pub fn toggle(&mut self) {
-        if self.candidates.is_empty() {
-            return;
-        }
-        if !self.checked.remove(&self.cursor) {
-            self.checked.insert(self.cursor);
-        }
-    }
-
-    /// `a`：已全选则清空，否则全选。
-    pub fn toggle_all(&mut self) {
-        if self.checked.len() == self.candidates.len() {
-            self.checked.clear();
-        } else {
-            self.checked = (0..self.candidates.len()).collect();
-        }
-    }
-
-    /// Enter：把勾选项写入 wyj 配置，进入报告阶段。
-    pub fn apply(&mut self) {
-        let selected: Vec<wyj_store::import::ImportCandidate> = self
-            .checked
-            .iter()
-            .filter_map(|&i| self.candidates.get(i).cloned())
-            .collect();
-        match wyj_store::import::apply_import(&self.targets, &selected) {
-            Ok(outcome) => self.stage = ImportStage::Report(outcome),
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-}
-
 /// 全局 UI 状态
 pub struct AppState {
     pub messages: Vec<ChatMessage>,
@@ -6387,8 +6268,6 @@ pub struct AppState {
     pub agents_dialog: Option<AgentsDialog>,
     /// 统一 Skill/MCP/Plugin 资源面板（/extensions 命令触发时 Some）
     pub extensions_dialog: Option<ExtensionsDialog>,
-    /// 一键导入面板（/import 命令触发时 Some）
-    pub import_dialog: Option<ImportDialog>,
     /// 定时任务面板（/schedule 命令触发时 Some）
     pub schedule_dialog: Option<ScheduleDialog>,
     /// 标记当前轮次完成后需保存 session 文件
@@ -6537,7 +6416,6 @@ impl AppState {
             plugins_dialog: None,
             agents_dialog: None,
             extensions_dialog: None,
-            import_dialog: None,
             schedule_dialog: None,
             save_needed: false,
             config,
@@ -6609,7 +6487,6 @@ impl AppState {
         self.todo_execution_logs.clear();
         self.agents_dialog = None;
         self.extensions_dialog = None;
-        self.import_dialog = None;
         self.pending_attachments.clear();
         self.current_op = None;
         self.turn_start_time = None;
@@ -7399,6 +7276,27 @@ impl AppState {
                 self.turns += 1;
                 self.save_needed = true;
                 self.injector = None;
+                // 回合已正常结束（`stop_reason != tool_use`，模型已产出最终回答）：
+                // 任何仍处于 InProgress 的 todo 都视为已完成。否则 UI 会卡在
+                // "[N/N] ⋯ xxx" 这种永远不收口的"进行中"状态（即便 todo_stats
+                // 不再累加耗时，已渲染行的状态字段读不到 Completed 也会显示 ⋯），
+                // 直到下一次 TodoWrite 才有机会刷新——而很多模型会在最后一次回答
+                // 里直接出最终输出，不再调用一次 TodoWrite 把最后一项标 completed，
+                // 于是用户看到"AI 已回完，但任务列表还显示进行中"的割裂感。
+                // 走与 TodoUpdate handler 里 was_in_progress → not_in_progress 同款
+                // started_at → elapsed_secs 收口，统计数字保持连续。
+                if let Some(items) = self.current_todos.as_mut() {
+                    for item in items.iter_mut() {
+                        if item.status == TodoStatus::InProgress {
+                            item.status = TodoStatus::Completed;
+                            if let Some(s) = self.todo_stats.get_mut(&item.id) {
+                                if let Some(start) = s.started_at.take() {
+                                    s.elapsed_secs += start.elapsed().as_secs_f64();
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(start) = self.turn_start_time.take() {
                     let elapsed = start.elapsed().as_secs_f64();
                     let d_in = self
@@ -11720,40 +11618,6 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ⓪.59 一键导入面板拦截（/import 命令触发）
-                    if let Some(dialog) = &mut state.import_dialog {
-                        let in_report = matches!(dialog.stage, ImportStage::Report(_));
-                        match key.code {
-                            KeyCode::Esc => state.import_dialog = None,
-                            _ if in_report => {
-                                // 报告阶段：任意确认键关闭
-                                if matches!(key.code, KeyCode::Enter | KeyCode::Char('q')) {
-                                    state.import_dialog = None;
-                                }
-                            }
-                            KeyCode::Up => dialog.move_cursor(-1),
-                            KeyCode::Down => dialog.move_cursor(1),
-                            KeyCode::Char(' ') => dialog.toggle(),
-                            KeyCode::Char('a') => dialog.toggle_all(),
-                            KeyCode::Enter if !dialog.checked.is_empty() => {
-                                let count = dialog.checked.len();
-                                dialog.apply();
-                                if matches!(dialog.stage, ImportStage::Report(_)) {
-                                    // 写入成功：刷新内存配置，提示生效边界
-                                    if let Ok(cfg) = Config::load() {
-                                        state.config = cfg;
-                                    }
-                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
-                                        "import.applied_notice",
-                                        &[("count", &count.to_string())],
-                                    )));
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
                     // ⓪.58 可用 Agent 类型面板拦截（/agents 命令触发）
                     if state.agents_dialog.is_some() {
                         state.ui_focus = UiFocus::AgentsCatalog;
@@ -13809,9 +13673,6 @@ async fn tui_main(
                                         state.extensions_dialog =
                                             Some(ExtensionsDialog::new(&state.cwd));
                                     }
-                                    Ok(CommandResult::OpenImportDialog) => {
-                                        state.import_dialog = Some(ImportDialog::new(&state.cwd));
-                                    }
                                     Ok(CommandResult::OpenAgentsDialog { defs, .. }) => {
                                         state.agents_dialog = Some(AgentsDialog::new(defs));
                                         state.ui_focus = UiFocus::AgentsCatalog;
@@ -15121,6 +14982,62 @@ mod todo_stats_tests {
         assert!(state.todo_execution_logs.is_empty());
     }
 
+    /// 回合正常结束时（`stop_reason != tool_use`，模型已产出最终回答），
+    /// 任何仍处 InProgress 的 todo 都必须自动改为 Completed 并把
+    /// `started_at` 累加进 `elapsed_secs`——否则会卡在"AI 已回完但任务列表
+    /// 还显示进行中"的 UI 割裂状态（典型场景：模型最后一轮直接出最终回答，
+    /// 不再调用一次 TodoWrite 收尾）。
+    #[test]
+    fn turn_done_auto_completes_remaining_in_progress_todos() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+            todo("c", TodoStatus::InProgress),
+        ]));
+        // 模拟 c 已积累一段 in_progress 耗时
+        let c_started = state.todo_stats.get("c").and_then(|s| s.started_at);
+        assert!(c_started.is_some(), "InProgress todo 必须有 started_at");
+
+        state.apply_agent_event(AgentEvent::TurnDone);
+
+        let items = state
+            .current_todos
+            .as_deref()
+            .expect("TurnDone 不应清空 current_todos");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::Completed);
+        assert_eq!(
+            items[2].status,
+            TodoStatus::Completed,
+            "TurnDone 必须把遗留的 InProgress 改为 Completed"
+        );
+        let c_stats = state.todo_stats.get("c").expect("c 的 stats 必须保留");
+        assert!(
+            c_stats.started_at.is_none(),
+            "started_at 必须在 Completed 时被 take 掉，否则 elapsed_secs 会被双重计算"
+        );
+        assert!(
+            c_stats.elapsed_secs > 0.0,
+            "elapsed_secs 必须把 started_at 段累加进来"
+        );
+    }
+
+    /// TurnDone 在没有遗留 InProgress 时 no-op：不丢失数据、不修改已完成项。
+    #[test]
+    fn turn_done_with_no_in_progress_keeps_state_untouched() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+        ]));
+        state.apply_agent_event(AgentEvent::TurnDone);
+        let items = state.current_todos.as_deref().unwrap();
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(items[1].status, TodoStatus::Completed);
+    }
+
     #[test]
     fn active_todo_captures_tool_execution_messages() {
         let mut state = make_state();
@@ -15285,41 +15202,40 @@ mod evolution_dialog_tests {
 mod mcp_dialog_tests {
     use super::*;
 
-    /// 回归测试：`.mcp.json` 原生来源的 server 被"卸载"后（内部落成禁用，见
-    /// `wyj_store::mcp_install::uninstall_mcp_server` 文档——wyj-code 没法删
-    /// 掉不属于自己的 `.mcp.json` 那一行），应该从 `/mcp` 面板"已安装"列表里
-    /// 消失，用户看不出跟真正卸载有什么区别。修复前：uninstall 只是清空
-    /// lockfile 记录，`managed` 变回 `None` 后 UI 默认按"启用"处理，
-    /// `merged_mcp_servers` 又会把它从 `.mcp.json` 重新合并回来，条目卡在
-    /// 列表里赶不走。
+    /// 回归测试：wyj 自己项目级来源（`<git-root>/.wyj-code/mcp.toml`）的
+    /// server 被卸载后（v1.5.15 起走"从来源文件删行 + lockfile 移除"统一
+    /// 逻辑，不再有原生来源的"禁用 shadow"兜底分支），应该从 `/mcp` 面板
+    /// "已安装"列表里消失。
     #[test]
-    fn uninstalled_native_server_disappears_from_installed_list() {
+    fn uninstalled_wyj_project_server_disappears_from_installed_list() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(".mcp.json"),
-            r#"{"mcpServers": {"native-srv": {"command": "npx", "args": ["-y", "native-srv-mcp"]}}}"#,
+        wyj_config::save_project_mcp(
+            dir.path(),
+            &[wyj_config::McpServerConfig {
+                name: "wyj-srv".to_string(),
+                transport: wyj_config::McpTransport::Stdio,
+                command: Some("npx".to_string()),
+                args: vec!["-y".to_string(), "wyj-srv-mcp".to_string()],
+                env: Default::default(),
+                url: None,
+                headers: Default::default(),
+            }],
         )
         .unwrap();
 
         let cfg = Config::default();
         let dialog = McpDialog::new(&cfg, dir.path());
-        assert!(dialog
-            .installed
-            .iter()
-            .any(|r| r.config.name == "native-srv"));
+        assert!(dialog.installed.iter().any(|r| r.config.name == "wyj-srv"));
 
         wyj_store::mcp_install::uninstall_mcp_server(
-            "native-srv",
+            "wyj-srv",
             wyj_store::InstallScope::Project,
             dir.path(),
         )
         .unwrap();
 
         let dialog = McpDialog::new(&cfg, dir.path());
-        assert!(!dialog
-            .installed
-            .iter()
-            .any(|r| r.config.name == "native-srv"));
+        assert!(!dialog.installed.iter().any(|r| r.config.name == "wyj-srv"));
     }
 
     /// 回归测试：真正 wyj 自己 registry 安装、受 lockfile 管理的 server，
