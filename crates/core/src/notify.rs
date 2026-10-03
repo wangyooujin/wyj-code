@@ -15,8 +15,8 @@
 //! 1. TUI `apply_agent_event(TurnDone)` — `crates/tui/src/app.rs:7394` 之后
 //! 2. TUI `apply_agent_event(Error)` — `crates/tui/src/app.rs:7416` 之后
 //! 3. TUI 后台子 Agent `SubAgentDone` — `crates/tui/src/app.rs:8052` 之后
-//! 4. CLI `-p` 单回合完成 — `crates/cli/src/main.rs:1905` 之前
-//! 5. CLI headless REPL 回合完成 — `crates/cli/src/main.rs:3209` 之后
+//! 4. CLI `-p` 单回合完成 — `crates/cli/src/main.rs` 内 `RuntimeCommand::Prompt` 路径
+//! 5. CLI headless REPL 回合完成 — `crates/cli/src/main.rs` 内 `--headless` 循环
 //! 6. Daemon ACP 回合完成 — **故意不接**（daemon 无人值守，参见 CLAUDE.md [notify]）
 //! 7. cron schedule 任务失败 — `crates/cli/src/schedule_cmd.rs:267/292/299`
 //!
@@ -430,6 +430,7 @@ fn windows_send(payload: &NotificationPayload) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
+    use wyj_config::NotifyEventsCfg;
 
     /// 全局 DISPATCHER 是进程级单例，cargo test 默认并行跑测试会让多个测试
     /// 互相覆盖对方的 cfg + sink，导致测试结果依赖运气。
@@ -511,8 +512,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec = RecordingSink::new(0);
         let sinks: Vec<Box<dyn NotificationSink>> = vec![Box::new(rec.clone())];
-        let mut cfg = NotifyCfg::default();
-        cfg.enabled = false;
+        let cfg = NotifyCfg {
+            enabled: false,
+            ..NotifyCfg::default()
+        };
         init_with_sinks(&cfg, sinks);
         emit(NotificationEvent::TurnFinished {
             duration_ms: 100,
@@ -527,8 +530,13 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec = RecordingSink::new(0);
         let sinks: Vec<Box<dyn NotificationSink>> = vec![Box::new(rec.clone())];
-        let mut cfg = NotifyCfg::default();
-        cfg.events.subagent_done = false;
+        let cfg = NotifyCfg {
+            events: NotifyEventsCfg {
+                subagent_done: false,
+                ..NotifyEventsCfg::default()
+            },
+            ..NotifyCfg::default()
+        };
         init_with_sinks(&cfg, sinks);
         emit(NotificationEvent::SubAgentDone {
             agent_id: "a1".to_string(),
@@ -549,8 +557,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec = RecordingSink::new(0);
         let sinks: Vec<Box<dyn NotificationSink>> = vec![Box::new(rec.clone())];
-        let mut cfg = NotifyCfg::default();
-        cfg.rate_limit_seconds = 60;
+        let cfg = NotifyCfg {
+            rate_limit_seconds: 60,
+            ..NotifyCfg::default()
+        };
         init_with_sinks(&cfg, sinks);
         // 两次同 kind 在 60s 内：第二次应被吞掉
         emit(NotificationEvent::TurnFinished {
@@ -572,8 +582,10 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec = RecordingSink::new(0);
         let sinks: Vec<Box<dyn NotificationSink>> = vec![Box::new(rec.clone())];
-        let mut cfg = NotifyCfg::default();
-        cfg.rate_limit_seconds = 0;
+        let cfg = NotifyCfg {
+            rate_limit_seconds: 0,
+            ..NotifyCfg::default()
+        };
         init_with_sinks(&cfg, sinks);
         emit(NotificationEvent::TurnFinished {
             duration_ms: 1,

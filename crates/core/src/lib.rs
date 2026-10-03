@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod interfaces;
 pub mod memory;
 pub mod memory_v3;
+pub mod notify;
 pub mod permission;
 pub mod project;
 pub mod prompts;

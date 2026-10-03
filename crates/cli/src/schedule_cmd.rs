@@ -13,7 +13,7 @@ use tokio::process::Command;
 use wyj_store::cron_sync;
 use wyj_store::schedule::{self, RunStatus, SchedulePermissions};
 
-use crate::notify::{emit as notify_emit, NotificationEvent};
+use wyj_core::notify::{emit as notify_emit, NotificationEvent};
 
 /// 读取当前用户 storage 配置(失败回退 default,避免阻塞 schedule 执行)。
 /// schedule run 由系统 crontab 触发,headless 环境下不应因 config 解析失败
@@ -331,7 +331,7 @@ fn notify_emit_init_default_if_needed() {
     if std::env::var("WYJ_CODE_NOTIFY_OFF").ok().as_deref() == Some("1") {
         return;
     }
-    crate::notify::init(&crate::notify::NotifyCfg::default());
+    wyj_core::notify::init(&wyj_core::notify::NotifyCfg::default());
 }
 
 fn prepare_log_file(id: &str, cfg: &wyj_config::StorageRetentionCfg) -> Result<PathBuf> {

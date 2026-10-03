@@ -21,7 +21,6 @@ mod acp;
 mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
-mod notify;
 mod review_cmd;
 mod schedule_cmd;
 mod storage_cmd;
@@ -761,7 +760,7 @@ async fn main() -> Result<()> {
     let mut cfg = Config::load()?;
     // 统一通知通道 init（fail-safe：未 init 时 emit 是 no-op；env WYJ_CODE_NOTIFY_OFF
     // 全关；first-wins 多次 init 后续无效）
-    notify::init(&cfg.notify);
+    wyj_core::notify::init(&cfg.notify);
     let lang = cfg
         .language
         .clone()
@@ -1914,12 +1913,12 @@ async fn main() -> Result<()> {
         .await;
         // 统一通知：CLI -p 回合完成 / 错误
         match &turn_result {
-            Ok(()) => notify::emit(notify::NotificationEvent::TurnFinished {
+            Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
                 duration_ms: started.elapsed().as_millis() as u64,
                 summary: format!("-p ({turns} msgs)"),
                 session_id: Some(session_id.clone()),
             }),
-            Err(e) => notify::emit(notify::NotificationEvent::TurnError {
+            Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
                 error: e.to_string(),
                 session_id: Some(session_id.clone()),
             }),
@@ -3225,12 +3224,12 @@ async fn repl(
         .await;
         // 统一通知：headless REPL 回合完成 / 错误
         match &run_result {
-            Ok(()) => notify::emit(notify::NotificationEvent::TurnFinished {
+            Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
                 duration_ms: started.elapsed().as_millis() as u64,
                 summary: format!("repl (turn {turns})"),
                 session_id: Some(session_id.clone()),
             }),
-            Err(e) => notify::emit(notify::NotificationEvent::TurnError {
+            Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
                 error: e.to_string(),
                 session_id: Some(session_id.clone()),
             }),
