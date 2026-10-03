@@ -297,19 +297,6 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         }
     }
 
-    for file in native_mcp_candidates(cwd) {
-        if file.exists() {
-            issues.push(DoctorIssue {
-                code: "migration_available".to_string(),
-                severity: "info".to_string(),
-                message: format!("native MCP configuration found at {}", file.display()),
-                remediation: Some(
-                    "run `wyj-code extensions migrate` after reviewing the import".to_string(),
-                ),
-            });
-        }
-    }
-
     Ok(DoctorReport {
         schema_version: EXTENSIONS_SCHEMA_VERSION,
         cwd: cwd.to_path_buf(),
@@ -390,14 +377,6 @@ fn configured_mcp_servers(cwd: &Path) -> Result<Vec<(InstallScope, McpServerConf
     Ok(servers)
 }
 
-fn native_mcp_candidates(cwd: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![cwd.join(".mcp.json")];
-    if let Ok(home) = wyj_config::home_dir() {
-        paths.push(home.join(".claude.json"));
-    }
-    paths
-}
-
 pub fn now() -> chrono::DateTime<Utc> {
     Utc::now()
 }
@@ -411,20 +390,5 @@ mod tests {
         assert_eq!(parse_id("mcp:postgres").unwrap().0, ExtensionKind::Mcp);
         assert!(parse_id("unknown:x").is_err());
         assert!(parse_id("mcp:").is_err());
-    }
-
-    #[test]
-    fn reads_native_stdio_and_http_servers() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".mcp.json");
-        std::fs::write(
-            &path,
-            r#"{"mcpServers":{"local":{"command":"node","args":["server.js"]},"remote":{"url":"https://example.test/mcp","headers":{"Authorization":"${TOKEN}"}}}}"#,
-        )
-        .unwrap();
-        let servers = wyj_config::load_native_mcp(&path).unwrap();
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].transport, McpTransport::Stdio);
-        assert_eq!(servers[1].transport, McpTransport::StreamableHttp);
     }
 }

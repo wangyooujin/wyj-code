@@ -1,14 +1,17 @@
 //! 项目级 MCP server 信任确认。
 //!
-//! `.wyj-code/mcp.toml`/`<cwd>/.mcp.json` 里的 `command`/`args` 会被当作子
-//! 进程直接执行，且随 `git clone` 一起落地——克隆一个陌生仓库、或者给这个
-//! 仓库配了 `wyj-code schedule` 定时任务，都可能在用户没意识到的情况下
-//! 静默执行仓库自带的任意命令。本模块只覆盖"项目级来源"的 server（不含
-//! 全局 `~/.wyj-code/config.toml` 的 `[[mcp_servers]]`，那是用户自己机器上
-//! 的配置，天然可信），要求用户在首次连接前显式批准一次；批准记录必须落在
-//! 仓库内容控制不到的位置——`~/.wyj-code/projects/<project_key>/`（与既有
-//! `allowed_tools.json` 同级），否则被信任的仓库自己就能在同一个受版本控制
-//! 的文件里悄悄把"已批准"标记也改掉，形同虚设。
+//! `<git-root>/.wyj-code/mcp.toml` 里的 `command`/`args` 会被当作子进程直接执行，
+//! 且随 `git clone` 一起落地——克隆一个陌生仓库、或者给这个仓库配了 `wyj-code
+//! schedule` 定时任务，都可能在用户没意识到的情况下静默执行仓库自带的任意命
+//! 令。本模块只覆盖"项目级来源"的 server（不含全局 `~/.wyj-code/config.toml`
+//! 的 `[[mcp_servers]]`，那是用户自己机器上的配置，天然可信），要求用户在首
+//! 次连接前显式批准一次；批准记录必须落在仓库内容控制不到的位置——
+//! `~/.wyj-code/projects/<project_key>/`（与既有 `allowed_tools.json` 同级），
+//! 否则被信任的仓库自己就能在同一个受版本控制的文件里悄悄把"已批准"标记也
+//! 改掉，形同虚设。
+//!
+//! 自 v1.5.15 起不再读取 `<cwd>/.mcp.json` 等"原生"配置——wyj-code 只读
+//! `<git-root>/.wyj-code/mcp.toml` 一个项目级来源。
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -34,26 +37,13 @@ pub enum TrustStatus {
     Pending(Vec<McpServerConfig>),
 }
 
-/// 只合并"项目级来源"的 MCP server：`.wyj-code/mcp.toml` + `<cwd>/.mcp.json`
-/// （同名后者覆盖，与 `wyj_config::merged_mcp_servers` 里项目侧的合并顺序一致），
-/// 不含全局 `config.toml` 的 server。
+/// 只读 `<git-root>/.wyj-code/mcp.toml` 一个项目级来源——不再合并
+/// `<cwd>/.mcp.json` 等"原生"配置（v1.5.15 起）。
 fn project_scoped_mcp_servers(cwd: &Path) -> Vec<McpServerConfig> {
-    let mut merged = wyj_config::load_project_mcp(cwd).unwrap_or_else(|e| {
+    wyj_config::load_project_mcp(cwd).unwrap_or_else(|e| {
         tracing::warn!("加载项目级 MCP 配置失败，忽略: {e}");
         Vec::new()
-    });
-    let native_path = cwd.join(".mcp.json");
-    for native_server in wyj_config::load_native_mcp(&native_path).unwrap_or_else(|e| {
-        tracing::warn!("加载原生项目 MCP 配置失败，忽略: {e}");
-        Vec::new()
-    }) {
-        if let Some(existing) = merged.iter_mut().find(|s| s.name == native_server.name) {
-            *existing = native_server;
-        } else {
-            merged.push(native_server);
-        }
-    }
-    merged
+    })
 }
 
 /// 对项目级来源的 server 列表计算指纹：按 name 排序后规范序列化再 sha256，

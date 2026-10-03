@@ -6,13 +6,10 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub mod codex;
 pub mod project_mcp;
 pub mod project_settings;
-pub use codex::{codex_home_dir, load_codex_mcp};
 pub use project_mcp::{
-    load_native_mcp, load_project_mcp, merged_mcp_servers, native_mcp_names, project_mcp_path,
-    save_project_mcp, ProjectMcpConfig,
+    load_project_mcp, merged_mcp_servers, project_mcp_path, save_project_mcp, ProjectMcpConfig,
 };
 pub use project_settings::{
     load_project_settings, project_settings_path, save_project_settings, ProjectSettings,
@@ -1154,8 +1151,11 @@ impl Config {
 }
 
 impl Config {
-    /// 加载配置：先读文件（含旧格式一次性迁移），再合并 `~/.claude.json` 的原生
-    /// MCP 配置，最后用环境变量覆盖激活分组的 api_key。
+    /// 加载配置：先读 `~/.wyj-code/config.toml` 文件本体（含旧格式一次性迁移），
+    /// 再用环境变量覆盖激活分组的 api_key。
+    ///
+    /// 自 v1.5.15 起不再合并 `~/.claude.json` 等外部"原生"MCP 配置——wyj-code
+    /// 只信任用户写在 `~/.wyj-code/` 与 `<git-root>/.wyj-code/` 下的条目。
     pub fn load() -> Result<Self> {
         let mut cfg = Self::load_file_only()?;
 
@@ -1166,23 +1166,6 @@ impl Config {
                 "[sandbox] 配置块已废弃（crates/sandbox crate 已移除）；Bash 命令直接继承宿主 PATH/USER/SHELL。\
                  请从 ~/.wyj-code/config.toml 删除 [sandbox] 块以消除本警告。"
             );
-        }
-
-        // Claude Code's global native MCP file has higher precedence than the
-        // legacy wyj global TOML, while remaining read-only until explicit migrate.
-        if let Ok(home) = home_dir() {
-            let native_path = home.join(".claude.json");
-            if let Ok(native_servers) = load_native_mcp(&native_path) {
-                for server in native_servers {
-                    if let Some(existing) =
-                        cfg.mcp_servers.iter_mut().find(|s| s.name == server.name)
-                    {
-                        *existing = server;
-                    } else {
-                        cfg.mcp_servers.push(server);
-                    }
-                }
-            }
         }
 
         // 环境变量只写入 serde 跳过的运行期槽位，绝不能因为打开设置面板并保存
@@ -1213,9 +1196,9 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 只读 `config.toml` 文件本体（含旧格式一次性迁移）：不合并 `~/.claude.json`
-    /// 的原生 MCP、不吃环境变量。`/import` 等"要把结果写回 config.toml"的路径必须
-    /// 用这个入口做冲突检测与写回，否则会把只读的原生 server 误物化进文件。
+    /// 只读 `config.toml` 文件本体（含旧格式一次性迁移），不吃环境变量。当前与
+    /// `Config::load` 行为完全一致（合并 `~/.claude.json` 的逻辑自 v1.5.15 起
+    /// 删除），保留该入口仅为兼容历史调用方——新代码直接用 `Config::load`。
     pub fn load_file_only() -> Result<Self> {
         Self::load_file_only_at(&config_file_path()?)
     }
@@ -1981,22 +1964,61 @@ context_window = 200000
         );
     }
 
+    /// 进程级 Mutex：jev API key 测试需要改 `TYPESAFE_API_KEY` env，
+    /// `std::env::set_var` 在多线程并发下与 libc getenv 不同步（getenv 返回
+    /// 各线程启动时的快照），cargo test 默认多线程并发会让 3 个测试相互覆盖
+    /// env 值。Mutex 串行化确保任意时刻只有一个测试持有 env 修改权。
+    static JEV_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn resolve_jev_api_key_prefers_field_over_env_when_both_set() {
-        // 不依赖外部 env：默认 env 未设置，验证字段路径。
+    fn resolve_jev_api_key_prefers_env_over_field_when_both_set() {
+        // env 优先于字段（与 `Config::runtime_api_key` 模式一致；CLAUDE.md
+        // 「统一通知通道」节明确这是 env override 优先语义）。env 通过
+        // `JEV_ENV_LOCK` 串行化 + 临时 set / 还原隔离，避免测试间串扰。
+        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("TYPESAFE_API_KEY").ok();
+        std::env::set_var("TYPESAFE_API_KEY", "from-env");
         let mut cfg = Config::default();
         cfg.tools.jev.api_key = Some("from-field".to_string());
-        assert_eq!(cfg.resolve_jev_api_key().as_deref(), Some("from-field"));
+        let result = cfg.resolve_jev_api_key();
+        match prev {
+            Some(v) => std::env::set_var("TYPESAFE_API_KEY", v),
+            None => std::env::remove_var("TYPESAFE_API_KEY"),
+        }
+        assert_eq!(result.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn resolve_jev_api_key_uses_field_when_env_unset() {
+        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("TYPESAFE_API_KEY").ok();
+        if prev.is_some() {
+            std::env::remove_var("TYPESAFE_API_KEY");
+        }
+        let mut cfg = Config::default();
+        cfg.tools.jev.api_key = Some("from-field".to_string());
+        let result = cfg.resolve_jev_api_key();
+        if let Some(v) = prev {
+            std::env::set_var("TYPESAFE_API_KEY", v);
+        }
+        assert_eq!(result.as_deref(), Some("from-field"));
     }
 
     #[test]
     fn resolve_jev_api_key_treats_empty_field_as_unset() {
+        // 字段空字符串视为未设置；env 通过 guard 隔离。
+        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("TYPESAFE_API_KEY").ok();
+        if prev.is_some() {
+            std::env::remove_var("TYPESAFE_API_KEY");
+        }
         let mut cfg = Config::default();
         cfg.tools.jev.api_key = Some(String::new());
-        // 默认无 TYPESAFE_API_KEY env，应返回 None（不返回空串）
-        if std::env::var("TYPESAFE_API_KEY").is_err() {
-            assert_eq!(cfg.resolve_jev_api_key(), None);
+        let result = cfg.resolve_jev_api_key();
+        if let Some(v) = prev {
+            std::env::set_var("TYPESAFE_API_KEY", v);
         }
+        assert_eq!(result, None);
     }
 
     #[test]

@@ -477,26 +477,6 @@ impl Command for ExtensionsCmd {
     }
 }
 
-// ── /import ───────────────────────────────────────────────────────────────────
-
-pub struct ImportCmd;
-
-#[async_trait]
-impl Command for ImportCmd {
-    fn name(&self) -> &str {
-        "import"
-    }
-    fn description(&self) -> String {
-        tr("import.desc")
-    }
-    fn usage(&self) -> String {
-        "/import".to_string()
-    }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        Ok(CommandResult::OpenImportDialog)
-    }
-}
-
 // ── /agents ───────────────────────────────────────────────────────────────────
 
 pub struct AgentsCmd;
@@ -1657,7 +1637,6 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(ExtensionsCmd));
-    reg.register(Arc::new(ImportCmd));
     reg.register(Arc::new(BugCmd));
     reg.register(Arc::new(ReviewCmd));
     reg.register(Arc::new(PrCommentsCmd));
@@ -1711,7 +1690,6 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(ExtensionsCmd));
-    reg.register(Arc::new(ImportCmd));
     reg.register(Arc::new(BugCmd));
     reg.register(Arc::new(ReviewCmd));
     reg.register(Arc::new(PrCommentsCmd));

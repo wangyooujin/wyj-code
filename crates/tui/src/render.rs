@@ -3,12 +3,12 @@
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
     AskQuestionStage, Attachment, ChatMessage, EvolutionDialog, EvolutionRow,
-    ExecModeConfirmDialog, ExtensionsDialog, FlatRow, ImportDialog, ImportStage, InProgressAnswer,
-    InputOwner, McpConnStatus, McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow,
-    MessageRole, PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog,
-    PluginsDialogTab, ProfileDialog, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
-    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog,
-    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
+    McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
+    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
+    ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
+    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsDialog,
+    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
     SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
@@ -501,11 +501,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 
     if let Some(dialog) = &mut state.extensions_dialog {
         draw_extensions_dialog(f, dialog, area);
-    }
-
-    // 一键导入面板叠加在最顶层
-    if let Some(dialog) = &state.import_dialog {
-        draw_import_dialog(f, dialog, area);
     }
 
     // 定时任务面板叠加在最顶层
@@ -4465,187 +4460,6 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
     }
     f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
 }
-
-/// 一键导入面板渲染（/import 命令触发）
-fn draw_import_dialog(f: &mut Frame, dialog: &ImportDialog, area: Rect) {
-    let is_report = matches!(dialog.stage, ImportStage::Report(_));
-    let body_rows = if is_report {
-        let ImportStage::Report(outcome) = &dialog.stage else {
-            unreachable!()
-        };
-        (outcome.applied.len()
-            + outcome.overwritten.len()
-            + outcome.shadow_warnings.len()
-            + outcome.errors.len()
-            + 6)
-        .clamp(3, 20)
-    } else {
-        dialog.candidates.len().clamp(1, MAX_LIST_VIEWPORT)
-    };
-    let error_rows = (!dialog.scan_errors.is_empty() || dialog.error.is_some()) as usize;
-    let height = ((body_rows + error_rows + 4) as u16).min(area.height.saturating_sub(2));
-    let width = (area.width * 9 / 10).clamp(72, 132).min(area.width);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let dialog_area = Rect::new(x, y, width, height);
-
-    f.render_widget(Clear, dialog_area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Theme::claude_color()))
-        .title(Span::styled(
-            format!(" {} ", wyj_i18n::tr("import.dialog.title")),
-            Style::default()
-                .fg(Theme::claude_color())
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(dialog_area);
-    f.render_widget(block, dialog_area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
-        .split(inner);
-    let body_area = chunks[0];
-    let mut lines = Vec::new();
-
-    if let ImportStage::Report(outcome) = &dialog.stage {
-        if !outcome.applied.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} ({})",
-                    wyj_i18n::tr("import.report.applied"),
-                    outcome.applied.len()
-                ),
-                Style::default().fg(Color::Green),
-            )));
-            for item in &outcome.applied {
-                lines.push(Line::from(Span::raw(format!("  ✓ {item}"))));
-            }
-        }
-        if !outcome.overwritten.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "{} ({})",
-                    wyj_i18n::tr("import.report.overwritten"),
-                    outcome.overwritten.len()
-                ),
-                Style::default().fg(Color::Yellow),
-            )));
-            for item in &outcome.overwritten {
-                lines.push(Line::from(Span::raw(format!("  ↻ {item}"))));
-            }
-        }
-        if !outcome.shadow_warnings.is_empty() {
-            lines.push(Line::from(Span::styled(
-                wyj_i18n::tr("import.report.shadowed_note"),
-                Style::default().fg(Color::Yellow),
-            )));
-            for item in &outcome.shadow_warnings {
-                lines.push(Line::from(Span::styled(
-                    truncate_line(&format!("  ≫ {item}"), body_area.width as usize),
-                    Theme::dim(),
-                )));
-            }
-        }
-        if !outcome.errors.is_empty() {
-            lines.push(Line::from(Span::styled(
-                wyj_i18n::tr("import.report.errors"),
-                Theme::error(),
-            )));
-            for item in &outcome.errors {
-                lines.push(Line::from(Span::styled(
-                    truncate_line(&format!("  ✗ {item}"), body_area.width as usize),
-                    Theme::error(),
-                )));
-            }
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                wyj_i18n::tr("import.report.nothing"),
-                Theme::dim(),
-            )));
-        }
-    } else if dialog.candidates.is_empty() {
-        lines.push(Line::from(Span::styled(
-            wyj_i18n::tr("import.dialog.empty"),
-            Theme::dim(),
-        )));
-    } else {
-        let visible = dialog.candidates.len().clamp(1, MAX_LIST_VIEWPORT);
-        let start = scroll_window_start(dialog.candidates.len(), dialog.cursor, visible);
-        for (pos, candidate) in dialog
-            .candidates
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-        {
-            let selected = pos == dialog.cursor;
-            let marker = if selected { "▶ " } else { "  " };
-            let checkbox = if dialog.checked.contains(&pos) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            let source = match candidate.source_app {
-                wyj_store::import::ImportSourceApp::Codex => "codex",
-                wyj_store::import::ImportSourceApp::Claude => "claude",
-            };
-            let mut flags = Vec::new();
-            if candidate.conflict.is_some() {
-                flags.push(wyj_i18n::tr("import.label.conflict"));
-            }
-            if candidate.shadowed {
-                flags.push(wyj_i18n::tr("import.label.shadowed"));
-            }
-            let text = truncate_line(
-                &format!(
-                    "{marker}{checkbox} {:<6} {:<32} {source:<6} → {:<7} {}",
-                    candidate.kind.as_str(),
-                    candidate.name,
-                    format!("{:?}", candidate.scope).to_lowercase(),
-                    flags.join(" ")
-                ),
-                body_area.width as usize,
-            );
-            let style = if selected {
-                Theme::selected_row()
-            } else if candidate.conflict.is_some() {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            lines.push(Line::from(Span::styled(text, style)));
-        }
-    }
-    for err in dialog.scan_errors.iter().chain(dialog.error.iter()) {
-        lines.push(Line::from(Span::styled(
-            truncate_line(&format!("! {err}"), body_area.width as usize),
-            Theme::error(),
-        )));
-    }
-    f.render_widget(Paragraph::new(Text::from(lines)), body_area);
-
-    let footer_area = chunks[1];
-    let hint = if is_report {
-        wyj_i18n::tr("import.report.hint")
-    } else {
-        wyj_i18n::tr("import.dialog.hint")
-    };
-    let footer = vec![
-        Line::from(Span::styled(
-            "─".repeat(footer_area.width as usize),
-            Theme::border(),
-        )),
-        Line::from(Span::styled(
-            truncate_line(&hint, footer_area.width as usize),
-            Theme::dim(),
-        )),
-    ];
-    f.render_widget(Paragraph::new(Text::from(footer)), footer_area);
-}
-
 /// 分组管理面板渲染（/model 无参命令触发）
 fn draw_profile_dialog(
     f: &mut Frame,

@@ -79,10 +79,6 @@ pub enum CommandResult {
     OpenPluginsDialog,
     /// 打开统一资源中心（/extensions 命令触发）
     OpenExtensionsDialog,
-    /// 打开一键导入面板（/import 命令触发）：扫描 Codex / Claude Code 配置，
-    /// 勾选确认后物化为 wyj 自管配置。headless 不支持，提示改用
-    /// `wyj-code extensions migrate`。
-    OpenImportDialog,
     /// 打开可用 Agent 类型交互面板（/agents 命令触发）。
     /// TUI 使用 `defs` 渲染列表与详情；headless 使用 `fallback_text` 保持纯文本输出。
     OpenAgentsDialog {
