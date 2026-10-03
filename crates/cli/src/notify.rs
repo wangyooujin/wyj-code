@@ -33,7 +33,8 @@ use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+// cfg 类型从 config crate 导入；`NotifyCfg` 是 crate 内主要使用类型所以 re-export。
+pub use wyj_config::NotifyCfg;
 
 // `DISPATCHER` 选 `Mutex<Option<...>>` 而非 `OnceLock<...>` 的理由：
 // 1. `OnceLock::set` 在已 set 时返 Err，测试间无法重置 cfg / sink 列表。
@@ -44,84 +45,9 @@ static DISPATCHER: Mutex<Option<NotifyDispatcher>> = Mutex::new(None);
 
 // ── 配置类型 ───────────────────────────────────────────────────────────────
 //
-// Step 1：定义在本文件以便 trait 形状独立验证。
-// Step 2：整体迁移到 `wyj_config::NotifyCfg`，本文件改用 `wyj_config::NotifyCfg`。
-//
-// 字段语义见 CLAUDE.md "Storage caps (defaults)" 表格的 `[notify]` 行，
-// 以及 CHANGELOG v1.5.14 条目。
-
-/// 顶层 `[notify]` 配置块。所有字段都有合理默认；master / desktop / events.* 是
-/// opt-out（默认开），`bell` 与 `include_session_id` 是 opt-in（默认关）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NotifyCfg {
-    /// 总开关。默认 `true`（opt-out），仿 `evolution.enabled=true`。
-    pub enabled: bool,
-    /// 终端响铃（stderr `\x07`）。默认 `false`（opt-in）—— 共享场景（图书馆/会议）易扰民。
-    #[serde(default)]
-    pub bell: NotifyBellCfg,
-    /// 桌面通知。默认 `true`（opt-out）。
-    #[serde(default)]
-    pub desktop: NotifyDesktopCfg,
-    /// 4 类事件的细粒度开关。
-    #[serde(default)]
-    pub events: NotifyEventsCfg,
-    /// 同类事件最小发送间隔（秒）。`0` 关闭限流。默认 30。
-    pub rate_limit_seconds: u64,
-    /// 是否在通知 body 末尾追加 `[session:xxx]` 上下文。默认 `false`。
-    pub include_session_id: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NotifyBellCfg {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NotifyDesktopCfg {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NotifyEventsCfg {
-    pub turn_finished: bool,
-    pub turn_error: bool,
-    pub subagent_done: bool,
-    pub schedule_failure: bool,
-}
-
-impl Default for NotifyCfg {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            bell: NotifyBellCfg::default(),  // enabled: false
-            desktop: NotifyDesktopCfg::default(),  // enabled: true
-            events: NotifyEventsCfg::default(),  // 全 true
-            rate_limit_seconds: 30,
-            include_session_id: false,
-        }
-    }
-}
-
-impl Default for NotifyDesktopCfg {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
-
-impl Default for NotifyEventsCfg {
-    fn default() -> Self {
-        Self {
-            turn_finished: true,
-            turn_error: true,
-            subagent_done: true,
-            schedule_failure: true,
-        }
-    }
-}
+// cfg 类型（`NotifyCfg` / `NotifyBellCfg` / `NotifyDesktopCfg` / `NotifyEventsCfg`）
+// 定义在 `wyj_config` crate；本文件通过 `pub use` re-export 保持向后兼容。
+// 字段语义见 CLAUDE.md `[notify]` 段 + CHANGELOG v1.5.14 条目。
 
 // ── 事件类型 ───────────────────────────────────────────────────────────────
 

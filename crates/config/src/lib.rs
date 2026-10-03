@@ -795,6 +795,12 @@ pub struct Config {
     /// `[profiles]` 的 chat 协议语义。
     #[serde(default)]
     pub tools: ToolsCfg,
+    /// 统一通知通道（v1.5.14+）：覆盖 TUI/CLI 回合完成 / 错误、后台子 Agent
+    /// 完成、定时任务失败四类事件，通过终端响铃（stderr `\x07`）与桌面通知
+    /// （macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast）
+    /// 提醒用户。详见 `crates/cli/src/notify.rs`。
+    #[serde(default)]
+    pub notify: NotifyCfg,
 }
 
 /// `[tools]` 节：可选/付费工具的注册门控。每项独立配置、各自带
@@ -859,6 +865,92 @@ impl Default for ToolsJevCfg {
     }
 }
 
+/// `[notify]` 配置块（v1.5.14+）—— 统一通知通道的横切配置。
+///
+/// 覆盖 TUI/CLI/Schedule 三个子系统共用的 4 类事件（TUI 回合完成/错误、
+/// 后台子 Agent 完成、cron 任务失败），通过 [`NotifyBellCfg`] 与
+/// [`NotifyDesktopCfg`] 两个 sink 通道发到用户面前：
+///
+/// - `bell` —— stderr `\x07`，**opt-in 默认关**（共享场景易扰民）
+/// - `desktop` —— 桌面通知，**opt-out 默认开**（cron / 后台场景必须）
+/// - `events.*` —— 4 个细粒度事件 gate；`subagent_done` 用户选择
+///   opt-out 默认开（后台 Agent 是用户离开终端最该被提醒的场景）
+/// - `rate_limit_seconds` —— 同 kind 最小间隔，0 = 关闭
+/// - `include_session_id` —— 是否在 body 末尾追加 `[session:xxx]`
+///
+/// env 紧急关：`WYJ_CODE_NOTIFY_OFF=1`；具体字段 override：`_BELL` / `_DESKTOP`。
+/// env 在 `wyj_cli::notify::init` 阶段读取，**绝不写回 cfg**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyCfg {
+    /// 总开关。默认 `true`（opt-out），仿 `evolution.enabled=true`。
+    pub enabled: bool,
+    /// 终端响铃 sink。
+    #[serde(default)]
+    pub bell: NotifyBellCfg,
+    /// 桌面通知 sink。
+    #[serde(default)]
+    pub desktop: NotifyDesktopCfg,
+    /// 4 类事件的细粒度 gate。
+    #[serde(default)]
+    pub events: NotifyEventsCfg,
+    /// 同类事件最小发送间隔（秒）。`0` 关闭限流。默认 30。
+    pub rate_limit_seconds: u64,
+    /// 是否在通知 body 末尾追加 `[session:xxx]` 上下文。默认 `false`。
+    pub include_session_id: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyBellCfg {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyDesktopCfg {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyEventsCfg {
+    pub turn_finished: bool,
+    pub turn_error: bool,
+    pub subagent_done: bool,
+    pub schedule_failure: bool,
+}
+
+impl Default for NotifyCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bell: NotifyBellCfg::default(),  // enabled: false
+            desktop: NotifyDesktopCfg::default(),  // enabled: true
+            events: NotifyEventsCfg::default(),  // 全 true
+            rate_limit_seconds: 30,
+            include_session_id: false,
+        }
+    }
+}
+
+impl Default for NotifyDesktopCfg {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl Default for NotifyEventsCfg {
+    fn default() -> Self {
+        Self {
+            turn_finished: true,
+            turn_error: true,
+            subagent_done: true,
+            schedule_failure: true,
+        }
+    }
+}
+
 /// serde 字段级默认值（与 `Default::default` 同源）。
 fn default_jev_model() -> String {
     "jev-latest".to_string()
@@ -904,6 +996,7 @@ impl Default for Config {
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             tools: ToolsCfg::default(),
+            notify: NotifyCfg::default(),
         }
     }
 }
@@ -989,6 +1082,7 @@ impl From<LegacyConfigV0> for Config {
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             tools: ToolsCfg::default(),
+            notify: NotifyCfg::default(),
         }
     }
 }
@@ -1826,6 +1920,51 @@ context_window = 200000
         assert_eq!(cfg.model, "jev-latest");
         assert_eq!(cfg.max_questions, 32);
         assert_eq!(cfg.daily_budget_usd, 5.0);
+    }
+
+    #[test]
+    fn notify_defaults_match_recommendation() {
+        let cfg = super::NotifyCfg::default();
+        assert!(cfg.enabled, "master opt-out 默认开");
+        assert!(!cfg.bell.enabled, "bell opt-in 默认关（共享场景防扰民）");
+        assert!(cfg.desktop.enabled, "desktop opt-out 默认开");
+        assert!(cfg.events.turn_finished);
+        assert!(cfg.events.turn_error);
+        assert!(
+            cfg.events.subagent_done,
+            "subagent_done 用户选择 opt-out 默认开（后台离开终端最该被提醒）"
+        );
+        assert!(cfg.events.schedule_failure);
+        assert_eq!(cfg.rate_limit_seconds, 30);
+        assert!(!cfg.include_session_id);
+    }
+
+    #[test]
+    fn empty_notify_section_keeps_safe_defaults() {
+        // 完全空的 `[notify]` 块应全部走 default impl，不允许用户写空块崩解析。
+        let toml = r#"
+            [notify]
+            "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.notify.enabled);
+        assert!(!cfg.notify.bell.enabled);
+        assert!(cfg.notify.desktop.enabled);
+        assert_eq!(cfg.notify.rate_limit_seconds, 30);
+    }
+
+    #[test]
+    fn notify_partial_override_keeps_untouched_defaults() {
+        // 只写一个字段，其它字段继承 default
+        let toml = r#"
+            [notify.events]
+            turn_finished = false
+            "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.notify.events.turn_finished);
+        assert!(cfg.notify.events.turn_error);
+        assert!(cfg.notify.events.subagent_done);
+        assert!(cfg.notify.events.schedule_failure);
+        assert_eq!(cfg.notify.rate_limit_seconds, 30);
     }
 
     #[test]
