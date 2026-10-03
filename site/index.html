@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.13：TypeSafe Jev 决策 API 接入（JevTool + /decision + 三层硬封顶）。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.14：统一通知通道（终端响铃 + 桌面通知）。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.12 已公开发布：TUI 终端 panic 兜底还原（panic 时自动还原 raw mode + alternate screen）、CJK/emoji 字符串截断安全（`wyj_core::textutil::floor_char_boundary` 治本 memory_v3 撞 char boundary panic）、输入框标题栏/状态栏精简；安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.14 已公开发布：统一通知通道（终端响铃 + 桌面通知 4 类事件 × 2 类 sink × 7 触发点，TUI/CLI/cron 任务完成与后台子 Agent 完成首次能在 Notification Center 拿到提示）；安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.12</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.14</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.12 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.14 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.13 · TypeSafe Jev 决策 API 接入</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.13 重大特性：把 TypeSafe System One 决策模型以独立 tool 的形式接入 wyj-code——`JevTool`（POST `https://api.typesafe.ai/v1/systemone`，三种 primitive：choice / score / noul，每个 answer 自带 confidence + probabilities），与主 chat 模型走完全不同的协议路径（无 stream / 无 multi-turn / 无 tool calling 协议，**不**污染 `WireProtocol`/`Provider` 分桶）。客户端三层硬封顶（`max_state_chars` 按 char boundary 安全截断 / `max_questions` / `daily_budget_usd` 进程级日预算 micro-cent 精度）防失控计费。`Config::resolve_jev_api_key()` 走 env 优先 + 字段兜底的合并，**不**回写 cfg.toml（沿用 `runtime_api_key` 的 serde skip 语义）。`core::prompts::JEV_HINT` 仅在 jev 已注册时拼到 system prompt，未注册时模型看不到这个能力。新增 `/decision [ping|ask <问题>]` slash 命令（zh/en.yml `/help.body` 已同步注册）做连通性诊断 + 快速问答。Jev 与 chat LLM 不是替代关系——主 Agent 在歧义场景主动调 Jev 拿结构化判断 + 置信度，对齐 Anthropic 官方推荐的 "use a decision model alongside your LLM" 用法。历史 tag 保持不可移动，Release 与安装脚本同步指向最新公开版本。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.14 · 统一通知通道</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.14 首次接入系统级通知：把"任务完成 / 错误 / 后台子 Agent 完成 / cron schedule 失败"4 类事件统一派发到终端响铃（stderr `\x07`）与桌面通知（macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast），用户离开终端时也能在 Notification Center 拿到带项目上下文的提示。新增 `wyj_core::notify` 模块（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免反向依赖循环），覆盖 4 类事件 × 2 类 sink × 7 触发点（实际接入 6 个，ACP/daemon 长跑后端无人类会话上下文故不接）。Config 新增顶层 `[notify]` block（master / bell / desktop / events / rate_limit / include_session_id 全字段 opt-out 默认开，仅 `bell.enabled` opt-in 默认关避扰民；rate_limit 30s 同类事件最小间隔防滥用，0 = 关闭）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`（env 在 init 阶段读取，绝不写回 cfg）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。零新第三方依赖。9 项 notify 单测 + 3 项 config 单测全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.12" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.12 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.14" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.14 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -538,8 +538,18 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.13</span>
+          <span class="font-display font-bold text-phosphor">v1.5.14</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1514"><strong class="text-amber-400">统一通知通道</strong>：新增 <code class="text-amber-400">wyj_core::notify</code>（从 <code class="text-amber-400">wyj_cli::notify</code> 上迁到 <code class="text-amber-400">wyj_core</code> 供 TUI + CLI 双向共用，避免 <code class="text-amber-400">wyj-cli</code>/<code class="text-amber-400">wyj-tui</code> 之间的反向依赖循环），覆盖 4 类事件（<code class="text-amber-400">TurnFinished</code>/<code class="text-amber-400">TurnError</code>/<code class="text-amber-400">SubAgentDone</code>/<code class="text-amber-400">ScheduleFailed</code>）× 2 类 sink（<code class="text-amber-400">BellSink</code> stderr <code class="text-amber-400">\x07</code> 跨平台通用 / <code class="text-amber-400">DesktopSink</code> macOS <code class="text-amber-400">osascript</code> + Linux <code class="text-amber-400">notify-send</code> + Windows PowerShell BurntToast），6/7 触发点已接入（TUI TurnDone / TUI Error / TUI 后台 SubAgentDone / CLI <code class="text-amber-400">-p</code> / CLI <code class="text-amber-400">--headless</code> REPL / cron schedule 失败；ACP/daemon 长跑后端无人类会话上下文故故意不接）。Config 顶层 <code class="text-amber-400">[notify]</code> block（<code class="text-amber-400">enabled</code>/<code class="text-amber-400">bell.enabled</code>/<code class="text-amber-400">desktop.enabled</code>/<code class="text-amber-400">events.*</code>/<code class="text-amber-400">rate_limit_seconds</code>/<code class="text-amber-400">include_session_id</code>，<code class="text-amber-400">bell.enabled</code> opt-in 默认关避扰民其余全部 opt-out 默认开，<code class="text-amber-400">rate_limit_seconds=30</code> 同类事件最小间隔防滥用）。env override 最小集 <code class="text-amber-400">WYJ_CODE_NOTIFY_OFF/BELL/DESKTOP</code>——env 在 init 阶段读取，<strong>绝不</strong>写回 cfg（沿用 <code class="text-amber-400">Config::resolve_jev_api_key</code> 模式）。所有 sink 失败 swallow + 首次失败 <code class="text-amber-400">tracing::debug!</code> 一次（<code class="text-amber-400">OnceLock</code> 防洪水）。<code class="text-amber-400">include_session_id=true</code> 时 body 末尾追加 <code class="text-amber-400">[session:&lt;id&gt;]</code>，总长被 200 字符上限收口。零新第三方依赖。9 项 notify 单测 + 3 项 config 单测全绿。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.13</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1513"><strong class="text-amber-400">TypeSafe Jev 决策 API 接入</strong>：新增 <code class="text-amber-400">crates/tools/src/jev.rs</code> 的 <code class="text-amber-400">JevTool</code>（POST <code class="text-amber-400">https://api.typesafe.ai/v1/systemone</code>，三种 primitive：choice / score / noul，每个 answer 自带 <code class="text-amber-400">confidence</code> + <code class="text-amber-400">probabilities</code>），与 <code class="text-amber-400">JevBudget</code> 进程级日预算计数器（micro-cent 精度，输入 <code class="text-amber-400">$0.042/M</code>、输出免费）。<code class="text-amber-400">Config.tools.jev</code> 子块 + <code class="text-amber-400">Config::resolve_jev_api_key()</code> env/字段合并（与 <code class="text-amber-400">runtime_api_key</code> 同款"serde skip"语义，绝不把 env 值物化进 config.toml）。客户端三层硬封顶：<code class="text-amber-400">max_state_chars</code>（按 char boundary 安全截断）/ <code class="text-amber-400">max_questions</code> / <code class="text-amber-400">daily_budget_usd</code>（<code class="text-amber-400">0</code> 关闭）。<code class="text-amber-400">cli::register_jev_tool_if_enabled</code> 仿 <code class="text-amber-400">register_computer_tool_if_enabled</code> 的门控模式（仅 enabled + API Key 可解析时注册），驱动 <code class="text-amber-400">core::prompts::JEV_HINT</code> 仅在已注册时拼到 system prompt。<code class="text-amber-400">/decision [ping|ask &lt;问题&gt;]</code> slash 命令做连通性诊断 + 快速问答（zh/en.yml <code class="text-amber-400">/help.body</code> 已同步注册）。Jev 与 chat 模型完全不同——无 stream / 无 multi-turn / 无 tool calling 协议——<strong>不</strong>新增 <code class="text-amber-400">WireProtocol</code> 变体、<strong>不</strong>改 <code class="text-amber-400">Provider</code> trait，避免污染 routing/capability_cache 分桶。子 Agent 工厂不注册（与 Computer / SubAgent / AskQuestion 同款白名单策略）。13 项 jev 单元测试覆盖 client-side validation / happy path / 三 primitive 端到端 / HTTP 错误归一（401/422/429/529）/ 429 重试 / state 截断 / budget 硬封顶；7 项 config 测试覆盖 jev 默认值 / partial 段解析 / base URL trim / api key 解析；workspace 全量回归 + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
       </div>
