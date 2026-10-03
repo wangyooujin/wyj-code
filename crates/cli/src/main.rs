@@ -1912,6 +1912,18 @@ async fn main() -> Result<()> {
             turn_result.as_ref().err().map(ToString::to_string),
         )
         .await;
+        // 统一通知：CLI -p 回合完成 / 错误
+        match &turn_result {
+            Ok(()) => notify::emit(notify::NotificationEvent::TurnFinished {
+                duration_ms: started.elapsed().as_millis() as u64,
+                summary: format!("-p ({turns} msgs)"),
+                session_id: Some(session_id.clone()),
+            }),
+            Err(e) => notify::emit(notify::NotificationEvent::TurnError {
+                error: e.to_string(),
+                session_id: Some(session_id.clone()),
+            }),
+        }
         turn_result?;
         println!();
         // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
@@ -3191,6 +3203,7 @@ async fn repl(
         turns += 1;
         println!();
         let agent_snapshot = shared_agent.read().unwrap().clone();
+        let started = std::time::Instant::now();
         let run_result = agent_snapshot
             .run_turn(&mut session, &ctx, &mut |d| {
                 print!("{d}");
@@ -3210,6 +3223,18 @@ async fn repl(
             run_result.as_ref().err().map(ToString::to_string),
         )
         .await;
+        // 统一通知：headless REPL 回合完成 / 错误
+        match &run_result {
+            Ok(()) => notify::emit(notify::NotificationEvent::TurnFinished {
+                duration_ms: started.elapsed().as_millis() as u64,
+                summary: format!("repl (turn {turns})"),
+                session_id: Some(session_id.clone()),
+            }),
+            Err(e) => notify::emit(notify::NotificationEvent::TurnError {
+                error: e.to_string(),
+                session_id: Some(session_id.clone()),
+            }),
+        }
         if let Err(e) = run_result {
             eprintln!("\n[错误] {e}");
         }
