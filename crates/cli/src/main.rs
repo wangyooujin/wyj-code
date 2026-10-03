@@ -759,6 +759,9 @@ async fn main() -> Result<()> {
     // 先加载 config 拿 language 字段并 set_locale，确保 Cli::parse() 生成的
     // --help 文本、以及后续所有输出都使用正确的语言。
     let mut cfg = Config::load()?;
+    // 统一通知通道 init（fail-safe：未 init 时 emit 是 no-op；env WYJ_CODE_NOTIFY_OFF
+    // 全关；first-wins 多次 init 后续无效）
+    notify::init(&cfg.notify);
     let lang = cfg
         .language
         .clone()
