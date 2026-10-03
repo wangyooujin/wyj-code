@@ -820,3 +820,15 @@ welcome:
     compact: '/compact to shrink context'
     mode: 'Shift+Tab to switch mode'
     quit: 'Ctrl+C to quit'
+
+notify:
+  title:
+    turn_finished: "wyj-code turn finished"
+    turn_error: "wyj-code turn error"
+    subagent_done: "wyj-code subagent finished"
+    schedule_failed: "wyj-code schedule task failed"
+  body:
+    turn_finished: "Duration {duration_ms}ms. {summary}"
+    turn_error: "{error}"
+    subagent_done: "Agent {agent_id}. {summary}"
+    schedule_failed: "Task {task_name}. {error}"

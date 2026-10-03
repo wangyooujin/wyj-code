@@ -201,45 +201,63 @@ impl NotifyDispatcher {
                 duration_ms,
                 summary,
                 session_id,
-            } => NotificationPayload {
-                kind,
-                title: title_for(kind),
-                body: append_session_id(
-                    format!("Duration {duration_ms}ms. {summary}"),
-                    session_id,
-                    self.cfg.include_session_id,
-                ),
-                source,
-            },
-            NotificationEvent::TurnError { error, session_id } => NotificationPayload {
-                kind,
-                title: title_for(kind),
-                body: append_session_id(error, session_id, self.cfg.include_session_id),
-                source,
-            },
-            NotificationEvent::SubAgentDone { agent_id, summary } => NotificationPayload {
-                kind,
-                title: title_for(kind),
-                body: format!("Agent {agent_id}. {summary}"),
-                source,
-            },
-            NotificationEvent::ScheduleFailed { task_name, error } => NotificationPayload {
-                kind,
-                title: title_for(kind),
-                body: format!("Task {task_name}. {error}"),
-                source,
-            },
+            } => {
+                let duration_str = duration_ms.to_string();
+                let body = wyj_i18n::tr_fmt(
+                    "notify.body.turn_finished",
+                    &[("duration_ms", &duration_str), ("summary", &summary)],
+                );
+                NotificationPayload {
+                    kind,
+                    title: title_for(kind),
+                    body: append_session_id(body, session_id, self.cfg.include_session_id),
+                    source,
+                }
+            }
+            NotificationEvent::TurnError { error, session_id } => {
+                let body = wyj_i18n::tr_fmt("notify.body.turn_error", &[("error", &error)]);
+                NotificationPayload {
+                    kind,
+                    title: title_for(kind),
+                    body: append_session_id(body, session_id, self.cfg.include_session_id),
+                    source,
+                }
+            }
+            NotificationEvent::SubAgentDone { agent_id, summary } => {
+                let body = wyj_i18n::tr_fmt(
+                    "notify.body.subagent_done",
+                    &[("agent_id", &agent_id), ("summary", &summary)],
+                );
+                NotificationPayload {
+                    kind,
+                    title: title_for(kind),
+                    body,
+                    source,
+                }
+            }
+            NotificationEvent::ScheduleFailed { task_name, error } => {
+                let body = wyj_i18n::tr_fmt(
+                    "notify.body.schedule_failed",
+                    &[("task_name", &task_name), ("error", &error)],
+                );
+                NotificationPayload {
+                    kind,
+                    title: title_for(kind),
+                    body,
+                    source,
+                }
+            }
         }
     }
 }
 
 fn title_for(kind: NotificationKind) -> String {
-    match kind {
-        NotificationKind::TurnFinished => "wyj-code turn finished".to_string(),
-        NotificationKind::TurnError => "wyj-code turn error".to_string(),
-        NotificationKind::SubAgentDone => "wyj-code subagent finished".to_string(),
-        NotificationKind::ScheduleFailed => "wyj-code schedule task failed".to_string(),
-    }
+    wyj_i18n::tr(match kind {
+        NotificationKind::TurnFinished => "notify.title.turn_finished",
+        NotificationKind::TurnError => "notify.title.turn_error",
+        NotificationKind::SubAgentDone => "notify.title.subagent_done",
+        NotificationKind::ScheduleFailed => "notify.title.schedule_failed",
+    })
 }
 
 fn append_session_id(body: String, session_id: Option<String>, enabled: bool) -> String {
@@ -254,7 +272,10 @@ fn append_session_id(body: String, session_id: Option<String>, enabled: bool) ->
     if total <= MAX_BODY {
         format!("{body}{suffix}")
     } else {
-        let cut = body.chars().take(MAX_BODY.saturating_sub(suffix.len())).collect::<String>();
+        let cut = body
+            .chars()
+            .take(MAX_BODY.saturating_sub(suffix.len()))
+            .collect::<String>();
         format!("{cut}{suffix}")
     }
 }
@@ -492,10 +513,8 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec1 = RecordingSink::new(0);
         let rec2 = RecordingSink::new(0);
-        let sinks: Vec<Box<dyn NotificationSink>> = vec![
-            Box::new(rec1.clone()),
-            Box::new(rec2.clone()),
-        ];
+        let sinks: Vec<Box<dyn NotificationSink>> =
+            vec![Box::new(rec1.clone()), Box::new(rec2.clone())];
         init_with_sinks(&NotifyCfg::default(), sinks);
         emit(NotificationEvent::ScheduleFailed {
             task_name: "test-task".to_string(),
@@ -604,11 +623,9 @@ mod tests {
     fn sink_failure_does_not_block_other_sinks() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rec_ok = RecordingSink::new(0);
-        let rec_failing = RecordingSink::new(10);  // 总是失败
-        let sinks: Vec<Box<dyn NotificationSink>> = vec![
-            Box::new(rec_failing.clone()),
-            Box::new(rec_ok.clone()),
-        ];
+        let rec_failing = RecordingSink::new(10); // 总是失败
+        let sinks: Vec<Box<dyn NotificationSink>> =
+            vec![Box::new(rec_failing.clone()), Box::new(rec_ok.clone())];
         init_with_sinks(&NotifyCfg::default(), sinks);
         emit(NotificationEvent::TurnFinished {
             duration_ms: 1,
@@ -648,7 +665,10 @@ mod tests {
         assert!(cfg.desktop.enabled, "desktop 应 opt-out 默认开");
         assert!(cfg.events.turn_finished);
         assert!(cfg.events.turn_error);
-        assert!(cfg.events.subagent_done, "subagent_done 用户选择 opt-out 默认开");
+        assert!(
+            cfg.events.subagent_done,
+            "subagent_done 用户选择 opt-out 默认开"
+        );
         assert!(cfg.events.schedule_failure);
         assert_eq!(cfg.rate_limit_seconds, 30);
         assert!(!cfg.include_session_id);

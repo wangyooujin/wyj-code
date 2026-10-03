@@ -815,6 +815,9 @@ async fn forward_events(
                     "content": {"type": "text", "text": format!("\n[wyj-code error] {message}\n")}
                 }),
             ),
+            // NOTE: daemon intentionally does not notify (see CLAUDE.md [notify]).
+            // ACP/daemon 是长跑后端进程，没有人类用户的本地会话上下文；turn finished
+            // 不通过 wyj_core::notify 派发，避免桌面通知 / 终端响铃污染宿主。
             SessionEvent::TurnFinished => {}
             other => {
                 let notification = json!({
