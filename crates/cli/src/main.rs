@@ -21,6 +21,7 @@ mod acp;
 mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
+mod notify;
 mod review_cmd;
 mod schedule_cmd;
 mod storage_cmd;
