@@ -772,14 +772,14 @@ mod tests {
     // ── happy path + mock server ────────────────────────────────────────────
 
     /// 起一个本地 mock server 处理 POST /v1/systemone，按调用计数。
-/// 真实生产中由 typesafe.ai 提供。
-///
-/// 极简 HTTP/1.1 mock server：仅处理 `POST /v1/systemone`、读 body、
-/// 调 handler、回 200。**仅测试用**——只兼容 reqwest 发出的请求格式，
-/// 不解析 keep-alive / chunked 等。避免引入 axum 这类重型依赖。
-mod mock_server {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    /// 真实生产中由 typesafe.ai 提供。
+    ///
+    /// 极简 HTTP/1.1 mock server：仅处理 `POST /v1/systemone`、读 body、
+    /// 调 handler、回 200。**仅测试用**——只兼容 reqwest 发出的请求格式，
+    /// 不解析 keep-alive / chunked 等。避免引入 axum 这类重型依赖。
+    mod mock_server {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         pub struct Mock {
             pub url: String,
