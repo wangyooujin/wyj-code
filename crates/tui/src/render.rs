@@ -7,7 +7,7 @@ use crate::app::{
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
     ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
-    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsDialog,
+    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, ShellStatus, SkillsDialog,
     SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
@@ -421,6 +421,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 防御性清零：只有 BottomPanel::SubAgents 分支里真正画出详情区时才会重新写入
     // 准确值，避免面板本帧未展示详情区（终端太矮/未展开/无选中）时残留上一帧的旧值。
     state.sub_agent_detail_max_scroll = 0;
+    state.shell_detail_max_scroll = 0;
     match panel_kind {
         BottomPanel::None => {}
         BottomPanel::Permission => {
@@ -445,6 +446,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         }
         BottomPanel::SubAgents => {
             draw_sub_agents_panel(f, state, chunks[1]);
+        }
+        BottomPanel::ShellProcesses => {
+            draw_shell_panel(f, state, chunks[1]);
         }
     }
     if !state.file_completions.is_empty() {
@@ -526,12 +530,38 @@ enum BottomPanel {
     ExecModeConfirm,
     PlanApproval,
     SubAgents,
+    ShellProcesses,
 }
 
 /// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
 const SUB_AGENT_LIST_MAX: usize = 6;
 /// agents 面板详情区（工具流水 + 结果/状态提示）最多占用的行数（超出内部滚动）
 const SUB_AGENT_DETAIL_MAX: u16 = 12;
+/// 后台任务面板列表区最多同时展示的行数
+const SHELL_LIST_MAX: usize = 6;
+/// 后台任务面板详情区（实时输出）最多占用的行数（超出内部滚动）
+const SHELL_DETAIL_MAX: u16 = 12;
+/// 面板详情区读多少字节的输出尾部（与 `SHELL_WAKE_TAIL_BYTES` 同量级，
+/// 保证面板看到的内容与唤醒时喂给模型的内容一致）
+const SHELL_TAIL_BYTES: usize = 64 * 1024;
+
+/// 后台任务面板高度（列表行 + 边框 + 可选详情区）。
+/// sizing 阶段没有宽度信息，详情区行数只能按 `SHELL_DETAIL_MAX` 粗估；
+/// 精确的可视行数在 `draw_shell_panel` 渲染时用 `Paragraph::line_count`
+/// 重算并 clamp 写回。
+fn shell_panel_height(state: &AppState, area_height: u16) -> u16 {
+    let list_rows = state.shells.len().min(SHELL_LIST_MAX) as u16;
+    let detail_rows = if state.shell_detail_open {
+        SHELL_DETAIL_MAX
+    } else {
+        0
+    };
+    let content_rows = list_rows + detail_rows;
+    let max_h = (area_height * 7 / 10).max(list_rows + 2);
+    (content_rows + 2)
+        .clamp(list_rows + 2, max_h)
+        .min(area_height)
+}
 
 fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     // 权限确认最优先：几乎每次 Edit/Write/Bash 调用都可能弹出，必须始终可立即
@@ -555,12 +585,41 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         // 这里只剩固定 3 行的三选一选择器，贴在输入框上方，宽度对齐 Permission。
         return (5u16.min(area_height), BottomPanel::PlanApproval);
     }
+    // 后台任务面板：与子 Agent 面板互斥（底部只有一个位置），判定规则是
+    // **「用户焦点所在面板优先，其次才看有没有运行中任务」**。
+    //
+    // 为什么不能简单按"有运行中"排先后：子 Agent 和后台 shell 经常同时跑
+    // （典型场景就是「派子 Agent 去改代码，同时自己起 dev server」），
+    // 若固定让子 Agent 面板占位，后台任务就永远看不见、也按不了 k。
+    // 焦点优先保证用户想看哪个就能通过 Shift+↑ + ↓ 导航切过去。
+    if state.ui_focus == UiFocus::Shells && !state.shells.is_empty() {
+        return (
+            shell_panel_height(state, area_height),
+            BottomPanel::ShellProcesses,
+        );
+    }
+    if state.ui_focus == UiFocus::SubAgents && !state.sub_agents.is_empty() {
+        // 焦点在子 Agent 面板时，即使它已全部结束也要保持可见（用户正在看）
+        let list_rows = state.sub_agents.len().min(SUB_AGENT_LIST_MAX) as u16;
+        let max_h = (area_height * 7 / 10).max(list_rows + 2);
+        return (
+            (list_rows + 2).clamp(list_rows + 2, max_h).min(area_height),
+            BottomPanel::SubAgents,
+        );
+    }
+    if state.has_running_shells() && !state.shells.is_empty() {
+        return (
+            shell_panel_height(state, area_height),
+            BottomPanel::ShellProcesses,
+        );
+    }
+
     // 子 Agent 聚合面板：运行期间自动显示，全部结束后自动收起；用户通过
     // `/subagents` 或方向键主动进入面板焦点时仍可查看本会话历史详情。
     // 列表区固定行数上限 + 滚动窗口（本会话内全部保留，数量可能持续增长）；
     // 详情展开时追加详情区所需行数，整体按可用高度 70% 封顶，避免聊天区被挤没。
     let visible = state.visible_sub_agents();
-    let show_sub_agents = state.has_running_sub_agents() || state.ui_focus == UiFocus::SubAgents;
+    let show_sub_agents = state.has_running_sub_agents();
     if show_sub_agents && !visible.is_empty() {
         let list_rows = visible.len().min(SUB_AGENT_LIST_MAX) as u16;
         let detail_rows = if state.sub_agent_detail_open {
@@ -1212,6 +1271,25 @@ fn push_inline_todo_lines(
     };
 
     lines.push(Line::from(""));
+    // 全部完成：只保留这一行摘要。不画分隔线、不列条目、不给展开提示——
+    // 任务已经干完了，2 行折叠面板（头部 + ─）会一直挂在聊天流里占地方，
+    // 而 `TurnDone` 刻意不清 current_todos（见 app.rs 的 TurnDone handler），
+    // 意味着它会一直挂到用户发下一条消息才消失。收成一行既保留了"这轮做了
+    // 什么、耗时多少 token"的可追溯信息，又不再干扰阅读。
+    if all_done {
+        lines.push(Line::from(vec![
+            Span::styled("  TodoWrite", Theme::tool_call()),
+            Span::styled("  ", Theme::dim()),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Theme::claude_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        return (detail_scroll, 0);
+    }
+
     lines.push(Line::from(vec![
         Span::styled("  TodoWrite", Theme::tool_call()),
         Span::styled("  ", Theme::dim()),
@@ -1938,6 +2016,167 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             );
         }
     }
+}
+
+/// 后台 Shell 任务面板：列表（id / 命令 / 状态 / 耗时）+ 详情（实时输出）。
+/// 结构与 `draw_sub_agents_panel` 完全对称，便于两处对照维护。
+fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
+    // shells 是 Vec，天然保持 spawn 顺序；用 owned Vec 拿 id 快照，避免和
+    // 后面 `get(id)` 的可变借用冲突。
+    let ids: Vec<String> = state.shells.iter().map(|s| s.id.clone()).collect();
+
+    let title = wyj_i18n::tr_fmt(
+        "shell.panel_title",
+        &[("count", ids.len().to_string().as_str())],
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::border())
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Theme::claude_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let selected_idx = state
+        .selected_shell
+        .as_deref()
+        .and_then(|id| ids.iter().position(|i| i == id));
+    let detail_open = state.shell_detail_open && selected_idx.is_some();
+
+    let list_rows = (ids.len().min(SHELL_LIST_MAX) as u16).min(inner.height);
+    let (list_area, detail_area) = if detail_open && inner.height > list_rows {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(list_rows), Constraint::Min(1)])
+            .split(inner);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (inner, None)
+    };
+
+    let max_content_width = list_area.width.saturating_sub(2) as usize;
+    let max_show = (list_area.height as usize).max(1);
+    let start = match selected_idx {
+        Some(idx) if idx >= max_show => idx - max_show + 1,
+        _ => 0,
+    };
+
+    let mut lines: Vec<Line<'static>> = vec![];
+    for (row_i, id) in ids.iter().skip(start).take(max_show).enumerate() {
+        let Some(s) = state.shells.iter().find(|s| &s.id == id) else {
+            continue;
+        };
+        let is_selected = selected_idx == Some(start + row_i);
+        let sel_bg = |mut st: Style| -> Style {
+            if is_selected {
+                st = st.bg(Theme::selected_bg_color());
+            }
+            st
+        };
+
+        // 状态图标：运行中转 spinner，正常退出 ✓，非零退出码 ✗
+        let (icon, item_style) = match s.status {
+            ShellStatus::Running => (
+                SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            ShellStatus::Exited(0) => (
+                "✓".to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+            ShellStatus::Exited(_) => ("✗".to_string(), Theme::error()),
+        };
+
+        let mut spans = vec![
+            Span::styled(format!(" {id} "), sel_bg(Theme::dim())),
+            Span::styled(format!("{icon} "), sel_bg(item_style)),
+            Span::styled(
+                truncate_line(&s.command, max_content_width.saturating_sub(24)),
+                sel_bg(item_style),
+            ),
+            Span::styled(
+                format!(" ⏱ {}", format_hms(s.elapsed_secs())),
+                sel_bg(Theme::dim()),
+            ),
+        ];
+        if let ShellStatus::Exited(code) = s.status {
+            spans.push(Span::styled(
+                format!(
+                    " · {}",
+                    wyj_i18n::tr_fmt("shell.exited", &[("code", &code.to_string())])
+                ),
+                sel_bg(Theme::dim()),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if state.ui_focus == UiFocus::Shells && !detail_open {
+        lines.push(Line::from(Span::styled(
+            format!("  {}", wyj_i18n::tr("shell.focus_hint")),
+            Theme::dim(),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), list_area);
+
+    // 详情区：实时输出。
+    let Some(detail_area) = detail_area else {
+        return;
+    };
+    let Some(id) = selected_idx.map(|idx| ids[idx].clone()) else {
+        return;
+    };
+    let detail_width = detail_area.width.saturating_sub(2) as usize;
+    let output = wyj_tools::BashSessionManager::global()
+        .get(&id)
+        .map(|j| j.tail(SHELL_TAIL_BYTES))
+        .unwrap_or_default();
+
+    let mut detail_lines: Vec<Line<'static>> = Vec::new();
+    if output.trim().is_empty() {
+        detail_lines.push(Line::from(Span::styled(
+            format!("  {}", wyj_i18n::tr("shell.no_output")),
+            Theme::dim(),
+        )));
+    } else {
+        for l in output.lines() {
+            detail_lines.push(Line::from(Span::styled(
+                format!("  {}", truncate_line(l, detail_width.saturating_sub(2))),
+                Theme::tool_result(),
+            )));
+        }
+    }
+    detail_lines.push(Line::from(Span::styled(
+        format!("  {}", wyj_i18n::tr("shell.detail_hint")),
+        Theme::dim(),
+    )));
+
+    let text = Text::from(detail_lines);
+    let dw = detail_area.width.max(1);
+    let para = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+    let total = para.line_count(dw).min(u16::MAX as usize) as u16;
+    let visible_height = detail_area.height;
+    let max_scroll = total.saturating_sub(visible_height);
+    state.shell_detail_max_scroll = max_scroll;
+    // clamp 后写回，防止按键累加超过 max_scroll 导致"到顶/底后要多按几次才生效"
+    let clamped = state.shell_detail_scroll.min(max_scroll);
+    state.shell_detail_scroll = clamped;
+    // `clamped` 语义与子 Agent 详情区一致：从底部往上偏移的行数。
+    // clamped = 0 → 贴底跟随新输出；用户 PageUp 后 clamped > 0 → 停在历史位置。
+    let scroll = max_scroll.saturating_sub(clamped);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        detail_area,
+    );
 }
 
 // ─── 输入框 ──────────────────────────────────────────────────────────────────
@@ -5110,6 +5349,17 @@ mod tool_result_fold_tests {
         }
     }
 
+    fn shell(status: ShellStatus) -> crate::app::ShellUiState {
+        crate::app::ShellUiState {
+            id: "bash_1".to_string(),
+            command: "npm run dev".to_string(),
+            status,
+            started_at: Instant::now(),
+            final_elapsed: (status != ShellStatus::Running).then_some(1.0),
+            wake_sent: false,
+        }
+    }
+
     #[test]
     fn completed_sub_agents_do_not_keep_passive_panel_visible() {
         let mut state = make_state();
@@ -5131,6 +5381,79 @@ mod tool_result_fold_tests {
         let (height, panel) = bottom_panel_size(&state, 40);
 
         assert!(height > 0);
+        assert!(matches!(panel, BottomPanel::SubAgents));
+    }
+
+    // ── 后台任务面板可见性 ─────────────────────────────────────────────
+    //
+    // 回归背景：用户报告「所有 shell 后台执行的任务界面上看不见执行的内容」。
+    // 面板显示规则与子 Agent 面板同构：有运行中任务时自动出现、全部结束后
+    // 自动收起，但用户仍可用 /shells 或方向键显式打开查看历史。
+
+    #[test]
+    fn running_shells_keep_automatic_panel_visible() {
+        let mut state = make_state();
+        state.shells.push(shell(ShellStatus::Running));
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0, "有运行中后台任务时面板必须自动显示");
+        assert!(matches!(panel, BottomPanel::ShellProcesses));
+    }
+
+    #[test]
+    fn completed_shells_do_not_keep_passive_panel_visible() {
+        let mut state = make_state();
+        state.shells.push(shell(ShellStatus::Exited(0)));
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert_eq!(height, 0, "全部结束后不应继续占用底部空间");
+        assert!(matches!(panel, BottomPanel::None));
+    }
+
+    #[test]
+    fn completed_shells_remain_available_when_panel_is_opened_explicitly() {
+        let mut state = make_state();
+        state.shells.push(shell(ShellStatus::Exited(0)));
+        state.selected_shell = Some("bash_1".to_string());
+        state.ui_focus = UiFocus::Shells;
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0, "用户显式聚焦时已结束的任务仍应可见");
+        assert!(matches!(panel, BottomPanel::ShellProcesses));
+    }
+
+    #[test]
+    fn shell_focus_outranks_running_sub_agents() {
+        // 子 Agent 和后台 shell 经常同时跑（派 agent 改代码 + 自己起 dev
+        // server）。若按"有运行中"固定排先后，子 Agent 会永远占住底部位置，
+        // 后台任务就再也看不见、也按不了 k —— 用户显式导航过去必须能赢。
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, sub_agent(SubAgentStatus::Running));
+        state.shells.push(shell(ShellStatus::Running));
+        state.ui_focus = UiFocus::Shells;
+
+        let (_, panel) = bottom_panel_size(&state, 40);
+
+        assert!(matches!(panel, BottomPanel::ShellProcesses));
+    }
+
+    #[test]
+    fn sub_agent_focus_outranks_running_shells() {
+        // 上一条的镜像：焦点在子 Agent 面板时也不该被后台任务抢走。
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, sub_agent(SubAgentStatus::Running));
+        state.shells.push(shell(ShellStatus::Running));
+        state.ui_focus = UiFocus::SubAgents;
+
+        let (_, panel) = bottom_panel_size(&state, 40);
+
         assert!(matches!(panel, BottomPanel::SubAgents));
     }
 
@@ -5180,6 +5503,113 @@ mod tool_result_fold_tests {
 
         assert!(height > 0);
         assert!(matches!(panel, BottomPanel::SubAgents));
+    }
+
+    // ── 任务全部完成 → 收成一行摘要 ─────────────────────────────────────
+    //
+    // 回归背景：用户报告「tasklist 多任务全部完成后，折叠态的面板一直挂在
+    // 聊天流里不消失」。根因是 `TurnDone` 刻意不清 `current_todos`（现有测试
+    // 锁死了这个行为），而原渲染把「全部完成」画成 2 行（头部 + ─ 分隔线），
+    // 于是它会一直挂到用户发下一条消息。改成只画一行摘要后既保留了「这轮
+    // 做了什么 / 耗时多少 token」的可追溯信息，又不再占地方。
+
+    #[test]
+    fn completed_todo_panel_renders_single_summary_line() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![
+            wyj_tools::todo::TodoItem {
+                id: "a".to_string(),
+                content: "task a".to_string(),
+                status: wyj_tools::todo::TodoStatus::Completed,
+                priority: None,
+                active_form: None,
+            },
+            wyj_tools::todo::TodoItem {
+                id: "b".to_string(),
+                content: "task b".to_string(),
+                status: wyj_tools::todo::TodoStatus::Completed,
+                priority: None,
+                active_form: None,
+            },
+        ]);
+
+        let rendered: Vec<String> = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // 从面板头部往后看：只剩摘要这一行，后面不能再有任何内容
+        // （不能再有 ─ 分隔线、条目列表和 ctrl+t 展开提示）。
+        let head = rendered
+            .iter()
+            .position(|l| l.contains("TodoWrite"))
+            .expect("面板未渲染");
+        let tail = &rendered[head..];
+        assert_eq!(
+            tail.len(),
+            1,
+            "全部完成后面板应只剩一行摘要，实际是 {tail:?}"
+        );
+        assert!(tail[0].contains("任务已完成 [2/2]"));
+        assert!(
+            !tail.iter().any(|l| l.contains('─')),
+            "摘要态不应再画分隔线：{tail:?}"
+        );
+        assert!(
+            !tail.iter().any(|l| l.contains("ctrl+t")),
+            "摘要态不应再提示可展开：{tail:?}"
+        );
+    }
+
+    #[test]
+    fn in_progress_todo_panel_still_renders_separator_and_items() {
+        // 上一条的对照：未全部完成时行为完全不变（仍有分隔线与条目）。
+        let mut state = make_state();
+        state.current_todos = Some(vec![
+            wyj_tools::todo::TodoItem {
+                id: "a".to_string(),
+                content: "task a".to_string(),
+                status: wyj_tools::todo::TodoStatus::Completed,
+                priority: None,
+                active_form: None,
+            },
+            wyj_tools::todo::TodoItem {
+                id: "b".to_string(),
+                content: "task b".to_string(),
+                status: wyj_tools::todo::TodoStatus::InProgress,
+                priority: None,
+                active_form: None,
+            },
+        ]);
+
+        let rendered: Vec<String> = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let head = rendered
+            .iter()
+            .position(|l| l.contains("TodoWrite"))
+            .expect("面板未渲染");
+        let tail = &rendered[head..];
+        assert!(
+            tail.iter().any(|l| l.contains('─')),
+            "未完成时保留分隔线：{tail:?}"
+        );
+        assert!(
+            tail.iter().any(|l| l.contains("task b")),
+            "未完成时列出条目：{tail:?}"
+        );
     }
 
     #[test]

@@ -188,7 +188,7 @@ impl MemoryStore {
 
         let result = provider
             .complete(
-                crate::prompts::MEMORY_SYSTEM,
+                &wyj_api::SystemPrompt::stable_only(crate::prompts::MEMORY_SYSTEM),
                 &req,
                 &[],
                 &wyj_api::provider::RequestOptions::text_only(4096),

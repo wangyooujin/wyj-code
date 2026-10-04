@@ -68,7 +68,7 @@ impl SummaryGenerator {
         let result = self
             .provider
             .complete(
-                system,
+                &wyj_api::SystemPrompt::stable_only(system),
                 &req,
                 &[],
                 &wyj_api::provider::RequestOptions::text_only(256),

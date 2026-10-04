@@ -81,7 +81,7 @@ fn print_value(value: &serde_json::Value, json: bool) -> Result<()> {
 
 fn checkpoint_before_activation(cwd: &Path, id: &str) -> Result<String> {
     let sessions = wyj_config::config_dir()?.join("sessions");
-    let store = CheckpointStore::new(&sessions, format!("evolution-approval-{id}"))?;
+    let store = CheckpointStore::configured(&sessions, format!("evolution-approval-{id}"))?;
     let summary = store.create(
         cwd,
         &[],

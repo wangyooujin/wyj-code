@@ -347,7 +347,8 @@ mod tests {
             title_generated: false,
         };
         store.save(&parent).unwrap();
-        let checkpoints = crate::checkpoint::CheckpointStore::new(store.dir(), "parent").unwrap();
+        let checkpoints =
+            crate::checkpoint::CheckpointStore::configured(store.dir(), "parent").unwrap();
         let summary = checkpoints
             .create(
                 workspace.path(),

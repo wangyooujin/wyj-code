@@ -48,6 +48,105 @@ fn truncate_head_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
     format!("{head}\n…[truncated {omitted} bytes]…\n{}", &s[start..])
 }
 
+/// 单次 `shrink_json_to_budget` 调用的最大裁剪轮数。
+const SHRINK_MAX_ROUNDS: usize = 32;
+
+/// 每轮多砍的余量字节。避免"只差 1 字节"时反复逼近产生死循环。
+const SHRINK_SLACK: usize = 64;
+
+/// 返回 `v` 子树里最长的 string 叶子长度；没有 string 叶子返回 `None`。
+fn max_string_len(v: &serde_json::Value) -> Option<usize> {
+    match v {
+        serde_json::Value::String(s) => Some(s.len()),
+        serde_json::Value::Array(a) => a.iter().filter_map(max_string_len).max(),
+        serde_json::Value::Object(o) => o.values().filter_map(max_string_len).max(),
+        _ => None,
+    }
+}
+
+/// 在 `v` 子树里定位最长的 string 叶子并原地 head 截断到 `<= keep` 字节。
+/// 返回是否真的发生了截断（`false` 表示已无可砍，调用方据此终止）。
+///
+/// 用下标两段式（先只读定位、再按下标取 `&mut`）而不是直接返回 `&mut`，
+/// 是为了在 `Vec` / `Map` 迭代里避开借用检查器的跨迭代可变借用冲突。
+fn truncate_longest_string(v: &mut serde_json::Value, keep: usize) -> bool {
+    match v {
+        serde_json::Value::String(s) => {
+            if s.len() > keep {
+                *s = truncate_str(s, keep).to_string();
+                true
+            } else {
+                false
+            }
+        }
+        serde_json::Value::Array(a) => {
+            let mut best: Option<(usize, usize)> = None;
+            for (i, item) in a.iter().enumerate() {
+                if let Some(len) = max_string_len(item) {
+                    if !matches!(&best, Some((bl, _)) if len <= *bl) {
+                        best = Some((len, i));
+                    }
+                }
+            }
+            let Some((_, i)) = best else { return false };
+            truncate_longest_string(&mut a[i], keep)
+        }
+        serde_json::Value::Object(o) => {
+            let mut best: Option<(usize, String)> = None;
+            for (k, item) in o.iter() {
+                if let Some(len) = max_string_len(item) {
+                    if !matches!(&best, Some((bl, _)) if len <= *bl) {
+                        best = Some((len, k.clone()));
+                    }
+                }
+            }
+            let Some((_, k)) = best else { return false };
+            match o.get_mut(&k) {
+                Some(child) => truncate_longest_string(child, keep),
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// 把 `v` 裁剪到 `serde_json::to_string(v)` 的字节数 `<= budget`，
+/// 且**全程保持合法 JSON**。
+///
+/// 存在的理由：`ContentBlock::ToolUse.input` 与 `ToolResultContent::Blocks`
+/// 都是 JSON 值。对它们做字符串级 head+tail 截断会在中间插入
+/// `[truncated N bytes]` 标记，使 `from_str` 必然失败——旧实现正是这样，
+/// 而失败分支是 `if let Ok(value) = ...`，于是 `tool_use_input_bytes`(默认
+/// 64 KiB) 从上线起就是一个**静默 no-op**，超限的 `Edit`/`Write` 参数
+/// 既不落盘截断也不运行时截断，直接进请求体。见本文件 `mod tests` 里
+/// `tool_use_input_over_cap_is_actually_truncated` 这个回归测试。
+///
+/// 策略：每轮把当前最长的 string 叶子按「超出量 + 余量」head 截断，
+/// 重新序列化度量，最多 `SHRINK_MAX_ROUNDS` 轮。
+///
+/// 已知边界：若 `v` 里没有 string 叶子（例如几万个数字组成的数组），
+/// 继续裁剪只能删字段、会改变工具语义，故原样保留并放弃。
+/// 真实输入的字节量几乎全部来自 string 叶子（`Edit.new_string`、
+/// `Write.content`、MCP 入参的长文本等），这个边界不影响实际效果。
+fn shrink_json_to_budget(v: &mut serde_json::Value, budget: usize) {
+    for _ in 0..SHRINK_MAX_ROUNDS {
+        let Ok(serialized) = serde_json::to_string(v) else {
+            return;
+        };
+        let size = serialized.len();
+        if size <= budget {
+            return;
+        }
+        let Some(longest) = max_string_len(v) else {
+            return;
+        };
+        let keep = longest.saturating_sub((size - budget) + SHRINK_SLACK);
+        if !truncate_longest_string(v, keep) {
+            return;
+        }
+    }
+}
+
 /// 在落盘前对 `SessionFile.messages` 内 `ContentBlock` 做原地截断。
 /// `SessionFile` struct 字段签名不变。
 ///
@@ -123,13 +222,7 @@ pub fn truncate_content_block(block: &mut ApiContentBlock, cfg: &PersistCapCfg) 
         }
         ApiContentBlock::ToolUse { input, .. } => {
             if cfg.tool_use_input_bytes > 0 {
-                let raw = serde_json::to_string(input).unwrap_or_default();
-                if raw.len() > cfg.tool_use_input_bytes {
-                    let truncated = truncate_head_tail(&raw, cfg.tool_use_input_bytes, 0);
-                    if let Ok(value) = serde_json::from_str(&truncated) {
-                        *input = value;
-                    }
-                }
+                shrink_json_to_budget(input, cfg.tool_use_input_bytes);
             }
         }
         ApiContentBlock::Image { .. } | ApiContentBlock::RedactedThinking { .. } => {}
@@ -164,19 +257,17 @@ fn truncate_tool_result(content: &mut ToolResultContent, cfg: &PersistCapCfg) {
         }
         ToolResultContent::Blocks(values) => {
             if cfg.tool_result_head_bytes > 0 || cfg.tool_result_tail_bytes > 0 {
-                if let Ok(serialized) = serde_json::to_string(values) {
-                    if serialized.len() > cfg.tool_result_head_bytes + cfg.tool_result_tail_bytes {
-                        let truncated = truncate_head_tail(
-                            &serialized,
-                            cfg.tool_result_head_bytes,
-                            cfg.tool_result_tail_bytes,
-                        );
-                        if let Ok(parsed) =
-                            serde_json::from_str::<Vec<serde_json::Value>>(&truncated)
-                        {
-                            *values = parsed;
-                        }
-                    }
+                // 与 ToolUse 同理：Blocks 是 JSON 值，必须整体保持合法，
+                // 预算按 head+tail 之和计（语义上与 text 分支的合计量一致）。
+                // `shrink_json_to_budget` 操作 `Value`，这里临时包成
+                // `Value::Array` 再取回。
+                let budget = cfg
+                    .tool_result_head_bytes
+                    .saturating_add(cfg.tool_result_tail_bytes);
+                let mut wrapper = serde_json::Value::Array(std::mem::take(values));
+                shrink_json_to_budget(&mut wrapper, budget);
+                if let serde_json::Value::Array(arr) = wrapper {
+                    *values = arr;
                 }
             }
         }
@@ -623,5 +714,108 @@ mod tests {
             panic!()
         };
         assert!(!data.starts_with("cas://"));
+    }
+
+    // ── shrink_json_to_budget：persist_cap 对 JSON 值的裁剪 ──────────────
+    //
+    // 背景：ToolUse.input 与 ToolResultContent::Blocks 都是 JSON 值。旧实现
+    // 对它们做字符串级 head+tail 截断后再 from_str，中间插入的
+    // `[truncated N bytes]` 标记使解析必然失败，而失败分支是
+    // `if let Ok(...)`，于是 persist_cap 这两条上限从上线起就是静默 no-op。
+    // 下面第一个测试是针对该缺陷的回归测试。
+
+    #[test]
+    fn shrink_json_keeps_valid_json_and_meets_budget() {
+        let mut v = serde_json::json!({
+            "file_path": "/tmp/a.rs",
+            "new_string": "x".repeat(5000),
+        });
+        assert!(serde_json::to_string(&v).unwrap().len() > 512);
+        shrink_json_to_budget(&mut v, 512);
+        let out = serde_json::to_string(&v).unwrap();
+        assert!(out.len() <= 512, "serialized = {}", out.len());
+        // 关键断言：裁剪后必须仍是可解析的 Value，且非超大字段没被动过
+        let back: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(back["file_path"], "/tmp/a.rs");
+        assert!(back["new_string"].as_str().unwrap().len() < 5000);
+    }
+
+    #[test]
+    fn shrink_json_prefers_longest_string_and_is_char_boundary_safe() {
+        let mut v = serde_json::json!({
+            "short": "ab",
+            "long": "中".repeat(2000),
+            "nested": { "deep": "y".repeat(100) },
+        });
+        shrink_json_to_budget(&mut v, 800);
+        let out = serde_json::to_string(&v).unwrap();
+        assert!(out.len() <= 800, "serialized = {}", out.len());
+        // 裁剪只该动最长的 string 叶子
+        assert_eq!(v["short"], "ab");
+        assert_eq!(v["nested"]["deep"], "y".repeat(100));
+        // 头截断回退到 char boundary，to_string 不 panic 即说明没切断字符
+        assert!(v["long"].as_str().unwrap().len() < 6000);
+    }
+
+    #[test]
+    fn shrink_json_gives_up_when_no_string_leaves() {
+        // 已知边界：全是数字的大数组无法在不删语义的前提下裁剪，应原样保留。
+        let arr: Vec<serde_json::Value> = (0..5000u32).map(serde_json::Value::from).collect();
+        let mut v = serde_json::Value::Array(arr);
+        let before = serde_json::to_string(&v).unwrap().len();
+        shrink_json_to_budget(&mut v, 100);
+        let after = serde_json::to_string(&v).unwrap();
+        assert_eq!(after.len(), before);
+        assert!(serde_json::from_str::<serde_json::Value>(&after).is_ok());
+    }
+
+    #[test]
+    fn tool_use_input_over_cap_is_actually_truncated() {
+        let mut block = ContentBlock::ToolUse {
+            id: "t1".to_string(),
+            name: "Write".to_string(),
+            input: serde_json::json!({ "content": "z".repeat(300_000) }),
+        };
+        let cfg = PersistCapCfg {
+            tool_use_input_bytes: 4096,
+            ..Default::default()
+        };
+        truncate_content_block(&mut block, &cfg);
+        let ContentBlock::ToolUse { input, .. } = &block else {
+            panic!("expected ToolUse")
+        };
+        let out = serde_json::to_string(input).unwrap();
+        assert!(
+            out.len() <= 4096,
+            "tool_use input serialized = {}",
+            out.len()
+        );
+        // 保留的头部内容仍在，不是被整个丢弃
+        assert!(out.contains('z'));
+    }
+
+    #[test]
+    fn tool_result_blocks_over_cap_is_actually_truncated() {
+        let mut block = ContentBlock::ToolResult {
+            tool_use_id: "t2".to_string(),
+            content: ToolResultContent::Blocks(vec![serde_json::json!({
+                "k": "q".repeat(200_000)
+            })]),
+            is_error: false,
+        };
+        let cfg = PersistCapCfg {
+            tool_result_head_bytes: 2048,
+            tool_result_tail_bytes: 1024,
+            ..Default::default()
+        };
+        truncate_content_block(&mut block, &cfg);
+        let ContentBlock::ToolResult { content, .. } = &block else {
+            panic!("expected ToolResult")
+        };
+        let ToolResultContent::Blocks(values) = content else {
+            panic!("expected Blocks")
+        };
+        let out = serde_json::to_string(values).unwrap();
+        assert!(out.len() <= 3072, "blocks serialized = {}", out.len());
     }
 }

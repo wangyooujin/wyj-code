@@ -193,6 +193,39 @@ struct ImageSource {
     data: String,
 }
 
+/// 按 `SystemPrompt` 的两段结构生成 system 块列表。
+///
+/// 拆成两块是有意为之：Anthropic 的缓存按**前缀**匹配，`cache_control` 断点
+/// 打在哪块末尾，该块及其之前才进缓存。
+///   * `stable`（主提示 / `<env>` / 模式段 / 记忆快照 / CLAUDE.md 祖先链）
+///     承载缓存，断点打在这块末尾；
+///   * `volatile`（当前工具可用性 / 模型兼容 suffix / 子目录 CLAUDE.md
+///     reminder）每轮都可能变，放在断点**之后**且不打断点——这样它变化时
+///     不会让 stable 整段（约 1.6k~5k token）全价重算。
+///
+/// 断点预算：system 1 + tools 1 + 历史 1 = 3，仍在 Anthropic 上限 4 以内。
+fn build_system_blocks<'a>(
+    system: &crate::provider::SystemPrompt<'a>,
+    prompt_cache: bool,
+) -> Vec<ApiSystemBlock<'a>> {
+    let mut blocks: Vec<ApiSystemBlock<'a>> = Vec::new();
+    if !system.stable.is_empty() {
+        blocks.push(ApiSystemBlock {
+            block_type: "text",
+            text: system.stable,
+            cache_control: prompt_cache.then_some(EPHEMERAL),
+        });
+    }
+    if !system.volatile.is_empty() {
+        blocks.push(ApiSystemBlock {
+            block_type: "text",
+            text: system.volatile,
+            cache_control: None,
+        });
+    }
+    blocks
+}
+
 /// 把中立 `ToolDefinition` 序列化为 Anthropic 请求体里的单个工具条目。
 /// 原生工具（`native = Some`）按 `{"type", "name", ...extra}` 展开，不带
 /// description/input_schema；普通工具沿用 `{name, description, input_schema}`。
@@ -459,7 +492,7 @@ fn parse_stop_reason(s: &str) -> StopReason {
 impl Provider for AnthropicProvider {
     async fn stream(
         &self,
-        system: &str,
+        system: &crate::provider::SystemPrompt<'_>,
         messages: &[Message],
         tools: &[ToolDefinition],
         opts: &crate::provider::RequestOptions,
@@ -488,16 +521,8 @@ impl Provider for AnthropicProvider {
             _ => opts.max_tokens,
         };
 
-        // ── 构建 system 块（带 cache_control，缓存 system prompt）──
-        let system_blocks = if system.is_empty() {
-            vec![]
-        } else {
-            vec![ApiSystemBlock {
-                block_type: "text",
-                text: system,
-                cache_control: self.prompt_cache.then_some(EPHEMERAL),
-            }]
-        };
+        // ── 构建 system 块（带 cache_control，缓存 system prompt 的稳定前缀）──
+        let system_blocks = build_system_blocks(system, self.prompt_cache);
 
         // ── 构建 tools 块（最后一个工具打 cache_control，缓存全部工具定义）──
         let tool_count = tools.len();
@@ -868,5 +893,78 @@ mod tests {
     #[test]
     fn beta_header_is_none_without_any_beta_source() {
         assert_eq!(collect_beta_header(false, false, &[]), None);
+    }
+
+    // ── system 分段与 prompt cache 断点 ─────────────────────────────────
+    //
+    // 回归背景：整个 system 曾被压成单个 text 块、断点打在块尾，导致
+    // `<current-tool-availability>`、模型兼容 suffix、子目录 CLAUDE.md
+    // reminder、每轮重算的 Project Brief 中任何一项变化，都会让整段 system
+    // 全价重算。拆成 stable / volatile 两块后断点只保护 stable。
+
+    #[test]
+    fn stable_and_volatile_map_to_separate_system_blocks() {
+        let system = crate::provider::SystemPrompt {
+            stable: "STABLE-PROMPT",
+            volatile: "VOLATILE-TAIL",
+        };
+        let blocks = build_system_blocks(&system, true);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].text, "STABLE-PROMPT");
+        assert_eq!(blocks[1].text, "VOLATILE-TAIL");
+    }
+
+    #[test]
+    fn cache_breakpoint_sits_only_on_the_stable_block() {
+        let system = crate::provider::SystemPrompt {
+            stable: "STABLE-PROMPT",
+            volatile: "VOLATILE-TAIL",
+        };
+        let blocks = build_system_blocks(&system, true);
+        assert!(
+            blocks[0].cache_control.is_some(),
+            "断点必须打在 stable 块末尾，否则 volatile 变化会让 stable 失效"
+        );
+        assert!(
+            blocks[1].cache_control.is_none(),
+            "volatile 块不应打断点（会白白多占一个 breakpoint 配额）"
+        );
+    }
+
+    #[test]
+    fn volatile_changes_do_not_disturb_the_stable_prefix() {
+        // 同一份 stable + 不同 volatile → stable 块序列化结果必须逐字节相同，
+        // 这正是 prompt cache 仍能命中的前提。
+        let a = crate::provider::SystemPrompt {
+            stable: "SAME",
+            volatile: "turn-1 tool list: Read, Bash",
+        };
+        let b = crate::provider::SystemPrompt {
+            stable: "SAME",
+            volatile: "turn-2 tool list: Read, Bash, WebFetch",
+        };
+        // 只比较 stable 块本身（整份块列表当然会因 volatile 文本不同而不同）。
+        let stable_a = serde_json::to_string(&build_system_blocks(&a, true)[0]).unwrap();
+        let stable_b = serde_json::to_string(&build_system_blocks(&b, true)[0]).unwrap();
+        assert_eq!(stable_a, stable_b, "volatile 变化不应改写 stable 块");
+        // 断点仍在 stable 块末尾
+        assert!(stable_a.contains("cache_control"));
+    }
+
+    #[test]
+    fn empty_segments_are_omitted_and_prompt_cache_off_drops_breakpoint() {
+        let only_stable = crate::provider::SystemPrompt::stable_only("S");
+        let blocks = build_system_blocks(&only_stable, true);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].cache_control.is_some());
+
+        // prompt_cache = false → 一律不打断点
+        let blocks = build_system_blocks(&only_stable, false);
+        assert_eq!(blocks.len(), 1);
+        assert!(blocks[0].cache_control.is_none());
+
+        // 两段都空 → 不产出块（保持旧行为：system 字段 skip_serializing_if 空数组）
+        let none = crate::provider::SystemPrompt::default();
+        assert!(build_system_blocks(&none, true).is_empty());
     }
 }

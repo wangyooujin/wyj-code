@@ -1416,7 +1416,7 @@ impl MemoryV3Store {
     async fn process_job(&self, job: &MemoryJob, provider: Arc<dyn Provider>) -> Result<usize> {
         let result = provider
             .complete(
-                MEMORY_V3_EXTRACT_SYSTEM,
+                &wyj_api::SystemPrompt::stable_only(MEMORY_V3_EXTRACT_SYSTEM),
                 &[Message::user(memory_v3_extract_prompt(job))],
                 &[],
                 &wyj_api::provider::RequestOptions::text_only(4096),

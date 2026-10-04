@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.15：配置加载收敛到 .wyj-code/。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.16：后台任务可见性与自动续跑 + prompt cache 自我击穿修复。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.15 已公开发布：配置加载收敛到 .wyj-code/（全局 + 项目级），不再读取 ~/.claude/、~/.claude.json、&lt;cwd&gt;/.mcp.json、~/.codex/ 等外部源；/import 子命令与 Codex 兼容层同步下线。安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.16 已公开发布：后台任务不再"派完就不动"——后台 subagent 与后台 shell 完成即自动唤醒 Agent 续跑；新增底部后台任务面板实时看输出并按 k 终止。同期修复 prompt cache 自我击穿、子 Agent 权限比主 Agent 更严、persist_cap 两条 JSON 上限静默失效等缺陷。安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.15</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.16</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.15 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.16 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.15 · 配置加载收敛到 .wyj-code</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.15 是首个 BREAKING 版本——配置加载路径从"兼容外部"隐性向"独立产品"收敛。wyj-code 自 v1.5.15 起<strong>只</strong>读写 `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级）两个目录，不再读取 `~/.claude/commands/`、`~/.claude/agents/`、`~/.claude.json`、`<cwd>/.mcp.json`、`~/.codex/config.toml` 等任何外部源。Skill 加载链由 6 层裁为 4 层（内置 → `~/.wyj-code/skills` → 插件贡献 → 项目 `~/.wyj-code/skills`），SubAgent 类型链同方向 6 层裁为 4 层；MCP 全局配置 `Config::load()` 不再合并 `~/.claude.json`、项目级 `merged_mcp_servers` 不再读 `<cwd>/.mcp.json`、`uninstall_mcp_server` 删"原生来源 → 落禁用记录"分支统一走"从来源文件删行 + lockfile 移除"路径。<code>/import</code> slash 命令 + TUI `ImportDialog` + `ExtensionCommand::Migrate` + `crates/store/src/import.rs`（700+ 行）+ `crates/config/src/codex.rs`（Codex 兼容层 150+ 行 + 5 个测试）整链路下线——用户跨来源导入需求改为手工复制粘贴到 `.wyj-code/`。同步修复 master 上 pre-existing 的 `resolve_jev_api_key_prefers_field_over_env_when_both_set` 测试失败（拆 3 个测试 + 进程级 `JEV_ENV_LOCK: Mutex<()>` 串行化）；TUI `AgentEvent::TurnDone` 分支增加清扫，把任何遗留 InProgress 的 todo 自动收口为 Completed，根治"AI 已回复但任务列表还显示进行中"的 UI 割裂。CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。1099 个 workspace 测试 + clippy `-D warnings` 全绿。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.16 · 后台任务可见性与自动续跑</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">v1.5.16 把"后台任务派完就不动"和"后台输出看不见"两件事一次解决：后台 subagent 与后台 shell 完成时<strong>自动唤醒 Agent 续跑</strong>（多任务同帧完成合并成一轮，避免连续多次 LLM 往返）；新增底部<strong>后台任务面板</strong>实时滚动输出，<code>Enter</code> 展开、<code>PageUp</code>/<code>PageDown</code> 翻页看历史、按 <code>k</code> 直接终止进程组，任务退出时输出尾部自动回显给模型（不主动调 BashOutput 也看得到）；新增 <code>/shells [id]</code> 命令手动查看已结束任务。ESC 中断后暂停自动唤醒，直到你发下一条消息。任务列表全部完成后收成一行摘要，不再以折叠面板一直挂在聊天流里。同期修复一批"看起来在工作、实际静默失效"的缺陷：<strong>prompt cache 自我击穿</strong>（system prompt 拆 stable/volatile 两段，断点只打在稳定段，记忆快照按 10 轮分桶缓存）、<strong>子 Agent 权限比主 Agent 更严</strong>（Bypass 模式下子 Agent 的 Bash/Edit/Write 此前被全量拒掉）、<strong>persist_cap 两条 JSON 上限从上线起从未生效</strong>（截断插入的标记使 JSON 必然解析失败，错误被静默吞掉，超限的 Edit/Write 参数与 Bash 输出原样进请求体并落盘）、<strong>孤儿 tool_use 兜底配对</strong>（模型写参数被 max_tokens 截断时留下无配对 tool_result，该历史一旦落盘会让每次 --resume 永久 400）。1170+ workspace 测试 + clippy <code>-D warnings</code> 全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.15" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.15 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.16" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.16 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -538,8 +538,20 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.15</span>
+          <span class="font-display font-bold text-phosphor">v1.5.16</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516"><strong class="text-amber-400">后台任务可见性与自动续跑</strong>：此前后台 subagent 的结果只暂存到下一条用户消息才注入、后台 shell 更只返回一个 <code class="text-amber-400">bash_N</code> id 靠模型自己轮询 <code class="text-amber-400">BashOutput</code>，两条路都会停在等用户输入——"派完活就不动了"。现在主循环 idle 钩子检测到后台任务完成即自动起新 turn 把结果喂回主 Agent，多任务同帧完成合并成<strong>一轮</strong>避免连续多次 LLM 往返；<code class="text-amber-400">spawn_agent_turn</code> 新增自动唤醒模式（<code class="text-amber-400">text: Option&lt;String&gt;</code>），reminder 作为这一轮唯一 user 输入而非伪装成用户发言，聊天流只显示可读的 <code class="text-amber-400">⚙</code> 系统提示。ESC 中断后<strong>暂停自动唤醒</strong>（"我明明打断了怎么又跑起来"），直到你发下一条消息才恢复。新增底部<strong class="text-amber-400">后台任务面板</strong>：有 run_in_background 任务时自动出现，<code class="text-amber-400">BashSessionManager</code> 有完整输出缓冲但 TUI 侧此前一行代码都没接，所有后台任务在界面上完全不可见——现在列表实时显示 id / 命令 / 状态 / 耗时 / 退出码，<code class="text-amber-400">Enter</code> 展开实时输出、<code class="text-amber-400">PageUp/PageDown</code> 翻页看历史（默认贴底跟随）、按 <code class="text-amber-400">k</code> 终止进程组；任务退出时输出尾部自动回显给模型。新增 <code class="text-amber-400">/shells [id]</code> 命令手动查看已结束任务。两个面板互斥时按<strong>用户焦点优先</strong>（子 Agent 与后台 shell 常同时跑，固定先后会让其中一方永远看不见也按不了 k），跨区链条 <code class="text-amber-400">Chat ↓ → Todos ↓ → SubAgents ↓ → Shells</code>。新增 <code class="text-amber-400">BackgroundJob::tail()</code> 只读快照 API——面板每帧读输出不能推进 <code class="text-amber-400">BashOutput</code> 的增量游标，否则两者互相抢对方的内容。三个坑都做了防护：退出时 <code class="text-amber-400">kill_all()</code> 会把全部 job 翻成 <code class="text-amber-400">Exited(-1)</code>，<code class="text-amber-400">should_quit</code> 守卫拦住误唤醒；后台任务<strong>跨轮次保留</strong>只在会话级重置才清（否则 dev server 会在你发新消息时从面板凭空消失）；任务列表全部完成后<strong>收成一行摘要</strong>，不再以 2 行折叠面板一直挂到下一条消息。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516b"><strong class="text-amber-400">Prompt cache 自我击穿修复</strong>：<code class="text-amber-400">Provider</code> 的 <code class="text-amber-400">system</code> 参数从 <code class="text-amber-400">&amp;str</code> 改为 <code class="text-amber-400">&amp;SystemPrompt&lt;_'&gt;</code>（新增 <code class="text-amber-400">stable</code> / <code class="text-amber-400">volatile</code> 两段）。此前整个 system 压成一个字符串、Anthropic 侧只能发单个 text 块且断点打在块尾，而 system 里混了大量每轮会变的内容（工具可用性、模型兼容 suffix、子目录 CLAUDE.md reminder、Project Brief），<strong>任何一项变化都让整段 1.6k~5k token 全价重算</strong>——旧注释"reminder 只增不减、前缀仍可缓存"是错的，追加在断点之后同样改写前缀哈希。现在 stable 段末尾打 <code class="text-amber-400">cache_control: EPHEMERAL</code>、volatile 段不打（断点预算 3，仍在上限 4 内）；Project Brief 改按 <code class="text-amber-400">MEMORY_SNAPSHOT_REFRESH_TURNS = 10</code> 分桶缓存，缓存抖动降到 1/10。<strong>【源码级破坏】</strong>自定义 <code class="text-amber-400">Provider</code> 实现需改签名（辅助 LLM 调用用 <code class="text-amber-400">SystemPrompt::stable_only(...)</code> 一行迁移）。<strong>【API 移除】</strong><code class="text-amber-400">compact::COMPACT_TRIGGER_BUFFER</code> 常量改为函数。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516c"><strong class="text-amber-400">一批"看起来在工作、实际静默失效"的缺陷修复</strong>：<code class="text-amber-400">persist_cap</code> 的两条 JSON 上限<strong>从上线起从未生效</strong>——<code class="text-amber-400">ToolUse.input</code> 与 tool_result 的 <code class="text-amber-400">Blocks</code> 被 <code class="text-amber-400">to_string</code> 后做字符串级截断，插入的 <code class="text-amber-400">[truncated N bytes]</code> 标记使 JSON <strong>必然</strong>解析失败，而失败分支是 <code class="text-amber-400">if let Ok(...)</code> 静默吞掉，超限的 Edit/Write 参数与 Bash 输出原样进请求体并落盘；改为 <code class="text-amber-400">shrink_json_to_budget()</code> 按"最长 string 叶子"裁剪并保持合法 JSON。<strong>子 Agent 权限比主 Agent 更严</strong>：父级处于 Bypass(AutoApprove) 时子 Agent 落回默认 Prompt，而它没有审批 UI，<code class="text-amber-400">Prompt</code> + 无 UI 通道在 <code class="text-amber-400">PermissionPolicy::evaluate</code> 与 <code class="text-amber-400">confirm_tool</code> <strong>两道</strong>关卡上 fail-closed，Bash/Edit/Write 被全量拒掉；改为委派本身已在父级审批过、子 Agent 继承 AutoApprove，同时<strong>加护栏</strong>：只有被委派类型<em>可能</em>拿到副作用工具时才弹一次审批（Explore/Plan 零打扰）。<strong>孤儿 tool_use 兜底配对</strong>：模型写参数被 <code class="text-amber-400">max_tokens</code> 截断时留下无配对 <code class="text-amber-400">tool_result</code>，该历史一旦落盘会让每次 <code class="text-amber-400">--resume</code> 永久 400 且用户无法自愈；现在合成 <code class="text-amber-400">is_error: true</code> 的兜底结果。<strong>Checkpoint 配置被 TUI 侧覆盖</strong>：7 处裸 <code class="text-amber-400">new()</code> + <code class="text-amber-400">attach_agent_session</code> 覆盖装配好的 store，切换一次模型后 checkpoint 不再封顶、快照不走 CAS 去重（同 session 从 &lt;5 MB 退回 200 MB 量级）；改为进程级 <code class="text-amber-400">set_checkpoint_config()</code> + <code class="text-amber-400">configured()</code>。<strong>压缩用量漏记</strong>：压缩本身的 LLM 往返被丢弃，<code class="text-amber-400">/cost</code> 系统性低估真实花费；<strong>悬空 cwd panic</strong>：工作目录被删时 <code class="text-amber-400">current_dir()</code> 返回 Err 而调用点 <code class="text-amber-400">.unwrap()</code> panic，改为明确中文错误并<strong>刻意不做 <code class="text-amber-400">$HOME</code> 兜底</strong>（cwd 决定 project root 与会话归属，静默换目录比报错危险）；<code class="text-amber-400">/context</code> 占用率不再写死 200K；<code class="text-amber-400">agent.compacted</code> 文案从硬编码中文改走 i18n。删除 4 个<strong>从未有任何消费点的幻象配置</strong>（<code class="text-amber-400">checkpoint_bytes_per_session</code> / <code class="text-amber-400">cas_total_bytes</code> / <code class="text-amber-400">cas_gc_on_start</code> / <code class="text-amber-400">checkpoint_ttl_days</code>，迁移成本为零）——但需注意 <code class="text-amber-400">cas/</code> 与 <code class="text-amber-400">*.checkpoints/</code> 至今仍无任何回收路径。</p>
+      </div>
+    </div>
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-amber-500">v1.5.15</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1515"><strong class="text-amber-400">配置加载收敛到 .wyj-code/（BREAKING）</strong>：wyj-code 自 v1.5.15 起<strong>只</strong>读写 <code class="text-amber-400">~/.wyj-code/</code>（全局）与 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/</code>（项目级），不再读取 <code class="text-amber-400">~/.claude/commands/</code> / <code class="text-amber-400">~/.claude/agents/</code> / <code class="text-amber-400">~/.claude.json</code> / <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code> / <code class="text-amber-400">~/.codex/</code> 等任何外部源。Skill 加载链由 6 层裁为 4 层（内置 → <code class="text-amber-400">~/.wyj-code/skills</code> → 插件贡献 → 项目 <code class="text-amber-400">~/.wyj-code/skills</code>），SubAgent 类型链同方向 6 层裁为 4 层；MCP 全局 <code class="text-amber-400">Config::load()</code> 不再合并 <code class="text-amber-400">~/.claude.json</code>、项目级 <code class="text-amber-400">merged_mcp_servers</code> 不再读 <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code>、<code class="text-amber-400">uninstall_mcp_server</code> 删"原生来源 → 落禁用记录"分支统一走"从来源文件删行 + lockfile 移除"。<code class="text-amber-400">/import</code> slash 命令 + TUI <code class="text-amber-400">ImportDialog</code> + <code class="text-amber-400">ExtensionCommand::Migrate</code> + <code class="text-amber-400">crates/store/src/import.rs</code>（700+ 行）+ <code class="text-amber-400">crates/config/src/codex.rs</code>（Codex 兼容层 150+ 行 + 5 个测试）整链路下线——用户跨来源导入需求改为手工复制粘贴到 <code class="text-amber-400">.wyj-code/</code>。同步修复 master 上 pre-existing 的 <code class="text-amber-400">resolve_jev_api_key_prefers_field_over_env_when_both_set</code> 测试失败（拆 3 个测试 + 进程级 <code class="text-amber-400">JEV_ENV_LOCK: Mutex&lt;()&gt;</code> 串行化）；TUI <code class="text-amber-400">AgentEvent::TurnDone</code> 分支增加清扫，把任何遗留 InProgress 的 todo 自动收口为 Completed，根治"AI 已回复但任务列表还显示进行中"的 UI 割裂。CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。1099 个 workspace 测试 + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
       </div>

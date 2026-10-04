@@ -287,6 +287,10 @@ impl ToolContext for ToolCtx {
         )
     }
 
+    fn permission_mode(&self) -> Option<wyj_core::permission::PermissionMode> {
+        Some(self.permission_mode.read().unwrap().clone())
+    }
+
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         safe_resolve_write_target(&self.cwd, raw).map_err(|reason| reason.message)
     }
@@ -530,5 +534,76 @@ mod tests {
         assert!(!ctx.confirm_tool("Bash", "rm -rf /").await);
         responder.await.unwrap();
         assert!(!ctx.always_allowed.read().unwrap().contains("Bash"));
+    }
+
+    #[tokio::test]
+    async fn bypass_mode_exposes_auto_approve_and_no_allowlist() {
+        // Bypass 下 `allowed_tools()` 返回 None（白名单语义不适用），
+        // 子 Agent 必须改从 `permission_mode()` 读到 AutoApprove，
+        // 否则会落回 Prompt 而被无 UI 通道 fail-closed。
+        let ctx = ToolCtx::new("/tmp");
+        ctx.set_permission_mode(PermissionMode::AutoApprove);
+        assert!(ctx.allowed_tools().is_none());
+        assert!(matches!(
+            ctx.permission_mode(),
+            Some(PermissionMode::AutoApprove)
+        ));
+        assert!(ctx.confirm_tool("Bash", "ls").await);
+    }
+
+    /// 端到端复现用户报的场景：父级 Normal(Prompt) 模式 → 派生一个子 Agent
+    /// ctx（无审批 UI、surface = SubAgent）→ 走完整两道权限关卡。
+    ///
+    /// 修复前：Bash 在 `is_allowed`（`evaluate`: Prompt + 副作用工具 + 非交互
+    /// surface → `interactive_approval_unavailable`）就被拒，压根到不了
+    /// `confirm_tool`。
+    #[tokio::test]
+    async fn sub_agent_bash_is_blocked_under_prompt_and_allowed_after_inheritance() {
+        use serde_json::json;
+        let cwd = std::env::temp_dir();
+        let input = json!({ "command": "ls -la" });
+
+        // ── 修复前的行为：Prompt + SubAgent surface，无审批 UI ──
+        let before = ToolCtx::new(&cwd);
+        before.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+        before.set_permission_mode(PermissionMode::Prompt);
+        assert!(
+            !before.is_allowed("Bash", &input),
+            "Prompt + 非交互 surface 的 Bash 本应在 evaluate 处被拒（修复前的基线）"
+        );
+        assert!(!before.confirm_tool("Bash", "ls -la").await);
+
+        // ── 修复后：父级 Prompt → 子 Agent 继承 AutoApprove ──
+        let after = ToolCtx::new(&cwd);
+        after.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+        after.set_permission_mode(PermissionMode::AutoApprove);
+        assert!(
+            after.is_allowed("Bash", &input),
+            "继承放行后 evaluate 应放行"
+        );
+        assert!(after.confirm_tool("Bash", "ls -la").await);
+    }
+
+    /// Plan 模式必须**继续**收窄：子 Agent 拿到的是只读白名单 + Plan 语义，
+    /// 写工具与非只读 Bash 仍应被拒。
+    #[test]
+    fn plan_parent_keeps_sub_agent_read_only() {
+        use serde_json::json;
+        let allowed: HashSet<String> = ["Read", "Glob", "Grep", "Bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ctx = ToolCtx::new(std::env::temp_dir());
+        ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+        ctx.set_permission_mode(PermissionMode::Plan(allowed));
+        // 只读命令放行
+        assert!(ctx.is_allowed("Bash", &json!({ "command": "ls" })));
+        // 有副作用的命令仍被拒
+        assert!(!ctx.is_allowed("Bash", &json!({ "command": "rm -rf /tmp/x" })));
+        // 写工具不在白名单
+        assert!(!ctx.is_allowed(
+            "Write",
+            &json!({ "file_path": "src/lib.rs", "content": "x" })
+        ));
     }
 }

@@ -21,15 +21,14 @@ input:
 # 此处仅保留用户可见的 UI 文案。
 
 subagent:
+  spawn_summary: "启动 {type} 子 Agent"
+  spawn_summary_named: "启动 {type} 子 Agent：{desc}"
   unknown_type: "未知的 agent 类型 `{name}`。可用类型: {available}"
   create_failed: "创建子 Agent 失败: {err}"
   run_failed: "子 Agent 执行失败: {err}"
   interrupted: "子 Agent 已被中断"
   no_output: "子 Agent 未产生输出"
   bg_done_notice: "后台 agent {id}（{type}: {desc}）已完成，结果将注入对话"
-  waiting_bg: "等待 {count} 个后台 agent 完成…"
-  panel_title: " agents [{count}] "
-  inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
   inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
@@ -44,6 +43,27 @@ subagents:
   not_found: "未找到子 Agent a{id}（本会话不存在该 id）"
   empty: "本会话暂无子 Agent 记录"
   headless_unsupported: "[headless 模式不支持 /subagents 面板，请用 `wyj-code subagent-trace <session-id> [id]` 查看落盘的执行轨迹]"
+
+shell:
+  panel_title: " 后台任务 [{count}] "
+  focus_hint: "↑↓ 选择   Enter/Space 查看输出   k 终止   Esc 返回输入框"
+  detail_hint: "↑↓ 滚动   PageUp/PageDown 翻页   k 终止   Enter/Esc 返回列表"
+  no_output: "(暂无输出)"
+  exited: "已退出 ({code})"
+
+shells:
+  desc: "打开后台 Shell 面板，查看后台 Bash 任务的实时输出与状态"
+  bad_id: "无效的后台任务 id: `{arg}`（应为形如 bash_1 或 1）"
+  not_found: "未找到后台任务 {id}（本会话不存在该 id）"
+  empty: "本会话暂无后台 Shell 任务"
+  headless_unsupported: "[headless 模式不支持 /shells 面板；模型侧仍可通过 BashOutput 工具读取后台任务输出]"
+  exited_notice: "后台任务 {id} 已退出（code {code}，耗时 {elapsed}）"
+  kill_done: "已终止后台任务 {id}"
+  kill_missing: "未找到可终止的后台任务 {id}"
+  kill_nothing_selected: "未选中后台任务（按 ↑↓ 选择一个）"
+
+bg_wake:
+  notice: "后台任务已完成，正在自动继续执行"
 
 subagent_trace:
   no_records: "会话 {session} 没有落盘的子 Agent 记录（未跑过子 Agent，或 trace_enabled=false）"
@@ -62,6 +82,7 @@ thinking:
 agent:
   degraded:
     parameter_removed: "[模型端点不支持参数 `{name}`，已安全移除后重试一次]"
+  compacted: "\n[已压缩对话历史：移除 {removed} 条消息，节省约 {saved} tokens]\n"
 
 claude_md:
   source:
@@ -138,6 +159,7 @@ help:
     - `/cost` — 显示本会话 token 用量与费用估算（含子 Agent 用量单列）
     - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
+    - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/decision [ping|ask <问题>]` — 通过 TypeSafe Jev 决策 API 获取结构化判断；用于意图路由/分类/置信度标注，需要 [tools.jev].enabled=true 且 TYPESAFE_API_KEY 或 api_key 已配置
