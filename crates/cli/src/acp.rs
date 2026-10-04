@@ -595,7 +595,7 @@ async fn rewind_session(
         .session_store
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("checkpoint storage is unavailable"))?;
-    let checkpoints = CheckpointStore::new(store.dir(), entry.runtime.session_id())?;
+    let checkpoints = CheckpointStore::configured(store.dir(), entry.runtime.session_id())?;
     let checkpoint = checkpoints.load(checkpoint_id)?;
     let scope = parse_rewind_scope(scope)?;
     let preview = if matches!(scope, RewindScope::Files | RewindScope::Both) {
@@ -669,7 +669,7 @@ async fn branch_session(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("session/checkpoint storage is unavailable"))?;
     persist_session(state, entry).await;
-    let checkpoints = CheckpointStore::new(store.dir(), entry.runtime.session_id())?;
+    let checkpoints = CheckpointStore::configured(store.dir(), entry.runtime.session_id())?;
     let checkpoint = checkpoints.load(checkpoint_id)?;
     let preview = if restore_files {
         Some(checkpoints.preview_files(checkpoint_id, &entry.cwd)?)
@@ -1199,7 +1199,7 @@ mod tests {
     impl Provider for StaticProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &RequestOptions,
@@ -1221,7 +1221,7 @@ mod tests {
     impl Provider for PermissionProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &RequestOptions,
@@ -1298,7 +1298,7 @@ mod tests {
     impl Provider for BlockingProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &RequestOptions,
@@ -1713,7 +1713,7 @@ mod tests {
             .unwrap();
         client_write.flush().await.unwrap();
         let session_id = read_session_id(&mut lines).await;
-        let checkpoints = CheckpointStore::new(store.dir(), session_id.clone()).unwrap();
+        let checkpoints = CheckpointStore::configured(store.dir(), session_id.clone()).unwrap();
         let checkpoint = checkpoints
             .create(
                 cwd.path(),

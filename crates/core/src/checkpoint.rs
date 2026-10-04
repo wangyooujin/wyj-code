@@ -203,6 +203,67 @@ pub struct CheckpointStore {
     cas: Option<Arc<WorkspaceCas>>,
 }
 
+/// 进程内 checkpoint 构造配置,由 CLI 装配阶段 `set_checkpoint_config` 注入,
+/// `CheckpointStore::configured` 读取。
+///
+/// 存在的理由:TUI 侧有 7 处用裸 `CheckpointStore::new(...)` 构造 store
+/// (`attach_agent_session` + 6 处直接写路径),而裸 `new()` 的
+/// `max_per_session` 硬编码 0(= 不限)、`cas` 恒为 `None`。其中
+/// `attach_agent_session` 还会**覆盖**掉 CLI 装配阶段已经正确配置好的
+/// store —— 结果是 TUI 用户只要切换过一次模型 / 模式,checkpoint 就不再
+/// 封顶、文件快照也不再走 CAS 去重(同 session 从 <5 MB 退回 200 MB 量级)。
+///
+/// 走进程级配置后,所有构造点拿到同一份配置,不再依赖"谁最后 set"。
+/// 用 `Mutex<Option<>>` 而非 `OnceLock` 是为了允许单测重置
+/// (`OnceLock` 只能 set 一次,跨测试用例不够用)。
+#[derive(Clone, Default)]
+pub struct CheckpointConfig {
+    /// 单 session checkpoint 条数上限(0 = 不限)。
+    pub max_per_session: usize,
+    /// 可选 CAS 池,用于 capture_files / restore_files_snapshot 去重。
+    pub cas: Option<Arc<WorkspaceCas>>,
+}
+
+static CHECKPOINT_CONFIG: std::sync::Mutex<Option<CheckpointConfig>> = std::sync::Mutex::new(None);
+
+/// CLI 装配阶段(主进程 `main` 入口)调用一次,把
+/// `cfg.storage.checkpoints_per_session` 与已打开的 CAS 池注入全局。
+pub fn set_checkpoint_config(cfg: CheckpointConfig) {
+    match CHECKPOINT_CONFIG.lock() {
+        Ok(mut slot) => *slot = Some(cfg),
+        Err(poisoned) => {
+            tracing::warn!("checkpoint config 锁被 poison，沿用既有配置");
+            *poisoned.into_inner() = Some(cfg);
+        }
+    }
+}
+
+/// 仅供单测:清空进程内配置,避免用例之间互相污染。
+#[cfg(test)]
+pub fn clear_checkpoint_config_for_tests() {
+    if let Ok(mut slot) = CHECKPOINT_CONFIG.lock() {
+        *slot = None;
+    }
+}
+
+impl CheckpointStore {
+    /// 按进程内全局配置构造 store。**TUI 的所有构造点都应走这里**,
+    /// 而不是 `new()`。
+    ///
+    /// 未配置(单测、库调用方)时退化为 `new()` 语义:不限条数、不接 CAS。
+    pub fn configured(sessions_dir: &Path, session_id: impl Into<String>) -> Result<Self> {
+        let cfg = CHECKPOINT_CONFIG
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default();
+        let mut store = Self::new(sessions_dir, session_id)?;
+        store.max_per_session = cfg.max_per_session;
+        store.cas = cfg.cas;
+        Ok(store)
+    }
+}
+
 impl CheckpointStore {
     pub fn new(sessions_dir: &Path, session_id: impl Into<String>) -> Result<Self> {
         let session_id = session_id.into();
@@ -1570,5 +1631,53 @@ mod tests {
         assert_eq!(entry.inline_bytes.len(), 2048);
         let stats = cas.stats().unwrap();
         assert_eq!(stats.total_blobs, 0, "超阈值不应进 CAS");
+    }
+
+    // ── configured() 进程级配置 ─────────────────────────────────────────
+    //
+    // 回归背景：TUI 的 `attach_agent_session` 曾用裸 `CheckpointStore::new()`
+    // 覆盖 CLI 装配好的 store，而裸 new() 的 max_per_session 恒为 0(不限)、
+    // cas 恒为 None。用户切换一次模型后 checkpoint 就不再封顶、文件快照
+    // 也不再走 CAS 去重。
+
+    #[test]
+    fn configured_defaults_to_unlimited_and_no_cas_when_unset() {
+        clear_checkpoint_config_for_tests();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::configured(sessions.path(), "s-default").unwrap();
+        assert_eq!(store.max_per_session, 0, "未注入配置时应等同裸 new()");
+        assert!(store.cas().is_none());
+    }
+
+    #[test]
+    fn configured_picks_up_injected_max_per_session() {
+        clear_checkpoint_config_for_tests();
+        let sessions = tempfile::tempdir().unwrap();
+        set_checkpoint_config(CheckpointConfig {
+            max_per_session: 7,
+            cas: None,
+        });
+        let store = CheckpointStore::configured(sessions.path(), "s-injected").unwrap();
+        assert_eq!(store.max_per_session, 7);
+        // 无 CAS 时不应 panic，capture_files 走 inline 兜底
+        assert!(store.cas().is_none());
+        clear_checkpoint_config_for_tests();
+    }
+
+    #[test]
+    fn set_checkpoint_config_replaces_previous_value() {
+        clear_checkpoint_config_for_tests();
+        let sessions = tempfile::tempdir().unwrap();
+        set_checkpoint_config(CheckpointConfig {
+            max_per_session: 3,
+            cas: None,
+        });
+        set_checkpoint_config(CheckpointConfig {
+            max_per_session: 5,
+            cas: None,
+        });
+        let store = CheckpointStore::configured(sessions.path(), "s-replace").unwrap();
+        assert_eq!(store.max_per_session, 5, "后一次注入应覆盖前一次");
+        clear_checkpoint_config_for_tests();
     }
 }

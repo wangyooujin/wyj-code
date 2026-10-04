@@ -444,7 +444,7 @@ fn stream_events_from_chunk(
 /// 字段由 `apply_thinking_to_openai_body` 在此调用后 mutate。
 fn build_openai_request_body(
     identity: &ModelIdentity,
-    system: &str,
+    system: &crate::provider::SystemPrompt<'_>,
     messages: &[Message],
     tools: &[ToolDefinition],
     opts: &crate::provider::RequestOptions,
@@ -452,9 +452,11 @@ fn build_openai_request_body(
     supports_vision: bool,
 ) -> Map<String, Value> {
     let max_tokens = opts.max_tokens;
+    // Chat Completions 没有 system 块 / cache_control 概念，只有一条 system
+    // 消息，因此把 stable + volatile 拼成一条即可（`combined` 已处理空段）。
     let mut api_messages = vec![ApiMessage {
         role: "system".to_string(),
-        content: Some(Value::String(system.to_string())),
+        content: Some(Value::String(system.combined())),
         tool_calls: None,
         tool_call_id: None,
     }];
@@ -524,7 +526,7 @@ fn build_openai_request_body(
 impl Provider for OpenAIProvider {
     async fn stream(
         &self,
-        system: &str,
+        system: &crate::provider::SystemPrompt<'_>,
         messages: &[Message],
         tools: &[ToolDefinition],
         opts: &crate::provider::RequestOptions,
@@ -927,7 +929,15 @@ mod tests {
             reasoning_effort: Some("high".to_string()),
             ..Default::default()
         };
-        let body = build_openai_request_body(&id, "sys", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         assert_eq!(body["model"], "deepseek-v4-pro");
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_effort"], "high");
@@ -941,7 +951,15 @@ mod tests {
             thinking_budget: Some(8192),
             ..Default::default()
         };
-        let body = build_openai_request_body(&id, "sys", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         assert_eq!(body["enable_thinking"], true);
         assert_eq!(body["thinking_budget"], 8192);
         assert!(body.get("reasoning_effort").is_none());
@@ -955,7 +973,15 @@ mod tests {
             thinking_budget: Some(20_000),
             ..Default::default()
         };
-        let body = build_openai_request_body(&id, "sys", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 8192);
     }
@@ -968,7 +994,15 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             ..Default::default()
         };
-        let body = build_openai_request_body(&id, "sys", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["reasoning_split"], true);
     }
@@ -977,7 +1011,15 @@ mod tests {
     fn body_skips_thinking_when_disabled_and_user_opted_in_to_default() {
         let id = identity_for("zhipu", "glm-4.6");
         let opts = crate::provider::RequestOptions::default();
-        let body = build_openai_request_body(&id, "sys", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         // 没开 thinking 时 body 不带 thinking 字段
         assert!(body.get("thinking").is_none());
         assert!(body.get("enable_thinking").is_none());
@@ -990,7 +1032,15 @@ mod tests {
             max_tokens: 4096,
             ..Default::default()
         };
-        let body = build_openai_request_body(&id, "You are helpful.", &[], &[], &opts, false, true);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("You are helpful."),
+            &[],
+            &[],
+            &opts,
+            false,
+            true,
+        );
         assert_eq!(body["model"], "gpt-5");
         assert_eq!(body["stream"], true);
         let messages = body["messages"].as_array().expect("messages array");
@@ -998,5 +1048,26 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "You are helpful.");
         assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn openai_system_message_concatenates_stable_and_volatile() {
+        // Chat Completions 没有 system 块 / cache_control 概念，两段拼成一条
+        // system 消息即可；拼接结果必须与 SystemPrompt::combined() 一致。
+        let id = identity_for("openai", "gpt-test");
+        let opts = crate::provider::RequestOptions::text_only(16);
+        let system = crate::provider::SystemPrompt {
+            stable: "STABLE",
+            volatile: "VOLATILE",
+        };
+        let body = build_openai_request_body(&id, &system, &[], &[], &opts, false, true);
+        let messages = body.get("messages").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], system.combined().as_str());
+        assert!(messages[0]["content"].as_str().unwrap().contains("STABLE"));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("VOLATILE"));
     }
 }

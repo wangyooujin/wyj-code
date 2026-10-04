@@ -570,6 +570,37 @@ impl Command for SubAgentsCmd {
     }
 }
 
+/// 打开/定位后台 Shell 任务面板；`args` 可选，形如 `bash_1` 或 `1`。
+pub struct ShellsCmd;
+
+#[async_trait]
+impl Command for ShellsCmd {
+    fn name(&self) -> &str {
+        "shells"
+    }
+    fn description(&self) -> String {
+        tr("shells.desc")
+    }
+    fn usage(&self) -> String {
+        "/shells [id]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        let arg = args.trim();
+        if arg.is_empty() {
+            return Ok(CommandResult::OpenShellsPanel(None));
+        }
+        // 后台任务 id 形如 `bash_1`；同时接受裸数字（1），方便用户少打几个字符
+        let digits = arg.strip_prefix("bash_").unwrap_or(arg);
+        match digits.parse::<u64>() {
+            Ok(n) => Ok(CommandResult::OpenShellsPanel(Some(format!("bash_{n}")))),
+            Err(_) => Ok(CommandResult::Output(tr_fmt(
+                "shells.bad_id",
+                &[("arg", arg)],
+            ))),
+        }
+    }
+}
+
 fn fmt_num(n: u32) -> String {
     let s = n.to_string();
     let mut result = String::new();
@@ -1618,6 +1649,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(SubAgentsCmd));
+    reg.register(Arc::new(ShellsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(EvolveCmd));
@@ -1671,6 +1703,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(CostCmd));
     reg.register(Arc::new(AgentsCmd));
     reg.register(Arc::new(SubAgentsCmd));
+    reg.register(Arc::new(ShellsCmd));
     reg.register(Arc::new(HooksCmd));
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(EvolveCmd));
@@ -1867,6 +1900,47 @@ mod subagents_tests {
             CommandResult::Output(text) => assert!(text.contains("not-a-number")),
             other => panic!("expected Output error text, got {other:?}"),
         }
+    }
+
+    // ── /shells ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn shells_no_args_opens_panel_without_target() {
+        let ctx = empty_ctx();
+        let result = ShellsCmd.run("", &ctx).await.unwrap();
+        assert!(matches!(result, CommandResult::OpenShellsPanel(None)));
+    }
+
+    #[tokio::test]
+    async fn shells_accepts_both_bash_prefixed_and_bare_numeric_ids() {
+        let ctx = empty_ctx();
+        // 面板里显示的就是 `bash_1`，用户也可能只记得尾号
+        assert!(matches!(
+            ShellsCmd.run("bash_3", &ctx).await.unwrap(),
+            CommandResult::OpenShellsPanel(Some(id)) if id == "bash_3"
+        ));
+        assert!(matches!(
+            ShellsCmd.run("3", &ctx).await.unwrap(),
+            CommandResult::OpenShellsPanel(Some(id)) if id == "bash_3"
+        ));
+    }
+
+    #[tokio::test]
+    async fn shells_garbage_arg_reports_error() {
+        let ctx = empty_ctx();
+        let result = ShellsCmd.run("not-a-shell", &ctx).await.unwrap();
+        match result {
+            CommandResult::Output(text) => assert!(text.contains("not-a-shell")),
+            other => panic!("expected Output error text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shells_command_is_registered() {
+        // CLAUDE.md 约定：新增 slash 命令必须在同一个注册表里出现，
+        // 否则用户根本无从发现（/help 是唯一入口）。
+        let reg = standard_registry();
+        assert!(reg.get("shells").is_some(), "/shells 必须注册进命令表");
     }
 }
 

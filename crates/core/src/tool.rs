@@ -104,6 +104,21 @@ pub trait ToolContext: Send + Sync {
     fn is_plan_mode(&self) -> bool {
         false
     }
+    /// 当前权限模式，供派生的子 Agent 忠实继承。
+    ///
+    /// 背景：`allowed_tools()` 只在白名单语义（`Plan`/`Allowlist`）下返回
+    /// `Some`，对 `Prompt` 与 `AutoApprove` 一律返回 `None`。子 Agent 过去
+    /// 只据 `allowed_tools()` 决定自身模式，于是父级处于 **Bypass
+    /// (`AutoApprove`)** 时子 Agent 会落回默认的 `Prompt`；而子 Agent 没有
+    /// 审批 UI，`Prompt` + 无 UI 通道 = `confirm_tool`/`evaluate` 一律 fail-closed
+    /// —— 结果是 Bypass 下子 Agent 的 Bash/Edit/Write **全部被拒**，比父级更严，
+    /// 任何继承语义都不可能要求这样。
+    ///
+    /// 默认 `None` 表示「不暴露模式」，派生 Agent 退回旧的 `allowed_tools()`
+    /// 逻辑（保持对既有 mock / 其它 `ToolContext` 实现的兼容）。
+    fn permission_mode(&self) -> Option<crate::permission::PermissionMode> {
+        None
+    }
     /// 再次安全解析真实写入目标。Write/Edit 在落盘前调用，避免只在 Agent 前置
     /// 权限检查中解析一次后被路径或 symlink 竞态绕过。
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<std::path::PathBuf, String> {

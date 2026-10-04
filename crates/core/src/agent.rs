@@ -243,6 +243,31 @@ pub struct Agent {
     /// `None` 表示关闭 runtime 截断(磁盘路径仍由 `SessionStore::save` 自身的
     /// `current_persist_cap()` 全局兜底)。
     persist_cap: Option<wyj_config::PersistCapCfg>,
+    /// 跨会话记忆快照缓存（system prompt 稳定前缀的一部分）。分桶重算，
+    /// 避免每轮改写 system 尾部击穿 prompt cache。用 `Arc<Mutex<..>>` 是为了
+    /// 兼容 `Agent: Clone`（TUI `/model` 重建与模式切换都会 clone），
+    /// 同时让重建出的 Agent 继承同一份缓存。
+    memory_snapshot: Arc<std::sync::Mutex<MemorySnapshotCache>>,
+}
+
+/// 跨会话记忆快照的重算间隔（按用户轮次分桶）。
+///
+/// Project Brief 每次都按「最近 4 条 user 消息」重算相关性排序
+/// （`MemoryV3Store::project_brief`），而它被拼进 system prompt 的稳定前缀
+/// —— 意味着**每个用户轮次都会改写 system 尾部**，把整段 system（约
+/// 1.6k~5k token）的 prompt cache 全部击穿。旧 v1 `MemoryStore` 专门用
+/// `OnceLock` 冻结整个会话来防这件事，v3 路径没继承该保护。
+///
+/// 折中：按桶重算 —— 每 10 个用户轮次才重算一次，缓存抖动降到 1/10，
+/// 同时长会话内后台新提取的记忆不会无限期对模型不可见（最迟 10 轮后可见）。
+const MEMORY_SNAPSHOT_REFRESH_TURNS: u32 = 10;
+
+/// 记忆快照缓存：按 `用户轮次 / MEMORY_SNAPSHOT_REFRESH_TURNS` 分桶，
+/// 同桶内复用上次算好的文本。
+#[derive(Default)]
+struct MemorySnapshotCache {
+    bucket: Option<u32>,
+    text: String,
 }
 
 struct EvolutionEpisodeGuard {
@@ -297,6 +322,7 @@ impl Agent {
             fallback_routes: Vec::new(),
             active_route: Arc::new(AtomicUsize::new(0)),
             thinking_cb: None,
+            memory_snapshot: Arc::new(std::sync::Mutex::new(MemorySnapshotCache::default())),
             hook_runner: None,
             checkpoint_store: None,
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -774,6 +800,42 @@ impl Agent {
         result
     }
 
+    /// 取本次请求要拼进 system 稳定前缀的跨会话记忆快照。
+    ///
+    /// 按「用户轮次 / [`MEMORY_SNAPSHOT_REFRESH_TURNS`]」分桶：同桶直接复用
+    /// 缓存文本，跨桶才真正重算。分桶而非纯计数是为了让「同一桶内的多次
+    /// turn」自然命中——即使 session 被 `/clear` 重置，桶号也会自然回退。
+    fn memory_snapshot_text(&self, session: &Session) -> String {
+        let user_turns = session
+            .messages
+            .iter()
+            .filter(|m| m.role == wyj_api::types::Role::User)
+            .count() as u32;
+        let bucket = user_turns / MEMORY_SNAPSHOT_REFRESH_TURNS;
+
+        let mut cache = match self.memory_snapshot.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.bucket == Some(bucket) {
+            return cache.text.clone();
+        }
+
+        let text = if let Some(memory) = &self.memory_v3 {
+            build_memory_snapshot(memory, session)
+        } else if let Some(evolution) = &self.evolution {
+            evolution.context_snapshot(&last_user_goal(session))
+        } else if let Some(mem) = &self.memory {
+            // 旧 v1 store 自身已用 OnceLock 冻结，这里再缓存一层也无副作用。
+            mem.load_context_cached().to_string()
+        } else {
+            String::new()
+        };
+        cache.bucket = Some(bucket);
+        cache.text = text.clone();
+        text
+    }
+
     async fn run_turn_with_injection_inner(
         &self,
         session: &mut Session,
@@ -787,38 +849,31 @@ impl Agent {
         if let Some(state) = &self.lazy_tool_state {
             state.begin_task_turn();
         }
-        // 构建 system prompt 基础部分：默认提示 + 跨会话记忆 + CLAUDE.md 祖先链。
-        // CLAUDE.md 内容拼进 system prompt（而非注入 user 消息），配合 prompt caching
-        // 使其首轮全价、后续轮次命中缓存按 0.1x 计费，避免跨轮线性累积。
-        // 子目录动态 reminder 在循环内追加到 system 末尾（只增不减，前缀仍可缓存）。
-        let mut system = self.system_prompt.clone();
-        if let Some(memory) = &self.memory_v3 {
-            let snapshot = build_memory_snapshot(memory, session);
-            if !snapshot.is_empty() {
-                system.push_str("\n\n");
-                system.push_str(&snapshot);
-            }
-        } else if let Some(evolution) = &self.evolution {
-            let snapshot = evolution.context_snapshot(&last_user_goal(session));
-            if !snapshot.is_empty() {
-                system.push_str("\n\n");
-                system.push_str(&snapshot);
-            }
-        } else if let Some(mem) = &self.memory {
-            // 会话级快照：本会话内容固定，防止后台提取的新记忆改变 system
-            // 前缀而击穿 prompt 缓存；新记忆自然在下个会话生效。
-            let ctx_str = mem.load_context_cached();
-            if !ctx_str.is_empty() {
-                system.push_str("\n\n");
-                system.push_str(ctx_str);
-            }
+        // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
+        //
+        //   * `system_stable`   —— 主提示 + 跨会话记忆 + CLAUDE.md 祖先链。
+        //     承载 prompt cache，Anthropic 侧 cache_control 断点打在这段末尾。
+        //     记忆快照按 10 个用户轮次分桶重算（`memory_snapshot_text`），
+        //     CLAUDE.md 每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
+        //     「用户改了 CLAUDE.md」时才失效缓存。
+        //
+        //   * `system_volatile` —— 循环内累积的子目录 CLAUDE.md reminder。
+        //     放在断点之后：旧实现把它 `push_str` 到 system 末尾并注释说
+        //     「只增不减，前缀仍可缓存」——这是错的，追加在断点**之后**同样会
+        //     改变断点处的前缀哈希，导致每命中一个新目录就整段全价重算。
+        let mut system_stable = self.system_prompt.clone();
+        let memory_snapshot = self.memory_snapshot_text(session);
+        if !memory_snapshot.is_empty() {
+            system_stable.push_str("\n\n");
+            system_stable.push_str(&memory_snapshot);
         }
         if let Some(loader) = &self.claude_md {
             if let Some(reminder) = loader.turn_reminder() {
-                system.push_str("\n\n");
-                system.push_str(&reminder);
+                system_stable.push_str("\n\n");
+                system_stable.push_str(&reminder);
             }
         }
+        let mut system_volatile = String::new();
 
         // 调用方在进入 run_turn 前已 push 本次真实用户消息；checkpoint 保存其
         // 之前的完整对话与当前工作树，确保 /rewind 可以回到提交前边界。
@@ -915,12 +970,14 @@ impl Agent {
             let mut route_index = self.active_route_index();
             let (blocks, stop_reason, used_route) = 'route_attempt: loop {
                 let route = self.route_at(route_index);
-                let mut request_system = system.clone();
+                // stable 段跨 route 复用（内容本就与 route 无关）；每轮变化的
+                // 部分（模型兼容 suffix + 当前工具可用性）归入 volatile。
+                let mut request_system_volatile = system_volatile.clone();
                 if let Some(capabilities) = &route.capabilities {
                     let suffix = wyj_api::PromptPolicy::compatibility_suffix(capabilities);
                     if !suffix.is_empty() {
-                        request_system.push_str("\n\n");
-                        request_system.push_str(suffix);
+                        request_system_volatile.push_str("\n\n");
+                        request_system_volatile.push_str(suffix);
                     }
                 }
                 let opts = if let Some(capabilities) = &route.capabilities {
@@ -971,10 +1028,14 @@ impl Agent {
                     .iter()
                     .map(|definition| definition.name.as_str())
                     .collect::<Vec<_>>();
-                request_system.push_str("\n\n");
-                request_system.push_str(&crate::prompts::current_tool_availability_block(
+                request_system_volatile.push_str("\n\n");
+                request_system_volatile.push_str(&crate::prompts::current_tool_availability_block(
                     &attached_tool_names,
                 ));
+                let request_system = wyj_api::SystemPrompt {
+                    stable: &system_stable,
+                    volatile: &request_system_volatile,
+                };
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 session.tool_schema_tokens = session
                     .tool_schema_tokens
@@ -1013,9 +1074,12 @@ impl Agent {
                         tracing::warn!("上下文压缩失败: {error}");
                     } else if outcome.passes > 0 {
                         if let Some(result) = outcome.last_result {
-                            on_text(&format!(
-                                "\n[已压缩对话历史：移除 {} 条消息，节省约 {} tokens]\n",
-                                result.messages_removed, result.tokens_saved_estimate
+                            on_text(&wyj_i18n::tr_fmt(
+                                "agent.compacted",
+                                &[
+                                    ("removed", &result.messages_removed.to_string()),
+                                    ("saved", &result.tokens_saved_estimate.to_string()),
+                                ],
                             ));
                         }
                         if outcome.passes > 1 {
@@ -1593,8 +1657,10 @@ impl Agent {
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
-                // 追加到 system prompt 末尾（而非注入 user 消息），使历史消息保持
-                // 干净、避免跨轮重复发送；seen_dirs 去重保证每条只追加一次。
+                // 追加到 system 的 **volatile 段**（而非稳定前缀、也不注入 user
+                // 消息）。这样历史消息保持干净、避免跨轮重复发送，seen_dirs 去重
+                // 保证每条只追加一次；更重要的是它位于 cache breakpoint 之后，
+                // 命中新目录不会让稳定前缀整段全价重算。
                 if let Some(loader) = &self.claude_md {
                     let mut new_reminders = String::new();
                     for dir in &touched_dirs {
@@ -1604,8 +1670,60 @@ impl Agent {
                         }
                     }
                     if !new_reminders.is_empty() {
-                        system.push_str(&new_reminders);
+                        system_volatile.push_str(&new_reminders);
                     }
+                }
+            } else if !pending_tools.is_empty() {
+                // 兜底配对：assistant 消息里带了 tool_use，但本轮并不是以
+                // `stop_reason == ToolUse` 结束的——典型是 `MaxTokens`，即模型
+                // 正在写工具参数时被 max_tokens 截断。
+                //
+                // 为什么必须在这里补：`pending_tools` 与 `assistant_blocks` 是
+                // 从同一批 StreamedBlock 构造的，不看 stop_reason，所以这条
+                // 路径下 tool_use 已随 `push_assistant` 进入历史，却没有配对的
+                // tool_result。后果有二：
+                //   1. 本回合的下一次请求会被 provider 判为协议错误(400)；
+                //   2. 更糟的是该历史已落盘，任何一次 `--resume` 都会复现，
+                //      用户不手动 /rewind 或 /clear 就无法自愈。
+                //
+                // 这里为每个残留 tool_use 合成一条错误 tool_result，沿用
+                // `Rejected` 分支的语义：告诉模型这次调用**没有执行任何东西**，
+                // 让它自己决定重试还是改用别的方案。
+                //
+                // 注：`input` 无需额外兜底 —— 参数管线失败时 `assistant_blocks`
+                // 里已写入 `{"_wyj_code_invalid_arguments": true}` 之类的合法
+                // JSON 占位（见上方 `PendingToolCall::Rejected` 分支），
+                // 历史里不会出现半截 JSON。
+                let reason = format!("{stop_reason:?}");
+                let mut results = Vec::new();
+                for pending in &pending_tools {
+                    let (id, name) = match pending {
+                        PendingToolCall::Valid(call) => (call.id.clone(), call.name.clone()),
+                        PendingToolCall::Rejected { id, name, .. } => (id.clone(), name.clone()),
+                    };
+                    let feedback = serde_json::json!({
+                        "error": "tool_call_incomplete",
+                        "tool": name,
+                        "stop_reason": reason,
+                        "instruction": "The response ended before this tool call \
+                                        completed. Nothing was executed. Retry it, or \
+                                        proceed without it.",
+                    })
+                    .to_string();
+                    if let Some(cb) = &self.tool_cb {
+                        cb(ToolEvent::End {
+                            id: id.clone(),
+                            name: name.clone(),
+                            is_error: true,
+                            elapsed_secs: 0.0,
+                            output: feedback.clone(),
+                        });
+                    }
+                    results.push((id, wyj_api::types::ToolResultContent::Text(feedback), true));
+                }
+                // pending_tools 本身已按原始顺序，无需再排序。
+                for (id, content, is_error) in results {
+                    session.push_tool_result(id, content, is_error);
                 }
             }
 
@@ -2311,7 +2429,7 @@ mod tests {
     impl Provider for TwoToolProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -2357,7 +2475,7 @@ mod tests {
     impl Provider for EndTurnProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -2522,7 +2640,7 @@ mod tests {
     impl Provider for RepeatedTwoToolProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -2735,7 +2853,7 @@ mod tests {
     impl Provider for MalformedThenTextProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -2803,7 +2921,7 @@ mod tests {
     impl Provider for InvalidSchemaThenCorrectProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3069,7 +3187,7 @@ mod tests {
     impl Provider for CountingEndTurnProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3164,7 +3282,7 @@ mod tests {
     impl Provider for UnsupportedThinkingThenSuccessProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             opts: &wyj_api::provider::RequestOptions,
@@ -3216,7 +3334,7 @@ mod tests {
     impl Provider for TypedFailureProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3312,7 +3430,7 @@ mod tests {
     impl Provider for FlakyProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3370,7 +3488,7 @@ mod tests {
     impl Provider for EofAfterCompletionProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3428,7 +3546,7 @@ mod tests {
     impl Provider for AlwaysBrokenProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3462,7 +3580,7 @@ mod tests {
     impl Provider for ThinkingProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -3812,6 +3930,162 @@ mod tests {
         assert!(
             !snapshot.contains("Resuming task"),
             "非续接 query 不应追加 continuation 块: {snapshot}"
+        );
+    }
+
+    // ── 孤儿 tool_use 兜底配对 ───────────────────────────────────────────
+    //
+    // 模型正在写工具参数时被 max_tokens 截断时，assistant 消息里会带一个没有
+    // 配对 tool_result 的 tool_use。这个畸形历史会被原样落盘，之后任何一次
+    // `--resume` 都会让 provider 直接 400，且用户不手动 /rewind 或 /clear
+    // 无法自愈。`run_turn` 必须为残留 tool_use 补一条 is_error 的 tool_result。
+
+    /// 发一个工具调用后以 `MaxTokens` 结束（模拟参数写到一半被截断）
+    struct MaxTokensToolUseProvider;
+    #[async_trait::async_trait]
+    impl Provider for MaxTokensToolUseProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "Sleep".into(),
+                }),
+                Ok(StreamEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    json_delta: r#"{"ms":10,"tag":"truncated"}"#.into(),
+                }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::MaxTokens,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn max_tokens_with_pending_tool_use_still_gets_a_matching_tool_result() {
+        let mut agent = Agent::new(Arc::new(MaxTokensToolUseProvider));
+        agent.register_tool(Arc::new(SleepTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        let uses: Vec<&str> = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses, vec!["t1"], "工具调用应照常进入历史");
+
+        let results: Vec<(&str, bool, String)> = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => Some((
+                    tool_use_id.as_str(),
+                    *is_error,
+                    match content {
+                        wyj_api::types::ToolResultContent::Text(t) => t.clone(),
+                        _ => String::new(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            1,
+            "MaxTokens 截断后必须补 tool_result，否则历史配对断裂 → provider 400"
+        );
+        let (id, is_error, text) = &results[0];
+        assert_eq!(*id, "t1");
+        assert!(is_error, "兜底 tool_result 必须标记 is_error");
+        assert!(
+            text.contains("tool_call_incomplete") && text.contains("MaxTokens"),
+            "兜底结果应说明未完成及原因，实际: {text}"
+        );
+    }
+
+    // ── 记忆快照分桶缓存 ───────────────────────────────────────────────
+    //
+    // 回归背景：Project Brief 每次都按「最近 4 条 user 消息」重算相关性排序，
+    // 而它被拼进 system prompt 的稳定前缀 —— 每个用户轮次都会改写 system
+    // 尾部，把整段 system 的 prompt cache 击穿。`memory_snapshot_text` 按
+    // 10 个用户轮次分桶缓存：同桶复用，跨桶重算。
+
+    #[test]
+    fn memory_snapshot_reuses_cache_within_bucket_and_refreshes_across_buckets() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::MemoryV3Store::new(base.path(), project.path()).unwrap());
+        seed_task(&store, "任务 A", TaskStatus::InProgress, None);
+
+        let agent = Agent::new(Arc::new(EndTurnProvider)).with_memory_v3(store.clone());
+        let mut session = session_with_query("继续");
+
+        let first = agent.memory_snapshot_text(&session);
+        assert!(first.contains("任务 A"), "首次应带上 Open Tasks");
+
+        // 同桶内新增记忆：仍应命中缓存
+        seed_task(&store, "任务 B", TaskStatus::InProgress, None);
+        let same_bucket = agent.memory_snapshot_text(&session);
+        assert_eq!(
+            first, same_bucket,
+            "同桶内必须复用缓存，否则 system 稳定前缀每轮都被改写"
+        );
+        assert!(
+            !same_bucket.contains("任务 B"),
+            "同桶内不应看到新写入的记忆"
+        );
+
+        // 跨桶：重算后应看到新记忆
+        for i in 0..MEMORY_SNAPSHOT_REFRESH_TURNS {
+            push_user_text(&mut session, &format!("继续 {i}"));
+        }
+        let refreshed = agent.memory_snapshot_text(&session);
+        assert!(
+            refreshed.contains("任务 B"),
+            "跨桶后应重新计算并看到后台新提取的记忆"
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_is_shared_across_agent_clones() {
+        // `/model` 重建与模式切换都会 clone Agent，缓存必须共享，
+        // 否则切一次模型就白白重算一次并改写 system 前缀。
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::MemoryV3Store::new(base.path(), project.path()).unwrap());
+        seed_task(&store, "任务 A", TaskStatus::InProgress, None);
+
+        let agent = Agent::new(Arc::new(EndTurnProvider)).with_memory_v3(store.clone());
+        let session = session_with_query("继续");
+        let first = agent.memory_snapshot_text(&session);
+        seed_task(&store, "任务 B", TaskStatus::InProgress, None);
+        let cloned = agent.clone();
+        assert_eq!(
+            first,
+            cloned.memory_snapshot_text(&session),
+            "clone 出来的 Agent 应复用同一份快照缓存"
         );
     }
 }

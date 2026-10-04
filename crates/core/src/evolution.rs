@@ -1169,7 +1169,7 @@ impl EvolutionStore {
         let system = "You identify approval-gated Rule and Skill candidates from coding-agent Episodes. Return only JSON objects, one per line. Never emit ordinary memories, repository facts, or user preferences.";
         let result = provider
             .complete(
-                system,
+                &wyj_api::SystemPrompt::stable_only(system),
                 &[Message::user(prompt)],
                 &[],
                 &wyj_api::provider::RequestOptions::text_only(4096),

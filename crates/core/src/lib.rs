@@ -34,8 +34,8 @@ pub mod workspace_cas;
 pub use agent::{Agent, AgentRoute, InjectionKind, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};
 pub use checkpoint::{
-    Checkpoint, CheckpointKind, CheckpointStore, CheckpointSummary, RewindPreview, RewindScope,
-    WorkspaceSnapshot,
+    set_checkpoint_config, Checkpoint, CheckpointConfig, CheckpointKind, CheckpointStore,
+    CheckpointSummary, RewindPreview, RewindScope, WorkspaceSnapshot,
 };
 pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile};
 pub use code_index::{CodeSearchTool, ProjectCodeIndex};

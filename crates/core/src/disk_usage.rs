@@ -111,10 +111,19 @@ pub fn warn_if_over_budget(config_base: &Path, threshold_bytes: u64) {
         .map(|(name, b)| format!("{name}={}MB", b / 1024 / 1024))
         .collect::<Vec<_>>()
         .join(", ");
+    // 告警文案里给出可直接手动清理的绝对路径。旧文案推荐 `wyj-code
+    // session prune`,但该子命令不存在(`storage prune` / `doctor` 也仍是
+    // TODO 桩),用户按提示操作只会得到"未知命令"。
+    let top_dirs = top
+        .iter()
+        .map(|(name, _)| format!("~/.wyj-code/{name}/"))
+        .collect::<Vec<_>>()
+        .join("、");
     tracing::warn!(
         "~/.wyj-code 占用 {total_mb}MB 超过 {threshold_mb}MB 阈值(top:{top_str})。\
-         可调整 ~/.wyj-code/config.toml [storage] 节下的 cap 默认值,或运行 \
-         `wyj-code session prune` / 手动清理过期 sessions/。",
+         {top_dirs} 尚无自动清理路径(会话文件 / checkpoint / 子 Agent trace \
+         都不会被自动删除),需手动删除对应目录下的旧文件;\
+         其余子系统的 cap 可在 ~/.wyj-code/config.toml [storage] 节调整。",
     );
 }
 

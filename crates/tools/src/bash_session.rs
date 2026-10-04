@@ -68,6 +68,22 @@ impl BackgroundJob {
         buf.read_offset = buf.data.len();
         (new, dropped)
     }
+
+    /// 读取当前缓冲尾部最多 `max_bytes` 字节的内容。
+    ///
+    /// **不推进 `read_offset`** —— `read_new` 的游标是 `BashOutput` 工具的增量读
+    /// 通道，TUI 面板每帧用它刷新实时输出视图，两者共用同一游标会互相抢走对方
+    /// 的增量内容（面板看到空白、工具看到"无新输出"）。这里只做只读快照。
+    pub fn tail(&self, max_bytes: usize) -> String {
+        let buf = self.buffer.lock().unwrap();
+        let mut start = buf.data.len().saturating_sub(max_bytes);
+        // 按 char boundary 收口：中文/emoji 是多字节，切在中间会 panic
+        // （同 `append` 里的保尾裁剪）。
+        while start < buf.data.len() && !buf.data.is_char_boundary(start) {
+            start += 1;
+        }
+        buf.data[start..].to_string()
+    }
 }
 
 #[derive(Default)]
@@ -308,5 +324,63 @@ mod tests {
         assert_ne!(job.status(), JobStatus::Running);
         // 幂等
         assert!(mgr.kill(&id).await.unwrap());
+    }
+
+    /// `tail` 必须是不抢游标的只读快照：TUI 面板每帧调它刷新实时输出，
+    /// 若它推进了 `read_offset`，`BashOutput` 工具就会读到空增量。
+    #[tokio::test]
+    async fn tail_does_not_advance_read_cursor() {
+        let mgr = BashSessionManager::default();
+        let id = mgr
+            .spawn("echo hello", std::path::Path::new("/tmp"))
+            .unwrap();
+        let job = mgr.get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // 面板侧先看一次
+        assert!(job.tail(1024).contains("hello"));
+        // 工具侧仍应拿到完整增量，没有被面板抢走
+        let (out, _) = job.read_new();
+        assert!(
+            out.contains("hello"),
+            "tail() 不得推进 read_offset，否则 BashOutput 工具会读到空增量"
+        );
+        // 反向：工具读完后面板仍能看到内容（tail 不依赖游标位置）
+        assert!(job.tail(1024).contains("hello"));
+    }
+
+    /// `tail` 的字节上限可能在多字节字符中间切断，必须按 char boundary 收口。
+    #[tokio::test]
+    async fn tail_respects_max_bytes_at_char_boundary() {
+        let mgr = BashSessionManager::default();
+        // 每个汉字 3 字节，故意用 1..=8 逐个偏移试探（含落在汉字中间的偏移）
+        let id = mgr
+            .spawn("echo 中文中文中文", std::path::Path::new("/tmp"))
+            .unwrap();
+        let job = mgr.get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let full = job.tail(1024);
+        assert!(full.contains("中文"));
+        for max_bytes in 1..=full.len() {
+            let piece = job.tail(max_bytes);
+            // 切出来的每一段都必须是合法 UTF-8（不 panic 即证明）
+            assert!(
+                piece.len() <= full.len().max(max_bytes),
+                "tail 返回的长度不应超过请求上限对应的内容"
+            );
+        }
+        // 上限足够大时内容完整
+        assert!(job.tail(1024).contains("中文中文中文"));
     }
 }

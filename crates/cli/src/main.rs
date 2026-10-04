@@ -482,7 +482,9 @@ async fn run_model_probe(
 
     let text_result = provider
         .complete(
-            "You are a compatibility probe. Reply with exactly OK.",
+            &wyj_api::SystemPrompt::stable_only(
+                "You are a compatibility probe. Reply with exactly OK.",
+            ),
             &[Message::user("Reply OK")],
             &[],
             &wyj_api::provider::RequestOptions::text_only(32),
@@ -514,7 +516,9 @@ async fn run_model_probe(
     };
     let tool_result = provider
         .complete(
-            "Call probe_echo exactly once with value set to ok. Do not answer with text.",
+            &wyj_api::SystemPrompt::stable_only(
+                "Call probe_echo exactly once with value set to ok. Do not answer with text.",
+            ),
             &[Message::user("Run the echo compatibility probe")],
             std::slice::from_ref(&echo),
             &wyj_api::provider::RequestOptions::text_only(128),
@@ -538,7 +542,7 @@ async fn run_model_probe(
     if level == "full" {
         let parallel = provider
             .complete(
-                "Call probe_echo twice in one response, each with value ok. Do not answer with text.",
+                &wyj_api::SystemPrompt::stable_only("Call probe_echo twice in one response, each with value ok. Do not answer with text."),
                 &[Message::user("Run the parallel tool compatibility probe")],
                 std::slice::from_ref(&echo),
                 &wyj_api::provider::RequestOptions::text_only(192),
@@ -564,7 +568,7 @@ async fn run_model_probe(
         if let Some(budget) = profile.thinking_budget.filter(|budget| *budget > 0) {
             provider
                 .complete(
-                    "Reply with exactly OK.",
+                    &wyj_api::SystemPrompt::stable_only("Reply with exactly OK."),
                     &[Message::user(
                         "Run the configured reasoning parameter probe",
                     )],
@@ -745,6 +749,35 @@ fn workflow_parent_ceiling(
     wyj_core::WorkflowPermissionCeiling { allowed_tools }
 }
 
+/// 把 `std::env::current_dir()` 的失败翻译成可操作的用户提示。
+///
+/// `current_dir()` 在**当前工作目录已被删除**时返回 `Err(NotFound)`
+/// （Unix `getcwd(2)` 的 ENOENT 语义）。典型触发场景：从一个随后被
+/// `rm -rf` / 移动 / 卸载的目录里启动二进制 —— 例如 `./build.sh package`
+/// 产出的 `dist/` 被清掉、临时构建目录被回收、或从已弹出的挂载卷中运行。
+/// 此时 `.unwrap()` 会 panic，用户只看到一条裸 Rust panic 信息。
+fn cwd_lookup_error(error: std::io::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "无法确定当前工作目录（{error}）。\n\
+         你当前这个终端会话的工作目录已被删除或移动 —— 这是 shell 层面的问题，\
+         不只影响 wyj-code：该会话里执行任何依赖相对路径的命令都会失败。\n\
+         解决办法：先 `cd` 到一个有效目录（`cd ~` 亦可）再重试；\
+         若本就不想进入该目录，也可以用 `--cwd <目录>` 显式指定。"
+    )
+}
+
+/// 解析本次运行使用的工作目录：`--cwd` 优先，否则回退到进程 cwd。
+///
+/// **刻意不做 `$HOME` 兜底**：cwd 决定 project root（`.git` 向上查找）、
+/// 会话归属与项目级配置（`.wyj-code/`），静默切到别的目录会让 Agent
+/// 在错误的仓库上读写并落到错误的会话分区 —— 比明确报错危险得多。
+fn resolve_cwd(cli_cwd: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    match cli_cwd {
+        Some(cwd) => Ok(cwd),
+        None => std::env::current_dir().map_err(cwd_lookup_error),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 注册 panic hook：TUI 路径下,run_tui 配对的 disable_raw_mode +
@@ -878,10 +911,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.config_status {
-        let status_cwd = cli
-            .cwd
-            .clone()
-            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let status_cwd = resolve_cwd(cli.cwd.clone())?;
         let active = cfg.active_profile().clone();
         println!(
             "{}",
@@ -945,7 +975,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let cwd = cli.cwd.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let cwd = resolve_cwd(cli.cwd)?;
     let config_base = wyj_config::config_dir()?;
 
     // 启动期一次性磁盘占用提示。`OnceLock` 保证进程内只触发一次,
@@ -1067,20 +1097,19 @@ async fn main() -> Result<()> {
         cfg.storage.cas_max_blob_bytes,
     )
     .map(std::sync::Arc::new);
-    let checkpoint_store = session_store_arc
-        .as_ref()
-        .and_then(|store| {
-            wyj_core::CheckpointStore::new(store.dir(), session_id.clone())
-                .map(|s| {
-                    let s = s.with_max_per_session(cfg.storage.checkpoints_per_session);
-                    match workspace_cas.as_ref() {
-                        Some(cas) => s.with_cas(cas.clone()),
-                        None => s,
-                    }
-                })
-                .ok()
-        })
-        .map(Arc::new);
+    // checkpoint 构造配置注入进程全局。TUI 侧有 7 处构造点必须走
+    // `CheckpointStore::configured`,否则会退回裸 `new()` 的"不限条数 +
+    // 不接 CAS"语义 —— `attach_agent_session` 更会覆盖掉这里装配好的
+    // store,导致切换过模型后 checkpoint 不再封顶、文件快照不走 CAS 去重。
+    wyj_core::checkpoint::set_checkpoint_config(wyj_core::checkpoint::CheckpointConfig {
+        max_per_session: cfg.storage.checkpoints_per_session,
+        cas: workspace_cas.clone(),
+    });
+    let checkpoint_store = session_store_arc.as_ref().and_then(|store| {
+        wyj_core::CheckpointStore::configured(store.dir(), session_id.clone())
+            .ok()
+            .map(Arc::new)
+    });
 
     // 把 cfg.persist_cap 注入 SessionStore + CheckpointStore 落盘前截断全局。
     // 用 OnceLock 全局而非 builder 模式,是为了不改 14+ 个 caller 签名。
@@ -2461,7 +2490,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
     match command {
         SessionCommand::Checkpoint { session_id, name } => {
             let file = sessions.load(&session_id)?;
-            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id)?;
             let checkpoint = store.create(
                 Path::new(&file.cwd),
                 &file.messages,
@@ -2471,7 +2500,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
             println!("{}", checkpoint.id);
         }
         SessionCommand::Checkpoints { session_id } => {
-            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id)?;
             println!("{}", checkpoint_list_text(&store)?);
         }
         SessionCommand::Rewind {
@@ -2482,7 +2511,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
         } => {
             let mut file = sessions.load(&session_id)?;
             let cwd = PathBuf::from(&file.cwd);
-            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id)?;
+            let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id)?;
             let checkpoint = store.load(&checkpoint_id)?;
             let scope = parse_rewind_scope(&scope);
             if matches!(
@@ -2538,7 +2567,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
         } => {
             let file = sessions.load(&session_id)?;
             let cwd = PathBuf::from(&file.cwd);
-            let store = wyj_core::CheckpointStore::new(sessions.dir(), session_id.clone())?;
+            let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id.clone())?;
             let checkpoint = store.load(&checkpoint_id)?;
             if restore_files {
                 let preview = store.preview_files(&checkpoint_id, &cwd)?;
@@ -2676,7 +2705,9 @@ async fn repl(
     let mut session_id = session_id;
     let mut checkpoint_store = session_store
         .as_ref()
-        .and_then(|store| wyj_core::CheckpointStore::new(store.dir(), session_id.clone()).ok())
+        .and_then(|store| {
+            wyj_core::CheckpointStore::configured(store.dir(), session_id.clone()).ok()
+        })
         .map(Arc::new);
     let mut session = Session::new();
     if let Some(file) = session_store
@@ -2826,7 +2857,9 @@ async fn repl(
             output_tokens: session.total_output_tokens,
             cache_read_tokens: session.total_cache_read_tokens,
             cache_write_tokens: session.total_cache_write_tokens,
-            context_window: 200_000,
+            // 取当前 Profile 真实的窗口，而不是写死 200K —— 否则非 200K
+            // 模型下 /context 的占用百分比会算错。
+            context_window: cfg.active_profile().context_window,
             estimated_tokens: wyj_core::estimate_tokens(&session.messages),
             home_dir,
             sub_input_tokens: 0,
@@ -2973,7 +3006,7 @@ async fn repl(
                     session.branch_parent_session_id = branch.branch_parent_session_id;
                     session.branch_parent_checkpoint_id = branch.branch_parent_checkpoint_id;
                     turns = branch.turns;
-                    let new_store = Arc::new(wyj_core::CheckpointStore::new(
+                    let new_store = Arc::new(wyj_core::CheckpointStore::configured(
                         session_files.dir(),
                         session_id.clone(),
                     )?);
@@ -3168,6 +3201,9 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenSubAgentsPanel(_)) => {
                     println!("{}", wyj_i18n::tr("subagents.headless_unsupported"));
+                }
+                Ok(CommandResult::OpenShellsPanel(_)) => {
+                    println!("{}", wyj_i18n::tr("shells.headless_unsupported"));
                 }
                 Ok(CommandResult::OpenScheduleDialog) => {
                     println!("{}", wyj_i18n::tr("schedule.headless_unsupported"));
@@ -3514,5 +3550,33 @@ mod cli_tests {
         for forbidden in ["Agent", "TodoWrite", "AskQuestion", "ExitPlanMode"] {
             assert!(!names.iter().any(|n| n == forbidden));
         }
+    }
+
+    // ── 悬空 cwd ────────────────────────────────────────────────────────
+    //
+    // 回归背景：`std::env::current_dir()` 在当前工作目录被删除时返回
+    // `Err(NotFound)`（Unix getcwd(2) 的 ENOENT 语义）。两处调用点曾用
+    // `.unwrap()`，从已删除目录启动二进制会 panic，用户只看到裸 Rust 报错。
+    // 这里锁定「明确报错 + 提示 --cwd」，同时锁定**不做 $HOME 兜底**
+    // （cwd 决定 project root 与会话归属，静默换目录比报错危险）。
+
+    #[test]
+    fn cwd_lookup_error_message_is_actionable() {
+        let err = cwd_lookup_error(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let msg = err.to_string();
+        assert!(msg.contains("--cwd"), "错误提示必须告诉用户逃生方式: {msg}");
+        assert!(msg.contains("cd"), "错误提示必须告诉用户先切换目录: {msg}");
+        // 关键：要点明这是 shell 层面的问题，否则用户会误以为是 wyj-code 自身故障，
+        // 在同一个必然失败的命令上反复重试。
+        assert!(
+            msg.contains("shell") && msg.contains("wyj-code"),
+            "错误提示必须区分「shell 的 cwd 失效」与「wyj-code 故障」: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_prefers_explicit_flag_over_process_cwd() {
+        let explicit = std::path::PathBuf::from("/tmp/wyj-explicit-cwd");
+        assert_eq!(resolve_cwd(Some(explicit.clone())).unwrap(), explicit);
     }
 }

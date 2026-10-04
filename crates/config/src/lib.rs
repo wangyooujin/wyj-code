@@ -640,19 +640,12 @@ pub struct StorageRetentionCfg {
     /// CAS blob pool 单 blob 字节上限(0 = 关闭 CAS,沿用旧 inline 行为)。
     /// 超此值的文件不进 CAS,直接 inline 进 checkpoint JSON。
     pub cas_max_blob_bytes: u64,
-
-    /// Phase 4:单 session checkpoint 字节上限(0 = 不限,沿用数量上限)。
-    /// 超限时按 timestamp 升序淘汰最老 checkpoint。
-    pub checkpoint_bytes_per_session: u64,
-
-    /// Phase 4:CAS blob pool 总字节上限(0 = 不限)。超限清理 ref_count=0 + TTL 过期实体。
-    pub cas_total_bytes: u64,
-
-    /// Phase 4:CAS GC 启动时启用(首启跳过避免误删老 hash)。
-    pub cas_gc_on_start: bool,
-
-    /// Phase 4:checkpoint 寿命 TTL(按 timestamp;0 = 永久保留)。
-    pub checkpoint_ttl_days: u32,
+    // 曾经存在的 4 个 Phase 4 字段(`checkpoint_bytes_per_session` /
+    // `cas_total_bytes` / `cas_gc_on_start` / `checkpoint_ttl_days`)已删除:
+    // 它们有非零默认值,但全仓库没有任何消费点 —— `WorkspaceCas::gc` 只被
+    // 单测调用,`storage prune` / `doctor` 仍是 TODO 桩。留着只会让人误以为
+    // 存在对应的清理逻辑。`#[serde(default)]` + 无 `deny_unknown_fields`,
+    // 用户既有配置里写了这些键会被静默忽略,不影响加载。
 }
 
 impl Default for StorageRetentionCfg {
@@ -670,10 +663,6 @@ impl Default for StorageRetentionCfg {
             workspace_worktree_max_age_days: 30,
             disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
             cas_max_blob_bytes: 16 * 1024 * 1024,
-            checkpoint_bytes_per_session: 200 * 1024 * 1024,
-            cas_total_bytes: 5 * 1024 * 1024 * 1024,
-            cas_gc_on_start: true,
-            checkpoint_ttl_days: 30,
         }
     }
 }

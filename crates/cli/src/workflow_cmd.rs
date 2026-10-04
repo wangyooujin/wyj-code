@@ -483,7 +483,7 @@ fn prepare_workflow_workspace_at(
         return Ok(None);
     }
     let checkpoint_store =
-        CheckpointStore::new(&config.join("sessions"), format!("workflow-{}", spec.id))?;
+        CheckpointStore::configured(&config.join("sessions"), format!("workflow-{}", spec.id))?;
     let checkpoint = checkpoint_store.create(
         &repository_root,
         &[],

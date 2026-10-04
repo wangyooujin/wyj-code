@@ -244,7 +244,7 @@ mod tests {
     impl Provider for StaticProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &RequestOptions,

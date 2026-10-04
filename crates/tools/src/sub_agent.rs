@@ -149,10 +149,143 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// 该 agent 类型定义是否可能被授予有外部副作用的工具。
+///
+/// 供 `SubAgentTool::needs_permission` 决定「要不要先问用户」：
+///   * `tools: None` —— 标准工具集全集，含 Write/Edit/Bash → 有副作用；
+///   * `tools: Some(list)` —— 只在 list 里出现副作用工具时才算有。
+///
+/// 内置 Explore / Plan 的 `tools` 是 `READONLY_TOOLS`，因此**不触发**审批；
+/// general-purpose 触发。这样审批弹窗只出现在真正可能改盘/执行命令的
+/// 委派上，读多写少的探索类委派不被打断。
+pub(crate) fn def_can_touch_side_effects(def: &AgentDefinition) -> bool {
+    /// 会被 `is_side_effect_tool` 视为有副作用、且在标准工具集里的工具名。
+    const SIDE_EFFECT_TOOLS: &[&str] = &[
+        "Write",
+        "Edit",
+        "Bash",
+        "BashOutput",
+        "KillShell",
+        "computer",
+        "app_computer",
+    ];
+    match &def.tools {
+        None => true,
+        Some(list) => list
+            .iter()
+            .any(|name| SIDE_EFFECT_TOOLS.contains(&name.as_str())),
+    }
+}
+
+/// 派生子 Agent 时，忠实继承父级的权限模式。
+///
+/// 旧实现只看 `ctx.allowed_tools()`，而它对 `Prompt` / `AutoApprove` 一律返回
+/// `None`，于是子 Agent 落回 `ToolCtx::new` 的默认 `Prompt`。子 Agent 没有
+/// 审批 UI（`ui_ask_tx` 恒为 None），`Prompt` + 无 UI 通道在两道关卡上都是
+/// fail-closed：
+///   * `PermissionPolicy::evaluate`：`Prompt` + 副作用工具 + 非交互 surface
+///     → `Deny("interactive_approval_unavailable")`；
+///   * `ToolCtx::confirm_tool`：`Prompt` + 无 `ui_ask_tx` → `return false`。
+///
+/// 结果就是子 Agent 的 Bash/Edit/Write 被全量拒掉，而父级同一个工具正常。
+/// 这在 **Bypass(`AutoApprove`)** 下尤其荒谬：用户显式选择了「全部放行」，
+/// 子 Agent 却比主 Agent 更严。Bypass 现在原样传给子 Agent。
+///
+/// 白名单语义（`Plan`/`Allowlist`）维持「只能更严不能更松」的既有行为：
+/// Plan 父级再收窄一层只读白名单，其余按原白名单继承。
+pub(crate) fn derive_sub_agent_permission_mode(
+    parent_mode: Option<wyj_core::permission::PermissionMode>,
+    allowed: Option<std::collections::HashSet<String>>,
+    parent_is_plan: bool,
+) -> crate::ctx::PermissionMode {
+    use crate::ctx::PermissionMode;
+    match parent_mode {
+        // Bypass 显式全放行 → 子 Agent 同样全放行
+        Some(PermissionMode::AutoApprove) => PermissionMode::AutoApprove,
+        // Normal(Prompt)：子 Agent 没有、也不应该有再弹窗的审批通道，而
+        // 「委派这个子任务」本身已经在父级做过一次审批 —— `SubAgentTool::
+        // needs_permission` 按被委派类型是否有副作用决定要不要问用户
+        // （见 `def_can_touch_side_effects`）。这次委派即覆盖子 Agent 内部
+        // 的写/执行类工具。
+        //
+        // 若这里退回 Prompt，`Prompt` + 无 UI 通道会在 `evaluate`（副作用
+        // 工具 + 非交互 surface → `interactive_approval_unavailable`）和
+        // `confirm_tool`（无 `ui_ask_tx` → false）两处 fail-closed，把
+        // general-purpose 子 Agent 的 Bash/Edit/Write **全部废掉**，比父级
+        // 更严 —— 任何"继承"语义都不可能要求这样。
+        Some(PermissionMode::Prompt) => PermissionMode::AutoApprove,
+        _ => match allowed {
+            None => PermissionMode::Prompt,
+            Some(allowed) => {
+                if parent_is_plan {
+                    let read_only = allowed
+                        .into_iter()
+                        .filter(|name| {
+                            !matches!(
+                                name.as_str(),
+                                "Write"
+                                    | "Edit"
+                                    | "Agent"
+                                    | "computer"
+                                    | "app_computer"
+                                    | "ExitPlanMode"
+                            )
+                        })
+                        .collect();
+                    PermissionMode::Plan(read_only)
+                } else {
+                    PermissionMode::Allowlist(allowed)
+                }
+            }
+        },
+    }
+}
+
 #[async_trait]
 impl Tool for SubAgentTool {
     fn name(&self) -> &str {
         "Agent"
+    }
+
+    /// 只有当被委派的 agent 类型**可能**拿到 Write/Edit/Bash 这类有副作用的
+    /// 工具时才要求审批。
+    ///
+    /// 背景：子 Agent 没有审批 UI，`Normal` 模式下若父级不做任何拦截，
+    /// 子 Agent 会在 `evaluate` 与 `confirm_tool` 两处 fail-closed 被全量
+    /// 拒绝。放宽子 Agent 之前必须在这里补上审批点，否则整个权限系统在默认
+    /// 模式下可被「委派」一步绕过：主 Agent 零弹窗拉起子 Agent，子 Agent
+    /// 零弹窗执行任意命令。
+    ///
+    /// 读多写少的 Explore / Plan（`tools` = `READONLY_TOOLS`）不触发审批，
+    /// 避免探索类委派被弹窗打断。解析不到定义时返回 false —— `run()` 本身
+    /// 会返回「未知类型」错误，无需再拦一道。
+    fn needs_permission(&self, input: &Value) -> bool {
+        let type_name = input
+            .get("subagent_type")
+            .and_then(Value::as_str)
+            .unwrap_or("general-purpose");
+        self.find_def(type_name)
+            .map(|def| def_can_touch_side_effects(&def))
+            .unwrap_or(false)
+    }
+
+    fn action_summary(&self, input: &Value) -> String {
+        let type_name = input
+            .get("subagent_type")
+            .and_then(Value::as_str)
+            .unwrap_or("general-purpose");
+        let desc = input
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if desc.is_empty() {
+            tr_fmt("subagent.spawn_summary", &[("type", type_name)])
+        } else {
+            tr_fmt(
+                "subagent.spawn_summary_named",
+                &[("type", type_name), ("desc", desc)],
+            )
+        }
     }
 
     fn parallel_safe(&self) -> bool {
@@ -189,7 +322,7 @@ impl Tool for SubAgentTool {
                     },
                     "description": {
                         "type": "string",
-                        "description": "A short (3-5 word) description of the task, shown to the user"
+                        "description": "Optional: a short (3-5 word) summary of the task shown to the user in the agents panel. If omitted, the UI auto-derives one from the first words of `prompt`."
                     },
                     "prompt": {
                         "type": "string",
@@ -210,7 +343,7 @@ impl Tool for SubAgentTool {
                     }
                 },
                 "anyOf": [
-                    {"required": ["description", "prompt"]},
+                    {"required": ["prompt"]},
                     {"properties": {"action": {"const": "message"}}, "required": ["action", "target_id", "prompt"]},
                     {"properties": {"action": {"enum": ["interrupt", "retry"]}}, "required": ["action", "target_id"]}
                 ],
@@ -249,14 +382,14 @@ impl SubAgentTool {
         if inp.action != "spawn" {
             return Ok(self.run_control(&inp));
         }
-        if inp.prompt.trim().is_empty()
-            || inp
-                .description
-                .as_deref()
-                .map_or(true, |description| description.is_empty())
-        {
+        // `description` 是 UI 增强(agents 面板展示用),`run_impl` 后续会从
+        // `prompt` 前缀派生 fallback(line 312-315)。这里只校验 prompt 真正必填,
+        // 不要因 description 缺失而拒绝 schema-合法的调用 —— 多 agent 并行场景下
+        // 模型经常只填 `prompt`,漏 `description`,把 description 也标记成必填会
+        // 直接触发 tool_arguments_invalid,用户体感是"分派失败"。
+        if inp.prompt.trim().is_empty() {
             return Ok(ToolResult::err(
-                "Agent spawn requires non-empty description and prompt".to_string(),
+                "Agent spawn requires non-empty prompt".to_string(),
             ));
         }
         if self.depth >= self.max_depth {
@@ -362,6 +495,10 @@ impl SubAgentTool {
         let cwd = ctx.cwd().to_path_buf();
         let allowed = ctx.allowed_tools();
         let parent_is_plan = ctx.is_plan_mode();
+        // 必须在 spawn 之前取：下面的 `tokio::spawn` 要求捕获的依赖是 'static，
+        // 而 `ctx: &dyn ToolContext` 是方法借用。与 allowed / parent_is_plan
+        // 同样先取成 owned 值再 move 进闭包。
+        let parent_mode = ctx.permission_mode();
         let prompt = inp.prompt;
         let semaphore = self.hub.semaphore();
         let parent_id = self.caller_id;
@@ -391,27 +528,11 @@ impl SubAgentTool {
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
             // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
             // 独立的共享句柄（而非复用父 ctx 的 Arc）即可，避免父子间意外共享可变状态。
-            if let Some(allowed) = allowed {
-                if parent_is_plan {
-                    let read_only = allowed
-                        .into_iter()
-                        .filter(|name| {
-                            !matches!(
-                                name.as_str(),
-                                "Write"
-                                    | "Edit"
-                                    | "Agent"
-                                    | "computer"
-                                    | "app_computer"
-                                    | "ExitPlanMode"
-                            )
-                        })
-                        .collect();
-                    sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Plan(read_only));
-                } else {
-                    sub_ctx.set_permission_mode(crate::ctx::PermissionMode::Allowlist(allowed));
-                }
-            }
+            sub_ctx.set_permission_mode(derive_sub_agent_permission_mode(
+                parent_mode,
+                allowed,
+                parent_is_plan,
+            ));
 
             let mut outputs = Vec::new();
             let mut is_error = false;
@@ -565,6 +686,65 @@ mod tests {
     use wyj_api::types::{Message, StopReason, StreamEvent};
 
     #[test]
+    fn definition_schema_accepts_missing_description() {
+        // 回归测试:v1.5.15 之前 schema 把 description 标成必填,模型在多 agent
+        // 并行场景漏 description 时直接 tool_arguments_invalid,体感"分派失败"。
+        // 现在 description 是 optional,prompt 是唯一必填。
+        let defs = Arc::new(vec![AgentDefinition {
+            name: "general-purpose".to_string(),
+            description: "test".to_string(),
+            tools: None,
+            model: None,
+            system_prompt: "test".to_string(),
+            builtin: true,
+            source: None,
+        }]);
+        let hub = Arc::new(SubAgentHub::new());
+        let tool = SubAgentTool::new(defs, hub, |_| -> Result<Agent> {
+            panic!("factory not called in this test")
+        });
+        let td = tool.definition();
+        assert_eq!(td.name, "Agent");
+
+        let mut pipeline = wyj_core::tool_arguments::ToolArgumentPipeline::default();
+        pipeline.register(&td);
+
+        // (1) 无 description 也能通过 schema
+        let call = wyj_api::types::RawToolCall {
+            id: "t1".into(),
+            name: "Agent".into(),
+            raw_arguments: r#"{"prompt": "do the thing"}"#.into(),
+        };
+        let result = pipeline
+            .process(call)
+            .expect("schema should accept call with no description");
+        assert_eq!(result.input["prompt"], "do the thing");
+
+        // (2) 有 description 仍然 OK
+        let call = wyj_api::types::RawToolCall {
+            id: "t2".into(),
+            name: "Agent".into(),
+            raw_arguments: r#"{"description": "do thing", "prompt": "do the thing"}"#.into(),
+        };
+        let result = pipeline.process(call).expect("schema accepts description");
+        assert_eq!(result.input["description"], "do thing");
+
+        // (3) 缺 prompt 仍然失败(必填性保留)
+        let call = wyj_api::types::RawToolCall {
+            id: "t3".into(),
+            name: "Agent".into(),
+            raw_arguments: r#"{"description": "do thing"}"#.into(),
+        };
+        let err = pipeline
+            .process(call)
+            .expect_err("schema must still require prompt");
+        assert_eq!(
+            err.kind,
+            wyj_core::tool_arguments::ToolArgumentErrorKind::SchemaViolation
+        );
+    }
+
+    #[test]
     fn summarize_prefers_primary_arg() {
         let v = serde_json::json!({"file_path": "/a/b.rs", "other": 1});
         assert_eq!(summarize_input(&v), "/a/b.rs");
@@ -592,7 +772,7 @@ mod tests {
     impl Provider for SpawnChildProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -638,7 +818,7 @@ mod tests {
     impl Provider for EndProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -662,7 +842,7 @@ mod tests {
     impl Provider for DelayedFollowUpProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -949,5 +1129,181 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("depth limit"));
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── 子 Agent 权限继承 ───────────────────────────────────────────────
+    //
+    // 回归背景：`allowed_tools()` 只在白名单语义下返回 Some，对 Prompt /
+    // AutoApprove 一律返回 None。子 Agent 过去只据它决定自身模式，于是父级
+    // Bypass(AutoApprove) 时子 Agent 落回默认 Prompt；子 Agent 无审批 UI，
+    // Prompt + 无 UI 通道在 evaluate 和 confirm_tool 两道关卡都 fail-closed，
+    // 导致 Bash/Edit/Write 被全量拒绝 —— 比父级更严，任何继承语义都不可能
+    // 要求这样。
+
+    #[test]
+    fn sub_agent_inherits_bypass_as_auto_approve() {
+        use crate::ctx::PermissionMode;
+        // Bypass 父级：`allowed_tools()` 返回 None（与真实 ToolCtx 一致）
+        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::AutoApprove), None, false);
+        assert!(
+            matches!(mode, PermissionMode::AutoApprove),
+            "Bypass 必须原样传给子 Agent，否则子 Agent 比主 Agent 更严"
+        );
+    }
+
+    #[test]
+    fn sub_agent_keeps_plan_read_only_narrowing() {
+        use crate::ctx::PermissionMode;
+        let base: std::collections::HashSet<String> =
+            ["Bash", "Read", "Grep", "Write", "Edit", "Agent"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mode = derive_sub_agent_permission_mode(
+            Some(PermissionMode::Plan(base.clone())),
+            Some(base),
+            true,
+        );
+        let PermissionMode::Plan(set) = mode else {
+            panic!("Plan 父级应产出 Plan 子模式")
+        };
+        assert!(set.contains("Bash") && set.contains("Read") && set.contains("Grep"));
+        assert!(
+            !set.contains("Write") && !set.contains("Edit") && !set.contains("Agent"),
+            "Plan 父级下子 Agent 必须继续只读"
+        );
+    }
+
+    #[test]
+    fn sub_agent_inherits_allowlist_unchanged() {
+        use crate::ctx::PermissionMode;
+        let base: std::collections::HashSet<String> =
+            ["Bash", "Read"].iter().map(|s| s.to_string()).collect();
+        let mode = derive_sub_agent_permission_mode(
+            Some(PermissionMode::Allowlist(base.clone())),
+            Some(base.clone()),
+            false,
+        );
+        let PermissionMode::Allowlist(set) = mode else {
+            panic!("Allowlist 父级应产出 Allowlist 子模式")
+        };
+        assert_eq!(set, base);
+    }
+
+    #[test]
+    fn sub_agent_without_exposed_parent_mode_falls_back_to_allowlist_derivation() {
+        use crate::ctx::PermissionMode;
+        // `permission_mode()` 返回 None 的 ToolContext（如旧 mock）应退回
+        // 旧的 allowed_tools() 派生逻辑，保证向后兼容。
+        let base: std::collections::HashSet<String> =
+            ["Bash", "Read"].iter().map(|s| s.to_string()).collect();
+        let mode = derive_sub_agent_permission_mode(None, Some(base.clone()), false);
+        assert!(matches!(mode, PermissionMode::Allowlist(_)));
+        // 既没有模式也没有白名单 → Prompt（维持现状）
+        let mode = derive_sub_agent_permission_mode(None, None, false);
+        assert!(matches!(mode, PermissionMode::Prompt));
+    }
+
+    // ── Agent 工具的审批点 ─────────────────────────────────────────────
+    //
+    // 放宽子 Agent 内部权限的前提：主 Agent 拉起子 Agent 这一步本身要过审批，
+    // 否则「委派」就成了一条绕过整个权限系统的路径。审批粒度按被委派类型的
+    // 副作用能力决定 —— 只读类型不打断。
+
+    fn tool_with_builtin_defs() -> SubAgentTool {
+        SubAgentTool::new(
+            Arc::new(wyj_core::agent_def::builtin_defs()),
+            Arc::new(SubAgentHub::new()),
+            |_| -> Result<Agent> { panic!("factory not called in this test") },
+        )
+    }
+
+    #[test]
+    fn agent_tool_requires_permission_only_for_side_effecting_types() {
+        let tool = tool_with_builtin_defs();
+        // general-purpose: tools = None（标准工具集全集，含 Write/Edit/Bash）
+        assert!(
+            tool.needs_permission(&serde_json::json!({
+                "prompt": "改一下代码",
+                "subagent_type": "general-purpose"
+            })),
+            "general-purpose 能拿到 Bash/Edit，必须先问用户"
+        );
+        // 缺省 subagent_type 也是 general-purpose
+        assert!(tool.needs_permission(&serde_json::json!({ "prompt": "改一下代码" })));
+
+        // Explore / Plan: tools = READONLY_TOOLS，不应打断
+        for ty in ["Explore", "Plan"] {
+            assert!(
+                !tool.needs_permission(&serde_json::json!({
+                    "prompt": "帮我调研",
+                    "subagent_type": ty
+                })),
+                "{ty} 是只读类型，不应触发审批弹窗"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_tool_skips_permission_for_unknown_type() {
+        // 解析不到定义时交给 run() 返回「未知类型」，不重复拦一道
+        let tool = tool_with_builtin_defs();
+        assert!(!tool.needs_permission(&serde_json::json!({
+            "prompt": "x",
+            "subagent_type": "does-not-exist"
+        })));
+    }
+
+    #[test]
+    fn agent_tool_action_summary_names_type_and_task() {
+        let tool = tool_with_builtin_defs();
+        // 摘要必须点名类型与任务，便于用户在审批弹窗里判断
+        let named = tool.action_summary(&serde_json::json!({
+            "prompt": "x", "subagent_type": "general-purpose", "description": "修 bug"
+        }));
+        assert!(
+            named.contains("general-purpose") && named.contains("修 bug"),
+            "{named}"
+        );
+        let bare = tool.action_summary(&serde_json::json!({ "prompt": "x" }));
+        assert!(bare.contains("general-purpose"), "{bare}");
+        assert_ne!(named, bare, "有 description 时摘要应更具体");
+    }
+
+    #[test]
+    fn def_can_touch_side_effects_matches_tools_frontmatter() {
+        let mk = |name: &str, tools: Option<Vec<String>>| AgentDefinition {
+            name: name.to_string(),
+            description: "d".to_string(),
+            tools,
+            model: None,
+            system_prompt: "s".to_string(),
+            builtin: true,
+            source: None,
+        };
+        assert!(def_can_touch_side_effects(&mk("all", None)));
+        assert!(!def_can_touch_side_effects(&mk(
+            "ro",
+            Some(vec!["Read".into(), "Grep".into()])
+        )));
+        assert!(def_can_touch_side_effects(&mk(
+            "wo",
+            Some(vec!["Read".into(), "Write".into()])
+        )));
+        assert!(def_can_touch_side_effects(&mk(
+            "sh",
+            Some(vec!["Bash".into()])
+        )));
+    }
+
+    #[test]
+    fn sub_agent_in_normal_prompt_mode_inherits_allow() {
+        use crate::ctx::PermissionMode;
+        // Normal 模式：委派已在父级审批过，子 Agent 不应再被 fail-closed 全量拒绝
+        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::Prompt), None, false);
+        assert!(
+            matches!(mode, PermissionMode::AutoApprove),
+            "Normal 模式下子 Agent 应继承放行，否则 Bash/Edit/Write 全废"
+        );
     }
 }

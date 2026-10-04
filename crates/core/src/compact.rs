@@ -8,10 +8,41 @@ use wyj_api::{
 
 use crate::session::Session;
 
-/// 压缩触发缓冲（距上限此 token 数时触发）
-pub const COMPACT_TRIGGER_BUFFER: u32 = 40_000;
 /// 保留最近 N 条消息不压缩，确保上下文连续性
 const COMPACT_KEEP_RECENT: usize = 6;
+
+/// `compact_session` 的两种「已无可压缩」信号。
+///
+/// 与真正的失败（LLM 调用报错、摘要为空）区分开，供
+/// `compact_session_until_fit` 决定是把控制权还给调用方还是上报错误。
+///
+/// 旧实现靠 `error.to_string().contains("消息数量过少")` 做子串匹配来识别：
+/// 这句中文错误文案一旦被 i18n 本地化、或有人调整措辞，判定会静默变成
+/// 「真失败」，`last_error` 被上报并走 warn 分支。typed error 从根上消除
+/// 这个字符串耦合；`Display` 仍输出原来的中文文案，既有日志与单测行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactSkip {
+    /// 消息数不足（`<= COMPACT_KEEP_RECENT + 2`），再压没有意义。
+    TooFewMessages(usize),
+    /// 找不到不拆散 tool_use / tool_result 配对的安全边界。
+    NoSafeBoundary,
+}
+
+impl std::fmt::Display for CompactSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompactSkip::TooFewMessages(n) => write!(f, "消息数量过少（{n}条），无需压缩"),
+            CompactSkip::NoSafeBoundary => write!(f, "找不到安全的压缩边界，暂不压缩"),
+        }
+    }
+}
+
+impl std::error::Error for CompactSkip {}
+
+/// 从 `anyhow::Error` 里取回 [`CompactSkip`]（若它是 compact 的良性跳过）。
+pub fn compact_skip_of(error: &anyhow::Error) -> Option<CompactSkip> {
+    error.downcast_ref::<CompactSkip>().copied()
+}
 
 pub fn compact_trigger_buffer(context_window: u32) -> u32 {
     40_000.min((context_window / 5).max(4_000))
@@ -29,7 +60,7 @@ pub struct CompactResult {
 /// 携带 system prompt、工具定义，并要为输出预留 `max_tokens`。所有供应商的分词
 /// 器和消息包装开销并不相同，因此这仍是保守估算，但覆盖面比只估 messages 完整。
 pub fn estimate_request_tokens(
-    system: &str,
+    system: &wyj_api::SystemPrompt<'_>,
     messages: &[Message],
     tools: &[ToolDefinition],
     max_output_tokens: u32,
@@ -37,7 +68,9 @@ pub fn estimate_request_tokens(
     const REQUEST_OVERHEAD_TOKENS: u32 = 64;
     const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 
-    let system_tokens = estimate_text_tokens(system) as u32;
+    // system 分 stable / volatile 两段（见 wyj_api::SystemPrompt），估算时按
+    // 拼接后的完整文本计，与实际发送的字节保持一致。
+    let system_tokens = estimate_text_tokens(&system.combined()) as u32;
     let message_overhead = (messages.len() as u32).saturating_mul(MESSAGE_OVERHEAD_TOKENS);
     let tool_tokens = tools.iter().fold(0u32, |total, tool| {
         let schema = tool.input_schema.to_string();
@@ -145,11 +178,11 @@ pub async fn compact_session(
 ) -> Result<CompactResult> {
     let total = session.messages.len();
     if total <= COMPACT_KEEP_RECENT + 2 {
-        anyhow::bail!("消息数量过少（{}条），无需压缩", total);
+        return Err(CompactSkip::TooFewMessages(total).into());
     }
 
     let keep_from = safe_keep_from(&session.messages, COMPACT_KEEP_RECENT)
-        .ok_or_else(|| anyhow::anyhow!("找不到安全的压缩边界，暂不压缩"))?;
+        .ok_or(CompactSkip::NoSafeBoundary)?;
 
     // 工具密集型单回合的消息序列通常只有首条是真实 user 消息：
     // user → assistant(tool_use) → user(tool_result) → ...。此时安全边界会回退
@@ -168,6 +201,10 @@ pub async fn compact_session(
     let before_tokens = estimate_tokens(&session.messages);
 
     let conv_text = messages_to_text(to_compact);
+    // 这里就把长度取出来：`to_compact` 对 `session.messages` 的不可变借用必须
+    // 在下面 `session.add_usage(...)`（可变借用）之前结束，否则借用检查器
+    // 判定冲突。取完长度后 `to_compact` 不再被使用，NLL 即刻结束该借用。
+    let messages_removed = to_compact.len();
     let prompt = crate::prompts::compact_prompt(&conv_text);
 
     let req = vec![Message {
@@ -180,12 +217,23 @@ pub async fn compact_session(
 
     let result = provider
         .complete(
-            crate::prompts::COMPACT_SYSTEM,
+            &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
             &req,
             &[],
             &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
         )
         .await?;
+
+    // 压缩本身是一次真实的 LLM 往返，必须计入用量。旧实现直接丢弃
+    // `CompletionResult` 的 usage 字段（也不累加 `api_calls`），导致
+    // `/cost` 与 `WYJ_STATS_JSON` 系统性低估真实花费，压缩越频繁偏差越大。
+    // 计入时机放在空摘要检查之前：即使摘要生成失败，这轮 token 也已经花掉了。
+    session.add_usage(result.input_tokens, result.output_tokens);
+    session.add_cache_usage(
+        result.cache_read_input_tokens,
+        result.cache_creation_input_tokens,
+    );
+    session.api_calls += 1;
 
     let summary: String = result
         .content
@@ -204,8 +252,6 @@ pub async fn compact_session(
     if summary.is_empty() {
         anyhow::bail!("摘要生成失败：模型返回空输出");
     }
-
-    let messages_removed = to_compact.len();
 
     if reset_entire_session {
         session.messages = vec![Message {
@@ -276,14 +322,16 @@ pub async fn compact_session_until_fit(
                 last_result = Some(Ok(result));
             }
             Err(error) => {
-                let reason = error.to_string();
                 // 「消息数过少」/「找不到安全边界」是『已无可压缩』的合法
                 // 信号——常见于连跑多轮 compact 后只剩 1~2 条 user/assistant
                 // 配对,此时本来就压不动了;把控制权还给 caller,让它继续
                 // stream（runtime `truncate_messages` 仍会兜底截断单块超长
                 // 内容）。其它错误(LLM 调用失败 / 摘要为空) 才算真失败。
-                if reason.contains("消息数量过少") || reason.contains("找不到安全的压缩边界")
-                {
+                if let Some(skip) = compact_skip_of(&error) {
+                    tracing::debug!(
+                        ?skip,
+                        "compact 已无可压缩空间，把控制权交回调用方由 truncate 兜底"
+                    );
                     return CompactUntilFitOutcome {
                         final_estimated: estimate_tokens(&session.messages),
                         passes: pass,
@@ -295,7 +343,7 @@ pub async fn compact_session_until_fit(
                     final_estimated: estimate_tokens(&session.messages),
                     passes: pass,
                     last_result: None,
-                    last_error: Some(reason),
+                    last_error: Some(error.to_string()),
                 };
             }
         }
@@ -455,7 +503,7 @@ mod tests {
     impl Provider for StaticSummaryProvider {
         async fn stream(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -465,7 +513,7 @@ mod tests {
 
         async fn complete(
             &self,
-            _system: &str,
+            _system: &wyj_api::SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
             _opts: &wyj_api::provider::RequestOptions,
@@ -495,7 +543,7 @@ mod tests {
 
         let message_only = estimate_tokens(&messages);
         let full_request = estimate_request_tokens(
-            "system instruction ".repeat(40).as_str(),
+            &wyj_api::SystemPrompt::stable_only("system instruction ".repeat(40).as_str()),
             &messages,
             &tools,
             1024,
@@ -688,7 +736,7 @@ mod tests {
         impl Provider for FailingProvider {
             async fn stream(
                 &self,
-                _system: &str,
+                _system: &wyj_api::SystemPrompt<'_>,
                 _messages: &[Message],
                 _tools: &[ToolDefinition],
                 _opts: &wyj_api::provider::RequestOptions,
@@ -697,7 +745,7 @@ mod tests {
             }
             async fn complete(
                 &self,
-                _system: &str,
+                _system: &wyj_api::SystemPrompt<'_>,
                 _messages: &[Message],
                 _tools: &[ToolDefinition],
                 _opts: &wyj_api::provider::RequestOptions,
@@ -778,5 +826,93 @@ mod tests {
         let text = "中".repeat(100); // 100 CJK chars
         let tokens = estimate_text_tokens(&text);
         assert_eq!(tokens, 150, "100 CJK chars 应估 150 tokens");
+    }
+
+    /// 与 `StaticSummaryProvider` 相同，但返回非零 usage —— 用于验证压缩的
+    /// LLM 往返确实被计入 Session 计数器。
+    struct UsageSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for UsageSummaryProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::provider::EventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn complete(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::types::CompletionResult> {
+            Ok(wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text {
+                    text: "## Task & Intent\n继续完成当前任务。".to_string(),
+                }],
+                stop_reason: wyj_api::types::StopReason::EndTurn,
+                input_tokens: 1_234,
+                output_tokens: 56,
+                cache_read_input_tokens: 7,
+                cache_creation_input_tokens: 8,
+            })
+        }
+    }
+
+    fn multi_turn_session() -> Session {
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        session
+    }
+
+    #[tokio::test]
+    async fn compact_session_counts_the_summary_round_trip_in_session_usage() {
+        // 回归背景：旧实现直接丢弃 `CompletionResult` 的 usage，也不累加
+        // `api_calls`，`/cost` 与 WYJ_STATS_JSON 因此系统性低估真实花费。
+        let mut session = multi_turn_session();
+        compact_session(&mut session, &UsageSummaryProvider, 200_000)
+            .await
+            .expect("normal multi-turn session should compact");
+        assert_eq!(session.total_input_tokens, 1_234);
+        assert_eq!(session.total_output_tokens, 56);
+        assert_eq!(session.total_cache_read_tokens, 7);
+        assert_eq!(session.total_cache_write_tokens, 8);
+        assert_eq!(session.api_calls, 1);
+    }
+
+    #[test]
+    fn compact_skip_is_typed_and_downcastable_not_string_matched() {
+        // 回归背景：旧实现靠 `error.to_string().contains("消息数量过少")` 识别
+        // 良性跳过。中文文案一旦被 i18n 本地化或改措辞，判定会静默变成「真失败」。
+        let mut session = Session::new();
+        session.push_user("hi");
+        let err = futures::executor::block_on(compact_session(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+        ))
+        .expect_err("只有 1 条消息时应报跳过");
+        assert_eq!(
+            compact_skip_of(&err),
+            Some(CompactSkip::TooFewMessages(1)),
+            "必须是 typed error，不能靠字符串匹配识别"
+        );
+        // Display 仍输出原中文文案，保持既有日志/单测行为
+        assert!(err.to_string().contains("消息数量过少"));
     }
 }

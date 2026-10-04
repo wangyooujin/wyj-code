@@ -77,6 +77,8 @@ pub enum AgentEvent {
     },
     /// 子 Agent 生命周期事件（SubAgentHub 汇聚转发）
     SubAgent(wyj_tools::SubAgentEvent),
+    /// 用户在后台任务面板按 `k` 终止某个任务后，kill 流程完成的通知
+    ShellKilled(String),
     /// 后台标题生成完成（首轮后 LLM 生成短标题，用于更新终端窗口标题）
     TitleGenerated(String),
     /// /mcp 面板 Browse tab 发起的 registry 搜索结果

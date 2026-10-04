@@ -8,6 +8,56 @@ use std::pin::Pin;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + 'static>>;
 
+/// 一次请求的 system prompt，按「会话内稳定前缀」与「每轮变化尾部」两段传入。
+///
+/// Anthropic 的 prompt cache 按**前缀**匹配：`cache_control` 断点打在哪个块
+/// 末尾，该块及其之前的内容才被缓存。之前整个 system 被压成**单个** text 块、
+/// 断点打在块尾，于是任何一处尾部改动都会让整段 system（约 1.6k~5k token）
+/// 全价重算：
+///   * `<current-tool-availability>` 随工具懒加载命中/过期而变；
+///   * 模型兼容 suffix 随 route 能力而变；
+///   * Project Brief 每次按「最近 4 条 user 消息」重算相关性排序；
+///   * 子目录 CLAUDE.md reminder 被 `push_str` 追加到 system 末尾——旧注释
+///     里「只增不减，前缀仍可缓存」的说法是错的，追加在断点**之后**同样会
+///     改变断点处的前缀哈希。
+///
+/// 拆成两段后，`stable` 承载进缓存的内容（主提示 / `<env>` / 模式段 /
+/// 记忆快照 / CLAUDE.md 祖先链），断点只打在它末尾；`volatile` 承载每轮
+/// 变化的内容，不打断点，也不影响 `stable` 的缓存命中。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemPrompt<'a> {
+    /// 会话内稳定前缀，命中 prompt cache。
+    pub stable: &'a str,
+    /// 每轮变化部分，不参与缓存。
+    pub volatile: &'a str,
+}
+
+impl<'a> SystemPrompt<'a> {
+    /// 单一稳定 system，无 volatile 尾部。摘要生成、记忆提取、标题生成等
+    /// 辅助 LLM 调用都属于这一类。
+    pub fn stable_only(system: &'a str) -> Self {
+        Self {
+            stable: system,
+            volatile: "",
+        }
+    }
+
+    /// 两段拼接后的完整文本。供 token 估算与 OpenAI 协议使用
+    /// （Chat Completions 没有 system 块概念，只有一条 system 消息）。
+    pub fn combined(&self) -> String {
+        match (self.stable.is_empty(), self.volatile.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => self.volatile.to_string(),
+            (false, true) => self.stable.to_string(),
+            (false, false) => format!("{}\n\n{}", self.stable, self.volatile),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stable.is_empty() && self.volatile.is_empty()
+    }
+}
+
 /// 单次推理请求的选项（收敛为结构体，后续扩展不再破坏 trait 签名）
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
@@ -62,7 +112,7 @@ pub trait Provider: Send + Sync {
     /// 发起流式推理，返回 SSE 事件流
     async fn stream(
         &self,
-        system: &str,
+        system: &SystemPrompt<'_>,
         messages: &[Message],
         tools: &[ToolDefinition],
         opts: &RequestOptions,
@@ -71,7 +121,7 @@ pub trait Provider: Send + Sync {
     /// 发起非流式推理，等待完整结果（默认由 stream 实现，可覆盖以提升性能）
     async fn complete(
         &self,
-        system: &str,
+        system: &SystemPrompt<'_>,
         messages: &[Message],
         tools: &[ToolDefinition],
         opts: &RequestOptions,
