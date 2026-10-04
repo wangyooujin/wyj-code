@@ -2,6 +2,78 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.16] - 2026-10-04
+
+### 后台任务可见性与自动续跑（本次主线）
+
+- **后台任务完成 → 自动唤醒 Agent 续跑**：此前后台 subagent 的结果只暂存在 `pending_bg_reminders`、等用户发下一条消息才注入；后台 shell 则只返回 `bash_N` id、输出全靠模型自己轮询 `BashOutput`。两条路都会停在等用户输入，"派完活就不动了"。现在主循环 idle 钩子（`AppState::poll_shells` + reminder 投递）在检测到后台任务完成的下一帧自动起新 turn 把结果喂回主 Agent，无需人工输入。多任务同帧完成时合并成**一轮**（`reminders.join("\n\n")`），避免连续多轮 LLM 调用浪费 token。
+- **`spawn_agent_turn` 新增自动唤醒模式**（`text: Option<String>`）：常规回合传 `Some(用户输入)`，自动唤醒传 `None`——此时 reminder 本身就是这一轮唯一的 user 输入。此前若直接传 `Some(reminder 原文)`，reminder 会被当成"用户说的话"写进 session 历史并在 `/resume` 后继续显示，既污染上下文又让模型误以为用户催过它。聊天流侧只显示可读的 `⚙ 后台任务已完成，正在自动继续执行` 系统提示，不暴露 reminder 原文。
+- **ESC 中断后暂停自动唤醒**（`AppState.auto_wake_paused`）：用户按 ESC 意味着"先别继续"，后台任务这时刚好完成也不应该自动把 Agent 唤醒续跑（那会显得不听话）。下一次用户自己发消息时自动恢复。
+- **后台 Shell 实时输出面板**（新增，`BottomPanel::ShellProcesses` + `render::draw_shell_panel`）：此前 `BashSessionManager` 有完整输出缓冲但 TUI 侧一行代码都没接，所有 `run_in_background` 任务在界面上完全不可见——用户报告"所有 shell 后台执行的任务界面上看不见执行的内容"。现在有运行中任务时底部面板自动出现（列表：id / 命令摘要 / 状态图标 / 耗时 / 退出码），`Enter`/`Space` 展开实时输出，`PageUp`/`PageDown` 翻页看历史（默认贴底跟随新输出），`k` 终止选中任务的进程组（SIGTERM → 2s 兜底 SIGKILL）。任务退出时往聊天流追加 `⚙ 后台任务 bash_1 已退出（code 0，耗时 12.3s）`。
+- **新增 `/shells [id]` slash 命令**：手动打开面板查看已结束任务的历史输出（参数接受 `bash_1` 或裸数字 `1`，带 id 直接定位；无参数定位到最近一个并展开）。已在 `/help` 正文注册（CLAUDE.md 硬性约定：新增 slash 命令必须同步 `/help`），中英双语文案走 i18n。
+- **面板优先级为「用户焦点 > 有运行中任务」**：子 Agent 和后台 shell 经常同时跑（典型场景：派子 Agent 改代码 + 自己起 dev server）。若固定让子 Agent 面板占住底部位置，后台任务就永远看不见也按不了 k；现在 `Shift+↑` + `↓` 导航到 Shells 焦点即可查看，跨区链条为 `Chat ↓ → Todos ↓ → SubAgents ↓ → Shells`（反向同理）。
+- **`BackgroundJob::tail()` 只读快照 API**（`crates/tools/src/bash_session.rs`）：面板每帧需要读输出，但既有的 `read_new()` 推进的是 `BashOutput` 工具的增量读游标，两者共用会把对方的增量内容抢走（面板看到空白、工具看到"无新输出"）。`tail(max_bytes)` 只做只读快照、按 char boundary 收口（中文/emoji 安全），与工具游标完全隔离。2 个回归测试锁定该不变量。
+- **退出误唤醒防护**：TUI 退出时 `kill_all()` 给所有 Running job 发 SIGKILL，而 `spawn_prepared` 里的 `child.wait()` task 仍会把它们翻成 `Exited(-1)`。轮询检测若不加守卫，退出那一帧会把**每个**后台任务都误判为"刚完成"并触发一次自动唤醒。`should_quit` 守卫拦在轮询之前。
+- **后台任务跨轮次保留、会话级才清**：`begin_new_turn`（每轮对话）**刻意不清** `shells`——dev server 这类任务的生命周期跨对话轮次，在这儿清会让正在运行的任务从面板凭空消失（既看不到输出也按不了 k）。真正作废的是 `reset_for_new_session`（`/clear`、新会话、resume 切会话），那里 shell 进程本身也已被 `kill_all` 收走。
+- **任务列表全部完成后收成一行摘要**：`TurnDone` 刻意不清 `current_todos`（现有测试 `turn_done_auto_completes_remaining_in_progress_todos` 用 `expect("TurnDone 不应清空 current_todos")` 锁死了该行为），加上 `TodoUpdate` 全部完成时只置折叠，导致"任务已完成 [N/N]"的 2 行折叠面板（头部 + `─` 分隔线）一直挂在聊天流里，直到用户发下一条消息才消失。现在 `all_done` 时只画一行摘要（保留耗时/token 统计的可追溯信息），不画分隔线、不列条目、不给展开提示；`Ctrl+T` 在该状态下不再展开成永远渲染不出来的空壳。
+- **输出回显给模型**：后台 shell 退出时读取输出尾部（64 KiB，再经 `truncate_head_tail` 收口到 4 KB）拼进 reminder，模型不主动调 `BashOutput` 也能知道结果。`wyj_core::prompts::bg_shell_done_reminder` 与既有的 `bg_agent_done_reminder` 同构。
+- i18n 新增 `shell.*`（面板标题 / focus_hint / detail_hint / no_output / exited）、`shells.*`（命令 desc / bad_id / not_found / empty / headless_unsupported / exited_notice / kill_done / kill_missing / kill_nothing_selected）、`bg_wake.notice` 三组 key，中英同步。
+
+### Prompt cache 自我击穿修复（Provider 契约变更）
+
+- **system prompt 拆成 stable / volatile 两段**：此前 `Provider::stream/complete` 的 `system: &str` 签名强迫整个 system 压成一个字符串，Anthropic 侧只能发单个 text 块、断点打在块尾。而 system 内容里混了大量每轮会变的东西（当前工具可用性、模型兼容 suffix、子目录 CLAUDE.md reminder、Project Brief），**任何一项变化都会让整段 1.6k~5k token 的 system 全价重算**。旧代码注释里"reminder 只增不减、前缀仍可缓存"的说法是错的——追加在断点之后同样会改写断点处的前缀哈希。
+  - `crates/api/src/provider.rs` 新增 `SystemPrompt<'a> { stable, volatile }`（带 `stable_only()` / `combined()` / `is_empty()`），`Provider::stream` / `complete` 签名从 `&str` 改为 `&SystemPrompt<'_>`。
+  - `crates/api/src/anthropic.rs` 新增 `build_system_blocks()`：stable 块末尾打 `cache_control: EPHEMERAL`，volatile 块不打。断点预算 system 1 + tools 1 + 历史 1 = 3，仍在 Anthropic 上限 4 内。
+  - `crates/api/src/openai.rs` 的 Chat Completions 无 system 块概念，用 `system.combined()` 拼成一条 system 消息。
+  - `crates/core/src/agent.rs` 把 system 拆成 `system_stable`（主提示 + 记忆快照 + CLAUDE.md 祖先链）与 `system_volatile`（初始为空），循环内每轮只往 volatile 追加。
+  - **记忆快照分桶缓存**（`MEMORY_SNAPSHOT_REFRESH_TURNS = 10`）：Project Brief 原本每次都按"最近 4 条 user 消息"重算相关性排序并拼进稳定前缀，等于每轮都改写前缀。改为按 `user_turns / 10` 分桶，同桶复用缓存文本、跨桶才重算——缓存抖动降到 1/10，代价是新提取的记忆最迟 10 轮后可见。
+  - **【源码级破坏】** `Provider` trait 的 `system` 参数类型变更，所有自定义 `Provider` 实现必须改签名。仓内已全部改完（含约 20 个测试 mock）。辅助 LLM 调用（记忆提取 / 标题摘要 / Evolution 候选提取）一律用 `SystemPrompt::stable_only(...)` 一行迁移。
+  - **【API 移除】** `wyj_core::compact::COMPACT_TRIGGER_BUFFER` 公开常量删除，改为 `compact_trigger_buffer(context_window)` 函数。全仓库无引用，但对把 `wyj_core` 当库用的下游是公开 API 移除。
+
+### 静默失效的持久化上限修复
+
+- **`persist_cap` 的两条 JSON 上限从上线起从未生效**：`ContentBlock::ToolUse.input` 与 `ToolResultContent::Blocks` 都是 `serde_json::Value`，旧实现把它们 `to_string` 后做字符串级 head+tail 截断（中间插入 `[truncated N bytes]` 标记），再 `from_str` 回来——插入的标记使 JSON **必然**解析失败，而失败分支是 `if let Ok(...)`，错误被静默吞掉。结果 `persist_cap.tool_use_input_bytes`（默认 64 KiB）和 tool_result 的 Blocks 路径形同虚设，超限的 `Edit`/`Write` 参数、`Bash` 大段输出直接原样进请求体并落盘。
+  - `crates/core/src/serialize.rs` 新增 `shrink_json_to_budget(v, budget)`：每轮重新序列化度量字节数，找出当前最长的 string 叶子按"超出量 + 64 B 余量"做 head 截断，最多 32 轮，全程保持合法 JSON；截断走 char-boundary 回退，CJK/emoji 安全。
+  - 已知边界并显式记录：没有 string 叶子的 JSON（例如几万个数字的数组）无法在不删语义的前提下裁剪，原样保留。
+  - 5 个新回归测试覆盖实际截断 / 合法性 / 最长叶子优先 / char boundary 安全 / 无 string 叶子时放弃。
+
+### 子 Agent 权限继承修复（本批风险最高）
+
+- **修复「子 Agent 比主 Agent 更严」**：`ToolContext::allowed_tools()` 只在白名单语义（`Plan`/`Allowlist`）下返回 `Some`，对 `Prompt` 与 `AutoApprove` 一律返回 `None`。子 Agent 过去只据它决定自身模式，于是父级处于 **Bypass(AutoApprove)** 时子 Agent 落回默认 `Prompt`；而子 Agent 没有审批 UI（`ui_ask_tx` 恒为 `None`），`Prompt` + 无 UI 通道在**两道**关卡上 fail-closed（`PermissionPolicy::evaluate` 判 Deny + `ToolCtx::confirm_tool` 返回 false）。结果子 Agent 的 Bash/Edit/Write 被**全量拒掉**——用户显式选了"全部放行"，子 Agent 却比主 Agent 更严。
+  - `ToolContext` 新增 `permission_mode() -> Option<PermissionMode>`（带默认实现返回 `None`，对下游 implementor 源码兼容）。
+  - 新增 `derive_sub_agent_permission_mode(parent_mode, allowed, parent_is_plan)`：AutoApprove 原样传；**Prompt → AutoApprove**（委派这一步本身已在父级审批过，子 Agent 不应、也没有再弹窗的通道）；`Plan` 父级继续收窄只读白名单；`Allowlist` 原样继承；`permission_mode() == None` 时退回旧的 `allowed_tools()` 派生。
+  - **安全护栏**：放宽子 Agent 内部权限的同时，`SubAgentTool` 新增 `needs_permission()`——只有被委派的 agent 类型**可能**拿到副作用工具时才弹审批（`tools: None` 的 general-purpose 需审批；`tools: Some(READONLY_TOOLS)` 的 Explore/Plan 不打断）。Explore/Plan 委派零打扰，general-purpose 委派在父级弹一次窗、进去后 Bash/Edit/Write 正常。
+  - **行为变更**：Bypass 模式下子 Agent 现在真的会执行 Bash/Edit/Write（此前全量被拒）。
+- **Agent 工具 schema：`description` 由必填改为可选**：多 agent 并行场景下模型经常只填 `prompt` 漏 `description`，直接触发 `tool_arguments_invalid`（用户体感是"分派失败"），而 `run_impl` 本来就会从 `prompt` 前缀派生 fallback 描述。schema 的 `required` 从 `["description", "prompt"]` 改为 `["prompt"]`，运行时校验同步只校验 prompt。回归测试 `definition_schema_accepts_missing_description` 覆盖三态。
+
+### Agent 循环健壮性
+
+- **孤儿 tool_use 兜底配对（修 resume 后永久 400）**：模型写工具参数时被 `max_tokens` 截断时，assistant 消息里会带一个没有配对 `tool_result` 的 `tool_use`（`pending_tools` 与 `assistant_blocks` 从同一批 `StreamedBlock` 构造、不看 `stop_reason`）。后果有二：本回合下一次请求被 provider 判为协议错误；更糟的是**该历史已落盘，任何一次 `--resume` 都会复现，用户不手动 `/rewind` 或 `/clear` 无法自愈**。现在为每个残留 tool_use 合成一条 `is_error: true` 的 tool_result（JSON 含 `error: "tool_call_incomplete"` / `stop_reason` / `instruction`），并回调 `ToolEvent::End` 让 UI 正常收口。回归测试 `max_tokens_with_pending_tool_use_still_gets_a_matching_tool_result`。
+
+### Checkpoint 配置注入（TUI 侧失效修复）
+
+- **`CheckpointStore::new()` 的 `max_per_session` 硬编码 0（不限）、`cas` 恒为 `None`**：CLI 装配阶段会正确配置，但 TUI 侧有 7 处用裸 `new()` 构造，其中 `attach_agent_session` 还会**覆盖掉**装配好的 store。后果是 TUI 用户只要切换过一次模型 / 模式，checkpoint 就不再封顶、文件快照也不再走 CAS 去重（同 session 从 <5 MB 退回 200 MB 量级）。
+  - 新增 `CheckpointConfig { max_per_session, cas }` + 进程级 `set_checkpoint_config()` + `CheckpointStore::configured()`（用 `Mutex<Option<>>` 而非 `OnceLock` 以便单测重置）。
+  - TUI 侧 7 处 + ACP 3 处 + `evolve_cmd` / `workflow_cmd` / `session checkpoint|rewind|branch` 全部改走 `configured()`。未配置时（单测、库调用方）退化为裸 `new()` 语义。
+
+### 压缩与存储治理
+
+- **压缩计入用量**：`/cost` 与 `WYJ_STATS_JSON` 系统性低估真实花费——压缩本身是一次真实 LLM 往返，旧实现直接丢弃 `CompletionResult` 的 usage 也不累加 `api_calls`，压缩越频繁偏差越大。现在计入 `input/output/cache_read/cache_write` 并 `api_calls += 1`，且**计入时机放在空摘要检查之前**（这轮 token 即使摘要失败也已花掉）。**行为变更**：`/cost` 数字会变高。
+- **typed error 替代字符串匹配**：`compact_session_until_fit` 靠 `error.to_string().contains("消息数量过少")` 子串匹配识别"已无可压缩"的良性跳过，一旦被 i18n 本地化或改措辞就静默变成"真失败"。新增 typed `enum CompactSkip { TooFewMessages(usize), NoSafeBoundary }` + downcast helper，`Display` 仍输出原中文文案，既有日志与单测行为不变。
+- **【配置项幻象清理】** 删除 `StorageRetentionCfg` 的 4 个 Phase 4 字段：`checkpoint_bytes_per_session` / `cas_total_bytes` / `cas_gc_on_start` / `checkpoint_ttl_days`。它们有非零默认值但全仓库无任何消费点（`WorkspaceCas::gc` 只被单测调用，`storage prune` / `doctor` 仍是 TODO 桩），删除不改变任何运行时行为、**迁移成本为零**（`#[serde(default)]` + 无 `deny_unknown_fields`，用户既有 config.toml 里写了这些键会被静默忽略）。**需注意**：`~/.wyj-code/cas` 与 `*.checkpoints/` 至今仍**没有任何自动或手动回收路径**，磁盘告警超阈值时只会提示手动删目录。
+- **磁盘告警文案指向真实路径**：旧文案推荐 `wyj-code session prune`，但该子命令**不存在**，用户按提示操作只会得到"未知命令"。新文案直接给出可手动删除的绝对路径并说明"尚无自动清理路径"。
+
+### CLI 健壮性与文案
+
+- **悬空 cwd 不再 panic**：`std::env::current_dir()` 在当前工作目录已被删除时返回 `Err(NotFound)`（Unix `getcwd(2)` 的 ENOENT 语义），两处调用点曾用 `.unwrap()`——从已删除目录启动二进制会 panic，用户只看到裸 Rust 报错。现在报明确中文错误并提示"先 `cd` 到有效目录，或用 `--cwd <目录>`"，同时点明"这是 shell 层面的问题，不只影响 wyj-code"。**刻意不做 `$HOME` 兜底**：cwd 决定 project root、会话归属与项目级配置 `.wyj-code/`，静默换目录比报错危险得多。
+- **`/context` 占用率不再写死 200K**：`context_window` 从写死的 `200_000` 改为 `cfg.active_profile().context_window`，非 200K 模型下占用百分比不再算错。
+- **界面文案本地化修复**：`agent.compacted`（"已压缩对话历史：移除 N 条消息，节省约 M tokens"）原先是硬编码中文内联字符串，英文界面下会显示中文，现走 i18n（`agent.rs` → `wyj_i18n::tr_fmt`）。顺带修掉 `subagent` 段里 `waiting_bg` / `panel_title` / `inline_running` 三个 key 的重复定义（en.yml 与 zh.yml 各一份，后者静默覆盖前者）。
+- **子 Agent 派发引导对齐 Claude Code**：Agent 工具描述从"已知就两三个文件就别派"改写为"Delegate to subagents proactively — it is the default, not a last resort"，并补上"子 Agent 有独立 context window、探索输出不污染主上下文""并行调用"等引导；主 system prompt 的 Agent 段落同步改写；三个内置类型的 description 全部重写为 Claude Code 官方措辞（强调 Explore 是只读且"任何需要读超过 handful 文件的探索都应主动派它"）。
+
+### 回归 / 验证
+
+`cargo fmt` + `cargo clippy --workspace --all-targets` 零警告 + `cargo test --workspace` 全绿（本次新增约 30 个回归测试：shell 面板 5 + tasklist 摘要 2 + 自动唤醒与跨轮次粒度 5 + 焦点导航 3 + ESC 暂停 1 + `tail()` 游标隔离 2 + `persist_cap` JSON 裁剪 5 + 压缩用量 1 + compact typed error 1 + `/shells` 命令 4 + Agent 工具 schema 1 + 孤儿 tool_use 1），release 构建通过。
+
 ## [1.5.15] - 2026-10-03
 
 - **BREAKING: 配置加载收敛到 `.wyj-code/`**（全局 + 项目级）。wyj-code 自 v1.5.15 起只读写 `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级），不再读取 `~/.claude/`（commands / agents）、`~/.claude.json`、`<cwd>/.mcp.json`、`~/.codex/` 等任何外部配置。Skill 加载链由 6 层（内置 → `~/.wyj-code/skills` → `~/.claude/commands` → 插件 → 项目 `~/.wyj-code/skills` → 项目 `.claude/commands`）裁为 4 层（内置 → `~/.wyj-code/skills` → 插件 → 项目 `~/.wyj-code/skills`）；SubAgent 类型加载链同方向 6 层裁为 4 层。MCP 全局配置：`Config::load()` 不再合并 `~/.claude.json`，与 `Config::load_file_only()` 行为一致；项目级 `merged_mcp_servers` 不再读 `<cwd>/.mcp.json`；`project_scoped_mcp_servers` 同款；`uninstall_mcp_server` 删"原生来源 → 落禁用记录"兜底分支，统一走"从来源文件删行 + lockfile 移除"。MCP 卸载相关 4 个测试改写（`native_project_mcp_overrides_legacy_toml` 删除；`uninstall_native_origin_server_disables_instead_of_deleting` → `uninstall_wyj_config_server_removes_from_source_and_lockfile`；`uninstalled_native_server_disappears_from_installed_list` → `uninstalled_wyj_project_server_disappears_from_installed_list`；`reads_native_stdio_and_http_servers` 删除）。

@@ -44,6 +44,11 @@ use wyj_tools::trace::TraceEvent;
 use wyj_tools::{ctx::UiAskRequest, PermissionMode};
 use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 
+/// 后台 shell 任务退出时，读取多少字节的输出尾部喂给模型（喂之前还会再经
+/// `truncate_head_tail` 收口到 4KB）。留 64KB 是为了覆盖「模型正要关心
+/// 结尾几行、但任务狂刷日志」的情况。
+const SHELL_WAKE_TAIL_BYTES: usize = 64 * 1024;
+
 /// 用于 /model 热切换 / 设置面板保存后重建 Agent 的函数类型
 pub type RebuildFn = Arc<dyn Fn(&Config, &str) -> anyhow::Result<Agent> + Send + Sync>;
 
@@ -236,6 +241,37 @@ pub struct SubAgentUiState {
 
 impl SubAgentUiState {
     /// 当前应展示的耗时秒数
+    pub fn elapsed_secs(&self) -> f64 {
+        self.final_elapsed
+            .unwrap_or_else(|| self.started_at.elapsed().as_secs_f64())
+    }
+}
+
+/// 后台 shell 任务状态（TUI 展示用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellStatus {
+    Running,
+    Exited(i32),
+}
+
+/// 单个后台 shell 任务的 TUI 实时状态。
+///
+/// 用 `Vec` 而非 `BTreeMap`/`HashMap`：job id 形如 `bash_1` / `bash_10`，
+/// 按字符串排序会把 `bash_10` 排到 `bash_2` 前面；`Vec` 天然保持 spawn
+/// 顺序，面板从上到下即启动先后。
+#[derive(Debug, Clone)]
+pub struct ShellUiState {
+    pub id: String,
+    pub command: String,
+    pub status: ShellStatus,
+    pub started_at: Instant,
+    /// 退出时定格的耗时；运行中用 started_at.elapsed() 实时算
+    pub final_elapsed: Option<f64>,
+    /// 是否已因本次退出触发过自动唤醒（防同一任务重复唤醒 Agent）
+    pub wake_sent: bool,
+}
+
+impl ShellUiState {
     pub fn elapsed_secs(&self) -> f64 {
         self.final_elapsed
             .unwrap_or_else(|| self.started_at.elapsed().as_secs_f64())
@@ -1228,7 +1264,7 @@ async fn execute_evolution_action(
             );
             let sessions = session_store.context("checkpoint storage unavailable")?;
             let checkpoint_store =
-                wyj_core::CheckpointStore::new(sessions.dir(), session_id.to_string())?;
+                wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())?;
             let messages = session.lock().await.messages.clone();
             let checkpoint = checkpoint_store.create(
                 cwd,
@@ -6055,6 +6091,7 @@ pub enum UiFocus {
     TodoDetail,
     AgentsCatalog,
     SubAgents,
+    Shells,
 }
 
 pub struct AgentsDialog {
@@ -6296,6 +6333,13 @@ pub struct AppState {
     pub last_turn_output_tokens: u32,
     /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
     pub injector: Option<mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>>,
+    /// 终止后台任务的异步流程完成后，把结果发回 UI 线程的通道
+    /// （`BashSessionManager::kill` 要等 2s 兜底 SIGKILL，不能在同步按键里 await）
+    pub kill_tx: Option<mpsc::Sender<AgentEvent>>,
+    /// 用户按 ESC 中断过当前回合：暂停后台任务完成后的自动唤醒。
+    /// 用户主动打断意味着「先别继续」，后台任务这时完成再自动续跑会显得
+    /// 不听话；下一次用户自己发消息时自动恢复。
+    pub auto_wake_paused: bool,
     /// 最近一次粘贴的瞬时提示（在输入框光标处显示）
     pub(crate) paste_hint: Option<PasteHint>,
     /// 排队中尚未被 Agent 消费的补充消息（文本 + 附件），用于状态栏提示计数、
@@ -6321,6 +6365,17 @@ pub struct AppState {
     pub sub_agent_detail_max_scroll: u16,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
+    /// 后台 shell 任务（Vec 保持 spawn 顺序，见 ShellUiState 注释）。
+    /// 数据源是 `BashSessionManager::global()`，由主循环每帧 `poll_shells()` 同步。
+    pub shells: Vec<ShellUiState>,
+    /// shell 面板当前选中项（按 id 存而非 index，避免列表变动时错位）
+    pub selected_shell: Option<String>,
+    /// 选中 shell 是否已展开详情（实时输出）
+    pub shell_detail_open: bool,
+    /// 详情内容的行级滚动偏移（渲染时按可视行数 clamp 并写回）
+    pub shell_detail_scroll: u16,
+    /// 详情面板上一帧渲染算出的内部可滚动上限，供 scroll_focus_lines 判断是否已到边界并转发给聊天区
+    pub shell_detail_max_scroll: u16,
     /// 子 Agent 累计 token 用量（与主 session 分开统计，/cost 单列）
     pub sub_input_tokens: u32,
     pub sub_output_tokens: u32,
@@ -6431,6 +6486,8 @@ impl AppState {
             last_turn_input_tokens: 0,
             last_turn_output_tokens: 0,
             injector: None,
+            kill_tx: None,
+            auto_wake_paused: false,
             paste_hint: None,
             pending_queue: vec![],
             sub_agents: BTreeMap::new(),
@@ -6442,6 +6499,11 @@ impl AppState {
             sub_agent_detail_scroll: 0,
             sub_agent_detail_max_scroll: 0,
             pending_bg_reminders: vec![],
+            shells: Vec::new(),
+            selected_shell: None,
+            shell_detail_open: false,
+            shell_detail_scroll: 0,
+            shell_detail_max_scroll: 0,
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             hub,
@@ -6451,6 +6513,36 @@ impl AppState {
             mcp_connection_status: HashMap::new(),
             hook_runner: None,
         }
+    }
+
+    /// 一轮新对话开始时清理「按轮次」的生命周期状态。
+    ///
+    /// 目前只管 TodoWrite 面板。任务是**某一轮对话**的产物：上一轮的任务列表
+    /// 对新一轮没有参考价值，留着只会误导 —— 尤其上一轮全部完成后，面板会以
+    /// 折叠态一直挂在聊天流里，直到用户发新消息（`TodoUpdate` 不会再来，
+    /// 于是永远不消失）。
+    ///
+    /// 粒度上刻意区别于 `reset_for_new_session`：那是「新会话 / resume /
+    /// /clear」用的整块重置，这里只管每轮都会作废的那部分。
+    ///
+    /// 下一轮若确实需要任务板，模型重新调一次 TodoWrite 就会重新出现
+    /// （`AgentEvent::TodoUpdate` 负责填 `current_todos`）。
+    fn begin_new_turn(&mut self) {
+        self.current_todos = None;
+        self.todo_panel_expanded = false;
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.todo_stats.clear();
+        self.todo_execution_logs.clear();
+        // 用户主动发了消息 = 恢复对自动唤醒的信任（此前可能是 ESC 打断后暂停的）
+        self.auto_wake_paused = false;
+        // 刻意**不**清 shells：后台任务（dev server / watcher / 长跑构建）的
+        // 生命周期跨对话轮次，新一轮对话不代表它们结束了。在这儿清会让正在
+        // 运行的任务从面板上凭空消失，用户既看不到输出也按不了 k。
+        // 真正作废这些状态的是 `reset_for_new_session`（/clear、新会话、
+        // resume 切会话），那里 shell 进程本身也已被 kill_all 收走。
     }
 
     fn reset_for_new_session(&mut self) {
@@ -6503,6 +6595,14 @@ impl AppState {
         self.sub_agent_detail_open = false;
         self.sub_agent_detail_scroll = 0;
         self.pending_bg_reminders.clear();
+        // 会话级重置：后台任务属于「上一段会话的现场」，随会话一起作废
+        // （进程本身由退出路径的 kill_all 收走）。与 begin_new_turn 的
+        // 「跨轮次保留」是刻意区分的两级粒度。
+        self.shells.clear();
+        self.selected_shell = None;
+        self.shell_detail_open = false;
+        self.shell_detail_scroll = 0;
+        self.shell_detail_max_scroll = 0;
         self.sub_input_tokens = 0;
         self.sub_output_tokens = 0;
         self.ui_focus = UiFocus::Composer;
@@ -6617,7 +6717,10 @@ impl AppState {
                 } else if self.chat_scroll < self.chat_max_scroll {
                     self.scroll_chat_lines(1);
                 } else if !self.focus_todo_edge(true) {
-                    self.focus_sub_agent_edge(true);
+                    // 跨区链条：Chat → Todos → SubAgents → Shells，逐级回退
+                    if !self.focus_sub_agent_edge(true) {
+                        self.focus_shell_edge(true);
+                    }
                 }
             }
             UiFocus::Todos => {
@@ -6625,7 +6728,11 @@ impl AppState {
                     if delta < 0 {
                         self.focus_chat_edge(false);
                     } else {
-                        self.focus_sub_agent_edge(true);
+                        // 没有子 Agent 面板可去时，顺势落到后台任务面板，
+                        // 保持 Chat ↓→ Todos ↓→ SubAgents ↓→ Shells 的链条连通。
+                        if !self.focus_sub_agent_edge(true) {
+                            self.focus_shell_edge(true);
+                        }
                     }
                 }
             }
@@ -6644,12 +6751,30 @@ impl AppState {
                 }
             }
             UiFocus::SubAgents if !self.sub_agents.is_empty() => {
-                if !self.move_selected_sub_agent(delta) && delta < 0 && !self.focus_todo_edge(false)
+                if !self.move_selected_sub_agent(delta) {
+                    if delta < 0 {
+                        if !self.focus_todo_edge(false) {
+                            self.focus_chat_edge(false);
+                        }
+                    } else {
+                        // 越过最后一条子 Agent → 后台任务面板
+                        self.focus_shell_edge(true);
+                    }
+                }
+            }
+            UiFocus::SubAgents => self.ui_focus = UiFocus::Composer,
+            // 后台任务面板排在子 Agent 面板下方（Chat ↓ → Todos ↓ → SubAgents ↓ → Shells），
+            // 向上跨区时逐级回退：Shells → SubAgents → Todos → Chat。
+            UiFocus::Shells if !self.shells.is_empty() => {
+                if !self.move_selected_shell(delta)
+                    && delta < 0
+                    && !self.focus_sub_agent_edge(false)
+                    && !self.focus_todo_edge(false)
                 {
                     self.focus_chat_edge(false);
                 }
             }
-            UiFocus::SubAgents => self.ui_focus = UiFocus::Composer,
+            UiFocus::Shells => self.ui_focus = UiFocus::Composer,
         }
     }
 
@@ -6686,9 +6811,20 @@ impl AppState {
                     self.scroll_chat_lines(delta);
                 }
             }
+            // 后台任务详情：与子 Agent 详情同款——滚到边界就把滚动量转发给
+            // 聊天区，不让滚轮事件无声消失。
+            UiFocus::Shells if self.shell_detail_open => {
+                if !Self::adjust_bounded_u16_scroll(
+                    &mut self.shell_detail_scroll,
+                    delta,
+                    self.shell_detail_max_scroll,
+                ) {
+                    self.scroll_chat_lines(delta);
+                }
+            }
             UiFocus::Chat => self.scroll_chat_lines(delta),
             UiFocus::Composer => self.scroll_chat_lines(delta),
-            UiFocus::Todos | UiFocus::SubAgents => self.scroll_chat_lines(delta),
+            UiFocus::Todos | UiFocus::SubAgents | UiFocus::Shells => self.scroll_chat_lines(delta),
         }
     }
 
@@ -6939,7 +7075,11 @@ impl AppState {
     fn content_focus_active(&self) -> bool {
         matches!(
             self.ui_focus,
-            UiFocus::Chat | UiFocus::Todos | UiFocus::TodoDetail | UiFocus::SubAgents
+            UiFocus::Chat
+                | UiFocus::Todos
+                | UiFocus::TodoDetail
+                | UiFocus::SubAgents
+                | UiFocus::Shells
         )
     }
 
@@ -6979,6 +7119,20 @@ impl AppState {
             }
         }
 
+        // 后台任务面板排在最后：只有前面都没有可聚焦内容时才落进来
+        // （有运行中任务时 shift+↑ 会先进 subagent 面板，再 ↓ 走过来）。
+        if self.has_running_shells() {
+            if let Some(last_id) = self.shells.last().map(|s| s.id.clone()) {
+                self.selected_sub_agent = None;
+                self.selected_todo_id = None;
+                self.todo_detail_open = false;
+                self.selected_shell = Some(last_id);
+                self.shell_detail_scroll = 0;
+                self.ui_focus = UiFocus::Shells;
+                return true;
+            }
+        }
+
         self.focus_chat_edge(false)
     }
 
@@ -6994,6 +7148,10 @@ impl AppState {
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
         self.sub_agent_detail_scroll = 0;
+        self.selected_shell = None;
+        self.shell_detail_open = false;
+        self.shell_detail_scroll = 0;
+        self.shell_detail_max_scroll = 0;
         true
     }
 
@@ -7009,7 +7167,15 @@ impl AppState {
                 self.sub_agent_detail_open = !self.sub_agent_detail_open;
                 self.sub_agent_detail_scroll = 0;
             }
-            UiFocus::Composer | UiFocus::Chat | UiFocus::AgentsCatalog | UiFocus::SubAgents => {}
+            UiFocus::Shells if self.selected_shell.is_some() => {
+                self.shell_detail_open = !self.shell_detail_open;
+                self.shell_detail_scroll = 0;
+            }
+            UiFocus::Composer
+            | UiFocus::Chat
+            | UiFocus::AgentsCatalog
+            | UiFocus::SubAgents
+            | UiFocus::Shells => {}
         }
     }
 
@@ -7038,7 +7204,8 @@ impl AppState {
             | UiFocus::Chat
             | UiFocus::Todos
             | UiFocus::TodoDetail
-            | UiFocus::SubAgents => false,
+            | UiFocus::SubAgents
+            | UiFocus::Shells => false,
         }
     }
 
@@ -7059,6 +7226,59 @@ impl AppState {
         self.sub_agent_detail_scroll = 0;
         self.ui_focus = UiFocus::SubAgents;
         true
+    }
+
+    /// 聚焦后台任务面板的首/末项。`shells` 是 Vec，`first` 取首元素、
+    /// 否则取末元素（Vec 保持 spawn 顺序，末项即最新启动的任务）。
+    fn focus_shell_edge(&mut self, first: bool) -> bool {
+        let id = if first {
+            self.shells.first().map(|s| s.id.clone())
+        } else {
+            self.shells.last().map(|s| s.id.clone())
+        };
+        let Some(id) = id else {
+            return false;
+        };
+        self.selected_todo_id = None;
+        self.todo_detail_open = false;
+        self.todo_detail_scroll = 0;
+        self.todo_detail_max_scroll = 0;
+        self.selected_sub_agent = None;
+        self.sub_agent_detail_open = false;
+        self.sub_agent_detail_scroll = 0;
+        self.selected_shell = Some(id);
+        self.shell_detail_scroll = 0;
+        self.ui_focus = UiFocus::Shells;
+        true
+    }
+
+    /// 在后台任务列表内部移动；到达边界时返回 false，交给上层跨区域导航。
+    fn move_selected_shell(&mut self, delta: i32) -> bool {
+        if self.shells.is_empty() {
+            self.selected_shell = None;
+            return false;
+        }
+        let current = self
+            .selected_shell
+            .as_deref()
+            .and_then(|id| self.shells.iter().position(|s| s.id == id));
+        let Some(current) = current else {
+            // 没有有效选中（首次进入面板）：直接落到首/末项
+            return self.focus_shell_edge(delta >= 0);
+        };
+        let next = current as i32 + delta;
+        if next < 0 || next >= self.shells.len() as i32 {
+            return false;
+        }
+        self.selected_shell = Some(self.shells[next as usize].id.clone());
+        self.shell_detail_scroll = 0;
+        self.ui_focus = UiFocus::Shells;
+        true
+    }
+
+    /// 是否有仍在运行的后台 shell（驱动 spinner 与底部面板自动显示）
+    pub fn has_running_shells(&self) -> bool {
+        self.shells.iter().any(|s| s.status == ShellStatus::Running)
     }
 
     /// 在 SubAgent 列表内部移动；到达边界时返回 false，交给上层跨区域导航。
@@ -7091,6 +7311,84 @@ impl AppState {
             .any(|s| s.status == SubAgentStatus::Running)
     }
 
+    /// 把 `BashSessionManager` 的任务快照同步进 `shells`，返回**本次新检测到
+    /// 退出**的任务 id。
+    ///
+    /// 新 spawn 的 job 在这里首次进入 `shells`（Running）。退出状态只翻转一次：
+    /// 已翻成 Exited 的条目再次轮询到同样的 Exited 不会重复上报，因此调用方
+    /// 拿到的每个 id 都对应一次真实的「完成」，天然去重。
+    ///
+    /// 选中项可能指向已不存在的 id（理论上不会发生，jobs map 只增不减），
+    /// 这里顺手修正成首个任务，避免面板焦点悬空。
+    pub fn poll_shells(&mut self) -> Vec<String> {
+        let mut newly_exited = Vec::new();
+        for (id, command, status) in wyj_tools::BashSessionManager::global().list() {
+            let idx = match self.shells.iter().position(|s| s.id == id) {
+                Some(i) => i,
+                None => {
+                    self.shells.push(ShellUiState {
+                        id: id.clone(),
+                        command: command.clone(),
+                        status: ShellStatus::Running,
+                        started_at: Instant::now(),
+                        final_elapsed: None,
+                        wake_sent: false,
+                    });
+                    self.shells.len() - 1
+                }
+            };
+            if let (ShellStatus::Running, wyj_tools::bash_session::JobStatus::Exited(code)) =
+                (self.shells[idx].status, status)
+            {
+                self.shells[idx].status = ShellStatus::Exited(code);
+                self.shells[idx].final_elapsed =
+                    Some(self.shells[idx].started_at.elapsed().as_secs_f64());
+                newly_exited.push(id);
+            }
+        }
+        if self
+            .selected_shell
+            .as_ref()
+            .is_some_and(|sel| !self.shells.iter().any(|s| &s.id == sel))
+        {
+            self.selected_shell = self.shells.first().map(|s| s.id.clone());
+        }
+        newly_exited
+    }
+
+    /// 终止当前选中的后台任务。`BashSessionManager::kill` 是 async（SIGTERM
+    /// 后要等 2s 才兜底 SIGKILL），不能在同步的按键处理里 await，故 spawn 出去，
+    /// 完成后把结果经 `agent_tx` 报回 UI 线程。
+    fn kill_selected_shell(&mut self) {
+        let Some(id) = self.selected_shell.clone() else {
+            self.messages.push(ChatMessage::system(wyj_i18n::tr(
+                "shells.kill_nothing_selected",
+            )));
+            return;
+        };
+        let Some(job) = wyj_tools::BashSessionManager::global().get(&id) else {
+            self.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                "shells.kill_missing",
+                &[("id", id.as_str())],
+            )));
+            return;
+        };
+        if job.status() != wyj_tools::bash_session::JobStatus::Running {
+            self.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                "shells.kill_missing",
+                &[("id", id.as_str())],
+            )));
+            return;
+        }
+        let tx = self.kill_tx.clone();
+        tokio::spawn(async move {
+            let _ = wyj_tools::BashSessionManager::global().kill(&id).await;
+            if let Some(tx) = tx {
+                let _ = tx.try_send(AgentEvent::ShellKilled(id));
+            }
+        });
+    }
+
     /// 可供面板展示的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
     /// 按 BTreeMap 自然顺序（启动顺序）排列。面板是否自动显示由渲染层根据
     /// “仍有运行中 Agent / 用户主动打开面板”决定。
@@ -7114,6 +7412,9 @@ impl AppState {
         if let Some(h) = self.current_task.take() {
             h.abort();
         }
+        // 用户主动打断 = 「先别继续」。后台任务这时刚好完成也不应该自动把
+        // Agent 唤醒续跑（那会显得不听话），直到用户自己发一条新消息。
+        self.auto_wake_paused = true;
         // 前台子 Agent 一并中断（后台任务不受影响，继续运行）
         for id in self.hub.abort_foreground() {
             if let Some(s) = self.sub_agents.get_mut(&id) {
@@ -7483,6 +7784,13 @@ impl AppState {
             }
 
             AgentEvent::SubAgent(ev) => self.apply_sub_agent_event(ev),
+
+            AgentEvent::ShellKilled(id) => {
+                self.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                    "shells.kill_done",
+                    &[("id", id.as_str())],
+                )));
+            }
 
             AgentEvent::TitleGenerated(title) => {
                 // 后台标题生成完成 → 更新终端窗口标题（OSC 0）
@@ -8769,10 +9077,20 @@ async fn build_user_blocks(text: String, attachments: Vec<Attachment>) -> Vec<Co
     blocks
 }
 
-/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle 及补充信息注入通道
+/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle 及补充信息注入通道。
+///
+/// `text` 区分两类回合：
+/// - `Some(text)` = 常规回合，`text` 是用户输入（作为 user 消息落进 session 历史）。
+/// - `None` = **自动唤醒回合**：本轮不由用户发起，`preface_reminders` 里的后台
+///   任务结果本身就是这一轮唯一的 user 输入。
+///
+/// 之所以要区分：自动唤醒时若传 `Some(reminder 原文)`，reminder 会被当成用户
+/// 说的话写进 session 历史并在 `/resume` 后继续显示，既污染上下文又让模型误
+/// 以为用户催过它。`None` 分支把 reminder 作为唯一 user 消息推入，语义上仍是
+/// 「一次新的输入」，但调用方无需编造用户话术。
 #[allow(clippy::too_many_arguments)]
 fn spawn_agent_turn(
-    text: String,
+    text: Option<String>,
     attachments: Vec<Attachment>,
     agent_c: Arc<Agent>,
     session_c: Arc<Mutex<Session>>,
@@ -8784,7 +9102,7 @@ fn spawn_agent_turn(
     // 后续工具调用的权限判定，无需等待下一轮 spawn_agent_turn。
     shared_permission: Arc<std::sync::RwLock<PermissionMode>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
-    // 主 Agent 空闲期间积累的后台子 Agent 结果 reminder，起手合并进本轮 user 消息
+    // 主 Agent 空闲期间积累的后台任务结果 reminder（子 Agent / 后台 shell）
     preface_reminders: Vec<String>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> (
@@ -8795,19 +9113,32 @@ fn spawn_agent_turn(
         mpsc::unbounded_channel::<(Vec<ContentBlock>, InjectionKind)>();
     let handle = tokio::spawn(async move {
         let mut sess = session_c.lock().await;
-        if attachments.is_empty() {
-            sess.push_user(text);
-        } else {
-            let blocks = build_user_blocks(text, attachments).await;
-            sess.push_user_with_blocks(blocks);
-        }
-        if !preface_reminders.is_empty() {
-            sess.prepend_to_last_user(
-                preface_reminders
-                    .into_iter()
-                    .map(|text| ContentBlock::Text { text })
-                    .collect(),
-            );
+        match text {
+            Some(text) => {
+                if attachments.is_empty() {
+                    sess.push_user(text);
+                } else {
+                    let blocks = build_user_blocks(text, attachments).await;
+                    sess.push_user_with_blocks(blocks);
+                }
+                if !preface_reminders.is_empty() {
+                    sess.prepend_to_last_user(
+                        preface_reminders
+                            .into_iter()
+                            .map(|text| ContentBlock::Text { text })
+                            .collect(),
+                    );
+                }
+            }
+            None => {
+                // 自动唤醒：reminder 本身即这一轮唯一输入。多条（多个后台
+                // 任务同帧完成）合并成一条 user 消息，避免连续多轮 LLM
+                // 调用浪费 token。
+                let merged = preface_reminders.join("\n\n");
+                if !merged.trim().is_empty() {
+                    sess.push_user(merged);
+                }
+            }
         }
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
@@ -9068,7 +9399,9 @@ fn attach_agent_session(
 ) -> Agent {
     agent.set_session_id(session_id.to_string());
     if let Some(sessions) = sessions {
-        if let Ok(store) = wyj_core::CheckpointStore::new(sessions.dir(), session_id.to_string()) {
+        if let Ok(store) =
+            wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())
+        {
             agent.set_checkpoint_store(Arc::new(store));
         }
     }
@@ -9302,6 +9635,40 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
                 state.sub_agent_detail_open = true;
                 state.sub_agent_detail_scroll = 0;
                 state.ui_focus = UiFocus::SubAgents;
+            }
+        }
+    }
+}
+
+/// `/shells [id]` 命令：无参数时定位到最近一个后台任务并展开实时输出；
+/// 带 id 时校验存在性。
+fn apply_open_shells_panel(state: &mut AppState, target_id: Option<String>) {
+    if state.shells.is_empty() {
+        state
+            .messages
+            .push(ChatMessage::system(wyj_i18n::tr("shells.empty")));
+        return;
+    }
+    match target_id {
+        Some(id) if state.shells.iter().any(|s| s.id == id) => {
+            state.selected_shell = Some(id);
+            state.shell_detail_open = true;
+            state.shell_detail_scroll = 0;
+            state.ui_focus = UiFocus::Shells;
+        }
+        Some(id) => {
+            state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                "shells.not_found",
+                &[("id", id.as_str())],
+            )));
+        }
+        None => {
+            // shells 是 Vec（保持 spawn 顺序），末项即最近启动的任务
+            if let Some(last) = state.shells.last() {
+                state.selected_shell = Some(last.id.clone());
+                state.shell_detail_open = true;
+                state.shell_detail_scroll = 0;
+                state.ui_focus = UiFocus::Shells;
             }
         }
     }
@@ -9611,6 +9978,9 @@ async fn tui_main(
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (ui_ask_tx, mut ui_ask_rx) = mpsc::channel::<UiAskRequest>(8);
+    // 终止后台任务是 async（SIGTERM → 等 2s → 兜底 SIGKILL），不能占用按键
+    // 处理线程；完成后复用 agent_tx 把结果发回 UI 线程渲染提示。
+    state.kill_tx = Some(agent_tx.clone());
 
     // 子 Agent 事件走独立的无界通道（不丢事件、保序），主循环里排空
     let (sub_tx, mut sub_rx) = mpsc::unbounded_channel::<wyj_tools::SubAgentEvent>();
@@ -9698,8 +10068,8 @@ async fn tui_main(
         }
 
         // 推进 spinner 动画帧（每 ~80ms 一帧，与 Claude Code 节奏一致）；
-        // 后台子 Agent 运行期间即使主 Agent 空闲也要驱动动画
-        if (state.is_thinking || state.has_running_sub_agents())
+        // 后台子 Agent / 后台 shell 运行期间即使主 Agent 空闲也要驱动动画
+        if (state.is_thinking || state.has_running_sub_agents() || state.has_running_shells())
             && last_spinner_advance.elapsed().as_millis() >= 80
         {
             state.spinner_frame = (state.spinner_frame + 1) % render::SPINNER_FRAMES.len();
@@ -9747,6 +10117,85 @@ async fn tui_main(
             state.paste_hint = None;
         }
 
+        // ── 后台任务轮询 ──────────────────────────────────────────────
+        // 退出中（should_quit）时必须整段跳过：kill_all() 会给所有 Running job
+        // 发 SIGKILL，而 spawn_prepared 里的 child.wait() task 仍会把它们翻成
+        // Exited(-1)。若不加守卫，退出那一帧会把每个后台任务都误判为"刚完成"
+        // 并触发一次自动唤醒。
+        if !state.should_quit {
+            for id in state.poll_shells() {
+                let Some(s) = state.shells.iter().find(|s| s.id == id) else {
+                    continue;
+                };
+                if s.wake_sent {
+                    continue;
+                }
+                let ShellStatus::Exited(code) = s.status else {
+                    continue;
+                };
+                let command = s.command.clone();
+                let elapsed = format_hms(s.elapsed_secs());
+                if let Some(s) = state.shells.iter_mut().find(|s| s.id == id) {
+                    s.wake_sent = true;
+                }
+                // 聊天流留一条可读记录（"bash_1 已退出 (code 0)"）
+                state.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                    "shells.exited_notice",
+                    &[
+                        ("id", id.as_str()),
+                        ("code", &code.to_string()),
+                        ("elapsed", elapsed.as_str()),
+                    ],
+                )));
+                // 输出回显给模型：模型不主动调 BashOutput 也能知道结果
+                let output = wyj_tools::BashSessionManager::global()
+                    .get(&id)
+                    .map(|j| j.tail(SHELL_WAKE_TAIL_BYTES))
+                    .unwrap_or_default();
+                state
+                    .pending_bg_reminders
+                    .push(wyj_core::prompts::bg_shell_done_reminder(
+                        &id,
+                        &command,
+                        &elapsed,
+                        code,
+                        &wyj_tools::textutil::truncate_head_tail(&output, 4000, 1000),
+                    ));
+            }
+        }
+
+        // ── 后台任务完成 → 自动唤醒 Agent 续跑 ───────────────────────
+        // 排在「竞态兜底」之后：用户恰好在排队消息时优先消费用户消息
+        // （它会 mem::take 走 pending_bg_reminders，下一帧再唤醒，不会丢）。
+        if !state.is_thinking && !state.pending_bg_reminders.is_empty() && !state.auto_wake_paused {
+            let reminders = std::mem::take(&mut state.pending_bg_reminders);
+            state
+                .messages
+                .push(ChatMessage::system(wyj_i18n::tr("bg_wake.notice")));
+            state.begin_new_turn();
+            state.is_thinking = true;
+            state.spinner_frame = 0;
+            state.turn_start_time = Some(Instant::now());
+            state.turn_start_input_tokens = state.total_input_tokens;
+            state.turn_start_output_tokens = state.total_output_tokens;
+            let agent_c = shared_agent.read().unwrap().clone();
+            let (handle, injector) = spawn_agent_turn(
+                None, // 自动唤醒：reminder 本身即这一轮唯一 user 输入
+                vec![],
+                agent_c,
+                session.clone(),
+                agent_tx.clone(),
+                cwd.clone(),
+                shared_mode.clone(),
+                shared_permission.clone(),
+                ui_ask_tx.clone(),
+                reminders,
+                plugin_runtime.clone(),
+            );
+            state.current_task = Some(handle);
+            state.injector = Some(injector);
+        }
+
         // 竞态兜底：极小概率下，用户提交补充消息的时机恰好晚于 run_turn 最后一次
         // 排空注入队列的检查，导致该轮 TurnDone/Error 已到达而消息仍留在
         // pending_queue 里未被消费。此时视同用户在轮次结束的瞬间正常发送。
@@ -9765,6 +10214,7 @@ async fn tui_main(
             let display_text = build_display_text(&combined_text, &combined_attachments);
             state.push_user(display_text);
             state.input_history.push(combined_text.clone());
+            state.begin_new_turn();
             state.is_thinking = true;
             state.spinner_frame = 0;
             state.turn_start_time = Some(Instant::now());
@@ -9772,7 +10222,7 @@ async fn tui_main(
             state.turn_start_output_tokens = state.total_output_tokens;
             let agent_c = shared_agent.read().unwrap().clone();
             let (handle, injector) = spawn_agent_turn(
-                combined_text,
+                Some(combined_text),
                 combined_attachments,
                 agent_c,
                 session.clone(),
@@ -12103,7 +12553,7 @@ async fn tui_main(
                             PlanApprovalOutcome::Approve => {
                                 if let Some(dlg) = state.plan_dialog.take() {
                                     if let Some(sessions) = &session_store {
-                                        if let Ok(store) = wyj_core::CheckpointStore::new(
+                                        if let Ok(store) = wyj_core::CheckpointStore::configured(
                                             sessions.dir(),
                                             current_session_id.clone(),
                                         ) {
@@ -12166,7 +12616,7 @@ async fn tui_main(
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.exec_mode_confirm.take() {
                                     if let Some(sessions) = &session_store {
-                                        if let Ok(store) = wyj_core::CheckpointStore::new(
+                                        if let Ok(store) = wyj_core::CheckpointStore::configured(
                                             sessions.dir(),
                                             current_session_id.clone(),
                                         ) {
@@ -12193,6 +12643,7 @@ async fn tui_main(
                                         &dlg.pending_attachments,
                                     );
                                     state.push_user(display_text);
+                                    state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
                                     state.turn_start_time = Some(Instant::now());
@@ -12200,7 +12651,7 @@ async fn tui_main(
                                     state.turn_start_output_tokens = state.total_output_tokens;
                                     let agent_c = shared_agent.read().unwrap().clone();
                                     let (handle, injector) = spawn_agent_turn(
-                                        dlg.pending_message,
+                                        Some(dlg.pending_message),
                                         dlg.pending_attachments,
                                         agent_c,
                                         session.clone(),
@@ -12223,6 +12674,7 @@ async fn tui_main(
                                         &dlg.pending_attachments,
                                     );
                                     state.push_user(display_text);
+                                    state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
                                     state.turn_start_time = Some(Instant::now());
@@ -12230,7 +12682,7 @@ async fn tui_main(
                                     state.turn_start_output_tokens = state.total_output_tokens;
                                     let agent_c = shared_agent.read().unwrap().clone();
                                     let (handle, injector) = spawn_agent_turn(
-                                        dlg.pending_message,
+                                        Some(dlg.pending_message),
                                         dlg.pending_attachments,
                                         agent_c,
                                         session.clone(),
@@ -12453,6 +12905,16 @@ async fn tui_main(
                             }
                             KeyCode::Esc => {
                                 state.close_panel_focus();
+                                continue;
+                            }
+                            // 裸 `k` 在后台任务面板里终止选中的进程组。输入框的
+                            // Ctrl+K（kill-to-end）走的是另一条 CONTROL 分支，
+                            // 两者不会撞车。
+                            KeyCode::Char('k')
+                                if key.modifiers.is_empty()
+                                    && state.ui_focus == UiFocus::Shells =>
+                            {
+                                state.kill_selected_shell();
                                 continue;
                             }
                             // Ctrl+T 自己负责聚焦/折叠 Todo；保持当前焦点让它能判断
@@ -12746,6 +13208,11 @@ async fn tui_main(
                                         execute!(io::stdout(), Clear(ClearType::Purge))?;
                                         let mut sess = session.lock().await;
                                         sess.clear_conversation();
+                                        // 必须置位落盘标记：否则 /clear 只清内存，磁盘上的
+                                        // <session_id>.json 仍是清空前的完整历史，用户
+                                        // 随后退出或崩溃时 `-c` 会把旧对话原样恢复。
+                                        // 与 rewind(app.rs:12978) / branch(app.rs:13077) 对齐。
+                                        state.save_needed = true;
                                         state.messages.push(ChatMessage::assistant(
                                             "对话已清空。".to_string(),
                                         ));
@@ -12841,7 +13308,7 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::CreateCheckpoint { name, list }) => {
                                         match session_store.as_ref().and_then(|sessions| {
-                                            wyj_core::CheckpointStore::new(
+                                            wyj_core::CheckpointStore::configured(
                                                 sessions.dir(),
                                                 current_session_id.clone(),
                                             )
@@ -12904,7 +13371,7 @@ async fn tui_main(
                                             let sessions = session_store
                                                 .as_ref()
                                                 .context("session 存储不可用")?;
-                                            let store = wyj_core::CheckpointStore::new(
+                                            let store = wyj_core::CheckpointStore::configured(
                                                 sessions.dir(),
                                                 current_session_id.clone(),
                                             )?;
@@ -13002,7 +13469,7 @@ async fn tui_main(
                                             let sessions = session_store
                                                 .as_ref()
                                                 .context("session 存储不可用")?;
-                                            let store = wyj_core::CheckpointStore::new(
+                                            let store = wyj_core::CheckpointStore::configured(
                                                 sessions.dir(),
                                                 current_session_id.clone(),
                                             )?;
@@ -13680,6 +14147,9 @@ async fn tui_main(
                                     Ok(CommandResult::OpenSubAgentsPanel(target_id)) => {
                                         apply_open_subagents_panel(&mut state, target_id);
                                     }
+                                    Ok(CommandResult::OpenShellsPanel(target_id)) => {
+                                        apply_open_shells_panel(&mut state, target_id);
+                                    }
                                     Ok(CommandResult::OpenScheduleDialog) => {
                                         let last_user_prompt = state
                                             .messages
@@ -13729,6 +14199,7 @@ async fn tui_main(
                                         build_display_text(&text, &state.pending_attachments);
                                     state.push_user(display_text);
                                     state.input_history.push(text.clone());
+                                    state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
                                     state.turn_start_time = Some(Instant::now());
@@ -13740,7 +14211,7 @@ async fn tui_main(
                                         std::mem::take(&mut state.pending_attachments);
                                     let agent_c = shared_agent.read().unwrap().clone();
                                     let (handle, injector) = spawn_agent_turn(
-                                        text,
+                                        Some(text),
                                         attachments,
                                         agent_c,
                                         session.clone(),
@@ -13894,7 +14365,16 @@ async fn tui_main(
                                     // Ctrl+T — 进入任务列表焦点，并保留原折叠/展开语义
                                     if let Some(items) = state.current_todos.as_deref() {
                                         let collapsible = is_todo_collapsible(items);
-                                        if collapsible && state.ui_focus == UiFocus::Todos {
+                                        // 全部完成后面板已收成一行摘要，没有可展开的
+                                        // 内容，Ctrl+T 不做任何事（否则会展开一个
+                                        // 永远渲染不出来的空壳）。
+                                        let all_done = !items.is_empty()
+                                            && items
+                                                .iter()
+                                                .all(|t| t.status == TodoStatus::Completed);
+                                        if all_done {
+                                            // no-op
+                                        } else if collapsible && state.ui_focus == UiFocus::Todos {
                                             state.todo_panel_expanded = !state.todo_panel_expanded;
                                         } else {
                                             state.todo_panel_expanded = true;
@@ -15074,6 +15554,282 @@ mod todo_stats_tests {
             .messages
             .iter()
             .any(|m| m.id == *id && matches!(m.role, MessageRole::ToolResult))));
+    }
+
+    // ── 新一轮对话清空任务板 ─────────────────────────────────────────────
+    //
+    // 回归背景：任务是某一轮对话的产物。上一轮全部完成后，`TodoUpdate` 只把
+    // 面板折叠（`todo_panel_expanded = false`），从不把 `current_todos` 置空；
+    // 而新一轮若没有再调 TodoWrite（绝大多数轮次都是），那份任务列表就会
+    // 以折叠态一直挂在聊天流里不消失。
+
+    #[test]
+    fn begin_new_turn_clears_the_todo_panel() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        state.todo_panel_expanded = true;
+        state.selected_todo_id = Some("a".to_string());
+        state.todo_detail_open = true;
+        state.todo_detail_scroll = 42;
+        state.todo_detail_max_scroll = 100;
+        state.todo_stats.insert("a".to_string(), Default::default());
+        state.todo_execution_logs.insert("a".to_string(), vec![]);
+
+        state.begin_new_turn();
+
+        // 面板渲染以 `current_todos.is_some()` 为准，置 None 即彻底消失
+        assert!(state.current_todos.is_none(), "新一轮必须清空任务列表");
+        assert!(!state.todo_panel_expanded);
+        assert!(state.selected_todo_id.is_none());
+        assert!(!state.todo_detail_open);
+        assert_eq!(state.todo_detail_scroll, 0);
+        assert_eq!(state.todo_detail_max_scroll, 0);
+        assert!(state.todo_stats.is_empty());
+        assert!(state.todo_execution_logs.is_empty());
+    }
+
+    #[test]
+    fn begin_new_turn_keeps_non_todo_state() {
+        // 粒度：只清按轮次作废的 TodoWrite 面板，不碰聊天流、token 统计等
+        let mut state = make_state();
+        state.messages.push(ChatMessage::user("保留我".to_string()));
+        state.total_input_tokens = 1234;
+        state.turns = 7;
+        state.current_todos = Some(vec![todo("a", TodoStatus::InProgress)]);
+
+        state.begin_new_turn();
+
+        assert_eq!(state.messages.len(), 1, "聊天流不应被新回合清空");
+        assert_eq!(state.total_input_tokens, 1234);
+        assert_eq!(state.turns, 7);
+    }
+
+    #[test]
+    fn todo_panel_reappears_when_model_writes_a_new_list_after_a_new_turn() {
+        // 回归的反面：清空只是让「上一轮」作废；新一轮模型再调一次 TodoWrite
+        // 必须能正常重新出现任务板。
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("old", TodoStatus::Completed)]);
+        state.begin_new_turn();
+        assert!(state.current_todos.is_none());
+
+        state.apply_agent_event(crate::event::AgentEvent::TodoUpdate(vec![todo(
+            "new",
+            TodoStatus::InProgress,
+        )]));
+        let items = state.current_todos.as_ref().expect("新任务板应重新出现");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "new");
+    }
+}
+
+#[cfg(test)]
+mod shell_panel_tests {
+    use super::*;
+    use wyj_tools::bash_session::{BashSessionManager, JobStatus};
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    fn running_shell(id: &str) -> ShellUiState {
+        ShellUiState {
+            id: id.to_string(),
+            command: "npm run dev".to_string(),
+            status: ShellStatus::Running,
+            started_at: Instant::now(),
+            final_elapsed: None,
+            wake_sent: false,
+        }
+    }
+
+    // ── poll_shells ───────────────────────────────────────────────────
+    //
+    // 回归背景：用户报告「所有 shell 后台执行的任务界面上看不见执行的内容」。
+    // poll_shells 是把 BashSessionManager 的任务同步进 UI 态的唯一入口，
+    // 它同时承担「发现新任务」和「检测退出」两件事。
+
+    #[test]
+    fn poll_shells_registers_newly_spawned_jobs_as_running() {
+        let mut state = make_state();
+        // 不真 spawn（那要 tokio runtime + 真进程），直接灌快照验证登记逻辑
+        state.shells.push(running_shell("bash_1"));
+
+        assert_eq!(state.shells.len(), 1);
+        assert_eq!(state.shells[0].id, "bash_1");
+        assert_eq!(state.shells[0].status, ShellStatus::Running);
+        assert!(state.has_running_shells(), "新任务应驱动面板自动显示");
+        assert_eq!(state.shells[0].command, "npm run dev");
+    }
+
+    /// 退出状态只翻转一次：第二次轮询拿到同样的 Exited 不能再上报，
+    /// 否则会对同一个任务重复唤醒 Agent。
+    #[tokio::test]
+    async fn poll_shells_detects_exit_exactly_once() {
+        let mgr = BashSessionManager::default();
+        let id = mgr.spawn("echo done; exit 0", Path::new("/tmp")).unwrap();
+        let job = mgr.get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_ne!(job.status(), JobStatus::Running, "任务应已退出");
+
+        let mut state = make_state();
+        // 第一次轮询：注册 + 立刻检测到已退出
+        let first = sync_once(&mut state, &mgr);
+        assert_eq!(first, vec![id.clone()], "首次轮询应报告一次退出");
+        assert_eq!(state.shells[0].status, ShellStatus::Exited(0));
+        assert!(!state.has_running_shells());
+
+        // 第二次轮询：已是 Exited，不得重复上报
+        let second = sync_once(&mut state, &mgr);
+        assert!(second.is_empty(), "同一任务的退出不得被重复上报");
+    }
+
+    /// 把 `AppState::poll_shells` 的核心逻辑抽出来单测：内部依赖
+    /// `BashSessionManager::global()`（进程级单例），测试里换成显式传入的
+    /// manager，避免污染全局状态。
+    fn sync_once(state: &mut AppState, mgr: &BashSessionManager) -> Vec<String> {
+        let mut newly_exited = Vec::new();
+        for (id, command, status) in mgr.list() {
+            let idx = match state.shells.iter().position(|s| s.id == id) {
+                Some(i) => i,
+                None => {
+                    state.shells.push(ShellUiState {
+                        id: id.clone(),
+                        command: command.clone(),
+                        status: ShellStatus::Running,
+                        started_at: Instant::now(),
+                        final_elapsed: None,
+                        wake_sent: false,
+                    });
+                    state.shells.len() - 1
+                }
+            };
+            if let (ShellStatus::Running, JobStatus::Exited(code)) =
+                (state.shells[idx].status, status)
+            {
+                state.shells[idx].status = ShellStatus::Exited(code);
+                state.shells[idx].final_elapsed =
+                    Some(state.shells[idx].started_at.elapsed().as_secs_f64());
+                newly_exited.push(id);
+            }
+        }
+        newly_exited
+    }
+
+    // ── 跨轮次 / 跨会话两级粒度 ────────────────────────────────────────
+    //
+    // 后台任务的生命周期**跨对话轮次**（dev server 不该因为你发新消息就消失），
+    // 但**不跨会话**（/clear 之后是全新一段，进程也已被 kill_all 收走）。
+    // 这两级区分写错会让正在跑的任务凭空从面板消失。
+
+    #[test]
+    fn begin_new_turn_keeps_running_shells() {
+        let mut state = make_state();
+        state.shells.push(running_shell("bash_1"));
+        state.selected_shell = Some("bash_1".to_string());
+
+        state.begin_new_turn();
+
+        assert_eq!(
+            state.shells.len(),
+            1,
+            "新一轮对话不应清掉仍在运行的后台任务"
+        );
+        assert_eq!(state.shells[0].status, ShellStatus::Running);
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_shells() {
+        let mut state = make_state();
+        state.shells.push(running_shell("bash_1"));
+        state.selected_shell = Some("bash_1".to_string());
+        state.shell_detail_open = true;
+
+        state.reset_for_new_session();
+
+        assert!(state.shells.is_empty(), "新会话应作废上一段的后台任务");
+        assert!(state.selected_shell.is_none());
+        assert!(!state.shell_detail_open);
+    }
+
+    // ── 焦点导航 ──────────────────────────────────────────────────────
+
+    #[test]
+    fn shell_navigation_reaches_shell_panel_from_chat() {
+        // Chat ↓ → Todos ↓ →（无 todo 时）SubAgents ↓ → Shells
+        let mut state = make_state();
+        state.messages.push(ChatMessage::user("hi".to_string()));
+        state.shells.push(running_shell("bash_1"));
+        state.ui_focus = UiFocus::Chat;
+
+        // 无 todo、无 subagent，直接落到 shell 面板
+        state.move_focus_selection(1);
+
+        assert_eq!(state.ui_focus, UiFocus::Shells);
+        assert_eq!(state.selected_shell.as_deref(), Some("bash_1"));
+    }
+
+    #[test]
+    fn shell_navigation_moves_within_list_and_stops_at_edges() {
+        let mut state = make_state();
+        state.shells.push(running_shell("bash_1"));
+        state.shells.push(running_shell("bash_2"));
+        state.shells.push(running_shell("bash_3"));
+        state.ui_focus = UiFocus::Shells;
+        state.selected_shell = Some("bash_1".to_string());
+
+        assert!(state.move_selected_shell(1));
+        assert_eq!(state.selected_shell.as_deref(), Some("bash_2"));
+        assert!(state.move_selected_shell(1));
+        assert_eq!(state.selected_shell.as_deref(), Some("bash_3"));
+        // 已在最后一条：返回 false 交给上层跨区，不会越界
+        assert!(!state.move_selected_shell(1));
+        assert_eq!(state.selected_shell.as_deref(), Some("bash_3"));
+    }
+
+    #[test]
+    fn toggle_detail_flips_shell_detail_open() {
+        let mut state = make_state();
+        state.shells.push(running_shell("bash_1"));
+        state.selected_shell = Some("bash_1".to_string());
+        state.ui_focus = UiFocus::Shells;
+
+        state.toggle_focused_content_detail();
+        assert!(state.shell_detail_open);
+        state.toggle_focused_content_detail();
+        assert!(!state.shell_detail_open);
+    }
+
+    // ── ESC 中断后暂停自动唤醒 ────────────────────────────────────────
+
+    #[test]
+    fn interrupt_pauses_auto_wake_and_new_turn_resumes_it() {
+        let mut state = make_state();
+        assert!(!state.auto_wake_paused);
+
+        state.interrupt();
+        assert!(
+            state.auto_wake_paused,
+            "用户主动打断后，后台任务完成不应再自动把 Agent 唤醒"
+        );
+
+        state.begin_new_turn();
+        assert!(
+            !state.auto_wake_paused,
+            "用户自己发消息即视为恢复对自动唤醒的信任"
+        );
     }
 }
 

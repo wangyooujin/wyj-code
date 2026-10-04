@@ -24,7 +24,7 @@ pub use model_catalog::{CatalogResolution, ModelCatalog, VerificationStatus};
 pub use models::{fetch_model_ids, ProfileTemplate, PROFILE_TEMPLATES};
 pub use openai::OpenAIProvider;
 pub use prompt_policy::PromptPolicy;
-pub use provider::Provider;
+pub use provider::{Provider, SystemPrompt};
 pub use request_plan::*;
 pub use thinking::{
     adapter_for, apply_thinking_to_openai_body, should_emit_interleaved_beta, ReasoningEffort,
@@ -89,7 +89,7 @@ const MISSING_API_KEY_MESSAGE: &str =
 impl Provider for MissingKeyProvider {
     async fn stream(
         &self,
-        _system: &str,
+        _system: &SystemPrompt<'_>,
         _messages: &[crate::types::Message],
         _tools: &[crate::types::ToolDefinition],
         _opts: &crate::provider::RequestOptions,
@@ -112,7 +112,7 @@ mod tests {
         let provider = MissingKeyProvider;
         let opts = RequestOptions::text_only(32);
         let mut stream = provider
-            .stream("", &[], &[], &opts)
+            .stream(&SystemPrompt::default(), &[], &[], &opts)
             .await
             .expect("stream 自身应 Ok(stream of Err)");
         let first = stream.next().await.expect("占位流应恰好发出一个 Err 项");

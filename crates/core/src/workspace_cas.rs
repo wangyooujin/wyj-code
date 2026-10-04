@@ -275,9 +275,16 @@ impl WorkspaceCas {
     /// 阶段 2:若总字节 > `total_budget`,按 last_ref_at 升序淘汰最久未引用的 0-ref 实体,
     /// 直到 ≤ budget。
     ///
-    /// **首启保护**:Phase 4 默认 `force=false`,老 session 的 hash 全是 0-ref,
-    /// GC 会误删。所以 `StorageRetentionCfg.cas_gc_on_start` 在首启跳过。
-    /// 业务上以"调用方知道 ref_count 已重建"为前提才传 `force=true`。
+    /// **首启保护**:默认 `force=false`,老 session 的 hash 全是 0-ref,
+    /// 直接 GC 会误删。业务上以"调用方知道 ref_count 已重建"为前提才传
+    /// `force=true`。
+    ///
+    /// 注意:本方法当前**没有任何生产调用点**(仅单测使用),因此
+    /// `~/.wyj-code/cas` 目前是只增不减的。此前用
+    /// `StorageRetentionCfg.cas_total_bytes` / `cas_gc_on_start` 描述
+    /// "Phase 4 GC" 的文档与配置项已一并删除 —— 那些配置项从上线起就没有
+    /// 消费点,留着会让人误以为存在自动回收。接线时同步在
+    /// `StorageRetentionCfg` 里加回对应字段与实现。
     pub fn gc(&self, total_budget: u64) -> Result<GcStats> {
         let walker = self.root.join("sha256");
         if !walker.exists() {

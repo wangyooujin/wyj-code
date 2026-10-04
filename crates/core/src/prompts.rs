@@ -36,7 +36,7 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 - Batch independent tool calls into a single response so they run in parallel — e.g., reading three files, or a Read plus a Grep. Do this whenever calls do not depend on each other's results.
 - Determine tool availability only from the tool definitions attached to the current request. Never use project memory, prior conversations, CLAUDE.md, or mode labels such as default/bypass/plan to claim that an attached tool is unavailable. Permission modes govern approval and execution; they do not remove an attached tool schema.
 - Bash: use absolute paths and avoid `cd`. Quote paths containing spaces. Keep the command's side effects minimal and explain non-obvious commands briefly in the description field. For long-running processes (dev servers, watchers), pass run_in_background=true and poll with BashOutput instead of blocking. Bash inherits the host PATH/USER/SHELL environment.
-- Agent (sub-agent) calls start with only the supplied prompt, not this conversation. The runtime can append user-initiated follow-up or retry instructions only at complete model/tool boundaries, so the initial prompt must still be complete and self-contained. Use Explore for open-ended codebase questions where you only need conclusions; do NOT spawn an agent when you already know the two or three files to read.
+- Delegate to subagents proactively — it is the default, not a last resort. Use the Agent tool with `subagent_type='Explore'` for open-ended codebase research where you would otherwise need to read many files (it is read-only, fast, and keeps exploration output out of your main context); `general-purpose` for multi-step self-contained subtasks that may write or modify code; `Plan` when designing an implementation strategy and you want a separate context to think through it. A sub-agent call starts with only the supplied prompt, not this conversation, so write the initial prompt to be complete and self-contained; the runtime can append user-initiated follow-up or retry instructions only at complete model/tool boundaries. Only skip delegation when the change is trivial and you already know the exact files to touch.
 
 # Memory
 - Two scopes only: `global` (cross-project, requires user natural-language confirmation before activation) and `project` (auto-managed for the current working directory). There is no shared workspace scope.
@@ -222,10 +222,9 @@ pub const SUBAGENT_EXPLORE: &str = r#"You are a read-only exploration sub-agent.
 pub const SUBAGENT_PLAN: &str = r#"You are a software architect sub-agent. Design an implementation plan for the task in the prompt: investigate the relevant code read-only, then produce a step-by-step plan that names the critical files, reuses existing functions and utilities where possible, and calls out important trade-offs. Your final message is the only thing returned to the main agent — include the full plan in it."#;
 
 /// 内置子 Agent 类型的选型描述（进入 Agent 工具的 subagent_type 说明，模型侧）
-pub const SUBAGENT_GENERAL_DESC: &str = "General-purpose sub-agent with read/write/execute tools, for multi-step self-contained subtasks";
-pub const SUBAGENT_EXPLORE_DESC: &str = "Read-only exploration agent (Read/Glob/Grep/WebFetch), for broad codebase research where you only need conclusions";
-pub const SUBAGENT_PLAN_DESC: &str =
-    "Planning agent: analyzes code read-only and returns a step-by-step implementation plan";
+pub const SUBAGENT_GENERAL_DESC: &str = "A capable agent for complex, multi-step tasks that require both exploration and action. Tools: every tool available to subagents. Use when the task spans exploration and modification, needs reasoning to interpret intermediate results, or is composed of multiple dependent steps.";
+pub const SUBAGENT_EXPLORE_DESC: &str = "A fast, read-only agent optimized for searching and analyzing codebases. Tools: Read, Glob, Grep, WebFetch only — Write and Edit are denied. Use proactively for any exploration that requires reading more than a handful of files. Returns only the final conclusion, keeping raw exploration output out of the main conversation context.";
+pub const SUBAGENT_PLAN_DESC: &str = "A research agent used to gather context before presenting an implementation plan. Tools: read-only. Investigates the relevant code and returns a step-by-step plan naming critical files, reusing existing utilities and patterns where possible, and calling out important trade-offs.";
 
 // ── 上下文压缩 ────────────────────────────────────────────────────────────────
 
@@ -288,6 +287,23 @@ pub fn bg_agent_done_reminder(
 ) -> String {
     format!(
         "<system-reminder>\nBackground agent {id} ({agent_type} — {description}) finished after {elapsed}. Result:\n\n{result}\n</system-reminder>"
+    )
+}
+
+/// 后台 shell 退出结果的注入 reminder（模型侧）
+///
+/// 与 `bg_agent_done_reminder` 同构：TUI 检测到后台 shell 退出后把它包成
+/// reminder 自动唤醒主 Agent 续跑。`output` 由调用方截断（模型不需要完整
+/// 日志，需要的是「跑完了什么、退出码是多少」）。
+pub fn bg_shell_done_reminder(
+    id: &str,
+    command: &str,
+    elapsed: &str,
+    exit_code: i32,
+    output: &str,
+) -> String {
+    format!(
+        "<system-reminder>\nBackground shell {id} (`{command}`) exited after {elapsed} with code {exit_code}. Output:\n\n{output}\n</system-reminder>"
     )
 }
 

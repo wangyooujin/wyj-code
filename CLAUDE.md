@@ -161,8 +161,10 @@ args = ["--flag"]
 | 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
 | Sub-agent trace | 256 KiB / agent（已存在,不在本批改动） | `subagent.trace_max_bytes_per_agent` |
-| 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K head+tail,thinking 8K,tool_use.input 64K | `persist_cap.*` |
+| 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K、text 16K+8K、thinking 8K、reasoning_details 8K、tool_use.input 64K(均 head+tail,JSON 值按最长 string 叶子裁剪且保持合法 JSON) | `persist_cap.*` |
 | 顶层 `~/.wyj-code` warn | 5 GiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
+
+**已知缺口**:`sessions/*.json`、`<session_id>.checkpoints/`、`<session_id>.subagents/`、`cas/` 四者**没有任何自动或手动回收路径**(`storage prune` / `doctor` 仍是 TODO 桩);顶层 warn 超阈值时只会提示手动删目录。`WorkspaceCas::gc` 已实现但只被单测调用,对应配置项 `cas_total_bytes` / `cas_gc_on_start` / `checkpoint_bytes_per_session` / `checkpoint_ttl_days` 因从无消费点已删除。
 
 **实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
 
@@ -249,6 +251,20 @@ args = ["--flag"]
     - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done,schedule_failure}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::resolve_jev_api_key` 模式）。
     - **i18n**：title + body 模板统一走 `wyj_i18n::tr("notify.title.*")` / `tr_fmt("notify.body.*")`，模型/工具侧提示词仍为英文常量（CLAUDE.md 「模型侧提示词」节），通知 UI 文案与现有 i18n key 体系一致；`include_session_id=true` 时 body 末尾追加 `[session:<id>]`，总长被 200 字符上限收口（`append_session_id` 内部按 `chars().take(N)` 安全截断）。
     - **进程级初始化路径**：`cli::main()` 构造 `Config` 后立刻 `wyj_core::notify::init(&cfg.notify)`，TUI/CLI -p/REPL 共享这条；`wyj-code schedule run <id>` 子进程路径在 `schedule_cmd::notify_emit_init_default_if_needed()` 用 `NotifyCfg::default()` 兜底 init（cron 触发不在 `main()` 装配链路里，但因主开关 + desktop 默认开，行为对用户透明）。
+
+20. **后台任务可见性与自动续跑（v1.5.16+）**：解决"派完活就不动"和"后台输出看不见"两个问题。
+    - **自动唤醒**（`app.rs` 主循环 idle 钩子）：后台 subagent 结果此前只进 `pending_bg_reminders` 等用户下一条消息、后台 shell 更只返回 `bash_N` id 靠模型自己轮询 `BashOutput`，两条路都停在等用户输入。现在 idle 时 `AppState::poll_shells()` 同步 `BashSessionManager::global().list()` 到 `shells`，检测到退出就把 `prompts::bg_shell_done_reminder`（含输出尾部，经 `truncate_head_tail` 收口到 4KB）推进 `pending_bg_reminders`；**第二个独立 if 块**在 `!is_thinking && !pending_bg_reminders.is_empty() && !auto_wake_paused` 时起新 turn。多任务同帧完成**合并成一轮**（`reminders.join("\n\n")`），避免连续多次 LLM 往返。
+    - **两种回合必须区分**：`spawn_agent_turn` 的 `text: Option<String>`——`Some(用户输入)` 常规回合，`None` 自动唤醒回合（reminder 本身就是这一轮唯一 user 输入）。若自动唤醒时传 `Some(reminder 原文)`，reminder 会被当成"用户说的话"写进 session 历史并在 `/resume` 后继续显示。聊天流侧只 push `ChatMessage::system(tr("bg_wake.notice"))`，不暴露 reminder 原文。
+    - **ESC 保护**：`AppState.auto_wake_paused` 在 `interrupt()` 置 true、`begin_new_turn()` 清 false——用户主动打断意味着"先别继续"，此时后台任务完成也不该自动唤醒（会显得不听话）。
+    - **只读快照 API**（`bash_session.rs::BackgroundJob::tail(max_bytes)`）：面板每帧要读输出，但 `read_new()` 推进的是 `BashOutput` 工具的增量读游标，两者共用会互相抢内容（面板看到空白、工具看到"无新输出"）。`tail` 按 char boundary 收口（中文/emoji 安全）且**不推进游标**。**新写 UI 侧读输出时不要用 `read_new()`。**
+    - **退出误唤醒**：`kill_all()`（`app.rs` 退出路径 + `cli/main.rs` headless）给所有 Running job 发 SIGKILL，但 `spawn_prepared` 里的 `child.wait()` task 仍会把它们翻成 `Exited(-1)`。轮询检测**必须**用 `!state.should_quit` 守卫拦在前面，否则退出那一帧会把每个后台任务都误判为"刚完成"并触发唤醒。
+    - **两级生命周期粒度**：`begin_new_turn()`（每轮对话）**刻意不清** `shells`——dev server 等任务跨轮次持续存在，在这儿清会让它们从面板凭空消失；真正作废的是 `reset_for_new_session()`（`/clear`/新会话/resume），那里进程本身也已被 `kill_all` 收走。
+    - **面板优先级**（`render.rs::bottom_panel_size`）：`Shells` 与 `SubAgents` 互斥（底部只有一个位置），规则是**用户焦点优先，其次按"有运行中任务"**。两者常同时跑（派 agent 改代码 + 自己起 dev server），固定先后会让其中一方永远看不见也按不了 k。跨区链条 `Chat ↓ → Todos ↓ → SubAgents ↓ → Shells`，`UiFocus` 需在 6 处 match 里同步加分支（`move_focus_selection` / `scroll_focus_lines` / `content_focus_active` / `enter_content_focus` / `leave_content_focus` / `toggle_focused_content_detail` / `close_panel_focus`）。
+    - **详情区 scroll 语义**：`draw_shell_panel` 与 `draw_sub_agents_panel` 一致——`clamped` 是"从底部往上偏移的行数"，`clamped=0` 即贴底跟随新输出，用户 PageUp 后停在历史位置。渲染时用 `Paragraph::line_count` 重算并 clamp 写回 `shell_detail_max_scroll`（`draw()` 每帧先防御性清零）。
+    - **`k` 键无冲突**：裸 `k` 在内容区焦点态未占用；输入框的 `Ctrl+K`（kill-to-end）走 `key.modifiers.contains(CONTROL)` 另一条分支。`kill_selected_shell` 必须 `&mut self`（要 push 提示消息），且 `BashSessionManager::kill` 是 async（等 2s 兜底 SIGKILL），经 `state.kill_tx` 把 `AgentEvent::ShellKilled` 发回 UI 线程。
+    - **tasklist 摘要**：`push_inline_todo_lines` 在 `all_done` 时只画一行摘要（保留耗时/token 统计的可追溯信息），不画分隔线/条目/展开提示。`TurnDone` **刻意不清** `current_todos`（测试 `turn_done_auto_completes_remaining_in_progress_todos` 用 `expect` 锁死了该行为），所以"全部完成 → 下一条消息之间"面板会一直存在，收成一行是唯一能在不改该测试的前提下消掉干扰的办法。`Ctrl+T` 在 `all_done` 时 no-op（否则展开一个永远渲染不出来的空壳）。
+
+21. **System prompt 拆 stable / volatile 两段（v1.5.16+）**：修 Anthropic prompt cache 自我击穿。`Provider::stream/complete` 的 `system` 参数从 `&str` 改为 `&SystemPrompt<'_>`（`api/src/provider.rs`，含 `stable_only()` / `combined()` / `is_empty()`）。**背景**：旧签名迫使整个 system 压成一个字符串，Anthropic 侧只能发单个 text 块且断点打在块尾，而 system 里混了大量每轮会变的内容（工具可用性、模型兼容 suffix、子目录 CLAUDE.md reminder、Project Brief），任一变化都让整段 1.6k~5k token 全价重算。**注意**：旧注释"reminder 只增不减、前缀仍可缓存"是**错的**——追加在断点之后同样改写前缀哈希。`build_system_blocks()` 只在 stable 块末尾打 `cache_control: EPHEMERAL`；断点预算 system 1 + tools 1 + 历史 1 = 3（Anthropic 上限 4）。OpenAI 侧无 system 块概念，用 `combined()` 拼成单条 system 消息。辅助 LLM 调用（记忆提取 / 标题摘要 / Evolution 候选提取）一律 `SystemPrompt::stable_only(...)`。**记忆快照分桶**：`MEMORY_SNAPSHOT_REFRESH_TURNS = 10`，Project Brief 按 `user_turns / 10` 分桶缓存（原本每轮重算相关性排序并拼进稳定前缀，等于每轮改写前缀）——代价是新提取的记忆最迟 10 轮后可见。
 
 ### 权限模型（TUI）
 
