@@ -434,6 +434,38 @@ impl Default for ModelRuntimeCfg {
     }
 }
 
+/// tool-result context editing：超阈值时先把过期工具输出外部化到 CAS，
+/// 清理得动就**不**去跑整段摘要。对齐 Claude Code 的 "It clears older tool
+/// outputs first, then summarizes the conversation if needed."
+///
+/// 全部字段 opt-out：`enabled = false` 完全退回 v1.5.16 的行为（只压缩、只统计
+/// 可回收量、不真删）。详见 `doc/plan/v1.5.17-context-management-plan.md`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextEditCfg {
+    pub enabled: bool,
+    /// 最近 N 个工具结果保留全文（Anthropic `clear_tool_uses_20250919` 的 `keep`）。
+    pub protect_recent: usize,
+    /// 单批清理条数。每批都会改写 prompt cache 前缀，批太大浪费命中率。
+    pub batch_size: usize,
+    /// 低于此字节数的结果不清理：省下的 token 还不够一条占位符本身。
+    pub min_result_bytes: usize,
+    /// 单次请求最多连续清理几批（防"历史里全是可清理项"时一次做掉一大手术）。
+    pub max_batches: usize,
+}
+
+impl Default for ContextEditCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            protect_recent: 3,
+            batch_size: 10,
+            min_result_bytes: 2_000,
+            max_batches: 3,
+        }
+    }
+}
+
 /// `crates/sandbox/` 已删除，下方所有 `Sandbox*Cfg` 字段仍保留只为兼容
 /// `~/.wyj-code/config.toml` 历史配置文件（旧 block 不会被 serde 报错），
 /// 运行时整块忽略，不再映射到任何 ToolCtx 状态。读取后会在 Config::load
@@ -640,11 +672,21 @@ pub struct StorageRetentionCfg {
     /// CAS blob pool 单 blob 字节上限(0 = 关闭 CAS,沿用旧 inline 行为)。
     /// 超此值的文件不进 CAS,直接 inline 进 checkpoint JSON。
     pub cas_max_blob_bytes: u64,
-    // 曾经存在的 4 个 Phase 4 字段(`checkpoint_bytes_per_session` /
-    // `cas_total_bytes` / `cas_gc_on_start` / `checkpoint_ttl_days`)已删除:
-    // 它们有非零默认值,但全仓库没有任何消费点 —— `WorkspaceCas::gc` 只被
-    // 单测调用,`storage prune` / `doctor` 仍是 TODO 桩。留着只会让人误以为
-    // 存在对应的清理逻辑。`#[serde(default)]` + 无 `deny_unknown_fields`,
+
+    /// CAS blob pool 总量上限(字节,0 = 不做容量回收)。
+    ///
+    /// v1.5.17 重新加回：此前它因"无消费点"被删，但 `core::context_edit` 现在
+    /// 会把过期工具输出外部化进 CAS —— `WorkspaceCas::gc` 的**生产调用点**
+    /// 就是这里(进程启动时跑一次)。`gc` 只回收 `ref_count == 0` 的 blob，
+    /// 所以依赖会话结束时逐个 `release`；两个机制缺一都会让 pool 无界增长。
+    pub cas_total_bytes: u64,
+
+    /// 是否在进程启动时跑一次 `WorkspaceCas::gc(cas_total_bytes)`。
+    /// 关掉可省掉启动期一次全池目录遍历（blob 多时是毫秒级 IO）。
+    pub cas_gc_on_start: bool,
+    // 曾经存在的 2 个 Phase 4 字段(`checkpoint_bytes_per_session` /
+    // `checkpoint_ttl_days`)仍无消费点,保持删除:留着只会让人误以为存在
+    // 对应的清理逻辑。`#[serde(default)]` + 无 `deny_unknown_fields`,
     // 用户既有配置里写了这些键会被静默忽略,不影响加载。
 }
 
@@ -663,6 +705,10 @@ impl Default for StorageRetentionCfg {
             workspace_worktree_max_age_days: 30,
             disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
             cas_max_blob_bytes: 16 * 1024 * 1024,
+            // 1 GiB。context editing 每次清理写入的是"当时在上下文里"的内容，
+            // 单个会话可控；跨会话累积靠 gc 在启动时按 LRU 收口。
+            cas_total_bytes: 1024 * 1024 * 1024,
+            cas_gc_on_start: true,
         }
     }
 }
@@ -751,6 +797,9 @@ pub struct Config {
     /// 国内模型能力、工具参数恢复与 lazy schema 策略。
     #[serde(default)]
     pub model_runtime: ModelRuntimeCfg,
+    /// tool-result context editing（外部化过期工具输出优先于整段摘要）。
+    /// 设为 `enabled = false` 完全退回 v1.5.16 行为。
+    pub context_edit: ContextEditCfg,
     /// OS sandbox 文件系统、网络和降级策略。
     #[serde(default)]
     pub sandbox: SandboxCfg,
@@ -775,80 +824,12 @@ pub struct Config {
     /// 全部字段 opt-out,0 = 不截断。
     #[serde(default)]
     pub persist_cap: PersistCapCfg,
-    /// 可选/付费工具的注册门控（`[tools.jev]` 等子块）。Jev 是
-    /// stateless 决策 API（typesafe.ai System One），不能作为 chat 模型
-    /// 替代主 Agent；这里集中配置其注册门槛、限速与预算，避免污染
-    /// `[profiles]` 的 chat 协议语义。
-    #[serde(default)]
-    pub tools: ToolsCfg,
     /// 统一通知通道（v1.5.14+）：覆盖 TUI/CLI 回合完成 / 错误、后台子 Agent
     /// 完成、定时任务失败四类事件，通过终端响铃（stderr `\x07`）与桌面通知
     /// （macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast）
     /// 提醒用户。详见 `crates/cli/src/notify.rs`。
     #[serde(default)]
     pub notify: NotifyCfg,
-}
-
-/// `[tools]` 节：可选/付费工具的注册门控。每项独立配置、各自带
-/// 默认安全值，未配置时一律不注册对应工具，模型看不到该工具。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolsCfg {
-    /// Jev（typesafe.ai System One）决策工具。
-    pub jev: ToolsJevCfg,
-}
-
-/// `[tools.jev]` 节：Jev 决策 API（typesafe.ai System One）的注册门槛。
-///
-/// Jev 与 chat 模型完全不同：无 stream、无 multi-turn、无 tool calling 协议，
-/// 它是 stateless 决策 API（POST `/v1/systemone`），输出结构化 answers +
-/// probabilities + confidence，作为独立工具暴露给主 Agent 在歧义场景
-/// 主动调用（意图路由/分类/guardrails/置信度标注）。主模型仍是 Claude/GPT，
-/// 这里只控制 Jev 工具的注册与限速。
-///
-/// 默认全部安全收紧：`enabled=false`（不注册，模型看不到），
-/// API Key 优先从 `TYPESAFE_API_KEY` env 读取，env 与 `api_key` 字段都为空
-/// 时不注册；`daily_budget_usd = 0` 关闭 budget 维度（仅受 size 上限保护）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ToolsJevCfg {
-    /// 总开关。默认 false——Jev 是付费 API，不主动启用。
-    pub enabled: bool,
-    /// API Key；空字符串或 None 时回退到环境变量 `TYPESAFE_API_KEY`，
-    /// 都为空则工具不注册。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
-    /// 端点 base URL；空字符串使用 `https://api.typesafe.ai`。
-    #[serde(default)]
-    pub base_url: String,
-    /// 默认模型名；仅在 tool input 没显式给 `model` 时使用。
-    /// 当前官方 `jev-latest` 与 `jev-preview` 都指向 `jev-1.13.0`。
-    #[serde(default = "default_jev_model")]
-    pub model: String,
-    /// 单次调用最多 questions 数量（client-side validate，缺超则拒）。
-    pub max_questions: usize,
-    /// `state` 文本字符上限（超则按 char boundary 截断）。
-    pub max_state_chars: usize,
-    /// 429/5xx 客户端重试上限。
-    pub max_retries: u32,
-    /// 进程级日预算（USD）；0 = 关闭 budget 维度，仍受 size 上限保护。
-    /// 输出 token 官方免费（$0/M），只有输入侧按 $0.042/M 计费。
-    pub daily_budget_usd: f64,
-}
-
-impl Default for ToolsJevCfg {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            base_url: String::new(),
-            model: default_jev_model(),
-            max_questions: 32,
-            max_state_chars: 32_000,
-            max_retries: 2,
-            daily_budget_usd: 5.0,
-        }
-    }
 }
 
 /// `[notify]` 配置块（v1.5.14+）—— 统一通知通道的横切配置。
@@ -937,11 +918,6 @@ impl Default for NotifyEventsCfg {
     }
 }
 
-/// serde 字段级默认值（与 `Default::default` 同源）。
-fn default_jev_model() -> String {
-    "jev-latest".to_string()
-}
-
 fn default_true() -> bool {
     true
 }
@@ -974,6 +950,7 @@ impl Default for Config {
             subagent: SubAgentCfg::default(),
             routing: RoutingCfg::default(),
             model_runtime: ModelRuntimeCfg::default(),
+            context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
@@ -981,7 +958,6 @@ impl Default for Config {
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
-            tools: ToolsCfg::default(),
             notify: NotifyCfg::default(),
         }
     }
@@ -1060,6 +1036,7 @@ impl From<LegacyConfigV0> for Config {
             subagent: SubAgentCfg::default(),
             routing: RoutingCfg::default(),
             model_runtime: ModelRuntimeCfg::default(),
+            context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
             search_provider: default_search_provider(),
@@ -1067,7 +1044,6 @@ impl From<LegacyConfigV0> for Config {
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
-            tools: ToolsCfg::default(),
             notify: NotifyCfg::default(),
         }
     }
@@ -1110,33 +1086,6 @@ impl Config {
             AgentMode::Normal | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
         }
     }
-
-    /// 解析 Jev 决策工具的 API Key：优先 `TYPESAFE_API_KEY` env，回退到
-    /// `[tools.jev].api_key` 字段；都为空返回 None（调用方应跳过注册）。
-    /// 与 `runtime_api_key` 同样**不**回写到 `tools.jev.api_key`，
-    /// env 与字段的合并始终在运行时由本方法完成。
-    pub fn resolve_jev_api_key(&self) -> Option<String> {
-        if let Ok(value) = std::env::var("TYPESAFE_API_KEY") {
-            if !value.is_empty() {
-                return Some(value);
-            }
-        }
-        self.tools
-            .jev
-            .api_key
-            .as_deref()
-            .filter(|k| !k.is_empty())
-            .map(str::to_string)
-    }
-
-    /// 解析 Jev 工具的 base URL：留空用官方 `https://api.typesafe.ai`。
-    pub fn resolve_jev_base_url(&self) -> String {
-        if self.tools.jev.base_url.trim().is_empty() {
-            "https://api.typesafe.ai".to_string()
-        } else {
-            self.tools.jev.base_url.trim_end_matches('/').to_string()
-        }
-    }
 }
 
 impl Config {
@@ -1177,11 +1126,6 @@ impl Config {
                 cfg.search_api_key = Some(key);
             }
         }
-        // Jev（typesafe.ai）key：env 与 `[tools.jev].api_key` 字段的合并
-        // 由 `Config::resolve_jev_api_key()` 处理，**不**在这里写回 cfg
-        // 字段（与 `runtime_api_key` 同款 serde-skip 语义：避免 `/config`
-        // 等面板保存时把 env 值物化进 config.toml）。
-
         Ok(cfg)
     }
 
@@ -1873,28 +1817,6 @@ context_window = 200000
     }
 
     #[test]
-    fn jev_defaults_are_off_and_safe() {
-        let cfg = super::ToolsJevCfg::default();
-        assert!(!cfg.enabled, "Jev 默认禁用，避免无意中暴露付费工具");
-        assert!(cfg.api_key.is_none());
-        assert!(cfg.base_url.is_empty());
-        assert_eq!(cfg.model, "jev-latest");
-        assert_eq!(cfg.max_questions, 32);
-        assert_eq!(cfg.max_state_chars, 32_000);
-        assert_eq!(cfg.max_retries, 2);
-        assert!((cfg.daily_budget_usd - 5.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn partial_jev_section_keeps_safe_defaults() {
-        let cfg: super::ToolsJevCfg = toml::from_str(r#"enabled = true"#).unwrap();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.model, "jev-latest");
-        assert_eq!(cfg.max_questions, 32);
-        assert_eq!(cfg.daily_budget_usd, 5.0);
-    }
-
-    #[test]
     fn notify_defaults_match_recommendation() {
         let cfg = super::NotifyCfg::default();
         assert!(cfg.enabled, "master opt-out 默认开");
@@ -1938,108 +1860,6 @@ context_window = 200000
         assert!(cfg.notify.events.schedule_failure);
         assert_eq!(cfg.notify.rate_limit_seconds, 30);
     }
-
-    #[test]
-    fn resolve_jev_base_url_defaults_to_official_endpoint() {
-        let cfg = Config::default();
-        assert_eq!(cfg.resolve_jev_base_url(), "https://api.typesafe.ai");
-
-        let mut cfg2 = Config::default();
-        cfg2.tools.jev.base_url = "https://api.example.com/v1/".to_string();
-        assert_eq!(
-            cfg2.resolve_jev_base_url(),
-            "https://api.example.com/v1",
-            "末尾 / 应被 trim，避免与 /v1/systemone 拼成 //"
-        );
-    }
-
-    /// 进程级 Mutex：jev API key 测试需要改 `TYPESAFE_API_KEY` env，
-    /// `std::env::set_var` 在多线程并发下与 libc getenv 不同步（getenv 返回
-    /// 各线程启动时的快照），cargo test 默认多线程并发会让 3 个测试相互覆盖
-    /// env 值。Mutex 串行化确保任意时刻只有一个测试持有 env 修改权。
-    static JEV_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn resolve_jev_api_key_prefers_env_over_field_when_both_set() {
-        // env 优先于字段（与 `Config::runtime_api_key` 模式一致；CLAUDE.md
-        // 「统一通知通道」节明确这是 env override 优先语义）。env 通过
-        // `JEV_ENV_LOCK` 串行化 + 临时 set / 还原隔离，避免测试间串扰。
-        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("TYPESAFE_API_KEY").ok();
-        std::env::set_var("TYPESAFE_API_KEY", "from-env");
-        let mut cfg = Config::default();
-        cfg.tools.jev.api_key = Some("from-field".to_string());
-        let result = cfg.resolve_jev_api_key();
-        match prev {
-            Some(v) => std::env::set_var("TYPESAFE_API_KEY", v),
-            None => std::env::remove_var("TYPESAFE_API_KEY"),
-        }
-        assert_eq!(result.as_deref(), Some("from-env"));
-    }
-
-    #[test]
-    fn resolve_jev_api_key_uses_field_when_env_unset() {
-        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("TYPESAFE_API_KEY").ok();
-        if prev.is_some() {
-            std::env::remove_var("TYPESAFE_API_KEY");
-        }
-        let mut cfg = Config::default();
-        cfg.tools.jev.api_key = Some("from-field".to_string());
-        let result = cfg.resolve_jev_api_key();
-        if let Some(v) = prev {
-            std::env::set_var("TYPESAFE_API_KEY", v);
-        }
-        assert_eq!(result.as_deref(), Some("from-field"));
-    }
-
-    #[test]
-    fn resolve_jev_api_key_treats_empty_field_as_unset() {
-        // 字段空字符串视为未设置；env 通过 guard 隔离。
-        let _guard = JEV_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("TYPESAFE_API_KEY").ok();
-        if prev.is_some() {
-            std::env::remove_var("TYPESAFE_API_KEY");
-        }
-        let mut cfg = Config::default();
-        cfg.tools.jev.api_key = Some(String::new());
-        let result = cfg.resolve_jev_api_key();
-        if let Some(v) = prev {
-            std::env::set_var("TYPESAFE_API_KEY", v);
-        }
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn config_serializes_with_new_tools_section() {
-        // 反向兼容：旧 config.toml 无 [tools] 段时仍能加载（serde default）
-        let cfg: Config = toml::from_str(
-            r#"
-active_profile = "default"
-
-[[profiles]]
-name = "default"
-provider = "anthropic"
-model = "claude-opus-4-8"
-base_url = "https://api.anthropic.com"
-api_key = "sk-test"
-max_tokens = 8192
-context_window = 200000
-"#,
-        )
-        .unwrap();
-        assert!(!cfg.tools.jev.enabled);
-        // 序列化为 TOML 后应包含 [tools] 段
-        let s = toml::to_string(&cfg).unwrap();
-        assert!(s.contains("[tools.jev]"));
-    }
-}
-
-// `~/.wyj-code/config.toml` 含 API Key 等敏感字段,
-// `write_atomic` rename 后应默认收紧到 0o600 (Unix only).
-#[cfg(all(test, unix))]
-mod write_atomic_permissions_tests {
-    use super::*;
 
     #[test]
     fn save_to_sets_0o600_permissions_on_unix() {

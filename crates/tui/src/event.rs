@@ -33,13 +33,13 @@ pub enum AgentEvent {
     TurnDone,
     /// Agent 出错
     Error(String),
-    /// Token 用量（覆盖式更新）。`context_tokens` 是本轮结束时 session.messages 的
-    /// 实际大小估算（供状态栏占比显示），与 `input`（跨轮次累加的历史用量总和，
-    /// 供 /cost 与单轮增量展示）是不同的量。
+    /// Token 用量（覆盖式更新）。`compact_count` 是本会话自动压缩次数，供状态栏
+    /// 显示语义指示；`input` 是跨轮次累加的历史用量总和，供 /cost 与单轮增量
+    /// 展示。上下文占用的精确分解走 `/context`，不在事件流里重复传输。
     Usage {
         input: u32,
         output: u32,
-        context_tokens: u32,
+        compact_count: u32,
         tool_schema_tokens: u32,
         tool_schema_tokens_saved: u32,
     },

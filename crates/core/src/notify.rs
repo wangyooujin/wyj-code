@@ -25,7 +25,7 @@
 //! - `WYJ_CODE_NOTIFY_BELL=0/1` — 覆盖 `bell.enabled`
 //! - `WYJ_CODE_NOTIFY_DESKTOP=0/1` — 覆盖 `desktop.enabled`
 //!
-//! env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::resolve_jev_api_key` 模式）。
+//! env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::runtime_api_key` 的 env 不回写语义）。
 
 use std::collections::HashMap;
 use std::io::Write;

@@ -286,7 +286,7 @@ pub fn set_externalize_cas(cas: Option<Arc<WorkspaceCas>>) {
     *EXTERNALIZE_CAS.lock().expect("EXTERNALIZE_CAS poisoned") = cas;
 }
 
-fn current_externalize_cas() -> Option<Arc<WorkspaceCas>> {
+pub fn current_externalize_cas() -> Option<Arc<WorkspaceCas>> {
     EXTERNALIZE_CAS
         .lock()
         .expect("EXTERNALIZE_CAS poisoned")
@@ -524,6 +524,9 @@ mod tests {
             branch_parent_session_id: None,
             branch_parent_checkpoint_id: None,
             title_generated: false,
+            compact_count: 0,
+            elided_blobs: vec![],
+            context_edit_freed_tokens: 0,
         };
         let mut messages = session_file.messages.clone();
         let cfg = PersistCapCfg {

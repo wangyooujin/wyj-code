@@ -7,6 +7,7 @@
 //!   - 横向 RGB 渐变（橙 215,119,87 → 中间橙黄 225,160,85 → 暖黄 240,200,80）
 //!   - BOLD 强调，无背景填充（避免与下方终端默认背景形成突兀色块）
 //!   - 左缩进 `INFO_INDENT`（2 空格），与下方信息行共用同一左基准
+//! - 版本号行（紧贴 logo 下方，左缩进，dim 灰）
 //! - 1 行间隔
 //! - `Profile · Model`（左对齐，dim 灰）
 //! - `‹ cwd ›`（左对齐，dim 灰）
@@ -24,7 +25,7 @@ use crate::render::{char_display_width, truncate_line};
 use crate::theme::Theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use wyj_i18n::tr;
+use wyj_i18n::{tr, tr_fmt};
 
 /// 欢迎页所需的运行时上下文（由调用方从 `AppState` 投影而来）
 ///
@@ -95,6 +96,7 @@ const ASCII_LOGO: &[&str] = &[
 /// 布局（自上而下）：
 /// - 顶部 `TOP_BLANK_LINES` 行留白
 /// - logo 行（按列渐变橙→黄，靠左对齐，左缩进 `INFO_INDENT`）
+/// - 1 行版本号（左缩进 `INFO_INDENT`，dim 灰，紧贴 logo 下方）
 /// - `LOGO_INFO_BLANK_LINES` 行间隔
 /// - 1 行 Profile/Model（左缩进 `INFO_INDENT`，dim 灰）
 /// - 1 行 CWD（左缩进 `INFO_INDENT`，dim 灰，‹ › 包裹）
@@ -106,6 +108,7 @@ const ASCII_LOGO: &[&str] = &[
 pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static>> {
     let total = TOP_BLANK_LINES
         + ASCII_LOGO.len()
+        + 1
         + LOGO_INFO_BLANK_LINES
         + 2
         + INFO_TIP_BLANK_LINES
@@ -141,7 +144,23 @@ pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static
     }
     lines.extend(logo_lines);
 
-    // 2) logo 与信息行之间的间隔
+    // 2) 版本号行：紧贴 logo 正下方、左缩进与其余信息行同列起首。
+    //
+    // 版本号取编译期 `CARGO_PKG_VERSION`（workspace 统一继承，与 `/help`、
+    // `/doctor` 显示的版本同源），无需从 AppState 透传——不为此给
+    // `WelcomeContext` 加字段。ASCII_LOGO 末行本身是空行，视觉上与 logo
+    // 留有一行呼吸，不会贴死。
+    let available_width = (area_width as usize).saturating_sub(INFO_INDENT.len());
+    let version_text = tr_fmt("welcome.version", &[("version", env!("CARGO_PKG_VERSION"))]);
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{INFO_INDENT}{}",
+            truncate_line(&version_text, available_width)
+        ),
+        Theme::dim(),
+    )));
+
+    // 3) logo 与信息行之间的间隔
     for _ in 0..LOGO_INFO_BLANK_LINES {
         lines.push(Line::from(""));
     }
@@ -166,7 +185,6 @@ pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static
     }
 
     // 6) tip 行（💡 + 轮播文案，越界索引防御性取模）
-    let available_width = (area_width as usize).saturating_sub(INFO_INDENT.len());
     let tip_key = TIPS[ctx.tip_index % TIPS.len()];
     let tip_text = truncate_line(&tr(tip_key), available_width.saturating_sub(2));
     lines.push(Line::from(Span::styled(
@@ -341,6 +359,7 @@ mod tests {
         let lines = render_welcome(&ctx, 120);
         let expected = TOP_BLANK_LINES
             + ASCII_LOGO.len()
+            + 1
             + LOGO_INFO_BLANK_LINES
             + 2
             + INFO_TIP_BLANK_LINES
@@ -351,7 +370,7 @@ mod tests {
         assert_eq!(
             lines.len(),
             expected,
-            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 间隔 {LOGO_INFO_BLANK_LINES} + 信息 2 + 间隔 {INFO_TIP_BLANK_LINES} + tip 1 + 示例 1 + 间隔 {TIP_SHORTCUT_BLANK_LINES} + 快捷键 1）",
+            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 版本 1 + 间隔 {LOGO_INFO_BLANK_LINES} + 信息 2 + 间隔 {INFO_TIP_BLANK_LINES} + tip 1 + 示例 1 + 间隔 {TIP_SHORTCUT_BLANK_LINES} + 快捷键 1）",
             expected,
             ASCII_LOGO.len()
         );
@@ -499,7 +518,8 @@ mod tests {
     fn render_welcome_blank_line_between_logo_and_info() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let inter_start = TOP_BLANK_LINES + ASCII_LOGO.len();
+        // 空行起点 = 版本行之后（logo 块末尾是 ASCII_LOGO 末行空行，再接版本行）
+        let inter_start = version_line_idx() + 1;
         for i in 0..LOGO_INFO_BLANK_LINES {
             let blank = &lines[inter_start + i];
             assert_eq!(collect_text(blank), "", "logo 后第 {} 行应为空行", i + 1);
@@ -510,7 +530,7 @@ mod tests {
     fn render_welcome_profile_line_uses_dim_style() {
         let ctx = sample_ctx_with_profile();
         let lines = render_welcome(&ctx, 120);
-        let profile_line = &lines[TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES];
+        let profile_line = &lines[info_base_idx()];
         assert_eq!(
             profile_line.spans[0].style.fg,
             Some(Theme::inactive_color()),
@@ -522,7 +542,7 @@ mod tests {
     fn render_welcome_profile_line_omits_default_profile() {
         let ctx = sample_ctx(); // profile = "default"
         let lines = render_welcome(&ctx, 120);
-        let profile_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let profile_line_idx = info_base_idx();
         let text = collect_text(&lines[profile_line_idx]);
         assert!(
             !text.contains("default"),
@@ -540,7 +560,7 @@ mod tests {
     fn render_welcome_profile_line_includes_custom_profile() {
         let ctx = sample_ctx_with_profile(); // profile = "glm-cheap"
         let lines = render_welcome(&ctx, 120);
-        let profile_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let profile_line_idx = info_base_idx();
         let text = collect_text(&lines[profile_line_idx]);
         assert!(
             text.contains("glm-cheap") && text.contains("glm-5.2"),
@@ -553,7 +573,7 @@ mod tests {
     fn render_welcome_cwd_line_uses_bracketed_format() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let cwd_line_idx = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 1;
+        let cwd_line_idx = info_base_idx() + 1;
         let text = collect_text(&lines[cwd_line_idx]);
         assert!(
             text.contains("‹ ") && text.contains(" ›"),
@@ -571,7 +591,7 @@ mod tests {
     fn render_welcome_info_lines_are_left_indented() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let base = TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES;
+        let base = info_base_idx();
         let profile_text = collect_text(&lines[base]);
         let cwd_text = collect_text(&lines[base + 1]);
         assert!(
@@ -663,8 +683,16 @@ mod tests {
         );
     }
 
+    fn version_line_idx() -> usize {
+        TOP_BLANK_LINES + ASCII_LOGO.len()
+    }
+
+    fn info_base_idx() -> usize {
+        version_line_idx() + 1 + LOGO_INFO_BLANK_LINES
+    }
+
     fn tip_line_idx() -> usize {
-        TOP_BLANK_LINES + ASCII_LOGO.len() + LOGO_INFO_BLANK_LINES + 2 + INFO_TIP_BLANK_LINES
+        info_base_idx() + 2 + INFO_TIP_BLANK_LINES
     }
 
     fn placeholder_line_idx() -> usize {
@@ -673,6 +701,57 @@ mod tests {
 
     fn shortcuts_line_idx() -> usize {
         placeholder_line_idx() + 1 + TIP_SHORTCUT_BLANK_LINES
+    }
+
+    #[test]
+    fn render_welcome_version_line_sits_directly_below_logo() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let idx = version_line_idx();
+        assert_eq!(
+            idx,
+            TOP_BLANK_LINES + ASCII_LOGO.len(),
+            "版本行应紧跟在 logo 块之后（原 ASCII_LOGO 末行是空行，视觉上与 logo 留一行呼吸）"
+        );
+        assert_eq!(
+            collect_text(&lines[idx]),
+            format!(
+                "{INFO_INDENT}{}",
+                tr_fmt("welcome.version", &[("version", env!("CARGO_PKG_VERSION"))])
+            ),
+            "版本行应为左缩进的当前版本号；实际：{:?}",
+            collect_text(&lines[idx])
+        );
+    }
+
+    #[test]
+    fn render_welcome_version_line_uses_dim_style() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        assert_eq!(
+            lines[version_line_idx()].spans[0].style.fg,
+            Some(Theme::inactive_color()),
+            "版本行应使用 dim 色（INACTIVE 灰）"
+        );
+    }
+
+    #[test]
+    fn render_welcome_version_line_does_not_overflow_narrow_width() {
+        // 窄终端（比 "v1.5.16" 还窄）下应截断为省略号，不溢出右边界。
+        // 下限取 INFO_INDENT 宽度：缩进本身占 2 列，比它更窄时整页所有行
+        // 都已溢出（既有行为，不归版本行管）。
+        for width in [INFO_INDENT.len(), 4, 8] {
+            let lines = render_welcome(&sample_ctx(), width as u16);
+            let text = collect_text(&lines[version_line_idx()]);
+            let measured: usize = text.chars().map(char_display_width).sum();
+            assert!(
+                measured <= width,
+                "宽度 {} 下版本行不应超宽；实际宽度 {}：{:?}",
+                width,
+                measured,
+                text
+            );
+        }
     }
 
     #[test]

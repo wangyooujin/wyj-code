@@ -314,26 +314,6 @@ impl Theme {
         Style::default().fg(Self::claude_color())
     }
 
-    /// 进度条已填充颜色（< 70%）
-    pub fn progress_normal() -> Style {
-        Style::default().fg(Self::suggestion_color())
-    }
-
-    /// 进度条告警颜色（70-90%）
-    pub fn progress_warn() -> Style {
-        Style::default().fg(Self::warning_color())
-    }
-
-    /// 进度条危险颜色（>= 90%）
-    pub fn progress_danger() -> Style {
-        Style::default().fg(Self::error_color())
-    }
-
-    /// 进度条空余部分
-    pub fn progress_empty() -> Style {
-        Style::default().fg(Self::inactive_color())
-    }
-
     // ── 欢迎页 logo 专用（橙→黄渐变 + 整块反色填充）───────────────────────────
     /// 渐变起点：品牌橙（与 CLAUDE 同色，确保 logo 起始色与品牌一致）
     pub const WELCOME_LOGO_GRADIENT_START: Color = Color::Rgb(215, 119, 87);
