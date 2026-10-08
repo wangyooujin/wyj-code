@@ -117,6 +117,16 @@ pub struct CommandContext {
     pub cache_write_tokens: u32,
     pub context_window: u32,
     pub estimated_tokens: u32,
+    /// 最近一次模型请求的上下文占用分解。与自动压缩的触发计算**同源**
+    /// （`wyj_core::compact::ContextAudit::from_request`），`/context` 面板
+    /// 直接展示它——旧实现里 `/cost` 的百分比用的是只算 messages 的
+    /// `estimated_tokens`，与压缩阈值差一万多 token，对不上号。
+    /// `None` = 本会话还没发起过模型请求。
+    pub context_audit: Option<wyj_core::compact::ContextAudit>,
+    /// 本会话自动压缩发生次数。
+    pub compact_count: u32,
+    /// 本会话 tool-result context editing 的 `(清理条数, 释放的估算 token)`。
+    pub context_edit: (u32, u32),
     pub home_dir: std::path::PathBuf,
     /// 子 Agent 累计 token 用量（与主会话分开统计，/cost 单列；headless 传 0）
     pub sub_input_tokens: u32,

@@ -30,6 +30,17 @@ pub struct SessionFile {
     /// 是否已通过 LLM 生成过标题（首轮后生成一次，之后固定）
     #[serde(default)]
     pub title_generated: bool,
+    /// 本会话自动压缩次数。落盘是为了 `/resume` 后状态栏的"已自动压缩 ×N"
+    /// 指示不消失——压缩对用户不可见，少了这个数字就等于黑盒。
+    #[serde(default)]
+    pub compact_count: u32,
+    /// 本会话被 context editing 外部化到 CAS 的 blob hash。落盘是为了会话被
+    /// 丢弃时能逐个 `release` —— CAS 的 `gc` 只回收 `ref_count == 0` 的 blob。
+    #[serde(default)]
+    pub elided_blobs: Vec<String>,
+    /// 本会话 context editing 累计释放的估算 token。
+    #[serde(default)]
+    pub context_edit_freed_tokens: u32,
 }
 
 /// 会话摘要（不含消息体，用于列表展示）
@@ -131,6 +142,13 @@ impl SessionStore {
         if let Some(cfg) = current_persist_cap() {
             crate::serialize::truncate_session_for_persistence(&mut file, &cfg);
         }
+        // 落盘文件里 context editing 清理过的工具结果是占位符（体积小），原文在
+        // CAS。Resume 的语义是「新会话从完整上下文开始」——这里把原文还原回内存，
+        // 之后随会话增长再逐步被重新清理。blob 已被 gc 时保留占位符。
+        crate::context_edit::materialize_elided(
+            &mut file.messages,
+            crate::serialize::current_externalize_cas().as_deref(),
+        );
         Ok(file)
     }
 
@@ -197,6 +215,9 @@ impl SessionStore {
             branch_parent_session_id: Some(parent_session_id.to_string()),
             branch_parent_checkpoint_id: Some(checkpoint.id.clone()),
             title_generated: false,
+            compact_count: 0,
+            elided_blobs: vec![],
+            context_edit_freed_tokens: 0,
         };
         self.save(&file)?;
         Ok(file)
@@ -284,6 +305,9 @@ mod tests {
             branch_parent_session_id: None,
             branch_parent_checkpoint_id: None,
             title_generated: false,
+            compact_count: 0,
+            elided_blobs: vec![],
+            context_edit_freed_tokens: 0,
         }
     }
 
@@ -345,6 +369,9 @@ mod tests {
             branch_parent_session_id: None,
             branch_parent_checkpoint_id: None,
             title_generated: false,
+            compact_count: 0,
+            elided_blobs: vec![],
+            context_edit_freed_tokens: 0,
         };
         store.save(&parent).unwrap();
         let checkpoints =
@@ -396,6 +423,9 @@ mod tests {
             branch_parent_session_id: None,
             branch_parent_checkpoint_id: None,
             title_generated: false,
+            compact_count: 0,
+            elided_blobs: vec![],
+            context_edit_freed_tokens: 0,
         };
         store.save(&file).unwrap();
         let raw = std::fs::read_to_string(store.path("secret-session")).unwrap();

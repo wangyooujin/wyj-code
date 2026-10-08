@@ -5491,7 +5491,7 @@ mod navigation_focus_tests {
         state.unseen_messages = true;
         state.total_input_tokens = 11;
         state.total_output_tokens = 13;
-        state.context_tokens = 17;
+        state.compact_count = 17;
         state.turns = 2;
         state
             .messages
@@ -5510,7 +5510,7 @@ mod navigation_focus_tests {
         assert!(!state.unseen_messages);
         assert_eq!(state.total_input_tokens, 0);
         assert_eq!(state.total_output_tokens, 0);
-        assert_eq!(state.context_tokens, 0);
+        assert_eq!(state.compact_count, 0);
         assert_eq!(state.turns, 0);
         assert!(state.pending_queue.is_empty());
         assert_eq!(state.messages.len(), 1);
@@ -6234,11 +6234,11 @@ pub struct AppState {
     pub unseen_messages: bool,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
-    /// 当前会话实际上下文大小估算（`estimate_tokens(&session.messages)`），
-    /// 用于状态栏上下文占比显示。与 total_input_tokens（跨轮次累加的历史
-    /// 用量总和，用于 /cost 与单轮增量展示）是两个不同的量：后者只增不减，
-    /// 压缩后也不会反映真实上下文缩小，因此不能拿来算占比。
-    pub context_tokens: u32,
+    /// 本会话自动压缩次数。状态栏用它显示一个**语义**指示（"自动压缩 ×N"）
+    /// 而不是上下文占用百分比——压缩已完全自动化，占比对用户没有可操作性；
+    /// 而"系统替我丢过历史"这件事必须可见，否则自动管理就成了黑盒。
+    /// 精确分解走 `/context`（与压缩阈值同源）。
+    pub compact_count: u32,
     pub tool_schema_tokens: u32,
     pub tool_schema_tokens_saved: u32,
     pub cwd: PathBuf,
@@ -6432,7 +6432,7 @@ impl AppState {
             unseen_messages: false,
             total_input_tokens: 0,
             total_output_tokens: 0,
-            context_tokens: 0,
+            compact_count: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
             cwd,
@@ -6562,7 +6562,7 @@ impl AppState {
         self.unseen_messages = false;
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
-        self.context_tokens = 0;
+        self.compact_count = 0;
         self.tool_schema_tokens = 0;
         self.tool_schema_tokens_saved = 0;
         self.turns = 0;
@@ -7661,13 +7661,13 @@ impl AppState {
             AgentEvent::Usage {
                 input,
                 output,
-                context_tokens,
+                compact_count,
                 tool_schema_tokens,
                 tool_schema_tokens_saved,
             } => {
                 self.total_input_tokens = input;
                 self.total_output_tokens = output;
-                self.context_tokens = context_tokens;
+                self.compact_count = compact_count;
                 self.tool_schema_tokens = tool_schema_tokens;
                 self.tool_schema_tokens_saved = tool_schema_tokens_saved;
             }
@@ -8806,6 +8806,9 @@ pub async fn run_tui(
     // 引导用户填写。仅当 `wyj_api::build_provider_with_model` 因缺 Key 失败、
     // 且当前入口是 TUI 默认启动时,`wyj-code` CLI 装配阶段才传 true。
     needs_api_key_onboarding: bool,
+    // CAS blob pool。用于 `/clear` / 退出时 release 本会话被 context editing
+    // 外部化的 blob 引用 —— CAS 的 gc 只回收 `ref_count == 0` 的 blob。
+    workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -8851,6 +8854,7 @@ pub async fn run_tui(
         plugin_runtime,
         wheel_routing,
         needs_api_key_onboarding,
+        workspace_cas,
     )
     .await;
 
@@ -9194,7 +9198,8 @@ fn spawn_agent_turn(
                     .send(AgentEvent::Usage {
                         input: sess.total_input_tokens,
                         output: sess.total_output_tokens,
-                        context_tokens: wyj_core::estimate_tokens(&sess.messages),
+                        compact_count: sess.compact_count,
+
                         tool_schema_tokens: sess.tool_schema_tokens,
                         tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
                     })
@@ -9937,6 +9942,8 @@ async fn tui_main(
     // 首次启动 + `~/.wyj-code` 缺失 + 用户尚未填入 API Key 时为 true。
     // `AppState::new` 之后立即打开 `ProfileDialog` 引导用户填写。
     needs_api_key_onboarding: bool,
+    // CAS blob pool：`/clear` 时 release 本会话被 context editing 外部化的 blob。
+    workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -10032,6 +10039,7 @@ async fn tui_main(
         init_sess.total_output_tokens = file.output_tokens;
         init_sess.routing_events = file.routing_events;
         init_sess.current_checkpoint_id = file.current_checkpoint_id;
+        init_sess.compact_count = file.compact_count;
         init_sess.branch_parent_session_id = file.branch_parent_session_id;
         init_sess.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
     }
@@ -10040,7 +10048,7 @@ async fn tui_main(
         state.total_input_tokens = init_sess.total_input_tokens;
         state.total_output_tokens = init_sess.total_output_tokens;
         state.welcome_frozen = true;
-        state.context_tokens = wyj_core::estimate_tokens(&init_sess.messages);
+        state.compact_count = init_sess.compact_count;
         state.messages = reconstruct_display(&init_sess.messages);
         state.messages.push(ChatMessage::system(format!(
             "已恢复会话  共 {} 条消息",
@@ -10260,6 +10268,10 @@ async fn tui_main(
                         timestamp: now_iso(),
                         turns: state.turns,
                         input_tokens: sess.total_input_tokens,
+                        compact_count: sess.compact_count,
+                        elided_blobs: sess.elided_blobs.clone(),
+                        context_edit_freed_tokens: sess.context_edit_freed_tokens,
+
                         output_tokens: sess.total_output_tokens,
                         messages: sess.messages.clone(),
                         routing_events: sess.routing_events.clone(),
@@ -10419,6 +10431,11 @@ async fn tui_main(
                                                     timestamp: now_iso(),
                                                     turns: state.turns,
                                                     input_tokens: sess.total_input_tokens,
+                                                    compact_count: sess.compact_count,
+                                                    elided_blobs: sess.elided_blobs.clone(),
+                                                    context_edit_freed_tokens: sess
+                                                        .context_edit_freed_tokens,
+
                                                     output_tokens: sess.total_output_tokens,
                                                     messages: sess.messages.clone(),
                                                     routing_events: sess.routing_events.clone(),
@@ -10476,6 +10493,11 @@ async fn tui_main(
                                                         timestamp: now_iso(),
                                                         turns: state.turns,
                                                         input_tokens: sess.total_input_tokens,
+                                                        compact_count: sess.compact_count,
+                                                        elided_blobs: sess.elided_blobs.clone(),
+                                                        context_edit_freed_tokens: sess
+                                                            .context_edit_freed_tokens,
+
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
                                                         routing_events: sess.routing_events.clone(),
@@ -10504,13 +10526,13 @@ async fn tui_main(
                                                         file.routing_events.clone();
                                                     sess.current_checkpoint_id =
                                                         file.current_checkpoint_id.clone();
+                                                    sess.compact_count = file.compact_count;
                                                     sess.branch_parent_session_id =
                                                         file.branch_parent_session_id.clone();
                                                     sess.branch_parent_checkpoint_id =
                                                         file.branch_parent_checkpoint_id.clone();
                                                     sess.messages = file.messages;
-                                                    let context_tokens =
-                                                        wyj_core::estimate_tokens(&sess.messages);
+                                                    let compact_count = sess.compact_count;
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -10525,7 +10547,7 @@ async fn tui_main(
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
-                                                    state.context_tokens = context_tokens;
+                                                    state.compact_count = compact_count;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;
@@ -13112,12 +13134,36 @@ async fn tui_main(
                                 &disabled_skills,
                                 &current_plugin_skill_sources,
                             );
-                            let (estimated, cache_read, cache_write) = {
+                            let (
+                                audit,
+                                estimated,
+                                cache_read,
+                                cache_write,
+                                compact_count,
+                                context_edit,
+                            ) = {
                                 let sess = session.lock().await;
+                                // 优先用 Agent 侧算好的 request 级分解（与自动压缩
+                                // 阈值同源）；本会话还没发过模型请求时才退回
+                                // messages-only 估算。
+                                let audit = if sess.context_audit.total() > 0 {
+                                    Some(sess.context_audit)
+                                } else {
+                                    None
+                                };
+                                let estimated = audit
+                                    .map(|a| a.total())
+                                    .unwrap_or_else(|| wyj_core::estimate_tokens(&sess.messages));
                                 (
-                                    wyj_core::estimate_tokens(&sess.messages),
+                                    audit,
+                                    estimated,
                                     sess.total_cache_read_tokens,
                                     sess.total_cache_write_tokens,
+                                    sess.compact_count,
+                                    (
+                                        wyj_core::context_edit::elided_count(&sess.messages) as u32,
+                                        sess.context_edit_freed_tokens,
+                                    ),
                                 )
                             };
                             let cmd_ctx = CommandContext {
@@ -13129,6 +13175,9 @@ async fn tui_main(
                                 cache_write_tokens: cache_write,
                                 context_window,
                                 estimated_tokens: estimated,
+                                context_audit: audit,
+                                compact_count,
+                                context_edit,
                                 home_dir: std::env::var("HOME")
                                     .map(std::path::PathBuf::from)
                                     .unwrap_or_default(),
@@ -13171,7 +13220,7 @@ async fn tui_main(
                                         state.messages.clear();
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
-                                        state.context_tokens = 0;
+                                        state.compact_count = 0;
                                         state.tool_schema_tokens = 0;
                                         state.tool_schema_tokens_saved = 0;
                                         state.pending_attachments.clear();
@@ -13207,6 +13256,19 @@ async fn tui_main(
                                         state.welcome_frozen = true;
                                         execute!(io::stdout(), Clear(ClearType::Purge))?;
                                         let mut sess = session.lock().await;
+                                        // /clear 会把 elided_blobs 一起清空，必须先
+                                        // release：CAS 的 gc 只回收 ref_count == 0 的
+                                        // blob，不 release 就等于永久泄漏。
+                                        let released =
+                                            wyj_core::context_edit::release_session_blobs(
+                                                workspace_cas.as_deref(),
+                                                &sess.take_elided_blobs(),
+                                            );
+                                        if released > 0 {
+                                            tracing::debug!(
+                                                "/clear: 释放 {released} 个 CAS blob 引用"
+                                            );
+                                        }
                                         sess.clear_conversation();
                                         // 必须置位落盘标记：否则 /clear 只清内存，磁盘上的
                                         // <session_id>.json 仍是清空前的完整历史，用户
@@ -13222,8 +13284,7 @@ async fn tui_main(
                                         let mut sess = session.lock().await;
                                         match agent_c.compact_context(&mut sess).await {
                                             Ok(r) if r.messages_removed > 0 => {
-                                                state.context_tokens =
-                                                    wyj_core::estimate_tokens(&sess.messages);
+                                                state.compact_count = sess.compact_count;
                                                 state.messages.push(ChatMessage::assistant(
                                                     format!(
                                                         "已压缩：移除 {} 条消息，节省约 {} tokens",
@@ -13273,6 +13334,11 @@ async fn tui_main(
                                                         timestamp: now_iso(),
                                                         turns: state.turns,
                                                         input_tokens: sess.total_input_tokens,
+                                                        compact_count: sess.compact_count,
+                                                        elided_blobs: sess.elided_blobs.clone(),
+                                                        context_edit_freed_tokens: sess
+                                                            .context_edit_freed_tokens,
+
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
                                                         routing_events: sess.routing_events.clone(),
@@ -13427,8 +13493,7 @@ async fn tui_main(
                                                 sess.messages = checkpoint.messages;
                                                 sess.current_checkpoint_id = Some(id.clone());
                                                 state.messages = reconstruct_display(&sess.messages);
-                                                state.context_tokens =
-                                                    wyj_core::estimate_tokens(&sess.messages);
+                                                state.compact_count = sess.compact_count;
                                                 state.turns = sess
                                                     .messages
                                                     .iter()
@@ -13522,8 +13587,7 @@ async fn tui_main(
                                                     branch.branch_parent_checkpoint_id;
                                                 state.messages =
                                                     reconstruct_display(&sess.messages);
-                                                state.context_tokens =
-                                                    wyj_core::estimate_tokens(&sess.messages);
+                                                state.compact_count = sess.compact_count;
                                                 state.turns = branch.turns;
                                                 state.total_input_tokens = 0;
                                                 state.total_output_tokens = 0;
@@ -13760,10 +13824,8 @@ async fn tui_main(
                                                         .send(AgentEvent::Usage {
                                                             input: sess.total_input_tokens,
                                                             output: sess.total_output_tokens,
-                                                            context_tokens:
-                                                                wyj_core::estimate_tokens(
-                                                                    &sess.messages,
-                                                                ),
+                                                            compact_count: sess.compact_count,
+
                                                             tool_schema_tokens: sess
                                                                 .tool_schema_tokens,
                                                             tool_schema_tokens_saved: sess
@@ -13898,10 +13960,8 @@ async fn tui_main(
                                                         .send(AgentEvent::Usage {
                                                             input: sess.total_input_tokens,
                                                             output: sess.total_output_tokens,
-                                                            context_tokens:
-                                                                wyj_core::estimate_tokens(
-                                                                    &sess.messages,
-                                                                ),
+                                                            compact_count: sess.compact_count,
+
                                                             tool_schema_tokens: sess
                                                                 .tool_schema_tokens,
                                                             tool_schema_tokens_saved: sess
@@ -13948,6 +14008,11 @@ async fn tui_main(
                                                         timestamp: now_iso(),
                                                         turns: state.turns,
                                                         input_tokens: sess.total_input_tokens,
+                                                        compact_count: sess.compact_count,
+                                                        elided_blobs: sess.elided_blobs.clone(),
+                                                        context_edit_freed_tokens: sess
+                                                            .context_edit_freed_tokens,
+
                                                         output_tokens: sess.total_output_tokens,
                                                         messages: sess.messages.clone(),
                                                         routing_events: sess.routing_events.clone(),
@@ -13981,8 +14046,7 @@ async fn tui_main(
                                                     sess.branch_parent_checkpoint_id =
                                                         file.branch_parent_checkpoint_id.clone();
                                                     sess.messages = file.messages;
-                                                    let context_tokens =
-                                                        wyj_core::estimate_tokens(&sess.messages);
+                                                    let compact_count = sess.compact_count;
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -13997,7 +14061,7 @@ async fn tui_main(
                                                     state.messages = display_msgs;
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
-                                                    state.context_tokens = context_tokens;
+                                                    state.compact_count = compact_count;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;
@@ -14478,6 +14542,10 @@ async fn tui_main(
                     timestamp: now_iso(),
                     turns: state.turns,
                     input_tokens: sess.total_input_tokens,
+                    compact_count: sess.compact_count,
+                    elided_blobs: sess.elided_blobs.clone(),
+                    context_edit_freed_tokens: sess.context_edit_freed_tokens,
+
                     output_tokens: sess.total_output_tokens,
                     messages: sess.messages.clone(),
                     routing_events: sess.routing_events.clone(),
@@ -14488,6 +14556,18 @@ async fn tui_main(
                 });
                 resumable_session_id = Some(current_session_id.clone());
             }
+        }
+    }
+    // 退出时释放本会话被 context editing 外部化的 CAS blob 引用。会话没了，
+    // 这些 blob 也就没人会召回；不 release 的话 ref_count 永远停在 1，gc
+    // 永远删不掉，CAS pool 随会话数线性增长。
+    if let Ok(mut sess) = session.try_lock() {
+        let released = wyj_core::context_edit::release_session_blobs(
+            workspace_cas.as_deref(),
+            &sess.take_elided_blobs(),
+        );
+        if released > 0 {
+            tracing::debug!("退出: 释放 {released} 个 CAS blob 引用");
         }
     }
 

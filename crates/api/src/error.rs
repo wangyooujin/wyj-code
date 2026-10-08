@@ -95,9 +95,17 @@ impl ProviderError {
             429 => ProviderErrorKind::RateLimited,
             529 => ProviderErrorKind::Overloaded,
             500..=599 => ProviderErrorKind::Overloaded,
+            // 各家 400 正文差异很大，只 match 前三句会漏掉 Anthropic 官方
+            // 的 "prompt is too long: 250000 tokens > 200000 maximum"——它一句
+            // 都不含，会掉进下面的 `is_client_error` 被误判成普通 InvalidRequest，
+            // 于是 wyj-code 既不强制压缩也不提示，只能把 400 抛给用户。
             _ if lower.contains("context length")
                 || lower.contains("maximum context")
-                || lower.contains("too many tokens") =>
+                || lower.contains("too many tokens")
+                || lower.contains("prompt is too long")
+                || lower.contains("context_length_exceeded")
+                || lower.contains("input is too long")
+                || lower.contains("reduce the length") =>
             {
                 ProviderErrorKind::ContextLengthExceeded
             }
@@ -170,5 +178,37 @@ mod tests {
         assert_eq!(error.parameter.as_deref(), Some("reasoning"));
         assert_eq!(error.request_id.as_deref(), Some("req-1"));
         assert!(!error.redacted_message.contains("sk-secret-value"));
+    }
+
+    /// 回归：Anthropic 官方的超限文案 `prompt is too long: N tokens > M maximum`
+    /// 一句都不含 "context length" / "maximum context" / "too many tokens"，
+    /// 旧匹配表会把它归成普通 `InvalidRequest` —— 于是 agent 层既不触发
+    /// 强制压缩也不提示，直接把 400 抛给用户。
+    #[test]
+    fn anthropic_prompt_too_long_is_classified_as_context_overflow() {
+        let headers = reqwest::header::HeaderMap::new();
+        let body = r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#;
+        let error = ProviderError::from_http(reqwest::StatusCode::BAD_REQUEST, &headers, body);
+        assert_eq!(error.kind, ProviderErrorKind::ContextLengthExceeded);
+    }
+
+    #[test]
+    fn openai_maximum_context_length_is_classified_as_context_overflow() {
+        let headers = reqwest::header::HeaderMap::new();
+        let body = r#"{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens."}}"#;
+        let error = ProviderError::from_http(reqwest::StatusCode::BAD_REQUEST, &headers, body);
+        assert_eq!(error.kind, ProviderErrorKind::ContextLengthExceeded);
+    }
+
+    /// 放宽匹配表不能误伤：普通 400 仍是 InvalidRequest。
+    #[test]
+    fn ordinary_bad_request_stays_invalid_request() {
+        let headers = reqwest::header::HeaderMap::new();
+        let error = ProviderError::from_http(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            r#"{"error":{"message":"messages must alternate user and assistant"}}"#,
+        );
+        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
     }
 }

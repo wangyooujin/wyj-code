@@ -78,6 +78,106 @@ impl Command for CompactCmd {
     }
 }
 
+// ── /context ─────────────────────────────────────────────────────────────────
+// 上下文占用分解面板。状态栏自 v1.5.17 起不再显示占用百分比（压缩已完全自动化，
+// 且旧百分比算的是 messages-only 口径、与压缩阈值对不上号），所以愿意关心上下文
+// 的人改用这个命令主动查——这里的数字与自动压缩的触发计算**同源**。
+pub struct ContextCmd;
+
+#[async_trait]
+impl Command for ContextCmd {
+    fn name(&self) -> &str {
+        "context"
+    }
+    fn description(&self) -> String {
+        tr("context.desc")
+    }
+    fn usage(&self) -> String {
+        tr("context.usage")
+    }
+    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        let window = ctx.context_window;
+        let mut text = format!("{}\n\n", tr("context.header"));
+
+        let Some(audit) = ctx.context_audit.filter(|_| window > 0) else {
+            text.push_str(&tr("context.empty"));
+            return Ok(CommandResult::Output(text));
+        };
+
+        let total = audit.total();
+        let pct = if window > 0 {
+            total as f64 / window as f64 * 100.0
+        } else {
+            0.0
+        };
+        // 压缩阈值 = 窗口 - buffer。buffer 必须覆盖输出预留，否则压缩完
+        // 再加 max_tokens 还是会撞穿（见 compact_trigger_buffer）。
+        let buffer = wyj_core::compact::compact_trigger_buffer(window, audit.output_reserve);
+        let threshold = window.saturating_sub(buffer);
+
+        let rows: [(String, u32); 6] = [
+            (tr("context.system"), audit.system_tokens),
+            (tr("context.tools"), audit.tool_schema_tokens),
+            (tr("context.history"), audit.history_tokens),
+            (tr("context.output"), audit.output_reserve),
+            (tr("context.framing"), audit.framing_tokens),
+            (tr("context.total"), total),
+        ];
+        for (label, value) in rows {
+            text.push_str(&format!("  {label:<18}{:>9}\n", fmt_num(value)));
+        }
+
+        text.push_str(&tr_fmt(
+            "context.summary",
+            &[
+                ("total", &fmt_num(total)),
+                ("window", &fmt_num(window)),
+                ("pct", &format!("{pct:.0}")),
+                ("threshold", &fmt_num(threshold)),
+            ],
+        ));
+
+        // 可回收的旧工具结果：目前**只统计不删除**（第 3 批的 context editing
+        // 才会真的回收），如实告知用户有多少是"已经用不上但仍占着窗口"的。
+        if audit.reclaimable_tool_result_tokens > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "context.reclaimable",
+                &[
+                    ("tokens", &fmt_num(audit.reclaimable_tool_result_tokens)),
+                    (
+                        "kept",
+                        &wyj_core::compact::RECLAIM_KEEP_RECENT_TOOL_CALLS.to_string(),
+                    ),
+                ],
+            ));
+        }
+
+        // 已清理量：把「已经省下多少」和「还能省多少」放在一起，否则用户看到
+        // 一个持续增长的可回收量却看不到它有没有被处理过。
+        if ctx.context_edit.0 > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "context.edited",
+                &[
+                    ("count", &ctx.context_edit.0.to_string()),
+                    ("saved", &fmt_num(ctx.context_edit.1)),
+                ],
+            ));
+        }
+
+        if ctx.compact_count > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "context.compacted",
+                &[("times", &ctx.compact_count.to_string())],
+            ));
+        }
+
+        Ok(CommandResult::Output(text))
+    }
+}
+
 // ── /new ────────────────────────────────────────────────────────────────────
 // 对齐 Claude Code `/new`：开启新会话，自动保存当前会话历史到磁盘后分配新
 // session_id、清空 TUI 内存状态。无二次确认弹窗（用户已经明确输入了命令名）。
@@ -267,8 +367,15 @@ impl Command for CostCmd {
         let input = ctx.input_tokens;
         let output = ctx.output_tokens;
         let total = input + output;
+        // 百分比口径与自动压缩同源：优先用 request 级 audit（含 system +
+        // 工具 schema + 输出预留），退回旧的 messages-only 估算只在还没
+        // 发起过模型请求时才会发生。
+        let ctx_estimated = ctx
+            .context_audit
+            .map(|audit| audit.total())
+            .unwrap_or(ctx.estimated_tokens);
         let ctx_pct = if ctx.context_window > 0 {
-            ctx.estimated_tokens as f64 / ctx.context_window as f64 * 100.0
+            ctx_estimated as f64 / ctx.context_window as f64 * 100.0
         } else {
             0.0
         };
@@ -351,7 +458,7 @@ impl Command for CostCmd {
             "cost.context_line",
             &[
                 ("pct", &format!("{ctx_pct:.0}")),
-                ("estimated", &fmt_num(ctx.estimated_tokens)),
+                ("estimated", &fmt_num(ctx_estimated)),
                 ("window", &fmt_num(ctx.context_window)),
             ],
         );
@@ -1040,92 +1147,6 @@ impl Command for ComputerCmd {
     }
 }
 
-// ── /decision ─────────────────────────────────────────────────────────────────
-
-/// `/decision [ping | ask <text>]` —— TypeSafe Jev 决策 API 入口。
-///
-/// - `/decision` (无参): 打印帮助 + 当前 `[tools.jev]` 注册状态。
-/// - `/decision ping`: 发最小 noul question 验证 API Key + 网络。
-/// - `/decision ask <text>`: 把 `<text>` 包装成单个 noul question，
-///   state="" + 仅 model 走默认 `jev-latest`，快速拿 yes/no 概率。
-///
-/// HTTP 路径与 `JevTool` 复用同一份（`wyj_tools::jev::dispatch_noul`），
-/// 不在 commands 层重新引入 reqwest。
-pub struct DecisionCmd;
-
-async fn jev_dispatch(
-    state: &str,
-    instructions: &str,
-    cfg: &wyj_config::Config,
-) -> Result<CommandResult> {
-    use wyj_tools::DispatchOutcome;
-    match wyj_tools::dispatch_noul(state, instructions, cfg).await {
-        DispatchOutcome::NoKey => Ok(CommandResult::Output(tr("decision.no_key"))),
-        DispatchOutcome::Network(err) => Ok(CommandResult::Output(tr_fmt(
-            "decision.network_error",
-            &[("err", &err)],
-        ))),
-        DispatchOutcome::Http { status, body } => Ok(CommandResult::Output(tr_fmt(
-            "decision.http_error",
-            &[("status", &status.to_string()), ("body", body.trim())],
-        ))),
-        DispatchOutcome::Parse(err) => Ok(CommandResult::Output(tr_fmt(
-            "decision.parse_error",
-            &[("err", &err)],
-        ))),
-        DispatchOutcome::Success { noul, pretty } => {
-            // 优先展示 `answers.answer.noul`（ping 路径），其它情况回退到原始 JSON。
-            if let Some(n) = noul {
-                Ok(CommandResult::Output(tr_fmt(
-                    "decision.ping_success",
-                    &[("noul", &format!("{n:.3}"))],
-                )))
-            } else {
-                Ok(CommandResult::Output(pretty))
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl Command for DecisionCmd {
-    fn name(&self) -> &str {
-        "decision"
-    }
-    fn description(&self) -> String {
-        tr("decision.desc")
-    }
-    fn usage(&self) -> String {
-        tr("decision.usage")
-    }
-    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        let cfg = wyj_config::Config::load()?;
-        let mut rest = args.trim();
-        let sub = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !sub.is_empty() {
-            // 消耗掉子命令词
-            rest = rest[sub.len()..].trim_start();
-        }
-
-        match sub.as_str() {
-            "" => Ok(CommandResult::Output(tr("decision.help"))),
-            "ping" => jev_dispatch("", "is the connection alive", &cfg).await,
-            "ask" => {
-                let question = rest;
-                if question.is_empty() {
-                    return Ok(CommandResult::Output(tr("decision.help")));
-                }
-                jev_dispatch("", question, &cfg).await
-            }
-            _ => Ok(CommandResult::Output(tr("decision.help"))),
-        }
-    }
-}
-
 // ── /model ────────────────────────────────────────────────────────────────────
 
 pub struct ModelCmd;
@@ -1641,6 +1662,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(ContextCmd));
     reg.register(Arc::new(NewCmd));
     reg.register(Arc::new(CheckpointCmd));
     reg.register(Arc::new(RewindCmd));
@@ -1655,7 +1677,6 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
-    reg.register(Arc::new(DecisionCmd));
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
@@ -1695,6 +1716,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(HelpCmd));
     reg.register(Arc::new(ClearCmd));
     reg.register(Arc::new(CompactCmd));
+    reg.register(Arc::new(ContextCmd));
     reg.register(Arc::new(NewCmd));
     reg.register(Arc::new(CheckpointCmd));
     reg.register(Arc::new(RewindCmd));
@@ -1709,7 +1731,6 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
-    reg.register(Arc::new(DecisionCmd));
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
@@ -1745,6 +1766,9 @@ mod help_tests {
             cache_write_tokens: 0,
             context_window: 0,
             estimated_tokens: 0,
+            context_audit: None,
+            compact_count: 0,
+            context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
@@ -1819,6 +1843,9 @@ mod agents_tests {
             cache_write_tokens: 0,
             context_window: 0,
             estimated_tokens: 0,
+            context_audit: None,
+            compact_count: 0,
+            context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
@@ -1858,6 +1885,9 @@ mod subagents_tests {
             cache_write_tokens: 0,
             context_window: 0,
             estimated_tokens: 0,
+            context_audit: None,
+            compact_count: 0,
+            context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
@@ -1899,6 +1929,82 @@ mod subagents_tests {
         match result {
             CommandResult::Output(text) => assert!(text.contains("not-a-number")),
             other => panic!("expected Output error text, got {other:?}"),
+        }
+    }
+
+    // ── /context ──────────────────────────────────────────────────────
+
+    fn ctx_with_audit(
+        audit: Option<wyj_core::compact::ContextAudit>,
+        window: u32,
+    ) -> CommandContext {
+        let mut ctx = empty_ctx();
+        ctx.context_window = window;
+        ctx.context_audit = audit;
+        ctx
+    }
+
+    #[tokio::test]
+    async fn context_without_audit_reports_no_request_yet() {
+        let ctx = ctx_with_audit(None, 200_000);
+        let result = ContextCmd.run("", &ctx).await.unwrap();
+        match result {
+            // 用 i18n key 本身做断言而不是硬编码中文——测试跑在任意 locale 下
+            // 都成立（`set_locale` 是进程级全局状态，不能在测试里改）。
+            CommandResult::Output(text) => {
+                assert!(text.contains(&tr("context.empty")), "got: {text}")
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    /// 面板里的合计必须与压缩决策同源：`audit.total()` 直接等于阈值判定用的值，
+    /// 不是 messages-only 的旧估算。回归背景：旧 `/cost` 百分比与压缩阈值差
+    /// 一万多 token（200K 窗口下 6 个以上百分点）。
+    #[tokio::test]
+    async fn context_panel_uses_the_same_accounting_as_compaction() {
+        let audit = wyj_core::compact::ContextAudit {
+            system_tokens: 2_000,
+            tool_schema_tokens: 5_000,
+            history_tokens: 100_000,
+            output_reserve: 8_192,
+            framing_tokens: 300,
+            reclaimable_tool_result_tokens: 0,
+        };
+        let ctx = ctx_with_audit(Some(audit), 200_000);
+        let result = ContextCmd.run("", &ctx).await.unwrap();
+        match result {
+            CommandResult::Output(text) => {
+                // `fmt_num` 可能带千分位，断言前先归一化。
+                let flat = text.replace(',', "");
+                assert!(flat.contains(&audit.total().to_string()), "got: {text}");
+                // 阈值 = 200K - max(8192+8192, 20000) = 180K
+                assert!(
+                    flat.contains("180000"),
+                    "阈值未按新 buffer 公式显示: {text}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_panel_surfaces_reclaimable_tool_results() {
+        let audit = wyj_core::compact::ContextAudit {
+            history_tokens: 100_000,
+            reclaimable_tool_result_tokens: 23_100,
+            ..Default::default()
+        };
+        let ctx = ctx_with_audit(Some(audit), 200_000);
+        match ContextCmd.run("", &ctx).await.unwrap() {
+            CommandResult::Output(text) => {
+                // `fmt_num` 可能带千分位，断言前先把它归一化掉。
+                assert!(
+                    text.replace(',', "").contains("23100"),
+                    "可回收量未显示: {text}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
         }
     }
 

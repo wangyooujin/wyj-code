@@ -1097,6 +1097,27 @@ async fn main() -> Result<()> {
         cfg.storage.cas_max_blob_bytes,
     )
     .map(std::sync::Arc::new);
+    // v1.5.17：CAS 启动期容量回收。`gc` 只回收 `ref_count == 0` 的 blob，
+    // 而 ref_count 靠"会话结束时逐个 release"归零 —— 两个机制缺一，pool 就是
+    // 无界增长。此前 `cas_total_bytes` / `cas_gc_on_start` 因"无消费点"被删，
+    // 现在 `core::context_edit` 让它们有了真实消费点。
+    if cfg.storage.cas_gc_on_start {
+        if let Some(cas) = workspace_cas.as_ref() {
+            if cfg.storage.cas_total_bytes > 0 {
+                match cas.gc(cfg.storage.cas_total_bytes) {
+                    Ok(stats) if stats.deleted_blobs > 0 => tracing::debug!(
+                        "CAS gc: 扫描 {} 个 blob / {} 字节，回收 {} 个 / {} 字节",
+                        stats.scanned_blobs,
+                        stats.total_bytes,
+                        stats.deleted_blobs,
+                        stats.freed_bytes
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!("CAS gc 失败: {error}"),
+                }
+            }
+        }
+    }
     // checkpoint 构造配置注入进程全局。TUI 侧有 7 处构造点必须走
     // `CheckpointStore::configured`,否则会退回裸 `new()` 的"不限条数 +
     // 不接 CAS"语义 —— `attach_agent_session` 更会覆盖掉这里装配好的
@@ -1249,6 +1270,11 @@ async fn main() -> Result<()> {
     registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
     if let Some(memory) = &memory_v3_store {
         registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+        // CAS 可用时必须注册 ContextRecall：否则被外部化的工具输出对模型
+        // 就是不可逆的损失（尤其 Bash / WebFetch 重跑也拿不回）。
+        if let Some(t) = wyj_tools::context_recall::tool_for_cas(workspace_cas.clone()) {
+            registry.register_arc(Arc::new(t));
+        }
     }
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
@@ -1341,9 +1367,6 @@ async fn main() -> Result<()> {
     // 截图作为 image block 塞进 tool_result），见该函数文档。
     register_window_capture_tool_if_enabled(&mut registry, &cfg);
     register_app_computer_tool_if_enabled(&mut registry, &cfg);
-    // Jev 决策 API（typesafe.ai System One）：门控 = enabled + API Key 可解析。
-    // 返回值决定下面是否追加 JEV_HINT（教模型在多路决策场景主动调用）。
-    let jev_enabled = register_jev_tool_if_enabled(&mut registry, &cfg);
 
     // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
     // + 已启用插件贡献的 agent 定义 + --plugin-dir 临时加载的 agent 定义
@@ -1376,6 +1399,7 @@ async fn main() -> Result<()> {
         code_index.clone(),
         memory_v3_store.clone(),
         evolution_store.clone(),
+        workspace_cas.clone(),
     );
     registry.register_arc(Arc::new(
         SubAgentTool::new_shared(shared_agent_defs.clone(), sub_agent_hub.clone(), {
@@ -1521,15 +1545,6 @@ async fn main() -> Result<()> {
         system_prompt_extra.push_str(extra);
     }
 
-    // Jev 已注册：教模型在多路决策/分类/guardrails 场景主动调用，拿到结构化
-    // answers + confidence 而不是凭直觉猜。
-    if jev_enabled {
-        let extra = wyj_core::prompts::JEV_HINT;
-        agent = agent.append_system(extra);
-        system_prompt_extra.push_str("\n\n");
-        system_prompt_extra.push_str(extra);
-    }
-
     // Active plugin output style is a model-facing instruction, independent of UI locale. Keep
     // it out of `system_prompt_extra`: rebuild_fn installs it directly so scoped/headless model
     // switches receive the same style without the TUI appending it twice.
@@ -1573,7 +1588,17 @@ async fn main() -> Result<()> {
     // 在每次 `provider.stream()` 之前按同一上限（与 `SessionStore::save`
     // / `SessionStore::load` 共用）对 `session.messages` 做截断，防止长
     // `ContentBlock::Text` / `ToolResult` 撞穿模型上下文窗口。
+    // 进程级累计统计：Agent 被 `/model` 重建后仍能延续同一份数字。
+    let context_edit_totals =
+        std::sync::Arc::new(wyj_core::context_edit::ContextEditTotals::default());
     agent = agent.with_persist_cap(Some(cfg.persist_cap.clone()));
+    // tool-result context editing：超阈值时先把过期工具输出外部化到 CAS，
+    // 清理得动就不跑整段摘要。CAS 不可用（目录不可写）时整体降级关闭。
+    agent = agent.with_context_edit(build_context_edit_cfg(
+        &cfg,
+        workspace_cas.clone(),
+        context_edit_totals.clone(),
+    ));
 
     for def in registry.definitions() {
         let name = def.name.clone();
@@ -1745,6 +1770,8 @@ async fn main() -> Result<()> {
     let hook_runner_for_rebuild = hook_runner.clone();
     let checkpoint_store_for_rebuild = checkpoint_store.clone();
     let mcp_tools_for_rebuild = mcp_tools.clone();
+    let workspace_cas_for_rebuild = workspace_cas.clone();
+    let context_edit_totals_for_rebuild = context_edit_totals.clone();
     let code_index_for_rebuild = code_index.clone();
     let plugin_output_style_for_rebuild = plugin_output_style.clone();
     let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
@@ -1788,6 +1815,11 @@ async fn main() -> Result<()> {
         // `cfg.persist_cap` 注入,确保切换 Profile 后仍按同一上限守住
         // 单次 stream 不会撞穿模型上下文窗口。
         new_agent = new_agent.with_persist_cap(Some(cfg.persist_cap.clone()));
+        new_agent = new_agent.with_context_edit(build_context_edit_cfg(
+            cfg,
+            workspace_cas_for_rebuild.clone(),
+            context_edit_totals_for_rebuild.clone(),
+        ));
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
@@ -1816,6 +1848,11 @@ async fn main() -> Result<()> {
         reg.register_arc(Arc::new(AskQuestionTool::new()));
         if let Some(memory) = &memory_v3_for_rebuild {
             reg.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+            if let Some(t) =
+                wyj_tools::context_recall::tool_for_cas(workspace_cas_for_rebuild.clone())
+            {
+                reg.register_arc(Arc::new(t));
+            }
         }
         if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
             reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
@@ -1833,6 +1870,7 @@ async fn main() -> Result<()> {
             code_index_for_rebuild.clone(),
             memory_v3_for_rebuild.clone(),
             evolution_store_for_rebuild.clone(),
+            workspace_cas_for_rebuild.clone(),
         );
         reg.register_arc(Arc::new(
             SubAgentTool::new_shared(
@@ -1913,6 +1951,7 @@ async fn main() -> Result<()> {
             session.total_input_tokens = file.input_tokens;
             session.total_output_tokens = file.output_tokens;
             session.routing_events = file.routing_events;
+            session.compact_count = file.compact_count;
             session.current_checkpoint_id = file.current_checkpoint_id;
             session.branch_parent_session_id = file.branch_parent_session_id;
             session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
@@ -2023,6 +2062,9 @@ async fn main() -> Result<()> {
                 output_tokens: out_tok,
                 messages: session.messages.clone(),
                 routing_events: session.routing_events.clone(),
+                compact_count: session.compact_count,
+                elided_blobs: session.elided_blobs.clone(),
+                context_edit_freed_tokens: session.context_edit_freed_tokens,
                 current_checkpoint_id: session.current_checkpoint_id.clone(),
                 branch_parent_session_id: session.branch_parent_session_id.clone(),
                 branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
@@ -2049,6 +2091,7 @@ async fn main() -> Result<()> {
             mcp_tools.clone(),
             sub_agent_hub.clone(),
             plugin_runtime.clone(),
+            workspace_cas.clone(),
         )
         .await
     } else {
@@ -2072,6 +2115,7 @@ async fn main() -> Result<()> {
             shared_agent_defs,
             plugin_runtime.clone(),
             matches!(initial_provider, InitialProvider::MissingApiKey),
+            workspace_cas.clone(),
         )
         .await
     };
@@ -2123,6 +2167,34 @@ fn select_sub_agent_tools(
 /// 返回值：是否实际注册了。调用方据此决定要不要追加
 /// `wyj_core::prompts::COMPUTER_USE_HINT`（教模型优先走稳定窗口后台路径、用
 /// Bash 直接启动应用，并把旧 `computer` 视为显式前台兼容能力）。
+/// 把 `Config.context_edit` 装配成 Agent 侧的 `ContextEditCfg`。
+///
+/// CAS 不可用（`~/.wyj-code/cas` 不可写）时返回 `None` —— 清理机制**整体关闭**
+/// 而不是降级成"就地删掉"：没有 CAS 就意味着原文真的会丢，而 Bash / WebFetch
+/// 的输出重跑也拿不回来。
+fn build_context_edit_cfg(
+    cfg: &Config,
+    cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
+    totals: Arc<wyj_core::context_edit::ContextEditTotals>,
+) -> Option<wyj_core::context_edit::ContextEditCfg> {
+    if !cfg.context_edit.enabled {
+        return None;
+    }
+    let cas = cas?;
+    let edit = &cfg.context_edit;
+    Some(wyj_core::context_edit::ContextEditCfg {
+        enabled: true,
+        opts: wyj_core::context_edit::ElideOptions {
+            protect_recent: edit.protect_recent,
+            batch_size: edit.batch_size,
+            min_bytes: edit.min_result_bytes,
+        },
+        max_batches: edit.max_batches,
+        cas,
+        totals,
+    })
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
     let profile = cfg.active_profile();
@@ -2157,54 +2229,6 @@ fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) -> bool {
     false
-}
-
-/// Jev 决策 API（typesafe.ai System One）的注册门控。
-///
-/// 注册条件：`Config.tools.jev.enabled=true` 且 `Config::resolve_jev_api_key()`
-/// 返回 Some。API Key 优先 `TYPESAFE_API_KEY` env，回退到 `[tools.jev].api_key`
-/// 字段；都为空时仅打印一次性 info 提示后跳过注册（不报错——避免无 key
-/// 用户被噪声干扰）。
-///
-/// 返回 `true` 表示已注册；调用方据此决定是否在 system prompt 末尾追加
-/// `wyj_core::prompts::JEV_HINT`，与 `register_computer_tool_if_enabled` 同款
-/// 模式。Budget 计数器随 Tool 一起走 process-wide（不持久化），与 plan 中
-/// "日 = 进程生命周期累计"语义一致。
-fn register_jev_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
-    if !cfg.tools.jev.enabled {
-        return false;
-    }
-    let api_key = match cfg.resolve_jev_api_key() {
-        Some(k) => k,
-        None => {
-            tracing::info!(
-                "[tools.jev] enabled=true 但未找到 API Key（设置 TYPESAFE_API_KEY 或 [tools.jev].api_key），跳过注册"
-            );
-            return false;
-        }
-    };
-    let base_url = cfg.resolve_jev_base_url();
-    let model = cfg.tools.jev.model.clone();
-    let max_questions = cfg.tools.jev.max_questions;
-    let max_state_chars = cfg.tools.jev.max_state_chars;
-    let max_retries = cfg.tools.jev.max_retries;
-    let budget = Arc::new(wyj_tools::JevBudget::new(cfg.tools.jev.daily_budget_usd));
-    registry.register_arc(Arc::new(wyj_tools::JevTool::new(
-        api_key,
-        base_url,
-        model,
-        max_questions,
-        max_state_chars,
-        max_retries,
-        budget,
-    )));
-    tracing::info!(
-        "[tools.jev] registered (base_url={}, model={}, daily_budget_usd={})",
-        cfg.resolve_jev_base_url(),
-        cfg.tools.jev.model,
-        cfg.tools.jev.daily_budget_usd,
-    );
-    true
 }
 
 /// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v1.4，见
@@ -2254,6 +2278,7 @@ fn make_sub_agent_factory(
     code_index: Arc<dyn wyj_core::CodeIndex>,
     memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
     evolution: Option<Arc<wyj_core::EvolutionStore>>,
+    workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
         let routing_role = if def.name.eq_ignore_ascii_case("explore") {
@@ -2339,6 +2364,11 @@ fn make_sub_agent_factory(
         sub_registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
         if let Some(memory) = &memory_v3 {
             sub_registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+            // 子 Agent 同样需要召回：清理发生在**主**会话历史里，子 Agent
+            // 读到的 transcript 也含占位符。
+            if let Some(t) = wyj_tools::context_recall::tool_for_cas(workspace_cas.clone()) {
+                sub_registry.register_arc(Arc::new(t));
+            }
         }
         // WebSearch：与主 Agent 同样的"仅配置了 search_api_key 才注册"语义，
         // 让子 Agent 类型定义（如 general-purpose 的 tools: None）能拿到它。
@@ -2696,6 +2726,7 @@ async fn repl(
     mcp_tools: wyj_tools::SharedMcpTools,
     sub_agent_hub: Arc<wyj_tools::SubAgentHub>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
 ) -> Result<()> {
     use std::io::BufRead;
     println!(
@@ -2860,7 +2891,16 @@ async fn repl(
             // 取当前 Profile 真实的窗口，而不是写死 200K —— 否则非 200K
             // 模型下 /context 的占用百分比会算错。
             context_window: cfg.active_profile().context_window,
-            estimated_tokens: wyj_core::estimate_tokens(&session.messages),
+            estimated_tokens: session
+                .context_audit
+                .total()
+                .max(wyj_core::estimate_tokens(&session.messages)),
+            context_audit: (session.context_audit.total() > 0).then_some(session.context_audit),
+            compact_count: session.compact_count,
+            context_edit: (
+                wyj_core::context_edit::elided_count(&session.messages) as u32,
+                session.context_edit_freed_tokens,
+            ),
             home_dir,
             sub_input_tokens: 0,
             sub_output_tokens: 0,
@@ -2875,6 +2915,12 @@ async fn repl(
                     println!("{out}");
                 }
                 Ok(CommandResult::ClearHistory) => {
+                    // 见 TUI /clear：clear_conversation 会连 elided_blobs 一起
+                    // 清空，必须先 release，否则 CAS blob 永久泄漏。
+                    wyj_core::context_edit::release_session_blobs(
+                        workspace_cas.as_deref(),
+                        &session.take_elided_blobs(),
+                    );
                     session.clear_conversation();
                     println!("对话已清空。");
                 }
@@ -2993,6 +3039,9 @@ async fn repl(
                         output_tokens: session.total_output_tokens,
                         messages: session.messages.clone(),
                         routing_events: session.routing_events.clone(),
+                        compact_count: session.compact_count,
+                        elided_blobs: session.elided_blobs.clone(),
+                        context_edit_freed_tokens: session.context_edit_freed_tokens,
                         current_checkpoint_id: session.current_checkpoint_id.clone(),
                         branch_parent_session_id: session.branch_parent_session_id.clone(),
                         branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
@@ -3299,12 +3348,23 @@ async fn repl(
             output_tokens: session.total_output_tokens,
             messages: session.messages.clone(),
             routing_events: session.routing_events.clone(),
+            compact_count: session.compact_count,
+            elided_blobs: session.elided_blobs.clone(),
+            context_edit_freed_tokens: session.context_edit_freed_tokens,
             current_checkpoint_id: session.current_checkpoint_id.clone(),
             branch_parent_session_id: session.branch_parent_session_id.clone(),
             branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
             title_generated: false,
         });
     }
+    // 保存完成后释放本会话被 context editing 外部化的 CAS blob 引用。
+    // 顺序很重要：`save` 需要 `elided_blobs` 写进 SessionFile（下次 resume 的
+    // 会话要接管这些引用，并在它自己结束时释放），所以 release 必须在其后。
+    // 会话没了就没人会召回它们；不 release 则 ref_count 停在 1，gc 永远删不掉。
+    wyj_core::context_edit::release_session_blobs(
+        workspace_cas.as_deref(),
+        &session.take_elided_blobs(),
+    );
     println!("再见！");
     Ok(())
 }
