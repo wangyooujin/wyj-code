@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod claude_md;
 pub mod code_index;
 pub mod compact;
+pub mod context_edit;
 pub mod disk_usage;
 pub mod eval;
 pub mod evolution;

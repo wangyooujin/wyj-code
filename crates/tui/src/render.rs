@@ -2602,24 +2602,6 @@ fn interaction_usage_text(state: &AppState) -> String {
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let (used, total) = (state.context_tokens, state.context_window);
-    let pct = if total > 0 {
-        (used as f64 / total as f64).min(1.0)
-    } else {
-        0.0
-    };
-    let bar_width = 8usize;
-    let filled = ((pct * bar_width as f64).round() as usize).min(bar_width);
-    let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-    let pct_int = (pct * 100.0).round() as u32;
-
-    let progress_style = if pct >= 0.90 {
-        Theme::progress_danger()
-    } else if pct >= 0.70 {
-        Theme::progress_warn()
-    } else {
-        Theme::progress_normal()
-    };
     let usage_text = interaction_usage_text(state);
 
     let cwd_str = {
@@ -2677,16 +2659,40 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         AgentMode::Bypass => " [bypass]",
         AgentMode::Normal => "",
     };
+    // 自动压缩的**语义**指示：只报次数，不报占比。压缩对用户不可见，除以
+    // 数字之外必须让"自动管理发生过"本身可见，否则就成了黑盒。
+    let compact_chip = if state.compact_count > 0 {
+        format!(
+            " · {}",
+            wyj_i18n::tr_fmt(
+                "status.auto_compacted",
+                &[("times", &state.compact_count.to_string())],
+            )
+        )
+    } else {
+        String::new()
+    };
+
     let left_text = format!(
-        " ◆ {}{} · [{}] {}% · {} · {}",
-        state.model_name, mode_str, bar, pct_int, usage_text, cwd_str
+        " ◆ {}{}{} · {} · {}",
+        state.model_name, mode_str, compact_chip, usage_text, cwd_str
     );
     let right_len = right_help.chars().count();
     let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
 
     // thinking 指示器已迁回 `draw_input` 标题栏（"⠋ Thinking.." 紧贴用户输入框），
-    // 状态栏保持单一职责：左侧"模型 + 进度 + 用量 + cwd"，右侧在按 Ctrl+C / 排队时
-    // 给出对应提示；不再额外画 spinner，避免上下两处同时闪烁 + 与标题栏文字打架。
+    // 状态栏保持单一职责：左侧"模型 + 压缩次数 + 用量 + cwd"，右侧在按 Ctrl+C /
+    // 排队时给出对应提示；不再额外画 spinner，避免上下两处同时闪烁 + 与标题栏
+    // 文字打架。
+    //
+    // 这里**刻意不显示上下文占用百分比**（v1.5.17 移除）。三个理由：
+    //   1. 旧实现算的是 `estimate_tokens(messages)`，压缩决策算的是
+    //      `estimate_request_tokens`（含 system + 工具 schema + 输出预留），
+    //      两者差 1 万+ token，在 200K 窗口下就是 6 个以上百分点的系统性
+    //      低报——条的颜色和实际压缩时机对不上号。Anthropic 官方文档也
+    //      明确警告过 statusline 的 `used_percentage` 不指示压缩时机。
+    //   2. 压缩已完全自动化，百分比对用户没有可操作性，只是持续制造焦虑。
+    //   3. 想看的人可以主动查 `/context`，那里是同源口径的精确分解。
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         " ◆ ",
@@ -2698,10 +2704,11 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     if let Some(ms) = mode_span {
         spans.push(ms);
     }
+    if !compact_chip.is_empty() {
+        spans.push(Span::styled(compact_chip, Theme::dim()));
+    }
     spans.extend([
-        Span::styled(" · [".to_string(), Theme::dim()),
-        Span::styled(bar, progress_style),
-        Span::styled(format!("] {}% · ", pct_int), Theme::dim()),
+        Span::styled(" · ".to_string(), Theme::dim()),
         Span::styled(usage_text, Style::default().fg(Color::Cyan)),
         Span::styled(format!(" · {}", cwd_str), Theme::dim()),
         Span::raw(" ".repeat(pad)),
@@ -6271,6 +6278,90 @@ mod tool_result_fold_tests {
         assert!(
             !last_line.contains("/help"),
             "状态栏最末行不应再渲染 /help 入口提示, 实际: {last_line:?}"
+        );
+    }
+
+    /// v1.5.17：状态栏不再显示上下文占用百分比与进度条。
+    ///
+    /// 回归背景有两条，缺一不可：
+    ///   1. 旧实现算的是 `estimate_tokens(messages)`，而自动压缩决策算的是
+    ///      `estimate_request_tokens`（含 system + 工具 schema + 输出预留），
+    ///      两者差 1 万+ token —— 条的颜色和实际压缩时机对不上号。
+    ///   2. 压缩已完全自动化，占比对用户没有可操作性；精确分解改走 `/context`。
+    #[test]
+    fn draw_status_omits_context_percentage_and_bar() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = false;
+        // 故意把占用顶到接近满格，确保不是"因为占比低所以没显示"。
+        state.context_window = 200_000;
+        let input = InputBox::new();
+
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let buffer = terminal.backend().buffer().clone();
+        let last_line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
+            .collect();
+
+        assert!(
+            !last_line.contains('%'),
+            "状态栏不应再出现上下文占用百分比, 实际: {last_line:?}"
+        );
+        assert!(
+            !last_line.contains('█') && !last_line.contains('░'),
+            "状态栏不应再出现进度条, 实际: {last_line:?}"
+        );
+    }
+
+    /// 反向锁：压缩发生过时状态栏必须给出**语义**指示（次数），否则
+    /// "系统替我丢过历史"就成了黑盒 —— 这正是去掉百分比后必须补上的可见性。
+    #[test]
+    fn draw_status_shows_auto_compacted_chip_when_history_was_summarized() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+
+        let mut state = make_state();
+        state.is_thinking = false;
+        state.compact_count = 0;
+        let input = InputBox::new();
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+        let without: String = {
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
+                .collect()
+        };
+        assert!(
+            !without.contains("×0"),
+            "从未压缩过时不显示该指示, 实际: {without:?}"
+        );
+
+        state.compact_count = 3;
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+        let with: String = {
+            let buffer = terminal.backend().buffer().clone();
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
+                .collect()
+        };
+        assert!(
+            with.contains('×') && with.contains('3'),
+            "压缩 3 次后状态栏应显示计数指示, 实际: {with:?}"
         );
     }
 

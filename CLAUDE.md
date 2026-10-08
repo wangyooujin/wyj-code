@@ -82,23 +82,24 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）
 search_api_key = ""          # WebSearch API Key，优先读环境变量 WYJ_CODE_SEARCH_API_KEY；未配置则 WebSearch 工具不注册（模型看不到）
 
-[tools.jev]                  # TypeSafe Jev 决策 API（https://typesafe.ai/，System One 模型）
-                              # Jev 不是 chat 模型——无 stream / 无 multi-turn，仅作主 Agent 主动调用的决策工具
-                              # 用于意图路由 / 分类 / guardrails / 置信度标注，输出结构化 answers + confidence
-enabled = false              # 默认禁用：Jev 是付费 API，显式开启才注册到 ToolRegistry
-api_key = ""                 # 留空读环境变量 TYPESAFE_API_KEY；都为空则工具不注册（与 runtime_api_key 同款"serde skip"语义）
-base_url = ""                # 留空用 https://api.typesafe.ai
-model = "jev-latest"         # 默认 jev-latest（当前 alias 指向 jev-1.13.0）；可在 tool input 中覆盖
-max_questions = 32           # 单次最多 questions 数量（client-side validate，超限直接拒）
-max_state_chars = 32000      # state 字符上限（按 char boundary 安全截断，避免 String::truncate panic）
-max_retries = 2              # 429/5xx 客户端重试上限
-daily_budget_usd = 5.0       # 进程级日预算（输入侧 $0.042/M，输出免费）；0 = 关闭 budget 维度（仍受 size 上限）
-
 [subagent]
 default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组
 explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
 trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
+
+[context_edit]                   # tool-result context editing（v1.5.17+）：
+                                # 超阈值时先把过期工具输出外部化到 CAS，
+                                # **清理优先于整段摘要**（对齐 Claude Code 的
+                                # "clears older tool outputs first, then summarizes
+                                # the conversation if needed"）。
+                                # 详见架构节「上下文压缩」与
+                                # doc/plan/v1.5.17-context-management-plan.md
+enabled = true               # false = 完全退回 v1.5.16 行为（只压缩、不清理）
+protect_recent = 3           # 最近 N 个工具结果保留全文（Anthropic keep=3）
+batch_size = 10              # 单批清理条数（每批都会击穿 prompt cache 前缀）
+min_result_bytes = 2000      # 小于此值不清理（省下的不够占位符本身）
+max_batches = 3              # 单请求最多连续清理几批
 
 [notify]                      # 统一通知通道（v1.5.14+）：TUI/CLI 回合完成 / 错误、
                               # 后台子 Agent 完成、cron schedule 失败统一派发到
@@ -160,11 +161,12 @@ args = ["--flag"]
 | Schedule `run.log` | 10 MiB × 3 rotations | `storage.schedule_run_log_*` |
 | 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
+| CAS blob pool（context editing 外部化的工具输出 + checkpoint 文件快照） | 1 GiB，启动时 gc | `storage.cas_total_bytes` / `storage.cas_gc_on_start` |
 | Sub-agent trace | 256 KiB / agent（已存在,不在本批改动） | `subagent.trace_max_bytes_per_agent` |
 | 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K、text 16K+8K、thinking 8K、reasoning_details 8K、tool_use.input 64K(均 head+tail,JSON 值按最长 string 叶子裁剪且保持合法 JSON) | `persist_cap.*` |
 | 顶层 `~/.wyj-code` warn | 5 GiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
 
-**已知缺口**:`sessions/*.json`、`<session_id>.checkpoints/`、`<session_id>.subagents/`、`cas/` 四者**没有任何自动或手动回收路径**(`storage prune` / `doctor` 仍是 TODO 桩);顶层 warn 超阈值时只会提示手动删目录。`WorkspaceCas::gc` 已实现但只被单测调用,对应配置项 `cas_total_bytes` / `cas_gc_on_start` / `checkpoint_bytes_per_session` / `checkpoint_ttl_days` 因从无消费点已删除。
+**已知缺口**:`sessions/*.json`、`<session_id>.checkpoints/`、`<session_id>.subagents/` 三者**没有任何自动或手动回收路径**(`storage prune` / `doctor` 仍是 TODO 桩);顶层 warn 超阈值时只会提示手动删目录。`cas/` 已在 v1.5.17 接入回收链路(`storage.cas_total_bytes` + `cas_gc_on_start` 启动时 gc;会话被丢弃时逐个 `release` 让 `ref_count` 归零,否则 gc 永远删不掉),但 gc **只在进程启动时跑一次**,长跑进程内不回收。`checkpoint_bytes_per_session` / `checkpoint_ttl_days` 仍因从无消费点保持删除。
 
 **实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
 
@@ -183,7 +185,7 @@ args = ["--flag"]
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session runtime/events、HistoryStore、MemoryStore、权限、checkpoint、workspace/workflow 接口与本地 CodeIndex |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer/Jev；WebSearch 仅在配置 search_api_key 时注册，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile，Jev 仅在 `[tools.jev].enabled=true` 且 API Key 可解析时注册；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例、jev.rs 决策 API 客户端 + Budget 硬封顶）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer；WebSearch 仅在配置 search_api_key 时注册，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
 | `crates/computer` | `wyj-computer` | computer-use 系统层：`xcap` 截图 + `enigo` 输入合成（两者内部已各自分派 macOS/Windows，本 crate 不再手写 target_os 分支），坐标缩放数学（`scale` 模块，平台无关可测）；仅 `[target.'cfg(any(macos, windows))']` 拉取真实依赖，其余平台编译进桩实现 |
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
@@ -196,7 +198,9 @@ args = ["--flag"]
 
 1. **Tool trait**（`core::tool`）：所有工具实现 `async fn run(input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>`，由 `tools::ToolRegistry` 统一管理。
 2. **Agent 推理循环**（`core::agent::Agent::run_turn`）：流式接收 LLM 输出 → 累积工具调用 → 执行（`Tool::parallel_safe()` 为 true 的调用如 Agent 用 `join_all` 单任务内并发，其余相互保持顺序但与并发组同时进行，结果按原始下标保序回填，见 `exec_tool_call`）→ 将结果追回 session → 继续直到 `stop_reason != tool_use`。注意 `ToolContext` 是 `Send + Sync` 的（旧注释"非 Send"已过时）。
-3. **上下文压缩**（`core::compact`）：估算 token 数按 CJK/非 CJK/图片分别启发式计算；触发缓冲为 `min(40000, max(4000, context_window / 5))`，当 `estimated > context_window - buffer` 时调用 LLM 生成摘要替换旧消息，保留最近 6 条。
+3. **上下文压缩**（`core::compact`，v1.5.17 重整）：`ContextAudit::from_request` 是**唯一的上下文度量口径**——一次性算出 system / 工具 schema / 对话历史 / 输出预留 / 协议开销 / 可回收旧工具结果六项，压缩决策、`/cost`、`/context` 面板全部消费它（此前压缩决策算 request 级、状态栏算 messages-only，两者差 1 万+ token，在 200K 窗口下是 6 个以上百分点的系统性低报）。触发缓冲 `compact_trigger_buffer(cw, max_output) = max(max_output + 8192, cw / 10)`——必须 ≥ `max_tokens`（否则「阈值 + 输出预留 > 窗口」结构性必 400），且随窗口线性伸缩（1M 窗口不再只留 4% 余量）。保留量按 token 预算 `clamp(cw/8, 4K, 32K)` 而非固定条数，配合 `safe_keep_from_budget` 回退到真实用户边界，绝不拆散 tool_use/tool_result 配对。`compact_session_until_fit` 最多 3 轮收敛防裸发。**状态栏自 v1.5.17 起不显示上下文占用百分比**（`draw_status`），只显示 `已自动压缩 ×N` 语义指示（`SessionFile.compact_count` 落盘，`/resume` 后不丢）；精确分解走 `/context`。另有 `ContextLengthExceeded` 恢复路径：provider 报超限时无视阈值强制压缩一次并重试（只重试一次防 thrashing），失败也重入循环让 `truncate_messages` 兜底。
+
+    **清理优先于摘要**（`core::context_edit`，v1.5.17 第 3 批）：超阈值时先把**过期的工具输出外部化到 CAS**（`elide_tool_results`，白名单 `ELIDABLE_TOOLS = [Read, Grep, Glob, Bash, WebFetch]`，最近 `protect_recent=3` 个保留全文，`Edit`/`Write`/`NotebookEdit` 回执永不清理），清理后重估、达标就停手，仍超标才跑 `compact_session_until_fit` —— 顺序对齐 Claude Code 的 "It clears older tool outputs first, then summarizes the conversation if needed"。清理比摘要便宜（无 output token、不幻觉）也更保真（原文没被转述）。关键设计：**模型可见上下文 ≠ 持久 transcript** —— 落盘 session 存占位符（带 `cas://<hash>`）+ 原文在 CAS，`SessionStore::load` 调 `materialize_elided` 还原（resume = 新会话从头开始）。`ContextRecall` 工具按 hash 取回（`ALWAYS_VISIBLE_TOOL_SCHEMAS` 里常驻，否则占位符引用成死路）。**回收链路两个机制缺一不可**：`WorkspaceCas::gc` 只回收 `ref_count == 0` 的 blob，所以 `Session.elided_blobs` 必须随 `SessionFile` 落盘并在会话丢弃时（`/clear` / 退出 / resume 别的会话）逐个 `release`，同时 `storage.cas_total_bytes` + `cas_gc_on_start` 提供进程启动时的容量兜底。配置在 `[context_edit]`，`enabled=false` 完全退回 v1.5.16 行为；CAS 不可写时机制整体关闭（不降级成"就地删掉"）。详见 `doc/plan/v1.5.17-context-management-plan.md`（含 Claude Code / Codex / Goose / Cline / Cursor 的对标调研与失败模式清单）。
 4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
 5. **CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 CLAUDE.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
 6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
@@ -248,7 +252,7 @@ args = ["--flag"]
     - **事件源**：`TurnFinished` / `TurnError` / `SubAgentDone`（仅后台 `run_in_background: true`）/ `ScheduleFailed`；ACP/daemon 长跑后端故意不接通知（`crates/cli/src/acp.rs` `SessionEvent::TurnFinished => {}` 注释里写明原因）。
     - **触发点（7 sites 实际用 6 + daemon 故意跳过 1）**：(a) TUI `apply_agent_event(TurnDone)` 与 (b) `apply_agent_event(Error)` 在 `crates/tui/src/app.rs`，(c) 后台子 Agent 完成（`background=true` 分支），(d) CLI `-p` 单回合完成 与 (e) CLI `--headless` REPL 回合在 `crates/cli/src/main.rs`，(f) cron schedule 任务失败三处在 `crates/cli/src/schedule_cmd.rs`。TUI 与 CLI 共用同一份 dispatcher（`DISPATCHER: Mutex<Option<NotifyDispatcher>>`，`init` 走 first-wins 保护、env override 阶段读取），同一 root session 派生路径天然继承同一份 cfg。
     - **Sink**：`BellSink` 写 stderr `\x07`（raw mode 只影响 stdin line discipline，stderr 不在 alt-screen 范围，跨平台通用）；`DesktopSink` 三平台 `cfg(target_os)` 分支：macOS `osascript -e 'display notification ... with title ...'`、Linux `notify-send --app-name=wyj-code`、Windows PowerShell BurntToast（缺失模块静默 fallback）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。
-    - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done,schedule_failure}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::resolve_jev_api_key` 模式）。
+    - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done,schedule_failure}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::runtime_api_key` 的 env 不回写语义）。
     - **i18n**：title + body 模板统一走 `wyj_i18n::tr("notify.title.*")` / `tr_fmt("notify.body.*")`，模型/工具侧提示词仍为英文常量（CLAUDE.md 「模型侧提示词」节），通知 UI 文案与现有 i18n key 体系一致；`include_session_id=true` 时 body 末尾追加 `[session:<id>]`，总长被 200 字符上限收口（`append_session_id` 内部按 `chars().take(N)` 安全截断）。
     - **进程级初始化路径**：`cli::main()` 构造 `Config` 后立刻 `wyj_core::notify::init(&cfg.notify)`，TUI/CLI -p/REPL 共享这条；`wyj-code schedule run <id>` 子进程路径在 `schedule_cmd::notify_emit_init_default_if_needed()` 用 `NotifyCfg::default()` 兜底 init（cron 触发不在 `main()` 装配链路里，但因主开关 + desktop 默认开，行为对用户透明）。
 

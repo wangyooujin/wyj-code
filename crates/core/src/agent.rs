@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_session_until_fit, compact_trigger_buffer, estimate_request_tokens};
+use crate::compact::{compact_session_until_fit, compact_trigger_buffer, ContextAudit};
 use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
@@ -54,6 +54,9 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "AskQuestion",
     "TodoWrite",
     "Memory",
+    // 清理把工具输出外部化后，模型唯一取回全文的入口。**必须常驻**——
+    // 一旦被 lazy 折叠掉，占位符里的 cas:// 引用就成了死路，清理变成不可逆。
+    "ContextRecall",
     "Agent",
     "ExitPlanMode",
     // COMPUTER_USE_HINT 要求模型直接从稳定窗口发现开始，再走后台动作。
@@ -243,6 +246,9 @@ pub struct Agent {
     /// `None` 表示关闭 runtime 截断(磁盘路径仍由 `SessionStore::save` 自身的
     /// `current_persist_cap()` 全局兜底)。
     persist_cap: Option<wyj_config::PersistCapCfg>,
+    /// tool-result context editing 的装配：`None` = 关闭（不清理旧工具输出）。
+    /// 见 `crate::context_edit` 与 `doc/plan/v1.5.17-context-management-plan.md`。
+    context_edit: Option<crate::context_edit::ContextEditCfg>,
     /// 跨会话记忆快照缓存（system prompt 稳定前缀的一部分）。分桶重算，
     /// 避免每轮改写 system 尾部击穿 prompt cache。用 `Arc<Mutex<..>>` 是为了
     /// 兼容 `Agent: Clone`（TUI `/model` 重建与模式切换都会 clone），
@@ -328,6 +334,7 @@ impl Agent {
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             capability_cache: None,
             persist_cap: None,
+            context_edit: None,
         }
     }
 
@@ -347,6 +354,13 @@ impl Agent {
     /// 模型上下文窗口。
     pub fn with_persist_cap(mut self, cap: Option<wyj_config::PersistCapCfg>) -> Self {
         self.persist_cap = cap;
+        self
+    }
+
+    /// 装配 tool-result context editing。`None` 或 `enabled == false` 时该机制
+    /// 完全不参与，历史只走整段摘要（v1.5.16 及更早的行为）。
+    pub fn with_context_edit(mut self, cfg: Option<crate::context_edit::ContextEditCfg>) -> Self {
+        self.context_edit = cfg.filter(|c| c.enabled);
         self
     }
 
@@ -800,6 +814,80 @@ impl Agent {
         result
     }
 
+    /// 清理过期工具输出，返回清理后的请求估算 token。
+    ///
+    /// 按批推进（每批 `ElideOptions::batch_size` 条），每批后重估；一旦落进
+    /// `compact_threshold` 就停手——**能靠清理解决就不该去花摘要的 LLM 往返**。
+    /// 批数上限 `max_batches` 防"历史里全是可清理项"时一次请求做掉一大手术、
+    /// 把 prompt cache 前缀反复击穿。
+    #[allow(clippy::too_many_arguments)]
+    fn elide_stale_tool_results(
+        &self,
+        session: &mut Session,
+        cfg: &crate::context_edit::ContextEditCfg,
+        compact_threshold: u32,
+        request_system: &wyj_api::SystemPrompt<'_>,
+        request_tools: &[ToolDefinition],
+        max_output_tokens: u32,
+    ) -> u32 {
+        use crate::context_edit::elide_tool_results;
+        use std::sync::atomic::Ordering;
+
+        let mut estimate = ContextAudit::from_request(
+            request_system,
+            &session.messages,
+            request_tools,
+            max_output_tokens,
+        )
+        .total();
+
+        for _ in 0..cfg.max_batches.max(1) {
+            if estimate <= compact_threshold {
+                break;
+            }
+            let stats = elide_tool_results(session, &cfg.cas, &cfg.opts);
+            if stats.elided == 0 {
+                // 没有可清理的了，剩下的超标只能交给 compact。
+                break;
+            }
+            cfg.totals
+                .elided
+                .fetch_add(stats.elided as u32, Ordering::Relaxed);
+            cfg.totals
+                .freed_tokens
+                .fetch_add(stats.freed_tokens, Ordering::Relaxed);
+            // blob 记到 session 上，会话被丢弃时才有据可 release
+            // （CAS 的 gc 只删 ref_count == 0 的 blob，不记就永不回收）。
+            session.elided_blobs.extend(stats.blobs.iter().cloned());
+            session.context_edit_freed_tokens = session
+                .context_edit_freed_tokens
+                .saturating_add(stats.freed_tokens);
+            tracing::debug!(
+                elided = stats.elided,
+                freed_tokens = stats.freed_tokens,
+                "context editing: 已把过期工具输出外部化到 CAS"
+            );
+            estimate = ContextAudit::from_request(
+                request_system,
+                &session.messages,
+                request_tools,
+                max_output_tokens,
+            )
+            .total();
+        }
+
+        // 清理改变了历史构成，审计快照必须同步刷新，否则 `/context` 面板和
+        // 下一次阈值判定会拿着清理前的数字。
+        let audit = ContextAudit::from_request(
+            request_system,
+            &session.messages,
+            request_tools,
+            max_output_tokens,
+        );
+        session.context_audit = audit;
+        audit.total()
+    }
+
     /// 取本次请求要拼进 system 稳定前缀的跨会话记忆快照。
     ///
     /// 按「用户轮次 / [`MEMORY_SNAPSHOT_REFRESH_TURNS`]」分桶：同桶直接复用
@@ -1045,16 +1133,41 @@ impl Agent {
                     .saturating_add(all_schema_tokens.saturating_sub(sent_schema_tokens));
 
                 // 按当前路由目标的真实窗口与能力估算；fallback 模型可能比主模型
-                // 上下文更小，不能复用主模型预算。
-                let estimated = estimate_request_tokens(
+                // 上下文更小，不能复用主模型预算。分解结果落进 session，
+                // 供 TUI 的 `/context` 面板与状态栏和压缩决策**共用同一口径**。
+                let context_audit = ContextAudit::from_request(
                     &request_system,
                     &session.messages,
                     &request_tools,
                     opts.max_tokens,
                 );
-                let compact_threshold = route
-                    .context_window
-                    .saturating_sub(compact_trigger_buffer(route.context_window));
+                let estimated_before = context_audit.total();
+                session.context_audit = context_audit;
+                let compact_threshold = route.context_window.saturating_sub(
+                    compact_trigger_buffer(route.context_window, opts.max_tokens),
+                );
+
+                // 清理优先于摘要：超阈值时先把过期的工具输出外部化掉（更便宜、
+                // 不产生幻觉、更保真），清理后仍超标才跑整段摘要。对齐 Claude
+                // Code 的原话 "It clears older tool outputs first, then summarizes
+                // the conversation if needed."。额外好处是清得动就省掉一次
+                // LLM round-trip + 一份摘要的 output token。
+                let estimated = if estimated_before > compact_threshold {
+                    match self.context_edit.as_ref() {
+                        Some(cfg) => self.elide_stale_tool_results(
+                            session,
+                            cfg,
+                            compact_threshold,
+                            &request_system,
+                            &request_tools,
+                            opts.max_tokens,
+                        ),
+                        None => estimated_before,
+                    }
+                } else {
+                    estimated_before
+                };
+
                 if estimated > compact_threshold {
                     // 循环压缩：单次 compact 不一定够（heuristic 偏低 /
                     // reasoning 模型一轮回巨长 / 上次摘要本身偏长）；
@@ -1074,11 +1187,15 @@ impl Agent {
                         tracing::warn!("上下文压缩失败: {error}");
                     } else if outcome.passes > 0 {
                         if let Some(result) = outcome.last_result {
+                            session.compact_count = session.compact_count.saturating_add(1);
+                            session.last_compact_saved_tokens = result.tokens_saved_estimate;
                             on_text(&wyj_i18n::tr_fmt(
                                 "agent.compacted",
                                 &[
                                     ("removed", &result.messages_removed.to_string()),
                                     ("saved", &result.tokens_saved_estimate.to_string()),
+                                    ("times", &session.compact_count.to_string()),
+                                    ("kept", &result.messages_kept.to_string()),
                                 ],
                             ));
                         }
@@ -1107,6 +1224,11 @@ impl Agent {
                 let mut stream_retries: u32 = 0;
                 let mut effective_opts = opts;
                 let mut parameter_degraded = false;
+                // provider 报「上下文超限」时的强制恢复：阈值估算只是启发式，
+                // 真的撞穿时必须能自愈，而不是把 400 直接抛给用户。
+                // `context_recovered` 保证只重试一次，避免无进展的死循环
+                // （对标 Claude Code 的 "Autocompact is thrashing" 熔断）。
+                let mut context_recovered = false;
                 let result = loop {
                     session.api_calls += 1;
                     let mut stream = match route
@@ -1121,6 +1243,53 @@ impl Agent {
                     {
                         Ok(stream) => stream,
                         Err(error) => {
+                            // 上下文超限：无视阈值强制压一次再重试。压缩失败
+                            // 也照常 `continue`——重入循环体会再跑一遍
+                            // `truncate_messages`（persist_cap 单块截断兜底），
+                            // 那条路能处理"消息太少压不动、但单块超长"的情况。
+                            let context_overflow = !context_recovered
+                                && error
+                                    .downcast_ref::<wyj_api::ProviderError>()
+                                    .map(|e| {
+                                        e.kind == wyj_api::ProviderErrorKind::ContextLengthExceeded
+                                    })
+                                    .unwrap_or(false);
+                            if context_overflow {
+                                context_recovered = true;
+                                on_text(&wyj_i18n::tr("agent.context_overflow"));
+                                match crate::compact::compact_session(
+                                    session,
+                                    route.provider.as_ref(),
+                                    route.context_window,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        session.compact_count =
+                                            session.compact_count.saturating_add(1);
+                                        session.last_compact_saved_tokens =
+                                            result.tokens_saved_estimate;
+                                        on_text(&wyj_i18n::tr_fmt(
+                                            "agent.compacted",
+                                            &[
+                                                ("removed", &result.messages_removed.to_string()),
+                                                (
+                                                    "saved",
+                                                    &result.tokens_saved_estimate.to_string(),
+                                                ),
+                                                ("times", &session.compact_count.to_string()),
+                                                ("kept", &result.messages_kept.to_string()),
+                                            ],
+                                        ));
+                                    }
+                                    Err(compact_error) => {
+                                        tracing::warn!(
+                                            "上下文超限后的强制压缩未能完成: {compact_error}"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let safe_parameter = error
                                 .downcast_ref::<wyj_api::ProviderError>()
                                 .filter(|provider_error| {

@@ -8,21 +8,30 @@ use wyj_api::{
 
 use crate::session::Session;
 
-/// 保留最近 N 条消息不压缩，确保上下文连续性
-const COMPACT_KEEP_RECENT: usize = 6;
+/// 压缩时保留给"最近尾部原文"的 token 预算。
+///
+/// 旧实现用固定条数（6 条），在两种场景下都是错的：工具密集
+/// 回合里 6 条可能就是一整个巨型 tool_result（保留太多，压不下去）；纯对话回合
+/// 里 6 条可能只有 1K token（保留太少，压完仍超标，才需要连跑 3 轮 pass）。
+/// 改为随窗口伸缩的 token 预算后两种场景都对。
+///
+/// 比例与量级参照 Goose 的 `compute_tool_call_cutoff`（`3 × limit / 20000`
+/// clamp 到 10–500）——保留量必须随窗口线性伸缩，否则小窗口被压垮、
+/// 大窗口浪费。
+fn compact_keep_budget(context_window: u32) -> u32 {
+    (context_window / 8).clamp(4_000, 32_000)
+}
+
+/// 低于这个条数就不再压：没有足够的历史值得花一次 LLM 往返。
+const COMPACT_MIN_MESSAGES: usize = 3;
 
 /// `compact_session` 的两种「已无可压缩」信号。
 ///
 /// 与真正的失败（LLM 调用报错、摘要为空）区分开，供
 /// `compact_session_until_fit` 决定是把控制权还给调用方还是上报错误。
-///
-/// 旧实现靠 `error.to_string().contains("消息数量过少")` 做子串匹配来识别：
-/// 这句中文错误文案一旦被 i18n 本地化、或有人调整措辞，判定会静默变成
-/// 「真失败」，`last_error` 被上报并走 warn 分支。typed error 从根上消除
-/// 这个字符串耦合；`Display` 仍输出原来的中文文案，既有日志与单测行为不变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactSkip {
-    /// 消息数不足（`<= COMPACT_KEEP_RECENT + 2`），再压没有意义。
+    /// 消息数不足（`< COMPACT_MIN_MESSAGES`），再压没有意义。
     TooFewMessages(usize),
     /// 找不到不拆散 tool_use / tool_result 配对的安全边界。
     NoSafeBoundary,
@@ -44,49 +53,152 @@ pub fn compact_skip_of(error: &anyhow::Error) -> Option<CompactSkip> {
     error.downcast_ref::<CompactSkip>().copied()
 }
 
-pub fn compact_trigger_buffer(context_window: u32) -> u32 {
-    40_000.min((context_window / 5).max(4_000))
+/// 压缩触发时预留的 buffer（不参与压缩的窗口尾部空间）。
+///
+/// 必须同时满足两个约束，缺一不可：
+///
+/// 1. **不小于本轮输出预留 `max_tokens`**。压缩只是把历史压到阈值以下，真正
+///    决定这次请求会不会撞穿窗口的是 `阈值 + max_tokens`。旧公式固定封顶
+///    40K，在 `max_tokens = 64000` 的配置下会出现
+///    `160K(阈值) + 64K(输出) > 200K(窗口)` 的**结构性必 400**。
+///    这与 Claude Code 官方文档对 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 的说明
+///    一致：调大输出上限会直接吃掉自动压缩前的可用窗口。
+/// 2. **随窗口线性伸缩**。旧公式 `min(40K, cw/5)` 在 1M 窗口下只留 4%
+///    余量（阈值 96%），窗口越大反而触发越晚。改为 `cw / 10` 后
+///    200K → 90%、1M → 90%，与 Codex CLI 的 `window × 0.9` 对齐。
+///
+/// 小窗口靠 `max_tokens + 8_192` 的加法项兜底，不会被比例项压到过激。
+pub fn compact_trigger_buffer(context_window: u32, max_output_tokens: u32) -> u32 {
+    max_output_tokens
+        .saturating_add(8_192)
+        .max(context_window / 10)
 }
 
 #[derive(Debug, Clone)]
 pub struct CompactResult {
     pub messages_removed: usize,
+    /// 压缩后保留原文的尾部消息条数（按 token 预算而非固定条数决定）。
+    pub messages_kept: usize,
     pub tokens_saved_estimate: u32,
+}
+
+/// 一次模型请求的上下文占用分解。
+///
+/// 存在的意义是**消灭两套口径**：旧实现里压缩决策用
+/// [`estimate_request_tokens`]（含 system + tools + 输出预留），而状态栏用
+/// [`estimate_tokens`]（只有 messages），两者能差出 1 万+ token，在 200K
+/// 窗口下就是 6 个以上百分点的系统性低报——进度条和压缩时机对不上号。
+/// 现在压缩决策、展示、`/context` 面板全部共用这一个结构体。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextAudit {
+    /// system prompt（主提示 + env + 记忆快照 + CLAUDE.md 祖先链）。
+    pub system_tokens: u32,
+    /// 本次实际发送的工具定义（已扣除 lazy tool 折叠的部分）。
+    pub tool_schema_tokens: u32,
+    /// 会话历史（messages）。
+    pub history_tokens: u32,
+    /// 输出预留 `max_tokens`。
+    pub output_reserve: u32,
+    /// 每条消息的包装开销 + 协议级固定开销。
+    pub framing_tokens: u32,
+    /// 历史里「超出最近 K 个工具调用」的 tool_result 合计。**只统计、
+    /// 不删除**——第 3 批的 tool_result context editing 才真的回收它；
+    /// 现在先让 `/context` 能如实告诉用户有多少是"可回收"的。
+    pub reclaimable_tool_result_tokens: u32,
+}
+
+/// 保留全文的最近工具调用数，与 Anthropic `clear_tool_uses_20250919`
+/// 的默认 `keep = 3` 对齐。
+pub const RECLAIM_KEEP_RECENT_TOOL_CALLS: usize = 3;
+
+impl ContextAudit {
+    /// 本次请求实际占用的上下文（不含可回收项——那部分目前仍真实占用）。
+    pub fn total(&self) -> u32 {
+        self.system_tokens
+            .saturating_add(self.tool_schema_tokens)
+            .saturating_add(self.history_tokens)
+            .saturating_add(self.output_reserve)
+            .saturating_add(self.framing_tokens)
+    }
+
+    pub fn from_request(
+        system: &wyj_api::SystemPrompt<'_>,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        max_output_tokens: u32,
+    ) -> Self {
+        const REQUEST_OVERHEAD_TOKENS: u32 = 64;
+        const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
+
+        // system 分 stable / volatile 两段（见 wyj_api::SystemPrompt），估算时按
+        // 拼接后的完整文本计，与实际发送的字节保持一致。
+        let system_tokens = estimate_text_tokens(&system.combined()) as u32;
+        let message_overhead = (messages.len() as u32).saturating_mul(MESSAGE_OVERHEAD_TOKENS);
+        let tool_tokens = tools.iter().fold(0u32, |total, tool| {
+            let schema = tool.input_schema.to_string();
+            total.saturating_add(
+                (estimate_text_tokens(&tool.name)
+                    + estimate_text_tokens(&tool.description)
+                    + estimate_text_tokens(&schema)) as u32,
+            )
+        });
+
+        Self {
+            system_tokens,
+            tool_schema_tokens: tool_tokens,
+            history_tokens: estimate_tokens(messages),
+            output_reserve: max_output_tokens,
+            framing_tokens: message_overhead.saturating_add(REQUEST_OVERHEAD_TOKENS),
+            reclaimable_tool_result_tokens: reclaimable_tool_result_tokens(messages),
+        }
+    }
+}
+
+/// 历史中「超出最近 [`RECLAIM_KEEP_RECENT_TOOL_CALLS`] 个工具调用」的
+/// tool_result 合计 token。
+///
+/// 从后往前数工具结果，跳过保留窗口内的，剩下的按出现顺序累加——与
+/// `clear_tool_uses_20250919` "按时间顺序清最旧的" 语义一致。
+pub fn reclaimable_tool_result_tokens(messages: &[Message]) -> u32 {
+    let mut seen = 0usize;
+    let mut reclaimable = 0usize;
+    for block in messages.iter().rev().flat_map(|m| m.content.iter()) {
+        if let ContentBlock::ToolResult { content, .. } = block {
+            seen += 1;
+            if seen > RECLAIM_KEEP_RECENT_TOOL_CALLS {
+                reclaimable += match content {
+                    ToolResultContent::Text(t) => estimate_text_tokens(t),
+                    ToolResultContent::Parts(parts) => parts
+                        .iter()
+                        .map(|p| match p {
+                            wyj_api::types::ToolResultPart::Text { text } => {
+                                estimate_text_tokens(text)
+                            }
+                            wyj_api::types::ToolResultPart::Image { data, .. } => {
+                                estimate_image_tokens(data.len())
+                            }
+                        })
+                        .sum(),
+                    ToolResultContent::Blocks(v) => {
+                        v.iter().map(|x| estimate_text_tokens(&x.to_string())).sum()
+                    }
+                };
+            }
+        }
+    }
+    reclaimable as u32
 }
 
 /// 估算一整次模型请求占用的上下文，而不是只看会话历史。
 ///
-/// 自动压缩的目标是避免下一次 `Provider::stream` 超出模型窗口；该请求实际还会
-/// 携带 system prompt、工具定义，并要为输出预留 `max_tokens`。所有供应商的分词
-/// 器和消息包装开销并不相同，因此这仍是保守估算，但覆盖面比只估 messages 完整。
+/// 保留为薄封装：与压缩决策同源，见 [`ContextAudit`]。
 pub fn estimate_request_tokens(
     system: &wyj_api::SystemPrompt<'_>,
     messages: &[Message],
     tools: &[ToolDefinition],
     max_output_tokens: u32,
 ) -> u32 {
-    const REQUEST_OVERHEAD_TOKENS: u32 = 64;
-    const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
-
-    // system 分 stable / volatile 两段（见 wyj_api::SystemPrompt），估算时按
-    // 拼接后的完整文本计，与实际发送的字节保持一致。
-    let system_tokens = estimate_text_tokens(&system.combined()) as u32;
-    let message_overhead = (messages.len() as u32).saturating_mul(MESSAGE_OVERHEAD_TOKENS);
-    let tool_tokens = tools.iter().fold(0u32, |total, tool| {
-        let schema = tool.input_schema.to_string();
-        total.saturating_add(
-            (estimate_text_tokens(&tool.name)
-                + estimate_text_tokens(&tool.description)
-                + estimate_text_tokens(&schema)) as u32,
-        )
-    });
-
-    estimate_tokens(messages)
-        .saturating_add(system_tokens)
-        .saturating_add(tool_tokens)
-        .saturating_add(message_overhead)
-        .saturating_add(REQUEST_OVERHEAD_TOKENS)
-        .saturating_add(max_output_tokens)
+    ContextAudit::from_request(system, messages, tools, max_output_tokens).total()
 }
 
 /// 粗略估算消息列表的 token 数。
@@ -103,32 +215,38 @@ pub fn estimate_tokens(messages: &[Message]) -> u32 {
     messages
         .iter()
         .flat_map(|m| m.content.iter())
-        .map(|b| match b {
-            ContentBlock::Text { text } => estimate_text_tokens(text),
-            ContentBlock::ToolUse { name, input, .. } => {
-                estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
-            }
-            ContentBlock::ToolResult { content, .. } => match content {
-                ToolResultContent::Text(t) => estimate_text_tokens(t),
-                ToolResultContent::Parts(parts) => parts
-                    .iter()
-                    .map(|p| match p {
-                        wyj_api::types::ToolResultPart::Text { text } => estimate_text_tokens(text),
-                        wyj_api::types::ToolResultPart::Image { data, .. } => {
-                            estimate_image_tokens(data.len())
-                        }
-                    })
-                    .sum(),
-                ToolResultContent::Blocks(v) => {
-                    v.iter().map(|x| estimate_text_tokens(&x.to_string())).sum()
-                }
-            },
-            ContentBlock::Image { data, .. } => estimate_image_tokens(data.len()),
-            // thinking 输出不占后续请求的 input（回传不计费），但估算宁多勿少
-            ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking),
-            ContentBlock::RedactedThinking { data } => data.len() / 4,
-        })
+        .map(estimate_block_tokens)
         .sum::<usize>() as u32
+}
+
+/// 单个 `ContentBlock` 的 token 估算。`context_edit` 需要按块度量
+/// 「清理这一条省了多少」，所以从 `estimate_tokens` 里拆出这一层。
+pub fn estimate_block_tokens(block: &ContentBlock) -> usize {
+    match block {
+        ContentBlock::Text { text } => estimate_text_tokens(text),
+        ContentBlock::ToolUse { name, input, .. } => {
+            estimate_text_tokens(name) + estimate_text_tokens(&input.to_string())
+        }
+        ContentBlock::ToolResult { content, .. } => match content {
+            ToolResultContent::Text(t) => estimate_text_tokens(t),
+            ToolResultContent::Parts(parts) => parts
+                .iter()
+                .map(|p| match p {
+                    wyj_api::types::ToolResultPart::Text { text } => estimate_text_tokens(text),
+                    wyj_api::types::ToolResultPart::Image { data, .. } => {
+                        estimate_image_tokens(data.len())
+                    }
+                })
+                .sum(),
+            ToolResultContent::Blocks(v) => {
+                v.iter().map(|x| estimate_text_tokens(&x.to_string())).sum()
+            }
+        },
+        ContentBlock::Image { data, .. } => estimate_image_tokens(data.len()),
+        // thinking 输出不占后续请求的 input（回传不计费），但估算宁多勿少
+        ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking),
+        ContentBlock::RedactedThinking { data } => data.len() / 4,
+    }
 }
 
 /// 图片 token 估算：Anthropic 按约 像素数/750 计 token。无尺寸信息时用解码
@@ -140,7 +258,7 @@ fn estimate_image_tokens(b64_len: usize) -> usize {
 
 /// 启发式 token 估算：CJK 字符按 1.5 token/字，其余按 0.33 token/字
 /// （≈3 字符/token，对代码/JSON 内容更贴近 Claude BPE 真实值）。
-fn estimate_text_tokens(text: &str) -> usize {
+pub fn estimate_text_tokens(text: &str) -> usize {
     let mut cjk = 0usize;
     let mut other = 0usize;
     for ch in text.chars() {
@@ -177,11 +295,11 @@ pub async fn compact_session(
     context_window: u32,
 ) -> Result<CompactResult> {
     let total = session.messages.len();
-    if total <= COMPACT_KEEP_RECENT + 2 {
+    if total < COMPACT_MIN_MESSAGES {
         return Err(CompactSkip::TooFewMessages(total).into());
     }
 
-    let keep_from = safe_keep_from(&session.messages, COMPACT_KEEP_RECENT)
+    let keep_from = safe_keep_from_budget(&session.messages, compact_keep_budget(context_window))
         .ok_or(CompactSkip::NoSafeBoundary)?;
 
     // 工具密集型单回合的消息序列通常只有首条是真实 user 消息：
@@ -205,6 +323,7 @@ pub async fn compact_session(
     // 在下面 `session.add_usage(...)`（可变借用）之前结束，否则借用检查器
     // 判定冲突。取完长度后 `to_compact` 不再被使用，NLL 即刻结束该借用。
     let messages_removed = to_compact.len();
+    let messages_kept = to_keep.len();
     let prompt = crate::prompts::compact_prompt(&conv_text);
 
     let req = vec![Message {
@@ -282,6 +401,7 @@ pub async fn compact_session(
 
     Ok(CompactResult {
         messages_removed,
+        messages_kept,
         tokens_saved_estimate: tokens_saved,
     })
 }
@@ -396,6 +516,28 @@ fn safe_keep_from(messages: &[Message], keep_recent: usize) -> Option<usize> {
     Some(keep_from)
 }
 
+/// 预算版保留点：先按 token 预算从尾部往前累加定出朴素索引，再复用
+/// [`safe_keep_from`] 做「回退到真实用户发言边界」。
+///
+/// 单条消息本身就超预算时（一条巨型 tool_result）至少退回"保留它之前"的
+/// 边界——既不保留全部（压缩等于没做），也不越界访问 `messages[len()]`。
+fn safe_keep_from_budget(messages: &[Message], budget: u32) -> Option<usize> {
+    let mut used = 0u32;
+    let mut keep_from = messages.len();
+    while keep_from > 0 {
+        let cost = estimate_tokens(std::slice::from_ref(&messages[keep_from - 1]));
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used = used.saturating_add(cost);
+        keep_from -= 1;
+    }
+    if keep_from >= messages.len() {
+        keep_from = messages.len().saturating_sub(1);
+    }
+    safe_keep_from(messages, messages.len() - keep_from)
+}
+
 fn messages_to_text(messages: &[Message]) -> String {
     messages
         .iter()
@@ -470,9 +612,33 @@ mod tests {
 
     #[test]
     fn compact_trigger_buffer_scales_with_context_window() {
-        assert_eq!(compact_trigger_buffer(200_000), 40_000);
-        assert_eq!(compact_trigger_buffer(32_000), 6_400);
-        assert_eq!(compact_trigger_buffer(8_000), 4_000);
+        // 大窗口按比例留 10%，不再被 40K 绝对封顶顶成 96% 才触发。
+        assert_eq!(compact_trigger_buffer(200_000, 8_192), 20_000);
+        assert_eq!(compact_trigger_buffer(1_000_000, 8_192), 100_000);
+        // 小窗口靠 `max_tokens + 8192` 兜底，不会被比例项压到过激。
+        assert_eq!(compact_trigger_buffer(8_000, 8_192), 16_384);
+    }
+
+    /// 回归：`max_tokens > 40K` 时旧公式会算出
+    /// `阈值(160K) + 输出(64K) > 窗口(200K)` 的结构性必 400。
+    /// 新公式必须保证 `窗口 - buffer + max_tokens <= 窗口`。
+    #[test]
+    fn compact_trigger_buffer_always_covers_max_output_tokens() {
+        for (window, max_output) in [
+            (200_000u32, 64_000u32),
+            (200_000, 128_000),
+            (32_000, 8_192),
+            (1_000_000, 128_000),
+        ] {
+            let buffer = compact_trigger_buffer(window, max_output);
+            assert!(
+                buffer >= max_output,
+                "window={window} max_output={max_output} buffer={buffer}: \
+                 压缩阈值 + 输出预留必须不超过窗口"
+            );
+            let threshold = window.saturating_sub(buffer);
+            assert!(threshold + max_output <= window);
+        }
     }
 
     fn assistant_tool_use() -> Message {
@@ -914,5 +1080,107 @@ mod tests {
         );
         // Display 仍输出原中文文案，保持既有日志/单测行为
         assert!(err.to_string().contains("消息数量过少"));
+    }
+
+    fn tool_result_msg(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t".to_string(),
+                content: ToolResultContent::text(text),
+                is_error: false,
+            }],
+        }
+    }
+
+    /// 可回收 tool_result 只统计"超出最近 K 个"的部分——最近 3 个必须保留
+    /// 全文，否则模型刚读到的文件/grep 结果会凭空消失。
+    #[test]
+    fn reclaimable_keeps_the_most_recent_tool_results() {
+        let messages: Vec<Message> = (0..6).map(|_| tool_result_msg(&"x".repeat(600))).collect();
+        let total_each = estimate_text_tokens(&"x".repeat(600)) as u32;
+        let reclaimable = reclaimable_tool_result_tokens(&messages);
+        assert_eq!(
+            reclaimable,
+            total_each * 3,
+            "6 个工具结果里只有最早的 3 个可回收"
+        );
+        assert!(reclaimable < estimate_tokens(&messages));
+    }
+
+    #[test]
+    fn reclaimable_is_zero_when_fewer_than_keep_window() {
+        let messages: Vec<Message> = (0..2).map(|_| tool_result_msg(&"x".repeat(600))).collect();
+        assert_eq!(reclaimable_tool_result_tokens(&messages), 0);
+    }
+
+    /// 保留量按 token 预算而非固定条数：短消息要多留，长消息要少留。
+    #[test]
+    fn safe_keep_from_budget_scales_with_message_size() {
+        let short: Vec<Message> = (0..20).map(|i| user_text(&format!("{}", i))).collect();
+        let long: Vec<Message> = (0..20)
+            .map(|i| user_text(&format!("{} {}", i, "x".repeat(2000))))
+            .collect();
+
+        // 预算 2_000 token：短消息（每条约 1 token）能留很多条
+        let keep_short = safe_keep_from_budget(&short, 2_000).unwrap();
+        assert!(
+            keep_short < 5,
+            "20 条极短消息在 2K 预算下应保留几乎全部，实际保留起点 {keep_short}"
+        );
+
+        // 同预算下，每条约 667 token 的大消息只能留 2~3 条
+        let keep_long = safe_keep_from_budget(&long, 2_000).unwrap();
+        assert!(
+            keep_long > 15,
+            "20 条大消息在 2K 预算下应只保留末尾少数几条，实际保留起点 {keep_long}"
+        );
+    }
+
+    /// 单条消息就超预算时不能越界，也不能退化成"保留全部"（等于没压）。
+    #[test]
+    fn safe_keep_from_budget_handles_single_oversized_message() {
+        let messages = vec![
+            user_text("first"),
+            user_text(&"x".repeat(20_000)),
+            user_text("last"),
+        ];
+        let keep_from = safe_keep_from_budget(&messages, 100).expect("必须有安全边界");
+        assert!(keep_from < messages.len(), "必须真的丢掉点什么，不能全保留");
+        assert!(is_user_turn_boundary(&messages[keep_from]));
+    }
+
+    /// `ContextAudit::total()` 必须与旧的 `estimate_request_tokens` 完全等价，
+    /// 否则压缩阈值会因"引入分解结构体"而静默漂移。
+    #[test]
+    fn context_audit_total_matches_request_estimate() {
+        let messages = vec![
+            user_text("hello world"),
+            assistant_tool_use(),
+            user_tool_result(),
+        ];
+        let tools = vec![ToolDefinition {
+            name: "Read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({"path": {"type": "string"}}),
+            native: None,
+        }];
+        let system = wyj_api::SystemPrompt::stable_only("system instruction ");
+
+        let audit = ContextAudit::from_request(&system, &messages, &tools, 8_192);
+        let legacy = estimate_request_tokens(&system, &messages, &tools, 8_192);
+        assert_eq!(audit.total(), legacy);
+        assert_eq!(audit.output_reserve, 8_192);
+        assert!(audit.system_tokens > 0);
+        assert!(audit.tool_schema_tokens > 0);
+        assert!(audit.history_tokens > 0);
+    }
+
+    /// 压缩保留预算必须随窗口伸缩——固定条数 / 固定绝对值在两端都会出错。
+    #[test]
+    fn compact_keep_budget_scales_and_clamps() {
+        assert_eq!(compact_keep_budget(8_000), 4_000);
+        assert_eq!(compact_keep_budget(200_000), 25_000);
+        assert_eq!(compact_keep_budget(1_000_000), 32_000);
     }
 }

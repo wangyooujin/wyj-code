@@ -15,6 +15,7 @@
 - [Provider / WireProtocol / Capability 三层模型](#provider-wireprotocol-capability-三层模型)
 - [上下文管理](#上下文管理)
   - [Compact 与持久化截断](#compact-与持久化截断)
+  - [Tool-result context editing（清理优先于摘要）](#tool-result-context-editing清理优先于摘要)
   - [CLAUDE.md 注入](#claudemd-注入)
   - [Memory v3](#memory-v3)
 - [会话与 Checkpoint](#会话与-checkpoint)
@@ -55,7 +56,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、Profile / ModelRuntime / MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析、Capability 探测与缓存 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session runtime/events、HistoryStore、Memory v3、ClaudeMdLoader、Hooks、Checkpoint、CAS 存储、Workspace/Workflow 接口 |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/TodoWrite/SubAgent/Computer/AppComputer/Jev 等）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/TodoWrite/SubAgent/Computer/AppComputer 等）|
 | `crates/computer` | `wyj-computer` | computer-use 系统层：`xcap` 截图 + `enigo` 输入合成 + 平台无关的坐标缩放数学（`scale` 模块）|
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact、/model、/agents、/evolve 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换 |
@@ -96,7 +97,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
         ┌──────────────────────────────────────────────────────────┐
         │   Tool Registry (wyj-tools)                              │
         │   Read Write Edit Bash Glob Grep WebFetch WebSearch       │
-        │   TodoWrite SubAgent Computer AppComputer Jev ...        │
+        │   TodoWrite SubAgent Computer AppComputer ...             │
         │   + MCP 桥接工具 (wyj-mcp)                                │
         │   + 用户 Skill / 命令                                   │
         └─────────────────────────┬────────────────────────────────────┘
@@ -165,7 +166,6 @@ trait Tool: Send + Sync {
 
 - 同一 `Provider`（如 `AnthropicProvider`）可对接任意 Anthropic 兼容端点；官方端点判定由 `is_official_anthropic_endpoint()`（`provider == Anthropic` 且 `base_url` 为空或等于官方地址）单独控制某些能力（如原生 `computer_20251124`）。
 - Capability 解析来源：① 内置 vendor 静态表（`api/src/model_catalog.rs`）② `CapabilityCache` 持久化探测结果 ③ 用户自定义 Profile 覆盖。
-- Jev 决策 API（`tools/jev.rs`）不新增 `WireProtocol` 变体、不改 `Provider` trait——它走 ToolRegistry 直接调 HTTP，避免污染 routing/capability_cache 分桶。
 - 模型侧提示词（`core/prompts` + `tools/descriptions`）为英文常量不走 i18n；末尾 "reply in the user's language" 保证中文用户得到中文回复。
 - 双协议降级：Anthropic 路径完整（thinking、cache_control、native computer_20251124）；OpenAI Chat Completions 路径上 image_url 降级、thinking_* 直接忽略、tool 内嵌图片不可用（影响 computer-use 截图回传）。
 
@@ -177,11 +177,61 @@ trait Tool: Send + Sync {
 
 **Token 估算**（`core/compact.rs::estimate_text_tokens`）：
 
-- CJK：1.5 token/字（修订后 0.33 字节/token，避免低估）
-- 非 CJK：0.25 token/字
+- CJK：1.5 token/字
+- 非 CJK：1/3 token/字（≈3 字符/token，对代码 / JSON 更贴近真实 BPE；旧值 0.25
+  对含 `{` `}` 的内容偏低约 2 倍，会让压缩触发过晚直到撞穿窗口）
 - image ≈ b64 字节 × 3/4 / 750，封顶 1600
 
-**触发**：`estimated > context_window - buffer`（`buffer = min(40000, max(4000, context_window/5))`），调 LLM 生成摘要替换旧消息，保留最近 6 条；连续 3 轮仍未收敛视为"上下文爆了"。
+**唯一口径**（`ContextAudit::from_request`）：一次性算出 system / 工具 schema / 对话历史 /
+输出预留 / 协议开销 / 可回收旧工具结果六项，**压缩决策、`/cost`、`/context` 面板全部
+消费它**。v1.5.17 之前压缩决策算 request 级而状态栏算 messages-only，两者差 1 万+
+token，在 200K 窗口下是 6 个以上百分点的系统性低报。
+
+**触发**：`estimated > context_window - buffer`，其中
+`buffer = max(max_output_tokens + 8192, context_window / 10)`。两个约束缺一不可：
+
+- 必须 ≥ `max_tokens`——否则「阈值 + 输出预留 > 窗口」是结构性必 400（`max_tokens`
+  在配置层没有上限钳制，`64000` + `200000` 窗口下旧公式必然越界）；
+- 必须随窗口线性伸缩——旧公式 `min(40K, cw/5)` 在 1M 窗口下只留 4% 余量（阈值 96%），
+  窗口越大反而触发越晚。
+
+**保留量**按 token 预算 `clamp(context_window / 8, 4K, 32K)` 而非固定 6 条：工具密集
+回合里 6 条可能就是一整个巨型 tool_result（保留太多压不下去），纯对话回合里 6 条可能
+只有 1K token（保留太少，压完仍超标才要连跑 3 轮）。`safe_keep_from_budget` 从尾部按
+预算累加定出朴素索引，再回退到真实用户发言边界，绝不拆散 tool_use / tool_result 配对。
+连续 3 轮仍未收敛视为"压不动了"，把控制权交回调用方由 `truncate_messages` 兜底。
+
+**超限自愈**：`ProviderErrorKind::ContextLengthExceeded` 原本有分类但 agent 层从不消费，
+启发式一旦低估就只能把 400 抛给用户。现在命中时无视阈值强制压缩一次并重试
+（`context_recovered` 保证只重试一次，对标 Claude Code 的 "Autocompact is thrashing" 熔断）；
+压缩本身压不动也照常重入循环，让 `truncate_messages` 处理"消息太少但单块超长"的情况。
+
+### Tool-result context editing（清理优先于摘要）
+
+超阈值时**先**把过期的工具输出外部化到 CAS，清理得动就不去跑整段摘要——顺序对齐
+Claude Code 官方文档的 "It clears older tool outputs first, then summarizes the
+conversation if needed"。清理比摘要便宜（无 output token、不产生幻觉）也更保真
+（原文只是移出模型视野，没被转述；而摘要最先丢的恰好是负知识、精确路径/行号、
+顺序因果）。
+
+- **白名单**：`Read` / `Grep` / `Glob` / `Bash` / `WebFetch`（`Edit` / `Write` /
+  `NotebookEdit` 的回执永不清理——丢了模型会以为自己没改过从而重做）。`ToolResult`
+  不携带工具名（只有 `tool_use_id`），所以先扫 `ToolUse` 块建 `id → name` 映射；
+  映射不到的历史块保守跳过。最近 `protect_recent = 3` 个保留全文。
+- **模型可见上下文 ≠ 持久 transcript**：落盘 session 存占位符（工具名 / 大小 / 首行 /
+  `cas://<hash>`），原文在 CAS。`SessionStore::load` 调 `materialize_elided` 还原
+  （resume = 新会话从完整上下文开始，之后随增长再逐步重新清理）。blob 已被 gc 时
+  保留占位符，不变成空洞。
+- **`ContextRecall` 工具**按 hash 取回，支持分页与 char boundary 安全切分；必须常驻
+  `ALWAYS_VISIBLE_TOOL_SCHEMAS`——一旦被 lazy 折叠，占位符里的引用就成了死路。
+- **回收链路两个机制缺一不可**：`WorkspaceCas::gc` 只回收 `ref_count == 0` 的 blob，
+  所以 `Session.elided_blobs` 必须随 `SessionFile` 落盘并在会话丢弃时（`/clear` /
+  退出 / resume 别的会话）逐个 `release`；`storage.cas_total_bytes` +
+  `cas_gc_on_start` 提供进程启动时的容量兜底。CAS 不可写时机制**整体关闭**而不降级
+  成"就地删掉"。
+
+配置在 `[context_edit]`，`enabled = false` 完全退回 v1.5.16 行为。
+详见 `doc/plan/v1.5.17-context-management-plan.md`。
 
 **持久化前截断**（`persist_cap`）：
 
@@ -283,7 +333,7 @@ Checkpoint 支持：
 
 **模型解析优先级**：`def.model`（Profile 名）→ `[subagent].explore_profile`（仅 Explore）→ `[subagent].default_profile` → 主 Agent 当前分组（`cli::make_sub_agent_factory`）。
 
-**白名单**：子 Agent 一律不注册 Agent / AskQuestion / ExitPlanMode / TodoWrite / Computer / AppComputer / Jev，并继承 Plan 白名单交集。
+**白名单**：子 Agent 一律不注册 Agent / AskQuestion / ExitPlanMode / TodoWrite / Computer / AppComputer，并继承 Plan 白名单交集。
 
 **轨迹持久化**（v1.2）：`SubAgentHub::emit()` 接入专职后台写手 `tools::trace::TraceWriter`（内部 mpsc 串行 append，调用方零阻塞），把 `SubAgentEvent` 转成落盘用 `TraceEvent`（`ToolStart`/`ToolEnd` 补全完整 input/output JSON，超 `trace_max_bytes_per_agent` 默认 256KB 静默停写）写入 JSONL：`~/.wyj-code/sessions/<session_id>.subagents/a<id>.jsonl`。CLI 子命令 `wyj-code subagent-trace <session_id> [<sub_id>] [--json]` 纯读打印落盘内容。
 

@@ -217,9 +217,9 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 ### Agent 与工具
 
 - 内置工具：Read / Write / Edit / Bash（带 sandbox）/ Glob / Grep / WebFetch / WebSearch /
-  TodoWrite / SubAgent / Computer / AppComputer / Jev。
+  TodoWrite / SubAgent / Computer / AppComputer。
 - WebSearch 仅在配置 `search_api_key` 时注册；Computer 仅 macOS/Windows 编译且需
-  vision + Anthropic profile；Jev 仅在 `[tools.jev].enabled=true` 且 API Key 可解析时注册。
+  vision + Anthropic profile。
 - SubAgent 类型：内置 general-purpose / Explore（只读）/ Plan + 用户自定义六层合并链。
 
 ### 工程化工作流
@@ -274,15 +274,6 @@ language = ""                     # "en"/"zh"，留空自动检测系统 locale
 
 # API Key 优先从环境变量 WYJ_CODE_API_KEY 读取；配置文件不要写明文 key
 # 多个 Profile 通过 TUI 内 /model 管理；详见 CLAUDE.md "Profile" 节
-
-[tools.jev]                       # TypeSafe Jev 决策 API（v1.5.13+）
-enabled = false                   # 默认禁用；付费 API，显式开启才注册
-api_key = ""                      # 留空读环境变量 TYPESAFE_API_KEY
-base_url = ""                     # 留空用 https://api.typesafe.ai
-model = "jev-latest"
-max_state_chars = 32000           # state 字符上限
-max_questions = 32                # 单次最多 questions 数量
-daily_budget_usd = 5.0            # 进程级日预算；0 = 关闭
 
 [subagent]
 default_profile = ""              # 子 Agent 默认 Profile
