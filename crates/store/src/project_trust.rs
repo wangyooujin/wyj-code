@@ -59,11 +59,20 @@ pub fn compute_project_mcp_fingerprint(cwd: &Path) -> String {
 }
 
 fn trust_path(cwd: &Path) -> Result<PathBuf> {
+    project_trust_record_path(cwd, "mcp_trust.json")
+}
+
+/// 信任记录的落盘位置：`~/.wyj-code/projects/<project_key>/<file_name>`。
+///
+/// **必须落在仓库内容控制不到的位置**——若写在 `<git-root>/.wyj-code/` 下，
+/// 被信任的仓库自己就能在同一个受版本控制的文件里把「已批准」标记改掉，
+/// 形同虚设。`skill_trust` 模块复用本函数以保持这条不变式一致。
+pub(crate) fn project_trust_record_path(cwd: &Path, file_name: &str) -> Result<PathBuf> {
     let key = wyj_core::project_key(cwd);
     Ok(wyj_config::config_dir()?
         .join("projects")
         .join(key)
-        .join("mcp_trust.json"))
+        .join(file_name))
 }
 
 fn load_record(cwd: &Path) -> Option<ProjectTrustRecord> {

@@ -1,6 +1,6 @@
 # wyj-code
 
-[![Release](https://img.shields.io/badge/release-v1.5.18-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.18)
+[![Release](https://img.shields.io/badge/release-v1.5.19-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
@@ -21,8 +21,13 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 [贡献指南](./CONTRIBUTING.md)
 
 > **版本状态**：最新公开版本
-> [v1.5.18](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.18)。
+> [v1.5.19](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19)。
 > 历史 tag 保持不可移动，一键安装脚本始终下载 GitHub 最新公开 Release。
+>
+> **⚠️ v1.5.19 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
+> 显式信任批准。首次启动会弹出信任面板，**不批准则这些 skill 不加载**（斜杠补全
+> 里不出现，模型也看不见、不会推荐）。批准记录落在仓库外，内容变化后需重新批准。
+> 配 cron 定时任务前可先跑 `wyj-code trust`（或 `trust-skills`）一次性批准。
 >
 > **⚠️ v1.5.18 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
 > `AGENTS.md`，wyj-code 不再读取任何 `.claude/` 路径。把仓库根的 `CLAUDE.md`

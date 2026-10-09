@@ -115,6 +115,8 @@ cli:
   subagent_trace_sub_id_help: "Sub-agent id (the number the Hub assigned, e.g. 3); omit to list all sub-agents in the session"
   subagent_trace_json_help: "Print the raw JSONL (for piping); only takes effect when a sub-agent id is given"
   trust_mcp_about: "Approve trust for the current project's project-scoped MCP servers (.wyj-code/mcp.toml/.mcp.json); run this before setting up scheduled tasks"
+  trust_skills_about: "Approve trust for the current project's project-scoped skills (.wyj-code/skills/); their bodies come from the repo author and are handed to the model as instructions"
+  trust_about: "Approve trust for both project-scoped MCP servers and skills; run this before setting up scheduled tasks"
 
 update:
   checking: "Checking for the latest version…"
@@ -198,6 +200,7 @@ help:
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
     - `Ctrl+T` — Focus the task list; expand/collapse it when already focused
+    - `Ctrl+O` — Expand/collapse thinking and tool result bodies
     - `Ctrl+L` — Clear screen (keeps conversation history)
     - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
     - `Ctrl+K` — Delete from cursor to end of line
@@ -706,6 +709,9 @@ dialog:
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"
   project_trust_hint: "  [y] Trust and connect   [n/Esc] Skip for now (asked again on next launch)"
+  skill_trust_title: " ⚠ Project Skills Need Trust "
+  skill_trust_intro: "The following slash commands come from this repository's .wyj-code/skills/ and were written by the repo author. Until trusted they are absent from completions and unknown to the model. Once trusted, running one hands its entire body to the model as instructions:"
+  skill_trust_hint: "  [y] Trust and enable   [n/Esc] Skip for now (asked again on next launch)"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "
   ask_question_other_label: "Other…"

@@ -353,9 +353,16 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Spinner 动画帧（braille，复刻 Claude Code 风格）
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Codex 风格静态工具预览：标题不计入，正文最多展示三个终端视觉行。
+/// `!` bash 命令输出的静态预览上限：标题不计入，正文最多展示三个终端视觉行。
+///
+/// **只对 `MessageRole::BashOutput` 生效**。工具调用结果（`MessageRole::ToolResult`）
+/// 自 v1.5.19 起默认整块折叠、由 `Ctrl+O` 展开出全文，不再经过本上限——见
+/// `render_tool_result_block`。此常量是 `push_capped_preview_lines` 的最后依赖，
+/// 删除前需先给 BashOutput 定新策略。
 const TASK_PREVIEW_MAX_ROWS: usize = 3;
 
+/// 把静态预览正文截断到 [`TASK_PREVIEW_MAX_ROWS`] 个视觉行，超出时补一行 `...`。
+/// 仅 `!` bash 输出（`MessageRole::BashOutput`）使用。
 fn push_capped_preview_lines(
     lines: &mut Vec<Line<'static>>,
     preview: Vec<Line<'static>>,
@@ -432,6 +439,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         BottomPanel::ProjectTrust => {
             if let Some(servers) = &state.pending_mcp_trust {
                 draw_project_trust_panel(f, servers, chunks[1]);
+            }
+        }
+        BottomPanel::SkillTrust => {
+            if let Some(infos) = &state.pending_skill_trust {
+                draw_skill_trust_panel(f, infos, chunks[1]);
             }
         }
         BottomPanel::ExecModeConfirm => {
@@ -527,6 +539,7 @@ enum BottomPanel {
     None,
     Permission,
     ProjectTrust,
+    SkillTrust,
     ExecModeConfirm,
     PlanApproval,
     SubAgents,
@@ -576,6 +589,16 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     // ExecModeConfirm/PlanApproval 这类流程性面板挡住。
     if state.pending_mcp_trust.is_some() {
         return (11u16.min(area_height), BottomPanel::ProjectTrust);
+    }
+    // 项目级 skill 信任确认：与 MCP 同类的安全门槛，排在 MCP 之后（后者能执行
+    // 任意命令、级别更高），同样压过 ExecModeConfirm/PlanApproval 这类流程性面板。
+    if let Some(infos) = &state.pending_skill_trust {
+        // 高度必须覆盖 intro 的折行（窄屏下 2-3 行）+ 条目 + 空行 + hint。
+        // intro 长度随语言不同、还会随宽度折行，这里给足余量而不是精算——
+        // 宁可面板略高，也不要把 `[y] 信任并启用` 这行操作提示裁掉
+        // （裁掉的话用户根本不知道该怎么应答）。
+        let rows = (infos.len() as u16).min(6) + 9;
+        return (rows.min(area_height), BottomPanel::SkillTrust);
     }
     if state.exec_mode_confirm.is_some() {
         return (4u16.min(area_height), BottomPanel::ExecModeConfirm);
@@ -658,8 +681,8 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
 
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
 
-/// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时），
-/// 供 ToolResult 展开区（Edit/Write diff 与普通展开两处）和 agents 面板详情区共用。
+/// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时）。
+/// 只被 agents 面板详情区调用（与聊天流的 ToolResult 渲染是两条独立路径）。
 fn push_sub_agent_tool_log(
     lines: &mut Vec<Line<'static>>,
     tool_log: &[SubToolLine],
@@ -701,8 +724,9 @@ struct ChatRenderCtx<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
-    /// Ctrl+O 全局展开/折叠 thinking 正文。
-    thinking_expanded: bool,
+    /// Ctrl+O 全局展开/折叠**所有**可折叠正文：thinking 块与工具调用结果。
+    /// 折叠态一律不得触碰 `content`（见 `render_thinking_block` 的 `live` 分支）。
+    output_expanded: bool,
 }
 
 /// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
@@ -867,7 +891,7 @@ fn render_chat_message(
                 max_content_width,
                 ThinkingRenderOpts {
                     live: false,
-                    expanded: ctx.thinking_expanded,
+                    expanded: ctx.output_expanded,
                     elapsed_secs: msg.thinking_elapsed_secs,
                 },
             );
@@ -1083,16 +1107,22 @@ fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
         .collect()
 }
 
-/// `bash.rs` 在非零退出时会把 `退出码 N` 拼在输出最前面。这行对模型有用，但 TUI 里
-/// 它会占掉 `⎿` 预览唯一的第一行——用户看到的永远是「退出码 1」这种零信息量的摘要，
-/// 真正有用的错误信息（第三方 API 的 JSON 错误体等）被整块挤到视野之外。渲染层识别
-/// 并跳过它，让 `⎿` 行直接展示真实错误首行。
+/// `bash.rs` 在非零退出时会把 `退出码 N` 拼在输出最前面。这行是**给模型看的**——它让模型
+/// 无需解析 shell 语义就知道退出状态。对人类读者它是纯冗余：标题行早已用红色 ` · failed`
+/// 标出失败，真正有用的错误信息（第三方 API 的 JSON 错误体等）却要等读者越过这一行。
+/// 渲染层识别并跳过它，让 `⎿` 行直接展示真实错误首行。
 fn is_exit_code_banner(line: &str) -> bool {
     line.trim()
         .strip_prefix("退出码 ")
         .is_some_and(|rest| rest.trim().parse::<i64>().is_ok())
 }
 
+/// 渲染工具结果的**正文**（不含标题行）。只在展开态被调用——折叠态由
+/// `render_tool_result_block` 提前 return，正文一个字符都不渲染。
+///
+/// 出全文、不做任何行数截断：展开是用户的显式 opt-in 行为，全文才是它的意义。
+/// 仍保留少量表达层规范化（剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、
+/// 错误首行红其余 dim），这些只改样式与前缀、不丢用户关心的内容。
 fn render_tool_result_preview(
     lines: &mut Vec<Line<'static>>,
     msg: &ChatMessage,
@@ -1106,25 +1136,19 @@ fn render_tool_result_preview(
             .is_some_and(|name| matches!(name, "Edit" | "Write"));
     let content_lines = tool_result_content_lines(msg);
     let fallback = message_summary(msg);
-    // ToolResult 只有 3 个视觉预览行：空行不应被当成有效内容，
-    // 否则 AskQuestion 这类结构化结果会把名额浪费在纯空白上。Diff 中的
-    // 空上下文行仍保留，避免改变 Edit/Write 预览的补丁结构。
-    let mut compact_content = content_lines
-        .into_iter()
-        .filter(|line| is_diff || !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    // 错误场景：丢掉工具自拼的 `退出码 N` 横幅，把这行名额让给真实错误信息。
-    if msg.is_error
-        && compact_content
-            .first()
-            .is_some_and(|l| is_exit_code_banner(l))
-    {
-        compact_content.remove(0);
+    // 空行**不再**被当成「浪费名额」丢掉：展开态出全文，空行是 AskQuestion /
+    // 多段 bash 输出的段落分隔，删掉会把结构压平。这里只判定「是否整段皆空」以决定
+    // 是否回落到摘要（全部内容都是空行时渲染成空白毫无意义）。
+    let has_visible = content_lines.iter().any(|line| !line.trim().is_empty());
+    let mut full_content = content_lines;
+    // 错误场景：丢掉工具自拼的 `退出码 N` 横幅，把首行让给真实错误信息。
+    if msg.is_error && full_content.first().is_some_and(|l| is_exit_code_banner(l)) {
+        full_content.remove(0);
     }
-    let source = if compact_content.is_empty() {
+    let source = if !has_visible {
         vec![fallback.as_str()]
     } else {
-        compact_content
+        full_content
     };
     let mut preview = Vec::new();
     let mut first = true;
@@ -1133,6 +1157,7 @@ fn render_tool_result_preview(
             // 只有第一视觉行保持红色作为「失败」锚点，其余降为 dim：一次 curl 参数
             // 错误后 AI 会自行重试，属预期内的可自愈噪音，整块刷红会把它渲染成
             // 程序崩溃级别的告警，真正的 shell 失败反而被淹没在同样的红里。
+            // 展开态下这个论证更强——400 行的错误块刷成一片红比 3 行时糟糕得多。
             if first {
                 Theme::error()
             } else {
@@ -1149,6 +1174,13 @@ fn render_tool_result_preview(
         } else {
             Theme::tool_result()
         };
+        // 空行必须渲染成**真正的空 Line**，不能是带缩进 span 的空白行：
+        // `trim_trailing_blank_lines` 只弹 `spans.is_empty()` 的行，带 prefix 的
+        // 空白行弹不掉，会在每个工具结果尾部留下一行拖尾空格。
+        if raw.trim().is_empty() {
+            preview.push(Line::from(""));
+            continue;
+        }
         for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
             let prefix = if is_diff {
                 "    "
@@ -1164,17 +1196,10 @@ fn render_tool_result_preview(
             first = false;
         }
     }
-    if msg.is_error && preview.len() > TASK_PREVIEW_MAX_ROWS {
-        // 错误输出改 head+tail：第三方 API 的关键字段（`request id` / `reason` /
-        // traceback 末行）几乎总在**尾部**，只取 head 必然丢失它们。保首末两行，
-        // 中间用 ⋮ 明示省略——比追加一行 `...` 更明确地表达「中间被吃掉了」。
-        let last = preview.pop().expect("preview 非空");
-        let mut capped = preview.into_iter().take(1).collect::<Vec<_>>();
-        capped.push(Line::from(Span::styled("       ⋮", Theme::dim())));
-        capped.push(last);
-        preview = capped;
-    }
-    push_capped_preview_lines(lines, preview, if is_diff { "    " } else { "       " });
+    // 展开即全文：不截断、不补 `...`、错误也不做 head+tail。旧的 `⋮` 省略逻辑存在时
+    // 曾专门用来保住尾部的 `request_id` / `reason`，展开后尾部天然可见，保留它反而
+    // 会主动删掉用户明确要求看到的中间内容。
+    lines.extend(preview);
 }
 
 fn render_tool_result_block(
@@ -1209,6 +1234,13 @@ fn render_tool_result_block(
             Span::styled("  ⎿ result", Theme::dim()),
             Span::styled(elapsed_str, Theme::dim()),
         ]));
+    }
+    // 折叠态到此为止：正文一个字符都不渲染。这与 `render_thinking_block` 的形状
+    // 一致（先出头 → `if !expanded { return; }` → 全文），也让默认路径彻底绕开
+    // `tool_result_content_lines`（它会把整个 `content` `lines().collect()` 成 Vec）
+    // ——旧实现每帧构建完整 preview 再只取 3 行扔掉，是纯粹的浪费。
+    if !ctx.output_expanded {
+        return;
     }
     render_tool_result_preview(lines, result, ctx);
 }
@@ -1265,7 +1297,7 @@ pub(crate) fn build_pending_chat_lines(
             max_content_width,
             sub_agents: &state.sub_agents,
             spinner_frame: state.spinner_frame,
-            thinking_expanded: state.thinking_expanded,
+            output_expanded: state.output_expanded,
         },
         &mut is_first_user,
     ));
@@ -1277,7 +1309,7 @@ pub(crate) fn build_pending_chat_lines(
             max_content_width,
             ThinkingRenderOpts {
                 live: true,
-                expanded: state.thinking_expanded,
+                expanded: state.output_expanded,
                 elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
             },
         );
@@ -1303,6 +1335,7 @@ pub(crate) fn build_pending_chat_lines(
             state.todo_detail_scroll,
             &state.todo_stats,
             max_content_width,
+            state.output_expanded,
         );
         state.todo_detail_scroll = next_scroll;
         state.todo_detail_max_scroll = next_max_scroll;
@@ -1332,6 +1365,7 @@ fn push_inline_todo_lines(
     detail_scroll: u16,
     todo_stats: &HashMap<String, TodoRuntimeStats>,
     max_content_width: usize,
+    output_expanded: bool,
 ) -> (u16, u16) {
     if items.is_empty() {
         return (detail_scroll, 0);
@@ -1518,6 +1552,7 @@ fn push_inline_todo_lines(
                 todo_stats.get(&item.id),
                 detail_scroll,
                 max_content_width,
+                output_expanded,
             );
         }
     }
@@ -1535,6 +1570,7 @@ fn push_todo_detail_lines(
     stats: Option<&TodoRuntimeStats>,
     detail_scroll: u16,
     max_content_width: usize,
+    output_expanded: bool,
 ) -> (u16, u16) {
     lines.push(Line::from(Span::styled(
         format!("  {}", "─".repeat(max_content_width.saturating_sub(2))),
@@ -1598,8 +1634,10 @@ fn push_todo_detail_lines(
             max_content_width: detail_width,
             sub_agents,
             spinner_frame: 0,
-            // Todo 详情区里只会重放工具执行事件，不含 thinking 消息
-            thinking_expanded: false,
+            // 跟随全局 Ctrl+O flag：详情区通过 `TodoExecutionEntry::Message` 重放的
+            // **恰恰是工具消息**（不是 thinking），若这里硬编码 false，面板会只剩
+            // 一排 `⏺ Tool(...)` 标题、正文全空，等于摧毁这个面板的存在意义。
+            output_expanded,
         };
         for entry in log {
             match entry {
@@ -1697,7 +1735,7 @@ struct MessageRangeRenderArgs<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
-    thinking_expanded: bool,
+    output_expanded: bool,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -1712,13 +1750,13 @@ fn render_message_range(
         max_content_width,
         sub_agents,
         spinner_frame,
-        thinking_expanded,
+        output_expanded,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
         sub_agents,
         spinner_frame,
-        thinking_expanded,
+        output_expanded,
     };
     let mut lines = vec![];
     let mut i = range.start;
@@ -2912,6 +2950,44 @@ fn draw_project_trust_panel(f: &mut Frame, servers: &[wyj_config::McpServerConfi
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         wyj_i18n::tr("dialog.project_trust_hint"),
+        Theme::highlight(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    f.render_widget(para, inner);
+}
+
+/// 项目级 skill 信任面板。展示内容取自
+/// `wyj_commands::skill::project_skill_infos`（走与真正加载完全相同的 walk），
+/// 因此这里列的命令名与批准后实际生效的完全一致。
+fn draw_skill_trust_panel(
+    f: &mut Frame,
+    infos: &[wyj_commands::skill::ProjectSkillInfo],
+    area: Rect,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(
+            wyj_i18n::tr("dialog.skill_trust_title"),
+            Theme::permission_dialog(),
+        ));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::raw(wyj_i18n::tr(
+        "dialog.skill_trust_intro",
+    )))];
+    for info in infos {
+        lines.push(Line::from(Span::raw(truncate_chars(
+            &format!("  · /{}: {}", info.name, info.description),
+            inner.width as usize,
+        ))));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.skill_trust_hint"),
         Theme::highlight(),
     )));
 
@@ -5432,13 +5508,13 @@ mod tool_result_fold_tests {
     }
 
     fn render_messages(messages: &[ChatMessage], width: usize) -> Vec<String> {
-        render_messages_with_thinking_expanded(messages, width, false)
+        render_messages_with_output_expanded(messages, width, false)
     }
 
-    fn render_messages_with_thinking_expanded(
+    fn render_messages_with_output_expanded(
         messages: &[ChatMessage],
         width: usize,
-        thinking_expanded: bool,
+        output_expanded: bool,
     ) -> Vec<String> {
         let mut is_first_user = true;
         rendered_text(render_message_range(
@@ -5448,7 +5524,7 @@ mod tool_result_fold_tests {
                 max_content_width: width,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
-                thinking_expanded,
+                output_expanded,
             },
             &mut is_first_user,
         ))
@@ -5598,6 +5674,51 @@ mod tool_result_fold_tests {
 
         assert!(height > 0);
         assert!(matches!(panel, BottomPanel::ProjectTrust));
+    }
+
+    fn skill_info(name: &str, desc: &str) -> wyj_commands::skill::ProjectSkillInfo {
+        wyj_commands::skill::ProjectSkillInfo {
+            name: name.to_string(),
+            description: desc.to_string(),
+        }
+    }
+
+    #[test]
+    fn pending_skill_trust_shows_skill_trust_panel() {
+        let mut state = make_state();
+        state.pending_skill_trust = Some(vec![skill_info("review", "Review code")]);
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0);
+        assert!(matches!(panel, BottomPanel::SkillTrust));
+    }
+
+    /// 两者都是安全门槛，MCP 能执行任意命令、级别更高，必须先弹。
+    #[test]
+    fn project_mcp_trust_outranks_skill_trust() {
+        let mut state = make_state();
+        state.pending_mcp_trust = Some(vec![]);
+        state.pending_skill_trust = Some(vec![skill_info("review", "Review code")]);
+
+        let (_, panel) = bottom_panel_size(&state, 40);
+
+        assert!(matches!(panel, BottomPanel::ProjectTrust));
+    }
+
+    /// skill 门控同属安全门槛，必须压过 ExecModeConfirm 这类流程性面板。
+    #[test]
+    fn skill_trust_outranks_exec_mode_confirm() {
+        let mut state = make_state();
+        state.pending_skill_trust = Some(vec![skill_info("review", "Review code")]);
+        state.exec_mode_confirm = Some(ExecModeConfirmDialog {
+            pending_message: "go".to_string(),
+            pending_attachments: Vec::new(),
+        });
+
+        let (_, panel) = bottom_panel_size(&state, 40);
+
+        assert!(matches!(panel, BottomPanel::SkillTrust));
     }
 
     #[test]
@@ -6081,20 +6202,30 @@ mod tool_result_fold_tests {
         result.tool_name = Some("Read".to_string());
         result.display_summary = "read 3 lines".to_string();
         let messages = vec![call, result];
-        let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered.len(), 4);
+        // 折叠态：只剩标题行，正文一个字都不渲染
+        let rendered = render_messages(&messages, 100);
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert!(rendered[0].contains("⏺ Read("));
-        assert_eq!(rendered[1], "    ⎿ first");
-        assert_eq!(rendered[2], "       second");
-        assert_eq!(rendered[3], "       third");
+        assert!(
+            !rendered.iter().any(|line| line.contains("first")),
+            "折叠态不得泄露任何正文: {rendered:?}"
+        );
+        // 折叠头不加任何元信息——这条断言现在才真正承重（需求明确要求"只留标题行"）
         assert!(rendered
             .iter()
             .all(|line| !line.contains("ctrl+o") && !line.contains('▶')));
+
+        // 展开态：全文出齐
+        let expanded = render_messages_with_output_expanded(&messages, 100, true);
+        assert_eq!(expanded.len(), 4, "{expanded:?}");
+        assert_eq!(expanded[1], "    ⎿ first");
+        assert_eq!(expanded[2], "       second");
+        assert_eq!(expanded[3], "       third");
     }
 
     #[test]
-    fn ask_question_preview_skips_blank_protocol_lines() {
+    fn ask_question_result_keeps_blank_separator_lines_when_expanded() {
         let mut call = message(MessageRole::ToolCall, "AskQuestion");
         call.sequence_no = Some(1);
         call.tool_name = Some("AskQuestion".to_string());
@@ -6106,15 +6237,21 @@ mod tool_result_fold_tests {
         result.sequence_no = Some(1);
         result.tool_name = Some("AskQuestion".to_string());
 
-        let rendered = render_messages(&[call, result], 100);
+        // 展开态：空行是访谈问答的段落分隔，必须保留（旧实现会把它当"浪费名额"丢掉），
+        // 且不再有 `...` 截断
+        let rendered = render_messages_with_output_expanded(&[call, result], 100, true);
 
-        assert_eq!(rendered.len(), 5);
         assert!(rendered[0].contains("AskQuestion"));
         assert_eq!(rendered[1], "    ⎿ 访谈已完成，用户作答如下：");
-        assert_eq!(rendered[2], "       Q1（粒度）: 扫描后如何处理？");
-        assert_eq!(rendered[3], "       → 用户选择: 立即执行");
-        assert_eq!(rendered[4], "       ...");
-        assert!(rendered.iter().all(|line| !line.trim().is_empty()));
+        assert_eq!(rendered[2], "", "空行应作为真正的空行保留");
+        assert_eq!(rendered[3], "       Q1（粒度）: 扫描后如何处理？");
+        assert_eq!(rendered[4], "       → 用户选择: 立即执行");
+        assert_eq!(rendered[5], "", "Q1 与 Q2 之间的分隔空行同样保留");
+        assert_eq!(rendered[6], "       Q2: 是否继续？");
+        assert!(
+            !rendered.iter().any(|line| line.trim() == "..."),
+            "展开态不得再补省略号: {rendered:?}"
+        );
     }
 
     #[test]
@@ -6141,12 +6278,20 @@ mod tool_result_fold_tests {
         let messages = vec![call, result, next];
         let rendered = render_messages(&messages, 100);
 
-        assert_eq!(rendered.len(), 5);
+        // 折叠态：工具块塌成一行标题，但块间空行分隔符语义与折叠正交、必须保留
+        assert_eq!(rendered.len(), 3, "{rendered:?}");
         assert!(rendered[0].contains("Read("));
-        assert_eq!(rendered[1], "    ⎿ first");
-        assert_eq!(rendered[2], "       second");
-        assert!(rendered[3].trim().is_empty());
-        assert_eq!(rendered[4], "  after tool");
+        assert!(rendered[1].trim().is_empty());
+        assert_eq!(rendered[2], "  after tool");
+
+        // 展开态：完整块 + 分隔符
+        let expanded = render_messages_with_output_expanded(&messages, 100, true);
+        assert_eq!(expanded.len(), 5, "{expanded:?}");
+        assert!(expanded[0].contains("Read("));
+        assert_eq!(expanded[1], "    ⎿ first");
+        assert_eq!(expanded[2], "       second");
+        assert!(expanded[3].trim().is_empty());
+        assert_eq!(expanded[4], "  after tool");
     }
 
     #[test]
@@ -6177,7 +6322,7 @@ mod tool_result_fold_tests {
             "one\ntwo\nthree\nfour\nfive\nsix\nseven",
         );
         thinking.thinking_elapsed_secs = Some(12.0);
-        let rendered = render_messages_with_thinking_expanded(&[thinking], 100, true);
+        let rendered = render_messages_with_output_expanded(&[thinking], 100, true);
 
         // 展开后出全文（旧实现固定只给前 3 行，几十行思考的结论永远看不到）
         assert_eq!(rendered.len(), 8, "{rendered:?}");
@@ -6224,16 +6369,37 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn long_single_line_tool_result_is_capped_after_wrapping() {
+    fn long_single_line_tool_result_wraps_fully_when_expanded() {
         let mut result = message(
             MessageRole::ToolResult,
             "abcdefghijklmnopqrstuvwxyz0123456789",
         );
         result.tool_name = Some("Grep".to_string());
-        let rendered = render_messages(&[result], 14);
 
-        assert_eq!(rendered.len(), 5);
-        assert_eq!(rendered.last().map(String::as_str), Some("       ..."));
+        // 折叠态：连折行都不做，正文一个字符都不碰
+        let folded = render_messages(&[result.clone()], 14);
+        assert_eq!(folded.len(), 1, "{folded:?}");
+
+        // 展开态：完整折行、无省略号
+        let rendered = render_messages_with_output_expanded(&[result], 14, true);
+        assert!(
+            !rendered.iter().any(|line| line.trim() == "..."),
+            "展开态不得补 `...`: {rendered:?}"
+        );
+        // 剥掉首行的 `    ⎿ ` 与后续行的 7 空格缩进后，拼回必须逐字等于原文
+        let joined: String = rendered
+            .iter()
+            .skip(1) // 首行是标题 `  ⎿ result`
+            .map(|line| {
+                line.strip_prefix("    ⎿ ")
+                    .or_else(|| line.strip_prefix("       "))
+                    .unwrap_or(line.as_str())
+            })
+            .collect();
+        assert_eq!(
+            joined, "abcdefghijklmnopqrstuvwxyz0123456789",
+            "折行拼回必须逐字还原原文"
+        );
     }
 
     #[test]
@@ -6246,12 +6412,12 @@ mod tool_result_fold_tests {
         let mut is_first_user = true;
         let lines = render_message_range(
             MessageRangeRenderArgs {
-                messages: &[result],
+                messages: &[result.clone()],
                 range: 0..1,
                 max_content_width: 100,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
-                thinking_expanded: false,
+                output_expanded: true,
             },
             &mut is_first_user,
         );
@@ -6265,19 +6431,28 @@ mod tool_result_fold_tests {
         assert_eq!(lines[2].spans[0].style, Style::default().fg(Color::Green));
         assert_eq!(lines[3].spans[0].style, Theme::dim());
         assert!(!rendered.iter().any(|line| line.contains("Updated file")));
+
+        // 折叠态：diff 一行都不渲染（需求：Edit/Write 与其他结果一律折叠）
+        let folded = render_messages(&[result], 100);
+        assert_eq!(folded.len(), 1, "{folded:?}");
+        assert_eq!(folded[0], "  ⎿ result");
     }
 
     #[test]
-    fn long_edit_diff_is_capped_with_ascii_ellipsis() {
+    fn long_edit_diff_renders_all_lines_when_expanded() {
         let mut result = message(
             MessageRole::ToolResult,
             "Updated file successfully\n- old one\n+ new one\n  context\n+ another",
         );
         result.tool_name = Some("Edit".to_string());
-        let rendered = render_messages(&[result], 100);
+        let rendered = render_messages_with_output_expanded(&[result], 100, true);
 
-        assert_eq!(rendered.len(), 5);
-        assert_eq!(rendered.last().map(String::as_str), Some("    ..."));
+        assert_eq!(rendered.len(), 5, "{rendered:?}");
+        assert_eq!(rendered[4], "    + another", "尾部补丁行必须可见");
+        assert!(
+            !rendered.iter().any(|line| line.trim() == "..."),
+            "展开态不得补 `...`: {rendered:?}"
+        );
     }
 
     #[test]
@@ -6288,7 +6463,7 @@ mod tool_result_fold_tests {
         );
         result.tool_name = Some("Bash".to_string());
         result.is_error = true;
-        let rendered = render_messages(&[result], 100);
+        let rendered = render_messages_with_output_expanded(&[result], 100, true);
 
         assert_eq!(rendered[0], "  ⎿ result");
         assert_eq!(
@@ -6310,7 +6485,7 @@ mod tool_result_fold_tests {
                 max_content_width: 100,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
-                thinking_expanded: false,
+                output_expanded: true,
             },
             &mut is_first_user,
         );
@@ -6328,22 +6503,30 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn error_tool_result_preview_keeps_tail_line() {
+    fn error_tool_result_renders_every_line_when_expanded() {
         let mut result = message(
             MessageRole::ToolResult,
             "{\"error\":\"bad request\"}\ndetail1\ndetail2\ndetail3\nrequest_id: abc-123",
         );
         result.tool_name = Some("Bash".to_string());
         result.is_error = true;
-        let rendered = render_messages(&[result], 100);
+        let rendered = render_messages_with_output_expanded(&[result], 100, true);
 
         assert_eq!(rendered[1], "    ⎿ {\"error\":\"bad request\"}");
-        assert_eq!(rendered[2], "       ⋮");
+        assert_eq!(rendered[2], "       detail1");
+        assert_eq!(rendered[3], "       detail2");
+        assert_eq!(rendered[4], "       detail3");
         assert_eq!(
-            rendered[3], "       request_id: abc-123",
+            rendered[5], "       request_id: abc-123",
             "尾部字段（request_id / reason）必须可见"
         );
-        assert_eq!(rendered.len(), 4, "head+tail 后恰好 3 行，不应再追加 ...");
+        assert_eq!(rendered.len(), 6, "展开态出全文，不应再省略中间行");
+        // 旧的 head+tail 逻辑会在中间插 `⋮`。展开已是全文，保留它等于主动删掉
+        // 用户明确要求看到的内容
+        assert!(
+            !rendered.iter().any(|line| line.contains('⋮')),
+            "展开态不得再有 `⋮` 中间省略: {rendered:?}"
+        );
     }
 
     #[test]
@@ -6364,7 +6547,115 @@ mod tool_result_fold_tests {
         assert!(user_joined.contains("u1-long-content-that-must-wrap-without-loss"));
         assert!(rendered.iter().any(|line| line.contains("u5")));
         assert!(rendered.iter().any(|line| line.contains("a5")));
+        // 末条断言现在恒真（User/Assistant 路径本来就不截断，且工具结果的截断
+        // 逻辑已整体移除）——保留作无害的兜底，它现在只覆盖 User/Assistant 路径。
         assert!(!rendered.iter().any(|line| line.trim() == "..."));
+    }
+
+    /// 折叠态**完全不碰 content**——性能属性的回归钉子。
+    ///
+    /// `render_tool_result_block` 必须在调 `render_tool_result_preview`（它会把整个
+    /// `content` `lines().collect()` 成 Vec）之前 return。旧实现每帧为每条工具结果
+    /// 构建完整 preview 再只取 3 行扔掉，长会话下是纯粹的浪费——与
+    /// `live_thinking_block_renders_one_line_and_never_touches_content` 消灭的
+    /// 是同一类问题。
+    #[test]
+    fn collapsed_tool_result_never_touches_content() {
+        let mut result = message(MessageRole::ToolResult, &"x".repeat(100_000));
+        result.tool_name = Some("Bash".to_string());
+        let rendered = render_messages(&[result], 100);
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|line| line.contains("xxx")),
+            "折叠态不得渲染任何正文"
+        );
+    }
+
+    /// 展开态不得出现任何形式的省略标记。
+    ///
+    /// 旧的截断机制有两套：`push_capped_preview_lines` 的 `...`（所有超长结果）和
+    /// 错误结果的 head+tail `⋮`（专程保住尾部的 `request_id` / `reason`）。展开已是
+    /// 全文，两者都必须消失——`⋮` 尤其危险，它会主动删掉用户明确要求看到的中间内容。
+    #[test]
+    fn expanded_result_has_no_ellipsis_of_any_kind() {
+        let long_err = {
+            let mut m = message(
+                MessageRole::ToolResult,
+                &(1..=30)
+                    .map(|i| format!("err line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            m.tool_name = Some("Bash".to_string());
+            m.is_error = true;
+            m
+        };
+        let long_diff = {
+            let mut m = message(
+                MessageRole::ToolResult,
+                &(1..=30)
+                    .map(|i| format!("+ added line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            m.tool_name = Some("Edit".to_string());
+            m
+        };
+        let long_plain = {
+            let mut m = message(
+                MessageRole::ToolResult,
+                &(1..=30)
+                    .map(|i| format!("plain line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            m.tool_name = Some("Bash".to_string());
+            m
+        };
+
+        for result in [long_err, long_diff, long_plain] {
+            let rendered = render_messages_with_output_expanded(&[result], 100, true);
+            assert!(
+                !rendered.iter().any(|line| line.trim() == "..."),
+                "展开态不得出现 `...`: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|line| line.contains('⋮')),
+                "展开态不得出现 `⋮`: {rendered:?}"
+            );
+            assert!(
+                rendered.last().is_some_and(|l| !l.trim().is_empty()),
+                "展开态最后一行应是真实内容而非省略标记: {rendered:?}"
+            );
+        }
+    }
+
+    /// `!` bash 命令输出（`MessageRole::BashOutput`）**不折叠**，保持三行预览。
+    ///
+    /// 该分支是 `push_capped_preview_lines` / `TASK_PREVIEW_MAX_ROWS` 的最后调用点，
+    /// 且此前零测试覆盖——删掉截断常量或误把折叠逻辑扩到这里都会让本测试变红。
+    #[test]
+    fn bangs_bash_output_keeps_its_own_three_line_preview() {
+        let output = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut msg = message(MessageRole::BashOutput, &output);
+        msg.elapsed_secs = Some(0.4);
+
+        // Ctrl+O 无论开关，都保持三行预览 + `...`
+        for expanded in [false, true] {
+            let rendered = render_messages_with_output_expanded(&[msg.clone()], 100, expanded);
+            assert!(
+                rendered.iter().any(|line| line.trim() == "..."),
+                "`!` 输出应保留 3 行预览（expanded={expanded}）: {rendered:?}"
+            );
+            assert!(
+                !rendered.iter().any(|line| line.contains("line 10")),
+                "`!` 输出不应因 Ctrl+O 而出全文（expanded={expanded}）: {rendered:?}"
+            );
+        }
     }
 
     /// 回归测试：AI 思考期间用户继续在主输入框打字 / 移动光标时，硬件光标

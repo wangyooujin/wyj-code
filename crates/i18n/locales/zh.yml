@@ -114,6 +114,8 @@ cli:
   subagent_trace_sub_id_help: "子 Agent id（Hub 分配的数字，如 3；留空则列出该会话全部子 Agent 概览）"
   subagent_trace_json_help: "直接输出原始 JSONL（供管道处理），仅在指定了子 Agent id 时生效"
   trust_mcp_about: "批准当前项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）的信任确认，供配置定时任务前手动批准"
+  trust_skills_about: "批准当前项目级 skill（.wyj-code/skills/）的信任确认；这些 skill 的正文来自本仓库提交者，执行时整段交给模型"
+  trust_about: "一次性批准当前项目级的 MCP server 与 skill，供配置定时任务前手动批准"
 
 update:
   checking: "正在检查最新版本…"
@@ -197,6 +199,7 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
+    - `Ctrl+O` — 展开/折叠 thinking 与工具结果正文
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾
@@ -705,6 +708,9 @@ dialog:
   project_trust_title: " ⚠ 项目级 MCP server 待信任确认 "
   project_trust_intro: "以下项目级 MCP server 会被当作子进程执行，请确认信任后再连接："
   project_trust_hint: "  [y] 信任并连接   [n/Esc] 本次跳过（下次启动会再次询问）"
+  skill_trust_title: " ⚠ 项目级 skill 待信任确认 "
+  skill_trust_intro: "以下斜杠命令来自本仓库的 .wyj-code/skills/，由仓库作者编写。未信任前它们不会出现在补全里，模型也不知道它们存在。信任后每次执行都会把整段正文作为指令交给模型："
+  skill_trust_hint: "  [y] 信任并启用   [n/Esc] 本次跳过（下次启动会再次询问）"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "
   ask_question_other_label: "其他…"

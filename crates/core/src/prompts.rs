@@ -28,9 +28,10 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 - Do not ask about things you can resolve yourself by reading code or picking a sensible default.
 
 # Skills
-- Skills are reusable instruction sets the user installs. They live only in `~/.wyj-code/skills/` (global) and `<git-repo-root>/.wyj-code/skills/` (project); each is a directory with a `SKILL.md` entrypoint, or a bare `<name>.md` file.
+- Skills are reusable instruction sets the user installs. They live only in `~/.wyj-code/skills/` (global) and `<git-repo-root>/.wyj-code/skills/` (project); each is a directory with a `SKILL.md` entrypoint, or a bare `<name>.md` file. The absolute path of `~` is the "Home directory" field in the `<env>` block below.
 - **Skills are invoked by the user as slash commands** (`/<skill-name> [arguments]`). They are not a tool and not something you can load yourself. There is no `Skill` tool in your tool definitions, and no way for you to invoke one.
-- The skills installed in this environment are listed at the end of this section. When the user asks you to "use a skill", pick from that list and tell them the exact command to type. Never read, list, or search `~/.claude/skills/` or any other `.claude` path to answer this — wyj-code loads nothing from there, so browsing those directories only finds files that are not wired into this session.
+- The skills installed in this environment are listed at the end of this section. When the user asks you to "use a skill", pick from that list and tell them the exact command to type.
+- **Never go looking for skill files yourself.** Do not read, list, glob, or search any skills directory — not `~/.wyj-code/skills/`, not `<git-repo-root>/.wyj-code/skills/`, not `~/.claude/skills/`, not any other path, and never a path you reconstructed from memory or guessed. To answer "which skills are available?" or "can you use skill X?", the only correct source is the list below. Searching the filesystem cannot improve your answer and only risks reporting on files that are not wired into this session.
 - If the list is empty, say plainly that no skills are installed here rather than guessing a name.
 {skills}
 - If the user has already invoked a skill in this conversation, its instructions are already part of the conversation. Follow them; do not try to re-read the skill file.
@@ -70,6 +71,11 @@ pub struct EnvInfo {
     pub platform: String,
     pub today: String,
     pub model: String,
+    /// 用户主目录的绝对路径。模型需要它来定位 `~/.wyj-code/` 下的配置与
+    /// skill 目录——不给的话模型只能猜，实测会凭空编出 `/Users/dev` 这类
+    /// 不存在的路径（`~/.wyj-code/skills/...` 里的 `~` 只有 shell 会展开）。
+    /// 与 `cwd` 一样是会话内恒定字段，进 prompt cache 的 stable 段。
+    pub home: String,
 }
 
 impl EnvInfo {
@@ -83,8 +89,20 @@ impl EnvInfo {
             platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             today: today_local(),
             model: model.to_string(),
+            home: home_dir_display(),
         }
     }
+}
+
+/// 取用户主目录。取不到时退回字面量 `~` —— 此时 `~/.wyj-code/skills/`
+/// 这类含 `~` 的写法对模型仍然成立（shell 工具会自行展开），比编一个
+/// 不存在的绝对路径安全得多。
+fn home_dir_display() -> String {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()))
+        .unwrap_or_else(|| "~".to_string())
 }
 
 fn today_local() -> String {
@@ -166,8 +184,9 @@ fn one_line(text: &str) -> String {
 /// `<env>` 环境块：拼接在主 system prompt 之后。只含会话内稳定字段。
 pub fn environment_block(env: &EnvInfo) -> String {
     format!(
-        "\n\n<env>\nWorking directory: {}\nIs git repo: {}\nPlatform: {}\nToday's date: {}\nModel: {}\n</env>",
+        "\n\n<env>\nWorking directory: {}\nHome directory: {}\nIs git repo: {}\nPlatform: {}\nToday's date: {}\nModel: {}\n</env>",
         env.cwd,
+        env.home,
         if env.is_git_repo { "yes" } else { "no" },
         env.platform,
         env.today,
@@ -417,12 +436,29 @@ mod tests {
             platform: "macos arm64".into(),
             today: "2026-07-03".into(),
             model: "m1".into(),
+            home: "/Users/someone".into(),
         };
         let block = environment_block(&env);
         assert!(block.contains("<env>"));
         assert!(block.contains("Working directory: /tmp/x"));
+        assert!(block.contains("Home directory: /Users/someone"));
         assert!(block.contains("Is git repo: yes"));
         assert!(block.contains("Model: m1"));
+    }
+
+    /// `<env>` 必须带 home 目录：否则模型无从得知 `~/.wyj-code/skills/` 的真实
+    /// 绝对路径。实测（2026-10-09）缺这一项时，模型会凭空编出 `/Users/dev/...`
+    /// 这种不存在的路径，并据此断言"skill 实际未安装"。
+    #[test]
+    fn env_block_always_reports_a_home_directory() {
+        let env = EnvInfo::collect(std::path::Path::new("/tmp"), "m1");
+        let home = env.home.clone();
+        assert!(!home.is_empty(), "home 不得为空字符串");
+        assert!(
+            std::path::Path::new(&home).is_absolute() || home == "~",
+            "home 应是绝对路径，或退回 `~`，绝不能是编出来的路径: {home}"
+        );
+        assert!(environment_block(&env).contains(&format!("Home directory: {home}")));
     }
 
     #[test]
@@ -456,8 +492,29 @@ mod tests {
             "必须明确否认存在 Skill 工具，否则模型会反复尝试调用不存在的工具"
         );
         assert!(
-            MAIN.contains("Never read, list, or search `~/.claude/skills/`"),
-            "必须显式禁止翻 .claude 目录，否则模型仍会按训练先验去找"
+            MAIN.contains("Never go looking for skill files yourself"),
+            "必须显式禁止自行检索 skill 目录，否则模型仍会按训练先验去找"
+        );
+        // 回归背景（2026-10-09 补）：禁令原先只枚举 `~/.claude/skills/` 这一个
+        // **具体路径**，模型换个目录就绕过去了——它去读「正确」的
+        // `~/.wyj-code/skills/`，只是把 home 编成了 `/Users/dev`（会话记录里
+        // 它自己写了 "But I don't know the home dir"），据此断言 skill 未安装。
+        // 修法：禁令从「禁某几个路径」升级为「禁止一切自发检索」的行为禁令，
+        // 并指向唯一的合法信息来源（下方名单）。
+        for forbidden in [
+            "not `~/.wyj-code/skills/`",
+            "not `<git-repo-root>/.wyj-code/skills/`",
+            "not `~/.claude/skills/`",
+            "never a path you reconstructed from memory or guessed",
+        ] {
+            assert!(
+                MAIN.contains(forbidden),
+                "行为禁令必须逐一点名这些易被误检索的目录: 缺 {forbidden}"
+            );
+        }
+        assert!(
+            MAIN.contains("Home directory"),
+            "必须指向 <env> 块里的 Home directory，让模型知道 `~` 的真实绝对路径"
         );
         // 回归背景（v1.5.18 补）：只禁检索、却不给名单，模型唯一诚实的回答就是
         // 把禁令复述给用户（"我不能自己调用 skill"）。名单靠 `{skills}` 占位注入。
