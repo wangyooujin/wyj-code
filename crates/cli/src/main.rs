@@ -135,6 +135,14 @@ enum Commands {
     /// 项目级 server 而不连接，配 cron 任务前先用这个命令批准一次。
     #[command(name = "trust-mcp", about = wyj_i18n::tr("cli.trust_mcp_about"))]
     TrustMcp,
+    /// 批准当前项目级 skill（`.wyj-code/skills/`）的信任确认。
+    /// 这些 skill 的正文是纯文本指令，敲 `/xxx` 后整段交给模型；来源是本仓库
+    /// 的提交者。`trust-mcp` 仍只管 MCP——信任决策逐类可见。
+    #[command(name = "trust-skills", about = wyj_i18n::tr("cli.trust_skills_about"))]
+    TrustSkills,
+    /// 一次性批准项目级的 MCP server 与 skill（配 cron 定时任务前用这个）。
+    #[command(name = "trust", about = wyj_i18n::tr("cli.trust_about"))]
+    Trust,
     /// Inspect model identity, capabilities and optional live compatibility probes.
     #[command(name = "model")]
     Model {
@@ -676,14 +684,22 @@ fn collect_skill_entries(
     if let Some(local) = local_plugin {
         sources.extend(local.skill_paths.clone());
     }
-    let mut entries: Vec<wyj_core::prompts::SkillEntry> =
-        wyj_commands::skill::load_skills(home, cwd, &disabled, &sources)
-            .iter()
-            .map(|c| wyj_core::prompts::SkillEntry {
-                name: c.name().to_string(),
-                description: c.description(),
-            })
-            .collect();
+    // 信任门控：未批准的项目级 skill 既不进斜杠注册表，也不进模型名单。
+    // `collect_skill_entries` 是所有运行模式（-p / --headless / TUI / ACP /
+    // daemon / workflow run）的公共路径，门控放在这里即全覆盖。
+    let mut entries: Vec<wyj_core::prompts::SkillEntry> = wyj_commands::skill::load_skills(
+        home,
+        cwd,
+        &disabled,
+        &sources,
+        wyj_commands::skill::ProjectSkillsGate::resolve(cwd),
+    )
+    .iter()
+    .map(|c| wyj_core::prompts::SkillEntry {
+        name: c.name().to_string(),
+        description: c.description(),
+    })
+    .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
 }
@@ -869,6 +885,14 @@ async fn main() -> Result<()> {
             Commands::TrustMcp => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return trust_cmd::run(&cwd).await;
+            }
+            Commands::TrustSkills => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return trust_cmd::run_with_scope(&cwd, trust_cmd::TrustScope::Skills).await;
+            }
+            Commands::Trust => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return trust_cmd::run_with_scope(&cwd, trust_cmd::TrustScope::All).await;
             }
             Commands::Storage { command } => {
                 let config_base = wyj_config::config_dir()?;
@@ -1460,6 +1484,20 @@ async fn main() -> Result<()> {
         // 跳过、不连接：`-p` 常被脚本/cron 无 TTY 调用，没有交互通道可以弹窗
         // 确认，静默放行等于让克隆到的陌生仓库能无感执行任意命令。用户需要
         // 先在 TUI 里批准一次，或运行 `wyj-code trust-mcp` 批准。
+        // 项目级 skill 未信任：同样静默排除并提示一次。**绝不**做 stdin 阻塞式
+        // 确认——`-p` 常被脚本/cron 无 TTY 调用，阻塞会挂起。
+        {
+            let disabled = wyj_store::disabled_skill_names(&cwd);
+            let pending = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
+            if !pending.is_empty() && !wyj_store::skill_trust::project_skills_trusted(&cwd) {
+                let mut names: Vec<_> = pending.iter().map(|i| i.name.clone()).collect();
+                names.sort();
+                eprintln!(
+                    "[以下项目级 skill 尚未信任批准，本次未加载: {}；运行 `wyj-code trust-skills` 批准]",
+                    names.join(", ")
+                );
+            }
+        }
         let (mut effective_mcp_servers, untrusted_servers) =
             wyj_store::mcp_install::effective_mcp_servers_trust_split(&cfg, &cwd);
         if !untrusted_servers.is_empty() {
@@ -1817,10 +1855,15 @@ async fn main() -> Result<()> {
     let context_edit_totals_for_rebuild = context_edit_totals.clone();
     let code_index_for_rebuild = code_index.clone();
     let plugin_output_style_for_rebuild = plugin_output_style.clone();
-    // rebuild_fn 必须捕获同一份 skill 名单：`/model` 热切换与设置面板保存都会
-    // 重建 Agent，不重新注入的话 `{skills}` 占位会残留、模型重新变回"我不知道
-    // 有哪些 skill"。复用主 Agent 的那一份，保证重建前后名单字节一致。
-    let skill_entries_for_rebuild = skill_entries;
+    // rebuild_fn 必须注入 skill 名单：`/model` 热切换与设置面板保存都会重建
+    // Agent，不注入的话 `{skills}` 占位会残留、模型重新变回"我不知道有哪些
+    // skill"。
+    //
+    // **在闭包内重算**而不是捕获主 Agent 那一份 `skill_entries`（v1.5.19 修正）：
+    // 捕获的是不可变快照，`/skills` 面板 enable/disable、项目级 skill 信任批准
+    // 之后重建都刷不到新名单——会出现"斜杠能敲、模型永远不知道"的不一致。
+    let skill_home_for_rebuild = skill_home.clone();
+    let local_plugin_for_rebuild = local_plugin.clone();
     let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
         let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
         let routing_role = if cfg.active_profile().plan_model.as_deref() == Some(new_model) {
@@ -1836,7 +1879,11 @@ async fn main() -> Result<()> {
         let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
         let mut new_agent = Agent::new(provider)
             .with_system(wyj_core::prompts::main_system_prompt(&env_info))
-            .with_skills(skill_entries_for_rebuild.clone())
+            .with_skills(collect_skill_entries(
+                &skill_home_for_rebuild,
+                &cwd_for_rebuild,
+                local_plugin_for_rebuild.as_ref(),
+            ))
             .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
             .with_max_tokens(cfg.active_profile().max_tokens)
             .with_context_window(cfg.active_profile().context_window)
@@ -2823,6 +2870,18 @@ async fn repl(
     // 与 `-p` 单次模式一致：未信任的项目级 MCP server 只提示一次，不在每轮
     // reconcile 时重复刷屏（`effective_mcp_servers_for_runtime` 本身已经在
     // 每轮静默排除它们，这里只是让用户知道"为什么少了几个工具"）。
+    {
+        let disabled = wyj_store::disabled_skill_names(&cwd);
+        let pending = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
+        if !pending.is_empty() && !wyj_store::skill_trust::project_skills_trusted(&cwd) {
+            let mut names: Vec<_> = pending.iter().map(|i| i.name.clone()).collect();
+            names.sort();
+            eprintln!(
+                "[以下项目级 skill 尚未信任批准，本次未加载: {}；运行 `wyj-code trust-skills` 批准]",
+                names.join(", ")
+            );
+        }
+    }
     if let wyj_store::TrustStatus::Pending(servers) = wyj_store::project_trust::trust_status(&cwd) {
         let mut names: Vec<_> = servers.iter().map(|s| s.name.clone()).collect();
         names.sort();
@@ -2926,6 +2985,7 @@ async fn repl(
             &cwd,
             &disabled_skills,
             &current_plugin_skill_sources,
+            wyj_commands::skill::ProjectSkillsGate::resolve(&cwd),
         );
         let dynamic_commands: Vec<(String, String, String)> = cmd_registry
             .list()
