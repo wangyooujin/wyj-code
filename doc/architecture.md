@@ -16,7 +16,7 @@
 - [上下文管理](#上下文管理)
   - [Compact 与持久化截断](#compact-与持久化截断)
   - [Tool-result context editing（清理优先于摘要）](#tool-result-context-editing清理优先于摘要)
-  - [CLAUDE.md 注入](#claudemd-注入)
+  - [AGENTS.md 注入](#agentsmd-注入)
   - [Memory v3](#memory-v3)
 - [会话与 Checkpoint](#会话与-checkpoint)
   - [存储 CAS + Delta 重构](#存储-cas-delta-重构)
@@ -97,7 +97,8 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
         ┌──────────────────────────────────────────────────────────┐
         │   Tool Registry (wyj-tools)                              │
         │   Read Write Edit Bash Glob Grep WebFetch WebSearch       │
-        │   TodoWrite SubAgent Computer AppComputer ...             │
+        │   SubAgent Computer AppComputer ...                       │
+        │   (+ TodoWrite，仅 [tools].todo_enabled = true)           │
         │   + MCP 桥接工具 (wyj-mcp)                                │
         │   + 用户 Skill / 命令                                   │
         └─────────────────────────┬────────────────────────────────────┘
@@ -113,7 +114,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 **关键路径**：
 
 1. 用户输入 → Agent 推理循环 → Provider 流式输出 → 累积 tool_use → 并发执行（`parallel_safe` 工具组内并发，其余串行但与并发组并行）→ ToolResult 回灌 → 续轮直到 `stop_reason != tool_use`。
-2. 每轮开始时 `run_turn_with_injection` 从 `ClaudeMdLoader` 读 `CLAUDE.md`/`CLAUDE.local.md`/`AGENTS.md`，按目录去重拼到当轮 user 消息（不进历史，配合 prompt cache）。
+2. 每轮开始时 `run_turn_with_injection` 从 `ClaudeMdLoader` 读 `AGENTS.md`/`AGENTS.local.md`，按目录去重拼到当轮 user 消息（不进历史，配合 prompt cache）。
 3. 子 Agent 由 `tools::SubAgentTool` 整体 `tokio::spawn` 进 `SubAgentHub`（进程级单例，Semaphore 并发上限 8），事件汇入 hub 统一回调；后台完成结果经注入通道或 `pending_bg_reminders` 送达主 Agent。
 4. TUI 与 headless 共享同一套 Agent / Provider 装配；差异只在渲染层与 `ToolCtx.permission_mode` 默认值。
 
@@ -243,15 +244,15 @@ conversation if needed"。清理比摘要便宜（无 output token、不产生�
 
 落盘前在 `serialize.rs` 走 `truncate_session_for_persistence`，resume/load 时再还原。
 
-### CLAUDE.md 注入
+### AGENTS.md 注入
 
 `core::claude_md::ClaudeMdLoader`：
 
-- 查找范围：全局 `~/.claude/CLAUDE.md` + 从 git 仓库根到 cwd 的祖先链。
-- 每级目录内 `CLAUDE.md`/`CLAUDE.local.md` 都存在则都读（local 视作个人覆盖追加，不提交 git）；两者都不存在则回退读 `AGENTS.md`。
+- 查找范围：全局 `~/.wyj-code/AGENTS.md` + 从项目根到 cwd 的祖先链（v1.5.18 起不再读任何 `.claude/` 路径）。
+- 每级目录内 `AGENTS.md`/`AGENTS.local.md` 都存在则都读（local 视作个人覆盖追加，不提交 git）。文件名对齐 AGENTS.md 开放标准；`CLAUDE.md` 系自 v1.5.18 起硬切换不再读取。
 - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
 - 每轮对话开始重新读盘，以 `<system-reminder>` 包装拼进当轮 user 消息末尾（不注入 system、不进历史；文件不变时字节级稳定、缓存可命中）。
-- 工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有 CLAUDE.md 系文件且本会话未展示过，在 `agent.rs` 工具执行循环里追加到 system 末尾（按目录去重）。
+- 工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有 AGENTS.md 系文件且本会话未展示过，在 `agent.rs` 工具执行循环里追加到 system 末尾（按目录去重）。
 - 不再兼容旧版 `WYJ.md`。
 
 ### Memory v3

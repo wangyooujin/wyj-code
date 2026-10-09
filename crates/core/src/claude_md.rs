@@ -1,8 +1,13 @@
-//! CLAUDE.md 记忆文件加载：对齐 Claude Code 的查找范围与注入方式。
+//! 记忆文件加载：`AGENTS.md`（全局 + 项目祖先链）。
 //!
-//! - 查找范围：全局 `~/.claude/CLAUDE.md` + 从 git 仓库根到 cwd 的祖先链，
-//!   每级目录内 `CLAUDE.md`/`CLAUDE.local.md` 都存在就都读（local 视作个人覆盖追加），
-//!   两者都不存在则回退读 `AGENTS.md`。
+//! - 查找范围：全局 `~/.wyj-code/AGENTS.md` + 从 git 仓库根到 cwd 的祖先链，
+//!   每级目录内 `AGENTS.md` / `AGENTS.local.md` 都存在就都读
+//!   （local 视作个人覆盖追加，不提交 git）。
+//! - **v1.5.18 起彻底不再读取任何 `.claude/` 路径**（原为
+//!   `~/.claude/CLAUDE.md` + `CLAUDE.md` / `CLAUDE.local.md`，`AGENTS.md`
+//!   仅作为二者皆无时的末位回退）。文件名统一为 `AGENTS.md`（复数，对齐
+//!   AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 等均采用），不再有
+//!   "CLAUDE.md 优先于 AGENTS.md"的特殊层级——两者是同一个名字。
 //! - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
 //! - 不缓存文件内容，只缓存"哪些目录参与"这个列表；内容每次调用都重新读盘，
 //!   保证运行期间编辑立即生效、压缩后依然完整（因为每轮都重新拼装，不依赖历史消息）。
@@ -12,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const MAX_IMPORT_DEPTH: u8 = 4;
+
+/// 记忆文件名（主）与个人覆盖文件名。两级顺序读取，local 追加在后。
+const MEMORY_FILE: &str = "AGENTS.md";
+const MEMORY_LOCAL_FILE: &str = "AGENTS.local.md";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClaudeMdSource {
@@ -38,7 +47,7 @@ pub struct ClaudeMdLoader {
 
 impl ClaudeMdLoader {
     pub fn new(cwd: &Path) -> Self {
-        let global_dir = wyj_config::claude_home_dir().ok();
+        let global_dir = wyj_config::global_config_dir().ok();
         let root = wyj_config::project_root(cwd);
         let chain_dirs = collect_chain(&root, cwd);
 
@@ -75,12 +84,12 @@ impl ClaudeMdLoader {
             return None;
         }
         Some(wrap_reminder(
-            "The following CLAUDE.md memory files apply to the current project. Follow their instructions.",
+            "The following AGENTS.md memory files apply to the current project. Follow their instructions.",
             &sections,
         ))
     }
 
-    /// 工具触达新目录时调用：若该目录此前未展示过且存在 CLAUDE.md 系文件，
+    /// 工具触达新目录时调用：若该目录此前未展示过且存在 AGENTS.md 系文件，
     /// 返回一段独立的 reminder 文本；否则返回 None。
     pub fn maybe_dir_reminder(&self, dir: &Path) -> Option<String> {
         let dir = dir.to_path_buf();
@@ -93,7 +102,7 @@ impl ClaudeMdLoader {
         }
         let text = load_dir_files(&dir)?;
         Some(wrap_reminder(
-            "The directory you just accessed has additional CLAUDE.md instructions. Follow them as well:",
+            "The directory you just accessed has additional AGENTS.md instructions. Follow them as well:",
             &[(ClaudeMdSource::Subdir, dir, text)],
         ))
     }
@@ -102,7 +111,7 @@ impl ClaudeMdLoader {
 /// 供 `/memory` 面板调用的纯函数：列出当前 cwd 适用的全部候选文件（含不存在的）。
 pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
     let mut out = vec![];
-    if let Ok(g) = wyj_config::claude_home_dir() {
+    if let Ok(g) = wyj_config::global_config_dir() {
         push_dir_candidates(&mut out, &g, ClaudeMdSource::Global);
     }
     let root = wyj_config::project_root(cwd);
@@ -113,20 +122,17 @@ pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
 }
 
 fn push_dir_candidates(out: &mut Vec<DiscoveredFile>, dir: &Path, source: ClaudeMdSource) {
-    let claude = dir.join("CLAUDE.md");
-    let local = dir.join("CLAUDE.local.md");
-    let agents = dir.join("AGENTS.md");
-    let claude_exists = claude.is_file();
+    let main = dir.join(MEMORY_FILE);
+    let local = dir.join(MEMORY_LOCAL_FILE);
+    let main_exists = main.is_file();
     let local_exists = local.is_file();
-    let agents_exists = agents.is_file();
 
-    if claude_exists || (!local_exists && !agents_exists) {
-        out.push(DiscoveredFile {
-            path: claude,
-            source,
-            exists: claude_exists,
-        });
-    }
+    // 主文件恒定列出（不存在时 exists=false，供 `/memory` 面板提供创建入口）。
+    out.push(DiscoveredFile {
+        path: main,
+        source,
+        exists: main_exists,
+    });
     if local_exists {
         out.push(DiscoveredFile {
             path: local,
@@ -134,40 +140,23 @@ fn push_dir_candidates(out: &mut Vec<DiscoveredFile>, dir: &Path, source: Claude
             exists: true,
         });
     }
-    if !claude_exists && !local_exists && agents_exists {
-        out.push(DiscoveredFile {
-            path: agents,
-            source,
-            exists: true,
-        });
-    }
 }
 
-/// 单个目录内的 CLAUDE.md 系文件读取规则：CLAUDE.md 和 CLAUDE.local.md 都存在就都读
-/// （local 追加在后，视作个人覆盖增补）；两者都不存在则回退读 AGENTS.md。
+/// 单个目录内的记忆文件读取规则：`AGENTS.md` 与 `AGENTS.local.md` 都存在就都读
+/// （local 追加在后，视作个人覆盖增补）。
 fn load_dir_files(dir: &Path) -> Option<String> {
-    let claude = dir.join("CLAUDE.md");
-    let local = dir.join("CLAUDE.local.md");
-    let has_claude = claude.is_file();
-    let has_local = local.is_file();
+    let main = dir.join(MEMORY_FILE);
+    let local = dir.join(MEMORY_LOCAL_FILE);
 
     let mut parts = vec![];
-    if has_claude {
-        if let Some(c) = read_and_resolve(&claude, 0) {
+    if main.is_file() {
+        if let Some(c) = read_and_resolve(&main, 0) {
             parts.push(c);
         }
     }
-    if has_local {
+    if local.is_file() {
         if let Some(c) = read_and_resolve(&local, 0) {
             parts.push(c);
-        }
-    }
-    if !has_claude && !has_local {
-        let agents = dir.join("AGENTS.md");
-        if agents.is_file() {
-            if let Some(c) = read_and_resolve(&agents, 0) {
-                parts.push(c);
-            }
         }
     }
 
@@ -296,17 +285,6 @@ fn wrap_reminder(intro: &str, sections: &[(ClaudeMdSource, PathBuf, String)]) ->
     format!("<system-reminder>\n{}\n</system-reminder>", body.trim_end())
 }
 
-pub(crate) fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        if d.join(".git").exists() {
-            return Some(d.to_path_buf());
-        }
-        dir = d.parent();
-    }
-    None
-}
-
 /// 收集从 root 到 cwd（含两端）的目录链，按 root → cwd 顺序返回。
 fn collect_chain(root: &Path, cwd: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![cwd.to_path_buf()];
@@ -340,31 +318,36 @@ mod tests {
     }
 
     #[test]
-    fn load_dir_files_merges_claude_and_local() {
+    fn load_dir_files_merges_agents_and_local() {
         let dir = unique_dir("merge");
-        std::fs::write(dir.join("CLAUDE.md"), "shared rules").unwrap();
-        std::fs::write(dir.join("CLAUDE.local.md"), "my private override").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "shared rules").unwrap();
+        std::fs::write(dir.join("AGENTS.local.md"), "my private override").unwrap();
         let text = load_dir_files(&dir).unwrap();
         assert!(text.contains("shared rules"));
         assert!(text.contains("my private override"));
     }
 
     #[test]
-    fn load_dir_files_falls_back_to_agents_md() {
-        let dir = unique_dir("agents-fallback");
-        std::fs::write(dir.join("AGENTS.md"), "agents content").unwrap();
-        let text = load_dir_files(&dir).unwrap();
-        assert!(text.contains("agents content"));
+    fn load_dir_files_ignores_claude_md_entirely() {
+        // v1.5.18 硬切换：CLAUDE.md / CLAUDE.local.md 一律不再读取。
+        // 这条锁死"彻底摆脱 .claude 依赖"，防止有人日后把 CLAUDE.md 加回回退链。
+        let dir = unique_dir("claude-ignored");
+        std::fs::write(dir.join("CLAUDE.md"), "legacy claude memory").unwrap();
+        std::fs::write(dir.join("CLAUDE.local.md"), "legacy local").unwrap();
+        assert!(load_dir_files(&dir).is_none(), "CLAUDE.md 系列不应再被读取");
     }
 
     #[test]
-    fn load_dir_files_ignores_agents_md_when_claude_md_present() {
-        let dir = unique_dir("agents-ignored");
-        std::fs::write(dir.join("CLAUDE.md"), "claude wins").unwrap();
-        std::fs::write(dir.join("AGENTS.md"), "should not appear").unwrap();
+    fn agents_md_wins_when_both_agent_variants_present() {
+        // AGENTS.md 与 AGENTS.local.md 同时存在时两者都读（local 追加在后）。
+        let dir = unique_dir("agents-precedence");
+        std::fs::write(dir.join("AGENTS.md"), "committed rules").unwrap();
+        std::fs::write(dir.join("AGENTS.local.md"), "personal override").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "legacy noise").unwrap();
         let text = load_dir_files(&dir).unwrap();
-        assert!(text.contains("claude wins"));
-        assert!(!text.contains("should not appear"));
+        assert!(text.contains("committed rules"));
+        assert!(text.contains("personal override"));
+        assert!(!text.contains("legacy noise"));
     }
 
     #[test]
@@ -403,15 +386,6 @@ mod tests {
     }
 
     #[test]
-    fn find_git_root_walks_up_to_dot_git() {
-        let root = unique_dir("git-root");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        let nested = root.join("a").join("b");
-        std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(find_git_root(&nested), Some(root));
-    }
-
-    #[test]
     fn collect_chain_orders_root_to_cwd() {
         let root = unique_dir("chain-root");
         let cwd = root.join("a").join("b");
@@ -425,7 +399,7 @@ mod tests {
     #[test]
     fn maybe_dir_reminder_only_fires_once_per_dir() {
         let dir = unique_dir("subdir-dedup");
-        std::fs::write(dir.join("CLAUDE.md"), "subdir notes").unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "subdir notes").unwrap();
         let loader = ClaudeMdLoader {
             global_dir: None,
             chain_dirs: vec![],

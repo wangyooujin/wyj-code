@@ -1,11 +1,16 @@
-//! Hooks 生命周期自动化：`.claude/settings.json` 声明的 shell 命令在
-//! PreToolUse/PostToolUse/UserPromptSubmit/Stop 四个时机被执行，对齐真
-//! Claude Code 的配置格式与 stdin/stdout 执行协议。
+//! Hooks 生命周期自动化：settings 文件里声明的 shell 命令在
+//! PreToolUse/PostToolUse/UserPromptSubmit/Stop 四个时机被执行，沿用真
+//! Claude Code 的配置格式与 stdin/stdout 执行协议（但路径完全自有）。
 //!
-//! 三源合并（用户级 `~/.claude/settings.json` → 项目级
-//! `<git-root>/.claude/settings.json` → `<git-root>/.claude/settings.local.json`）
+//! 三源合并（用户级 `~/.wyj-code/settings.json` → 项目级
+//! `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`）
 //! 是纯拼接、不覆盖：同一事件下三源的 hook 列表按来源顺序依次追加、依次执行，
 //! 与真 CC 语义一致（项目/本地配置是对用户级配置的补充，不是替换）。
+//!
+//! **v1.5.18 起不再读取任何 `.claude/` 路径**——原先的三源是
+//! `~/.claude/settings.json` + `<git-root>/.claude/settings.json` +
+//! `<git-root>/.claude/settings.local.json`，现已全部迁入 `.wyj-code/` 体系，
+//! 与 skill / MCP / agent 定义的项目边界（`config::project_config_dir`）保持一致。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,15 +22,13 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::claude_md::find_git_root;
-
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 fn default_hook_type() -> String {
     "command".to_string()
 }
 
-/// 一份 `.claude/settings.json` 里 `hooks` 键的解析结果，key 为事件名
+/// 一份 settings 文件里 `hooks` 键的解析结果，key 为事件名
 /// （`"PreToolUse"`/`"PostToolUse"`/`"UserPromptSubmit"`/`"Stop"`）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HooksSettings {
@@ -316,12 +319,12 @@ fn build_command(command: &str) -> Command {
 /// 同一哲学：内容不缓存，保证运行期间编辑立即生效）。
 pub fn load_effective_hooks(cwd: &Path) -> HooksSettings {
     let mut paths = Vec::new();
-    if let Ok(home) = wyj_config::claude_home_dir() {
-        paths.push(home.join("settings.json"));
+    if let Ok(global) = wyj_config::global_config_dir() {
+        paths.push(global.join("settings.json"));
     }
-    let root = find_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    paths.push(root.join(".claude").join("settings.json"));
-    paths.push(root.join(".claude").join("settings.local.json"));
+    let root = wyj_config::project_root(cwd);
+    paths.push(root.join(".wyj-code").join("settings.json"));
+    paths.push(root.join(".wyj-code").join("settings.local.json"));
     merge_sources(&paths)
 }
 

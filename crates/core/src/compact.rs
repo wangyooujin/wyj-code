@@ -91,7 +91,7 @@ pub struct CompactResult {
 /// 现在压缩决策、展示、`/context` 面板全部共用这一个结构体。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContextAudit {
-    /// system prompt（主提示 + env + 记忆快照 + CLAUDE.md 祖先链）。
+    /// system prompt（主提示 + env + 记忆快照 + AGENTS.md 祖先链）。
     pub system_tokens: u32,
     /// 本次实际发送的工具定义（已扣除 lazy tool 折叠的部分）。
     pub tool_schema_tokens: u32,
@@ -551,7 +551,7 @@ fn messages_to_text(messages: &[Message]) -> String {
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::Text { text } => {
-                        // 跳过历史中残留的 CLAUDE.md <system-reminder> 块（旧版本注入
+                        // 跳过历史中残留的 AGENTS.md <system-reminder> 块（旧版本注入
                         // 到 user 消息的遗留），避免摘要里混入记忆文件碎片。
                         if text.contains("<system-reminder>") {
                             None

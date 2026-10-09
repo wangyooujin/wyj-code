@@ -895,7 +895,7 @@ impl Command for DoctorCmd {
         ));
         lines.push(tr_fmt("doctor.model", &[("model", &ctx.model)]));
 
-        // CLAUDE.md 系文件（全局 + 祖先链）
+        // AGENTS.md 系文件（全局 + 祖先链）
         let claude_md_files = wyj_core::discover_files(&ctx.cwd);
         let existing: Vec<String> = claude_md_files
             .iter()
@@ -1236,14 +1236,14 @@ impl Command for InitCmd {
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         // 骨架创建是确定性代码，不依赖 LLM：先确保 .wyj-code/ 目录 + 带注释的
         // 空 mcp.toml/settings.toml 模板存在（已存在则不动，防止覆盖用户已填
-        // 内容），再触发 agent 回合生成/合并 CLAUDE.md。失败按 best-effort
+        // 内容），再触发 agent 回合生成/合并 AGENTS.md。失败按 best-effort
         // 处理——骨架初始化是锦上添花，不应该让 /init 的核心功能（生成
         // CLAUDE.md）因为这一步失败而整体失败。
         ensure_project_config_skeleton(&ctx.cwd);
 
         // 对齐真实 Claude Code：/init 不是静态模板写文件，而是触发一次真正的 agent
         // 回合，让它自己去探索项目（Cargo.toml/package.json/README/目录结构等）
-        // 生成或合并改进 CLAUDE.md。已存在则要求读取后合并而非整体覆盖。
+        // 生成或合并改进 AGENTS.md。已存在则要求读取后合并而非整体覆盖。
         let prompt = tr_fmt(
             "init.agent_prompt",
             &[("cwd", &ctx.cwd.display().to_string())],

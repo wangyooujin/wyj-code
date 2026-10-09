@@ -17,12 +17,12 @@ pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send + '
 ///   * `<current-tool-availability>` 随工具懒加载命中/过期而变；
 ///   * 模型兼容 suffix 随 route 能力而变；
 ///   * Project Brief 每次按「最近 4 条 user 消息」重算相关性排序；
-///   * 子目录 CLAUDE.md reminder 被 `push_str` 追加到 system 末尾——旧注释
+///   * 子目录 AGENTS.md reminder 被 `push_str` 追加到 system 末尾——旧注释
 ///     里「只增不减，前缀仍可缓存」的说法是错的，追加在断点**之后**同样会
 ///     改变断点处的前缀哈希。
 ///
 /// 拆成两段后，`stable` 承载进缓存的内容（主提示 / `<env>` / 模式段 /
-/// 记忆快照 / CLAUDE.md 祖先链），断点只打在它末尾；`volatile` 承载每轮
+/// 记忆快照 / AGENTS.md 祖先链），断点只打在它末尾；`volatile` 承载每轮
 /// 变化的内容，不打断点，也不影响 `stable` 的缓存命中。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SystemPrompt<'a> {
