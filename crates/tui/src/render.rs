@@ -1026,6 +1026,16 @@ fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
         .collect()
 }
 
+/// `bash.rs` 在非零退出时会把 `退出码 N` 拼在输出最前面。这行对模型有用，但 TUI 里
+/// 它会占掉 `⎿` 预览唯一的第一行——用户看到的永远是「退出码 1」这种零信息量的摘要，
+/// 真正有用的错误信息（第三方 API 的 JSON 错误体等）被整块挤到视野之外。渲染层识别
+/// 并跳过它，让 `⎿` 行直接展示真实错误首行。
+fn is_exit_code_banner(line: &str) -> bool {
+    line.trim()
+        .strip_prefix("退出码 ")
+        .is_some_and(|rest| rest.trim().parse::<i64>().is_ok())
+}
+
 fn render_tool_result_preview(
     lines: &mut Vec<Line<'static>>,
     msg: &ChatMessage,
@@ -1042,10 +1052,18 @@ fn render_tool_result_preview(
     // ToolResult 只有 3 个视觉预览行：空行不应被当成有效内容，
     // 否则 AskQuestion 这类结构化结果会把名额浪费在纯空白上。Diff 中的
     // 空上下文行仍保留，避免改变 Edit/Write 预览的补丁结构。
-    let compact_content = content_lines
+    let mut compact_content = content_lines
         .into_iter()
         .filter(|line| is_diff || !line.trim().is_empty())
         .collect::<Vec<_>>();
+    // 错误场景：丢掉工具自拼的 `退出码 N` 横幅，把这行名额让给真实错误信息。
+    if msg.is_error
+        && compact_content
+            .first()
+            .is_some_and(|l| is_exit_code_banner(l))
+    {
+        compact_content.remove(0);
+    }
     let source = if compact_content.is_empty() {
         vec![fallback.as_str()]
     } else {
@@ -1055,7 +1073,14 @@ fn render_tool_result_preview(
     let mut first = true;
     for raw in source {
         let style = if msg.is_error {
-            Theme::error()
+            // 只有第一视觉行保持红色作为「失败」锚点，其余降为 dim：一次 curl 参数
+            // 错误后 AI 会自行重试，属预期内的可自愈噪音，整块刷红会把它渲染成
+            // 程序崩溃级别的告警，真正的 shell 失败反而被淹没在同样的红里。
+            if first {
+                Theme::error()
+            } else {
+                Theme::dim()
+            }
         } else if is_diff {
             if raw.starts_with("+ ") {
                 Style::default().fg(Color::Green)
@@ -1081,6 +1106,16 @@ fn render_tool_result_preview(
             )));
             first = false;
         }
+    }
+    if msg.is_error && preview.len() > TASK_PREVIEW_MAX_ROWS {
+        // 错误输出改 head+tail：第三方 API 的关键字段（`request id` / `reason` /
+        // traceback 末行）几乎总在**尾部**，只取 head 必然丢失它们。保首末两行，
+        // 中间用 ⋮ 明示省略——比追加一行 `...` 更明确地表达「中间被吃掉了」。
+        let last = preview.pop().expect("preview 非空");
+        let mut capped = preview.into_iter().take(1).collect::<Vec<_>>();
+        capped.push(Line::from(Span::styled("       ⋮", Theme::dim())));
+        capped.push(last);
+        preview = capped;
     }
     push_capped_preview_lines(lines, preview, if is_diff { "    " } else { "       " });
 }
@@ -3282,7 +3317,7 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
     f.render_widget(para, inner);
 }
 
-/// CLAUDE.md 记忆面板渲染（/memory 命令触发）
+/// AGENTS.md 记忆面板渲染（/memory 命令触发）
 fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
     let content_lines = dialog.rows.len() as u16 + 3; // 行列表 + 分隔线 + 错误行 + 提示行
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
@@ -6106,6 +6141,71 @@ mod tool_result_fold_tests {
 
         assert_eq!(rendered.len(), 5);
         assert_eq!(rendered.last().map(String::as_str), Some("    ..."));
+    }
+
+    #[test]
+    fn error_bash_result_skips_exit_code_banner_in_preview() {
+        let mut result = message(
+            MessageRole::ToolResult,
+            "退出码 1\n{\"error\":{\"code\":\"invalid_request\"}}",
+        );
+        result.tool_name = Some("Bash".to_string());
+        result.is_error = true;
+        let rendered = render_messages(&[result], 100);
+
+        assert_eq!(rendered[0], "  ⎿ result");
+        assert_eq!(
+            rendered[1], "    ⎿ {\"error\":{\"code\":\"invalid_request\"}}",
+            "⎿ 行应直接展示真实错误首行，而不是被「退出码 1」占掉"
+        );
+    }
+
+    #[test]
+    fn error_tool_result_keeps_only_first_line_red() {
+        let mut result = message(MessageRole::ToolResult, "退出码 1\nboom\ndetails here");
+        result.tool_name = Some("Bash".to_string());
+        result.is_error = true;
+        let mut is_first_user = true;
+        let lines = render_message_range(
+            MessageRangeRenderArgs {
+                messages: &[result],
+                range: 0..1,
+                max_content_width: 100,
+                sub_agents: &std::collections::BTreeMap::new(),
+                spinner_frame: 0,
+            },
+            &mut is_first_user,
+        );
+
+        assert_eq!(
+            lines[1].spans[0].style,
+            Theme::error(),
+            "首行红色作失败锚点"
+        );
+        assert_eq!(
+            lines[2].spans[0].style,
+            Theme::dim(),
+            "其余行降为 dim，避免整块刷红"
+        );
+    }
+
+    #[test]
+    fn error_tool_result_preview_keeps_tail_line() {
+        let mut result = message(
+            MessageRole::ToolResult,
+            "{\"error\":\"bad request\"}\ndetail1\ndetail2\ndetail3\nrequest_id: abc-123",
+        );
+        result.tool_name = Some("Bash".to_string());
+        result.is_error = true;
+        let rendered = render_messages(&[result], 100);
+
+        assert_eq!(rendered[1], "    ⎿ {\"error\":\"bad request\"}");
+        assert_eq!(rendered[2], "       ⋮");
+        assert_eq!(
+            rendered[3], "       request_id: abc-123",
+            "尾部字段（request_id / reason）必须可见"
+        );
+        assert_eq!(rendered.len(), 4, "head+tail 后恰好 3 行，不应再追加 ...");
     }
 
     #[test]
