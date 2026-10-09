@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
+use wyj_commands::skill::ProjectSkillsGate;
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::notify::{emit as notify_emit, NotificationEvent};
@@ -5805,16 +5806,16 @@ mod clipboard_paste_tests {
     }
 
     #[test]
-    fn thinking_expanded_defaults_to_folded_and_resets_with_session() {
+    fn output_expanded_defaults_to_folded_and_resets_with_session() {
         let mut state = make_state();
         assert!(
-            !state.thinking_expanded,
+            !state.output_expanded,
             "thinking 默认折叠，避免默认视图被几十行思考挤满"
         );
 
-        state.thinking_expanded = true;
+        state.output_expanded = true;
         state.reset_for_new_session();
-        assert!(!state.thinking_expanded);
+        assert!(!state.output_expanded);
     }
 
     #[test]
@@ -6254,9 +6255,10 @@ pub struct AppState {
     /// extended thinking 流式累积（正文开始时固化为 Thinking 消息）
     pub thinking_buf: String,
     pub thinking_started: Option<std::time::Instant>,
-    /// 是否展开 thinking 正文（Ctrl+O 全局切换）。默认折叠：thinking 常常几十
-    /// 行且默认视图只该留给最终答案，需要细节时再按一次展开。
-    pub thinking_expanded: bool,
+    /// 是否展开所有可折叠正文——thinking 块与**工具调用结果**（Ctrl+O 全局切换，
+    /// 两者共用同一个 flag）。默认折叠：thinking 动辄几十行、工具输出动辄几百行，
+    /// 默认视图只该留给对话本身与最终答案，需要细节时再按一次展开。
+    pub output_expanded: bool,
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
     /// 项目级 MCP server 信任确认：TUI 启动后台连接阶段检测到未信任的
@@ -6264,6 +6266,9 @@ pub struct AppState {
     /// `PermissionDialog` 那样逐工具调用触发，因此不需要 oneshot 回传通道，
     /// 直接在按键处理里调用 `wyj_store::project_trust::approve` 即可）。
     pub pending_mcp_trust: Option<Vec<wyj_config::McpServerConfig>>,
+    /// 项目级 skill 的待批准条目（`.wyj-code/skills/` 随 git clone 落地、
+    /// 内容由仓库作者控制）。为 `Some` 时这些 skill 未进注册表也不在模型名单里。
+    pub pending_skill_trust: Option<Vec<wyj_commands::skill::ProjectSkillInfo>>,
     pub ask_question_dialog: Option<AskQuestionDialog>,
     /// ExitPlanMode 触发的计划批准对话框
     pub plan_dialog: Option<PlanApprovalDialog>,
@@ -6469,10 +6474,11 @@ impl AppState {
             streaming_buf: String::new(),
             thinking_buf: String::new(),
             thinking_started: None,
-            thinking_expanded: false,
+            output_expanded: false,
             is_thinking: false,
             permission_dialog: None,
             pending_mcp_trust: None,
+            pending_skill_trust: None,
             ask_question_dialog: None,
             plan_dialog: None,
             exec_mode_confirm: None,
@@ -6604,7 +6610,7 @@ impl AppState {
         self.streaming_buf.clear();
         self.thinking_buf.clear();
         self.thinking_started = None;
-        self.thinking_expanded = false;
+        self.output_expanded = false;
         self.is_thinking = false;
         self.frozen_up_to = 0;
         // Historical sessions and /clear intentionally freeze the welcome screen;
@@ -10081,8 +10087,13 @@ async fn tui_main(
     if let Some(local) = &local_plugin {
         plugin_skill_sources.extend(local.skill_paths.clone());
     }
-    let mut cmd_registry =
-        standard_registry_with_skills(&home_dir, &cwd, &disabled_skills, &plugin_skill_sources);
+    let mut cmd_registry = standard_registry_with_skills(
+        &home_dir,
+        &cwd,
+        &disabled_skills,
+        &plugin_skill_sources,
+        ProjectSkillsGate::resolve(&cwd),
+    );
 
     // 工具回调：ToolStart/ToolEnd/Usage → AgentEvent，同时拦截 TodoWrite 读取快照
     // （title_cb 也在 wire_tool_callback 内部设置，确保 /model 重建后仍生效）
@@ -10105,6 +10116,17 @@ async fn tui_main(
     // 那样每帧刷新），弹窗见 render::draw_project_trust_panel + 下方按键处理。
     if let wyj_store::TrustStatus::Pending(servers) = wyj_store::project_trust::trust_status(&cwd) {
         state.pending_mcp_trust = Some(servers);
+    }
+
+    // 项目级 skill 信任确认：与 MCP 同构，同样只在启动时检查一次。载荷取自
+    // `project_skill_infos`（走与真正加载完全相同的 walk），确保面板列的名字与
+    // 批准后实际生效的名字一致。全部被 disabled 时不弹空面板。
+    {
+        let disabled = wyj_store::disabled_skill_names(&cwd);
+        let infos = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
+        if !infos.is_empty() {
+            state.pending_skill_trust = Some(infos);
+        }
     }
 
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
@@ -12897,6 +12919,54 @@ async fn tui_main(
                         continue;
                     }
 
+                    // 项目级 skill 信任确认拦截。放在 MCP 分支**之后**：两者同时
+                    // pending 时 MCP 先吃掉这次按键（它能执行任意命令，优先级更高），
+                    // 答完后下一轮自然轮到 skill——不需要额外的排队逻辑。
+                    if state.pending_skill_trust.is_some() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                if let Err(e) = wyj_store::skill_trust::approve_skills(&cwd) {
+                                    tracing::warn!("写入项目级 skill 信任记录失败: {e}");
+                                }
+                                state.pending_skill_trust = None;
+                                // ① 重建命令注册表 —— 不做这步的症状是"按了 y 但
+                                //    `/xxx` 还是敲不出来"，且没有任何报错。
+                                {
+                                    let disabled = wyj_store::disabled_skill_names(&cwd);
+                                    let mut plugin_sources =
+                                        wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
+                                    if let Some(local) = &local_plugin {
+                                        plugin_sources.extend(local.skill_paths.clone());
+                                    }
+                                    cmd_registry = standard_registry_with_skills(
+                                        &home_dir,
+                                        &cwd,
+                                        &disabled,
+                                        &plugin_sources,
+                                        ProjectSkillsGate::resolve(&cwd),
+                                    );
+                                    update_slash_completions(&mut state, &input, &cmd_registry);
+                                }
+                                state.messages.push(ChatMessage::system(
+                                    "已信任，本会话即可使用这些项目 skill。".to_string(),
+                                ));
+                            }
+                            KeyCode::Char('n')
+                            | KeyCode::Char('N')
+                            | KeyCode::Esc
+                            | KeyCode::Char('d')
+                            | KeyCode::Char('D') => {
+                                state.pending_skill_trust = None;
+                                state.messages.push(ChatMessage::system(
+                                    "已跳过，这些项目 skill 本次不加载（下次启动会重新询问）。"
+                                        .to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // ② @ 文件选取器拦截 ↑/↓/Tab/Enter/Esc
                     if !state.file_completions.is_empty() {
                         let fc_len = state.file_completions.len();
@@ -13022,10 +13092,10 @@ async fn tui_main(
                             // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
                             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             }
-                            // Ctrl+O 展开/折叠 thinking 正文。必须显式占位并
+                            // Ctrl+O 展开/折叠 thinking 正文与工具结果正文。必须显式占位并
                             // `continue`：否则会落进下面的 `_` 兜底退出内容焦点。
                             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                state.thinking_expanded = !state.thinking_expanded;
+                                state.output_expanded = !state.output_expanded;
                                 continue;
                             }
                             _ => {
@@ -13218,6 +13288,7 @@ async fn tui_main(
                                 &cwd,
                                 &disabled_skills,
                                 &current_plugin_skill_sources,
+                                ProjectSkillsGate::resolve(&cwd),
                             );
                             let (
                                 audit,
@@ -13329,7 +13400,7 @@ async fn tui_main(
                                         state.streaming_buf.clear();
                                         state.thinking_buf.clear();
                                         state.thinking_started = None;
-                                        state.thinking_expanded = false;
+                                        state.output_expanded = false;
                                         // 已冻结写入终端真实 scrollback 的历史消息（Inline
                                         // viewport 架构下 insert_before 直接落进终端原生回
                                         // 滚缓冲区，state.messages.clear() 管不到它）不额外
@@ -14575,10 +14646,10 @@ async fn tui_main(
                                     }
                                 }
                                 'o' => {
-                                    // Ctrl+O — 展开/折叠 thinking 正文。与内容焦点
+                                    // Ctrl+O — 展开/折叠 thinking 与工具结果正文。与内容焦点
                                     // 态共用同一个 flag，因此在输入框态也必须可用：
                                     // 折叠头提示的正是这个键，而输入框是默认焦点态。
-                                    state.thinking_expanded = !state.thinking_expanded;
+                                    state.output_expanded = !state.output_expanded;
                                 }
                                 _ => {}
                             }

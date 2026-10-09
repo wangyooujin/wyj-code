@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.18：彻底切断 .claude/ 依赖——CLAUDE.md 硬切换为 AGENTS.md（BREAKING）；TodoWrite 任务列表默认关闭；可用 skill 名单注入模型上下文；extended thinking 默认折叠。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<meta name="description" content="wyj-code v1.5.19：项目自带 skill 需显式信任批准（BREAKING）——克隆仓库不再自动注入敌对指令；工具结果默认折叠、Ctrl+O 出全文；修掉模型凭空编造 skill 路径的幻觉。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -80,7 +80,7 @@
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
       <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.18 已公开发布：彻底切断 .claude/ 依赖——项目记忆由 CLAUDE.md 硬切换为 AGENTS.md（BREAKING，升级必读）；可用 skill 名单注入模型上下文，模型不再答「我不能调用 skill」；extended thinking 默认折叠。安装脚本会获取最新公开 Release。</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.19 已公开发布：项目自带的 skill 现在需要显式信任批准（BREAKING，升级必读）——克隆陌生仓库时，对方放进 <code>.wyj-code/skills/</code> 的敌对指令不再自动生效；工具结果默认折叠、Ctrl+O 出全文；并修掉模型凭空编造 skill 路径的幻觉。安装脚本会获取最新公开 Release。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
         <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
           <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
@@ -109,7 +109,7 @@
     </div>
 
     <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.18</div>
+      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.19</div>
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -121,7 +121,7 @@
           <div class="flex items-center gap-2 text-paper/45">
             <span class="text-phosphor">❯</span><span>wyj-code</span>
           </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.18 · latest release · static_only</div>
+          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v1.5.19 · latest release · static_only</div>
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
@@ -182,8 +182,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.18 · 切断 .claude/ 依赖 + skill 可见</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次是一个<strong>边界收口</strong>的版本：把「wyj-code 到底读哪些外部路径」这件事彻底定死，并补上三处真实故障的根因修复。<br><br><strong>BREAKING：彻底切断 <code>.claude/</code> 依赖</strong>。wyj-code 自本版起<strong>不再读取任何 <code>.claude/</code> 路径</strong>——不是「优先读 A、回退读 B」，是硬切换。起因是一个被实测出来的真实故障：模型凭 Claude Code 的训练先验去找 <code>~/.claude/skills/</code>（那里有 20 个 wyj-code 根本不读的 skill），而 wyj-code 自己的 <code>~/.wyj-code/skills/</code> 就躺在旁边看不见。<strong>升级必读：仓库根的 <code>CLAUDE.md</code> 不再被读取</strong>，请改名为 <code>AGENTS.md</code>（AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 均采用）。查找范围为全局 <code>~/.wyj-code/AGENTS.md</code> + 从项目根到 cwd 的祖先链，<code>AGENTS.local.md</code> 作个人覆盖追加（不提交 git）；原三级兜底塌缩为两级。hooks 三源同步迁入 <code>.wyj-code/settings.json</code> → <code>settings.local.json</code>，<code>/init</code> 的生成目标同步改为 <code>AGENTS.md</code>。<br><br><strong>skill 名单注入模型上下文</strong>。此前用户说「请使用 skill 分析股票」，模型回答「我不能自己调用 skill——skill 必须由你用斜杠命令触发」，用户依然<strong>不知道该敲哪条命令</strong>。根因是提示词同时要求了两件冲突的事：<strong>禁止</strong>模型自行检索 skill 目录、却要求它输出一个具体命令名，而 skill 名单此前只存在于 TUI 的 <code>CommandRegistry</code>（只服务 <code>/xxx</code> 补全），<strong>从不进入模型上下文</strong>——这是典型的<strong>禁令 / 数据不匹配</strong>。修法是仿子 Agent 类型那条现成通路给 skill 补上同等出口：<code># Skills</code> 段留占位，<code>Agent::with_skills()</code> 在构造期替换为按 name 排序的可用名单（不排序会打穿 prompt cache）。名单落在 system prompt 的 stable 段、会话内冻结，<strong>prompt cache 照常命中</strong>。skill 仍是用户侧斜杠命令、<strong>不是模型可调用的工具</strong>（仍无 <code>Skill</code> 工具），但模型现在能准确回答「请运行 /xxx」。<br><br><strong>thinking 块默认折叠</strong>。此前固定显示前 3 行正文 + 一个语义不明的 <code>· 41 lines</code> 标记，头部字符 <code>✻</code>（U+273B, Dingbats）在终端字体里缺字形画成豆腐块。现在流式期间只画一行 <code>⎿ ⠋ 思考中…</code> 且<strong>完全不碰 content</strong>（旧实现每帧把整个 thinking buffer 重新折行一遍再只取 3 行扔掉），固化后折叠成 <code>⎿ 已思考 12s（41 行） · Ctrl+O 展开</code>，<code>Ctrl+O</code> 展开后出<strong>全文</strong>——旧实现取头 3 行意味着几十行思考的<strong>结论永远看不到</strong>，而 thinking 是流式追加的、结论在尾部。字符换成 <code>⎿</code>（U+23BF，与 <code>⏺</code> 同区、字体覆盖率不是一个量级）。<br><br><strong>TodoWrite 任务列表默认关闭</strong>，对齐 Claude Code v2.1.233 与 Codex CLI v0.152.0。本地实测依据是 102 个历史会话里的 <strong>132 次调用 100% 独占一个完整 LLM 往返</strong>（0 次与真实工作工具同轮发出），回给模型的「任务列表已更新」信息量为零，最密会话累计重复 prefill 5.2 MB 上下文，<strong>59% 的会话结束时 todo 未收尾</strong>；新增 <code>[tools].todo_enabled</code> 开关，弱模型场景仍可开启。工具结果预览同步修正：<code>⎿</code> 行直接展示真实错误首行，不再被「退出码 N」横幅占掉（第三方 API 的 request id / traceback 末行几乎总在尾部）。<strong>1000 个 workspace 测试</strong> + clippy <code>-D warnings</code> 全绿。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.19 · 项目 skill 信任门控 + 工具结果折叠</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次把「仓库能往我上下文里塞什么」这条边界收口：<strong>BREAKING —— 项目自带的 <code>.wyj-code/skills/</code> 现在需要显式信任批准</strong>。<br><br><strong class="text-amber-400">为什么现在才补</strong>。<code>.wyj-code/skills/</code> 随 <code>git clone</code> 落地，正文由<strong>仓库作者</strong>（可能是陌生人）控制，而 skill 正文是纯文本指令——敲 <code>/xxx</code> 时整段就作为模型指令进入对话。注入面其实<strong>早就开了一半</strong>：skill 的 <code>description</code> 自 v1.5.18 起就经 <code>{skills}</code> 占位注入 system prompt，模型会主动向用户推荐这些命令。而同样能执行任意命令的 <code>mcp.toml</code> 恰恰一直有门控——这个不一致是真实的。<br><br><strong class="text-amber-400">指纹为什么必须覆盖整棵树</strong>。只哈希 <code>SKILL.md</code> 会留下一个<strong>二阶注入面</strong>：<code>references/</code> 虽不被注册成命令，但它是<strong>经由已批准的 SKILL.md 可达的</strong>（SKILL.md 可以写「先读 references/x.md 再动手」，而模型有 Read 工具）。攻击者可以提交一份<strong>干净的</strong> SKILL.md + 恶意 references，你批准后再改子文档即绕过。因此哈希范围刻意做成加载器注册范围的<strong>严格超集</strong>，且是<strong>纯内容哈希</strong>（不含 mtime/inode/权限，否则 <code>git checkout</code> 的字节级还原会被误判成「内容变了」）。回归测试专门钉住这条不变式——<strong>任何人把哈希「优化」成只覆盖 SKILL.md 都会直接打开这个洞</strong>。<br><br><strong class="text-amber-400">工具结果折叠</strong>。此前工具结果固定显示<strong>最多 3 个视觉行</strong>，Bash 的 JSON 输出永远只有头三行，尾部的 <code>request_id</code> / <code>reason</code> / traceback 末行看不到。现有代码里已有三处针对这个缺陷打的补丁（head+tail、跳过「退出码 N」、剥行号），全都是在「3 行预算」这个错误前提下做取舍。现在套用 thinking 的折叠模式：<strong>默认只留 <code>⏺ Bash(…)</code> 标题行、下面一行正文都不出</strong>，<code>Ctrl+O</code> 出<strong>全文</strong>，对齐 Claude Code。内容加工逻辑按「是否预算启发式」分化：三行截断、错误 head+tail 的 <code>⋮</code>、空行过滤<strong>全部删除</strong>（展开已是全文，保留 <code>⋮</code> 反而会<strong>主动删掉用户明确要求看到的中间内容</strong>）；与预算无关的表达层规范化全保留。连带收益是<strong>默认路径反而更快</strong>：折叠态在读取 content 之前就 return，彻底消灭了旧实现「每帧为每条工具结果构建完整 preview 再只取 3 行扔掉」的浪费。<br><br><strong class="text-amber-400">顺带修掉的既有缺陷</strong>。<code>rebuild_fn</code> 原先把 skill 名单当不可变快照捕获，连 <code>/model</code> 热切换都刷不到新名单——改为每次重建时重算，附带修好 <code>/skills</code> 面板 enable/disable 后模型名单不刷新的老问题；i18n 快捷键列表此前<strong>完全没有 <code>Ctrl+O</code></strong>，本版补上（工具结果折叠头不带提示，发现入口更窄）。<br><br><strong>1024 个 workspace 测试</strong> + clippy <code>-D warnings</code> 全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -227,7 +227,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.18" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.18 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.19 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -538,8 +538,20 @@ cargo run -- --config-status</code></pre>
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.18</span>
+        <span class="font-display font-bold text-phosphor">v1.5.19</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519"><strong class="text-amber-400">BREAKING：项目级 skill 信任确认</strong>：<code class="text-amber-400">.wyj-code/skills/</code> 随 <code class="text-amber-400">git clone</code> 落地、正文由<strong>仓库作者</strong>控制，此前与你自己写的 skill 走同一条加载路径。本版门控强度与 <code class="text-amber-400">mcp.toml</code> 完全对齐：首次启动弹面板，<strong>不批准则这些 skill 不加载</strong>（斜杠补全不出现、模型看不见也不会推荐）；批准记录落 <code class="text-amber-400">~/.wyj-code/projects/&lt;key&gt;/skill_trust.json</code>，在仓库内容控制不到的位置；内容变化后指纹失配、重新待批准（含被 <code class="text-amber-400">git pull</code> 悄悄替换的场景）。CLI 侧 <code class="text-amber-400">trust-mcp</code> 一字不改，另设 <code class="text-amber-400">trust-skills</code> 与总入口 <code class="text-amber-400">trust</code>——信任决策必须逐类可见。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519b"><strong class="text-amber-400">工具结果折叠（对齐 Claude Code）</strong>：此前工具结果固定显示<strong>最多 3 个视觉行</strong>，Bash 的 JSON 输出永远只有头三行，看不到尾部的 <code class="text-amber-400">request_id</code> / <code class="text-amber-400">reason</code> / traceback 末行。现套用 v1.5.18 的 thinking 折叠模式：<strong>默认只留 <code class="text-amber-400">⏺ Bash(…)</code> 标题行、下面一行正文都不出</strong>，<code class="text-amber-400">Ctrl+O</code> 出全文、不再有任何行数上限；Edit/Write 彩色 diff、失败结果的红色 <code class="text-amber-400">· failed</code> 同理。内容加工按「是否预算启发式」分化——三行截断 <code class="text-amber-400">...</code>、错误 head+tail 的 <code class="text-amber-400">⋮</code>、空行过滤全部删除；剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、错误首行红其余淡全部保留。输入框敲 <code class="text-amber-400">!</code> 的命令输出是唯一例外，仍保持三行预览。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519c"><strong class="text-amber-400">修模型凭空编造 skill 路径</strong>：用户输入「请用 skills 分析股票」，模型答「技能目录 <code class="text-amber-400">/Users/dev/.wyj-code/skills</code> 在这台机器上不存在」——该路径全仓库和 skill 目录里都不存在，是模型<strong>编的</strong>（真实用户名并非 <code class="text-amber-400">dev</code>）。session 记录里抓到它的 thinking 原文：「Read the file directly at /Users/dev/… <strong>But I don't know the home dir</strong>」。skill 名单注入本身正常（模型能准确说出 <code class="text-amber-400">/hithink-finance</code>），暴露的是两个真缺陷：① 禁令是<strong>路径枚举</strong>、模型换个目录就绕过去了（它转而去读<strong>正确</strong>的 <code class="text-amber-400">~/.wyj-code/skills/</code>，只是把 home 编错），现改成<strong>行为禁令</strong>「禁止一切自发检索 skill 目录」；② <code class="text-amber-400">&lt;env&gt;</code> 块没有 home 目录、模型无从得知真实绝对路径，现新增 <code class="text-amber-400">Home directory</code> 字段（与会话内恒定的 cwd 同性质，进 prompt cache 的 stable 段）。</p>
+      </div>
+    </div>
+
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+          <span class="font-display font-bold text-phosphor">v1.5.18</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518"><strong class="text-amber-400">BREAKING：彻底切断 .claude/ 依赖，CLAUDE.md → AGENTS.md</strong>：wyj-code 自本版起<strong>不再读取任何 .claude/ 路径</strong>——不是「优先读 A、回退读 B」，是硬切换、不保留回退。起因是一个被实测出来的真实故障：模型凭 Claude Code 的训练先验去找 <code class="text-amber-400">~/.claude/skills/</code>（那里有 20 个 wyj-code 根本不读的 skill），而 wyj-code 自己的 <code class="text-amber-400">~/.wyj-code/skills/</code> 就躺在旁边看不见。<strong>升级必读</strong>：仓库根的 <code class="text-amber-400">CLAUDE.md</code> 不再被读取，请改名为 <code class="text-amber-400">AGENTS.md</code>（AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 均采用）。查找范围为全局 <code class="text-amber-400">~/.wyj-code/AGENTS.md</code> + 从项目根到 cwd 的祖先链，每级目录内 <code class="text-amber-400">AGENTS.local.md</code> 作个人覆盖追加（不提交 git）；原「CLAUDE.md → 祖先链 → 两者皆无才读 AGENTS.md」的三级兜底<strong>塌缩为两级</strong>（回退机制本身也是模型行为漂移的来源）。hooks 三源同步迁入 <code class="text-amber-400">.wyj-code/settings.json</code> → <code class="text-amber-400">settings.local.json</code>，原 <code class="text-amber-400">.claude/settings*.json</code> 不再被读取（4 个事件语义、exit 2 = block、stdout JSON 的 decision/reason 表达全部不变）。<code class="text-amber-400">/init</code> 的生成目标同步改为 <code class="text-amber-400">AGENTS.md</code>，否则它会生成一个永远不会被读取的文件。</p>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518b"><strong class="text-amber-400">skill 名单注入模型上下文</strong>：此前用户说「请使用 skill 分析股票」，模型回答「我不能自己调用 skill——skill 必须由你用斜杠命令触发」，用户依然<strong>不知道该敲哪条命令</strong>。根因是提示词同时要求了两件冲突的事——<strong>禁止</strong>模型自行检索 skill 目录、却要求它输出一个具体命令名；而 skill 名单此前只存在于 TUI 的 <code class="text-amber-400">CommandRegistry</code>（只服务 <code class="text-amber-400">/xxx</code> 补全），<strong>从不进入模型上下文</strong>。这是提示词的<strong>禁令 / 数据不匹配</strong>：拿走了获取名单的途径，却要求基于该信息输出。修法是仿子 Agent 类型那条现成通路（<code class="text-amber-400">SUB_AGENT_TEMPLATE.replace("{types}", …)</code>）给 skill 补上同等出口——<code class="text-amber-400"># Skills</code> 段留 <code class="text-amber-400">{skills}</code> 占位，<code class="text-amber-400">Agent::with_skills()</code> 在构造期替换为可用 skill 名单。名单<strong>按 name 排序</strong>后注入（<code class="text-amber-400">load_skills</code> 内部是 HashMap，不排序则每次进程启动字节不同、打穿 prompt cache），落在 system prompt 的 stable 段、会话内冻结，<strong>prompt cache 照常命中</strong>。skill 仍是用户侧斜杠命令、<strong>不是模型可调用的工具</strong>（仍无 <code class="text-amber-400">Skill</code> 工具），但模型现在能准确回答「请运行 /xxx」。</p>

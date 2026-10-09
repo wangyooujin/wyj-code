@@ -1704,11 +1704,18 @@ pub fn standard_registry_with_skills(
     cwd: &std::path::Path,
     disabled_skills: &std::collections::HashSet<String>,
     plugin_skill_sources: &[std::path::PathBuf],
+    project_gate: crate::skill::ProjectSkillsGate,
 ) -> Arc<CommandRegistry> {
     let mut reg = CommandRegistry::new();
 
     // 先注册 skill（优先级低）
-    for skill in crate::skill::load_skills(home, cwd, disabled_skills, plugin_skill_sources) {
+    for skill in crate::skill::load_skills(
+        home,
+        cwd,
+        disabled_skills,
+        plugin_skill_sources,
+        project_gate,
+    ) {
         reg.register(skill);
     }
 

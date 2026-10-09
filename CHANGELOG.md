@@ -2,6 +2,47 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.19] - 2026-10-09
+
+### 【BREAKING】项目级 skill 信任确认：仓库自带的 skill 需显式批准
+
+`<git-root>/.wyj-code/skills/` 随 `git clone` 一起落地，正文由**仓库作者**（可能是陌生人）控制。此前它们与你自己写的 skill 走同一条加载路径——克隆一个陌生仓库、对方在里面放几个 `.wyj-code/skills/*.md`，你敲 `/xxx` 时整段敌对文本就会作为模型指令进入对话。**注入面其实已经开了一半**：skill 的 `description`（≤240 字符）自 v1.5.18 起就经 `{skills}` 占位注入 system prompt，模型会主动向用户推荐这些命令。
+
+本版补上门控，强度与 `mcp.toml` 完全对齐。
+
+- **⚠️ 升级必读**：仓库里带有 `.wyj-code/skills/` 的项目，首次启动会弹出信任面板。**不批准**（`n`/`Esc`）则这些 skill 本次不加载——斜杠补全里不出现，模型也看不见、不会推荐；下次启动会重新询问。批准记录落 `~/.wyj-code/projects/<project_key>/skill_trust.json`，**在仓库内容控制不到的位置**（否则被信任的仓库自己就能在受版本控制的文件里把「已批准」标记改掉）。内容变化后指纹失配、重新变为待批准——**含「被 `git pull` 悄悄替换过」的场景**。
+- **指纹覆盖整棵树、含 `references/`**：`references/` 虽然不会被注册成命令，但它是**经由已批准的 SKILL.md 可达的二阶注入面**（SKILL.md 可以写「先读 `references/x.md` 再动手」，而模型有 Read 工具）。只哈希 SKILL.md 的话，攻击者可以提交一份干净 SKILL.md + 恶意 references，你批准后再改子文档即可绕过。因此哈希范围刻意做成加载器注册范围的**严格超集**：不 follow symlink（防符号链接环 DoS）、symlink 按 link target 字符串入哈希、哈希一切普通文件不过滤扩展名。指纹是**纯内容哈希**（不含 mtime/inode/权限），`git checkout` 的字节级还原不会被误判成「内容变了」。回归测试 `fingerprint_changes_when_reference_doc_changes` 是这条不变式的钉子。
+- **批准后本会话即生效**：批准时同步重建命令注册表与 Agent——斜杠补全立刻可用，模型也在本轮就知道这些 skill 存在。顺带修掉一个既有缺陷：`rebuild_fn` 原先把 skill 名单当不可变快照捕获，连 `/model` 热切换都刷不到新名单，现在改为每次重建时重算，附带修好 `/skills` 面板 enable/disable 后模型名单不刷新的老问题。
+- **CLI**：`trust-mcp` **一字不改**（已上线、可能被脚本化），另设 `trust-skills` 专管 skill、`trust` 为两者总入口（配 cron 定时任务前一次批完）。**信任决策必须逐类可见**——把 skill 并进 `trust-mcp` 会产生「以为在批准 MCP 却连带批准了仓库作者写的指令正文」的真实误操作。
+- **无 UI 通道场景**（`-p` / `--headless` / `schedule run`）与 MCP 同构：静默排除 + 打印一次提示，**不做 stdin 阻塞式确认**（`-p` 常被 cron 无 TTY 调用，阻塞会挂起）。
+- **只覆盖项目级来源**：全局 `~/.wyj-code/skills/`、插件贡献路径、内置 skill 均不受影响——它们不在仓库内容控制范围内。
+
+### 工具结果折叠：默认只留标题行，`Ctrl+O` 出全文
+
+TUI 聊天流里工具调用的结果此前走静态预览：**最多 3 个视觉行**，超出显示 `...`。Bash 的 JSON 输出永远只有头三行，尾部的关键信息（`request_id` / `reason` / traceback 末行）看不到，也不知道下面还有多少内容。现有代码里已有三处针对这个缺陷打的补丁（错误输出改 head+tail、`⎿` 行跳过「退出码 N」横幅、Read 剥离行号），全都是在「3 行预算」这个错误前提下做取舍。
+
+本版把 v1.5.18 的 thinking 折叠模式套到**所有工具结果**上，对齐 Claude Code。
+
+- **默认折叠**：`⏺ Bash(cd /tmp && …) · 0.0s` 之下**一行正文都不出**；Edit/Write 的彩色 diff 同理。失败结果不例外，一律折叠，标题行的红色 ` · failed` 保留。`Ctrl+O` 全局切换后出**全文**、不再有任何行数上限。折叠头**不加任何元信息**（不加行数、不加展开提示）——只留现有标题行。
+- **`!` bash 输出是唯一例外**（输入框敲 `!` 直接执行的命令）保持三行预览 + `...`，`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines` 现在只服务这一条路径。
+- **内容加工逻辑按「是否预算启发式」分化**：纯预算启发式（三行截断 `...`、错误 head+tail 的 `⋮`、空行过滤）全部删除——展开已是全文，保留 `⋮` 反而会**主动删掉用户明确要求看到的中间内容**；与预算无关的表达层规范化（剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、错误首行红/其余 dim）全部保留。
+- **连带收益（默认路径反而更快）**：折叠态在 `tool_result_content_lines`（会把整个 `content` `lines().collect()` 成 Vec）**之前**就 return，彻底消灭了旧实现「每帧为每条工具结果构建完整 preview 再只取 3 行扔掉」的浪费——与 thinking 流式态当初消灭的是同一类问题。测试 `collapsed_tool_result_never_touches_content` 是这条不变式的回归钉子。
+- **Todo 详情面板跟随同一 flag**：它重放的是工具消息，硬编码折叠会让面板只剩一排 `⏺ Tool(...)` 标题、正文全空。
+
+### 修 skill 幻觉路径：`<env>` 补 home 目录 + 禁令改成行为禁令
+
+用户输入「请用 skills 分析股票」，模型回复「技能目录 `/Users/dev/.wyj-code/skills` 在这台机器上不存在」——**`/Users/dev` 这个路径全仓库和 skill 目录里都不存在，是模型编的**（你的用户名是 `wangyoujin`）。会话记录里抓到了它的 thinking 原文：「Read the file directly at /Users/dev/… **But I don't know the home dir**」。同批会话里还编了 `D:\dev\data-platform`、`C:\Users\Alex\…`——中文训练数据的路径模式泄漏。
+
+skill 名单注入本身是正常的（模型能准确说出 `/hithink-finance`），真正暴露的是两个缺陷：
+
+- **禁令是路径枚举，模型换个目录就绕过去了**。原提示只写「禁止读 `~/.claude/skills/` 或任何 `.claude` 路径」，而模型转而去读**正确**的 `~/.wyj-code/skills/`（提示词自己告诉它这个目录）——想去的地方没错，只是把 home 编错了。现改成**行为禁令**：「禁止一切自发检索 skill 目录」，逐一点名三个易误检索目录 + 明确禁止 reconstructed from memory or guessed，并指明名单是唯一合法信息来源。
+- **`<env>` 块没有 home 目录**，模型无从得知 `~/.wyj-code/` 的真实绝对路径，只能猜。现新增 `Home directory` 字段（与会话内恒定的 `cwd` 同性质，进 prompt cache 的 stable 段，不增加重算成本）。
+
+### 顺手修掉的既有缺陷
+
+- **i18n 快捷键列表缺 `Ctrl+O`**：全仓 `Ctrl+O` 此前只出现在 thinking 折叠头和注释里。本次改动让工具结果折叠头不带提示，发现入口更窄，故在 `zh.yml` / `en.yml` 的快捷键列表各补一行。
+- **`trust-mcp` 之外新增两个子命令**，见上文「CLI」条。
+
 ## [1.5.18] - 2026-10-09
 
 ### 【BREAKING】彻底切断 `.claude/` 依赖：`CLAUDE.md` → `AGENTS.md` 硬切换
