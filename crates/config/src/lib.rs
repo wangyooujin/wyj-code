@@ -466,6 +466,35 @@ impl Default for ContextEditCfg {
     }
 }
 
+/// `[tools]` 节 —— 工具注册的门控开关。
+///
+/// 未注册的工具不产生 schema，模型目录里根本看不到它，因此这里的开关等价于
+/// "该工具是否存在"，而不是运行期的软禁用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsCfg {
+    /// 是否注册 `TodoWrite` 任务列表工具。
+    ///
+    /// **默认关闭**，对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0 ——
+    /// 两家头部厂商都已把 todo 脚手架从默认开启改为默认关闭，官方口径是「新模型
+    /// 不需要书面任务列表也能自行跟踪多步工作」。
+    ///
+    /// 本地实测（102 个历史会话）支持这个默认值：
+    /// - 27 个会话用到 TodoWrite，共 132 次调用，其中 **132 次（100%）独占一个完整
+    ///   LLM 往返**，没有一次与真实工作工具同轮发出；回给模型的 `tool_result`
+    ///   （"任务列表已更新: N 项…"）信息量为零——模型自己刚写的，它自己知道。
+    /// - **59% 的会话结束时 todo 未收尾**，与 arXiv:2604.12147（21,120 条 SWE-agent
+    ///   轨迹）的结论一致：与模型内部工作流不对齐的计划会拖后腿，"a subpar plan
+    ///   hurts performance even more than no plan at all"。
+    ///
+    /// 但保留开关而非彻底删除：arXiv:2609.20804 的消融显示 planning 对**弱模型**
+    /// 是 +11.6pp 的防过早放弃脚手架（把"无 edit 就终止"从 68.6% 压到 27.8%），
+    /// 对强模型才是"省 ~30% 成本、准确率不升反微降"。wyj-code 同时接 anthropic /
+    /// openai / MiniMax / GLM / Kimi 等多个 provider，模型能力跨度大，自托管或小
+    /// 模型场景下这个脚手架仍有价值，故交由用户按模型能力自行开启。
+    pub todo_enabled: bool,
+}
+
 /// `crates/sandbox/` 已删除，下方所有 `Sandbox*Cfg` 字段仍保留只为兼容
 /// `~/.wyj-code/config.toml` 历史配置文件（旧 block 不会被 serde 报错），
 /// 运行时整块忽略，不再映射到任何 ToolCtx 状态。读取后会在 Config::load
@@ -806,6 +835,9 @@ pub struct Config {
     /// computer-use 后台优先与前台回退策略（[computer_use] 节）
     #[serde(default)]
     pub computer_use: ComputerUseCfg,
+    /// 工具注册门控（[tools] 节）
+    #[serde(default)]
+    pub tools: ToolsCfg,
     /// WebSearch 搜索 provider（目前支持 "tavily"）
     #[serde(default = "default_search_provider")]
     pub search_provider: String,
@@ -953,6 +985,7 @@ impl Default for Config {
             context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
+            tools: ToolsCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
@@ -1039,6 +1072,7 @@ impl From<LegacyConfigV0> for Config {
             context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
+            tools: ToolsCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
@@ -1355,11 +1389,14 @@ pub fn config_file_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
-/// 返回真实 Claude Code 的全局配置目录路径（~/.claude），仅解析路径、不创建。
-/// 复用该路径是为了让 wyj-code 直接吃到用户已有的真实 Claude Code 全局
-/// CLAUDE.md 记忆，与其使用习惯保持一致。
-pub fn claude_home_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join(".claude"))
+/// 返回全局配置目录（`~/.wyj-code`），仅解析路径、不创建。
+///
+/// 记忆文件 `~/.wyj-code/AGENTS.md` 与全局 hooks `~/.wyj-code/settings.json`
+/// 都落在这里。**v1.5.18 起不再有 `claude_home_dir()`**：这两者分别从
+/// `~/.claude/CLAUDE.md` 与 `~/.claude/settings.json` 迁入，wyj-code 自此
+/// 完全不读任何 `.claude/` 路径。项目级对应物由 [`project_config_dir`] 定位。
+pub fn global_config_dir() -> Result<PathBuf> {
+    Ok(global_config_dir_in(&home_dir()?))
 }
 
 /// 返回用户主目录路径。
@@ -1859,6 +1896,22 @@ context_window = 200000
         assert!(cfg.notify.events.subagent_done);
         assert!(cfg.notify.events.schedule_failure);
         assert_eq!(cfg.notify.rate_limit_seconds, 30);
+    }
+
+    #[test]
+    fn todo_is_disabled_by_default_and_opt_in_works() {
+        // 默认关闭：对齐 Claude Code v2.1.233 / Codex CLI v0.152.0。
+        // 本地实测 132 次 TodoWrite 调用 100% 独占一个完整 LLM 往返，
+        // 且 59% 的会话结束时 todo 未收尾——对强模型是净成本。
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(
+            !cfg.tools.todo_enabled,
+            "TodoWrite 必须默认不注册，否则旧配置文件升级后会静默保留全部开销"
+        );
+
+        // 用户显式开启时（弱模型 / 自托管场景，对应 CLAUDE_CODE_ENABLE_TODO_TOOLS=1）
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
+        assert!(cfg.tools.todo_enabled);
     }
 
     #[test]
