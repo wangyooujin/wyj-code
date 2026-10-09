@@ -164,7 +164,7 @@ help:
     - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
-    - `/memory` — 打开 CLAUDE.md 记忆面板
+    - `/memory` — 打开 AGENTS.md 记忆面板
     - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
     - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
@@ -178,7 +178,7 @@ help:
     - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
-    - `/init` — 让 Agent 探索项目并生成/合并更新 CLAUDE.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
+    - `/init` — 让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
     - `/bug [简述]` — 在浏览器打开本仓库 GitHub issue 页并预填环境信息（零依赖）
     - `/review [PR编号]` — 拉取 PR diff 交给 Agent 审查（需已安装 gh CLI）
     - `/pr-comments [PR编号]` — 查看指定 PR 的评论（需已安装 gh CLI）
@@ -299,13 +299,13 @@ agents:
     hint_detail: "↑↓ 选择   PageUp/PageDown 滚动详情   Enter/Space 收起   Esc 关闭"
 
 memory:
-  desc: "打开 CLAUDE.md 记忆面板"
-  headless_unsupported: "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
+  desc: "打开 AGENTS.md 记忆面板"
+  headless_unsupported: "[headless 模式不支持 /memory 面板，请直接编辑 AGENTS.md 或 ~/.wyj-code/memory/ 下的文件]"
   continuation:
     no_open_tasks: "当前项目没有未完成任务，请说明要开始的新任务。"
   clear_all_help: "/memory clear-all — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行。CLI 用 `wyj-code memory clear-all --yes`。"
   dialog:
-    title: " ◆ CLAUDE.md 记忆 "
+    title: " ◆ AGENTS.md 记忆 "
     not_found: "（未创建，回车可新建）"
     auto_memory_label: "auto-memory 自动记忆提取"
     auto_memory_on: "已启用"
@@ -566,7 +566,7 @@ plugins:
     local_no_upgrade: "本地开发插件没有版本信息，无法升级"
 
 doctor:
-  desc: "诊断运行环境（API Key / 配置 / CLAUDE.md / 记忆）"
+  desc: "诊断运行环境（API Key / 配置 / AGENTS.md / 记忆）"
   header: "wyj-code v{version} 环境诊断\n"
   api_key_missing: "  ✗  API Key      未配置（请设置 WYJ_CODE_API_KEY 或 config.toml）"
   config_file_ok: "  ✓  配置文件    {path}"
@@ -574,8 +574,8 @@ doctor:
   config_dir_err: "  ✗  配置目录    {err}"
   provider: "  ✓  供应商      {provider}"
   model: "  ✓  模型        {model}"
-  claude_md_ok: "  ✓  CLAUDE.md   {paths}"
-  claude_md_missing: "  ✗  CLAUDE.md   未找到（运行 /init 可生成）"
+  claude_md_ok: "  ✓  AGENTS.md   {paths}"
+  claude_md_missing: "  ✗  AGENTS.md   未找到（运行 /init 可生成）"
   memory_dir_with_count: "  ✓  记忆目录    {path} ({count} 条)"
   memory_dir_empty: "  ✗  记忆目录    {path} (暂无记忆)"
   mcp_configured: "  ✓  MCP 服务    {count} 个已配置"
@@ -641,19 +641,19 @@ cwd:
   body: "工作目录: {cwd}"
 
 init:
-  desc: "让 Agent 探索项目并生成/合并更新 CLAUDE.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在"
+  desc: "让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在"
   agent_prompt: |-
-    请为当前项目生成或更新 CLAUDE.md 记忆文件（工作目录：{cwd}）。
+    请为当前项目生成或更新 AGENTS.md 记忆文件（工作目录：{cwd}）。
 
     步骤：
     1. 探索项目结构：查看 Cargo.toml/package.json/pyproject.toml/go.mod 等清单文件、README、
        已有的 lint/CI 配置（如 .eslintrc、.golangci.yml、GitHub Actions workflow），
        判断技术栈、构建命令、测试命令、代码规范。
-    2. 若 {cwd}/CLAUDE.md 已存在，先完整读取，在其基础上合并、补充、改进，
+    2. 若 {cwd}/AGENTS.md 已存在，先完整读取，在其基础上合并、补充、改进，
        不要整体覆盖或丢弃已有内容。
-    3. 若项目中存在 AGENTS.md、.cursorrules 等其它 AI 助手规则文件，
-       阅读并将其中仍然适用的部分整合进 CLAUDE.md。
-    4. 最终把结果写入 {cwd}/CLAUDE.md，内容至少包含：项目概览、构建/测试/lint 命令、
+    3. 若项目中存在 .cursorrules、.github/copilot-instructions.md 等其它 AI 助手规则文件，
+       阅读并将其中仍然适用的部分整合进 AGENTS.md。
+    4. 最终把结果写入 {cwd}/AGENTS.md，内容至少包含：项目概览、构建/测试/lint 命令、
        代码架构说明、开发约定。保持简洁，避免臆测不确定的信息。
 
 config:
@@ -813,7 +813,7 @@ welcome:
   tip_1: '/clear 清空当前对话历史，开始一个新任务'
   tip_2: '在消息里输入 @ 可以快速引用项目里的文件'
   tip_3: '复杂任务可以让 Agent 派生 SubAgent 并行探索，互不干扰主线程'
-  tip_4: '/memory 查看和管理跨会话记忆（CLAUDE.md）'
+  tip_4: '/memory 查看和管理跨会话记忆（AGENTS.md）'
   hint:
     help: '/help 帮助'
     compact: '/compact 压缩上下文'

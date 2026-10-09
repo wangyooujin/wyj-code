@@ -217,9 +217,11 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 ### Agent 与工具
 
 - 内置工具：Read / Write / Edit / Bash（带 sandbox）/ Glob / Grep / WebFetch / WebSearch /
-  TodoWrite / SubAgent / Computer / AppComputer。
+  SubAgent / Computer / AppComputer。
 - WebSearch 仅在配置 `search_api_key` 时注册；Computer 仅 macOS/Windows 编译且需
   vision + Anthropic profile。
+- TodoWrite 任务列表**默认不注册**（`[tools].todo_enabled = false`，对齐 Claude Code
+  v2.1.233 与 Codex CLI v0.152.0）；弱模型 / 自托管场景可显式开启。
 - SubAgent 类型：内置 general-purpose / Explore（只读）/ Plan + 用户自定义六层合并链。
 
 ### 工程化工作流

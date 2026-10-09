@@ -1,5 +1,7 @@
-//! 轻量 Markdown frontmatter 解析器 —— 供 agent_def（`~/.claude/agents/*.md`）
-//! 与 commands::skill（`~/.claude/commands/*.md` / skill 文件）共用。
+//! 轻量 Markdown frontmatter 解析器 —— 供 agent_def
+//! （`~/.wyj-code/agents/*.md` 与 `<git-root>/.wyj-code/agents/*.md`）与
+//! commands::skill（`~/.wyj-code/skills/` / `<git-root>/.wyj-code/skills/`）
+//! 共用。
 //!
 //! 不是完整 YAML，只支持逐行 `key: value`，与真实 Claude Code 的 frontmatter 字段
 //! （如 `tools: Read, Grep, Glob` 逗号分隔字符串）风格一致，无需引入重量级 yaml 依赖。

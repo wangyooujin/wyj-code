@@ -950,9 +950,9 @@ impl SettingsDialog {
     }
 }
 
-// ── CLAUDE.md 记忆面板：/memory 命令触发 ──────────────────────────────────────
+// ── AGENTS.md 记忆面板：/memory 命令触发 ──────────────────────────────────────
 
-/// 记忆面板里的一行：CLAUDE.md 系候选文件 / auto-memory 开关 / auto-memory 索引入口
+/// 记忆面板里的一行：AGENTS.md 系候选文件 / auto-memory 开关 / auto-memory 索引入口
 /// / Memory v3 clear-all 一键清空入口（按 y 二次确认执行）。
 pub enum MemoryRow {
     File(DiscoveredFile),
@@ -6291,7 +6291,7 @@ pub struct AppState {
     pub settings_dialog: Option<SettingsDialog>,
     /// 分组管理面板（/model 无参命令触发时 Some）
     pub profile_dialog: Option<ProfileDialog>,
-    /// CLAUDE.md 记忆面板（/memory 命令触发时 Some）
+    /// AGENTS.md 记忆面板（/memory 命令触发时 Some）
     pub memory_dialog: Option<MemoryDialog>,
     /// 证据化自进化治理中心（/evolve 命令触发时 Some）
     pub evolution_dialog: Option<EvolutionDialog>,
@@ -8183,7 +8183,7 @@ impl AppState {
                 tool_name,
                 arg_summary,
                 // 完整 input 只落盘（trace.rs），TUI 内存态摘要不保留全文（见
-                // CLAUDE.md/plan：避免长会话下常驻全文内存暴涨）
+                // AGENTS.md/plan：避免长会话下常驻全文内存暴涨）
                 input,
             } => {
                 let (input_json, truncated) = wyj_tools::trace::truncate_input(&input);
@@ -11286,7 +11286,7 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ⓪.55 CLAUDE.md 记忆面板拦截（/memory 命令触发）
+                    // ⓪.55 AGENTS.md 记忆面板拦截（/memory 命令触发）
                     if state.memory_dialog.is_some() {
                         match key.code {
                             KeyCode::Up => {
