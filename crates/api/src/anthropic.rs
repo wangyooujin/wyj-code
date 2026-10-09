@@ -197,9 +197,9 @@ struct ImageSource {
 ///
 /// 拆成两块是有意为之：Anthropic 的缓存按**前缀**匹配，`cache_control` 断点
 /// 打在哪块末尾，该块及其之前才进缓存。
-///   * `stable`（主提示 / `<env>` / 模式段 / 记忆快照 / CLAUDE.md 祖先链）
+///   * `stable`（主提示 / `<env>` / 模式段 / 记忆快照 / AGENTS.md 祖先链）
 ///     承载缓存，断点打在这块末尾；
-///   * `volatile`（当前工具可用性 / 模型兼容 suffix / 子目录 CLAUDE.md
+///   * `volatile`（当前工具可用性 / 模型兼容 suffix / 子目录 AGENTS.md
 ///     reminder）每轮都可能变，放在断点**之后**且不打断点——这样它变化时
 ///     不会让 stable 整段（约 1.6k~5k token）全价重算。
 ///
@@ -898,7 +898,7 @@ mod tests {
     // ── system 分段与 prompt cache 断点 ─────────────────────────────────
     //
     // 回归背景：整个 system 曾被压成单个 text 块、断点打在块尾，导致
-    // `<current-tool-availability>`、模型兼容 suffix、子目录 CLAUDE.md
+    // `<current-tool-availability>`、模型兼容 suffix、子目录 AGENTS.md
     // reminder、每轮重算的 Project Brief 中任何一项变化，都会让整段 system
     // 全价重算。拆成 stable / volatile 两块后断点只保护 stable。
 

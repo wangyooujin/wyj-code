@@ -1,9 +1,10 @@
 //! Agent 定义 — 内置 subagent 类型 + 用户自定义 agent（markdown frontmatter）加载
 //!
-//! 自定义 agent 定义文件来源与 skill 链同一哲学（同作用域内真实 Claude Code
-//! 路径覆盖 wyj-code 自造路径，项目覆盖全局）：全局 `~/.wyj-code/agents/*.md`
-//! → 全局 `~/.claude/agents/*.md` → 项目 `{cwd}/.wyj-code/agents/*.md` → 项目
-//! `{cwd}/.claude/agents/*.md`，同名后者覆盖前者。
+//! 自定义 agent 定义文件来源与 skill 链同一哲学（项目覆盖全局）：全局
+//! `~/.wyj-code/agents/*.md` → 已启用插件贡献路径（先到先得）→ 项目
+//! `<git-root>/.wyj-code/agents/*.md`，同名后者覆盖前者。
+//! **不读取 `~/.claude/agents/` 或 `<cwd>/.claude/agents/` 等任何外部源**
+//! （v1.5.15 起移除；本段文档此前仍描述旧的四层链，是一处过时记录）。
 //! frontmatter 支持 name/description/tools/model 四个字段，未识别字段静默忽略；
 //! `model` 引用 `~/.wyj-code/config.toml` 中的 Profile 名（而非模型 ID）。
 

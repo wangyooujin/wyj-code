@@ -61,7 +61,7 @@ pub enum CommandResult {
     ResumeSession(String),
     /// 打开配置设置面板（/config 命令触发）
     OpenSettingsDialog,
-    /// 打开 CLAUDE.md 记忆面板（/memory 命令触发）
+    /// 打开 AGENTS.md 记忆面板（/memory 命令触发）
     OpenMemoryDialog,
     /// 打开 Memory v3 clear-all 二级确认对话框（/memory clear-all 触发）。
     /// 与 `OpenMemoryDialog` 区分：用户必须再按 y/Enter 才执行清空，避免误操作。
