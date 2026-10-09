@@ -1,6 +1,6 @@
 # wyj-code
 
-[![Release](https://img.shields.io/badge/release-v1.5.13-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.13)
+[![Release](https://img.shields.io/badge/release-v1.5.18-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.18)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
@@ -21,8 +21,13 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 [贡献指南](./CONTRIBUTING.md)
 
 > **版本状态**：最新公开版本
-> [v1.5.13](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.13)。
+> [v1.5.18](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.18)。
 > 历史 tag 保持不可移动，一键安装脚本始终下载 GitHub 最新公开 Release。
+>
+> **⚠️ v1.5.18 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
+> `AGENTS.md`，wyj-code 不再读取任何 `.claude/` 路径。把仓库根的 `CLAUDE.md`
+> 改名为 `AGENTS.md`（或另建一份），否则 wyj-code 读不到你的项目上下文。
+> 详见下方「架构」节的说明与 [CHANGELOG](./CHANGELOG.md)。
 >
 > **国产模型适配报告**：[DeepSeek / GLM / Kimi / Qwen / 豆包 / MiniMax 与 Claude Code / Codex 的能力对照](./doc/analysis/domestic-models-vs-claude-code.md)
 > （基于公开网络资料与社区分享的最佳实践总结，未包含实测 benchmark）。
@@ -333,13 +338,19 @@ CLI 治理入口：
 ## 架构
 
 整体架构、Workspace crate 布局、Agent 推理循环、Provider / WireProtocol / Capability
-三层模型、上下文管理（compact、CLAUDE.md 注入、Memory v3）、CAS 会话存储、权限模型、
+三层模型、上下文管理（compact、AGENTS.md 注入、Memory v3）、CAS 会话存储、权限模型、
 SubAgent 编排、MCP/Skill/Plugin/Hooks 扩展点、TUI/Headless/ACP/Daemon 入口、Computer-use 与
 Schedule、Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/architecture.md)。
 
 更细的实现细节、版本演进中的"教训"注释与"为什么这样设计"的背景说明在
 [`CLAUDE.md`](./CLAUDE.md)——那是同时喂给 Claude Code 的项目上下文，是最权威、更新最及时的
 架构参考。
+
+> **注意（v1.5.18 起 BREAKING）**：wyj-code 自己读取的项目记忆文件是 **`AGENTS.md`**
+> （全局 `~/.wyj-code/AGENTS.md` + 仓库根到 cwd 的祖先链），**不再读取 `CLAUDE.md`**，
+> 也不再读取任何 `.claude/` 路径（hooks 三源同样已迁至 `.wyj-code/settings*.json`）。
+> 本仓库的 `CLAUDE.md` 保留下来是给 Claude Code 等工具用的开发文档；若希望
+> **wyj-code 本身**也读到项目上下文，请把内容放进仓库根的 `AGENTS.md`。
 
 ---
 

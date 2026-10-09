@@ -467,6 +467,26 @@ impl Agent {
         self
     }
 
+    /// 注入本会话可用的 skill 名单，替换 [`prompts::MAIN`] 中 `# Skills` 段的
+    /// `{skills}` 占位。
+    ///
+    /// **必须排在 [`Agent::with_system`] 之后**——后者是整体替换，会抹掉这里
+    /// 的写入；反过来本方法只做占位替换，放在 `with_system` 之前等于白写。
+    ///
+    /// 名单在会话内冻结（不做每轮重算），因此落在 system prompt 的 stable 段
+    /// 里、prompt cache 照常命中。代价：用户在 `/skills` 面板中途禁用某个 skill
+    /// 后，本会话的名单不会更新，模型仍可能推荐那个命令。这是刻意的取舍——
+    /// 放进 volatile 段能实时，但每轮要为名单全价重算上千 token。
+    ///
+    /// [`prompts::MAIN`]: crate::prompts::MAIN
+    pub fn with_skills(mut self, skills: Vec<crate::prompts::SkillEntry>) -> Self {
+        let catalog = crate::prompts::render_skill_catalog(&skills);
+        self.system_prompt = self
+            .system_prompt
+            .replace(crate::prompts::SKILL_CATALOG_PLACEHOLDER, &catalog);
+        self
+    }
+
     pub fn with_memory(mut self, mem: Arc<MemoryStore>) -> Self {
         self.memory = Some(mem);
         self
@@ -4234,6 +4254,43 @@ mod tests {
             refreshed.contains("任务 B"),
             "跨桶后应重新计算并看到后台新提取的记忆"
         );
+    }
+
+    #[test]
+    fn with_skills_injects_the_catalog_and_leaves_no_placeholder() {
+        // 回归背景：用户说"请使用 skill 分析股票"，模型回复"我不能自己调用
+        // skill——skill 必须由你用斜杠命令触发"。根因是 skill 名单只存在于 TUI
+        // 的 CommandRegistry（只服务 `/xxx` 补全），从不进入模型上下文；而
+        // 提示词既禁止模型自行检索目录、又要求它给出具体命令名，模型手里没有
+        // 任何名字，唯一诚实的回答就是把禁令复述一遍。
+        let agent =
+            Agent::new(Arc::new(EndTurnProvider)).with_skills(vec![crate::prompts::SkillEntry {
+                name: "hithink-finance".into(),
+                description: "查询 A 股行情与财务数据".into(),
+            }]);
+        assert!(
+            !agent
+                .system_prompt
+                .contains(crate::prompts::SKILL_CATALOG_PLACEHOLDER),
+            "占位符必须被替换掉，不能字面泄漏进 system prompt"
+        );
+        assert!(
+            agent
+                .system_prompt
+                .contains("- `hithink-finance` — 查询 A 股行情与财务数据"),
+            "{}",
+            agent.system_prompt
+        );
+    }
+
+    #[test]
+    fn with_skills_survives_an_empty_installation() {
+        // 一个 skill 都没有时同样不能留下 `{skills}` 字面量
+        let agent = Agent::new(Arc::new(EndTurnProvider)).with_skills(Vec::new());
+        assert!(!agent
+            .system_prompt
+            .contains(crate::prompts::SKILL_CATALOG_PLACEHOLDER));
+        assert!(agent.system_prompt.contains("No skills are installed"));
     }
 
     #[test]
