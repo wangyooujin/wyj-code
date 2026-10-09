@@ -7500,6 +7500,12 @@ impl AppState {
                 name,
                 input_json,
             } => {
+                // TodoWrite 有专属面板（push_inline_todo_lines），走常规工具行会
+                // 让同一次调用在聊天流里出现三遍：⏺ TodoWrite / ⎿ 任务列表已更新… /
+                // TodoWrite 面板头 + 分隔线 + 条目。面板已经把"改了什么"讲得更完整，
+                // 常规行只剩噪音。这里仍然照常登记 tool_info 与占用 seq（ToolEnd 靠
+                // seq 配对回执，见下方同名分支），只是不往聊天流插消息。
+                let is_todo = name == "TodoWrite";
                 self.tool_call_count += 1;
                 let seq = self.tool_call_count;
                 let arg = tool_display_arg(&name, &input_json);
@@ -7511,10 +7517,12 @@ impl AppState {
                 self.current_op = Some(display.clone());
                 self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
-                let mut msg = ChatMessage::tool_call(display, seq);
-                // ToolCall 也记录工具名，供 SubAgent Started 事件 FIFO 配对
-                msg.tool_name = Some(name);
-                self.push_tracked_message(msg);
+                if !is_todo {
+                    let mut msg = ChatMessage::tool_call(display, seq);
+                    // ToolCall 也记录工具名，供 SubAgent Started 事件 FIFO 配对
+                    msg.tool_name = Some(name);
+                    self.push_tracked_message(msg);
+                }
             }
 
             AgentEvent::ToolEnd {
@@ -7525,35 +7533,48 @@ impl AppState {
             } => {
                 self.current_op = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
-                let summary = tool_result_summary(&name, &output, is_error);
-                // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
-                // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
-                // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
-                // 先聚在一起，之后所有 ⎿ 结果再聚在一起，无法一一对应。
-                let call_idx = self.messages.iter().rposition(|m| {
-                    matches!(m.role, MessageRole::ToolCall) && m.sequence_no == Some(seq)
-                });
-                // Agent 工具：把 ToolCall 上绑定的子 Agent id 带到 ToolResult，
-                // 供展开时渲染内部工具调用明细
-                let sub_id = if name == "Agent" {
-                    call_idx.and_then(|i| self.messages[i].sub_agent_id)
+                // ToolStart 已跳过 TodoWrite 的常规行，这里对称地跳过它的回执。
+                // 不能只依赖"call_idx 找不到配对"来自然落空——那样会走
+                // `push_tracked_message` 把 "⎿ 任务列表已更新: N 项…" 追加到流尾。
+                if name == "TodoWrite" {
+                    // TodoWrite 没有 ToolCall 行，因此也不存在 sub_agent_id 回填。
                 } else {
-                    None
-                };
-                let mut msg =
-                    ChatMessage::tool_result(output, is_error, elapsed_secs, seq, name, summary);
-                msg.sub_agent_id = sub_id;
-                match call_idx {
-                    Some(i) => {
-                        self.insert_tracked_message_after(i, msg);
+                    let summary = tool_result_summary(&name, &output, is_error);
+                    // 找到对应的 ToolCall 消息位置：多个工具调用在同一轮里并发执行时，
+                    // ToolEnd 到达顺序未必与 ToolStart 一致，必须按 seq 定位插入点，
+                    // 而不是无条件 push 到列表尾部——否则并发调用会导致所有 ⏺ 标题
+                    // 先聚在一起，之后所有 ⎿ 结果再聚在一起，无法一一对应。
+                    let call_idx = self.messages.iter().rposition(|m| {
+                        matches!(m.role, MessageRole::ToolCall) && m.sequence_no == Some(seq)
+                    });
+                    // Agent 工具：把 ToolCall 上绑定的子 Agent id 带到 ToolResult，
+                    // 供展开时渲染内部工具调用明细
+                    let sub_id = if name == "Agent" {
+                        call_idx.and_then(|i| self.messages[i].sub_agent_id)
+                    } else {
+                        None
+                    };
+                    let mut msg = ChatMessage::tool_result(
+                        output,
+                        is_error,
+                        elapsed_secs,
+                        seq,
+                        name,
+                        summary,
+                    );
+                    msg.sub_agent_id = sub_id;
+                    match call_idx {
+                        Some(i) => {
+                            self.insert_tracked_message_after(i, msg);
+                        }
+                        None => {
+                            self.push_tracked_message(msg);
+                        }
                     }
-                    None => {
-                        self.push_tracked_message(msg);
-                    }
-                }
-                if let Some(said) = sub_id {
-                    if let Some(s) = self.sub_agents.get_mut(&said) {
-                        s.has_result = true;
+                    if let Some(said) = sub_id {
+                        if let Some(s) = self.sub_agents.get_mut(&said) {
+                            s.has_result = true;
+                        }
                     }
                 }
             }
@@ -15634,6 +15655,68 @@ mod todo_stats_tests {
             .messages
             .iter()
             .any(|m| m.id == *id && matches!(m.role, MessageRole::ToolResult))));
+    }
+
+    // ── TodoWrite 不进常规工具行（v1.5.18） ────────────────────────────────
+    //
+    // 回归背景：修复三重渲染前，一次 TodoWrite 会在聊天流里出现三遍——
+    // `ToolStart` 无条件 push 的 ⏺ TodoWrite、`ToolEnd` 追加的 ⎿ 任务列表已更新…、
+    // 以及 `push_inline_todo_lines` 画的面板头 + 分隔线 + 条目。面板已经把"改了什么"
+    // 讲得更完整，常规行只剩噪音。
+
+    #[test]
+    fn todo_write_does_not_push_regular_tool_call_line() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "TodoWrite".to_string(),
+            input_json: serde_json::json!({"todos": []}),
+        });
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "call-1".to_string(),
+            output: "任务列表已更新: 0 项（待处理 0，进行中 0，已完成 0）".to_string(),
+            is_error: false,
+            elapsed_secs: 0.01,
+        });
+
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::ToolCall)),
+            "TodoWrite 不应产生常规 ⏺ 工具行：{:?}",
+            state.messages
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .any(|m| matches!(m.role, MessageRole::ToolResult)),
+            "TodoWrite 不应产生 ⎿ 回执行（否则 call_idx 失配会把它追加到流尾）：{:?}",
+            state.messages
+        );
+    }
+
+    #[test]
+    fn todo_write_still_consumes_a_sequence_number() {
+        // ToolEnd 靠 seq 与 tool_info 配对；ToolStart 若不占用 seq，后续工具会
+        // 与更早的调用撞号。本测试锁死"跳过渲染但不跳过记账"。
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "todo-1".to_string(),
+            name: "TodoWrite".to_string(),
+            input_json: serde_json::json!({"todos": []}),
+        });
+        let todo_seq = state.tool_call_count;
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "read-1".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({"file_path": "a.rs"}),
+        });
+        let read_seq = state.tool_call_count;
+
+        assert_eq!(todo_seq, 1);
+        assert_eq!(read_seq, 2, "TodoWrite 必须占用 seq，Read 不能与之撞号");
     }
 
     // ── 新一轮对话清空任务板 ─────────────────────────────────────────────

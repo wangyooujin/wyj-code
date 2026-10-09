@@ -52,7 +52,6 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "WebFetch",
     "WebSearch",
     "AskQuestion",
-    "TodoWrite",
     "Memory",
     // 清理把工具输出外部化后，模型唯一取回全文的入口。**必须常驻**——
     // 一旦被 lazy 折叠掉，占位符里的 cas:// 引用就成了死路，清理变成不可逆。
@@ -192,7 +191,7 @@ pub struct Agent {
     /// 证据化自进化存储（可选）。Memory v3 存在时只记录 Episode 并发现需审批
     /// 的 Rule/Skill 候选；无 v3 时保留旧 Memory v2 兼容行为。
     evolution: Option<Arc<EvolutionStore>>,
-    /// CLAUDE.md 系记忆文件加载器（可选）
+    /// AGENTS.md 系记忆文件加载器（可选）
     claude_md: Option<Arc<ClaudeMdLoader>>,
     /// 可选的工具事件回调（Send + Sync，可跨线程）
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
@@ -939,13 +938,13 @@ impl Agent {
         }
         // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
         //
-        //   * `system_stable`   —— 主提示 + 跨会话记忆 + CLAUDE.md 祖先链。
+        //   * `system_stable`   —— 主提示 + 跨会话记忆 + AGENTS.md 祖先链。
         //     承载 prompt cache，Anthropic 侧 cache_control 断点打在这段末尾。
         //     记忆快照按 10 个用户轮次分桶重算（`memory_snapshot_text`），
-        //     CLAUDE.md 每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
-        //     「用户改了 CLAUDE.md」时才失效缓存。
+        //     AGENTS.md 每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
+        //     「用户改了 AGENTS.md」时才失效缓存。
         //
-        //   * `system_volatile` —— 循环内累积的子目录 CLAUDE.md reminder。
+        //   * `system_volatile` —— 循环内累积的子目录 AGENTS.md reminder。
         //     放在断点之后：旧实现把它 `push_str` 到 system 末尾并注释说
         //     「只增不减，前缀仍可缓存」——这是错的，追加在断点**之后**同样会
         //     改变断点处的前缀哈希，导致每命中一个新目录就整段全价重算。
@@ -1825,7 +1824,7 @@ impl Agent {
                     invalid_argument_rounds = 0;
                 }
 
-                // 子目录动态加载：本轮工具触达的目录若有未展示过的 CLAUDE.md 系文件，
+                // 子目录动态加载：本轮工具触达的目录若有未展示过的 AGENTS.md 系文件，
                 // 追加到 system 的 **volatile 段**（而非稳定前缀、也不注入 user
                 // 消息）。这样历史消息保持干净、避免跨轮重复发送，seen_dirs 去重
                 // 保证每条只追加一次；更重要的是它位于 cache breakpoint 之后，
@@ -4264,7 +4263,7 @@ fn default_system_prompt() -> String {
     crate::prompts::MAIN.to_string()
 }
 
-/// 从工具调用输入里推导其触达的目录，供 CLAUDE.md 子目录动态加载判断。
+/// 从工具调用输入里推导其触达的目录，供 AGENTS.md 子目录动态加载判断。
 /// Read/Edit/Write 用 file_path（取父目录）；Glob/Grep 用 path（文件取父目录，目录取自身）。
 fn touched_dir(
     tool_name: &str,

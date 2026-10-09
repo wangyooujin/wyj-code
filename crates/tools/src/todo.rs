@@ -139,6 +139,15 @@ impl Tool for TodoWriteTool {
         }
     }
 
+    fn parallel_safe(&self) -> bool {
+        // 纯状态写入，与 Read/Bash/Edit 等真实工作工具没有先后依赖。实测 102 个
+        // 历史会话里 132 次 TodoWrite 调用**没有一次**与其它工具同轮发出——默认的
+        // `parallel_safe() = false` 逼模型每次都单独占一个完整 LLM 往返，而回给
+        // 模型的 tool_result（"任务列表已更新: N 项…"）信息量为零：模型自己刚写的
+        // 列表，它自己知道。置 true 让模型可以把 todo 更新和真实工作合并进同一轮。
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
         let items: Vec<TodoItem> = inp

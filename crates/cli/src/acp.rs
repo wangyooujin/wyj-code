@@ -1005,7 +1005,6 @@ fn set_mode(context: &ToolCtx, mode: &str) -> Result<()> {
                 "Bash",
                 "BashOutput",
                 "ExitPlanMode",
-                "TodoWrite",
                 "Agent",
             ]
             .into_iter()

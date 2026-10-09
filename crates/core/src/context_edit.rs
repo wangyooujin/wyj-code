@@ -474,7 +474,7 @@ mod tests {
         for tool in ["Read", "Grep", "Glob", "Bash", "WebFetch"] {
             assert!(is_elidable(tool), "{tool} 应在白名单里");
         }
-        for tool in ["Edit", "Write", "TodoWrite", "Memory", "Agent"] {
+        for tool in ["Edit", "Write", "Memory", "Agent"] {
             assert!(!is_elidable(tool), "{tool} 不应被清理");
         }
     }

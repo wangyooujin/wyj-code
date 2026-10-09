@@ -1164,7 +1164,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // CLAUDE.md 系记忆文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
+    // AGENTS.md 系记忆文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
     // （共享子目录动态加载去重状态）。
     let claude_md_loader = Arc::new(wyj_core::ClaudeMdLoader::new(&cwd));
 
@@ -1328,7 +1328,6 @@ async fn main() -> Result<()> {
                 "Bash",
                 "BashOutput",
                 "ExitPlanMode",
-                "TodoWrite",
                 "Memory",
                 "Agent",
             ]
@@ -1353,7 +1352,13 @@ async fn main() -> Result<()> {
     tool_ctx.set_permission_mode(initial_permission);
 
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
-    registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
+    // 任务列表默认不注册（对齐 Claude Code v2.1.233 / Codex v0.152.0）。未注册的
+    // 工具不产生 schema，模型目录里根本看不到，模型也就不会浪费 LLM 往返去更新它。
+    // todo_store 仍无条件构造并向下传递：TUI 的 TodoUpdate 事件链路要读它，
+    // 且开启开关后的 rebuild_fn 复用同一个 store。
+    if cfg.tools.todo_enabled {
+        registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
+    }
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
     // WebSearch：仅当配置了搜索 API Key 时注册（否则模型看不到该工具，避免误调）
@@ -1524,7 +1529,7 @@ async fn main() -> Result<()> {
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前含 Plan 模式
-    // 限制说明与 computer-use 使用提示；CLAUDE.md 系文件不焊死进 system prompt，
+    // 限制说明与 computer-use 使用提示；AGENTS.md 系文件不焊死进 system prompt，
     // 见 with_claude_md）。
     let mut system_prompt_extra = String::new();
 
@@ -1608,7 +1613,7 @@ async fn main() -> Result<()> {
     }
     if enable_lazy_tool_schemas {
         agent.enable_lazy_tools(
-            ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite", "Memory"]
+            ["Read", "Glob", "Grep", "AskQuestion", "Memory"]
                 .into_iter()
                 .map(str::to_string),
             cfg.model_runtime.lazy_tools_threshold,
@@ -1844,7 +1849,11 @@ async fn main() -> Result<()> {
         reg.register_arc(Arc::new(wyj_core::CodeSearchTool::new(
             code_index_for_rebuild.clone(),
         )));
-        reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
+        // 与初始 registry 同一道门控：`/model` 热切换与设置面板保存都走这里，
+        // 漏掉会让用户关了开关却仍然看得见工具（v1.5.13 Jev 事故同款）。
+        if cfg.tools.todo_enabled {
+            reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
+        }
         reg.register_arc(Arc::new(AskQuestionTool::new()));
         if let Some(memory) = &memory_v3_for_rebuild {
             reg.register_arc(Arc::new(MemoryTool::new(memory.clone())));
@@ -1887,7 +1896,7 @@ async fn main() -> Result<()> {
         }
         if enable_lazy_tool_schemas {
             new_agent.enable_lazy_tools(
-                ["Read", "Glob", "Grep", "AskQuestion", "TodoWrite", "Memory"]
+                ["Read", "Glob", "Grep", "AskQuestion", "Memory"]
                     .into_iter()
                     .map(str::to_string),
                 cfg.model_runtime.lazy_tools_threshold,
@@ -3213,7 +3222,7 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenMemoryDialog) => {
                     println!(
-                        "[headless 模式不支持 /memory 面板，请直接编辑 CLAUDE.md 或 ~/.wyj-code/memory/ 下的文件]"
+                        "[headless 模式不支持 /memory 面板，请直接编辑 AGENTS.md 或 ~/.wyj-code/memory/ 下的文件]"
                     );
                 }
                 Ok(CommandResult::OpenMemoryClearAllConfirm { .. }) => {
