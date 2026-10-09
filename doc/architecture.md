@@ -65,7 +65,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框、panic 兜底还原 |
 | `crates/cli` | 二进制入口 | 解析 CLI 参数，组装所有 crate；启动 TUI / Headless REPL / 单次 `-p` 模式 / ACP adapter / daemon |
 
-二进制名 `wyj-code`；workspace 版本 `1.5.13`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
+二进制名 `wyj-code`；workspace 版本 `1.5.18`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
 
 ---
 
@@ -353,15 +353,23 @@ Checkpoint 支持：
 
 ### Skill / 自定义命令
 
-六层合并链：内置 → `~/.wyj-code/skills` → `~/.claude/commands` → 插件贡献 → `<git-root>/.wyj-code/skills` → `<git-root>/.claude/commands`。
+四层合并链（v1.5.15 起由六层裁剪）：内置 → `~/.wyj-code/skills` → 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。**不读取 `~/.claude/commands/` 或任何外部源**（v1.5.18 起连整个 `.claude/` 都不再读取，见「AGENTS.md 注入」）。
 
-- 支持单文件 `name.md` 与目录式 `name/SKILL.md`。
+- 支持单文件 `name.md` 与目录式 `name/SKILL.md`（命中目录式入口后不再递归注册其 `references/assets/*.md` 私有资源）。
 - frontmatter：`description` / `argument-hint` / `allowed-tools` / `model`（复用 `core::frontmatter::parse`）。
 - `allowed-tools` 执行期通过 `CommandResult::RunPromptScoped` 把 `PermissionMode` 临时收紧为 `Allowlist`，跑完这一轮（含 ESC 中断）自动还原；TUI scoped execution 按 `model` 临时使用指定 Profile。
 
+**skill 是用户侧的斜杠命令，不是模型可调用的工具**（全仓库无 `Skill` 工具），但**可用名单会注入模型上下文**：`prompts::MAIN` 的 `# Skills` 段留 `{skills}` 占位，`Agent::with_skills(Vec<SkillEntry>)` 在构造期替换为 `render_skill_catalog` 的渲染结果。CLI 侧 `main.rs::collect_skill_entries` 调 `load_skills` 取数并按 name 排序（`load_skills` 内部是 `HashMap::into_values()`，不排序会让 system prompt 每次启动字节不同、打穿 prompt cache），注入点为 Agent 构造链与 `rebuild_fn` 两处。
+
+- 为什么需要这条通路：提示词若只禁止模型自行检索目录、却不给它名单，模型唯一既诚实又不违规的回答就是把禁令复述给用户。子 Agent 类型早就通过 `SUB_AGENT_TEMPLATE.replace("{types}", …)` 走了同一条路，skill 之前缺的就是这个出口。
+- 名单**落在 system prompt 的 stable 段、会话内冻结**，因此 prompt cache 照常命中；代价是 `/skills` 面板中途禁用某个 skill 后本会话名单不更新。
+- 仍**不做 `Skill` 工具化**：skill 正文经 `tool_result` 回传会被 `persist_cap` 截断（超长 SKILL.md 会让模型读到残缺指令）、`allowed-tools` 在 `Tool::run` 层拿不到通道、子 Agent 会误继承、marketplace skill 无信任门控。详见 `CLAUDE.md` 架构节第 23 条的五条权衡。
+
 ### Agent 定义
 
-六层合并链同 Skill。frontmatter 字段同 Skill。
+四层合并链同 Skill（内置 → 全局 → 插件贡献 → 项目）。frontmatter 字段同 Skill。
+
+**与 Skill 的关键差异**：Agent 类型列表会经工具描述的 `{types}` 占位动态注入模型上下文（`tools/src/sub_agent.rs`），模型可直接按名调用；Skill 不走这条路，而是走上面的 `# Skills` 名单段落。
 
 ### Hooks 生命周期自动化
 
@@ -393,6 +401,8 @@ Checkpoint 支持：
 | **全局 daemon** | `wyj-code daemon --listen 127.0.0.1:61337` | TCP 连接之间共享进程级 session map，断线不终止 session；扩展 `_wyj/session/list` / `_wyj/session/control` 使用 schema version 2，覆盖 text/thinking/tool/usage/error/turn finished 以及 PermissionRequested、DiffAvailable、CheckpointChanged、AgentStateChanged 事件 |
 
 TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底部、全部历史应用内滚动。
+
+**extended thinking 默认整块折叠**（v1.5.18+）：流式期间只画一行 `⎿ ⠋ 思考中…`（**完全不碰 content**——旧实现每帧把整个 thinking buffer 重新折行一遍、再只取前 3 行扔掉）；固化后折叠成一行元信息 `⎿ 已思考 12s（41 行）  ·  Ctrl+O 展开`，`Ctrl+O` 全局切换后出全文。之所以不给逐条展开：`Ctrl+O` 此前完全空闲，而聊天区的「无选中」语义（`_ => leave_content_focus()` 兜底、Enter = 回输入框）都是围绕"没有消息选中游标"设计的，把历史上被刻意移除的消息选中搬回来回归面过大。耗时取自 `AppState.thinking_started`，固化时落到 `ChatMessage.thinking_elapsed_secs`（不复用按工具语义消费的 `elapsed_secs`）；`/resume` 的旧会话没有耗时记录，显示无秒数变体而非假的 `0.0s`。折叠头用 `⎿`(U+23BF) 而非旧实现的 `✻`(U+273B)：后者属 Dingbats 区，终端字体覆盖率低一个量级，缺字形时画成豆腐块。
 
 ---
 

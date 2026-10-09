@@ -2,6 +2,58 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.18] - 2026-10-09
+
+### 【BREAKING】彻底切断 `.claude/` 依赖：`CLAUDE.md` → `AGENTS.md` 硬切换
+
+wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读 A、回退读 B"，是硬切换、不保留回退）。这不是洁癖，是一个被实测出来的真实故障：模型凭 Claude Code 的训练先验去找 `~/.claude/skills/`，那里有 20 个 wyj-code 根本不读的 skill，而 wyj-code 自己的 `~/.wyj-code/skills/hithink-finance` 就躺在旁边看不见。
+
+- **⚠️ 升级必读**：仓库根目录的 `CLAUDE.md` **不再被读取**。请改名为 `AGENTS.md`（AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 均采用），或同时保留两份。
+- **记忆文件名统一为 `AGENTS.md`（复数）**：`ClaudeMdLoader` 查找范围为全局 `~/.wyj-code/AGENTS.md` + 从项目根到 cwd 的祖先链（`.git` / `.wyj-code/project.toml` 定位仓库根，找不到则只用 cwd 本身）；每级目录内 `AGENTS.md` 与 `AGENTS.local.md` 都存在则都读（local 视作个人覆盖追加、不提交 git）。不再兼容旧版 `WYJ.md`，也不保留 `CLAUDE.local.md`。i18n key 仍沿用历史拼写 `claude_md_ok` / `claude_md_missing`（key 是代码契约，改名会波及所有调用点，值已改成 AGENTS.md）。测试 `load_dir_files_ignores_claude_md_entirely` 锁死该行为。
+- **回退链塌缩为纯两级**：原「全局 CLAUDE.md → 祖先链 CLAUDE.md → 两者皆无才读 AGENTS.md」的三级兜底塌缩为「全局 + 项目祖先链」两级，回退机制本身就是模型行为漂移的来源之一。
+- **hooks 三源全部迁入 `.wyj-code/`**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，供个人临时覆盖、不提交 git）；原三个 `.claude/settings*.json` 源不再被读取。`hooks.rs` 的 git root 探测改用更强的 `config::project_root`（额外识别 `.wyj-code/project.toml`），删除随之失效的 `find_git_root` 死代码并补 3 个 git root 测试。4 个事件（`PreToolUse` / `PostToolUse` / `UserPromptSubmit` / `Stop`）、exit 2 = block、stdout JSON 表达 decision/reason/additionalContext 的语义全部不变。
+- **`/init` 生成目标改为 `AGENTS.md`**（否则 `/init` 会生成一个永远不会被读取的文件）；`claude_home_dir()` 删除、替换为中性命名的 `global_config_dir()`；`frontmatter.rs` / `agent_def.rs` / `prompts.rs` 中过时的 `~/.claude/agents/`、`~/.claude/` 注释与断言同步清理。
+- 工具（Read/Edit/Write/Glob/Grep）触达新子目录时的 `maybe_dir_reminder` 动态加载机制不变。
+
+### TodoWrite 任务列表默认关闭
+
+`[tools].todo_enabled` 默认 `false`，`TodoWriteTool` 不再无条件注册——未注册 = 工具不产生 schema、模型目录里看不到它。**对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0：两家头部厂商在 2026 年都把 todo 脚手架改成了默认关闭**，官方口径是「新模型不需要书面任务列表也能自行跟踪多步工作」。
+
+- **本地实测依据**（102 个历史会话）：27 个会话用到 TodoWrite、共 132 次调用，其中 **132 次（100%）独占一个完整 LLM 往返**，0 次与真实工作工具同轮发出；回给模型的 `tool_result`（"任务列表已更新: N 项…"）信息量为零——模型自己刚写的列表它自己知道。最密会话 15 次这样的空转往返累计重复 prefill 5.2 MB 上下文。**59% 的会话结束时 todo 未收尾。**
+- **外部实证**：arXiv:2604.12147（UIUC+IBM，21,120 条 SWE-agent 轨迹 × 8 种 plan 设置）——「a subpar plan hurts performance even more than no plan at all」；arXiv:2609.20804（UMass，176 组配置 × SWE-Bench/Terminal-Bench）——对强模型 planning 是「省 ~30% 成本、准确率不升反微降」，对弱模型则是 +11.6pp 的防过早放弃脚手架。
+- **保留开关而非删除**：wyj-code 同时接 anthropic / openai / MiniMax / GLM / Kimi 等多个 provider，弱模型 / 自托管场景下这个脚手架仍有实证价值，交由用户按模型能力自行开启。
+- **同步修掉三处实现缺陷**（即便开启也该修）：① **三重渲染**——同一次调用在聊天流里出现三遍（`⏺ TodoWrite` / `⎿ 任务列表已更新…` / 面板头+分隔线+条目），现改为 `ToolStart` 与 `ToolEnd` 都对 `TodoWrite` 跳过常规工具行只保留面板（**`ToolStart` 仍照常占用 seq 并登记 `tool_info`**，否则 `ToolEnd` 靠 seq 配对会失配）；② **100% 独占往返**——`TodoWriteTool` 覆盖 `parallel_safe() -> true`（默认的 false 逼模型每次单独占一轮）；③ **描述精简**——按 Anthropic 官方形态重写为「一句话 + status 枚举 + 单任务 in_progress」。
+
+### skill 机制：先讲清规则，再注入可用名单
+
+用户在 TUI 输入「请使用 skill 分析股票」，模型回复「我不能自己调用 skill——skill 必须由你用斜杠命令触发」，用户依然不知道该敲哪条命令。
+
+- **首次处置（`prompts::MAIN` 加 `# Skills` 段）**：讲清 skill 只存在于 `~/.wyj-code/skills/` 与 `<git-root>/.wyj-code/skills/`、由**用户**用 `/xxx` 调用（显式否认存在 `Skill` 工具，避免模型反复尝试调用不存在的工具）、被要求"用 skill"时不要自己去翻目录、尤其禁止读/列/搜 `~/.claude/skills/`。
+- **二次处置（注入名单）**：只禁检索、不给数据，模型唯一既诚实又不违规的回答就是把禁令复述给用户——**这是提示词的禁令/数据不匹配**，禁掉了获取名单的途径却又要求输出一个无从得知的名字。修法是仿子 Agent 类型那条现成通路（`tools/src/sub_agent.rs` 的 `SUB_AGENT_TEMPLATE.replace("{types}", &types)`），给 skill 补上同等出口：`prompts::MAIN` 的 `# Skills` 段留 `{skills}` 占位，`Agent::with_skills(Vec<SkillEntry>)` 替换之，名单由 `prompts::render_skill_catalog` 渲染。
+  - 名单**直接来自 `load_skills`**（CLI 侧 `main.rs::collect_skill_entries`），不从 `CommandRegistry::list()` 筛 `is_dynamic()`——registry 是「skill 先注册、内置命令后覆盖同名」，已确认 `review` skill 会被内置 `ReviewCmd` 顶掉，从 registry 筛会漏。
+  - 名单**按 name 排序**后注入：`load_skills` 内部是 `HashMap::into_values()`，不排序会让 system prompt 每次进程启动字节不同、连带打穿 prompt cache。
+  - 注入点两处：主 Agent 构造链 + `rebuild_fn` 内（`/model` 热切换与设置面板保存都会重建 Agent，漏了会重新退回"我不知道有哪些 skill"）。列表落在 system prompt 的 **stable 段**，会话内冻结、prompt cache 照常命中；代价是 `/skills` 面板中途禁用某 skill 后本会话名单不更新——刻意取舍，放 volatile 段能实时但每轮要为名单全价重算上千 token。
+  - **仍不做 `Skill` 工具化**：skill 正文走 `tool_result` 会被 `persist_cap` 截断（20KB head + 10KB tail，超长 SKILL.md 会让模型读到中间被挖空的残缺指令，比现状更糟）；`allowed-tools` 靠 `CommandResult::RunPromptScoped` 生效、`Tool::run` 拿不到该通道；子 Agent 会继承 Skill（Claude Code 的做法是禁用）；marketplace skill 作为 tool_result 回给模型是一条**当前完全没有信任门控**的 prompt injection 面。名单注入已解决"模型不知道有哪些 skill"这个真实痛点。
+
+### thinking 块默认折叠，附带修掉字形缺失与行数语义不明
+
+原实现固定显示前 3 行正文 + 一个 `· N lines` 标记，头部字符 `✻`(U+273B, Dingbats) 在终端字体里缺字形画成豆腐块。
+
+- **默认折叠成一行元信息**：`⎿ 已思考 12s（41 行）  ·  Ctrl+O 展开`，`Ctrl+O` 全局切换展开/折叠后出**全文**。`⎿`(U+23BF) 与同文件高频的 `⏺`(U+23FA) 同属 Miscellaneous Technical 区，字体覆盖率不是一个量级。
+- **行数口径修正**：`N lines` 数的是去掉空行后的**原始**行数，与屏幕上经折行再截断的**视觉**行数没有对应关系，因此它只能当元信息、不能当"下面还有多少内容"的提示。
+- **取头改为可展开取全文**：thinking 是流式追加的，最新结论在尾部，旧实现固定取前 3 行意味着几十行思考的结论永远看不到（用户看到的一直是复述任务的开头）。
+- **流式期间不再每帧全量折行**：旧实现每帧把整个 `thinking_buf` 重新 `clean + wrap` 一遍、再只取前 3 行扔掉（500 行 thinking 在 20fps 下约每秒 10000 次无用切分与分配）。现在流式态只画一行 `⎿ ⠋ 思考中…`，**完全不碰 content**。
+- **接线两个一直存在却从未被消费的东西**：`AppState.thinking_started` 自 `ThinkingDelta` 首块写入后**只有写点、零读点**（固化时直接丢弃），现于 `flush_thinking` 清空前算出耗时落到新的 `ChatMessage.thinking_elapsed_secs`（**不复用** `elapsed_secs`——那个字段按工具语义被 6 处渲染代码消费，混入思考耗时会被误显示为工具耗时）；i18n 里 `thinking.done`（"已思考 {secs}s（{lines} 行）"）长期零引用，现在复活并接上。`/resume` 恢复的旧会话没有耗时记录，故新增 `thinking.done_no_elapsed` 分支而不是显示假的 `0.0s`。
+- **不重新引入聊天区消息选中游标**：`Ctrl+O` 是全局开关而非逐条展开——`crates/tui/src/app.rs` 里 `_ => leave_content_focus()` 兜底与 Enter「回输入框」的语义都是按"聊天区无选中"设计的，把历史上被刻意移除的消息选中搬回来回归面过大。
+
+### TUI 工具结果预览
+
+- **`⎿` 行直接展示真实错误首行**，不再被「退出码 N」横幅占掉（第三方 API 的关键字段如 `request id` / `reason` / traceback 末行几乎总在尾部）。错误块整体降级为 dim。
+
+### 测试
+
+1000 个 workspace 测试全部通过（新增 8 个：thinking 折叠/展开/流式/无耗时四种渲染形态、`flush_thinking` 耗时接线、`thinking_expanded` 默认值与复位、`render_skill_catalog` 四例、`with_skills` 注入与空安装防占位符泄漏、`collect_skill_entries` 端到端读取与排序），`clippy --all-targets -D warnings` 零警告。
+
 ## [1.5.17] - 2026-10-08
 
 ### 上下文管理：口径统一 + 状态栏去百分比 + 两个会真 400 的硬缺陷

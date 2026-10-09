@@ -30,8 +30,9 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 # Skills
 - Skills are reusable instruction sets the user installs. They live only in `~/.wyj-code/skills/` (global) and `<git-repo-root>/.wyj-code/skills/` (project); each is a directory with a `SKILL.md` entrypoint, or a bare `<name>.md` file.
 - **Skills are invoked by the user as slash commands** (`/<skill-name> [arguments]`). They are not a tool and not something you can load yourself. There is no `Skill` tool in your tool definitions, and no way for you to invoke one.
-- When the user asks you to "use a skill", do not go looking for skill directories yourself. Never read, list, or search `~/.claude/skills/`, `<cwd>/.claude/`, or any other `.claude` path — wyj-code does not load skills from there. Searching those paths wastes turns and finds files that are not wired into this session. wyj-code reads nothing under any `.claude/` directory.
-- Instead, tell the user which skill to run — name it and give the exact command to type, e.g. "Run `/hithink-finance 分析 600519`". If you are unsure a matching skill exists, say so rather than guessing a path.
+- The skills installed in this environment are listed at the end of this section. When the user asks you to "use a skill", pick from that list and tell them the exact command to type. Never read, list, or search `~/.claude/skills/` or any other `.claude` path to answer this — wyj-code loads nothing from there, so browsing those directories only finds files that are not wired into this session.
+- If the list is empty, say plainly that no skills are installed here rather than guessing a name.
+{skills}
 - If the user has already invoked a skill in this conversation, its instructions are already part of the conversation. Follow them; do not try to re-read the skill file.
 
 # Tool usage policy
@@ -99,6 +100,67 @@ fn today_local() -> String {
         }
     }
     String::from("unknown")
+}
+
+/// [`MAIN`] 中 `# Skills` 段的名单占位符，由 [`Agent::with_skills`] 替换。
+///
+/// 换 [`Agent::with_skills`]: crate::agent::Agent::with_skills
+pub const SKILL_CATALOG_PLACEHOLDER: &str = "{skills}";
+
+/// 注入模型上下文的单个可用 skill。
+///
+/// skill 本身是**用户侧的斜杠命令**（`commands::skill::load_skills` 返回
+/// `Vec<Arc<dyn Command>>` 进 `CommandRegistry`，只服务 TUI 的 `/xxx` 补全），
+/// 模型侧因此拿不到任何名单。名单缺失时提示词既禁止模型自行检索目录、又要求
+/// 它输出一个具体命令名，模型唯一既诚实又不违规的回答就是把禁令复述给用户。
+/// 注入名单是唯一解法——放开目录检索会让模型翻到 wyj-code 根本不读的
+/// `~/.claude/skills/`，把「答不上来」变成「答错」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    /// frontmatter 的 `description`（用户可自由书写，可能是多行长文本）。
+    pub description: String,
+}
+
+/// 单条 skill 描述在名单里的最大字符数。frontmatter 的 description 由第三方
+/// 写入、没有长度上限，不截断的话一条超长条目会把整个名单撑成散文。
+const SKILL_DESCRIPTION_MAX_CHARS: usize = 240;
+
+/// 把 skill 列表渲染成提示词里的名单块。
+///
+/// 输入**必须已按 `name` 排序**：调用方通常直接消费 `load_skills` 的返回值，
+/// 而它内部是 `HashMap::into_values()`（迭代序不确定）。不排序会让 system
+/// prompt 每次进程启动字节不同、prompt cache 永不命中。
+pub fn render_skill_catalog(skills: &[SkillEntry]) -> String {
+    if skills.is_empty() {
+        return "No skills are installed in this environment.".to_string();
+    }
+    let mut s =
+        String::from("Skills installed in this environment (invoked by the user as `/name`):\n");
+    for skill in skills {
+        s.push_str("- `");
+        s.push_str(&skill.name);
+        s.push('`');
+        let desc = one_line(&skill.description);
+        if !desc.is_empty() {
+            s.push_str(" — ");
+            s.push_str(&desc);
+        }
+        s.push('\n');
+    }
+    s.trim_end().to_string()
+}
+
+/// frontmatter 的 `description` 常是多行自由文本；名单里必须压成单行，否则
+/// 一条 skill 就会把整个块撑成散文、后续条目全部错位。按 `char` 而非字节
+/// 截断以避开 CJK/emoji 的 char boundary panic。
+fn one_line(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if joined.chars().count() <= SKILL_DESCRIPTION_MAX_CHARS {
+        return joined;
+    }
+    let cut: String = joined.chars().take(SKILL_DESCRIPTION_MAX_CHARS).collect();
+    format!("{cut}…")
 }
 
 /// `<env>` 环境块：拼接在主 system prompt 之后。只含会话内稳定字段。
@@ -397,6 +459,70 @@ mod tests {
             MAIN.contains("Never read, list, or search `~/.claude/skills/`"),
             "必须显式禁止翻 .claude 目录，否则模型仍会按训练先验去找"
         );
+        // 回归背景（v1.5.18 补）：只禁检索、却不给名单，模型唯一诚实的回答就是
+        // 把禁令复述给用户（"我不能自己调用 skill"）。名单靠 `{skills}` 占位注入。
+        assert!(
+            MAIN.contains(SKILL_CATALOG_PLACEHOLDER),
+            "必须留出 skill 名单占位，否则模型依然拿不到任何可用的 skill 名"
+        );
+        assert!(
+            MAIN.contains("listed at the end of this section"),
+            "提示词必须明确告诉模型名单在提示词内，不要自己去翻目录"
+        );
+    }
+
+    fn entry(name: &str, description: &str) -> SkillEntry {
+        SkillEntry {
+            name: name.to_string(),
+            description: description.to_string(),
+        }
+    }
+
+    #[test]
+    fn skill_catalog_lists_name_and_description_as_slash_commands() {
+        let catalog = render_skill_catalog(&[
+            entry("hithink-finance", "查询 A 股行情与财务数据"),
+            entry("pdf", "PDF manipulation toolkit"),
+        ]);
+        assert!(
+            catalog.contains("- `hithink-finance` — 查询 A 股行情与财务数据"),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("- `pdf` — PDF manipulation toolkit"),
+            "{catalog}"
+        );
+    }
+
+    #[test]
+    fn skill_catalog_says_none_installed_rather_than_rendering_nothing() {
+        // 空列表必须留一句明确说明：否则提示词里那段"名单"变成悬空指代，
+        // 模型可能转而去猜名字（而它连一个名字都不知道）
+        let catalog = render_skill_catalog(&[]);
+        assert!(catalog.contains("No skills are installed"), "{catalog}");
+    }
+
+    #[test]
+    fn skill_catalog_collapses_multiline_and_truncates_long_descriptions() {
+        let catalog = render_skill_catalog(&[entry("multi", "第一行\n第二行\n\n第三行")]);
+        assert_eq!(catalog.lines().count(), 2, "{catalog}"); // 标题 + 1 条
+        assert!(catalog.contains("第一行 第二行 第三行"), "{catalog}");
+
+        let long = "描".repeat(SKILL_DESCRIPTION_MAX_CHARS + 100);
+        let catalog = render_skill_catalog(&[entry("long", &long)]);
+        assert!(
+            catalog.contains('…'),
+            "超长描述必须截断，否则一条就能撑爆整个块"
+        );
+        // 按 char 而非字节：CJK 描述不能被截成乱码或 panic
+        assert!(catalog.is_char_boundary(catalog.len()));
+    }
+
+    #[test]
+    fn skill_catalog_output_is_stable_for_the_same_input_order() {
+        // 名单落在 system prompt 的 stable 段，字节必须可复现才能命中 prompt cache
+        let skills = vec![entry("b", "B"), entry("a", "A"), entry("c", "C")];
+        assert_eq!(render_skill_catalog(&skills), render_skill_catalog(&skills));
     }
 
     #[test]

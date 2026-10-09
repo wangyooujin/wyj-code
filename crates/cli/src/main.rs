@@ -657,6 +657,37 @@ fn configured_route_names(cfg: &Config, role: RoutingRole) -> Vec<String> {
     names
 }
 
+/// 采集本会话要注入模型上下文的 skill 名单。
+///
+/// 直接调 `load_skills` 而**不是**从 `CommandRegistry::list()` 里筛
+/// `is_dynamic()`：registry 的注册顺序是「skill 先注册、内置命令后覆盖同名」，
+/// 从 registry 筛会漏掉被内置命令顶掉的 skill（已知 `review` 就是这种）。
+///
+/// 排序是硬要求而非洁癖：`load_skills` 内部返回 `HashMap::into_values()`，
+/// 迭代序不确定。不排序会让 system prompt 每次进程启动字节不同，落在 stable
+/// 段的 skill 名单会连带把 prompt cache 全部打穿。
+fn collect_skill_entries(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+) -> Vec<wyj_core::prompts::SkillEntry> {
+    let disabled = wyj_store::disabled_skill_names(cwd);
+    let mut sources = wyj_store::plugin_install::enabled_plugin_skill_paths(cwd);
+    if let Some(local) = local_plugin {
+        sources.extend(local.skill_paths.clone());
+    }
+    let mut entries: Vec<wyj_core::prompts::SkillEntry> =
+        wyj_commands::skill::load_skills(home, cwd, &disabled, &sources)
+            .iter()
+            .map(|c| wyj_core::prompts::SkillEntry {
+                name: c.name().to_string(),
+                description: c.description(),
+            })
+            .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries
+}
+
 fn build_fallback_routes(
     cfg: &Config,
     role: RoutingRole,
@@ -1510,8 +1541,15 @@ async fn main() -> Result<()> {
     let model_capabilities = model_resolution.capabilities.clone();
     let fallback_routes = build_fallback_routes(&cfg, routing_role, &cfg.active_profile().name);
     let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
+    // skill 的全局根目录，取法与 repl() 里的 `repl_home` 保持一致
+    let skill_home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let skill_entries = collect_skill_entries(&skill_home, &cwd, local_plugin.as_ref());
     let mut agent = Agent::new(provider_arc.clone())
         .with_system(wyj_core::prompts::main_system_prompt(&env_info))
+        // 必须紧跟 with_system：它做 `{skills}` 占位替换，而 with_system 是整体替换
+        .with_skills(skill_entries.clone())
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window)
@@ -1779,6 +1817,10 @@ async fn main() -> Result<()> {
     let context_edit_totals_for_rebuild = context_edit_totals.clone();
     let code_index_for_rebuild = code_index.clone();
     let plugin_output_style_for_rebuild = plugin_output_style.clone();
+    // rebuild_fn 必须捕获同一份 skill 名单：`/model` 热切换与设置面板保存都会
+    // 重建 Agent，不重新注入的话 `{skills}` 占位会残留、模型重新变回"我不知道
+    // 有哪些 skill"。复用主 Agent 的那一份，保证重建前后名单字节一致。
+    let skill_entries_for_rebuild = skill_entries;
     let rebuild_fn: wyj_tui::RebuildFn = Arc::new(move |cfg: &Config, new_model: &str| {
         let provider = wyj_api::build_provider_with_model(cfg, new_model)?;
         let routing_role = if cfg.active_profile().plan_model.as_deref() == Some(new_model) {
@@ -1794,6 +1836,7 @@ async fn main() -> Result<()> {
         let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
         let mut new_agent = Agent::new(provider)
             .with_system(wyj_core::prompts::main_system_prompt(&env_info))
+            .with_skills(skill_entries_for_rebuild.clone())
             .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
             .with_max_tokens(cfg.active_profile().max_tokens)
             .with_context_window(cfg.active_profile().context_window)
@@ -3381,6 +3424,49 @@ async fn repl(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn collect_skill_entries_reads_global_skills_and_sorts_them() {
+        // 端到端锁住「名单真的能被读到」这条链路：模型看不到 CommandRegistry，
+        // 它能看到的唯一来源就是这个函数的返回值。
+        let home = tempfile::tempdir().unwrap();
+        for (name, description) in [("beta", "第二个"), ("alpha", "第一个")] {
+            let dir = home.path().join(".wyj-code").join("skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n"),
+            )
+            .unwrap();
+        }
+
+        // cwd 用仓库根：`disabled_skill_names` / `enabled_plugin_skill_paths`
+        // 会去读项目配置，但 alpha/beta 不可能与真实配置里的条目撞名
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let entries = collect_skill_entries(home.path(), repo, None);
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // 写入顺序是 beta→alpha，断言必须证明排序真的发生了（`load_skills`
+        // 内部是 HashMap::into_values()，不排序则此处随机失败且 prompt cache
+        // 永远打不中）。名单里还会带上 `load_skills` 的内置 skill
+        // （run/review/fix/explain/commit），它们同样该让模型知道。
+        assert_eq!(names.first(), Some(&"alpha"), "{names:?}");
+        assert!(names.contains(&"beta"), "{names:?}");
+        assert!(
+            names.windows(2).all(|w| w[0] <= w[1]),
+            "名单必须整体有序: {names:?}"
+        );
+        let alpha = entries.iter().find(|e| e.name == "alpha").unwrap();
+        assert!(
+            alpha.description.contains("第一个"),
+            "{}",
+            alpha.description
+        );
+    }
 
     #[test]
     fn config_status_flag_parses() {
