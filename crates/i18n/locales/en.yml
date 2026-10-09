@@ -71,7 +71,10 @@ subagent_trace:
   not_found: "No sub-agent record a{id} found in session {session}"
 
 thinking:
-  done: "✻ Thought for {secs}s ({lines} lines)"
+  running: "  ⎿ ⠋ Thinking…"
+  done: "  ⎿ Thought for {secs}s ({lines} lines)"
+  done_no_elapsed: "  ⎿ Thought ({lines} lines)"
+  expand_hint: "  ·  Ctrl+O to expand"
   status:
     budget: "🧠 budget={n}"
     effort: "🧠 effort={e}"

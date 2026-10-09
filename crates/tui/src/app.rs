@@ -83,6 +83,10 @@ pub struct ChatMessage {
     pub is_error: bool,
     /// 工具执行耗时（ToolResult/BashOutput 专用）
     pub elapsed_secs: Option<f64>,
+    /// AI extended thinking 段的累计耗时（Thinking 专用）。
+    /// 不复用 `elapsed_secs`：那个字段按"工具执行耗时"语义被多处渲染代码消费，
+    /// 混入思考耗时会被误当成工具耗时显示。默认 None，由 `flush_thinking` 填。
+    pub thinking_elapsed_secs: Option<f64>,
     /// 本次工具调用的序号（ToolCall 和 ToolResult 共用，从 1 开始）
     pub sequence_no: Option<usize>,
     /// 工具名（ToolResult 专用）
@@ -105,6 +109,7 @@ impl ChatMessage {
             content,
             is_error: false,
             elapsed_secs: None,
+            thinking_elapsed_secs: None,
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
@@ -121,8 +126,12 @@ impl ChatMessage {
         Self::base(MessageRole::Assistant, content)
     }
 
-    fn thinking(content: String) -> Self {
-        Self::base(MessageRole::Thinking, content)
+    /// Thinking 消息构造。`elapsed_secs` 由 `flush_thinking` 从
+    /// `thinking_started` 算出后回填（该字段此前只有写点、零读点）。
+    fn thinking(content: String, elapsed_secs: Option<f64>) -> Self {
+        let mut m = Self::base(MessageRole::Thinking, content);
+        m.thinking_elapsed_secs = elapsed_secs;
+        m
     }
 
     fn assistant_err(content: String) -> Self {
@@ -151,6 +160,7 @@ impl ChatMessage {
             content: output,
             is_error,
             elapsed_secs: Some(elapsed_secs),
+            thinking_elapsed_secs: None,
             sequence_no: Some(seq),
             tool_name: Some(name),
             display_summary: summary,
@@ -166,6 +176,7 @@ impl ChatMessage {
             content: output,
             is_error: exit_code != 0,
             elapsed_secs: Some(elapsed_secs),
+            thinking_elapsed_secs: None,
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
@@ -5427,7 +5438,7 @@ mod navigation_focus_tests {
         let mut state = make_state();
         state
             .messages
-            .push(ChatMessage::thinking("a\nb\nc".to_string()));
+            .push(ChatMessage::thinking("a\nb\nc".to_string(), None));
         state.chat_scroll = 7;
         state.chat_max_scroll = 12;
 
@@ -5766,6 +5777,44 @@ mod clipboard_paste_tests {
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
+    }
+
+    #[test]
+    fn flush_thinking_records_elapsed_and_clears_the_timer() {
+        // `thinking_started` 自 ThinkingDelta 首块写入后一直只有写点、零读点，
+        // 固化时直接丢弃会让折叠头永远拿不到耗时
+        let mut state = make_state();
+        state.thinking_buf.push_str("第一段\n第二段");
+        state.thinking_started =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1200));
+
+        state.flush_thinking();
+
+        assert!(state.thinking_buf.is_empty());
+        assert!(state.thinking_started.is_none());
+        let thinking = state
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Thinking)
+            .expect("thinking 应已固化为消息");
+        assert_eq!(thinking.content, "第一段\n第二段");
+        let secs = thinking
+            .thinking_elapsed_secs
+            .expect("固化时必须把耗时落到消息上");
+        assert!((1.1..5.0).contains(&secs), "secs={secs}");
+    }
+
+    #[test]
+    fn thinking_expanded_defaults_to_folded_and_resets_with_session() {
+        let mut state = make_state();
+        assert!(
+            !state.thinking_expanded,
+            "thinking 默认折叠，避免默认视图被几十行思考挤满"
+        );
+
+        state.thinking_expanded = true;
+        state.reset_for_new_session();
+        assert!(!state.thinking_expanded);
     }
 
     #[test]
@@ -6205,6 +6254,9 @@ pub struct AppState {
     /// extended thinking 流式累积（正文开始时固化为 Thinking 消息）
     pub thinking_buf: String,
     pub thinking_started: Option<std::time::Instant>,
+    /// 是否展开 thinking 正文（Ctrl+O 全局切换）。默认折叠：thinking 常常几十
+    /// 行且默认视图只该留给最终答案，需要细节时再按一次展开。
+    pub thinking_expanded: bool,
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
     /// 项目级 MCP server 信任确认：TUI 启动后台连接阶段检测到未信任的
@@ -6417,6 +6469,7 @@ impl AppState {
             streaming_buf: String::new(),
             thinking_buf: String::new(),
             thinking_started: None,
+            thinking_expanded: false,
             is_thinking: false,
             permission_dialog: None,
             pending_mcp_trust: None,
@@ -6551,6 +6604,7 @@ impl AppState {
         self.streaming_buf.clear();
         self.thinking_buf.clear();
         self.thinking_started = None;
+        self.thinking_expanded = false;
         self.is_thinking = false;
         self.frozen_up_to = 0;
         // Historical sessions and /clear intentionally freeze the welcome screen;
@@ -7474,8 +7528,12 @@ impl AppState {
         if !self.thinking_buf.is_empty() {
             let text = std::mem::take(&mut self.thinking_buf);
             self.thinking_buf.clear();
+            // 必须先算耗时再清 `thinking_started`：该字段自 ThinkingDelta 首块
+            // （见下方 apply_agent_event）写入后一直只有写点、零读点，直接丢弃
+            // 会让 thinking 折叠头永远拿不到耗时。
+            let elapsed = self.thinking_started.map(|t| t.elapsed().as_secs_f64());
             self.thinking_started = None;
-            self.push_tracked_message(ChatMessage::thinking(text));
+            self.push_tracked_message(ChatMessage::thinking(text, elapsed));
         }
     }
 
@@ -12964,6 +13022,12 @@ async fn tui_main(
                             // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
                             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             }
+                            // Ctrl+O 展开/折叠 thinking 正文。必须显式占位并
+                            // `continue`：否则会落进下面的 `_` 兜底退出内容焦点。
+                            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                state.thinking_expanded = !state.thinking_expanded;
+                                continue;
+                            }
                             _ => {
                                 state.leave_content_focus();
                             }
@@ -13265,6 +13329,7 @@ async fn tui_main(
                                         state.streaming_buf.clear();
                                         state.thinking_buf.clear();
                                         state.thinking_started = None;
+                                        state.thinking_expanded = false;
                                         // 已冻结写入终端真实 scrollback 的历史消息（Inline
                                         // viewport 架构下 insert_before 直接落进终端原生回
                                         // 滚缓冲区，state.messages.clear() 管不到它）不额外
@@ -14508,6 +14573,12 @@ async fn tui_main(
                                             }
                                         }
                                     }
+                                }
+                                'o' => {
+                                    // Ctrl+O — 展开/折叠 thinking 正文。与内容焦点
+                                    // 态共用同一个 flag，因此在输入框态也必须可用：
+                                    // 折叠头提示的正是这个键，而输入框是默认焦点态。
+                                    state.thinking_expanded = !state.thinking_expanded;
                                 }
                                 _ => {}
                             }

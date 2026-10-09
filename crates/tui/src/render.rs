@@ -701,6 +701,20 @@ struct ChatRenderCtx<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
+    /// Ctrl+O 全局展开/折叠 thinking 正文。
+    thinking_expanded: bool,
+}
+
+/// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
+/// （`ChatMessage::Thinking`）两条数据路径共用同一个渲染入口。
+struct ThinkingRenderOpts {
+    /// 仍在流式累积：只画一行状态，**完全不碰 `content`**。
+    live: bool,
+    /// 定稿后是否展开正文。
+    expanded: bool,
+    /// 该段 thinking 的累计耗时。`None` = 本次会话没有记录到
+    /// （`/resume` 恢复的旧会话：耗时从未持久化过）。
+    elapsed_secs: Option<f64>,
 }
 
 fn clean_thinking_lines(content: &str) -> Vec<&str> {
@@ -711,29 +725,63 @@ fn clean_thinking_lines(content: &str) -> Vec<&str> {
         .collect()
 }
 
-fn render_thinking_block(lines: &mut Vec<Line<'static>>, content: &str, max_content_width: usize) {
+/// thinking 块：默认折叠成一行元信息（耗时 + 行数 + 展开提示），Ctrl+O 展开
+/// 全文。
+///
+/// 旧实现是"固定显示前 3 行 + ` · N lines` 标记"，有三个问题：`✻`(U+273B,
+/// Dingbats) 在终端字体里常缺字形画成豆腐块；`N lines` 数的是去掉空行后的
+/// **原始**行数，与屏幕上折行后再截断到 3 行的**视觉**行数毫无对应；只取头
+/// 3 行意味着几十行思考的结论永远看不到（thinking 是流式追加的，最新结论在
+/// 尾部）。更糟的是流式期间每帧都要把整个 buf 重新折行一遍、再只取前 3 行
+/// 扔掉，纯属浪费——现在 `live` 分支直接不碰 content。
+fn render_thinking_block(
+    lines: &mut Vec<Line<'static>>,
+    content: &str,
+    max_content_width: usize,
+    opts: ThinkingRenderOpts,
+) {
+    if opts.live {
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr("thinking.running"),
+            Style::default().fg(Color::Cyan),
+        )));
+        return;
+    }
+
     let clean_lines = clean_thinking_lines(content);
-    let total = clean_lines.len();
-    let folded = if total > TASK_PREVIEW_MAX_ROWS {
-        format!(" · {total} lines")
-    } else {
-        String::new()
+    let total = clean_lines.len().to_string();
+    let header = match opts.elapsed_secs {
+        Some(secs) => wyj_i18n::tr_fmt(
+            "thinking.done",
+            &[("secs", &format!("{secs:.1}")), ("lines", &total)],
+        ),
+        // 无耗时（`/resume` 的旧会话）只报行数，不显示一个假的 "0.0s"
+        None => wyj_i18n::tr_fmt("thinking.done_no_elapsed", &[("lines", &total)]),
     };
     lines.push(Line::from(vec![
-        Span::styled("  ✻ thinking", Style::default().fg(Color::Cyan)),
-        Span::styled(folded, Theme::dim()),
+        Span::styled(header, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if opts.expanded {
+                String::new()
+            } else {
+                wyj_i18n::tr("thinking.expand_hint")
+            },
+            Theme::dim(),
+        ),
     ]));
 
-    let mut preview = Vec::new();
+    if !opts.expanded {
+        return;
+    }
+    // 展开即全文：用户主动行为，不再截断；超出视口由既有的 chat_scroll 滚动。
     for line in clean_lines {
         for wrapped in wrap_line(line, max_content_width.saturating_sub(4).max(1)) {
-            preview.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                 format!("    {wrapped}"),
                 Theme::dim(),
             )));
         }
     }
-    push_capped_preview_lines(lines, preview, "    ");
 }
 
 /// 渲染单条消息（追加到 `lines`）。从 `draw_chat` 提炼出来，保证完整消息流、
@@ -813,7 +861,16 @@ fn render_chat_message(
         }
 
         MessageRole::Thinking => {
-            render_thinking_block(lines, &msg.content, max_content_width);
+            render_thinking_block(
+                lines,
+                &msg.content,
+                max_content_width,
+                ThinkingRenderOpts {
+                    live: false,
+                    expanded: ctx.thinking_expanded,
+                    elapsed_secs: msg.thinking_elapsed_secs,
+                },
+            );
         }
 
         // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
@@ -1208,12 +1265,22 @@ pub(crate) fn build_pending_chat_lines(
             max_content_width,
             sub_agents: &state.sub_agents,
             spinner_frame: state.spinner_frame,
+            thinking_expanded: state.thinking_expanded,
         },
         &mut is_first_user,
     ));
 
     if !state.thinking_buf.is_empty() {
-        render_thinking_block(&mut lines, &state.thinking_buf, max_content_width);
+        render_thinking_block(
+            &mut lines,
+            &state.thinking_buf,
+            max_content_width,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: state.thinking_expanded,
+                elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
+            },
+        );
     }
 
     // 流式文本（实时输出中）
@@ -1531,6 +1598,8 @@ fn push_todo_detail_lines(
             max_content_width: detail_width,
             sub_agents,
             spinner_frame: 0,
+            // Todo 详情区里只会重放工具执行事件，不含 thinking 消息
+            thinking_expanded: false,
         };
         for entry in log {
             match entry {
@@ -1628,6 +1697,7 @@ struct MessageRangeRenderArgs<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
+    thinking_expanded: bool,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -1642,11 +1712,13 @@ fn render_message_range(
         max_content_width,
         sub_agents,
         spinner_frame,
+        thinking_expanded,
     } = args;
     let ctx = ChatRenderCtx {
         max_content_width,
         sub_agents,
         spinner_frame,
+        thinking_expanded,
     };
     let mut lines = vec![];
     let mut i = range.start;
@@ -5338,6 +5410,7 @@ mod tool_result_fold_tests {
             content: content.to_string(),
             is_error: false,
             elapsed_secs: None,
+            thinking_elapsed_secs: None,
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
@@ -5359,6 +5432,14 @@ mod tool_result_fold_tests {
     }
 
     fn render_messages(messages: &[ChatMessage], width: usize) -> Vec<String> {
+        render_messages_with_thinking_expanded(messages, width, false)
+    }
+
+    fn render_messages_with_thinking_expanded(
+        messages: &[ChatMessage],
+        width: usize,
+        thinking_expanded: bool,
+    ) -> Vec<String> {
         let mut is_first_user = true;
         rendered_text(render_message_range(
             MessageRangeRenderArgs {
@@ -5367,6 +5448,7 @@ mod tool_result_fold_tests {
                 max_content_width: width,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
+                thinking_expanded,
             },
             &mut is_first_user,
         ))
@@ -6068,23 +6150,77 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_is_cleaned_and_capped_to_three_visual_lines() {
-        let thinking = message(
+    fn thinking_is_folded_to_a_single_metadata_line_by_default() {
+        let mut thinking = message(
             MessageRole::Thinking,
             "\n\none\n\ntwo\nthree\n\nfour\nfive\nsix\nseven\n",
         );
-        let messages = vec![thinking];
-        let rendered = render_messages(&messages, 100);
+        thinking.thinking_elapsed_secs = Some(1.5);
+        let rendered = render_messages(&[thinking], 100);
 
-        assert_eq!(rendered.len(), 5);
-        assert!(rendered[0].contains("thinking · 7 lines"));
-        assert_eq!(rendered[1], "    one");
-        assert_eq!(rendered[2], "    two");
-        assert_eq!(rendered[3], "    three");
-        assert_eq!(rendered[4], "    ...");
-        assert!(rendered
-            .iter()
-            .all(|line| !line.contains("ctrl+o") && !line.contains('▶')));
+        // 折叠态只出一行头（耗时 + 行数 + 展开提示），正文一律不渲染
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(rendered[0].contains("1.5"), "{}", rendered[0]);
+        assert!(rendered[0].contains('7'), "{}", rendered[0]);
+        assert!(rendered[0].contains("Ctrl+O"), "{}", rendered[0]);
+        assert!(
+            !rendered[0].contains('✻'),
+            "U+273B(Dingbats) 在终端字体里常缺字形画成豆腐块，改用 ⎿: {}",
+            rendered[0]
+        );
+    }
+
+    #[test]
+    fn thinking_expanded_renders_full_body_not_just_first_three_lines() {
+        let mut thinking = message(
+            MessageRole::Thinking,
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven",
+        );
+        thinking.thinking_elapsed_secs = Some(12.0);
+        let rendered = render_messages_with_thinking_expanded(&[thinking], 100, true);
+
+        // 展开后出全文（旧实现固定只给前 3 行，几十行思考的结论永远看不到）
+        assert_eq!(rendered.len(), 8, "{rendered:?}");
+        assert!(rendered[0].contains("12.0"), "{}", rendered[0]);
+        assert!(
+            !rendered[0].contains("Ctrl+O"),
+            "已展开时不该再提示如何展开: {}",
+            rendered[0]
+        );
+        assert_eq!(rendered[7], "    seven");
+    }
+
+    #[test]
+    fn thinking_without_elapsed_omits_the_seconds_placeholder() {
+        // `/resume` 恢复的旧会话没有耗时记录（该字段从未持久化过），
+        // 不能显示一个假的 "0.0s"
+        let thinking = message(MessageRole::Thinking, "one\ntwo");
+        let rendered = render_messages(&[thinking], 100);
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(!rendered[0].contains("0.0s"), "{}", rendered[0]);
+        assert!(rendered[0].contains('2'), "{}", rendered[0]);
+    }
+
+    #[test]
+    fn live_thinking_block_renders_one_line_and_never_touches_content() {
+        // 流式期间只画一行状态，且完全不碰 content —— 旧实现每帧把整个
+        // thinking_buf 重新折行一遍、再只取前 3 行扔掉
+        let mut lines = vec![];
+        render_thinking_block(
+            &mut lines,
+            &"x".repeat(100_000),
+            80,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: false,
+                elapsed_secs: Some(3.0),
+            },
+        );
+        assert_eq!(lines.len(), 1);
+
+        let text = rendered_text(lines);
+        assert!(!text[0].contains("xxxx"), "流式态不得渲染正文");
     }
 
     #[test]
@@ -6115,6 +6251,7 @@ mod tool_result_fold_tests {
                 max_content_width: 100,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
+                thinking_expanded: false,
             },
             &mut is_first_user,
         );
@@ -6173,6 +6310,7 @@ mod tool_result_fold_tests {
                 max_content_width: 100,
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
+                thinking_expanded: false,
             },
             &mut is_first_user,
         );

@@ -70,7 +70,10 @@ subagent_trace:
   not_found: "会话 {session} 中未找到子 Agent 记录 a{id}"
 
 thinking:
-  done: "✻ 已思考 {secs}s（{lines} 行）"
+  running: "  ⎿ ⠋ 思考中…"
+  done: "  ⎿ 已思考 {secs}s（{lines} 行）"
+  done_no_elapsed: "  ⎿ 已思考（{lines} 行）"
+  expand_hint: "  ·  Ctrl+O 展开"
   status:
     budget: "🧠 budget={n}"
     effort: "🧠 effort={e}"
