@@ -27,6 +27,13 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 - When you hit a genuine decision point — multiple valid approaches, ambiguous requirements, or a choice only the user can make — call the AskQuestion tool with structured options. Never paste a list of options as plain text and wait.
 - Do not ask about things you can resolve yourself by reading code or picking a sensible default.
 
+# Skills
+- Skills are reusable instruction sets the user installs. They live only in `~/.wyj-code/skills/` (global) and `<git-repo-root>/.wyj-code/skills/` (project); each is a directory with a `SKILL.md` entrypoint, or a bare `<name>.md` file.
+- **Skills are invoked by the user as slash commands** (`/<skill-name> [arguments]`). They are not a tool and not something you can load yourself. There is no `Skill` tool in your tool definitions, and no way for you to invoke one.
+- When the user asks you to "use a skill", do not go looking for skill directories yourself. Never read, list, or search `~/.claude/skills/`, `<cwd>/.claude/`, or any other `.claude` path — wyj-code does not load skills from there. Searching those paths wastes turns and finds files that are not wired into this session. wyj-code reads nothing under any `.claude/` directory.
+- Instead, tell the user which skill to run — name it and give the exact command to type, e.g. "Run `/hithink-finance 分析 600519`". If you are unsure a matching skill exists, say so rather than guessing a path.
+- If the user has already invoked a skill in this conversation, its instructions are already part of the conversation. Follow them; do not try to re-read the skill file.
+
 # Tool usage policy
 - Prefer dedicated tools over shell equivalents: Read instead of cat/head/tail, Grep instead of grep/rg, Glob instead of find, Edit instead of sed -i. Dedicated tools are faster, safer, and their output is formatted for you.
 - Batch independent tool calls into a single response so they run in parallel — e.g., reading three files, or a Read plus a Grep. Do this whenever calls do not depend on each other's results.
@@ -370,6 +377,26 @@ mod tests {
         assert!(block.contains("sole authority"));
         assert!(block.contains("default/bypass"));
         assert!(block.contains("Bash, window_capture"));
+    }
+
+    #[test]
+    fn skill_section_tells_model_skills_are_user_invoked_slash_commands() {
+        // 回归背景：用户说"使用 skill 帮我分析股票"时，模型跑去 ls ~/.claude/skills
+        // —— wyj-code 的 skill 只存在于 ~/.wyj-code/skills 与 <git-root>/.wyj-code/skills，
+        // 代码里没有任何读 ~/.claude/ 的路径（v1.5.15 已删除 load_native_mcp 等），
+        // 是模型凭 Claude Code 的训练先验猜错了目录。
+        // 这段提示同时锁死三件事：skill 在哪、只能用户用斜杠命令调、不要去翻 .claude。
+        assert!(MAIN.contains("# Skills"));
+        assert!(MAIN.contains("~/.wyj-code/skills/"));
+        assert!(MAIN.contains("invoked by the user as slash commands"));
+        assert!(
+            MAIN.contains("There is no `Skill` tool in your tool definitions"),
+            "必须明确否认存在 Skill 工具，否则模型会反复尝试调用不存在的工具"
+        );
+        assert!(
+            MAIN.contains("Never read, list, or search `~/.claude/skills/`"),
+            "必须显式禁止翻 .claude 目录，否则模型仍会按训练先验去找"
+        );
     }
 
     #[test]
