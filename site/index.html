@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>wyj-code — 用 Rust 从零实现的终端 AI 编程助手</title>
-<meta name="description" content="wyj-code v1.5.19：项目自带 skill 需显式信任批准（BREAKING）——克隆仓库不再自动注入敌对指令；工具结果默认折叠、Ctrl+O 出全文；修掉模型凭空编造 skill 路径的幻觉。Rust 单二进制，零遥测，支持国内模型与双协议端点。" />
+<title>wyj-code — 跑在你自己终端里的 AI 编码助手</title>
+<meta name="description" content="wyj-code 是一个终端里的 AI 编码助手：每一次工具调用都在你眼前展开，写文件前先问你，随时能打断。单二进制、零遥测，支持 Anthropic / OpenAI 双协议端点与国内主流模型。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -14,6 +14,7 @@
 <body class="relative overflow-x-hidden selection:bg-amber-500">
 
 <!-- icon sprite -->
+
 <svg style="display:none" aria-hidden="true">
   <symbol id="i-layers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="13" height="13" rx="2"/><rect x="8" y="8" width="13" height="13" rx="2"/></symbol>
   <symbol id="i-network" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2.4"/><circle cx="18" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><line x1="6" y1="6" x2="12" y2="18"/><line x1="18" y1="6" x2="12" y2="18"/><line x1="6" y1="6" x2="18" y2="6"/></symbol>
@@ -46,11 +47,11 @@
       <span class="font-display font-bold tracking-tight text-lg">wyj-code</span>
     </a>
     <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
-      <a href="#delivery" class="hover:text-amber-500 transition-colors" data-i18n="nav.delivery">交付状态</a>
-      <a href="#features" class="hover:text-amber-500 transition-colors" data-i18n="nav.features">特性</a>
-      <a href="#architecture" class="hover:text-amber-500 transition-colors" data-i18n="nav.architecture">架构</a>
+      <a href="#demo" class="hover:text-amber-500 transition-colors" data-i18n="nav.demo">演示</a>
+      <a href="#compat" class="hover:text-amber-500 transition-colors" data-i18n="nav.compat">模型兼容</a>
+      <a href="#audience" class="hover:text-amber-500 transition-colors" data-i18n="nav.audience">适合谁</a>
       <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
-      <a href="#changelog" class="hover:text-amber-500 transition-colors" data-i18n="nav.changelog">更新日志</a>
+      <a href="docs.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.docs">文档</a>
     </nav>
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-1 text-xs font-medium">
@@ -74,24 +75,21 @@
     <div class="reveal min-w-0">
       <div class="inline-flex items-center gap-2 badge-pill rounded-full px-3.5 py-1.5 text-xs mb-7">
         <span class="w-1.5 h-1.5 rounded-full bg-phosphor"></span>
-        <span data-i18n="hero.kicker">个人工程作品 · Clean-room 实现 · 开源</span>
+        <span data-i18n="hero.kicker">单二进制 · 零遥测 · MIT 开源</span>
       </div>
       <h1 class="font-display font-extrabold leading-[0.95] tracking-tight text-5xl sm:text-6xl lg:text-[4.2rem]">
         <span class="text-amber-500">&gt;</span>_wyj-code<span class="caret animate-blink"></span>
       </h1>
-      <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium" data-i18n="hero.tagline">用 Rust 从零实现的终端 AI 编程助手</p>
-      <p class="mt-4 text-base leading-relaxed text-paper/60 max-w-xl" data-i18n="hero.desc">v1.5.19 已公开发布：项目自带的 skill 现在需要显式信任批准（BREAKING，升级必读）——克隆陌生仓库时，对方放进 <code>.wyj-code/skills/</code> 的敌对指令不再自动生效；工具结果默认折叠、Ctrl+O 出全文；并修掉模型凭空编造 skill 路径的幻觉。安装脚本会获取最新公开 Release。</p>
+      <p class="mt-6 text-xl sm:text-2xl text-paper/90 font-medium leading-snug" data-i18n="hero.tagline">跑在你自己终端里的 AI 编码助手</p>
+      <p class="mt-4 text-base leading-relaxed text-paper/65 max-w-xl" data-i18n="hero.desc">每一次工具调用都在你眼前展开，写文件之前先问你一句，任何时候都能打断。它不把判断藏起来——因为这是你自己的代码库。</p>
       <div class="mt-9 flex flex-wrap items-center gap-4">
-        <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
-          <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
-          <span data-i18n="hero.cta.github">查看 GitHub 仓库</span>
-        </a>
-        <a href="#install" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="hero.cta.install">60 秒上手 →</a>
+        <a href="#install" class="btn-primary rounded-lg px-6 py-3 text-sm" data-i18n="hero.cta.install">60 秒安装</a>
+        <a href="#demo" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="hero.cta.demo">先看它怎么工作 ↓</a>
       </div>
 
       <div class="mt-6 reveal" style="transition-delay:60ms">
         <p class="text-xs text-paper/40 mb-2" data-i18n="hero.oneliner.label">一键安装（macOS / Linux）：</p>
-        <div class="code-block rounded-lg relative max-w-md">
+        <div class="code-block rounded-lg relative">
           <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-hero-oneliner" data-copy-text="curl -fsSL https://wangyooujin.github.io/wyj-code/install.sh | sh" aria-label="copy">
             <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
           </button>
@@ -104,12 +102,11 @@
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">Rust 1.80+</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">MIT OR Apache-2.0</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">macOS · Linux · Windows</span>
-        <span class="badge-pill rounded-md px-3 py-1.5 text-xs" data-i18n="hero.badge.telemetry">零遥测</span>
       </div>
     </div>
 
-    <div class="relative reveal min-w-0" style="transition-delay:120ms">
-      <div class="absolute -top-4 -right-3 z-10 rotate-6 bg-amber-500 text-ink-950 text-xs font-bold px-3 py-1.5 rounded shadow-lg">v1.5.19</div>
+    <!-- DEMO TERMINAL -->
+    <div id="demo" class="relative reveal min-w-0 scroll-mt-24" style="transition-delay:120ms">
       <div class="term-window rounded-xl overflow-hidden">
         <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
@@ -125,278 +122,216 @@
 
           <div class="mt-3 flex gap-2">
             <span class="shrink-0 text-amber-400 font-semibold">You</span>
-            <span data-i18n="hero.term.user">把 CLI 参数解析里 <code class="text-paper">--resume</code> 的边界情况补一下测试</span>
+            <span data-i18n="demo.term.user">给所有 HTTP handler 加上 tracing span</span>
           </div>
 
           <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.read">正在读取 <span class="text-paper">crates/cli/src/main.rs</span>...</span></div>
-            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.readres">Read main.rs (238 lines)</span></div>
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.search">搜索路由处理器</span></div>
+            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.searchres">找到 31 处，分布在 31 个文件</span></div>
           </div>
 
           <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.edit">调用工具 <span class="text-paper">Edit</span> — crates/cli/src/main.rs</span></div>
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.edit">调用工具 <span class="text-paper">Edit</span> × 31</span></div>
             <div class="mt-2 ml-4 rounded-lg border border-white/[0.1] bg-ink-950/70 px-3 py-2 text-[11px] leading-relaxed">
-              <p class="text-paper/70" data-i18n="hero.term.confirm.title">允许此次编辑？</p>
+              <p class="text-paper/70" data-i18n="demo.term.confirm.title">允许此次批量编辑？</p>
               <p class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-paper/45">
-                <span><span class="text-phosphor">[y]</span> <span data-i18n="hero.term.confirm.yes">允许一次</span></span>
-                <span><span class="text-phosphor">[a]</span> <span data-i18n="hero.term.confirm.always">始终允许</span></span>
-                <span><span class="text-paper/35">[d]</span> <span data-i18n="hero.term.confirm.deny">拒绝</span></span>
+                <span><span class="text-phosphor">[y]</span> <span data-i18n="demo.term.confirm.yes">允许一次</span></span>
+                <span><span class="text-phosphor">[a]</span> <span data-i18n="demo.term.confirm.always">始终允许</span></span>
+                <span><span class="text-paper/35">[d]</span> <span data-i18n="demo.term.confirm.deny">拒绝</span></span>
               </p>
             </div>
-            <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.written">已写入 <span class="text-phosphor">+18</span> <span class="text-[#ff8a8a]">-2</span></span></div>
+            <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.written">已写入 <span class="text-phosphor">+214</span> <span class="text-[#ff8a8a]">-37</span></span></div>
           </div>
 
           <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="hero.term.run">运行 <span class="text-paper">cargo test -p wyj-code</span></span></div>
-            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="hero.term.testresult">test result: ok. 12 passed</span><span class="caret animate-blink"></span></div>
+            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.run">运行 <span class="text-paper">cargo test</span></span></div>
+            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.testresult">test result: ok. 148 passed</span><span class="caret animate-blink"></span></div>
           </div>
         </div>
       </div>
+      <p class="mt-4 text-xs text-paper/35 leading-relaxed" data-i18n="demo.foldnote">上面是折叠态：每个工具调用只留标题行，长输出不刷屏。按 <kbd class="text-paper/60">Ctrl+O</kbd> 随时展开全文。</p>
     </div>
   </div>
 </section>
 
-<!-- STATS -->
-<section class="border-y border-white/[0.06] bg-ink-950/40">
-  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-14 grid grid-cols-2 lg:grid-cols-4 gap-8">
-    <div class="reveal">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12<span class="text-amber-500">MB</span></div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.size">release 二进制体积（已 strip）</p>
+<!-- FIVE MINUTES -->
+<section class="max-w-6xl mx-auto px-5 sm:px-8 pb-24">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="quick.kicker">First Five Minutes</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="quick.title">装好之后，这四件事都做得到</h2>
+  </div>
+
+  <div class="mt-10 grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div class="card reveal rounded-xl p-6">
+      <div class="font-display font-extrabold text-amber-500 text-2xl">01</div>
+      <h3 class="mt-3 font-semibold" data-i18n="quick.1.title">配好一个模型</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="quick.1.desc">首次启动自动打开配置面板，填入 API Key 即可。Key 只存本机，也可走环境变量，不落盘明文。</p>
     </div>
-    <div class="reveal" style="transition-delay:80ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">~10<span class="text-amber-500">ms</span></div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.boot">稳态冷启动耗时</p>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:60ms">
+      <div class="font-display font-extrabold text-amber-500 text-2xl">02</div>
+      <h3 class="mt-3 font-semibold" data-i18n="quick.2.title">在你自己的仓库里问一个真问题</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="quick.2.desc">它会先读文件再回答，读取过程逐行展开给你看，不是凭空作答。</p>
     </div>
-    <div class="reveal" style="transition-delay:160ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12</div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.crates">workspace crate 数量</p>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:120ms">
+      <div class="font-display font-extrabold text-amber-500 text-2xl">03</div>
+      <h3 class="mt-3 font-semibold" data-i18n="quick.3.title">让它改一处你早就想改的东西</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="quick.3.desc">权限弹窗按 <kbd class="text-amber-400">y</kbd> 放行、<kbd class="text-amber-400">d</kbd> 拒绝——拒绝的信息也会回灌给它，让它换个思路。</p>
     </div>
-    <div class="reveal" style="transition-delay:240ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">0</div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.telemetry">遥测 / 埋点上报</p>
+    <div class="card reveal rounded-xl p-6" style="transition-delay:180ms">
+      <div class="font-display font-extrabold text-amber-500 text-2xl">04</div>
+      <h3 class="mt-3 font-semibold" data-i18n="quick.4.title">挂上你自己的 MCP server</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="quick.4.desc">在 <code class="text-paper/70">~/.wyj-code/config.toml</code> 加一段配置，它的工具就出现在模型可用的工具列表里。</p>
     </div>
   </div>
 </section>
 
-<!-- DELIVERY STATUS -->
-<section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
+<!-- MODEL COMPATIBILITY -->
+<section id="compat" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06] scroll-mt-20">
   <div class="reveal max-w-3xl">
-    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v1.5.19 · 项目 skill 信任门控 + 工具结果折叠</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次把「仓库能往我上下文里塞什么」这条边界收口：<strong>BREAKING —— 项目自带的 <code>.wyj-code/skills/</code> 现在需要显式信任批准</strong>。<br><br><strong class="text-amber-400">为什么现在才补</strong>。<code>.wyj-code/skills/</code> 随 <code>git clone</code> 落地，正文由<strong>仓库作者</strong>（可能是陌生人）控制，而 skill 正文是纯文本指令——敲 <code>/xxx</code> 时整段就作为模型指令进入对话。注入面其实<strong>早就开了一半</strong>：skill 的 <code>description</code> 自 v1.5.18 起就经 <code>{skills}</code> 占位注入 system prompt，模型会主动向用户推荐这些命令。而同样能执行任意命令的 <code>mcp.toml</code> 恰恰一直有门控——这个不一致是真实的。<br><br><strong class="text-amber-400">指纹为什么必须覆盖整棵树</strong>。只哈希 <code>SKILL.md</code> 会留下一个<strong>二阶注入面</strong>：<code>references/</code> 虽不被注册成命令，但它是<strong>经由已批准的 SKILL.md 可达的</strong>（SKILL.md 可以写「先读 references/x.md 再动手」，而模型有 Read 工具）。攻击者可以提交一份<strong>干净的</strong> SKILL.md + 恶意 references，你批准后再改子文档即绕过。因此哈希范围刻意做成加载器注册范围的<strong>严格超集</strong>，且是<strong>纯内容哈希</strong>（不含 mtime/inode/权限，否则 <code>git checkout</code> 的字节级还原会被误判成「内容变了」）。回归测试专门钉住这条不变式——<strong>任何人把哈希「优化」成只覆盖 SKILL.md 都会直接打开这个洞</strong>。<br><br><strong class="text-amber-400">工具结果折叠</strong>。此前工具结果固定显示<strong>最多 3 个视觉行</strong>，Bash 的 JSON 输出永远只有头三行，尾部的 <code>request_id</code> / <code>reason</code> / traceback 末行看不到。现有代码里已有三处针对这个缺陷打的补丁（head+tail、跳过「退出码 N」、剥行号），全都是在「3 行预算」这个错误前提下做取舍。现在套用 thinking 的折叠模式：<strong>默认只留 <code>⏺ Bash(…)</code> 标题行、下面一行正文都不出</strong>，<code>Ctrl+O</code> 出<strong>全文</strong>，对齐 Claude Code。内容加工逻辑按「是否预算启发式」分化：三行截断、错误 head+tail 的 <code>⋮</code>、空行过滤<strong>全部删除</strong>（展开已是全文，保留 <code>⋮</code> 反而会<strong>主动删掉用户明确要求看到的中间内容</strong>）；与预算无关的表达层规范化全保留。连带收益是<strong>默认路径反而更快</strong>：折叠态在读取 content 之前就 return，彻底消灭了旧实现「每帧为每条工具结果构建完整 preview 再只取 3 行扔掉」的浪费。<br><br><strong class="text-amber-400">顺带修掉的既有缺陷</strong>。<code>rebuild_fn</code> 原先把 skill 名单当不可变快照捕获，连 <code>/model</code> 热切换都刷不到新名单——改为每次重建时重算，附带修好 <code>/skills</code> 面板 enable/disable 后模型名单不刷新的老问题；i18n 快捷键列表此前<strong>完全没有 <code>Ctrl+O</code></strong>，本版补上（工具结果折叠头不带提示，发现入口更窄）。<br><br><strong>1024 个 workspace 测试</strong> + clippy <code>-D warnings</code> 全绿。</p>
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="compat.kicker">Model Compatibility</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="compat.title">我的模型能不能用</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="compat.desc">这张表按<strong>证据等级</strong>如实标注，而不是一律写「支持」。<strong>StaticOnly 意味着「我们从未在你的模型上实测过」</strong>——下面会告诉你怎么自己验证。</p>
   </div>
 
-  <div class="mt-10 grid md:grid-cols-3 gap-4">
-    <div class="card reveal rounded-xl p-6">
-      <div class="flex items-center justify-between gap-3">
-        <h3 class="font-semibold" data-i18n="delivery.p0.title">P0 · 可信执行</h3>
-        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
-      </div>
-      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p0.desc">国内模型能力目录与 doctor、工具参数修复/schema 校验、Provider 错误分类、权限 fail-closed、Plan 文档写策略与 OS sandbox。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <div class="flex items-center justify-between gap-3">
-        <h3 class="font-semibold" data-i18n="delivery.p1.title">P1 · 效率与恢复</h3>
-        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
-      </div>
-      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p1.desc">ToolSearch/lazy schema、同角色 fallback、checkpoint/rewind/branch、SubAgent 控制，以及 TUI/Markdown/终端交互整合。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <div class="flex items-center justify-between gap-3">
-        <h3 class="font-semibold" data-i18n="delivery.p2.title">P2 · 工程控制面</h3>
-        <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
-      </div>
-      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p2.desc">Managed Worktree、Workflow DAG、ACP/daemon、跨连接 session、CodeIndex/LSP、Plugin runtime、本地 Review 与严格 Release CI。</p>
-    </div>
+  <div class="mt-10 reveal overflow-x-auto">
+    <table class="w-full text-sm min-w-[720px]">
+      <thead>
+        <tr class="border-b border-white/[0.1] text-left">
+          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.provider">Provider</th>
+          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.protocol">接入协议</th>
+          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.level">验证等级</th>
+          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.parallel">并行工具调用</th>
+          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.thinking">思考预算</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="border-b border-white/[0.06]">
+          <td class="py-3 pr-4 text-paper/85">Anthropic</td>
+          <td class="py-3 pr-4 text-paper/50">Messages</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="compat.level.reference">Reference</span></td>
+          <td class="py-3 pr-4 text-phosphor/90" data-i18n="compat.yes">支持</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
+        </tr>
+        <tr class="border-b border-white/[0.06]">
+          <td class="py-3 pr-4 text-paper/85">OpenAI</td>
+          <td class="py-3 pr-4 text-paper/50">Chat Completions</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="compat.level.reference">Reference</span></td>
+          <td class="py-3 pr-4 text-phosphor/90" data-i18n="compat.yes">支持</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.no">不支持</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">智谱 GLM</td>
+          <td class="py-3 pr-4 text-paper/50">Anthropic 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">MiniMax</td>
+          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">月之暗面 Kimi</td>
+          <td class="py-3 pr-4 text-paper/50">Anthropic 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">DeepSeek</td>
+          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">阿里 Qwen</td>
+          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
+        </tr>
+        <tr class="border-b border-white/[0.06] bg-ink-950/30">
+          <td class="py-3 pr-4 text-paper/85">豆包</td>
+          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
+          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
+        </tr>
+        <tr class="border-b border-white/[0.06]">
+          <td class="py-3 pr-4 text-paper/85">Ollama / vLLM</td>
+          <td class="py-3 pr-4 text-paper/50">本地 OpenAI 兼容</td>
+          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-paper/50" data-i18n="compat.level.experimental">Experimental</span></td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.parallel.dep">取决于模型与启动参数</td>
+          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.no">不支持</td>
+        </tr>
+      </tbody>
+    </table>
   </div>
 
-  <div class="mt-5 reveal rounded-xl border border-phosphor/20 bg-phosphor/[0.04] p-6 sm:p-7">
-    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
-      <div class="max-w-3xl">
-        <h3 class="font-semibold text-phosphor" data-i18n="delivery.evolution.title">v1.5.12 · TUI 终端 panic 还原 + char-boundary 安全</h3>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.evolution.desc">新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`：`cli::main()` 入口最前 `wyj_tui::panic_guard::install()`（`take_hook` 链式保留前一个 hook），`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()/mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时 hook 检查到 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。新增 `crates/core/src/textutil.rs::floor_char_boundary(&str, usize) -> usize`：按字节切字符串时先回退到最近 char boundary 再 `String::truncate`，治本 `memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时撞 CJK/emoji char boundary 触发的 `is_char_boundary` assertion panic。配套新增 `TestBackend` 回归测试 `draw_input_keeps_cursor_visible_while_thinking` 与 `draw_input_title_shows_thinking_spinner_when_thinking` 防止"is_thinking 时跳过 `set_cursor_position` 致光标卡死"再次回归。</p>
-      </div>
-      <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-phosphor hover:text-paper transition-colors text-sm shrink-0" data-i18n="delivery.evolution.plan">查看 Memory v3 实施计划 →</a>
-    </div>
-  </div>
+  <!-- 自证 -->
+  <div class="mt-8 reveal grid lg:grid-cols-[1.15fr_0.85fr] gap-6 items-start">
+    <div class="rounded-xl border border-white/[0.08] bg-ink-950/40 p-6 sm:p-7">
+      <h3 class="font-semibold" data-i18n="compat.probe.title">别信这张表，自己验一遍</h3>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="compat.probe.desc">装好之后，静态诊断是免费的；实测会发极少量最小请求，<strong>结果写入本机缓存，之后该模型在你的机器上就标记为「已实测验证」</strong>。</p>
+      <div class="code-block rounded-lg relative mt-4">
+        <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-probe" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="px-4 py-3 pr-12 text-[12px] leading-[1.7] overflow-x-auto"><code id="code-probe"><span class="text-paper/35"># 静态诊断，免费</span>
+wyj-code model doctor
 
-  <div class="mt-5 reveal rounded-xl border border-amber-500/20 bg-amber-500/[0.04] p-6 sm:p-7">
-    <div class="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-5">
-      <div class="max-w-3xl">
-        <h3 class="font-semibold text-amber-400" data-i18n="delivery.domestic.title">国内模型专项收口</h3>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
-      </div>
-      <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v1.5.19 Release →</a>
-        <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
+<span class="text-paper/35"># 实测兼容性（basic | full）</span>
+WYJ_CODE_PROBE_API_KEY=sk-... \
+  wyj-code model doctor --probe basic</code></pre>
       </div>
     </div>
-  </div>
 
-  <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
-    <div class="arch-node reveal rounded-lg p-4">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">869</p>
-      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
-    </div>
-    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.clippy.value">0 warning</p>
-      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.clippy.label">workspace · all targets · Rust 1.96.0</p>
-    </div>
-    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:60ms">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.platforms.value">5 / 5</p>
-      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.platforms.label">macOS · Linux musl · Windows</p>
-    </div>
-    <div class="arch-node reveal rounded-lg p-4" style="transition-delay:90ms">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.assets.value">11 assets</p>
-      <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.assets.label">5 归档 + 5 sidecar + SHA256SUMS</p>
+    <div class="card rounded-xl p-6 sm:p-7">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="compat.probe.keytitle">实测必须用临时 key</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="compat.probe.keydesc">实测<strong>故意不读取</strong>配置文件里已保存的凭据，只认 <code class="text-amber-400">WYJ_CODE_PROBE_API_KEY</code>。需要你自己临时轮换一个——理由是探测请求要能证明「这个 key 能用」，而不是「配置文件里那串字符还在」。</p>
     </div>
   </div>
 </section>
 
-<!-- FEATURES -->
-<section id="features" class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
-  <div class="reveal max-w-2xl">
-    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="features.kicker">Features</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="features.title">核心能力</h2>
-    <p class="mt-4 text-paper/55" data-i18n="features.desc">从推理循环到交互体验，每一层都是为终端场景重新设计的。</p>
-  </div>
+<!-- AUDIENCE -->
+<section id="audience" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+    <div class="reveal max-w-2xl">
+      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="audience.kicker">Who Is This For</p>
+      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="audience.title">它适合谁，不适合谁</h2>
+      <p class="mt-4 text-paper/55" data-i18n="audience.desc">右边那一列同样重要——如果你正好属于它，现在就可以关掉这个页面。</p>
+    </div>
 
-  <div class="mt-12 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-layers"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.provider.title">国内模型可信运行时</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.provider.desc">GLM、MiniMax、Kimi、DeepSeek、Qwen、豆包按能力来源和置信度适配；静态兼容与 live verified 明确分开。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.agent.title">可控的多 Agent 协作</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.agent.desc">进程级 Hub 管理并发、前后台调度、follow-up、interrupt、retry-last 与落盘 trace，控制消息只在安全边界注入。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-bolt"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.hooks.title">Hooks 生命周期自动化</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.hooks.desc">PreToolUse / PostToolUse / UserPromptSubmit / Stop 四个节点可挂任意 shell 脚本，对齐真实 Claude Code。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-plug"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.mcp.title">可插拔 MCP</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.mcp.desc">内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并可桥接任意外部 MCP server。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-compress"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.compact.title">上下文自动压缩</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.compact.desc">token 数逼近窗口上限时自动生成摘要替换旧消息，长会话也不会突然断档。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-book"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.memory.title">CLAUDE.md 记忆机制</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.memory.desc">每轮重新读盘注入、子目录动态加载、@path 递归导入，跨会话记忆同样开箱即用。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-layers"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.evolution.title">证据化自进化</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.evolution.desc">v1.5.5 用 Episode、可验证 Memory、人工审批 Rule/Skill 候选和原子回滚形成透明闭环；Web/MCP 外部上下文默认隔离。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-terminal"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.tui.title">原生 ratatui TUI</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.tui.desc">流式 markdown、语法高亮、工具调用实时展示、子 Agent 聚合面板，交互体验为终端而生。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-sliders"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.profile.title">能力诊断与安全 Key 引用</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.profile.desc"><code class="text-amber-400">model doctor</code> 展示 vendor/protocol/能力来源；<code class="text-amber-400">api_key_env</code> 避免运行时 secret 被写回配置。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-save"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.session.title">Checkpoint / Rewind / Branch</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.session.desc">保留真实 Git index，按 conversation/files/both 恢复，并从任意 checkpoint 创建不影响原会话的新分支。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-slash"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.slash.title">自定义 Slash 命令</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.slash.desc">兼容 <code class="text-amber-400">~/.claude/commands/*.md</code> 与项目级命令，六层路径合并加载。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-globe"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.i18n.title">中 / 英双语</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.i18n.desc">界面文案运行时切换语言，自动检测系统 locale，也可在配置中显式指定。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">Fail-closed OS Sandbox</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">macOS Seatbelt + 受控域名代理、Linux bubblewrap；headless、schedule 与 SubAgent 无 UI 时拒绝隐式放行。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-monitor"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.computer.title">Computer-use 桌面控制</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.computer.desc">模型可观察并操控本机 GUI（macOS / Windows）；v1.5.5 允许 headless/daemon 安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-network"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.workflow.title">Workflow + 隔离 Worktree</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.workflow.desc">DAG 支持并行、预算、审批、暂停、重试与取消；有写权限的编码节点从脏工作区 checkpoint 自动创建独立 worktree，变更需显式 review/accept。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-terminal"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.acp.title">ACP / daemon 控制面</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.acp.desc">stdio ACP 与本地 TCP daemon 共享前端无关事件协议；daemon session 跨连接存活，可重连、列出、提交、打断、rewind、branch 和关闭。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-plug"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.plugin.title">Plugin Runtime + LSP</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.plugin.desc">插件可事务式贡献 hooks、styles、themes、channels、LSP、monitors 与 settings；真实 <code class="text-amber-400">workspace/symbol</code> 与本地索引合并。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.review.title">本地 Review 证据</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.review.desc"><code class="text-amber-400">review run</code> 对 commit/PR diff 生成可审计 JSON，处理 rename、空格路径和 binary，并对 secret evidence 脱敏。</p>
-    </div>
-    <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.jev.title">Jev 决策 API（v1.5.13）</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.jev.desc">TypeSafe System One 决策模型作独立 tool：意图路由 / 分类 / guardrails / 置信度标注，输出结构化 answers + probabilities；<code class="text-amber-400">/decision</code> slash 命令做连通性诊断，三层硬封顶（state 大小 / question 数 / 日预算）防失控。</p>
-    </div>
-  </div>
-</section>
-
-<!-- ARCHITECTURE -->
-<section id="architecture" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
-  <div class="reveal max-w-2xl">
-    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="arch.kicker">Architecture</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">12 个 crate 的 Rust workspace</h2>
-    <p class="mt-4 text-paper/55" data-i18n="arch.desc">单一 wyj-code 二进制，职责分层清晰：从上到下依次是入口、服务、核心、基础四层。</p>
-  </div>
-
-  <div class="mt-12 space-y-3">
-    <div class="reveal">
-      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.entry">入口层 · Entry</p>
-      <div class="grid sm:grid-cols-2 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/cli</p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.cli">二进制入口：组装全部 crate、解析 CLI 参数，启动 TUI / REPL / Workflow / ACP / daemon / Review</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tui <span class="text-paper/30">· wyj-tui</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tui">ratatui 终端渲染：输入框、权限确认对话框、子 Agent 面板</p></div>
+    <div class="mt-12 grid md:grid-cols-2 gap-5">
+      <div class="card reveal rounded-xl p-7">
+        <div class="flex items-center gap-2.5">
+          <svg viewBox="0 0 24 24" class="w-5 h-5 text-phosphor"><use href="#i-check"/></svg>
+          <h3 class="font-semibold text-phosphor" data-i18n="audience.for.title">你可能更适合它，如果</h3>
+        </div>
+        <ul class="mt-5 space-y-3.5 text-sm text-paper/60 leading-relaxed">
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.1">你本来就在终端里工作，希望 AI 的每一步都看得见，而不是收到一个成品 diff</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.2">你在用国内模型，需要一套统一工具链，而不是为每个厂商单独适配一遍</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.3">你在意工具链本身——愿意读源码、自己改工具链，甚至自己加一个模型适配</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.4">你需要定时任务、后台任务与多 Agent 协作，而不是只有一问一答</span></li>
+        </ul>
       </div>
-    </div>
-    <div class="reveal" style="transition-delay:40ms">
-      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.services">服务层 · Services</p>
-      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tools <span class="text-paper/30">· wyj-tools</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tools">Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite 等工具实现</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/computer <span class="text-paper/30">· wyj-computer</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.computer">Computer-use 系统层：截图 + 鼠标键盘输入合成，坐标缩放数学独立可测</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/commands <span class="text-paper/30">· wyj-commands</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.commands">Slash 命令注册表与内置命令（/help、/compact 等）</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/mcp <span class="text-paper/30">· wyj-mcp</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.mcp">MCP 客户端桥接（stdio / http 传输）</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/store <span class="text-paper/30">· wyj-store</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.store">Extension 安装与 lockfile、Plugin runtime 事务激活、持久 LSP client、schedule</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/i18n <span class="text-paper/30">· wyj-i18n</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.i18n">多语言资源与运行时语言切换</p></div>
-      </div>
-    </div>
-    <div class="reveal" style="transition-delay:80ms">
-      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.core">核心层 · Core</p>
-      <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/core <span class="text-paper/30">· wyj-core</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.core">Agent、Session runtime/events、权限、checkpoint、workspace/workflow 接口与本地 CodeIndex</p></div>
-    </div>
-    <div class="reveal" style="transition-delay:120ms">
-      <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.foundation">基础层 · Foundation</p>
-      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/api <span class="text-paper/30">· wyj-api</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.api">LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/config <span class="text-paper/30">· wyj-config</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.config">配置加载（~/.wyj-code/config.toml）、MCP 配置结构</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/sandbox <span class="text-paper/30">· wyj-sandbox</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.sandbox">Seatbelt / bubblewrap 命令隔离、凭证 deny-read 与域名级网络边界</p></div>
+
+      <div class="card reveal rounded-xl p-7" style="transition-delay:80ms">
+        <div class="flex items-center gap-2.5">
+          <svg viewBox="0 0 24 24" class="w-5 h-5 text-paper/40"><use href="#i-slash"/></svg>
+          <h3 class="font-semibold text-paper/70" data-i18n="audience.against.title">你可能不用换，如果</h3>
+        </div>
+        <ul class="mt-5 space-y-3.5 text-sm text-paper/55 leading-relaxed">
+          <li class="flex gap-3"><span class="text-paper/30 shrink-0">·</span><span data-i18n="audience.against.1">你需要开箱即用的图形界面，不想面对终端</span></li>
+          <li class="flex gap-3"><span class="text-paper/30 shrink-0">·</span><span data-i18n="audience.against.2">你不想自己准备 API Key 并管理多模型配置</span></li>
+          <li class="flex gap-3"><span class="text-paper/30 shrink-0">·</span><span data-i18n="audience.against.3">你依赖某个闭源产品特有的生态、托管能力和商业支持</span></li>
+          <li class="flex gap-3"><span class="text-paper/30 shrink-0">·</span><span data-i18n="audience.against.4">你更在意「什么都不用管」，而不是「每一步都在你控制下」</span></li>
+        </ul>
       </div>
     </div>
   </div>
@@ -494,322 +429,41 @@ cargo run -- --config-status</code></pre>
   </div>
 </section>
 
-<!-- PRINCIPLES -->
-<section class="border-t border-white/[0.06] bg-ink-950/40">
-  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
-    <div class="reveal max-w-2xl">
-      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="principles.kicker">Principles</p>
-      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="principles.title">设计原则</h2>
+
+<!-- TRUST -->
+<section class="border-t border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-16 grid grid-cols-2 lg:grid-cols-4 gap-8">
+    <div class="reveal">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">~10<span class="text-amber-500">ms</span></div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.boot">稳态冷启动耗时</p>
     </div>
-    <div class="mt-12 grid sm:grid-cols-2 lg:grid-cols-4 gap-5">
-      <div class="reveal">
-        <div class="text-amber-500 font-display font-extrabold text-2xl">01</div>
-        <h3 class="mt-3 font-semibold" data-i18n="principle.local.title">本地优先</h3>
-        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.local.desc">没有隐式埋点、没有崩溃上报，配置与会话数据全部留在本机。</p>
-      </div>
-      <div class="reveal" style="transition-delay:40ms">
-        <div class="text-amber-500 font-display font-extrabold text-2xl">02</div>
-        <h3 class="mt-3 font-semibold" data-i18n="principle.transparent.title">透明可控</h3>
-        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.transparent.desc">每一次工具调用全程实时展示，敏感操作前弹权限确认，随时可以 ESC 打断。</p>
-      </div>
-      <div class="reveal" style="transition-delay:80ms">
-        <div class="text-amber-500 font-display font-extrabold text-2xl">03</div>
-        <h3 class="mt-3 font-semibold" data-i18n="principle.neutral.title">协议中立</h3>
-        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.neutral.desc">vendor 与 wire protocol 分离，同一兼容协议可服务不同厂商，不把模型名称猜测当成最终事实。</p>
-      </div>
-      <div class="reveal" style="transition-delay:120ms">
-        <div class="text-amber-500 font-display font-extrabold text-2xl">04</div>
-        <h3 class="mt-3 font-semibold" data-i18n="principle.zero.title">零遥测</h3>
-        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="principle.zero.desc">只有显式的 LLM / WebFetch / MCP 调用才会出网，没有任何后台上报。</p>
-      </div>
+    <div class="reveal" style="transition-delay:80ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12<span class="text-amber-500">MB</span></div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.size">release 二进制体积（已 strip）</p>
+    </div>
+    <div class="reveal" style="transition-delay:160ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">0</div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.telemetry">遥测 / 埋点上报</p>
+    </div>
+    <div class="reveal" style="transition-delay:240ms">
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">4</div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.principles">条设计原则，无一例外</p>
     </div>
   </div>
-</section>
-
-<!-- CHANGELOG -->
-<section id="changelog" class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
-  <div class="reveal max-w-2xl">
-    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="changelog.kicker">Changelog</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="changelog.title">版本亮点</h2>
-  </div>
-
-  <div class="mt-12 space-y-0">
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-        <span class="font-display font-bold text-phosphor">v1.5.19</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519"><strong class="text-amber-400">BREAKING：项目级 skill 信任确认</strong>：<code class="text-amber-400">.wyj-code/skills/</code> 随 <code class="text-amber-400">git clone</code> 落地、正文由<strong>仓库作者</strong>控制，此前与你自己写的 skill 走同一条加载路径。本版门控强度与 <code class="text-amber-400">mcp.toml</code> 完全对齐：首次启动弹面板，<strong>不批准则这些 skill 不加载</strong>（斜杠补全不出现、模型看不见也不会推荐）；批准记录落 <code class="text-amber-400">~/.wyj-code/projects/&lt;key&gt;/skill_trust.json</code>，在仓库内容控制不到的位置；内容变化后指纹失配、重新待批准（含被 <code class="text-amber-400">git pull</code> 悄悄替换的场景）。CLI 侧 <code class="text-amber-400">trust-mcp</code> 一字不改，另设 <code class="text-amber-400">trust-skills</code> 与总入口 <code class="text-amber-400">trust</code>——信任决策必须逐类可见。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519b"><strong class="text-amber-400">工具结果折叠（对齐 Claude Code）</strong>：此前工具结果固定显示<strong>最多 3 个视觉行</strong>，Bash 的 JSON 输出永远只有头三行，看不到尾部的 <code class="text-amber-400">request_id</code> / <code class="text-amber-400">reason</code> / traceback 末行。现套用 v1.5.18 的 thinking 折叠模式：<strong>默认只留 <code class="text-amber-400">⏺ Bash(…)</code> 标题行、下面一行正文都不出</strong>，<code class="text-amber-400">Ctrl+O</code> 出全文、不再有任何行数上限；Edit/Write 彩色 diff、失败结果的红色 <code class="text-amber-400">· failed</code> 同理。内容加工按「是否预算启发式」分化——三行截断 <code class="text-amber-400">...</code>、错误 head+tail 的 <code class="text-amber-400">⋮</code>、空行过滤全部删除；剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、错误首行红其余淡全部保留。输入框敲 <code class="text-amber-400">!</code> 的命令输出是唯一例外，仍保持三行预览。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1519c"><strong class="text-amber-400">修模型凭空编造 skill 路径</strong>：用户输入「请用 skills 分析股票」，模型答「技能目录 <code class="text-amber-400">/Users/dev/.wyj-code/skills</code> 在这台机器上不存在」——该路径全仓库和 skill 目录里都不存在，是模型<strong>编的</strong>（真实用户名并非 <code class="text-amber-400">dev</code>）。session 记录里抓到它的 thinking 原文：「Read the file directly at /Users/dev/… <strong>But I don't know the home dir</strong>」。skill 名单注入本身正常（模型能准确说出 <code class="text-amber-400">/hithink-finance</code>），暴露的是两个真缺陷：① 禁令是<strong>路径枚举</strong>、模型换个目录就绕过去了（它转而去读<strong>正确</strong>的 <code class="text-amber-400">~/.wyj-code/skills/</code>，只是把 home 编错），现改成<strong>行为禁令</strong>「禁止一切自发检索 skill 目录」；② <code class="text-amber-400">&lt;env&gt;</code> 块没有 home 目录、模型无从得知真实绝对路径，现新增 <code class="text-amber-400">Home directory</code> 字段（与会话内恒定的 cwd 同性质，进 prompt cache 的 stable 段）。</p>
-      </div>
-    </div>
-
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-phosphor">v1.5.18</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518"><strong class="text-amber-400">BREAKING：彻底切断 .claude/ 依赖，CLAUDE.md → AGENTS.md</strong>：wyj-code 自本版起<strong>不再读取任何 .claude/ 路径</strong>——不是「优先读 A、回退读 B」，是硬切换、不保留回退。起因是一个被实测出来的真实故障：模型凭 Claude Code 的训练先验去找 <code class="text-amber-400">~/.claude/skills/</code>（那里有 20 个 wyj-code 根本不读的 skill），而 wyj-code 自己的 <code class="text-amber-400">~/.wyj-code/skills/</code> 就躺在旁边看不见。<strong>升级必读</strong>：仓库根的 <code class="text-amber-400">CLAUDE.md</code> 不再被读取，请改名为 <code class="text-amber-400">AGENTS.md</code>（AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 均采用）。查找范围为全局 <code class="text-amber-400">~/.wyj-code/AGENTS.md</code> + 从项目根到 cwd 的祖先链，每级目录内 <code class="text-amber-400">AGENTS.local.md</code> 作个人覆盖追加（不提交 git）；原「CLAUDE.md → 祖先链 → 两者皆无才读 AGENTS.md」的三级兜底<strong>塌缩为两级</strong>（回退机制本身也是模型行为漂移的来源）。hooks 三源同步迁入 <code class="text-amber-400">.wyj-code/settings.json</code> → <code class="text-amber-400">settings.local.json</code>，原 <code class="text-amber-400">.claude/settings*.json</code> 不再被读取（4 个事件语义、exit 2 = block、stdout JSON 的 decision/reason 表达全部不变）。<code class="text-amber-400">/init</code> 的生成目标同步改为 <code class="text-amber-400">AGENTS.md</code>，否则它会生成一个永远不会被读取的文件。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518b"><strong class="text-amber-400">skill 名单注入模型上下文</strong>：此前用户说「请使用 skill 分析股票」，模型回答「我不能自己调用 skill——skill 必须由你用斜杠命令触发」，用户依然<strong>不知道该敲哪条命令</strong>。根因是提示词同时要求了两件冲突的事——<strong>禁止</strong>模型自行检索 skill 目录、却要求它输出一个具体命令名；而 skill 名单此前只存在于 TUI 的 <code class="text-amber-400">CommandRegistry</code>（只服务 <code class="text-amber-400">/xxx</code> 补全），<strong>从不进入模型上下文</strong>。这是提示词的<strong>禁令 / 数据不匹配</strong>：拿走了获取名单的途径，却要求基于该信息输出。修法是仿子 Agent 类型那条现成通路（<code class="text-amber-400">SUB_AGENT_TEMPLATE.replace("{types}", …)</code>）给 skill 补上同等出口——<code class="text-amber-400"># Skills</code> 段留 <code class="text-amber-400">{skills}</code> 占位，<code class="text-amber-400">Agent::with_skills()</code> 在构造期替换为可用 skill 名单。名单<strong>按 name 排序</strong>后注入（<code class="text-amber-400">load_skills</code> 内部是 HashMap，不排序则每次进程启动字节不同、打穿 prompt cache），落在 system prompt 的 stable 段、会话内冻结，<strong>prompt cache 照常命中</strong>。skill 仍是用户侧斜杠命令、<strong>不是模型可调用的工具</strong>（仍无 <code class="text-amber-400">Skill</code> 工具），但模型现在能准确回答「请运行 /xxx」。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518c"><strong class="text-amber-400">thinking 块默认折叠</strong>：此前固定显示前 3 行正文 + 一个语义不明的 <code class="text-amber-400">· 41 lines</code> 标记，头部字符 <code class="text-amber-400">✻</code>（U+273B, Dingbats）在终端字体里缺字形画成豆腐块。现在流式期间只画一行 <code class="text-amber-400">⎿ ⠋ 思考中…</code>，<strong>完全不碰 content</strong>——旧实现每帧把整个 thinking buffer 重新折行一遍、再只取前 3 行扔掉（500 行 thinking 在 20fps 下约每秒一万次无用切分与分配）；固化后折叠成一行元信息 <code class="text-amber-400">⎿ 已思考 12s（41 行） · Ctrl+O 展开</code>，<code class="text-amber-400">Ctrl+O</code> 全局切换后出<strong>全文</strong>（旧实现取头 3 行意味着几十行思考的<strong>结论永远看不到</strong>，而 thinking 是流式追加的、结论在尾部）。行数口径一并修正：<code class="text-amber-400">N lines</code> 数的是去空行后的原始行数，与屏幕上经折行再截断的视觉行数并<strong>无对应关系</strong>，因此只能当元信息。字符换成 <code class="text-amber-400">⎿</code>（U+23BF）——与 <code class="text-amber-400">⏺</code> 同属 Miscellaneous Technical 区，字体覆盖率不是一个量级。顺带接上两个<strong>一直存在却从未被消费</strong>的东西：<code class="text-amber-400">AppState.thinking_started</code>（自 ThinkingDelta 首块写入后零读点、固化时被直接丢弃）与 i18n 里的 <code class="text-amber-400">thinking.done</code>（零引用死 key，其「只报元信息不给正文」的形态恰恰是原始设计意图，实现漂移成了「显示前 3 行」）。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1518d"><strong class="text-amber-400">TodoWrite 任务列表默认关闭</strong>：对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0——两家头部厂商在 2026 年都已把 todo 脚手架改为默认关闭。本地实测依据是 102 个历史会话里的 <strong>132 次调用 100% 独占一个完整 LLM 往返</strong>（0 次与真实工作工具同轮发出），回给模型的「任务列表已更新」信息量为零（模型自己刚写的列表它自己知道），最密会话累计重复 prefill 5.2 MB 上下文，<strong>59% 的会话结束时 todo 未收尾</strong>。新增 <code class="text-amber-400">[tools].todo_enabled</code> 开关，弱模型 / 自托管场景仍可按需开启（外部实证：对强模型 planning 是「省 ~30% 成本、准确率不升反微降」，对弱模型则是 +11.6pp 的防过早放弃脚手架）。同时修掉三处实现缺陷：同一次调用在聊天流里<strong>渲染三遍</strong>、每次调用<strong>独占一轮</strong>往返、描述冗长诱导性措辞。<br><br><strong class="text-amber-400">工具结果预览</strong>：<code class="text-amber-400">⎿</code> 行直接展示真实错误首行，不再被「退出码 N」横幅占掉——第三方 API 的 <code class="text-amber-400">request id</code> / <code class="text-amber-400">reason</code> / traceback 末行几乎总在<strong>尾部</strong>，取头部必然丢失它们。<strong>1000 个 workspace 测试</strong> + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.17</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1517"><strong class="text-amber-400">上下文管理重整：清理优先于摘要</strong>：超阈值时先把<strong>过期的工具输出外部化到 CAS</strong>，留一条带工具名 / 大小 / 首行 / <code class="text-amber-400">cas://&lt;hash&gt;</code> 的占位符，清理得动就<strong>不</strong>去跑整段摘要——顺序对齐 Claude Code 官方文档的 "It clears older tool outputs first, then summarizes the conversation if needed"。清理比摘要便宜（无 output token、不产生幻觉）也更保真：原文只是移出模型视野<strong>没被转述</strong>，而摘要最先丢的恰好是负知识（被否决的假设）、精确路径行号、顺序因果。新增 <code class="text-amber-400">ContextRecall</code> 工具按 hash 取回全文并支持分页（<code class="text-amber-400">Bash</code> / <code class="text-amber-400">WebFetch</code> 这类一次性命令重跑也拿不回来）；白名单 <code class="text-amber-400">Read / Grep / Glob / Bash / WebFetch</code>，<code class="text-amber-400">Edit</code> / <code class="text-amber-400">Write</code> / <code class="text-amber-400">NotebookEdit</code> 的回执永不清理（丢了模型会以为自己没改过从而重做），最近 3 个工具结果保留全文。<strong>模型可见上下文 ≠ 持久 transcript</strong>：落盘 session 存占位符、原文在 CAS，<code class="text-amber-400">--resume</code> 时还原成完整上下文（新会话从头开始），之后随增长再逐步重新清理；blob 已被回收时保留占位符而不是变成空洞。<code class="text-amber-400">cas_total_bytes</code> / <code class="text-amber-400">cas_gc_on_start</code> 这两个此前因「无消费点」被删的配置项恢复并接上真实生产调用点（启动时 gc + 会话丢弃时逐个 release，让 CAS 的 <code class="text-amber-400">ref_count</code> 归零）。<code class="text-amber-400">[context_edit]</code> 配置块可整体关闭退回 v1.5.16 行为；CAS 不可写时机制整体关闭而不降级成「就地删掉」。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1517b"><strong class="text-amber-400">口径统一 + 状态栏去掉上下文占比</strong>：此前压缩决策算 request 级（system + 工具 schema + 输出预留）、状态栏只算 messages、记忆注入另有 8KB 字节硬截断——<strong>三套口径互不一致</strong>。主 system prompt 约 2,245 token + 十余个常驻工具 schema + <code class="text-amber-400">max_tokens</code> 8,192 全都不在进度条里，200K 窗口下就是 ≥6.5 个百分点的系统性低报，条的颜色和实际压缩时机对不上号（Anthropic 官方文档也明确警告过 statusline 的 <code class="text-amber-400">used_percentage</code> 不指示压缩时机；Claude Code 内置 UI 也已不再默认显示该百分比）。现在新增 <code class="text-amber-400">ContextAudit::from_request</code> 作为<strong>唯一口径</strong>，压缩决策 / <code class="text-amber-400">/cost</code> / 新增的 <code class="text-amber-400">/context</code> 面板全部消费它。状态栏<strong>彻底移除</strong> <code class="text-amber-400">[████░░░░] 78%</code>，改为 <code class="text-amber-400">已自动压缩 ×N</code> 的语义指示（计数随 <code class="text-amber-400">SessionFile.compact_count</code> 落盘，<code class="text-amber-400">/resume</code> 后不丢）——去掉占比不等于去掉可见性，「系统替我丢过历史」必须让用户知道，否则自动化就是黑盒。压缩提示词也改写成结构化系统消息（第 N 次 / 丢弃几条 / 保留几条原文 / 释放多少 token）。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1517c"><strong class="text-amber-400">两个会导致真 400 的硬缺陷</strong>：<strong>压缩 buffer 必须 ≥ <code class="text-amber-400">max_tokens</code></strong>——旧公式 <code class="text-amber-400">min(40K, cw/5)</code> 绝对封顶 40K，而 <code class="text-amber-400">max_tokens</code> 在配置层没有任何上限钳制，<code class="text-amber-400">max_tokens = 64000</code> + <code class="text-amber-400">context_window = 200000</code> 时算出阈值 160K，加 64K 输出 = <strong>224K &gt; 200K，结构性必 400</strong>；且 1M 窗口下只留 4% 余量（阈值 96%），窗口越大反而触发越晚。改为 <code class="text-amber-400">max(max_output_tokens + 8192, cw / 10)</code>，200K / 1M 都是 90%，与 Codex CLI 的 <code class="text-amber-400">window × 0.9</code> 对齐。<strong>没有 context 超限恢复路径</strong>——<code class="text-amber-400">ProviderErrorKind::ContextLengthExceeded</code> 分类早在 <code class="text-amber-400">error.rs</code> 就有，但 <code class="text-amber-400">agent.rs</code> 的 stream 错误分支只处理 <code class="text-amber-400">UnsupportedParameter</code>（thinking 降级）和同角色模型 fallback，<strong>没有任何一处消费它</strong>：启发式一旦低估，400 就直接抛给用户；更糟的是 Anthropic 官方的 <code class="text-amber-400">prompt is too long: N tokens &gt; M maximum</code> 一句都不含旧匹配表的三个关键词，会掉进 <code class="text-amber-400">is_client_error</code> 被误判成普通 <code class="text-amber-400">InvalidRequest</code>。现在超限时无视阈值强制压缩一次并重试（只重试一次，对标 Claude Code 的 "Autocompact is thrashing" 熔断），压缩本身压不动也照常重入循环让 <code class="text-amber-400">truncate_messages</code> 兜底。压缩保留量也从固定 6 条改为随窗口伸缩的 token 预算 <code class="text-amber-400">clamp(cw/8, 4K, 32K)</code>（工具密集回合里 6 条可能就是一整个巨型 tool_result，纯对话回合里 6 条可能只有 1K token——两头都错）。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1517d"><strong class="text-amber-400">全量移除 Jev 决策工具</strong>：<code class="text-amber-400">crates/tools/src/jev.rs</code>（约 1,240 行 / 8 文件）审计发现「实现了但没接通」——97 个历史 session 中模型 <strong>0 次</strong>调用过它，两处接线缺陷（<code class="text-amber-400">rebuild_fn</code> 漏注册、被 lazy 工具折叠），每轮固定烧约 1,150 token。已从 <code class="text-amber-400">lib.rs</code> / <code class="text-amber-400">descriptions.rs</code> / <code class="text-amber-400">prompts.rs</code> / <code class="text-amber-400">config</code> / <code class="text-amber-400">main.rs</code> / <code class="text-amber-400">builtin.rs</code>（<code class="text-amber-400">/decision</code>）/ i18n / README / CLAUDE.md / CHANGELOG 移除全部接线与文案，并从用户 <code class="text-amber-400">~/.wyj-code/config.toml</code> 删掉 <code class="text-amber-400">[tools.jev]</code> 块（原文件备份为 <code class="text-amber-400">config.toml.bak-before-jev-removal</code>）。<strong>982 个 workspace 测试</strong> + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.16</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516"><strong class="text-amber-400">后台任务可见性与自动续跑</strong>：此前后台 subagent 的结果只暂存到下一条用户消息才注入、后台 shell 更只返回一个 <code class="text-amber-400">bash_N</code> id 靠模型自己轮询 <code class="text-amber-400">BashOutput</code>，两条路都会停在等用户输入——"派完活就不动了"。现在主循环 idle 钩子检测到后台任务完成即自动起新 turn 把结果喂回主 Agent，多任务同帧完成合并成<strong>一轮</strong>避免连续多次 LLM 往返；<code class="text-amber-400">spawn_agent_turn</code> 新增自动唤醒模式（<code class="text-amber-400">text: Option&lt;String&gt;</code>），reminder 作为这一轮唯一 user 输入而非伪装成用户发言，聊天流只显示可读的 <code class="text-amber-400">⚙</code> 系统提示。ESC 中断后<strong>暂停自动唤醒</strong>（"我明明打断了怎么又跑起来"），直到你发下一条消息才恢复。新增底部<strong class="text-amber-400">后台任务面板</strong>：有 run_in_background 任务时自动出现，<code class="text-amber-400">BashSessionManager</code> 有完整输出缓冲但 TUI 侧此前一行代码都没接，所有后台任务在界面上完全不可见——现在列表实时显示 id / 命令 / 状态 / 耗时 / 退出码，<code class="text-amber-400">Enter</code> 展开实时输出、<code class="text-amber-400">PageUp/PageDown</code> 翻页看历史（默认贴底跟随）、按 <code class="text-amber-400">k</code> 终止进程组；任务退出时输出尾部自动回显给模型。新增 <code class="text-amber-400">/shells [id]</code> 命令手动查看已结束任务。两个面板互斥时按<strong>用户焦点优先</strong>（子 Agent 与后台 shell 常同时跑，固定先后会让其中一方永远看不见也按不了 k），跨区链条 <code class="text-amber-400">Chat ↓ → Todos ↓ → SubAgents ↓ → Shells</code>。新增 <code class="text-amber-400">BackgroundJob::tail()</code> 只读快照 API——面板每帧读输出不能推进 <code class="text-amber-400">BashOutput</code> 的增量游标，否则两者互相抢对方的内容。三个坑都做了防护：退出时 <code class="text-amber-400">kill_all()</code> 会把全部 job 翻成 <code class="text-amber-400">Exited(-1)</code>，<code class="text-amber-400">should_quit</code> 守卫拦住误唤醒；后台任务<strong>跨轮次保留</strong>只在会话级重置才清（否则 dev server 会在你发新消息时从面板凭空消失）；任务列表全部完成后<strong>收成一行摘要</strong>，不再以 2 行折叠面板一直挂到下一条消息。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516b"><strong class="text-amber-400">Prompt cache 自我击穿修复</strong>：<code class="text-amber-400">Provider</code> 的 <code class="text-amber-400">system</code> 参数从 <code class="text-amber-400">&amp;str</code> 改为 <code class="text-amber-400">&amp;SystemPrompt&lt;_'&gt;</code>（新增 <code class="text-amber-400">stable</code> / <code class="text-amber-400">volatile</code> 两段）。此前整个 system 压成一个字符串、Anthropic 侧只能发单个 text 块且断点打在块尾，而 system 里混了大量每轮会变的内容（工具可用性、模型兼容 suffix、子目录 CLAUDE.md reminder、Project Brief），<strong>任何一项变化都让整段 1.6k~5k token 全价重算</strong>——旧注释"reminder 只增不减、前缀仍可缓存"是错的，追加在断点之后同样改写前缀哈希。现在 stable 段末尾打 <code class="text-amber-400">cache_control: EPHEMERAL</code>、volatile 段不打（断点预算 3，仍在上限 4 内）；Project Brief 改按 <code class="text-amber-400">MEMORY_SNAPSHOT_REFRESH_TURNS = 10</code> 分桶缓存，缓存抖动降到 1/10。<strong>【源码级破坏】</strong>自定义 <code class="text-amber-400">Provider</code> 实现需改签名（辅助 LLM 调用用 <code class="text-amber-400">SystemPrompt::stable_only(...)</code> 一行迁移）。<strong>【API 移除】</strong><code class="text-amber-400">compact::COMPACT_TRIGGER_BUFFER</code> 常量改为函数。</p>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1516c"><strong class="text-amber-400">一批"看起来在工作、实际静默失效"的缺陷修复</strong>：<code class="text-amber-400">persist_cap</code> 的两条 JSON 上限<strong>从上线起从未生效</strong>——<code class="text-amber-400">ToolUse.input</code> 与 tool_result 的 <code class="text-amber-400">Blocks</code> 被 <code class="text-amber-400">to_string</code> 后做字符串级截断，插入的 <code class="text-amber-400">[truncated N bytes]</code> 标记使 JSON <strong>必然</strong>解析失败，而失败分支是 <code class="text-amber-400">if let Ok(...)</code> 静默吞掉，超限的 Edit/Write 参数与 Bash 输出原样进请求体并落盘；改为 <code class="text-amber-400">shrink_json_to_budget()</code> 按"最长 string 叶子"裁剪并保持合法 JSON。<strong>子 Agent 权限比主 Agent 更严</strong>：父级处于 Bypass(AutoApprove) 时子 Agent 落回默认 Prompt，而它没有审批 UI，<code class="text-amber-400">Prompt</code> + 无 UI 通道在 <code class="text-amber-400">PermissionPolicy::evaluate</code> 与 <code class="text-amber-400">confirm_tool</code> <strong>两道</strong>关卡上 fail-closed，Bash/Edit/Write 被全量拒掉；改为委派本身已在父级审批过、子 Agent 继承 AutoApprove，同时<strong>加护栏</strong>：只有被委派类型<em>可能</em>拿到副作用工具时才弹一次审批（Explore/Plan 零打扰）。<strong>孤儿 tool_use 兜底配对</strong>：模型写参数被 <code class="text-amber-400">max_tokens</code> 截断时留下无配对 <code class="text-amber-400">tool_result</code>，该历史一旦落盘会让每次 <code class="text-amber-400">--resume</code> 永久 400 且用户无法自愈；现在合成 <code class="text-amber-400">is_error: true</code> 的兜底结果。<strong>Checkpoint 配置被 TUI 侧覆盖</strong>：7 处裸 <code class="text-amber-400">new()</code> + <code class="text-amber-400">attach_agent_session</code> 覆盖装配好的 store，切换一次模型后 checkpoint 不再封顶、快照不走 CAS 去重（同 session 从 &lt;5 MB 退回 200 MB 量级）；改为进程级 <code class="text-amber-400">set_checkpoint_config()</code> + <code class="text-amber-400">configured()</code>。<strong>压缩用量漏记</strong>：压缩本身的 LLM 往返被丢弃，<code class="text-amber-400">/cost</code> 系统性低估真实花费；<strong>悬空 cwd panic</strong>：工作目录被删时 <code class="text-amber-400">current_dir()</code> 返回 Err 而调用点 <code class="text-amber-400">.unwrap()</code> panic，改为明确中文错误并<strong>刻意不做 <code class="text-amber-400">$HOME</code> 兜底</strong>（cwd 决定 project root 与会话归属，静默换目录比报错危险）；<code class="text-amber-400">/context</code> 占用率不再写死 200K；<code class="text-amber-400">agent.compacted</code> 文案从硬编码中文改走 i18n。删除 4 个<strong>从未有任何消费点的幻象配置</strong>（<code class="text-amber-400">checkpoint_bytes_per_session</code> / <code class="text-amber-400">cas_total_bytes</code> / <code class="text-amber-400">cas_gc_on_start</code> / <code class="text-amber-400">checkpoint_ttl_days</code>，迁移成本为零）——但需注意 <code class="text-amber-400">cas/</code> 与 <code class="text-amber-400">*.checkpoints/</code> 至今仍无任何回收路径。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.15</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1515"><strong class="text-amber-400">配置加载收敛到 .wyj-code/（BREAKING）</strong>：wyj-code 自 v1.5.15 起<strong>只</strong>读写 <code class="text-amber-400">~/.wyj-code/</code>（全局）与 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/</code>（项目级），不再读取 <code class="text-amber-400">~/.claude/commands/</code> / <code class="text-amber-400">~/.claude/agents/</code> / <code class="text-amber-400">~/.claude.json</code> / <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code> / <code class="text-amber-400">~/.codex/</code> 等任何外部源。Skill 加载链由 6 层裁为 4 层（内置 → <code class="text-amber-400">~/.wyj-code/skills</code> → 插件贡献 → 项目 <code class="text-amber-400">~/.wyj-code/skills</code>），SubAgent 类型链同方向 6 层裁为 4 层；MCP 全局 <code class="text-amber-400">Config::load()</code> 不再合并 <code class="text-amber-400">~/.claude.json</code>、项目级 <code class="text-amber-400">merged_mcp_servers</code> 不再读 <code class="text-amber-400">&lt;cwd&gt;/.mcp.json</code>、<code class="text-amber-400">uninstall_mcp_server</code> 删"原生来源 → 落禁用记录"分支统一走"从来源文件删行 + lockfile 移除"。<code class="text-amber-400">/import</code> slash 命令 + TUI <code class="text-amber-400">ImportDialog</code> + <code class="text-amber-400">ExtensionCommand::Migrate</code> + <code class="text-amber-400">crates/store/src/import.rs</code>（700+ 行）+ <code class="text-amber-400">crates/config/src/codex.rs</code>（Codex 兼容层 150+ 行 + 5 个测试）整链路下线——用户跨来源导入需求改为手工复制粘贴到 <code class="text-amber-400">.wyj-code/</code>。同步修复 master 上 pre-existing 的 <code class="text-amber-400">resolve_jev_api_key_prefers_field_over_env_when_both_set</code> 测试失败（拆 3 个测试 + 进程级 <code class="text-amber-400">JEV_ENV_LOCK: Mutex&lt;()&gt;</code> 串行化）；TUI <code class="text-amber-400">AgentEvent::TurnDone</code> 分支增加清扫，把任何遗留 InProgress 的 todo 自动收口为 Completed，根治"AI 已回复但任务列表还显示进行中"的 UI 割裂。CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。1099 个 workspace 测试 + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.14</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1514"><strong class="text-amber-400">统一通知通道</strong>：新增 <code class="text-amber-400">wyj_core::notify</code>（从 <code class="text-amber-400">wyj_cli::notify</code> 上迁到 <code class="text-amber-400">wyj_core</code> 供 TUI + CLI 双向共用，避免 <code class="text-amber-400">wyj-cli</code>/<code class="text-amber-400">wyj-tui</code> 之间的反向依赖循环），覆盖 4 类事件（<code class="text-amber-400">TurnFinished</code>/<code class="text-amber-400">TurnError</code>/<code class="text-amber-400">SubAgentDone</code>/<code class="text-amber-400">ScheduleFailed</code>）× 2 类 sink（<code class="text-amber-400">BellSink</code> stderr <code class="text-amber-400">\x07</code> 跨平台通用 / <code class="text-amber-400">DesktopSink</code> macOS <code class="text-amber-400">osascript</code> + Linux <code class="text-amber-400">notify-send</code> + Windows PowerShell BurntToast），6/7 触发点已接入（TUI TurnDone / TUI Error / TUI 后台 SubAgentDone / CLI <code class="text-amber-400">-p</code> / CLI <code class="text-amber-400">--headless</code> REPL / cron schedule 失败；ACP/daemon 长跑后端无人类会话上下文故故意不接）。Config 顶层 <code class="text-amber-400">[notify]</code> block（<code class="text-amber-400">enabled</code>/<code class="text-amber-400">bell.enabled</code>/<code class="text-amber-400">desktop.enabled</code>/<code class="text-amber-400">events.*</code>/<code class="text-amber-400">rate_limit_seconds</code>/<code class="text-amber-400">include_session_id</code>，<code class="text-amber-400">bell.enabled</code> opt-in 默认关避扰民其余全部 opt-out 默认开，<code class="text-amber-400">rate_limit_seconds=30</code> 同类事件最小间隔防滥用）。env override 最小集 <code class="text-amber-400">WYJ_CODE_NOTIFY_OFF/BELL/DESKTOP</code>——env 在 init 阶段读取，<strong>绝不</strong>写回 cfg（沿用 <code class="text-amber-400">Config::resolve_jev_api_key</code> 模式）。所有 sink 失败 swallow + 首次失败 <code class="text-amber-400">tracing::debug!</code> 一次（<code class="text-amber-400">OnceLock</code> 防洪水）。<code class="text-amber-400">include_session_id=true</code> 时 body 末尾追加 <code class="text-amber-400">[session:&lt;id&gt;]</code>，总长被 200 字符上限收口。零新第三方依赖。9 项 notify 单测 + 3 项 config 单测全绿。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.13</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1513"><strong class="text-amber-400">TypeSafe Jev 决策 API 接入</strong>：新增 <code class="text-amber-400">crates/tools/src/jev.rs</code> 的 <code class="text-amber-400">JevTool</code>（POST <code class="text-amber-400">https://api.typesafe.ai/v1/systemone</code>，三种 primitive：choice / score / noul，每个 answer 自带 <code class="text-amber-400">confidence</code> + <code class="text-amber-400">probabilities</code>），与 <code class="text-amber-400">JevBudget</code> 进程级日预算计数器（micro-cent 精度，输入 <code class="text-amber-400">$0.042/M</code>、输出免费）。<code class="text-amber-400">Config.tools.jev</code> 子块 + <code class="text-amber-400">Config::resolve_jev_api_key()</code> env/字段合并（与 <code class="text-amber-400">runtime_api_key</code> 同款"serde skip"语义，绝不把 env 值物化进 config.toml）。客户端三层硬封顶：<code class="text-amber-400">max_state_chars</code>（按 char boundary 安全截断）/ <code class="text-amber-400">max_questions</code> / <code class="text-amber-400">daily_budget_usd</code>（<code class="text-amber-400">0</code> 关闭）。<code class="text-amber-400">cli::register_jev_tool_if_enabled</code> 仿 <code class="text-amber-400">register_computer_tool_if_enabled</code> 的门控模式（仅 enabled + API Key 可解析时注册），驱动 <code class="text-amber-400">core::prompts::JEV_HINT</code> 仅在已注册时拼到 system prompt。<code class="text-amber-400">/decision [ping|ask &lt;问题&gt;]</code> slash 命令做连通性诊断 + 快速问答（zh/en.yml <code class="text-amber-400">/help.body</code> 已同步注册）。Jev 与 chat 模型完全不同——无 stream / 无 multi-turn / 无 tool calling 协议——<strong>不</strong>新增 <code class="text-amber-400">WireProtocol</code> 变体、<strong>不</strong>改 <code class="text-amber-400">Provider</code> trait，避免污染 routing/capability_cache 分桶。子 Agent 工厂不注册（与 Computer / SubAgent / AskQuestion 同款白名单策略）。13 项 jev 单元测试覆盖 client-side validation / happy path / 三 primitive 端到端 / HTTP 错误归一（401/422/429/529）/ 429 重试 / state 截断 / budget 硬封顶；7 项 config 测试覆盖 jev 默认值 / partial 段解析 / base URL trim / api key 解析；workspace 全量回归 + clippy <code class="text-amber-400">-D warnings</code> 全绿。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.12</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1512">TUI 终端 panic 兜底还原 + char-boundary 安全工具 + 标题栏/状态栏精简：新增 <code class="text-amber-400">crates/tui/src/panic_guard.rs</code> 进程级 <code class="text-amber-400">panic::set_hook</code>（<code class="text-amber-400">cli::main()</code> 入口最前 <code class="text-amber-400">install()</code>，<code class="text-amber-400">run_tui</code> 在 <code class="text-amber-400">enter/leave_terminal_screen</code> 配对 <code class="text-amber-400">mark_active/mark_inactive</code>），panic 触发时若 active 则 best-effort 还原终端（<code class="text-amber-400">DisableMouseCapture</code> → <code class="text-amber-400">LeaveAlternateScreen</code> → <code class="text-amber-400">disable_raw_mode</code> → <code class="text-amber-400">Show</code>）。新增 <code class="text-amber-400">wyj_core::textutil::floor_char_boundary</code> 治本 <code class="text-amber-400">memory_v3.rs</code> 拼装 Active Memory 上下文超 <code class="text-amber-400">MAX_CONTEXT_BYTES</code> 时撞 CJK/emoji char boundary 的 <code class="text-amber-400">is_char_boundary</code> assertion panic。<code class="text-amber-400">thinking_status_label</code> 改回单层优先级静态字符串（去掉旧的"大象装进冰箱"4 秒旋转短语）；<code class="text-amber-400">draw_input</code> 标题栏仅 thinking 态保留 spinner，三模式 Plan/Bypass/Normal 非思考态只留最简洁 <code class="text-amber-400">[plan/bypass] Enter to send</code> / <code class="text-amber-400">Enter to send</code>；状态栏默认右侧不再放快捷键提示；删除 <code class="text-amber-400">draw_input</code> 在 <code class="text-amber-400">is_thinking=true</code> 时提前 <code class="text-amber-400">return</code> 致光标卡死的回归，配套新增两个 <code class="text-amber-400">TestBackend</code> 回归测试防再次复发。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.11</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1511">Session 存储重构（M1-M4）：新增 <code class="text-amber-400">crates/core/src/workspace_cas.rs</code> 提供 sha256 内容寻址 Blob Pool（<code class="text-amber-400">intern/get/release/gc/stats</code>），<code class="text-amber-400">FileEntry { hash, inline_bytes, size, sha256 }</code> 替代内联字节 + <code class="text-amber-400">#[serde(default, alias = "bytes")]</code> 兼容旧 v1.5.10 checkpoint；<code class="text-amber-400">WorkspaceSnapshot::Delta</code> 同 cwd 自动 fold 父链（20 层上限），跨 cwd 强制 baseline；<code class="text-amber-400">externalize_block_with</code> 把 &gt;32KB image 与 &gt;16KB thinking 外置到 CAS（<code class="text-amber-400">cas://&lt;hash&gt;</code> 引用，<code class="text-amber-400">materialize_block_with</code> 在 resume 时还原）；<code class="text-amber-400">gc()</code> 用 <code class="text-amber-400">last_ref_at</code> LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。新增 <code class="text-amber-400">/new</code> slash 命令对齐 Claude Code 新会话语义：自动保存当前会话 + 分配新 session_id + 清空 TUI 状态 + 无二次确认弹窗。新增 <code class="text-amber-400">wyj-code storage {status,doctor,prune}</code> 占用治理子命令，<code class="text-amber-400">status --json</code> 可脚本消费。869 workspace 测试 + clippy clean。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.10</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v1510">50GB 级磁盘占用默认 cap：Evolution per-project 100MiB + 28–180 天 TTL；Session checkpoint 20/session、Memory v2/v3 records/Superseded 单独计数；Schedule 日志 50 文件 + run.log 10MiB×3 轮转；plugin .git 7 天 <code class="text-amber-400">git gc</code>；workspace worktree 30 天 prune；持久化前 content 截断（tool_result 20K+10K、thinking 8K、tool_use.input 64K）；顶层 <code class="text-amber-400">~/.wyj-code</code> 达 5GiB 启动一次性 warn；全部 opt-out by <code class="text-amber-400">0</code> in config。首次启动 <code class="text-amber-400">~/.wyj-code</code> 缺失时 TUI 自动打开 /model 引导用户填写 API Key（焦点预置 api_key 字段），写盘后 chmod 0600 自动重建 agent，无需重启；headless / -p / ACP / daemon 无 UI 时继续报错但给出指向 TUI 与 <code class="text-amber-400">WYJ_CODE_API_KEY</code> 的可复制 hint。MiniMax M3 thinking 按 <code class="text-amber-400">effort_levels</code> 拆出 <code class="text-amber-400">ReasoningEffort</code>，与 M2 协议并行走不同 vendor dispatch 与 capability 路径。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.6</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v156">Memory v3 收敛为 Global/Project 两层（删除共享 Workspace scope），AI 自动管理项目记忆、Project 覆盖 Global 冲突；Global 背景提取走 Pending 候选，由 Memory 工具三步自然语言确认；新增 Task 类型（InProgress/Completed/Cancelled/Blocked）+ 动态 Project Brief，"继续/接着/resume/go on" 命中即恢复最近未完成任务；`/memory clear-all` 一键清空重建。Evolution 收敛到 GovernanceOnly，普通 Memory 数据层不再注入也不再自动生成。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-amber-500 timeline-dot"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-amber-500">v1.5.5</span>
-          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v155">新增证据化 Evolution store、/evolve 四视图与完整 CLI、相关性 Memory 注入、外部上下文隔离、人工审批 Rule/Skill 候选、结构化 Skill eval、原子安装回滚；同时纳入多图片 Composer 与 Ghostty 滚轮/方向键隔离。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.5.4</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v154">按 action 对齐 computer-use 的统一权限与工具权限语义：headless/daemon 可安全执行截图、窗口枚举和元素检查，点击、输入、滚动及未知动作仍失败关闭。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.5.3</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v153">ToolSearch 保留 computer-use 核心 schema，避免国内模型误判 GUI 不可用；同时修复 Windows checksum 的 CRLF 可移植性，并在上传前实测五平台 SHA256。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.5.2</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v152">ToolSearch lazy schema 始终保留核心读写与 Agent 执行面，避免国内模型在大工具集下看不到必需工具；同时完成 Rust/Clippy 1.96 严格门禁兼容并固定 Release/Review 工具链。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.5.1</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v151">修复国内模型一次返回多个完整工具调用时的兼容路径：保守能力仍控制串行执行，但不再错误拒绝额外合法调用或误触参数重试熔断；同时修复 Linux 专属严格 Clippy 阻塞。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.5.0</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v150">完整交付 P2：Workflow 编码节点从当前脏工作区 checkpoint 自动进入 managed worktree；新增 workspace review/accept 生命周期、schema v2 ACP/daemon 全局 session、真实 Plugin LSP workspace/symbol、事务式 Plugin runtime、本地 Review/CI，并整合 Markdown 网格、终端原生拖选与 OSC 8 超链接。国内模型无独立 probe Key 时仍保持 static_only。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3">
-          <span class="font-display font-bold text-paper/70">v1.4.4</span>
-        </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v144">国内模型可信运行时与安全执行：能力目录/doctor、工具参数修复校验、同角色 fallback、ToolSearch lazy schema、checkpoint/rewind/branch、SubAgent 控制协议，以及 macOS Seatbelt / Linux bubblewrap sandbox。未使用已暴露的 MiniMax Key，国内模型当前保持 static_only，不冒充 live verified。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <div class="flex items-center gap-3"><span class="font-display font-bold text-paper/70">v1.4.2</span></div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v142">TUI 对齐 Codex 静态执行流：Thinking、工具结果和 Bash 输出默认最多显示 3 个视觉行，Edit/Write 自动展示彩色 diff；鼠标可直接拖选复制文字，无需 Shift；并新增聊天逐行滚动、Todo 单任务详情，以及上滚阅读时不抢视口的新消息提示。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:40ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.4.1</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v141">修复 TUI 图片/文字/文件粘贴链路：Ctrl/Command+V 可直接读取纯图片剪贴板，附件以内联 <code class="text-amber-400">[Image]</code> / <code class="text-amber-400">[File]</code> 占位符显示并支持 attachment-only 发送；修复 foreground computer 在同 App 多窗口和“点击后立即输入”连续动作中误报 <code class="text-amber-400">target_changed</code>。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:80ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.4.0</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v140">Computer-use 重构为人机互不干扰架构：默认改为稳定窗口目标 + macOS Accessibility 后台操作，不移动物理光标、不抢前台窗口，用户可在其它 App 正常输入的同时让 Agent 后台操作目标窗口，仅在真正冲突时才安全熔断；新增项目级 MCP server 信任确认（按内容指纹首次需人工批准）与 <code class="text-amber-400">.wyj-code/</code> 项目配置按 Git 仓库根自动发现，任意子目录启动均可用。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:120ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.3.3</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v133">新增 <code class="text-amber-400">/schedule</code> 定时任务面板：一句话 prompt 或固化当前对话即可生成到点自动执行的任务，保存后自动同步进系统 crontab（macOS / Linux），失败可选 macOS 系统通知；新增 <code class="text-amber-400">/import</code> 一键导入 Codex / Claude Code 的 MCP、自定义命令与 Agent 配置；全应用列表选中态背景色统一为深灰，告别忽蓝忽无色的不一致观感。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:160ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.3.0</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v130">新增 Computer-use 桌面 GUI 控制（macOS / Windows）：模型截图观察桌面、合成鼠标键盘操作，官方端点用原生工具、第三方 Anthropic 协议兼容端点自动退化为 custom 工具；TUI 主界面改为永久 Fullscreen，输入框/状态栏始终贴住窗口底部，不再有留白。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:200ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.2.2</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v122">统一 Extensions 中心管理 Skill / MCP / Plugin，支持热应用、诊断与兼容迁移；安装、锁定与回滚更可靠；上下文压缩更稳，MiniMax / GLM / DeepSeek 已完成请求采用供应商精确 usage 账务。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:240ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.2.1</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v121">TUI 消息流重构（thinking / 工具块 / Ctrl+O 展开应用内滚动）；Profile 新增 prompt_cache / openai_stream_options 兼容开关，GLM / Kimi / DeepSeek 等国内模型官方开箱即用；/cost 与 stats JSON 补全 full input / 缓存命中率 / context 指标。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:280ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.2.0</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v120">自定义 Slash 命令对齐真实 Claude Code（识别 <code class="text-amber-400">~/.claude/commands/*.md</code>）；性能实测（12MB / ~10ms）与依赖排查；预编译包新增一键安装脚本 install.sh / install.bat。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:320ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.1.0</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v110">新增 Hooks 生命周期自动化系统（PreToolUse / PostToolUse / UserPromptSubmit / Stop）；开源产品化基线（LICENSE、CONTRIBUTING、CHANGELOG）。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0" style="transition-delay:360ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.0.2</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v102">新增 <code class="text-amber-400">wyj-code update</code> 自更新；ExitPlanMode 计划面板重构；<code class="text-amber-400">build.sh release</code> 一键发版脚本。</p>
-      </div>
-    </div>
-    <div class="reveal flex gap-6 pl-8 relative min-w-0" style="transition-delay:400ms">
-      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-paper/30"></span>
-      <div class="min-w-0">
-        <span class="font-display font-bold text-paper/70">v1.0.0</span>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v100">首发：Agent 推理循环、双协议 LLM 适配、内置工具集、ratatui TUI、子 Agent、上下文压缩、跨会话记忆、MCP / Skill / Plugin 市场。</p>
-      </div>
-    </div>
-  </div>
-
-  <a href="https://github.com/wangyooujin/wyj-code/blob/master/CHANGELOG.md" target="_blank" rel="noopener" class="inline-block mt-4 text-sm text-amber-500 hover:text-amber-400 transition-colors" data-i18n="changelog.link">查看完整更新日志 →</a>
 </section>
 
 <!-- CTA -->
 <section class="border-t border-white/[0.06]">
   <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24 text-center reveal">
-    <h2 class="font-display font-bold text-3xl sm:text-4xl" data-i18n="cta.title">在你的终端里试一下</h2>
-    <p class="mt-4 text-paper/55 max-w-lg mx-auto" data-i18n="cta.desc">开源、单二进制、零遥测——克隆下来跑起来只要 60 秒。</p>
+    <h2 class="font-display font-bold text-3xl sm:text-4xl" data-i18n="cta.title">在你的终端里试一次</h2>
+    <p class="mt-4 text-paper/55 max-w-lg mx-auto" data-i18n="cta.desc">单二进制、零遥测，克隆下来跑起来只要 60 秒。</p>
     <div class="mt-8 flex flex-wrap justify-center gap-4">
-      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-primary rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
+      <a href="#install" class="btn-primary rounded-lg px-6 py-3 text-sm" data-i18n="cta.install">60 秒安装</a>
+      <a href="docs.html" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="cta.docs">想先了解实现？看文档</a>
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-ghost rounded-lg px-6 py-3 text-sm inline-flex items-center gap-2">
         <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
-        <span data-i18n="cta.github">前往 GitHub</span>
+        <span data-i18n="cta.github">GitHub 仓库</span>
       </a>
-      <a href="#install" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="cta.install">查看安装步骤</a>
     </div>
   </div>
 </section>
