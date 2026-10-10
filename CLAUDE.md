@@ -89,7 +89,7 @@ trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
 
 [tools]                          # 工具注册门控（v1.5.18+）
-todo_enabled = false            # 是否注册 TodoWrite 任务列表工具。**默认关闭**，
+todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认关闭**，
                                 # 对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0
                                 # （两家头部厂商均已把 todo 脚手架改为默认关闭）。
                                 # 未注册 = 工具不产生 schema，模型目录里看不到它。
