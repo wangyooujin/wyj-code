@@ -49,6 +49,10 @@ pub struct Session {
     /// 同角色模型 fallback 记录。只保存 profile 名与错误分类，不保存请求正文、
     /// endpoint query 或认证信息。
     pub routing_events: Vec<RoutingEvent>,
+    /// 本会话实际生效的 prompt cache 模式，取值见
+    /// [`crate::session_store::prompt_cache_state`]。2 = 曾开启但端点 400 已降级，
+    /// 让 `/cost` 能解释「缓存为什么是 0」。
+    pub prompt_cache_state: u8,
     pub current_checkpoint_id: Option<String>,
     pub branch_parent_session_id: Option<String>,
     pub branch_parent_checkpoint_id: Option<String>,
@@ -69,10 +73,15 @@ impl Session {
         let current_checkpoint_id = self.current_checkpoint_id.clone();
         let branch_parent_session_id = self.branch_parent_session_id.clone();
         let branch_parent_checkpoint_id = self.branch_parent_checkpoint_id.clone();
+        // prompt_cache_state 描述的是「当前 profile/端点是否真的在用缓存」，
+        // 属于运行环境而非本次对话内容——`/clear` 换对话不换端点，抹掉它会让
+        // 紧接着的 `/cost` 把"已降级"误报成"从未开启"。
+        let prompt_cache_state = self.prompt_cache_state;
         *self = Self {
             current_checkpoint_id,
             branch_parent_session_id,
             branch_parent_checkpoint_id,
+            prompt_cache_state,
             ..Self::default()
         };
     }
@@ -155,6 +164,33 @@ impl Session {
     pub fn add_cache_usage(&mut self, cache_read: u32, cache_write: u32) {
         self.total_cache_read_tokens += cache_read;
         self.total_cache_write_tokens += cache_write;
+    }
+
+    /// 从落盘文件恢复**全部计量与血缘字段**。
+    ///
+    /// 与 [`SessionFile::from_session`] 成对：这两个函数是 `Session` ↔
+    /// `SessionFile` 之间计量字段的唯一起止点。resume / `/resume` 切换 / 分支
+    /// 三条恢复路径以前各自手写 `sess.total_input_tokens = file.input_tokens`
+    /// 这一串，新增字段必然漏改（这正是 cache/api_calls 此前只能活在内存里的
+    /// 根因）。集中到这里后，漏改在编译期暴露。
+    ///
+    /// 注意**不**碰 `messages`——各恢复路径对消息体的处理不同（是否
+    /// `materialize_elided`、是否替换为 checkpoint 内容），由调用方自己决定。
+    pub fn restore_usage_from(&mut self, file: &crate::session_store::SessionFile) {
+        self.total_input_tokens = file.input_tokens;
+        self.total_output_tokens = file.output_tokens;
+        self.total_cache_read_tokens = file.cache_read_tokens;
+        self.total_cache_write_tokens = file.cache_write_tokens;
+        self.api_calls = file.api_calls;
+        self.tool_schema_tokens = file.tool_schema_tokens;
+        self.tool_schema_tokens_saved = file.tool_schema_tokens_saved;
+        self.prompt_cache_state = file.prompt_cache_state;
+        self.compact_count = file.compact_count;
+        self.context_edit_freed_tokens = file.context_edit_freed_tokens;
+        self.routing_events = file.routing_events.clone();
+        self.current_checkpoint_id = file.current_checkpoint_id.clone();
+        self.branch_parent_session_id = file.branch_parent_session_id.clone();
+        self.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id.clone();
     }
 }
 

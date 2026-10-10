@@ -536,6 +536,8 @@ mod tests {
                     output_tokens: 0,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    api_calls: 0,
+                    prompt_cache_state: 0,
                     context_window: 0,
                     estimated_tokens: 0,
                     context_audit: None,

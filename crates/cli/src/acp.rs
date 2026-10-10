@@ -19,7 +19,8 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, AgentSessionRuntime,
     CheckpointKind, CheckpointStore, ExecutionSurface, RewindScope, Session, SessionControl,
-    SessionEvent, SessionEventEnvelope, SessionFile, SessionStore, WorkspaceDiffSummary,
+    SessionEvent, SessionEventEnvelope, SessionFile, SessionFileMeta, SessionStore,
+    WorkspaceDiffSummary,
 };
 use wyj_tools::ctx::{PermissionDecision, UiAskRequest};
 use wyj_tools::{PermissionMode, ToolCtx};
@@ -732,13 +733,10 @@ fn parse_rewind_scope(scope: &str) -> Result<RewindScope> {
 
 fn session_from_file(file: SessionFile) -> Session {
     let mut session = Session::new();
+    // 计量与血缘字段统一走 restore_usage_from，避免新增字段时漏改这里
+    // （`/cost` 在 resume 后全零正是这种漏改的结果）。
+    session.restore_usage_from(&file);
     session.messages = file.messages;
-    session.total_input_tokens = file.input_tokens;
-    session.total_output_tokens = file.output_tokens;
-    session.routing_events = file.routing_events;
-    session.current_checkpoint_id = file.current_checkpoint_id;
-    session.branch_parent_session_id = file.branch_parent_session_id;
-    session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
     session
 }
 
@@ -1054,25 +1052,18 @@ async fn persist_session(state: &ConnectionState, entry: &SessionEntry) {
         return;
     };
     let session = entry.runtime.session_snapshot().await;
-    let _ = store.save(&SessionFile {
-        session_id: entry.runtime.session_id().to_string(),
-        title: extract_title(&session.messages),
-        last_preview: extract_preview(&session.messages),
-        cwd: entry.cwd.display().to_string(),
-        timestamp: now_iso(),
-        turns: session.messages.len(),
-        input_tokens: session.total_input_tokens,
-        output_tokens: session.total_output_tokens,
-        messages: session.messages,
-        routing_events: session.routing_events,
-        compact_count: session.compact_count,
-        elided_blobs: session.elided_blobs.clone(),
-        context_edit_freed_tokens: session.context_edit_freed_tokens,
-        current_checkpoint_id: session.current_checkpoint_id,
-        branch_parent_session_id: session.branch_parent_session_id,
-        branch_parent_checkpoint_id: session.branch_parent_checkpoint_id,
-        title_generated: false,
-    });
+    let _ = store.save(&SessionFile::from_session(
+        &session,
+        SessionFileMeta {
+            session_id: entry.runtime.session_id().to_string(),
+            title: extract_title(&session.messages),
+            last_preview: extract_preview(&session.messages),
+            cwd: entry.cwd.display().to_string(),
+            timestamp: now_iso(),
+            turns: session.messages.len(),
+            title_generated: false,
+        },
+    ));
 }
 
 fn absolute_cwd(params: &Value) -> Result<PathBuf> {
@@ -1621,6 +1612,12 @@ mod tests {
                 turns: 2,
                 input_tokens: 1,
                 output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                api_calls: 0,
+                tool_schema_tokens: 0,
+                tool_schema_tokens_saved: 0,
+                prompt_cache_state: 0,
                 messages: vec![
                     Message::user("saved question"),
                     Message::assistant_text("saved answer"),

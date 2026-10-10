@@ -181,8 +181,8 @@ wyj-code 用 `Provider` enum 二分派发(Anthropic | OpenAI),trait 单方法 `s
 | SSE 流式输出 | ✅ 完整事件;usage 可来自 `message_start` 或 `message_delta`(`anthropic.rs:601-614` 注释:兼容 MiniMax 等只在后者返回真实用量) | ✅ eventsource + scan 维护 `PendingToolCall`;每 chunk 可同时带 finish_reason + usage(`openai.rs:317-321` + 单测 `finish_chunk_keeps_usage_for_exact_token_accounting`) | OpenAI 兼容代理偶发不发 `[DONE]`,需容忍 EOF |
 | Tool calling(function_call) | ✅ `ContentBlockStart::ToolUse` → `InputJsonDelta` 流式拼参数 | ✅ `tool_calls` 数组 delta,按 `index` 入 HashMap | 豆包 Ark 模型名常是 `ep-xxxxxxxx-xxxxx` 而非固定名 |
 | Tool result 回传结构 | ✅ ToolResult 嵌入 user content 数组;`Parts` 转 Anthropic 原生 image block | ⚠️ 走独立 `role: "tool"` 消息 + `tool_call_id`;`Parts` 强制 `display_text()` 占位(`openai.rs:171-179`) | **OpenAI `role: tool` 不支持图片块**:computer-use 截屏回传在 OpenAI 路径只能拿到占位 |
-| Tool schema 严格校验 | ✅ 标准 JSON schema | ⚠️ `strict_tool_schema` 用 `ModelCapabilities` 协商;Bilingual + `RequiresSingleTool` 的 Profile 通过 `core::tool_arguments::simplified_tool_definition` 简化 schema(`agent.rs:826-834`) | 防国内代理对 `$schema / additionalProperties:false / anyOf` 报错 |
-| Parallel tool calls | ✅ 默认允许 | ❌ 国内 OpenAI 代理常单 tool/turn(`model_catalog.rs:119` + quirks),`PromptPolicy` 给 Bilingual + single_tool 注入双语提示 | `force_single_tool` 路径由 capabilities 决定 |
+| Tool schema 严格校验 | ✅ 标准 JSON schema | ⚠️ `strict_tool_schema` 用 `ModelCapabilities` 协商;该能力为 false 时经 `core::tool_arguments::simplified_tool_definition` 简化 schema(`agent.rs:1115-1122`,**只看 `strict_tool_schema`,与 `RequiresSingleTool` quirk 无关**) | 防国内代理对 `$schema / additionalProperties:false / anyOf` 报错 |
+| Parallel tool calls | ✅ 默认允许 | ⚠️ 静态目录对**所有非 anthropic/openai 端点**一律判 `max_tools_per_turn = 1`(`model_catalog.rs` `base_capabilities`),`PromptPolicy` 据此注入双语「每次最多调用一个工具」;该判定按 vendor 猜测而非实测,可用 `wyj-code model doctor --probe full` 实测后写回 capability cache,或在 profile 里设 `max_tools_per_turn` 直接覆盖 | `force_single_tool` 路径由 capabilities 决定 |
 | Prompt caching(cache_control) | ✅ 三处 ephemeral:system / 最后一个 tool / 历史末尾可承载块(`anthropic.rs:457-474`);拼 beta `prompt-caching-2024-07-31` | ❌ 不支持 cache_control 显式断点;仅解析 `prompt_tokens_details.cached_tokens` 作为只读信号(`openai.rs:143-147` + `252-268`) | GLM/Kimi 走 Anthropic 兼容路径时必须 `prompt_cache = false`,否则 beta header 触发 400 |
 | Stream usage / token 账本 | ✅ `usage_event` 接收 input/output/cache_read/cache_creation | ✅ `stream_options.include_usage = effective_openai_stream_options_for_model(model)`,默认对 OpenAI / MiniMax / GLM / DeepSeek true,对 Ollama/vLLM/proxy false | 模型目录把 `minimax/glm/deepseek/bigmodel.cn/z.ai/deepseek.com` 标记为"需要 supplier-returned usage"(`lib.rs:255-265`) |
 | Extended thinking | ✅ `ThinkingParam { type: enabled, budget_tokens }`;interleaved 单独走 `interleaved-thinking-2025-05-14` beta;Thinking + RedactedThinking 块 + signature 回传保留(`anthropic.rs:483-486` + `agent.rs:3006` 测试) | ❌ 直接 `// OpenAI 格式不支持 Anthropic 式 thinking 参数,忽略 opts.thinking_*`(`openai.rs:336`) | 用户配 `thinking_budget` 但 provider=OpenAI 会被 silently 丢弃;`RequestPlan::from_capabilities` 把 reasoning 设为 `Disabled` 并把 `thinking_budget` 加进 `dropped_parameters` |
@@ -874,8 +874,8 @@ fallback_profiles = ["glm-fallback", "claude-fallback"]
 | `crates/core/src/agent.rs` | 777-781 | 流中断重试注释 |
 | `crates/core/src/agent.rs` | 780-781 | 半成品不入账 |
 | `crates/core/src/agent.rs` | 798-846 | round 入口按 `route.capabilities` 翻译 |
-| `crates/core/src/agent.rs` | 801-805 | `PromptPolicy::compatibility_suffix` 调用点 |
-| `crates/core/src/agent.rs` | 826-834 | `simplified_tool_definition` 调用 |
+| `crates/core/src/agent.rs` | 1082-1088 | `PromptPolicy::compatibility_suffix` 调用点(拼进 system 的 volatile 段,在 prompt cache 断点之后) |
+| `crates/core/src/agent.rs` | 1115-1122 | `simplified_tool_definition` 调用 |
 | `crates/core/src/agent.rs` | 3006 | `ThinkingProvider` 测试 |
 | `crates/core/src/prompts.rs` | 61-115 | `EnvInfo` + `<env>` 块 |
 | `crates/core/src/prompts.rs` | 122-150 | git 状态快照 |

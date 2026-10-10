@@ -20,7 +20,10 @@ pub use capabilities::*;
 pub use capability_cache::{CapabilityCache, CapabilityCacheRecord, PROBE_VERSION};
 pub use doctor::ModelDoctorReport;
 pub use error::{ProviderError, ProviderErrorKind};
-pub use model_catalog::{CatalogResolution, ModelCatalog, VerificationStatus};
+pub use model_catalog::{
+    apply_parallel_policy, CatalogResolution, ModelCatalog, VerificationStatus,
+    DEFAULT_PARALLEL_MAX_TOOLS,
+};
 pub use models::{fetch_model_ids, ProfileTemplate, PROFILE_TEMPLATES};
 pub use openai::OpenAIProvider;
 pub use prompt_policy::PromptPolicy;

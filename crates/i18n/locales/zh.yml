@@ -274,6 +274,23 @@ cost:
   input_detail_line: "输入明细: full {full} / 未缓存 {uncached} / 缓存命中率 {hit_ratio}%"
   cache_line: "缓存:   命中 {read} + 写入 {write} tokens（相对全价输入节省约 {saved_pct}%，费用已计入上方合计）"
   subagent_line: "子 Agent: 输入 {input} + 输出 {output} = {total} tokens（独立于主会话统计，费用未计入上方估算）"
+  api_calls_line: "模型调用: {api_calls} 次（平均 {avg_input}/次 —— 调用次数是总输入的一阶乘数）"
+  cache_downgraded_line: "Prompt 缓存已停用：端点拒绝了 cache_control / anthropic-beta，本会话余下时间按全价计费。"
+  price_missing: "模型 \"{model}\" 暂无单价表条目，仅显示 token 数、不估算费用。"
+
+usage:
+  header: "跨会话 Token 用量"
+  no_sessions: "未找到任何会话。"
+  totals: "会话 {sessions} 个 · 回合 {turns} 次 · 模型调用 {api_calls} 次"
+  tokens: "输入 {input} · 输出 {output} · 缓存命中 {cache_read} · 缓存写入 {cache_write}"
+  rates: "每回合: 输入 {input_per_turn} / 输出 {output_per_turn} · 每次调用: 输入 {input_per_call} / 输出 {output_per_call} · 缓存命中率 {cache_hit} · 输出占比 {output_share}"
+  legacy_no_api_calls: "提示: 有 {count} 个会话早于调用次数记录，「每次调用」指标只覆盖近期记录完整的会话。"
+  cache_downgraded: "有 {count} 个会话因端点拒绝缓存而降级。"
+  never_trimmed: "该区间内没有任何会话发生过压缩或上下文清理 —— 工具输出一直是全量累积的。"
+  by_month: "按月:"
+  month_row: "输入 {input} · 输出 {output} · 回合 {turns} · 每回合输入 {input_per_turn}"
+  by_project: "按项目:"
+  project_row: "输入 {input} · 输出 {output} · {sessions} 个会话"
 
 hooks:
   desc: "列出当前生效的 Hooks 配置（按事件分组）"
@@ -626,6 +643,8 @@ status:
   endpoint: "端点:    {url}"
   api_key_configured: "API Key: {prefix}...（已配置）"
   api_key_error: "API Key: {err}"
+  context_window_unverified: "上下文窗口 {window} tokens 未经探测验证。自动压缩要到约 {trigger} tokens 才触发，期间工具输出全量累积；若真实窗口更小，请调低 `context_window` 让清理与压缩真正生效。"
+  parallel_tools_capped: "max_tools_per_turn = {current} 低于该端点支持的上限（{supported}）。每多一趟往返就重发一遍完整上下文，是输入成本的一阶驱动因素。"
   other_profiles: "其他分组: {names}"
   mcp_servers: "MCP servers: {count}"
   # headless REPL / `-p` / ACP stdio / daemon TCP 四个非 UI 入口在缺 Key 时

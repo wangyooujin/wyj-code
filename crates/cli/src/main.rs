@@ -10,7 +10,7 @@ use wyj_config::{AgentMode, Config, RoutingRole};
 use wyj_core::{
     extract_preview, extract_title, new_session_id, now_iso, Agent, EvolutionStore,
     ExecutionSurface, HistoryEntry, HistoryStore, HookRunner, MemoryStore, MemoryV3Store, Session,
-    SessionFile, SessionStore, SummaryGenerator, ToolEvent,
+    SessionFile, SessionFileMeta, SessionStore, SummaryGenerator, ToolEvent,
 };
 use wyj_tools::{
     AskQuestionTool, MemoryTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx,
@@ -26,6 +26,7 @@ mod schedule_cmd;
 mod storage_cmd;
 mod trust_cmd;
 mod update_cmd;
+mod usage_cmd;
 mod workflow_cmd;
 mod workspace_cmd;
 
@@ -93,6 +94,19 @@ enum Commands {
         #[arg(help = wyj_i18n::tr("cli.subagent_trace_sub_id_help"))]
         sub_id: Option<u64>,
         #[arg(long, help = wyj_i18n::tr("cli.subagent_trace_json_help"))]
+        json: bool,
+    },
+    /// 跨会话 token 消耗汇总（`~/.wyj-code/sessions/*.json`）。
+    /// `/cost` 只看单会话且不落盘缓存与调用次数，本命令是 token 治理的基线来源。
+    #[command(name = "usage", about = "Cross-session token usage summary")]
+    Usage {
+        /// 只统计 timestamp >= 该日期（YYYY-MM-DD）的会话
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        since: Option<String>,
+        /// 只统计该 cwd 的会话
+        #[arg(long, value_name = "PATH")]
+        project: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     #[command(name = "extensions", about = "Manage Skill, MCP and Plugin resources")]
@@ -249,6 +263,74 @@ enum SessionCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// `--config-status` 的降耗提示。**只提示、不改写配置**——这些值都是用户
+/// 显式意图，自动纠正会让人不知道自己为什么突然变慢或变快。
+///
+/// 1. **超大 `context_window` 未经验证**：窗口直接决定压缩触发线
+///    （`window - compact_trigger_buffer`）。1M 窗口下触发线在 900K，于是
+///    context editing 永远够不着，工具输出全量累积、每趟 API 都在重发整段
+///    历史。而 `context_window` 是裸 `u32` 配置项，没有任何 live probe 兜底，
+///    官方文档给 MiniMax M2.x 标的是 204,800——所以"设成 1M"是否成立完全
+///    取决于用户是否真的核过。
+/// 2. **`max_tools_per_turn` 低于端点能力**：模型调用次数是 input 消耗的
+///    一阶乘数，每多一趟就重发一遍完整上下文。
+fn print_config_hints(active: &wyj_config::Profile) {
+    // 1) 超大上下文窗口
+    if active.context_window > 500_000 {
+        let trigger =
+            active
+                .context_window
+                .saturating_sub(wyj_core::compact::compact_trigger_buffer(
+                    active.context_window,
+                    active.max_tokens,
+                ));
+        println!(
+            "{}",
+            wyj_i18n::tr_fmt(
+                "status.context_window_unverified",
+                &[
+                    ("window", &active.context_window.to_string()),
+                    ("trigger", &trigger.to_string()),
+                ]
+            )
+        );
+    }
+
+    // 2) 并发工具数被显式压到端点能力之下。
+    //    比较的基准必须是**端点本身的能力**（静态目录 + live probe），不能直接问
+    //    目录要数字——`resolve_with_cache` 末尾会应用 `max_tools_per_turn` 覆盖，
+    //    问它只会拿回用户自己的设置，拿自己跟自己比永远相等。
+    //    所以先把覆盖抹掉再解析一次，得到的才是端点真实上限。
+    let cache_dir = wyj_config::config_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("model-capabilities");
+    let endpoint_max = {
+        let mut probe_profile = active.clone();
+        probe_profile.max_tools_per_turn = None;
+        wyj_api::model_catalog::ModelCatalog::resolve_with_cache(
+            &probe_profile,
+            None,
+            Some(&wyj_api::capability_cache::CapabilityCache::new(&cache_dir)),
+        )
+        .capabilities
+        .max_tools_per_turn
+    };
+    if let Some(override_max) = active.max_tools_per_turn {
+        if override_max < endpoint_max {
+            println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.parallel_tools_capped",
+                    &[
+                        ("current", &override_max.to_string()),
+                        ("supported", &endpoint_max.to_string()),
+                    ]
+                )
+            );
+        }
+    }
 }
 
 /// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
@@ -464,6 +546,18 @@ async fn run_model_command(command: ModelCommand, cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// 纯文本探针的 max_tokens。只需够写一个 "OK"，但留出余量。
+const PROBE_TEXT_MAX_TOKENS: u32 = 256;
+
+/// 工具探针的 max_tokens。
+///
+/// 这里**不能**按"一个工具调用能有多大"来给：MiniMax/GLM/DeepSeek 等端点在服务端
+/// 默认开思考，`RequestOptions::text_only` 又不会显式关掉它，预算被 thinking 吃光后
+/// 工具调用就发不出来——表现为 tool_use 的 arguments 是空串，探针报
+/// `malformed arguments ... EOF while parsing a value`，看起来像"端点不支持工具调用"，
+/// 实则是预算不够。给足思考 + 调用的余量，否则探针对 thinking 模型永远误报失败。
+const PROBE_TOOL_MAX_TOKENS: u32 = 4096;
+
 async fn run_model_probe(
     profile: &wyj_config::Profile,
     level: &str,
@@ -495,7 +589,7 @@ async fn run_model_probe(
             ),
             &[Message::user("Reply OK")],
             &[],
-            &wyj_api::provider::RequestOptions::text_only(32),
+            &wyj_api::provider::RequestOptions::text_only(PROBE_TEXT_MAX_TOKENS),
         )
         .await?;
     if text_result
@@ -529,7 +623,7 @@ async fn run_model_probe(
             ),
             &[Message::user("Run the echo compatibility probe")],
             std::slice::from_ref(&echo),
-            &wyj_api::provider::RequestOptions::text_only(128),
+            &wyj_api::provider::RequestOptions::text_only(PROBE_TOOL_MAX_TOKENS),
         )
         .await?;
     let valid_echo = tool_result.content.iter().any(|block| {
@@ -553,7 +647,7 @@ async fn run_model_probe(
                 &wyj_api::SystemPrompt::stable_only("Call probe_echo twice in one response, each with value ok. Do not answer with text."),
                 &[Message::user("Run the parallel tool compatibility probe")],
                 std::slice::from_ref(&echo),
-                &wyj_api::provider::RequestOptions::text_only(192),
+                &wyj_api::provider::RequestOptions::text_only(PROBE_TOOL_MAX_TOKENS),
             )
             .await?;
         let valid_count = parallel
@@ -567,8 +661,19 @@ async fn run_model_probe(
                 )
             })
             .count();
-        capabilities.parallel_tool_calls = Capability::new(
-            valid_count >= 2,
+        // 必须走 apply_parallel_policy 而不是只写 parallel_tool_calls：
+        // max_tools_per_turn 与 RequiresSingleTool quirk 是同一个事实的两个视图，
+        // 漏写会让 `prompt_policy` 继续注入「每次回复最多调用一个工具」，
+        // 探针明明测出能并发、模型却依然被锁成每轮一次往返。
+        let parallel = valid_count >= 2;
+        wyj_api::apply_parallel_policy(
+            &mut capabilities,
+            parallel,
+            if parallel {
+                wyj_api::DEFAULT_PARALLEL_MAX_TOOLS
+            } else {
+                1
+            },
             CapabilitySource::LiveProbe,
             Confidence::Verified,
         );
@@ -704,12 +809,32 @@ fn collect_skill_entries(
     entries
 }
 
+/// 解析模型能力，**始终带上 capability cache**。
+///
+/// `ModelCatalog::resolve` 等价于 `resolve_with_cache(..., None)`，那条路径下
+/// `--probe` 写盘的实测结果与端点拒绝记录都不会被合回运行时——capability cache
+/// 会退化成只写不读。所有需要 capabilities 的地方都必须走这里。
+///
+/// 拿不到配置目录时降级为无 cache 的 `resolve`：能力解析失败不该让整个会话起不来。
+fn resolve_model_capabilities(
+    profile: &wyj_config::Profile,
+    model_override: Option<&str>,
+) -> wyj_api::CatalogResolution {
+    match wyj_config::config_dir() {
+        Ok(config_base) => {
+            let cache = wyj_api::CapabilityCache::new(&config_base);
+            wyj_api::ModelCatalog::resolve_with_cache(profile, model_override, Some(&cache))
+        }
+        Err(_) => wyj_api::ModelCatalog::resolve(profile, model_override),
+    }
+}
+
 fn build_fallback_routes(
     cfg: &Config,
     role: RoutingRole,
     primary_profile: &str,
 ) -> Vec<wyj_core::AgentRoute> {
-    let primary_resolution = wyj_api::ModelCatalog::resolve(
+    let primary_resolution = resolve_model_capabilities(
         cfg.profile_by_name(primary_profile)
             .unwrap_or_else(|| cfg.active_profile()),
         None,
@@ -720,7 +845,7 @@ fn build_fallback_routes(
         .filter_map(|name| {
             let profile = cfg.profile_by_name(&name)?;
             let model = model_for_routing_role(profile, role);
-            let resolution = wyj_api::ModelCatalog::resolve(profile, Some(&model));
+            let resolution = resolve_model_capabilities(profile, Some(&model));
             if !cfg.routing.cross_provider_fallback
                 && resolution.identity.vendor != primary_resolution.identity.vendor
             {
@@ -866,6 +991,11 @@ async fn main() -> Result<()> {
                 sub_id,
                 json,
             } => return run_subagent_trace_cmd(&session_id, sub_id, json),
+            Commands::Usage {
+                since,
+                project,
+                json,
+            } => return usage_cmd::run(since, project, json),
             Commands::Extensions { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return extensions_cmd::run(command, &cwd).await;
@@ -1006,6 +1136,8 @@ async fn main() -> Result<()> {
                 wyj_i18n::tr_fmt("status.api_key_error", &[("err", &e.to_string())])
             ),
         }
+        print_config_hints(&active);
+
         let others: Vec<&str> = cfg
             .profiles
             .iter()
@@ -1575,7 +1707,7 @@ async fn main() -> Result<()> {
     // 主 system prompt：英文静态提示 + <env> 环境块（会话内稳定字段，进缓存）。
     // git 状态快照单独走首轮 user 消息注入（会变的字段进 system 会击穿缓存）。
     let env_info = wyj_core::prompts::EnvInfo::collect(&cwd, &model_name);
-    let model_resolution = wyj_api::ModelCatalog::resolve(cfg.active_profile(), Some(&model_name));
+    let model_resolution = resolve_model_capabilities(cfg.active_profile(), Some(&model_name));
     let model_capabilities = model_resolution.capabilities.clone();
     let fallback_routes = build_fallback_routes(&cfg, routing_role, &cfg.active_profile().name);
     let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
@@ -1871,8 +2003,7 @@ async fn main() -> Result<()> {
         } else {
             RoutingRole::Execute
         };
-        let model_resolution =
-            wyj_api::ModelCatalog::resolve(cfg.active_profile(), Some(new_model));
+        let model_resolution = resolve_model_capabilities(cfg.active_profile(), Some(new_model));
         let model_capabilities = model_resolution.capabilities.clone();
         let fallback_routes = build_fallback_routes(cfg, routing_role, &cfg.active_profile().name);
         let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
@@ -2047,13 +2178,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .and_then(|store| store.load(&session_id).ok())
         {
-            session.total_input_tokens = file.input_tokens;
-            session.total_output_tokens = file.output_tokens;
-            session.routing_events = file.routing_events;
-            session.compact_count = file.compact_count;
-            session.current_checkpoint_id = file.current_checkpoint_id;
-            session.branch_parent_session_id = file.branch_parent_session_id;
-            session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+            session.restore_usage_from(&file);
         }
         session.messages = initial_messages;
         session.push_user(prompt);
@@ -2150,25 +2275,18 @@ async fn main() -> Result<()> {
             });
         }
         if let Some(store) = &session_store_arc {
-            let _ = store.save(&SessionFile {
-                session_id: session_id.clone(),
-                title: extract_title(&session.messages),
-                last_preview: extract_preview(&session.messages),
-                cwd: cwd.display().to_string(),
-                timestamp: now_iso(),
-                turns,
-                input_tokens: in_tok,
-                output_tokens: out_tok,
-                messages: session.messages.clone(),
-                routing_events: session.routing_events.clone(),
-                compact_count: session.compact_count,
-                elided_blobs: session.elided_blobs.clone(),
-                context_edit_freed_tokens: session.context_edit_freed_tokens,
-                current_checkpoint_id: session.current_checkpoint_id.clone(),
-                branch_parent_session_id: session.branch_parent_session_id.clone(),
-                branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
-                title_generated: false,
-            });
+            let _ = store.save(&SessionFile::from_session(
+                &session,
+                SessionFileMeta {
+                    session_id: session_id.clone(),
+                    title: extract_title(&session.messages),
+                    last_preview: extract_preview(&session.messages),
+                    cwd: cwd.display().to_string(),
+                    timestamp: now_iso(),
+                    turns,
+                    title_generated: false,
+                },
+            ));
         }
         Ok(())
     } else if cli.headless {
@@ -2289,6 +2407,7 @@ fn build_context_edit_cfg(
             min_bytes: edit.min_result_bytes,
         },
         max_batches: edit.max_batches,
+        soft_limit_ratio: edit.soft_limit_ratio,
         cas,
         totals,
     })
@@ -2432,7 +2551,7 @@ fn make_sub_agent_factory(
             ),
         };
         let provider = wyj_api::build_provider_from_profile(p, Some(&model))?;
-        let model_resolution = wyj_api::ModelCatalog::resolve(p, Some(&model));
+        let model_resolution = resolve_model_capabilities(p, Some(&model));
         let model_capabilities = model_resolution.capabilities.clone();
         let fallback_routes = if routing_enabled {
             build_fallback_routes(&cfg, routing_role, &p.name)
@@ -2844,12 +2963,7 @@ async fn repl(
         .as_ref()
         .and_then(|store| store.load(&session_id).ok())
     {
-        session.total_input_tokens = file.input_tokens;
-        session.total_output_tokens = file.output_tokens;
-        session.routing_events = file.routing_events;
-        session.current_checkpoint_id = file.current_checkpoint_id;
-        session.branch_parent_session_id = file.branch_parent_session_id;
-        session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+        session.restore_usage_from(&file);
     }
     session.messages = initial_messages;
     let stdin = io::stdin();
@@ -3000,6 +3114,8 @@ async fn repl(
             output_tokens: session.total_output_tokens,
             cache_read_tokens: session.total_cache_read_tokens,
             cache_write_tokens: session.total_cache_write_tokens,
+            api_calls: session.api_calls,
+            prompt_cache_state: session.prompt_cache_state,
             // 取当前 Profile 真实的窗口，而不是写死 200K —— 否则非 200K
             // 模型下 /context 的占用百分比会算错。
             context_window: cfg.active_profile().context_window,
@@ -3140,25 +3256,18 @@ async fn repl(
                         )?;
                         store.restore_files(&id, &cwd, confirmed)?;
                     }
-                    session_files.save(&SessionFile {
-                        session_id: session_id.clone(),
-                        title: extract_title(&session.messages),
-                        last_preview: extract_preview(&session.messages),
-                        cwd: cwd.display().to_string(),
-                        timestamp: now_iso(),
-                        turns,
-                        input_tokens: session.total_input_tokens,
-                        output_tokens: session.total_output_tokens,
-                        messages: session.messages.clone(),
-                        routing_events: session.routing_events.clone(),
-                        compact_count: session.compact_count,
-                        elided_blobs: session.elided_blobs.clone(),
-                        context_edit_freed_tokens: session.context_edit_freed_tokens,
-                        current_checkpoint_id: session.current_checkpoint_id.clone(),
-                        branch_parent_session_id: session.branch_parent_session_id.clone(),
-                        branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
-                        title_generated: false,
-                    })?;
+                    session_files.save(&SessionFile::from_session(
+                        &session,
+                        SessionFileMeta {
+                            session_id: session_id.clone(),
+                            title: extract_title(&session.messages),
+                            last_preview: extract_preview(&session.messages),
+                            cwd: cwd.display().to_string(),
+                            timestamp: now_iso(),
+                            turns,
+                            title_generated: false,
+                        },
+                    ))?;
                     let branch = session_files.branch_from_checkpoint(&session_id, &checkpoint)?;
                     session_id = branch.session_id.clone();
                     session = Session::new();
@@ -3449,25 +3558,18 @@ async fn repl(
     }
     // 退出时保存 SessionFile，使 REPL 会话可通过 --resume 恢复
     if let Some(store) = &session_store {
-        let _ = store.save(&SessionFile {
-            session_id,
-            title: extract_title(&session.messages),
-            last_preview: extract_preview(&session.messages),
-            cwd: cwd.display().to_string(),
-            timestamp: now_iso(),
-            turns,
-            input_tokens: session.total_input_tokens,
-            output_tokens: session.total_output_tokens,
-            messages: session.messages.clone(),
-            routing_events: session.routing_events.clone(),
-            compact_count: session.compact_count,
-            elided_blobs: session.elided_blobs.clone(),
-            context_edit_freed_tokens: session.context_edit_freed_tokens,
-            current_checkpoint_id: session.current_checkpoint_id.clone(),
-            branch_parent_session_id: session.branch_parent_session_id.clone(),
-            branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
-            title_generated: false,
-        });
+        let _ = store.save(&SessionFile::from_session(
+            &session,
+            SessionFileMeta {
+                session_id,
+                title: extract_title(&session.messages),
+                last_preview: extract_preview(&session.messages),
+                cwd: cwd.display().to_string(),
+                timestamp: now_iso(),
+                turns,
+                title_generated: false,
+            },
+        ));
     }
     // 保存完成后释放本会话被 context editing 外部化的 CAS blob 引用。
     // 顺序很重要：`save` 需要 `elided_blobs` 写进 SessionFile（下次 resume 的
