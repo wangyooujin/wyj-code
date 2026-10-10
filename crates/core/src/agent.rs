@@ -170,6 +170,29 @@ impl AgentRoute {
     }
 }
 
+/// 由 `[context_edit].soft_limit_ratio` 算出 context editing 的**动手线**。
+///
+/// 返回 `u32::MAX` 表示关闭软阈值——此时 `estimated > u32::MAX` 恒为假，
+/// 条件退化成旧实现的 `estimated > compact_threshold`，行为逐字节一致。
+/// 这样"关闭软阈值"就不需要调用点写任何分支。
+///
+/// 与压缩硬阈值的关系：软阈值只决定**何时开始**清理，硬阈值决定**何时停手**。
+/// 1M 窗口下硬阈值在 900K，实际会话（~300K）永远够不着，context editing
+/// 等于从未运行——这正是实测 129 个会话 `context_edit_freed_tokens` 全为 0
+/// 的原因。提前动手的收益是乘法的：外部化越早，每趟 API 携带的历史越小。
+fn soft_threshold_tokens(
+    context_window: u32,
+    cfg: Option<&crate::context_edit::ContextEditCfg>,
+) -> u32 {
+    match cfg {
+        Some(cfg) if cfg.soft_limit_ratio > 0.0 => (context_window as f64 * cfg.soft_limit_ratio)
+            .floor()
+            .clamp(1.0, u32::MAX as f64) as u32,
+        // 未启用 context editing，或显式 `soft_limit_ratio = 0`
+        _ => u32::MAX,
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -835,8 +858,17 @@ impl Agent {
 
     /// 清理过期工具输出，返回清理后的请求估算 token。
     ///
-    /// 按批推进（每批 `ElideOptions::batch_size` 条），每批后重估；一旦落进
-    /// `compact_threshold` 就停手——**能靠清理解决就不该去花摘要的 LLM 往返**。
+    /// 两级阈值：
+    /// - **软阈值**（`soft_threshold`）：开始动手的线。超过就开始外部化。
+    /// - **硬阈值**（`compact_threshold`）：停手的线。降到它以下才停。
+    ///
+    /// 早期只有硬阈值，于是 1M 窗口下这条线在 900K，实际会话（~300K）永远
+    /// 够不着——context editing 等于从未运行。软阈值把「动手时机」提前，
+    /// **不改变**停手目标：清理不动了照样交给 compact 摘要。
+    ///
+    /// `soft_threshold >= compact_threshold`（含 `soft_threshold = u32::MAX`，
+    /// 即 `soft_limit_ratio = 0` 关闭软阈值）时行为与旧实现逐字节一致。
+    ///
     /// 批数上限 `max_batches` 防"历史里全是可清理项"时一次请求做掉一大手术、
     /// 把 prompt cache 前缀反复击穿。
     #[allow(clippy::too_many_arguments)]
@@ -845,6 +877,7 @@ impl Agent {
         session: &mut Session,
         cfg: &crate::context_edit::ContextEditCfg,
         compact_threshold: u32,
+        soft_threshold: u32,
         request_system: &wyj_api::SystemPrompt<'_>,
         request_tools: &[ToolDefinition],
         max_output_tokens: u32,
@@ -859,6 +892,12 @@ impl Agent {
             max_output_tokens,
         )
         .total();
+
+        // 软阈值不得高于硬阈值，否则软阈值形同虚设（等于退回旧的单阈值行为）。
+        let start_threshold = soft_threshold.min(compact_threshold);
+        if estimate <= start_threshold {
+            return estimate;
+        }
 
         for _ in 0..cfg.max_batches.max(1) {
             if estimate <= compact_threshold {
@@ -1165,18 +1204,26 @@ impl Agent {
                 let compact_threshold = route.context_window.saturating_sub(
                     compact_trigger_buffer(route.context_window, opts.max_tokens),
                 );
+                // 软阈值：context editing 的**动手线**，与上面的压缩硬阈值分开。
+                // 硬阈值决定"何时停手"，软阈值决定"何时开始"——1M 窗口下硬阈值
+                // 在 900K，等它触发意味着整段历史被原样重发了几百趟。
+                // `soft_limit_ratio = 0` 时取 u32::MAX，条件退化成
+                // `estimated_before > compact_threshold`，与改动前完全一致。
+                let soft_threshold =
+                    soft_threshold_tokens(route.context_window, self.context_edit.as_ref());
 
                 // 清理优先于摘要：超阈值时先把过期的工具输出外部化掉（更便宜、
                 // 不产生幻觉、更保真），清理后仍超标才跑整段摘要。对齐 Claude
                 // Code 的原话 "It clears older tool outputs first, then summarizes
                 // the conversation if needed."。额外好处是清得动就省掉一次
                 // LLM round-trip + 一份摘要的 output token。
-                let estimated = if estimated_before > compact_threshold {
+                let estimated = if estimated_before > soft_threshold {
                     match self.context_edit.as_ref() {
                         Some(cfg) => self.elide_stale_tool_results(
                             session,
                             cfg,
                             compact_threshold,
+                            soft_threshold,
                             &request_system,
                             &request_tools,
                             opts.max_tokens,
@@ -1250,6 +1297,11 @@ impl Agent {
                 let mut context_recovered = false;
                 let result = loop {
                     session.api_calls += 1;
+                    // 把 provider 侧的缓存生效状态同步进会话。第三方端点拒绝
+                    // cache_control 时会自动降级，若不回写，`/cost` 看到
+                    // cache_read 恒为 0 却无法区分"没配"与"配了但用不了"——
+                    // 而这两种情况用户该做的事完全相反。
+                    session.prompt_cache_state = route.provider.prompt_cache_state();
                     let mut stream = match route
                         .provider
                         .stream(
@@ -2531,6 +2583,83 @@ mod tests {
         TaskStatus, TaskStep,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `soft_threshold_tokens` 的测试用最小 `ContextEditCfg`。CAS 指向临时目录，
+    /// 这些断言只关心阈值计算本身，不触发真实外部化。
+    fn mk_edit_cfg() -> crate::context_edit::ContextEditCfg {
+        let dir = std::env::temp_dir().join(format!("wyj-soft-threshold-{}", std::process::id()));
+        crate::context_edit::ContextEditCfg {
+            enabled: true,
+            opts: crate::context_edit::ElideOptions::default(),
+            cas: std::sync::Arc::new(
+                crate::workspace_cas::WorkspaceCas::open(&dir, 0).expect("CAS 可用"),
+            ),
+            max_batches: 3,
+            soft_limit_ratio: 0.55,
+            totals: std::sync::Arc::new(crate::context_edit::ContextEditTotals::default()),
+        }
+    }
+
+    /// 软阈值决定 context editing 何时**动手**。
+    ///
+    /// 这条是整个 C1 变更的核心断言：`soft_limit_ratio = 0`（关闭）必须退化成
+    /// 旧行为，否则「opt-out 配置」就名存实亡。
+    #[test]
+    fn soft_threshold_disabled_falls_back_to_old_behavior() {
+        let cfg = crate::context_edit::ContextEditCfg {
+            enabled: false,
+            soft_limit_ratio: 0.0,
+            ..mk_edit_cfg()
+        };
+        assert_eq!(soft_threshold_tokens(1_000_000, Some(&cfg)), u32::MAX);
+        // 未装配 context editing 时同理：u32::MAX 让 `estimated > soft` 恒假。
+        assert_eq!(soft_threshold_tokens(1_000_000, None), u32::MAX);
+    }
+
+    #[test]
+    fn soft_threshold_starts_editing_earlier_than_compact_threshold() {
+        let cfg = crate::context_edit::ContextEditCfg {
+            soft_limit_ratio: 0.55,
+            ..mk_edit_cfg()
+        };
+        let window = 1_000_000u32;
+        let soft = soft_threshold_tokens(window, Some(&cfg));
+        let hard = window.saturating_sub(crate::compact::compact_trigger_buffer(window, 32_000));
+        assert_eq!(soft, 550_000);
+        // 软阈值必须严格早于硬阈值，否则 C1 等于没做。
+        assert!(
+            soft < hard,
+            "soft {soft} must be below compact threshold {hard}, otherwise trimming never starts early"
+        );
+    }
+
+    /// 200K 窗口下 `soft_limit_ratio = 0.55` 给出 110K，仍然早于硬阈值。
+    #[test]
+    fn soft_threshold_scales_with_window() {
+        let cfg = crate::context_edit::ContextEditCfg {
+            soft_limit_ratio: 0.55,
+            ..mk_edit_cfg()
+        };
+        assert_eq!(soft_threshold_tokens(200_000, Some(&cfg)), 110_000);
+    }
+
+    /// 荒谬比例不能溢出或产生 0（0 会让每个请求都无谓地跑一遍清理循环）。
+    #[test]
+    fn soft_threshold_clamps_absurd_ratios() {
+        let huge = crate::context_edit::ContextEditCfg {
+            soft_limit_ratio: 9_999.0,
+            ..mk_edit_cfg()
+        };
+        let v = soft_threshold_tokens(1_000_000, Some(&huge));
+        assert_eq!(v, u32::MAX, "过大的比例必须夹到 u32::MAX 而非溢出回绕");
+
+        let negative = crate::context_edit::ContextEditCfg {
+            soft_limit_ratio: -1.0,
+            ..mk_edit_cfg()
+        };
+        // 负数与 0 同义（关闭），绝不能 clamp 成 1 让清理每轮都触发。
+        assert_eq!(soft_threshold_tokens(1_000_000, Some(&negative)), u32::MAX);
+    }
     use wyj_api::provider::EventStream;
     use wyj_api::types::{Message, StopReason, ToolResultContent};
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use wyj_api::types::{ContentBlock, Message, Role};
 
-use crate::session::RoutingEvent;
+use crate::session::{RoutingEvent, Session};
 
 /// 持久化到磁盘的完整会话数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +41,96 @@ pub struct SessionFile {
     /// 本会话 context editing 累计释放的估算 token。
     #[serde(default)]
     pub context_edit_freed_tokens: u32,
+    /// 累计命中 prompt 缓存的输入 token 数（按约 0.1x 输入价计费，**不**计入
+    /// `input_tokens`）。落盘是为了 `/resume` 后 `/cost` 仍能算缓存命中率——
+    /// 旧文件没有这两个字段，`resume` 回来的缓存恒为 0，成本被系统性低估。
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// 累计写入 prompt 缓存的输入 token 数（按约 1.25x 输入价计费，同样
+    /// 不计入 `input_tokens`）。
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+    /// 本会话累计模型推理次数（每次 provider.stream 计 1，压缩/摘要往返也计）。
+    /// 落盘后才能算出「每次调用的平均 input」——input 消耗的一阶乘数是这个数，
+    /// 不是单次 token 数。
+    #[serde(default)]
+    pub api_calls: u32,
+    /// 实际随请求发送的工具 schema 估算 token 累计值。
+    #[serde(default)]
+    pub tool_schema_tokens: u32,
+    /// lazy tool schema 相对全量工具集合累计避免发送的估算 token。
+    #[serde(default)]
+    pub tool_schema_tokens_saved: u32,
+    /// 本会话实际生效的 prompt cache 模式（见 [`PromptCacheState`]）。
+    /// 存 u8 而非 enum 是为了旧文件 `#[serde(default)]` 直接落到 0，
+    /// 也避免将来加枚举值时反序列化失败。
+    #[serde(default)]
+    pub prompt_cache_state: u8,
+}
+
+/// `SessionFile::prompt_cache_state` 的取值。序列化为 u8 以保持
+/// `#[serde(default)]` 的前向兼容（枚举将来加值也不会让旧文件读不出来）。
+pub mod prompt_cache_state {
+    /// 未启用（默认，含第三方端点未显式配置 `prompt_cache = true` 的情况）。
+    pub const OFF: u8 = 0;
+    /// 已启用且正常工作。
+    pub const ON: u8 = 1;
+    /// 曾启用，但该端点返回 400（不支持 cache_control / beta 头），已自动降级。
+    /// 持久化这个状态是为了 `/cost` 能解释「为什么缓存是 0」——否则用户只能
+    /// 看到全零却无从判断是没用还是用不了。
+    pub const DOWNGRADED: u8 = 2;
+}
+
+/// 调用方各自计算、但不属于 `Session` 的会话元数据。
+///
+/// 之所以要单独一个 struct：12 处 `SessionFile { .. }` 构造点各自算
+/// `title` / `last_preview` / `timestamp` / `turns`（不同路径算法略有差异），
+/// 而计量字段必须由 `Session` 单点搬运。拆开后 `from_session` 成为唯一的
+/// 搬运入口，将来再加计量字段只需要改这一处。
+#[derive(Debug, Clone)]
+pub struct SessionFileMeta {
+    pub session_id: String,
+    pub title: String,
+    pub last_preview: String,
+    pub cwd: String,
+    pub timestamp: String,
+    pub turns: usize,
+    pub title_generated: bool,
+}
+
+impl SessionFile {
+    /// 从内存 `Session` 构造落盘结构：**所有计量字段的唯一搬运入口**。
+    ///
+    /// 12 处调用点原先各自手写全量字段，新增计量字段时必然漏改——这正是
+    /// v1.5.x 期间 `cache_read_tokens` / `api_calls` 只在内存里活着、
+    /// `resume` 后 `/cost` 全零的根因。统一走这里后，漏改在编译期就会暴露。
+    pub fn from_session(session: &Session, meta: SessionFileMeta) -> Self {
+        Self {
+            session_id: meta.session_id,
+            title: meta.title,
+            last_preview: meta.last_preview,
+            cwd: meta.cwd,
+            timestamp: meta.timestamp,
+            turns: meta.turns,
+            title_generated: meta.title_generated,
+            input_tokens: session.total_input_tokens,
+            output_tokens: session.total_output_tokens,
+            cache_read_tokens: session.total_cache_read_tokens,
+            cache_write_tokens: session.total_cache_write_tokens,
+            api_calls: session.api_calls,
+            tool_schema_tokens: session.tool_schema_tokens,
+            tool_schema_tokens_saved: session.tool_schema_tokens_saved,
+            prompt_cache_state: session.prompt_cache_state,
+            compact_count: session.compact_count,
+            context_edit_freed_tokens: session.context_edit_freed_tokens,
+            elided_blobs: session.elided_blobs.clone(),
+            routing_events: session.routing_events.clone(),
+            current_checkpoint_id: session.current_checkpoint_id.clone(),
+            branch_parent_session_id: session.branch_parent_session_id.clone(),
+            branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
+            messages: session.messages.clone(),
+        }
+    }
 }
 
 /// 会话摘要（不含消息体，用于列表展示）
@@ -209,6 +299,12 @@ impl SessionStore {
                 .count(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            prompt_cache_state: prompt_cache_state::OFF,
             messages: checkpoint.messages.clone(),
             routing_events: vec![],
             current_checkpoint_id: Some(checkpoint.id.clone()),
@@ -299,6 +395,12 @@ mod tests {
             turns: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![],
             routing_events: vec![],
             current_checkpoint_id: None,
@@ -309,6 +411,121 @@ mod tests {
             elided_blobs: vec![],
             context_edit_freed_tokens: 0,
         }
+    }
+
+    /// v1.5.19 之前落盘的会话文件没有这 6 个计量字段。必须仍能读出来，
+    /// 且缺省值语义正确（计数为 0、缓存状态为 OFF 而不是"未知"）。
+    #[test]
+    fn legacy_file_without_measurement_fields_still_loads() {
+        let legacy = serde_json::json!({
+            "session_id": "old",
+            "title": "t",
+            "last_preview": "p",
+            "cwd": "/tmp",
+            "timestamp": "2026-07-01T00:00:00Z",
+            "turns": 3,
+            "input_tokens": 1234,
+            "output_tokens": 567,
+            "messages": [],
+        });
+        let f: SessionFile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(f.input_tokens, 1234);
+        assert_eq!(f.output_tokens, 567);
+        assert_eq!(f.cache_read_tokens, 0);
+        assert_eq!(f.cache_write_tokens, 0);
+        assert_eq!(f.api_calls, 0);
+        assert_eq!(f.tool_schema_tokens, 0);
+        assert_eq!(f.tool_schema_tokens_saved, 0);
+        assert_eq!(f.prompt_cache_state, prompt_cache_state::OFF);
+    }
+
+    /// `from_session` ↔ `restore_usage_from` 是计量字段的唯一搬运通道。
+    /// 逐字段比对，防止将来新增字段时只改了一端。
+    #[test]
+    fn from_session_and_restore_usage_from_round_trip_every_counter() {
+        let mut s = Session::new();
+        s.add_usage(11_000, 2_200);
+        s.add_cache_usage(30_000, 4_000);
+        s.api_calls = 17;
+        s.tool_schema_tokens = 5_000;
+        s.tool_schema_tokens_saved = 1_500;
+        s.prompt_cache_state = prompt_cache_state::DOWNGRADED;
+        s.compact_count = 2;
+        s.context_edit_freed_tokens = 9_000;
+        s.messages.push(wyj_api::types::Message::user("hi"));
+
+        let file = SessionFile::from_session(
+            &s,
+            SessionFileMeta {
+                session_id: "s1".to_string(),
+                title: "t".to_string(),
+                last_preview: "p".to_string(),
+                cwd: "/tmp".to_string(),
+                timestamp: "2026-07-01T00:00:00Z".to_string(),
+                turns: 1,
+                title_generated: false,
+            },
+        );
+        assert_eq!(file.cache_read_tokens, 30_000);
+        assert_eq!(file.cache_write_tokens, 4_000);
+        assert_eq!(file.api_calls, 17);
+        assert_eq!(file.tool_schema_tokens, 5_000);
+        assert_eq!(file.tool_schema_tokens_saved, 1_500);
+        assert_eq!(file.prompt_cache_state, prompt_cache_state::DOWNGRADED);
+        assert_eq!(file.compact_count, 2);
+        assert_eq!(file.context_edit_freed_tokens, 9_000);
+
+        let mut restored = Session::new();
+        restored.restore_usage_from(&file);
+        assert_eq!(restored.total_input_tokens, 11_000);
+        assert_eq!(restored.total_output_tokens, 2_200);
+        assert_eq!(restored.total_cache_read_tokens, 30_000);
+        assert_eq!(restored.total_cache_write_tokens, 4_000);
+        assert_eq!(restored.api_calls, 17);
+        assert_eq!(restored.tool_schema_tokens, 5_000);
+        assert_eq!(restored.tool_schema_tokens_saved, 1_500);
+        assert_eq!(restored.prompt_cache_state, prompt_cache_state::DOWNGRADED);
+        assert_eq!(restored.compact_count, 2);
+        assert_eq!(restored.context_edit_freed_tokens, 9_000);
+    }
+
+    /// 计量字段此前只活在内存里，`/resume` 后 `/cost` 的缓存与调用次数恒为 0。
+    /// 这条钉住 save→load 往返不再丢数据。
+    #[test]
+    fn measurement_fields_survive_save_load_round_trip() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-rt-{}", std::process::id()));
+        let sessions = base.join("sessions");
+        let store = SessionStore::new(sessions).unwrap();
+        let mut file = mk_file("rt", &base, "2026-07-06T10:00:00Z");
+        file.input_tokens = 8_888;
+        file.output_tokens = 1_111;
+        file.cache_read_tokens = 7_777;
+        file.cache_write_tokens = 222;
+        file.api_calls = 42;
+        file.tool_schema_tokens = 3_333;
+        file.tool_schema_tokens_saved = 444;
+        file.prompt_cache_state = prompt_cache_state::ON;
+        store.save(&file).unwrap();
+
+        let loaded = store.load("rt").unwrap();
+        assert_eq!(loaded.cache_read_tokens, 7_777);
+        assert_eq!(loaded.cache_write_tokens, 222);
+        assert_eq!(loaded.api_calls, 42);
+        assert_eq!(loaded.tool_schema_tokens, 3_333);
+        assert_eq!(loaded.tool_schema_tokens_saved, 444);
+        assert_eq!(loaded.prompt_cache_state, prompt_cache_state::ON);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `/clear` 换对话不换端点：缓存是运行环境的属性，不能被抹成"从未开启"。
+    #[test]
+    fn clear_conversation_keeps_prompt_cache_state() {
+        let mut s = Session::new();
+        s.add_usage(100, 10);
+        s.prompt_cache_state = prompt_cache_state::DOWNGRADED;
+        s.clear_conversation();
+        assert_eq!(s.total_input_tokens, 0);
+        assert_eq!(s.prompt_cache_state, prompt_cache_state::DOWNGRADED);
     }
 
     #[test]
@@ -363,6 +580,12 @@ mod tests {
             turns: 2,
             input_tokens: 10,
             output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![Message::user("first"), Message::assistant_text("answer")],
             routing_events: vec![],
             current_checkpoint_id: None,
@@ -417,6 +640,12 @@ mod tests {
             turns: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![Message::user(format!("credential: {secret}"))],
             routing_events: Vec::new(),
             current_checkpoint_id: None,

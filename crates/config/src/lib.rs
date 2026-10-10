@@ -198,6 +198,17 @@ pub struct Profile {
     /// vendor 默认 adaptive 也允许显式关）。env var `WYJ_CODE_THINKING_SWITCH` 优先。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_switch: Option<String>,
+    /// 每次回复最多并行几个工具调用。None = 由模型目录/探测结果决定；
+    /// Some(n) 强制覆盖（含 Some(1) 显式退回串行）。env var
+    /// `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先（runtime override，不写盘）。
+    ///
+    /// 静态目录对所有非 anthropic/openai 端点一律判定"不支持并发工具"，
+    /// 并往 system prompt 注入"每次回复最多调用一个工具"。该判定按 vendor
+    /// 猜测而非实测，MiniMax/GLM/Kimi 等实际能并发的端点会被静默锁死成
+    /// 每轮一次往返。此字段是它的逃生舱：`wyj-code model doctor --probe full`
+    /// 探针通过后即可在此显式放开。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tools_per_turn: Option<usize>,
 }
 
 fn default_vision() -> bool {
@@ -226,6 +237,7 @@ impl Default for Profile {
             openai_stream_options: None,
             reasoning_effort: None,
             thinking_switch: None,
+            max_tools_per_turn: None,
         }
     }
 }
@@ -307,6 +319,21 @@ impl Profile {
         {
             Some(value) => Some(value),
             None => self.thinking_switch.clone(),
+        }
+    }
+
+    /// 有效 `max_tools_per_turn`：env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先，否则 profile。
+    /// 非法值（0 / 非数字）视为未设置并回落到 profile，不让一次手滑的 env 把
+    /// 能力关掉——`0` 若被当成"关并行"会和 `Some(1)` 语义混淆，宁可什么都不做。
+    pub fn effective_max_tools_per_turn(&self) -> Option<usize> {
+        match std::env::var("WYJ_CODE_MAX_TOOLS_PER_TURN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+        {
+            Some(value) => Some(value),
+            None => self.max_tools_per_turn,
         }
     }
 }
@@ -452,6 +479,21 @@ pub struct ContextEditCfg {
     pub min_result_bytes: usize,
     /// 单次请求最多连续清理几批（防"历史里全是可清理项"时一次做掉一大手术）。
     pub max_batches: usize,
+    /// **软阈值**：上下文占用超过窗口的这个比例就开始外部化过期工具结果，
+    /// 而不是等到撞上压缩硬阈值才动手。`0.0` = 关闭，完全退回「只在硬阈值清理」。
+    ///
+    /// 为什么需要它：context editing 原本只在 `estimate > compact_threshold`
+    /// 时运行，而 `compact_threshold = window - compact_trigger_buffer`。1M 窗口
+    /// 下这条线在 900K，于是「实际会话长到 300K 就该减负」这件事永远不发生
+    /// （实测 129 个会话的 `context_edit_freed_tokens` 全为 0）。
+    ///
+    /// 提前动手的收益是乘法的：外部化越早，每趟 API 携带的历史越小、累计
+    /// input 越低；而代价很小——外部化是无损的（原文进 CAS，`ContextRecall`
+    /// 能召回），且便宜（无 output token、不幻觉），本就在压缩之前的优先路径上。
+    ///
+    /// 软阈值**不改变**最终收敛目标：清理到硬阈值以下才停；清理不动了仍然
+    /// 交给 compact 摘要。
+    pub soft_limit_ratio: f64,
 }
 
 impl Default for ContextEditCfg {
@@ -462,6 +504,7 @@ impl Default for ContextEditCfg {
             batch_size: 10,
             min_result_bytes: 2_000,
             max_batches: 3,
+            soft_limit_ratio: 0.55,
         }
     }
 }
@@ -1060,6 +1103,7 @@ impl From<LegacyConfigV0> for Config {
                 openai_stream_options: None,
                 reasoning_effort: None,
                 thinking_switch: None,
+                max_tools_per_turn: None,
             }],
             log_level: legacy.log_level,
             language: legacy.language,
@@ -1523,6 +1567,7 @@ mod valid_env_name_tests {
                 openai_stream_options: None,
                 reasoning_effort: None,
                 thinking_switch: None,
+                max_tools_per_turn: None,
             }],
             ..Config::default()
         };

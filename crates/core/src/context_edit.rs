@@ -78,6 +78,9 @@ pub struct ContextEditCfg {
     /// 单次请求最多连续清理几批，防"历史里全是可清理项"时一次做掉一大手术、
     /// 把 prompt cache 前缀反复击穿。
     pub max_batches: usize,
+    /// 软阈值占窗口的比例（来自 `[context_edit].soft_limit_ratio`）。
+    /// `0.0` = 关闭软阈值，退回「只在硬阈值清理」的旧行为。
+    pub soft_limit_ratio: f64,
     /// 统计：本次会话累计清理条数 / 释放 token。
     pub totals: std::sync::Arc<ContextEditTotals>,
 }

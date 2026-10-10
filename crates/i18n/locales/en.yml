@@ -275,6 +275,23 @@ cost:
   input_detail_line: "Input detail: full {full} / uncached {uncached} / cache hit {hit_ratio}%"
   cache_line: "Cache:  {read} read + {write} written tokens (~{saved_pct}% saved vs full-price input; cost included in the total above)"
   subagent_line: "Sub-agents: input {input} + output {output} = {total} tokens (tracked separately from the main session; cost not included in the estimate above)"
+  api_calls_line: "API calls: {api_calls} (avg {avg_input}/call — call count is the first-order multiplier of total input)"
+  cache_downgraded_line: "Prompt cache is OFF: this endpoint rejected cache_control / anthropic-beta, so caching was disabled for the rest of the session."
+  price_missing: "No unit price for model \"{model}\" — showing token counts only, no cost estimate."
+
+usage:
+  header: "Cross-session token usage"
+  no_sessions: "No sessions found."
+  totals: "Sessions: {sessions} · Turns: {turns} · Model calls: {api_calls}"
+  tokens: "Input: {input} · Output: {output} · Cache read: {cache_read} · Cache write: {cache_write}"
+  rates: "Per turn: {input_per_turn} in / {output_per_turn} out · Per call: {input_per_call} in / {output_per_call} out · Cache hit: {cache_hit} · Output share: {output_share}"
+  legacy_no_api_calls: "Note: {count} session(s) predate api-call tracking, so the per-call figures cover only recently recorded sessions."
+  cache_downgraded: "Prompt cache was downgraded by the endpoint in {count} session(s)."
+  never_trimmed: "No session in this range was ever compacted or context-edited — tool results accumulated in full."
+  by_month: "By month:"
+  month_row: "in {input} · out {output} · turns {turns} · {input_per_turn} in/turn"
+  by_project: "By project:"
+  project_row: "in {input} · out {output} · {sessions} session(s)"
 
 hooks:
   desc: "List currently active Hooks (grouped by event)"
@@ -627,6 +644,8 @@ status:
   endpoint: "Endpoint: {url}"
   api_key_configured: "API Key: {prefix}... (configured)"
   api_key_error: "API Key: {err}"
+  context_window_unverified: "Context window {window} tokens is unverified (not probed). Auto-compact will not fire until ~{trigger} tokens, so tool results accumulate in full. If the real window is smaller, lower `context_window` to make trimming and compaction happen."
+  parallel_tools_capped: "max_tools_per_turn = {current} is below what this endpoint supports ({supported}). Each extra round-trip re-sends the whole context, so this is the first-order driver of input cost."
   other_profiles: "Other profiles: {names}"
   mcp_servers: "MCP servers: {count}"
   # headless REPL / `-p` / ACP stdio / daemon TCP exit hint when API Key

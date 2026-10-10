@@ -17,6 +17,7 @@ cargo run -- --no-hooks           # 禁用 Hooks 自动化系统
 cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
 cargo run -- subagent-trace <session_id> [<sub_id>] [--json]  # 查看落盘的子 Agent 执行轨迹（无 sub_id 列出概览）
+cargo run -- usage [--since YYYY-MM-DD] [--project PATH] [--json]  # 跨会话 token 消耗汇总（消耗率基线来源）
 cargo run -- workspace list      # 列出 managed Git worktree
 cargo run -- workflow validate workflow.json # 校验 Workflow DAG
 cargo run -- workflow run workflow.json      # 运行 DAG；写节点自动隔离
@@ -73,7 +74,12 @@ base_url = ""                # 留空使用供应商默认端点
 max_tokens = 8192
 context_window = 200000
 vision = true                # 模型是否支持图片输入；false 时图片降级为占位文本（防非多模态端点 400）
-# prompt_cache = false       # Anthropic-compatible 第三方端点可显式关闭 cache_control / beta header
+# prompt_cache = true         # prompt caching。**默认跟随端点类型**：官方 Anthropic 端点开，
+                              # 第三方 Anthropic 兼容端点（MiniMax/GLM/Kimi…）默认关——它们实现了
+                              # cache_control（命中约 0.1x 输入价），但对未知 anthropic-beta 头常直接 400，
+                              # 故第三方开启时只发 cache_control、不发 caching beta 头。
+                              # 若端点连 cache_control 也不认，首次 400 会自动降级（不中断会话），
+                              # 本进程内停用缓存并在 /cost 里显示降级原因。
 # openai_stream_options = false # OpenAI-compatible 第三方端点可显式关闭 stream_options.include_usage
 # thinking_budget = 8000     # extended thinking 预算 token；不写/0 = 关闭（思考计入 output 计费）
 # interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
@@ -107,6 +113,11 @@ protect_recent = 3           # 最近 N 个工具结果保留全文（Anthropic 
 batch_size = 10              # 单批清理条数（每批都会击穿 prompt cache 前缀）
 min_result_bytes = 2000      # 小于此值不清理（省下的不够占位符本身）
 max_batches = 3              # 单请求最多连续清理几批
+soft_limit_ratio = 0.55       # **软阈值**：上下文占用超过窗口的这个比例就开始外部化，
+                                # 而不是等撞上压缩硬阈值才动手。1M 窗口下硬阈值在 900K，
+                                # 实际会话永远够不着 → context editing 等于从未运行。
+                                # 0 = 关闭（完全退回旧行为）。软阈值只改「何时开始」，
+                                # 不改「何时停手」：降到硬阈值以下才停。
 
 [notify]                      # 统一通知通道（v1.5.14+）：TUI/CLI 回合完成 / 错误、
                               # 后台子 Agent 完成、cron schedule 失败统一派发到
