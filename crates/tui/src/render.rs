@@ -2333,19 +2333,53 @@ fn thinking_elapsed_secs(state: &AppState) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 输入框标题栏 thinking 指示器的基础文案（不含 spinner 帧与 animated dots）。
+/// 标题栏显示的耗时：有工具步骤在跑时算**这一步**的耗时，没有则回落整轮耗时。
+///
+/// 标题栏的耗时紧挨着某个操作名（`Bash(cargo test)`），语义必须是"这一步跑了多久"，
+/// 否则用户会把整轮的 3 分钟误读成这条命令卡了 3 分钟。步骤切换归零、无步骤时用
+/// `thinking_elapsed_secs` 兜底。
+fn current_step_elapsed_secs(state: &AppState) -> f64 {
+    state
+        .current_op_started
+        .map(|start| start.elapsed().as_secs_f64())
+        .unwrap_or_else(|| thinking_elapsed_secs(state))
+}
+
+/// 标题栏显示的 token 消耗：**本轮**实时累计（`↑` input / `↓` output）。
+///
+/// 数据源是 `turn_live_*`（由 `AgentEvent::UsageDelta` 逐请求累加），**不是**
+/// `total_* - turn_start_*`：后者在整个回合里恒为 0——`AgentEvent::Usage` 只在回合
+/// 收尾时推送一次 session 累计（见回合结束处的 send），而标题栏恰恰只在回合进行中
+/// 显示。详见 `AppState::turn_live_input_tokens` 的注释。
+fn title_token_text(state: &AppState) -> String {
+    format!(
+        "{}↑ {}↓",
+        crate::app::fmt_tokens(state.turn_live_input_tokens),
+        crate::app::fmt_tokens(state.turn_live_output_tokens)
+    )
+}
+
+/// 输入框标题栏 thinking 指示器的基础文案（即"每一步操作的名字"，不含 spinner 帧）。
 ///
 /// 优先级（从最具辨识度到默认）：
-///   1. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
-///   2. `current_op`（如 `"Read(crates/tui/src/render.rs)"`）拆分出的工具名
-///      → "Reading file" / "Running command" 等固定短语
+///   1. `current_op` 原文（如 `"Bash(cargo test)"` / `"Read(src/app.rs)"`）——
+///      直接显示工具名 + 参数，信息量高于旧的固定短语映射
+///   2. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
 ///   3. `permission_dialog` → "Waiting for approval"
 ///   4. `plan_dialog`      → "Reviewing plan"
 ///   5. `pending_queue`    → "Queuing message"
 ///   6. fallback           → "Thinking"
 ///
-/// 由 `draw_input` 标题栏调用，格式化为 `⠋ {label}{suffix}`（spinner + label + animated dots）。
+/// 由 `draw_input` 标题栏调用，格式化为
+/// `⠋ {label} · {耗时} · {token}`。
 fn thinking_status_label(state: &AppState) -> String {
+    // 1. 当前步骤原文：`ToolStart` 记下的 `"Bash(cargo test)"` 形式。
+    //    旧实现把它降级成 "Running command" 这类固定短语，标题栏因此看不出
+    //    到底在跑哪条命令 / 改哪个文件；现在直接给原文，长度由调用方截断兜底。
+    if let Some(op) = state.current_op.as_deref() {
+        return op.to_string();
+    }
+
     if let Some(task) = state
         .current_todos
         .as_deref()
@@ -2360,21 +2394,6 @@ fn thinking_status_label(state: &AppState) -> String {
             .to_string();
     }
 
-    if let Some(op) = state.current_op.as_deref() {
-        let name = op.split(['(', ' ']).next().unwrap_or(op);
-        return match name {
-            "Read" => "Reading file".to_string(),
-            "Grep" | "Glob" => "Searching code".to_string(),
-            "Bash" => "Running command".to_string(),
-            "Edit" | "MultiEdit" | "Write" => "Editing file".to_string(),
-            "TodoWrite" => "Updating todos".to_string(),
-            "Agent" => "Delegating task".to_string(),
-            "WebFetch" | "WebSearch" => "Browsing".to_string(),
-            "ExitPlanMode" => "Preparing plan".to_string(),
-            other => format!("Running {other}"),
-        };
-    }
-
     if state.permission_dialog.is_some() {
         return "Waiting for approval".to_string();
     }
@@ -2386,15 +2405,6 @@ fn thinking_status_label(state: &AppState) -> String {
     }
 
     "Thinking".to_string()
-}
-
-fn thinking_status_suffix(state: &AppState) -> &'static str {
-    match ((thinking_elapsed_secs(state) / 0.55) as usize) % 4 {
-        0 => "",
-        1 => ".",
-        2 => "..",
-        _ => "...",
-    }
 }
 
 fn draw_input(
@@ -2448,14 +2458,17 @@ fn draw_input(
             .unwrap_or(false);
 
     let (mut title_content, title_style) = if state.is_thinking {
-        // AI 思考中：标题栏只放 `⠋ Thinking..` 一个核心指示，spinner 帧 + label +
-        // animated dots 与状态栏里同源（`thinking_status_label` / `_suffix`），
-        // 但本帧 spin 在标题栏渲染，颜色用品牌橙 + 加粗作为视觉锚点。
+        // AI 工作中：标题栏是唯一的"实时进度条"，内容为
+        //   `⠋ <当前这一步的名字> · <这一步耗时> · <本轮 token>`
+        // spinner 帧提供运动感（每 tick 前进一格），不再叠 animated dots ——
+        // 点数尾巴与新加的耗时/用量两段信息同时动会让整行读起来发飘，且
+        // "..." 在窄终端里最容易把真正重要的操作名挤出可视区。
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
         let label = thinking_status_label(state);
-        let suffix = thinking_status_suffix(state);
+        let elapsed = crate::app::format_hms(current_step_elapsed_secs(state));
+        let tokens = title_token_text(state);
         (
-            format!(" {frame} {label}{suffix} "),
+            format!(" {frame} {label} · {elapsed} · {tokens} "),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
@@ -2481,9 +2494,11 @@ fn draw_input(
             ),
             AgentMode::Bypass => (
                 " [bypass] Enter to send ".to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                // 与状态栏的 [bypass] 芯片同色：Bypass 会跳过全部权限确认，
+                // 属于"危险但合法"的模式，黄色偏中性、不足以承担提醒职责。
+                // 三处（状态栏芯片 / 标题栏 / 输入框边框）必须同色，
+                // 否则用户会以为底部两处说的是不同的模式。
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             AgentMode::Normal => (" Enter to send ".to_string(), Theme::dim()),
         }
@@ -2495,7 +2510,7 @@ fn draw_input(
     } else {
         match &state.mode {
             AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
-            AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Yellow),
+            AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Red),
             _ => Theme::border(),
         }
     };
@@ -2738,17 +2753,32 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
 
 // ─── 状态栏 ──────────────────────────────────────────────────────────────────
 
-fn interaction_usage_text(state: &AppState) -> String {
-    format!(
-        "total ↑{} ↓{}",
-        fmt_tokens(state.total_input_tokens),
-        fmt_tokens(state.total_output_tokens)
-    )
+/// 状态栏左侧的模式芯片：`[plan]` / `[bypass]` / `[default]`，返回 (文本, 样式)。
+///
+/// 三种模式都必须显式展示：旧实现里 Normal 不显示任何标记，于是"看不到标记"
+/// 既可能是 Normal、也可能是芯片被挤出可视区，用户无法区分自己是否正处在
+/// 跳过全部权限确认的 Bypass 模式下——而这恰恰是最需要一眼确认的状态。
+///
+/// Bypass 用红色而非黄色：它等价于「本次会话里 Edit/Write/Bash 全部不再询问」，
+/// 是需要用户知情承担的取舍，黄色读起来仍像中性提示。文本与样式一并返回而不是
+/// 直接给 `Span`，是因为调用方还要拿纯文本按字符宽度算右对齐补位。
+fn status_mode_chip(mode: &AgentMode) -> (&'static str, Style) {
+    match mode {
+        AgentMode::Plan => (
+            "[plan]",
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        AgentMode::Bypass => (
+            "[bypass]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        AgentMode::Normal => ("[default]", Theme::dim()),
+    }
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let usage_text = interaction_usage_text(state);
-
     let cwd_str = {
         let full = state.cwd.display().to_string();
         let home = std::env::var("HOME").unwrap_or_default();
@@ -2777,58 +2807,25 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        // 默认状态：状态栏右侧不再放 "ctrl+d / ctrl+c twice / /help" 提示，
-        // 这些快捷键 /help 命令的入口在顶部 /help 命令里有完整说明，底部状态栏
-        // 留给左侧更重要的"模型 / 进度 / 用量 / cwd"信息，整体更简洁。
+        // 默认状态：状态栏右侧不占位，只在排队 / Ctrl+C 待确认时给出对应提示。
         (String::new(), Theme::dim())
     };
 
-    let mode_span = match &state.mode {
-        AgentMode::Plan => Some(Span::styled(
-            " [plan] ",
-            Style::default()
-                .fg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        )),
-        AgentMode::Bypass => Some(Span::styled(
-            " [bypass] ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        AgentMode::Normal => None,
-    };
+    // 左侧固定三段：模型 · 工作模式 · 工作目录。
+    //
+    // 用量已迁到输入框标题栏（与"当前这一步"同处一行，见 `title_token_text`），
+    // 自动压缩次数也从这里移除——状态栏是常驻信息，该留给"我在哪 / 我以什么
+    // 身份在跑"这类每一眼都要确认的常量，而不是会不断变长的累计数字。
+    let (chip_text, chip_style) = status_mode_chip(&state.mode);
+    // 芯片只带前导空格（不带尾随），否则和紧随其后的 " · " 会叠成两个空格。
+    let left_text = format!(" ◆ {} {} · {}", state.model_name, chip_text, cwd_str);
 
-    let mode_str = match &state.mode {
-        AgentMode::Plan => " [plan]",
-        AgentMode::Bypass => " [bypass]",
-        AgentMode::Normal => "",
-    };
-    // 自动压缩的**语义**指示：只报次数，不报占比。压缩对用户不可见，除以
-    // 数字之外必须让"自动管理发生过"本身可见，否则就成了黑盒。
-    let compact_chip = if state.compact_count > 0 {
-        format!(
-            " · {}",
-            wyj_i18n::tr_fmt(
-                "status.auto_compacted",
-                &[("times", &state.compact_count.to_string())],
-            )
-        )
-    } else {
-        String::new()
-    };
-
-    let left_text = format!(
-        " ◆ {}{}{} · {} · {}",
-        state.model_name, mode_str, compact_chip, usage_text, cwd_str
-    );
     let right_len = right_help.chars().count();
     let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
 
-    // thinking 指示器已迁回 `draw_input` 标题栏（"⠋ Thinking.." 紧贴用户输入框），
-    // 状态栏保持单一职责：左侧"模型 + 压缩次数 + 用量 + cwd"，右侧在按 Ctrl+C /
-    // 排队时给出对应提示；不再额外画 spinner，避免上下两处同时闪烁 + 与标题栏
-    // 文字打架。
+    // thinking 指示器已迁回 `draw_input` 标题栏（"⠋ <步骤> · 3.2s · 1.2k↑ 3↓"
+    // 紧贴用户输入框），状态栏保持单一职责，不再额外画 spinner，避免上下两处
+    // 同时闪烁 + 与标题栏文字打架。
     //
     // 这里**刻意不显示上下文占用百分比**（v1.5.17 移除）。三个理由：
     //   1. 旧实现算的是 `estimate_tokens(messages)`，压缩决策算的是
@@ -2846,20 +2843,12 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(state.model_name.clone(), Theme::dim()));
-    if let Some(ms) = mode_span {
-        spans.push(ms);
-    }
-    if !compact_chip.is_empty() {
-        spans.push(Span::styled(compact_chip, Theme::dim()));
-    }
-    spans.extend([
-        Span::styled(" · ".to_string(), Theme::dim()),
-        Span::styled(usage_text, Style::default().fg(Color::Cyan)),
-        Span::styled(format!(" · {}", cwd_str), Theme::dim()),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(right_help, right_style),
-        Span::raw(" "),
-    ]);
+    spans.push(Span::styled(format!(" {chip_text}"), chip_style));
+    spans.push(Span::styled(" · ".to_string(), Theme::dim()));
+    spans.push(Span::styled(cwd_str, Theme::dim()));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(right_help, right_style));
+    spans.push(Span::raw(" "));
 
     let line = Line::from(spans);
     let para = Paragraph::new(line).style(Theme::status_bar());
@@ -6023,32 +6012,10 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_suffix_animates_per_half_second() {
-        // `thinking_status_label` 与 `thinking_status_suffix` 都由输入框标题栏
-        // thinking 指示器组合使用：`⠋ {label}{suffix}`。这里只测 suffix 自身的节奏；
-        // label 各分支的优先级由下面四个测试保护。
+    fn thinking_status_label_prefers_raw_current_op_then_todo_then_dialogs() {
         let mut state = make_state();
-        // 0..550ms 还在第一档
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(100));
-        assert_eq!(thinking_status_suffix(&state), "");
-
-        // 550..1100ms 第二档
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(700));
-        assert_eq!(thinking_status_suffix(&state), ".");
-
-        // 1100..1650ms 第三档
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(1300));
-        assert_eq!(thinking_status_suffix(&state), "..");
-
-        // 1650ms+ 第四档
-        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_millis(2000));
-        assert_eq!(thinking_status_suffix(&state), "...");
-    }
-
-    #[test]
-    fn thinking_status_label_prefers_active_todo_active_form_then_content() {
-        let mut state = make_state();
-        // 同时设 current_op 验证 todo active_form 优先级最高
+        // 在跑的工具有最高优先级：标题栏要显示"每一步操作的名字"，
+        // 而不是被 todo 任务名或 "Reading file" 这类固定短语顶掉。
         state.current_op = Some("Read(crates/tui/src/render.rs)".to_string());
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
@@ -6057,10 +6024,15 @@ mod tool_result_fold_tests {
             priority: Some("high".to_string()),
             active_form: Some("正在检查交互焦点".to_string()),
         }]);
+        assert_eq!(
+            thinking_status_label(&state),
+            "Read(crates/tui/src/render.rs)"
+        );
 
+        // 没有在跑的工具时才让 InProgress todo 接管：active_form 优先于 content。
+        state.current_op = None;
         assert_eq!(thinking_status_label(&state), "正在检查交互焦点");
 
-        // 没有 active_form 时回退到 content
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "b".to_string(),
             content: "检查 fallback".to_string(),
@@ -6070,7 +6042,7 @@ mod tool_result_fold_tests {
         }]);
         assert_eq!(thinking_status_label(&state), "检查 fallback");
 
-        // 非 InProgress 状态的 todo 不参与优先级
+        // 非 InProgress 状态的 todo 不参与优先级；对话框 / 排队提示逐级兜底。
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "c".to_string(),
             content: "已完成".to_string(),
@@ -6078,32 +6050,7 @@ mod tool_result_fold_tests {
             priority: None,
             active_form: Some("不应被选中".to_string()),
         }]);
-        // InProgress 没了 → current_op 接管
-        assert_eq!(thinking_status_label(&state), "Reading file");
-    }
-
-    #[test]
-    fn thinking_status_label_maps_current_op_to_tool_label() {
-        let cases = [
-            ("Read(crates/tui/src/render.rs)", "Reading file"),
-            ("Grep(render.rs)", "Searching code"),
-            ("Glob(**/*.rs)", "Searching code"),
-            ("Bash(cargo test)", "Running command"),
-            ("Edit(src/lib.rs)", "Editing file"),
-            ("MultiEdit([..])", "Editing file"),
-            ("Write(src/lib.rs)", "Editing file"),
-            ("TodoWrite", "Updating todos"),
-            ("Agent(general-purpose)", "Delegating task"),
-            ("WebFetch(https://example.com)", "Browsing"),
-            ("WebSearch(query)", "Browsing"),
-            ("ExitPlanMode", "Preparing plan"),
-            ("UnknownTool", "Running UnknownTool"), // other 分支
-        ];
-        for (op, expected) in cases {
-            let mut state = make_state();
-            state.current_op = Some(op.to_string());
-            assert_eq!(thinking_status_label(&state), expected, "current_op={op}");
-        }
+        assert_eq!(thinking_status_label(&state), "Thinking");
     }
 
     #[test]
@@ -6119,31 +6066,65 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn interaction_usage_text_shows_session_totals_only() {
+    fn title_token_text_shows_this_turn_only_not_session_totals() {
         let mut state = make_state();
+        // session 累计已经很大（历史 + 上一轮），标题栏只显示本轮的实时累加值。
         state.total_input_tokens = 12_345;
         state.total_output_tokens = 678;
-        state.tool_schema_tokens = 1_100_000;
-        state.tool_schema_tokens_saved = 235_761;
-        state.last_turn_elapsed_secs = Some(12.0);
-        state.last_turn_input_tokens = 1_000;
-        state.last_turn_output_tokens = 200;
+        state.turn_live_input_tokens = 345;
+        state.turn_live_output_tokens = 178;
 
-        let text = interaction_usage_text(&state);
-        assert_eq!(text, "total ↑12,345 ↓678");
+        assert_eq!(title_token_text(&state), "345↑ 178↓");
     }
 
     #[test]
-    fn interaction_usage_text_ignores_running_turn_delta() {
+    fn title_token_text_ignores_session_usage_that_only_lands_at_turn_end() {
+        // 回归钉子：`AgentEvent::Usage` 在回合进行中**不会**推任何值，session 累计
+        // 停在回合开始那一刻。若标题栏改回读 `total_*`，这里会从 "0↑ 0↓" 变成
+        // 把上一轮的量显示成本轮开销。
         let mut state = make_state();
-        state.total_input_tokens = 150;
-        state.total_output_tokens = 40;
-        state.turn_start_time = Some(Instant::now());
-        state.turn_start_input_tokens = 100;
-        state.turn_start_output_tokens = 10;
+        state.total_input_tokens = 99_000;
+        state.total_output_tokens = 4_000;
+        assert_eq!(title_token_text(&state), "0↑ 0↓");
+    }
 
-        let text = interaction_usage_text(&state);
-        assert_eq!(text, "total ↑150 ↓40");
+    #[test]
+    fn current_step_elapsed_falls_back_to_turn_when_no_tool_running() {
+        // 纯思考阶段没有 ToolStart，只有 turn_start_time：耗时必须仍然有值，
+        // 不能退化成常驻 0.0s（那会让用户以为界面卡死）。
+        let mut state = make_state();
+        state.current_op = None;
+        state.current_op_started = None;
+        state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(7));
+        assert!(current_step_elapsed_secs(&state) >= 6.9);
+
+        // 工具在跑时用步骤起点，与整轮耗时无关。
+        state.current_op = Some("Bash(cargo test)".to_string());
+        state.current_op_started = Some(Instant::now() - std::time::Duration::from_millis(1500));
+        let step = current_step_elapsed_secs(&state);
+        assert!(
+            (1.4..1.6).contains(&step),
+            "步骤耗时应约 1.5s 而不是整轮的 7s，实际 {step}"
+        );
+    }
+
+    #[test]
+    fn thinking_status_label_prefers_raw_current_op_over_phrases() {
+        // 标题栏要显示"每一步操作的名字"：能看出在跑哪条命令 / 改哪个文件，
+        // 而不是被降级成 "Running command" 这种丢掉全部信息的固定短语。
+        let mut state = make_state();
+        state.current_op = Some("Bash(cargo test -p wyj-core)".to_string());
+        assert_eq!(
+            thinking_status_label(&state),
+            "Bash(cargo test -p wyj-core)"
+        );
+
+        // 没有在跑的工具时才逐级回落到 todo / 对话框 / 排队提示。
+        state.current_op = None;
+        state.permission_dialog = None;
+        state.plan_dialog = None;
+        state.pending_queue.clear();
+        assert_eq!(thinking_status_label(&state), "Thinking");
     }
 
     #[test]
@@ -6698,28 +6679,33 @@ mod tool_result_fold_tests {
         );
     }
 
-    /// 输入框标题栏在 is_thinking=true 时必须显示 spinner + label + animated dots，
-    /// 不再画旧的"esc to interrupt"硬编码提示。
+    /// 输入框标题栏在 is_thinking=true 时必须显示
+    /// `⠋ <当前步骤> · <耗时> · <本轮 token>`，且**不带** animated dots 尾巴。
     ///
-    /// 这个测试用例同时覆盖两件事:
-    ///   1. 标题栏文案以 "⠋ " 开头的 spinner 帧打头(SPINNER_FRAMES[0] 是 ⠋)
-    ///   2. 文案包含 label 的最小 fallback "Thinking" 或更具体文案（如 "Reading file"）
-    ///   3. 文案以 animated dots 结尾（每 550ms 一档 "."/".."/"..."）
-    ///
-    /// 任何未来误把 spinner 重新迁回状态栏、或把标题栏改回"esc to interrupt"的回归
-    /// 都会让这条断言失败，避免悄悄削弱用户对"AI 在思考"的核心视觉锚点。
+    /// 四段信息各由独立状态驱动（spinner 帧 / `thinking_status_label` /
+    /// `current_step_elapsed_secs` / `title_token_text`），这里整帧渲染一次全部验掉：
+    ///   1. spinner 帧打头（SPINNER_FRAMES[0] = ⠋）—— 唯一的运动效果来源
+    ///   2. label 用工具原文 `Bash(cargo test)`，而非旧短语 "Running command"
+    ///   3. 耗时取**这一步**的起点（1.5s），不是整轮的 3s
+    ///   4. token 是本轮增量 `1,000↑ 40↓`，不是 session 累计
+    ///   5. 不含 "..." 点数尾巴（与耗时/用量同时动会发飘，窄屏最先被挤掉）
     #[test]
-    fn draw_input_title_shows_thinking_spinner_when_thinking() {
+    fn draw_input_title_shows_step_elapsed_and_turn_tokens_when_thinking() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        // 120x10 同上
         let backend = TestBackend::new(120, 10);
         let mut terminal = Terminal::new(backend).expect("TestBackend init");
 
         let mut state = make_state();
         state.is_thinking = true;
         state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(3));
+        state.current_op = Some("Bash(cargo test)".to_string());
+        state.current_op_started = Some(Instant::now() - std::time::Duration::from_millis(1500));
+        state.turn_live_input_tokens = 1_000;
+        state.turn_live_output_tokens = 40;
+        state.total_input_tokens = 1_100;
+        state.total_output_tokens = 50;
         let input = InputBox::new();
 
         terminal
@@ -6742,18 +6728,28 @@ mod tool_result_fold_tests {
         let title_line = rendered
             .iter()
             .rev()
-            .find(|l| l.contains("Thinking") || l.contains("⠋"))
-            .expect("is_thinking 时标题栏必须出现 Thinking 文字 + ⠋ spinner");
+            .find(|l| l.contains("Bash") || l.contains('⠋'))
+            .expect("is_thinking 时标题栏必须出现当前操作名 + ⠋ spinner");
 
-        // 标题栏必须以 spinner 帧(当前 SPINNER_FRAMES[0] = ⠋)开头
         assert!(
             title_line.contains('⠋'),
             "is_thinking 时标题栏应包含 ⠋ spinner 帧，实际行: {title_line:?}"
         );
-        // 必须包含 label 文字(默认 fallback 是 "Thinking",Todo/current_op 时会被覆盖)
         assert!(
-            title_line.contains("Thinking") || title_line.contains("Reading"),
-            "is_thinking 时标题栏应包含 label 文字(Thinking 或具体 task), 实际行: {title_line:?}"
+            title_line.contains("Bash(cargo test)"),
+            "标题栏应显示每一步操作的名字原文, 实际行: {title_line:?}"
+        );
+        assert!(
+            title_line.contains("1.5s") && !title_line.contains(" 3s"),
+            "标题栏耗时应是这一步的 1.5s 而非整轮的 3s, 实际行: {title_line:?}"
+        );
+        assert!(
+            title_line.contains("1,000↑") && title_line.contains("40↓"),
+            "标题栏应显示本轮 token 增量, 实际行: {title_line:?}"
+        );
+        assert!(
+            !title_line.contains("..."),
+            "标题栏不应再带 animated dots 尾巴, 实际行: {title_line:?}"
         );
         // 不应再包含旧的"esc to interrupt"提示文案(已迁到主输入框光标区注释)
         assert!(
@@ -6850,10 +6846,14 @@ mod tool_result_fold_tests {
         );
     }
 
-    /// 反向锁：压缩发生过时状态栏必须给出**语义**指示（次数），否则
-    /// "系统替我丢过历史"就成了黑盒 —— 这正是去掉百分比后必须补上的可见性。
+    /// 反向锁：状态栏只保留「模型 · 模式 · 工作目录」三段常驻信息，
+    /// 自动压缩计数**不再**回到这里（v1.5.20 起从状态栏移除）。
+    ///
+    /// 移除理由：状态栏每帧都在，它该回答"我在哪 / 我以什么身份在跑"；压缩次数
+    /// 是低频、需要主动查询的信息，塞在这里只会把 cwd 往右挤窄屏。压缩是否发生
+    /// 仍可通过 `/context` 查看（那边是同源口径的精确分解）。
     #[test]
-    fn draw_status_shows_auto_compacted_chip_when_history_was_summarized() {
+    fn draw_status_omits_compact_chip_even_after_summarizing() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -6862,36 +6862,74 @@ mod tool_result_fold_tests {
 
         let mut state = make_state();
         state.is_thinking = false;
-        state.compact_count = 0;
+        state.compact_count = 3;
         let input = InputBox::new();
         terminal
             .draw(|f| draw(f, &mut state, &input))
             .expect("draw ok");
-        let without: String = {
+        let last_line: String = {
             let buffer = terminal.backend().buffer().clone();
             (0..buffer.area.width)
                 .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
                 .collect()
         };
         assert!(
-            !without.contains("×0"),
-            "从未压缩过时不显示该指示, 实际: {without:?}"
+            !last_line.contains('×') && !last_line.contains("已自动压缩"),
+            "状态栏不应再显示压缩计数, 实际: {last_line:?}"
         );
+        // 三段常驻信息必须仍在
+        assert!(
+            last_line.contains(&state.model_name)
+                && last_line.contains("[default]")
+                && last_line.contains("·"),
+            "状态栏应保留 模型 / 模式 / 工作目录 三段, 实际: {last_line:?}"
+        );
+    }
 
-        state.compact_count = 3;
-        terminal
-            .draw(|f| draw(f, &mut state, &input))
-            .expect("draw ok");
-        let with: String = {
+    /// 三种模式在状态栏都必须显式标出，且 Bypass 必须是**红色**——
+    /// 它等价于「本次会话跳过全部权限确认」，是唯一需要用户知情承担的模式。
+    #[test]
+    fn draw_status_labels_every_mode_and_paints_bypass_red() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for (mode, expect) in [
+            (AgentMode::Normal, "[default]"),
+            (AgentMode::Plan, "[plan]"),
+            (AgentMode::Bypass, "[bypass]"),
+        ] {
+            let backend = TestBackend::new(120, 10);
+            let mut terminal = Terminal::new(backend).expect("TestBackend init");
+            let mut state = make_state();
+            state.is_thinking = false;
+            state.mode = mode.clone();
+            let input = InputBox::new();
+            terminal
+                .draw(|f| draw(f, &mut state, &input))
+                .expect("draw ok");
+
             let buffer = terminal.backend().buffer().clone();
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
-                .collect()
-        };
-        assert!(
-            with.contains('×') && with.contains('3'),
-            "压缩 3 次后状态栏应显示计数指示, 实际: {with:?}"
-        );
+            let row = buffer.area.height - 1;
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, row)].symbol().to_string())
+                .collect();
+            assert!(
+                line.contains(expect),
+                "模式 {mode:?} 必须在状态栏显式标注 {expect}, 实际: {line:?}"
+            );
+
+            // Bypass 芯片必须染成红色（提醒语义），其余模式不受此约束。
+            if mode == AgentMode::Bypass {
+                let idx = line.find("[bypass]").expect("bypass 芯片存在");
+                let cell = &buffer[(idx as u16, row)];
+                assert_eq!(
+                    cell.fg,
+                    Color::Red,
+                    "Bypass 芯片必须是红色而不是中性黄, 实际 fg={:?}",
+                    cell.fg
+                );
+            }
+        }
     }
 
     /// 状态栏不应再设置显式背景色（之前 `Theme::status_bar()` 用 `Rgb(30, 30, 30)`
