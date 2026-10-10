@@ -335,6 +335,10 @@ impl Command for AgentControlCmd {
 pub struct CostCmd;
 
 // (input_per_mtok, output_per_mtok) in USD
+//
+// 硬编码单价，随官方调价可能过时——这是已知的未决项（计划 U3）。查不到单价时
+// **必须显式提示**而不是静默降级成"只有 token 数"：用户看到没有金额时无法区分
+// 「真的免费」和「我没查到」。
 static PRICES: &[(&str, f64, f64)] = &[
     ("claude-opus-4", 15.0, 75.0),
     ("claude-opus-3", 15.0, 75.0),
@@ -342,6 +346,12 @@ static PRICES: &[(&str, f64, f64)] = &[
     ("claude-sonnet-3", 3.0, 15.0),
     ("claude-haiku-4", 0.8, 4.0),
     ("claude-haiku-3", 0.25, 1.25),
+    // MiniMax M3.x / M2.x 走 Anthropic 兼容端点，单价远低于 Anthropic 同档：
+    // input $0.30/M、output $1.20/M；缓存命中按 0.1x、写入按 1.25x 由
+    // `CostCmd` 单独换算。放在列表里是因为第三方端点默认**不**开启缓存
+    // （见 `Profile::effective_prompt_cache`），未显式配置时全额按 input 计。
+    ("minimax-m3", 0.30, 1.20),
+    ("minimax-m2", 0.30, 1.20),
 ];
 
 fn lookup_price(model: &str) -> Option<(f64, f64)> {
@@ -466,6 +476,32 @@ impl Command for CostCmd {
         let header = tr("cost.header");
         let mut text =
             format!("{header}\n{cost_line}{input_detail_line}{cache_line}\n\n{ctx_line}");
+
+        // 调用次数与平均单次输入：把"消耗率"拆成可行动的两个因子。少一趟调用
+        // 的收益远大于单次少一点上下文——每少一趟就少重发一遍完整历史。
+        if ctx.api_calls > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "cost.api_calls_line",
+                &[
+                    ("api_calls", &ctx.api_calls.to_string()),
+                    ("avg_input", &fmt_num(input / ctx.api_calls)),
+                ],
+            ));
+        }
+
+        // 缓存被端点拒绝而停用：把"0 缓存"从"没配"里区分出来，否则用户看到
+        // 缓存全零时无从判断是没开、还是开了但这个端点不支持。
+        if ctx.prompt_cache_state == wyj_core::prompt_cache_state::DOWNGRADED {
+            text.push('\n');
+            text.push_str(&tr("cost.cache_downgraded_line"));
+        }
+
+        // 单价表未覆盖当前模型：静默降级成"无金额"会让用户误以为模型免费。
+        if lookup_price(&ctx.model).is_none() {
+            text.push('\n');
+            text.push_str(&tr_fmt("cost.price_missing", &[("model", &ctx.model)]));
+        }
 
         // 子 Agent 用量单列（有用量时才显示）
         let sub_total = ctx.sub_input_tokens + ctx.sub_output_tokens;
@@ -1771,6 +1807,8 @@ mod help_tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            api_calls: 0,
+            prompt_cache_state: 0,
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
@@ -1848,6 +1886,8 @@ mod agents_tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            api_calls: 0,
+            prompt_cache_state: 0,
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
@@ -1890,6 +1930,8 @@ mod subagents_tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_write_tokens: 0,
+            api_calls: 0,
+            prompt_cache_state: 0,
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,

@@ -118,6 +118,17 @@ pub trait Provider: Send + Sync {
         opts: &RequestOptions,
     ) -> Result<EventStream>;
 
+    /// 本 provider 当前的 prompt cache 生效状态，取值与
+    /// `wyj_core::session_store::prompt_cache_state` 一致：
+    /// `0` 未启用 / `1` 已启用 / `2` 曾启用但端点拒绝、已自动降级。
+    ///
+    /// 存在的理由：`/cost` 看到 cache_read 恒为 0 时，**无法区分**"用户没配
+    /// 缓存"和"配了但这个端点根本不支持"——这两种情况的用户动作完全相反。
+    /// 默认 0 表示"不支持/未启用"；支持缓存的 provider 覆盖它。
+    fn prompt_cache_state(&self) -> u8 {
+        0
+    }
+
     /// 发起非流式推理，等待完整结果（默认由 stream 实现，可覆盖以提升性能）
     async fn complete(
         &self,
@@ -133,6 +144,7 @@ pub trait Provider: Send + Sync {
 
         let mut text_buf = String::new();
         let mut tool_bufs: Vec<(String, String, String)> = vec![]; // (id, name, json)
+        let mut current_tool_idx: Option<usize> = None;
         let mut stop_reason = StopReason::EndTurn;
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
@@ -144,9 +156,21 @@ pub trait Provider: Send + Sync {
                 StreamEvent::TextDelta(delta) => text_buf.push_str(&delta),
                 StreamEvent::ToolUseStart { id, name } => {
                     tool_bufs.push((id, name, String::new()));
+                    current_tool_idx = Some(tool_bufs.len() - 1);
                 }
                 StreamEvent::ToolUseDelta { id, json_delta } => {
-                    if let Some(buf) = tool_bufs.iter_mut().find(|(bid, _, _)| *bid == id) {
+                    // Anthropic 协议的 `input_json_delta` 事件只带 block index、不带
+                    // tool id，适配层因此把 id 留空。按 id 匹配会一个都匹配不上，
+                    // 工具参数被静默丢弃（表现为 `malformed arguments ... EOF`）。
+                    // 主推理路径 agent.rs 早已用「id 为空则回落到当前打开的 tool 块」
+                    // 处理同一问题，这里必须对齐，否则 complete() 对所有端点的每一次
+                    // 工具调用都拿不到参数。
+                    let idx = if id.is_empty() {
+                        current_tool_idx
+                    } else {
+                        tool_bufs.iter().position(|(bid, _, _)| *bid == id)
+                    };
+                    if let Some(buf) = idx.and_then(|i| tool_bufs.get_mut(i)) {
                         buf.2.push_str(&json_delta);
                     }
                 }
@@ -198,5 +222,167 @@ pub trait Provider: Send + Sync {
             cache_read_input_tokens,
             cache_creation_input_tokens,
         })
+    }
+}
+
+#[cfg(test)]
+mod complete_tool_args_tests {
+    use super::*;
+    use crate::types::{ContentBlock, StopReason};
+    use futures::stream;
+
+    struct ReplayingProvider {
+        events: Vec<StreamEvent>,
+    }
+
+    #[async_trait]
+    impl Provider for ReplayingProvider {
+        async fn stream(
+            &self,
+            _system: &SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &RequestOptions,
+        ) -> Result<EventStream> {
+            let events = self.events.clone();
+            Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    fn provider_with(events: Vec<StreamEvent>) -> ReplayingProvider {
+        ReplayingProvider { events }
+    }
+
+    /// Anthropic 协议的 `input_json_delta` 只带 block index、不带 tool id，
+    /// 适配层把 id 留空。`complete()` 曾按 id 匹配 delta，一个都匹配不上，
+    /// 于是**每一次非流式工具调用的参数都被静默丢弃**——compact、记忆提取、
+    /// 标题摘要、模型探针全都走这条路。agent.rs 的流式路径早已用
+    /// 「id 为空则回落到当前打开的 tool 块」处理过同一问题，这里是对齐它的回归钉子。
+    #[tokio::test]
+    async fn complete_collects_tool_arguments_when_delta_carries_no_id() {
+        let provider = provider_with(vec![
+            StreamEvent::ToolUseStart {
+                id: "call_1".to_string(),
+                name: "probe_echo".to_string(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: String::new(),
+                json_delta: "{\"value\": ".to_string(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: String::new(),
+                json_delta: "\"ok\"}".to_string(),
+            },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        let result = provider
+            .complete(
+                &SystemPrompt::stable_only("x"),
+                &[Message::user("y")],
+                &[],
+                &RequestOptions::text_only(64),
+            )
+            .await
+            .expect("complete 不应因参数被丢弃而报错");
+
+        let tool = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { id, name, input } => {
+                    Some((id.clone(), name.clone(), input.clone()))
+                }
+                _ => None,
+            })
+            .expect("应还原出 ToolUse 块");
+        assert_eq!(tool.0, "call_1");
+        assert_eq!(tool.1, "probe_echo");
+        assert_eq!(tool.2.get("value").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    /// 单条 delta 一次性带完整参数（部分端点如此）也必须能还原。
+    #[tokio::test]
+    async fn complete_collects_tool_arguments_from_single_delta() {
+        let provider = provider_with(vec![
+            StreamEvent::ToolUseStart {
+                id: "call_x".to_string(),
+                name: "probe_echo".to_string(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: String::new(),
+                json_delta: "{\"value\":\"ok\"}".to_string(),
+            },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        let result = provider
+            .complete(
+                &SystemPrompt::stable_only("x"),
+                &[Message::user("y")],
+                &[],
+                &RequestOptions::text_only(64),
+            )
+            .await
+            .expect("complete 应成功");
+        assert!(result.content.iter().any(|b| matches!(
+            b,
+            ContentBlock::ToolUse { input, .. }
+                if input.get("value").and_then(|v| v.as_str()) == Some("ok")
+        )));
+    }
+
+    /// 两个工具块必须各自拿到自己的参数，不能串到一起。
+    #[tokio::test]
+    async fn complete_keeps_parallel_tool_arguments_separated() {
+        let provider = provider_with(vec![
+            StreamEvent::ToolUseStart {
+                id: "call_a".to_string(),
+                name: "probe_echo".to_string(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: String::new(),
+                json_delta: "{\"value\":\"ok\"}".to_string(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call_b".to_string(),
+                name: "probe_echo".to_string(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: String::new(),
+                json_delta: "{\"value\":\"ok\"}".to_string(),
+            },
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+        let result = provider
+            .complete(
+                &SystemPrompt::stable_only("x"),
+                &[Message::user("y")],
+                &[],
+                &RequestOptions::text_only(64),
+            )
+            .await
+            .expect("complete 应成功");
+        let tools: Vec<_> = result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, input, .. } => Some((id.clone(), input.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2, "两个工具块都应被还原");
+        for (id, input) in tools {
+            assert!(id == "call_a" || id == "call_b");
+            assert_eq!(
+                input.get("value").and_then(|v| v.as_str()),
+                Some("ok"),
+                "工具 {id} 的参数被串到了别的块上"
+            );
+        }
     }
 }

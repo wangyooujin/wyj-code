@@ -39,6 +39,10 @@ pub struct ModelDoctorReport {
 
 impl ModelDoctorReport {
     pub fn static_report(profile: &Profile, cache: Option<&CapabilityCache>) -> Self {
+        // 能力本身走 `resolve_with_cache`，由它统一做「静态目录 < live probe < 用户
+        // 覆盖」的分层。这里曾把 `record.capabilities` 整体替换进来，那会把用户在
+        // profile 里写的覆盖（以及 resolve 刚算出的结果）一起冲掉，导致 doctor
+        // 报告的能力与运行时实际用的不是同一份。
         let CatalogResolution {
             identity,
             capabilities,
@@ -47,21 +51,14 @@ impl ModelDoctorReport {
             known_degradations,
             documentation_url,
             catalog_updated_at,
-        } = ModelCatalog::resolve(profile, None);
+        } = ModelCatalog::resolve_with_cache(profile, None, cache);
         let cached = cache.and_then(|cache| cache.load(&identity).ok().flatten());
-        let (capabilities, verification_status, probe_status, probed_at) = match cached {
+        let (probe_status, probed_at) = match cached {
             Some(record) => (
-                record.capabilities,
-                VerificationStatus::LiveVerified,
                 "cached_live_probe".to_string(),
                 Some(record.probed_at.to_rfc3339()),
             ),
-            None => (
-                capabilities,
-                verification_status,
-                "not_probed".to_string(),
-                None,
-            ),
+            None => ("not_probed".to_string(), None),
         };
         Self {
             profile: profile.name.clone(),

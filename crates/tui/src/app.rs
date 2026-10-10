@@ -38,7 +38,7 @@ use wyj_core::{
     discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent,
     AgentDefinition, CandidatePayload, CandidateStatus, DiscoveredFile, Episode,
     EvolutionCandidate, EvolutionMemory, EvolutionStore, HistoryEntry, HistoryStore, InjectionKind,
-    MemoryStatus, Session, SessionFile, SessionMeta, SessionStore, ToolEvent,
+    MemoryStatus, Session, SessionFile, SessionFileMeta, SessionMeta, SessionStore, ToolEvent,
 };
 use wyj_tools::todo::{is_todo_collapsible, TodoItem, TodoStatus};
 use wyj_tools::trace::TraceEvent;
@@ -1428,6 +1428,9 @@ pub struct ProfileEntryDraft {
     pub reasoning_effort: String,
     /// OpenAI-vendor thinking.type 字符串（enabled/disabled/auto/adaptive）
     pub thinking_switch: String,
+    /// 每轮并行工具数上限（面板暂不暴露编辑入口，仅透传保留原值）。
+    /// 漏在这里会被 `to_profile` 静默重置成 None 且无任何报错。
+    pub max_tools_per_turn: Option<usize>,
 }
 
 impl ProfileEntryDraft {
@@ -1455,6 +1458,7 @@ impl ProfileEntryDraft {
             openai_stream_options: p.openai_stream_options,
             reasoning_effort: p.reasoning_effort.clone().unwrap_or_default(),
             thinking_switch: p.thinking_switch.clone().unwrap_or_default(),
+            max_tools_per_turn: p.max_tools_per_turn,
         }
     }
 
@@ -1486,6 +1490,9 @@ impl ProfileEntryDraft {
             interleaved_thinking: true,
             prompt_cache: t.prompt_cache,
             openai_stream_options: t.openai_stream_options,
+            // 从厂商模板新建的 profile 不继承覆盖值：模板描述的是端点默认形状，
+            // 并行工具数该由探测或用户显式决定。
+            max_tools_per_turn: None,
             reasoning_effort: String::new(),
             thinking_switch: String::new(),
         }
@@ -1598,6 +1605,7 @@ impl ProfileEntryDraft {
             } else {
                 Some(self.thinking_switch.trim().to_string())
             },
+            max_tools_per_turn: self.max_tools_per_turn,
         }
     }
 }
@@ -10188,13 +10196,7 @@ async fn tui_main(
         .as_ref()
         .and_then(|store| store.load(&current_session_id).ok())
     {
-        init_sess.total_input_tokens = file.input_tokens;
-        init_sess.total_output_tokens = file.output_tokens;
-        init_sess.routing_events = file.routing_events;
-        init_sess.current_checkpoint_id = file.current_checkpoint_id;
-        init_sess.compact_count = file.compact_count;
-        init_sess.branch_parent_session_id = file.branch_parent_session_id;
-        init_sess.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+        init_sess.restore_usage_from(&file);
     }
     init_sess.messages = initial_messages;
     if has_initial {
@@ -10409,26 +10411,18 @@ async fn tui_main(
                         Some(f) if f.title_generated => (f.title, true),
                         _ => (extract_title(&sess.messages), false),
                     };
-                    let sf = SessionFile {
-                        session_id: current_session_id.clone(),
-                        title,
-                        last_preview: extract_preview(&sess.messages),
-                        cwd: cwd.display().to_string(),
-                        timestamp: now_iso(),
-                        turns: state.turns,
-                        input_tokens: sess.total_input_tokens,
-                        compact_count: sess.compact_count,
-                        elided_blobs: sess.elided_blobs.clone(),
-                        context_edit_freed_tokens: sess.context_edit_freed_tokens,
-
-                        output_tokens: sess.total_output_tokens,
-                        messages: sess.messages.clone(),
-                        routing_events: sess.routing_events.clone(),
-                        current_checkpoint_id: sess.current_checkpoint_id.clone(),
-                        branch_parent_session_id: sess.branch_parent_session_id.clone(),
-                        branch_parent_checkpoint_id: sess.branch_parent_checkpoint_id.clone(),
-                        title_generated,
-                    };
+                    let sf = SessionFile::from_session(
+                        &sess,
+                        SessionFileMeta {
+                            session_id: current_session_id.clone(),
+                            title,
+                            last_preview: extract_preview(&sess.messages),
+                            cwd: cwd.display().to_string(),
+                            timestamp: now_iso(),
+                            turns: state.turns,
+                            title_generated,
+                        },
+                    );
                     let _ = store.save(&sf);
                 }
             }
@@ -10572,33 +10566,20 @@ async fn tui_main(
                                                     Some(f) if f.title_generated => (f.title, true),
                                                     _ => (extract_title(&sess.messages), false),
                                                 };
-                                                let _ = store.save(&SessionFile {
-                                                    session_id: current_session_id.clone(),
-                                                    title,
-                                                    last_preview: extract_preview(&sess.messages),
-                                                    cwd: cwd.display().to_string(),
-                                                    timestamp: now_iso(),
-                                                    turns: state.turns,
-                                                    input_tokens: sess.total_input_tokens,
-                                                    compact_count: sess.compact_count,
-                                                    elided_blobs: sess.elided_blobs.clone(),
-                                                    context_edit_freed_tokens: sess
-                                                        .context_edit_freed_tokens,
-
-                                                    output_tokens: sess.total_output_tokens,
-                                                    messages: sess.messages.clone(),
-                                                    routing_events: sess.routing_events.clone(),
-                                                    current_checkpoint_id: sess
-                                                        .current_checkpoint_id
-                                                        .clone(),
-                                                    branch_parent_session_id: sess
-                                                        .branch_parent_session_id
-                                                        .clone(),
-                                                    branch_parent_checkpoint_id: sess
-                                                        .branch_parent_checkpoint_id
-                                                        .clone(),
-                                                    title_generated,
-                                                });
+                                                let _ = store.save(&SessionFile::from_session(
+                                                    &sess,
+                                                    SessionFileMeta {
+                                                        session_id: current_session_id.clone(),
+                                                        title,
+                                                        last_preview: extract_preview(
+                                                            &sess.messages,
+                                                        ),
+                                                        cwd: cwd.display().to_string(),
+                                                        timestamp: now_iso(),
+                                                        turns: state.turns,
+                                                        title_generated,
+                                                    },
+                                                ));
                                             }
                                         }
                                         let mut sess = session.lock().await;
@@ -10632,35 +10613,20 @@ async fn tui_main(
                                                         }
                                                         _ => (extract_title(&sess.messages), false),
                                                     };
-                                                    let _ = store.save(&SessionFile {
-                                                        session_id: current_session_id.clone(),
-                                                        title,
-                                                        last_preview: extract_preview(
-                                                            &sess.messages,
-                                                        ),
-                                                        cwd: cwd.display().to_string(),
-                                                        timestamp: now_iso(),
-                                                        turns: state.turns,
-                                                        input_tokens: sess.total_input_tokens,
-                                                        compact_count: sess.compact_count,
-                                                        elided_blobs: sess.elided_blobs.clone(),
-                                                        context_edit_freed_tokens: sess
-                                                            .context_edit_freed_tokens,
-
-                                                        output_tokens: sess.total_output_tokens,
-                                                        messages: sess.messages.clone(),
-                                                        routing_events: sess.routing_events.clone(),
-                                                        current_checkpoint_id: sess
-                                                            .current_checkpoint_id
-                                                            .clone(),
-                                                        branch_parent_session_id: sess
-                                                            .branch_parent_session_id
-                                                            .clone(),
-                                                        branch_parent_checkpoint_id: sess
-                                                            .branch_parent_checkpoint_id
-                                                            .clone(),
-                                                        title_generated,
-                                                    });
+                                                    let _ = store.save(&SessionFile::from_session(
+                                                        &sess,
+                                                        SessionFileMeta {
+                                                            session_id: current_session_id.clone(),
+                                                            title,
+                                                            last_preview: extract_preview(
+                                                                &sess.messages,
+                                                            ),
+                                                            cwd: cwd.display().to_string(),
+                                                            timestamp: now_iso(),
+                                                            turns: state.turns,
+                                                            title_generated,
+                                                        },
+                                                    ));
                                                 }
                                             }
                                             // 加载目标会话
@@ -10669,17 +10635,7 @@ async fn tui_main(
                                                     let display_msgs =
                                                         reconstruct_display(&file.messages);
                                                     let mut sess = session.lock().await;
-                                                    sess.total_input_tokens = file.input_tokens;
-                                                    sess.total_output_tokens = file.output_tokens;
-                                                    sess.routing_events =
-                                                        file.routing_events.clone();
-                                                    sess.current_checkpoint_id =
-                                                        file.current_checkpoint_id.clone();
-                                                    sess.compact_count = file.compact_count;
-                                                    sess.branch_parent_session_id =
-                                                        file.branch_parent_session_id.clone();
-                                                    sess.branch_parent_checkpoint_id =
-                                                        file.branch_parent_checkpoint_id.clone();
+                                                    sess.restore_usage_from(&file);
                                                     sess.messages = file.messages;
                                                     let compact_count = sess.compact_count;
                                                     let plan_approved =
@@ -13339,6 +13295,8 @@ async fn tui_main(
                                 estimated,
                                 cache_read,
                                 cache_write,
+                                api_calls,
+                                prompt_cache_state,
                                 compact_count,
                                 context_edit,
                             ) = {
@@ -13359,6 +13317,8 @@ async fn tui_main(
                                     estimated,
                                     sess.total_cache_read_tokens,
                                     sess.total_cache_write_tokens,
+                                    sess.api_calls,
+                                    sess.prompt_cache_state,
                                     sess.compact_count,
                                     (
                                         wyj_core::context_edit::elided_count(&sess.messages) as u32,
@@ -13373,6 +13333,8 @@ async fn tui_main(
                                 output_tokens: state.total_output_tokens,
                                 cache_read_tokens: cache_read,
                                 cache_write_tokens: cache_write,
+                                api_calls,
+                                prompt_cache_state,
                                 context_window,
                                 estimated_tokens: estimated,
                                 context_audit: audit,
@@ -13525,35 +13487,20 @@ async fn tui_main(
                                                         }
                                                         _ => (extract_title(&sess.messages), false),
                                                     };
-                                                    let _ = store.save(&SessionFile {
-                                                        session_id: current_session_id.clone(),
-                                                        title,
-                                                        last_preview: extract_preview(
-                                                            &sess.messages,
-                                                        ),
-                                                        cwd: cwd.display().to_string(),
-                                                        timestamp: now_iso(),
-                                                        turns: state.turns,
-                                                        input_tokens: sess.total_input_tokens,
-                                                        compact_count: sess.compact_count,
-                                                        elided_blobs: sess.elided_blobs.clone(),
-                                                        context_edit_freed_tokens: sess
-                                                            .context_edit_freed_tokens,
-
-                                                        output_tokens: sess.total_output_tokens,
-                                                        messages: sess.messages.clone(),
-                                                        routing_events: sess.routing_events.clone(),
-                                                        current_checkpoint_id: sess
-                                                            .current_checkpoint_id
-                                                            .clone(),
-                                                        branch_parent_session_id: sess
-                                                            .branch_parent_session_id
-                                                            .clone(),
-                                                        branch_parent_checkpoint_id: sess
-                                                            .branch_parent_checkpoint_id
-                                                            .clone(),
-                                                        title_generated,
-                                                    });
+                                                    let _ = store.save(&SessionFile::from_session(
+                                                        &sess,
+                                                        SessionFileMeta {
+                                                            session_id: current_session_id.clone(),
+                                                            title,
+                                                            last_preview: extract_preview(
+                                                                &sess.messages,
+                                                            ),
+                                                            cwd: cwd.display().to_string(),
+                                                            timestamp: now_iso(),
+                                                            turns: state.turns,
+                                                            title_generated,
+                                                        },
+                                                    ));
                                                 }
                                             }
                                             {
@@ -14195,35 +14142,20 @@ async fn tui_main(
                                                         }
                                                         _ => (extract_title(&sess.messages), false),
                                                     };
-                                                    let _ = store.save(&SessionFile {
-                                                        session_id: current_session_id.clone(),
-                                                        title,
-                                                        last_preview: extract_preview(
-                                                            &sess.messages,
-                                                        ),
-                                                        cwd: cwd.display().to_string(),
-                                                        timestamp: now_iso(),
-                                                        turns: state.turns,
-                                                        input_tokens: sess.total_input_tokens,
-                                                        compact_count: sess.compact_count,
-                                                        elided_blobs: sess.elided_blobs.clone(),
-                                                        context_edit_freed_tokens: sess
-                                                            .context_edit_freed_tokens,
-
-                                                        output_tokens: sess.total_output_tokens,
-                                                        messages: sess.messages.clone(),
-                                                        routing_events: sess.routing_events.clone(),
-                                                        current_checkpoint_id: sess
-                                                            .current_checkpoint_id
-                                                            .clone(),
-                                                        branch_parent_session_id: sess
-                                                            .branch_parent_session_id
-                                                            .clone(),
-                                                        branch_parent_checkpoint_id: sess
-                                                            .branch_parent_checkpoint_id
-                                                            .clone(),
-                                                        title_generated,
-                                                    });
+                                                    let _ = store.save(&SessionFile::from_session(
+                                                        &sess,
+                                                        SessionFileMeta {
+                                                            session_id: current_session_id.clone(),
+                                                            title,
+                                                            last_preview: extract_preview(
+                                                                &sess.messages,
+                                                            ),
+                                                            cwd: cwd.display().to_string(),
+                                                            timestamp: now_iso(),
+                                                            turns: state.turns,
+                                                            title_generated,
+                                                        },
+                                                    ));
                                                 }
                                             }
                                             // 加载目标会话
@@ -14735,26 +14667,18 @@ async fn tui_main(
                     Some(f) if f.title_generated => (f.title, true),
                     _ => (extract_title(&sess.messages), false),
                 };
-                let _ = store.save(&SessionFile {
-                    session_id: current_session_id.clone(),
-                    title,
-                    last_preview: extract_preview(&sess.messages),
-                    cwd: cwd.display().to_string(),
-                    timestamp: now_iso(),
-                    turns: state.turns,
-                    input_tokens: sess.total_input_tokens,
-                    compact_count: sess.compact_count,
-                    elided_blobs: sess.elided_blobs.clone(),
-                    context_edit_freed_tokens: sess.context_edit_freed_tokens,
-
-                    output_tokens: sess.total_output_tokens,
-                    messages: sess.messages.clone(),
-                    routing_events: sess.routing_events.clone(),
-                    current_checkpoint_id: sess.current_checkpoint_id.clone(),
-                    branch_parent_session_id: sess.branch_parent_session_id.clone(),
-                    branch_parent_checkpoint_id: sess.branch_parent_checkpoint_id.clone(),
-                    title_generated,
-                });
+                let _ = store.save(&SessionFile::from_session(
+                    &sess,
+                    SessionFileMeta {
+                        session_id: current_session_id.clone(),
+                        title,
+                        last_preview: extract_preview(&sess.messages),
+                        cwd: cwd.display().to_string(),
+                        timestamp: now_iso(),
+                        turns: state.turns,
+                        title_generated,
+                    },
+                ));
                 resumable_session_id = Some(current_session_id.clone());
             }
         }
@@ -16427,6 +16351,27 @@ mod mcp_dialog_tests {
 #[cfg(test)]
 mod profile_dialog_onboarding_tests {
     use super::*;
+
+    /// `ProfileEntryDraft::to_profile` 是逐字段**重建**一个新 Profile，不是原地改字段。
+    /// 任何只加在 `wyj_config::Profile` 上、却没在 draft 上透传的字段，都会在用户
+    /// 每次 Ctrl+S 保存 ProfileDialog 时被静默重置成默认值，且没有任何报错。
+    /// 与 CLAUDE.md 记过的 rebuild_fn 快照陷阱同类，这里用往返测试钉死。
+    #[test]
+    fn profile_dialog_round_trip_preserves_max_tools_per_turn() {
+        for requested in [None, Some(1usize), Some(4), Some(8)] {
+            let profile = wyj_config::Profile {
+                name: "default".to_string(),
+                max_tools_per_turn: requested,
+                ..wyj_config::Profile::default()
+            };
+            let restored = ProfileEntryDraft::from_profile(&profile).to_profile();
+            assert_eq!(
+                restored.max_tools_per_turn, requested,
+                "max_tools_per_turn 在 ProfileDialog 往返中丢失: {requested:?} → {:?}",
+                restored.max_tools_per_turn
+            );
+        }
+    }
 
     #[test]
     fn new_for_onboarding_focuses_on_api_key_field() {

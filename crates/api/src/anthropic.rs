@@ -14,9 +14,19 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use wyj_config::{Config, WireProtocol};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// prompt cache 生效状态取值。与
+/// `wyj_core::session_store::prompt_cache_state` 的常量一一对应，但**不在此处
+/// 依赖 core**（api 是 core 的下层依赖，core 依赖 api）。两处常量必须同步
+/// 修改，语义由 `session_store` 侧的定义为准。
+pub const PROMPT_CACHE_STATE_OFF: u8 = 0;
+pub const PROMPT_CACHE_STATE_ON: u8 = 1;
+pub const PROMPT_CACHE_STATE_DOWNGRADED: u8 = 2;
 
 pub struct AnthropicProvider {
     client: Client,
@@ -27,6 +37,13 @@ pub struct AnthropicProvider {
     /// 避免非多模态端点收到 image 块直接 400 打断整轮对话。
     supports_vision: bool,
     prompt_cache: bool,
+    /// 是否把 `prompt-caching-2024-07-31` 放进 `anthropic-beta` 头。
+    /// 只有官方 Anthropic 端点为 true；第三方兼容端点开启缓存时只发
+    /// `cache_control` 而不发 beta 头，理由见 [`collect_beta_header`]。
+    send_cache_beta: bool,
+    /// 该端点已被实测判定不支持 `cache_control`（首次 400 后单调置位，
+    /// 本进程内不再尝试缓存）。供 agent 层据此在 `/cost` 解释缓存为何为 0。
+    cache_disabled: Arc<AtomicBool>,
     /// vendor 名（anthropic / zhipu / minimax / moonshot / 等）。用于 thinking adapter
     /// dispatch，决定是否发 interleaved-thinking beta header。
     vendor: String,
@@ -53,6 +70,7 @@ impl AnthropicProvider {
             .unwrap_or_else(|| infer_vendor(&profile.base_url, model).to_string());
         let dropped_parameters =
             crate::request_plan::RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
+        let is_official = profile.is_official_anthropic_endpoint();
         Ok(Self {
             client: Client::new(),
             api_key,
@@ -60,8 +78,12 @@ impl AnthropicProvider {
             model: model.to_string(),
             supports_vision: profile.vision,
             prompt_cache: profile.effective_prompt_cache(),
+            // 第三方端点不发 caching beta 头：它们实现了 cache_control，但对
+            // 未知 beta 头普遍直接 400。降级兜底见 `send_with_cache_fallback`。
+            send_cache_beta: is_official,
+            cache_disabled: Arc::new(AtomicBool::new(false)),
             vendor,
-            is_official_anthropic_endpoint: profile.is_official_anthropic_endpoint(),
+            is_official_anthropic_endpoint: is_official,
             dropped_parameters,
         })
     }
@@ -454,13 +476,20 @@ fn to_api_messages(messages: &[Message], vision: bool) -> Vec<ApiMessage> {
 /// 汇总本次请求需要的 `anthropic-beta` header 值（逗号分隔，去重）。
 /// `prompt_cache`/`interleaved_thinking` 对应固定 beta；每个原生工具
 /// （`ToolDefinition.native`）各自携带所需 beta，按声明顺序去重追加。
+///
+/// `send_cache_beta` 与 `prompt_cache` **刻意解耦**：prompt caching 在
+/// Anthropic 协议层是「请求体里的 `cache_control` 块」，beta 头只是官方
+/// 在 GA 前的开关。第三方 Anthropic 兼容端点（MiniMax / GLM / Kimi …）
+/// 普遍实现了前者却会对未知 beta 头直接 400，所以第三方开启缓存时只发
+/// `cache_control`、不发 beta 头。官方端点两者都发（保持既有行为）。
 fn collect_beta_header(
     prompt_cache: bool,
+    send_cache_beta: bool,
     interleaved_thinking: bool,
     tools: &[ToolDefinition],
 ) -> Option<String> {
     let mut betas: Vec<&str> = vec![];
-    if prompt_cache {
+    if prompt_cache && send_cache_beta {
         betas.push("prompt-caching-2024-07-31");
     }
     if interleaved_thinking {
@@ -474,6 +503,57 @@ fn collect_beta_header(
         }
     }
     (!betas.is_empty()).then(|| betas.join(","))
+}
+
+/// 发送一次 Anthropic Messages 请求（连接前阶段带指数退避重试）。
+///
+/// 单独成函数而不是内联闭包：降级重试需要用同一组连接参数发第二次，而
+/// `RetryPolicy` 与 `url` 都是借用——内联闭包会让 future 借用临时值。
+/// 429/5xx/连接错误的重试在这里统一处理，流未开始消费，重试对上层透明。
+async fn send_anthropic_request(
+    client: &Client,
+    api_key: &str,
+    url: &str,
+    policy: &crate::retry::RetryPolicy,
+    body_value: &Value,
+    beta_header: Option<&str>,
+) -> Result<reqwest::Response> {
+    crate::retry::send_with_retry(policy, "Anthropic", || {
+        let mut req = client
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json");
+        if let Some(beta) = beta_header {
+            req = req.header("anthropic-beta", beta);
+        }
+        req.json(body_value)
+    })
+    .await
+}
+
+/// 该错误是否意味着「端点不接受 cache_control / caching beta 头」。
+///
+/// 必须排除 `ContextLengthExceeded`：它也是 400，但语义是
+/// 「提示词太长」，正确反应是上层强制压缩（`agent.rs` 的
+/// `ContextLengthExceeded` 恢复路径）而不是关缓存。若把它误判成缓存不支持，
+/// 用户会遇到「上下文一满就再也不用缓存了」这种莫名其妙的降级。
+///
+/// 只认 `UnsupportedParameter` 与 `InvalidRequest` 两类：前者是端点明确说不认识
+/// 该参数，后者是「无法解析请求」——`cache_control` 写坏或 beta 头不被接受时
+/// 都落在这里。其余 400（如 tool schema 非法）不降级，避免把真实 bug 掩盖成
+/// 「缓存不支持」。
+fn is_cache_rejection(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::error::ProviderError>()
+        .map(|e| {
+            e.provider_status == Some(400)
+                && matches!(
+                    e.kind,
+                    crate::error::ProviderErrorKind::UnsupportedParameter
+                        | crate::error::ProviderErrorKind::InvalidRequest
+                )
+        })
+        .unwrap_or(false)
 }
 
 fn parse_stop_reason(s: &str) -> StopReason {
@@ -490,6 +570,16 @@ fn parse_stop_reason(s: &str) -> StopReason {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn prompt_cache_state(&self) -> u8 {
+        if !self.prompt_cache {
+            PROMPT_CACHE_STATE_OFF
+        } else if self.cache_disabled.load(Ordering::Relaxed) {
+            PROMPT_CACHE_STATE_DOWNGRADED
+        } else {
+            PROMPT_CACHE_STATE_ON
+        }
+    }
+
     async fn stream(
         &self,
         system: &crate::provider::SystemPrompt<'_>,
@@ -521,92 +611,127 @@ impl Provider for AnthropicProvider {
             _ => opts.max_tokens,
         };
 
-        // ── 构建 system 块（带 cache_control，缓存 system prompt 的稳定前缀）──
-        let system_blocks = build_system_blocks(system, self.prompt_cache);
+        // ── 缓存是否生效 ──
+        // profile 显式开启（第三方端点默认关，见 `effective_prompt_cache`），
+        // 且本进程尚未因 400 判定该端点不支持。
+        let cache_requested = self.prompt_cache;
+        let cache_active = cache_requested && !self.cache_disabled.load(Ordering::Relaxed);
 
-        // ── 构建 tools 块（最后一个工具打 cache_control，缓存全部工具定义）──
-        let tool_count = tools.len();
-        let api_tools: Vec<Value> = tools
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let cc = (self.prompt_cache && tool_count > 0 && i == tool_count - 1)
-                    .then_some(EPHEMERAL);
-                build_api_tool(t, cc)
-            })
-            .collect();
-
-        // ── 构建消息历史，在最后一个内容块打 cache_control 断点 ──
-        // Anthropic 缓存按前缀匹配：把断点放在历史末尾，使「system + tools +
-        // 既有历史」整体被缓存，后续轮次只有新增的 user/assistant 内容按全价。
-        // 注意 breakpoint 总数上限为 4（system 1 + tools 1 + 历史 1 = 3，安全）。
-        let mut api_messages = to_api_messages(messages, self.supports_vision);
-        // 独立 Image 块不能承载 cache_control：从末尾向前回退到最近一个可打
-        // 断点的块（旧实现直接放弃断点，以图片结尾的轮次会丢失缓存写入）。
-        if self.prompt_cache {
-            'breakpoint: for msg in api_messages.iter_mut().rev() {
-                for block in msg.content.iter_mut().rev() {
-                    match block {
-                        ApiContentBlock::Text { cache_control, .. }
-                        | ApiContentBlock::ToolUse { cache_control, .. }
-                        | ApiContentBlock::ToolResult { cache_control, .. } => {
-                            *cache_control = Some(EPHEMERAL);
-                            break 'breakpoint;
-                        }
-                        // Image/Thinking 块不可承载 cache_control，继续向前找
-                        ApiContentBlock::Image { .. }
-                        | ApiContentBlock::Thinking { .. }
-                        | ApiContentBlock::RedactedThinking { .. } => {}
-                    }
-                }
-            }
-        }
-
-        let body = ApiRequest {
-            model: &self.model,
-            max_tokens,
-            system: system_blocks,
-            messages: api_messages,
-            tools: api_tools,
-            stream: true,
-            thinking: thinking_budget.map(|b| ThinkingParam {
-                kind: "enabled",
-                budget_tokens: b,
-            }),
-        };
-        // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
-        let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
-
-        // beta 头：prompt caching 恒开；interleaved thinking 仅在 thinking 开启
-        // 且 adapter 允许时追加——第三方 Anthropic 兼容端点（GLM/MiniMax/Moonshot
-        // 的 /anthropic 路径）默认不发 interleaved-thinking beta header，因为该
-        // header 不在它们的兼容范围内。原生工具（如 computer-use）各自携带
-        // 所需 beta，按需去重追加。
+        // ── 按 cache_active 构建请求体与 beta 头 ──
+        // 做成闭包而不是先建好再改，是因为 400 降级需要一份**完全重建**的
+        // 请求：reqwest 的 RequestBuilder 不可复用，而 cache_control 是
+        // 序列化进 body 的，不是可以事后摘掉的 header。
         let identity = self.identity();
         let interleaved_enabled = thinking_budget.is_some()
             && opts.interleaved
             && should_emit_interleaved_beta(&identity, self.is_official_anthropic_endpoint);
-        let beta_header = collect_beta_header(self.prompt_cache, interleaved_enabled, tools);
+        // 官方端点 beta 与 cache_control 同生共死；第三方即使本次降级重试，
+        // 也不应发 caching beta 头（那正是可能触发 400 的东西）。
+        let send_cache_beta = self.send_cache_beta;
 
-        let url = format!("{}/v1/messages", self.base_url);
-        // 连接前阶段带指数退避重试（429/5xx/连接错误），流未开始消费，重试透明
-        let resp = crate::retry::send_with_retry(
-            &crate::retry::RetryPolicy::default(),
-            "Anthropic",
-            || {
-                let mut req = self
-                    .client
-                    .post(&url)
-                    .header("x-api-key", &self.api_key)
-                    .header("anthropic-version", ANTHROPIC_VERSION)
-                    .header("content-type", "application/json");
-                if let Some(beta) = &beta_header {
-                    req = req.header("anthropic-beta", beta);
+        let build_request = |cache_active: bool| -> Result<(Value, Option<String>)> {
+            let system_blocks = build_system_blocks(system, cache_active);
+
+            let tool_count = tools.len();
+            let api_tools: Vec<Value> = tools
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let cc = (cache_active && tool_count > 0 && i == tool_count - 1)
+                        .then_some(EPHEMERAL);
+                    build_api_tool(t, cc)
+                })
+                .collect();
+
+            // Anthropic 缓存按前缀匹配：把断点放在历史末尾，使「system + tools +
+            // 既有历史」整体被缓存，后续轮次只有新增的 user/assistant 内容按全价。
+            // 注意 breakpoint 总数上限为 4（system 1 + tools 1 + 历史 1 = 3，安全）。
+            let mut api_messages = to_api_messages(messages, self.supports_vision);
+            // 独立 Image 块不能承载 cache_control：从末尾向前回退到最近一个可打
+            // 断点的块（旧实现直接放弃断点，以图片结尾的轮次会丢失缓存写入）。
+            if cache_active {
+                'breakpoint: for msg in api_messages.iter_mut().rev() {
+                    for block in msg.content.iter_mut().rev() {
+                        match block {
+                            ApiContentBlock::Text { cache_control, .. }
+                            | ApiContentBlock::ToolUse { cache_control, .. }
+                            | ApiContentBlock::ToolResult { cache_control, .. } => {
+                                *cache_control = Some(EPHEMERAL);
+                                break 'breakpoint;
+                            }
+                            // Image/Thinking 块不可承载 cache_control，继续向前找
+                            ApiContentBlock::Image { .. }
+                            | ApiContentBlock::Thinking { .. }
+                            | ApiContentBlock::RedactedThinking { .. } => {}
+                        }
+                    }
                 }
-                req.json(&body_value)
-            },
+            }
+
+            let body = ApiRequest {
+                model: &self.model,
+                max_tokens,
+                system: system_blocks,
+                messages: api_messages,
+                tools: api_tools,
+                stream: true,
+                thinking: thinking_budget.map(|b| ThinkingParam {
+                    kind: "enabled",
+                    budget_tokens: b,
+                }),
+            };
+            // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
+            let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
+            let beta =
+                collect_beta_header(cache_active, send_cache_beta, interleaved_enabled, tools);
+            Ok((body_value, beta))
+        };
+
+        let (body_value, beta_header) = build_request(cache_active)?;
+        let url = format!("{}/v1/messages", self.base_url);
+        let policy = crate::retry::RetryPolicy::default();
+        let resp = match send_anthropic_request(
+            &self.client,
+            &self.api_key,
+            &url,
+            &policy,
+            &body_value,
+            beta_header.as_deref(),
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            // 端点不认 cache_control / caching beta 头 → 单调降级并重试一次。
+            // 发生在 SSE 开始之前，尚未产出任何 delta，重放安全。
+            Err(err) => {
+                if !(cache_active && is_cache_rejection(&err)) {
+                    return Err(err);
+                }
+                // compare_exchange 保证并发请求里只有一个执行降级，避免重复告警。
+                if self
+                    .cache_disabled
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    tracing::warn!(
+                        vendor = %self.vendor,
+                        model = %self.model,
+                        base_url = %self.base_url,
+                        "端点拒绝了 prompt cache（cache_control / anthropic-beta），本进程已停用缓存并重试；如需缓存请确认该模型是否支持"
+                    );
+                }
+                let (plain_body, plain_beta) = build_request(false)?;
+                send_anthropic_request(
+                    &self.client,
+                    &self.api_key,
+                    &url,
+                    &policy,
+                    &plain_body,
+                    plain_beta.as_deref(),
+                )
+                .await?
+            }
+        };
 
         let byte_stream = resp.bytes_stream();
         let sse = byte_stream.eventsource();
@@ -886,13 +1011,69 @@ mod tests {
     #[test]
     fn beta_header_appends_native_tool_beta_and_dedupes() {
         let tools = vec![computer_tool_def(), computer_tool_def()];
-        let header = collect_beta_header(true, false, &tools).unwrap();
+        let header = collect_beta_header(true, true, false, &tools).unwrap();
         assert_eq!(header, "prompt-caching-2024-07-31,computer-use-2025-11-24");
     }
 
     #[test]
     fn beta_header_is_none_without_any_beta_source() {
-        assert_eq!(collect_beta_header(false, false, &[]), None);
+        assert_eq!(collect_beta_header(false, true, false, &[]), None);
+    }
+
+    /// 第三方兼容端点开启缓存时**只发 cache_control、不发 caching beta 头**。
+    /// MiniMax / GLM / Kimi 的 /anthropic 路径实现了 cache_control，但对未知
+    /// beta 头直接 400；把两者绑死会让「开启缓存」在第三方上必然失败。
+    #[test]
+    fn third_party_endpoint_sends_cache_control_without_caching_beta() {
+        let header = collect_beta_header(true, false, false, &[]);
+        assert_eq!(header, None, "第三方端点开启缓存不应产生 anthropic-beta 头");
+    }
+
+    /// 但 interleaved-thinking / 原生工具 beta 仍照发——只有 caching beta 被
+    /// 按端点裁掉，不能把整个 header 一起吞掉。
+    #[test]
+    fn third_party_still_sends_unrelated_betas() {
+        let tools = vec![computer_tool_def()];
+        let header = collect_beta_header(true, false, true, &tools).unwrap();
+        assert_eq!(
+            header,
+            "interleaved-thinking-2025-05-14,computer-use-2025-11-24"
+        );
+    }
+
+    /// 400「提示词太长」不是「缓存不支持」。误判会让上下文一满就永久失去缓存，
+    /// 而正确反应是上层强制压缩。
+    #[test]
+    fn context_overflow_400_is_not_a_cache_rejection() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = anyhow::Error::new(crate::error::ProviderError::from_http(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+        ));
+        assert!(!is_cache_rejection(&err));
+    }
+
+    #[test]
+    fn unsupported_parameter_400_triggers_cache_downgrade() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = anyhow::Error::new(crate::error::ProviderError::from_http(
+            reqwest::StatusCode::BAD_REQUEST,
+            &headers,
+            r#"{"error":{"message":"unsupported parameter: anthropic-beta"}}"#,
+        ));
+        assert!(is_cache_rejection(&err));
+    }
+
+    #[test]
+    fn non_400_never_triggers_cache_downgrade() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = anyhow::Error::new(crate::error::ProviderError::from_http(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            r#"{"error":{"message":"unsupported parameter"}}"#,
+        ));
+        assert!(!is_cache_rejection(&err));
     }
 
     // ── system 分段与 prompt cache 断点 ─────────────────────────────────

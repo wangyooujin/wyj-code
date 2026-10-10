@@ -115,6 +115,12 @@ pub struct CommandContext {
     pub cache_read_tokens: u32,
     /// 写入 prompt 缓存的输入 token（1.25x 计费，不含在 input_tokens 内）
     pub cache_write_tokens: u32,
+    /// 本会话累计模型推理次数。`/cost` 用它算「每次调用平均带多少上下文」——
+    /// 调用次数才是 input 消耗的一阶乘数，只看单次 token 数会低估往返成本。
+    pub api_calls: u32,
+    /// 实际生效的 prompt cache 模式，取值见 `wyj_core::prompt_cache_state`。
+    /// 2 = 曾开启但端点 400 已降级，`/cost` 据此解释「为什么缓存是 0」。
+    pub prompt_cache_state: u8,
     pub context_window: u32,
     pub estimated_tokens: u32,
     /// 最近一次模型请求的上下文占用分解。与自动压缩的触发计算**同源**

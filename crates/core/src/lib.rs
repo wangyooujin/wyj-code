@@ -76,7 +76,10 @@ pub use project::{project_key, project_root, same_project};
 pub use secret::{redact_sensitive_text, REDACTED_SECRET};
 pub use session::{RoutingEvent, Session};
 pub use session_runtime::{AgentSessionRuntime, SessionEventEmitter, TurnOutcome};
-pub use session_store::{extract_preview, extract_title, SessionFile, SessionMeta, SessionStore};
+pub use session_store::{
+    extract_preview, extract_title, prompt_cache_state, SessionFile, SessionFileMeta, SessionMeta,
+    SessionStore,
+};
 pub use summary::SummaryGenerator;
 pub use tool::{Tool, ToolResult};
 pub use tool_arguments::{

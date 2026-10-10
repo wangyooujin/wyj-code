@@ -513,6 +513,12 @@ mod tests {
             turns: 1,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            prompt_cache_state: crate::session_store::prompt_cache_state::OFF,
             messages: vec![Message {
                 role: wyj_api::types::Role::User,
                 content: vec![ApiContentBlock::Text {
