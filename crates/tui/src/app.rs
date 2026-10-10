@@ -6376,12 +6376,30 @@ pub struct AppState {
     pub at_browse_dir: PathBuf,
     /// 当前正在执行的操作名（工具调用时为 "ToolName(arg)"，LLM 思考时为 None）
     pub current_op: Option<String>,
+    /// 当前步骤（`current_op`）的开始时刻，用于标题栏显示**这一步**的耗时。
+    ///
+    /// 与 `turn_start_time`（整轮耗时）是两件事：标题栏的耗时贴在某个操作名旁边，
+    /// 语义是"这一步跑了多久"，步骤切换时归零；没有工具在跑（纯思考 / 等权限）
+    /// 时回落到整轮耗时。
+    pub current_op_started: Option<Instant>,
     /// 本轮对话开始时间（用于计算耗时）
     pub turn_start_time: Option<Instant>,
     /// 本轮对话开始时的 input_tokens 快照
     pub turn_start_input_tokens: u32,
     /// 本轮对话开始时的 output_tokens 快照
     pub turn_start_output_tokens: u32,
+    /// 本轮**实时**累计的 input tokens：每个 LLM 请求结束时由 `AgentEvent::UsageDelta`
+    /// 累加（`with_usage_callback` 逐请求回调）。
+    ///
+    /// 为什么不能拿 `total_input_tokens - turn_start_input_tokens` 代替：
+    /// `AgentEvent::Usage` 只在**整轮回合结束**时才推送一次 session 累计值
+    /// （见回合收尾处的 `send(AgentEvent::Usage { input: sess.total_input_tokens, .. })`），
+    /// 回合进行中 `total_*` 一直是回合开始时的旧值 —— 拿它做差，标题栏整个回合都显示
+    /// `0↑ 0↓`，直到回合结束（那时标题栏早已不再显示）。`UsageDelta` 才是真正的
+    /// 实时数据源：它在每个请求的流结束时触发一次。
+    pub turn_live_input_tokens: u32,
+    /// 本轮实时累计的 output tokens（与 `turn_live_input_tokens` 同源同节奏）
+    pub turn_live_output_tokens: u32,
     /// 最近一轮 AI 交互耗时。当前轮运行时由 `turn_start_time` 实时计算，完成后落这里。
     pub last_turn_elapsed_secs: Option<f64>,
     /// 最近一轮 AI 交互输入 token 增量。
@@ -6538,9 +6556,12 @@ impl AppState {
             file_selected: 0,
             at_browse_dir: PathBuf::new(),
             current_op: None,
+            current_op_started: None,
             turn_start_time: None,
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
+            turn_live_input_tokens: 0,
+            turn_live_output_tokens: 0,
             last_turn_elapsed_secs: None,
             last_turn_input_tokens: 0,
             last_turn_output_tokens: 0,
@@ -6586,6 +6607,22 @@ impl AppState {
     ///
     /// 下一轮若确实需要任务板，模型重新调一次 TodoWrite 就会重新出现
     /// （`AgentEvent::TodoUpdate` 负责填 `current_todos`）。
+    /// 记录本轮计时基准：**所有**发起回合的入口都必须走这里（用户消息、排队
+    /// 注入、自动唤醒、slash 命令展开的 prompt、面板"立即运行"等）。
+    ///
+    /// 抽成单一入口的原因：`turn_start_*` 是 session 累计量的基准，而 session 累计
+    /// 只在回合结束时才刷新；少一处复位，标题栏就会把上一轮的 token 差值算进这一轮。
+    /// 与 `begin_new_turn` 分开是因为后者不是每轮都调（如 skill 展开的 prompt 路径）。
+    fn begin_turn_timing(&mut self) {
+        self.turn_start_time = Some(Instant::now());
+        self.turn_start_input_tokens = self.total_input_tokens;
+        self.turn_start_output_tokens = self.total_output_tokens;
+        // 实时计数器归零：它靠 UsageDelta 逐请求累加，跨轮不清零会把上一轮
+        // 的开销带进新一轮标题栏（表现为"刚发消息就显示几万 token"）。
+        self.turn_live_input_tokens = 0;
+        self.turn_live_output_tokens = 0;
+    }
+
     fn begin_new_turn(&mut self) {
         self.current_todos = None;
         self.todo_panel_expanded = false;
@@ -6641,9 +6678,12 @@ impl AppState {
         self.extensions_dialog = None;
         self.pending_attachments.clear();
         self.current_op = None;
+        self.current_op_started = None;
         self.turn_start_time = None;
         self.turn_start_input_tokens = 0;
         self.turn_start_output_tokens = 0;
+        self.turn_live_input_tokens = 0;
+        self.turn_live_output_tokens = 0;
         self.last_turn_elapsed_secs = None;
         self.last_turn_input_tokens = 0;
         self.last_turn_output_tokens = 0;
@@ -7579,6 +7619,9 @@ impl AppState {
                     format!("{name}({arg})")
                 };
                 self.current_op = Some(display.clone());
+                // 步骤计时起点：并发多个工具时后到的 ToolStart 会覆盖成最后一个，
+                // 与 `current_op` 保持同一口径（标题栏只展示"最近开始的那一步"）。
+                self.current_op_started = Some(Instant::now());
                 self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
                 if !is_todo {
@@ -7596,6 +7639,7 @@ impl AppState {
                 elapsed_secs,
             } => {
                 self.current_op = None;
+                self.current_op_started = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
                 // ToolStart 已跳过 TodoWrite 的常规行，这里对称地跳过它的回执。
                 // 不能只依赖"call_idx 找不到配对"来自然落空——那样会走
@@ -7659,6 +7703,7 @@ impl AppState {
                 self.flush_streaming();
                 self.is_thinking = false;
                 self.current_op = None;
+                self.current_op_started = None;
                 self.turns += 1;
                 self.save_needed = true;
                 self.injector = None;
@@ -7761,6 +7806,13 @@ impl AppState {
                 input_tokens,
                 output_tokens,
             } => {
+                // 逐请求累加成本轮实时用量（标题栏 `title_token_text` 消费）。
+                // saturating_add：极端长会话下 u32 溢出在 debug 构建会 panic，
+                // 而这里只是展示，饱和截断完全可接受。
+                self.turn_live_input_tokens =
+                    self.turn_live_input_tokens.saturating_add(input_tokens);
+                self.turn_live_output_tokens =
+                    self.turn_live_output_tokens.saturating_add(output_tokens);
                 let active_ids: Vec<String> = self
                     .current_todos
                     .as_deref()
@@ -10284,9 +10336,7 @@ async fn tui_main(
             state.begin_new_turn();
             state.is_thinking = true;
             state.spinner_frame = 0;
-            state.turn_start_time = Some(Instant::now());
-            state.turn_start_input_tokens = state.total_input_tokens;
-            state.turn_start_output_tokens = state.total_output_tokens;
+            state.begin_turn_timing();
             let agent_c = shared_agent.read().unwrap().clone();
             let (handle, injector) = spawn_agent_turn(
                 None, // 自动唤醒：reminder 本身即这一轮唯一 user 输入
@@ -10326,9 +10376,7 @@ async fn tui_main(
             state.begin_new_turn();
             state.is_thinking = true;
             state.spinner_frame = 0;
-            state.turn_start_time = Some(Instant::now());
-            state.turn_start_input_tokens = state.total_input_tokens;
-            state.turn_start_output_tokens = state.total_output_tokens;
+            state.begin_turn_timing();
             let agent_c = shared_agent.read().unwrap().clone();
             let (handle, injector) = spawn_agent_turn(
                 Some(combined_text),
@@ -12769,9 +12817,7 @@ async fn tui_main(
                                     state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
-                                    state.turn_start_time = Some(Instant::now());
-                                    state.turn_start_input_tokens = state.total_input_tokens;
-                                    state.turn_start_output_tokens = state.total_output_tokens;
+                                    state.begin_turn_timing();
                                     let agent_c = shared_agent.read().unwrap().clone();
                                     let (handle, injector) = spawn_agent_turn(
                                         Some(dlg.pending_message),
@@ -12800,9 +12846,7 @@ async fn tui_main(
                                     state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
-                                    state.turn_start_time = Some(Instant::now());
-                                    state.turn_start_input_tokens = state.total_input_tokens;
-                                    state.turn_start_output_tokens = state.total_output_tokens;
+                                    state.begin_turn_timing();
                                     let agent_c = shared_agent.read().unwrap().clone();
                                     let (handle, injector) = spawn_agent_turn(
                                         Some(dlg.pending_message),
@@ -13928,9 +13972,7 @@ async fn tui_main(
                                         state.push_user(prompt.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
-                                        state.turn_start_time = Some(Instant::now());
-                                        state.turn_start_input_tokens = state.total_input_tokens;
-                                        state.turn_start_output_tokens = state.total_output_tokens;
+                                        state.begin_turn_timing();
 
                                         let agent_c = shared_agent.read().unwrap().clone();
                                         let session_c = session.clone();
@@ -14014,9 +14056,7 @@ async fn tui_main(
                                         state.push_user(text.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
-                                        state.turn_start_time = Some(Instant::now());
-                                        state.turn_start_input_tokens = state.total_input_tokens;
-                                        state.turn_start_output_tokens = state.total_output_tokens;
+                                        state.begin_turn_timing();
 
                                         let agent_c = if let Some(profile_name) = profile {
                                             let mut scoped_cfg = state.config.clone();
@@ -14423,9 +14463,7 @@ async fn tui_main(
                                     state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
-                                    state.turn_start_time = Some(Instant::now());
-                                    state.turn_start_input_tokens = state.total_input_tokens;
-                                    state.turn_start_output_tokens = state.total_output_tokens;
+                                    state.begin_turn_timing();
 
                                     // 捕获并清空附件列表（移入 async task）
                                     let attachments =
@@ -15612,6 +15650,32 @@ mod todo_stats_tests {
     #[test]
     fn split_evenly_n_one_gets_all() {
         assert_eq!(split_evenly(7, 1), vec![7]);
+    }
+
+    /// 标题栏的实时 token 必须逐请求累加（UsageDelta 是回合进行中唯一的用量信号），
+    /// 且新一轮开始时归零——否则"刚发一条消息就显示上一轮几万 token"。
+    #[test]
+    fn usage_delta_accumulates_this_turn_and_resets_on_next_turn() {
+        let mut state = make_state();
+        state.begin_turn_timing();
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 40,
+        });
+        state.apply_agent_event(AgentEvent::UsageDelta {
+            input_tokens: 2_000,
+            output_tokens: 60,
+        });
+        assert_eq!(state.turn_live_input_tokens, 3_000);
+        assert_eq!(state.turn_live_output_tokens, 100);
+
+        // 下一轮：实时计数器归零，但 session 累计不受影响。
+        state.total_input_tokens = 50_000;
+        state.begin_turn_timing();
+        assert_eq!(state.turn_live_input_tokens, 0);
+        assert_eq!(state.turn_live_output_tokens, 0);
+        assert_eq!(state.turn_start_input_tokens, 50_000);
+        assert!(state.turn_start_time.is_some());
     }
 
     #[test]
