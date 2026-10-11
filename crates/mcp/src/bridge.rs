@@ -26,6 +26,44 @@ type McpHandle = RunningService<RoleClient, ClientInfo>;
 /// `tokio::time::timeout` 包一层，避免某个 server 卡住/无响应无限拖慢调用方。
 pub const MCP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// 单次 MCP 工具调用的超时上限。
+///
+/// `MCP_CONNECT_TIMEOUT` 只管「连上 + 发现工具」，**不管 `call_tool`**：
+/// server 接受请求后不返回结果（自己内部卡死、或它转发给的某个 HTTP 服务
+/// 挂住）时，`call_tool` 会无限期 await。
+///
+/// 危害有两层，一层比一层隐蔽：
+/// 1. turn task 永不返回 → `is_thinking` 永久为 true → 用户后续输入全部
+///    滞留 `pending_queue` 无人排空（详见 `api::stream_guard` 模块文档描述的
+///    同一条死锁链，只是触发点从「LLM 流 hang」换成了「工具 hang」）。
+/// 2. 本函数持有 `self.client` 这把 `tokio::sync::Mutex`；hang 期间锁不放，
+///    **同一 server 的所有后续调用全部排队等一把永远不会开的锁**。
+///
+/// 默认 120s：远大于本地 stdio server 的正常调用耗时，又不至于让 UI
+/// 无限期无反馈。可用 `WYJ_CODE_MCP_CALL_SECS` 覆盖（0 = 关闭）。
+pub const MCP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 实际生效的 MCP 调用超时（首次调用时解析环境变量，之后固定）。
+pub fn mcp_call_timeout() -> std::time::Duration {
+    static CALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *CALL.get_or_init(|| {
+        let Some(raw) = std::env::var("WYJ_CODE_MCP_CALL_SECS").ok() else {
+            return MCP_CALL_TIMEOUT;
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(0) => std::time::Duration::MAX,
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "WYJ_CODE_MCP_CALL_SECS 不是合法秒数，回退到默认值"
+                );
+                MCP_CALL_TIMEOUT
+            }
+        }
+    })
+}
+
 /// `-p`（单次问答）模式下等待 MCP server 连接的宽限期，远小于
 /// `MCP_CONNECT_TIMEOUT`。`-p` 是真正的单轮、进程跑完即退出，没有 TUI/
 /// `--headless` REPL 那种"后台连完之后还有很多轮对话可以补挂工具"的空间，
@@ -59,11 +97,27 @@ impl Tool for McpBridgeTool {
         };
         let params = CallToolRequestParams::new(self.remote_tool_name.clone()).with_arguments(args);
 
-        let guard = self.client.lock().await;
-        let result = guard
-            .call_tool(params)
-            .await
-            .map_err(|e| anyhow::anyhow!("MCP 工具调用失败: {e}"))?;
+        // 取锁与调用包在同一个 timeout 里：锁的等待同样需要上界。只给
+        // `call_tool` 单独加超时是不够的——前一次调用若已 hang 并持锁，
+        // 后面的调用会永远卡在 `lock()` 上，根本走不到自己的超时。
+        let timeout = mcp_call_timeout();
+        let outcome = tokio::time::timeout(timeout, async {
+            let guard = self.client.lock().await;
+            guard.call_tool(params).await
+        })
+        .await;
+
+        let result = match outcome {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("MCP 工具调用失败: {e}")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "MCP 工具调用超时（{}s 无响应）: {}",
+                    timeout.as_secs(),
+                    self.remote_tool_name
+                ));
+            }
+        };
 
         let text = result
             .content

@@ -67,6 +67,22 @@ pub fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
     Duration::from_millis(jittered.max(0) as u64)
 }
 
+/// 请求头等待超时。`connect_timeout` 只覆盖到 TCP+TLS 握手完成；握手之后
+/// 到响应头返回之间（服务端接受连接但迟迟不响应）此前是**无期限**的，
+/// 而 `with_idle_timeout` 包的是 `bytes_stream()`，此时尚未生效。
+pub const HEADER_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// 读错误响应体，带上限。正文只用于填充错误 message，拿不到就降级为空串。
+async fn read_body_with_timeout(resp: reqwest::Response) -> String {
+    match tokio::time::timeout(HEADER_TIMEOUT, resp.text()).await {
+        Ok(body) => body.unwrap_or_default(),
+        Err(_) => {
+            tracing::warn!("读取错误响应体超时，降级为空正文");
+            String::new()
+        }
+    }
+}
+
 /// 带重试地发送请求并校验状态码。`build` 每次调用须返回等价的新
 /// RequestBuilder（reqwest 的 builder 不可复用）。返回已确认 2xx 的响应，
 /// 流的后续消费错误不在此层处理。
@@ -77,7 +93,27 @@ pub async fn send_with_retry(
 ) -> Result<reqwest::Response> {
     let mut attempt: u32 = 0;
     loop {
-        let send_result = build().send().await;
+        // 超时按连接层错误处理，走同一套可重试退避。
+        let send_result = match tokio::time::timeout(HEADER_TIMEOUT, build().send()).await {
+            Ok(result) => result,
+            Err(_) => {
+                let can_retry = attempt < policy.max_retries;
+                if !can_retry {
+                    return Err(anyhow::anyhow!(
+                        "provider `{provider_name}` 请求头等待超时（{}s 无响应）",
+                        HEADER_TIMEOUT.as_secs()
+                    ));
+                }
+                let delay = backoff_delay(policy, attempt);
+                tracing::warn!(
+                    "{provider_name} 请求头超时（第 {} 次尝试），{delay:?} 后重试",
+                    attempt + 1
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+        };
         let can_retry = attempt < policy.max_retries;
 
         match send_result {
@@ -103,7 +139,10 @@ pub async fn send_with_retry(
                 let retryable = is_retryable_status(status.as_u16());
                 if !retryable || !can_retry {
                     let headers = resp.headers().clone();
-                    let err = resp.text().await.unwrap_or_default();
+                    // 读错误响应体同样不能无期限等：服务端可能只发了状态码和
+                    // 头就保持连接不关。错误正文拿不到不影响判定（下面只用它
+                    // 填 message），直接降级为空串。
+                    let err = read_body_with_timeout(resp).await;
                     return Err(anyhow::Error::new(crate::error::ProviderError::from_http(
                         status, &headers, &err,
                     )));
@@ -112,7 +151,7 @@ pub async fn send_with_retry(
                 let delay = match parse_retry_after(resp.headers()) {
                     Some(ra) if ra > policy.retry_after_cap => {
                         let headers = resp.headers().clone();
-                        let err = resp.text().await.unwrap_or_default();
+                        let err = read_body_with_timeout(resp).await;
                         let mut provider_error =
                             crate::error::ProviderError::from_http(status, &headers, &err);
                         provider_error.redacted_message = format!(
