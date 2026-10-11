@@ -446,6 +446,34 @@ fn normalize_vendor(vendor: &str) -> &'static str {
     }
 }
 
+/// 该 endpoint 是否接受 `reasoning_effort` 档位（不关心具体档位值）。
+///
+/// 唯一判据是 `ThinkingSpec::for_vendor(..).effort_levels`。`ModelCapabilities`
+/// 里的 `ThinkingMode` 是**单值**标签（Qwen 同时支持 budget 与 effort，标签只能
+/// 记一个），拿它判 effort 会同时产生两类错误：Qwen 被误判成"不支持 effort"，
+/// GLM / Ollama / Moonshot k2 被误判成"支持 effort"。
+pub fn supports_effort(identity: &ModelIdentity) -> bool {
+    !ThinkingSpec::for_vendor(&identity.vendor, &identity.wire_protocol, &identity.model)
+        .effort_levels
+        .is_empty()
+}
+
+/// 把用户填的 effort 字符串收敛成该 vendor 真正支持的档位。
+///
+/// 返回 `None` 的两种情况都代表**不能上送**：vendor 整体不支持 effort，或这个
+/// 具体档位不在 `effort_levels` 内（如给 DeepSeek 填 `xhigh`）。调用方应把它
+/// 记成 `dropped_parameter`，不能静默丢弃。
+///
+/// catalog / agent 层 / provider 序列化 body 三处共用这一个判据，避免
+/// "catalog 说支持、adapter 悄悄丢掉"这种自相矛盾。
+pub fn normalize_effort(identity: &ModelIdentity, raw: &str) -> Option<&'static str> {
+    let spec = ThinkingSpec::for_vendor(&identity.vendor, &identity.wire_protocol, &identity.model);
+    let parsed = ReasoningEffort::parse(raw)?;
+    spec.effort_levels
+        .contains(&parsed)
+        .then_some(parsed.as_str())
+}
+
 // ── ThinkingAdapter trait + dispatch ─────────────────────────────────────────
 
 /// 各 vendor 的 thinking 应用策略。`&'static` 实例，dispatch 时零分配。
@@ -484,6 +512,7 @@ pub fn adapter_for(identity: &ModelIdentity) -> &'static dyn ThinkingAdapter {
             }
         }
         (WireProtocol::OpenAiChatCompletions, "ollama") => &OllamaOpenAiAdapter,
+        (WireProtocol::OpenAiChatCompletions, "vllm") => &VllmOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, _) => &GenericOpenAiAdapter,
         _ => &GenericOpenAiAdapter,
     }
@@ -538,8 +567,10 @@ impl ThinkingAdapter for DeepSeekOpenAiAdapter {
                 Value::String(effort.as_str().to_string()),
             );
         }
-        // DeepSeek 启用 thinking 后 temperature 等被忽略，主动移除避免歧义
-        if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
+        // DeepSeek 启用 thinking 后 temperature 等被忽略，主动移除避免歧义。
+        // 判据用 `effective_switch_enabled` 而非"有没有 budget/effort"：档位被
+        // 丢弃后 thinking 仍然是开着的（降级成 `thinking.type=enabled`）。
+        if effective_switch_enabled(opts).unwrap_or(false) {
             body.remove("temperature");
             body.remove("top_p");
         }
@@ -587,8 +618,8 @@ impl ThinkingAdapter for ZhipuOpenAiAdapter {
         if let Some(switch_type) = effective_switch_type(opts, "enabled") {
             body.insert("thinking".to_string(), json!({ "type": switch_type }));
         }
-        if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
-            // GLM 启用 thinking 后 temperature/top_p 被忽略，主动移除
+        // GLM 启用 thinking 后 temperature/top_p 被忽略，主动移除
+        if effective_switch_enabled(opts).unwrap_or(false) {
             body.remove("temperature");
             body.remove("top_p");
         }
@@ -702,8 +733,34 @@ struct OllamaOpenAiAdapter;
 
 impl ThinkingAdapter for OllamaOpenAiAdapter {
     fn apply_openai(&self, body: &mut Map<String, Value>, opts: &RequestOptions) {
-        if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
+        if effective_switch_enabled(opts).unwrap_or(false) {
             body.insert("think".to_string(), Value::Bool(true));
+        }
+    }
+
+    fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
+        false
+    }
+}
+
+/// vLLM：`chat_template_kwargs.enable_thinking`。
+///
+/// vLLM 没有 vendor 私有的顶层 thinking 字段，开思考靠把开关传给 chat
+/// template（`chat_template_kwargs`）——这正是 vLLM 文档给 Qwen3 系模型的做法。
+/// 注意 `reasoning_effort` 在 vLLM 里只是透传给 template 的一个变量名，各家
+/// 模板并不都消费它，所以 `vllm()` spec 的 `effort_levels` 保持为空：用户填的
+/// effort 会被 `normalize_effort` 记成 dropped_parameter，而不是发一个大概率被
+/// 忽略的字段。
+struct VllmOpenAiAdapter;
+
+impl ThinkingAdapter for VllmOpenAiAdapter {
+    fn apply_openai(&self, body: &mut Map<String, Value>, opts: &RequestOptions) {
+        // 与 `effective_switch_type` 同语义，但 vLLM 的取值是 bool 而非字符串。
+        if effective_switch_enabled(opts).unwrap_or(false) {
+            body.insert(
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": true }),
+            );
         }
     }
 
@@ -751,6 +808,22 @@ fn effective_switch_type(opts: &RequestOptions, default: &str) -> Option<String>
     }
 }
 
+/// `effective_switch_type` 的布尔版本，供只认开/关（不认档位）的 vendor 使用：
+/// Ollama `think` / vLLM `chat_template_kwargs.enable_thinking`。
+/// 返回 `None` 表示"用户没说"，此时不写任何字段。
+fn effective_switch_enabled(opts: &RequestOptions) -> Option<bool> {
+    if let Some(explicit) = opts.thinking_switch.as_deref() {
+        return Some(!matches!(
+            explicit.trim().to_ascii_lowercase().as_str(),
+            "disabled" | "false"
+        ));
+    }
+    if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
+        return Some(true);
+    }
+    None
+}
+
 /// OpenAI provider 调用的统一入口。在 `OpenAIProvider::stream` 序列化 body 后调用。
 /// 当 `ThinkingSpec::for_vendor(...).control == Disabled` 时直接返回，不改 body
 /// （generic 与不支持的 vendor 都不会自作主张塞 thinking 字段）。
@@ -764,7 +837,20 @@ pub fn apply_thinking_to_openai_body(
         return;
     }
     let adapter = adapter_for(identity);
-    adapter.apply_openai(body, opts);
+    // effort 在这里收敛一次：不在 `spec.effort_levels` 内的档位（含 vendor 整体
+    // 不支持 effort 的情况）不进 body。adapter 因此可以放心地"收到即写入"，
+    // 不会再出现 catalog 说支持、adapter 悄悄丢掉的半吊子状态。
+    let mut sanitized = opts.clone();
+    if let Some(raw) = opts.reasoning_effort.as_deref() {
+        sanitized.reasoning_effort = normalize_effort(identity, raw).map(str::to_string);
+        // 档位发不出去 ≠ 不思考。GLM / Ollama / Moonshot k2 / vLLM 这些只认开关的
+        // vendor，用户填 effort 的意图就是"开思考"——退化成 `thinking.type=enabled`
+        // 才不会让思考凭空消失（丢弃档位这件事本身记在 `dropped_parameter` 里）。
+        if sanitized.reasoning_effort.is_none() && sanitized.thinking_switch.is_none() {
+            sanitized.thinking_switch = Some("enabled".to_string());
+        }
+    }
+    adapter.apply_openai(body, &sanitized);
 }
 
 /// Anthropic provider 调用的统一入口。返回是否发 `interleaved-thinking-2025-05-14` beta。
@@ -787,6 +873,123 @@ mod tests {
             base_url: "https://example.com".to_string(),
             wire_protocol: wire,
         }
+    }
+
+    #[test]
+    fn normalize_effort_respects_per_vendor_levels() {
+        let deepseek = identity(
+            "deepseek",
+            WireProtocol::OpenAiChatCompletions,
+            "deepseek-v4-pro",
+        );
+        assert_eq!(normalize_effort(&deepseek, " High "), Some("high"));
+        // DeepSeek 只认 low/medium/high/max：xhigh / adaptive 发出去就是 400。
+        assert_eq!(normalize_effort(&deepseek, "xhigh"), None);
+        assert_eq!(normalize_effort(&deepseek, "adaptive"), None);
+
+        let qwen = identity(
+            "alibaba",
+            WireProtocol::OpenAiChatCompletions,
+            "qwen3-coder-plus",
+        );
+        assert_eq!(normalize_effort(&qwen, "xhigh"), Some("xhigh"));
+
+        let k3 = identity("moonshot", WireProtocol::OpenAiChatCompletions, "kimi-k3");
+        assert_eq!(normalize_effort(&k3, "high"), Some("high"));
+        assert_eq!(normalize_effort(&k3, "medium"), None);
+
+        // 只认开关的 vendor 一律不收 effort。
+        for (vendor, model) in [
+            ("zhipu", "glm-4.6"),
+            ("volcengine", "doubao-seed-code"),
+            ("ollama", "qwen3-think"),
+            ("vllm", "deepseek-r1-distill-reasoning"),
+            ("moonshot", "kimi-k2.5"),
+            ("minimax", "MiniMax-M2"),
+        ] {
+            let id = identity(vendor, WireProtocol::OpenAiChatCompletions, model);
+            assert!(!supports_effort(&id), "{vendor}/{model} 不该支持 effort");
+            assert_eq!(normalize_effort(&id, "high"), None);
+        }
+
+        assert!(supports_effort(&deepseek));
+        assert!(supports_effort(&qwen));
+        assert!(supports_effort(&k3));
+        assert!(supports_effort(&identity(
+            "minimax",
+            WireProtocol::OpenAiChatCompletions,
+            "MiniMax-M3"
+        )));
+    }
+
+    /// 不在 `effort_levels` 内的档位不能进 body——用户填错时是"不发"，
+    /// 而不是让服务端回 400。
+    #[test]
+    fn unsupported_effort_level_never_reaches_body() {
+        let id = identity(
+            "deepseek",
+            WireProtocol::OpenAiChatCompletions,
+            "deepseek-v4-pro",
+        );
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("xhigh".to_string()),
+            ..Default::default()
+        };
+        apply_thinking_to_openai_body(&id, &mut body, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("reasoning_effort").is_none(), "{body:?}");
+    }
+
+    /// vLLM 此前没有 adapter 分支，用户配的 thinking 开关被 Generic 兜底静默丢掉。
+    /// 它认的是 `chat_template_kwargs.enable_thinking`。
+    #[test]
+    fn vllm_thinking_goes_through_chat_template_kwargs() {
+        let id = identity(
+            "vllm",
+            WireProtocol::OpenAiChatCompletions,
+            "deepseek-r1-distill-reasoning",
+        );
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        apply_thinking_to_openai_body(&id, &mut body, &opts);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            thinking_switch: Some("disabled".to_string()),
+            ..Default::default()
+        };
+        apply_thinking_to_openai_body(&id, &mut body, &opts);
+        assert!(body.is_empty(), "显式关闭时不应留下任何字段: {body:?}");
+
+        // 非 reasoning 模型：control = Disabled，body 完全不动。
+        let plain = identity("vllm", WireProtocol::OpenAiChatCompletions, "qwen3");
+        let mut body = Map::new();
+        apply_thinking_to_openai_body(&plain, &mut body, &opts);
+        assert!(body.is_empty());
+    }
+
+    /// Moonshot k2.5 不认顶层 `reasoning_effort`（只认 `thinking.type`）：
+    /// 档位必须在这里就被挡掉，不能等 adapter 分支二选一。
+    #[test]
+    fn moonshot_k2_effort_falls_back_to_switch_only() {
+        let id = identity("moonshot", WireProtocol::OpenAiChatCompletions, "kimi-k2.5");
+        let mut body = Map::new();
+        let opts = RequestOptions {
+            max_tokens: 1024,
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        apply_thinking_to_openai_body(&id, &mut body, &opts);
+        assert!(body.get("reasoning_effort").is_none(), "{body:?}");
+        assert_eq!(body["thinking"]["type"], "enabled");
     }
 
     #[test]

@@ -58,6 +58,12 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "ContextRecall",
     "Agent",
     "ExitPlanMode",
+    // TodoWrite 由 `[tools].todo_enabled` 门控（默认关），用户显式打开后
+    // **必须**常驻：它是纯状态写入、不碰文件系统，但 schema 一旦被 lazy 折叠，
+    // 模型就完全不知道这个工具存在 —— 配置只管「注册」，管不到「可见」，
+    // 表现为「配了 todo_enabled = true 但任务列表面板永远不出现」。
+    // 未注册时不产生 schema，因此列在这里对只读子 Agent / Plan 模式同样无副作用。
+    "TodoWrite",
     // COMPUTER_USE_HINT 要求模型直接从稳定窗口发现开始，再走后台动作。
     // 如果这三个 schema 被 ToolSearch 隐藏，国内模型可能把“当前不可见”误判为
     // “本会话未注册”，从而在没有发起任何工具调用时直接拒绝 GUI 任务。
@@ -1126,19 +1132,41 @@ impl Agent {
                         request_system_volatile.push_str(suffix);
                     }
                 }
+                // effort 能不能上送由 `wyj_api::normalize_effort` 单独裁决：它查的是
+                // vendor 的 `effort_levels`，不是 `ModelCapabilities` 里那个**单值**
+                // `ThinkingMode` 标签——后者既记不下 Qwen 这种 budget/effort 都认的
+                // vendor，又会把 GLM / Ollama / Moonshot k2 这类只认开关的误标成
+                // "支持 effort"，然后在 adapter 里被无声吞掉。
+                let route_identity = wyj_api::ModelIdentity {
+                    vendor: route.vendor.clone(),
+                    model: route.model.clone(),
+                    base_url: wyj_api::capabilities::sanitized_base_url(&route.base_url),
+                    wire_protocol: route.wire_protocol.clone(),
+                };
+                let reasoning_effort = route
+                    .reasoning_effort
+                    .as_deref()
+                    .and_then(|effort| wyj_api::normalize_effort(&route_identity, effort))
+                    .map(str::to_string);
                 let opts = if let Some(capabilities) = &route.capabilities {
+                    // 能力快照可能已经把 thinking 整体禁掉（用户 override，或上一次
+                    // 端点 4xx 被 `CapabilityCache` 记成 rejected）。端点已经亲口说过
+                    // 不认，这时静态 spec 不作数。
+                    let blocked = matches!(
+                        capabilities.thinking.value,
+                        wyj_api::ThinkingMode::Unsupported | wyj_api::ThinkingMode::ProviderNative
+                    );
                     wyj_api::provider::RequestOptions {
                         max_tokens: route.max_tokens.min(capabilities.max_output_tokens),
                         thinking_budget: route.thinking_budget.filter(|_| {
-                            matches!(
-                                capabilities.thinking.value,
-                                wyj_api::ThinkingMode::BudgetTokens
-                            )
+                            !blocked
+                                && matches!(
+                                    capabilities.thinking.value,
+                                    wyj_api::ThinkingMode::BudgetTokens
+                                )
                         }),
-                        reasoning_effort: route.reasoning_effort.clone().filter(|_| {
-                            matches!(capabilities.thinking.value, wyj_api::ThinkingMode::Effort)
-                        }),
-                        thinking_switch: route.thinking_switch.clone(),
+                        reasoning_effort: reasoning_effort.filter(|_| !blocked),
+                        thinking_switch: route.thinking_switch.clone().filter(|_| !blocked),
                         interleaved: route.interleaved_thinking
                             && capabilities.interleaved_thinking.value,
                     }
@@ -1146,7 +1174,7 @@ impl Agent {
                     wyj_api::provider::RequestOptions {
                         max_tokens: route.max_tokens,
                         thinking_budget: route.thinking_budget,
-                        reasoning_effort: route.reasoning_effort.clone(),
+                        reasoning_effort,
                         thinking_switch: route.thinking_switch.clone(),
                         interleaved: route.interleaved_thinking,
                     }
@@ -1369,15 +1397,19 @@ impl Agent {
                                 })
                                 .and_then(|provider_error| provider_error.parameter.as_deref())
                                 .filter(|parameter| {
-                                    matches!(
-                                        *parameter,
-                                        "thinking" | "thinking_budget" | "interleaved_thinking"
-                                    )
+                                    // 各家报错的 param 名字并不统一（`reasoning_effort` /
+                                    // `reasoning` / `thinking.type` / `enable_thinking` …），
+                                    // 只要落在 thinking 家族就整体降级：只撤 budget 却留着
+                                    // effort/switch，重试仍会 400，而 400 只会再来一次。
+                                    let lower = parameter.to_ascii_lowercase();
+                                    lower.contains("thinking") || lower.contains("reasoning")
                                 });
                             if !parameter_degraded && safe_parameter.is_some() {
                                 let parameter = safe_parameter.unwrap_or("thinking");
                                 parameter_degraded = true;
                                 effective_opts.thinking_budget = None;
+                                effective_opts.reasoning_effort = None;
+                                effective_opts.thinking_switch = None;
                                 effective_opts.interleaved = false;
                                 on_text(&wyj_i18n::tr_fmt(
                                     "agent.degraded.parameter_removed",
@@ -2583,6 +2615,7 @@ mod tests {
         TaskStatus, TaskStep,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// `soft_threshold_tokens` 的测试用最小 `ContextEditCfg`。CAS 指向临时目录，
     /// 这些断言只关心阈值计算本身，不触发真实外部化。
@@ -3638,6 +3671,141 @@ mod tests {
             .unwrap();
         // i18n: agent.degraded.parameter_removed。中文翻译：模型端点不支持参数 `{name}`，已安全移除后重试一次
         let msg = wyj_i18n::tr_fmt("agent.degraded.parameter_removed", &[("name", "thinking")]);
+        assert!(visible.contains(&msg), "expected {msg:?} in {visible:?}");
+        assert_eq!(session.api_calls, 2);
+    }
+
+    /// 只认 `reasoning_effort` 的端点（DeepSeek）：profile → route → RequestOptions
+    /// 必须一路带到底。中间任何一环漏掉，用户看到的都是"思考开着、档位没生效"，
+    /// 而且没有任何报错——这正是本次修复前 `with_reasoning_effort` 零调用点的后果。
+    struct EffortRecordingProvider {
+        seen: Arc<Mutex<Option<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for EffortRecordingProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            *self.seen.lock().unwrap() = Some(opts.reasoning_effort.clone());
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ])))
+        }
+    }
+
+    async fn effort_seen_by_provider(
+        vendor: &str,
+        model: &str,
+        effort: &str,
+    ) -> Option<Option<String>> {
+        let seen: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
+        let agent = Agent::new(Arc::new(EffortRecordingProvider {
+            seen: Arc::clone(&seen),
+        }))
+        .with_route_identity("test".to_string(), vendor.to_string(), model.to_string())
+        .with_reasoning_effort(Some(effort.to_string()));
+        let mut session = Session::new();
+        session.push_user("hi");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+        let snapshot = seen.lock().unwrap().clone();
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_reaches_request_options() {
+        assert_eq!(
+            effort_seen_by_provider("deepseek", "deepseek-v4-pro", "high").await,
+            Some(Some("high".to_string()))
+        );
+    }
+
+    /// 档位不在该 vendor 的 `effort_levels` 内（DeepSeek 没有 xhigh）时不能发出去——
+    /// 发了就是 400。
+    #[tokio::test]
+    async fn effort_outside_vendor_levels_is_not_sent() {
+        assert_eq!(
+            effort_seen_by_provider("deepseek", "deepseek-v4-pro", "xhigh").await,
+            Some(None)
+        );
+    }
+
+    /// 只认开关不认档位的 vendor（GLM）：catalog 曾把它标成 `ThinkingMode::Effort`，
+    /// 现在必须按 spec 丢弃而不是"发出去再被 adapter 吞掉"。
+    #[tokio::test]
+    async fn switch_only_vendor_does_not_receive_effort() {
+        assert_eq!(
+            effort_seen_by_provider("zhipu", "glm-4.6", "high").await,
+            Some(None)
+        );
+    }
+
+    /// 端点回 4xx 说不认 `reasoning_effort` 时，降级必须把它一起撤掉——只撤 budget
+    /// 的话重试仍会带上 effort、再 400 一次，然后整个 turn 失败。
+    #[tokio::test]
+    async fn rejected_effort_parameter_is_removed_and_reported() {
+        struct EffortRejectedThenOk {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl Provider for EffortRejectedThenOk {
+            async fn stream(
+                &self,
+                _system: &wyj_api::SystemPrompt<'_>,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<EventStream> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut error = wyj_api::ProviderError::new(
+                        wyj_api::ProviderErrorKind::UnsupportedParameter,
+                        "unsupported parameter reasoning_effort",
+                    );
+                    error.parameter = Some("reasoning_effort".to_string());
+                    return Err(anyhow::Error::new(error));
+                }
+                assert_eq!(opts.reasoning_effort, None);
+                assert_eq!(opts.thinking_switch, None);
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("ok".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ])))
+            }
+        }
+
+        let agent = Agent::new(Arc::new(EffortRejectedThenOk {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_route_identity(
+            "deepseek".to_string(),
+            "deepseek".to_string(),
+            "deepseek-v4-pro".to_string(),
+        )
+        .with_reasoning_effort(Some("high".to_string()))
+        .with_thinking_switch(Some("enabled".to_string()));
+        let mut session = Session::new();
+        session.push_user("hi");
+        let mut visible = String::new();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+            .await
+            .unwrap();
+        let msg = wyj_i18n::tr_fmt(
+            "agent.degraded.parameter_removed",
+            &[("name", "reasoning_effort")],
+        );
         assert!(visible.contains(&msg), "expected {msg:?} in {visible:?}");
         assert_eq!(session.api_calls, 2);
     }

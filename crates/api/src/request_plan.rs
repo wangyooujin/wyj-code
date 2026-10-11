@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::ModelIdentity;
+use crate::thinking::{normalize_effort, ThinkingSpec};
 use crate::{ModelCapabilities, ModelCatalog, PromptCacheMode, ThinkingMode};
 use wyj_config::Profile;
 
@@ -62,32 +63,57 @@ impl RequestPlan {
         profile: &Profile,
     ) -> Self {
         let mut dropped_parameters = Vec::new();
+        // 能力快照可能已经把整个 thinking 关掉（用户 override，或上一次端点 4xx 被
+        // `CapabilityCache` 记成 rejected）。这时的优先级高于静态 spec——端点已经
+        // 亲口说过不认，不能再发一次试错。
+        let blocked = matches!(
+            capabilities.thinking.value,
+            ThinkingMode::Unsupported | ThinkingMode::ProviderNative
+        );
+        let spec = ThinkingSpec::for_vendor(&model.vendor, &model.wire_protocol, &model.model);
         // 优先级：profile.thinking_budget > profile.effective_reasoning_effort > Disabled
         // （OpenAI-vendor 的 effort 与 Anthropic 协议的 budget 是两种 reasoning）
         let budget = profile.thinking_budget.filter(|budget| *budget > 0);
         let effort = profile.effective_reasoning_effort();
-        let reasoning = match (budget, effort.as_deref(), capabilities.thinking.value) {
-            (Some(b), _, ThinkingMode::BudgetTokens) => ReasoningRequest::BudgetTokens(b),
-            (Some(_), _, _) => {
+        let reasoning = match (budget, effort.as_deref()) {
+            (Some(budget), _) if spec.budget_tokens_supported && !blocked => {
+                ReasoningRequest::BudgetTokens(budget)
+            }
+            (Some(_), _) => {
                 dropped_parameters.push(DroppedParameter {
                     name: "thinking_budget".to_string(),
                     reason: "model capability does not support token-budget reasoning".to_string(),
                 });
                 ReasoningRequest::Disabled
             }
-            (None, Some(effort_str), ThinkingMode::Effort) => {
-                ReasoningRequest::Effort(effort_str.to_string())
-            }
-            (None, Some(effort_str), _) => {
-                // 用户指定 effort 但 vendor 不认：降级为 Disabled + dropped
+            // `ThinkingMode` 是单值标签，记不下 Qwen 这种 budget 与 effort 都认的
+            // vendor；这里直接问 spec 的 `effort_levels`，顺带把"档位写错"
+            // （如给 DeepSeek 填 xhigh）也变成可见的 dropped 而不是 400。
+            (None, Some(_)) if blocked || spec.effort_levels.is_empty() => {
                 dropped_parameters.push(DroppedParameter {
                     name: "reasoning_effort".to_string(),
                     reason: "model capability does not support effort-based reasoning".to_string(),
                 });
-                let _ = effort_str;
                 ReasoningRequest::Disabled
             }
-            _ => ReasoningRequest::Disabled,
+            (None, Some(raw)) => match normalize_effort(&model, raw) {
+                Some(level) => ReasoningRequest::Effort(level.to_string()),
+                None => {
+                    dropped_parameters.push(DroppedParameter {
+                        name: "reasoning_effort".to_string(),
+                        reason: format!(
+                            "`{raw}` is not a supported level for this model (expected one of: {})",
+                            spec.effort_levels
+                                .iter()
+                                .map(|level| level.as_str())
+                                .collect::<Vec<_>>()
+                                .join("/")
+                        ),
+                    });
+                    ReasoningRequest::Disabled
+                }
+            },
+            (None, None) => ReasoningRequest::Disabled,
         };
         let cache_policy = match capabilities.prompt_cache.value {
             PromptCacheMode::Unsupported => CachePolicy::Disabled,
@@ -116,6 +142,88 @@ impl RequestPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OpenAI 协议 + 指定 vendor —— `Profile::default()` 是 Anthropic 协议，
+    /// 那样所有 vendor 都会落到 `anthropic_compatible`，测不到 effort 分支。
+    fn profile_for(vendor: &str, model: &str, effort: &str) -> Profile {
+        Profile {
+            provider: wyj_config::Provider::OpenAI,
+            vendor: Some(vendor.to_string()),
+            model: model.to_string(),
+            reasoning_effort: Some(effort.to_string()),
+            ..Profile::default()
+        }
+    }
+
+    /// Qwen 的 `ThinkingMode` 标签是 `BudgetTokens`（单值标签记不下双认），
+    /// 曾经因此把 effort 当成"不支持"丢掉——adapter 里那段 effort 分支是死代码。
+    #[test]
+    fn qwen_effort_is_accepted_even_though_capability_says_budget() {
+        let plan =
+            RequestPlan::from_profile(&profile_for("alibaba", "qwen3-coder-plus", "high"), None);
+        assert_eq!(plan.reasoning, ReasoningRequest::Effort("high".to_string()));
+        assert!(
+            plan.dropped_parameters.is_empty(),
+            "{:?}",
+            plan.dropped_parameters
+        );
+    }
+
+    /// 两者都配时 budget 优先（Qwen 协议互斥），且不产生 dropped。
+    #[test]
+    fn budget_wins_over_effort_when_both_configured() {
+        let mut profile = profile_for("alibaba", "qwen3-coder-plus", "high");
+        profile.thinking_budget = Some(4096);
+        let plan = RequestPlan::from_profile(&profile, None);
+        assert_eq!(plan.reasoning, ReasoningRequest::BudgetTokens(4096));
+        assert!(plan.dropped_parameters.is_empty());
+    }
+
+    /// 档位写错（DeepSeek 没有 xhigh）必须是可见的 dropped，而不是发出去换 400。
+    #[test]
+    fn effort_level_outside_vendor_list_is_dropped_visibly() {
+        let plan =
+            RequestPlan::from_profile(&profile_for("deepseek", "deepseek-v4-pro", "xhigh"), None);
+        assert_eq!(plan.reasoning, ReasoningRequest::Disabled);
+        let dropped = plan
+            .dropped_parameters
+            .iter()
+            .find(|parameter| parameter.name == "reasoning_effort")
+            .expect("应记录 reasoning_effort 被丢弃");
+        assert!(dropped.reason.contains("xhigh"), "{}", dropped.reason);
+        assert!(dropped.reason.contains("high"), "{}", dropped.reason);
+    }
+
+    /// GLM 只认 `thinking.type` 开关；catalog 标成 `Effort` 只是单值标签的副作用，
+    /// 不能据此把档位放行。
+    #[test]
+    fn switch_only_vendor_drops_effort() {
+        let plan = RequestPlan::from_profile(&profile_for("zhipu", "glm-4.6", "high"), None);
+        assert_eq!(plan.reasoning, ReasoningRequest::Disabled);
+        assert!(plan
+            .dropped_parameters
+            .iter()
+            .any(|parameter| parameter.name == "reasoning_effort"));
+    }
+
+    /// 能力缓存（用户 override / 上次 4xx 记录）把 thinking 禁掉时，静态 spec 不作数。
+    #[test]
+    fn capability_block_overrides_static_spec() {
+        let profile = profile_for("deepseek", "deepseek-v4-pro", "high");
+        let resolution = ModelCatalog::resolve(&profile, None);
+        let mut capabilities = resolution.capabilities.clone();
+        capabilities.thinking = crate::Capability::new(
+            ThinkingMode::Unsupported,
+            crate::CapabilitySource::UserOverride,
+            crate::Confidence::High,
+        );
+        let plan = RequestPlan::from_capabilities(resolution.identity, &capabilities, &profile);
+        assert_eq!(plan.reasoning, ReasoningRequest::Disabled);
+        assert!(plan
+            .dropped_parameters
+            .iter()
+            .any(|parameter| parameter.name == "reasoning_effort"));
+    }
 
     #[test]
     fn unsupported_reasoning_is_dropped_visibly() {
