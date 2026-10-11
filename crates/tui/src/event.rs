@@ -91,6 +91,15 @@ pub enum AgentEvent {
         git_url: String,
         result: Result<Vec<wyj_store::marketplace::MarketplaceSkillEntry>, String>,
     },
+    /// /skills 面板 Browse tab 发起的 HTTP 技能注册表（SkillHub）搜索结果
+    SkillRegistrySearched {
+        result: Result<Vec<wyj_store::skillhub::SkillHubSkill>, String>,
+    },
+    /// /skills 面板：注册表技能包已下载并扫描出内容预览，等用户确认是否安装。
+    /// 携带原始 zip 字节是为了让确认后的安装不必再下载一次。
+    SkillRegistryArchiveFetched {
+        result: Result<(wyj_store::skillhub::SkillArchivePreview, Vec<u8>), String>,
+    },
     /// /mcp 面板"升级"结果（row_idx 对应 McpDialog.installed 下标）
     McpUpgraded {
         row_idx: usize,

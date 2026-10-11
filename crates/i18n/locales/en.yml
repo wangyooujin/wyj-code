@@ -32,7 +32,7 @@ subagent:
   bg_done_notice: "Background agent {id} ({type}: {desc}) finished; result will be injected into the conversation"
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
   panel_title: " agents [{count}] "
-  inline_running: "running · {elapsed}s · ↑{tokens} tokens · {count} tool uses"
+  inline_running: "running · {elapsed} · ↑{tokens} tokens · {count} tool uses"
   detail_running: "running, current action:"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
@@ -75,6 +75,9 @@ thinking:
   done: "  ⎿ Thought for {secs}s ({lines} lines)"
   done_no_elapsed: "  ⎿ Thought ({lines} lines)"
   expand_hint: "  ·  Ctrl+O to expand"
+
+diff:
+  more_lines: "    … {n} more lines (Ctrl+O to expand)"
   status:
     budget: "🧠 budget={n}"
     effort: "🧠 effort={e}"
@@ -88,6 +91,8 @@ agent:
     parameter_removed: "[Model endpoint does not support parameter `{name}`; safely removed and retrying]"
   context_overflow: "\n[Context exceeded the model window; compacting urgently and retrying]\n"
   compacted: "\n[Auto-compacted · #{times} · dropped {removed} older messages · kept the last {kept} verbatim · freed about {saved} tokens]\n"
+  turn_task_lost: "The turn task terminated abnormally (internal error or forced abort); this turn was stopped. You can keep typing."
+  turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
 
 claude_md:
   source:
@@ -482,10 +487,15 @@ skills:
     empty_marketplace_entries: "No installable skills found in this marketplace"
     unmanaged_tag: "manual"
     syncing: "Syncing…"
+    searching: "Searching the registry…"
+    fetching: "Downloading package…"
+    no_results: "No matching results"
+    search_row: "🔍 Search: {query}"
+    search_row_placeholder: "+ Search the skill registry (Enter to type a keyword)"
     add_marketplace_row: "+ Add marketplace"
     hint_installed: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
     hint_marketplaces: "  ↑↓ select  Enter action menu/add  ←→ switch tab  Esc close"
-    hint_browse: "  ↑↓ select  Enter action menu  ←→ switch tab  Esc close"
+    hint_browse: "  ↑↓ select  Enter search/action menu  ←→ switch tab  Esc close"
   menu:
     enable: "Enable"
     disable: "Disable"
@@ -506,11 +516,20 @@ skills:
     add_prompt: "Enter a git repository URL (use a file:// prefix for local paths):"
   install:
     confirm_title: " Confirm Skill Install "
+    registry_confirm_title: " Confirm Skill Install (registry) "
     name_label: "Name: "
     scope_label: "Scope: "
     path_label: "Source path: "
+    version_label: "Version: "
     confirm_hint: "  ←→ toggle scope  [y/Enter] confirm install  [n/Esc] cancel"
     done: "Installed — applies at the next agent turn boundary"
+    registry_done: "Installed {name} — applies at the next agent turn boundary"
+  registry:
+    source_label: "Source: "
+    owner_label: "Author: "
+    content_label: "Package contents: "
+    content_summary: "{files} files · {size}"
+    executables_warning: "⚠ Contains {count} executable script(s) — the agent may invoke them via Bash"
   upgrade:
     in_progress: "Upgrading…"
     done: "Upgraded to {version}"
@@ -520,6 +539,9 @@ skills:
   error:
     sync_failed: "Failed to sync marketplace: {err}"
     install_failed: "Install failed: {err}"
+    registry_search_failed: "Skill registry search failed: {err}"
+    registry_download_failed: "Failed to download the skill package: {err}"
+    registry_install_failed: "Install failed: {err}"
     uninstall_failed: "Uninstall failed: {err}"
     upgrade_failed: "Upgrade failed: {err}"
     manual_no_upgrade: "Manually configured entries have no version info and can't be upgraded"
@@ -751,6 +773,7 @@ dialog:
     mcp_add_registry: "[MCP] Enter registry URL (Enter to submit / Esc to cancel)"
     mcp_browse_search: "[MCP] Search (Enter to submit / Esc to cancel)"
     skills_add_marketplace: "[Skills] Enter marketplace URL (Enter to submit / Esc to cancel)"
+    skills_search: "[Skills] Enter a keyword to search the registry (Enter to search / Esc to cancel)"
     plugins_add_marketplace: "[Plugins] Enter marketplace URL (Enter to submit / Esc to cancel)"
     plugins_add_local: "[Plugins] Enter local plugin path (Enter to submit / Esc to cancel)"
     profile_rename: "[Model] Rename profile (Enter to submit / Esc to cancel)"

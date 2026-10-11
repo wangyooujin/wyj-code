@@ -12,6 +12,7 @@ pub mod prompt_policy;
 pub mod provider;
 pub mod request_plan;
 pub mod retry;
+pub mod stream_guard;
 pub mod thinking;
 pub mod types;
 
@@ -30,8 +31,9 @@ pub use prompt_policy::PromptPolicy;
 pub use provider::{Provider, SystemPrompt};
 pub use request_plan::*;
 pub use thinking::{
-    adapter_for, apply_thinking_to_openai_body, should_emit_interleaved_beta, ReasoningEffort,
-    ThinkingAdapter, ThinkingControl, ThinkingResponseFields, ThinkingSpec,
+    adapter_for, apply_thinking_to_openai_body, normalize_effort, should_emit_interleaved_beta,
+    supports_effort, ReasoningEffort, ThinkingAdapter, ThinkingControl, ThinkingResponseFields,
+    ThinkingSpec,
 };
 pub use types::*;
 
