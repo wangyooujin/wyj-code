@@ -7,8 +7,8 @@ use crate::app::{
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
     ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
-    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, ShellStatus, SkillsDialog,
-    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
+    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsBrowseSource,
+    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
     TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
     PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
     SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
@@ -563,7 +563,7 @@ const SHELL_TAIL_BYTES: usize = 64 * 1024;
 /// 精确的可视行数在 `draw_shell_panel` 渲染时用 `Paragraph::line_count`
 /// 重算并 clamp 写回。
 fn shell_panel_height(state: &AppState, area_height: u16) -> u16 {
-    let list_rows = state.shells.len().min(SHELL_LIST_MAX) as u16;
+    let list_rows = state.running_shells().len().min(SHELL_LIST_MAX) as u16;
     let detail_rows = if state.shell_detail_open {
         SHELL_DETAIL_MAX
     } else {
@@ -615,22 +615,24 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     // （典型场景就是「派子 Agent 去改代码，同时自己起 dev server」），
     // 若固定让子 Agent 面板占位，后台任务就永远看不见、也按不了 k。
     // 焦点优先保证用户想看哪个就能通过 Shift+↑ + ↓ 导航切过去。
-    if state.ui_focus == UiFocus::Shells && !state.shells.is_empty() {
+    if state.ui_focus == UiFocus::Shells && state.has_running_shells() {
         return (
             shell_panel_height(state, area_height),
             BottomPanel::ShellProcesses,
         );
     }
-    if state.ui_focus == UiFocus::SubAgents && !state.sub_agents.is_empty() {
-        // 焦点在子 Agent 面板时，即使它已全部结束也要保持可见（用户正在看）
-        let list_rows = state.sub_agents.len().min(SUB_AGENT_LIST_MAX) as u16;
+    if state.ui_focus == UiFocus::SubAgents && state.has_running_sub_agents() {
+        // 焦点在子 Agent 面板时保持可见；列表只含运行中的条目
+        // （`visible_sub_agents`），全部完成后由 `reconcile_sub_agent_selection`
+        // 把焦点交还输入框，这里自然收起。
+        let list_rows = state.visible_sub_agents().len().min(SUB_AGENT_LIST_MAX) as u16;
         let max_h = (area_height * 7 / 10).max(list_rows + 2);
         return (
             (list_rows + 2).clamp(list_rows + 2, max_h).min(area_height),
             BottomPanel::SubAgents,
         );
     }
-    if state.has_running_shells() && !state.shells.is_empty() {
+    if state.has_running_shells() {
         return (
             shell_panel_height(state, area_height),
             BottomPanel::ShellProcesses,
@@ -1072,11 +1074,7 @@ fn message_summary(msg: &ChatMessage) -> String {
 
 fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
     let raw = msg.content.lines().collect::<Vec<_>>();
-    let is_diff = !msg.is_error
-        && msg
-            .tool_name
-            .as_deref()
-            .is_some_and(|name| matches!(name, "Edit" | "Write"));
+    let is_diff = is_diff_result(msg);
     let content = if is_diff {
         raw.iter()
             .position(|line| {
@@ -1129,11 +1127,7 @@ fn render_tool_result_preview(
     ctx: &ChatRenderCtx,
 ) {
     let max_content_width = ctx.max_content_width;
-    let is_diff = !msg.is_error
-        && msg
-            .tool_name
-            .as_deref()
-            .is_some_and(|name| matches!(name, "Edit" | "Write"));
+    let is_diff = is_diff_result(msg);
     let content_lines = tool_result_content_lines(msg);
     let fallback = message_summary(msg);
     // 空行**不再**被当成「浪费名额」丢掉：展开态出全文，空行是 AskQuestion /
@@ -1235,14 +1229,83 @@ fn render_tool_result_block(
             Span::styled(elapsed_str, Theme::dim()),
         ]));
     }
-    // 折叠态到此为止：正文一个字符都不渲染。这与 `render_thinking_block` 的形状
-    // 一致（先出头 → `if !expanded { return; }` → 全文），也让默认路径彻底绕开
-    // `tool_result_content_lines`（它会把整个 `content` `lines().collect()` 成 Vec）
-    // ——旧实现每帧构建完整 preview 再只取 3 行扔掉，是纯粹的浪费。
+    // 折叠态：Edit/Write 是**唯一例外**——就地渲染一段截断的彩色 diff，其余
+    // 工具结果正文一个字符都不出。
+    //
+    // 为什么它是例外：`Edit`/`Write` 的 ToolResult 正文本身就是 diff
+    // （`tools/src/edit.rs` 调 `make_diff` 拼进回执），而 diff **才是**这次
+    // 调用的结果，回执「已替换 1 处」什么信息量都没有。折叠掉它等于让用户
+    // 只能看到「文件被改了」而看不到「改成了什么」，必须先按 Ctrl+O 才知道
+    // 这次编辑到底做了什么——对一个以改代码为主业的 CLI 来说这是不可接受的
+    // （对齐 Claude Code：Edit/Write 的 diff 内联可见，长 diff 折叠）。
+    //
+    // 为什么其余工具仍然一个字符都不碰：`tool_result_content_lines` 会把整个
+    // `content` `lines().collect()` 成 Vec。旧实现每帧为每条工具结果构建完整
+    // preview 再只取 3 行扔掉，是纯粹的浪费——`Bash` 的输出可以有几 MB。
+    // diff 例外不破坏这条不变式：Edit/Write 的回执被 `MAX_DIFF_LINES = 200`
+    // 在工具层就封了顶，构造开销有硬上界，且下面还只渲染前 N 行。
     if !ctx.output_expanded {
+        if is_diff_result(result) {
+            render_collapsed_diff_preview(lines, result, ctx);
+        }
         return;
     }
     render_tool_result_preview(lines, result, ctx);
+}
+
+/// 是否是 Edit/Write 的**成功**回执（失败时正文是错误文本，不是 diff）。
+fn is_diff_result(msg: &ChatMessage) -> bool {
+    !msg.is_error
+        && msg
+            .tool_name
+            .as_deref()
+            .is_some_and(|name| matches!(name, "Edit" | "Write"))
+}
+
+/// 折叠态 Edit/Write 的 diff 预览行数上限。超出的部分折成一行
+/// 「… 还有 N 行（Ctrl+O 展开全文）」。
+///
+/// 取 20 是权衡：够看完一次局部编辑的全部改动行，又不至于让新建大文件时
+/// 200 行 diff 糊满屏幕（Write 新建文件时整份内容都是 `+` 行，最容易触发）。
+const COLLAPSED_DIFF_MAX_LINES: usize = 20;
+
+/// 折叠态渲染 Edit/Write 的 diff 前 [`COLLAPSED_DIFF_MAX_LINES`] 行。
+///
+/// 与展开态共用同一套 diff 起点定位（`tool_result_content_lines` 会跳过
+/// 「已替换 N 处: path」这类回执前缀，只留 `-`/`+`/上下文行）与同一套配色
+/// （`+` 绿 / `-` 红 / 上下文 dim），因此两态视觉一致，切换 Ctrl+O 不会让
+/// 已经看习惯的行忽然换一种缩进或换一种颜色。
+fn render_collapsed_diff_preview(
+    lines: &mut Vec<Line<'static>>,
+    msg: &ChatMessage,
+    ctx: &ChatRenderCtx,
+) {
+    let max_content_width = ctx.max_content_width;
+    let content_lines = tool_result_content_lines(msg);
+    let shown = content_lines.len().min(COLLAPSED_DIFF_MAX_LINES);
+    for raw in content_lines.iter().take(shown) {
+        if raw.trim().is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        let style = if raw.starts_with("+ ") {
+            Style::default().fg(Color::Green)
+        } else if raw.starts_with("- ") {
+            Theme::error()
+        } else {
+            Theme::dim()
+        };
+        for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
+            lines.push(Line::from(Span::styled(format!("    {wrapped}"), style)));
+        }
+    }
+    let remaining = content_lines.len().saturating_sub(shown);
+    if remaining > 0 {
+        lines.push(Line::from(Span::styled(
+            wyj_i18n::tr_fmt("diff.more_lines", &[("n", &remaining.to_string())]),
+            Theme::dim(),
+        )));
+    }
 }
 
 /// 渲染欢迎页所有行。供 [`build_pending_chat_lines`] 与高度测量复用，避免两处
@@ -1996,8 +2059,15 @@ fn push_sub_agent_trace_lines(
 /// 列表区固定行数上限（SUB_AGENT_LIST_MAX）+ 滚动窗口；运行期间自动显示，
 /// 全部完成后自动收起，历史详情仍可通过 `/subagents` 主动打开。
 fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
-    // 按 id 升序（BTreeMap 天然启动顺序），用 owned Vec 避免和后面对 state 的可变借用冲突
-    let ids: Vec<u64> = state.sub_agents.keys().copied().collect();
+    // 只列**运行中**的子 Agent（`visible_sub_agents` 是唯一口径）。完成/失败/
+    // 中断的条目不再展示：结果已经回灌对话，完整轨迹仍可用
+    // `wyj-code subagent-trace` 从落盘文件查阅。
+    // 按 id 升序（BTreeMap 天然启动顺序），用 owned Vec 避免可变借用冲突。
+    let ids: Vec<u64> = state
+        .visible_sub_agents()
+        .iter()
+        .map(|(id, _)| **id)
+        .collect();
 
     let title = wyj_i18n::tr_fmt(
         "subagent.panel_title",
@@ -2051,23 +2121,12 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             st
         };
 
-        // 状态图标 + 内容配色（对齐任务列表的 ○/spinner/✓ 风格）
-        let (icon, item_style) = match s.status {
-            SubAgentStatus::Running => (
-                SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            SubAgentStatus::Done => (
-                "✓".to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ),
-            SubAgentStatus::Failed => ("✗".to_string(), Theme::error()),
-            SubAgentStatus::Interrupted => ("⊘".to_string(), Theme::dim()),
-        };
+        // 面板只列运行中的条目（见函数头的 `visible_sub_agents`），因此图标恒为
+        // spinner——完成/失败/中断的状态由聊天流与 `bg_agent_done_reminder` 承载。
+        let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
+        let item_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
 
         let bg_tag = if s.background { " ◇bg" } else { "" };
         let head = format!("a{} {}({})", id, s.agent_type, s.description);
@@ -2166,9 +2225,14 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
 /// 后台 Shell 任务面板：列表（id / 命令 / 状态 / 耗时）+ 详情（实时输出）。
 /// 结构与 `draw_sub_agents_panel` 完全对称，便于两处对照维护。
 fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
-    // shells 是 Vec，天然保持 spawn 顺序；用 owned Vec 拿 id 快照，避免和
-    // 后面 `get(id)` 的可变借用冲突。
-    let ids: Vec<String> = state.shells.iter().map(|s| s.id.clone()).collect();
+    // 只列**运行中**的 shell（`running_shells` 是唯一口径）。已完成条目对用户
+    // 已无操作价值：输出早已通过 reminder 回灌模型、聊天流里也留了退出记录。
+    // 用 owned Vec 拿 id 快照，避免和后面 `get(id)` 的可变借用冲突。
+    let ids: Vec<String> = state
+        .running_shells()
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
 
     let title = wyj_i18n::tr_fmt(
         "shell.panel_title",
@@ -2223,24 +2287,15 @@ fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
             st
         };
 
-        // 状态图标：运行中转 spinner，正常退出 ✓，非零退出码 ✗
-        let (icon, item_style) = match s.status {
-            ShellStatus::Running => (
-                SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            ShellStatus::Exited(0) => (
-                "✓".to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            ),
-            ShellStatus::Exited(_) => ("✗".to_string(), Theme::error()),
-        };
+        // 面板只列运行中的条目（见函数头的 `running_shells`），因此图标恒为
+        // spinner——不存在「已完成」分支可匹配，退出状态由聊天流里的
+        // `bash_N 已退出` 记录承载。
+        let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
+        let item_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
 
-        let mut spans = vec![
+        lines.push(Line::from(vec![
             Span::styled(format!(" {id} "), sel_bg(Theme::dim())),
             Span::styled(format!("{icon} "), sel_bg(item_style)),
             Span::styled(
@@ -2251,17 +2306,7 @@ fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
                 format!(" ⏱ {}", format_hms(s.elapsed_secs())),
                 sel_bg(Theme::dim()),
             ),
-        ];
-        if let ShellStatus::Exited(code) = s.status {
-            spans.push(Span::styled(
-                format!(
-                    " · {}",
-                    wyj_i18n::tr_fmt("shell.exited", &[("code", &code.to_string())])
-                ),
-                sel_bg(Theme::dim()),
-            ));
-        }
-        lines.push(Line::from(spans));
+        ]));
     }
     if state.ui_focus == UiFocus::Shells && !detail_open {
         lines.push(Line::from(Span::styled(
@@ -4183,11 +4228,46 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
                     )
                 }
                 (SkillsDialogTab::Browse, FlatRow::Entry(idx)) => {
-                    let e = &dialog.browse_results[*idx];
-                    format!("{marker}{} v{} — {}", e.name, e.version, e.description)
+                    // 同一张表可能装的是 git marketplace 条目，也可能是注册表搜索
+                    // 结果，两者字段完全不同，必须按来源取数。
+                    match dialog.browse_source {
+                        SkillsBrowseSource::Registry => match dialog.registry_results.get(*idx) {
+                            Some(s) => {
+                                let mut line = format!(
+                                    "{marker}{} v{} — {}",
+                                    s.display_name, s.version, s.description
+                                );
+                                if s.stars > 0 {
+                                    line.push_str(&format!("  ★{}", s.stars));
+                                }
+                                line
+                            }
+                            None => String::new(),
+                        },
+                        _ => match dialog.browse_results.get(*idx) {
+                            Some(e) => {
+                                format!("{marker}{} v{} — {}", e.name, e.version, e.description)
+                            }
+                            None => String::new(),
+                        },
+                    }
                 }
-                (SkillsDialogTab::Installed, FlatRow::AddNew)
-                | (SkillsDialogTab::Browse, FlatRow::AddNew) => String::new(),
+                // Browse tab 的固定第 0 行是搜索框（沿用 MCP 面板同一约定）
+                (SkillsDialogTab::Browse, FlatRow::AddNew) => {
+                    let query = dialog.live_input.display_lines().join("");
+                    if query.is_empty() {
+                        format!(
+                            "{marker}{}",
+                            wyj_i18n::tr("skills.dialog.search_row_placeholder")
+                        )
+                    } else {
+                        format!(
+                            "{marker}{}",
+                            wyj_i18n::tr_fmt("skills.dialog.search_row", &[("query", &query)])
+                        )
+                    }
+                }
+                (SkillsDialogTab::Installed, FlatRow::AddNew) => String::new(),
             };
             let text = truncate_line(&text, w);
             lines.push(Line::from(Span::styled(text, style)));
@@ -4225,6 +4305,20 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
         draw_action_menu(f, area, &wyj_i18n::tr("skills.dialog.title"), menu);
     } else {
         draw_skills_overlay(f, &dialog.overlay, area);
+    }
+}
+
+/// 人类可读的字节数（确认框里展示技能包体积用）。
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let value = bytes as f64;
+    if value >= MB {
+        format!("{:.1} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -4285,6 +4379,100 @@ fn draw_skills_overlay(f: &mut Frame, overlay: &SkillsOverlay, area: Rect) {
                 Theme::dim(),
             ))];
             draw_confirm_box(f, &wyj_i18n::tr("skills.dialog.title"), lines, area);
+        }
+        SkillsOverlay::Searching => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("skills.dialog.searching"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("skills.dialog.title"), lines, area);
+        }
+        SkillsOverlay::FetchingArchive => {
+            let lines = vec![Line::from(Span::styled(
+                wyj_i18n::tr("skills.dialog.fetching"),
+                Theme::dim(),
+            ))];
+            draw_confirm_box(f, &wyj_i18n::tr("skills.dialog.title"), lines, area);
+        }
+        // 注册表技能的安装确认：来源 / 作者 / 版本 + 包内容摘要必须一次看全。
+        // 技能正文会整段作为模型指令进入对话，而包里可能夹带 scripts/ 可执行内容，
+        // 这是不可逆的信任动作，值得占一整屏。
+        SkillsOverlay::RegistryInstallConfirm {
+            skill,
+            preview,
+            scope,
+            ..
+        } => {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.install.name_label"), Theme::dim()),
+                    Span::raw(skill.display_name.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.registry.source_label"), Theme::dim()),
+                    Span::raw(format!(
+                        "{} ({})",
+                        if skill.canonical_name.is_empty() {
+                            skill.slug.clone()
+                        } else {
+                            skill.canonical_name.clone()
+                        },
+                        if skill.source.is_empty() {
+                            "community".to_string()
+                        } else {
+                            skill.source.clone()
+                        }
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.registry.owner_label"), Theme::dim()),
+                    Span::raw(skill.owner_name.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.install.version_label"), Theme::dim()),
+                    Span::raw(skill.version.clone()),
+                ]),
+                Line::from(vec![
+                    Span::styled(wyj_i18n::tr("skills.registry.content_label"), Theme::dim()),
+                    Span::raw(wyj_i18n::tr_fmt(
+                        "skills.registry.content_summary",
+                        &[
+                            ("files", &preview.file_count.to_string()),
+                            ("size", &format_bytes(preview.total_bytes)),
+                        ],
+                    )),
+                ]),
+            ];
+            if preview.has_executables() {
+                lines.push(Line::from(Span::styled(
+                    wyj_i18n::tr_fmt(
+                        "skills.registry.executables_warning",
+                        &[("count", &preview.executable_count.to_string())],
+                    ),
+                    Theme::warning(),
+                )));
+                for path in &preview.executable_paths {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}", path),
+                        Theme::warning(),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(wyj_i18n::tr("skills.install.scope_label"), Theme::dim()),
+                Span::raw(mcp_scope_label(*scope)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                wyj_i18n::tr("skills.install.confirm_hint"),
+                Theme::highlight(),
+            )));
+            draw_confirm_box(
+                f,
+                &wyj_i18n::tr("skills.install.registry_confirm_title"),
+                lines,
+                area,
+            );
         }
         SkillsOverlay::Detail { title, lines } => {
             let lines = lines
@@ -5454,6 +5642,7 @@ fn parse_iso_to_secs(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tool_result_fold_tests {
     use super::*;
+    use crate::app::ShellStatus;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -5602,7 +5791,11 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn completed_shells_remain_available_when_panel_is_opened_explicitly() {
+    fn completed_shells_are_not_listed_even_when_panel_is_focused() {
+        // 显式聚焦（Shift+↑ 或 /shells）**不再**让已结束的任务回到列表里：
+        // 面板口径统一为「只列运行中」。原先这里断言已完成条目仍可见，那是用户
+        // 明确要求去掉的行为——已退出的任务输出早已回灌模型、聊天流也留了
+        // `bash_N 已退出` 记录，留在面板里只是噪音。
         let mut state = make_state();
         state.shells.push(shell(ShellStatus::Exited(0)));
         state.selected_shell = Some("bash_1".to_string());
@@ -5610,7 +5803,21 @@ mod tool_result_fold_tests {
 
         let (height, panel) = bottom_panel_size(&state, 40);
 
-        assert!(height > 0, "用户显式聚焦时已结束的任务仍应可见");
+        assert_eq!(height, 0, "已结束的任务不应继续占用底部空间");
+        assert!(matches!(panel, BottomPanel::None));
+    }
+
+    #[test]
+    fn running_shell_stays_listed_when_focus_moves_away() {
+        // 反向钉子：口径收紧到「只列运行中」不能误伤「有运行中就显示」——
+        // 焦点不在 shells 上时，底部面板仍应自动显示运行中的任务。
+        let mut state = make_state();
+        state.shells.push(shell(ShellStatus::Running));
+        state.ui_focus = UiFocus::Composer;
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(height > 0);
         assert!(matches!(panel, BottomPanel::ShellProcesses));
     }
 
@@ -5727,7 +5934,10 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn completed_sub_agents_remain_available_when_panel_is_opened_explicitly() {
+    fn completed_sub_agents_are_not_listed_even_when_panel_is_focused() {
+        // 与 shells 同构：面板口径统一为「只列运行中」。结果早已通过
+        // `bg_agent_done_reminder` 回灌对话，完整轨迹仍可用
+        // `wyj-code subagent-trace` 从落盘文件查阅。
         let mut state = make_state();
         state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
         state.selected_sub_agent = Some(1);
@@ -5735,8 +5945,38 @@ mod tool_result_fold_tests {
 
         let (height, panel) = bottom_panel_size(&state, 40);
 
-        assert!(height > 0);
-        assert!(matches!(panel, BottomPanel::SubAgents));
+        assert_eq!(height, 0, "已完成的子 Agent 不应继续占用底部空间");
+        assert!(matches!(panel, BottomPanel::None));
+    }
+
+    #[test]
+    fn visible_sub_agents_filters_out_finished_ones() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+        state
+            .sub_agents
+            .insert(2, sub_agent(SubAgentStatus::Running));
+        state
+            .sub_agents
+            .insert(3, sub_agent(SubAgentStatus::Failed));
+        state
+            .sub_agents
+            .insert(4, sub_agent(SubAgentStatus::Interrupted));
+        state
+            .sub_agents
+            .insert(5, sub_agent(SubAgentStatus::Running));
+
+        let visible: Vec<u64> = state
+            .visible_sub_agents()
+            .iter()
+            .map(|(id, _)| **id)
+            .collect();
+
+        assert_eq!(
+            visible,
+            vec![2, 5],
+            "只有 Running 的子 Agent 应当进入面板列表"
+        );
     }
 
     // ── 任务全部完成 → 收成一行摘要 ─────────────────────────────────────
@@ -6089,6 +6329,29 @@ mod tool_result_fold_tests {
     }
 
     #[test]
+    fn subagent_inline_running_does_not_double_the_seconds_suffix() {
+        // 回归钉子：`format_hms` 返回值**自带** `s`（"38s" / "1m 5s"），模板里
+        // 再拼一个 `{elapsed}s` 就会渲染成 "38ss"。秒级用例最容易被当成
+        // 笔误放过，60s 以上更是变成 "1m 5ss"——所以两级都要断言。
+        for (secs, needle) in [(38.0_f64, "38s"), (65.0, "1m 5s")] {
+            let elapsed = format_hms(secs);
+            let rendered = wyj_i18n::tr_fmt(
+                "subagent.inline_running",
+                &[
+                    ("elapsed", elapsed.as_str()),
+                    ("tokens", "1.2k"),
+                    ("count", "31"),
+                ],
+            );
+            assert!(
+                rendered.contains(needle),
+                "耗时 {elapsed} 应原样出现在状态行里，实际：{rendered}"
+            );
+            assert!(!rendered.contains("ss"), "耗时单位重复成 `ss`：{rendered}");
+        }
+    }
+
+    #[test]
     fn current_step_elapsed_falls_back_to_turn_when_no_tool_running() {
         // 纯思考阶段没有 ToolStart，只有 turn_start_time：耗时必须仍然有值，
         // 不能退化成常驻 0.0s（那会让用户以为界面卡死）。
@@ -6413,10 +6676,93 @@ mod tool_result_fold_tests {
         assert_eq!(lines[3].spans[0].style, Theme::dim());
         assert!(!rendered.iter().any(|line| line.contains("Updated file")));
 
-        // 折叠态：diff 一行都不渲染（需求：Edit/Write 与其他结果一律折叠）
-        let folded = render_messages(&[result], 100);
-        assert_eq!(folded.len(), 1, "{folded:?}");
-        assert_eq!(folded[0], "  ⎿ result");
+        // 折叠态：diff 仍然内联可见（Edit/Write 是折叠规则的唯一例外），
+        // 但渲染的行必须与展开态同形同色——切换 Ctrl+O 不会让已看惯的行
+        // 忽然换一种缩进或换一种颜色。
+        let folded = render_messages(&[result.clone()], 100);
+        assert_eq!(
+            folded,
+            vec![
+                "  ⎿ result",
+                "    - old content",
+                "    + new content",
+                "      context",
+            ],
+            "{folded:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_edit_diff_is_truncated_with_an_expand_hint() {
+        // 折叠态的截断：长 diff 只出前 N 行 + 一行提示，而不是糊满屏幕。
+        let long_diff = {
+            let mut m = message(
+                MessageRole::ToolResult,
+                &format!(
+                    "已替换 1 处: src/app.rs\n{}",
+                    (1..=60)
+                        .map(|i| format!("+ added line {i}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            );
+            m.tool_name = Some("Edit".to_string());
+            m
+        };
+
+        let rendered = render_messages(&[long_diff], 100);
+
+        assert_eq!(
+            rendered[0], "  ⎿ result",
+            "回执行仍被 diff 起点定位跳过：{rendered:?}"
+        );
+        // 回执前缀不占名额：60 行 diff 全部来自 `+` 行本体
+        let diff_lines: Vec<&String> = rendered
+            .iter()
+            .skip(1)
+            .filter(|l| !l.contains("more lines"))
+            .collect();
+        assert_eq!(
+            diff_lines.len(),
+            COLLAPSED_DIFF_MAX_LINES,
+            "折叠态必须截断到上限: {rendered:?}"
+        );
+        let hint = rendered.last().expect("截断提示行");
+        assert!(
+            hint.contains(&format!("{}", 60 - COLLAPSED_DIFF_MAX_LINES)) && hint.contains("Ctrl+O"),
+            "截断提示必须报出剩余行数并指明如何展开: {hint}"
+        );
+    }
+
+    #[test]
+    fn short_collapsed_edit_diff_has_no_truncation_hint() {
+        // 反向钉子：没超上限就不该出现「还有 0 行」这种占位提示。
+        let mut m = message(MessageRole::ToolResult, "已写入: a.rs\n- old\n+ new");
+        m.tool_name = Some("Write".to_string());
+
+        let rendered = render_messages(&[m], 100);
+
+        assert_eq!(rendered.len(), 3, "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|l| l.contains("more lines")),
+            "未截断时不得出现截断提示: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn failed_edit_result_is_not_rendered_as_diff() {
+        // 失败回执正文是错误文本而非 diff，不能被当成 diff 染色内联展示。
+        let mut m = message(
+            MessageRole::ToolResult,
+            "安全检查失败：写入 `a.rs` 前必须先用 Read 读取该文件",
+        );
+        m.tool_name = Some("Edit".to_string());
+        m.is_error = true;
+
+        let rendered = render_messages(&[m], 100);
+
+        assert_eq!(rendered.len(), 1, "错误回执不适用 diff 例外: {rendered:?}");
+        assert_eq!(rendered[0], "  ⎿ result");
     }
 
     #[test]

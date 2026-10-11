@@ -2,6 +2,83 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [1.5.21] - 2026-10-11
+
+### 长任务跑到一半停住，之后输入任何内容都没反应
+
+「执行久了就会停」是表象，真正的原因是**回合 task 一旦卡死不再返回，UI 就永久锁在 thinking 态**：task 全程持有 session Mutex，而 `is_thinking` 的清零只认 `TurnDone` / `Error`——这两个事件只在 task 收尾时才发。用户后续输入全部滞留 `pending_queue`，连主循环里 `!is_thinking && !pending_queue.is_empty()` 那条唯一的排空兜底分支也被同一个标志挡住。时长只是把尾部概率放大的放大器，不是成因。
+
+既有的 `reap_lost_turn_task` 看门狗只看 `task.is_finished()`，**只兜「task 已死」（panic / 被 abort），管不了「task 还活着却卡住」**——后者那个标志恒为 false。三层一起补：
+
+- **MCP 工具调用超时**（`mcp/src/bridge.rs`）：`call_tool` 原本是裸 `await` 零超时。更隐蔽的是它持有 `client` 这把 mutex——一次 hang 会让**同一 server 的后续全部调用排队等一把永远不会开的锁**。现把取锁与调用包在同一个 `tokio::time::timeout` 里（默认 120s，`WYJ_CODE_MCP_CALL_SECS` 覆盖）。
+- **响应头等待超时**（`api/src/retry.rs`）：`connect_timeout` 只管到 TLS 握手完成；握手之后到响应头返回之间此前**无期限**，而流级看门狗（`stream_guard`）此时还没生效。两处读错误响应体的 `resp.text()` 同样无保护。新增 `HEADER_TIMEOUT` 90s，超时按连接层错误走既有退避重试。
+- **回合心跳看门狗**（`tui/src/app.rs`）：新增 `abort_stalled_turn()`，与 `reap_lost_turn_task` 并列调用，兜住所有未知阻塞。判据是**「多久没动静」而非「跑了多久」**——`apply_agent_event` 每收到任何事件就重置基准，长回合只要还在吐 delta 或跑工具就不会被判死（默认 900s，`WYJ_CODE_TURN_STALL_SECS` 覆盖，0 = 关闭）。两个刻意决定：**弹窗打开期间不计入心跳**（权限确认 / AskQuestion / 计划批准时回合合法地 await 在 oneshot 上，用户可能离开几分钟才回来，把它算进去等于「出去倒杯水」就杀掉一段长工作，比原 bug 更糟）；**阈值严格大于 Bash 的 600s 上限**，让工具侧的超时错误永远先于心跳触发，否则报错会把原因指向错误的地方。
+
+顺带修掉两个既存缺陷：`stream_guard.rs` 的两个测试**从一开始就没法编译**（reqwest 0.12 的 `Client` 没有 `connect_timeout()` / `timeout()` getter，只有 builder 上的 setter，`cargo test -p wyj-api` 在本批改动前就是坏的），改为断言常量边界 + 一个从源码文本确认 `build_client` 里没有 `.timeout(` 的静态钉子；`spawn_agent_turn` 尾部重复构造 `TurnTask`（`spawn_turn_task` 已返回句柄，却又手工造一个并引用作用域外的 `handle`/`finished`）。
+
+### 任务列表面板配了 `todo_enabled = true` 却永远不出现（真 bug）
+
+开关只管**注册**、管不到**可见性**：`TodoWrite` 不在 `agent.rs` 的 `ALWAYS_VISIBLE_TOOL_SCHEMAS` 里，而工具总数一旦超过 `model_runtime.lazy_tools_threshold`（默认 12；标准工具 9 个 + CodeSearch/Memory/ContextRecall/AskQuestion/Agent + computer 三件套 + 任一 MCP server 的工具，**几乎必然触发**）就会启用 ToolSearch 折叠，未在名单里的 schema 被隐藏——模型根本不知道这个工具存在，自然从不调用。两条一起修：`TodoWrite` 进常驻名单；`prompts::TODO_HINT` 恢复但改成**开关为真时才条件注入**（工具描述只说了「它是什么」没说「什么时候用」，只修可见性会变成「看得见但不碰」；关闭时 prompt 一个字节都不变，默认路径继续对齐 Claude Code v2.1.233 / Codex v0.152.0）。
+
+### Edit/Write 的 diff 折叠后要按 Ctrl+O 才看得见
+
+diff 一直都在生成（`tools/src/diff.rs`），但 `render_tool_result_block` 在折叠态直接 return，于是「文件被改了」看得见、「改成了什么」看不见。现改为**折叠态内联渲染 diff 前 20 行 + `… 还有 N 行（Ctrl+O 展开全文）`**，配色与缩进沿用展开态同一套，切 Ctrl+O 不会让已看惯的行换样。只对 Edit/Write 的**成功**回执生效（`Bash` 那种几 MB 的输出仍然一个字符不碰）。
+
+### shells / subagents 面板不再列出已完成的任务
+
+两个面板口径统一为「只显示运行中」，完成即离开列表（对齐 Claude Code）。底层状态仍保留全部条目——退出状态要等 `poll_shells` 读、自动唤醒 reminder 也要读，只是不再展示。选中项在状态翻转时（`poll_shells` 检出退出、子 Agent `Done`、interrupt、ESC 中断）重新对齐到仍在运行的条目；一个都不剩时收起面板并把焦点交还输入框，而不是让焦点悬空在一个看不见的幽灵行上。已完成的条目并非不可查：子 Agent 完整轨迹仍落盘，`wyj-code subagent-trace <session> [id]` 可读。
+
+### `reasoning_effort` 此前根本没发出去：整条链断在装配层
+
+profile 里的 `reasoning_effort` / `thinking_switch` 写进配置、TUI 面板能编辑、catalog 与 adapter 也都实现了对应字段名，但**这两个值从未到达任何端点**：`Agent` / `AgentRoute` 上的 `with_reasoning_effort` / `with_thinking_switch` 全仓库**零调用点**。结果是最坏的一种——不报错、不降级，用户填了档位却发现思考强度纹丝不动，且日志里什么都没有。实际只有 `thinking_budget` 真的发得出去。
+
+- **装配层补齐**：主 Agent、`/model` 热切换重建、子 Agent、routing fallback 四处全部改为透传 `effective_reasoning_effort()` / `effective_thinking_switch()`（用 effective 版，顺带让 env `WYJ_CODE_THINKING_EFFORT` / `WYJ_CODE_THINKING_SWITCH` 对 fallback route 与子 Agent 同样生效，此前只有主 profile 认）。
+- **判据收敛成一处**：新增 `thinking::normalize_effort`，以 `ThinkingSpec::effort_levels` 为唯一真值，agent 组装 `RequestOptions` 与 provider 序列化 body 两处都过它。此前用 `ModelCapabilities` 那个**单值** `ThinkingMode` 标签判断，同时犯了两个方向的错：Qwen 的标签是 `BudgetTokens`，于是它支持 effort 这件事被整个忽略（`QwenOpenAiAdapter` 里的 effort 分支是死代码）；GLM / Ollama / Moonshot k2 / vLLM 的标签是 `Effort`，于是档位被一路放行、在 adapter 里无人接收地消失。
+- **填错档位不再换 400**：给 DeepSeek 填 `xhigh`（它只有 low/medium/high/max）这类情况，现在记入 `dropped_parameter` 并说明该模型期望的档位，`wyj-code model doctor` 与启动日志可见。
+- **vLLM 补上 adapter**：此前它在 `adapter_for` 里没有分支，直接落到 Generic 兜底，用户配的 thinking 开关被静默丢弃；现在按 vLLM 的方式发 `chat_template_kwargs.enable_thinking`。
+- **4xx 降级补全**：端点回"不认 `reasoning_effort` / `thinking.type`"时，agent 此前只撤 `thinking_budget`，effort 仍留在重试请求里 → 再 400 一次，整个 turn 直接失败。现在 thinking 家族任一参数被拒都会整体撤掉并重试一次，并把拒绝记进 `CapabilityCache`。
+- **回归测试**：`normalize_effort` 的逐 vendor 档位矩阵、vLLM adapter、Qwen effort 不再是死代码、`xhigh` 落到 DeepSeek 被挡、GLM 收不到档位、能力缓存禁掉 thinking 时静态 spec 不作数，以及 agent 层"effort 确实进了 `RequestOptions` / 被拒后确实被撤掉"两条端到端用例。
+
+### HTTP 技能注册表（SkillHub）：不 clone 整个仓库就能搜技能
+
+此前 wyj-code 的技能来源只有 git 型市场（`store::marketplace`）：搜一个关键字要先 `git clone --depth 1` 整个仓库再本地过滤。本版接入 SkillHub 的 HTTP 接口作为**第二来源**，形状刻意复刻已有的 MCP Registry 客户端（`store::registry`），并保留全部既有安装记账。
+
+- **新增 `store::skillhub`**：`GET {base}/search?q=&limit=` 搜索，`GET {base}/download?slug=&namespace=` 下载 zip。与 git 市场并存——面板 Browse tab 记住当前列表的来源（`SkillsBrowseSource`），按来源走对应安装路径。
+- **逐条确认后才落盘**：面板里选中搜索结果回车后，**先下载并扫描但不写盘**，确认框展示来源 / 作者 / 版本 / 文件数 / 体积；命中 `scripts/`、`hooks/`、`bin/` 时逐行列出可执行脚本并警告，用户 `y` 才解压。命令行 `wyj-code skillhub install` 同理，非 TTY 必须显式 `--yes`——第三方技能正文会整段作为模型指令进入对话，且注册表社区源实测多为 clawhub 镜像，这是不设门控就默认打开的 prompt injection 面。
+- **解压按解不可信归档处理**：拒绝 `..` 穿越、绝对路径、符号链接条目；限制条目数 / 下载体积 / 解压总字节（防 zip bomb）；要求根目录含 `SKILL.md`；先解到同级 staging 目录再原子 rename，lockfile 写失败回滚磁盘。安装目录名先 `sanitize_install_name`（远程 slug 是发布者可控字符串，会直接成为 skills 目录名），同名目录仅在 lockfile 有纳管条目时允许覆盖。
+- **修掉两个目录形态的既有缺陷**：注册表装的是目录 `<name>/SKILL.md`（带 `references/`、`scripts/`），而 marketplace 装的是单文件 `<name>.md`。此前 `scan_skill_dir_for_display` 只扫 `*.md`（注册表技能装了却**在 Installed tab 里看不见**）、`uninstall_skill` 只删 `.md`（残留目录，且 `references/*.md` 会被加载器误注册成额外 slash command）。两处均已补上目录形态。
+- **`lockfile::SkillSource` 新增 `registry` 字段**（`{base_url, slug, namespace}`，与 git marketplace 字段互斥，`#[serde(default)]` 兼容旧 lockfile）。`upgrade_skill` 按来源分流——否则会对一个 https URL 执行 `git clone`。实测重复升级返回 `AlreadyLatest`，不会每次重装。
+- **新 CLI**：`wyj-code skillhub search|info|install`，`/skills` 面板在 headless 下不可用时的等价入口。`search --json` 便于脚本消费。
+- **顺带修掉一个 i18n 缺陷**：`zh.yml` 里整块技能面板文案挂在错误的顶层键 `import:` 下（无任何代码引用），导致**所有中文技能面板文案一直回落英文**。已改回 `skills:`。
+
+## [1.5.20] - 2026-10-10
+
+> 补记：v1.5.20 发布时本文件漏写了版本小节，本次一并补齐。
+
+### token 账本：内存里有计数器，落盘时一个都没写
+
+`SessionFile` 补齐 `cache_read` / `cache_write` / `api_calls` / `tool_schema_tokens` 与 `prompt_cache_state` 六个字段（全部 `serde(default)`，旧会话文件可直接读）。**根因不在字段本身，而在 12 处构造点各自手写全量字段**——新增字段不可能不漏。现收敛为 `SessionFile::from_session` / `Session::restore_usage_from` 一对，漏改从此是编译期错误。新增 `wyj-code usage` 跨会话汇总（`--since` / `--project` / `--json`），按月按项目聚合；`api_calls` 缺失时 per-call 返回 `None` 而非 0，区分「没记录」与「真的是 0」。
+
+### 上下文清理此前从未运行
+
+实测 129 个会话 `compact_count` 与 `context_edit_freed_tokens` 全为 0：`context_window = 1M` 把压缩触发线推到 900K，实际会话最大约 292K。新增 `[context_edit] soft_limit_ratio`（默认 0.55）作为动手线，硬阈值仍是停手线，收敛目标不变；`= 0` 完全退回旧行为并有回归测试钉住。
+
+### prompt cache 对第三方端点可用且失败安全
+
+`cache_control` 与 `anthropic-beta` 头解耦：第三方开启缓存时只发前者。首次 400 且分类为 `UnsupportedParameter` / `InvalidRequest` 时自动降级并重试一次，进程内单调置位；**`ContextLengthExceeded` 被显式排除**，避免上下文一满就永久失去缓存。降级事实经 `Provider::prompt_cache_state()` 回写会话并落盘，`/cost` 据此区分「没配缓存」与「配了但端点用不了」。`model_catalog` 的 `prompt_cache` 能力改为采信显式配置，不再把 `protocol_default` 猜测当作最终结论。
+
+### 并行工具能力收敛到单一写入点
+
+`parallel_tool_calls` / `max_tools_per_turn` / `RequiresSingleTool` 统一经 `apply_parallel_policy`，配三字段同步不变式的回归钉子。`model doctor` 改走 `resolve_with_cache`，报告能力与运行时实际用的同一份；`max_tools_per_turn` 进入 `/model` 面板并有往返测试。
+
+### `/cost` 与配置提示
+
+新增 API 调用次数与平均单次输入行、缓存降级说明行；补 MiniMax 单价档位，单价表未覆盖时显式提示而非静默降级成「无金额」。`--config-status` 对未经探测的超大 `context_window` 给出警告。
+
+### 站点
+
+`docs.html` / `index.html` / `script.js` 更新到 v1.5.20；顺带修掉 `delivery.title`/`desc` 的 zh/en 字典停在 v1.5.18（`applyLang` 用字典覆盖 HTML，线上 delivery 标题一直是旧版本）。
+
 ## [1.5.19] - 2026-10-09
 
 ### 【BREAKING】项目级 skill 信任确认：仓库自带的 skill 需显式批准
