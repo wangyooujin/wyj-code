@@ -270,11 +270,11 @@ fn install_skill_from_cache(cache_dir: &Path, req: &SkillInstallRequest, cwd: &P
             name,
             version: Some(req.entry.version.clone()),
             scope: req.scope,
-            source: Some(SkillSource {
-                marketplace_id: req.marketplace_id.clone(),
-                marketplace_url: req.marketplace_url.clone(),
-                entry_path: req.entry.path.clone(),
-            }),
+            source: Some(SkillSource::marketplace(
+                &req.marketplace_id,
+                &req.marketplace_url,
+                &req.entry.path,
+            )),
             enabled: true,
             installed_at: existing_installed_at.unwrap_or(now),
             updated_at: now,
@@ -329,6 +329,13 @@ pub async fn upgrade_skill(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("'{name}' 是手动配置项，没有版本信息，无法升级"))?;
 
+    // 注册表来源（SkillHub 等 HTTP 源）的升级路径与 git marketplace 完全不同：
+    // 没有仓库可 sync，直接按 slug 重新下载覆盖。必须在这里分流，否则会对一个
+    // https URL 执行 git clone 并给出莫名其妙的错误。
+    if source.is_registry() {
+        return crate::skillhub::upgrade_skillhub_skill(name, scope, cwd).await;
+    }
+
     let entries = marketplace::sync_marketplace(&source.marketplace_url).await?;
     let latest = entries
         .into_iter()
@@ -357,12 +364,22 @@ pub async fn upgrade_skill(
 }
 
 /// 卸载：删除对应 scope 目录下的 `.md` 文件 + 从 lockfile 删除 entry。
+///
+/// 技能有两种磁盘形态：marketplace 装的是单文件 `<name>.md`，HTTP 注册表
+/// （SkillHub）装的是目录 `<name>/SKILL.md`——后者带 `references/`、`scripts/`
+/// 等附属文件，只删 `.md` 会把一堆目录残留在 skills 根下，并让加载器继续把
+/// `references/*.md` 误注册成 slash command。
 pub fn uninstall_skill(name: &str, scope: InstallScope, cwd: &Path) -> Result<()> {
     let dest_dir = skill_dir(scope, cwd)?;
     let dest_path = dest_dir.join(format!("{name}.md"));
     if dest_path.exists() {
         std::fs::remove_file(&dest_path)
             .with_context(|| format!("删除 skill 文件失败: {}", dest_path.display()))?;
+    }
+    let bundle_dir = dest_dir.join(name);
+    if bundle_dir.is_dir() {
+        std::fs::remove_dir_all(&bundle_dir)
+            .with_context(|| format!("删除 skill 目录失败: {}", bundle_dir.display()))?;
     }
     let mut manifest = lockfile::load_scope(scope, cwd)?;
     manifest.skills.retain(|e| e.name != name);
