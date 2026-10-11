@@ -34,3 +34,5 @@ chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# 仅测试用：构造注册表技能包 zip 夹具，验证安装后的 lockfile 记账与目录清理
+zip.workspace = true
