@@ -72,7 +72,7 @@ impl AnthropicProvider {
             crate::request_plan::RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
         let is_official = profile.is_official_anthropic_endpoint();
         Ok(Self {
-            client: Client::new(),
+            client: crate::stream_guard::build_client()?,
             api_key,
             base_url,
             model: model.to_string(),
@@ -742,7 +742,12 @@ impl Provider for AnthropicProvider {
             futures::stream::iter(events)
         });
 
-        Ok(Box::pin(stream))
+        // idle 看门狗：连接被中间设备静默吞掉时 reqwest 永远不会返回错误，
+        // 裸流会无限期挂住（详见 `stream_guard` 模块文档）。
+        Ok(crate::stream_guard::with_idle_timeout(
+            Box::pin(stream),
+            crate::stream_guard::stream_idle_timeout(),
+        ))
     }
 }
 

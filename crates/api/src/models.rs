@@ -4,7 +4,6 @@
 //! 供应商随时可能调整接口地址或下线旧模型，用户创建后应自行核对。
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
 use serde::Deserialize;
 use wyj_config::{Provider, WireProtocol};
 
@@ -179,7 +178,7 @@ pub async fn fetch_model_ids(
     if base_url.is_empty() {
         return Err(anyhow!("base_url 为空，无法拉取模型列表"));
     }
-    let client = Client::new();
+    let client = crate::stream_guard::build_client()?;
     let ids: Vec<String> = match provider {
         Provider::OpenAI => {
             let url = format!("{base_url}/models");
