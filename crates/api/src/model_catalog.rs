@@ -169,6 +169,12 @@ fn base_capabilities(
                 )
             }
         }
+        // ⚠️ 这个标签是**单值**的，记不下 Qwen 那种 budget 与 effort 都认的 vendor
+        // （上面 SwitchPlusBudget 已经把它记成 BudgetTokens），也表达不了"只认
+        // `thinking.type` 开关"的 GLM / Ollama / Moonshot k2 —— 它们被标成 Effort
+        // 只是"需要用户手动控制强度"的意思，不代表真的接受 `reasoning_effort` 字段。
+        // 因此**判断某个档位能不能上送一律以 `ThinkingSpec::effort_levels` 为准**
+        // （见 `thinking::normalize_effort`），别再拿这个标签当 effort 的判据。
         ThinkingControl::SwitchPlusEffort
         | ThinkingControl::EffortOnly
         | ThinkingControl::SwitchOnly => Capability::new(
