@@ -109,6 +109,44 @@ wyj-i18n = { path = "crates/i18n" }
 wyj-store = { path = "crates/store" }
 wyj-computer = { path = "crates/computer" }
 
+# 1. 优化所有第三方依赖库的编译（Workspace 核心优化）
+# 即使你在开发/测试模式，也让 tokio, reqwest, ratatui 等上百个底层依赖库以零优化、无 debug 符号的方式编译。
+# 这样不仅能极大地缩减外部依赖在 target 里的体积，还能大幅加快后续的链接速度。
+[profile.dev.package."*"]
+opt-level = 0
+debug = false
+
+[profile.test.package."*"]
+opt-level = 0
+debug = false
+
+# 2. dev/test profile：关闭增量编译 + 只保留行号表
+#
+# 为什么必须关掉 incremental（2026-10-11 实测定位，勿轻易调回）：
+# 增量编译会把每个 codegen unit 的目标文件写进 `target/debug/deps/*.o`，文件名带
+# metadata hash。源码一改，整个 crate 换一个新 hash → rustc 写出一批全新文件名的 .o，
+# 而**被取代的旧 .o 原地保留、cargo 从不回收**。本仓库一次完整构建就产出 10,465 个 .o
+# （0.70 GB，全部来自 11 个工作区 crate）；实测「touch crates/core/src/lib.rs +
+# cargo build」单轮就新增 1,807 个 .o / 359 MB。按每天 20 轮估算 ≈ 7 GB/天、90 天
+# ≈ 630 GB，与实际观察到的 target 膨胀到 225 GB / 134 万文件吻合。
+# 代价不只是占盘：cargo 每次调用都要 stat 全部产物才能判断新鲜度，实测真·无变更 build
+# 的地板成本随文件数线性增长（4.2 GB / 1.07 万文件 = 0.66s；134 万文件就是分钟级）。
+# 关掉后 .o 不再散落到 deps/，产物按 metadata hash 稳定命名并原地覆盖，target 不再单调增长。
+[profile.dev]
+incremental = false
+# 只保留「文件名 + 行号」：panic backtrace 仍能定位到具体行，但不含变量值。
+# macOS 上 split-debuginfo = "unpacked" 意味着 DWARF 留在 .o 里，两者相乘才是体积放大器
+# （实测每个 .o 平均 70 KB）。完整调试（lldb 看变量/断点）需要时再临时改回 debug = 1。
+debug = "line-tables-only"
+split-debuginfo = "unpacked" # 在 macOS/Windows 上极其有效，防止符号文件重复打包进二进制中
+# codegen-units 保持默认(256)：文件数压力已由 incremental=false 消除，再调低只会拖慢编译。
+
+[profile.test]
+incremental = false
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+
 [profile.release]
 opt-level = 3
 lto = "thin"

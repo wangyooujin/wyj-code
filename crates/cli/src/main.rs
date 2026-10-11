@@ -23,6 +23,7 @@ mod extensions_cmd;
 mod memory_cmd;
 mod review_cmd;
 mod schedule_cmd;
+mod skillhub_cmd;
 mod storage_cmd;
 mod trust_cmd;
 mod update_cmd;
@@ -134,6 +135,17 @@ enum Commands {
     Schedule {
         #[command(subcommand)]
         command: schedule_cmd::ScheduleCommand,
+    },
+    /// HTTP 技能注册表（SkillHub）的搜索/预览/安装，`/skills` 面板 Browse tab 的
+    /// headless 等价物。安装第三方技能前会展示来源、作者、版本与包内容摘要，
+    /// 非交互环境需显式 `--yes`。
+    #[command(
+        name = "skillhub",
+        about = "Search and install skills from the SkillHub registry"
+    )]
+    SkillHub {
+        #[command(subcommand)]
+        command: skillhub_cmd::SkillHubCommand,
     },
     /// 按 TTL + 字节上限本地存储治理(Phase 4)。
     #[command(
@@ -689,8 +701,8 @@ async fn run_model_probe(
                     &wyj_api::provider::RequestOptions {
                         max_tokens: budget.saturating_add(32),
                         thinking_budget: Some(budget),
-                        reasoning_effort: profile.reasoning_effort.clone(),
-                        thinking_switch: profile.thinking_switch.clone(),
+                        reasoning_effort: profile.effective_reasoning_effort(),
+                        thinking_switch: profile.effective_thinking_switch(),
                         interleaved: profile.interleaved_thinking,
                     },
                 )
@@ -867,7 +879,9 @@ fn build_fallback_routes(
                 wyj_core::AgentRoute::new(name, resolution.identity.vendor, model, provider)
                     .with_capabilities(resolution.capabilities)
                     .with_limits(profile.max_tokens, profile.context_window)
-                    .with_thinking(profile.thinking_budget, profile.interleaved_thinking),
+                    .with_thinking(profile.thinking_budget, profile.interleaved_thinking)
+                    .with_reasoning_effort(profile.effective_reasoning_effort())
+                    .with_thinking_switch(profile.effective_thinking_switch()),
             )
         })
         .collect()
@@ -1007,6 +1021,9 @@ async fn main() -> Result<()> {
             Commands::Memory { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return memory_cmd::run(command, &cwd, cfg.auto_memory_enabled);
+            }
+            Commands::SkillHub { command } => {
+                return skillhub_cmd::run(command).await;
             }
             Commands::Schedule { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -1733,7 +1750,9 @@ async fn main() -> Result<()> {
         .with_thinking(
             cfg.active_profile().thinking_budget,
             cfg.active_profile().interleaved_thinking,
-        );
+        )
+        .with_reasoning_effort(cfg.active_profile().effective_reasoning_effort())
+        .with_thinking_switch(cfg.active_profile().effective_thinking_switch());
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前含 Plan 模式
@@ -1753,6 +1772,17 @@ async fn main() -> Result<()> {
     // 且每个变更动作已有独立确认弹窗、无需先在聊天里问用户"允许"
     if computer_use_enabled {
         let extra = wyj_core::prompts::COMPUTER_USE_HINT;
+        agent = agent.append_system(extra);
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(extra);
+    }
+
+    // TodoWrite 已由 `[tools].todo_enabled` 显式打开：补一段「何时用」的指引。
+    // 工具描述只说了它是什么，模型没有动机去调用；不注入的话会出现「配了开关
+    // 但面板永远不出现」。写进 `system_prompt_extra` 是为了让 TUI 侧 `/model`
+    // 重建 Agent 时同样带上（漏了就会在热切换后退回「模型不用 TodoWrite」）。
+    if cfg.tools.todo_enabled {
+        let extra = wyj_core::prompts::TODO_HINT;
         agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
@@ -2029,6 +2059,8 @@ async fn main() -> Result<()> {
                 cfg.active_profile().thinking_budget,
                 cfg.active_profile().interleaved_thinking,
             )
+            .with_reasoning_effort(cfg.active_profile().effective_reasoning_effort())
+            .with_thinking_switch(cfg.active_profile().effective_thinking_switch())
             .with_claude_md(claude_md_for_rebuild.clone())
             .with_hooks(hook_runner_for_rebuild.clone());
         if let Some(style) = &plugin_output_style_for_rebuild {
@@ -2567,6 +2599,8 @@ fn make_sub_agent_factory(
             .with_route_identity(p.name.clone(), model_resolution.identity.vendor, model)
             .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(p.thinking_budget, p.interleaved_thinking)
+            .with_reasoning_effort(p.effective_reasoning_effort())
+            .with_thinking_switch(p.effective_thinking_switch())
             .with_claude_md(claude_md.clone());
         if let Some(store) = &evolution {
             sub_agent = sub_agent.with_evolution(store.clone());
