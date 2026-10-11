@@ -24,6 +24,7 @@ use ratatui::Terminal;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
@@ -1852,6 +1853,8 @@ pub enum McpInputField {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SkillsInputField {
     AddMarketplaceUrl,
+    /// Browse tab 顶部的注册表搜索框：输入关键字，回车后发起 HTTP 搜索
+    BrowseSearch,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1883,6 +1886,10 @@ impl InputOwner {
             ),
             InputOwner::Skills(SkillsInputField::AddMarketplaceUrl) => (
                 wyj_i18n::tr("dialog.input_owner.skills_add_marketplace"),
+                Theme::claude_color(),
+            ),
+            InputOwner::Skills(SkillsInputField::BrowseSearch) => (
+                wyj_i18n::tr("dialog.input_owner.skills_search"),
                 Theme::claude_color(),
             ),
             InputOwner::Plugins(PluginsInputField::AddMarketplaceUrl) => (
@@ -3762,6 +3769,10 @@ pub enum SkillsOverlay {
     None,
     /// 文本内容存在 `SkillsDialog.live_input`（借用底部主输入框，见 `InputOwner`）
     AddMarketplace,
+    /// 注册表搜索进行中（吞掉所有按键，等待 `SkillRegistrySearched`）
+    Searching,
+    /// 已下载技能包、正在等用户确认是否落盘（`RegistryInstallConfirm` 的前置态）
+    FetchingArchive,
     Syncing {
         marketplace_id: String,
         git_url: String,
@@ -3772,6 +3783,16 @@ pub enum SkillsOverlay {
         entry: wyj_store::marketplace::MarketplaceSkillEntry,
         scope: wyj_store::InstallScope,
     },
+    /// 注册表（SkillHub）来源的技能安装确认。**必须在解压落盘之前**停下来让
+    /// 用户过目来源/作者/版本与包内容摘要——技能正文会整段作为模型指令进入
+    /// 对话，而包里可能夹带 `scripts/` 可执行内容，属于不可逆的信任动作。
+    RegistryInstallConfirm {
+        skill: Box<wyj_store::skillhub::SkillHubSkill>,
+        preview: wyj_store::skillhub::SkillArchivePreview,
+        /// 已下载的 zip 原始字节，确认后直接解压，无需二次下载
+        archive: Vec<u8>,
+        scope: wyj_store::InstallScope,
+    },
     Upgrading {
         row_idx: usize,
     },
@@ -3780,6 +3801,19 @@ pub enum SkillsOverlay {
         title: String,
         lines: Vec<String>,
     },
+}
+
+/// Browse tab 当前列表的数据来源。同一张表可以由 git marketplace 同步填充，
+/// 也可以由 HTTP 技能注册表搜索填充——两者条目类型不同，安装路径也不同，
+/// 因此必须记住"当前这份结果是哪儿来的"，不能靠 `browse_results` 非空来猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillsBrowseSource {
+    /// 还没有任何来源
+    None,
+    /// 来自某个 git marketplace（Marketplaces tab 选中"浏览"触发同步）
+    Marketplace,
+    /// 来自 HTTP 技能注册表（Browse tab 顶部搜索框）
+    Registry,
 }
 
 /// Installed 行菜单动作
@@ -3820,17 +3854,37 @@ fn scan_skill_dir_for_display(dir: &std::path::Path) -> Vec<(String, String)> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(name) = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
-        else {
+        // 目录式技能 `<name>/SKILL.md`（HTTP 注册表安装的形态）与单文件 `<name>.md`
+        //（git marketplace 安装的形态）都要收录，否则注册表装来的技能在
+        // Installed tab 里完全看不见——装了却看不见是最糟的一种 bug。
+        let (skill_file, name) = if path.is_dir() {
+            // 目录式技能：命令名是**目录名**，不是 SKILL.md 的文件名
+            // （用 file_stem 取会得到 "SKILL"）。
+            let candidate = path.join("SKILL.md");
+            if !candidate.is_file() {
+                continue;
+            }
+            let Some(name) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            (candidate, name)
+        } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            let Some(name) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            (path.clone(), name)
+        } else {
             continue;
         };
-        let description = std::fs::read_to_string(&path)
+        let description = std::fs::read_to_string(&skill_file)
             .ok()
             .and_then(|content| {
                 content
@@ -3855,6 +3909,17 @@ pub struct SkillsDialog {
     pub active_marketplace_id: String,
     pub active_marketplace_git_url: String,
     pub browse_results: Vec<wyj_store::marketplace::MarketplaceSkillEntry>,
+    /// Browse tab 当前的 HTTP 注册表搜索结果。与 `browse_results` 是互斥的两份
+    /// 列表：同一时刻只有一份有效，由 `browse_source` 指明是哪一份。
+    pub registry_results: Vec<wyj_store::skillhub::SkillHubSkill>,
+    /// `browse_results` 的来源，决定选中条目按哪条安装路径处理
+    pub browse_source: SkillsBrowseSource,
+    /// 正在下载/等待确认的那个注册表技能的 slug。下载期间用户仍可能移动光标，
+    /// 确认框回来时要按 slug 回查是哪一条，而不是信任当时的 cursor。
+    pub pending_registry_slug: String,
+    /// HTTP 技能注册表 API 根。留作后续支持多注册表/自建实例；当前固定用官方
+    /// 公共实例，不进 lockfile（与 SkillHub 的部署地址绑死无实际意义）。
+    pub registry_base_url: String,
     pub overlay: SkillsOverlay,
     /// 选中列表条目回车后弹出的操作菜单；None = 未打开
     pub menu: Option<ActionMenu<FlatRow, SkillsMenuAction>>,
@@ -3915,6 +3980,10 @@ impl SkillsDialog {
             active_marketplace_id: String::new(),
             active_marketplace_git_url: String::new(),
             browse_results: Vec::new(),
+            registry_results: Vec::new(),
+            browse_source: SkillsBrowseSource::None,
+            pending_registry_slug: String::new(),
+            registry_base_url: wyj_store::skillhub::SKILLHUB_BASE_URL.to_string(),
             overlay: SkillsOverlay::None,
             menu: None,
             error: None,
@@ -3931,7 +4000,7 @@ impl SkillsDialog {
     }
 
     /// 扁平化行列表：当前 tab 下的条目下标，或该 tab 的固定"+ 添加"行。
-    /// tab 头不算进 rows()，单独渲染；Installed/Browse 没有 AddNew。
+    /// tab 头不算进 rows()，单独渲染；Installed 没有 AddNew。
     pub fn rows(&self) -> Vec<FlatRow> {
         match self.tab {
             SkillsDialogTab::Installed => (0..self.installed.len()).map(FlatRow::Entry).collect(),
@@ -3940,7 +4009,18 @@ impl SkillsDialog {
                 r.push(FlatRow::AddNew);
                 r
             }
-            SkillsDialogTab::Browse => (0..self.browse_results.len()).map(FlatRow::Entry).collect(),
+            SkillsDialogTab::Browse => {
+                // 搜索框固定占第 0 行（沿用 MCP 面板 Browse 的 AddNew 约定）。
+                // `FlatRow::Entry(i)` 携带的是**结果列表下标**而非行号，因此
+                // 搜索结果不需要整体偏移 1。
+                let count = match self.browse_source {
+                    SkillsBrowseSource::Registry => self.registry_results.len(),
+                    _ => self.browse_results.len(),
+                };
+                let mut r = vec![FlatRow::AddNew];
+                r.extend((0..count).map(FlatRow::Entry));
+                r
+            }
         }
     }
 
@@ -4290,22 +4370,104 @@ fn skills_execute_menu_action(
             }
         }
         SkillsMenuAction::Browse(SkillsBrowseAction::Install) => {
-            let entry = state
-                .skills_dialog
-                .as_ref()
-                .and_then(|d| d.browse_results.get(idx).cloned());
-            if let Some(entry) = entry {
-                if let Some(dialog) = &mut state.skills_dialog {
-                    dialog.overlay = SkillsOverlay::InstallConfirm {
-                        marketplace_id: dialog.active_marketplace_id.clone(),
-                        git_url: dialog.active_marketplace_git_url.clone(),
-                        entry,
-                        scope: wyj_store::InstallScope::Global,
-                    };
+            // 同一张 Browse 表可能装的是 git marketplace 条目，也可能是 HTTP
+            // 注册表搜索结果——两条安装路径完全不同（前者直接拷贝 .md，后者要
+            // 下载 zip、过安全校验、解压成目录），按 browse_source 分流。
+            let source = state.skills_dialog.as_ref().map(|d| d.browse_source);
+            match source {
+                Some(SkillsBrowseSource::Registry) => {
+                    let skill = state
+                        .skills_dialog
+                        .as_ref()
+                        .and_then(|d| d.registry_results.get(idx).cloned());
+                    if let Some(skill) = skill {
+                        start_registry_archive_fetch(state, agent_tx, skill);
+                    }
+                }
+                _ => {
+                    let entry = state
+                        .skills_dialog
+                        .as_ref()
+                        .and_then(|d| d.browse_results.get(idx).cloned());
+                    if let Some(entry) = entry {
+                        if let Some(dialog) = &mut state.skills_dialog {
+                            dialog.overlay = SkillsOverlay::InstallConfirm {
+                                marketplace_id: dialog.active_marketplace_id.clone(),
+                                git_url: dialog.active_marketplace_git_url.clone(),
+                                entry,
+                                scope: wyj_store::InstallScope::Global,
+                            };
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// 在后台发起一次注册表关键字搜索，结果经 `SkillRegistrySearched` 回到 UI 线程。
+///
+/// 不在主循环里 `block_on`：搜索是一次网络往返，卡住事件循环会让整个 TUI 冻结。
+fn start_registry_search(
+    state: &mut AppState,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    query: String,
+) {
+    let base_url = state
+        .skills_dialog
+        .as_ref()
+        .map(|d| d.registry_base_url.clone())
+        .unwrap_or_else(|| wyj_store::skillhub::SKILLHUB_BASE_URL.to_string());
+    if let Some(dialog) = &mut state.skills_dialog {
+        dialog.overlay = SkillsOverlay::Searching;
+        dialog.error = None;
+        dialog.status = None;
+    }
+    let tx = agent_tx.clone();
+    tokio::spawn(async move {
+        let client = wyj_store::skillhub::SkillHubClient::new(base_url);
+        let result = client
+            .search_default(&query)
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AgentEvent::SkillRegistrySearched { result }).await;
+    });
+}
+
+/// 下载技能包并扫描内容预览，**全程不落盘**。
+///
+/// 刻意把「下载」和「安装」拆成两步：确认框要展示来源/作者/版本与包里到底有
+/// 什么（尤其 `scripts/`、`hooks/` 下的可执行内容），所以必须先把包拉到手上看
+/// 一眼，再由用户决定是否解压进 skills 目录。
+fn start_registry_archive_fetch(
+    state: &mut AppState,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    skill: wyj_store::skillhub::SkillHubSkill,
+) {
+    let base_url = state
+        .skills_dialog
+        .as_ref()
+        .map(|d| d.registry_base_url.clone())
+        .unwrap_or_else(|| wyj_store::skillhub::SKILLHUB_BASE_URL.to_string());
+    if let Some(dialog) = &mut state.skills_dialog {
+        dialog.overlay = SkillsOverlay::FetchingArchive;
+        dialog.error = None;
+        dialog.pending_registry_slug = skill.slug.clone();
+    }
+    let tx = agent_tx.clone();
+    tokio::spawn(async move {
+        let client = wyj_store::skillhub::SkillHubClient::new(base_url);
+        let result = async {
+            let archive = client.download(&skill.slug, &skill.namespace).await?;
+            let preview = wyj_store::skillhub::preview_archive(&archive)?;
+            anyhow::Ok((preview, archive))
+        }
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let _ = tx
+            .send(AgentEvent::SkillRegistryArchiveFetched { result })
+            .await;
+    });
 }
 
 // ── 插件管理面板：/plugins 命令触发 ─────────────────────────────────────────────
@@ -5284,8 +5446,15 @@ mod navigation_focus_tests {
             todo("a", TodoStatus::Pending),
             todo("b", TodoStatus::Pending),
         ]);
-        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
-        state.sub_agents.insert(2, sub_agent(SubAgentStatus::Done));
+        // 子 Agent 必须是 Running：面板只列运行中的条目（`visible_sub_agents`
+        // 是唯一口径），已完成的条目导航根本走不到。本测试要验的是跨区域导航
+        // 链条本身，与条目状态无关。
+        state
+            .sub_agents
+            .insert(1, sub_agent(SubAgentStatus::Running));
+        state
+            .sub_agents
+            .insert(2, sub_agent(SubAgentStatus::Running));
         state.chat_scroll = 6;
         state.chat_max_scroll = 6;
 
@@ -6321,7 +6490,22 @@ pub struct AppState {
     pub model_name: String,
     pub context_window: u32,
     pub mode: AgentMode,
-    pub current_task: Option<AbortHandle>,
+    pub current_task: Option<TurnTask>,
+    /// 本轮最后一次收到「有任何动静」的时刻，用于回合心跳看门狗。
+    ///
+    /// 与 `turn_start_time`（整轮耗时）不同：那个从回合开始一路累加，
+    /// 这个**每当 `apply_agent_event` 收到任何事件就重置**。判据是
+    /// 「多久没有任何进展」而非「这轮跑了多久」——长回合只要还在吐
+    /// delta / 跑工具就不该被判死。
+    ///
+    /// 为什么需要它（`reap_lost_turn_task` 补不了的洞）：后者只看
+    /// `task.is_finished()`，即只兜「task 已死」（panic / abort）。task
+    /// **活着但卡住**时该标志恒为 false，看门狗永不触发，而 `is_thinking`
+    /// 的清零只认 `TurnDone` / `Error`——用户后续输入全部滞留
+    /// `pending_queue`，连兜底分支也被同一标志挡住，表现为「跑着跑着
+    /// 停住，之后输入全无响应」。已知的卡死源（LLM 流 stall、工具 hang、
+    /// MCP 不回响应）各有各的局部超时，但未知的那部分只能在这里兜底。
+    pub last_turn_activity: Instant,
     pub ctrl_c_pressed: bool,
     pub last_ctrl_c: Option<Instant>,
     /// Slash 命令补全候选列表（命令名, 描述）
@@ -6531,6 +6715,7 @@ impl AppState {
             context_window,
             mode,
             current_task: None,
+            last_turn_activity: Instant::now(),
             ctrl_c_pressed: false,
             last_ctrl_c: None,
             slash_completions: vec![],
@@ -6715,6 +6900,9 @@ impl AppState {
         self.sub_output_tokens = 0;
         self.ui_focus = UiFocus::Composer;
         self.input_owner = None;
+        // 心跳基准随会话一起重置：新会话第一帧不能继承上一段的静默时长，
+        // 否则空闲很久后立刻发消息会被看门狗当帧判死。
+        self.last_turn_activity = Instant::now();
     }
 
     pub fn ensure_message_ids(&mut self) {
@@ -7230,7 +7418,7 @@ impl AppState {
         // 后台任务面板排在最后：只有前面都没有可聚焦内容时才落进来
         // （有运行中任务时 shift+↑ 会先进 subagent 面板，再 ↓ 走过来）。
         if self.has_running_shells() {
-            if let Some(last_id) = self.shells.last().map(|s| s.id.clone()) {
+            if let Some(last_id) = self.running_shells().last().map(|s| s.id.clone()) {
                 self.selected_sub_agent = None;
                 self.selected_todo_id = None;
                 self.todo_detail_open = false;
@@ -7317,12 +7505,10 @@ impl AppState {
         }
     }
 
+    /// 只在**运行中**的子 Agent 间取首/末（与 `visible_sub_agents` 同一口径）。
     fn focus_sub_agent_edge(&mut self, first: bool) -> bool {
-        let id = if first {
-            self.sub_agents.keys().next().copied()
-        } else {
-            self.sub_agents.keys().next_back().copied()
-        };
+        let mut ids = self.visible_sub_agents().into_iter().map(|(id, _)| *id);
+        let id = if first { ids.next() } else { ids.next_back() };
         let Some(id) = id else {
             return false;
         };
@@ -7338,11 +7524,13 @@ impl AppState {
 
     /// 聚焦后台任务面板的首/末项。`shells` 是 Vec，`first` 取首元素、
     /// 否则取末元素（Vec 保持 spawn 顺序，末项即最新启动的任务）。
+    /// 只在**运行中**的条目间取边缘（与 `running_shells` 同一口径）。
     fn focus_shell_edge(&mut self, first: bool) -> bool {
+        let running = self.running_shells();
         let id = if first {
-            self.shells.first().map(|s| s.id.clone())
+            running.first().map(|s| s.id.clone())
         } else {
-            self.shells.last().map(|s| s.id.clone())
+            running.last().map(|s| s.id.clone())
         };
         let Some(id) = id else {
             return false;
@@ -7361,24 +7549,27 @@ impl AppState {
     }
 
     /// 在后台任务列表内部移动；到达边界时返回 false，交给上层跨区域导航。
+    /// 只在**运行中**的条目间移动（与 `running_shells` 同一口径）：已完成的
+    /// 条目不在列表里，按 ↓ 跳过它只会让用户以为按键失灵。
     fn move_selected_shell(&mut self, delta: i32) -> bool {
-        if self.shells.is_empty() {
+        let running = self.running_shells();
+        if running.is_empty() {
             self.selected_shell = None;
             return false;
         }
         let current = self
             .selected_shell
             .as_deref()
-            .and_then(|id| self.shells.iter().position(|s| s.id == id));
+            .and_then(|id| running.iter().position(|s| s.id == id));
         let Some(current) = current else {
             // 没有有效选中（首次进入面板）：直接落到首/末项
             return self.focus_shell_edge(delta >= 0);
         };
         let next = current as i32 + delta;
-        if next < 0 || next >= self.shells.len() as i32 {
+        if next < 0 || next >= running.len() as i32 {
             return false;
         }
-        self.selected_shell = Some(self.shells[next as usize].id.clone());
+        self.selected_shell = Some(running[next as usize].id.clone());
         self.shell_detail_scroll = 0;
         self.ui_focus = UiFocus::Shells;
         true
@@ -7390,8 +7581,14 @@ impl AppState {
     }
 
     /// 在 SubAgent 列表内部移动；到达边界时返回 false，交给上层跨区域导航。
+    /// 只在**运行中**的条目间移动（与 `visible_sub_agents` 同一口径）。
     fn move_selected_sub_agent(&mut self, delta: i32) -> bool {
-        let ids: Vec<u64> = self.sub_agents.keys().copied().collect();
+        let ids: Vec<u64> = self
+            .sub_agents
+            .iter()
+            .filter(|(_, s)| s.status == SubAgentStatus::Running)
+            .map(|(id, _)| *id)
+            .collect();
         if ids.is_empty() {
             self.selected_sub_agent = None;
             return false;
@@ -7419,6 +7616,68 @@ impl AppState {
             .any(|s| s.status == SubAgentStatus::Running)
     }
 
+    /// 面板里**应当列出**的后台 shell：只含仍在运行的。
+    ///
+    /// `self.shells` 本身只增不减（退出状态要留在里面等 `poll_shells` 读、
+    /// 自动唤醒也要读），但面板列表只展示运行中的条目 —— 已完成的 shell 对
+    /// 用户已经没有可操作价值（输出早已通过 reminder 回灌给模型、聊天流里
+    /// 也留了 `bash_N 已退出` 记录），继续挂在列表里只是噪音。
+    pub fn running_shells(&self) -> Vec<&ShellUiState> {
+        self.shells
+            .iter()
+            .filter(|s| s.status == ShellStatus::Running)
+            .collect()
+    }
+
+    /// 选中项若已不在运行列表里（刚好退出），落到最后一个运行项上；
+    /// 一个都不剩时清空选中态，避免焦点悬空指向一个看不见的行。
+    pub fn reconcile_shell_selection(&mut self) {
+        let running: Vec<String> = self
+            .shells
+            .iter()
+            .filter(|s| s.status == ShellStatus::Running)
+            .map(|s| s.id.clone())
+            .collect();
+        let still_valid = self
+            .selected_shell
+            .as_ref()
+            .is_some_and(|sel| running.iter().any(|id| id == sel));
+        if !still_valid {
+            self.selected_shell = running.last().cloned();
+            self.shell_detail_scroll = 0;
+        }
+        if self.selected_shell.is_none() {
+            self.shell_detail_open = false;
+            if self.ui_focus == UiFocus::Shells {
+                self.ui_focus = UiFocus::Composer;
+            }
+        }
+    }
+
+    /// 子 Agent 版的 [`AppState::reconcile_shell_selection`]：选中项完成/
+    /// 中断后重新落到运行中的最后一项，没有运行项时收起面板并交还输入焦点。
+    pub fn reconcile_sub_agent_selection(&mut self) {
+        let running: Vec<u64> = self
+            .sub_agents
+            .iter()
+            .filter(|(_, s)| s.status == SubAgentStatus::Running)
+            .map(|(id, _)| *id)
+            .collect();
+        let still_valid = self
+            .selected_sub_agent
+            .is_some_and(|sel| running.contains(&sel));
+        if !still_valid {
+            self.selected_sub_agent = running.last().copied();
+            self.sub_agent_detail_scroll = 0;
+        }
+        if self.selected_sub_agent.is_none() {
+            self.sub_agent_detail_open = false;
+            if self.ui_focus == UiFocus::SubAgents {
+                self.ui_focus = UiFocus::Composer;
+            }
+        }
+    }
+
     /// 把 `BashSessionManager` 的任务快照同步进 `shells`，返回**本次新检测到
     /// 退出**的任务 id。
     ///
@@ -7427,7 +7686,7 @@ impl AppState {
     /// 拿到的每个 id 都对应一次真实的「完成」，天然去重。
     ///
     /// 选中项可能指向已不存在的 id（理论上不会发生，jobs map 只增不减），
-    /// 这里顺手修正成首个任务，避免面板焦点悬空。
+    /// 这里顺手把选中态收敛到仍在运行的条目上，避免焦点悬空。
     pub fn poll_shells(&mut self) -> Vec<String> {
         let mut newly_exited = Vec::new();
         for (id, command, status) in wyj_tools::BashSessionManager::global().list() {
@@ -7454,12 +7713,10 @@ impl AppState {
                 newly_exited.push(id);
             }
         }
-        if self
-            .selected_shell
-            .as_ref()
-            .is_some_and(|sel| !self.shells.iter().any(|s| &s.id == sel))
-        {
-            self.selected_shell = self.shells.first().map(|s| s.id.clone());
+        // 本次可能刚有任务退出（newly_exited 非空），选中态需要重新对齐到
+        // 仍在运行的条目上；否则用户会停在一个已经从列表里消失的行上。
+        if !newly_exited.is_empty() {
+            self.reconcile_shell_selection();
         }
         newly_exited
     }
@@ -7497,11 +7754,19 @@ impl AppState {
         });
     }
 
-    /// 可供面板展示的子 Agent：本会话生命周期内全部保留（不再按完成时长过滤），
-    /// 按 BTreeMap 自然顺序（启动顺序）排列。面板是否自动显示由渲染层根据
-    /// “仍有运行中 Agent / 用户主动打开面板”决定。
+    /// 可供面板展示的子 Agent：**只含仍在运行的**，按 BTreeMap 自然顺序
+    /// （启动顺序）排列。
+    ///
+    /// 已完成 / 失败 / 中断的条目不再列出——它们的最终结果已经通过
+    /// `bg_agent_done_reminder` 回灌进对话（前台则直接作为 ToolResult），
+    /// 完整轨迹也仍落盘在 `~/.wyj-code/sessions/<id>.subagents/`，可用
+    /// `wyj-code subagent-trace` 或 `/subagents <id>` 之外的落盘路径查阅。
+    /// 留在面板里只是占位：用户唯一能对它做的操作（看 trace）已经不在列表上了。
     pub fn visible_sub_agents(&self) -> Vec<(&u64, &SubAgentUiState)> {
-        self.sub_agents.iter().collect()
+        self.sub_agents
+            .iter()
+            .filter(|(_, s)| s.status == SubAgentStatus::Running)
+            .collect()
     }
 
     pub fn sub_agent_trace_events(&mut self, id: u64) -> Option<Vec<TraceEvent>> {
@@ -7534,6 +7799,7 @@ impl AppState {
                 }
             }
         }
+        self.reconcile_sub_agent_selection();
         if self.is_thinking {
             if self.streaming_buf.is_empty() {
                 self.streaming_buf = "[已中断]".to_string();
@@ -7561,6 +7827,133 @@ impl AppState {
             self.messages
                 .push(ChatMessage::system(format!("已中断，{n} 条排队消息已丢弃")));
         }
+    }
+
+    /// 回合 task 看门狗：task 已经死了、UI 却还以为它在思考时，补一个终止事件
+    /// 把状态收回来。返回 true 表示本帧做了兜底。
+    ///
+    /// 调用位置硬约束：必须排在主循环 `agent_rx` 排空**之后**。task 正常收尾
+    /// 的顺序是「先把 `TurnDone` / `Error` 塞进 channel，再结束自己」，若在这
+    /// 里抢在事件被应用之前判 `is_finished()`，就会把正常收尾误判成异常终止。
+    ///
+    /// 为什么必须有它：panic 的信息写进 alternate screen 下的 stderr，用户
+    /// 看不见；没有这个兜底，UI 就永久停在 thinking，用户后续输入全部滞留
+    /// `pending_queue`（连 `!is_thinking` 的兜底分支也被同一个标志挡住）。
+    pub fn reap_lost_turn_task(&mut self) -> bool {
+        if !self.is_thinking {
+            return false;
+        }
+        match &self.current_task {
+            Some(task) if task.is_finished() => {}
+            _ => return false,
+        }
+        self.current_task = None;
+        self.flush_streaming();
+        self.is_thinking = false;
+        self.injector = None;
+        self.current_op = None;
+        self.current_op_started = None;
+        let message = wyj_i18n::tr("agent.turn_task_lost");
+        self.push_tracked_message(ChatMessage::assistant_err(message.clone()));
+        notify_emit(NotificationEvent::TurnError {
+            error: truncate_notify_body(&message),
+            session_id: if self.current_session_id.is_empty() {
+                None
+            } else {
+                Some(self.current_session_id.clone())
+            },
+        });
+        true
+    }
+
+    /// 回合心跳看门狗：task **活着但长时间没有任何进展**时，主动 abort 它。
+    ///
+    /// 与 [`Self::reap_lost_turn_task`] 的分工：后者只看 `is_finished()`，
+    /// 兜的是「task 已死」（panic / 被 abort）；本方法兜的是「task 还活着
+    /// 却卡住了」。两者缺一不可——只有后者时，一条 hang 住的 LLM 流或工具
+    /// 调用会让 UI 永久停在 thinking，用户后续输入全部滞留
+    /// `pending_queue`，连 `!is_thinking && !pending_queue.is_empty()` 的
+    /// 兜底分支也被同一个标志挡住。
+    ///
+    /// 调用位置硬约束：与 `reap_lost_turn_task` 同处，且排在 agent 事件
+    /// 排空之后——刚收到的事件不应被本帧立刻判死。
+    ///
+    /// **刻意不统计「用户正在等交互」的时长**：权限确认 / AskQuestion /
+    /// 计划批准弹窗打开期间，round 处于合法阻塞（await oneshot），用户可能
+    /// 离开几分钟才回来。这段时间不计入心跳，否则一次正常的「出去倒杯水」
+    /// 就会把回合杀掉。判据是「既没有事件、又没有弹窗在等用户」。
+    ///
+    /// 返回 true 表示本帧做了兜底。
+    pub fn abort_stalled_turn(&mut self) -> bool {
+        if !self.is_thinking {
+            self.last_turn_activity = Instant::now();
+            return false;
+        }
+        // 正在等用户交互：这不是「卡死」，是合法阻塞。心跳继续静置，
+        // 等用户答复后事件一到自然重置。
+        if self.permission_dialog.is_some()
+            || self.ask_question_dialog.is_some()
+            || self.plan_dialog.is_some()
+            || self.exec_mode_confirm.is_some()
+        {
+            self.last_turn_activity = Instant::now();
+            return false;
+        }
+        let stalled_for = self.last_turn_activity.elapsed();
+        let threshold = turn_stall_timeout();
+        if stalled_for < threshold {
+            return false;
+        }
+
+        // 先 abort task：它的 future 被 drop 时会释放 session Mutex，
+        // 且 TurnFinishedGuard 随之置位（但不依赖它——下面手工收状态）。
+        if let Some(task) = self.current_task.take() {
+            task.abort();
+        }
+        // task 若正卡在等 oneshot（confirm_tool / AskQuestion / ExitPlanMode），
+        // abort 掉 future 后 receiver 也随之被 drop，发送端写不写都不会
+        // 挂住。但这里仍然显式发一次 Deny/拒绝：万一弹窗还开着，用户看到的
+        // 就是一个能按的框，而不是一个死界面。
+        if let Some(dlg) = self.permission_dialog.take() {
+            let _ = dlg.response_tx.send(wyj_tools::PermissionDecision::Deny);
+        }
+        if let Some(dlg) = self.ask_question_dialog.take() {
+            let _ = dlg.response_tx.send(None);
+        }
+        if let Some(dlg) = self.plan_dialog.take() {
+            let _ = dlg.response_tx.send(false);
+        }
+        self.exec_mode_confirm = None;
+
+        self.flush_streaming();
+        self.is_thinking = false;
+        self.injector = None;
+        self.current_op = None;
+        self.current_op_started = None;
+        self.last_turn_activity = Instant::now();
+        if let Some(start) = self.turn_start_time.take() {
+            self.last_turn_elapsed_secs = Some(start.elapsed().as_secs_f64());
+            self.last_turn_input_tokens = self
+                .total_input_tokens
+                .saturating_sub(self.turn_start_input_tokens);
+            self.last_turn_output_tokens = self
+                .total_output_tokens
+                .saturating_sub(self.turn_start_output_tokens);
+        }
+        let message = wyj_i18n::tr_fmt(
+            "agent.turn_stalled",
+            &[("secs", &threshold.as_secs().to_string())],
+        );
+        self.push_tracked_message(ChatMessage::assistant_err(message.clone()));
+        notify_emit(NotificationEvent::TurnError {
+            error: truncate_notify_body(&message),
+            session_id: if self.current_session_id.is_empty() {
+                None
+            } else {
+                Some(self.current_session_id.clone())
+            },
+        });
+        true
     }
 
     fn push_user(&mut self, text: String) {
@@ -7592,6 +7985,9 @@ impl AppState {
     }
 
     fn apply_agent_event(&mut self, event: AgentEvent) {
+        // 回合心跳：任何事件都算「有进展」。看门狗判的是「多久没动静」，
+        // 不是「这轮跑了多久」——长回合只要还在吐 delta / 跑工具就不该判死。
+        self.last_turn_activity = Instant::now();
         match event {
             AgentEvent::TextDelta(d) => {
                 // thinking 结束、正文开始：先折叠思考行
@@ -8038,12 +8434,91 @@ impl AppState {
                                 dialog.active_marketplace_id = marketplace_id;
                                 dialog.active_marketplace_git_url = git_url;
                                 dialog.browse_results = entries;
+                                // 这批结果是 git marketplace 来的，必须记下来源，
+                                // 否则后面安装时会按注册表路径去下载 zip。
+                                dialog.browse_source = SkillsBrowseSource::Marketplace;
                                 dialog.tab = SkillsDialogTab::Browse;
-                                dialog.cursor = 0;
+                                // rows() 里位置 0 是搜索行，第一条真实结果在 1。
+                                dialog.cursor = if dialog.browse_results.is_empty() {
+                                    0
+                                } else {
+                                    1
+                                };
                             }
                             Err(e) => {
                                 dialog.error = Some(wyj_i18n::tr_fmt(
                                     "skills.error.sync_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::SkillRegistrySearched { result } => {
+                if let Some(dialog) = &mut self.skills_dialog {
+                    // 只接受当前仍在等待的那次搜索的结果，避免连按回车时旧响应
+                    // 覆盖新结果。
+                    if matches!(dialog.overlay, SkillsOverlay::Searching) {
+                        dialog.overlay = SkillsOverlay::None;
+                        match result {
+                            Ok(results) => {
+                                dialog.status = if results.is_empty() {
+                                    Some(wyj_i18n::tr("skills.dialog.no_results"))
+                                } else {
+                                    None
+                                };
+                                dialog.registry_results = results;
+                                dialog.browse_results = Vec::new();
+                                dialog.browse_source = SkillsBrowseSource::Registry;
+                                dialog.tab = SkillsDialogTab::Browse;
+                                // 位置 0 是搜索行；有结果时停在第一条上。
+                                dialog.cursor = if dialog.registry_results.is_empty() {
+                                    0
+                                } else {
+                                    1
+                                };
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "skills.error.registry_search_failed",
+                                    &[("err", &e)],
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            AgentEvent::SkillRegistryArchiveFetched { result } => {
+                if let Some(dialog) = &mut self.skills_dialog {
+                    if matches!(dialog.overlay, SkillsOverlay::FetchingArchive) {
+                        dialog.overlay = SkillsOverlay::None;
+                        match result {
+                            Ok((preview, archive)) => {
+                                // 回填发起下载时选中的那条技能；期间用户可能已经
+                                // 移动过光标，所以按 slug 回查而不是信任当前 cursor。
+                                let Some(idx) = dialog
+                                    .registry_results
+                                    .iter()
+                                    .position(|s| s.slug == dialog.pending_registry_slug.clone())
+                                else {
+                                    return;
+                                };
+                                let Some(skill) = dialog.registry_results.get(idx).cloned() else {
+                                    return;
+                                };
+                                dialog.overlay = SkillsOverlay::RegistryInstallConfirm {
+                                    skill: Box::new(skill),
+                                    preview,
+                                    archive,
+                                    scope: wyj_store::InstallScope::Global,
+                                };
+                            }
+                            Err(e) => {
+                                dialog.error = Some(wyj_i18n::tr_fmt(
+                                    "skills.error.registry_download_failed",
                                     &[("err", &e)],
                                 ));
                             }
@@ -8403,6 +8878,8 @@ impl AppState {
                         agent.current_tool = None;
                         agent.finished_at = Some(Instant::now());
                     }
+                    // 被中断的条目从面板列表消失，选中态要重新对齐
+                    self.reconcile_sub_agent_selection();
                 }
             }
             E::Done {
@@ -8433,6 +8910,9 @@ impl AppState {
                     s.finished_at = Some(Instant::now());
                     s.final_result = Some(result.clone());
                 }
+                // 完成即从面板列表消失，选中态（若正指向它）要重新对齐到
+                // 仍在运行的条目；一个都不剩时收起面板并把焦点交还输入框。
+                self.reconcile_sub_agent_selection();
                 if background {
                     // 统一通知：后台子 Agent 完成（前台调用不通知，避免和主回合
                     // TurnFinished 在同一面板里重复提示）
@@ -9226,7 +9706,104 @@ async fn build_user_blocks(text: String, attachments: Vec<Attachment>) -> Vec<Co
     blocks
 }
 
-/// 构建并 spawn 一轮 Agent 对话任务，返回可用于中断的 AbortHandle 及补充信息注入通道。
+/// 回合心跳看门狗的静默阈值：连续这么久（且期间无弹窗等待用户）都没有收到
+/// 任何 Agent 事件，就判定 task 已卡死并主动 abort。
+///
+/// 取 15 分钟的理由：必须显著大于任何**合法**的静默窗口，否则会误杀健康回合。
+/// 已知的合法长静默有三种——LLM 长流式生成（`api::stream_guard` 侧 120s
+/// idle 看门狗已覆盖，超时会被打断重试而非静默）、前台 Bash（工具侧默认
+/// 120s、schema 上限 600s）、长 thinking（按 delta 持续流出，不静默）。
+/// **必须严格大于 600s**：等于会让「Bash 跑满 600s 上限」与看门狗判死
+/// 同时发生，工具还没来得及返回自己的超时错误回合就被杀了——那样的报错
+/// 会把原因指向错误的地方。留出余量确保「工具侧超时永远先于心跳触发」。
+///
+/// 可用 `WYJ_CODE_TURN_STALL_SECS` 覆盖（0 = 关闭看门狗）。
+pub const TURN_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// 实际生效的回合静默阈值（首次读取时解析环境变量，之后固定）。
+pub fn turn_stall_timeout() -> std::time::Duration {
+    static STALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *STALL.get_or_init(|| {
+        let Some(raw) = std::env::var("WYJ_CODE_TURN_STALL_SECS").ok() else {
+            return TURN_STALL_TIMEOUT;
+        };
+        match raw.trim().parse::<u64>() {
+            Ok(0) => std::time::Duration::MAX,
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    "WYJ_CODE_TURN_STALL_SECS 不是合法秒数，回退到默认值"
+                );
+                TURN_STALL_TIMEOUT
+            }
+        }
+    })
+}
+
+/// 一轮 Agent 对话 task 的句柄：中断能力 + 存活标记。
+///
+/// 修复前 `spawn_agent_turn` 只把 `AbortHandle` 交回 UI（`JoinHandle` 被
+/// `abort_handle()` 消费掉，等于 task 被 detach），于是 task 无论 panic 还是被
+/// 外部 abort，都**不会**产生 `TurnDone` / `Error`。而 `is_thinking` 的清零
+/// 只认这两个事件（`AppState::apply_agent_event`）。task 一死，UI 就永久停在
+/// thinking，用户后续输入全部滞留 `pending_queue` 无人排空——连兜底分支
+/// `!is_thinking && !pending_queue.is_empty()` 也被同一个标志挡住——表现为
+/// 「跑着跑着停住，之后输入什么都不响应」。
+///
+/// `finished` 由 task 内的 [`TurnFinishedGuard`] 置位。正常返回、panic 展开、
+/// 被 abort 丢弃 future，三条路径都会 drop guard，缺一不可，所以不能用
+/// 「task 末尾显式置位」那种写法。
+pub struct TurnTask {
+    abort: AbortHandle,
+    finished: Arc<AtomicBool>,
+}
+
+impl TurnTask {
+    pub fn abort(&self) {
+        self.abort.abort();
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+/// RAII 存活标记：只要 task 的 future 被销毁（正常结束 / panic 展开 / abort），
+/// Drop 一定执行，据此把「task 已死」这件事可靠地告诉 UI。
+struct TurnFinishedGuard(Arc<AtomicBool>);
+
+impl Drop for TurnFinishedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// spawn 一个回合 task 并返回带存活标记的句柄。
+///
+/// **所有会置 `is_thinking = true` 的 spawn 都必须走这里**（`spawn_agent_turn`
+/// 与两处 `CommandResult::RunPrompt*`）。裸 `tokio::spawn` + 只取
+/// `abort_handle()` 会让 task 变成 detach：panic 信息写进 alternate screen 下
+/// 的 stderr，用户看不见，而 UI 永远等不到终止事件。
+fn spawn_turn_task<F>(future: F) -> TurnTask
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let finished = Arc::new(AtomicBool::new(false));
+    let finished_for_task = finished.clone();
+    let handle = tokio::spawn(async move {
+        // 存活标记必须包在 future 最外层：task 因 panic 或 abort 而死时
+        // （也就是最需要通知 UI 的两种情况），靠它把 is_thinking 解开。
+        let _finished_guard = TurnFinishedGuard(finished_for_task);
+        future.await;
+    });
+    TurnTask {
+        abort: handle.abort_handle(),
+        finished,
+    }
+}
+
+/// 构建并 spawn 一轮 Agent 对话任务，返回任务句柄及补充信息注入通道。
 ///
 /// `text` 区分两类回合：
 /// - `Some(text)` = 常规回合，`text` 是用户输入（作为 user 消息落进 session 历史）。
@@ -9255,12 +9832,12 @@ fn spawn_agent_turn(
     preface_reminders: Vec<String>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
 ) -> (
-    AbortHandle,
+    TurnTask,
     mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>,
 ) {
     let (inject_tx, mut inject_rx) =
         mpsc::unbounded_channel::<(Vec<ContentBlock>, InjectionKind)>();
-    let handle = tokio::spawn(async move {
+    let task = spawn_turn_task(async move {
         let mut sess = session_c.lock().await;
         match text {
             Some(text) => {
@@ -9356,7 +9933,7 @@ fn spawn_agent_turn(
             }
         }
     });
-    (handle.abort_handle(), inject_tx)
+    (task, inject_tx)
 }
 
 fn emit_plugin_event_background(
@@ -9760,14 +10337,22 @@ fn reload_persisted_sub_agents(
 /// （本会话历史子 Agent 已在启动/`/resume` 时由 `reload_persisted_sub_agents`
 /// 回灌进 `state.sub_agents`，故这里天然覆盖跨会话查看）；带 id 时校验存在性。
 fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
-    if state.sub_agents.is_empty() {
+    // 面板只列运行中的子 Agent（`visible_sub_agents` 是唯一口径），因此这里
+    // 也只在运行项里定位：选中一个不在列表上的 id 会让焦点悬空在一行看不见的
+    // 位置，用户按 ↑↓ 才知道发生了什么。
+    let running: Vec<u64> = state
+        .visible_sub_agents()
+        .iter()
+        .map(|(id, _)| **id)
+        .collect();
+    if running.is_empty() {
         state
             .messages
             .push(ChatMessage::system(wyj_i18n::tr("subagents.empty")));
         return;
     }
     match target_id {
-        Some(id) if state.sub_agents.contains_key(&id) => {
+        Some(id) if running.contains(&id) => {
             state.selected_sub_agent = Some(id);
             state.sub_agent_detail_open = true;
             state.sub_agent_detail_scroll = 0;
@@ -9780,7 +10365,7 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
             )));
         }
         None => {
-            if let Some(&last_id) = state.sub_agents.keys().next_back() {
+            if let Some(&last_id) = running.last() {
                 state.selected_sub_agent = Some(last_id);
                 state.sub_agent_detail_open = true;
                 state.sub_agent_detail_scroll = 0;
@@ -9790,17 +10375,22 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
     }
 }
 
-/// `/shells [id]` 命令：无参数时定位到最近一个后台任务并展开实时输出；
-/// 带 id 时校验存在性。
+/// `/shells [id]` 命令：无参数时定位到最近一个**运行中**的后台任务并展开实时
+/// 输出；带 id 时同样只在运行项里校验（面板不列已完成的条目）。
 fn apply_open_shells_panel(state: &mut AppState, target_id: Option<String>) {
-    if state.shells.is_empty() {
+    let running: Vec<String> = state
+        .running_shells()
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+    if running.is_empty() {
         state
             .messages
             .push(ChatMessage::system(wyj_i18n::tr("shells.empty")));
         return;
     }
     match target_id {
-        Some(id) if state.shells.iter().any(|s| s.id == id) => {
+        Some(id) if running.iter().any(|s| s == &id) => {
             state.selected_shell = Some(id);
             state.shell_detail_open = true;
             state.shell_detail_scroll = 0;
@@ -9813,9 +10403,9 @@ fn apply_open_shells_panel(state: &mut AppState, target_id: Option<String>) {
             )));
         }
         None => {
-            // shells 是 Vec（保持 spawn 顺序），末项即最近启动的任务
-            if let Some(last) = state.shells.last() {
-                state.selected_shell = Some(last.id.clone());
+            // 保持 spawn 顺序的末项即最近启动的**运行中**任务
+            if let Some(last) = running.last() {
+                state.selected_shell = Some(last.clone());
                 state.shell_detail_open = true;
                 state.shell_detail_scroll = 0;
                 state.ui_focus = UiFocus::Shells;
@@ -10251,6 +10841,16 @@ async fn tui_main(
             state.apply_agent_event(AgentEvent::SubAgent(ev));
         }
 
+        // 回合 task 看门狗。必须排在上面两处排空之后：task 正常收尾是「先塞
+        // TurnDone/Error 再结束自己」，抢在事件被应用之前判定会把正常收尾
+        // 误判成异常终止。
+        state.reap_lost_turn_task();
+
+        // 回合心跳：兜「task 活着但卡住」——reap_lost_turn_task 只认已结束的
+        // task，对 hang 住的 task 无能为力。同样的位置约束：必须排在事件
+        // 排空之后，刚收到的事件不能被本帧立刻判死。
+        state.abort_stalled_turn();
+
         // Resource mutations are applied only after the previous Agent turn is
         // no longer active. The current turn keeps its immutable snapshot; the
         // next turn gets the reconciled MCP set atomically.
@@ -10340,7 +10940,7 @@ async fn tui_main(
             state.spinner_frame = 0;
             state.begin_turn_timing();
             let agent_c = shared_agent.read().unwrap().clone();
-            let (handle, injector) = spawn_agent_turn(
+            let (task, injector) = spawn_agent_turn(
                 None, // 自动唤醒：reminder 本身即这一轮唯一 user 输入
                 vec![],
                 agent_c,
@@ -10353,7 +10953,7 @@ async fn tui_main(
                 reminders,
                 plugin_runtime.clone(),
             );
-            state.current_task = Some(handle);
+            state.current_task = Some(task);
             state.injector = Some(injector);
         }
 
@@ -10380,7 +10980,7 @@ async fn tui_main(
             state.spinner_frame = 0;
             state.begin_turn_timing();
             let agent_c = shared_agent.read().unwrap().clone();
-            let (handle, injector) = spawn_agent_turn(
+            let (task, injector) = spawn_agent_turn(
                 Some(combined_text),
                 combined_attachments,
                 agent_c,
@@ -10393,7 +10993,7 @@ async fn tui_main(
                 std::mem::take(&mut state.pending_bg_reminders),
                 plugin_runtime.clone(),
             );
-            state.current_task = Some(handle);
+            state.current_task = Some(task);
             state.injector = Some(injector);
         }
 
@@ -10840,6 +11440,25 @@ async fn tui_main(
                                             }
                                         } else if let Some(dialog) = &mut state.skills_dialog {
                                             dialog.overlay = SkillsOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Skills(SkillsInputField::BrowseSearch) => {
+                                        let query = text.filter(|t| !t.trim().is_empty());
+                                        state.input_owner = None;
+                                        match query {
+                                            Some(q) => {
+                                                if let Some(dialog) = &mut state.skills_dialog {
+                                                    dialog.tab = SkillsDialogTab::Browse;
+                                                }
+                                                start_registry_search(&mut state, &agent_tx, q);
+                                                // 关键字留在 live_input 里不清空，方便
+                                                // 同一次会话里微调关键字重新搜索。
+                                            }
+                                            None => {
+                                                if let Some(dialog) = &mut state.skills_dialog {
+                                                    dialog.overlay = SkillsOverlay::None;
+                                                }
+                                            }
                                         }
                                     }
                                     InputOwner::Plugins(PluginsInputField::AddMarketplaceUrl) => {
@@ -11726,7 +12345,10 @@ async fn tui_main(
 
                         // ── 纯展示态（loading/详情）：吞掉按键，仅 Detail 支持 Enter/Esc 关闭
                         match &state.skills_dialog.as_ref().unwrap().overlay {
-                            SkillsOverlay::Syncing { .. } | SkillsOverlay::Upgrading { .. } => {
+                            SkillsOverlay::Syncing { .. }
+                            | SkillsOverlay::Upgrading { .. }
+                            | SkillsOverlay::Searching
+                            | SkillsOverlay::FetchingArchive => {
                                 continue;
                             }
                             SkillsOverlay::Detail { .. } => {
@@ -11814,6 +12436,93 @@ async fn tui_main(
                                 }
                                 continue;
                             }
+                            SkillsOverlay::RegistryInstallConfirm { .. } => {
+                                match key.code {
+                                    KeyCode::Left | KeyCode::Right => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            if let SkillsOverlay::RegistryInstallConfirm {
+                                                scope,
+                                                ..
+                                            } = &mut dialog.overlay
+                                            {
+                                                *scope = match scope {
+                                                    wyj_store::InstallScope::Global => {
+                                                        wyj_store::InstallScope::Project
+                                                    }
+                                                    wyj_store::InstallScope::Project => {
+                                                        wyj_store::InstallScope::Global
+                                                    }
+                                                };
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('y') | KeyCode::Enter => {
+                                        // archive 用 mem::take 移出而不是 clone：确认框
+                                        // 借用了 dialog，而安装又要读 state.cwd，
+                                        // 两个借用不能同时活着，顺带省掉一次几 MB 的拷贝。
+                                        let pending =
+                                            state.skills_dialog.as_mut().and_then(|d| match &mut d
+                                                .overlay
+                                            {
+                                                SkillsOverlay::RegistryInstallConfirm {
+                                                    skill,
+                                                    archive,
+                                                    scope,
+                                                    ..
+                                                } => Some((
+                                                    skill.as_ref().clone(),
+                                                    std::mem::take(archive),
+                                                    *scope,
+                                                    d.registry_base_url.clone(),
+                                                )),
+                                                _ => None,
+                                            });
+                                        if let Some((skill, archive, scope, base_url)) = pending {
+                                            let install_name = skill.install_name();
+                                            let result =
+                                                wyj_store::skillhub::install_skillhub_archive(
+                                                    &archive,
+                                                    &wyj_store::skillhub::SkillHubInstallRequest {
+                                                        base_url: base_url.clone(),
+                                                        slug: skill.slug.clone(),
+                                                        namespace: skill.namespace.clone(),
+                                                        install_name: install_name.clone(),
+                                                        version: skill.version.clone(),
+                                                        scope,
+                                                        source_label: skill.canonical_name.clone(),
+                                                    },
+                                                    &state.cwd,
+                                                );
+                                            let home = wyj_config::home_dir().unwrap_or_default();
+                                            if let Some(dialog) = &mut state.skills_dialog {
+                                                dialog.overlay = SkillsOverlay::None;
+                                                match result {
+                                                    Ok(_) => {
+                                                        dialog.status = Some(wyj_i18n::tr_fmt(
+                                                            "skills.install.registry_done",
+                                                            &[("name", &install_name)],
+                                                        ));
+                                                        dialog.refresh_installed(&home, &state.cwd);
+                                                    }
+                                                    Err(e) => {
+                                                        dialog.error = Some(wyj_i18n::tr_fmt(
+                                                            "skills.error.registry_install_failed",
+                                                            &[("err", &e.to_string())],
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('n') | KeyCode::Esc => {
+                                        if let Some(dialog) = &mut state.skills_dialog {
+                                            dialog.overlay = SkillsOverlay::None;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
                             SkillsOverlay::None => {}
                         }
 
@@ -11864,13 +12573,28 @@ async fn tui_main(
                                     .and_then(|d| d.rows().get(d.cursor).copied());
                                 match row {
                                     Some(FlatRow::AddNew) => {
+                                        // 同一个 AddNew 行在两个 tab 里含义不同：
+                                        // Marketplaces tab 是"添加 git 源"，Browse tab
+                                        // 固定占据位置 0，含义是"输入关键字搜索"。
+                                        let browse_tab = state
+                                            .skills_dialog
+                                            .as_ref()
+                                            .map(|d| d.tab == SkillsDialogTab::Browse)
+                                            .unwrap_or(false);
                                         if let Some(dialog) = &mut state.skills_dialog {
-                                            dialog.overlay = SkillsOverlay::AddMarketplace;
+                                            dialog.overlay = if browse_tab {
+                                                SkillsOverlay::None
+                                            } else {
+                                                SkillsOverlay::AddMarketplace
+                                            };
                                             dialog.live_input = InputBox::new();
                                         }
-                                        state.input_owner = Some(InputOwner::Skills(
-                                            SkillsInputField::AddMarketplaceUrl,
-                                        ));
+                                        state.input_owner =
+                                            Some(InputOwner::Skills(if browse_tab {
+                                                SkillsInputField::BrowseSearch
+                                            } else {
+                                                SkillsInputField::AddMarketplaceUrl
+                                            }));
                                     }
                                     Some(FlatRow::Entry(_)) => {
                                         if let Some(dialog) = &mut state.skills_dialog {
@@ -12679,6 +13403,14 @@ async fn tui_main(
                             PlanApprovalOutcome::Continue => {}
                             PlanApprovalOutcome::Approve => {
                                 if let Some(dlg) = state.plan_dialog.take() {
+                                    // 锁顺序硬约束：必须先 send 再取 session 锁。
+                                    // Agent task 全程持有 session Mutex 等待本弹窗的
+                                    // oneshot（crates/tools/src/ctx.rs::exit_plan_mode），
+                                    // 若这里先 `session.lock().await` 建 checkpoint，
+                                    // UI 会等一把 Agent 正持着、而 Agent 又在等我们
+                                    // send 的锁 —— 100% 死锁，且 ESC/interrupt 都救不
+                                    // 回来（interrupt 也走主循环，同样卡在这）。
+                                    let _ = dlg.response_tx.send(true);
                                     if let Some(sessions) = &session_store {
                                         if let Ok(store) = wyj_core::CheckpointStore::configured(
                                             sessions.dir(),
@@ -12695,7 +13427,6 @@ async fn tui_main(
                                             }
                                         }
                                     }
-                                    let _ = dlg.response_tx.send(true);
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
                                     let new_mode = AgentMode::Normal;
@@ -12775,7 +13506,7 @@ async fn tui_main(
                                     state.spinner_frame = 0;
                                     state.begin_turn_timing();
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let (handle, injector) = spawn_agent_turn(
+                                    let (task, injector) = spawn_agent_turn(
                                         Some(dlg.pending_message),
                                         dlg.pending_attachments,
                                         agent_c,
@@ -12788,7 +13519,7 @@ async fn tui_main(
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );
-                                    state.current_task = Some(handle);
+                                    state.current_task = Some(task);
                                     state.injector = Some(injector);
                                 }
                             }
@@ -12804,7 +13535,7 @@ async fn tui_main(
                                     state.spinner_frame = 0;
                                     state.begin_turn_timing();
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let (handle, injector) = spawn_agent_turn(
+                                    let (task, injector) = spawn_agent_turn(
                                         Some(dlg.pending_message),
                                         dlg.pending_attachments,
                                         agent_c,
@@ -12817,7 +13548,7 @@ async fn tui_main(
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );
-                                    state.current_task = Some(handle);
+                                    state.current_task = Some(task);
                                     state.injector = Some(injector);
                                 }
                             }
@@ -13930,7 +14661,7 @@ async fn tui_main(
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
 
-                                        let handle = tokio::spawn(async move {
+                                        let task = spawn_turn_task(async move {
                                             let mut sess = session_c.lock().await;
                                             sess.push_user(prompt);
                                             let current_mode = mode_arc.lock().await.clone();
@@ -13987,7 +14718,7 @@ async fn tui_main(
                                                 }
                                             }
                                         });
-                                        state.current_task = Some(handle.abort_handle());
+                                        state.current_task = Some(task);
                                     }
                                     Ok(CommandResult::RunPromptScoped {
                                         text,
@@ -14044,7 +14775,7 @@ async fn tui_main(
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
 
-                                        let handle = tokio::spawn(async move {
+                                        let task = spawn_turn_task(async move {
                                             let mut sess = session_c.lock().await;
                                             sess.push_user(text);
                                             let current_mode = mode_arc.lock().await.clone();
@@ -14121,7 +14852,7 @@ async fn tui_main(
                                                 }
                                             }
                                         });
-                                        state.current_task = Some(handle.abort_handle());
+                                        state.current_task = Some(task);
                                     }
                                     Ok(CommandResult::ResumeSession(id)) => {
                                         if state.is_thinking {
@@ -14401,7 +15132,7 @@ async fn tui_main(
                                     let attachments =
                                         std::mem::take(&mut state.pending_attachments);
                                     let agent_c = shared_agent.read().unwrap().clone();
-                                    let (handle, injector) = spawn_agent_turn(
+                                    let (task, injector) = spawn_agent_turn(
                                         Some(text),
                                         attachments,
                                         agent_c,
@@ -14414,7 +15145,7 @@ async fn tui_main(
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
                                     );
-                                    state.current_task = Some(handle);
+                                    state.current_task = Some(task);
                                     state.injector = Some(injector);
                                 }
                             }
@@ -15161,13 +15892,16 @@ mod cross_session_subagents_tests {
     #[test]
     fn open_panel_without_id_selects_most_recent_and_opens_detail() {
         let mut state = make_state();
+        // 条目必须是 Running：面板口径是「只列运行中」（`visible_sub_agents`
+        // 是唯一口径），`/subagents` 也只在运行项里定位——否则选中一个不在
+        // 列表上的 id 会让焦点悬空在一行看不见的位置。
         state.sub_agents.insert(
             1,
             SubAgentUiState {
                 agent_type: "t".into(),
                 description: "d".into(),
                 background: false,
-                status: SubAgentStatus::Done,
+                status: SubAgentStatus::Running,
                 started_at: Instant::now(),
                 final_elapsed: Some(1.0),
                 input_tokens: 0,
@@ -15186,7 +15920,7 @@ mod cross_session_subagents_tests {
                 agent_type: "t".into(),
                 description: "d2".into(),
                 background: false,
-                status: SubAgentStatus::Done,
+                status: SubAgentStatus::Running,
                 started_at: Instant::now(),
                 final_elapsed: Some(1.0),
                 input_tokens: 0,
@@ -15214,7 +15948,7 @@ mod cross_session_subagents_tests {
                 agent_type: "t".into(),
                 description: "d".into(),
                 background: false,
-                status: SubAgentStatus::Done,
+                status: SubAgentStatus::Running,
                 started_at: Instant::now(),
                 final_elapsed: Some(1.0),
                 input_tokens: 0,
@@ -16416,5 +17150,387 @@ mod profile_dialog_onboarding_tests {
             .position(|p| p.name == cfg.active_profile)
             .unwrap_or(0);
         assert_eq!(d.expanded, Some(active_idx));
+    }
+}
+
+#[cfg(test)]
+mod skills_registry_tests {
+    use super::*;
+
+    fn sample_skill(slug: &str) -> wyj_store::skillhub::SkillHubSkill {
+        wyj_store::skillhub::SkillHubSkill {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            description: "测试技能".to_string(),
+            version: "1.2.3".to_string(),
+            source: "clawhub".to_string(),
+            namespace: "someone".to_string(),
+            canonical_name: format!("@someone/{slug}"),
+            owner_name: "someone".to_string(),
+            stars: 42,
+            installs: 100,
+        }
+    }
+
+    /// 目录扫描必须认 `<name>/SKILL.md` 这种目录式技能，且命令名取**目录名**。
+    ///
+    /// 回归点：HTTP 注册表装来的技能是目录形态，早期实现只扫 `*.md`，
+    /// 结果是「装成功了但 Installed tab 里看不见、/help 里也没有」。
+    #[test]
+    fn directory_shaped_skills_are_scanned_with_their_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(skills.join("demo-skill")).unwrap();
+        std::fs::write(
+            skills.join("demo-skill").join("SKILL.md"),
+            "# 目录式技能\n正文",
+        )
+        .unwrap();
+        // references/ 下的 .md 是技能私有资源，不该被当成独立技能收录。
+        std::fs::create_dir_all(skills.join("demo-skill").join("references")).unwrap();
+        std::fs::write(skills.join("demo-skill/references/api.md"), "# api").unwrap();
+        // 单文件形态仍要照常收录。
+        std::fs::write(skills.join("flat.md"), "# 单文件技能\n正文").unwrap();
+
+        let found = scan_skill_dir_for_display(&skills);
+        let names: Vec<_> = found.iter().map(|(n, _)| n.clone()).collect();
+        assert!(names.contains(&"demo-skill".to_string()), "got {names:?}");
+        assert!(names.contains(&"flat".to_string()), "got {names:?}");
+        assert!(
+            !names.contains(&"api".to_string()),
+            "references/*.md 不应被当成技能: {names:?}"
+        );
+        assert!(!names.contains(&"SKILL".to_string()), "got {names:?}");
+    }
+
+    /// 搜索无结果时不能因为 `rows()` 首行是搜索框就越界。
+    #[test]
+    fn browse_tab_always_keeps_a_search_row_at_index_zero() {
+        let mut state = make_state();
+        state.skills_dialog = Some(SkillsDialog::new(
+            std::path::Path::new("/nonexistent-home"),
+            std::path::Path::new("/tmp"),
+        ));
+        let dialog = state.skills_dialog.as_mut().unwrap();
+        dialog.tab = SkillsDialogTab::Browse;
+        dialog.browse_source = SkillsBrowseSource::None;
+
+        let rows = dialog.rows();
+        assert_eq!(rows.len(), 1, "没有任何结果时仍应保留搜索行");
+        assert!(matches!(rows[0], FlatRow::AddNew));
+
+        dialog.registry_results = vec![sample_skill("alpha"), sample_skill("beta")];
+        dialog.browse_source = SkillsBrowseSource::Registry;
+        let rows = dialog.rows();
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], FlatRow::AddNew));
+        // Entry 携带的是结果下标，不是行号——否则渲染会取错元素。
+        assert!(matches!(rows[1], FlatRow::Entry(0)));
+        assert!(matches!(rows[2], FlatRow::Entry(1)));
+    }
+
+    /// 搜索结果回来后要同时切 tab、标来源、把光标停在第一条结果上。
+    #[test]
+    fn registry_search_event_populates_browse_tab() {
+        let mut state = make_state();
+        state.skills_dialog = Some(SkillsDialog::new(
+            std::path::Path::new("/nonexistent-home"),
+            std::path::Path::new("/tmp"),
+        ));
+        state.skills_dialog.as_mut().unwrap().overlay = SkillsOverlay::Searching;
+
+        state.apply_agent_event(AgentEvent::SkillRegistrySearched {
+            result: Ok(vec![sample_skill("alpha"), sample_skill("beta")]),
+        });
+
+        let dialog = state.skills_dialog.as_ref().unwrap();
+        assert!(matches!(dialog.overlay, SkillsOverlay::None));
+        assert_eq!(dialog.browse_source, SkillsBrowseSource::Registry);
+        assert_eq!(dialog.tab, SkillsDialogTab::Browse);
+        assert_eq!(dialog.registry_results.len(), 2);
+        // git marketplace 那份列表必须被清空，否则安装会按错的来源走。
+        assert!(dialog.browse_results.is_empty());
+        assert_eq!(dialog.cursor, 1);
+    }
+
+    /// 迟到的旧搜索响应不能覆盖当前界面状态。
+    #[test]
+    fn stale_registry_search_response_is_ignored() {
+        let mut state = make_state();
+        state.skills_dialog = Some(SkillsDialog::new(
+            std::path::Path::new("/nonexistent-home"),
+            std::path::Path::new("/tmp"),
+        ));
+        // 用户已经关掉搜索浮层、转而干别的事了。
+        state.skills_dialog.as_mut().unwrap().overlay = SkillsOverlay::None;
+
+        state.apply_agent_event(AgentEvent::SkillRegistrySearched {
+            result: Ok(vec![sample_skill("alpha")]),
+        });
+
+        let dialog = state.skills_dialog.as_ref().unwrap();
+        assert!(dialog.registry_results.is_empty());
+    }
+
+    /// 搜索空结果：留在搜索行，给出提示文案，而不是把 cursor 推到越界位置。
+    #[test]
+    fn empty_registry_search_keeps_cursor_on_search_row() {
+        let mut state = make_state();
+        state.skills_dialog = Some(SkillsDialog::new(
+            std::path::Path::new("/nonexistent-home"),
+            std::path::Path::new("/tmp"),
+        ));
+        state.skills_dialog.as_mut().unwrap().overlay = SkillsOverlay::Searching;
+
+        state.apply_agent_event(AgentEvent::SkillRegistrySearched {
+            result: Ok(Vec::new()),
+        });
+
+        let dialog = state.skills_dialog.as_mut().unwrap();
+        assert_eq!(dialog.cursor, 0);
+        assert!(dialog.status.is_some(), "空结果应给出提示而不是静默");
+        dialog.clamp_cursor();
+        assert_eq!(dialog.cursor, 0);
+    }
+
+    /// 下载完成的包要按 slug 回查成确认框——下载期间用户可能已经移动了光标。
+    #[test]
+    fn archive_fetch_event_opens_confirm_for_the_pending_slug() {
+        let mut state = make_state();
+        state.skills_dialog = Some(SkillsDialog::new(
+            std::path::Path::new("/nonexistent-home"),
+            std::path::Path::new("/tmp"),
+        ));
+        {
+            let dialog = state.skills_dialog.as_mut().unwrap();
+            dialog.tab = SkillsDialogTab::Browse;
+            dialog.browse_source = SkillsBrowseSource::Registry;
+            dialog.registry_results = vec![sample_skill("alpha"), sample_skill("beta")];
+            dialog.overlay = SkillsOverlay::FetchingArchive;
+            dialog.pending_registry_slug = "beta".to_string();
+            // 下载期间光标被挪到了第一条
+            dialog.cursor = 1;
+        }
+
+        let preview = wyj_store::skillhub::SkillArchivePreview {
+            file_count: 3,
+            total_bytes: 2048,
+            executable_count: 1,
+            executable_paths: vec!["scripts/run.sh".to_string()],
+        };
+        state.apply_agent_event(AgentEvent::SkillRegistryArchiveFetched {
+            result: Ok((preview, vec![0u8, 1, 2])),
+        });
+
+        let dialog = state.skills_dialog.as_ref().unwrap();
+        match &dialog.overlay {
+            SkillsOverlay::RegistryInstallConfirm {
+                skill,
+                preview,
+                scope,
+                ..
+            } => {
+                // 必须命中 beta，而不是光标所在的 alpha。
+                assert_eq!(skill.slug, "beta");
+                assert_eq!(preview.executable_count, 1);
+                assert!(preview.has_executables());
+                assert_eq!(*scope, wyj_store::InstallScope::Global);
+            }
+            _ => panic!("expected a RegistryInstallConfirm overlay"),
+        }
+    }
+
+    /// 注册表来源与 git marketplace 来源必须能在 lockfile 层面区分开，
+    /// 否则升级会对一个 https URL 执行 git clone。
+    #[test]
+    fn registry_install_is_recorded_as_a_registry_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = wyj_store::skillhub::SkillHubInstallRequest {
+            base_url: "https://example.invalid/api/v1".to_string(),
+            slug: "demo".to_string(),
+            namespace: "someone".to_string(),
+            install_name: String::new(),
+            version: "1.0.0".to_string(),
+            scope: wyj_store::InstallScope::Project,
+            source_label: "someone/demo".to_string(),
+        };
+        wyj_store::skillhub::install_skillhub_archive(&build_test_archive(), &req, dir.path())
+            .unwrap();
+
+        let manifest = wyj_store::lockfile::load_project(dir.path()).unwrap();
+        let entry = manifest.skills.iter().find(|s| s.name == "demo").unwrap();
+        let source = entry.source.as_ref().unwrap();
+        assert!(source.is_registry());
+        assert_eq!(source.registry.as_ref().unwrap().slug, "demo");
+        assert_eq!(source.marketplace_url, "");
+
+        // 卸载要连目录一起删干净，否则 references/*.md 会被加载器当成
+        // 额外的 slash command 重新注册。
+        wyj_store::skill_install::uninstall_skill(
+            "demo",
+            wyj_store::InstallScope::Project,
+            dir.path(),
+        )
+        .unwrap();
+        assert!(!dir.path().join(".wyj-code/skills/demo").exists());
+    }
+
+    fn build_test_archive() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            w.start_file("SKILL.md", opts).unwrap();
+            w.write_all(b"---\nname: demo\ndescription: d\n---\nbody")
+                .unwrap();
+            w.start_file("references/api.md", opts).unwrap();
+            w.write_all(b"# api").unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Normal,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    /// 核心回归钉子：task **活着但长时间无进展**时，看门狗必须把状态收回来。
+    ///
+    /// 这是 `reap_lost_turn_task` 补不了的洞——它只看 `is_finished()`，而
+    /// hang 住的 task 该标志恒为 false。漏掉本条的症状就是用户报的
+    /// 「跑着跑着停住，之后输入任何东西都没反应」：`is_thinking` 永为 true
+    /// 时用户输入全进 `pending_queue`，连主循环的兜底分支都被同一标志挡住。
+    #[tokio::test]
+    async fn stalled_turn_is_aborted_even_while_task_is_alive() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        // 造一个「活着但卡住」的 task：spawn 一个永不完成的 future，
+        // 用它证明看门狗判的是静默时长，而不是 is_finished()。
+        let task = spawn_turn_task(std::future::pending::<()>());
+        assert!(
+            !task.is_finished(),
+            "前提：task 必须仍活着，否则测的是 reap 而非心跳"
+        );
+        state.current_task = Some(task);
+        state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT + Duration::from_secs(5));
+
+        assert!(state.abort_stalled_turn(), "静默超阈值必须触发兜底");
+        assert!(
+            !state.is_thinking,
+            "兜底后必须解锁 thinking，否则用户后续输入仍会滞留"
+        );
+        assert!(
+            state.current_task.is_none(),
+            "task 句柄必须清掉，避免下帧重复 abort"
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|m| m.is_error && m.content.contains("900")),
+            "必须给用户一条可见提示，不能静默中止"
+        );
+    }
+
+    /// 兜底之后 pending_queue 必须能被排空——这正是用户「输入无响应」的
+    /// 直接成因：is_thinking 卡住时，主循环 `!is_thinking &&
+    /// !pending_queue.is_empty()` 这条唯一的排空路径也进不去。
+    #[tokio::test]
+    async fn stalled_turn_recovery_unblocks_pending_queue() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
+        state.pending_queue.push(("继续".to_string(), Vec::new()));
+        state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT + Duration::from_secs(5));
+
+        state.abort_stalled_turn();
+
+        assert!(!state.is_thinking, "解锁后主循环才可能排空 pending_queue");
+        assert!(!state.pending_queue.is_empty(), "队列内容应保留待下轮消费");
+    }
+
+    /// 不误杀：静默未超阈值时必须什么都不做。
+    #[tokio::test]
+    async fn active_turn_is_never_aborted_early() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
+
+        assert!(!state.abort_stalled_turn());
+        assert!(state.is_thinking, "健康回合不得被误杀");
+        assert!(state.current_task.is_some());
+    }
+
+    /// 关键的反误杀回归：弹窗打开期间（用户去倒杯水）**不得**判死。
+    ///
+    /// 回合此时合法地 await 在 oneshot 上，这不是卡死。若把这段静默计入
+    /// 心跳，一次正常的离开几分钟就会把回合杀掉——那是比原 bug 更糟的
+    /// 体验（用户在毫不知情的情况下丢掉一段长工作）。
+    #[tokio::test]
+    async fn permission_dialog_pauses_the_stall_watchdog() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.permission_dialog = Some(PermissionDialog {
+            tool_name: "Bash".to_string(),
+            action_summary: "cargo test".to_string(),
+            response_tx: tx,
+        });
+        // 静默远超阈值，但弹窗开着
+        state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT * 3);
+
+        assert!(!state.abort_stalled_turn(), "等待用户交互不算卡死");
+        assert!(state.is_thinking);
+        assert!(state.permission_dialog.is_some(), "弹窗不得被心跳吃掉");
+    }
+
+    /// 空闲态（没在思考）不该刷出「回合被中止」的提示。
+    #[test]
+    fn idle_state_is_never_reported_as_stalled() {
+        let mut state = make_state();
+        state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT * 10);
+        assert!(!state.abort_stalled_turn());
+        assert!(state.messages.is_empty(), "空闲态不得产生任何提示");
+    }
+
+    /// 心跳基准必须由事件驱动重置，否则「持续吐 delta 的长回合」会被误杀。
+    #[tokio::test]
+    async fn any_agent_event_resets_the_stall_clock() {
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
+        state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT * 3);
+
+        state.apply_agent_event(AgentEvent::TextDelta("还在输出".to_string()));
+
+        assert!(
+            !state.abort_stalled_turn(),
+            "刚收到事件说明回合健康，不得判死"
+        );
+        assert!(state.is_thinking);
+    }
+
+    /// 阈值必须显著大于任何合法静默窗口（前台 Bash 最大 600s、LLM 流
+    /// idle 看门狗 120s），否则工具侧超时还没触发、心跳先把回合杀了，
+    /// 健康的长时间构建会被误杀。
+    #[test]
+    fn stall_threshold_exceeds_the_longest_legal_silent_window() {
+        assert!(
+            TURN_STALL_TIMEOUT > std::time::Duration::from_secs(600),
+            "必须大于 Bash 的 600s 上限，否则长构建会被心看门狗抢先杀掉"
+        );
+        assert!(
+            TURN_STALL_TIMEOUT > wyj_api::stream_guard::DEFAULT_STREAM_IDLE_TIMEOUT * 2,
+            "应显著大于流级 idle 看门狗，让工具侧超时先触发"
+        );
     }
 }

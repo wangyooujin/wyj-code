@@ -31,7 +31,7 @@ subagent:
   bg_done_notice: "后台 agent {id}（{type}: {desc}）已完成，结果将注入对话"
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
-  inline_running: "运行中 · {elapsed}s · ↑{tokens} tokens · {count} 次工具调用"
+  inline_running: "运行中 · {elapsed} · ↑{tokens} tokens · {count} 次工具调用"
   detail_running: "运行中，当前动作："
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
@@ -74,6 +74,9 @@ thinking:
   done: "  ⎿ 已思考 {secs}s（{lines} 行）"
   done_no_elapsed: "  ⎿ 已思考（{lines} 行）"
   expand_hint: "  ·  Ctrl+O 展开"
+
+diff:
+  more_lines: "    … 还有 {n} 行（Ctrl+O 展开全文）"
   status:
     budget: "🧠 budget={n}"
     effort: "🧠 effort={e}"
@@ -87,6 +90,8 @@ agent:
     parameter_removed: "[模型端点不支持参数 `{name}`，已安全移除后重试一次]"
   context_overflow: "\n[上下文超出模型窗口，正在紧急压缩后重试]\n"
   compacted: "\n[已自动压缩 · 第 {times} 次 · 丢弃 {removed} 条旧消息 · 保留最近 {kept} 条原文 · 释放约 {saved} tokens]\n"
+  turn_task_lost: "回合任务已异常终止（内部错误或被强制中断），本轮已中止。可以直接继续输入指令。"
+  turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
 
 claude_md:
   source:
@@ -468,7 +473,7 @@ schedule:
   overlay:
     sync_error_title: "同步 crontab 失败"
 
-import:
+skills:
   desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
   headless_unsupported: "[headless 模式不支持 /skills 面板，请使用 `wyj-code extensions` 管理 Skill]"
   dialog:
@@ -481,10 +486,15 @@ import:
     empty_marketplace_entries: "该 marketplace 未发现可安装的 skill"
     unmanaged_tag: "手动配置"
     syncing: "同步中…"
+    searching: "正在搜索技能注册表…"
+    fetching: "正在下载技能包…"
+    no_results: "未找到匹配的技能"
+    search_row: "🔍 搜索: {query}"
+    search_row_placeholder: "+ 搜索技能注册表（Enter 输入关键字）"
     add_marketplace_row: "+ 添加 marketplace"
     hint_installed: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
     hint_marketplaces: "  ↑↓ 选择  Enter 操作菜单/新增  ←→ 切换标签  Esc 关闭"
-    hint_browse: "  ↑↓ 选择  Enter 操作菜单  ←→ 切换标签  Esc 关闭"
+    hint_browse: "  ↑↓ 选择  Enter 搜索/操作菜单  ←→ 切换标签  Esc 关闭"
   menu:
     enable: "启用"
     disable: "禁用"
@@ -505,11 +515,20 @@ import:
     add_prompt: "输入 git 仓库 URL（本地路径可用 file:// 前缀）:"
   install:
     confirm_title: " 确认安装 Skill "
+    registry_confirm_title: " 确认安装 Skill（注册表）"
     name_label: "名称: "
     scope_label: "作用域: "
     path_label: "来源路径: "
+    version_label: "版本: "
     confirm_hint: "  ←→ 切换作用域  [y/Enter] 确认安装  [n/Esc] 取消"
     done: "安装成功，将在下一次 Agent 回合边界应用"
+    registry_done: "已安装 {name}，将在下一次 Agent 回合边界应用"
+  registry:
+    source_label: "来源: "
+    owner_label: "作者: "
+    content_label: "包内容: "
+    content_summary: "{files} 个文件 · {size}"
+    executables_warning: "⚠ 包含 {count} 个可执行脚本，Agent 可能通过 Bash 调用它们"
   upgrade:
     in_progress: "升级中…"
     done: "已升级到 {version}"
@@ -519,6 +538,9 @@ import:
   error:
     sync_failed: "同步 marketplace 失败: {err}"
     install_failed: "安装失败: {err}"
+    registry_search_failed: "搜索技能注册表失败: {err}"
+    registry_download_failed: "下载技能包失败: {err}"
+    registry_install_failed: "安装失败: {err}"
     uninstall_failed: "卸载失败: {err}"
     upgrade_failed: "升级失败: {err}"
     manual_no_upgrade: "手动配置项没有版本信息，无法升级"
@@ -750,6 +772,7 @@ dialog:
     mcp_add_registry: "[MCP] 输入 registry URL (Enter 提交 / Esc 取消)"
     mcp_browse_search: "[MCP] 搜索 (Enter 提交 / Esc 取消)"
     skills_add_marketplace: "[Skills] 输入 marketplace 地址 (Enter 提交 / Esc 取消)"
+    skills_search: "[Skills] 输入关键字搜索注册表 (Enter 搜索 / Esc 取消)"
     plugins_add_marketplace: "[Plugins] 输入 marketplace 地址 (Enter 提交 / Esc 取消)"
     plugins_add_local: "[Plugins] 输入本地插件路径 (Enter 提交 / Esc 取消)"
     profile_rename: "[Model] 重命名分组 (Enter 提交 / Esc 取消)"
