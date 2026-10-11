@@ -27,5 +27,6 @@ uuid.workspace = true
 cron.workspace = true
 jsonschema.workspace = true
 url.workspace = true
+futures.workspace = true
 
 [dev-dependencies]

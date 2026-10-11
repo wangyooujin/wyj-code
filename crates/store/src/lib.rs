@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod self_update;
 pub mod skill_install;
 pub mod skill_trust;
+pub mod skillhub;
 
 pub use lockfile::{disabled_mcp_names, disabled_skill_names, InstallScope};
 pub use project_trust::{compute_project_mcp_fingerprint, TrustStatus};

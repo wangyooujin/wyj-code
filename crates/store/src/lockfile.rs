@@ -141,12 +141,43 @@ impl InstalledSkillEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SkillSource {
     pub marketplace_id: String,
     pub marketplace_url: String,
     /// marketplace.json 里该条目的 path 字段（相对仓库根）
     pub entry_path: String,
+    /// HTTP 技能注册表（SkillHub）来源。与上面三个 git marketplace 字段互斥：
+    /// 注册表来源只填 `registry`，marketplace 字段留空。
+    pub registry: Option<SkillRegistrySource>,
+}
+
+impl SkillSource {
+    pub fn marketplace(marketplace_id: &str, marketplace_url: &str, entry_path: &str) -> Self {
+        Self {
+            marketplace_id: marketplace_id.to_string(),
+            marketplace_url: marketplace_url.to_string(),
+            entry_path: entry_path.to_string(),
+            registry: None,
+        }
+    }
+
+    /// 是否是 HTTP 注册表来源（升级路径与 marketplace 的 git sync 完全不同）。
+    pub fn is_registry(&self) -> bool {
+        self.registry.is_some()
+    }
+}
+
+/// 一个 HTTP 技能注册表条目的来源标识。注册表按 `slug` + `namespace` 定位单个
+/// 技能，`base_url` 保留是为了支持自建/私有部署实例（换源后旧条目仍知道自己是
+/// 从哪装的）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillRegistrySource {
+    /// 注册表 API 根，例如 `https://api.skillhub.cn/api/v1`
+    pub base_url: String,
+    pub slug: String,
+    pub namespace: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,11 +553,11 @@ mod tests {
             name: "enabled-skill".to_string(),
             version: Some("1.0.0".to_string()),
             scope: InstallScope::Global,
-            source: Some(SkillSource {
-                marketplace_id: "abc".to_string(),
-                marketplace_url: "file:///tmp/x".to_string(),
-                entry_path: "skills/a.md".to_string(),
-            }),
+            source: Some(SkillSource::marketplace(
+                "abc",
+                "file:///tmp/x",
+                "skills/a.md",
+            )),
             enabled: true,
             installed_at: Utc::now(),
             updated_at: Utc::now(),
@@ -535,11 +566,11 @@ mod tests {
             name: "disabled-skill".to_string(),
             version: Some("1.0.0".to_string()),
             scope: InstallScope::Global,
-            source: Some(SkillSource {
-                marketplace_id: "abc".to_string(),
-                marketplace_url: "file:///tmp/x".to_string(),
-                entry_path: "skills/b.md".to_string(),
-            }),
+            source: Some(SkillSource::marketplace(
+                "abc",
+                "file:///tmp/x",
+                "skills/b.md",
+            )),
             enabled: false,
             installed_at: Utc::now(),
             updated_at: Utc::now(),
