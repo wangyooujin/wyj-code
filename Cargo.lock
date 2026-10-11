@@ -5358,6 +5358,7 @@ dependencies = [
  "chrono",
  "cron",
  "flate2",
+ "futures",
  "jsonschema",
  "reqwest 0.12.28",
  "semver",
@@ -5435,6 +5436,7 @@ dependencies = [
  "wyj-mcp",
  "wyj-store",
  "wyj-tools",
+ "zip",
 ]
 
 [[package]]

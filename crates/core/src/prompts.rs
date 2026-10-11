@@ -246,6 +246,19 @@ pub const PLAN_TURN: &str = r#"Plan mode is active. Investigate the task with re
 /// headless 单次问答（-p）：AskQuestion 不可用
 pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user cannot answer questions. Do not call AskQuestion; make reasonable assumptions, state them briefly, and proceed.";
 
+/// `[tools].todo_enabled = true` 时追加：教模型**何时**用 TodoWrite。
+///
+/// v1.5.18 把这条指引从 `MAIN` 里删掉了，理由是「默认关闭的工具不该在
+/// system prompt 里被提及」。但删完之后，开关打开的用户会遇到一个更糟的状态：
+/// 工具注册了、schema 也可见了（见 `agent.rs` 的 `ALWAYS_VISIBLE_TOOL_SCHEMAS`），
+/// 模型却没有任何动机去调用它 —— 工具描述只说了「这是什么」，没说「什么时候用」。
+/// 于是「配了可见却从不出现」从注册层 bug 变成了动机层 bug。
+///
+/// 因此这里做成**条件注入**而非写回 `MAIN`：只有用户显式打开开关时才追加，
+/// 关闭时 prompt 一个字节都不变，默认路径继续对齐 Claude Code v2.1.233 /
+/// Codex v0.152.0 的「todo 脚手架默认关闭」。
+pub const TODO_HINT: &str = "For multi-step tasks (roughly three or more distinct steps), use TodoWrite to keep a visible task list: create it once at the start, then update it as you make progress, marking exactly one task in_progress at a time and moving to the next only after the current one is done. Skip it for single-step tasks.";
+
 /// computer-use 工具已注册时追加：launching apps via GUI hunting (Spotlight/
 /// Start menu/desktop icons) is slow and unreliable — the model otherwise
 /// tends to take one screenshot, see an empty desktop, and give up instead of
