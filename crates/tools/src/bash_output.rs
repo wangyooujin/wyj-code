@@ -126,6 +126,15 @@ impl Tool for KillShellTool {
         }
     }
 
+    /// 每个 shell_id 各自独立：`BashSessionManager` 内部用 `Mutex` 保护 job 表，
+    /// 且 `kill` 对已退出的任务幂等返回成功，因此并发 kill 多个后台任务互不干扰。
+    ///
+    /// 并发在这里是**净收益**：`kill` 内部有一次固定 2s 的 TERM→KILL 等待
+    /// （`bash_session.rs::kill`），串行执行 N 个 KillShell 要 2N 秒，并发只需 2 秒。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: KillInput = serde_json::from_value(input)?;
         match BashSessionManager::global().kill(&inp.shell_id).await {

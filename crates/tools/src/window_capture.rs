@@ -102,6 +102,15 @@ impl Tool for WindowCaptureTool {
         }
     }
 
+    /// `list` / `capture` 都是纯只读截图：不激活窗口、不移动指针、不改焦点，
+    /// 因此同批次里截多个窗口互不影响，可以并发。
+    ///
+    /// 截图像素级开销不小（每次 capture 都要编码 PNG），串行排会让
+    /// 「先 list 再 capture 多个窗口」这类正常流程变成一串加法。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let action = input.get("action").and_then(Value::as_str);
         let query = input.get("query").and_then(Value::as_str);

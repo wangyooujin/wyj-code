@@ -146,6 +146,14 @@ impl Tool for MemoryTool {
         }
     }
 
+    /// `MemoryStore` 的写入路径自带进程内互斥（`memory_v3::MemoryStore.write_lock`），
+    /// 读取路径无共享可变状态；一次调用只作用于一条独立的记忆记录。
+    ///
+    /// 因此同批次里的多条 Memory 调用彼此不冲突，可以并发。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let input: Input = serde_json::from_value(input)?;
         // store 上的所有错误（schema 校验失败、fingerprint 被拒、id 不存在等）
