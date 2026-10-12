@@ -507,6 +507,12 @@ impl SubAgentTool {
         let task_type = agent_type.clone();
         let task_desc = description.clone();
         let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<AgentControl>();
+        // 用户中途补充的内容：与主 Agent 排空**同一份**队列。没有它，前台子
+        // Agent 就是一段完全不透光的等待——用户在它跑的过程中补充的要求既进不了
+        // 子 Agent，也进不了被本次工具调用堵住的主 Agent（实测一个 12 分钟的子
+        // Agent = 12 分钟白等）。`Option<&SteerQueue>` 是 `'static` 引用，
+        // 配合上面 `Arc` 句柄可以直接 move 进 task。
+        let steer: Option<Arc<wyj_core::SteerQueue>> = ctx.steer_queue().cloned();
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -522,8 +528,10 @@ impl SubAgentTool {
             let mut session = Session::new();
             let mut next_input = Some(vec![ContentBlock::Text { text: prompt }]);
 
-            let sub_ctx = crate::ctx::ToolCtx::new(&cwd);
+            let mut sub_ctx = crate::ctx::ToolCtx::new(&cwd);
             sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+            // 同一份队列往下传：嵌套子 Agent 也能被中途补充
+            sub_ctx.steer_queue = steer.clone();
             // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
             // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
@@ -542,9 +550,13 @@ impl SubAgentTool {
                 session.push_user_with_blocks(input);
                 let mut output_buf = String::new();
                 let run_res = agent
-                    .run_turn(&mut session, &sub_ctx, &mut |delta| {
-                        output_buf.push_str(delta)
-                    })
+                    .run_turn_with_user_steerage(
+                        &mut session,
+                        &sub_ctx,
+                        &mut |delta| output_buf.push_str(delta),
+                        steer.as_deref(),
+                        |_kind| {},
+                    )
                     .await;
                 match run_res {
                     Ok(()) if output_buf.is_empty() => outputs.push(tr("subagent.no_output")),

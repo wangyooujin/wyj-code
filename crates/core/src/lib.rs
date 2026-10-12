@@ -32,7 +32,7 @@ pub mod workflow;
 pub mod workspace;
 pub mod workspace_cas;
 
-pub use agent::{Agent, AgentRoute, InjectionKind, ToolEvent};
+pub use agent::{Agent, AgentRoute, InjectionKind, SteerQueue, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};
 pub use checkpoint::{
     set_checkpoint_config, Checkpoint, CheckpointConfig, CheckpointKind, CheckpointStore,

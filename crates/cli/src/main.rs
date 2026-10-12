@@ -1368,7 +1368,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // AGENTS.md 系记忆文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
+    // 项目规约文件加载器：全局 + 祖先链，主 Agent 与 sub-agent 共用同一份
     // （共享子目录动态加载去重状态）。
     let claude_md_loader = Arc::new(wyj_core::ClaudeMdLoader::new(&cwd));
 
@@ -1756,7 +1756,7 @@ async fn main() -> Result<()> {
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前含 Plan 模式
-    // 限制说明与 computer-use 使用提示；AGENTS.md 系文件不焊死进 system prompt，
+    // 限制说明与 computer-use 使用提示；规约文件不焊死进 system prompt，
     // 见 with_claude_md）。
     let mut system_prompt_extra = String::new();
 

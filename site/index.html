@@ -48,7 +48,6 @@
     </a>
     <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
       <a href="#demo" class="hover:text-amber-500 transition-colors" data-i18n="nav.demo">演示</a>
-      <a href="#compat" class="hover:text-amber-500 transition-colors" data-i18n="nav.compat">模型兼容</a>
       <a href="#audience" class="hover:text-amber-500 transition-colors" data-i18n="nav.audience">适合谁</a>
       <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
       <a href="docs.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.docs">文档</a>
@@ -185,118 +184,6 @@
   </div>
 </section>
 
-<!-- MODEL COMPATIBILITY -->
-<section id="compat" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06] scroll-mt-20">
-  <div class="reveal max-w-3xl">
-    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="compat.kicker">Model Compatibility</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="compat.title">我的模型能不能用</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="compat.desc">这张表按<strong>证据等级</strong>如实标注，而不是一律写「支持」。<strong>StaticOnly 意味着「我们从未在你的模型上实测过」</strong>——下面会告诉你怎么自己验证。</p>
-  </div>
-
-  <div class="mt-10 reveal overflow-x-auto">
-    <table class="w-full text-sm min-w-[720px]">
-      <thead>
-        <tr class="border-b border-white/[0.1] text-left">
-          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.provider">Provider</th>
-          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.protocol">接入协议</th>
-          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.level">验证等级</th>
-          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.parallel">并行工具调用</th>
-          <th class="py-3 pr-4 font-semibold text-paper/70" data-i18n="compat.th.thinking">思考预算</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr class="border-b border-white/[0.06]">
-          <td class="py-3 pr-4 text-paper/85">Anthropic</td>
-          <td class="py-3 pr-4 text-paper/50">Messages</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="compat.level.reference">Reference</span></td>
-          <td class="py-3 pr-4 text-phosphor/90" data-i18n="compat.yes">支持</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
-        </tr>
-        <tr class="border-b border-white/[0.06]">
-          <td class="py-3 pr-4 text-paper/85">OpenAI</td>
-          <td class="py-3 pr-4 text-paper/50">Chat Completions</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="compat.level.reference">Reference</span></td>
-          <td class="py-3 pr-4 text-phosphor/90" data-i18n="compat.yes">支持</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.no">不支持</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">智谱 GLM</td>
-          <td class="py-3 pr-4 text-paper/50">Anthropic 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">MiniMax</td>
-          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">月之暗面 Kimi</td>
-          <td class="py-3 pr-4 text-paper/50">Anthropic 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">DeepSeek</td>
-          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.effort">effort 档</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">阿里 Qwen</td>
-          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
-        </tr>
-        <tr class="border-b border-white/[0.06] bg-ink-950/30">
-          <td class="py-3 pr-4 text-paper/85">豆包</td>
-          <td class="py-3 pr-4 text-paper/50">OpenAI 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-amber-400" data-i18n="compat.level.static">StaticOnly</span></td>
-          <td class="py-3 pr-4 text-amber-400/90" data-i18n="compat.parallel.off">关闭（未实测前）</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.budget">token 预算</td>
-        </tr>
-        <tr class="border-b border-white/[0.06]">
-          <td class="py-3 pr-4 text-paper/85">Ollama / vLLM</td>
-          <td class="py-3 pr-4 text-paper/50">本地 OpenAI 兼容</td>
-          <td class="py-3 pr-4"><span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-paper/50" data-i18n="compat.level.experimental">Experimental</span></td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.parallel.dep">取决于模型与启动参数</td>
-          <td class="py-3 pr-4 text-paper/50" data-i18n="compat.no">不支持</td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
-  <!-- 自证 -->
-  <div class="mt-8 reveal grid lg:grid-cols-[1.15fr_0.85fr] gap-6 items-start">
-    <div class="rounded-xl border border-white/[0.08] bg-ink-950/40 p-6 sm:p-7">
-      <h3 class="font-semibold" data-i18n="compat.probe.title">别信这张表，自己验一遍</h3>
-      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="compat.probe.desc">装好之后，静态诊断是免费的；实测会发极少量最小请求，<strong>结果写入本机缓存，之后该模型在你的机器上就标记为「已实测验证」</strong>。</p>
-      <div class="code-block rounded-lg relative mt-4">
-        <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-probe" aria-label="copy">
-          <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
-        </button>
-        <pre class="px-4 py-3 pr-12 text-[12px] leading-[1.7] overflow-x-auto"><code id="code-probe"><span class="text-paper/35"># 静态诊断，免费</span>
-wyj-code model doctor
-
-<span class="text-paper/35"># 实测兼容性（basic | full）</span>
-WYJ_CODE_PROBE_API_KEY=sk-... \
-  wyj-code model doctor --probe basic</code></pre>
-      </div>
-    </div>
-
-    <div class="card rounded-xl p-6 sm:p-7">
-      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="compat.probe.keytitle">实测必须用临时 key</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="compat.probe.keydesc">实测<strong>故意不读取</strong>配置文件里已保存的凭据，只认 <code class="text-amber-400">WYJ_CODE_PROBE_API_KEY</code>。需要你自己临时轮换一个——理由是探测请求要能证明「这个 key 能用」，而不是「配置文件里那串字符还在」。</p>
-    </div>
-  </div>
-</section>
 
 <!-- AUDIENCE -->
 <section id="audience" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">

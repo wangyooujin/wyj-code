@@ -1,13 +1,20 @@
-//! 记忆文件加载：`AGENTS.md`（全局 + 项目祖先链）。
+//! 记忆文件加载（全局 + 项目祖先链）。
 //!
-//! - 查找范围：全局 `~/.wyj-code/AGENTS.md` + 从 git 仓库根到 cwd 的祖先链，
-//!   每级目录内 `AGENTS.md` / `AGENTS.local.md` 都存在就都读
-//!   （local 视作个人覆盖追加，不提交 git）。
-//! - **v1.5.18 起彻底不再读取任何 `.claude/` 路径**（原为
-//!   `~/.claude/CLAUDE.md` + `CLAUDE.md` / `CLAUDE.local.md`，`AGENTS.md`
-//!   仅作为二者皆无时的末位回退）。文件名统一为 `AGENTS.md`（复数，对齐
-//!   AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 等均采用），不再有
-//!   "CLAUDE.md 优先于 AGENTS.md"的特殊层级——两者是同一个名字。
+//! - 查找范围：全局 `~/.wyj-code/` + 从 git 仓库根到 cwd 的祖先链。
+//! - **按槽位独立回退**（v1.5.22 起）。每级目录分两个槽位，各自按候选链
+//!   顺序探测、**命中第一个即停**：
+//!   - 主槽位：`AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`
+//!   - 个人覆盖槽：`AGENTS.local.md` → `CLAUDE.local.md`
+//!
+//!   `AGENTS.md` 仍是首选（对齐 AGENTS.md 开放标准，Codex / Cursor /
+//!   Gemini CLI 等均采用）；回退只为覆盖「项目根只有某种工具的规约文件」
+//!   这类既有仓库——这些文件是项目作者写的规约，读不到等于整个项目的
+//!   约定对模型不可见，代价远大于多试几个 `is_file()` 调用。
+//!
+//!   **槽位独立**而非「整个家族二选一」，是为了保住 personal override
+//!   语义：主文件走 `AGENTS.md` 而个人私有覆盖写在 `CLAUDE.local.md`
+//!   时仍然生效，不会被静默丢弃。两个槽位各自只取一个文件，
+//!   因此**永远不存在同一份规约被注入两遍**的情况。
 //! - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
 //! - 不缓存文件内容，只缓存"哪些目录参与"这个列表；内容每次调用都重新读盘，
 //!   保证运行期间编辑立即生效、压缩后依然完整（因为每轮都重新拼装，不依赖历史消息）。
@@ -18,9 +25,16 @@ use std::sync::{Mutex, OnceLock};
 
 const MAX_IMPORT_DEPTH: u8 = 4;
 
-/// 记忆文件名（主）与个人覆盖文件名。两级顺序读取，local 追加在后。
-const MEMORY_FILE: &str = "AGENTS.md";
-const MEMORY_LOCAL_FILE: &str = "AGENTS.local.md";
+/// 主槽位候选文件名，按优先级排列（越靠前越优先）。`AGENTS.md` 是
+/// AGENTS.md 开放标准的规范名，其余是各工具的既有约定名，仅作回退：
+/// 没有它们的话，「根目录只有 CLAUDE.md」的老仓库会被当成没有任何项目
+/// 规约，模型对项目约定完全失明。`AGENT.md`（单数）是实践中常见的
+/// 手写变体，排在最后。
+const MEMORY_FILES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", "GEMINI.md", "AGENT.md"];
+
+/// 个人覆盖槽候选文件名，语义同 [`MEMORY_FILES`]：local 视作个人私有
+/// 增补追加（不提交 git），排在主文件之后注入。
+const MEMORY_LOCAL_FILES: [&str; 2] = ["AGENTS.local.md", "CLAUDE.local.md"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClaudeMdSource {
@@ -84,12 +98,12 @@ impl ClaudeMdLoader {
             return None;
         }
         Some(wrap_reminder(
-            "The following AGENTS.md memory files apply to the current project. Follow their instructions.",
+            "The following project memory files apply to the current project. Follow their instructions.",
             &sections,
         ))
     }
 
-    /// 工具触达新目录时调用：若该目录此前未展示过且存在 AGENTS.md 系文件，
+    /// 工具触达新目录时调用：若该目录此前未展示过且存在项目规约文件，
     /// 返回一段独立的 reminder 文本；否则返回 None。
     pub fn maybe_dir_reminder(&self, dir: &Path) -> Option<String> {
         let dir = dir.to_path_buf();
@@ -102,7 +116,7 @@ impl ClaudeMdLoader {
         }
         let text = load_dir_files(&dir)?;
         Some(wrap_reminder(
-            "The directory you just accessed has additional AGENTS.md instructions. Follow them as well:",
+            "The directory you just accessed has additional project instructions. Follow them as well:",
             &[(ClaudeMdSource::Subdir, dir, text)],
         ))
     }
@@ -122,43 +136,58 @@ pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
 }
 
 fn push_dir_candidates(out: &mut Vec<DiscoveredFile>, dir: &Path, source: ClaudeMdSource) {
-    let main = dir.join(MEMORY_FILE);
-    let local = dir.join(MEMORY_LOCAL_FILE);
-    let main_exists = main.is_file();
-    let local_exists = local.is_file();
+    // 与 `load_dir_files` 走同一条解析线（同一个 `resolve_slot`），保证面板
+    // 显示的就是实际会注入的那个文件，不存在"面板说有、实际没读"的漂移。
+    let main = resolve_slot(dir, &MEMORY_FILES);
+    let local = resolve_slot(dir, &MEMORY_LOCAL_FILES);
 
-    // 主文件恒定列出（不存在时 exists=false，供 `/memory` 面板提供创建入口）。
-    out.push(DiscoveredFile {
-        path: main,
-        source,
-        exists: main_exists,
-    });
-    if local_exists {
+    match main {
+        Some((path, _)) => out.push(DiscoveredFile {
+            path,
+            source,
+            exists: true,
+        }),
+        // 一个候选都不命中：列出规范名供 `/memory` 面板提供创建入口
+        //（exists=false）。
+        None => out.push(DiscoveredFile {
+            path: dir.join(MEMORY_FILES[0]),
+            source,
+            exists: false,
+        }),
+    }
+    if let Some((path, _)) = local {
         out.push(DiscoveredFile {
-            path: local,
+            path,
             source,
             exists: true,
         });
     }
 }
 
-/// 单个目录内的记忆文件读取规则：`AGENTS.md` 与 `AGENTS.local.md` 都存在就都读
-/// （local 追加在后，视作个人覆盖增补）。
-fn load_dir_files(dir: &Path) -> Option<String> {
-    let main = dir.join(MEMORY_FILE);
-    let local = dir.join(MEMORY_LOCAL_FILE);
+/// 在单个目录内按候选链解析一个槽位，返回**第一个有实际内容**的
+/// （路径, 解析后内容）。
+///
+/// "有实际内容" 而非单纯 `is_file()`：一个 0 字节 / 全空白的 `AGENTS.md`
+/// 等于没有规约，回退到下一个候选比就此停下更符合直觉，也不会让
+/// `/memory` 面板显示一个实际不生效的文件。
+fn resolve_slot(dir: &Path, names: &[&str]) -> Option<(PathBuf, String)> {
+    for name in names {
+        let path = dir.join(name);
+        if let Some(content) = read_and_resolve(&path, 0) {
+            return Some((path, content));
+        }
+    }
+    None
+}
 
-    let mut parts = vec![];
-    if main.is_file() {
-        if let Some(c) = read_and_resolve(&main, 0) {
-            parts.push(c);
-        }
-    }
-    if local.is_file() {
-        if let Some(c) = read_and_resolve(&local, 0) {
-            parts.push(c);
-        }
-    }
+/// 单个目录内的记忆文件读取规则：主槽位与个人覆盖槽各取一个文件，
+/// 两个都命中时 local 追加在后（视作个人覆盖增补）。
+fn load_dir_files(dir: &Path) -> Option<String> {
+    let parts: Vec<String> = [MEMORY_FILES.as_slice(), MEMORY_LOCAL_FILES.as_slice()]
+        .iter()
+        .filter_map(|names| resolve_slot(dir, names))
+        .map(|(_, content)| content)
+        .collect();
 
     if parts.is_empty() {
         None
@@ -328,26 +357,117 @@ mod tests {
     }
 
     #[test]
-    fn load_dir_files_ignores_claude_md_entirely() {
-        // v1.5.18 硬切换：CLAUDE.md / CLAUDE.local.md 一律不再读取。
-        // 这条锁死"彻底摆脱 .claude 依赖"，防止有人日后把 CLAUDE.md 加回回退链。
-        let dir = unique_dir("claude-ignored");
-        std::fs::write(dir.join("CLAUDE.md"), "legacy claude memory").unwrap();
-        std::fs::write(dir.join("CLAUDE.local.md"), "legacy local").unwrap();
-        assert!(load_dir_files(&dir).is_none(), "CLAUDE.md 系列不应再被读取");
+    fn main_slot_falls_back_to_claude_md_when_no_agents_md() {
+        // 「项目根只有 CLAUDE.md」是最常见的既有仓库形态：读不到它等于
+        // 整个项目的约定对模型不可见，代价远大于多试几个 is_file()。
+        let dir = unique_dir("claude-fallback");
+        std::fs::write(dir.join("CLAUDE.md"), "claude project rules").unwrap();
+        let text = load_dir_files(&dir).unwrap();
+        assert!(text.contains("claude project rules"));
     }
 
     #[test]
-    fn agents_md_wins_when_both_agent_variants_present() {
-        // AGENTS.md 与 AGENTS.local.md 同时存在时两者都读（local 追加在后）。
+    fn main_slot_stops_at_agents_md_when_both_present() {
+        // 命中第一个即停：绝不把两份内容都注入（重复内容白烧 token，
+        // 且两个文件冲突时模型行为不可预测）。
         let dir = unique_dir("agents-precedence");
         std::fs::write(dir.join("AGENTS.md"), "committed rules").unwrap();
         std::fs::write(dir.join("AGENTS.local.md"), "personal override").unwrap();
-        std::fs::write(dir.join("CLAUDE.md"), "legacy noise").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "lower priority noise").unwrap();
+        std::fs::write(dir.join("AGENT.md"), "tail candidate noise").unwrap();
         let text = load_dir_files(&dir).unwrap();
         assert!(text.contains("committed rules"));
         assert!(text.contains("personal override"));
-        assert!(!text.contains("legacy noise"));
+        assert!(!text.contains("lower priority noise"));
+        assert!(!text.contains("tail candidate noise"));
+    }
+
+    #[test]
+    fn main_slot_reaches_gemini_and_agent_tail_candidates() {
+        let gemini = unique_dir("gemini-tail");
+        std::fs::write(gemini.join("GEMINI.md"), "gemini rules").unwrap();
+        assert!(load_dir_files(&gemini).unwrap().contains("gemini rules"));
+
+        let agent = unique_dir("agent-tail");
+        std::fs::write(agent.join("AGENT.md"), "singular agent rules").unwrap();
+        assert!(load_dir_files(&agent)
+            .unwrap()
+            .contains("singular agent rules"));
+    }
+
+    #[test]
+    fn local_slot_falls_back_to_claude_local_md() {
+        // 两个槽位**独立**回退：主文件走 AGENTS.md、私有覆盖写在
+        // CLAUDE.local.md 时仍然生效，不被静默丢弃。
+        let dir = unique_dir("local-fallback");
+        std::fs::write(dir.join("AGENTS.md"), "shared rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.local.md"), "claude private override").unwrap();
+        let text = load_dir_files(&dir).unwrap();
+        assert!(text.contains("shared rules"));
+        assert!(text.contains("claude private override"));
+    }
+
+    #[test]
+    fn blank_primary_falls_through_to_next_candidate() {
+        // 0 字节 / 全空白的主文件等于「这里没有规约」，应继续往下探，
+        // 否则面板会显示一个实际不生效的 AGENTS.md。
+        let dir = unique_dir("blank-primary");
+        std::fs::write(dir.join("AGENTS.md"), "   \n\n").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "real rules").unwrap();
+        let text = load_dir_files(&dir).unwrap();
+        assert!(text.contains("real rules"));
+    }
+
+    #[test]
+    fn push_dir_candidates_lists_the_file_that_is_actually_read() {
+        // 面板与注入必须同源：不能出现「面板列了 GEMINI.md，实际读的是
+        // CLAUDE.md」这种漂移。
+        let dir = unique_dir("discover-fallback");
+        std::fs::write(dir.join("CLAUDE.md"), "root rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.local.md"), "private rules").unwrap();
+        std::fs::write(dir.join("GEMINI.md"), "must not win").unwrap();
+
+        let mut out = vec![];
+        push_dir_candidates(&mut out, &dir, ClaudeMdSource::Project);
+        let shown: Vec<String> = out.iter().map(|f| f.path.display().to_string()).collect();
+        assert!(shown.iter().any(|p| p.ends_with("CLAUDE.md")));
+        assert!(shown.iter().any(|p| p.ends_with("CLAUDE.local.md")));
+        assert!(!shown.iter().any(|p| p.ends_with("GEMINI.md")));
+        assert!(out.iter().all(|f| f.exists));
+    }
+
+    #[test]
+    fn push_dir_candidates_offers_agents_md_as_creation_entry_when_empty() {
+        // 一个候选都不存在时仍要给出规范名的创建入口（/memory 面板回车新建）。
+        let dir = unique_dir("discover-empty");
+        let mut out = vec![];
+        push_dir_candidates(&mut out, &dir, ClaudeMdSource::Project);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].path.ends_with("AGENTS.md"));
+        assert!(!out[0].exists);
+    }
+
+    #[test]
+    fn ancestor_chain_injects_fallback_files_at_every_level() {
+        // 端到端：祖先链每一级都走同一套回退规则（根 CLAUDE.md + 子目录
+        // GEMINI.md 同时被注入）。这里手工装配 loader 而不调 `new()`，
+        // 避开进程级 project_root override 与真实 `~/.wyj-code` 的干扰。
+        let root = unique_dir("chain-fallback-root");
+        let cwd = root.join("sub");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(root.join("CLAUDE.md"), "root level rules").unwrap();
+        std::fs::write(cwd.join("GEMINI.md"), "sub level rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            chain_dirs: vec![root.clone(), cwd.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone(), cwd.clone()])),
+        };
+        let reminder = loader.turn_reminder().unwrap();
+        assert!(reminder.contains("root level rules"));
+        assert!(reminder.contains("sub level rules"));
+        // 文件名已泛化，不再硬编码 AGENTS.md（回退生效时那句会变成假话）。
+        assert!(!reminder.contains("AGENTS.md memory files"));
     }
 
     #[test]
