@@ -135,6 +135,22 @@ pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
     out
 }
 
+/// 该目录**已经存在**的规约文件名（走与注入完全相同的 `resolve_slot` 解析线）。
+///
+/// 供 `/init` 决定生成目标：仓库里既然已经有 `CLAUDE.md`，就该更新那一份，
+/// 而不是凭空再写一份内容重复的 `AGENTS.md`——两份同名职责不同文件名的
+/// 规约文件是漂移的温床，而「命中即停」只保证模型不双份注入，并不阻止
+/// 维护者把它们写成两份不同步的副本。
+///
+/// 一个候选都不存在时返回 `None`，此时用规范名 `MEMORY_FILES[0]`（`AGENTS.md`）
+/// 作创建目标。
+pub fn existing_memory_file_name(dir: &Path) -> Option<String> {
+    resolve_slot(dir, &MEMORY_FILES).and_then(|(path, _)| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    })
+}
+
 fn push_dir_candidates(out: &mut Vec<DiscoveredFile>, dir: &Path, source: ClaudeMdSource) {
     // 与 `load_dir_files` 走同一条解析线（同一个 `resolve_slot`），保证面板
     // 显示的就是实际会注入的那个文件，不存在"面板说有、实际没读"的漂移。
@@ -416,6 +432,34 @@ mod tests {
         std::fs::write(dir.join("CLAUDE.md"), "real rules").unwrap();
         let text = load_dir_files(&dir).unwrap();
         assert!(text.contains("real rules"));
+    }
+
+    /// `/init` 的生成目标必须跟着仓库现状走，否则会在已有 `CLAUDE.md` 的仓库里
+    /// 凭空造一份内容重复的 `AGENTS.md`——「命中即停」只保证模型不双份注入，
+    /// 管不住两份副本各自漂移。这是本条不变式的钉子。
+    #[test]
+    fn init_target_follows_the_file_that_would_actually_be_read() {
+        let dir = unique_dir("init-target-existing");
+        std::fs::write(dir.join("CLAUDE.md"), "root rules").unwrap();
+        assert_eq!(
+            existing_memory_file_name(&dir).as_deref(),
+            Some("CLAUDE.md"),
+            "已有 CLAUDE.md 时 /init 必须更新它，而不是新建 AGENTS.md"
+        );
+
+        // 两个都在时按注入的优先级走（AGENTS.md 首选），不能各写各的。
+        std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
+        assert_eq!(existing_memory_file_name(&dir).as_deref(), Some("AGENTS.md"));
+    }
+
+    /// 一个候选都不存在时返回 None，调用方据此回退到规范名 AGENTS.md。
+    #[test]
+    fn init_target_is_none_when_no_candidate_exists() {
+        let dir = unique_dir("init-target-none");
+        assert_eq!(existing_memory_file_name(&dir), None);
+        // 全空白的 AGENTS.md 也不算「有」，否则会写进一个永不生效的文件。
+        std::fs::write(dir.join("AGENTS.md"), "  \n ").unwrap();
+        assert_eq!(existing_memory_file_name(&dir), None);
     }
 
     #[test]

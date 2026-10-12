@@ -692,19 +692,25 @@ cwd:
   body: "Working directory: {cwd}"
 
 init:
-  desc: "Have the Agent explore the project and generate/merge AGENTS.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists"
+  desc: "Have the Agent explore the project and generate/merge the project convention file (target follows the repo: update an existing AGENTS.md/CLAUDE.md, otherwise create AGENTS.md); also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists"
   agent_prompt: |-
-    Generate or update the AGENTS.md memory file for the current project (working directory: {cwd}).
+    Generate or update the {target_name} memory file for the current project (working directory: {cwd}).
+
+    The target was chosen from this repo's current state: {target}. Always write that one file; do not
+    create a second file with the same role (even if it is named AGENTS.md) — two convention files with
+    duplicate content drift apart, and the loader only ever resolves one of them, leaving the other as
+    an unmaintained zombie copy.
 
     Steps:
     1. Explore the project structure: check manifest files like Cargo.toml/package.json/pyproject.toml/go.mod,
        the README, and existing lint/CI configs (e.g. .eslintrc, .golangci.yml, GitHub Actions workflows)
        to determine the tech stack, build/test commands, and coding conventions.
-    2. If {cwd}/AGENTS.md already exists, read it in full first, then merge, extend, and improve it —
+    2. If {target} already exists, read it in full first, then merge, extend, and improve it —
        do not overwrite or discard its existing content wholesale.
-    3. If the project has other AI assistant rule files such as CLAUDE.md, GEMINI.md, AGENT.md,
-       .cursorrules or .github/copilot-instructions.md, read them and fold in whatever parts still apply.
-    4. Write the result to {cwd}/AGENTS.md. It should include at least: project overview, build/test/lint
+    3. If the project has other AI assistant rule files (the ones whose names differ from the target,
+       e.g. AGENTS.md / CLAUDE.md / GEMINI.md / AGENT.md / .cursorrules /
+       .github/copilot-instructions.md), read them and fold in whatever parts still apply to {target}.
+    4. Write the result to {target}. It should include at least: project overview, build/test/lint
        commands, architecture notes, and development conventions. Keep it concise and avoid speculating
        about anything you couldn't verify.
 
