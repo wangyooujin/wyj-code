@@ -274,6 +274,15 @@ impl Tool for ToolSearchTool {
         }
     }
 
+    /// 目录查询本身无副作用，可安全并发：`LazyToolState` 内部是
+    /// `Arc<RwLock<..>>`，search 把命中的工具置 sticky 的写入也是加锁的。
+    ///
+    /// 漏掉这个覆写会让「同时搜两个能力」退化成两趟串行往返，而 ToolSearch
+    /// 恰恰是 lazy-tools 折叠下**每次换能力都要付一趟**的高频工具。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let input: SearchInput = serde_json::from_value(input)?;
         let matches = self.state.search(

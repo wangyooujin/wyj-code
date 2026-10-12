@@ -2010,6 +2010,13 @@ impl Agent {
                 // 分区执行：parallel_safe 的调用（如 SubAgent）各自并发，其余调用
                 // 保持相互顺序、但与并发组同时进行；结果按原始下标排序回填保序。
                 // 均为单任务内并发（join!），不要求 ctx 满足 Send/'static。
+                //
+                // **`parallel_safe = false` 的语义边界**：它只保证「本组内部按序」，
+                // **不保证与并发组之间有先后**——下面那次 `tokio::join!` 让两组真正
+                // 同时跑。需要权限确认的工具（Edit/Write/Bash）落进 seq_calls 后
+                // 彼此串行，这才是「同一时刻至多一个对话框」真正依赖的性质；
+                // 但它与同批次的只读工具并发执行本来就是允许的。
+                // 改这段之前先分清这两种「顺序」的差别。
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
                 for (idx, id, name, input) in calls {
