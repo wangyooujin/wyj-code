@@ -1279,10 +1279,23 @@ impl Command for InitCmd {
 
         // 对齐真实 Claude Code：/init 不是静态模板写文件，而是触发一次真正的 agent
         // 回合，让它自己去探索项目（Cargo.toml/package.json/README/目录结构等）
-        // 生成或合并改进 AGENTS.md。已存在则要求读取后合并而非整体覆盖。
+        // 生成或合并改进规约文件。已存在则要求读取后合并而非整体覆盖。
+        //
+        // 目标文件名**必须跟着仓库现状走**：项目里已经有 CLAUDE.md 时再去生成
+        // AGENTS.md，等于凭空造一份内容重复的第二份规约——「命中即停」只保证
+        // 模型不会双份注入，管不住维护者把两份写成不同步的副本。这里复用
+        // `claude_md::existing_memory_file_name`，与实际注入走同一条解析线，
+        // 不存在「改了 A 文件、面板却说 B」的第二条路径。
+        let target_name = wyj_core::claude_md::existing_memory_file_name(&ctx.cwd)
+            .unwrap_or_else(|| "AGENTS.md".to_string());
+        let target = ctx.cwd.join(&target_name);
         let prompt = tr_fmt(
             "init.agent_prompt",
-            &[("cwd", &ctx.cwd.display().to_string())],
+            &[
+                ("cwd", &ctx.cwd.display().to_string()),
+                ("target", &target.display().to_string()),
+                ("target_name", &target_name),
+            ],
         );
         Ok(CommandResult::RunPrompt(prompt))
     }

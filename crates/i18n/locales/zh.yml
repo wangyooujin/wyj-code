@@ -691,20 +691,24 @@ cwd:
   body: "工作目录: {cwd}"
 
 init:
-  desc: "让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在"
+  desc: "让 Agent 探索项目并生成/合并更新项目规约文件（目标跟随仓库现状：已有 AGENTS.md/CLAUDE.md 就更新那一份，否则新建 AGENTS.md）；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在"
   agent_prompt: |-
-    请为当前项目生成或更新 AGENTS.md 记忆文件（工作目录：{cwd}）。
+    请为当前项目生成或更新记忆文件 {target_name}（工作目录：{cwd}）。
+
+    目标文件由本仓库现状决定：{target}。请始终写这一份，不要另建同职责的
+    另一个文件（哪怕它叫 AGENTS.md）——两份内容重复的规约文件会各自漂移，
+    而加载器只会命中其中一份，另一份就成了没人维护的僵尸副本。
 
     步骤：
     1. 探索项目结构：查看 Cargo.toml/package.json/pyproject.toml/go.mod 等清单文件、README、
        已有的 lint/CI 配置（如 .eslintrc、.golangci.yml、GitHub Actions workflow），
        判断技术栈、构建命令、测试命令、代码规范。
-    2. 若 {cwd}/AGENTS.md 已存在，先完整读取，在其基础上合并、补充、改进，
+    2. 若 {target} 已存在，先完整读取，在其基础上合并、补充、改进，
        不要整体覆盖或丢弃已有内容。
-    3. 若项目中存在 CLAUDE.md、GEMINI.md、AGENT.md、.cursorrules、
-       .github/copilot-instructions.md 等其它 AI 助手规则文件，
-       阅读并将其中仍然适用的部分整合进 AGENTS.md。
-    4. 最终把结果写入 {cwd}/AGENTS.md，内容至少包含：项目概览、构建/测试/lint 命令、
+    3. 若项目中还存在其它 AI 助手的规则文件（与目标文件**不同名**的那些，
+       如 AGENTS.md / CLAUDE.md / GEMINI.md / AGENT.md / .cursorrules /
+       .github/copilot-instructions.md），阅读并将其中仍然适用的部分整合进 {target}。
+    4. 最终把结果写入 {target}，内容至少包含：项目概览、构建/测试/lint 命令、
        代码架构说明、开发约定。保持简洁，避免臆测不确定的信息。
 
 config:
