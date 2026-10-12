@@ -139,6 +139,48 @@ fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachmen
     display
 }
 
+/// 聊天区里那条用户消息的展示文本——**与输入框走同一条投影线**。
+///
+/// 附件占位符的位置信息只存在于输入框内部的原子标记里（`InputBox::text()`
+/// 会把它们过滤掉，事后无从还原），所以这里必须接收**发送瞬间**的输入框
+/// 快照。输入框里写的是 `[Image #1]`，消息区就必须是 `[Image #1]`：把
+/// 同一个附件在两处渲染成不同样子（输入框 `[Image #1]`、消息区末尾一行
+/// `[图片 402×288]`）会让人以为发送丢了图或换了一张图。
+///
+/// `expand_at_refs_to_attachments` 从正文里的 `@path` 追加的文件没有对应
+/// 标记（用户就是敲了一行路径，不是粘贴），它们在末尾单列，避免凭空消失。
+pub(crate) fn attachment_display_text(input: &InputBox, attachments: &[Attachment]) -> String {
+    let marked = input.attachment_marker_count().min(attachments.len());
+    // 只投影有标记的那一段：`input_with_attachment_placeholders` 末尾还有一段
+    // 「旧状态兼容」兜底，会把没有标记的附件补到行首（输入框需要它来对齐
+    // `pending_attachments`，聊天区不需要——它们由下面统一在末尾单列，
+    // 两边都画一遍就是同一个附件出现两次）。
+    let mut display = input_with_attachment_placeholders(input, &attachments[..marked]).text();
+
+    // 已被占位符投影的图片数，作为末尾追加时的编号起点。
+    let mut image_number = attachments
+        .iter()
+        .take(marked)
+        .filter(|att| matches!(att, Attachment::Image { .. }))
+        .count();
+    for att in &attachments[marked..] {
+        match att {
+            Attachment::Image { preview_label, .. } => {
+                image_number += 1;
+                display.push_str(&format!("\n[Image #{image_number} {preview_label}]"));
+            }
+            Attachment::File { path } => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                display.push_str(&format!("\n[File: {name}]"));
+            }
+        }
+    }
+    display
+}
+
 #[cfg(test)]
 mod attachment_input_tests {
     use super::*;
@@ -162,6 +204,45 @@ mod attachment_input_tests {
             "describe this [Image #1] ".chars().count()
         );
         assert_eq!(input.text(), "describe this");
+    }
+
+    /// 用户报的核心症状：输入框里是 `[Image #1]`（还带粘贴位置），发出去
+    /// 消息区却变成末尾一行 `[图片 402×288]`——同一个附件两套长相，会让人
+    /// 以为发送丢了图或换了一张。这条钉死"两处必须是同一段文本"。
+    #[test]
+    fn chat_display_is_byte_identical_to_the_input_box() {
+        let mut input = InputBox::new();
+        input.insert_attachment_marker();
+        input.insert_text("请按图更新自选股");
+        let attachments = vec![Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded".to_string(),
+            preview_label: "402×288".to_string(),
+        }];
+
+        let in_input_box = input_with_attachment_placeholders(&input, &attachments)
+            .display_lines()
+            .join("\n");
+        let in_chat = attachment_display_text(&input, &attachments);
+
+        assert_eq!(in_chat, in_input_box);
+        assert_eq!(in_chat, "[Image #1] 请按图更新自选股");
+    }
+
+    /// 正文里的 `@path` 追加出来的附件没有输入框标记（用户敲的是路径文本，
+    /// 不是粘贴），不能在末尾被漏掉——单列一行，且用同一套 `[File: …]` 文案。
+    #[test]
+    fn at_referenced_files_without_a_marker_are_listed_at_the_end() {
+        let mut input = InputBox::new();
+        input.insert_text("看下 @notes.txt");
+        let attachments = vec![Attachment::File {
+            path: std::path::PathBuf::from("/tmp/wyj/notes.txt"),
+        }];
+
+        assert_eq!(
+            attachment_display_text(&input, &attachments),
+            "看下 @notes.txt\n[File: notes.txt]"
+        );
     }
 
     #[test]
@@ -605,8 +686,24 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     }
     if state.plan_dialog.is_some() {
         // 计划正文已作为普通消息并入应用内聊天流，
-        // 这里只剩固定 3 行的三选一选择器，贴在输入框上方，宽度对齐 Permission。
-        return (5u16.min(area_height), BottomPanel::PlanApproval);
+        // 这里只剩三选一选择器，贴在输入框上方，宽度对齐 Permission。
+        //
+        // 手动输入框是多行的（Shift+Enter / Ctrl+J / 行尾 `\`+Enter 都能换行，
+        // 见 `apply_edit_key`），高度必须跟着实际行数走：此前写死 5 行、渲染
+        // 又只画 `lines.first()`，用户写三行只看见一行，回车却把三行一起发
+        // 出去——所见非所发。同批改动已把 AskQuestion 的自由输入改成逐行渲染，
+        // 这里是对齐遗漏的那个兄弟面板。
+        let freetext_rows = state
+            .plan_dialog
+            .as_ref()
+            .and_then(|dlg| dlg.freetext_input().map(|input| input.lines.len()))
+            .unwrap_or(0) as u16;
+        let rows = if freetext_rows > 0 {
+            3 + freetext_rows
+        } else {
+            5
+        };
+        return (rows.min(area_height), BottomPanel::PlanApproval);
     }
     // 后台任务面板：与子 Agent 面板互斥（底部只有一个位置），判定规则是
     // **「用户焦点所在面板优先，其次才看有没有运行中任务」**。
@@ -2452,6 +2549,28 @@ fn thinking_status_label(state: &AppState) -> String {
     "Thinking".to_string()
 }
 
+/// 排队提示：写清「已排队」+ 当前在挡着的东西。
+///
+/// 点名当前步骤（`Bash(sleep 540)` / `Agent(...)`）比笼统的「当前操作完成后」
+/// 有用得多：用户看到 `Agent(...)` 就知道在等子 Agent，可以选择再等等、还是
+/// ESC 中断重来。
+///
+/// **刻意不承诺具体送达时刻**：前台子 Agent 会在**它自己的**下一个工具边界
+/// 把排队内容取走（见 `wyj_core::SteerQueue`），通常早于「主 Agent 这一步
+/// 结束」。写死"X 结束后送达"要么说早了要么说晚了。
+fn queue_hint_text(state: &AppState) -> String {
+    if state.pending_queue.is_empty() {
+        return String::new();
+    }
+    let running = state
+        .current_op
+        .as_deref()
+        .filter(|op| !op.is_empty())
+        .map(|op| format!("{op} 进行中"))
+        .unwrap_or_else(|| "等待送达".to_string());
+    format!("{} 条已排队（{running}）", state.pending_queue.len())
+}
+
 fn draw_input(
     f: &mut Frame,
     state: &AppState,
@@ -2512,8 +2631,17 @@ fn draw_input(
         let label = thinking_status_label(state);
         let elapsed = crate::app::format_hms(current_step_elapsed_secs(state));
         let tokens = title_token_text(state);
+        // 排队中：挂在标题栏而不是只靠状态栏右对齐那一句——窄终端上右对齐
+        // 会被左边的「模型 · 模式 · cwd」挤掉后半句（实测只剩「…将在」），
+        // 而「我的补充还没送达」正是用户最需要看到的信息。
+        let queue = queue_hint_text(state);
+        let queue = if queue.is_empty() {
+            String::new()
+        } else {
+            format!(" · {queue}")
+        };
         (
-            format!(" {frame} {label} · {elapsed} · {tokens} "),
+            format!(" {frame} {label} · {elapsed} · {tokens}{queue} "),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
@@ -2836,10 +2964,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
 
     let (right_help, right_style) = if !state.pending_queue.is_empty() {
         (
-            format!(
-                "● {} 条消息已排队，将在当前操作完成后发送",
-                state.pending_queue.len()
-            ),
+            format!("● {}", queue_hint_text(state)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -3054,16 +3179,24 @@ fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect)
         plan_option_row(1, cursor, "继续规划", max_w),
     ];
     if let Some(input) = dlg.freetext_input() {
-        let text = input.lines.first().map(|s| s.as_str()).unwrap_or("");
-        lines.push(Line::from(Span::styled(
-            format!(
-                "❯ 手动输入： {}_",
-                truncate_line(text, max_w.saturating_sub(8))
-            ),
-            Style::default()
-                .fg(Theme::claude_color())
-                .add_modifier(Modifier::BOLD),
-        )));
+        // 多行逐行渲染（`PlanApprovalDialog` 接了 `apply_edit_key`，Shift+Enter /
+        // Ctrl+J / 行尾 `\`+Enter 都能换行，提交时 `input.text()` 会带上全部
+        // 内容）。此前只画 `lines.first()` 并把一个假的 `_` 永远贴在行尾：
+        // 多行内容直接不可见，用户写三行只看见一行，回车却把三行一起发出去。
+        // 直接复用 AskQuestion 自由输入那条已验过的 `freetext_line`（真实块状
+        // 光标 + 超宽横向滚动），两个弹窗从此走同一条渲染线。
+        let total = input.lines.len();
+        for (row, line) in input.lines.iter().enumerate() {
+            let mut rendered = freetext_line(input, row, line, max_w);
+            // 首行加树形分叉标记，多行读起来是一整块输入而不是几条散项
+            if row + 1 < total {
+                let marker = Span::styled("├ ", Style::default().fg(Theme::claude_color()));
+                let mut spans = vec![marker];
+                spans.append(&mut rendered.spans);
+                rendered = Line::from(spans);
+            }
+            lines.push(rendered);
+        }
     } else {
         lines.push(plan_option_row(2, cursor, "手动输入反馈…", max_w));
     }
@@ -3139,6 +3272,104 @@ fn format_confirmed_answer_ui(spec: &AskQuestionSpec, answer: &QuestionAnswer) -
     }
 }
 
+/// 自由文本的一行：`❯ ` 前缀 + 真实块状光标 + 超宽时按光标横向滚动。
+///
+/// 光标用**反色块**而不是移动终端硬件光标：弹窗是浮层，硬件光标同时被底部
+/// 主输入框占用，两者会打架；反色块在任何焦点状态下都稳定可见。
+fn freetext_line(input: &InputBox, row: usize, line: &str, max_w: usize) -> Line<'static> {
+    const PREFIX: &str = "❯ ";
+    let inner_w = max_w.saturating_sub(PREFIX.len()).max(1);
+    let chars: Vec<char> = line.chars().collect();
+    let cursor_col = if row == input.cursor_row {
+        input.cursor_col.min(chars.len())
+    } else {
+        usize::MAX
+    };
+    let (start, end) = visible_window(&chars, cursor_col, inner_w);
+
+    let mut spans = vec![Span::styled(
+        PREFIX.to_string(),
+        Style::default().fg(Theme::claude_color()),
+    )];
+    if start > 0 {
+        spans.push(Span::styled("‹", Theme::dim()));
+    }
+    for (i, ch) in chars[start..end].iter().enumerate() {
+        if cursor_col != usize::MAX && start + i == cursor_col {
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Theme::claude_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(Color::White),
+            ));
+        }
+    }
+    // 光标停在行尾（插入态）：补一个反色空格，否则看不出还能继续打字
+    if cursor_col != usize::MAX && cursor_col == chars.len() {
+        spans.push(Span::styled(
+            " ".to_string(),
+            Style::default().fg(Color::Black).bg(Theme::claude_color()),
+        ));
+    }
+    if end < chars.len() {
+        spans.push(Span::styled("›", Theme::dim()));
+    }
+    Line::from(spans)
+}
+
+/// 按显示宽度取一个「把光标放进窗口」的字符区间（start, end）。
+///
+/// 不变式：**光标之前的文本必须完整落在窗口内**，否则光标会被挤出可视区、
+/// 整个反色块消失——用户就失去了所有光标位置提示（比旧的假 `_` 更糟：旧的
+/// 位置虽然永远错，但永远看得见）。
+///
+/// 向后走的时候要减的是**即将被丢到左边窗外**的那个字符，且循环条件比较的是
+/// 「留在窗口内的前缀宽度」。反过来写（拿光标前的总宽度去减、拿丢弃量去比）
+/// 会让循环在「左侧丢弃的文本塞得下」时就停——恰好与意图相反，光标偏移量
+/// 随之无界增长，行宽超过约 `2 × inner_w` 时必然消失。
+fn visible_window(chars: &[char], cursor_col: usize, inner_w: usize) -> (usize, usize) {
+    let upto = if cursor_col == usize::MAX {
+        0
+    } else {
+        cursor_col.min(chars.len())
+    };
+    let cursor_w: usize = chars[..upto]
+        .iter()
+        .map(|c| crate::input::char_width(*c))
+        .sum();
+    // 光标自身最多占 2 列（CJK），按它的实际宽度留位，否则它会被挤出窗口
+    let cursor_cell = crate::input::char_width(*chars.get(upto).unwrap_or(&' '));
+    let target = inner_w.saturating_sub(cursor_cell);
+    let mut start = 0usize;
+    if cursor_w > target {
+        // 从左侧逐个丢弃字符，直到「留下的前缀 + 光标」塞得下
+        let mut i = 0usize;
+        let mut w = cursor_w;
+        while i < upto && w > target {
+            w -= crate::input::char_width(chars[i]);
+            i += 1;
+        }
+        start = i;
+    }
+    let mut end = start;
+    let mut w = 0usize;
+    while end < chars.len() {
+        let cw = crate::input::char_width(chars[end]);
+        if w + cw > inner_w {
+            break;
+        }
+        w += cw;
+        end += 1;
+    }
+    (start, end)
+}
+
 fn build_answering_lines(
     dlg: &AskQuestionDialog,
     index: usize,
@@ -3156,14 +3387,18 @@ fn build_answering_lines(
     ];
 
     if let InProgressAnswer::FreeText { input, .. } = &dlg.current {
-        let text = input.lines.first().map(|s| s.as_str()).unwrap_or("");
-        lines.push(Line::from(Span::styled(
-            format!("> {}_", truncate_line(text, max_w.saturating_sub(2))),
-            Style::default().fg(Theme::claude_color()),
-        )));
+        // 自由文本此前**只画第一行**、并把一个假的 `_` 永远贴在行尾：多行
+        // （Shift+Enter）内容直接看不见，光标位置也永远是错的。这里改成
+        // 逐行渲染 + 真实块状光标 + 横向滚动窗口 + 字数。
+        for (row, line) in input.lines.iter().enumerate() {
+            lines.push(freetext_line(input, row, line, max_w));
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            wyj_i18n::tr("dialog.hint_freetext_submit_cancel"),
+            wyj_i18n::tr_fmt(
+                "dialog.hint_freetext",
+                &[("chars", &input.text().chars().count().to_string())],
+            ),
             Theme::dim(),
         )));
         return lines;
@@ -4029,7 +4264,13 @@ fn draw_mcp_dialog(
     f.render_widget(para, inner);
 
     if let Some(menu) = &dialog.menu {
-        draw_action_menu(f, area, &wyj_i18n::tr("mcp.dialog.title"), menu);
+        draw_action_menu(
+            f,
+            area,
+            dialog_area,
+            &wyj_i18n::tr("mcp.dialog.title"),
+            menu,
+        );
     } else {
         draw_mcp_overlay(f, dialog, area);
     }
@@ -4302,7 +4543,13 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
     f.render_widget(para, inner);
 
     if let Some(menu) = &dialog.menu {
-        draw_action_menu(f, area, &wyj_i18n::tr("skills.dialog.title"), menu);
+        draw_action_menu(
+            f,
+            area,
+            dialog_area,
+            &wyj_i18n::tr("skills.dialog.title"),
+            menu,
+        );
     } else {
         draw_skills_overlay(f, &dialog.overlay, area);
     }
@@ -4613,7 +4860,13 @@ fn draw_plugins_dialog(f: &mut Frame, dialog: &PluginsDialog, area: Rect) {
     f.render_widget(para, inner);
 
     if let Some(menu) = &dialog.menu {
-        draw_action_menu(f, area, &wyj_i18n::tr("plugins.dialog.title"), menu);
+        draw_action_menu(
+            f,
+            area,
+            dialog_area,
+            &wyj_i18n::tr("plugins.dialog.title"),
+            menu,
+        );
     } else {
         draw_plugins_overlay(f, &dialog.overlay, area);
     }
@@ -5193,7 +5446,7 @@ fn draw_profile_dialog(
     // 光标完全交给 draw_input 的借用态分支（借用中不在这里画光标）。
 
     if let Some(menu) = &dialog.menu {
-        draw_action_menu(f, area, &wyj_i18n::tr("profile.title"), menu);
+        draw_action_menu(f, area, dialog_area, &wyj_i18n::tr("profile.title"), menu);
         return;
     }
 
@@ -5378,7 +5631,7 @@ fn draw_schedule_dialog(
     f.render_widget(para, inner);
 
     if let Some(menu) = &dialog.menu {
-        draw_action_menu(f, area, &wyj_i18n::tr("schedule.title"), menu);
+        draw_action_menu(f, area, dialog_area, &wyj_i18n::tr("schedule.title"), menu);
         return;
     }
 
@@ -5482,6 +5735,7 @@ fn draw_profile_list_overlay(
 pub fn draw_action_menu<T, A: PartialEq>(
     f: &mut Frame,
     area: Rect,
+    anchor: Rect,
     title: &str,
     menu: &ActionMenu<T, A>,
 ) {
@@ -5492,16 +5746,32 @@ pub fn draw_action_menu<T, A: PartialEq>(
             .find(|it| &it.action == confirming)
             .map(|it| it.label.as_str())
             .unwrap_or("");
-        draw_confirm_overlay(f, area, title, label);
+        draw_confirm_overlay(f, area, anchor, title, label);
         return;
     }
 
-    let width = (area.width * 6 / 10).clamp(40, 90).min(area.width);
+    let width = (anchor.width * 7 / 10)
+        .clamp(36, 72)
+        .min(area.width.saturating_sub(4));
     let height = ((menu.items.len() as u16) + 2)
-        .min(area.height.saturating_sub(2))
+        .min(area.height.saturating_sub(4))
         .max(4);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    // **贴着父面板摆放，而不是叠在它身上。** 之前子菜单和父面板用的是同一个
+    // `area`（整屏）居中，两者坐标完全重合，父面板的文字从弹窗左右两侧露出来
+    // （实测第二行 profile 被切掉一半），看起来像渲染错位而不是"打开了一个
+    // 子菜单"。右边放不下就落到下方，两边都不行才退回居中。
+    let right_edge = area.x + area.width;
+    let bottom_edge = area.y + area.height;
+    let (mut x, mut y) = (anchor.right() + 1, anchor.y + 1);
+    if x + width + 1 > right_edge {
+        x = anchor.x + 2;
+        y = anchor.bottom() + 1;
+    }
+    if y + height + 1 > bottom_edge {
+        y = bottom_edge.saturating_sub(height + 1);
+    }
+    x = x.clamp(area.x, right_edge.saturating_sub(width));
+    y = y.clamp(area.y, bottom_edge.saturating_sub(height));
     let overlay_area = Rect::new(x, y, width, height);
 
     f.render_widget(Clear, overlay_area);
@@ -5547,11 +5817,21 @@ pub fn draw_action_menu<T, A: PartialEq>(
 }
 
 /// `draw_action_menu` 里危险操作的二级确认子步骤："确定要 {label} 吗？"
-fn draw_confirm_overlay(f: &mut Frame, area: Rect, title: &str, action_label: &str) {
-    let width = (area.width * 6 / 10).clamp(40, 70).min(area.width);
-    let height = 4u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
+fn draw_confirm_overlay(f: &mut Frame, area: Rect, anchor: Rect, title: &str, action_label: &str) {
+    // 二级确认同样贴着触发它的弹窗摆，不要再叠上去
+    let width = (anchor.width * 7 / 10)
+        .clamp(40, 70)
+        .min(area.width.saturating_sub(4));
+    let height = 4u16.min(area.height.saturating_sub(2));
+    let (mut x, mut y) = (anchor.right() + 1, anchor.y + 1);
+    if x + width + 1 > area.x + area.width {
+        x = anchor.x + 2;
+        y = anchor.bottom() + 1;
+    }
+    let bottom_edge = area.y + area.height;
+    let right_edge = area.x + area.width;
+    x = x.clamp(area.x, right_edge.saturating_sub(width));
+    y = y.clamp(area.y, bottom_edge.saturating_sub(height));
     let overlay_area = Rect::new(x, y, width, height);
 
     f.render_widget(Clear, overlay_area);
@@ -5637,6 +5917,142 @@ fn parse_iso_to_secs(s: &str) -> Option<u64> {
         .copied()
         .unwrap_or(0);
     Some((y_days + mo_days + day.saturating_sub(1)) * 86400 + h * 3600 + m * 60 + sec)
+}
+
+#[cfg(test)]
+mod freetext_window_tests {
+    use super::*;
+
+    fn cursor_is_painted(chars: &[char], cursor_col: usize, inner_w: usize) -> bool {
+        let (start, end) = visible_window(chars, cursor_col, inner_w);
+        (start..end).any(|i| i == cursor_col) || cursor_col == chars.len()
+    }
+
+    /// 光标必须**落在窗口内**：`freetext_line` 只给 `start..end` 里的
+    /// `cursor_col` 画反色块，光标不在区间里、又不等于行尾时，**整块光标消失**，
+    /// 用户失去所有光标位置提示。
+    ///
+    /// 旧实现向后走时减的是「即将丢到左窗外的字符」、比的却是「光标前总宽度」，
+    /// 于是循环在「左侧丢弃量塞得下」时就停——与意图相反，光标偏移量无界增长，
+    /// 行宽超过约 `2 × inner_w` 后必然消失（inner_w=70 时 ASCII 第 139 个字符、
+    /// 中文第 70 个字起就看不见了）。中英混排的项目里一行稍长的回答就会触发。
+    #[test]
+    fn cursor_stays_visible_on_long_lines() {
+        for (name, text) in [
+            ("ascii", "a".repeat(400)),
+            ("cjk", "中".repeat(400)),
+            ("emoji", "😀".repeat(300)),
+            (
+                "mixed",
+                "这是一段中英 mixed 混排的测试文本用来检查滚动窗口的行为是否正确".repeat(12),
+            ),
+        ] {
+            let chars: Vec<char> = text.chars().collect();
+            for inner_w in [4usize, 10, 20, 40, 56, 70, 110] {
+                for cursor in 0..=chars.len() {
+                    // 退化区间跳过：单个字符本身就比整列还宽（1 列窗口里的 CJK），
+                    // 任何实现都画不下，这不是本函数该保证的事。
+                    let cell = if cursor < chars.len() {
+                        crate::input::char_width(chars[cursor])
+                    } else {
+                        1
+                    };
+                    if cell > inner_w || inner_w < 2 {
+                        continue;
+                    }
+                    assert!(
+                        cursor_is_painted(&chars, cursor, inner_w),
+                        "{name}: inner_w={inner_w} cursor={cursor} 处光标不可见"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 窗口宽度本身也必须守恒：向前丢字符不能把总显示宽度撑破 inner_w，
+    /// 否则 ratatui 会把整行裁掉，右侧内容连带光标一起消失。
+    #[test]
+    fn window_never_exceeds_available_width() {
+        let texts = ["a".repeat(300), "中".repeat(300), "中a中b".repeat(80)];
+        for text in texts {
+            let chars: Vec<char> = text.chars().collect();
+            for inner_w in [2usize, 4, 10, 40, 70] {
+                for cursor in 0..=chars.len().min(200) {
+                    let (start, end) = visible_window(&chars, cursor, inner_w);
+                    assert!(start <= end, "start={start} end={end}");
+                    let width: usize = chars[start..end]
+                        .iter()
+                        .map(|c| crate::input::char_width(*c))
+                        .sum();
+                    assert!(width <= inner_w, "width={width} > inner_w={inner_w}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod plan_approval_render_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// 计划批准面板的手动输入必须**逐行渲染**。
+    ///
+    /// 该输入已接上 `apply_edit_key`（Shift+Enter / Ctrl+J / 行尾 `\`+Enter
+    /// 都能换行），提交时取的是 `input.text()`。此前渲染只取
+    /// `lines.first()` 并把一个假的 `_` 永远贴在行尾，面板高度还写死 5 行：
+    /// 用户写三行只看见一行，回车却把三行一起发出去——所见非所发。
+    #[test]
+    fn freetext_lines_are_all_rendered() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut dlg = PlanApprovalDialog::new(tx);
+        // 进入「手动输入反馈…」并敲三行
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key(KeyCode::Down);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for line in ["第一行内容", "第二行内容", "第三行内容"] {
+            for ch in line.chars() {
+                dlg.handle_key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+            }
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        }
+        // 末尾那次 Ctrl+J 会多出一个空行，正好也验证它不被吞
+        assert_eq!(
+            dlg.freetext_input().map(|i| i.lines.len()),
+            Some(4),
+            "手动输入必须真的能存下多行"
+        );
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                draw_plan_approval_panel(f, &dlg, area);
+            })
+            .expect("draw ok");
+
+        let buf = terminal.backend().buffer();
+        // TestBuffer 把宽字符（CJK）的占位空格也存成 cell，逐 cell 拼出来是
+        // "第 一 行 内 容" 这种带空隙的样子，比对前先去掉所有空白。
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        for expected in ["第一行内容", "第二行内容", "第三行内容"] {
+            assert!(
+                compact.contains(expected),
+                "面板必须画出每一行，缺了 {expected:?}\n实际渲染：\n{text}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5910,6 +6326,7 @@ mod tool_result_fold_tests {
         state.exec_mode_confirm = Some(ExecModeConfirmDialog {
             pending_message: "go".to_string(),
             pending_attachments: Vec::new(),
+            pending_display: "go".to_string(),
         });
 
         let (_, panel) = bottom_panel_size(&state, 40);

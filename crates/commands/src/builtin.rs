@@ -931,7 +931,7 @@ impl Command for DoctorCmd {
         ));
         lines.push(tr_fmt("doctor.model", &[("model", &ctx.model)]));
 
-        // AGENTS.md 系文件（全局 + 祖先链）
+        // 项目规约文件（全局 + 祖先链，按 AGENTS.md → CLAUDE.md → … 回退）
         let claude_md_files = wyj_core::discover_files(&ctx.cwd);
         let existing: Vec<String> = claude_md_files
             .iter()

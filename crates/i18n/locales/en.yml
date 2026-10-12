@@ -94,6 +94,9 @@ agent:
   turn_task_lost: "The turn task terminated abnormally (internal error or forced abort); this turn was stopped. You can keep typing."
   turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
 
+session:
+  busy_notice: "The previous turn is still running — wait for it to finish before doing that."
+
 claude_md:
   source:
     global: "global"
@@ -175,7 +178,7 @@ help:
     - `/shells [id]` — Open the background shell panel to watch live output of Bash tasks started with run_in_background; pass an id (e.g. bash_1) to jump directly to it
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
-    - `/memory` — Open the AGENTS.md memory panel
+    - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
     - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
     - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
     - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
@@ -328,13 +331,13 @@ agents:
     hint_detail: "↑↓ select   PageUp/PageDown scroll detail   Enter/Space collapse   Esc close"
 
 memory:
-  desc: "Open the AGENTS.md memory panel"
+  desc: "Open the project memory panel (AGENTS.md / CLAUDE.md / …)"
   headless_unsupported: "[headless mode doesn't support the /memory panel — edit AGENTS.md or the files under ~/.wyj-code/memory/ directly]"
   continuation:
     no_open_tasks: "No open tasks in this project. Please describe the new task you want to start."
   clear_all_help: "/memory clear-all — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation. CLI: `wyj-code memory clear-all --yes`."
   dialog:
-    title: " ◆ AGENTS.md Memory "
+    title: " ◆ Project Memory "
     not_found: "(not created yet, press Enter to create)"
     auto_memory_label: "auto-memory extraction"
     auto_memory_on: "enabled"
@@ -612,7 +615,7 @@ plugins:
     local_no_upgrade: "Local development plugins have no version info and can't be upgraded"
 
 doctor:
-  desc: "Diagnose the runtime environment (API Key / config / AGENTS.md / memory)"
+  desc: "Diagnose the runtime environment (API Key / config / project memory files / memory)"
   header: "wyj-code v{version} environment diagnostics\n"
   api_key_missing: "  ✗  API Key      not configured (set WYJ_CODE_API_KEY or config.toml)"
   config_file_ok: "  ✓  Config file  {path}"
@@ -620,8 +623,8 @@ doctor:
   config_dir_err: "  ✗  Config dir   {err}"
   provider: "  ✓  Provider     {provider}"
   model: "  ✓  Model        {model}"
-  claude_md_ok: "  ✓  AGENTS.md    {paths}"
-  claude_md_missing: "  ✗  AGENTS.md    not found (run /init to generate)"
+  claude_md_ok: "  ✓  Memory files  {paths}"
+  claude_md_missing: "  ✗  Memory files  not found (run /init to generate AGENTS.md)"
   memory_dir_with_count: "  ✓  Memory dir   {path} ({count} entries)"
   memory_dir_empty: "  ✗  Memory dir   {path} (no memory yet)"
   mcp_configured: "  ✓  MCP servers  {count} configured"
@@ -699,8 +702,8 @@ init:
        to determine the tech stack, build/test commands, and coding conventions.
     2. If {cwd}/AGENTS.md already exists, read it in full first, then merge, extend, and improve it —
        do not overwrite or discard its existing content wholesale.
-    3. If the project has other AI assistant rule files such as .cursorrules or .github/copilot-instructions.md,
-       read them and fold in whatever parts still apply.
+    3. If the project has other AI assistant rule files such as CLAUDE.md, GEMINI.md, AGENT.md,
+       .cursorrules or .github/copilot-instructions.md, read them and fold in whatever parts still apply.
     4. Write the result to {cwd}/AGENTS.md. It should include at least: project overview, build/test/lint
        commands, architecture notes, and development conventions. Keep it concise and avoid speculating
        about anything you couldn't verify.
@@ -759,6 +762,7 @@ dialog:
   ask_question_confirm_submit: "Confirm & Submit"
   hint_single_select: "  ↑↓ Select  Enter Next  ←/Shift+Tab Prev  Esc Cancel"
   hint_multi_select: "  ↑↓ Select  Space Toggle  Enter Next  ←/Shift+Tab Prev  Esc Cancel"
+  hint_freetext: "Enter submit · Shift+Enter / Ctrl+J / trailing \\ for newline · ↑↓ history · {chars} chars"
   hint_freetext_submit_cancel: "  Type your answer  Enter Submit  Esc Back to options"
   hint_overview: "  ↑↓ Select  Enter Edit/Submit  Esc Cancel"
   session_picker_title: " Sessions ({count}) "
@@ -864,7 +868,7 @@ welcome:
   tip_1: '/clear wipes the conversation to start a fresh task'
   tip_2: 'Type @ in your message to quickly reference a file in the project'
   tip_3: 'For complex tasks, ask the agent to spin up SubAgents to explore in parallel'
-  tip_4: '/memory views and manages cross-session memory (AGENTS.md)'
+  tip_4: '/memory views and manages project rules and cross-session memory (AGENTS.md / CLAUDE.md, etc.)'
   hint:
     help: '/help for help'
     compact: '/compact to shrink context'

@@ -3,6 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::Arc;
 use wyj_api::types::ToolDefinition;
 
 /// 工具执行结果。`content` 恒为展示/降级用文本（TUI 与不支持多模态的
@@ -99,6 +100,11 @@ pub trait ToolContext: Send + Sync {
     /// 这个信号；headless/cron/子 Agent 默认 false，不得把无 UI 当成批准。
     fn supports_interactive_confirmation(&self) -> bool {
         false
+    }
+    /// 回合级共享注入队列：Agent 忙碌期间用户补充的内容。仅 `SubAgentTool`
+    /// 需要它（把注入能力带进前台子 Agent 内部），其余工具默认 None。
+    fn steer_queue(&self) -> Option<&Arc<crate::SteerQueue>> {
+        None
     }
     /// 当前是否为 Plan 权限语义，供派生的子 Agent 继承限制。
     fn is_plan_mode(&self) -> bool {

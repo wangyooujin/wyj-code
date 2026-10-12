@@ -319,13 +319,71 @@ pub enum TodoExecutionEntry {
     Note(String),
 }
 
+/// 把 token 数压成短字符串。唯一目标是**宽度**：状态栏、输入框标题栏、子 Agent
+/// 行内状态、Todo 详情、`/cost` 面板都要把 token 与其它字段排在同一行，位数越少越好。
+///
+/// - `>= 1_000_000` → 一位小数的 M（`1.5M`）
+/// - `>= 10_000` → 一位小数的 k（`12.3k`）。这一步是 v1.5.22 加的：会话累计轻易
+///   破六位数，原来的 `format!("{},{:03}")` 会把 `123,456`（7 字符）整段塞进标题栏，
+///   在窄终端里直接把模型名和耗时挤出视野。1000~9999 仍在千分位区间，量级还没
+///   到需要牺牲精度的时候。
+/// - `>= 1_000` → 千分位（`1,234`）
+/// - 其余原样（`678`）
 pub(crate) fn fmt_tokens(n: u32) -> String {
     if n >= 1_000_000 {
-        format!("{}.{}M", n / 1_000_000, (n % 1_000_000) / 100_000)
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
     } else if n >= 1000 {
         format!("{},{:03}", n / 1000, n % 1000)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod fmt_tokens_tests {
+    use super::fmt_tokens;
+
+    #[test]
+    fn four_digit_and_below_keep_exact_digits_or_thousands_separator() {
+        // 1000~9999 仍是千分位区间：量级还小，千分位比 "1.2k" 更精确也更易读。
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(678), "678");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1,000");
+        assert_eq!(fmt_tokens(9_999), "9,999");
+    }
+
+    #[test]
+    fn five_digits_switch_to_one_decimal_k() {
+        // 边界：9999 → 千分位，10000 → k。两者都只差一个字符宽度，
+        // 但整条规则的分界点就在这里，钉死它防止有人把阈值挪到 1000。
+        assert_eq!(fmt_tokens(10_000), "10.0k");
+        assert_eq!(fmt_tokens(10_001), "10.0k");
+        assert_eq!(fmt_tokens(12_345), "12.3k");
+        assert_eq!(fmt_tokens(50_000), "50.0k");
+        assert_eq!(fmt_tokens(300_000), "300.0k");
+    }
+
+    #[test]
+    fn millions_keep_the_m_suffix() {
+        assert_eq!(fmt_tokens(999_999), "1000.0k");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn formatted_width_never_grows_with_magnitude() {
+        // 这条规则的全部动机：标题栏/状态栏是固定宽度的一行，token 段的
+        // 字符数必须与数值大小无关，否则长会话会把前面的模型名和耗时挤出屏幕。
+        let widest = (0..=2_000_000_000u32)
+            .step_by(9_973)
+            .map(fmt_tokens)
+            .map(|s| s.chars().count())
+            .max()
+            .expect("非空区间");
+        assert!(widest <= 7, "最宽 {widest} 字符，超出预算");
     }
 }
 
@@ -361,6 +419,86 @@ pub struct PermissionDialog {
     pub action_summary: String,
     /// 决策回传通道（AllowOnce / AllowAlways / Deny）
     pub response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
+}
+
+/// 弹窗内自由文本的输入历史（`↑` `↓` 翻上一条）。
+///
+/// 主输入框有自己那条历史（走 `navigate_input_or_history`），弹窗是另一条：
+/// 用户在 AskQuestion/计划批准里反复输入反馈时，上下键翻回刚才那条很常用，
+/// 而现状是 `↑` `↓` 被"翻题/移动选项"占用。
+#[derive(Default)]
+pub struct InputHistory {
+    entries: Vec<String>,
+    /// None = 停在最新输入（draft），Some(i) = 正在看第 i 条历史
+    cursor: Option<usize>,
+    draft: String,
+}
+
+impl InputHistory {
+    /// 提交一条非空文本后记账；连续重复提交同一条不重复记。
+    pub fn push(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.entries.last().map(|last| last == text) == Some(true) {
+            return;
+        }
+        self.entries.push(text.to_string());
+        if self.entries.len() > 50 {
+            self.entries.remove(0);
+        }
+        self.cursor = None;
+        self.draft.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `↑` 往回翻一条；没有历史返回 false（调用方据此回退到"翻题"等原语义）。
+    pub fn prev(&mut self, input: &mut InputBox) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let next = match self.cursor {
+            None => {
+                self.draft = input.text();
+                self.entries.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.cursor = Some(next);
+        self.load_into(input);
+        true
+    }
+
+    /// `↓` 往前翻一条；已经停在最新输入再按则恢复翻动前的草稿。
+    pub fn next(&mut self, input: &mut InputBox) -> bool {
+        match self.cursor {
+            None => false,
+            Some(i) if i + 1 < self.entries.len() => {
+                self.cursor = Some(i + 1);
+                self.load_into(input);
+                true
+            }
+            Some(_) => {
+                self.cursor = None;
+                let draft = std::mem::take(&mut self.draft);
+                input.set_text(&draft);
+                true
+            }
+        }
+    }
+
+    fn load_into(&self, input: &mut InputBox) {
+        if let Some(text) = self.cursor.and_then(|i| self.entries.get(i)) {
+            input.set_text(text);
+            // 翻出来的是历史内容，光标落到末尾（readline 行为）
+            input.move_to_end_of_line();
+        }
+    }
 }
 
 /// 单题当前"进行中"的作答状态（未确认，随光标/勾选实时变化）
@@ -416,6 +554,8 @@ pub struct AskQuestionDialog {
     pub confirmed: Vec<Option<ConfirmedAnswer>>,
     /// 标记当前是否是从总览页跳回来编辑某一题（确认后应回到总览页而不是继续往下一题走）
     pub entered_from_overview: bool,
+    /// "其他"自由输入的 `↑` `↓` 历史（跨题共享一条，符合"我在反复改同一段反馈"的用法）
+    pub history: InputHistory,
     pub response_tx: tokio::sync::oneshot::Sender<Option<Vec<QuestionAnswer>>>,
 }
 
@@ -450,6 +590,7 @@ impl AskQuestionDialog {
             current,
             confirmed: vec![None; n],
             entered_from_overview: false,
+            history: InputHistory::default(),
             response_tx,
         }
     }
@@ -592,10 +733,13 @@ impl AskQuestionDialog {
                         }
                     }
                     InProgressAnswer::FreeText { prior, input } => {
-                        let text = input.lines.join("").trim().to_string();
+                        // join("\n") 而非 join("")：Shift+Enter 换出来的多行反馈
+                        // 不能被抹成一行
+                        let text = input.text().trim().to_string();
                         if text.is_empty() {
                             ConfirmAction::Ignore
                         } else {
+                            self.history.push(&text);
                             let answer = match prior.as_ref() {
                                 InProgressAnswer::Multi { checked, .. } if !checked.is_empty() => {
                                     let indices: Vec<usize> = checked.iter().copied().collect();
@@ -622,6 +766,88 @@ impl AskQuestionDialog {
                 AskQuestionKeyOutcome::Continue
             }
         }
+    }
+
+    /// 带修饰键的统一入口（主循环用）。`handle_key` 只剩裸 `KeyCode` 的老签名，
+    /// 保留给既有单测与"语义不变"的调用方。
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> AskQuestionKeyOutcome {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if let InProgressAnswer::FreeText { input, .. } = &mut self.current {
+            // 编辑键（Backspace/Delete/左右/Home/End/Ctrl+A/E/K/U/W/Alt+←→
+            // Shift+Enter…）与主输入框**同一份实现**，不再只有左右和退格
+            if crate::input::apply_edit_key(input, &key) {
+                return AskQuestionKeyOutcome::Continue;
+            }
+            // Ctrl+V：弹窗里也要能粘贴长文本。不在这里拦的话，带 CONTROL 的
+            // 'v' 会掉进下面的 plain 分支之外、最终被 handle_key 当成字符 'v'
+            // 直接敲进输入框。
+            if is_clipboard_paste_key(key) {
+                if let Some(text) = read_clipboard_text() {
+                    input.insert_text(&text);
+                }
+                return AskQuestionKeyOutcome::Continue;
+            }
+            // 行尾 `\` + Enter = 换行（不支持 Shift+Enter 的终端里唯一稳的写法）
+            if key.code == KeyCode::Enter
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && crate::input::trailing_backslash_before_cursor(input)
+            {
+                input.backspace();
+                input.insert_newline();
+                return AskQuestionKeyOutcome::Continue;
+            }
+            match key.code {
+                KeyCode::Enter => return self.confirm(),
+                // ↑↓：优先翻"其他"的历史；没有历史时才回退到翻题
+                KeyCode::Up | KeyCode::Down => {
+                    let moved = if key.code == KeyCode::Up {
+                        self.history.prev(input)
+                    } else {
+                        self.history.next(input)
+                    };
+                    if !moved {
+                        self.move_cursor(if key.code == KeyCode::Up { -1 } else { 1 });
+                    }
+                    return AskQuestionKeyOutcome::Continue;
+                }
+                KeyCode::Char(c) if plain => {
+                    input.insert_char(c);
+                    return AskQuestionKeyOutcome::Continue;
+                }
+                _ => {}
+            }
+            return self.handle_key(key.code);
+        }
+
+        // 选项态：敲任意非空白字符直接进"其他"输入框。
+        // 比 ↓↓ 再回车少两步，也不用先看清选项列表（Claude Code 那边目前仍要
+        // ↓ 到 Other 行才能打字，这里是更快的等价路径；↓+Enter 那条路保留不变）。
+        if plain {
+            if let KeyCode::Char(c) = key.code {
+                if !c.is_whitespace() && self.enter_other_with_char(c) {
+                    return AskQuestionKeyOutcome::Continue;
+                }
+            }
+        }
+        self.handle_key(key.code)
+    }
+
+    /// 直接进入"其他"自由输入，并把 `c` 作为首字符写入。返回是否成功进入。
+    fn enter_other_with_char(&mut self, c: char) -> bool {
+        let AskQuestionStage::Answering { index } = self.stage else {
+            return false;
+        };
+        let prior = std::mem::replace(&mut self.current, InProgressAnswer::Single { cursor: 0 });
+        let mut input = InputBox::new();
+        input.insert_char(c);
+        self.current = InProgressAnswer::FreeText {
+            prior: Box::new(prior),
+            input,
+        };
+        let _ = index;
+        true
     }
 
     /// 统一按键入口：返回 Continue/Cancel/Submit，外层（AppState）只需据此决定是否 take() 面板
@@ -696,6 +922,8 @@ pub struct PlanApprovalDialog {
     /// `Single { cursor }` 里 0=批准 1=继续规划 2=手动输入（虚拟位）；
     /// 落在虚拟位上回车后进入 `FreeText` 子模式就地输入反馈文本。
     current: InProgressAnswer,
+    /// 反馈文本的 `↑` `↓` 历史（计划往往反复改好几轮反馈）
+    pub history: InputHistory,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
 }
 
@@ -715,6 +943,7 @@ impl PlanApprovalDialog {
     pub fn new(response_tx: tokio::sync::oneshot::Sender<bool>) -> Self {
         Self {
             current: InProgressAnswer::Single { cursor: 0 },
+            history: InputHistory::default(),
             response_tx,
         }
     }
@@ -755,6 +984,71 @@ impl PlanApprovalDialog {
         }
     }
 
+    /// 带修饰键的统一入口（主循环用）。编辑键与主输入框同一份实现。
+    pub fn handle_key_event(&mut self, key: KeyEvent) -> PlanApprovalOutcome {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if let InProgressAnswer::FreeText { input, .. } = &mut self.current {
+            if crate::input::apply_edit_key(input, &key) {
+                return PlanApprovalOutcome::Continue;
+            }
+            // Ctrl+V 同 AskQuestion：拦截后再走编辑键，避免 'v' 被当字符敲进去
+            if is_clipboard_paste_key(key) {
+                if let Some(text) = read_clipboard_text() {
+                    input.insert_text(&text);
+                }
+                return PlanApprovalOutcome::Continue;
+            }
+            // 行尾 `\` + Enter = 换行
+            if key.code == KeyCode::Enter
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && crate::input::trailing_backslash_before_cursor(input)
+            {
+                input.backspace();
+                input.insert_newline();
+                return PlanApprovalOutcome::Continue;
+            }
+            match key.code {
+                KeyCode::Up | KeyCode::Down => {
+                    let moved = if key.code == KeyCode::Up {
+                        self.history.prev(input)
+                    } else {
+                        self.history.next(input)
+                    };
+                    if !moved {
+                        self.move_cursor(if key.code == KeyCode::Up { -1 } else { 1 });
+                    }
+                    return PlanApprovalOutcome::Continue;
+                }
+                KeyCode::Char(c) if plain => {
+                    input.insert_char(c);
+                    return PlanApprovalOutcome::Continue;
+                }
+                _ => {}
+            }
+        } else if plain {
+            // 选项态直接打字 = 走"手动输入反馈"那条路（虚拟位 index 2），
+            // 少一次 ↓↓ + 回车；↓+Enter 那条路保留不变。
+            if let KeyCode::Char(c) = key.code {
+                if !c.is_whitespace() {
+                    let prior = std::mem::replace(
+                        &mut self.current,
+                        InProgressAnswer::Single { cursor: 2 },
+                    );
+                    let mut input = InputBox::new();
+                    input.insert_char(c);
+                    self.current = InProgressAnswer::FreeText {
+                        prior: Box::new(prior),
+                        input,
+                    };
+                    return PlanApprovalOutcome::Continue;
+                }
+            }
+        }
+        self.handle_key(key.code)
+    }
+
     /// 统一按键入口：↑/↓ 移动高亮、Enter 确认当前项（手动输入位先展开文本框再提交）、
     /// Esc 仅用于从 FreeText 子模式退回三选一（不再等价于拒绝计划）。
     pub fn handle_key(&mut self, code: KeyCode) -> PlanApprovalOutcome {
@@ -784,10 +1078,11 @@ impl PlanApprovalDialog {
                     PlanApprovalOutcome::Continue
                 }
                 InProgressAnswer::FreeText { input, .. } => {
-                    let text = input.lines.join("").trim().to_string();
+                    let text = input.text().trim().to_string();
                     if text.is_empty() {
                         PlanApprovalOutcome::Continue
                     } else {
+                        self.history.push(&text);
                         PlanApprovalOutcome::Feedback(text)
                     }
                 }
@@ -828,6 +1123,8 @@ impl PlanApprovalDialog {
 pub struct ExecModeConfirmDialog {
     pub pending_message: String,
     pub pending_attachments: Vec<Attachment>,
+    /// 聊天区展示文本（附件占位符已按输入框位置展开，见 `OutgoingMessage`）
+    pub pending_display: String,
 }
 
 /// 会话选择器状态（/sessions 命令触发）
@@ -1278,7 +1575,13 @@ async fn execute_evolution_action(
             let sessions = session_store.context("checkpoint storage unavailable")?;
             let checkpoint_store =
                 wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())?;
-            let messages = session.lock().await.messages.clone();
+            // 这个函数由主循环 `.await`，绝不能在这里等锁——等下去整个界面
+            // 就停在这一帧（不重绘、不读按键），回合越久冻得越死。
+            let messages = session
+                .try_lock()
+                .map_err(|_| anyhow::anyhow!("{}", wyj_i18n::tr("session.busy_notice")))?
+                .messages
+                .clone();
             let checkpoint = checkpoint_store.create(
                 cwd,
                 &messages,
@@ -5013,6 +5316,34 @@ pub enum Attachment {
     },
 }
 
+/// 一条待发送的用户消息。
+///
+/// `display` 必须在**输入框还存在的那一刻**算好：附件占位符的位置只存在于
+/// 输入框内部的原子标记里，`InputBox::text()` 会把它们过滤掉，一旦离开
+/// 输入框就再也拼不出与输入框一致的展示文本。因此凡是消息要排队/等确认
+/// 的路径（`pending_queue`、`ExecModeConfirmDialog`）都必须把它一起带着走，
+/// 不能等到消费时再从 `text + attachments` 现拼。
+#[derive(Debug, Clone)]
+pub struct OutgoingMessage {
+    /// 发给模型的正文（不含任何展示用占位符）
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+    /// 聊天区展示文本，附件占位符已按输入框里的位置展开
+    pub display: String,
+}
+
+impl OutgoingMessage {
+    /// 无附件的消息（测试与内部注入路径用），展示文本即正文。
+    pub fn plain(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            display: text.clone(),
+            text,
+            attachments: Vec::new(),
+        }
+    }
+}
+
 // ── 工具展示帮助函数 ─────────────────────────────────────────────────────────
 
 /// 从工具输入 JSON 中提取用于展示的参数字符串（如文件路径或命令）
@@ -5685,7 +6016,7 @@ mod navigation_focus_tests {
         state
             .messages
             .push(ChatMessage::assistant("old".to_string()));
-        state.pending_queue.push(("queued".to_string(), vec![]));
+        state.pending_queue.push(OutgoingMessage::plain("queued"));
 
         state.reset_for_new_session();
         state
@@ -5776,8 +6107,32 @@ fn read_clipboard_image() -> Option<ClipboardPaste> {
 }
 
 fn read_clipboard_text() -> Option<String> {
+    // 测试期可注入：直接读真实剪贴板的测试在开发机上会随机失败（CI 空剪贴板
+    // 过、本机有内容就红），这种「本地红 CI 绿」的测试比稳定失败更糟——没人会
+    // 再信任它。见 `with_clipboard_text_override`。
+    #[cfg(test)]
+    if let Some(forced) = TEST_CLIPBOARD_TEXT.with(|slot| slot.borrow().clone()) {
+        return forced;
+    }
     let mut clipboard = arboard::Clipboard::new().ok()?;
     clipboard.get_text().ok().filter(|text| !text.is_empty())
+}
+
+// `None` = 未注入（读真实剪贴板）；`Some(x)` = 钉死为 `x`（`Some(None)`
+// 即"剪贴板为空"）。外层 Option 用来区分这两者。
+#[cfg(test)]
+thread_local! {
+    static TEST_CLIPBOARD_TEXT: std::cell::RefCell<Option<Option<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在 `f` 执行期间把剪贴板内容钉死为 `text`（`None` 表示剪贴板为空）。
+#[cfg(test)]
+fn with_clipboard_text_override<R>(text: Option<&str>, f: impl FnOnce() -> R) -> R {
+    TEST_CLIPBOARD_TEXT.with(|slot| *slot.borrow_mut() = Some(text.map(str::to_owned)));
+    let out = f();
+    TEST_CLIPBOARD_TEXT.with(|slot| *slot.borrow_mut() = None);
+    out
 }
 
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
@@ -5955,6 +6310,237 @@ mod clipboard_paste_tests {
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
+    }
+
+    /// 主循环取 session 锁必须**永不阻塞**。
+    ///
+    /// 回合 task（`spawn_agent_turn` / 两处内联 turn task）会持锁跑完**整个**
+    /// agent 回合——LLM 往返加全部工具调用，动辄几分钟。主循环一旦在这把锁上
+    /// `.await`，界面就停在那一帧：不重绘、不读按键，连排在保存分支上游的
+    /// `abort_stalled_turn()` 看门狗都跑不到下一轮，ESC/Ctrl+C 也失效。
+    /// 超时兜底：哪天有人把它改回 `lock().await`，这条会挂在 timeout 上失败，
+    /// 而不是静默通过。
+    #[tokio::test]
+    async fn try_session_lock_never_waits_for_a_running_turn() {
+        let session = Arc::new(Mutex::new(Session::new()));
+        let holder = session.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _guard = holder.lock().await; // 模拟回合 task 持锁
+            let _ = release_rx.await;
+        });
+        tokio::task::yield_now().await; // 让 holder 先跑到持锁
+
+        let unavailable = tokio::time::timeout(Duration::from_millis(200), async {
+            try_session_lock(&session).is_none()
+        })
+        .await
+        .expect("try_session_lock 不得阻塞等待回合释放锁");
+        assert!(unavailable, "锁被回合持有时必须立刻返回 None");
+
+        let _ = release_tx.send(());
+    }
+
+    /// 排队消息必须在**提交那一刻**就出现在聊天流里，且只在 `AgentEvent::Injected`
+    ///（Agent 真正排空时）出队、不再画第二遍。
+    ///
+    /// 回显原本挂在 `AgentEvent::Injected` 上，而排空点在 Agent 的工具轮边界——
+    /// 前台子 Agent / 长 Bash 期间可能几十分钟不排空，用户那边看就是「我输入的
+    /// 字不见了」。
+    #[test]
+    fn queued_message_is_echoed_on_submit_and_not_duplicated_on_drain() {
+        let mut state = make_state();
+        let before = state.messages.len();
+
+        state.enqueue_message(OutgoingMessage::plain("顺便看一下成交量"));
+
+        assert_eq!(state.pending_queue.len(), 1);
+        assert_eq!(
+            state.messages.len(),
+            before + 1,
+            "入队当场就要回显，不能等 Agent 排空"
+        );
+        assert_eq!(state.messages.last().unwrap().content, "顺便看一下成交量");
+
+        // Agent 排空：只出队，不再回显（否则同一条消息显示两遍）
+        state.apply_agent_event(AgentEvent::Injected);
+        assert!(state.pending_queue.is_empty());
+        assert_eq!(state.messages.len(), before + 1, "排空时不得重复回显");
+    }
+
+    /// 前台子 Agent 取走排队消息时**不会**发 `Injected`（它没有 UI 事件通道），
+    /// 因此镜像会停在旧水位；回合一结束，兜底重发就会把这条已经投递给子 Agent
+    /// 的消息**再当一条全新用户消息发一遍**——同一条要求子 Agent 干一遍、主
+    /// Agent 再干一遍，token 双倍。
+    ///
+    /// 这条钉子守的是共享 steer 队列最容易踩的坑：只测「Agent 层只投递一次」
+    /// （`shared_steer_queue_delivers_to_exactly_one_agent`）是不够的，UI 侧
+    /// 的镜像必须跟着真实水位一起走。
+    #[test]
+    fn subagent_drained_steerage_is_not_resent_as_a_new_user_message() {
+        let mut state = make_state();
+        let queue = Arc::new(wyj_core::SteerQueue::new());
+        state.injector = Some(queue.clone());
+
+        // 用户在子 Agent 运行期间补充两条要求：UI 镜像 + 共享队列各加两条
+        state.enqueue_message(OutgoingMessage::plain("先看成交量"));
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "先看成交量".into(),
+            }],
+            wyj_core::InjectionKind::UserMessage,
+        );
+        state.enqueue_message(OutgoingMessage::plain("再看资金流"));
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "再看资金流".into(),
+            }],
+            wyj_core::InjectionKind::UserMessage,
+        );
+        assert_eq!(state.pending_queue.len(), 2);
+
+        // 子 Agent 在自己的工具轮边界把两条都取走（不发 Injected）
+        let taken = queue.drain_user_messages();
+        assert_eq!(taken.len(), 2);
+        assert_eq!(state.pending_queue.len(), 2, "此时镜像还停在旧水位");
+
+        // 回合结束：对齐后镜像必须清空，兜底重发才不会把它们再发一遍
+        state.is_thinking = false;
+        state.reconcile_pending_queue();
+        assert!(
+            state.pending_queue.is_empty(),
+            "已被子 Agent 取走的排队消息不得再被重发"
+        );
+    }
+
+    /// 反向钉子：**确实没被取走**的消息必须留在镜像里，否则真正的竞态兜底
+    /// （提交时机晚于本轮最后一次排空）会把用户的输入静默吞掉。
+    #[test]
+    fn undelivered_steerage_survives_reconciliation_for_the_race_fallback() {
+        let mut state = make_state();
+        let queue = Arc::new(wyj_core::SteerQueue::new());
+        state.injector = Some(queue.clone());
+
+        state.enqueue_message(OutgoingMessage::plain("继续"));
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "继续".into(),
+            }],
+            wyj_core::InjectionKind::UserMessage,
+        );
+        // 队列里还有一条后台结果通知（SystemReminder），它从不进 pending_queue
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "后台 agent 完成".into(),
+            }],
+            wyj_core::InjectionKind::SystemReminder,
+        );
+
+        state.reconcile_pending_queue();
+        assert_eq!(
+            state.pending_queue.len(),
+            1,
+            "未被取走的用户消息必须保留给兜底重发"
+        );
+        assert_eq!(state.pending_queue[0].text, "继续");
+    }
+
+    #[tokio::test]
+    async fn try_session_lock_succeeds_when_no_turn_is_running() {
+        let session = Arc::new(Mutex::new(Session::new()));
+        let guard = tokio::time::timeout(Duration::from_millis(200), async {
+            try_session_lock(&session)
+        })
+        .await
+        .expect("空闲时取锁不应超时");
+        assert!(guard.is_some(), "没有回合在跑时必须能直接拿到锁");
+    }
+
+    /// 终态事件（Usage / TurnDone / Error）走的是**阻塞式** send（通道容量
+    /// 256），而 UI 收到 TurnDone 后会把 `save_needed` 置位、下一帧就去
+    /// `session.lock().await` 保存。若 turn task 发事件时**仍持着锁**：
+    /// UI 等锁、turn task 等 UI 排空通道 → 环形等待，界面永久冻结，且排在
+    /// 保存分支上游的看门狗 `abort_stalled_turn()` 也跑不到。
+    /// 三处 turn task 都必须先放锁再发——静态钉子，谁把 `drop(sess)` 删掉或
+    /// 挪到发送之后，这条立刻变红。
+    #[test]
+    fn every_turn_task_releases_the_session_lock_before_terminal_events() {
+        const SEND: &str = "tx.send(AgentEvent::TurnDone).await;";
+        let source = include_str!("app.rs");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut checked = 0usize;
+        let mut segment_start = 0usize; // 当前 turn task 在源码中的起始行
+        for (idx, line) in lines.iter().enumerate() {
+            if line.contains("let task = spawn_turn_task(async move {")
+                || line.contains("fn spawn_agent_turn(")
+            {
+                segment_start = idx;
+            }
+            // 真实发送点：`tx.send(...)` 且整行以 `.await;` 结尾。
+            // （按整行匹配，避免把本测试源码里的字符串字面量当成发送点。）
+            if !(line.contains(SEND) && line.trim_end().ends_with(".await;")) {
+                continue;
+            }
+            let segment = lines[segment_start..idx].join("\n");
+            let usage_at = segment
+                .find("let usage = AgentEvent::Usage")
+                .unwrap_or_else(|| {
+                    panic!("终态 Usage 事件应在锁内先取好快照（免得放锁后再读 sess）")
+                });
+            let drop_at = segment
+                .rfind("drop(sess)")
+                .unwrap_or_else(|| panic!("turn task 在发终态事件前没有释放 session 锁"));
+            assert!(
+                usage_at < drop_at,
+                "顺序必须是「锁内取 Usage 快照 → drop(sess) → 发事件」"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3, "三处 turn task 都应被这条钉子覆盖");
+    }
+
+    /// 主循环碰不到 session 锁时**不能 `continue`**——静态钉子。
+    ///
+    /// `save_needed` 分支位于主循环的**无条件区段**（不在 `event::poll()`
+    /// 的按键处理块里）。这里的 `continue` 跳回的是整个循环，被跳过的正是
+    /// 紧随其后的 `ui_ask_rx` 消费与 `event::poll()`：按键、权限确认弹窗、
+    /// AskQuestion、计划批准全部停摆。而 `terminal.draw()` 在本行之前，
+    /// 画面照常刷新 —— 用户看到的是「界面活着但按键全哑」，ESC/Ctrl+C 也
+    /// 救不回来（真正终止回合的是排在 `continue` **上游**的回合心跳看门狗，
+    /// 因此现场更像「莫名其妙卡住几分钟后自己恢复」）。
+    ///
+    /// 触发极其常见：`TurnDone` 置位 `save_needed` 与自动唤醒 / 排队兜底
+    /// 的 spawn 发生在同一帧，所以**每一条排队消息触发的自动续跑都会踩中**，
+    /// 整个新回合全程失灵。
+    ///
+    /// 正确的形状是「拿不到锁就只置位回退，流程自然落到下面继续消费输入
+    /// 层」——存盘晚一帧没有代价，等锁才有。
+    #[test]
+    fn autosave_never_continues_past_the_input_layer() {
+        let source = include_str!("app.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        // 按「整行 trim 后正好等于」匹配，避免命中本测试源码里那句字符串
+        // 字面量（`include_str!` 把测试自己也包进来了）。
+        let start = lines
+            .iter()
+            .position(|l| l.trim() == "if state.save_needed {")
+            .expect("主循环应有 autosave 分支");
+        // 分支体内不得出现 `continue`：从 `if state.save_needed {` 起，找到
+        // 缩进回落到该层级为止的整个块。
+        let indent = lines[start].len() - lines[start].trim_start().len();
+        let body = lines[start + 1..]
+            .iter()
+            .take_while(|l| {
+                let ind = l.len() - l.trim_start().len();
+                l.trim().is_empty() || ind > indent
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !body.iter().any(|l| l.trim() == "continue;"),
+            "autosave 分支不得 `continue`：那会跳过 ui_ask 消费与 event::poll()，\
+             整个输入层在回合运行期间全程停摆"
+        );
     }
 
     #[test]
@@ -6599,7 +7185,7 @@ pub struct AppState {
     /// 最近一轮 AI 交互输出 token 增量。
     pub last_turn_output_tokens: u32,
     /// 当前运行中 Agent 任务的补充信息注入通道（is_thinking 期间提交的消息走这里）
-    pub injector: Option<mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>>,
+    pub injector: Option<Arc<wyj_core::SteerQueue>>,
     /// 终止后台任务的异步流程完成后，把结果发回 UI 线程的通道
     /// （`BashSessionManager::kill` 要等 2s 兜底 SIGKILL，不能在同步按键里 await）
     pub kill_tx: Option<mpsc::Sender<AgentEvent>>,
@@ -6609,9 +7195,12 @@ pub struct AppState {
     pub auto_wake_paused: bool,
     /// 最近一次粘贴的瞬时提示（在输入框光标处显示）
     pub(crate) paste_hint: Option<PasteHint>,
-    /// 排队中尚未被 Agent 消费的补充消息（文本 + 附件），用于状态栏提示计数、
-    /// 消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
-    pub pending_queue: Vec<(String, Vec<Attachment>)>,
+    /// 上一次「上一轮还在运行」提示的时刻。拿不到 session 锁时给用户一句提示，
+    /// 但按键会被按住不放，逐次弹消息会把聊天流刷满 —— 3 秒去重窗口。
+    pub(crate) last_session_busy_notice: Option<Instant>,
+    /// 排队中尚未被 Agent 消费的补充消息（正文 + 附件 + 聊天区展示文本），用于
+    /// 状态栏提示计数、消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
+    pub pending_queue: Vec<OutgoingMessage>,
     /// 当前生效的完整配置（/config 设置面板的数据来源与保存目标）
     pub config: Config,
     /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
@@ -6762,6 +7351,7 @@ impl AppState {
             kill_tx: None,
             auto_wake_paused: false,
             paste_hint: None,
+            last_session_busy_notice: None,
             pending_queue: vec![],
             sub_agents: BTreeMap::new(),
             sub_agent_trace_cache: BTreeMap::new(),
@@ -7884,6 +8474,62 @@ impl AppState {
     /// 就会把回合杀掉。判据是「既没有事件、又没有弹窗在等用户」。
     ///
     /// 返回 true 表示本帧做了兜底。
+    /// 把一条用户消息排进"回合结束后送达"队列，**并在入队那一刻就回显**。
+    ///
+    /// 不变式：**每处入队都必须当场 `push_user`**。排空点在 Agent 侧（工具轮
+    /// 边界），前台子 Agent / 长 Bash 期间可能几十分钟都不排空；若把回显也
+    /// 挂在排空上，用户会看到"我打的字凭空消失"。
+    /// 真实投递仍由 Agent 排空时完成，这里只负责让用户立刻看见提交了什么。
+    pub(crate) fn enqueue_message(&mut self, message: OutgoingMessage) {
+        self.push_user(message.display.clone());
+        self.pending_queue.push(message);
+    }
+
+    /// 把 `pending_queue`（steer 队列的 UI 侧镜像）裁剪到共享队列的真实水位。
+    ///
+    /// 必须在 `TurnDone` / `Error` 里、**`injector` 被清空之前**调用——那之后
+    /// 就再也拿不到这份队列了。
+    ///
+    /// 为什么需要：入队时两边各加一条，正常靠 `AgentEvent::Injected` 出队。但
+    /// 共享 steer 队列之后**取走者不再唯一**——前台子 Agent 也会
+    /// `drain_user_messages()`，而它没有 UI 的事件通道、`on_inject` 是空闭包，
+    /// 发不出 `Injected`。镜像于是停在旧水位，回合结束后 11480 的兜底重发会把
+    /// **已经投递给子 Agent 的消息再当一条全新用户消息发一遍**：同一条要求子
+    /// Agent 干一遍、主 Agent 再干一遍，token 双倍。这直接违反「一条内容只被
+    /// 投递一次」这条不变式。
+    ///
+    /// 对齐用的是队列的真实水位而不是「谁取走的」，因此主 Agent、前台子 Agent、
+    /// 嵌套子 Agent 三种取走路径一律正确，无需给每个都补事件通道。
+    fn reconcile_pending_queue(&mut self) {
+        let Some(queue) = &self.injector else { return };
+        let undelivered = queue.pending_user_messages();
+        // 只裁剪「镜像比队列多」的情况：队列里的 SystemReminder（后台任务结果
+        // 通知）从来不进 pending_queue，计入会让 undelivered 偏大而漏裁。
+        if self.pending_queue.len() > undelivered {
+            let delivered = self.pending_queue.len() - undelivered;
+            self.pending_queue.drain(..delivered);
+        }
+    }
+
+    /// 主循环碰不到 session 锁（上一轮还在跑）时的用户提示，带 3 秒去重窗口。
+    ///
+    /// 与 [`Self::abort_stalled_turn`] 是同一个问题的两面：**UI 线程绝不能等这把
+    /// 锁**——回合 task 会持锁跑完整个 agent 回合，等下去等于整个界面停摆，
+    /// 连 ESC 都按不动。正确做法是跳过本帧动作、下一帧重试（见
+    /// [`try_session_lock`]）。
+    pub(crate) fn notify_session_busy(&mut self) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+        let now = Instant::now();
+        if self
+            .last_session_busy_notice
+            .is_some_and(|last| now.duration_since(last) < WINDOW)
+        {
+            return;
+        }
+        self.last_session_busy_notice = Some(now);
+        self.push_message(ChatMessage::system(wyj_i18n::tr("session.busy_notice")));
+    }
+
     pub fn abort_stalled_turn(&mut self) -> bool {
         if !self.is_thinking {
             self.last_turn_activity = Instant::now();
@@ -8110,6 +8756,8 @@ impl AppState {
                 self.current_op_started = None;
                 self.turns += 1;
                 self.save_needed = true;
+                // 先对齐排队镜像再清 injector：那之后就拿不到共享队列了
+                self.reconcile_pending_queue();
                 self.injector = None;
                 // 回合已正常结束（`stop_reason != tool_use`，模型已产出最终回答）：
                 // 任何仍处于 InProgress 的 todo 都视为已完成。否则 UI 会卡在
@@ -8171,6 +8819,7 @@ impl AppState {
                         .saturating_sub(self.turn_start_output_tokens);
                 }
                 self.is_thinking = false;
+                self.reconcile_pending_queue();
                 self.injector = None;
                 self.push_tracked_message(ChatMessage::assistant_err(format!("[错误] {e}")));
                 // 统一通知：主回合出错
@@ -8185,10 +8834,10 @@ impl AppState {
             }
 
             AgentEvent::Injected => {
+                // 只出队：聊天流里的回显在**提交那一刻**就画好了（见 Enter 分支）。
+                // 这里再 push_user 一次就是同一条消息显示两遍。
                 if !self.pending_queue.is_empty() {
-                    let (text, attachments) = self.pending_queue.remove(0);
-                    let display_text = build_display_text(&text, &attachments);
-                    self.push_user(display_text);
+                    self.pending_queue.remove(0);
                 }
             }
 
@@ -8931,11 +9580,11 @@ impl AppState {
                         &result,
                     );
                     match &self.injector {
-                        Some(tx) => {
-                            let _ = tx.send((
+                        Some(queue) => {
+                            queue.push(
                                 vec![ContentBlock::Text { text: reminder }],
                                 InjectionKind::SystemReminder,
-                            ));
+                            );
                         }
                         None => self.pending_bg_reminders.push(reminder),
                     }
@@ -9660,25 +10309,6 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     }
 }
 
-/// 构建消息的聊天区显示文本（含附件摘要）
-fn build_display_text(text: &str, attachments: &[Attachment]) -> String {
-    if attachments.is_empty() {
-        return text.to_string();
-    }
-    let mut s = text.to_string();
-    for att in attachments {
-        match att {
-            Attachment::Image { preview_label, .. } => {
-                s.push_str(&format!("\n[图片 {preview_label}]"));
-            }
-            Attachment::File { path } => {
-                s.push_str(&format!("\n[附件 {}]", path.display()));
-            }
-        }
-    }
-    s
-}
-
 /// 把文本 + 附件转换为发给 Provider 的内容块（图片直接内联，文件读内容包装为 `<file>` 标签）。
 /// 供正常发送与 Agent 忙碌期间的补充信息注入两处复用。
 async fn build_user_blocks(text: String, attachments: Vec<Attachment>) -> Vec<ContentBlock> {
@@ -9785,6 +10415,57 @@ impl Drop for TurnFinishedGuard {
 /// 与两处 `CommandResult::RunPrompt*`）。裸 `tokio::spawn` + 只取
 /// `abort_handle()` 会让 task 变成 detach：panic 信息写进 alternate screen 下
 /// 的 stderr，用户看不见，而 UI 永远等不到终止事件。
+/// 主循环取 session 锁：**永不阻塞**，拿不到就返回 `None`。
+///
+/// 回合 task（`spawn_agent_turn` / 两处内联 turn task）会在**整个 agent 回合
+/// 期间**持有同一把 `tokio::sync::Mutex`——LLM 往返 + 全部工具调用都在锁内，
+/// 一次长回合动辄几分钟。主循环只要在这把锁上 `.await`，整个界面就会停在
+/// 那一帧：不重绘、不读按键，连 v1.5.21 的回合心跳看门狗
+/// （`AppState::abort_stalled_turn`，排在保存分支**上游**）都跑不到下一轮——
+/// 用户按 ESC 也救不回来，表现就是「执行久了卡死不动」。
+///
+/// 因此主循环里凡是碰 session 的地方一律走这里：拿不到就跳过本帧动作、
+/// 下一帧再试。**回合 task 内部的 `lock().await` 不要改**——那正是持锁者。
+fn try_session_lock(session: &Arc<Mutex<Session>>) -> Option<tokio::sync::MutexGuard<'_, Session>> {
+    session.try_lock().ok()
+}
+
+/// 「批准计划 / 确认切执行模式」时建 checkpoint——**放到后台 task，绝不在主循环里等锁**。
+///
+/// 这两处确认都发生在**回合进行中**：agent task 正持着 session 锁等本弹窗的
+/// oneshot，批准后它还要继续跑完这一轮，锁全程不放。原来在这里
+/// `session.lock().await`，等于主循环停在这一帧直到整个回合结束——不重绘、
+/// 不读按键，连 ESC/Ctrl+C 都按不动（输入处理在 `event::poll` 之后）。
+///
+/// 改成后台 task 后：UI 立刻恢复响应，锁一释放（回合一结束）checkpoint 自动
+/// 落盘。代价是快照取的是「锁可用那一刻」的消息列表，可能已包含批准后本轮
+/// 追加的内容——比"没有 checkpoint"好，且 `/rewind` 照常能列出它。
+fn spawn_plan_approval_checkpoint(
+    session: Arc<Mutex<Session>>,
+    cwd: std::path::PathBuf,
+    session_id: String,
+    session_store: Option<&Arc<SessionStore>>,
+) {
+    let Some(sessions) = session_store else {
+        return;
+    };
+    let Ok(store) = wyj_core::CheckpointStore::configured(sessions.dir(), session_id) else {
+        return;
+    };
+    tokio::spawn(async move {
+        // 这里是后台 task，锁一释放（回合一结束）就自然拿到，等锁无副作用
+        let mut sess = session.lock().await;
+        if let Ok(checkpoint) = store.create(
+            &cwd,
+            &sess.messages,
+            wyj_core::CheckpointKind::PlanApproval,
+            Some("before plan approval".to_string()),
+        ) {
+            sess.current_checkpoint_id = Some(checkpoint.id);
+        }
+    });
+}
+
 fn spawn_turn_task<F>(future: F) -> TurnTask
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -9831,12 +10512,12 @@ fn spawn_agent_turn(
     // 主 Agent 空闲期间积累的后台任务结果 reminder（子 Agent / 后台 shell）
     preface_reminders: Vec<String>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
-) -> (
-    TurnTask,
-    mpsc::UnboundedSender<(Vec<ContentBlock>, InjectionKind)>,
-) {
-    let (inject_tx, mut inject_rx) =
-        mpsc::unbounded_channel::<(Vec<ContentBlock>, InjectionKind)>();
+) -> (TurnTask, Arc<wyj_core::SteerQueue>) {
+    // 共享注入队列：主 Agent 与（经 ToolContext 拿到的）前台子 Agent 排空的是
+    // 同一份，谁先到工具轮边界谁取走——子 Agent 在跑时，用户补充的内容插进
+    // 子 Agent 的下一轮，而不是等它整个跑完。
+    let steer = Arc::new(wyj_core::SteerQueue::new());
+    let steer_in_task = Arc::clone(&steer);
     let task = spawn_turn_task(async move {
         let mut sess = session_c.lock().await;
         match text {
@@ -9869,6 +10550,9 @@ fn spawn_agent_turn(
         let current_mode = mode_arc.lock().await.clone();
         let mut ctx = ToolCtx::new(&ctx_cwd);
         ctx.set_execution_surface(wyj_core::ExecutionSurface::TuiInteractive);
+        // 让前台子 Agent 能拿到同一份注入队列：用户在它跑的过程中补充的要求
+        // 插进子 Agent 自己的工具轮边界，而不是被堵到它跑完为止。
+        ctx.steer_queue = Some(Arc::clone(&steer_in_task));
         ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
         // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
@@ -9893,7 +10577,7 @@ fn spawn_agent_turn(
                 &mut sess,
                 &ctx,
                 &mut on_text,
-                Some(&mut inject_rx),
+                Some(steer_in_task.as_ref()),
                 on_inject,
             )
             .await;
@@ -9901,6 +10585,14 @@ fn spawn_agent_turn(
             "turn_finished"
         } else {
             "turn_error"
+        };
+        // 锁内先把要上报的用量取出来，随后发终态事件前统一 drop 锁
+        let usage = AgentEvent::Usage {
+            input: sess.total_input_tokens,
+            output: sess.total_output_tokens,
+            compact_count: sess.compact_count,
+            tool_schema_tokens: sess.tool_schema_tokens,
+            tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
         };
         emit_plugin_event_background(
             plugin_runtime,
@@ -9914,18 +10606,16 @@ fn spawn_agent_turn(
                 "error": turn_result.as_ref().err().map(ToString::to_string),
             }),
         );
+        // ── 必须在发终态事件**之前**放掉 session 锁 ──────────────────
+        // 终态事件走的是**阻塞式** send（通道容量 256），而 UI 收到 TurnDone
+        // 后会把 `save_needed` 置位，主循环下一帧就去 `session.lock().await`
+        // 保存（排在 `event::poll` 之前）。若这里还持着锁：UI 等锁、这里等 UI
+        // 排空通道 → 环形等待，界面永久冻结，且看门狗跑不到（它在上游）。
+        // 长回合期间工具事件已把通道填满，这个环很容易撞上。
+        drop(sess);
         match turn_result {
             Ok(_) => {
-                let _ = tx
-                    .send(AgentEvent::Usage {
-                        input: sess.total_input_tokens,
-                        output: sess.total_output_tokens,
-                        compact_count: sess.compact_count,
-
-                        tool_schema_tokens: sess.tool_schema_tokens,
-                        tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
-                    })
-                    .await;
+                let _ = tx.send(usage).await;
                 let _ = tx.send(AgentEvent::TurnDone).await;
             }
             Err(e) => {
@@ -9933,7 +10623,7 @@ fn spawn_agent_turn(
             }
         }
     });
-    (task, inject_tx)
+    (task, steer)
 }
 
 fn emit_plugin_event_background(
@@ -10960,20 +11650,27 @@ async fn tui_main(
         // 竞态兜底：极小概率下，用户提交补充消息的时机恰好晚于 run_turn 最后一次
         // 排空注入队列的检查，导致该轮 TurnDone/Error 已到达而消息仍留在
         // pending_queue 里未被消费。此时视同用户在轮次结束的瞬间正常发送。
+        //
+        // 镜像与共享队列的对齐见 `reconcile_pending_queue`：它在 TurnDone/Error
+        // 里、`injector` 还没被清空之前就做完了，因此这里拿到的
+        // `pending_queue` 一定只含**确实没被任何 Agent 取走**的消息。
         if !state.is_thinking && !state.pending_queue.is_empty() {
             let queued = std::mem::take(&mut state.pending_queue);
             state.injector = None;
             let mut combined_text = String::new();
+            let mut combined_display = String::new();
             let mut combined_attachments = vec![];
-            for (i, (text, atts)) in queued.into_iter().enumerate() {
+            for (i, message) in queued.into_iter().enumerate() {
                 if i > 0 {
                     combined_text.push_str("\n---\n");
+                    combined_display.push_str("\n---\n");
                 }
-                combined_text.push_str(&text);
-                combined_attachments.extend(atts);
+                combined_text.push_str(&message.text);
+                combined_display.push_str(&message.display);
+                combined_attachments.extend(message.attachments);
             }
-            let display_text = build_display_text(&combined_text, &combined_attachments);
-            state.push_user(display_text);
+            // 不再 push_user：每条排队消息在**入队那一刻**就已回显（见 Enter 分支
+            // 的不变式注释），这里重画一遍就是同一条消息出现两次。
             state.input_history.push(combined_text.clone());
             state.begin_new_turn();
             state.is_thinking = true;
@@ -11001,29 +11698,46 @@ async fn tui_main(
         if state.save_needed {
             state.save_needed = false;
             if let Some(store) = &session_store {
-                let sess = session.lock().await;
-                if !sess.messages.is_empty() {
-                    // 保留已有的 LLM 生成标题（若已生成则不覆盖为启发式 title）
-                    let (title, title_generated) = match session_store
-                        .as_ref()
-                        .and_then(|s| s.load(&current_session_id).ok())
-                    {
-                        Some(f) if f.title_generated => (f.title, true),
-                        _ => (extract_title(&sess.messages), false),
-                    };
-                    let sf = SessionFile::from_session(
-                        &sess,
-                        SessionFileMeta {
-                            session_id: current_session_id.clone(),
-                            title,
-                            last_preview: extract_preview(&sess.messages),
-                            cwd: cwd.display().to_string(),
-                            timestamp: now_iso(),
-                            turns: state.turns,
-                            title_generated,
-                        },
-                    );
-                    let _ = store.save(&sf);
+                // 回合正在跑时锁被占住：**不在这里等**，下一帧再存。
+                // 这正是「执行久了界面卡死」的现场——主循环停在这一行，
+                // 后面的 `event::poll()` 永远到不了：不重绘、不读按键，
+                // 连上游的回合心跳看门狗都跑不到下一轮。
+                //
+                // **这里绝不能 `continue`**：`continue` 跳回的是整个主循环，
+                // 被跳过的正是紧随其后的 `ui_ask_rx` 消费与 `event::poll()`
+                // ——按键、权限确认弹窗、AskQuestion 全部停摆。而
+                // `terminal.draw()` 在本行之前、画面照常刷新，看起来「活着」
+                // 却按键全哑。`TurnDone` 置位 `save_needed` 与 11450/11480
+                // 的自动唤醒 spawn 发生在同一帧，因此**每一条排队消息触发的
+                // 自动续跑都会踩中**，整个新回合全程失灵。
+                // 存盘晚一帧没有代价，等锁才有：拿不到就只置位回退，流程
+                // 自然落到下面继续消费输入层。
+                if let Some(sess) = try_session_lock(&session) {
+                    if !sess.messages.is_empty() {
+                        // 保留已有的 LLM 生成标题（若已生成则不覆盖为启发式 title）
+                        let (title, title_generated) = match session_store
+                            .as_ref()
+                            .and_then(|s| s.load(&current_session_id).ok())
+                        {
+                            Some(f) if f.title_generated => (f.title, true),
+                            _ => (extract_title(&sess.messages), false),
+                        };
+                        let sf = SessionFile::from_session(
+                            &sess,
+                            SessionFileMeta {
+                                session_id: current_session_id.clone(),
+                                title,
+                                last_preview: extract_preview(&sess.messages),
+                                cwd: cwd.display().to_string(),
+                                timestamp: now_iso(),
+                                turns: state.turns,
+                                title_generated,
+                            },
+                        );
+                        let _ = store.save(&sf);
+                    }
+                } else {
+                    state.save_needed = true;
                 }
             }
         }
@@ -11098,6 +11812,21 @@ async fn tui_main(
                         continue;
                     }
 
+                    // AskQuestion / 计划批准的"其他"自由输入同理：粘贴进弹窗自己的
+                    // 输入框，不能穿透成一条新的聊天消息
+                    if let Some(dlg) = &mut state.ask_question_dialog {
+                        if let Some(ib) = dlg.freetext_input_mut() {
+                            ib.insert_text(&pasted);
+                            continue;
+                        }
+                    }
+                    if let Some(dlg) = &mut state.plan_dialog {
+                        if let Some(ib) = dlg.freetext_input_mut() {
+                            ib.insert_text(&pasted);
+                            continue;
+                        }
+                    }
+
                     // 文本 bracketed paste 和应用直读 Ctrl+V 共用同一套附件/文字逻辑。
                     // 这里仍优先探测图片，以兼容同时暴露图片与文本 flavor 的剪贴板。
                     let paste = read_clipboard_image().unwrap_or(ClipboardPaste::Text(pasted));
@@ -11153,11 +11882,18 @@ async fn tui_main(
                                 }
                             }
                             KeyCode::Enter => {
+                                // 本分支内有 4 处要动 session，在**入口一次取锁**复用。
+                                // 拿不到就保留选择器并提示，绝不在这里等——回合 task 会
+                                // 持锁跑完整个回合，主循环一停就是「卡死」：不重绘、不读
+                                // 按键，连 ESC/Ctrl+C 都救不回来。
+                                let Some(mut sess) = try_session_lock(&session) else {
+                                    state.notify_session_busy();
+                                    continue;
+                                };
                                 if let Some(picker) = state.session_picker.take() {
                                     if picker.selected == 0 {
                                         // 新建会话：自动保存当前后重置
                                         if let Some(store) = &session_store {
-                                            let sess = session.lock().await;
                                             if !sess.messages.is_empty() {
                                                 let (title, title_generated) = match store
                                                     .load(&current_session_id)
@@ -11182,7 +11918,6 @@ async fn tui_main(
                                                 ));
                                             }
                                         }
-                                        let mut sess = session.lock().await;
                                         *sess = Session::new();
                                         drop(sess);
                                         current_session_id = new_session_id();
@@ -11202,7 +11937,6 @@ async fn tui_main(
                                         if let Some(store) = &session_store {
                                             // 自动保存当前会话
                                             {
-                                                let sess = session.lock().await;
                                                 if !sess.messages.is_empty() {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
@@ -11234,7 +11968,6 @@ async fn tui_main(
                                                 Ok(file) => {
                                                     let display_msgs =
                                                         reconstruct_display(&file.messages);
-                                                    let mut sess = session.lock().await;
                                                     sess.restore_usage_from(&file);
                                                     sess.messages = file.messages;
                                                     let compact_count = sess.compact_count;
@@ -11594,34 +12327,18 @@ async fn tui_main(
                                     }
                                 }
                             }
-                            KeyCode::Backspace => {
+                            // 退格/删除/左右/Home/End 与主输入框、弹窗自由文本
+                            // 走同一份实现（此前这里是手写的另一套，缺 Ctrl+U/A/E/K/W
+                            // 与 Alt+←→，同一个编辑动作换个界面就按不动）。
+                            // 配置输入框不接受附件，所以没有附件标记要对齐。
+                            KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Home
+                            | KeyCode::End => {
                                 if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.backspace();
-                                }
-                            }
-                            KeyCode::Delete => {
-                                if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.delete_char_forward();
-                                }
-                            }
-                            KeyCode::Left => {
-                                if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.move_left();
-                                }
-                            }
-                            KeyCode::Right => {
-                                if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.move_right();
-                                }
-                            }
-                            KeyCode::Home => {
-                                if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.move_to_start_of_line();
-                                }
-                            }
-                            KeyCode::End => {
-                                if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.move_to_end_of_line();
+                                    crate::input::apply_edit_key(ib, &key);
                                 }
                             }
                             _ if is_clipboard_paste_key(key) => {
@@ -11635,7 +12352,9 @@ async fn tui_main(
                             }
                             KeyCode::Char(c) => {
                                 if let Some(ib) = owner.live_input_mut(&mut state) {
-                                    ib.insert_char(c);
+                                    if !crate::input::apply_edit_key(ib, &key) {
+                                        ib.insert_char(c);
+                                    }
                                 }
                             }
                             _ => {}
@@ -13399,7 +14118,7 @@ async fn tui_main(
                             state.interrupt();
                             continue;
                         }
-                        match dlg.handle_key(key.code) {
+                        match dlg.handle_key_event(key) {
                             PlanApprovalOutcome::Continue => {}
                             PlanApprovalOutcome::Approve => {
                                 if let Some(dlg) = state.plan_dialog.take() {
@@ -13411,22 +14130,12 @@ async fn tui_main(
                                     // send 的锁 —— 100% 死锁，且 ESC/interrupt 都救不
                                     // 回来（interrupt 也走主循环，同样卡在这）。
                                     let _ = dlg.response_tx.send(true);
-                                    if let Some(sessions) = &session_store {
-                                        if let Ok(store) = wyj_core::CheckpointStore::configured(
-                                            sessions.dir(),
-                                            current_session_id.clone(),
-                                        ) {
-                                            let mut sess = session.lock().await;
-                                            if let Ok(checkpoint) = store.create(
-                                                &cwd,
-                                                &sess.messages,
-                                                wyj_core::CheckpointKind::PlanApproval,
-                                                Some("before plan approval".to_string()),
-                                            ) {
-                                                sess.current_checkpoint_id = Some(checkpoint.id);
-                                            }
-                                        }
-                                    }
+                                    spawn_plan_approval_checkpoint(
+                                        session.clone(),
+                                        cwd.clone(),
+                                        current_session_id.clone(),
+                                        session_store.as_ref(),
+                                    );
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
                                     let new_mode = AgentMode::Normal;
@@ -13462,7 +14171,7 @@ async fn tui_main(
                                     let _ = dlg.response_tx.send(false);
                                 }
                                 state.interrupt();
-                                state.pending_queue.push((text, vec![]));
+                                state.enqueue_message(OutgoingMessage::plain(text));
                             }
                         }
                         continue;
@@ -13473,22 +14182,12 @@ async fn tui_main(
                         match key.code {
                             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 if let Some(dlg) = state.exec_mode_confirm.take() {
-                                    if let Some(sessions) = &session_store {
-                                        if let Ok(store) = wyj_core::CheckpointStore::configured(
-                                            sessions.dir(),
-                                            current_session_id.clone(),
-                                        ) {
-                                            let mut sess = session.lock().await;
-                                            if let Ok(checkpoint) = store.create(
-                                                &cwd,
-                                                &sess.messages,
-                                                wyj_core::CheckpointKind::PlanApproval,
-                                                Some("before plan approval".to_string()),
-                                            ) {
-                                                sess.current_checkpoint_id = Some(checkpoint.id);
-                                            }
-                                        }
-                                    }
+                                    spawn_plan_approval_checkpoint(
+                                        session.clone(),
+                                        cwd.clone(),
+                                        current_session_id.clone(),
+                                        session_store.as_ref(),
+                                    );
                                     let new_mode = AgentMode::Normal;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
@@ -13496,11 +14195,7 @@ async fn tui_main(
                                     state.messages.push(ChatMessage::system(
                                         "已切换至执行模式。".to_string(),
                                     ));
-                                    let display_text = build_display_text(
-                                        &dlg.pending_message,
-                                        &dlg.pending_attachments,
-                                    );
-                                    state.push_user(display_text);
+                                    state.push_user(dlg.pending_display.clone());
                                     state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
@@ -13525,11 +14220,7 @@ async fn tui_main(
                             }
                             KeyCode::Char('n') | KeyCode::Char('N') => {
                                 if let Some(dlg) = state.exec_mode_confirm.take() {
-                                    let display_text = build_display_text(
-                                        &dlg.pending_message,
-                                        &dlg.pending_attachments,
-                                    );
-                                    state.push_user(display_text);
+                                    state.push_user(dlg.pending_display.clone());
                                     state.begin_new_turn();
                                     state.is_thinking = true;
                                     state.spinner_frame = 0;
@@ -13565,7 +14256,7 @@ async fn tui_main(
 
                     // ② AskQuestion 对话框优先拦截全部按键
                     if let Some(dlg) = &mut state.ask_question_dialog {
-                        match dlg.handle_key(key.code) {
+                        match dlg.handle_key_event(key) {
                             AskQuestionKeyOutcome::Continue => {}
                             AskQuestionKeyOutcome::Cancel => {
                                 if let Some(dlg) = state.ask_question_dialog.take() {
@@ -13890,11 +14581,31 @@ async fn tui_main(
                     state.ctrl_c_pressed = false;
                     state.last_ctrl_c = None;
 
-                    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // 换行三种等价写法：Shift+Enter（终端上报键盘协议时可用）、
+                    // Ctrl+J（到处可用）、行尾 `\` + Enter（连 Ctrl 都收不到时）。
+                    // 后两种与 Claude Code 文档推荐的写法一致。
+                    let newline = (key.code == KeyCode::Enter
+                        && key.modifiers.contains(KeyModifiers::SHIFT))
+                        || (matches!(key.code, KeyCode::Char('j' | 'J'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL))
+                        || (key.code == KeyCode::Enter
+                            && !key.modifiers.contains(KeyModifiers::SHIFT)
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && crate::input::trailing_backslash_before_cursor(&input));
+                    if newline {
+                        if key.code == KeyCode::Enter
+                            && !key.modifiers.contains(KeyModifiers::SHIFT)
+                        {
+                            // 行尾反斜杠只是"换行记号"，不进正文
+                            input.backspace();
+                        }
                         input.insert_newline();
                         state.slash_completions.clear();
                     } else if key.code == KeyCode::Enter && !state.is_thinking {
                         if composer_has_content(&state, &input) {
+                            // 附件占位符的位置只存在于输入框内部（`take()` 之后
+                            // 标记就没了），先留一份快照给聊天区展示用。
+                            let composer_snapshot = input.clone();
                             let text = input.take();
                             state.slash_completions.clear();
                             state.file_completions.clear();
@@ -14031,7 +14742,13 @@ async fn tui_main(
                                 compact_count,
                                 context_edit,
                             ) = {
-                                let sess = session.lock().await;
+                                let sess = match try_session_lock(&session) {
+                                    Some(sess) => sess,
+                                    None => {
+                                        state.notify_session_busy();
+                                        continue;
+                                    }
+                                };
                                 // 优先用 Agent 侧算好的 request 级分解（与自动压缩
                                 // 阈值同源）；本会话还没发过模型请求时才退回
                                 // messages-only 估算。
@@ -14110,6 +14827,15 @@ async fn tui_main(
                                         state.messages.push(ChatMessage::assistant(out));
                                     }
                                     Ok(CommandResult::ClearHistory) => {
+                                        // 先取锁再做这一大串状态重置：反过来会让用户看到
+                                        // 「屏清了但对话还在」的闪回（拿不到锁就整条命令放弃）
+                                        let mut sess = match try_session_lock(&session) {
+                                            Some(sess) => sess,
+                                            None => {
+                                                state.notify_session_busy();
+                                                continue;
+                                            }
+                                        };
                                         state.messages.clear();
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
@@ -14149,7 +14875,6 @@ async fn tui_main(
                                         // 下一次冻结时把欢迎页重新画一遍。
                                         state.welcome_frozen = true;
                                         execute!(io::stdout(), Clear(ClearType::Purge))?;
-                                        let mut sess = session.lock().await;
                                         // /clear 会把 elided_blobs 一起清空，必须先
                                         // release：CAS 的 gc 只回收 ref_count == 0 的
                                         // blob，不 release 就等于永久泄漏。
@@ -14175,7 +14900,13 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::CompactHistory) => {
                                         let agent_c = shared_agent.read().unwrap().clone();
-                                        let mut sess = session.lock().await;
+                                        let mut sess = match try_session_lock(&session) {
+                                            Some(sess) => sess,
+                                            None => {
+                                                state.notify_session_busy();
+                                                continue;
+                                            }
+                                        };
                                         match agent_c.compact_context(&mut sess).await {
                                             Ok(r) if r.messages_removed > 0 => {
                                                 state.compact_count = sess.compact_count;
@@ -14207,7 +14938,13 @@ async fn tui_main(
                                             ));
                                         } else {
                                             if let Some(store) = &session_store {
-                                                let sess = session.lock().await;
+                                                let sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => {
+                                                        state.notify_session_busy();
+                                                        continue;
+                                                    }
+                                                };
                                                 if !sess.messages.is_empty() {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
@@ -14235,7 +14972,13 @@ async fn tui_main(
                                                 }
                                             }
                                             {
-                                                let mut sess = session.lock().await;
+                                                let mut sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => {
+                                                        state.notify_session_busy();
+                                                        continue;
+                                                    }
+                                                };
                                                 *sess = Session::new();
                                             }
                                             current_session_id = new_session_id();
@@ -14272,7 +15015,13 @@ async fn tui_main(
                                                 }
                                             }
                                             Some(store) => {
-                                                let sess = session.lock().await;
+                                                let sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => {
+                                                        state.notify_session_busy();
+                                                        continue;
+                                                    }
+                                                };
                                                 match store.create(
                                                     &cwd,
                                                     &sess.messages,
@@ -14340,8 +15089,10 @@ async fn tui_main(
                                                     ));
                                                 }
                                             }
-                                            let current_messages =
-                                                session.lock().await.messages.clone();
+                                            let current_messages = match try_session_lock(&session) {
+                                                Some(sess) => sess.messages.clone(),
+                                                None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
+                                            };
                                             let protection = store.create(
                                                 &cwd,
                                                 &current_messages,
@@ -14361,14 +15112,19 @@ async fn tui_main(
                                                     format_rewind_preview(&preview)
                                                 );
                                             }
-                                            session.lock().await.current_checkpoint_id =
-                                                Some(id.clone());
+                                            match try_session_lock(&session) {
+                                                Some(mut sess) => sess.current_checkpoint_id = Some(id.clone()),
+                                                None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
+                                            };
                                             if matches!(
                                                 scope,
                                                 wyj_core::RewindScope::Conversation
                                                     | wyj_core::RewindScope::Both
                                             ) {
-                                                let mut sess = session.lock().await;
+                                                let mut sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
+                                                };
                                                 sess.messages = checkpoint.messages;
                                                 sess.current_checkpoint_id = Some(id.clone());
                                                 state.messages = reconstruct_display(&sess.messages);
@@ -14431,8 +15187,10 @@ async fn tui_main(
                                                         id
                                                     );
                                                 }
-                                                let current_messages =
-                                                    session.lock().await.messages.clone();
+                                                let current_messages = match try_session_lock(&session) {
+                                                    Some(sess) => sess.messages.clone(),
+                                                    None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
+                                                };
                                                 store.create(
                                                     &cwd,
                                                     &current_messages,
@@ -14455,7 +15213,13 @@ async fn tui_main(
                                                 current_session_id = branch.session_id.clone();
                                                 state.current_session_id =
                                                     current_session_id.clone();
-                                                let mut sess = session.lock().await;
+                                                let mut sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => anyhow::bail!(
+                                                        "{}",
+                                                        wyj_i18n::tr("session.busy_notice")
+                                                    ),
+                                                };
                                                 *sess = Session::new();
                                                 sess.messages = branch.messages;
                                                 sess.current_checkpoint_id =
@@ -14681,6 +15445,14 @@ async fn tui_main(
                                             let run_result = turn_agent
                                                 .run_turn(&mut sess, &ctx, &mut on_text)
                                                 .await;
+                                            let usage = AgentEvent::Usage {
+                                                input: sess.total_input_tokens,
+                                                output: sess.total_output_tokens,
+                                                compact_count: sess.compact_count,
+                                                tool_schema_tokens: sess.tool_schema_tokens,
+                                                tool_schema_tokens_saved: sess
+                                                    .tool_schema_tokens_saved,
+                                            };
                                             emit_plugin_event_background(
                                                 plugin_runtime_c,
                                                 if run_result.is_ok() {
@@ -14695,20 +15467,13 @@ async fn tui_main(
                                                     "error": run_result.as_ref().err().map(ToString::to_string),
                                                 }),
                                             );
+                                            // 发终态事件前先放锁，理由同 `spawn_agent_turn`
+                                            // （阻塞式 send + UI 侧 `session.lock().await`
+                                            //  = 环形等待，界面永久冻结）。
+                                            drop(sess);
                                             match run_result {
                                                 Ok(_) => {
-                                                    let _ = tx
-                                                        .send(AgentEvent::Usage {
-                                                            input: sess.total_input_tokens,
-                                                            output: sess.total_output_tokens,
-                                                            compact_count: sess.compact_count,
-
-                                                            tool_schema_tokens: sess
-                                                                .tool_schema_tokens,
-                                                            tool_schema_tokens_saved: sess
-                                                                .tool_schema_tokens_saved,
-                                                        })
-                                                        .await;
+                                                    let _ = tx.send(usage).await;
                                                     let _ = tx.send(AgentEvent::TurnDone).await;
                                                 }
                                                 Err(e) => {
@@ -14815,6 +15580,14 @@ async fn tui_main(
                                             let run_result = turn_agent
                                                 .run_turn(&mut sess, &ctx, &mut on_text)
                                                 .await;
+                                            let usage = AgentEvent::Usage {
+                                                input: sess.total_input_tokens,
+                                                output: sess.total_output_tokens,
+                                                compact_count: sess.compact_count,
+                                                tool_schema_tokens: sess.tool_schema_tokens,
+                                                tool_schema_tokens_saved: sess
+                                                    .tool_schema_tokens_saved,
+                                            };
                                             emit_plugin_event_background(
                                                 plugin_runtime_c,
                                                 if run_result.is_ok() {
@@ -14829,20 +15602,13 @@ async fn tui_main(
                                                     "error": run_result.as_ref().err().map(ToString::to_string),
                                                 }),
                                             );
+                                            // 发终态事件前先放锁，理由同 `spawn_agent_turn`
+                                            // （阻塞式 send + UI 侧 `session.lock().await`
+                                            //  = 环形等待，界面永久冻结）。
+                                            drop(sess);
                                             match run_result {
                                                 Ok(_) => {
-                                                    let _ = tx
-                                                        .send(AgentEvent::Usage {
-                                                            input: sess.total_input_tokens,
-                                                            output: sess.total_output_tokens,
-                                                            compact_count: sess.compact_count,
-
-                                                            tool_schema_tokens: sess
-                                                                .tool_schema_tokens,
-                                                            tool_schema_tokens_saved: sess
-                                                                .tool_schema_tokens_saved,
-                                                        })
-                                                        .await;
+                                                    let _ = tx.send(usage).await;
                                                     let _ = tx.send(AgentEvent::TurnDone).await;
                                                 }
                                                 Err(e) => {
@@ -14862,7 +15628,13 @@ async fn tui_main(
                                         } else if let Some(store) = &session_store {
                                             // 自动保存当前会话
                                             {
-                                                let sess = session.lock().await;
+                                                let sess = match try_session_lock(&session) {
+                                                    Some(sess) => sess,
+                                                    None => {
+                                                        state.notify_session_busy();
+                                                        continue;
+                                                    }
+                                                };
                                                 if !sess.messages.is_empty() {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
@@ -14894,7 +15666,14 @@ async fn tui_main(
                                                 Ok(file) => {
                                                     let display_msgs =
                                                         reconstruct_display(&file.messages);
-                                                    let mut sess = session.lock().await;
+                                                    let mut sess = match try_session_lock(&session)
+                                                    {
+                                                        Some(sess) => sess,
+                                                        None => {
+                                                            state.notify_session_busy();
+                                                            continue;
+                                                        }
+                                                    };
                                                     sess.total_input_tokens = file.input_tokens;
                                                     sess.total_output_tokens = file.output_tokens;
                                                     sess.routing_events =
@@ -15103,6 +15882,13 @@ async fn tui_main(
                                     &mut state.pending_attachments,
                                 );
 
+                                // 展示文本从快照投影（必须在 @ 展开之后算：@ 追加的
+                                // 附件没有输入框标记，要作为末尾单列项一起画）
+                                let display_text = crate::render::attachment_display_text(
+                                    &composer_snapshot,
+                                    &state.pending_attachments,
+                                );
+
                                 // plan 模式下若历史中已有获批的 ExitPlanMode → 拦截，弹确认框
                                 let plan_already_approved = matches!(state.mode, AgentMode::Plan)
                                     && session
@@ -15116,11 +15902,10 @@ async fn tui_main(
                                         pending_attachments: std::mem::take(
                                             &mut state.pending_attachments,
                                         ),
+                                        pending_display: display_text,
                                     });
                                     state.input_history.push(text);
                                 } else {
-                                    let display_text =
-                                        build_display_text(&text, &state.pending_attachments);
                                     state.push_user(display_text);
                                     state.input_history.push(text.clone());
                                     state.begin_new_turn();
@@ -15153,6 +15938,7 @@ async fn tui_main(
                     } else if key.code == KeyCode::Enter && state.is_thinking {
                         // Agent 忙碌期间提交 → 排队，不打断当前操作
                         if !input.is_empty() || !state.pending_attachments.is_empty() {
+                            let composer_snapshot = input.clone();
                             let text = input.take();
                             state.slash_completions.clear();
                             state.file_completions.clear();
@@ -15163,16 +15949,28 @@ async fn tui_main(
                                 &cwd,
                                 &mut state.pending_attachments,
                             );
+                            let display = crate::render::attachment_display_text(
+                                &composer_snapshot,
+                                &state.pending_attachments,
+                            );
                             let attachments = std::mem::take(&mut state.pending_attachments);
-                            if let Some(tx) = &state.injector {
+                            if let Some(queue) = &state.injector {
                                 let blocks =
                                     build_user_blocks(text.clone(), attachments.clone()).await;
-                                let _ = tx.send((blocks, InjectionKind::UserMessage));
-                                state.pending_queue.push((text, attachments));
+                                queue.push(blocks, InjectionKind::UserMessage);
+                                // **当场回显**，不等 Agent 排空：排空点在「一轮工具
+                                // 调用全部返回之后」，前台子 Agent / 长 Bash 期间可能
+                                // 几十分钟都不排空，回显跟着一起等就等于「我打的字被
+                                // 吞了」。真实投递仍由 Agent 排空时完成，这里只管让
+                                // 用户立刻看见自己提交了什么。
+                                state.enqueue_message(OutgoingMessage {
+                                    text,
+                                    attachments,
+                                    display,
+                                });
                             } else {
                                 // 理论上不应发生：is_thinking 但没有活跃任务，按普通消息兜底处理
-                                let display_text = build_display_text(&text, &attachments);
-                                state.push_user(display_text);
+                                state.push_user(display);
                                 state.input_history.push(text);
                                 state.pending_attachments = attachments;
                             }
@@ -15231,22 +16029,25 @@ async fn tui_main(
                         } else {
                             input.move_to_end_of_line();
                         }
-                    } else if key.code == KeyCode::Left {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            || key.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            input.move_word_backward();
-                        } else {
-                            input.move_left();
-                        }
-                    } else if key.code == KeyCode::Right {
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
-                            || key.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            input.move_word_forward();
-                        } else {
-                            input.move_right();
-                        }
+                    } else if key.code == KeyCode::Char('w')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // Ctrl+W 必须在共享编辑实现**之前**拦下：它要连带删除
+                        // 光标前的附件占位标记（`delete_word_backward_composer`），
+                        // 纯文本实现不认识附件。
+                        delete_word_backward_composer(&mut input, &mut state.pending_attachments);
+                        update_slash_completions(&mut state, &input, &cmd_registry);
+                        update_file_completions(&mut state, &input, &cwd);
+                    } else if crate::input::apply_edit_key(&mut input, &key) {
+                        // 左右移动 / Ctrl+A / Ctrl+E / Ctrl+K / Ctrl+U 走唯一实现，
+                        // 与各弹窗的自由文本输入同源（见 `input::apply_edit_key`）。
+                        // 不走共享实现的只有五类，它们各自还背着应用层语义：
+                        // Backspace / Delete（附件占位标记）、Ctrl+W（同上）、
+                        // Home / End（输入框为空时是"跳到对话首尾"）、
+                        // Enter / ↑↓ / 粘贴（提交、历史、附件）。
+                        input.reconcile_attachment_markers(state.pending_attachments.len());
+                        update_slash_completions(&mut state, &input, &cmd_registry);
+                        update_file_completions(&mut state, &input, &cwd);
                     } else if is_clipboard_paste_key(key) {
                         // 纯图片剪贴板不会让终端产生 Event::Paste；应用必须在收到
                         // Ctrl+V（部分终端为 Super+V）时主动读取系统剪贴板。
@@ -15259,26 +16060,7 @@ async fn tui_main(
                         // Ctrl 组合键
                         if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match c {
-                                'a' => input.move_to_start_of_line(),
-                                'e' => input.move_to_end_of_line(),
-                                'k' => {
-                                    input.kill_to_end_of_line();
-                                    update_slash_completions(&mut state, &input, &cmd_registry);
-                                    update_file_completions(&mut state, &input, &cwd);
-                                }
-                                'u' => {
-                                    input.kill_to_start_of_line();
-                                    update_slash_completions(&mut state, &input, &cmd_registry);
-                                    update_file_completions(&mut state, &input, &cwd);
-                                }
-                                'w' => {
-                                    delete_word_backward_composer(
-                                        &mut input,
-                                        &mut state.pending_attachments,
-                                    );
-                                    update_slash_completions(&mut state, &input, &cmd_registry);
-                                    update_file_completions(&mut state, &input, &cwd);
-                                }
+                                // a/e/k/u/w 已由上游 `apply_edit_key` 接管
                                 'l' => {
                                     // Ctrl+L：对齐大多数 shell/终端的"清屏重绘"语义。
                                     let _ = terminal.clear();
@@ -15448,10 +16230,22 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
         match &msg.role {
             Role::User => {
                 let mut has_text = false;
+                // 恢复会话时图片块此前被整个 `_ => {}` 吞掉——历史消息里的
+                // 图片在聊天流里不留任何痕迹，用户会以为图没发出去。补上
+                // `[Image #n]`：占位符在正文里的原始位置从未落盘（那是输入框
+                // 内部的原子标记），只能在末尾补，编号与实时发送路径
+                // （`render::attachment_display_text`）保持一致。
+                let image_count = msg
+                    .content
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::Image { .. }))
+                    .count();
+                let mut last_user_index = None;
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text } if !text.trim().is_empty() => {
                             result.push(ChatMessage::user(text.clone()));
+                            last_user_index = Some(result.len() - 1);
                             has_text = true;
                         }
                         ContentBlock::ToolResult {
@@ -15478,6 +16272,15 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                             ));
                         }
                         _ => {}
+                    }
+                }
+                if image_count > 0 {
+                    let suffix: String = (1..=image_count)
+                        .map(|i| format!("\n[Image #{i}]"))
+                        .collect();
+                    match last_user_index {
+                        Some(idx) => result[idx].content.push_str(&suffix),
+                        None => result.push(ChatMessage::user(suffix.trim_start().to_string())),
                     }
                 }
                 let _ = has_text;
@@ -15512,6 +16315,45 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
 #[cfg(test)]
 mod reconstruct_display_tests {
     use super::*;
+
+    /// 恢复历史会话时，用户消息里的图片块此前被 `_ => {}` 整个吞掉——
+    /// 聊天流里不留任何痕迹，用户会以为当初那张图没发出去。占位符编号
+    /// 必须与实时发送路径（`render::attachment_display_text`）一致。
+    #[test]
+    fn user_images_survive_into_the_reconstructed_display() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Text {
+                        text: "如图".to_string(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "AAAA".to_string(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "BBBB".to_string(),
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "CCCC".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let display = reconstruct_display(&messages);
+        assert_eq!(display[0].content, "如图\n[Image #1]");
+        // 纯图片消息（无正文）也不能凭空消失
+        assert_eq!(display[1].content, "[Image #1]\n[Image #2]");
+    }
 
     /// 回归测试：一个助手回合里有多个并行工具调用时，`reconstruct_display`
     /// 曾经用循环里"当前"的 tool_seq 给所有 ToolResult 赋值——多个并行调用的
@@ -16019,6 +16861,235 @@ mod ask_question_dialog_tests {
         (AskQuestionDialog::new(questions, tx), rx)
     }
 
+    /// 选项态直接敲字符 = 进"其他"输入框并把它当首字符。少一次 ↓↓ + 回车。
+    #[test]
+    fn typing_a_character_enters_other_with_that_character() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('见'), KeyModifiers::NONE));
+        let input = match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => input,
+            _ => panic!("应当直接进入自由输入模式"),
+        };
+        assert_eq!(input.text(), "见");
+    }
+
+    /// 空格保留原语义（多选 toggle），不能被"打字就进 Other"吃掉。
+    #[test]
+    fn space_still_toggles_checkbox_instead_of_opening_other() {
+        let (mut dlg, _rx) = make_dialog(vec![multi_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        match &dlg.current {
+            InProgressAnswer::Multi { checked, .. } => assert_eq!(checked.len(), 1),
+            _ => panic!("空格应当只做勾选，不该进入自由输入"),
+        }
+    }
+
+    /// 自由文本里必须能用与主输入框同一套编辑键：Delete / Home / End /
+    /// Ctrl+A / Ctrl+E / Ctrl+U / Ctrl+K / Ctrl+W / Alt+← →。
+    /// 钉住"弹窗与主输入框同源"，否则改一处忘一处就又分叉。
+    #[test]
+    fn freetext_supports_the_same_editing_keys_as_the_composer() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        let enter_other = |dlg: &mut AskQuestionDialog| {
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        };
+        enter_other(&mut dlg);
+        for c in "abcd".chars() {
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let text = |dlg: &AskQuestionDialog| match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => input.text(),
+            _ => panic!("应处于自由输入"),
+        };
+        assert_eq!(text(&dlg), "xabcd");
+
+        let k = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        // 光标在末尾，左移一格后 Delete 删的是「光标处」那个字符
+        dlg.handle_key_event(k(KeyCode::Left));
+        dlg.handle_key_event(k(KeyCode::Delete));
+        assert_eq!(text(&dlg), "xabc");
+        dlg.handle_key_event(k(KeyCode::Home));
+        dlg.handle_key_event(k(KeyCode::Delete));
+        assert_eq!(text(&dlg), "abc");
+        // End + Ctrl+E：都在行尾，文本不变
+        dlg.handle_key_event(k(KeyCode::End));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert_eq!(text(&dlg), "abc");
+        // Ctrl+U 清到行首
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(text(&dlg), "");
+        // 重新打字后：Ctrl+K 删到行尾、Alt+← 按词左移 + Ctrl+W 删词
+        for c in "one two".chars() {
+            dlg.handle_key_event(k(KeyCode::Char(c)));
+        }
+        assert_eq!(text(&dlg), "one two");
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(text(&dlg), "one two");
+        // 光标在行尾；Alt+← 跳到 "two" 的行首，Ctrl+W 删掉它前面的 "one "
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(text(&dlg), "two");
+    }
+
+    /// Shift+Enter 换行，且提交时**不能**把换行抹掉（原来 join("") 会拼成一行）。
+    #[test]
+    fn shift_enter_newline_survives_submission() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        let text = match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => input.text(),
+            _ => panic!("应处于自由输入"),
+        };
+        assert_eq!(text, "a\nb");
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &dlg.confirmed[0] {
+            Some(c) => assert!(matches!(&c.answer, QuestionAnswer::FreeText(t) if t == "a\nb")),
+            None => panic!("应已确认"),
+        }
+    }
+
+    /// ↑↓ 在自由文本里翻输入历史；没有历史时才回退成"翻题"。
+    #[test]
+    fn up_down_recall_freetext_history() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1"), single_spec("Q2")]);
+        // 第一条：选项态打字 → 提交
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('甲'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // 已推进到第二题
+        assert!(matches!(
+            dlg.stage,
+            AskQuestionStage::Answering { index: 1 }
+        ));
+
+        // 第二题里进入自由输入，按 ↑ 应翻出「甲」
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('乙'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "甲"),
+            _ => panic!("应处于自由输入"),
+        }
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "乙"),
+            _ => panic!("应处于自由输入"),
+        }
+    }
+
+    /// Ctrl+V 是粘贴，不是"敲一个字母 v"。
+    ///
+    /// 两个分支都要钉死剪贴板来测：此前这条直接读**用户真实剪贴板**，断言
+    /// "文本逐字不变"——在剪贴板为空的机器/CI 上过，在有内容的开发机上就红
+    /// （本地实测就撞到了），是条没人能信任的环境相关测试。
+    #[test]
+    fn ctrl_v_in_freetext_pastes_instead_of_typing_a_literal_v() {
+        // 有内容：应该粘贴进来，而不是敲进一个字母 v
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        with_clipboard_text_override(Some("剪贴板内容"), || {
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        });
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => {
+                assert_eq!(input.text(), "x剪贴板内容", "Ctrl+V 应粘贴剪贴板内容");
+            }
+            _ => panic!("应处于自由输入"),
+        }
+
+        // 空剪贴板：粘贴不到内容，但更不能把字母 v 敲进去
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        with_clipboard_text_override(None, || {
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        });
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => {
+                assert_eq!(input.text(), "x", "剪贴板为空时 Ctrl+V 也不该插入字符 v");
+            }
+            _ => panic!("应处于自由输入"),
+        }
+    }
+
+    /// 换行三种写法都要能用：Shift+Enter（终端支持时）/ Ctrl+J /
+    /// 行尾 `\` + Enter。第三种在不支持键盘协议的终端（tmux 默认、多数
+    /// Windows 终端）里是唯一能换行的方式。
+    #[test]
+    fn newline_works_via_ctrl_j_and_trailing_backslash() {
+        // Ctrl+J
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "a\nb"),
+            _ => panic!("应处于自由输入"),
+        }
+
+        // 行尾反斜杠 + Enter（反斜杠本身不进正文）
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match &dlg.current {
+            // 仍然是自由输入（没被 Enter 提交掉），且多出一行
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "a\n"),
+            _ => panic!("反斜杠 + Enter 应当换行而不是提交"),
+        }
+    }
+
+    /// 弹窗自由文本与主输入框、配置输入框共用 `input::apply_edit_key`。
+    /// 这条钉住"同一份编辑实现"——否则改一处忘一处，弹窗就会重新退化成只能
+    /// 打字/退格/左右的老样子。
+    #[test]
+    fn edit_key_table_is_shared_by_composer_and_dialogs() {
+        use crate::input::apply_edit_key;
+        let mut composer = InputBox::new();
+        for c in "one two".chars() {
+            composer.insert_char(c);
+        }
+        let mut dialog = InputBox::new();
+        for c in "one two".chars() {
+            dialog.insert_char(c);
+        }
+
+        let keys = [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        ];
+        for key in keys {
+            assert!(apply_edit_key(&mut composer, &key), "按键应被消费");
+            assert!(apply_edit_key(&mut dialog, &key));
+        }
+        assert_eq!(composer.text(), "two");
+        assert_eq!(dialog.text(), "two");
+    }
+
+    /// readline 传统别名：Ctrl+B/F 左右、Ctrl+H 退格、Ctrl+D 前删。
+    /// （Ctrl+D 在普通终端里可能被终端自己吃掉，绑上无坏处。）
+    #[test]
+    fn readline_aliases_work_in_freetext() {
+        let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1")]);
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        for c in "bcd".chars() {
+            dlg.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        // "abcd" 光标在末尾；Ctrl+B 左移一格到 3，Ctrl+H 删掉光标前的 'c'
+        dlg.handle_key_event(ctrl('b'));
+        dlg.handle_key_event(ctrl('h'));
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "abd"),
+            _ => panic!("应处于自由输入"),
+        }
+        // Ctrl+D 删掉光标处的 'd'
+        dlg.handle_key_event(ctrl('d'));
+        match &dlg.current {
+            InProgressAnswer::FreeText { input, .. } => assert_eq!(input.text(), "ab"),
+            _ => panic!("应处于自由输入"),
+        }
+    }
+
     #[test]
     fn single_select_enter_advances_to_next_question() {
         let (mut dlg, _rx) = make_dialog(vec![single_spec("Q1"), single_spec("Q2")]);
@@ -16177,6 +17248,37 @@ mod plan_approval_dialog_tests {
     fn starts_with_approve_highlighted() {
         let (dlg, _rx) = make_dialog();
         assert_eq!(dlg.cursor(), 0);
+    }
+
+    /// 手动输入是多行的，面板高度必须跟着**实际行数**走。
+    ///
+    /// 此前 `bottom_panel_size` 对 PlanApproval 写死 5 行，渲染又只画
+    /// `input.lines.first()` 并把一个假的 `_` 贴在行尾——用户写三行只看见
+    /// 一行，按回车却把三行一起发出去（提交取的是 `input.text()`）。同批
+    /// 改动已把 AskQuestion 的自由输入改成逐行渲染，这里是对齐遗漏的兄弟面板。
+    #[test]
+    fn freetext_can_hold_multiple_lines() {
+        let (mut dlg, _rx) = make_dialog();
+        // 走到「手动输入反馈…」
+        for _ in 0..2 {
+            dlg.handle_key(KeyCode::Down);
+        }
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let InProgressAnswer::FreeText { input, .. } = &dlg.current else {
+            panic!("应进入自由输入");
+        };
+        assert_eq!(input.lines.len(), 1);
+
+        // Ctrl+J 换行 + 继续打字
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        dlg.handle_key_event(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+        let InProgressAnswer::FreeText { input, .. } = &dlg.current else {
+            panic!("应仍在自由输入");
+        };
+        assert_eq!(input.lines.len(), 2, "Ctrl+J 必须真的插入一个换行");
+        assert_eq!(input.text(), "a\nb", "提交取的是 input.text()，两行都要在");
     }
 
     #[test]
@@ -17448,7 +18550,7 @@ mod skills_registry_tests {
         let mut state = make_state();
         state.is_thinking = true;
         state.current_task = Some(spawn_turn_task(std::future::pending::<()>()));
-        state.pending_queue.push(("继续".to_string(), Vec::new()));
+        state.pending_queue.push(OutgoingMessage::plain("继续"));
         state.last_turn_activity = Instant::now() - (TURN_STALL_TIMEOUT + Duration::from_secs(5));
 
         state.abort_stalled_turn();

@@ -16,7 +16,7 @@
 - [上下文管理](#上下文管理)
   - [Compact 与持久化截断](#compact-与持久化截断)
   - [Tool-result context editing（清理优先于摘要）](#tool-result-context-editing清理优先于摘要)
-  - [AGENTS.md 注入](#agentsmd-注入)
+  - [项目规约文件注入](#项目规约文件注入)
   - [Memory v3](#memory-v3)
 - [会话与 Checkpoint](#会话与-checkpoint)
   - [存储 CAS + Delta 重构](#存储-cas-delta-重构)
@@ -143,7 +143,7 @@ trait Tool: Send + Sync {
 2. 流式接收 `StreamEvent`，累积 `ContentBlock`；遇到 `tool_use` 闭合则入栈。
 3. 一轮 `tool_use` 全部收齐后按 `parallel_safe` 分组：组内 `join_all` 并发，组间与串行工具保持原始下标，最终按原始顺序回填到 assistant message。
 4. 每个 tool result 依次经过 `PreToolUse` hook → 权限检查 → 执行 → `PostToolUse` hook → 持久化截断（`persist_cap`）→ 回到 SessionStore。
-5. 若用户在中途提交新消息，进入 `AppState.pending_queue`，由 `run_turn_with_injection` 在工具调用往返边界排空注入。
+5. 若用户在中途提交新消息，**当场回显**到聊天流（`AppState::enqueue_message`）并进入 `AppState.pending_queue`，由 `run_turn_with_injection` 在**工具轮边界**排空注入；队列是主 Agent 与前台子 Agent 共享的 `core::SteerQueue`，子 Agent 只取其中的 `UserMessage`（后台任务结果 reminder 留给主 Agent）。详见「会话中补充消息注入」一节。
 6. 一轮结束触发 `Stop` hook（仅 `!has_tool_calls && !got_injection` 分支）。
 
 **ToolContext**：
@@ -244,16 +244,22 @@ conversation if needed"。清理比摘要便宜（无 output token、不产生�
 
 落盘前在 `serialize.rs` 走 `truncate_session_for_persistence`，resume/load 时再还原。
 
-### AGENTS.md 注入
+### 项目规约文件注入
 
-`core::claude_md::ClaudeMdLoader`：
+即 AGENTS.md / CLAUDE.md 等「项目规约文件」。`core::claude_md::ClaudeMdLoader`：
 
-- 查找范围：全局 `~/.wyj-code/AGENTS.md` + 从项目根到 cwd 的祖先链（v1.5.18 起不再读任何 `.claude/` 路径）。
-- 每级目录内 `AGENTS.md`/`AGENTS.local.md` 都存在则都读（local 视作个人覆盖追加，不提交 git）。文件名对齐 AGENTS.md 开放标准；`CLAUDE.md` 系自 v1.5.18 起硬切换不再读取。
+- 查找范围：全局 `~/.wyj-code/` + 从项目根到 cwd 的祖先链。
+- **按槽位独立回退，命中第一个即停**（v1.5.22）：主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`。`AGENTS.md` 是首选（对齐 AGENTS.md 开放标准），其余是各工具的既有约定名。
+  - 为什么不按"整个家族二选一"：两个槽位独立才能保住 personal override 语义——主文件走 `AGENTS.md`、私有覆盖写在 `CLAUDE.local.md` 时仍然生效。两个槽位各只取一个文件，因此**不存在同一份规约被注入两遍**。
+  - 为什么需要回退：这些文件都是项目作者写的规约，读不到等于整个项目的约定对模型不可见；一个"根目录只有 CLAUDE.md"的仓库不该被当成没有任何项目规约。
+  - 判定用"有实际内容"而非单纯 `is_file()`：0 字节 / 全空白的主文件继续往下探。
+- v1.5.18 曾硬切到只读 `AGENTS.md`（无回退），v1.5.22 在保留"命中即停、绝不双份注入"的前提下把回退链加了回来。
 - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
 - 每轮对话开始重新读盘，以 `<system-reminder>` 包装拼进当轮 user 消息末尾（不注入 system、不进历史；文件不变时字节级稳定、缓存可命中）。
-- 工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有 AGENTS.md 系文件且本会话未展示过，在 `agent.rs` 工具执行循环里追加到 system 末尾（按目录去重）。
-- 不再兼容旧版 `WYJ.md`。
+- 工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有规约文件且本会话未展示过，在 `agent.rs` 工具执行循环里追加到 system 末尾（按目录去重）。
+- `/memory` 面板与 `doctor` 走同一个 `resolve_slot`，面板显示的就是实际会注入的那个文件（不存在"面板列了 A、实际读 B"的漂移）。
+- `/init` 的生成目标恒为 `AGENTS.md`（规范名），并要求把 `CLAUDE.md` 等其它工具的规则文件一并整合进去。
+- 不再兼容旧版 `WYJ.md`；全局路径仍只有 `~/.wyj-code/`，不读任何外部工具的全局目录。
 
 ### Memory v3
 
@@ -359,7 +365,7 @@ Checkpoint 支持：
 
 ### Skill / 自定义命令
 
-四层合并链（v1.5.15 起由六层裁剪）：内置 → `~/.wyj-code/skills` → 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。**第 4 层受信任门控控制**（v1.5.19，见上「项目级 skill 信任确认」），未批准时整层不加载。**不读取 `~/.claude/commands/` 或任何外部源**（v1.5.18 起连整个 `.claude/` 都不再读取，见「AGENTS.md 注入」）。
+四层合并链（v1.5.15 起由六层裁剪）：内置 → `~/.wyj-code/skills` → 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。**第 4 层受信任门控控制**（v1.5.19，见上「项目级 skill 信任确认」），未批准时整层不加载。**不读取 `~/.claude/commands/` 或任何外部源**（v1.5.18 起连整个 `~/.claude/` 目录都不再读取；项目**目录内**的 `CLAUDE.md` 作为规约文件被读取是另一回事，见「项目规约文件注入」）。
 
 - 支持单文件 `name.md` 与目录式 `name/SKILL.md`（命中目录式入口后不再递归注册其 `references/assets/*.md` 私有资源）。
 - frontmatter：`description` / `argument-hint` / `allowed-tools` / `model`（复用 `core::frontmatter::parse`）。
