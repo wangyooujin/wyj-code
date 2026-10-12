@@ -328,6 +328,15 @@ impl Tool for CodeSearchTool {
         }
     }
 
+    /// 纯本地索引查询，无副作用，可安全并发执行。
+    ///
+    /// 漏掉这个覆写会让 CodeSearch 落进 `agent.rs` 的 `seq_calls` 串行链，
+    /// 于是「Read + CodeSearch + Grep」这类纯读批次退化成串行。`search()`
+    /// 走的是同步索引（见 `run` 里的 `spawn_blocking`），必须配并发才有意义。
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
         let input: CodeSearchInput = serde_json::from_value(input)?;
         let query = CodeQuery {
@@ -336,7 +345,13 @@ impl Tool for CodeSearchTool {
             language: input.language,
             limit: input.limit.unwrap_or(20),
         };
-        let matches = self.index.search(&query)?;
+        // `CodeIndex::search` 是同步 fn（trait 边界上就没有 async），索引未就绪时
+        // 还会退化成 ignore-aware 的整目录 walk —— 两者都可能扫上万文件。直接写在
+        // async fn 里会占住 tokio worker 线程，把同批次的并发工具全部堵死。
+        let index = self.index.clone();
+        let matches = tokio::task::spawn_blocking(move || index.search(&query))
+            .await
+            .map_err(|e| anyhow::anyhow!("CodeSearch 索引查询任务失败: {e}"))??;
         Ok(ToolResult::ok(serde_json::to_string(&serde_json::json!({
             "status": self.index.status(),
             "matches": matches

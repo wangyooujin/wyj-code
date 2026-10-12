@@ -26,6 +26,21 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// 只累计 `api_calls > 0` 的会话的 input / output。
+    ///
+    /// **为什么需要单独一份**：`input_per_api_call` 这类「每次调用平均 X」必须
+    /// 分子分母来自同一批会话。v1.5.19 之前的 129 个会话有 token 却没有 calls，
+    /// 把它们的 token 计入分子、calls 不进分母，会让比率被**系统性高估**——
+    /// 本机实测 5.0×（input）与 3.3×（output），足以把「未缓存 input 只有 3.2k」
+    /// 误读成「1.6 万」，进而得出「缓存完全失效」的相反结论。
+    ///
+    /// 同理适用于 `cache_hit_ratio` / `output_share`：cache_read 只有新会话才有，
+    /// 拿旧会话的裸 input 去稀释分子会把命中率也读低。
+    ///
+    /// 总量字段（`input_tokens` 等）仍收全部会话——「这个月一共烧了多少」不受影响。
+    pub attributed_input_tokens: u64,
+    pub attributed_output_tokens: u64,
+    pub attributed_cache_read_tokens: u64,
     /// 发生过自动压缩 / context editing 清理的会话数。
     pub sessions_compacted: usize,
     /// `context_edit_freed_tokens > 0` 的会话数。
@@ -56,6 +71,13 @@ impl UsageTotals {
         self.output_tokens += f.output_tokens as u64;
         self.cache_read_tokens += f.cache_read_tokens as u64;
         self.cache_write_tokens += f.cache_write_tokens as u64;
+        // 「每次调用平均」类比率的分子只收有 calls 的会话，保证与分母同源。
+        // 详见 `attributed_input_tokens` 的注释——这里错一次就是 5 倍偏差。
+        if f.api_calls > 0 {
+            self.attributed_input_tokens += f.input_tokens as u64;
+            self.attributed_output_tokens += f.output_tokens as u64;
+            self.attributed_cache_read_tokens += f.cache_read_tokens as u64;
+        }
         if f.compact_count > 0 {
             self.sessions_compacted += 1;
         }
@@ -68,15 +90,18 @@ impl UsageTotals {
     }
 
     pub fn rates(&self) -> UsageRates {
-        let denominator = self.input_tokens + self.cache_read_tokens;
+        // 分子分母必须同源：只用「有 api_calls 的会话」那份 token 去比 calls。
+        // 总量级比率（per_turn / 总量）不受影响，因为它们的分母 turns 全部会话都有。
+        let fresh = self.attributed_input_tokens;
+        let cached = self.attributed_cache_read_tokens;
+        let denominator = fresh + cached;
         UsageRates {
             input_per_turn: ratio(self.input_tokens as f64, self.turns as f64),
             output_per_turn: ratio(self.output_tokens as f64, self.turns as f64),
-            input_per_api_call: per_call(self.input_tokens, self.api_calls),
-            output_per_api_call: per_call(self.output_tokens, self.api_calls),
-            cache_hit_ratio: (self.cache_read_tokens > 0)
-                .then(|| self.cache_read_tokens as f64 / denominator as f64),
-            output_share: ratio(self.output_tokens as f64, denominator as f64),
+            input_per_api_call: per_call(fresh, self.api_calls),
+            output_per_api_call: per_call(self.attributed_output_tokens, self.api_calls),
+            cache_hit_ratio: (cached > 0).then(|| cached as f64 / denominator as f64),
+            output_share: ratio(self.attributed_output_tokens as f64, denominator as f64),
         }
     }
 }
@@ -434,6 +459,68 @@ mod tests {
         assert_eq!(r.rates.input_per_turn, 250.0);
     }
 
+    /// **混合场景**（真实形态：38 个新会话 + 129 个 legacy 会话）下的比率口径。
+    ///
+    /// 这是本条不变式的钉子：legacy 会话有 token 但 `api_calls == 0`，若把它们的
+    /// token 计入 per-call 的分子，会让 `input_per_api_call` 被高估 **5 倍**，
+    /// 把「未缓存 input 只有 3.2k」误读成「1.6 万」——足以让人得出
+    /// 「缓存完全失效」的**相反**结论。分子分母不同源是这个 bug 的全部本质。
+    #[test]
+    fn mixed_legacy_and_instrumented_sessions_keep_ratios_same_source() {
+        let fx = Fixture::new("mixed");
+        // 新会话：2 次调用、共 300 input / 60 output → 每次 150 / 30
+        fx.write(
+            "new",
+            session_json("2026-10-02T00:00:00Z", "/p", 300, 60, 2),
+        );
+        // legacy 会话：token 齐全，api_calls 缺失（v1.5.19 之前落盘）
+        fx.write(
+            "old1",
+            session_json("2026-09-01T00:00:00Z", "/p", 100_000, 20_000, 0),
+        );
+        fx.write(
+            "old2",
+            session_json("2026-09-02T00:00:00Z", "/p", 100_000, 20_000, 0),
+        );
+        let r = collect(&fx.dir, None, None).unwrap();
+
+        // 总量收全部会话——「一共烧了多少」不受口径影响。
+        assert_eq!(r.total.sessions, 3);
+        assert_eq!(r.total.input_tokens, 200_300);
+        assert_eq!(r.total.output_tokens, 40_060);
+        assert_eq!(r.sessions_without_api_calls, 2);
+
+        // per-call 只能用新会话那份 token：150 / 30，而不是 (200300/2)=100150。
+        assert_eq!(r.rates.input_per_api_call, Some(150.0));
+        assert_eq!(r.rates.output_per_api_call, Some(30.0));
+
+        // per-turn 的分母 turns 全部会话都有，保持全量口径。
+        assert_eq!(r.rates.input_per_turn, 200_300.0 / 6.0);
+
+        // 分子分母同源的另一个出口：cache_hit_ratio 不该被 legacy 的裸 input 稀释。
+        assert_eq!(r.rates.cache_hit_ratio, None);
+        assert_eq!(r.rates.output_share, 60.0 / 300.0);
+    }
+
+    /// cache_hit_ratio / output_share 同样只认有 api_calls 的会话——
+    /// legacy 会话没有 cache_read 记录，拿它们的裸 input 当分母会把命中率读低。
+    #[test]
+    fn cache_ratios_ignore_legacy_sessions_bare_input() {
+        let fx = Fixture::new("cache-mixed");
+        let mut body = session_json("2026-10-02T00:00:00Z", "/p", 300, 60, 2);
+        body["cache_read_tokens"] = serde_json::json!(700);
+        fx.write("new", body);
+        fx.write(
+            "old",
+            session_json("2026-09-01T00:00:00Z", "/p", 100_000, 20_000, 0),
+        );
+        let r = collect(&fx.dir, None, None).unwrap();
+        assert_eq!(r.rates.cache_hit_ratio, Some(700.0 / 1000.0));
+        assert_eq!(r.rates.output_share, 60.0 / 1000.0);
+        // 总量仍然含 legacy 会话。
+        assert_eq!(r.total.input_tokens, 100_300);
+    }
+
     #[test]
     fn empty_directory_reports_zero_without_erroring() {
         let fx = Fixture::new("empty");
@@ -470,9 +557,12 @@ mod tests {
         let mut t = UsageTotals {
             input_tokens: 300,
             cache_read_tokens: 700,
+            attributed_input_tokens: 300,
+            attributed_cache_read_tokens: 700,
             ..Default::default()
         };
         t.turns = 1;
+        t.api_calls = 1;
         assert_eq!(t.rates().cache_hit_ratio, Some(0.7));
     }
 

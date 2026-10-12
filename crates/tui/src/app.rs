@@ -11248,17 +11248,38 @@ fn effective_mcp_servers_for_runtime(
     servers
 }
 
+/// 外部资源 reconcile 的节流间隔。稳定态下这两条路径产出完全相同的结果，
+/// 每帧重跑只是纯浪费；1 秒既能覆盖「用户改完配置希望立刻生效」的诉求，
+/// 又把空闲期的 `Config::load()` + `Agent::clone()` 压到 1 次/秒。
+const EXTERNAL_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `AgentDefinition` 不 derive `PartialEq`，而它只有五六个元素——`Debug` 展开的
+/// 字符串既便宜又覆盖全部字段，拿它当变更指纹比逐字段手写比较更不容易漏。
+fn agent_defs_fingerprint(defs: &[wyj_core::AgentDefinition]) -> String {
+    format!("{defs:?}")
+}
+
+/// 重载 agent 定义并把工具 schema 刷新进 Agent。
+///
+/// `last_fingerprint` 用于跳过无变化的重建：定义没变时**不会**去 clone Agent
+/// 也不会重跑 `refresh_tool_definitions()`，两者都是本函数里最贵的部分。
 fn refresh_tui_agent_definitions(
     shared_defs: &wyj_tools::SharedAgentDefinitions,
     shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
     cwd: &Path,
     local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+    last_fingerprint: &mut Option<String>,
 ) {
     let mut sources = wyj_store::plugin_install::enabled_plugin_agent_paths(cwd);
     if let Some(local) = local_plugin {
         sources.extend(local.agent_paths.clone());
     }
     let defs = wyj_core::load_agent_defs(cwd, &sources);
+    let fingerprint = agent_defs_fingerprint(&defs);
+    if last_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        return;
+    }
+    *last_fingerprint = Some(fingerprint);
     if let Ok(mut current) = shared_defs.write() {
         *current = defs;
     }
@@ -11279,6 +11300,7 @@ fn refresh_tui_mcp_runtime(
     mcp_tools: &wyj_tools::SharedMcpTools,
     cwd: &std::path::Path,
     local_plugin: Option<&wyj_store::lockfile::PluginContributions>,
+    last_tool_names: &mut Vec<String>,
 ) {
     let live_cfg = wyj_config::Config::load().unwrap_or_else(|e| {
         tracing::debug!("读取运行时配置失败，继续使用当前配置: {e}");
@@ -11299,6 +11321,10 @@ fn refresh_tui_mcp_runtime(
 
     let mut events = runtime.reconcile(&servers);
     events.extend(runtime.drain());
+    // 任何连接生命周期事件（连上 / 失败 / 移除）都意味着工具实现可能已经换过，
+    // 此时**必须**重建 Agent，哪怕工具名集合没变——server 重启后 schema 变了
+    // 但名字没变是最典型的漏网场景。
+    let force_rebuild = !events.is_empty();
     for event in events {
         match event {
             wyj_mcp::McpRuntimeEvent::Connected { name, tool_count } => {
@@ -11333,6 +11359,14 @@ fn refresh_tui_mcp_runtime(
         *shared = snapshot;
     }
     let tools = mcp_tools.read().unwrap().clone();
+    // 工具名集合没变又没有连接事件 ⇒ Agent 里已经挂着同一批工具，跳过重建。
+    // clone + remove_tools_where + register_tool 是本函数最贵的部分，而稳定态下
+    // 它的结果与上一帧逐字节相同。
+    let desired_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    if !force_rebuild && desired_names == *last_tool_names {
+        return;
+    }
+    *last_tool_names = desired_names;
     let mut new_agent = (**shared_agent.read().unwrap()).clone();
     new_agent.remove_tools_where(|name| name.starts_with("mcp__"));
     for tool in tools {
@@ -11500,6 +11534,13 @@ async fn tui_main(
     let mut last_spinner_advance = Instant::now();
     let mut ghostty_arrow_router = GhosttyArrowRouter::default();
     let mut classified_arrow_keys = VecDeque::<KeyEvent>::new();
+    // 外部资源（agent 定义 / MCP server）的 reconcile 指纹，初值 `None`
+    // 表示「还没算过」——必须让第一帧真的跑一次，否则启动时已连接的 MCP 工具
+    // 永远进不了 Agent。
+    let mut agent_defs_fingerprint: Option<String> = None;
+    let mut mcp_tool_names: Vec<String> = Vec::new();
+    // 让下面第一次判断立刻成立（否则首帧被节流挡掉，MCP 工具要等 1 秒才出现）。
+    let mut last_external_refresh = Instant::now() - EXTERNAL_REFRESH_INTERVAL;
 
     loop {
         // Ctrl+C 首次按下超过 3 秒未确认则重置
@@ -11544,12 +11585,20 @@ async fn tui_main(
         // Resource mutations are applied only after the previous Agent turn is
         // no longer active. The current turn keeps its immutable snapshot; the
         // next turn gets the reconciled MCP set atomically.
-        if !state.is_thinking {
+        //
+        // **为什么要节流**：这段原本每个空闲帧都跑，内部是 `Config::load()` 读盘 +
+        // 一次 `Agent::clone()` 深拷贝 + 对全部工具重求 `definition()` 并重建
+        // argument pipeline。稳定态下这些结果一个字节都不会变，却按 ~30 帧/秒
+        // 重复烧 CPU，直接表现为空闲时输入回显发涩。1 秒一次的感知上限是
+        // 「配置改完最多 1 秒生效」，远低于人能察觉的阈值。
+        if !state.is_thinking && last_external_refresh.elapsed() >= EXTERNAL_REFRESH_INTERVAL {
+            last_external_refresh = Instant::now();
             refresh_tui_agent_definitions(
                 &shared_agent_defs,
                 &shared_agent,
                 &cwd,
                 local_plugin.as_ref(),
+                &mut agent_defs_fingerprint,
             );
             refresh_tui_mcp_runtime(
                 &mut mcp_runtime,
@@ -11558,6 +11607,7 @@ async fn tui_main(
                 &mcp_tools,
                 &cwd,
                 local_plugin.as_ref(),
+                &mut mcp_tool_names,
             );
         }
 
