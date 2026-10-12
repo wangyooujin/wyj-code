@@ -2,6 +2,120 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+## [Unreleased]
+
+## [1.5.22] - 2026-10-12
+
+### 修 review 抓出的 5 个缺陷：其中两个是「修卡死」这个改动自己引入的新卡死
+
+对上一批未提交的改动做了一轮完整 review，抓出 5 个实质缺陷。其中**前两个出在「修卡死」那条改动自己身上**——它引入的 `continue` 作用域过大，制造出一种比原 bug 更隐蔽的假死；共享注入队列的镜像没跟着真实水位走，让「一条消息只投递一次」这条自己声明的不变式当场破掉。
+
+**① autosave 的 `continue` 跳过整个输入层（严重）**。回合 task 持锁期间取不到 session 锁，于是主循环的保存分支 `continue` 下一帧。问题是 `continue` 跳回的是**整个主循环**，被跳过的正是紧随其后的 `ui_ask_rx` 消费与 `event::poll()`：按键、权限确认弹窗、AskQuestion、计划批准全部停摆。而 `terminal.draw()` 在该行**之前**，画面照常刷新——用户看到的是「界面活着但按键全哑」，比原来那个"完全不刷新"更难判断。ESC/Ctrl+C 也救不回来，因为真正终止回合的心跳看门狗排在 `continue` **上游**，现场更像「莫名卡几分钟后自己恢复」。
+
+触发极其常见：`TurnDone` 置位 `save_needed` 与自动唤醒 / 排队兜底的 spawn 发生在同一帧，因此**每一条排队消息触发的自动续跑都会踩中**，整个新回合全程失灵。
+
+改为把保存整段收进 `if let Some(sess) = try_session_lock(&session) { … } else { save_needed = true }`，拿不到锁就自然落到下面继续消费输入层——存盘晚一帧没有代价，等锁才有。`event::poll()` 按键块**内部**的 `continue` 不受影响（消费一个按键、下一帧继续）。不变式「主循环无条件区段拿不到锁只能跳过这件事、不能 `continue`」写进 `crates/tui/CLAUDE.md`，钉子 `autosave_never_continues_past_the_input_layer`（静态检查该分支内不得出现 `continue`）。
+
+**② 子 Agent 取走的排队消息被重复投递（严重）**。`pending_queue` 是 steer 队列的 UI 侧镜像，正常靠 `AgentEvent::Injected` 出队。但共享队列之后**取走者不再唯一**：主 Agent 排空全部、前台子 Agent 只排空 `UserMessage`、嵌套子 Agent 同享同一份——而子 Agent 没有 UI 事件通道、`on_inject` 是空闭包，**发不出 `Injected`**。镜像于是停在旧水位，回合结束后兜底重发会把已经投递给子 Agent 的消息**再当一条全新用户消息发一遍**：同一条要求子 Agent 干一遍、主 Agent 再干一遍，token 双倍。这直接违反同一批改动自己写下的「一条内容只会被投递一次」。
+
+修法不是给每条取走路径补事件通道，而是新增 `SteerQueue::pending_user_messages()` 并在 UI 侧加 `reconcile_pending_queue()`：在 `TurnDone` / `Error` 里、`injector` 被清空**之前**按队列真实水位裁剪镜像。按水位而不是「谁取走的」，三种取走路径一律正确，且不需要动 `ToolContext` trait 与 `SubAgentTool` 的构造签名。反向钉子 `undelivered_steerage_survives_reconciliation_for_the_race_fallback` 守住另一半：确实没被取走的消息必须留下，否则真正的竞态兜底会静默吞掉用户输入。
+
+**③ 自由文本的光标在长行上彻底消失**。`visible_window` 的回退循环不变量写反了：`w` 初值是「光标之前的总宽度」，每轮减的却是「即将丢到左窗外的字符」，减完之后 `w` 实际是**已丢弃前缀**的宽度。循环于是在「左侧丢弃的文本塞得下 `inner_w-1`」时就停——与意图恰好相反，光标偏移量随之无界增长。
+
+`freetext_line` 只给窗口 `[start, end)` 内的 `cursor_col` 画反色块，光标被挤出区间、又不等于行尾时，**整块光标完全不渲染**。实测（80 列终端 `inner_w≈70`）：ASCII 第 139 个字符、中文第 70 个字起光标消失，120 列终端阈值翻倍。对旧代码是**回归**——旧的假 `_` 位置虽然永远错，但永远看得见。
+
+改为向前丢弃字符、比较「留在窗口内的前缀宽度」；光标自身的预留也从写死 1 列改成按 `char_width` 实际宽度（CJK 是 2 列，否则窗口宽恰好等于前缀宽时 CJK 光标仍会被挤出）。穷举验证（ASCII / 中文 / emoji / 中英混排 × 7 种宽度 × 全部光标位）：新实现 0 例真实失败，旧实现 12258 例；剩余 857 例全是退化情形（1 列窗口里的宽字符，任何实现都画不下）。
+
+**④ 计划批准面板的多行输入只画第一行**。这次给 `PlanApprovalDialog` 接上了 `apply_edit_key`，Shift+Enter / Ctrl+J / 行尾 `\`+Enter 都能在"手动输入"里产生多行，提交时取的是 `input.text()`——但渲染写死 `input.lines.first()` 加一个假 `_`，面板高度也写死 5 行。用户写三行只看见一行，回车却把三行一起发出去。同一批改动已经把 AskQuestion 的自由输入改成逐行渲染，这里是对齐遗漏的兄弟面板。现统一走 `freetext_line`，`bottom_panel_size` 的高度按 `3 + input.lines.len()` 算。
+
+**⑤ 一条"本地红 CI 绿"的环境相关单测**。`ctrl_v_in_freetext_does_not_type_a_literal_v` 直接读**用户真实剪贴板**，并断言输入框文本逐字不变——在剪贴板为空的机器与 CI 上过，在有内容的开发机上就红（本次 review 在这台机器上就撞到了，`cargo test --workspace` 唯一那条失败）。这种测试比稳定失败更糟：没人会再信任它。现把剪贴板做成可注入（`with_clipboard_text_override`），测试拆成两个分支分别断言——有内容时**应粘贴**、空剪贴板时**不该敲出字母 v**——比原来那条更强。
+
+顺带修掉 CHANGELOG 里一处置复的标题行。**1163 个 workspace 测试** + clippy `-D warnings` 全绿。
+
+### 弹窗与配置面板里的手写输入难用：编辑键各写各的、自由文本连光标都不显示
+
+同一个编辑动作，在主输入框能按、在弹窗里按不动——这是"交互反人类"的根因，不是审美问题。现状是**三套按键表**：主输入框一套、`InputOwner` 借用态（/model /mcp /skills /plugins /schedule 的配置输入）一套、AskQuestion 与计划批准的"其他"自由输入又一套（只有 `Char` / `Backspace` / `Left` / `Right`，连 `Delete`、`Home`、`End`、`Ctrl+U/A/E/K/W`、`Alt+←→`、粘贴都没有）。而 `InputBox` 的原语其实**早就齐全**（`move_word_*` / `kill_*_of_line` / `delete_word_backward` / `delete_char_forward`），缺的纯粹是接线。
+
+- **`input::apply_edit_key`：纯文本编辑按键的唯一实现**。主输入框、配置面板借用态、两个弹窗的自由输入全部走它。`Enter` / `Esc` / `Tab` / `↑↓` / 粘贴刻意留在调用方——它们各有应用层语义（提交、取消、翻页、历史、附件）。主输入框只保留 5 个不走共享实现的键，各自原因写在代码注释里：`Backspace` / `Delete` / `Ctrl+W` 要连带删除附件占位标记（`backspace_composer` 等），`Home` / `End` 在输入框为空时是"跳到对话首尾"。
+- **打字直接进"其他"**：选项态敲任意非空白字符立即进入自由输入并把它当首字符，少一次 `↓↓` + 回车。空格保留多选 toggle 语义。（参考：Claude Code 目前**没有**这个快捷路径，仍需 `↓` 到 Other 行；这里是更快的等价实现，`↓`+`Enter` 那条路保留不变。）
+- **自由文本补齐编辑能力**：三种换行写法 `Shift+Enter` / `Ctrl+J` / 行尾 `\` + `Enter`（后两者是 Claude Code 文档推荐的兜底——`Shift+Enter` 只有终端上报键盘协议时才区分得出来，tmux 默认设置下会被原样报成普通 Enter 直接提交）；`↑↓` 翻输入历史（弹窗自己的 `InputHistory`，无历史时回退成原来的翻题/移选项）；`Ctrl+V` 粘贴（此前 `Ctrl+V` 会把字母 `v` 直接敲进输入框）；提交时按 `input.text()` 取值，不再 `lines.join("")` 把多行抹成一行。
+- **自由文本终于看得见光标**：此前**只画第一行**并把一个假的 `_` 永远贴在行尾——多行内容直接不可见、光标位置永远是错的。现按行渲染 + 反色块光标 + 超宽时按光标横向滚动 + 字数。光标用反色块而非移动硬件光标：弹窗是浮层，硬件光标同时被底部主输入框占用，两者会打架。
+- **修嵌套弹窗遮挡**：`draw_action_menu` 与二级确认此前和父面板用**同一个整屏 `area` 居中**，坐标完全重合，父面板文字从弹窗两侧露出来（实测 `/model` 的第二行 profile 被切掉一半），看着像渲染错位而不是"打开了一个子菜单"。现改为贴着父面板摆放：右侧放不下落到下方，两边都不行才退回居中。
+
+回归钉子：`edit_key_table_is_shared_by_composer_and_dialogs`、`freetext_supports_the_same_editing_keys_as_the_composer`、`typing_a_character_enters_other_with_that_character`、`space_still_toggles_checkbox_instead_of_opening_other`、`shift_enter_newline_survives_submission`、`newline_works_via_ctrl_j_and_trailing_backslash`、`up_down_recall_freetext_history`、`ctrl_v_in_freetext_does_not_type_a_literal_v`。
+
+
+### 子 Agent / 长命令跑到一半补不进话：注入通道在工具轮边界，前台子 Agent 是一段不透光的等待
+
+2026-10-12 实测复现：前台 `Bash(sleep 30)` 期间提交补充内容，回显了、状态栏提示「已排队」，但直到 `sleep` **返回的那一刻**才送达；前台子 Agent 更糟——用户补充的内容既进不了子 Agent（它的循环 `run_turn` 压根没有注入通道），也进不了被 `SubAgentTool::run()` 这个「不返回的工具调用」整个堵住的主 Agent。12 分钟的子 Agent = 12 分钟白等。后台任务实测不受影响（主回合已结束，回车直接开新一轮）。
+
+两处修复：
+
+- **回显与投递解耦**：排队消息在**提交那一刻**就画进聊天流（`AppState::enqueue_message`），`AgentEvent::Injected` 只负责出队。此前回显也挂在排空事件上，与真正的投递同一个时机点，前台长工具期间用户那边看就是「我输入的字凭空消失」。提示文案也搬进**标题栏**并点名当前正在跑的工具——原先只有状态栏右对齐那一句，窄终端会被「模型 · 模式 · cwd」挤掉后半句（实测只剩「…将在」），而「我的补充还没送达」正是最该看见的信息。
+- **注入通道打通进前台子 Agent**：mpsc 接收端是单消费者且子 Agent 拿不到，改为共享队列 `core::SteerQueue`（`Arc` + 内部 `Mutex`，`push`/`drain` 都是 `&self`——主 Agent 与工具侧要同时持有句柄，`&mut` 做不到），经 `ToolContext::steer_queue()` / `ToolCtx.steer_queue` 带进子 Agent（含嵌套子 Agent）。**谁先到工具轮边界谁取走**：子 Agent 在跑则插进子 Agent 的下一轮，子 Agent 已返回则插进主 Agent 的下一轮。
+
+引入共享队列时避开了一个陷阱：**子 Agent 只排空 `UserMessage`**（`SteerQueue::drain_user_messages`）。`SystemReminder` 装的是后台子 Agent / 后台 shell 的完成通知，那是给**主 Agent** 的结论；被子 Agent 抢走会答非所问，更糟的是子 Agent 返回时队列已空，主 Agent 永远收不到那条结果。
+
+回归钉子：`queued_message_is_echoed_on_submit_and_not_duplicated_on_drain`（提交即回显、排空不重复）、`steer_queue_is_fifo_and_drain_takes_everything`、`shared_steer_queue_delivers_to_exactly_one_agent`（一条内容只进一个会话）、`subagent_drain_leaves_system_reminders_for_the_main_agent`。真机验证：前台子 Agent 跑到一半提交一条要求，子 Agent 在自己的下一个工具边界取走并执行，主 Agent 的最终回复里确认收到了该要求。
+
+
+### 「执行久了整个界面卡死」：UI 线程在等一把回合 task 持有着的锁
+
+2026-10-12 实测定位（用户现场那个跑了 44 分钟的进程仍在，取证后修复）。表象是「跑一阵子之后界面完全不动、ESC 和 Ctrl+C 都按不动」，但 0% CPU、12 个线程全 idle —— 不是慢、不是内存、不是渲染。
+
+`lldb` 主线程栈只有 4 层用户帧且两次采样相隔 5 分钟**逐帧相同**：
+
+```
+main → lang_start_internal → tokio Runtime::block_on → CachedParkThread::block_on
+     → CondvarParker::park → pthread_cond_wait
+```
+
+async 帧不进调用栈，栈这么浅本身就是结论：**整个 `async main` 挂在一个永不返回的 `.await` 上**，而不是事件循环在 poll 超时。两条独立缺陷叠加：
+
+- **回合 task 在整个 agent 回合期间持有 `session` 这把 `tokio::sync::Mutex`**（`spawn_agent_turn`：`let mut sess = session_c.lock().await` 之后 `run_turn_with_injection(&mut sess, …)` 一路到 task 结束，LLM 往返 + 全部工具调用都在锁内）。而 TUI 主循环有 20 多处无超时 `session.lock().await`，其中自动保存分支排在 `event::poll()` **之前**：一旦停在那里，整个界面就没有心跳了——不重绘、不读按键。现场证据完全吻合：会话文件 mtime 停在 10:10:24 再没写过、turn task 仍在发新 bash 子进程、界面冻住。
+- **终态事件是阻塞式 send**（`mpsc::channel::<AgentEvent>(256)`）。`TurnDone` 一到，UI 置 `save_needed`、下一帧就来取锁；turn task 若发事件时**仍持锁**，就是「UI 等锁 / turn task 等 UI 排空通道」的环形等待。工具事件走 `try_send`（满了丢弃）不会堵，但回合收尾的 `Usage` / `TurnDone` / `Error` 会，长回合期间通道早已填满。
+
+**为什么 v1.5.21 的看门狗救不了**：回合心跳 `abort_stalled_turn()` 排在保存分支**上游**，主循环一停就不再进下一轮；而按键处理在 `event::poll` **下游**。专门用来救卡死回合的机制，恰好被造成卡死的那把锁挡在身后 —— 这是本次排查里最值得记的一条。
+
+修复两端，缺一不可：
+
+- **UI 线程永不阻塞等锁**：新增 `try_session_lock()`，主循环里凡是碰 session 的地方全部改走它，拿不到就提示「上一轮还在运行」（3 秒去重防刷屏）并跳过本帧。保存路径保留 `save_needed = true` 下一帧重试；`/rewind`、`/branch` 这些自带 `Result` 通道的命令改走 `anyhow::bail!`；会话选择器分支改为**入口一次取锁**复用 4 处（拿不到就保留选择器不关）。计划批准 / 确认切执行模式这两处 checkpoint 改为后台 task（这两处必然发生在回合中，原代码等于"批准计划就冻住直到本轮跑完"）。
+- **发终态事件前先放锁**：三处 turn task 统一为「锁内取 Usage 快照 → `drop(sess)` → 发事件」。
+
+回归钉子：`try_session_lock_never_waits_for_a_running_turn`（带超时兜底，改回 `lock().await` 会挂在 timeout 上而不是静默通过）、`try_session_lock_succeeds_when_no_turn_is_running`、`every_turn_task_releases_the_session_lock_before_terminal_events`（静态检查三处 turn task 的顺序）。不变式写进 `crates/tui/CLAUDE.md`，明确「回合 task 内部的 `lock().await` 不要动——那正是持锁者」。
+
+
+### 粘贴的图片在消息区变了样：输入框 `[Image #1]`，发出去变成末尾一行 `[图片 402×288]`
+
+同一个附件在输入框和聊天流里长成两个样子，而且**位置也丢了**——用户在正文中间粘贴的图，发送后跑到了消息末尾。根因不是渲染写错了，而是**位置信息在发送那一刻就被销毁了**：`InputBox` 用不可见的原子标记 `U+FFFC` 记录"这个附件贴在哪儿"，`InputBox::text()`（也就是发给模型的正文）会把它过滤掉，而消息区展示文本当时是用 `text + attachments` 现拼的——那个 `attachments` 只有"有几个附件"和"每个多大"，**没有位置**，于是只能统一追加到末尾。早期把维度写进文案（`[图片 402×288]`）反而掩盖了这点：看起来像是个精心设计的摘要，实际是信息已经丢了。
+
+修法不是把两处文案改成一样，而是**让两处走同一条投影线**：
+
+- 新增 `render::attachment_display_text(input, attachments)`，复用输入框绘制用的 `input_with_attachment_placeholders`，**占位符停在用户粘贴它的那个位置**，文案逐字节相同（`[Image #1]` / `[File: name]`）。
+- 关键约束：**展示文本必须在 `input.take()` 之前算好**（发送路径先 `input.clone()` 留快照）。凡是消息要离开输入框的路径都把 `display` 一起带走——`pending_queue` 从 `Vec<(String, Vec<Attachment>)>` 改成 `Vec<OutgoingMessage>`（正文 + 附件 + 展示文本），`ExecModeConfirmDialog` 增 `pending_display`。**不允许在消费端重算**：那里已经没有输入框了，重算等于把 bug 换条路径再犯一遍。
+- 正文里 `@path` 展开出来的文件没有标记（用户敲的是路径文本，不是粘贴），由同一个函数在末尾单列。这里有个坑：`input_with_attachment_placeholders` 末尾有一段「旧状态兼容」兜底会把无标记附件补进行首，聊天区只投影 `attachments[..marked]` 避开它——否则同一个附件显示两次（这条是新写的测试当场抓到的）。
+- **`/resume` 另一处独立缺口**：`reconstruct_display` 里图片块被 `_ => {}` 整个吞掉，恢复历史会话后聊天流里**完全看不到当初发过图**。现在补 `[Image #n]`（位置从未落盘，只能在末尾）；纯图片、没正文的消息也会正常出现，不会凭空消失。
+
+回归钉子三条：`chat_display_is_byte_identical_to_the_input_box`（两处必须逐字节相同）、`at_referenced_files_without_a_marker_are_listed_at_the_end`、`user_images_survive_into_the_reconstructed_display`。
+
+### 项目规约文件恢复回退链：根目录只有 `CLAUDE.md` 的仓库此前对模型完全失明
+
+v1.5.18 做的是**硬切换**：`ClaudeMdLoader` 只认 `AGENTS.md` / `AGENTS.local.md`，`CLAUDE.md` 系列一律不读，并由测试 `load_dir_files_ignores_claude_md_entirely` 主动锁死。这条设计的前提是「AGENTS.md 已是开放标准，用户会改名」——但现实中大量既有仓库的根目录只有 `CLAUDE.md`，`git clone` 下来之后 wyj-code 会把它们判定为**没有任何项目规约**：模型既不知道构建命令、测试命令，也不知道这个仓库的编码约定，而这些恰恰是作者写下来、指望 AI 助手读的东西。漏读一份规约的代价，远大于多试几次 `is_file()`。
+
+现改为**按槽位独立回退、命中第一个即停**：
+
+- 主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`
+- 个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`
+
+`AGENTS.md` 仍是首选，回退只是兜底。两个设计点值得记下来：
+
+- **槽位独立而非「整个家族二选一」**：这样主文件走 `AGENTS.md`、私有覆盖写在 `CLAUDE.local.md` 时仍然生效，不会被静默丢弃；反过来若按家族整体接管，已有 `CLAUDE.local.md` 个人覆盖的用户会突然失效。两槽位各只取一个文件，因此**永远不存在同一份规约被注入两遍**（既烧 token 又让冲突时的模型行为不可预测）。
+- **判定用「有实际内容」而非单纯 `is_file()`**：0 字节 / 全空白的主文件继续往下探，而不是就此停下并在 `/memory` 面板里显示一个实际不生效的文件。
+
+连带修掉三处会**报出与事实相反的结果**的地方：`doctor` 的 `claude_md_ok` / `claude_md_missing` 把 `AGENTS.md` 硬编码在 i18n 文案里（回退生效时会显示「AGENTS.md 未找到」，而实际正在读 CLAUDE.md）；注入文本的英文 intro 同样硬编码了 `AGENTS.md`；`/memory` 面板此前是另一套 `is_file()` 判断。现 `/memory` 与注入共用同一个 `resolve_slot`，面板显示的就是实际会注入的那个文件。锁死旧行为的测试被替换为回退链系列（主槽回退、命中即停、尾部候选、local 槽回退、空白穿透、面板与注入同源、祖先链逐级回退）。
+
+不变的部分：全局路径仍只有 `~/.wyj-code/`，任何 `~/.claude/` 一律不读——被读的是**项目目录内**的 `CLAUDE.md` 文件，与读取外部工具的全局配置目录是两回事；prompt cache 行为不变（注入文本含路径与文件名，文件增删时自然失效）；`/init` 的生成目标恒为规范名 `AGENTS.md`，但 prompt 已要求把 `CLAUDE.md` 等其它工具的规则文件一并整合进去。
+
 ## [1.5.21] - 2026-10-11
 
 ### 长任务跑到一半停住，之后输入任何内容都没反应

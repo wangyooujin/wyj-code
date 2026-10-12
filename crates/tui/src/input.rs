@@ -1,11 +1,142 @@
 //! 多行输入框状态
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 /// 结构化附件在编辑器里的内部原子标记。
 ///
 /// 它不会直接渲染，也不会进入发送给模型的正文；渲染层会按附件类型把它替换成
 /// [Image #n] / [File: ...]。把标记放进真实编辑序列，才能让占位符跟随粘贴时
 /// 的光标位置，并自然参与左右移动、换行和普通文字插入。
 pub(crate) const ATTACHMENT_MARKER: char = '\u{fffc}';
+
+/// 光标前一个字符是不是反斜杠 —— Claude Code 用的第三种换行写法
+///（行尾打一个 `\` 再按 Enter）。在不支持 Shift+Enter 的终端里，这是唯一
+/// 不依赖键盘协议的换行方式。
+pub fn trailing_backslash_before_cursor(input: &InputBox) -> bool {
+    let row = input.cursor_row;
+    let col = input.cursor_col;
+    let Some(line) = input.lines.get(row) else {
+        return false;
+    };
+    let chars: Vec<char> = line.chars().collect();
+    col.checked_sub(1)
+        .and_then(|i| chars.get(i))
+        .is_some_and(|c| *c == '\\')
+}
+
+/// 纯文本编辑按键的**统一实现**：主输入框与所有弹窗的自由文本输入共用。
+///
+/// 之前这两套按键表是各写各的，弹窗只有 Char / Backspace / Left / Right，
+/// 连 Delete、Home、End、Ctrl+U/A/E/K/W、Alt+←→、Shift+Enter 都没有——同一个
+/// 输入动作在主输入框能按、在弹窗里按不动，是「交互反人类」的主要来源。
+/// 既然 [`InputBox`] 的原语（`move_word_*` / `kill_*_of_line` /
+/// `delete_word_backward` 等）本来就齐全，这里只做**接线**，不重复造原语。
+///
+/// 返回 `true` 表示该按键已被当作编辑操作消费，调用方不要再走自己的分支。
+///
+/// **刻意不含** `Enter` / `Esc` / `Tab` / `↑` `↓` / 粘贴：这几类各有应用层
+/// 语义（提交、取消、翻页、历史、附件），由调用方自己分发。唯一例外是
+/// `Shift+Enter` —— 它在所有输入场景里都只表示"换行"，没有别的含义。
+pub fn apply_edit_key(input: &mut InputBox, key: &KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace => {
+            if alt {
+                input.delete_word_backward();
+            } else {
+                input.backspace();
+            }
+            true
+        }
+        KeyCode::Delete => {
+            input.delete_char_forward();
+            true
+        }
+        KeyCode::Left => {
+            if ctrl || alt {
+                input.move_word_backward();
+            } else {
+                input.move_left();
+            }
+            true
+        }
+        KeyCode::Right => {
+            if ctrl || alt {
+                input.move_word_forward();
+            } else {
+                input.move_right();
+            }
+            true
+        }
+        KeyCode::Home => {
+            input.move_to_start_of_line();
+            true
+        }
+        KeyCode::End => {
+            input.move_to_end_of_line();
+            true
+        }
+        // 换行的三种等价写法。Shift+Enter 只有终端上报 modifyOtherKeys /
+        // kitty 键盘协议时才区分得出来（Ghostty/Kitty/iTerm2/WezTerm 可以，
+        // tmux + 默认设置不行，会原样报成普通 Enter 直接提交），所以必须给出
+        // 到处都能用的兜底 —— 这也是 Claude Code 文档里推荐的三种写法。
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL) =>
+        {
+            input.insert_newline();
+            true
+        }
+        // Ctrl+J 有时被终端报成 Char('j')+CONTROL
+        KeyCode::Char('j' | 'J') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.insert_newline();
+            true
+        }
+        KeyCode::Char(c) if ctrl => match c {
+            // readline 传统别名，和 Claude Code 文档里的键表一致
+            'b' | 'B' => {
+                input.move_left();
+                true
+            }
+            'f' | 'F' => {
+                input.move_right();
+                true
+            }
+            'h' | 'H' => {
+                input.backspace();
+                true
+            }
+            'd' | 'D' => {
+                input.delete_char_forward();
+                true
+            }
+            'a' | 'A' => {
+                input.move_to_start_of_line();
+                true
+            }
+            'e' | 'E' => {
+                input.move_to_end_of_line();
+                true
+            }
+            'k' | 'K' => {
+                input.kill_to_end_of_line();
+                true
+            }
+            'u' | 'U' => {
+                input.kill_to_start_of_line();
+                true
+            }
+            'w' | 'W' => {
+                input.delete_word_backward();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 /// 终端列宽：CJK 全角字符=2，其余=1
 pub fn char_width(c: char) -> usize {
@@ -78,7 +209,11 @@ impl InputBox {
         self.insert_char(ATTACHMENT_MARKER);
     }
 
-    fn attachment_marker_count(&self) -> usize {
+    /// 输入框内当前有多少个附件原子标记。**每个标记对应 `pending_attachments`
+    /// 里的前 N 项**（粘贴路径保证一一对应，`reconcile_attachment_markers` 负责
+    /// 修复旧状态漂移），因此 `attachments[N..]` 就是「没有占位符、只能在消息
+    /// 末尾单列」的那些。
+    pub(crate) fn attachment_marker_count(&self) -> usize {
         self.lines
             .iter()
             .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())

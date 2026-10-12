@@ -29,6 +29,109 @@ pub enum InjectionKind {
     SystemReminder,
 }
 
+/// 注入范围：主 Agent 收全部；前台子 Agent 只收用户补充。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InjectScope {
+    All,
+    UserMessagesOnly,
+}
+
+/// 回合级共享注入队列：Agent 忙碌期间用户补充的内容，在**工具轮边界**被排空。
+///
+/// 为什么是共享队列而不是每个 Agent 一条 mpsc：
+/// **前台子 Agent 是一个不返回的工具调用**——`SubAgentTool::run()` 内部
+/// `await` 整个子 Agent，而子 Agent 自己的循环此前根本没有注入通道
+/// （`run_turn` 不接受任何注入源）。于是用户在子 Agent 跑的过程中补充的内容，
+/// 既进不了子 Agent，也进不了被工具调用堵住的主 Agent，只能等它整个跑完
+/// （实测一个 12 分钟的子 Agent = 12 分钟白等）。
+///
+/// 改成主 Agent 与子 Agent 排空**同一份**队列后，谁先到达工具轮边界谁取走：
+/// 子 Agent 在跑 → 补充内容插进子 Agent 的下一轮；子 Agent 已返回 → 补充内容
+/// 插进主 Agent 的下一轮。两种时机都是"尽快送达"，不再取决于最慢的那个工具。
+///
+/// 内部用 `std::sync::Mutex` + 共享引用（`&self`）而非 `&mut` 接收端：多份
+/// `Arc` 句柄要同时能从主 Agent 侧和工具侧拿到句柄，`&mut` 做不到。
+#[derive(Default)]
+pub struct SteerQueue {
+    items: std::sync::Mutex<std::collections::VecDeque<(Vec<ContentBlock>, InjectionKind)>>,
+}
+
+impl SteerQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 用户提交了一条补充内容（或后台结果 reminder）。
+    pub fn push(&self, blocks: Vec<ContentBlock>, kind: InjectionKind) {
+        if let Ok(mut items) = self.items.lock() {
+            items.push_back((blocks, kind));
+        }
+    }
+
+    /// 排空全部待注入内容；返回空表示当前没有。**主 Agent 用这个**。
+    pub fn drain(&self) -> Vec<(Vec<ContentBlock>, InjectionKind)> {
+        match self.items.lock() {
+            Ok(mut items) => items.drain(..).collect(),
+            // 上一位排空者正持锁时把它抢过来代价不大（最多丢一条用户补充），
+            // 但这里不该发生——同一时刻只有一个 Agent 在跑工具轮。
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 只排空**用户补充**（`UserMessage`），把 `SystemReminder` 原样留在队列里。
+    ///
+    /// **前台子 Agent 必须用这个。** 队列是共享的，`SystemReminder` 装的是后台
+    /// 子 Agent / 后台 shell 的完成通知——那是给**主 Agent** 的结论，混进子
+    /// Agent 的会话既答非所问，又会让主 Agent 永远收不到这条结果（子 Agent
+    /// 返回后队列已空）。用户补充则相反：它就是要打断当前正在跑的东西，
+    /// 谁在跑就进谁的下一轮。
+    pub fn drain_user_messages(&self) -> Vec<(Vec<ContentBlock>, InjectionKind)> {
+        let Ok(mut items) = self.items.lock() else {
+            return Vec::new();
+        };
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        while let Some(item) = items.pop_front() {
+            match item.1 {
+                InjectionKind::UserMessage => taken.push(item),
+                InjectionKind::SystemReminder => kept.push_back(item),
+            }
+        }
+        *items = kept;
+        taken
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items
+            .lock()
+            .map(|items| items.is_empty())
+            .unwrap_or(true)
+    }
+
+    /// 队列里**尚未被任何 Agent 取走的用户补充**条数。
+    ///
+    /// UI 侧的 `pending_queue` 是这份队列的镜像（入队时两边各加一条），
+    /// 正常靠 `AgentEvent::Injected` 出队。但共享队列之后**取走者不再唯一**：
+    /// 前台子 Agent 也会 `drain_user_messages()`，而它拿不到 UI 的事件通道、
+    /// 发不出 `Injected`（见 `SubAgentTool` 里的空 `on_inject`）。于是镜像会
+    /// 停在旧值上，回合结束后的兜底重发会把**已经投递给子 Agent 的消息再发
+    /// 一遍**——同一条要求子 Agent 干一遍、主 Agent 再干一遍。
+    ///
+    /// 有了这个计数，UI 就能把镜像裁剪到队列的真实水位，而不必知道是谁取走的。
+    /// `SystemReminder`（后台结果通知）不计入：它从来不进 `pending_queue`。
+    pub fn pending_user_messages(&self) -> usize {
+        self.items
+            .lock()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|(_, kind)| matches!(kind, InjectionKind::UserMessage))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+}
+
 fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
     let bytes = serde_json::to_vec(tools)
         .map(|value| value.len())
@@ -220,7 +323,7 @@ pub struct Agent {
     /// 证据化自进化存储（可选）。Memory v3 存在时只记录 Episode 并发现需审批
     /// 的 Rule/Skill 候选；无 v3 时保留旧 Memory v2 兼容行为。
     evolution: Option<Arc<EvolutionStore>>,
-    /// AGENTS.md 系记忆文件加载器（可选）
+    /// 项目规约文件（AGENTS.md / CLAUDE.md 等）加载器（可选）
     claude_md: Option<Arc<ClaudeMdLoader>>,
     /// 可选的工具事件回调（Send + Sync，可跨线程）
     tool_cb: Option<Arc<dyn Fn(ToolEvent) + Send + Sync>>,
@@ -810,9 +913,46 @@ impl Agent {
         session: &mut Session,
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
-        inject_rx: Option<
-            &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<ContentBlock>, InjectionKind)>,
-        >,
+        steer: Option<&SteerQueue>,
+        on_inject: impl FnMut(InjectionKind),
+    ) -> Result<()> {
+        self.run_turn_scoped(session, ctx, on_text, steer, InjectScope::All, on_inject)
+            .await
+    }
+
+    /// **前台子 Agent 专用入口**：与 [`Self::run_turn_with_injection`] 相同，但只
+    /// 排空「用户补充」，把队列里的 `SystemReminder` 原样留给主 Agent。
+    ///
+    /// 队列是主 Agent 与前台子 Agent 共享的（见 [`SteerQueue`]），但两者该收的
+    /// 东西不一样：用户补充要"打断当前正在跑的"，谁在跑就进谁的下一轮；后台
+    /// 子 Agent / 后台 shell 的完成通知是**给主 Agent 的结论**，进了子 Agent 的
+    /// 会话既答非所问，又会让主 Agent 永远收不到（子 Agent 返回时队列已被取空）。
+    pub async fn run_turn_with_user_steerage(
+        &self,
+        session: &mut Session,
+        ctx: &dyn ToolContext,
+        on_text: &mut impl FnMut(&str),
+        steer: Option<&SteerQueue>,
+        on_inject: impl FnMut(InjectionKind),
+    ) -> Result<()> {
+        self.run_turn_scoped(
+            session,
+            ctx,
+            on_text,
+            steer,
+            InjectScope::UserMessagesOnly,
+            on_inject,
+        )
+        .await
+    }
+
+    async fn run_turn_scoped(
+        &self,
+        session: &mut Session,
+        ctx: &dyn ToolContext,
+        on_text: &mut impl FnMut(&str),
+        steer: Option<&SteerQueue>,
+        scope: InjectScope,
         on_inject: impl FnMut(InjectionKind),
     ) -> Result<()> {
         let mut evolution_guard = self.evolution.as_ref().map(|evolution| {
@@ -839,7 +979,7 @@ impl Agent {
             }
         });
         let result = self
-            .run_turn_with_injection_inner(session, ctx, on_text, inject_rx, on_inject)
+            .run_turn_with_injection_inner(session, ctx, on_text, steer, scope, on_inject)
             .await;
         if let Some(guard) = evolution_guard.as_mut() {
             let capture = guard
@@ -993,9 +1133,8 @@ impl Agent {
         session: &mut Session,
         ctx: &dyn ToolContext,
         on_text: &mut impl FnMut(&str),
-        mut inject_rx: Option<
-            &mut tokio::sync::mpsc::UnboundedReceiver<(Vec<ContentBlock>, InjectionKind)>,
-        >,
+        steer: Option<&SteerQueue>,
+        scope: InjectScope,
         mut on_inject: impl FnMut(InjectionKind),
     ) -> Result<()> {
         if let Some(state) = &self.lazy_tool_state {
@@ -1003,13 +1142,13 @@ impl Agent {
         }
         // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
         //
-        //   * `system_stable`   —— 主提示 + 跨会话记忆 + AGENTS.md 祖先链。
+        //   * `system_stable`   —— 主提示 + 跨会话记忆 + 项目规约祖先链。
         //     承载 prompt cache，Anthropic 侧 cache_control 断点打在这段末尾。
         //     记忆快照按 10 个用户轮次分桶重算（`memory_snapshot_text`），
-        //     AGENTS.md 每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
-        //     「用户改了 AGENTS.md」时才失效缓存。
+        //     规约文件每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
+        //     「用户改了规约文件」时才失效缓存。
         //
-        //   * `system_volatile` —— 循环内累积的子目录 AGENTS.md reminder。
+        //   * `system_volatile` —— 循环内累积的子目录规约 reminder。
         //     放在断点之后：旧实现把它 `push_str` 到 system 末尾并注释说
         //     「只增不减，前缀仍可缓存」——这是错的，追加在断点**之后**同样会
         //     改变断点处的前缀哈希，导致每命中一个新目录就整段全价重算。
@@ -1928,7 +2067,7 @@ impl Agent {
                     invalid_argument_rounds = 0;
                 }
 
-                // 子目录动态加载：本轮工具触达的目录若有未展示过的 AGENTS.md 系文件，
+                // 子目录动态加载：本轮工具触达的目录若有未展示过的规约文件，
                 // 追加到 system 的 **volatile 段**（而非稳定前缀、也不注入 user
                 // 消息）。这样历史消息保持干净、避免跨轮重复发送，seen_dirs 去重
                 // 保证每条只追加一次；更重要的是它位于 cache breakpoint 之后，
@@ -2003,8 +2142,12 @@ impl Agent {
             // 合并进当前工具结果所在的 user 消息（若刚执行过工具），
             // 或作为一条新的 user 消息续接对话（若本轮本要结束）。
             let mut got_injection = false;
-            if let Some(rx) = inject_rx.as_deref_mut() {
-                while let Ok((blocks, kind)) = rx.try_recv() {
+            if let Some(queue) = steer {
+                let items = match scope {
+                    InjectScope::All => queue.drain(),
+                    InjectScope::UserMessagesOnly => queue.drain_user_messages(),
+                };
+                for (blocks, kind) in items {
                     session.push_user_blocks_merged(blocks);
                     got_injection = true;
                     on_inject(kind);
@@ -3591,20 +3734,19 @@ mod tests {
     #[tokio::test]
     async fn injection_kind_routes_to_callback() {
         let agent = Agent::new(Arc::new(EndTurnProvider));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        tx.send((
+        let queue = SteerQueue::new();
+        queue.push(
             vec![ContentBlock::Text {
                 text: "bg result".into(),
             }],
             InjectionKind::SystemReminder,
-        ))
-        .unwrap();
+        );
 
         let mut kinds = vec![];
         let mut session = Session::new();
         session.push_user("hi");
         agent
-            .run_turn_with_injection(&mut session, &FakeCtx, &mut |_| {}, Some(&mut rx), |k| {
+            .run_turn_with_injection(&mut session, &FakeCtx, &mut |_| {}, Some(&queue), |k| {
                 kinds.push(k)
             })
             .await
@@ -3618,6 +3760,110 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("bg result")))
         });
         assert!(merged);
+    }
+
+    /// 共享注入队列的基本语义：FIFO、`drain` 取走全部、取空后为空。
+    #[test]
+    fn steer_queue_is_fifo_and_drain_takes_everything() {
+        let queue = SteerQueue::new();
+        assert!(queue.is_empty());
+
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "first".into(),
+            }],
+            InjectionKind::UserMessage,
+        );
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "second".into(),
+            }],
+            InjectionKind::SystemReminder,
+        );
+        assert!(!queue.is_empty());
+
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(drained[0].1, InjectionKind::UserMessage));
+        assert!(matches!(drained[1].1, InjectionKind::SystemReminder));
+        assert!(queue.is_empty());
+        assert!(queue.drain().is_empty());
+    }
+
+    /// 前台子 Agent 只取**用户补充**：队列里的 `SystemReminder`（后台子 Agent /
+    /// 后台 shell 的完成通知）是给主 Agent 的结论，进了子 Agent 的会话既答非所问，
+    /// 又会让主 Agent 永远收不到——子 Agent 返回时队列已被取空。
+    ///
+    /// 这条钉子守住「共享队列」最容易踩的坑：把 `drain()` 直接给子 Agent 用。
+    #[tokio::test]
+    async fn subagent_drain_leaves_system_reminders_for_the_main_agent() {
+        let queue = SteerQueue::new();
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "user steer".into(),
+            }],
+            InjectionKind::UserMessage,
+        );
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "bg agent finished".into(),
+            }],
+            InjectionKind::SystemReminder,
+        );
+
+        // 子 Agent 侧：只排空用户补充
+        let taken = queue.drain_user_messages();
+        assert_eq!(taken.len(), 1);
+        assert!(matches!(taken[0].1, InjectionKind::UserMessage));
+
+        // 主 Agent 侧：后台结果仍原封不动地等着
+        let rest = queue.drain();
+        assert_eq!(rest.len(), 1);
+        assert!(matches!(rest[0].1, InjectionKind::SystemReminder));
+        assert!(queue.is_empty());
+    }
+
+    /// 「谁先到工具轮边界谁取走」——主 Agent 与前台子 Agent 排空**同一份**队列，
+    /// 因此一条补充内容只会被投递一次，不会同时进两个会话（也不会凭空丢失）。
+    ///
+    /// 这条是前台子 Agent 接入注入通道后的核心不变式：如果哪天改成两份拷贝或
+    /// 各自独立的队列，用户补充的内容要么被投递两次、要么子 Agent 那份永远没人取。
+    #[tokio::test]
+    async fn shared_steer_queue_delivers_to_exactly_one_agent() {
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let queue = SteerQueue::new();
+        queue.push(
+            vec![ContentBlock::Text {
+                text: "steer me".into(),
+            }],
+            InjectionKind::UserMessage,
+        );
+
+        let mut first = Session::new();
+        first.push_user("hi");
+        agent
+            .run_turn_with_injection(&mut first, &FakeCtx, &mut |_| {}, Some(&queue), |_| {})
+            .await
+            .unwrap();
+
+        let mut second = Session::new();
+        second.push_user("hi");
+        agent
+            .run_turn_with_injection(&mut second, &FakeCtx, &mut |_| {}, Some(&queue), |_| {})
+            .await
+            .unwrap();
+
+        let landed = |session: &Session| {
+            session.messages.iter().any(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("steer me")))
+            })
+        };
+        assert!(
+            landed(&first) ^ landed(&second),
+            "补充内容必须且只能进入其中一个会话"
+        );
     }
 
     /// 首次流中途断开、第二次成功的 provider（流中断重试测试用）
@@ -4617,7 +4863,7 @@ fn default_system_prompt() -> String {
     crate::prompts::MAIN.to_string()
 }
 
-/// 从工具调用输入里推导其触达的目录，供 AGENTS.md 子目录动态加载判断。
+/// 从工具调用输入里推导其触达的目录，供项目规约子目录动态加载判断。
 /// Read/Edit/Write 用 file_path（取父目录）；Glob/Grep 用 path（文件取父目录，目录取自身）。
 fn touched_dir(
     tool_name: &str,

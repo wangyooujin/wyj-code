@@ -93,6 +93,9 @@ agent:
   turn_task_lost: "回合任务已异常终止（内部错误或被强制中断），本轮已中止。可以直接继续输入指令。"
   turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
 
+session:
+  busy_notice: "上一轮还在运行，请等它结束后再执行这个操作。"
+
 claude_md:
   source:
     global: "全局"
@@ -174,7 +177,7 @@ help:
     - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
-    - `/memory` — 打开 AGENTS.md 记忆面板
+    - `/memory` — 打开项目记忆面板（AGENTS.md / CLAUDE.md 等规约文件）
     - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
     - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
     - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
@@ -327,13 +330,13 @@ agents:
     hint_detail: "↑↓ 选择   PageUp/PageDown 滚动详情   Enter/Space 收起   Esc 关闭"
 
 memory:
-  desc: "打开 AGENTS.md 记忆面板"
+  desc: "打开项目记忆面板"
   headless_unsupported: "[headless 模式不支持 /memory 面板，请直接编辑 AGENTS.md 或 ~/.wyj-code/memory/ 下的文件]"
   continuation:
     no_open_tasks: "当前项目没有未完成任务，请说明要开始的新任务。"
   clear_all_help: "/memory clear-all — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行。CLI 用 `wyj-code memory clear-all --yes`。"
   dialog:
-    title: " ◆ AGENTS.md 记忆 "
+    title: " ◆ 项目记忆 "
     not_found: "（未创建，回车可新建）"
     auto_memory_label: "auto-memory 自动记忆提取"
     auto_memory_on: "已启用"
@@ -611,7 +614,7 @@ plugins:
     local_no_upgrade: "本地开发插件没有版本信息，无法升级"
 
 doctor:
-  desc: "诊断运行环境（API Key / 配置 / AGENTS.md / 记忆）"
+  desc: "诊断运行环境（API Key / 配置 / 项目规约文件 / 记忆）"
   header: "wyj-code v{version} 环境诊断\n"
   api_key_missing: "  ✗  API Key      未配置（请设置 WYJ_CODE_API_KEY 或 config.toml）"
   config_file_ok: "  ✓  配置文件    {path}"
@@ -619,8 +622,8 @@ doctor:
   config_dir_err: "  ✗  配置目录    {err}"
   provider: "  ✓  供应商      {provider}"
   model: "  ✓  模型        {model}"
-  claude_md_ok: "  ✓  AGENTS.md   {paths}"
-  claude_md_missing: "  ✗  AGENTS.md   未找到（运行 /init 可生成）"
+  claude_md_ok: "  ✓  项目规约   {paths}"
+  claude_md_missing: "  ✗  项目规约   未找到（运行 /init 可生成 AGENTS.md）"
   memory_dir_with_count: "  ✓  记忆目录    {path} ({count} 条)"
   memory_dir_empty: "  ✗  记忆目录    {path} (暂无记忆)"
   mcp_configured: "  ✓  MCP 服务    {count} 个已配置"
@@ -698,7 +701,8 @@ init:
        判断技术栈、构建命令、测试命令、代码规范。
     2. 若 {cwd}/AGENTS.md 已存在，先完整读取，在其基础上合并、补充、改进，
        不要整体覆盖或丢弃已有内容。
-    3. 若项目中存在 .cursorrules、.github/copilot-instructions.md 等其它 AI 助手规则文件，
+    3. 若项目中存在 CLAUDE.md、GEMINI.md、AGENT.md、.cursorrules、
+       .github/copilot-instructions.md 等其它 AI 助手规则文件，
        阅读并将其中仍然适用的部分整合进 AGENTS.md。
     4. 最终把结果写入 {cwd}/AGENTS.md，内容至少包含：项目概览、构建/测试/lint 命令、
        代码架构说明、开发约定。保持简洁，避免臆测不确定的信息。
@@ -758,6 +762,7 @@ dialog:
   ask_question_confirm_submit: "确认提交"
   hint_single_select: "  ↑↓ 选择  Enter 下一题  ←/Shift+Tab 上一题  Esc 取消"
   hint_multi_select: "  ↑↓ 选择  Space 勾选  Enter 下一题  ←/Shift+Tab 上一题  Esc 取消"
+  hint_freetext: "Enter 提交 · Shift+Enter / Ctrl+J / 行尾 \\ 换行 · ↑↓ 翻上一条 · {chars} 字"
   hint_freetext_submit_cancel: "  输入自定义答案  Enter 提交  Esc 返回选项"
   hint_overview: "  ↑↓ 选择  Enter 编辑/提交  Esc 取消"
   session_picker_title: " 会话列表 ({count}) "
@@ -864,7 +869,7 @@ welcome:
   tip_1: '/clear 清空当前对话历史，开始一个新任务'
   tip_2: '在消息里输入 @ 可以快速引用项目里的文件'
   tip_3: '复杂任务可以让 Agent 派生 SubAgent 并行探索，互不干扰主线程'
-  tip_4: '/memory 查看和管理跨会话记忆（AGENTS.md）'
+  tip_4: '/memory 查看和管理项目规约与跨会话记忆（AGENTS.md / CLAUDE.md 等）'
   hint:
     help: '/help 帮助'
     compact: '/compact 压缩上下文'

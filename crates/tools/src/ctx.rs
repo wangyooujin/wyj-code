@@ -74,6 +74,14 @@ pub struct ToolCtx {
     /// 「始终允许」持久化文件路径（`~/.wyj-code/projects/<project_key>/allowed_tools.json`）；
     /// None 时不持久化（如 headless 未启用）。
     pub allowed_tools_path: Option<PathBuf>,
+    /// 回合级共享注入队列（用户在 Agent 忙碌期间补充的内容）。
+    ///
+    /// **存在的理由是前台子 Agent**：`SubAgentTool::run()` 会 `await` 整个子
+    /// Agent，而子 Agent 此前没有注入通道，用户在它跑的过程中补充的要求既进不了
+    /// 子 Agent、也进不了被工具调用堵住的主 Agent，只能等它整个跑完。挂上这份
+    /// 队列后，子 Agent 与主 Agent 排空同一份，谁先到工具轮边界谁取走。
+    /// headless / cron / 后台子 Agent 场景为 None。
+    pub steer_queue: Option<Arc<wyj_core::SteerQueue>>,
 }
 
 impl ToolCtx {
@@ -86,6 +94,7 @@ impl ToolCtx {
             ui_ask_tx: None,
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
+            steer_queue: None,
         }
     }
 
@@ -102,6 +111,9 @@ impl ToolCtx {
             ui_ask_tx: None,
             always_allowed: RwLock::new(self.always_allowed.read().unwrap().clone()),
             allowed_tools_path: self.allowed_tools_path.clone(),
+            // ACP/daemon 的会话各自独立：注入队列不跨会话共享（daemon 本身也没有
+            // 「回合进行中补话」这个交互面）
+            steer_queue: None,
         }
     }
 
@@ -174,6 +186,10 @@ impl ToolCtx {
 impl ToolContext for ToolCtx {
     fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    fn steer_queue(&self) -> Option<&Arc<wyj_core::SteerQueue>> {
+        self.steer_queue.as_ref()
     }
 
     fn is_allowed(&self, name: &str, input: &Value) -> bool {
