@@ -75,6 +75,11 @@ thinking:
   done: "  ⎿ Thought for {secs}s ({lines} lines)"
   done_no_elapsed: "  ⎿ Thought ({lines} lines)"
   expand_hint: "  ·  Ctrl+O to expand"
+  live_omitted: "⋮ {count} more lines above"
+
+# Live output block of a running tool (tail lines only)
+live_output:
+  omitted: "⋮ {count} more lines of output above"
 
 diff:
   more_lines: "    … {n} more lines (Ctrl+O to expand)"
@@ -208,7 +213,7 @@ help:
     - `Esc` — Interrupt current task
     - `Shift+Tab` — Cycle mode Normal → Plan → Bypass
     - `Ctrl+T` — Focus the task list; expand/collapse it when already focused
-    - `Ctrl+O` — Expand/collapse thinking and tool result bodies
+    - `Ctrl+O` — Force-expand/collapse all thinking and tool result bodies (auto by default: shown while running, collapsed when done)
     - `Ctrl+L` — Clear screen (keeps conversation history)
     - `Ctrl+A` / `Ctrl+E` — Jump to start / end of line
     - `Ctrl+K` — Delete from cursor to end of line

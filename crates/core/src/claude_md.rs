@@ -449,7 +449,10 @@ mod tests {
 
         // 两个都在时按注入的优先级走（AGENTS.md 首选），不能各写各的。
         std::fs::write(dir.join("AGENTS.md"), "agents rules").unwrap();
-        assert_eq!(existing_memory_file_name(&dir).as_deref(), Some("AGENTS.md"));
+        assert_eq!(
+            existing_memory_file_name(&dir).as_deref(),
+            Some("AGENTS.md")
+        );
     }
 
     /// 一个候选都不存在时返回 None，调用方据此回退到规范名 AGENTS.md。

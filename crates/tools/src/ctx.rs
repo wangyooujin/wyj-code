@@ -35,6 +35,30 @@ pub fn is_project_approve_once_tool(name: &str) -> bool {
     PROJECT_APPROVE_ONCE_TOOLS.contains(&name)
 }
 
+/// 全局实时输出 sink：TUI 进程启动时安装一次，之后所有 [`ToolCtx::new`] 构造的
+/// ctx 自动带上它。
+///
+/// 做成进程级而不是逐个 ctx 传参，是因为一次 TUI 会话里 ToolCtx 会在八个
+/// 回合构造点被重建（正常回合、追问、计划批准、压缩续跑……），逐处透传只会把
+/// 同一个 sender 抄八遍。与 `bash_session::BashSessionManager::global()` 同理：
+/// 一个进程同时只有一个交互式前台。headless / 子 Agent 走 `fork_for_surface`
+/// 会显式清掉它。
+static GLOBAL_TOOL_OUTPUT_TX: std::sync::OnceLock<mpsc::Sender<wyj_core::tool::ToolOutputChunk>> =
+    std::sync::OnceLock::new();
+
+/// 安装全局实时输出 sink（仅 TUI 前台调用，且一个进程只应调一次）。
+///
+/// 重复安装返回 false 且不覆盖：主循环若意外重入，新旧两个 receiver 会同时
+/// 抢同一批快照，表现为输出随机停在半途。
+pub fn install_global_tool_output_sink(tx: mpsc::Sender<wyj_core::tool::ToolOutputChunk>) -> bool {
+    GLOBAL_TOOL_OUTPUT_TX.set(tx).is_ok()
+}
+
+/// 新建 ctx 时取用全局 sink（未安装则为 None）。
+pub(crate) fn global_tool_output_sink() -> Option<mpsc::Sender<wyj_core::tool::ToolOutputChunk>> {
+    GLOBAL_TOOL_OUTPUT_TX.get().cloned()
+}
+
 /// 工具向 TUI 发送的交互请求
 pub enum UiAskRequest {
     /// AskQuestion 工具的多题访谈请求
@@ -68,6 +92,10 @@ pub struct ToolCtx {
     pub permission_policy: Arc<RwLock<PermissionPolicy>>,
     /// TUI 模式下注入此 sender，工具通过它向 TUI 发起交互
     pub ui_ask_tx: Option<mpsc::Sender<UiAskRequest>>,
+    /// 工具执行途中的实时输出通道，仅 TUI 前台挂载（headless / ACP / 子 Agent
+    /// 为 None，见 `fork_for_surface`）。前台 Bash 据此把 stdout/stderr 尾部快照
+    /// 推进聊天区；收不到就退化成「跑完一次性返回」，不改变结果内容。
+    pub tool_output_tx: Option<mpsc::Sender<wyj_core::tool::ToolOutputChunk>>,
     /// 已获项目级授权的工具名集合，启动时从项目级文件载入；AllowAlways，或
     /// computer-use 首次 AllowOnce 时就地插入并写盘。用 RwLock 支持 &self 修改。
     pub always_allowed: RwLock<HashSet<String>>,
@@ -92,6 +120,7 @@ impl ToolCtx {
             execution_surface: Arc::new(RwLock::new(ExecutionSurface::HeadlessRepl)),
             permission_policy: Arc::new(RwLock::new(PermissionPolicy::default())),
             ui_ask_tx: None,
+            tool_output_tx: global_tool_output_sink(),
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
             steer_queue: None,
@@ -109,10 +138,12 @@ impl ToolCtx {
                 self.permission_policy.read().unwrap().clone(),
             )),
             ui_ask_tx: None,
+            tool_output_tx: None,
             always_allowed: RwLock::new(self.always_allowed.read().unwrap().clone()),
             allowed_tools_path: self.allowed_tools_path.clone(),
             // ACP/daemon 的会话各自独立：注入队列不跨会话共享（daemon 本身也没有
-            // 「回合进行中补话」这个交互面）
+            // 「回合进行中补话」这个交互面）。实时输出同理——非 TUI 表面没有
+            // 接收端，挂上只会让工具白白多跑一条推送路径。
             steer_queue: None,
         }
     }
@@ -218,6 +249,10 @@ impl ToolContext for ToolCtx {
 
     fn supports_interactive_confirmation(&self) -> bool {
         self.ui_ask_tx.is_some()
+    }
+
+    fn tool_output(&self) -> Option<&mpsc::Sender<wyj_core::tool::ToolOutputChunk>> {
+        self.tool_output_tx.as_ref()
     }
 
     async fn ask_questions(&self, questions: &[AskQuestionSpec]) -> Option<Vec<QuestionAnswer>> {

@@ -4,6 +4,51 @@
 
 ## [Unreleased]
 
+## [1.5.24] - 2026-10-13
+
+### 长命令跑到一半，界面什么都不给：前台 Bash 的输出改为实时推进
+
+`Bash(cargo build)`、`Bash(pytest)`、`Bash(npm run dev)` 这类命令此前只有两种状态：刚点下去的一瞬，和跑完之后的一大坨。中间那几分钟里界面只有一个转圈——用户既看不出命令在干什么，也判断不出它是死了还是在慢慢跑，而「命令还在动」这件事本来是唯一能让人安心的信号。更难受的是**中途没有任何回头路**：输出没到手，就不知道该不该中断。
+
+改动集中在 `BashTool`：它改为**自己抽管道**，并在抽字节的同一个循环里按 100ms 节流把 stdout / stderr 的**累计尾部快照**推给 UI，TUI 收到后按 `sequence_no` 挂到对应的 `⏺` 行下方实时渲染，跑完即收起、由折叠态的 `⎿` 结果行接管正文。
+
+几个刻意如此、且各自都有钉子的取舍：
+
+- **推「快照」而不是「增量」**。每帧自带完整累计输出，所以通道满时 `try_send` 直接丢帧也是无损的——下一帧覆盖上一帧。反过来若传增量，丢一帧就是永久丢一段数据。工具侧一律**不 await** 这个通道：`send().await` 在工具 future 被 drop（ESC 中断）时会连带把工具挂死。
+- **节流比较「累计字节数」而不是「快照长度」**。输出超过 8KB 保尾上限后快照长度会钉死在上限不变，只比长度会让 `cargo build` 这种持续刷新的命令视图**冻结在半途中**——这是最容易写错、也最不容易被测出来的一处。
+- **抽字节与推快照合流在这一个循环里**，而不是另起一个 ticker task。回合被 ESC 中断时 `h.abort()` 掉的是回合 future，另起的 ticker 会变成孤儿、永远按周期往 TUI 推陈旧数据。合流后生命周期锚在管道 EOF 上：命令结束，泵自然结束。
+- **尾部截断按 UTF-8 字符边界回退**。直接 `String::from_utf8_lossy(&bytes[len - max..])` 会在多字节字符中间切开，产出一串 U+FFFD 替换符（中文 / emoji 高发）。
+- **渲染层只画尾部 30 行**（`LIVE_TAIL_LINES`），用 `str::rsplit` 反向惰性迭代取尾——取 N 行只解码 N 行，代价与正文长度无关。这是「折叠态一律不得触碰 content」那条性能不变式的第二处显式豁免，上界由 8KB 快照 + 30 行渲染双重钉死。
+- **通道默认 `None`**（`ToolContext::tool_output()`）。headless / 子 Agent / ACP 没有接收端，工具据此静默降级为「跑完一次性返回」，回给模型的正文与本特性引入前逐字节一致——流式只影响**给人看的那块视图**。
+
+UI 侧两道闸门缺一不可：① `tool_info` 里必须已登记该 `tool_use_id`；② `is_thinking` 必须为真。ESC 中断会 abort 掉回合 future，但 Bash 的 pump 会一直读到管道 EOF，中断之后仍可能推来最后几帧——不过闸就渲染出一块永远转圈的幽灵输出。另外实时刷新**不**点亮「未读」标记，否则用户上滚翻历史时每帧被拽一次。
+
+顺带修两处同源缺陷：手写管道后若继续 `wait()` 不抽，子进程写满 64KB pipe buffer 会与这里互等死锁；**超时后只放弃等待是不行的**——`bash -c` 及其子进程会继续在后台跑完，而模型和用户都以为这条命令已经结束了。现超时走 TERM → 2s → KILL 的整组三段式（与 `bash_session::kill` 一致，`signal_group` 因此提为 `pub(crate)`），并有 `bash_times_out_and_kills_the_process_group` 用「子进程 sleep 后写文件、kill 生效则文件永不出现」验证。
+
+### 流式 thinking 从「一个字符都不碰」改成「只看尾部 30 行」
+
+上一条不变式被过度执行了：流式 thinking 期间**完全不碰 `content`**——旧实现每帧把整个 `thinking_buf` 重新折行一遍、再只取前 3 行扔掉，长 thinking 下是纯浪费；但改成「一个字符都不碰」之后，用户就**彻底看不见模型在想什么**了，而 thinking 恰恰是最需要实时可见的一段。现在两头兼顾：`rsplit` 取尾部 `LIVE_TAIL_LINES` 行，两端都不扫全文。钉子 `live_thinking_block_shows_tail_only_and_stays_cheap`（把 `rsplit` 改回 `lines()` 或改成全文折行再截断，行数断言立刻变红）。
+
+### `Ctrl+O` 的两种态不是「全折叠 ↔ 全展开」，而是「自动 ↔ 全展开」
+
+`AppState.output_expanded == false`（默认）现在是**自动模式**：正在流式输出的 thinking 与正在执行的工具实时展开，跑完即收起，历史保持干净；`true` 才是把全部 thinking 与工具结果一次性摊开。判定式 `output_expanded || is_live`。按第二次 Ctrl+O 回到自动模式后，新执行的步骤会自动展开，而不是像旧语义那样永远保持折叠。`/help` 文案同步改成「强制展开/收起全部…」。
+
+### Ghostty 下 Ctrl+C 退出后，提示符后凭空多出 `9;5;3u`
+
+现场：按两次 Ctrl+C 退出 TUI，回到 shell 后提示符后面多出七个字符 `9;5;3u`（用 Ctrl+D 退出则是 `100;5;3u`）。
+
+根因在 Kitty 键盘协议。Ghostty 路径压了 `DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES`，按协议 `ctrl+c` 不再以 `0x03` 送达，而是 `CSI 99;5;1u`（press）+ `CSI 99;5;3u`（**release**，事件类型字段由 `REPORT_EVENT_TYPES` 追加）。而 **release 的产生时刻 = 用户松手时刻**：TUI 收到 press 就立刻置 `should_quit` 退出，松手才生成的那串字节此刻还躺在内核 tty 队列里没人读。`PopKeyboardEnhancementFlags`（`CSI < u`）只改写**之后**的编码，杀不掉已发出的字节，于是它们被 shell 读到——zsh 的 ZLE 不认识带参数的 `CSI u`，吃掉 `ESC [` 后把参数当普通字符插进命令行。协议只把 Enter/Tab/Backspace 排除在 release 之外（好让崩掉的程序之后还能敲 `reset`），**Ctrl+C 不在豁免名单里**。
+
+三处收口缺一不可：
+
+- `await_quit_key_release` 在置 `should_quit` 前按 20ms 切片等回配对的 release（上限 300ms；非 Ghostty 路径无 release 事件，直接跳过）。
+- `terminal_input::drain_pending_input` 在 pop 之后、关 raw mode 之前，以 `O_NONBLOCK` 读 `/dev/tty` 到 `EAGAIN`，按 40ms 切片轮询、上限 200ms（覆盖粘贴尾巴等没有配对按键的残留）。**顺序不可换**：pop 之前排空没用——终端还在增强模式、随时可能再写新的 release 进来；关 raw mode 之后排空有害——canonical 模式的 `ISIG` 会让队列里残留的 `0x03` 给本进程发 SIGINT。
+- `panic_guard::restore_terminal_best_effort` 必须**无条件**发 `PopKeyboardEnhancementFlags`。panic 路径拿不到 `TerminalWheelRouting`，漏 pop 会让 shell **永久停在增强模式**：Ctrl+C 不再有 SIGINT，之后每次按键都变 `CSI u`。同时只在 TUI 所属线程上排空队列——worker panic 同样触发 hook，从 worker 读 `/dev/tty` 会吞掉用户正在 TUI 里敲的键。
+
+残留边角：按住 Ctrl+C 超过 300ms 才松手时，release 仍会漏给 shell，属可接受的极小概率。
+
+**1184 个 workspace 测试** + clippy `-D warnings` 全绿。
+
 ## [1.5.22] - 2026-10-12
 
 ### 修 review 抓出的 5 个缺陷：其中两个是「修卡死」这个改动自己引入的新卡死
