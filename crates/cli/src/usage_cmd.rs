@@ -26,6 +26,13 @@ pub struct UsageTotals {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// 子 Agent 扇出累计输入 token。与 `input_tokens` 不重叠（子 Agent 跑在
+    /// 自己的 `Session` 上），单列出来才能看出"总消耗里有多少是扇出去的"。
+    pub sub_input_tokens: u64,
+    /// 子 Agent 扇出累计输出 token。
+    pub sub_output_tokens: u64,
+    /// 子 Agent 扇出累计缓存命中 token。
+    pub sub_cache_read_tokens: u64,
     /// 只累计 `api_calls > 0` 的会话的 input / output。
     ///
     /// **为什么需要单独一份**：`input_per_api_call` 这类「每次调用平均 X」必须
@@ -71,6 +78,9 @@ impl UsageTotals {
         self.output_tokens += f.output_tokens as u64;
         self.cache_read_tokens += f.cache_read_tokens as u64;
         self.cache_write_tokens += f.cache_write_tokens as u64;
+        self.sub_input_tokens += f.sub_input_tokens as u64;
+        self.sub_output_tokens += f.sub_output_tokens as u64;
+        self.sub_cache_read_tokens += f.sub_cache_read_tokens as u64;
         // 「每次调用平均」类比率的分子只收有 calls 的会话，保证与分母同源。
         // 详见 `attributed_input_tokens` 的注释——这里错一次就是 5 倍偏差。
         if f.api_calls > 0 {
@@ -237,6 +247,22 @@ fn print_human(report: &UsageReport) {
             ]
         )
     );
+    // 子 Agent 口径单列：不并入上面那行（那行是主 Agent 的四个计数，
+    // 与子 Agent 的不重叠），但也不该藏起来——扇出开销占总消耗的比例是
+    // 判断"要不要收敛子 Agent 策略"的关键输入。
+    if t.sub_input_tokens > 0 || t.sub_output_tokens > 0 || t.sub_cache_read_tokens > 0 {
+        println!(
+            "{}",
+            tr_fmt(
+                "usage.subagent_tokens",
+                &[
+                    ("sub_input", &t.sub_input_tokens.to_string()),
+                    ("sub_output", &t.sub_output_tokens.to_string()),
+                    ("sub_cache_read", &t.sub_cache_read_tokens.to_string()),
+                ]
+            )
+        );
+    }
     println!(
         "{}",
         tr_fmt(

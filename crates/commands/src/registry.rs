@@ -10,6 +10,16 @@ use std::sync::Arc;
 pub enum CommandResult {
     /// 输出文本给用户
     Output(String),
+    /// 输出**自带排版**的文本：换行与列对齐必须原样保留。
+    ///
+    /// 为什么不复用 [`Output`]：那条路径在 TUI 里会走 `render_markdown`，
+    /// 而 markdown 把「连续非空行」当一个段落重新折行（软换行语义）。任何
+    /// 依赖列对齐的输出——`/cost` 的表格、`/usage` 的汇总——都会被揉成一团
+    /// 糊（实测 50 行的成本表塌成 6 行）。代码块围栏也不行：那会给整块加上
+    /// `╭─╮` 边框并再缩进 4 列。
+    ///
+    /// 消费方约定：逐行原样渲染，只在单行超出可用宽度时截断，**不折行**。
+    OutputPlain(String),
     /// 清空对话历史
     ClearHistory,
     /// 打开分组（Profile）管理面板（/model 无参触发）
@@ -109,6 +119,12 @@ pub enum SubAgentControlAction {
 pub struct CommandContext {
     pub cwd: std::path::PathBuf,
     pub model: String,
+    /// 聊天区**可用列数**，供 `/cost` 这类要排版的命令按终端宽度自适应。
+    ///
+    /// 0 = 未知（无 TTY、测试构造），命令走 `cost_view::DEFAULT_WIDTH`。
+    /// 这里传的是内容宽度而非终端宽度——与 `tui::render::chat_content_width`
+    /// 同源，否则表格算出的列数会比实际可渲染的宽，按终端宽排版就会被换行。
+    pub terminal_width: usize,
     pub input_tokens: u32,
     pub output_tokens: u32,
     /// 命中 prompt 缓存的输入 token（0.1x 计费，不含在 input_tokens 内）
@@ -135,8 +151,18 @@ pub struct CommandContext {
     pub context_edit: (u32, u32),
     pub home_dir: std::path::PathBuf,
     /// 子 Agent 累计 token 用量（与主会话分开统计，/cost 单列；headless 传 0）
+    ///
+    /// 数据源是 `Session::sub_usage()`——由 `SubAgentTool` 在子 Agent 结束时
+    /// 把**自己那层 Session** 的计数加进共享累加器、主 Agent 每批工具执行后
+    /// 抽干入账。不用 TUI 的 `SubAgentEvent::Usage` 累加是因为那条路只带
+    /// input/output，**不含 cache_read**，而子 Agent 的开销大头恰恰是缓存
+    /// 命中；且它只活在内存里，`/resume` 后归零。
     pub sub_input_tokens: u32,
     pub sub_output_tokens: u32,
+    /// 子 Agent 命中的缓存 token（0.1x 计费）。
+    pub sub_cache_read_tokens: u32,
+    /// 子 Agent 写入的缓存 token（1.25x 计费）。
+    pub sub_cache_write_tokens: u32,
     /// 合并全局+项目配置、过滤禁用条目后实际会连接的 MCP server 数量
     /// （由调用方用 `wyj_store::mcp_install::effective_mcp_servers` 算好传入，
     /// `crates/commands` 本身不依赖 `wyj-store` 以保持 crate 边界干净）。

@@ -1482,7 +1482,12 @@ async fn main() -> Result<()> {
     }
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
-    let tool_ctx = ToolCtx::new(&cwd);
+    let mut tool_ctx = ToolCtx::new(&cwd);
+    // 子 Agent 用量回灌通道。TUI 侧在每个回合的 ToolCtx 上单独挂（见
+    // `crates/tui/src/app.rs`）；headless / `-p` / ACP 只有这一个 ctx，
+    // 不挂的话子 Agent 的 token 在这些模式下仍然全部丢失。
+    let sub_usage = Arc::new(wyj_core::SubUsageTotals::default());
+    tool_ctx.sub_usage = Some(Arc::clone(&sub_usage));
     tool_ctx.set_execution_surface(if cli.prompt.is_some() {
         ExecutionSurface::SinglePrompt
     } else if is_protocol_mode {
@@ -2265,7 +2270,7 @@ async fn main() -> Result<()> {
             let context_tokens = wyj_core::estimate_tokens(&session.messages);
             eprintln!();
             eprintln!(
-                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"tool_schema_tokens\":{},\"tool_schema_tokens_saved\":{},\"duration_secs\":{:.1}}}",
+                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"tool_schema_tokens\":{},\"tool_schema_tokens_total\":{},\"tool_schema_tokens_saved\":{},\"sub_input_tokens\":{},\"sub_output_tokens\":{},\"sub_cache_read_tokens\":{},\"sub_cache_write_tokens\":{},\"duration_secs\":{:.1}}}",
                 session.total_input_tokens,
                 session.total_output_tokens,
                 session.total_cache_read_tokens,
@@ -2275,8 +2280,15 @@ async fn main() -> Result<()> {
                 context_tokens,
                 context_window,
                 session.api_calls,
+                // 稳态口径（最近一次请求实际发送量），与 /context 面板同源。
+                session.tool_schema_tokens_last,
+                // 累加口径（本会话为工具定义总共付出的量）。
                 session.tool_schema_tokens,
                 session.tool_schema_tokens_saved,
+                session.sub_input_tokens,
+                session.sub_output_tokens,
+                session.sub_cache_read_tokens,
+                session.sub_cache_write_tokens,
                 started.elapsed().as_secs_f64()
             );
         }
@@ -2949,8 +2961,11 @@ async fn emit_plugin_turn_event(
         "cwd": cwd,
         "input_tokens": session.total_input_tokens,
         "output_tokens": session.total_output_tokens,
-        "tool_schema_tokens": session.tool_schema_tokens,
+        "tool_schema_tokens": session.tool_schema_tokens_last,
+        "tool_schema_tokens_total": session.tool_schema_tokens,
         "tool_schema_tokens_saved": session.tool_schema_tokens_saved,
+        "sub_input_tokens": session.sub_input_tokens,
+        "sub_output_tokens": session.sub_output_tokens,
         "error": error,
     });
     for result in runtime.emit_channel_event(event, &payload).await {
@@ -3143,7 +3158,11 @@ async fn repl(
             .collect();
         let cmd_ctx = CommandContext {
             cwd: cwd.clone(),
-            model: "".to_string(),
+            // 此前硬编码空串，导致 headless / `-p` 下 `/cost` 永远走"无单价"
+            // 分支——明明 Profile 里就有模型名和单价，却只能显示 token 数，
+            // 并附一条"暂无单价表条目"的误导性提示。
+            model: cfg.active_profile().model.clone(),
+            terminal_width: wyj_tui::detect_terminal_width(),
             input_tokens: session.total_input_tokens,
             output_tokens: session.total_output_tokens,
             cache_read_tokens: session.total_cache_read_tokens,
@@ -3164,8 +3183,10 @@ async fn repl(
                 session.context_edit_freed_tokens,
             ),
             home_dir,
-            sub_input_tokens: 0,
-            sub_output_tokens: 0,
+            sub_input_tokens: session.sub_input_tokens,
+            sub_output_tokens: session.sub_output_tokens,
+            sub_cache_read_tokens: session.sub_cache_read_tokens,
+            sub_cache_write_tokens: session.sub_cache_write_tokens,
             effective_mcp_count,
             plugin_agent_paths: plugin_agent_paths.clone(),
             hooks_enabled,
@@ -3174,6 +3195,10 @@ async fn repl(
         if let Some(result) = cmd_registry.dispatch(trimmed, &cmd_ctx).await {
             match result {
                 Ok(CommandResult::Output(out)) => {
+                    println!("{out}");
+                }
+                Ok(CommandResult::OutputPlain(out)) => {
+                    // 原样打印即可：headless 没有 markdown 渲染，排版天然保留。
                     println!("{out}");
                 }
                 Ok(CommandResult::ClearHistory) => {

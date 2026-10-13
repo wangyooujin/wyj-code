@@ -97,7 +97,7 @@ impl Command for ContextCmd {
     }
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         let window = ctx.context_window;
-        let mut text = format!("{}\n\n", tr("context.header"));
+        let mut text = format!("{}{}\n\n", crate::cost_view::INDENT, tr("context.header"));
 
         let Some(audit) = ctx.context_audit.filter(|_| window > 0) else {
             text.push_str(&tr("context.empty"));
@@ -115,17 +115,29 @@ impl Command for ContextCmd {
         let buffer = wyj_core::compact::compact_trigger_buffer(window, audit.output_reserve);
         let threshold = window.saturating_sub(buffer);
 
-        let rows: [(String, u32); 6] = [
+        // 列宽按**显示宽度**算，不能用 `{label:<18}`——那是按字符个数补的，
+        // 中文标签每字占 2 列，补出来的列自然歪（"System prompt" 13 字符补到
+        // 18 = 18 列，"工具定义" 4 字符补到 18 = 16 列，差 2 列）。
+        let rows: Vec<crate::cost_view::Row> = [
             (tr("context.system"), audit.system_tokens),
             (tr("context.tools"), audit.tool_schema_tokens),
             (tr("context.history"), audit.history_tokens),
             (tr("context.output"), audit.output_reserve),
             (tr("context.framing"), audit.framing_tokens),
-            (tr("context.total"), total),
-        ];
-        for (label, value) in rows {
-            text.push_str(&format!("  {label:<18}{:>9}\n", fmt_num(value)));
-        }
+        ]
+        .into_iter()
+        .map(|(label, value)| crate::cost_view::Row::new(label, u64::from(value), None))
+        .collect();
+        let mut rows = rows;
+        rows.push(crate::cost_view::Row::total(
+            tr("context.total"),
+            u64::from(total),
+            None,
+        ));
+        // 数值列不留 `—` 占位：这里每项都有确切值，`cost.unknown` 会让
+        // 有值的行也挂上「未知」标记。
+        text.push_str(&crate::cost_view::Table::new(rows, "").render(ctx.terminal_width));
+        text.push('\n');
 
         text.push_str(&tr_fmt(
             "context.summary",
@@ -174,7 +186,9 @@ impl Command for ContextCmd {
             ));
         }
 
-        Ok(CommandResult::Output(text))
+        // 表格必须原样输出：走 `Output` 会被 markdown 当段落重新折行，
+        // 上面那列对齐会全部作废。
+        Ok(CommandResult::OutputPlain(text.trim_end().to_string()))
     }
 }
 
@@ -373,10 +387,208 @@ impl Command for CostCmd {
     fn usage(&self) -> String {
         "/cost".to_string()
     }
+
+    /// 重排后的 `/cost`：主表（明细 + 合计线）→ 派生指标 → 上下文占比条
+    /// → 子 Agent 分表 → 脚注。
+    ///
+    /// 相对旧版的三个实质变化：
+    /// 1. **列宽在 [`cost_view`] 里算**，不再靠 i18n 模板里的空格凑对齐（旧版
+    ///    切到英文就散架）；
+    /// 2. **未知值显式渲染**（缓存写入恒 0 时显示"未上报"而非 `~$0.0000`，
+    ///    后者会被读成"这项免费"）；
+    /// 3. **口径说明全部下沉到脚注**，行内只留数字——旧版每行都拖着一句括号
+    ///    解释，是"凌乱"的主因。
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
-        let input = ctx.input_tokens;
-        let output = ctx.output_tokens;
-        let total = input + output;
+        use crate::cost_view::{context_bar, display_width, fmt_int, fmt_pct, Row, Table, INDENT};
+
+        // 归一化一次，之后所有子部件都吃同一个 `width`，各自不再夹。
+        let width = crate::cost_view::usable_width(ctx.terminal_width);
+        let indent_w = display_width(INDENT);
+        let prices = lookup_price(&ctx.model);
+        let unknown = tr("cost.unknown");
+
+        // ── 金额换算 ──────────────────────────────────────────────────────
+        // 缓存命中按 0.1x 输入价、缓存写入按 1.25x 输入价。`cache_write_known`
+        // 为 false 时用 None 占位而不是折算成 0 —— 端点不上报 ≠ 不计费。
+        let (input_cost, output_cost, cache_read_cost, cache_write_cost, sub_costs) = match prices {
+            Some((ip, op)) => {
+                let sub = (
+                    ctx.sub_input_tokens as f64 / 1_000_000.0 * ip,
+                    ctx.sub_output_tokens as f64 / 1_000_000.0 * op,
+                    ctx.sub_cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1,
+                    ctx.sub_cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
+                );
+                (
+                    ctx.input_tokens as f64 / 1_000_000.0 * ip,
+                    ctx.output_tokens as f64 / 1_000_000.0 * op,
+                    ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1,
+                    ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
+                    sub,
+                )
+            }
+            None => (0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0, 0.0)),
+        };
+        let total_cost = input_cost
+            + output_cost
+            + cache_read_cost
+            + cache_write_cost
+            + sub_costs.0
+            + sub_costs.1
+            + sub_costs.2
+            + sub_costs.3;
+
+        // ── 主表 ──────────────────────────────────────────────────────────
+        // 缓存命中 > 0 而写入恒 0：端点能缓存却不统计写入量。此时写入行必须
+        // 走占位符 —— 折算成 `~$0.0000` 等于告诉用户"这项免费"，而它是**未上报**，
+        // 真实费用未知（可能还要按 1.25x 输入价补）。这是本命令最容易出错
+        // 的一个数，单独提出来先算好。
+        //
+        // 排除 DOWNGRADED：那是端点**拒绝**了 cache_control、缓存整个停用，
+        // 与"能用但不报写入量"是两回事。此时残留的 cache_read 来自降级之前，
+        // 套上"下界"提示只会误导——该提示的是 `cache_downgraded_line`。
+        let cache_write_unreported = ctx.cache_read_tokens > 0
+            && ctx.cache_write_tokens == 0
+            && ctx.prompt_cache_state != wyj_core::prompt_cache_state::DOWNGRADED;
+        let total_tokens = u64::from(ctx.input_tokens)
+            + u64::from(ctx.output_tokens)
+            + u64::from(ctx.cache_read_tokens)
+            + u64::from(ctx.cache_write_tokens);
+        let mut rows = vec![
+            Row::new(
+                tr("cost.row_input"),
+                u64::from(ctx.input_tokens),
+                prices.map(|_| input_cost),
+            ),
+            Row::new(
+                tr("cost.row_output"),
+                u64::from(ctx.output_tokens),
+                prices.map(|_| output_cost),
+            ),
+            Row::new(
+                tr("cost.row_cache_read"),
+                u64::from(ctx.cache_read_tokens),
+                prices.map(|_| cache_read_cost),
+            ),
+            Row::new(
+                tr("cost.row_cache_write"),
+                u64::from(ctx.cache_write_tokens),
+                if cache_write_unreported {
+                    None
+                } else {
+                    prices.map(|_| cache_write_cost)
+                },
+            ),
+            Row::total(
+                tr("cost.row_total"),
+                total_tokens,
+                prices.map(|_| total_cost),
+            ),
+        ];
+        // 子 Agent 有用量时并进同一张表：它已计入上方合计，单独成表反而会
+        // 让用户以为有两笔费用。放在合计线之后，用分节标题 + 一层缩进区分。
+        let has_sub = ctx.sub_input_tokens > 0
+            || ctx.sub_output_tokens > 0
+            || ctx.sub_cache_read_tokens > 0
+            || ctx.sub_cache_write_tokens > 0;
+        if has_sub {
+            rows.push(Row::section(tr("cost.subagent_section")));
+            rows.push(
+                Row::new(
+                    tr("cost.subagent_input"),
+                    u64::from(ctx.sub_input_tokens),
+                    prices.map(|_| sub_costs.0),
+                )
+                .indented(),
+            );
+            rows.push(
+                Row::new(
+                    tr("cost.subagent_output"),
+                    u64::from(ctx.sub_output_tokens),
+                    prices.map(|_| sub_costs.1),
+                )
+                .indented(),
+            );
+            rows.push(
+                Row::new(
+                    tr("cost.subagent_cache"),
+                    u64::from(ctx.sub_cache_read_tokens),
+                    prices.map(|_| sub_costs.2),
+                )
+                .indented(),
+            );
+        }
+
+        let table = Table::new(rows, unknown.clone()).with_header(
+            tr("cost.col_item"),
+            tr("cost.col_tokens"),
+            tr("cost.col_cost"),
+        );
+
+        let mut out = String::new();
+        // 标题行按"有值才拼"：headless / ACP 等表面拿不到 model 名，
+        // 直接塞进模板会渲染成 `标题 ·  · 0 calls` 这种悬空分隔符。
+        let mut title_parts = vec![tr("cost.header")];
+        if !ctx.model.is_empty() {
+            title_parts.push(ctx.model.clone());
+        }
+        title_parts.push(tr_fmt(
+            "cost.calls_suffix",
+            &[("calls", &fmt_int(u64::from(ctx.api_calls)))],
+        ));
+        // 标题行也带 INDENT：预排版消息在渲染层不再补缩进，整块版式由这里
+        // 统一负责，标题与表格才会左边缘对齐。
+        out.push_str(INDENT);
+        out.push_str(&crate::cost_view::fit_line(
+            &title_parts.join(" · "),
+            width.saturating_sub(indent_w),
+        ));
+        out.push('\n');
+        out.push_str(&table.render_block(width));
+        out.push('\n');
+
+        // ── 派生指标 ──────────────────────────────────────────────────────
+        // 这几行文案长度随 locale 与数值变化，必须逐行按可用宽度收口，
+        // 否则窄终端下它们会被聊天区换行拆散（实测 44 列时一行冲到 75 列）。
+        // 与表格同缩进，面板读起来是**一个**块而不是两截。
+        let indent = INDENT.to_string();
+        let mut line = |s: String| {
+            out.push('\n');
+            out.push_str(&indent);
+            out.push_str(&crate::cost_view::fit_line(
+                &s,
+                width.saturating_sub(indent_w),
+            ));
+        };
+        let full_input = u64::from(ctx.input_tokens)
+            + u64::from(ctx.cache_read_tokens)
+            + u64::from(ctx.cache_write_tokens);
+        if full_input > 0 {
+            let hit = ctx.cache_read_tokens as f64 / full_input as f64 * 100.0;
+            let full_price = (ctx.input_tokens + ctx.cache_read_tokens) as f64;
+            let saved_pct = if full_price > 0.0 {
+                ctx.cache_read_tokens as f64 * 0.9 / full_price * 100.0
+            } else {
+                0.0
+            };
+            line(tr_fmt(
+                "cost.cache_stats_line",
+                &[
+                    ("hit_ratio", &fmt_pct(hit)),
+                    ("saved_pct", &fmt_pct(saved_pct)),
+                ],
+            ));
+        }
+        if ctx.api_calls > 0 {
+            line(tr_fmt(
+                "cost.api_calls_line",
+                &[(
+                    "avg_input",
+                    &fmt_int(u64::from(ctx.input_tokens / ctx.api_calls.max(1))),
+                )],
+            ));
+        }
+
+        // ── 上下文占比 ────────────────────────────────────────────────
         // 百分比口径与自动压缩同源：优先用 request 级 audit（含 system +
         // 工具 schema + 输出预留），退回旧的 messages-only 估算只在还没
         // 发起过模型请求时才会发生。
@@ -384,139 +596,72 @@ impl Command for CostCmd {
             .context_audit
             .map(|audit| audit.total())
             .unwrap_or(ctx.estimated_tokens);
-        let ctx_pct = if ctx.context_window > 0 {
-            ctx_estimated as f64 / ctx.context_window as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        let cost_line = if let Some((ip, op)) = lookup_price(&ctx.model) {
-            let input_cost = input as f64 / 1_000_000.0 * ip;
-            let output_cost = output as f64 / 1_000_000.0 * op;
-            // 缓存命中约 0.1x 输入价、缓存写入约 1.25x 输入价
-            let cache_read_cost = ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1;
-            let cache_write_cost = ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25;
-            let total_cost = input_cost + output_cost + cache_read_cost + cache_write_cost;
-            tr_fmt(
-                "cost.line_with_price",
+        if ctx.context_window > 0 {
+            // 条 + 数字合并成一行：拆两行会让本就高的面板再高一截，而
+            // 「占了多少 / 一共多少」本就该一眼同框。后缀必须**先算出来传
+            // 给 context_bar** 参与格数预算——否则条按满格渲染、再把长
+            // 后缀拼在后面，窄终端必然超宽。
+            let pct = fmt_pct(ctx_estimated as f64 / ctx.context_window as f64 * 100.0);
+            let detail = tr_fmt(
+                "cost.context_detail_line",
                 &[
-                    ("input", &format!("{:>10}", fmt_num(input))),
-                    ("input_cost", &format!("{input_cost:.4}")),
-                    ("output", &format!("{:>10}", fmt_num(output))),
-                    ("output_cost", &format!("{output_cost:.4}")),
-                    ("total", &format!("{:>10}", fmt_num(total))),
-                    ("total_cost", &format!("{total_cost:.4}")),
+                    ("pct", &pct),
+                    ("used", &fmt_int(u64::from(ctx_estimated))),
+                    ("window", &fmt_int(u64::from(ctx.context_window))),
                 ],
-            )
-        } else {
-            tr_fmt(
-                "cost.line_no_price",
-                &[
-                    ("input", &format!("{:>10}", fmt_num(input))),
-                    ("output", &format!("{:>10}", fmt_num(output))),
-                    ("total", &format!("{:>10}", fmt_num(total))),
-                ],
-            )
-        };
-
-        // 缓存用量单列（有缓存活动时才显示）：展示缓存收益与真实成本
-        let full_input = input + ctx.cache_read_tokens + ctx.cache_write_tokens;
-        let hit_ratio = if full_input > 0 {
-            ctx.cache_read_tokens as f64 / full_input as f64 * 100.0
-        } else {
-            0.0
-        };
-        let input_detail_line = format!(
-            "\n{}",
-            tr_fmt(
-                "cost.input_detail_line",
-                &[
-                    ("full", &fmt_num(full_input)),
-                    ("uncached", &fmt_num(input)),
-                    ("hit_ratio", &format!("{hit_ratio:.0}")),
-                ],
-            )
-        );
-
-        let cache_line = if ctx.cache_read_tokens > 0 || ctx.cache_write_tokens > 0 {
-            let saved_pct = {
-                let full = ctx.cache_read_tokens as f64;
-                let all_input = input as f64 + full;
-                if all_input > 0.0 {
-                    // 命中部分按 0.1x 计，相对全价的节省比例
-                    full * 0.9 / all_input * 100.0
-                } else {
-                    0.0
-                }
-            };
-            format!(
-                "\n{}",
-                tr_fmt(
-                    "cost.cache_line",
-                    &[
-                        ("read", &fmt_num(ctx.cache_read_tokens)),
-                        ("write", &fmt_num(ctx.cache_write_tokens)),
-                        ("saved_pct", &format!("{saved_pct:.0}")),
-                    ],
-                )
-            )
-        } else {
-            String::new()
-        };
-
-        let ctx_line = tr_fmt(
-            "cost.context_line",
-            &[
-                ("pct", &format!("{ctx_pct:.0}")),
-                ("estimated", &fmt_num(ctx_estimated)),
-                ("window", &fmt_num(ctx.context_window)),
-            ],
-        );
-
-        let header = tr("cost.header");
-        let mut text =
-            format!("{header}\n{cost_line}{input_detail_line}{cache_line}\n\n{ctx_line}");
-
-        // 调用次数与平均单次输入：把"消耗率"拆成可行动的两个因子。少一趟调用
-        // 的收益远大于单次少一点上下文——每少一趟就少重发一遍完整历史。
-        if ctx.api_calls > 0 {
-            text.push('\n');
-            text.push_str(&tr_fmt(
-                "cost.api_calls_line",
-                &[
-                    ("api_calls", &ctx.api_calls.to_string()),
-                    ("avg_input", &fmt_num(input / ctx.api_calls)),
-                ],
-            ));
+            );
+            if let Some(bar) = context_bar(
+                ctx_estimated,
+                ctx.context_window,
+                width.saturating_sub(indent_w),
+                &tr("cost.bar_full"),
+                &tr("cost.bar_empty"),
+                &detail,
+            ) {
+                line(bar.trim_start().to_string());
+            }
         }
 
-        // 缓存被端点拒绝而停用：把"0 缓存"从"没配"里区分出来，否则用户看到
-        // 缓存全零时无从判断是没开、还是开了但这个端点不支持。
+        // ── 脚注 / 告警 ───────────────────────────────────────────────────
+        let mut notes: Vec<String> = Vec::new();
+        if cache_write_unreported {
+            notes.push(tr("cost.note_cache_write_unreported"));
+        }
         if ctx.prompt_cache_state == wyj_core::prompt_cache_state::DOWNGRADED {
-            text.push('\n');
-            text.push_str(&tr("cost.cache_downgraded_line"));
+            notes.push(tr("cost.cache_downgraded_line"));
         }
-
-        // 单价表未覆盖当前模型：静默降级成"无金额"会让用户误以为模型免费。
-        if lookup_price(&ctx.model).is_none() {
-            text.push('\n');
-            text.push_str(&tr_fmt("cost.price_missing", &[("model", &ctx.model)]));
+        if prices.is_none() {
+            notes.push(tr_fmt("cost.price_missing", &[("model", &ctx.model)]));
         }
-
-        // 子 Agent 用量单列（有用量时才显示）
-        let sub_total = ctx.sub_input_tokens + ctx.sub_output_tokens;
-        if sub_total > 0 {
-            text.push('\n');
-            text.push_str(&tr_fmt(
-                "cost.subagent_line",
-                &[
-                    ("input", &fmt_num(ctx.sub_input_tokens)),
-                    ("output", &fmt_num(ctx.sub_output_tokens)),
-                    ("total", &fmt_num(sub_total)),
-                ],
+        if ctx.compact_count > 0 {
+            notes.push(tr_fmt(
+                "cost.note_compacted",
+                &[("times", &ctx.compact_count.to_string())],
             ));
         }
-        Ok(CommandResult::Output(text))
+        if !notes.is_empty() {
+            out.push('\n');
+            for note in notes {
+                for (i, l) in note.lines().enumerate() {
+                    let budget = width.saturating_sub(display_width(INDENT) + 2);
+                    let body = if budget > 8 {
+                        crate::cost_view::truncate_note(l, budget)
+                    } else {
+                        l.to_string()
+                    };
+                    out.push_str(INDENT);
+                    out.push_str(if i == 0 { "⚠ " } else { "  " });
+                    out.push_str(&body);
+                    out.push('\n');
+                }
+            }
+        }
+
+        // 合计金额已在表格的 `Total` 行给出——底部再重复一次纯属冗余。
+        //
+        // 必须走 `OutputPlain`：表格的列对齐依赖换行原样保留，而 `Output` 会
+        // 被 TUI 的 markdown 渲染器当段落重新折行，整张表会被揉成一团糊。
+        Ok(CommandResult::OutputPlain(out.trim_end().to_string()))
     }
 }
 
@@ -1816,6 +1961,7 @@ mod help_tests {
         CommandContext {
             cwd: std::path::PathBuf::new(),
             model: String::new(),
+            terminal_width: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -1830,6 +1976,8 @@ mod help_tests {
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -1895,6 +2043,7 @@ mod agents_tests {
         CommandContext {
             cwd: std::path::PathBuf::new(),
             model: String::new(),
+            terminal_width: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -1909,6 +2058,8 @@ mod agents_tests {
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -1939,6 +2090,7 @@ mod subagents_tests {
         CommandContext {
             cwd: std::path::PathBuf::new(),
             model: String::new(),
+            terminal_width: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -1953,6 +2105,8 @@ mod subagents_tests {
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -2013,10 +2167,10 @@ mod subagents_tests {
         match result {
             // 用 i18n key 本身做断言而不是硬编码中文——测试跑在任意 locale 下
             // 都成立（`set_locale` 是进程级全局状态，不能在测试里改）。
-            CommandResult::Output(text) => {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
                 assert!(text.contains(&tr("context.empty")), "got: {text}")
             }
-            other => panic!("expected Output, got {other:?}"),
+            other => panic!("expected Output(Plain), got {other:?}"),
         }
     }
 
@@ -2036,7 +2190,7 @@ mod subagents_tests {
         let ctx = ctx_with_audit(Some(audit), 200_000);
         let result = ContextCmd.run("", &ctx).await.unwrap();
         match result {
-            CommandResult::Output(text) => {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
                 // `fmt_num` 可能带千分位，断言前先归一化。
                 let flat = text.replace(',', "");
                 assert!(flat.contains(&audit.total().to_string()), "got: {text}");
@@ -2046,7 +2200,7 @@ mod subagents_tests {
                     "阈值未按新 buffer 公式显示: {text}"
                 );
             }
-            other => panic!("expected Output, got {other:?}"),
+            other => panic!("expected Output(Plain), got {other:?}"),
         }
     }
 
@@ -2059,14 +2213,14 @@ mod subagents_tests {
         };
         let ctx = ctx_with_audit(Some(audit), 200_000);
         match ContextCmd.run("", &ctx).await.unwrap() {
-            CommandResult::Output(text) => {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
                 // `fmt_num` 可能带千分位，断言前先把它归一化掉。
                 assert!(
                     text.replace(',', "").contains("23100"),
                     "可回收量未显示: {text}"
                 );
             }
-            other => panic!("expected Output, got {other:?}"),
+            other => panic!("expected Output(Plain), got {other:?}"),
         }
     }
 
@@ -2145,5 +2299,334 @@ mod github_tests {
         assert_eq!(percent_encode("x/y#z"), "x%2Fy%23z");
         // 未保留字符保持原样
         assert_eq!(percent_encode("Aa0-_.~"), "Aa0-_.~");
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+    use crate::cost_view::{display_width, fmt_int, MIN_WIDTH};
+
+    fn base_ctx() -> CommandContext {
+        CommandContext {
+            cwd: std::path::PathBuf::new(),
+            // 单价表里有的模型，否则会走"无单价"分支，看不到金额。
+            model: "claude-sonnet-4".to_string(),
+            terminal_width: 64,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            prompt_cache_state: 0,
+            context_window: 0,
+            estimated_tokens: 0,
+            context_audit: None,
+            compact_count: 0,
+            context_edit: (0, 0),
+            home_dir: std::path::PathBuf::new(),
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
+            effective_mcp_count: 0,
+            plugin_agent_paths: vec![],
+            hooks_enabled: false,
+            dynamic_commands: vec![],
+        }
+    }
+
+    /// 完整会话场景：主 Agent + 子 Agent + 缓存命中 + 未上报的缓存写入。
+    fn full_ctx(width: usize) -> CommandContext {
+        CommandContext {
+            terminal_width: width,
+            input_tokens: 31_845,
+            output_tokens: 535,
+            cache_read_tokens: 183_427,
+            cache_write_tokens: 0,
+            api_calls: 3,
+            sub_input_tokens: 1_132,
+            sub_output_tokens: 193,
+            sub_cache_read_tokens: 19_968,
+            context_window: 200_000,
+            context_audit: Some(wyj_core::compact::ContextAudit {
+                system_tokens: 6_400,
+                tool_schema_tokens: 8_044,
+                history_tokens: 40_738,
+                output_reserve: 32_000,
+                framing_tokens: 200,
+                reclaimable_tool_result_tokens: 0,
+            }),
+            ..base_ctx()
+        }
+    }
+
+    async fn render(ctx: &CommandContext) -> String {
+        match CostCmd.run("", ctx).await.unwrap() {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => text,
+            other => panic!("expected Output(Plain), got {other:?}"),
+        }
+    }
+
+    /// 行首连续空格数。
+    fn indent_of(line: &str) -> usize {
+        line.chars().take_while(|c| *c == ' ').count()
+    }
+
+    /// 脚注在窄终端会被截断，断言完整文案必然失败。这里只断言"这行存在"，
+    /// 具体文案交给 i18n 单测。
+    fn has_note(text: &str) -> bool {
+        text.lines().any(|l| l.trim_start().starts_with('⚠'))
+    }
+
+    // ── 宽度自适应 ──────────────────────────────────────────────────────
+
+    /// 核心回归：面板里**每一行**（标题、派生指标、占比条、脚注）都必须落在
+    /// 可用列数内。旧实现只约束了表格，派生行在 44 列终端下冲到 75 列，
+    /// 被聊天区换行拆散。
+    #[tokio::test]
+    async fn every_line_fits_the_advertised_width() {
+        for width in [120usize, 100, 80, 64, 52, 44, 36, 32] {
+            let text = render(&full_ctx(width)).await;
+            for line in text.lines() {
+                assert!(
+                    display_width(line) <= width.max(MIN_WIDTH),
+                    "宽度 {width} 下超宽 ({} 列): {line:?}",
+                    display_width(line)
+                );
+            }
+        }
+    }
+
+    /// 表格内所有带金额的行必须等宽——表格"齐不齐"全看这条。
+    /// 用"含金额"来筛而不是"含缩进"：派生指标行也有缩进但宽度本就不同，
+    /// 混进来会把断言变成永远失败的假阳性。
+    #[tokio::test]
+    async fn every_table_row_shares_one_width() {
+        let text = render(&full_ctx(64)).await;
+        let widths: Vec<usize> = text
+            .lines()
+            .filter(|l| l.contains("~$"))
+            .map(display_width)
+            .collect();
+        assert!(widths.len() >= 7, "行数不对: {widths:?}\n{text}");
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "表格行宽不一致: {widths:?}\n{text}"
+        );
+    }
+
+    /// 终端再窄也不得丢行——宁可截标签。
+    #[tokio::test]
+    async fn narrow_terminal_never_drops_rows() {
+        for width in [MIN_WIDTH, 40, 52] {
+            let text = render(&full_ctx(width)).await;
+            // 窄终端下**标签**会被截断成 `Input (unc…`，所以不能断言完整文案；
+            // 真正不能丢的是行本身——按"含金额的行数"数。
+            let rows = text
+                .lines()
+                .filter(|l| l.contains("~$") || l.contains(&tr("cost.unknown")))
+                .count();
+            assert!(
+                rows >= 6,
+                "宽度 {width} 下丢了行（只剩 {rows} 行）:\n{text}"
+            );
+        }
+    }
+
+    // ── 未知值不得伪装成 0 ──────────────────────────────────────────────
+
+    /// 未上报的缓存写入必须显示占位符，**不能**显示成 `~$0.0000`——后者
+    /// 等于告诉用户"这项免费"，而它其实是未知（可能还要按 1.25x 补）。
+    #[tokio::test]
+    async fn unreported_cache_write_is_never_rendered_as_zero_cost() {
+        let text = render(&full_ctx(64)).await;
+        let write_row = text
+            .lines()
+            .find(|l| l.contains(&tr("cost.row_cache_write")))
+            .expect("缺少缓存写入行");
+        assert!(
+            write_row.contains(&tr("cost.unknown")),
+            "未上报项应显示占位符: {write_row}"
+        );
+        assert!(
+            !write_row.contains("~$0.0000"),
+            "未上报项不能显示成 0 费用: {write_row}"
+        );
+        assert!(has_note(&text), "缺少下界说明脚注:\n{text}");
+    }
+
+    /// 反向：写入量**真的**有值时不能误报"未上报"。
+    #[tokio::test]
+    async fn reported_cache_write_is_not_flagged() {
+        let ctx = CommandContext {
+            cache_write_tokens: 15_000,
+            ..full_ctx(64)
+        };
+        let text = render(&ctx).await;
+        assert!(!has_note(&text), "写入量正常时不该出现下界警告:\n{text}");
+    }
+
+    /// 没有缓存活动时不下"下界"警告——纯 input/output 的会话不该被无关
+    /// 告警打扰。
+    #[tokio::test]
+    async fn no_cache_activity_means_no_lower_bound_warning() {
+        let ctx = CommandContext {
+            cache_read_tokens: 0,
+            sub_cache_read_tokens: 0,
+            ..full_ctx(64)
+        };
+        let text = render(&ctx).await;
+        assert!(!has_note(&text), "无缓存活动时不该警告:\n{text}");
+    }
+
+    // ── 数字自洽 ────────────────────────────────────────────────────────
+
+    /// 合计行必须等于各明细行之和——用户会拿它对账，对不上就是 bug。
+    #[tokio::test]
+    async fn total_row_equals_the_sum_of_detail_rows() {
+        let text = render(&full_ctx(64)).await;
+        let sum = 31_845u64 + 535 + 183_427;
+        let total_row = text
+            .lines()
+            .find(|l| l.contains(&tr("cost.row_total")))
+            .expect("缺少合计行");
+        assert!(
+            total_row.contains(&fmt_int(sum)),
+            "合计行与明细和不符: {total_row}"
+        );
+    }
+
+    /// 子 Agent 扇出要出现在面板里，且比主表明细多一层缩进。
+    #[tokio::test]
+    async fn subagent_usage_appears_one_level_deeper() {
+        let text = render(&full_ctx(64)).await;
+        assert!(text.contains(&tr("cost.subagent_section")), "{text}");
+        let sub_row = text
+            .lines()
+            .find(|l| l.contains("19,968"))
+            .expect("子 Agent 缓存行缺失");
+        let main_row = text
+            .lines()
+            .find(|l| l.contains(&fmt_int(31_845)))
+            .expect("主 Agent 输入行缺失");
+        assert_eq!(
+            indent_of(sub_row),
+            indent_of(main_row) + 2,
+            "子 Agent 行应比主表明细多一层缩进: sub={sub_row:?} main={main_row:?}"
+        );
+    }
+
+    /// 没有任何子 Agent 用量时，整节都不出现。
+    #[tokio::test]
+    async fn subagent_section_is_omitted_when_unused() {
+        let ctx = CommandContext {
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            ..full_ctx(64)
+        };
+        let text = render(&ctx).await;
+        assert!(
+            !text.contains(&tr("cost.subagent_section")),
+            "无子 Agent 用量时不该出现该节:\n{text}"
+        );
+    }
+
+    // ── 上下文占比条 ────────────────────────────────────────────────────
+
+    /// 条要跟着 used/window 变化，且随终端变窄而收缩。
+    #[tokio::test]
+    async fn context_bar_tracks_usage_and_shrinks_when_narrow() {
+        let cells = |s: &str| s.matches('█').count() + s.matches('░').count();
+        let wide = render(&full_ctx(120)).await;
+        let narrow = render(&full_ctx(36)).await;
+        let wide_cells = wide.lines().find(|l| l.contains('█')).map(cells);
+        let narrow_cells = narrow.lines().find(|l| l.contains('█')).map(cells);
+        let (wide_cells, narrow_cells) = (wide_cells.unwrap_or(0), narrow_cells.unwrap_or(0));
+        assert!(wide_cells > 0, "宽终端应有占比条:\n{wide}");
+        assert!(
+            narrow_cells < wide_cells,
+            "窄终端的条应收缩: wide={wide_cells} narrow={narrow_cells}"
+        );
+    }
+
+    /// 占比要反映真实占用，不是恒定值。
+    #[tokio::test]
+    async fn context_bar_reflects_the_real_ratio() {
+        let low = render(&full_ctx(64)).await;
+        let high = render(&CommandContext {
+            context_audit: Some(wyj_core::compact::ContextAudit {
+                system_tokens: 6_400,
+                tool_schema_tokens: 8_044,
+                history_tokens: 175_000,
+                output_reserve: 32_000,
+                framing_tokens: 200,
+                reclaimable_tool_result_tokens: 0,
+            }),
+            ..full_ctx(64)
+        })
+        .await;
+        let filled = |s: &str| s.matches('█').count();
+        assert!(
+            filled(&high) > filled(&low),
+            "占用更高时实心格应更多: high={} low={}",
+            filled(&high),
+            filled(&low)
+        );
+    }
+
+    /// 拿不到窗口信息时整行省略，而不是画一个假的 0%。
+    #[tokio::test]
+    async fn context_section_is_omitted_without_a_window() {
+        let ctx = CommandContext {
+            context_window: 0,
+            context_audit: None,
+            ..full_ctx(64)
+        };
+        let text = render(&ctx).await;
+        assert!(
+            !text.contains('█') && !text.contains('░'),
+            "无窗口时不该画占比条:\n{text}"
+        );
+    }
+
+    // ── 端点能力缺失时的诚实降级 ────────────────────────────────────────
+
+    /// 单价表未覆盖：必须显式说明"没有金额"，且不出现任何金额。
+    #[tokio::test]
+    async fn missing_price_is_explained_instead_of_silent_zero() {
+        let ctx = CommandContext {
+            model: "some-unlisted-model".to_string(),
+            ..full_ctx(64)
+        };
+        let text = render(&ctx).await;
+        assert!(has_note(&text), "无单价时应有说明脚注:\n{text}");
+        assert!(!text.contains("~$"), "无单价时不该出现金额:\n{text}");
+        // token 数照常显示——没有单价不等于没有用量。
+        assert!(
+            text.contains(&fmt_int(31_845)),
+            "无单价时也应显示 token 数:\n{text}"
+        );
+    }
+
+    /// 缓存被端点拒绝而停用：与"未上报写入"是两回事，各出各的脚注。
+    #[tokio::test]
+    async fn downgraded_cache_is_reported_separately() {
+        let ctx = CommandContext {
+            prompt_cache_state: wyj_core::prompt_cache_state::DOWNGRADED,
+            ..CommandContext {
+                cache_read_tokens: 100_000,
+                ..base_ctx()
+            }
+        };
+        let text = render(&ctx).await;
+        assert!(has_note(&text), "缓存降级应有自己的说明脚注:\n{text}");
+        // 关键回归：缓存被端点拒绝而停用 ≠ 端点不报写入量。此时绝不能再套
+        // "金额是下界"——那是两种完全不同的故障，混起来会误导用户。
+        assert!(
+            !text.contains(&tr("cost.unknown")),
+            "缓存已停用时不该出现未上报占位符:\n{text}"
+        );
     }
 }

@@ -518,6 +518,11 @@ mod tests {
             api_calls: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
+            tool_schema_tokens_last: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             prompt_cache_state: crate::session_store::prompt_cache_state::OFF,
             messages: vec![Message {
                 role: wyj_api::types::Role::User,
