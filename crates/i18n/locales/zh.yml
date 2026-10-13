@@ -74,6 +74,11 @@ thinking:
   done: "  ⎿ 已思考 {secs}s（{lines} 行）"
   done_no_elapsed: "  ⎿ 已思考（{lines} 行）"
   expand_hint: "  ·  Ctrl+O 展开"
+  live_omitted: "⋮ 上面还有 {count} 行"
+
+# 正在执行的工具的实时输出块（只显示尾部若干行）
+live_output:
+  omitted: "⋮ 上面还有 {count} 行输出"
 
 diff:
   more_lines: "    … 还有 {n} 行（Ctrl+O 展开全文）"
@@ -207,7 +212,7 @@ help:
     - `Esc` — 中断当前任务
     - `Shift+Tab` — 循环切换模式 Normal → Plan → Bypass
     - `Ctrl+T` — 聚焦任务列表；已聚焦时折叠/展开任务列表
-    - `Ctrl+O` — 展开/折叠 thinking 与工具结果正文
+    - `Ctrl+O` — 强制展开/收起全部 thinking 与工具结果正文（默认自动：执行中展开，跑完即收）
     - `Ctrl+L` — 清屏（保留对话历史）
     - `Ctrl+A` / `Ctrl+E` — 跳到行首 / 行尾
     - `Ctrl+K` — 删除光标到行尾

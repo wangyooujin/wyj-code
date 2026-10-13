@@ -5418,6 +5418,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ignore",
+ "libc",
  "png 0.17.16",
  "pulldown-cmark",
  "ratatui",

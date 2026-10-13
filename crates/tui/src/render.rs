@@ -823,9 +823,89 @@ struct ChatRenderCtx<'a> {
     max_content_width: usize,
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
-    /// Ctrl+O 全局展开/折叠**所有**可折叠正文：thinking 块与工具调用结果。
+    /// `Ctrl+O` 手动强制展开**所有**可折叠正文：thinking 块与工具调用结果。
+    ///
+    /// `false` 不是「全折叠」而是**自动模式**——正在流式输出的 thinking 与正在
+    /// 执行的工具实时展开，跑完立即收起，因此最终判定是 `output_expanded || is_live`。
     /// 折叠态一律不得触碰 `content`（见 `render_thinking_block` 的 `live` 分支）。
     output_expanded: bool,
+    /// 正在执行中的工具调用的实时输出：`sequence_no` → 累计输出的尾部快照。
+    ///
+    /// 由 `build_pending_chat_lines` 从 `AppState.tool_info` ×
+    /// `AppState.live_tool_out` 求交集后按 `sequence_no` 重建，因此天然只含
+    /// 仍在飞的调用；回合被中断后遗留的孤儿快照进不来。
+    live_tool_out: &'a std::collections::HashMap<usize, String>,
+}
+
+/// 执行中实时输出块显示的尾部行数。
+///
+/// 定这个值是终端高度的直觉：够看清一段命令在干什么，又不至于把屏幕刷满。
+/// 完整正文始终保留在工具结果里，跑完后自动收起，需要回看再按 Ctrl+O。
+const LIVE_TAIL_LINES: usize = 30;
+
+/// 取正文尾部最多 [`LIVE_TAIL_LINES`] 行，并返回被截掉的行数。
+///
+/// 工具实时输出与流式 thinking 共用这一个取尾逻辑（两者都只关心「最新的一段
+/// 正在发生什么」）。用 `rsplit` 是因为它是反向惰性迭代器：取 N 行只解码 N 行，
+/// 正文再长也不必全文折行——thinking 缓冲能长到几十 KB，每帧全量重排正是当初
+/// 「整屏换行比机器慢」的成因。
+fn live_tail(body: &str) -> (Vec<&str>, usize) {
+    let total = body.bytes().filter(|b| *b == b'\n').count() + 1;
+    let skipped = total.saturating_sub(LIVE_TAIL_LINES);
+    let mut lines: Vec<&str> = body
+        .rsplit('\n')
+        .take(LIVE_TAIL_LINES)
+        .map(str::trim_end)
+        .collect();
+    lines.reverse();
+    (lines, skipped)
+}
+
+/// 渲染「正在执行」的工具实时输出块，挂在对应 ⏺ 行下方。
+///
+/// 这是**唯一**允许在折叠态触碰工具输出的地方，理由与风险：内容按定义处于
+/// 展开态，且只取尾部 [`LIVE_TAIL_LINES`] 行折行——不做全文重排，因此不受
+/// `collapsed_tool_result_never_touches_content` 那条性能不变式的约束（那条
+/// 钉的是 100KB 正文的 Bash 结果在折叠态零成本）。
+fn render_live_tool_output(lines: &mut Vec<Line<'static>>, tail: &str, ctx: &ChatRenderCtx) {
+    let width = ctx.max_content_width.saturating_sub(7).max(1);
+    let body = tail.trim_end();
+    if body.is_empty() {
+        return;
+    }
+    let (tail_lines, skipped) = live_tail(body);
+
+    let frame = SPINNER_FRAMES[ctx.spinner_frame % SPINNER_FRAMES.len()];
+    let mut first = true;
+    for raw in tail_lines {
+        if raw.trim().is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for wrapped in wrap_line(raw, width) {
+            let (prefix, style) = if first {
+                ("    ⎿ ", Theme::tool_result())
+            } else {
+                ("       ", Theme::dim())
+            };
+            let text = if first {
+                format!("{prefix}{frame} {wrapped}")
+            } else {
+                format!("{prefix}{wrapped}")
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+            first = false;
+        }
+    }
+    if skipped > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "       {}",
+                wyj_i18n::tr_fmt("live_output.omitted", &[("count", &skipped.to_string())])
+            ),
+            Theme::dim(),
+        )));
+    }
 }
 
 /// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
@@ -848,15 +928,17 @@ fn clean_thinking_lines(content: &str) -> Vec<&str> {
         .collect()
 }
 
-/// thinking 块：默认折叠成一行元信息（耗时 + 行数 + 展开提示），Ctrl+O 展开
-/// 全文。
+/// thinking 块的两个态（`ThinkingRenderOpts.live`）：
+///
+/// - **流式中**：一行状态 + 尾部 [`LIVE_TAIL_LINES`] 行思考正文，跑完即消失。
+/// - **定稿后**：折叠成一行元信息（耗时 + 行数 + 展开提示），Ctrl+O 展开全文。
 ///
 /// 旧实现是"固定显示前 3 行 + ` · N lines` 标记"，有三个问题：`✻`(U+273B,
 /// Dingbats) 在终端字体里常缺字形画成豆腐块；`N lines` 数的是去掉空行后的
 /// **原始**行数，与屏幕上折行后再截断到 3 行的**视觉**行数毫无对应；只取头
 /// 3 行意味着几十行思考的结论永远看不到（thinking 是流式追加的，最新结论在
 /// 尾部）。更糟的是流式期间每帧都要把整个 buf 重新折行一遍、再只取前 3 行
-/// 扔掉，纯属浪费——现在 `live` 分支直接不碰 content。
+/// 扔掉，纯属浪费——现在 `live` 分支只 `rsplit` 取尾部若干行，两端都不扫全文。
 fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -868,6 +950,34 @@ fn render_thinking_block(
             wyj_i18n::tr("thinking.running"),
             Style::default().fg(Color::Cyan),
         )));
+        // 流式期间把尾部思考显出来，让「正在想什么」可见；定稿后立刻收起。
+        // 取尾逻辑与工具实时输出块共用 `live_tail`。
+        let body = content.trim_end();
+        if body.is_empty() {
+            return;
+        }
+        let (tail_lines, skipped) = live_tail(body);
+        let width = max_content_width.saturating_sub(4).max(1);
+        for line in tail_lines {
+            if line.is_empty() {
+                continue;
+            }
+            for wrapped in wrap_line(line, width) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {wrapped}"),
+                    Theme::dim(),
+                )));
+            }
+        }
+        if skipped > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    wyj_i18n::tr_fmt("thinking.live_omitted", &[("count", &skipped.to_string())])
+                ),
+                Theme::dim(),
+            )));
+        }
         return;
     }
 
@@ -1005,6 +1115,13 @@ fn render_chat_message(
                     Theme::tool_call(),
                 ),
             ]));
+
+            // 正在执行中的工具：把实时输出挂在 ⏺ 行下方，完成后由 ⎿ 结果行接手。
+            // 没有这一段的话，执行中的工具在聊天区里只有一行标题，用户只能盯着
+            // 状态栏的 spinner 猜它在干什么。
+            if let Some(tail) = msg.sequence_no.and_then(|seq| ctx.live_tool_out.get(&seq)) {
+                render_live_tool_output(lines, tail, ctx);
+            }
 
             // 子 Agent 调用：运行期间紧跟一条实时刷新的动态 ⎿ 状态行
             if let Some(s) = msg.sub_agent_id.and_then(|id| ctx.sub_agents.get(&id)) {
@@ -1450,6 +1567,14 @@ pub(crate) fn build_pending_chat_lines(
         .iter()
         .take(start)
         .any(|m| matches!(m.role, MessageRole::User));
+    // 只保留仍在飞的调用的实时输出：与 `tool_info` 求交集即完成「还在执行」
+    // 的判定，无需额外维护 in-flight 集合（两份真相迟早会对不上）。入飞时按
+    // `sequence_no` 建索引，渲染侧就能直接按消息序号查表。
+    let live_tool_out: HashMap<usize, String> = state
+        .tool_info
+        .iter()
+        .filter_map(|(id, (_, seq))| state.live_tool_out.get(id).map(|t| (*seq, t.clone())))
+        .collect();
     lines.extend(render_message_range(
         MessageRangeRenderArgs {
             messages: &state.messages,
@@ -1458,6 +1583,7 @@ pub(crate) fn build_pending_chat_lines(
             sub_agents: &state.sub_agents,
             spinner_frame: state.spinner_frame,
             output_expanded: state.output_expanded,
+            live_tool_out: &live_tool_out,
         },
         &mut is_first_user,
     ));
@@ -1798,6 +1924,9 @@ fn push_todo_detail_lines(
             // **恰恰是工具消息**（不是 thinking），若这里硬编码 false，面板会只剩
             // 一排 `⏺ Tool(...)` 标题、正文全空，等于摧毁这个面板的存在意义。
             output_expanded,
+            // 详情区渲染的是**历史**执行记录，那些调用早已 ToolEnd 完毕，
+            // 实时输出块不会、也不该出现在这里。
+            live_tool_out: &HashMap::new(),
         };
         for entry in log {
             match entry {
@@ -1896,6 +2025,7 @@ struct MessageRangeRenderArgs<'a> {
     sub_agents: &'a std::collections::BTreeMap<u64, SubAgentUiState>,
     spinner_frame: usize,
     output_expanded: bool,
+    live_tool_out: &'a std::collections::HashMap<usize, String>,
 }
 
 /// 渲染 `messages[range]` 为 `Vec<Line>`。`is_first_user` 携带"区间开始前是否已
@@ -1910,6 +2040,7 @@ fn render_message_range(
         max_content_width,
         sub_agents,
         spinner_frame,
+        live_tool_out,
         output_expanded,
     } = args;
     let ctx = ChatRenderCtx {
@@ -1917,6 +2048,7 @@ fn render_message_range(
         sub_agents,
         spinner_frame,
         output_expanded,
+        live_tool_out,
     };
     let mut lines = vec![];
     let mut i = range.start;
@@ -6102,13 +6234,22 @@ mod tool_result_fold_tests {
     }
 
     fn render_messages(messages: &[ChatMessage], width: usize) -> Vec<String> {
-        render_messages_with_output_expanded(messages, width, false)
+        render_messages_full(messages, width, false, &HashMap::new())
     }
 
     fn render_messages_with_output_expanded(
         messages: &[ChatMessage],
         width: usize,
         output_expanded: bool,
+    ) -> Vec<String> {
+        render_messages_full(messages, width, output_expanded, &HashMap::new())
+    }
+
+    fn render_messages_full(
+        messages: &[ChatMessage],
+        width: usize,
+        output_expanded: bool,
+        live_tool_out: &HashMap<usize, String>,
     ) -> Vec<String> {
         let mut is_first_user = true;
         rendered_text(render_message_range(
@@ -6119,6 +6260,7 @@ mod tool_result_fold_tests {
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
                 output_expanded,
+                live_tool_out,
             },
             &mut is_first_user,
         ))
@@ -7009,13 +7151,18 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn live_thinking_block_renders_one_line_and_never_touches_content() {
-        // 流式期间只画一行状态，且完全不碰 content —— 旧实现每帧把整个
-        // thinking_buf 重新折行一遍、再只取前 3 行扔掉
+    fn live_thinking_block_shows_tail_only_and_stays_cheap() {
+        // 流式期间要把思考显出来，但**只取尾部 LIVE_TAIL_LINES 行**。
+        // 这条钉的是性能不变式而非视觉：thinking_buf 能长到几十 KB，若每帧把
+        // 全文折行一遍再截断，就回到了「整屏换行比机器慢」的老问题。
+        let body = (1..=5_000)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut lines = vec![];
         render_thinking_block(
             &mut lines,
-            &"x".repeat(100_000),
+            &body,
             80,
             ThinkingRenderOpts {
                 live: true,
@@ -7023,10 +7170,88 @@ mod tool_result_fold_tests {
                 elapsed_secs: Some(3.0),
             },
         );
-        assert_eq!(lines.len(), 1);
 
         let text = rendered_text(lines);
-        assert!(!text[0].contains("xxxx"), "流式态不得渲染正文");
+        // 状态行 + 30 行尾部 + 1 行截断提示
+        assert_eq!(text.len(), LIVE_TAIL_LINES + 2, "{}", text.len());
+        // 首行是状态行（文案走 i18n，这里只断言它不含正文）
+        assert!(!text[0].contains("line-"), "{}", text[0]);
+        // 尾部是最新内容，不是开头
+        let last = &text[LIVE_TAIL_LINES];
+        assert!(last.contains("line-5000"), "{}", last);
+        assert!(text[1].contains("line-4971"), "{}", text[1]);
+        assert!(!text[1].contains("line-1 "), "不应渲染开头内容");
+        assert!(
+            text[text.len() - 1].contains("4970"),
+            "截断提示应给出被折叠的行数：{}",
+            text[text.len() - 1]
+        );
+    }
+
+    #[test]
+    fn live_thinking_block_tolerates_empty_buffer() {
+        let mut lines = vec![];
+        render_thinking_block(
+            &mut lines,
+            "",
+            80,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: false,
+                elapsed_secs: None,
+            },
+        );
+        assert_eq!(rendered_text(lines).len(), 1, "空缓冲只出状态行");
+    }
+
+    #[test]
+    fn live_output_survives_the_full_state_to_render_path() {
+        // 端到端：state.tool_info × state.live_tool_out 求交集 → 挂到 ⏺ 行下。
+        // 单测里手工拼 live_tool_out 的那张表，这里必须走真实构造路径。
+        let mut state = make_state();
+        state.is_thinking = true;
+        let mut call = message(MessageRole::ToolCall, "Bash(cargo build)");
+        call.sequence_no = Some(5);
+        call.id = 42;
+        state.messages.push(call);
+        state.tool_info.insert("toolu_x".into(), ("Bash".into(), 5));
+
+        // 快照通道尚未送达：还没有实时输出，⏺ 行下面必须是空的
+        let rendered = |state: &mut AppState| -> Vec<String> {
+            build_pending_chat_lines(state, 100)
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        assert!(
+            !rendered(&mut state).iter().any(|l| l.contains("⎿")),
+            "无快照时不得凭空多出输出块"
+        );
+
+        state.apply_tool_output_chunk(wyj_core::tool::ToolOutputChunk {
+            tool_use_id: "toolu_x".into(),
+            tail: "Compiling serde v1.0".into(),
+        });
+        let after = rendered(&mut state);
+        assert!(
+            after.iter().any(|l| l.contains("Compiling serde")),
+            "实时输出应出现在聊天区：{after:?}"
+        );
+
+        // 通道里的快照由 tool_info 把门：登记被撤掉（回合中断）后立即消失
+        state.tool_info.clear();
+        let after_interrupt = rendered(&mut state);
+        assert!(
+            !after_interrupt
+                .iter()
+                .any(|l| l.contains("Compiling serde")),
+            "调用不再在飞时不得残留实时块：{after_interrupt:?}"
+        );
     }
 
     #[test]
@@ -7079,6 +7304,7 @@ mod tool_result_fold_tests {
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
                 output_expanded: true,
+                live_tool_out: &HashMap::new(),
             },
             &mut is_first_user,
         );
@@ -7230,6 +7456,7 @@ mod tool_result_fold_tests {
                 sub_agents: &std::collections::BTreeMap::new(),
                 spinner_frame: 0,
                 output_expanded: true,
+                live_tool_out: &HashMap::new(),
             },
             &mut is_first_user,
         );
@@ -7313,6 +7540,133 @@ mod tool_result_fold_tests {
         assert!(
             !rendered.iter().any(|line| line.contains("xxx")),
             "折叠态不得渲染任何正文"
+        );
+    }
+
+    #[test]
+    fn running_tool_renders_its_live_output_under_the_call_line() {
+        // 「正在执行的步骤默认展开」：⏺ 行下方应直接跟出实时输出块，
+        // 即便 output_expanded = false（自动模式）。
+        let mut call = message(MessageRole::ToolCall, "Bash(cargo build)");
+        call.sequence_no = Some(7);
+        let live = HashMap::from([(7usize, "compiling foo\nwarning: unused\n".to_string())]);
+
+        let rendered = render_messages_full(&[call], 100, false, &live);
+
+        assert_eq!(rendered.len(), 3, "{rendered:?}");
+        assert!(rendered[0].contains("cargo build"), "{}", rendered[0]);
+        assert!(
+            rendered[1].contains("⎿"),
+            "实时块需挂在 ⎿ 下：{}",
+            rendered[1]
+        );
+        assert!(rendered[1].contains("compiling foo"), "{}", rendered[1]);
+        assert!(rendered[2].contains("unused"), "{}", rendered[2]);
+    }
+
+    #[test]
+    fn live_output_shows_in_auto_mode_and_in_force_expanded_mode() {
+        // Ctrl+O 是在「自动」与「全展开」之间切换，不是「折叠 ↔ 展开」：
+        // 自动模式下执行中的步骤本就展开，所以两个模式下实时块都必须存在；
+        // 而已完成的结果只在全展开模式下才摊开全文。切回自动模式（Ctrl+O
+        // 再按一次）不得让正在跑的那一步突然消失。
+        let mut call = message(MessageRole::ToolCall, "Bash(make)");
+        call.sequence_no = Some(4);
+        let mut result = message(MessageRole::ToolResult, "final body text");
+        result.tool_name = Some("Bash".to_string());
+        result.sequence_no = Some(4);
+        let live = HashMap::from([(4usize, "in-flight tail".to_string())]);
+
+        let auto = render_messages_full(&[call.clone()], 100, false, &live);
+        assert!(
+            auto.iter().any(|l| l.contains("in-flight tail")),
+            "自动模式下执行中的步骤应展开：{auto:?}"
+        );
+
+        let expanded = render_messages_full(&[call.clone()], 100, true, &live);
+        assert!(
+            expanded.iter().any(|l| l.contains("in-flight tail")),
+            "全展开模式下实时块同样在：{expanded:?}"
+        );
+
+        // 已完成的结果：自动模式折叠、全展开模式摊开。
+        let auto_done = render_messages_full(&[call.clone(), result.clone()], 100, false, &live);
+        assert!(
+            !auto_done.iter().any(|l| l.contains("final body text")),
+            "自动模式下完成即收：{auto_done:?}"
+        );
+        let expanded_done = render_messages_full(&[call, result], 100, true, &live);
+        assert!(
+            expanded_done.iter().any(|l| l.contains("final body text")),
+            "全展开模式下应看到完整结果：{expanded_done:?}"
+        );
+    }
+
+    #[test]
+    fn live_output_only_attaches_to_the_matching_call() {
+        // 按 sequence_no 配对：seq 不匹配的 ⏺ 行不得挂上别人的实时输出
+        let mut other = message(MessageRole::ToolCall, "Read(a.rs)");
+        other.sequence_no = Some(1);
+        let mut running = message(MessageRole::ToolCall, "Bash(make)");
+        running.sequence_no = Some(2);
+        let live = HashMap::from([(2usize, "gcc -O2 foo.c".to_string())]);
+
+        let rendered = render_messages_full(&[other, running], 100, false, &live);
+
+        assert!(!rendered[0].contains("gcc"), "{}", rendered[0]);
+        assert!(
+            rendered.iter().any(|l| l.contains("gcc -O2")),
+            "seq=2 的实时输出应出现：{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn live_output_block_is_capped_to_tail_lines() {
+        // 100KB 正文的 Bash 结果在折叠态零成本（见上一条测试）；实时块是唯一
+        // 例外，因此它必须自带硬上界，且明确告知用户上方还有多少行。
+        let mut call = message(MessageRole::ToolCall, "Bash(make)");
+        call.sequence_no = Some(0);
+        let live = HashMap::from([(
+            0usize,
+            (1..=100_000)
+                .map(|i| format!("compile {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )]);
+
+        let rendered = render_messages_full(&[call], 100, false, &live);
+
+        assert_eq!(rendered.len(), LIVE_TAIL_LINES + 2, "{}", rendered.len());
+        assert!(
+            rendered[rendered.len() - 1].contains("99970"),
+            "末行应是截断提示：{}",
+            rendered[rendered.len() - 1]
+        );
+        assert!(
+            rendered[rendered.len() - 2].contains("compile 100000"),
+            "尾部应是最新一行：{}",
+            rendered[rendered.len() - 2]
+        );
+    }
+
+    #[test]
+    fn finished_tool_has_no_live_block_even_with_a_stale_snapshot() {
+        // 快照的正常回收点是 `ToolEnd` 里的 `live_tool_out.remove`。这里钉的是
+        // 回收点万一失效时的兜底：结果行已经落地 = 这次调用已完成，
+        // `render_message_range` 会把 ToolCall + ToolResult 合并成一块渲染，
+        // 那条路径根本不查 `live_tool_out`——即使哈希表里还躺着快照也画不出来。
+        let mut call = message(MessageRole::ToolCall, "Bash(make)");
+        call.sequence_no = Some(3);
+        let mut result = message(MessageRole::ToolResult, "done");
+        result.tool_name = Some("Bash".to_string());
+        result.sequence_no = Some(3);
+        let live = HashMap::from([(3usize, "stale tail".to_string())]);
+
+        let rendered = render_messages_full(&[call, result], 100, false, &live);
+
+        assert!(
+            !rendered.iter().any(|l| l.contains("stale")),
+            "已完成的调用不应再画实时块：{rendered:?}"
         );
     }
 
