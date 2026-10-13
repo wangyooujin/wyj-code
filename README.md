@@ -60,7 +60,8 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 wyj-code 把 AI coding 的核心能力放进一个**可审计、可扩展、可本地运行**的终端工具：
 
 - **原生终端体验**：单二进制发布，流式 Markdown、代码高亮、多行输入、图片粘贴、
-  diff 预览、Todo、SubAgent 与权限确认界面。
+  diff 预览、Todo、SubAgent 与权限确认界面；长命令的 stdout / stderr 边跑边显示，
+  流式思考实时可见。
 - **多模型 + 双协议**：供应商、线协议与模型能力分开建模，同一套工具可连接官方 API、
   国内模型与本地兼容端点。
 - **Agent 与工具系统**：内置代码搜索、文件编辑、Bash、Web、Computer Use 与 SubAgent，
@@ -212,7 +213,8 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 ### 终端体验
 
 - 单二进制 release，无运行时依赖；macOS / Linux / Windows 全平台发布。
-- ratatui TUI：流式 Markdown、代码高亮、多行输入、图片粘贴、diff 预览。
+- ratatui TUI：流式 Markdown、代码高亮、多行输入、图片粘贴、diff 预览；
+  前台 Bash 输出按 100ms 节流实时推进，跑完即折叠。
 - 权限确认、AskQuestion 多题面板、ExitPlanMode 计划批准、TUI panic 兜底还原。
 
 ### 多模型与双协议

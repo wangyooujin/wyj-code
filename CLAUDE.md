@@ -157,6 +157,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 22 | TodoWrite 默认关闭 | `[tools].todo_enabled` | `crates/core` |
 | 23 | Skill 名单注入模型上下文（不是工具） | `core::prompts::MAIN` 的 `# Skills` 段 | `crates/core` |
 | 24 | HTTP 技能注册表 SkillHub | `store::skillhub` | `crates/store` |
+| 25 | 前台 Bash 输出实时推进（快照节流，非增量） | `tools::BashTool` + `ToolContext::tool_output()` | `crates/tools` + `crates/tui` |
 
 **跨 crate 改动的两条硬约定**：
 
