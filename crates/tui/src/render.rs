@@ -1230,6 +1230,20 @@ fn render_chat_message(
                 Span::styled(msg.content.clone(), style),
             ]));
         }
+        MessageRole::Preformatted => {
+            // 逐行原样渲染：换行是排版的一部分，折行会毁掉列对齐。
+            // 单行超宽时按显示宽度截断（CJK 安全），而不是折成两行。
+            //
+            // **不加任何前缀缩进**——内容自己决定版式（`/cost` 的表格已经自带
+            // 两格缩进）。渲染层再补一截会让标题行与表格行错开。
+            let budget = max_content_width.max(1);
+            for raw in msg.content.lines() {
+                lines.push(Line::from(Span::styled(
+                    truncate_line(raw, budget),
+                    Theme::code_body(),
+                )));
+            }
+        }
         MessageRole::TurnSummary => {
             lines.push(Line::from(vec![Span::styled(
                 format!("  {}", msg.content),
@@ -2077,8 +2091,17 @@ fn render_message_range(
     lines
 }
 
+/// 聊天区可用内容列数。
+///
+/// **与 [`draw_chat`] 的 `max_content_width` 必须同源**：两者一旦各算各的，
+/// `/cost` 这类按宽度排版的命令会算得比实际可渲染的宽，表格就被换行拆散。
+/// 抽成函数就是为了让这种漂移变成编译期可见（`draw_chat` 也走这里）。
+pub fn chat_content_width(frame_width: u16) -> usize {
+    frame_width.saturating_sub(2) as usize
+}
+
 fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
-    let max_content_width = area.width.saturating_sub(2) as usize;
+    let max_content_width = chat_content_width(area.width);
     let lines = build_pending_chat_lines(state, max_content_width);
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
 
@@ -6233,6 +6256,71 @@ mod tool_result_fold_tests {
             .collect()
     }
 
+    /// `/cost` 的表格依赖换行与列对齐。TUI 的 assistant 消息走 markdown，
+    /// 而 markdown 把「连续非空行」当一个段落重新折行——曾把一张 50 行的
+    /// 成本表塌成 6 行糊在一起。这条测试锁死「预排版消息必须逐行原样保留」。
+    #[test]
+    fn preformatted_message_keeps_every_line_and_its_alignment() {
+        // 用程序构造对齐的样本（手写容易把右边缘数错 1 列）。
+        let body = [
+            format!("{:<14}{:>9}  {:>9}", "Item", "Tokens", "Cost"),
+            format!("{:<14}{:>9}  {:>9}", "Input", "289,112", "~$0.0867"),
+            format!("{:<14}{:>9}  {:>9}", "Output", "40,440", "~$0.0485"),
+            format!("{:<14}{:>9}  {:>9}", "Total", "329,552", "~$0.1352"),
+        ]
+        .join("\n");
+        let msg = ChatMessage::preformatted(body.clone());
+        let lines = render_messages(&[msg], 100);
+
+        // 行数必须与源文本一致——markdown 段落合并会把多行揉成一行再折行。
+        assert_eq!(
+            lines.len(),
+            body.lines().count(),
+            "预排版内容被重新折行了:\n源:\n{body}\n渲染:\n{lines:?}"
+        );
+        // 数字列右边缘必须齐平（渲染层统一加了 2 空格缩进）。
+        let edge = |l: &str| crate::markdown::display_width(l);
+        let widths: Vec<usize> = lines.iter().map(|l| edge(l)).collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "各行宽度不齐（缩进/折行被破坏）: {widths:?}\n{lines:?}"
+        );
+    }
+
+    /// 预排版消息超宽时必须**截断**而不是折行——折行会凭空多出一行，
+    /// 把下面的表格行顶歪。
+    #[test]
+    fn preformatted_message_truncates_instead_of_wrapping() {
+        let long = "x".repeat(300);
+        let msg = ChatMessage::preformatted(long);
+        let lines = render_messages(&[msg], 60);
+        assert_eq!(lines.len(), 1, "超宽行被折成了多行:\n{lines:?}");
+        assert!(
+            lines[0].chars().count() <= 60,
+            "截断后仍超宽: {}",
+            lines[0].chars().count()
+        );
+    }
+
+    /// 多行预排版消息：行数必须与源文本一致，且**不出现空行**——
+    /// markdown 的段落合并正是靠空行分段，这里一旦混进去就会被重新折行。
+    #[test]
+    fn preformatted_message_has_no_blank_lines_injected() {
+        let body = "a\nb\nc";
+        let msg = ChatMessage::preformatted(body.to_string());
+        let lines = render_messages(&[msg], 60);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| !l.trim().is_empty()),
+            "被插入了空行:\n{lines:?}"
+        );
+    }
+
+    /// 把一段预排版文本送进真实渲染管线，返回渲染后的各行文本。
+    pub(super) fn render_preformatted(body: &str, width: usize) -> Vec<String> {
+        render_messages(&[ChatMessage::preformatted(body.to_string())], width)
+    }
+
     fn render_messages(messages: &[ChatMessage], width: usize) -> Vec<String> {
         render_messages_full(messages, width, false, &HashMap::new())
     }
@@ -8142,5 +8230,76 @@ mod tool_result_fold_tests {
                 cell.style().bg
             );
         }
+    }
+}
+
+/// `/cost` 真实输出 → TUI 渲染管线的端到端回归。
+///
+/// 这条测试锁死的是 2026-10-13 实际发生的那次事故：`/cost` 重排后表格看着
+/// 正常，但 TUI 把 assistant 消息交给 markdown 渲染，而 markdown 按段落合并
+/// 连续行再折行，一张 50 行的成本表在界面上塌成 6 行糊在一起。headless 路径
+/// 是裸 `println`，**不经过**这一步，所以只在 headless 验证会全部漏过。
+#[cfg(test)]
+mod cost_panel_render_tests {
+    use super::tool_result_fold_tests::render_preformatted;
+    use wyj_commands::Command;
+
+    fn cost_ctx(width: usize) -> wyj_commands::CommandContext {
+        wyj_commands::CommandContext {
+            cwd: std::path::PathBuf::new(),
+            model: "MiniMax-M3.1-Flash-Preview".to_string(),
+            terminal_width: width,
+            input_tokens: 289_112,
+            output_tokens: 40_440,
+            cache_read_tokens: 3_030_912,
+            cache_write_tokens: 0,
+            api_calls: 50,
+            prompt_cache_state: 1,
+            context_window: 200_000,
+            estimated_tokens: 159_164,
+            context_audit: None,
+            compact_count: 0,
+            context_edit: (0, 0),
+            home_dir: std::path::PathBuf::new(),
+            sub_input_tokens: 51_795,
+            sub_output_tokens: 31_723,
+            sub_cache_read_tokens: 1_159_231,
+            sub_cache_write_tokens: 0,
+            effective_mcp_count: 0,
+            plugin_agent_paths: vec![],
+            hooks_enabled: false,
+            dynamic_commands: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn real_cost_output_survives_the_tui_render_pipeline() {
+        let cmd = wyj_commands::builtin::CostCmd;
+        let raw = match cmd.run("", &cost_ctx(100)).await.unwrap() {
+            wyj_commands::CommandResult::OutputPlain(text) => text,
+            other => panic!("/cost 必须返回 OutputPlain（否则排版会被 markdown 揉碎）: {other:?}"),
+        };
+        let source_lines = raw.lines().count();
+        assert!(source_lines >= 12, "源文本行数异常: {source_lines}");
+
+        let lines = render_preformatted(&raw, 100);
+
+        // 核心断言：渲染行数 == 源行数。markdown 段落合并会让这个数字塌下来。
+        assert_eq!(
+            lines.len(),
+            source_lines,
+            "渲染后行数变了，说明内容被重新折行:\n源:\n{raw}\n渲染:\n{lines:?}"
+        );
+        // 且每一行的 Tokens 列右边缘必须齐平。
+        let widths: Vec<usize> = lines
+            .iter()
+            .filter(|l| l.contains("~$") || l.contains('—'))
+            .map(|l| crate::markdown::display_width(l))
+            .collect();
+        assert!(widths.len() >= 5, "带金额的行太少: {widths:?}\n{raw}");
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "表格列对齐被破坏: {widths:?}\n{raw}"
+        );
     }
 }

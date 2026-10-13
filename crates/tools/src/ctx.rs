@@ -110,6 +110,15 @@ pub struct ToolCtx {
     /// 队列后，子 Agent 与主 Agent 排空同一份，谁先到工具轮边界谁取走。
     /// headless / cron / 后台子 Agent 场景为 None。
     pub steer_queue: Option<Arc<wyj_core::SteerQueue>>,
+    /// 子 Agent 用量的共享累加器。主会话 ctx 持有它，`SubAgentTool` 把子 Agent
+    /// 自己的 `Session` 计数加进来，主 Agent 每批工具执行后抽干入账。
+    ///
+    /// **逐层透传，不会重复计数**：每一层只把自己那层 `Session` 的
+    /// `total_*` 加进去，而各层 `Session` 的计数只覆盖**自己发出的** API
+    /// 调用——嵌套子 Agent 的调用记在它自己的 Session 上，与父层的
+    /// `total_*` 天然不相交。`fork_for_surface` 仍然清掉它：fork 出来的
+    /// 是独立会话（ACP/daemon），不该继承某一个会话的累加器。
+    pub sub_usage: Option<wyj_core::session::SharedSubUsage>,
 }
 
 impl ToolCtx {
@@ -124,6 +133,7 @@ impl ToolCtx {
             always_allowed: RwLock::new(HashSet::new()),
             allowed_tools_path: None,
             steer_queue: None,
+            sub_usage: None,
         }
     }
 
@@ -145,6 +155,9 @@ impl ToolCtx {
             // 「回合进行中补话」这个交互面）。实时输出同理——非 TUI 表面没有
             // 接收端，挂上只会让工具白白多跑一条推送路径。
             steer_queue: None,
+            // fork 出的会话各自独立（ACP/daemon），不该继承某一个会话的子 Agent
+            // 用量累加器——那会把别的会话的开销记到本会话头上。
+            sub_usage: None,
         }
     }
 
@@ -253,6 +266,10 @@ impl ToolContext for ToolCtx {
 
     fn tool_output(&self) -> Option<&mpsc::Sender<wyj_core::tool::ToolOutputChunk>> {
         self.tool_output_tx.as_ref()
+    }
+
+    fn sub_usage_sink(&self) -> Option<&wyj_core::session::SharedSubUsage> {
+        self.sub_usage.as_ref()
     }
 
     async fn ask_questions(&self, questions: &[AskQuestionSpec]) -> Option<Vec<QuestionAnswer>> {

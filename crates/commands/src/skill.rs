@@ -532,6 +532,7 @@ mod tests {
                 &CommandContext {
                     cwd: PathBuf::new(),
                     model: String::new(),
+                    terminal_width: 0,
                     input_tokens: 0,
                     output_tokens: 0,
                     cache_read_tokens: 0,
@@ -546,6 +547,8 @@ mod tests {
                     home_dir: PathBuf::new(),
                     sub_input_tokens: 0,
                     sub_output_tokens: 0,
+                    sub_cache_read_tokens: 0,
+                    sub_cache_write_tokens: 0,
                     effective_mcp_count: 0,
                     plugin_agent_paths: vec![],
                     hooks_enabled: false,

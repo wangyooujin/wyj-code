@@ -132,11 +132,24 @@ impl SteerQueue {
     }
 }
 
+/// 随请求发送的工具 schema 估算 token。
+///
+/// **必须与 [`ContextAudit::from_request`] 的 `tool_schema_tokens` 同口径**
+/// （逐工具：name + description + input_schema 三段各自 `estimate_text_tokens`
+/// 后求和）。历史上这里用的是"整个 tools 数组序列化成 JSON 再 `bytes/4`"，
+/// 与审计口径差 28%：同一批工具在 `/context` 面板显示 8044、而本函数算 6281。
+/// 两个数指同一件事却长期不等，`/context` 又声称"与压缩决策同源"——
+/// 压缩用的是审计口径，本函数算出来的累计值就与真正发出去的量对不上。
+/// 现在统一到审计口径。
 fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
-    let bytes = serde_json::to_vec(tools)
-        .map(|value| value.len())
-        .unwrap_or(0);
-    ((bytes.saturating_add(3)) / 4).min(u32::MAX as usize) as u32
+    tools.iter().fold(0u32, |total, tool| {
+        let schema = tool.input_schema.to_string();
+        total.saturating_add(
+            (crate::compact::estimate_text_tokens(&tool.name)
+                + crate::compact::estimate_text_tokens(&tool.description)
+                + crate::compact::estimate_text_tokens(&schema)) as u32,
+        )
+    })
 }
 
 /// 主提示词和基础工作流会直接引用这些工具；lazy schema 只能隐藏可选集成，
@@ -1350,6 +1363,14 @@ impl Agent {
                     volatile: &request_system_volatile,
                 };
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
+                // 两个口径必须并存，含义不同：
+                // · `last` = 本次请求实际发送的量（稳态），与
+                //   `ContextAudit::tool_schema_tokens` 同源同值，`/context` 面板同口径；
+                // · 累计值 = 本会话为工具定义总共付了多少（成本口径）。
+                // 过去只有累计值且被 JSON / 插件事件当作"当前占用"展示，
+                // 200 次调用的会话会显示成百万级（实测 1,457,192），比真实稳态
+                // 值（6,281）高两个数量级。
+                session.tool_schema_tokens_last = sent_schema_tokens;
                 session.tool_schema_tokens = session
                     .tool_schema_tokens
                     .saturating_add(sent_schema_tokens);
@@ -2050,6 +2071,10 @@ impl Agent {
 
                 tool_results.extend(par_results.into_iter().chain(seq_results));
                 tool_results.sort_by_key(|(idx, _)| *idx);
+                // 子 Agent 用量回灌：必须等这批工具（可能并发跑了多个子 Agent）
+                // 全部 join 完再抽干，否则会漏掉后完成的那几个。`take` 是
+                // `swap(0)`，多调一次也不会重复计账。
+                session.drain_sub_usage(ctx.sub_usage_sink().map(|sink| sink.as_ref()));
                 for (_, (id, output, is_error)) in tool_results {
                     session.push_tool_result(id, output, is_error);
                 }
