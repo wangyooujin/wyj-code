@@ -158,6 +158,9 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 23 | Skill 名单注入模型上下文（不是工具） | `core::prompts::MAIN` 的 `# Skills` 段 | `crates/core` |
 | 24 | HTTP 技能注册表 SkillHub | `store::skillhub` | `crates/store` |
 | 25 | 前台 Bash 输出实时推进（快照节流，非增量） | `tools::BashTool` + `ToolContext::tool_output()` | `crates/tools` + `crates/tui` |
+| 26 | 面板类命令的排版引擎（按显示宽度对齐，零 i18n 调用） | `commands::cost_view` + `CommandContext::terminal_width` | `crates/commands` |
+| 27 | 预排版消息通道（逐行原样渲染，不折行） | `CommandResult::OutputPlain` + `MessageRole::Preformatted` | `crates/commands` + `crates/tui` |
+| 28 | 子 Agent token 用量计量（原子累加器，逐层透传） | `core::session::SubUsage` + `ToolContext::sub_usage_sink()` | `crates/core` + `crates/tools` |
 
 **跨 crate 改动的两条硬约定**：
 

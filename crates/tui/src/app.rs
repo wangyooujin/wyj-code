@@ -57,6 +57,28 @@ const SHELL_WAKE_TAIL_BYTES: usize = 64 * 1024;
 /// 用于 /model 热切换 / 设置面板保存后重建 Agent 的函数类型
 pub type RebuildFn = Arc<dyn Fn(&Config, &str) -> anyhow::Result<Agent> + Send + Sync>;
 
+/// 非 TUI 表面（headless REPL、`-p`、cron）探测终端列数，供 `CommandContext`
+/// 的排版类命令使用。TUI 路径不用它——那边每帧从真实 frame 回写
+/// （`AppState::chat_content_width`），resize 才跟得上。
+///
+/// 顺序：`COLUMNS` 环境变量 → `crossterm` 查询真实 TTY。前者优先是因为
+/// cron / 管道里 `COLUMNS` 往往是调用方显式给的意图值，而 crossterm 在
+/// 无 TTY 时可能返回默认值 80（看着像真值，实际是猜的）。都拿不到时返回
+/// 0，由 `cost_view` 回落到 `DEFAULT_WIDTH`。
+pub fn detect_terminal_width() -> usize {
+    if let Ok(cols) = std::env::var("COLUMNS") {
+        if let Ok(parsed) = cols.trim().parse::<usize>() {
+            if parsed > 0 {
+                return parsed.saturating_sub(2);
+            }
+        }
+    }
+    match crossterm::terminal::size() {
+        Ok((w, _)) if w > 0 => (w as usize).saturating_sub(2),
+        _ => 0,
+    }
+}
+
 /// 消息角色
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -75,6 +97,13 @@ pub enum MessageRole {
     /// ExitPlanMode 提交的计划正文，作为普通消息并入应用内聊天流；批准/拒绝/
     /// 手动输入的交互留在贴底的 `PlanApprovalDialog`。
     PlanProposal,
+    /// 自带排版的文本（`/cost` 的表格、`/usage` 的汇总）：换行与列对齐
+    /// **原样保留**，不经过 markdown。
+    ///
+    /// 为什么需要它：markdown 把「连续非空行」当一个段落重新折行，任何依赖
+    /// 列对齐的输出都会被揉成一团糊。代码块围栏也不行——会给整块加 `╭─╮`
+    /// 边框并再缩进 4 列。
+    Preformatted,
 }
 
 /// 渲染用消息
@@ -143,6 +172,11 @@ impl ChatMessage {
         let mut m = Self::base(MessageRole::Assistant, content);
         m.is_error = true;
         m
+    }
+
+    /// 自带排版的文本。内容里的换行与列对齐会被原样保留。
+    pub(crate) fn preformatted(content: String) -> Self {
+        Self::base(MessageRole::Preformatted, content)
     }
 
     fn tool_call(display: String, seq: usize) -> Self {
@@ -7137,6 +7171,10 @@ pub struct AppState {
     pub chat_scroll: usize,
     /// 当前聊天区可视行数，由渲染层每帧回写。
     pub chat_view_height: usize,
+    /// 当前聊天区**可用列数**，由渲染层每帧回写（见
+    /// [`render::chat_content_width`]）。`/cost` 这类需要按宽度排版的命令
+    /// 从这里取宽度：拿终端原始宽度会算得比实际可渲染的宽，表格被换行拆散。
+    pub chat_content_width: usize,
     /// 当前聊天区最大滚动偏移，由渲染层每帧回写。
     pub chat_max_scroll: usize,
     /// 是否跟随最新消息到底部。用户主动上滚后置 false。
@@ -7382,6 +7420,7 @@ impl AppState {
             welcome_frozen: false,
             chat_scroll: 0,
             chat_view_height: 0,
+            chat_content_width: 0,
             chat_max_scroll: 0,
             chat_follow_tail: true,
             unseen_messages: false,
@@ -10678,6 +10717,10 @@ fn spawn_agent_turn(
     // 子 Agent 的下一轮，而不是等它整个跑完。
     let steer = Arc::new(wyj_core::SteerQueue::new());
     let steer_in_task = Arc::clone(&steer);
+    // 子 Agent 用量累加器。ToolCtx 每回合重建（见上面 `ToolCtx::new`），
+    // 所以句柄必须跟着 task 走而不是挂在 ctx 上活一回合——否则子 Agent 写完
+    // 就随 ctx 一起丢弃，累加器永远是空的。
+    let sub_usage_acc = Arc::new(wyj_core::SubUsageTotals::default());
     let task = spawn_turn_task(async move {
         let mut sess = session_c.lock().await;
         match text {
@@ -10713,6 +10756,11 @@ fn spawn_agent_turn(
         // 让前台子 Agent 能拿到同一份注入队列：用户在它跑的过程中补充的要求
         // 插进子 Agent 自己的工具轮边界，而不是被堵到它跑完为止。
         ctx.steer_queue = Some(Arc::clone(&steer_in_task));
+        // 子 Agent 用量回灌通道：子 Agent 在自己的 Session 上跑，其 token 既不
+        // 进主会话的 total_* 也不发 AgentEvent::Usage（那只由主 Agent 发射）。
+        // 挂上这个累加器，主 Agent 每批工具执行后会把它抽干记进 session 的
+        // sub_* 字段，`/cost` 的「子 Agent」行与金额合计才有数据。
+        ctx.sub_usage = Some(Arc::clone(&sub_usage_acc));
         ctx.permission_mode = shared_permission;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
         // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
@@ -10751,7 +10799,7 @@ fn spawn_agent_turn(
             input: sess.total_input_tokens,
             output: sess.total_output_tokens,
             compact_count: sess.compact_count,
-            tool_schema_tokens: sess.tool_schema_tokens,
+            tool_schema_tokens: sess.tool_schema_tokens_last,
             tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
         };
         emit_plugin_event_background(
@@ -10761,8 +10809,15 @@ fn spawn_agent_turn(
                 "cwd": ctx_cwd,
                 "input_tokens": sess.total_input_tokens,
                 "output_tokens": sess.total_output_tokens,
-                "tool_schema_tokens": sess.tool_schema_tokens,
+                // 稳态口径：本次请求实际发送的工具 schema（与 /context 同源）。
+                "tool_schema_tokens": sess.tool_schema_tokens_last,
+                // 累加口径：本会话为工具定义总共付出的量。
+                "tool_schema_tokens_total": sess.tool_schema_tokens,
                 "tool_schema_tokens_saved": sess.tool_schema_tokens_saved,
+                "sub_input_tokens": sess.sub_input_tokens,
+                "sub_output_tokens": sess.sub_output_tokens,
+                "sub_cache_read_tokens": sess.sub_cache_read_tokens,
+                "sub_cache_write_tokens": sess.sub_cache_write_tokens,
                 "error": turn_result.as_ref().err().map(ToString::to_string),
             }),
         );
@@ -11732,7 +11787,13 @@ async fn tui_main(
             last_spinner_advance = Instant::now();
         }
 
-        terminal.draw(|f| render::draw(f, &mut state, &input))?;
+        terminal.draw(|f| {
+            // 先回写聊天区可用列数：`/cost` 等需要按宽度排版的命令在事件
+            // 分支里读它。必须取自本次真实 frame，而不是启动时探测一次——
+            // 用户中途 resize 时只有这里知道新宽度。
+            state.chat_content_width = render::chat_content_width(f.area().width);
+            render::draw(f, &mut state, &input)
+        })?;
 
         // 清空 agent 事件队列
         while let Ok(ev) = agent_rx.try_recv() {
@@ -14969,6 +15030,7 @@ async fn tui_main(
                                 prompt_cache_state,
                                 compact_count,
                                 context_edit,
+                                sub_usage,
                             ) = {
                                 let sess = match try_session_lock(&session) {
                                     Some(sess) => sess,
@@ -15000,11 +15062,18 @@ async fn tui_main(
                                         wyj_core::context_edit::elided_count(&sess.messages) as u32,
                                         sess.context_edit_freed_tokens,
                                     ),
+                                    // 子 Agent 用量取自 Session 的累加器而非
+                                    // `state.sub_*`：后者只收 SubAgentEvent 的
+                                    // input/output，**不含 cache_read**，且
+                                    // `/resume` 后归零。子 Agent 的开销大头恰恰是
+                                    // 缓存命中，丢掉它 /cost 会少算一大截。
+                                    sess.sub_usage(),
                                 )
                             };
                             let cmd_ctx = CommandContext {
                                 cwd: cwd.clone(),
                                 model: state.model_name.clone(),
+                                terminal_width: state.chat_content_width,
                                 input_tokens: state.total_input_tokens,
                                 output_tokens: state.total_output_tokens,
                                 cache_read_tokens: cache_read,
@@ -15019,8 +15088,10 @@ async fn tui_main(
                                 home_dir: std::env::var("HOME")
                                     .map(std::path::PathBuf::from)
                                     .unwrap_or_default(),
-                                sub_input_tokens: state.sub_input_tokens,
-                                sub_output_tokens: state.sub_output_tokens,
+                                sub_input_tokens: sub_usage.input,
+                                sub_output_tokens: sub_usage.output,
+                                sub_cache_read_tokens: sub_usage.cache_read,
+                                sub_cache_write_tokens: sub_usage.cache_write,
                                 effective_mcp_count: wyj_store::mcp_install::effective_mcp_servers(
                                     &state.config,
                                     &cwd,
@@ -15053,6 +15124,11 @@ async fn tui_main(
                                 match result {
                                     Ok(CommandResult::Output(out)) => {
                                         state.messages.push(ChatMessage::assistant(out));
+                                    }
+                                    Ok(CommandResult::OutputPlain(out)) => {
+                                        // 保留原始排版：不走 markdown，否则列对齐
+                                        // 会被段落折行揉碎。
+                                        state.messages.push(ChatMessage::preformatted(out));
                                     }
                                     Ok(CommandResult::ClearHistory) => {
                                         // 先取锁再做这一大串状态重置：反过来会让用户看到
@@ -15661,6 +15737,10 @@ async fn tui_main(
                                             ctx.set_execution_surface(
                                                 wyj_core::ExecutionSurface::TuiInteractive,
                                             );
+                                            // 追问续跑是同一个会话、新的 ToolCtx，
+                                            // 子 Agent 用量仍需回灌到同一个 session。
+                                            ctx.sub_usage =
+                                                Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
@@ -15677,7 +15757,7 @@ async fn tui_main(
                                                 input: sess.total_input_tokens,
                                                 output: sess.total_output_tokens,
                                                 compact_count: sess.compact_count,
-                                                tool_schema_tokens: sess.tool_schema_tokens,
+                                                tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
                                             };
@@ -15776,6 +15856,10 @@ async fn tui_main(
                                             ctx.set_execution_surface(
                                                 wyj_core::ExecutionSurface::TuiInteractive,
                                             );
+                                            // 追问续跑是同一个会话、新的 ToolCtx，
+                                            // 子 Agent 用量仍需回灌到同一个 session。
+                                            ctx.sub_usage =
+                                                Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c.clone();
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
                                             let turn_agent =
@@ -15812,7 +15896,7 @@ async fn tui_main(
                                                 input: sess.total_input_tokens,
                                                 output: sess.total_output_tokens,
                                                 compact_count: sess.compact_count,
-                                                tool_schema_tokens: sess.tool_schema_tokens,
+                                                tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
                                             };

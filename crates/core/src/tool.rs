@@ -154,6 +154,21 @@ pub trait ToolContext: Send + Sync {
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<std::path::PathBuf, String> {
         Err(format!("当前工具上下文未授权写入目标：{raw}"))
     }
+    /// 子 Agent 用量的共享累加器（见 [`crate::session::SubUsageTotals`]）。
+    ///
+    /// 子 Agent 在**自己的 `Session`** 上跑，用量天然与主会话的 `total_*`
+    /// 隔离——`AgentEvent::Usage` 只由主 Agent 发射，于是 `/cost` 里主会话
+    /// 的数字**系统性漏掉整棵子 Agent 子树**（实测最高消耗会话 6 个用户轮次
+    /// 跑了 225 次 API 调用，其中大量来自子 Agent）。本方法把累加器交给
+    /// `SubAgentTool`：子 Agent 结束时把自己的计数加进去，主 Agent 在每批
+    /// 工具执行后 `Session::drain_sub_usage` 抽干入账。
+    ///
+    /// 默认 `None` 表示"本上下文不承载子 Agent 用量"（headless / 测试 mock /
+    /// 子 Agent 自身的 ctx——嵌套子 Agent 记到**根**累加器上，避免同一 token
+    /// 被逐层重复计入）。
+    fn sub_usage_sink(&self) -> Option<&crate::session::SharedSubUsage> {
+        None
+    }
 }
 
 /// 单次工具调用的元信息（供需要关联 `tool_use_id` 的工具使用，如 SubAgent

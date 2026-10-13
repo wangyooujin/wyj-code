@@ -4,6 +4,49 @@
 
 ## [Unreleased]
 
+## [1.5.25] - 2026-10-13
+
+### `/cost` 里那张表其实根本没渲染出来，还把子 Agent 的开销整段漏掉了
+
+改这批之前先复现了一次「`/cost` 显示」：在 headless 下打印是对的表格，切到 TUI 就塌成**六行**，列全是歪的。两条独立的根因，一条是渲染管线，一条是排版本身。
+
+**① TUI 把表格揉成了一段散文**。TUI 收到 assistant 消息后交给 markdown 渲染，而 markdown 把「连续非空行」当一个段落、合并后再折行——一张 50 行的成本表在它眼里只是一段文字，于是原样折行、加行距、并到相邻段落里。headless 走裸 `println`、**不经过这一步**，所以只在 headless 验证会全部漏过。
+
+新增 `CommandResult::OutputPlain(String)` 与 `MessageRole::Preformatted`：逐行原样渲染，只在单行超宽时截断，**不折行**。刻意不复用代码块围栏——那会给整块加 `╭─╮` 边框并再缩进 4 列，表格反而更窄。渲染层也**不再补缩进**：内容自带版式，再补一截会让标题行与表格行错开。钉子 `real_cost_output_survives_the_tui_render_pipeline` 把真实的 `/cost` 输出过一遍真实渲染管线，断言渲染行数 == 源行数。
+
+**② 列宽是排版问题，不是翻译问题**。旧实现把对齐硬编码进 i18n 模板（`"  输入:   {input} tokens"`），靠中文字符恰好占 2 列来凑齐——切到英文立刻散架（`Input` 有缩进而 `Output`/`Total` 没有）。新增 `crates/commands/src/cost_view.rs` 作为独立排版引擎：宽度在 Rust 侧按**显示宽度**算（`unicode-width`，与 `tui/render.rs` 同版本，口径必须和实际渲染一致），标签只负责"叫什么"。宽度自适应聊天区可用列数（`CommandContext::terminal_width`，窄终端下先压标签列、再退化为省略号，**数字列永远保底**——它们才是用户真正要读的数）；宽度只在入口归一化一次，否则各子部件各自夹一次、拼起来必然超宽。
+
+几处刻意如此：
+
+- **未知 ≠ 0**。此前未上报的费用显示成 `~$0.0000`，那会被读成「这项免费」；现显示 `—` 占位并在脚注说明「金额为下界」。但**排除 `DOWNGRADED`**——那是端点拒绝 `cache_control`、缓存整个停用，与「能用但不报写入量」是两回事，混起来会误导。
+- **无单价必须显式提示**而不是静默降级成「只有 token 数」——静默降级会让用户以为那就是完整账单。
+- 费用固定 4 位小数：塌成 `0.0000` 同样会被误读成「没花钱」。
+- 数字列 `pad_start` **超宽时原样返回**：宁可破坏对齐也不能截错数字。
+- 宽度 < 32 列截断、> 160 列封顶（后者是不让超宽终端下表格拉成一行几百列的散沙）。
+
+### 子 Agent 的 token 用量此前整段没进主会话口径
+
+`AgentEvent::Usage` 只由主 Agent 发射，子 Agent 跑在自己的 `Session` 上——所以 `/cost` **系统性漏掉整棵子 Agent 子树**，而扇出的开销恰恰不在少数。TUI 侧原本有 `SubAgentEvent::Usage` 那条路，但它**不含 cache_read**、且 `/resume` 之后归零；子 Agent 的开销大头恰恰是缓存命中，等于漏上加漏。
+
+新增 `core::session::SubUsage`（4 个 `AtomicU32` 的累加器）+ `SharedSubUsage` 句柄：
+
+- **用原子量而非 Mutex**：子 Agent 可能 `parallel_safe` 并发跑；`take` 走 `swap(0)`，每个 token 只计一次，**天然幂等**。
+- **逐层透传、不重复计数**：每层只把自己那层 `Session` 的 `total_*` 加进累加器，各层天然不相交，嵌套子 Agent 同样汇总到根。
+- **抽干时机**必须等这一批工具全部 join 完，而不是单个工具返回时。
+- `fork_for_surface`（ACP / daemon）**必须清掉**累加器，否则别的会话开销会记到本会话头上；钉子 `drain_moves_subagent_usage_into_session_without_touching_main_totals` 守着这件事。
+- TUI 侧累加器句柄必须**跟着 task 走**而不是挂在 `ToolContext` 上活一回合——ctx 每回合重建，否则子 Agent 写完即随 ctx 丢弃，累加器永远是空的（这是实现时最先踩的坑）。
+- `/clear` 会连带清空子 Agent 计数（换对话但计费也归零），但**保留** `prompt_cache_state`（它描述运行环境而非对话内容）。
+
+`sub_*` 四个字段全部 `#[serde(default)]` 落盘，`/resume` 后继续累加；`wyj-code usage` 汇总与插件 channel 事件 payload、`WYJ_STATS_JSON` 同步补上。
+
+### `/context` 面板改用同一套排版引擎
+
+明细行（System prompt / 工具定义 / 对话历史 / 输出预留 / 协议开销）与合计行改走同一个 `cost_view::Table`，合计、百分比与阈值和自动压缩**同源**；headless 侧改读当前 Profile 的窗口而不是写死 200K。旧实现用 `{label:<18}` 补位——那是按**字符个数**补的，中文每字占 2 列，必然歪。
+
+顺带修一处覆盖缺口：`session_store.rs` 的落盘回归测试逐字段比对了 cache / api_calls / tool_schema / prompt_cache_state / compact_count / context_edit，但**没有比对**新加的 4 个 `sub_*` 字段。
+
+**1221 个 workspace 测试**（1184 → 1221） + clippy `-D warnings` 全绿。
+
 ## [1.5.24] - 2026-10-13
 
 ### 长命令跑到一半，界面什么都不给：前台 Bash 的输出改为实时推进

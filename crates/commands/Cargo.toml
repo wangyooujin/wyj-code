@@ -19,6 +19,10 @@ serde_json.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+# /cost 的表格列宽必须按**显示宽度**算（CJK 占 2 列）——对齐一旦交给
+# i18n 模板里的空格，换个语言就散架。这与 tui/render.rs 用的是同一个 crate
+# 版本，口径才能和实际渲染一致。
+unicode-width.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

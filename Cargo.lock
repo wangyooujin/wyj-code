@@ -5262,6 +5262,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "unicode-width 0.2.0",
  "wyj-computer",
  "wyj-config",
  "wyj-core",

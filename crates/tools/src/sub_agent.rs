@@ -513,6 +513,11 @@ impl SubAgentTool {
         // Agent = 12 分钟白等）。`Option<&SteerQueue>` 是 `'static` 引用，
         // 配合上面 `Arc` 句柄可以直接 move 进 task。
         let steer: Option<Arc<wyj_core::SteerQueue>> = ctx.steer_queue().cloned();
+        // 子 Agent 用量回灌通道，与 steer 同理必须先取成 'static 的 Arc。
+        // 逐层透传：每层只把自己那层 Session 的 total_* 加进去，各层不相交，
+        // 因此嵌套子 Agent 的开销同样能汇总到根（不会双计，见 ToolCtx::sub_usage）。
+        let sub_usage_sink: Option<wyj_core::session::SharedSubUsage> =
+            ctx.sub_usage_sink().cloned();
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -532,6 +537,8 @@ impl SubAgentTool {
             sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
             // 同一份队列往下传：嵌套子 Agent 也能被中途补充
             sub_ctx.steer_queue = steer.clone();
+            // 累加器同样往下传，让嵌套子 Agent 的开销也能回到根会话。
+            sub_ctx.sub_usage = sub_usage_sink.clone();
             // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
             // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
             // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
@@ -615,6 +622,21 @@ impl SubAgentTool {
                 outputs.join("\n\n")
             };
             is_error |= interrupted;
+
+            // 用量回灌。子 Agent 跑在自己的 `Session` 上，其 token 既不进主会话的
+            // `total_*`，也不发 `AgentEvent::Usage`（那只由主 Agent 路径发射）——
+            // 不记这一笔，`/cost` 看到的就是一棵被整棵截掉的子树账（实测最高
+            // 消耗会话 6 个用户轮次跑 225 次 API 调用，其中大量来自子 Agent）。
+            // 只加**本层** Session 的 `total_*`：各层 Session 的计数只覆盖自己
+            // 发出的调用，天然不相交，嵌套子 Agent 同样能汇总到根。
+            if let Some(sink) = &sub_usage_sink {
+                sink.add(wyj_core::session::SubUsage {
+                    input: session.total_input_tokens,
+                    output: session.total_output_tokens,
+                    cache_read: session.total_cache_read_tokens,
+                    cache_write: session.total_cache_write_tokens,
+                });
+            }
 
             hub_task.emit(SubAgentEvent::Done {
                 id,

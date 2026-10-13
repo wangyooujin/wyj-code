@@ -1,6 +1,74 @@
 //! 会话状态：消息历史 + 累计用量
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use wyj_api::types::{ContentBlock, Message, Role};
+
+/// 子 Agent 的用量快照（不含缓存写入时为 0）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubUsage {
+    pub input: u32,
+    pub output: u32,
+    pub cache_read: u32,
+    pub cache_write: u32,
+}
+
+/// 子 Agent 用量的**共享累加器**。
+///
+/// 子 Agent 跑在独立的 `Session` 上（`sub_agent.rs` 的 `Session::new()`），
+/// 它自己的 token 既不会进主会话的 `total_*`，也不会进
+/// `AgentEvent::Usage`——`UsageDelta` 只在 TUI 主 Agent 路径发射。因此在
+/// `/cost` 里看到的主会话用量**系统性漏掉整棵子 Agent 扇出子树**。
+///
+/// 机制：主会话在自己的 `ToolContext` 上挂一个本累加器，子 Agent 结束时把
+/// 自己那一轮 `Session` 的计数加进来（`add`），主 Agent 在每批工具执行后
+/// 调 [`SubUsageTotals::take`] 抽干计入 `Session` 的 `sub_*` 字段
+/// （`Session::drain_sub_usage`）。
+///
+/// 用原子量而非 `Mutex` 是因为子 Agent 可能 `parallel_safe` 并发跑，多个
+/// 子 Agent 会在同一批里同时累加；`take` 用 `swap(0)` 保证每个 token 只被
+/// 主会话计入一次，天然幂等。
+#[derive(Debug, Default)]
+pub struct SubUsageTotals {
+    input: AtomicU32,
+    output: AtomicU32,
+    cache_read: AtomicU32,
+    cache_write: AtomicU32,
+}
+
+impl SubUsageTotals {
+    pub fn add(&self, usage: SubUsage) {
+        self.input.fetch_add(usage.input, Ordering::Relaxed);
+        self.output.fetch_add(usage.output, Ordering::Relaxed);
+        self.cache_read
+            .fetch_add(usage.cache_read, Ordering::Relaxed);
+        self.cache_write
+            .fetch_add(usage.cache_write, Ordering::Relaxed);
+    }
+
+    /// 抽走并清空累计值。多次并发调用不会重复计账。
+    pub fn take(&self) -> SubUsage {
+        SubUsage {
+            input: self.input.swap(0, Ordering::Relaxed),
+            output: self.output.swap(0, Ordering::Relaxed),
+            cache_read: self.cache_read.swap(0, Ordering::Relaxed),
+            cache_write: self.cache_write.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    pub fn snapshot(&self) -> SubUsage {
+        SubUsage {
+            input: self.input.load(Ordering::Relaxed),
+            output: self.output.load(Ordering::Relaxed),
+            cache_read: self.cache_read.load(Ordering::Relaxed),
+            cache_write: self.cache_write.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// 共享句柄别名，供 `ToolContext::sub_usage_sink` 使用。
+pub type SharedSubUsage = Arc<SubUsageTotals>;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RoutingEvent {
@@ -26,10 +94,34 @@ pub struct Session {
     /// 本会话累计发起的模型推理次数（每次 provider.stream 调用计 1），
     /// 供评测基准（WYJ_STATS_JSON）衡量任务完成所需的 API 往返数。
     pub api_calls: u32,
-    /// 实际随模型请求发送的工具 schema 估算 token 累计值。
+    /// **累计**随模型请求发送的工具 schema 估算 token（全会话求和，每次
+    /// `provider.stream` 前累加一次）。它回答的是"本次会话为工具定义总共
+    /// 付了多少"，不是"当前上下文里占了多少"。
+    ///
+    /// ⚠️ 不要拿它当单请求的稳态值展示：一次 200 次调用的会话会累到百万级
+    /// （实测最高 1,457,192），而真实的单请求值只有 6,281。单请求口径看
+    /// [`Self::context_audit`] 的 `tool_schema_tokens`——`/context` 面板用的
+    /// 就是它。
     pub tool_schema_tokens: u32,
+    /// **最近一次请求**实际发送的工具 schema 估算 token（稳态值）。
+    ///
+    /// 与 [`crate::compact::ContextAudit::tool_schema_tokens`] 同源同值，
+    /// 单独存一份是为了让 JSON / 插件事件这类拿不到 `context_audit` 的消费
+    /// 方也能拿到稳态口径，不必自己重算。
+    pub tool_schema_tokens_last: u32,
     /// lazy schema 相对全量工具集合累计避免发送的估算 token。
     pub tool_schema_tokens_saved: u32,
+    /// 子 Agent 扇出累计消耗的输入 token。与 `total_input_tokens` **不重叠**
+    /// ——子 Agent 跑在自己的 `Session` 上，其用量由
+    /// [`Self::drain_sub_usage`] 从 `ToolContext` 的共享累加器搬进来。
+    pub sub_input_tokens: u32,
+    /// 子 Agent 累计输出 token。
+    pub sub_output_tokens: u32,
+    /// 子 Agent 累计缓存命中 token。
+    pub sub_cache_read_tokens: u32,
+    /// 子 Agent 累计缓存写入 token（当前配置的第三方端点不上报，恒为 0，
+    /// 与主会话的 `total_cache_write_tokens` 同因，详见 `/cost` 的说明行）。
+    pub sub_cache_write_tokens: u32,
     /// 最近一次模型请求的上下文占用分解。与压缩决策**同源**，供 TUI 的
     /// `/context` 面板使用——旧实现里面板/状态栏自己调 `estimate_tokens`
     /// （只算 messages），与 `estimate_request_tokens`（含 system + tools +
@@ -166,6 +258,32 @@ impl Session {
         self.total_cache_write_tokens += cache_write;
     }
 
+    /// 把子 Agent 累加器里已记录的用量搬进本会话的 `sub_*` 字段。
+    ///
+    /// 由 `Agent::run_turn` 在**每批工具执行后**调用一次（子 Agent 可能
+    /// `parallel_safe` 并发，抽干必须等这批 join 完）。`take` 内部是
+    /// `swap(0)`，所以重复调用不会重复计账；没有累加器时是 no-op。
+    pub fn drain_sub_usage(&mut self, sink: Option<&SubUsageTotals>) {
+        let Some(sink) = sink else { return };
+        let usage = sink.take();
+        self.sub_input_tokens = self.sub_input_tokens.saturating_add(usage.input);
+        self.sub_output_tokens = self.sub_output_tokens.saturating_add(usage.output);
+        self.sub_cache_read_tokens = self.sub_cache_read_tokens.saturating_add(usage.cache_read);
+        self.sub_cache_write_tokens = self
+            .sub_cache_write_tokens
+            .saturating_add(usage.cache_write);
+    }
+
+    /// 本会话的子 Agent 用量合计（`/cost` 的「子 Agent」行用）。
+    pub fn sub_usage(&self) -> SubUsage {
+        SubUsage {
+            input: self.sub_input_tokens,
+            output: self.sub_output_tokens,
+            cache_read: self.sub_cache_read_tokens,
+            cache_write: self.sub_cache_write_tokens,
+        }
+    }
+
     /// 从落盘文件恢复**全部计量与血缘字段**。
     ///
     /// 与 [`SessionFile::from_session`] 成对：这两个函数是 `Session` ↔
@@ -184,6 +302,10 @@ impl Session {
         self.api_calls = file.api_calls;
         self.tool_schema_tokens = file.tool_schema_tokens;
         self.tool_schema_tokens_saved = file.tool_schema_tokens_saved;
+        self.sub_input_tokens = file.sub_input_tokens;
+        self.sub_output_tokens = file.sub_output_tokens;
+        self.sub_cache_read_tokens = file.sub_cache_read_tokens;
+        self.sub_cache_write_tokens = file.sub_cache_write_tokens;
         self.prompt_cache_state = file.prompt_cache_state;
         self.compact_count = file.compact_count;
         self.context_edit_freed_tokens = file.context_edit_freed_tokens;
@@ -197,6 +319,112 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 子 Agent 用量回灌 ────────────────────────────────────────────────
+
+    fn usage(input: u32, output: u32, cache_read: u32, cache_write: u32) -> SubUsage {
+        SubUsage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    #[test]
+    fn sub_totals_take_is_draining_not_peeking() {
+        let totals = SubUsageTotals::default();
+        totals.add(usage(100, 20, 5_000, 7));
+        let first = totals.take();
+        assert_eq!(first, usage(100, 20, 5_000, 7));
+        // 抽干后必须归零：否则主 Agent 每批工具执行后 drain 一次，
+        // 同一批子 Agent 的用量会被反复计入（take 的语义是 drain）。
+        assert_eq!(totals.take(), SubUsage::default());
+    }
+
+    #[test]
+    fn concurrent_subagents_accumulate_without_loss() {
+        let totals = Arc::new(SubUsageTotals::default());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let totals = Arc::clone(&totals);
+                std::thread::spawn(move || totals.add(usage(10, 2, 100, 0)))
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(totals.take(), usage(80, 16, 800, 0));
+    }
+
+    #[test]
+    fn drain_moves_subagent_usage_into_session_without_touching_main_totals() {
+        let totals = SubUsageTotals::default();
+        totals.add(usage(3_000, 400, 120_000, 0));
+        let mut session = Session::new();
+        session.add_usage(500, 50);
+        session.add_cache_usage(9_000, 0);
+
+        session.drain_sub_usage(Some(&totals));
+
+        // 主会话口径不变——子 Agent 用量必须**不重叠**，否则 /cost 会双计。
+        assert_eq!(session.total_input_tokens, 500);
+        assert_eq!(session.total_output_tokens, 50);
+        assert_eq!(session.total_cache_read_tokens, 9_000);
+        // 子 Agent 口径独立。
+        assert_eq!(session.sub_input_tokens, 3_000);
+        assert_eq!(session.sub_output_tokens, 400);
+        assert_eq!(session.sub_cache_read_tokens, 120_000);
+    }
+
+    #[test]
+    fn repeated_drain_is_idempotent() {
+        let totals = SubUsageTotals::default();
+        totals.add(usage(1_000, 100, 50_000, 0));
+        let mut session = Session::new();
+        session.drain_sub_usage(Some(&totals));
+        session.drain_sub_usage(Some(&totals));
+        session.drain_sub_usage(Some(&totals));
+        assert_eq!(session.sub_input_tokens, 1_000);
+        assert_eq!(session.sub_cache_read_tokens, 50_000);
+    }
+
+    #[test]
+    fn drain_without_sink_is_a_noop() {
+        let mut session = Session::new();
+        session.drain_sub_usage(None);
+        assert_eq!(session.sub_usage(), SubUsage::default());
+    }
+
+    #[test]
+    fn clear_conversation_also_resets_subagent_usage() {
+        let totals = SubUsageTotals::default();
+        totals.add(usage(700, 70, 21_000, 0));
+        let mut session = Session::new();
+        session.drain_sub_usage(Some(&totals));
+        assert!(session.sub_input_tokens > 0);
+        // /clear 换的是对话内容，但计费用量一并归零——否则新对话的 /cost
+        // 会把上一段对话的子 Agent 开销算进来。
+        session.clear_conversation();
+        assert_eq!(session.sub_usage(), SubUsage::default());
+    }
+
+    // ── 工具 schema 双口径 ───────────────────────────────────────────────
+
+    /// 回归：`tool_schema_tokens` 是**全会话累加**，`tool_schema_tokens_last`
+    /// 才是最近一次请求的稳态值。历史上只有前者且被当作稳态值展示，
+    /// 225 次调用的会话会显示成 1,457,192（真实稳态值只有 6,281）。
+    #[test]
+    fn tool_schema_accumulates_while_last_stays_steady() {
+        let mut session = Session::new();
+        for _ in 0..225 {
+            session.tool_schema_tokens_last = 6_281;
+            session.tool_schema_tokens = session.tool_schema_tokens.saturating_add(6_281);
+        }
+        assert_eq!(session.tool_schema_tokens, 225 * 6_281);
+        assert_eq!(session.tool_schema_tokens_last, 6_281);
+        assert!(session.tool_schema_tokens > session.tool_schema_tokens_last * 100);
+    }
 
     #[test]
     fn clear_conversation_preserves_checkpoint_lineage() {

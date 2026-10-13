@@ -1616,7 +1616,12 @@ mod tests {
                 cache_write_tokens: 0,
                 api_calls: 0,
                 tool_schema_tokens: 0,
+                tool_schema_tokens_last: 0,
                 tool_schema_tokens_saved: 0,
+                sub_input_tokens: 0,
+                sub_output_tokens: 0,
+                sub_cache_read_tokens: 0,
+                sub_cache_write_tokens: 0,
                 prompt_cache_state: 0,
                 messages: vec![
                     Message::user("saved question"),

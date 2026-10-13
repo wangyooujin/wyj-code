@@ -55,12 +55,36 @@ pub struct SessionFile {
     /// 不是单次 token 数。
     #[serde(default)]
     pub api_calls: u32,
-    /// 实际随请求发送的工具 schema 估算 token 累计值。
+    /// **累计**随请求发送的工具 schema 估算 token（全会话求和）。
+    ///
+    /// ⚠️ 这是**累加值**，不是单请求稳态值——200 次调用的会话会累到百万级
+    /// （实测最高 1,457,192），真实单请求值只有 6,281。展示"当前上下文里
+    /// 工具定义占了多少"必须改用 `tool_schema_tokens_last`，或直接读
+    /// `ContextAudit::tool_schema_tokens`（`/context` 面板走的就是后者）。
     #[serde(default)]
     pub tool_schema_tokens: u32,
+    /// **最近一次请求**发送的工具 schema 估算 token（稳态值）。
+    ///
+    /// 不落盘：`/resume` 回来的会话尚未发起过新请求，没有任何"最近一次"
+    /// 可言，填一个陈旧值比留 0 更糟（用户会以为当前请求真发了那么多）。
+    /// 下一次请求发出后本字段自然被刷新。
+    #[serde(default, skip_serializing)]
+    pub tool_schema_tokens_last: u32,
     /// lazy tool schema 相对全量工具集合累计避免发送的估算 token。
     #[serde(default)]
     pub tool_schema_tokens_saved: u32,
+    /// 子 Agent 扇出累计输入 token。与 `input_tokens` 不重叠。
+    #[serde(default)]
+    pub sub_input_tokens: u32,
+    /// 子 Agent 扇出累计输出 token。
+    #[serde(default)]
+    pub sub_output_tokens: u32,
+    /// 子 Agent 扇出累计缓存命中 token。
+    #[serde(default)]
+    pub sub_cache_read_tokens: u32,
+    /// 子 Agent 扇出累计缓存写入 token。
+    #[serde(default)]
+    pub sub_cache_write_tokens: u32,
     /// 本会话实际生效的 prompt cache 模式（见 [`PromptCacheState`]）。
     /// 存 u8 而非 enum 是为了旧文件 `#[serde(default)]` 直接落到 0，
     /// 也避免将来加枚举值时反序列化失败。
@@ -119,7 +143,12 @@ impl SessionFile {
             cache_write_tokens: session.total_cache_write_tokens,
             api_calls: session.api_calls,
             tool_schema_tokens: session.tool_schema_tokens,
+            tool_schema_tokens_last: session.tool_schema_tokens_last,
             tool_schema_tokens_saved: session.tool_schema_tokens_saved,
+            sub_input_tokens: session.sub_input_tokens,
+            sub_output_tokens: session.sub_output_tokens,
+            sub_cache_read_tokens: session.sub_cache_read_tokens,
+            sub_cache_write_tokens: session.sub_cache_write_tokens,
             prompt_cache_state: session.prompt_cache_state,
             compact_count: session.compact_count,
             context_edit_freed_tokens: session.context_edit_freed_tokens,
@@ -303,7 +332,12 @@ impl SessionStore {
             cache_write_tokens: 0,
             api_calls: 0,
             tool_schema_tokens: 0,
+            tool_schema_tokens_last: 0,
             tool_schema_tokens_saved: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             messages: checkpoint.messages.clone(),
             routing_events: vec![],
@@ -400,6 +434,11 @@ mod tests {
             api_calls: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
+            tool_schema_tokens_last: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![],
             routing_events: vec![],
@@ -585,6 +624,11 @@ mod tests {
             api_calls: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
+            tool_schema_tokens_last: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![Message::user("first"), Message::assistant_text("answer")],
             routing_events: vec![],
@@ -645,6 +689,11 @@ mod tests {
             api_calls: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
+            tool_schema_tokens_last: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             messages: vec![Message::user(format!("credential: {secret}"))],
             routing_events: Vec::new(),
