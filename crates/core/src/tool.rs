@@ -43,6 +43,20 @@ impl ToolResult {
     }
 }
 
+/// 工具执行过程中的**实时输出快照**（可选能力，默认不启用）。
+///
+/// 语义刻意是「快照」而非「增量」：每次推送都携带当前累计输出的尾部若干字节，
+/// 接收端拿到任意一帧都是自洽的最新视图。因此上游用 `try_send` 在通道满时
+/// 直接丢弃是安全的——被丢掉的快照会被下一次推送覆盖，不会留下内容缺口。
+/// 反过来若传增量，丢弃就等于永久丢数据。
+#[derive(Debug, Clone)]
+pub struct ToolOutputChunk {
+    /// 对应 [`ToolCallMeta::tool_use_id`]，接收端据此把输出挂到正确的调用上。
+    pub tool_use_id: String,
+    /// 当前累计输出的尾部（不超过调用方设定的字节上限）。
+    pub tail: String,
+}
+
 /// AskQuestion 工具的单个选项
 #[derive(Debug, Clone)]
 pub struct AskQuestionOption {
@@ -104,6 +118,16 @@ pub trait ToolContext: Send + Sync {
     /// 回合级共享注入队列：Agent 忙碌期间用户补充的内容。仅 `SubAgentTool`
     /// 需要它（把注入能力带进前台子 Agent 内部），其余工具默认 None。
     fn steer_queue(&self) -> Option<&Arc<crate::SteerQueue>> {
+        None
+    }
+    /// 实时输出通道：工具执行途中把输出快照推给 UI（当前只有前台 Bash 的
+    /// stdout/stderr 尾部用）。默认 `None` —— headless / 子 Agent / 无 UI 表面
+    /// 没有接收端，工具据此静默降级为「跑完一次性返回」，行为与本通道引入
+    /// 前完全一致。
+    ///
+    /// 约定：调用方（工具）**不得** await 该通道，用 `try_send`；且必须节流
+    /// （快照语义下丢弃是安全的，详见 [`ToolOutputChunk`]）。
+    fn tool_output(&self) -> Option<&tokio::sync::mpsc::Sender<ToolOutputChunk>> {
         None
     }
     /// 当前是否为 Plan 权限语义，供派生的子 Agent 继承限制。

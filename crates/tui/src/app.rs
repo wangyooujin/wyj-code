@@ -34,7 +34,7 @@ use wyj_commands::skill::ProjectSkillsGate;
 use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::notify::{emit as notify_emit, NotificationEvent};
-use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
+use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolOutputChunk};
 use wyj_core::{
     discover_files, extract_preview, extract_title, new_session_id, now_iso, Agent,
     AgentDefinition, CandidatePayload, CandidateStatus, DiscoveredFile, Episode,
@@ -43,7 +43,10 @@ use wyj_core::{
 };
 use wyj_tools::todo::{is_todo_collapsible, TodoItem, TodoStatus};
 use wyj_tools::trace::TraceEvent;
-use wyj_tools::{ctx::UiAskRequest, PermissionMode};
+use wyj_tools::{
+    ctx::{install_global_tool_output_sink, UiAskRequest},
+    PermissionMode,
+};
 use wyj_tools::{ExitPlanModeTool, TodoStore, ToolCtx};
 
 /// 后台 shell 任务退出时，读取多少字节的输出尾部喂给模型（喂之前还会再经
@@ -6569,16 +6572,100 @@ mod clipboard_paste_tests {
     }
 
     #[test]
-    fn output_expanded_defaults_to_folded_and_resets_with_session() {
+    fn output_expanded_defaults_to_auto_mode_and_resets_with_session() {
         let mut state = make_state();
         assert!(
             !state.output_expanded,
-            "thinking 默认折叠，避免默认视图被几十行思考挤满"
+            "默认进自动模式：执行中的步骤自动展开，历史保持折叠"
         );
 
         state.output_expanded = true;
         state.reset_for_new_session();
-        assert!(!state.output_expanded);
+        assert!(!state.output_expanded, "新会话回到自动模式");
+    }
+
+    #[test]
+    fn live_tool_output_only_lands_while_the_call_is_in_flight() {
+        let mut state = make_state();
+        let chunk = ToolOutputChunk {
+            tool_use_id: "toolu_1".to_string(),
+            tail: "first".to_string(),
+        };
+
+        // ToolStart 之前：还没有调用登记，快照无处可挂（也无处可显）
+        state.is_thinking = true;
+        state.apply_tool_output_chunk(chunk.clone());
+        assert!(state.live_tool_out.is_empty(), "未登记的调用不得产生实时块");
+
+        // ToolStart 之后
+        state.tool_info.insert("toolu_1".into(), ("Bash".into(), 0));
+        state.apply_tool_output_chunk(chunk.clone());
+        assert_eq!(
+            state.live_tool_out.get("toolu_1").map(String::as_str),
+            Some("first")
+        );
+
+        // 后续快照原地替换（快照语义：每帧自带完整累计输出）
+        state.apply_tool_output_chunk(ToolOutputChunk {
+            tool_use_id: "toolu_1".to_string(),
+            tail: "first\nsecond".to_string(),
+        });
+        assert_eq!(
+            state.live_tool_out.get("toolu_1").map(String::as_str),
+            Some("first\nsecond")
+        );
+
+        // ToolEnd 收工
+        let tail = "first\nsecond".to_string();
+        state.apply_agent_event(AgentEvent::ToolEnd {
+            id: "toolu_1".to_string(),
+            output: tail,
+            is_error: false,
+            elapsed_secs: 0.1,
+        });
+        assert!(
+            state.live_tool_out.is_empty(),
+            "调用结束必须摘掉快照，否则哈希表里会一直躺着没人渲染的 8KB"
+        );
+    }
+
+    #[test]
+    fn late_live_output_after_an_interrupted_turn_is_dropped() {
+        // ESC 中断 abort 掉回合 future，但 Bash 的 pump 会一直读到管道 EOF，
+        // 中断之后还可能推来最后几帧。这些帧若被接收，聊天区会留下一块永远
+        // 转圈的幽灵输出。
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.tool_info.insert("toolu_1".into(), ("Bash".into(), 0));
+
+        // 中断：回合结束但 tool_info 未被清理（与真实路径一致）
+        state.is_thinking = false;
+        state.apply_tool_output_chunk(ToolOutputChunk {
+            tool_use_id: "toolu_1".to_string(),
+            tail: "late".to_string(),
+        });
+        assert!(
+            state.live_tool_out.is_empty(),
+            "回合已结束后到达的快照必须丢弃"
+        );
+    }
+
+    #[test]
+    fn live_tool_output_does_not_mark_unseen_messages() {
+        // 实时刷新是同一块区域的原地更新。若点亮「未读」，用户上滚翻历史时
+        // 会每帧被计一次新消息。
+        let mut state = make_state();
+        state.is_thinking = true;
+        state.tool_info.insert("toolu_1".into(), ("Bash".into(), 0));
+        state.chat_follow_tail = false;
+        state.unseen_messages = false;
+
+        state.apply_tool_output_chunk(ToolOutputChunk {
+            tool_use_id: "toolu_1".to_string(),
+            tail: "noise".to_string(),
+        });
+
+        assert!(!state.unseen_messages);
     }
 
     #[test]
@@ -7018,9 +7105,13 @@ pub struct AppState {
     /// extended thinking 流式累积（正文开始时固化为 Thinking 消息）
     pub thinking_buf: String,
     pub thinking_started: Option<std::time::Instant>,
-    /// 是否展开所有可折叠正文——thinking 块与**工具调用结果**（Ctrl+O 全局切换，
-    /// 两者共用同一个 flag）。默认折叠：thinking 动辄几十行、工具输出动辄几百行，
-    /// 默认视图只该留给对话本身与最终答案，需要细节时再按一次展开。
+    /// Ctrl+O 全局覆盖开关。`false`（默认）**不是「全部折叠」，而是「自动模式」**：
+    /// 正在执行的步骤（工具实时输出、流式 thinking）默认展开，跑完即收起，历史
+    /// 保持干净；`true` 才是把 thinking 块与工具调用结果一次性全部展开，常见于
+    /// 一次性通读整段执行过程。
+    ///
+    /// 按 Ctrl+O 在两者间切换；再按一次回到自动模式——与旧语义（切回「全折叠」）
+    /// 的区别是，回自动模式后新执行的步骤会自动展开，而不是永远保持折叠。
     pub output_expanded: bool,
     pub is_thinking: bool,
     pub permission_dialog: Option<PermissionDialog>,
@@ -7073,6 +7164,12 @@ pub struct AppState {
     pub tool_call_count: usize,
     /// 工具 id → (名称, 序号)，用于将 ToolEnd 与 ToolStart 关联
     pub tool_info: HashMap<String, (String, usize)>,
+    /// 正在执行中的工具的实时输出：`tool_use_id` → 当前累计输出的尾部快照。
+    ///
+    /// 键空间刻意与 `tool_info` 重叠——条目的存在与否就是「这个调用还在飞」的
+    /// 唯一判据（渲染层据此与 `tool_info` 求交集后再按 `sequence_no` 挂到
+    /// 对应的 ⏺ 行下方）。不留「已完成但内容还没清」的中间态。
+    pub live_tool_out: HashMap<String, String>,
     pub model_name: String,
     pub context_window: u32,
     pub mode: AgentMode,
@@ -7300,6 +7397,7 @@ impl AppState {
             spinner_frame: 0,
             tool_call_count: 0,
             tool_info: HashMap::new(),
+            live_tool_out: HashMap::new(),
             model_name,
             context_window,
             mode,
@@ -7448,6 +7546,7 @@ impl AppState {
         self.turns = 0;
         self.tool_call_count = 0;
         self.tool_info.clear();
+        self.live_tool_out.clear();
         self.history_idx = None;
         self.history_draft = None;
         self.current_todos = None;
@@ -7779,6 +7878,23 @@ impl AppState {
         if !self.chat_follow_tail {
             self.unseen_messages = true;
         }
+    }
+
+    /// 收下一帧工具实时输出快照。
+    ///
+    /// **不**调 `note_new_chat_content`：实时刷新是同一块区域的原地更新，不是新
+    /// 消息。若在这里点亮「未读」标记，用户上滚翻历史时会每 50ms 被拽一次。
+    /// 视觉跟随由聊天区的贴底逻辑负责，它看的是内容高度而不是未读计数。
+    pub(crate) fn apply_tool_output_chunk(&mut self, chunk: ToolOutputChunk) {
+        // 两道闸门缺一不可：
+        // ① `tool_info` 无此 id = 这次调用已经 ToolEnd 配对完毕。ESC 中断会
+        //    abort 掉回合 future，但 Bash 的 pump 会一直读到管道 EOF，中断后
+        //    仍可能推来最后几帧；不过闸就渲染出一块永远转圈的幽灵输出。
+        // ② `is_thinking` = 回合已结束（异常退出也会走这里），同上。
+        if !self.is_thinking || !self.tool_info.contains_key(&chunk.tool_use_id) {
+            return;
+        }
+        self.live_tool_out.insert(chunk.tool_use_id, chunk.tail);
     }
 
     fn push_message(&mut self, mut msg: ChatMessage) -> u64 {
@@ -8691,6 +8807,10 @@ impl AppState {
                 self.current_op = None;
                 self.current_op_started = None;
                 let (name, seq) = self.tool_info.remove(&id).unwrap_or_default();
+                // 实时输出块就此收工：后续由折叠态的 ⎿ 结果行接管正文。
+                // 漏删的话，`apply_tool_output_chunk` 的闸门会挡住它，但哈希表
+                // 里会一直留着一份没人渲染的快照（每个执行过的 Bash 一份 8KB）。
+                self.live_tool_out.remove(&id);
                 // ToolStart 已跳过 TodoWrite 的常规行，这里对称地跳过它的回执。
                 // 不能只依赖"call_idx 找不到配对"来自然落空——那样会走
                 // `push_tracked_message` 把 "⎿ 任务列表已更新: N 项…" 追加到流尾。
@@ -9655,6 +9775,39 @@ impl TerminalWheelRouting {
     }
 }
 
+/// 等回触发退出的那个按键的 release 事件的总上限。
+const QUIT_KEY_RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
+/// `event::poll` 的切片：分片轮询而不是一次睡满，便于超时精确收口。
+const QUIT_KEY_POLL_SLICE: Duration = Duration::from_millis(20);
+
+/// 退出前等回触发退出的按键的 release 事件。
+///
+/// Ghostty 路径压了 `DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES`，一次 Ctrl+C /
+/// Ctrl+D 因此会产生 **press + release 两个 `CSI u` 事件**（c → `CSI 99;5;1u` 与
+/// `CSI 99;5;3u`；`CSI < u` 只能改写*之后*的编码，杀不掉已经发出的字节）。收到 press
+/// 就直接退出的话，松手时才生成的 release 会落进 shell，被 zsh 的 ZLE 当普通字符插进
+/// 命令行，表现为提示符后凭空多出 `9;5;3u`。这里把配对的 release 等回来（带上限），
+/// 让一次按键的 press/release 在 TUI 内部闭环。
+///
+/// 其它终端路径的按键没有 release 事件，直接跳过、不浪费退出时间。
+fn await_quit_key_release(wheel_routing: TerminalWheelRouting) {
+    if !wheel_routing.distinguishes_synthetic_arrows() {
+        return;
+    }
+    let deadline = Instant::now() + QUIT_KEY_RELEASE_TIMEOUT;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if remaining.is_zero() {
+            break;
+        }
+        match event::poll(remaining.min(QUIT_KEY_POLL_SLICE)) {
+            // 拿到任何一个按键事件即认为配对完成（正常情况下就是那个 release）。
+            Ok(true) => return,
+            Ok(false) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
 /// 进入全屏 TUI，但明确关闭鼠标捕获：鼠标由终端原生处理，用户可直接拖选文字，
 /// 不需要按住 Shift/Option，松开修饰键后选区也不会被应用鼠标事件立即冲掉。
 fn enter_terminal_screen<W: Write>(
@@ -10132,10 +10285,15 @@ pub async fn run_tui(
     )
     .await;
 
-    disable_raw_mode()?;
+    // 顺序有讲究：先还原终端协议（pop Kitty 键盘增强标志），再排空这批在途按键事件，
+    // 最后关 raw mode。排空必须夹在中间 —— pop 之前终端还在增强模式、随时可能再写新的
+    // release 事件进来；关 raw mode 之后队列里残留的 0x03 又会给本进程发 SIGINT。
     // 全程都在 alternate screen，退出时统一还原；再次发送 DisableMouseCapture
     // 可防御外部组件或异常路径意外开启鼠标报告模式。
-    leave_terminal_screen(terminal.backend_mut(), wheel_routing)?;
+    let leave_result = leave_terminal_screen(terminal.backend_mut(), wheel_routing);
+    crate::terminal_input::drain_pending_input();
+    disable_raw_mode()?;
+    leave_result?;
     // 标记已离开 alternate screen：panic hook 不再还原终端。
     // 必须放在 leave 成功之后,确保 leave 失败时 hook 仍会兜底还原一次。
     crate::panic_guard::mark_inactive();
@@ -10276,8 +10434,9 @@ fn wire_tool_callback(
 /// 挂起 TUI，交给 $EDITOR（未设置回退 vi）打开指定文件，编辑完成后恢复 TUI
 /// 并强制整屏重绘。除了 raw mode / alternate screen，还必须成对撤销并恢复
 /// Kitty 键盘增强、bracketed paste 和滚轮路由；否则外部编辑器会收到 TUI 请求的
-/// press/repeat/release 编码，把一次普通按键解析成多个字符。文件父目录若不存在会
-/// 先创建，方便直接对着尚不存在的候选路径按 Enter 新建。
+/// press/repeat/release 编码，把一次普通按键解析成多个字符。撤销之后再排空一次
+/// tty 队列：pop 只影响之后的编码，已经在途的 release 事件会被编辑器当成字符读走。
+/// 文件父目录若不存在会先创建，方便直接对着尚不存在的候选路径按 Enter 新建。
 async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     path: &std::path::Path,
@@ -10287,8 +10446,9 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
         let _ = std::fs::create_dir_all(parent);
     }
 
-    disable_raw_mode()?;
     leave_terminal_screen(terminal.backend_mut(), wheel_routing)?;
+    crate::terminal_input::drain_pending_input();
+    disable_raw_mode()?;
 
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let path_buf = path.to_path_buf();
@@ -11444,6 +11604,18 @@ async fn tui_main(
 
     let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
     let (ui_ask_tx, mut ui_ask_rx) = mpsc::channel::<UiAskRequest>(8);
+    // 工具执行途中的实时输出。前台 Bash 把 stdout/stderr 的累计尾部按 100ms
+    // 快照推进这里，主循环排空后交给渲染层挂在对应 ⏺ 行下方——这是「正在执行
+    // 的步骤默认展开」的唯一数据来源。
+    //
+    // 容量取 8 是刻意的：快照语义下满了直接丢最旧的即可（下一帧自带完整累计
+    // 输出），而容量放大只会让突发输出把排队延迟拉长到肉眼可见。
+    let (tool_out_tx, mut tool_out_rx) = mpsc::channel::<ToolOutputChunk>(8);
+    if !install_global_tool_output_sink(tool_out_tx) {
+        // 进程内已有 sink（理论上只有一份 TUI 主循环）。第二个 receiver 与第一个
+        // 抢同一批快照，表现为输出随机停在半途——与其静默错乱不如喊出来。
+        tracing::warn!("工具实时输出 sink 已被占用，本实例的前台 Bash 将退回「跑完一次性返回」");
+    }
     // 终止后台任务是 async（SIGTERM → 等 2s → 兜底 SIGKILL），不能占用按键
     // 处理线程；完成后复用 agent_tx 把结果发回 UI 线程渲染提示。
     state.kill_tx = Some(agent_tx.clone());
@@ -11565,6 +11737,9 @@ async fn tui_main(
         // 清空 agent 事件队列
         while let Ok(ev) = agent_rx.try_recv() {
             state.apply_agent_event(ev);
+        }
+        while let Ok(chunk) = tool_out_rx.try_recv() {
+            state.apply_tool_output_chunk(chunk);
         }
 
         // 清空子 Agent 事件队列（在 agent 事件之后排空，保证父 ToolStart 先于 Started 应用）
@@ -14564,8 +14739,9 @@ async fn tui_main(
                             // “已经聚焦”并延续原有第二次按下折叠/展开的语义。
                             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             }
-                            // Ctrl+O 展开/折叠 thinking 正文与工具结果正文。必须显式占位并
-                            // `continue`：否则会落进下面的 `_` 兜底退出内容焦点。
+                            // Ctrl+O 在「全部展开」与「自动模式」间切换（自动模式下正在执行的
+                            // 步骤本就展开）。必须显式占位并 `continue`：否则会落进
+                            // 下面的 `_` 兜底退出内容焦点。
                             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 state.output_expanded = !state.output_expanded;
                                 continue;
@@ -14578,6 +14754,7 @@ async fn tui_main(
 
                     // Ctrl+D → 立即退出
                     if is_quit(&key) {
+                        await_quit_key_release(wheel_routing);
                         state.should_quit = true;
                         continue;
                     }
@@ -14593,6 +14770,7 @@ async fn tui_main(
                             state.ctrl_c_pressed = false;
                             state.last_ctrl_c = None;
                         } else if state.ctrl_c_pressed {
+                            await_quit_key_release(wheel_routing);
                             state.should_quit = true;
                         } else {
                             state.ctrl_c_pressed = true;

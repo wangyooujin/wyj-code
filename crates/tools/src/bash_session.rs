@@ -248,7 +248,7 @@ enum PipeReader {
 /// 额外进程，从源头消除这个竞态，同时也不再依赖 PATH 里一定有 `kill` 这个
 /// 外部命令。
 #[cfg(unix)]
-fn signal_group(pgid: u32, sig: &str) {
+pub(crate) fn signal_group(pgid: u32, sig: &str) {
     if pgid == 0 {
         return;
     }
@@ -265,7 +265,7 @@ fn signal_group(pgid: u32, sig: &str) {
 }
 
 #[cfg(not(unix))]
-fn signal_group(pgid: u32, sig: &str) {
+pub(crate) fn signal_group(pgid: u32, sig: &str) {
     if pgid == 0 {
         return;
     }

@@ -7,6 +7,7 @@ pub mod input;
 pub mod markdown;
 pub mod panic_guard;
 pub mod render;
+pub mod terminal_input;
 pub mod theme;
 pub mod welcome;
 
