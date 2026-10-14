@@ -19,6 +19,17 @@
 | `docs/reference/config.md` | 手动查阅 | `config.toml` 带注释全量参考、规约文件回退链、Hooks 事件 |
 | `docs/plan/*.md` | 手动查阅 | 各项设计的历史决策与失败模式调研 |
 
+## 代码导航约定
+
+**读代码优先用 MCP `codegraph`**，它是本仓库唯一同时给得出调用关系、影响面和逐字源码的入口。
+
+- **绝大多数探索走 `codegraph_explore`**：一次调用返回按文件分组的源码，等价于 Read，返回里已经给出的文件不要再 open。
+- 只知道符号名要定位 → `codegraph_search`；explore 被截断或遇到同名重载 → `codegraph_node`（用 `file`/`line` 消歧）。重载方法尤其别急着 grep。
+- 改签名、重构前 → `codegraph_callers` / `callees` / `impact`；看项目布局 → `codegraph_files`；索引可疑 → `codegraph_status`。
+- `Grep` / `Glob` 留给 codegraph 命不中的场景：未索引的文件、字符串字面量、配置与文档。
+- 内置 `CodeSearch`（`crates/core/src/code_index.rs`）是不依赖 MCP 的词法兜底，仅在 MCP 未连接或要跨项目查时选它。
+- 索引可能滞后于工作区：codegraph 给的位置/内容与磁盘冲突时以 `Read` 为准，必要时提示用户重建索引。
+
 ## Build & Run
 
 ```bash
