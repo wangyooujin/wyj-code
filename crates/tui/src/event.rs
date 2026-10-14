@@ -42,6 +42,11 @@ pub enum AgentEvent {
         compact_count: u32,
         tool_schema_tokens: u32,
         tool_schema_tokens_saved: u32,
+        /// 本回合的时延画像（TTFT / 总耗时 / 重试开销）。跟着 `Usage` 走而不是
+        /// 新增一个事件，是因为两者的采集点完全相同（Agent 的 stream 循环收尾
+        /// 处）、生命周期也相同（每回合一个快照），拆成两个事件只会让发送侧多
+        /// 一半发送次数。
+        latency: wyj_core::session::TurnLatency,
     },
     /// 单次 LLM 流式返回的增量 token 用量（非累计），用于把 token 消耗实时归因到
     /// 当前 in_progress 的任务（与 `Usage` 的覆盖式总量不同）。

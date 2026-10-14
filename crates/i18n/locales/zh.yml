@@ -276,6 +276,8 @@ context:
   summary: "合计 {total} / {window} tokens（{pct}%）· 自动压缩阈值 {threshold}"
   reclaimable: "可回收的旧工具结果：{tokens} tokens（保留最近 {kept} 个工具调用全文）"
   compacted: "本会话已自动压缩 {times} 次"
+  latency: "上一趟请求 · 首 token {ttft} · 生成 {total}（已扣除重试耗时）"
+  latency_retry: "上一趟请求发生过重试：其中 {spent} 花在重试与退避上，不是推理耗时"
   edited: "已清理过期工具结果 {count} 条 · 释放约 {saved} tokens（用 ContextRecall 按 hash 取回原文）"
 
 cost:

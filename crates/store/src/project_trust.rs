@@ -10,7 +10,7 @@
 //! 否则被信任的仓库自己就能在同一个受版本控制的文件里悄悄把"已批准"标记也
 //! 改掉，形同虚设。
 //!
-//! 自 v1.5.15 起不再读取 `<cwd>/.mcp.json` 等"原生"配置——wyj-code 只读
+//! 自 v0.2.24 起不再读取 `<cwd>/.mcp.json` 等"原生"配置——wyj-code 只读
 //! `<git-root>/.wyj-code/mcp.toml` 一个项目级来源。
 
 use anyhow::{Context, Result};
@@ -38,7 +38,7 @@ pub enum TrustStatus {
 }
 
 /// 只读 `<git-root>/.wyj-code/mcp.toml` 一个项目级来源——不再合并
-/// `<cwd>/.mcp.json` 等"原生"配置（v1.5.15 起）。
+/// `<cwd>/.mcp.json` 等"原生"配置（v0.2.24 起）。
 fn project_scoped_mcp_servers(cwd: &Path) -> Vec<McpServerConfig> {
     wyj_config::load_project_mcp(cwd).unwrap_or_else(|e| {
         tracing::warn!("加载项目级 MCP 配置失败，忽略: {e}");

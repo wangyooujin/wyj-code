@@ -444,7 +444,7 @@ mod tests {
         assert!(out.contains("[truncated"));
     }
 
-    /// 回归 v1.5.12 修的「366K text input 撞穿 262K 上下文窗口」bug。
+    /// 回归 v0.2.21 修的「366K text input 撞穿 262K 上下文窗口」bug。
     /// 长 assistant 总结、用户粘贴日志在 `ContentBlock::Text` 里无界累积
     /// 是直接根因——这条 test 锁住 `truncate_content_block` 对 Text 块做
     /// head+tail 截断的行为,确保未来不会因为重构把 Text 重新漏出。
@@ -476,7 +476,7 @@ mod tests {
 
     /// opt-out 行为:任一字段 = 0 即关闭对应截断(向后兼容)。
     /// 用户把 `text_head_bytes = 0` 时,长 Text 块必须原样保留——与
-    /// v1.5.10 之前的行为完全一致,不破坏老用户的运行预期。
+    /// v0.2.19 之前的行为完全一致,不破坏老用户的运行预期。
     #[test]
     fn truncate_text_block_skipped_when_caps_are_zero() {
         let original = "x".repeat(50_000);

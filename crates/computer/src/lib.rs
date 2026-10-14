@@ -2,8 +2,8 @@
 //!
 //! 仅 macOS/Windows 提供真实实现（`xcap` 截图 + `enigo` 输入合成，两者内部
 //! 已各自按平台分派，本 crate 无需再手写一套 target_os 分支）；其余平台
-//! （含 Linux，v1.3.0 不支持）编译进 [`unsupported`] 桩实现，保证 workspace
-//! 整体可跨平台编译。详见 doc/plan/v1.3.0-plan.md。
+//! （含 Linux，v0.2.1 不支持）编译进 [`unsupported`] 桩实现，保证 workspace
+//! 整体可跨平台编译。详见 doc/plan/v0.2.1-plan.md。
 
 #[cfg(target_os = "macos")]
 pub mod accessibility;
@@ -30,7 +30,7 @@ use anyhow::Result;
 pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// 截图下采样目标长边像素默认值。与 Anthropic 官方 computer-use 博客推荐的
-/// "1280x720 是大多数场景的安全默认分辨率"一致（见 doc/plan/v1.3.0-plan.md
+/// "1280x720 是大多数场景的安全默认分辨率"一致（见 doc/plan/v0.2.1-plan.md
 /// 增强三）。归属这里而非 `wyj-tools::computer`：这是"按什么分辨率捕获"的
 /// 系统层决策，不是工具层的调用约定。
 pub const DEFAULT_MAX_DIM: u32 = 1280;

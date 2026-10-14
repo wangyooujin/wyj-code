@@ -174,8 +174,8 @@ const ALWAYS_VISIBLE_TOOL_SCHEMAS: &[&str] = &[
     "ContextRecall",
     "Agent",
     "ExitPlanMode",
-    // TodoWrite 由 `[tools].todo_enabled` 门控（默认关），用户显式打开后
-    // **必须**常驻：它是纯状态写入、不碰文件系统，但 schema 一旦被 lazy 折叠，
+    // TodoWrite 由 `[tools].todo_enabled` 门控（默认开，用户可显式关掉）。
+    // 开启时**必须**常驻：它是纯状态写入、不碰文件系统，但 schema 一旦被 lazy 折叠，
     // 模型就完全不知道这个工具存在 —— 配置只管「注册」，管不到「可见」，
     // 表现为「配了 todo_enabled = true 但任务列表面板永远不出现」。
     // 未注册时不产生 schema，因此列在这里对只读子 Agent / Plan 模式同样无副作用。
@@ -378,11 +378,33 @@ pub struct Agent {
     /// 最近 N 次工具调用的 (name, fnv_hash(input)) 队列,用于 loop detection。
     /// 跨调用共享 state 需要内部可变性 + Clone 兼容,故用 Arc<Mutex<...>>。
     loop_guard: Arc<std::sync::Mutex<std::collections::VecDeque<(String, u64)>>>,
+    /// **本次用户提交内**已获 `AllowOnce` 的工具名。
+    ///
+    /// 用户按 Enter 提交的是「一个任务」，模型实现时会连续发出十几个
+    /// Edit/Write。旧行为每个都弹一次对话框，于是「批准这个任务」被拆成十几个
+    /// 串行的用户按键往返——每一次都是模型时延上的一个真实停顿，跨十几个文件的
+    /// 重构尤其明显。
+    ///
+    /// 记录后本轮同名的后续调用直接放行。它**严格弱于**既有的 `AllowAlways`
+    /// （后者写进项目级 `allowed_tools.json` 跨会话生效），因此不构成新的风险面，
+    /// 只是把「这一次任务的授权」从「每一次调用的授权」里析出来。
+    ///
+    /// 粒度取**工具名**，与 `allowed_tools.json` 的键完全一致——用户按下 y 时
+    /// 心里的「允许 Edit」和这里记下的语义是同一件事，不引入第二套心智模型。
+    ///
+    /// 生命周期：`run_turn_with_injection_inner` 入口清空（那正是「一次用户
+    /// 提交」的边界：TUI 每次 Enter 调一次、子 Agent 每个任务调一次；内部工具
+    /// 轮循环**不**清，否则第 2 轮又弹）。`Arc<Mutex<..>>` 与 `loop_guard` 同理：
+    /// Agent 会被 clone（TUI `/model` 重建、模式切换），且并发工具调用要同时读。
+    turn_permission_grants: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// CapabilityCache（可选）。Agent 在 `parameter_degraded` 撤掉端点不认的
     /// 参数重试成功后调 `record_rejection`；下次同 fingerprint
     /// `ModelCatalog::resolve_with_cache` 会让 capabilities.thinking=Unsupported。
     /// 子 Agent 不设置，避免嵌套路径写文件。
     capability_cache: Option<Arc<wyj_api::CapabilityCache>>,
+    /// 项目声明的校验命令（`verify::load_verify_cfg` 读 `.wyj-code/settings.json`）。
+    /// `None` = 该项目没有声明 = **一次子进程都不跑**，这是默认值。
+    verify_cfg: Option<Arc<crate::verify::VerifyCfg>>,
     /// 运行时 `ContentBlock` 字节截断配置(由 CLI/TUI 装配时注入),作用:
     /// 在 `run_turn_with_injection_inner` 调用 `provider.stream()` 之前对
     /// `session.messages` 做与磁盘 save 路径等价的截断,避免长
@@ -391,7 +413,7 @@ pub struct Agent {
     /// `current_persist_cap()` 全局兜底)。
     persist_cap: Option<wyj_config::PersistCapCfg>,
     /// tool-result context editing 的装配：`None` = 关闭（不清理旧工具输出）。
-    /// 见 `crate::context_edit` 与 `doc/plan/v1.5.17-context-management-plan.md`。
+    /// 见 `crate::context_edit` 与 `doc/plan/v0.2.26-context-management-plan.md`。
     context_edit: Option<crate::context_edit::ContextEditCfg>,
     /// 跨会话记忆快照缓存（system prompt 稳定前缀的一部分）。分桶重算，
     /// 避免每轮改写 system 尾部击穿 prompt cache。用 `Arc<Mutex<..>>` 是为了
@@ -411,6 +433,39 @@ pub struct Agent {
 /// 折中：按桶重算 —— 每 10 个用户轮次才重算一次，缓存抖动降到 1/10，
 /// 同时长会话内后台新提取的记忆不会无限期对模型不可见（最迟 10 轮后可见）。
 const MEMORY_SNAPSHOT_REFRESH_TURNS: u32 = 10;
+
+/// 后台记忆提取的最小用户轮次间隔。
+///
+/// 提取本身是一次完整的 LLM 往返，打的是主循环正在用的同一个 provider。旧行为
+/// 每个用户轮次都提一次，等于「用户每提交一次，额外插入一趟等长的请求」——在
+/// 并发跑子 Agent 时更要命：主 Agent、子 Agent、提取任务三者挤同一份 rate
+/// limit，交互路径反而被自己的后台活拖慢。
+///
+/// 记忆的用途是**跨会话召回**，不是逐轮刷新：一个 20 轮的长任务从中受益的
+/// 概率远高于一个 2 轮的问答。因此降到 1/3，交互路径立刻轻下来，记忆的时效性
+/// 代价很小（最迟 3 轮后可见）。
+const MEMORY_EXTRACT_EVERY_TURNS: usize = 3;
+
+/// 后台辅助 LLM 调用的让路延迟。
+///
+/// `tokio::spawn` 只保证「不阻塞当前轮」，不保证「不和当前轮抢配额」——两者都
+/// 用同一个 provider、同一个 HTTP 连接池、服务端同一份 rate limit。用户在工具
+/// 跑完后几秒就会按下 Enter，主循环要立刻发下一趟；这时候插进来的提取请求会让
+/// 主循环被限流，实测表现是「agent 自己变慢了」。
+///
+/// 3 秒是按人机节奏定的：工具结束到用户看完输出并敲下一个问题，通常大于 3 秒，
+/// 于是后台活几乎总是排在交互请求之后。它不保证成功（服务端不排队），但足以让
+/// 绝大多数「用户正在等」的时刻不被后台任务插队。
+const BACKGROUND_LLM_YIELD: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 该轮是否到点做记忆提取。
+///
+/// 首轮必提：新项目/新会话的第一轮正是最值得沉淀的（「用户在做什么、用什么
+/// 栈、什么约定」），而且短会话里如果没有这一次，记忆功能对小任务等于不存在。
+/// 之后每 [`MEMORY_EXTRACT_EVERY_TURNS`] 轮提一次。
+fn memory_extraction_due(user_turns: usize) -> bool {
+    user_turns > 0 && (user_turns - 1) % MEMORY_EXTRACT_EVERY_TURNS == 0
+}
 
 /// 记忆快照缓存：按 `用户轮次 / MEMORY_SNAPSHOT_REFRESH_TURNS` 分桶，
 /// 同桶内复用上次算好的文本。
@@ -476,7 +531,11 @@ impl Agent {
             hook_runner: None,
             checkpoint_store: None,
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            turn_permission_grants: Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
             capability_cache: None,
+            verify_cfg: None,
             persist_cap: None,
             context_edit: None,
         }
@@ -502,9 +561,20 @@ impl Agent {
     }
 
     /// 装配 tool-result context editing。`None` 或 `enabled == false` 时该机制
-    /// 完全不参与，历史只走整段摘要（v1.5.16 及更早的行为）。
+    /// 完全不参与，历史只走整段摘要（v0.2.25 及更早的行为）。
     pub fn with_context_edit(mut self, cfg: Option<crate::context_edit::ContextEditCfg>) -> Self {
         self.context_edit = cfg.filter(|c| c.enabled);
+        self
+    }
+
+    /// 装配编辑后自动校验。`None`（项目没在 `.wyj-code/settings.json` 里声明
+    /// `verify.command`）= 完全不触发，一次子进程都不跑。
+    ///
+    /// 与 `with_context_edit` 同样的 `filter` 口味：调用方可以直接把
+    /// `load_verify_cfg()` 的原始返回值塞进来，由本方法负责把「没声明」和
+    /// 「声明了但 enabled=false」统一收敛成 `None`，省得每个装配点各判一次。
+    pub fn with_verify(mut self, cfg: Option<crate::verify::VerifyCfg>) -> Self {
+        self.verify_cfg = cfg.filter(|c| c.enabled).map(Arc::new);
         self
     }
 
@@ -1153,6 +1223,16 @@ impl Agent {
         if let Some(state) = &self.lazy_tool_state {
             state.begin_task_turn();
         }
+
+        // 本轮权限授权从零开始。放在这里而不是工具轮循环里：进入本函数的
+        // 每一个调用点都是「一次用户提交」（TUI 每次 Enter / 子 Agent 每个任务），
+        // 而内部工具轮循环要**继承**这次授权——否则跨十几轮的重构每轮都要重新
+        // 按十几次 y，等于没省。放在下一轮 Enter 时才清，是「这个任务授权过了、
+        // 下一个任务要重新问）。锁中毒时静默跳过：残留的旧授权最坏只是少问一次，
+        // 而在这里 panic 会直接掀翻整场会话。
+        if let Ok(mut g) = self.turn_permission_grants.lock() {
+            g.clear();
+        }
         // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
         //
         //   * `system_stable`   —— 主提示 + 跨会话记忆 + 项目规约祖先链。
@@ -1245,7 +1325,24 @@ impl Agent {
         loop {
             turn += 1;
             if turn > max_turns {
-                anyhow::bail!("超过最大推理轮数 {}", max_turns);
+                // 触顶意味着这一轮几十次工具调用的成果要被丢在原地：用户能用的
+                // 最近锚点是本次提交**开始前**的 AutoUser checkpoint，`/rewind`
+                // 回去等于把这半小时全部推倒。先在中止点落一份 TurnLimit 存档，
+                // 把「已经做成什么样」这个状态钉住，用户至少能回到工作现场。
+                //
+                // checkpoint_store 为 None（未接文件系统）时静默跳过——中止行为
+                // 不能因为存不了档就变成「静默卡死」，报错照旧。
+                self.create_checkpoint(
+                    session,
+                    ctx.cwd(),
+                    session.messages.clone(),
+                    crate::checkpoint::CheckpointKind::TurnLimit,
+                    Some(format!("推理轮数触顶前自动存档（{max_turns} 轮）")),
+                )
+                .await;
+                anyhow::bail!(
+                    "超过最大推理轮数 {max_turns}。已自动存档到触顶前的状态，可用 `/rewind` 回到工作现场后换个思路继续。"
+                );
             }
 
             // 流式消费，带中断重试：流已消费一半时断开（网络重置、供应商
@@ -1476,6 +1573,7 @@ impl Agent {
 
                 const MAX_STREAM_RETRIES: u32 = 2;
                 let mut stream_retries: u32 = 0;
+                let mut retry_spent_ms: u64 = 0;
                 let mut effective_opts = opts;
                 let mut parameter_degraded = false;
                 // provider 报「上下文超限」时的强制恢复：阈值估算只是启发式，
@@ -1490,6 +1588,11 @@ impl Agent {
                     // cache_read 恒为 0 却无法区分"没配"与"配了但用不了"——
                     // 而这两种情况用户该做的事完全相反。
                     session.prompt_cache_state = route.provider.prompt_cache_state();
+                    // TTFT 的起点：从**发起请求**算起，不是从 stream 建立算起。
+                    // 连接建立、TLS、上传 prefill 全在这一段里，而它恰恰是用户
+                    // 「点了回车到屏幕开始动」里最容易变慢、最少被看见的一段。
+                    let attempt_started = Instant::now();
+                    let mut ttft_ms: Option<u64> = None;
                     let mut stream = match route
                         .provider
                         .stream(
@@ -1641,6 +1744,9 @@ impl Agent {
                         };
                         match event {
                             StreamEvent::TextDelta(delta) => {
+                                if ttft_ms.is_none() {
+                                    ttft_ms = Some(attempt_started.elapsed().as_millis() as u64);
+                                }
                                 on_text(&delta);
                                 self.emit_session_event(crate::SessionEvent::TextDelta {
                                     text: delta.clone(),
@@ -1658,6 +1764,12 @@ impl Agent {
                                 });
                             }
                             StreamEvent::ThinkingDelta(delta) => {
+                                // thinking 也要算首 token：开着 extended thinking
+                                // 时屏幕是随 thinking 开始动的，只认 TextDelta 会
+                                // 把整段思考时间错误地记到 total 上，TTFT 永远为空。
+                                if ttft_ms.is_none() {
+                                    ttft_ms = Some(attempt_started.elapsed().as_millis() as u64);
+                                }
                                 if let Some(cb) = &self.thinking_cb {
                                     cb(&delta);
                                 }
@@ -1725,6 +1837,12 @@ impl Agent {
                             StreamEvent::MessageStop { stop_reason: sr } => {
                                 stop_reason = sr;
                                 seen_completion = true;
+                                session.latency = crate::session::TurnLatency {
+                                    ttft_ms,
+                                    total_ms: attempt_started.elapsed().as_millis() as u64,
+                                    retry_ms: retry_spent_ms,
+                                    retried: stream_retries > 0,
+                                };
                             }
                             StreamEvent::Usage {
                                 input_tokens,
@@ -1745,6 +1863,10 @@ impl Agent {
 
                     match stream_err {
                         Some(error) if stream_retries < MAX_STREAM_RETRIES => {
+                            // 把「失败 + 退避等待」整段记成重试开销：它和网络
+                            // 建连时间一样会把 total 撑大，却和模型推理毫无关系。
+                            // 记下来，`/context` 才能把它和净推理耗时分开报。
+                            retry_spent_ms += attempt_started.elapsed().as_millis() as u64;
                             stream_retries += 1;
                             tracing::warn!("流中断（第 {stream_retries} 次重试）: {error}");
                             on_text(&format!(
@@ -2218,34 +2340,56 @@ impl Agent {
             }
 
             if !has_tool_calls && !got_injection {
+                // 记忆/标题提取是「LLM 辅助调用」，和主循环共用同一个 provider、
+                // 同一把连接、同一份 rate limit。`tokio::spawn` 让它不阻塞
+                // 当前轮是对的，但**不解决它抢配额**：用户在工具跑完后几秒内
+                // 就会按下 Enter，主循环要立刻发下一趟请求，这时候挤进来的
+                // 提取任务让主循环被限流 → 主循环变慢。异步 ≠ 无成本。
+                //
+                // 两道闸：① 降频到 `MEMORY_EXTRACT_EVERY_TURNS` 个用户轮次
+                // 才提一次（首轮必提，那正是新项目最需要记忆的时刻）；
+                // ② 让路延迟 `BACKGROUND_LLM_YIELD`，把交互路径的请求排在前面。
+                // 真正的「独立配额」做不到——同一个 API key 在服务端是一份，
+                // 进程内没有隔离手段，能做的只有「别跟主循环抢」。
+                let user_turns = session
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == wyj_api::types::Role::User)
+                    .count();
+
                 // Memory v3 先把任务原子写入磁盘，再异步消费；即使进程在 spawn
                 // 后退出，pending/running 任务也会在下次 store open 时恢复。
-                if let Some(memory) = self.memory_v3.as_ref().cloned() {
-                    let session_id = self
-                        .session_id
-                        .clone()
-                        .unwrap_or_else(|| "ephemeral".to_string());
-                    match memory.enqueue_extraction(&session_id, &session.messages) {
-                        Ok(Some(_)) => {
+                let extract_now = memory_extraction_due(user_turns);
+                if extract_now {
+                    if let Some(memory) = self.memory_v3.as_ref().cloned() {
+                        let session_id = self
+                            .session_id
+                            .clone()
+                            .unwrap_or_else(|| "ephemeral".to_string());
+                        match memory.enqueue_extraction(&session_id, &session.messages) {
+                            Ok(Some(_)) => {
+                                let provider = self.route_at(self.active_route_index()).provider;
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
+                                    if let Err(error) = memory.drain_jobs(provider).await {
+                                        tracing::debug!("Memory v3 后台任务失败: {error}");
+                                    }
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => tracing::warn!("Memory v3 任务入队失败: {error}"),
+                        }
+                    } else if self.evolution.is_none() {
+                        if let Some(mem) = self.memory.as_ref().cloned() {
                             let provider = self.route_at(self.active_route_index()).provider;
+                            let msgs = session.messages.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = memory.drain_jobs(provider).await {
-                                    tracing::debug!("Memory v3 后台任务失败: {error}");
+                                tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
+                                if let Err(e) = mem.extract_and_save(msgs, provider).await {
+                                    tracing::debug!("记忆提取失败: {e}");
                                 }
                             });
                         }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!("Memory v3 任务入队失败: {error}"),
-                    }
-                } else if self.evolution.is_none() {
-                    if let Some(mem) = self.memory.as_ref().cloned() {
-                        let provider = self.route_at(self.active_route_index()).provider;
-                        let msgs = session.messages.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = mem.extract_and_save(msgs, provider).await {
-                                tracing::debug!("记忆提取失败: {e}");
-                            }
-                        });
                     }
                 }
                 // 首轮后触发后台标题生成（若已配置 SummaryGenerator 且有 session_id）
@@ -2254,6 +2398,9 @@ impl Agent {
                         let msgs = session.messages.clone();
                         let title_cb = self.title_cb.clone();
                         tokio::spawn(async move {
+                            // 标题不影响正确性，只影响侧栏可读性，让它排在
+                            // 交互请求之后毫无代价。
+                            tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
                             if let Some(title) = gen.generate_title(&sid, &msgs).await {
                                 if let Some(cb) = title_cb {
                                     cb(title);
@@ -2267,6 +2414,57 @@ impl Agent {
         }
         self.emit_session_event(crate::SessionEvent::TurnFinished);
         Ok(())
+    }
+
+    /// 本次用户提交内该工具是否已拿到授权。
+    ///
+    /// 锁中毒时返回 `false`（= 重新弹窗）而不是 panic：这是个纯加速路径，
+    /// 它坏了最坏结果是用户体验退回旧行为，而权限路径 panic 会直接掀翻会话。
+    fn turn_granted(&self, name: &str) -> bool {
+        self.turn_permission_grants
+            .lock()
+            .map(|s| s.contains(name))
+            .unwrap_or(false)
+    }
+
+    /// 记下「本次提交内该工具已授权」。
+    fn grant_for_turn(&self, name: &str) {
+        if let Ok(mut s) = self.turn_permission_grants.lock() {
+            s.insert(name.to_string());
+        }
+    }
+
+    /// 该工具跑完后要不要跑一次项目校验。两个条件缺一不可：项目声明了命令
+    /// （`verify_cfg.is_some()`），且这个工具确实改动了工作区文件。
+    fn should_verify(&self, tool_name: &str) -> bool {
+        self.verify_cfg.is_some() && crate::verify::VERIFY_TRIGGER_TOOLS.contains(&tool_name)
+    }
+
+    /// 工具执行前的权限闸门。`true` = 可以直接跑。
+    ///
+    /// 三段式：不需要确认的工具直接放行；本轮已授权的同名工具直接放行（这是
+    /// 「批准一个任务」不再被拆成十几个 y 的关键）；其余才走 `confirm_tool`，
+    /// 弹窗批准后把工具名记进本轮授权集。
+    ///
+    /// `confirm_tool` 返回 `true` 的所有路径（AllowOnce / AllowAlways /
+    /// computer 的 project-approve-once 升格）都意味着「用户此刻批准了这个工具
+    /// 在本轮执行」，所以不区分是哪一种按键，统一记入——AllowAlways 重复记
+    /// 一遍是无害的幂等写入。
+    async fn ensure_tool_permission(
+        &self,
+        name: &str,
+        t: &Arc<dyn Tool>,
+        input: &serde_json::Value,
+        ctx: &dyn ToolContext,
+    ) -> bool {
+        if !t.needs_permission(input) || self.turn_granted(name) {
+            return true;
+        }
+        if !ctx.confirm_tool(name, &t.action_summary(input)).await {
+            return false;
+        }
+        self.grant_for_turn(name);
+        true
     }
 
     /// 执行单个工具调用：触发 Start/End 回调、权限检查、执行并计时。
@@ -2363,9 +2561,7 @@ impl Agent {
                     if !ctx.is_allowed(&name, &input) {
                         let msg = format!("工具 `{name}` 在当前模式下不被允许");
                         (msg.clone(), ToolResultContent::Text(msg), true)
-                    } else if t.needs_permission(&input)
-                        && !ctx.confirm_tool(&name, &t.action_summary(&input)).await
-                    {
+                    } else if !self.ensure_tool_permission(&name, &t, &input, ctx).await {
                         // 逐调用权限确认：用户拒绝，将拒绝信息回灌给模型（模型据此改道）
                         let msg = format!(
                             "用户拒绝执行工具 `{name}`。请不要重试该操作；改用其他方式，或先向用户询问原因。"
@@ -2412,6 +2608,25 @@ impl Agent {
                 (format!("{display}{suffix}"), content)
             }
             None => (display, content),
+        };
+
+        // ── 编辑后校验（verify loop）────────────────────────────────────
+        // 排在 PostToolUse hook 之后：hook 是用户私有的自动化，可能已经跑了
+        // 自己的校验；声明了 verify 的项目两者并存，两段反馈都留给模型。
+        //
+        // 只在 `!is_error` 时跑——工具自己都失败了，代码处于半改状态，此时的
+        // 编译错误多半是「这个 Edit 没写成」而不是「改动引入了新错」，回灌进去
+        // 只会把模型带偏。
+        let (display, content) = if !is_error && self.should_verify(&name) {
+            let cfg = self
+                .verify_cfg
+                .clone()
+                .expect("should_verify 为真时 verify_cfg 必非空");
+            let outcome = crate::verify::run_verify(&cfg, ctx.cwd()).await;
+            let content = append_hook_feedback(content, &outcome.report);
+            (format!("{display}{}", outcome.report), content)
+        } else {
+            (display, content)
         };
 
         if let Some(cb) = &self.tool_cb {
@@ -2992,6 +3207,509 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    /// 幂等性不变量：**框架层的任何重试都不得重复执行工具**。
+    ///
+    /// 这是 P2-9 审查的结论，用测试钉住而不是只写在注释里。理由：Agent 里所有
+    /// 重试点（流中断重发、`parameter_degraded` 降参重发、上下文超限截断后重发、
+    /// fallback 路由切换）**全部发生在 assistant 消息提交之前**——此时本次
+    /// assistant 的 `tool_use` 块还没进 `session.messages`，工具也就还没跑过。
+    /// 半成品 assistant 消息绝不入史（见 stream 循环的注释），所以重发的消息里
+    /// 不含任何已执行的工具，重试是干净的。
+    ///
+    /// 工具一旦跑过，重试路径就再也不存在了：下一轮是**模型**基于 tool_result
+    /// 重新决策，那属于模型行为，不是框架重复执行。
+    #[tokio::test]
+    async fn a_retry_never_re_executes_an_already_committed_tool() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(Arc::new(FlakyFirstAttemptProvider {
+            phase: std::sync::atomic::AtomicUsize::new(0),
+        }))
+        .with_max_turns(10);
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: false,
+            runs: runs.clone(),
+        }));
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+            .await
+            .unwrap();
+
+        // 第 1 次 stream 发了一个 tool_use 后流中断，第 2 次又发了一个 tool_use，
+        // 两次的 input 完全相同——正是「如果框架把半成品也提交了、或把重发当成
+        // 第二次调用追加上去」的重复执行形态。此处工具只应跑 1 次。
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "重发后的 tool_use 只应执行一次"
+        );
+        let assistant_with_tool_calls = session
+            .messages
+            .iter()
+            .filter(|m| m.role == wyj_api::types::Role::Assistant)
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|b| matches!(b, wyj_api::types::ContentBlock::ToolUse { .. }))
+            })
+            .count();
+        assert_eq!(
+            assistant_with_tool_calls, 1,
+            "半成品 assistant 消息不得入史，否则重试会变成重复执行"
+        );
+    }
+
+    /// 三段式 provider：第 1 次发工具调用后流中断，第 2 次**发同一个工具调用**
+    /// 并正常收尾，第 3 次才 EndTurn。两次 tool_use 的 input 刻意完全一致。
+    struct FlakyFirstAttemptProvider {
+        phase: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for FlakyFirstAttemptProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let phase = self.phase.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = vec![
+                Ok(StreamEvent::ToolUseStart {
+                    id: "t0".into(),
+                    name: "Edit".into(),
+                }),
+                Ok(StreamEvent::ToolUseDelta {
+                    id: "t0".into(),
+                    json_delta: r#"{"path":"a.rs"}"#.into(),
+                }),
+                Ok(StreamEvent::ToolUseEnd { id: "t0".into() }),
+            ];
+            match phase {
+                // 流中途断开：没有 MessageStop，Agent 丢弃半成品后重发。
+                0 => {
+                    let mut events = call;
+                    events.push(Err(anyhow::anyhow!("simulated mid-stream disconnect")));
+                    Ok(Box::pin(futures::stream::iter(events)))
+                }
+                // 这次完整收尾，工具调用被提交 → 应当执行恰好一次。
+                1 => {
+                    let mut events = call;
+                    events.push(Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }));
+                    Ok(Box::pin(futures::stream::iter(events)))
+                }
+                _ => Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                )]))),
+            }
+        }
+    }
+
+    /// 记忆提取降频：首轮必提，之后每 N 轮一次；空会话不提取。
+    #[test]
+    fn memory_extraction_fires_on_the_first_turn_then_every_third() {
+        assert!(memory_extraction_due(1), "首轮必须提：新项目最需要记忆");
+        assert!(!memory_extraction_due(2));
+        assert!(!memory_extraction_due(3));
+        assert!(memory_extraction_due(4));
+        assert!(!memory_extraction_due(5));
+        assert!(memory_extraction_due(7));
+        assert!(memory_extraction_due(31));
+        assert!(!memory_extraction_due(0), "空会话没有可提取的内容");
+    }
+
+    // ── 编辑后自动校验（verify loop）───────────────────────────────────────
+
+    /// 编辑类工具，`runs` 用来证明校验跑在工具**之后**而不是之前。
+    struct EditingTool {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for EditingTool {
+        fn name(&self) -> &str {
+            "Edit"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "Edit".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            }
+        }
+        fn needs_permission(&self, _input: &serde_json::Value) -> bool {
+            false
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("文件已更新"))
+        }
+    }
+
+    /// 把一个会失败的 Edit 送进开着 verify 的 Agent，确认编译器输出真的进了
+    /// 发给模型的 tool_result——这是整个特性的全部意义所在。
+    #[tokio::test]
+    async fn verify_failures_reach_the_model_as_tool_result() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(burst("Edit", 1)).with_verify(Some(crate::verify::VerifyCfg {
+            command: "echo 'error[E0308]: mismatched types' >&2; exit 1".into(),
+            timeout_ms: 5_000,
+            max_output_bytes: 4_000,
+            enabled: true,
+        }));
+        agent.register_tool(Arc::new(EditingTool { runs: runs.clone() }));
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        let tool_results: Vec<String> = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                wyj_api::types::ContentBlock::ToolResult { content, .. } => {
+                    Some(format!("{content:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1, "应当只有一个 Edit 的 tool_result");
+        assert!(
+            tool_results[0].contains("[verify] 校验失败"),
+            "校验反馈没进 tool_result：{}",
+            tool_results[0]
+        );
+        assert!(
+            tool_results[0].contains("E0308"),
+            "编译器错误没回灌：{}",
+            tool_results[0]
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// 零假设是硬约束：项目没声明命令时，一次子进程都不许跑。
+    #[tokio::test]
+    async fn without_a_declared_command_nothing_runs() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(burst("Edit", 1));
+        agent.register_tool(Arc::new(EditingTool { runs: runs.clone() }));
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(!agent.should_verify("Edit"));
+        let texts: Vec<String> = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                wyj_api::types::ContentBlock::ToolResult { content, .. } => {
+                    Some(format!("{content:?}"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1);
+        assert!(
+            !texts[0].contains("[verify]"),
+            "不该有任何校验痕迹：{}",
+            texts[0]
+        );
+    }
+
+    /// 只对改文件的工具触发：Bash / Read / Grep 都不跑校验。
+    #[test]
+    fn only_workspace_mutating_tools_trigger_verify() {
+        let agent =
+            Agent::new(Arc::new(EndTurnProvider)).with_verify(Some(crate::verify::VerifyCfg {
+                command: "true".into(),
+                timeout_ms: 1,
+                max_output_bytes: 1,
+                enabled: true,
+            }));
+        for name in ["Edit", "Write"] {
+            assert!(agent.should_verify(name), "{name} 应当触发校验");
+        }
+        for name in ["Bash", "Read", "Grep", "Glob", "Agent", "TodoWrite"] {
+            assert!(!agent.should_verify(name), "{name} 不该触发校验");
+        }
+
+        // enabled = false 即使显式装配也要被过滤掉（防调用方漏判）
+        let off =
+            Agent::new(Arc::new(EndTurnProvider)).with_verify(Some(crate::verify::VerifyCfg {
+                command: "true".into(),
+                timeout_ms: 1,
+                max_output_bytes: 1,
+                enabled: false,
+            }));
+        assert!(!off.should_verify("Edit"));
+    }
+
+    // ── 本轮权限授权（per-turn tool permission grants）─────────────────────
+
+    /// 记录 `confirm_tool` 被问了几次、每次的摘要，并按固定决定放行/拒绝。
+    struct PermissionProbeCtx {
+        asks: std::sync::atomic::AtomicUsize,
+        summaries: std::sync::Mutex<Vec<String>>,
+        grant: bool,
+    }
+    impl PermissionProbeCtx {
+        fn new(grant: bool) -> Self {
+            Self {
+                asks: std::sync::atomic::AtomicUsize::new(0),
+                summaries: std::sync::Mutex::new(Vec::new()),
+                grant,
+            }
+        }
+        fn ask_count(&self) -> usize {
+            self.asks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl ToolContext for PermissionProbeCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+            true
+        }
+        async fn confirm_tool(&self, name: &str, summary: &str) -> bool {
+            self.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.summaries
+                .lock()
+                .unwrap()
+                .push(format!("{name}:{summary}"));
+            self.grant
+        }
+    }
+
+    /// `needs_permission()` 可控的探针工具。
+    struct GatedTool {
+        name: &'static str,
+        needs_permission: bool,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for GatedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            }
+        }
+        fn needs_permission(&self, _input: &serde_json::Value) -> bool {
+            self.needs_permission
+        }
+        fn action_summary(&self, input: &serde_json::Value) -> String {
+            input["path"].as_str().unwrap_or("?").to_string()
+        }
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("done"))
+        }
+    }
+
+    /// 每轮 emit **一个**工具调用，发满 `budget` 个后 EndTurn 并把计数**归零**。
+    ///
+    /// 刻意不做「一次 emit 多个」：真实模型每轮只发一个 tool_use，而 Agent 的
+    /// 内部工具轮循环正是把 N 个工具调用摊成 N 轮——「一次用户提交里的 3 次
+    /// Edit」= 3 个内部轮。
+    ///
+    /// 归零是关键：provider 实例被两次 `run_turn` 共用，计数只增不减的话第二次
+    /// 提交会直接拿到 EndTurn、一个工具都不发，测到的就成了「provider 没发调用」
+    /// 而不是「授权没被清」。用 `emitted` / `budget` 双计数而不是同一个计数器
+    /// 递减，也是为了 `stop_reason` 由「还剩没发完」决定，而非递减的副作用。
+    struct BurstToolProvider {
+        emitted: std::sync::atomic::AtomicUsize,
+        budget: usize,
+        tool: String,
+    }
+    #[async_trait::async_trait]
+    impl Provider for BurstToolProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self
+                .emitted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= self.budget {
+                self.emitted.store(0, std::sync::atomic::Ordering::SeqCst);
+                return Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    },
+                )])));
+            }
+            let id = format!("t{n}");
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: self.tool.clone(),
+                }),
+                Ok(StreamEvent::ToolUseDelta {
+                    id: id.clone(),
+                    json_delta: format!(r#"{{"path":"f{}.rs"}}"#, n),
+                }),
+                Ok(StreamEvent::ToolUseEnd { id }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn burst(tool: &str, budget: usize) -> Arc<dyn Provider> {
+        Arc::new(BurstToolProvider {
+            emitted: std::sync::atomic::AtomicUsize::new(0),
+            budget,
+            tool: tool.to_string(),
+        })
+    }
+
+    /// 核心行为：同一次提交里 3 个 Edit 只弹 1 次框，3 次都真的执行了。
+    #[tokio::test]
+    async fn one_confirm_covers_every_matching_call_in_a_turn() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(burst("Edit", 3));
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: true,
+            runs: runs.clone(),
+        }));
+        let ctx = PermissionProbeCtx::new(true);
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &ctx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.ask_count(), 1, "本轮 3 次 Edit 只应弹一次确认");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // 摘要取自第一次：用户是为 f0.rs 点头的，f1/f2 靠本轮授权放行
+        assert_eq!(*ctx.summaries.lock().unwrap(), ["Edit:f0.rs"]);
+    }
+
+    /// 下一次提交必须重新问：本轮授权不是会话级授权。
+    #[tokio::test]
+    async fn grants_do_not_survive_into_the_next_turn() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // budget 1：每次提交只发一次 Edit。两次提交之间唯一的变化就是
+        // `turn_permission_grants` 有没有被清空。
+        let mut agent = Agent::new(burst("Edit", 1));
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: true,
+            runs: runs.clone(),
+        }));
+        let ctx = PermissionProbeCtx::new(true);
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &ctx, &mut |_| {})
+            .await
+            .unwrap();
+        session.push_user("再来一次");
+        agent
+            .run_turn(&mut session, &ctx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.ask_count(), 2, "第二次提交是新的信任边界，必须重新确认");
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// 拒绝不产生本轮授权：模型重试时用户还要再看到一次框，且工具一次都不该跑。
+    #[tokio::test]
+    async fn a_denial_grants_nothing_and_blocks_every_attempt() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent = Agent::new(burst("Edit", 2));
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: true,
+            runs: runs.clone(),
+        }));
+        let ctx = PermissionProbeCtx::new(false);
+        let mut session = Session::new();
+
+        agent
+            .run_turn(&mut session, &ctx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ctx.ask_count(),
+            2,
+            "拒绝必须每次都重新问，否则就成了静默放行"
+        );
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// 授权按工具名隔离：批了 Edit 不代表批了 Write；只读工具根本不问。
+    #[tokio::test]
+    async fn grants_are_scoped_to_the_approved_tool_name() {
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let ctx = PermissionProbeCtx::new(true);
+        let needs_perm = serde_json::json!({});
+        let gated = |name: &'static str, needs_permission: bool| -> Arc<dyn Tool> {
+            Arc::new(GatedTool {
+                name,
+                needs_permission,
+                runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+        };
+        let edit = gated("Edit", true);
+
+        agent
+            .ensure_tool_permission("Edit", &edit, &needs_perm, &ctx)
+            .await;
+        agent
+            .ensure_tool_permission("Edit", &edit, &needs_perm, &ctx)
+            .await;
+        agent
+            .ensure_tool_permission("Write", &edit, &needs_perm, &ctx)
+            .await;
+        agent
+            .ensure_tool_permission("Read", &gated("Read", false), &needs_perm, &ctx)
+            .await;
+
+        assert_eq!(
+            *ctx.summaries.lock().unwrap(),
+            ["Edit:?", "Write:?"],
+            "Edit 只问一次、Write 单独问一次、Read 根本不问"
+        );
     }
 
     /// 每轮都直接 EndTurn 的 provider（注入路由测试用）

@@ -1,5 +1,5 @@
 //! Computer 工具 — Anthropic 原生 computer-use（桌面 GUI 控制）。
-//! 仅 macOS/Windows 编译（见 wyj-computer crate 与 doc/plan/v1.3.0-plan.md）。
+//! 仅 macOS/Windows 编译（见 wyj-computer crate 与 doc/plan/v0.2.1-plan.md）。
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -28,7 +28,7 @@ const MAX_ACTIONS_WITHOUT_SCREENSHOT: usize = 20;
 const MAX_WAIT_SECS: f64 = 5.0;
 
 /// 每个 scroll_amount 单位对应的物理像素滚动量（无官方文档给出精确值，
-/// 需结合实际系统手测微调，见 doc/plan/v1.3.0-plan.md 验证节）。
+/// 需结合实际系统手测微调，见 doc/plan/v0.2.1-plan.md 验证节）。
 const SCROLL_STEP_PX: i32 = 40;
 
 /// zoom 动作请求区域四周留出的余量比例（各方向按区域自身宽/高的这个比例

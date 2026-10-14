@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "要重新验证并发布的既有 annotated tag（例如 v1.5.5）"
+        description: "要重新验证并发布的既有 annotated tag（例如 v0.2.14）"
         required: true
         type: string
 

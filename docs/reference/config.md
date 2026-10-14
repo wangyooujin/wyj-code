@@ -38,21 +38,21 @@ explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便�
 trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
 
-[tools]                          # 工具注册门控（v1.5.18+）
-todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认关闭**，
-                                # 对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0
-                                # （两家头部厂商均已把 todo 脚手架改为默认关闭）。
-                                # 未注册 = 工具不产生 schema，模型目录里看不到它。
-                                # 详见架构节「TodoWrite 默认关闭」。
+[tools]                          # 工具注册门控（v0.2.27+）
+todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认开启**
+                                # （v0.3.1 起由关闭改为开启，见架构节
+                                # 「TodoWrite 默认开启」）。未注册 = 工具不产生
+                                # schema，模型目录里看不到它。简单任务为主、
+                                # 或用强模型跑短任务时设 false 更划算。
 
-[context_edit]                   # tool-result context editing（v1.5.17+）：
+[context_edit]                   # tool-result context editing（v0.2.26+）：
                                 # 超阈值时先把过期工具输出外部化到 CAS，
                                 # **清理优先于整段摘要**（对齐 Claude Code 的
                                 # "clears older tool outputs first, then summarizes
                                 # the conversation if needed"）。
                                 # 详见架构节「上下文压缩」与
-                                # doc/plan/v1.5.17-context-management-plan.md
-enabled = true               # false = 完全退回 v1.5.16 行为（只压缩、不清理）
+                                # doc/plan/v0.2.26-context-management-plan.md
+enabled = true               # false = 完全退回 v0.2.25 行为（只压缩、不清理）
 protect_recent = 3           # 最近 N 个工具结果保留全文（Anthropic keep=3）
 batch_size = 10              # 单批清理条数（每批都会击穿 prompt cache 前缀）
 min_result_bytes = 2000      # 小于此值不清理（省下的不够占位符本身）
@@ -63,7 +63,7 @@ soft_limit_ratio = 0.55       # **软阈值**：上下文占用超过窗口的�
                                 # 0 = 关闭（完全退回旧行为）。软阈值只改「何时开始」，
                                 # 不改「何时停手」：降到硬阈值以下才停。
 
-[notify]                      # 统一通知通道（v1.5.14+）：TUI/CLI 回合完成 / 错误、
+[notify]                      # 统一通知通道（v0.2.23+）：TUI/CLI 回合完成 / 错误、
                               # 后台子 Agent 完成、cron schedule 失败统一派发到
                               # 终端响铃（stderr \x07）与桌面通知（macOS osascript /
                               # Linux notify-send / Windows PowerShell BurntToast）。
@@ -102,11 +102,31 @@ args = ["--flag"]
 
 ### 项目规约文件回退链
 
-**项目规约文件记忆机制**（`core::claude_md::ClaudeMdLoader`）：查找范围为全局 `~/.wyj-code/` + 从项目根到 cwd 的祖先链（`config::project_root`，找不到 `.git`/`.wyj-code/project.toml` 则只用 cwd 本身）。**v1.5.22 起按槽位独立回退、命中第一个即停**：主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`；两槽位都命中时 local 追加在后（视作个人覆盖增补，不提交 git）。**`AGENTS.md` 始终是首选**（复数，对齐 AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 等均采用），回退只是为了让「根目录只有 CLAUDE.md」的既有仓库不至于对模型完全失明——这些文件都是项目作者写的规约，读不到等于整个项目的约定不可见。**两个槽位独立而非「整个家族二选一」**，是为了保住 personal override 语义：主文件走 `AGENTS.md` 而私有覆盖写在 `CLAUDE.local.md` 时仍然生效，不被静默丢弃；两槽位各只取一个文件，因此**永远不存在同一份规约被注入两遍**。判定用「有实际内容」而非单纯 `is_file()`：0 字节 / 全空白的主文件继续往下探。**历史沿革**：v1.5.18 曾硬切到只读 `AGENTS.md`（明确不保留回退，测试 `load_dir_files_ignores_claude_md_entirely` 锁死），v1.5.22 在保留「命中即停、绝不双份注入」这个核心不变式的前提下把回退链加了回来，该锁死测试已被替换为回退链系列测试。**全局路径仍只有 `~/.wyj-code/`，任何 `~/.claude/` 一律不读**（`config::claude_home_dir()` 已删除、替换为 `config::global_config_dir()`）；读的是**项目目录内**的 `CLAUDE.md` 文件，与读取外部工具的全局配置目录是两回事。支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。每轮对话开始时重新读盘，以 `<system-reminder>` 包装拼进当轮 **system prompt 末尾**（不注入 user 消息、不进历史，配合 prompt caching 避免跨轮累积；文件不变时字节级稳定、缓存可命中；注入文本里含具体路径与文件名，故增删/改名规约文件会自然失效该段缓存）。工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有规约文件且本会话未展示过，会在 `agent.rs` 的工具执行循环里追加到 system 末尾（`ClaudeMdLoader::maybe_dir_reminder`，按目录去重）。`/init` 触发一次真正的 agent 回合（`CommandResult::RunPrompt`）去探索项目并生成/合并更新**项目规约文件**，而非静态模板写文件。**生成目标跟随仓库现状**：走 `claude_md::existing_memory_file_name`（与实际注入同一条 `resolve_slot` 解析线）取「当前真正会被读到的那一份」，只有当一个候选都不存在时才回退到规范名 `AGENTS.md` 创建新文件，并要求把其余不同名的规则文件一并整合进去。**这条不是洁癖**：本仓库自己就踩过——v1.5.22 的提交同时留下了 `AGENTS.md` 与内容逐字节相同的 `CLAUDE.md`，两份副本随后各自漂移；`git rm` 掉前者之后，若 `/init` 仍硬编码 `AGENTS.md`，下次跑一次就会把那份僵尸副本原样重建。「命中即停」只保证模型不双份注入，**管不住维护者写出两份不同步的文件**。回归测试 `init_target_follows_the_file_that_would_actually_be_read` 是这条不变式的钉子。`/memory` 打开 TUI 面板列出当前会话适用的全部文件（与注入共用同一个 `resolve_slot`，面板显示的就是实际会注入的那个文件，不存在「面板列了 A、实际读 B」的漂移；一个候选都不存在时才列出 `AGENTS.md` 作为 `exists=false` 的创建入口），选中后挂起 TUI 唤起 `$EDITOR` 编辑，同时暴露 auto-memory（跨会话记忆提取）开关与索引入口（`Config.auto_memory_enabled`）。不再兼容旧版 `WYJ.md`。**注意 i18n key 名仍沿用历史拼写 `claude_md_ok` / `claude_md_missing`（值已泛化为「项目规约 / Memory files」，不再硬编码某个文件名——回退生效时写死文件名会让 `doctor` 报出「未找到」这种与事实相反的结果），key 是代码契约，不要因为改名去动 i18n YAML 里的 key。**
+**项目规约文件记忆机制**（`core::claude_md::ClaudeMdLoader`）：查找范围为全局 `~/.wyj-code/` + 从项目根到 cwd 的祖先链（`config::project_root`，找不到 `.git`/`.wyj-code/project.toml` 则只用 cwd 本身）。**v0.2.31 起按槽位独立回退、命中第一个即停**：主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`；两槽位都命中时 local 追加在后（视作个人覆盖增补，不提交 git）。**`AGENTS.md` 始终是首选**（复数，对齐 AGENTS.md 开放标准，Codex / Cursor / Gemini CLI 等均采用），回退只是为了让「根目录只有 CLAUDE.md」的既有仓库不至于对模型完全失明——这些文件都是项目作者写的规约，读不到等于整个项目的约定不可见。**两个槽位独立而非「整个家族二选一」**，是为了保住 personal override 语义：主文件走 `AGENTS.md` 而私有覆盖写在 `CLAUDE.local.md` 时仍然生效，不被静默丢弃；两槽位各只取一个文件，因此**永远不存在同一份规约被注入两遍**。判定用「有实际内容」而非单纯 `is_file()`：0 字节 / 全空白的主文件继续往下探。**历史沿革**：v0.2.27 曾硬切到只读 `AGENTS.md`（明确不保留回退，测试 `load_dir_files_ignores_claude_md_entirely` 锁死），v0.2.31 在保留「命中即停、绝不双份注入」这个核心不变式的前提下把回退链加了回来，该锁死测试已被替换为回退链系列测试。**全局路径仍只有 `~/.wyj-code/`，任何 `~/.claude/` 一律不读**（`config::claude_home_dir()` 已删除、替换为 `config::global_config_dir()`）；读的是**项目目录内**的 `CLAUDE.md` 文件，与读取外部工具的全局配置目录是两回事。支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。每轮对话开始时重新读盘，以 `<system-reminder>` 包装拼进当轮 **system prompt 末尾**（不注入 user 消息、不进历史，配合 prompt caching 避免跨轮累积；文件不变时字节级稳定、缓存可命中；注入文本里含具体路径与文件名，故增删/改名规约文件会自然失效该段缓存）。工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有规约文件且本会话未展示过，会在 `agent.rs` 的工具执行循环里追加到 system 末尾（`ClaudeMdLoader::maybe_dir_reminder`，按目录去重）。`/init` 触发一次真正的 agent 回合（`CommandResult::RunPrompt`）去探索项目并生成/合并更新**项目规约文件**，而非静态模板写文件。**生成目标跟随仓库现状**：走 `claude_md::existing_memory_file_name`（与实际注入同一条 `resolve_slot` 解析线）取「当前真正会被读到的那一份」，只有当一个候选都不存在时才回退到规范名 `AGENTS.md` 创建新文件，并要求把其余不同名的规则文件一并整合进去。**这条不是洁癖**：本仓库自己就踩过——v0.2.31 的提交同时留下了 `AGENTS.md` 与内容逐字节相同的 `CLAUDE.md`，两份副本随后各自漂移；`git rm` 掉前者之后，若 `/init` 仍硬编码 `AGENTS.md`，下次跑一次就会把那份僵尸副本原样重建。「命中即停」只保证模型不双份注入，**管不住维护者写出两份不同步的文件**。回归测试 `init_target_follows_the_file_that_would_actually_be_read` 是这条不变式的钉子。`/memory` 打开 TUI 面板列出当前会话适用的全部文件（与注入共用同一个 `resolve_slot`，面板显示的就是实际会注入的那个文件，不存在「面板列了 A、实际读 B」的漂移；一个候选都不存在时才列出 `AGENTS.md` 作为 `exists=false` 的创建入口），选中后挂起 TUI 唤起 `$EDITOR` 编辑，同时暴露 auto-memory（跨会话记忆提取）开关与索引入口（`Config.auto_memory_enabled`）。不再兼容旧版 `WYJ.md`。**注意 i18n key 名仍沿用历史拼写 `claude_md_ok` / `claude_md_missing`（值已泛化为「项目规约 / Memory files」，不再硬编码某个文件名——回退生效时写死文件名会让 `doctor` 报出「未找到」这种与事实相反的结果），key 是代码契约，不要因为改名去动 i18n YAML 里的 key。**
+
+### 编辑后自动验证（verify.command）
+
+**项目级**、写在同一套 `.wyj-code/settings.json` 体系里的键（与 `hooks` 同源同合并顺序：全局 → 项目 → `settings.local.json`）：
+
+```json
+{
+  "verify": {
+    "command": "cargo test -p wyj-core",
+    "timeout_secs": 120
+  }
+}
+```
+
+`verify.command` 让「编辑完就验证」成为闭环：每次 Edit / Write / MultiEdit 成功返回后，Agent 立即跑这条命令，把退出码和截断后的输出作为一条 tool result 回灌给模型，模型据此自己看到编译/测试错误并继续修——而不是把「我改完了，跑一下看看对不对」这件事推给用户。
+
+三条设计约束：
+- **零配置成本**：没有声明 `verify.command` 时，`verify.rs` 直接 early-return，**不探测 `npm`/`cargo` 是否存在、不启动任何 shell、不产生任何输出**。绝大多数项目不会配这个键，不配就没有任何代价。
+- **执行顺序**：编辑工具成功 → `PostToolUse` hook → 项目 verify。hook 的反馈（格式化、lint 提示）先到，verify 看到的是 hook 已经处理过的工作树。编辑工具**自身失败**时不跑 verify——失败原因已经在工具结果里了，再跑一遍命令只是浪费。
+- **有界**：默认超时 120s（`timeout_secs` 可覆盖），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model` 热重建。
 
 ### Hooks 自动化系统
 
-**Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v1.5.18 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
+**Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v0.2.27 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
 
 ### /config 面板
 

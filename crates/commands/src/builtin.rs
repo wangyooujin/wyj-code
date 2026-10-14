@@ -79,7 +79,7 @@ impl Command for CompactCmd {
 }
 
 // ── /context ─────────────────────────────────────────────────────────────────
-// 上下文占用分解面板。状态栏自 v1.5.17 起不再显示占用百分比（压缩已完全自动化，
+// 上下文占用分解面板。状态栏自 v0.2.26 起不再显示占用百分比（压缩已完全自动化，
 // 且旧百分比算的是 messages-only 口径、与压缩阈值对不上号），所以愿意关心上下文
 // 的人改用这个命令主动查——这里的数字与自动压缩的触发计算**同源**。
 pub struct ContextCmd;
@@ -186,9 +186,45 @@ impl Command for ContextCmd {
             ));
         }
 
+        // 时延画像：TTFT / 净推理 / 重试开销。只在真跑过请求后显示，
+        // 否则一行「TTFT —」对还没提问的用户是纯噪音。
+        if ctx.last_latency.total_ms > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "context.latency",
+                &[
+                    (
+                        "ttft",
+                        &ctx.last_latency
+                            .ttft_ms
+                            .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                            .unwrap_or_else(|| "-".to_string()),
+                    ),
+                    ("total", &fmt_secs(ctx.last_latency.net_total_ms())),
+                ],
+            ));
+            // 重试单列：把它混在总耗时里，用户会把网络抖动误判成「模型变慢了」。
+            if ctx.last_latency.retried {
+                text.push('\n');
+                text.push_str(&tr_fmt(
+                    "context.latency_retry",
+                    &[("spent", &fmt_secs(ctx.last_latency.retry_ms))],
+                ));
+            }
+        }
+
         // 表格必须原样输出：走 `Output` 会被 markdown 当段落重新折行，
         // 上面那列对齐会全部作废。
         Ok(CommandResult::OutputPlain(text.trim_end().to_string()))
+    }
+}
+
+/// 毫秒 → 「1.8s」/「320ms」。低于 1s 用 ms，否则用户看不出差别。
+fn fmt_secs(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
 
@@ -1971,6 +2007,7 @@ mod help_tests {
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
+            last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
@@ -2053,6 +2090,7 @@ mod agents_tests {
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
+            last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
@@ -2100,6 +2138,7 @@ mod subagents_tests {
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
+            last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
@@ -2322,6 +2361,7 @@ mod cost_tests {
             context_window: 0,
             estimated_tokens: 0,
             context_audit: None,
+            last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
@@ -2582,6 +2622,7 @@ mod cost_tests {
         let ctx = CommandContext {
             context_window: 0,
             context_audit: None,
+            last_latency: Default::default(),
             ..full_ctx(64)
         };
         let text = render(&ctx).await;

@@ -145,6 +145,10 @@ pub struct CommandContext {
     /// `estimated_tokens`，与压缩阈值差一万多 token，对不上号。
     /// `None` = 本会话还没发起过模型请求。
     pub context_audit: Option<wyj_core::compact::ContextAudit>,
+    /// 最近一次模型往返的时延画像（TTFT / 总耗时 / 重试开销）。
+    /// 由 `Agent` 在每次 `MessageStop` 时写进 session，TUI 再透传到面板。
+    /// `Default`（全 0）= 还没发起过模型请求，面板据此隐藏整行。
+    pub last_latency: wyj_core::session::TurnLatency,
     /// 本会话自动压缩发生次数。
     pub compact_count: u32,
     /// 本会话 tool-result context editing 的 `(清理条数, 释放的估算 token)`。

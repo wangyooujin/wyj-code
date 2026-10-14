@@ -86,7 +86,7 @@ pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
         wire_protocol: WireProtocol::OpenAiChatCompletions,
         base_url: "https://api.deepseek.com",
         example_model: "deepseek-chat",
-        note: "deepseek-reasoner 模型返回 reasoning_content 字段（v1.5.7+ 自动落盘为 thinking 块）；reasoner 多轮工具循环默认 max_turns=32；usage 仅在最后 message_delta chunk 出现",
+        note: "deepseek-reasoner 模型返回 reasoning_content 字段（v0.2.16+ 自动落盘为 thinking 块）；reasoner 多轮工具循环默认 max_turns=32；usage 仅在最后 message_delta chunk 出现",
         vision: false,
         prompt_cache: None,
         openai_stream_options: Some(true),

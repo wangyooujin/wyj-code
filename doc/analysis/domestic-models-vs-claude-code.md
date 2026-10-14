@@ -194,7 +194,7 @@ wyj-code 用 `Provider` enum 二分派发(Anthropic | OpenAI),trait 单方法 `s
 
 ### 3.3 国内厂商踩坑的代码层防御
 
-- **`is_official_anthropic_endpoint`**(`crates/config/src/lib.rs:238-242`)= `provider == Anthropic && (base_url 空 || 等于 api.anthropic.com)`,与 `effective_prompt_cache` 和 `register_computer_tool_if_enabled` 共用同一判定。**教训**:早期把"是否注册"和"native == Anthropic"两件事合并,导致 MiniMax 这类走 `provider = "anthropic"` + 自定义 `base_url` 接入的第三方端点,要么被误判成官方端点收到无 schema 的原生工具直接 400,要么被整体拒绝注册;现在拆成"注册与否看协议、原生与否看端点"两层判断(详见 `doc/plan/v1.3.0-plan.md`)。
+- **`is_official_anthropic_endpoint`**(`crates/config/src/lib.rs:238-242`)= `provider == Anthropic && (base_url 空 || 等于 api.anthropic.com)`,与 `effective_prompt_cache` 和 `register_computer_tool_if_enabled` 共用同一判定。**教训**:早期把"是否注册"和"native == Anthropic"两件事合并,导致 MiniMax 这类走 `provider = "anthropic"` + 自定义 `base_url` 接入的第三方端点,要么被误判成官方端点收到无 schema 的原生工具直接 400,要么被整体拒绝注册;现在拆成"注册与否看协议、原生与否看端点"两层判断(详见 `doc/plan/v0.2.1-plan.md`)。
 
 - **`effective_prompt_cache`**(`lib.rs:244-247`)= `prompt_cache.unwrap_or(is_official_anthropic_endpoint)`,**只有官方 Anthropic 才默认 true**,GLM/Kimi 走 Anthropic 兼容协议必须显式设 `prompt_cache = false`,否则 beta header 触发 400。Profile 模板里 glm/kimi 已默认 `Some(false)`(`models.rs:41, 80`),custom 默认 `None`。
 
@@ -232,7 +232,7 @@ wyj-code 用 `Provider` enum 二分派发(Anthropic | OpenAI),trait 单方法 `s
 - Profile 是 serde-tagged,加新字段不会破坏旧 config.toml
 - ProfileTemplate 是 const 数组,新增一个国内厂商只要再加一行
 - vendor 字符串开放,`model_catalog.rs::infer_vendor` + `normalize_vendor` 已留好 keyword 列表
-- v1.4 后的分层:`ModelRuntimeCfg`(`lib.rs:380-402`)管 probe 模式 / TTL / tool_argument_retries / lazy_tools_threshold / top_k / sticky_turns;`RoutingCfg` + `RoutingRoles`(`lib.rs:303-336`)做同角色 profile 池 + 可恢复错误 fallback;`cross_provider_fallback` 默认 `false`(`lib.rs:298-302`)避免用户未授权时把对话发给别的厂商
+- v0.2.5 后的分层:`ModelRuntimeCfg`(`lib.rs:380-402`)管 probe 模式 / TTL / tool_argument_retries / lazy_tools_threshold / top_k / sticky_turns;`RoutingCfg` + `RoutingRoles`(`lib.rs:303-336`)做同角色 profile 池 + 可恢复错误 fallback;`cross_provider_fallback` 默认 `false`(`lib.rs:298-302`)避免用户未授权时把对话发给别的厂商
 
 **痛点**:
 - 新协议本质要碰 `wyj-api` 里三个函数 + `ProfileTemplate` + `model_catalog::infer_vendor/normalize_vendor` + `capabilities::ModelCapabilities` 的能力字段,**不是"热插拔"**
@@ -439,10 +439,10 @@ DeepSeek V4-Flash 实测(CowAgent 框架):6 个场景全一次跑通,**零死循
 - CLAUDE.md 注入机制六层合并链:`内置 → 全局 ~/.wyj-code/skills → 全局真 CC ~/.claude/commands → 已启用插件贡献路径 → 项目 <git-root>/.wyj-code/skills → 项目真 CC .claude/commands`
 - 斜杠命令覆盖:/help /compact /config /model /init /memory /skills /agents /schedule /workspace /workflow /mcp /cost /subagents
 - Computer-use "礼让机制"(`tools::app_computer` + `computer::activity::InputArbiter`)独家实现
-- 定时任务系统(v1.4):schedule.rs + cron_sync.rs + ScheduleDialog
-- Managed Worktree + Workflow(v1.5.0)
-- ACP / daemon 全局 Session Registry(v1.5.0)
-- EvolutionStore 证据驱动进化(v1.5.5)
+- 定时任务系统(v0.2.5):schedule.rs + cron_sync.rs + ScheduleDialog
+- Managed Worktree + Workflow(v0.2.9)
+- ACP / daemon 全局 Session Registry(v0.2.9)
+- EvolutionStore 证据驱动进化(v0.2.14)
 
 **wyj-code 与 Codex 的主要差异**:
 - Codex 主要在 OpenAI Responses API 上做了很多 reasoning + tool 联动优化
@@ -684,10 +684,10 @@ fallback_profiles = ["glm-fallback", "claude-fallback"]
 
 ### P3(生态)
 
-- **新协议扩展**:`Profile.wire_protocol` 字段已枚举 `OpenAiResponses | QwenNative | Gemini` 但 `build_provider` 未读。**建议**:在 v1.6 路线图中考虑实现 OpenAI Responses API 支持,这是消除 OpenAI Chat Completions 多项硬限制的关键
+- **新协议扩展**:`Profile.wire_protocol` 字段已枚举 `OpenAiResponses | QwenNative | Gemini` 但 `build_provider` 未读。**建议**:在 v0.4.0 路线图中考虑实现 OpenAI Responses API 支持,这是消除 OpenAI Chat Completions 多项硬限制的关键
 - **cc-switch 集成**:开源 GUI 工具 cc-switch 本地起代理把 Anthropic 请求重定向到任意 OpenAI 兼容端点(支持 Qwen / GLM / DeepSeek / Kimi / 豆包 / 百川 / MiniMax)。wyj-code 是否需要类似工具?当前 PROFILE_TEMPLATES 已覆盖主流,不需要
 
-### 7.1 v1.5.7 实施状态
+### 7.1 v0.2.16 实施状态
 
 | 优先级 | 改进项 | 状态 | 关键改动 |
 |---|---|---|---|
@@ -698,14 +698,14 @@ fallback_profiles = ["glm-fallback", "claude-fallback"]
 | **P2** | loop detection(同工具+参数哈希近似) | ✅ 已实施 | `crates/core/src/agent.rs` `Agent.loop_guard: Arc<Mutex<VecDeque<(String, u64)>>>`;`fnv_hash_value` + `normalize_for_hash`(key 顺序不敏感);`detect_loop` 最近 5 条命中 ≥3 次触发;3 个新单测 + 1 个 mock provider 微调 |
 | **P3** | `/model doctor` 国产配置体检 | ✅ 已实施 | `crates/api/src/doctor.rs` `ModelDoctorReport` 加 7 个 profile_* / effective_* / requires_supplier_usage 字段;`crates/tui/src/app.rs::format_tui_model_doctor` 输出 `profile:` 行;3 个新单测 |
 | **P3** | Profile 模板 `note` 字段(踩坑提示) | ✅ 已实施 | `crates/api/src/models.rs::PROFILE_TEMPLATES` 9 个模板全部填充踩坑提示(GLM prompt_cache=false、Kimi prompt_cache=false、DeepSeek reasoning_content & max_iterations=32、火山引擎 ep-xxxxx 模型名、Qwen 不支持 extended thinking、Ollama 不支持 stream_options.include_usage、custom 完全开放) |
-| **P3** | README + `/help` 加报告链接 | ✅ 已实施 | `README.md` 加报告链接行(版本号待 v1.5.7 发版时改);`crates/i18n/locales/{zh,en}.yml` `help.body` 末尾新增"## 报告"章节指向 GitHub blob |
+| **P3** | README + `/help` 加报告链接 | ✅ 已实施 | `README.md` 加报告链接行(版本号待 v0.2.16 发版时改);`crates/i18n/locales/{zh,en}.yml` `help.body` 末尾新增"## 报告"章节指向 GitHub blob |
 
 **实施统计**:
-- 8 项全部完成,1 个合并 commit(v1.5.7 发版时)
+- 8 项全部完成,1 个合并 commit(v0.2.16 发版时)
 - 测试增量:11 个新单元测试(`crates/api` 6 + `crates/core` 4 + 已存在 1 个 `parts_display_text_uses_placeholder_for_images` 跑过),1 个既有 mock provider 调整(`RepeatedTwoToolProvider` 输入加 round 标识避免误伤 loop detection)
 - 测试覆盖:`cargo clippy --all-targets` 干净,`cargo test --workspace` 789 个测试 0 失败
 
-**未在本版本实施(留给 v1.6+)**:
+**未在本版本实施(留给 v0.4.0+)**:
 - OpenAI Responses API 支持(消除 tool 内嵌图片 / cache_control 写 / 原生 computer 工具等多项硬限制)
 - Anthropic 协议第三方端点能力深度扩展(GLM/Kimi 的 thinking 实际效果)
 - `display_text()` 中期方案:`ToolResultPart::Image` 加 `width/height/filename` 字段从源头携带
@@ -730,8 +730,8 @@ fallback_profiles = ["glm-fallback", "claude-fallback"]
 
 - **wyj-code 实测 benchmark**:跑同一组 Claude Code / Codex / wyj-code+国产 在固定任务(SWE-bench Lite 子集 + Aider Polyglot)上的对比,生成可比数据
 - **`/benchmark` slash 命令**:让用户在 TUI 中一键跑内置 benchmark 套件,生成自家环境的实测对比表
-- **持续更新本报告**:每个 wyj-code 大版本(v1.6/v1.7)后刷新"能力矩阵"与"踩坑清单"
-- **OpenAI Responses API 支持**:v1.6 路线图候选,消除 OpenAI Chat Completions 多项硬限制
+- **持续更新本报告**:每个 wyj-code 大版本(v0.4.0/v0.5.0)后刷新"能力矩阵"与"踩坑清单"
+- **OpenAI Responses API 支持**:v0.4.0 路线图候选,消除 OpenAI Chat Completions 多项硬限制
 - **国内厂商新模型追踪**:每月更新主流厂商新模型与价格(参考 <https://api-docs.deepseek.com/news/>、<https://z.ai/blog>、<https://kimi-k2.com/blog>)
 
 ---

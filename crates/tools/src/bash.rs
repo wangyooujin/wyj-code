@@ -380,7 +380,17 @@ impl BashTool {
 
         let is_error = !status.success();
         if is_error {
-            result = format!("退出码 {}\n{result}", status.code().unwrap_or(-1));
+            // `code()` 为 None = 被信号杀死（SIGKILL / SIGTERM），不是「退出码 -1」。
+            // 报成 -1 会让模型以为这是一次普通的非零退出从而直接重跑命令——而
+            // 被信号打断恰恰是**状态不明**的典型：`rm -rf` 杀在 `rm` 之后、
+            // 数据库迁移杀在写了一半、测试杀在临时文件已生成之后。重跑一次可能
+            // 把半完成状态变成两遍。这里明确说出来，让模型先探查现状再决定。
+            result = match status.code() {
+                Some(code) => format!("退出码 {code}\n{result}"),
+                None => format!(
+                    "命令被信号终止（可能已产生部分副作用——先检查当前状态再决定是否重跑）\n{result}"
+                ),
+            };
         }
         Ok(ToolResult {
             content: result,

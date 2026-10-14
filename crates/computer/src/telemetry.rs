@@ -22,7 +22,7 @@ pub struct TelemetrySnapshot {
     pub target_changed: u64,
     pub requires_foreground: u64,
     pub background_focus_fuses: u64,
-    /// v1.4 把“后台失败后自动切全局输入”定义为禁止行为；保留在诊断快照中
+    /// v0.2.5 把“后台失败后自动切全局输入”定义为禁止行为；保留在诊断快照中
     /// 作为可直接核验的恒零不变量。
     pub automatic_foreground_fallbacks: u64,
 }

@@ -126,7 +126,7 @@ impl SessionFile {
     /// 从内存 `Session` 构造落盘结构：**所有计量字段的唯一搬运入口**。
     ///
     /// 12 处调用点原先各自手写全量字段，新增计量字段时必然漏改——这正是
-    /// v1.5.x 期间 `cache_read_tokens` / `api_calls` 只在内存里活着、
+    /// v0.2.9~v0.2.33 期间 `cache_read_tokens` / `api_calls` 只在内存里活着、
     /// `resume` 后 `/cost` 全零的根因。统一走这里后，漏改在编译期就会暴露。
     pub fn from_session(session: &Session, meta: SessionFileMeta) -> Self {
         Self {
@@ -252,7 +252,7 @@ impl SessionStore {
     pub fn load(&self, session_id: &str) -> Result<SessionFile> {
         let content = std::fs::read_to_string(self.path(session_id))?;
         let mut file: SessionFile = serde_json::from_str(&content)?;
-        // Resume 路径也走 persist_cap:v1.5.10 之前落盘的 session 没有
+        // Resume 路径也走 persist_cap:v0.2.19 之前落盘的 session 没有
         // text/tool_result/thinking 等任何上限;若不在 load 后重 cap,resume
         // 出来的 in-memory messages 会把运行时单次 LLM 请求撑爆。
         // 与 save() 同源(`truncate_session_for_persistence` 内部委托
@@ -452,7 +452,7 @@ mod tests {
         }
     }
 
-    /// v1.5.19 之前落盘的会话文件没有这 6 个计量字段。必须仍能读出来，
+    /// v0.2.28 之前落盘的会话文件没有这 6 个计量字段。必须仍能读出来，
     /// 且缺省值语义正确（计数为 0、缓存状态为 OFF 而不是"未知"）。
     #[test]
     fn legacy_file_without_measurement_fields_still_loads() {

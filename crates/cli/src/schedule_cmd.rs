@@ -90,7 +90,7 @@ pub enum ScheduleCommand {
     /// actually invokes; not meant for interactive use.
     Run {
         id: String,
-        /// Retained for CLI compatibility with v1.4 prereleases. Foreground
+        /// Retained for CLI compatibility with v0.2.5 prereleases. Foreground
         /// computer-use is now fail-closed in every headless/scheduled run,
         /// while background app_computer may safely run alongside the user.
         #[arg(long)]
