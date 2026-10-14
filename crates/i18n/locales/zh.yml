@@ -1,6 +1,7 @@
 _version: 1
 command:
   unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
+  background_unsupported: "命令 /{name} 声明为后台执行，但返回了 TUI 无法直接渲染的结果类型：{result}"
 skill:
   run:
     desc: "构建并运行当前项目"
@@ -31,6 +32,7 @@ subagent:
   bg_done_notice: "后台 agent {id}（{type}: {desc}）已完成，结果将注入对话"
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
+  content_hint: "↑↓ 切换子 Agent · PgUp/PgDn 翻阅执行内容 · Esc 回输入框"
   inline_running: "运行中 · {elapsed} · ↑{tokens} tokens · {count} 次工具调用"
   detail_running: "运行中，当前动作："
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
@@ -97,6 +99,11 @@ spinner:
 # 正在执行的工具的实时输出块（只显示尾部若干行）
 live_output:
   omitted: "⋮ 上面还有 {count} 行输出"
+
+# 工具行尾部的后端标注：Grep 是唯一在两套搜索后端间分流的工具
+tool_backend:
+  rg: "rg"
+  native: "内置"
 
 diff:
   more_lines: "    … 还有 {n} 行（Ctrl+O 展开全文）"
@@ -279,6 +286,13 @@ new:
 compact:
   desc: "手动压缩对话上下文，减少 token 消耗"
   usage: "/compact [摘要提示]"
+  done: "已压缩：移除 {removed} 条消息，节省约 {saved} tokens"
+  noop: "上下文较短，无需压缩。"
+  failed_tag: "压缩失败"
+
+checkpoint:
+  created: "已创建 checkpoint {id}"
+  failed_tag: "checkpoint 创建失败"
 
 context:
   desc: "查看上下文占用分解，与自动压缩阈值同源"

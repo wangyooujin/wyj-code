@@ -58,6 +58,16 @@
     - **退出误唤醒**：`kill_all()`（`app.rs` 退出路径 + `cli/main.rs` headless）给所有 Running job 发 SIGKILL，但 `spawn_prepared` 里的 `child.wait()` task 仍会把它们翻成 `Exited(-1)`。轮询检测**必须**用 `!state.should_quit` 守卫拦在前面，否则退出那一帧会把每个后台任务都误判为"刚完成"并触发唤醒。
     - **两级生命周期粒度**：`begin_new_turn()`（每轮对话）**刻意不清** `shells`——dev server 等任务跨轮次持续存在，在这儿清会让它们从面板凭空消失；真正作废的是 `reset_for_new_session()`（`/clear`/新会话/resume），那里进程本身也已被 `kill_all` 收走。
     - **面板优先级**（`render.rs::bottom_panel_size`）：`Shells` 与 `SubAgents` 互斥（底部只有一个位置），规则是**用户焦点优先，其次按"有运行中任务"**。两者常同时跑（派 agent 改代码 + 自己起 dev server），固定先后会让其中一方永远看不见也按不了 k。跨区链条 `Chat ↓ → Todos ↓ → SubAgents ↓ → Shells`，`UiFocus` 需在 6 处 match 里同步加分支（`move_focus_selection` / `scroll_focus_lines` / `content_focus_active` / `enter_content_focus` / `leave_content_focus` / `toggle_focused_content_detail` / `close_panel_focus`）。
-    - **详情区 scroll 语义**：`draw_shell_panel` 与 `draw_sub_agents_panel` 一致——`clamped` 是"从底部往上偏移的行数"，`clamped=0` 即贴底跟随新输出，用户 PageUp 后停在历史位置。渲染时用 `Paragraph::line_count` 重算并 clamp 写回 `shell_detail_max_scroll`（`draw()` 每帧先防御性清零）。
+    - **子 Agent 执行内容占内容区，不占面板**（v0.3.3）：选中子 Agent（`Shift+↑` / `↑↓` / `/subagents`）后 `draw()` 把 `chunks[0]` 从 `draw_chat` 换成 `draw_sub_agent_content`，底部面板退化成纯列表 + 选中高亮。**不要再把 trace 塞回面板**：面板高度受 `bottom_panel_size` 预算限制，且列表本身要占行，`ui_focus == SubAgents` 分支给的高度恒等于 `list_rows + 2`，任何"详情区"布局判断（旧的 `inner.height > list_rows`）恒为 false —— 这就是曾经"选中子 Agent 后一片空白"的根因。后台 shell 面板**仍用面板内详情区**（`draw_shell_panel`），两者刻意不对称：shell 详情是实时输出尾巴，量小；subagent trace 是完整工具入参/出参，需要整屏。
+    - **详情区 scroll 语义**：`draw_shell_panel` 的详情区与 `draw_sub_agent_content` 一致——`clamped` 是"从底部往上偏移的行数"，`clamped=0` 即贴底跟随新输出，用户 PageUp 后停在历史位置。渲染时用 `Paragraph::line_count` 重算并 clamp 写回 `shell_detail_max_scroll` / `sub_agent_detail_max_scroll`（`draw()` 每帧先防御性清零）。
     - **`k` 键无冲突**：裸 `k` 在内容区焦点态未占用；输入框的 `Ctrl+K`（kill-to-end）走 `key.modifiers.contains(CONTROL)` 另一条分支。`kill_selected_shell` 必须 `&mut self`（要 push 提示消息），且 `BashSessionManager::kill` 是 async（等 2s 兜底 SIGKILL），经 `state.kill_tx` 把 `AgentEvent::ShellKilled` 发回 UI 线程。
     - **tasklist 摘要**：`push_inline_todo_lines` 在 `all_done` 时只画一行摘要（保留耗时/token 统计的可追溯信息），不画分隔线/条目/展开提示。`TurnDone` **刻意不清** `current_todos`（测试 `turn_done_auto_completes_remaining_in_progress_todos` 用 `expect` 锁死了该行为），所以"全部完成 → 下一条消息之间"面板会一直存在，收成一行是唯一能在不改该测试的前提下消掉干扰的办法。`Ctrl+T` 在 `all_done` 时 no-op（否则展开一个永远渲染不出来的空壳）。
+
+## 主循环绝不做阻塞等待
+
+19. **主循环绝不做阻塞等待（`/compact` 冻死界面的根因与治法）**：
+    - **因果链**：`tui_main` 是**同一个 task** 既重绘又读按键。只要在这个 task 上 `await` 一个完成时间不可预期的操作，`event::poll()` 就再也跑不到——界面停在最后一帧、ESC / Ctrl+C 读不到、回合停滞看门狗也不跑，最后只能 `kill`。`/compact` 曾把一次完整的 LLM 往返 inline 在这里（摘要预算 `min(cw/10, 16000)` + `RetryPolicy::default()` 的 5 次指数退避），端点不稳时能冻住数分钟且零反馈。
+    - **同类成员**：`/checkpoint`、`/rewind`、`/branch`、`/evolve` 的工作区快照（git 管道 / 全树哈希，秒级同步 IO）、`/bug` `/pr-comments` 的子进程（`git` / `gh` / `open`）。
+    - **统一形状**：`state.begin_background_task(label)` 点亮忙碌态（复用 `is_thinking`，顺带获得"输入被挡 + spinner + ESC 可 abort + 15 分钟停滞看门狗"），`spawn_turn_task` 起后台 task，做完经一个 `AgentEvent::*` 变体把**结果**发回主循环渲染。后台 task 里该等锁就 `lock().await`（不会冻结界面），但**发事件前必须先放锁**。
+    - **新增阻塞型 slash 命令**：在 `Command` 上实现 `needs_background() -> true`，TUI 会自动丢后台 task。契约：**只能返回 `Output` / `OutputPlain` / `None`**；返回 `RunPrompt` 的命令不能标（回合 spawn 只存在于主循环里，结果回事件通道起不了回合）——`/review` 就是这个原因才保持 inline，代价是秒级停顿。
+    - **回归钉子**（`app.rs` 测试模块）：`main_loop_never_awaits_the_session_lock`、`compact_runs_in_a_background_task_not_on_the_ui_thread`、`workspace_snapshot_commands_run_in_background_tasks`、`only_process_spawning_commands_are_marked_background`。

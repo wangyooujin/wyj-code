@@ -511,11 +511,17 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         ])
         .split(area);
 
-    draw_chat(f, state, chunks[0]);
-    // 防御性清零：只有 BottomPanel::SubAgents 分支里真正画出详情区时才会重新写入
-    // 准确值，避免面板本帧未展示详情区（终端太矮/未展开/无选中）时残留上一帧的旧值。
+    // 防御性清零：只有内容区真正画出子 Agent 执行内容（`draw_sub_agent_content`）
+    // 时才会重新写入准确值，避免本帧未展示（面板未聚焦/无选中）时残留上一帧的旧值。
     state.sub_agent_detail_max_scroll = 0;
     state.shell_detail_max_scroll = 0;
+    // 选中子 Agent 后内容区切换为它的执行内容；↑↓ 在运行中的子 Agent 之间切换，
+    // Esc / ↑ 越界回到输入框时恢复聊天流。
+    if state.ui_focus == UiFocus::SubAgents && state.selected_sub_agent.is_some() {
+        draw_sub_agent_content(f, state, chunks[0]);
+    } else {
+        draw_chat(f, state, chunks[0]);
+    }
     match panel_kind {
         BottomPanel::None => {}
         BottomPanel::Permission => {
@@ -635,8 +641,6 @@ enum BottomPanel {
 
 /// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
 const SUB_AGENT_LIST_MAX: usize = 6;
-/// agents 面板详情区（工具流水 + 结果/状态提示）最多占用的行数（超出内部滚动）
-const SUB_AGENT_DETAIL_MAX: u16 = 12;
 /// 后台任务面板列表区最多同时展示的行数
 const SHELL_LIST_MAX: usize = 6;
 /// 后台任务面板详情区（实时输出）最多占用的行数（超出内部滚动）
@@ -742,43 +746,14 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         );
     }
 
-    // 子 Agent 聚合面板：运行期间自动显示，全部结束后自动收起；用户通过
-    // `/subagents` 或方向键主动进入面板焦点时仍可查看本会话历史详情。
-    // 列表区固定行数上限 + 滚动窗口（本会话内全部保留，数量可能持续增长）；
-    // 详情展开时追加详情区所需行数，整体按可用高度 70% 封顶，避免聊天区被挤没。
+    // 子 Agent 聚合面板：运行期间自动显示，全部结束后自动收起。选中条目的执行
+    // 内容由内容区 `draw_sub_agent_content` 接管，面板本身只负责列表与选中高亮。
     let visible = state.visible_sub_agents();
     let show_sub_agents = state.has_running_sub_agents();
     if show_sub_agents && !visible.is_empty() {
         let list_rows = visible.len().min(SUB_AGENT_LIST_MAX) as u16;
-        let detail_rows = if state.sub_agent_detail_open {
-            state
-                .selected_sub_agent
-                .and_then(|id| state.sub_agents.get(&id))
-                .map(|s| {
-                    // sizing 阶段没有宽度信息，只能用原始行数粗略估算；
-                    // 精确的可视行数在 draw_sub_agents_panel 渲染时用 Paragraph::line_count 重新计算并 clamp scroll。
-                    let tool_rows = if s.tool_log.is_empty() {
-                        0
-                    } else {
-                        s.tool_log.len() as u16 + 1 // +1 分隔线
-                    };
-                    let status_rows = match s.status {
-                        SubAgentStatus::Running | SubAgentStatus::Interrupted => 1,
-                        SubAgentStatus::Done | SubAgentStatus::Failed => s
-                            .final_result
-                            .as_deref()
-                            .map(|r| r.lines().count().max(1) as u16)
-                            .unwrap_or(1),
-                    };
-                    (tool_rows + status_rows).min(SUB_AGENT_DETAIL_MAX)
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let content_rows = list_rows + detail_rows;
         let max_h = (area_height * 7 / 10).max(list_rows + 2);
-        let h = (content_rows + 2).clamp(list_rows + 2, max_h);
+        let h = (list_rows + 2).clamp(list_rows + 2, max_h);
         return (h.min(area_height), BottomPanel::SubAgents);
     }
     (0, BottomPanel::None)
@@ -807,6 +782,8 @@ fn push_sub_agent_tool_log(
         } else {
             format!("{}({})", tl.tool_name, tl.arg_summary)
         };
+        // 与主聊天流同一口径：Grep 行尾标出这次跑的是 rg 还是内置 Rust 实现
+        let call = format!("{call}{}", crate::app::tool_backend_badge(&tl.tool_name));
         lines.push(Line::from(vec![
             Span::styled("       ⏺ ", Theme::tool_call()),
             Span::styled(
@@ -1726,12 +1703,15 @@ fn push_inline_todo_lines(
     };
 
     lines.push(Line::from(""));
-    // 全部完成：只保留这一行摘要。不画分隔线、不列条目、不给展开提示——
-    // 任务已经干完了，2 行折叠面板（头部 + ─）会一直挂在聊天流里占地方，
-    // 而 `TurnDone` 刻意不清 current_todos（见 app.rs 的 TurnDone handler），
-    // 意味着它会一直挂到用户发下一条消息才消失。收成一行既保留了"这轮做了
-    // 什么、耗时多少 token"的可追溯信息，又不再干扰阅读。
-    if all_done {
+    // 全部完成：**默认**只保留这一行摘要（不画分隔线、不列条目）——2 行折叠
+    // 面板挂在聊天流里纯粹占地方，而 `TurnDone` 刻意不清 current_todos，它会
+    // 一直挂到用户发下一条消息才消失。收成一行既保留"这轮做了什么、耗时多少
+    // token"的可追溯信息，又不干扰阅读。
+    //
+    // 但完成 ≠ 不可读。用户在这个窗口里最想知道的恰恰是"刚才做了哪几步、
+    // 每步多少 token"——`todo_stats` 与 `todo_execution_logs` 是唯一的审计
+    // 凭据且不落盘，所以用户主动 Ctrl+T 时必须还能把它叫回来。
+    if all_done && collapsed {
         lines.push(Line::from(vec![
             Span::styled("  TodoWrite", Theme::tool_call()),
             Span::styled("  ", Theme::dim()),
@@ -1741,6 +1721,8 @@ fn push_inline_todo_lines(
                     .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD),
             ),
+            // 折叠态照常给展开提示，否则用户无从知道这一行还能被叫回来。
+            Span::styled(wyj_i18n::tr("spinner.todo_expand"), Theme::dim()),
         ]));
         return (detail_scroll, 0);
     }
@@ -2163,6 +2145,125 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     }
 }
 
+/// 选中子 Agent 时接管整个内容区，把它的执行过程（trace）铺开显示。
+///
+/// 执行内容不再挤在底部面板的详情带里：那条带子受 `bottom_panel_size` 的高度预算
+/// 限制，列表本身还要占行，实际几乎永远显示不全。滚动语义沿用
+/// `sub_agent_detail_scroll` —— clamped == 0 表示贴底跟随新事件，PageUp/PageDown 翻阅。
+fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
+    let Some(id) = state.selected_sub_agent else {
+        draw_chat(f, state, area);
+        return;
+    };
+    let detail_width = chat_content_width(area.width);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // 标题：与面板列表行同款，让"内容区这一屏属于哪个子 Agent"一眼可辨。
+    if let Some(s) = state.sub_agents.get(&id) {
+        let bg_tag = if s.background { " ◇bg" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" a{id} "), Theme::dim()),
+            Span::styled(
+                truncate_line(&s.description, detail_width.saturating_sub(16)),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " ⏱ {} ↑{} ↓{}{bg_tag}",
+                    format_hms(s.elapsed_secs()),
+                    fmt_tokens(s.input_tokens),
+                    fmt_tokens(s.output_tokens),
+                ),
+                Theme::dim(),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(detail_width),
+            Theme::dim(),
+        )));
+    }
+
+    // 正文：优先 trace（含工具入参/出参），落盘 trace 缺失时才退回面板那份摘要流水。
+    let events = state.sub_agent_trace_events(id);
+    match events {
+        Some(events) if !events.is_empty() => {
+            push_sub_agent_trace_lines(&mut lines, &events, detail_width);
+        }
+        _ => {
+            let (tool_log, current_tool, status, final_result) = state
+                .sub_agents
+                .get(&id)
+                .map(|s| {
+                    (
+                        s.tool_log.clone(),
+                        s.current_tool.clone(),
+                        s.status,
+                        s.final_result.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (Vec::new(), None, SubAgentStatus::Running, None));
+            push_sub_agent_tool_log(&mut lines, &tool_log, detail_width);
+            if let Some(cur) = &current_tool {
+                push_wrapped_detail_line(
+                    &mut lines,
+                    &wyj_i18n::tr("subagent.detail_running"),
+                    cur,
+                    Theme::dim(),
+                    detail_width,
+                );
+            }
+            match status {
+                SubAgentStatus::Running => {}
+                SubAgentStatus::Done | SubAgentStatus::Failed => {
+                    let style = if status == SubAgentStatus::Failed {
+                        Theme::error()
+                    } else {
+                        Theme::tool_result()
+                    };
+                    let result = final_result.unwrap_or_else(|| wyj_i18n::tr("subagent.no_output"));
+                    push_wrapped_detail_line(&mut lines, "result", &result, style, detail_width);
+                }
+                SubAgentStatus::Interrupted => {
+                    push_wrapped_detail_line(
+                        &mut lines,
+                        "status",
+                        &wyj_i18n::tr("subagent.interrupted"),
+                        Theme::error(),
+                        detail_width,
+                    );
+                }
+            }
+        }
+    }
+
+    // 末行留给固定的返回/滚动提示，不随正文滚动。
+    let body_height = area.height.saturating_sub(1).max(1);
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    let total = para.line_count(area.width.max(1)).min(u16::MAX as usize) as u16;
+    let max_scroll = total.saturating_sub(body_height);
+    state.sub_agent_detail_max_scroll = max_scroll;
+    let clamped = state.sub_agent_detail_scroll.min(max_scroll);
+    state.sub_agent_detail_scroll = clamped;
+    let scroll_y = max_scroll.saturating_sub(clamped);
+    f.render_widget(para.scroll((scroll_y, 0)), area);
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        wyj_i18n::tr("subagent.content_hint"),
+        Style::default().fg(Color::Cyan),
+    )));
+    f.render_widget(
+        hint,
+        Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(1),
+            width: area.width,
+            height: 1,
+        },
+    );
+}
+
 fn push_wrapped_detail_line(
     lines: &mut Vec<Line<'static>>,
     label: &str,
@@ -2359,21 +2460,11 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
     let selected_idx = state
         .selected_sub_agent
         .and_then(|id| ids.iter().position(|&i| i == id));
-    let detail_open = state.sub_agent_detail_open && selected_idx.is_some();
 
-    let list_rows = (ids.len().min(SUB_AGENT_LIST_MAX) as u16).min(inner.height);
-    let (list_area, detail_area) = if detail_open && inner.height > list_rows {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(list_rows), Constraint::Min(1)])
-            .split(inner);
-        (chunks[0], Some(chunks[1]))
-    } else {
-        (inner, None)
-    };
+    let list_area = inner;
 
     let max_content_width = list_area.width.saturating_sub(2) as usize;
-    let max_show = (list_area.height as usize).max(1);
+    let max_show = (list_area.height as usize).clamp(1, SUB_AGENT_LIST_MAX);
     let start = match selected_idx {
         Some(idx) if idx >= max_show => idx - max_show + 1,
         _ => 0,
@@ -2425,72 +2516,6 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), list_area);
-
-    // 详情区：先列工具调用流水，再按状态展示"运行中/已中断/最终结果"
-    if let (Some(detail_area), Some(idx)) = (detail_area, selected_idx) {
-        let id = ids[idx];
-        let trace_events = state.sub_agent_trace_events(id);
-        if let Some(s) = state.sub_agents.get(&id) {
-            let detail_width = detail_area.width.saturating_sub(2) as usize;
-            let mut detail_lines: Vec<Line<'static>> = vec![];
-            if let Some(events) = trace_events.as_deref().filter(|events| !events.is_empty()) {
-                push_sub_agent_trace_lines(&mut detail_lines, events, detail_width.max(20));
-            } else {
-                push_sub_agent_tool_log(&mut detail_lines, &s.tool_log, detail_width.max(20));
-                match s.status {
-                    SubAgentStatus::Running => {
-                        let cur = s.current_tool.as_deref().unwrap_or("…");
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  {}{}", wyj_i18n::tr("subagent.detail_running"), cur),
-                            Style::default().fg(Color::Cyan),
-                        )));
-                    }
-                    SubAgentStatus::Interrupted => {
-                        detail_lines.push(Line::from(Span::styled(
-                            format!("  ✗ {}", wyj_i18n::tr("subagent.interrupted")),
-                            Theme::error(),
-                        )));
-                    }
-                    SubAgentStatus::Done | SubAgentStatus::Failed => {
-                        let style = if s.status == SubAgentStatus::Failed {
-                            Theme::error()
-                        } else {
-                            Theme::tool_result()
-                        };
-                        if let Some(result) = &s.final_result {
-                            for l in result.lines() {
-                                detail_lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "  {}",
-                                        truncate_line(l, detail_width.saturating_sub(2))
-                                    ),
-                                    style,
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-
-            let text = Text::from(detail_lines);
-            let dw = detail_area.width.max(1);
-            let para = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
-            let total = para.line_count(dw).min(u16::MAX as usize) as u16;
-            let visible_height = detail_area.height;
-            let max_scroll = total.saturating_sub(visible_height);
-            state.sub_agent_detail_max_scroll = max_scroll;
-            // clamp 后写回，防止按键累加超过 max_scroll 导致"到顶/底后要多按几次才生效"
-            let clamped = state.sub_agent_detail_scroll.min(max_scroll);
-            state.sub_agent_detail_scroll = clamped;
-            let scroll = max_scroll.saturating_sub(clamped);
-            f.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0)),
-                detail_area,
-            );
-        }
-    }
 }
 
 /// 后台 Shell 任务面板：列表（id / 命令 / 状态 / 耗时）+ 详情（实时输出）。
@@ -6711,13 +6736,16 @@ mod tool_result_fold_tests {
         );
     }
 
-    // ── 任务全部完成 → 收成一行摘要 ─────────────────────────────────────
+    // ── 任务全部完成 → 默认收成一行摘要，但可再展开 ─────────────────────
     //
     // 回归背景：用户报告「tasklist 多任务全部完成后，折叠态的面板一直挂在
     // 聊天流里不消失」。根因是 `TurnDone` 刻意不清 `current_todos`（现有测试
     // 锁死了这个行为），而原渲染把「全部完成」画成 2 行（头部 + ─ 分隔线），
     // 于是它会一直挂到用户发下一条消息。改成只画一行摘要后既保留了「这轮
     // 做了什么 / 耗时多少 token」的可追溯信息，又不再占地方。
+    //
+    // 但「默认折叠」不等于「不可读」：每项耗时/token 与执行回放是唯一的审计
+    // 凭据且不落盘，用户按 Ctrl+T 必须还能把完整清单叫回来。
 
     #[test]
     fn completed_todo_panel_renders_single_summary_line() {
@@ -6767,8 +6795,65 @@ mod tool_result_fold_tests {
             "摘要态不应再画分隔线：{tail:?}"
         );
         assert!(
-            !tail.iter().any(|l| l.contains("ctrl+t")),
-            "摘要态不应再提示可展开：{tail:?}"
+            tail[0].contains(&wyj_i18n::tr("spinner.todo_expand")),
+            "摘要态必须提示还能展开，否则用户不知道这一行可以被叫回来：{tail:?}"
+        );
+    }
+
+    #[test]
+    fn completed_todo_panel_is_still_expandable_by_ctrl_t() {
+        // 上一条的对照：全部完成只是**默认**折叠，`todo_panel_expanded`
+        // （即 Ctrl+T 的作用结果）为 true 时必须画回完整条目清单。
+        let mut state = make_state();
+        state.current_todos = Some(vec![
+            wyj_tools::todo::TodoItem {
+                id: "a".to_string(),
+                content: "task a".to_string(),
+                status: wyj_tools::todo::TodoStatus::Completed,
+                priority: None,
+                active_form: None,
+            },
+            wyj_tools::todo::TodoItem {
+                id: "b".to_string(),
+                content: "task b".to_string(),
+                status: wyj_tools::todo::TodoStatus::Completed,
+                priority: None,
+                active_form: None,
+            },
+        ]);
+        state.todo_panel_expanded = true;
+
+        let rendered: Vec<String> = build_pending_chat_lines(&mut state, 100)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let head = rendered
+            .iter()
+            .position(|l| l.contains("TodoWrite"))
+            .expect("面板未渲染");
+        let tail = &rendered[head..];
+        assert!(
+            tail.iter().any(|l| l.contains("task a")),
+            "完成后按 Ctrl+T 应能重新看到条目清单：{tail:?}"
+        );
+        assert!(
+            tail.iter().any(|l| l.contains("task b")),
+            "完成后按 Ctrl+T 应能重新看到条目清单：{tail:?}"
+        );
+        assert!(
+            tail.iter().any(|l| l.contains('✓')),
+            "完成项应渲染为 ✓：{tail:?}"
+        );
+        assert!(
+            tail.iter()
+                .any(|l| l.contains(&wyj_i18n::tr("spinner.todo_collapse"))),
+            "展开态应给出折叠提示：{tail:?}"
         );
     }
 
@@ -6850,6 +6935,110 @@ mod tool_result_fold_tests {
             .iter()
             .any(|line| line.contains("task: short task")));
         assert!(rendered.iter().any(|line| line.contains("PageUp/PageDown")));
+    }
+
+    /// 渲染一屏到 TestBackend 并拼成纯文本，方便断言"这一屏到底画了什么"。
+    fn render_to_text(f: impl FnOnce(&mut Frame), width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, height)).expect("TestBackend init");
+        terminal.draw(f).expect("draw should not panic");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn running_sub_agent_with_tool_log() -> SubAgentUiState {
+        let mut sub = sub_agent(SubAgentStatus::Running);
+        sub.current_tool = Some("WebFetch(url)".to_string());
+        sub.tool_log = vec![SubToolLine {
+            tool_name: "Grep".to_string(),
+            arg_summary: "pattern=needle".to_string(),
+            is_error: false,
+            elapsed_secs: Some(0.1),
+        }];
+        sub
+    }
+
+    /// 回归钉子：选中子 Agent 后**内容区**必须换成它的执行内容。
+    ///
+    /// 此前执行内容只画在底部面板的详情带里，而 `bottom_panel_size` 在
+    /// `ui_focus == SubAgents` 分支压根不给详情预留行数，`draw_sub_agents_panel`
+    /// 的 `inner.height > list_rows` 恒为 false —— 选中后什么也看不到。
+    #[test]
+    fn selected_sub_agent_replaces_content_area_with_its_execution() {
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, running_sub_agent_with_tool_log());
+        state.selected_sub_agent = Some(1);
+        state.sub_agent_detail_open = true;
+        state.ui_focus = UiFocus::SubAgents;
+
+        let text = render_to_text(|f| draw_sub_agent_content(f, &mut state, f.area()), 100, 20);
+
+        assert!(
+            text.contains("test task"),
+            "内容区应标出该子 Agent：\n{text}"
+        );
+        assert!(
+            text.contains("Grep(pattern=needle)"),
+            "内容区应列出工具流水：\n{text}"
+        );
+        assert!(
+            text.contains("WebFetch(url)"),
+            "内容区应显示当前动作：\n{text}"
+        );
+    }
+
+    /// 焦点离开面板后内容区必须切回聊天流，否则会话正文会被子 Agent 视图永久顶掉。
+    #[test]
+    fn chat_area_returns_when_sub_agent_panel_loses_focus() {
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, running_sub_agent_with_tool_log());
+        let mut msg = ChatMessage::system("hello from the main conversation".to_string());
+        msg.role = MessageRole::User;
+        state.messages.push(msg);
+        state.chat_follow_tail = true;
+
+        // 复现 `leave_content_focus` 的收尾动作：焦点回输入框、选中清空。
+        state.ui_focus = UiFocus::Composer;
+        state.selected_sub_agent = None;
+        state.sub_agent_detail_open = false;
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 100, 20);
+
+        assert!(
+            text.contains("hello from the main conversation"),
+            "退出面板后聊天流应重新出现：\n{text}"
+        );
+    }
+
+    /// 面板高度只覆盖列表：详情由内容区承担，`bottom_panel_size` 不再为它预留行数。
+    #[test]
+    fn focused_sub_agent_panel_reserves_rows_for_list_only() {
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, running_sub_agent_with_tool_log());
+        state.selected_sub_agent = Some(1);
+        state.sub_agent_detail_open = true;
+        state.ui_focus = UiFocus::SubAgents;
+
+        let (height, panel) = bottom_panel_size(&state, 40);
+
+        assert!(matches!(panel, BottomPanel::SubAgents));
+        assert_eq!(height, 3, "1 条运行中列表 + 上下边框；详情不再占行");
     }
 
     #[test]

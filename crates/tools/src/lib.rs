@@ -41,6 +41,7 @@ pub use bash_session::BashSessionManager;
 pub use computer::ComputerTool;
 pub use ctx::{PermissionDecision, PermissionMode, ToolCtx, UiAskRequest};
 pub use exit_plan_mode::ExitPlanModeTool;
+pub use grep::backend_label as grep_backend_label;
 pub use memory::MemoryTool;
 pub use registry::ToolRegistry;
 pub use sub_agent::{AgentFactory, SharedAgentDefinitions, SubAgentTool};

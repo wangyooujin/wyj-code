@@ -204,6 +204,17 @@ impl Tool for BashTool {
         true
     }
 
+    /// 每次 Bash 调用都是各自独立的子进程（独立 pipe、独立 pgid、独立实时输出
+    /// 槽），彼此没有任何共享可变状态，所以同名的多个调用**并发执行与串行执行
+    /// 结果完全一致**。
+    ///
+    /// 声明 true 不代表"永远并发"：调用方还要确认这一次不会阻塞在权限弹框上
+    /// （见 `Tool::parallel_safe_with_peer`）。仍需弹框的那一批照旧串行，
+    /// 「同一时刻至多一个对话框」不变。
+    fn parallel_safe_with_peer(&self) -> bool {
+        true
+    }
+
     fn action_summary(&self, input: &Value) -> String {
         input
             .get("command")

@@ -76,6 +76,13 @@ impl Tool for GlobTool {
                 .hidden(false)
                 .ignore(true)
                 .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                // 非 git 仓库里也让 .gitignore 生效（ignore crate 默认 true）。
+                // 工具描述里承诺的是「Respects .gitignore」，之前这句话在非 git 目录
+                // 是不成立的：被项目显式排除的 `.venv/`、数据目录照样被遍历，
+                // 单次调用多花几百毫秒。对齐 `grep.rs` 里已有的同一处设置。
+                .require_git(false)
                 .build();
 
             for entry in walker {

@@ -1772,6 +1772,11 @@ impl Command for BugCmd {
     fn usage(&self) -> String {
         "/bug [简述]".to_string()
     }
+    fn needs_background(&self) -> bool {
+        // 同步跑 `git remote get-url` 并拉起系统浏览器（`open`）：在 TUI 主循环
+        // 里 inline await 会让按键（ESC / Ctrl+C）全部读不到。
+        true
+    }
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         let (ok, stdout, _) = run_capture("git", &["remote", "get-url", "origin"], &ctx.cwd).await;
         let Some(slug) = (if ok { parse_github_slug(&stdout) } else { None }) else {
@@ -1823,6 +1828,10 @@ impl Command for ReviewCmd {
     fn usage(&self) -> String {
         "/review [PR编号]".to_string()
     }
+    // 刻意**不**标 needs_background：`/review` 成功时返回 RunPrompt（要把 diff
+    // 交给 Agent 起新回合），而回合 spawn 只存在于 TUI 主循环里，后台 task 的
+    // 结果回不到那里。代价是一次 `gh pr diff` 的秒级停顿——与 `/compact` 那种
+    // 分钟级、且无任何反馈的冻结不同量级，故不做这次重构。
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         if !gh_available().await {
             return Ok(CommandResult::Output(tr("gh.missing")));
@@ -1863,6 +1872,11 @@ impl Command for PrCommentsCmd {
     }
     fn usage(&self) -> String {
         "/pr-comments [PR编号]".to_string()
+    }
+    fn needs_background(&self) -> bool {
+        // `gh --version` + `gh pr view --comments`：两次子进程往返，PR 评论多时
+        // 输出十几 KB，inline 执行会冻住界面。
+        true
     }
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
         if !gh_available().await {
