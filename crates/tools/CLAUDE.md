@@ -6,6 +6,18 @@
 根目录 `CLAUDE.md` 只留跨 crate 的通则与索引，本目录的实现细节全部沉在这里。
 
 
+## Grep 工具的两级实现
+
+`tools::grep` 刻意做成**两级、对外行为一致**的搜索后端，测试里 `assert_both_ways` 对同一输入断言两条路径的输出一致：
+
+- **rg 快路径**（默认，`rg_binary` 只在 `PATH` 里探测一次）：直接 spawn `rg --color=never --no-heading -H --hidden --no-messages -g '!.git' -g '!.git/**' -e <pattern> -- <root>`，流式读 stdout，命中 `head_limit`/500 匹配上限后 `kill` 掉子进程（不读完，避免白扫整棵树）；`files_with_matches`/`count` 模式额外按路径排序，抵消多线程遍历的乱序。三条硬约定：① 子进程 `RIPGREP_CONFIG_PATH=""`，否则用户自己的 rg 配置（如 `--smart-case`）会静默改变匹配语义；② `-H` 必须带，否则 rg 搜索**单个文件**时默认只打行号不打路径；③ rg 插在相邻上下文组之间的 `--` 分隔符要剔除（原生实现不输出它）。rg 退出码 ≥2（非法 pattern/glob）视为「rg 搞不定」，回退纯 Rust。
+- **纯 Rust 兜底**（没装 ripgrep 的机器）：`ignore::WalkBuilder::build_parallel()`（线程数 = `available_parallelism`，上限 16，命中上限后 `WalkState::Quit`）+ regex-automata 字面量预筛。预筛用 `regex_syntax` 在 Hir 上抽字面量（`Prefilter::new(MatchKind::LeftmostFirst, …)`，memchr/memmem）：**先整文件字节级粗筛**，没有候选就连二进制 NUL 扫描与 UTF-8 校验都省掉，再逐行过滤后才进 regex 引擎。大小写不敏感时必须用 `ParserBuilder::case_insensitive(true)` 解析出**已折叠**的 Hir 再抽字面量——不能把 needle 简单转小写，那会漏掉 ſ/İ/K 这类 Unicode 折叠特例造成**静默漏报**；抽不出字面量或模式可匹配空串时返回 None，退回逐行 `is_match`，宁可慢不能漏。
+
+**忽略语义两条路径必须一致**（这是改造的另一半收益）：跳过 `.git` 目录、`.gitignore`/`.ignore`/`.git/info/exclude` 在任何目录都生效。旧实现 `hidden(false)` 会把 `.git/objects` 一起遍历（本仓库 710 个文件里 473 个是 `.git` 内部文件），且 ignore crate 的 `require_git` 默认 true，非 git 仓库里 `.gitignore` 静默失效。
+
+实测（release、Apple Silicon）：本仓库常规搜索 10~30×；832MB/3 万文件的语料上全量扫描 rg 快路径 4~11×，纯 Rust 兜底 2~7×。纯 Rust 兜底在大文件全量扫描时仍受「整份 read 拷贝」限制（~600MB/s），没有走 mmap——`memmap2::Mmap::map` 是 unsafe 且文件被并发截断时会 SIGBUS（进程直接死），不值得为兜底路径冒这个险。
+
+
 ## SubAgent 工具与后台 shell
 
 

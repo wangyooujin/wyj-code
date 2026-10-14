@@ -72,17 +72,69 @@ mod tests {
             tr_fmt("command.unknown", &[("name", "foo")]) // 存在性冒烟：不 panic 即可
         );
 
+        // 底部进度区（输入框标题栏 spinner / TodoWrite 面板）：两种语言都得真的
+        // 被翻译，且三种插值占位符都接得上。未解析时 rust-i18n 会原样回显 key，
+        // 那正是"漏了一半翻译"最难被发现的形态，所以在两个 locale 各查一遍。
+        assert_eq!(
+            tr_fmt(
+                "spinner.queue_hint",
+                &[("count", "3"), ("running", "等待送达")]
+            ),
+            "3 条已排队（等待送达）"
+        );
+        assert_eq!(
+            tr_fmt("spinner.queue_op_running", &[("op", "Bash(sleep 540)")]),
+            "Bash(sleep 540) 进行中"
+        );
+        assert_eq!(
+            tr_fmt("thinking.running", &[("frame", "⠹")]),
+            "  ⎿ ⠹ 思考中…"
+        );
+        let zh: Vec<String> = SPINNER_KEYS.iter().map(|k| tr(k)).collect();
+
         set_locale("en");
         assert_eq!(current_locale(), "en");
         assert_eq!(
             tr("help.desc"),
             "Show all available commands and keyboard shortcuts"
         );
+        assert_eq!(
+            tr_fmt(
+                "spinner.queue_hint",
+                &[("count", "3"), ("running", "awaiting delivery")]
+            ),
+            "3 queued (awaiting delivery)"
+        );
+        assert_eq!(
+            tr_fmt("thinking.running", &[("frame", "⠹")]),
+            "  ⎿ ⠹ Thinking…"
+        );
+        let en: Vec<String> = SPINNER_KEYS.iter().map(|k| tr(k)).collect();
+        for ((key, en), z) in SPINNER_KEYS.iter().zip(&en).zip(&zh) {
+            assert!(!en.starts_with("spinner."), "en 的 {key} 未解析：{en:?}");
+            assert!(!z.starts_with("spinner."), "zh 的 {key} 未翻译：{z:?}");
+            assert_ne!(en, z, "{key} 在 zh 下没翻：{z:?}");
+        }
 
         // 缺失 key 时 rust-i18n 按约定原样回显 key（不 panic），冒烟验证不会崩
         let missing = tr("this.key.does.not.exist");
         assert!(!missing.is_empty());
     }
+
+    /// 底部进度区的全部 key。两 locale 必须**逐条都有**且措辞不同 —— 这些文案
+    /// 曾以中英混排的形式硬编码在 `crates/tui/src/render.rs` 里，漏一条就会让
+    /// 切换 locale 后底部看起来只翻译了一半。
+    const SPINNER_KEYS: &[&str] = &[
+        "spinner.thinking",
+        "spinner.waiting_approval",
+        "spinner.reviewing_plan",
+        "spinner.queuing_message",
+        "spinner.queue_pending",
+        "spinner.todo_title",
+        "spinner.todo_done",
+        "spinner.todo_expand",
+        "spinner.todo_collapse",
+    ];
 
     #[test]
     fn locale_display_name_has_native_names() {

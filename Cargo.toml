@@ -74,6 +74,9 @@ scraper = "0.21"
 encoding_rs = "0.8"
 # 正则（Grep 工具）
 regex = "1"
+# Grep 纯 Rust 兜底：从正则抽字面量做 memchr/memmem 预筛
+regex-automata = "0.4"
+regex-syntax = "0.8"
 # Markdown 解析（TUI 渲染）
 pulldown-cmark = { version = "0.12", default-features = false }
 # 剪贴板（图片粘贴 + Ctrl+Y 复制）
