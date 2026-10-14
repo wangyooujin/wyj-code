@@ -348,6 +348,25 @@ impl ToolContext for ToolCtx {
         }
     }
 
+    fn needs_dialog(&self, name: &str) -> bool {
+        // 判据与 confirm_tool 的两个「直接放行」分支严格对齐，差一个字就会
+        // 出现「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个
+        // 对话框」——那正好破坏 `needs_dialog` 存在的唯一理由。
+        if !matches!(
+            &*self.permission_mode.read().unwrap(),
+            PermissionMode::Prompt
+        ) {
+            return false;
+        }
+        if self.always_allowed.read().unwrap().contains(name) {
+            return false;
+        }
+        // 无 UI 通道时 confirm_tool 直接 fail-closed 返回 false（并不 await），
+        // 但那种情况下调用压根不会被执行，仍按会弹框处理，让这类上下文
+        // 退回串行的旧行为。
+        true
+    }
+
     fn is_plan_mode(&self) -> bool {
         matches!(
             &*self.permission_mode.read().unwrap(),
@@ -399,6 +418,46 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 钉子：`needs_dialog` 的两个 false 分支必须与 `confirm_tool` 的两个
+    /// 「直接放行、不发 UiAskRequest」分支一字不差地对齐。
+    ///
+    /// 错位的后果是双向的，且都很难在别处被发现：
+    /// `needs_dialog` 判 false 而 `confirm_tool` 仍发请求 → Agent 把多个调用
+    /// 排进并发组 → 同一时刻弹出多个对话框；
+    /// 反向错位只是白白丢掉并发，属于性能退化而非正确性问题，所以判据只按
+    /// 「宁可串行，不可多弹框」的方向偏保守。
+    #[test]
+    fn needs_dialog_matches_confirm_tool_fast_paths() {
+        let base = tmp_base();
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut ctx = ToolCtx::new(&cwd);
+        ctx.load_allowed_tools(&base);
+
+        // Prompt 模式 + 未授权：会弹框。
+        *ctx.permission_mode.write().unwrap() = PermissionMode::Prompt;
+        assert!(ctx.needs_dialog("Bash"));
+        assert!(ctx.needs_dialog("Edit"));
+
+        // 项目级 AllowAlways（用户按过 a）：不再弹框。
+        ctx.always_allowed.write().unwrap().insert("Bash".into());
+        assert!(!ctx.needs_dialog("Bash"), "已 AllowAlways 的工具不该再弹框");
+        assert!(ctx.needs_dialog("Edit"), "只授权了 Bash，Edit 仍需弹框");
+
+        // 其余模式一律不弹框。
+        for mode in [
+            PermissionMode::AutoApprove,
+            PermissionMode::Plan(HashSet::new()),
+        ] {
+            *ctx.permission_mode.write().unwrap() = mode.clone();
+            assert!(!ctx.needs_dialog("Bash"), "{mode:?} 不该弹框");
+            assert!(!ctx.needs_dialog("Edit"), "{mode:?} 不该弹框");
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

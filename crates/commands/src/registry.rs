@@ -194,6 +194,21 @@ pub trait Command: Send + Sync {
     fn is_dynamic(&self) -> bool {
         false
     }
+    /// 该命令的执行是否必须离开 UI 主循环。
+    ///
+    /// 标 true 的命令会 spawn 子进程或走网络（`gh`、`open`），**完成时间不可预期**：
+    /// 认证挂起、网络重试、大仓库的 `gh pr diff` 都可能拖到几十秒。TUI 主循环是
+    /// 一个同时负责重绘和读按键的 task，inline `await` 它等于让界面停在那一帧——
+    /// 不重绘、不 `event::poll()`，ESC / Ctrl+C 全部失效（见 `crates/tui/CLAUDE.md`
+    /// 第 19 条）。因此 TUI 见到 `true` 的命令会丢进后台 task，跑完用
+    /// `AgentEvent::BackgroundCommandDone` 把结果发回主循环渲染。
+    ///
+    /// 约定：后台执行的命令只能返回 `Output` / `OutputPlain` / `None`。
+    /// 返回 `RunPrompt`（要起新回合）的命令不能标 true——回合的 spawn 逻辑
+    /// 只存在于 TUI 主循环里，把结果发回事件通道无法起回合。
+    fn needs_background(&self) -> bool {
+        false
+    }
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult>;
 }
 
@@ -214,6 +229,24 @@ impl CommandRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Command>> {
         self.commands.get(name)
+    }
+
+    /// 该命令是否声明了 [`Command::needs_background`]（TUI 据此丢后台 task）。
+    pub fn needs_background(&self, name: &str) -> bool {
+        self.commands
+            .get(name)
+            .is_some_and(|cmd| cmd.needs_background())
+    }
+
+    /// 从 "/foo bar" 里取出命令名（不含 `/`、不含参数）。非 slash 输入返回 `None`。
+    pub fn command_name(input: &str) -> Option<&str> {
+        let rest = input.trim().strip_prefix('/')?;
+        let name = rest.split_whitespace().next().unwrap_or("");
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     pub fn list(&self) -> Vec<&Arc<dyn Command>> {

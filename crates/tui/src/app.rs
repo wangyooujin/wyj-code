@@ -1,6 +1,6 @@
 //! TUI 应用主循环
 
-use crate::event::{is_quit, AgentEvent};
+use crate::event::{is_quit, AgentEvent, BranchSwitch, RewindPrepared};
 use crate::hyperlink::{open_target, HyperlinkBackend, HyperlinkRegistry};
 use crate::input::InputBox;
 use crate::render;
@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 use wyj_commands::skill::ProjectSkillsGate;
-use wyj_commands::{standard_registry_with_skills, CommandContext, CommandResult};
+use wyj_commands::{standard_registry_with_skills, CommandContext, CommandRegistry, CommandResult};
 use wyj_config::{AgentMode, Config};
 use wyj_core::notify::{emit as notify_emit, NotificationEvent};
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer, ToolOutputChunk};
@@ -1692,6 +1692,182 @@ async fn execute_evolution_action(
             Ok(format!("Candidate {id} 已回滚，下一回合生效"))
         }
     }
+}
+
+/// `/rewind` 的后台执行体。
+///
+/// 为什么独立成函数：这一步 = 读 checkpoint + 预览文件 + **建保护快照**（git
+/// 管道或全树哈希）+ 还原文件，全是同步 IO，大仓库上秒级。放在主循环里
+/// inline await 会把整个界面按住不动（`crates/tui/CLAUDE.md` 第 19 条）。
+///
+/// 与 `/evolve` 的旧写法不同，这里用 `session.lock().await` 而不是 `try_lock`：
+/// 本函数跑在后台 task 上，等锁不会冻结界面；换来的是"读了 messages 之后
+/// 又被回合改掉"这个窗口被彻底关掉（保护快照必须对应回退当下的历史）。
+async fn run_rewind_in_background(
+    sessions: &Arc<SessionStore>,
+    cwd: &Path,
+    session_id: &str,
+    checkpoint_id: Option<String>,
+    scope: wyj_core::RewindScope,
+    confirmed: bool,
+    session: &Arc<Mutex<Session>>,
+) -> anyhow::Result<RewindPrepared> {
+    let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())?;
+    let id = resolve_tui_checkpoint_id(&store, checkpoint_id)?;
+    let restores_files = matches!(
+        scope,
+        wyj_core::RewindScope::Files | wyj_core::RewindScope::Both
+    );
+    let restores_conversation = matches!(
+        scope,
+        wyj_core::RewindScope::Conversation | wyj_core::RewindScope::Both
+    );
+
+    let mut sess = session.lock().await;
+    let current_messages = sess.messages.clone();
+
+    enum Io {
+        NeedsConfirm(String),
+        Ready {
+            messages: Vec<Message>,
+            protection_id: String,
+            file_text: String,
+        },
+    }
+
+    let cwd = cwd.to_path_buf();
+    let io_id = id.clone();
+    let io = tokio::task::spawn_blocking(move || -> anyhow::Result<Io> {
+        let checkpoint = store.load(&io_id)?;
+        if restores_files {
+            let preview = store.preview_files(&io_id, &cwd)?;
+            if preview.requires_confirmation && !confirmed {
+                return Ok(Io::NeedsConfirm(format!(
+                    "{}\n\n确认后请重新执行：`/rewind {} {:?} --confirm`",
+                    format_rewind_preview(&preview),
+                    io_id,
+                    scope
+                )));
+            }
+        }
+        let protection = store.create(
+            &cwd,
+            &current_messages,
+            wyj_core::CheckpointKind::PreRewind,
+            Some(format!("before rewind {io_id}")),
+        )?;
+        let file_text = if restores_files {
+            let preview = store.restore_files(&io_id, &cwd, confirmed)?;
+            format!("\n{}", format_rewind_preview(&preview))
+        } else {
+            String::new()
+        };
+        Ok(Io::Ready {
+            messages: checkpoint.messages,
+            protection_id: protection.id,
+            file_text,
+        })
+    })
+    .await??;
+
+    match io {
+        Io::NeedsConfirm(text) => Ok(RewindPrepared::NeedsConfirm(text)),
+        Io::Ready {
+            messages,
+            protection_id,
+            file_text,
+        } => {
+            sess.current_checkpoint_id = Some(id.clone());
+            if restores_conversation {
+                sess.messages = messages.clone();
+            }
+            let turns = sess
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role, Role::User))
+                .count();
+            Ok(RewindPrepared::Ready {
+                checkpoint_id: id,
+                restored_conversation: restores_conversation,
+                protection_id,
+                file_text,
+                messages: sess.messages.clone(),
+                compact_count: sess.compact_count,
+                turns,
+            })
+        }
+    }
+}
+
+/// `/branch` 的后台执行体：还原文件（可选）+ 从 checkpoint 派生新会话 + 切换
+/// live session 与 agent 的会话指针。
+///
+/// 同样是同步 IO 的长任务（git 管道 + 写 session 文件），必须在后台跑；
+/// 见 `run_rewind_in_background` 上面的说明。
+#[allow(clippy::too_many_arguments)]
+async fn run_branch_in_background(
+    sessions: &Arc<SessionStore>,
+    cwd: &Path,
+    session_id: &str,
+    checkpoint_id: Option<String>,
+    restore_files: bool,
+    confirmed: bool,
+    session: &Arc<Mutex<Session>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+) -> anyhow::Result<BranchSwitch> {
+    let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())?;
+    let id = resolve_tui_checkpoint_id(&store, checkpoint_id)?;
+
+    let mut sess = session.lock().await;
+    let current_messages = sess.messages.clone();
+
+    let cwd = cwd.to_path_buf();
+    let branch = {
+        let sessions = sessions.clone();
+        let session_id = session_id.to_string();
+        let io_id = id.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<SessionFile> {
+            let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id.clone())?;
+            let checkpoint = store.load(&io_id)?;
+            if restore_files {
+                let preview = store.preview_files(&io_id, &cwd)?;
+                if preview.requires_confirmation && !confirmed {
+                    anyhow::bail!(
+                        "{}\n\n确认后请重新执行：/branch {} --restore-files --confirm",
+                        format_rewind_preview(&preview),
+                        io_id
+                    );
+                }
+                store.create(
+                    &cwd,
+                    &current_messages,
+                    wyj_core::CheckpointKind::PreRewind,
+                    Some(format!("before branch restore {io_id}")),
+                )?;
+                store.restore_files(&io_id, &cwd, confirmed)?;
+            }
+            sessions.branch_from_checkpoint(&session_id, &checkpoint)
+        })
+        .await??
+    };
+
+    let checkpoint_id = id;
+    let new_session_id = branch.session_id.clone();
+    let turns = branch.turns;
+    *sess = Session::new();
+    sess.messages = branch.messages.clone();
+    sess.current_checkpoint_id = branch.current_checkpoint_id;
+    sess.branch_parent_session_id = branch.branch_parent_session_id;
+    sess.branch_parent_checkpoint_id = branch.branch_parent_checkpoint_id;
+    drop(sess);
+    retarget_agent_session(shared_agent, Some(sessions), &new_session_id);
+
+    Ok(BranchSwitch {
+        session_id: new_session_id,
+        checkpoint_id,
+        messages: branch.messages,
+        turns,
+    })
 }
 
 /// 设置面板/分组面板里可编辑字段的类型
@@ -5383,6 +5559,23 @@ impl OutgoingMessage {
 
 // ── 工具展示帮助函数 ─────────────────────────────────────────────────────────
 
+/// 工具行尾部追加的后端标注，只有 Grep 会拿到非空值。
+///
+/// Grep 是唯一在两套搜索后端间分流的工具（`PATH` 里有 ripgrep 就走 rg 快路径，
+/// 否则用内置的纯 Rust 实现，见 `crates/tools/src/grep.rs`），工具名对模型可见，
+/// 光看 `⏺ Grep(...)` 分不出这次到底谁在跑，所以补一个后缀。判据直接取
+/// `wyj_tools::grep_backend_label()`，与工具内部的分流同源，不会两处口径打架。
+pub(crate) fn tool_backend_badge(tool_name: &str) -> String {
+    if !tool_name.eq_ignore_ascii_case("Grep") {
+        return String::new();
+    }
+    let key = match wyj_tools::grep_backend_label() {
+        "rg" => "tool_backend.rg",
+        _ => "tool_backend.native",
+    };
+    format!(" · {}", wyj_i18n::tr(key))
+}
+
 /// 从工具输入 JSON 中提取用于展示的参数字符串（如文件路径或命令）
 fn tool_display_arg(name: &str, input: &serde_json::Value) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -5550,6 +5743,22 @@ mod tool_summary_tests {
             tool_display_arg("WebFetch", &fetch_input),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn backend_badge_only_marks_grep_and_follows_the_tools_side_label() {
+        // 非 Grep 工具一律不挂标注——只有 Grep 在两套搜索后端间分流
+        assert_eq!(tool_backend_badge("Read"), "");
+        assert_eq!(tool_backend_badge("Bash"), "");
+        // Grep 的标注与工具内部的分流同源，不在 TUI 里另写一套判据
+        let badge = tool_backend_badge("Grep");
+        assert!(!badge.is_empty());
+        assert!(badge.starts_with(' '), "标注应作为行尾后缀：{badge:?}");
+        let expected = match wyj_tools::grep_backend_label() {
+            "rg" => " · rg".to_string(),
+            _ => format!(" · {}", wyj_i18n::tr("tool_backend.native")),
+        };
+        assert_eq!(badge, expected);
     }
 }
 
@@ -6580,6 +6789,172 @@ mod clipboard_paste_tests {
         );
     }
 
+    /// 取出 `tui_main` 的函数体行（不含签名与收尾大括号）。
+    ///
+    /// 签名是多行的，结束的 `) -> Result<...> {` 顶格，必须先跳过它再按缩进
+    /// 收块，否则 take_while 会在签名末尾就把整个函数体截断。
+    fn tui_main_body() -> Vec<String> {
+        let source = include_str!("app.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let signature = lines
+            .iter()
+            .position(|l| l.trim() == "async fn tui_main(")
+            .expect("app.rs 里应有 tui_main");
+        let body_start = (signature + 1..)
+            .find(|offset| lines[*offset].ends_with('{'))
+            .map(|offset| offset + 1)
+            .expect("tui_main 签名应以 `{` 收尾");
+        let indent = lines[body_start - 1].len() - lines[body_start - 1].trim_start().len();
+        let body = lines[body_start..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || (l.len() - l.trim_start().len()) > indent)
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            body.len() > 1000,
+            "tui_main 提取出的函数体过短，多半是收块失败"
+        );
+        body
+    }
+
+    /// 取 `match` 分支的**函数体**（不含模式本身）。
+    ///
+    /// 模式可能跨多行（`Ok(CommandResult::Rewind {` 后面跟着三个绑定、闭括号
+    /// 回到与模式同缩进），直接从模式行往后 take_while 只能拿到绑定列表，
+    /// 拿不到 `=> { ... }` 里的逻辑。这里先定位真正的 `=> {` 行，再按
+    /// 「缩进大于模式行」收块。
+    fn match_arm_body<'a>(body: &'a [String], marker: &str) -> Vec<&'a str> {
+        let arm = body
+            .iter()
+            .position(|l| l.contains(marker))
+            .unwrap_or_else(|| panic!("主循环应能定位到 {marker} 分支"));
+        let indent = body[arm].len() - body[arm].trim_start().len();
+        let start = (arm..)
+            .find(|offset| body[*offset].trim_end().ends_with("=> {"))
+            .unwrap_or_else(|| panic!("{marker} 分支应是空分支或格式异常"));
+        body[start + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || (l.len() - l.trim_start().len()) > indent)
+            .map(|l| l.as_str())
+            .collect()
+    }
+
+    /// 核心不变量（`crates/tui/CLAUDE.md` 第 19 条）：**主循环里不得出现
+    /// `session.lock().await`**。
+    ///
+    /// 主循环是同时负责重绘与读按键的**同一个 task**；在它上面等 session 锁，
+    /// 等于把「界面重绘 + 事件轮询 + 回合看门狗」全部停摆——用户看到的是整个
+    /// 界面冻死、ESC / Ctrl+C 全部读不到，只能 kill。拿不到锁就该 `try_lock`
+    /// 立刻放弃并落回输入层。
+    #[test]
+    fn main_loop_never_awaits_the_session_lock() {
+        for (offset, line) in tui_main_body().iter().enumerate() {
+            // 注释里讨论这条规则的说明文字不算
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let compact = line.split("//").next().unwrap_or(line);
+            assert!(
+                !compact.contains("session.lock().await"),
+                "tui_main 第 {} 行（源码）出现 `session.lock().await`：主循环绝不能等 session 锁，\
+                 改成 try_lock 或把活丢给后台 task。",
+                offset + 1
+            );
+        }
+    }
+
+    /// `/compact` 曾是整个类别的典型样本：一次完整的 LLM 往返被 inline await 在
+    /// 主循环上。摘要输出预算 `min(cw/10, 16000)`，再叠 `RetryPolicy::default()`
+    /// 的 5 次指数退避，端点不稳时能冻住界面数分钟且毫无反馈。
+    ///
+    /// 这里钉的是「必须交给 `spawn_turn_task`」而不是「不许出现 compact_context」
+    /// ——后者会把正常的后台实现也一起禁掉。
+    #[test]
+    fn compact_runs_in_a_background_task_not_on_the_ui_thread() {
+        let body = tui_main_body();
+        let inner = match_arm_body(&body, "CommandResult::CompactHistory");
+        let text = inner.join("\n");
+        assert!(
+            text.contains("spawn_turn_task(") && text.contains("begin_background_task("),
+            "/compact 必须在后台 task 里跑并点亮忙碌态：inline await 会让重绘、\
+             event::poll() 和 Ctrl+C 全部停摆"
+        );
+        assert!(
+            text.contains("AgentEvent::CompactFinished"),
+            "/compact 的结果必须经 AgentEvent::CompactFinished 回传（锁必须先放再发）"
+        );
+    }
+
+    /// 同类钉子：工作区快照（git 管道 / 全树哈希）是秒级同步 IO，压在主循环上
+    /// 一样是"界面按住不动、按键读不到"。`/checkpoint`、`/rewind`、`/branch`、
+    /// `/evolve` 四条路径都必须先出后台 task。
+    #[test]
+    fn workspace_snapshot_commands_run_in_background_tasks() {
+        let body = tui_main_body();
+        for arm_marker in [
+            "CommandResult::CreateCheckpoint {",
+            "CommandResult::Rewind {",
+            "CommandResult::BranchSession {",
+        ] {
+            let text = match_arm_body(&body, arm_marker).join("\n");
+            assert!(
+                text.contains("begin_background_task("),
+                "{arm_marker} 分支必须调用 begin_background_task：工作区快照是秒级同步 IO，\
+                 压在主循环上等于界面无响应"
+            );
+        }
+
+        // /evolve 的确认动作没有 CommandResult 走同一个 match，只能按
+        // 「execute_evolution_action 的调用点必须与 spawn / 忙碌标记同窗」来钉。
+        let call_at = body
+            .iter()
+            .position(|l| l.contains("execute_evolution_action("))
+            .expect("主循环应有 execute_evolution_action 调用");
+        let window_start = call_at.saturating_sub(15);
+        let window_end = (call_at + 15).min(body.len() - 1);
+        let window = body[window_start..=window_end].join("\n");
+        assert!(
+            window.contains("spawn_turn_task(") && window.contains("\"/evolve\""),
+            "/evolve 的确认动作必须在后台 task 里跑：激活候选前要建工作区快照"
+        );
+    }
+
+    /// `/bug`、`/pr-comments` 的执行体是子进程（`git` / `gh` / `open`），完成时间
+    /// 不可预期，必须由 TUI 丢后台 task。这里钉住「声明集合」本身：新增阻塞型
+    /// 命令时忘了标 `needs_background`，或者误标了纯本地命令，都会被拦下。
+    #[test]
+    fn only_process_spawning_commands_are_marked_background() {
+        let registry = wyj_commands::builtin::standard_registry();
+        assert!(
+            registry.needs_background("bug"),
+            "/bug 会拉起系统浏览器，必须后台执行"
+        );
+        assert!(
+            registry.needs_background("pr-comments"),
+            "/pr-comments 会跑两次 gh 子进程，必须后台执行"
+        );
+        // 这些是纯内存 / 纯配置操作，标 background 只会白白多一次 task 往返
+        for name in ["help", "compact", "model", "status", "rewind", "checkpoint"] {
+            assert!(
+                !registry.needs_background(name),
+                "/{name} 是本地操作，不应声明 needs_background"
+            );
+        }
+    }
+
+    #[test]
+    fn command_name_extraction_handles_slash_inputs() {
+        use wyj_commands::CommandRegistry;
+        assert_eq!(CommandRegistry::command_name("/bug 崩了"), Some("bug"));
+        assert_eq!(
+            CommandRegistry::command_name("  /pr-comments  "),
+            Some("pr-comments")
+        );
+        assert_eq!(CommandRegistry::command_name("/"), None);
+        assert_eq!(CommandRegistry::command_name("/   "), None);
+        assert_eq!(CommandRegistry::command_name("hello"), None);
+    }
+
     #[test]
     fn flush_thinking_records_elapsed_and_clears_the_timer() {
         // `thinking_started` 自 ThinkingDelta 首块写入后一直只有写点、零读点，
@@ -7532,6 +7907,26 @@ impl AppState {
     ///
     /// 下一轮若确实需要任务板，模型重新调一次 TodoWrite 就会重新出现
     /// （`AgentEvent::TodoUpdate` 负责填 `current_todos`）。
+    /// 标记「有一个后台长任务在跑」（`/compact` 的 LLM 往返、
+    /// `needs_background` 的 slash 命令、`/checkpoint` / `/rewind` / `/branch`
+    /// 的工作区快照、`/evolve` 的候选激活）。
+    ///
+    /// 复用 `is_thinking` 而不是新增标志位，是因为"用户输入被挡、标题栏跑
+    /// spinner、ESC 能 abort 掉 `current_task`、15 分钟停滞看门狗兜底"这一整套
+    /// 机制已经挂在 `is_thinking` 上了；新造一个标志位等于把这四条重新实现一遍。
+    /// 代价是 `/context` 之类面板会把后台压缩误读成"正在思考"——可接受，
+    /// 换来的是用户随时能 ESC 中断。
+    ///
+    /// **不发** `turn_start_time`：它驱动的是回合耗时统计，后台任务不是回合，
+    /// 混进去会污染 `/context` 的时延画像。
+    pub(crate) fn begin_background_task(&mut self, label: String) {
+        self.is_thinking = true;
+        self.spinner_frame = 0;
+        self.current_op = Some(label);
+        self.current_op_started = Some(Instant::now());
+        self.last_turn_activity = Instant::now();
+    }
+
     /// 记录本轮计时基准：**所有**发起回合的入口都必须走这里（用户消息、排队
     /// 注入、自动唤醒、slash 命令展开的 prompt、面板"立即运行"等）。
     ///
@@ -8137,10 +8532,14 @@ impl AppState {
         }
 
         if self.has_running_sub_agents() {
-            if let Some(last_id) = self.sub_agents.keys().next_back().copied() {
+            // 必须取 `visible_sub_agents` 的末项而不是 `sub_agents` 的末项：面板只列
+            // 运行中的条目，若选中一个已完成的，内容区会显示它的内容而列表高亮无处可落。
+            let last_id = self.visible_sub_agents().last().map(|(id, _)| **id);
+            if let Some(last_id) = last_id {
                 self.selected_todo_id = None;
                 self.selected_sub_agent = Some(last_id);
                 self.todo_detail_open = false;
+                self.sub_agent_detail_open = true;
                 self.sub_agent_detail_scroll = 0;
                 self.ui_focus = UiFocus::SubAgents;
                 return true;
@@ -8199,6 +8598,33 @@ impl AppState {
         self.shell_detail_scroll = 0;
         self.shell_detail_max_scroll = 0;
         true
+    }
+
+    /// Ctrl+T — 展开/折叠任务列表面板，并把内容焦点交给它。
+    ///
+    /// 任务全部完成也照常展开：完成态只是**默认**折叠成一行摘要（见
+    /// `render::push_inline_todo_lines` 的 `all_done && collapsed` 早退），而不是
+    /// 不可读。每项耗时/token 与执行回放是唯一的审计凭据且不落盘，而复盘窗口
+    /// 恰恰就是"这一轮干完了、下一轮还没发"的这一刻。
+    fn toggle_todo_panel(&mut self) {
+        let Some(items) = self.current_todos.as_deref() else {
+            return;
+        };
+        if is_todo_collapsible(items) && self.ui_focus == UiFocus::Todos {
+            self.todo_panel_expanded = !self.todo_panel_expanded;
+        } else {
+            self.todo_panel_expanded = true;
+        }
+        self.ensure_selected_todo();
+        if self.selected_todo_id.is_some() {
+            self.selected_sub_agent = None;
+            self.todo_detail_open = false;
+            self.todo_detail_scroll = 0;
+            self.todo_detail_max_scroll = 0;
+            self.ui_focus = UiFocus::Todos;
+            self.chat_follow_tail = true;
+            self.unseen_messages = false;
+        }
     }
 
     fn toggle_focused_content_detail(&mut self) {
@@ -8267,6 +8693,7 @@ impl AppState {
         self.todo_detail_scroll = 0;
         self.todo_detail_max_scroll = 0;
         self.selected_sub_agent = Some(id);
+        self.sub_agent_detail_open = true;
         self.sub_agent_detail_scroll = 0;
         self.ui_focus = UiFocus::SubAgents;
         true
@@ -8354,6 +8781,7 @@ impl AppState {
             return false;
         }
         self.selected_sub_agent = Some(ids[next as usize]);
+        self.sub_agent_detail_open = true;
         self.sub_agent_detail_scroll = 0;
         self.ui_focus = UiFocus::SubAgents;
         true
@@ -8828,6 +9256,9 @@ impl AppState {
                 } else {
                     format!("{name}({arg})")
                 };
+                // 后端标注挂在整行尾部（`⏺ Grep(pat in .) · rg`），三处消费同一串：
+                // 聊天流 ToolCall、标题栏 current_op、思考折叠标题。
+                let display = format!("{display}{}", tool_backend_badge(&name));
                 self.current_op = Some(display.clone());
                 // 步骤计时起点：并发多个工具时后到的 ToolStart 会覆盖成最后一个，
                 // 与 `current_op` 保持同一口径（标题栏只展示"最近开始的那一步"）。
@@ -8968,6 +9399,180 @@ impl AppState {
                             Some(self.current_session_id.clone())
                         },
                     });
+                }
+            }
+
+            // ── 后台任务（非回合）完成 ───────────────────────────────
+            // 这四个事件对应「离开主循环执行的长任务」：`/compact` 的 LLM 往返、
+            // `needs_background` 的 slash 命令、`/checkpoint` 的工作区快照、
+            // `/rewind` / `/branch` 的快照 + 文件还原、`/evolve` 的候选激活。
+            // 它们共用的收尾形状：摘掉标题栏的操作名、清 thinking 标志，让
+            // 用户输入立刻恢复。
+            AgentEvent::CompactFinished {
+                result,
+                compact_count,
+            } => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                self.compact_count = compact_count;
+                self.save_needed = true;
+                match result {
+                    Ok(r) if r.messages_removed > 0 => {
+                        self.push_tracked_message(ChatMessage::assistant(wyj_i18n::tr_fmt(
+                            "compact.done",
+                            &[
+                                ("removed", &r.messages_removed.to_string()),
+                                ("saved", &r.tokens_saved_estimate.to_string()),
+                            ],
+                        )));
+                    }
+                    Ok(_) => {
+                        self.push_tracked_message(ChatMessage::assistant(wyj_i18n::tr(
+                            "compact.noop",
+                        )));
+                    }
+                    Err(e) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(format!(
+                            "[{}] {e}",
+                            wyj_i18n::tr("compact.failed_tag")
+                        )));
+                    }
+                }
+            }
+
+            AgentEvent::BackgroundCommandDone { name, result } => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                match result {
+                    Ok(CommandResult::Output(out)) => {
+                        self.push_tracked_message(ChatMessage::assistant(out));
+                    }
+                    Ok(CommandResult::OutputPlain(out)) => {
+                        // 保留原始排版：不走 markdown，否则列对齐会被段落折行揉碎
+                        self.push_tracked_message(ChatMessage::preformatted(out));
+                    }
+                    Ok(CommandResult::None) => {}
+                    // `needs_background` 的契约只允许上面三种（见
+                    // `Command::needs_background` 文档）。真返回了别的，提示而不是
+                    // 静默丢弃——否则就是一个"命令跑了但什么都没发生"的幽灵。
+                    Ok(other) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
+                            "command.background_unsupported",
+                            &[("name", &name), ("result", &format!("{other:?}"))],
+                        )));
+                    }
+                    Err(e) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(format!(
+                            "[/{name}] {e}"
+                        )));
+                    }
+                }
+            }
+
+            AgentEvent::CheckpointCreated(result) => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                match result {
+                    Ok(id) => {
+                        self.save_needed = true;
+                        self.push_tracked_message(ChatMessage::assistant(wyj_i18n::tr_fmt(
+                            "checkpoint.created",
+                            &[("id", &id)],
+                        )));
+                    }
+                    Err(e) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(format!(
+                            "[{}] {e}",
+                            wyj_i18n::tr("checkpoint.failed_tag")
+                        )));
+                    }
+                }
+            }
+
+            AgentEvent::RewindPrepared(result) => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                match result {
+                    Ok(RewindPrepared::NeedsConfirm(text)) => {
+                        self.push_tracked_message(ChatMessage::assistant(text));
+                    }
+                    Ok(RewindPrepared::Ready {
+                        checkpoint_id,
+                        restored_conversation,
+                        protection_id,
+                        file_text,
+                        messages,
+                        compact_count,
+                        turns,
+                    }) => {
+                        // live session 已由后台 task 写回，这里只重建展示层
+                        if restored_conversation {
+                            self.messages = reconstruct_display(&messages);
+                            self.welcome_frozen = true;
+                            self.frozen_up_to = 0;
+                        }
+                        self.compact_count = compact_count;
+                        self.turns = turns;
+                        self.save_needed = true;
+                        self.push_tracked_message(ChatMessage::assistant(format!(
+                            "已回退到 {checkpoint_id}；回退前保护 checkpoint：{protection_id}{file_text}"
+                        )));
+                    }
+                    Err(e) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(format!(
+                            "[rewind 失败] {e}"
+                        )));
+                    }
+                }
+            }
+
+            AgentEvent::BranchPrepared(result) => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                match result {
+                    Ok(branch) => {
+                        self.messages = reconstruct_display(&branch.messages);
+                        self.compact_count = 0;
+                        self.turns = branch.turns;
+                        self.total_input_tokens = 0;
+                        self.total_output_tokens = 0;
+                        self.frozen_up_to = 0;
+                        self.welcome_frozen = true;
+                        self.save_needed = true;
+                        // 主循环下一帧把自己的本地 session id 镜像同步过来
+                        // （见 `apply_agent_event` 调用点之后的 re-sync）。
+                        self.current_session_id = branch.session_id.clone();
+                        self.push_tracked_message(ChatMessage::assistant(format!(
+                            "已从 checkpoint {} 创建并切换到分支会话 {}",
+                            branch.checkpoint_id, branch.session_id
+                        )));
+                    }
+                    Err(e) => {
+                        self.push_tracked_message(ChatMessage::assistant_err(format!(
+                            "[branch 失败] {e}"
+                        )));
+                    }
+                }
+            }
+
+            AgentEvent::EvolutionActionDone(result) => {
+                self.is_thinking = false;
+                self.current_op = None;
+                self.current_op_started = None;
+                if let Some(dialog) = self.evolution_dialog.as_mut() {
+                    dialog.confirm = None;
+                    match result {
+                        Ok(message) => {
+                            dialog.reload();
+                            dialog.error = Some(message);
+                        }
+                        Err(error) => dialog.error = Some(error),
+                    }
                 }
             }
 
@@ -9611,11 +10216,13 @@ impl AppState {
                     });
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.tool_calls += 1;
-                    s.current_tool = Some(if arg_summary.is_empty() {
+                    let current = if arg_summary.is_empty() {
                         tool_name.clone()
                     } else {
                         format!("{tool_name}({arg_summary})")
-                    });
+                    };
+                    // 与主聊天流同一口径：子 Agent 里的 Grep 也标出后端
+                    s.current_tool = Some(format!("{current}{}", tool_backend_badge(&tool_name)));
                     s.tool_log.push(SubToolLine {
                         tool_name,
                         arg_summary,
@@ -11816,6 +12423,13 @@ async fn tui_main(
             state.apply_agent_event(AgentEvent::SubAgent(ev));
         }
 
+        // `/branch` 的会话切换跑在后台 task 里（见 `run_branch_in_background`），
+        // 事件 handler 只能改 AppState —— 把主循环这份本地镜像同步回去，
+        // 之后 autosave / checkpoint 才会写到新会话上。
+        if state.current_session_id != current_session_id {
+            current_session_id = state.current_session_id.clone();
+        }
+
         // 回合 task 看门狗。必须排在上面两处排空之后：task 正常收尾是「先塞
         // TurnDone/Error 再结束自己」，抢在事件被应用之前判定会把正常收尾
         // 误判成异常终止。
@@ -12790,25 +13404,29 @@ async fn tui_main(
                                         .expect("Evolution dialog exists")
                                         .store
                                         .clone();
-                                    let result = execute_evolution_action(
-                                        action,
-                                        store,
-                                        &cwd,
-                                        session_store.as_ref(),
-                                        &current_session_id,
-                                        &session,
-                                    )
-                                    .await;
-                                    if let Some(dialog) = &mut state.evolution_dialog {
-                                        dialog.confirm = None;
-                                        match result {
-                                            Ok(message) => {
-                                                dialog.reload();
-                                                dialog.error = Some(message);
-                                            }
-                                            Err(error) => dialog.error = Some(error.to_string()),
-                                        }
-                                    }
+                                    // 激活候选要先建工作区快照（git 管道 / 全树
+                                    // 哈希），同步 IO 秒级，不能压住主循环。
+                                    let session_c = session.clone();
+                                    let cwd_c = cwd.clone();
+                                    let id_c = current_session_id.clone();
+                                    let session_store_c = session_store.clone();
+                                    let tx = agent_tx.clone();
+                                    state.begin_background_task("/evolve".to_string());
+                                    let task = spawn_turn_task(async move {
+                                        let result = execute_evolution_action(
+                                            action,
+                                            store,
+                                            &cwd_c,
+                                            session_store_c.as_ref(),
+                                            &id_c,
+                                            &session_c,
+                                        )
+                                        .await
+                                        .map_err(|e| e.to_string());
+                                        let _ =
+                                            tx.send(AgentEvent::EvolutionActionDone(result)).await;
+                                    });
+                                    state.current_task = Some(task);
                                 }
                                 KeyCode::Esc => {
                                     if let Some(dialog) = &mut state.evolution_dialog {
@@ -15129,6 +15747,39 @@ async fn tui_main(
                                     .map(|c| (c.name().to_string(), c.description(), c.usage()))
                                     .collect(),
                             };
+                            // 声明了 `needs_background` 的命令（`/bug`、`/pr-comments`）
+                            // 含子进程 / 网络往返，inline dispatch 会连按键都读不到。
+                            // 丢后台 task，结果经 `AgentEvent::BackgroundCommandDone`
+                            // 发回主循环渲染；ESC 可以随时 abort。
+                            if let Some(name) = CommandRegistry::command_name(&trimmed) {
+                                if cmd_registry.needs_background(name) {
+                                    let registry = cmd_registry.clone();
+                                    let ctx = cmd_ctx;
+                                    let input = trimmed.to_string();
+                                    let name = name.to_string();
+                                    let tx = agent_tx.clone();
+                                    state.begin_background_task(format!("/{name}"));
+                                    let task = spawn_turn_task(async move {
+                                        let result = match registry.dispatch(&input, &ctx).await {
+                                            Some(Ok(result)) => Ok(result),
+                                            Some(Err(error)) => Err(error.to_string()),
+                                            None => Err(wyj_i18n::tr_fmt(
+                                                "command.unknown",
+                                                &[("name", &name)],
+                                            )),
+                                        };
+                                        let _ = tx
+                                            .send(AgentEvent::BackgroundCommandDone {
+                                                name,
+                                                result,
+                                            })
+                                            .await;
+                                    });
+                                    state.current_task = Some(task);
+                                    continue;
+                                }
+                            }
+
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
                                     Ok(CommandResult::Output(out)) => {
@@ -15212,35 +15863,36 @@ async fn tui_main(
                                         ));
                                     }
                                     Ok(CommandResult::CompactHistory) => {
+                                        // 压缩是一次完整的 LLM 往返（摘要输出预算
+                                        // `min(cw/10, 16000)` + 最多 5 次指数退避重试），
+                                        // 端点不稳时可以拖到数分钟。**绝不能**在主循环
+                                        // 里 inline await：那会让同一个 task 既不重绘
+                                        // 也不 `event::poll()`，界面冻死且 ESC /
+                                        // Ctrl+C 全部读不到，只能 kill。见
+                                        // `crates/tui/CLAUDE.md` 第 19 条。
                                         let agent_c = shared_agent.read().unwrap().clone();
-                                        let mut sess = match try_session_lock(&session) {
-                                            Some(sess) => sess,
-                                            None => {
-                                                state.notify_session_busy();
-                                                continue;
-                                            }
-                                        };
-                                        match agent_c.compact_context(&mut sess).await {
-                                            Ok(r) if r.messages_removed > 0 => {
-                                                state.compact_count = sess.compact_count;
-                                                state.messages.push(ChatMessage::assistant(
-                                                    format!(
-                                                        "已压缩：移除 {} 条消息，节省约 {} tokens",
-                                                        r.messages_removed, r.tokens_saved_estimate
-                                                    ),
-                                                ));
-                                            }
-                                            Ok(_) => {
-                                                state.messages.push(ChatMessage::assistant(
-                                                    "上下文较短，无需压缩。".to_string(),
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                state.messages.push(ChatMessage::assistant_err(
-                                                    format!("[压缩失败] {e}"),
-                                                ));
-                                            }
+                                        let session_c = session.clone();
+                                        let tx = agent_tx.clone();
+                                        if try_session_lock(&session).is_none() {
+                                            state.notify_session_busy();
+                                            continue;
                                         }
+                                        state.begin_background_task("/compact".to_string());
+                                        let task = spawn_turn_task(async move {
+                                            let result = {
+                                                let mut sess = session_c.lock().await;
+                                                let out = agent_c.compact_context(&mut sess).await;
+                                                // 锁内快照，锁必须先放再发事件
+                                                (out.map_err(|e| e.to_string()), sess.compact_count)
+                                            };
+                                            let _ = tx
+                                                .send(AgentEvent::CompactFinished {
+                                                    result: result.0,
+                                                    compact_count: result.1,
+                                                })
+                                                .await;
+                                        });
+                                        state.current_task = Some(task);
                                     }
                                     Ok(CommandResult::StartNewSession) => {
                                         // 对齐 Claude Code `/new`：开启全新会话，保存当前会话
@@ -15328,6 +15980,12 @@ async fn tui_main(
                                                 }
                                             }
                                             Some(store) => {
+                                                // `store.create` 会跑 git 管道（`git add -A`
+                                                // + `write-tree` + `commit-tree`）做工作区快照：
+                                                // 同步 IO，大仓库上能到秒级，绝不能挂在主循环
+                                                // 里（那会让整帧卡住、按键读不到）。丢后台
+                                                // task，连带把 `current_checkpoint_id` 写回
+                                                // session 一起搬过去。
                                                 let sess = match try_session_lock(&session) {
                                                     Some(sess) => sess,
                                                     None => {
@@ -15335,32 +15993,52 @@ async fn tui_main(
                                                         continue;
                                                     }
                                                 };
-                                                match store.create(
-                                                    &cwd,
-                                                    &sess.messages,
-                                                    wyj_core::CheckpointKind::Manual,
-                                                    name,
-                                                ) {
-                                                    Ok(checkpoint) => {
-                                                        drop(sess);
-                                                        session
-                                                            .lock()
-                                                            .await
-                                                            .current_checkpoint_id =
-                                                            Some(checkpoint.id.clone());
-                                                        state.messages.push(
-                                                            ChatMessage::assistant(format!(
-                                                                "已创建 checkpoint {}",
-                                                                checkpoint.id
-                                                            )),
-                                                        );
-                                                    }
-                                                    Err(error) => state.messages.push(
-                                                        ChatMessage::assistant_err(format!(
-                                                            "[checkpoint 创建失败] {error}"
-                                                        )),
-                                                    ),
-                                                }
+                                                let messages = sess.messages.clone();
+                                                drop(sess);
+                                                let session_c = session.clone();
+                                                let store_c = store.clone();
+                                                let cwd_c = cwd.clone();
+                                                let tx = agent_tx.clone();
+                                                state.begin_background_task(
+                                                    "/checkpoint".to_string(),
+                                                );
+                                                let task = spawn_turn_task(async move {
+                                                    let id = {
+                                                        // 快照本身是同步 IO：再套一层
+                                                        // spawn_blocking，不占着 runtime
+                                                        // 的工作线程。
+                                                        let created = tokio::task::spawn_blocking(
+                                                            move || {
+                                                                store_c
+                                                                    .create(
+                                                                        &cwd_c,
+                                                                        &messages,
+                                                                        wyj_core::CheckpointKind::Manual,
+                                                                        name,
+                                                                    )
+                                                                    .map(|cp| cp.id)
+                                                                    .map_err(|e| e.to_string())
+                                                            },
+                                                        )
+                                                        .await
+                                                        .unwrap_or_else(|e| Err(e.to_string()));
+                                                        match created {
+                                                            Ok(id) => {
+                                                                session_c
+                                                                    .lock()
+                                                                    .await
+                                                                    .current_checkpoint_id =
+                                                                    Some(id.clone());
+                                                                Ok(id)
+                                                            }
+                                                            Err(e) => Err(e),
+                                                        }
+                                                    };
+                                                    let _ = tx
+                                                        .send(AgentEvent::CheckpointCreated(id))
+                                                        .await;
+                                                });
+                                                state.current_task = Some(task);
                                             }
                                             None => {
                                                 state.messages.push(ChatMessage::assistant_err(
@@ -15374,201 +16052,74 @@ async fn tui_main(
                                         scope,
                                         confirmed,
                                     }) => {
-                                        let result: anyhow::Result<String> = async {
-                                            let sessions = session_store
-                                                .as_ref()
-                                                .context("session 存储不可用")?;
-                                            let store = wyj_core::CheckpointStore::configured(
-                                                sessions.dir(),
-                                                current_session_id.clone(),
-                                            )?;
-                                            let id = resolve_tui_checkpoint_id(
-                                                &store,
+                                        // 快照 + 文件还原是同步 IO 的长任务，
+                                        // 交给后台 task（见 `run_rewind_in_background`）。
+                                        let Some(sessions) = session_store.clone() else {
+                                            state.messages.push(ChatMessage::assistant_err(
+                                                "[rewind] session 存储不可用".to_string(),
+                                            ));
+                                            continue;
+                                        };
+                                        let session_c = session.clone();
+                                        let cwd_c = cwd.clone();
+                                        let id_c = current_session_id.clone();
+                                        let tx = agent_tx.clone();
+                                        state.begin_background_task("/rewind".to_string());
+                                        let task = spawn_turn_task(async move {
+                                            let outcome = run_rewind_in_background(
+                                                &sessions,
+                                                &cwd_c,
+                                                &id_c,
                                                 checkpoint_id,
-                                            )?;
-                                            let checkpoint = store.load(&id)?;
-                                            if matches!(
                                                 scope,
-                                                wyj_core::RewindScope::Files
-                                                    | wyj_core::RewindScope::Both
-                                            ) {
-                                                let preview = store.preview_files(&id, &cwd)?;
-                                                if preview.requires_confirmation && !confirmed {
-                                                    return Ok(format!(
-                                                        "{}\n\n确认后请重新执行：`/rewind {} {:?} --confirm`",
-                                                        format_rewind_preview(&preview),
-                                                        id,
-                                                        scope
-                                                    ));
-                                                }
-                                            }
-                                            let current_messages = match try_session_lock(&session) {
-                                                Some(sess) => sess.messages.clone(),
-                                                None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
-                                            };
-                                            let protection = store.create(
-                                                &cwd,
-                                                &current_messages,
-                                                wyj_core::CheckpointKind::PreRewind,
-                                                Some(format!("before rewind {id}")),
-                                            )?;
-                                            let mut file_text = String::new();
-                                            if matches!(
-                                                scope,
-                                                wyj_core::RewindScope::Files
-                                                    | wyj_core::RewindScope::Both
-                                            ) {
-                                                let preview =
-                                                    store.restore_files(&id, &cwd, confirmed)?;
-                                                file_text = format!(
-                                                    "\n{}",
-                                                    format_rewind_preview(&preview)
-                                                );
-                                            }
-                                            match try_session_lock(&session) {
-                                                Some(mut sess) => sess.current_checkpoint_id = Some(id.clone()),
-                                                None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
-                                            };
-                                            if matches!(
-                                                scope,
-                                                wyj_core::RewindScope::Conversation
-                                                    | wyj_core::RewindScope::Both
-                                            ) {
-                                                let mut sess = match try_session_lock(&session) {
-                                                    Some(sess) => sess,
-                                                    None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
-                                                };
-                                                sess.messages = checkpoint.messages;
-                                                sess.current_checkpoint_id = Some(id.clone());
-                                                state.messages = reconstruct_display(&sess.messages);
-                                                state.compact_count = sess.compact_count;
-                                                state.turns = sess
-                                                    .messages
-                                                    .iter()
-                                                    .filter(|message| {
-                                                        matches!(
-                                                            message.role,
-                                                            wyj_api::types::Role::User
-                                                        )
-                                                    })
-                                                    .count();
-                                                state.welcome_frozen = true;
-                                                state.frozen_up_to = 0;
-                                            }
-                                            state.save_needed = true;
-                                            Ok(format!(
-                                                "已回退到 {id}；回退前保护 checkpoint：{}{}",
-                                                protection.id, file_text
-                                            ))
-                                        }
-                                        .await;
-                                        match result {
-                                            Ok(text) => {
-                                                state.messages.push(ChatMessage::assistant(text))
-                                            }
-                                            Err(error) => {
-                                                state.messages.push(ChatMessage::assistant_err(
-                                                    format!("[rewind 失败] {error}"),
+                                                confirmed,
+                                                &session_c,
+                                            )
+                                            .await;
+                                            let _ = tx
+                                                .send(AgentEvent::RewindPrepared(
+                                                    outcome.map_err(|e| e.to_string()),
                                                 ))
-                                            }
-                                        }
+                                                .await;
+                                        });
+                                        state.current_task = Some(task);
                                     }
                                     Ok(CommandResult::BranchSession {
                                         checkpoint_id,
                                         restore_files,
                                         confirmed,
                                     }) => {
-                                        let result: anyhow::Result<(SessionFile, String)> = async {
-                                            let sessions = session_store
-                                                .as_ref()
-                                                .context("session 存储不可用")?;
-                                            let store = wyj_core::CheckpointStore::configured(
-                                                sessions.dir(),
-                                                current_session_id.clone(),
-                                            )?;
-                                            let id = resolve_tui_checkpoint_id(
-                                                &store,
+                                        let Some(sessions) = session_store.clone() else {
+                                            state.messages.push(ChatMessage::assistant_err(
+                                                "[branch] session 存储不可用".to_string(),
+                                            ));
+                                            continue;
+                                        };
+                                        let session_c = session.clone();
+                                        let agent_c = shared_agent.clone();
+                                        let cwd_c = cwd.clone();
+                                        let id_c = current_session_id.clone();
+                                        let tx = agent_tx.clone();
+                                        state.begin_background_task("/branch".to_string());
+                                        let task = spawn_turn_task(async move {
+                                            let outcome = run_branch_in_background(
+                                                &sessions,
+                                                &cwd_c,
+                                                &id_c,
                                                 checkpoint_id,
-                                            )?;
-                                            let checkpoint = store.load(&id)?;
-                                            if restore_files {
-                                                let preview = store.preview_files(&id, &cwd)?;
-                                                if preview.requires_confirmation && !confirmed {
-                                                    anyhow::bail!(
-                                                        "{}\n\n确认后请重新执行：/branch {} --restore-files --confirm",
-                                                        format_rewind_preview(&preview),
-                                                        id
-                                                    );
-                                                }
-                                                let current_messages = match try_session_lock(&session) {
-                                                    Some(sess) => sess.messages.clone(),
-                                                    None => anyhow::bail!("{}", wyj_i18n::tr("session.busy_notice")),
-                                                };
-                                                store.create(
-                                                    &cwd,
-                                                    &current_messages,
-                                                    wyj_core::CheckpointKind::PreRewind,
-                                                    Some(format!(
-                                                        "before branch restore {id}"
-                                                    )),
-                                                )?;
-                                                store.restore_files(&id, &cwd, confirmed)?;
-                                            }
-                                            let branch = sessions.branch_from_checkpoint(
-                                                &current_session_id,
-                                                &checkpoint,
-                                            )?;
-                                            Ok((branch, id))
-                                        }
-                                        .await;
-                                        match result {
-                                            Ok((branch, checkpoint_id)) => {
-                                                current_session_id = branch.session_id.clone();
-                                                state.current_session_id =
-                                                    current_session_id.clone();
-                                                let mut sess = match try_session_lock(&session) {
-                                                    Some(sess) => sess,
-                                                    None => anyhow::bail!(
-                                                        "{}",
-                                                        wyj_i18n::tr("session.busy_notice")
-                                                    ),
-                                                };
-                                                *sess = Session::new();
-                                                sess.messages = branch.messages;
-                                                sess.current_checkpoint_id =
-                                                    branch.current_checkpoint_id;
-                                                sess.branch_parent_session_id =
-                                                    branch.branch_parent_session_id;
-                                                sess.branch_parent_checkpoint_id =
-                                                    branch.branch_parent_checkpoint_id;
-                                                state.messages =
-                                                    reconstruct_display(&sess.messages);
-                                                state.compact_count = sess.compact_count;
-                                                state.turns = branch.turns;
-                                                state.total_input_tokens = 0;
-                                                state.total_output_tokens = 0;
-                                                state.frozen_up_to = 0;
-                                                state.welcome_frozen = true;
-                                                drop(sess);
-                                                retarget_agent_session(
-                                                    &shared_agent,
-                                                    session_store.as_ref(),
-                                                    &current_session_id,
-                                                );
-                                                state.messages.push(ChatMessage::assistant(
-                                                    format!(
-                                                    "已从 checkpoint {} 创建并切换到分支会话 {}",
-                                                    checkpoint_id, current_session_id
-                                                ),
-                                                ));
-                                                state.save_needed = true;
-                                            }
-                                            Err(error) => {
-                                                state.messages.push(ChatMessage::assistant_err(
-                                                    format!("[branch 失败] {error}"),
+                                                restore_files,
+                                                confirmed,
+                                                &session_c,
+                                                &agent_c,
+                                            )
+                                            .await;
+                                            let _ = tx
+                                                .send(AgentEvent::BranchPrepared(
+                                                    outcome.map_err(|e| e.to_string()),
                                                 ))
-                                            }
-                                        }
+                                                .await;
+                                        });
+                                        state.current_task = Some(task);
                                     }
                                     Ok(CommandResult::ControlSubAgent { id, action }) => {
                                         let result = match action {
@@ -16389,34 +16940,8 @@ async fn tui_main(
                                     let _ = terminal.clear();
                                 }
                                 't' => {
-                                    // Ctrl+T — 进入任务列表焦点，并保留原折叠/展开语义
-                                    if let Some(items) = state.current_todos.as_deref() {
-                                        let collapsible = is_todo_collapsible(items);
-                                        // 全部完成后面板已收成一行摘要，没有可展开的
-                                        // 内容，Ctrl+T 不做任何事（否则会展开一个
-                                        // 永远渲染不出来的空壳）。
-                                        let all_done = !items.is_empty()
-                                            && items
-                                                .iter()
-                                                .all(|t| t.status == TodoStatus::Completed);
-                                        if all_done {
-                                            // no-op
-                                        } else if collapsible && state.ui_focus == UiFocus::Todos {
-                                            state.todo_panel_expanded = !state.todo_panel_expanded;
-                                        } else {
-                                            state.todo_panel_expanded = true;
-                                        }
-                                        state.ensure_selected_todo();
-                                        if state.selected_todo_id.is_some() {
-                                            state.selected_sub_agent = None;
-                                            state.todo_detail_open = false;
-                                            state.todo_detail_scroll = 0;
-                                            state.todo_detail_max_scroll = 0;
-                                            state.ui_focus = UiFocus::Todos;
-                                            state.chat_follow_tail = true;
-                                            state.unseen_messages = false;
-                                        }
-                                    }
+                                    // Ctrl+T — 展开/折叠任务列表（含全部完成态）
+                                    state.toggle_todo_panel();
                                 }
                                 'y' => {
                                     // Ctrl+Y — 复制最后一条 AI 回复到系统剪贴板
@@ -16850,7 +17375,11 @@ mod sub_agent_ui_tests {
         {
             let s = state.sub_agents.get(&1).unwrap();
             assert_eq!(s.tool_calls, 1);
-            assert_eq!(s.current_tool.as_deref(), Some("Grep(foo)"));
+            // 行尾带后端标注，且标注与 `grep_backend_label()` 同源
+            assert_eq!(
+                s.current_tool.as_deref(),
+                Some(format!("Grep(foo){}", tool_backend_badge("Grep")).as_str())
+            );
         }
         state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::ToolEnd {
             id: 1,
@@ -17100,6 +17629,62 @@ mod cross_session_subagents_tests {
         );
 
         apply_open_subagents_panel(&mut state, None);
+        assert_eq!(state.selected_sub_agent, Some(2));
+        assert!(state.sub_agent_detail_open);
+    }
+
+    fn running_sub_agent(id: u64) -> SubAgentUiState {
+        SubAgentUiState {
+            agent_type: "t".into(),
+            description: format!("d{id}"),
+            background: false,
+            status: SubAgentStatus::Running,
+            started_at: Instant::now(),
+            final_elapsed: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            tool_calls: 0,
+            current_tool: None,
+            tool_log: vec![],
+            has_result: false,
+            finished_at: None,
+            final_result: None,
+        }
+    }
+
+    /// 方向键在子 Agent 间移动时必须保持详情展开 —— 否则内容区会在移动后
+    /// 突然塌回聊天流，用户会觉得"按 ↓ 把正在跑的东西弄丢了"。
+    #[test]
+    fn moving_between_sub_agents_keeps_the_content_view_open() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, running_sub_agent(1));
+        state.sub_agents.insert(2, running_sub_agent(2));
+        state.sub_agent_detail_open = false;
+
+        assert!(state.move_selected_sub_agent(1));
+        assert_eq!(state.selected_sub_agent, Some(1));
+        assert!(state.sub_agent_detail_open, "选中即应展开内容视图");
+
+        assert!(state.move_selected_sub_agent(1));
+        assert_eq!(state.selected_sub_agent, Some(2));
+        assert!(state.sub_agent_detail_open);
+    }
+
+    /// `Shift+↑` 进入面板时必须选中**运行中**的条目。取 `sub_agents` 末项会选中
+    /// 已完成的子 Agent（面板只列运行中），内容区会显示一个列表里看不见的条目。
+    #[test]
+    fn entering_panel_selects_a_running_sub_agent_not_the_last_one_added() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, running_sub_agent(1));
+        state.sub_agents.insert(2, running_sub_agent(2));
+        // id 更大但已结束：`sub_agents` 末项是它，`visible_sub_agents` 末项不是。
+        let mut done = running_sub_agent(3);
+        done.status = SubAgentStatus::Done;
+        state.sub_agents.insert(3, done);
+
+        state.enter_content_focus();
+
+        assert_eq!(state.ui_focus, UiFocus::SubAgents);
         assert_eq!(state.selected_sub_agent, Some(2));
         assert!(state.sub_agent_detail_open);
     }
@@ -18072,6 +18657,59 @@ mod todo_stats_tests {
         let items = state.current_todos.as_ref().expect("新任务板应重新出现");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "new");
+    }
+
+    // ── 任务全部完成后 Ctrl+T 仍能展开 ───────────────────────────────────
+    //
+    // 回归背景：原实现在 Ctrl+T 里对 `all_done` 直接 no-op，理由是「面板已收成
+    // 一行摘要，没有可展开的内容」。但摘要行的早退在渲染层、无条件生效，
+    // 于是完成态成了真正的不可读——恰恰抹掉了唯一的复盘入口：每项耗时/token
+    // 与执行回放（`todo_stats` / `todo_execution_logs`）只存在于内存，不落盘。
+    // 正确划分是「默认折叠」（渲染层一行摘要）vs「可展开」（按键层照常切换）。
+
+    #[test]
+    fn ctrl_t_expands_the_panel_even_after_everything_is_done() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        state.ui_focus = UiFocus::Chat;
+
+        state.toggle_todo_panel();
+
+        assert!(
+            state.todo_panel_expanded,
+            "全部完成后 Ctrl+T 仍应展开面板，而不是被静默吞掉"
+        );
+        assert_eq!(state.ui_focus, UiFocus::Todos);
+        assert_eq!(state.selected_todo_id.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn ctrl_t_collapses_the_completed_panel_again() {
+        let mut state = make_state();
+        state.current_todos = Some(vec![todo("a", TodoStatus::Completed)]);
+        state.ui_focus = UiFocus::Chat;
+
+        state.toggle_todo_panel();
+        assert!(state.todo_panel_expanded);
+        state.toggle_todo_panel();
+
+        assert!(
+            !state.todo_panel_expanded,
+            "再次 Ctrl+T 应折回一行完成摘要，保持原有的 toggle 语义"
+        );
+    }
+
+    #[test]
+    fn ctrl_t_is_a_noop_when_there_is_no_todo_list() {
+        // 新一轮（begin_new_turn 已清空 current_todos）之后没有可展开的东西，
+        // 也不该抢走焦点。
+        let mut state = make_state();
+        state.ui_focus = UiFocus::Chat;
+
+        state.toggle_todo_panel();
+
+        assert!(!state.todo_panel_expanded);
+        assert_eq!(state.ui_focus, UiFocus::Chat, "没有任务列表时不应劫持焦点");
     }
 }
 

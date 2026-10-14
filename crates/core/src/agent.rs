@@ -2150,30 +2150,39 @@ impl Agent {
                     .await;
                 }
 
-                // 分区执行：parallel_safe 的调用（如 SubAgent）各自并发，其余调用
-                // 保持相互顺序、但与并发组同时进行；结果按原始下标排序回填保序。
-                // 均为单任务内并发（join!），不要求 ctx 满足 Send/'static。
+                // 分区执行：并发安全的调用各自并发，其余调用保持相互顺序、但与
+                // 并发组同时进行；结果按原始下标排序回填保序。均为单任务内并发
+                //（join!），不要求 ctx 满足 Send/'static。
                 //
-                // **`parallel_safe = false` 的语义边界**：它只保证「本组内部按序」，
-                // **不保证与并发组之间有先后**——下面那次 `tokio::join!` 让两组真正
-                // 同时跑。需要权限确认的工具（Edit/Write/Bash）落进 seq_calls 后
-                // 彼此串行，这才是「同一时刻至多一个对话框」真正依赖的性质；
-                // 但它与同批次的只读工具并发执行本来就是允许的。
-                // 改这段之前先分清这两种「顺序」的差别。
+                // **两组之间的先后关系没有任何保证**——下面那次 `tokio::join!` 让
+                // 两组真正同时跑。
+                //
+                // **「同一时刻至多一个对话框」靠的是"需要弹框的调用彼此串行"，
+                // 而不是 `parallel_safe = false` 本身**。所以判定并发资格时，
+                // `parallel_safe` 与 `parallel_safe_with_peer` 都为 false 的工具
+                // 还要再看它这次会不会真的阻塞在权限弹框上：Bypass / Plan 白名单 /
+                // 项目级 AllowAlways / 本轮已授权这四种情况都不会弹框，此时把
+                // `Bash` 之类彼此隔离的调用排队纯属白白拉长回合——一次回合里
+                // 排 8 条只读查询，就是 8 次 LLM 往返的额外空转。
+                // 改这段之前先分清「同组内顺序」与「会弹框」这两种不同的约束。
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
                 for (idx, id, name, input) in calls {
-                    let is_par = self
-                        .tool_impls
-                        .get(&name)
-                        .map(|t| t.parallel_safe())
+                    let tool_impl = self.tool_impls.get(&name);
+                    let needs_ui = tool_impl
+                        .map(|t| t.needs_permission(&input))
+                        .unwrap_or(false)
+                        && ctx.needs_dialog(&name)
+                        && !self.turn_granted(&name);
+                    let tool_allows_par = tool_impl
+                        .map(|t| t.parallel_safe() || (t.parallel_safe_with_peer() && !needs_ui))
                         .unwrap_or(false);
                     let model_allows_parallel = used_route
                         .capabilities
                         .as_ref()
                         .map(|capabilities| capabilities.parallel_tool_calls.value)
                         .unwrap_or(true);
-                    if is_par && total > 1 && model_allows_parallel {
+                    if tool_allows_par && total > 1 && model_allows_parallel {
                         par_futs.push(async move {
                             (idx, self.exec_tool_call(ctx, id, name, input).await)
                         });
@@ -3845,6 +3854,195 @@ mod tests {
         assert_eq!(
             results,
             vec![("t1", "first", false), ("t2", "second", false)]
+        );
+    }
+
+    /// 模拟 `Bash`：需要权限确认（`parallel_safe` 保持默认 false），但每次调用
+    /// 彼此隔离、可以并发——这正是 `parallel_safe_with_peer` 描述的形状。
+    struct ConfirmableIsolatedTool;
+    #[async_trait::async_trait]
+    impl Tool for ConfirmableIsolatedTool {
+        fn name(&self) -> &str {
+            "ConfirmableIsolated"
+        }
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "ConfirmableIsolated".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            }
+        }
+        fn needs_permission(&self, _input: &serde_json::Value) -> bool {
+            true
+        }
+        fn parallel_safe_with_peer(&self) -> bool {
+            true
+        }
+        async fn run(
+            &self,
+            input: serde_json::Value,
+            _ctx: &dyn ToolContext,
+        ) -> Result<ToolResult> {
+            let ms = input.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            let tag = input.get("tag").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(ToolResult::ok(tag.to_string()))
+        }
+    }
+
+    /// 同一批返回两个 `ConfirmableIsolated` 调用的 provider。
+    struct TwoConfirmableProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for TwoConfirmableProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n == 0 {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "c1".into(),
+                        name: "ConfirmableIsolated".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "c1".into(),
+                        json_delta: r#"{"ms":200,"tag":"first"}"#.into(),
+                    }),
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "c2".into(),
+                        name: "ConfirmableIsolated".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "c2".into(),
+                        json_delta: r#"{"ms":200,"tag":"second"}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 已授权的上下文：Bypass / Plan 白名单 / 项目级 AllowAlways / 本轮已授权时
+    /// `confirm_tool` 都不会 await UI，对应 `needs_dialog` 返回 false。
+    struct NoDialogCtx;
+    #[async_trait::async_trait]
+    impl ToolContext for NoDialogCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+            true
+        }
+        async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
+            true
+        }
+        fn needs_dialog(&self, _name: &str) -> bool {
+            false
+        }
+    }
+
+    /// 仍需弹框的上下文：用户当场按下允许，`confirm_tool` 返回 true 但**确实
+    /// 等待过 UI**。用它验证「会弹框的调用必须串行」——两个这样的调用并发起来
+    /// 就会在同一时刻弹出两个对话框。
+    struct DialogCtx;
+    #[async_trait::async_trait]
+    impl ToolContext for DialogCtx {
+        fn cwd(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp")
+        }
+        fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+            true
+        }
+        async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
+            true
+        }
+    }
+
+    /// 钉子：`parallel_safe_with_peer` 只在**真的不弹框**时才会兑现并发。
+    /// `DialogCtx` 是 Prompt 模式下用户还没对这个工具点过 AllowAlways 的等价物
+    /// （`needs_dialog` 保持默认的 true），此时两个会弹框的调用必须仍然串行——
+    /// 「同一时刻至多一个对话框」是这个不变式的全部理由，把它们排进并发组就会
+    /// 同时弹出两个对话框。
+    #[tokio::test]
+    async fn confirmable_isolated_calls_stay_serial_while_a_dialog_would_block() {
+        let mut agent = Agent::new(Arc::new(TwoConfirmableProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(ConfirmableIsolatedTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let start = Instant::now();
+        agent
+            .run_turn(&mut session, &DialogCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(380),
+            "会弹权限框的调用必须彼此串行（一次只弹一个对话框），实际耗时 {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 钉子：一旦不再需要弹框，同一批里的同类调用就该并发跑完，而不是排队。
+    /// 这条直接对应 gupiao 的实测痛点——模型一轮里返回多条互不依赖的只读查询时，
+    /// 串行执行让每个回合凭空多出 N 次工具等待。
+    #[tokio::test]
+    async fn confirmable_isolated_calls_run_concurrently_once_authorized() {
+        let mut agent = Agent::new(Arc::new(TwoConfirmableProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(ConfirmableIsolatedTool));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let start = Instant::now();
+        agent
+            .run_turn(&mut session, &NoDialogCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(380),
+            "已授权后两个 200ms 的隔离调用应并发（总计约 200ms），实际耗时 {:?}",
+            start.elapsed()
+        );
+        // 并发不改变回填顺序：结果仍按 tool_use 原始下标排序。
+        let results: Vec<_> = session
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: ToolResultContent::Text(text),
+                    ..
+                } => Some((tool_use_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("c1", "first"), ("c2", "second")],
+            "并发执行后仍必须按原始顺序回填 tool_result"
         );
     }
 

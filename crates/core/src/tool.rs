@@ -110,6 +110,18 @@ pub trait ToolContext: Send + Sync {
     async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
         false
     }
+    /// 本次调用是否会**阻塞等待**用户在 UI 上做出权限决定。
+    ///
+    /// 用途：`Agent` 决定同一轮 assistant 消息里的多个工具调用怎么分组执行时，
+    /// 「会弹框的副作用工具必须串行」（同一时刻至多一个对话框），而**不会弹框的
+    /// 同类调用没有理由排队**。返回 `false` 表示 `confirm_tool` 不会 await UI，
+    /// 该调用可以并入并发组。
+    ///
+    /// 默认 `true`（保守 = 会阻塞）—— headless / 子 Agent / mock 一律退回到
+    /// 「串行执行」的旧行为，绝不因为漏覆盖而让某个无 UI 通道的调用被静默放行。
+    fn needs_dialog(&self, _name: &str) -> bool {
+        true
+    }
     /// 当前上下文是否有真实人类交互通道。前台 computer-use 接管必须依赖
     /// 这个信号；headless/cron/子 Agent 默认 false，不得把无 UI 当成批准。
     fn supports_interactive_confirmation(&self) -> bool {
@@ -194,6 +206,24 @@ pub trait Tool: Send + Sync {
     /// 同一轮 assistant 消息里的多个此工具调用是否可以并发执行。
     /// 默认 false（顺序执行）；SubAgent 等自身即独立任务的工具返回 true。
     fn parallel_safe(&self) -> bool {
+        false
+    }
+    /// 同名调用彼此是否**完全隔离**（并发的两次调用互不影响结果）。
+    ///
+    /// 与 [`Tool::parallel_safe`] 的区别：后者只说明「工具自身适合并发」，
+    /// 两者都 `false` 时 `Bash` 仍然被排在串行组里——理由见 `agent.rs` 的
+    /// `partition` 分组：需要弹权限框的副作用工具为了「同一时刻至多一个对话框」
+    /// 必须排队，于是整个回合退化成 N 个 LLM 往返 × N 次串行等待。
+    ///
+    /// 但 `Bash` 的每次调用是各自独立的子进程（独立 pipe、独立 pgid、独立的
+    /// 流式快照槽——`ToolOutputChunk` 按 `tool_use_id` 寻址），只要不阻塞在权限
+    /// 弹框上就没有理由排队。返回 true 后是否真的并发，还要由调用方同时满足
+    /// 「本工具已授权、不需要弹框」和「模型能力声明允许并发」。
+    ///
+    /// **只对「多次调用互不覆盖」的工具有效**。Write/Edit 之类的写工具若同一批里
+    /// 指向同一个文件，并发会双双读到同一份原文、后写覆盖先写（丢失更新），
+    /// 因此它们必须保持默认 `false`，由调用方另行按路径去重。
+    fn parallel_safe_with_peer(&self) -> bool {
         false
     }
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>;

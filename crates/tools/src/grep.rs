@@ -242,6 +242,21 @@ fn rg_binary() -> Option<&'static Path> {
     .as_deref()
 }
 
+/// Grep 这次会走哪个后端（`"rg"` = 系统 ripgrep 快路径，`"native"` = 内置纯 Rust
+/// 实现），供 UI 在工具行上标注。
+///
+/// 判据与 [`rg_backend`] 的分流同源（共用上面那份 `PATH` 探测缓存），所以标成
+/// `"rg"` 就一定会 spawn `rg`。唯一的例外是 rg 跑起来之后自己失败（退出码 ≥2
+/// 且无输出，例如非法 pattern），那种情况 `rg_backend` 会静默退回纯 Rust 实现，
+/// 而标注已经提前画上去了——它表达的是"会走 rg"而非"这次确实跑完了 rg"。
+pub fn backend_label() -> &'static str {
+    if rg_binary().is_some() {
+        "rg"
+    } else {
+        "native"
+    }
+}
+
 /// 用 ripgrep 执行搜索；没装 rg、spawn 失败或 rg 自身报错时返回 None，交给纯 Rust 兜底。
 fn rg_backend(root: &Path, spec: &SearchSpec) -> Option<(Vec<String>, bool)> {
     let exe = rg_binary()?;

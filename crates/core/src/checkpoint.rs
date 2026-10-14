@@ -783,6 +783,11 @@ fn capture_files(root: &Path, cas: Option<&WorkspaceCas>) -> Result<FileSnapshot
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .git_ignore(true)
+        // **必须**为 false：`ignore` 的 `git_ignore(true)` 默认 `require_git = true`，
+        // 在非 git 仓库里会**整份丢弃 .gitignore**，于是被项目显式排除的目录
+        // （典型：`.venv/`、数据产物目录、`archive/`）照样被遍历、被读取。
+        // checkpoint 的快照范围由项目的忽略规则决定，而不是「一律全量」。
+        .require_git(false)
         .ignore(true)
         .build()
         .flatten()
@@ -799,13 +804,30 @@ fn capture_files(root: &Path, cas: Option<&WorkspaceCas>) -> Result<FileSnapshot
             sensitive_files_skipped += 1;
             continue;
         }
-        let bytes = std::fs::read(path)?;
-        if files.len() >= NON_GIT_MAX_FILES
-            || captured_bytes.saturating_add(bytes.len() as u64) > NON_GIT_MAX_BYTES
-        {
+        // **先看大小再决定要不要读**。曾经的写法是 `std::fs::read(path)?` 之后才
+        // 判断是否超过 NON_GIT_MAX_FILES / NON_GIT_MAX_BYTES，于是配额早就满了之后
+        // 仍会把余下每一个文件完整读进内存再丢掉：在一个「数据文件占 2.4GB」的项目
+        // 里，一次 checkpoint 因此要读 2.39GB 却只留 7.6MB，实测 3.56s；
+        // 而 checkpoint 在每次工具调用的 PreTool / PostTool 各跑一次——
+        // 单次工具调用白白多出约 7s，占整场分析的一半时间。
+        //
+        // 计数上限先判，是为了连 `stat` 都不必做：项目再大，剩下的每个文件
+        // 都会走同一条「跳过」分支，而 `skipped_files` 的含义仍然是
+        // 「遍历到但没进快照的文件数」，不受影响。
+        if files.len() >= NON_GIT_MAX_FILES {
             skipped_files += 1;
             continue;
         }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if captured_bytes.saturating_add(metadata.len()) > NON_GIT_MAX_BYTES {
+            skipped_files += 1;
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         captured_bytes += bytes.len() as u64;
         let sha = sha256(&bytes);
         let size = bytes.len() as u64;
@@ -1323,6 +1345,80 @@ mod tests {
         assert!(!snapshot.files.contains_key(Path::new(".ssh/id_ed25519")));
         assert_eq!(snapshot.sensitive_files_skipped, 2);
         assert!(!snapshot.complete);
+    }
+
+    /// 钉子：**非 git 目录里 `.gitignore` 必须生效**。
+    ///
+    /// `ignore` 的 `git_ignore(true)` 默认 `require_git = true`，在非 git 仓库里
+    /// 会把整份 `.gitignore` 丢掉。于是一个明确写了 `.venv/`、`archive/`、
+    /// `data/*.duckdb` 的数据型项目，checkpoint 依然把那些大文件全读一遍——
+    /// 实测一次 checkpoint 读 2.39GB 只留 7.6MB、耗时 3.56s，而 checkpoint 在
+    /// 每次工具调用的 PreTool / PostTool 各跑一次。
+    #[test]
+    fn non_git_checkpoint_honours_project_gitignore() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".gitignore"), ".venv/\narchive/\ndata/\n").unwrap();
+        std::fs::create_dir_all(root.path().join(".venv/lib")).unwrap();
+        std::fs::write(root.path().join(".venv/lib/pkg.py"), "ignored").unwrap();
+        std::fs::create_dir_all(root.path().join("archive")).unwrap();
+        std::fs::write(root.path().join("archive/old.json"), "ignored").unwrap();
+        std::fs::create_dir_all(root.path().join("data")).unwrap();
+        std::fs::write(root.path().join("data/market.duckdb"), "ignored").unwrap();
+        std::fs::write(root.path().join("keep.py"), "kept").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "gitignore-non-git").unwrap();
+        let summary = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let checkpoint = store.load(&summary.id).unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!("expected non-git snapshot");
+        };
+        assert!(snapshot.files.contains_key(Path::new("keep.py")));
+        for ignored in [".venv/lib/pkg.py", "archive/old.json", "data/market.duckdb"] {
+            assert!(
+                !snapshot.files.contains_key(Path::new(ignored)),
+                "{ignored} 被 .gitignore 排除，不该进快照（否则每次工具调用都要重读一遍）"
+            );
+        }
+    }
+
+    /// 钉子：**超配额的文件一个字节都不该读**。
+    ///
+    /// 曾经的顺序是「`fs::read` → 判断是否超配额 → 超了就丢」，于是配额满之后
+    /// 仍会把余下每个文件完整读进内存。这里用一个稀疏大文件把这条钉死：它
+    /// `set_len` 出来不占磁盘，但真去读就要分配同等大小的缓冲区。
+    #[test]
+    fn non_git_checkpoint_stops_reading_once_the_byte_budget_is_spent() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("first.bin"), vec![0u8; 1024]).unwrap();
+        let hog = root.path().join("zz-huge.bin");
+        let file = std::fs::File::create(&hog).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "byte-budget").unwrap();
+        let start = std::time::Instant::now();
+        let summary = store
+            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        let checkpoint = store.load(&summary.id).unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!("expected non-git snapshot");
+        };
+        assert!(snapshot.files.contains_key(Path::new("first.bin")));
+        assert!(
+            !snapshot.files.contains_key(Path::new("zz-huge.bin")),
+            "超过 NON_GIT_MAX_BYTES 的文件不该被收进快照"
+        );
+        // 真去读那个 512MiB 稀疏文件，光是分配与填充就要数百毫秒到数秒。
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "超配额的大文件必须只 stat 不读，本次 capture 耗时 {elapsed:?}"
+        );
     }
 
     /// M1 验证:CAS 路径下,200 个相同内容文件的 checkpoint JSON 体积应 < 50KB,

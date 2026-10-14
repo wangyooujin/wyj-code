@@ -1,6 +1,7 @@
 _version: 1
 command:
   unknown: "Unknown command: /{name}  (type /help to see all commands)"
+  background_unsupported: "Command /{name} is declared background-executed but returned a result type the TUI cannot render directly: {result}"
 skill:
   run:
     desc: "Build and run the current project"
@@ -32,6 +33,7 @@ subagent:
   bg_done_notice: "Background agent {id} ({type}: {desc}) finished; result will be injected into the conversation"
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
   panel_title: " agents [{count}] "
+  content_hint: "↑↓ switch sub-agent · PgUp/PgDn scroll execution · Esc back to composer"
   inline_running: "running · {elapsed} · ↑{tokens} tokens · {count} tool uses"
   detail_running: "running, current action:"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
@@ -98,6 +100,12 @@ spinner:
 # Live output block of a running tool (tail lines only)
 live_output:
   omitted: "⋮ {count} more lines of output above"
+
+# Backend tag appended to tool lines: Grep is the only tool that splits
+# across two search backends.
+tool_backend:
+  rg: "rg"
+  native: "native"
 
 diff:
   more_lines: "    … {n} more lines (Ctrl+O to expand)"
@@ -280,6 +288,13 @@ new:
 compact:
   desc: "Manually compact conversation context to reduce token usage"
   usage: "/compact [summary hint]"
+  done: "Compacted: removed {removed} messages, saving roughly {saved} tokens"
+  noop: "Context is already short; nothing to compact."
+  failed_tag: "compaction failed"
+
+checkpoint:
+  created: "Created checkpoint {id}"
+  failed_tag: "checkpoint creation failed"
 
 context:
   desc: "Show the context breakdown, using the same accounting as the auto-compact threshold"

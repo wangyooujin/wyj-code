@@ -15,6 +15,8 @@
 
 **忽略语义两条路径必须一致**（这是改造的另一半收益）：跳过 `.git` 目录、`.gitignore`/`.ignore`/`.git/info/exclude` 在任何目录都生效。旧实现 `hidden(false)` 会把 `.git/objects` 一起遍历（本仓库 710 个文件里 473 个是 `.git` 内部文件），且 ignore crate 的 `require_git` 默认 true，非 git 仓库里 `.gitignore` 静默失效。
 
+**用户可见的后端标注**：`grep::backend_label()`（经 `wyj_tools::grep_backend_label` 导出）返回本次会走的分流结果（`"rg"` / `"native"`），判据与 `rg_backend` 同源、共用同一份 `PATH` 探测缓存。TUI 用它在工具行尾部补后缀（`⏺ Grep(pat in .) · rg`，i18n key `tool_backend.rg` / `tool_backend.native`，见 `tui::app::tool_backend_badge`）——工具名对模型可见，光看 `Grep(...)` 分不出这次到底谁在跑。注意它表达的是「会走哪条路」而非「这次确实跑完了 rg」：rg 起来后自己报错（退出码 ≥2 且无输出）仍会静默退回纯 Rust，标注来不及更正。
+
 实测（release、Apple Silicon）：本仓库常规搜索 10~30×；832MB/3 万文件的语料上全量扫描 rg 快路径 4~11×，纯 Rust 兜底 2~7×。纯 Rust 兜底在大文件全量扫描时仍受「整份 read 拷贝」限制（~600MB/s），没有走 mmap——`memmap2::Mmap::map` 是 unsafe 且文件被并发截断时会 SIGBUS（进程直接死），不值得为兜底路径冒这个险。
 
 
