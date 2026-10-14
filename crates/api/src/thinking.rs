@@ -127,7 +127,10 @@ pub struct ThinkingResponseFields {
     pub reasoning_content: bool,
     /// `delta.reasoning_details` / `message.reasoning_details`（MiniMax 特有）
     pub reasoning_details: bool,
-    /// 是否需要把 `reasoning_content` 拼回多轮 messages（GLM/Qwen/DeepSeek 工具调用场景必须）
+    /// 是否需要把 `reasoning_content` 拼回多轮 messages（GLM/Qwen/DeepSeek 工具调用场景必须）。
+    /// 由 `openai.rs::to_api_messages` 消费：`true` 时 assistant 消息带出
+    /// `reasoning_content`（以及 MiniMax 的 `reasoning_details`），`false` 时字段
+    /// 整个不出现——ollama / vllm 虽在响应里回填 reasoning_content，回传却会 400。
     pub echo_back_in_messages: bool,
 }
 

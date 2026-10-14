@@ -116,6 +116,10 @@
 
 **模型侧提示词**（`core::prompts` + `tools::descriptions`）：主 system prompt、模式追加段（Plan/non-interactive）、子 agent 内置提示、compact 结构化摘要模板、记忆提取提示、全部工具描述均为**英文原创常量**，不走 i18n（模型行为不应随 locale 漂移；末尾 "reply in the user's language" 保证中文用户得到中文回复）。system prompt 结构 = 英文主提示 + `<env>` 环境块（**cwd/home**/平台/日期/model 等会话内稳定字段，进 prompt 缓存）+ 跨会话记忆快照 + AGENTS.md reminder；**`home` 必须带上**——2026-10-09 实测缺这一项时，模型无从得知 `~/.wyj-code/skills/` 的真实绝对路径，会凭空编出 `/Users/dev/.wyj-code/skills` 这类不存在的路径，并据此断言"skill 实际未安装"（会话记录里它自己写了 "But I don't know the home dir"）。同一教训见架构节 23 条：`# Skills` 段的禁令必须写成**行为禁令**（"禁止一切自发检索 skill 目录，名单是唯一合法来源"）而非**路径枚举**（只禁 `~/.claude/skills/` 会被换个目录绕过）。**git 状态快照**（分支/porcelain/近 5 commit）走会话首轮 user 消息注入（`Agent::with_git_snapshot`），因其每轮可能变、进 system 会击穿缓存。
 
+**语言规则必须显式覆盖 reasoning**（`prompts.rs` 的 `# Tone and style` + 三段子 Agent 模板）：2026-10-15 排查 thinking 输出「英文为主、偶发中文」时的结论是——**代码全链路对 thinking 零强制**（`agent.rs` 纯 `push_str` 累积、OpenAI 的 `reasoning_content`、`compact` 的摘要、TUI 的 `clean_thinking_lines`，全是字节级透传，无翻译无规范化），唯一能动的地方是提示词。原句只写 "Always **reply** in ...", 而模型普遍把 thinking 当**内部推理通道**而非回复，训练时对它独立施加英文先验，与最终回复语言解耦——于是「全英文 system prompt + 中文回复 + 英文 thinking」是完全自洽的状态。现措辞显式点名 "including your extended thinking / reasoning"；子 Agent 三模板同样补上（`Agent::with_system` 是**整体替换**、不继承 `MAIN`，子 Agent 此前**一条语言指令都没有**，是漂移概率最高的一档）。**改 prompt 不影响 cache 命中率的持续性**：thinking 活在 `session.messages`、从不进 system prompt，改 `MAIN` 只在升级后第一轮整体换一次前缀。
+
+**压缩不再丢弃 thinking**（`compact.rs::messages_to_text`）：此前 `ContentBlock::Thinking` 一律 `None`，理由是「内部推理，非对话事实」。这个理由在压缩场景下站不住——摘要是压缩后**唯一**的续跑上下文，丢掉推理链等于每轮重新起跑：既丢掉已付出的推理，也让输出语言在压缩点后漂移。现按 `[思考] <truncate_chars(400)>` 纳入摘要文本，空 thinking 与 `RedactedThinking` 只留占位；配套在 `compact_prompt` 模板加 `## Key Reasoning` 一节，指示摘要器只提炼**最终答案里看不见**的推理（排除掉的方案、读代码发现的约束），没有就不输出该节，避免把整段 reasoning 原样倒灌进摘要。单测 `thinking_reaches_compaction_text` / `long_thinking_is_truncated_in_compaction_text` / `empty_and_redacted_thinking_produce_placeholder_only`。
+
 
 ## 效率与自愈（v0.3.1）
 
