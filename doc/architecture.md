@@ -65,7 +65,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框、panic 兜底还原 |
 | `crates/cli` | 二进制入口 | 解析 CLI 参数，组装所有 crate；启动 TUI / Headless REPL / 单次 `-p` 模式 / ACP adapter / daemon |
 
-二进制名 `wyj-code`；workspace 版本 `0.3.1`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
+二进制名 `wyj-code`；workspace 版本 `0.3.2`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
 
 ---
 
