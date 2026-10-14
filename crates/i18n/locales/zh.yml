@@ -70,11 +70,29 @@ subagent_trace:
   not_found: "会话 {session} 中未找到子 Agent 记录 a{id}"
 
 thinking:
-  running: "  ⎿ ⠋ 思考中…"
+  # {frame} 是实时 spinner 帧（SPINNER_FRAMES[n]）。刻意做成占位符而不是把
+  # 第一帧写死进文案：写死的那一行在流式期间永远不转，与标题栏的动画对不上。
+  running: "  ⎿ {frame} 思考中…"
   done: "  ⎿ 已思考 {secs}s（{lines} 行）"
   done_no_elapsed: "  ⎿ 已思考（{lines} 行）"
   expand_hint: "  ·  Ctrl+O 展开"
   live_omitted: "⋮ 上面还有 {count} 行"
+
+# 底部进度区（输入框标题栏 spinner / TodoWrite 面板头 / 排队提示）的文案。
+# 这些是**用户可见 UI 文案**，必须走 i18n：同一块底部区域里混着中英会让
+# 切换 locale 后看起来只翻译了一半。
+spinner:
+  thinking: "思考中"
+  waiting_approval: "等待批准"
+  reviewing_plan: "审阅计划"
+  queuing_message: "消息排队中"
+  queue_hint: "{count} 条已排队（{running}）"
+  queue_op_running: "{op} 进行中"
+  queue_pending: "等待送达"
+  todo_title: "任务列表"
+  todo_done: "任务已完成"
+  todo_expand: "  （Ctrl+T 展开）"
+  todo_collapse: "  （Ctrl+T 折叠）"
 
 # 正在执行的工具的实时输出块（只显示尾部若干行）
 live_output:

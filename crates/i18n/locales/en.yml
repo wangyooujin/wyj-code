@@ -71,11 +71,29 @@ subagent_trace:
   not_found: "No sub-agent record a{id} found in session {session}"
 
 thinking:
-  running: "  ⎿ ⠋ Thinking…"
+  # {frame} 是实时 spinner 帧（SPINNER_FRAMES[n]）。刻意做成占位符而不是把
+  # 第一帧写死进文案：写死的那一行在流式期间永远不转，与标题栏的动画对不上。
+  running: "  ⎿ {frame} Thinking…"
   done: "  ⎿ Thought for {secs}s ({lines} lines)"
   done_no_elapsed: "  ⎿ Thought ({lines} lines)"
   expand_hint: "  ·  Ctrl+O to expand"
   live_omitted: "⋮ {count} more lines above"
+
+# 底部进度区（输入框标题栏 spinner / TodoWrite 面板头 / 排队提示）的文案。
+# 这些是**用户可见 UI 文案**，必须走 i18n：同一块底部区域里混着中英会让
+# 切换 locale 后看起来只翻译了一半。
+spinner:
+  thinking: "Thinking"
+  waiting_approval: "Waiting for approval"
+  reviewing_plan: "Reviewing plan"
+  queuing_message: "Queuing message"
+  queue_hint: "{count} queued ({running})"
+  queue_op_running: "{op} running"
+  queue_pending: "awaiting delivery"
+  todo_title: "Task list"
+  todo_done: "Tasks complete"
+  todo_expand: "  (ctrl+t to expand)"
+  todo_collapse: "  (ctrl+t to collapse)"
 
 # Live output block of a running tool (tail lines only)
 live_output:
