@@ -434,6 +434,12 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Spinner 动画帧（braille，复刻 Claude Code 风格）
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// 取第 `idx` 帧动画字符的 `String`，供需要把它塞进 i18n 占位符的调用方使用
+/// （`tr_fmt` 的实参是 `&str`，`char` 需要先变成有所有权的字符串）。
+pub(crate) fn spinner_frame_str(idx: usize) -> String {
+    SPINNER_FRAMES[idx % SPINNER_FRAMES.len()].to_string()
+}
+
 /// `!` bash 命令输出的静态预览上限：标题不计入，正文最多展示三个终端视觉行。
 ///
 /// **只对 `MessageRole::BashOutput` 生效**。工具调用结果（`MessageRole::ToolResult`）
@@ -918,6 +924,8 @@ struct ThinkingRenderOpts {
     /// 该段 thinking 的累计耗时。`None` = 本次会话没有记录到
     /// （`/resume` 恢复的旧会话：耗时从未持久化过）。
     elapsed_secs: Option<f64>,
+    /// 实时 spinner 帧序号（`live` 时注入 `thinking.running` 的 `{frame}`）。
+    spinner_frame: usize,
 }
 
 fn clean_thinking_lines(content: &str) -> Vec<&str> {
@@ -946,8 +954,11 @@ fn render_thinking_block(
     opts: ThinkingRenderOpts,
 ) {
     if opts.live {
+        // `{frame}` 由渲染层注入当前 spinner 帧：i18n 文案里写死 `⠋` 会让这行
+        // 在流式期间永远停在第一帧，用户往回滚看历史时整屏只有标题栏在动。
+        let frame = spinner_frame_str(opts.spinner_frame);
         lines.push(Line::from(Span::styled(
-            wyj_i18n::tr("thinking.running"),
+            wyj_i18n::tr_fmt("thinking.running", &[("frame", frame.as_str())]),
             Style::default().fg(Color::Cyan),
         )));
         // 流式期间把尾部思考显出来，让「正在想什么」可见；定稿后立刻收起。
@@ -1102,6 +1113,7 @@ fn render_chat_message(
                     live: false,
                     expanded: ctx.output_expanded,
                     elapsed_secs: msg.thinking_elapsed_secs,
+                    spinner_frame: ctx.spinner_frame,
                 },
             );
         }
@@ -1611,6 +1623,7 @@ pub(crate) fn build_pending_chat_lines(
                 live: true,
                 expanded: state.output_expanded,
                 elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
+                spinner_frame: state.spinner_frame,
             },
         );
     }
@@ -1701,9 +1714,15 @@ fn push_inline_todo_lines(
         String::new()
     };
     let title = if all_done {
-        format!("任务已完成 [{done}/{total}]{stats_suffix}")
+        format!(
+            "{} [{done}/{total}]{stats_suffix}",
+            wyj_i18n::tr("spinner.todo_done")
+        )
     } else {
-        format!("{spinner_prefix}任务列表 [{done}/{total}]{stats_suffix}")
+        format!(
+            "{spinner_prefix}{} [{done}/{total}]{stats_suffix}",
+            wyj_i18n::tr("spinner.todo_title")
+        )
     };
 
     lines.push(Line::from(""));
@@ -1738,9 +1757,9 @@ fn push_inline_todo_lines(
         if collapsible {
             Span::styled(
                 if collapsed {
-                    "  (ctrl+t to expand)"
+                    wyj_i18n::tr("spinner.todo_expand")
                 } else {
-                    "  (ctrl+t to collapse)"
+                    wyj_i18n::tr("spinner.todo_collapse")
                 },
                 Theme::dim(),
             )
@@ -2659,18 +2678,33 @@ fn title_token_text(state: &AppState) -> String {
 /// 输入框标题栏 thinking 指示器的基础文案（即"每一步操作的名字"，不含 spinner 帧）。
 ///
 /// 优先级（从最具辨识度到默认）：
-///   1. `current_op` 原文（如 `"Bash(cargo test)"` / `"Read(src/app.rs)"`）——
+///   1. `permission_dialog` → "Waiting for approval"
+///   2. `plan_dialog`       → "Reviewing plan"
+///   3. `current_op` 原文（如 `"Bash(cargo test)"` / `"Read(src/app.rs)"`）——
 ///      直接显示工具名 + 参数，信息量高于旧的固定短语映射
-///   2. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
-///   3. `permission_dialog` → "Waiting for approval"
-///   4. `plan_dialog`      → "Reviewing plan"
+///   4. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
 ///   5. `pending_queue`    → "Queuing message"
 ///   6. fallback           → "Thinking"
+///
+/// **两个对话框必须排在 `current_op` 前面**：`Agent::exec_tool_call` 是先
+/// `emit ToolEvent::Start`（TUI 据此写 `current_op`）再走 `ensure_tool_permission`
+/// ——见 `crates/core/src/agent.rs`。所以权限弹窗打开期间 `current_op` 一定
+/// 非空，旧顺序下标题栏永远显示 `Bash(cargo test) · 12.3s` 且秒表继续走，
+/// 看着"在忙"实则整轮卡在等用户点 y；`plan_dialog` 同理。
 ///
 /// 由 `draw_input` 标题栏调用，格式化为
 /// `⠋ {label} · {耗时} · {token}`。
 fn thinking_status_label(state: &AppState) -> String {
-    // 1. 当前步骤原文：`ToolStart` 记下的 `"Bash(cargo test)"` 形式。
+    // 1/2. 正在等用户交互：这是**阻塞在用户身上**而非在跑工具，必须先于
+    //      `current_op` 判定，否则秒表会把"等审批的时间"算成"命令跑了多久"。
+    if state.permission_dialog.is_some() {
+        return wyj_i18n::tr("spinner.waiting_approval");
+    }
+    if state.plan_dialog.is_some() {
+        return wyj_i18n::tr("spinner.reviewing_plan");
+    }
+
+    // 3. 当前步骤原文：`ToolStart` 记下的 `"Bash(cargo test)"` 形式。
     //    旧实现把它降级成 "Running command" 这类固定短语，标题栏因此看不出
     //    到底在跑哪条命令 / 改哪个文件；现在直接给原文，长度由调用方截断兜底。
     if let Some(op) = state.current_op.as_deref() {
@@ -2691,17 +2725,11 @@ fn thinking_status_label(state: &AppState) -> String {
             .to_string();
     }
 
-    if state.permission_dialog.is_some() {
-        return "Waiting for approval".to_string();
-    }
-    if state.plan_dialog.is_some() {
-        return "Reviewing plan".to_string();
-    }
     if !state.pending_queue.is_empty() {
-        return "Queuing message".to_string();
+        return wyj_i18n::tr("spinner.queuing_message");
     }
 
-    "Thinking".to_string()
+    wyj_i18n::tr("spinner.thinking")
 }
 
 /// 排队提示：写清「已排队」+ 当前在挡着的东西。
@@ -2721,9 +2749,68 @@ fn queue_hint_text(state: &AppState) -> String {
         .current_op
         .as_deref()
         .filter(|op| !op.is_empty())
-        .map(|op| format!("{op} 进行中"))
-        .unwrap_or_else(|| "等待送达".to_string());
-    format!("{} 条已排队（{running}）", state.pending_queue.len())
+        .map(|op| wyj_i18n::tr_fmt("spinner.queue_op_running", &[("op", op)]))
+        .unwrap_or_else(|| wyj_i18n::tr("spinner.queue_pending"));
+    wyj_i18n::tr_fmt(
+        "spinner.queue_hint",
+        &[
+            ("count", &state.pending_queue.len().to_string()),
+            ("running", running.as_str()),
+        ],
+    )
+}
+
+/// 标题栏分段拼接：`budget` 列内放不下时，按"整段丢弃"而不是从尾部硬截断。
+///
+/// 旧实现先 `format!` 拼成一整串再交给 [`truncate_line`]，而 [`truncate_line`]
+/// 是从**尾部**截的——排队提示恰好拼在最后，于是窄终端上第一个消失的必然是
+/// 「我的补充还没送达」，与 `queue_hint_text` 上方"这正是用户最需要看到的信息"
+/// 的判断正好相反（实测 80 列以下就已发生）。
+///
+/// 保留优先级（rank 越大越留得住）：`tokens`(0) < `elapsed`(1) < `queue`(2)。
+/// token 是本轮用量、另有 `/cost` 可查，耗时可由状态栏旁证，唯独排队提示一旦
+/// 整段消失用户就无从确认自己的补充有没有被接收。
+///
+/// 全部丢完仍超宽时，最后才对 `label` 做省略号截断——它是唯一不可丢弃的一段。
+fn build_thinking_title(
+    frame: char,
+    label: &str,
+    queue: &str,
+    elapsed: &str,
+    tokens: &str,
+    budget: usize,
+) -> String {
+    // 固定开销：前导空格 + spinner 帧 + 帧后空格 + 尾随空格
+    let shell = 4;
+    let label_w = || label.chars().map(char_display_width).sum::<usize>();
+    // 每段自身的宽度 + " · " 分隔符
+    let seg_w = |s: &str| s.chars().map(char_display_width).sum::<usize>() + 3;
+
+    // (保留优先级, 文本)，Vec 顺序即显示顺序：耗时 → token → 排队提示
+    let mut optional: Vec<(usize, &str)> = vec![(1, elapsed), (0, tokens)];
+    if !queue.is_empty() {
+        optional.push((2, queue));
+    }
+
+    let cost = |segs: &[(usize, &str)]| segs.iter().map(|(_, s)| seg_w(s)).sum::<usize>();
+    while shell + label_w() + cost(&optional) > budget {
+        let Some(pos) = optional
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (rank, _))| *rank)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        optional.remove(pos);
+    }
+
+    let tail = optional
+        .iter()
+        .map(|(_, s)| format!(" · {s}"))
+        .collect::<String>();
+    let label = truncate_line(label, budget.saturating_sub(shell + cost(&optional)));
+    format!(" {frame} {label}{tail} ")
 }
 
 fn draw_input(
@@ -2776,7 +2863,10 @@ fn draw_input(
             .map(|l| l.starts_with('!'))
             .unwrap_or(false);
 
-    let (mut title_content, title_style) = if state.is_thinking {
+    // 标题栏可用列数：Block::border 两侧各吃掉 1 列。
+    let title_budget = area.width.saturating_sub(2) as usize;
+
+    let (title_content, title_style) = if state.is_thinking {
         // AI 工作中：标题栏是唯一的"实时进度条"，内容为
         //   `⠋ <当前这一步的名字> · <这一步耗时> · <本轮 token>`
         // spinner 帧提供运动感（每 tick 前进一格），不再叠 animated dots ——
@@ -2788,22 +2878,18 @@ fn draw_input(
         let tokens = title_token_text(state);
         // 排队中：挂在标题栏而不是只靠状态栏右对齐那一句——窄终端上右对齐
         // 会被左边的「模型 · 模式 · cwd」挤掉后半句（实测只剩「…将在」），
-        // 而「我的补充还没送达」正是用户最需要看到的信息。
+        // 而「我的补充还没送达」正是用户最需要看到的信息。窄屏下由
+        // `build_thinking_title` 按优先级整段丢弃，而不是从尾部截掉它。
         let queue = queue_hint_text(state);
-        let queue = if queue.is_empty() {
-            String::new()
-        } else {
-            format!(" · {queue}")
-        };
         (
-            format!(" {frame} {label} · {elapsed} · {tokens}{queue} "),
+            build_thinking_title(frame, &label, &queue, &elapsed, &tokens, title_budget),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
         )
     } else if is_bang {
         (
-            " $ bash · Enter to run ".to_string(),
+            truncate_line(" $ bash · Enter to run ", title_budget),
             Style::default()
                 .fg(Theme::success_color())
                 .add_modifier(Modifier::BOLD),
@@ -2813,25 +2899,24 @@ fn draw_input(
         // 把 "↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode"
         // 等历史提示全部砍掉（这些在 TUI 顶部 /help 与 docs 里有完整说明，
         // 在标题栏塞一长串会让底部看起来很拥挤）。
-        match &state.mode {
-            AgentMode::Plan => (
-                " [plan] Enter to send ".to_string(),
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            AgentMode::Bypass => (
-                " [bypass] Enter to send ".to_string(),
-                // 与状态栏的 [bypass] 芯片同色：Bypass 会跳过全部权限确认，
-                // 属于"危险但合法"的模式，黄色偏中性、不足以承担提醒职责。
-                // 三处（状态栏芯片 / 标题栏 / 输入框边框）必须同色，
-                // 否则用户会以为底部两处说的是不同的模式。
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            AgentMode::Normal => (" Enter to send ".to_string(), Theme::dim()),
-        }
+        let raw = match &state.mode {
+            AgentMode::Plan => " [plan] Enter to send ",
+            AgentMode::Bypass => " [bypass] Enter to send ",
+            AgentMode::Normal => " Enter to send ",
+        };
+        let style = match &state.mode {
+            AgentMode::Plan => Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            // 与状态栏的 [bypass] 芯片同色：Bypass 会跳过全部权限确认，
+            // 属于"危险但合法"的模式，黄色偏中性、不足以承担提醒职责。
+            // 三处（状态栏芯片 / 标题栏 / 输入框边框）必须同色，
+            // 否则用户会以为底部两处说的是不同的模式。
+            AgentMode::Bypass => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            AgentMode::Normal => Theme::dim(),
+        };
+        (truncate_line(raw, title_budget), style)
     };
-    title_content = truncate_line(&title_content, area.width.saturating_sub(2) as usize);
 
     let border_style = if is_bang {
         Style::default().fg(Theme::success_color())
@@ -6676,7 +6761,7 @@ mod tool_result_fold_tests {
             1,
             "全部完成后面板应只剩一行摘要，实际是 {tail:?}"
         );
-        assert!(tail[0].contains("任务已完成 [2/2]"));
+        assert!(tail[0].contains(&format!("{} [2/2]", wyj_i18n::tr("spinner.todo_done"))));
         assert!(
             !tail.iter().any(|l| l.contains('─')),
             "摘要态不应再画分隔线：{tail:?}"
@@ -7038,6 +7123,176 @@ mod tool_result_fold_tests {
     }
 
     #[test]
+    fn thinking_status_label_prefers_dialogs_over_current_op() {
+        // 回归钉子：`Agent::exec_tool_call` 是先 `emit ToolEvent::Start`、**之后**
+        // 才 `ensure_tool_permission`（见 crates/core/src/agent.rs）。所以权限
+        // 弹窗打开期间 `current_op` 必然非空——旧顺序下标题栏永远停在
+        // `Bash(cargo test) · 12.3s` 且秒表继续走，看着在忙实则卡在等用户点 y。
+        let mut state = make_state();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        state.current_op = Some("Bash(cargo test)".to_string());
+        state.permission_dialog = Some(PermissionDialog {
+            tool_name: "Bash".to_string(),
+            action_summary: "cargo test".to_string(),
+            response_tx: tx,
+        });
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.waiting_approval"),
+            "等审批时必须显示'等用户'而不是工具名，否则秒表把等待时间算成了命令耗时"
+        );
+        assert!(!thinking_status_label(&state).contains("cargo test"));
+
+        // 计划审批同构：ExitPlanMode 也先 Start 再弹窗。
+        state.permission_dialog = None;
+        let (plan_tx, _plan_rx) = tokio::sync::oneshot::channel();
+        state.plan_dialog = Some(PlanApprovalDialog::new(plan_tx));
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("spinner.reviewing_plan")
+        );
+    }
+
+    #[test]
+    fn build_thinking_title_drops_queue_only_as_last_resort() {
+        // 回归钉子：旧实现先 format! 拼整串再 truncate_line（从尾部截），而排队
+        // 提示恰好拼在最后 —— 窄屏下第一个消失的必然是「我的补充还没送达」。
+        // 现在按整段丢弃 + 优先级：token 先丢，耗时次之，排队提示最后。
+        let queue = "2 queued (Bash(sleep 540) running)";
+        let wide = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 200);
+        assert!(wide.contains(queue) && wide.contains("1.5s") && wide.contains("1,000↑"));
+
+        // 逐级丢段的预算阈值：全量 76 列 → 丢 token 后 63 → 丢耗时后 56
+        let mid = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 66);
+        assert!(!mid.contains("1,000↑"), "token 应先被丢：{mid:?}");
+        assert!(mid.contains(queue), "排队提示必须留下：{mid:?}");
+        assert!(mid.contains("1.5s"), "耗时仍应保留：{mid:?}");
+
+        let tight = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 58);
+        assert!(
+            !tight.contains("1.5s"),
+            "耗时应在排队提示之前被丢：{tight:?}"
+        );
+        assert!(tight.contains(queue), "排队提示是最后可丢的段：{tight:?}");
+
+        // 再窄一档才轮到排队提示，且它消失后耗时也不回来（不是"轮换显示"）
+        let tiny = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 40);
+        assert!(!tiny.contains(queue) && !tiny.contains("1.5s"), "{tiny:?}");
+    }
+
+    #[test]
+    fn build_thinking_title_never_exceeds_budget_and_keeps_label_readable() {
+        // 全部可丢段都丢光后仍超宽时，只对 label 做省略号截断（它不可丢弃），
+        // 且任何预算下都不得溢出——溢出会在 Block::title 上直接画到边框外。
+        for budget in [8usize, 12, 20, 40, 80] {
+            let title = build_thinking_title(
+                '⠋',
+                "Bash(cargo test -p wyj-core --all-features)",
+                "3 queued",
+                "1m 5s",
+                "12,345↑ 678↓",
+                budget,
+            );
+            let w = title.chars().map(char_display_width).sum::<usize>();
+            assert!(w <= budget, "预算 {budget} 下溢出到 {w} 列：{title:?}");
+        }
+        // 极窄预算下 label 至少留下 spinner 帧本身，不整段消失。
+        let tiny = build_thinking_title('⠋', "Bash(cargo test)", "", "1.5s", "1,000↑", 6);
+        assert!(tiny.contains('⠋'), "极窄下仍应保留 spinner 帧：{tiny:?}");
+    }
+
+    #[test]
+    fn build_thinking_title_without_queue_matches_legacy_layout() {
+        // 无排队时的排版与旧实现逐字符一致（回归保护：底部进度条的形态是
+        // 用户长期习惯的，改版不该顺手改掉）。
+        assert_eq!(
+            build_thinking_title('⠋', "Read(src/app.rs)", "", "3.2s", "1,024↑ 40↓", 200),
+            " ⠋ Read(src/app.rs) · 3.2s · 1,024↑ 40↓ "
+        );
+    }
+
+    #[test]
+    fn thinking_running_line_uses_live_spinner_frame_not_baked_first_frame() {
+        // 回归钉子：`thinking.running` 的文案里曾把 `⠋` 写死，于是聊天流里的
+        // 思考状态行在流式期间永远停在第一帧——往上滚看历史时整屏只有标题栏
+        // 在动，看起来像一行静态文字。帧号必须由渲染层注入。
+        let render_at = |frame: usize| {
+            let mut lines: Vec<Line> = Vec::new();
+            render_thinking_block(
+                &mut lines,
+                "",
+                80,
+                ThinkingRenderOpts {
+                    live: true,
+                    expanded: false,
+                    elapsed_secs: None,
+                    spinner_frame: frame,
+                },
+            );
+            rendered_text(lines).join("\n")
+        };
+        let first = render_at(0);
+        let later = render_at(4);
+        assert!(
+            first.contains(spinner_frame_str(0).as_str()),
+            "第 0 帧应是 ⠋，实际 {first:?}"
+        );
+        assert!(
+            later.contains(spinner_frame_str(4).as_str()),
+            "第 4 帧应是 ⠼，实际 {later:?}"
+        );
+        assert_ne!(first, later, "帧号没生效：thinking 状态行不随 spinner 推进");
+    }
+
+    #[test]
+    fn spinner_text_keys_resolve_with_their_placeholders() {
+        // 底部进度区的文案必须全部走 i18n：一旦某条 key 拼错，rust-i18n 会静默
+        // 回退成 "spinner.xxx" 字面量，正好让"漏翻译"以最难发现的形态出现。
+        //
+        // 只在**当前 locale** 下断言：本文件里的其他测试并行跑，任何一个调
+        // `wyj_i18n::set_locale` 都会与它们串味（见 wyj-i18n 里的同款说明）。
+        // zh 侧的对照断言放在 `wyj-i18n` 的单测里。
+        for key in [
+            "spinner.thinking",
+            "spinner.waiting_approval",
+            "spinner.reviewing_plan",
+            "spinner.queuing_message",
+            "spinner.queue_pending",
+            "spinner.todo_title",
+            "spinner.todo_done",
+            "spinner.todo_expand",
+            "spinner.todo_collapse",
+        ] {
+            let v = wyj_i18n::tr(key);
+            assert!(
+                !v.is_empty() && !v.starts_with("spinner."),
+                "{key} 未解析：{v:?}"
+            );
+        }
+        let hint = wyj_i18n::tr_fmt(
+            "spinner.queue_hint",
+            &[
+                ("count", "2"),
+                ("running", wyj_i18n::tr("spinner.queue_pending").as_str()),
+            ],
+        );
+        assert!(hint.contains('2'), "queue_hint 丢了 {{count}}：{hint:?}");
+        let op = wyj_i18n::tr_fmt("spinner.queue_op_running", &[("op", "Bash(x)")]);
+        assert!(
+            op.contains("Bash(x)"),
+            "queue_op_running 丢了 {{op}}：{op:?}"
+        );
+        let running = wyj_i18n::tr_fmt(
+            "thinking.running",
+            &[("frame", spinner_frame_str(2).as_str())],
+        );
+        assert!(
+            running.contains('⠹'),
+            "thinking.running 丢了 {{frame}}：{running:?}"
+        );
+    }
+
+    #[test]
     fn strip_read_line_number_removes_numeric_tab_prefix() {
         assert_eq!(strip_read_line_number("42\tfn main() {}"), "fn main() {}");
         assert_eq!(strip_read_line_number("1\t"), "");
@@ -7256,6 +7511,7 @@ mod tool_result_fold_tests {
                 live: true,
                 expanded: false,
                 elapsed_secs: Some(3.0),
+                spinner_frame: 0,
             },
         );
 
@@ -7287,6 +7543,7 @@ mod tool_result_fold_tests {
                 live: true,
                 expanded: false,
                 elapsed_secs: None,
+                spinner_frame: 0,
             },
         );
         assert_eq!(rendered_text(lines).len(), 1, "空缓冲只出状态行");

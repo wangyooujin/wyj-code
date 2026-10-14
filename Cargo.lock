@@ -5391,6 +5391,8 @@ dependencies = [
  "ignore",
  "libc",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "scraper",
