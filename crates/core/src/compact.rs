@@ -578,8 +578,16 @@ fn messages_to_text(messages: &[Message]) -> String {
                         Some(format!("{prefix} {text}"))
                     }
                     ContentBlock::Image { .. } => Some("[图片]".to_string()),
-                    // 思考内容不进摘要（内部推理，非对话事实）
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
+                    // 思考内容进摘要：推理链是模型续跑的语言锚点，压缩时丢弃会让
+                    // 后续轮次重新起跑（既丢失已付出的推理，也让输出语言漂移）。
+                    // 长思考按 truncate_chars 截断，避免摘要被单轮 reasoning 撑爆。
+                    ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                        Some(format!("[思考] {}", truncate_chars(thinking, 400)))
+                    }
+                    // 加密的 redacted 块没有可读内容，只能占位。
+                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
+                        Some("[思考]".to_string())
+                    }
                 })
                 .collect();
             format!("[{role}]: {}", parts.join(" | "))
@@ -607,6 +615,72 @@ mod tests {
             content: vec![ContentBlock::Text {
                 text: s.to_string(),
             }],
+        }
+    }
+
+    fn assistant_with_thinking(thinking: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: thinking.to_string(),
+                    signature: String::new(),
+                    reasoning_details: None,
+                },
+                ContentBlock::Text {
+                    text: "改完了".to_string(),
+                },
+            ],
+        }
+    }
+
+    /// 推理内容必须进摘要文本：压缩后它是模型续跑唯一的语言/推理锚点，
+    /// 丢弃会让后续轮次重新起跑。
+    #[test]
+    fn thinking_reaches_compaction_text() {
+        let msgs = vec![assistant_with_thinking("先确认 grep.rs 的后端选择")];
+        let text = messages_to_text(&msgs);
+        assert!(
+            text.contains("先确认 grep.rs 的后端选择"),
+            "thinking 未进入摘要文本: {text}"
+        );
+        assert!(text.contains("改完了"), "普通文本不能被挤掉: {text}");
+    }
+
+    /// 长 reasoning 截断到 400 字符，避免单轮思考把摘要撑爆。
+    #[test]
+    fn long_thinking_is_truncated_in_compaction_text() {
+        let long = "思".repeat(2000);
+        let text = messages_to_text(&[assistant_with_thinking(&long)]);
+        assert!(text.contains('…'), "超长 thinking 应被截断: {text}");
+        assert!(text.chars().count() < 2000, "截断未生效");
+    }
+
+    /// 空 thinking 与 redacted 块只留占位，不产生空段。
+    #[test]
+    fn empty_and_redacted_thinking_produce_placeholder_only() {
+        let msgs = [
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: String::new(),
+                    reasoning_details: None,
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::RedactedThinking {
+                    data: "encrypted".to_string(),
+                }],
+            },
+        ];
+        for msg in &msgs {
+            assert_eq!(
+                messages_to_text(std::slice::from_ref(msg)),
+                "[助手]: [思考]",
+                "空/加密 thinking 应只剩占位"
+            );
         }
     }
 

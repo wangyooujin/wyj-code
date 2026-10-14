@@ -118,7 +118,7 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct ApiMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +127,15 @@ struct ApiMessage {
     tool_calls: Option<Vec<ApiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// DeepSeek / Qwen / GLM 等在多轮工具调用场景要求把上一轮的
+    /// `reasoning_content` 拼回 assistant 消息，否则推理链断裂、续轮被拒。
+    /// 仅在 `ThinkingResponseFields::echo_back_in_messages` 为 true 时序列化
+    /// ——ollama / vllm 等虽然响应里带 reasoning_content，回传却会被拒。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    /// MiniMax 特有的结构化 reasoning 块数组，同样只在 vendor 声明支持时回传。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -221,7 +230,14 @@ struct PendingToolCall {
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
 
-fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessage> {
+/// 内部模型 → API 请求转换。`echo_reasoning` 来自
+/// [`ThinkingSpec::response_fields`]：仅 vendor 声明需要时，才把 assistant 的
+/// 推理内容拼回 `reasoning_content` / `reasoning_details`。
+fn to_api_messages(
+    messages: &[Message],
+    supports_vision: bool,
+    echo_reasoning: bool,
+) -> Vec<ApiMessage> {
     let mut out = vec![];
     for m in messages {
         match m.role {
@@ -261,8 +277,8 @@ fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessag
                             tool_results.push(ApiMessage {
                                 role: "tool".to_string(),
                                 content: Some(Value::String(content_str)),
-                                tool_calls: None,
                                 tool_call_id: Some(tool_use_id.clone()),
+                                ..Default::default()
                             });
                         }
                         _ => {}
@@ -280,22 +296,22 @@ fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessag
                     out.push(ApiMessage {
                         role: "user".to_string(),
                         content: Some(Value::Array(content_parts)),
-                        tool_calls: None,
-                        tool_call_id: None,
+                        ..Default::default()
                     });
                 } else {
                     // 普通文本 user 消息：content 是纯字符串
                     out.push(ApiMessage {
                         role: "user".to_string(),
                         content: Some(Value::String(text_parts.join(""))),
-                        tool_calls: None,
-                        tool_call_id: None,
+                        ..Default::default()
                     });
                 }
             }
             Role::Assistant => {
                 let mut text_parts = vec![];
                 let mut tool_calls = vec![];
+                let mut reasoning_text = String::new();
+                let mut reasoning_details: Vec<Value> = vec![];
                 for block in &m.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
@@ -309,7 +325,27 @@ fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessag
                                 },
                             });
                         }
-                        _ => {}
+                        // 国产 reasoning 模型（DeepSeek / Qwen / GLM / Doubao /
+                        // Moonshot / MiniMax）在多轮工具调用场景要求把推理内容
+                        // 拼回 assistant 消息，缺失会断链或被拒。Anthropic 协议
+                        // 走 thinking 块（本文件不适用），此处按 vendor 声明的
+                        // `echo_back_in_messages` 门控——ollama / vllm 等同样会在
+                        // 响应里带 reasoning_content，但回传反而 400。
+                        ContentBlock::Thinking {
+                            thinking,
+                            reasoning_details: details,
+                            ..
+                        } => {
+                            if echo_reasoning {
+                                reasoning_text.push_str(thinking);
+                                if let Some(items) = details {
+                                    reasoning_details.extend(items.iter().cloned());
+                                }
+                            }
+                        }
+                        // RedactedThinking 是 Anthropic 专属形态，OpenAI 协议无对应字段。
+                        ContentBlock::RedactedThinking { .. } => {}
+                        ContentBlock::Image { .. } | ContentBlock::ToolResult { .. } => {}
                     }
                 }
                 out.push(ApiMessage {
@@ -324,7 +360,17 @@ fn to_api_messages(messages: &[Message], supports_vision: bool) -> Vec<ApiMessag
                     } else {
                         Some(tool_calls)
                     },
-                    tool_call_id: None,
+                    reasoning_content: if echo_reasoning && !reasoning_text.is_empty() {
+                        Some(reasoning_text)
+                    } else {
+                        None
+                    },
+                    reasoning_details: if echo_reasoning && !reasoning_details.is_empty() {
+                        Some(reasoning_details)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
                 });
             }
         }
@@ -452,15 +498,21 @@ fn build_openai_request_body(
     supports_vision: bool,
 ) -> Map<String, Value> {
     let max_tokens = opts.max_tokens;
+    let echo_reasoning = crate::thinking::ThinkingSpec::for_vendor(
+        &identity.vendor,
+        &identity.wire_protocol,
+        &identity.model,
+    )
+    .response_fields
+    .echo_back_in_messages;
     // Chat Completions 没有 system 块 / cache_control 概念，只有一条 system
     // 消息，因此把 stable + volatile 拼成一条即可（`combined` 已处理空段）。
     let mut api_messages = vec![ApiMessage {
         role: "system".to_string(),
         content: Some(Value::String(system.combined())),
-        tool_calls: None,
-        tool_call_id: None,
+        ..Default::default()
     }];
-    api_messages.extend(to_api_messages(messages, supports_vision));
+    api_messages.extend(to_api_messages(messages, supports_vision, echo_reasoning));
 
     // 原生工具（如 Anthropic computer-use）无 description/input_schema，
     // 且 OpenAI Chat Completions 不支持该调用形态：过滤掉。这类工具只在
@@ -861,7 +913,7 @@ mod tests {
             ],
         }];
 
-        let api = to_api_messages(&msgs, true);
+        let api = to_api_messages(&msgs, true, false);
         assert_eq!(api.len(), 1);
         let content = api[0].content.as_ref().expect("user content");
         let parts = content.as_array().expect("content must be an array");
@@ -893,7 +945,7 @@ mod tests {
             ],
         }];
 
-        let api = to_api_messages(&msgs, false);
+        let api = to_api_messages(&msgs, false, false);
         assert_eq!(api.len(), 1);
         let content = api[0].content.as_ref().expect("user content");
         // 纯字符串，内容只包含文本段
@@ -910,9 +962,126 @@ mod tests {
             }],
         }];
 
-        let api = to_api_messages(&msgs, true);
+        let api = to_api_messages(&msgs, true, false);
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].content.as_ref().unwrap().as_str(), Some("hello"));
+    }
+
+    // ── reasoning 回传（echo_back_in_messages 接线） ──
+
+    fn assistant_with_thinking() -> Vec<Message> {
+        vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "先看 grep.rs".to_string(),
+                    signature: String::new(),
+                    reasoning_details: None,
+                },
+                ContentBlock::Text {
+                    text: "done".to_string(),
+                },
+            ],
+        }]
+    }
+
+    /// vendor 声明需要回传时，assistant 消息必须带出 `reasoning_content`，
+    /// 否则国产 reasoning 模型在工具调用续轮里推理链断裂。
+    #[test]
+    fn assistant_echoes_reasoning_content_when_vendor_requires_it() {
+        let api = to_api_messages(&assistant_with_thinking(), true, true);
+        assert_eq!(api.len(), 1);
+        assert_eq!(
+            api[0].reasoning_content.as_deref(),
+            Some("先看 grep.rs"),
+            "echo_reasoning=true 时不得丢弃推理内容"
+        );
+        // 文本与 reasoning 各自独立，不能互相挤掉。
+        assert_eq!(api[0].content.as_ref().unwrap().as_str(), Some("done"));
+    }
+
+    /// 反向不变式：vendor 不声明回传时字段必须整个不出现——多写一个未知字段
+    /// 就可能被第三方端点判 400（这正是 ollama / vllm 的情况）。
+    #[test]
+    fn assistant_omits_reasoning_fields_when_vendor_does_not_require_echo() {
+        let api = to_api_messages(&assistant_with_thinking(), true, false);
+        assert_eq!(api.len(), 1);
+        let json = serde_json::to_value(&api[0]).unwrap();
+        assert!(
+            json.get("reasoning_content").is_none(),
+            "echo_reasoning=false 时 reasoning_content 必须缺省"
+        );
+        assert!(json.get("reasoning_details").is_none());
+    }
+
+    /// MiniMax 的 `reasoning_details` 与 `reasoning_content` 同时回传。
+    #[test]
+    fn assistant_echoes_minimax_reasoning_details() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "推理".to_string(),
+                signature: String::new(),
+                reasoning_details: Some(vec![serde_json::json!({"type": "text", "text": "推理"})]),
+            }],
+        }];
+        let api = to_api_messages(&msgs, true, true);
+        assert_eq!(api[0].reasoning_content.as_deref(), Some("推理"));
+        let details = api[0]
+            .reasoning_details
+            .as_ref()
+            .expect("details must echo");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["type"], "text");
+    }
+
+    /// 空 reasoning 不产生空字符串字段。
+    #[test]
+    fn empty_reasoning_serializes_no_field() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+                reasoning_details: None,
+            }],
+        }];
+        let api = to_api_messages(&msgs, true, true);
+        let json = serde_json::to_value(&api[0]).unwrap();
+        assert!(json.get("reasoning_content").is_none());
+        assert!(json.get("reasoning_details").is_none());
+    }
+
+    /// body 层集成：`echo_back_in_messages` 由 vendor 声明自动推导，
+    /// 调用方不传开关——这里验证 deepseek 会带、ollama 不会。
+    #[test]
+    fn body_echoes_reasoning_for_deepseek_but_not_ollama() {
+        let system = crate::provider::SystemPrompt {
+            stable: "s",
+            volatile: "",
+        };
+        let opts = crate::provider::RequestOptions {
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        for (vendor, expect_echo) in [("deepseek", true), ("ollama", false)] {
+            let body = build_openai_request_body(
+                &identity_for(vendor, "some-model"),
+                &system,
+                &assistant_with_thinking(),
+                &[],
+                &opts,
+                false,
+                true,
+            );
+            let msgs = body["messages"].as_array().unwrap();
+            let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+            assert_eq!(
+                assistant.get("reasoning_content").is_some(),
+                expect_echo,
+                "vendor={vendor} 的 reasoning 回传判定不符预期"
+            );
+        }
     }
 
     // ── build_openai_request_body 与 thinking adapter 的集成单测 ──
