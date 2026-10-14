@@ -252,7 +252,7 @@ fn base_capabilities(
     }
 }
 
-/// reference 端点允许的并行工具数，与 v1.5 之前的硬编码值一致。
+/// reference 端点允许的并行工具数，与 v0.2.9 之前的硬编码值一致。
 pub const DEFAULT_PARALLEL_MAX_TOOLS: usize = 8;
 
 /// `parallel_tool_calls` / `max_tools_per_turn` / `RequiresSingleTool` quirk

@@ -6,7 +6,7 @@
 //!
 //! **不再读取任何原生 Claude Code / Codex 等外部源**：wyj-code 只读写
 //! `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级），其它路径一律不
-//! 触碰。`load_native_mcp` / `native_mcp_names` 等历史兼容工具已于 v1.5.15 删除。
+//! 触碰。`load_native_mcp` / `native_mcp_names` 等历史兼容工具已于 v0.2.24 删除。
 
 use crate::{Config, McpServerConfig};
 use anyhow::{Context, Result};

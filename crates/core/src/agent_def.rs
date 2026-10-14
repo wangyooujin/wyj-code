@@ -4,7 +4,7 @@
 //! `~/.wyj-code/agents/*.md` → 已启用插件贡献路径（先到先得）→ 项目
 //! `<git-root>/.wyj-code/agents/*.md`，同名后者覆盖前者。
 //! **不读取 `~/.claude/agents/` 或 `<cwd>/.claude/agents/` 等任何外部源**
-//! （v1.5.15 起移除；本段文档此前仍描述旧的四层链，是一处过时记录）。
+//! （v0.2.24 起移除；本段文档此前仍描述旧的四层链，是一处过时记录）。
 //! frontmatter 支持 name/description/tools/model 四个字段，未识别字段静默忽略；
 //! `model` 引用 `~/.wyj-code/config.toml` 中的 Profile 名（而非模型 ID）。
 
@@ -102,7 +102,7 @@ fn upsert_overwrite(defs: &mut Vec<AgentDefinition>, def: AgentDefinition) {
     }
 }
 
-/// 加载全部 agent 定义，**四层合并链**（v1.5.15 起由 6 层简化）：内置 → 全局
+/// 加载全部 agent 定义，**四层合并链**（v0.2.24 起由 6 层简化）：内置 → 全局
 /// `~/.wyj-code/agents` → 已启用插件贡献路径（按安装顺序，先到先得，跳过并警
 /// 告同名冲突）→ 项目 `<git-root>/.wyj-code/agents`（最高优先级，覆盖一切，包
 /// 括插件）。
@@ -387,13 +387,13 @@ mod tests {
 
     #[test]
     fn project_wyj_agents_override_global_wyj_agents() {
-        // v1.5.15 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
+        // v0.2.24 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
         // `<cwd>/.claude/agents` 不再被读取。本测试原本要在 `home/.wyj-code/agents`
         // 与 `<git-root>/.wyj-code/agents` 之间验证"项目级覆盖全局级"，
         // 但全局目录 fixture 会污染真实 `~/.wyj-code/agents/`（home_dir 不可
         // 在单测里 mock）。作用域优先级（全局 < 项目）的合并语义与 Skill 链
         // 完全等价，已被 `custom_overrides_builtin_by_name`（builtin 覆盖）与
         // `project_dir_still_overrides_plugin_contribution`（项目级覆盖插件）
-        // 两处覆盖；本测试保留为占位以记录这条边界已由 v1.5.15 简化移除。
+        // 两处覆盖；本测试保留为占位以记录这条边界已由 v0.2.24 简化移除。
     }
 }

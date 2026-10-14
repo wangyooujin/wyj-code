@@ -1301,7 +1301,7 @@ async fn main() -> Result<()> {
         cfg.storage.cas_max_blob_bytes,
     )
     .map(std::sync::Arc::new);
-    // v1.5.17：CAS 启动期容量回收。`gc` 只回收 `ref_count == 0` 的 blob，
+    // v0.2.26：CAS 启动期容量回收。`gc` 只回收 `ref_count == 0` 的 blob，
     // 而 ref_count 靠"会话结束时逐个 release"归零 —— 两个机制缺一，pool 就是
     // 无界增长。此前 `cas_total_bytes` / `cas_gc_on_start` 因"无消费点"被删，
     // 现在 `core::context_edit` 让它们有了真实消费点。
@@ -1847,6 +1847,9 @@ async fn main() -> Result<()> {
         workspace_cas.clone(),
         context_edit_totals.clone(),
     ));
+    // 编辑后自动校验：项目在 `.wyj-code/settings.json` 里声明了 `verify.command`
+    // 才生效，没声明则这里挂 None —— 一次子进程都不跑，对零配置项目零成本。
+    agent = agent.with_verify(wyj_core::verify::load_verify_cfg(&cwd));
 
     for def in registry.definitions() {
         let name = def.name.clone();
@@ -2026,7 +2029,7 @@ async fn main() -> Result<()> {
     // Agent，不注入的话 `{skills}` 占位会残留、模型重新变回"我不知道有哪些
     // skill"。
     //
-    // **在闭包内重算**而不是捕获主 Agent 那一份 `skill_entries`（v1.5.19 修正）：
+    // **在闭包内重算**而不是捕获主 Agent 那一份 `skill_entries`（v0.2.28 修正）：
     // 捕获的是不可变快照，`/skills` 面板 enable/disable、项目级 skill 信任批准
     // 之后重建都刷不到新名单——会出现"斜杠能敲、模型永远不知道"的不一致。
     let skill_home_for_rebuild = skill_home.clone();
@@ -2083,6 +2086,9 @@ async fn main() -> Result<()> {
             workspace_cas_for_rebuild.clone(),
             context_edit_totals_for_rebuild.clone(),
         ));
+        // `/model` 热切换会重建 Agent，漏掉这里会让「项目声明了 verify 但切个
+        // 模型就没了校验」——而且只在切换之后才犯，最难复现。
+        new_agent = new_agent.with_verify(wyj_core::verify::load_verify_cfg(&cwd_for_rebuild));
         if let Some(mem) = &memory_store_for_rebuild {
             new_agent = new_agent.with_memory(mem.clone());
         }
@@ -2108,7 +2114,7 @@ async fn main() -> Result<()> {
             code_index_for_rebuild.clone(),
         )));
         // 与初始 registry 同一道门控：`/model` 热切换与设置面板保存都走这里，
-        // 漏掉会让用户关了开关却仍然看得见工具（v1.5.13 Jev 事故同款）。
+        // 漏掉会让用户关了开关却仍然看得见工具（v0.2.22 Jev 事故同款）。
         if cfg.tools.todo_enabled {
             reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
         }
@@ -2493,7 +2499,7 @@ fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config
     false
 }
 
-/// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v1.4，见
+/// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v0.2.5，见
 /// `tools::window_capture::WindowCaptureTool` 文档），注册门槛与
 /// `register_computer_tool_if_enabled` 完全一致（同样需要把截图作为 image
 /// block 塞进 tool_result，因此同样要求 vision + Anthropic provider）。
@@ -2512,7 +2518,7 @@ fn register_window_capture_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Co
 fn register_window_capture_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) {}
 
 /// macOS 后台优先 computer-use：按稳定窗口目标截图，用 Accessibility/目标 PID
-/// 事件执行，不移动全局光标、不激活应用。Windows 在 v1.4 先保持安全边界，
+/// 事件执行，不移动全局光标、不激活应用。Windows 在 v0.2.5 先保持安全边界，
 /// 只提供稳定窗口截图和默认关闭的前台兼容工具。
 #[cfg(target_os = "macos")]
 fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) {
@@ -3168,6 +3174,7 @@ async fn repl(
             cache_read_tokens: session.total_cache_read_tokens,
             cache_write_tokens: session.total_cache_write_tokens,
             api_calls: session.api_calls,
+            last_latency: session.latency,
             prompt_cache_state: session.prompt_cache_state,
             // 取当前 Profile 真实的窗口，而不是写死 200K —— 否则非 200K
             // 模型下 /context 的占用百分比会算错。

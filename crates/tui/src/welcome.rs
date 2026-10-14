@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn render_welcome_version_line_does_not_overflow_narrow_width() {
-        // 窄终端（比 "v1.5.16" 还窄）下应截断为省略号，不溢出右边界。
+        // 窄终端（比 "v0.2.25" 还窄）下应截断为省略号，不溢出右边界。
         // 下限取 INFO_INDENT 宽度：缩进本身占 2 列，比它更窄时整页所有行
         // 都已溢出（既有行为，不归版本行管）。
         for width in [INFO_INDENT.len(), 4, 8] {

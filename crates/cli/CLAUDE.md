@@ -64,4 +64,4 @@ ProfileDialog 浮层在事件循环里拦截所有用户输入,`agent.run_turn` 
 - `profile.error.api_key_required` —— 引导提交校验
 ## 本地 Review 与 CI
 
-12. **本地 Review 与 CI**（v1.5.0，`cli::review_cmd` + `.github/workflows/review.yml`）：对 commit/PR diff 生成可审计 JSON，解析 rename、带空格路径和 binary numstat，对 secret evidence 脱敏；Release workflow 同时执行 workspace tests 与 `clippy --all-targets -D warnings`。
+12. **本地 Review 与 CI**（v0.2.9，`cli::review_cmd` + `.github/workflows/review.yml`）：对 commit/PR diff 生成可审计 JSON，解析 rename、带空格路径和 binary numstat，对 secret evidence 脱敏；Release workflow 同时执行 workspace tests 与 `clippy --all-targets -D warnings`。

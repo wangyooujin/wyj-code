@@ -111,8 +111,15 @@ impl Tool for McpBridgeTool {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => return Err(anyhow::anyhow!("MCP 工具调用失败: {e}")),
             Err(_) => {
+                // 超时是**状态不明**，不是「调用失败」：我们这边的 future 被
+                // 丢弃了，remote server 那边可能正在正常执行，也可能早就跑完
+                // 只是响应没回来。对只读工具重试无害，对会写东西的 MCP 工具
+                // 重试就是把一次操作变成两次。把这两种可能明确告诉模型，让它
+                // 先探查结果再决定要不要重发，而不是看到 error 就条件反射重试。
                 return Err(anyhow::anyhow!(
-                    "MCP 工具调用超时（{}s 无响应）: {}",
+                    "MCP 工具调用超时（{}s 无响应）: {}。\
+                     注意：超时只代表我们没收到响应，远端可能仍在执行或已经执行完毕，\
+                     状态不明——如果该工具有副作用，先探查它是否已经生效，再决定是否重发。",
                     timeout.as_secs(),
                     self.remote_tool_name
                 ));

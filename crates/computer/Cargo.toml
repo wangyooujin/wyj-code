@@ -16,7 +16,7 @@ libc.workspace = true
 
 # 截图 + 输入合成：这两个 crate 自身已按平台内部分派 macOS/Windows 实现，
 # 因此本 crate 无需再手写一套 platform #[cfg] 后端——只需把整体依赖和
-# 编译目标限定在 macOS/Windows（Linux 首版不支持，见 doc/plan/v1.3.0-plan.md）。
+# 编译目标限定在 macOS/Windows（Linux 首版不支持，见 doc/plan/v0.2.1-plan.md）。
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 xcap = "0.9"
 enigo = "0.6"

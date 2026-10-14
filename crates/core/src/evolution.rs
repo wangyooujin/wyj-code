@@ -168,7 +168,7 @@ pub struct RepositoryCitation {
     pub display_line: Option<u32>,
 }
 
-/// v1.5.5 收敛：普通 Memory 数据层已迁出 `MemoryV3Store`。Evolution 里
+/// v0.2.14 收敛：普通 Memory 数据层已迁出 `MemoryV3Store`。Evolution 里
 /// `EvolutionMemory` 仅保留为兼容 stub：构造该类型用于类型签名兼容，
 /// 但所有字段都为空壳——不应再被实例化或序列化进入活跃索引。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,7 +197,7 @@ pub struct EvolutionMemory {
     pub supersedes: Vec<String>,
 }
 
-/// 供 `list_memories` 兼容桩使用的最小化返回类型。v1.5.5 后 Evolution 不再
+/// 供 `list_memories` 兼容桩使用的最小化返回类型。v0.2.14 后 Evolution 不再
 /// 持有普通 Memory 索引；TUI/CLI 调用站点若读到 `Vec<EvolutionMemoryStub>`，
 /// 应当作空列表处理，让用户改用 `/memory` 面板（v3）做事实/状态管理。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -407,7 +407,7 @@ struct AnalysisItem {
     skill_steps: Vec<String>,
 }
 
-/// v1.5.5 收敛：Evolution 不再生成普通 Memory，只剩治理（Rule/Skill
+/// v0.2.14 收敛：Evolution 不再生成普通 Memory，只剩治理（Rule/Skill
 /// candidate + Episode 健康度）。`MemoryAndGovernance` 保留为别名，
 /// 等价 `GovernanceOnly`，让旧代码/测试引用继续编译。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,7 +434,7 @@ pub struct EvolutionStore {
 impl EvolutionStore {
     pub fn new(base_dir: &Path, cwd: &Path, cfg: EvolutionCfg) -> Result<Self> {
         let repository_root = project_root(cwd);
-        // v1.5.5 收敛：Evolution 不再维护 legacy memory dir（普通 Memory 已
+        // v0.2.14 收敛：Evolution 不再维护 legacy memory dir（普通 Memory 已
         // 完全迁出 v3）。保留字段避免破坏外部 `EvolutionStore.directory()`
         // 等 API；实际读取时永远为空。
         let legacy_dir = base_dir.join("memory").join(project_id(&repository_root));
@@ -640,7 +640,7 @@ impl EvolutionStore {
     }
 
     pub fn schedule_analysis(&self, episode: Episode, provider: Arc<dyn Provider>) {
-        // v1.5.5 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill
+        // v0.2.14 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill
         // 治理分析。该入口保留名称（外部 CLI/TUI 仍可能调用）并直接转发
         // 到 GovernanceOnly 调度。
         self.schedule_analysis_with_mode(episode, provider, EvolutionAnalysisMode::GovernanceOnly);
@@ -709,7 +709,7 @@ impl EvolutionStore {
     }
 
     /// 在下一次正常 Agent 回合到来时，重新处理由显式反馈或手动纳入触发的旧
-    /// Episode。v1.5.5 后只剩 Rule/Skill 治理分析。
+    /// Episode。v0.2.14 后只剩 Rule/Skill 治理分析。
     pub fn schedule_pending_analysis(&self, provider: Arc<dyn Provider>) {
         self.schedule_pending_analysis_with_mode(provider, EvolutionAnalysisMode::GovernanceOnly);
     }
@@ -786,7 +786,7 @@ impl EvolutionStore {
         Ok(episodes)
     }
 
-    /// v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；`/evolve` 面板只剩
+    /// v0.2.14 收敛：普通 Memory 数据层已迁出 Evolution；`/evolve` 面板只剩
     /// Active / Candidates / Episodes / Health。`list_memories` 保留为返回
     /// 空 Vec 的兼容桩，避免外部 TUI/CLI 调用站点批量报错。
     pub fn list_memories(&self) -> Result<Vec<EvolutionMemory>> {
@@ -1129,7 +1129,7 @@ impl EvolutionStore {
     }
 
     pub fn migrate_legacy(&self) -> Result<MigrationPreview> {
-        // v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；migrate_legacy
+        // v0.2.14 收敛：普通 Memory 数据层已迁出 Evolution；migrate_legacy
         // 不再灌库，仅返回 preview 让调用方知道"已迁出，无可迁数据"。
         self.migration_preview()
     }
@@ -1165,7 +1165,7 @@ impl EvolutionStore {
             return Ok(0);
         }
         let prompt = evolution_analysis_prompt(episode, mode);
-        let _ = mode; // v1.5.5 后模式只剩 GovernanceOnly
+        let _ = mode; // v0.2.14 后模式只剩 GovernanceOnly
         let system = "You identify approval-gated Rule and Skill candidates from coding-agent Episodes. Return only JSON objects, one per line. Never emit ordinary memories, repository facts, or user preferences.";
         let result = provider
             .complete(
@@ -1203,7 +1203,7 @@ impl EvolutionStore {
         item: AnalysisItem,
         mode: EvolutionAnalysisMode,
     ) -> Result<()> {
-        // v1.5.5 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill 治理。
+        // v0.2.14 收敛：Evolution 不再生成普通 Memory；只剩 Rule/Skill 治理。
         // 模式只剩 GovernanceOnly，旧 MemoryAndGovernance 分支全部删除。
         debug_assert_eq!(mode, EvolutionAnalysisMode::GovernanceOnly);
         self.upsert_governance_analysis_item(episode, item)
@@ -1378,7 +1378,7 @@ impl EvolutionStore {
     }
 
     fn load_context(&self, _goal: &str) -> String {
-        // v1.5.5 收敛：普通 Memory 数据层已迁出 Evolution；上下文注入
+        // v0.2.14 收敛：普通 Memory 数据层已迁出 Evolution；上下文注入
         // 由 v3 Memory 的 project_brief + 续接分支接管。Evolution 只剩
         // Rule/Skill candidate 治理，本函数不再生成任何 Memory 上下文。
         let _ = self.list_candidates();
@@ -1386,7 +1386,7 @@ impl EvolutionStore {
     }
 
     fn build_citation(&self, _value: &str) -> Result<RepositoryCitation> {
-        // v1.5.5：普通 Memory 数据层已迁出；build_citation 失去业务意义。
+        // v0.2.14：普通 Memory 数据层已迁出；build_citation 失去业务意义。
         // 保留为 no-op 让旧调用站点（已被 noop 化的 upsert_governance 分支）
         // 不破坏编译。
         Ok(RepositoryCitation {
@@ -1542,7 +1542,7 @@ impl EvolutionStore {
             .retain(|candidate| matches!(candidate.status, CandidateStatus::Active));
         write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
 
-        // v1.5.5：普通 Memory 数据层已迁出 Evolution；这里不再清洗
+        // v0.2.14：普通 Memory 数据层已迁出 Evolution；这里不再清洗
         // memories/index.json（不存在也不该存在）。容量清理仍按 max_project_
         // store_bytes 触发。
 
@@ -2463,7 +2463,7 @@ mod tests {
         assert!(store.list_candidates().unwrap().is_empty());
     }
 
-    // v1.5.5 收敛后删除：旧的 `legacy_analysis_mode_still_writes_memory_v2_when_v3_is_absent`
+    // v0.2.14 收敛后删除：旧的 `legacy_analysis_mode_still_writes_memory_v2_when_v3_is_absent`
     // 验证 `MemoryAndGovernance` 模式下普通 Memory 仍能写入；该模式已废除，
     // 普通 Memory 由 v3 MemoryV3Store 接管。
 
@@ -2566,7 +2566,7 @@ mod tests {
         assert_eq!(feedback.feedback.len(), 1);
     }
 
-    // v1.5.5 收敛后删除：`context_snapshot_is_relevance_filtered_and_byte_bounded`
+    // v0.2.14 收敛后删除：`context_snapshot_is_relevance_filtered_and_byte_bounded`
     // 依赖旧 Memory 索引生成 relevance-filtered 上下文；普通 Memory 数据层
     // 已迁出 Evolution，`context_snapshot` 现在只剩 Rule/Skill 治理摘要。
 
@@ -2634,11 +2634,11 @@ mod tests {
         assert_eq!(eval.distinct_sessions, 1);
     }
 
-    // v1.5.5 收敛后删除：`capacity_cleanup_preserves_active_and_pinned_memories`
+    // v0.2.14 收敛后删除：`capacity_cleanup_preserves_active_and_pinned_memories`
     // 验证旧 memories/index.json 的 active/pinned 保留；普通 Memory 数据层
     // 已迁出 Evolution，容量清理不再触碰该索引。
 
-    // v1.5.5 收敛后删除：`legacy_migration_is_previewed_and_backed_up`
+    // v0.2.14 收敛后删除：`legacy_migration_is_previewed_and_backed_up`
     // 验证旧 legacy markdown 自动灌入 v2 MemoryIndex；该路径已废除，新库
     // 不再做任何隐式迁移。
 

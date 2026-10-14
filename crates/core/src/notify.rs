@@ -1,4 +1,4 @@
-//! 统一通知通道（v1.5.14+）
+//! 统一通知通道（v0.2.23+）
 //!
 //! 覆盖 4 类事件源（TUI/CLI 回合完成 / 错误、后台子 Agent 完成、定时任务失败），
 //! 通过 [`BellSink`]（stderr `\x07`）和 [`DesktopSink`]（macOS `osascript` / Linux
@@ -47,7 +47,7 @@ static DISPATCHER: Mutex<Option<NotifyDispatcher>> = Mutex::new(None);
 //
 // cfg 类型（`NotifyCfg` / `NotifyBellCfg` / `NotifyDesktopCfg` / `NotifyEventsCfg`）
 // 定义在 `wyj_config` crate；本文件通过 `pub use` re-export 保持向后兼容。
-// 字段语义见 CLAUDE.md `[notify]` 段 + CHANGELOG v1.5.14 条目。
+// 字段语义见 CLAUDE.md `[notify]` 段 + CHANGELOG v0.2.23 条目。
 
 // ── 事件类型 ───────────────────────────────────────────────────────────────
 

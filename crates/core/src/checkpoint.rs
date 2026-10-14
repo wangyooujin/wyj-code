@@ -24,6 +24,14 @@ pub enum CheckpointKind {
     PostTool,
     PlanApproval,
     Manual,
+    /// 触顶推理轮数上限、被迫中止**之前**自动落的工作点存档。
+    ///
+    /// 它和 [`CheckpointKind::AutoUser`] 的分工是：AutoUser 存的是「这次用户
+    /// 提交**开始前**」的状态，所以 `/rewind` 回 AutoUser 等于把这一轮几十次
+    /// 工具调用全部推倒重来——对 reasoning 模型（上限仅 32 轮）来说这可能就是一
+    /// 个半小时的工作。而本变体存的是「撞上限的那一刻已经做成什么样」，让用户
+    /// 能 `/rewind` 回到最后一步继续，而不是回到起点。
+    TurnLimit,
     PreRewind,
 }
 
@@ -1378,14 +1386,14 @@ mod tests {
         assert_eq!(entry.size, 5);
     }
 
-    /// M1 兼容验证:老 v1.5.10 checkpoint JSON(含顶层 `bytes: Vec<u8>` 字段)
+    /// M1 兼容验证:老 v0.2.19 checkpoint JSON(含顶层 `bytes: Vec<u8>` 字段)
     /// 仍能加载,且 `inline_bytes` 字段被填充。
     #[test]
     fn load_legacy_v1_checkpoint_with_bytes_field() {
         let sessions = tempfile::tempdir().unwrap();
         let dir = sessions.path().join("legacy-sess.checkpoints");
         std::fs::create_dir_all(&dir).unwrap();
-        // 手工写一份 v1.5.10 格式的 checkpoint(顶层 FileEntry.bytes)
+        // 手工写一份 v0.2.19 格式的 checkpoint(顶层 FileEntry.bytes)
         let legacy_json = r#"{
             "version": 1,
             "id": "legacy-cp",

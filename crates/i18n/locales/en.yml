@@ -278,6 +278,8 @@ context:
   reclaimable: "Reclaimable older tool results: {tokens} tokens (full text of the last {kept} tool calls is kept)"
   edited: "Externalized {count} stale tool results · freed about {saved} tokens (use ContextRecall with the hash to get the original back)"
   compacted: "Auto-compacted {times} time(s) in this session"
+  latency: "Last request · first token {ttft} · generation {total} (retry time excluded)"
+  latency_retry: "The request above was retried; {spent} was spent on the retry/backoff, not on inference"
 
 cost:
   desc: "Show token usage and cost estimate for this session"

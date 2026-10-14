@@ -1,6 +1,6 @@
 //! `wyj-code usage` —— 跨会话 token 消耗汇总。
 //!
-//! 为什么需要它：v1.5.19 之前 token 计量只存在于 `/cost` 的单会话视图里，且
+//! 为什么需要它：v0.2.28 之前 token 计量只存在于 `/cost` 的单会话视图里，且
 //! `cache_read_tokens` / `api_calls` 根本不落盘（`/resume` 后归零）。于是
 //! 「这个月一共烧了多少 token、每次模型调用平均带多少上下文」这类问题在
 //! 磁盘上无解。本命令直接扫 `~/.wyj-code/sessions/*.json` 做聚合，
@@ -36,7 +36,7 @@ pub struct UsageTotals {
     /// 只累计 `api_calls > 0` 的会话的 input / output。
     ///
     /// **为什么需要单独一份**：`input_per_api_call` 这类「每次调用平均 X」必须
-    /// 分子分母来自同一批会话。v1.5.19 之前的 129 个会话有 token 却没有 calls，
+    /// 分子分母来自同一批会话。v0.2.28 之前的 129 个会话有 token 却没有 calls，
     /// 把它们的 token 计入分子、calls 不进分母，会让比率被**系统性高估**——
     /// 本机实测 5.0×（input）与 3.3×（output），足以把「未缓存 input 只有 3.2k」
     /// 误读成「1.6 万」，进而得出「缓存完全失效」的相反结论。
@@ -300,7 +300,7 @@ fn print_human(report: &UsageReport) {
     );
 
     if report.sessions_without_api_calls > 0 {
-        // 必须提示：这些会话的 `api_calls` 是 0（v1.5.19 之前未落盘），
+        // 必须提示：这些会话的 `api_calls` 是 0（v0.2.28 之前未落盘），
         // per-call 比率的样本是**有偏的**，且随时间推移越晚的会话越可信。
         println!(
             "{}",
@@ -469,7 +469,7 @@ mod tests {
         assert_eq!(r.by_project.len(), 1);
     }
 
-    /// v1.5.19 之前落盘的会话没有 `api_calls`。per-call 必须给 None 而不是
+    /// v0.2.28 之前落盘的会话没有 `api_calls`。per-call 必须给 None 而不是
     /// 除零/0，否则历史数据会被读成「每次调用零消耗」。
     #[test]
     fn legacy_sessions_without_api_calls_report_none_not_zero() {
@@ -499,7 +499,7 @@ mod tests {
             "new",
             session_json("2026-10-02T00:00:00Z", "/p", 300, 60, 2),
         );
-        // legacy 会话：token 齐全，api_calls 缺失（v1.5.19 之前落盘）
+        // legacy 会话：token 齐全，api_calls 缺失（v0.2.28 之前落盘）
         fx.write(
             "old1",
             session_json("2026-09-01T00:00:00Z", "/p", 100_000, 20_000, 0),

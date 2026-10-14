@@ -1,6 +1,6 @@
 //! 前端无关的 workspace、workflow、daemon/ACP 与代码索引契约。
 //!
-//! schema version 2 在 v1.5.0 把原先只冻结的 P2 接口扩展为可执行 runtime：
+//! schema version 2 在 v0.2.9 把原先只冻结的 P2 接口扩展为可执行 runtime：
 //! worktree 支持 review/选择性接受，workflow 节点有稳定状态，session 控制覆盖
 //! workflow 与关闭语义。新增字段继续使用 serde 默认值保持旧数据可读取。
 

@@ -824,7 +824,7 @@ mod tests {
         assert!(is_user_turn_boundary(&messages[keep_from]));
     }
 
-    /// v1.5.12 修「366K text input 撞穿 262K 上下文」:首次估算就已在
+    /// v0.2.21 修「366K text input 撞穿 262K 上下文」:首次估算就已在
     /// 阈值内时,`compact_session_until_fit` 应跑 0 轮 compact 直接返回,
     /// 不白白消耗 LLM round-trip 预算。
     #[tokio::test]
@@ -849,7 +849,7 @@ mod tests {
 
     /// 兜底回归:即便 compact 第一次没把消息压回阈值(heuristic 偏低 /
     /// 摘要本身偏长),`compact_session_until_fit` 必须继续重试而不是
-    /// 裸发——这是 v1.5.10 之前『单次 compact 不够就 400 撞穿』的根因。
+    /// 裸发——这是 v0.2.19 之前『单次 compact 不够就 400 撞穿』的根因。
     #[tokio::test]
     async fn compact_session_until_fit_loops_until_under_threshold() {
         let mut session = Session::new();
@@ -875,7 +875,7 @@ mod tests {
             threshold,
         )
         .await;
-        // 必须循环过 compact——v1.5.10 之前『0 轮就裸发』的回归根因。
+        // 必须循环过 compact——v0.2.19 之前『0 轮就裸发』的回归根因。
         assert!(outcome.passes >= 1, "必须循环重试,不能裸发");
         assert!(outcome.passes <= 3);
         // 收敛目标:要嘛 final_estimated 落入阈值,要嘛 caller 拿到的是
@@ -971,7 +971,7 @@ mod tests {
     }
 
     /// 回归:estimate_text_tokens 对代码/JSON (BPE 2.5-3 chars/token) 不再
-    /// 用 0.25 (4 chars/token) 偏低——这是 v1.5.12 之前 heuristic 让
+    /// 用 0.25 (4 chars/token) 偏低——这是 v0.2.21 之前 heuristic 让
     /// compact 触发过晚、最终撞穿 262K 上限的隐藏根因之一。
     /// 这里用 ASCII 长字符串(代表代码 / 路径 / JSON 文本)验证估算比例。
     #[test]

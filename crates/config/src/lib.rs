@@ -408,7 +408,7 @@ impl Default for SubAgentCfg {
 
 /// 旧版全局 `computer` 工具需要占用前台鼠标/键盘时的回退策略。
 ///
-/// v1.4 起后台 `app_computer` 是默认路径；前台接管必须显式配置，不能在
+/// v0.2.5 起后台 `app_computer` 是默认路径；前台接管必须显式配置，不能在
 /// 后台动作不支持时悄悄降级，否则仍会和人类用户争夺焦点与输入设备。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -465,8 +465,8 @@ impl Default for ModelRuntimeCfg {
 /// 清理得动就**不**去跑整段摘要。对齐 Claude Code 的 "It clears older tool
 /// outputs first, then summarizes the conversation if needed."
 ///
-/// 全部字段 opt-out：`enabled = false` 完全退回 v1.5.16 的行为（只压缩、只统计
-/// 可回收量、不真删）。详见 `doc/plan/v1.5.17-context-management-plan.md`。
+/// 全部字段 opt-out：`enabled = false` 完全退回 v0.2.25 的行为（只压缩、只统计
+/// 可回收量、不真删）。详见 `doc/plan/v0.2.26-context-management-plan.md`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextEditCfg {
@@ -513,29 +513,41 @@ impl Default for ContextEditCfg {
 ///
 /// 未注册的工具不产生 schema，模型目录里根本看不到它，因此这里的开关等价于
 /// "该工具是否存在"，而不是运行期的软禁用。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsCfg {
     /// 是否注册 `TodoWrite` 任务列表工具。
     ///
-    /// **默认关闭**，对齐 Claude Code v2.1.233 与 OpenAI Codex CLI v0.152.0 ——
-    /// 两家头部厂商都已把 todo 脚手架从默认开启改为默认关闭，官方口径是「新模型
-    /// 不需要书面任务列表也能自行跟踪多步工作」。
+    /// **默认开启**（v0.3.1 起由关闭改为开启）。这里保留一段反向实测，
+    /// 因为它是"为什么曾经关闭"的唯一记录，也是本开关存在的理由：
     ///
-    /// 本地实测（102 个历史会话）支持这个默认值：
-    /// - 27 个会话用到 TodoWrite，共 132 次调用，其中 **132 次（100%）独占一个完整
-    ///   LLM 往返**，没有一次与真实工作工具同轮发出；回给模型的 `tool_result`
-    ///   （"任务列表已更新: N 项…"）信息量为零——模型自己刚写的，它自己知道。
-    /// - **59% 的会话结束时 todo 未收尾**，与 arXiv:2604.12147（21,120 条 SWE-agent
-    ///   轨迹）的结论一致：与模型内部工作流不对齐的计划会拖后腿，"a subpar plan
-    ///   hurts performance even more than no plan at all"。
+    /// - 曾对齐 Claude Code v2.1.233 / Codex CLI v0.152.0 的默认关闭口径
+    ///   （"新模型不需要书面任务列表也能自行跟踪多步工作"）。
+    /// - 本地 102 个历史会话实测支持那个口径：27 个会话用到 TodoWrite、共 132
+    ///   次调用，其中 **132 次（100%）独占一个完整 LLM 往返**，没有一次与真实
+    ///   工作工具同轮发出；**59% 的会话结束时 todo 未收尾**，与 arXiv:2604.12147
+    ///   的结论一致——"a subpar plan hurts performance even more than no plan at
+    ///   all"。
     ///
-    /// 但保留开关而非彻底删除：arXiv:2609.20804 的消融显示 planning 对**弱模型**
-    /// 是 +11.6pp 的防过早放弃脚手架（把"无 edit 就终止"从 68.6% 压到 27.8%），
-    /// 对强模型才是"省 ~30% 成本、准确率不升反微降"。wyj-code 同时接 anthropic /
-    /// openai / MiniMax / GLM / Kimi 等多个 provider，模型能力跨度大，自托管或小
-    /// 模型场景下这个脚手架仍有价值，故交由用户按模型能力自行开启。
+    /// 那么为什么还是改成了默认开启：上面那份实测只覆盖了**强模型的短任务**，
+    /// 它的结论形态是"对强模型是净成本"。而本项目要扛的复杂任务形态恰恰是
+    /// 另一个区间——跨十几个文件、几十轮工具调用、中途还会被自动压缩打断的长
+    /// 任务。那种任务里模型**没有外部状态锚点**：压缩一发生，它不知道自己走过
+    /// 哪条路，实测退化路径是重新 grep 刚 grep 过的目录、重新 read 刚读过的
+    /// 文件，把刚省下的上下文又吃回去。TodoWrite 是目前唯一一条能穿透压缩的
+    /// 显式进度载体——它每轮被重放进上下文，压缩后仍在。
+    ///
+    /// 代价是确定的：**每个用了 TodoWrite 的会话多花约 1 个 LLM 往返**
+    /// （132/27 ≈ 4.9 次调用，但按会话折算首次那一次不可省）。所以开关保留：
+    /// 简单任务为主、或用强模型跑短任务的场景，`todo_enabled = false` 仍然
+    /// 更划算。
     pub todo_enabled: bool,
+}
+
+impl Default for ToolsCfg {
+    fn default() -> Self {
+        Self { todo_enabled: true }
+    }
 }
 
 /// `crates/sandbox/` 已删除，下方所有 `Sandbox*Cfg` 字段仍保留只为兼容
@@ -747,7 +759,7 @@ pub struct StorageRetentionCfg {
 
     /// CAS blob pool 总量上限(字节,0 = 不做容量回收)。
     ///
-    /// v1.5.17 重新加回：此前它因"无消费点"被删，但 `core::context_edit` 现在
+    /// v0.2.26 重新加回：此前它因"无消费点"被删，但 `core::context_edit` 现在
     /// 会把过期工具输出外部化进 CAS —— `WorkspaceCas::gc` 的**生产调用点**
     /// 就是这里(进程启动时跑一次)。`gc` 只回收 `ref_count == 0` 的 blob，
     /// 所以依赖会话结束时逐个 `release`；两个机制缺一都会让 pool 无界增长。
@@ -785,7 +797,7 @@ impl Default for StorageRetentionCfg {
     }
 }
 
-/// 本地、自包含的 Agent 经验闭环。v1.5.5 收敛后只剩 Rule/Skill 治理；
+/// 本地、自包含的 Agent 经验闭环。v0.2.14 收敛后只剩 Rule/Skill 治理；
 /// 普通 Memory 数据层迁出 Evolution 后 `generate_experiences` /
 /// `auto_activate_memories` 不再有业务含义，已删除（serde 默认忽略旧字段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,7 +882,7 @@ pub struct Config {
     #[serde(default)]
     pub model_runtime: ModelRuntimeCfg,
     /// tool-result context editing（外部化过期工具输出优先于整段摘要）。
-    /// 设为 `enabled = false` 完全退回 v1.5.16 行为。
+    /// 设为 `enabled = false` 完全退回 v0.2.25 行为。
     pub context_edit: ContextEditCfg,
     /// OS sandbox 文件系统、网络和降级策略。
     #[serde(default)]
@@ -899,7 +911,7 @@ pub struct Config {
     /// 全部字段 opt-out,0 = 不截断。
     #[serde(default)]
     pub persist_cap: PersistCapCfg,
-    /// 统一通知通道（v1.5.14+）：覆盖 TUI/CLI 回合完成 / 错误、后台子 Agent
+    /// 统一通知通道（v0.2.23+）：覆盖 TUI/CLI 回合完成 / 错误、后台子 Agent
     /// 完成、定时任务失败四类事件，通过终端响铃（stderr `\x07`）与桌面通知
     /// （macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast）
     /// 提醒用户。详见 `crates/cli/src/notify.rs`。
@@ -907,7 +919,7 @@ pub struct Config {
     pub notify: NotifyCfg,
 }
 
-/// `[notify]` 配置块（v1.5.14+）—— 统一通知通道的横切配置。
+/// `[notify]` 配置块（v0.2.23+）—— 统一通知通道的横切配置。
 ///
 /// 覆盖 TUI/CLI/Schedule 三个子系统共用的 4 类事件（TUI 回合完成/错误、
 /// 后台子 Agent 完成、cron 任务失败），通过 [`NotifyBellCfg`] 与
@@ -1170,7 +1182,7 @@ impl Config {
     /// 加载配置：先读 `~/.wyj-code/config.toml` 文件本体（含旧格式一次性迁移），
     /// 再用环境变量覆盖激活分组的 api_key。
     ///
-    /// 自 v1.5.15 起不再合并 `~/.claude.json` 等外部"原生"MCP 配置——wyj-code
+    /// 自 v0.2.24 起不再合并 `~/.claude.json` 等外部"原生"MCP 配置——wyj-code
     /// 只信任用户写在 `~/.wyj-code/` 与 `<git-root>/.wyj-code/` 下的条目。
     pub fn load() -> Result<Self> {
         let mut cfg = Self::load_file_only()?;
@@ -1208,7 +1220,7 @@ impl Config {
     }
 
     /// 只读 `config.toml` 文件本体（含旧格式一次性迁移），不吃环境变量。当前与
-    /// `Config::load` 行为完全一致（合并 `~/.claude.json` 的逻辑自 v1.5.15 起
+    /// `Config::load` 行为完全一致（合并 `~/.claude.json` 的逻辑自 v0.2.24 起
     /// 删除），保留该入口仅为兼容历史调用方——新代码直接用 `Config::load`。
     pub fn load_file_only() -> Result<Self> {
         Self::load_file_only_at(&config_file_path()?)
@@ -1436,7 +1448,7 @@ pub fn config_file_path() -> Result<PathBuf> {
 /// 返回全局配置目录（`~/.wyj-code`），仅解析路径、不创建。
 ///
 /// 记忆文件 `~/.wyj-code/AGENTS.md` 与全局 hooks `~/.wyj-code/settings.json`
-/// 都落在这里。**v1.5.18 起不再有 `claude_home_dir()`**：这两者分别从
+/// 都落在这里。**v0.2.27 起不再有 `claude_home_dir()`**：这两者分别从
 /// `~/.claude/CLAUDE.md` 与 `~/.claude/settings.json` 迁入，wyj-code 自此
 /// 完全不读任何 `.claude/` 路径。项目级对应物由 [`project_config_dir`] 定位。
 pub fn global_config_dir() -> Result<PathBuf> {
@@ -1944,19 +1956,26 @@ context_window = 200000
     }
 
     #[test]
-    fn todo_is_disabled_by_default_and_opt_in_works() {
-        // 默认关闭：对齐 Claude Code v2.1.233 / Codex CLI v0.152.0。
-        // 本地实测 132 次 TodoWrite 调用 100% 独占一个完整 LLM 往返，
-        // 且 59% 的会话结束时 todo 未收尾——对强模型是净成本。
+    fn todo_is_enabled_by_default_and_opt_out_works() {
+        // 默认开启（v0.3.1）：复杂长任务里 TodoWrite 是唯一能穿透自动压缩的
+        // 显式进度锚点。代价是每个用到的会话多约 1 个 LLM 往返，所以开关保留。
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(
-            !cfg.tools.todo_enabled,
-            "TodoWrite 必须默认不注册，否则旧配置文件升级后会静默保留全部开销"
-        );
-
-        // 用户显式开启时（弱模型 / 自托管场景，对应 CLAUDE_CODE_ENABLE_TODO_TOOLS=1）
-        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = true\n").unwrap();
         assert!(cfg.tools.todo_enabled);
+
+        // 用户显式关闭时（简单任务 / 强模型短任务，对应 CLAUDE_CODE_ENABLE_TODO_TOOLS=0）
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = false\n").unwrap();
+        assert!(!cfg.tools.todo_enabled);
+    }
+
+    #[test]
+    fn todo_opt_out_survives_a_partial_tools_block() {
+        // 老配置里已有 [tools] 但没写 todo_enabled：走结构体级 serde(default)，
+        // 取 ToolsCfg::default() 的 true。显式写 false 的必须仍是 false——
+        // 否则用户关不掉，只能去删整个 [tools] 块。
+        let cfg: Config = toml::from_str("[tools]\n").unwrap();
+        assert!(cfg.tools.todo_enabled);
+        let cfg: Config = toml::from_str("[tools]\ntodo_enabled = false\n").unwrap();
+        assert!(!cfg.tools.todo_enabled);
     }
 
     #[test]

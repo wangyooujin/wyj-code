@@ -1146,7 +1146,7 @@ mod tests {
             "MiniMax-M3",
         );
         assert!(spec.user_can_disable);
-        // M3 从 v1.5.9 起走 SwitchPlusEffort：保留 thinking.type 开关同时
+        // M3 从 v0.2.18 起走 SwitchPlusEffort：保留 thinking.type 开关同时
         // 接受 reasoning_effort 档位（low/high/max，对齐 Moonshot k3）。
         assert_eq!(spec.control, ThinkingControl::SwitchPlusEffort);
         assert_eq!(
@@ -1164,7 +1164,7 @@ mod tests {
 
     /// M3 路径：switch + effort 两条字段独立写入 body。user 既可以单独配 switch、
     /// 也可以单独配 effort（adapter 因 effort 非空回落到默认 enabled），也可以两者
-    /// 都配。M3 从 v1.5.9 起走 SwitchPlusEffort（与 DeepSeek / Moonshot k3 同形态）。
+    /// 都配。M3 从 v0.2.18 起走 SwitchPlusEffort（与 DeepSeek / Moonshot k3 同形态）。
     #[test]
     fn minimax_m3_emits_switch_and_effort_independently() {
         let id = identity("minimax", WireProtocol::OpenAiChatCompletions, "MiniMax-M3");

@@ -10,7 +10,7 @@
 | 文件 | 何时加载 | 内容 |
 |---|---|---|
 | `crates/core/CLAUDE.md` | 触达 `crates/core/` | Agent 循环、上下文压缩与 context editing、跨会话记忆、规约文件注入、补充消息注入队列、worktree/workflow、ACP/daemon、Hooks、通知、system prompt 分段、TodoWrite、Skill 名单、Evolution、Storage caps、模型侧提示词 |
-| `crates/tools/CLAUDE.md` | 触达 `crates/tools/` | SubAgent 工具与后台 shell、Computer-use 桌面 GUI 控制（含 v1.4 人机互不干扰架构、坐标缩放、权限边界） |
+| `crates/tools/CLAUDE.md` | 触达 `crates/tools/` | SubAgent 工具与后台 shell、Computer-use 桌面 GUI 控制（含 v0.2.5 人机互不干扰架构、坐标缩放、权限边界） |
 | `crates/store/CLAUDE.md` | 触达 `crates/store/` | Extensions/Plugin runtime、定时任务系统、项目级 `.wyj-code` 发现与信任门控、SkillHub |
 | `crates/tui/CLAUDE.md` | 触达 `crates/tui/` | 聊天区渲染、输入框/状态栏、终端 panic 还原、后台任务面板 |
 | `crates/cli/CLAUDE.md` | 触达 `crates/cli/` | CLI 装配、review/CI |
@@ -77,8 +77,8 @@ cargo clippy                     # lint
 - 注册位置：`/help` 的输出由 `crates/commands/src/builtin.rs` 中 `HelpCmd` 读取的 i18n 模板 `help.body` 渲染（**不是**动态枚举注册表），因此新增命令时必须同步在 `crates/i18n/locales/{en,zh}.yml` 的 `help.body` 模板里追加该命令的说明行，保持与现有条目相同的格式与缩进。
 - 同步要求：新增命令的 PR/提交里就应包含对应的 `/help` 条目，不要留到后续补；若临时不希望暴露（如调试命令），应在 `/help` 中显式标注「内部/调试」而非直接省略。
 - 命令文案需走 i18n（`tr()` key），与 `/help` 其余条目一致，不可硬编码中文。
-- **动态命令（Skill / 项目级自定义命令）是上述约定的例外**：这类命令运行时从磁盘发现、因人而异，不可能写死进静态 `help.body` 模板。`Command` trait 的 `is_dynamic()` 默认方法（仅 `SkillCommand` 覆盖为 `true`）标记这类命令，`CommandContext.dynamic_commands` 由调用方在构造 ctx 前用 `cmd_registry.list()` 过滤好传入，`HelpCmd` 渲染完静态模板后在末尾追加一个「自定义命令」分组（i18n key: `help.custom_commands_header`）。两者互不冲突，新增静态内置命令仍必须遵守上面的硬性约定。v1.5.15 起 Skill 来源收敛到 `~/.wyj-code/skills/` + `<git-root>/.wyj-code/skills/`，不再读取 `~/.claude/commands/` / `<cwd>/.claude/commands/`，动态命令扫描范围同步收敛。
-- **Skill / 自定义命令加载**（`commands::skill::load_skills`）：四层合并链（v1.5.15 起由 6 层简化）——`内置 → 全局 ~/.wyj-code/skills → 已启用插件贡献路径(先到先得) → 项目 <git-root>/.wyj-code/skills`（最高优先级）。wyj-code **不读取** `~/.claude/commands/` 或 `<cwd>/.claude/commands/` 等任何外部源。项目 Skill 支持单文件 `name.md` 与标准目录式 `name/SKILL.md`；命中目录式入口后不再递归注册其 `references/assets/*.md` 私有资源。frontmatter 支持 `description`/`argument-hint`/`allowed-tools`/`model` 四字段（复用 `core::frontmatter::parse`，与 `agent_def.rs` 共用同一套轻量 `key: value` 解析器）；`allowed-tools` 执行期通过 `CommandResult::RunPromptScoped` 让调用方把 `PermissionMode` 临时收紧为 `Allowlist`，跑完这一轮（含 ESC 中断，TUI 侧靠 `RestorePermissionOnDrop` 的 RAII 兜底）自动还原，不修改 `AgentMode` 本身；TUI scoped execution 会按 `model` 临时使用指定 Profile；普通嵌套 Markdown 仍递归映射为 `/namespace:cmd`。**注意 skill 仍不是模型可调用的工具**（无 `Skill` 工具），但可用 skill 的名单会经 `Agent::with_skills` 注入 system prompt 的 `# Skills` 段（v1.5.18+），模型据此能回答"该敲哪条斜杠命令"，详见架构节第 23 条。
+- **动态命令（Skill / 项目级自定义命令）是上述约定的例外**：这类命令运行时从磁盘发现、因人而异，不可能写死进静态 `help.body` 模板。`Command` trait 的 `is_dynamic()` 默认方法（仅 `SkillCommand` 覆盖为 `true`）标记这类命令，`CommandContext.dynamic_commands` 由调用方在构造 ctx 前用 `cmd_registry.list()` 过滤好传入，`HelpCmd` 渲染完静态模板后在末尾追加一个「自定义命令」分组（i18n key: `help.custom_commands_header`）。两者互不冲突，新增静态内置命令仍必须遵守上面的硬性约定。v0.2.24 起 Skill 来源收敛到 `~/.wyj-code/skills/` + `<git-root>/.wyj-code/skills/`，不再读取 `~/.claude/commands/` / `<cwd>/.claude/commands/`，动态命令扫描范围同步收敛。
+- **Skill / 自定义命令加载**（`commands::skill::load_skills`）：四层合并链（v0.2.24 起由 6 层简化）——`内置 → 全局 ~/.wyj-code/skills → 已启用插件贡献路径(先到先得) → 项目 <git-root>/.wyj-code/skills`（最高优先级）。wyj-code **不读取** `~/.claude/commands/` 或 `<cwd>/.claude/commands/` 等任何外部源。项目 Skill 支持单文件 `name.md` 与标准目录式 `name/SKILL.md`；命中目录式入口后不再递归注册其 `references/assets/*.md` 私有资源。frontmatter 支持 `description`/`argument-hint`/`allowed-tools`/`model` 四字段（复用 `core::frontmatter::parse`，与 `agent_def.rs` 共用同一套轻量 `key: value` 解析器）；`allowed-tools` 执行期通过 `CommandResult::RunPromptScoped` 让调用方把 `PermissionMode` 临时收紧为 `Allowlist`，跑完这一轮（含 ESC 中断，TUI 侧靠 `RestorePermissionOnDrop` 的 RAII 兜底）自动还原，不修改 `AgentMode` 本身；TUI scoped execution 会按 `model` 临时使用指定 Profile；普通嵌套 Markdown 仍递归映射为 `/namespace:cmd`。**注意 skill 仍不是模型可调用的工具**（无 `Skill` 工具），但可用 skill 的名单会经 `Agent::with_skills` 注入 system prompt 的 `# Skills` 段（v0.2.27+），模型据此能回答"该敲哪条斜杠命令"，详见架构节第 23 条。
 
 ## Configuration
 
@@ -123,7 +123,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
-| `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置与安装数据层；`plugin_runtime` 事务式激活 hooks/styles/themes/channels/LSP/monitors/settings/userConfig，持久 LSP client 提供 `workspace/symbol`；schedule/cron_sync、lockfile 与 marketplace 同样在此。v1.5.15 起移除 `import` 子模块（/import 命令下线）与 `wyj-config::codex` 兼容层（Codex 导入能力下线） |
+| `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置与安装数据层；`plugin_runtime` 事务式激活 hooks/styles/themes/channels/LSP/monitors/settings/userConfig，持久 LSP client 提供 `workspace/symbol`；schedule/cron_sync、lockfile 与 marketplace 同样在此。v0.2.24 起移除 `import` 子模块（/import 命令下线）与 `wyj-config::codex` 兼容层（Codex 导入能力下线） |
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框 |
 | `crates/cli` | 二进制入口 | 组装所有 crate，解析 CLI 参数，启动 TUI/REPL/单次模式 |
 
@@ -154,13 +154,16 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 19 | 统一通知通道（bell + 桌面通知） | `core::notify` | `crates/core` |
 | 20 | 后台任务可见性与自动续跑 | `tui::AppState::poll_shells` | `crates/tui` |
 | 21 | System prompt 拆 stable / volatile 两段 | `api::SystemPrompt` | `crates/api` |
-| 22 | TodoWrite 默认关闭 | `[tools].todo_enabled` | `crates/core` |
+| 22 | TodoWrite 默认开启（`[tools].todo_enabled` 可关） | `[tools].todo_enabled` | `crates/core` |
 | 23 | Skill 名单注入模型上下文（不是工具） | `core::prompts::MAIN` 的 `# Skills` 段 | `crates/core` |
 | 24 | HTTP 技能注册表 SkillHub | `store::skillhub` | `crates/store` |
 | 25 | 前台 Bash 输出实时推进（快照节流，非增量） | `tools::BashTool` + `ToolContext::tool_output()` | `crates/tools` + `crates/tui` |
 | 26 | 面板类命令的排版引擎（按显示宽度对齐，零 i18n 调用） | `commands::cost_view` + `CommandContext::terminal_width` | `crates/commands` |
 | 27 | 预排版消息通道（逐行原样渲染，不折行） | `CommandResult::OutputPlain` + `MessageRole::Preformatted` | `crates/commands` + `crates/tui` |
 | 28 | 子 Agent token 用量计量（原子累加器，逐层透传） | `core::session::SubUsage` + `ToolContext::sub_usage_sink()` | `crates/core` + `crates/tools` |
+| 29 | 编辑后自动验证闭环（项目声明 `verify.command` 才生效） | `core::verify` | `crates/core` |
+| 30 | 每轮时延画像（TTFT / 生成 / 重试开销） | `core::session::TurnLatency` + `/context` | `crates/core` + `crates/commands` |
+| 31 | 推理轮数触顶前自动存档 | `CheckpointKind::TurnLimit` | `crates/core` |
 
 **跨 crate 改动的两条硬约定**：
 
@@ -172,4 +175,4 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 
 ### 权限模型（TUI）
 
-`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`。**逐调用工具权限确认（v1.0.1 起）**：Normal 模式映射为 `Prompt`，`agent.rs::exec_tool_call` 在执行任一 `Tool::needs_permission()` 为 true 的工具（Edit/Write/Bash）前调用 `ToolContext::confirm_tool(name, summary)`；`ToolCtx` 的实现经 `ui_ask_tx` 发 `UiAskRequest::ToolPermission` 并 await `oneshot<PermissionDecision>`，TUI 弹 `PermissionDialog`（`draw_permission_dialog`），按键 y=AllowOnce / a=AllowAlways / d·Esc=Deny。`Deny` 把拒绝信息作为 `is_error` 工具结果回灌给模型；`AllowAlways` 把工具名写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`（`project_key` 按 git 仓库根派生，见 `core::project`）并跨会话生效——`ToolCtx::load_allowed_tools` 在每轮 ctx 装配时载入。computer-use 是刻意收窄的例外语义：`PROJECT_APPROVE_ONCE_TOOLS = ["computer", "app_computer"]`，这两个工具的首次 `AllowOnce` 也等价于当前工具的项目级 `AllowAlways`，因此用户只确认一次，但批准 `app_computer` 不会隐式放行风险更高的旧 `computer`。`summary` 由 `Tool::action_summary()` 提供（Bash=命令、Edit/Write=文件路径）。需要确认的工具均非 `parallel_safe`，串行执行，同一时刻至多一个对话框。Bypass=`AutoApprove` 全放行；Plan=`Allowlist` 白名单限制。`ui_ask_tx` 同时承载 AskQuestion 多题面板与 ExitPlanMode 计划批准；子 Agent 的 ctx 不接 `ui_ask_tx`，`confirm_tool` 默认放行（不阻塞、不弹窗）。
+`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`。**逐调用工具权限确认（v0.1.2 起）**：Normal 模式映射为 `Prompt`，`agent.rs::exec_tool_call` 在执行任一 `Tool::needs_permission()` 为 true 的工具（Edit/Write/Bash）前调用 `ToolContext::confirm_tool(name, summary)`；`ToolCtx` 的实现经 `ui_ask_tx` 发 `UiAskRequest::ToolPermission` 并 await `oneshot<PermissionDecision>`，TUI 弹 `PermissionDialog`（`draw_permission_dialog`），按键 y=AllowOnce / a=AllowAlways / d·Esc=Deny。`Deny` 把拒绝信息作为 `is_error` 工具结果回灌给模型；`AllowAlways` 把工具名写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`（`project_key` 按 git 仓库根派生，见 `core::project`）并跨会话生效——`ToolCtx::load_allowed_tools` 在每轮 ctx 装配时载入。computer-use 是刻意收窄的例外语义：`PROJECT_APPROVE_ONCE_TOOLS = ["computer", "app_computer"]`，这两个工具的首次 `AllowOnce` 也等价于当前工具的项目级 `AllowAlways`，因此用户只确认一次，但批准 `app_computer` 不会隐式放行风险更高的旧 `computer`。`summary` 由 `Tool::action_summary()` 提供（Bash=命令、Edit/Write=文件路径）。需要确认的工具均非 `parallel_safe`，串行执行，同一时刻至多一个对话框。Bypass=`AutoApprove` 全放行；Plan=`Allowlist` 白名单限制。`ui_ask_tx` 同时承载 AskQuestion 多题面板与 ExitPlanMode 计划批准；子 Agent 的 ctx 不接 `ui_ask_tx`，`confirm_tool` 默认放行（不阻塞、不弹窗）。
