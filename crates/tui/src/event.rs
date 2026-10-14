@@ -140,6 +140,71 @@ pub enum AgentEvent {
         row_idx: usize,
         result: Result<wyj_store::UpgradeOutcome, String>,
     },
+    /// `/compact` 的后台压缩结果。
+    ///
+    /// 为什么必须走事件而不是在主循环里 `await`（`crates/tui/CLAUDE.md` 第 19 条）：
+    /// 压缩是一次完整的 LLM 往返，摘要输出预算给到 `min(cw/10, 16000)`，
+    /// 再叠 `RetryPolicy::default()` 的 5 次指数退避（单次尝试上限 90s），
+    /// 端点不稳时可以拖到数分钟。它挂在主循环上 = 不重绘、不 `event::poll`，
+    /// ESC / Ctrl+C 全部失效。
+    CompactFinished {
+        result: Result<wyj_core::compact::CompactResult, String>,
+        /// 压缩后的自动压缩计数（锁内快照，锁必须先放再发事件）。
+        compact_count: u32,
+    },
+    /// 声明了 [`wyj_commands::Command::needs_background`] 的 slash 命令跑完。
+    /// 这类命令含子进程 / 网络往返（`gh`、`open`），inline 执行同样冻住主循环。
+    BackgroundCommandDone {
+        name: String,
+        result: Result<wyj_commands::CommandResult, String>,
+    },
+    /// `/checkpoint` 创建完成。`Ok` 是新 checkpoint 的 id。
+    CheckpointCreated(Result<String, String>),
+    /// `/rewind` 的准备工作（确认预览 / 回退前保护 + 文件还原）在后台跑完。
+    RewindPrepared(Result<RewindPrepared, String>),
+    /// `/branch` 在后台跑完（含切换 session / 重定向 agent），UI 只需刷新展示。
+    BranchPrepared(Result<BranchSwitch, String>),
+    /// `/evolve` 面板里某个确认动作（激活 / 拒绝 / 回滚）执行完成。
+    EvolutionActionDone(Result<String, String>),
+}
+
+/// `/rewind` 在后台 task 里跑完之后带回的结果。
+///
+/// 拆成两个分支是因为"需要二次确认"不是错误也不是成功：文件还原会覆盖工作区，
+/// 必须先把预览文案交给用户，等他重新带上 `--confirm` 再跑一次。
+///
+/// 后台 task 已经把 `messages` 写回了 live session（那里持锁等锁是对的），
+/// 这里带回的 `messages` 只用于重建**展示**用的消息列表。
+#[derive(Debug)]
+pub enum RewindPrepared {
+    /// 需要用户确认，UI 只需把提示文案贴进聊天区。
+    NeedsConfirm(String),
+    /// 已就绪：UI 据此 `reconstruct_display` 并刷新状态栏。
+    Ready {
+        /// 被回退到的 checkpoint id（仅用于结果文案）。
+        checkpoint_id: String,
+        /// 本次是否真的换了会话历史（`/rewind --files` 为 false）。
+        /// UI 只在 true 时重建展示列表，避免把仅存在于 UI 层的提示消息冲掉。
+        restored_conversation: bool,
+        protection_id: String,
+        /// 文件还原预览文案（空串表示本次不还原文件）。
+        file_text: String,
+        messages: Vec<wyj_api::types::Message>,
+        compact_count: u32,
+        turns: usize,
+    },
+}
+
+/// `/branch` 后台任务完成后的会话切换信息。
+///
+/// 与 `RewindPrepared` 同理：session 已被后台 task 换掉，这里只带展示层
+/// 重新构建所需的数据 + 新的会话 id（主循环据此同步本地镜像）。
+#[derive(Debug)]
+pub struct BranchSwitch {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub messages: Vec<wyj_api::types::Message>,
+    pub turns: usize,
 }
 
 /// MCP server 后台连接失败的具体原因，供渲染层区分文案
