@@ -7,7 +7,7 @@
 //! 是纯拼接、不覆盖：同一事件下三源的 hook 列表按来源顺序依次追加、依次执行，
 //! 与真 CC 语义一致（项目/本地配置是对用户级配置的补充，不是替换）。
 //!
-//! **v1.5.18 起不再读取任何 `.claude/` 路径**——原先的三源是
+//! **v0.2.27 起不再读取任何 `.claude/` 路径**——原先的三源是
 //! `~/.claude/settings.json` + `<git-root>/.claude/settings.json` +
 //! `<git-root>/.claude/settings.local.json`，现已全部迁入 `.wyj-code/` 体系，
 //! 与 skill / MCP / agent 定义的项目边界（`config::project_config_dir`）保持一致。

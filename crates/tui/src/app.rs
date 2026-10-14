@@ -360,7 +360,7 @@ pub enum TodoExecutionEntry {
 /// 行内状态、Todo 详情、`/cost` 面板都要把 token 与其它字段排在同一行，位数越少越好。
 ///
 /// - `>= 1_000_000` → 一位小数的 M（`1.5M`）
-/// - `>= 10_000` → 一位小数的 k（`12.3k`）。这一步是 v1.5.22 加的：会话累计轻易
+/// - `>= 10_000` → 一位小数的 k（`12.3k`）。这一步是 v0.2.31 加的：会话累计轻易
 ///   破六位数，原来的 `format!("{},{:03}")` 会把 `123,456`（7 字符）整段塞进标题栏，
 ///   在窄终端里直接把模型名和耗时挤出视野。1000~9999 仍在千分位区间，量级还没
 ///   到需要牺牲精度的时候。
@@ -1746,7 +1746,7 @@ pub struct ProfileEntryDraft {
     pub name: String,
     /// 0 = Anthropic, 1 = OpenAI
     pub provider_idx: usize,
-    /// v1.4.4 能力运行时字段；设置面板尚未暴露编辑入口，仅透传保留。
+    /// v0.2.8 能力运行时字段；设置面板尚未暴露编辑入口，仅透传保留。
     pub vendor: Option<String>,
     pub wire_protocol: Option<wyj_config::WireProtocol>,
     pub model: String,
@@ -3214,7 +3214,7 @@ fn schedule_execute_menu_action(
             if let Some(id) = id {
                 if let Ok(exe) = std::env::current_exe() {
                     tokio::spawn(async move {
-                        // --manual 仅为兼容 v1.4 预发布 CLI；headless 前台接管
+                        // --manual 仅为兼容 v0.2.5 预发布 CLI；headless 前台接管
                         // 已统一失败关闭，后台 app_computer 可与用户并行。
                         let _ = tokio::process::Command::new(exe)
                             .arg("schedule")
@@ -3597,7 +3597,7 @@ impl McpDialog {
         let merged = wyj_config::merged_mcp_servers(cfg, cwd);
         let global_lock = wyj_store::lockfile::load_global().unwrap_or_default();
         let project_lock = wyj_store::lockfile::load_project(cwd).unwrap_or_default();
-        // 项目级来源只剩 `<git-root>/.wyj-code/mcp.toml` 一个（v1.5.15 起不再
+        // 项目级来源只剩 `<git-root>/.wyj-code/mcp.toml` 一个（v0.2.24 起不再
         // 读取 `<cwd>/.mcp.json`），所以 Project scope 直接由 `load_project_mcp`
         // 判定。
         let project_names: std::collections::HashSet<String> = wyj_config::load_project_mcp(cwd)
@@ -7183,6 +7183,10 @@ pub struct AppState {
     pub unseen_messages: bool,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
+    /// 最近一次模型往返的时延画像，由 `AgentEvent::TurnDone` 从 session 带回来，
+    /// 供 `/context` 面板展示。Agent 侧记在 `Session::latency` 上（因为计时只在
+    /// Agent 的 stream 循环里准确），TUI 这边只是每次回合结束时同步一份快照。
+    pub session_latency: wyj_core::session::TurnLatency,
     /// 本会话自动压缩次数。状态栏用它显示一个**语义**指示（"自动压缩 ×N"）
     /// 而不是上下文占用百分比——压缩已完全自动化，占比对用户没有可操作性；
     /// 而"系统替我丢过历史"这件事必须可见，否则自动管理就成了黑盒。
@@ -7425,6 +7429,7 @@ impl AppState {
             chat_follow_tail: true,
             unseen_messages: false,
             total_input_tokens: 0,
+            session_latency: wyj_core::session::TurnLatency::default(),
             total_output_tokens: 0,
             compact_count: 0,
             tool_schema_tokens: 0,
@@ -9006,7 +9011,9 @@ impl AppState {
                 compact_count,
                 tool_schema_tokens,
                 tool_schema_tokens_saved,
+                latency,
             } => {
+                self.session_latency = latency;
                 self.total_input_tokens = input;
                 self.total_output_tokens = output;
                 self.compact_count = compact_count;
@@ -10619,7 +10626,7 @@ impl Drop for TurnFinishedGuard {
 /// 回合 task（`spawn_agent_turn` / 两处内联 turn task）会在**整个 agent 回合
 /// 期间**持有同一把 `tokio::sync::Mutex`——LLM 往返 + 全部工具调用都在锁内，
 /// 一次长回合动辄几分钟。主循环只要在这把锁上 `.await`，整个界面就会停在
-/// 那一帧：不重绘、不读按键，连 v1.5.21 的回合心跳看门狗
+/// 那一帧：不重绘、不读按键，连 v0.2.30 的回合心跳看门狗
 /// （`AppState::abort_stalled_turn`，排在保存分支**上游**）都跑不到下一轮——
 /// 用户按 ESC 也救不回来，表现就是「执行久了卡死不动」。
 ///
@@ -10801,6 +10808,7 @@ fn spawn_agent_turn(
             compact_count: sess.compact_count,
             tool_schema_tokens: sess.tool_schema_tokens_last,
             tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
+            latency: sess.latency,
         };
         emit_plugin_event_background(
             plugin_runtime,
@@ -10925,7 +10933,7 @@ fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
         ),
         format!("probe: {}", report.probe_status),
     ];
-    // v1.5.7 国产配置体检:把 profile 原始字段 + 推导后的 effective 值并列显示,
+    // v0.2.16 国产配置体检:把 profile 原始字段 + 推导后的 effective 值并列显示,
     // 让用户一眼能看出当前 provider/base_url/字段是否与协议匹配。
     lines.push(format!(
         "profile: thinking_budget={} · prompt_cache={:?}→effective={} · stream_options={:?}→effective={} · vision={} · base_url={}",
@@ -15083,6 +15091,7 @@ async fn tui_main(
                                 context_window,
                                 estimated_tokens: estimated,
                                 context_audit: audit,
+                                last_latency: state.session_latency,
                                 compact_count,
                                 context_edit,
                                 home_dir: std::env::var("HOME")
@@ -15760,6 +15769,7 @@ async fn tui_main(
                                                 tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
+                                                latency: sess.latency,
                                             };
                                             emit_plugin_event_background(
                                                 plugin_runtime_c,
@@ -15899,6 +15909,7 @@ async fn tui_main(
                                                 tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
+                                                latency: sess.latency,
                                             };
                                             emit_plugin_event_background(
                                                 plugin_runtime_c,
@@ -17935,7 +17946,7 @@ mod todo_stats_tests {
             .any(|m| m.id == *id && matches!(m.role, MessageRole::ToolResult))));
     }
 
-    // ── TodoWrite 不进常规工具行（v1.5.18） ────────────────────────────────
+    // ── TodoWrite 不进常规工具行（v0.2.27） ────────────────────────────────
     //
     // 回归背景：修复三重渲染前，一次 TodoWrite 会在聊天流里出现三遍——
     // `ToolStart` 无条件 push 的 ⏺ TodoWrite、`ToolEnd` 追加的 ⎿ 任务列表已更新…、
@@ -18400,7 +18411,7 @@ mod mcp_dialog_tests {
     use super::*;
 
     /// 回归测试：wyj 自己项目级来源（`<git-root>/.wyj-code/mcp.toml`）的
-    /// server 被卸载后（v1.5.15 起走"从来源文件删行 + lockfile 移除"统一
+    /// server 被卸载后（v0.2.24 起走"从来源文件删行 + lockfile 移除"统一
     /// 逻辑，不再有原生来源的"禁用 shadow"兜底分支），应该从 `/mcp` 面板
     /// "已安装"列表里消失。
     #[test]

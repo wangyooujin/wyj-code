@@ -4,7 +4,7 @@
 //!
 //! 整段摘要把 20K 的 Grep 输出压成一行 `[工具输出] xxx…`，而摘要最先丢的恰好是
 //! **负知识**（被否决的假设）、**精确值**（路径/行号/常量）、**顺序因果**——见
-//! `doc/plan/v1.5.17-context-management-plan.md` 的失败模式清单。清理比摘要便宜
+//! `doc/plan/v0.2.26-context-management-plan.md` 的失败模式清单。清理比摘要便宜
 //! （无 output token、不产生幻觉）**也更保真**（原文只是移出模型视野，没被转述）。
 //! Claude Code 官方文档的措辞正是这个顺序：*"It clears older tool outputs first,
 //! then summarizes the conversation if needed."*

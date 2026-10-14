@@ -18,7 +18,7 @@ pub struct ModelDoctorReport {
     pub catalog_updated_at: String,
     pub probe_status: String,
     pub probed_at: Option<String>,
-    // ── v1.5.7 国产配置体检 ────────────────────────────────────────────
+    // ── v0.2.16 国产配置体检 ────────────────────────────────────────────
     /// Profile 原始 prompt_cache 字段(`None` / `Some(true)` / `Some(false)`)
     pub profile_prompt_cache: Option<bool>,
     /// Profile 原始 openai_stream_options 字段
@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(report.probe_status, "not_probed");
     }
 
-    /// v1.5.7 国产配置体检:模拟 GLM Profile（Anthropic 兼容端点 + 显式
+    /// v0.2.16 国产配置体检:模拟 GLM Profile（Anthropic 兼容端点 + 显式
     /// prompt_cache=false），doctor 应填充 profile_* 字段 + 推导 effective 值。
     #[test]
     fn profile_fields_populated_for_third_party_anthropic() {

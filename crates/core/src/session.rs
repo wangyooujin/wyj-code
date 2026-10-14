@@ -76,7 +76,7 @@ pub struct RoutingEvent {
     pub from_profile: String,
     pub to_profile: String,
     pub error_kind: wyj_api::ProviderErrorKind,
-    /// v1.4.4 只允许在尚未提交 assistant 消息或工具执行结果的完整边界切换。
+    /// v0.2.8 只允许在尚未提交 assistant 消息或工具执行结果的完整边界切换。
     pub boundary: String,
 }
 
@@ -148,6 +148,44 @@ pub struct Session {
     pub current_checkpoint_id: Option<String>,
     pub branch_parent_session_id: Option<String>,
     pub branch_parent_checkpoint_id: Option<String>,
+    /// 最近一次模型往返的时延画像（`/context` 面板展示）。
+    pub latency: TurnLatency,
+}
+
+/// 一次模型往返的时延分解。
+///
+/// **为什么必须拆成三段而不是只记一个总耗时**：总耗时高是个没有行动指向的结论，
+/// 而「慢在哪」直接对应三种完全不同的处置——
+///
+/// - `ttft_ms` 高 → 首 token 前的固定开销（DNS/连接/TLS、上传大 prefill、缓存
+///   未命中的全量 prefill、服务端排队）。这是 prompt 大小与缓存命中率的问题，
+///   不是模型慢。
+/// - `ttft_ms` 低但 `total_ms` 大 → 服务端在稳定吐 token，说明是模型真的在长考
+///   或者输出量大。该降的是 `max_tokens` 或换模型，不是上下文工程。
+/// - `retry_ms > 0` → 其中相当一部分「慢」根本不是推理，是重试打出来的。
+///   把它单列出来是为了不把网络抖动误判成模型性能问题。
+///
+/// `ttft_ms` 从发起 `provider.stream()` 算起（含连接建立与请求上传），到收到
+/// 第一个 `TextDelta` / `ThinkingDelta` 为止——这是用户真正感知的「点了回车到
+/// 屏幕开始动」的时间，用 stream 建立后的时刻起算会漏掉最该被看见的那一段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnLatency {
+    /// 首 token 延迟（毫秒）。`None` = 本次往返没有产生任何输出增量。
+    pub ttft_ms: Option<u64>,
+    /// 从发起请求到收到 `MessageStop` 的总耗时（毫秒），含重试。
+    pub total_ms: u64,
+    /// 因可重试错误重发请求额外花掉的时间（毫秒）。0 = 一次就成了。
+    pub retry_ms: u64,
+    /// 本次往返是否发生过至少一次重试（`retry_ms` 的可见化，
+    /// 避免「总共只慢了 300ms」的噪声被当成信号）。
+    pub retried: bool,
+}
+
+impl TurnLatency {
+    /// 扣掉重试之后的净推理耗时。重试是网络问题，不该记在模型账上。
+    pub fn net_total_ms(&self) -> u64 {
+        self.total_ms.saturating_sub(self.retry_ms)
+    }
 }
 
 impl Session {

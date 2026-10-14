@@ -248,7 +248,7 @@ pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user c
 
 /// `[tools].todo_enabled = true` 时追加：教模型**何时**用 TodoWrite。
 ///
-/// v1.5.18 把这条指引从 `MAIN` 里删掉了，理由是「默认关闭的工具不该在
+/// v0.2.27 把这条指引从 `MAIN` 里删掉了，理由是「默认关闭的工具不该在
 /// system prompt 里被提及」。但删完之后，开关打开的用户会遇到一个更糟的状态：
 /// 工具注册了、schema 也可见了（见 `agent.rs` 的 `ALWAYS_VISIBLE_TOOL_SCHEMAS`），
 /// 模型却没有任何动机去调用它 —— 工具描述只说了「这是什么」，没说「什么时候用」。
@@ -283,7 +283,7 @@ pub const TODO_HINT: &str = "For multi-step tasks (roughly three or more distinc
 /// and it's the user's own device/accounts, asked directly by that same
 /// user — there is no third party whose privacy is at stake. The hint
 /// spells this out explicitly so the model attempts the task instead of
-/// refusing and redirecting the user to do it by hand. Fifth: v1.4 routes GUI
+/// refusing and redirecting the user to do it by hand. Fifth: v0.2.5 routes GUI
 /// work through stable window targets and treats foreground desktop takeover as
 /// an explicit compatibility exception, never an implicit fallback. Sixth: a
 /// reported real-world failure with a third-party (non-Anthropic-trained)
@@ -494,7 +494,7 @@ mod tests {
     fn skill_section_tells_model_skills_are_user_invoked_slash_commands() {
         // 回归背景：用户说"使用 skill 帮我分析股票"时，模型跑去 ls ~/.claude/skills
         // —— wyj-code 的 skill 只存在于 ~/.wyj-code/skills 与 <git-root>/.wyj-code/skills，
-        // 代码里没有任何读 ~/.claude/ 的路径（v1.5.15 已删除 load_native_mcp 等），
+        // 代码里没有任何读 ~/.claude/ 的路径（v0.2.24 已删除 load_native_mcp 等），
         // 是模型凭 Claude Code 的训练先验猜错了目录。
         // 这段提示同时锁死三件事：skill 在哪、只能用户用斜杠命令调、不要去翻 .claude。
         assert!(MAIN.contains("# Skills"));
@@ -529,7 +529,7 @@ mod tests {
             MAIN.contains("Home directory"),
             "必须指向 <env> 块里的 Home directory，让模型知道 `~` 的真实绝对路径"
         );
-        // 回归背景（v1.5.18 补）：只禁检索、却不给名单，模型唯一诚实的回答就是
+        // 回归背景（v0.2.27 补）：只禁检索、却不给名单，模型唯一诚实的回答就是
         // 把禁令复述给用户（"我不能自己调用 skill"）。名单靠 `{skills}` 占位注入。
         assert!(
             MAIN.contains(SKILL_CATALOG_PLACEHOLDER),

@@ -28,6 +28,7 @@ pub mod textutil;
 pub mod tool;
 pub mod tool_arguments;
 pub mod tool_search;
+pub mod verify;
 pub mod workflow;
 pub mod workspace;
 pub mod workspace_cas;

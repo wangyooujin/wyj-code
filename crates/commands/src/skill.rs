@@ -302,7 +302,7 @@ fn load_from_path_if_absent(
 /// `disabled` 由上层调用方传入(汇总全局+项目 lockfile 里 `enabled == false` 的
 /// skill 名)，用于过滤掉被 /skills 面板禁用的条目。
 ///
-/// **合并链（v1.5.15 起由 6 层简化到 4 层）**：内置 → `~/.wyj-code/skills` →
+/// **合并链（v0.2.24 起由 6 层简化到 4 层）**：内置 → `~/.wyj-code/skills` →
 /// 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。
 /// 不再读取 `~/.claude/commands/` 与 `<cwd>/.claude/commands/` 等外部源——
 /// wyj-code 只信任 `.wyj-code/` 下用户自己写下的条目。
@@ -542,6 +542,7 @@ mod tests {
                     context_window: 0,
                     estimated_tokens: 0,
                     context_audit: None,
+                    last_latency: Default::default(),
                     compact_count: 0,
                     context_edit: (0, 0),
                     home_dir: PathBuf::new(),
@@ -707,7 +708,7 @@ mod tests {
 
     #[test]
     fn global_wyj_skills_dir_is_loaded() {
-        // v1.5.15 起只读 `~/.wyj-code/skills/`，`~/.claude/commands/` 不再被读取。
+        // v0.2.24 起只读 `~/.wyj-code/skills/`，`~/.claude/commands/` 不再被读取。
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let skills_dir = home.path().join(".wyj-code").join("skills");
@@ -727,7 +728,7 @@ mod tests {
 
     #[test]
     fn project_wyj_skills_override_global_wyj_skills() {
-        // v1.5.15 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
+        // v0.2.24 起不再有"同作用域内真 CC 覆盖 wyj"的边界——
         // `~/.claude/commands/` 不再被读取。项目级 `~/.wyj-code/skills/` 覆盖
         // 全局级同名条目（作用域优先级 = 全局 < 项目）。
         let home = tempfile::tempdir().unwrap();

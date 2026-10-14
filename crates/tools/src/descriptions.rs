@@ -31,7 +31,7 @@ pub const SUB_AGENT_TEMPLATE: &str = "Use this tool when you need to launch a ne
 /// computer-use 工具描述：作为 Anthropic 原生工具（`native` 字段非空）注册，
 /// 实际发给模型的 schema 由 Anthropic 内置，不使用这里的 description/
 /// input_schema；两者仅供本地工具列表/详情展示（如 `/tools`、TUI 面板）使用。
-pub const COMPUTER: &str = "Foreground compatibility computer-use tool. Read-only screenshots/zoom are available, but mutating actions synthesize global mouse/keyboard input and are disabled by default in v1.4. Prefer `window_capture` + `app_computer`, which bind actions to a stable window and do not move the user's pointer or activate an app. The action schema is built into the model by Anthropic; this description is for local display only and is not sent to the model.";
+pub const COMPUTER: &str = "Foreground compatibility computer-use tool. Read-only screenshots/zoom are available, but mutating actions synthesize global mouse/keyboard input and are disabled by default in v0.2.5. Prefer `window_capture` + `app_computer`, which bind actions to a stable window and do not move the user's pointer or activate an app. The action schema is built into the model by Anthropic; this description is for local display only and is not sent to the model.";
 
 /// computer-use 工具描述模板（custom 工具模式，`{width}`/`{height}` 由
 /// `computer_custom_description()` 在运行时替换为实际下采样目标分辨率）。

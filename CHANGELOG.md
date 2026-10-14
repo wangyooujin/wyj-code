@@ -2,9 +2,56 @@
 
 本文件记录 wyj-code 各版本的主要变更，按版本从新到旧排列。
 
+> **版本号已重编（自 0.3.1 起）**：旧的 `1.x.y` 编号不再延续，改用 `0.x.y`。
+> 每条标题括注了它在旧编号下的原版本号，便于对照历史 release 与 commit。
+> 映射规则是**按历史发布顺序连续编号**：`1.0.0~1.2.3` → `0.1.1~0.1.8`、
+> `1.3.0~1.5.25` → `0.2.1~0.2.34`；没有写进本文件的补丁版本同样占号
+> （如 1.5.8 → 0.2.17），所以编号序列里会看到空档——那是刻意保留的，
+> 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
+> 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
+
 ## [Unreleased]
 
-## [1.5.25] - 2026-10-13
+## [0.3.1] - 2026-10-14
+
+### 编辑后自动验证闭环：把「跑一下测试」从人的嘴里挪到框架里
+
+复杂任务里模型最高频的失败模式不是不会写，而是**不知道自己写错了**：改完十个
+文件直接交付，没有编译器告诉它第五个文件的类型不匹配。新增 `core::verify`，
+项目在 `.wyj-code/settings.json` 里声明校验命令（与 hooks 同三源合并，后者覆盖
+前者；单值覆盖而非追加）：
+
+```json
+{ "verify": { "command": "cargo check --quiet --all-targets" } }
+```
+
+**未声明 = 完全静默**：不跑子进程、不产生 tool_result 字节、不改变任何行为——
+零假设是这个特性的第一原则。命令不硬编码成 `cargo test`：wyj-code 同时服务
+Python / Node / Go 项目，且同一项目改十个文件跑十次全量测试的代价无法接受。
+
+### TodoWrite 默认开启
+
+`[tools].todo_enabled` 默认由 `false` 改为 `true`，用户可显式关掉。
+
+### `/context` 增加每轮时延画像
+
+`core::session::TurnLatency` 记录上一趟请求的首 token 延迟、总耗时与其中的重试
+开销。跟着 `AgentEvent::Usage` 走而不是新增事件——两者采集点与生命周期完全相同，
+拆开只会让发送侧多做一半发送次数。面板据此把「慢」拆成「模型慢」与「重试慢」：
+重试与退避的时间会单列，不计入推理耗时。
+
+### 推理轮数触顶前自动存档
+
+新增 `CheckpointKind::TurnLimit`：达到推理轮数上限、自动存档之前先落一次
+checkpoint，避免触顶收尾时的状态丢失。
+
+### MCP 超时错误措辞：状态不明 ≠ 调用失败
+
+MCP 工具调用超时只说明**我们这边没收到响应**，远端可能仍在执行、也可能早已执行
+完毕。错误文案明确写出这一点，避免模型把超时读成「没执行」而条件反射重试
+一个有副作用的工具。
+
+## [0.2.34] - 2026-10-13（原 1.5.25）
 
 ### `/cost` 里那张表其实根本没渲染出来，还把子 Agent 的开销整段漏掉了
 
@@ -47,7 +94,7 @@
 
 **1221 个 workspace 测试**（1184 → 1221） + clippy `-D warnings` 全绿。
 
-## [1.5.24] - 2026-10-13
+## [0.2.33] - 2026-10-13（原 1.5.24）
 
 ### 长命令跑到一半，界面什么都不给：前台 Bash 的输出改为实时推进
 
@@ -92,7 +139,7 @@ UI 侧两道闸门缺一不可：① `tool_info` 里必须已登记该 `tool_use
 
 **1184 个 workspace 测试** + clippy `-D warnings` 全绿。
 
-## [1.5.22] - 2026-10-12
+## [0.2.31] - 2026-10-12（原 1.5.22）
 
 ### 修 review 抓出的 5 个缺陷：其中两个是「修卡死」这个改动自己引入的新卡死
 
@@ -163,7 +210,7 @@ async 帧不进调用栈，栈这么浅本身就是结论：**整个 `async main
 - **回合 task 在整个 agent 回合期间持有 `session` 这把 `tokio::sync::Mutex`**（`spawn_agent_turn`：`let mut sess = session_c.lock().await` 之后 `run_turn_with_injection(&mut sess, …)` 一路到 task 结束，LLM 往返 + 全部工具调用都在锁内）。而 TUI 主循环有 20 多处无超时 `session.lock().await`，其中自动保存分支排在 `event::poll()` **之前**：一旦停在那里，整个界面就没有心跳了——不重绘、不读按键。现场证据完全吻合：会话文件 mtime 停在 10:10:24 再没写过、turn task 仍在发新 bash 子进程、界面冻住。
 - **终态事件是阻塞式 send**（`mpsc::channel::<AgentEvent>(256)`）。`TurnDone` 一到，UI 置 `save_needed`、下一帧就来取锁；turn task 若发事件时**仍持锁**，就是「UI 等锁 / turn task 等 UI 排空通道」的环形等待。工具事件走 `try_send`（满了丢弃）不会堵，但回合收尾的 `Usage` / `TurnDone` / `Error` 会，长回合期间通道早已填满。
 
-**为什么 v1.5.21 的看门狗救不了**：回合心跳 `abort_stalled_turn()` 排在保存分支**上游**，主循环一停就不再进下一轮；而按键处理在 `event::poll` **下游**。专门用来救卡死回合的机制，恰好被造成卡死的那把锁挡在身后 —— 这是本次排查里最值得记的一条。
+**为什么 v0.2.30 的看门狗救不了**：回合心跳 `abort_stalled_turn()` 排在保存分支**上游**，主循环一停就不再进下一轮；而按键处理在 `event::poll` **下游**。专门用来救卡死回合的机制，恰好被造成卡死的那把锁挡在身后 —— 这是本次排查里最值得记的一条。
 
 修复两端，缺一不可：
 
@@ -188,7 +235,7 @@ async 帧不进调用栈，栈这么浅本身就是结论：**整个 `async main
 
 ### 项目规约文件恢复回退链：根目录只有 `CLAUDE.md` 的仓库此前对模型完全失明
 
-v1.5.18 做的是**硬切换**：`ClaudeMdLoader` 只认 `AGENTS.md` / `AGENTS.local.md`，`CLAUDE.md` 系列一律不读，并由测试 `load_dir_files_ignores_claude_md_entirely` 主动锁死。这条设计的前提是「AGENTS.md 已是开放标准，用户会改名」——但现实中大量既有仓库的根目录只有 `CLAUDE.md`，`git clone` 下来之后 wyj-code 会把它们判定为**没有任何项目规约**：模型既不知道构建命令、测试命令，也不知道这个仓库的编码约定，而这些恰恰是作者写下来、指望 AI 助手读的东西。漏读一份规约的代价，远大于多试几次 `is_file()`。
+v0.2.27 做的是**硬切换**：`ClaudeMdLoader` 只认 `AGENTS.md` / `AGENTS.local.md`，`CLAUDE.md` 系列一律不读，并由测试 `load_dir_files_ignores_claude_md_entirely` 主动锁死。这条设计的前提是「AGENTS.md 已是开放标准，用户会改名」——但现实中大量既有仓库的根目录只有 `CLAUDE.md`，`git clone` 下来之后 wyj-code 会把它们判定为**没有任何项目规约**：模型既不知道构建命令、测试命令，也不知道这个仓库的编码约定，而这些恰恰是作者写下来、指望 AI 助手读的东西。漏读一份规约的代价，远大于多试几次 `is_file()`。
 
 现改为**按槽位独立回退、命中第一个即停**：
 
@@ -204,7 +251,7 @@ v1.5.18 做的是**硬切换**：`ClaudeMdLoader` 只认 `AGENTS.md` / `AGENTS.l
 
 不变的部分：全局路径仍只有 `~/.wyj-code/`，任何 `~/.claude/` 一律不读——被读的是**项目目录内**的 `CLAUDE.md` 文件，与读取外部工具的全局配置目录是两回事；prompt cache 行为不变（注入文本含路径与文件名，文件增删时自然失效）；`/init` 的生成目标恒为规范名 `AGENTS.md`，但 prompt 已要求把 `CLAUDE.md` 等其它工具的规则文件一并整合进去。
 
-## [1.5.21] - 2026-10-11
+## [0.2.30] - 2026-10-11（原 1.5.21）
 
 ### 长任务跑到一半停住，之后输入任何内容都没反应
 
@@ -253,9 +300,9 @@ profile 里的 `reasoning_effort` / `thinking_switch` 写进配置、TUI 面板�
 - **新 CLI**：`wyj-code skillhub search|info|install`，`/skills` 面板在 headless 下不可用时的等价入口。`search --json` 便于脚本消费。
 - **顺带修掉一个 i18n 缺陷**：`zh.yml` 里整块技能面板文案挂在错误的顶层键 `import:` 下（无任何代码引用），导致**所有中文技能面板文案一直回落英文**。已改回 `skills:`。
 
-## [1.5.20] - 2026-10-10
+## [0.2.29] - 2026-10-10（原 1.5.20）
 
-> 补记：v1.5.20 发布时本文件漏写了版本小节，本次一并补齐。
+> 补记：v0.2.29 发布时本文件漏写了版本小节，本次一并补齐。
 
 ### token 账本：内存里有计数器，落盘时一个都没写
 
@@ -279,13 +326,13 @@ profile 里的 `reasoning_effort` / `thinking_switch` 写进配置、TUI 面板�
 
 ### 站点
 
-`docs.html` / `index.html` / `script.js` 更新到 v1.5.20；顺带修掉 `delivery.title`/`desc` 的 zh/en 字典停在 v1.5.18（`applyLang` 用字典覆盖 HTML，线上 delivery 标题一直是旧版本）。
+`docs.html` / `index.html` / `script.js` 更新到 v0.2.29；顺带修掉 `delivery.title`/`desc` 的 zh/en 字典停在 v0.2.27（`applyLang` 用字典覆盖 HTML，线上 delivery 标题一直是旧版本）。
 
-## [1.5.19] - 2026-10-09
+## [0.2.28] - 2026-10-09（原 1.5.19）
 
 ### 【BREAKING】项目级 skill 信任确认：仓库自带的 skill 需显式批准
 
-`<git-root>/.wyj-code/skills/` 随 `git clone` 一起落地，正文由**仓库作者**（可能是陌生人）控制。此前它们与你自己写的 skill 走同一条加载路径——克隆一个陌生仓库、对方在里面放几个 `.wyj-code/skills/*.md`，你敲 `/xxx` 时整段敌对文本就会作为模型指令进入对话。**注入面其实已经开了一半**：skill 的 `description`（≤240 字符）自 v1.5.18 起就经 `{skills}` 占位注入 system prompt，模型会主动向用户推荐这些命令。
+`<git-root>/.wyj-code/skills/` 随 `git clone` 一起落地，正文由**仓库作者**（可能是陌生人）控制。此前它们与你自己写的 skill 走同一条加载路径——克隆一个陌生仓库、对方在里面放几个 `.wyj-code/skills/*.md`，你敲 `/xxx` 时整段敌对文本就会作为模型指令进入对话。**注入面其实已经开了一半**：skill 的 `description`（≤240 字符）自 v0.2.27 起就经 `{skills}` 占位注入 system prompt，模型会主动向用户推荐这些命令。
 
 本版补上门控，强度与 `mcp.toml` 完全对齐。
 
@@ -300,7 +347,7 @@ profile 里的 `reasoning_effort` / `thinking_switch` 写进配置、TUI 面板�
 
 TUI 聊天流里工具调用的结果此前走静态预览：**最多 3 个视觉行**，超出显示 `...`。Bash 的 JSON 输出永远只有头三行，尾部的关键信息（`request_id` / `reason` / traceback 末行）看不到，也不知道下面还有多少内容。现有代码里已有三处针对这个缺陷打的补丁（错误输出改 head+tail、`⎿` 行跳过「退出码 N」横幅、Read 剥离行号），全都是在「3 行预算」这个错误前提下做取舍。
 
-本版把 v1.5.18 的 thinking 折叠模式套到**所有工具结果**上，对齐 Claude Code。
+本版把 v0.2.27 的 thinking 折叠模式套到**所有工具结果**上，对齐 Claude Code。
 
 - **默认折叠**：`⏺ Bash(cd /tmp && …) · 0.0s` 之下**一行正文都不出**；Edit/Write 的彩色 diff 同理。失败结果不例外，一律折叠，标题行的红色 ` · failed` 保留。`Ctrl+O` 全局切换后出**全文**、不再有任何行数上限。折叠头**不加任何元信息**（不加行数、不加展开提示）——只留现有标题行。
 - **`!` bash 输出是唯一例外**（输入框敲 `!` 直接执行的命令）保持三行预览 + `...`，`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines` 现在只服务这一条路径。
@@ -322,7 +369,7 @@ skill 名单注入本身是正常的（模型能准确说出 `/hithink-finance`�
 - **i18n 快捷键列表缺 `Ctrl+O`**：全仓 `Ctrl+O` 此前只出现在 thinking 折叠头和注释里。本次改动让工具结果折叠头不带提示，发现入口更窄，故在 `zh.yml` / `en.yml` 的快捷键列表各补一行。
 - **`trust-mcp` 之外新增两个子命令**，见上文「CLI」条。
 
-## [1.5.18] - 2026-10-09
+## [0.2.27] - 2026-10-09（原 1.5.18）
 
 ### 【BREAKING】彻底切断 `.claude/` 依赖：`CLAUDE.md` → `AGENTS.md` 硬切换
 
@@ -374,11 +421,11 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 
 1000 个 workspace 测试全部通过（新增 8 个：thinking 折叠/展开/流式/无耗时四种渲染形态、`flush_thinking` 耗时接线、`thinking_expanded` 默认值与复位、`render_skill_catalog` 四例、`with_skills` 注入与空安装防占位符泄漏、`collect_skill_entries` 端到端读取与排序），`clippy --all-targets -D warnings` 零警告。
 
-## [1.5.17] - 2026-10-08
+## [0.2.26] - 2026-10-08（原 1.5.17）
 
 ### 上下文管理：口径统一 + 状态栏去百分比 + 两个会真 400 的硬缺陷
 
-调研对标 Claude Code / Codex CLI / Aider / Cline / Goose / Cursor 2025-2026 公开实现后，定位到 wyj-code 的上下文由**三条口径互不一致的链路**分别度量：压缩决策用 `estimate_request_tokens`（system + 工具 schema + 输出预留 + framing），状态栏用 `estimate_tokens`（**只有 messages**），记忆注入用 8,000 字节硬截断。实测隐形开销 ≥1.3 万 token（主 system prompt 2,245 + ≥16 个常驻工具 schema + `max_tokens` 8,192 + 协议开销），在 200K 窗口下就是 **≥6.5 个百分点的系统性低报**——进度条的颜色和实际压缩时机对不上号。详细调研与业界基线见 `doc/plan/v1.5.17-context-management-plan.md`。
+调研对标 Claude Code / Codex CLI / Aider / Cline / Goose / Cursor 2025-2026 公开实现后，定位到 wyj-code 的上下文由**三条口径互不一致的链路**分别度量：压缩决策用 `estimate_request_tokens`（system + 工具 schema + 输出预留 + framing），状态栏用 `estimate_tokens`（**只有 messages**），记忆注入用 8,000 字节硬截断。实测隐形开销 ≥1.3 万 token（主 system prompt 2,245 + ≥16 个常驻工具 schema + `max_tokens` 8,192 + 协议开销），在 200K 窗口下就是 **≥6.5 个百分点的系统性低报**——进度条的颜色和实际压缩时机对不上号。详细调研与业界基线见 `doc/plan/v0.2.26-context-management-plan.md`。
 
 - **状态栏移除上下文占用百分比与进度条**（`crates/tui/src/render.rs::draw_status`）：条与数字对用户没有可操作性，只是持续制造焦虑；`Theme::progress_{normal,warn,danger,empty}` 四个主题色一并删除。改为显示**语义**指示 `已自动压缩 ×N`——压缩对用户不可见，除以数字之外必须让"自动管理发生过"本身可见，否则就成了黑盒。计数落盘在 `SessionFile.compact_count`，`/resume` 后不丢。2 个回归测试锁死（`draw_status_omits_context_percentage_and_bar` / `draw_status_shows_auto_compacted_chip_when_history_was_summarized`）。
 - **新增 `ContextAudit` 消灭口径分裂**（`crates/core/src/compact.rs`）：一次性算出 system / 工具 schema / 对话历史 / 输出预留 / 协议开销 / 可回收旧工具结果六项分解。压缩决策、`/cost` 百分比、`/context` 面板**全部共用这一个结构体**，从根上杜绝"显示的数字和实际决策量不是同一个"这类偏差。`estimate_request_tokens` 保留为 `ContextAudit::total()` 的薄封装（行为完全等价，有回归测试）。
@@ -397,8 +444,8 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **新增 `ContextRecall` 工具**：按占位符里的 `cas://<hash>` 取回原文，支持 `offset`/`max_bytes` 分页、按 char boundary 切分（CJK/emoji 安全）、hash 必须是 32-64 位 hex（挡路径穿越）。取不回来时明确告诉模型"去重跑工具"，而不是让它把失败理解成"内容本来就没有"。**进 `ALWAYS_VISIBLE_TOOL_SCHEMAS`**——一旦被 lazy 工具折叠，占位符里的引用就成了死路，清理变不可逆。
 - **保护规则用白名单**：`ELIDABLE_TOOLS = [Read, Grep, Glob, Bash, WebFetch]`，新增工具默认不被清理。`Edit`/`Write`/`NotebookEdit` 的回执被清理会让模型以为自己没改过从而重做，代价远高于漏删。`ToolResult` 不携带工具名（只有 `tool_use_id`），所以先扫 `ToolUse` 块建 `id → name` 映射；映射不到的历史块保守跳过。最近 3 个工具结果保留全文。
 - **「模型可见上下文」与「持久 transcript」分离**：落盘的 session 文件里存占位符（体积小）+ 原文在 CAS；`SessionStore::load` 调 `materialize_elided` 把原文还原回内存——resume 的语义是「新会话从完整上下文开始」，之后随增长再逐步重新清理。blob 已被 gc 时保留占位符（让模型知道"这里曾经有内容、来自哪个工具"并决定重跑），不变成空洞。
-- **回收链路补齐**：`WorkspaceCas::gc` 此前只被单测调用、`cas_total_bytes`/`cas_gc_on_start` 因「无消费点」被删。v1.5.17 恢复这两个配置项并接上真实生产消费点——CLI 启动时按 `cas_total_bytes` 跑一次 `gc`；`Session.elided_blobs` 随 `SessionFile` 落盘，在 TUI `/clear`、TUI 退出、headless `/clear`、headless 退出四处 `release`。**CAS 的 `gc` 只回收 `ref_count == 0` 的 blob，release 与 gc 缺一就是无界增长。**
-- **新增 `[context_edit]` 配置块**：`enabled`（默认 true，关闭即完全退回 v1.5.16 行为）/ `protect_recent` / `batch_size` / `min_result_bytes` / `max_batches`。CAS 不可写时机制**整体关闭**而不是降级成"就地删掉"——没有 CAS 意味着原文真的会丢，而 Bash/WebFetch 的输出重跑也拿不回来。
+- **回收链路补齐**：`WorkspaceCas::gc` 此前只被单测调用、`cas_total_bytes`/`cas_gc_on_start` 因「无消费点」被删。v0.2.26 恢复这两个配置项并接上真实生产消费点——CLI 启动时按 `cas_total_bytes` 跑一次 `gc`；`Session.elided_blobs` 随 `SessionFile` 落盘，在 TUI `/clear`、TUI 退出、headless `/clear`、headless 退出四处 `release`。**CAS 的 `gc` 只回收 `ref_count == 0` 的 blob，release 与 gc 缺一就是无界增长。**
+- **新增 `[context_edit]` 配置块**：`enabled`（默认 true，关闭即完全退回 v0.2.25 行为）/ `protect_recent` / `batch_size` / `min_result_bytes` / `max_batches`。CAS 不可写时机制**整体关闭**而不是降级成"就地删掉"——没有 CAS 意味着原文真的会丢，而 Bash/WebFetch 的输出重跑也拿不回来。
 - **主提示词新增 `# Context management` 段**：教模型看到 `[context-edited]` 占位符就 `ContextRecall`、不要凭空猜内容，也不要投机性召回（占位符里的工具名和首行通常就够判断值不值得）。
 - `/context` 面板新增「已清理 N 条 / 释放约 M tokens」一行，与「可回收」并列——只报持续增长的可回收量而不报处理进度，用户会以为机制没生效。
 - 11 个新测试：保护规则、往返（清理→占位可解析→召回→还原一致）、blob 丢失时保留占位符、幂等（同内容去重但 ref 仍按次数记账）、release→gc 闭环、以及一条策略级测试锁住「纯清理就能落回阈值内、不需要摘要」并断言占位符开销远小于释放量。
@@ -409,7 +456,7 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - 压缩**不可回看**（原文只在当轮开始的 `AutoUser` checkpoint，上限 20/session）；业界通行做法是 append-only transcript + 压缩点标记。
 - tool_result context editing 的 3 个已知限制（均已写进设计文档）：① 单请求清理上限 30 条（3 批 × 10），极端会话需跨 2 个推理轮次才收敛；② 清理必然击穿 prompt cache 前缀（Anthropic 官方明写），目前 `/cost` 还不能区分"正常 miss"与"上下文编辑导致的预期 miss"；③ CAS 的 gc 只在进程启动时跑一次，长跑进程内不回收。
 
-## [1.5.16] - 2026-10-04
+## [0.2.25] - 2026-10-04（原 1.5.16）
 
 ### 后台任务可见性与自动续跑（本次主线）
 
@@ -481,62 +528,62 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 
 `cargo fmt` + `cargo clippy --workspace --all-targets` 零警告 + `cargo test --workspace` 全绿（本次新增约 30 个回归测试：shell 面板 5 + tasklist 摘要 2 + 自动唤醒与跨轮次粒度 5 + 焦点导航 3 + ESC 暂停 1 + `tail()` 游标隔离 2 + `persist_cap` JSON 裁剪 5 + 压缩用量 1 + compact typed error 1 + `/shells` 命令 4 + Agent 工具 schema 1 + 孤儿 tool_use 1），release 构建通过。
 
-## [1.5.15] - 2026-10-03
+## [0.2.24] - 2026-10-03（原 1.5.15）
 
-- **BREAKING: 配置加载收敛到 `.wyj-code/`**（全局 + 项目级）。wyj-code 自 v1.5.15 起只读写 `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级），不再读取 `~/.claude/`（commands / agents）、`~/.claude.json`、`<cwd>/.mcp.json`、`~/.codex/` 等任何外部配置。Skill 加载链由 6 层（内置 → `~/.wyj-code/skills` → `~/.claude/commands` → 插件 → 项目 `~/.wyj-code/skills` → 项目 `.claude/commands`）裁为 4 层（内置 → `~/.wyj-code/skills` → 插件 → 项目 `~/.wyj-code/skills`）；SubAgent 类型加载链同方向 6 层裁为 4 层。MCP 全局配置：`Config::load()` 不再合并 `~/.claude.json`，与 `Config::load_file_only()` 行为一致；项目级 `merged_mcp_servers` 不再读 `<cwd>/.mcp.json`；`project_scoped_mcp_servers` 同款；`uninstall_mcp_server` 删"原生来源 → 落禁用记录"兜底分支，统一走"从来源文件删行 + lockfile 移除"。MCP 卸载相关 4 个测试改写（`native_project_mcp_overrides_legacy_toml` 删除；`uninstall_native_origin_server_disables_instead_of_deleting` → `uninstall_wyj_config_server_removes_from_source_and_lockfile`；`uninstalled_native_server_disappears_from_installed_list` → `uninstalled_wyj_project_server_disappears_from_installed_list`；`reads_native_stdio_and_http_servers` 删除）。
+- **BREAKING: 配置加载收敛到 `.wyj-code/`**（全局 + 项目级）。wyj-code 自 v0.2.24 起只读写 `~/.wyj-code/`（全局）与 `<git-root>/.wyj-code/`（项目级），不再读取 `~/.claude/`（commands / agents）、`~/.claude.json`、`<cwd>/.mcp.json`、`~/.codex/` 等任何外部配置。Skill 加载链由 6 层（内置 → `~/.wyj-code/skills` → `~/.claude/commands` → 插件 → 项目 `~/.wyj-code/skills` → 项目 `.claude/commands`）裁为 4 层（内置 → `~/.wyj-code/skills` → 插件 → 项目 `~/.wyj-code/skills`）；SubAgent 类型加载链同方向 6 层裁为 4 层。MCP 全局配置：`Config::load()` 不再合并 `~/.claude.json`，与 `Config::load_file_only()` 行为一致；项目级 `merged_mcp_servers` 不再读 `<cwd>/.mcp.json`；`project_scoped_mcp_servers` 同款；`uninstall_mcp_server` 删"原生来源 → 落禁用记录"兜底分支，统一走"从来源文件删行 + lockfile 移除"。MCP 卸载相关 4 个测试改写（`native_project_mcp_overrides_legacy_toml` 删除；`uninstall_native_origin_server_disables_instead_of_deleting` → `uninstall_wyj_config_server_removes_from_source_and_lockfile`；`uninstalled_native_server_disappears_from_installed_list` → `uninstalled_wyj_project_server_disappears_from_installed_list`；`reads_native_stdio_and_http_servers` 删除）。
 - **/import 全链路删除**：`/import` slash 命令 + TUI `ImportDialog` + `ExtensionCommand::Migrate` + `crates/store/src/import.rs` 整文件（700+ 行） + `crates/config/src/codex.rs` 整文件（Codex 兼容层 150+ 行 + 5 个测试）+ `crates/commands::ImportCmd` + `commands::registry::OpenImportDialog` 枚举成员 + `crates/tui::ImportDialog` struct + `crates/tui::render::draw_import_dialog` 函数（180 行）+ `crates/tui::app::import_dialog` 状态字段 + 键盘 handler + 关闭路径 + `crates/cli::main` `OpenImportDialog` handler + `crates/cli::extensions_cmd::ExtensionCommand::Migrate` 枚举成员 + dispatch + `wyj-config` 的 `pub use codex::*` 与 `pub use project_mcp::{load_native_mcp, native_mcp_names}` re-export。i18n `help.body` 模板里 `/import` 行删除（中英同步），`import.*` keys（desc / headless_unsupported / dialog / label / report / applied_notice / nothing / shadowed_note / errors / overwritten 等）整段删除。`extensions list/doctor/install mcp/remove mcp:*` 行为不变；用户跨来源导入需求改为手工复制粘贴到 `.wyj-code/`。
 - **删除死代码工具函数**：`wyj_config::load_native_mcp`、`wyj_config::native_mcp_names`、`wyj_config::codex_home_dir`、`wyj_config::load_codex_mcp`、`wyj_store::extensions::native_mcp_candidates` 全部删除（仅被 `/import` 子链路引用）；`serde_json::Value` import 在 `project_mcp.rs` 不再需要也清理。`doctor` 命令里"提示迁移原生 MCP 配置"的循环删除。
 - **测试清理**：`crates/store/src/mcp_install::tests::install_then_uninstall_roundtrip` 不变（已经走 wyj 路径）；`crates/commands::skill::tests` 中 mock `.claude/commands/` 的 4 个测试改写为 `.wyj-code/skills/` 路径；`crates/core::agent_def::tests` 中 mock `.claude/agents/` 的 3 个测试改写为 `.wyj-code/agents/` 路径；Skill 链裁层后"同作用域内真 CC 覆盖 wyj"边界测试删除，等价边界由 `.wyj-code/skills` 同层测试覆盖。
 - **回归 / 验证**：cargo check + cargo test 全绿（1099 测试通过，本次改动引入的失败 0；CLAUDE.md 同步更新 Skill 链 / Agent 链 / MCP 加载边界。
 - **TUI 任务列表收口**：LLM 完成最后一回合直接出最终回答而不再调用一次 TodoWrite 把最后一项 InProgress 改成 Completed 时，UI 会卡在"[N/N] ⋯ xxx"这种永远不收口的"进行中"状态——典型场景：用户看到 AI 已回复但任务列表还显示进行中。`AgentEvent::TurnDone` 分支（`crates/tui/src/app.rs`）增加清扫，把任何遗留 InProgress 的 todo 自动改为 Completed，并复用既有 TodoUpdate 路径同款 `started_at.take()` + `elapsed_secs +=` 收口逻辑，保证 stats 数字连续。`Error` 分支保持现状（保留 InProgress 让用户知道哪条卡住）。新增 2 个回归测试（`turn_done_auto_completes_remaining_in_progress_todos` 核心场景 + `turn_done_with_no_in_progress_keeps_state_untouched` no-op 边界）。
 
-## [1.5.14] - 2026-10-03
+## [0.2.23] - 2026-10-03（原 1.5.14）
 
 - **统一通知通道**：任务完成 / 错误 / 后台子 Agent 完成 / 定时任务失败首次接入系统通知。新增 `wyj_core::notify`（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用），覆盖 4 类事件（`TurnFinished` / `TurnError` / `SubAgentDone` / `ScheduleFailed`）+ 2 类 sink（终端响铃 stderr `\x07` + 桌面通知 macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast）。零新第三方依赖。Config 新增顶层 `[notify]` block（`enabled`/`bell.enabled`/`desktop.enabled`/`events.{turn_finished,turn_error,subagent_done,schedule_failure}`/`rate_limit_seconds`/`include_session_id`），主开关与桌面通知 opt-out 默认开、终端响铃 opt-in 默认关、events.subagent_done 用户选择 opt-out 默认开，rate-limit 默认 30s（同类事件最小间隔防滥用，0 = 关闭）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关、`WYJ_CODE_NOTIFY_BELL=0/1` 覆盖 `bell.enabled`、`WYJ_CODE_NOTIFY_DESKTOP=0/1` 覆盖 `desktop.enabled`（env 在 init 阶段读取，绝不写回 cfg，仿 `Config::runtime_api_key` 的 env 不回写语义）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。7 个触发点（TUI TurnDone / TUI Error / TUI 后台 SubAgentDone / CLI `-p` / CLI headless REPL / cron schedule 失败 / daemon ACP 故意不接）已全部接入，ACP/daemon 长跑后端无人类会话上下文故不通知。9 个 notify 单测 + 3 个 config 单测全绿。
 - **Ghostty 终端适配提示**：macOS 上 osascript 的通知归属是当前终端 app 的 bundle ID。在 Ghostty / iTerm / Cursor 等非 Terminal.app 终端跑 `wyj-code` 时，需在 `System Settings > Notifications > <终端 app 名>` 打开 Allow notifications；BellSink 写 stderr `\x07` 在 Ghostty 默认静音，需在 `~/.config/ghostty/config` 启用 `bell-on-urgent = true` + `bell-features = audible`。
 
-## [1.5.12] - 2026-09-08
+## [0.2.21] - 2026-09-08（原 1.5.12）
 
 - **TUI 终端 panic 兜底还原**：新增 `crates/tui/src/panic_guard.rs` 进程级 `panic::set_hook`，`cli::main()` 入口最前 `wyj_tui::panic_guard::install()`（`take_hook` 链式保留前一个 hook），`run_tui` 在 `enter/leave_terminal_screen` 配对 `mark_active()` / `mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时若 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。告别"TUI 进程 panic 后终端卡死在 raw mode + alternate screen 残留 frame + panic 写 stderr 覆盖 ratatui cell 造成画面撕裂"的复合失败模式。
 - **CJK / emoji 字符串截断安全**：新增 `wyj_core::textutil::floor_char_boundary(&str, usize) -> usize`，按字节切字符串时先回退到最近 char boundary 再 `String::truncate`，治本 `memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时撞 CJK/emoji char boundary 触发的 `is_char_boundary` assertion panic（2026-09 用户跑 `stock_fenxi` 项目时实触发）。与 `wyj-tools::textutil::truncate_str` 分工：这里是 `usize` 索引版本，配合 `String::truncate` 做原地截断避免重复分配。
 - **TUI 标题栏 / 状态栏文案精简**：`thinking_status_label` 改回单层优先级静态字符串（InProgress TodoItem 的 `active_form` / `content` → current_op 映射 `Reading file / Running command / Editing file / Updating todos / Delegating task / Browsing / Preparing plan / Running <Tool>` → permission_dialog → plan_dialog → pending_queue → fallback `Thinking`），砍掉旧的"大象装进冰箱"4 秒旋转短语（多语言干扰、跨平台兼容性差）。`draw_input` 标题栏只在 thinking 态保留 `⠋ {label}{suffix}`（spinner + label + animated dots）+ 加粗品牌橙；非 thinking 态 Plan/Bypass/Normal 三种模式标题栏分别精简为 `[plan] Enter to send` / `[bypass] Enter to send` / `Enter to send`，把 `↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode` 等长串提示砍掉（这些在顶部 `/help` 与 docs 里有完整说明）。状态栏（`draw_status`）默认右侧不再放 `ctrl+d or ctrl+c twice to exit  /help`，留给左侧"模型 / 进度 / 用量 / cwd"；thinking 指示器单点（标题栏）而非上下两处同闪烁。
 - **修复 TUI 思考时光标卡死的回归**：删除 `draw_input` 在 `is_thinking=true` 时提前 `return` 的旧逻辑——那个 `return` 跳过了末尾 `f.set_cursor_position(...)`，crossterm 硬件光标永远停在"上次成功提交瞬间"的位置、用户主观感觉光标卡住/错位。现在 thinking 态仍调 `set_cursor_position` 让硬件光标跟随用户实际操作，配套新增两个 `TestBackend` 回归测试（`draw_input_keeps_cursor_visible_while_thinking` + `draw_input_title_shows_thinking_spinner_when_thinking`）防止再次回归。
 
-## [1.5.11] - 2026-09-05
+## [0.2.20] - 2026-09-05（原 1.5.11）
 
-- **Session 存储 CAS + Delta 重构（M1-M4）**：新增 `crates/core/src/workspace_cas.rs` 提供 sha256 内容寻址 Blob Pool（`intern / get / release / gc / stats`），CAS 路径 `~/.wyj-code/cas/sha256/aa/bb/<hash>.blob + .meta.json`。`FileEntry { hash, inline_bytes, size, sha256 }` 替代内联字节，serde 用 `#[serde(default, alias = "bytes")]` 兼容旧 v1.5.10 checkpoint。`WorkspaceSnapshot::Delta(DeltaSnapshot)` 同 cwd 自动 fold 父链（最多 20 层），跨 cwd 强制 baseline。`externalize_block_with` 把 >32KB image 与 >16KB thinking 外置，`cas://<hash>` 引用 + `materialize_block_with` 在 resume 时还原。`gc()` 用 `last_ref_at` LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。
+- **Session 存储 CAS + Delta 重构（M1-M4）**：新增 `crates/core/src/workspace_cas.rs` 提供 sha256 内容寻址 Blob Pool（`intern / get / release / gc / stats`），CAS 路径 `~/.wyj-code/cas/sha256/aa/bb/<hash>.blob + .meta.json`。`FileEntry { hash, inline_bytes, size, sha256 }` 替代内联字节，serde 用 `#[serde(default, alias = "bytes")]` 兼容旧 v0.2.19 checkpoint。`WorkspaceSnapshot::Delta(DeltaSnapshot)` 同 cwd 自动 fold 父链（最多 20 层），跨 cwd 强制 baseline。`externalize_block_with` 把 >32KB image 与 >16KB thinking 外置，`cas://<hash>` 引用 + `materialize_block_with` 在 resume 时还原。`gc()` 用 `last_ref_at` LRU 淘汰 0-ref blob，对齐 git pack-files 语义。实测：单 checkpoint 11MB → ~100KB，21 checkpoint 长会话从 ~230MB → ~3MB（~99% 压缩）。
 - **`/new` slash 命令**：对齐 Claude Code 新会话语义——自动保存当前会话历史后分配新 session_id、清空 TUI 状态、无二次确认弹窗；与 `/clear` 区分（清空 ≠ 全新会话）。
 - **`wyj-code storage {status,doctor,prune}` 子命令**：占用诊断与 GC 治理，`status --json` 可脚本消费。
 - 869 workspace 测试 + clippy clean。
 
-## [1.5.10] - 2026-08-31
+## [0.2.19] - 2026-08-31（原 1.5.10）
 
 - 50GB 级磁盘占用默认 cap：Evolution per-project 100MiB + 28–180 天 TTL；Session checkpoint 20/session、Memory v2/v3 records/Superseded 单独计数；Schedule 日志 50 文件 + run.log 10MiB×3 轮转；plugin .git 7 天 `git gc`；workspace worktree 30 天 prune；持久化前 content 截断（tool_result 20K+10K、thinking 8K、tool_use.input 64K）；顶层 `~/.wyj-code` 达 5GiB 启动一次性 warn；全部 opt-out by `0` in config。
 - 首次启动 `~/.wyj-code` 缺失时 TUI 自动打开 /model 引导用户填写 API Key（焦点预置 api_key 字段），写盘后 chmod 0600 自动重建 agent，无需重启；headless / -p / ACP / daemon 无 UI 时继续报错但给出指向 TUI 与 `WYJ_CODE_API_KEY` 的可复制 hint。
 - MiniMax M3 thinking 按 `effort_levels` 拆出 `ReasoningEffort`，与 M2 协议并行走不同 vendor dispatch 与 capability 路径。
 
-## [1.5.7] - 2026-08-26
+## [0.2.16] - 2026-08-26（原 1.5.7）
 
-- v1.5.7 国产模型适配 8 项收口：reasoning_content 落盘 / image_url / tool_result 降级 / R1 max_iterations / loop detection / doctor。详见对应 plan。
+- v0.2.16 国产模型适配 8 项收口：reasoning_content 落盘 / image_url / tool_result 降级 / R1 max_iterations / loop detection / doctor。详见对应 plan。
 
-## [1.5.6] - 2026-08-22
+## [0.2.15] - 2026-08-22（原 1.5.6）
 
 - **Memory v3 最终设计落地**：把 v3 收敛为 Global / Project 两层（删除共享 Workspace scope 与自动迁移旧数据），AI 自动管理项目记忆、Project 覆盖 Global 冲突、reference 不进入 Brief；Global 背景提取走 `PendingGlobalCandidate`，由模型用 `Memory` 工具 `list_pending_global_candidates / confirm_global_candidate / reject_global_candidate` 三步自然语言确认，reject 后的 `(scope,kind,title,content_fingerprint)` 写入 `rejected_history.json`，重复提议同一指纹会被立即拒绝。Evolution 收敛到 `GovernanceOnly`：`EvolutionStore::new` 不再 `create_dir_all("memories")`，普通 Memory 数据层只保留兼容桩，cfg 删除 `auto_activate_memories` / `generate_experiences` 字段，普通 Memory 不再被注入也不再自动生成。
 - **Task 类型 + Project Brief + "继续" 语义**：新增 `MemoryClaimKind::Task` + `TaskStatus { InProgress, Completed, Cancelled, Blocked }` + `TaskStep[]` + `blocked_reason`；同 title + InProgress 的新写入自动 supersede 旧 InProgress 任务。`MemoryV3Store::project_brief` 动态生成 Project Brief（Open Tasks 含 next step + blocked_reason、Latest Mutable State、Recent Important Events、Top Relevant Project/Global Claims，reference 类型不出现），不写盘避免与结构化记忆双写漂移。Agent 在用户输入 `继续 / 接着 / continue / resume / 再来 / go on` 时自动注入最近 InProgress Task 详情 + 全部 Open Tasks 概览；无开放任务走 `memory.continuation.no_open_tasks` i18n key。
 - **`/memory clear-all` 一键清空重建**：TUI `/memory` 面板新增 `ClearAll` 行 + 二级确认（Enter 进确认态、y 真正执行、Esc/n 取消），CLI `wyj-code memory clear-all [--yes]`（未带 `--yes` 直接 hard-bail）。`MemoryV3Store::clear_all` 把 `records/jobs/audit` 全部 `fs::rename` 到 `backups/<ts>/`、写 `manifest.json`、落 `reset_marker.json`，**保留 `rejected_history.json`**（用户曾拒绝的指纹不可遗忘），重建目录后 `active_records == 0`。Memory 工具收到 `action=clear_all` 立即 `ToolResult::err` 拒绝 AI 直调，与"AI 不允许静默触发清空"原则对齐。
 - **Evolution 普通 Memory 死代码清理**：与 v3 数据面收敛同步，删除 `EvolutionStore` 内不再可达的 9 个普通 Memory 治理 helpers（`memory_relevance` / `is_relevance_stopword` / `should_activate_memory` / `detect_memory_conflicts` / `refresh_memory_statuses` / `repository_identity` / `memory_status_rank` / `memory_injection_priority` / `dedupe_memories`）、2 个 candidate 写入函数（`upsert_skill_candidate_unlocked` / `upsert_rule_candidate_unlocked`）、`MemoryIndex` 结构与 `MEMORY_INDEX_FILE` / `CONTEXT_HEADER` 常量、`AnalysisItem.explicit_user_statement` / `user_quote` 死字段、`resolve_legacy` 兼容方法；`cargo clippy --workspace --all-targets` 零警告零错误，775 个测试全绿。
 
-## [1.5.5] - 2026-08-04
+## [0.2.14] - 2026-08-04（原 1.5.5）
 
 - **证据化本地自进化 L0-L3**：每个用户目标落盘为独立 Episode，并按用户反馈、确定性测试、Review、工具结果和取消状态形成可审计 outcome；从成功/失败证据提炼带 scope、citation、TTL、冲突和当前分支验证的 Memory v2，按当前目标相关性和 8KB 预算选择性注入。Web/MCP/ToolSearch Episode 默认隔离，只有显式 include 后才允许形成仓库级候选。
 - **Rule / Skill 候选与人工治理**：重复工作流和失败模式可生成 Rule/Skill 候选，Skill 自动构造直接、间接、信息不全、负向和安全边界共至少 8 个结构化 eval，并展示历史成功 Episode/Session 证据；当前不执行逐例 Agent replay、安装前后成功率对照或完整 benchmark。Rule 和 Skill 均不会自动激活。新增 `/evolve` 四视图治理中心与 `wyj-code evolve {status,list,review,feedback,skillize,approve,reject,rollback,forget,run,include,migrate,export,doctor}`，批准 Skill 前创建保护 checkpoint，项目/全局安装通过原子文件与 lockfile 写入，支持跨进程恢复旧内容。
-- **本地、限额、可迁移**：Evolution 默认空闲 5 分钟、单 worker、每日 50,000 token / 30 分钟、每项目 100 MB；连续可恢复错误最多三次退避，三次失败后在 Health 暴露。旧 Markdown Memory 先 preview、再原子迁移并保留带时间戳备份；L4 核心代码自修改明确延后 v1.6.0，v1.5.5 不包含无人监督的自改代码。
+- **本地、限额、可迁移**：Evolution 默认空闲 5 分钟、单 worker、每日 50,000 token / 30 分钟、每项目 100 MB；连续可恢复错误最多三次退避，三次失败后在 Health 暴露。旧 Markdown Memory 先 preview、再原子迁移并保留带时间戳备份；L4 核心代码自修改明确延后 v0.4.0，v0.2.14 不包含无人监督的自改代码。
 - **TUI 多图片编辑修复**：输入框内图片占位符按顺序显示为 `[Image #1]` / `[Image #2]`；支持连续粘贴多张不同图片，并可在真实文本起点用 Backspace 从右向左逐个删除图片/文件附件，占位符仍只用于渲染，不会混入发送给模型的正文。
 - **TUI 鼠标滚轮不再翻动输入历史**：根因是 Ghostty 在 alternate screen 且应用关闭 mouse capture 时，DEC mode 1007 会把滚轮转译为无修饰 `Up/Down`，随后被 Composer 的 `navigate_input_or_history` 误当真实键盘。Ghostty 直连路径现通过 Kitty 键盘 release/repeat 事件区分两者，滚轮只滚动内容区，真实 `↑/↓` 仍保留输入光标/历史语义；其它终端及 tmux/zellij 路径会成对保存、关闭、恢复 mode 1007，防止伪方向键污染输入。全程仍保持 `DisableMouseCapture`，不回退无需 Shift/Option 的终端原生拖选复制。
 - **本地 Bash 环境与联网修复**：sandbox 新增 `network.allow_all` 以及 `environment.inherit/allow/deny` 配置，解决宿主网络正常时 Bash 仍表现为 DNS 解析失败、以及自定义环境变量被 `env_clear()` 无差别清空的问题；默认严格边界不变，启用继承时仍默认隔离 wyj-code 自身 provider/search/probe key。
 - **computer-use 跨会话记忆污染修复**：当前请求显式注入真实工具清单并声明其高于历史记忆，`default/bypass` 仅影响审批而不移除 schema；自动记忆提取与解析同时拒绝保存"本轮/本会话缺少 Bash 或 computer-use"等瞬时运行状态。
 
-### 1.5.5 发布后追溯补录（功能随 v1.5.5 同期 ship，但条目最初漏记在 CHANGELOG 中；本次 v1.5.6 文档整理时一并补全）
+### 0.2.14 发布后追溯补录（功能随 v0.2.14 同期 ship，但条目最初漏记在 CHANGELOG 中；本次 v0.2.15 文档整理时一并补全）
 
 - **macOS App 启动走一次性宿主审批**：定位 `open -a` 的 LaunchServices `-54` 为 Seatbelt 专用 `lsopen` 权限缺失；通用 Bash profile 继续不授予该外部副作用，避免任意沙箱命令无提示启动 App、打开 URL/文件。Bash 新增 `run_outside_sandbox=true` 显式越界请求，仅非 Plan 的 TUI/ACP 可逐次批准且不可持久化，plan、headless、schedule、hook、SubAgent 继续 fail-closed；模型侧 GUI 指引同步要求使用该受控路径，并对旧 `-54` 输出给出可执行诊断。
 - **TUI 图片占位符跟随粘贴位置**：图片/文件附件改为输入编辑序列中的结构化原子，`[Image #n]` / `[File: ...]` 会显示在实际粘贴光标处，之后输入的文字保留在占位符之后；Backspace/Delete 可在对应位置删除附件，内部标记不会进入历史或 Provider 正文。
@@ -546,33 +593,33 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **Release CI 可恢复发布**：Release workflow 现在支持从默认分支手动选择并严格校验既有 annotated tag，checkout、tag dereference 与 `HEAD` 必须一致后才允许测试和打包；用于修复 CI 基础设施时无需移动已公开 tag，也不会把 tag 之后的产品代码混入旧版本资产。
 - **Linux sandbox 发布门禁**：GitHub Ubuntu Runner 显式安装 bubblewrap；若 Ubuntu 24.04 AppArmor 启用了 `kernel.apparmor_restrict_unprivileged_userns`，只在临时 Runner 内解除限制并执行 bwrap 预检，确保 Linux 环境隔离测试验证真实 sandbox，而不是因 runner 缺少依赖或 namespace 权限误失败。
 
-## [1.5.4]
+## [0.2.13]（原 1.5.4）
 
 - **Computer-use 只读权限与工具语义对齐**：统一权限策略现在按 `action` 区分 `computer` / `app_computer` 的只读观察与变更操作。`screenshot`、`zoom`、`cursor_position`、`wait`、`list_windows`、`inspect_element` 可在 headless/daemon 的 Prompt 模式下执行，不再因为缺少交互审批通道被整类工具误拒。
 - **变更操作继续失败关闭**：点击、输入、滚动及未知/缺失 action 在无 UI 表面仍拒绝；交互表面仍返回逐调用审批，AutoApprove、Allowlist、Plan、sandbox、foreground compatibility 与项目级授权边界均未扩大。
-- **不可移动发布边界**：v1.5.3 已完成五平台 Release、11 个资产和 Pages 发布，因此保持原 tag 不变；该发布后发现的权限前置判断缺口以 v1.5.4 新补丁交付。
+- **不可移动发布边界**：v0.2.12 已完成五平台 Release、11 个资产和 Pages 发布，因此保持原 tag 不变；该发布后发现的权限前置判断缺口以 v0.2.13 新补丁交付。
 
-## [1.5.3]
+## [0.2.12]（原 1.5.3）
 
 - **Computer-use lazy schema 保底**：ToolSearch 在工具集很大时仍保留已注册的 `window_capture`、`app_computer` 与兼容 `computer` schema，避免国内模型把“当前未展示”误判成“本会话不支持 GUI”；工具是否注册、foreground compatibility 开关、权限与 sandbox 限制均不扩张。
 - **跨平台 checksum 可移植性**：Windows 打包不再用产生 CRLF 的 `Out-File` 写 sidecar，而是显式写入 ASCII + LF；`SHA256SUMS` 聚合时同时防御性移除行尾 `\r`，因此 Unix `sha256sum/shasum` 不会把 Windows 文件名解析为带回车字符。
 - **发布前实物校验**：Publish Release 在上传前对五个平台归档执行 `sha256sum --check SHA256SUMS`，任一 archive、sidecar 或聚合内容不一致都会阻断 Release，不再把 checksum 可下载误当成 checksum 可用。
-- **不可移动边界**：v1.5.2 的 Test/Lint、五平台 Build 与 Publish Release 均成功，但发布后实物验收发现 Windows checksum CRLF 缺陷；v1.5.3 以新 tag 修复，所有历史 tag 保持不变。
+- **不可移动边界**：v0.2.11 的 Test/Lint、五平台 Build 与 Publish Release 均成功，但发布后实物验收发现 Windows checksum CRLF 缺陷；v0.2.12 以新 tag 修复，所有历史 tag 保持不变。
 
-## [1.5.2]
+## [0.2.11]（原 1.5.2）
 
 - **ToolSearch 核心执行面保底**：lazy schema 在大工具集下始终保留 Read/Glob/Grep/CodeSearch、Bash/Edit/Write、AskQuestion/TodoWrite、Agent/ExitPlanMode 等已注册核心工具，只延迟暴露可选集成；避免国内模型只看到搜索入口却看不到完成编码任务所需的执行工具。Plan/只读子 Agent 仍只暴露其实际注册和授权的子集。
 - **Rust 1.96 严格门禁兼容**：修复 Rust/Clippy 1.96 新增的 `collapsible_match` 与 `unnecessary_sort_by` 告警，覆盖 Agent/Skill frontmatter、工具参数对象提取、MCP 工具稳定排序和 TUI import 确认路径；行为保持不变。
 - **可复现 CI 工具链**：Release 的 Test/Lint 与五平台 Build、Review Action 都固定 Rust `1.96.0`，不再让可变的 `stable` 在 tag 推送后引入未本地复现的新 lint。发布前同时用 Linux Rust 1.96.1 容器执行全 workspace/all-targets 严格 Clippy。
-- **不可移动发布边界**：`v1.5.1` 的 workspace tests 通过，但远端 `stable` 已升级到 Clippy 1.96，新增 lint 使其 Release Action 失败且未生成资产；`v1.5.2` 作为新的补丁版本接替发布，`v1.4.4`、`v1.5.0`、`v1.5.1` 均保持不可移动。
+- **不可移动发布边界**：`v0.2.10` 的 workspace tests 通过，但远端 `stable` 已升级到 Clippy 1.96，新增 lint 使其 Release Action 失败且未生成资产；`v0.2.11` 作为新的补丁版本接替发布，`v0.2.8`、`v0.2.9`、`v0.2.10` 均保持不可移动。
 
-## [1.5.1]
+## [0.2.10]（原 1.5.1）
 
 - **国内模型多工具调用兼容修复**：保守能力目录仍可声明 `max_tools_per_turn = 1` 和禁止并行，但模型若已经在一个完整响应中返回多个合法 `tool_use`，执行器会按能力声明受控串行执行并逐个回填 `tool_result`，不再把额外调用伪装成参数错误，也不会因连续完整多调用响应误触“参数重试耗尽”。工具原始 schema、权限与 sandbox 校验继续逐项生效。
 - **Release CI 跨平台修复**：修复 Linux `detect_backend` 的 `clippy::needless_return`，并按实际使用平台/测试条件编译 computer-use 窗口 generation helper；本机与 Linux/Rust 1.94 的 `cargo clippy --workspace --all-targets --locked -- -D warnings` 均作为发布门禁。
-- **发布边界**：`v1.5.0` annotated tag 已公开且其首轮 Release Action 在 Test & Lint 阶段失败，因此保持不可移动；`v1.5.1` 随后也因 CI 的可变 `stable` 升级到 Clippy 1.96 而未生成 Release 资产，最终发布修复迁移到 `v1.5.2`。
+- **发布边界**：`v0.2.9` annotated tag 已公开且其首轮 Release Action 在 Test & Lint 阶段失败，因此保持不可移动；`v0.2.10` 随后也因 CI 的可变 `stable` 升级到 Clippy 1.96 而未生成 Release 资产，最终发布修复迁移到 `v0.2.11`。
 
-## [1.5.0]
+## [0.2.9]（原 1.5.0）
 
 - **Workflow 自动隔离编码节点**：`wyj-code workflow validate/run/status/control` 已交付 DAG runtime、并发上限、token budget、human approval、pause/resume/retry/skip/cancel 和持久化状态。拥有 Write/Edit/Bash 且配置 `write_roots` 的 Agent/Review 节点会从当前脏工作区 checkpoint 自动创建独立 managed Git worktree；成功和失败现场都保留，结果返回 diff/review/accept 命令，不自动覆盖父 checkout。
 - **Managed Worktree 完整生命周期**：`wyj-code workspace create/list/diff/accept/dispose` 支持 binary-capable diff、遗漏路径提示和选择性接受；接受前防御 symlink 逃逸、父 checkout HEAD 前进、用户并发修改与 binary 漏应用，强制清理必须显式 `--force`。
@@ -583,9 +630,9 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **Review 与执行安全收口**：新增 `wyj-code review run` 和 GitHub Review Action，扫描 rename、空格路径、binary numstat，并对 secret evidence 脱敏；headless REPL 的 `!command` 统一走 SandboxRunner，不再通过 `sh -c` 绕过隔离。Release CI 强制执行 workspace 全量测试与 `clippy -D warnings`。
 - **整合 TUI 交互改进**：纳入 Markdown 表格/timeline 物理行网格、终端原生鼠标拖选、OSC 8 文件/网页超链接、稠密渲染、welcome/theme 调整，并保持普通 `↑/↓` 留在 Composer，已退休的 `Shift+↑ content` 文案不再恢复。
 - **国内模型边界不夸大**：未读取或使用此前暴露的 MiniMax Key；live probe 仍只接受独立 `WYJ_CODE_PROBE_API_KEY`。MiniMax 和其他无独立轮换 Key 的国内模型继续标记为 `static_only` / protocol-compatible。
-- **版本**：工作区版本升级到 `1.5.0`；已发布的 annotated tag `v1.4.4` 保持不可移动。
+- **版本**：工作区版本升级到 `0.2.9`；已发布的 annotated tag `v0.2.8` 保持不可移动。
 
-## [1.4.4]
+## [0.2.8]（原 1.4.4）
 
 - **国内模型可信运行时**：新增 vendor / wire protocol 分离的 `ModelCapabilities`、能力来源与置信度、静态模型目录和 TTL cache；覆盖 GLM、MiniMax、Kimi、DeepSeek、Qwen/百炼、豆包/火山，以及 Ollama/vLLM/OpenAI-compatible 兼容端点。`wyj-code model doctor` 与 `/model doctor` 默认只做静态诊断，显式 live probe 只读取独立的 `WYJ_CODE_PROBE_API_KEY`。
 - **工具调用不再带病执行**：原始工具参数先经过有限 JSON 语法修复，再按原始 schema 校验；缺少必填字段或语义不明时把精确错误回灌给模型定向重试，重试耗尽后停止，禁止退化为空对象或 `null` 执行。Provider 错误统一分类，安全参数可见降级，同厂商/同角色 fallback 只在完整消息边界和可恢复错误上发生。
@@ -595,9 +642,9 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **SubAgent 与 schedule 收口**：SubAgentHub 新增 follow-up、interrupt、retry-last、父子元数据和控制事件 trace；follow-up 只在完整模型/工具边界注入。旧 schedule 自动禁用并要求权限复核，TUI 可编辑 allowed tools、write roots、allowed domains 与 require sandbox，复核后仍需用户再次显式启用。
 - **Secret 与后续接口**：Profile 支持 `api_key_env`，运行时 Key 不会因设置面板保存而物化进 `config.toml`，doctor/config-status 只显示末尾掩码；冻结 `ExecutionWorkspace`、workflow/DAG、前端无关 `SessionEvent`/ACP 和 `CodeIndex` 的 P2 接口，但不宣称已交付完整 worktree、daemon、workflow 或语义索引。
 - **验证状态说明**：本版本没有使用用户此前暴露的 MiniMax Key；MiniMax 与其他未提供轮换 Key 的国内模型保持 `static_only` / protocol-compatible，不宣称 live verified。Linux 域名 allowlist、原生 Windows 同等级 sandbox 仍是明确边界。
-- **版本**：工作区版本升级到 `1.4.4`。
+- **版本**：工作区版本升级到 `0.2.8`。
 
-## [1.4.2]
+## [0.2.7]（原 1.4.2）
 
 - **恢复终端原生鼠标选中**：TUI 启动时显式关闭 mouse capture，聊天内容可直接用鼠标拖选复制，不再要求 Shift/Option；松开修饰键后应用也不会立即用鼠标事件冲掉选区。应用内历史继续通过 PageUp/PageDown 等键盘入口浏览，OSC 8 文件与网页链接仍由终端原生 Command/Ctrl+点击打开。
 - **内容区连续键盘导航**：普通 `↑/↓` 始终保留给输入框和输入历史；Todo 与 SubAgent 支持键盘选择和单任务详情逐行阅读，`Esc` 按详情 → 列表 → 输入框逐级返回并保留草稿。
@@ -605,19 +652,19 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **Edit/Write 自动 diff 预览**：编辑和写入结果直接展示红色删除、绿色新增、灰色上下文，不再需要手动展开；长 diff 同样遵守三视觉行上限，历史会话恢复后仍保留工具名并正确识别 diff。
 - **稳定的尾部跟随语义**：默认视口跟随内容最后一行；用户主动上滚后保持阅读位置并显示新消息提示，流式 token、工具结果和新消息不会抢走视口，滚回底部后自动恢复跟随。
 - 中英文 `/help` 与输入框快捷键提示同步新交互，并补齐三行预览、长单行换行、diff 配色、跨区域导航和上滚新消息等回归测试。
-- **版本**：工作区版本升级到 `1.4.2`。
+- **版本**：工作区版本升级到 `0.2.7`。
 
-## [1.4.1]
+## [0.2.6]（原 1.4.1）
 
 - **TUI 剪贴板与附件体验修复**：Ctrl/Command+V 会主动读取系统剪贴板，纯图片剪贴板不再因为终端没有产生 bracketed-paste 事件而无法粘贴；文字、图片与文件路径统一走同一条处理链，配置类面板借用输入框时粘贴内容不会再穿透到聊天输入框。
 - 图片与文件改为在输入框内持久显示 `[Image]` / `[File: name]` 占位符，不再额外占用一整条附件面板；占位符只参与渲染，不会混入发送给模型的正文。支持只发送附件，ESC/Ctrl+C 会一次清空文字与待发送附件，并避免重复附加同一图片或文件。
 - **修复旧版前台 `computer` 连续动作误报 `target_changed`**：前台窗口识别改为保留系统 z-order，不再从展示排序后的同 App 多窗口中任取一个；截图观察在真实前台窗口未变化时可跨多次动作复用，因此“点击输入框 → 立即输入”不再被错误拦截，原有约 20 次动作上限与每次动作前的窗口身份复核仍保留。
 - 强化第三方模型 computer-use 指引：精确文字、配置与诊断内容必须由工具结果或 zoom 裁剪证实；AXPress 不支持按固定控件能力处理，不盲目重试；切换到无目标绑定的旧 `computer` 前必须重新确认目标 App 位于最前台。
-- **版本**：工作区版本升级到 `1.4.1`。
+- **版本**：工作区版本升级到 `0.2.6`。
 
-## [1.4.0]
+## [0.2.5]（原 1.4.0）
 
-- **v1.4 computer-use 人机互不干扰架构**：默认改为稳定窗口目标 + macOS Accessibility/目标 PID 后台动作，不移动物理光标、不主动切换前台 App；旧全局 `computer` 降级为默认关闭的 foreground compatibility 工具，禁止从后台失败静默回退。
+- **v0.2.5 computer-use 人机互不干扰架构**：默认改为稳定窗口目标 + macOS Accessibility/目标 PID 后台动作，不移动物理光标、不主动切换前台 App；旧全局 `computer` 降级为默认关闭的 foreground compatibility 工具，禁止从后台失败静默回退。
 - 新增 marker-based `InputArbiter`：精确排除自身合成事件，前台租约被人类输入立即撤销；后台动作按事件类型与目标窗口区域识别冲突，因此用户可持续在其它 App 输入/移动鼠标，只有碰到 Agent 目标窗口时才抢占。Event Tap、权限、锁屏或事件历史异常时失败关闭。
 - 新增 `window_capture list/capture`、`app_computer`、结构化安全错误、前台 PID 前后校验与会话内不兼容动作熔断；删除动作级“检测到用户输入，是否继续”暂停弹窗，headless/cron/子 Agent 无条件禁止旧前台接管。
 - `/computer` 扩展为完整只读诊断：AX/Input Monitoring、稳定窗口枚举、前台回退配置和本地路径/抢占/熔断计数，其中自动前台回退计数是恒零安全不变量。
@@ -626,9 +673,9 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - 新增**项目级 MCP server 信任确认**：`.wyj-code/mcp.toml`/`.mcp.json` 里的 server 会被当子进程执行，随仓库 clone 落地即可能静默跑任意命令，因此改为按内容指纹首次需人工批准；批准记录落在仓库控制不到的 `~/.wyj-code/projects/<key>/`，TUI 面板确认，`wyj-code trust-mcp` 提供无 UI 场景下的手动批准入口，`-p`/headless/`schedule run` 未批准时静默跳过并提示。
 - `.wyj-code/settings.toml` 新增 `disabled_skills`/`disabled_mcp_servers`，按名字禁用 Skill/MCP（不限来源，覆盖六层合并链任意一层），与 lockfile 的 `enabled: false`（仅覆盖 `/extensions install` 装入的条目）互补。
 
-## [1.3.3]
+## [0.2.4]（原 1.3.3）
 
-- **新增 `/schedule` 定时任务系统**（TUI 面板 + CLI `wyj-code schedule {list,add,remove,enable,disable,sync,run}`，详见 `doc/plan/v1.3.3-plan.md`）：
+- **新增 `/schedule` 定时任务系统**（TUI 面板 + CLI `wyj-code schedule {list,add,remove,enable,disable,sync,run}`，详见 `doc/plan/v0.2.4-plan.md`）：
   - 一句话 prompt 或"把当前对话固化为模板"即可生成到点自动执行的任务；wyj-code 本身没有常驻后台进程，定时能力完全依赖系统级 `crontab`（v1 仅 macOS/Linux）唤起 headless 执行，`wyj-code schedule run <id>` 以子进程方式调用自身 `-p "<prompt>" --cwd <dir>` 入口，与手动配置 crontab 完全等价。
   - 面板保存后立即自动同步进系统 crontab，只替换 `# BEGIN/END wyj-code schedule` 标记的区块，不触碰用户其他 cron 条目，首次同步前自动备份原始 crontab。
   - 每个任务独立绑定工作目录；失败不重试，记录失败原因，可选 macOS 系统通知；跨天业务状态（如候选池）由任务 prompt 自行读写文件，框架不做业务状态管理。
@@ -644,7 +691,7 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **修复 `extensions migrate` 冲突检测 bug**：旧实现用 `Config::load()`（会合并 `~/.claude.json`）做去重，导致全局原生 server 全量误报 skipped、且合并结果被误物化写进 config.toml；新实现改用 `Config::load_file_only()` 裸读 config.toml 做冲突检测与写回。
 - **修复 TUI 里 `/extensions` 不可用**：`ExtensionsCmd` 此前只注册在 `standard_registry()`，TUI 实际使用的 `standard_registry_with_skills()` 漏注册。
 
-## [1.3.0]
+## [0.2.1]（原 1.3.0）
 
 - **Computer-use（桌面 GUI 控制，macOS/Windows）**：对接 Anthropic 原生 `computer_20251124` 工具——模型截图观察桌面、合成鼠标点击/拖拽/滚动与键盘输入操控本机 GUI。
   - 新增 `crates/computer`（`wyj-computer`）：`xcap` 截图 + `enigo` 输入合成（两者内部已各自处理 macOS/Windows 差异，无需再手写一套平台分支），坐标缩放数学独立成模块、平台无关可测；仅 macOS/Windows 拉取真实依赖，其余平台编译进桩实现，Linux 首版不支持。
@@ -663,7 +710,7 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
   - **有意的取舍**：为了让鼠标滚轮驱动应用内翻页，同时开启了 `EnableMouseCapture`，代价是终端原生鼠标选中/拖拽复制聊天记录、终端原生 scrollback 缓冲区不再可用（多数终端可用 Option/Shift+拖拽 强制原生选中作为退路）；改为应用内滚动——PageUp/PageDown、鼠标滚轮、Ctrl+O 展开单条消息，历史消息永远留在应用状态里，理论上不会丢。复制最后一条 AI 回复用 Ctrl+Y（不受影响）。
   - **技术依据**：此前两次尝试在 `Viewport::Inline` 模式下"撑满终端高度"实现贴底（`b5729c5` 与本版本内一次收窄重试）都在真实终端上复现了画面撕裂/输入不可见，根因是 Inline 构造/resize 依赖的终端光标位置查询在部分终端下存在竞态。`Viewport::Fullscreen` 的构造路径不查询光标位置，结构上避开了这个问题。
 
-## [1.2.2]
+## [0.1.7]（原 1.2.2）
 
 - **统一 Extensions 资源平台**：新增 `wyj-code extensions` CLI 和 `/extensions` 入口，统一查看、诊断、迁移、安装、升级、启用、禁用和卸载 Skill / MCP / Plugin。
 - **运行时热应用**：MCP 连接、插件 Agent 定义和工具快照在安全 Agent 回合边界原子更新；禁用/卸载后旧工具不会继续暴露给下一回合。
@@ -676,9 +723,9 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - **修复长内容被视口遮挡（可见性优先冻结）**：长 markdown 正文/工具流此前会被「最后可折叠 ToolResult」的冻结封顶困在 Inline viewport 待定尾部，超出可视高度（终端高 70%）的部分既不在屏幕也不在终端 scrollback、彻底无法查看。现在待定尾部一旦超过可视上限即豁免封顶，内容冻结进 scrollback 用鼠标滚轮完整回看；AskQuestion 面板打开期间同样豁免，且打开时强制视口贴底并清掉选中锚点，保证选项区立即可见。MCP/JSON 工具结果的 `⎿` 摘要行不再显示无信息量的 `{`，改取第一条有内容的行。
 - **上下文压缩可靠性**：工具调用密集的单回合不会再产生空消息压缩；完整请求预算纳入系统提示、工具 schema、消息开销与输出预留，UTF-8 截断安全，记忆按反馈、用户、项目、参考资料的优先级注入。
 - **精确 Token 账务**：MiniMax、GLM 与 DeepSeek 的已完成请求优先采用供应商响应中的 `usage` 精确计数；OpenAI 兼容流自动请求并解析流式 usage，Anthropic 兼容流兼容 `message_start` / `message_delta`。发送前的上下文保护仍使用保守估算。
-- **版本**：工作区版本升级到 `1.2.2`。
+- **版本**：工作区版本升级到 `0.1.7`。
 
-## [1.2.0]
+## [0.1.5]（原 1.2.0）
 
 - **自定义 slash 命令对齐真实 Claude Code**：Skill 系统扩展为同时识别真 CC 的
   `~/.claude/commands/*.md`（全局）与 `.claude/commands/*.md`（项目），六层合并链下同作用域内
@@ -698,7 +745,7 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
   `%USERPROFILE%\.wyj-code\bin`）并自动配置 PATH，全程无需 sudo/管理员权限；重复运行幂等，
   不会重复追加 PATH 配置。
 
-## [1.1.0]
+## [0.1.4]（原 1.1.0）
 
 - **新增 Hooks 生命周期自动化系统**：支持在 `.claude/settings.json`（用户级 → 项目级 →
   `settings.local.json` 三源合并）声明 shell hook，在 `PreToolUse` / `PostToolUse` /
@@ -714,14 +761,14 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - 明确记录 TUI Inline viewport 输入框贴底问题的调查结论：确认为 ratatui/crossterm 层面
   限制而非本项目代码可修的 bug，本版本不做改动，保留动态定高方案（见 README「已知限制」）。
 
-## [1.0.2]
+## [0.1.3]（原 1.0.2）
 
 - 修复工具结果展开正文与摘要首行重复的问题。
 - ExitPlanMode 计划面板重构为消息流内的 `PlanProposal`，支持原生鼠标滚轮滚动。
 - 新增 `wyj-code update` 自更新命令（检查 GitHub Release、下载校验、原地替换二进制）。
 - 新增 `build.sh release` 一键发版脚本。
 
-## [1.0.1]
+## [0.1.2]（原 1.0.1）
 
 - 逐调用工具权限确认（Edit/Write/Bash 前弹出权限对话框，支持 AllowOnce/AllowAlways/Deny）。
 - 会话按项目（git 仓库根）隔离存储与恢复。
@@ -730,7 +777,7 @@ wyj-code 自本版起**不再读取任何 `.claude/` 路径**（不是"优先读
 - TUI 聊天区改用终端原生 scrollback（`ratatui::Viewport::Inline` + `insert_before`），
   对齐 Claude Code 的鼠标滚轮/原生选中复制体验。
 
-## [1.0.0]
+## [0.1.1]（原 1.0.0）
 
 - 首个正式版本：Agent 推理循环、双协议 LLM 适配（Anthropic/OpenAI）、内置工具集
   （Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite）、ratatui TUI、Profile 分组配置、

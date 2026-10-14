@@ -1,6 +1,6 @@
 # wyj-code
 
-[![Release](https://img.shields.io/badge/release-v1.5.19-ffb454.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19)
+[![Release](https://img.shields.io/badge/release-v0.3.1-2ee6a4.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.1)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
@@ -21,15 +21,15 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 [贡献指南](./CONTRIBUTING.md)
 
 > **版本状态**：最新公开版本
-> [v1.5.19](https://github.com/wangyooujin/wyj-code/releases/tag/v1.5.19)。
+> [v0.3.1](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.1)。
 > 历史 tag 保持不可移动，一键安装脚本始终下载 GitHub 最新公开 Release。
 >
-> **⚠️ v1.5.19 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
+> **⚠️ v0.2.28 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
 > 显式信任批准。首次启动会弹出信任面板，**不批准则这些 skill 不加载**（斜杠补全
 > 里不出现，模型也看不见、不会推荐）。批准记录落在仓库外，内容变化后需重新批准。
 > 配 cron 定时任务前可先跑 `wyj-code trust`（或 `trust-skills`）一次性批准。
 >
-> **⚠️ v1.5.18 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
+> **⚠️ v0.2.27 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
 > `AGENTS.md`，wyj-code 不再读取任何 `.claude/` 路径。把仓库根的 `CLAUDE.md`
 > 改名为 `AGENTS.md`（或另建一份），否则 wyj-code 读不到你的项目上下文。
 > 详见下方「架构」节的说明与 [CHANGELOG](./CHANGELOG.md)。
@@ -330,7 +330,7 @@ args = ["--flag"]
 |---|---|
 | `~/.wyj-code/config.toml` | 全局 Profile、模型、语言、sandbox 与运行时配置 |
 | `~/.wyj-code/sessions/` | 本地会话、checkpoint 与 SubAgent trace |
-| `~/.wyj-code/cas/` | CAS Blob Pool（v1.5.11+，内容寻址会话快照）|
+| `~/.wyj-code/cas/` | CAS Blob Pool（v0.2.20+，内容寻址会话快照）|
 | `~/.wyj-code/evolution/` | Episode、Memory v3、Rule/Skill 候选数据 |
 | `~/.wyj-code/schedule/` | 定时任务清单 + crontab 标记区块 |
 | `~/.wyj-code/projects/<project_key>/` | 项目级 `allowed_tools.json` 与 `mcp_trust.json` |
@@ -355,7 +355,7 @@ Schedule、Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/arch
 [`CLAUDE.md`](./CLAUDE.md)——那是同时喂给 Claude Code 的项目上下文，是最权威、更新最及时的
 架构参考。
 
-> **注意（v1.5.18 起 BREAKING）**：wyj-code 自己读取的项目记忆文件是 **`AGENTS.md`**
+> **注意（v0.2.27 起 BREAKING）**：wyj-code 自己读取的项目记忆文件是 **`AGENTS.md`**
 > （全局 `~/.wyj-code/AGENTS.md` + 仓库根到 cwd 的祖先链），**不再读取 `CLAUDE.md`**，
 > 也不再读取任何 `.claude/` 路径（hooks 三源同样已迁至 `.wyj-code/settings*.json`）。
 > 本仓库的 `CLAUDE.md` 保留下来是给 Claude Code 等工具用的开发文档；若希望

@@ -65,7 +65,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框、panic 兜底还原 |
 | `crates/cli` | 二进制入口 | 解析 CLI 参数，组装所有 crate；启动 TUI / Headless REPL / 单次 `-p` 模式 / ACP adapter / daemon |
 
-二进制名 `wyj-code`；workspace 版本 `1.5.19`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
+二进制名 `wyj-code`；workspace 版本 `0.3.1`，最低 Rust `1.80`，双协议许可（MIT OR Apache-2.0）。
 
 ---
 
@@ -107,7 +107,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
         ┌──────────────────────────────────────────────────────────┐
         │            SessionStore + HistoryStore                    │
         │   (wyj-core: 持久化到 ~/.wyj-code/sessions/)              │
-        │   CAS Blob Pool + Delta Snapshot (v1.5.11)                │
+        │   CAS Blob Pool + Delta Snapshot (v0.2.20)                │
         └──────────────────────────────────────────────────────────┘
 ```
 
@@ -185,7 +185,7 @@ trait Tool: Send + Sync {
 
 **唯一口径**（`ContextAudit::from_request`）：一次性算出 system / 工具 schema / 对话历史 /
 输出预留 / 协议开销 / 可回收旧工具结果六项，**压缩决策、`/cost`、`/context` 面板全部
-消费它**。v1.5.17 之前压缩决策算 request 级而状态栏算 messages-only，两者差 1 万+
+消费它**。v0.2.26 之前压缩决策算 request 级而状态栏算 messages-only，两者差 1 万+
 token，在 200K 窗口下是 6 个以上百分点的系统性低报。
 
 **触发**：`estimated > context_window - buffer`，其中
@@ -231,8 +231,8 @@ conversation if needed"。清理比摘要便宜（无 output token、不产生�
   `cas_gc_on_start` 提供进程启动时的容量兜底。CAS 不可写时机制**整体关闭**而不降级
   成"就地删掉"。
 
-配置在 `[context_edit]`，`enabled = false` 完全退回 v1.5.16 行为。
-详见 `doc/plan/v1.5.17-context-management-plan.md`。
+配置在 `[context_edit]`，`enabled = false` 完全退回 v0.2.25 行为。
+详见 `doc/plan/v0.2.26-context-management-plan.md`。
 
 **持久化前截断**（`persist_cap`）：
 
@@ -249,11 +249,11 @@ conversation if needed"。清理比摘要便宜（无 output token、不产生�
 即 AGENTS.md / CLAUDE.md 等「项目规约文件」。`core::claude_md::ClaudeMdLoader`：
 
 - 查找范围：全局 `~/.wyj-code/` + 从项目根到 cwd 的祖先链。
-- **按槽位独立回退，命中第一个即停**（v1.5.22）：主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`。`AGENTS.md` 是首选（对齐 AGENTS.md 开放标准），其余是各工具的既有约定名。
+- **按槽位独立回退，命中第一个即停**（v0.2.31）：主槽位 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`。`AGENTS.md` 是首选（对齐 AGENTS.md 开放标准），其余是各工具的既有约定名。
   - 为什么不按"整个家族二选一"：两个槽位独立才能保住 personal override 语义——主文件走 `AGENTS.md`、私有覆盖写在 `CLAUDE.local.md` 时仍然生效。两个槽位各只取一个文件，因此**不存在同一份规约被注入两遍**。
   - 为什么需要回退：这些文件都是项目作者写的规约，读不到等于整个项目的约定对模型不可见；一个"根目录只有 CLAUDE.md"的仓库不该被当成没有任何项目规约。
   - 判定用"有实际内容"而非单纯 `is_file()`：0 字节 / 全空白的主文件继续往下探。
-- v1.5.18 曾硬切到只读 `AGENTS.md`（无回退），v1.5.22 在保留"命中即停、绝不双份注入"的前提下把回退链加了回来。
+- v0.2.27 曾硬切到只读 `AGENTS.md`（无回退），v0.2.31 在保留"命中即停、绝不双份注入"的前提下把回退链加了回来。
 - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
 - 每轮对话开始重新读盘，以 `<system-reminder>` 包装拼进当轮 user 消息末尾（不注入 system、不进历史；文件不变时字节级稳定、缓存可命中）。
 - 工具（Read/Edit/Write/Glob/Grep）触达新子目录时，若该目录有规约文件且本会话未展示过，在 `agent.rs` 工具执行循环里追加到 system 末尾（按目录去重）。
@@ -342,7 +342,7 @@ Checkpoint 支持：
 
 **白名单**：子 Agent 一律不注册 Agent / AskQuestion / ExitPlanMode / TodoWrite / Computer / AppComputer，并继承 Plan 白名单交集。
 
-**轨迹持久化**（v1.2）：`SubAgentHub::emit()` 接入专职后台写手 `tools::trace::TraceWriter`（内部 mpsc 串行 append，调用方零阻塞），把 `SubAgentEvent` 转成落盘用 `TraceEvent`（`ToolStart`/`ToolEnd` 补全完整 input/output JSON，超 `trace_max_bytes_per_agent` 默认 256KB 静默停写）写入 JSONL：`~/.wyj-code/sessions/<session_id>.subagents/a<id>.jsonl`。CLI 子命令 `wyj-code subagent-trace <session_id> [<sub_id>] [--json]` 纯读打印落盘内容。
+**轨迹持久化**（v0.1.5）：`SubAgentHub::emit()` 接入专职后台写手 `tools::trace::TraceWriter`（内部 mpsc 串行 append，调用方零阻塞），把 `SubAgentEvent` 转成落盘用 `TraceEvent`（`ToolStart`/`ToolEnd` 补全完整 input/output JSON，超 `trace_max_bytes_per_agent` 默认 256KB 静默停写）写入 JSONL：`~/.wyj-code/sessions/<session_id>.subagents/a<id>.jsonl`。CLI 子命令 `wyj-code subagent-trace <session_id> [<sub_id>] [--json]` 纯读打印落盘内容。
 
 ---
 
@@ -355,9 +355,9 @@ Checkpoint 支持：
 - 全局 `~/.wyj-code/config.toml` 的 `[[mcp_servers]]`
 - 项目级 `<git-root>/.wyj-code/mcp.toml` 与 `<cwd>/.mcp.json`
 
-**项目级 MCP 信任确认**（v1.4，`store::project_trust`）：项目级 server 计算指纹（按 name 排序后规范序列化再 sha256），未信任时静默排除；批准记录必须落在仓库控制不到的位置 `~/.wyj-code/projects/<project_key>/mcp_trust.json`。CLI `wyj-code trust-mcp [--cwd <dir>]` 做交互式批准；TUI 启动检测到 Pending 时渲染 `BottomPanel::ProjectTrust`；headless/cron 无 UI 通道时一律跳过未信任 server 并打印一次提示（避免 stdin 阻塞）。
+**项目级 MCP 信任确认**（v0.2.5，`store::project_trust`）：项目级 server 计算指纹（按 name 排序后规范序列化再 sha256），未信任时静默排除；批准记录必须落在仓库控制不到的位置 `~/.wyj-code/projects/<project_key>/mcp_trust.json`。CLI `wyj-code trust-mcp [--cwd <dir>]` 做交互式批准；TUI 启动检测到 Pending 时渲染 `BottomPanel::ProjectTrust`；headless/cron 无 UI 通道时一律跳过未信任 server 并打印一次提示（避免 stdin 阻塞）。
 
-**项目级 skill 信任确认**（v1.5.19，`store::skill_trust`）：`<git-root>/.wyj-code/skills/` 随 `git clone` 落地、内容由仓库作者控制，skill 正文是纯文本指令、敲 `/xxx` 后整段作为 user message 进入对话成为模型指令（且其 `description` 自 v1.5.18 起已注入 system prompt，模型会主动推荐这些命令）。门控强度与 `project_trust` 对齐：只覆盖项目级来源，批准记录落 `~/.wyj-code/projects/<project_key>/skill_trust.json`（复用 `project_trust::project_trust_record_path`，同样必须在仓库内容控制不到的位置）。
+**项目级 skill 信任确认**（v0.2.28，`store::skill_trust`）：`<git-root>/.wyj-code/skills/` 随 `git clone` 落地、内容由仓库作者控制，skill 正文是纯文本指令、敲 `/xxx` 后整段作为 user message 进入对话成为模型指令（且其 `description` 自 v0.2.27 起已注入 system prompt，模型会主动推荐这些命令）。门控强度与 `project_trust` 对齐：只覆盖项目级来源，批准记录落 `~/.wyj-code/projects/<project_key>/skill_trust.json`（复用 `project_trust::project_trust_record_path`，同样必须在仓库内容控制不到的位置）。
 
 **指纹必须覆盖整棵树、含 `references/`**——`references/` 虽不被 `load_skills` 注册成命令，但它是**经由已批准的 SKILL.md 可达的二阶注入面**（SKILL.md 可写"先读 `references/x.md` 再动手"，而模型有 Read 工具）。只哈希 SKILL.md 的话，攻击者可以提交干净 SKILL.md + 恶意 references、获批后再改子文档即绕过。故哈希范围刻意做成加载器注册范围的**严格超集**：递归不 follow symlink（防符号链接环 DoS）、symlink 按 link target 字符串入哈希、哈希一切普通文件不过滤扩展名。指纹是**纯内容哈希**（不含 mtime/inode/权限），`git checkout` 的字节级还原不会被误判成"内容变了"；另加 32 MiB 累计预算。回归测试 `fingerprint_changes_when_reference_doc_changes` 是这条不变式的钉子。
 
@@ -365,7 +365,7 @@ Checkpoint 支持：
 
 ### Skill / 自定义命令
 
-四层合并链（v1.5.15 起由六层裁剪）：内置 → `~/.wyj-code/skills` → 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。**第 4 层受信任门控控制**（v1.5.19，见上「项目级 skill 信任确认」），未批准时整层不加载。**不读取 `~/.claude/commands/` 或任何外部源**（v1.5.18 起连整个 `~/.claude/` 目录都不再读取；项目**目录内**的 `CLAUDE.md` 作为规约文件被读取是另一回事，见「项目规约文件注入」）。
+四层合并链（v0.2.24 起由六层裁剪）：内置 → `~/.wyj-code/skills` → 已启用插件贡献路径（先到先得）→ `<git-root>/.wyj-code/skills`（最高优先级）。**第 4 层受信任门控控制**（v0.2.28，见上「项目级 skill 信任确认」），未批准时整层不加载。**不读取 `~/.claude/commands/` 或任何外部源**（v0.2.27 起连整个 `~/.claude/` 目录都不再读取；项目**目录内**的 `CLAUDE.md` 作为规约文件被读取是另一回事，见「项目规约文件注入」）。
 
 - 支持单文件 `name.md` 与目录式 `name/SKILL.md`（命中目录式入口后不再递归注册其 `references/assets/*.md` 私有资源）。
 - frontmatter：`description` / `argument-hint` / `allowed-tools` / `model`（复用 `core::frontmatter::parse`）。
@@ -414,15 +414,15 @@ Checkpoint 支持：
 
 TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底部、全部历史应用内滚动。
 
-**extended thinking 默认整块折叠**（v1.5.18+）：流式期间只画一行 `⎿ ⠋ 思考中…`（**完全不碰 content**——旧实现每帧把整个 thinking buffer 重新折行一遍、再只取前 3 行扔掉）；固化后折叠成一行元信息 `⎿ 已思考 12s（41 行）  ·  Ctrl+O 展开`，`Ctrl+O` 全局切换后出全文。之所以不给逐条展开：`Ctrl+O` 此前完全空闲，而聊天区的「无选中」语义（`_ => leave_content_focus()` 兜底、Enter = 回输入框）都是围绕"没有消息选中游标"设计的，把历史上被刻意移除的消息选中搬回来回归面过大。耗时取自 `AppState.thinking_started`，固化时落到 `ChatMessage.thinking_elapsed_secs`（不复用按工具语义消费的 `elapsed_secs`）；`/resume` 的旧会话没有耗时记录，显示无秒数变体而非假的 `0.0s`。折叠头用 `⎿`(U+23BF) 而非旧实现的 `✻`(U+273B)：后者属 Dingbats 区，终端字体覆盖率低一个量级，缺字形时画成豆腐块。
+**extended thinking 默认整块折叠**（v0.2.27+）：流式期间只画一行 `⎿ ⠋ 思考中…`（**完全不碰 content**——旧实现每帧把整个 thinking buffer 重新折行一遍、再只取前 3 行扔掉）；固化后折叠成一行元信息 `⎿ 已思考 12s（41 行）  ·  Ctrl+O 展开`，`Ctrl+O` 全局切换后出全文。之所以不给逐条展开：`Ctrl+O` 此前完全空闲，而聊天区的「无选中」语义（`_ => leave_content_focus()` 兜底、Enter = 回输入框）都是围绕"没有消息选中游标"设计的，把历史上被刻意移除的消息选中搬回来回归面过大。耗时取自 `AppState.thinking_started`，固化时落到 `ChatMessage.thinking_elapsed_secs`（不复用按工具语义消费的 `elapsed_secs`）；`/resume` 的旧会话没有耗时记录，显示无秒数变体而非假的 `0.0s`。折叠头用 `⎿`(U+23BF) 而非旧实现的 `✻`(U+273B)：后者属 Dingbats 区，终端字体覆盖率低一个量级，缺字形时画成豆腐块。
 
-**工具结果同样默认折叠**（v1.5.19+）：`MessageRole::ToolResult`（含 Edit/Write 的彩色 diff）与 thinking 共用同一个 `AppState.output_expanded` flag 和同一个 `Ctrl+O` 开关——默认只渲染 `⏺ Bash(...) · 0.0s` 标题行、正文一个字符都不出，`Ctrl+O` 后出**全文**且不再有任何行数上限，对齐 Claude Code。`render_tool_result_block` 照抄 thinking 的形状（画完标题行即 `if !ctx.output_expanded { return; }`），因此折叠态连 `tool_result_content_lines`（会把整个 `content` `lines().collect()` 成 Vec）都不会触碰——把「每帧构建完整 preview 再只取 3 行扔掉」的旧浪费一并消灭。原先为 3 行预算打的补丁随之分化：纯预算启发式（三行截断 `...`、错误 head+tail 的 `⋮`、空行过滤）全部删除；与预算无关的表达层规范化（剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、错误首行红/其余 dim）全部保留。`!` bash 输出（`MessageRole::BashOutput`）是唯一例外，仍保持三行预览，`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines` 现在只服务这条路径。Todo 详情面板的 `ChatRenderCtx` 跟随同一 flag——它重放的是工具消息，硬编码折叠会让面板只剩一排 `⏺ Tool(...)` 标题。
+**工具结果同样默认折叠**（v0.2.28+）：`MessageRole::ToolResult`（含 Edit/Write 的彩色 diff）与 thinking 共用同一个 `AppState.output_expanded` flag 和同一个 `Ctrl+O` 开关——默认只渲染 `⏺ Bash(...) · 0.0s` 标题行、正文一个字符都不出，`Ctrl+O` 后出**全文**且不再有任何行数上限，对齐 Claude Code。`render_tool_result_block` 照抄 thinking 的形状（画完标题行即 `if !ctx.output_expanded { return; }`），因此折叠态连 `tool_result_content_lines`（会把整个 `content` `lines().collect()` 成 Vec）都不会触碰——把「每帧构建完整 preview 再只取 3 行扔掉」的旧浪费一并消灭。原先为 3 行预算打的补丁随之分化：纯预算启发式（三行截断 `...`、错误 head+tail 的 `⋮`、空行过滤）全部删除；与预算无关的表达层规范化（剔除「退出码 N」横幅、Read 剥行号、Edit 只显示 diff 段、错误首行红/其余 dim）全部保留。`!` bash 输出（`MessageRole::BashOutput`）是唯一例外，仍保持三行预览，`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines` 现在只服务这条路径。Todo 详情面板的 `ChatRenderCtx` 跟随同一 flag——它重放的是工具消息，硬编码折叠会让面板只剩一排 `⏺ Tool(...)` 标题。
 
 ---
 
 ## Computer-use 与 Schedule
 
-### Computer-use（v1.3.0+，仅 macOS/Windows 编译）
+### Computer-use（v0.2.1+，仅 macOS/Windows 编译）
 
 - 系统层 `wyj-computer`：`xcap` 截图 + `enigo` 输入合成 + 平台无关的 `scale` 模块。
 - 工具层 `tools::computer::ComputerTool`：双模式由 `new(max_dim, native: bool)` 的 `native` 参数决定。
@@ -430,9 +430,9 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
   - `native=false`：声明为普通 custom 工具，`description`/`input_schema` 动态嵌入实际下采样分辨率，用于第三方兼容端点。
 - 注册门控：平台 `#[cfg]` + `Profile.vision` + `provider == Anthropic` + 端点官方判定，缺一不注册。
 - 物理像素 vs 逻辑像素：macOS Retina 上 `xcap::Monitor` 返回"点"（逻辑），实际截到的是像素；裁剪 / 截图链路必须按"点→像素"换算（`scale::scale_region_to_pixels`），但点击坐标统一用"点"（`enigo` 坐标系）。
-- v1.4 人机互不干扰架构：默认后台目标化执行（`tools::app_computer`），全局前台输入降级为显式兼容模式 `[computer_use].foreground_fallback = disabled|ask|idle_only`，默认 `disabled`；headless/cron/子 Agent 一律禁止前台接管。
+- v0.2.5 人机互不干扰架构：默认后台目标化执行（`tools::app_computer`），全局前台输入降级为显式兼容模式 `[computer_use].foreground_fallback = disabled|ask|idle_only`，默认 `disabled`；headless/cron/子 Agent 一律禁止前台接管。
 
-### Schedule（v1.4）
+### Schedule（v0.2.5）
 
 - 数据层 `store::schedule`：标准 5 段 cron 表达式，原子写到 `~/.wyj-code/schedule/tasks.json`。
 - 同步层 `store::cron_sync::sync_crontab`：只替换 `crontab -l` 输出里 `# BEGIN/END wyj-code schedule` 标记的区块，标记外内容原样保留；首次同步前自动备份原始 crontab。

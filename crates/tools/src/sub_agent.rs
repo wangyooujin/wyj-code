@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn definition_schema_accepts_missing_description() {
-        // 回归测试:v1.5.15 之前 schema 把 description 标成必填,模型在多 agent
+        // 回归测试:v0.2.24 之前 schema 把 description 标成必填,模型在多 agent
         // 并行场景漏 description 时直接 tool_arguments_invalid,体感"分派失败"。
         // 现在 description 是 optional,prompt 是唯一必填。
         let defs = Arc::new(vec![AgentDefinition {

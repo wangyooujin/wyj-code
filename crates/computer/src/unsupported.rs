@@ -1,5 +1,5 @@
 //! 非 macOS/Windows 平台的兜底实现：保证 workspace 整体可编译，运行时报错。
-//! v1.3.0 首版不支持 Linux（见 doc/plan/v1.3.0-plan.md “保留边界”）。
+//! v0.2.1 首版不支持 Linux（见 doc/plan/v0.2.1-plan.md “保留边界”）。
 
 use crate::{Capture, DisplaySize, MouseButton};
 use anyhow::{bail, Result};

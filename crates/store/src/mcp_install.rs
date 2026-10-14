@@ -387,7 +387,7 @@ pub async fn upgrade_mcp_server(
 /// 卸载：从 config（对应 scope）删除该条目 + 从 lockfile 删除对应 entry。
 /// 手动条目（lockfile 无记录）同样支持删除 config 条目。
 ///
-/// 自 v1.5.15 起，"原生来源"概念消失——wyj-code 不再读取 `~/.claude.json` /
+/// 自 v0.2.24 起，"原生来源"概念消失——wyj-code 不再读取 `~/.claude.json` /
 /// `<cwd>/.mcp.json`，所有 server 都来自 `~/.wyj-code/config.toml` 或
 /// `<git-root>/.wyj-code/mcp.toml`，所以卸载一律走"从来源文件删行 + lockfile
 /// 移除"统一逻辑，不再走"禁用 + 保留来源文件"的兜底分支。
@@ -658,7 +658,7 @@ mod tests {
 
     /// 回归测试：卸载 `<git-root>/.wyj-code/mcp.toml` 来源的 server 应该真删
     /// （从来源文件删行 + lockfile 移除条目），不再走"禁用 + 保留来源文件"的
-    /// 兜底分支——自 v1.5.15 起，wyj-code 不再读取 `.mcp.json` 等"原生"配置，
+    /// 兜底分支——自 v0.2.24 起，wyj-code 不再读取 `.mcp.json` 等"原生"配置，
     /// 因此该边界测试简化为单一断言：来源文件 + lockfile 都被清空。
     #[test]
     fn uninstall_wyj_config_server_removes_from_source_and_lockfile() {

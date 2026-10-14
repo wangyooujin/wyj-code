@@ -26,7 +26,7 @@ pub enum PermissionDecision {
 
 /// 首次批准后即按项目记住授权的 computer-use 工具。
 ///
-/// 这两个名字分别对应旧前台兼容路径和 v1.4 后台目标化路径。它们仍各自
+/// 这两个名字分别对应旧前台兼容路径和 v0.2.5 后台目标化路径。它们仍各自
 /// 独立授权，避免批准后台语义操作时隐式扩大到风险更高的前台全局输入。
 pub const PROJECT_APPROVE_ONCE_TOOLS: &[&str] = &["computer", "app_computer"];
 

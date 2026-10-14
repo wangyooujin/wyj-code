@@ -437,7 +437,7 @@ pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', 
 /// `!` bash 命令输出的静态预览上限：标题不计入，正文最多展示三个终端视觉行。
 ///
 /// **只对 `MessageRole::BashOutput` 生效**。工具调用结果（`MessageRole::ToolResult`）
-/// 自 v1.5.19 起默认整块折叠、由 `Ctrl+O` 展开出全文，不再经过本上限——见
+/// 自 v0.2.28 起默认整块折叠、由 `Ctrl+O` 展开出全文，不再经过本上限——见
 /// `render_tool_result_block`。此常量是 `push_capped_preview_lines` 的最后依赖，
 /// 删除前需先给 BashOutput 定新策略。
 const TASK_PREVIEW_MAX_ROWS: usize = 3;
@@ -3152,7 +3152,7 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     // 紧贴用户输入框），状态栏保持单一职责，不再额外画 spinner，避免上下两处
     // 同时闪烁 + 与标题栏文字打架。
     //
-    // 这里**刻意不显示上下文占用百分比**（v1.5.17 移除）。三个理由：
+    // 这里**刻意不显示上下文占用百分比**（v0.2.26 移除）。三个理由：
     //   1. 旧实现算的是 `estimate_tokens(messages)`，压缩决策算的是
     //      `estimate_request_tokens`（含 system + 工具 schema + 输出预留），
     //      两者差 1 万+ token，在 200K 窗口下就是 6 个以上百分点的系统性
@@ -8011,7 +8011,7 @@ mod tool_result_fold_tests {
         );
     }
 
-    /// v1.5.17：状态栏不再显示上下文占用百分比与进度条。
+    /// v0.2.26：状态栏不再显示上下文占用百分比与进度条。
     ///
     /// 回归背景有两条，缺一不可：
     ///   1. 旧实现算的是 `estimate_tokens(messages)`，而自动压缩决策算的是
@@ -8052,7 +8052,7 @@ mod tool_result_fold_tests {
     }
 
     /// 反向锁：状态栏只保留「模型 · 模式 · 工作目录」三段常驻信息，
-    /// 自动压缩计数**不再**回到这里（v1.5.20 起从状态栏移除）。
+    /// 自动压缩计数**不再**回到这里（v0.2.29 起从状态栏移除）。
     ///
     /// 移除理由：状态栏每帧都在，它该回答"我在哪 / 我以什么身份在跑"；压缩次数
     /// 是低频、需要主动查询的信息，塞在这里只会把 cwd 往右挤窄屏。压缩是否发生
@@ -8258,6 +8258,7 @@ mod cost_panel_render_tests {
             context_window: 200_000,
             estimated_tokens: 159_164,
             context_audit: None,
+            last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
