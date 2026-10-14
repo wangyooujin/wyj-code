@@ -275,8 +275,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.1 · 模型写错了，没有任何东西告诉它</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次五条改动，指向同一个缺口：<strong>模型知道自己刚做了什么，但没有任何东西告诉它做得对不对</strong>。<br><br><strong class="text-amber-400">① 编辑后自动验证闭环</strong>。复杂任务里最常见的失败不是不会写，而是<strong>不知道自己写错了</strong>——改完十个文件直接交付，没有编译器告诉它第五个文件的类型不匹配。项目在 <code>.wyj-code/settings.json</code> 里声明 <code>verify.command</code>，编辑后由框架自己跑一遍、把结果回灌给模型（<code>core::verify</code>）。三处刻意如此：<strong>未声明 = 完全静默</strong>——不跑子进程、不产生 tool_result 字节、不改变任何行为，零假设是这个特性的第一原则；<strong>命令不硬编码成 <code>cargo test</code></strong>——同一个二进制要服务 Python / Node / Go 项目，且同一项目改十处、跑十次全量测试的代价无法接受；配置与 hooks 同源合并，后者覆盖前者，单值覆盖而非追加。<br><br><strong class="text-amber-400">② TodoWrite 默认开启</strong>。<code>[tools].todo_enabled</code> 默认由关闭改为开启，用户可显式关掉。<br><br><strong class="text-amber-400">③ <code>/context</code> 增加每轮时延画像</strong>。<code>core::session::TurnLatency</code> 跟着 <code>AgentEvent::Usage</code> 一起发，而不是新增事件——两者采集点与生命周期完全相同，拆开只会让发送侧多做一半发送次数。面板据此把「慢」拆成<strong>模型慢</strong>与<strong>重试慢</strong>：重试与退避耗时单列，不计入推理耗时。<br><br><strong class="text-amber-400">④ 推理轮数触顶前自动存档</strong>：新增 <code>CheckpointKind::TurnLimit</code>，触顶收尾之前先落一次 checkpoint，避免状态恰好丢在最难重建的时候。<br><br><strong class="text-amber-400">⑤ MCP 超时不再等于「调用失败」</strong>。超时的文案明确写出「远端可能仍在执行、也可能早已执行完毕」，避免模型把超时读成「没执行」而条件反射重试一个有副作用的工具。<br><br>本版同时<strong>重编版本号</strong>：旧的 <code>1.x.y</code> 自此改为 <code>0.x.y</code>，历史条目按发布顺序连续重编号、每条标题括注原版本号。<strong>1241 个 workspace 测试</strong>（1221 → 1241）+ clippy <code>-D warnings</code> 全绿。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.2 · 转圈不等于在干活</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次四条改动，指向同一件事：<strong>界面上那些让你以为「它在动」的信号，此前多半不可信</strong>。<br><br><strong class="text-amber-400">① Grep 装了就该用 ripgrep，没装也得有得用</strong>。此前 <code>GrepTool</code> 只有一条纯 Rust 路径（<code>ignore::WalkBuilder</code> + <code>regex</code>），全量读文件逐行匹配。现改为<strong>两级、对外行为一致</strong>的后端：<code>rg_binary</code> 只在 <code>PATH</code> 里探测一次，命中上限后直接 <code>kill</code> 子进程（不读完，避免白扫整棵树）；没装 ripgrep 的机器落回纯 Rust 兜底，用 <code>regex_syntax</code> 在 Hir 上抽字面量做 memchr / memmem 预筛，<strong>先整文件字节级粗筛</strong>，没有候选就连二进制 NUL 扫描与 UTF-8 校验都省掉。测试用 <code>assert_both_ways</code> 对同一输入断言两条路径输出一致。三处刻意如此：子进程 <code>RIPGREP_CONFIG_PATH=""</code>，否则用户自己的 rg 配置（如 <code>--smart-case</code>）会<strong>静默改变匹配语义</strong>；<strong><code>-H</code> 必须带</strong>，否则 rg 搜单个文件时只打行号不打路径；大小写不敏感必须用 <code>ParserBuilder::case_insensitive(true)</code> 解析出<strong>已折叠的 Hir</strong> 再抽字面量——把 needle 简单转小写会漏掉 ſ / İ / K 这类 Unicode 折叠特例，造成<strong>静默漏报</strong>，抽不出字面量时宁可退回逐行匹配。忽略语义两条路径也对齐了：旧实现 <code>hidden(false)</code> 会把 <code>.git/objects</code> 一起遍历，且 ignore crate 的 <code>require_git</code> 默认 true——<strong>非 git 仓库里 <code>.gitignore</code> 静默失效</strong>。实测本仓库常规搜索 <strong>10~30×</strong>。<br><br><strong class="text-amber-400">② TUI 底部那一整块文案此前根本没走 i18n</strong>。输入框标题栏 spinner、TodoWrite 面板头、排队提示、thinking 状态行全是硬编码的中英混排（中文界面里夹着 <code>Waiting for approval</code>、<code>Queuing message</code>、<code>ctrl+t to expand</code>），切到英文又是另一种混排。新增 <code>spinner.*</code> 键族收敛，测试对两个 locale 各查一遍并断言四种占位符都接得上——rust-i18n 未解析时是<strong>原样回显 key</strong>，那正是「漏了一半翻译」最难被发现的形态。<code>thinking.running</code> 同时从写死第一帧改成 <code>{frame}</code> 占位符：那行此前在流式期间<strong>永远停在 ⠋</strong>，用户往回滚看历史时整屏只有标题栏在动。<br><br><strong class="text-amber-400">③ 权限弹窗开着的时候，标题栏却显示「Bash(cargo test) · 12.3s」</strong>。<code>Agent::exec_tool_call</code> 是先 <code>emit ToolEvent::Start</code>（TUI 据此写 <code>current_op</code>）<strong>之后</strong>才 <code>ensure_tool_permission</code>，所以弹窗打开期间 <code>current_op</code> 必然非空，而旧优先级把它排在对话框前面——秒表继续走、看着「在忙」，实则整轮卡在等用户点 y。<code>plan_dialog</code> 同构。现在两个对话框都排到 <code>current_op</code> 前面。<br><br><strong class="text-amber-400">④ 窄终端下第一个消失的偏偏是「我的补充还没送达」</strong>。旧实现先 <code>format!</code> 拼整串再交给 <code>truncate_line</code>，而后者是<strong>从尾部截</strong>的——排队提示恰好拼在最后，于是实测 80 列以下第一个消失的就是它。新增 <code>build_thinking_title</code> 改为<strong>按整段丢弃 + 优先级</strong>：<code>tokens</code>(0) &lt; <code>elapsed</code>(1) &lt; <code>queue</code>(2)，全部丢完仍超宽时才对不可丢弃的 label 做省略号截断；无排队时排版与旧实现<strong>逐字符一致</strong>。<br><br><strong>1253 个 workspace 测试</strong>（1241 → 1253）+ clippy <code>-D warnings</code> 全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -320,7 +320,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.1" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v0.3.1 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.2" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v0.3.2 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -328,7 +328,7 @@
 
   <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="arch-node reveal rounded-lg p-4">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">1241</p>
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">1253</p>
       <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
     </div>
     <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
@@ -359,8 +359,19 @@
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-        <span class="font-display font-bold text-phosphor">v0.3.1</span>
+        <span class="font-display font-bold text-phosphor">v0.3.2</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v032"><strong class="text-amber-400">转圈不等于在干活</strong>。本次四条改动指向同一件事：<strong>界面上那些让你以为「它在动」的信号，此前多半不可信</strong>。① <strong>Grep 改造成两级后端</strong>——此前只有 <code>ignore::WalkBuilder</code> + <code>regex</code> 一条纯 Rust 路径，全量读文件逐行匹配；现按 <code>PATH</code> 里探测到 <code>rg</code> 就走 ripgrep（<strong>命中上限后直接 kill 子进程</strong>，不读完，避免白扫整棵树），没装则落回纯 Rust 兜底，用 <code>regex_syntax</code> 在 Hir 上抽字面量做 memchr / memmem 预筛、<strong>先整文件字节级粗筛</strong>。测试 <code>assert_both_ways</code> 断言两条路径输出一致。三处刻意如此：<code>RIPGREP_CONFIG_PATH=""</code>（否则用户自己的 <code>--smart-case</code> 会<strong>静默改变匹配语义</strong>）、<strong><code>-H</code> 必须带</strong>（否则 rg 搜单个文件只打行号）、大小写不敏感必须解析出<strong>已折叠的 Hir</strong> 再抽字面量（把 needle 转小写会漏掉 ſ / İ / K，造成<strong>静默漏报</strong>）。忽略语义也对齐了——旧实现会把 <code>.git/objects</code> 一起遍历，且 <code>require_git</code> 默认 true 意味着<strong>非 git 仓库里 <code>.gitignore</code> 静默失效</strong>。实测本仓库常规搜索 <strong>10~30×</strong>。<br><br>② <strong>底部那一整块文案此前根本没走 i18n</strong>：标题栏 spinner、TodoWrite 面板头、排队提示、thinking 状态行全是硬编码的中英混排，中文界面里夹着 <code>Waiting for approval</code>、<code>ctrl+t to expand</code>。新增 <code>spinner.*</code> 键族收敛；<code>thinking.running</code> 同时从写死第一帧改成 <code>{frame}</code> 占位符——那行此前在流式期间<strong>永远停在 ⠋</strong>，往回滚看历史时整屏只有标题栏在动。<br><br>③ <strong>权限弹窗开着，标题栏却显示「Bash(cargo test) · 12.3s」</strong>。<code>Agent::exec_tool_call</code> 先 <code>emit ToolEvent::Start</code>（TUI 据此写 <code>current_op</code>）<strong>之后</strong>才 <code>ensure_tool_permission</code>，弹窗期间 <code>current_op</code> 必然非空，旧优先级下<strong>秒表把「等用户点 y」的时间算成了命令耗时</strong>。<br><br>④ <strong>窄终端下第一个消失的偏偏是「我的补充还没送达」</strong>：旧实现从<strong>尾部截断</strong>，而排队提示恰好拼在最后。改为<strong>按整段丢弃 + 优先级</strong>（<code>tokens</code> &lt; <code>elapsed</code> &lt; <code>queue</code>），label 不可丢弃。<strong>1253 个 workspace 测试</strong>（1241 → 1253）+ clippy <code>-D warnings</code> 全绿。</p>
+      </div>
+    </div>
+
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+        <span class="font-display font-bold text-phosphor">v0.3.1</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v031"><strong class="text-amber-400">模型写错了，没有任何东西告诉它</strong>。复杂任务里最常见的失败不是不会写，而是<strong>不知道自己写错了</strong>：改完十个文件直接交付，没有编译器告诉它第五个文件的类型不匹配。项目可在 <code>.wyj-code/settings.json</code> 声明 <code>verify.command</code>，编辑后框架自己跑一遍、结果回灌给模型。<strong>未声明 = 完全静默</strong>（不跑子进程、不产生 tool_result 字节、零行为变化），命令也刻意<strong>不硬编码成 <code>cargo test</code></strong>——同一个二进制要服务 Python / Node / Go 项目。同期：TodoWrite 默认开启；<code>/context</code> 新增每轮时延画像（跟 <code>AgentEvent::Usage</code> 同发，把「模型慢」与「重试慢」分开计）；推理轮数触顶前按 <code>CheckpointKind::TurnLimit</code> 自动存档；MCP 超时文案明确写出「远端可能仍在执行」，避免模型把超时读成没执行而重试有副作用的工具。版本号同时重编为 <code>0.x.y</code>，历史条目按发布顺序连续重编号。<strong>1241 个 workspace 测试</strong> + clippy <code>-D warnings</code> 全绿。</p>
       </div>
