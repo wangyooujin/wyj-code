@@ -12,6 +12,83 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-14
+
+### Grep 工具改造成两级搜索后端：装了就用 ripgrep，没装也有得用
+
+`GrepTool` 此前只有一条纯 Rust 路径（`ignore::WalkBuilder` + `regex`），全量读文件
+逐行匹配。现在做成**两级、对外行为一致**的后端，`rg_binary` 只在 `PATH` 里探测一次，
+没装 ripgrep 的机器自动落回纯 Rust 实现；测试里 `assert_both_ways` 对同一输入断言
+两条路径的输出一致。
+
+**rg 快路径**：`rg --color=never --no-heading -H --hidden --no-messages -g '!.git'
+-g '!.git/**' -e <pattern> -- <root>`，流式读 stdout，命中 `head_limit` / 500 匹配
+上限后直接 `kill` 掉子进程（不读完，避免白扫整棵树）；`files_with_matches` / `count`
+模式额外按路径排序，抵消多线程遍历的乱序。三条硬约定：
+
+- 子进程 `RIPGREP_CONFIG_PATH=""`。否则用户自己的 rg 配置（如 `--smart-case`）会
+  **静默改变匹配语义**——同一个 pattern 在两台机器上给出不同结果，且没有任何报错。
+- `-H` 必须带。否则 rg 搜**单个文件**时默认只打行号不打路径，输出直接不可解析。
+- rg 插在相邻上下文组之间的 `--` 分隔符要剔除（原生实现不输出它）。
+
+rg 退出码 ≥2（非法 pattern / glob）视为「rg 搞不定」，落回纯 Rust，而不是把 rg 的
+错误原样透给用户。
+
+**纯 Rust 兜底**：`ignore::WalkBuilder::build_parallel()`（线程数 =
+`available_parallelism`，上限 16，命中上限后 `WalkState::Quit`）+ regex-automata
+字面量预筛。预筛用 `regex_syntax` 在 Hir 上抽字面量（`Prefilter::new(MatchKind::
+LeftmostFirst, …)`，走 memchr / memmem）：**先整文件字节级粗筛**，没有候选就连二进制
+NUL 扫描与 UTF-8 校验都省掉，再逐行过滤后才进 regex 引擎。
+
+**大小写不敏感必须用 `ParserBuilder::case_insensitive(true)` 解析出已折叠的 Hir
+再抽字面量**——不能把 needle 简单转小写，那会漏掉 ſ / İ / K 这类 Unicode 折叠特例，
+造成**静默漏报**：该匹配却报告「没找到」，比慢严重得多。抽不出字面量、或模式可匹配
+空串时返回 `None` 退回逐行 `is_match`，宁可慢不能漏。
+
+**忽略语义两条路径必须一致**（这是改造的另一半收益）：跳过 `.git` 目录，
+`.gitignore` / `.ignore` / `.git/info/exclude` 在任何目录都生效。旧实现
+`hidden(false)` 会把 `.git/objects` 一起遍历（本仓库 710 个文件里 473 个是 `.git`
+内部文件），且 ignore crate 的 `require_git` 默认 true——**非 git 仓库里
+`.gitignore` 静默失效**。
+
+实测（release、Apple Silicon）：本仓库常规搜索 10~30×；832MB / 3 万文件的语料上
+全量扫描 rg 快路径 4~11×、纯 Rust 兜底 2~7×。纯 Rust 兜底在大文件全量扫描时仍受
+「整份 read 拷贝」限制（~600MB/s），没有走 mmap——`memmap2::Mmap::map` 是 unsafe，
+且文件被并发截断时会 SIGBUS（进程直接死），不值得为兜底路径冒这个险。
+
+### TUI 底部进度区文案此前根本没走 i18n
+
+输入框标题栏 spinner、TodoWrite 面板头、排队提示、thinking 状态行——这一整块底部
+区域此前是硬编码的中英混排（中文界面里夹着 `Waiting for approval`、
+`Queuing message`、`Thinking`、`ctrl+t to expand`），切到英文则是另一种混排。新增
+`spinner.*` 键族收敛这一片文案，`crates/i18n` 的测试对两个 locale 各查一遍并断言
+`{count}` / `{running}` / `{op}` / `{frame}` 四种占位符都接得上——rust-i18n 未解析时
+会**原样回显 key**，那正是「漏了一半翻译」最难被发现的形态。
+
+`thinking.running` 同时从写死第一帧改成 `{frame}` 占位符，帧号由渲染层注入。原来那行
+在流式期间**永远停在 `⠋`**：用户往回滚看历史时整屏只有标题栏在动，看起来像一行静态
+文字。
+
+### 权限弹窗开着的时候，标题栏却显示「Bash(cargo test) · 12.3s」
+
+`Agent::exec_tool_call` 是先 `emit ToolEvent::Start`（TUI 据此写 `current_op`）**之后**
+才 `ensure_tool_permission`。所以权限弹窗打开期间 `current_op` 必然非空，而旧优先级把
+`current_op` 排在对话框前面——秒表继续走、看着「在忙」，实则整轮卡在等用户点 y。
+`plan_dialog` 同构（`ExitPlanMode` 也是先 Start 再弹窗）。现在两个对话框都排到
+`current_op` 前面，「等待批准 / 审阅计划」如实显示。
+
+### 窄终端下第一个消失的偏偏是「我的补充还没送达」
+
+旧实现先 `format!` 把整串拼好再交给 `truncate_line`，而后者是**从尾部**截的——排队提示
+恰好拼在最后，于是实测 80 列以下第一个消失的就是它，与「这正是用户最需要看到的信息」
+的判断正好相反。新增 `build_thinking_title` 改为**按整段丢弃 + 优先级**：
+`tokens`(0) < `elapsed`(1) < `queue`(2)。token 是本轮用量、另有 `/cost` 可查，耗时可由
+状态栏旁证，唯独排队提示一旦整段消失，用户就无从确认自己的补充有没有被接收。全部丢完
+仍超宽时，最后才对 `label` 做省略号截断——它是唯一不可丢弃的一段。无排队时的排版与旧
+实现**逐字符一致**：底部进度条的形态是用户长期习惯的，不该顺手改掉。
+
+**1253 个 workspace 测试**（1241 → 1253）+ clippy `-D warnings` 全绿。
+
 ## [0.3.1] - 2026-10-14
 
 ### 编辑后自动验证闭环：把「跑一下测试」从人的嘴里挪到框架里
