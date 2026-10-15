@@ -867,7 +867,7 @@ impl EvolutionStore {
         index
             .pending_analysis_episodes
             .insert(episode_id.to_string());
-        write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)?;
         self.append_audit_unlocked(
             "episode_feedback",
             Some(episode_id),
@@ -891,7 +891,7 @@ impl EvolutionStore {
         index
             .pending_analysis_episodes
             .insert(episode_id.to_string());
-        write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)?;
         self.append_audit_unlocked(
             "include_external_episode",
             Some(episode_id),
@@ -931,7 +931,7 @@ impl EvolutionStore {
         candidate.status = CandidateStatus::Rejected;
         candidate.rejection_reason = reason.map(|value| bounded_redacted(&value, 1_000));
         candidate.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("reject_candidate", Some(candidate_id), "")
     }
 
@@ -953,7 +953,7 @@ impl EvolutionStore {
         candidate.status = CandidateStatus::Active;
         candidate.activated_path = activated_path;
         candidate.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("activate_candidate", Some(candidate_id), "")
     }
 
@@ -970,7 +970,7 @@ impl EvolutionStore {
             .with_context(|| format!("candidate not found: {candidate_id}"))?;
         candidate.status = CandidateStatus::RolledBack;
         candidate.updated_at = Utc::now().to_rfc3339();
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("rollback_candidate", Some(candidate_id), "")
     }
 
@@ -1068,7 +1068,7 @@ impl EvolutionStore {
                 rejection_reason: None,
                 activated_path: None,
             });
-            write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+            crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
             self.append_audit_unlocked("manual_skill_candidate", Some(&id), &episode.goal_summary)?;
         }
         Ok(id)
@@ -1373,7 +1373,7 @@ impl EvolutionStore {
         } else {
             index.candidates.push(candidate);
         }
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked(action, Some(&candidate_id), &detail)
     }
 
@@ -1447,7 +1447,7 @@ impl EvolutionStore {
         index
             .pending_analysis_episodes
             .insert(episode_id.to_string());
-        write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)
+        crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)
     }
 
     fn clear_pending_analysis(&self, episode_id: &str) -> Result<()> {
@@ -1457,7 +1457,7 @@ impl EvolutionStore {
             .expect("evolution write lock poisoned");
         let mut index = self.load_feedback_index_unlocked();
         index.pending_analysis_episodes.remove(episode_id);
-        write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)
+        crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)
     }
 
     fn take_pending_analysis(&self) -> Vec<String> {
@@ -1470,7 +1470,8 @@ impl EvolutionStore {
             .into_iter()
             .collect::<Vec<_>>();
         if !pending.is_empty() {
-            let _ = write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index);
+            let _ =
+                crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index);
         }
         pending
     }
@@ -1516,7 +1517,7 @@ impl EvolutionStore {
                     now,
                 )
         });
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
 
         let audit_path = self.dir.join(AUDIT_FILE);
         if audit_path.exists() {
@@ -1540,7 +1541,7 @@ impl EvolutionStore {
         candidates
             .candidates
             .retain(|candidate| matches!(candidate.status, CandidateStatus::Active));
-        write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
+        crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &candidates)?;
 
         // v0.2.14：普通 Memory 数据层已迁出 Evolution；这里不再清洗
         // memories/index.json（不存在也不该存在）。容量清理仍按 max_project_
@@ -1603,7 +1604,7 @@ impl EvolutionStore {
         let today = Utc::now().date_naive().to_string();
         if usage.date != today {
             usage = DailyUsage::default();
-            write_json_atomic(&self.dir.join(USAGE_FILE), &usage)?;
+            crate::serialize::write_json_atomic(&self.dir.join(USAGE_FILE), &usage)?;
         }
         Ok(usage.tokens < self.cfg.max_daily_tokens
             && usage.wall_secs < self.cfg.max_daily_wall_secs)
@@ -1621,7 +1622,7 @@ impl EvolutionStore {
         }
         usage.tokens = usage.tokens.saturating_add(tokens);
         usage.wall_secs = usage.wall_secs.saturating_add(wall_secs);
-        write_json_atomic(&self.dir.join(USAGE_FILE), &usage)
+        crate::serialize::write_json_atomic(&self.dir.join(USAGE_FILE), &usage)
     }
 
     fn record_health_success(&self) -> Result<()> {
@@ -1634,7 +1635,7 @@ impl EvolutionStore {
         health.last_error = None;
         health.last_success_at = Some(Utc::now().to_rfc3339());
         health.notice_pending = false;
-        write_json_atomic(&self.dir.join(HEALTH_FILE), &health)
+        crate::serialize::write_json_atomic(&self.dir.join(HEALTH_FILE), &health)
     }
 
     fn record_health_failure(&self, error: &str) -> Result<()> {
@@ -1648,7 +1649,7 @@ impl EvolutionStore {
         if health.consecutive_failures >= 3 {
             health.notice_pending = true;
         }
-        write_json_atomic(&self.dir.join(HEALTH_FILE), &health)
+        crate::serialize::write_json_atomic(&self.dir.join(HEALTH_FILE), &health)
     }
 
     fn append_audit_unlocked(
@@ -2200,23 +2201,6 @@ fn older_than_days(timestamp: &str, days: u32, now: DateTime<Utc>) -> bool {
                 >= i64::from(days)
         })
         .unwrap_or(false)
-}
-
-fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!(
-        "tmp-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp, bytes)?;
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(error.into());
-    }
-    Ok(())
 }
 
 fn directory_size(root: &Path) -> u64 {

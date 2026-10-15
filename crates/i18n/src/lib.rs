@@ -55,6 +55,20 @@ pub fn detect_system_locale() -> &'static str {
     "en"
 }
 
+/// 解析「当前生效的 locale」：`config.toml` 的 `language` 优先，留空回退系统检测。
+///
+/// 这是 `language` 字段的唯一语义入口。三处曾经各自复刻这段
+/// `configured.unwrap_or_else(detect_system_locale)`，一旦某处漏读（比如只喂给
+/// `set_locale` 却没喂给模型侧），语言就会在 UI 与模型输出之间劈叉——2026-10-15
+/// 实测就是这种形态：UI 全中文、thinking 全英文，而配置里明明写着 `language = "zh"`。
+pub fn resolve_locale(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| detect_system_locale().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +173,26 @@ mod tests {
 
         unsafe {
             std::env::remove_var("LC_ALL");
+        }
+    }
+
+    /// `language` 字段的唯一语义入口：配置优先，空串/空白等同「未配置」。
+    ///
+    /// 回退分支**只断言「非空」**：它要读 `LC_ALL`，而同 crate 的
+    /// `detect_system_locale_prefers_zh_prefixed_env_and_falls_back_to_en`
+    /// 会并发改写同一个环境变量，断言具体值就是断言一个正在被改的值（实测
+    /// 并行跑必 flaky）。回退正确性由那个测试负责，这里只守住本函数自己的
+    /// 不变式——空白配置不得产出空 locale。
+    #[test]
+    fn resolve_locale_prefers_config_and_never_yields_an_empty_locale() {
+        assert_eq!(resolve_locale(Some("zh")), "zh");
+        assert_eq!(resolve_locale(Some(" en ")), "en");
+        for blank in [Some(""), Some("   "), None] {
+            let resolved = resolve_locale(blank);
+            assert!(
+                !resolved.trim().is_empty(),
+                "未配置时不得产出空 locale（会让 <env> 里的语言声明消失）"
+            );
         }
     }
 }

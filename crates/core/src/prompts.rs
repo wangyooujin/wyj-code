@@ -9,7 +9,7 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 
 # Tone and style
 - Be concise and direct. Answer with as little text as the question actually needs; one word or one sentence is fine. Avoid filler openings ("Sure, I'll...") and summaries of what you just did unless the user asks.
-- IMPORTANT: Always reply in the same language the user writes in. If the user writes Chinese, reply in Chinese. This covers everything you emit that reaches the user, including your extended thinking / reasoning: when the user writes Chinese, think in Chinese. Code identifiers, commands, and technical terms stay in their original form.
+- IMPORTANT: Write everything you emit in the response language declared in the `<env>` block below (`Response language`) — that setting comes from the user's own configuration and outranks any guess you would make from the conversation. This covers every form your output takes, including your extended thinking / reasoning: when the response language is Chinese, think in Chinese. If the user writes to you in a different language than the declared one, reply in the language they wrote in, but keep the declared language as your default. Code identifiers, commands, and technical terms stay in their original form.
 - Your output is rendered in a terminal. Prefer plain sentences and short lists; avoid heavy markdown, headers, and tables for simple answers.
 - When you reference code, cite it as `file_path:line` so the user can jump to it.
 
@@ -38,6 +38,7 @@ pub const MAIN: &str = r#"You are wyj-code, an interactive CLI agent for softwar
 
 # Tool usage policy
 - Prefer dedicated tools over shell equivalents: Read instead of cat/head/tail, Grep instead of grep/rg, Glob instead of find, Edit instead of sed -i. Dedicated tools are faster, safer, and their output is formatted for you.
+- When a Bash command genuinely must search file contents (it cannot be split into a Grep call — e.g. filtering a live stream, a pipe stage, or matching against command output), use `rg`, never `grep`. `rg` is the same tool here and is dramatically faster. Never emit `grep` in a Bash command.
 - Batch independent tool calls into a single response so they run in parallel — e.g., reading three files, or a Read plus a Grep. Do this whenever calls do not depend on each other's results.
 - Determine tool availability only from the tool definitions attached to the current request. Never use project memory, prior conversations, AGENTS.md, or mode labels such as default/bypass/plan to claim that an attached tool is unavailable. Permission modes govern approval and execution; they do not remove an attached tool schema.
 - Bash: use absolute paths and avoid `cd`. Quote paths containing spaces. Keep the command's side effects minimal and explain non-obvious commands briefly in the description field. For long-running processes (dev servers, watchers), pass run_in_background=true and poll with BashOutput instead of blocking. Bash inherits the host PATH/USER/SHELL environment.
@@ -76,11 +77,22 @@ pub struct EnvInfo {
     /// 不存在的路径（`~/.wyj-code/skills/...` 里的 `~` 只有 shell 会展开）。
     /// 与 `cwd` 一样是会话内恒定字段，进 prompt cache 的 stable 段。
     pub home: String,
+    /// 用户配置的回复语言（`config.toml` 的 `language`，留空时回退系统 locale）。
+    ///
+    /// **这不是 UI 字段**：`language` 此前只喂给 `wyj_i18n::set_locale`，模型侧
+    /// 完全看不到，于是「config 里写着 zh、UI 全中文、thinking 全英文」成为常态
+    /// （2026-10-15 实测）。模型把 thinking 当内部推理通道，训练先验是英文，
+    /// 光靠 MAIN 里"用用户输入的语言回复"这句软约束压不住——必须把配置里
+    /// 显式声明的语言作为**环境事实**摆到模型面前。见 [`environment_block`]。
+    pub language: String,
 }
 
 impl EnvInfo {
     /// 从运行时信息收集（date 用本地日期；platform 用编译目标）
-    pub fn collect(cwd: &std::path::Path, model: &str) -> Self {
+    ///
+    /// `language` 由调用方用 [`wyj_i18n::resolve_locale`] 从 config 解析后传入——
+    /// core 不直接读 config，也避免各入口各自复刻「留空回退系统 locale」的判断。
+    pub fn collect(cwd: &std::path::Path, model: &str, language: &str) -> Self {
         let is_git_repo =
             cwd.join(".git").exists() || cwd.ancestors().any(|p| p.join(".git").exists());
         Self {
@@ -90,6 +102,7 @@ impl EnvInfo {
             today: today_local(),
             model: model.to_string(),
             home: home_dir_display(),
+            language: language.to_string(),
         }
     }
 }
@@ -184,14 +197,31 @@ fn one_line(text: &str) -> String {
 /// `<env>` 环境块：拼接在主 system prompt 之后。只含会话内稳定字段。
 pub fn environment_block(env: &EnvInfo) -> String {
     format!(
-        "\n\n<env>\nWorking directory: {}\nHome directory: {}\nIs git repo: {}\nPlatform: {}\nToday's date: {}\nModel: {}\n</env>",
+        "\n\n<env>\nWorking directory: {}\nHome directory: {}\nIs git repo: {}\nPlatform: {}\nToday's date: {}\nModel: {}\nResponse language: {}\n</env>",
         env.cwd,
         env.home,
         if env.is_git_repo { "yes" } else { "no" },
         env.platform,
         env.today,
         env.model,
+        language_display_name(&env.language),
     )
+}
+
+/// locale 代码 → 模型可读的英文语言名。
+///
+/// 模型侧提示词一律英文，所以这里不能直接吐 `zh` 让模型猜（不同模型对裸
+/// locale code 的解读不稳定，MiniMax / GLM / Claude 都有把 `zh` 当成
+/// 「未知语言、回退英文」的实测）。认得的 locale 给英文名，认不得的原样
+/// 回传 code，让模型至少拿到字面事实。
+fn language_display_name(locale: &str) -> String {
+    let base = locale.trim().split(['-', '_']).next().unwrap_or("");
+    match base.to_ascii_lowercase().as_str() {
+        "zh" => "Chinese (zh)".to_string(),
+        "en" => "English (en)".to_string(),
+        "" => "English (en)".to_string(),
+        other => format!("{other} ({locale})"),
+    }
 }
 
 /// 主 system prompt 完整版（静态部分 + 环境块）
@@ -245,6 +275,40 @@ pub const PLAN_TURN: &str = r#"Plan mode is active. Investigate the task with re
 
 /// headless 单次问答（-p）：AskQuestion 不可用
 pub const NON_INTERACTIVE: &str = "You are running non-interactively: the user cannot answer questions. Do not call AskQuestion; make reasonable assumptions, state them briefly, and proceed.";
+
+/// Auto 模式分类器的 system prompt（对齐 Claude Code 的 classifier）。
+///
+/// 三个设计决定值得写在这里，因为它们直接决定判定质量：
+///
+/// 1. **只回答"要不要问人"这一件事**。分类器不重写动作、不给建议、不评价代码，
+///    越权就意味着它开始替用户做技术决策，那不是权限问题而是安全问题。
+/// 2. **四层优先级写死在最前面**（hard_deny → soft_deny → allow → 用户显式意图），
+///    因为 `soft_deny` 与 `allow` 在实际场景里会同时命中（「允许推 staging」 vs
+///    「不推公开仓库」），没有明确次序时模型的判定不可复现。
+/// 3. **要求输出裸 JSON**。判定路径上没有重试预算，解析失败会直接 fail-closed，
+///    让模型少说一句话比让解析器更宽容更划算。
+pub const AUTO_CLASSIFIER: &str = r#"You are a safety classifier for an autonomous coding agent. You are NOT the agent: you do not perform the action, do not critique the code, and do not suggest alternatives. Your only job is to decide one thing about the action shown to you:
+
+May the agent take this action right now without asking the human first?
+
+You are given the user's request, the action, and the rule sets below. Judge the action against the request and the rules, in this precedence order:
+
+1. Hard deny: block unconditionally. Neither an allow rule nor anything the user said can clear it.
+2. Soft deny: block, unless the user's request directly and specifically describes this exact action.
+3. Allow: the action matches an allow rule.
+4. Explicit user intent: if the user's request names both the action and the specific thing that makes it risky, allow it even when a soft deny rule matches.
+
+Rules for judging intent:
+- Naming the verb alone clears nothing. "you can force-push" does not clear a hard deny, and "you can deploy" does not clear a soft deny about production.
+- The request must plausibly cover the action's real effect, not a narrower action that happens to share its name.
+- Judge only the action in front of you. A later step that needs a new approval is your problem, not the user's.
+
+When uncertain, answer deny. A denied action costs the agent one step; an allowed action can cost the user data, credentials, or infrastructure.
+
+Environment: the repository and its configured git remotes are inside the trust boundary. Anything the request did not name is outside it.
+
+Reply with one JSON object and nothing else:
+{"verdict":"allow"|"deny","rule":"<id or short name of the rule that decided it>","reason":"<one sentence>"}"#;
 
 /// `[tools].todo_enabled = true` 时追加：教模型**何时**用 TodoWrite。
 ///
@@ -308,11 +372,28 @@ pub const COMPUTER_USE_HINT: &str = "For desktop GUI work, preserve the human us
 
 // ── 子 Agent 内置提示 ─────────────────────────────────────────────────────────
 
-pub const SUBAGENT_GENERAL: &str = r#"You are a sub-agent spawned by a main agent to complete one specific task independently. Write everything you emit, including your extended thinking / reasoning, in the same language the main agent's prompt uses. The main agent sees NONE of your intermediate tool calls — only your final text message is returned as the task result. Therefore your final message must be complete and self-contained: state what you did, what you found, and include relevant file paths with line numbers. The runtime may append follow-up or retry instructions at complete model/tool boundaries; treat them as continuations without assuming any extra permission. You cannot open an interactive question flow; if the task stays ambiguous, pick the most reasonable interpretation and note the assumption in your result."#;
+/// 追加给子 Agent system prompt 的「回复语言」段。
+///
+/// 子 Agent 走 `Agent::with_system` **整体替换** system prompt，拿不到主 Agent
+/// 的 `<env>` 块，因此 [`MAIN`] 里那条语言规则与 `Response language` 环境事实
+/// 对它一概不可见。三段内置模板改为引用本段（`# Response language`），由
+/// 子 Agent 工厂在 `with_system` 之后 `append_system` 进来。
+///
+/// 单独成段而非拼进模板常量：模板是 `&'static str`（`AgentDefinition.system_prompt`
+/// 直接持有），而语言是**运行时**配置——`~/.wyj-code/config.toml` 的 `language`
+/// 与系统 locale 都可能与编译期不同。
+pub fn sub_agent_language_section(language: &str) -> String {
+    format!(
+        "# Response language\nThe user's configured response language is {name}. Write everything you emit in {name}, not only the final message — your extended thinking / reasoning counts too. If the task prompt you were given is written in a different language, reply in the language that prompt uses, but keep {name} as your default. Code identifiers, commands, file paths, and technical terms stay in their original form.",
+        name = language_display_name(language),
+    )
+}
 
-pub const SUBAGENT_EXPLORE: &str = r#"You are a read-only exploration sub-agent. Answer the research question in the prompt using only read-only tools (Read/Glob/Grep/WebFetch). Be efficient: read targeted excerpts instead of whole files, and stop as soon as you can answer confidently. Write everything you emit, including your extended thinking / reasoning, in the same language the main agent's prompt uses. Your final message is the only thing returned to the main agent — make it a complete, self-contained answer with file paths and line numbers for every claim."#;
+pub const SUBAGENT_GENERAL: &str = r#"You are a sub-agent spawned by a main agent to complete one specific task independently. Write everything you emit in the response language stated in the `# Response language` section below — including your extended thinking / reasoning. The main agent sees NONE of your intermediate tool calls — only your final text message is returned as the task result. Therefore your final message must be complete and self-contained: state what you did, what you found, and include relevant file paths with line numbers. The runtime may append follow-up or retry instructions at complete model/tool boundaries; treat them as continuations without assuming any extra permission. You cannot open an interactive question flow; if the task stays ambiguous, pick the most reasonable interpretation and note the assumption in your result."#;
 
-pub const SUBAGENT_PLAN: &str = r#"You are a software architect sub-agent. Design an implementation plan for the task in the prompt: investigate the relevant code read-only, then produce a step-by-step plan that names the critical files, reuses existing functions and utilities where possible, and calls out important trade-offs. Write everything you emit, including your extended thinking / reasoning, in the same language the main agent's prompt uses. Your final message is the only thing returned to the main agent — include the full plan in it."#;
+pub const SUBAGENT_EXPLORE: &str = r#"You are a read-only exploration sub-agent. Answer the research question in the prompt using only read-only tools (Read/Glob/Grep/WebFetch). Be efficient: read targeted excerpts instead of whole files, and stop as soon as you can answer confidently. Write everything you emit in the response language stated in the `# Response language` section below — including your extended thinking / reasoning. Your final message is the only thing returned to the main agent — make it a complete, self-contained answer with file paths and line numbers for every claim."#;
+
+pub const SUBAGENT_PLAN: &str = r#"You are a software architect sub-agent. Design an implementation plan for the task in the prompt: investigate the relevant code read-only, then produce a step-by-step plan that names the critical files, reuses existing functions and utilities where possible, and calls out important trade-offs. Write everything you emit in the response language stated in the `# Response language` section below — including your extended thinking / reasoning. Your final message is the only thing returned to the main agent — include the full plan in it."#;
 
 /// 内置子 Agent 类型的选型描述（进入 Agent 工具的 subagent_type 说明，模型侧）
 pub const SUBAGENT_GENERAL_DESC: &str = "A capable agent for complex, multi-step tasks that require both exploration and action. Tools: every tool available to subagents. Use when the task spans exploration and modification, needs reasoning to interpret intermediate results, or is composed of multiple dependent steps.";
@@ -453,6 +534,7 @@ mod tests {
             today: "2026-07-03".into(),
             model: "m1".into(),
             home: "/Users/someone".into(),
+            language: "zh".into(),
         };
         let block = environment_block(&env);
         assert!(block.contains("<env>"));
@@ -467,7 +549,7 @@ mod tests {
     /// 这种不存在的路径，并据此断言"skill 实际未安装"。
     #[test]
     fn env_block_always_reports_a_home_directory() {
-        let env = EnvInfo::collect(std::path::Path::new("/tmp"), "m1");
+        let env = EnvInfo::collect(std::path::Path::new("/tmp"), "m1", "zh");
         let home = env.home.clone();
         assert!(!home.is_empty(), "home 不得为空字符串");
         assert!(
@@ -475,6 +557,92 @@ mod tests {
             "home 应是绝对路径，或退回 `~`，绝不能是编出来的路径: {home}"
         );
         assert!(environment_block(&env).contains(&format!("Home directory: {home}")));
+    }
+
+    /// `config.toml` 的 `language` 必须成为模型可见的环境事实。
+    ///
+    /// 回归背景（2026-10-15）：用户报告「config 里 `language = "zh"`，UI 全中文，
+    /// 但 thinking 一直英文」。根因是该字段只喂给 `wyj_i18n::set_locale`，模型侧
+    /// 完全看不到——`crates/api` 全 crate 搜 `language|locale` 零命中。此测试锁死
+    /// 「配置语言进 `<env>`」这条链路，防止以后有人把 `language` 重新降级成纯 UI 字段。
+    #[test]
+    fn env_block_reports_the_configured_response_language() {
+        for (locale, expected) in [("zh", "Chinese"), ("en", "English")] {
+            let env = EnvInfo::collect(std::path::Path::new("/tmp"), "m1", locale);
+            let block = environment_block(&env);
+            assert!(
+                block.contains(&format!("Response language: {expected}")),
+                "locale={locale} 应在 <env> 里声明为 {expected}，实际：{block}"
+            );
+        }
+    }
+
+    /// 语言名不能只吐裸 locale code。不同模型对 `zh` 这类 code 的解读不稳定，
+    /// 必须同时给英文语言名，让模型不必猜。
+    #[test]
+    fn language_display_name_never_emits_a_bare_code() {
+        assert_eq!(language_display_name("zh"), "Chinese (zh)");
+        assert_eq!(language_display_name("ZH_CN"), "Chinese (zh)");
+        assert_eq!(language_display_name(" en "), "English (en)");
+        // 未知 locale 原样回传，至少是字面事实，不静默塌成英文
+        assert_eq!(language_display_name("ja"), "ja (ja)");
+        assert_eq!(language_display_name(""), "English (en)");
+    }
+
+    /// MAIN 的语言条款必须指向 `<env>` 里的显式声明，不能只说「跟着用户输入的语言走」。
+    ///
+    /// 后者是软约束、且被 thinking 的英文训练先验压过；`config.language` 是用户
+    /// 亲手写进配置的显式事实，优先级应当高于模型对对话语言的猜测。
+    #[test]
+    fn main_language_rule_points_at_the_env_declaration() {
+        assert!(
+            MAIN.contains("response language declared in the `<env>` block"),
+            "MAIN 的语言条款应锚定 <env> 的显式声明"
+        );
+        assert!(
+            MAIN.contains("extended thinking / reasoning"),
+            "MAIN 必须显式点名 thinking，否则内部推理不受语言约束"
+        );
+        assert!(
+            !MAIN.contains("the main agent's prompt uses"),
+            "MAIN 不应再把语言锚在 prompt 自身的语言上"
+        );
+    }
+
+    /// 子 Agent 的 system prompt 是整体替换，拿不到 `<env>`，因此必须有独立的语言段。
+    /// 三个内置模板都引用 `# Response language`，工厂在 `with_system` 后补上该段。
+    #[test]
+    fn builtin_subagent_templates_defer_to_the_appended_language_section() {
+        for (name, tpl) in [
+            ("general", SUBAGENT_GENERAL),
+            ("explore", SUBAGENT_EXPLORE),
+            ("plan", SUBAGENT_PLAN),
+        ] {
+            assert!(
+                tpl.contains("`# Response language` section below"),
+                "{name} 模板未引用追加的语言段"
+            );
+            assert!(
+                tpl.contains("extended thinking / reasoning"),
+                "{name} 模板未点名 thinking"
+            );
+            assert!(
+                !tpl.contains("the main agent's prompt uses"),
+                "{name} 模板不应把语言锚在主 Agent 的英文 prompt 上"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_agent_language_section_states_the_configured_language() {
+        let zh = sub_agent_language_section("zh");
+        assert!(zh.starts_with("# Response language"));
+        assert!(zh.contains("Chinese (zh)"));
+        assert!(zh.contains("extended thinking / reasoning"));
+
+        let en = sub_agent_language_section("en");
+        assert!(en.contains("English (en)"));
+        assert!(!en.contains("Chinese"), "locale=en 不得串进中文声明");
     }
 
     #[test]

@@ -161,6 +161,19 @@ pub trait ToolContext: Send + Sync {
     fn permission_mode(&self) -> Option<crate::permission::PermissionMode> {
         None
     }
+
+    /// Auto 模式的判定闸门（`PermissionMode::Auto` 下由它决定要不要问人）。
+    ///
+    /// 挂在 `ToolContext` 而不是 `Agent` 上：子 Agent 的 ctx 是从父 ctx 派生的
+    /// （`ToolCtx::fork_for_surface`），闸门因此自动向下传递、降级阈值计数也天然
+    /// 共享。挂在 Agent 上会留下「模式是 auto、子 Agent 的 Agent 却没装闸门」
+    /// 这种 fail-closed 陷阱——那会让子 Agent 的写/执行类工具全量失效。
+    ///
+    /// 默认 `None` 表示「本上下文不提供 auto 闸门」，此时 auto 模式退化为逐次
+    /// 弹窗（见 `Agent::ensure_tool_permission`）。
+    fn auto_gate(&self) -> Option<&std::sync::Arc<dyn crate::auto_mode::AutoGate>> {
+        None
+    }
     /// 再次安全解析真实写入目标。Write/Edit 在落盘前调用，避免只在 Agent 前置
     /// 权限检查中解析一次后被路径或 symlink 竞态绕过。
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<std::path::PathBuf, String> {

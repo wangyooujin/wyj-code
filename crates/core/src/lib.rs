@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod agent_def;
+pub mod auto_mode;
+pub mod auto_rules;
 pub mod checkpoint;
 pub mod claude_md;
 pub mod code_index;
@@ -35,6 +37,10 @@ pub mod workspace_cas;
 
 pub use agent::{Agent, AgentRoute, InjectionKind, SteerQueue, ToolEvent};
 pub use agent_def::{builtin_defs, load_agent_defs, AgentDefinition};
+pub use auto_mode::{
+    AutoClassifierUsage, AutoCounters, AutoGate, AutoGateConfig, AutoGateImpl, AutoReviewRequest,
+    AutoRuleOverrides, AutoVerdict, ResolvedRules,
+};
 pub use checkpoint::{
     set_checkpoint_config, Checkpoint, CheckpointConfig, CheckpointKind, CheckpointStore,
     CheckpointSummary, RewindPreview, RewindScope, WorkspaceSnapshot,
@@ -92,4 +98,4 @@ pub use workflow::{
     validate_workflow, WorkflowEvent, WorkflowHandle, WorkflowNodeContext, WorkflowNodeExecutor,
     WorkflowNodeOutput, WorkflowNodeRecord, WorkflowRuntime, WorkflowSnapshot,
 };
-pub use workspace::GitWorktreeManager;
+pub use workspace::{GitWorktreeManager, ReconcileReport, WorkspaceHealth};

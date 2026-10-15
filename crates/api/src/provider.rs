@@ -77,13 +77,22 @@ pub struct RequestOptions {
 }
 
 impl RequestOptions {
-    /// 纯文本请求（无 thinking），供 compact/memory/summary 等辅助调用使用
+    /// 纯文本请求（无 thinking），供 compact/memory/summary/classifier 等辅助调用使用。
+    ///
+    /// **`thinking_switch = "disabled"` 不是可选项**：只把 `thinking_budget` 置 None
+    /// 挡不住 OpenAI-vendor 端点——它们的 thinking 由 `thinking.type` 控制，不发这个
+    /// 字段等于"没说"，端点按自己的默认（通常是开）处理。2026-10 实测踩到过：auto
+    /// 模式分类器预算 256 token 全被思考吃掉，`stop_reason=MaxTokens` 且可见文本为空，
+    /// 一次都没判定成功。
+    ///
+    /// Anthropic 协议路径只读 `thinking_budget`、完全忽略 `thinking_switch`，因此这个
+    /// 字段对 Anthropic 是 no-op，不会写出它不认识的 `thinking.type`。
     pub fn text_only(max_tokens: u32) -> Self {
         Self {
             max_tokens,
             thinking_budget: None,
             reasoning_effort: None,
-            thinking_switch: None,
+            thinking_switch: Some("disabled".to_string()),
             interleaved: false,
         }
     }

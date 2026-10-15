@@ -439,7 +439,17 @@ fn native_search(spec: &SearchSpec) -> (Vec<String>, bool) {
         .git_ignore(true) // .gitignore
         .git_global(true)
         .git_exclude(true)
-        .require_git(false) // 非 git 仓库里也生效（ignore crate 默认 true，与 rg 不一致）
+        // 按仓库位置动态决定，而不是写死 false：非 git 仓库里也让忽略规则生效
+        // （与 rg 默认行为对齐，工具描述里承诺了 Respects .gitignore）。
+        //
+        // 在 git 仓库 / **managed worktree** 里必须为 true：`ignore` crate 解析
+        // worktree 的 common git dir（`.git` 是 `gitdir:` 指针文件）只在
+        // `require_git == true` 的分支里，写死 false 会让它去读
+        // `<worktree>/.git/info/exclude`——那是个文件，一条规则都加载不到。
+        // 后果是**两条后端在 worktree 里给出不同结果**：rg 走的是 Git 自己的
+        // 解析（正确应用 info/exclude），本兜底路径不应用，于是同一个工具
+        // 有时搜得到、有时搜不到。
+        .require_git(wyj_config::gitignore::is_inside_git_repo(&spec.root))
         .threads(threads)
         .filter_entry(|e| e.file_name() != OsStr::new(".git"));
     builder.build_parallel().run(|| {

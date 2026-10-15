@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub const SCHEDULE_VERSION: u32 = 2;
@@ -77,6 +78,13 @@ pub struct ScheduleTask {
 pub struct ScheduleManifest {
     pub version: u32,
     pub tasks: Vec<ScheduleTask>,
+    /// 本进程加载时读到的**原始文件文本**，供 `save_to` 做三方 diff 合并。
+    ///
+    /// 与 `lockfile::InstalledManifest::baseline_json` 同理：删除是硬删
+    /// （`retain`），无脑 union 会把别人刚删的任务复活——而 crontab 里那行还在，
+    /// 于是定时任务变成「文件里没有、crontab 里照跑」的幽灵。
+    #[serde(skip)]
+    pub baseline_json: Option<String>,
 }
 
 impl ScheduleManifest {
@@ -84,6 +92,7 @@ impl ScheduleManifest {
         Self {
             version: SCHEDULE_VERSION,
             tasks: Vec::new(),
+            baseline_json: None,
         }
     }
 }
@@ -98,7 +107,13 @@ pub fn schedule_file_path() -> Result<PathBuf> {
 
 fn load_from(path: &Path) -> Result<ScheduleManifest> {
     if !path.exists() {
-        return Ok(ScheduleManifest::new());
+        let mut manifest = ScheduleManifest::new();
+        // 空基线**必须**记下来：文件不存在是最常见的情形（首次建任务），
+        // 此时若返回 `baseline_json: None`，`save_to` 会退化成整份覆盖，
+        // 于是两个实例各自「首次新建」时后一个照样会抹掉前一个——恰好把最需要
+        // 保护的场景排除在保护之外。
+        manifest.baseline_json = serde_json::to_string(&ScheduleManifest::new()).ok();
+        return Ok(manifest);
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取定时任务文件失败: {}", path.display()))?;
@@ -113,6 +128,7 @@ fn load_from(path: &Path) -> Result<ScheduleManifest> {
         }
     }
     manifest.version = SCHEDULE_VERSION;
+    manifest.baseline_json = Some(content);
     if migrated {
         save_to(path, &manifest)?;
     }
@@ -124,7 +140,12 @@ fn save_to(path: &Path, manifest: &ScheduleManifest) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建定时任务目录失败: {}", parent.display()))?;
     }
-    let content = serde_json::to_string_pretty(manifest).context("序列化定时任务失败")?;
+    // 跨进程排他锁：新建/删除定时任务是 load → 改 → save 的 read-modify-write。
+    // 无锁时两个实例各自从同一份旧快照出发，后保存者会把对方刚建的任务整个抹掉——
+    // 表现是「刚加的定时任务重启后自己没了」，而 crontab 已经被写进去了。
+    let _guard = wyj_config::filelock::acquire(&path.with_extension("json.lock"), "tasks.json")?;
+    let merged = merge_with_disk(path, manifest)?;
+    let content = serde_json::to_string_pretty(&merged).context("序列化定时任务失败")?;
     let nonce = format!(
         ".tmp-{}-{}",
         std::process::id(),
@@ -157,6 +178,58 @@ pub fn load() -> Result<ScheduleManifest> {
 
 pub fn save(manifest: &ScheduleManifest) -> Result<()> {
     save_to(&schedule_file_path()?, manifest)
+}
+
+/// 把本进程的改动三方合并到锁内重读的磁盘值上，规则同 `lockfile::merge_entries`：
+///
+/// - base 有、mine 无 → 本进程删掉了它 → 结果里不保留（**不复活**别人刚删的任务）
+/// - base 无、mine 有 → 本进程新加的 → 追加
+/// - base 有、mine 有 → 以 mine 为准
+/// - 三者都没有  → 保留磁盘值（本进程没碰，别人的改动自动并入）
+///
+/// 无基线（内存构造）时退化为整份覆盖。
+fn merge_with_disk(path: &Path, mine: &ScheduleManifest) -> Result<ScheduleManifest> {
+    let base = mine
+        .baseline_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<ScheduleManifest>(raw).ok());
+    // 刻意**不**复用 `load_from`：它在检测到旧版本时会回调 `save_to`，而 `save_to`
+    // 又会回到这里——迁移路径上直接变成无限递归。这里只关心磁盘上的条目内容。
+    let disk = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ScheduleManifest>(&raw).ok());
+    let (Some(base), Some(disk)) = (base, disk) else {
+        return Ok(mine.clone());
+    };
+    let mut merged = disk.clone();
+    merged.version = mine.version;
+    merged.baseline_json = None;
+
+    let base_ids: HashSet<&str> = base.tasks.iter().map(|t| t.id.as_str()).collect();
+    let mine_ids: HashSet<&str> = mine.tasks.iter().map(|t| t.id.as_str()).collect();
+    merged.tasks = disk
+        .tasks
+        .iter()
+        .filter(|task| {
+            // 保留条件 = 「基线里没有它」或「本进程仍然要它」
+            !base_ids.contains(task.id.as_str()) || mine_ids.contains(task.id.as_str())
+        })
+        .cloned()
+        .collect();
+    for task in &mine.tasks {
+        match merged
+            .tasks
+            .iter_mut()
+            .find(|existing| existing.id == task.id)
+        {
+            Some(existing) => *existing = task.clone(),
+            // 磁盘上没有且本进程基线里有 → 别人刚删了它，尊重删除。
+            None if base_ids.contains(task.id.as_str()) => {}
+            None => merged.tasks.push(task.clone()),
+        }
+    }
+    merged.tasks.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(merged)
 }
 
 pub struct NewTask {
@@ -319,6 +392,83 @@ mod tests {
         let manifest = load_from(&dir.path().join("tasks.json")).unwrap();
         assert_eq!(manifest.version, SCHEDULE_VERSION);
         assert!(manifest.tasks.is_empty());
+    }
+
+    /// 两个实例各自从同一份空快照出发、各建一个任务：两个都必须留下。
+    /// 旧行为是整份覆盖，后保存者把对方刚建的任务抹掉，而 crontab 里那行还在。
+    #[test]
+    fn concurrent_creates_keep_both_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+
+        // 两个实例各自 load（拿到**同一份**空基线），各建一个任务。
+        let mut a = load_from(&path).unwrap();
+        let mut b = load_from(&path).unwrap();
+        let make = |id: &str| ScheduleTask {
+            id: id.to_string(),
+            name: id.to_string(),
+            prompt: "p".to_string(),
+            cron: "0 8 * * *".to_string(),
+            cwd: dir.path().to_path_buf(),
+            enabled: true,
+            needs_permission_review: false,
+            permissions: SchedulePermissions::default(),
+            notify_on_failure: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_run: None,
+        };
+        a.tasks.push(make("task-a"));
+        b.tasks.push(make("task-b"));
+
+        save_to(&path, &b).unwrap();
+        save_to(&path, &a).unwrap();
+
+        let final_manifest = load_from(&path).unwrap();
+        let ids: Vec<&str> = final_manifest.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert!(
+            ids.contains(&"task-a") && ids.contains(&"task-b"),
+            "并发新建的任务必须都保留，实际: {ids:?}"
+        );
+    }
+
+    /// 关键性质：一个实例删除的任务**不能**被另一个实例的陈旧快照复活。
+    /// 如果这里退化成 union，被删的任务会重新出现在 tasks.json 里，而 crontab 里
+    /// 对应那行已经被摘掉——于是它变成既不可见又不可管的幽灵。
+    #[test]
+    fn a_stale_snapshot_never_resurrects_a_deleted_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let mut seed = load_from(&path).unwrap();
+        seed.tasks.push(ScheduleTask {
+            id: "doomed".to_string(),
+            name: "d".to_string(),
+            prompt: "p".to_string(),
+            cron: "0 8 * * *".to_string(),
+            cwd: dir.path().to_path_buf(),
+            enabled: true,
+            needs_permission_review: false,
+            permissions: SchedulePermissions::default(),
+            notify_on_failure: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_run: None,
+        });
+        save_to(&path, &seed).unwrap();
+
+        // A、B 都看到含 doomed 的状态；A 删掉它，B 什么都不知道。
+        let mut a = load_from(&path).unwrap();
+        let b = load_from(&path).unwrap();
+        a.tasks.retain(|t| t.id != "doomed");
+
+        save_to(&path, &a).unwrap();
+        save_to(&path, &b).unwrap();
+
+        let final_manifest = load_from(&path).unwrap();
+        assert!(
+            !final_manifest.tasks.iter().any(|t| t.id == "doomed"),
+            "被删除的任务不能因为另一个进程的陈旧快照而复活"
+        );
     }
 
     #[test]

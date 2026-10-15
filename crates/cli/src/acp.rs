@@ -988,7 +988,8 @@ fn prompt_blocks(params: &Value) -> Result<Vec<wyj_api::types::ContentBlock>> {
 
 fn set_mode(context: &ToolCtx, mode: &str) -> Result<()> {
     match mode {
-        "normal" => context.set_permission_mode(PermissionMode::Prompt),
+        "auto" => context.set_permission_mode(PermissionMode::Auto),
+        "normal" | "manual" => context.set_permission_mode(PermissionMode::Prompt),
         "plan" => {
             let allowed = [
                 "Read",
@@ -1019,6 +1020,7 @@ fn modes(current: &str) -> Value {
     json!({
         "currentModeId": current,
         "availableModes": [
+            {"id": "auto", "name": "Auto", "description": "Runs without routine prompts; a classifier reviews actions before they run"},
             {"id": "normal", "name": "Normal", "description": "Interactive coding with per-tool permission requests"},
             {"id": "plan", "name": "Plan", "description": "Read-only analysis plus approved plan-document writes"}
         ]

@@ -98,7 +98,7 @@
 | Schedule 日志 | 50 文件 / task | `storage.schedule_logs_per_task` |
 | Schedule `run.log` | 10 MiB × 3 rotations | `storage.schedule_run_log_*` |
 | 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
-| Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
+| Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days`（由 `cli::workspace_cmd::manager` 接上 `with_storage_retention`，此前是零调用死代码；`workspace list` 交叉 `git worktree list --porcelain` 报健康度，`--reconcile` 清失效 manifest） |
 | CAS blob pool（context editing 外部化的工具输出 + checkpoint 文件快照） | 1 GiB，启动时 gc | `storage.cas_total_bytes` / `storage.cas_gc_on_start` |
 | Sub-agent trace | 256 KiB / agent（已存在,不在本批改动） | `subagent.trace_max_bytes_per_agent` |
 | 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K、text 16K+8K、thinking 8K、reasoning_details 8K、tool_use.input 64K(均 head+tail,JSON 值按最长 string 叶子裁剪且保持合法 JSON) | `persist_cap.*` |
@@ -117,6 +117,16 @@
 **模型侧提示词**（`core::prompts` + `tools::descriptions`）：主 system prompt、模式追加段（Plan/non-interactive）、子 agent 内置提示、compact 结构化摘要模板、记忆提取提示、全部工具描述均为**英文原创常量**，不走 i18n（模型行为不应随 locale 漂移；末尾 "reply in the user's language" 保证中文用户得到中文回复）。system prompt 结构 = 英文主提示 + `<env>` 环境块（**cwd/home**/平台/日期/model 等会话内稳定字段，进 prompt 缓存）+ 跨会话记忆快照 + AGENTS.md reminder；**`home` 必须带上**——2026-10-09 实测缺这一项时，模型无从得知 `~/.wyj-code/skills/` 的真实绝对路径，会凭空编出 `/Users/dev/.wyj-code/skills` 这类不存在的路径，并据此断言"skill 实际未安装"（会话记录里它自己写了 "But I don't know the home dir"）。同一教训见架构节 23 条：`# Skills` 段的禁令必须写成**行为禁令**（"禁止一切自发检索 skill 目录，名单是唯一合法来源"）而非**路径枚举**（只禁 `~/.claude/skills/` 会被换个目录绕过）。**git 状态快照**（分支/porcelain/近 5 commit）走会话首轮 user 消息注入（`Agent::with_git_snapshot`），因其每轮可能变、进 system 会击穿缓存。
 
 **语言规则必须显式覆盖 reasoning**（`prompts.rs` 的 `# Tone and style` + 三段子 Agent 模板）：2026-10-15 排查 thinking 输出「英文为主、偶发中文」时的结论是——**代码全链路对 thinking 零强制**（`agent.rs` 纯 `push_str` 累积、OpenAI 的 `reasoning_content`、`compact` 的摘要、TUI 的 `clean_thinking_lines`，全是字节级透传，无翻译无规范化），唯一能动的地方是提示词。原句只写 "Always **reply** in ...", 而模型普遍把 thinking 当**内部推理通道**而非回复，训练时对它独立施加英文先验，与最终回复语言解耦——于是「全英文 system prompt + 中文回复 + 英文 thinking」是完全自洽的状态。现措辞显式点名 "including your extended thinking / reasoning"；子 Agent 三模板同样补上（`Agent::with_system` 是**整体替换**、不继承 `MAIN`，子 Agent 此前**一条语言指令都没有**，是漂移概率最高的一档）。**改 prompt 不影响 cache 命中率的持续性**：thinking 活在 `session.messages`、从不进 system prompt，改 `MAIN` 只在升级后第一轮整体换一次前缀。
+
+**`config.language` 曾经到不了模型**（`language` 从纯 UI 字段升级为「UI + 模型输出语言」）：用户报「config 里写着 `language = "zh"`、UI 全中文、thinking 一直英文」。根因是该字段全仓只有三处消费者，全是 `wyj_i18n::set_locale`（`cli/src/main.rs` 启动、`tui/src/app.rs` 设置面板两处）——`crates/api` 全 crate 搜 `language|locale` **零命中**，模型侧根本不知道用户配了什么语言。提示词里那句"跟着用户输入的语言回复"是软约束，且被 thinking 的英文训练先验压过，撑不住。修法是把配置值变成**模型可见的环境事实**，而不是继续加软措辞：
+
+- `EnvInfo` 加 `language` 字段，`environment_block()` 输出 `Response language: Chinese (zh)`。**不能只吐裸 locale code**——不同模型对 `zh` 这类 code 的解读不稳定（实测有把未知 code 直接回退英文的），必须配英文语言名，由 `language_display_name` 负责。`EnvInfo::collect` 的第三个参数由调用方用 `wyj_i18n::resolve_locale(cfg.language.as_deref())` 解析后传入——core 不直接读 config，也避免各入口各自复刻「留空回退系统 locale」的判断。
+- `MAIN` 的语言条款改为**锚定 `<env>` 的显式声明**（"comes from the user's own configuration and outranks any guess you would make from the conversation"），仍保留「用户当期用别的语言写就跟着他」作为次级规则。写软措辞不管用，要写**事实**。
+- **子 Agent 走独立通道**：`with_system` 整体替换 → 子 Agent 拿不到 `<env>` 块，因此新增 `prompts::sub_agent_language_section(locale)`，三段内置模板改为引用 `# Response language`，由 `cli::make_sub_agent_factory` 在 `with_system` **之后** `append_system`（放前面会被整体替换抹掉）。
+- **`inp.system` 覆盖是同一类陷阱**：`SubAgentTool` 的运行时 system 覆盖同样走 `with_system`，会把工厂追加的语言段抹掉，且现象随模型是否恰好传该字段而**随机复现**。故 `SubAgentTool` 存 `response_language`（`with_response_language`），覆盖后补回；嵌套递归构造时一并 `clone`。
+- locale 解析统一收口到 `wyj_i18n::resolve_locale`（原先三处各自复刻 `configured.unwrap_or_else(detect_system_locale)`，漏一处就劈叉）。注意**空串/纯空白必须等同「未配置」**——`language = ""` 是 `docs/reference/config.md` 明示的合法写法，当成有效值会得到空 locale 并让 `<env>` 的语言声明整条消失。
+
+**改 `MAIN` / `<env>` 的 cache 代价**：两者都在 stable 段，locale 是会话内恒定字段，正常使用不增加重算成本；只有 `/config` 热切 language（走 `rebuild_fn` 重算 `EnvInfo`）与版本升级那一次会整体换前缀，属预期。
 
 **压缩不再丢弃 thinking**（`compact.rs::messages_to_text`）：此前 `ContentBlock::Thinking` 一律 `None`，理由是「内部推理，非对话事实」。这个理由在压缩场景下站不住——摘要是压缩后**唯一**的续跑上下文，丢掉推理链等于每轮重新起跑：既丢掉已付出的推理，也让输出语言在压缩点后漂移。现按 `[思考] <truncate_chars(400)>` 纳入摘要文本，空 thinking 与 `RedactedThinking` 只留占位；配套在 `compact_prompt` 模板加 `## Key Reasoning` 一节，指示摘要器只提炼**最终答案里看不见**的推理（排除掉的方案、读代码发现的约束），没有就不输出该节，避免把整段 reasoning 原样倒灌进摘要。单测 `thinking_reaches_compaction_text` / `long_thinking_is_truncated_in_compaction_text` / `empty_and_redacted_thinking_produce_placeholder_only`。
 
@@ -144,4 +154,19 @@
 ## 推理轮数触顶
 
 
-`max_turns_for_model` 对 reasoning 模型压到 32 轮、普通模型 200 轮。触顶时用户能用的最近锚点是 `AutoUser` checkpoint——而它存的是**本次提交开始前**的状态，`/rewind` 回去等于把这半小时几十次工具调用全部推倒重来。故 `bail!` 前先落一份 `CheckpointKind::TurnLimit` 存档（存「撞上限那一刻已经做成什么样」），报错文案指引 `/rewind` 回工作现场。`checkpoint_store` 为 `None` 时静默跳过：存不了档不能让中止行为变成别的样子。
+## 推理轮数触顶不再等于失败
+
+`max_turns_for_model` 对 reasoning 模型压到 32 轮、普通模型 200 轮（`[agent].max_turns` 可覆盖普通模型那一档）。
+
+**事故（2026-10-15）**：一次跨十几个文件的重构在第 200 轮触顶，抛出的却是 `bail!` —— 用户看到一句红色「超过最大推理轮数 200」，而工作树里那 143 次 Edit、85 次 Bash、81 次 Read 全都已经落地，错误率仅 6%，**没有一轮是空转**。翻出触顶时刻的 `turn_limit` checkpoint 逐轮核对后确认：模型一直在干有效工作，只是没人告诉它「该停了，该总结了」。
+
+**根因不是上限太高，是触顶只有一条出口**。200 这个值的本意是「防模型死循环」，可它同时成了正常长任务的唯一出口，于是「任务还在正常推进」和「模型死循环」被压成同一个结局：报错。两者需要的处理恰好相反——后者该中止，前者该**交付**。
+
+**修法**：触顶前留 `TURN_LIMIT_GRACE = 4` 轮收尾宽限。在此窗口内注入一次 `<turn-budget-reminder>`（走 `push_user_blocks_merged`，与工具结果同处一条 user 消息，不破坏角色交替），要求模型停止调用工具、立即输出「已完成 / 已验证 / 未完成 / 下一步」。模型据此交出最终文本，`has_tool_calls` 转 false，循环正常 `break` —— **回合以「完成」收尾**，用户拿到一份可读的阶段交付而不是一句错误。
+
+三条不变式：
+
+- **只注入一次**（`wrap_up_sent`）。否则模型可以靠无视指令 + 反复注入给自己续命，「最多 N 轮」形同虚设；无视指令的模型下一轮就落到硬中止，那才是真正该报错的形态。
+- **硬中止仍然保留**，且仍在 `bail!` 前落一份 `CheckpointKind::TurnLimit` 存档（存「撞上限那一刻已经做成什么样」）。它现在只在「模型收到收尾指令仍不交出最终回答」时触发。`checkpoint_store` 为 `None` 时静默跳过：存不了档不能让中止行为变成别的样子。
+- **触顶即失败是错的，触顶即静默同样是错的**。宽限窗口内 `agent.turn_budget_wrap_up` 会明说「已用掉 N/M 轮，已要求模型停止调用工具并总结」，用户看到的是「这一轮到此为止，这是阶段成果」，而不是意外。
+

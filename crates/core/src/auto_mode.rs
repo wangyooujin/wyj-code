@@ -1,0 +1,875 @@
+//! Auto 模式的判定闸门（对齐 Claude Code 的 auto mode）。
+//!
+//! 与手动模式「逐次弹窗」的区别只在一个位置：**谁来回答"这一步要不要问人"**。
+//! Auto 模式把这个问题交给一条固定顺序的流水线：
+//!
+//! 1. 确定性 hard_deny —— 命中即拒，不发模型请求；
+//! 2. 确定性 allow —— 命中即放行，不发模型请求；
+//! 3. 模型分类器 —— 前两步都没结论时才付一次模型往返，让它按 `soft_deny` /
+//!    `allow` / `environment` 规则做语义判定（"这次 `git push` 到底该不该做"）。
+//!
+//! 前两步刻意做成**同步、纯本地、可单测**：高频动作（读文件、跑测试）根本不该
+//! 等一次网络往返，而真正危险的少数命令必须无论端点多慢都拦得住。
+//!
+//! 失败策略按上游语义 fail-closed：分类器请求超时 / 返回非法内容 / 空响应，一律
+//! 判为拒绝。只有一种例外是 `AskUser`——配置显式关掉分类器时，那是用户自己选的
+//! 偏好，不是故障，此时交回人工确认。
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use wyj_api::{
+    provider::{Provider, RequestOptions},
+    types::{ContentBlock, Message, Role},
+    SystemPrompt,
+};
+
+use crate::auto_rules::{
+    self, DEFAULT_ALLOW, DEFAULT_ENVIRONMENT, DEFAULT_HARD_DENY, DEFAULT_SOFT_DENY,
+};
+
+/// 分类器输出 token 上限。
+///
+/// **不要按"判定只需一个极短的 JSON"来定这个数**：2026-10 实测，adaptive thinking
+/// 模型（MiniMax-M3.1-Flash-Preview 之类）会在字段缺省时**自行开启思考**，而
+/// `text_only()` 把 `thinking_budget` 置 None 后，`anthropic.rs:602` 只读 budget、
+/// 完全忽略 `thinking_switch`，于是请求体里根本不发 `thinking` 字段 —— 端点按自己
+/// 的默认（开）处理。这类模型还**物理上拒绝关闭思考**：
+/// `thinking.type="disabled"` 会被 400 拒（`requires adaptive thinking`）。
+///
+/// 所以唯一可调的旋钮就是这个预算。256 远远不够：实测真实分类器 prompt
+/// （AUTO_CLASSIFIER + 四组规则 + 命令全文）下思考量 1105–2395 字符，256 会被
+/// 思考吃光 → `stop_reason=MaxTokens` 且可见文本为空 → `parse_classifier_output`
+/// 失败 → fail-closed，于是**每条需要过闸门的命令都被拒**，看起来像随机抽风
+/// （短的 `ls -la` 有时能挤进去，长的必然失败）。
+///
+/// 2048 是实测余量：贴近 `ACTION_SUMMARY_LIMIT` 上限的长命令在 2048 下思考
+/// 1972 字符、判定正常、端到端 5.5s。注意 `max_tokens` 只是上限不是预付，
+/// 思考短的请求不会多消耗 token，所以给足余量没有成本。
+const CLASSIFIER_MAX_TOKENS: u32 = 2048;
+
+/// 送给分类器的动作描述上限，避免一条巨长命令把提示词顶爆。
+const ACTION_SUMMARY_LIMIT: usize = 2000;
+
+/// 送给分类器的用户目标上限。
+const USER_GOAL_LIMIT: usize = 4000;
+
+/// 分类器规则文本的总量上限：规则来自配置文件，写多了既贵又会稀释判定质量。
+const RULES_LIMIT: usize = 12_000;
+
+/// 用户在配置里写下的规则（`[auto_mode]` 段），未展开 `$defaults`。
+#[derive(Debug, Clone, Default)]
+pub struct AutoRuleOverrides {
+    pub hard_deny: Vec<String>,
+    pub soft_deny: Vec<String>,
+    pub allow: Vec<String>,
+    pub environment: Vec<String>,
+}
+
+impl AutoRuleOverrides {
+    /// 展开 `$defaults` 得到最终规则集，并对「整段替换掉内置安全规则」告警。
+    ///
+    /// 告警而非拒绝：`allow` / `environment` 整段替换通常正是用户想要的（不想继承
+    /// 一堆用不上的规则），但 `soft_deny` / `hard_deny` 丢掉内置项会实打实放宽
+    /// 拦截面，这种配置值得在启动日志里喊一声。
+    pub fn resolve(&self) -> ResolvedRules {
+        ResolvedRules {
+            hard_deny: splice(&self.hard_deny, DEFAULT_HARD_DENY, "hard_deny"),
+            soft_deny: splice(&self.soft_deny, DEFAULT_SOFT_DENY, "soft_deny"),
+            allow: splice(&self.allow, DEFAULT_ALLOW, "allow"),
+            environment: splice(&self.environment, DEFAULT_ENVIRONMENT, "environment"),
+        }
+    }
+}
+
+fn splice(configured: &[String], defaults: &[&'static str], name: &str) -> Vec<String> {
+    if !configured.is_empty() && !auto_rules::declares_defaults(configured) {
+        tracing::warn!(
+            rule_set = name,
+            "autoMode.{name} 配置里没有 \"$defaults\"，内置规则已被整段替换"
+        );
+    }
+    auto_rules::splice_defaults(configured, defaults)
+}
+
+/// 展开后的最终规则集。
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedRules {
+    pub hard_deny: Vec<String>,
+    pub soft_deny: Vec<String>,
+    pub allow: Vec<String>,
+    pub environment: Vec<String>,
+}
+
+/// Auto 模式的闸门配置（由 CLI/TUI 从 `[auto_mode]` 段装配）。
+#[derive(Debug, Clone)]
+pub struct AutoGateConfig {
+    /// 分类器总开关。关掉后只剩确定性规则层，拿不准的一律交回人工确认。
+    pub enabled: bool,
+    /// 分类器单次请求超时。超时按 fail-closed 判拒绝。
+    pub timeout: Duration,
+    /// 连续被分类器拒绝多少次后自动降级为逐次人工确认。
+    pub max_consecutive_blocks: u32,
+    /// 整个会话累计被拒多少次后自动降级。
+    pub max_total_blocks: u32,
+    /// true 时所有 shell 命令一律送审，不走确定性 allow 白名单（更安全但更慢）。
+    pub classify_all_shell: bool,
+    pub rules: ResolvedRules,
+}
+
+impl Default for AutoGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout: Duration::from_secs(30),
+            max_consecutive_blocks: 3,
+            max_total_blocks: 20,
+            classify_all_shell: false,
+            rules: ResolvedRules::default(),
+        }
+    }
+}
+
+/// 一次待判定的动作。
+#[derive(Debug, Clone)]
+pub struct AutoReviewRequest {
+    pub tool: String,
+    /// 展示用的动作摘要（Bash 是完整命令，Edit/Write 是目标路径）。
+    pub action_summary: String,
+    pub input: Value,
+    pub cwd: PathBuf,
+    /// 用户这一轮原始请求，分类器据此判断「这一步是否在请求范围内」。
+    pub user_goal: String,
+}
+
+/// 闸门判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoVerdict {
+    /// 自动放行。
+    Allow,
+    /// 直接拒绝。`reason` 会回灌给模型，让它换路子而不是重试。
+    Deny { rule: String, reason: String },
+    /// 交回人工确认（配置关掉了分类器，或根本没配分类器）。
+    AskUser { reason: String },
+}
+
+/// 会话内的拦截计数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoCounters {
+    pub consecutive: u32,
+    pub total: u32,
+    /// 已因连续/累计超阈值而自动降级。
+    pub degraded: bool,
+}
+
+/// Auto 模式闸门。
+#[async_trait]
+pub trait AutoGate: Send + Sync {
+    /// 判定一次工具调用是否可以不经人工确认直接执行。
+    async fn review(&self, request: &AutoReviewRequest) -> AutoVerdict;
+    /// 当前拦截计数（供 UI 显示与降级判定）。
+    fn counters(&self) -> AutoCounters;
+    /// 是否已因连续或累计超阈值而应当降级为逐次人工确认。
+    fn should_degrade(&self) -> bool;
+    /// 用户在人工确认里批准了一次，清空连续计数。
+    fn note_human_approval(&self);
+}
+
+/// 分类器请求的记账：与主会话的 `Session.total_*` 分开统计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AutoClassifierUsage {
+    pub requests: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+}
+
+/// 生产实现：确定性规则层 + 可选模型分类器。
+pub struct AutoGateImpl {
+    config: AutoGateConfig,
+    /// `None` = 没配分类器（例如 `classifier_profile` 指向不存在的分组），
+    /// 此时闸门退化为「确定性规则 + 其余交回人工」。
+    classifier: Option<Arc<dyn Provider>>,
+    counters: Mutex<AutoCounters>,
+    usage: Mutex<AutoClassifierUsage>,
+    /// 用户这一轮的原始请求，由 Agent 在回合入口写入。
+    user_goal: Mutex<String>,
+}
+
+impl AutoGateImpl {
+    pub fn new(config: AutoGateConfig, classifier: Option<Arc<dyn Provider>>) -> Self {
+        Self {
+            config,
+            classifier,
+            counters: Mutex::new(AutoCounters::default()),
+            usage: Mutex::new(AutoClassifierUsage::default()),
+            user_goal: Mutex::new(String::new()),
+        }
+    }
+
+    /// 记录本轮用户请求。分类器判断「是否超出请求范围」时需要它。
+    pub fn set_user_goal(&self, goal: &str) {
+        if let Ok(mut slot) = self.user_goal.lock() {
+            *slot = goal.to_string();
+        }
+    }
+
+    pub fn usage(&self) -> AutoClassifierUsage {
+        self.usage.lock().map(|u| *u).unwrap_or_default()
+    }
+
+    /// 按当前计数判断是否应当自动降级（连续超阈值，或累计超阈值）。
+    ///
+    /// 幂等：一旦越过阈值就恒为 true，由调用方决定「切换模式」这个副作用只做一次。
+    pub fn should_degrade(&self) -> bool {
+        let counters = self.counters.lock().map(|c| *c).unwrap_or_default();
+        counters.consecutive >= self.config.max_consecutive_blocks
+            || counters.total >= self.config.max_total_blocks
+    }
+
+    fn note_block(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.consecutive += 1;
+            counters.total += 1;
+            if counters.consecutive >= self.config.max_consecutive_blocks
+                || counters.total >= self.config.max_total_blocks
+            {
+                counters.degraded = true;
+            }
+        }
+    }
+
+    /// 确定性放行判定：命中返回 `Some(依据)`，未命中返回 `None`。
+    ///
+    /// 覆盖三类：工作目录内的文件写、只读/构建/依赖安装类 shell 命令。
+    fn deterministic_allow(&self, request: &AutoReviewRequest) -> Option<String> {
+        match request.tool.as_str() {
+            // 受保护路径已在 `PermissionPolicy::evaluate` 里先行 deny，
+            // 走到这里只可能是普通文件写。
+            "Write" | "Edit" | "NotebookEdit" => {
+                let raw = request
+                    .input
+                    .get("file_path")
+                    .or_else(|| request.input.get("notebook_path"))
+                    .and_then(Value::as_str)?;
+                let target =
+                    crate::permission::safe_resolve_write_target(&request.cwd, raw).ok()?;
+                if is_within_cwd(&target, &request.cwd) {
+                    Some(format!("工作目录内文件写：{}", target.display()))
+                } else {
+                    None
+                }
+            }
+            "Bash" => {
+                let command = request.input.get("command").and_then(Value::as_str)?;
+                if self.config.classify_all_shell {
+                    return None;
+                }
+                auto_rules::match_allow(command).map(|basis| format!("命中允许规则：{basis}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// 确定性拒绝判定：命中返回 `Some(依据)`。
+    fn deterministic_deny(&self, request: &AutoReviewRequest) -> Option<(String, String)> {
+        let command = match request.tool.as_str() {
+            "Bash" => request.input.get("command").and_then(Value::as_str),
+            _ => None,
+        }?;
+        let pattern = auto_rules::match_hard_deny(command)?;
+        Some((
+            pattern.id.to_string(),
+            format!("命中禁止规则：{}", pattern.summary),
+        ))
+    }
+
+    fn rules_prompt(&self) -> String {
+        let rules = &self.config.rules;
+        let mut out = String::new();
+        for (title, items) in [
+            ("Environment", &rules.environment),
+            ("Hard deny (unconditional)", &rules.hard_deny),
+            (
+                "Soft deny (clearable only by explicit user intent)",
+                &rules.soft_deny,
+            ),
+            ("Allow", &rules.allow),
+        ] {
+            if items.is_empty() {
+                continue;
+            }
+            out.push_str(&format!("\n## {title}\n"));
+            for item in items {
+                out.push_str("- ");
+                out.push_str(item);
+                out.push('\n');
+            }
+        }
+        clip(&out, RULES_LIMIT)
+    }
+
+    fn build_prompt(&self, request: &AutoReviewRequest) -> String {
+        let goal = self.user_goal.lock().map(|g| g.clone()).unwrap_or_default();
+        let goal = if goal.is_empty() {
+            "(unknown)"
+        } else {
+            goal.as_str()
+        };
+        let mut out = String::new();
+        out.push_str("<user_request>\n");
+        out.push_str(&clip(goal, USER_GOAL_LIMIT));
+        out.push_str("\n</user_request>\n\n<action>\ntool: ");
+        out.push_str(&request.tool);
+        out.push('\n');
+        out.push_str(&clip(&request.action_summary, ACTION_SUMMARY_LIMIT));
+        out.push_str("\n</action>\n");
+        out.push_str(&self.rules_prompt());
+        out
+    }
+
+    async fn call_classifier(&self, request: &AutoReviewRequest) -> Result<AutoVerdict, String> {
+        let provider = self
+            .classifier
+            .as_ref()
+            .ok_or_else(|| "未配置分类器".to_string())?;
+        let messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: self.build_prompt(request),
+            }],
+        }];
+        let system = SystemPrompt::stable_only(crate::prompts::AUTO_CLASSIFIER);
+        let options = RequestOptions::text_only(CLASSIFIER_MAX_TOKENS);
+        let call = provider.complete(&system, &messages, &[], &options);
+        let result = tokio::time::timeout(self.config.timeout, call)
+            .await
+            .map_err(|_| format!("分类器请求超时（{}s）", self.config.timeout.as_secs()))?
+            .map_err(|error| format!("分类器请求失败：{error}"))?;
+
+        if let Ok(mut usage) = self.usage.lock() {
+            usage.requests += 1;
+            usage.input_tokens += result.input_tokens;
+            usage.output_tokens += result.output_tokens;
+        }
+
+        let raw = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        match parse_classifier_output(&raw) {
+            Ok(verdict) => Ok(verdict),
+            Err(error) => {
+                // 解析失败一律 fail-closed，但**必须留下线索**：只报「无法解析」的话，
+                // 用户既改不了模型也改不了提示词，只能看着操作一次次被拦。
+                // 所以把截断后的原始输出与 stop_reason 一并带进错误里。
+                tracing::warn!(
+                    %error,
+                    stop_reason = ?result.stop_reason,
+                    raw = %clip(&raw, 400),
+                    "分类器输出无法解析"
+                );
+                Err(format!(
+                    "{error}（模型返回：{}；stop_reason={:?}）",
+                    clip(&raw, 160),
+                    result.stop_reason
+                ))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl AutoGate for AutoGateImpl {
+    async fn review(&self, request: &AutoReviewRequest) -> AutoVerdict {
+        // 配置显式关闭分类器 = 用户自己选的偏好，不是故障：交回人工而不是拒绝。
+        if !self.config.enabled || self.classifier.is_none() {
+            return AutoVerdict::AskUser {
+                reason: "auto 模式未启用模型分类器，该操作需人工确认".to_string(),
+            };
+        }
+
+        if let Some((rule, reason)) = self.deterministic_deny(request) {
+            self.note_block();
+            return AutoVerdict::Deny { rule, reason };
+        }
+
+        if let Some(reason) = self.deterministic_allow(request) {
+            tracing::trace!(tool = %request.tool, %reason, "auto 确定性放行");
+            return AutoVerdict::Allow;
+        }
+
+        match self.call_classifier(request).await {
+            Ok(AutoVerdict::Allow) => {
+                // 放行也要清零连续计数：用户目标里点名批准过的动作被模型确认安全，
+                // 不该让计数继续往上累。
+                self.note_human_approval();
+                AutoVerdict::Allow
+            }
+            Ok(AutoVerdict::Deny { rule, reason }) => {
+                self.note_block();
+                AutoVerdict::Deny { rule, reason }
+            }
+            Ok(AutoVerdict::AskUser { reason }) => AutoVerdict::AskUser { reason },
+            // fail-closed：拿不到判定就当没通过，绝不静默放行。
+            Err(reason) => {
+                self.note_block();
+                AutoVerdict::Deny {
+                    rule: "classifier_unavailable".to_string(),
+                    reason,
+                }
+            }
+        }
+    }
+
+    fn counters(&self) -> AutoCounters {
+        self.counters.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    fn should_degrade(&self) -> bool {
+        self.should_degrade()
+    }
+
+    fn note_human_approval(&self) {
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.consecutive = 0;
+        }
+    }
+}
+
+/// 按 `[auto_mode]` 配置段装配闸门。
+///
+/// 分类器 Provider 的选取：`classifier_profile` 留空就用 `provider`（主模型），
+/// 填了就按名从 `config.profiles` 里单独建一个（适合用小模型降本）。按名找不到
+/// 或构建失败时**降级为无分类器**而不是 panic——那时 auto 模式退化成"确定性规则
+/// + 其余逐次弹窗"，仍然是一个正确（只是更啰嗦）的会话。
+pub fn build_gate(config: &wyj_config::Config, provider: Arc<dyn Provider>) -> Arc<dyn AutoGate> {
+    let cfg = &config.auto_mode;
+    let classifier: Option<Arc<dyn Provider>> = {
+        let name = cfg.classifier_profile.trim();
+        if name.is_empty() {
+            Some(provider)
+        } else {
+            match config
+                .profiles
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| wyj_api::build_provider_from_profile(p, None).ok())
+            {
+                Some(provider) => Some(provider),
+                None => {
+                    tracing::warn!(
+                        profile = name,
+                        "autoMode.classifier_profile 指向的分组不存在或构建失败，\
+                         auto 模式退回逐次确认"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    Arc::new(AutoGateImpl::new(
+        AutoGateConfig {
+            enabled: cfg.enabled,
+            timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
+            max_consecutive_blocks: cfg.max_consecutive_blocks.max(1),
+            max_total_blocks: cfg.max_total_blocks.max(1),
+            classify_all_shell: cfg.classify_all_shell,
+            rules: AutoRuleOverrides {
+                hard_deny: cfg.hard_deny.clone(),
+                soft_deny: cfg.soft_deny.clone(),
+                allow: cfg.allow.clone(),
+                environment: cfg.environment.clone(),
+            }
+            .resolve(),
+        },
+        classifier,
+    ))
+}
+
+/// 按字节上限截断并回退到 char boundary，避免中文/emoji 被切在半个字符上。
+fn clip(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(max_bytes + 3);
+    out.push_str(&text[..crate::textutil::floor_char_boundary(text, max_bytes)]);
+    out.push('…');
+    out
+}
+
+fn is_within_cwd(target: &Path, cwd: &Path) -> bool {
+    let cwd = crate::project::project_root(cwd);
+    let target = target.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    // 任一侧解析失败时退化为字面比较：解析不出真实路径不代表就一定在工作目录内，
+    // 此时返回 false 交给分类器判，而不是直接放行。
+    let normalized =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = normalized(&target);
+    let cwd = normalized(&cwd);
+    target == cwd || target.starts_with(&cwd)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ClassifierOutput {
+    verdict: String,
+    #[serde(default)]
+    rule: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// 解析分类器输出。容忍代码围栏与前后废话，只认第一个完整 JSON 对象。
+///
+/// 解析不出来就是 fail-closed 的触发条件之一，所以这里返回 `Err` 而不是
+/// 「猜一个 allow」。
+fn parse_classifier_output(raw: &str) -> Result<AutoVerdict, String> {
+    let trimmed = raw.trim();
+    let start = trimmed.find('{').ok_or("分类器未返回 JSON 对象")?;
+    let end = trimmed.rfind('}').ok_or("分类器 JSON 不完整")?;
+    if end <= start {
+        return Err("分类器 JSON 不完整".to_string());
+    }
+    let parsed: ClassifierOutput = serde_json::from_str(&trimmed[start..=end])
+        .map_err(|error| format!("分类器输出无法解析：{error}"))?;
+    let reason = if parsed.reason.trim().is_empty() {
+        "分类器未说明理由".to_string()
+    } else {
+        parsed.reason.trim().to_string()
+    };
+    match parsed.verdict.trim().to_ascii_lowercase().as_str() {
+        "allow" | "approve" => Ok(AutoVerdict::Allow),
+        "deny" | "block" | "reject" => Ok(AutoVerdict::Deny {
+            rule: if parsed.rule.trim().is_empty() {
+                "classifier".to_string()
+            } else {
+                parsed.rule.trim().to_string()
+            },
+            reason,
+        }),
+        other => Err(format!("分类器返回了未知判定：{other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use wyj_api::{
+        provider::EventStream,
+        types::{CompletionResult, StopReason, ToolDefinition},
+    };
+
+    /// 假分类器：按工具摘要里的标记返回预设结果，或直接失败。
+    struct FakeProvider {
+        reply: Option<String>,
+        fail: bool,
+        delay: Duration,
+        calls: AtomicU32,
+    }
+
+    impl FakeProvider {
+        fn allow() -> Arc<Self> {
+            Arc::new(Self {
+                reply: Some(r#"{"verdict":"allow","rule":"","reason":"in scope"}"#.into()),
+                fail: false,
+                delay: Duration::ZERO,
+                calls: AtomicU32::new(0),
+            })
+        }
+
+        fn deny(reason: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Some(format!(
+                    r#"{{"verdict":"deny","rule":"soft_deny","reason":"{reason}"}}"#
+                )),
+                fail: false,
+                delay: Duration::ZERO,
+                calls: AtomicU32::new(0),
+            })
+        }
+
+        fn broken() -> Arc<Self> {
+            Arc::new(Self {
+                reply: None,
+                fail: true,
+                delay: Duration::ZERO,
+                calls: AtomicU32::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        async fn complete(
+            &self,
+            _system: &SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _options: &RequestOptions,
+        ) -> anyhow::Result<CompletionResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("boom");
+            }
+            let text = self.reply.clone().unwrap_or_default();
+            tokio::time::sleep(self.delay).await;
+            Ok(CompletionResult {
+                content: vec![ContentBlock::Text { text }],
+                stop_reason: StopReason::EndTurn,
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn stream(
+            &self,
+            _system: &SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _options: &RequestOptions,
+        ) -> anyhow::Result<EventStream> {
+            // 分类器只走 `complete`；真走到 `stream` 说明测试假设变了，
+            // 让它当场炸掉而不是静默返回一个空流。
+            unreachable!("分类器只使用 complete 路径")
+        }
+    }
+
+    fn bash_request(command: &str) -> AutoReviewRequest {
+        AutoReviewRequest {
+            tool: "Bash".to_string(),
+            action_summary: command.to_string(),
+            input: serde_json::json!({ "command": command }),
+            cwd: std::env::temp_dir(),
+            user_goal: "run the tests".to_string(),
+        }
+    }
+
+    fn gate_with(config: AutoGateConfig, provider: Option<Arc<dyn Provider>>) -> AutoGateImpl {
+        AutoGateImpl::new(config, provider)
+    }
+
+    #[test]
+    fn classifier_budget_covers_thinking_on_adaptive_endpoints() {
+        // 防回归：曾把这里设成 256，理由是"判定只需一个极短的 JSON"。但
+        // adaptive thinking 端点在 thinking 字段缺省时自行开启思考，且物理上
+        // 拒绝关闭（thinking.type=disabled 会被 400 拒），256 会被思考吃光 →
+        // stop_reason=MaxTokens + 可见文本为空 → fail-closed → 命令被随机拒绝。
+        // 实测思考量 1105–2395 字符，下限取 2048。
+        assert!(
+            CLASSIFIER_MAX_TOKENS >= 2048,
+            "分类器预算不能低于 2048，否则 thinking 端点上会被思考吃空"
+        );
+    }
+
+    #[test]
+    fn default_timeout_outlives_a_thinking_classifier_roundtrip() {
+        // 同一次故障的第二个出口：超时与"解析失败"共用 fail-closed，用户看到
+        // 的都是"命令被莫名拒绝"。实测单次往返 3.4–5.5s，15s 会被抖动撞到。
+        assert!(
+            AutoGateConfig::default().timeout >= Duration::from_secs(30),
+            "分类器默认超时不能低于 30s，否则网络抖动就会把正常判定变成拒绝"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_fenced_and_noisy_output() {
+        let verdict = parse_classifier_output(
+            "```json\n{\"verdict\":\"deny\",\"rule\":\"soft_deny\",\"reason\":\"超出请求范围\"}\n```",
+        )
+        .unwrap();
+        assert!(matches!(verdict, AutoVerdict::Deny { .. }));
+
+        let verdict =
+            parse_classifier_output("Sure! {\"verdict\":\"allow\"} hope that helps").unwrap();
+        assert_eq!(verdict, AutoVerdict::Allow);
+    }
+
+    #[test]
+    fn parse_rejects_garbage_as_error() {
+        assert!(parse_classifier_output("I think it is fine").is_err());
+        assert!(parse_classifier_output("{\"verdict\":\"maybe\"}").is_err());
+        assert!(parse_classifier_output("").is_err());
+    }
+
+    #[tokio::test]
+    async fn hard_deny_blocks_without_calling_model() {
+        let provider = FakeProvider::allow();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        let verdict = gate.review(&bash_request("rm -rf /")).await;
+        match verdict {
+            AutoVerdict::Deny { rule, .. } => assert_eq!(rule, "critical_path_removal"),
+            other => panic!("应被确定性规则拦下，实际 {other:?}"),
+        }
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "确定性拦截不应发模型请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_shell_skips_model() {
+        let provider = FakeProvider::deny("不该走到这里");
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        assert_eq!(
+            gate.review(&bash_request("git status")).await,
+            AutoVerdict::Allow
+        );
+        assert_eq!(
+            gate.review(&bash_request("cargo test -p wyj-core")).await,
+            AutoVerdict::Allow
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn classify_all_shell_forces_model_review() {
+        let provider = FakeProvider::deny("命令超出请求范围");
+        let config = AutoGateConfig {
+            classify_all_shell: true,
+            ..Default::default()
+        };
+        let gate = gate_with(config, Some(provider.clone()));
+        assert!(matches!(
+            gate.review(&bash_request("git status")).await,
+            AutoVerdict::Deny { .. }
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_command_goes_to_classifier() {
+        let provider = FakeProvider::allow();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        assert_eq!(
+            gate.review(&bash_request("npm run deploy:staging")).await,
+            AutoVerdict::Allow
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn classifier_failure_fails_closed() {
+        let gate = gate_with(AutoGateConfig::default(), Some(FakeProvider::broken()));
+        match gate.review(&bash_request("npm run deploy:staging")).await {
+            AutoVerdict::Deny { rule, .. } => assert_eq!(rule, "classifier_unavailable"),
+            other => panic!("分类器失败必须 fail-closed，实际 {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classifier_timeout_fails_closed() {
+        let provider = Arc::new(FakeProvider {
+            reply: Some(r#"{"verdict":"allow"}"#.into()),
+            fail: false,
+            delay: Duration::from_millis(200),
+            calls: AtomicU32::new(0),
+        });
+        let config = AutoGateConfig {
+            timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let gate = gate_with(config, Some(provider));
+        assert!(matches!(
+            gate.review(&bash_request("npm run deploy:staging")).await,
+            AutoVerdict::Deny { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn disabled_classifier_falls_back_to_human() {
+        let gate = gate_with(
+            AutoGateConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            Some(FakeProvider::allow()),
+        );
+        assert!(matches!(
+            gate.review(&bash_request("npm run deploy:staging")).await,
+            AutoVerdict::AskUser { .. }
+        ));
+        assert_eq!(gate.counters().total, 0, "交回人工不算拦截");
+    }
+
+    #[tokio::test]
+    async fn consecutive_blocks_trigger_degradation() {
+        let gate = gate_with(
+            AutoGateConfig::default(),
+            Some(FakeProvider::deny("超出请求范围")),
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                gate.review(&bash_request("npm run deploy:prod")).await,
+                AutoVerdict::Deny { .. }
+            ));
+        }
+        let counters = gate.counters();
+        assert_eq!(counters.consecutive, 3);
+        assert_eq!(counters.total, 3);
+        assert!(counters.degraded);
+        assert!(gate.should_degrade());
+    }
+
+    #[tokio::test]
+    async fn total_blocks_trigger_degradation_across_runs() {
+        let gate = AutoGateImpl::new(
+            AutoGateConfig {
+                max_consecutive_blocks: 100,
+                max_total_blocks: 4,
+                ..Default::default()
+            },
+            Some(FakeProvider::deny("超出请求范围")),
+        );
+        for _ in 0..2 {
+            gate.review(&bash_request("npm run deploy:prod")).await;
+            // 人工批准一次会清零连续计数，累计计数则保留。
+            gate.note_human_approval();
+        }
+        assert_eq!(gate.counters().consecutive, 0);
+        assert_eq!(gate.counters().total, 2);
+        gate.review(&bash_request("npm run deploy:prod")).await;
+        gate.note_human_approval();
+        assert!(!gate.counters().degraded);
+        gate.review(&bash_request("npm run deploy:prod")).await;
+        assert!(gate.counters().degraded);
+    }
+
+    #[tokio::test]
+    async fn local_file_write_is_allowed_without_model() {
+        let provider = FakeProvider::deny("不该走到这里");
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        let cwd = std::env::temp_dir();
+        let request = AutoReviewRequest {
+            tool: "Write".to_string(),
+            action_summary: format!("{}/notes.md", cwd.display()),
+            input: serde_json::json!({ "file_path": cwd.join("notes.md").to_string_lossy() }),
+            cwd: cwd.clone(),
+            user_goal: "write notes".to_string(),
+        };
+        assert_eq!(gate.review(&request).await, AutoVerdict::Allow);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn overrides_splice_defaults_in_place() {
+        let overrides = AutoRuleOverrides {
+            allow: vec!["$defaults".into(), "允许推送到 staging".into()],
+            ..Default::default()
+        };
+        let resolved = overrides.resolve();
+        assert_eq!(resolved.allow.len(), DEFAULT_ALLOW.len() + 1);
+        assert_eq!(resolved.allow.last().unwrap(), "允许推送到 staging");
+        assert_eq!(resolved.hard_deny.len(), DEFAULT_HARD_DENY.len());
+    }
+}

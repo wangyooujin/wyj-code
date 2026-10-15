@@ -7,11 +7,11 @@ use crate::app::{
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
     ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
-    ScheduleOverlay, ScheduleRow, SessionPickerState, SettingsDialog, SkillsBrowseSource,
-    SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, SubToolLine,
-    TodoExecutionEntry, TodoRuntimeStats, UiFocus, PROFILE_API_KEY_FIELD_IDX,
-    PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY,
-    SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState, SettingsDialog,
+    SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus,
+    SubAgentUiState, SubToolLine, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
+    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS,
+    SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::{InputBox, ATTACHMENT_MARKER};
 use crate::markdown::render_markdown;
@@ -529,6 +529,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
                 draw_permission_dialog(f, dlg, chunks[1]);
             }
         }
+        BottomPanel::SessionConflict => {
+            if let Some(dlg) = &state.session_conflict {
+                draw_session_conflict_panel(f, dlg, chunks[1]);
+            }
+        }
         BottomPanel::ProjectTrust => {
             if let Some(servers) = &state.pending_mcp_trust {
                 draw_project_trust_panel(f, servers, chunks[1]);
@@ -631,6 +636,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 enum BottomPanel {
     None,
     Permission,
+    SessionConflict,
     ProjectTrust,
     SkillTrust,
     ExecModeConfirm,
@@ -638,6 +644,9 @@ enum BottomPanel {
     SubAgents,
     ShellProcesses,
 }
+
+/// 会话占用裁决框的固定高度：2 行边框 + 2 行说明 + 3 行选项 + 1 行操作提示。
+const SESSION_CONFLICT_PANEL_H: u16 = 8;
 
 /// agents 面板列表区最多同时展示的行数（超出用滚动窗口，不再随数量线性增长）
 const SUB_AGENT_LIST_MAX: usize = 6;
@@ -673,6 +682,15 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
     // Claude Code Inline 模式——不再走全屏浮层，避免每次都触发全屏切换闪烁）。
     if state.permission_dialog.is_some() {
         return (11u16.min(area_height), BottomPanel::Permission);
+    }
+    // 会话占用裁决排在权限框之后：权限框只可能在一轮工具调用中途出现，而占用框
+    // 只在启动横幅那一瞬间存在，两者实际不会同框。万一真的重叠（`/resume` 撞上
+    // 中途弹出的权限框），权限优先是既有行为，不为这个特例去改它。
+    if state.session_conflict.is_some() {
+        return (
+            SESSION_CONFLICT_PANEL_H.min(area_height),
+            BottomPanel::SessionConflict,
+        );
     }
     // 项目级 MCP server 信任确认：只在启动时出现一次，优先级次于逐调用权限
     // 确认（后者可能在一轮工具调用中途弹出，必须绝对优先响应），但高于其余
@@ -3372,6 +3390,71 @@ fn draw_permission_dialog(f: &mut Frame, dlg: &PermissionDialog, area: Rect) {
 
     let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
     f.render_widget(para, inner);
+}
+
+// ─── 会话占用裁决框 ───────────────────────────────────────────────────────────
+
+/// 「恢复的会话正被另一个实例使用」裁决框。与权限框同为底部常驻面板（不居中浮层）：
+/// 它挡在聊天区输入框之上、不抢整屏，用户仍能往上翻看被恢复出来的历史。
+///
+/// 文案全部走 `tr()`——用户可见 UI 走 i18n 是仓库硬约定（历史上 plan / exec-mode
+/// 面板硬编码中文是遗留，不要照抄）。
+fn draw_session_conflict_panel(f: &mut Frame, dlg: &SessionConflictDialog, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Theme::permission_dialog())
+        .title(Span::styled(
+            wyj_i18n::tr("dialog.session_conflict_title"),
+            Theme::permission_dialog(),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let max_w = (inner.width as usize).saturating_sub(2).max(20);
+    let body = wyj_i18n::tr_fmt(
+        "dialog.session_conflict_body",
+        &[
+            ("id", &dlg.info.session_id),
+            ("pid", &dlg.info.owner_pid.to_string()),
+        ],
+    );
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(truncate_chars(&body, max_w), Theme::dim())),
+        Line::from(""),
+    ];
+    let labels = [
+        wyj_i18n::tr("dialog.session_conflict_take_over"),
+        wyj_i18n::tr("dialog.session_conflict_read_only"),
+        wyj_i18n::tr("dialog.session_conflict_abort"),
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        lines.push(choice_row(
+            index == dlg.selected,
+            &format!("[{}] {label}", index + 1),
+            max_w,
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        wyj_i18n::tr("dialog.session_conflict_hint"),
+        Theme::highlight(),
+    )));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+/// 一行可选项：`▶` 标记当前选中项（与 `plan_option_row` 同一套视觉语言）。
+fn choice_row(selected: bool, label: &str, max_w: usize) -> Line<'static> {
+    let marker = if selected { "▶ " } else { "  " };
+    let style = if selected {
+        Theme::highlight()
+    } else {
+        Theme::dim()
+    };
+    Line::from(Span::styled(
+        truncate_chars(&format!("{marker}{label}"), max_w),
+        style,
+    ))
 }
 
 /// 项目级 MCP server 信任确认面板：只在 TUI 启动后台连接阶段检测到未信任的
@@ -8570,13 +8653,13 @@ mod tool_result_fold_tests {
         // 三段常驻信息必须仍在
         assert!(
             last_line.contains(&state.model_name)
-                && last_line.contains("[default]")
+                && last_line.contains("[manual]")
                 && last_line.contains("·"),
             "状态栏应保留 模型 / 模式 / 工作目录 三段, 实际: {last_line:?}"
         );
     }
 
-    /// 三种模式在状态栏都必须显式标出，且 Bypass 必须是**红色**——
+    /// 四种模式在状态栏都必须显式标出，且 Bypass 必须是**红色**——
     /// 它等价于「本次会话跳过全部权限确认」，是唯一需要用户知情承担的模式。
     #[test]
     fn draw_status_labels_every_mode_and_paints_bypass_red() {
@@ -8584,7 +8667,8 @@ mod tool_result_fold_tests {
         use ratatui::Terminal;
 
         for (mode, expect) in [
-            (AgentMode::Manual, "[default]"),
+            (AgentMode::Auto, "[auto]"),
+            (AgentMode::Manual, "[manual]"),
             (AgentMode::Plan, "[plan]"),
             (AgentMode::Bypass, "[bypass]"),
         ] {
