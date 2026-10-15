@@ -209,8 +209,6 @@ pub fn truncate_messages(messages: &mut [Message], cfg: &PersistCapCfg) {
 fn is_persist_cap_active(cfg: &PersistCapCfg) -> bool {
     cfg.tool_result_head_bytes != 0
         || cfg.tool_result_tail_bytes != 0
-        || cfg.thinking_bytes != 0
-        || cfg.reasoning_details_bytes != 0
         || cfg.tool_use_input_bytes != 0
         || cfg.text_head_bytes != 0
         || cfg.text_tail_bytes != 0
@@ -226,34 +224,19 @@ pub fn truncate_content_block(block: &mut ApiContentBlock, cfg: &PersistCapCfg) 
                 *text = truncate_head_tail(text, cfg.text_head_bytes, cfg.text_tail_bytes);
             }
         }
-        ApiContentBlock::Thinking {
-            thinking,
-            reasoning_details,
-            ..
-        } => {
-            if cfg.thinking_bytes > 0 {
-                *thinking = truncate_head_tail(thinking, cfg.thinking_bytes, 0);
-            }
-            if cfg.reasoning_details_bytes > 0 {
-                if let Some(details) = reasoning_details.as_mut() {
-                    for item in details.iter_mut() {
-                        if let Some(obj) = item.as_object_mut() {
-                            let Some(field) = obj.get_mut("text") else {
-                                continue;
-                            };
-                            let owned =
-                                std::mem::replace(field, serde_json::Value::String(String::new()));
-                            if let serde_json::Value::String(s) = owned {
-                                if let serde_json::Value::String(target) = field {
-                                    *target =
-                                        truncate_head_tail(&s, cfg.reasoning_details_bytes, 0);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // thinking / reasoning_details **刻意不截断**。
+        //
+        // Anthropic 协议硬性要求工具调用续轮时把 thinking 块连同 `signature`
+        // 原样回传；MiniMax 的要求更具体：「当响应包含 thinking 内容块时，
+        // 后续轮次中应原样保留这些内容块，尤其是在工具调用对话中」。
+        // 截断文本却保留 signature，两端校验必然失配——`reasoning_details`
+        // 同理：改 `text` 而留下 `id` / `format` 等于造一个半损坏的块。
+        // 这类改写**不可逆**，与下面的 CAS 外部化有本质区别（后者 resume 时
+        // `materialize_block_with` 会原样还原）。
+        //
+        // 体积改由 context_edit / compact 收拾：它们的语义是「丢弃整段历史」，
+        // 不会在历史里留下一个内容与签名不匹配的块。
+        ApiContentBlock::Thinking { .. } => {}
         ApiContentBlock::ToolUse { input, .. } => {
             if cfg.tool_use_input_bytes > 0 {
                 shrink_json_to_budget(input, cfg.tool_use_input_bytes);
@@ -865,5 +848,47 @@ mod tests {
         };
         let out = serde_json::to_string(values).unwrap();
         assert!(out.len() <= 3072, "blocks serialized = {}", out.len());
+    }
+
+    #[test]
+    fn thinking_blocks_are_never_truncated_even_above_cap() {
+        // Anthropic 协议 + MiniMax 都要求 thinking 块（含 signature）
+        // 原样回传，截断会让签名失配且不可逆。persist_cap 里的
+        // thinking_bytes / reasoning_details_bytes 已废弃，这里锁住不再截断。
+        let original = "思".repeat(20_000); // 60KB，远超任何历史 cap
+        let mut block = ContentBlock::Thinking {
+            thinking: original.clone(),
+            signature: "sig-abc".to_string(),
+            reasoning_details: Some(vec![serde_json::json!({
+                "type": "reasoning.text",
+                "id": "reasoning-text-1",
+                "format": "MiniMax-response-v1",
+                "index": 0,
+                "text": original,
+            })]),
+        };
+        let cfg = PersistCapCfg {
+            thinking_bytes: 8192,
+            reasoning_details_bytes: 8192,
+            ..Default::default()
+        };
+        truncate_content_block(&mut block, &cfg);
+
+        let ContentBlock::Thinking {
+            thinking,
+            signature,
+            reasoning_details,
+        } = &block
+        else {
+            panic!("expected Thinking")
+        };
+        assert_eq!(thinking, &original, "thinking 文本被截断了");
+        assert_eq!(signature, "sig-abc", "signature 不得被动过");
+        let detail_text = &reasoning_details.as_ref().unwrap()[0]["text"];
+        assert_eq!(
+            detail_text.as_str().unwrap(),
+            original,
+            "reasoning_details[].text 被截断了"
+        );
     }
 }

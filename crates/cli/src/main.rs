@@ -1861,6 +1861,9 @@ async fn main() -> Result<()> {
         .with_system(wyj_core::prompts::main_system_prompt(&env_info))
         // 必须紧跟 with_system：它做 `{skills}` 占位替换，而 with_system 是整体替换
         .with_skills(skill_entries.clone())
+        // `<env>` 里的语言事实在 system 中段（后面还压着记忆快照 + CLAUDE.md
+        // reminder），尾部再钉一遍提高 recency。见 prompts::response_language_reminder。
+        .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window)
@@ -2183,6 +2186,9 @@ async fn main() -> Result<()> {
                 local_plugin_for_rebuild.as_ref(),
             ))
             .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
+            // 必须与上面 EnvInfo 一起重算，否则 /config 热切 language 只换 UI
+            // 文案，尾部提醒还挂着旧语言。
+            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
             .with_max_tokens(cfg.active_profile().max_tokens)
             .with_context_window(cfg.active_profile().context_window)
             .with_max_turns(cfg.agent.max_turns)

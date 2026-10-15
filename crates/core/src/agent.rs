@@ -354,6 +354,18 @@ pub struct Agent {
     /// 首轮注入首条 user 消息。不进 system prompt：git 状态每轮都可能变，
     /// 进 system 会击穿 prompt 缓存；进首轮消息则位于缓存前缀内、轮间稳定。
     git_snapshot: Option<String>,
+    /// 用户配置的回复语言（`wyj_i18n::resolve_locale` 的解析结果）。
+    ///
+    /// 只用于每轮往 system prompt **尾部**追加一句
+    /// [`prompts::response_language_reminder`]。语言事实本身已经在
+    /// `with_system(main_system_prompt(..))` 的 `<env>` 里；这里追加是**为了
+    /// 位置**——`run_turn` 会在 `<env>` 后面继续拼记忆快照、CLAUDE.md
+    /// `turn_reminder`，本仓库规约文件动辄几万 token，recency 权重落不到中段
+    /// 那句上，MiniMax M3.1 的 thinking 因此全英文（2026-10-15 实测）。
+    ///
+    /// 落在 volatile 段：不改变 stable 前缀哈希 → 不影响 prompt cache 命中。
+    /// `None` = 不追加（子 Agent、后台任务等未接线的路径行为不变）。
+    response_language: Option<String>,
     /// Extended thinking 预算（None/0 = 关闭）与交错思考开关
     thinking_budget: Option<u32>,
     interleaved_thinking: bool,
@@ -518,6 +530,7 @@ impl Agent {
             session_id: None,
             title_cb: None,
             git_snapshot: None,
+            response_language: None,
             thinking_budget: None,
             interleaved_thinking: true,
             reasoning_effort: None,
@@ -657,6 +670,18 @@ impl Agent {
 
     pub fn with_system(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
+        self
+    }
+
+    /// 设置回复语言，供每轮往 system prompt **尾部**追加语言提醒。
+    ///
+    /// 调用方传 `wyj_i18n::resolve_locale(cfg.language.as_deref())` 的解析结果，
+    /// 不传 locale code 本身（core 不读 config）。与 `tools` 侧
+    /// `SubAgentTool::with_response_language` 同名不同层：那个补的是子 Agent
+    /// 缺失的整段语言规则（子 Agent 走 `with_system` 整体替换，拿不到 `<env>`），
+    /// 这个补的是**位置**。
+    pub fn with_response_language(mut self, language: impl Into<String>) -> Self {
+        self.response_language = Some(language.into());
         self
     }
 
@@ -1545,6 +1570,16 @@ impl Agent {
                 request_system_volatile.push_str(&crate::prompts::current_tool_availability_block(
                     &attached_tool_names,
                 ));
+                // 语言提醒必须是 system prompt 的**最后一段**：它存在的全部理由
+                // 就是位置（`<env>` 里的语言事实在中段，被记忆快照 + CLAUDE.md
+                // reminder 压在后面几万 token）。谁在它后面再追加东西，就把这个
+                // 不变量打破了——`response_language_reminder_is_the_last_system
+                // section` 那条测试就是钉这里的。
+                if let Some(language) = &self.response_language {
+                    request_system_volatile.push_str("\n\n");
+                    request_system_volatile
+                        .push_str(&crate::prompts::response_language_reminder(language));
+                }
                 let request_system = wyj_api::SystemPrompt {
                     stable: &system_stable,
                     volatile: &request_system_volatile,
@@ -3527,6 +3562,97 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    /// 捕获每次请求的 system prompt 全文，回一句文本就 EndTurn。
+    struct SystemRecordingProvider {
+        seen: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for SystemRecordingProvider {
+        async fn stream(
+            &self,
+            system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(system.combined().to_string());
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn capture_system(
+        agent: &mut Agent,
+        seen: &std::sync::Arc<Mutex<Vec<String>>>,
+    ) -> String {
+        let mut session = Session::new();
+        agent
+            .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+            .await
+            .unwrap();
+        let captured = seen.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "本用例只应发一次请求，实际 {}",
+            captured.len()
+        );
+        captured.into_iter().next().unwrap()
+    }
+
+    /// 语言提醒的价值**全在位置**：它存在的理由是 `<env>` 里的语言事实在
+    /// system 中段（后面还压着记忆快照 + CLAUDE.md reminder，动辄几万 token），
+    /// recency 权重落不到那句上，于是 MiniMax M3.1 的 thinking 全英文。
+    /// 谁在它后面再追加东西，这个修复就静默失效——所以钉死「必须是最后一段」。
+    #[tokio::test]
+    async fn response_language_reminder_is_the_last_system_section() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(Arc::new(SystemRecordingProvider { seen: seen.clone() }))
+            .with_system("MAIN-STUB")
+            .with_response_language("zh");
+        let combined = capture_system(&mut agent, &seen).await;
+
+        assert!(combined.starts_with("MAIN-STUB"));
+        let reminder = crate::prompts::response_language_reminder("zh");
+        assert!(
+            combined.trim_end().ends_with(reminder.trim_end()),
+            "语言提醒必须是 system prompt 的最后一段，实际最后一段：{:?}",
+            combined.trim_end().rsplit('\n').next().unwrap_or_default()
+        );
+        let reminder_at = combined
+            .find("# Response language")
+            .expect("未发出语言提醒");
+        let tool_block_at = combined
+            .find("<current-tool-availability>")
+            .expect("未发出工具可用性块");
+        assert!(
+            reminder_at > tool_block_at,
+            "提醒必须排在 volatile 段的工具可用性块之后，否则 recency 修复被自己顶掉"
+        );
+    }
+
+    /// 未接线（`None`）时不得凭空多出一段：子 Agent、后台任务等路径没设语言，
+    /// 那里追加一句只会变成与 CoT 无关的噪声。
+    #[tokio::test]
+    async fn no_response_language_means_no_reminder() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::new(Arc::new(SystemRecordingProvider { seen: seen.clone() }))
+            .with_system("MAIN-STUB");
+        let combined = capture_system(&mut agent, &seen).await;
+        assert!(
+            !combined.contains("# Response language"),
+            "未设置语言时不应追加提醒"
+        );
     }
 
     /// 幂等性不变量：**框架层的任何重试都不得重复执行工具**。

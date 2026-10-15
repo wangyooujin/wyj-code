@@ -75,45 +75,53 @@ impl RequestPlan {
         // （OpenAI-vendor 的 effort 与 Anthropic 协议的 budget 是两种 reasoning）
         let budget = profile.thinking_budget.filter(|budget| *budget > 0);
         let effort = profile.effective_reasoning_effort();
-        let reasoning = match (budget, effort.as_deref()) {
-            (Some(budget), _) if spec.budget_tokens_supported && !blocked => {
-                ReasoningRequest::BudgetTokens(budget)
-            }
-            (Some(_), _) => {
-                dropped_parameters.push(DroppedParameter {
-                    name: "thinking_budget".to_string(),
-                    reason: "model capability does not support token-budget reasoning".to_string(),
-                });
-                ReasoningRequest::Disabled
-            }
-            // `ThinkingMode` 是单值标签，记不下 Qwen 这种 budget 与 effort 都认的
-            // vendor；这里直接问 spec 的 `effort_levels`，顺带把"档位写错"
-            // （如给 DeepSeek 填 xhigh）也变成可见的 dropped 而不是 400。
-            (None, Some(_)) if blocked || spec.effort_levels.is_empty() => {
-                dropped_parameters.push(DroppedParameter {
-                    name: "reasoning_effort".to_string(),
-                    reason: "model capability does not support effort-based reasoning".to_string(),
-                });
-                ReasoningRequest::Disabled
-            }
-            (None, Some(raw)) => match normalize_effort(&model, raw) {
-                Some(level) => ReasoningRequest::Effort(level.to_string()),
-                None => {
+        let effort_usable = !blocked && !spec.effort_levels.is_empty();
+        // budget 不被支持时**不能顺手把 effort 一起废掉**：旧 config 里两个都配很常见
+        // （DeepSeek、MiniMax `/anthropic` 都是「不支持 budget、认 effort」的组合）。
+        // 早先的 match 臂会在 budget 上短路成 `Disabled`，effort 连同被丢——用户只看到
+        // 一条 thinking_budget 的 dropped，reasoning 实际已整条关闭。
+        let reasoning = match budget.filter(|_| spec.budget_tokens_supported && !blocked) {
+            Some(budget) => ReasoningRequest::BudgetTokens(budget),
+            None => {
+                if budget.is_some() {
                     dropped_parameters.push(DroppedParameter {
-                        name: "reasoning_effort".to_string(),
-                        reason: format!(
-                            "`{raw}` is not a supported level for this model (expected one of: {})",
-                            spec.effort_levels
-                                .iter()
-                                .map(|level| level.as_str())
-                                .collect::<Vec<_>>()
-                                .join("/")
-                        ),
+                        name: "thinking_budget".to_string(),
+                        reason: "model capability does not support token-budget reasoning"
+                            .to_string(),
                     });
-                    ReasoningRequest::Disabled
                 }
-            },
-            (None, None) => ReasoningRequest::Disabled,
+                // `ThinkingMode` 是单值标签，记不下 Qwen 那种 budget 与 effort 都认的
+                // vendor；这里直接问 spec 的 `effort_levels`，顺带把"档位写错"
+                // （如给 DeepSeek 填 xhigh）也变成可见的 dropped 而不是 400。
+                match (effort.as_deref(), effort_usable) {
+                    (None, _) => ReasoningRequest::Disabled,
+                    (Some(_), false) => {
+                        dropped_parameters.push(DroppedParameter {
+                            name: "reasoning_effort".to_string(),
+                            reason: "model capability does not support effort-based reasoning"
+                                .to_string(),
+                        });
+                        ReasoningRequest::Disabled
+                    }
+                    (Some(raw), true) => match normalize_effort(&model, raw) {
+                        Some(level) => ReasoningRequest::Effort(level.to_string()),
+                        None => {
+                            dropped_parameters.push(DroppedParameter {
+                                name: "reasoning_effort".to_string(),
+                                reason: format!(
+                                    "`{raw}` is not a supported level for this model (expected one of: {})",
+                                    spec.effort_levels
+                                        .iter()
+                                        .map(|level| level.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("/")
+                                ),
+                            });
+                            ReasoningRequest::Disabled
+                        }
+                    },
+                }
+            }
         };
         let cache_policy = match capabilities.prompt_cache.value {
             PromptCacheMode::Unsupported => CachePolicy::Disabled,

@@ -161,6 +161,7 @@ impl ThinkingSpec {
         ) {
             // ── Anthropic 协议 ──
             (WireProtocol::AnthropicMessages, "anthropic", _) => Self::anthropic_native(),
+            (WireProtocol::AnthropicMessages, "minimax", m) => Self::minimax_anthropic(m),
             (WireProtocol::AnthropicMessages, _, _) => Self::anthropic_compatible(),
 
             // ── OpenAI 协议 + 各国产 vendor ──
@@ -335,6 +336,59 @@ impl ThinkingSpec {
         }
     }
 
+    /// MiniMax 的 **`/anthropic` 线协议**（与 [`Self::minimax`] 的 OpenAI 线是两套
+    /// 不同的端点形态，档位集合也不一致，不要互相复用）。
+    ///
+    /// `/anthropic` 端点只认 `thinking.type ∈ {省略, adaptive, disabled}`，思考深度
+    /// 走 `output_config.effort`。因此四条与 `anthropic_compatible()` 相反：
+    /// - `budget_tokens_supported: false`——`budget_tokens` 在这条线上没有语义，
+    ///   不设 false 的话 `request_plan` 会把它当成合法 reasoning 参数放行，
+    ///   adapter 端再丢一次，两层各记一次「被忽略」，更糟的是会把同一 profile 里的
+    ///   `reasoning_effort` 一起连坐丢掉（见 `request_plan` 的 budget 兜底臂）。
+    /// - `control: SwitchOnly`——catalog 据此把 `ThinkingMode` 标成 `Effort`，
+    ///   `agent.rs` 才不会用 `ThinkingMode::BudgetTokens` 的判据把 thinking_budget 留下。
+    /// - `user_can_disable` 只有 M3 为真（M3.1 发 `disabled` 直接 400、M2.x 发了
+    ///   不生效），与 adapter 的降级策略同源。
+    /// - `effort_levels` 仅 M3.1 有，且是端点文档的五档全量（含 OpenAI 线那边
+    ///   刻意避开的 `medium` / `xhigh`）。
+    fn minimax_anthropic(model: &str) -> Self {
+        if is_minimax_m31_flash(model) {
+            Self {
+                control: ThinkingControl::SwitchOnly,
+                user_can_disable: false,
+                lock_sampling_params: false,
+                budget_tokens_supported: false,
+                effort_levels: MINIMAX_M31_ANTHROPIC_EFFORT_LEVELS,
+                // Anthropic 线协议下 `response_fields` 当前无消费者
+                // （只有 `openai.rs::to_api_messages` 读它），仍按端点真实行为填写，
+                // 以免将来接线时又出现「catalog 说一套、adapter 做另一套」。
+                response_fields: ThinkingResponseFields {
+                    reasoning_content: true,
+                    reasoning_details: true,
+                    echo_back_in_messages: true,
+                },
+                ignore_disabled_when_forced: true,
+            }
+        } else {
+            let is_m2 = model.contains("m2") && !model.contains("m3");
+            Self {
+                control: ThinkingControl::SwitchOnly,
+                user_can_disable: !is_m2,
+                lock_sampling_params: false,
+                budget_tokens_supported: false,
+                // M3 / M2.x 的 `/anthropic` 端点不认 output_config.effort，档位集合
+                // 留空 = request_plan 把 profile 的 reasoning_effort 记成可见 dropped。
+                effort_levels: &[],
+                response_fields: ThinkingResponseFields {
+                    reasoning_content: true,
+                    reasoning_details: true,
+                    echo_back_in_messages: true,
+                },
+                ignore_disabled_when_forced: is_m2,
+            }
+        }
+    }
+
     fn minimax(model: &str) -> Self {
         // M2.x 强制思考（`thinking.type=adaptive`，忽略 user disabled）；
         // M3 起允许显式关闭、并支持 effort 档位（low / high / max，
@@ -479,15 +533,65 @@ pub fn normalize_effort(identity: &ModelIdentity, raw: &str) -> Option<&'static 
 
 // ── ThinkingAdapter trait + dispatch ─────────────────────────────────────────
 
+// ── Anthropic 线协议下的 thinking 字段 ─────────────────────────────────────
+
+/// Anthropic 线协议（`/v1/messages`）下 thinking 相关字段的最终形态。
+///
+/// 与 OpenAI 路径不同，这里不直接 mutate 一个 `Map`：provider 侧的请求体是
+/// `#[derive(Serialize)]` 的具名结构体（`ApiRequest`），字段是否出现由
+/// `Option` 决定，因此让 adapter 产出一个补丁而不是副作用。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AnthropicThinkingPatch {
+    /// 请求体的 `thinking` 字段。官方 Anthropic 是
+    /// `{"type":"enabled","budget_tokens":N}`；MiniMax 兼容端点是
+    /// `{"type":"adaptive"}` / `{"type":"disabled"}`（**没有** budget 字段）。
+    pub thinking: Option<Value>,
+    /// `thinking.budget_tokens` 的**结构化**取值，供 provider 抬高 `max_tokens`
+    /// （Anthropic 硬性要求 `budget_tokens < max_tokens`）。
+    ///
+    /// 之所以不从 `thinking` 这个 `Value` 里反解键名：`budget_tokens` 与 `max_tokens`
+    /// 的联动是协议硬约束，却要经过一次字符串往返才能拿到——adapter 改个键名，
+    /// 兜底会**静默失效**且没有任何告警，而后果是端点直接 400。显式字段让这件事
+    /// 在类型上就可见。MiniMax 恒为 `None`（端点没有 budget 概念）。
+    pub budget: Option<u32>,
+    /// 请求体的 `output_config` 字段（MiniMax M3.1-Flash-Preview 的思考深度档位）。
+    pub output_config: Option<Value>,
+    /// 用户显式配置了但被端点硬约束否决、已静默忽略的字段名。
+    /// 非空时 provider 应打一条 warn——静默丢弃会让用户以为配置生效了。
+    pub ignored: Vec<&'static str>,
+}
+
 /// 各 vendor 的 thinking 应用策略。`&'static` 实例，dispatch 时零分配。
 pub trait ThinkingAdapter: Send + Sync {
     /// 把 thinking 参数应用到 OpenAI 协议的请求 body。
     /// 仅在 control != Disabled 时调用；否则 body 不变。
     fn apply_openai(&self, body: &mut Map<String, Value>, opts: &RequestOptions);
 
+    /// 计算 Anthropic 线协议（`/v1/messages`）下要发的 thinking 字段。
+    /// 默认不主动发任何东西，由 provider 自行处理。
+    ///
+    /// `identity` 透传是为了让 adapter 能调 [`normalize_effort`]——档位判据只有
+    /// `ThinkingSpec::effort_levels` 一处，adapter 私藏第二份白名单必然漂移。
+    fn apply_anthropic(
+        &self,
+        identity: &ModelIdentity,
+        opts: &RequestOptions,
+    ) -> AnthropicThinkingPatch {
+        let _ = (identity, opts);
+        AnthropicThinkingPatch::default()
+    }
+
     /// 是否在 Anthropic 兼容端点发 `interleaved-thinking` beta header。
     /// 官方 Anthropic 端点 → true；第三方兼容 → false。
     fn emit_interleaved_beta(&self, is_official_anthropic: bool) -> bool;
+}
+
+/// provider 侧统一入口：算出 Anthropic 线协议下要发的 thinking 字段。
+pub fn apply_anthropic_thinking(
+    identity: &ModelIdentity,
+    opts: &RequestOptions,
+) -> AnthropicThinkingPatch {
+    adapter_for(identity).apply_anthropic(identity, opts)
 }
 
 /// Dispatch：`match (wire, vendor)` 静态分派到具体 adapter。
@@ -496,6 +600,22 @@ pub fn adapter_for(identity: &ModelIdentity) -> &'static dyn ThinkingAdapter {
     let vendor = normalize_vendor(&identity.vendor);
     match (wire, vendor) {
         (WireProtocol::AnthropicMessages, "anthropic") => &AnthropicNativeAdapter,
+        (WireProtocol::AnthropicMessages, "minimax") => {
+            // MiniMax 的 `/anthropic` 端点不吃 Anthropic 原生的
+            // `{type:"enabled", budget_tokens:N}` 形态：思考深度由
+            // `output_config.effort` 档位控制，且不同代际对 `disabled` 的
+            // 容忍度不同（见 `AnthropicMinimaxAdapter`）。
+            if is_minimax_m31_flash(&identity.model) {
+                static M31_ADAPTER: AnthropicMinimaxAdapter = AnthropicMinimaxAdapter::M31Flash;
+                &M31_ADAPTER
+            } else if identity.model.to_ascii_lowercase().contains("m3") {
+                static M3_ADAPTER: AnthropicMinimaxAdapter = AnthropicMinimaxAdapter::M3;
+                &M3_ADAPTER
+            } else {
+                static M2_ADAPTER: AnthropicMinimaxAdapter = AnthropicMinimaxAdapter::M2;
+                &M2_ADAPTER
+            }
+        }
         (WireProtocol::AnthropicMessages, _) => &AnthropicCompatibleAdapter,
         (WireProtocol::OpenAiChatCompletions, "deepseek") => &DeepSeekOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, "alibaba") => &QwenOpenAiAdapter,
@@ -531,6 +651,32 @@ impl ThinkingAdapter for AnthropicNativeAdapter {
         // Anthropic 协议不走 OpenAI body；anthropic.rs 自行处理。
     }
 
+    fn apply_anthropic(
+        &self,
+        _identity: &ModelIdentity,
+        opts: &RequestOptions,
+    ) -> AnthropicThinkingPatch {
+        // 官方 Anthropic：只有 `enabled` + `budget_tokens` 这一种形态，且思考
+        // 预算必须显式给出（省略 thinking 字段 = 关闭思考）。
+        let budget = opts.thinking_budget.filter(|b| *b > 0);
+        let mut patch = AnthropicThinkingPatch {
+            thinking: budget.map(|b| json!({"type": "enabled", "budget_tokens": b})),
+            budget,
+            output_config: None,
+            ignored: Vec::new(),
+        };
+        // 这条线协议的开关**只有 budget 一个旋钮**，profile 的 thinking_switch
+        // 无处落地。两种静默覆盖都要记进 ignored：配了 `disabled` 却仍发出
+        // `enabled`（thinking 照开）、配了 `enabled` 却没有 budget（thinking
+        // 其实没开）——用户看日志才知道自己配的东西被谁覆盖了。
+        // 注意 `text_only()` 的 `disabled` + budget=None 组合是**被兑现的**，
+        // 不该告警（否则 compact/memory 等每次辅助调用都吵一遍）。
+        if explicit_switch(opts).is_some() && switch_says_off(opts) != budget.is_none() {
+            patch.ignored.push("thinking_switch");
+        }
+        patch
+    }
+
     fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
         true
     }
@@ -544,10 +690,146 @@ impl ThinkingAdapter for AnthropicCompatibleAdapter {
         // 同上，anthropic.rs 处理。
     }
 
+    fn apply_anthropic(
+        &self,
+        _identity: &ModelIdentity,
+        opts: &RequestOptions,
+    ) -> AnthropicThinkingPatch {
+        // 第三方 Anthropic 兼容端点但 vendor 不是 MiniMax：沿用 Anthropic 原生
+        // 形态。GLM / Moonshot 的 `/anthropic` 路径确实认 `enabled` +
+        // `budget_tokens`；未知的兼容端点按最保守的可接受形态发。
+        // 开关判据与 `AnthropicNativeAdapter` 完全一致（那边就是本 adapter 的原型）。
+        let budget = opts.thinking_budget.filter(|b| *b > 0);
+        let mut patch = AnthropicThinkingPatch {
+            thinking: budget.map(|b| json!({"type": "enabled", "budget_tokens": b})),
+            budget,
+            output_config: None,
+            ignored: Vec::new(),
+        };
+        if explicit_switch(opts).is_some() && switch_says_off(opts) != budget.is_none() {
+            patch.ignored.push("thinking_switch");
+        }
+        patch
+    }
+
     fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
         // 第三方兼容端点不认 interleaved-thinking beta 时会 400。
         // 调用方传入 is_official_anthropic_endpoint() 结果，但即便官方 Anthropic
         // 路径的兼容模式也按"无 beta"对待。
+        false
+    }
+}
+
+/// MiniMax `/anthropic` 端点（**仅 M3.1**）支持的 effort 档位全量。
+///
+/// 同时供 [`ThinkingSpec::minimax_anthropic`] 的 `effort_levels` 与
+/// `AnthropicMinimaxAdapter` 使用——两处共用同一份常量，避免「catalog 说支持、
+/// adapter 悄悄丢掉」这种自相矛盾（`normalize_effort` 与 adapter 都只认它）。
+/// 注意与 OpenAI 线的 `Self::minimax()` 档位集合**不同**：那边刻意避开了
+/// `medium` / `xhigh`，`/anthropic` 端点文档则两者都收。
+pub(crate) const MINIMAX_M31_ANTHROPIC_EFFORT_LEVELS: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
+];
+
+/// `MiniMax-M3.1-Flash-Preview` 的模型名识别。
+///
+/// 该模型的 thinking 由 `output_config.effort` 档位控制、且 `thinking.type=disabled`
+/// 会被端点拒绝（400），与 M3 / M2.x 的默认行为都不同，必须单独分派。
+///
+/// **判据刻意只认版本段**：`contains("flash")` 这类营销词不能当版本证据——
+/// 它会把将来的 `M2.x-Flash` / `M3.5-Flash` 全部误路由到 M3.1，进而给这些
+/// 端点发它们不认的 `output_config.effort`。分派错误在这里是 400 级事故
+/// （把 M3.5 当 M2 会白发 `disabled`），不是退化的性能问题。
+fn is_minimax_m31_flash(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // `MiniMax-M3.1-Flash-Preview` / `minimax-m3-1` 都见过。**不认 `flash`**：
+    // 它是营销词而非版本证据，将来 `M2.x-Flash` 会被误路由。
+    m.contains("m3.1") || m.contains("m3-1") || m.contains("m31")
+}
+
+/// MiniMax `/anthropic` 端点的 thinking 参数形态，按模型代际分派。
+///
+/// 端点只承认三种 `thinking.type` 取值：**省略** / `adaptive` / `disabled`——
+/// `enabled` 与 `budget_tokens` 都不在文档支持范围内。各代际的语义：
+///
+/// | 模型 | 省略 | `adaptive` | `disabled` |
+/// |---|---|---|---|
+/// | M3.1-Flash-Preview | 开 | 开 | **400** |
+/// | M3 | 关 | 开 | 保持关 |
+/// | M2.x | 开 | 开 | 接收但不生效 |
+///
+/// 思考深度由 `output_config.effort`（`low/medium/high/xhigh/max`）控制，且**只有
+/// M3.1-Flash-Preview 支持**；省略时端点默认 `max`。
+///
+/// 因此本 adapter 的三条硬规则：
+/// 1. 绝不发送 `enabled` 或 `budget_tokens`——`thinking_budget` 在这条线协议上
+///    没有对应语义，只能落进 `ignored` 提示用户。**而且它连「用户想开思考」
+///    这个信号都不算**：若拿它去翻开关，就会出现「一边记为被忽略、一边按它
+///    改变行为」的自相矛盾，且对 M3 是把思考从默认关翻成开这种用户没要求的
+///    行为翻转。开/关只认 `opts.thinking_switch`（显式意图）。
+/// 2. `disabled` 只在 M3 上真的生效；M3.1 发它会 400，M2.x 发了也无效，
+///    两者的 `disabled` 请求都降级成「不发 thinking 字段」并记入 `ignored`。
+/// 3. `effort` 只在 M3.1 上上送；档位判据统一走 [`normalize_effort`]（即
+///    `ThinkingSpec::minimax_anthropic` 的 `effort_levels`），不在本 adapter
+///    里维护第二份白名单。
+enum AnthropicMinimaxAdapter {
+    M31Flash,
+    M3,
+    M2,
+}
+
+impl ThinkingAdapter for AnthropicMinimaxAdapter {
+    fn apply_openai(&self, _body: &mut Map<String, Value>, _opts: &RequestOptions) {
+        // Anthropic 线协议不走 OpenAI body。
+    }
+
+    fn apply_anthropic(
+        &self,
+        identity: &ModelIdentity,
+        opts: &RequestOptions,
+    ) -> AnthropicThinkingPatch {
+        let mut patch = AnthropicThinkingPatch::default();
+
+        // thinking.type：**只认显式 switch**。不表达意图时字段整个不发——省略
+        // 本身就有明确语义（M3.1/M2.x=开、M3=关），比猜一个 `adaptive` 更贴近
+        // 端点默认，也省得撞上任何代际对 disabled 的拒绝。
+        let switch = explicit_switch(opts);
+        patch.thinking = match switch.as_deref() {
+            None => None,
+            Some(s) if switch_is_off(s) => match self {
+                // M3 是唯一「关得掉」的代际。
+                Self::M3 => Some(json!({"type": "disabled"})),
+                // M3.1 发 disabled 会 400、M2.x 发了也不生效 → 降级成「不发」。
+                _ => None,
+            },
+            Some(_) => Some(json!({"type": "adaptive"})),
+        };
+        if switch_says_off(opts) && !matches!(self, Self::M3) {
+            patch.ignored.push("thinking_switch=disabled");
+        }
+
+        // thinking_budget：MiniMax 不用 token 预算控制思考深度，且不得作为
+        // 开关信号（见上方规则 1）。
+        if opts.thinking_budget.is_some() {
+            patch.ignored.push("thinking_budget");
+        }
+
+        // output_config.effort：档位判据与 catalog 层共用 `effort_levels`。
+        if let Some(raw) = opts.reasoning_effort.as_deref() {
+            match normalize_effort(identity, raw) {
+                Some(level) => patch.output_config = Some(json!({ "effort": level })),
+                None => patch.ignored.push("reasoning_effort"),
+            }
+        }
+
+        patch
+    }
+
+    fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
         false
     }
 }
@@ -791,6 +1073,28 @@ impl ThinkingAdapter for GenericOpenAiAdapter {
 
 // ── 自由函数：provider 调用入口 ──────────────────────────────────────────────
 
+/// **只读 profile 显式指定的 switch**，不做「配了 budget/effort ⇒ 想开」的推断。
+///
+/// 与 [`effective_switch_type`] 的区别就是后者多出的那层推断。分派时必须先问
+/// 「用户说了什么」再问「默认怎么开」——混在一起会导致「记为被忽略的参数」反过来
+/// 又被当成开启信号（`thinking_budget` 在 MiniMax `/anthropic` 上就踩过这个坑）。
+fn explicit_switch(opts: &RequestOptions) -> Option<String> {
+    opts.thinking_switch
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+}
+
+/// `switch` 字符串里的「关闭」取值。各 vendor 对关的表达不统一
+/// （GLM/Qwen 用 `disabled`，部分 profile 直接写 `false`），判据必须同源。
+fn switch_is_off(switch: &str) -> bool {
+    matches!(switch, "disabled" | "false")
+}
+
+/// `explicit_switch` 的谓词版本：「显式要求关闭」。
+fn switch_says_off(opts: &RequestOptions) -> bool {
+    explicit_switch(opts).is_some_and(|s| switch_is_off(&s))
+}
+
 /// 推导 effective `thinking.type` 字符串。
 ///
 /// 返回 `None` 表示"用户没显式指定，vendor 自己决定"（GLM adaptive 等场景）。
@@ -801,8 +1105,8 @@ impl ThinkingAdapter for GenericOpenAiAdapter {
 /// 2. 用户开了 budget/effort → Some(default)
 /// 3. 否则 → None（不写 thinking 字段）
 fn effective_switch_type(opts: &RequestOptions, default: &str) -> Option<String> {
-    if let Some(explicit) = opts.thinking_switch.as_deref() {
-        return Some(explicit.trim().to_ascii_lowercase());
+    if let Some(explicit) = explicit_switch(opts) {
+        return Some(explicit);
     }
     if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
         Some(default.to_string())
@@ -815,11 +1119,8 @@ fn effective_switch_type(opts: &RequestOptions, default: &str) -> Option<String>
 /// Ollama `think` / vLLM `chat_template_kwargs.enable_thinking`。
 /// 返回 `None` 表示"用户没说"，此时不写任何字段。
 fn effective_switch_enabled(opts: &RequestOptions) -> Option<bool> {
-    if let Some(explicit) = opts.thinking_switch.as_deref() {
-        return Some(!matches!(
-            explicit.trim().to_ascii_lowercase().as_str(),
-            "disabled" | "false"
-        ));
+    if let Some(explicit) = explicit_switch(opts) {
+        return Some(!switch_is_off(&explicit));
     }
     if opts.thinking_budget.is_some() || opts.reasoning_effort.is_some() {
         return Some(true);
@@ -1521,5 +1822,302 @@ mod tests {
         };
         apply_thinking_to_openai_body(&id, &mut body, &opts);
         assert!(body.is_empty());
+    }
+
+    // ── MiniMax `/anthropic` 端点的 thinking 形态 ──
+    //
+    // 端点只认省略 / `adaptive` / `disabled`，思考深度走 `output_config.effort`。
+    // 这些测试锁住「绝不发 enabled / budget_tokens」这条硬约束。
+
+    fn minimax_anthropic(model: &str) -> ModelIdentity {
+        identity("minimax", WireProtocol::AnthropicMessages, model)
+    }
+
+    #[test]
+    fn minimax_m31_maps_effort_to_output_config_not_budget_tokens() {
+        let id = minimax_anthropic("MiniMax-M3.1-Flash-Preview");
+        let opts = RequestOptions {
+            max_tokens: 32000,
+            thinking_budget: Some(8192),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let patch = apply_anthropic_thinking(&id, &opts);
+
+        assert_eq!(
+            patch.output_config,
+            Some(json!({"effort": "high"})),
+            "思考深度必须走 output_config.effort，否则 reasoning_effort 是死配置"
+        );
+        // 端点不认 `budget_tokens`，也不能出现 `enabled`。
+        assert_eq!(
+            patch.thinking, None,
+            "budget 在这条线上没有语义，不能拿它当『想开思考』的信号去翻开关"
+        );
+        assert!(patch.budget.is_none(), "MiniMax 侧不存在 budget 预算");
+        assert!(patch.ignored.contains(&"thinking_budget"));
+    }
+
+    #[test]
+    fn minimax_budget_alone_never_flips_the_switch() {
+        // 「记为被忽略的参数」不得反过来改变行为：M3 默认关思考，
+        // 只配 thinking_budget 时若被翻成 adaptive 就是用户没要求的行为翻转。
+        for model in ["MiniMax-M3", "MiniMax-M3.1-Flash-Preview", "MiniMax-M2.7"] {
+            let patch = apply_anthropic_thinking(
+                &minimax_anthropic(model),
+                &RequestOptions {
+                    thinking_budget: Some(8192),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(patch.thinking, None, "{model}: budget 不该翻开关");
+            assert!(patch.ignored.contains(&"thinking_budget"), "{model}");
+        }
+    }
+
+    #[test]
+    fn minimax_explicit_switch_on_maps_to_adaptive() {
+        // 显式要开 → adaptive（`enabled` 是 Anthropic 原生取值，端点不认）。
+        for model in ["MiniMax-M3", "MiniMax-M3.1-Flash-Preview", "MiniMax-M2.7"] {
+            let patch = apply_anthropic_thinking(
+                &minimax_anthropic(model),
+                &RequestOptions {
+                    thinking_switch: Some("Enabled".to_string()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                patch.thinking,
+                Some(json!({"type": "adaptive"})),
+                "{model}: 显式开关必须生效，且大小写/空白归一"
+            );
+            assert!(patch.ignored.is_empty(), "{model}: {:?}", patch.ignored);
+        }
+    }
+
+    #[test]
+    fn minimax_m31_refuses_disabled_instead_of_sending_a_400() {
+        let id = minimax_anthropic("MiniMax-M3.1-Flash-Preview");
+        let opts = RequestOptions {
+            max_tokens: 32000,
+            thinking_switch: Some("disabled".to_string()),
+            ..Default::default()
+        };
+        let patch = apply_anthropic_thinking(&id, &opts);
+
+        assert_eq!(
+            patch.thinking, None,
+            "M3.1 收 disabled 会 400；省略字段（默认开）才是等价且安全的表达"
+        );
+        assert!(
+            patch.ignored.contains(&"thinking_switch=disabled"),
+            "静默忽略用户配置会让人以为关掉了思考：{:?}",
+            patch.ignored
+        );
+    }
+
+    #[test]
+    fn minimax_m3_honours_disabled_and_defaults_to_off() {
+        let id = minimax_anthropic("MiniMax-M3");
+
+        // M3 默认关闭 thinking：什么都没配就不该发任何字段。
+        assert_eq!(
+            apply_anthropic_thinking(&id, &RequestOptions::default()).thinking,
+            None
+        );
+
+        // 显式关掉是真能关的（与 M3.1 相反）。
+        let off = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_switch: Some("disabled".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(off.thinking, Some(json!({"type": "disabled"})));
+        assert!(off.ignored.is_empty());
+    }
+
+    #[test]
+    fn minimax_m2_forces_thinking_on_and_drops_effort() {
+        let id = minimax_anthropic("MiniMax-M2.7");
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                reasoning_effort: Some("high".to_string()),
+                thinking_switch: Some("disabled".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.thinking, None,
+            "M2.x 省略即开启，disabled 发了也不生效"
+        );
+        assert!(patch.output_config.is_none());
+        assert!(patch.ignored.contains(&"reasoning_effort"));
+    }
+
+    #[test]
+    fn minimax_m31_drops_unsupported_effort_levels() {
+        let id = minimax_anthropic("MiniMax-M3.1-Flash-Preview");
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                reasoning_effort: Some("minimal".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.output_config, None,
+            "端点只认 low/medium/high/xhigh/max，minimal 发出去会 400"
+        );
+        assert!(patch.ignored.contains(&"reasoning_effort"));
+    }
+
+    #[test]
+    fn official_anthropic_keeps_the_native_budget_shape() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_budget: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.thinking,
+            Some(json!({"type": "enabled", "budget_tokens": 4096})),
+            "官方端点的原生形态不能被 MiniMax 适配带偏"
+        );
+        assert_eq!(
+            patch.budget,
+            Some(4096),
+            "max_tokens 兜底靠这个结构化字段，不许再从 Value 里反解键名"
+        );
+        assert!(patch.output_config.is_none());
+    }
+
+    #[test]
+    fn anthropic_native_reports_switch_that_budget_overrode() {
+        // budget 是这条线唯一的开关旋钮：用户要关、却因为有 budget 仍在发
+        // `enabled`（thinking 照开）——必须可见，否则用户以为关掉了。
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let off = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_switch: Some("disabled".to_string()),
+                thinking_budget: Some(4096),
+                ..Default::default()
+            },
+        );
+        assert_eq!(off.thinking.unwrap()["type"], "enabled");
+        assert!(
+            off.ignored.contains(&"thinking_switch"),
+            "{:?}",
+            off.ignored
+        );
+
+        // 反向：要开却没给 budget → 压根没发 thinking 字段，thinking 其实没开。
+        let on = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_switch: Some("enabled".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(on.thinking.is_none());
+        assert!(on.ignored.contains(&"thinking_switch"), "{:?}", on.ignored);
+    }
+
+    #[test]
+    fn text_only_switch_is_honoured_on_official_anthropic_without_warning() {
+        // compact / memory / summary / 分类器全走 text_only()：它的
+        // `disabled` + 无 budget 正好是「被兑现」的组合，绝不能记成 ignored，
+        // 否则每次辅助调用都刷一条 warn。
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let patch = apply_anthropic_thinking(&id, &RequestOptions::text_only(256));
+        assert!(patch.thinking.is_none());
+        assert!(
+            patch.ignored.is_empty(),
+            "text_only 不该产生告警：{:?}",
+            patch.ignored
+        );
+    }
+
+    /// **端到端**：profile → catalog → RequestOptions → 请求体补丁。
+    ///
+    /// 前面所有 adapter 单测都手工构造 `RequestOptions`，恰好绕开了真正会杀人的
+    /// 那一层：`request_plan` 依据 `ThinkingSpec::effort_levels` 决定 reasoning_effort
+    /// 是否放行。spec 一旦漏了 MiniMax + AnthropicMessages 分臂，adapter 写得再对
+    /// 也是死代码（曾经就这么坏过：profile 里配的 effort 被 catalog 静默丢弃，
+    /// 而单测全绿）。因此这条断言必须从 profile 出发。
+    #[test]
+    fn minimax_effort_survives_the_catalog_layer() {
+        let profile = minimax_profile_with_effort("high");
+        let plan = crate::request_plan::RequestPlan::from_profile(&profile, None);
+        assert!(
+            !plan
+                .dropped_parameters
+                .iter()
+                .any(|d| d.name == "reasoning_effort"),
+            "effort 被 catalog 层丢掉了：{:?}",
+            plan.dropped_parameters
+        );
+
+        let opts = RequestOptions::from_request_plan(&plan);
+        let identity = identity("minimax", WireProtocol::AnthropicMessages, &profile.model);
+        let patch = apply_anthropic_thinking(&identity, &opts);
+        assert_eq!(
+            patch.output_config,
+            Some(json!({"effort": "high"})),
+            "catalog 放行了 effort，adapter 却没上送——两层判据又漂移了"
+        );
+    }
+
+    #[test]
+    fn minimax_anthropic_spec_refuses_budget_but_keeps_effort() {
+        // 旧 config 里常见的「两个都配」：budget 不支持不该把 effort 连坐丢掉。
+        let mut profile = minimax_profile_with_effort("high");
+        profile.thinking_budget = Some(8192);
+        let plan = crate::request_plan::RequestPlan::from_profile(&profile, None);
+        let names: Vec<_> = plan
+            .dropped_parameters
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["thinking_budget"],
+            "只应丢 budget，effort 必须留：{names:?}"
+        );
+        assert_eq!(
+            plan.reasoning,
+            crate::request_plan::ReasoningRequest::Effort("high".to_string()),
+            "budget 不可用时 effort 仍应生效，不能整体退化成 Disabled"
+        );
+    }
+
+    fn minimax_profile_with_effort(effort: &str) -> wyj_config::Profile {
+        wyj_config::Profile {
+            name: "minimax".to_string(),
+            provider: wyj_config::Provider::Anthropic,
+            base_url: "https://api.minimaxi.com/anthropic".to_string(),
+            model: "MiniMax-M3.1-Flash-Preview".to_string(),
+            vendor: Some("minimax".to_string()),
+            reasoning_effort: Some(effort.to_string()),
+            ..Default::default()
+        }
     }
 }

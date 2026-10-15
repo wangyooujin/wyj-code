@@ -72,7 +72,13 @@ pub struct RequestOptions {
     /// 由 profile.thinking_switch 直接透传，agent 层负责拼装；adapter 内部决定
     /// 是否真的写到 body
     pub thinking_switch: Option<String>,
-    /// 工具调用轮之间允许交错思考（仅 Anthropic 协议 + thinking_budget 开启时生效）
+    /// 工具调用轮之间允许交错思考。
+    ///
+    /// 生效条件不是「有 thinking_budget」而是「**真的发出了 thinking 字段**」：
+    /// MiniMax `/anthropic` 的 `{"type":"adaptive"}` 由显式 switch 触发、没有 budget，
+    /// 官方 Anthropic 则两者等价。因此 provider 侧判据是 `patch.thinking.is_some()`，
+    /// 实际能不能发还受 vendor 的 `emit_interleaved_beta` 二次过滤
+    /// （第三方兼容端点一律不发，避免 400）。
     pub interleaved: bool,
 }
 
@@ -85,8 +91,12 @@ impl RequestOptions {
     /// 模式分类器预算 256 token 全被思考吃掉，`stop_reason=MaxTokens` 且可见文本为空，
     /// 一次都没判定成功。
     ///
-    /// Anthropic 协议路径只读 `thinking_budget`、完全忽略 `thinking_switch`，因此这个
-    /// 字段对 Anthropic 是 no-op，不会写出它不认识的 `thinking.type`。
+    /// Anthropic 线协议**会读**这个字段，但只经由 vendor adapter 翻译：官方
+    /// Anthropic / GLM / Moonshot 把它当噪声忽略（那边开关只有 budget 一个旋钮，
+    /// 冲突时 adapter 会记 `ignored` 并让 provider 打 warn）；MiniMax `/anthropic`
+    /// 才真正消费它（`disabled` → `adaptive`，且 M3.1 收 `disabled` 直接 400，
+    /// 降级成「不发 thinking 字段」）。这层翻译不能省——直接透传会写出这些
+    /// 端点不认识的 `thinking.type`。
     pub fn text_only(max_tokens: u32) -> Self {
         Self {
             max_tokens,

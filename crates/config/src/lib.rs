@@ -782,9 +782,16 @@ pub struct PersistCapCfg {
     pub tool_result_head_bytes: usize,
     /// `ToolResult` 文本部分(tail)字节上限。0 = 不截断。
     pub tool_result_tail_bytes: usize,
-    /// `Thinking.thinking` 字符串字节上限。0 = 不截断。
+    /// **已废弃，不再生效**（保留字段仅为兼容既有 `config.toml`）。
+    ///
+    /// 原先按此上限截断 `Thinking.thinking`，但 Anthropic 协议与 MiniMax 都
+    /// 要求工具调用续轮时把 thinking 块**原样**回传：截断文本却保留
+    /// `signature` 会让签名校验失配，且该改写不可逆。思考体积改由
+    /// context_edit / compact 控制。设 0 与设任意值行为一致。
     pub thinking_bytes: usize,
-    /// `Thinking.reasoning_details` 每项 `text` 字段字节上限。0 = 不截断。
+    /// **已废弃，不再生效**（保留字段仅为兼容既有 `config.toml`）。
+    /// 理由同上；额外考虑是原实现会改 `reasoning_details[].text` 却保留
+    /// `id` / `format`，产出结构不自洽的块。
     pub reasoning_details_bytes: usize,
     /// `ToolUse.input` JSON 字符串字节上限。0 = 不截断。
     pub tool_use_input_bytes: usize,
@@ -802,8 +809,11 @@ impl Default for PersistCapCfg {
         Self {
             tool_result_head_bytes: 20 * 1024,
             tool_result_tail_bytes: 10 * 1024,
-            thinking_bytes: 8 * 1024,
-            reasoning_details_bytes: 8 * 1024,
+            // thinking / reasoning_details 不再截断（见字段注释）：截断会让
+            // thinking 文本与 signature 失配，破坏工具调用续轮。默认值取 0
+            // 以免让读者以为该项仍然生效。
+            thinking_bytes: 0,
+            reasoning_details_bytes: 0,
             tool_use_input_bytes: 64 * 1024,
             // Text 信息密度低于 tool_result (常含 markdown / 长 reasoning 解释),
             // 默认 head+tail 24K 比 tool_result 30K 更紧;长上下文先撞上限,
