@@ -2145,11 +2145,31 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     }
 }
 
+/// 详情面板滚动偏移的收敛，返回真正喂给 `Paragraph::scroll` 的行偏移。
+///
+/// `scroll` 是**从正文第一行往下跳过的行数**，与 `Paragraph::scroll` 同向。
+/// `follow_tail` 为真时视口钉在末尾跟随新内容（滚动值每帧重算成 `max_scroll`）；
+/// 为假时保留用户的绝对偏移，后续追加的事件只在下方堆积、不再把视口拽走。
+/// 两个值都会写回，让调用方下一次按键看到的就是实际渲染位置。
+pub(crate) fn resolve_detail_scroll(
+    scroll: &mut u16,
+    follow_tail: &mut bool,
+    max_scroll: u16,
+) -> u16 {
+    let value = if *follow_tail {
+        max_scroll
+    } else {
+        (*scroll).min(max_scroll)
+    };
+    *scroll = value;
+    value
+}
+
 /// 选中子 Agent 时接管整个内容区，把它的执行过程（trace）铺开显示。
 ///
 /// 执行内容不再挤在底部面板的详情带里：那条带子受 `bottom_panel_size` 的高度预算
-/// 限制，列表本身还要占行，实际几乎永远显示不全。滚动语义沿用
-/// `sub_agent_detail_scroll` —— clamped == 0 表示贴底跟随新事件，PageUp/PageDown 翻阅。
+/// 限制，列表本身还要占行，实际几乎永远显示不全。滚动语义见
+/// [`resolve_detail_scroll`]：默认贴底跟随新事件，PageUp/PgDn 翻阅后停在历史位置。
 fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     let Some(id) = state.selected_sub_agent else {
         draw_chat(f, state, area);
@@ -2244,13 +2264,22 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     let total = para.line_count(area.width.max(1)).min(u16::MAX as usize) as u16;
     let max_scroll = total.saturating_sub(body_height);
     state.sub_agent_detail_max_scroll = max_scroll;
-    let clamped = state.sub_agent_detail_scroll.min(max_scroll);
-    state.sub_agent_detail_scroll = clamped;
-    let scroll_y = max_scroll.saturating_sub(clamped);
+    let scroll_y = resolve_detail_scroll(
+        &mut state.sub_agent_detail_scroll,
+        &mut state.sub_agent_detail_follow_tail,
+        max_scroll,
+    );
     f.render_widget(para.scroll((scroll_y, 0)), area);
 
+    // 用户主动上滚后视口脱离实时尾部：正文下方还会持续堆新事件，用提示行说明
+    // 「往下还有内容」以及如何回到跟随态，免得看起来像子 Agent 卡住不动了。
+    let detached = scroll_y < max_scroll;
     let hint = Paragraph::new(Line::from(Span::styled(
-        wyj_i18n::tr("subagent.content_hint"),
+        if detached {
+            wyj_i18n::tr("subagent.content_more_below")
+        } else {
+            wyj_i18n::tr("subagent.content_hint")
+        },
         Style::default().fg(Color::Cyan),
     )));
     f.render_widget(
@@ -2651,12 +2680,11 @@ fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
     let visible_height = detail_area.height;
     let max_scroll = total.saturating_sub(visible_height);
     state.shell_detail_max_scroll = max_scroll;
-    // clamp 后写回，防止按键累加超过 max_scroll 导致"到顶/底后要多按几次才生效"
-    let clamped = state.shell_detail_scroll.min(max_scroll);
-    state.shell_detail_scroll = clamped;
-    // `clamped` 语义与子 Agent 详情区一致：从底部往上偏移的行数。
-    // clamped = 0 → 贴底跟随新输出；用户 PageUp 后 clamped > 0 → 停在历史位置。
-    let scroll = max_scroll.saturating_sub(clamped);
+    let scroll = resolve_detail_scroll(
+        &mut state.shell_detail_scroll,
+        &mut state.shell_detail_follow_tail,
+        max_scroll,
+    );
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -2927,7 +2955,8 @@ fn draw_input(
         let raw = match &state.mode {
             AgentMode::Plan => " [plan] Enter to send ",
             AgentMode::Bypass => " [bypass] Enter to send ",
-            AgentMode::Normal => " Enter to send ",
+            AgentMode::Auto => " [auto] Enter to send ",
+            AgentMode::Manual => " Enter to send ",
         };
         let style = match &state.mode {
             AgentMode::Plan => Style::default()
@@ -2938,7 +2967,10 @@ fn draw_input(
             // 三处（状态栏芯片 / 标题栏 / 输入框边框）必须同色，
             // 否则用户会以为底部两处说的是不同的模式。
             AgentMode::Bypass => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            AgentMode::Normal => Theme::dim(),
+            AgentMode::Auto => Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+            AgentMode::Manual => Theme::dim(),
         };
         (truncate_line(raw, title_budget), style)
     };
@@ -2949,6 +2981,7 @@ fn draw_input(
         match &state.mode {
             AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
             AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Red),
+            AgentMode::Auto if !state.is_thinking => Style::default().fg(Color::Green),
             _ => Theme::border(),
         }
     };
@@ -3212,7 +3245,13 @@ fn status_mode_chip(mode: &AgentMode) -> (&'static str, Style) {
             "[bypass]",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        AgentMode::Normal => ("[default]", Theme::dim()),
+        AgentMode::Auto => (
+            "[auto]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        AgentMode::Manual => ("[manual]", Theme::dim()),
     }
 }
 
@@ -6332,7 +6371,7 @@ mod tool_result_fold_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             wyj_config::Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -8545,7 +8584,7 @@ mod tool_result_fold_tests {
         use ratatui::Terminal;
 
         for (mode, expect) in [
-            (AgentMode::Normal, "[default]"),
+            (AgentMode::Manual, "[default]"),
             (AgentMode::Plan, "[plan]"),
             (AgentMode::Bypass, "[bypass]"),
         ] {

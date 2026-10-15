@@ -3528,7 +3528,7 @@ mod schedule_permissions_tests {
             cwd.path().to_path_buf(),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         );
@@ -5771,7 +5771,7 @@ mod navigation_focus_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -6179,6 +6179,7 @@ mod navigation_focus_tests {
         state.sub_agent_detail_open = true;
         state.sub_agent_detail_scroll = 5;
         state.sub_agent_detail_max_scroll = 20;
+        state.sub_agent_detail_follow_tail = false;
         state.chat_scroll = 10;
         state.chat_max_scroll = 20;
 
@@ -6186,6 +6187,145 @@ mod navigation_focus_tests {
 
         assert_eq!(state.sub_agent_detail_scroll, 8);
         assert_eq!(state.chat_scroll, 10);
+    }
+
+    /// 滚动方向必须与渲染同向：`scroll` 是"从正文第一行往下跳过的行数"，
+    /// delta > 0 向下、delta < 0 向上。曾经实现把 scroll 当"距底部偏移"、
+    /// 渲染时再取反，按键却原样透传 delta，于是 PageUp 反而把视口推向实时
+    /// 尾部，用户按多少次都停不下来。
+    #[test]
+    fn sub_agent_detail_scroll_direction_matches_render() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+        state.sub_agent_detail_scroll = 10;
+        state.sub_agent_detail_max_scroll = 40;
+        state.sub_agent_detail_follow_tail = false;
+
+        state.scroll_focus_lines(8); // PageDown
+        assert_eq!(state.sub_agent_detail_scroll, 18);
+        state.scroll_focus_lines(-8); // PageUp
+        assert_eq!(state.sub_agent_detail_scroll, 10);
+        // 滚到顶不再越界
+        state.scroll_focus_lines(-100);
+        assert_eq!(state.sub_agent_detail_scroll, 0);
+        // 滚到底不再越界，并恢复贴底跟随
+        state.scroll_focus_lines(1000);
+        assert_eq!(state.sub_agent_detail_scroll, 40);
+        assert!(state.sub_agent_detail_follow_tail);
+    }
+
+    /// 用户主动上滚后必须能"停住"：运行中的子 Agent 持续追加 trace 事件、
+    /// max_scroll 只增不减，但视口要停在原地，不能被新内容拽走。
+    #[test]
+    fn sub_agent_detail_detaches_from_live_tail_after_user_scrolls_up() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+        state.sub_agent_detail_max_scroll = 40;
+        state.sub_agent_detail_follow_tail = true;
+
+        // 贴底态按 PageUp：视口离开末尾，脱离跟随
+        state.scroll_focus_lines(-8);
+        assert_eq!(state.sub_agent_detail_scroll, 32);
+        assert!(!state.sub_agent_detail_follow_tail);
+
+        // 新事件把可滚动上限推高，视口必须原地不动
+        state.sub_agent_detail_max_scroll = 100;
+        render::resolve_detail_scroll(
+            &mut state.sub_agent_detail_scroll,
+            &mut state.sub_agent_detail_follow_tail,
+            state.sub_agent_detail_max_scroll,
+        );
+        assert_eq!(state.sub_agent_detail_scroll, 32);
+        assert!(!state.sub_agent_detail_follow_tail);
+
+        // 复位后重新贴底，新内容会把视口一起带到底部
+        state.reset_sub_agent_detail_view();
+        state.sub_agent_detail_max_scroll = 100;
+        render::resolve_detail_scroll(
+            &mut state.sub_agent_detail_scroll,
+            &mut state.sub_agent_detail_follow_tail,
+            state.sub_agent_detail_max_scroll,
+        );
+        assert_eq!(state.sub_agent_detail_scroll, 100);
+    }
+
+    /// 复位（切换选中项 / 关闭详情）必须同时把 follow_tail 拉回真，
+    /// 否则下一个子 Agent 的执行内容会以"停在旧偏移"开场。
+    #[test]
+    fn reset_sub_agent_detail_view_restores_live_tail() {
+        let mut state = make_state();
+        state.sub_agent_detail_scroll = 12;
+        state.sub_agent_detail_follow_tail = false;
+
+        state.reset_sub_agent_detail_view();
+
+        assert_eq!(state.sub_agent_detail_scroll, 0);
+        assert!(state.sub_agent_detail_follow_tail);
+    }
+
+    /// 面板浏览态的 Ctrl+C / Ctrl+D 必须在内容区焦点分支被吃掉：它们一旦落进
+    /// `_` 兜底就会继续下坠到全局分支，Ctrl+C 触发 interrupt() →
+    /// current_task.abort() + hub.abort_foreground()，把整轮执行和所有前台
+    /// 子 Agent 一起杀掉。
+    #[test]
+    fn panel_focus_swallows_ctrl_c_and_ctrl_d() {
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+
+        assert!(state.content_focus_swallows_global_key(&ctrl_key('c')));
+        assert!(state.content_focus_swallows_global_key(&KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL
+        )));
+
+        // 面板焦点下普通字符不拦：仍按原逻辑退出面板焦点并落进输入框
+        assert!(!state.content_focus_swallows_global_key(&KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        )));
+
+        // Chat 焦点下 Ctrl+C 保留"中断 Agent"的原义
+        state.ui_focus = UiFocus::Chat;
+        assert!(!state.content_focus_swallows_global_key(&ctrl_key('c')));
+    }
+
+    /// 端到端的方向不变式：PageUp 之后真正喂给 `Paragraph::scroll` 的行偏移必须
+    /// **变小**（视口上移）。旧实现把 scroll 当"距底部偏移"、渲染时再取反，
+    /// 按键却原样透传 delta，于是 PageUp 反而让渲染偏移变大——视口被推向实时
+    /// 尾部，新事件持续追加就永远停不下来。
+    #[test]
+    fn page_up_moves_rendered_viewport_up_not_down() {
+        fn rendered(state: &mut AppState) -> u16 {
+            render::resolve_detail_scroll(
+                &mut state.sub_agent_detail_scroll,
+                &mut state.sub_agent_detail_follow_tail,
+                state.sub_agent_detail_max_scroll,
+            )
+        }
+
+        let mut state = make_state();
+        state.ui_focus = UiFocus::SubAgents;
+        state.sub_agent_detail_open = true;
+        state.sub_agent_detail_max_scroll = 40;
+        state.sub_agent_detail_follow_tail = true;
+
+        let tail = rendered(&mut state);
+        assert_eq!(tail, 40, "默认贴底对齐末尾");
+
+        state.scroll_focus_lines(-8); // PageUp
+        let up = rendered(&mut state);
+        assert!(up < tail, "PageUp 必须让视口上移：{up} < {tail}");
+
+        state.scroll_focus_lines(8); // PageDown 原路返回
+        assert_eq!(rendered(&mut state), tail);
+        assert!(state.sub_agent_detail_follow_tail);
+    }
+
+    fn ctrl_key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -6552,7 +6692,7 @@ mod clipboard_paste_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -7729,10 +7869,15 @@ pub struct AppState {
     pub selected_sub_agent: Option<u64>,
     /// 选中项是否已展开详情（工具调用流水 + 最终结果）
     pub sub_agent_detail_open: bool,
-    /// 详情内容的行级滚动偏移（渲染时按可视行数 clamp 并写回）
+    /// 详情内容的行级滚动偏移：**从正文第一行往下跳过的行数**，
+    /// 与 `Paragraph::scroll` 同向（渲染时按可视行数 clamp 并写回）。
     pub sub_agent_detail_scroll: u16,
     /// 详情面板上一帧渲染算出的内部可滚动上限，供 scroll_focus_lines 判断是否已到边界并转发给聊天区
     pub sub_agent_detail_max_scroll: u16,
+    /// 详情视口是否钉在末尾跟随新事件。为真时 `sub_agent_detail_scroll` 由渲染
+    /// 每帧重置成 `max_scroll`；用户一旦主动上滚即置假，此后 scroll 是绝对偏移，
+    /// 后续追加的 trace 事件只在下方堆积、不再把视口拽走。
+    pub sub_agent_detail_follow_tail: bool,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
     /// 后台 shell 任务（Vec 保持 spawn 顺序，见 ShellUiState 注释）。
@@ -7742,10 +7887,12 @@ pub struct AppState {
     pub selected_shell: Option<String>,
     /// 选中 shell 是否已展开详情（实时输出）
     pub shell_detail_open: bool,
-    /// 详情内容的行级滚动偏移（渲染时按可视行数 clamp 并写回）
+    /// 详情内容的行级滚动偏移：**从正文第一行往下跳过的行数**（同 sub_agent_detail_scroll）
     pub shell_detail_scroll: u16,
     /// 详情面板上一帧渲染算出的内部可滚动上限，供 scroll_focus_lines 判断是否已到边界并转发给聊天区
     pub shell_detail_max_scroll: u16,
+    /// 详情视口是否钉在末尾跟随新输出，语义同 `sub_agent_detail_follow_tail`
+    pub shell_detail_follow_tail: bool,
     /// 子 Agent 累计 token 用量（与主 session 分开统计，/cost 单列）
     pub sub_input_tokens: u32,
     pub sub_output_tokens: u32,
@@ -7878,12 +8025,14 @@ impl AppState {
             sub_agent_detail_open: false,
             sub_agent_detail_scroll: 0,
             sub_agent_detail_max_scroll: 0,
+            sub_agent_detail_follow_tail: true,
             pending_bg_reminders: vec![],
             shells: Vec::new(),
             selected_shell: None,
             shell_detail_open: false,
             shell_detail_scroll: 0,
             shell_detail_max_scroll: 0,
+            shell_detail_follow_tail: true,
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             hub,
@@ -8014,7 +8163,7 @@ impl AppState {
         self.sub_agent_trace_cache.clear();
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.pending_bg_reminders.clear();
         // 会话级重置：后台任务属于「上一段会话的现场」，随会话一起作废
         // （进程本身由退出路径的 kill_all 收走）。与 begin_new_turn 的
@@ -8022,7 +8171,7 @@ impl AppState {
         self.shells.clear();
         self.selected_shell = None;
         self.shell_detail_open = false;
-        self.shell_detail_scroll = 0;
+        self.reset_shell_detail_view();
         self.shell_detail_max_scroll = 0;
         self.sub_input_tokens = 0;
         self.sub_output_tokens = 0;
@@ -8056,7 +8205,7 @@ impl AppState {
         self.todo_detail_scroll = 0;
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.ui_focus = UiFocus::Chat;
         if first {
             self.chat_scroll = 0;
@@ -8125,6 +8274,49 @@ impl AppState {
         let after = (*value).min(max);
         *value = after;
         before != after
+    }
+
+    /// 详情面板（子 Agent 执行内容 / 后台任务输出）的通用滚动，语义对齐
+    /// [`AppState::scroll_chat_lines`]。
+    ///
+    /// `scroll` 是**从正文第一行往下跳过的行数**，与 `Paragraph::scroll` 同向：
+    /// delta > 0 向下翻、delta < 0 向上翻。`follow_tail` 为真时视口钉在末尾跟随
+    /// 新内容（此时 `scroll` 的取值由渲染每帧覆盖成 `max_scroll`），用户一旦
+    /// 主动上滚就置假，此后新事件只在下方堆积、不再把正在读的位置拽走；一路
+    /// 滚回底部再自动恢复跟随。
+    ///
+    /// 返回 false 表示详情面板内部无处可滚（`max == 0`，内容根本没超出视口），
+    /// 调用方应把这次滚动量转发给聊天区，而不是让滚轮事件无声消失。
+    fn scroll_detail_lines(scroll: &mut u16, follow_tail: &mut bool, max: u16, delta: i32) -> bool {
+        if delta == 0 || max == 0 {
+            return false;
+        }
+        let current = if *follow_tail {
+            max
+        } else {
+            (*scroll).min(max)
+        };
+        let amount = delta.unsigned_abs().min(u16::MAX as u32) as u16;
+        let next = if delta < 0 {
+            current.saturating_sub(amount)
+        } else {
+            current.saturating_add(amount).min(max)
+        };
+        *scroll = next;
+        *follow_tail = next >= max;
+        true
+    }
+
+    /// 选中项变化 / 关闭详情时把子 Agent 详情视图复位成「贴底跟随新事件」。
+    fn reset_sub_agent_detail_view(&mut self) {
+        self.sub_agent_detail_scroll = 0;
+        self.sub_agent_detail_follow_tail = true;
+    }
+
+    /// [`AppState::reset_sub_agent_detail_view`] 的后台任务版。
+    fn reset_shell_detail_view(&mut self) {
+        self.shell_detail_scroll = 0;
+        self.shell_detail_follow_tail = true;
     }
 
     fn move_focus_selection(&mut self, delta: i32) {
@@ -8227,21 +8419,23 @@ impl AppState {
                 );
             }
             UiFocus::SubAgents if self.sub_agent_detail_open => {
-                if !Self::adjust_bounded_u16_scroll(
+                if !Self::scroll_detail_lines(
                     &mut self.sub_agent_detail_scroll,
-                    delta,
+                    &mut self.sub_agent_detail_follow_tail,
                     self.sub_agent_detail_max_scroll,
+                    delta,
                 ) {
                     self.scroll_chat_lines(delta);
                 }
             }
-            // 后台任务详情：与子 Agent 详情同款——滚到边界就把滚动量转发给
+            // 后台任务详情：与子 Agent 详情同款——内容装得下时把滚动量转发给
             // 聊天区，不让滚轮事件无声消失。
             UiFocus::Shells if self.shell_detail_open => {
-                if !Self::adjust_bounded_u16_scroll(
+                if !Self::scroll_detail_lines(
                     &mut self.shell_detail_scroll,
-                    delta,
+                    &mut self.shell_detail_follow_tail,
                     self.shell_detail_max_scroll,
+                    delta,
                 ) {
                     self.scroll_chat_lines(delta);
                 }
@@ -8445,7 +8639,7 @@ impl AppState {
         self.todo_detail_max_scroll = 0;
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.ui_focus = UiFocus::Todos;
         self.chat_follow_tail = true;
         self.unseen_messages = false;
@@ -8524,6 +8718,24 @@ impl AppState {
         )
     }
 
+    /// 内容区焦点下，这个键是否必须**被面板吃掉**，绝不能继续下坠到全局快捷键处理。
+    ///
+    /// 内容区焦点分支只具名处理导航/翻页/Esc，`Char('c')`+CONTROL（中断 Agent）
+    /// 与 is_quit（退出）会落进 `_` 兜底；兜底只 `leave_content_focus()` 而**没有
+    /// continue**，于是继续下坠被全局分支接住：Ctrl+C 走 [`AppState::interrupt`]
+    /// → `current_task.abort()` + `hub.abort_foreground()`，把当前回合和所有前台
+    /// 子 Agent 一起中断。在执行轨迹/后台输出面板里按 Ctrl+C 想表达的是
+    /// "停下、退出浏览"，不该顺手杀掉整个 agent 服务。
+    ///
+    /// 只对**面板**焦点生效：Chat 焦点下 Ctrl+C 仍保留"中断 Agent"的原义
+    /// （焦点也可能只是滚动聊天区时顺手进来的）。
+    fn content_focus_swallows_global_key(&self, key: &KeyEvent) -> bool {
+        matches!(self.ui_focus, UiFocus::SubAgents | UiFocus::Shells)
+            && (is_quit(key)
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+    }
+
     /// 从输入框显式进入内容区。优先选择离输入框最近且当前可见的运行中 SubAgent
     /// 面板，其次是内联 Todo，最后是聊天区底部。
     fn enter_content_focus(&mut self) -> bool {
@@ -8540,7 +8752,7 @@ impl AppState {
                 self.selected_sub_agent = Some(last_id);
                 self.todo_detail_open = false;
                 self.sub_agent_detail_open = true;
-                self.sub_agent_detail_scroll = 0;
+                self.reset_sub_agent_detail_view();
                 self.ui_focus = UiFocus::SubAgents;
                 return true;
             }
@@ -8572,7 +8784,7 @@ impl AppState {
                 self.selected_todo_id = None;
                 self.todo_detail_open = false;
                 self.selected_shell = Some(last_id);
-                self.shell_detail_scroll = 0;
+                self.reset_shell_detail_view();
                 self.ui_focus = UiFocus::Shells;
                 return true;
             }
@@ -8592,10 +8804,10 @@ impl AppState {
         self.todo_detail_max_scroll = 0;
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.selected_shell = None;
         self.shell_detail_open = false;
-        self.shell_detail_scroll = 0;
+        self.reset_shell_detail_view();
         self.shell_detail_max_scroll = 0;
         true
     }
@@ -8637,11 +8849,11 @@ impl AppState {
             }
             UiFocus::SubAgents if self.selected_sub_agent.is_some() => {
                 self.sub_agent_detail_open = !self.sub_agent_detail_open;
-                self.sub_agent_detail_scroll = 0;
+                self.reset_sub_agent_detail_view();
             }
             UiFocus::Shells if self.selected_shell.is_some() => {
                 self.shell_detail_open = !self.shell_detail_open;
-                self.shell_detail_scroll = 0;
+                self.reset_shell_detail_view();
             }
             UiFocus::Composer
             | UiFocus::Chat
@@ -8694,7 +8906,7 @@ impl AppState {
         self.todo_detail_max_scroll = 0;
         self.selected_sub_agent = Some(id);
         self.sub_agent_detail_open = true;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.ui_focus = UiFocus::SubAgents;
         true
     }
@@ -8718,9 +8930,9 @@ impl AppState {
         self.todo_detail_max_scroll = 0;
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.selected_shell = Some(id);
-        self.shell_detail_scroll = 0;
+        self.reset_shell_detail_view();
         self.ui_focus = UiFocus::Shells;
         true
     }
@@ -8747,7 +8959,7 @@ impl AppState {
             return false;
         }
         self.selected_shell = Some(running[next as usize].id.clone());
-        self.shell_detail_scroll = 0;
+        self.reset_shell_detail_view();
         self.ui_focus = UiFocus::Shells;
         true
     }
@@ -8782,7 +8994,7 @@ impl AppState {
         }
         self.selected_sub_agent = Some(ids[next as usize]);
         self.sub_agent_detail_open = true;
-        self.sub_agent_detail_scroll = 0;
+        self.reset_sub_agent_detail_view();
         self.ui_focus = UiFocus::SubAgents;
         true
     }
@@ -8822,7 +9034,7 @@ impl AppState {
             .is_some_and(|sel| running.iter().any(|id| id == sel));
         if !still_valid {
             self.selected_shell = running.last().cloned();
-            self.shell_detail_scroll = 0;
+            self.reset_shell_detail_view();
         }
         if self.selected_shell.is_none() {
             self.shell_detail_open = false;
@@ -8846,7 +9058,7 @@ impl AppState {
             .is_some_and(|sel| running.contains(&sel));
         if !still_valid {
             self.selected_sub_agent = running.last().copied();
-            self.sub_agent_detail_scroll = 0;
+            self.reset_sub_agent_detail_view();
         }
         if self.selected_sub_agent.is_none() {
             self.sub_agent_detail_open = false;
@@ -10974,12 +11186,17 @@ pub async fn run_tui(
     }
 }
 
-/// 循环切换 Agent 模式：Normal → Plan → Bypass → Normal
+/// 循环切换 Agent 模式：Auto → Manual → Plan → Bypass → Auto
+///
+/// 顺序对齐上游 Shift+Tab 循环（auto 起步，plan 之后才到可选模式）。Bypass
+/// 排最后而不是 auto 之前：它是"用户明说全都放行"的选择，不该出现在
+/// auto→manual 的日常切换路径里。
 fn cycle_mode(mode: &AgentMode) -> AgentMode {
     match mode {
-        AgentMode::Normal => AgentMode::Plan,
+        AgentMode::Auto => AgentMode::Manual,
+        AgentMode::Manual => AgentMode::Plan,
         AgentMode::Plan => AgentMode::Bypass,
-        AgentMode::Bypass => AgentMode::Normal,
+        AgentMode::Bypass => AgentMode::Auto,
     }
 }
 
@@ -11321,6 +11538,9 @@ fn spawn_agent_turn(
     // 使得本轮运行期间的模式切换（如 Plan 审批、Shift+Tab）能立即影响
     // 后续工具调用的权限判定，无需等待下一轮 spawn_agent_turn。
     shared_permission: Arc<std::sync::RwLock<PermissionMode>>,
+    // Auto 模式判定闸门。随 ctx 派生传给子 Agent；`None` 时 auto 模式退化为
+    // 逐次弹窗（见 `Agent::ensure_tool_permission`）。
+    auto_gate: Option<Arc<dyn wyj_core::auto_mode::AutoGate>>,
     ui_ask_tx_clone: mpsc::Sender<UiAskRequest>,
     // 主 Agent 空闲期间积累的后台任务结果 reminder（子 Agent / 后台 shell）
     preface_reminders: Vec<String>,
@@ -11376,6 +11596,7 @@ fn spawn_agent_turn(
         // sub_* 字段，`/cost` 的「子 Agent」行与金额合计才有数据。
         ctx.sub_usage = Some(Arc::clone(&sub_usage_acc));
         ctx.permission_mode = shared_permission;
+        ctx.auto_gate = auto_gate;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
         // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
         if let Ok(config_base) = wyj_config::config_dir() {
@@ -11510,7 +11731,11 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
             PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
-        AgentMode::Normal => PermissionMode::Prompt,
+        AgentMode::Manual => PermissionMode::Prompt,
+        // Auto 与 Prompt 的差别不在 `evaluate`（两者都放行到这里），而在
+        // `Agent::ensure_tool_permission`：前者先问 AutoGate，只有闸门判
+        // AskUser / 没装闸门时才落到 `confirm_tool` 弹窗。
+        AgentMode::Auto => PermissionMode::Auto,
     }
 }
 
@@ -11875,7 +12100,7 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
         Some(id) if running.contains(&id) => {
             state.selected_sub_agent = Some(id);
             state.sub_agent_detail_open = true;
-            state.sub_agent_detail_scroll = 0;
+            state.reset_sub_agent_detail_view();
             state.ui_focus = UiFocus::SubAgents;
         }
         Some(id) => {
@@ -11888,7 +12113,7 @@ fn apply_open_subagents_panel(state: &mut AppState, target_id: Option<u64>) {
             if let Some(&last_id) = running.last() {
                 state.selected_sub_agent = Some(last_id);
                 state.sub_agent_detail_open = true;
-                state.sub_agent_detail_scroll = 0;
+                state.reset_sub_agent_detail_view();
                 state.ui_focus = UiFocus::SubAgents;
             }
         }
@@ -11913,7 +12138,7 @@ fn apply_open_shells_panel(state: &mut AppState, target_id: Option<String>) {
         Some(id) if running.iter().any(|s| s == &id) => {
             state.selected_shell = Some(id);
             state.shell_detail_open = true;
-            state.shell_detail_scroll = 0;
+            state.reset_shell_detail_view();
             state.ui_focus = UiFocus::Shells;
         }
         Some(id) => {
@@ -11927,7 +12152,7 @@ fn apply_open_shells_panel(state: &mut AppState, target_id: Option<String>) {
             if let Some(last) = running.last() {
                 state.selected_shell = Some(last.clone());
                 state.shell_detail_open = true;
-                state.shell_detail_scroll = 0;
+                state.reset_shell_detail_view();
                 state.ui_focus = UiFocus::Shells;
             }
         }
@@ -12238,6 +12463,13 @@ async fn tui_main(
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
     // 顶部说明：解决"运行中切换模式对本轮已生效"的问题。
     let shared_permission = Arc::new(std::sync::RwLock::new(mode_to_permission(&mode)));
+    // Auto 模式闸门：整个会话一份，随 ctx 派生传给子 Agent（降级阈值因此
+    // 全局共享）。建不出来时传 `None` —— auto 模式会退化成逐次弹窗。
+    let auto_gate = Some(wyj_core::auto_mode::build_gate(&config, agent.provider_handle()));
+    // Auto 是默认起始模式，且它会**替人**做放行决定。首次进入时把这件事说清楚，
+    // 否则用户看到"什么都没问就改了文件"时的第一反应是以为权限系统坏了。
+    let started_in_auto = mode == AgentMode::Auto;
+    let mut auto_degrade_notified = false;
     let mut state = AppState::new(
         cwd.clone(),
         model_name,
@@ -12256,6 +12488,10 @@ async fn tui_main(
     }
     state.hyperlink_registry = hyperlink_registry;
     state.hook_runner = agent.hook_runner_ref().cloned();
+    if started_in_auto && initial_messages.is_empty() {
+        // 只在新会话说一次。恢复旧会话时那些工具早就跑完了，再补一句是噪音。
+        state.messages.push(ChatMessage::system(wyj_i18n::tr("auto.mode_notice")));
+    }
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
     state.current_session_id = current_session_id.clone();
@@ -12525,6 +12761,23 @@ async fn tui_main(
             }
         }
 
+        // ── Auto 模式降级检查 ─────────────────────────────────────────
+        // 分类器连续/累计拦截超阈值后自动退回逐次确认（对齐上游的
+        // "3 consecutive or 20 total"）。只在本会话检查一次：降级后用户手动
+        // 切回 auto 也不重置这个提示位——那正是"这个会话的分类器不太灵"的
+        // 信号，反复提醒没有意义。
+        if !auto_degrade_notified && state.mode == AgentMode::Auto {
+            let degraded = auto_gate.as_ref().is_some_and(|gate| gate.should_degrade());
+            if degraded {
+                auto_degrade_notified = true;
+                switch_mode(&shared_mode, &shared_permission, AgentMode::Manual).await;
+                state.mode = AgentMode::Manual;
+                state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                    "auto.degraded_to_manual",
+                )));
+            }
+        }
+
         // ── 后台任务完成 → 自动唤醒 Agent 续跑 ───────────────────────
         // 排在「竞态兜底」之后：用户恰好在排队消息时优先消费用户消息
         // （它会 mem::take 走 pending_bg_reminders，下一帧再唤醒，不会丢）。
@@ -12547,6 +12800,7 @@ async fn tui_main(
                 cwd.clone(),
                 shared_mode.clone(),
                 shared_permission.clone(),
+                auto_gate.clone(),
                 ui_ask_tx.clone(),
                 reminders,
                 plugin_runtime.clone(),
@@ -12594,6 +12848,7 @@ async fn tui_main(
                 cwd.clone(),
                 shared_mode.clone(),
                 shared_permission.clone(),
+                auto_gate.clone(),
                 ui_ask_tx.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
                 plugin_runtime.clone(),
@@ -12911,7 +13166,7 @@ async fn tui_main(
                                                     );
                                                     state.selected_sub_agent = None;
                                                     state.sub_agent_detail_open = false;
-                                                    state.sub_agent_detail_scroll = 0;
+                                                    state.reset_sub_agent_detail_view();
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已切换至会话 {}  共 {} 轮对话",
@@ -15050,7 +15305,7 @@ async fn tui_main(
                                     );
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
-                                    let new_mode = AgentMode::Normal;
+                                    let new_mode = AgentMode::Manual;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
@@ -15100,7 +15355,7 @@ async fn tui_main(
                                         current_session_id.clone(),
                                         session_store.as_ref(),
                                     );
-                                    let new_mode = AgentMode::Normal;
+                                    let new_mode = AgentMode::Manual;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
@@ -15122,6 +15377,7 @@ async fn tui_main(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         shared_permission.clone(),
+                                        auto_gate.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
@@ -15147,6 +15403,7 @@ async fn tui_main(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         shared_permission.clone(),
+                                        auto_gate.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
@@ -15384,6 +15641,14 @@ async fn tui_main(
                     // SubAgent 在各自边界自然跨区；TodoDetail 内则改为逐行滚动。
                     // Esc 按“详情 → 列表 → 输入框”逐级返回并始终保留草稿。
                     if state.content_focus_active() {
+                        // 面板浏览态先截下全局中断/退出键（见
+                        // `content_focus_swallows_global_key`），否则 Ctrl+C 会穿过
+                        // 下面的 `_` 兜底直落 `interrupt()`，把整轮执行连同所有
+                        // 前台子 Agent 一起 abort 掉。
+                        if state.content_focus_swallows_global_key(&key) {
+                            state.close_panel_focus();
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Up => {
                                 state.move_focus_selection(-1);
@@ -15600,13 +15865,25 @@ async fn tui_main(
                             // 以 "/mode" 为前缀的命令会被误吞（strip_prefix 不检查词边界）。
                             if trimmed == "/mode" || trimmed.starts_with("/mode ") {
                                 let args = trimmed.strip_prefix("/mode").unwrap().trim();
-                                let new_mode = match args {
-                                    "plan" => Some(AgentMode::Plan),
-                                    "bypass" => Some(AgentMode::Bypass),
-                                    "normal" | "" => Some(AgentMode::Normal),
-                                    _ => None,
-                                };
-                                match new_mode {
+                                // 走 `AgentMode::parse` 而不是在这里再写一遍 match：
+                                // CLI 的 `--permission-mode` 与 TUI 的 `/mode` 必须接受
+                                // 同一组名字与别名（`default` ≡ `manual`），两处各写
+                                // 一份必然漂移。
+                                //
+                                // 裸 `/mode` 显示当前模式与可选值，而不是像从前那样
+                                // 「切到 normal」——现在默认值是 auto，一个不带参数的
+                                // 切换命令没有任何自解释的语义。
+                                if args.is_empty() {
+                                    state.messages.push(ChatMessage::system(
+                                        wyj_i18n::tr_fmt(
+                                            "mode.current",
+                                            &[("mode", state.mode.label())],
+                                        ),
+                                    ));
+                                    state.input_history.push(trimmed);
+                                    continue;
+                                }
+                                match AgentMode::parse(args) {
                                     Some(m) => {
                                         let label = m.label();
                                         switch_mode(&shared_mode, &shared_permission, m.clone())
@@ -16592,7 +16869,7 @@ async fn tui_main(
                                                     );
                                                     state.selected_sub_agent = None;
                                                     state.sub_agent_detail_open = false;
-                                                    state.sub_agent_detail_scroll = 0;
+                                                    state.reset_sub_agent_detail_view();
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已恢复会话 {}  共 {} 轮对话",
@@ -16800,6 +17077,7 @@ async fn tui_main(
                                         cwd.clone(),
                                         shared_mode.clone(),
                                         shared_permission.clone(),
+                                        auto_gate.clone(),
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
@@ -17280,7 +17558,7 @@ mod sub_agent_ui_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -17434,7 +17712,7 @@ mod cross_session_subagents_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -18117,7 +18395,7 @@ mod ask_question_dialog_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -18292,7 +18570,7 @@ mod todo_stats_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -18723,7 +19001,7 @@ mod shell_panel_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -18932,7 +19210,7 @@ mod tool_event_ordering_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -19459,7 +19737,7 @@ mod skills_registry_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Normal,
+            AgentMode::Manual,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
