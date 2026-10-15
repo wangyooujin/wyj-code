@@ -17,9 +17,43 @@
 
 use crate::session_store::SessionFile;
 use crate::workspace_cas::WorkspaceCas;
+use anyhow::Result;
+use serde::Serialize;
+use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 use wyj_api::types::{ContentBlock as ApiContentBlock, Message, ToolResultContent, ToolResultPart};
 use wyj_config::PersistCapCfg;
+
+/// 原子替换写：先写同目录 tmp 文件再 `rename`。
+///
+/// unix 的 `rename(2)` 对同一文件系统内是原子的，因此**任何时刻**读侧看到的都是
+/// 完整的一版，不存在「读到半截 JSON」。多个 wyj-code 进程共享同一状态文件时，
+/// 非原子 `fs::write` 会让并发写互相截断，读侧的 `serde_json::from_str` 随即失败
+/// ——若失败被静默吞掉（如授权名单），表现是该项目的配置「突然全部失效」。
+///
+/// tmp 名带 uuid：多个进程即使同时写同一目标也不会互相覆盖 tmp。
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
+    fs::write(&tmp, bytes)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // rename 失败时别把 tmp 留在磁盘上。
+            let _ = fs::remove_file(&tmp);
+            Err(anyhow::Error::from(error))
+        }
+    }
+}
+
+/// [`write_atomic`] 的 JSON 版本。
+pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
+}
 
 /// 按字节上限截断，保证不切断多字节字符。`s.len() <= max_bytes` 时原样借用返回。
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
