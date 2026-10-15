@@ -2543,9 +2543,10 @@ impl Agent {
     /// 它坏了最坏结果是用户体验退回旧行为，而权限路径 panic 会直接掀翻会话。
     ///
     /// `auto` 决定记忆粒度：手动模式按**工具名**（批准一次 Bash，本轮所有 Bash
-    /// 都不再问，这正是「批准一个任务」的价值）；Auto 模式按**工具名 + 输入**——
-    /// 同一把钥匙放到 Auto 上会把分类器架空：审过一条 `npm test` 之后，本轮
-    /// 剩下的 `npm run deploy` 全部免审。
+    /// 都不再问，这正是「批准一个任务」的价值）；Auto 模式不能照抄这把钥匙——
+    /// 审过一条 `npm test` 之后，本轮的 `npm run deploy` 全部免审，分类器直接被
+    /// 架空。所以 Auto 记的是**命令族**（见 [`auto_call_shape`]），只有同族的 flag
+    /// 差异才复用授权，落到具体参数上一律回退到精确指纹。
     fn turn_granted(&self, name: &str, input: &serde_json::Value, auto: bool) -> bool {
         self.turn_permission_grants
             .lock()
@@ -2554,10 +2555,12 @@ impl Agent {
     }
 
     fn permission_key(&self, tool_name: &str, input: &serde_json::Value, auto: bool) -> String {
-        if auto {
-            format!("{tool_name}\u{1f}{:x}", fnv_hash_value(input))
-        } else {
-            tool_name.to_string()
+        if !auto {
+            return tool_name.to_string();
+        }
+        match auto_call_shape(tool_name, input) {
+            Some(shape) => shape,
+            None => format!("{tool_name}\u{1f}{:x}", fnv_hash_value(input)),
         }
     }
 
@@ -2910,6 +2913,66 @@ fn fnv_hash_value(value: &serde_json::Value) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
+}
+
+/// Auto 模式「本轮已放行」的缓存键；无法归族时返回 `None`，由调用方回退到精确指纹。
+///
+/// 只对 Bash 开口（见 [`bash_call_shape`]）。其余工具保持精确：工作目录内的
+/// 文件写本来就命中闸门的确定性 allow，永远不会走到这把键；而写内容天然每次
+/// 不同，按路径放宽反而会让「同一个文件写第二遍」丢掉复审。
+fn auto_call_shape(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let command = input.get("command")?.as_str()?;
+    bash_call_shape(command).map(|shape| format!("{tool_name}\u{1f}shape:{shape}"))
+}
+
+/// 把 shell 命令归成「可复用授权」的族：程序 + 固定子命令。
+///
+/// 为什么不全量放宽：Auto 模式下每一把新键都要付一次分类器往返（实测 3.4–5.5s），
+/// 而 Bash 的 input 就是命令本身，`git log --oneline` 与 `git log -p` 必然不同键，
+/// 长任务里几十条同类命令就是把闸门打成串行队列。但直接退回「按工具名记」也不行——
+/// 那样审过 `npm test` 就会放过 `npm run deploy`。
+///
+/// 归族条件（三条都要满足，缺一即回退精确指纹）：
+///
+/// 1. **命令里没有任何 shell 元字符 / 引号 / 路径分隔符 / 通配符 / 变量展开**
+///    （见 `UNSAFE`）。带这些的命令一旦归族，参数里的路径差异就被抹掉了——
+///    `sed -i s/a/b/ notes.md` 与 `sed -i s/a/b/ /etc/hosts` 会撞成一族。
+/// 2. **argv[1] 存在且不是 flag**，即形如 `<program> <subcommand> [...]`。
+///    `rg -n foo`（argv[1] 是 flag）、`ls`、`rm -rf build`（argv[1] 是 flag）都退回
+///    精确——前者风险由 flag 决定，后者压根没有可复用的子命令语义。
+/// 3. **argv[2] 不存在或以 `-` 开头**，即不能出现第二个位置参数。
+///    这条挡住 `npm run build` 与 `npm run deploy`：它们的 argv[1] 同为 `run`，
+///    真正的差别在 argv[2]，而 `pip install <包名>` 同理（包名才是风险所在）。
+///    放过它们就等于把「二级子命令」从分类器视野里抹掉。
+///
+/// 满足条件时 flag 差异一律不参与分族：`git log --oneline` 与 `git log -p --since=x`
+/// 归为 `git log`，这正是长任务里最常见的重复形态。
+///
+/// 残余风险（知情取舍）：同族内换「同名子命令的非 flag 参数」仍会复用授权，例如
+/// `pip install a` 放过 `pip install b`。要收紧只能退回全量精确指纹，而那正是本函数
+/// 要解决的问题；分类器已在族首命令上看过完整输入，`hard_deny` 规则又在归族之前
+/// 先行拦截（`AutoGateImpl::deterministic_deny`），剩余窗口限于「已放行过的程序+子命令」。
+fn bash_call_shape(command: &str) -> Option<String> {
+    const UNSAFE: &[char] = &[
+        '\'', '"', '`', '$', '|', '&', ';', '<', '>', '(', ')', '{', '}', '[', ']', '*', '?', '!',
+        '\\', '\n', '\r', '/', '~', '#',
+    ];
+    if command.contains(UNSAFE) {
+        return None;
+    }
+    let mut tokens = command.split_whitespace();
+    let program = tokens.next()?;
+    let subcommand = tokens.next()?;
+    if program.is_empty() || subcommand.starts_with('-') {
+        return None;
+    }
+    if tokens.next().is_some_and(|token| !token.starts_with('-')) {
+        return None;
+    }
+    Some(format!("{program} {subcommand}"))
 }
 
 /// 把 Object 的 key 递归排序,数组与 Primitive 保持原样。让同一份语义 JSON
@@ -3338,6 +3401,50 @@ mod tests {
         let arr_a = serde_json::json!({"items": [1, 2, 3]});
         let arr_b = serde_json::json!({"items": [3, 2, 1]});
         assert_ne!(fnv_hash_value(&arr_a), fnv_hash_value(&arr_b));
+    }
+
+    /// Auto 模式的本轮授权缓存：同族命令复用，参数/子命令一落到具体值就回退精确。
+    ///
+    /// 回归背景：Auto 曾按「工具名 + 完整输入」记，`git log --oneline` 与
+    /// `git log -p` 必然不同键，长任务里每条命令都要付一次分类器往返。
+    #[test]
+    fn auto_call_shape_groups_shell_families_but_keeps_unsafe_calls_exact() {
+        let shape =
+            |command: &str| auto_call_shape("Bash", &serde_json::json!({ "command": command }));
+
+        // 同族：flag 差异不参与分族，这正是放宽要拿到的收益。
+        assert_eq!(shape("git log --oneline"), shape("git log -p --since=x"));
+        assert_eq!(
+            shape("cargo test"),
+            shape("cargo test --lib -- --nocapture")
+        );
+        assert_eq!(
+            shape("git status"),
+            Some("Bash\u{1f}shape:git status".to_string())
+        );
+
+        // 二级子命令是风险所在，必须区分（None = 回退精确指纹，天然不撞）。
+        assert!(shape("npm run build").is_none());
+        assert!(shape("npm run deploy").is_none());
+        assert!(shape("pip install requests").is_none());
+
+        // 没有可复用的子命令语义：argv[1] 是 flag，或压根只有程序名。
+        assert!(shape("rm -rf build").is_none());
+        assert!(shape("ls").is_none());
+
+        // 元字符 / 引号 / 路径分隔符：参数里藏路径的绝不能归族。
+        assert!(shape("sed -i s/a/b/ notes.md").is_none());
+        assert!(shape("cat /etc/passwd").is_none());
+        assert!(shape("cat ~/.ssh/id_rsa").is_none());
+        assert!(shape("cargo build && cargo test").is_none());
+        assert!(shape("rg pattern crates/core").is_none());
+
+        // 其余工具不放宽：写内容天然每次不同，按路径归族等于让同一文件第二遍免审。
+        assert!(auto_call_shape(
+            "Write",
+            &serde_json::json!({"file_path": "notes.md", "content": "x"})
+        )
+        .is_none());
     }
 
     /// 5 条历史里有 3 条同 (name, hash) 视为循环。

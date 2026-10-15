@@ -43,7 +43,7 @@ enabled = true                # 模型分类器总开关。false = 只保留本�
                                 # 拿不准的操作一律逐次弹窗（保守模式）。
 classifier_profile = ""       # 分类器用哪个调用分组。留空 = 复用当前激活分组；
                                 # 填分组名 = 用它单独跑（适合配便宜的小模型降本）
-timeout_secs = 30             # 单次分类器请求超时。超时按 fail-closed 判拒绝。
+timeout_secs = 30             # 单次分类器请求超时。超时后重试一次，仍失败则交回人工。
                                 # 默认 30：adaptive thinking 端点光思考就要好几秒
 max_consecutive_blocks = 3    # 连续被拦达到该次数 → 自动降级为逐次人工确认
 max_total_blocks = 20         # 整个会话累计被拦达到该次数 → 同样降级
@@ -141,8 +141,8 @@ wyj-code 的**默认起始模式**是 `auto`，对齐 Claude Code v2.1.283+ 的�
 2. **确定性 allow**——工作目录内的文件写、只读 shell 命令、构建/测试命令、lockfile 依赖安装，本地判定，零延迟零成本；
 3. **确定性 hard_deny**——`curl|bash`、`rm -rf ~`、`git push --force`、`git reset --hard`、`terraform destroy`、`sudo <program>`、凭据路径、启动无审批的 agent 循环等，本地判定，**不发模型请求**；
 4. **模型分类器**——前两步都没结论时才付一次模型往返，让它按 `soft_deny` / `allow` / `environment` 规则判断「这一步是否在用户请求范围内」。优先级 `hard_deny → soft_deny → allow → 用户显式意图`。
-5. **fail-closed**——分类器超时 / 返回非法内容 / 空响应，一律判拒绝。只有 `enabled = false`（用户主动选的保守模式）才交回人工弹窗。
-6. **降级**——连续 3 次或累计 20 次被拦，自动退回逐次人工确认并提示；Shift+Tab 可随时切回。
+5. **重试后交回人工**——分类器超时 / 返回非法内容 / 空响应（常见成因是 `stop_reason=MaxTokens` 把输出预算吃光）会先用「加格式提醒 + 输出预算翻倍」的输入重试一次；两次都拿不到判定就交回人工弹窗，**不消耗**降级计数——模型压根没表达过否决意图，计成拦截会让闸门白白退回逐次确认。安全侧没有松：无交互面（headless / 子 Agent）上人工确认本身就是 fail-closed，行为与直接拒绝一致。
+6. **降级**——连续 3 次或累计 20 次**被判定拒绝**（不含「交回人工」），自动退回逐次人工确认并提示；Shift+Tab 可随时切回。
 
 四种模式用 `--permission-mode auto|manual|plan|bypass` 或 TUI 的 Shift+Tab 切换（`default` 是 `manual` 的别名）；`--plan` / `--bypass-permissions` 是前两者的便捷写法。**auto 不要求交互面**，因此 `-p` / headless / 定时任务同样可用——这正是它相对「逐次弹窗」唯一而决定性的优势。
 
@@ -151,7 +151,8 @@ wyj-code 的**默认起始模式**是 `auto`，对齐 Claude Code v2.1.283+ 的�
 两个容易踩的点：
 
 - **分类器与主会话共用同一 Provider 时，它的 token 计在主会话的 `total_*` 里**。想彻底隔离，配一个独立的 `classifier_profile`（配便宜的小模型通常足够）。
-- **「本轮已放行」的记忆粒度在两种模式下不同**：manual 按工具名（批准一次 Bash，本轮不再问），auto 按 `工具名 + 输入`（只免审**完全相同**的调用）。这是刻意的——否则审过一次 `npm test` 就会让本轮所有 `npm run deploy` 一起免审。
+- **「本轮已放行」的记忆粒度在两种模式下不同**：manual 按工具名（批准一次 Bash，本轮不再问），auto 按**命令族**——`<程序> <子命令>` 相同就复用授权，flag 差异不参与分族（`git log --oneline` 与 `git log -p` 同族）。三类命令一律回退到「工具名 + 完整输入」的精确指纹：命令里带元字符/引号/路径分隔符、argv[1] 是 flag、或出现第二个位置参数（`npm run build` 与 `npm run deploy`、`pip install a` 与 `pip install b`）。这是刻意的——否则审过一次 `npm test` 就会让本轮所有 `npm run deploy` 一起免审。
+- **子 Agent 继承同一个闸门实例**（含降级计数），所以子 Agent 的副作用工具也由分类器判定，而不是退回逐次弹窗。headless / 后端子 Agent 没有审批 UI，分类器判定交回人工时会 fail-closed 拒掉该次调用。
 
 ### 项目规约文件回退链
 
