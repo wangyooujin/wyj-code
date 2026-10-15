@@ -26,6 +26,14 @@ pub struct ExecutionWorkspaceRequest {
     pub base_revision: String,
     pub parent_checkpoint_id: Option<String>,
     pub purpose: String,
+    /// 在该分支上 checkout worktree；`None` 则保持原有行为（`--detach` 游离 HEAD）。
+    ///
+    /// 「每实例一个分支」才是 worktree 在并行开发里的主用法：产出能直接 push /
+    /// PR，汇合走 git merge 而不是手工挑文件逐个 copy。而 detached HEAD 下
+    /// `git branch --show-current` 返回空串，会让注入给模型的 git 快照（`prompts`）
+    /// 变成 `"Current branch: "`。默认仍是 detach，避免改变既有 workflow 行为。
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +44,9 @@ pub struct ExecutionWorkspace {
     pub base_revision: String,
     pub parent_checkpoint_id: Option<String>,
     pub disposable: bool,
+    /// worktree 实际 checkout 的分支名；`--detach` 时为 `None`。
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
