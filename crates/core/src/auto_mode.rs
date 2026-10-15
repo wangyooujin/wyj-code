@@ -241,6 +241,17 @@ impl AutoGateImpl {
         }
     }
 
+    /// 判定结果的统一落地：放行清零连续计数（用户目标里点名批准过的动作被模型确认
+    /// 安全，不该让计数继续往上累），拒绝才计入降级预算，交回人工两者都不计。
+    fn apply_verdict(&self, verdict: AutoVerdict) -> AutoVerdict {
+        match &verdict {
+            AutoVerdict::Allow => self.note_human_approval(),
+            AutoVerdict::Deny { .. } => self.note_block(),
+            AutoVerdict::AskUser { .. } => {}
+        }
+        verdict
+    }
+
     /// 确定性放行判定：命中返回 `Some(依据)`，未命中返回 `None`。
     ///
     /// 覆盖三类：工作目录内的文件写、只读/构建/依赖安装类 shell 命令。
@@ -311,7 +322,10 @@ impl AutoGateImpl {
         clip(&out, RULES_LIMIT)
     }
 
-    fn build_prompt(&self, request: &AutoReviewRequest) -> String {
+    /// `retry` 为真时追加一条格式提醒。分类器对同一份输入是确定性的，原样重发
+    /// 大概率复现同一个坏输出；必须让第二次请求的输入**真的不同**（多一句
+    /// "只吐 JSON"），重试才可能翻盘。
+    fn build_prompt(&self, request: &AutoReviewRequest, retry: bool) -> String {
         let goal = self.user_goal.lock().map(|g| g.clone()).unwrap_or_default();
         let goal = if goal.is_empty() {
             "(unknown)"
@@ -326,11 +340,29 @@ impl AutoGateImpl {
         out.push('\n');
         out.push_str(&clip(&request.action_summary, ACTION_SUMMARY_LIMIT));
         out.push_str("\n</action>\n");
+        if retry {
+            out.push_str(
+                "\n<format_note>The previous attempt returned no parseable JSON. \
+                 Reply with the single JSON object and nothing else: \
+                 no reasoning, no code fence, no preamble.\n",
+            );
+        }
         out.push_str(&self.rules_prompt());
         out
     }
 
     async fn call_classifier(&self, request: &AutoReviewRequest) -> Result<AutoVerdict, String> {
+        self.call_classifier_attempt(request, false).await
+    }
+
+    /// 一次分类器请求。`retry` 同时放大输出预算：空响应最常见的成因就是
+    /// `stop_reason=MaxTokens`（思考吃掉预算、可见文本为空），第一次用
+    /// `CLASSIFIER_MAX_TOKENS`，第二次翻倍给内容留出余地。
+    async fn call_classifier_attempt(
+        &self,
+        request: &AutoReviewRequest,
+        retry: bool,
+    ) -> Result<AutoVerdict, String> {
         let provider = self
             .classifier
             .as_ref()
@@ -338,11 +370,16 @@ impl AutoGateImpl {
         let messages = vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: self.build_prompt(request),
+                text: self.build_prompt(request, retry),
             }],
         }];
         let system = SystemPrompt::stable_only(crate::prompts::AUTO_CLASSIFIER);
-        let options = RequestOptions::text_only(CLASSIFIER_MAX_TOKENS);
+        let max_tokens = if retry {
+            CLASSIFIER_MAX_TOKENS * 2
+        } else {
+            CLASSIFIER_MAX_TOKENS
+        };
+        let options = RequestOptions::text_only(max_tokens);
         let call = provider.complete(&system, &messages, &[], &options);
         let result = tokio::time::timeout(self.config.timeout, call)
             .await
@@ -406,25 +443,31 @@ impl AutoGate for AutoGateImpl {
         }
 
         match self.call_classifier(request).await {
-            Ok(AutoVerdict::Allow) => {
-                // 放行也要清零连续计数：用户目标里点名批准过的动作被模型确认安全，
-                // 不该让计数继续往上累。
-                self.note_human_approval();
-                AutoVerdict::Allow
-            }
-            Ok(AutoVerdict::Deny { rule, reason }) => {
-                self.note_block();
-                AutoVerdict::Deny { rule, reason }
-            }
-            Ok(AutoVerdict::AskUser { reason }) => AutoVerdict::AskUser { reason },
-            // fail-closed：拿不到判定就当没通过，绝不静默放行。
-            Err(reason) => {
-                self.note_block();
-                AutoVerdict::Deny {
-                    rule: "classifier_unavailable".to_string(),
-                    reason,
+            Ok(verdict) => self.apply_verdict(verdict),
+            // 第一次拿不到判定：换个（加提示、加预算的）输入重试一次。
+            Err(_) => match self.call_classifier_attempt(request, true).await {
+                Ok(verdict) => {
+                    tracing::info!("分类器首次调用失败，重试后拿到判定");
+                    self.apply_verdict(verdict)
                 }
-            }
+                // 两次都拿不到判定 → **交回人工**，而不是直接拒绝。
+                //
+                // 这是本项目里 fail-closed 唯一一处刻意的例外：闸门的判定主体是模型，
+                // 模型没答上来时，"拒绝"与"人工确认"对用户的差别只是多按一次 y，却让
+                // 一次端点抖动（空响应 / MaxTokens）变成一次操作失败——实测 auto 模式
+                // 的拒绝里空响应占了一大片。它也**不该消耗降级预算**（`note_block`）：
+                // 模型从未表达否决意图，计成"连续拦截"会让闸门白白退回 manual。
+                //
+                // 安全侧没有松：AskUser 最终落到 `ToolCtx::confirm_tool`，无交互面
+                // （headless / 子 Agent）时它 fail-closed，行为与旧的直接拒绝一致，
+                // 不存在静默放行的口子。
+                Err(reason) => {
+                    tracing::warn!(%reason, "分类器两次都不可用，交回人工确认");
+                    AutoVerdict::AskUser {
+                        reason: format!("自动判定不可用，已交回人工确认（{reason}）"),
+                    }
+                }
+            },
         }
     }
 
@@ -568,20 +611,51 @@ mod tests {
     };
 
     /// 假分类器：按工具摘要里的标记返回预设结果，或直接失败。
+    ///
+    /// `alt_reply` 只在第二次及以后的调用生效，用来模拟"第一次吐了坏输出、
+    /// 重试才给正经判定"这种真实端点抖动。
     struct FakeProvider {
         reply: Option<String>,
+        alt_reply: Option<String>,
         fail: bool,
         delay: Duration,
         calls: AtomicU32,
+        seen_max_tokens: Mutex<Vec<u32>>,
     }
 
     impl FakeProvider {
         fn allow() -> Arc<Self> {
             Arc::new(Self {
                 reply: Some(r#"{"verdict":"allow","rule":"","reason":"in scope"}"#.into()),
+                alt_reply: None,
                 fail: false,
                 delay: Duration::ZERO,
                 calls: AtomicU32::new(0),
+                seen_max_tokens: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// 第一次返回空文本（等价于 `stop_reason=MaxTokens` + 可见文本为空），
+        /// 第二次返回给定回复。
+        fn empty_then(reply: &str) -> Arc<Self> {
+            Arc::new(Self {
+                reply: None,
+                alt_reply: Some(reply.to_string()),
+                fail: false,
+                delay: Duration::ZERO,
+                calls: AtomicU32::new(0),
+                seen_max_tokens: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn delayed(reply: &str, delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                reply: Some(reply.to_string()),
+                alt_reply: None,
+                fail: false,
+                delay,
+                calls: AtomicU32::new(0),
+                seen_max_tokens: Mutex::new(Vec::new()),
             })
         }
 
@@ -590,18 +664,22 @@ mod tests {
                 reply: Some(format!(
                     r#"{{"verdict":"deny","rule":"soft_deny","reason":"{reason}"}}"#
                 )),
+                alt_reply: None,
                 fail: false,
                 delay: Duration::ZERO,
                 calls: AtomicU32::new(0),
+                seen_max_tokens: Mutex::new(Vec::new()),
             })
         }
 
         fn broken() -> Arc<Self> {
             Arc::new(Self {
                 reply: None,
+                alt_reply: None,
                 fail: true,
                 delay: Duration::ZERO,
                 calls: AtomicU32::new(0),
+                seen_max_tokens: Mutex::new(Vec::new()),
             })
         }
     }
@@ -613,13 +691,24 @@ mod tests {
             _system: &SystemPrompt<'_>,
             _messages: &[Message],
             _tools: &[ToolDefinition],
-            _options: &RequestOptions,
+            options: &RequestOptions,
         ) -> anyhow::Result<CompletionResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut seen) = self.seen_max_tokens.lock() {
+                seen.push(options.max_tokens);
+            }
             if self.fail {
                 anyhow::bail!("boom");
             }
-            let text = self.reply.clone().unwrap_or_default();
+            // alt_reply 只在重试（第二次及以后）生效；没给就照常重复第一次的回复。
+            let retry_reply = if self.calls.load(Ordering::SeqCst) > 1 {
+                self.alt_reply.clone()
+            } else {
+                None
+            };
+            let text = retry_reply
+                .or_else(|| self.reply.clone())
+                .unwrap_or_default();
             tokio::time::sleep(self.delay).await;
             Ok(CompletionResult {
                 content: vec![ContentBlock::Text { text }],
@@ -665,10 +754,12 @@ mod tests {
         // 拒绝关闭（thinking.type=disabled 会被 400 拒），256 会被思考吃光 →
         // stop_reason=MaxTokens + 可见文本为空 → fail-closed → 命令被随机拒绝。
         // 实测思考量 1105–2395 字符，下限取 2048。
-        assert!(
-            CLASSIFIER_MAX_TOKENS >= 2048,
-            "分类器预算不能低于 2048，否则 thinking 端点上会被思考吃空"
-        );
+        const {
+            assert!(
+                CLASSIFIER_MAX_TOKENS >= 2048,
+                "分类器预算不能低于 2048，否则 thinking 端点上会被思考吃空"
+            )
+        };
     }
 
     #[test]
@@ -759,31 +850,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classifier_failure_fails_closed() {
-        let gate = gate_with(AutoGateConfig::default(), Some(FakeProvider::broken()));
+    async fn classifier_failure_retries_then_falls_back_to_human() {
+        // 回归：曾经两次都是硬拒（Deny{classifier_unavailable}），一次端点抖动
+        // 就算"连续拦截"，几次抖动就把闸门打到 degraded 退回 manual。
+        let provider = FakeProvider::broken();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
         match gate.review(&bash_request("npm run deploy:staging")).await {
-            AutoVerdict::Deny { rule, .. } => assert_eq!(rule, "classifier_unavailable"),
-            other => panic!("分类器失败必须 fail-closed，实际 {other:?}"),
+            AutoVerdict::AskUser { reason } => {
+                assert!(reason.contains("自动判定不可用"), "实际 {reason}");
+            }
+            other => panic!("分类器两次都失败应交回人工，实际 {other:?}"),
         }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2, "应当重试一次");
+        assert_eq!(
+            gate.counters().total,
+            0,
+            "模型没给出判定不算拦截，不该消耗降级预算"
+        );
+        assert!(!gate.should_degrade());
     }
 
     #[tokio::test]
-    async fn classifier_timeout_fails_closed() {
-        let provider = Arc::new(FakeProvider {
-            reply: Some(r#"{"verdict":"allow"}"#.into()),
-            fail: false,
-            delay: Duration::from_millis(200),
-            calls: AtomicU32::new(0),
-        });
+    async fn empty_classifier_response_is_retried_and_can_recover() {
+        // 最常见的坏输出形态：stop_reason=MaxTokens + 可见文本为空。
+        let provider = FakeProvider::empty_then(r#"{"verdict":"allow","rule":"","reason":"ok"}"#);
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        assert_eq!(
+            gate.review(&bash_request("npm run deploy:staging")).await,
+            AutoVerdict::Allow,
+            "重试拿到判定就不该拒绝"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let seen = provider.seen_max_tokens.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], CLASSIFIER_MAX_TOKENS);
+        assert_eq!(
+            seen[1],
+            CLASSIFIER_MAX_TOKENS * 2,
+            "重试必须放大输出预算，否则 MaxTokens 会原样复现"
+        );
+    }
+
+    #[tokio::test]
+    async fn classifier_timeout_falls_back_to_human() {
+        let provider = FakeProvider::delayed(r#"{"verdict":"allow"}"#, Duration::from_millis(200));
         let config = AutoGateConfig {
             timeout: Duration::from_millis(20),
             ..Default::default()
         };
-        let gate = gate_with(config, Some(provider));
+        let gate = gate_with(config, Some(provider.clone()));
         assert!(matches!(
             gate.review(&bash_request("npm run deploy:staging")).await,
-            AutoVerdict::Deny { .. }
+            AutoVerdict::AskUser { .. }
         ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

@@ -188,6 +188,43 @@ pub(crate) fn def_can_touch_side_effects(def: &AgentDefinition) -> bool {
     }
 }
 
+/// 装配子 Agent 的 `ToolCtx`。
+///
+/// 三个必须往下传的东西：补充消息队列（让嵌套子 Agent 也能被中途插话）、用量
+/// 累加器（嵌套开销能回到根会话）、以及 **Auto 判定闸门**。
+///
+/// 闸门这条是 Auto 模式的命门：[`derive_sub_agent_permission_mode`] 让 Auto 原样
+/// 继承给子 Agent，判定主体因此从「人」换成「闸门」。子 Agent 恒无 `ui_ask_tx`，
+/// 一旦这里漏传，`Agent::ensure_tool_permission` 就会退到「逐次人工确认」，再在
+/// `ToolCtx::confirm_tool` 上 fail-closed —— 结果是子 Agent 的 Bash/Write/Edit
+/// 100% 被拒，而 Manual 下这些走 `AutoApprove` 反而全放行，比父级更严，
+/// 与 `ToolCtx::fork_for_surface` 里「闸门要继承」的既有语义也自相矛盾。
+fn sub_tool_ctx(
+    cwd: &std::path::Path,
+    auto_gate: Option<Arc<dyn wyj_core::auto_mode::AutoGate>>,
+    steer: Option<Arc<wyj_core::SteerQueue>>,
+    sub_usage_sink: Option<wyj_core::session::SharedSubUsage>,
+    parent_mode: Option<wyj_core::permission::PermissionMode>,
+    allowed: Option<std::collections::HashSet<String>>,
+    parent_is_plan: bool,
+) -> crate::ctx::ToolCtx {
+    let mut sub_ctx = crate::ctx::ToolCtx::new(cwd);
+    sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+    sub_ctx.steer_queue = steer;
+    sub_ctx.sub_usage = sub_usage_sink;
+    sub_ctx.auto_gate = auto_gate;
+    // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制的后门；
+    // 类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
+    // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此 `ToolCtx::new`
+    // 内部就构造了独立的共享句柄（而非复用父 ctx 的 Arc），避免父子间意外共享可变状态。
+    sub_ctx.set_permission_mode(derive_sub_agent_permission_mode(
+        parent_mode,
+        allowed,
+        parent_is_plan,
+    ));
+    sub_ctx
+}
+
 /// 派生子 Agent 时，忠实继承父级的权限模式。
 ///
 /// 旧实现只看 `ctx.allowed_tools()`，而它对 `Prompt` / `AutoApprove` 一律返回
@@ -543,6 +580,10 @@ impl SubAgentTool {
         // 因此嵌套子 Agent 的开销同样能汇总到根（不会双计，见 ToolCtx::sub_usage）。
         let sub_usage_sink: Option<wyj_core::session::SharedSubUsage> =
             ctx.sub_usage_sink().cloned();
+        // Auto 判定闸门同样必须先取成 'static 的 Arc 才能 move 进 spawn。
+        // 漏掉它的后果见 `sub_tool_ctx`：Auto 模式下子 Agent 会退化成「无闸门 + 无审批
+        // UI」，副作用工具全被拒。
+        let auto_gate = ctx.auto_gate().cloned();
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -558,21 +599,15 @@ impl SubAgentTool {
             let mut session = Session::new();
             let mut next_input = Some(vec![ContentBlock::Text { text: prompt }]);
 
-            let mut sub_ctx = crate::ctx::ToolCtx::new(&cwd);
-            sub_ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
-            // 同一份队列往下传：嵌套子 Agent 也能被中途补充
-            sub_ctx.steer_queue = steer.clone();
-            // 累加器同样往下传，让嵌套子 Agent 的开销也能回到根会话。
-            sub_ctx.sub_usage = sub_usage_sink.clone();
-            // 继承父级的工具白名单限制（如 Plan 模式），避免子 Agent 成为绕过限制
-            // 的后门；类型定义自身的工具限制已在 factory 注册工具时收窄，交集生效。
-            // 子 Agent 没有审批 UI，不存在运行中被外部改权限的场景，因此构造一个
-            // 独立的共享句柄（而非复用父 ctx 的 Arc）即可，避免父子间意外共享可变状态。
-            sub_ctx.set_permission_mode(derive_sub_agent_permission_mode(
+            let sub_ctx = sub_tool_ctx(
+                &cwd,
+                auto_gate,
+                steer.clone(),
+                sub_usage_sink.clone(),
                 parent_mode,
                 allowed,
                 parent_is_plan,
-            ));
+            );
 
             let mut outputs = Vec::new();
             let mut is_error = false;
@@ -743,6 +778,39 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wyj_api::provider::{EventStream, Provider};
     use wyj_api::types::{Message, StopReason, StreamEvent};
+
+    #[test]
+    fn sub_agent_ctx_inherits_auto_gate() {
+        // 回归：子 Agent 的 ctx 曾漏挂 auto_gate，而 Auto 模式又原样继承给子 Agent
+        // （见 derive_sub_agent_permission_mode）。于是 ensure_tool_permission 退到
+        // 「逐次人工确认」，子 Agent 又恒无 ui_ask_tx → fail-closed → 它的
+        // Bash/Write/Edit 100% 被拒，而 Manual 下这些走 AutoApprove 反而全放行。
+        use wyj_core::auto_mode::{AutoGate, AutoGateImpl};
+
+        let gate: Arc<dyn AutoGate> = Arc::new(AutoGateImpl::new(Default::default(), None));
+        let cwd = std::path::Path::new("/tmp");
+        let mut parent = crate::ctx::ToolCtx::new(cwd);
+        parent.auto_gate = Some(gate);
+
+        // 调用点做的事：spawn 之前从父 ctx 取成 owned，再传给子 ctx 装配。
+        let sub = sub_tool_ctx(
+            cwd,
+            parent.auto_gate().cloned(),
+            None,
+            None,
+            Some(wyj_core::permission::PermissionMode::Auto),
+            None,
+            false,
+        );
+        assert!(
+            sub.auto_gate.is_some(),
+            "Auto 模式下的子 Agent 必须带上判定闸门，否则副作用工具全被拒"
+        );
+        assert!(matches!(
+            sub.permission_mode(),
+            Some(crate::ctx::PermissionMode::Auto)
+        ));
+    }
 
     #[test]
     fn definition_schema_accepts_missing_description() {
