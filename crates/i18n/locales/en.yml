@@ -124,6 +124,8 @@ agent:
   compacted: "\n[Auto-compacted · #{times} · dropped {removed} older messages · kept the last {kept} verbatim · freed about {saved} tokens]\n"
   turn_task_lost: "The turn task terminated abnormally (internal error or forced abort); this turn was stopped. You can keep typing."
   turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
+  dangling_tool_uses_repaired: "\n[Repaired {count} tool call(s) left without a result by an earlier interruption — they were never executed]\n"
+  empty_completion: "\n[Empty response from the model (no text, no tool call). This usually means the endpoint rejected the request — try again, or `/clear` to start a new session if it keeps happening.]\n"
 
 session:
   busy_notice: "The previous turn is still running — wait for it to finish before doing that."

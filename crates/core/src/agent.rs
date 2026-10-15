@@ -1345,6 +1345,27 @@ impl Agent {
                 );
             }
 
+            // 补齐悬空 `tool_use`（详见 `Session::repair_dangling_tool_uses`
+            // 的事故说明）：请求末尾若是「assistant(tool_use) → user(没有
+            // tool_result)」，端点会回一个 200 的空流，回合于是**静默**结束
+            // ——用户表现为「输入继续没反应」，且每条后续消息都复发。
+            //
+            // 放在工具轮循环的开头而不是加载历史时：`--resume` 与「同一会话内
+            // ESC 中断」两条产生毒化历史的路径都在这个收口后面，而这里改的
+            // 就是 `session.messages` 本身，顺带让下一次落盘不再把毒化状态
+            // 写回磁盘——用户 `/rewind` 之外的自愈路径也就有了。
+            let repaired = session.repair_dangling_tool_uses();
+            if repaired > 0 {
+                tracing::warn!(
+                    repaired,
+                    "补齐了没有结果的 tool_use：会话历史停在工具调用中间（中断后 resume 的典型形态）"
+                );
+                on_text(&wyj_i18n::tr_fmt(
+                    "agent.dangling_tool_uses_repaired",
+                    &[("count", &repaired.to_string())],
+                ));
+            }
+
             // 流式消费，带中断重试：流已消费一半时断开（网络重置、供应商
             // overloaded 流内错误等），丢弃本次全部半成品缓冲、整轮重新生成。
             // 不变量：半成品 assistant 消息绝不 push 进 session（流完整结束
@@ -2066,6 +2087,11 @@ impl Agent {
                     "模型返回的工具数超过能力声明，降级为受控执行"
                 );
             }
+            // 空响应不等于正常结束：上游对协议不合法的请求可能回 200 + 空流
+            // （见 `Session::repair_dangling_tool_uses` 的事故说明），把它
+            // 当成功就表现为「说了话就没反应」且无从排查。先把事实记下来，
+            // 由回合收尾处决定要不要惊动用户。
+            let empty_completion = assistant_blocks.is_empty();
             session.push_assistant(assistant_blocks);
 
             let has_tool_calls = stop_reason == StopReason::ToolUse && !pending_tools.is_empty();
@@ -2345,6 +2371,18 @@ impl Agent {
                         }
                         _ => {}
                     }
+                }
+            }
+
+            if !has_tool_calls && !got_injection {
+                // 空响应：200 + 空流被当成了正常结束。必须让用户看见——否则
+                // 「模型一句话不说」和「请求根本没发出去」在界面上完全同形，
+                // 而后者（协议不合法 / 上游故障）是可以重试解决的。
+                if empty_completion {
+                    tracing::warn!(
+                        "模型返回了空响应（无文本、无 thinking、无 tool_use），回合按成功收尾"
+                    );
+                    on_text(&wyj_i18n::tr("agent.empty_completion"));
                 }
             }
 
@@ -3093,7 +3131,7 @@ mod tests {
         assert_eq!(soft_threshold_tokens(1_000_000, Some(&negative)), u32::MAX);
     }
     use wyj_api::provider::EventStream;
-    use wyj_api::types::{Message, StopReason, ToolResultContent};
+    use wyj_api::types::{ContentBlock, Message, Role, StopReason, ToolResultContent};
 
     struct FakeCtx;
     #[async_trait::async_trait]
@@ -3740,6 +3778,76 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    /// 记录每次请求收到的历史，用于验证「请求发出前」历史已被修复
+    struct RecordingProvider {
+        seen: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 回归：长任务被中断后 `--resume`，输入任何一条消息都不能再把
+    /// 「assistant(tool_use) → user(无 tool_result)」发出去。端点对这种请求
+    /// 回 200 + 空流，回合静默结束，用户表现为「说了继续没反应」，且每条
+    /// 后续消息都复发。钉子：请求历史末尾必须已配对。
+    #[tokio::test]
+    async fn dangling_tool_use_is_repaired_before_the_request_is_sent() {
+        let provider = Arc::new(RecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let agent = Agent::new(provider.clone());
+        let mut session = Session::new();
+        session.push_user("跑一下 git status");
+        session.push_assistant(vec![
+            ContentBlock::Text { text: "好".into() },
+            ContentBlock::ToolUse {
+                id: "toolu_1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({ "command": "git status --short" }),
+            },
+        ]);
+        // 落盘半截历史后重新载入，用户补一句「继续」——正是复现路径。
+        session.push_user("继续");
+
+        let mut visible = String::new();
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+            .await
+            .expect("回合不应报错");
+
+        let seen = provider.seen.lock().unwrap();
+        let request = seen.first().expect("provider 至少被调用一次");
+        let tail = request.last().expect("请求历史非空");
+        assert!(matches!(tail.role, Role::User));
+        assert!(
+            tail.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { tool_use_id, is_error: true, .. } if tool_use_id == "toolu_1"
+            )),
+            "发出的请求末尾必须带上 toolu_1 的合成 tool_result，否则端点回空流：{tail:?}"
+        );
+        assert!(
+            !visible.is_empty(),
+            "补齐动作必须对用户可见，否则仍是「没反应」的体感"
+        );
     }
 
     /// 可并发的 mock 工具：睡 ms 毫秒后返回 tag
