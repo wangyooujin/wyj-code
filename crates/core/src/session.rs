@@ -1,9 +1,10 @@
 //! 会话状态：消息历史 + 累计用量
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use wyj_api::types::{ContentBlock, Message, Role};
+use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
 
 /// 子 Agent 的用量快照（不含缓存写入时为 0）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -296,6 +297,89 @@ impl Session {
         self.total_cache_write_tokens += cache_write;
     }
 
+    /// 补齐「停在工具调用中间」的悬空 `tool_use`，返回补了几条。
+    ///
+    /// 事故背景（`--resume` 后输入「继续」毫无反应，每条消息都复发）：
+    /// 长任务被 ESC / 关进程打断时，assistant 消息已经带着 `tool_use` 进入
+    /// 历史，工具结果却还没写回；退出时 `SessionStore::save` 把这份半截历史
+    /// 原样落盘。resume 载入后，用户发的任何一条消息都会让请求的**末尾**变成
+    /// 「assistant(tool_use) → user(没有 tool_result)」。Anthropic 兼容端点对
+    /// 这种请求既不报错也不重试，而是回一个 HTTP 200、内容为空的 SSE 流
+    /// （实测 MiniMax M3.1：`message_start content=[]` → `message_delta
+    /// stop_reason=""` → `message_stop`）。客户端于是把空响应当成正常回复结束
+    /// 回合——没有文本、没有报错、spinner 直接停——而那条空 assistant 消息
+    /// 还会再次落盘，会话从此永久中毒。
+    ///
+    /// 只修**最后一条 assistant 消息**里的悬空调用，这是实测划出的边界：
+    /// 同一个请求体里，悬空 `tool_use` 出现在历史中段（后面还有完整的
+    /// user/assistant 往返）时端点照常返回正常内容。而 context editing 会把
+    /// 旧 `tool_result` 外部化成占位文本——若按「全历史扫描未配对」来补，
+    /// 会给这些已外部化的旧调用凭空造出结果，污染历史。
+    ///
+    /// 合成结果插在末尾那条 user 消息的**最前面**：协议要求 `tool_result` 位于
+    /// 紧跟其后的 user 消息里，且与工具执行路径（`push_tool_result` →
+    /// `push_user_blocks_merged`）的形态一致。末尾不是 user 消息时（压缩、
+    /// 子 Agent 收尾等边界）另起一条 user 消息承载，保证角色严格交替。
+    ///
+    /// 幂等：没有悬空调用时返回 0 且不改历史，因此可以在每次请求前无条件调。
+    pub fn repair_dangling_tool_uses(&mut self) -> usize {
+        let Some(last_assistant) = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(message.role, Role::Assistant))
+        else {
+            return 0;
+        };
+        let answered: HashSet<&str> = self.messages[last_assistant + 1..]
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let dangling: Vec<(String, String)> = self.messages[last_assistant]
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, .. } if !answered.contains(id.as_str()) => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if dangling.is_empty() {
+            return 0;
+        }
+        let repaired = dangling.len();
+        let results: Vec<ContentBlock> = dangling
+            .into_iter()
+            .map(|(id, name)| ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: ToolResultContent::Text(
+                    serde_json::json!({
+                        "error": "tool_call_interrupted",
+                        "tool": name,
+                        "instruction": "This call was interrupted before it produced a \
+                                        result. Nothing was executed. Retry it, or proceed \
+                                        without it.",
+                    })
+                    .to_string(),
+                ),
+                is_error: true,
+            })
+            .collect();
+        match self.messages.last_mut() {
+            Some(last) if matches!(last.role, Role::User) => {
+                let mut content = results;
+                content.append(&mut last.content);
+                last.content = content;
+            }
+            _ => self.push_user_with_blocks(results),
+        }
+        repaired
+    }
+
     /// 把子 Agent 累加器里已记录的用量搬进本会话的 `sub_*` 字段。
     ///
     /// 由 `Agent::run_turn` 在**每批工具执行后**调用一次（子 Agent 可能
@@ -357,6 +441,114 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── 悬空 tool_use 补齐 ────────────────────────────────────────────────
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({ "command": "git status --short" }),
+        }
+    }
+
+    fn dangling_tail() -> Session {
+        // resume 一个「长任务被 ESC 打断」后的会话：末尾 assistant 带着
+        // tool_use，工具结果从未写回，随后用户发来「继续」。
+        let mut session = Session::new();
+        session.push_user("跑一下 git status");
+        session.push_assistant(vec![
+            ContentBlock::Text {
+                text: "好".to_string(),
+            },
+            tool_use("toolu_1"),
+        ]);
+        session.push_user("继续");
+        session
+    }
+
+    #[test]
+    fn dangling_tool_use_gets_a_synthetic_result() {
+        let mut session = dangling_tail();
+        assert_eq!(session.repair_dangling_tool_uses(), 1);
+
+        let tail = session.messages.last().unwrap();
+        assert!(matches!(tail.role, Role::User));
+        assert!(
+            matches!(&tail.content[0], ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                if tool_use_id == "toolu_1"),
+            "合成结果必须是 user 消息里的第一个块，且标记为错误"
+        );
+        assert!(
+            matches!(&tail.content[1], ContentBlock::Text { text } if text == "继续"),
+            "用户原文必须仍留在合成结果之后"
+        );
+    }
+
+    #[test]
+    fn repair_is_idempotent_and_leaves_clean_history_untouched() {
+        let mut session = dangling_tail();
+        assert_eq!(session.repair_dangling_tool_uses(), 1);
+        let after_first = session.messages.len();
+        assert_eq!(
+            session.repair_dangling_tool_uses(),
+            0,
+            "已配对的历史不得被二次修补"
+        );
+        assert_eq!(session.messages.len(), after_first);
+    }
+
+    #[test]
+    fn answered_tool_use_is_never_touched() {
+        let mut session = Session::new();
+        session.push_user("跑一下 git status");
+        session.push_assistant(vec![tool_use("toolu_1")]);
+        session.push_tool_result(
+            "toolu_1".to_string(),
+            ToolResultContent::Text("done".into()),
+            false,
+        );
+        session.push_user("继续");
+        assert_eq!(session.repair_dangling_tool_uses(), 0);
+    }
+
+    #[test]
+    fn dangling_tool_use_in_the_middle_is_left_alone() {
+        // 端点对历史中段的未配对 tool_use 是容忍的（实测），且 context editing
+        // 会把旧 tool_result 外部化成占位文本——按「全历史扫描未配对」去补，
+        // 会给这些旧调用凭空造结果、污染历史。
+        let mut session = Session::new();
+        session.push_user("a");
+        session.push_assistant(vec![tool_use("toolu_old")]);
+        session.push_user("换个命令");
+        session.push_assistant(vec![ContentBlock::Text {
+            text: "已经改好了".to_string(),
+        }]);
+        session.push_user("继续");
+        assert_eq!(session.repair_dangling_tool_uses(), 0);
+        assert_eq!(session.messages.len(), 5);
+    }
+
+    #[test]
+    fn tail_that_is_not_a_user_message_gets_its_own_result_message() {
+        // 压缩 / 子 Agent 收尾等边界上，请求末尾可能仍是 assistant 消息。
+        // 另起一条 user 消息承载结果，才能维持角色严格交替。
+        let mut session = Session::new();
+        session.push_user("跑一下");
+        session.push_assistant(vec![tool_use("toolu_1"), tool_use("toolu_2")]);
+        assert_eq!(session.repair_dangling_tool_uses(), 2);
+        let tail = session.messages.last().unwrap();
+        assert!(matches!(tail.role, Role::User));
+        assert_eq!(tail.content.len(), 2);
+    }
+
+    #[test]
+    fn history_without_assistant_message_is_a_noop() {
+        let mut session = Session::new();
+        session.push_user("只有用户消息");
+        assert_eq!(session.repair_dangling_tool_uses(), 0);
+        assert_eq!(session.messages.len(), 1);
+    }
 
     // ── 子 Agent 用量回灌 ────────────────────────────────────────────────
 
