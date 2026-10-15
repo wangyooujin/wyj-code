@@ -4,6 +4,15 @@
 //! `<sessions_dir>/<session_id>.subagents/a<id>.jsonl`。
 //! 写入收敛到一个专职后台任务（单线程串行 append），`TraceWriter::send` 只是
 //! non-blocking channel 发送；8 并发子 Agent 各自文件互不干扰、无需加锁。
+//!
+//! # 同一会话被两个进程 resume 时
+//!
+//! 子 Agent id 由**每进程** `AtomicU64` 从 1 起分配，所以两个进程都会写
+//! `a1.jsonl`。append 不会互相覆盖（内容都还在），但归属会丢——看 trace 时无从
+//! 判断某一行来自哪个实例。
+//!
+//! 不改文件名（那会破坏 `subagent-trace` 的既有解析与已落盘文件），改为**每行自带
+//! pid**：读侧按 pid 分组就能还原出「两个实例各自的 a1 到底干了什么」。
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -58,6 +67,28 @@ pub enum TraceEvent {
         is_error: bool,
         elapsed_secs: f64,
     },
+}
+
+/// 一行落盘记录 = 归属信息 + 事件本体。
+///
+/// `pid` 是**写这一行的 wyj-code 进程**。单进程场景下它恒定，读侧可以忽略；
+/// 同一会话被两个进程 resume 时，两个实例都会写 `a1.jsonl`，靠这个字段才能把
+/// 交错的两条时间线拆开。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub pid: u32,
+    pub event: TraceEvent,
+}
+
+/// 读侧用：把一行还原成 `(pid, event)`。旧版本落盘的是裸事件（没有 `pid` 包装），
+/// 此时回退为 pid = 0，让历史文件仍可解析。
+pub fn parse_record(line: &str) -> Option<(u32, TraceEvent)> {
+    if let Ok(record) = serde_json::from_str::<TraceRecord>(line) {
+        return Some((record.pid, record.event));
+    }
+    serde_json::from_str::<TraceEvent>(line)
+        .ok()
+        .map(|event| (0, event))
 }
 
 /// 截断 input JSON：保头，长度以字节计。
@@ -121,8 +152,18 @@ pub fn read_trace(path: &Path) -> std::io::Result<Vec<TraceEvent>> {
     let content = std::fs::read_to_string(path)?;
     Ok(content
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| parse_record(l).map(|(_, event)| event))
         .collect())
+}
+
+/// [`read_trace`] 的归属感知版本：每条事件带上写它的进程 pid。
+///
+/// 同一会话被两个实例 resume 时，两者都写 `a1.jsonl`——这个函数是唯一能把两条
+/// 交错的时间线拆开的读侧入口。返回按 pid 分组的结果，pid = 0 是本进程，
+/// 非 0 是别的实例（0 同时也表示旧版本落盘的、无法判定归属的历史行）。
+pub fn read_trace_by_process(path: &Path) -> std::io::Result<Vec<(u32, TraceEvent)>> {
+    let content = std::fs::read_to_string(path)?;
+    Ok(content.lines().filter_map(parse_record).collect())
 }
 
 /// 后台 trace 写手：串行处理 `(sub_agent_id, TraceEvent)` 队列，每 id 独立文件 append。
@@ -147,7 +188,10 @@ impl TraceWriter {
                 if over_limit.contains(&id) {
                     continue;
                 }
-                let Ok(mut line) = serde_json::to_string(&ev) else {
+                let Ok(mut line) = serde_json::to_string(&TraceRecord {
+                    pid: std::process::id(),
+                    event: ev,
+                }) else {
                     continue;
                 };
                 line = wyj_core::redact_sensitive_text(&line);
@@ -219,6 +263,45 @@ mod tests {
         assert!(out.ends_with('T'));
     }
 
+    /// 两个实例的 `a1` 会交错写进同一个文件，读侧必须能按 pid 把它们拆开。
+    #[test]
+    fn read_trace_by_process_separates_two_instances_writing_the_same_a1() {
+        let tmp = unique_tmp_dir("mixed-owners");
+        std::fs::create_dir_all(trace_dir(&tmp, "sess-mixed")).unwrap();
+        let path = trace_file(&tmp, "sess-mixed", 1);
+        let event = TraceEvent::Done {
+            result: "done".into(),
+            is_error: false,
+            elapsed_secs: 1.0,
+        };
+        let mut content = String::new();
+        for pid in [111, 222, 111] {
+            let line = serde_json::to_string(&TraceRecord {
+                pid,
+                event: event.clone(),
+            })
+            .unwrap();
+            content.push_str(&line);
+            content.push('\n');
+        }
+        // 掺一行旧版本格式的裸事件，读侧要能回退解析而不是整行丢弃。
+        let legacy = serde_json::to_string(&event).unwrap();
+        content.push_str(&legacy);
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let records = read_trace_by_process(&path).unwrap();
+        assert_eq!(records.len(), 4, "旧格式那行也必须读得出来");
+        assert_eq!(records[0].0, 111);
+        assert_eq!(records[1].0, 222);
+        assert_eq!(records[2].0, 111);
+        assert_eq!(records[3].0, 0, "无 pid 包装的历史行归为 0");
+        // `read_trace` 保持旧语义：只吐事件，调用方不必关心包装。
+        assert_eq!(read_trace(&path).unwrap().len(), 4);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[tokio::test]
     async fn writer_persists_events_to_jsonl() {
         let tmp = unique_tmp_dir("basic");
@@ -228,7 +311,6 @@ mod tests {
             session_id.clone(),
             DEFAULT_MAX_TRACE_FILE_BYTES,
         );
-
         writer.send(
             1,
             TraceEvent::Started {

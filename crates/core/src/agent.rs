@@ -397,6 +397,9 @@ pub struct Agent {
     /// 轮循环**不**清，否则第 2 轮又弹）。`Arc<Mutex<..>>` 与 `loop_guard` 同理：
     /// Agent 会被 clone（TUI `/model` 重建、模式切换），且并发工具调用要同时读。
     turn_permission_grants: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// 本轮用户原始请求。Auto 分类器据此判断「这一步是否在请求范围内」，
+    /// 生命周期与 `turn_permission_grants` 一致（回合入口写入、工具轮循环继承）。
+    turn_user_goal: Arc<std::sync::Mutex<String>>,
     /// CapabilityCache（可选）。Agent 在 `parameter_degraded` 撤掉端点不认的
     /// 参数重试成功后调 `record_rejection`；下次同 fingerprint
     /// `ModelCatalog::resolve_with_cache` 会让 capabilities.thinking=Unsupported。
@@ -534,6 +537,7 @@ impl Agent {
             turn_permission_grants: Arc::new(std::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            turn_user_goal: Arc::new(std::sync::Mutex::new(String::new())),
             capability_cache: None,
             verify_cfg: None,
             persist_cap: None,
@@ -582,6 +586,16 @@ impl Agent {
     pub fn with_git_snapshot(mut self, snapshot: Option<String>) -> Self {
         self.git_snapshot = snapshot;
         self
+    }
+
+    /// 取主 Provider 的句柄（Auto 模式分类器默认复用它）。
+    ///
+    /// 闸门挂在 `ToolContext` 上而不是 Agent 上——子 Agent 的 ctx 从父 ctx 派生，
+    /// 闸门因此自动向下传递、降级阈值计数全局共享；挂在 Agent 上则要保证每个
+    /// 子 Agent 都单独装配一次，漏一处就等于给那条路径开了后门。Provider 则只在
+    /// Agent 手里，所以装配层需要这个出口。
+    pub fn provider_handle(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.provider)
     }
 
     /// 配置 extended thinking（budget None/0 = 关闭）
@@ -1233,6 +1247,11 @@ impl Agent {
         if let Ok(mut g) = self.turn_permission_grants.lock() {
             g.clear();
         }
+        // Auto 分类器判断「这一步是否在用户请求范围内」需要本轮原始请求。与
+        // 授权集同一生命周期：入口写一次，工具轮循环里读十几次。
+        if let Ok(mut goal) = self.turn_user_goal.lock() {
+            *goal = last_user_goal(session);
+        }
         // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
         //
         //   * `system_stable`   —— 主提示 + 跨会话记忆 + 项目规约祖先链。
@@ -1320,8 +1339,14 @@ impl Agent {
         // 兜底。
         let max_turns = self.max_turns_for_route(&self.route_model);
 
+        // 触顶前的**收尾宽限**。触顶不是「任务失败」，而是「这一轮该交付了」：
+        // 见下方 `TURN_LIMIT_GRACE` 注释。
+        let wrap_up_at = max_turns.saturating_sub(TURN_LIMIT_GRACE);
+
         let mut turn = 0;
         let mut invalid_argument_rounds = 0usize;
+        // 收尾指令只注入一次；注入后模型仍不交出最终回答，才落到硬中止。
+        let mut wrap_up_sent = false;
         loop {
             turn += 1;
             if turn > max_turns {
@@ -1343,6 +1368,50 @@ impl Agent {
                 anyhow::bail!(
                     "超过最大推理轮数 {max_turns}。已自动存档到触顶前的状态，可用 `/rewind` 回到工作现场后换个思路继续。"
                 );
+            }
+
+            // 收尾宽限：进入最后 TURN_LIMIT_GRACE 轮时，先给模型一次「停下来
+            // 交付」的机会，而不是等到硬上限才把整轮工作判成失败。
+            //
+            // 为什么需要这一段（这是「长任务必然报超过最大推理轮数」的根因）：
+            // 触顶前 `bail!` 把**已经做完的活**判成错误——用户看到的是一句红色
+            // 报错，而工作树里那一堆改动、测试结果、排查结论全在，只是没来得及
+            // 说出口。实测触顶会话的最后几十轮全是有效工作（改文件 / 跑测试 /
+            // 读源码），没有一轮是空转。200 这个上限本意是防死循环，不是给
+            // 正常长任务设的工期，可它成了唯一的出口。
+            //
+            // 宽限窗口里注入一条 user 消息，内容是「轮数快用完，停止调用工具，
+            // 现在就总结交付」。它走 `push_user_blocks_merged`，与工具结果落在
+            // 同一条 user 消息里，不破坏角色交替。模型据此交出最终文本，
+            // `has_tool_calls` 转 false，循环正常 break —— 回合以「完成」收尾，
+            // 用户拿到的是一份可读的阶段交付，而不是一句错误。
+            //
+            // 注入只做一次（`wrap_up_sent`）。模型无视指令继续调工具时，下一轮
+            // 就落到上面的硬中止——那才是真正该报错的情形。
+            if !wrap_up_sent && turn >= wrap_up_at {
+                wrap_up_sent = true;
+                let notice = format!(
+                    "<turn-budget-reminder remaining=\"{}\">\n\
+                     You have used {turn} of {max_turns} tool-loop turns for this request, \
+                     and this is the last turn you may use. Do not call any more tools. \
+                     Immediately write your final message: what you completed, what you \
+                     verified, what remains undone, and the exact next step. A partial \
+                     but honest delivery is required — an unfinished task reported \
+                     accurately is far more useful than more tool calls.\n\
+                     本轮工具循环已用掉 {turn}/{max_turns} 轮，这是最后一轮。不要再调用任何工具，\
+                     立即输出最终消息：已完成的、已验证的、未完成的、以及下一步具体做什么。\
+                     如实交付半成品远胜过继续调用工具。\n\
+                     </turn-budget-reminder>",
+                    max_turns.saturating_sub(turn),
+                );
+                session.push_user_blocks_merged(vec![ContentBlock::Text { text: notice }]);
+                on_text(&wyj_i18n::tr_fmt(
+                    "agent.turn_budget_wrap_up",
+                    &[("turn", &turn.to_string()), ("max", &max_turns.to_string())],
+                ));
+                // 不 `continue`：提醒已经并入 session，本轮就该带着它正常发请求，
+                // 模型的总结会在**下一个**工具轮边界回来。多跳一次只会白白
+                // 吃掉一格宽限预算。
             }
 
             // 补齐悬空 `tool_use`（详见 `Session::repair_dangling_tool_uses`
@@ -2191,6 +2260,11 @@ impl Agent {
                 // `Bash` 之类彼此隔离的调用排队纯属白白拉长回合——一次回合里
                 // 排 8 条只读查询，就是 8 次 LLM 往返的额外空转。
                 // 改这段之前先分清「同组内顺序」与「会弹框」这两种不同的约束。
+                //
+                // Auto 模式下这里**不能**假设「Auto 不会阻塞」：闸门判定要 await
+                // 分类器，闸门要求问人时还要弹窗，所以 Auto 与 Bypass/Plan 一样
+                // 落在"会阻塞"那一侧（`ToolCtx::needs_dialog` 里对应地返回 true）。
+                let auto_mode = self.in_auto_mode(ctx);
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
                 for (idx, id, name, input) in calls {
@@ -2199,7 +2273,7 @@ impl Agent {
                         .map(|t| t.needs_permission(&input))
                         .unwrap_or(false)
                         && ctx.needs_dialog(&name)
-                        && !self.turn_granted(&name);
+                        && !self.turn_granted(&name, &input, auto_mode);
                     let tool_allows_par = tool_impl
                         .map(|t| t.parallel_safe() || (t.parallel_safe_with_peer() && !needs_ui))
                         .unwrap_or(false);
@@ -2467,17 +2541,36 @@ impl Agent {
     ///
     /// 锁中毒时返回 `false`（= 重新弹窗）而不是 panic：这是个纯加速路径，
     /// 它坏了最坏结果是用户体验退回旧行为，而权限路径 panic 会直接掀翻会话。
-    fn turn_granted(&self, name: &str) -> bool {
+    ///
+    /// `auto` 决定记忆粒度：手动模式按**工具名**（批准一次 Bash，本轮所有 Bash
+    /// 都不再问，这正是「批准一个任务」的价值）；Auto 模式按**工具名 + 输入**——
+    /// 同一把钥匙放到 Auto 上会把分类器架空：审过一条 `npm test` 之后，本轮
+    /// 剩下的 `npm run deploy` 全部免审。
+    fn turn_granted(&self, name: &str, input: &serde_json::Value, auto: bool) -> bool {
         self.turn_permission_grants
             .lock()
-            .map(|s| s.contains(name))
+            .map(|s| s.contains(&self.permission_key(name, input, auto)))
             .unwrap_or(false)
     }
 
+    fn permission_key(&self, tool_name: &str, input: &serde_json::Value, auto: bool) -> String {
+        if auto {
+            format!("{tool_name}\u{1f}{:x}", fnv_hash_value(input))
+        } else {
+            tool_name.to_string()
+        }
+    }
+
     /// 记下「本次提交内该工具已授权」。
-    fn grant_for_turn(&self, name: &str) {
+    ///
+    /// `confirm_tool` 返回 `true` 的所有路径（AllowOnce / AllowAlways /
+    /// computer 的 project-approve-once 升格）都意味着「用户此刻批准了这个工具
+    /// 在本轮执行」，所以不区分是哪一种按键，统一记入——AllowAlways 重复记
+    /// 一遍是无害的幂等写入。
+    fn grant_for_turn(&self, name: &str, input: &serde_json::Value, auto: bool) {
+        let key = self.permission_key(name, input, auto);
         if let Ok(mut s) = self.turn_permission_grants.lock() {
-            s.insert(name.to_string());
+            s.insert(key);
         }
     }
 
@@ -2497,21 +2590,77 @@ impl Agent {
     /// computer 的 project-approve-once 升格）都意味着「用户此刻批准了这个工具
     /// 在本轮执行」，所以不区分是哪一种按键，统一记入——AllowAlways 重复记
     /// 一遍是无害的幂等写入。
+    ///
+    /// Auto 模式多一段：先问 `AutoGate`，只有它判定「该问人」才落到 `confirm_tool`。
+    /// 拒绝时返回 `Err(原因)` 而不是 `false`，好让调用方回灌**具体**理由给模型
+    /// （分类器判定越界 ≠ 用户点了 d，两者的模型后续行为不一样）。
     async fn ensure_tool_permission(
         &self,
         name: &str,
         t: &Arc<dyn Tool>,
         input: &serde_json::Value,
         ctx: &dyn ToolContext,
-    ) -> bool {
-        if !t.needs_permission(input) || self.turn_granted(name) {
-            return true;
+    ) -> Result<(), String> {
+        let auto = self.in_auto_mode(ctx);
+        if !t.needs_permission(input) || self.turn_granted(name, input, auto) {
+            return Ok(());
         }
-        if !ctx.confirm_tool(name, &t.action_summary(input)).await {
-            return false;
+        let summary = t.action_summary(input);
+        let gate = ctx.auto_gate().cloned();
+        if auto {
+            // 没装闸门 = auto 模式退化。此时**不能**当作"自动放行"——
+            // `ToolCtx::confirm_tool` 在 Auto 下会走真实弹窗，无 UI 通道时
+            // fail-closed，两条路都是安全的那一侧。
+            let Some(gate) = gate.as_ref() else {
+                tracing::debug!(
+                    tool = name,
+                    "auto 模式但本上下文未装配判定闸门，退回逐次人工确认"
+                );
+                if !ctx.confirm_tool(name, &summary).await {
+                    return Err(USER_DENIED_REASON.to_string());
+                }
+                self.grant_for_turn(name, input, auto);
+                return Ok(());
+            };
+            let request = crate::auto_mode::AutoReviewRequest {
+                tool: name.to_string(),
+                action_summary: summary.clone(),
+                input: input.clone(),
+                cwd: ctx.cwd().to_path_buf(),
+                user_goal: self
+                    .turn_user_goal
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default(),
+            };
+            match gate.review(&request).await {
+                crate::auto_mode::AutoVerdict::Allow => {
+                    self.grant_for_turn(name, input, auto);
+                    return Ok(());
+                }
+                crate::auto_mode::AutoVerdict::Deny { reason, .. } => return Err(reason),
+                crate::auto_mode::AutoVerdict::AskUser { reason } => {
+                    tracing::debug!(tool = name, %reason, "auto 闸门交回人工确认");
+                }
+            }
         }
-        self.grant_for_turn(name);
-        true
+        if !ctx.confirm_tool(name, &summary).await {
+            if let Some(gate) = gate.as_ref() {
+                gate.note_human_approval();
+            }
+            return Err(USER_DENIED_REASON.to_string());
+        }
+        self.grant_for_turn(name, input, auto);
+        Ok(())
+    }
+
+    /// 当前是否处于 Auto 模式（`ToolContext` 是唯一权威来源，它与 TUI 状态栏
+    /// 共享同一个 `Arc<RwLock<PermissionMode>>`，Shift+Tab 即时生效）。
+    fn in_auto_mode(&self, ctx: &dyn ToolContext) -> bool {
+        matches!(
+            ctx.permission_mode(),
+            Some(crate::permission::PermissionMode::Auto)
+        )
     }
 
     /// 执行单个工具调用：触发 Start/End 回调、权限检查、执行并计时。
@@ -2608,11 +2757,12 @@ impl Agent {
                     if !ctx.is_allowed(&name, &input) {
                         let msg = format!("工具 `{name}` 在当前模式下不被允许");
                         (msg.clone(), ToolResultContent::Text(msg), true)
-                    } else if !self.ensure_tool_permission(&name, &t, &input, ctx).await {
-                        // 逐调用权限确认：用户拒绝，将拒绝信息回灌给模型（模型据此改道）
-                        let msg = format!(
-                            "用户拒绝执行工具 `{name}`。请不要重试该操作；改用其他方式，或先向用户询问原因。"
-                        );
+                    } else if let Err(reason) =
+                        self.ensure_tool_permission(&name, &t, &input, ctx).await
+                    {
+                        // 逐调用权限确认被拒：把**具体**理由回灌给模型（用户点 d
+                        // 与 auto 分类器判定越界，模型该有的后续行为并不相同）。
+                        let msg = format!("工具 `{name}` 未获准执行：{reason}");
                         (msg.clone(), ToolResultContent::Text(msg), true)
                     } else {
                         run_tool(&t, input, ctx, &meta).await
@@ -2787,6 +2937,22 @@ const LOOP_GUARD_CAPACITY: usize = 16;
 /// 触发跳过的同 name+hash 命中阈值。最近 N 条里命中 ≥ K 次视为死循环。
 const LOOP_GUARD_WINDOW: usize = 5;
 const LOOP_GUARD_THRESHOLD: usize = 3;
+
+/// 触顶前的收尾宽限轮数：距离上限还剩这么多轮时，向模型注入一次「停止调用
+/// 工具、立即总结交付」的指令（见 `run_turn_with_injection_inner`）。
+///
+/// 取 4 而不是 1：模型读到指令后仍可能先补一次工具调用（比如把刚跑完的
+/// 测试结果读回来再作答），宽限太窄会让它来不及交出总结就被硬中止，白白
+/// 浪费已经完成的全部工作。4 轮足够它「不再调工具 + 写总结」，同时相对 200
+/// 的总预算可忽略不计。
+const TURN_LIMIT_GRACE: usize = 4;
+
+/// 用户在权限对话框里主动拒绝时回灌给模型的原因。
+///
+/// 措辞刻意命令式：模型收到「用户拒绝了」之后的典型失败模式是换个参数再试一次，
+/// 那既没用又招人烦。Auto 分类器的拒绝走各自的 `reason`，不带这句。
+const USER_DENIED_REASON: &str =
+    "用户拒绝执行该操作。请不要重试该操作；改用其他方式，或先向用户询问原因。";
 
 /// 检查 (name, hash) 是否已经在最近 LOOP_GUARD_WINDOW 次调用中命中
 /// LOOP_GUARD_THRESHOLD 次以上。是则返回 true 表示模型陷入循环,应跳过本次执行。
@@ -3051,7 +3217,7 @@ mod tests {
         MemoryClaimKind, MemoryClaimScope, MemorySource, MemorySourceKind, MemoryWriteRequest,
         TaskStatus, TaskStep,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// `soft_threshold_tokens` 的测试用最小 `ContextEditCfg`。CAS 指向临时目录，
@@ -3645,6 +3811,155 @@ mod tests {
         })
     }
 
+    /// 一直发工具调用，直到在 messages 里读到 `turn-budget-reminder` 才收手。
+    ///
+    /// 模拟的就是真实触顶会话里的模型：它并不会因为快到上限就自己停下，
+    /// 必须有人明确告诉它「别再调工具了，现在总结」。`ignore_reminder` 则
+    /// 造出反面形态——读到提醒仍然继续调工具，用来验证硬中止那道兜底。
+    struct BudgetAwareProvider {
+        calls: AtomicUsize,
+        seen_reminder: AtomicBool,
+        ignore_reminder: bool,
+    }
+    #[async_trait::async_trait]
+    impl Provider for BudgetAwareProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let has_reminder = messages.iter().any(|m| {
+                m.content.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("turn-budget-reminder"))
+                })
+            });
+            if has_reminder {
+                self.seen_reminder.store(true, Ordering::SeqCst);
+                if !self.ignore_reminder {
+                    return Ok(Box::pin(futures::stream::iter(vec![
+                        Ok(StreamEvent::TextDelta("收尾总结".into())),
+                        Ok(StreamEvent::MessageStop {
+                            stop_reason: StopReason::EndTurn,
+                        }),
+                    ])));
+                }
+            }
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let id = format!("b{n}");
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: "Edit".into(),
+                }),
+                Ok(StreamEvent::ToolUseDelta {
+                    id: id.clone(),
+                    json_delta: format!(r#"{{"path":"f{n}.rs"}}"#),
+                }),
+                Ok(StreamEvent::ToolUseEnd { id }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ])))
+        }
+    }
+
+    /// 触顶不再等于失败：宽限窗口内注入一次收尾指令，模型交出总结后回合
+    /// **正常结束**（`Ok`），而不是把已经做完的工作判成一句报错。
+    ///
+    /// 这条测试钉的是本次事故的根因修复。修复前：`max_turns=8` 的长任务在
+    /// 第 9 轮 `bail!`，用户拿到红色报错，工作树里的改动一句总结都没留下。
+    #[tokio::test]
+    async fn hitting_the_turn_budget_delivers_a_summary_instead_of_erroring() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(BudgetAwareProvider {
+            calls: AtomicUsize::new(0),
+            seen_reminder: AtomicBool::new(false),
+            ignore_reminder: false,
+        });
+        let mut agent = Agent::new(provider.clone()).with_max_turns(8);
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: false,
+            runs: runs.clone(),
+        }));
+        let mut session = Session::new();
+
+        let result = agent
+            .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "触顶后应正常收尾而不是报错: {:?}",
+            result.err()
+        );
+        assert!(
+            provider.seen_reminder.load(Ordering::SeqCst),
+            "宽限窗口内必须向模型注入收尾指令"
+        );
+        // 工具确实跑过——证明这份总结是「已完成的活」而不是空转出来的。
+        assert!(
+            runs.load(Ordering::SeqCst) > 0,
+            "工具一次都没跑，收尾无从谈起"
+        );
+        let has_summary = session.messages.iter().any(|m| {
+            m.role == wyj_api::types::Role::Assistant
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("收尾总结")))
+        });
+        assert!(has_summary, "回合历史里应留下模型的最终总结");
+    }
+
+    /// 收尾指令**只注入一次**：无视指令的模型不能靠反复注入把自己续命，
+    /// 否则「最多 N 轮」这个上限就形同虚设。
+    #[tokio::test]
+    async fn the_wrap_up_notice_is_injected_at_most_once() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(BudgetAwareProvider {
+            calls: AtomicUsize::new(0),
+            seen_reminder: AtomicBool::new(false),
+            // 无视收尾指令：模型读到提醒仍继续调工具，回合必须落到硬中止。
+            ignore_reminder: true,
+        });
+        let mut agent = Agent::new(provider.clone()).with_max_turns(8);
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: false,
+            runs: runs.clone(),
+        }));
+        let mut session = Session::new();
+
+        let result = agent
+            .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+            .await;
+
+        assert!(result.is_err(), "无视收尾指令时仍应硬中止（防续命上界）");
+        let notices = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| {
+                matches!(b, ContentBlock::Text { text } if text.contains("turn-budget-reminder"))
+            })
+            .count();
+        assert_eq!(notices, 1, "收尾指令只应注入一次，实际 {notices} 次");
+    }
+
+    /// 宽限窗口从 `max_turns - TURN_LIMIT_GRACE` 起算：留出的轮数必须够
+    /// 模型「不再调工具 + 写总结」，否则刚注入就被硬中止，宽限形同虚设。
+    ///
+    /// 用 const 块而不是 `assert!`：这两个事实不变量是编译期就该钉死的，
+    /// 写成运行时断言只会让 clippy 提醒把它挪过来。
+    #[test]
+    fn the_grace_window_leaves_room_to_actually_deliver() {
+        const { assert!(TURN_LIMIT_GRACE >= 2, "宽限至少要够一次工具轮 + 一次总结轮") };
+        // 默认 200 的配置下宽限占比极小，不构成实质性的预算削减。
+        const { assert!(TURN_LIMIT_GRACE * 10 < 200) };
+    }
+
     /// 核心行为：同一次提交里 3 个 Edit 只弹 1 次框，3 次都真的执行了。
     #[tokio::test]
     async fn one_confirm_covers_every_matching_call_in_a_turn() {
@@ -3741,22 +4056,156 @@ mod tests {
 
         agent
             .ensure_tool_permission("Edit", &edit, &needs_perm, &ctx)
-            .await;
+            .await
+            .expect("人工批准应放行");
         agent
             .ensure_tool_permission("Edit", &edit, &needs_perm, &ctx)
-            .await;
+            .await
+            .expect("本轮已授权应免问");
         agent
             .ensure_tool_permission("Write", &edit, &needs_perm, &ctx)
-            .await;
+            .await
+            .expect("人工批准应放行");
         agent
             .ensure_tool_permission("Read", &gated("Read", false), &needs_perm, &ctx)
-            .await;
+            .await
+            .expect("只读工具不需授权");
 
         assert_eq!(
             *ctx.summaries.lock().unwrap(),
             ["Edit:?", "Write:?"],
             "Edit 只问一次、Write 单独问一次、Read 根本不问"
         );
+    }
+
+    /// Auto 模式的 ctx 探针：暴露闸门 + 暴露 Auto 模式 + 记录弹窗次数。
+    struct AutoProbeCtx {
+        inner: PermissionProbeCtx,
+        gate: Arc<dyn crate::auto_mode::AutoGate>,
+    }
+    #[async_trait::async_trait]
+    impl ToolContext for AutoProbeCtx {
+        fn cwd(&self) -> &std::path::Path {
+            self.inner.cwd()
+        }
+        fn is_allowed(&self, name: &str, input: &serde_json::Value) -> bool {
+            self.inner.is_allowed(name, input)
+        }
+        async fn confirm_tool(&self, name: &str, summary: &str) -> bool {
+            self.inner.confirm_tool(name, summary).await
+        }
+        fn permission_mode(&self) -> Option<crate::permission::PermissionMode> {
+            Some(crate::permission::PermissionMode::Auto)
+        }
+        fn auto_gate(&self) -> Option<&Arc<dyn crate::auto_mode::AutoGate>> {
+            Some(&self.gate)
+        }
+    }
+
+    /// 记录每次 review 的动作摘要、返回预设 verdict 的假闸门。
+    struct RecordingGate {
+        seen: std::sync::Mutex<Vec<String>>,
+        verdict: crate::auto_mode::AutoVerdict,
+    }
+    #[async_trait::async_trait]
+    impl crate::auto_mode::AutoGate for RecordingGate {
+        async fn review(
+            &self,
+            request: &crate::auto_mode::AutoReviewRequest,
+        ) -> crate::auto_mode::AutoVerdict {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(request.action_summary.clone());
+            self.verdict.clone()
+        }
+        fn counters(&self) -> crate::auto_mode::AutoCounters {
+            crate::auto_mode::AutoCounters::default()
+        }
+        fn should_degrade(&self) -> bool {
+            false
+        }
+        fn note_human_approval(&self) {}
+    }
+
+    /// Auto 的核心不变式：**本轮记忆的粒度必须比手动模式细**。
+    ///
+    /// 手动模式按工具名记忆（Bash 批准一次，本轮所有 Bash 都免问）；Auto 若沿用
+    /// 同一把钥匙，就会出现「审过一条 `npm test` → 本轮剩下的 `npm run deploy`
+    /// 全部免审」，分类器被架空。这条测试钉死的就是这个分叉。
+    #[tokio::test]
+    async fn auto_mode_memory_is_per_call_not_per_tool() {
+        let gate = Arc::new(RecordingGate {
+            seen: std::sync::Mutex::new(Vec::new()),
+            verdict: crate::auto_mode::AutoVerdict::Allow,
+        });
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let ctx = AutoProbeCtx {
+            inner: PermissionProbeCtx::new(true),
+            gate: gate.clone(),
+        };
+        let bash: Arc<dyn Tool> = Arc::new(GatedTool {
+            name: "Bash",
+            needs_permission: true,
+            runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+
+        let test = |path: &str| serde_json::json!({ "path": path });
+
+        agent
+            .ensure_tool_permission("Bash", &bash, &test("a.txt"), &ctx)
+            .await
+            .expect("闸门放行");
+        agent
+            .ensure_tool_permission("Bash", &bash, &test("a.txt"), &ctx)
+            .await
+            .expect("完全相同的调用本轮免审");
+        assert_eq!(
+            gate.seen.lock().unwrap().len(),
+            1,
+            "完全相同的调用不该重复送审"
+        );
+
+        agent
+            .ensure_tool_permission("Bash", &bash, &test("b.txt"), &ctx)
+            .await
+            .expect("不同调用应重新过闸门");
+        assert_eq!(
+            gate.seen.lock().unwrap().len(),
+            2,
+            "Auto 下一次放行绝不能覆盖参数不同的调用"
+        );
+    }
+
+    /// 闸门拒给具体理由，回灌给模型的文案要带上它（模型据此换路子而不是重试）。
+    #[tokio::test]
+    async fn auto_mode_denial_carries_the_rule_reason() {
+        let gate = Arc::new(RecordingGate {
+            seen: std::sync::Mutex::new(Vec::new()),
+            verdict: crate::auto_mode::AutoVerdict::Deny {
+                rule: "soft_deny".to_string(),
+                reason: "命中禁止规则：生产部署".to_string(),
+            },
+        });
+        let agent = Agent::new(Arc::new(EndTurnProvider));
+        let ctx = AutoProbeCtx {
+            inner: PermissionProbeCtx::new(true),
+            gate,
+        };
+        let bash: Arc<dyn Tool> = Arc::new(GatedTool {
+            name: "Bash",
+            needs_permission: true,
+            runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let err = agent
+            .ensure_tool_permission("Bash", &bash, &serde_json::json!({ "path": "x" }), &ctx)
+            .await
+            .expect_err("分类器拒绝必须阻断执行");
+        assert!(
+            err.contains("生产部署"),
+            "回灌给模型的理由应包含分类器给出的具体原因，实际: {err}"
+        );
+        assert_eq!(ctx.inner.ask_count(), 0, "分类器拒给不应再弹窗问人");
     }
 
     /// 每轮都直接 EndTurn 的 provider（注入路由测试用）

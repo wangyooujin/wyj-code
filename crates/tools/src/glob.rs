@@ -78,11 +78,17 @@ impl Tool for GlobTool {
                 .git_ignore(true)
                 .git_global(true)
                 .git_exclude(true)
-                // 非 git 仓库里也让 .gitignore 生效（ignore crate 默认 true）。
-                // 工具描述里承诺的是「Respects .gitignore」，之前这句话在非 git 目录
-                // 是不成立的：被项目显式排除的 `.venv/`、数据目录照样被遍历，
-                // 单次调用多花几百毫秒。对齐 `grep.rs` 里已有的同一处设置。
-                .require_git(false)
+                // 按仓库位置动态决定，而不是写死 false：非 git 仓库里也让
+                // .gitignore 生效（工具描述里承诺的是「Respects .gitignore」，
+                // 之前这句话在非 git 目录不成立：被项目显式排除的 `.venv/`、
+                // 数据目录照样被遍历）。
+                //
+                // 而在 git 仓库/worktree 里**必须**为 true，否则 `.git/info/exclude`
+                // 失效：`ignore` crate 解析 worktree 的 common git dir（`.git` 是
+                // `gitdir:` 指针文件）走的是 `require_git == true` 的分支，写死 false
+                // 会让它去读 `<worktree>/.git/info/exclude`——那是个文件，一条规则都
+                // 加载不到。managed worktree 里的表现是：主仓库 exclude 掉的目录被遍历。
+                .require_git(wyj_config::gitignore::is_inside_git_repo(&root))
                 .build();
 
             for entry in walker {

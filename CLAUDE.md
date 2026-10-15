@@ -41,6 +41,7 @@ cargo run -- --config-status     # 查看当前配置和 API Key 状态
 cargo run -- --cwd <dir>         # 指定工作目录（默认当前目录）
 cargo run -- --plan              # 以 Plan 模式启动（仅只读工具）
 cargo run -- --bypass-permissions # 以 Bypass 模式启动（跳过权限确认）
+cargo run -- --permission-mode manual  # 显式选模式：auto（默认）/ manual / plan / bypass
 cargo run -- --no-hooks           # 禁用 Hooks 自动化系统
 cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
@@ -60,6 +61,40 @@ cargo run -- review run --base HEAD^ --head HEAD --json # 本地 diff 审查证�
 ./build.sh cross linux-x86_64    # 交叉编译（支持 linux-x86_64, linux-aarch64, macos-*）
 ./build.sh release               # 交互确认版本号后自动 bump Cargo.toml + commit + tag + push（触发 GitHub Actions Release）
 ```
+
+## 同一项目跑多个实例
+
+两个 wyj-code 进程共享同一批状态文件，**worktree 只隔离文件、不隔离状态**——`~/.wyj-code/`
+下的授权名单 / 记忆 / 会话 / 扩展清单仍是共享单文件。两者正交，缺一不可：
+
+| 冲突面 | 手段 |
+|---|---|
+| 两个 agent 同时改同一批源码 | `workspace create --branch <名字>` 开独立 worktree（唯一真隔离） |
+| 共享状态文件互相覆盖 | `core::filelock` 跨进程锁 + `serialize::write_atomic` 原子替换（会话 / 授权名单 / memory-v3 全局层） |
+| 两个进程 resume 同一会话 | 启动时检出占用并告警（`SessionStore::active_owner`）。锁只能防写坏，防不了「整文件覆盖」语义上的丢更新，所以并行必须换会话 |
+
+```bash
+# 1) 开一个隔离实例（worktree 落在 ~/.wyj-code/workspaces/<project_id>/worktrees/）
+cargo run -- workspace create --branch feat/login-refactor --session-id login
+
+# 命令末尾会直接打印可粘贴的启动行 —— **别去掉 --project-root**：
+wyj-code --cwd <worktree> --project-root /Volumes/WD_APFS/wyj-code
+
+# 2) 汇合：分支可直接 push / merge；也能逐文件回灌
+cargo run -- workspace diff <id>
+cargo run -- workspace accept <id> <paths...>
+cargo run -- workspace list [--reconcile]   # --reconcile 清掉失效 manifest 并 prune
+cargo run -- workspace dispose <id>
+```
+
+**`--project-root` 为什么不能省**：worktree 里 `.git` 是个**文件**，而 `config::resolve_project_root`
+用 `.exists()` 判仓库根（`crates/config/src/lib.rs`），于是不带这个参数时 worktree 会被当成
+**另一个项目**——`project_key` 变了，`allowed_tools.json`、项目记忆、MCP/skill 信任、演化记录、
+代码索引全部重开，`-c` / `/resume` 也看不到主仓库会话。带上它才是「共享身份 + 隔离文件」。
+
+**已知限制**：`git worktree add` 只 checkout 已提交内容，ignored / untracked 文件（`target/`、
+`node_modules/`、`.env`、未提交的 `AGENTS.local.md`）不会带过去。Rust 项目可用
+`CARGO_TARGET_DIR=<主仓库>/target` 指回去绕开冷构建——cargo 对同一 target 目录是阻塞排队而非写坏。
 
 GitHub Release 压缩包（`.github/workflows/release.yml` 产出的 tar.gz/zip，不同于 `./build.sh package`
 产出的裸二进制）额外内置 `install.sh`/`install.bat`（仓库根目录）两个一键安装脚本，解压后运行即可
@@ -174,7 +209,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 28 | 子 Agent token 用量计量（原子累加器，逐层透传） | `core::session::SubUsage` + `ToolContext::sub_usage_sink()` | `crates/core` + `crates/tools` |
 | 29 | 编辑后自动验证闭环（项目声明 `verify.command` 才生效） | `core::verify` | `crates/core` |
 | 30 | 每轮时延画像（TTFT / 生成 / 重试开销） | `core::session::TurnLatency` + `/context` | `crates/core` + `crates/commands` |
-| 31 | 推理轮数触顶前自动存档 | `CheckpointKind::TurnLimit` | `crates/core` |
+| 31 | 推理轮数触顶：先收尾交付，再硬中止存档 | `CheckpointKind::TurnLimit` + `TURN_LIMIT_GRACE` | `crates/core` |
 
 **跨 crate 改动的两条硬约定**：
 
@@ -186,4 +221,8 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 
 ### 权限模型（TUI）
 
-`ToolCtx.permission_mode`（Prompt/AutoApprove/Allowlist）控制 `is_allowed`。**逐调用工具权限确认（v0.1.2 起）**：Normal 模式映射为 `Prompt`，`agent.rs::exec_tool_call` 在执行任一 `Tool::needs_permission()` 为 true 的工具（Edit/Write/Bash）前调用 `ToolContext::confirm_tool(name, summary)`；`ToolCtx` 的实现经 `ui_ask_tx` 发 `UiAskRequest::ToolPermission` 并 await `oneshot<PermissionDecision>`，TUI 弹 `PermissionDialog`（`draw_permission_dialog`），按键 y=AllowOnce / a=AllowAlways / d·Esc=Deny。`Deny` 把拒绝信息作为 `is_error` 工具结果回灌给模型；`AllowAlways` 把工具名写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`（`project_key` 按 git 仓库根派生，见 `core::project`）并跨会话生效——`ToolCtx::load_allowed_tools` 在每轮 ctx 装配时载入。computer-use 是刻意收窄的例外语义：`PROJECT_APPROVE_ONCE_TOOLS = ["computer", "app_computer"]`，这两个工具的首次 `AllowOnce` 也等价于当前工具的项目级 `AllowAlways`，因此用户只确认一次，但批准 `app_computer` 不会隐式放行风险更高的旧 `computer`。`summary` 由 `Tool::action_summary()` 提供（Bash=命令、Edit/Write=文件路径）。需要确认的工具均非 `parallel_safe`，串行执行，同一时刻至多一个对话框。Bypass=`AutoApprove` 全放行；Plan=`Allowlist` 白名单限制。`ui_ask_tx` 同时承载 AskQuestion 多题面板与 ExitPlanMode 计划批准；子 Agent 的 ctx 不接 `ui_ask_tx`，`confirm_tool` 默认放行（不阻塞、不弹窗）。
+**四种模式（`AgentMode`：Auto / Manual / Plan / Bypass，`--permission-mode` 或 Shift+Tab 切换，`default` 是 `manual` 的别名）**。`ToolCtx.permission_mode`（`PermissionMode::{Auto, Prompt, AutoApprove, Allowlist, Plan}`）控制 `is_allowed`，而「要不要问人」在 `agent.rs::ensure_tool_permission` 里决定，它返回 `Result<(), String>`——错误里带**具体**原因，因为「用户点了 d」与「auto 分类器判定越界」对模型而言是两种不同的后续行为。
+
+**Auto 是默认起始模式**（对齐 Claude Code v2.1.283+）：判定交给 `core::auto_mode::AutoGate`，固定顺序 = 受保护路径 deny（任何模式都不放行）→ 确定性 allow（工作目录内文件写、只读/构建/lockfile 安装的 shell，零延迟）→ 确定性 hard_deny（`curl|bash`、`rm -rf ~`、force push、`git reset --hard`、`terraform destroy`、`sudo <program>`、凭据路径、无审批 agent 循环，不发模型请求）→ 模型分类器（其余才付一次模型往返，system prompt 见 `prompts::AUTO_CLASSIFIER`，规则文本见 `core::auto_rules`）→ **fail-closed**（超时/非法输出/空响应一律判拒绝，只有 `enabled=false` 才交回人工）→ **降级**（连续 3 次或累计 20 次被拦自动退回 `manual`）。闸门挂在 `ToolContext`（`auto_gate()`）而非 `Agent` 上：子 Agent 的 ctx 由父 ctx 派生，闸门自动传递、计数全局共享；`PermissionPolicy::evaluate` 保持同步，只管「任何模式都不放行」那部分（真实判定需要 await 模型）。**Auto 不要求交互面**，因此 `-p`/headless/定时任务同样可用。**「本轮已放行」的记忆粒度按模式分叉**：manual 按工具名（批准一次 Bash 本轮不再问），auto 按 `工具名 + 输入` —— 否则审过一次 `npm test` 会让本轮所有 `npm run deploy` 一起免审，把分类器架空。
+
+**逐调用工具权限确认（v0.1.2 起，Manual 模式与 Auto 的 AskUser 落点）**：`ToolCtx::confirm_tool(name, summary)` 经 `ui_ask_tx` 发 `UiAskRequest::ToolPermission` 并 await `oneshot<PermissionDecision>`，TUI 弹 `PermissionDialog`（`draw_permission_dialog`），按键 y=AllowOnce / a=AllowAlways / d·Esc=Deny。`Deny` 把拒绝信息作为 `is_error` 工具结果回灌给模型；`AllowAlways` 把工具名写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`（`project_key` 按 git 仓库根派生，见 `core::project`）并跨会话生效——`ToolCtx::load_allowed_tools` 在每轮 ctx 装配时载入。computer-use 是刻意收窄的例外语义：`PROJECT_APPROVE_ONCE_TOOLS = ["computer", "app_computer"]`，这两个工具的首次 `AllowOnce` 也等价于当前工具的项目级 `AllowAlways`，因此用户只确认一次，但批准 `app_computer` 不会隐式放行风险更高的旧 `computer`。`summary` 由 `Tool::action_summary()` 提供（Bash=命令、Edit/Write=文件路径）。需要确认的工具均非 `parallel_safe`，串行执行，同一时刻至多一个对话框；`ToolCtx::needs_dialog` 的判据必须与 `confirm_tool` 的两条「直接放行」分支严格对齐（Auto 也在其列——闸门判定要 await、AskUser 还要弹窗，同样会阻塞），否则 Agent 会把多调用排进并发组同时弹 N 个框。Bypass=`AutoApprove` 全放行；Plan=`Plan(白名单)` + 只读 Bash 校验 + 规划文档路径策略。`ui_ask_tx` 同时承载 AskQuestion 多题面板与 ExitPlanMode 计划批准；子 Agent 的 ctx 不接 `ui_ask_tx`，`confirm_tool` 默认放行（不阻塞、不弹窗）。配置见 `docs/reference/config.md` 的 `[auto_mode]` 节。

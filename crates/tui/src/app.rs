@@ -1175,6 +1175,73 @@ pub struct SessionPickerState {
 /// log_level 固定候选表（供设置面板循环切换/校验）
 pub const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
+/// 「本次 resume 的会话正被另一个实例使用」这一事实，由 CLI 装配阶段检出后传进来。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionConflictInfo {
+    pub session_id: String,
+    pub owner_pid: u32,
+}
+
+/// 用户对会话占用冲突的裁决。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionConflictChoice {
+    /// 接管：正常 resume 并照常保存。对方的未保存消息会被本进程的版本覆盖。
+    TakeOver,
+    /// 只读：把历史载入聊天区供阅读，但**不写回会话文件**，对方完全不受影响。
+    /// 这不是 Plan 模式——Plan 只限制文件工具，会话持久化照旧发生。
+    ReadOnly,
+    /// 放弃这次恢复，退出进程。
+    Abort,
+}
+
+/// 启动期「会话被占用」弹窗。
+///
+/// 与 `pending_mcp_trust` / `pending_skill_trust` 同构：启动横幅之后一次性出现、纯本地
+/// 状态、**不走 `UiAskRequest`**。这里没有 Agent 回合在 await，造一个 oneshot 通道
+/// 只会得到永远没人 send 的死路，还会把 ACP 那条穷尽 match 一起拖下水。
+pub struct SessionConflictDialog {
+    pub info: SessionConflictInfo,
+    /// 0 = 接管 / 1 = 只读 / 2 = 退出
+    pub selected: usize,
+}
+
+impl SessionConflictDialog {
+    pub const OPTIONS: usize = 3;
+
+    pub fn new(info: SessionConflictInfo) -> Self {
+        Self {
+            info,
+            // 默认选中「只读」而不是「接管」：接管会毁掉另一个实例正在写的数据，
+            // 破坏性更小的那一项该是回车默认。
+            selected: 1,
+        }
+    }
+
+    /// 处理一个按键。`None` 表示按键只是移动光标，或与本弹窗无关。
+    pub fn handle_key(&mut self, key: KeyCode) -> Option<SessionConflictChoice> {
+        match key {
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') => {
+                self.selected = (self.selected + Self::OPTIONS - 1) % Self::OPTIONS;
+                None
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') => {
+                self.selected = (self.selected + 1) % Self::OPTIONS;
+                None
+            }
+            // 数字键直达对应选项，省掉方向键。
+            KeyCode::Char('1') | KeyCode::Char('t') => Some(SessionConflictChoice::TakeOver),
+            KeyCode::Char('2') | KeyCode::Char('r') => Some(SessionConflictChoice::ReadOnly),
+            KeyCode::Char('3') | KeyCode::Esc => Some(SessionConflictChoice::Abort),
+            KeyCode::Enter | KeyCode::Char(' ') => Some(match self.selected {
+                0 => SessionConflictChoice::TakeOver,
+                1 => SessionConflictChoice::ReadOnly,
+                _ => SessionConflictChoice::Abort,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// 设置面板的可编辑字段索引（对应渲染顺序）——现仅剩 log_level/language，
 /// 调用相关字段（provider/model/base_url/api_key 等）已迁到 /model 的 ProfileDialog。
 pub const SETTINGS_FIELD_COUNT: usize = 2;
@@ -1197,10 +1264,7 @@ impl SettingsDraft {
             .iter()
             .position(|l| *l == cfg.log_level)
             .unwrap_or(3); // 默认 warn
-        let current_lang = cfg
-            .language
-            .clone()
-            .unwrap_or_else(|| wyj_i18n::detect_system_locale().to_string());
+        let current_lang = wyj_i18n::resolve_locale(cfg.language.as_deref());
         let language_idx = wyj_i18n::AVAILABLE_LOCALES
             .iter()
             .position(|l| *l == current_lang)
@@ -3643,10 +3707,11 @@ fn schedule_try_save(state: &mut AppState) -> bool {
             dialog.clamp_cursor();
             dialog.error = Some(msg);
         } else {
-            let manifest = wyj_store::schedule::ScheduleManifest {
-                version: wyj_store::schedule::SCHEDULE_VERSION,
-                tasks: dialog.tasks.clone(),
-            };
+            // 用 `load()` 打底而不是从零构造：manifest 的 `baseline_json` 记录了
+            // 「面板打开那一刻磁盘上有什么」，`save` 据此做三方 diff。没有基线就会
+            // 退化成整份覆盖，把面板打开期间别的实例新建的任务整个抹掉。
+            let mut manifest = wyj_store::schedule::load().unwrap_or_default();
+            manifest.tasks = dialog.tasks.clone();
             match wyj_store::schedule::save(&manifest) {
                 Ok(()) => {
                     saved = true;
@@ -7672,6 +7737,12 @@ pub struct AppState {
     /// 项目级 skill 的待批准条目（`.wyj-code/skills/` 随 git clone 落地、
     /// 内容由仓库作者控制）。为 `Some` 时这些 skill 未进注册表也不在模型名单里。
     pub pending_skill_trust: Option<Vec<wyj_commands::skill::ProjectSkillInfo>>,
+    /// 启动横幅之后弹出的「会话正被另一个实例使用」裁决框。为 `Some` 时会话历史
+    /// 已经载入聊天区，但**尚未决定要不要写回**——按键裁决前不产生任何落盘。
+    pub session_conflict: Option<SessionConflictDialog>,
+    /// 本实例是否以「只读」方式挂载了别人的会话（见 [`SessionConflictChoice::ReadOnly`]）。
+    /// 为 true 时所有会话持久化写入被跳过，对方实例的数据不会被覆盖。
+    pub read_only_session: bool,
     pub ask_question_dialog: Option<AskQuestionDialog>,
     /// ExitPlanMode 触发的计划批准对话框
     pub plan_dialog: Option<PlanApprovalDialog>,
@@ -7939,6 +8010,8 @@ impl AppState {
             permission_dialog: None,
             pending_mcp_trust: None,
             pending_skill_trust: None,
+            session_conflict: None,
+            read_only_session: false,
             ask_question_dialog: None,
             plan_dialog: None,
             exec_mode_confirm: None,
@@ -9317,6 +9390,18 @@ impl AppState {
     /// 锁**——回合 task 会持锁跑完整个 agent 回合，等下去等于整个界面停摆，
     /// 连 ESC 都按不动。正确做法是跳过本帧动作、下一帧重试（见
     /// [`try_session_lock`]）。
+    /// 本实例是否允许把会话写回磁盘。
+    ///
+    /// 「只读」挂载（[`SessionConflictChoice::ReadOnly`]）下为 false：这个会话文件
+    /// 属于另一个仍在运行的实例，本进程整份覆盖它正是我们要避免的那种丢数据。
+    ///
+    /// **每个会话保存点都必须先过这道闸**——共有六处（每轮结束、生成标题、切换
+    /// 会话、两条 subagent 忙碌通知、退出时），漏掉任何一处都会让「只读」变成谎言：
+    /// 面板上写着不写回，退出时却把整个会话覆盖掉了。
+    pub fn session_persist_allowed(&self) -> bool {
+        !self.read_only_session
+    }
+
     pub(crate) fn notify_session_busy(&mut self) {
         const WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
         let now = Instant::now();
@@ -11101,6 +11186,9 @@ pub async fn run_tui(
     // CAS blob pool。用于 `/clear` / 退出时 release 本会话被 context editing
     // 外部化的 blob 引用 —— CAS 的 gc 只回收 `ref_count == 0` 的 blob。
     workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
+    // 本次 resume 的会话正被另一个 wyj-code 实例使用（`(session_id, owner_pid)`）。
+    // 非 None 时启动横幅之后立刻弹窗让用户决定：接管 / 只读 / 退出。
+    session_conflict: Option<SessionConflictInfo>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -11147,6 +11235,7 @@ pub async fn run_tui(
         wheel_routing,
         needs_api_key_onboarding,
         workspace_cas,
+        session_conflict,
     )
     .await;
 
@@ -11908,7 +11997,14 @@ fn scan_files(
         .max_depth(Some(depth))
         .hidden(false)
         .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
         .ignore(true)
+        // 与 `code_index::walk_files` / `grep` / `glob` 对齐：非 git 目录里也让
+        // `.gitignore` 生效，在 git 仓库 / managed worktree 里必须为 true 才读得到
+        // 主仓库的 `.git/info/exclude`（`dir` 可能是 worktree 里的深层子目录，
+        // 判定会向上走到 worktree 根）。
+        .require_git(wyj_config::gitignore::is_inside_git_repo(dir))
         .build();
 
     for entry in walker.flatten() {
@@ -12458,6 +12554,8 @@ async fn tui_main(
     needs_api_key_onboarding: bool,
     // CAS blob pool：`/clear` 时 release 本会话被 context editing 外部化的 blob。
     workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
+    // resume 到的会话正被另一个实例使用；非 None 则启动后弹窗让用户裁决。
+    session_conflict: Option<SessionConflictInfo>,
 ) -> Result<Option<String>> {
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
@@ -12465,7 +12563,10 @@ async fn tui_main(
     let shared_permission = Arc::new(std::sync::RwLock::new(mode_to_permission(&mode)));
     // Auto 模式闸门：整个会话一份，随 ctx 派生传给子 Agent（降级阈值因此
     // 全局共享）。建不出来时传 `None` —— auto 模式会退化成逐次弹窗。
-    let auto_gate = Some(wyj_core::auto_mode::build_gate(&config, agent.provider_handle()));
+    let auto_gate = Some(wyj_core::auto_mode::build_gate(
+        &config,
+        agent.provider_handle(),
+    ));
     // Auto 是默认起始模式，且它会**替人**做放行决定。首次进入时把这件事说清楚，
     // 否则用户看到"什么都没问就改了文件"时的第一反应是以为权限系统坏了。
     let started_in_auto = mode == AgentMode::Auto;
@@ -12490,7 +12591,9 @@ async fn tui_main(
     state.hook_runner = agent.hook_runner_ref().cloned();
     if started_in_auto && initial_messages.is_empty() {
         // 只在新会话说一次。恢复旧会话时那些工具早就跑完了，再补一句是噪音。
-        state.messages.push(ChatMessage::system(wyj_i18n::tr("auto.mode_notice")));
+        state
+            .messages
+            .push(ChatMessage::system(wyj_i18n::tr("auto.mode_notice")));
     }
     let mut input = InputBox::new();
     let mut current_session_id = session_id;
@@ -12579,6 +12682,14 @@ async fn tui_main(
         if !infos.is_empty() {
             state.pending_skill_trust = Some(infos);
         }
+    }
+
+    // 恢复的会话正被另一个实例使用 → 启动即弹裁决框。放在 MCP/skill 信任之后：
+    // 信任框问的是「要不要执行这个仓库声明的东西」，冲突框问的是「要不要覆盖别人的
+    // 会话」，后者优先级更高（它直接决定本次运行的落盘行为），但两者不会同时存在
+    // ——真同时出现时这里会盖掉信任框，用户的第一次按键只处理冲突。
+    if let Some(info) = session_conflict {
+        state.session_conflict = Some(SessionConflictDialog::new(info));
     }
 
     // 初始化 Session：若有历史消息则恢复，并重建 TUI 显示
@@ -12772,9 +12883,9 @@ async fn tui_main(
                 auto_degrade_notified = true;
                 switch_mode(&shared_mode, &shared_permission, AgentMode::Manual).await;
                 state.mode = AgentMode::Manual;
-                state.messages.push(ChatMessage::system(wyj_i18n::tr(
-                    "auto.degraded_to_manual",
-                )));
+                state
+                    .messages
+                    .push(ChatMessage::system(wyj_i18n::tr("auto.degraded_to_manual")));
             }
         }
 
@@ -12876,7 +12987,7 @@ async fn tui_main(
                 // 存盘晚一帧没有代价，等锁才有：拿不到就只置位回退，流程
                 // 自然落到下面继续消费输入层。
                 if let Some(sess) = try_session_lock(&session) {
-                    if !sess.messages.is_empty() {
+                    if !sess.messages.is_empty() && state.session_persist_allowed() {
                         // 保留已有的 LLM 生成标题（若已生成则不覆盖为启发式 title）
                         let (title, title_generated) = match session_store
                             .as_ref()
@@ -12897,7 +13008,9 @@ async fn tui_main(
                                 title_generated,
                             },
                         );
-                        let _ = store.save(&sf);
+                        if state.session_persist_allowed() {
+                            let _ = store.save(&sf);
+                        }
                     }
                 } else {
                     state.save_needed = true;
@@ -13057,7 +13170,9 @@ async fn tui_main(
                                     if picker.selected == 0 {
                                         // 新建会话：自动保存当前后重置
                                         if let Some(store) = &session_store {
-                                            if !sess.messages.is_empty() {
+                                            if !sess.messages.is_empty()
+                                                && state.session_persist_allowed()
+                                            {
                                                 let (title, title_generated) = match store
                                                     .load(&current_session_id)
                                                     .ok()
@@ -13100,7 +13215,9 @@ async fn tui_main(
                                         if let Some(store) = &session_store {
                                             // 自动保存当前会话
                                             {
-                                                if !sess.messages.is_empty() {
+                                                if !sess.messages.is_empty()
+                                                    && state.session_persist_allowed()
+                                                {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
                                                         .ok()
@@ -13565,13 +13682,9 @@ async fn tui_main(
                                             Ok(()) => {
                                                 should_close = true;
                                                 state.config = new_cfg.clone();
-                                                let lang = state
-                                                    .config
-                                                    .language
-                                                    .clone()
-                                                    .unwrap_or_else(|| {
-                                                        wyj_i18n::detect_system_locale().to_string()
-                                                    });
+                                                let lang = wyj_i18n::resolve_locale(
+                                                    state.config.language.as_deref(),
+                                                );
                                                 wyj_i18n::set_locale(&lang);
 
                                                 let model_for_mode = state
@@ -15480,6 +15593,66 @@ async fn tui_main(
                         continue;
                     }
 
+                    // 会话占用裁决：优先级高于两个信任框（它直接决定本次运行会不会
+                    // 覆盖别人的数据）。`Ctrl+C` 走 interrupt 而不是 Abort——用户想
+                    // 的是「停掉当前回合」，不该被顺带解释成「放弃这个会话」。
+                    if state.session_conflict.is_some() {
+                        if matches!(
+                            key.code,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)
+                        ) {
+                            state.interrupt();
+                            continue;
+                        }
+                        let choice = state
+                            .session_conflict
+                            .as_mut()
+                            .and_then(|dialog| dialog.handle_key(key.code));
+                        if let Some(choice) = choice {
+                            let info = state
+                                .session_conflict
+                                .take()
+                                .map(|dialog| dialog.info)
+                                .unwrap_or_else(|| SessionConflictInfo {
+                                    session_id: String::new(),
+                                    owner_pid: 0,
+                                });
+                            match choice {
+                                SessionConflictChoice::TakeOver => {
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                        "dialog.session_conflict_taken_over",
+                                        &[
+                                            ("pid", &info.owner_pid.to_string()),
+                                            ("id", &info.session_id),
+                                        ],
+                                    )));
+                                }
+                                SessionConflictChoice::ReadOnly => {
+                                    // 只读：会话历史照常显示，但从现在起不写回会话文件。
+                                    // 这是与 Plan 模式不同的东西——Plan 只限制文件工具，
+                                    // 会话持久化照旧发生，覆盖冲突不会被 Plan 挡住。
+                                    state.read_only_session = true;
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                        "dialog.session_conflict_read_only_applied",
+                                        &[
+                                            ("pid", &info.owner_pid.to_string()),
+                                            ("id", &info.session_id),
+                                        ],
+                                    )));
+                                }
+                                SessionConflictChoice::Abort => {
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                                        "dialog.session_conflict_abort_applied",
+                                    )));
+                                    return Ok(Some(wyj_i18n::tr(
+                                        "dialog.session_conflict_abort_applied",
+                                    )));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     // 项目级 MCP server 信任确认拦截：y/Enter=信任并连接（写盘
                     // 批准记录，下一帧 refresh_tui_mcp_runtime 会自动纳入并连接）；
                     // n/Esc/其它=本次跳过（不写盘，下次启动会重新询问）。
@@ -15874,12 +16047,10 @@ async fn tui_main(
                                 // 「切到 normal」——现在默认值是 auto，一个不带参数的
                                 // 切换命令没有任何自解释的语义。
                                 if args.is_empty() {
-                                    state.messages.push(ChatMessage::system(
-                                        wyj_i18n::tr_fmt(
-                                            "mode.current",
-                                            &[("mode", state.mode.label())],
-                                        ),
-                                    ));
+                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                        "mode.current",
+                                        &[("mode", state.mode.label())],
+                                    )));
                                     state.input_history.push(trimmed);
                                     continue;
                                 }
@@ -16187,7 +16358,9 @@ async fn tui_main(
                                                         continue;
                                                     }
                                                 };
-                                                if !sess.messages.is_empty() {
+                                                if !sess.messages.is_empty()
+                                                    && state.session_persist_allowed()
+                                                {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
                                                         .ok()
@@ -16786,7 +16959,9 @@ async fn tui_main(
                                                         continue;
                                                     }
                                                 };
-                                                if !sess.messages.is_empty() {
+                                                if !sess.messages.is_empty()
+                                                    && state.session_persist_allowed()
+                                                {
                                                     let (title, title_generated) = match store
                                                         .load(&current_session_id)
                                                         .ok()
@@ -17301,7 +17476,7 @@ async fn tui_main(
     let mut resumable_session_id = None;
     if let Some(store) = &session_store {
         if let Ok(sess) = session.try_lock() {
-            if !sess.messages.is_empty() {
+            if !sess.messages.is_empty() && state.session_persist_allowed() {
                 let (title, title_generated) = match store.load(&current_session_id).ok() {
                     Some(f) if f.title_generated => (f.title, true),
                     _ => (extract_title(&sess.messages), false),
@@ -18418,6 +18593,99 @@ mod ask_question_dialog_tests {
         assert!(state.ask_question_dialog.is_some());
         assert!(state.chat_follow_tail);
         assert!(!state.unseen_messages);
+    }
+}
+
+#[cfg(test)]
+mod session_conflict_dialog_tests {
+    use super::*;
+
+    fn dialog() -> SessionConflictDialog {
+        SessionConflictDialog::new(SessionConflictInfo {
+            session_id: "sess-x".into(),
+            owner_pid: 4242,
+        })
+    }
+
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Manual,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
+    /// 回车默认必须落在「只读」而不是「接管」：接管会整份覆盖另一个实例正在写的
+    /// 数据，而多数用户看到弹窗只会无脑回车。把破坏性选项设成默认，等于把一次误操作
+    /// 变成一次确定的数据丢失。
+    #[test]
+    fn enter_defaults_to_read_only_not_take_over() {
+        let mut dlg = dialog();
+        assert_eq!(dlg.selected, 1);
+        assert_eq!(
+            dlg.handle_key(KeyCode::Enter),
+            Some(SessionConflictChoice::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn number_keys_select_directly() {
+        assert_eq!(
+            dialog().handle_key(KeyCode::Char('1')),
+            Some(SessionConflictChoice::TakeOver)
+        );
+        assert_eq!(
+            dialog().handle_key(KeyCode::Char('2')),
+            Some(SessionConflictChoice::ReadOnly)
+        );
+        assert_eq!(
+            dialog().handle_key(KeyCode::Char('3')),
+            Some(SessionConflictChoice::Abort)
+        );
+        assert_eq!(
+            dialog().handle_key(KeyCode::Esc),
+            Some(SessionConflictChoice::Abort)
+        );
+    }
+
+    #[test]
+    fn arrows_wrap_around_all_three_options() {
+        let mut dlg = dialog();
+        // 从 1（只读）按两次 Down 到 0（接管），第三次回到 2（退出）。
+        assert_eq!(dlg.handle_key(KeyCode::Down), None);
+        assert_eq!(dlg.selected, 2);
+        assert_eq!(dlg.handle_key(KeyCode::Down), None);
+        assert_eq!(dlg.selected, 0);
+        assert_eq!(
+            dlg.handle_key(KeyCode::Enter),
+            Some(SessionConflictChoice::TakeOver)
+        );
+        assert_eq!(dlg.handle_key(KeyCode::Up), None);
+        assert_eq!(dlg.selected, 2);
+    }
+
+    /// 无关按键不产生裁决，否则输入框的正常按键会被弹窗吞掉。
+    #[test]
+    fn unrelated_keys_do_not_decide() {
+        let mut dlg = dialog();
+        assert_eq!(dlg.handle_key(KeyCode::Char('x')), None);
+        assert_eq!(dlg.handle_key(KeyCode::Backspace), None);
+    }
+
+    /// 「只读」必须在每一个保存点都真的挡住写入——面板上写着不写回、退出时却覆盖，
+    /// 比根本没有这个选项更糟。
+    #[test]
+    fn read_only_blocks_session_persistence() {
+        let mut state = make_state();
+        assert!(state.session_persist_allowed(), "默认必须允许写回");
+        state.read_only_session = true;
+        assert!(
+            !state.session_persist_allowed(),
+            "只读挂载后任何会话写入都必须被拒"
+        );
     }
 }
 

@@ -119,6 +119,12 @@ pub struct ToolCtx {
     /// `total_*` 天然不相交。`fork_for_surface` 仍然清掉它：fork 出来的
     /// 是独立会话（ACP/daemon），不该继承某一个会话的累加器。
     pub sub_usage: Option<wyj_core::session::SharedSubUsage>,
+    /// Auto 模式判定闸门（`PermissionMode::Auto` 下由它决定要不要问人）。
+    ///
+    /// 随 ctx 一起派生（见 `fork_for_surface`）而不是挂在 Agent 上：子 Agent 的
+    /// ctx 从父 ctx 派生，闸门因此自动向下传递，降级阈值计数也不会分裂成
+    /// 每个子 Agent 一份。
+    pub auto_gate: Option<std::sync::Arc<dyn wyj_core::auto_mode::AutoGate>>,
 }
 
 impl ToolCtx {
@@ -134,6 +140,7 @@ impl ToolCtx {
             allowed_tools_path: None,
             steer_queue: None,
             sub_usage: None,
+            auto_gate: None,
         }
     }
 
@@ -158,6 +165,9 @@ impl ToolCtx {
             // fork 出的会话各自独立（ACP/daemon），不该继承某一个会话的子 Agent
             // 用量累加器——那会把别的会话的开销记到本会话头上。
             sub_usage: None,
+            // 闸门**要**继承：它是进程级的策略实例（同一个 Provider、同一份
+            // 降级计数），子 Agent 绕过它就等于绕过 auto 模式的全部保护。
+            auto_gate: self.auto_gate.clone(),
         }
     }
 
@@ -193,27 +203,42 @@ impl ToolCtx {
     }
 
     /// 把当前「始终允许」集合写盘（best-effort，失败仅告警）。
+    ///
+    /// 跨进程安全的关键是**在锁内重新读盘再取并集**，而不是把内存快照整份覆盖：
+    /// 本进程启动时只 `load_allowed_tools` 一次，此后内存里那份集合对别的进程
+    /// 发生的审批一无所知。直接整份写回会让「A 批准的 Bash」被「B 批准的 Edit」
+    /// 静默抹掉，用户表现为下次启动又要重新按一遍 `a`；而旧的裸 `fs::write` 在并发
+    /// 时还会截出半截 JSON，`load_allowed_tools` 的 `if let Ok` 把它当空列表 ——
+    /// 该项目的「始终允许」于是**整体**失效一次。锁 + 原子替换 + 取并集三者缺一不可。
     fn persist_allowed_tools(&self) {
         let Some(path) = &self.allowed_tools_path else {
             return;
         };
-        let list: Vec<String> = {
-            let set = self.always_allowed.read().unwrap();
-            let mut v: Vec<String> = set.iter().cloned().collect();
-            v.sort();
-            v
+        let guard = match wyj_config::filelock::acquire(path, "project tool allowlist") {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!("获取 allowed_tools 写锁失败: {e}");
+                return;
+            }
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let mut merged: std::collections::HashSet<String> = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<Vec<String>>(&content).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        merged.extend(self.always_allowed.read().unwrap().iter().cloned());
+        let mut list: Vec<String> = merged.into_iter().collect();
+        list.sort();
         match serde_json::to_string_pretty(&list) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
+                if let Err(e) = wyj_core::serialize::write_atomic(path, json.as_bytes()) {
                     tracing::warn!("写入 allowed_tools 失败: {e}");
                 }
             }
             Err(e) => tracing::warn!("序列化 allowed_tools 失败: {e}"),
         }
+        drop(guard);
     }
 
     /// 记住当前项目对某工具的授权，并立即 best-effort 落盘。
@@ -300,11 +325,14 @@ impl ToolContext for ToolCtx {
     }
 
     async fn confirm_tool(&self, name: &str, summary: &str) -> bool {
-        // 仅 Prompt 模式拦截；AutoApprove(Bypass)/Allowlist(Plan) 不弹窗
-        // （Allowlist 的准入已由 is_allowed 前置把关）。
+        // Prompt 逐次拦截；Auto 在闸门判 Allow 时压根不会走到这里，只有
+        // 闸门判 AskUser（或压根没装闸门）才落下来弹窗——所以 Auto 必须走真实
+        // 弹窗路径，否则「没装闸门」会变成无声放行。
+        // AutoApprove(Bypass)/Allowlist(Plan) 则不弹窗（Allowlist 的准入已由
+        // is_allowed 前置把关）。
         {
             let mode = self.permission_mode.read().unwrap();
-            if !matches!(&*mode, PermissionMode::Prompt) {
+            if !matches!(&*mode, PermissionMode::Prompt | PermissionMode::Auto) {
                 return true;
             }
         }
@@ -352,9 +380,12 @@ impl ToolContext for ToolCtx {
         // 判据与 confirm_tool 的两个「直接放行」分支严格对齐，差一个字就会
         // 出现「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个
         // 对话框」——那正好破坏 `needs_dialog` 存在的唯一理由。
+        // Auto 也返回 true：闸门判定要 await 分类器、判定为 AskUser 时还要弹窗，
+        // 与 Prompt 一样会阻塞。这些调用必须串行，否则会同时弹出 N 个对话框
+        // （正是 `needs_dialog` 存在的唯一理由）。
         if !matches!(
             &*self.permission_mode.read().unwrap(),
-            PermissionMode::Prompt
+            PermissionMode::Prompt | PermissionMode::Auto
         ) {
             return false;
         }
@@ -376,6 +407,10 @@ impl ToolContext for ToolCtx {
 
     fn permission_mode(&self) -> Option<wyj_core::permission::PermissionMode> {
         Some(self.permission_mode.read().unwrap().clone())
+    }
+
+    fn auto_gate(&self) -> Option<&std::sync::Arc<dyn wyj_core::auto_mode::AutoGate>> {
+        self.auto_gate.as_ref()
     }
 
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<PathBuf, String> {

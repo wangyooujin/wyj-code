@@ -213,18 +213,37 @@ impl MemoryStore {
             return Ok(());
         }
 
-        for item in &items {
-            self.write_item(item)?;
-        }
-        self.rebuild_index()?;
-        if let Some(cfg) = self
+        // 「写条目 → 重建索引 → 淘汰超限」是一个整体状态迁移，必须整体加锁。
+        //
+        // 拆开后的两种坏结局都不报错、都不丢数据文件，只是让索引与目录不一致：
+        // ① 两个进程各重建一次索引，后写的那份基于自己更早的扫描结果，会把对方
+        //    刚写的条目从索引里抹掉（条目文件还在，只是不再被索引看见）；
+        // ② A 判定超限正要删，B 恰好写完同名条目并重建了索引 —— A 照删不误，
+        //    索引里留下一个指向已删文件的条目。
+        //
+        // 注意 `flock` 按 open file description 生效、同一 fd 二次加锁是 no-op，
+        // 但本模块每次 `acquire` 都是新 `open()`，所以**绝不能**让持锁者再去调一个
+        // 同样取这把锁的函数——那会自我死锁。下面的顺序调用因此必须留在锁外，
+        // 锁内只跑 `_locked` 变体。
+        let retention_limit = self
             .storage_cfg
             .read()
             .expect("storage_cfg lock poisoned")
-            .clone()
+            .as_ref()
+            .map(|cfg| cfg.memory_v2_md_per_kind);
+
         {
-            if let Err(error) = self.enforce_retention(cfg.memory_v2_md_per_kind) {
-                tracing::warn!("Memory v2 retention 失败: {error}");
+            let _guard =
+                wyj_config::filelock::acquire(&self.dir.join("memory.lock"), "memory v2 write")?;
+            for item in &items {
+                self.write_item(item)?;
+            }
+            // 锁内重新扫描目录，让索引反映写回那一刻的真实状态。
+            self.rebuild_index_locked()?;
+            if let Some(limit) = retention_limit {
+                if let Err(error) = self.enforce_retention_locked(limit) {
+                    tracing::warn!("Memory v2 retention 失败: {error}");
+                }
             }
         }
         tracing::debug!("记忆已写入 {} 条 → {}", items.len(), self.dir.display());
@@ -238,6 +257,12 @@ impl MemoryStore {
     /// 写在 `rebuild_index` 之后调用；不影响 index 内容（index 本来就只取
     /// `MAX_INDEX_ENTRIES=200`），只物理删除超限文件。
     pub fn enforce_retention(&self, max_per_kind: usize) -> Result<()> {
+        let _guard = wyj_config::filelock::acquire(&self.dir.join("memory.lock"), "memory v2")?;
+        self.enforce_retention_locked(max_per_kind)
+    }
+
+    /// [`Self::enforce_retention`] 的临界区版本。**必须在已持有 `memory.lock` 时调用。**
+    fn enforce_retention_locked(&self, max_per_kind: usize) -> Result<()> {
         if max_per_kind == 0 {
             return Ok(());
         }
@@ -282,11 +307,23 @@ impl MemoryStore {
             "---\nname: {}\ndescription: {}\nmetadata:\n  type: {}\n---\n\n{}\n",
             item.name, item.description, item.kind, item.body
         );
-        std::fs::write(&path, content)?;
-        Ok(())
+        // 原子写：条目可能被两个进程同时写（同名条目 = 同一记忆），裸 `fs::write`
+        // 先截断，读侧会把半截 YAML 当成缺 frontmatter 的条目直接丢掉。
+        crate::serialize::write_atomic(&path, content.as_bytes())
     }
 
-    fn rebuild_index(&self) -> Result<()> {
+    /// 重建 `MEMORY_INDEX.md`。
+    ///
+    /// **必须已持有 `memory.lock`**（由 [`Self::write_items_locked`] 之外的调用方自行
+    /// 负责加锁）——索引是整个目录的快照而非增量：条目各自一个 `.md`，索引却要重扫
+    /// 全目录后整份重写。两个进程同时重建时，后写的那份基于自己更早的扫描结果，会把
+    /// 对方刚写好的条目从索引里抹掉——条目文件还在，只是再也不被索引看见，且没有任何
+    /// 报错。症状是「刚存进去的记忆，下个会话又不见了」。
+    ///
+    /// 这里不再自己取锁：它只在「写条目 → 重建 → 淘汰」的同一个临界区里被调用，
+    /// 而 `flock` 按 open file description 生效，本模块每次加锁都是新 `open()`，
+    /// 嵌套取同一把锁会**自我死锁**。
+    fn rebuild_index_locked(&self) -> Result<()> {
         let index_path = self.dir.join(MEMORY_INDEX);
 
         let mut entries: Vec<_> = std::fs::read_dir(&self.dir)?
@@ -331,7 +368,7 @@ impl MemoryStore {
             })
             .collect();
 
-        std::fs::write(&index_path, lines.join("\n") + "\n")?;
+        crate::serialize::write_atomic(&index_path, (lines.join("\n") + "\n").as_bytes())?;
         Ok(())
     }
 }

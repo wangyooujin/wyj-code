@@ -6,6 +6,8 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod filelock;
+pub mod gitignore;
 pub mod project_mcp;
 pub mod project_settings;
 pub use project_mcp::{
@@ -54,9 +56,14 @@ pub struct McpServerConfig {
 /// Agent 运行模式
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AgentMode {
-    /// 正常模式：全部工具可用，TUI 下工具调用前弹确认
+    /// Auto 模式（默认，对齐 Claude Code v2.1.283+ 的内置起始模式）：不由人逐次
+    /// 点确认，而是由 `wyj_core::auto_mode::AutoGate` 判定——确定性规则先行，
+    /// 拿不准的送模型分类器。Shift+Tab 可切到 Manual。
     #[default]
-    Normal,
+    Auto,
+    /// 手动模式：工具调用前逐次弹窗，等人点头。与 Auto 的差别只在"谁来回答
+    /// 要不要问人"，其余闸门（受保护路径、Plan 白名单）完全一致。
+    Manual,
     /// Plan 模式：允许只读工具与受限规划文档写入；执行层仍按路径和命令复核。
     Plan,
     /// Bypass 模式：跳过普通交互确认，但不覆盖 protected deny 或 OS sandbox。
@@ -66,9 +73,23 @@ pub enum AgentMode {
 impl AgentMode {
     pub fn label(&self) -> &'static str {
         match self {
-            AgentMode::Normal => "normal",
+            AgentMode::Auto => "auto",
+            AgentMode::Manual => "manual",
             AgentMode::Plan => "plan",
             AgentMode::Bypass => "bypass",
+        }
+    }
+
+    /// 解析用户输入的模式名。`default` 是 `manual` 的别名，对齐上游：
+    /// 配置值与界面标签本来就不同（上游 UI 叫 Manual，配置写 `default`），
+    /// 让用户在这两种写法间猜是纯粹的摩擦。
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(AgentMode::Auto),
+            "manual" | "default" | "normal" => Some(AgentMode::Manual),
+            "plan" => Some(AgentMode::Plan),
+            "bypass" | "bypasspermissions" | "bypass_permissions" => Some(AgentMode::Bypass),
+            _ => None,
         }
     }
 
@@ -436,6 +457,58 @@ pub struct ComputerUseCfg {
     pub restore_context: bool,
 }
 
+/// `[auto_mode]` 节 — Auto 权限模式的判定策略（对齐 Claude Code auto mode）。
+///
+/// 字段全部是**可选**的：不写这一节时 auto 模式仍然可用，用的是内置默认值与
+/// 内置规则集（`wyj_core::auto_rules`）。这个结构只承载"用户想改什么"。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoModeCfg {
+    /// 模型分类器总开关。关掉后只剩确定性规则层，拿不准的操作一律弹窗——
+    /// 这与「分类器请求失败」是两件事：这里是用户主动选的保守模式。
+    pub enabled: bool,
+    /// 分类器使用的 profile 名。留空 = 复用当前激活的 profile；填了就用
+    /// `profiles` 里的同名分组单独跑（适合用小模型降本）。
+    pub classifier_profile: String,
+    /// 分类器单次请求超时（秒）。超时按 fail-closed 判拒绝。
+    ///
+    /// 默认 30 而非更小的值：分类器面对的端点可能是 adaptive thinking 模型，
+    /// 思考本身就要好几秒（2026-10 对 MiniMax-M3.1-Flash-Preview 实测典型
+    /// 3.4–5.5s，叠加网络抖动会逼近 15s）。超时与"判定解析失败"是同一个
+    /// fail-closed 出口，用户看到的都是"命令被莫名拒绝"，排查时容易只盯着
+    /// 预算而忽略这里。
+    pub timeout_secs: u64,
+    /// 连续被拒达到该次数后，auto 自动降级为逐次人工确认。
+    pub max_consecutive_blocks: u32,
+    /// 整个会话累计被拒达到该次数后同样降级。
+    pub max_total_blocks: u32,
+    /// true 时所有 shell 命令一律送审，不再走确定性 allow 白名单（更安全更慢）。
+    pub classify_all_shell: bool,
+    /// 分类器规则文本（英文自然语言规则，非正则）。数组中出现字面量
+    /// `"$defaults"` 就在该位置插入内置规则；不写则整段替换内置规则。
+    pub hard_deny: Vec<String>,
+    pub soft_deny: Vec<String>,
+    pub allow: Vec<String>,
+    pub environment: Vec<String>,
+}
+
+impl Default for AutoModeCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            classifier_profile: String::new(),
+            timeout_secs: 30,
+            max_consecutive_blocks: 3,
+            max_total_blocks: 20,
+            classify_all_shell: false,
+            hard_deny: Vec::new(),
+            soft_deny: Vec::new(),
+            allow: Vec::new(),
+            environment: Vec::new(),
+        }
+    }
+}
+
 /// `[model_runtime]`：国内模型工具协议与能力探测的保守默认值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -506,6 +579,38 @@ impl Default for ContextEditCfg {
             max_batches: 3,
             soft_limit_ratio: 0.55,
         }
+    }
+}
+
+/// `[agent]` 节 —— Agent 推理循环本身的参数。
+///
+/// 与 `[tools]` 分开的原因：那一节管的是「哪些工具存在」（未注册 = 模型目录里
+/// 根本看不到），而这里管的是「一次用户提交内最多能跑多少个工具轮」，两者被
+/// 同一个开关混在一起时，「关掉某个工具」和「限制循环长度」会互相误伤。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentCfg {
+    /// 单次用户提交内允许的最大推理轮数（一次 LLM 往返 = 一轮）。
+    ///
+    /// **默认 200**。它的设计意图是「防模型死循环」，不是「给正常长任务设工期」，
+    /// 所以真正触发它的场景极少——本地实测里唯一一次触顶（2026-10-15）翻出的
+    /// 200 轮全是有效工作：143 次 Edit、85 次 Bash、81 次 Read，错误率 6%，
+    /// 没有一轮空转。也就是说触顶时工作树里已经躺着大半成果，却因为拿不到
+    /// 一次总结而被判成失败。
+    ///
+    /// 因此触顶前另有 `TURN_LIMIT_GRACE` 轮收尾宽限（见 `core::agent`），到点
+    /// 会先要求模型停止调用工具、立即交付阶段成果；本值只决定那道宽限从第几轮
+    /// 开始。调高它等于给「超长任务」更多预算，调低它限制的是**单次提交**的
+    /// 最长耗时，两者都不影响死循环保护——那由 `loop_guard` 独立承担。
+    ///
+    /// 推理模型（DeepSeek `deepseek-reasoner` 等）另有更保守的 32 轮熔断，
+    /// 不受本值影响。
+    pub max_turns: usize,
+}
+
+impl Default for AgentCfg {
+    fn default() -> Self {
+        Self { max_turns: 200 }
     }
 }
 
@@ -890,6 +995,12 @@ pub struct Config {
     /// computer-use 后台优先与前台回退策略（[computer_use] 节）
     #[serde(default)]
     pub computer_use: ComputerUseCfg,
+    /// Auto 权限模式的判定策略（[auto_mode] 节）
+    #[serde(default)]
+    pub auto_mode: AutoModeCfg,
+    /// Agent 推理循环参数（[agent] 节）
+    #[serde(default)]
+    pub agent: AgentCfg,
     /// 工具注册门控（[tools] 节）
     #[serde(default)]
     pub tools: ToolsCfg,
@@ -917,6 +1028,16 @@ pub struct Config {
     /// 提醒用户。详见 `crates/cli/src/notify.rs`。
     #[serde(default)]
     pub notify: NotifyCfg,
+    /// 本进程加载时读到的**原始磁盘文本**，供 `save_to` 做三方 diff 合并。
+    ///
+    /// 存原始文本而不是 `Config` 结构：合并要发生在 **toml key 粒度**上（见
+    /// [`Config::save_to`]），用结构体比对就得为每个字段写一遍 PartialEq + 字段名，
+    /// 每加一个配置项都会变成一处新的静默漏更新。
+    ///
+    /// `None` = 无基线（内存构造的 Config，如 onboarding 写入 API Key、或测试直接
+    /// `Config::default()`），此时 `save_to` 退化为整份覆盖。
+    #[serde(skip)]
+    pub loaded_baseline: Option<String>,
 }
 
 /// `[notify]` 配置块（v0.2.23+）—— 统一通知通道的横切配置。
@@ -1040,6 +1161,8 @@ impl Default for Config {
             context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
+            auto_mode: AutoModeCfg::default(),
+            agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
@@ -1047,6 +1170,7 @@ impl Default for Config {
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             notify: NotifyCfg::default(),
+            loaded_baseline: None,
         }
     }
 }
@@ -1128,6 +1252,8 @@ impl From<LegacyConfigV0> for Config {
             context_edit: ContextEditCfg::default(),
             sandbox: SandboxCfg::default(),
             computer_use: ComputerUseCfg::default(),
+            auto_mode: AutoModeCfg::default(),
+            agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
@@ -1135,6 +1261,7 @@ impl From<LegacyConfigV0> for Config {
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             notify: NotifyCfg::default(),
+            loaded_baseline: None,
         }
     }
 }
@@ -1173,7 +1300,11 @@ impl Config {
         let p = self.active_profile();
         match mode {
             AgentMode::Plan => p.plan_model.as_deref().unwrap_or(&p.model),
-            AgentMode::Normal | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
+            // Auto / Manual / Bypass 共用 exec 模型：三者对模型能力的要求相同，
+            // 差别只在权限判定，不值得让用户为切换模式再配一个模型。
+            AgentMode::Auto | AgentMode::Manual | AgentMode::Bypass => {
+                p.exec_model.as_deref().unwrap_or(&p.model)
+            }
         }
     }
 }
@@ -1260,6 +1391,14 @@ impl Config {
             cfg.active_profile = cfg.profiles[0].name.clone();
         }
 
+        // 记下「本进程读到的原始磁盘内容」，供 `save_to` 做三方 diff 合并。
+        // 必须在上面的规范化（补默认 profile、纠正 active_profile）**之前**采样，
+        // 否则基线里会混进「我们替用户补的值」，保存时会被误判成本进程改动。
+        cfg.loaded_baseline = config_path
+            .exists()
+            .then(|| std::fs::read_to_string(config_path).ok())
+            .flatten();
+
         Ok(cfg)
     }
 
@@ -1311,10 +1450,89 @@ impl Config {
     }
 
     /// 将当前配置写入指定路径（供 `/import` 等需要注入目标路径的调用方与测试使用）。
+    ///
+    /// 跨进程安全靠两层：
+    /// 1. **锁内重读 + 三方合并**——两个 wyj-code 同时改 `config.toml` 的**不同**字段
+    ///    （A 在 `/model` 换模型、B 在 `/config` 改 log_level）时，两者都必须生效。
+    ///    合并规则是标准三方 diff：只把「本进程相对基线改过的 key」覆盖到磁盘当前值上，
+    ///    其余保留磁盘版本。若没有基线（内存构造的 Config，如 onboarding 写入 API key），
+    ///    退化成整份覆盖——那种场景本进程掌握全部事实，无从也无须合并。
+    /// 2. **原子写**（tmp + rename），保证读侧不会看到截断的 toml。
+    ///
+    /// 刻意用 **toml key 粒度**而不是给每个字段写合并代码：配置项会一直增加，
+    /// 逐字段实现意味着每加一个字段都要记得更新合并逻辑，漏一个就是新的静默丢更新。
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self).context("序列化配置失败")?;
+        let _guard = filelock::acquire(&path.with_extension("toml.lock"), "config.toml")?;
+        let merged = self.merged_toml(path)?;
+        let content = toml::to_string_pretty(&merged).context("序列化配置失败")?;
         write_atomic(path, &content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))
+    }
+
+    /// 锁内求「应该写回磁盘的最终内容」：磁盘当前值 ⊕ 本进程相对基线的改动。
+    fn merged_toml(&self, path: &Path) -> Result<toml::Value> {
+        let mine = toml::Value::try_from(self).context("序列化配置失败")?;
+        let Some(baseline) = self.loaded_baseline.as_deref() else {
+            return Ok(mine);
+        };
+        let Ok(base_value) = toml::from_str::<toml::Value>(baseline) else {
+            // 基线不可解析（文件是别的进程写的、或被人手改坏了）：无基线可 diff，
+            // 整份覆盖是此刻唯一能确定语义的选择。
+            return Ok(mine);
+        };
+        let disk = match std::fs::read_to_string(path) {
+            Ok(text) => toml::from_str::<toml::Value>(&text).ok(),
+            // 磁盘文件没了（用户删了）：以基线为底，把本进程的改动全部盖上去。
+            Err(_) => Some(base_value.clone()),
+        };
+        let Some(mut merged) = disk else {
+            return Ok(mine);
+        };
+        let (Some(base_table), Some(merged_table)) = (base_value.as_table(), merged.as_table_mut())
+        else {
+            // 磁盘上不是 table 结构：无基线结构可比，整份覆盖。
+            return Ok(mine);
+        };
+        let empty = toml::Table::new();
+        apply_changes(merged_table, base_table, mine.as_table().unwrap_or(&empty));
+        Ok(merged)
+    }
+}
+
+/// 三方合并：把 `mine` 相对 `base` 变化的 key 覆盖到 `target` 上，未变化的保留 target。
+///
+/// 递归到 table 层，因此 `[sandbox.network]` 这种嵌套块里改一个子字段也不会把
+/// 同一块里的其他子字段一起覆盖掉。数组（含 `profiles`）按整体比较。
+fn apply_changes(target: &mut toml::Table, base: &toml::Table, mine: &toml::Table) {
+    for (key, mine_value) in mine {
+        let base_value = base.get(key);
+        if Some(mine_value) == base_value {
+            // 本进程没碰这个 key —— 保留磁盘上（可能被别人改过的）值。
+            continue;
+        }
+        let Some(base_table) = base_value.and_then(toml::Value::as_table) else {
+            target.insert(key.clone(), mine_value.clone());
+            continue;
+        };
+        match target.get_mut(key).and_then(toml::Value::as_table_mut) {
+            Some(target_table) => {
+                apply_changes(
+                    target_table,
+                    base_table,
+                    mine_value.as_table().unwrap_or(&toml::Table::new()),
+                );
+            }
+            // 磁盘上这个 key 不是 table（被别人换了类型）：本进程的改动优先。
+            None => {
+                target.insert(key.clone(), mine_value.clone());
+            }
+        }
+    }
+    // 只在基线里有、mine 里删掉的 key → 也算本进程的改动，要从 target 删掉。
+    for key in base.keys() {
+        if !mine.contains_key(key) && !matches!(target.get(key), Some(toml::Value::Table(_))) {
+            target.remove(key);
+        }
     }
 }
 
@@ -1979,6 +2197,25 @@ context_window = 200000
     }
 
     #[test]
+    fn max_turns_defaults_to_200_and_is_overridable() {
+        // 老配置里根本没有 [agent] 这一节：走结构体级 serde(default)，拿到 200。
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.agent.max_turns, 200);
+
+        // 超长任务的用户需要更多预算；显式写了必须生效。
+        let cfg: Config = toml::from_str("[agent]\nmax_turns = 500\n").unwrap();
+        assert_eq!(cfg.agent.max_turns, 500);
+    }
+
+    /// `[agent]` 块存在但没写 `max_turns` 时必须仍是 200——否则用户为了调
+    /// 别的参数而新建这个块，会顺手把上限静默改成 0，整个 Agent 立刻不可用。
+    #[test]
+    fn a_partial_agent_block_keeps_the_default_budget() {
+        let cfg: Config = toml::from_str("[agent]\n").unwrap();
+        assert_eq!(cfg.agent.max_turns, 200);
+    }
+
+    #[test]
     fn save_to_sets_0o600_permissions_on_unix() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
@@ -1991,5 +2228,127 @@ context_window = 200000
             0o600,
             "config.toml 应仅当前用户可读写"
         );
+    }
+
+    use super::AgentMode;
+
+    /// 两个 wyj-code 同时改 `config.toml` 的**不同**字段时，两边都必须生效。
+    ///
+    /// 旧行为是整份覆盖：A 在 `/model` 面板改 model，B 在 `/config` 改 log_level，
+    /// B 后保存就把 A 的 model 改回旧值——用户会看到「刚换的模型自己变回去了」，
+    /// 且没有任何提示。三方合并（base=各自的加载快照，mine=各自内存态，
+    /// target=锁内重读的磁盘当前值）保证未改动的字段一律以磁盘为准。
+    #[test]
+    fn save_to_merges_concurrent_edits_to_different_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+
+        // A 与 B 都从**同一份**磁盘状态加载，各自看到相同的基线。
+        let mut a = Config::load_file_only_at(&path).unwrap();
+        let mut b = Config::load_file_only_at(&path).unwrap();
+
+        // A 改模型，B 改日志级别——两个互不相干的字段。
+        a.profiles[0].model = "model-from-A".to_string();
+        b.log_level = "debug".to_string();
+
+        // B 先落盘，A 后落盘：A 是「陈旧快照」，必须合而不是盖。
+        b.save_to(&path).unwrap();
+        a.save_to(&path).unwrap();
+
+        let final_cfg = Config::load_file_only_at(&path).unwrap();
+        assert_eq!(
+            final_cfg.profiles[0].model, "model-from-A",
+            "A 改的 model 必须保住"
+        );
+        assert_eq!(
+            final_cfg.log_level, "debug",
+            "B 改的 log_level 不能被 A 的陈旧快照盖回去"
+        );
+    }
+
+    /// 同一个字段被两个进程改：后保存者赢（无法也不该调和，只能有确定行为）。
+    #[test]
+    fn save_to_last_writer_wins_on_the_same_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+
+        let mut a = Config::load_file_only_at(&path).unwrap();
+        let mut b = Config::load_file_only_at(&path).unwrap();
+        a.profiles[0].model = "from-A".to_string();
+        b.profiles[0].model = "from-B".to_string();
+
+        a.save_to(&path).unwrap();
+        b.save_to(&path).unwrap();
+        assert_eq!(
+            Config::load_file_only_at(&path).unwrap().profiles[0].model,
+            "from-B"
+        );
+    }
+
+    /// 无基线（内存构造，如 onboarding 写 API Key）时退化为整份覆盖，不能静默不写。
+    #[test]
+    fn save_to_without_baseline_still_writes_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.profiles[0].model = "onboarded-model".to_string();
+        cfg.save_to(&path).unwrap();
+        assert_eq!(
+            Config::load_file_only_at(&path).unwrap().profiles[0].model,
+            "onboarded-model"
+        );
+    }
+
+    /// 默认起始模式必须是 Auto —— 这是与上游对齐的第一条，回归测试钉死它。
+    #[test]
+    fn default_agent_mode_is_auto() {
+        assert_eq!(AgentMode::default(), AgentMode::Auto);
+        assert_eq!(AgentMode::Auto.label(), "auto");
+    }
+
+    /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器，
+    /// 因此 `default`（上游的配置值）必须等于 `manual`（上游的界面标签）。
+    #[test]
+    fn agent_mode_parse_accepts_upstream_spellings() {
+        assert_eq!(AgentMode::parse("auto"), Some(AgentMode::Auto));
+        assert_eq!(AgentMode::parse("AUTO"), Some(AgentMode::Auto));
+        assert_eq!(AgentMode::parse("manual"), Some(AgentMode::Manual));
+        assert_eq!(AgentMode::parse("default"), Some(AgentMode::Manual));
+        assert_eq!(AgentMode::parse("normal"), Some(AgentMode::Manual));
+        assert_eq!(AgentMode::parse("plan"), Some(AgentMode::Plan));
+        assert_eq!(AgentMode::parse("bypass"), Some(AgentMode::Bypass));
+        assert_eq!(AgentMode::parse("autoo"), None);
+        assert_eq!(AgentMode::parse(""), None);
+    }
+
+    /// `[auto_mode]` 缺省时全部走内置默认值；显式声明时逐字段解析。
+    #[test]
+    fn auto_mode_cfg_defaults_and_overrides() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.auto_mode.enabled);
+        assert_eq!(cfg.auto_mode.timeout_secs, 30);
+        assert_eq!(cfg.auto_mode.max_consecutive_blocks, 3);
+        assert_eq!(cfg.auto_mode.max_total_blocks, 20);
+        assert!(!cfg.auto_mode.classify_all_shell);
+        assert!(cfg.auto_mode.allow.is_empty(), "未配置时展开由 core 负责");
+
+        let cfg: Config = toml::from_str(
+            r#"
+[auto_mode]
+enabled = false
+classifier_profile = "cheap"
+classify_all_shell = true
+max_consecutive_blocks = 1
+allow = ["$defaults", "允许推送到 staging"]
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.auto_mode.enabled);
+        assert_eq!(cfg.auto_mode.classifier_profile, "cheap");
+        assert!(cfg.auto_mode.classify_all_shell);
+        assert_eq!(cfg.auto_mode.max_consecutive_blocks, 1);
+        assert_eq!(cfg.auto_mode.allow, vec!["$defaults", "允许推送到 staging"]);
     }
 }

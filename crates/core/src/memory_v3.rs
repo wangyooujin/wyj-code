@@ -299,6 +299,13 @@ struct ExtractedClaim {
     evidence: Vec<MemoryEvidence>,
 }
 
+/// 记忆存储的写锁守卫：同时持进程内 `Mutex` 与跨进程文件锁。
+/// 见 [`MemoryV3Store::write_critical`]。
+struct MemoryWriteGuard<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    _cross: Option<wyj_config::filelock::FileLock>,
+}
+
 #[derive(Clone)]
 pub struct MemoryV3Store {
     base_dir: PathBuf,
@@ -345,6 +352,40 @@ impl MemoryV3Store {
             .clone()
     }
 
+    /// 获取「进程内 + 跨进程」双重排他写锁。
+    ///
+    /// 进程内 `Mutex` 只挡本进程的多线程并发，而 `memory-v3/global/records.json`
+    /// 与 `rejected_history.json` 是**跨全部项目共用**的单文件：两个项目各起一个
+    /// 实例（甚至同项目开两个 wyj-code）时，后写者会把先写者整份覆盖，丢的是模型
+    /// 学到的项目事实。跨进程锁必须挂在 `memory-v3/` 根而非 `projects/<key>/`——
+    /// 否则不同项目各锁各的，全局层照样撞。
+    ///
+    /// 锁刻意做成 best-effort：拿不到跨进程锁时降级为「只持进程内锁 + 告警」。
+    /// 记忆提取是每轮后台跑的辅助子系统，为它把主流程卡死或整轮丢弃，代价大于
+    /// 一次偶发的丢更新。
+    fn write_critical(&self) -> MemoryWriteGuard<'_> {
+        // `unwrap_or_else(into_inner)`：持锁线程 panic 后 Mutex 被 poison，但记忆数据
+        // 本身不会因此不一致，poison 一次不该让之后每一轮的记忆提取都失败。
+        let local = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cross = match wyj_config::filelock::acquire(
+            &self.base_dir.join("store.lock"),
+            "cross-session memory store",
+        ) {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::warn!("获取记忆存储跨进程锁失败，本次写入仅受进程内锁保护: {error}");
+                None
+            }
+        };
+        MemoryWriteGuard {
+            _local: local,
+            _cross: cross,
+        }
+    }
+
     /// 物理删除过期 record + 总条数 cap + jobs queue + rejected_history cap。
     /// 任何 cap = 0 时跳过对应清理。失败仅 `tracing::warn`,不污染主流程。
     ///
@@ -388,7 +429,7 @@ impl MemoryV3Store {
             }
 
             if changed {
-                write_json_atomic(&path, &records)?;
+                crate::serialize::write_json_atomic(&path, &records)?;
                 let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
             }
         }
@@ -411,7 +452,7 @@ impl MemoryV3Store {
                     let keep_done = cfg.memory_v3_jobs_max.saturating_sub(live_len);
                     done.truncate(keep_done);
                     jobs = live.into_iter().chain(done).collect();
-                    write_json_atomic(&path, &jobs)?;
+                    crate::serialize::write_json_atomic(&path, &jobs)?;
                 }
             }
         }
@@ -437,7 +478,7 @@ impl MemoryV3Store {
     /// 加锁版本。供外部入口(如独立 GC 任务)使用;**upsert 末尾请用
     /// `run_gc_unlocked` 避免重复 lock**。
     pub fn run_gc(&self) -> Result<()> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         self.run_gc_unlocked()
     }
 
@@ -511,7 +552,7 @@ impl MemoryV3Store {
             }
         }
 
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let scope_key = self.scope_key(request.scope)?;
         let path = self.records_path(request.scope);
         let mut records = load_json_or_default::<Vec<MemoryRecord>>(&path)?;
@@ -591,7 +632,7 @@ impl MemoryV3Store {
             blocked_reason: request.blocked_reason,
         };
         records.push(record.clone());
-        write_json_atomic(&path, &records)?;
+        crate::serialize::write_json_atomic(&path, &records)?;
         self.append_audit_locked(
             "write",
             &record.id,
@@ -1000,7 +1041,7 @@ impl MemoryV3Store {
     /// 把 PendingGlobalCandidate 翻成 Active；写入审计 `confirm_global_candidate`。
     /// 不允许 confirm 非 Pending 的记录，避免重复操作污染审计。
     pub fn confirm_global_candidate(&self, id: &str) -> Result<MemoryRecord> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let path = self.global_records_path();
         let mut records = load_json_or_default::<Vec<MemoryRecord>>(&path)?;
         let Some(record) = records.iter_mut().find(|record| record.id == id) else {
@@ -1012,7 +1053,7 @@ impl MemoryV3Store {
         record.status = MemoryClaimStatus::Active;
         record.updated_at = now_iso();
         let updated = record.clone();
-        write_json_atomic(&path, &records)?;
+        crate::serialize::write_json_atomic(&path, &records)?;
         self.append_audit_locked(
             "confirm_global_candidate",
             &updated.id,
@@ -1025,7 +1066,7 @@ impl MemoryV3Store {
     /// 把 PendingGlobalCandidate 翻成 Rejected；写入审计 + rejected_history，
     /// 之后同 fingerprint 再来 global 写入会被 `upsert` 直接拒绝。
     pub fn reject_global_candidate(&self, id: &str, reason: &str) -> Result<MemoryRecord> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let path = self.global_records_path();
         let mut records = load_json_or_default::<Vec<MemoryRecord>>(&path)?;
         let Some(record) = records.iter_mut().find(|record| record.id == id) else {
@@ -1053,7 +1094,7 @@ impl MemoryV3Store {
         record.status = MemoryClaimStatus::Rejected;
         record.updated_at = now_iso();
         let updated = record.clone();
-        write_json_atomic(&path, &records)?;
+        crate::serialize::write_json_atomic(&path, &records)?;
 
         let mut history = load_rejected_history(&self.rejected_history_path())?;
         let now = now_iso();
@@ -1093,7 +1134,7 @@ impl MemoryV3Store {
     /// 撤销一条自动或显式写入：记录本身进入 Rejected；若它 supersede 了旧
     /// 状态，则恢复旧状态为 Active。历史和审计仍保留，不做不可恢复删除。
     pub fn forget(&self, id: &str, reason: &str) -> Result<MemoryRecord> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         for path in self.accessible_record_paths() {
             let mut records = load_json_or_default::<Vec<MemoryRecord>>(&path)?;
             let Some(index) = records.iter().position(|record| record.id == id) else {
@@ -1112,7 +1153,7 @@ impl MemoryV3Store {
                 }
             }
             let record = records[index].clone();
-            write_json_atomic(&path, &records)?;
+            crate::serialize::write_json_atomic(&path, &records)?;
             self.append_audit_locked("forget", id, reason)?;
             let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
             return Ok(record);
@@ -1165,7 +1206,7 @@ impl MemoryV3Store {
         if transcript.trim().is_empty() {
             return Ok(None);
         }
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let mut jobs = load_json_or_default::<Vec<MemoryJob>>(&self.jobs_path())?;
         let fingerprint = stable_text_hash(&format!("{session_id}\n{transcript}"));
         if jobs.iter().any(|job| {
@@ -1185,7 +1226,7 @@ impl MemoryV3Store {
             attempts: 0,
             last_error: None,
         });
-        write_json_atomic(&self.jobs_path(), &jobs)?;
+        crate::serialize::write_json_atomic(&self.jobs_path(), &jobs)?;
         Ok(Some(id))
     }
 
@@ -1369,13 +1410,13 @@ impl MemoryV3Store {
             }
         }
         if changed {
-            write_json_atomic(&path, &jobs)?;
+            crate::serialize::write_json_atomic(&path, &jobs)?;
         }
         Ok(())
     }
 
     fn claim_next_job(&self) -> Result<Option<MemoryJob>> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let mut jobs = load_json_or_default::<Vec<MemoryJob>>(&self.jobs_path())?;
         let Some(job) = jobs
             .iter_mut()
@@ -1387,12 +1428,12 @@ impl MemoryV3Store {
         job.attempts = job.attempts.saturating_add(1);
         job.updated_at = now_iso();
         let claimed = job.clone();
-        write_json_atomic(&self.jobs_path(), &jobs)?;
+        crate::serialize::write_json_atomic(&self.jobs_path(), &jobs)?;
         Ok(Some(claimed))
     }
 
     fn finish_job(&self, id: &str, error: Option<String>) -> Result<()> {
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         let mut jobs = load_json_or_default::<Vec<MemoryJob>>(&self.jobs_path())?;
         let job = jobs
             .iter_mut()
@@ -1410,7 +1451,7 @@ impl MemoryV3Store {
             job.last_error = None;
         }
         job.updated_at = now_iso();
-        write_json_atomic(&self.jobs_path(), &jobs)
+        crate::serialize::write_json_atomic(&self.jobs_path(), &jobs)
     }
 
     async fn process_job(&self, job: &MemoryJob, provider: Arc<dyn Provider>) -> Result<usize> {
@@ -1496,7 +1537,7 @@ impl MemoryV3Store {
             at: now_iso(),
             detail: redact_sensitive_text(detail),
         });
-        write_json_atomic(&self.audit_path(), &events)
+        crate::serialize::write_json_atomic(&self.audit_path(), &events)
     }
 
     fn refresh_overview(&self, path: &Path) -> Result<()> {
@@ -1556,7 +1597,7 @@ impl MemoryV3Store {
         if !self.is_enabled() {
             anyhow::bail!("Memory v3 已关闭，无法 clear_all");
         }
-        let _guard = self.write_lock.lock().unwrap();
+        let _guard = self.write_critical();
         // 停 worker：避免清空时后台还在写。
         self.worker_running.store(false, Ordering::Relaxed);
 
@@ -1628,11 +1669,11 @@ impl MemoryV3Store {
             schema_version: MEMORY_V3_SCHEMA_VERSION,
         };
         let marker_path = self.base_dir.join("reset_marker.json");
-        write_json_atomic(&marker_path, &marker)?;
+        crate::serialize::write_json_atomic(&marker_path, &marker)?;
 
         // 写一份 manifest.json 方便用户审查被搬走的内容。
         let manifest_path = backup_dir.join("manifest.json");
-        write_json_atomic(&manifest_path, &moved_files)?;
+        crate::serialize::write_json_atomic(&manifest_path, &moved_files)?;
 
         let rejected_history_preserved = self.rejected_history_path().exists();
         if rejected_history_preserved {
@@ -1999,7 +2040,7 @@ fn load_rejected_history(path: &Path) -> Result<RejectedHistory> {
 }
 
 fn save_rejected_history(path: &Path, history: &RejectedHistory) -> Result<()> {
-    write_json_atomic(path, history)
+    crate::serialize::write_json_atomic(path, history)
 }
 
 /// Global 候选指纹：足以把"同一偏好/事实"的不同描述聚到一起，又不会把无关
@@ -2039,25 +2080,11 @@ fn kind_slug(kind: MemoryClaimKind) -> &'static str {
     }
 }
 
-fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-    let bytes = serde_json::to_vec_pretty(value)?;
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
+/// 文本版原子写。委托给公共实现——「tmp 写完再 rename」这段逻辑全仓只该有一份；
+/// 曾经 memory_v3 / checkpoint / evolution 各抄一遍，三份的 tmp 名生成规则还各不
+/// 相同（`.simple()` 全长 / 带横杠 / 只取前 8 位），排查残留 tmp 文件时说不清该删哪个。
 fn write_text_atomic(path: &Path, value: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-    fs::write(&tmp, value.as_bytes())?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    crate::serialize::write_atomic(path, value.as_bytes())
 }
 
 fn status_rank(record: &MemoryRecord) -> (u8, u8) {

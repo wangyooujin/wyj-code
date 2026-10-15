@@ -10,6 +10,15 @@ use serde_json::Value;
 pub enum PermissionMode {
     /// 交互表面逐次询问；无交互表面 fail-closed。
     Prompt,
+    /// Auto 模式（对齐 Claude Code auto mode）：本模式下**不再逐次弹窗**，
+    /// 「要不要问人」交给 `crate::auto_mode::AutoGate` 判定——确定性规则先行，
+    /// 拿不准的送模型分类器。
+    ///
+    /// 这里刻意返回 `Allow` 而不是新增一个 verdict 变体：真正的判定需要
+    /// `.await` 模型，而 `evaluate` 是同步函数。Auto 闸门挂在 `Agent` 侧
+    /// （`Agent::ensure_tool_permission`），本函数只负责**任何模式都不放行**
+    /// 的那部分（受保护路径写入、Plan 白名单）。
+    Auto,
     /// 显式 bypass。跳过询问，但不绕过受保护路径。
     AutoApprove,
     /// Headless/schedule 的显式工具白名单。
@@ -148,6 +157,10 @@ impl PermissionPolicy {
                 PermissionVerdict::Allow
             }
             PermissionMode::AutoApprove => PermissionVerdict::Allow,
+            // Auto 不在这里下结论：受保护路径已在上面的 `safe_resolve_write_target`
+            // 里 deny 掉，剩下的「要不要问人」需要 await 分类器，由 Agent 侧的
+            // AutoGate 负责。这里放行不代表动作会真的执行。
+            PermissionMode::Auto => PermissionVerdict::Allow,
             PermissionMode::Prompt => {
                 if is_side_effect_tool(&request.tool_name, &request.input) {
                     if request.surface.is_interactive() {
