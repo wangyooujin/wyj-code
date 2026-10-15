@@ -453,6 +453,9 @@ impl WorkflowWorkspace {
             base_revision: self.base_revision.clone(),
             parent_checkpoint_id: Some(self.parent_checkpoint_id.clone()),
             purpose: context.node.prompt.clone(),
+            // workflow 节点保持 detached：节点产出要的是 diff 证据而非可推送分支，
+            // 而节点分支名带 workflow id / node id，推到远端几乎必然撞名。
+            branch: None,
         })
     }
 }

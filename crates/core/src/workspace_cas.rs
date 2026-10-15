@@ -105,6 +105,21 @@ impl WorkspaceCas {
             .join(format!("{hash}.meta.json"))
     }
 
+    /// 单个 blob 的跨进程写锁：`<root>/locks/<hash>.lock`。
+    ///
+    /// 刻意**不**放在 blob 同目录：`gc` / `stats` 遍历 `sha256/` 时按
+    /// `.meta.json` 后缀筛选，把锁放那儿会留下一堆删不掉的孤儿文件。`locks/` 不在
+    /// 扫描路径下，且随 CAS root 整体清理。
+    fn lock_hash(&self, hash: &str, what: &str) -> Result<wyj_config::filelock::FileLock> {
+        debug_assert_eq!(hash.len(), 64, "SHA-256 hex must be 64 chars");
+        let path = self
+            .root
+            .join("locks")
+            .join(&hash[..2])
+            .join(format!("{hash}.lock"));
+        wyj_config::filelock::acquire(&path, what)
+    }
+
     /// 计算 SHA-256 并返回 lowercase hex。纯函数,无副作用。
     pub fn digest(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
@@ -112,12 +127,19 @@ impl WorkspaceCas {
 
     /// 写或返回已存在 hash。幂等:同内容多次写只增 ref_count。
     ///
+    /// 整个「存在性检查 → 建 blob / 加计数」在**每个 blob 一把**的跨进程锁内完成。
+    /// 少了这把锁会出现一种静默损坏：两个进程同时发现 blob 不存在，各写一遍并各把
+    /// `ref_count` 写成 1（实际有 2 个引用）；其中一个随后 `release` 让计数归零，
+    /// `gc` 就把 blob 删了——另一个进程下一次 `get()` 直接失败，
+    /// checkpoint 的 workspace 快照**不可恢复**。同一个 bug 在单进程下永远测不出来。
+    ///
     /// 错误时返回 `Err`,调用方应 fallback 到 inline bytes(不阻断 checkpoint 写入)。
     pub fn intern(&self, bytes: &[u8]) -> Result<String> {
         let hash = Self::digest(bytes);
         let blob = self.blob_path(&hash);
         let meta = self.meta_path(&hash);
 
+        let _guard = self.lock_hash(&hash, "intern CAS blob")?;
         let now = now_iso();
         if blob.exists() {
             // 已存在:原子地 ref_count++ 并刷新 last_ref_at
@@ -181,6 +203,13 @@ impl WorkspaceCas {
         if !meta_path.exists() {
             return Ok(());
         }
+        // 与 `intern` 同一把锁：否则 decrement 可能和另一个进程的 increment 交叉，
+        // 计数凭空少一次/多一次，最终让 gc 删掉还在用的 blob。
+        let _guard = self.lock_hash(hash, "release CAS blob")?;
+        // 等锁期间 blob 可能刚被另一个进程 gc 掉，重新确认一次。
+        if !meta_path.exists() {
+            return Ok(());
+        }
         let mut meta: CasMeta = match serde_json::from_slice(&std::fs::read(&meta_path)?) {
             Ok(value) => value,
             Err(error) => {
@@ -197,6 +226,7 @@ impl WorkspaceCas {
     }
 
     /// 原子地 ref_count++ 并刷新 last_ref_at。
+    /// **必须在 [`Self::lock_hash`] 的临界区内调用**。
     fn bump_ref_count(&self, meta_path: &Path, now: &str) -> Result<()> {
         let mut meta: CasMeta = match std::fs::read(meta_path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -436,6 +466,87 @@ mod tests {
         let meta: CasMeta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
         assert_eq!(meta.ref_count, 2);
         assert_eq!(meta.size, 3);
+    }
+
+    /// 并发 `intern` 同一份内容时 `ref_count` 必须精确累加。
+    ///
+    /// 这条测试在**同一进程内用多线程**就能覆盖到 bug：POSIX `flock` 绑定的是
+    /// open file description，同进程两次 `open()` 同一文件得到两个 description，
+    /// 照样互斥。所以「每 hash 一把跨进程锁」在这里的语义与多进程一致，不必 fork。
+    ///
+    /// 没有锁时的失败形态很具体：所有线程都读到 `blob 不存在`，各写一遍并各把
+    /// `ref_count` 写成 1，随后任一次 release 就归零，`gc` 把还在用的 blob 删掉，
+    /// checkpoint 的 workspace 快照**不可恢复**。
+    #[test]
+    fn concurrent_interns_accumulate_ref_count_without_losing_updates() {
+        const THREADS: usize = 8;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let cas = cas_with_root(&root);
+                    barrier.wait();
+                    cas.intern(b"shared payload").unwrap()
+                })
+            })
+            .collect();
+        let hashes: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let cas = cas_with_root(&root);
+        let hash = hashes[0].clone();
+        assert!(
+            hashes.iter().all(|h| *h == hash),
+            "同内容必须寻址到同一个 blob"
+        );
+        let meta: CasMeta =
+            serde_json::from_slice(&std::fs::read(cas.meta_path(&hash)).unwrap()).unwrap();
+        assert_eq!(
+            meta.ref_count, THREADS as u32,
+            "{THREADS} 次并发 intern 后 ref_count 应为 {THREADS}，实际 {} —— 说明有丢更新",
+            meta.ref_count
+        );
+        assert!(cas.get(&hash).is_ok(), "blob 必须仍可读");
+    }
+
+    /// 并发 release 不能把计数减穿：`saturating_sub` 只防下溢，不防多减。
+    #[test]
+    fn concurrent_releases_never_double_decrement() {
+        const THREADS: usize = 8;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        let cas = cas_with_root(&root);
+        let hash = cas.intern(b"shared payload").unwrap();
+        // 只放 1 次引用，却有 THREADS 个线程同时 release。
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                let hash = hash.clone();
+                std::thread::spawn(move || {
+                    let cas = cas_with_root(&root);
+                    barrier.wait();
+                    cas.release(&hash).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let meta: CasMeta =
+            serde_json::from_slice(&std::fs::read(cas.meta_path(&hash)).unwrap()).unwrap();
+        assert_eq!(meta.ref_count, 0);
+        assert!(
+            cas.get(&hash).is_ok(),
+            "0 引用也不该立刻删实体——那是 gc 的活"
+        );
     }
 
     #[test]
