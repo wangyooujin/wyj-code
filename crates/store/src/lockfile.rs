@@ -71,6 +71,22 @@ pub struct InstalledManifest {
     /// v2 统一资源索引。旧数组仍然是配置/运行时的兼容来源，迁移完成后由
     /// extensions 模块逐步补齐此索引。
     pub extensions: Vec<ExtensionLockEntry>,
+    /// 本进程加载时读到的**原始 lockfile 文本**，供 `save_to` 做三方 diff 合并。
+    ///
+    /// 为什么必须存基线而不能「锁内 union 一下」：**卸载是硬删**（`remove_extension`
+    /// 走 `retain`，卸载 skill/plugin 直接从数组里 `retain` 掉）。union 会把另一个
+    /// 进程刚卸载的条目复活，用户看到「我明明卸载了它又回来了」。
+    ///
+    /// 存原始文本而不是「本进程改过的 id 集合」：manifest 有 **7 个并行数组**
+    /// （mcp_servers / skills / marketplaces / mcp_registries / plugins /
+    /// plugin_marketplaces / extensions），卸载改动分散在多个数组里，逐数组维护
+    /// 「我删了哪些 id」极容易漏一项——而漏掉的那一项会以「别人的卸载被撤销」
+    /// 的形式暴露出来，比丢更新更难解释。
+    ///
+    /// 存基线而不是改 `save_global`/`save_project` 的签名：调用点有二十几处，
+    /// 让每个调用方自己传 base 只会诱使后来者漏传，退化成静默丢更新。
+    #[serde(skip)]
+    pub baseline_json: Option<String>,
 }
 
 impl InstalledManifest {
@@ -84,6 +100,7 @@ impl InstalledManifest {
             plugins: Vec::new(),
             plugin_marketplaces: Vec::new(),
             extensions: Vec::new(),
+            baseline_json: None,
         }
     }
 }
@@ -305,7 +322,13 @@ pub fn project_lockfile_path(cwd: &Path) -> PathBuf {
 
 fn load_from(path: &Path) -> Result<InstalledManifest> {
     if !path.exists() {
-        return Ok(InstalledManifest::new());
+        let mut manifest = InstalledManifest::new();
+        // 空基线**必须**记下来：文件不存在是最常见的情形（首次装扩展），
+        // 此时若返回 `baseline_json: None`，`save_to` 会退化成整份覆盖，于是两个
+        // 实例各自「首次安装」时后一个照样抹掉前一个——恰好把最需要保护的场景
+        // 排除在保护之外。
+        manifest.baseline_json = serde_json::to_string(&InstalledManifest::new()).ok();
+        return Ok(manifest);
     }
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("读取 lockfile 失败: {}", path.display()))?;
@@ -313,6 +336,7 @@ fn load_from(path: &Path) -> Result<InstalledManifest> {
         .with_context(|| format!("解析 lockfile 失败: {}", path.display()))?;
     // v1 文件缺少统一 extensions 数组；保留所有旧字段并在下次写入时升级。
     manifest.version = LOCKFILE_VERSION;
+    manifest.baseline_json = Some(content);
     Ok(manifest)
 }
 
@@ -321,7 +345,13 @@ fn save_to(path: &Path, manifest: &InstalledManifest) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("创建 lockfile 目录失败: {}", parent.display()))?;
     }
-    let content = serde_json::to_string_pretty(manifest).context("序列化 lockfile 失败")?;
+    // 跨进程排他锁：装/卸扩展是 load → 改 → save 的 read-modify-write，此前
+    // 两个 wyj-code 同时装东西时后保存者会把对方刚装的条目整个盖掉，
+    // 表现为「刚装好的 skill 重启后不见了」。
+    let _guard =
+        wyj_config::filelock::acquire(&path.with_extension("json.lock"), "installed.json")?;
+    let merged = merge_with_disk(path, manifest)?;
+    let content = serde_json::to_string_pretty(&merged).context("序列化 lockfile 失败")?;
     // Write beside the destination and rename only after the complete JSON is
     // on disk.  A killed process or a full volume must never leave a truncated
     // installed.json that makes every extension appear missing on next start.
@@ -349,6 +379,115 @@ fn save_to(path: &Path, manifest: &InstalledManifest) -> Result<()> {
         return Err(e).with_context(|| format!("替换 lockfile 失败: {}", path.display()));
     }
     Ok(())
+}
+
+/// 把本进程的改动三方合并到锁内重读的磁盘值上。
+///
+/// 规则（`base` = 本进程加载时的 manifest，`mine` = 内存态，`disk` = 此刻磁盘值），
+/// 对 manifest 里**每一个数组**按 join key 逐条判定：
+///
+/// | base 有 | mine 有 | 结论 |
+/// |---|---|---|
+/// | ✓ | ✓ | 本进程可能改过它 → 以 `mine` 为准 |
+/// | ✓ | ✗ | **本进程卸载了它** → 从结果删除（不复活） |
+/// | ✗ | ✓ | 本进程新装的 → 追加 |
+/// | ✗ | ✗ | 本进程没碰 → 保留 `disk` 的 |
+///
+/// 「base 有而 mine 无」这一格就是**不能**用 union 的原因：union 会把别人刚卸载的
+/// 条目复活，用户看到「我明明卸载了，它又回来了」。
+///
+/// 7 个数组全部走同一条规则——旧数组（`mcp_servers` / `skills` / `plugins` …）目前
+/// 仍是运行时的兼容来源，只合并 `extensions` 会让「卸载」在这些数组上失效。
+///
+/// 无基线（内存构造的 manifest，见测试与迁移路径）时退化为整份覆盖——此时本进程
+/// 掌握全部事实，无从也无须合并。
+fn merge_with_disk(path: &Path, mine: &InstalledManifest) -> Result<InstalledManifest> {
+    let parse_base = || {
+        let raw = mine.baseline_json.as_deref()?;
+        serde_json::from_str::<InstalledManifest>(raw).ok()
+    };
+    let Some(base) = parse_base() else {
+        return Ok(mine.clone());
+    };
+    let Ok(disk) = load_from(path) else {
+        return Ok(mine.clone());
+    };
+    let mut merged = disk.clone();
+    merged.version = mine.version;
+    merged.baseline_json = None;
+
+    merged.mcp_servers = merge_entries(
+        &disk.mcp_servers,
+        &base.mcp_servers,
+        &mine.mcp_servers,
+        |e| e.name.clone(),
+    );
+    merged.skills = merge_entries(&disk.skills, &base.skills, &mine.skills, |e| e.name.clone());
+    merged.marketplaces = merge_entries(
+        &disk.marketplaces,
+        &base.marketplaces,
+        &mine.marketplaces,
+        |e| e.id.clone(),
+    );
+    merged.mcp_registries = merge_entries(
+        &disk.mcp_registries,
+        &base.mcp_registries,
+        &mine.mcp_registries,
+        |e| e.id.clone(),
+    );
+    merged.plugins = merge_entries(&disk.plugins, &base.plugins, &mine.plugins, |e| {
+        e.name.clone()
+    });
+    merged.plugin_marketplaces = merge_entries(
+        &disk.plugin_marketplaces,
+        &base.plugin_marketplaces,
+        &mine.plugin_marketplaces,
+        |e| e.id.clone(),
+    );
+    merged.extensions = merge_entries(&disk.extensions, &base.extensions, &mine.extensions, |e| {
+        e.id.clone()
+    });
+    Ok(merged)
+}
+
+/// 单个数组的三方合并，见 [`merge_with_disk`] 的规则表。
+///
+/// `key` 取 `fn(&T) -> String`（而不是返回 `&String` 的闭包）：`impl Fn(&T) -> K`
+/// 会要求闭包对**任意**生命周期都能返回 `K`，而借用返回做不到；直接返回 owned 的
+/// key 换来一个能编译的签名，一行 `name.clone()` 的开销相对 JSON 序列化可以忽略。
+fn merge_entries<T: Clone>(disk: &[T], base: &[T], mine: &[T], key: fn(&T) -> String) -> Vec<T> {
+    let base_keys: HashSet<String> = base.iter().map(&key).collect();
+    let mine_keys: HashSet<String> = mine.iter().map(&key).collect();
+    // 先保留 disk 上「本进程没删」的条目：磁盘上多出来的（别人装的）自动并入。
+    let mut result: Vec<T> = disk
+        .iter()
+        .filter(|entry| {
+            let key = key(entry);
+            // 保留条件 = 「基线里没有它」或「本进程仍然要它」
+            !base_keys.contains(&key) || mine_keys.contains(&key)
+        })
+        .cloned()
+        .collect();
+    for entry in mine {
+        let entry_key = key(entry);
+        match result.iter_mut().find(|e| key(e) == entry_key) {
+            Some(existing) => {
+                // 磁盘上已有同名条目：不论是本进程改的还是本进程新装的，都以本进程为准
+                //（并发装同一 id 时本进程拿到的版本可能更新）。
+                *existing = entry.clone();
+            }
+            None if base_keys.contains(&entry_key) => {
+                // mine 有、base 有、disk 却没有 → 别人刚卸载了它。
+                // 尊重删除，不复活——否则等于撤销别人刚做的卸载。
+            }
+            None => {
+                // 本进程新装的。
+                result.push(entry.clone());
+            }
+        }
+    }
+    result.sort_by_key(key);
+    result
 }
 
 pub fn load_global() -> Result<InstalledManifest> {
