@@ -174,6 +174,13 @@ pub struct CheckpointSummary {
     /// baseline 节点或 Git snapshot 时为 None。
     #[serde(default)]
     pub baseline_id: Option<String>,
+    /// 创建者 pid。`enforce_retention` 据此跳过**别的活跃进程**的 checkpoint。
+    ///
+    /// 没有这个字段时，同一 session 被两个 wyj-code resume 会互相删对方的
+    /// checkpoint：A 刚建好、正要 `/rewind` 回去的那一个，被 B 的保留策略淘汰，
+    /// 表现为「刚才还在的回滚点突然没了」，且无法从数据侧解释。
+    #[serde(default)]
+    pub owner_pid: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +258,22 @@ pub fn set_checkpoint_config(cfg: CheckpointConfig) {
 pub fn clear_checkpoint_config_for_tests() {
     if let Ok(mut slot) = CHECKPOINT_CONFIG.lock() {
         *slot = None;
+    }
+}
+
+/// 仅供单测:串行化那些读写 `CHECKPOINT_CONFIG` 的用例。
+///
+/// cargo test 默认多线程跑用例,而 `CHECKPOINT_CONFIG` 是**进程内全局可变状态**。
+/// 三个用例都在同一进程里 set/clear 它,并行执行时一个用例的 `clear` 会落在另一个
+/// 用例的 `set` 与读取之间——`configured_defaults_to_unlimited_and_no_cas_when_unset`
+/// 偶发读到别人注入的 7 就是这么来的。用例串行化是唯一正确的修法:让它们依赖「当前
+/// 没人改过配置」这个前提,就必须真正独占这个全局。
+#[cfg(test)]
+pub(crate) fn checkpoint_config_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match TEST_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -362,12 +385,17 @@ impl CheckpointStore {
             message_count: checkpoint.messages.len(),
             cwd_root,
             baseline_id,
+            owner_pid: std::process::id(),
         };
-        let mut manifest = self.load_manifest().unwrap_or_default();
-        manifest.checkpoints.push(summary.clone());
-        write_json_atomic(&self.manifest_path(), &manifest)?;
-        if let Err(error) = self.enforce_retention() {
-            tracing::warn!("Checkpoint retention 失败: {error}");
+        // push 与 retention 合并在**同一个**临界区里：分成两步的话，中间会被
+        // 另一个进程的 push 插进来，把裁剪结果整个盖回去，manifest 于是反复在
+        // 「超过上限」和「丢条目」之间来回横跳。
+        match self.mutate_manifest(|manifest| {
+            manifest.checkpoints.push(summary.clone());
+            self.prune_manifest_locked(manifest)
+        }) {
+            Ok(()) => {}
+            Err(error) => tracing::warn!("Checkpoint manifest 更新/retention 失败: {error}"),
         }
         Ok(summary)
     }
@@ -429,30 +457,62 @@ impl CheckpointStore {
     /// 按 manifest 中 timestamp 升序淘汰最老 checkpoint + 同步 manifest。
     /// `max_per_session == 0` 时跳过。失败仅 `tracing::warn`,不污染主流程。
     pub fn enforce_retention(&self) -> Result<()> {
+        self.mutate_manifest(|manifest| self.prune_manifest_locked(manifest))
+            .map(|_| ())
+    }
+
+    /// 保留上限之内的裁剪逻辑。**必须在 [`Self::mutate_manifest`] 的临界区内调用**
+    /// ——它会就地改 `manifest` 并删除磁盘上的 checkpoint 文件，中途被别的进程
+    /// 插一脚就会留下「manifest 说还在、文件已经没了」的僵尸条目。
+    ///
+    /// 跨进程保护：只淘汰**自己创建的**或**创建者已死**的 checkpoint。别人正在用的
+    /// 会话快照不是本进程的垃圾，哪怕它比自己创建得早——删掉它等于让另一个终端的
+    /// `/rewind` 目标凭空消失。单进程场景下 `owner_pid` 就是自己，行为与旧版完全一致。
+    fn prune_manifest_locked(&self, manifest: &mut CheckpointManifest) -> Result<()> {
         if self.max_per_session == 0 {
             return Ok(());
         }
-        let mut manifest = self.load_manifest().unwrap_or_default();
-        if manifest.checkpoints.len() <= self.max_per_session {
+        let self_pid = std::process::id();
+        // 先把「别人活着的」摘出来数一遍：它们占着配额却不能删，所以上限针对本进程
+        // 实际能删的那些计算，否则两个实例各留 21 个、总数直接翻倍。
+        // 收集 owned 的 id 而不是借 `&str`——下面要 `mem::take` 整个 vector。
+        let foreign_live: BTreeSet<String> = manifest
+            .checkpoints
+            .iter()
+            .filter(|entry| entry.owner_pid != self_pid)
+            .filter(|entry| {
+                entry.owner_pid == 0 || wyj_config::filelock::is_process_alive(entry.owner_pid)
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        let removable = manifest.checkpoints.len() - foreign_live.len();
+        if removable <= self.max_per_session {
             return Ok(());
         }
-        // 按 timestamp 升序,保留后 N 条(最新)
+        // 按 timestamp 升序,保留后 N 条(最新);被跳过的条目原样留回 manifest。
         manifest
             .checkpoints
             .sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-        let to_remove: Vec<String> = manifest
-            .checkpoints
-            .drain(..manifest.checkpoints.len() - self.max_per_session)
-            .map(|c| c.id)
-            .collect();
-        for id in &to_remove {
-            validate_checkpoint_id(id)?;
-            let path = self.checkpoint_path(id);
-            if let Err(error) = std::fs::remove_file(&path) {
-                tracing::warn!("删除旧 checkpoint 失败 {}: {error}", path.display());
+        let drop_count = removable - self.max_per_session;
+        let mut dropped = 0;
+        let mut kept = Vec::with_capacity(manifest.checkpoints.len());
+        for entry in std::mem::take(&mut manifest.checkpoints) {
+            if dropped < drop_count && !foreign_live.contains(&entry.id) {
+                validate_checkpoint_id(&entry.id)?;
+                let path = self.checkpoint_path(&entry.id);
+                if let Err(error) = std::fs::remove_file(&path) {
+                    // 删不掉就留在 manifest 里：manifest 有条目而文件在，是无害的
+                    // （`load` 能读出来）；反过来才是数据损坏。
+                    tracing::warn!("删除旧 checkpoint 失败 {}: {error}", path.display());
+                    kept.push(entry);
+                } else {
+                    dropped += 1;
+                }
+            } else {
+                kept.push(entry);
             }
         }
-        write_json_atomic(&self.manifest_path(), &manifest)?;
+        manifest.checkpoints = kept;
         Ok(())
     }
 
@@ -517,6 +577,10 @@ impl CheckpointStore {
         self.dir.join("manifest.json")
     }
 
+    fn manifest_lock_path(&self) -> PathBuf {
+        self.dir.join("manifest.json.lock")
+    }
+
     fn checkpoint_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}.json"))
     }
@@ -527,6 +591,28 @@ impl CheckpointStore {
             return Ok(CheckpointManifest::default());
         }
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    /// 在跨进程排他锁内完成「读 manifest → 修改 → 原子写回」整个 read-modify-write。
+    ///
+    /// manifest 是 checkpoint 唯一的索引，任何一次「读到旧版本 → 写回自己的版本」
+    /// 都会静默抹掉别的进程刚 push 的条目。两处写者（`create` 的 push 与
+    /// `enforce_retention` 的裁剪）共用这把锁，所以「新增 + 裁剪」也是一次原子的
+    /// 状态迁移，不会出现裁剪结果被别人的 push 覆盖回去。
+    ///
+    /// 注意这**只**解决索引一致性，不解决 checkpoint 文件本身的归属——同一个
+    /// session 被两个进程 resume 时，两边都会 create，那是另一个问题（见
+    /// `SessionStore::active_owner` 与 `enforce_retention` 的 owner 保护）。
+    fn mutate_manifest<R>(
+        &self,
+        mutate: impl FnOnce(&mut CheckpointManifest) -> Result<R>,
+    ) -> Result<R> {
+        let _guard =
+            wyj_config::filelock::acquire(&self.manifest_lock_path(), "checkpoint manifest")?;
+        let mut manifest = self.load_manifest()?;
+        let result = mutate(&mut manifest)?;
+        write_json_atomic(&self.manifest_path(), &manifest)?;
+        Ok(result)
     }
 }
 
@@ -783,12 +869,20 @@ fn capture_files(root: &Path, cas: Option<&WorkspaceCas>) -> Result<FileSnapshot
     for entry in ignore::WalkBuilder::new(&root)
         .hidden(false)
         .git_ignore(true)
-        // **必须**为 false：`ignore` 的 `git_ignore(true)` 默认 `require_git = true`，
-        // 在非 git 仓库里会**整份丢弃 .gitignore**，于是被项目显式排除的目录
-        // （典型：`.venv/`、数据产物目录、`archive/`）照样被遍历、被读取。
-        // checkpoint 的快照范围由项目的忽略规则决定，而不是「一律全量」。
-        .require_git(false)
+        // 按仓库位置动态决定 `require_git`，而不是写死 false：
+        // - 非 git 仓库：`ignore` 的 `git_ignore(true)` 默认要求在 git 仓库内，
+        //   否则**整份丢弃 .gitignore**，被项目显式排除的目录（典型：`.venv/`、
+        //   数据产物目录）照样被遍历、被读取。checkpoint 的快照范围应由项目的
+        //   忽略规则决定，而不是「一律全量」。
+        // - git 仓库 / **managed worktree**：必须为 true，否则主仓库的
+        //   `.git/info/exclude` 失效。`ignore` 解析 worktree common git dir
+        //   （`.git` 是 `gitdir:` 指针文件）只在 `require_git == true` 的分支里，
+        //   写死 false 会让它去读 `<worktree>/.git/info/exclude`——一个文件。
+        //   后果是 checkpoint 把用户明确排除的目录整个快照进会话历史。
+        .require_git(wyj_config::gitignore::is_inside_git_repo(&root))
         .ignore(true)
+        .git_global(true)
+        .git_exclude(true)
         .build()
         .flatten()
     {
@@ -1153,22 +1247,18 @@ fn git_output_bytes(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<
     Ok(output.stdout)
 }
 
+/// checkpoint 的 JSON 落盘：**紧凑**格式 + 敏感信息脱敏。
+///
+/// 与 `serialize::write_json_atomic` 的两点差异都是有意的，别顺手统一掉：
+/// 1. 脱敏 —— checkpoint 会快照整个 workspace（含未提交的源码），比会话文件
+///    更容易扫到用户硬编码的 token；会话侧同样脱敏，两者必须一致。
+/// 2. 紧凑（`to_string` 而非 pretty）—— 每个 checkpoint 含一份完整 workspace 快照，
+///    而保留条数由 `max_per_session` 控制（默认 21），缩进带来的膨胀会直接换成磁盘。
+///
+/// tmp + rename 的原子替换逻辑委托给 `serialize::write_atomic`，全仓只此一份。
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let json = serde_json::to_string(value)?;
-    let bytes = crate::secret::redact_sensitive_text(&json).into_bytes();
-    if let Err(error) = std::fs::write(&temp, bytes) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    if let Err(error) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    Ok(())
+    crate::serialize::write_atomic(path, crate::secret::redact_sensitive_text(&json).as_bytes())
 }
 
 /// 进程内全局 `PersistCapCfg` —— 由 CLI 装配阶段 `set_checkpoint_persist_cap`
@@ -1381,6 +1471,51 @@ mod tests {
                 "{ignored} 被 .gitignore 排除，不该进快照（否则每次工具调用都要重读一遍）"
             );
         }
+    }
+
+    /// managed worktree 里主仓库的 `.git/info/exclude` 必须仍然生效。
+    ///
+    /// worktree 的 `.git` 是 `gitdir:` 指针文件，`info/exclude` 始终躺在**主仓库**
+    /// 的 common git dir 下。`ignore` crate 解析这条路径只在 `require_git == true`
+    /// 的分支里；本模块此前写死 `require_git(false)`（为了修非 git 目录的
+    /// `.gitignore` 失效），于是 worktree 里会去读 `<worktree>/.git/info/exclude`
+    /// ——那是个文件。症状是 checkpoint 把用户用 info/exclude 明确排除的目录
+    /// （典型：本地密钥笔记、`*.local` 配置）整个快照进**会话历史并落盘**。
+    #[test]
+    fn worktree_checkpoint_honours_the_main_repo_info_exclude() {
+        let base = tempfile::tempdir().unwrap();
+        let main_git = base.path().join("main/.git");
+        let work_git = main_git.join("worktrees/wt");
+        std::fs::create_dir_all(main_git.join("info")).unwrap();
+        std::fs::create_dir_all(&work_git).unwrap();
+        std::fs::write(main_git.join("info/exclude"), "secrets/\n").unwrap();
+        // worktree 的 git dir 通过 `commondir` 指回主仓库的 `.git`（worktree 实测就是 `../..`）。
+        std::fs::write(work_git.join("commondir"), "../..\n").unwrap();
+
+        let worktree = base.path().join("wt");
+        std::fs::create_dir_all(worktree.join("secrets")).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", work_git.display()),
+        )
+        .unwrap();
+        std::fs::write(worktree.join("secrets/token.txt"), "hunter2").unwrap();
+        std::fs::write(worktree.join("keep.py"), "kept").unwrap();
+
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "gitignore-worktree").unwrap();
+        let summary = store
+            .create(&worktree, &[], CheckpointKind::Manual, None)
+            .unwrap();
+        let checkpoint = store.load(&summary.id).unwrap();
+        let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
+            panic!("expected files snapshot");
+        };
+        assert!(
+            !snapshot.files.contains_key(Path::new("secrets/token.txt")),
+            "主仓库 info/exclude 排除的目录不该被快照进会话历史"
+        );
+        assert!(snapshot.files.contains_key(Path::new("keep.py")));
     }
 
     /// 钉子：**超配额的文件一个字节都不该读**。
@@ -1746,6 +1881,7 @@ mod tests {
 
     #[test]
     fn configured_defaults_to_unlimited_and_no_cas_when_unset() {
+        let _guard = checkpoint_config_test_guard();
         clear_checkpoint_config_for_tests();
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::configured(sessions.path(), "s-default").unwrap();
@@ -1755,6 +1891,7 @@ mod tests {
 
     #[test]
     fn configured_picks_up_injected_max_per_session() {
+        let _guard = checkpoint_config_test_guard();
         clear_checkpoint_config_for_tests();
         let sessions = tempfile::tempdir().unwrap();
         set_checkpoint_config(CheckpointConfig {
@@ -1770,6 +1907,7 @@ mod tests {
 
     #[test]
     fn set_checkpoint_config_replaces_previous_value() {
+        let _guard = checkpoint_config_test_guard();
         clear_checkpoint_config_for_tests();
         let sessions = tempfile::tempdir().unwrap();
         set_checkpoint_config(CheckpointConfig {
@@ -1783,5 +1921,139 @@ mod tests {
         let store = CheckpointStore::configured(sessions.path(), "s-replace").unwrap();
         assert_eq!(store.max_per_session, 5, "后一次注入应覆盖前一次");
         clear_checkpoint_config_for_tests();
+    }
+
+    /// retention 必须跳过**别的活跃进程**创建的 checkpoint。
+    ///
+    /// 同一 session 被两个 wyj-code resume 时，两边都会 create。此前没有 `owner_pid`，
+    /// A 的保留策略会连同 B 刚建的、用户正要 `/rewind` 回去的那个一起淘汰——用户
+    /// 看到的是「刚才还在的回滚点凭空消失」，且日志里只有一条普通的 retention 记录。
+    #[test]
+    fn retention_never_deletes_another_live_processs_checkpoint() {
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "s-owner").unwrap();
+        let mut store = store;
+        store.max_per_session = 2;
+
+        // 伪造三条「属于别的活进程」的记录。用本测试二进制的 pid —— 它当然是活着的。
+        let live_pid = std::process::id();
+        let mut manifest = CheckpointManifest::default();
+        for i in 0..3 {
+            let id = format!("cp-foreign-{i}");
+            std::fs::write(
+                sessions
+                    .path()
+                    .join(format!("s-owner.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: live_pid,
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-owner.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // 再加一条真正属于本进程的，触发裁剪路径。
+        store
+            .mutate_manifest(|manifest| {
+                manifest.checkpoints.push(CheckpointSummary {
+                    id: "cp-mine".to_string(),
+                    name: None,
+                    kind: CheckpointKind::Manual,
+                    timestamp: "2024-02-01T00:00:00Z".to_string(),
+                    message_count: 0,
+                    cwd_root: String::new(),
+                    baseline_id: None,
+                    owner_pid: std::process::id(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(
+            sessions.path().join("s-owner.checkpoints/cp-mine.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        let remaining: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert!(
+            remaining.contains(&"cp-foreign-0".to_string())
+                && remaining.contains(&"cp-foreign-2".to_string()),
+            "别人的 checkpoint 必须全部保留，实际剩余: {remaining:?}"
+        );
+        assert!(
+            sessions
+                .path()
+                .join("s-owner.checkpoints/cp-foreign-0.json")
+                .is_file(),
+            "文件也不能被删——manifest 有条目而文件没了才是真的损坏"
+        );
+    }
+
+    /// 单进程行为不变：自己创建的、超过上限的最老那条照常被淘汰。
+    #[test]
+    fn retention_still_prunes_own_oldest_checkpoints() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::new(sessions.path(), "s-prune").unwrap();
+        store.max_per_session = 2;
+        let mut manifest = CheckpointManifest::default();
+        for i in 0..4 {
+            let id = format!("cp{i}");
+            std::fs::write(
+                sessions
+                    .path()
+                    .join(format!("s-prune.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: std::process::id(),
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-prune.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        store.enforce_retention().unwrap();
+        let remaining: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(remaining, vec!["cp2".to_string(), "cp3".to_string()]);
+        assert!(!sessions
+            .path()
+            .join("s-prune.checkpoints/cp0.json")
+            .is_file());
+        assert!(!sessions
+            .path()
+            .join("s-prune.checkpoints/cp1.json")
+            .is_file());
     }
 }

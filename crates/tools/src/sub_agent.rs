@@ -31,6 +31,9 @@ pub struct SubAgentTool {
     caller_id: Option<u64>,
     depth: usize,
     max_depth: usize,
+    /// 用户配置的回复语言。`inp.system` 覆盖走的是 `with_system`（整体替换），
+    /// 会把工厂追加的语言段一并抹掉，因此覆盖之后要按这里存的 locale 补回来。
+    response_language: Option<String>,
 }
 
 impl SubAgentTool {
@@ -47,6 +50,7 @@ impl SubAgentTool {
             caller_id: None,
             depth: 0,
             max_depth: 3,
+            response_language: None,
         }
     }
 
@@ -63,7 +67,14 @@ impl SubAgentTool {
             caller_id: None,
             depth: 0,
             max_depth: 3,
+            response_language: None,
         }
+    }
+
+    /// 记录用户配置的回复语言，供 `inp.system` 覆盖后补回语言段。
+    pub fn with_response_language(mut self, language: impl Into<String>) -> Self {
+        self.response_language = Some(language.into());
+        self
     }
 
     /// Bind sub-agent Episodes to the root conversation. All descendants reuse
@@ -214,6 +225,11 @@ pub(crate) fn derive_sub_agent_permission_mode(
         // general-purpose 子 Agent 的 Bash/Edit/Write **全部废掉**，比父级
         // 更严 —— 任何"继承"语义都不可能要求这样。
         Some(PermissionMode::Prompt) => PermissionMode::AutoApprove,
+        // Auto：**原样继承**，不做 Prompt 那样的降级。理由是 Auto 的判定者不是
+        // 人而是闸门——它不需要审批 UI（headless 也能判），而闸门随 ctx 派生
+        // 自动传给子 Agent。降成 AutoApprove 等于把子 Agent 里最容易出事的
+        // 那部分写/执行动作整个移出分类器视野。
+        Some(PermissionMode::Auto) => PermissionMode::Auto,
         _ => match allowed {
             None => PermissionMode::Prompt,
             Some(allowed) => {
@@ -417,7 +433,15 @@ impl SubAgentTool {
             }
         };
         agent = match inp.system {
-            Some(sys) => agent.with_system(sys),
+            Some(sys) => {
+                let mut a = agent.with_system(sys);
+                // `with_system` 是整体替换，工厂追加的语言段被一并抹掉；
+                // 覆盖之后补回来，否则这次 spawn 的子 Agent 会退回英文思考。
+                if let Some(lang) = self.response_language.as_deref() {
+                    a = a.append_system(wyj_core::prompts::sub_agent_language_section(lang));
+                }
+                a
+            }
             None => agent,
         };
 
@@ -439,6 +463,7 @@ impl SubAgentTool {
                 caller_id: Some(id),
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
+                response_language: self.response_language.clone(),
             }));
         }
         let agent_type = def.name.clone();
@@ -844,6 +869,86 @@ mod tests {
         }
     }
 
+    /// 把子 Agent 实际发出的 system prompt 抓下来的 provider（一次性槽）。
+    struct SystemSpyProvider {
+        seen: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for SystemSpyProvider {
+        async fn stream(
+            &self,
+            system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            if let Ok(mut slot) = self.seen.lock() {
+                if slot.is_none() {
+                    *slot = Some(system.combined());
+                }
+            }
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                },
+            )])))
+        }
+    }
+
+    /// `inp.system` 走的是 `with_system`（整体替换），会把工厂追加的语言段抹掉。
+    /// 覆盖之后必须按 `with_response_language` 记下的 locale 补回来——否则模型
+    /// 只要在 Agent 调用里带一个 `system` 字段，这次 spawn 就退回英文思考，
+    /// 且现象随模型是否恰好传该字段而随机复现。
+    #[tokio::test]
+    async fn system_override_still_carries_the_configured_response_language() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let provider_seen = seen.clone();
+        let hub = Arc::new(SubAgentHub::new());
+        let tool = SubAgentTool::new(
+            Arc::new(vec![AgentDefinition {
+                name: "general-purpose".to_string(),
+                description: "test".to_string(),
+                tools: None,
+                model: None,
+                system_prompt: "factory prompt".to_string(),
+                builtin: true,
+                source: None,
+            }]),
+            hub,
+            move |_| {
+                Ok(Agent::new(Arc::new(SystemSpyProvider {
+                    seen: provider_seen.clone(),
+                })))
+            },
+        )
+        .with_response_language("zh");
+        let cwd = tempfile::tempdir().unwrap();
+        let ctx = crate::ctx::ToolCtx::new(cwd.path());
+
+        let _ = tool
+            .run(
+                serde_json::json!({
+                    "subagent_type": "general-purpose",
+                    "description": "override test",
+                    "prompt": "do the thing",
+                    "system": "custom system prompt from the model"
+                }),
+                &ctx,
+            )
+            .await;
+
+        let system = seen.lock().unwrap().clone().expect("provider 未被调用");
+        assert!(
+            system.contains("custom system prompt from the model"),
+            "system 覆盖应当生效: {system}"
+        );
+        assert!(
+            system.contains("# Response language") && system.contains("Chinese (zh)"),
+            "system 覆盖后语言段被抹掉了，子 Agent 会退回英文思考: {system}"
+        );
+    }
+
     struct EndProvider {
         saw_agent_tool: Option<Arc<AtomicBool>>,
     }
@@ -1148,6 +1253,7 @@ mod tests {
             caller_id: Some(7),
             depth: 3,
             max_depth: 3,
+            response_language: None,
         };
         let cwd = tempfile::tempdir().unwrap();
         let result = tool
@@ -1333,11 +1439,23 @@ mod tests {
     #[test]
     fn sub_agent_in_normal_prompt_mode_inherits_allow() {
         use crate::ctx::PermissionMode;
-        // Normal 模式：委派已在父级审批过，子 Agent 不应再被 fail-closed 全量拒绝
+        // Manual 模式：委派已在父级审批过，子 Agent 不应再被 fail-closed 全量拒绝
         let mode = derive_sub_agent_permission_mode(Some(PermissionMode::Prompt), None, false);
         assert!(
             matches!(mode, PermissionMode::AutoApprove),
-            "Normal 模式下子 Agent 应继承放行，否则 Bash/Edit/Write 全废"
+            "Manual 模式下子 Agent 应继承放行，否则 Bash/Edit/Write 全废"
+        );
+    }
+
+    #[test]
+    fn sub_agent_keeps_auto_mode_for_classifier_review() {
+        use crate::ctx::PermissionMode;
+        // Auto 父级：子 Agent 没有审批 UI，但闸门不需要 UI，且随 ctx 派生传递。
+        // 若降成 AutoApprove，子 Agent 里的写/执行动作就完全脱离分类器视野。
+        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::Auto), None, false);
+        assert!(
+            matches!(mode, PermissionMode::Auto),
+            "Auto 模式下子 Agent 必须继续过分类器"
         );
     }
 }

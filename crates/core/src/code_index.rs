@@ -359,15 +359,30 @@ impl Tool for CodeSearchTool {
     }
 }
 
-fn build_files(root: &Path, max_file_bytes: u64) -> Result<BTreeMap<PathBuf, IndexedFile>> {
-    let mut files = BTreeMap::new();
-    for entry in WalkBuilder::new(root)
+/// 本模块统一的文件遍历器。
+///
+/// 三处调用点（建索引、检索遍历、fingerprint）此前各抄了一份逐字相同的
+/// `WalkBuilder` 配置；这种手工同步必然漂移——`glob.rs` / `grep.rs` /
+/// `checkpoint.rs` 已经因为 `require_git` 各自写死而对 worktree 与非 git 目录给出了
+/// 三种不同语义。收到这里之后，`require_git` 这类语义开关只有一处可改。
+///
+/// `require_git` 按仓库位置动态决定，见 [`wyj_config::gitignore::is_inside_git_repo`]：
+/// 非 git 仓库里也要让 `.gitignore` 生效；在 git 仓库 / managed worktree 里必须为
+/// true，否则 `.git/info/exclude` 失效。
+fn walk_files(root: &Path) -> ignore::Walk {
+    WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .ignore(true)
+        .require_git(wyj_config::gitignore::is_inside_git_repo(root))
         .build()
-    {
+}
+
+fn build_files(root: &Path, max_file_bytes: u64) -> Result<BTreeMap<PathBuf, IndexedFile>> {
+    let mut files = BTreeMap::new();
+    for entry in walk_files(root) {
         let entry = entry?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
@@ -560,13 +575,7 @@ fn direct_scan(root: &Path, query: &CodeQuery, max_file_bytes: u64) -> Result<Ve
     }
     let prefix = normalized_prefix(query.path_prefix.as_deref())?;
     let mut matches = Vec::new();
-    for entry in WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build()
-    {
+    for entry in walk_files(root) {
         let entry = entry?;
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
@@ -660,13 +669,7 @@ fn workspace_fingerprint(root: &Path) -> Option<String> {
 
 fn filesystem_fingerprint(root: &Path) -> Option<String> {
     let mut hasher = Sha256::new();
-    for entry in WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build()
-    {
+    for entry in walk_files(root) {
         let entry = entry.ok()?;
         if !entry.file_type().is_some_and(|kind| kind.is_file())
             || language_for(entry.path()).is_none()

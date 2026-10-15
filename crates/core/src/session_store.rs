@@ -7,6 +7,38 @@ use wyj_api::types::{ContentBlock, Message, Role};
 
 use crate::session::{RoutingEvent, Session};
 
+/// 会话占用租约。持有期间别的 `wyj-code` 会把它读成「这个会话正被使用」，
+/// 从而在 `--resume` 时询问用户；`drop`（正常退出、panic unwind）时撤销。
+///
+/// 进程被 `SIGKILL` / 断电时撤销不会执行，残留文件由
+/// [`wyj_config::filelock::active_holder`] 的存活判定忽略。
+pub struct SessionClaim {
+    path: PathBuf,
+}
+
+impl SessionClaim {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::serialize::write_atomic(path, format!("{}\n", std::process::id()).as_bytes())?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        // 只删自己写的那个：万一中途被别的进程接管了同一文件（极端情况），
+        // 删掉会让对方失去占用标记。这里以内容比对做最后一道保险。
+        let ours = format!("{}\n", std::process::id());
+        if std::fs::read_to_string(&self.path).is_ok_and(|text| text == ours) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// 持久化到磁盘的完整会话数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionFile {
@@ -214,6 +246,17 @@ impl SessionStore {
         self.dir.join(format!("{session_id}.json"))
     }
 
+    /// 会话写入的锁文件。与 `.json` 同目录，避免和 checkpoint 的旁路存储混淆。
+    fn lock_path(&self, session_id: &str) -> PathBuf {
+        self.dir.join(format!("{session_id}.json.lock"))
+    }
+
+    /// 会话占用租约文件。与写入锁分开：写入锁的持有周期是一次 save，租约是整个
+    /// 会话生命周期，两者语义完全不同。
+    fn claim_path(&self, session_id: &str) -> PathBuf {
+        self.dir.join(format!("{session_id}.json.owner"))
+    }
+
     /// 会话文件所在目录（`~/.wyj-code/sessions/`），供旁路存储（如子 Agent
     /// trace，见 `wyj_tools::trace`）按同一根目录 + `session_id` 定位文件。
     pub fn dir(&self) -> &Path {
@@ -242,11 +285,38 @@ impl SessionStore {
             }
         }
         let json = serde_json::to_string(&owned)?;
-        std::fs::write(
-            self.path(&file.session_id),
-            crate::secret::redact_sensitive_text(&json),
-        )?;
-        Ok(())
+        let path = self.path(&file.session_id);
+        // 两个进程 resume 同一个 session 时，此前是裸 `fs::write` 整文件截断：
+        // 并发写会截出半截 JSON，`load` 直接 Err，该会话再也恢复不了。锁把写入
+        // 串行化，tmp+rename 保证任何时刻磁盘上的文件都是完整的一版。
+        let _guard =
+            wyj_config::filelock::acquire(&self.lock_path(&file.session_id), "session file")?;
+        crate::serialize::write_atomic(
+            &path,
+            crate::secret::redact_sensitive_text(&json).as_bytes(),
+        )
+    }
+
+    /// 声明「本进程正在使用这个会话」，返回的守卫 drop 时自动撤销声明。
+    ///
+    /// 为什么需要它而不直接看写入锁：写入锁（`filelock`）只在 `save()` 的那一瞬间
+    /// 持有，读锁文件拿到的其实是**最后一个写者的 pid**。对方刚 `--resume`、还没保存
+    /// 时那把锁根本不存在，`active_owner` 会漏检；等它保存过再退出，pid 又已失效。
+    /// 语义要的是「从打开到关闭一直持有」，这只能靠一个独立于写入周期的租约表达。
+    ///
+    /// 崩溃/被 kill 留下的残留租约由 [`Self::active_owner`] 的存活判定自动忽略，
+    /// 不需要额外的清理任务。
+    pub fn claim(&self, session_id: &str) -> Result<SessionClaim> {
+        SessionClaim::acquire(&self.claim_path(session_id))
+    }
+
+    /// 另一个**仍存活**的 wyj-code 进程是否正在使用该会话。
+    ///
+    /// 会话文件是「整文件覆盖」而非追加，两个进程各持载入时的快照，谁后保存谁覆盖
+    /// 谁——`filelock` 只能防止写坏，防不了逻辑上的丢更新。所以 resume 侧必须主动
+    /// 检出占用并让用户决定，见 CLI 的接管询问。
+    pub fn active_owner(&self, session_id: &str) -> Option<u32> {
+        wyj_config::filelock::active_holder(&self.claim_path(session_id))
     }
 
     pub fn load(&self, session_id: &str) -> Result<SessionFile> {
@@ -418,6 +488,83 @@ pub fn set_session_persist_cap(cfg: wyj_config::PersistCapCfg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// 同一会话被多线程并发保存时，磁盘上必须始终是一份**能解析**的完整 JSON。
+    ///
+    /// 修复前 `save` 是裸 `fs::write` 整文件截断：并发写会互相截断中间态，
+    /// `load` 随即 `Err`，那个会话就再也 `--resume` 不回来了。这条测试守的正是
+    /// 「不再损坏」——注意它**不**保证不丢更新：两个进程各持载入时的快照，
+    /// 语义上的丢更新只能靠 `active_owner` 提前警告用户来规避。
+    #[test]
+    fn concurrent_saves_never_leave_an_unparseable_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let session_id = "sess-concurrent";
+        // 消息体撑大，让「写到一半」的窗口足够容易被撞上。
+        let filler = "x".repeat(200_000);
+
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let store = &store;
+                let session_id = session_id.to_string();
+                let filler = filler.clone();
+                scope.spawn(move || {
+                    for _ in 0..10 {
+                        let mut file =
+                            mk_file(&session_id, Path::new("/tmp"), "2024-01-01T00:00:00Z");
+                        file.title = format!("writer-{i}");
+                        file.messages = vec![Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text {
+                                text: filler.clone(),
+                            }],
+                        }];
+                        store.save(&file).unwrap();
+                        // 每次保存后立刻回读：损坏窗口一旦出现就会被抓住。
+                        store.load(&session_id).unwrap();
+                    }
+                });
+            }
+        });
+
+        // 落盘文件里不应残留任何 tmp 中间产物。
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
+    }
+
+    /// 占用检测只看「另一个活着的进程」，不能被本进程自己或死进程误导。
+    #[test]
+    fn active_owner_ignores_this_process_and_dead_pids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let session_id = "sess-owner";
+
+        assert_eq!(store.active_owner(session_id), None, "从未保存过");
+
+        store
+            .save(&mk_file(
+                session_id,
+                Path::new("/tmp"),
+                "2024-01-01T00:00:00Z",
+            ))
+            .unwrap();
+        assert_eq!(
+            store.active_owner(session_id),
+            None,
+            "本进程不算「别人正在用」"
+        );
+
+        // 伪造一个几乎不可能存活的 pid。
+        let lock = dir.path().join(format!("{session_id}.json.lock"));
+        fs::write(&lock, "4294967294\n").unwrap();
+        assert_eq!(store.active_owner(session_id), None, "死进程不算占用");
+    }
 
     fn mk_file(id: &str, cwd: &Path, ts: &str) -> SessionFile {
         SessionFile {

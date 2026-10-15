@@ -71,6 +71,9 @@ bg_wake:
 subagent_trace:
   no_records: "会话 {session} 没有落盘的子 Agent 记录（未跑过子 Agent，或 trace_enabled=false）"
   not_found: "会话 {session} 中未找到子 Agent 记录 a{id}"
+  mixed_owners: "注意：a{id} 由多个 wyj-code 进程写入（{owners}）。子 Agent id 在每个进程里都从 1 重新计数，这个文件里交错着两条时间线。"
+  owner_pid: "pid {pid}（{count} 条事件）"
+  owner_unknown: "pid 记录之前的历史数据（{count} 条事件）"
 
 thinking:
   # {frame} 是实时 spinner 帧（SPINNER_FRAMES[n]）。刻意做成占位符而不是把
@@ -125,6 +128,7 @@ agent:
   turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
   dangling_tool_uses_repaired: "\n[已为此前中断遗留的 {count} 个无结果工具调用补上占位结果（它们从未真正执行）]\n"
   empty_completion: "\n[模型返回了空响应（没有文本、没有工具调用）。通常是端点拒绝了这次请求——可以重试；若反复出现，用 `/clear` 开一个新会话。]\n"
+  turn_budget_wrap_up: "\n[本次提交的工具循环已用掉 {turn}/{max} 轮，已要求模型停止调用工具并立即总结当前进度]\n"
 
 session:
   busy_notice: "上一轮还在运行，请等它结束后再执行这个操作。"
@@ -184,6 +188,8 @@ main:
   session_not_found: "未找到会话 {id}，将开始新会话。"
   session_resumed: "已恢复会话 {id}（{count} 条消息）"
   session_resumed_last: "已恢复上次会话 {id}（{count} 条消息）"
+  session_in_use: "警告：会话 {id} 可能仍被 wyj-code 进程 {pid} 使用。两边各自保存会互相覆盖消息；要并行推进请改用 `wyj-code workspace create` 开独立 worktree 实例。"
+  session_in_use_headless: "会话 {id} 正被另一个 wyj-code 进程（{pid}）使用，拒绝恢复：headless 模式下没有人可以询问，继续下去等于静默覆盖另一个实例的消息。请改开新会话，或先停掉另一个进程。"
   resume_compacted: "恢复的会话历史较长，已预压缩（移除 {count} 条旧消息）"
   no_session_history: "暂无历史会话，将开始新会话。"
   mode_info_plan: " [plan 模式：仅只读工具]"
@@ -222,7 +228,7 @@ help:
     - `/schedule` — 管理定时任务（cron 触发的 prompt），macOS/Linux 下保存后自动同步进系统 crontab
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
-    - `/mode [模式]` — 切换运行模式（normal / plan / bypass）
+    - `/mode [模式]` — 切换运行模式（auto / manual / plan / bypass）；无参数则显示当前模式
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
     - `/init` — 让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
@@ -815,6 +821,15 @@ dialog:
   permission_title: " ⚑ 权限确认 "
   permission_tool_label: "工具: "
   permission_hint: "  [y] 允许一次   [a] 始终允许此类   [d] 拒绝并说明   (Esc 拒绝)"
+  session_conflict_title: "会话正被另一个 wyj-code 进程使用"
+  session_conflict_body: "会话 {id} 正被进程 {pid} 使用。在此恢复意味着两个实例写同一个文件 —— 谁后保存谁覆盖谁。"
+  session_conflict_take_over: "接管（对方未保存的消息可能丢失）"
+  session_conflict_read_only: "只读（载入历史，绝不写回）"
+  session_conflict_abort: "放弃并退出"
+  session_conflict_hint: "  [1/2/3] 或 方向键+回车   （默认：只读）"
+  session_conflict_taken_over: "已从进程 {pid} 接管会话 {id}，对方未保存的消息可能丢失。"
+  session_conflict_read_only_applied: "以只读方式查看会话 {id}（属进程 {pid}）。本实例不会写入该会话文件。"
+  session_conflict_abort_applied: "已放弃：会话 {id} 未被改动。"
   permission_hint_once: "  [y] 仅本次无隔离执行   [d] 拒绝   (不可持久授权)"
   permission_hint_project_once: "  [y/a] 允许本项目（后续不再询问）   [d] 拒绝并说明   (Esc 拒绝)"
   project_trust_title: " ⚠ 项目级 MCP server 待信任确认 "

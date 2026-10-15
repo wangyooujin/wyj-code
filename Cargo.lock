@@ -5294,6 +5294,7 @@ version = "0.3.3"
 dependencies = [
  "anyhow",
  "directories",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

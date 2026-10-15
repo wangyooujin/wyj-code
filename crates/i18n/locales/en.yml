@@ -72,6 +72,9 @@ bg_wake:
 subagent_trace:
   no_records: "No persisted sub-agent records for session {session} (none ran yet, or trace_enabled=false)"
   not_found: "No sub-agent record a{id} found in session {session}"
+  mixed_owners: "Note: a{id} was written by more than one wyj-code process ({owners}). Sub-agent ids restart from 1 in each process, so this file interleaves two timelines."
+  owner_pid: "pid {pid} ({count} events)"
+  owner_unknown: "records from before pid tracking ({count} events)"
 
 thinking:
   # {frame} 是实时 spinner 帧（SPINNER_FRAMES[n]）。刻意做成占位符而不是把
@@ -127,6 +130,7 @@ agent:
   turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
   dangling_tool_uses_repaired: "\n[Repaired {count} tool call(s) left without a result by an earlier interruption — they were never executed]\n"
   empty_completion: "\n[Empty response from the model (no text, no tool call). This usually means the endpoint rejected the request — try again, or `/clear` to start a new session if it keeps happening.]\n"
+  turn_budget_wrap_up: "\n[Tool loop for this submission has used {turn}/{max} turns — the model has been asked to stop calling tools and summarize its progress now]\n"
 
 session:
   busy_notice: "The previous turn is still running — wait for it to finish before doing that."
@@ -186,6 +190,8 @@ main:
   session_not_found: "Session {id} not found, starting a new session."
   session_resumed: "Resumed session {id} ({count} messages)"
   session_resumed_last: "Resumed last session {id} ({count} messages)"
+  session_in_use: "Warning: session {id} may still be in use by wyj-code process {pid}. Saving from both processes overwrites each other's messages. To work in parallel, start an isolated instance with `wyj-code workspace create`."
+  session_in_use_headless: "Session {id} is being used by another wyj-code process ({pid}). Refusing to resume: headless mode has nobody to ask, and continuing would silently overwrite the other instance's messages. Start a fresh session, or stop the other process first."
   resume_compacted: "Resumed history was long; pre-compacted ({count} old messages removed)"
   no_session_history: "No session history yet, starting a new session."
   mode_info_plan: " [plan mode: read-only tools only]"
@@ -224,7 +230,7 @@ help:
     - `/schedule` — Manage scheduled tasks (cron-triggered prompts); auto-syncs into the system crontab on macOS/Linux
     - `/hooks` — List currently active Hooks (grouped by event)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
-    - `/mode [mode]` — Switch run mode (normal / plan / bypass)
+    - `/mode [mode]` — Switch run mode (auto / manual / plan / bypass); no arg shows the current mode
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
     - `/init` — Have the Agent explore the project and generate/merge AGENTS.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists
@@ -819,6 +825,15 @@ dialog:
   permission_title: " ⚑ Permission Confirm "
   permission_tool_label: "Tool: "
   permission_hint: "  [y] Allow once   [a] Always allow this   [d] Deny   (Esc to deny)"
+  session_conflict_title: "Session in use by another wyj-code process"
+  session_conflict_body: "Session {id} is being used by process {pid}. Resuming it here means both instances write to the same file — whoever saves last overwrites the other."
+  session_conflict_take_over: "Take over (their unsaved messages may be lost)"
+  session_conflict_read_only: "Read only (load history, never write back)"
+  session_conflict_abort: "Abort and exit"
+  session_conflict_hint: "  [1/2/3] or arrows+Enter   (default: read only)"
+  session_conflict_taken_over: "Took over session {id} from process {pid}. Its unsaved messages may be lost."
+  session_conflict_read_only_applied: "Read-only view of session {id} (owned by process {pid}). This instance will not write to the session file."
+  session_conflict_abort_applied: "Aborted: session {id} was left untouched."
   permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"

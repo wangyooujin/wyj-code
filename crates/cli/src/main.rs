@@ -52,6 +52,10 @@ struct Cli {
     plan: bool,
     #[arg(long, help = wyj_i18n::tr("cli.bypass_help"))]
     bypass_permissions: bool,
+    /// 权限模式：auto（默认，分类器代替人逐次确认）/ manual（逐次弹窗）/ plan / bypass。
+    /// 省略时等价于 auto。`--plan` 与 `--bypass-permissions` 是它的便捷写法。
+    #[arg(long = "permission-mode")]
+    permission_mode: Option<String>,
     /// 本次进程允许调用的工具名；逗号分隔。仅工具名不会自动授权写入范围。
     #[arg(long, value_delimiter = ',')]
     allowed_tools: Vec<String>,
@@ -350,7 +354,7 @@ fn print_config_hints(active: &wyj_config::Profile) {
 /// 全部子 Agent 概览；带 sub_id 打印完整工具序列 + 全文 input/output + 最终结果，
 /// `--json` 直接吐原始 JSONL 供管道处理。
 fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> Result<()> {
-    use wyj_tools::trace::{list_trace_ids, read_trace, trace_file};
+    use wyj_tools::trace::{list_trace_ids, read_trace_by_process, trace_file};
 
     let sessions_dir = wyj_config::config_dir()?.join("sessions");
 
@@ -366,14 +370,16 @@ fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> 
             }
             for id in ids {
                 let path = trace_file(&sessions_dir, session_id, id);
-                let events = read_trace(&path).unwrap_or_default();
+                let records = read_trace_by_process(&path).unwrap_or_default();
+                print_subagent_trace_ownership(&id, &records);
+                let events: Vec<_> = records.into_iter().map(|(_, event)| event).collect();
                 print_subagent_trace_summary(id, &events);
             }
         }
         Some(id) => {
             let path = trace_file(&sessions_dir, session_id, id);
-            let events = read_trace(&path).unwrap_or_default();
-            if events.is_empty() {
+            let records = read_trace_by_process(&path).unwrap_or_default();
+            if records.is_empty() {
                 println!(
                     "{}",
                     wyj_i18n::tr_fmt(
@@ -386,11 +392,50 @@ fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> 
             if json {
                 print!("{}", std::fs::read_to_string(&path).unwrap_or_default());
             } else {
+                print_subagent_trace_ownership(&id, &records);
+                let events: Vec<_> = records.into_iter().map(|(_, event)| event).collect();
                 print_subagent_trace_detail(id, &events);
             }
         }
     }
     Ok(())
+}
+
+/// 子 Agent id 是**每进程**从 1 起分配的，所以同一会话被两个 wyj-code 实例 resume 时，
+/// 两个实例的 `a1` 会写进同一个 `a1.jsonl`。这里在打印前先说清楚这个文件由几个进程
+/// 写的、各自多少行——否则时间线交错，用户会把两个不同任务的动作当成一个 agent 的。
+fn print_subagent_trace_ownership(id: &u64, records: &[(u32, wyj_tools::trace::TraceEvent)]) {
+    let mut counts: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
+    for (pid, _) in records {
+        *counts.entry(*pid).or_default() += 1;
+    }
+    // pid 0 = 旧版本落盘的裸事件行，无法判定归属；只有一个来源时不必打扰用户。
+    if counts.len() <= 1 {
+        return;
+    }
+    let owners: Vec<String> = counts
+        .iter()
+        .map(|(pid, count)| {
+            if *pid == 0 {
+                wyj_i18n::tr_fmt(
+                    "subagent_trace.owner_unknown",
+                    &[("count", &count.to_string())],
+                )
+            } else {
+                wyj_i18n::tr_fmt(
+                    "subagent_trace.owner_pid",
+                    &[("pid", &pid.to_string()), ("count", &count.to_string())],
+                )
+            }
+        })
+        .collect();
+    println!(
+        "{}",
+        wyj_i18n::tr_fmt(
+            "subagent_trace.mixed_owners",
+            &[("id", &id.to_string()), ("owners", &owners.join(", "))]
+        )
+    );
 }
 
 fn print_subagent_trace_summary(id: u64, events: &[wyj_tools::trace::TraceEvent]) {
@@ -927,7 +972,9 @@ fn workflow_parent_ceiling(
             PermissionMode::Allowlist(allowed) | PermissionMode::Plan(allowed) => {
                 allowed.contains(name)
             }
-            PermissionMode::Prompt | PermissionMode::AutoApprove => true,
+            // Auto 与 Prompt 同样不使用工具名白名单：Auto 的准入在闸门里逐次判定，
+            // 不能用一个静态白名单把没列出的工具一刀切掉。
+            PermissionMode::Prompt | PermissionMode::Auto | PermissionMode::AutoApprove => true,
         })
         .collect();
     allowed_tools.sort();
@@ -964,6 +1011,35 @@ fn resolve_cwd(cli_cwd: Option<std::path::PathBuf>) -> Result<std::path::PathBuf
     }
 }
 
+/// 恢复会话前检出「这个会话正被另一个 wyj-code 实例使用」。
+///
+/// 会话文件是整文件覆盖而非追加，且 `load` 之后再不重读盘——两个进程各持载入时的
+/// 快照，谁后保存谁覆盖谁。`filelock` 只能保证文件不被写坏，挡不住整轮会话期间的
+/// 双写，所以必须在**载入之前**就把这个事实交给用户决定。
+///
+/// `interactive` 为 false（headless / `-p` / daemon / 定时任务）时没有人类在场，
+/// 弹窗无从谈起，只能直接报错退出：无人值守地继续，等于静默毁掉另一个实例正在写的
+/// 会话——那比拒绝危险得多。
+fn resolve_session_claim(
+    store: &Option<SessionStore>,
+    session_id: &str,
+    interactive: bool,
+) -> Result<Option<u32>> {
+    let Some(pid) = store.as_ref().and_then(|s| s.active_owner(session_id)) else {
+        return Ok(None);
+    };
+    if !interactive {
+        anyhow::bail!(
+            "{}",
+            wyj_i18n::tr_fmt(
+                "main.session_in_use_headless",
+                &[("id", session_id), ("pid", &pid.to_string())]
+            )
+        );
+    }
+    Ok(Some(pid))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 注册 panic hook：TUI 路径下,run_tui 配对的 disable_raw_mode +
@@ -980,10 +1056,7 @@ async fn main() -> Result<()> {
     // 统一通知通道 init（fail-safe：未 init 时 emit 是 no-op；env WYJ_CODE_NOTIFY_OFF
     // 全关；first-wins 多次 init 后续无效）
     wyj_core::notify::init(&cfg.notify);
-    let lang = cfg
-        .language
-        .clone()
-        .unwrap_or_else(|| wyj_i18n::detect_system_locale().to_string());
+    let lang = wyj_i18n::resolve_locale(cfg.language.as_deref());
     wyj_i18n::set_locale(&lang);
 
     let mut cli = Cli::parse();
@@ -1234,9 +1307,15 @@ async fn main() -> Result<()> {
     let history_store = HistoryStore::new(config_base.join("history")).ok();
     let session_store = SessionStore::new(config_base.join("sessions")).ok();
 
-    // 根据 --continue/-c 或 --resume 恢复历史会话
+    // 根据 --continue/-c 或 --resume 恢复历史会话。
+    // `session_conflict` 记下「该会话正被另一个实例使用」，交给 TUI 在启动横幅之后
+    // 弹窗让用户决定——此时终端还没进 alternate screen，任何提示都还看得见。
+    let mut session_conflict: Option<(String, u32)> = None;
     let (session_id, initial_messages) = match (&cli.resume, cli.continue_session) {
         (Some(id), _) => {
+            if let Some(pid) = resolve_session_claim(&session_store, id, is_tui_mode)? {
+                session_conflict = Some((id.clone(), pid));
+            }
             let msgs = session_store
                 .as_ref()
                 .and_then(|s| s.load(id).ok())
@@ -1265,6 +1344,11 @@ async fn main() -> Result<()> {
                 .and_then(|s| s.last_for_project(&cwd).ok().flatten());
             match last {
                 Some(meta) => {
+                    if let Some(pid) =
+                        resolve_session_claim(&session_store, &meta.session_id, is_tui_mode)?
+                    {
+                        session_conflict = Some((meta.session_id.clone(), pid));
+                    }
                     let msgs = session_store
                         .as_ref()
                         .and_then(|s| s.load(&meta.session_id).ok())
@@ -1293,6 +1377,18 @@ async fn main() -> Result<()> {
     };
 
     let session_store_arc = session_store.map(std::sync::Arc::new);
+    // 会话占用租约：从进程启动到退出一直持有，让下一个 `--resume` 同一会话的实例
+    // 能检出冲突（见 `resolve_session_claim`）。必须在上面的冲突判定**之后**建立 ——
+    // 反过来的话会把"别人在用"误判成"自己在用"。
+    //
+    // 用 `_claim` 前缀 + 绑到 `_` 之外的中间变量持有到 main 结束：直接 `let _ =` 会
+    // 立刻 drop，租约当场失效。
+    let _session_claim: Option<wyj_core::session_store::SessionClaim> =
+        match session_store_arc.as_ref() {
+            Some(store) => store.claim(&session_id).ok(),
+            None => None,
+        };
+
     // CAS blob pool:按 SHA-256 内容寻址去重 checkpoint 内 workspace 文件字节。
     // 21 checkpoint × 256 文件 = 5376 份冗余 → 256 份唯一,实测单 session 从
     // 223MB 降到 < 5MB。CAS root 不可写时 capture_files 走 inline 兜底。
@@ -1378,13 +1474,18 @@ async fn main() -> Result<()> {
     let evolution_store_for_rebuild = evolution_store.clone();
     let claude_md_for_rebuild = claude_md_loader.clone();
 
-    // 确定当前运行模式
-    let mode = if cli.plan {
-        AgentMode::Plan
-    } else if cli.bypass_permissions {
-        AgentMode::Bypass
-    } else {
-        AgentMode::Normal
+    // 确定当前运行模式。优先级：显式 --permission-mode > --plan / --bypass-permissions
+    // > 默认 auto。显式模式名报错而不是静默回退：用户敲了 `--permission-mode autoo`
+    // 却拿到 auto 模式，比启动失败更难排查。
+    let mode = match cli.permission_mode.as_deref() {
+        Some(value) => AgentMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "无法识别的 --permission-mode `{value}`；可选值：auto、manual、plan、bypass"
+            )
+        })?,
+        None if cli.plan => AgentMode::Plan,
+        None if cli.bypass_permissions => AgentMode::Bypass,
+        None => AgentMode::Auto,
     };
 
     let routing_role = if matches!(mode, AgentMode::Plan) {
@@ -1488,6 +1589,16 @@ async fn main() -> Result<()> {
     // 不挂的话子 Agent 的 token 在这些模式下仍然全部丢失。
     let sub_usage = Arc::new(wyj_core::SubUsageTotals::default());
     tool_ctx.sub_usage = Some(Arc::clone(&sub_usage));
+    // Auto 模式的判定闸门挂在 ctx 上（子 Agent 由 ctx 派生自动继承、降级阈值
+    // 全局共享）。headless / `-p` / 定时任务同样能享受 auto：闸门不需要审批 UI，
+    // 这正是它相对「逐次弹窗」唯一而决定性的优势。
+    //
+    // TUI 不在这里挂：它在自己的装配层按当前 Agent 重建（见 tui 的 build_auto_gate
+    // 调用点），这样 `/model` 换模型后分类器也跟着换。
+    tool_ctx.auto_gate = Some(wyj_core::auto_mode::build_gate(
+        &cfg,
+        Arc::clone(&provider_arc),
+    ));
     tool_ctx.set_execution_surface(if cli.prompt.is_some() {
         ExecutionSurface::SinglePrompt
     } else if is_protocol_mode {
@@ -1546,7 +1657,8 @@ async fn main() -> Result<()> {
             PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
-        AgentMode::Normal => PermissionMode::Prompt,
+        AgentMode::Manual => PermissionMode::Prompt,
+        AgentMode::Auto => PermissionMode::Auto,
     };
     if !cli.allowed_tools.is_empty() {
         let explicit: std::collections::HashSet<String> =
@@ -1620,6 +1732,7 @@ async fn main() -> Result<()> {
             let f = sub_agent_factory.clone();
             move |def| f(def)
         })
+        .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
         .with_session_id(session_id.clone()),
     ));
 
@@ -1728,7 +1841,13 @@ async fn main() -> Result<()> {
 
     // 主 system prompt：英文静态提示 + <env> 环境块（会话内稳定字段，进缓存）。
     // git 状态快照单独走首轮 user 消息注入（会变的字段进 system 会击穿缓存）。
-    let env_info = wyj_core::prompts::EnvInfo::collect(&cwd, &model_name);
+    // `language` 必须进 `<env>`：模型侧此前完全看不到用户配的语言，只有 UI 是中文
+    // 而 thinking 走英文（见 prompts::EnvInfo::language 的文档）。
+    let env_info = wyj_core::prompts::EnvInfo::collect(
+        &cwd,
+        &model_name,
+        &wyj_i18n::resolve_locale(cfg.language.as_deref()),
+    );
     let model_resolution = resolve_model_capabilities(cfg.active_profile(), Some(&model_name));
     let model_capabilities = model_resolution.capabilities.clone();
     let fallback_routes = build_fallback_routes(&cfg, routing_role, &cfg.active_profile().name);
@@ -1745,6 +1864,7 @@ async fn main() -> Result<()> {
         .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd))
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window)
+        .with_max_turns(cfg.agent.max_turns)
         .with_model_capabilities(model_capabilities)
         .with_route_identity(
             cfg.active_profile().name.clone(),
@@ -1935,7 +2055,10 @@ async fn main() -> Result<()> {
         let mode_info = match mode {
             AgentMode::Plan => wyj_i18n::tr("main.mode_info_plan"),
             AgentMode::Bypass => wyj_i18n::tr("main.mode_info_bypass"),
-            AgentMode::Normal => String::new(),
+            // Auto 在 headless 下是**默认**行为，提示它只会变成每次启动的噪音；
+            // Manual 才需要告诉用户"这次会逐次等你点头"。
+            AgentMode::Manual => wyj_i18n::tr("main.mode_info_manual"),
+            AgentMode::Auto => String::new(),
         };
         if !mode_info.is_empty() {
             eprintln!("\x1b[38;2;150;150;150m{mode_info}\x1b[0m");
@@ -2045,7 +2168,13 @@ async fn main() -> Result<()> {
         let model_capabilities = model_resolution.capabilities.clone();
         let fallback_routes = build_fallback_routes(cfg, routing_role, &cfg.active_profile().name);
         let enable_lazy_tool_schemas = model_capabilities.tool_calling.value;
-        let env_info = wyj_core::prompts::EnvInfo::collect(&cwd_for_rebuild, new_model);
+        // `/config` 面板热切 language 后走这里重建：locale 必须一起重算，
+        // 否则新语言只换了 UI 文案、模型侧 system prompt 里还是旧语言。
+        let env_info = wyj_core::prompts::EnvInfo::collect(
+            &cwd_for_rebuild,
+            new_model,
+            &wyj_i18n::resolve_locale(cfg.language.as_deref()),
+        );
         let mut new_agent = Agent::new(provider)
             .with_system(wyj_core::prompts::main_system_prompt(&env_info))
             .with_skills(collect_skill_entries(
@@ -2056,6 +2185,7 @@ async fn main() -> Result<()> {
             .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
             .with_max_tokens(cfg.active_profile().max_tokens)
             .with_context_window(cfg.active_profile().context_window)
+            .with_max_turns(cfg.agent.max_turns)
             .with_model_capabilities(model_capabilities)
             .with_route_identity(
                 cfg.active_profile().name.clone(),
@@ -2151,6 +2281,7 @@ async fn main() -> Result<()> {
                 hub_for_rebuild.clone(),
                 move |def| sub_factory(def),
             )
+            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
             .with_session_id(sid_for_rebuild.clone()),
         ));
         for def in reg.definitions() {
@@ -2383,6 +2514,12 @@ async fn main() -> Result<()> {
             plugin_runtime.clone(),
             matches!(initial_provider, InitialProvider::MissingApiKey),
             workspace_cas.clone(),
+            session_conflict.map(
+                |(session_id, owner_pid)| wyj_tui::app::SessionConflictInfo {
+                    session_id,
+                    owner_pid,
+                },
+            ),
         )
         .await
     };
@@ -2597,7 +2734,7 @@ fn make_sub_agent_factory(
             Some(p) => (p, model_for_routing_role(p, routing_role)),
             None => (
                 cfg.active_profile(),
-                cfg.model_for_mode(&AgentMode::Normal).to_string(),
+                cfg.model_for_mode(&AgentMode::Auto).to_string(),
             ),
         };
         let provider = wyj_api::build_provider_from_profile(p, Some(&model))?;
@@ -2613,6 +2750,7 @@ fn make_sub_agent_factory(
         let mut sub_agent = Agent::new(provider)
             .with_max_tokens(p.max_tokens)
             .with_context_window(p.context_window)
+            .with_max_turns(cfg.agent.max_turns)
             .with_model_capabilities(model_capabilities)
             .with_route_identity(p.name.clone(), model_resolution.identity.vendor, model)
             .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
@@ -2629,6 +2767,13 @@ fn make_sub_agent_factory(
         if !def.system_prompt.is_empty() {
             sub_agent = sub_agent.with_system(def.system_prompt.clone());
         }
+        // 语言段必须排在 `with_system` 之后：`with_system` 是整体替换，放在它
+        // 前面会被整段抹掉。子 Agent 拿不到主 Agent 的 `<env>` 块（那是 MAIN
+        // 的一部分），所以这里单独补一份——否则子 Agent 既看不到配置语言、
+        // 也继承不到 MAIN 的语言规则，是漂移概率最高的一档。
+        sub_agent = sub_agent.append_system(wyj_core::prompts::sub_agent_language_section(
+            &wyj_i18n::resolve_locale(cfg.language.as_deref()),
+        ));
 
         let mut sub_registry = ToolRegistry::standard();
         sub_registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
