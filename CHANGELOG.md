@@ -12,6 +12,91 @@
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-15
+
+### MiniMax `/anthropic` 线协议接线：reasoning_effort 从死配置变成真档位
+
+### ① 思考深度档位此前从未上送，改配置毫无效果
+
+**症状**：profile 里配了 `reasoning_effort`，改任何档位都不影响思考量；又因为端点
+默认 `max`，连「没生效」都看不出来。
+
+**成因**：Anthropic 线协议的请求体此前恒发 Anthropic 原生形态
+`{"type":"enabled","budget_tokens":N}`，而 MiniMax 的 `/anthropic` 端点**两条都不认**——
+它只承认 `thinking.type ∈ {省略, adaptive, disabled}`，`budget_tokens` 在这条线上没有语义，
+思考深度实际由 `output_config.effort`（`low/medium/high/xhigh/max`）控制。于是
+`reasoning_effort` 是个**从未上送的死配置**。更危险的是 `disabled`：`thinking.type="disabled"`
+会被 M3.1 直接 400（`requires adaptive thinking`），而 `text_only()` 的辅助调用路径
+正好会走到这里。
+
+修复引入 `api::thinking::AnthropicThinkingPatch` + `apply_anthropic_thinking` 统一入口，
+thinking 形态改由 **vendor × 线协议**共同决定（请求体的 `thinking` 字段随之从具名
+`ThinkingParam` 放宽成 `Option<Value>`，新增 `output_config`）。新增 `AnthropicMinimaxAdapter`
+按代际分派——三种 `thinking.type` 的语义随代际变：
+
+| 模型 | 省略 | `adaptive` | `disabled` |
+|---|---|---|---|
+| M3.1-Flash-Preview | 开 | 开 | **400** |
+| M3 | 关 | 开 | 保持关 |
+| M2.x | 开 | 开 | 接收但不生效 |
+
+三个容易再犯的点，都写进了 `crates/api/CLAUDE.md` 第 22 条：
+
+- **真正的坑不在 adapter，在 catalog 层**。`request_plan` 与 `agent.rs` 都以
+  `ThinkingSpec::for_vendor(...).effort_levels` 为唯一判据决定 `reasoning_effort` 是否放行，
+  而 `for_vendor` 此前**漏了 `(AnthropicMessages, "minimax")` 这一臂**，落到
+  `anthropic_compatible()` 的 `effort_levels: &[]`，profile 里的 effort 在**到达 provider 之前**
+  就被丢成 `DroppedParameter`，`output_config` 分支永不执行。adapter 写得再对也是死代码。
+- **被否决的配置项不静默丢弃**：进 `patch.ignored`，provider 打一条 warn（每进程一次），
+  否则用户会一直以为配置生效了。
+- **模型名分派只认版本段**（`m3.1` / `m3-1` / `m31`），不认 `flash` 这类营销词——否则将来的
+  `M2.x-Flash` 会被误路由到 M3.1 从而白发 `output_config`，而分派错误在这里是 400 级事故。
+  档位白名单只有 `ThinkingSpec::effort_levels` 一份真相源，adapter 一律走 `normalize_effort()`。
+
+**② budget 不被支持时，effort 不再被连坐丢掉**
+
+`request_plan` 旧的 match 臂会在 `budget_tokens_supported: false` 上短路成 `Disabled`，
+把同一 profile 里的 effort 一起丢掉——旧 config 里「budget + effort」都配很常见
+（DeepSeek、MiniMax `/anthropic` 都是「不支持 budget、认 effort」的组合）。用户只看到
+一条 `thinking_budget` 的 dropped，reasoning 实际已整条关闭。现改为 budget 记 dropped
+后继续走 effort 分支。
+
+**③ thinking 块不再被任何截断逻辑改写**
+
+`persist_cap` 的 `thinking_bytes` / `reasoning_details_bytes` **废弃**（字段保留仅为兼容既有
+`config.toml`，默认值归零）。Anthropic 与 MiniMax 都要求工具调用续轮时把 thinking 块连
+`signature` **原样**回传（MiniMax 原文：「当响应包含 thinking 内容块时，后续轮次中应原样保留
+这些内容块」），截断文本却保留 signature 必然校验失配、且**不可逆**；`reasoning_details`
+则是改 `text` 却留下 `id` / `format`，产出结构不自洽的块。体积改由 context_edit / compact
+收拾——它们的语义是「丢弃整段历史」，不会在历史里留下内容与签名不匹配的块。
+与之相对，**CAS 外部化（>16KB 落盘外置）保持启用**：它可逆，resume 时 `materialize_block_with`
+原样还原。
+
+代价是 thinking 成了唯一无界字段，长会话窗口被吃掉时应加 context editing 阈值或调低
+端点 effort，而**不是**去调已经无效的 `persist_cap.thinking_bytes`。
+
+### ④ thinking 全英文：这是模型行为，能动的杠杆只剩位置
+
+0.3.3 补的三个语言锚点全部生效后，「回复中文 + thinking 全英文」依旧。二次排查的结论
+是**别再当成待修 bug**：
+
+- **主因是 M3.1 的 CoT 语言先验**。推理模型的 thinking 通道在训练上是独立分布（英文数学/
+  代码 CoT 为主），系统提示里的语言指令对**最终回复**有效、对 thinking 只是弱约束。
+  措辞只能提高概率，反复重写提示词不解决问题。
+- **可动的杠杆是位置**。`<env>` 里的语言事实在 `MAIN` 末尾，但 `run_turn` 会在它后面继续拼
+  记忆快照 + CLAUDE.md `turn_reminder`（本仓库动辄几万 token）＋ volatile 段的工具可用性块，
+  recency 权重完全落不到那句上。故新增 `prompts::response_language_reminder(locale)`，
+  由 `Agent::with_response_language` 每轮追加到 **volatile 段最末尾**。它的**全部价值就是
+  「最后一段」这个位置**，谁在后面再追加东西修复就静默失效——
+  测试 `response_language_reminder_is_the_last_system_section` 钉的就是这条不变量。
+  落 volatile 段因此**不影响 prompt cache 命中**（断点打在 stable 末尾），代价是每轮多约
+  40 个未缓存 token。
+- **英文 thinking 会自我强化，验证必须开新会话**。Anthropic 线协议把 thinking 块连
+  `signature` 原样回传，压缩时 thinking 也以 `[思考]` 进摘要——历史里一旦是英文 CoT，
+  后续每轮的上下文里就是英文推理链。resume 老会话验证无效，老会话本身就是英文先验的产物。
+
+**1390 个 workspace 测试**（1288 → 1390）+ clippy `-D warnings` 全绿。
+
 ## [0.3.3] - 2026-10-15
 
 ### 两条「静默」：一个让会话彻底死掉，一个让思考悄悄换了语言
