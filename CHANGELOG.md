@@ -12,6 +12,65 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-15
+
+### 两条「静默」：一个让会话彻底死掉，一个让思考悄悄换了语言
+
+本次两个修复都不涉及新功能，而是两条此前**没有任何报错**的失效路径——用户看到的
+现象分别是「说了话没反应」和「thinking 里夹了中文」。
+
+### ① 悬空 tool_use 会让 resume 后的「继续」彻底静默
+
+**症状**：长任务被 ESC 或关进程打断，`--resume` 恢复后再发任何一条消息，模型零输出、
+零报错、spinner 直接停；此后该会话每条消息都复发。
+
+**成因**是一条链：打断时 assistant 消息已带 `tool_use` 进入历史，工具结果却还没写回，
+退出时 `SessionStore::save` 把这份半截历史原样落盘。恢复后用户发的消息让请求末尾变成
+「assistant(tool_use) → user(没有 tool_result)」。而 Anthropic 兼容端点对这种请求
+**既不报错也不重试**——实测 MiniMax M3.1 直接回 HTTP 200 + 内容为空的 SSE 流
+（`message_start` content=[] → `message_delta` stop_reason="" → `message_stop`）。
+客户端把空响应当正常回复结束回合，而那条空 assistant 消息还会再次落盘，
+会话从此**永久中毒**。
+
+修复落在三处：
+
+- `Session::repair_dangling_tool_uses`：只补**最后一条** assistant 消息里没有配对结果的
+  `tool_use`，合成 `is_error` 的 `tool_result` 插进末尾 user 消息最前面。边界是实测划出来的
+  ——**中段**悬空（后面还有完整往返）端点是容忍的，而 context editing 会把旧 tool_result
+  外部化成占位文本，按「全历史扫描未配对」补会污染历史。幂等，无悬空时不动历史。
+- `Agent` 工具轮循环开头**无条件**调用一次：`--resume` 与「会话内 ESC 中断」两条产生毒化
+  历史的路径都在这个收口后面，且改的就是 `session.messages` 本身——下一次落盘顺带把磁盘上的
+  毒化状态一起治好。
+- 回合收尾补空响应告警：既无文本也无 tool_use 时提示「模型返回了空响应……通常是端点拒绝了
+  这次请求」，避免任何上游空响应再表现为「说了话没反应」。
+
+验证：修复前同一会话 3/3 空响应零输出，修复后模型正常回复且落盘历史已带上合成 tool_result。
+
+### ② thinking 语言漂移：补上三个缺失的锚点
+
+**症状**：thinking 输出「英文为主、偶发中文」。排查结论是代码全链路对 thinking **零强制**
+——解析、累积（`agent.rs` 纯 `push_str`）、摘要、TUI 渲染全是字节级透传，唯一的语言约束只有
+system prompt 那句 "Always reply in ..."，而模型普遍把 thinking 当内部推理通道、与回复语言解耦。
+三处改动分别补上缺失的锚点：
+
+- `prompts.rs`：`# Tone and style` 的语言规则显式点名 extended thinking / reasoning；三个子
+  Agent 模板同样补齐——子 Agent 此前**一条语言指令都没有**（`Agent::with_system` 是整体替换、
+  不继承 `MAIN`），是漂移概率最高的一档。
+- `openai.rs`：接线 `ThinkingResponseFields::echo_back_in_messages` 这个长期悬空的声明字段。
+  assistant 分支此前只有 `Text` / `ToolUse` 两个 match、其余走 `_ => {}` 吞掉 `Thinking`，
+  跨轮没有任何历史推理作锚点，**每轮从 system prompt 独立起跑**。开关由
+  `build_openai_request_body` 查表推导，不暴露给调用方；ollama / vllm 声明为 false，字段整个不出现
+  （多写一个未知字段就会被第三方端点判 400）。
+- `compact.rs`：`messages_to_text` 不再丢弃 `Thinking`。此前「内部推理非对话事实」的理由在压缩
+  场景下站不住——摘要是压缩后唯一的续跑上下文，丢掉推理链等于每轮重新起跑，输出语言恰好在
+  **压缩点后**漂移。按 `[思考] + 400 字符截断` 纳入，空 thinking 与 RedactedThinking 只留占位；
+  `compact_prompt` 同步加 `## Key Reasoning` 一节，指示摘要器只提炼最终答案里看不见的推理。
+
+thinking 活在 `session.messages`、从不进 system prompt，改 `MAIN` 只在升级后第一轮整体换一次
+前缀，不影响后续缓存命中。
+
+**1288 个 workspace 测试**（1253 → 1288）+ clippy `-D warnings` 全绿。
+
 ## [0.3.2] - 2026-10-14
 
 ### Grep 工具改造成两级搜索后端：装了就用 ripgrep，没装也有得用
