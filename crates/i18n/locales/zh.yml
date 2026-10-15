@@ -33,6 +33,7 @@ subagent:
   waiting_bg: "等待 {count} 个后台 agent 完成…"
   panel_title: " agents [{count}] "
   content_hint: "↑↓ 切换子 Agent · PgUp/PgDn 翻阅执行内容 · Esc 回输入框"
+  content_more_below: "↓ 下方有新事件 · PgDn 回到底部恢复跟随"
   inline_running: "运行中 · {elapsed} · ↑{tokens} tokens · {count} 次工具调用"
   detail_running: "运行中，当前动作："
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
@@ -187,6 +188,7 @@ main:
   no_session_history: "暂无历史会话，将开始新会话。"
   mode_info_plan: " [plan 模式：仅只读工具]"
   mode_info_bypass: " [bypass 模式：跳过权限确认]"
+  mode_info_manual: " [manual 模式：工具调用前逐次确认]"
   session_stats: "会话统计"
   hooks_loaded_notice: "⚠️ 检测到 {count} 条 Hooks 配置（.claude/settings.json），将在工具调用/对话生命周期中执行任意 shell 命令。如非预期，请检查配置或使用 --no-hooks 禁用。"
 
@@ -737,10 +739,15 @@ model:
   desc: "管理调用分组：/model 打开分组管理面板，/model <分组名> 直接切换"
 
 mode:
-  desc: "切换运行模式: /mode [normal|plan|bypass]"
+  desc: "切换运行模式: /mode [auto|manual|plan|bypass]"
   switched: "已切换至 {mode} 模式"
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
-  unknown: "未知模式 '{args}'。可选：normal / plan / bypass"
+  current: "当前模式: {mode}（可选: auto / manual / plan / bypass）"
+  unknown: "未知模式 '{args}'。可选：auto / manual / plan / bypass"
+
+auto:
+  mode_notice: "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定。危险操作仍会被硬拦下。Shift+Tab 切换到 manual 逐次确认。"
+  degraded_to_manual: "auto 分类器连续拦截过多，已自动降级为 manual（逐次确认）。需要的话按 Shift+Tab 切回 auto。"
 
 cwd:
   desc: "显示当前工作目录"

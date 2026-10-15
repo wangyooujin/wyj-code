@@ -34,6 +34,7 @@ subagent:
   waiting_bg: "Waiting for {count} background agent(s) to finish…"
   panel_title: " agents [{count}] "
   content_hint: "↑↓ switch sub-agent · PgUp/PgDn scroll execution · Esc back to composer"
+  content_more_below: "↓ new events below · PgDn to return to live tail"
   inline_running: "running · {elapsed} · ↑{tokens} tokens · {count} tool uses"
   detail_running: "running, current action:"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
@@ -189,6 +190,7 @@ main:
   no_session_history: "No session history yet, starting a new session."
   mode_info_plan: " [plan mode: read-only tools only]"
   mode_info_bypass: " [bypass mode: skipping permission prompts]"
+  mode_info_manual: " [manual mode: confirming each tool call]"
   session_stats: "Session stats"
   hooks_loaded_notice: "⚠️ {count} Hook(s) detected from .claude/settings.json. They will execute arbitrary shell commands during tool calls / the conversation lifecycle. If this is unexpected, review the file or use --no-hooks to disable them."
 
@@ -739,10 +741,15 @@ model:
   desc: "Manage call profiles: /model opens the profile manager, /model <name> switches directly"
 
 mode:
-  desc: "Switch run mode: /mode [normal|plan|bypass]"
+  desc: "Switch run mode: /mode [auto|manual|plan|bypass]"
   switched: "Switched to {mode} mode"
   switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
-  unknown: "Unknown mode '{args}'. Options: normal / plan / bypass"
+  current: "Current mode: {mode} (options: auto / manual / plan / bypass)"
+  unknown: "Unknown mode '{args}'. Options: auto / manual / plan / bypass"
+
+auto:
+  mode_notice: "Auto mode is active: most actions no longer prompt. A local rule layer plus a model classifier decide before an action runs, and dangerous actions are still blocked outright. Press Shift+Tab for manual, per-action confirmation."
+  degraded_to_manual: "The auto classifier blocked too many actions in a row, so this session fell back to manual (per-action confirmation). Press Shift+Tab to switch back to auto."
 
 cwd:
   desc: "Show the current working directory"
