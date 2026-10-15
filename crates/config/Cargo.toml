@@ -14,6 +14,10 @@ anyhow.workspace = true
 thiserror.workspace = true
 directories.workspace = true
 tracing.workspace = true
+# 跨进程排他锁的 flock(2) 绑定（见 src/filelock.rs）。
+# 锁必须住在最底层 crate：`wyj-core` 依赖 `wyj-config`，所以锁放 core 就没法
+# 给 config.toml 自己的 load→改→save 加锁。
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
