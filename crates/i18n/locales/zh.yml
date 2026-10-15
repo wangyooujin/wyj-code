@@ -122,6 +122,8 @@ agent:
   compacted: "\n[已自动压缩 · 第 {times} 次 · 丢弃 {removed} 条旧消息 · 保留最近 {kept} 条原文 · 释放约 {saved} tokens]\n"
   turn_task_lost: "回合任务已异常终止（内部错误或被强制中断），本轮已中止。可以直接继续输入指令。"
   turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
+  dangling_tool_uses_repaired: "\n[已为此前中断遗留的 {count} 个无结果工具调用补上占位结果（它们从未真正执行）]\n"
+  empty_completion: "\n[模型返回了空响应（没有文本、没有工具调用）。通常是端点拒绝了这次请求——可以重试；若反复出现，用 `/clear` 开一个新会话。]\n"
 
 session:
   busy_notice: "上一轮还在运行，请等它结束后再执行这个操作。"
