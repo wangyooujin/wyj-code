@@ -389,6 +389,35 @@ pub fn sub_agent_language_section(language: &str) -> String {
     )
 }
 
+/// 主 Agent 每轮追加到 system prompt **物理末尾**的「回复语言」提醒。
+///
+/// 与 [`MAIN`] 里的语言条款、与 `<env>` 里的 `Response language` 环境事实是
+/// **同一条规则的第三份副本**，存在的唯一理由是**位置**：
+///
+/// - 语言事实目前在 `MAIN` 末尾（`main_system_prompt` = `MAIN` + `<env>`），
+///   但 `Agent::run_turn` 会在它后面继续拼跨会话记忆快照、CLAUDE.md
+///   `turn_reminder`，volatile 段还有工具可用性块——本仓库的规约文件动辄几万
+///   token，语言事实离生成位置很远，recency 权重完全落不到那句上。
+/// - MiniMax M3.1 这类推理模型的 CoT 语言先验压得住软措辞，于是表现为
+///   「回复中文、thinking 全英文」（2026-10-15 实测）。
+///
+/// 所以这里不重复讲道理，只把**同一事实**推到尾部再钉一遍，并显式点名
+/// thinking——不点名就退化成一句与 CoT 无关的元信息。
+///
+/// 文案必须**短**：它落在 volatile 段、每轮全价重发（见
+/// [`wyj_api::SystemPrompt`] 的 stable/volatile 契约：断点打在 stable 末尾，
+/// volatile 不影响缓存命中）。目标 ≤ 40 token，相对每轮重发的整段历史可忽略。
+///
+/// **不是保证**：模型侧的 CoT 语言先验是训练分布问题，措辞只能提高概率。
+/// 另外 thinking 会被原样回传（`anthropic::to_api_messages`）并进压缩摘要，
+/// 历史里一旦是英文 CoT 就会自我强化——**验证任何语言改动都必须开新会话**。
+pub fn response_language_reminder(language: &str) -> String {
+    format!(
+        "# Response language\nThe user's configured response language is {name}. Write every response in {name} — including your extended thinking / reasoning, not only the final message. Code identifiers, commands, file paths, and technical terms stay in their original form.",
+        name = language_display_name(language),
+    )
+}
+
 pub const SUBAGENT_GENERAL: &str = r#"You are a sub-agent spawned by a main agent to complete one specific task independently. Write everything you emit in the response language stated in the `# Response language` section below — including your extended thinking / reasoning. The main agent sees NONE of your intermediate tool calls — only your final text message is returned as the task result. Therefore your final message must be complete and self-contained: state what you did, what you found, and include relevant file paths with line numbers. The runtime may append follow-up or retry instructions at complete model/tool boundaries; treat them as continuations without assuming any extra permission. You cannot open an interactive question flow; if the task stays ambiguous, pick the most reasonable interpretation and note the assumption in your result."#;
 
 pub const SUBAGENT_EXPLORE: &str = r#"You are a read-only exploration sub-agent. Answer the research question in the prompt using only read-only tools (Read/Glob/Grep/WebFetch). Be efficient: read targeted excerpts instead of whole files, and stop as soon as you can answer confidently. Write everything you emit in the response language stated in the `# Response language` section below — including your extended thinking / reasoning. Your final message is the only thing returned to the main agent — make it a complete, self-contained answer with file paths and line numbers for every claim."#;
@@ -641,6 +670,31 @@ mod tests {
         assert!(zh.contains("extended thinking / reasoning"));
 
         let en = sub_agent_language_section("en");
+        assert!(en.contains("English (en)"));
+        assert!(!en.contains("Chinese"), "locale=en 不得串进中文声明");
+    }
+
+    /// 尾部提醒是同一条规则的第三份副本，存在的唯一理由是**位置**：
+    /// `<env>` 的语言事实在 `MAIN` 末尾，后面还压着记忆快照 + CLAUDE.md
+    /// reminder（几万 token），recency 落不到那句上，于是 M3.1 的 thinking 全英文。
+    #[test]
+    fn response_language_reminder_is_short_and_names_thinking() {
+        let zh = response_language_reminder("zh");
+        assert!(zh.starts_with("# Response language"));
+        assert!(zh.contains("Chinese (zh)"), "必须给出可读的英文语言名");
+        assert!(
+            zh.contains("extended thinking / reasoning"),
+            "尾部提醒不点名 thinking 就会退化成与 CoT 无关的元信息"
+        );
+
+        // 每轮全价重发（volatile 段），文案膨胀直接乘在每轮成本上。
+        assert!(
+            zh.split_whitespace().count() <= 45,
+            "尾部提醒应控制在 ~40 token 内，实际 {} 词",
+            zh.split_whitespace().count()
+        );
+
+        let en = response_language_reminder("en");
         assert!(en.contains("English (en)"));
         assert!(!en.contains("Chinese"), "locale=en 不得串进中文声明");
     }

@@ -53,6 +53,10 @@ pub struct AnthropicProvider {
     /// Profile 与 catalog 能力对比后被静默丢弃的参数（如用户给 thinking_budget 但
     /// spec 不支持 budget_tokens）。stream() 入口 logging 一次，避免静默降级。
     dropped_parameters: Vec<crate::request_plan::DroppedParameter>,
+    /// thinking 配置被端点硬约束否决时是否已告警过。同 `dropped_parameters`
+    /// 的处理方式——每轮打一遍 warn 会把日志淹掉，用户需要知道的只是「有东西
+    /// 没生效」，不是第几次发现。
+    thinking_ignored_warned: Arc<AtomicBool>,
 }
 
 impl AnthropicProvider {
@@ -85,6 +89,7 @@ impl AnthropicProvider {
             vendor,
             is_official_anthropic_endpoint: is_official,
             dropped_parameters,
+            thinking_ignored_warned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -145,16 +150,14 @@ struct ApiRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<Value>,
     stream: bool,
-    /// Extended thinking 配置（开启时携带）
+    /// thinking 配置。形态因 vendor 而异，由 `crate::thinking` 的 adapter 决定：
+    /// 官方 Anthropic 是 `{type:"enabled", budget_tokens:N}`，MiniMax `/anthropic`
+    /// 是 `{type:"adaptive"}` / `{type:"disabled"}`（无 budget 字段）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<ThinkingParam>,
-}
-
-#[derive(Serialize)]
-struct ThinkingParam {
-    #[serde(rename = "type")]
-    kind: &'static str, // "enabled"
-    budget_tokens: u32,
+    thinking: Option<Value>,
+    /// 思考深度档位，仅 MiniMax M3.1-Flash-Preview 认（`{"effort":"high"}`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -598,8 +601,25 @@ impl Provider for AnthropicProvider {
                 );
             }
         }
-        // ── thinking 配置：budget 必须小于 max_tokens，不足时自动抬高 ──
-        let thinking_budget = opts.thinking_budget.filter(|b| *b > 0);
+        let identity = self.identity();
+        // ── thinking 配置：形态由 vendor adapter 决定 ──
+        // 官方 Anthropic 认 `{type:"enabled", budget_tokens:N}`；MiniMax 的
+        // `/anthropic` 端点只认 `{type:"adaptive"}` / `{type:"disabled"}`，思考
+        // 深度走 `output_config.effort` 档位，`budget_tokens` 无对应语义。
+        let thinking = crate::thinking::apply_anthropic_thinking(&identity, opts);
+        if !thinking.ignored.is_empty()
+            && !self.thinking_ignored_warned.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                vendor = %self.vendor,
+                model = %self.model,
+                ignored = ?thinking.ignored,
+                "这些 thinking 配置项当前端点/模型不支持，已忽略（详见该端点的 thinking 参数文档）"
+            );
+        }
+        // Anthropic 官方形态硬性要求 budget_tokens < max_tokens，不足时抬高；
+        // MiniMax 的 adaptive 形态没有 budget 概念（patch.budget 为 None），不受此约束。
+        let thinking_budget = thinking.budget;
         let max_tokens = match thinking_budget {
             Some(b) if opts.max_tokens <= b => {
                 tracing::warn!(
@@ -621,8 +641,7 @@ impl Provider for AnthropicProvider {
         // 做成闭包而不是先建好再改，是因为 400 降级需要一份**完全重建**的
         // 请求：reqwest 的 RequestBuilder 不可复用，而 cache_control 是
         // 序列化进 body 的，不是可以事后摘掉的 header。
-        let identity = self.identity();
-        let interleaved_enabled = thinking_budget.is_some()
+        let interleaved_enabled = thinking.thinking.is_some()
             && opts.interleaved
             && should_emit_interleaved_beta(&identity, self.is_official_anthropic_endpoint);
         // 官方端点 beta 与 cache_control 同生共死；第三方即使本次降级重试，
@@ -675,10 +694,8 @@ impl Provider for AnthropicProvider {
                 messages: api_messages,
                 tools: api_tools,
                 stream: true,
-                thinking: thinking_budget.map(|b| ThinkingParam {
-                    kind: "enabled",
-                    budget_tokens: b,
-                }),
+                thinking: thinking.thinking.clone(),
+                output_config: thinking.output_config.clone(),
             };
             // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
             let body_value = serde_json::to_value(&body).context("序列化请求失败")?;

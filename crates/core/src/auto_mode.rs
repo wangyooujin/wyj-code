@@ -34,11 +34,12 @@ use crate::auto_rules::{
 /// 分类器输出 token 上限。
 ///
 /// **不要按"判定只需一个极短的 JSON"来定这个数**：2026-10 实测，adaptive thinking
-/// 模型（MiniMax-M3.1-Flash-Preview 之类）会在字段缺省时**自行开启思考**，而
-/// `text_only()` 把 `thinking_budget` 置 None 后，`anthropic.rs:602` 只读 budget、
-/// 完全忽略 `thinking_switch`，于是请求体里根本不发 `thinking` 字段 —— 端点按自己
-/// 的默认（开）处理。这类模型还**物理上拒绝关闭思考**：
-/// `thinking.type="disabled"` 会被 400 拒（`requires adaptive thinking`）。
+/// 模型（MiniMax-M3.1-Flash-Preview 之类）会在字段缺省时**自行开启思考**，
+/// 而且**物理上拒绝关闭思考**：`thinking.type="disabled"` 会被 400 拒
+/// （`requires adaptive thinking`）。`text_only()` 虽然写了
+/// `thinking_switch="disabled"`，但 `api::thinking::apply_anthropic_thinking`
+/// 正是为了避开这个 400 而把 `disabled` 降级成「不发 thinking 字段」——于是端点
+/// 仍按默认（开）思考，辅助调用的 token 预算被思考吃光。
 ///
 /// 所以唯一可调的旋钮就是这个预算。256 远远不够：实测真实分类器 prompt
 /// （AUTO_CLASSIFIER + 四组规则 + 命令全文）下思考量 1105–2395 字符，256 会被

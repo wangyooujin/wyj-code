@@ -101,8 +101,16 @@
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days`（由 `cli::workspace_cmd::manager` 接上 `with_storage_retention`，此前是零调用死代码；`workspace list` 交叉 `git worktree list --porcelain` 报健康度，`--reconcile` 清失效 manifest） |
 | CAS blob pool（context editing 外部化的工具输出 + checkpoint 文件快照） | 1 GiB，启动时 gc | `storage.cas_total_bytes` / `storage.cas_gc_on_start` |
 | Sub-agent trace | 256 KiB / agent（已存在,不在本批改动） | `subagent.trace_max_bytes_per_agent` |
-| 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K、text 16K+8K、thinking 8K、reasoning_details 8K、tool_use.input 64K(均 head+tail,JSON 值按最长 string 叶子裁剪且保持合法 JSON) | `persist_cap.*` |
+| 持久化前 `ContentBlock` 字节截断 | tool_result 20K+10K、text 16K+8K、tool_use.input 64K(均 head+tail,JSON 值按最长 string 叶子裁剪且保持合法 JSON)。**thinking / reasoning_details 不截断**（`persist_cap.thinking_bytes` / `reasoning_details_bytes` 已废弃、默认值归零，字段仅为兼容旧 `config.toml`） | `persist_cap.*` |
 | 顶层 `~/.wyj-code` warn | 5 GiB 启动一次性 warn | `storage.disk_usage_warn_bytes` |
+
+**thinking 不截断 = 它成了唯一无界字段**（代价与理由见 `crates/api/CLAUDE.md` 第 22 条）：
+Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同 `signature` 原样回传，
+截断文本却保留签名会让校验失配、且不可逆，而 CAS 外部化（>16KB）本身是可逆的
+（resume 时 `materialize_block_with` 还原）。单条 thinking 因此可以长到几十 KB，
+**兜底只剩 context_edit / compact**（语义是「丢弃整段历史」）。长会话里窗口被 thinking
+吃掉时，正确的反应是加 context editing 阈值或调低端点 effort，**不要**去调
+`persist_cap.thinking_bytes`——它现在完全无效。
 
 
 **已知缺口**:`sessions/*.json`、`<session_id>.checkpoints/`、`<session_id>.subagents/` 三者**没有任何自动或手动回收路径**(`storage prune` / `doctor` 仍是 TODO 桩);顶层 warn 超阈值时只会提示手动删目录。`cas/` 已在 v0.2.26 接入回收链路(`storage.cas_total_bytes` + `cas_gc_on_start` 启动时 gc;会话被丢弃时逐个 `release` 让 `ref_count` 归零,否则 gc 永远删不掉),但 gc **只在进程启动时跑一次**,长跑进程内不回收。`checkpoint_bytes_per_session` / `checkpoint_ttl_days` 仍因从无消费点保持删除。
@@ -127,6 +135,12 @@
 - locale 解析统一收口到 `wyj_i18n::resolve_locale`（原先三处各自复刻 `configured.unwrap_or_else(detect_system_locale)`，漏一处就劈叉）。注意**空串/纯空白必须等同「未配置」**——`language = ""` 是 `docs/reference/config.md` 明示的合法写法，当成有效值会得到空 locale 并让 `<env>` 的语言声明整条消失。
 
 **改 `MAIN` / `<env>` 的 cache 代价**：两者都在 stable 段，locale 是会话内恒定字段，正常使用不增加重算成本；只有 `/config` 热切 language（走 `rebuild_fn` 重算 `EnvInfo`）与版本升级那一次会整体换前缀，属预期。
+
+**thinking 仍是英文：模型行为，不是漏配**（2026-10-15 二次排查，上面那条链路全部生效后仍复现）。三条结论，别再当成待修 bug：
+
+- **主因是 M3.1 的 CoT 语言先验**。推理模型的 thinking 通道在训练上是独立分布（英文数学/代码 CoT 为主），系统提示里的语言指令对**最终回复**有效、对 thinking 只是弱约束——表现正是「回复中文、thinking 全英文」。措辞只能**提高概率**，不能保证；反复重写提示词不会解决它。
+- **可动的杠杆只剩位置**。`<env>` 的语言事实在 `MAIN` 末尾，但 `run_turn` 会在它后面继续拼记忆快照 + CLAUDE.md `turn_reminder`（本仓库动辄几万 token）＋ volatile 的工具可用性块，recency 权重完全落不到那句上。故新增 `prompts::response_language_reminder(locale)`，由 `Agent::with_response_language` 每轮追加到 **volatile 段最末尾**（`agent.rs` 里排在 `current_tool_availability_block` 之后）。**它的全部价值就是"最后一段"这个位置**——谁在后面再追加东西，修复就静默失效，测试 `response_language_reminder_is_the_last_system_section` 钉的就是这条不变量。落 volatile 段因此**不影响 prompt cache 命中**（断点打在 stable 末尾），代价是每轮多约 40 个未缓存 token，相对每轮重发的整段历史可忽略；文案必须短，`prompts.rs` 的测试卡在 45 词以内。
+- **英文 thinking 会自我强化，验证必须开新会话**。Anthropic 线协议把 thinking 块连 `signature` 原样回传（`anthropic.rs::to_api_messages`），压缩时 thinking 也以 `[思考]` 进摘要——历史里一旦是英文 CoT，后续每轮的上下文里就是英文推理链，继续英文。这解释了为什么是「**一直**英文」而不是偶尔英文。**任何语言相关改动都必须 resume 之外的新会话验证**，老会话本身就是英文先验的产物。
 
 **压缩不再丢弃 thinking**（`compact.rs::messages_to_text`）：此前 `ContentBlock::Thinking` 一律 `None`，理由是「内部推理，非对话事实」。这个理由在压缩场景下站不住——摘要是压缩后**唯一**的续跑上下文，丢掉推理链等于每轮重新起跑：既丢掉已付出的推理，也让输出语言在压缩点后漂移。现按 `[思考] <truncate_chars(400)>` 纳入摘要文本，空 thinking 与 `RedactedThinking` 只留占位；配套在 `compact_prompt` 模板加 `## Key Reasoning` 一节，指示摘要器只提炼**最终答案里看不见**的推理（排除掉的方案、读代码发现的约束），没有就不输出该节，避免把整段 reasoning 原样倒灌进摘要。单测 `thinking_reaches_compaction_text` / `long_thinking_is_truncated_in_compaction_text` / `empty_and_redacted_thinking_produce_placeholder_only`。
 
