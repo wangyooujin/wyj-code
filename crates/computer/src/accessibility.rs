@@ -4,8 +4,10 @@
 //! 激活应用。坐标由 [`crate::target::WindowTarget`] 从最近窗口截图映射而来。
 
 use anyhow::{anyhow, bail, Result};
-use objc2_application_services::{AXError, AXIsProcessTrusted, AXUIElement};
-use objc2_core_foundation::{CFBoolean, CFRetained, CFString, CFType};
+use objc2_application_services::{
+    AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType,
+};
+use objc2_core_foundation::{CFArray, CFBoolean, CFMutableArray, CFRetained, CFString, CFType};
 use serde::Serialize;
 use std::ptr::NonNull;
 
@@ -19,6 +21,13 @@ const AX_TITLE: &str = "AXTitle";
 const AX_PARENT: &str = "AXParent";
 const AX_FOCUSED_APPLICATION: &str = "AXFocusedApplication";
 const AX_FRONTMOST: &str = "AXFrontmost";
+const AX_WINDOWS: &str = "AXWindows";
+const AX_CHILDREN: &str = "AXChildren";
+const AX_POSITION: &str = "AXPosition";
+
+/// 持有所有权的 AX 元素。AX 的 create/copy 家族全部返回 +1，交给
+/// `CFRetained` 管理，避免遍历几百个节点时泄漏或提前释放。
+pub type AXUIElementRef = CFRetained<AXUIElement>;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ElementInfo {
@@ -28,6 +37,23 @@ pub struct ElementInfo {
     pub value: Option<String>,
     pub value_settable: bool,
     pub selected_text_settable: bool,
+}
+
+/// 设置 AX 全局 messaging 超时（秒）。
+///
+/// macOS 默认 6 秒。AX 元素的 `CFRelease` 是一次跨进程消息，目标 App 的 AX
+/// 线程若已挂起（窗口刚关闭、App 卡顿、元素已失效），释放就会一直等，最终
+/// 以 SIGTRAP 崩掉我们的进程——真机实测 Chrome 上遍历 22 个元素后集中释放
+/// 必然触发（exit 133），而 AXPress 本身是成功的。
+///
+/// 调短它让「等不到」变成「及时失败」，把崩溃换成可处理的错误。0 表示恢复
+/// 系统默认。
+pub fn set_messaging_timeout(seconds: f32) {
+    // SAFETY: 参数为正数时设置全局超时；0 恢复默认。API 明确支持这两种用法。
+    unsafe {
+        let system = AXUIElement::new_system_wide();
+        let _ = system.set_messaging_timeout(seconds);
+    }
 }
 
 pub fn is_process_trusted() -> bool {
@@ -180,6 +206,109 @@ pub fn inspect(pid: u32, x: f64, y: f64) -> Result<ElementInfo> {
     })
 }
 
+/// 沿祖先链上溯执行 AXPress。
+///
+/// 元素本身常常不是可按下的（如一个 `AXStaticText` 真正的点击目标是它的
+/// `AXButton` 祖先），所以要像坐标版本一样逐层上溯，最多 6 层。
+fn press_chain(chain: &[AXUIElementRef]) -> Result<()> {
+    let action = CFString::from_str(AX_PRESS);
+    let mut last_error = AXError::ActionUnsupported;
+    for element in chain {
+        // SAFETY: `element` is retained; AXPerformAction takes a borrowed ref.
+        let error = unsafe { element.perform_action(&action) };
+        if error == AXError::Success {
+            return Ok(());
+        }
+        last_error = error;
+        if !matches!(
+            error,
+            AXError::ActionUnsupported | AXError::AttributeUnsupported | AXError::NoValue
+        ) {
+            break;
+        }
+    }
+    bail!(
+        "requires_foreground_takeover: target element does not expose AXPress (AXError({}))",
+        last_error.0
+    )
+}
+
+/// 对已解析的元素句柄执行 AXPress（含父链上溯）。
+///
+/// B 期的执行入口：元素由 `element_ref` 定位而来，不经坐标命中，因此
+/// 不会误点到同位置的另一个控件。
+pub fn press_handle(handle: &AXUIElement) -> Result<()> {
+    require_trusted()?;
+    let mut chain = Vec::new();
+    let mut current = // SAFETY: `handle` 由调用方保证在本次调用期间存活；retain 只做 +1，不转移所有权。
+        unsafe { CFRetained::retain(NonNull::from(handle)) }.into();
+    for _ in 0..6 {
+        let Some(element) = current else { break };
+        chain.push(element.clone());
+        current = parent(&element)?;
+    }
+    press_chain(&chain)
+}
+
+/// 对已解析的元素句柄写入文本（AXValue / AXSelectedText）。
+pub fn set_text_handle(handle: &AXUIElement, text: &str) -> Result<&'static str> {
+    require_trusted()?;
+    let value = CFString::from_str(text);
+    let value_as_type: CFRetained<CFType> = value.into();
+    let mut current = // SAFETY: `handle` 由调用方保证在本次调用期间存活；retain 只做 +1，不转移所有权。
+        unsafe { CFRetained::retain(NonNull::from(handle)) }.into();
+    for _ in 0..6 {
+        let Some(element) = current else { break };
+        for (attribute_name, result_name) in
+            [(AX_VALUE, "AXValue"), (AX_SELECTED_TEXT, "AXSelectedText")]
+        {
+            if !is_settable(&element, attribute_name) {
+                continue;
+            }
+            let attribute = CFString::from_str(attribute_name);
+            // SAFETY: `element` is retained and `attribute`/`value_as_type` live through the call.
+            let error = unsafe { element.set_attribute_value(&attribute, &value_as_type) };
+            if error == AXError::Success {
+                return Ok(result_name);
+            }
+        }
+        current = parent(&element)?;
+    }
+    bail!("requires_foreground_takeover: target element exposes no settable AXValue/AXSelectedText")
+}
+
+/// 对已解析的元素句柄做语义滚动。`Ok(false)` 表示该方向不适用。
+pub fn scroll_handle(handle: &AXUIElement, direction: &str, amount: u32) -> Result<bool> {
+    let action_name = match direction {
+        "up" => AX_DECREMENT,
+        "down" => AX_INCREMENT,
+        "left" | "right" => return Ok(false),
+        other => bail!("invalid scroll direction `{other}`"),
+    };
+    require_trusted()?;
+    let action = CFString::from_str(action_name);
+    let mut current = // SAFETY: `handle` 由调用方保证在本次调用期间存活；retain 只做 +1，不转移所有权。
+        unsafe { CFRetained::retain(NonNull::from(handle)) }.into();
+    for _ in 0..6 {
+        let Some(element) = current else { break };
+        let first = unsafe { element.perform_action(&action) };
+        if first == AXError::Success {
+            for _ in 1..amount.clamp(1, 20) {
+                ax_result(unsafe { element.perform_action(&action) }, action_name)?;
+            }
+            return Ok(true);
+        }
+        if !matches!(
+            first,
+            AXError::ActionUnsupported | AXError::AttributeUnsupported | AXError::NoValue
+        ) {
+            ax_result(first, action_name)?;
+        }
+        current = parent(&element)?;
+    }
+    Ok(false)
+}
+
 pub fn press(pid: u32, x: f64, y: f64) -> Result<()> {
     let chain = element_chain(element_at(pid, x, y)?)?;
     let action = CFString::from_str(AX_PRESS);
@@ -251,4 +380,460 @@ pub fn scroll(pid: u32, x: f64, y: f64, direction: &str, amount: u32) -> Result<
         }
     }
     Ok(false)
+}
+
+/// 一次 `copy_multiple_attribute_values` 读回的属性集合。
+///
+/// 遍历性能的全部来源：逐属性读 3000 节点 = 15000 次 IPC（访达实测 18.2s），
+/// 批量读降到每节点 2 次（实测 9.3s）。
+pub struct BatchAttributes {
+    pub role: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub value: Option<String>,
+    pub enabled: Option<bool>,
+    pub focused: Option<bool>,
+    pub selected: Option<bool>,
+    /// `AXPosition`，全局逻辑点。
+    pub position: Option<(f64, f64)>,
+    /// `AXSize`，全局逻辑点。
+    pub size: Option<(f64, f64)>,
+    pub settable: bool,
+    pub selected_text_settable: bool,
+    pub actions: Vec<String>,
+    pub children: Vec<AXUIElementRef>,
+    /// `AXIdentifier`：开发者给的稳定选择器（菜单项上是 selector，如 `NewTab`）。
+    pub identifier: Option<String>,
+    /// `AXMenuItemCmdChar`：菜单项显示的快捷键字符。
+    pub shortcut: Option<String>,
+}
+
+impl BatchAttributes {
+    fn empty() -> Self {
+        Self {
+            role: None,
+            title: None,
+            description: None,
+            value: None,
+            enabled: None,
+            focused: None,
+            selected: None,
+            position: None,
+            size: None,
+            settable: false,
+            selected_text_settable: false,
+            actions: Vec::new(),
+            children: Vec::new(),
+            identifier: None,
+            shortcut: None,
+        }
+    }
+}
+
+/// 批量读取的属性名，顺序与 [`BatchAttributes`] 的解析下标一一对应。
+const BATCH_ATTRS: [&str; 9] = [
+    "AXRole",
+    "AXTitle",
+    "AXDescription",
+    "AXValue",
+    "AXEnabled",
+    "AXFocused",
+    "AXSelected",
+    "AXPosition",
+    "AXSize",
+];
+
+const AX_IDENTIFIER: &str = "AXIdentifier";
+const AX_MENU_ITEM_CMD_CHAR: &str = "AXMenuItemCmdChar";
+
+/// 把 `CFRetained<CFType>` 降级成字符串属性。
+fn as_string(value: &CFRetained<CFType>) -> Option<String> {
+    let text: CFRetained<CFString> = value.clone().downcast::<CFString>().ok()?;
+    Some(text.to_string())
+}
+
+/// 把 `CFRetained<CFType>` 降级成布尔属性。
+fn as_bool(value: &CFRetained<CFType>) -> Option<bool> {
+    value
+        .clone()
+        .downcast::<CFBoolean>()
+        .ok()
+        .map(|flag| flag.as_bool())
+}
+
+/// 从 `AXValue` 里读出一个二元数值（CGPoint / CGSize 共用）。
+///
+/// 必须按目标类型读：`AXPosition` 是 **CGPoint**，`AXSize` 是 **CGSize**，
+/// 两者 AXValue 类型不同。用同一种类型去读会被静默拒掉，表现为「元素没有几何」，
+/// 而探路阶段正是先踩了这个坑才把 `带几何的元素` 从 0 修到 3000。
+fn as_ax_pair(value: &CFRetained<CFType>, kind: AXValueType) -> Option<(f64, f64)> {
+    let ax: CFRetained<AXValue> = value.clone().downcast::<AXValue>().ok()?;
+    // SAFETY: `pair` 是栈上 out-param，且 `ax` 的类型已在下一行核对过。
+    unsafe {
+        if ax.r#type().0 != kind.0 {
+            return None;
+        }
+        let mut pair = [0.0f64; 2];
+        if !ax.value(kind, NonNull::from(&mut pair).cast()) {
+            return None;
+        }
+        Some((pair[0], pair[1]))
+    }
+}
+
+/// 读一个节点的全部常用属性 + 动作名 + 子节点。
+///
+/// `copy_multiple_attribute_values` 的 `options` 传 `empty()`：单个属性失败
+/// 不会中断整批（错误以 `kAXValueAXErrorType` 占位在对应位置），这对
+/// 「有些节点没有 AXValue / AXPosition」是必需的。
+pub fn batch_attributes(element: &AXUIElement) -> BatchAttributes {
+    let mut out = BatchAttributes::empty();
+    if !is_process_trusted() {
+        return out;
+    }
+
+    let names: CFRetained<CFMutableArray<CFString>> =
+        CFMutableArray::with_capacity(BATCH_ATTRS.len());
+    for name in BATCH_ATTRS {
+        names.append(&CFString::from_str(name));
+    }
+    let names = names.as_opaque();
+
+    let mut raw: *const CFArray = std::ptr::null();
+    // SAFETY: `names`/`raw` 均符合 API 契约，`raw` 是有效 out-pointer。
+    let error = unsafe {
+        element.copy_multiple_attribute_values(
+            names,
+            AXCopyMultipleAttributeOptions::empty(),
+            NonNull::from(&mut raw),
+        )
+    };
+    if error == AXError::Success && !raw.is_null() {
+        let Some(pointer) = NonNull::new(raw.cast_mut()) else {
+            return out;
+        };
+        // SAFETY: 成功时 API 返回 +1 retained array。
+        let values = unsafe { CFRetained::<CFArray>::from_raw(pointer) };
+        // SAFETY: 返回数组的元素全部是 CFType。
+        let values: &CFArray<CFType> = unsafe { values.cast_unchecked::<CFType>() };
+        let values = values.to_vec();
+        let at = |index: usize| values.get(index).cloned();
+
+        if let Some(value) = at(0) {
+            out.role = as_string(&value);
+        }
+        if let Some(value) = at(1) {
+            out.title = as_string(&value);
+        }
+        if let Some(value) = at(2) {
+            out.description = as_string(&value);
+        }
+        if let Some(value) = at(3) {
+            out.value = as_string(&value);
+        }
+        if let Some(value) = at(4) {
+            out.enabled = as_bool(&value);
+        }
+        if let Some(value) = at(5) {
+            out.focused = as_bool(&value);
+        }
+        if let Some(value) = at(6) {
+            out.selected = as_bool(&value);
+        }
+        if let Some(value) = at(7) {
+            out.position = as_ax_pair(&value, AXValueType::CGPoint);
+        }
+        if let Some(value) = at(8) {
+            out.size = as_ax_pair(&value, AXValueType::CGSize);
+        }
+    }
+
+    out.settable = is_settable(element, AX_VALUE);
+    out.selected_text_settable = is_settable(element, AX_SELECTED_TEXT);
+    out.actions = action_names(element);
+    out.children = child_elements(element);
+    // 这两个属性只有菜单类元素才有，不参与批量读取（会拖慢所有节点）。
+    out.identifier = copy_string_attribute(element, AX_IDENTIFIER).ok().flatten();
+    out.shortcut = copy_string_attribute(element, AX_MENU_ITEM_CMD_CHAR)
+        .ok()
+        .flatten();
+    out
+}
+
+/// 取得一个 application 元素（菜单栏挂在它下面）。
+pub fn find_application_element(pid: u32) -> Result<Option<AXUIElementRef>> {
+    require_trusted()?;
+    let pid_i32 = i32::try_from(pid).map_err(|_| anyhow!("invalid pid {pid}"))?;
+    // SAFETY: `pid_i32` 来自 xcap 的窗口枚举，是有效进程 id；create 返回 +1。
+    let app = unsafe { AXUIElement::new_application(pid_i32) };
+    // SAFETY: `app` 是刚创建的 +1 引用，在此期间存活；retain 再 +1 后即转交所有权。
+    Ok(Some(unsafe {
+        CFRetained::retain(std::ptr::NonNull::from(app.as_ref()))
+    }))
+}
+
+/// application 元素的直接子节点（AXWindow / AXMenuBar / AXScrollArea …）。
+pub fn application_children(app: &AXUIElement) -> Vec<AXUIElementRef> {
+    child_elements(app)
+}
+
+/// 规范化菜单项标签。
+///
+/// AX 的 `AXTitle` 常带尾随空白甚至整串为空（分隔线）。空串与纯空白统一
+/// 归一为 `None`，让调用方不必各自处理。
+pub fn normalize_label(raw: Option<String>) -> Option<String> {
+    let value = raw?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 读 `AXChildren` 数组。
+fn child_elements(element: &AXUIElement) -> Vec<AXUIElementRef> {
+    let Ok(Some(value)) = copy_attribute(element, AX_CHILDREN) else {
+        return Vec::new();
+    };
+    let Some(array) = value.downcast_ref::<CFArray>() else {
+        return Vec::new();
+    };
+    // SAFETY: AX 数组属性的元素全部是 CFType。
+    let typed: &CFArray<CFType> = unsafe { array.cast_unchecked::<CFType>() };
+    typed
+        .to_vec()
+        .into_iter()
+        .filter_map(|item: CFRetained<CFType>| {
+            // to_vec() 返回的已是 +1 owned 元素，直接 downcast 转移所有权。
+            item.downcast::<AXUIElement>().ok()
+        })
+        .collect()
+}
+
+/// 读元素支持的动作名。
+fn action_names(element: &AXUIElement) -> Vec<String> {
+    let mut raw: *const CFArray = std::ptr::null();
+    // SAFETY: `raw` 是有效 out-pointer。
+    let error = unsafe { element.copy_action_names(NonNull::from(&mut raw)) };
+    if error != AXError::Success || raw.is_null() {
+        return Vec::new();
+    }
+    let Some(pointer) = NonNull::new(raw.cast_mut()) else {
+        return Vec::new();
+    };
+    // SAFETY: 成功时 API 返回 +1 retained array。
+    let array = unsafe { CFRetained::<CFArray>::from_raw(pointer) };
+    // SAFETY: 动作名数组的元素全部是 CFString。
+    let typed: &CFArray<CFType> = unsafe { array.cast_unchecked::<CFType>() };
+    typed
+        .to_vec()
+        .into_iter()
+        .filter_map(|item: CFRetained<CFType>| {
+            let name: &CFString = item.downcast_ref::<CFString>()?;
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+/// 从应用元素读 `AXWindows`。
+fn window_elements(pid: u32) -> Result<Vec<AXUIElementRef>> {
+    let pid_i32 = i32::try_from(pid).map_err(|_| anyhow!("invalid target pid {pid}"))?;
+    // SAFETY: `pid_i32` 是有效进程 id；create API 返回 +1 引用。
+    let application = unsafe { AXUIElement::new_application(pid_i32) };
+    let Some(value) = copy_attribute(&application, AX_WINDOWS)? else {
+        return Ok(Vec::new());
+    };
+    let Some(array) = value.downcast_ref::<CFArray>() else {
+        return Ok(Vec::new());
+    };
+    // SAFETY: AX 数组属性的元素全部是 CFType。
+    let typed: &CFArray<CFType> = unsafe { array.cast_unchecked::<CFType>() };
+    Ok(typed
+        .to_vec()
+        .into_iter()
+        .filter_map(|item: CFRetained<CFType>| {
+            // to_vec() 返回的已是 +1 owned 元素，直接 downcast 转移所有权。
+            item.downcast::<AXUIElement>().ok()
+        })
+        .collect())
+}
+
+/// 读元素的 `AXPosition`（全局逻辑点）。
+fn element_position(element: &AXUIElement) -> Option<(f64, f64)> {
+    let Ok(Some(value)) = copy_attribute(element, AX_POSITION) else {
+        return None;
+    };
+    as_ax_pair(&value, AXValueType::CGPoint)
+}
+
+/// 定位目标窗口对应的 AX 元素。
+///
+/// 不能用 `AXFocusedWindow`——后台窗口拿不到焦点（真机已验证 `AXWindows`
+/// 对 Chrome / 同花顺 / 访达均可枚举）。策略是先用 `AXIdentifier` 精确匹配，
+/// 再退到 `AXTitle`，最后退到「左上角与窗口原点最接近」，因为实测同花顺的
+/// `AXTitle` 是空串（`accessibility.rs` 的 `AXTitle` 常量对它无效）。
+///
+/// 返回 `Ok(None)` 表示该 App 不暴露 AX 树，调用方据此走坐标降级路径
+/// （而不是把它当成「空元素列表」，否则模型会反复重试）。
+pub fn find_window_element(target: &crate::target::WindowTarget) -> Result<Option<AXUIElementRef>> {
+    require_trusted()?;
+    let windows = window_elements(target.pid)?;
+    if windows.is_empty() {
+        return Ok(None);
+    }
+
+    // 命中判据：左上角与窗口原点最接近。AX 的 AXTitle 在部分 App 上是空串
+    // 或与窗口标题不一致，用它做主判据会误选同 App 的其他窗口
+    // （`target.rs::frontmost_window` 记录的同花顺多窗口故障同源）。
+    let mut best: Option<(f64, AXUIElementRef)> = None;
+    for window in windows {
+        let position = element_position(&window);
+        let distance = position
+            .map(|(x, y)| (x - f64::from(target.x)).abs() + (y - f64::from(target.y)).abs())
+            .unwrap_or(f64::MAX);
+        match &best {
+            Some((current, _)) if *current <= distance => {}
+            _ => best = Some((distance, window)),
+        }
+    }
+
+    let Some((distance, window)) = best else {
+        return Ok(None);
+    };
+    // 容忍 8pt：AX 报告的窗口边框与 xcap 的窗口矩形可能差一条边框。
+    if distance > 8.0 && distance != f64::MAX {
+        return Ok(None);
+    }
+    Ok(Some(window))
+}
+
+/// 菜单体系的探测结果：一个 AX 节点及其可读属性与动作。
+#[derive(Debug, Clone)]
+pub struct MenuNode {
+    pub role: String,
+    pub title: Option<String>,
+    pub value: Option<String>,
+    pub identifier: Option<String>,
+    pub enabled: Option<bool>,
+    pub actions: Vec<String>,
+    pub depth: u16,
+    pub children: usize,
+}
+
+impl MenuNode {
+    /// 该节点是否像一个可点击的菜单项/菜单栏项。
+    pub fn is_selectable(&self) -> bool {
+        matches!(
+            self.role.as_str(),
+            "AXMenuItem" | "AXMenuBarItem" | "AXMenuItem | AXMenuBarItem"
+        ) && (self.actions.contains(&"AXPress".to_string())
+            || self.actions.contains(&"AXShowMenu".to_string()))
+    }
+}
+
+/// 读一个元素的全部诊断属性（探测用，含未过滤）。
+pub fn probe_node(
+    element: &AXUIElement,
+    depth: u16,
+    max_depth: u16,
+    max_nodes: usize,
+) -> Vec<MenuNode> {
+    let mut out = Vec::new();
+    let mut stack = vec![(handle_of(element), depth)];
+    let mut budget = max_nodes;
+    while let Some((node, depth)) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let attrs = batch_attributes(&node);
+        let role = attrs.role.clone().unwrap_or_default();
+        let children = attrs.children.len();
+        out.push(MenuNode {
+            role,
+            title: attrs.title.clone(),
+            value: attrs.value.clone(),
+            identifier: copy_string_attribute(&node, "AXIdentifier").ok().flatten(),
+            enabled: attrs.enabled,
+            actions: attrs.actions.clone(),
+            depth,
+            children,
+        });
+        if depth < max_depth {
+            for child in attrs.children {
+                stack.push((child, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// 借用一个已持有的元素，产出 +1 引用。
+///
+/// 借用语义：调用方保证原句柄存活，这里只做 +1，不转移所有权。
+/// 不能用 `from_raw`——那会把「接管所有权」的错误语义用到借用指针上，
+/// 导致引用计数多加一次、最终过度释放（B 期实测会 SIGTRAP）。
+fn handle_of(element: &AXUIElement) -> AXUIElementRef {
+    // SAFETY: `element` 借用自一个存活的 `CFRetained`，retain 只做 +1。
+    unsafe { CFRetained::retain(NonNull::from(element)) }
+}
+
+/// 探测一个 App 的菜单体系。
+///
+/// 后台 App 的菜单栏不在 `AXWindows` 里，而在 **application 元素**的
+/// `AXChildren` 下（`AXMenuBar`）。上下文菜单（右键菜单）是独立的弹出窗口，
+/// 只在弹出后才出现在 `AXWindows` 里。
+pub fn probe_app_menu(pid: u32) -> Result<String> {
+    require_trusted()?;
+    let pid_i32 = i32::try_from(pid).map_err(|_| anyhow!("invalid pid {pid}"))?;
+    // SAFETY: `pid_i32` 来自 xcap 的窗口枚举，是有效进程 id。
+    let app = unsafe { AXUIElement::new_application(pid_i32) };
+
+    let mut report = String::new();
+    let children = child_elements(&app);
+    report.push_str(&format!(
+        "application 根元素直接子节点: {} 个\n",
+        children.len()
+    ));
+
+    let mut total_menu_items = 0usize;
+    let mut pressable = 0usize;
+    for child in &children {
+        let nodes = probe_node(child, 0, 8, 400);
+        let role = nodes.first().map(|n| n.role.clone()).unwrap_or_default();
+        let items: Vec<&MenuNode> = nodes.iter().filter(|n| n.is_selectable()).collect();
+        total_menu_items += items.len();
+        pressable += items
+            .iter()
+            .filter(|n| n.actions.iter().any(|a| a == "AXPress"))
+            .count();
+        report.push_str(&format!(
+            "\n── 子树 root={role} （{} 节点，{} 可选）\n",
+            nodes.len(),
+            items.len()
+        ));
+        for node in nodes.iter().take(30) {
+            if !matches!(
+                node.role.as_str(),
+                "AXMenuBar" | "AXMenuItem" | "AXMenuBarItem" | "AXMenu" | "AXUnknown"
+            ) {
+                continue;
+            }
+            report.push_str(&format!(
+                "  {}{} title={:?} value={:?} id={:?} enabled={:?} acts={:?}\n",
+                "  ".repeat(node.depth as usize),
+                node.role,
+                node.title,
+                node.value,
+                node.identifier,
+                node.enabled,
+                node.actions
+            ));
+        }
+    }
+    report.push_str(&format!(
+        "\n合计：可选菜单项 {total_menu_items}，其中可直接 AXPress 的 {pressable}"
+    ));
+    Ok(report)
 }
