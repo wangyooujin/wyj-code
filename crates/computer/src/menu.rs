@@ -283,10 +283,7 @@ fn children_of(
     };
     let bar_attrs = accessibility::batch_attributes(&bar);
     // 走到被引用的那一项。
-    let target = bar_attrs
-        .children
-        .get(reference.0 as usize)
-        .cloned();
+    let target = bar_attrs.children.get(reference.0 as usize).cloned();
     let Some(target) = target else {
         return Ok(Vec::new());
     };
@@ -336,8 +333,12 @@ pub fn press_menu_path(target: &WindowTarget, path: &[MenuRef]) -> Result<String
     let bar_attrs = accessibility::batch_attributes(&bar);
 
     // 按序号走到顶层菜单项。
-    let mut level: Vec<AXUIElementRef> =
-        bar_attrs.children.get(first.0 as usize).cloned().into_iter().collect();
+    let mut level: Vec<AXUIElementRef> = bar_attrs
+        .children
+        .get(first.0 as usize)
+        .cloned()
+        .into_iter()
+        .collect();
     if level.is_empty() {
         anyhow::bail!(
             "target_changed: top-level menu {first} is not present; call list_menus again"

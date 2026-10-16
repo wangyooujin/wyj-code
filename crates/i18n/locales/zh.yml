@@ -129,6 +129,7 @@ agent:
   dangling_tool_uses_repaired: "\n[已为此前中断遗留的 {count} 个无结果工具调用补上占位结果（它们从未真正执行）]\n"
   empty_completion: "\n[模型返回了空响应（没有文本、没有工具调用）。通常是端点拒绝了这次请求——可以重试；若反复出现，用 `/clear` 开一个新会话。]\n"
   turn_budget_wrap_up: "\n[本次提交的工具循环已用掉 {turn}/{max} 轮，已要求模型停止调用工具并立即总结当前进度]\n"
+  invalid_arguments_wrap_up: "\n[工具参数连续校验失败，已要求模型修正参数形态或改用其他方案，并交付当前进度]\n"
 
 session:
   busy_notice: "上一轮还在运行，请等它结束后再执行这个操作。"
