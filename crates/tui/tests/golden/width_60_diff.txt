@@ -1,0 +1,13 @@
+❯ 宽度敏感
+
+  ⏺ Edit(src/lib.rs) · 0.4s
+    @@ -11,7 +11,7 @@
+    11 11 │     let value_9 = compute("payload", 9)?;
+    12 12 │     let value_10 = compute("payload", 10)?;
+    13 13 │     let value_11 = compute("payload", 11)?;
+    14    │ -     let value_12 = compute("payload", 12)?;
+       14 │ +     let value_12 = compute("payload", 12 + 1)?
+          │ ; // 修正 off-by-one
+    15 15 │     let value_13 = compute("payload", 13)?;
+    16 16 │     let value_14 = compute("payload", 14)?;
+    17 17 │     let value_15 = compute("payload", 15)?;

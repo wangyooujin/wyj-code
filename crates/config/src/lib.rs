@@ -56,14 +56,12 @@ pub struct McpServerConfig {
 /// Agent 运行模式
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AgentMode {
-    /// Auto 模式（默认，对齐 Claude Code v2.1.283+ 的内置起始模式）：不由人逐次
-    /// 点确认，而是由 `wyj_core::auto_mode::AutoGate` 判定——确定性规则先行，
-    /// 拿不准的送模型分类器。Shift+Tab 可切到 Manual。
+    /// Auto 模式（唯一需要判定的日常模式，也是默认）：不由人逐次点确认，
+    /// 而是由 `wyj_core::auto_mode::AutoGate` 判定——确定性规则先行，拿不准的
+    /// 送模型分类器，闸门自己也拿不准（分类器不可用 / 超阈值降级）时交回
+    /// 逐次弹窗。Shift+Tab 在 Auto / Plan / Bypass 三档间循环。
     #[default]
     Auto,
-    /// 手动模式：工具调用前逐次弹窗，等人点头。与 Auto 的差别只在"谁来回答
-    /// 要不要问人"，其余闸门（受保护路径、Plan 白名单）完全一致。
-    Manual,
     /// Plan 模式：允许只读工具与受限规划文档写入；执行层仍按路径和命令复核。
     Plan,
     /// Bypass 模式：跳过普通交互确认，但不覆盖 protected deny 或 OS sandbox。
@@ -74,23 +72,29 @@ impl AgentMode {
     pub fn label(&self) -> &'static str {
         match self {
             AgentMode::Auto => "auto",
-            AgentMode::Manual => "manual",
             AgentMode::Plan => "plan",
             AgentMode::Bypass => "bypass",
         }
     }
 
-    /// 解析用户输入的模式名。`default` 是 `manual` 的别名，对齐上游：
-    /// 配置值与界面标签本来就不同（上游 UI 叫 Manual，配置写 `default`），
-    /// 让用户在这两种写法间猜是纯粹的摩擦。
+    /// 解析用户输入的模式名。
+    ///
+    /// `manual` / `default` / `normal` 都是 `auto` 的**向后兼容别名**，不再
+    /// 指向独立模式：旧的配置文件与脚本里写着 `manual` 仍能加载，但语义已经
+    /// 并入 auto（弹窗改为闸门判定后才出现），解析成 `None` 会让用户的旧
+    /// 配置直接失效，那比留一个别名糟得多。
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(AgentMode::Auto),
-            "manual" | "default" | "normal" => Some(AgentMode::Manual),
+            "auto" | "manual" | "default" | "normal" => Some(AgentMode::Auto),
             "plan" => Some(AgentMode::Plan),
             "bypass" | "bypasspermissions" | "bypass_permissions" => Some(AgentMode::Bypass),
             _ => None,
         }
+    }
+
+    /// 全部可选模式名，供 `--permission-mode` 的报错文案与 `/mode` 提示共用。
+    pub fn all_labels() -> &'static [&'static str] {
+        &["auto", "plan", "bypass"]
     }
 
     /// Plan 模式下进入执行层复核的工具集；Write/Bash 不代表任意写入获批。
@@ -1310,11 +1314,9 @@ impl Config {
         let p = self.active_profile();
         match mode {
             AgentMode::Plan => p.plan_model.as_deref().unwrap_or(&p.model),
-            // Auto / Manual / Bypass 共用 exec 模型：三者对模型能力的要求相同，
+            // Auto 与 Bypass 共用 exec 模型：两者对模型能力的要求相同，
             // 差别只在权限判定，不值得让用户为切换模式再配一个模型。
-            AgentMode::Auto | AgentMode::Manual | AgentMode::Bypass => {
-                p.exec_model.as_deref().unwrap_or(&p.model)
-            }
+            AgentMode::Auto | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
         }
     }
 }
@@ -2318,15 +2320,18 @@ context_window = 200000
         assert_eq!(AgentMode::Auto.label(), "auto");
     }
 
-    /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器，
-    /// 因此 `default`（上游的配置值）必须等于 `manual`（上游的界面标签）。
+    /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器。
+    ///
+    /// `manual` / `default` / `normal` 是历史遗留拼法，手动模式合并进 auto 后
+    /// 它们全部落到 `Auto`——**必须仍然返回 `Some`**：旧配置与脚本里写着
+    /// `manual` 是常态，让它解析失败等于用户的配置被静默作废。
     #[test]
     fn agent_mode_parse_accepts_upstream_spellings() {
         assert_eq!(AgentMode::parse("auto"), Some(AgentMode::Auto));
         assert_eq!(AgentMode::parse("AUTO"), Some(AgentMode::Auto));
-        assert_eq!(AgentMode::parse("manual"), Some(AgentMode::Manual));
-        assert_eq!(AgentMode::parse("default"), Some(AgentMode::Manual));
-        assert_eq!(AgentMode::parse("normal"), Some(AgentMode::Manual));
+        assert_eq!(AgentMode::parse("manual"), Some(AgentMode::Auto));
+        assert_eq!(AgentMode::parse("default"), Some(AgentMode::Auto));
+        assert_eq!(AgentMode::parse("normal"), Some(AgentMode::Auto));
         assert_eq!(AgentMode::parse("plan"), Some(AgentMode::Plan));
         assert_eq!(AgentMode::parse("bypass"), Some(AgentMode::Bypass));
         assert_eq!(AgentMode::parse("autoo"), None);

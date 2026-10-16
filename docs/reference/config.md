@@ -135,24 +135,26 @@ args = ["--flag"]
 
 ### Auto 模式（默认权限模式）
 
-wyj-code 的**默认起始模式**是 `auto`，对齐 Claude Code v2.1.283+ 的内置起始模式。它与 `manual` 的差别只有一个位置：**谁来回答「这一步要不要问人」**。手动模式下是用户逐次点击；auto 模式下是一条固定顺序的流水线（`core::auto_mode::AutoGate`）：
+wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入它，作为兼容别名保留解析）。判定「这一步要不要问人」走一条固定顺序的流水线（`core::auto_mode::AutoGate`），拿不准时交回逐次弹窗：
 
 1. **受保护路径写入**（`.git`、`.wyj-code`、`.env`、密钥文件）——任何模式都不放行，直接拒绝；
 2. **确定性 allow**——工作目录内的文件写、只读 shell 命令、构建/测试命令、lockfile 依赖安装，本地判定，零延迟零成本；
 3. **确定性 hard_deny**——`curl|bash`、`rm -rf ~`、`git push --force`、`git reset --hard`、`terraform destroy`、`sudo <program>`、凭据路径、启动无审批的 agent 循环等，本地判定，**不发模型请求**；
 4. **模型分类器**——前两步都没结论时才付一次模型往返，让它按 `soft_deny` / `allow` / `environment` 规则判断「这一步是否在用户请求范围内」。优先级 `hard_deny → soft_deny → allow → 用户显式意图`。
-5. **重试后交回人工**——分类器超时 / 返回非法内容 / 空响应（常见成因是 `stop_reason=MaxTokens` 把输出预算吃光）会先用「加格式提醒 + 输出预算翻倍」的输入重试一次；两次都拿不到判定就交回人工弹窗，**不消耗**降级计数——模型压根没表达过否决意图，计成拦截会让闸门白白退回逐次确认。安全侧没有松：无交互面（headless / 子 Agent）上人工确认本身就是 fail-closed，行为与直接拒绝一致。
-6. **降级**——连续 3 次或累计 20 次**被判定拒绝**（不含「交回人工」），自动退回逐次人工确认并提示；Shift+Tab 可随时切回。
+5. **重试后交回人工**——分类器超时 / 返回非法内容 / 空响应（常见成因是 `stop_reason=MaxTokens` 把输出预算吃光）会先用「加格式提醒 + 输出预算翻倍」的输入重试一次；两次都拿不到判定就交回人工弹窗，**不消耗**降级计数——模型压根没表达过否决意图，计成拦截会让闸门白白停用分类器。安全侧没有松：无交互面（headless / 子 Agent）上人工确认本身就是 fail-closed，行为与直接拒绝一致。
+6. **降级**——连续 3 次或累计 20 次**被判定拒绝**（不含「交回人工」），自动**停用模型分类器**：此后只剩 1~2 两条确定性规则，拿不准的操作改为逐次弹窗。`hard_deny` 不受影响（它排在分类器开关之前，无论配置怎么写都拦得住）。用 `/mode auto` 显式选一次可重新启用分类器。
 
-四种模式用 `--permission-mode auto|manual|plan|bypass` 或 TUI 的 Shift+Tab 切换（`default` 是 `manual` 的别名）；`--plan` / `--bypass-permissions` 是前两者的便捷写法。**auto 不要求交互面**，因此 `-p` / headless / 定时任务同样可用——这正是它相对「逐次弹窗」唯一而决定性的优势。
+> 第 1~3 步的顺序是硬要求：**两条确定性规则必须排在「分类器是否可用」之前**。否则在 `[auto_mode] enabled = false` 时 `curl|bash` 只会剩下一个弹窗，用户按一个 `y` 就过去了——降级降的应是语义判定，不是安全底线。
+
+三种模式用 `--permission-mode auto|plan|bypass` 或 TUI 的 Shift+Tab 切换（`manual` / `default` / `normal` 仍可解析，全部落到 `auto`，是为了让旧配置与脚本不至于直接失效）；`--plan` / `--bypass-permissions` 是另两档的便捷写法。**auto 不要求交互面**，因此 `-p` / headless / 定时任务同样可用——这正是它相对「纯逐次弹窗」唯一而决定性的优势。
 
 `[auto_mode]` 的四个规则数组是**英文自然语言规则**（喂给分类器，不是正则），支持 `$defaults` 占位符原位插入内置规则。内置清单见 `core::auto_rules`。
 
 两个容易踩的点：
 
 - **分类器与主会话共用同一 Provider 时，它的 token 计在主会话的 `total_*` 里**。想彻底隔离，配一个独立的 `classifier_profile`（配便宜的小模型通常足够）。
-- **「本轮已放行」的记忆粒度在两种模式下不同**：manual 按工具名（批准一次 Bash，本轮不再问），auto 按**命令族**——`<程序> <子命令>` 相同就复用授权，flag 差异不参与分族（`git log --oneline` 与 `git log -p` 同族）。三类命令一律回退到「工具名 + 完整输入」的精确指纹：命令里带元字符/引号/路径分隔符、argv[1] 是 flag、或出现第二个位置参数（`npm run build` 与 `npm run deploy`、`pip install a` 与 `pip install b`）。这是刻意的——否则审过一次 `npm test` 就会让本轮所有 `npm run deploy` 一起免审。
-- **子 Agent 继承同一个闸门实例**（含降级计数），所以子 Agent 的副作用工具也由分类器判定，而不是退回逐次弹窗。headless / 后端子 Agent 没有审批 UI，分类器判定交回人工时会 fail-closed 拒掉该次调用。
+- **「本轮已放行」的记忆粒度按工具分叉：Bash 按工具名，其余按输入指纹**。批准一次 Bash 后本轮所有 Bash 免问（命令全文不参与这把钥匙）——Bash 的风险几乎由程序+子命令决定，闸门在复用之前仍逐条走过 hard_deny 与只读白名单。写工具、`Agent`、computer-use 则一律按规范化输入指纹：`Edit` 批过 `notes.md` 不该顺带放行 `deploy.sh`，用户在为一个文件点头、模型顺手改了另一个是**收紧**而不是继承。key 打乱顺序的等价 JSON 仍算同一次调用。
+- **子 Agent 继承同一个闸门实例**（含降级计数），所以子 Agent 的副作用工具也由分类器判定，而不是退回逐次弹窗。headless / 后端子 Agent 没有审批 UI，闸门判「交回人工」时会在 `confirm_tool` 处 fail-closed 拒掉该次调用。
 
 ### 项目规约文件回退链
 

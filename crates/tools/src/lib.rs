@@ -40,6 +40,9 @@ pub use bash_session::BashSessionManager;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use computer::ComputerTool;
 pub use ctx::{PermissionDecision, PermissionMode, ToolCtx, UiAskRequest};
+// TUI 的 diff 渲染层直接复用真实生成结果（而非手写样本），这样改了
+// `make_diff` 的输出形状会立刻反映到渲染快照上，而不是被一份过期的样本盖住。
+pub use diff::{make_added, make_diff};
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use grep::backend_label as grep_backend_label;
 pub use memory::MemoryTool;

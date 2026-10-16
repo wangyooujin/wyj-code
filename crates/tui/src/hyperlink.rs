@@ -8,11 +8,12 @@
 //! 2. 自定义 Crossterm backend 在 `Terminal` 已经完成 Buffer diff 之后，才给将要
 //!    输出的 Cell 包上 OSC 8。这样换行、宽字符和增量重绘都仍使用干净文本计算。
 
+use crate::theme::Theme;
 use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::{Buffer, Cell},
     layout::{Position, Rect, Size},
-    style::{Color, Modifier, Style},
+    style::Modifier,
 };
 use std::{
     collections::HashMap,
@@ -196,9 +197,7 @@ pub(crate) fn linkify_buffer(
     let (text, visible_cells) = visible_text(buffer, area);
     let links = detect_links(&text, cwd);
     let mut targets = HashMap::new();
-    let link_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::UNDERLINED);
+    let link_style = Theme::hint().add_modifier(Modifier::UNDERLINED);
 
     for link in links {
         for cell in visible_cells
@@ -720,6 +719,8 @@ pub(crate) fn open_target(target: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 生产代码里 `Style` 只在别处构造；这里是测试自己拼 cell 用的
+    use ratatui::style::Style;
 
     #[test]
     fn detects_web_links_and_existing_files_with_line_positions() {

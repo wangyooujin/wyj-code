@@ -250,25 +250,18 @@ pub(crate) fn derive_sub_agent_permission_mode(
     match parent_mode {
         // Bypass 显式全放行 → 子 Agent 同样全放行
         Some(PermissionMode::AutoApprove) => PermissionMode::AutoApprove,
-        // Normal(Prompt)：子 Agent 没有、也不应该有再弹窗的审批通道，而
-        // 「委派这个子任务」本身已经在父级做过一次审批 —— `SubAgentTool::
-        // needs_permission` 按被委派类型是否有副作用决定要不要问用户
-        // （见 `def_can_touch_side_effects`）。这次委派即覆盖子 Agent 内部
-        // 的写/执行类工具。
+        // Auto：**原样继承**。理由是 Auto 的判定者不是人而是闸门——它不需要
+        // 审批 UI（headless 也能判），而闸门随 ctx 派生自动传给子 Agent。
+        // 降成 AutoApprove 等于把子 Agent 里最容易出事的那部分写/执行动作
+        // 整个移出分类器视野。
         //
-        // 若这里退回 Prompt，`Prompt` + 无 UI 通道会在 `evaluate`（副作用
-        // 工具 + 非交互 surface → `interactive_approval_unavailable`）和
-        // `confirm_tool`（无 `ui_ask_tx` → false）两处 fail-closed，把
-        // general-purpose 子 Agent 的 Bash/Edit/Write **全部废掉**，比父级
-        // 更严 —— 任何"继承"语义都不可能要求这样。
-        Some(PermissionMode::Prompt) => PermissionMode::AutoApprove,
-        // Auto：**原样继承**，不做 Prompt 那样的降级。理由是 Auto 的判定者不是
-        // 人而是闸门——它不需要审批 UI（headless 也能判），而闸门随 ctx 派生
-        // 自动传给子 Agent。降成 AutoApprove 等于把子 Agent 里最容易出事的
-        // 那部分写/执行动作整个移出分类器视野。
+        // 子 Agent 内部判到 `AskUser` 时会在 `confirm_tool` 处 fail-closed
+        // （子 ctx 不接 `ui_ask_tx`），这是有意的：委派动作本身已经在父级
+        // 按 `def_can_touch_side_effects` 问过一次，子任务内部再判不该悄悄
+        // 放行，也不该把 general-purpose 的 Bash/Edit/Write 全部废掉。
         Some(PermissionMode::Auto) => PermissionMode::Auto,
         _ => match allowed {
-            None => PermissionMode::Prompt,
+            None => PermissionMode::Auto,
             Some(allowed) => {
                 if parent_is_plan {
                     let read_only = allowed
@@ -1407,9 +1400,25 @@ mod tests {
             ["Bash", "Read"].iter().map(|s| s.to_string()).collect();
         let mode = derive_sub_agent_permission_mode(None, Some(base.clone()), false);
         assert!(matches!(mode, PermissionMode::Allowlist(_)));
-        // 既没有模式也没有白名单 → Prompt（维持现状）
+        // 既没有模式也没有白名单 → Auto（走闸门，无白名单兜底）
         let mode = derive_sub_agent_permission_mode(None, None, false);
-        assert!(matches!(mode, PermissionMode::Prompt));
+        assert!(matches!(mode, PermissionMode::Auto));
+    }
+
+    /// Auto 父级：子 Agent **原样继承**，不降级。
+    ///
+    /// 降级成 `AutoApprove` 是这里曾经给手动模式的做法（因为子 Agent 没有弹窗
+    /// 通道，逐次确认会把 general-purpose 的 Bash/Edit/Write 全废）。合并成单一
+    /// auto 之后这条理由依然成立，而且降级会更糟：闸门本来就随 ctx 派生传给子
+    /// Agent，降级等于把最容易出事的写/执行动作整个移出分类器视野。
+    #[test]
+    fn sub_agent_in_auto_mode_inherits_the_gate_instead_of_auto_approve() {
+        use crate::ctx::PermissionMode;
+        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::Auto), None, false);
+        assert!(
+            matches!(mode, PermissionMode::Auto),
+            "auto 父级下子 Agent 必须继承闸门判定，而不是全放行"
+        );
     }
 
     // ── Agent 工具的审批点 ─────────────────────────────────────────────
@@ -1505,14 +1514,11 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_in_normal_prompt_mode_inherits_allow() {
+    fn sub_agent_in_bypass_mode_inherits_auto_approve() {
         use crate::ctx::PermissionMode;
-        // Manual 模式：委派已在父级审批过，子 Agent 不应再被 fail-closed 全量拒绝
-        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::Prompt), None, false);
-        assert!(
-            matches!(mode, PermissionMode::AutoApprove),
-            "Manual 模式下子 Agent 应继承放行，否则 Bash/Edit/Write 全废"
-        );
+        // Bypass 显式全放行时子 Agent 同样全放行（Bypass 不能比父级更严）。
+        let mode = derive_sub_agent_permission_mode(Some(PermissionMode::AutoApprove), None, false);
+        assert!(matches!(mode, PermissionMode::AutoApprove));
     }
 
     #[test]

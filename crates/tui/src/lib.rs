@@ -11,6 +11,13 @@ pub mod terminal_input;
 pub mod theme;
 pub mod welcome;
 
+#[cfg(test)]
+mod golden_tests;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod theme_tests;
+
 pub use app::{detect_terminal_width, run_tui, RebuildFn};
 pub use theme::{apply_theme_json, ThemePalette};
 pub use wyj_config::AgentMode;

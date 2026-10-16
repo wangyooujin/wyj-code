@@ -194,7 +194,6 @@ main:
   no_session_history: "暂无历史会话，将开始新会话。"
   mode_info_plan: " [plan 模式：仅只读工具]"
   mode_info_bypass: " [bypass 模式：跳过权限确认]"
-  mode_info_manual: " [manual 模式：工具调用前逐次确认]"
   session_stats: "会话统计"
   hooks_loaded_notice: "⚠️ 检测到 {count} 条 Hooks 配置（.claude/settings.json），将在工具调用/对话生命周期中执行任意 shell 命令。如非预期，请检查配置或使用 --no-hooks 禁用。"
 
@@ -228,7 +227,7 @@ help:
     - `/schedule` — 管理定时任务（cron 触发的 prompt），macOS/Linux 下保存后自动同步进系统 crontab
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
-    - `/mode [模式]` — 切换运行模式（auto / manual / plan / bypass）；无参数则显示当前模式
+    - `/mode [模式]` — 切换运行模式（auto / plan / bypass）；无参数则显示当前模式
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
     - `/init` — 让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
@@ -745,15 +744,15 @@ model:
   desc: "管理调用分组：/model 打开分组管理面板，/model <分组名> 直接切换"
 
 mode:
-  desc: "切换运行模式: /mode [auto|manual|plan|bypass]"
+  desc: "切换运行模式: /mode [auto|plan|bypass]"
   switched: "已切换至 {mode} 模式"
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
-  current: "当前模式: {mode}（可选: auto / manual / plan / bypass）"
-  unknown: "未知模式 '{args}'。可选：auto / manual / plan / bypass"
+  current: "当前模式: {mode}（可选: auto / plan / bypass）"
+  unknown: "未知模式 '{args}'。可选：auto / plan / bypass"
 
 auto:
-  mode_notice: "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定。危险操作仍会被硬拦下。Shift+Tab 切换到 manual 逐次确认。"
-  degraded_to_manual: "auto 分类器连续拦截过多，已自动降级为 manual（逐次确认）。需要的话按 Shift+Tab 切回 auto。"
+  mode_notice: "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。"
+  degraded_to_confirm: "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。"
 
 cwd:
   desc: "显示当前工作目录"

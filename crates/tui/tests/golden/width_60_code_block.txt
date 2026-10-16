@@ -1,0 +1,10 @@
+❯ 宽度敏感
+
+  ╭─ rust ─────────────────────────────────────────────────╮
+  │  1 fn compute(input: &str, depth: usize) -> Result<Vec │
+  │    <Token>, ParseError> {                              │
+  │  2     let mut out = Vec::with_capacity(input.len());  │
+  │    // 预分配避免反复扩容                               │
+  │  3     out                                             │
+  │  4 }                                                   │
+  ╰────────────────────────────────────────────────────────╯

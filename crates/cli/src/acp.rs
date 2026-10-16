@@ -988,8 +988,12 @@ fn prompt_blocks(params: &Value) -> Result<Vec<wyj_api::types::ContentBlock>> {
 
 fn set_mode(context: &ToolCtx, mode: &str) -> Result<()> {
     match mode {
-        "auto" => context.set_permission_mode(PermissionMode::Auto),
-        "normal" | "manual" => context.set_permission_mode(PermissionMode::Prompt),
+        // "normal" / "manual" 是手动模式并入 auto 之前的历史拼法：ACP 客户端
+        // 可能还在发它们。必须仍然落到 auto 而不是报错——客户端对模式名没有
+        // 校验能力，直接拒绝会让整个会话起不来。
+        "auto" | "normal" | "manual" | "default" => {
+            context.set_permission_mode(PermissionMode::Auto)
+        }
         "plan" => {
             let allowed = [
                 "Read",
