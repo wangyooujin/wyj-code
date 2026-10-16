@@ -767,7 +767,10 @@ fn parse_menu_path(input: &Value) -> Result<Vec<wyj_computer::menu::MenuRef>> {
         .ok_or_else(|| anyhow!("missing required field `menu_path` (array of menu references)"))?;
     // 空路径必须在参数校验阶段就拒掉——否则会一路走到 `press_menu_path` 的
     // `split_first()` 才失败，白白跑完一次租约与前台校验。
-    anyhow::ensure!(!raw.is_empty(), "`menu_path` must contain at least one reference");
+    anyhow::ensure!(
+        !raw.is_empty(),
+        "`menu_path` must contain at least one reference"
+    );
     raw.iter()
         .map(|item| {
             item.as_str()
