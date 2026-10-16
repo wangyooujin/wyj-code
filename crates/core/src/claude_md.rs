@@ -16,6 +16,11 @@
 //!   时仍然生效，不会被静默丢弃。两个槽位各自只取一个文件，
 //!   因此**永远不存在同一份规约被注入两遍**的情况。
 //! - 支持 `@path/to/file` 递归导入（深度上限 4，跳过 fenced code block）。
+//! - **子目录动态加载向上逐级查找**（见 [`ClaudeMdLoader::maybe_dir_reminder`]）：
+//!   工具触达某个文件后，从其所在目录一路查到项目根，沿途每个「有规约文件且尚未
+//!   展示过」的目录注入一次。只查触达目录本身会让有 `src/` 层的模块规约永远失联。
+//!   上界是项目根，越界的绝对路径只取其自身，不向上爬。
+//! - **注入量封顶**：单目录规约文本按 [`MAX_RULE_FILE_BYTES`] 截断并显式标注。
 //! - 不缓存文件内容，只缓存"哪些目录参与"这个列表；内容每次调用都重新读盘，
 //!   保证运行期间编辑立即生效、压缩后依然完整（因为每轮都重新拼装，不依赖历史消息）。
 
@@ -50,9 +55,23 @@ pub struct DiscoveredFile {
     pub exists: bool,
 }
 
+/// 单个目录内注入的规约文本字节上限。
+///
+/// 规约是**一次性**注入（`seen_dirs` 去重后不再重发），所以这个上限比记忆快照的
+/// `MAX_CONTEXT_BYTES`(8KB) 宽松得多——它要挡的是「把生成物 / 数据导出 / 巨型文档
+/// 误写成 `AGENTS.md`」这类事故，而不是压缩正常规约。64KB 足以覆盖本仓库最大的
+/// `crates/tui/CLAUDE.md`(51KB)，正常规约一个都不会被切。
+///
+/// 截断**保留头部并显式标注**：`char` 边界安全地切，绝不 panic；静默丢尾会让
+/// 模型以为自己读全了规则，后果比读到一半更糟。
+const MAX_RULE_FILE_BYTES: usize = 64 * 1024;
+
 /// 每次 Agent 构建时扫描一次，确定参与注入的目录列表；内容按需每轮重新读盘。
 pub struct ClaudeMdLoader {
     global_dir: Option<PathBuf>,
+    /// 项目根。子目录动态加载**向上查找的硬边界**：越过它就爬到 `/Volumes`、
+    /// `~` 这些与本项目无关的目录去了，而那里恰好可能有个 `AGENTS.md`。
+    project_root: PathBuf,
     /// 祖先链目录，root → cwd 顺序
     chain_dirs: Vec<PathBuf>,
     /// 子目录动态加载去重（含 global_dir/chain_dirs 本身，避免重复展示）
@@ -62,8 +81,12 @@ pub struct ClaudeMdLoader {
 impl ClaudeMdLoader {
     pub fn new(cwd: &Path) -> Self {
         let global_dir = wyj_config::global_config_dir().ok();
-        let root = wyj_config::project_root(cwd);
-        let chain_dirs = collect_chain(&root, cwd);
+        // 归一是必须的，不是洁癖：`maybe_dir_reminder` 拿 `project_root` 做
+        // `starts_with` 边界判断、拿 `seen_dirs` 去重，只要 root / cwd / 工具入参
+        // 三者的路径拼写不一致（`./a/b` vs `a/b`），边界就会漏判或去重失效。
+        let root = normalize_lexically(&wyj_config::project_root(cwd));
+        let cwd = normalize_lexically(cwd);
+        let chain_dirs = collect_chain(&root, &cwd);
 
         let mut seen = HashSet::new();
         if let Some(g) = &global_dir {
@@ -75,6 +98,7 @@ impl ClaudeMdLoader {
 
         Self {
             global_dir,
+            project_root: root,
             chain_dirs,
             seen_dirs: Mutex::new(seen),
         }
@@ -103,22 +127,57 @@ impl ClaudeMdLoader {
         ))
     }
 
-    /// 工具触达新目录时调用：若该目录此前未展示过且存在项目规约文件，
-    /// 返回一段独立的 reminder 文本；否则返回 None。
+    /// 工具触达新目录时调用：从该目录**逐级向上**找，直到项目根，沿途注入每个
+    /// 未展示过且确有规约文件的目录。返回一段 reminder 文本；全都没有则 None。
+    ///
+    /// 为什么要向上找而不是只看触达目录本身：工具报上来的是**文件的直接父目录**，
+    /// 而规约习惯写在模块根（`crates/core/CLAUDE.md`）。只看 `crates/core/src/`
+    /// 会永远返回 None，于是「按目录惰性下沉」在有 `src/` 层的 Rust / TS 仓库里
+    /// 形同虚设——模块规约内容全部对模型不可见，而这恰恰是它们唯一的存在理由。
     pub fn maybe_dir_reminder(&self, dir: &Path) -> Option<String> {
-        let dir = dir.to_path_buf();
+        let start = normalize_lexically(dir);
+        // 触达项目外的路径时只看它自己：继续向上会把 `/`、`~`、`/Volumes` 这些
+        // 与本项目无关的目录也扫一遍，而那里出现的 AGENTS.md 与本次任务无关，
+        // 纯属往上下文里塞噪声。
+        let bounded = start.starts_with(&self.project_root);
+
+        let mut sections: Vec<(ClaudeMdSource, PathBuf, String)> = vec![];
+        let mut cur = start;
+        loop {
+            if let Some(text) = self.take_unseen(&cur) {
+                sections.push((ClaudeMdSource::Subdir, cur.clone(), text));
+            }
+            if !bounded || cur == self.project_root {
+                break;
+            }
+            match cur.parent() {
+                Some(p) => cur = p.to_path_buf(),
+                None => break,
+            }
+        }
+
+        if sections.is_empty() {
+            return None;
+        }
+        Some(wrap_reminder(
+            "The directories you just accessed have additional project instructions. Follow them as well:",
+            &sections,
+        ))
+    }
+
+    /// 首次见到该目录时才读盘注入；见过了返回 None。
+    ///
+    /// `seen` 在读盘**之前**落盘是有意的：同一轮里多个工具命中同一目录（`Grep`
+    /// 带 path + `Read` 带 file_path）时只会探一次盘，而内容仍随每轮重读，
+    /// 运行期改文件照样生效（见模块注释）。
+    fn take_unseen(&self, dir: &Path) -> Option<String> {
         {
             let mut seen = self.seen_dirs.lock().unwrap();
-            if seen.contains(&dir) {
+            if !seen.insert(dir.to_path_buf()) {
                 return None;
             }
-            seen.insert(dir.clone());
         }
-        let text = load_dir_files(&dir)?;
-        Some(wrap_reminder(
-            "The directory you just accessed has additional project instructions. Follow them as well:",
-            &[(ClaudeMdSource::Subdir, dir, text)],
-        ))
+        load_dir_files(dir)
     }
 }
 
@@ -198,17 +257,69 @@ fn resolve_slot(dir: &Path, names: &[&str]) -> Option<(PathBuf, String)> {
 
 /// 单个目录内的记忆文件读取规则：主槽位与个人覆盖槽各取一个文件，
 /// 两个都命中时 local 追加在后（视作个人覆盖增补）。
+///
+/// 结果受 [`MAX_RULE_FILE_BYTES`] 约束：主槽位与 local 各自独立封顶后才拼接，
+/// 所以「一个超大主文件 + 正常 local」不会把 local 挤掉。
 fn load_dir_files(dir: &Path) -> Option<String> {
     let parts: Vec<String> = [MEMORY_FILES.as_slice(), MEMORY_LOCAL_FILES.as_slice()]
         .iter()
         .filter_map(|names| resolve_slot(dir, names))
-        .map(|(_, content)| content)
+        .map(|(_, content)| truncate_rule_text(&content))
         .collect();
 
     if parts.is_empty() {
         None
     } else {
         Some(parts.join("\n\n"))
+    }
+}
+
+/// 超长规约文本按字节封顶，保留头部并显式标注截断。
+///
+/// 回退到 `char` 边界：`MAX_RULE_FILE_BYTES` 落在多字节字符中间时直接切会 panic
+/// （Rust 的 String 不允许半个 code point），而中文规约里这个概率不是零。
+fn truncate_rule_text(text: &str) -> String {
+    if text.len() <= MAX_RULE_FILE_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_RULE_FILE_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[truncated: this rules file is {} bytes; only the first {} bytes were loaded]",
+        &text[..end],
+        text.len(),
+        end
+    )
+}
+
+/// 纯字符串的路径归一：消掉 `.` 与 `..`，**不解析符号链接**。
+///
+/// 为什么不用 `fs::canonicalize`：macOS 上 `/tmp` 会变成 `/private/tmp`，
+/// 于是同一个目录在 `seen_dirs` 里成了两条记录，同一份规约被注入两次——而重复注入
+/// 恰恰是这个模块要杜绝的事（见 `resolve_slot` 的「命中即停」）。代价是 `..` 跨
+/// 符号链接那一种形态不做文件系统语义解析，但工具入参极少产生这种路径。
+fn normalize_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // `..` 弹到根或空路径时丢弃：`/..` 仍是 `/`，而不是弹出一个
+                // `/..` 让后面的 `starts_with(project_root)` 比对失配。
+                if !out.pop() && !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
@@ -507,6 +618,7 @@ mod tests {
 
         let loader = ClaudeMdLoader {
             global_dir: None,
+            project_root: root.clone(),
             chain_dirs: vec![root.clone(), cwd.clone()],
             seen_dirs: Mutex::new(HashSet::from([root.clone(), cwd.clone()])),
         };
@@ -569,10 +681,161 @@ mod tests {
         std::fs::write(dir.join("AGENTS.md"), "subdir notes").unwrap();
         let loader = ClaudeMdLoader {
             global_dir: None,
+            project_root: dir.clone(),
             chain_dirs: vec![],
             seen_dirs: Mutex::new(HashSet::new()),
         };
         assert!(loader.maybe_dir_reminder(&dir).is_some());
         assert!(loader.maybe_dir_reminder(&dir).is_none());
+    }
+
+    /// 回归钉子：触达目录是 `crates/core/src/` 而规约写在 `crates/core/`。
+    /// 旧实现只看触达目录本身，永远返回 None，模块规约对模型完全不可见——
+    /// 而「子目录惰性下沉」是本模块存在的理由，注释里写着的功能实际没生效。
+    #[test]
+    fn dir_reminder_walks_up_to_find_rules_in_an_ancestor() {
+        let root = unique_dir("walk-up-root");
+        let module = root.join("crates/core");
+        let src = module.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(module.join("CLAUDE.md"), "core module rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            project_root: root.clone(),
+            chain_dirs: vec![root.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone()])),
+        };
+        let reminder = loader
+            .maybe_dir_reminder(&src)
+            .expect("src/ 下无规约，但父目录 crates/core/ 有，必须注入");
+        assert!(reminder.contains("core module rules"));
+        assert!(reminder.contains(&module.display().to_string()));
+    }
+
+    /// 沿途**每一级**都要注入，不是只注入最近的那一级：嵌套模块各写一份
+    /// 规约时，模型需要看到全部，不能因为 `inner/` 命中就跳过 `outer/`。
+    #[test]
+    fn dir_reminder_injects_every_unseen_level_on_the_way_up() {
+        let root = unique_dir("walk-up-multi-root");
+        let outer = root.join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("AGENTS.md"), "outer rules").unwrap();
+        std::fs::write(inner.join("AGENTS.md"), "inner rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            project_root: root.clone(),
+            chain_dirs: vec![root.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone()])),
+        };
+        let reminder = loader.maybe_dir_reminder(&inner).unwrap();
+        assert!(reminder.contains("outer rules"));
+        assert!(reminder.contains("inner rules"));
+    }
+
+    /// 项目根是硬边界：读 `a/b/c/x.rs` 不该把项目根**之上**的目录也扫一遍——
+    /// 那里出现的 AGENTS.md 与本项目无关。边界处（项目根本身）已在
+    /// `seen_dirs` 里，所以既不重复注入、也不会因为「根上恰好有文件」而多发一次。
+    #[test]
+    fn dir_reminder_never_walks_above_project_root() {
+        // 规约文件放在**项目根的上一层**，但那一层是本测试独占的临时目录，
+        // 不去动 `temp_dir()` 本身——那会和并行跑的其它用例抢同一个 AGENTS.md。
+        let outer = unique_dir("walk-up-boundary-outer");
+        let root = outer.join("project");
+        let deep = root.join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(outer.join("AGENTS.md"), "OUTSIDE-THE-PROJECT rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            project_root: root.clone(),
+            chain_dirs: vec![root.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone()])),
+        };
+        // 项目内没有任何规约文件 → 整条链上都是 None，边界外的那个不能被带进来。
+        assert!(loader.maybe_dir_reminder(&deep).is_none());
+    }
+
+    /// 触达项目**外**的绝对路径时只取其自身，不向上爬。
+    #[test]
+    fn dir_reminder_outside_project_root_stops_immediately() {
+        let root = unique_dir("walk-up-outside-root");
+        let outside = unique_dir("walk-up-outside-target");
+        std::fs::write(root.join("AGENTS.md"), "root rules").unwrap();
+        std::fs::write(outside.join("AGENTS.md"), "outside rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            project_root: root.clone(),
+            chain_dirs: vec![root.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone()])),
+        };
+        let reminder = loader.maybe_dir_reminder(&outside).unwrap();
+        assert!(reminder.contains("outside rules"));
+        assert!(
+            !reminder.contains("root rules"),
+            "项目外路径不该触发项目根规约的注入"
+        );
+    }
+
+    /// 同一个目录经由不同拼写（`a/./b`、`a/b`、`a/c/../b`）到达时只能注入一次：
+    /// 归一化不到位会让 `seen_dirs` 失效、同一份规约重复进上下文。
+    #[test]
+    fn dir_reminder_dedupes_across_lexically_equal_paths() {
+        let root = unique_dir("walk-up-dedup-root");
+        let a = root.join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("AGENTS.md"), "deep rules").unwrap();
+
+        let loader = ClaudeMdLoader {
+            global_dir: None,
+            project_root: root.clone(),
+            chain_dirs: vec![root.clone()],
+            seen_dirs: Mutex::new(HashSet::from([root.clone()])),
+        };
+        assert!(loader.maybe_dir_reminder(&b).is_some());
+        for spelling in [a.join("b"), a.join("./b"), a.join("c/../b")] {
+            assert!(
+                loader.maybe_dir_reminder(&spelling).is_none(),
+                "{} 与首轮是同一目录，不应再次注入",
+                spelling.display()
+            );
+        }
+    }
+
+    /// 超长规约必须被封顶**且显式标注**：静默丢尾会让模型以为自己读全了规则。
+    #[test]
+    fn oversized_rules_are_truncated_with_an_explicit_marker() {
+        let dir = unique_dir("oversize");
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "x".repeat(MAX_RULE_FILE_BYTES + 4096),
+        )
+        .unwrap();
+        let text = load_dir_files(&dir).unwrap();
+        assert!(text.contains("[truncated:"));
+        assert!(
+            text.len() < MAX_RULE_FILE_BYTES + 4096,
+            "截断后应显著短于原文"
+        );
+        // 未超限的文件一个字节都不能动（`resolve_imports` 会保留行尾换行，
+        // 所以这里比对 trim 后的结果而不是原文）。
+        let small = unique_dir("undersize");
+        std::fs::write(small.join("AGENTS.md"), "short rules").unwrap();
+        assert_eq!(load_dir_files(&small).unwrap().trim_end(), "short rules");
+    }
+
+    /// 截断点落在多字节字符中间时必须回退到 `char` 边界，不能 panic。
+    /// 中文规约里 UTF-8 序列占 3 字节，这个边界不是理论问题。
+    #[test]
+    fn truncation_lands_on_a_char_boundary() {
+        let text = "规".repeat(MAX_RULE_FILE_BYTES / 3 + 64);
+        let out = truncate_rule_text(&text);
+        assert!(out.contains("[truncated:"));
+        assert!(out.starts_with("规"));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }

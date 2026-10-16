@@ -6603,6 +6603,10 @@ fn default_system_prompt() -> String {
 
 /// 从工具调用输入里推导其触达的目录，供项目规约子目录动态加载判断。
 /// Read/Edit/Write 用 file_path（取父目录）；Glob/Grep 用 path（文件取父目录，目录取自身）。
+///
+/// 只负责**定位起点**：向上逐级查找、边界与去重都由
+/// `ClaudeMdLoader::maybe_dir_reminder` 负责。这里不做路径归一是因为
+/// `touched_dir` 同一轮会被多个工具复用，归一放 loader 里做一次即可。
 fn touched_dir(
     tool_name: &str,
     input: &serde_json::Value,
