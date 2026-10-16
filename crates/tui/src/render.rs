@@ -13,7 +13,7 @@ use crate::app::{
     PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS,
     SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
-use crate::input::{InputBox, ATTACHMENT_MARKER};
+use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
 use crate::markdown::{render_markdown, render_streaming_markdown};
 use crate::theme::Theme;
 use ratatui::{
@@ -60,27 +60,44 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
 ///
 /// InputBox 只保存不可见的单字符标记，发送正文时会过滤；这里按标记在编辑序列
 /// 中的真实位置展开图片/文件标签，所以占位符会跟随粘贴位置，而不是堆到首行行首。
-fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachment]) -> InputBox {
-    let mut placeholders = Vec::with_capacity(attachments.len());
+///
+/// 折叠的长文本粘贴（`PASTE_MARKER`）走**同一个循环**，展开成
+/// `[Pasted text #n +N lines]`。两类标记可以任意交错（先贴图、再贴一大段、再贴图），
+/// 所以必须是"一次遍历同时识别两种标记"，而不是各投影一遍再把两个 InputBox 合起来
+/// ——「两遍合成」正是附件占位符曾经出过 bug 的形态（同一个附件显示两次）。
+/// 两张表**编号空间独立**：`[Image #1]` 数图片，`[Pasted text #1]` 数折叠块，
+/// 中间插入另一类不会让任一方跳号。
+fn input_with_placeholders(
+    input: &InputBox,
+    attachments: &[Attachment],
+    pastes: &[crate::app::PasteBlock],
+) -> InputBox {
+    let mut attachment_labels = Vec::with_capacity(attachments.len());
     let mut image_number = 0usize;
     for attachment in attachments {
         match attachment {
             Attachment::Image { .. } => {
                 image_number += 1;
-                placeholders.push(format!("[Image #{image_number}]"));
+                attachment_labels.push(format!("[Image #{image_number}]"));
             }
             Attachment::File { path } => {
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.display().to_string());
-                placeholders.push(format!("[File: {name}]"));
+                attachment_labels.push(format!("[File: {name}]"));
             }
         }
     }
+    let paste_labels: Vec<String> = pastes
+        .iter()
+        .enumerate()
+        .map(|(idx, block)| format!("[Pasted text #{} +{} lines]", idx + 1, block.line_count))
+        .collect();
 
     let mut display = input.clone();
     let mut attachment_idx = 0usize;
+    let mut paste_idx = 0usize;
     for (row, source) in input.lines.iter().enumerate() {
         let chars = source.chars().collect::<Vec<_>>();
         let mut rendered = String::new();
@@ -95,29 +112,38 @@ fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachmen
             }
 
             let ch = chars[col];
-            if ch != ATTACHMENT_MARKER {
-                rendered.push(ch);
+            let label = match ch {
+                ATTACHMENT_MARKER => attachment_labels.get(attachment_idx),
+                PASTE_MARKER => paste_labels.get(paste_idx),
+                _ => {
+                    rendered.push(ch);
+                    continue;
+                }
+            };
+            if ch == ATTACHMENT_MARKER {
+                attachment_idx += 1;
+            } else {
+                paste_idx += 1;
+            }
+            let Some(label) = label else {
                 continue;
-            }
+            };
 
-            if let Some(placeholder) = placeholders.get(attachment_idx) {
-                if rendered
-                    .chars()
-                    .last()
-                    .is_some_and(|ch| !ch.is_whitespace())
-                {
-                    rendered.push(' ');
-                }
-                rendered.push_str(placeholder);
-                let next = chars.get(col + 1).copied();
-                if next.is_none()
-                    || next == Some(ATTACHMENT_MARKER)
-                    || next.is_some_and(|ch| !ch.is_whitespace())
-                {
-                    rendered.push(' ');
-                }
+            if rendered
+                .chars()
+                .last()
+                .is_some_and(|ch| !ch.is_whitespace())
+            {
+                rendered.push(' ');
             }
-            attachment_idx += 1;
+            rendered.push_str(label);
+            let next = chars.get(col + 1).copied();
+            if next.is_none()
+                || next.is_some_and(is_atomic_marker)
+                || next.is_some_and(|ch| !ch.is_whitespace())
+            {
+                rendered.push(' ');
+            }
         }
 
         display.lines[row] = rendered;
@@ -127,8 +153,8 @@ fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachmen
     }
 
     // 兼容升级前已存在但没有编辑器标记的瞬时附件状态；新粘贴路径不会进入这里。
-    if attachment_idx < placeholders.len() {
-        let prefix = format!("{} ", placeholders[attachment_idx..].join(" "));
+    if attachment_idx < attachment_labels.len() {
+        let prefix = format!("{} ", attachment_labels[attachment_idx..].join(" "));
         display.lines[0].insert_str(0, &prefix);
         if display.cursor_row == 0 {
             display.cursor_col += prefix.chars().count();
@@ -147,13 +173,21 @@ fn input_with_attachment_placeholders(input: &InputBox, attachments: &[Attachmen
 ///
 /// `expand_at_refs_to_attachments` 从正文里的 `@path` 追加的文件没有对应
 /// 标记（用户就是敲了一行路径，不是粘贴），它们在末尾单列，避免凭空消失。
-pub(crate) fn attachment_display_text(input: &InputBox, attachments: &[Attachment]) -> String {
+///
+/// `pastes` 是这次提交时被折叠的长文本块：它们的占位符位置同样只存在于
+/// 输入框快照里，必须在这里投影成 `[Pasted text #n +N lines]`——**不是原文**。
+/// 发给模型的正文由 `take_composer_text` 展开，两者用途不同，不要混。
+pub(crate) fn composer_display_text(
+    input: &InputBox,
+    attachments: &[Attachment],
+    pastes: &[crate::app::PasteBlock],
+) -> String {
     let marked = input.attachment_marker_count().min(attachments.len());
-    // 只投影有标记的那一段：`input_with_attachment_placeholders` 末尾还有一段
+    // 只投影有标记的那一段：`input_with_placeholders` 末尾还有一段
     // 「旧状态兼容」兜底，会把没有标记的附件补到行首（输入框需要它来对齐
     // `pending_attachments`，聊天区不需要——它们由下面统一在末尾单列，
     // 两边都画一遍就是同一个附件出现两次）。
-    let mut display = input_with_attachment_placeholders(input, &attachments[..marked]).text();
+    let mut display = input_with_placeholders(input, &attachments[..marked], pastes).text();
 
     // 已被占位符投影的图片数，作为末尾追加时的编号起点。
     let mut image_number = attachments
@@ -194,7 +228,7 @@ mod attachment_input_tests {
             preview_label: "320×180".to_string(),
         }];
 
-        let display = input_with_attachment_placeholders(&input, &attachments);
+        let display = input_with_placeholders(&input, &attachments, &[]);
 
         assert_eq!(display.display_lines(), &["describe this [Image #1] "]);
         assert_eq!(
@@ -218,13 +252,76 @@ mod attachment_input_tests {
             preview_label: "402×288".to_string(),
         }];
 
-        let in_input_box = input_with_attachment_placeholders(&input, &attachments)
+        let in_input_box = input_with_placeholders(&input, &attachments, &[])
             .display_lines()
             .join("\n");
-        let in_chat = attachment_display_text(&input, &attachments);
+        let in_chat = composer_display_text(&input, &attachments, &[]);
 
         assert_eq!(in_chat, in_input_box);
         assert_eq!(in_chat, "[Image #1] 请按图更新自选股");
+    }
+
+    /// 折叠的粘贴块走同一条投影线：输入框里是 `[Pasted text #1 +N lines]`，
+    /// 消息区就必须是同一段。发出去时展开成原文的是**模型那份**，展示给用户的
+    /// 聊天记录仍然只画占位符——否则一条消息能在聊天区里糊满几百行，折叠就白做了。
+    #[test]
+    fn pasted_text_placeholder_is_identical_in_the_input_box_and_the_chat() {
+        let mut input = InputBox::new();
+        input.insert_text("看下这段");
+        input.insert_paste_marker();
+        input.insert_text("有问题吗");
+        let pastes = vec![crate::app::PasteBlock {
+            text: (0..120)
+                .map(|i| format!("行{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            line_count: 120,
+        }];
+
+        let in_input_box = input_with_placeholders(&input, &[], &pastes)
+            .display_lines()
+            .join("\n");
+        let in_chat = composer_display_text(&input, &[], &pastes);
+
+        assert_eq!(in_chat, in_input_box);
+        assert_eq!(in_chat, "看下这段 [Pasted text #1 +120 lines] 有问题吗");
+    }
+
+    /// 折叠的粘贴块在输入框里必须**只占固定的一行**，与内容长度无关。
+    /// 输入框高度被 `draw` 硬 clamp 到 10 行（内区只剩 8 行），`draw_input` 的
+    /// `Paragraph` 又没有滚动、永远从第 0 行起画——占位符的宽度一旦随内容增长，
+    /// 后续内容就又掉进那个不可见的区域，「粘贴完打不了字」的老症状原样复现。
+    ///
+    /// 窄终端下 `[Pasted text #1 +N lines]` 自己折成两行是正常的（3~10 行的
+    /// 输入框放得下），所以这里断言的是**不变量**：贴 3 行和贴 30000 行，
+    /// 占位符占的行数必须一模一样。
+    #[test]
+    fn a_pasted_text_placeholder_does_not_grow_with_the_content() {
+        let measure = |line_count: usize| {
+            let mut input = InputBox::new();
+            input.insert_text("看下这段");
+            input.insert_paste_marker();
+            input.insert_text("有问题吗");
+            let pastes = vec![crate::app::PasteBlock {
+                text: (0..line_count)
+                    .map(|i| format!("行{i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                line_count,
+            }];
+            input_with_placeholders(&input, &[], &pastes).visual_height(40)
+        };
+
+        assert_eq!(
+            measure(3),
+            measure(30_000),
+            "占位符的显示行数不能随粘贴内容长度变化"
+        );
+        assert_eq!(
+            measure(3),
+            2,
+            "40 列宽下 `[Pasted text #1 +3 lines]` 加上下文折成两行"
+        );
     }
 
     /// 正文里的 `@path` 追加出来的附件没有输入框标记（用户敲的是路径文本，
@@ -238,7 +335,7 @@ mod attachment_input_tests {
         }];
 
         assert_eq!(
-            attachment_display_text(&input, &attachments),
+            composer_display_text(&input, &attachments, &[]),
             "看下 @notes.txt\n[File: notes.txt]"
         );
     }
@@ -255,7 +352,7 @@ mod attachment_input_tests {
             preview_label: "320×180".to_string(),
         }];
 
-        let display = input_with_attachment_placeholders(&input, &attachments);
+        let display = input_with_placeholders(&input, &attachments, &[]);
 
         assert_eq!(display.display_lines(), &["请看 [Image #1] 这张图"]);
         assert_eq!(display.cursor_col, "请看 [Image #1] 这张图".chars().count());
@@ -282,7 +379,7 @@ mod attachment_input_tests {
             },
         ];
 
-        let display = input_with_attachment_placeholders(&input, &attachments);
+        let display = input_with_placeholders(&input, &attachments, &[]);
 
         assert_eq!(display.display_lines(), &["[Image #1] 右侧 [Image #2] "]);
     }
@@ -305,7 +402,7 @@ mod attachment_input_tests {
             },
         ];
 
-        let display = input_with_attachment_placeholders(&input, &attachments);
+        let display = input_with_placeholders(&input, &attachments, &[]);
 
         assert_eq!(display.display_lines(), &["[Image #1] [Image #2] "]);
         assert_eq!(display.cursor_col, "[Image #1] [Image #2] ".chars().count());
@@ -333,7 +430,7 @@ mod attachment_input_tests {
             },
         ];
 
-        let display = input_with_attachment_placeholders(&input, &attachments);
+        let display = input_with_placeholders(&input, &attachments, &[]);
 
         assert_eq!(
             display.display_lines(),
@@ -483,7 +580,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     } else {
         &[]
     };
-    let display_input = input_with_attachment_placeholders(input, display_attachments);
+    let display_input = input_with_placeholders(input, display_attachments, &state.pending_pastes);
     let paste_hint_position = state.paste_hint.as_ref().map(|hint| {
         let mut hint_input = input.clone();
         hint_input.cursor_row = hint
@@ -492,7 +589,8 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         hint_input.cursor_col = hint
             .cursor_col
             .min(hint_input.lines[hint_input.cursor_row].chars().count());
-        let projected = input_with_attachment_placeholders(&hint_input, display_attachments);
+        let projected =
+            input_with_placeholders(&hint_input, display_attachments, &state.pending_pastes);
         (projected.cursor_row, projected.cursor_col)
     });
     let input_height = (display_input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
