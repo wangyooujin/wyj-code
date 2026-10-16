@@ -131,7 +131,7 @@ impl ToolCtx {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
-            permission_mode: Arc::new(RwLock::new(PermissionMode::Prompt)),
+            permission_mode: Arc::new(RwLock::new(PermissionMode::Auto)),
             execution_surface: Arc::new(RwLock::new(ExecutionSurface::HeadlessRepl)),
             permission_policy: Arc::new(RwLock::new(PermissionPolicy::default())),
             ui_ask_tx: None,
@@ -325,14 +325,14 @@ impl ToolContext for ToolCtx {
     }
 
     async fn confirm_tool(&self, name: &str, summary: &str) -> bool {
-        // Prompt 逐次拦截；Auto 在闸门判 Allow 时压根不会走到这里，只有
-        // 闸门判 AskUser（或压根没装闸门）才落下来弹窗——所以 Auto 必须走真实
-        // 弹窗路径，否则「没装闸门」会变成无声放行。
+        // 只有 Auto 需要弹窗：闸门判 Allow 时压根不会走到这里，只有判 AskUser
+        // （含「压根没装闸门」与「分类器已停用降级」）才落下来——所以 Auto 必须
+        // 走真实弹窗路径，否则这两条会变成无声放行。
         // AutoApprove(Bypass)/Allowlist(Plan) 则不弹窗（Allowlist 的准入已由
         // is_allowed 前置把关）。
         {
             let mode = self.permission_mode.read().unwrap();
-            if !matches!(&*mode, PermissionMode::Prompt | PermissionMode::Auto) {
+            if !matches!(&*mode, PermissionMode::Auto) {
                 return true;
             }
         }
@@ -381,12 +381,8 @@ impl ToolContext for ToolCtx {
         // 出现「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个
         // 对话框」——那正好破坏 `needs_dialog` 存在的唯一理由。
         // Auto 也返回 true：闸门判定要 await 分类器、判定为 AskUser 时还要弹窗，
-        // 与 Prompt 一样会阻塞。这些调用必须串行，否则会同时弹出 N 个对话框
-        // （正是 `needs_dialog` 存在的唯一理由）。
-        if !matches!(
-            &*self.permission_mode.read().unwrap(),
-            PermissionMode::Prompt | PermissionMode::Auto
-        ) {
+        // 两者都会阻塞。这些调用必须串行，否则会同时弹出 N 个对话框。
+        if !matches!(&*self.permission_mode.read().unwrap(), PermissionMode::Auto) {
             return false;
         }
         if self.always_allowed.read().unwrap().contains(name) {
@@ -473,7 +469,7 @@ mod tests {
         ctx.load_allowed_tools(&base);
 
         // Prompt 模式 + 未授权：会弹框。
-        *ctx.permission_mode.write().unwrap() = PermissionMode::Prompt;
+        *ctx.permission_mode.write().unwrap() = PermissionMode::Auto;
         assert!(ctx.needs_dialog("Bash"));
         assert!(ctx.needs_dialog("Edit"));
 
@@ -526,7 +522,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_tool_allow_always_persists_in_memory() {
         let mut ctx = ToolCtx::new("/tmp");
-        ctx.set_permission_mode(PermissionMode::Prompt);
+        ctx.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(8);
         ctx.ui_ask_tx = Some(tx);
         let responder = tokio::spawn(async move {
@@ -551,7 +547,7 @@ mod tests {
 
             let mut ctx = ToolCtx::new(&cwd);
             ctx.load_allowed_tools(&base);
-            ctx.set_permission_mode(PermissionMode::Prompt);
+            ctx.set_permission_mode(PermissionMode::Auto);
             let (tx, mut rx) = mpsc::channel(8);
             ctx.ui_ask_tx = Some(tx);
 
@@ -579,7 +575,7 @@ mod tests {
             // 重建同一项目的 ToolCtx 后仍直接放行。
             let mut reloaded = ToolCtx::new(&cwd);
             reloaded.load_allowed_tools(&base);
-            reloaded.set_permission_mode(PermissionMode::Prompt);
+            reloaded.set_permission_mode(PermissionMode::Auto);
             let (tx, rx) = mpsc::channel(1);
             reloaded.ui_ask_tx = Some(tx);
             drop(rx);
@@ -599,7 +595,7 @@ mod tests {
 
         let mut approved = ToolCtx::new(&project_a);
         approved.load_allowed_tools(&base);
-        approved.set_permission_mode(PermissionMode::Prompt);
+        approved.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(1);
         approved.ui_ask_tx = Some(tx);
         assert!(
@@ -615,7 +611,7 @@ mod tests {
 
         let mut isolated = ToolCtx::new(&project_b);
         isolated.load_allowed_tools(&base);
-        isolated.set_permission_mode(PermissionMode::Prompt);
+        isolated.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(1);
         isolated.ui_ask_tx = Some(tx);
         assert!(
@@ -645,7 +641,7 @@ mod tests {
 
         let mut ctx = ToolCtx::new(&cwd);
         ctx.load_allowed_tools(&base);
-        ctx.set_permission_mode(PermissionMode::Prompt);
+        ctx.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(1);
         ctx.ui_ask_tx = Some(tx);
         assert!(
@@ -667,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn ordinary_tool_allow_once_remains_one_shot() {
         let mut ctx = ToolCtx::new("/tmp");
-        ctx.set_permission_mode(PermissionMode::Prompt);
+        ctx.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(2);
         ctx.ui_ask_tx = Some(tx);
 
@@ -685,7 +681,7 @@ mod tests {
     #[tokio::test]
     async fn confirm_tool_deny_returns_false() {
         let mut ctx = ToolCtx::new("/tmp");
-        ctx.set_permission_mode(PermissionMode::Prompt);
+        ctx.set_permission_mode(PermissionMode::Auto);
         let (tx, mut rx) = mpsc::channel(8);
         ctx.ui_ask_tx = Some(tx);
         let responder = tokio::spawn(async move {
@@ -713,29 +709,38 @@ mod tests {
         assert!(ctx.confirm_tool("Bash", "ls").await);
     }
 
-    /// 端到端复现用户报的场景：父级 Normal(Prompt) 模式 → 派生一个子 Agent
-    /// ctx（无审批 UI、surface = SubAgent）→ 走完整两道权限关卡。
+    /// Auto 模式下子 Agent 的 Bash 必须 fail-closed：子 ctx 不接 `ui_ask_tx`，
+    /// 闸门判 `AskUser` 时 `confirm_tool` 没有审批通道可走。
     ///
-    /// 修复前：Bash 在 `is_allowed`（`evaluate`: Prompt + 副作用工具 + 非交互
-    /// surface → `interactive_approval_unavailable`）就被拒，压根到不了
-    /// `confirm_tool`。
+    /// 这是删掉 `PermissionMode::Prompt` 之后**唯一**保证「无交互面不放行」的
+    /// 关卡（policy 层在 Auto 下对一切非受保护路径都返回 `Allow`），所以两条
+    /// 路径都要钉：`is_allowed` 放行不等于执行，真正拦住的是 `confirm_tool`。
     #[tokio::test]
-    async fn sub_agent_bash_is_blocked_under_prompt_and_allowed_after_inheritance() {
+    async fn sub_agent_bash_fails_closed_under_auto_without_an_approval_channel() {
         use serde_json::json;
         let cwd = std::env::temp_dir();
         let input = json!({ "command": "ls -la" });
 
-        // ── 修复前的行为：Prompt + SubAgent surface，无审批 UI ──
-        let before = ToolCtx::new(&cwd);
-        before.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
-        before.set_permission_mode(PermissionMode::Prompt);
+        let ctx = ToolCtx::new(&cwd);
+        ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+        ctx.set_permission_mode(PermissionMode::Auto);
         assert!(
-            !before.is_allowed("Bash", &input),
-            "Prompt + 非交互 surface 的 Bash 本应在 evaluate 处被拒（修复前的基线）"
+            ctx.is_allowed("Bash", &input),
+            "Auto 在 policy 层不自行判定副作用，交由闸门 / confirm_tool"
         );
-        assert!(!before.confirm_tool("Bash", "ls -la").await);
+        assert!(
+            !ctx.confirm_tool("Bash", "ls -la").await,
+            "子 Agent ctx 没有 ui_ask_tx，闸门判 AskUser 时必须 fail-closed"
+        );
+    }
 
-        // ── 修复后：父级 Prompt → 子 Agent 继承 AutoApprove ──
+    /// Bypass 派生的子 Agent 全放行，不受上面那条约束影响。
+    #[tokio::test]
+    async fn sub_agent_bash_is_allowed_after_inheriting_auto_approve() {
+        use serde_json::json;
+        let cwd = std::env::temp_dir();
+        let input = json!({ "command": "ls -la" });
+
         let after = ToolCtx::new(&cwd);
         after.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
         after.set_permission_mode(PermissionMode::AutoApprove);

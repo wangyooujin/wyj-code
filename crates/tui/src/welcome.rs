@@ -247,18 +247,20 @@ fn logo_color_at(col: usize, total_cols: usize) -> Color {
         return Theme::welcome_logo_gradient_end_color();
     }
 
-    let (sr, sg, sb) = match Theme::welcome_logo_gradient_start_color() {
-        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
-        _ => (215.0, 119.0, 87.0),
-    };
-    let (mr, mg, mb) = match Theme::welcome_logo_gradient_mid_color() {
-        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
-        _ => (225.0, 160.0, 85.0),
-    };
-    let (er, eg, eb) = match Theme::welcome_logo_gradient_end_color() {
-        Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
-        _ => (240.0, 200.0, 80.0),
-    };
+    // 分量与插值都交给 theme 层：这里只负责"第几列"，不该再自己 match RGB
+    // 或写死品牌橙数字——否则渐变就成了全应用唯一一处绕过槽位的硬编码颜色。
+    let (sr, sg, sb) = Theme::rgb_components_or(
+        Theme::welcome_logo_gradient_start_color(),
+        Theme::WELCOME_LOGO_GRADIENT_START,
+    );
+    let (mr, mg, mb) = Theme::rgb_components_or(
+        Theme::welcome_logo_gradient_mid_color(),
+        Theme::WELCOME_LOGO_GRADIENT_MID,
+    );
+    let (er, eg, eb) = Theme::rgb_components_or(
+        Theme::welcome_logo_gradient_end_color(),
+        Theme::WELCOME_LOGO_GRADIENT_END,
+    );
     let t = col as f32 / (total_cols - 1) as f32;
     // 两段线性插值：0..0.5 用 START→MID，0.5..1 用 MID→END
     let (r, g, b) = if t <= 0.5 {
@@ -268,7 +270,7 @@ fn logo_color_at(col: usize, total_cols: usize) -> Color {
         let k = (t - 0.5) * 2.0;
         (mr + (er - mr) * k, mg + (eg - mg) * k, mb + (eb - mb) * k)
     };
-    Color::Rgb(r.round() as u8, g.round() as u8, b.round() as u8)
+    Theme::rgb_from_components(r, g, b)
 }
 
 /// 生成单行 logo 的 spans 列表（每非空字符一个 span，fg 横向渐变色 + BOLD）

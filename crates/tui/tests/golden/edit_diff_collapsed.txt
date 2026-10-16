@@ -1,0 +1,23 @@
+❯ 改一下
+
+  ⏺ Edit(src/main.rs) · 0.4s
+    @@ -3,7 +3,7 @@
+     3  3 │     let value_3 = 3;
+     4  4 │     let value_4 = 4;
+     5  5 │     let value_5 = 5;
+     6    │ -     let value_6 = 6;
+        6 │ +     let value_5 = 6; // 修 off-by-one
+     7  7 │     let value_7 = 7;
+     8  8 │     let value_8 = 8;
+     9  9 │     let value_9 = 9;
+    … 28 unchanged lines
+    @@ -38,7 +38,8 @@
+    38 38 │     let value_38 = 38;
+    39 39 │     let value_39 = 39;
+    40 40 │     let value_40 = 40;
+    41    │ -     let value_41 = 41;
+       41 │ +     let value_40 = 41;
+       42 │ +     let extra = 0;
+    42 43 │     let value_42 = 42;
+    43 44 │     let value_43 = 43;
+    44 45 │     let value_44 = 44;

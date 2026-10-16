@@ -196,7 +196,6 @@ main:
   no_session_history: "No session history yet, starting a new session."
   mode_info_plan: " [plan mode: read-only tools only]"
   mode_info_bypass: " [bypass mode: skipping permission prompts]"
-  mode_info_manual: " [manual mode: confirming each tool call]"
   session_stats: "Session stats"
   hooks_loaded_notice: "⚠️ {count} Hook(s) detected from .claude/settings.json. They will execute arbitrary shell commands during tool calls / the conversation lifecycle. If this is unexpected, review the file or use --no-hooks to disable them."
 
@@ -230,7 +229,7 @@ help:
     - `/schedule` — Manage scheduled tasks (cron-triggered prompts); auto-syncs into the system crontab on macOS/Linux
     - `/hooks` — List currently active Hooks (grouped by event)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
-    - `/mode [mode]` — Switch run mode (auto / manual / plan / bypass); no arg shows the current mode
+    - `/mode [mode]` — Switch run mode (auto / plan / bypass); no arg shows the current mode
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
     - `/init` — Have the Agent explore the project and generate/merge AGENTS.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists
@@ -747,15 +746,15 @@ model:
   desc: "Manage call profiles: /model opens the profile manager, /model <name> switches directly"
 
 mode:
-  desc: "Switch run mode: /mode [auto|manual|plan|bypass]"
+  desc: "Switch run mode: /mode [auto|plan|bypass]"
   switched: "Switched to {mode} mode"
   switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
-  current: "Current mode: {mode} (options: auto / manual / plan / bypass)"
-  unknown: "Unknown mode '{args}'. Options: auto / manual / plan / bypass"
+  current: "Current mode: {mode} (options: auto / plan / bypass)"
+  unknown: "Unknown mode '{args}'. Options: auto / plan / bypass"
 
 auto:
-  mode_notice: "Auto mode is active: most actions no longer prompt. A local rule layer plus a model classifier decide before an action runs, and dangerous actions are still blocked outright. Press Shift+Tab for manual, per-action confirmation."
-  degraded_to_manual: "The auto classifier blocked too many actions in a row, so this session fell back to manual (per-action confirmation). Press Shift+Tab to switch back to auto."
+  mode_notice: "Auto mode is active: most actions no longer prompt. A local rule layer plus a model classifier decide before an action runs, and anything the gate is unsure about still prompts you. Dangerous actions are blocked outright and stay blocked even when the classifier is off. Press Shift+Tab to reach plan / bypass."
+  degraded_to_confirm: "The auto classifier blocked too many actions in a row, so the model classifier has been switched off: dangerous commands are still blocked by the hard rules, and everything else now asks you one by one. Run /mode auto to turn the classifier back on."
 
 cwd:
   desc: "Show the current working directory"
@@ -834,6 +833,7 @@ dialog:
   session_conflict_taken_over: "Took over session {id} from process {pid}. Its unsaved messages may be lost."
   session_conflict_read_only_applied: "Read-only view of session {id} (owned by process {pid}). This instance will not write to the session file."
   session_conflict_abort_applied: "Aborted: session {id} was left untouched."
+  permission_hint_once: "  [y] Allow once, no sandboxing   [d] Deny   (cannot be persisted)"
   permission_hint_project_once: "  [y/a] Allow for this project (won't ask again)   [d] Deny   (Esc to deny)"
   project_trust_title: " ⚠ Project MCP Servers Need Trust "
   project_trust_intro: "The following project-scoped MCP servers will be run as subprocesses — confirm you trust them before connecting:"

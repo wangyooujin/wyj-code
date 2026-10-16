@@ -14,11 +14,11 @@ use crate::app::{
     SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::{InputBox, ATTACHMENT_MARKER};
-use crate::markdown::render_markdown;
+use crate::markdown::{render_markdown, render_streaming_markdown};
 use crate::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
@@ -46,9 +46,7 @@ fn highlight_at_refs(line: &str) -> Line<'static> {
         let token = rest[at_pos..at_pos + 1 + end].to_string();
         spans.push(Span::styled(
             token,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Theme::hint().add_modifier(Modifier::BOLD),
         ));
         rest = &rest[at_pos + 1 + end..];
     }
@@ -345,9 +343,21 @@ mod attachment_input_tests {
 }
 
 /// 字符显示宽度：CJK 全角 = 2，其余 = 1
+///
+/// **零宽字符一律交给 unicode-width 判定**（返回 0）。手写区间表只覆盖"可见字符"，
+/// 零宽空格 U+200B、组合记号、变体选择符、ZWJ 全都落到 `else` 分支被算成 1 列，
+/// 而终端**根本不占列**——于是含这类字符的行按 1 列折行、实际渲染 0 列，
+/// 右边线就比框宽出 N 列。这类字符在粘贴的代码里并不罕见（零宽空格是很多格式化
+/// 工具的产物），所以这不是理论问题。
+///
+/// 可见字符仍走手写表：它对"终端实际显示什么"的判断比 unicode-width 更贴近
+/// 经验值（例如某些符号），贸然整体换掉会牵动全应用的折行结果。
 pub(crate) fn char_display_width(c: char) -> usize {
     if c == '\t' {
         return 4;
+    }
+    if unicode_width::UnicodeWidthChar::width(c) == Some(0) {
+        return 0;
     }
     let cp = c as u32;
     if (0x1100..=0x115F).contains(&cp)       // Hangul Jamo
@@ -790,10 +800,7 @@ fn push_sub_agent_tool_log(
         let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
             (None, _) => ("…".to_string(), Theme::dim()),
             (Some(e), true) => (format!("✗ {}", format_hms(e)), Theme::error()),
-            (Some(e), false) => (
-                format!("✓ {}", format_hms(e)),
-                Style::default().fg(Color::Green),
-            ),
+            (Some(e), false) => (format!("✓ {}", format_hms(e)), Theme::success()),
         };
         let call = if tl.arg_summary.is_empty() {
             tl.tool_name.clone()
@@ -954,7 +961,7 @@ fn render_thinking_block(
         let frame = spinner_frame_str(opts.spinner_frame);
         lines.push(Line::from(Span::styled(
             wyj_i18n::tr_fmt("thinking.running", &[("frame", frame.as_str())]),
-            Style::default().fg(Color::Cyan),
+            Theme::info(),
         )));
         // 流式期间把尾部思考显出来，让「正在想什么」可见；定稿后立刻收起。
         // 取尾逻辑与工具实时输出块共用 `live_tail`。
@@ -998,7 +1005,7 @@ fn render_thinking_block(
         None => wyj_i18n::tr_fmt("thinking.done_no_elapsed", &[("lines", &total)]),
     };
     lines.push(Line::from(vec![
-        Span::styled(header, Style::default().fg(Color::Cyan)),
+        Span::styled(header, Theme::info()),
         Span::styled(
             if opts.expanded {
                 String::new()
@@ -1045,9 +1052,7 @@ fn render_chat_message(
 
             let mut content_lines = msg.content.lines();
             let first_line = content_lines.next().unwrap_or("");
-            let first_style = Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD);
+            let first_style = Theme::highlight();
             for (idx, wrapped) in wrap_line(first_line, max_content_width.saturating_sub(2).max(1))
                 .into_iter()
                 .enumerate()
@@ -1145,10 +1150,7 @@ fn render_chat_message(
                         );
                         let mut spans = vec![
                             Span::styled("    ⎿  ", Theme::dim()),
-                            Span::styled(
-                                format!("{frame} {stats}"),
-                                Style::default().fg(Color::Cyan),
-                            ),
+                            Span::styled(format!("{frame} {stats}"), Theme::info()),
                         ];
                         if let Some(cur) = &s.current_tool {
                             spans.push(Span::styled(
@@ -1181,7 +1183,7 @@ fn render_chat_message(
             let (icon, style) = if msg.is_error {
                 ("✗", Theme::error())
             } else {
-                ("$", Style::default().fg(Color::Green))
+                ("$", Theme::success())
             };
             let elapsed_str = msg
                 .elapsed_secs
@@ -1230,7 +1232,7 @@ fn render_chat_message(
             let (marker, style) = if msg.is_error {
                 ("  ⚠ ", Theme::warning())
             } else {
-                ("  ⚙ ", Style::default().fg(Color::Cyan))
+                ("  ⚙ ", Theme::info())
             };
             lines.push(Line::from(vec![
                 Span::styled(marker, style),
@@ -1266,12 +1268,12 @@ fn render_chat_message(
             lines.push(Line::from(Span::styled(
                 "  📋 计划",
                 Style::default()
-                    .fg(Color::Blue)
+                    .fg(Theme::plan_color())
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(Span::styled(
                 format!("  {divider}"),
-                Style::default().fg(Color::Blue),
+                Theme::plan(),
             )));
             let mut body: Vec<Line<'static>> = vec![];
             render_markdown(&mut body, &msg.content, max_content_width.saturating_sub(2));
@@ -1282,7 +1284,7 @@ fn render_chat_message(
             }
             lines.push(Line::from(Span::styled(
                 format!("  {divider}"),
-                Style::default().fg(Color::Blue),
+                Theme::plan(),
             )));
         }
     }
@@ -1313,7 +1315,11 @@ fn tool_result_content_lines(msg: &ChatMessage) -> Vec<&str> {
     let content = if is_diff {
         raw.iter()
             .position(|line| {
-                line.starts_with("+ ")
+                // `@@` 是 diff 正文的**第一行**（每个变更块的头），必须一并认作
+                // diff 特征行，否则定位会落在第一个 `  ` 上下文行上、把块头
+                // 当成回执前缀留在外面——而行号正是从块头推出来的。
+                line.starts_with("@@")
+                    || line.starts_with("+ ")
                     || line.starts_with("- ")
                     || line.starts_with("  ")
                     || line.starts_with("...(truncated")
@@ -1379,6 +1385,18 @@ fn render_tool_result_preview(
     } else {
         full_content
     };
+    // diff 走独立的解析/渲染路径：行号必须在**逻辑行**层面算完再折行，
+    // 逐行折行后再判类型会把一段长代码行的后半截误认成新行。
+    if is_diff {
+        let (rows, width) = parse_diff_rows(&source);
+        lines.extend(render_diff_rows(
+            &rows,
+            width,
+            max_content_width,
+            rows.len(),
+        ));
+        return;
+    }
     let mut preview = Vec::new();
     let mut first = true;
     for raw in source {
@@ -1388,14 +1406,6 @@ fn render_tool_result_preview(
             // 程序崩溃级别的告警，真正的 shell 失败反而被淹没在同样的红里。
             // 展开态下这个论证更强——400 行的错误块刷成一片红比 3 行时糟糕得多。
             if first {
-                Theme::error()
-            } else {
-                Theme::dim()
-            }
-        } else if is_diff {
-            if raw.starts_with("+ ") {
-                Style::default().fg(Color::Green)
-            } else if raw.starts_with("- ") {
                 Theme::error()
             } else {
                 Theme::dim()
@@ -1411,13 +1421,7 @@ fn render_tool_result_preview(
             continue;
         }
         for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
-            let prefix = if is_diff {
-                "    "
-            } else if first {
-                "    ⎿ "
-            } else {
-                "       "
-            };
+            let prefix = if first { "    ⎿ " } else { "       " };
             preview.push(Line::from(Span::styled(
                 format!("{prefix}{wrapped}"),
                 style,
@@ -1504,12 +1508,167 @@ fn is_diff_result(msg: &ChatMessage) -> bool {
 /// 200 行 diff 糊满屏幕（Write 新建文件时整份内容都是 `+` 行，最容易触发）。
 const COLLAPSED_DIFF_MAX_LINES: usize = 20;
 
-/// 折叠态渲染 Edit/Write 的 diff 前 [`COLLAPSED_DIFF_MAX_LINES`] 行。
+/// 一行 diff 在渲染前的解析结果。
+struct DiffRow<'a> {
+    /// `(旧侧行号, 新侧行号)`：删除行只有旧侧、新增行只有新侧、上下文两侧都有。
+    /// 缺的那侧渲染成空白，与 `git diff` 的行号列同义。
+    numbers: (Option<usize>, Option<usize>),
+    text: &'a str,
+    role: DiffRowRole,
+}
+
+enum DiffRowRole {
+    Context,
+    Removed,
+    Added,
+    /// `@@` 块头、`… N unchanged lines` 跳过提示、`…(truncated)` 截断提示。
+    /// 这些行不带行号（它们本身就在描述行号），整体 dim。
+    Meta,
+}
+
+/// 解析 `@@ -248,7 +248,7 @@` → `(248, 248)`。
 ///
-/// 与展开态共用同一套 diff 起点定位（`tool_result_content_lines` 会跳过
-/// 「已替换 N 处: path」这类回执前缀，只留 `-`/`+`/上下文行）与同一套配色
-/// （`+` 绿 / `-` 红 / 上下文 dim），因此两态视觉一致，切换 Ctrl+O 不会让
-/// 已经看习惯的行忽然换一种缩进或换一种颜色。
+/// 块头是行号的**唯一来源**：第一个变更块之前被丢掉的未改动内容没有留下任何
+/// 标记，从 1 开始数会把第 250 行的改动标成第 3 行。
+fn parse_hunk_header(line: &str) -> Option<(usize, usize)> {
+    let rest = line.strip_prefix("@@")?;
+    // 形如 ` -248,7 +248,7 @@`
+    let mut parts = rest.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let parse = |s: &str| s.split(',').next()?.parse::<usize>().ok();
+    Some((parse(old)?, parse(new)?))
+}
+
+/// 把 diff 正文解析成带行号的行序列，同时算出行号列宽。
+///
+/// 列宽必须扫完全部行才能定——`@@` 头里的起点可能比任何一行实际渲染出的行号
+/// 都大（块被截断时），先按最大行号算宽度，才能保证右边对齐。
+fn parse_diff_rows<'a>(content: &[&'a str]) -> (Vec<DiffRow<'a>>, usize) {
+    let mut rows: Vec<DiffRow> = Vec::with_capacity(content.len());
+    let mut old_no = 1usize;
+    let mut new_no = 1usize;
+    let mut width = 1usize;
+
+    for raw in content {
+        if let Some((o, n)) = parse_hunk_header(raw) {
+            old_no = o;
+            new_no = n;
+            rows.push(DiffRow {
+                numbers: (None, None),
+                text: raw,
+                role: DiffRowRole::Meta,
+            });
+            continue;
+        }
+        let (marker, rest): (&str, &str) = match raw.split_at_checked(2) {
+            Some(("- ", rest)) => ("-", rest),
+            Some(("+ ", rest)) => ("+", rest),
+            Some(("  ", rest)) => (" ", rest),
+            _ => ("", raw),
+        };
+        let role = match marker {
+            "-" => DiffRowRole::Removed,
+            "+" => DiffRowRole::Added,
+            " " => DiffRowRole::Context,
+            _ => DiffRowRole::Meta,
+        };
+        let numbers = match role {
+            DiffRowRole::Removed => (Some(old_no), None),
+            DiffRowRole::Added => (None, Some(new_no)),
+            DiffRowRole::Context => (Some(old_no), Some(new_no)),
+            DiffRowRole::Meta => (None, None),
+        };
+        for n in [numbers.0, numbers.1].into_iter().flatten() {
+            width = width.max(n.to_string().len());
+        }
+        match role {
+            DiffRowRole::Removed => old_no += 1,
+            DiffRowRole::Added => new_no += 1,
+            DiffRowRole::Context => {
+                old_no += 1;
+                new_no += 1;
+            }
+            DiffRowRole::Meta => {}
+        }
+        rows.push(DiffRow {
+            numbers,
+            // `+ ` / `- ` 标记**必须留在正文里**：颜色是唯一的区分手段在
+            // 无色终端（NO_COLOR、被降级成单色）下直接失效，删掉标记会让
+            // 「删了这段」和「加了这段」在视觉上完全一样。上下文的两个空格
+            // 只是对齐用的，反而要剥掉，否则整块右侧多出两列。
+            text: match role {
+                DiffRowRole::Context => rest,
+                _ => raw,
+            },
+            role,
+        });
+    }
+    (rows, width)
+}
+
+/// 渲染 diff 行序列（折叠态与展开态共用，保证两态视觉一致）。
+///
+/// 返回 `None` 表示内容为空——调用方需要画出 `⎿` 空块而不是凭空多一行。
+fn render_diff_rows(
+    rows: &[DiffRow],
+    width: usize,
+    max_width: usize,
+    limit: usize,
+) -> Vec<Line<'static>> {
+    // 行号列形如 `10 10 │ `：两侧定宽各 w + 中间分隔空格 + `│ ` 两列
+    // —— 即 2w+4。少算这一列的后果是所有 diff 行恒定溢出 1 列，窄终端
+    // 下右边会被 TUI 静默裁掉，看起来像代码莫名少了一截。
+    let gutter = width * 2 + 4;
+    let indent = "    ";
+    let body_width = max_width.saturating_sub(indent.len() + gutter).max(1);
+    let mut out = Vec::new();
+
+    for row in rows.iter().take(limit) {
+        if let DiffRowRole::Meta = row.role {
+            out.push(Line::from(Span::styled(
+                format!("{indent}{}", row.text),
+                Theme::dim(),
+            )));
+            continue;
+        }
+        let (old, new) = row.numbers;
+        let numbers = format!(
+            "{:>width$} {:>width$} │ ",
+            old.map(|v| v.to_string()).unwrap_or_default(),
+            new.map(|v| v.to_string()).unwrap_or_default(),
+            width = width
+        );
+        let style = match row.role {
+            DiffRowRole::Removed => Theme::error(),
+            DiffRowRole::Added => Theme::success(),
+            DiffRowRole::Context => Theme::dim(),
+            DiffRowRole::Meta => unreachable!(),
+        };
+        for (seg, wrapped) in wrap_line(row.text, body_width).into_iter().enumerate() {
+            // 折行续行不重复行号，但仍要补出等宽的竖线，右边缘才不会随折行跳动
+            let nums = if seg == 0 {
+                numbers.clone()
+            } else {
+                format!("{} │ ", " ".repeat(width * 2 + 1))
+            };
+            out.push(Line::from(vec![
+                Span::styled(format!("{indent}{nums}"), Theme::muted()),
+                Span::styled(wrapped, style),
+            ]));
+        }
+    }
+    out
+}
+
+/// 折叠态渲染 Edit/Write 的 diff 前 [`COLLAPSED_DIFF_MAX_LINES`] **条正文行**。
+///
+/// 与展开态共用同一套解析（`parse_diff_rows`）与同一套渲染（`render_diff_rows`），
+/// 因此两态的行号、缩进、配色完全一致，切换 Ctrl+O 不会让已经看习惯的行忽然变形。
+///
+/// **预算只算正文**（增/删/上下文）。`@@` 块头与 `… N unchanged lines` 跳过提示是
+/// 元信息，不占名额——否则一个改动分散在 5 个 hunk 的 diff 会用掉 9 行预算去显示
+/// 元信息，折叠态一屏几乎看不到任何实际改动内容。
 fn render_collapsed_diff_preview(
     lines: &mut Vec<Line<'static>>,
     msg: &ChatMessage,
@@ -1517,24 +1676,32 @@ fn render_collapsed_diff_preview(
 ) {
     let max_content_width = ctx.max_content_width;
     let content_lines = tool_result_content_lines(msg);
-    let shown = content_lines.len().min(COLLAPSED_DIFF_MAX_LINES);
-    for raw in content_lines.iter().take(shown) {
-        if raw.trim().is_empty() {
-            lines.push(Line::from(""));
+    if content_lines.is_empty() {
+        lines.push(Line::from(""));
+        return;
+    }
+    let (rows, width) = parse_diff_rows(&content_lines);
+    let body_total = rows
+        .iter()
+        .filter(|r| !matches!(r.role, DiffRowRole::Meta))
+        .count();
+    let keep = body_total.min(COLLAPSED_DIFF_MAX_LINES);
+    // 截到"第 keep+1 条正文"之前；它前面的元信息顺带带出，否则末行会孤零零
+    // 挂一个 `@@` 头却没有对应内容。
+    let mut cut = rows.len();
+    let mut seen = 0usize;
+    for (idx, row) in rows.iter().enumerate() {
+        if matches!(row.role, DiffRowRole::Meta) {
             continue;
         }
-        let style = if raw.starts_with("+ ") {
-            Style::default().fg(Color::Green)
-        } else if raw.starts_with("- ") {
-            Theme::error()
-        } else {
-            Theme::dim()
-        };
-        for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
-            lines.push(Line::from(Span::styled(format!("    {wrapped}"), style)));
+        if seen == keep {
+            cut = idx;
+            break;
         }
+        seen += 1;
     }
-    let remaining = content_lines.len().saturating_sub(shown);
+    lines.extend(render_diff_rows(&rows, width, max_content_width, cut));
+    let remaining = body_total - keep;
     if remaining > 0 {
         lines.push(Line::from(Span::styled(
             wyj_i18n::tr_fmt("diff.more_lines", &[("n", &remaining.to_string())]),
@@ -1625,7 +1792,10 @@ pub(crate) fn build_pending_chat_lines(
 
     // 流式文本（实时输出中）
     if !state.streaming_buf.is_empty() {
-        render_markdown(&mut lines, &state.streaming_buf, max_content_width);
+        // 流式路径走 streaming 变体：未定稿的内容按中间态渲染（未闭合围栏不画框、
+        // 未成形表格不合并），闭合那一刻才不会整块重排。定稿消息走 `render_markdown`
+        // 并按宽度缓存，两者互不影响。
+        render_streaming_markdown(&mut lines, &state.streaming_buf, max_content_width);
     }
 
     if let Some(items) = state.current_todos.clone() {
@@ -1792,20 +1962,20 @@ fn push_inline_todo_lines(
             }
         };
         let (icon, item_style) = match item.status {
-            TodoStatus::Pending => ("○".to_string(), Style::default().fg(Color::DarkGray)),
+            TodoStatus::Pending => ("○".to_string(), Theme::muted()),
             TodoStatus::InProgress => {
                 let frame = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
                 (
                     frame.to_string(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(Theme::info_color())
                         .add_modifier(Modifier::BOLD),
                 )
             }
             TodoStatus::Completed => (
                 "✓".to_string(),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(Theme::muted_color())
                     .add_modifier(Modifier::DIM),
             ),
         };
@@ -2149,7 +2319,7 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         let hint = Paragraph::new(Line::from(Span::styled(
             " new messages below · cmd+down ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Theme::info_color())
                 .add_modifier(Modifier::BOLD),
         )));
         let w = 30.min(area.width);
@@ -2204,7 +2374,7 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             Span::styled(
                 truncate_line(&s.description, detail_width.saturating_sub(16)),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Theme::info_color())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -2298,7 +2468,7 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
         } else {
             wyj_i18n::tr("subagent.content_hint")
         },
-        Style::default().fg(Color::Cyan),
+        Theme::info(),
     )));
     f.render_widget(
         hint,
@@ -2534,7 +2704,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         // spinner——完成/失败/中断的状态由聊天流与 `bg_agent_done_reminder` 承载。
         let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
         let item_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(Theme::info_color())
             .add_modifier(Modifier::BOLD);
 
         let bg_tag = if s.background { " ◇bg" } else { "" };
@@ -2635,7 +2805,7 @@ fn draw_shell_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         // `bash_N 已退出` 记录承载。
         let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
         let item_style = Style::default()
-            .fg(Color::Cyan)
+            .fg(Theme::info_color())
             .add_modifier(Modifier::BOLD);
 
         lines.push(Line::from(vec![
@@ -2974,21 +3144,20 @@ fn draw_input(
             AgentMode::Plan => " [plan] Enter to send ",
             AgentMode::Bypass => " [bypass] Enter to send ",
             AgentMode::Auto => " [auto] Enter to send ",
-            AgentMode::Manual => " Enter to send ",
         };
         let style = match &state.mode {
             AgentMode::Plan => Style::default()
-                .fg(Color::Blue)
+                .fg(Theme::plan_color())
                 .add_modifier(Modifier::BOLD),
             // 与状态栏的 [bypass] 芯片同色：Bypass 会跳过全部权限确认，
             // 属于"危险但合法"的模式，黄色偏中性、不足以承担提醒职责。
             // 三处（状态栏芯片 / 标题栏 / 输入框边框）必须同色，
             // 否则用户会以为底部两处说的是不同的模式。
-            AgentMode::Bypass => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            AgentMode::Auto => Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            AgentMode::Manual => Theme::dim(),
+            AgentMode::Bypass => Theme::danger().add_modifier(Modifier::BOLD),
+            // Auto 是默认档，走中性灰：绿色会把「默认」读成「已授予某种许可」，
+            // 而它实际上仍然会拦（hard_deny）也仍会弹窗（判 AskUser 时）。
+            // 手动模式并入 auto 之后，原先区分两者的颜色失去了对象。
+            AgentMode::Auto => Theme::dim().add_modifier(Modifier::BOLD),
         };
         (truncate_line(raw, title_budget), style)
     };
@@ -2997,9 +3166,9 @@ fn draw_input(
         Style::default().fg(Theme::success_color())
     } else {
         match &state.mode {
-            AgentMode::Plan if !state.is_thinking => Style::default().fg(Color::Blue),
-            AgentMode::Bypass if !state.is_thinking => Style::default().fg(Color::Red),
-            AgentMode::Auto if !state.is_thinking => Style::default().fg(Color::Green),
+            AgentMode::Plan if !state.is_thinking => Theme::plan(),
+            AgentMode::Bypass if !state.is_thinking => Theme::danger(),
+            // 默认档与普通边框同色：Auto 不再是一个"值得高亮"的状态。
             _ => Theme::border(),
         }
     };
@@ -3073,7 +3242,7 @@ fn draw_input(
                     let para = Paragraph::new(Line::from(Span::styled(
                         text,
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(Theme::hint_color())
                             .add_modifier(Modifier::BOLD)
                             .add_modifier(Modifier::REVERSED),
                     )));
@@ -3091,11 +3260,11 @@ fn draw_input(
 fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Theme::hint())
         .title(Span::styled(
             " @ 文件 ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Theme::hint_color())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -3143,18 +3312,15 @@ fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
                 Line::from(vec![
                     Span::styled(
                         name_padded,
-                        Style::default()
-                            .bg(Color::Cyan)
-                            .fg(Color::Black)
-                            .add_modifier(Modifier::BOLD),
+                        Theme::selection_on(Theme::hint_color()).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(hint, Style::default().bg(Color::Cyan).fg(Color::Black)),
+                    Span::styled(hint, Theme::selection_on(Theme::hint_color())),
                 ])
             } else {
                 let name_style = if entry.is_dir {
-                    Style::default().fg(Color::Cyan)
+                    Theme::hint()
                 } else {
-                    Style::default().fg(Color::White)
+                    Theme::body()
                 };
                 Line::from(vec![
                     Span::styled(name_padded, name_style),
@@ -3173,11 +3339,8 @@ fn draw_file_completions(f: &mut Frame, state: &AppState, area: Rect) {
 fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue))
-        .title(Span::styled(
-            " / 命令 & Skill ",
-            Style::default().fg(Color::Blue),
-        ));
+        .border_style(Theme::plan())
+        .title(Span::styled(" / 命令 & Skill ", Theme::plan()));
 
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3217,19 +3380,19 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
                         name_pad,
                         Style::default()
                             .bg(Theme::selected_bg_color())
-                            .fg(Color::White)
+                            .fg(Theme::text_color())
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         desc_str,
                         Style::default()
                             .bg(Theme::selected_bg_color())
-                            .fg(Color::Rgb(180, 200, 255)),
+                            .fg(Theme::text_dim_color()),
                     ),
                 ])
             } else {
                 Line::from(vec![
-                    Span::styled(name_pad, Style::default().fg(Color::White)),
+                    Span::styled(name_pad, Theme::body()),
                     Span::styled(desc_str, Theme::dim()),
                 ])
             }
@@ -3256,20 +3419,13 @@ fn status_mode_chip(mode: &AgentMode) -> (&'static str, Style) {
         AgentMode::Plan => (
             "[plan]",
             Style::default()
-                .fg(Color::Blue)
+                .fg(Theme::plan_color())
                 .add_modifier(Modifier::BOLD),
         ),
-        AgentMode::Bypass => (
-            "[bypass]",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        AgentMode::Auto => (
-            "[auto]",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AgentMode::Manual => ("[manual]", Theme::dim()),
+        AgentMode::Bypass => ("[bypass]", Theme::danger().add_modifier(Modifier::BOLD)),
+        // 默认档用中性灰（`dim`），与标题栏一致：绿色是 success 语义，
+        // auto 并没有"成功通过什么"，它只是默认档。
+        AgentMode::Auto => ("[auto]", Theme::dim().add_modifier(Modifier::BOLD)),
     }
 }
 
@@ -3288,14 +3444,14 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         (
             format!("● {}", queue_hint_text(state)),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Theme::queue_color())
                 .add_modifier(Modifier::BOLD),
         )
     } else if state.ctrl_c_pressed {
         (
             "ctrl+c again to exit".to_string(),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(Theme::warning_color())
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -3549,11 +3705,11 @@ fn draw_skill_trust_panel(
 fn draw_plan_approval_panel(f: &mut Frame, dlg: &PlanApprovalDialog, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue))
+        .border_style(Theme::plan())
         .title(Span::styled(
             " 📋 计划已就绪 · ↑/↓ 选择 · Enter 确认 ",
             Style::default()
-                .fg(Color::Blue)
+                .fg(Theme::plan_color())
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -3604,7 +3760,7 @@ fn plan_option_row(idx: usize, cursor: usize, label: &str, max_w: usize) -> Line
     } else {
         Line::from(Span::styled(
             format!("  {}", truncate_line(label, max_w.saturating_sub(2))),
-            Style::default().fg(Color::White),
+            Theme::body(),
         ))
     }
 }
@@ -3626,8 +3782,8 @@ fn draw_exec_mode_confirm_panel(f: &mut Frame, dlg: &ExecModeConfirmDialog, area
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("待发送：", Style::default().fg(Color::DarkGray)),
-            Span::styled(preview, Style::default().fg(Color::White)),
+            Span::styled("待发送：", Theme::muted()),
+            Span::styled(preview, Theme::body()),
         ]),
         Line::from(Span::styled(
             "  [y/Enter] 切换执行模式并发送   [n] 保持规划模式发送   [Esc] 取消",
@@ -3685,23 +3841,17 @@ fn freetext_line(input: &InputBox, row: usize, line: &str, max_w: usize) -> Line
         if cursor_col != usize::MAX && start + i == cursor_col {
             spans.push(Span::styled(
                 ch.to_string(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Theme::claude_color())
-                    .add_modifier(Modifier::BOLD),
+                Theme::selection_on(Theme::claude_color()).add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.push(Span::styled(
-                ch.to_string(),
-                Style::default().fg(Color::White),
-            ));
+            spans.push(Span::styled(ch.to_string(), Theme::cursor()));
         }
     }
     // 光标停在行尾（插入态）：补一个反色空格，否则看不出还能继续打字
     if cursor_col != usize::MAX && cursor_col == chars.len() {
         spans.push(Span::styled(
             " ".to_string(),
-            Style::default().fg(Color::Black).bg(Theme::claude_color()),
+            Theme::selection_on(Theme::claude_color()),
         ));
     }
     if end < chars.len() {
@@ -3767,7 +3917,7 @@ fn build_answering_lines(
         Line::from(Span::styled(
             truncate_line(&spec.question, max_w),
             Style::default()
-                .fg(Color::White)
+                .fg(Theme::text_color())
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled("─".repeat(max_w), Theme::border())),
@@ -3815,7 +3965,7 @@ fn build_answering_lines(
         } else {
             lines.push(Line::from(Span::styled(
                 format!("    {}", truncate_line(&label, max_w.saturating_sub(4))),
-                Style::default().fg(Color::White),
+                Theme::body(),
             )));
         }
         if let Some(desc) = &opt.description {
@@ -3844,7 +3994,7 @@ fn build_answering_lines(
                 "    {}",
                 truncate_line(&other_label, max_w.saturating_sub(4))
             ),
-            Style::default().fg(Color::White),
+            Theme::body(),
         )));
     }
 
@@ -3876,7 +4026,7 @@ fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> 
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Theme::body()
         };
         let prefix = if i == index { "▶ " } else { "  " };
         lines.push(Line::from(Span::styled(
@@ -3907,7 +4057,7 @@ fn build_overview_lines(dlg: &AskQuestionDialog, index: usize, max_w: usize) -> 
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        ("  ", Style::default().fg(Color::White))
+        ("  ", Theme::body())
     };
     lines.push(Line::from(Span::styled(
         format!("{prefix}{submit_label}"),
@@ -3963,13 +4113,13 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!("  ▶ {:<w$}", new_session_label, w = w.saturating_sub(4)),
             Style::default()
-                .fg(Color::Green)
+                .fg(Theme::success_color())
                 .add_modifier(Modifier::BOLD),
         )));
     } else {
         lines.push(Line::from(Span::styled(
             format!("    {:<w$}", new_session_label, w = w.saturating_sub(4)),
-            Style::default().fg(Color::Green),
+            Theme::success(),
         )));
     }
 
@@ -4014,7 +4164,7 @@ fn draw_session_picker(f: &mut Frame, picker: &SessionPickerState, area: Rect) {
                     line_str,
                     Style::default()
                         .bg(Theme::selected_bg_color())
-                        .fg(Color::White)
+                        .fg(Theme::text_color())
                         .add_modifier(Modifier::BOLD),
                 )));
             } else {
@@ -4098,7 +4248,7 @@ fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
         let style = if selected {
             Theme::selected_row()
         } else {
-            Style::default().fg(Color::White)
+            Theme::body()
         };
         lines.push(Line::from(Span::styled(text, style)));
     }
@@ -4201,7 +4351,7 @@ fn draw_memory_dialog(f: &mut Frame, dialog: &MemoryDialog, area: Rect) {
         let style = if selected {
             Theme::selected_row()
         } else {
-            Style::default().fg(Color::White)
+            Theme::body()
         };
         lines.push(Line::from(Span::styled(text, style)));
     }
@@ -4308,7 +4458,7 @@ fn draw_evolution_dialog(f: &mut Frame, dialog: &EvolutionDialog, area: Rect) {
             if index == dialog.selected {
                 Theme::selected_row()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             },
         )));
     }
@@ -4528,7 +4678,7 @@ fn draw_mcp_dialog(
             let style = if selected {
                 Theme::selected_row()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             let text = match (dialog.tab, row) {
                 (McpDialogTab::Installed, FlatRow::Entry(idx)) => {
@@ -4813,7 +4963,7 @@ fn draw_skills_dialog(f: &mut Frame, dialog: &SkillsDialog, area: Rect) {
             let style = if selected {
                 Theme::selected_row()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             let text = match (dialog.tab, row) {
                 (SkillsDialogTab::Installed, FlatRow::Entry(idx)) => {
@@ -5167,7 +5317,7 @@ fn draw_plugins_dialog(f: &mut Frame, dialog: &PluginsDialog, area: Rect) {
             let style = if selected {
                 Theme::selected_row()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             let text = match (dialog.tab, row) {
                 (PluginsDialogTab::Installed, FlatRow::Entry(idx)) => {
@@ -5453,7 +5603,7 @@ fn draw_agents_dialog(f: &mut Frame, dialog: &mut AgentsDialog, area: Rect) {
             let style = if selected {
                 Theme::selected_row()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
@@ -5613,7 +5763,7 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
             } else if !record.enabled {
                 Theme::dim()
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
@@ -5693,7 +5843,7 @@ fn draw_extensions_dialog(f: &mut Frame, dialog: &mut ExtensionsDialog, area: Re
                 ),
                 footer_area.width as usize,
             ),
-            Style::default().fg(Color::Yellow),
+            Theme::warning(),
         )));
     } else {
         footer.push(Line::from(Span::styled(
@@ -5800,11 +5950,11 @@ fn draw_profile_dialog(
         let text = truncate_line(&text, w);
 
         let style = if editing {
-            Style::default().fg(Color::Black).bg(Theme::claude_color())
+            Theme::selection_on(Theme::claude_color())
         } else if selected_row {
             Theme::selected_row()
         } else {
-            Style::default().fg(Color::White)
+            Theme::body()
         };
         lines.push(Line::from(Span::styled(text, style)));
     }
@@ -5987,11 +6137,11 @@ fn draw_schedule_dialog(
         let text = truncate_line(&text, w);
 
         let style = if editing {
-            Style::default().fg(Color::Black).bg(Theme::claude_color())
+            Theme::selection_on(Theme::claude_color())
         } else if selected_row {
             Theme::selected_row()
         } else {
-            Style::default().fg(Color::White)
+            Theme::body()
         };
         lines.push(Line::from(Span::styled(text, style)));
     }
@@ -6107,7 +6257,7 @@ fn draw_profile_list_overlay(
                     .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             Line::from(Span::styled(text, style))
         })
@@ -6195,7 +6345,7 @@ pub fn draw_action_menu<T, A: PartialEq>(
                     .fg(Theme::claude_color())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Theme::body()
             };
             Line::from(Span::styled(text, style))
         })
@@ -6446,47 +6596,10 @@ mod plan_approval_render_tests {
 mod tool_result_fold_tests {
     use super::*;
     use crate::app::ShellStatus;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    fn make_state() -> AppState {
-        AppState::new(
-            PathBuf::from("/tmp"),
-            "test-model".to_string(),
-            200_000,
-            AgentMode::Manual,
-            wyj_config::Config::default(),
-            Arc::new(wyj_tools::SubAgentHub::new()),
-        )
-    }
-
-    fn message(role: MessageRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            id: 1,
-            role,
-            content: content.to_string(),
-            is_error: false,
-            elapsed_secs: None,
-            thinking_elapsed_secs: None,
-            sequence_no: None,
-            tool_name: None,
-            display_summary: String::new(),
-            sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
-        }
-    }
-
-    fn rendered_text(lines: Vec<Line<'static>>) -> Vec<String> {
-        lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect()
-    }
+    use crate::test_support::{make_state, message, render_to_text, rendered_text};
+    // 生产代码不再出现裸 `Color`（见 theme_tests.rs 的扫描钉子）；测试需要它
+    // 来断言"渲染结果确实用了某个具体颜色"。
+    use ratatui::style::Color;
 
     /// `/cost` 的表格依赖换行与列对齐。TUI 的 assistant 消息走 markdown，
     /// 而 markdown 把「连续非空行」当一个段落重新折行——曾把一张 50 行的
@@ -7057,25 +7170,6 @@ mod tool_result_fold_tests {
             .iter()
             .any(|line| line.contains("task: short task")));
         assert!(rendered.iter().any(|line| line.contains("PageUp/PageDown")));
-    }
-
-    /// 渲染一屏到 TestBackend 并拼成纯文本，方便断言"这一屏到底画了什么"。
-    fn render_to_text(f: impl FnOnce(&mut Frame), width: u16, height: u16) -> String {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut terminal =
-            Terminal::new(TestBackend::new(width, height)).expect("TestBackend init");
-        terminal.draw(f).expect("draw should not panic");
-        let buf = terminal.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     fn running_sub_agent_with_tool_log() -> SubAgentUiState {
@@ -7946,9 +8040,12 @@ mod tool_result_fold_tests {
 
     #[test]
     fn edit_result_automatically_renders_colored_diff_preview() {
+        // 用**真实** `make_diff` 输出而不是手写样本：行号是从 `@@` 块头推出来的，
+        // 手写一个无块的 diff 会让测试绿在一个真实链路里根本走不到的分支上。
+        let diff = wyj_tools::make_diff("a\nb\nc\n", "a\nB\nc\n", 200);
         let mut result = message(
             MessageRole::ToolResult,
-            "Updated file successfully\n- old content\n+ new content\n  context",
+            &format!("已替换 1 处: demo.rs\n{diff}"),
         );
         result.tool_name = Some("Edit".to_string());
         let mut is_first_user = true;
@@ -7966,29 +8063,29 @@ mod tool_result_fold_tests {
         );
         let rendered = rendered_text(lines.clone());
 
+        // 块头原样透出（它就是行号的来源，也顺带告诉用户改动落在哪）
         assert_eq!(rendered[0], "  ⎿ result");
-        assert_eq!(rendered[1], "    - old content");
-        assert_eq!(rendered[2], "    + new content");
-        assert_eq!(rendered[3], "      context");
-        assert_eq!(lines[1].spans[0].style, Theme::error());
-        assert_eq!(lines[2].spans[0].style, Style::default().fg(Color::Green));
-        assert_eq!(lines[3].spans[0].style, Theme::dim());
-        assert!(!rendered.iter().any(|line| line.contains("Updated file")));
+        assert_eq!(rendered[1], "    @@ -1,3 +1,3 @@");
+        // 双列行号：删除行只有旧侧、新增行只有新侧、上下文两侧都有
+        assert_eq!(rendered[2], "    1 1 │ a", "{rendered:?}");
+        assert_eq!(rendered[3], "    2   │ - b", "{rendered:?}");
+        assert_eq!(rendered[4], "      2 │ + B", "{rendered:?}");
+        assert_eq!(rendered[5], "    3 3 │ c", "{rendered:?}");
+        // 断言槽位而不是具体色值：diff 的绿与 ✓ 的绿必须是**同一个**绿，
+        // 否则"新增=好/删除=坏"这套视觉语言会分裂成两套近似色。
+        assert_eq!(lines[3].spans[1].style, Theme::error());
+        assert_eq!(lines[4].spans[1].style, Theme::success());
+        assert_eq!(lines[5].spans[1].style, Theme::dim());
+        assert!(
+            !rendered.iter().any(|line| line.contains("已替换")),
+            "回执头不该出现在 diff 里"
+        );
 
         // 折叠态：diff 仍然内联可见（Edit/Write 是折叠规则的唯一例外），
-        // 但渲染的行必须与展开态同形同色——切换 Ctrl+O 不会让已看惯的行
-        // 忽然换一种缩进或换一种颜色。
+        // 但渲染的行必须与展开态**逐字节相同**——切换 Ctrl+O 不会让已看惯的
+        // 行忽然换一种缩进、换一种颜色，行号更不该凭空消失。
         let folded = render_messages(&[result.clone()], 100);
-        assert_eq!(
-            folded,
-            vec![
-                "  ⎿ result",
-                "    - old content",
-                "    + new content",
-                "      context",
-            ],
-            "{folded:?}"
-        );
+        assert_eq!(folded, rendered, "{folded:?}");
     }
 
     #[test]
@@ -8064,21 +8161,158 @@ mod tool_result_fold_tests {
         assert_eq!(rendered[0], "  ⎿ result");
     }
 
+    /// 展开态必须给出**全文**，且行号跨增删两侧各自推进：旧侧 `21` 之后新侧是
+    /// `22`，而紧跟的上下文行是 `22/23`（旧侧也 +1）。
     #[test]
     fn long_edit_diff_renders_all_lines_when_expanded() {
+        let old = (0..40)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("line20", "line20_patched\nanother");
+        let diff = wyj_tools::make_diff(&old, &new, 200);
         let mut result = message(
             MessageRole::ToolResult,
-            "Updated file successfully\n- old one\n+ new one\n  context\n+ another",
+            &format!("已替换 1 处: demo.rs\n{diff}"),
         );
         result.tool_name = Some("Edit".to_string());
         let rendered = render_messages_with_output_expanded(&[result], 100, true);
 
-        assert_eq!(rendered.len(), 5, "{rendered:?}");
-        assert_eq!(rendered[4], "    + another", "尾部补丁行必须可见");
+        let patched = rendered
+            .iter()
+            .find(|line| line.contains("+ another"))
+            .unwrap_or_else(|| panic!("尾部补丁行必须可见：{rendered:?}"));
+        assert!(patched.contains("22 │"), "末行应带新侧行号：{patched:?}");
+        assert!(
+            rendered.iter().any(|l| l.contains("24 25 │ line23")),
+            "上下文行的双侧行号应各自推进：{rendered:?}"
+        );
         assert!(
             !rendered.iter().any(|line| line.trim() == "..."),
             "展开态不得补 `...`: {rendered:?}"
         );
+    }
+
+    /// 折叠态的 20 行预算必须**只算正文**：多 hunk 的 diff 带一堆 `@@` 头与跳过
+    /// 提示，若元信息也占名额，折叠态一屏全是 `@@` 而看不到任何改动内容。
+    #[test]
+    fn collapsed_diff_budget_counts_body_lines_not_meta_lines() {
+        let old = (0..200)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = (0..10).fold(old.clone(), |acc, i| {
+            acc.replacen(&format!("line{}", i * 15), &format!("line{}_X", i * 15), 1)
+        });
+        let diff = wyj_tools::make_diff(&old, &new, 200);
+        let mut result = message(
+            MessageRole::ToolResult,
+            &format!("已替换 10 处: demo.rs\n{diff}"),
+        );
+        result.tool_name = Some("Edit".to_string());
+
+        let rendered = render_messages(&[result.clone()], 100);
+        // 正文行 = 带行号 gutter 的行。`@@` 头与 `… N unchanged lines` 都没有
+        // gutter，标题行 `⎿ result` 与截断提示行同样没有——比按文案过滤稳健。
+        let body = rendered.iter().filter(|l| l.contains('│')).count();
+        assert_eq!(
+            body, COLLAPSED_DIFF_MAX_LINES,
+            "折叠态应恰好给出 {COLLAPSED_DIFF_MAX_LINES} 行正文：{rendered:?}"
+        );
+
+        // 截断提示的数字必须是**剩余正文**数，不是「总行数 - 20」——那会把
+        // 元信息行算进「还有多少内容」，提示的数字偏大。期望值按 i18n key 取，
+        // 不硬编码文案（测试环境 locale 由外部决定）。
+        let all = render_messages_with_output_expanded(&[result], 100, true);
+        let body_total = all.iter().filter(|l| l.contains('│')).count();
+        let expected = wyj_i18n::tr_fmt(
+            "diff.more_lines",
+            &[("n", &(body_total - COLLAPSED_DIFF_MAX_LINES).to_string())],
+        );
+        assert_eq!(
+            rendered.last().map(|l| l.as_str()),
+            Some(expected.as_str()),
+            "截断提示数字应等于剩余正文数 {body_total} - {COLLAPSED_DIFF_MAX_LINES}"
+        );
+    }
+
+    /// **两条宽度路径必须对同一批字符给出同一个答案**：
+    /// `crate::markdown::display_width`（unicode-width）与本文件的
+    /// `char_display_width`（手写 CJK 区间表）。
+    ///
+    /// 分歧的后果不是"某个字符宽度差一点"，而是**宽度算错后右边线裂开**：
+    /// 按 A 算可用宽度、按 B 决定在哪折行，两者不一致时必然差若干列。
+    /// 框线字符、图标、emoji、中文各自落在哪条路径上，取决于调用点。
+    #[test]
+    fn the_two_width_paths_agree_on_every_character_we_render() {
+        let samples = "abc123 \u{2502}\u{250c}\u{252c}\u{2510}\u{2514}\u{2518}\u{256d}\u{256e}\u{2570}\u{2571}\u{2713}\u{2717}\u{25cb}\u{2699}\u{25cf}\u{25b6}\u{276f}\u{23bf}\u{2500}\u{00b7}\u{2026}\u{4e2d}\u{6f22}\u{5b57}\u{52fe}\u{2713}\u{1f680} \u{1f600} \u{200b} \u{0301} \u{9ad8}";
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut check = |ch: char| {
+            let a = crate::markdown::display_width(&ch.to_string());
+            let b = char_display_width(ch);
+            if a != b {
+                mismatches.push(format!(
+                    "U+{:04X} {:?}: unicode={a} table={b}",
+                    ch as u32, ch
+                ));
+            }
+        };
+        for ch in samples.chars() {
+            check(ch);
+        }
+        // 再按区段全量扫一遍——逐个手列关键字符只能挡住"我知道的"，
+        // 区段扫描才能挡住"我没想过会分叉的那些"（零宽字符就是这么漏进来的）。
+        for range in [
+            0x0300u32..=0x036F,   // 组合附加符号
+            0x2000u32..=0x206F,   // 通用标点（含零宽空格 U+200B、ZWSP、ZWJ）
+            0x20D0u32..=0x20FF,   // 组合记号
+            0xFE00u32..=0xFE0F,   // 变体选择符
+            0xE0100u32..=0xE01EF, // 变体选择符补充
+            0x2500u32..=0x257F,   // 制表符（框线，全应用渲染量最大的一批）
+            0x2580u32..=0x259F,   // 块元素
+        ] {
+            for cp in range {
+                if let Some(ch) = char::from_u32(cp) {
+                    check(ch);
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "两条宽度路径在 {} 个字符上不一致：\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// diff 行**不得超出**聊天区宽度。行号 gutter 是固定开销，折行宽度必须把它
+    /// 扣掉——漏扣的后果是长行把右边顶出屏幕（而 TUI 会静默裁掉，用户看到的
+    /// 是代码莫名其妙少了一截）。
+    #[test]
+    fn diff_rows_never_overflow_the_chat_width() {
+        let old = (0..30)
+            .map(|i| format!("    let value_{i} = compute(\"payload\", {i})?;"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replacen(
+            "let value_12 = compute(\"payload\", 12)?;",
+            "let value_12 = compute(\"payload_with_a_much_longer_name\", 12)?; // 中文注释",
+            1,
+        );
+        let diff = wyj_tools::make_diff(&old, &new, 200);
+        let mut result = message(
+            MessageRole::ToolResult,
+            &format!("已替换 1 处: demo.rs\n{diff}"),
+        );
+        result.tool_name = Some("Edit".to_string());
+
+        for width in [40usize, 60, 80, 100, 200] {
+            let rendered = render_messages(&[result.clone()], width);
+            for line in &rendered {
+                let w = crate::markdown::display_width(line);
+                assert!(w <= width, "width={width} 时该行宽 {w} 溢出：{line:?}");
+            }
+        }
     }
 
     #[test]
@@ -8190,7 +8424,7 @@ mod tool_result_fold_tests {
     fn collapsed_tool_result_never_touches_content() {
         let mut result = message(MessageRole::ToolResult, &"x".repeat(100_000));
         result.tool_name = Some("Bash".to_string());
-        let rendered = render_messages(&[result], 100);
+        let rendered = render_messages(&[result.clone()], 100);
 
         assert_eq!(rendered.len(), 1, "{rendered:?}");
         assert!(
@@ -8653,13 +8887,13 @@ mod tool_result_fold_tests {
         // 三段常驻信息必须仍在
         assert!(
             last_line.contains(&state.model_name)
-                && last_line.contains("[manual]")
+                && last_line.contains("[auto]")
                 && last_line.contains("·"),
             "状态栏应保留 模型 / 模式 / 工作目录 三段, 实际: {last_line:?}"
         );
     }
 
-    /// 四种模式在状态栏都必须显式标出，且 Bypass 必须是**红色**——
+    /// 三种模式在状态栏都必须显式标出，且 Bypass 必须是**红色**——
     /// 它等价于「本次会话跳过全部权限确认」，是唯一需要用户知情承担的模式。
     #[test]
     fn draw_status_labels_every_mode_and_paints_bypass_red() {
@@ -8668,7 +8902,6 @@ mod tool_result_fold_tests {
 
         for (mode, expect) in [
             (AgentMode::Auto, "[auto]"),
-            (AgentMode::Manual, "[manual]"),
             (AgentMode::Plan, "[plan]"),
             (AgentMode::Bypass, "[bypass]"),
         ] {
@@ -8692,27 +8925,129 @@ mod tool_result_fold_tests {
                 "模式 {mode:?} 必须在状态栏显式标注 {expect}, 实际: {line:?}"
             );
 
-            // Bypass 芯片必须染成红色（提醒语义），其余模式不受此约束。
+            // Bypass 必须染成 danger 槽位（提醒语义），其余模式不受此约束。
             if mode == AgentMode::Bypass {
                 let idx = line.find("[bypass]").expect("bypass 芯片存在");
-                let cell = &buffer[(idx as u16, row)];
                 assert_eq!(
-                    cell.fg,
-                    Color::Red,
-                    "Bypass 芯片必须是红色而不是中性黄, 实际 fg={:?}",
-                    cell.fg
+                    buffer[(idx as u16, row)].fg,
+                    Theme::danger_color(),
+                    "Bypass 芯片必须是 danger 槽位而不是中性黄, 实际 fg={:?}",
+                    buffer[(idx as u16, row)].fg
+                );
+
+                // 「三处同色」是硬不变式（见 tui/CLAUDE.md）：状态栏芯片 +
+                // 标题栏 + 输入框边框。只查状态栏等于没查——标题栏与边框
+                // 各写各的颜色时，用户看到的是两种红/非红，无法判断当前模式。
+                let mut hits = Vec::new();
+                for y in 0..buffer.area.height {
+                    let row_text: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect();
+                    if let Some(i) = row_text.find("[bypass]") {
+                        hits.push((y, i as u16));
+                    }
+                }
+                assert_eq!(
+                    hits.len(),
+                    2,
+                    "[bypass] 应在状态栏与输入框标题栏各出现一次，实际 {hits:?}"
+                );
+                for (y, x) in &hits {
+                    assert_eq!(
+                        buffer[(*x, *y)].fg,
+                        Theme::danger_color(),
+                        "bypass 文字 ({x},{y}) 必须与芯片同色"
+                    );
+                }
+
+                // 输入框底边框（状态栏正上方那行）的左端框角
+                let border_row = row - 1;
+                let corner_x = (0..buffer.area.width)
+                    .find(|x| buffer[(*x, border_row)].symbol() != " ")
+                    .expect("输入框底边框应至少有一个可见 cell");
+                assert_eq!(
+                    buffer[(corner_x, border_row)].fg,
+                    Theme::danger_color(),
+                    "输入框边框必须与 bypass 芯片同色"
                 );
             }
         }
     }
 
+    /// 默认档（auto）必须走**中性灰**，不能是 success 绿。
+    ///
+    /// 合并掉 manual 之后 auto 就是唯一日常档，它不再"通过了什么"，只是一档
+    /// 默认设置；染成绿色会让用户把当前状态读成"已获授权"。同时标题栏的
+    /// `[auto] Enter to send` 与输入框边框必须同属中性档——边框与普通框线同色，
+    /// 标题栏与状态栏芯片同色（`dim`），三处读起来是同一个意思。
+    #[test]
+    fn auto_mode_is_painted_neutral_gray_not_success_green() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+        let mut state = make_state();
+        state.is_thinking = false;
+        state.mode = AgentMode::Auto;
+        let input = InputBox::new();
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+
+        let buffer = terminal.backend().buffer().clone();
+        let status_row = buffer.area.height - 1;
+        let status_text: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, status_row)].symbol().to_string())
+            .collect();
+        let idx = status_text.find("[auto]").expect("auto 芯片存在") as u16;
+        assert_eq!(
+            buffer[(idx, status_row)].fg,
+            Theme::inactive_color(),
+            "auto 芯片必须是中性灰（inactive 槽位），实际 fg={:?}",
+            buffer[(idx, status_row)].fg
+        );
+
+        // 标题栏的 `[auto] Enter to send` 同色。
+        let mut title_hits = Vec::new();
+        for y in 0..status_row.saturating_sub(1) {
+            let row_text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect();
+            if let Some(i) = row_text.find("[auto] Enter") {
+                title_hits.push((y, i as u16));
+            }
+        }
+        assert_eq!(
+            title_hits.len(),
+            1,
+            "[auto] Enter to send 应恰好出现一次，实际 {title_hits:?}"
+        );
+        let (ty, tx) = title_hits[0];
+        assert_eq!(
+            buffer[(tx, ty)].fg,
+            Theme::inactive_color(),
+            "标题栏 auto 标签必须与状态栏芯片同色"
+        );
+
+        // 输入框边框回到默认框线色（不再是 success 绿）。
+        let border_row = status_row - 1;
+        let corner_x = (0..buffer.area.width)
+            .find(|x| buffer[(*x, border_row)].symbol() != " ")
+            .expect("输入框底边框应至少有一个可见 cell");
+        assert_eq!(
+            buffer[(corner_x, border_row)].fg,
+            Theme::border_color(),
+            "默认档的输入框边框不应被染色"
+        );
+    }
+
     /// 状态栏不应再设置显式背景色（之前 `Theme::status_bar()` 用 `Rgb(30, 30, 30)`
     /// 让最末行在终端默认黑底上呈现深灰带，与上方标题栏/聊天区割裂）。这里断言
-    /// 最后一行的所有非空 cell 都没有 `STATUS_BG` 这条深灰背景，防止后续误改回
-    /// `bg(Self::status_bg_color())` 又把这条黑条加回来。
+    /// 最后一行的所有非空 cell 都是 `Color::Reset`（= 未设置前景外的任何背景），
+    /// 防止后续误写 `bg(...)` 又把这条黑条加回来。
     #[test]
     fn draw_status_does_not_set_explicit_background() {
-        use crate::theme::Theme;
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -8731,7 +9066,6 @@ mod tool_result_fold_tests {
 
         let buffer = terminal.backend().buffer().clone();
         let status_row = buffer.area.height - 1;
-        let expected_bg = Some(Theme::status_bg_color());
 
         for x in 0..buffer.area.width {
             let cell = &buffer[(x, status_row)];
@@ -8740,11 +9074,12 @@ mod tool_result_fold_tests {
                 // 状态栏尾部 padding 可能没有渲染符号，跳过避免误报
                 continue;
             }
-            assert_ne!(
+            assert_eq!(
                 cell.style().bg,
-                expected_bg,
-                "状态栏最末行的 cell ({x},{status_row}) 背景仍是 STATUS_BG={expected_bg:?}, \
-                 不应再显式设置背景；恢复透传终端默认底色更协调"
+                Some(Color::Reset),
+                "状态栏最末行的 cell ({x},{status_row}) 背景被显式设成了 {:?}, \
+                 不应再显式设置背景；恢复透传终端默认底色更协调",
+                cell.style().bg
             );
         }
     }

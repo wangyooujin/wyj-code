@@ -8,16 +8,19 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
-    /// 交互表面逐次询问；无交互表面 fail-closed。
-    Prompt,
-    /// Auto 模式（对齐 Claude Code auto mode）：本模式下**不再逐次弹窗**，
-    /// 「要不要问人」交给 `crate::auto_mode::AutoGate` 判定——确定性规则先行，
-    /// 拿不准的送模型分类器。
+    /// Auto 模式（唯一需要判定的日常模式）：「要不要问人」交给
+    /// `crate::auto_mode::AutoGate` 判定——确定性规则先行，拿不准的送模型
+    /// 分类器，闸门自己也拿不准时交回逐次弹窗。
     ///
     /// 这里刻意返回 `Allow` 而不是新增一个 verdict 变体：真正的判定需要
     /// `.await` 模型，而 `evaluate` 是同步函数。Auto 闸门挂在 `Agent` 侧
     /// （`Agent::ensure_tool_permission`），本函数只负责**任何模式都不放行**
     /// 的那部分（受保护路径写入、Plan 白名单）。
+    ///
+    /// 历史上的 `Prompt`（逐次弹窗）变体已并入本变体：它与 Auto 的差别只是
+    /// 「谁来回答要不要问人」，而 Auto 的闸门在判 `AskUser` 时本来就会落到
+    /// 同一条弹窗路径（`ToolCtx::confirm_tool`）——无交互面时那里 fail-closed，
+    /// 覆盖了原 `Prompt` 分支在 headless 下的职责。
     Auto,
     /// 显式 bypass。跳过询问，但不绕过受保护路径。
     AutoApprove,
@@ -159,27 +162,9 @@ impl PermissionPolicy {
             PermissionMode::AutoApprove => PermissionVerdict::Allow,
             // Auto 不在这里下结论：受保护路径已在上面的 `safe_resolve_write_target`
             // 里 deny 掉，剩下的「要不要问人」需要 await 分类器，由 Agent 侧的
-            // AutoGate 负责。这里放行不代表动作会真的执行。
+            // AutoGate 负责。这里放行不代表动作会真的执行；闸门判 AskUser 时
+            // 会落到 `ToolCtx::confirm_tool`，无交互面时它 fail-closed。
             PermissionMode::Auto => PermissionVerdict::Allow,
-            PermissionMode::Prompt => {
-                if is_side_effect_tool(&request.tool_name, &request.input) {
-                    if request.surface.is_interactive() {
-                        PermissionVerdict::Ask(PermissionPrompt {
-                            reason: "该工具可能产生外部副作用，需要用户确认".to_string(),
-                        })
-                    } else {
-                        PermissionVerdict::Deny(DenyReason::new(
-                            "interactive_approval_unavailable",
-                            format!(
-                                "工具 `{}` 需要确认，但当前运行表面没有交互审批通道",
-                                request.tool_name
-                            ),
-                        ))
-                    }
-                } else {
-                    PermissionVerdict::Allow
-                }
-            }
         }
     }
 
@@ -345,27 +330,6 @@ fn is_file_write_tool(name: &str) -> bool {
     matches!(name, "Write" | "Edit")
 }
 
-fn is_side_effect_tool(name: &str, input: &Value) -> bool {
-    if is_file_write_tool(name) {
-        return true;
-    }
-    match name {
-        "Bash" | "KillShell" | "Agent" | "ExitPlanMode" => true,
-        // PermissionPolicy runs before Tool::needs_permission. Keep the same
-        // read-only boundary here so headless surfaces can observe/inspect the
-        // desktop while mutations still fail closed without an approval UI.
-        "computer" => !matches!(
-            input.get("action").and_then(Value::as_str),
-            Some("screenshot" | "zoom" | "cursor_position" | "wait")
-        ),
-        "app_computer" => !matches!(
-            input.get("action").and_then(Value::as_str),
-            Some("list_windows" | "screenshot" | "inspect_element")
-        ),
-        _ => false,
-    }
-}
-
 pub fn validate_plan_read_only_command(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
@@ -480,83 +444,79 @@ mod tests {
         }
     }
 
+    /// Auto 在 `evaluate` 层**只拦一件事**：受保护路径写入。
+    ///
+    /// 这是「Auto 会放行一切」的印象能成立的前提——没有这条，任何模式的
+    /// `Allow` 都会变成绕过 `.env` / `.ssh/` / `.git` 的口子。工具自身要不要
+    /// 审批（`Tool::needs_permission`，含 computer-use 的只读/副作用区分）不在
+    /// 这一层，见 `crates/tools/src/computer.rs` 与 `app_computer.rs` 的测试。
     #[test]
-    fn prompt_without_ui_denies_side_effects_but_allows_reads() {
+    fn auto_blocks_protected_write_targets_but_defers_everything_else() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join("secret.pem"), "x").unwrap();
         let policy = PermissionPolicy::default();
-        let cwd = std::env::temp_dir();
+        let cwd = repo.path();
+
+        // 受保护路径：`.git` 内写入 + 凭据后缀文件，任何模式都不放行。
+        for path in [".git/config", "secret.pem", ".env", ".ssh/id_ed25519"] {
+            assert!(
+                matches!(
+                    policy.evaluate(&request(
+                        PermissionMode::Auto,
+                        cwd,
+                        "Write",
+                        json!({ "file_path": path })
+                    )),
+                    PermissionVerdict::Deny(_)
+                ),
+                "Auto 下写 {path} 必须 deny"
+            );
+        }
+
+        // 普通文件写与 Bash：这里放行，真正的判定交给 AutoGate / confirm_tool。
         assert!(matches!(
-            policy.evaluate(&request(PermissionMode::Prompt, &cwd, "Read", json!({}))),
+            policy.evaluate(&request(
+                PermissionMode::Auto,
+                cwd,
+                "Write",
+                json!({ "file_path": "src/lib.rs" })
+            )),
             PermissionVerdict::Allow
         ));
         assert!(matches!(
             policy.evaluate(&request(
-                PermissionMode::Prompt,
-                &cwd,
+                PermissionMode::Auto,
+                cwd,
                 "Bash",
-                json!({"command": "ls"})
+                json!({ "command": "git reset --hard" })
             )),
-            PermissionVerdict::Deny(_)
+            PermissionVerdict::Allow
         ));
-        for (tool, input) in [
-            ("computer", json!({"action": "screenshot"})),
-            ("computer", json!({"action": "zoom"})),
-            ("computer", json!({"action": "cursor_position"})),
-            ("computer", json!({"action": "wait"})),
-            ("app_computer", json!({"action": "list_windows"})),
-            ("app_computer", json!({"action": "screenshot"})),
-            ("app_computer", json!({"action": "inspect_element"})),
-        ] {
-            assert!(
-                matches!(
-                    policy.evaluate(&request(PermissionMode::Prompt, &cwd, tool, input)),
-                    PermissionVerdict::Allow
-                ),
-                "只读 computer-use 动作 {tool} 不应要求 headless 交互审批"
-            );
-        }
-        for (tool, input) in [
-            ("computer", json!({"action": "left_click"})),
-            ("computer", json!({"action": "unknown"})),
-            ("computer", json!({})),
-            ("app_computer", json!({"action": "click"})),
-            ("app_computer", json!({"action": "set_text"})),
-            ("app_computer", json!({"action": "unknown"})),
-            ("app_computer", json!({})),
-        ] {
-            assert!(
-                matches!(
-                    policy.evaluate(&request(PermissionMode::Prompt, &cwd, tool, input)),
-                    PermissionVerdict::Deny(_)
-                ),
-                "有副作用的 computer-use 动作 {tool} 在 headless 下必须 fail closed"
-            );
-        }
     }
 
+    /// Auto 的 `Allow` 不能被误读成「无交互面也放行」：headless 下 `evaluate`
+    /// 放行之后，`Agent::ensure_tool_permission` 仍会问闸门，闸门判 AskUser 时
+    /// `ToolCtx::confirm_tool` 在没有 UI 通道时 fail-closed。这条链路端到端钉在
+    /// `crates/tools/src/ctx.rs` 的 `sub_agent_bash_is_blocked_...`，这里只固定
+    /// 它依赖的前置事实：Auto 不会在 policy 层自己把有副作用的动作拒掉。
     #[test]
-    fn interactive_prompt_only_asks_for_mutating_computer_actions() {
+    fn auto_leaves_side_effect_decision_to_the_gate_not_to_the_policy() {
         let policy = PermissionPolicy::default();
         let cwd = std::env::temp_dir();
-        let mut read = request(
-            PermissionMode::Prompt,
-            &cwd,
-            "app_computer",
-            json!({"action": "inspect_element"}),
-        );
-        read.surface = ExecutionSurface::TuiInteractive;
-        assert!(matches!(policy.evaluate(&read), PermissionVerdict::Allow));
-
-        let mut mutation = request(
-            PermissionMode::Prompt,
-            &cwd,
-            "app_computer",
-            json!({"action": "click"}),
-        );
-        mutation.surface = ExecutionSurface::TuiInteractive;
-        assert!(matches!(
-            policy.evaluate(&mutation),
-            PermissionVerdict::Ask(_)
-        ));
+        for (tool, input) in [
+            ("Bash", json!({ "command": "rm -rf build" })),
+            ("app_computer", json!({ "action": "click" })),
+            ("computer", json!({ "action": "left_click" })),
+        ] {
+            assert!(
+                matches!(
+                    policy.evaluate(&request(PermissionMode::Auto, &cwd, tool, input)),
+                    PermissionVerdict::Allow
+                ),
+                "{tool} 的副作用判定属于 AutoGate，policy 层不应代劳"
+            );
+        }
     }
 
     #[test]

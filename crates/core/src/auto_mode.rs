@@ -16,6 +16,7 @@
 //! 偏好，不是故障，此时交回人工确认。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -173,10 +174,17 @@ pub trait AutoGate: Send + Sync {
     async fn review(&self, request: &AutoReviewRequest) -> AutoVerdict;
     /// 当前拦截计数（供 UI 显示与降级判定）。
     fn counters(&self) -> AutoCounters;
-    /// 是否已因连续或累计超阈值而应当降级为逐次人工确认。
+    /// 是否已因连续或累计超阈值而应当停用分类器、逐次人工确认。
     fn should_degrade(&self) -> bool;
     /// 用户在人工确认里批准了一次，清空连续计数。
     fn note_human_approval(&self);
+    /// 停用模型分类器：此后只剩确定性规则层，拿不准的一律交回逐次弹窗。
+    /// 幂等。**只停用语义判定，不动 `hard_deny`**。
+    fn disable_classifier(&self);
+    /// 恢复模型分类器。幂等。
+    fn enable_classifier(&self);
+    /// 分类器当前是否可用（UI 展示「已降级为逐次确认」用）。
+    fn classifier_enabled(&self) -> bool;
 }
 
 /// 分类器请求的记账：与主会话的 `Session.total_*` 分开统计。
@@ -193,6 +201,11 @@ pub struct AutoGateImpl {
     /// `None` = 没配分类器（例如 `classifier_profile` 指向不存在的分组），
     /// 此时闸门退化为「确定性规则 + 其余交回人工」。
     classifier: Option<Arc<dyn Provider>>,
+    /// 运行时停用位。`config.enabled` 是启动期配置、这个是运行期可逆的开关：
+    /// 连续/累计拦截超阈值时停用它（降级为逐次确认），用户在界面上再切回
+    /// auto 时重新打开。两者的效果都是「只剩确定性规则 + 弹窗」，但只有这个
+    /// 开关能在不重启进程的前提下恢复。
+    classifier_off: AtomicBool,
     counters: Mutex<AutoCounters>,
     usage: Mutex<AutoClassifierUsage>,
     /// 用户这一轮的原始请求，由 Agent 在回合入口写入。
@@ -204,10 +217,29 @@ impl AutoGateImpl {
         Self {
             config,
             classifier,
+            classifier_off: AtomicBool::new(false),
             counters: Mutex::new(AutoCounters::default()),
             usage: Mutex::new(AutoClassifierUsage::default()),
             user_goal: Mutex::new(String::new()),
         }
+    }
+
+    /// 分类器当前不可用的原因；`None` 表示可用。
+    ///
+    /// 三个来源各有各的成因，UI 上报「已降级」与排查时不能混为一谈：配置里
+    /// 显式关掉、`classifier_profile` 写错导致没建成 Provider、以及运行期
+    /// 因连续拦截超阈值被停用。
+    fn classifier_unavailable(&self) -> Option<&'static str> {
+        if !self.config.enabled {
+            return Some("配置已关闭 auto 分类器（[auto_mode] enabled = false）");
+        }
+        if self.classifier.is_none() {
+            return Some("未配置可用的分类器 Profile");
+        }
+        if self.classifier_off.load(Ordering::Relaxed) {
+            return Some("分类器连续拦截过多，已停用");
+        }
+        None
     }
 
     /// 记录本轮用户请求。分类器判断「是否超出请求范围」时需要它。
@@ -426,13 +458,12 @@ impl AutoGateImpl {
 #[async_trait]
 impl AutoGate for AutoGateImpl {
     async fn review(&self, request: &AutoReviewRequest) -> AutoVerdict {
-        // 配置显式关闭分类器 = 用户自己选的偏好，不是故障：交回人工而不是拒绝。
-        if !self.config.enabled || self.classifier.is_none() {
-            return AutoVerdict::AskUser {
-                reason: "auto 模式未启用模型分类器，该操作需人工确认".to_string(),
-            };
-        }
-
+        // 顺序有讲究：两条确定性规则都排在「分类器是否可用」**之前**。
+        //
+        // 旧实现把 `!config.enabled` 的检查放在最前面，于是配置里关掉分类器之后
+        // `curl|bash` / `git reset --hard` 这类 hard_deny 也一并失效——只剩弹窗，
+        // 用户按一个 y 就能放过去。停用分类器降级的应当是**语义判定**这一层，
+        // 不是安全底线：hard_deny 必须无论端点多慢、配置怎么写都拦得住。
         if let Some((rule, reason)) = self.deterministic_deny(request) {
             self.note_block();
             return AutoVerdict::Deny { rule, reason };
@@ -441,6 +472,15 @@ impl AutoGate for AutoGateImpl {
         if let Some(reason) = self.deterministic_allow(request) {
             tracing::trace!(tool = %request.tool, %reason, "auto 确定性放行");
             return AutoVerdict::Allow;
+        }
+
+        // 分类器不可用不是故障也不是否决：用户自己的配置、或运行期降级都走这里，
+        // 交回逐次弹窗。无交互面（headless / 子 Agent）时 `confirm_tool`
+        // fail-closed，与直接拒绝等价，不存在静默放行的口子。
+        if let Some(cause) = self.classifier_unavailable() {
+            return AutoVerdict::AskUser {
+                reason: format!("{cause}，该操作需人工确认"),
+            };
         }
 
         match self.call_classifier(request).await {
@@ -484,6 +524,22 @@ impl AutoGate for AutoGateImpl {
         if let Ok(mut counters) = self.counters.lock() {
             counters.consecutive = 0;
         }
+    }
+
+    fn disable_classifier(&self) {
+        self.classifier_off.store(true, Ordering::Relaxed);
+    }
+
+    fn enable_classifier(&self) {
+        self.classifier_off.store(false, Ordering::Relaxed);
+        if let Ok(mut counters) = self.counters.lock() {
+            counters.consecutive = 0;
+            counters.degraded = false;
+        }
+    }
+
+    fn classifier_enabled(&self) -> bool {
+        self.classifier_unavailable().is_none()
     }
 }
 
@@ -921,6 +977,70 @@ mod tests {
             AutoVerdict::AskUser { .. }
         ));
         assert_eq!(gate.counters().total, 0, "交回人工不算拦截");
+    }
+
+    /// 停用分类器降级的是**语义判定**，不是安全底线。
+    ///
+    /// 旧实现把 `!config.enabled` 放在 `review()` 最前面，于是关掉分类器之后
+    /// `rm -rf /` 只需要用户按一个 y 就能过去。这里把两条路径（配置关 /
+    /// 运行期停）一起钉住：hard_deny 仍然无条件拦，其余交回人工。
+    #[tokio::test]
+    async fn disabling_the_classifier_never_drops_the_hard_deny_layer() {
+        for off in [
+            AutoGateConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            AutoGateConfig::default(),
+        ] {
+            let provider = FakeProvider::allow();
+            let gate = gate_with(off, Some(provider.clone()));
+            let runtime_off = gate.classifier_enabled();
+            if runtime_off {
+                gate.disable_classifier();
+            }
+            assert!(!gate.classifier_enabled());
+
+            // hard_deny：照拦，且不发模型请求。
+            match gate.review(&bash_request("rm -rf /")).await {
+                AutoVerdict::Deny { rule, .. } => assert_eq!(rule, "critical_path_removal"),
+                other => panic!("停用分类器后仍必须硬拦，实际 {other:?}"),
+            }
+            // 只读 allow：照放。
+            assert_eq!(
+                gate.review(&bash_request("git status")).await,
+                AutoVerdict::Allow
+            );
+            // 语义层：交回人工，不拒绝、也不计降级预算。
+            assert!(matches!(
+                gate.review(&bash_request("npm run deploy:staging")).await,
+                AutoVerdict::AskUser { .. }
+            ));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(gate.counters().total, 1, "只有 hard_deny 计入拦截预算");
+        }
+    }
+
+    /// `enable_classifier` 必须能真正恢复，而不只是把停用位翻回去——连续计数
+    /// 与 `degraded` 标记一并清零，否则用户切回 auto 后闸门会立刻再次降级。
+    #[tokio::test]
+    async fn re_enabling_the_classifier_clears_the_degradation_budget() {
+        let gate = gate_with(AutoGateConfig::default(), Some(FakeProvider::deny("越界")));
+        for _ in 0..3 {
+            gate.review(&bash_request("npm run deploy:prod")).await;
+        }
+        assert!(gate.should_degrade());
+
+        gate.disable_classifier();
+        gate.enable_classifier();
+        assert!(gate.classifier_enabled());
+        assert!(!gate.should_degrade());
+        assert_eq!(gate.counters().consecutive, 0);
+        // 恢复后确实重新走分类器（deny 而非 AskUser），证明没停在降级态。
+        assert!(matches!(
+            gate.review(&bash_request("npm run deploy:prod")).await,
+            AutoVerdict::Deny { .. }
+        ));
     }
 
     #[tokio::test]
