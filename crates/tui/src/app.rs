@@ -5594,6 +5594,24 @@ pub enum Attachment {
     },
 }
 
+/// 一段被折叠起来的长文本粘贴。
+///
+/// 输入框里只留一个 `PASTE_MARKER` 原子占位（渲染成 `[Pasted text #n +N lines]`），
+/// 原文存在这里，直到发送时才由 `InputBox::text_with_pastes` 按标记位置填回正文。
+///
+/// **为什么不留在输入框里**：输入框高度被 `render::draw` 硬 clamp 到 10 行，
+/// 且 `draw_input` 的 `Paragraph` 没有滚动、只从第 0 行开始画。几百行内容一进去
+/// 就等于消失——用户看到的是「粘贴满了但打不了字」，真实原因既不是长度上限也不是
+/// 截断，而是渲染层从第一行起画且永不跟随光标。折叠把问题从「看不见」降级成
+/// 「占一行」，与 Claude Code 的 `[Pasted text #1 +250 lines]` 一致。
+#[derive(Debug, Clone)]
+pub struct PasteBlock {
+    /// 原文。发送时逐字回填，一个字符都不能少。
+    pub text: String,
+    /// 行数，只用于占位符文案 `[Pasted text #n +N lines]`。
+    pub line_count: usize,
+}
+
 /// 一条待发送的用户消息。
 ///
 /// `display` 必须在**输入框还存在的那一刻**算好：附件占位符的位置只存在于
@@ -6520,41 +6538,69 @@ enum ClipboardPaste {
         width: usize,
         height: usize,
     },
+    /// 剪贴板里是文件引用（macOS Finder 复制的文件、Windows 资源管理器
+    /// 复制的文件）。必须**优先于** [`ClipboardPaste::Image`] 探测：见
+    /// [`read_system_clipboard`]。
+    Files(Vec<PathBuf>),
     Text(String),
 }
 
 /// 直接读取系统剪贴板。
 ///
 /// 终端的 bracketed paste 只会为文本产生 `Event::Paste`；纯图片剪贴板不会触发
-/// 该事件，因此 Ctrl+V 必须由应用主动读取剪贴板。图片优先，和原有
-/// `Event::Paste` 路径保持一致。
+/// 该事件，因此 Ctrl+V 必须由应用主动读取剪贴板。
+///
+/// **探测顺序 = 文件 → 文本 → 图片**，顺序本身就是这个函数唯一重要的部分：
+///
+/// macOS 从 Finder 复制一个文件时，NSPasteboard 同时写 `public.file-url`（真正的
+/// 文件引用）和 `public.tiff`（文件图标的 Quick Look 预览）。arboard 的
+/// `get_image()` 在 macOS 读的恰好就是 `NSPasteboardTypeTIFF`
+/// （arboard-3.6.1 `src/platform/osx.rs`）。旧实现把 `get_image()` 放在最前面且
+/// 成功即 return，于是**任何**从 Finder 复制的文件都会先命中图标预览、走
+/// `Attachment::Image` 分支，输入框里显示成 `[Image #1 16×16]`，而本该走的
+/// `try_resolve_path` → `[File: foo.pdf]` 一次都没机会执行。
+///
+/// 文本排在图片前面同样安全：截图工具、浏览器「复制图片」都只写图像 flavor，
+/// 不写 `public.utf8-plain-text`；而不少应用复制图片时会附带 alt 文本，那段文字
+/// 才是用户真正想说的。旧注释写的「兼容同时暴露图片与文本 flavor 的剪贴板」
+/// 对**文件**恰好是反的。
 fn read_system_clipboard() -> Option<ClipboardPaste> {
     let mut clipboard = arboard::Clipboard::new().ok()?;
 
-    if let Ok(image) = clipboard.get_image() {
-        let png_bytes =
-            encode_rgba_to_png(&image.bytes, image.width as u32, image.height as u32).ok()?;
-        use base64::Engine as _;
-        return Some(ClipboardPaste::Image {
-            data: base64::engine::general_purpose::STANDARD.encode(png_bytes),
-            width: image.width,
-            height: image.height,
-        });
+    // 1) 文件引用：arboard 自带 `file_list()`，macOS 侧读 NSURL 并带
+    //    `NSURLURLReadingFileURLsOnlyKey`。此前从未接线，能力在依赖里躺着。
+    if let Ok(files) = clipboard.get().file_list() {
+        if !files.is_empty() {
+            return Some(ClipboardPaste::Files(files));
+        }
     }
 
-    clipboard
-        .get_text()
-        .ok()
-        .filter(|text| !text.is_empty())
-        .map(ClipboardPaste::Text)
+    // 2) 纯文本
+    if let Ok(text) = clipboard.get_text() {
+        if !text.is_empty() {
+            return Some(ClipboardPaste::Text(text));
+        }
+    }
+
+    // 3) 图片（剪贴板里只有像素时）
+    let image = clipboard.get_image().ok()?;
+    let png_bytes =
+        encode_rgba_to_png(&image.bytes, image.width as u32, image.height as u32).ok()?;
+    use base64::Engine as _;
+    Some(ClipboardPaste::Image {
+        data: base64::engine::general_purpose::STANDARD.encode(png_bytes),
+        width: image.width,
+        height: image.height,
+    })
 }
 
-/// bracketed paste 已经携带可靠的文本内容；这里只额外探测同一剪贴板是否为图片。
-fn read_clipboard_image() -> Option<ClipboardPaste> {
-    match read_system_clipboard() {
-        image @ Some(ClipboardPaste::Image { .. }) => image,
-        Some(ClipboardPaste::Text(_)) | None => None,
-    }
+/// bracketed paste 已经携带可靠的文本内容；这里只额外探测同一剪贴板里是否还有
+/// **文件引用**（同样只认 `file_list()`，不去碰 `get_image()`——文本已经拿到了，
+/// 剩下的 flavor 不该反过来把它顶掉）。
+fn read_clipboard_files() -> Option<ClipboardPaste> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let files = clipboard.get().file_list().ok()?;
+    (!files.is_empty()).then_some(ClipboardPaste::Files(files))
 }
 
 fn read_clipboard_text() -> Option<String> {
@@ -6637,6 +6683,60 @@ pub(crate) struct PasteHint {
 
 const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
 
+/// 超过任一阈值就把粘贴的长文本折叠成 `[Pasted text #n +N lines]` 占位符。
+///
+/// 取「200 字符 / 5 行」是用户选定的口径：日常敲的字、几行路径、一次报错片段
+/// 都不受影响，一旦是真日志/真源码就立刻折叠。真正的判据不是数值本身，而是
+/// 「会不会把 8 行的可视区灌满」——超过就一定会看不见。
+const PASTE_FOLD_MIN_CHARS: usize = 200;
+const PASTE_FOLD_MIN_LINES: usize = 5;
+
+fn paste_text_should_fold(text: &str) -> bool {
+    text.chars().count() >= PASTE_FOLD_MIN_CHARS
+        || text.lines().filter(|l| !l.trim().is_empty()).count() >= PASTE_FOLD_MIN_LINES
+}
+
+/// 把一段长文本折叠成占位符。返回 `false` 表示不需要折叠（调用方按普通文本插入）。
+fn fold_paste(state: &mut AppState, input: &mut InputBox, text: &str) -> bool {
+    if !paste_text_should_fold(text) {
+        return false;
+    }
+    let line_count = text.lines().count().max(1);
+    let index = input.paste_insertion_index();
+    state.pending_pastes.insert(
+        index,
+        PasteBlock {
+            text: text.to_string(),
+            line_count,
+        },
+    );
+    input.insert_paste_marker();
+    true
+}
+
+/// 剪贴板里的一批文件 → 每个文件一个 `Attachment::File`，在光标处按顺序插标记。
+fn attach_files(
+    state: &mut AppState,
+    input: &mut InputBox,
+    files: &[PathBuf],
+) -> Option<PasteHint> {
+    for path in files {
+        if state.pending_attachments.iter().any(
+            |attachment| matches!(attachment, Attachment::File { path: existing } if existing == path),
+        ) {
+            continue;
+        }
+        input.reconcile_attachment_markers(state.pending_attachments.len());
+        let insertion_index = input.attachment_insertion_index();
+        state
+            .pending_attachments
+            .insert(insertion_index, Attachment::File { path: path.clone() });
+        input.insert_attachment_marker();
+    }
+    // 文件由输入框内的持久占位符确认，不需要瞬时提示。
+    None
+}
+
 fn apply_clipboard_paste(
     state: &mut AppState,
     input: &mut InputBox,
@@ -6668,70 +6768,98 @@ fn apply_clipboard_paste(
             // 图片会以持久的 `[Image #n]` 占位显示在输入框里，不再叠加瞬时提示。
             None
         }
+        ClipboardPaste::Files(files) => attach_files(state, input, &files),
         ClipboardPaste::Text(pasted) => {
             if let Some(path) = try_resolve_path(pasted.trim()) {
-                let already_attached = state.pending_attachments.iter().any(
-                    |attachment| matches!(attachment, Attachment::File { path: existing } if existing == &path),
-                );
-                if !already_attached {
-                    input.reconcile_attachment_markers(state.pending_attachments.len());
-                    let insertion_index = input.attachment_insertion_index();
-                    state
-                        .pending_attachments
-                        .insert(insertion_index, Attachment::File { path });
-                    input.insert_attachment_marker();
-                }
-                // 文件也由输入框内的持久占位符确认，不需要瞬时提示。
-                None
-            } else {
-                input.insert_text(&pasted);
-                pasted_text_needs_hint(&pasted).then(|| PasteHint {
-                    text: format!(
-                        "[{}]",
-                        wyj_i18n::tr_fmt(
-                            "input.paste_text",
-                            &[("count", &pasted.chars().count().to_string())]
-                        )
-                    ),
-                    expires_at,
-                    cursor_row: input.cursor_row,
-                    cursor_col: input.cursor_col,
-                })
+                return attach_files(state, input, std::slice::from_ref(&path));
             }
+            // 长文本折叠优先于直接插入：占位符已经自我说明（`[Pasted text #1
+            // +250 lines]`），不需要再叠一层 1.5 秒就消失的提示。
+            if fold_paste(state, input, &pasted) {
+                return None;
+            }
+            input.insert_text(&pasted);
+            pasted_text_needs_hint(&pasted).then(|| PasteHint {
+                text: format!(
+                    "[{}]",
+                    wyj_i18n::tr_fmt(
+                        "input.paste_text",
+                        &[("count", &pasted.chars().count().to_string())]
+                    )
+                ),
+                expires_at,
+                cursor_row: input.cursor_row,
+                cursor_col: input.cursor_col,
+            })
         }
     }
 }
 
 fn composer_has_content(state: &AppState, input: &InputBox) -> bool {
-    !input.is_empty() || !state.pending_attachments.is_empty()
+    !input.is_empty() || !state.pending_attachments.is_empty() || !state.pending_pastes.is_empty()
 }
 
-/// 删除输入框光标左侧的内容。若紧邻光标的是附件原子，则同步删除对应结构化附件；
-/// 否则保持普通文本 Backspace 语义。
-fn backspace_composer(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
-    input.reconcile_attachment_markers(attachments.len());
+/// 取出输入框里「不该发给模型之前就丢掉」的东西：折叠的粘贴块必须先按位置
+/// 展开成**原文**，否则 `InputBox::text()` 只会把标记过滤掉，用户贴的三百行
+/// 日志会变成一条空消息。
+///
+/// 返回值第二项把粘贴块**交回给调用方**，不留在 `state` 里：调用方紧接着要用
+/// 「发送瞬间的输入框快照」把它们投影成 `[Pasted text #n +N lines]`
+/// （`render::composer_display_text`），而标记在 `*input = InputBox::new()` 时
+/// 已经没了。在函数内部清掉会让展示投影拿到空列表，聊天区里一个占位符都不剩。
+///
+/// 三处提交路径（主发送 / 忙碌时排队 / 斜杠命令展开）都必须走这里，不要各自
+/// 调 `input.take()`——`take()` 拿不到 `pending_pastes`。
+fn take_composer_text(state: &mut AppState, input: &mut InputBox) -> (String, Vec<PasteBlock>) {
+    let text = input.text_with_pastes(&state.pending_pastes);
+    let pastes = std::mem::take(&mut state.pending_pastes);
+    *input = InputBox::new();
+    (text, pastes)
+}
+
+/// 删除输入框光标左侧的内容。若紧邻光标的是一个原子标记（附件或折叠的粘贴块），
+/// 则**整体**删除并同步删掉对应的结构化数据；否则保持普通文本 Backspace 语义。
+///
+/// 「整体」是硬要求：`[Pasted text #1 +250 lines]` 若允许逐字退格，
+/// 用户会得到一个删掉开头、看起来毫无意义的残片，还误以为内容本来就这么点。
+fn backspace_composer(state: &mut AppState, input: &mut InputBox) {
+    input.reconcile_attachment_markers(state.pending_attachments.len());
+    if let Some(index) = input.paste_marker_before_cursor() {
+        input.backspace();
+        state.pending_pastes.remove(index);
+        return;
+    }
     if let Some(index) = input.attachment_marker_before_cursor() {
         input.backspace();
-        attachments.remove(index);
+        state.pending_attachments.remove(index);
         return;
     }
     input.backspace();
 }
 
-fn delete_composer_forward(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
-    input.reconcile_attachment_markers(attachments.len());
+fn delete_composer_forward(state: &mut AppState, input: &mut InputBox) {
+    input.reconcile_attachment_markers(state.pending_attachments.len());
+    if let Some(index) = input.paste_marker_at_cursor() {
+        input.delete_char_forward();
+        state.pending_pastes.remove(index);
+        return;
+    }
     if let Some(index) = input.attachment_marker_at_cursor() {
         input.delete_char_forward();
-        attachments.remove(index);
+        state.pending_attachments.remove(index);
         return;
     }
     input.delete_char_forward();
 }
 
-fn delete_word_backward_composer(input: &mut InputBox, attachments: &mut Vec<Attachment>) {
-    input.reconcile_attachment_markers(attachments.len());
-    if input.attachment_marker_before_cursor().is_some() {
-        backspace_composer(input, attachments);
+fn delete_word_backward_composer(state: &mut AppState, input: &mut InputBox) {
+    input.reconcile_attachment_markers(state.pending_attachments.len());
+    // Alt+Backspace / Ctrl+W：命中原子标记时退化成整体删除，而不是把占位符
+    // 当普通单词删出 `[Pasted text` 这种半截残片。
+    if input.paste_marker_before_cursor().is_some()
+        || input.attachment_marker_before_cursor().is_some()
+    {
+        backspace_composer(state, input);
     } else {
         input.delete_word_backward();
     }
@@ -6740,6 +6868,7 @@ fn delete_word_backward_composer(input: &mut InputBox, attachments: &mut Vec<Att
 fn clear_composer(state: &mut AppState, input: &mut InputBox) {
     *input = InputBox::new();
     state.pending_attachments.clear();
+    state.pending_pastes.clear();
     state.paste_hint = None;
     state.slash_completions.clear();
     state.file_completions.clear();
@@ -7431,9 +7560,10 @@ mod clipboard_paste_tests {
 
     #[test]
     fn backspace_deletes_text_then_attachments_from_the_right() {
+        let mut state = make_state();
         let mut input = InputBox::new();
         input.insert_text("x");
-        let mut attachments = vec![
+        state.pending_attachments = vec![
             Attachment::Image {
                 media_type: "image/png".to_string(),
                 data: "first".to_string(),
@@ -7446,18 +7576,18 @@ mod clipboard_paste_tests {
             },
         ];
 
-        backspace_composer(&mut input, &mut attachments);
+        backspace_composer(&mut state, &mut input);
         assert!(input.is_empty());
-        assert_eq!(attachments.len(), 2);
+        assert_eq!(state.pending_attachments.len(), 2);
 
-        backspace_composer(&mut input, &mut attachments);
+        backspace_composer(&mut state, &mut input);
         assert!(matches!(
-            attachments.as_slice(),
+            state.pending_attachments.as_slice(),
             [Attachment::Image { data, .. }] if data == "first"
         ));
 
-        backspace_composer(&mut input, &mut attachments);
-        assert!(attachments.is_empty());
+        backspace_composer(&mut state, &mut input);
+        assert!(state.pending_attachments.is_empty());
     }
 
     #[test]
@@ -7476,11 +7606,11 @@ mod clipboard_paste_tests {
         );
         input.insert_text("后");
 
-        backspace_composer(&mut input, &mut state.pending_attachments);
+        backspace_composer(&mut state, &mut input);
         assert_eq!(input.text(), "前");
         assert_eq!(state.pending_attachments.len(), 1);
 
-        backspace_composer(&mut input, &mut state.pending_attachments);
+        backspace_composer(&mut state, &mut input);
         assert_eq!(input.text(), "前");
         assert!(state.pending_attachments.is_empty());
     }
@@ -7501,7 +7631,7 @@ mod clipboard_paste_tests {
         );
         input.move_left();
 
-        delete_composer_forward(&mut input, &mut state.pending_attachments);
+        delete_composer_forward(&mut state, &mut input);
 
         assert_eq!(input.text(), "前");
         assert!(state.pending_attachments.is_empty());
@@ -7525,6 +7655,317 @@ mod clipboard_paste_tests {
 
         assert_eq!(input.take(), "请看这张图");
         assert_eq!(state.pending_attachments.len(), 1);
+    }
+
+    // ── 长文本粘贴折叠（`[Pasted text #n +N lines]`）─────────────────────────
+
+    /// 一段足够长的日志：行数与字符数都远超阈值。
+    fn long_log() -> String {
+        (1..=60)
+            .map(|i| format!("2026-10-16 12:00:{i:02} INFO worker tick {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 用户报的核心症状：粘贴几百行后输入框被灌满、之后打的字完全看不见
+    /// （`draw` 把输入框高度 clamp 到 10 行，`draw_input` 的 `Paragraph` 无
+    /// 滚动且从第 0 行起画，第 9 行之后的内容永远画不出来）。折叠之后无论
+    /// 贴进来多少行，输入框**恒为一行**。
+    #[test]
+    fn a_long_paste_never_grows_the_input_box() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+
+        assert_eq!(
+            input.visual_height(80),
+            1,
+            "折叠后的占位符必须只占一行，粘贴再多也不会灌满可视区"
+        );
+        assert_eq!(state.pending_pastes.len(), 1);
+    }
+
+    #[test]
+    fn short_pastes_stay_inline_and_are_not_folded() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        let short = "见 docs/plan/abc.md 第 3 节".to_string();
+
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(short.clone()));
+
+        assert!(state.pending_pastes.is_empty(), "短文本不该被折叠");
+        assert_eq!(input.text(), short);
+    }
+
+    /// 两个阈值各自独立生效：字符数够就折叠，行数够也折叠。
+    #[test]
+    fn both_fold_thresholds_trigger_independently() {
+        let mut state = make_state();
+        // 4 行但很长
+        let wide = "x".repeat(200);
+        let mut input = InputBox::new();
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(wide));
+        assert_eq!(state.pending_pastes.len(), 1, "≥200 字符即折叠，与行数无关");
+
+        // 很多行但每行很短
+        let mut state2 = make_state();
+        let mut input2 = InputBox::new();
+        let tall = (1..=6)
+            .map(|i| format!("行{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        apply_clipboard_paste(&mut state2, &mut input2, ClipboardPaste::Text(tall));
+        assert_eq!(state2.pending_pastes.len(), 1, "≥5 行即折叠，与字符数无关");
+    }
+
+    /// 折叠只是换个存法，**一个字符都不能少**。这是整个改动里最不能错的一条：
+    /// `text()` 会把 `PASTE_MARKER` 过滤掉，误用 `take()` 就会把用户贴的整段
+    /// 日志变成一条空消息。
+    #[test]
+    fn sending_expands_a_folded_paste_back_to_its_original_text() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        let log = long_log();
+        input.insert_text("看看这个：");
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(log.clone()));
+        input.insert_text("就这些");
+
+        let (text, pastes) = take_composer_text(&mut state, &mut input);
+
+        assert_eq!(text, format!("看看这个：{log}就这些"));
+        assert_eq!(pastes.len(), 1);
+        assert_eq!(pastes[0].text, log);
+        assert_eq!(pastes[0].line_count, 60);
+        assert!(state.pending_pastes.is_empty());
+    }
+
+    /// 占位符是**一个不可分割的原子**：退格要么删掉一个普通字符，要么删掉整个
+    /// 占位符，绝不能停在 `asted text #1 +60 lines]` 这种半截残片上——那既
+    /// 看不懂，也会让人误以为内容本来就这么点。逐次退格全程都不许出现半截。
+    #[test]
+    fn a_folded_paste_is_deleted_whole_never_leaving_a_half_placeholder() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("前");
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+        input.insert_text("后");
+
+        // 一次退格只能删掉「一个东西」：普通字符或**整个**占位符。
+        for expected_pastes in [1, 0, 0] {
+            backspace_composer(&mut state, &mut input);
+            let text = input.text();
+            assert!(
+                !text.contains("Pasted") && !text.contains("lines]"),
+                "退格留下了半截占位符：{text}"
+            );
+            assert_eq!(state.pending_pastes.len(), expected_pastes);
+        }
+        assert!(input.is_empty());
+        assert!(state.pending_pastes.is_empty());
+    }
+
+    /// Delete 的语义基准点是「光标压在占位符上」：一次前进删除抹掉整个占位符，
+    /// 而不是只削掉 `[` 或 `+60 lines]`。
+    #[test]
+    fn delete_key_removes_the_folded_paste_the_cursor_sits_on() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("前");
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+        input.insert_text("后");
+        // line = ['前', M, '后']，光标退到 index 1 正好压在占位符上。
+        input.move_left();
+        input.move_left();
+
+        delete_composer_forward(&mut state, &mut input);
+
+        assert_eq!(input.text(), "前后", "一次删除就抹掉整个占位符");
+        assert!(state.pending_pastes.is_empty());
+    }
+
+    /// Alt+Backspace / Ctrl+W 的基准点是「光标紧跟在占位符后面」：此时删一个词
+    /// 必须退化成删整个占位符，否则会留下 `[Pasted` 这种半截残片。
+    #[test]
+    fn word_delete_after_a_folded_paste_removes_the_whole_placeholder() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("前");
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+        input.insert_text("后");
+        input.move_left();
+
+        delete_word_backward_composer(&mut state, &mut input);
+
+        assert_eq!(input.text(), "前后");
+        assert!(state.pending_pastes.is_empty());
+    }
+
+    /// 删掉中间那个占位符时，编号要跟着重排——否则剩下的会顶着已经
+    /// 不存在的编号，用户点开一看少一块，还以为内容被吞了。
+    #[test]
+    fn deleting_the_middle_of_three_folded_pastes_renumbers_the_rest() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        for _ in 0..3 {
+            apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+            input.insert_text("|");
+        }
+        // 三个粘贴块 + 三个分隔符共 6 个字符，光标在行尾（col 6）；
+        // 退 4 格落在第二个占位符上（col 2）。
+        for _ in 0..4 {
+            input.move_left();
+        }
+
+        delete_composer_forward(&mut state, &mut input);
+
+        assert_eq!(state.pending_pastes.len(), 2);
+        let display = crate::render::composer_display_text(
+            &input,
+            &state.pending_attachments,
+            &state.pending_pastes,
+        );
+        assert_eq!(
+            display.matches("[Pasted text #1 +60 lines]").count(),
+            1,
+            "实际是：{display}"
+        );
+        assert_eq!(
+            display.matches("[Pasted text #2 +60 lines]").count(),
+            1,
+            "剩下的必须重排成 #1/#2，实际是：{display}"
+        );
+    }
+
+    /// 图与长文本可以任意交错，两类编号各自独立：中间插一个粘贴块不能让
+    /// `[Image #2]` 跳成 `#3`，反之亦然。
+    #[test]
+    fn image_and_pasted_text_placeholders_are_numbered_independently() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "left".to_string(),
+                width: 1,
+                height: 1,
+            },
+        );
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Text(long_log()));
+        apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Image {
+                data: "right".to_string(),
+                width: 2,
+                height: 2,
+            },
+        );
+
+        let display = crate::render::composer_display_text(
+            &input,
+            &state.pending_attachments,
+            &state.pending_pastes,
+        );
+        assert!(display.contains("[Image #1]"), "{display}");
+        assert!(display.contains("[Pasted text #1 +60 lines]"), "{display}");
+        assert!(display.contains("[Image #2]"), "{display}");
+    }
+
+    // ── 剪贴板 flavor 判定：文件优先于图片 ───────────────────────────────
+
+    /// 用户报的现象：粘贴文件一律变成 `[Image #n]`。根因是 macOS Finder 复制的
+    /// 文件同时带 `public.file-url` 和 `public.tiff`（文件图标预览），而 arboard
+    /// 的 `get_image()` 恰好读 TIFF。现在文件 flavor 先于图片被认领。
+    #[test]
+    fn clipboard_files_become_file_attachments_not_images() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+
+        let hint = apply_clipboard_paste(
+            &mut state,
+            &mut input,
+            ClipboardPaste::Files(vec![
+                PathBuf::from("/tmp/report.pdf"),
+                PathBuf::from("/tmp/notes.md"),
+            ]),
+        );
+
+        assert!(hint.is_none());
+        assert!(
+            state
+                .pending_attachments
+                .iter()
+                .all(|att| matches!(att, Attachment::File { .. })),
+            "文件不能被当成图片，实际是 {:?}",
+            state.pending_attachments
+        );
+        let display = crate::render::composer_display_text(
+            &input,
+            &state.pending_attachments,
+            &state.pending_pastes,
+        );
+        assert!(display.contains("[File: report.pdf]"), "{display}");
+        assert!(display.contains("[File: notes.md]"), "{display}");
+    }
+
+    #[test]
+    fn duplicate_clipboard_files_are_ignored() {
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        let files = vec![PathBuf::from("/tmp/report.pdf")];
+
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Files(files.clone()));
+        apply_clipboard_paste(&mut state, &mut input, ClipboardPaste::Files(files));
+
+        assert_eq!(state.pending_attachments.len(), 1);
+    }
+
+    /// ↑ 翻出来的历史是展开后的完整正文，回填时若不重新折叠就重现
+    /// 「输入框被灌满、看不见」的老症状。
+    #[test]
+    fn recalling_a_long_history_entry_refolds_it() {
+        let mut state = make_state();
+        let log = long_log();
+        state
+            .input_history
+            .push(format!("帮我看下这段日志：\n{log}"));
+        let mut input = InputBox::new();
+
+        assert!(state.navigate_input_or_history(&mut input, -1));
+
+        assert_eq!(input.visual_height(80), 1, "长历史回填后同样只占一行");
+        assert_eq!(state.pending_pastes.len(), 1);
+        let (text, _) = take_composer_text(&mut state, &mut input);
+        assert_eq!(
+            text,
+            format!("帮我看下这段日志：\n{log}"),
+            "原文必须完整回填"
+        );
+    }
+
+    /// 附件和折叠的粘贴块必须**一起**清掉。只清一半的残留会让下一次粘贴的块
+    /// 拿到错误序号（`[Pasted text #2]` 顶着已经删掉的 #1），而 `text_with_pastes`
+    /// 按序号回填原文，对不上就是**发错内容**——不是显示瑕疵。
+    #[test]
+    fn interrupting_clears_attachments_and_folded_pastes_together() {
+        let mut state = make_state();
+        state.pending_attachments.push(Attachment::File {
+            path: PathBuf::from("/tmp/a.txt"),
+        });
+        state.pending_pastes.push(PasteBlock {
+            text: "残留原文".to_string(),
+            line_count: 1,
+        });
+
+        state.interrupt();
+
+        assert!(state.pending_attachments.is_empty());
+        assert!(
+            state.pending_pastes.is_empty(),
+            "残留的粘贴块会把下一次粘贴的编号顶偏，并按错序号回填原文"
+        );
     }
 
     #[test]
@@ -7871,6 +8312,9 @@ pub struct AppState {
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
     pub pending_attachments: Vec<Attachment>,
+    /// 被折叠的长文本粘贴，与输入框里的 `PASTE_MARKER` 原子一一对应。
+    /// 发送时由 `InputBox::text_with_pastes` 按位置展开回正文。
+    pub pending_pastes: Vec<PasteBlock>,
     /// @ 文件选取器候选列表
     pub file_completions: Vec<FileEntry>,
     /// 当前选中的文件选取器项索引
@@ -8071,6 +8515,7 @@ impl AppState {
             save_needed: false,
             config,
             pending_attachments: vec![],
+            pending_pastes: vec![],
             file_completions: vec![],
             file_selected: 0,
             at_browse_dir: PathBuf::new(),
@@ -8219,7 +8664,7 @@ impl AppState {
         self.todo_execution_logs.clear();
         self.agents_dialog = None;
         self.extensions_dialog = None;
-        self.pending_attachments.clear();
+        self.clear_pending_uploads();
         self.current_op = None;
         self.current_op_started = None;
         self.turn_start_time = None;
@@ -8524,14 +8969,16 @@ impl AppState {
             return false;
         }
         if self.history_idx.is_none() {
-            self.history_draft = Some(input.text());
+            // 存草稿要走展开版：只含折叠粘贴块的输入框，`text()` 返回空串，
+            // 翻历史回来就没了。
+            self.history_draft = Some(input.text_with_pastes(&self.pending_pastes));
         }
         let next = match self.history_idx {
             None => self.input_history.len() - 1,
             Some(idx) => idx.saturating_sub(1),
         };
         self.history_idx = Some(next);
-        input.set_text(&self.input_history[next]);
+        self.load_history_entry(input, next);
         true
     }
 
@@ -8542,12 +8989,42 @@ impl AppState {
         if idx + 1 < self.input_history.len() {
             let next = idx + 1;
             self.history_idx = Some(next);
-            input.set_text(&self.input_history[next]);
+            self.load_history_entry(input, next);
         } else {
             self.history_idx = None;
-            input.set_text(&self.history_draft.take().unwrap_or_default());
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.pending_pastes.clear();
+            input.set_text(&draft);
+            self.refold_loaded_text(input);
         }
         true
+    }
+
+    fn load_history_entry(&mut self, input: &mut InputBox, idx: usize) {
+        let Some(text) = self.input_history.get(idx).cloned() else {
+            return;
+        };
+        self.pending_pastes.clear();
+        input.set_text(&text);
+        self.refold_loaded_text(input);
+    }
+
+    /// 历史里存的是**展开后**的正文（折叠只发生在编辑期，发送时已经还原），
+    /// 所以回填一段长历史会重现粘贴长文本的老问题：内容全进输入框，而输入框只画
+    /// 头 8 行且不滚动。同一套折叠在这里再跑一次，让 ↑ 翻出来的历史和粘贴进来的
+    /// 文本有同样的观感。
+    fn refold_loaded_text(&mut self, input: &mut InputBox) {
+        let text = input.text_with_pastes(&[]);
+        if text.trim().is_empty() {
+            return;
+        }
+        input.set_text("");
+        self.pending_pastes.clear();
+        // 整段作为一块折叠：历史正文已经是一条完整消息，按行切开再拼回去
+        // 只会让 `[Pasted text #n]` 的编号与用户当初看到的对不上。
+        if !fold_paste(self, input, &text) {
+            input.set_text(&text);
+        }
     }
 
     /// 普通 ↑/↓ 永远属于输入框：多行草稿先移动逻辑行，只有到达首/末行后才
@@ -8571,6 +9048,18 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// 清空「已粘/已贴但还没发出去」的全部待发送数据。
+    ///
+    /// 附件与折叠的粘贴块是**同一个原子机制的两半**（`ATTACHMENT_MARKER` /
+    /// `PASTE_MARKER` ↔ `pending_attachments` / `pending_pastes`），只清其中一半
+    /// 就会让编号与标记对不上：残留的 `pending_pastes` 在下一次粘贴时把新块挤到
+    /// 错误的序号上。三个调用点（中断、新会话、/clear）必须走这一个方法，
+    /// 新增待发送通道时也不会漏改。
+    fn clear_pending_uploads(&mut self) {
+        self.pending_attachments.clear();
+        self.pending_pastes.clear();
     }
 
     fn assign_message_id(&mut self, msg: &mut ChatMessage) {
@@ -9282,7 +9771,7 @@ impl AppState {
             let _ = dlg.response_tx.send(false);
         }
         self.exec_mode_confirm = None;
-        self.pending_attachments.clear();
+        self.clear_pending_uploads();
         self.injector = None;
         if !self.pending_queue.is_empty() {
             let n = self.pending_queue.len();
@@ -13127,8 +13616,10 @@ async fn tui_main(
                     }
 
                     // 文本 bracketed paste 和应用直读 Ctrl+V 共用同一套附件/文字逻辑。
-                    // 这里仍优先探测图片，以兼容同时暴露图片与文本 flavor 的剪贴板。
-                    let paste = read_clipboard_image().unwrap_or(ClipboardPaste::Text(pasted));
+                    // 这里只额外探测「同一剪贴板里是不是文件」——**不**碰图片：文本
+                    // 已经拿到了，让 `get_image()` 顶掉它正是文件被误判成 `[Image #n]`
+                    // 的那条路（macOS Finder 复制的文件带 TIFF 图标预览）。
+                    let paste = read_clipboard_files().unwrap_or(ClipboardPaste::Text(pasted));
                     state.paste_hint = apply_clipboard_paste(&mut state, &mut input, paste);
                     update_slash_completions(&mut state, &input, &cmd_registry);
                     update_file_completions(&mut state, &input, &cwd);
@@ -15982,7 +16473,10 @@ async fn tui_main(
                             // 附件占位符的位置只存在于输入框内部（`take()` 之后
                             // 标记就没了），先留一份快照给聊天区展示用。
                             let composer_snapshot = input.clone();
-                            let text = input.take();
+                            // 折叠的粘贴块在这里展开回**原文**：`input.take()`
+                            // 拿不到 `pending_pastes`，用它会把用户贴的内容整段吞掉。
+                            let (text, composer_pastes) =
+                                take_composer_text(&mut state, &mut input);
                             state.slash_completions.clear();
                             state.file_completions.clear();
                             state.history_idx = None;
@@ -16280,7 +16774,7 @@ async fn tui_main(
                                         state.compact_count = 0;
                                         state.tool_schema_tokens = 0;
                                         state.tool_schema_tokens_saved = 0;
-                                        state.pending_attachments.clear();
+                                        state.clear_pending_uploads();
                                         state.turns = 0;
                                         state.tool_call_count = 0;
                                         state.tool_info.clear();
@@ -17236,9 +17730,10 @@ async fn tui_main(
 
                                 // 展示文本从快照投影（必须在 @ 展开之后算：@ 追加的
                                 // 附件没有输入框标记，要作为末尾单列项一起画）
-                                let display_text = crate::render::attachment_display_text(
+                                let display_text = crate::render::composer_display_text(
                                     &composer_snapshot,
                                     &state.pending_attachments,
+                                    &composer_pastes,
                                 );
 
                                 // plan 模式下若历史中已有获批的 ExitPlanMode → 拦截，弹确认框
@@ -17290,9 +17785,13 @@ async fn tui_main(
                         }
                     } else if key.code == KeyCode::Enter && state.is_thinking {
                         // Agent 忙碌期间提交 → 排队，不打断当前操作
-                        if !input.is_empty() || !state.pending_attachments.is_empty() {
+                        if !input.is_empty()
+                            || !state.pending_attachments.is_empty()
+                            || !state.pending_pastes.is_empty()
+                        {
                             let composer_snapshot = input.clone();
-                            let text = input.take();
+                            let (text, composer_pastes) =
+                                take_composer_text(&mut state, &mut input);
                             state.slash_completions.clear();
                             state.file_completions.clear();
                             state.history_idx = None;
@@ -17302,9 +17801,10 @@ async fn tui_main(
                                 &cwd,
                                 &mut state.pending_attachments,
                             );
-                            let display = crate::render::attachment_display_text(
+                            let display = crate::render::composer_display_text(
                                 &composer_snapshot,
                                 &state.pending_attachments,
+                                &composer_pastes,
                             );
                             let attachments = std::mem::take(&mut state.pending_attachments);
                             if let Some(queue) = &state.injector {
@@ -17349,17 +17849,14 @@ async fn tui_main(
                     } else if key.code == KeyCode::Backspace {
                         if key.modifiers.contains(KeyModifiers::ALT) {
                             // Alt+Backspace — 删词
-                            delete_word_backward_composer(
-                                &mut input,
-                                &mut state.pending_attachments,
-                            );
+                            delete_word_backward_composer(&mut state, &mut input);
                         } else {
-                            backspace_composer(&mut input, &mut state.pending_attachments);
+                            backspace_composer(&mut state, &mut input);
                         }
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Delete {
-                        delete_composer_forward(&mut input, &mut state.pending_attachments);
+                        delete_composer_forward(&mut state, &mut input);
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
                     } else if key.code == KeyCode::Home {
@@ -17388,7 +17885,7 @@ async fn tui_main(
                         // Ctrl+W 必须在共享编辑实现**之前**拦下：它要连带删除
                         // 光标前的附件占位标记（`delete_word_backward_composer`），
                         // 纯文本实现不认识附件。
-                        delete_word_backward_composer(&mut input, &mut state.pending_attachments);
+                        delete_word_backward_composer(&mut state, &mut input);
                         update_slash_completions(&mut state, &input, &cmd_registry);
                         update_file_completions(&mut state, &input, &cwd);
                     } else if crate::input::apply_edit_key(&mut input, &key) {
@@ -17561,7 +18058,7 @@ fn reconstruct_display(messages: &[Message]) -> Vec<ChatMessage> {
                 // 图片在聊天流里不留任何痕迹，用户会以为图没发出去。补上
                 // `[Image #n]`：占位符在正文里的原始位置从未落盘（那是输入框
                 // 内部的原子标记），只能在末尾补，编号与实时发送路径
-                // （`render::attachment_display_text`）保持一致。
+                // （`render::composer_display_text`）保持一致。
                 let image_count = msg
                     .content
                     .iter()
@@ -17645,7 +18142,7 @@ mod reconstruct_display_tests {
 
     /// 恢复历史会话时，用户消息里的图片块此前被 `_ => {}` 整个吞掉——
     /// 聊天流里不留任何痕迹，用户会以为当初那张图没发出去。占位符编号
-    /// 必须与实时发送路径（`render::attachment_display_text`）一致。
+    /// 必须与实时发送路径（`render::composer_display_text`）一致。
     #[test]
     fn user_images_survive_into_the_reconstructed_display() {
         let messages = vec![
