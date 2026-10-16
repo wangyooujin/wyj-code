@@ -1370,6 +1370,8 @@ impl Agent {
 
         let mut turn = 0;
         let mut invalid_argument_rounds = 0usize;
+        // 收尾指令只注入一次；注入后仍继续用同样方式撞校验，才落到硬中止。
+        let mut invalid_argument_wrap_up_sent = false;
         // 收尾指令只注入一次；注入后模型仍不交出最终回答，才落到硬中止。
         let mut wrap_up_sent = false;
         loop {
@@ -2159,13 +2161,28 @@ impl Agent {
                                     "拒绝执行无效工具参数"
                                 );
                                 // 协议续轮要求 assistant tool_use 与 tool_result 成对。
-                                // 这里只保存不可执行标记，绝不把解析失败降级成 {} / null。
+                                //
+                                // 写回**模型实际发过的参数**（能解析成 object 时），
+                                // 而不是 `{"_wyj_code_invalid_arguments": true}`
+                                // 这类占位符。占位符看着安全，实则抽掉了纠错所需的
+                                // 唯一信息：模型在下一轮只看得到「哪个字段类型不对」，
+                                // 看不到自己传的是什么，于是照原样重发同一个错参数，
+                                // 空转到重试上限。实测一次真实故障里模型连续 5 轮
+                                // 重发同一个字符串 `tree_id`，历史里每次都只剩占位符。
+                                //
+                                // 只有「连 JSON object 都不是」时才用占位符——此时
+                                // 没有可回写的合法参数，写原始文本会让续轮请求本身
+                                // 变成非法 JSON。
+                                let echo =
+                                    error.original_input.map(|input| *input).unwrap_or_else(|| {
+                                        serde_json::json!({
+                                            "_wyj_code_invalid_arguments": true
+                                        })
+                                    });
                                 assistant_blocks.push(ContentBlock::ToolUse {
                                     id: id.clone(),
                                     name: name.clone(),
-                                    input: serde_json::json!({
-                                        "_wyj_code_invalid_arguments": true
-                                    }),
+                                    input: echo,
                                 });
                                 pending_tools.push(PendingToolCall::Rejected {
                                     id: id.clone(),
@@ -2357,11 +2374,29 @@ impl Agent {
 
                 if invalid_argument_count > 0 {
                     invalid_argument_rounds += 1;
-                    if invalid_argument_rounds > 2 {
-                        anyhow::bail!("工具参数连续校验失败，已停止执行以避免无界重试");
+                    // 连续参数校验失败**不等于任务失败**，与轮数触顶同源：模型
+                    // 往往只是卡在某一个调用的参数形态上，而这一轮里其它工具
+                    // 已经跑出来的成果（截图、搜索、改文件）不该跟着作废。
+                    // 先给一次「换个思路、就地收尾」的机会，只有模型无视该指令
+                    // 继续用同样方式硬撞才中止——那才是真正该报错的形态。
+                    if invalid_argument_rounds >= INVALID_ARGUMENT_GRACE_AT
+                        && !invalid_argument_wrap_up_sent
+                    {
+                        invalid_argument_wrap_up_sent = true;
+                        session.push_user_blocks_merged(vec![ContentBlock::Text {
+                            text: invalid_argument_wrap_up_notice().to_string(),
+                        }]);
+                        on_text(&wyj_i18n::tr("agent.invalid_arguments_wrap_up"));
+                    } else if invalid_argument_rounds > INVALID_ARGUMENT_GRACE_AT + 1 {
+                        anyhow::bail!(
+                            "工具参数连续校验失败（已给过一次收尾指令），已停止执行以避免无界重试"
+                        );
                     }
                 } else {
                     invalid_argument_rounds = 0;
+                    // 出现正常工具轮即视为自愈，重新给一次收尾机会：收尾指令是
+                    // 「本次连撞」的兜底，不是对整轮永久生效的封条。
+                    invalid_argument_wrap_up_sent = false;
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的规约文件，
@@ -2399,9 +2434,9 @@ impl Agent {
                 // 让它自己决定重试还是改用别的方案。
                 //
                 // 注：`input` 无需额外兜底 —— 参数管线失败时 `assistant_blocks`
-                // 里已写入 `{"_wyj_code_invalid_arguments": true}` 之类的合法
-                // JSON 占位（见上方 `PendingToolCall::Rejected` 分支），
-                // 历史里不会出现半截 JSON。
+                // 里已写入模型原始参数，或 `{"_wyj_code_invalid_arguments": true}`
+                // 之类的合法 JSON 占位（见上方 `PendingToolCall::Rejected`
+                // 分支），历史里不会出现半截 JSON。
                 let reason = format!("{stop_reason:?}");
                 let mut results = Vec::new();
                 for pending in &pending_tools {
@@ -2987,6 +3022,33 @@ const LOOP_GUARD_THRESHOLD: usize = 3;
 /// 浪费已经完成的全部工作。4 轮足够它「不再调工具 + 写总结」，同时相对 200
 /// 的总预算可忽略不计。
 const TURN_LIMIT_GRACE: usize = 4;
+
+/// 连续工具参数校验失败到第几轮时，向模型注入一次「换个思路、就地收尾」的指令。
+///
+/// 取 3 而非原来的「3 轮直接 bail」：原实现把「同一类参数错误重复 3 次」直接
+/// 判成整轮失败，把这一轮其它工具已经产出的成果一起丢掉。实测一次真实故障
+/// （模型把 19 位 `tree_id` 反复当字符串发）里，前几轮已经成功完成了窗口枚举、
+/// 截图和菜单列举，最后却因为一个调用的参数形态而整轮中止。现在改成先收尾。
+///
+/// 硬中止保留在 `GRACE_AT + 1` 轮之后：模型无视收尾指令、继续用同样方式硬撞，
+/// 那才是真正需要报错终止的情形。
+const INVALID_ARGUMENT_GRACE_AT: usize = 3;
+
+/// 参数校验连续失败时的收尾指令。措辞要点是**换路径**而不是「再试一次」——
+/// 模型卡住的原因通常是某个调用的参数形态它表达不出来，继续原样重试只会
+/// 复现同一个失败。
+fn invalid_argument_wrap_up_notice() -> &'static str {
+    "<tool-arguments-wrap-up>\n\
+     Several consecutive tool calls were rejected because their arguments did not \
+     match the tool schema. Do not repeat the same call shape again. Either fix the \
+     specific field the error named, or switch to a different tool or approach that \
+     does not need that argument. If the task is already blocked, say so plainly and \
+     report what you learned so far.\n\
+     连续数次工具调用因参数不符合 schema 被拒绝。不要再用同样的参数形态重试。\
+     请修正报错点名的字段，或改用不需要该参数的其他工具与方式；若任务确实卡住，\
+     请如实说明并汇报目前已知的信息。\n\
+     </tool-arguments-wrap-up>"
+}
 
 /// 用户在权限对话框里主动拒绝时回灌给模型的原因。
 ///
@@ -5210,6 +5272,271 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(session.api_calls >= 3);
+    }
+
+    /// 参数校验失败时，历史里必须留着**模型实际发过的参数**。
+    ///
+    /// 一次真实故障（会话 `sess-1792142673-799da7d07fbc`）：模型把 19 位
+    /// `tree_id` 当字符串发了 5 轮，每轮历史里都只剩
+    /// `{"_wyj_code_invalid_arguments": true}`——模型只看到「tree_id 类型不对」，
+    /// 看不到自己传了什么，于是原样重发同一个错误参数，直到触发重试上限把
+    /// 整轮（已完成窗口枚举、截图、菜单列举）作废。
+    #[tokio::test]
+    async fn an_invalid_call_keeps_its_own_arguments_in_history() {
+        let mut agent = Agent::new(Arc::new(SchemaViolationThenTextProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(RequiredCountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        let echoed = session.messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolUse { name, input, .. }
+                        if name == "RequiredEcho" && input["value"] == "wrong"
+                )
+            })
+        });
+        assert!(
+            echoed,
+            "校验失败的工具调用应在历史里保留模型原始参数，让模型能对照纠错"
+        );
+        assert!(
+            !session.messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(
+                        block,
+                        ContentBlock::ToolUse { input, .. }
+                            if input.get("_wyj_code_invalid_arguments").is_some()
+                    )
+                })
+            }),
+            "参数可解析成 object 时不应再用占位符代替它"
+        );
+    }
+
+    struct SchemaViolationThenTextProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for SchemaViolationThenTextProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let events: Vec<Result<StreamEvent>> = if self.calls.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: "bad-enum".into(),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: "bad-enum".into(),
+                        json_delta: r#"{"value":"wrong"}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 连续参数校验失败**不得**把整轮判成失败。
+    ///
+    /// 这是上面那次故障的直接后果：这一轮里窗口枚举、截图、菜单列举都已成功，
+    /// 却因为一个调用的参数形态被 `bail!` 整轮中止。正确形态是先注入一次
+    /// 「换个思路、就地收尾」的指令，模型读到后交出总结，回合正常结束。
+    #[tokio::test]
+    async fn repeated_argument_failures_wrap_up_instead_of_aborting_the_turn() {
+        let mut agent = Agent::new(Arc::new(InvalidThenDeliverProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(RequiredCountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .expect("连续参数校验失败不应中止整轮");
+
+        assert!(
+            session.messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.contains("tool-arguments-wrap-up"))
+                })
+            }),
+            "应向模型注入一次收尾指令"
+        );
+        assert!(
+            session.messages.iter().any(|message| {
+                message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text.contains("here is what I have"))
+                })
+            }),
+            "模型读到收尾指令后应能正常交付，这一轮不该被判成失败"
+        );
+    }
+
+    /// 连撞到触发收尾的那一轮，随后交出总结——这是收尾机制生效的正常路径。
+    struct InvalidThenDeliverProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for InvalidThenDeliverProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n < INVALID_ARGUMENT_GRACE_AT {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: format!("bad-{n}"),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: format!("bad-{n}"),
+                        json_delta: r#"{"value":12}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("here is what I have so far".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 收尾指令只注入一次：反复注入等于给模型续命，防无界重试的闸门就形同虚设。
+    #[tokio::test]
+    async fn the_argument_wrap_up_notice_is_injected_at_most_once_per_streak() {
+        let mut agent = Agent::new(Arc::new(AlwaysInvalidProvider {
+            calls: AtomicUsize::new(0),
+        }));
+        agent.register_tool(Arc::new(RequiredCountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let _ = agent.run_turn(&mut session, &FakeCtx, &mut |_| {}).await;
+
+        let notices = session
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|block| {
+                matches!(block, ContentBlock::Text { text } if text.contains("tool-arguments-wrap-up"))
+            })
+            .count();
+        assert_eq!(notices, 1, "收尾指令只应注入一次，实际 {notices} 次");
+    }
+
+    /// 模型无视收尾指令、继续用同样方式硬撞，才落到硬中止——那才是真正该
+    /// 报错的形态（否则「避免无界重试」这条注释就成了空话）。
+    #[tokio::test]
+    async fn ignoring_the_wrap_up_notice_still_stops_the_runaway_retry() {
+        let mut agent = Agent::new(Arc::new(AlwaysInvalidProvider {
+            calls: AtomicUsize::new(0),
+        }))
+        .with_max_turns(16);
+        agent.register_tool(Arc::new(RequiredCountingTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut session = Session::new();
+        session.push_user("go");
+
+        let error = agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .expect_err("无视收尾指令后仍应硬中止（防续命上界）");
+        assert!(
+            error.to_string().contains("工具参数连续校验失败"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// 无视收尾指令、每轮都重发同一个无效参数。
+    struct AlwaysInvalidProvider {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl Provider for AlwaysInvalidProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events: Vec<Result<StreamEvent>> = if n == 0 {
+                vec![
+                    Ok(StreamEvent::TextDelta("partial".into())),
+                    Ok(StreamEvent::ToolUseStart {
+                        id: format!("bad-{n}"),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: format!("bad-{n}"),
+                        json_delta: r#"{"value":12}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::ToolUseStart {
+                        id: format!("bad-{n}"),
+                        name: "RequiredEcho".into(),
+                    }),
+                    Ok(StreamEvent::ToolUseDelta {
+                        id: format!("bad-{n}"),
+                        json_delta: r#"{"value":12}"#.into(),
+                    }),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::ToolUse,
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
     }
 
     /// `is_allowed` 恒返回 false，用于验证 PreToolUse `Approve` 不能绕过强制策略。

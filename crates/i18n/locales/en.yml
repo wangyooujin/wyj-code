@@ -131,6 +131,7 @@ agent:
   dangling_tool_uses_repaired: "\n[Repaired {count} tool call(s) left without a result by an earlier interruption — they were never executed]\n"
   empty_completion: "\n[Empty response from the model (no text, no tool call). This usually means the endpoint rejected the request — try again, or `/clear` to start a new session if it keeps happening.]\n"
   turn_budget_wrap_up: "\n[Tool loop for this submission has used {turn}/{max} turns — the model has been asked to stop calling tools and summarize its progress now]\n"
+  invalid_arguments_wrap_up: "\n[Tool arguments failed validation several turns in a row — the model has been asked to fix the argument shape or switch approaches, and deliver its current progress]\n"
 
 session:
   busy_notice: "The previous turn is still running — wait for it to finish before doing that."
