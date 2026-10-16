@@ -13,7 +13,7 @@ use crossterm::{
         MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Print, ResetColor, SetForegroundColor},
     terminal::{
         disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
         LeaveAlternateScreen,
@@ -3592,7 +3592,7 @@ mod schedule_permissions_tests {
             cwd.path().to_path_buf(),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         );
@@ -5836,7 +5836,7 @@ mod navigation_focus_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -6757,7 +6757,7 @@ mod clipboard_paste_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -11259,11 +11259,11 @@ pub async fn run_tui(
             let _ = execute!(
                 stdout,
                 Print("\n"),
-                SetForegroundColor(Color::DarkGrey),
+                SetForegroundColor(Theme::to_crossterm(Theme::inactive_color())),
                 Print("恢复此会话："),
                 ResetColor,
                 Print("\n  wyj-code --resume "),
-                SetForegroundColor(Color::Cyan),
+                SetForegroundColor(Theme::to_crossterm(Theme::hint_color())),
                 Print(&resumable_session_id),
                 ResetColor,
                 Print("\n"),
@@ -11275,15 +11275,14 @@ pub async fn run_tui(
     }
 }
 
-/// 循环切换 Agent 模式：Auto → Manual → Plan → Bypass → Auto
+/// 循环切换 Agent 模式：Auto → Plan → Bypass → Auto
 ///
-/// 顺序对齐上游 Shift+Tab 循环（auto 起步，plan 之后才到可选模式）。Bypass
-/// 排最后而不是 auto 之前：它是"用户明说全都放行"的选择，不该出现在
-/// auto→manual 的日常切换路径里。
+/// 三档而不是四档：手动模式已并入 auto（弹窗改由闸门在判 AskUser 时出现），
+/// 用户不该再为「要不要弹窗」单独切一档。Bypass 排最后而不是 auto 之前：它是
+/// "用户明说全都放行"的选择，不该出现在日常切换路径里。
 fn cycle_mode(mode: &AgentMode) -> AgentMode {
     match mode {
-        AgentMode::Auto => AgentMode::Manual,
-        AgentMode::Manual => AgentMode::Plan,
+        AgentMode::Auto => AgentMode::Plan,
         AgentMode::Plan => AgentMode::Bypass,
         AgentMode::Bypass => AgentMode::Auto,
     }
@@ -11820,10 +11819,9 @@ fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
             PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
-        AgentMode::Manual => PermissionMode::Prompt,
-        // Auto 与 Prompt 的差别不在 `evaluate`（两者都放行到这里），而在
-        // `Agent::ensure_tool_permission`：前者先问 AutoGate，只有闸门判
-        // AskUser / 没装闸门时才落到 `confirm_tool` 弹窗。
+        // Auto 在 `evaluate` 层放行，判定全部落在
+        // `Agent::ensure_tool_permission`：先问 AutoGate，只有闸门判 AskUser /
+        // 没装闸门 / 分类器已降级时才落到 `confirm_tool` 弹窗。
         AgentMode::Auto => PermissionMode::Auto,
     }
 }
@@ -11981,6 +11979,26 @@ async fn switch_mode(
 ) {
     *shared_mode.lock().await = new_mode.clone();
     *shared_permission.write().unwrap() = mode_to_permission(&new_mode);
+}
+
+/// 模式切换后同步闸门的分类器开关。
+///
+/// 降级（`AutoGate::disable_classifier`）是一次性的：闸门在这个会话里已经证明
+/// 判定不可靠，切走再切回来**不应该**悄悄恢复它，否则用户按两下 Shift+Tab 就
+/// 把一个反复拒绝的动作重新塞回分类器往返里。反过来，用户在 `/mode` 里**显式
+/// 选中 auto** 是「我知道了，我要重试」的表态，那就要恢复。
+///
+/// 因此只有 `reset` 为真的调用点（`/mode` 的显式选择与启动装配）才重新打开，
+/// Shift+Tab 的循环走 `reset = false`。
+async fn sync_gate_classifier(
+    gate: Option<&Arc<dyn wyj_core::auto_mode::AutoGate>>,
+    mode: &AgentMode,
+    reset: bool,
+) {
+    let Some(gate) = gate else { return };
+    if matches!(mode, AgentMode::Auto) && reset {
+        gate.enable_classifier();
+    }
 }
 
 /// 扫描目录并按过滤词返回文件候选列表
@@ -12872,20 +12890,25 @@ async fn tui_main(
             }
         }
 
-        // ── Auto 模式降级检查 ─────────────────────────────────────────
-        // 分类器连续/累计拦截超阈值后自动退回逐次确认（对齐上游的
-        // "3 consecutive or 20 total"）。只在本会话检查一次：降级后用户手动
-        // 切回 auto 也不重置这个提示位——那正是"这个会话的分类器不太灵"的
-        // 信号，反复提醒没有意义。
+        // ── Auto 分类器降级检查 ───────────────────────────────────────
+        // 连续/累计拦截超阈值后停用分类器：此后只剩确定性规则层，拿不准的
+        // 交回逐次弹窗（对齐上游的 "3 consecutive or 20 total"）。
+        //
+        // 手动模式并入 auto 之后，这里**不能**再"切走"——那会把用户带到一个
+        // 不存在的模式上。可逆的降级只有停用分类器这一个动作：确定性 allow /
+        // hard_deny 都还在，弹窗照旧，hard_deny 也不会因此失效（闸门里两条
+        // 确定性规则排在分类器开关之前）。只在本会话提示一次：反复提醒「这个
+        // 会话的分类器不太灵」没有意义。
         if !auto_degrade_notified && state.mode == AgentMode::Auto {
             let degraded = auto_gate.as_ref().is_some_and(|gate| gate.should_degrade());
             if degraded {
                 auto_degrade_notified = true;
-                switch_mode(&shared_mode, &shared_permission, AgentMode::Manual).await;
-                state.mode = AgentMode::Manual;
-                state
-                    .messages
-                    .push(ChatMessage::system(wyj_i18n::tr("auto.degraded_to_manual")));
+                if let Some(gate) = auto_gate.as_ref() {
+                    gate.disable_classifier();
+                }
+                state.messages.push(ChatMessage::system(wyj_i18n::tr(
+                    "auto.degraded_to_confirm",
+                )));
             }
         }
 
@@ -15418,7 +15441,7 @@ async fn tui_main(
                                     );
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
-                                    let new_mode = AgentMode::Manual;
+                                    let new_mode = AgentMode::Auto;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
@@ -15468,7 +15491,7 @@ async fn tui_main(
                                         current_session_id.clone(),
                                         session_store.as_ref(),
                                     );
-                                    let new_mode = AgentMode::Manual;
+                                    let new_mode = AgentMode::Auto;
                                     switch_mode(&shared_mode, &shared_permission, new_mode.clone())
                                         .await;
                                     state.mode = new_mode;
@@ -16059,6 +16082,9 @@ async fn tui_main(
                                         let label = m.label();
                                         switch_mode(&shared_mode, &shared_permission, m.clone())
                                             .await;
+                                        // 显式 `/mode auto` 是「重试」的表态：
+                                        // 恢复本次会话因拦截过多而停用的分类器。
+                                        sync_gate_classifier(auto_gate.as_ref(), &m, true).await;
                                         state.mode = m;
                                         state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
                                             "mode.switched",
@@ -17733,7 +17759,7 @@ mod sub_agent_ui_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -17887,7 +17913,7 @@ mod cross_session_subagents_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -18570,7 +18596,7 @@ mod ask_question_dialog_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -18612,7 +18638,7 @@ mod session_conflict_dialog_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -18838,7 +18864,7 @@ mod todo_stats_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(SubAgentHub::new()),
         )
@@ -19269,7 +19295,7 @@ mod shell_panel_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -19478,7 +19504,7 @@ mod tool_event_ordering_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )
@@ -20005,7 +20031,7 @@ mod skills_registry_tests {
             PathBuf::from("/tmp"),
             "test-model".to_string(),
             200_000,
-            AgentMode::Manual,
+            AgentMode::Auto,
             Config::default(),
             Arc::new(wyj_tools::SubAgentHub::new()),
         )

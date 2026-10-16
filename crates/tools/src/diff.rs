@@ -14,13 +14,24 @@ const CONTEXT_LINES: usize = 3;
 
 /// 生成行级 diff 文本。
 ///
-/// 格式：上下文行以两个空格开头，删除行以 `- ` 开头，新增行以 `+ ` 开头，
-/// 不输出 `@@ hunk` 头，保持紧凑。**只输出含改动的块**，块之间未被任何改动
-/// 触及的连续未改动行折成一行 `… N unchanged lines`。
+/// 格式：每个变更块前有一行 `@@ -old_start,old_len +new_start,new_len @@`，上下文行以两个
+/// 空格开头，删除行以 `- ` 开头，新增行以 `+ ` 开头。**只输出含改动的块**，块之间未被
+/// 任何改动触及的连续未改动行折成一行 `… N unchanged lines`。
 ///
 /// - `old` / `new` 为原始文本（按行切分）。
-/// - `max_lines` 限制输出行数（含截断提示行），避免超长 diff 撑爆输出。
+/// - `max_lines` 限制输出行数（含 `@@` 头与截断提示行），避免超长 diff 撑爆输出。
 ///   超限时末尾追加 `…(truncated, N more lines)`。
+///
+/// ## 为什么输出 `@@` 头
+///
+/// 渲染层要显示「旧侧/新侧双列行号」，而**行号只能从块头推算**：第一个变更块之前
+/// 被丢掉的未改动内容没有留下任何标记（`… N unchanged lines` 只出现在块**之间**），
+/// 所以渲染端从 1 开始数会把第 100 行的改动标成第 1 行。块头一给出绝对起点，每块都能
+/// 独立重置，多 hunk 文件也就不会一路错位到底。
+///
+/// 用 `@@` 而不是自创格式还有两个理由：它是 unified diff 的既有语法，**模型认识**
+/// （看到 `@@ -12,7 +12,9 @@` 比看到无头的裸 diff 更清楚改动落在哪），且每个块只多
+/// 二十来个字符——相比"每行都加行号前缀"（200 行 diff 多约 400 token），成本可忽略。
 ///
 /// ## 为什么不能遍历「全部行」
 ///
@@ -55,6 +66,7 @@ pub fn make_diff(old: &str, new: &str, max_lines: usize) -> String {
                 rows.push(("", format!("… {skipped} unchanged lines")));
             }
         }
+        rows.push(("@@", hunk_header(&group)));
         for op in &group {
             let (tag, old_range, new_range) = op.as_tag_tuple();
             match tag {
@@ -97,6 +109,22 @@ pub fn make_diff(old: &str, new: &str, max_lines: usize) -> String {
         out.pop();
     }
     out
+}
+
+/// 一个变更块的头行：`@@ -old_start,old_len +new_start,new_len @@`
+///
+/// 起点取 `first` 的 range 起点（+1 转成 1-based），长度取整个块的跨度。
+/// 纯 Insert 块的 `old_range` 是空区间，此时起点表示「插入点落在旧文件第几行之后」——
+/// 渲染层不需要区分这种情况，它只把这行当作"从这里开始数"的锚点。
+fn hunk_header(group: &[similar::DiffOp]) -> String {
+    let (Some(first), Some(last)) = (group.first(), group.last()) else {
+        return String::new();
+    };
+    let old_start = first.old_range().start + 1;
+    let new_start = first.new_range().start + 1;
+    let old_len = last.old_range().end.saturating_sub(first.old_range().start);
+    let new_len = last.new_range().end.saturating_sub(first.new_range().start);
+    format!(" -{old_start},{old_len} +{new_start},{new_len} @@")
 }
 
 /// 新文件专用：整份内容作为纯新增（全行 `+`），用于 Write 创建新文件的场景。
@@ -206,10 +234,49 @@ mod tests {
             !d.contains("truncated"),
             "改动量远低于上限，不该被截断: {d}"
         );
-        // 单个变更块：前后各 3 行上下文 + 1 组 -/+，其余未改动内容不出现。
+        // 单个变更块：一行 `@@` 头 + 前后各 3 行上下文 + 1 组 -/+，其余未改动内容不出现。
         // 没有「跳过」提示是正确的——文件里只有这一处改动，没有东西被跳过。
-        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(lines.len(), 9, "{lines:?}");
         assert!(!d.contains("unchanged lines"), "{d}");
+        // 块头必须给出**绝对**起点：改的是第 250 行，上下文是 247..253，
+        // 所以头行是 -248（248 起、共 7 行）。渲染层靠它把行号钉在源文件位置上，
+        // 从 1 开始数会把这次改动标成第 3 行。
+        assert_eq!(lines[0], "@@ -248,7 +248,7 @@", "{d}");
+    }
+
+    /// 多 hunk 文件里**每块各自**给出自己的起点，渲染层据此逐块重置行号。
+    #[test]
+    fn diff_hunk_headers_carry_absolute_positions_per_block() {
+        let old = (0..40)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old
+            .replacen("line5", "line5_X", 1)
+            .replacen("line30", "line30_Y", 1);
+        let d = make_diff(&old, &new, 200);
+        let headers: Vec<&str> = d.lines().filter(|l| l.starts_with("@@")).collect();
+        assert_eq!(headers.len(), 2, "{d}");
+        // 第一块：改动在第 6 行，上下文 3..9 → 起点 3、共 7 行
+        assert_eq!(headers[0], "@@ -3,7 +3,7 @@", "{d}");
+        // 第二块：改动在第 31 行，上下文 28..34 → 起点 28、共 7 行
+        assert_eq!(headers[1], "@@ -28,7 +28,7 @@", "{d}");
+    }
+
+    /// 在文件末尾追加一行：similar 把它与末行并成一个 Replace 组，头行的新侧
+    /// 长度因此比旧侧多 1。头行必须如实反映这个差异——渲染层要靠它决定新侧行号
+    /// 从哪开始、递增几步。
+    #[test]
+    fn diff_hunk_header_reflects_unequal_old_and_new_lengths() {
+        let old = (0..10)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = format!("{old}\nappended");
+        let d = make_diff(&old, &new, 200);
+        let header = d.lines().find(|l| l.starts_with("@@")).expect("应有块头");
+        assert_eq!(header, "@@ -7,4 +7,5 @@", "{d}");
+        assert!(d.contains("+ appended"), "{d}");
     }
 
     /// 回归钉子：`max_lines` 曾按**总行数**计费，导致文件后部的改动在走到

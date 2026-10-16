@@ -972,9 +972,9 @@ fn workflow_parent_ceiling(
             PermissionMode::Allowlist(allowed) | PermissionMode::Plan(allowed) => {
                 allowed.contains(name)
             }
-            // Auto 与 Prompt 同样不使用工具名白名单：Auto 的准入在闸门里逐次判定，
+            // Auto 同样不使用工具名白名单：Auto 的准入在闸门里逐次判定，
             // 不能用一个静态白名单把没列出的工具一刀切掉。
-            PermissionMode::Prompt | PermissionMode::Auto | PermissionMode::AutoApprove => true,
+            PermissionMode::Auto | PermissionMode::AutoApprove => true,
         })
         .collect();
     allowed_tools.sort();
@@ -1281,6 +1281,9 @@ async fn main() -> Result<()> {
     for warning in &plugin_runtime.warnings {
         eprintln!("[plugin] {warning}");
     }
+    // 先按终端能力降级默认调色板（NO_COLOR / 非 truecolor），再让插件主题
+    // 覆盖——`apply_theme_json` 内部会对插件主题再降级一次，故顺序无关。
+    wyj_tui::theme::apply_terminal_capabilities();
     if let Some(theme) = plugin_runtime.active_theme() {
         if let Err(error) = wyj_tui::apply_theme_json(&theme.palette) {
             eprintln!("[plugin {} theme {}] {error}", theme.plugin, theme.name);
@@ -1479,9 +1482,7 @@ async fn main() -> Result<()> {
     // 却拿到 auto 模式，比启动失败更难排查。
     let mode = match cli.permission_mode.as_deref() {
         Some(value) => AgentMode::parse(value).ok_or_else(|| {
-            anyhow::anyhow!(
-                "无法识别的 --permission-mode `{value}`；可选值：auto、manual、plan、bypass"
-            )
+            anyhow::anyhow!("无法识别的 --permission-mode `{value}`；可选值：auto、plan、bypass")
         })?,
         None if cli.plan => AgentMode::Plan,
         None if cli.bypass_permissions => AgentMode::Bypass,
@@ -1657,7 +1658,6 @@ async fn main() -> Result<()> {
             PermissionMode::Plan(set)
         }
         AgentMode::Bypass => PermissionMode::AutoApprove,
-        AgentMode::Manual => PermissionMode::Prompt,
         AgentMode::Auto => PermissionMode::Auto,
     };
     if !cli.allowed_tools.is_empty() {
@@ -2058,9 +2058,7 @@ async fn main() -> Result<()> {
         let mode_info = match mode {
             AgentMode::Plan => wyj_i18n::tr("main.mode_info_plan"),
             AgentMode::Bypass => wyj_i18n::tr("main.mode_info_bypass"),
-            // Auto 在 headless 下是**默认**行为，提示它只会变成每次启动的噪音；
-            // Manual 才需要告诉用户"这次会逐次等你点头"。
-            AgentMode::Manual => wyj_i18n::tr("main.mode_info_manual"),
+            // Auto 在 headless 下是**默认**行为，提示它只会变成每次启动的噪音。
             AgentMode::Auto => String::new(),
         };
         if !mode_info.is_empty() {
