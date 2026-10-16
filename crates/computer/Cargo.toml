@@ -27,7 +27,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # 依赖不增加编译体积，只是让 wyj-computer 能直接使用系统安全边界。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGSession", "libc"] }
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFDate", "CFDictionary", "CFMachPort", "CFNumber", "CFRunLoop", "CFString"] }
-objc2-application-services = { version = "0.3", default-features = false, features = ["AXActionConstants", "AXAttributeConstants", "AXError", "AXUIElement", "HIServices", "libc", "objc2-core-graphics"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFMachPort", "CFNumber", "CFRunLoop", "CFString"] }
+objc2-application-services = { version = "0.3", default-features = false, features = ["AXActionConstants", "AXAttributeConstants", "AXError", "AXUIElement", "AXValue", "HIServices", "libc", "objc2-core-graphics"] }
 
 [dev-dependencies]

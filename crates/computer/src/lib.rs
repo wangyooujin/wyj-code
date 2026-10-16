@@ -8,6 +8,10 @@
 #[cfg(target_os = "macos")]
 pub mod accessibility;
 pub mod activity;
+#[cfg(target_os = "macos")]
+pub mod element;
+#[cfg(target_os = "macos")]
+pub mod menu;
 pub mod scale;
 pub mod target;
 #[cfg(target_os = "macos")]
