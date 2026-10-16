@@ -9,6 +9,32 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// 的光标位置，并自然参与左右移动、换行和普通文字插入。
 pub(crate) const ATTACHMENT_MARKER: char = '\u{fffc}';
 
+/// 被折叠的长文本粘贴在编辑器里的内部原子标记。
+///
+/// 语义与 [`ATTACHMENT_MARKER`] 完全平行：一个标记 ↔ `pending_pastes` 里的
+/// 一段原文，参与左右移动、换行、Ctrl+K/U 的标记保全，并随粘贴位置停在原处。
+/// 与附件的差别只在**展开方向**：附件展开成 `[Image #1]` 这种只读占位符就结束
+/// （内容走结构化通道），粘贴块必须在**发送时**把原文填回正文——否则模型收到
+/// 的就只有一句 `[Pasted text #1]`，等于把用户贴的东西吞了。
+///
+/// 取 Unicode 私用区 U+E0000：用户实际粘贴的文本几乎不可能命中，
+/// 而 `text()` 之后还要按这个字符做过滤，撞上一个真实字符就会静默吃掉内容。
+pub(crate) const PASTE_MARKER: char = '\u{e0000}';
+
+/// 这两个标记都必须被 `text()` 过滤掉，且在所有编辑原语里同等地当作
+/// 「一个不可分割的原子」。写漏任何一处，占位符就会在正文里漏出控制字符，
+/// 或者只能被删掉半个（`[Pasted text #1]` 被退格成 `asted text #1`）。
+#[inline]
+pub(crate) fn is_atomic_marker(ch: char) -> bool {
+    ch == ATTACHMENT_MARKER || ch == PASTE_MARKER
+}
+
+/// 保留标记的字符过滤器：Ctrl+K / Ctrl+U 会把整段正文删掉，但标记必须活着，
+/// 否则删一次行尾就把已经粘贴进来的附件/长文本从编辑序列里弄丢了。
+fn keep_markers_only(ch: char) -> bool {
+    is_atomic_marker(ch)
+}
+
 /// 光标前一个字符是不是反斜杠 —— Claude Code 用的第三种换行写法
 ///（行尾打一个 `\` 再按 Enter）。在不支持 Shift+Enter 的终端里，这是唯一
 /// 不依赖键盘协议的换行方式。
@@ -209,14 +235,23 @@ impl InputBox {
         self.insert_char(ATTACHMENT_MARKER);
     }
 
+    /// 在当前光标处插入一个「已折叠的长文本粘贴」原子。
+    pub(crate) fn insert_paste_marker(&mut self) {
+        self.insert_char(PASTE_MARKER);
+    }
+
     /// 输入框内当前有多少个附件原子标记。**每个标记对应 `pending_attachments`
     /// 里的前 N 项**（粘贴路径保证一一对应，`reconcile_attachment_markers` 负责
     /// 修复旧状态漂移），因此 `attachments[N..]` 就是「没有占位符、只能在消息
     /// 末尾单列」的那些。
     pub(crate) fn attachment_marker_count(&self) -> usize {
+        self.count_markers(ATTACHMENT_MARKER)
+    }
+
+    fn count_markers(&self, marker: char) -> usize {
         self.lines
             .iter()
-            .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+            .map(|line| line.chars().filter(|ch| *ch == marker).count())
             .sum()
     }
 
@@ -237,20 +272,25 @@ impl InputBox {
     }
 
     fn attachment_marker_ordinal_at(&self, row: usize, col: usize) -> Option<usize> {
-        let marker = self.lines.get(row)?.chars().nth(col)?;
-        if marker != ATTACHMENT_MARKER {
+        self.marker_ordinal_at(row, col, ATTACHMENT_MARKER)
+    }
+
+    /// 某个原子标记在整段编辑序列里的序号（0 起），非标记处返回 `None`。
+    /// 附件与粘贴块各自从 0 独立编号，各自对应自己那个 Vec 的下标。
+    fn marker_ordinal_at(&self, row: usize, col: usize, marker: char) -> Option<usize> {
+        if self.lines.get(row)?.chars().nth(col)? != marker {
             return None;
         }
 
         Some(
             self.lines[..row]
                 .iter()
-                .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+                .map(|line| line.chars().filter(|ch| *ch == marker).count())
                 .sum::<usize>()
                 + self.lines[row]
                     .chars()
                     .take(col)
-                    .filter(|ch| *ch == ATTACHMENT_MARKER)
+                    .filter(|ch| *ch == marker)
                     .count(),
         )
     }
@@ -265,26 +305,51 @@ impl InputBox {
         self.attachment_marker_ordinal_at(self.cursor_row, self.cursor_col)
     }
 
+    pub(crate) fn paste_marker_before_cursor(&self) -> Option<usize> {
+        (self.cursor_col > 0)
+            .then(|| self.marker_ordinal_at(self.cursor_row, self.cursor_col - 1, PASTE_MARKER))
+            .flatten()
+    }
+
+    pub(crate) fn paste_marker_at_cursor(&self) -> Option<usize> {
+        self.marker_ordinal_at(self.cursor_row, self.cursor_col, PASTE_MARKER)
+    }
+
     /// 新附件应插入结构化附件向量的位置。顺序按编辑器中的可视位置计算，而不是
     /// 一律追加到末尾，保证用户把光标移到前文后再粘贴时，标记、编号、删除和发送
     /// 顺序仍指向同一个附件。
     pub(crate) fn attachment_insertion_index(&self) -> usize {
+        self.marker_insertion_index(ATTACHMENT_MARKER)
+    }
+
+    /// 新粘贴块应插入 `pending_pastes` 的位置，与 [`Self::attachment_insertion_index`]
+    /// 同理：按编辑序列里的真实位置算，发送时的展开顺序才不会和屏幕上看到的不一致。
+    pub(crate) fn paste_insertion_index(&self) -> usize {
+        self.marker_insertion_index(PASTE_MARKER)
+    }
+
+    fn marker_insertion_index(&self, marker: char) -> usize {
         self.lines[..self.cursor_row]
             .iter()
-            .map(|line| line.chars().filter(|ch| *ch == ATTACHMENT_MARKER).count())
+            .map(|line| line.chars().filter(|ch| *ch == marker).count())
             .sum::<usize>()
             + self.lines[self.cursor_row]
                 .chars()
                 .take(self.cursor_col)
-                .filter(|ch| *ch == ATTACHMENT_MARKER)
+                .filter(|ch| *ch == marker)
                 .count()
     }
 
     fn remove_attachment_marker(&mut self, ordinal: usize) -> bool {
+        self.remove_marker(ordinal, ATTACHMENT_MARKER)
+    }
+
+    /// 按序号删掉一个原子标记，并把落在它右侧的同标记光标列号左移一格。
+    fn remove_marker(&mut self, ordinal: usize, marker: char) -> bool {
         let mut seen = 0usize;
         for row in 0..self.lines.len() {
             let marker_col = self.lines[row].chars().enumerate().find_map(|(col, ch)| {
-                if ch != ATTACHMENT_MARKER {
+                if ch != marker {
                     return None;
                 }
                 if seen == ordinal {
@@ -392,10 +457,10 @@ impl InputBox {
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
         let mut pos = self.cursor_col;
-        while pos > 0 && chars[pos - 1] != ATTACHMENT_MARKER && !chars[pos - 1].is_alphanumeric() {
+        while pos > 0 && !is_atomic_marker(chars[pos - 1]) && !chars[pos - 1].is_alphanumeric() {
             pos -= 1;
         }
-        if pos > 0 && chars[pos - 1] == ATTACHMENT_MARKER {
+        if pos > 0 && is_atomic_marker(chars[pos - 1]) {
             self.cursor_col = pos;
             return;
         }
@@ -417,11 +482,10 @@ impl InputBox {
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
         let mut pos = self.cursor_col;
-        while pos < chars.len() && chars[pos] != ATTACHMENT_MARKER && !chars[pos].is_alphanumeric()
-        {
+        while pos < chars.len() && !is_atomic_marker(chars[pos]) && !chars[pos].is_alphanumeric() {
             pos += 1;
         }
-        if pos < chars.len() && chars[pos] == ATTACHMENT_MARKER {
+        if pos < chars.len() && is_atomic_marker(chars[pos]) {
             self.cursor_col = pos;
             return;
         }
@@ -462,7 +526,7 @@ impl InputBox {
         let byte = self.cursor_byte_offset();
         let markers = self.lines[self.cursor_row][byte..]
             .chars()
-            .filter(|ch| *ch == ATTACHMENT_MARKER)
+            .filter(|ch| keep_markers_only(*ch))
             .collect::<String>();
         self.lines[self.cursor_row].truncate(byte);
         self.lines[self.cursor_row].push_str(&markers);
@@ -476,7 +540,7 @@ impl InputBox {
         let byte = self.cursor_byte_offset();
         let markers = self.lines[self.cursor_row][..byte]
             .chars()
-            .filter(|ch| *ch == ATTACHMENT_MARKER)
+            .filter(|ch| keep_markers_only(*ch))
             .collect::<String>();
         let rest = self.lines[self.cursor_row].split_off(byte);
         self.lines[self.cursor_row] = format!("{markers}{rest}");
@@ -504,16 +568,16 @@ impl InputBox {
 
     /// 整体替换输入框内容（历史导航整体替换时用）：先清空再复用 insert_text 的换行/字符处理
     pub fn set_text(&mut self, text: &str) {
-        let anchors = self.attachment_marker_positions();
+        let anchors = self.atom_marker_positions();
         *self = Self::new();
         self.insert_text(
             &text
                 .chars()
-                .filter(|ch| *ch != ATTACHMENT_MARKER)
+                .filter(|ch| !is_atomic_marker(*ch))
                 .collect::<String>(),
         );
-        for (row, col) in anchors {
-            self.insert_attachment_marker_at_text_position(row, col);
+        for (row, col, marker) in anchors {
+            self.insert_marker_at_text_position(row, col, marker);
         }
         self.cursor_row = self.lines.len().saturating_sub(1);
         self.cursor_col = self.lines[self.cursor_row].chars().count();
@@ -522,29 +586,64 @@ impl InputBox {
     pub fn is_empty(&self) -> bool {
         self.lines
             .iter()
-            .all(|line| line.chars().all(|ch| ch == ATTACHMENT_MARKER))
+            .all(|line| line.chars().all(is_atomic_marker))
     }
 
-    /// 返回纯文字内容；内部附件原子永远不会泄漏到历史记录或 Provider 正文。
+    /// 返回纯文字内容；内部原子标记永远不会泄漏到历史记录或 Provider 正文。
+    ///
+    /// **折叠的粘贴块在这一步也只会消失、不在这里展开**——`text()` 拿不到
+    /// `pending_pastes`。凡是发往模型或存进历史的正文都必须走
+    /// [`Self::text_with_pastes`]；误用这里的后果是用户贴的三百行日志变成空消息。
     pub(crate) fn text(&self) -> String {
         self.lines
             .iter()
             .map(|line| {
                 line.chars()
-                    .filter(|ch| *ch != ATTACHMENT_MARKER)
+                    .filter(|ch| !is_atomic_marker(*ch))
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn attachment_marker_positions(&self) -> Vec<(usize, usize)> {
+    /// 返回发往模型的正文：折叠的粘贴块按其在编辑序列里的位置展开回**原文**。
+    ///
+    /// 编号从 0 起，与 `pending_pastes` 的下标一一对应。展开是纯文本拼接，
+    /// 不引入任何占位符残留——模型必须看到用户真正贴进来的内容。数量对不上
+    /// （理论上不会发生，`apply_clipboard_paste` 一次插一个标记）时多余的标记
+    /// 仍然按 `text()` 的规则被丢掉，而不是漏成控制字符。
+    pub(crate) fn text_with_pastes(&self, pastes: &[crate::app::PasteBlock]) -> String {
+        let mut out = String::new();
+        let mut idx = 0usize;
+        for (row, line) in self.lines.iter().enumerate() {
+            if row > 0 {
+                out.push('\n');
+            }
+            for ch in line.chars() {
+                match ch {
+                    ATTACHMENT_MARKER => {}
+                    PASTE_MARKER => {
+                        if let Some(block) = pastes.get(idx) {
+                            out.push_str(&block.text);
+                        }
+                        idx += 1;
+                    }
+                    c => out.push(c),
+                }
+            }
+        }
+        out
+    }
+
+    /// 记录全部原子标记在**纯文字**坐标系下的位置与类型，供 `set_text`
+    /// 重建——位置记的是字符序号而不是字节偏移，重建时才不必再看旧字符串。
+    fn atom_marker_positions(&self) -> Vec<(usize, usize, char)> {
         let mut positions = Vec::new();
         for (row, line) in self.lines.iter().enumerate() {
             let mut text_col = 0usize;
             for ch in line.chars() {
-                if ch == ATTACHMENT_MARKER {
-                    positions.push((row, text_col));
+                if is_atomic_marker(ch) {
+                    positions.push((row, text_col, ch));
                 } else {
                     text_col += 1;
                 }
@@ -553,17 +652,17 @@ impl InputBox {
         positions
     }
 
-    fn insert_attachment_marker_at_text_position(&mut self, row: usize, col: usize) {
+    fn insert_marker_at_text_position(&mut self, row: usize, col: usize, marker: char) {
         let row = row.min(self.lines.len().saturating_sub(1));
         let text_len = self.lines[row]
             .chars()
-            .filter(|ch| *ch != ATTACHMENT_MARKER)
+            .filter(|ch| !is_atomic_marker(*ch))
             .count();
         let target = col.min(text_len);
         let mut text_col = 0usize;
         let mut byte = self.lines[row].len();
         for (offset, ch) in self.lines[row].char_indices() {
-            if ch == ATTACHMENT_MARKER {
+            if is_atomic_marker(ch) {
                 continue;
             }
             if text_col == target {
@@ -572,7 +671,7 @@ impl InputBox {
             }
             text_col += 1;
         }
-        self.lines[row].insert(byte, ATTACHMENT_MARKER);
+        self.lines[row].insert(byte, marker);
     }
 
     /// 返回光标相对于输入框的绝对显示列偏移（用于渲染光标）
