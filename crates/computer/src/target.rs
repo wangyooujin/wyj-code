@@ -49,6 +49,34 @@ impl WindowTarget {
             self.y as f64 + sy as f64 * self.height as f64 / self.target_height as f64,
         ))
     }
+
+    /// [`Self::screenshot_to_global`] 的逆运算：把 AX 报告的全局逻辑坐标换算回
+    /// 最近一次窗口截图的像素坐标，供元素列表与截图对照。
+    ///
+    /// AX 报告的 `AXPosition`/`AXSize` 可能落在窗口矩形之外（多显示器布局、
+    /// 窗口溢出屏幕、AX 报告延迟）。实机实测 Ghostty 的滚动条
+    /// `frame=(1902,574,19x500)` 在 1920 宽的窗口里映射出截图坐标 2853——
+    /// 直接交给模型会让它点一个不存在的位置。因此越界一律夹取到捕获边界内，
+    /// 由调用方决定是丢弃还是保留（[`crate::element`] 选择丢弃）。
+    pub fn global_to_screenshot(&self, gx: f64, gy: f64) -> Option<(f64, f64)> {
+        if self.target_width == 0 || self.target_height == 0 {
+            return None;
+        }
+        let scale_x = self.target_width as f64 / self.width as f64;
+        let scale_y = self.target_height as f64 / self.height as f64;
+        if !(scale_x.is_finite() && scale_y.is_finite()) || self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let sx = (gx - self.x as f64) * scale_x;
+        let sy = (gy - self.y as f64) * scale_y;
+        if !sx.is_finite() || !sy.is_finite() {
+            return None;
+        }
+        Some((
+            sx.clamp(0.0, f64::from(self.target_width - 1)),
+            sy.clamp(0.0, f64::from(self.target_height - 1)),
+        ))
+    }
 }
 
 /// FNV-1a 64-bit：不依赖进程随机种子，便于工具调用间稳定校验。
