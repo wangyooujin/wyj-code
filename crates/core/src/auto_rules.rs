@@ -46,6 +46,15 @@ pub const DEFAULT_SOFT_DENY: &[&str] = &[
     "Never send content, cookies, or credentials off-origin with a browser automation tool.",
     "Never expose a local service to the public internet via a tunnel or reverse shell.",
     "Never install packages from a public registry when the environment declares an internal registry, unless the user asked for it.",
+    // ── 桌面 GUI 的高风险形态 ────────────────────────────────────────────
+    //
+    // 与 DEFAULT_ALLOW 里的 GUI 条目配对：导航界面是日常操作，但**产生对外
+    // 可见后果**的那一步不是。只在这几个动作上要求用户点名授权，其余 GUI
+    // 操作一律走 allow。
+    "Never send a message, post, comment, or email from the user's account unless the user named this exact message and asked you to send it.",
+    "Never confirm a purchase, payment, subscription, or financial transaction, and never accept terms of service, cookie banners, or one-time codes on the user's behalf unless the user asked for that exact transaction.",
+    "Never permanently delete data through a GUI — emptying the trash, confirming a delete dialog, wiping an app's data — unless the user named that data and asked for its deletion.",
+    "Never change system settings, permissions, firewall rules, keychain entries, or login credentials through a GUI unless the user asked for that specific change.",
 ];
 
 /// 内置 allow：明确安全、免审直放。
@@ -60,6 +69,23 @@ pub const DEFAULT_ALLOW: &[&str] = &[
     "Deleting exactly the processes, jobs, or temporary files this session created.",
     "Reading, reviewing, or writing security-related code, configuration, and threat models as part of the task.",
     "Exchanging messages with other agents in this same session.",
+    // ── 桌面 GUI 操作 ──────────────────────────────────────────────────
+    //
+    // 这组规则此前完全缺失，导致 GUI 任务寸步难行：`app_computer` 的每个变更
+    // 动作都 100% 落进分类器（`deterministic_allow` 的 match 只覆盖
+    // Write/Edit/NotebookEdit/Bash），而 allow 清单里没有任何一条提到鼠标、
+    // 键盘、窗口，prompt 又写着「When uncertain, answer deny」——于是每个点击
+    // 都被判 deny，而每次重试都要重付一次分类器往返。
+    //
+    // 语义边界：**读界面与在界面里导航是日常操作**，不构成风险面。真正的
+    // 高风险形态（付款、发送消息、删除、改设置、提交表单）在 soft_deny 里
+    // 单独点名，用户明确要求时才豁免。
+    "Taking a screenshot of the screen or of a single application window.",
+    "Listing windows, reading an application's menu bar, and reading its accessibility element tree.",
+    "Clicking, scrolling, and moving focus inside an application window to navigate its interface: opening a menu, selecting an item, switching tabs, scrolling a list, expanding a collapsed section.",
+    "Typing text into a field the user asked you to fill in, and pressing keys to navigate an application (tab, arrow, escape, page up/down).",
+    "Launching an application the user named, and bringing an application window into view.",
+    "Using an application's own menu commands for routine work — File/New, Edit/Undo, View toggles, Window/Minimize — when the task requires it.",
 ];
 
 /// 内置 environment：告诉分类器「什么算信任边界之内」。

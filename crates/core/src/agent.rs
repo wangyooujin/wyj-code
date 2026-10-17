@@ -2721,10 +2721,16 @@ impl Agent {
             }
         }
         if !ctx.confirm_tool(name, &summary).await {
-            if let Some(gate) = gate.as_ref() {
-                gate.note_human_approval();
-            }
             return Err(USER_DENIED_REASON.to_string());
+        }
+        // 用户批准后必须通知闸门清空连续计数，否则闸门仍认为「刚刚连撞」。
+        //
+        // 之前这段通知挂在**拒绝**分支上（方向反了），而 `note_human_approval`
+        // 的文档写的是「用户批准了一次，清空连续计数」。后果有两个：用户点了
+        // 10 次「允许」不会打断连续计数（闸门仍然在数着上几次的 deny），
+        // 反而是用户点「拒绝」——那是最强的「不该放行」信号——把计数清零了。
+        if let Some(gate) = gate.as_ref() {
+            gate.note_human_approval();
         }
         self.grant_for_turn(name, input);
         Ok(())
