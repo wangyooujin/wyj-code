@@ -9,6 +9,8 @@
 pub mod accessibility;
 pub mod activity;
 #[cfg(target_os = "macos")]
+pub mod cursor_click;
+#[cfg(target_os = "macos")]
 pub mod element;
 #[cfg(target_os = "macos")]
 pub mod menu;

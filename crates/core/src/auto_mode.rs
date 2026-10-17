@@ -359,11 +359,30 @@ impl AutoGateImpl {
     /// 大概率复现同一个坏输出；必须让第二次请求的输入**真的不同**（多一句
     /// "只吐 JSON"），重试才可能翻盘。
     fn build_prompt(&self, request: &AutoReviewRequest, retry: bool) -> String {
-        let goal = self.user_goal.lock().map(|g| g.clone()).unwrap_or_default();
-        let goal = if goal.is_empty() {
-            "(unknown)"
+        // 必须读 `request.user_goal`（调用方每轮填好），不是 `self.user_goal`。
+        //
+        // 后者是接线 bug 的产物：`set_user_goal` 全仓零调用方，而 Agent 一直
+        // 在 `AutoReviewRequest.user_goal` 里认真填了本轮请求。结果是
+        // `<user_request>` **恒为字面量 `(unknown)`**。而分类器 prompt 的第 2
+        // 层（soft deny 可被「用户明确要求」豁免）与第 4 层（explicit user
+        // intent）都要求「用户的请求直接具体地描述了这个动作」——读不到用户
+        // 说了什么，它对任何需要判断的动作只能按「不确定就 deny」走。
+        //
+        // 回退到 `self.user_goal` 是为了不破坏显式设置过它的调用方（目前没有，
+        // 但它是 pub API）。
+        let request_goal = request.user_goal.trim();
+        let stored_goal = self
+            .user_goal
+            .lock()
+            .ok()
+            .map(|guard| guard.trim().to_string());
+        let goal = if !request_goal.is_empty() {
+            request_goal
         } else {
-            goal.as_str()
+            match stored_goal.as_deref() {
+                Some(stored) if !stored.is_empty() => stored,
+                _ => "(unknown)",
+            }
         };
         let mut out = String::new();
         out.push_str("<user_request>\n");
@@ -471,6 +490,12 @@ impl AutoGate for AutoGateImpl {
 
         if let Some(reason) = self.deterministic_allow(request) {
             tracing::trace!(tool = %request.tool, %reason, "auto 确定性放行");
+            // 确定性放行必须同样清空连续计数。它与 `apply_verdict(Allow)`
+            // 走的是同一个语义——一次被确认安全的动作——之前这里直接 return
+            // 绕过了记账，于是 `deny → 只读命令 → deny → 只读命令 → deny`
+            // 依然凑满连续阈值。对 GUI 任务尤其致命：截图/列举元素这类**本来
+            // 就是**合法的只读调用，却一点都断不了连续计数。
+            self.note_human_approval();
             return AutoVerdict::Allow;
         }
 
@@ -533,7 +558,13 @@ impl AutoGate for AutoGateImpl {
     fn enable_classifier(&self) {
         self.classifier_off.store(false, Ordering::Relaxed);
         if let Ok(mut counters) = self.counters.lock() {
+            // `total` 也必须清：它只增不减，而 `should_degrade` 是
+            // `consecutive >= 连续阈值 || total >= 累计阈值`。只清 consecutive
+            // 的话，若这次降级是由 total 触发的，`/mode auto` 之后
+            // `should_degrade()` **立刻仍为 true**——用户看到的现象是
+            // 「明明重新选了 auto，状态栏还是显示已降级」。
             counters.consecutive = 0;
+            counters.total = 0;
             counters.degraded = false;
         }
     }
