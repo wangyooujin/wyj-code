@@ -3024,25 +3024,31 @@ fn title_token_text(state: &AppState) -> String {
     )
 }
 
-/// 输入框标题栏 thinking 指示器的基础文案（即"每一步操作的名字"，不含 spinner 帧）。
+/// 输入框标题栏 thinking 指示器的基础文案（即"这一步在做什么"，不含 spinner 帧
+/// 与「第 N 步」前缀）。
 ///
 /// 优先级（从最具辨识度到默认）：
 ///   1. `permission_dialog` → "Waiting for approval"
 ///   2. `plan_dialog`       → "Reviewing plan"
-///   3. `current_op` 原文（如 `"Bash(cargo test)"` / `"Read(src/app.rs)"`）——
-///      直接显示工具名 + 参数，信息量高于旧的固定短语映射
-///   4. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的任务名
-///   5. `pending_queue`    → "Queuing message"
-///   6. fallback           → "Thinking"
+///   3. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的**意图**：
+///      "修复登录 bug" 比 "Edit" 更能回答"这一轮到底在干什么"
+///   4. `current_tool_name` —— 只有工具名（`Bash` / `Read`），**不带参数**。
+///      参数已经完整画在聊天区的 `⏺ Bash(cargo test)` 上，标题栏复述一遍就是
+///      逐字节重复：底部那行与聊天区最后一条永远一模一样，用户看着像卡住了。
+///      两处分工是「聊天区答'在做什么动作'，标题栏答'为哪件事、第几步'」。
+///   5. `current_op` 原文 —— 仅剩非工具型后台任务（`/compact` 等，见
+///      `begin_background_task`，那里 `current_tool_name` 为 None）
+///   6. `pending_queue`    → "Queuing message"
+///   7. fallback           → "Thinking"
 ///
-/// **两个对话框必须排在 `current_op` 前面**：`Agent::exec_tool_call` 是先
+/// **两个对话框必须排在前面**：`Agent::exec_tool_call` 是先
 /// `emit ToolEvent::Start`（TUI 据此写 `current_op`）再走 `ensure_tool_permission`
 /// ——见 `crates/core/src/agent.rs`。所以权限弹窗打开期间 `current_op` 一定
 /// 非空，旧顺序下标题栏永远显示 `Bash(cargo test) · 12.3s` 且秒表继续走，
 /// 看着"在忙"实则整轮卡在等用户点 y；`plan_dialog` 同理。
 ///
 /// 由 `draw_input` 标题栏调用，格式化为
-/// `⠋ {label} · {耗时} · {token}`。
+/// `⠋ {第 N 步 · }{label} · {耗时} · {token}`。
 fn thinking_status_label(state: &AppState) -> String {
     // 1/2. 正在等用户交互：这是**阻塞在用户身上**而非在跑工具，必须先于
     //      `current_op` 判定，否则秒表会把"等审批的时间"算成"命令跑了多久"。
@@ -3053,13 +3059,8 @@ fn thinking_status_label(state: &AppState) -> String {
         return wyj_i18n::tr("spinner.reviewing_plan");
     }
 
-    // 3. 当前步骤原文：`ToolStart` 记下的 `"Bash(cargo test)"` 形式。
-    //    旧实现把它降级成 "Running command" 这类固定短语，标题栏因此看不出
-    //    到底在跑哪条命令 / 改哪个文件；现在直接给原文，长度由调用方截断兜底。
-    if let Some(op) = state.current_op.as_deref() {
-        return op.to_string();
-    }
-
+    // 3. 有任务清单时先答"为哪件事"：工具名每几步就会换，任务名才是用户
+    //    真正在追的进度。缺这一步的话，标题栏与聊天区的工具行仍是同义反复。
     if let Some(task) = state
         .current_todos
         .as_deref()
@@ -3074,11 +3075,34 @@ fn thinking_status_label(state: &AppState) -> String {
             .to_string();
     }
 
+    // 4. 工具名（不带参数）：参数在聊天区 `⏺ Bash(cargo test)` 上已经完整可见。
+    if let Some(name) = state.current_tool_name.as_deref() {
+        return name.to_string();
+    }
+
+    // 5. 非工具型后台任务（`/compact` / `/checkpoint` …）只有 `current_op`，
+    //    它本身就是那句标签（`/compact`），没有聊天区行与之重复。
+    if let Some(op) = state.current_op.as_deref() {
+        return op.to_string();
+    }
+
     if !state.pending_queue.is_empty() {
         return wyj_i18n::tr("spinner.queuing_message");
     }
 
     wyj_i18n::tr("spinner.thinking")
+}
+
+/// 「第 N 步」前缀：仅本轮已经起过工具调用时出现。
+///
+/// 纯思考阶段（还没调工具）与后台任务（`turn_step_no` 被
+/// `begin_background_task` 归零）都不显示——那里没有"步"的概念，硬塞一个
+/// 「第 0 步」只会让人怀疑进度统计坏了。
+fn thinking_step_prefix(state: &AppState) -> String {
+    if state.turn_step_no == 0 {
+        return String::new();
+    }
+    wyj_i18n::tr_fmt("spinner.step", &[("n", &state.turn_step_no.to_string())])
 }
 
 /// 排队提示：写清「已排队」+ 当前在挡着的东西。
@@ -3222,7 +3246,18 @@ fn draw_input(
         // 点数尾巴与新加的耗时/用量两段信息同时动会让整行读起来发飘，且
         // "..." 在窄终端里最容易把真正重要的操作名挤出可视区。
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
-        let label = thinking_status_label(state);
+        // 「第 N 步」并进 label 而不是单独一段：它是 label 的限定语，且必须与
+        // label 同生共死——预算不足时 `build_thinking_title` 只会对 label 做
+        // 省略号截断，把步号做成独立段就会在窄屏下先被整段丢掉。
+        let label = {
+            let step = thinking_step_prefix(state);
+            let base = thinking_status_label(state);
+            if step.is_empty() {
+                base
+            } else {
+                format!("{step} {base}")
+            }
+        };
         let elapsed = crate::app::format_hms(current_step_elapsed_secs(state));
         let tokens = title_token_text(state);
         // 排队中：挂在标题栏而不是只靠状态栏右对齐那一句——窄终端上右对齐
@@ -7511,11 +7546,13 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_label_prefers_raw_current_op_then_todo_then_dialogs() {
+    fn thinking_status_label_prefers_todo_then_tool_name_then_dialogs() {
         let mut state = make_state();
-        // 在跑的工具有最高优先级：标题栏要显示"每一步操作的名字"，
-        // 而不是被 todo 任务名或 "Reading file" 这类固定短语顶掉。
+        // 工具在跑，同时有 in-progress todo：标题栏答"为哪件事"而不是复述工具行
+        // —— 聊天区的 `⏺ Read(...)` 已经把动作讲清楚了，两处说同一句话等于没有
+        // 第二处信息。这是「spinner 与输出区最后一条一模一样」的正面钉子。
         state.current_op = Some("Read(crates/tui/src/render.rs)".to_string());
+        state.current_tool_name = Some("Read".to_string());
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "a".to_string(),
             content: "检查交互焦点".to_string(),
@@ -7523,14 +7560,16 @@ mod tool_result_fold_tests {
             priority: Some("high".to_string()),
             active_form: Some("正在检查交互焦点".to_string()),
         }]);
-        assert_eq!(
-            thinking_status_label(&state),
-            "Read(crates/tui/src/render.rs)"
-        );
-
-        // 没有在跑的工具时才让 InProgress todo 接管：active_form 优先于 content。
-        state.current_op = None;
         assert_eq!(thinking_status_label(&state), "正在检查交互焦点");
+
+        // 没有 todo 时退到**工具名**：不带参数、不带后端标注。参数仍在聊天区那行
+        // `⏺ Read(crates/tui/src/render.rs)` 上，标题栏不再逐字节复述它。
+        state.current_todos = None;
+        assert_eq!(thinking_status_label(&state), "Read");
+        assert!(
+            !thinking_status_label(&state).contains("render.rs"),
+            "标题栏不得重复聊天区工具行里的参数"
+        );
 
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "b".to_string(),
@@ -7541,7 +7580,7 @@ mod tool_result_fold_tests {
         }]);
         assert_eq!(thinking_status_label(&state), "检查 fallback");
 
-        // 非 InProgress 状态的 todo 不参与优先级；对话框 / 排队提示逐级兜底。
+        // 非 InProgress 状态的 todo 不参与优先级；工具名之后逐级兜底。
         state.current_todos = Some(vec![wyj_tools::todo::TodoItem {
             id: "c".to_string(),
             content: "已完成".to_string(),
@@ -7549,6 +7588,11 @@ mod tool_result_fold_tests {
             priority: None,
             active_form: Some("不应被选中".to_string()),
         }]);
+        assert_eq!(thinking_status_label(&state), "Read");
+
+        // 工具也跑完了：没有 current_tool_name / current_op 时落到 "Thinking"。
+        state.current_tool_name = None;
+        state.current_op = None;
         assert_eq!(thinking_status_label(&state), "Thinking");
     }
 
@@ -7631,22 +7675,40 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_label_prefers_raw_current_op_over_phrases() {
-        // 标题栏要显示"每一步操作的名字"：能看出在跑哪条命令 / 改哪个文件，
-        // 而不是被降级成 "Running command" 这种丢掉全部信息的固定短语。
+    fn thinking_status_label_prefers_tool_name_over_op_arguments() {
+        // 回归钉子：标题栏曾直接回显 `current_op`（`"Bash(cargo test -p wyj-core)"`），
+        // 而聊天区最后一条恰好也是这个字符串 —— 用户看到的就是"底部把上面那条
+        // 又抄了一遍"，动的是同一行文字，看起来像界面卡住。
         let mut state = make_state();
         state.current_op = Some("Bash(cargo test -p wyj-core)".to_string());
-        assert_eq!(
-            thinking_status_label(&state),
-            "Bash(cargo test -p wyj-core)"
-        );
+        state.current_tool_name = Some("Bash".to_string());
+        assert_eq!(thinking_status_label(&state), "Bash");
+        assert!(!thinking_status_label(&state).contains("cargo test"));
 
-        // 没有在跑的工具时才逐级回落到 todo / 对话框 / 排队提示。
+        // 非工具型后台任务没有 current_tool_name，只有 current_op —— 那是它的
+        // 全部标签（`/compact`），聊天区没有对应行，照原样显示。
+        state.current_tool_name = None;
+        state.current_op = Some("/compact".to_string());
+        assert_eq!(thinking_status_label(&state), "/compact");
+
+        // 没有在跑的东西时才逐级回落到 todo / 对话框 / 排队提示。
         state.current_op = None;
         state.permission_dialog = None;
         state.plan_dialog = None;
         state.pending_queue.clear();
         assert_eq!(thinking_status_label(&state), "Thinking");
+    }
+
+    #[test]
+    fn thinking_step_prefix_only_appears_once_a_tool_started_this_turn() {
+        let mut state = make_state();
+        // 纯思考阶段（还没起工具）没有"步"的概念，硬塞「第 0 步」会让人怀疑统计坏了。
+        assert_eq!(thinking_step_prefix(&state), "");
+        state.turn_step_no = 3;
+        assert_eq!(
+            thinking_step_prefix(&state),
+            wyj_i18n::tr_fmt("spinner.step", &[("n", "3")])
+        );
     }
 
     #[test]
@@ -8866,7 +8928,9 @@ mod tool_result_fold_tests {
         state.is_thinking = true;
         state.turn_start_time = Some(Instant::now() - std::time::Duration::from_secs(3));
         state.current_op = Some("Bash(cargo test)".to_string());
+        state.current_tool_name = Some("Bash".to_string());
         state.current_op_started = Some(Instant::now() - std::time::Duration::from_millis(1500));
+        state.turn_step_no = 2;
         state.turn_live_input_tokens = 1_000;
         state.turn_live_output_tokens = 40;
         state.total_input_tokens = 1_100;
@@ -8901,8 +8965,14 @@ mod tool_result_fold_tests {
             "is_thinking 时标题栏应包含 ⠋ spinner 帧，实际行: {title_line:?}"
         );
         assert!(
-            title_line.contains("Bash(cargo test)"),
-            "标题栏应显示每一步操作的名字原文, 实际行: {title_line:?}"
+            title_line.contains(&wyj_i18n::tr_fmt("spinner.step", &[("n", "2")]))
+                && title_line.contains("Bash"),
+            "标题栏应是「第 N 步 · 工具名」, 实际行: {title_line:?}"
+        );
+        assert!(
+            !title_line.contains("cargo test"),
+            "标题栏不得复述聊天区工具行里的参数（那正是「和输出区最后一条一样」的成因）, \
+             实际行: {title_line:?}"
         );
         assert!(
             title_line.contains("1.5s") && !title_line.contains(" 3s"),
