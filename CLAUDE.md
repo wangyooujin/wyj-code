@@ -17,7 +17,7 @@
 | `crates/api/CLAUDE.md` | 触达 `crates/api/` | System prompt stable/volatile 分段与 prompt cache 断点 |
 | `crates/mcp/CLAUDE.md` | 触达 `crates/mcp/` | MCP 桥接 |
 | `docs/reference/config.md` | 手动查阅 | `config.toml` 带注释全量参考、规约文件回退链、Hooks 事件 |
-| `docs/plan/*.md` | 手动查阅 | 各项设计的历史决策与失败模式调研 |
+| `doc/plan/*.md` | 手动查阅 | 各项设计的历史决策与失败模式调研 |
 
 ## 代码导航约定
 

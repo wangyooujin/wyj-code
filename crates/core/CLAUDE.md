@@ -23,7 +23,7 @@
 4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
 
 
-5. **AGENTS.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn_with_injection` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 AGENTS.md 系内容包成 `<system-reminder>` 前插进当轮 user 消息；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载。详见上方 Configuration 节。
+5. **AGENTS.md / CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 AGENTS.md 系内容用 `wrap_reminder` 包成 `<system-reminder>`，**追加进 system prompt 的 stable 段**（不是当轮 user 消息）；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载，结果进 **volatile 段**——放在缓存断点之后，避免每命中一个新目录就整段前缀全价重算。配套说明见根 `CLAUDE.md` 的「Configuration」与「System prompt 分段」两节。
 
 
 8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在**工具轮边界**排空注入队列、合并进当前或续接的 user 回合。注入负载是 `core::SteerQueue`（共享队列）里的 `Vec<ContentBlock>` + `InjectionKind`。三条不变式：① **回显在提交那一刻就发生**（`AppState::enqueue_message` 内部 `push_user`），不等 Agent 排空——排空点在工具轮边界，前台子 Agent / 长 Bash 期间可能几十分钟不排空，回显跟着等就等于「我打的字被吞了」；`AgentEvent::Injected` 只负责出队，不重复画。② **主 Agent 与前台子 Agent 排空同一份队列**：前台 `SubAgentTool::run()` 会 `await` 整个子 Agent，而子 Agent 此前完全没有注入通道，用户在它跑的过程中补充的要求既进不了子 Agent、也进不了被工具调用堵住的主 Agent（实测一个 12 分钟的子 Agent = 12 分钟白等）。现经 `ToolContext::steer_queue()` 把队列带进子 Agent（`ToolCtx.steer_queue`，嵌套子 Agent 同享），子 Agent 在跑 → 补充内容插进**子 Agent 自己的**下一轮；子 Agent 已返回 → 插进主 Agent 的下一轮。**谁先到边界谁取走**，因此一条内容只会被投递一次。③ **子 Agent 只取 `UserMessage`**（`SteerQueue::drain_user_messages`）：`SystemReminder` 装的是后台子 Agent / 后台 shell 的完成通知，那是**给主 Agent 的结论**，进了子 Agent 的会话既答非所问，又会让主 Agent 永远收不到（子 Agent 返回时队列已空）。队列的 `push` / `drain` 都是 `&self`（内部 `std::sync::Mutex`）：主 Agent 与工具侧要同时持有 `Arc` 句柄，`&mut` 接收端做不到。headless / cron / 后台子 Agent 为 `None`，行为不变。UI 侧提示在**标题栏与状态栏**（`render::queue_hint_text`，点名当前正在跑的工具）；只放状态栏右对齐会在窄终端被「模型 · 模式 · cwd」挤掉后半句，而「我的补充还没送达」正是最该看见的信息。
@@ -164,9 +164,6 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 框架层**任何重试都不得重复执行工具**。Agent 的全部重试点（流中断重发、`parameter_degraded` 降参重发、上下文超限截断后重发、fallback 路由切换）**都发生在 assistant 消息提交之前**——此时本次 assistant 的 `tool_use` 块尚未进入 `session.messages`，工具自然也没跑过；半成品 assistant 消息绝不入史。工具一旦跑过，框架的重试路径就不复存在：下一轮是**模型**基于 tool_result 重新决策，那是模型行为，不是框架重复执行。回归测试 `a_retry_never_re_executes_an_already_committed_tool` 钉住这条——它故意让两次 stream 发出 input 完全相同的 tool_use，正是「重复执行」会出现的形态。
 
 真正会真的跑两遍的是**状态不明**的失败：MCP 超时（远端可能仍在执行）、Bash 被信号杀死（`rm` 可能已删了一半）。这类错误消息必须写明「状态不明、先探查再决定是否重跑」——尤其 Bash 的 `status.code()` 为 `None` 时曾被报成「退出码 -1」，那是谎话，会让模型把它当普通非零退出直接重跑。修成显式的「被信号终止（可能已产生部分副作用）」。
-
-## 推理轮数触顶
-
 
 ## 推理轮数触顶不再等于失败
 
