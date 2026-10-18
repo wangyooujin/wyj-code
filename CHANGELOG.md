@@ -10,9 +10,13 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
-## [Unreleased]
+## [0.3.8] - 2026-10-18
 
-### 标题栏去掉「第 N 步」，改显示动词短语
+### 中断的子 Agent 丢掉了「已经做到哪」，标题栏在复述一个步号
+
+本次三块改动共用一个判据：**能还原的必须是结论，不是过程截图**。
+
+### ① 标题栏去掉「第 N 步」，改显示动词短语
 
 `⠋ 第 3 步 · Bash · 1.5s · 12k↑` → `⠋ 运行命令 · 1.5s · 12k↑`。
 
@@ -25,8 +29,55 @@ label 从工具注册名换成动词短语（`tool_activity.*`，中英各 19 �
 不是动作，用户得先知道这个 CLI 有哪些工具才读得懂。未收录的工具回落注册名，拼错
 key 也回落注册名而不是把 `tool_activity.xxx` 露给用户。参数仍只在聊天区的
 `⏺ Bash(cargo test)` 上——标题栏答"在做什么"，聊天区答"对什么做"。
+新增钉子测试逐个校验内置工具都有短语，新增工具漏配 i18n 会立刻变红。
 
 `AppState.turn_step_no` 与 `spinner.step` 一并删除。
+
+### ② 子 Agent 交接物：中断也能说清做到哪了
+
+ESC 中断的子 Agent 此前只回一句「已中止」，已完成轮次的产出全丢；硬杀进程则连一句
+话都没有。新增 `tools::handoff`：
+
+- `SubAgentHandoff { status, reason, conclusion, digest, elapsed_secs }` 与 `ToolDigest`
+  落盘 `a<id>.handoff.json`，与 trace 同目录
+- 运行期 `HandoffProgress` 快照边跑边记，ESC/abort 时由 `SubAgentHub::abort()`
+  **前**补写——abort 之后任务收尾代码不会执行，这是中断场景唯一可行的路径
+- 中断不再丢弃已完成轮的 outputs，改为「产出 + 中断标记」一并回填
+- trace 新增 `TraceEvent::Assistant`（每轮末文本，保头 4KB）：`ToolStart`/`ToolEnd`
+  只说明读了什么，说明不了由此得出了什么
+- 注入走 `prompts::subagent_handoff_body`（继续 / 重新委派 / 问用户 三选一），
+  前台 `ToolResult` 与后台 `bg_agent_reminder_with` 共用同一份渲染，避免双层套壳
+- `/subagents` 详情顶部固定渲染交接摘要；`trace_enabled = false` 时只有交接物的
+  agent 也能列出，trace 缺失时用交接物重建最小记录
+
+### ③ 消息增量日志：硬杀进程也有兜底
+
+交接物只能覆盖「进程还活着」的中断。新增 `Session.message_sink` 与
+`tools::message_log::MessageLogWriter`，写 `a<id>.messages.jsonl`：
+
+- 三种事件 `Appended` / `UpdatedLast` / `Replaced`。后两者必须区分：
+  `push_user_blocks_merged` 与 `prepend_to_last_user` 原地改最后一条 user 消息；
+  压缩与 context editing 则整段替换，必须打 snapshot 锚点
+- 与 `TraceWriter` 同构：后台串行、零阻塞、脱敏；1MB 上限并留 `truncated` 标记
+- `replay()` 从最后一个 snapshot 起算，半行跳过并置 `incomplete`；
+  `recover_progress()` 在无交接物时还原最后一轮 assistant 文本
+- `subagent-trace` 无交接物时打印 `recovered from message log`
+
+### ④ 子 Agent 编排加固
+
+- `AgentDefinition` 新增 `disallowedTools`（先减后取交集，支持 `mcp__server` /
+  `mcp__server__*` 整组屏蔽）与 `omitClaudeMd`（内置 Explore/Plan 默认不注入项目规约）
+- `[subagent]` 新增 `max_depth`（默认 3，触顶时**不注册** Agent 工具，而不是留一个
+  每次调用都报错的工具）与 `max_concurrent`（默认 8，超限排队不失败）
+- 子 Agent 输出统一按 `<subagent-report>` 定界，不可信文本过
+  `escape_harness_markers`；后台 agent 结果、后台 shell 输出、PeerMessage 正文
+  共用同一套转义
+- 新增 `ToolContext::confirm_denial_reason`：区分「无审批通道」的 fail-closed 拒绝
+  与「用户主动拒绝」，避免模型以为有人否决而换参数反复重试
+- `/agents` 面板文案修正为 `.wyj-code/agents`，frontmatter 字段列表同步
+
+测试：1548 个 workspace 测试通过，clippy `-D warnings` 全绿。
+
 
 ## [0.3.7] - 2026-10-18
 
