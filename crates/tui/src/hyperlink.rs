@@ -9,6 +9,10 @@
 //!    输出的 Cell 包上 OSC 8。这样换行、宽字符和增量重绘都仍使用干净文本计算。
 
 use crate::theme::Theme;
+use crossterm::{
+    cursor::{Hide, MoveTo, Show},
+    queue,
+};
 use ratatui::{
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::{Buffer, Cell},
@@ -63,6 +67,12 @@ impl HyperlinkRegistry {
 pub(crate) struct HyperlinkBackend<W: Write> {
     inner: CrosstermBackend<W>,
     links: HyperlinkRegistry,
+    /// ratatui 的 `try_draw` 固定按 `show_cursor()` → `set_cursor_position()` 调用，
+    /// 两次调用各自 flush 一次。`show_cursor` 单独落地会让硬件光标先在上一次 diff
+    /// 的末格（thinking 时就是标题栏的 spinner）显形整一拍，再把 `MoveTo` 发出去
+    /// —— 观感就是 spinner 那格自己闪。这里把 Show 缓到 `set_cursor_position`,
+    /// 与 `MoveTo` 合并成一次写出。
+    pending_show: bool,
 }
 
 impl<W: Write> HyperlinkBackend<W> {
@@ -70,7 +80,19 @@ impl<W: Write> HyperlinkBackend<W> {
         Self {
             inner: CrosstermBackend::new(writer),
             links,
+            pending_show: false,
         }
+    }
+
+    /// 把被 `show_cursor` 暂存的显示请求立刻落地。`Terminal::show_cursor` 之后
+    /// 不会再有 `set_cursor_position` 跟着（退出路径），只能由调用方显式收尾。
+    pub(crate) fn flush_pending_cursor(&mut self) -> io::Result<()> {
+        if !self.pending_show {
+            return Ok(());
+        }
+        self.pending_show = false;
+        queue!(self.inner, Show)?;
+        Write::flush(&mut self.inner)
     }
 }
 
@@ -114,11 +136,15 @@ impl<W: Write> Backend for HyperlinkBackend<W> {
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
-        self.inner.hide_cursor()
+        self.pending_show = false;
+        queue!(self.inner, Hide)
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
-        self.inner.show_cursor()
+        // 不立刻写 Show：此刻硬件光标还停在上一次 diff 的末格，先显示再 MoveTo
+        // 会让那个格子显形一整拍。等 `set_cursor_position` 一起写出。
+        self.pending_show = true;
+        Ok(())
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
@@ -126,7 +152,14 @@ impl<W: Write> Backend for HyperlinkBackend<W> {
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
-        self.inner.set_cursor_position(position)
+        let Position { x, y } = position.into();
+        if self.pending_show {
+            self.pending_show = false;
+            // 一次写出「定位 + 显示」：终端只会看到光标出现在目标格。
+            queue!(self.inner, MoveTo(x, y), Show)
+        } else {
+            self.inner.set_cursor_position(Position { x, y })
+        }
     }
 
     fn clear(&mut self) -> io::Result<()> {
@@ -813,30 +846,83 @@ mod tests {
 
     #[test]
     fn backend_injects_osc8_after_buffer_diff() {
-        #[derive(Clone, Default)]
-        struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl Write for SharedWriter {
-            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let registry = HyperlinkRegistry::default();
         registry.replace(HashMap::from([((0, 0), "https://example.com".to_string())]));
-        let writer = SharedWriter::default();
-        let output = writer.0.clone();
-        let mut backend = HyperlinkBackend::new(writer, registry);
+        let writer = Writer::default();
+        let mut backend = HyperlinkBackend::new(writer.clone(), registry);
         let cell = Cell::new("x");
 
         backend.draw(std::iter::once((0, 0, &cell))).unwrap();
-        let output = output.lock().unwrap();
-        let output = String::from_utf8_lossy(&output);
+        let output = String::from_utf8_lossy(&writer.take()).to_string();
         assert!(output.contains("\x1b]8;;https://example.com\x1b\\x\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn cursor_show_is_deferred_until_the_final_position() {
+        let writer = Writer::default();
+        let output = writer.0.clone();
+        let mut backend = HyperlinkBackend::new(writer, HyperlinkRegistry::default());
+
+        // ratatui 的调用顺序：先 show_cursor，再 set_cursor_position。
+        // Show 必须被延后，且与 MoveTo 落在同一次写出里——否则硬件光标会先在上一次
+        // diff 的末格（thinking 时正是标题栏 spinner）显形一整拍。
+        backend.show_cursor().unwrap();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "show_cursor 不得立刻写出"
+        );
+
+        backend.set_cursor_position(Position::new(3, 7)).unwrap();
+        let bytes = output.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("\x1b[?25h").count(), 1);
+        let show_at = text.find("\x1b[?25h").unwrap();
+        let move_at = text.find("\x1b[").unwrap();
+        assert!(move_at < show_at, "定位必须先于显示：{text:?}");
+        assert!(
+            text.starts_with("\x1b[8;4H"),
+            "先 MoveTo 到目标格：{text:?}"
+        );
+    }
+
+    #[test]
+    fn hide_cancels_a_pending_show_and_flush_emits_it() {
+        let writer = Writer::default();
+
+        // hide 之后到达的 show 被取消：不会有「先 Show 再 Hide」的抖动
+        let mut backend = HyperlinkBackend::new(writer.clone(), HyperlinkRegistry::default());
+        backend.show_cursor().unwrap();
+        backend.hide_cursor().unwrap();
+        backend.set_cursor_position(Position::new(0, 0)).unwrap();
+        let text = String::from_utf8_lossy(&writer.take()).to_string();
+        assert_eq!(text.matches("\x1b[?25h").count(), 0);
+
+        // 无人收尾的 show（退出路径）必须由 flush_pending_cursor 兜底落地，
+        // 否则离开 TUI 后光标停在隐藏态。
+        let mut backend = HyperlinkBackend::new(writer.clone(), HyperlinkRegistry::default());
+        backend.show_cursor().unwrap();
+        backend.flush_pending_cursor().unwrap();
+        let text = String::from_utf8_lossy(&writer.take()).to_string();
+        assert_eq!(text.matches("\x1b[?25h").count(), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Writer {
+        fn take(&self) -> Vec<u8> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    impl Write for Writer {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
