@@ -22,6 +22,17 @@ pub struct AgentDefinition {
     pub description: String,
     /// 允许的工具名列表；None 表示不限制（使用标准工具集全集）
     pub tools: Option<Vec<String>>,
+    /// 显式禁用的工具名列表，在 `tools` 之前生效（先减后取交集），支持
+    /// `mcp__server` / `mcp__server__*` 整组屏蔽一个 MCP server。
+    ///
+    /// 只有 `tools` 白名单时，「继承全部但去掉 Write/Edit」是表达不出来的：
+    /// MCP 工具是运行时发现的，用户根本列不全剩下的部分。
+    pub disallowed_tools: Vec<String>,
+    /// 是否不注入项目 `CLAUDE.md` 规约（内置 Explore/Plan 默认 true）。
+    ///
+    /// 探索类子 Agent 的典型任务是「找三处定义」，而本仓库根规约加子目录规约
+    /// 动辄上万 token，一次都用不上。主 Agent 读到结果时它自己仍有完整规约。
+    pub omit_claude_md: bool,
     /// 引用 config.toml 中的 Profile 名；None 表示使用全局 subagent 配置或主模型
     pub model: Option<String>,
     /// 系统提示词（frontmatter 之后的 markdown 正文）
@@ -40,6 +51,8 @@ pub fn builtin_defs() -> Vec<AgentDefinition> {
             name: "general-purpose".to_string(),
             description: crate::prompts::SUBAGENT_GENERAL_DESC.to_string(),
             tools: None,
+            disallowed_tools: Vec::new(),
+            omit_claude_md: false,
             model: None,
             system_prompt: crate::prompts::SUBAGENT_GENERAL.to_string(),
             builtin: true,
@@ -49,6 +62,10 @@ pub fn builtin_defs() -> Vec<AgentDefinition> {
             name: "Explore".to_string(),
             description: crate::prompts::SUBAGENT_EXPLORE_DESC.to_string(),
             tools: Some(readonly.clone()),
+            disallowed_tools: Vec::new(),
+            // 探索类委派最频繁、单次最轻：规约全文对「找出这三处定义」毫无帮助，
+            // 却每趟都要付 prefill。对齐 Claude Code 的 Explore/Plan 取舍。
+            omit_claude_md: true,
             model: None,
             system_prompt: crate::prompts::SUBAGENT_EXPLORE.to_string(),
             builtin: true,
@@ -58,6 +75,8 @@ pub fn builtin_defs() -> Vec<AgentDefinition> {
             name: "Plan".to_string(),
             description: crate::prompts::SUBAGENT_PLAN_DESC.to_string(),
             tools: Some(readonly),
+            disallowed_tools: Vec::new(),
+            omit_claude_md: true,
             model: None,
             system_prompt: crate::prompts::SUBAGENT_PLAN.to_string(),
             builtin: true,
@@ -151,6 +170,8 @@ fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
         name: stem,
         description: String::new(),
         tools: None,
+        disallowed_tools: Vec::new(),
+        omit_claude_md: false,
         model: None,
         system_prompt: body.trim().to_string(),
         builtin: false,
@@ -165,14 +186,16 @@ fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
             }
             "description" => def.description = value,
             "tools" => {
-                let list: Vec<String> = value
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let list = parse_tool_list(&value);
                 if !list.is_empty() {
                     def.tools = Some(list);
                 }
+            }
+            "disallowed_tools" | "disallowedTools" => {
+                def.disallowed_tools = parse_tool_list(&value)
+            }
+            "omit_claude_md" | "omitClaudeMd" => {
+                def.omit_claude_md = matches!(value.trim(), "true" | "yes" | "1")
             }
             "model" if !value.is_empty() => def.model = Some(value),
             // 未识别字段（如真实 Claude Code 的其他 frontmatter key）静默忽略
@@ -180,6 +203,15 @@ fn parse_agent_file(content: &str, path: &Path) -> AgentDefinition {
         }
     }
     def
+}
+
+/// 逗号分隔的工具名列表（`tools` / `disallowed_tools` 共用）
+fn parse_tool_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -223,6 +255,29 @@ mod tests {
     }
 
     #[test]
+    fn disallowed_tools_and_omit_claude_md_frontmatter() {
+        // 「继承全部但去掉 Write/Edit」是只有 tools 白名单时表达不出来的写法
+        let def = parse(
+            "---\nname: no-writes\ndisallowedTools: Write, Edit, mcp__github\nomitClaudeMd: true\n---\nbody",
+        );
+        assert!(def.tools.is_none(), "未写 tools 时应表示不限制");
+        assert_eq!(
+            def.disallowed_tools,
+            vec![
+                "Write".to_string(),
+                "Edit".to_string(),
+                "mcp__github".to_string()
+            ]
+        );
+        assert!(def.omit_claude_md);
+
+        // 下划线写法同样认，默认值是 false
+        let def = parse("---\nname: y\ndisallowed_tools: Bash\n---\nbody");
+        assert_eq!(def.disallowed_tools, vec!["Bash".to_string()]);
+        assert!(!def.omit_claude_md);
+    }
+
+    #[test]
     fn no_frontmatter_whole_file_is_prompt() {
         let def = parse("# 直接就是提示词\n\n内容");
         assert_eq!(def.name, "reviewer");
@@ -255,6 +310,20 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["general-purpose", "Explore", "Plan"]);
         assert!(defs.iter().skip(1).all(|d| d.tools.is_some()));
+    }
+
+    /// 探索类内置类型不注入 CLAUDE.md：这是它们唯一的成本优势来源。
+    /// 改动这条等于把本仓库上万 token 的规约重新压到每一次探索委派上。
+    #[test]
+    fn builtin_explore_and_plan_skip_claude_md() {
+        let defs = builtin_defs();
+        let by_name = |name: &str| defs.iter().find(|d| d.name == name).unwrap().clone();
+        assert!(by_name("Explore").omit_claude_md);
+        assert!(by_name("Plan").omit_claude_md);
+        assert!(
+            !by_name("general-purpose").omit_claude_md,
+            "写代码的子 Agent 仍需要项目规约"
+        );
     }
 
     #[test]

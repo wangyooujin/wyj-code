@@ -8436,14 +8436,6 @@ pub struct AppState {
     /// 语义是"这一步跑了多久"，步骤切换时归零；没有工具在跑（纯思考 / 等权限）
     /// 时回落到整轮耗时。
     pub current_op_started: Option<Instant>,
-    /// **本轮**已开始的工具调用序号（标题栏的「第 N 步」）。
-    ///
-    /// 不能用 `tool_call_count`：那是跨轮累计的渲染序号（`ToolEnd` 靠它与
-    /// `ToolStart` 配对），`/clear` 之外从不清零，拿来当步数会显示「第 47 步」。
-    /// 归零时机与 `turn_live_*` 一致（`begin_turn_timing`），另在
-    /// `begin_background_task` 里归零——后台任务不是回合，`/compact` 不该
-    /// 顶着上一轮遗留的步号。
-    pub turn_step_no: usize,
     /// 本轮对话开始时间（用于计算耗时）
     pub turn_start_time: Option<Instant>,
     /// 本轮对话开始时的 input_tokens 快照
@@ -8649,7 +8641,6 @@ impl AppState {
             current_op: None,
             current_tool_name: None,
             current_op_started: None,
-            turn_step_no: 0,
             turn_start_time: None,
             turn_start_input_tokens: 0,
             turn_start_output_tokens: 0,
@@ -8721,7 +8712,6 @@ impl AppState {
         self.current_op = Some(label);
         self.current_tool_name = None;
         self.current_op_started = Some(Instant::now());
-        self.turn_step_no = 0;
         self.last_turn_activity = Instant::now();
     }
 
@@ -8739,8 +8729,6 @@ impl AppState {
         // 的开销带进新一轮标题栏（表现为"刚发消息就显示几万 token"）。
         self.turn_live_input_tokens = 0;
         self.turn_live_output_tokens = 0;
-        // 步号同理：标题栏的「第 N 步」是**本轮**的进度，不是会话累计。
-        self.turn_step_no = 0;
     }
 
     fn begin_new_turn(&mut self) {
@@ -8806,7 +8794,6 @@ impl AppState {
         self.turn_start_output_tokens = 0;
         self.turn_live_input_tokens = 0;
         self.turn_live_output_tokens = 0;
-        self.turn_step_no = 0;
         self.last_turn_elapsed_secs = None;
         self.last_turn_input_tokens = 0;
         self.last_turn_output_tokens = 0;
@@ -10220,7 +10207,6 @@ impl AppState {
                 // 步骤计时起点：并发多个工具时后到的 ToolStart 会覆盖成最后一个，
                 // 与 `current_op` 保持同一口径（标题栏只展示"最近开始的那一步"）。
                 self.current_op_started = Some(Instant::now());
-                self.turn_step_no += 1;
                 self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
                 if !is_todo {

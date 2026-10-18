@@ -110,6 +110,19 @@ pub trait ToolContext: Send + Sync {
     async fn confirm_tool(&self, _name: &str, _summary: &str) -> bool {
         false
     }
+    /// [`Self::confirm_tool`] 拒绝时，向模型解释「为什么被拒」。
+    ///
+    /// 返回 `None` 表示「就是用户点的拒绝」——调用方回落到通用措辞。
+    /// 返回 `Some(reason)` 表示这次拒绝有更具体的原因（比如本执行面根本没有
+    /// 审批通道），调用方原样把它回灌给模型。
+    ///
+    /// 为什么需要它：子 Agent / headless 的 `confirm_tool` 在无 UI 通道时
+    /// fail-closed，回灌的却是「用户拒绝执行该操作」。模型据此以为有人看过并
+    /// 否决了，于是换参数重试或反复询问；实际上根本没人可问，它应当直接
+    /// 改用不需要审批的路径或如实汇报受阻。
+    fn confirm_denial_reason(&self, _name: &str) -> Option<String> {
+        None
+    }
     /// 本次调用是否会**阻塞等待**用户在 UI 上做出权限决定。
     ///
     /// 用途：`Agent` 决定同一轮 assistant 消息里的多个工具调用怎么分组执行时，

@@ -37,6 +37,9 @@ default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Ag
 explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
 trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
+max_depth = 3                # 子 Agent 最大嵌套层数（主 Agent 之下算第一层）；1 = 禁止嵌套。
+                             # 触顶时 Agent 工具会从该层子 Agent 的工具集里消失，而不是留着报错
+max_concurrent = 8           # 同时运行的子 Agent 上限；超限的 spawn 排队等待，不失败
 
 [auto_mode]                     # Auto 权限模式（默认起始模式，详见下方 Auto 模式节）
 enabled = true                # 模型分类器总开关。false = 只保留本地确定性规则层，

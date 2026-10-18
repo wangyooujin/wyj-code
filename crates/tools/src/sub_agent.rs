@@ -85,6 +85,15 @@ impl SubAgentTool {
         self
     }
 
+    /// 覆盖最大嵌套层数（来自 `[subagent].max_depth`，默认 3）。
+    ///
+    /// 0 或 1 都表示「子 Agent 不允许再派子 Agent」；上层调用点负责钳到
+    /// 至少 1，避免一个手滑的配置把 `Agent` 工具从主 Agent 那里也拿掉。
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth.max(1);
+        self
+    }
+
     fn find_def(&self, type_name: &str) -> Option<AgentDefinition> {
         self.defs
             .read()
@@ -169,6 +178,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// 内置 Explore / Plan 的 `tools` 是 `READONLY_TOOLS`，因此**不触发**审批；
 /// general-purpose 触发。这样审批弹窗只出现在真正可能改盘/执行命令的
 /// 委派上，读多写少的探索类委派不被打断。
+///
+/// `disallowed_tools` 参与判定：`tools: None` + `disallowed_tools: Write, Edit,
+/// Bash` 的定义实际拿不到任何副作用工具，不该再弹一次窗——否则用户会被问
+/// 「要不要放行一个只读 Agent」这种没有意义的问题。
 pub(crate) fn def_can_touch_side_effects(def: &AgentDefinition) -> bool {
     /// 会被 `is_side_effect_tool` 视为有副作用、且在标准工具集里的工具名。
     const SIDE_EFFECT_TOOLS: &[&str] = &[
@@ -180,11 +193,14 @@ pub(crate) fn def_can_touch_side_effects(def: &AgentDefinition) -> bool {
         "computer",
         "app_computer",
     ];
+    let allowed_and_side_effecting = |name: &str| {
+        SIDE_EFFECT_TOOLS.contains(&name) && !def.disallowed_tools.iter().any(|d| d == name)
+    };
     match &def.tools {
-        None => true,
-        Some(list) => list
+        None => SIDE_EFFECT_TOOLS
             .iter()
-            .any(|name| SIDE_EFFECT_TOOLS.contains(&name.as_str())),
+            .any(|name| allowed_and_side_effecting(name)),
+        Some(list) => list.iter().any(|name| allowed_and_side_effecting(name)),
     }
 }
 
@@ -480,10 +496,15 @@ impl SubAgentTool {
         if let Some(session_id) = &self.root_session_id {
             agent.set_session_id(session_id.clone());
         }
-        if def
-            .tools
-            .as_ref()
-            .map_or(true, |tools| tools.iter().any(|tool| tool == "Agent"))
+        // 嵌套注册：深度已触顶时**不注册** Agent 工具，而不是留一个每次调用
+        // 都报 "depth limit reached" 的工具。模型看到工具没了会自己把活干完；
+        // 看到工具还在则会换个措辞反复重试——这是 `CLAUDE_CODE_MAX_SUBAGENT_
+        // SPAWN_DEPTH` 同款的取舍。
+        if self.depth + 1 < self.max_depth.max(1)
+            && def
+                .tools
+                .as_ref()
+                .map_or(true, |tools| tools.iter().any(|tool| tool == "Agent"))
         {
             agent.register_tool(Arc::new(Self {
                 defs: self.defs.clone(),
@@ -647,7 +668,16 @@ impl SubAgentTool {
                                 .push(ContentBlock::Text {
                                     text: format!("<agent-message from=\"a{from_id}\">"),
                                 });
-                            next_input.get_or_insert_with(Vec::new).extend(content);
+                            // 来自另一个子 Agent 的话，同样是模型输出：转义后
+                            // 才能保证它伪造不出闭合标签、也冒充不了用户指令。
+                            next_input.get_or_insert_with(Vec::new).extend(
+                                content.into_iter().map(|block| match block {
+                                    ContentBlock::Text { text } => ContentBlock::Text {
+                                        text: wyj_core::textutil::escape_harness_markers(&text),
+                                    },
+                                    other => other,
+                                }),
+                            );
                             next_input
                                 .get_or_insert_with(Vec::new)
                                 .push(ContentBlock::Text {
@@ -701,10 +731,19 @@ impl SubAgentTool {
                 background,
             });
             hub_task.finish(id);
-            let result = if is_error {
-                ToolResult::err(content)
+            // 成功路径的最终报告一律套 `subagent-report` 定界外壳：它可能包含
+            // 子 Agent 读到的网页/日志原文，裸文本回填等于让那些内容以「用户或
+            // harness 的话」的身份进入主对话。失败/中断文本是本进程自己写的，
+            // 不含第三方内容，保持原样（模型更容易一眼看出这是错误）。
+            let model_content = if is_error {
+                content.clone()
             } else {
-                ToolResult::ok(content)
+                wyj_core::prompts::subagent_report_body(&content)
+            };
+            let result = if is_error {
+                ToolResult::err(model_content)
+            } else {
+                ToolResult::ok(model_content)
             };
             let _ = result_tx.send(result);
         });
@@ -814,6 +853,8 @@ mod tests {
             name: "general-purpose".to_string(),
             description: "test".to_string(),
             tools: None,
+            disallowed_tools: Vec::new(),
+            omit_claude_md: false,
             model: None,
             system_prompt: "test".to_string(),
             builtin: true,
@@ -971,6 +1012,8 @@ mod tests {
                 name: "general-purpose".to_string(),
                 description: "test".to_string(),
                 tools: None,
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "factory prompt".to_string(),
                 builtin: true,
@@ -1084,6 +1127,8 @@ mod tests {
                 name: "general-purpose".to_string(),
                 description: "test".to_string(),
                 tools: None,
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "test".to_string(),
                 builtin: true,
@@ -1145,6 +1190,8 @@ mod tests {
                 name: "outer".to_string(),
                 description: "spawns a child".to_string(),
                 tools: Some(vec!["Agent".to_string()]),
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "outer".to_string(),
                 builtin: true,
@@ -1154,6 +1201,8 @@ mod tests {
                 name: "child".to_string(),
                 description: "leaf".to_string(),
                 tools: Some(Vec::new()),
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "child".to_string(),
                 builtin: true,
@@ -1205,6 +1254,8 @@ mod tests {
                 name: "leaf".to_string(),
                 description: "leaf".to_string(),
                 tools: Some(vec!["Read".to_string()]),
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "leaf".to_string(),
                 builtin: true,
@@ -1255,6 +1306,8 @@ mod tests {
                 name: "general-purpose".to_string(),
                 description: "test".to_string(),
                 tools: None,
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "test".to_string(),
                 builtin: true,
@@ -1298,6 +1351,8 @@ mod tests {
                 name: "general-purpose".to_string(),
                 description: "test".to_string(),
                 tools: None,
+                disallowed_tools: Vec::new(),
+                omit_claude_md: false,
                 model: None,
                 system_prompt: "test".to_string(),
                 builtin: true,
@@ -1330,6 +1385,67 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("depth limit"));
         assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// 深度触顶的那一层不该再拿到 `Agent` 工具。
+    ///
+    /// 留着一个「调了就报 depth limit」的工具，模型会换个措辞反复重试；
+    /// 工具直接消失时它才会自己把活干完。判据是 `depth + 1 < max_depth`：
+    /// 子 Agent 的 depth 取 `self.depth + 1`，所以要给它留出下一层。
+    #[tokio::test]
+    async fn agent_tool_disappears_at_the_depth_limit() {
+        async fn spawned_child_sees_agent_tool(depth: usize, max_depth: usize) -> bool {
+            let observed = Arc::new(AtomicBool::new(false));
+            let provider_observed = observed.clone();
+            let tool = SubAgentTool {
+                defs: Arc::new(std::sync::RwLock::new(vec![AgentDefinition {
+                    name: "general-purpose".to_string(),
+                    description: "test".to_string(),
+                    tools: None,
+                    disallowed_tools: Vec::new(),
+                    omit_claude_md: false,
+                    model: None,
+                    system_prompt: "test".to_string(),
+                    builtin: true,
+                    source: None,
+                }])),
+                hub: Arc::new(SubAgentHub::new()),
+                factory: Arc::new(move |_| {
+                    Ok(Agent::new(Arc::new(EndProvider {
+                        saw_agent_tool: Some(provider_observed.clone()),
+                    })))
+                }),
+                root_session_id: None,
+                caller_id: Some(1),
+                depth,
+                max_depth,
+                response_language: None,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let result = tool
+                .run(
+                    serde_json::json!({"description": "probe", "prompt": "go"}),
+                    &crate::ctx::ToolCtx::new(dir.path()),
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error, "探测本身不该失败: {}", result.content);
+            observed.load(Ordering::SeqCst)
+        }
+
+        // 还有一层余量：子 Agent 应当仍能看到 Agent
+        assert!(
+            spawned_child_sees_agent_tool(0, 3).await,
+            "depth=0 max=3 时子 Agent 还能再派一层"
+        );
+        assert!(spawned_child_sees_agent_tool(1, 3).await);
+        // 触顶：这一层已到最深处，Agent 工具必须消失
+        assert!(
+            !spawned_child_sees_agent_tool(1, 2).await,
+            "触顶后仍暴露 Agent 会让模型反复重试同一个调用"
+        );
+        // 配置为 1（禁止嵌套）：第一层子 Agent 立刻拿不到 Agent
+        assert!(!spawned_child_sees_agent_tool(0, 1).await);
     }
 
     // ── 子 Agent 权限继承 ───────────────────────────────────────────────
@@ -1493,6 +1609,8 @@ mod tests {
             name: name.to_string(),
             description: "d".to_string(),
             tools,
+            disallowed_tools: Vec::new(),
+            omit_claude_md: false,
             model: None,
             system_prompt: "s".to_string(),
             builtin: true,
@@ -1511,6 +1629,35 @@ mod tests {
             "sh",
             Some(vec!["Bash".into()])
         )));
+    }
+
+    /// `disallowed_tools` 把副作用工具全减光时，spawn 不该再要审批。
+    /// 否则用户会被问「要不要放行一个只读 Agent」，而拒绝与否都不改变实际能力。
+    #[test]
+    fn def_with_only_disallowed_side_effect_tools_needs_no_permission() {
+        let def = AgentDefinition {
+            name: "read-only".to_string(),
+            description: "d".to_string(),
+            tools: None,
+            disallowed_tools: vec![
+                "Write".to_string(),
+                "Edit".to_string(),
+                "Bash".to_string(),
+                "BashOutput".to_string(),
+                "KillShell".to_string(),
+                "computer".to_string(),
+                "app_computer".to_string(),
+            ],
+            omit_claude_md: false,
+            model: None,
+            system_prompt: "s".to_string(),
+            builtin: false,
+            source: None,
+        };
+        assert!(
+            !def_can_touch_side_effects(&def),
+            "副作用工具已被黑名单减光，不应再要求审批"
+        );
     }
 
     #[test]

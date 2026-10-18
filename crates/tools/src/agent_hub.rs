@@ -220,6 +220,14 @@ impl SubAgentHub {
         self
     }
 
+    /// 覆盖并发上限（来自 `[subagent].max_concurrent`，默认 `MAX_CONCURRENT_SUBAGENTS`）。
+    /// 超限的 spawn 在信号量上排队，不会失败。
+    #[must_use]
+    pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
+        self.semaphore = Arc::new(Semaphore::new(max_concurrent.max(1)));
+        self
+    }
+
     /// 注册事件回调（TUI 转发进事件通道，headless 打印纯文本行）
     pub fn set_event_cb(&self, cb: impl Fn(SubAgentEvent) + Send + Sync + 'static) {
         *self.event_cb.write().unwrap() = Some(Arc::new(cb));

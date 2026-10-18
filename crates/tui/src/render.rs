@@ -3024,18 +3024,17 @@ fn title_token_text(state: &AppState) -> String {
     )
 }
 
-/// 输入框标题栏 thinking 指示器的基础文案（即"这一步在做什么"，不含 spinner 帧
-/// 与「第 N 步」前缀）。
+/// 输入框标题栏 thinking 指示器的基础文案（即"这一步在做什么"，不含 spinner 帧）。
 ///
 /// 优先级（从最具辨识度到默认）：
 ///   1. `permission_dialog` → "Waiting for approval"
 ///   2. `plan_dialog`       → "Reviewing plan"
 ///   3. 当前 InProgress TodoItem 的 `active_form` 或 `content` —— 用户视角的**意图**：
 ///      "修复登录 bug" 比 "Edit" 更能回答"这一轮到底在干什么"
-///   4. `current_tool_name` —— 只有工具名（`Bash` / `Read`），**不带参数**。
+///   4. `current_tool_name` → 动词短语（[`tool_activity_label`]）：`Bash` → "运行命令"。
 ///      参数已经完整画在聊天区的 `⏺ Bash(cargo test)` 上，标题栏复述一遍就是
 ///      逐字节重复：底部那行与聊天区最后一条永远一模一样，用户看着像卡住了。
-///      两处分工是「聊天区答'在做什么动作'，标题栏答'为哪件事、第几步'」。
+///      但只显示工具名（`Bash`）同样答不了"在做什么"——动词短语补的正是这段。
 ///   5. `current_op` 原文 —— 仅剩非工具型后台任务（`/compact` 等，见
 ///      `begin_background_task`，那里 `current_tool_name` 为 None）
 ///   6. `pending_queue`    → "Queuing message"
@@ -3047,8 +3046,7 @@ fn title_token_text(state: &AppState) -> String {
 /// 非空，旧顺序下标题栏永远显示 `Bash(cargo test) · 12.3s` 且秒表继续走，
 /// 看着"在忙"实则整轮卡在等用户点 y；`plan_dialog` 同理。
 ///
-/// 由 `draw_input` 标题栏调用，格式化为
-/// `⠋ {第 N 步 · }{label} · {耗时} · {token}`。
+/// 由 `draw_input` 标题栏调用，格式化为 `⠋ {label} · {耗时} · {token}`。
 fn thinking_status_label(state: &AppState) -> String {
     // 1/2. 正在等用户交互：这是**阻塞在用户身上**而非在跑工具，必须先于
     //      `current_op` 判定，否则秒表会把"等审批的时间"算成"命令跑了多久"。
@@ -3075,9 +3073,11 @@ fn thinking_status_label(state: &AppState) -> String {
             .to_string();
     }
 
-    // 4. 工具名（不带参数）：参数在聊天区 `⏺ Bash(cargo test)` 上已经完整可见。
+    // 4. 工具动词短语（不带参数）：参数在聊天区 `⏺ Bash(cargo test)` 上已经完整
+    //    可见，这里只补"在做什么"这一层——只写工具名（`Bash`）等于把工具注册名
+    //    端给用户看，答不了"它在跑什么"。
     if let Some(name) = state.current_tool_name.as_deref() {
-        return name.to_string();
+        return tool_activity_label(name);
     }
 
     // 5. 非工具型后台任务（`/compact` / `/checkpoint` …）只有 `current_op`，
@@ -3093,16 +3093,45 @@ fn thinking_status_label(state: &AppState) -> String {
     wyj_i18n::tr("spinner.thinking")
 }
 
-/// 「第 N 步」前缀：仅本轮已经起过工具调用时出现。
+/// 工具名 → 标题栏动词短语（`Bash` → "运行命令"）。
 ///
-/// 纯思考阶段（还没调工具）与后台任务（`turn_step_no` 被
-/// `begin_background_task` 归零）都不显示——那里没有"步"的概念，硬塞一个
-/// 「第 0 步」只会让人怀疑进度统计坏了。
-fn thinking_step_prefix(state: &AppState) -> String {
-    if state.turn_step_no == 0 {
-        return String::new();
+/// **为什么不复用 `current_op` 原文**：那是 `Bash(cargo test)`，与聊天区的 `⏺`
+/// 行逐字节相同，底部只是在抄上面最后一条（v0.3.7 修过一次的形态）。
+/// **为什么不直接显示工具名**：`Bash` / `Read` 是注册名，不是动作——用户得先知道
+/// 这个 CLI 有哪些工具才读得懂。动词短语两头都避开。
+///
+/// 未收录的工具回落工具名本身：新增工具不该因为漏配一条 i18n 就显示成空白。
+fn tool_activity_label(name: &str) -> String {
+    let key = match name.to_ascii_lowercase().as_str() {
+        "bash" => "tool_activity.bash",
+        "read" => "tool_activity.read",
+        "write" => "tool_activity.write",
+        "edit" => "tool_activity.edit",
+        "glob" => "tool_activity.glob",
+        "grep" => "tool_activity.grep",
+        "webfetch" => "tool_activity.webfetch",
+        "websearch" => "tool_activity.websearch",
+        "agent" => "tool_activity.agent",
+        "todowrite" => "tool_activity.todo",
+        "askquestion" => "tool_activity.ask",
+        "exitplanmode" => "tool_activity.plan",
+        "toolsearch" => "tool_activity.tool_search",
+        "codesearch" => "tool_activity.code_search",
+        "memory" => "tool_activity.memory",
+        "bashoutput" => "tool_activity.bash_output",
+        "killshell" => "tool_activity.kill_shell",
+        "contextrecall" => "tool_activity.context_recall",
+        "computer" | "app_computer" => "tool_activity.computer",
+        _ => return name.to_string(),
+    };
+    let label = wyj_i18n::tr(key);
+    // rust-i18n 对拼错的 key 是**静默回退成 key 字面量**，那样标题栏会出现
+    // "tool_activity.bash" 这种字符串。宁可退回工具名也不要把它露给用户。
+    if label.is_empty() || label.starts_with("tool_activity.") {
+        name.to_string()
+    } else {
+        label
     }
-    wyj_i18n::tr_fmt("spinner.step", &[("n", &state.turn_step_no.to_string())])
 }
 
 /// 排队提示：写清「已排队」+ 当前在挡着的东西。
@@ -3246,18 +3275,7 @@ fn draw_input(
         // 点数尾巴与新加的耗时/用量两段信息同时动会让整行读起来发飘，且
         // "..." 在窄终端里最容易把真正重要的操作名挤出可视区。
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
-        // 「第 N 步」并进 label 而不是单独一段：它是 label 的限定语，且必须与
-        // label 同生共死——预算不足时 `build_thinking_title` 只会对 label 做
-        // 省略号截断，把步号做成独立段就会在窄屏下先被整段丢掉。
-        let label = {
-            let step = thinking_step_prefix(state);
-            let base = thinking_status_label(state);
-            if step.is_empty() {
-                base
-            } else {
-                format!("{step} {base}")
-            }
-        };
+        let label = thinking_status_label(state);
         let elapsed = crate::app::format_hms(current_step_elapsed_secs(state));
         let tokens = title_token_text(state);
         // 排队中：挂在标题栏而不是只靠状态栏右对齐那一句——窄终端上右对齐
@@ -7546,7 +7564,7 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_label_prefers_todo_then_tool_name_then_dialogs() {
+    fn thinking_status_label_prefers_todo_then_tool_activity_then_dialogs() {
         let mut state = make_state();
         // 工具在跑，同时有 in-progress todo：标题栏答"为哪件事"而不是复述工具行
         // —— 聊天区的 `⏺ Read(...)` 已经把动作讲清楚了，两处说同一句话等于没有
@@ -7562,10 +7580,13 @@ mod tool_result_fold_tests {
         }]);
         assert_eq!(thinking_status_label(&state), "正在检查交互焦点");
 
-        // 没有 todo 时退到**工具名**：不带参数、不带后端标注。参数仍在聊天区那行
-        // `⏺ Read(crates/tui/src/render.rs)` 上，标题栏不再逐字节复述它。
+        // 没有 todo 时退到**动词短语**：既不是参数（那是聊天区的事），也不是
+        // 工具注册名（`Read` 答不了"在做什么"）。
         state.current_todos = None;
-        assert_eq!(thinking_status_label(&state), "Read");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("tool_activity.read")
+        );
         assert!(
             !thinking_status_label(&state).contains("render.rs"),
             "标题栏不得重复聊天区工具行里的参数"
@@ -7588,7 +7609,10 @@ mod tool_result_fold_tests {
             priority: None,
             active_form: Some("不应被选中".to_string()),
         }]);
-        assert_eq!(thinking_status_label(&state), "Read");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("tool_activity.read")
+        );
 
         // 工具也跑完了：没有 current_tool_name / current_op 时落到 "Thinking"。
         state.current_tool_name = None;
@@ -7675,15 +7699,23 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_status_label_prefers_tool_name_over_op_arguments() {
+    fn thinking_status_label_prefers_tool_activity_over_op_arguments() {
         // 回归钉子：标题栏曾直接回显 `current_op`（`"Bash(cargo test -p wyj-core)"`），
         // 而聊天区最后一条恰好也是这个字符串 —— 用户看到的就是"底部把上面那条
         // 又抄了一遍"，动的是同一行文字，看起来像界面卡住。
         let mut state = make_state();
         state.current_op = Some("Bash(cargo test -p wyj-core)".to_string());
         state.current_tool_name = Some("Bash".to_string());
-        assert_eq!(thinking_status_label(&state), "Bash");
+        assert_eq!(
+            thinking_status_label(&state),
+            wyj_i18n::tr("tool_activity.bash")
+        );
         assert!(!thinking_status_label(&state).contains("cargo test"));
+        assert_ne!(
+            thinking_status_label(&state),
+            "Bash",
+            "标题栏不该把工具注册名端给用户：`Bash` 答不了「在做什么」"
+        );
 
         // 非工具型后台任务没有 current_tool_name，只有 current_op —— 那是它的
         // 全部标签（`/compact`），聊天区没有对应行，照原样显示。
@@ -7700,15 +7732,41 @@ mod tool_result_fold_tests {
     }
 
     #[test]
-    fn thinking_step_prefix_only_appears_once_a_tool_started_this_turn() {
-        let mut state = make_state();
-        // 纯思考阶段（还没起工具）没有"步"的概念，硬塞「第 0 步」会让人怀疑统计坏了。
-        assert_eq!(thinking_step_prefix(&state), "");
-        state.turn_step_no = 3;
-        assert_eq!(
-            thinking_step_prefix(&state),
-            wyj_i18n::tr_fmt("spinner.step", &[("n", "3")])
-        );
+    fn tool_activity_label_covers_every_registered_tool_and_falls_back_to_name() {
+        // 标题栏的动词短语必须覆盖当前全部内置工具——漏一个就等于那个工具在跑时
+        // 底部又退回显示注册名（`Bash` 那种读不懂的形态）。清单与
+        // `crates/tools` 里各 Tool::name() 以及 core 的 ToolSearch/CodeSearch 同源。
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+            "TodoWrite",
+            "AskQuestion",
+            "ExitPlanMode",
+            "ToolSearch",
+            "CodeSearch",
+            "Memory",
+            "BashOutput",
+            "KillShell",
+            "ContextRecall",
+            "computer",
+            "app_computer",
+        ] {
+            let label = tool_activity_label(name);
+            assert_ne!(label, name, "{name} 没有对应的动词短语");
+            assert!(
+                !label.starts_with("tool_activity."),
+                "{name} 的 i18n key 未解析：{label:?}"
+            );
+        }
+        // 未收录的工具回落注册名本身：新增工具不该因为漏配一条 i18n 显示成空白。
+        assert_eq!(tool_activity_label("BrandNewTool"), "BrandNewTool");
     }
 
     #[test]
@@ -8912,10 +8970,12 @@ mod tool_result_fold_tests {
     /// 四段信息各由独立状态驱动（spinner 帧 / `thinking_status_label` /
     /// `current_step_elapsed_secs` / `title_token_text`），这里整帧渲染一次全部验掉：
     ///   1. spinner 帧打头（SPINNER_FRAMES[0] = ⠋）—— 唯一的运动效果来源
-    ///   2. label 用工具原文 `Bash(cargo test)`，而非旧短语 "Running command"
+    ///   2. label 是动词短语 `运行命令`，而非工具注册名 `Bash`，也不是
+    ///      聊天区那条带参数的 `Bash(cargo test)`
     ///   3. 耗时取**这一步**的起点（1.5s），不是整轮的 3s
     ///   4. token 是本轮增量 `1,000↑ 40↓`，不是 session 累计
     ///   5. 不含 "..." 点数尾巴（与耗时/用量同时动会发飘，窄屏最先被挤掉）
+    ///   6. 不含「第 N 步」——步号既不回答"还剩多少"也不回答"在做什么"
     #[test]
     fn draw_input_title_shows_step_elapsed_and_turn_tokens_when_thinking() {
         use ratatui::backend::TestBackend;
@@ -8930,7 +8990,6 @@ mod tool_result_fold_tests {
         state.current_op = Some("Bash(cargo test)".to_string());
         state.current_tool_name = Some("Bash".to_string());
         state.current_op_started = Some(Instant::now() - std::time::Duration::from_millis(1500));
-        state.turn_step_no = 2;
         state.turn_live_input_tokens = 1_000;
         state.turn_live_output_tokens = 40;
         state.total_input_tokens = 1_100;
@@ -8954,25 +9013,29 @@ mod tool_result_fold_tests {
                 rendered.push(line);
             }
         }
+        let activity = wyj_i18n::tr("tool_activity.bash");
         let title_line = rendered
             .iter()
             .rev()
-            .find(|l| l.contains("Bash") || l.contains('⠋'))
-            .expect("is_thinking 时标题栏必须出现当前操作名 + ⠋ spinner");
+            .find(|l| l.contains(&activity) || l.contains('⠋'))
+            .expect("is_thinking 时标题栏必须出现当前动作短语 + ⠋ spinner");
 
         assert!(
             title_line.contains('⠋'),
             "is_thinking 时标题栏应包含 ⠋ spinner 帧，实际行: {title_line:?}"
         );
         assert!(
-            title_line.contains(&wyj_i18n::tr_fmt("spinner.step", &[("n", "2")]))
-                && title_line.contains("Bash"),
-            "标题栏应是「第 N 步 · 工具名」, 实际行: {title_line:?}"
+            title_line.contains(&activity),
+            "标题栏应是动词短语「{activity}」, 实际行: {title_line:?}"
         );
         assert!(
             !title_line.contains("cargo test"),
             "标题栏不得复述聊天区工具行里的参数（那正是「和输出区最后一条一样」的成因）, \
              实际行: {title_line:?}"
+        );
+        assert!(
+            !title_line.contains("第") && !title_line.contains("Bash"),
+            "标题栏既不该显示步号，也不该显示工具注册名, 实际行: {title_line:?}"
         );
         assert!(
             title_line.contains("1.5s") && !title_line.contains(" 3s"),
