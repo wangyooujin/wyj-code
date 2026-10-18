@@ -3,6 +3,7 @@ command:
   unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
   background_unsupported: "命令 /{name} 声明为后台执行，但返回了 TUI 无法直接渲染的结果类型：{result}"
 skill:
+  invoked: "使用 skill: /{name}"
   run:
     desc: "构建并运行当前项目"
   review:
@@ -142,10 +143,11 @@ tool_activity:
   context_recall: "回溯上下文"
   computer: "操作桌面"
 
-# 工具行尾部的后端标注：Grep 是唯一在两套搜索后端间分流的工具
+# 工具行尾部的后端标注：Grep 分两套搜索后端，MCP 工具标注外部来源
 tool_backend:
   rg: "rg"
   native: "内置"
+  mcp: "mcp"
 
 diff:
   more_lines: "    … 还有 {n} 行（Ctrl+O 展开全文）"
