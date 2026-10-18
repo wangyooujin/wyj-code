@@ -88,6 +88,7 @@ pub use session_store::{
     SessionStore,
 };
 pub use summary::SummaryGenerator;
+pub use textutil::escape_harness_markers;
 pub use tool::{Tool, ToolResult};
 pub use tool_arguments::{
     simplified_tool_definition, ToolArgumentError, ToolArgumentErrorKind, ToolArgumentIssue,

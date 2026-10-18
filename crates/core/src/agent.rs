@@ -2745,7 +2745,9 @@ impl Agent {
                     "auto 模式但本上下文未装配判定闸门，退回逐次人工确认"
                 );
                 if !ctx.confirm_tool(name, &summary).await {
-                    return Err(USER_DENIED_REASON.to_string());
+                    return Err(ctx
+                        .confirm_denial_reason(name)
+                        .unwrap_or_else(|| USER_DENIED_REASON.to_string()));
                 }
                 self.grant_for_turn(name, input);
                 return Ok(());
@@ -2773,7 +2775,9 @@ impl Agent {
             }
         }
         if !ctx.confirm_tool(name, &summary).await {
-            return Err(USER_DENIED_REASON.to_string());
+            return Err(ctx
+                .confirm_denial_reason(name)
+                .unwrap_or_else(|| USER_DENIED_REASON.to_string()));
         }
         // 用户批准后必须通知闸门清空连续计数，否则闸门仍认为「刚刚连撞」。
         //

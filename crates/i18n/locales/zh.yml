@@ -89,9 +89,6 @@ thinking:
 # 切换 locale 后看起来只翻译了一半。
 spinner:
   thinking: "思考中"
-  # 标题栏的步号前缀：{n} 是本轮已开始的工具调用序号，与后面的任务名/工具名
-  # 拼成「第 3 步 · 修复登录 bug · 4.2s · 12k↑」。
-  step: "第 {n} 步 ·"
   waiting_approval: "等待批准"
   reviewing_plan: "审阅计划"
   queuing_message: "消息排队中"
@@ -106,6 +103,30 @@ spinner:
 # 正在执行的工具的实时输出块（只显示尾部若干行）
 live_output:
   omitted: "⋮ 上面还有 {count} 行输出"
+
+# 输入框标题栏 spinner 的动词短语：标题栏答「在做什么」，聊天区的 ⏺ 行答「具体
+# 对什么做」（参数）。两处都不写工具注册名，用户不必先知道有哪些工具才读得懂。
+# 未收录的工具回落工具注册名本身（见 render::tool_activity_label）。
+tool_activity:
+  bash: "运行命令"
+  read: "读取文件"
+  write: "写入文件"
+  edit: "编辑文件"
+  glob: "查找文件"
+  grep: "搜索代码"
+  webfetch: "抓取网页"
+  websearch: "搜索网页"
+  agent: "调度子 Agent"
+  todo: "更新任务列表"
+  ask: "等待你的回答"
+  plan: "准备计划"
+  tool_search: "检索工具"
+  code_search: "搜索代码库"
+  memory: "整理记忆"
+  bash_output: "读取后台输出"
+  kill_shell: "结束后台任务"
+  context_recall: "回溯上下文"
+  computer: "操作桌面"
 
 # 工具行尾部的后端标注：Grep 是唯一在两套搜索后端间分流的工具
 tool_backend:
@@ -389,7 +410,7 @@ agents:
   tools_all: "全部标准工具"
   source_line: "来源: {source}"
   builtin_tag: "内置"
-  reload_note: "自定义定义读取自 ~/.claude/agents/ 与项目 .claude/agents/ 下的 *.md（frontmatter: name/description/tools/model，model 填 Profile 名）。此列表实时读盘，但注册给模型的类型列表在启动时固定——新增/修改定义后需重启生效。"
+  reload_note: "自定义定义读取自 ~/.wyj-code/agents/ 与项目 .wyj-code/agents/ 下的 *.md（frontmatter: name/description/tools/disallowed_tools/model/omit_claude_md，model 填 Profile 名）。此列表实时读盘，但注册给模型的类型列表在启动时固定——新增/修改定义后需重启生效。"
   dialog:
     title: "Agent 类型"
     empty: "暂无可用 Agent 类型"

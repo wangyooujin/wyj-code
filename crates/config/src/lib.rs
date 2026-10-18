@@ -378,6 +378,16 @@ pub struct SubAgentCfg {
     /// 单个子 Agent trace 文件的字节上限，超限后该子 Agent 的后续事件静默停写
     /// （不影响其它子 Agent、不影响主流程）。默认 256KB。
     pub trace_max_bytes_per_agent: u64,
+    /// 子 Agent 的最大嵌套层数（主 Agent 之下算第一层）。1 = 禁止子 Agent 再派子
+    /// Agent。默认 3。
+    ///
+    /// 触顶时 `Agent` 工具会从该层子 Agent 的工具集里**消失**（而不是留在原地
+    /// 每次调用都报错）——模型看到工具没了才会自己把活干完，否则它会换个措辞
+    /// 反复重试。
+    pub max_depth: usize,
+    /// 同时运行的子 Agent 上限（含本次会话内所有根级子 Agent）。默认 8。
+    /// 超限的 spawn 在信号量上排队等待，不会失败。
+    pub max_concurrent: usize,
 }
 
 /// `[routing]` 节 — 按角色选择模型 Profile，并在可恢复供应商故障时按顺序切换。
@@ -427,6 +437,8 @@ impl Default for SubAgentCfg {
             explore_profile: None,
             trace_enabled: true,
             trace_max_bytes_per_agent: 256 * 1024,
+            max_depth: 3,
+            max_concurrent: 8,
         }
     }
 }

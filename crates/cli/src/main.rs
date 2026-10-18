@@ -1735,15 +1735,18 @@ async fn main() -> Result<()> {
         Arc::new(std::sync::RwLock::new((*agent_defs).clone()));
     // 子 Agent 执行轨迹落盘（`SubAgentCfg::trace_enabled`，默认开启）：与
     // TUI/headless 共用同一个 Hub，`emit()` 集中接入，两端自动获得持久化能力。
-    let sub_agent_hub = Arc::new(if cfg.subagent.trace_enabled {
-        wyj_tools::SubAgentHub::new().with_trace(
-            config_base.join("sessions"),
-            session_id.clone(),
-            cfg.subagent.trace_max_bytes_per_agent,
-        )
-    } else {
-        wyj_tools::SubAgentHub::new()
-    });
+    let sub_agent_hub = Arc::new(
+        if cfg.subagent.trace_enabled {
+            wyj_tools::SubAgentHub::new().with_trace(
+                config_base.join("sessions"),
+                session_id.clone(),
+                cfg.subagent.trace_max_bytes_per_agent,
+            )
+        } else {
+            wyj_tools::SubAgentHub::new()
+        }
+        .with_max_concurrent(cfg.subagent.max_concurrent),
+    );
     // 当前已连接 MCP 工具的共享快照：`-p`/`--headless`/TUI 三种模式各自的
     // MCP 连接时机不同，但都在工具注册成功时 push 进这个句柄，供子 Agent
     // 工厂与 `/model` 重建共同读取（子 Agent 只能看到 spawn 时刻已连好的）。
@@ -1763,7 +1766,8 @@ async fn main() -> Result<()> {
             move |def| f(def)
         })
         .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-        .with_session_id(session_id.clone()),
+        .with_session_id(session_id.clone())
+        .with_max_depth(cfg.subagent.max_depth),
     ));
 
     // -p（单次问答）模式：仍在启动时连接 MCP server，但只等一个远小于
@@ -2562,8 +2566,13 @@ async fn main() -> Result<()> {
     run_result
 }
 
-/// 按 agent 定义的 `tools` 白名单（`None` 表示不限制）从给定 registry 里选出
-/// 允许该子 Agent 使用的工具集。纯函数，便于脱离 Provider/网络构建单测。
+/// 按 agent 的 `tools` 白名单（`None` 表示不限制）与 `disallowed_tools`
+/// 黑名单从给定 registry 里选出可用工具集。纯函数，便于脱离 Provider/网络
+/// 构建单测。
+///
+/// 顺序固定为「先减后取交集」：`disallowed_tools` 永远优先，即使同一个名字
+/// 也出现在 `tools` 里。只有白名单时「除 Write/Edit 之外全部」表达不出来
+/// ——MCP 工具是运行时发现的，用户根本列不全剩下的部分。
 fn select_sub_agent_tools(
     def: &wyj_core::AgentDefinition,
     registry: &ToolRegistry,
@@ -2571,6 +2580,7 @@ fn select_sub_agent_tools(
     registry
         .definitions()
         .into_iter()
+        .filter(|tdef| !is_tool_disallowed(&tdef.name, &def.disallowed_tools))
         .filter(|tdef| {
             def.tools
                 .as_ref()
@@ -2578,6 +2588,27 @@ fn select_sub_agent_tools(
         })
         .filter_map(|tdef| registry.get(&tdef.name))
         .collect()
+}
+
+/// 工具名是否命中 `disallowed_tools`。
+///
+/// 支持三种写法：`Write`（精确）、`mcp__github`（整个 server）、
+/// `mcp__github__*`（整个 server 的通配形式）。MCP 工具统一命名为
+/// `mcp__<server>__<tool>`（`crates/mcp/src/bridge.rs`），所以前者的前缀匹配
+/// 不会误伤别的 server。
+fn is_tool_disallowed(name: &str, disallowed: &[String]) -> bool {
+    disallowed.iter().any(|pattern| {
+        if let Some(server) = pattern.strip_prefix("mcp__") {
+            let server = server.trim_end_matches("__*").trim_end_matches('*');
+            let prefix = format!("mcp__{server}");
+            name == prefix
+                || name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|rest| rest.starts_with("__"))
+        } else {
+            name == pattern
+        }
+    })
 }
 
 /// computer-use 是否应当注册并按需注册：仅 macOS/Windows 编译进 `wyj-tools`
@@ -2791,8 +2822,14 @@ fn make_sub_agent_factory(
             .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(p.thinking_budget, p.interleaved_thinking)
             .with_reasoning_effort(p.effective_reasoning_effort())
-            .with_thinking_switch(p.effective_thinking_switch())
-            .with_claude_md(claude_md.clone());
+            .with_thinking_switch(p.effective_thinking_switch());
+        // 规约注入按类型分叉：Explore/Plan 与显式 `omit_claude_md` 的定义不挂
+        // loader。本仓库根规约 + 子目录规约动辄上万 token，对「找出这三处定义」
+        // 这类探索任务一次都用不上，却每趟都要付 prefill；主 Agent 读结果时
+        // 自己仍有完整规约，多数规则不需要下沉到子 Agent。
+        if !def.omit_claude_md {
+            sub_agent = sub_agent.with_claude_md(claude_md.clone());
+        }
         if let Some(store) = &evolution {
             sub_agent = sub_agent.with_evolution(store.clone());
         }
@@ -4083,6 +4120,8 @@ mod cli_tests {
             name: "custom".to_string(),
             description: String::new(),
             tools: Some(vec!["Read".to_string(), "mcp_echo".to_string()]),
+            disallowed_tools: Vec::new(),
+            omit_claude_md: false,
             model: None,
             system_prompt: String::new(),
             builtin: false,
@@ -4096,6 +4135,76 @@ mod cli_tests {
         assert!(names.iter().any(|n| n == "mcp_echo"));
         assert!(!names.iter().any(|n| n == "WebSearch"));
         assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn disallowed_tools_subtract_from_the_inherited_pool() {
+        // 「继承全部但去掉 Write/Edit」——只有白名单时表达不出来的写法
+        let def = wyj_core::AgentDefinition {
+            name: "no-writes".to_string(),
+            description: String::new(),
+            tools: None,
+            disallowed_tools: vec!["Write".to_string(), "Edit".to_string()],
+            omit_claude_md: false,
+            model: None,
+            system_prompt: String::new(),
+            builtin: false,
+            source: None,
+        };
+        let names: Vec<String> = select_sub_agent_tools(&def, &registry_with_mcp_and_websearch())
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert!(!names.iter().any(|n| n == "Write" || n == "Edit"));
+        // 其余标准工具、MCP 与 WebSearch 都还在——这正是黑名单的价值
+        assert!(names.iter().any(|n| n == "Read"));
+        assert!(names.iter().any(|n| n == "Bash"));
+        assert!(names.iter().any(|n| n == "mcp_echo"));
+    }
+
+    #[test]
+    fn disallowed_tools_win_over_the_whitelist() {
+        // 同一个名字同时出现在两边 → 移除（先减后取交集）
+        let def = wyj_core::AgentDefinition {
+            name: "contradictory".to_string(),
+            description: String::new(),
+            tools: Some(vec!["Read".to_string(), "Write".to_string()]),
+            disallowed_tools: vec!["Write".to_string()],
+            omit_claude_md: false,
+            model: None,
+            system_prompt: String::new(),
+            builtin: false,
+            source: None,
+        };
+        let names: Vec<String> = select_sub_agent_tools(&def, &registry_with_mcp_and_websearch())
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["Read".to_string()]);
+    }
+
+    #[test]
+    fn disallowed_mcp_server_patterns_match_the_whole_server() {
+        assert!(is_tool_disallowed(
+            "mcp__github__create_issue",
+            &["mcp__github".to_string()]
+        ));
+        assert!(is_tool_disallowed(
+            "mcp__github__create_issue",
+            &["mcp__github__*".to_string()]
+        ));
+        assert!(is_tool_disallowed(
+            "mcp__github",
+            &["mcp__github".to_string()]
+        ));
+        // 前缀相同但 server 不同的不能被误伤
+        assert!(!is_tool_disallowed(
+            "mcp__github_enterprise__x",
+            &["mcp__github".to_string()]
+        ));
+        assert!(!is_tool_disallowed("Read", &["mcp__github".to_string()]));
+        assert!(is_tool_disallowed("Read", &["Read".to_string()]));
+        assert!(!is_tool_disallowed("Read", &["Write".to_string()]));
     }
 
     #[test]
