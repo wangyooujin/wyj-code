@@ -554,6 +554,7 @@ mod tests {
             title_generated: false,
             compact_count: 0,
             elided_blobs: vec![],
+            session_profile: None,
             context_edit_freed_tokens: 0,
         };
         let mut messages = session_file.messages.clone();
