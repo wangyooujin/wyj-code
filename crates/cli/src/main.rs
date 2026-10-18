@@ -1494,14 +1494,44 @@ async fn main() -> Result<()> {
     } else {
         RoutingRole::Execute
     };
+    // 会话级分组（`/model` 面板「仅本会话使用」）：随会话文件落盘，`--resume`
+    // / `-c` 后继续生效。优先级 **显式 `--profile` > 会话级分组 > routing 默认**。
+    // 显式 `--profile` 是「这次运行就按它来」的强意图，不该被会话历史覆盖；
+    // 它也不写回会话文件，下次不带参数 resume 仍用会话记录的那一个。
+    //
+    // 先把「全局默认值」定下来再叠加覆盖：两者必须分开，否则 `tui_cfg` 里
+    // 留下的就是临时分组，`/config` 一保存就把它固化成全局默认值。
+    let mut global_cfg = cfg.clone();
     if !profile_was_explicit {
-        if let Some(primary) = configured_route_names(&cfg, routing_role)
+        if let Some(primary) = configured_route_names(&global_cfg, routing_role)
             .into_iter()
             .next()
         {
-            cfg.active_profile = primary;
+            global_cfg.active_profile = primary;
         }
     }
+    let session_profile_override: Option<String> = if profile_was_explicit {
+        None
+    } else {
+        session_store_arc
+            .as_ref()
+            .and_then(|store| store.load(&session_id).ok())
+            .and_then(|file| file.session_profile)
+            // 分组被改名/删除时静默回落全局：留着一个不存在的名字只会让
+            // `build_provider` 在启动阶段直接失败，而用户其实没做错什么。
+            .filter(|name| cfg.profile_by_name(name).is_some())
+    };
+    // `cfg` 从这一刻起代表**本次运行实际生效**的配置（可能带会话级覆盖），
+    // 供 Provider 构建与模型选择使用；写盘一律用 `global_cfg`（见下）。
+    if let Some(name) = &session_profile_override {
+        cfg.active_profile = name.clone();
+    } else if !profile_was_explicit {
+        cfg.active_profile = global_cfg.active_profile.clone();
+    }
+    // 传给 TUI 的 config 必须携带**全局默认值**：`/config` `/memory` 等面板
+    // 保存时写的是它。生效值由 `state.session_profile_override` 在构造
+    // Provider 时叠加（`AppState::effective_config`）。
+    let tui_cfg = global_cfg;
 
     // 按模式选择模型
     let model_name = model_for_routing_role(cfg.active_profile(), routing_role);
@@ -2510,7 +2540,8 @@ async fn main() -> Result<()> {
             mode,
             todo_store,
             system_prompt_extra,
-            cfg,
+            tui_cfg,
+            session_profile_override,
             sub_agent_hub.clone(),
             local_plugin.clone(),
             mcp_tools.clone(),

@@ -522,15 +522,33 @@ pub const MEMORY_SYSTEM: &str = "You extract long-term memories from coding-agen
 /// 每次 provider 请求的真实工具清单边界。第三方模型有时会把跨会话记忆中
 /// “上次没有某工具”的陈述误当成当前 schema 事实，因此显式列出本次可直接调用
 /// 的工具，并说明 default/bypass 只改变审批语义。
-pub fn current_tool_availability_block(names: &[&str]) -> String {
+///
+/// `hidden` 是 lazy schema 折叠掉的工具（按来源分组计数）。**这一行不能省**：
+/// 只报「直接可调用」的名单，模型会把「不在列表里」读成「本会话没有这个
+/// 工具」。实测（2026-10-18）MCP codegraph 的 8 个工具全被折叠后，模型回答
+/// “当前会话未挂载任何 MCP 工具”并改用 Read/Grep 手工翻代码——而它们一直在
+/// catalog 里，只是没人告诉模型可以去检索。列表为空时输出与旧版逐字节相同。
+pub fn current_tool_availability_block(names: &[&str], hidden: &[(String, usize)]) -> String {
     let attached = if names.is_empty() {
         "(none)".to_string()
     } else {
         names.join(", ")
     };
-    format!(
-        "<current-tool-availability>\nThe tool definitions attached to this request are the sole authority for what is directly callable now. Historical memory and prior turns may be stale and must never override this list. If a needed tool appears below, call it instead of claiming it is unavailable. default/bypass permission modes affect approval and execution only; they do not remove schemas.\nAttached tools: {attached}\n</current-tool-availability>"
-    )
+    let mut block = format!(
+        "<current-tool-availability>\nThe tool definitions attached to this request are the sole authority for what is directly callable now. Historical memory and prior turns may be stale and must never override this list. If a needed tool appears below, call it instead of claiming it is unavailable. default/bypass permission modes affect approval and execution only; they do not remove schemas.\nAttached tools: {attached}"
+    );
+    if !hidden.is_empty() {
+        let listed = hidden
+            .iter()
+            .map(|(source, count)| format!("{source} ({count})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        block.push_str(&format!(
+            "\nHidden but available via ToolSearch: {listed}. Their absence above means folded, not missing — call ToolSearch with a capability query to expose them on the next turn."
+        ));
+    }
+    block.push_str("\n</current-tool-availability>");
+    block
 }
 
 /// 记忆提取指令。`{conversation}` 处拼对话文本。输出格式与 memory.rs 解析器约定一致。
@@ -711,10 +729,28 @@ mod tests {
 
     #[test]
     fn current_tool_block_makes_request_schemas_authoritative() {
-        let block = current_tool_availability_block(&["Bash", "window_capture"]);
+        let block = current_tool_availability_block(&["Bash", "window_capture"], &[]);
         assert!(block.contains("sole authority"));
         assert!(block.contains("default/bypass"));
         assert!(block.contains("Bash, window_capture"));
+        // 无折叠时输出与旧版逐字节相同：这一行只该在真被折叠时出现。
+        assert!(!block.contains("Hidden but available"));
+    }
+
+    /// 折叠提示必须点名来源与数量，并指路 ToolSearch——只报「直接可调用」
+    /// 的名单会让模型把 MCP 工具当成「本会话未挂载」。
+    #[test]
+    fn current_tool_block_names_folded_sources() {
+        let hidden = vec![("builtin".to_string(), 2), ("mcp:codegraph".to_string(), 8)];
+        let block = current_tool_availability_block(&["Bash"], &hidden);
+        assert!(block.contains("Hidden but available via ToolSearch"));
+        assert!(block.contains("mcp:codegraph (8)"));
+        assert!(block.contains("builtin (2)"));
+        assert!(
+            block.contains("folded, not missing"),
+            "必须显式否认「不在列表里 = 不存在」，否则模型仍会断言工具缺失"
+        );
+        assert!(block.trim_end().ends_with("</current-tool-availability>"));
     }
 
     #[test]

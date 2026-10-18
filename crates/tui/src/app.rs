@@ -129,10 +129,17 @@ pub struct ChatMessage {
     pub display_summary: String,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
     pub sub_agent_id: Option<u64>,
-    /// Assistant 消息的 markdown 渲染缓存（宽度, 渲染行）。消息定稿后内容
-    /// 不再变化，缓存避免每帧（约 20fps）对全部历史重跑 markdown 解析，
-    /// 长对话下这是交互延迟的主要来源。宽度变化时自动失效。
-    pub md_cache: std::cell::RefCell<Option<(usize, Vec<ratatui::text::Line<'static>>)>>,
+    /// 按宽度缓存的正文渲染结果（`(宽度, 渲染行)`）。
+    ///
+    /// 服务两类「定稿后内容不再变化」的正文：Assistant 的 markdown
+    /// （`render_markdown`）与 `!` bash 的折行结果。消息定稿后缓存避免每帧
+    /// （约 20fps）对全部历史重跑解析/折行，长对话下这是交互延迟的主要来源。
+    /// 宽度变化时自动失效。
+    ///
+    /// 名字里的 `render` 是刻意的：一旦正文被折叠/截断（曾经的三行预览）就
+    /// 没有缓存的必要——被丢掉的那部分根本不必算；这个字段存在的前提就是
+    /// 「全文都要画」。
+    pub render_cache: std::cell::RefCell<Option<(usize, Vec<ratatui::text::Line<'static>>)>>,
 }
 
 impl ChatMessage {
@@ -148,7 +155,7 @@ impl ChatMessage {
             tool_name: None,
             display_summary: String::new(),
             sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
+            render_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -204,7 +211,7 @@ impl ChatMessage {
             tool_name: Some(name),
             display_summary: summary,
             sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
+            render_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -220,7 +227,7 @@ impl ChatMessage {
             tool_name: None,
             display_summary: String::new(),
             sub_agent_id: None,
-            md_cache: std::cell::RefCell::new(None),
+            render_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -1923,6 +1930,10 @@ async fn run_branch_in_background(
     sess.current_checkpoint_id = branch.current_checkpoint_id;
     sess.branch_parent_session_id = branch.branch_parent_session_id;
     sess.branch_parent_checkpoint_id = branch.branch_parent_checkpoint_id;
+    // 分支继承父会话的临时分组（`branch_from_checkpoint` 已把它写进新会话
+    // 文件）。内存 Session 也要带上，否则下一次 autosave 会把新分支文件里的
+    // 这个字段覆盖成 None，`--resume` 分支时又悄悄回到全局默认端点。
+    sess.session_profile = branch.session_profile.clone();
     drop(sess);
     retarget_agent_session(shared_agent, Some(sessions), &new_session_id);
 
@@ -2064,7 +2075,7 @@ impl ProfileEntryDraft {
             base_url: t.base_url.to_string(),
             api_key: String::new(),
             api_key_env: None,
-            max_tokens: "8192".to_string(),
+            max_tokens: "32000".to_string(),
             context_window: "200000".to_string(),
             vision: t.vision,
             thinking_budget: None,
@@ -2169,7 +2180,7 @@ impl ProfileEntryDraft {
                 Some(self.api_key.clone())
             },
             api_key_env: self.api_key_env.clone(),
-            max_tokens: self.max_tokens.trim().parse().unwrap_or(8192),
+            max_tokens: self.max_tokens.trim().parse().unwrap_or(32_000),
             context_window: self.context_window.trim().parse().unwrap_or(200_000),
             vision: self.vision,
             thinking_budget: self.thinking_budget,
@@ -2228,12 +2239,18 @@ pub struct ProfileDialog {
     pub menu: Option<ActionMenu<ProfileRow, ProfileMenuAction>>,
     /// 拉取到的模型名列表，供 `ProfileMenuAction::ModelChoice(下标)` 按下标取值
     pub pending_models: Vec<String>,
+    /// 打开面板时当前会话的临时分组（`None` = 跟随全局）。
+    ///
+    /// 菜单据此把「仅本会话使用」画成禁用态（已经在用了），并决定要不要显示
+    /// 「恢复跟随全局」——面板内的编辑都只是草稿，不能靠 `active_idx` 判断，
+    /// 那个字段表达的是「保存后写进 config.toml 的全局默认值」。
+    pub session_profile: Option<String>,
     /// 打开面板时的快照，供 Esc 时判断"是否有未保存改动"
     saved_snapshot: (Vec<ProfileEntryDraft>, usize),
 }
 
 impl ProfileDialog {
-    fn new(cfg: &Config) -> Self {
+    fn new(cfg: &Config, session_profile: Option<String>) -> Self {
         let entries = cfg
             .profiles
             .iter()
@@ -2255,6 +2272,7 @@ impl ProfileDialog {
             live_input: InputBox::new(),
             menu: None,
             pending_models: Vec::new(),
+            session_profile,
             saved_snapshot,
         }
     }
@@ -2264,7 +2282,7 @@ impl ProfileDialog {
     /// 编辑 API Key,无需先按 Enter 展开 entry。其它字段全部可访问,
     /// 但通过顶部 title / hint / api_key 必填校验引导用户聚焦 Key。
     pub fn new_for_onboarding(cfg: &Config) -> Self {
-        let mut d = Self::new(cfg);
+        let mut d = Self::new(cfg, None);
         let active_idx = cfg
             .profiles
             .iter()
@@ -2338,6 +2356,11 @@ impl ProfileDialog {
                 let is_active = entry_idx == self.active_idx;
                 let expanded = self.expanded == Some(entry_idx);
                 let can_delete = self.entries.len() > 1 && !is_active;
+                // 会话级分组的判据只能看 `session_profile`（打开面板时的真实
+                // 生效值），不能看 `active_idx`——后者是"保存后写进全局"的草稿。
+                let in_session =
+                    self.session_profile.as_deref() == Some(self.entries[entry_idx].name.as_str());
+                let has_session_override = self.session_profile.is_some();
                 let items = vec![
                     ActionMenuItem {
                         label: wyj_i18n::tr(if expanded {
@@ -2357,6 +2380,22 @@ impl ProfileDialog {
                         disabled: is_active,
                         disabled_reason: is_active
                             .then(|| wyj_i18n::tr("profile.menu.already_active")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.use_for_session"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::UseForSession),
+                        dangerous: false,
+                        disabled: in_session,
+                        disabled_reason: in_session
+                            .then(|| wyj_i18n::tr("profile.menu.already_session")),
+                    },
+                    ActionMenuItem {
+                        label: wyj_i18n::tr("profile.menu.follow_global"),
+                        action: ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal),
+                        dangerous: false,
+                        disabled: !has_session_override,
+                        disabled_reason: (!has_session_override)
+                            .then(|| wyj_i18n::tr("profile.menu.no_session_override")),
                     },
                     ActionMenuItem {
                         label: wyj_i18n::tr("profile.menu.rename"),
@@ -2635,6 +2674,11 @@ pub enum ProfileRow {
 pub enum ProfileHeaderAction {
     ToggleExpand,
     Activate,
+    /// 仅本会话使用：切换本次运行的分组，**不写 `config.toml`**，
+    /// 但随会话文件落盘，`--resume` 后继续生效。
+    UseForSession,
+    /// 取消会话级覆盖，恢复跟随全局默认分组。
+    FollowGlobal,
     Rename,
     Delete,
 }
@@ -2658,12 +2702,28 @@ pub enum ProfileMenuAction {
     ModelChoice(usize),
 }
 
+/// `/model` 面板操作菜单里会改变"本次运行用哪套端点"的动作。
+///
+/// 需要重建 Agent（`rebuild_fn` 只在主循环作用域内可见），所以菜单分发只把
+/// 意图返回给调用方，由主循环统一执行——与 `Step::Execute` 里其余纯内存动作
+/// 分开，避免把 `rebuild_fn`/`session_store` 一路透传进菜单函数。
+#[derive(Clone, PartialEq, Eq)]
+pub enum ProfileSessionAction {
+    /// 仅本会话使用该分组（不写 config.toml）。
+    Use(String),
+    /// 取消会话级覆盖，恢复跟随全局默认分组。
+    FollowGlobal,
+}
+
 /// `/model` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
+///
+/// 返回 `Some(_)` 表示选中的是「仅本会话使用 / 恢复跟随全局」，调用方必须
+/// 执行 [`apply_session_profile`]（菜单层拿不到 `rebuild_fn`）。
 fn profile_handle_menu_key(
     state: &mut AppState,
     code: KeyCode,
     agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
-) {
+) -> Option<ProfileSessionAction> {
     enum Step {
         None,
         Close,
@@ -2674,10 +2734,10 @@ fn profile_handle_menu_key(
 
     let step = {
         let Some(dialog) = &mut state.profile_dialog else {
-            return;
+            return None;
         };
         let Some(menu) = &mut dialog.menu else {
-            return;
+            return None;
         };
         let target = menu.target;
         if let Some(confirming) = menu.confirming {
@@ -2733,9 +2793,28 @@ fn profile_handle_menu_key(
             if let Some(dialog) = &mut state.profile_dialog {
                 dialog.menu = None;
             }
-            profile_execute_menu_action(state, action, target, agent_tx);
+            // 「仅本会话使用 / 恢复跟随全局」需要重建 Agent，交给主循环执行；
+            // 其余动作纯改面板内存，就地完成。
+            match action {
+                ProfileMenuAction::Header(ProfileHeaderAction::UseForSession) => {
+                    let ProfileRow::Header(entry_idx) = target else {
+                        return None;
+                    };
+                    let name = state
+                        .profile_dialog
+                        .as_ref()
+                        .and_then(|d| d.entries.get(entry_idx))
+                        .map(|e| e.name.clone())?;
+                    return Some(ProfileSessionAction::Use(name));
+                }
+                ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal) => {
+                    return Some(ProfileSessionAction::FollowGlobal);
+                }
+                other => profile_execute_menu_action(state, other, target, agent_tx),
+            }
         }
     }
+    None
 }
 
 fn profile_execute_menu_action(
@@ -2870,6 +2949,10 @@ fn profile_execute_menu_action(
                 }
             }
         }
+        // 会话级动作在 `profile_handle_menu_key` 里先行拦截（需要重建 Agent），
+        // 不会走到这里。
+        ProfileMenuAction::Header(ProfileHeaderAction::UseForSession)
+        | ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal) => {}
     }
 }
 
@@ -2920,8 +3003,21 @@ fn profile_try_save(
                     Ok(()) => {
                         saved = true;
                         state.config = new_cfg.clone();
-                        let model_for_mode = state.config.model_for_mode(&state.mode).to_string();
-                        match rebuild_fn(&state.config, &model_for_mode) {
+                        // 保存的是**全局默认值**；本会话若仍有临时分组，生效值
+                        // 依旧由 `effective_config()` 叠加。`dialog.session_profile`
+                        // 已经跟着面板内的重命名走过（见 Rename 提交分支），
+                        // 这里以它为准；分组被这次保存删掉时覆盖自动失效。
+                        if let Some(dialog) = &state.profile_dialog {
+                            state.session_profile_override = dialog.session_profile.clone();
+                        }
+                        if let Some(name) = state.session_profile_override.clone() {
+                            if new_cfg.profile_by_name(&name).is_none() {
+                                state.session_profile_override = None;
+                            }
+                        }
+                        let effective = state.effective_config();
+                        let model_for_mode = effective.model_for_mode(&state.mode).to_string();
+                        match rebuild_fn(&effective, &model_for_mode) {
                             Ok(new_agent) => {
                                 // rebuild_fn 已装配完整 system prompt，只拼回模式追加段
                                 let new_agent = new_agent
@@ -2938,7 +3034,10 @@ fn profile_try_save(
                                 );
                                 *shared_agent.write().unwrap() = Arc::new(new_agent);
                                 state.model_name = model_for_mode;
-                                state.context_window = state.config.active_profile().context_window;
+                                state.context_window = effective.active_profile().context_window;
+                                if let Some(dialog) = &mut state.profile_dialog {
+                                    dialog.session_profile = state.session_profile_override.clone();
+                                }
                                 state
                                     .messages
                                     .push(ChatMessage::system(wyj_i18n::tr("profile.saved")));
@@ -8371,7 +8470,18 @@ pub struct AppState {
     /// 状态栏提示计数、消费后回放到对话流、以及轮次已结束但仍有残留时的兜底重发
     pub pending_queue: Vec<OutgoingMessage>,
     /// 当前生效的完整配置（/config 设置面板的数据来源与保存目标）
+    ///
+    /// 这里的 `active_profile` 始终是**全局默认值**（`config.toml` 里的值）。
+    /// 会话级分组（`/model` 面板「仅本会话使用」）另存于
+    /// [`AppState::session_profile_override`]，由 [`AppState::effective_config`]
+    /// 在构造 Provider 时叠加——这样任何一次 `config.save()` 都不会把临时
+    /// 分组固化成全局默认值。
     pub config: Config,
+    /// 会话级分组覆盖（`/model` 面板「仅本会话使用」），`None` = 跟随全局。
+    ///
+    /// 只在当前会话生效，随 `SessionFile.session_profile` 落盘，`--resume`
+    /// 后继续生效；新会话 / 切换到别的会话时会被换成那个会话自己的值。
+    pub session_profile_override: Option<String>,
     /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
     pub sub_agents: BTreeMap<u64, SubAgentUiState>,
     /// 当前会话的子 Agent trace 事件缓存，按子 Agent id 索引。
@@ -8514,6 +8624,7 @@ impl AppState {
             schedule_dialog: None,
             save_needed: false,
             config,
+            session_profile_override: None,
             pending_attachments: vec![],
             pending_pastes: vec![],
             file_completions: vec![],
@@ -8706,6 +8817,39 @@ impl AppState {
                 msg.id = self.next_message_id;
                 self.next_message_id += 1;
             }
+        }
+    }
+
+    /// 构造**本次运行实际生效**的配置：在全局配置上叠加会话级分组。
+    ///
+    /// 所有"要用配置去造 Provider / 读 context_window / 算 model"的地方都必须
+    /// 走这里，而不是直接用 `self.config`——后者是全局默认值，会话级分组只在
+    /// 本字段里。反过来，任何写盘路径都必须用 `self.config`（全局值），两者
+    /// 不能混。
+    pub fn effective_config(&self) -> Config {
+        let mut cfg = self.config.clone();
+        if let Some(name) = &self.session_profile_override {
+            if cfg.profile_by_name(name).is_some() {
+                cfg.active_profile = name.clone();
+            }
+        }
+        cfg
+    }
+
+    /// 会话级分组当前是否生效（用于状态栏与 `/model` 面板提示）。
+    pub fn session_profile_active(&self) -> Option<&str> {
+        self.session_profile_override
+            .as_deref()
+            .filter(|name| self.config.profile_by_name(name).is_some())
+    }
+
+    /// 把会话级分组写入内存 Session（落盘时由 `SessionFile::from_session` 带走）。
+    fn set_session_profile_in_session(&self, session: &Arc<Mutex<Session>>, name: Option<String>) {
+        // 主循环里不能 await：拿不到锁说明回合正在跑，而回合本身是持锁者。
+        // 会话级分组只影响下一轮请求，晚一帧写入没有副作用，直接跳过即可
+        // （调用点都在 UI 线程上，且都是用户按键触发的离散操作）。
+        if let Some(mut sess) = try_session_lock(session) {
+            sess.session_profile = name;
         }
     }
 
@@ -11659,6 +11803,10 @@ pub async fn run_tui(
     system_prompt_extra: String,
     // 当前生效的完整配置（供 /config 设置面板展示初始值、保存后重建 Agent 用）
     config: Config,
+    // 会话级分组（`/model` 面板「仅本会话使用」）。`--resume` / `-c` 时由 CLI
+    // 从会话文件读出；新会话为 None。它与 `config.active_profile` 分离，
+    // 保证任何一次 `config.save()` 都不会把临时分组固化成全局默认值。
+    session_profile_override: Option<String>,
     // 子 Agent 生命周期管理中心（注册事件回调、中断、退出清理）
     hub: Arc<wyj_tools::SubAgentHub>,
     // `--plugin-dir` 临时加载的本地开发插件贡献（不落盘、仅当次进程生效）
@@ -11715,6 +11863,7 @@ pub async fn run_tui(
         todo_store,
         system_prompt_extra,
         config,
+        session_profile_override,
         hub,
         local_plugin,
         mcp_tools,
@@ -12440,6 +12589,157 @@ fn retarget_agent_session(
     *shared_agent.write().unwrap() = Arc::new(updated);
 }
 
+/// 应用 `/model` 面板的「仅本会话使用 / 恢复跟随全局」。
+///
+/// 与 `CommandResult::SwitchProfile`（写盘改全局默认值）严格区分：
+///
+/// 1. **绝不写 `config.toml`**。这是本功能的全部意义——为个别项目临时换模型
+///    不该污染全局默认值，也不该影响别的项目。
+/// 2. **记进内存 Session**（`Session.session_profile`），由 `SessionFile::from_session`
+///    落盘，`--resume` 后继续生效。落盘的只有分组名，端点/Key 仍以
+///    `config.toml` 为唯一事实来源；分组被删掉时恢复侧回落全局。
+/// 3. 重建 Agent 时用 `effective_config()`（全局配置 + 会话级覆盖），而不是
+///    直接改 `state.config.active_profile`——后者会让后续任何一次无关的
+///    `config.save()`（`/config` 改语言、`/memory` 切开关）把临时分组固化。
+///
+/// 失败时**不改任何状态**：用户仍在原来的端点上，只是多一条错误提示。
+#[allow(clippy::too_many_arguments)]
+fn apply_session_profile(
+    state: &mut AppState,
+    action: ProfileSessionAction,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    rebuild_fn: &RebuildFn,
+    system_prompt_extra: &str,
+    todo_store: &Arc<std::sync::Mutex<TodoStore>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_store: Option<&Arc<SessionStore>>,
+    current_session_id: &str,
+    session: &Arc<Mutex<Session>>,
+) {
+    let desired = match action {
+        ProfileSessionAction::Use(name) => Some(name),
+        ProfileSessionAction::FollowGlobal => None,
+    };
+    set_session_profile(
+        state,
+        desired,
+        true,
+        agent_tx,
+        rebuild_fn,
+        system_prompt_extra,
+        todo_store,
+        shared_agent,
+        session_store,
+        current_session_id,
+        session,
+    );
+}
+
+/// [`apply_session_profile`] 的实际实现，`notify = false` 供会话切换复用
+/// （那里已经有一条「已切换至会话 …」的提示，再来一条只会是噪音）。
+#[allow(clippy::too_many_arguments)]
+fn set_session_profile(
+    state: &mut AppState,
+    desired: Option<String>,
+    notify: bool,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    rebuild_fn: &RebuildFn,
+    system_prompt_extra: &str,
+    todo_store: &Arc<std::sync::Mutex<TodoStore>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_store: Option<&Arc<SessionStore>>,
+    current_session_id: &str,
+    session: &Arc<Mutex<Session>>,
+) {
+    // 名字必须能在当前全局配置里解析到：分组被改名/删除后，旧会话文件里的
+    // 名字会指向不存在的东西，静默回落全局比在下一轮请求时 400 更可解释。
+    let desired = desired.filter(|name| state.config.profile_by_name(name).is_some());
+
+    let mut candidate = state.effective_config();
+    match &desired {
+        Some(name) => candidate.active_profile = name.clone(),
+        // 恢复跟随全局：`effective_config` 本来就会回落，显式写一遍更直白。
+        None => candidate.active_profile = state.config.active_profile.clone(),
+    }
+    let model_for_mode = candidate.model_for_mode(&state.mode).to_string();
+    let new_agent = match rebuild_fn(&candidate, &model_for_mode) {
+        Ok(agent) => agent,
+        Err(e) => {
+            state
+                .messages
+                .push(ChatMessage::assistant_err(wyj_i18n::tr_fmt(
+                    "profile.switch_failed",
+                    &[("err", &e.to_string())],
+                )));
+            return;
+        }
+    };
+    let new_agent = new_agent.append_system(system_prompt_extra.trim_start().to_string());
+    let new_agent = attach_agent_session(new_agent, session_store, current_session_id);
+    let new_agent = wire_tool_callback(new_agent, agent_tx.clone(), todo_store.clone());
+    *shared_agent.write().unwrap() = Arc::new(new_agent);
+
+    state.session_profile_override = desired.clone();
+    state.model_name = model_for_mode;
+    state.context_window = candidate.active_profile().context_window;
+    state.set_session_profile_in_session(session, desired.clone());
+    // 会话级分组随会话落盘：这里只置标记，真正写盘走主循环的 autosave，
+    // 避免在按键处理里同步做一次全量 JSON 序列化。
+    state.save_needed = true;
+    if let Some(dialog) = &mut state.profile_dialog {
+        dialog.session_profile = desired.clone();
+    }
+
+    if !notify {
+        return;
+    }
+    let msg = match &desired {
+        Some(name) => wyj_i18n::tr_fmt("profile.session_switched", &[("name", name)]),
+        None => wyj_i18n::tr("profile.session_follow_global").to_string(),
+    };
+    state.messages.push(ChatMessage::assistant(msg));
+}
+
+/// 会话切换（新建 / 切历史 / branch）后把生效分组换成目标会话自己的那个。
+///
+/// 会话级分组是**会话的属性**，不是进程的属性：从 A 会话切到 B 会话，端点和
+/// 模型必须跟着 B 走，否则 B 的历史由一个它从未用过的模型续写。目标会话没有
+/// 覆盖时回落全局默认值。
+#[allow(clippy::too_many_arguments)]
+fn adopt_session_profile(
+    state: &mut AppState,
+    target: Option<String>,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    rebuild_fn: &RebuildFn,
+    system_prompt_extra: &str,
+    todo_store: &Arc<std::sync::Mutex<TodoStore>>,
+    shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_store: Option<&Arc<SessionStore>>,
+    current_session_id: &str,
+    session: &Arc<Mutex<Session>>,
+) {
+    let target = target.filter(|name| state.config.profile_by_name(name).is_some());
+    if target == state.session_profile_override {
+        // 同一个分组：不必重建 Agent（重建会换掉 provider 句柄，正在跑的
+        // 工具/缓存都白费），但会话文件里的记录要跟上目标会话。
+        state.set_session_profile_in_session(session, target);
+        return;
+    }
+    set_session_profile(
+        state,
+        target,
+        false,
+        agent_tx,
+        rebuild_fn,
+        system_prompt_extra,
+        todo_store,
+        shared_agent,
+        session_store,
+        current_session_id,
+        session,
+    );
+}
+
 fn attach_agent_session(
     mut agent: Agent,
     sessions: Option<&Arc<SessionStore>>,
@@ -13049,6 +13349,7 @@ async fn tui_main(
     todo_store: Arc<std::sync::Mutex<TodoStore>>,
     system_prompt_extra: String,
     config: Config,
+    session_profile_override: Option<String>,
     hub: Arc<wyj_tools::SubAgentHub>,
     local_plugin: Option<wyj_store::lockfile::PluginContributions>,
     mcp_tools: wyj_tools::SharedMcpTools,
@@ -13086,6 +13387,7 @@ async fn tui_main(
         config,
         hub.clone(),
     );
+    state.session_profile_override = session_profile_override;
     if needs_api_key_onboarding {
         // 首次启动缺 API Key 时,默认聚焦 api_key 字段而非 entry header,
         // 用户键入即开始编辑 ProfileDialog,无需先按 Enter 展开。
@@ -13282,6 +13584,22 @@ async fn tui_main(
         // 之后 autosave / checkpoint 才会写到新会话上。
         if state.current_session_id != current_session_id {
             current_session_id = state.current_session_id.clone();
+            // 分支会话继承了父会话的临时分组（`branch_from_checkpoint` 写进
+            // 新会话文件、后台 task 写进内存 Session）。这里把它落到 AppState
+            // 并重建 Agent：不做的话分支内容会由一个它从未用过的端点续写。
+            let branch_profile = try_session_lock(&session).and_then(|s| s.session_profile.clone());
+            adopt_session_profile(
+                &mut state,
+                branch_profile,
+                &agent_tx,
+                &rebuild_fn,
+                &system_prompt_extra,
+                &todo_store,
+                &shared_agent,
+                session_store.as_ref(),
+                &current_session_id,
+                &session,
+            );
         }
 
         // 回合 task 看门狗。必须排在上面两处排空之后：task 正常收尾是「先塞
@@ -13720,6 +14038,19 @@ async fn tui_main(
                                             session_store.as_ref(),
                                             &current_session_id,
                                         );
+                                        // 新会话不继承上一个会话的临时分组。
+                                        adopt_session_profile(
+                                            &mut state,
+                                            None,
+                                            &agent_tx,
+                                            &rebuild_fn,
+                                            &system_prompt_extra,
+                                            &todo_store,
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                            &session,
+                                        );
                                         state
                                             .messages
                                             .push(ChatMessage::system("已开始新会话".to_string()));
@@ -13798,6 +14129,21 @@ async fn tui_main(
                                                     state.selected_sub_agent = None;
                                                     state.sub_agent_detail_open = false;
                                                     state.reset_sub_agent_detail_view();
+                                                    // 生效分组跟着目标会话走：B 会话
+                                                    // 若记录了临时分组，就用它重建 Agent；
+                                                    // 没记录则回落全局默认值。
+                                                    adopt_session_profile(
+                                                        &mut state,
+                                                        file.session_profile.clone(),
+                                                        &agent_tx,
+                                                        &rebuild_fn,
+                                                        &system_prompt_extra,
+                                                        &todo_store,
+                                                        &shared_agent,
+                                                        session_store.as_ref(),
+                                                        &current_session_id,
+                                                        &session,
+                                                    );
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已切换至会话 {}  共 {} 轮对话",
@@ -14070,7 +14416,17 @@ async fn tui_main(
                                         state.input_owner = None;
                                         if !name.trim().is_empty() {
                                             if let Some(dialog) = &mut state.profile_dialog {
-                                                dialog.entries[entry_idx].name = name;
+                                                let old = dialog.entries[entry_idx].name.clone();
+                                                dialog.entries[entry_idx].name = name.clone();
+                                                // 重命名的是本会话正在用的分组时，
+                                                // 覆盖记录里的名字要跟着改：否则
+                                                // Ctrl+S 时按新名字找不到旧覆盖，
+                                                // 会静默回落全局（安全但意外）。
+                                                if dialog.session_profile.as_deref()
+                                                    == Some(old.as_str())
+                                                {
+                                                    dialog.session_profile = Some(name);
+                                                }
                                             }
                                         }
                                     }
@@ -15464,7 +15820,22 @@ async fn tui_main(
 
                         // ── 操作菜单已打开：Up/Down 选、Enter 确认/二次确认、Esc 逐级返回
                         if state.profile_dialog.as_ref().unwrap().menu.is_some() {
-                            profile_handle_menu_key(&mut state, key.code, &agent_tx);
+                            if let Some(action) =
+                                profile_handle_menu_key(&mut state, key.code, &agent_tx)
+                            {
+                                apply_session_profile(
+                                    &mut state,
+                                    action,
+                                    &agent_tx,
+                                    &rebuild_fn,
+                                    &system_prompt_extra,
+                                    &todo_store,
+                                    &shared_agent,
+                                    session_store.as_ref(),
+                                    &current_session_id,
+                                    &session,
+                                );
+                            }
                             continue;
                         }
 
@@ -16924,6 +17295,19 @@ async fn tui_main(
                                                 session_store.as_ref(),
                                                 &current_session_id,
                                             );
+                                            // 新会话不继承上一个会话的临时分组。
+                                            adopt_session_profile(
+                                                &mut state,
+                                                None,
+                                                &agent_tx,
+                                                &rebuild_fn,
+                                                &system_prompt_extra,
+                                                &todo_store,
+                                                &shared_agent,
+                                                session_store.as_ref(),
+                                                &current_session_id,
+                                                &session,
+                                            );
                                             state.messages.push(ChatMessage::system(
                                                 wyj_i18n::tr("new.started").to_string(),
                                             ));
@@ -17111,8 +17495,10 @@ async fn tui_main(
                                         )));
                                     }
                                     Ok(CommandResult::OpenProfileDialog) => {
-                                        state.profile_dialog =
-                                            Some(ProfileDialog::new(&state.config));
+                                        state.profile_dialog = Some(ProfileDialog::new(
+                                            &state.config,
+                                            state.session_profile_override.clone(),
+                                        ));
                                     }
                                     Ok(CommandResult::ModelDoctor(profile_name)) => {
                                         let selected = match profile_name.as_deref() {
@@ -17151,6 +17537,21 @@ async fn tui_main(
                                             match new_cfg.save() {
                                                 Ok(()) => {
                                                     state.config = new_cfg.clone();
+                                                    // `/model <名>` 是「把全局默认值改成它」，
+                                                    // 与「仅本会话使用」语义相反。此时若还留着
+                                                    // 会话级覆盖，生效值仍是旧的那套端点，用户会
+                                                    // 看到"切了但没生效"。清掉覆盖让本会话立刻
+                                                    // 跟随新的全局值（同时把会话文件里的记录也清掉，
+                                                    // 否则下次 resume 又回到旧覆盖）。
+                                                    if state
+                                                        .session_profile_override
+                                                        .take()
+                                                        .is_some()
+                                                    {
+                                                        state.set_session_profile_in_session(
+                                                            &session, None,
+                                                        );
+                                                    }
                                                     let model_for_mode = state
                                                         .config
                                                         .model_for_mode(&state.mode)
@@ -20282,6 +20683,132 @@ mod profile_dialog_onboarding_tests {
             .position(|p| p.name == cfg.active_profile)
             .unwrap_or(0);
         assert_eq!(d.expanded, Some(active_idx));
+    }
+
+    /// 「仅本会话使用」必须与「设为当前」严格区分：前者只看打开面板时
+    /// `session_profile` 的真实生效值，后者看 `active_idx`（保存后写进全局
+    /// 的草稿）。两者混用会出现「本会话在用 A，菜单却把 B 标成已启用」。
+    #[test]
+    fn session_profile_menu_marks_only_the_effective_session_profile() {
+        let mut profiles = Config::default().profiles;
+        for name in ["alpha", "beta"] {
+            profiles.push(wyj_config::Profile {
+                name: name.to_string(),
+                ..wyj_config::Profile::default()
+            });
+        }
+        let cfg = Config {
+            active_profile: "alpha".to_string(),
+            profiles,
+            ..Config::default()
+        };
+        let mut dialog = ProfileDialog::new(&cfg, Some("beta".to_string()));
+
+        fn use_item(
+            dialog: &mut ProfileDialog,
+            entry_idx: usize,
+        ) -> ActionMenuItem<ProfileMenuAction> {
+            dialog.cursor = entry_idx; // expanded = None 时 Header(i) 就是第 i 行
+            dialog
+                .build_menu()
+                .into_iter()
+                .flat_map(|menu| menu.items)
+                .find(|item| {
+                    matches!(
+                        item.action,
+                        ProfileMenuAction::Header(ProfileHeaderAction::UseForSession)
+                    )
+                })
+                .expect("头行菜单必须有「仅本会话使用」")
+        }
+
+        let alpha_idx = cfg.profiles.iter().position(|p| p.name == "alpha").unwrap();
+        let beta_idx = cfg.profiles.iter().position(|p| p.name == "beta").unwrap();
+        // alpha 是全局默认值（active_idx），但本会话实际在用 beta：
+        // 「仅本会话使用」对 alpha 必须可用，对 beta 必须禁用。
+        assert!(!use_item(&mut dialog, alpha_idx).disabled);
+        assert!(use_item(&mut dialog, beta_idx).disabled);
+
+        // 跟随全局：本会话有覆盖时可用，没有时禁用。
+        let follow_item = |d: &ProfileDialog| {
+            let mut d = ProfileDialog {
+                entries: d.entries.clone(),
+                active_idx: d.active_idx,
+                cursor: alpha_idx,
+                expanded: None,
+                overlay: ProfileOverlay::None,
+                error: None,
+                live_input: InputBox::new(),
+                menu: None,
+                pending_models: Vec::new(),
+                session_profile: d.session_profile.clone(),
+                saved_snapshot: (d.entries.clone(), d.active_idx),
+            };
+            d.cursor = alpha_idx;
+            d.build_menu()
+                .into_iter()
+                .flat_map(|menu| menu.items)
+                .find(|item| {
+                    matches!(
+                        item.action,
+                        ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal)
+                    )
+                })
+                .expect("头行菜单必须有「恢复跟随全局」")
+        };
+        assert!(!follow_item(&dialog).disabled);
+        let no_override = ProfileDialog::new(&cfg, None);
+        assert!(follow_item(&no_override).disabled);
+    }
+
+    /// 会话级覆盖只影响生效配置，绝不改动 `config.active_profile`（全局默认值）。
+    #[test]
+    fn effective_config_applies_override_without_touching_global_default() {
+        let mut profiles = Config::default().profiles;
+        profiles.push(wyj_config::Profile {
+            name: "beta".to_string(),
+            model: "beta-model".to_string(),
+            ..wyj_config::Profile::default()
+        });
+        let cfg = Config {
+            active_profile: "default".to_string(),
+            profiles,
+            ..Config::default()
+        };
+        let mut state = AppState::new(
+            PathBuf::from("/tmp"),
+            "default-model".to_string(),
+            200_000,
+            AgentMode::Auto,
+            cfg,
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        );
+        state.session_profile_override = Some("beta".to_string());
+
+        assert_eq!(state.effective_config().active_profile, "beta");
+        assert_eq!(
+            state.effective_config().active_profile().model,
+            "beta-model"
+        );
+        // 全局默认值原封不动 —— 这是「不写盘」的实现保证。
+        assert_eq!(state.config.active_profile, "default");
+    }
+
+    /// 分组被改名/删除后，残留的覆盖必须静默失效（回落全局），
+    /// 而不是让 `build_provider` 在下一轮直接失败。
+    #[test]
+    fn stale_session_profile_override_falls_back_to_global() {
+        let mut state = AppState::new(
+            PathBuf::from("/tmp"),
+            "m".to_string(),
+            200_000,
+            AgentMode::Auto,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        );
+        state.session_profile_override = Some("deleted-profile".to_string());
+        assert_eq!(state.effective_config().active_profile, "default");
+        assert!(state.session_profile_active().is_none());
     }
 }
 

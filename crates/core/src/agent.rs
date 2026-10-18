@@ -1568,9 +1568,19 @@ impl Agent {
                     .iter()
                     .map(|definition| definition.name.as_str())
                     .collect::<Vec<_>>();
+                // 被 lazy 折叠掉的部分必须点名：只报「本次直接可调用」的名单，
+                // 模型会把「不在列表里」读成「本会话没有这个工具」（实测 MCP
+                // codegraph 的 8 个工具因此从未被调用过）。分组只报来源与数量，
+                // 不展开 schema——展开就退化成不折叠。
+                let hidden_sources = self
+                    .lazy_tool_state
+                    .as_ref()
+                    .map(|state| state.hidden_sources())
+                    .unwrap_or_default();
                 request_system_volatile.push_str("\n\n");
                 request_system_volatile.push_str(&crate::prompts::current_tool_availability_block(
                     &attached_tool_names,
+                    &hidden_sources,
                 ));
                 // 语言提醒必须是 system prompt 的**最后一段**：它存在的全部理由
                 // 就是位置（`<env>` 里的语言事实在中段，被记忆快照 + CLAUDE.md

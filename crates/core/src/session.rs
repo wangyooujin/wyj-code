@@ -149,6 +149,17 @@ pub struct Session {
     pub current_checkpoint_id: Option<String>,
     pub branch_parent_session_id: Option<String>,
     pub branch_parent_checkpoint_id: Option<String>,
+    /// 本会话临时使用的分组名（`/model` 面板里「仅本会话使用」）。
+    ///
+    /// 与 `Config.active_profile` 是**两个不同的东西**：后者是写进
+    /// `~/.wyj-code/config.toml` 的全局默认值，改了会影响下次启动和其它项目；
+    /// 这个字段只活在当前会话里，随 `SessionFile` 落盘，`--resume` 后继续生效，
+    /// 会话结束就没了。`None` = 跟随全局 `active_profile`。
+    ///
+    /// 存放的是**分组名**而不是整份 `Profile` 快照：分组定义（端点/Key/窗口）
+    /// 仍以 `config.toml` 为唯一事实来源，避免会话文件里留下一份会漂移的副本。
+    /// 分组被改名或删除时，恢复侧按「找不到就回落全局」处理。
+    pub session_profile: Option<String>,
     /// 最近一次模型往返的时延画像（`/context` 面板展示）。
     pub latency: TurnLatency,
 }
@@ -208,11 +219,15 @@ impl Session {
         // 属于运行环境而非本次对话内容——`/clear` 换对话不换端点，抹掉它会让
         // 紧接着的 `/cost` 把"已降级"误报成"从未开启"。
         let prompt_cache_state = self.prompt_cache_state;
+        // 同理：会话级分组是「这个会话跑在哪套端点上」，不是对话内容。
+        // `/clear` 只清消息，不该顺手把用户刚选的会话级模型丢掉。
+        let session_profile = self.session_profile.clone();
         *self = Self {
             current_checkpoint_id,
             branch_parent_session_id,
             branch_parent_checkpoint_id,
             prompt_cache_state,
+            session_profile,
             ..Self::default()
         };
     }
@@ -431,6 +446,7 @@ impl Session {
         self.prompt_cache_state = file.prompt_cache_state;
         self.compact_count = file.compact_count;
         self.context_edit_freed_tokens = file.context_edit_freed_tokens;
+        self.session_profile = file.session_profile.clone();
         self.routing_events = file.routing_events.clone();
         self.current_checkpoint_id = file.current_checkpoint_id.clone();
         self.branch_parent_session_id = file.branch_parent_session_id.clone();

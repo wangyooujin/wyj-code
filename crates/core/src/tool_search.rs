@@ -146,6 +146,31 @@ impl LazyToolState {
         inner.core.contains(name) || inner.sticky.contains_key(name) || name == "ToolSearch"
     }
 
+    /// 本次请求被 lazy 折叠掉的工具，按 source 分组计数（source 升序）。
+    ///
+    /// 唯一用途是喂给 system prompt 的 `<current-tool-availability>`：只报
+    /// 「本次直接可调用」的名单而不提被折叠的部分，模型会把「不在列表里」
+    /// 读成「本会话没有这个工具」。实测（2026-10-18）MCP codegraph 的 8 个
+    /// 工具全部被折叠后，模型面对「列出 mcp__ 开头的工具」直接回答"没有，
+    /// 当前会话未挂载任何 MCP 工具"，随后改用 Read/Grep 手工翻代码——
+    /// 而 catalog 里那 8 个工具一直躺着，只是没人告诉它可以去检索。
+    pub fn hidden_sources(&self) -> Vec<(String, usize)> {
+        let inner = self.inner.read().unwrap();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for entry in inner.catalog.values() {
+            let name = &entry.definition.name;
+            let visible = inner.core.contains(name)
+                || inner.sticky.contains_key(name)
+                || name == "ToolSearch";
+            if !visible {
+                *counts.entry(entry.source.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut grouped: Vec<(String, usize)> = counts.into_iter().collect();
+        grouped.sort_by(|a, b| a.0.cmp(&b.0));
+        grouped
+    }
+
     fn search(
         &self,
         query: &str,
@@ -341,6 +366,45 @@ mod tests {
         assert_eq!(found[0].definition.name, "Bash");
         assert!(state.visible("Bash"));
         assert!(!state.visible("WebFetch"));
+    }
+
+    #[test]
+    fn hidden_sources_groups_folded_tools_by_source() {
+        let state = LazyToolState::new(["Read".to_string()], 8, 3);
+        for (name, description) in [
+            ("Read", "read a file"),
+            ("Bash", "run a shell command"),
+            ("WebFetch", "fetch a URL"),
+        ] {
+            state.upsert(ToolDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            });
+        }
+        let mut mcp = ToolDefinition {
+            name: "mcp__codegraph__codegraph_search".to_string(),
+            description: "search symbols".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            native: None,
+        };
+        state.upsert(mcp.clone());
+        mcp.name = "mcp__codegraph__codegraph_explore".to_string();
+        state.upsert(mcp);
+
+        // Read 是 core、ToolSearch 自动可见，其余都算折叠。
+        assert_eq!(
+            state.hidden_sources(),
+            vec![("builtin".to_string(), 2), ("mcp:codegraph".to_string(), 2)]
+        );
+
+        state.search("shell", 8, None, &[], None);
+        // Bash 被命中后已 sticky，builtin 只剩 WebFetch 一个折叠。
+        assert_eq!(
+            state.hidden_sources(),
+            vec![("builtin".to_string(), 1), ("mcp:codegraph".to_string(), 2)]
+        );
     }
 
     #[test]
