@@ -220,7 +220,7 @@ help:
     - `/memory` — 打开项目记忆面板（AGENTS.md / CLAUDE.md 等规约文件）
     - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
     - `/evolve` — 打开自进化治理中心（Active / Candidates / Episodes / Health）
-    - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换
+    - `/model [分组名]` — 管理调用分组；无参数打开管理面板，带分组名直接切换（写盘，成为全局默认）。面板里选中分组后按 Enter →「仅本会话使用」可只对当前会话生效，不写 config.toml，随会话落盘、`--resume` 后继续生效
     - `/mcp` — 管理 MCP server（浏览/搜索 Registry、安装/升级/卸载、全局或项目作用域）
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
@@ -904,6 +904,8 @@ profile:
     success: "API Key 已保存,模型: {provider} / {model}。现在可以开始对话。"
   saved: "分组已保存"
   switched: "已切换至分组 {name}"
+  session_switched: "本会话已切换至分组 {name}（仅本次会话生效，未写入配置）"
+  session_follow_global: "已恢复跟随全局分组（仅本次会话生效，未写入配置）"
   switch_failed: "[切换失败] {err}"
   not_found: "未找到分组 '{name}'"
   headless_unsupported: "[headless 模式不支持 /model 管理分组，请在 TUI 模式下使用]"
@@ -917,6 +919,10 @@ profile:
     collapse: "收起字段"
     activate: "设为当前"
     already_active: "已经是当前分组"
+    use_for_session: "仅本会话使用（不写配置）"
+    already_session: "本会话已经在用这个分组"
+    follow_global: "恢复跟随全局分组"
+    no_session_override: "本会话没有临时分组"
     rename: "重命名"
     delete: "删除"
     manual_edit: "手动编辑"

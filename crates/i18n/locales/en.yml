@@ -222,7 +222,7 @@ help:
     - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
     - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
     - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
-    - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly
+    - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly (persisted as the global default). Inside the manager, press Enter on a profile → "Use for this session" applies it to the current session only: nothing is written to config.toml, and the choice is stored in the session file so `--resume` keeps using it
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
@@ -908,6 +908,8 @@ profile:
     success: "API key saved. Model: {provider} / {model}. You can start chatting now."
   saved: "Profile saved"
   switched: "Switched to profile {name}"
+  session_switched: "This session now uses profile {name} (session only; config not written)"
+  session_follow_global: "Back to following the global profile (session only; config not written)"
   switch_failed: "[Switch failed] {err}"
   not_found: "Profile '{name}' not found"
   headless_unsupported: "[headless mode doesn't support /model profile management, use TUI mode instead]"
@@ -920,6 +922,10 @@ profile:
     expand: "Expand fields"
     collapse: "Collapse fields"
     activate: "Set as active"
+    use_for_session: "Use for this session only (don't write config)"
+    already_session: "This session already uses this profile"
+    follow_global: "Back to the global profile"
+    no_session_override: "This session has no temporary profile"
     already_active: "Already the active profile"
     rename: "Rename"
     delete: "Delete"

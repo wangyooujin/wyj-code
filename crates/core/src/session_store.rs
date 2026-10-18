@@ -70,6 +70,13 @@ pub struct SessionFile {
     /// 丢弃时能逐个 `release` —— CAS 的 `gc` 只回收 `ref_count == 0` 的 blob。
     #[serde(default)]
     pub elided_blobs: Vec<String>,
+    /// 本会话临时使用的调用分组名（`/model` 面板「仅本会话使用」）。
+    ///
+    /// `None` = 跟随 `Config.active_profile`。落盘是为了 `--resume` 后继续
+    /// 用同一套端点/模型——否则用户为这个项目临时挑的模型，一恢复就悄悄
+    /// 变回全局默认值，而聊天记录里全是另一个模型的产出。
+    #[serde(default)]
+    pub session_profile: Option<String>,
     /// 本会话 context editing 累计释放的估算 token。
     #[serde(default)]
     pub context_edit_freed_tokens: u32,
@@ -185,6 +192,7 @@ impl SessionFile {
             compact_count: session.compact_count,
             context_edit_freed_tokens: session.context_edit_freed_tokens,
             elided_blobs: session.elided_blobs.clone(),
+            session_profile: session.session_profile.clone(),
             routing_events: session.routing_events.clone(),
             current_checkpoint_id: session.current_checkpoint_id.clone(),
             branch_parent_session_id: session.branch_parent_session_id.clone(),
@@ -385,6 +393,12 @@ impl SessionStore {
         checkpoint: &crate::checkpoint::Checkpoint,
     ) -> Result<SessionFile> {
         let session_id = crate::history::new_session_id();
+        // 分支继承父会话的临时分组：分支是「在同一次上下文里另开一条线」，
+        // 换回全局默认端点会让后续对话与已有的模型产出错配。
+        let session_profile = self
+            .load(parent_session_id)
+            .ok()
+            .and_then(|f| f.session_profile);
         let file = SessionFile {
             session_id,
             title: extract_title(&checkpoint.messages),
@@ -417,6 +431,7 @@ impl SessionStore {
             title_generated: false,
             compact_count: 0,
             elided_blobs: vec![],
+            session_profile,
             context_edit_freed_tokens: 0,
         };
         self.save(&file)?;
@@ -595,6 +610,7 @@ mod tests {
             title_generated: false,
             compact_count: 0,
             elided_blobs: vec![],
+            session_profile: None,
             context_edit_freed_tokens: 0,
         }
     }
@@ -673,6 +689,61 @@ mod tests {
         assert_eq!(restored.prompt_cache_state, prompt_cache_state::DOWNGRADED);
         assert_eq!(restored.compact_count, 2);
         assert_eq!(restored.context_edit_freed_tokens, 9_000);
+    }
+
+    /// 会话级分组必须完整走完「内存 Session → SessionFile → 磁盘 → 恢复」，
+    /// 否则 `--resume` 会悄悄换回全局默认端点，而聊天记录里全是另一个模型的产出。
+    #[test]
+    fn session_profile_survives_save_load_round_trip() {
+        let base = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(base.path().join("sessions")).unwrap();
+        let mut session = Session::new();
+        session.push_user("hello");
+        session.session_profile = Some("minimax".to_string());
+
+        let file = SessionFile::from_session(
+            &session,
+            SessionFileMeta {
+                session_id: "sp".to_string(),
+                title: "t".to_string(),
+                last_preview: "p".to_string(),
+                cwd: base.path().display().to_string(),
+                timestamp: "2026-10-18T00:00:00Z".to_string(),
+                turns: 1,
+                title_generated: false,
+            },
+        );
+        assert_eq!(file.session_profile.as_deref(), Some("minimax"));
+        store.save(&file).unwrap();
+
+        let loaded = store.load("sp").unwrap();
+        assert_eq!(loaded.session_profile.as_deref(), Some("minimax"));
+
+        let mut restored = Session::new();
+        restored.restore_usage_from(&loaded);
+        assert_eq!(restored.session_profile.as_deref(), Some("minimax"));
+    }
+
+    /// 旧会话文件没有这个字段，必须反序列化成 `None` 而不是报错——
+    /// 否则升级后所有历史会话都打不开。
+    #[test]
+    fn legacy_session_file_without_session_profile_loads_as_none() {
+        let mut value =
+            serde_json::to_value(mk_file("old", Path::new("/tmp"), "2026-07-01T00:00:00Z"))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("session_profile");
+        let file: SessionFile = serde_json::from_value(value).unwrap();
+        assert_eq!(file.session_profile, None);
+    }
+
+    /// `/clear` 换的是对话内容，不是端点：会话级分组必须留下来，
+    /// 否则用户刚挑好的模型在清空对话后凭空消失。
+    #[test]
+    fn clear_conversation_keeps_session_profile() {
+        let mut s = Session::new();
+        s.session_profile = Some("minimax".to_string());
+        s.clear_conversation();
+        assert_eq!(s.session_profile.as_deref(), Some("minimax"));
     }
 
     /// 计量字段此前只活在内存里，`/resume` 后 `/cost` 的缓存与调用次数恒为 0。
@@ -785,6 +856,7 @@ mod tests {
             title_generated: false,
             compact_count: 0,
             elided_blobs: vec![],
+            session_profile: None,
             context_edit_freed_tokens: 0,
         };
         store.save(&parent).unwrap();
@@ -850,6 +922,7 @@ mod tests {
             title_generated: false,
             compact_count: 0,
             elided_blobs: vec![],
+            session_profile: None,
             context_edit_freed_tokens: 0,
         };
         store.save(&file).unwrap();

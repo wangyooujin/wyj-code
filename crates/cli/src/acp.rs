@@ -1636,6 +1636,7 @@ mod tests {
                 routing_events: Vec::new(),
                 compact_count: 0,
                 elided_blobs: vec![],
+                session_profile: None,
                 context_edit_freed_tokens: 0,
                 current_checkpoint_id: None,
                 branch_parent_session_id: None,

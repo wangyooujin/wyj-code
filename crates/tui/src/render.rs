@@ -547,29 +547,42 @@ pub(crate) fn spinner_frame_str(idx: usize) -> String {
     SPINNER_FRAMES[idx % SPINNER_FRAMES.len()].to_string()
 }
 
-/// `!` bash 命令输出的静态预览上限：标题不计入，正文最多展示三个终端视觉行。
+/// `!` bash 输出的**正文**渲染（不含标题行）：逐行折行到 `width`，首行带
+/// `⎿` 前缀、续行对齐空出同宽缩进。
 ///
-/// **只对 `MessageRole::BashOutput` 生效**。工具调用结果（`MessageRole::ToolResult`）
-/// 自 v0.2.28 起默认整块折叠、由 `Ctrl+O` 展开出全文，不再经过本上限——见
-/// `render_tool_result_block`。此常量是 `push_capped_preview_lines` 的最后依赖，
-/// 删除前需先给 BashOutput 定新策略。
-const TASK_PREVIEW_MAX_ROWS: usize = 3;
-
-/// 把静态预览正文截断到 [`TASK_PREVIEW_MAX_ROWS`] 个视觉行，超出时补一行 `...`。
-/// 仅 `!` bash 输出（`MessageRole::BashOutput`）使用。
-fn push_capped_preview_lines(
-    lines: &mut Vec<Line<'static>>,
-    preview: Vec<Line<'static>>,
-    ellipsis_prefix: &str,
-) {
-    let truncated = preview.len() > TASK_PREVIEW_MAX_ROWS;
-    lines.extend(preview.into_iter().take(TASK_PREVIEW_MAX_ROWS));
-    if truncated {
-        lines.push(Line::from(Span::styled(
-            format!("{ellipsis_prefix}..."),
-            Theme::dim(),
-        )));
+/// 空输出回落到 `(no output)`——与旧的三行预览路径一致，让「跑成功了但什么
+/// 都没打印」和「正文被清空」在屏幕上可区分。
+fn render_bash_output_body(
+    content: &str,
+    width: usize,
+    style: ratatui::style::Style,
+) -> Vec<Line<'static>> {
+    let mut body = Vec::new();
+    // 判据用 `content.trim()` 而不是「`body` 是否为空」：只含空白的输出经
+    // `lines()` 会得到若干空行，`body` 非空却毫无信息量。与旧的预览路径同义。
+    if content.trim().is_empty() {
+        body.push(Line::from(Span::styled("    ⎿ (no output)", style)));
+        return body;
     }
+    let mut first = true;
+    for raw in content.lines() {
+        if raw.trim().is_empty() {
+            // 与工具结果展开态同一条纪律：空行必须是真正的空 Line，
+            // 否则 `trim_trailing_blank_lines` 弹不掉，每条 `!` 输出尾部
+            // 都会留一行拖尾空格。
+            body.push(Line::from(""));
+            continue;
+        }
+        for wrapped in wrap_line(raw, width) {
+            let prefix = if first { "    ⎿ " } else { "       " };
+            body.push(Line::from(Span::styled(
+                format!("{prefix}{wrapped}"),
+                style,
+            )));
+            first = false;
+        }
+    }
+    body
 }
 
 pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
@@ -1188,7 +1201,7 @@ fn render_chat_message(
             } else {
                 // 已定稿消息的 markdown 渲染结果按宽度缓存：避免每帧对
                 // 全部历史重跑 markdown 解析（长对话下的主要渲染开销）
-                let mut cache = msg.md_cache.borrow_mut();
+                let mut cache = msg.render_cache.borrow_mut();
                 let mut rendered = match cache.as_ref() {
                     Some((w, cached)) if *w == max_content_width => cached.clone(),
                     _ => {
@@ -1306,24 +1319,21 @@ fn render_chat_message(
             } else {
                 Theme::tool_result()
             };
-            let mut preview = Vec::new();
-            let source = if msg.content.trim().is_empty() {
-                vec!["(no output)"]
-            } else {
-                msg.content.lines().collect::<Vec<_>>()
-            };
-            let mut first = true;
-            for raw in source {
-                for wrapped in wrap_line(raw, max_content_width.saturating_sub(7).max(1)) {
-                    let prefix = if first { "    ⎿ " } else { "       " };
-                    preview.push(Line::from(Span::styled(
-                        format!("{prefix}{wrapped}"),
-                        body_style,
-                    )));
-                    first = false;
+            // 全文渲染，不折叠、不截断：`!` bash 的输出是用户**亲手执行**的那条
+            // 命令的原始回显，3 行预览等于「我让你做的事你没让我看到」。
+            // 代价（整段输出每帧都要折行）由 `render_cache` 收掉——消息定稿后
+            // 内容不再变化，折行结果按宽度缓存一次即可。
+            let body_width = max_content_width.saturating_sub(7).max(1);
+            let mut cache = msg.render_cache.borrow_mut();
+            let mut rendered = match cache.as_ref() {
+                Some((w, cached)) if *w == body_width => cached.clone(),
+                _ => {
+                    let fresh = render_bash_output_body(&msg.content, body_width, body_style);
+                    *cache = Some((body_width, fresh));
+                    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
                 }
-            }
-            push_capped_preview_lines(lines, preview, "       ");
+            };
+            lines.append(&mut rendered);
         }
 
         MessageRole::System => {
@@ -3563,8 +3573,18 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     // 自动压缩次数也从这里移除——状态栏是常驻信息，该留给"我在哪 / 我以什么
     // 身份在跑"这类每一眼都要确认的常量，而不是会不断变长的累计数字。
     let (chip_text, chip_style) = status_mode_chip(&state.mode);
+    // 会话级分组标记：只有「仅本会话使用」生效时才出现，紧跟模型名。
+    // 必须可见——这个功能的全部风险就是用户忘了它只在本次会话生效，
+    // 或者忘了自己切过、以为全局默认值被改了。状态栏是唯一每帧都在的位置。
+    let session_tag = state
+        .session_profile_active()
+        .map(|name| format!(" [{name}]"))
+        .unwrap_or_default();
     // 芯片只带前导空格（不带尾随），否则和紧随其后的 " · " 会叠成两个空格。
-    let left_text = format!(" ◆ {} {} · {}", state.model_name, chip_text, cwd_str);
+    let left_text = format!(
+        " ◆ {}{} {} · {}",
+        state.model_name, session_tag, chip_text, cwd_str
+    );
 
     let right_len = right_help.chars().count();
     let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
@@ -3589,6 +3609,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(state.model_name.clone(), Theme::dim()));
+    if !session_tag.is_empty() {
+        // 与模型名同色：它是模型名的限定语，不是另一条独立状态。
+        spans.push(Span::styled(session_tag, Theme::dim()));
+    }
     spans.push(Span::styled(format!(" {chip_text}"), chip_style));
     spans.push(Span::styled(" · ".to_string(), Theme::dim()));
     spans.push(Span::styled(cwd_str, Theme::dim()));
@@ -8717,12 +8741,14 @@ mod tool_result_fold_tests {
         }
     }
 
-    /// `!` bash 命令输出（`MessageRole::BashOutput`）**不折叠**，保持三行预览。
+    /// `!` bash 命令输出（`MessageRole::BashOutput`）**出全文**：不折叠、
+    /// 不截断、不补 `...`，且与 `Ctrl+O` 开关无关。
     ///
-    /// 该分支是 `push_capped_preview_lines` / `TASK_PREVIEW_MAX_ROWS` 的最后调用点，
-    /// 且此前零测试覆盖——删掉截断常量或误把折叠逻辑扩到这里都会让本测试变红。
+    /// 这条替代了旧的「三行预览」钉子。`!` 是用户亲手敲的命令，它的输出是
+    /// 用户明确要看的回显——按屏幕高度裁掉就等于替用户决定他该看到什么。
+    /// 展开态/折叠态都不该出现省略标记，也必须能一直滚到最后一行。
     #[test]
-    fn bangs_bash_output_keeps_its_own_three_line_preview() {
+    fn bangs_bash_output_renders_every_line_regardless_of_expand() {
         let output = (1..=10)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
@@ -8730,18 +8756,52 @@ mod tool_result_fold_tests {
         let mut msg = message(MessageRole::BashOutput, &output);
         msg.elapsed_secs = Some(0.4);
 
-        // Ctrl+O 无论开关，都保持三行预览 + `...`
         for expanded in [false, true] {
             let rendered = render_messages_with_output_expanded(&[msg.clone()], 100, expanded);
             assert!(
-                rendered.iter().any(|line| line.trim() == "..."),
-                "`!` 输出应保留 3 行预览（expanded={expanded}）: {rendered:?}"
+                !rendered.iter().any(|line| line.trim() == "..."),
+                "`!` 输出不得再出现三行预览的省略标记（expanded={expanded}）: {rendered:?}"
             );
             assert!(
-                !rendered.iter().any(|line| line.contains("line 10")),
-                "`!` 输出不应因 Ctrl+O 而出全文（expanded={expanded}）: {rendered:?}"
+                rendered.last().is_some_and(|l| l.contains("line 10")),
+                "末行必须是输出的最后一行而非省略标记（expanded={expanded}）: {rendered:?}"
             );
+            for i in 1..=10 {
+                assert!(
+                    rendered
+                        .iter()
+                        .any(|line| line.contains(&format!("line {i}"))),
+                    "第 {i} 行必须可见（expanded={expanded}）: {rendered:?}"
+                );
+            }
         }
+    }
+
+    /// `!` 输出里超过屏幕宽度的长行必须折行，且**不能被静默截断**——全文渲染
+    /// 的意义包含长行，丢了就是又变回「用户没看到的那部分」。
+    #[test]
+    fn bangs_bash_output_wraps_long_lines_instead_of_dropping_them() {
+        let long_line = "x".repeat(250);
+        let msg = message(MessageRole::BashOutput, &long_line);
+        let rendered = render_messages_with_output_expanded(&[msg], 80, false);
+
+        let xs: usize = rendered.iter().map(|l| l.matches('x').count()).sum();
+        assert_eq!(xs, 250, "折行后所有 x 都必须还在: {rendered:?}");
+        assert!(
+            rendered.len() > 4,
+            "250 字符的长行在 80 宽下必须折成多行: {rendered:?}"
+        );
+    }
+
+    /// 空的 `!` 输出必须显式回落到 `(no output)`，而不是渲染成一块空白。
+    #[test]
+    fn bangs_bash_output_falls_back_to_no_output_placeholder() {
+        let msg = message(MessageRole::BashOutput, "   \n  \n");
+        let rendered = render_messages_with_output_expanded(&[msg], 100, false);
+        assert!(
+            rendered.iter().any(|l| l.contains("(no output)")),
+            "{rendered:?}"
+        );
     }
 
     /// 回归测试：AI 思考期间用户继续在主输入框打字 / 移动光标时，硬件光标
