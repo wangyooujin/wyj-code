@@ -8,7 +8,7 @@
 `profile_try_save` 会写盘 + chmod 0600 + 通过 `rebuild_fn` 重建 `shared_agent`,
 无需重启。
 
-其余 4 个入口(headless REPL / `-p` 单轮 prompt / ACP stdio / daemon TCP)
+其余 4 个入口(headless REPL / `-p` 单轮 prompt / ACP stdio / daemon TCP;`workflow run` 是第 5 个,同样无 UI 通道)
 没有 UI 通道,继续以非零状态退出;`require_provider` 闭包统一给错误文案
 追加"运行 `wyj-code` 打开交互界面完成首次配置,或设置 `WYJ_CODE_API_KEY`"
 的 hint。
@@ -38,9 +38,9 @@ ProfileDialog 浮层在事件循环里拦截所有用户输入,`agent.run_turn` 
 打开期间不会被调用;`profile_try_save` 成功后 `rebuild_fn` 替换掉 `shared_agent`,
 占位 Provider 被丢弃。
 
-### 4 个非 TUI 入口的 guard
+### 非 TUI 入口的 guard(5 处)
 
-`crates/cli/src/main.rs::require_provider(initial, entry_label)`,在以下 4 处调用:
+`crates/cli/src/main.rs::require_provider(initial, entry_label)`,在以下 5 处调用:
 
 - `RuntimeCommand::Acp` → `"acp"`
 - `RuntimeCommand::Daemon { .. }` → `"daemon"`
