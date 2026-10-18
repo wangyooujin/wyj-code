@@ -89,6 +89,9 @@ thinking:
 # 切换 locale 后看起来只翻译了一半。
 spinner:
   thinking: "思考中"
+  # 标题栏的步号前缀：{n} 是本轮已开始的工具调用序号，与后面的任务名/工具名
+  # 拼成「第 3 步 · 修复登录 bug · 4.2s · 12k↑」。
+  step: "第 {n} 步 ·"
   waiting_approval: "等待批准"
   reviewing_plan: "审阅计划"
   queuing_message: "消息排队中"
