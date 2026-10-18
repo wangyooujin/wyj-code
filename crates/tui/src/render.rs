@@ -913,10 +913,11 @@ fn push_sub_agent_tool_log(
             (Some(e), true) => (format!("✗ {}", format_hms(e)), Theme::error()),
             (Some(e), false) => (format!("✓ {}", format_hms(e)), Theme::success()),
         };
+        let display_name = crate::app::tool_display_name(&tl.tool_name);
         let call = if tl.arg_summary.is_empty() {
-            tl.tool_name.clone()
+            display_name
         } else {
-            format!("{}({})", tl.tool_name, tl.arg_summary)
+            format!("{display_name}({})", tl.arg_summary)
         };
         // 与主聊天流同一口径：Grep 行尾标出这次跑的是 rg 还是内置 Rust 实现
         let call = format!("{call}{}", crate::app::tool_backend_badge(&tl.tool_name));

@@ -5751,6 +5751,12 @@ impl OutgoingMessage {
 /// 光看 `⏺ Grep(...)` 分不出这次到底谁在跑，所以补一个后缀。判据直接取
 /// `wyj_tools::grep_backend_label()`，与工具内部的分流同源，不会两处口径打架。
 pub(crate) fn tool_backend_badge(tool_name: &str) -> String {
+    // MCP 工具统一命名 `mcp__<server>__<tool>`（`crates/mcp/src/bridge.rs`）：
+    // 显示名已折成 `server:tool`，行尾再补一个 `mcp` 标注，让「这是外部 server
+    // 提供的工具」与内置工具一眼可分——Claude Code 也在工具行上区分这层来源。
+    if tool_name.starts_with("mcp__") {
+        return format!(" · {}", wyj_i18n::tr("tool_backend.mcp"));
+    }
     if !tool_name.eq_ignore_ascii_case("Grep") {
         return String::new();
     }
@@ -5759,6 +5765,35 @@ pub(crate) fn tool_backend_badge(tool_name: &str) -> String {
         _ => "tool_backend.native",
     };
     format!(" · {}", wyj_i18n::tr(key))
+}
+
+/// 判断这次输入是否触发了动态命令（skill），是则返回命令名。
+///
+/// skill 展开后的正文会被当作普通用户消息推进聊天流，用户看不出这次是某个 skill
+/// 触发的——尤其在展开内容与用户原话差得远时。`is_dynamic()` 是唯一判据，与
+/// `/help` 的「自定义命令」分组同源（见 `crates/commands/src/registry.rs`）。
+fn skill_invocation_name(registry: &wyj_commands::CommandRegistry, input: &str) -> Option<String> {
+    let name = wyj_commands::CommandRegistry::command_name(input)?;
+    registry
+        .get(name)
+        .filter(|cmd| cmd.is_dynamic())
+        .map(|_| name.to_string())
+}
+
+/// 把 MCP 工具名 `mcp__<server>__<tool>` 展示为 `<server>:<tool>`。
+///
+/// MCP 工具在聊天流里原本只显示裸注册名 `mcp__codegraph__codegraph_explore`：
+/// 既长又难读，也看不出这次调用走的是哪个 server。内置工具名不受影响。
+pub(crate) fn tool_display_name(name: &str) -> String {
+    match name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+    {
+        Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+            format!("{server}:{tool}")
+        }
+        _ => name.to_string(),
+    }
 }
 
 /// 从工具输入 JSON 中提取用于展示的参数字符串（如文件路径或命令）
@@ -5781,6 +5816,37 @@ fn tool_display_arg(name: &str, input: &serde_json::Value) -> String {
             s
         }
     };
+
+    // MCP 工具的参数 schema 由各 server 自定义，没有统一字段。按最常见的键
+    // 依次探测，取到第一个可读值；全都没有时退回「第一个字符串字段」，
+    // 让 `mcp__x__y` 至少不是一行光秃秃的工具名。
+    if name.starts_with("mcp__") {
+        for key in [
+            "file_path",
+            "path",
+            "query",
+            "pattern",
+            "command",
+            "url",
+            "name",
+            "id",
+        ] {
+            if let Some(v) = input.get(key).and_then(|v| v.as_str()) {
+                if !v.is_empty() {
+                    return trunc(shorten(v), 50);
+                }
+            }
+        }
+        return input
+            .as_object()
+            .and_then(|obj| {
+                obj.values()
+                    .find_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .map(|v| trunc(shorten(v), 50))
+            .unwrap_or_default();
+    }
 
     // 工具注册名是 PascalCase（如 "Read"/"WebFetch"，见 crates/tools/src/*.rs 的
     // Tool::name()），这里统一转小写后再匹配，否则下面的分支永远命中不了。
@@ -5932,7 +5998,7 @@ mod tool_summary_tests {
 
     #[test]
     fn backend_badge_only_marks_grep_and_follows_the_tools_side_label() {
-        // 非 Grep 工具一律不挂标注——只有 Grep 在两套搜索后端间分流
+        // 非 Grep / 非 MCP 工具一律不挂标注——只有 Grep 在两套搜索后端间分流
         assert_eq!(tool_backend_badge("Read"), "");
         assert_eq!(tool_backend_badge("Bash"), "");
         // Grep 的标注与工具内部的分流同源，不在 TUI 里另写一套判据
@@ -5944,6 +6010,57 @@ mod tool_summary_tests {
             _ => format!(" · {}", wyj_i18n::tr("tool_backend.native")),
         };
         assert_eq!(badge, expected);
+    }
+
+    /// MCP 工具名 `mcp__<server>__<tool>` 在聊天流里要变得可读：名字折成
+    /// `server:tool`，行尾补 ` · mcp` 标出来源，参数取不到具体字段时也不能空。
+    #[test]
+    fn mcp_tools_get_readable_name_and_origin_badge() {
+        assert_eq!(
+            tool_display_name("mcp__codegraph__codegraph_explore"),
+            "codegraph:codegraph_explore"
+        );
+        // 内置工具与畸形 MCP 名保持原样，不做猜测性改写。
+        assert_eq!(tool_display_name("Read"), "Read");
+        assert_eq!(tool_display_name("mcp__broken"), "mcp__broken");
+
+        let badge = tool_backend_badge("mcp__codegraph__codegraph_explore");
+        assert_eq!(badge, format!(" · {}", wyj_i18n::tr("tool_backend.mcp")));
+
+        let input = serde_json::json!({"query": "HyperlinkBackend"});
+        assert_eq!(
+            tool_display_arg("mcp__codegraph__codegraph_explore", &input),
+            "HyperlinkBackend"
+        );
+        // 常见键都没有时退回第一个字符串字段，避免工具行只剩一个名字。
+        let odd = serde_json::json!({"verbose": true, "text": "hello world"});
+        assert_eq!(tool_display_arg("mcp__x__y", &odd), "hello world");
+        let empty = serde_json::json!({});
+        assert_eq!(tool_display_arg("mcp__x__y", &empty), "");
+    }
+
+    /// Skill 提示只在**动态命令**上出现：内置命令（含覆盖同名 skill 的那些）
+    /// 不能误触发一行「使用 skill: /xxx」。
+    #[test]
+    fn skill_invocation_is_detected_for_dynamic_commands_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = wyj_commands::standard_registry_with_skills(
+            dir.path(),
+            dir.path(),
+            &std::collections::HashSet::new(),
+            &[],
+            ProjectSkillsGate::Open,
+        );
+
+        assert_eq!(skill_invocation_name(&reg, "/run").as_deref(), Some("run"));
+        assert_eq!(
+            skill_invocation_name(&reg, "/run  某个参数").as_deref(),
+            Some("run")
+        );
+        // `/review` 是被内置 `ReviewCmd` 顶掉的同名 skill：按注册表实际生效的那条算。
+        assert_eq!(skill_invocation_name(&reg, "/review"), None);
+        assert_eq!(skill_invocation_name(&reg, "/help"), None);
+        assert_eq!(skill_invocation_name(&reg, "普通消息"), None);
     }
 }
 
@@ -10198,10 +10315,11 @@ impl AppState {
                 self.tool_call_count += 1;
                 let seq = self.tool_call_count;
                 let arg = tool_display_arg(&name, &input_json);
+                let short_name = tool_display_name(&name);
                 let display = if arg.is_empty() {
-                    name.clone()
+                    short_name
                 } else {
-                    format!("{name}({arg})")
+                    format!("{short_name}({arg})")
                 };
                 // 后端标注挂在整行尾部（`⏺ Grep(pat in .) · rg`），三处消费同一串：
                 // 聊天流 ToolCall、标题栏 current_op、思考折叠标题。
@@ -11173,14 +11291,17 @@ impl AppState {
                     });
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.tool_calls += 1;
+                    let short_name = tool_display_name(&tool_name);
                     let current = if arg_summary.is_empty() {
-                        tool_name.clone()
+                        short_name
                     } else {
-                        format!("{tool_name}({arg_summary})")
+                        format!("{short_name}({arg_summary})")
                     };
                     // 与主聊天流同一口径：子 Agent 里的 Grep 也标出后端
                     s.current_tool = Some(format!("{current}{}", tool_backend_badge(&tool_name)));
                     s.tool_log.push(SubToolLine {
+                        // 存原始注册名：ToolEnd 靠它配对，渲染层再用
+                        // `tool_display_name` 折成可读名（MCP → `server:tool`）。
                         tool_name,
                         arg_summary,
                         is_error: false,
@@ -11940,6 +12061,9 @@ pub async fn run_tui(
     // 必须放在 leave 成功之后,确保 leave 失败时 hook 仍会兜底还原一次。
     crate::panic_guard::mark_inactive();
     terminal.show_cursor()?;
+    // Backend 把 Show 暂存到下一次 `set_cursor_position` 才落地；退出路径后面没有
+    // 定位调用，必须在这里显式收尾，否则光标停在隐藏态。
+    terminal.backend_mut().flush_pending_cursor()?;
 
     match result {
         Ok(Some(resumable_session_id)) => {
@@ -17225,6 +17349,12 @@ async fn tui_main(
                                 }
                             }
 
+                            // Skill 调用提示：动态命令（`~/.wyj-code/skills/*`）展开后的
+                            // prompt 会被当作用户消息推进聊天流，用户看不出这次是某个
+                            // skill 触发的——尤其在展开内容与用户原话差得远的时候。
+                            // 记下命令名，等 `RunPrompt*` 分支真正起回合前插一行提示。
+                            let skill_invocation = skill_invocation_name(&cmd_registry, &trimmed);
+
                             if let Some(result) = cmd_registry.dispatch(&trimmed, &cmd_ctx).await {
                                 match result {
                                     Ok(CommandResult::Output(out)) => {
@@ -17751,7 +17881,17 @@ async fn tui_main(
                                         }
                                     }
                                     Ok(CommandResult::RunPrompt(prompt)) => {
-                                        // Skill 展开后的 prompt → 当作用户消息发给 agent
+                                        // Skill 展开后的 prompt → 当作用户消息发给 agent。
+                                        // 先插一行「使用 skill: /x」，否则聊天流里只剩一大段
+                                        // 展开后的指令，用户看不出它是 skill 带来的。
+                                        if let Some(name) = &skill_invocation {
+                                            state.push_tracked_message(ChatMessage::system(
+                                                wyj_i18n::tr_fmt(
+                                                    "skill.invoked",
+                                                    &[("name", name)],
+                                                ),
+                                            ));
+                                        }
                                         state.push_user(prompt.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
@@ -17842,6 +17982,14 @@ async fn tui_main(
                                         // 不改 shared_mode，状态栏 Normal/Plan/Bypass 显示不受
                                         // 影响。`profile` 若存在，则只为这一轮构造一个临时
                                         // Agent；主会话 active profile 不会被修改。
+                                        if let Some(name) = &skill_invocation {
+                                            state.push_tracked_message(ChatMessage::system(
+                                                wyj_i18n::tr_fmt(
+                                                    "skill.invoked",
+                                                    &[("name", name)],
+                                                ),
+                                            ));
+                                        }
                                         state.push_user(text.clone());
                                         state.is_thinking = true;
                                         state.spinner_frame = 0;
