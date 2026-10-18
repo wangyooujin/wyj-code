@@ -81,7 +81,7 @@ pub struct RoutingEvent {
     pub boundary: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Session {
     pub messages: Vec<Message>,
     pub total_input_tokens: u32,
@@ -162,6 +162,79 @@ pub struct Session {
     pub session_profile: Option<String>,
     /// 最近一次模型往返的时延画像（`/context` 面板展示）。
     pub latency: TurnLatency,
+    /// 消息增量落盘回调（可选）。每条消息进入 `messages` 时同步调用一次。
+    ///
+    /// **为什么需要在 `Session` 上开口子**：子 Agent 跑在一个纯内存的
+    /// `Session` 上，正常结束/中断两条路径都能在收尾时写交接物，但**进程被
+    /// kill**（`SIGKILL`、终端被关、笔记本断电）时收尾代码一行都不执行。那时
+    /// 唯一还能救回「做到哪了」的依据，就是这条消息在产生时就已落盘。
+    ///
+    /// 回调必须是**同步非阻塞**的：实现侧应当只做 `try_send` 到后台写手，
+    /// 与 `trace::TraceWriter` 同一套做法。`Arc` + `dyn` 而非泛型，是因为
+    /// `Session` 到处都是按值克隆的，泛型会污染几乎每个签名。
+    pub message_sink: Option<MessageSink>,
+}
+
+/// 增量消息事件：落盘侧据此决定「追加一行」还是「改写最后一行」。
+///
+/// 为什么不能只发 `&Message`：`push_user_blocks_merged`（工具结果、运行时
+/// 补充输入）与 `prepend_to_last_user`（每轮规约注入）都**原地修改最后一条
+/// user 消息**。只追加不明写改，日志里的最后一条会永久停在残缺状态。
+#[derive(Clone)]
+pub enum MessageEvent {
+    /// 新消息追加到末尾
+    Appended(Message),
+    /// 最后一条消息被原地修改（合并 / 前插）
+    UpdatedLast(Message),
+    /// 整段历史被替换（压缩）。`messages` 是替换后的完整列表。
+    Replaced(Vec<Message>),
+}
+
+/// 消息增量回调类型
+pub type MessageSink = std::sync::Arc<dyn Fn(MessageEvent) + Send + Sync>;
+
+impl std::fmt::Debug for Session {
+    /// `message_sink` 是 `dyn Fn`，无法 derive Debug；手写一份只标「有没有挂
+    /// sink」，让日志里能看出增量落盘是否生效，又不去碰闭包本身。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("messages", &self.messages.len())
+            .field("total_input_tokens", &self.total_input_tokens)
+            .field("total_output_tokens", &self.total_output_tokens)
+            .field("api_calls", &self.api_calls)
+            .field("message_sink", &self.message_sink.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for MessageEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Appended(m) => write!(f, "Appended({:?})", m.role),
+            Self::UpdatedLast(m) => write!(f, "UpdatedLast({:?})", m.role),
+            Self::Replaced(v) => write!(f, "Replaced({} messages)", v.len()),
+        }
+    }
+}
+
+impl Session {
+    /// 挂上消息增量落盘回调（builder 风格）。
+    pub fn with_message_sink(mut self, sink: MessageSink) -> Self {
+        self.message_sink = Some(sink);
+        self
+    }
+
+    fn emit(&self, event: MessageEvent) {
+        if let Some(sink) = &self.message_sink {
+            sink(event);
+        }
+    }
+
+    /// 外部直接改写 `messages` 后（压缩、上下文编辑）调用，通知 sink 打一次
+    /// 全量快照。增量日志只有靠这个锚点才能在压缩后正确重放。
+    pub fn emit_replaced(&self) {
+        self.emit(MessageEvent::Replaced(self.messages.clone()));
+    }
 }
 
 /// 一次模型往返的时延分解。
@@ -233,7 +306,9 @@ impl Session {
     }
 
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.messages.push(Message::user(text));
+        let message = Message::user(text);
+        self.messages.push(message.clone());
+        self.emit(MessageEvent::Appended(message));
     }
 
     /// 取走并清空本会话外部化过的 CAS blob 引用。
@@ -246,17 +321,21 @@ impl Session {
 
     /// 推送含多个内容块的用户消息（支持图片/文件附件）
     pub fn push_user_with_blocks(&mut self, blocks: Vec<ContentBlock>) {
-        self.messages.push(Message {
+        let message = Message {
             role: Role::User,
             content: blocks,
-        });
+        };
+        self.messages.push(message.clone());
+        self.emit(MessageEvent::Appended(message));
     }
 
     pub fn push_assistant(&mut self, blocks: Vec<ContentBlock>) {
-        self.messages.push(Message {
+        let message = Message {
             role: Role::Assistant,
             content: blocks,
-        });
+        };
+        self.messages.push(message.clone());
+        self.emit(MessageEvent::Appended(message));
     }
 
     pub fn push_tool_result(
@@ -280,12 +359,16 @@ impl Session {
         match self.messages.last_mut() {
             Some(m) if matches!(m.role, Role::User) => {
                 m.content.extend(blocks);
+                let updated = m.clone();
+                self.emit(MessageEvent::UpdatedLast(updated));
             }
             _ => {
-                self.messages.push(Message {
+                let message = Message {
                     role: Role::User,
                     content: blocks,
-                });
+                };
+                self.messages.push(message.clone());
+                self.emit(MessageEvent::Appended(message));
             }
         }
     }
@@ -298,6 +381,8 @@ impl Session {
                 let mut new_content = blocks;
                 new_content.append(&mut m.content);
                 m.content = new_content;
+                let updated = m.clone();
+                self.emit(MessageEvent::UpdatedLast(updated));
             }
         }
     }

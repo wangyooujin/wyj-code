@@ -55,6 +55,11 @@ pub enum SubAgentEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// 子 Agent 每轮结束交出的 assistant 文本（只落盘，不驱动 UI）。
+    ///
+    /// 与 `ToolStart`/`ToolEnd` 互补：那两个记的是「做了什么」，这个记的是
+    /// 「由此得出了什么」。中断后交接任务时，结论不可再生，工具 I/O 可再生。
+    Assistant { id: u64, text: String },
     /// 父 Agent/用户发出的控制命令已经被 Hub 接受或拒绝。
     Control {
         id: u64,
@@ -70,6 +75,13 @@ pub enum SubAgentEvent {
         is_error: bool,
         elapsed_secs: f64,
         background: bool,
+        /// 任务未完成时，**已经渲染好的模型侧交接外壳**（含三选一措辞与工具
+        /// 摘要）；完成时为 `None`。
+        ///
+        /// 为什么由工具侧渲染而不是前端各写一份：前台走 `ToolResult`、后台走
+        /// `system-reminder`，两条路径必须给出**逐字相同**的交接语义，否则同一
+        /// 个中断在 TUI 与 headless 下会给模型两种不同的暗示。
+        handoff_body: Option<String>,
     },
 }
 
@@ -80,6 +92,7 @@ impl SubAgentEvent {
             | SubAgentEvent::ToolStart { id, .. }
             | SubAgentEvent::ToolEnd { id, .. }
             | SubAgentEvent::Usage { id, .. }
+            | SubAgentEvent::Assistant { id, .. }
             | SubAgentEvent::Control { id, .. }
             | SubAgentEvent::Done { id, .. } => *id,
         }
@@ -134,6 +147,16 @@ impl SubAgentEvent {
                 input_tokens: *input_tokens,
                 output_tokens: *output_tokens,
             },
+            SubAgentEvent::Assistant { text, .. } => TraceEvent::Assistant {
+                // 单轮文本按 assistant 文本上限截断（与持久化口径一致），
+                // 避免一段超长输出把整份 trace 挤爆——trace 面向交接与审计，
+                // 不需要逐字全文。
+                text: crate::textutil::truncate_head_tail(
+                    text,
+                    crate::trace::ASSISTANT_HEAD_BYTES,
+                    0,
+                ),
+            },
             SubAgentEvent::Control {
                 action, accepted, ..
             } => TraceEvent::Control {
@@ -178,6 +201,21 @@ struct RunningEntry {
     handle: JoinHandle<()>,
     control_tx: mpsc::UnboundedSender<AgentControl>,
     parent_id: Option<u64>,
+    /// 运行期进度快照。`interrupt()` 会 abort 任务，收尾代码不再执行，所以
+    /// 中断时的交接物只能从这里取——见 [`crate::handoff::HandoffProgress`]。
+    progress: Arc<Mutex<crate::handoff::HandoffProgress>>,
+    /// 交接物落盘所需的元信息（中断路径要自己拼一份）。
+    meta: HandoffMeta,
+}
+
+/// 中断路径拼交接物所需的、任务外就能拿到的字段。
+#[derive(Debug, Clone, Default)]
+pub struct HandoffMeta {
+    pub agent_type: String,
+    pub description: String,
+    pub background: bool,
+    pub sessions_dir: Option<PathBuf>,
+    pub session_id: Option<String>,
 }
 
 /// 前端注册的事件回调类型
@@ -259,6 +297,39 @@ impl SubAgentHub {
         control_tx: mpsc::UnboundedSender<AgentControl>,
         handle: JoinHandle<()>,
     ) {
+        self.register_with_handoff(
+            id,
+            background,
+            parent_id,
+            control_tx,
+            handle,
+            Arc::new(Mutex::new(crate::handoff::HandoffProgress::default())),
+            HandoffMeta {
+                agent_type: String::new(),
+                description: String::new(),
+                background,
+                sessions_dir: None,
+                session_id: None,
+            },
+        );
+    }
+
+    /// [`Self::register`] 的完整版本：额外登记进度快照与交接元信息。
+    ///
+    /// 中断路径（`interrupt` / `abort_foreground` / `abort_all`）靠这两样在
+    /// **任务被 abort 之后**仍然能落一份交接物——abort 会取消 future，任务自己
+    /// 的收尾代码一行都不会执行，而 ESC 恰恰是最需要「做到哪了」的场景。
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_with_handoff(
+        &self,
+        id: u64,
+        background: bool,
+        parent_id: Option<u64>,
+        control_tx: mpsc::UnboundedSender<AgentControl>,
+        handle: JoinHandle<()>,
+        progress: Arc<Mutex<crate::handoff::HandoffProgress>>,
+        meta: HandoffMeta,
+    ) {
         self.running.lock().unwrap().insert(
             id,
             RunningEntry {
@@ -266,6 +337,8 @@ impl SubAgentHub {
                 handle,
                 control_tx,
                 parent_id,
+                progress,
+                meta,
             },
         );
     }
@@ -347,6 +420,8 @@ impl SubAgentHub {
         };
         let sent = entry.control_tx.send(AgentControl::Interrupt).is_ok();
         entry.handle.abort();
+        // abort 已生效，任务自己的收尾不会再跑——交接物只能在这里补。
+        write_interrupted_handoff(id, &entry);
         self.emit(SubAgentEvent::Control {
             id,
             action: "interrupt".to_string(),
@@ -423,6 +498,7 @@ impl SubAgentHub {
         for (id, entry) in entries {
             let accepted = entry.control_tx.send(AgentControl::Interrupt).is_ok();
             entry.handle.abort();
+            write_interrupted_handoff(id, &entry);
             self.emit(SubAgentEvent::Control {
                 id,
                 action: "interrupt".to_string(),
@@ -465,6 +541,48 @@ impl SubAgentHub {
     /// 并发上限信号量（子 Agent 任务体内 acquire）
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.semaphore.clone()
+    }
+}
+
+/// 任务被 abort 之后补写一份中断交接物。
+///
+/// 为什么必须在 Hub 侧做：`JoinHandle::abort()` 会取消 future，子 Agent 任务
+/// 自己那份「收尾 → 写交接物」的代码一行都不会执行。而 ESC 是最常触发中断、
+/// 也最需要「做到哪了」的场景——不在这里补，交接物恰好只缺最该有的那一种。
+///
+/// 数据来自运行期持续更新的 [`HandoffProgress`]（不同于正常结束时的
+/// `Session` 全量），所以即使中途被杀也有内容。`sessions_dir` 未配置时静默
+/// 跳过（测试与未接文件系统的调用方）。
+fn write_interrupted_handoff(id: u64, entry: &RunningEntry) {
+    let (Some(dir), Some(session_id)) = (&entry.meta.sessions_dir, &entry.meta.session_id) else {
+        return;
+    };
+    let progress = entry
+        .progress
+        .lock()
+        .map(|p| crate::handoff::HandoffProgress {
+            conclusion: p.conclusion.clone(),
+            digest: p.digest.clone(),
+        })
+        .unwrap_or_default();
+    let handoff = crate::handoff::SubAgentHandoff {
+        version: crate::handoff::HANDOFF_VERSION,
+        id,
+        agent_type: entry.meta.agent_type.clone(),
+        description: entry.meta.description.clone(),
+        background: entry.meta.background,
+        status: crate::handoff::HandoffStatus::Interrupted,
+        reason: Some("interrupted by user".to_string()),
+        conclusion: crate::textutil::truncate_str(
+            &progress.conclusion,
+            crate::handoff::CONCLUSION_MAX_BYTES,
+        )
+        .to_string(),
+        digest: progress.digest,
+        elapsed_secs: 0.0,
+    };
+    if let Err(err) = crate::handoff::write_handoff(dir, session_id, &handoff) {
+        tracing::warn!(id, error = %err, "中断交接物落盘失败（不影响中断本身）");
     }
 }
 
@@ -548,6 +666,58 @@ mod tests {
         assert_eq!(hub.background_count(), 1);
         hub.wait_background().await;
         assert_eq!(hub.background_count(), 0);
+    }
+
+    /// 中断交接物：证明 abort 之后 Hub 仍能写出「做到哪了」。
+    ///
+    /// 这是整个交接方案的最后一环——子 Agent 任务的收尾代码在 abort 后不会
+    /// 执行，所以进度必须由 Hub 侧从运行期快照里补写。没有这条，ESC 中断
+    /// （最需要交接的场景）恰好是唯一没有交接记录的场景。
+    #[tokio::test]
+    async fn interrupt_writes_a_handoff_from_the_live_progress_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = SubAgentHub::new();
+        let progress = Arc::new(Mutex::new(crate::handoff::HandoffProgress::default()));
+        {
+            let mut p = progress.lock().unwrap();
+            p.record_turn_text("已定位到 middleware/auth.rs:88");
+            p.record_tool_start("Read", &serde_json::json!({"file_path": "auth.rs"}));
+        }
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.register_with_handoff(
+            4,
+            false,
+            None,
+            tx,
+            handle,
+            progress,
+            HandoffMeta {
+                agent_type: "general-purpose".to_string(),
+                description: "调查鉴权".to_string(),
+                background: false,
+                sessions_dir: Some(dir.path().to_path_buf()),
+                session_id: Some("s1".to_string()),
+            },
+        );
+
+        assert_eq!(hub.interrupt(4), AgentControlResult::Accepted);
+
+        let handoff = crate::handoff::read_handoff(dir.path(), "s1", 4)
+            .expect("abort 之后必须仍有中断交接物");
+        assert_eq!(handoff.status, crate::handoff::HandoffStatus::Interrupted);
+        assert_eq!(handoff.conclusion, "已定位到 middleware/auth.rs:88");
+        assert_eq!(handoff.digest.files_read, vec!["auth.rs".to_string()]);
+    }
+
+    /// 未配置 `sessions_dir` 时中断不落盘、也不 panic（测试与 headless 兼容）。
+    #[tokio::test]
+    async fn interrupt_without_sessions_dir_is_a_noop_for_handoff() {
+        let hub = SubAgentHub::new();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.register(5, false, None, tx, handle);
+        assert_eq!(hub.interrupt(5), AgentControlResult::Accepted);
     }
 
     #[tokio::test]

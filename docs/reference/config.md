@@ -37,6 +37,9 @@ default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Ag
 explore_profile = ""         # 内置 Explore 类型专用 Profile 名（配便宜模型），留空回退 default_profile
 trace_enabled = true         # 是否把子 Agent 完整执行轨迹落盘（供跨会话查看，见下方 SubAgent 节）
 trace_max_bytes_per_agent = 262144  # 单个子 Agent trace 文件字节上限（默认 256KB），超限静默停写
+                             # 交接物（a<id>.handoff.json）不受此上限约束：它是摘要，且必须完整
+                             # 消息增量日志（a<id>.messages.jsonl）固定 1MB 上限，超限留 truncated 标记
+                             # 两者都只在 trace_enabled = true 时生成；日志是进程被硬杀时唯一的恢复来源
 max_depth = 3                # 子 Agent 最大嵌套层数（主 Agent 之下算第一层）；1 = 禁止嵌套。
                              # 触顶时 Agent 工具会从该层子 Agent 的工具集里消失，而不是留着报错
 max_concurrent = 8           # 同时运行的子 Agent 上限；超限的 spawn 排队等待，不失败

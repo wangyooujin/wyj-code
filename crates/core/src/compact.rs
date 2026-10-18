@@ -396,7 +396,9 @@ pub async fn compact_session(
         ];
         session.messages.extend(to_keep);
     }
-
+    // 压缩是「整段历史被替换」，增量日志必须收到一次全量快照——否则重放时
+    // 会把压缩前的旧消息和压缩后的新消息拼在一起，拼出一个从未存在过的历史。
+    session.emit_replaced();
     let tokens_saved = before_tokens.saturating_sub(estimate_tokens(&session.messages));
 
     Ok(CompactResult {

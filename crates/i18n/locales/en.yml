@@ -40,6 +40,12 @@ subagent:
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
   builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
+  handoff_interrupted: "The sub-agent was interrupted (task NOT complete)"
+  handoff_turn_limit: "The sub-agent hit its turn limit (task NOT complete)"
+  handoff_failed: "The sub-agent failed (task NOT complete)"
+  handoff_completed: "completed"
+  handoff_unavailable: "(no handoff record)"
+  handoff_no_conclusion: "(no written conclusion before it stopped; see the trace for how far it got)"
 
 subagents:
   desc: "Open the sub-agent panel to inspect each sub-agent's full execution detail in this session (including sessions restored via /resume)"
@@ -47,6 +53,14 @@ subagents:
   not_found: "Sub-agent a{id} not found (no such id in this session)"
   empty: "No sub-agent records in this session"
   headless_unsupported: "[headless mode does not support the /subagents panel; use `wyj-code subagent-trace <session-id> [id]` to inspect the persisted trace instead]"
+  status_completed: "completed"
+  status_interrupted: "interrupted"
+  status_turn_limit: "turn limit"
+  status_failed: "failed"
+  handoff_line: "handoff: {status} · {calls} tool calls"
+  handoff_files_modified: "modified {count} file(s)"
+  handoff_files_read: "read {count} file(s)"
+  handoff_hint: "· task NOT complete; continue from the handoff summary"
 
 shell:
   panel_title: " shells [{count}] "
