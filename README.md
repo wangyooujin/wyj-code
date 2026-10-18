@@ -281,7 +281,7 @@ model = "claude-opus-4-8"
 plan_model = ""                   # Plan 模式专用模型，留空则用 model
 exec_model = ""                   # Bypass 模式专用模型，留空则用 model
 base_url = ""                     # 留空使用供应商默认端点
-max_tokens = 8192
+max_tokens = 32000
 context_window = 200000
 vision = true                     # 模型支持图片输入；false 时图片降级为占位文本
 

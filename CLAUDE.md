@@ -135,7 +135,7 @@ cargo clippy                     # lint
 provider = "anthropic"       # 或 "openai"
 model = "claude-opus-4-8"
 base_url = ""                # 留空用供应商默认端点
-max_tokens = 8192
+max_tokens = 32000
 context_window = 200000      # 决定压缩触发线：window - max(max_tokens+8192, window/10)
 vision = true
 log_level = "warn"           # 调试时 "debug"
