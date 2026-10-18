@@ -8,6 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use wyj_api::types::{ContentBlock, ToolDefinition};
@@ -34,6 +35,12 @@ pub struct SubAgentTool {
     /// 用户配置的回复语言。`inp.system` 覆盖走的是 `with_system`（整体替换），
     /// 会把工厂追加的语言段一并抹掉，因此覆盖之后要按这里存的 locale 补回来。
     response_language: Option<String>,
+    /// `~/.wyj-code/sessions`：交接物落盘根目录。`None`（测试/未接文件系统）
+    /// 时跳过落盘，行为与本字段引入前一致。
+    sessions_dir: Option<PathBuf>,
+    /// 消息增量日志写手。与 `sessions_dir` 独立开关：它只解决「进程被硬杀」
+    /// 这一种情况，不挂就退回「活着的收尾路径都能写交接物」的原有保证。
+    message_log: Option<Arc<crate::message_log::MessageLogWriter>>,
 }
 
 impl SubAgentTool {
@@ -51,6 +58,8 @@ impl SubAgentTool {
             depth: 0,
             max_depth: 3,
             response_language: None,
+            sessions_dir: None,
+            message_log: None,
         }
     }
 
@@ -68,6 +77,8 @@ impl SubAgentTool {
             depth: 0,
             max_depth: 3,
             response_language: None,
+            sessions_dir: None,
+            message_log: None,
         }
     }
 
@@ -91,6 +102,20 @@ impl SubAgentTool {
     /// 至少 1，避免一个手滑的配置把 `Agent` 工具从主 Agent 那里也拿掉。
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth.max(1);
+        self
+    }
+
+    /// 指定交接物落盘根目录（`~/.wyj-code/sessions`）。
+    ///
+    /// 不调用时完全不落盘——测试与「没接文件系统」的调用方保持原有行为。
+    pub fn with_sessions_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.sessions_dir = Some(dir.into());
+        self
+    }
+
+    /// 挂上消息增量日志写手（硬杀场景的唯一恢复依据）。
+    pub fn with_message_log(mut self, log: Arc<crate::message_log::MessageLogWriter>) -> Self {
+        self.message_log = Some(log);
         self
     }
 
@@ -158,6 +183,111 @@ fn summarize_input(input: &Value) -> String {
         }
     }
     truncate_chars(&input.to_string(), 60)
+}
+
+/// 把工具摘要渲染成交接外壳里的一小段事实清单。
+///
+/// 刻意只列**结论性**的字段（改了哪些文件、跑过什么、卡在什么错误上），
+/// 不列读过的原文——原文可再生（重读一次），塞进主对话就等于把子 Agent 省下
+/// 的上下文一次性还回去。返回 `None` 表示一个工具都没调用，此时外壳里连这一
+/// 段都不出现，避免给模型一段空标题。
+fn format_digest(digest: &crate::handoff::ToolDigest) -> Option<String> {
+    if digest.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::new();
+    if !digest.files_modified.is_empty() {
+        lines.push(format!(
+            "Files modified: {}",
+            digest.files_modified.join(", ")
+        ));
+    }
+    if !digest.files_read.is_empty() {
+        lines.push(format!("Files read: {}", digest.files_read.join(", ")));
+    }
+    if !digest.commands.is_empty() {
+        lines.push(format!("Commands run: {}", digest.commands.join("; ")));
+    }
+    if !digest.searches.is_empty() {
+        lines.push(format!("Searches: {}", digest.searches.join("; ")));
+    }
+    if !digest.errors.is_empty() {
+        lines.push(format!("Errors seen: {}", digest.errors.join("; ")));
+    }
+    lines.push(format!("Tool calls: {}", digest.total_calls));
+    Some(lines.join("\n"))
+}
+
+/// 从 `Agent::run_turn` 的错误里识别「推理轮数触顶」。
+///
+/// 触顶是一种**有产出**的失败：模型跑了几十轮有效工具调用才撞上上限，工作树
+/// 里已经改了东西，只是没来得及交付。把它与 provider 失败、工具 panic 这类
+/// 「可能什么都没做出来」的错误分开，交接物的措辞与后续建议都不同。
+fn is_turn_limit_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("超过最大推理轮数")
+}
+
+/// 组装交接物。
+///
+/// `last_turn_text` 优先于「从 messages 里捞最后一轮 assistant」：前者是模型
+/// 这一轮真正交出的文本，后者还要分辨哪些是中间工具轮的空 assistant 消息。
+/// 只有在它为空（例如连一轮都没跑完就被中断）时才回退到扫描 messages。
+#[allow(clippy::too_many_arguments)]
+fn build_handoff<'a>(
+    id: u64,
+    agent_type: &str,
+    description: &str,
+    background: bool,
+    status: crate::handoff::HandoffStatus,
+    reason: Option<String>,
+    last_turn_text: &str,
+    messages: impl Iterator<Item = &'a wyj_api::types::Message>,
+    elapsed_secs: f64,
+) -> crate::handoff::SubAgentHandoff {
+    let conclusion = if last_turn_text.trim().is_empty() {
+        last_assistant_text(messages)
+    } else {
+        last_turn_text.to_string()
+    };
+    crate::handoff::SubAgentHandoff {
+        version: crate::handoff::HANDOFF_VERSION,
+        id,
+        agent_type: agent_type.to_string(),
+        description: description.to_string(),
+        background,
+        status,
+        reason,
+        conclusion: crate::textutil::truncate_str(
+            &conclusion,
+            crate::handoff::CONCLUSION_MAX_BYTES,
+        )
+        .to_string(),
+        digest: crate::handoff::ToolDigest::default(),
+        elapsed_secs,
+    }
+}
+
+/// 回退路径：从消息历史里取最后一条非空 assistant 文本。
+fn last_assistant_text<'a>(messages: impl Iterator<Item = &'a wyj_api::types::Message>) -> String {
+    let mut out = String::new();
+    for msg in messages {
+        if !matches!(msg.role, wyj_api::types::Role::Assistant) {
+            continue;
+        }
+        let text: String = msg
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        if !text.trim().is_empty() {
+            out = text;
+        }
+    }
+    out
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -501,6 +631,7 @@ impl SubAgentTool {
         // 看到工具还在则会换个措辞反复重试——这是 `CLAUDE_CODE_MAX_SUBAGENT_
         // SPAWN_DEPTH` 同款的取舍。
         if self.depth + 1 < self.max_depth.max(1)
+            && !def.disallowed_tools.iter().any(|tool| tool == "Agent")
             && def
                 .tools
                 .as_ref()
@@ -515,6 +646,8 @@ impl SubAgentTool {
                 depth: self.depth + 1,
                 max_depth: self.max_depth,
                 response_language: self.response_language.clone(),
+                sessions_dir: self.sessions_dir.clone(),
+                message_log: self.message_log.clone(),
             }));
         }
         let agent_type = def.name.clone();
@@ -537,27 +670,50 @@ impl SubAgentTool {
         // 挂内部事件回调：工具事件与 token 用量汇入 Hub
         let hub_tool = self.hub.clone();
         let hub_usage = self.hub.clone();
+        // 工具摘要实时累积：与 trace 的 `from_trace` 共用同一套提取规则
+        // （`ToolDigest::record_start` / `record_error`），两条路径不会漂移。
+        // 用 Mutex 而非 channel：回调本身是同步的，且这里只有零星几次字段追加。
+        // 用 `HandoffProgress` 而不是裸 `ToolDigest`：同一份快照既供正常收尾组装
+        // 交接物，也供 `Hub::interrupt` 在 abort 之后补写（那时任务自己的收尾
+        // 代码已经不会执行）。
+        let progress = Arc::new(std::sync::Mutex::new(
+            crate::handoff::HandoffProgress::default(),
+        ));
+        let digest_for_cb = progress.clone();
+        let progress_in_task = progress.clone();
         let agent = agent
             .with_tool_callback(move |ev| match ev {
-                ToolEvent::Start { name, input, .. } => hub_tool.emit(SubAgentEvent::ToolStart {
-                    id,
-                    tool_name: name,
-                    arg_summary: summarize_input(&input),
-                    input,
-                }),
+                ToolEvent::Start { name, input, .. } => {
+                    if let Ok(mut d) = digest_for_cb.lock() {
+                        d.record_tool_start(&name, &input);
+                    }
+                    hub_tool.emit(SubAgentEvent::ToolStart {
+                        id,
+                        tool_name: name,
+                        arg_summary: summarize_input(&input),
+                        input,
+                    })
+                }
                 ToolEvent::End {
                     name,
                     is_error,
                     elapsed_secs,
                     output,
                     ..
-                } => hub_tool.emit(SubAgentEvent::ToolEnd {
-                    id,
-                    tool_name: name,
-                    is_error,
-                    elapsed_secs,
-                    output,
-                }),
+                } => {
+                    if is_error {
+                        if let Ok(mut d) = digest_for_cb.lock() {
+                            d.record_tool_error(&name, &output);
+                        }
+                    }
+                    hub_tool.emit(SubAgentEvent::ToolEnd {
+                        id,
+                        tool_name: name,
+                        is_error,
+                        elapsed_secs,
+                        output,
+                    })
+                }
             })
             .with_usage_callback(move |input_tokens, output_tokens| {
                 hub_usage.emit(SubAgentEvent::Usage {
@@ -598,6 +754,12 @@ impl SubAgentTool {
         // 漏掉它的后果见 `sub_tool_ctx`：Auto 模式下子 Agent 会退化成「无闸门 + 无审批
         // UI」，副作用工具全被拒。
         let auto_gate = ctx.auto_gate().cloned();
+        // assistant 文本通道：与 tool/usage 回调同源，落 trace 用。
+        let hub_assistant = self.hub.clone();
+        // 交接物落盘所需的 owned 值（`tokio::spawn` 要求 'static）。
+        let sessions_dir = self.sessions_dir.clone();
+        let session_id_for_handoff = self.root_session_id.clone();
+        let message_log = self.message_log.clone();
 
         let handle = tokio::spawn(async move {
             let start = Instant::now();
@@ -611,6 +773,12 @@ impl SubAgentTool {
             };
 
             let mut session = Session::new();
+            // 消息增量落盘：正常结束/ESC 中断的交接物由本任务与 Hub 补写，
+            // 但**进程被硬杀**时两者都不会执行。挂上 sink 后，每条消息在产生
+            // 时就已进日志，事后能从日志重放出「做到哪了」。
+            if let Some(log) = message_log.as_ref() {
+                session = session.with_message_sink(log.sink_for(id));
+            }
             let mut next_input = Some(vec![ContentBlock::Text { text: prompt }]);
 
             let sub_ctx = sub_tool_ctx(
@@ -626,6 +794,11 @@ impl SubAgentTool {
             let mut outputs = Vec::new();
             let mut is_error = false;
             let mut interrupted = false;
+            // 每轮收尾时的 assistant 文本（未截断）。交接物要用最后一轮，
+            // trace 的 `Assistant` 事件要用每一轮。
+            let mut last_turn_text = String::new();
+            let mut failure_reason: Option<String> = None;
+            let mut turn_limited = false;
             while let Some(input) = next_input.take() {
                 let retry_input = input.clone();
                 session.push_user_with_blocks(input);
@@ -639,6 +812,20 @@ impl SubAgentTool {
                         |_kind| {},
                     )
                     .await;
+                // 每轮交出的文本既是 trace 里的「得出什么」，也是交接物的候选结论。
+                // 放在 match 之前：失败轮也可能已经产出有价值的中间结论。
+                if !output_buf.trim().is_empty() {
+                    hub_assistant.emit(SubAgentEvent::Assistant {
+                        id,
+                        text: output_buf.clone(),
+                    });
+                    last_turn_text = output_buf.clone();
+                    // 同步进共享快照：ESC 中断会 abort 任务，收尾代码不再执行，
+                    // 中断交接物只能从这份快照里取结论。
+                    if let Ok(mut p) = progress_in_task.lock() {
+                        p.record_turn_text(&output_buf);
+                    }
+                }
                 match run_res {
                     Ok(()) if output_buf.is_empty() => outputs.push(tr("subagent.no_output")),
                     Ok(()) => outputs.push(crate::textutil::truncate_head_tail(
@@ -647,6 +834,12 @@ impl SubAgentTool {
                         10_000,
                     )),
                     Err(error) => {
+                        // 轮数触顶与「真出错」是两种终态：前者任务没做完但产出
+                        // 有价值，后者可能什么都没做出来。交接物要把它们分开。
+                        if is_turn_limit_error(&error) {
+                            turn_limited = true;
+                        }
+                        failure_reason.get_or_insert_with(|| error.to_string());
                         outputs.push(tr_fmt(
                             "subagent.run_failed",
                             &[("err", &error.to_string())],
@@ -699,8 +892,16 @@ impl SubAgentTool {
                     break;
                 }
             }
+            // 中断不是「什么都没发生」。旧实现在这里把 outputs 整个丢掉，主 Agent
+            // 只收到一句「子 Agent 被中断」——于是「上次做到哪里」这个唯一有交接
+            // 价值的信息，恰恰在中断时丢失。现在保留已完成轮的产出，并显式标明
+            // 中断发生在哪里。
             let content = if interrupted {
-                tr("subagent.interrupted")
+                if outputs.is_empty() {
+                    tr("subagent.interrupted")
+                } else {
+                    format!("{}\n\n{}", outputs.join("\n\n"), tr("subagent.interrupted"))
+                }
             } else {
                 outputs.join("\n\n")
             };
@@ -721,24 +922,77 @@ impl SubAgentTool {
                 });
             }
 
+            let elapsed_secs = start.elapsed().as_secs_f64();
+            let handoff_status = if interrupted {
+                crate::handoff::HandoffStatus::Interrupted
+            } else if turn_limited {
+                crate::handoff::HandoffStatus::TurnLimit
+            } else if is_error {
+                crate::handoff::HandoffStatus::Failed
+            } else {
+                crate::handoff::HandoffStatus::Completed
+            };
+            let handoff = build_handoff(
+                id,
+                &task_type,
+                &task_desc,
+                background,
+                handoff_status,
+                if interrupted {
+                    Some(tr("subagent.interrupted"))
+                } else {
+                    failure_reason.clone()
+                },
+                &last_turn_text,
+                session.messages.iter(),
+                elapsed_secs,
+            );
+            // 工具摘要来自运行期累积的那一份（不是事后从 trace 反推：trace 有
+            // 256KB 上限，超限停写后反推会静默丢尾部调用）。
+            let mut handoff = handoff;
+            if let Ok(p) = progress_in_task.lock() {
+                handoff.digest = p.digest.clone();
+            }
+            // 交接物落盘：尽力而为。写失败只 warn，绝不把一次正常运行判成失败。
+            if let (Some(dir), Some(sid)) = (&sessions_dir, &session_id_for_handoff) {
+                if let Err(err) = crate::handoff::write_handoff(dir, sid, &handoff) {
+                    tracing::warn!(
+                        id,
+                        error = %err,
+                        "子 Agent 交接物落盘失败（不影响本次运行）"
+                    );
+                }
+            }
+
+            // 回填给模型的内容分三档：
+            //   * 完成 → `subagent-report` 定界外壳（正文可能含读到的第三方原文）
+            //   * 未完成 → `subagent_handoff_body` 外壳，显式给三选一，否则模型
+            //     会默认「我接手」，把本该隔离的上下文灌回主对话
+            //   * 出错且没有任何产出 → 裸错误文本（本进程自己写的，不含第三方内容）
+            let handoff_body = handoff.status.is_incomplete().then(|| {
+                wyj_core::prompts::subagent_handoff_body(
+                    handoff.status.as_str(),
+                    handoff.reason.as_deref(),
+                    &content,
+                    format_digest(&handoff.digest).as_deref(),
+                )
+            });
+
             hub_task.emit(SubAgentEvent::Done {
                 id,
                 agent_type: task_type,
                 description: task_desc,
                 result: content.clone(),
                 is_error,
-                elapsed_secs: start.elapsed().as_secs_f64(),
+                elapsed_secs,
                 background,
+                handoff_body: handoff_body.clone(),
             });
             hub_task.finish(id);
-            // 成功路径的最终报告一律套 `subagent-report` 定界外壳：它可能包含
-            // 子 Agent 读到的网页/日志原文，裸文本回填等于让那些内容以「用户或
-            // harness 的话」的身份进入主对话。失败/中断文本是本进程自己写的，
-            // 不含第三方内容，保持原样（模型更容易一眼看出这是错误）。
-            let model_content = if is_error {
-                content.clone()
-            } else {
-                wyj_core::prompts::subagent_report_body(&content)
+            let model_content = match (handoff_body, is_error) {
+                (Some(body), _) => body,
+                (None, true) => content.clone(),
+                (None, false) => wyj_core::prompts::subagent_report_body(&content),
             };
             let result = if is_error {
                 ToolResult::err(model_content)
@@ -747,8 +1001,21 @@ impl SubAgentTool {
             };
             let _ = result_tx.send(result);
         });
-        self.hub
-            .register(id, background, self.caller_id, control_tx, handle);
+        self.hub.register_with_handoff(
+            id,
+            background,
+            self.caller_id,
+            control_tx,
+            handle,
+            progress,
+            crate::agent_hub::HandoffMeta {
+                agent_type: agent_type.clone(),
+                description: description.clone(),
+                background,
+                sessions_dir: self.sessions_dir.clone(),
+                session_id: self.root_session_id.clone(),
+            },
+        );
 
         if background {
             // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_done_reminder）
@@ -1370,6 +1637,8 @@ mod tests {
             depth: 3,
             max_depth: 3,
             response_language: None,
+            sessions_dir: None,
+            message_log: None,
         };
         let cwd = tempfile::tempdir().unwrap();
         let result = tool
@@ -1420,6 +1689,8 @@ mod tests {
                 depth,
                 max_depth,
                 response_language: None,
+                sessions_dir: None,
+                message_log: None,
             };
             let dir = tempfile::tempdir().unwrap();
             let result = tool
@@ -1677,6 +1948,114 @@ mod tests {
         assert!(
             matches!(mode, PermissionMode::Auto),
             "Auto 模式下子 Agent 必须继续过分类器"
+        );
+    }
+
+    // ── 交接物（中断/触顶时「做到哪了」） ────────────────────────────────
+
+    #[test]
+    fn turn_limit_errors_are_recognised() {
+        let limit = anyhow::anyhow!(
+            "超过最大推理轮数 200。已自动存档到触顶前的状态，可用 `/rewind` 回到工作现场后换个思路继续。"
+        );
+        assert!(is_turn_limit_error(&limit));
+        assert!(!is_turn_limit_error(&anyhow::anyhow!("connection reset")));
+    }
+
+    /// 中断必须保留已完成轮的产出。
+    ///
+    /// 这是「交接」这件事的地基：旧实现在中断时把 `outputs` 整个丢掉，主 Agent
+    /// 只收到一句「子 Agent 被中断」——恰恰在最需要「上次做到哪里」的时候把
+    /// 唯一有交接价值的信息扔了。
+    #[test]
+    fn interrupted_run_keeps_completed_turn_outputs() {
+        let outputs = ["已确认鉴权走 middleware/auth.rs:88".to_string()];
+        let interrupted_line = "子 Agent 已被中断";
+        // 与 run 内联逻辑同构：有产出时拼接，无产出时才退回纯中断语。
+        let with_output = if outputs.is_empty() {
+            interrupted_line.to_string()
+        } else {
+            format!("{}\n\n{}", outputs.join("\n\n"), interrupted_line)
+        };
+        assert!(
+            with_output.contains("middleware/auth.rs:88"),
+            "{with_output}"
+        );
+        assert!(with_output.contains(interrupted_line));
+
+        let empty: Vec<String> = Vec::new();
+        let without_output = if empty.is_empty() {
+            interrupted_line.to_string()
+        } else {
+            format!("{}\n\n{}", empty.join("\n\n"), interrupted_line)
+        };
+        assert_eq!(without_output, interrupted_line);
+    }
+
+    #[test]
+    fn handoff_conclusion_falls_back_to_last_assistant_message() {
+        use wyj_api::types::Message;
+        let messages = [
+            Message::user("任务"),
+            Message::assistant_text("中间结论 A"),
+            Message::assistant_text("最后一轮结论 B"),
+        ];
+        let handoff = build_handoff(
+            3,
+            "general-purpose",
+            "调查",
+            false,
+            crate::handoff::HandoffStatus::Interrupted,
+            Some("interrupted by user".to_string()),
+            // 运行期没来得及记录（例如第一轮就被打断）
+            "",
+            messages.iter(),
+            1.5,
+        );
+        assert_eq!(handoff.conclusion, "最后一轮结论 B");
+        assert!(handoff.status.is_incomplete());
+    }
+
+    #[test]
+    fn handoff_prefers_live_turn_text_over_message_scan() {
+        use wyj_api::types::Message;
+        let messages = [Message::assistant_text("旧的")];
+        let handoff = build_handoff(
+            3,
+            "Explore",
+            "找定义",
+            false,
+            crate::handoff::HandoffStatus::TurnLimit,
+            None,
+            "这一轮交出的结论",
+            messages.iter(),
+            9.0,
+        );
+        assert_eq!(handoff.conclusion, "这一轮交出的结论");
+    }
+
+    #[test]
+    fn digest_rendering_lists_modified_files_before_reads() {
+        let digest = crate::handoff::ToolDigest {
+            files_modified: vec!["src/a.rs".to_string()],
+            files_read: vec!["src/b.rs".to_string()],
+            commands: vec!["cargo test".to_string()],
+            searches: vec!["fn main".to_string()],
+            errors: vec!["Bash: error[E0308]".to_string()],
+            total_calls: 4,
+        };
+        let text = format_digest(&digest).expect("有调用就应有摘要");
+        // 改过的文件排最前：它才是「现场状态」里最需要被看见的一行
+        assert!(text.starts_with("Files modified: src/a.rs"), "{text}");
+        assert!(text.contains("Files read: src/b.rs"));
+        assert!(text.contains("Tool calls: 4"));
+    }
+
+    #[test]
+    fn digest_rendering_is_absent_when_nothing_ran() {
+        assert!(
+            format_digest(&crate::handoff::ToolDigest::default()).is_none(),
+            "一个工具都没调用时不该给模型一段空标题"
         );
     }
 }

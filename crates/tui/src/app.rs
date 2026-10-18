@@ -294,6 +294,9 @@ pub struct SubAgentUiState {
     /// 后台子 Agent 的 ToolResult 消息内容只是"已后台启动"占位文本，
     /// 真实结果只经这个字段，供 agents 面板详情区展示。
     pub final_result: Option<String>,
+    /// 终态交接物（`a<id>.handoff.json`）。**未完成时**它是「做到哪了」的
+    /// 唯一来源——`final_result` 里那段是给模型看的定界外壳，人读需要摘要。
+    pub handoff: Option<wyj_tools::handoff::SubAgentHandoff>,
 }
 
 impl SubAgentUiState {
@@ -6005,6 +6008,7 @@ mod navigation_focus_tests {
             has_result: false,
             finished_at: None,
             final_result: None,
+            handoff: None,
         }
     }
 
@@ -11146,6 +11150,7 @@ impl AppState {
                         has_result: false,
                         finished_at: None,
                         final_result: None,
+                        handoff: None,
                     },
                 );
             }
@@ -11234,6 +11239,20 @@ impl AppState {
                     s.output_tokens += output_tokens;
                 }
             }
+            E::Assistant { id, text } => {
+                // 只进内存态 trace 缓存（详情面板用），不驱动聊天区：
+                // 聊天区只展示子 Agent 的最终结果，中间落点属于详情。
+                self.sub_agent_trace_cache
+                    .entry(id)
+                    .or_default()
+                    .push(TraceEvent::Assistant {
+                        text: wyj_tools::textutil::truncate_head_tail(
+                            &text,
+                            wyj_tools::trace::ASSISTANT_HEAD_BYTES,
+                            0,
+                        ),
+                    });
+            }
             E::Control {
                 id,
                 action,
@@ -11264,6 +11283,7 @@ impl AppState {
                 is_error,
                 elapsed_secs,
                 background,
+                handoff_body,
             } => {
                 self.sub_agent_trace_cache
                     .entry(id)
@@ -11283,6 +11303,11 @@ impl AppState {
                     s.current_tool = None;
                     s.finished_at = Some(Instant::now());
                     s.final_result = Some(result.clone());
+                    // 交接物从盘上读回：Done 事件只带模型侧外壳，人读的摘要
+                    // （状态/结论/改了哪些文件）在 a<id>.handoff.json 里。
+                    s.handoff = self.sessions_dir.as_ref().and_then(|dir| {
+                        wyj_tools::handoff::read_handoff(dir, &self.current_session_id, id)
+                    });
                 }
                 // 完成即从面板列表消失，选中态（若正指向它）要重新对齐到
                 // 仍在运行的条目；一个都不剩时收起面板并把焦点交还输入框。
@@ -11296,13 +11321,16 @@ impl AppState {
                         summary: truncate_notify_body(&summary),
                     });
                     // 结果包成 system-reminder：主 Agent 忙则经注入通道在工具边界
-                    // 送达；空闲则暂存，下一轮起手合并进 user 消息
-                    let reminder = wyj_core::prompts::bg_agent_done_reminder(
+                    // 送达；空闲则暂存，下一轮起手合并进 user 消息。
+                    // `handoff_body` 为 Some（未完成）时用它替换普通报告外壳，
+                    // 保证后台与前台两条路径给模型的交接措辞逐字相同。
+                    let reminder = wyj_core::prompts::bg_agent_reminder_with(
                         &format!("a{id}"),
                         &agent_type,
                         &description,
                         &format_hms(elapsed_secs),
                         &result,
+                        handoff_body.as_deref(),
                     );
                     match &self.injector {
                         Some(queue) => {
@@ -12893,9 +12921,42 @@ fn reload_persisted_sub_agents(
     use wyj_tools::trace::{list_trace_ids, read_trace, trace_file, TraceEvent};
 
     let mut out = std::collections::BTreeMap::new();
-    for id in list_trace_ids(sessions_dir, session_id) {
+    let mut ids = list_trace_ids(sessions_dir, session_id);
+    // `trace_enabled = false` 时会话只有交接物、没有 trace——这些 agent 同样
+    // 应当出现在面板里（否则「有交接记录但看不到」比没有更困惑）。
+    for id in wyj_tools::handoff::list_handoff_ids(sessions_dir, session_id) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    for id in ids {
         let path = trace_file(sessions_dir, session_id, id);
+        // 没有 trace（`trace_enabled = false` 或文件被清理）但仍有交接物时，
+        // 用交接物本身重建一条最小记录——总比让用户看不到这个 agent 好。
         let Ok(events) = read_trace(&path) else {
+            if let Some(handoff) = wyj_tools::handoff::read_handoff(sessions_dir, session_id, id) {
+                out.insert(
+                    id,
+                    SubAgentUiState {
+                        agent_type: handoff.agent_type.clone(),
+                        description: handoff.description.clone(),
+                        background: handoff.background,
+                        status: sub_agent_status_from_handoff(handoff.status),
+                        started_at: Instant::now(),
+                        final_elapsed: Some(handoff.elapsed_secs),
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        tool_calls: handoff.digest.total_calls,
+                        current_tool: None,
+                        tool_log: Vec::new(),
+                        has_result: true,
+                        finished_at: Some(Instant::now()),
+                        final_result: Some(handoff.conclusion.clone()),
+                        handoff: Some(handoff),
+                    },
+                );
+            }
             continue;
         };
         let mut reconstructed: Option<SubAgentUiState> = None;
@@ -12924,6 +12985,7 @@ fn reload_persisted_sub_agents(
                         has_result: false,
                         finished_at: Some(Instant::now()),
                         final_result: None,
+                        handoff: None,
                     });
                 }
                 TraceEvent::ToolStart {
@@ -12969,6 +13031,9 @@ fn reload_persisted_sub_agents(
                         s.output_tokens += output_tokens;
                     }
                 }
+                // 每轮落点：回灌时保留，详情面板靠它显示「推导出了什么」。
+                // 不参与状态机，不影响 Running/Done 的判定。
+                TraceEvent::Assistant { .. } => {}
                 TraceEvent::Control { action, accepted } => {
                     if let Some(s) = &mut reconstructed {
                         if accepted && action == "interrupt" {
@@ -13000,7 +13065,26 @@ fn reload_persisted_sub_agents(
             out.insert(id, s);
         }
     }
+    // 交接物与 trace 分开读：trace 可能因进程被强杀而缺 Done，但 Hub 在
+    // abort 前写的 `a<id>.handoff.json` 仍在——它才是终态与结论的权威来源。
+    for (id, state) in out.iter_mut() {
+        if let Some(handoff) = wyj_tools::handoff::read_handoff(sessions_dir, session_id, *id) {
+            state.handoff = Some(handoff);
+        }
+    }
     out
+}
+
+/// 交接终态 → 面板状态。`Completed` 之外一律映射为 `Interrupted`，
+/// 因为面板只有 Running/Done/Failed/Interrupted 四态，而「轮数触顶」在 UI
+/// 语义上就是一次没跑完的提前停止（详情区会显示具体是 turn_limit）。
+fn sub_agent_status_from_handoff(status: wyj_tools::handoff::HandoffStatus) -> SubAgentStatus {
+    use wyj_tools::handoff::HandoffStatus;
+    match status {
+        HandoffStatus::Completed => SubAgentStatus::Done,
+        HandoffStatus::Failed => SubAgentStatus::Failed,
+        HandoffStatus::Interrupted | HandoffStatus::TurnLimit => SubAgentStatus::Interrupted,
+    }
 }
 
 /// `/subagents [id]` 命令：无参数时定位到最近一个子 Agent 并展开详情
@@ -18751,6 +18835,7 @@ mod sub_agent_ui_tests {
             is_error: false,
             elapsed_secs: 1.2,
             background: true,
+            handoff_body: None,
         }));
         assert_eq!(state.pending_bg_reminders.len(), 1);
         assert!(state.pending_bg_reminders[0].contains("调查结论"));
@@ -19005,6 +19090,7 @@ mod cross_session_subagents_tests {
                 has_result: true,
                 finished_at: Some(Instant::now()),
                 final_result: Some("r1".into()),
+                handoff: None,
             },
         );
         state.sub_agents.insert(
@@ -19024,6 +19110,7 @@ mod cross_session_subagents_tests {
                 has_result: true,
                 finished_at: Some(Instant::now()),
                 final_result: Some("r2".into()),
+                handoff: None,
             },
         );
 
@@ -19048,6 +19135,7 @@ mod cross_session_subagents_tests {
             has_result: false,
             finished_at: None,
             final_result: None,
+            handoff: None,
         }
     }
 
@@ -19108,6 +19196,7 @@ mod cross_session_subagents_tests {
                 has_result: true,
                 finished_at: Some(Instant::now()),
                 final_result: Some("r1".into()),
+                handoff: None,
             },
         );
         apply_open_subagents_panel(&mut state, Some(99));

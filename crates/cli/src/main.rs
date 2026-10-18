@@ -360,7 +360,15 @@ fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> 
 
     match sub_id {
         None => {
-            let ids = list_trace_ids(&sessions_dir, session_id);
+            let mut ids = list_trace_ids(&sessions_dir, session_id);
+            // 只有交接物/消息日志、没有 trace 的 agent 也必须列出来：
+            // `trace_enabled = false` 时它们本就只有这些文件。
+            for id in wyj_tools::handoff::list_handoff_ids(&sessions_dir, session_id) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids.sort_unstable();
             if ids.is_empty() {
                 println!(
                     "{}",
@@ -374,12 +382,23 @@ fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> 
                 print_subagent_trace_ownership(&id, &records);
                 let events: Vec<_> = records.into_iter().map(|(_, event)| event).collect();
                 print_subagent_trace_summary(id, &events);
+                print_subagent_trace_handoff(&sessions_dir, session_id, id);
             }
         }
         Some(id) => {
             let path = trace_file(&sessions_dir, session_id, id);
             let records = read_trace_by_process(&path).unwrap_or_default();
             if records.is_empty() {
+                // 没有 trace 不等于没有这个 agent：`trace_enabled = false` 时
+                // 只剩交接物/消息日志。有其中任何一个就照常打印，别报「不存在」。
+                if wyj_tools::handoff::read_handoff(&sessions_dir, session_id, id).is_some()
+                    || wyj_tools::message_log::recover_progress(&sessions_dir, session_id, id)
+                        .is_some()
+                {
+                    println!("=== a{id} (no trace) ===");
+                    print_subagent_trace_handoff(&sessions_dir, session_id, id);
+                    return Ok(());
+                }
                 println!(
                     "{}",
                     wyj_i18n::tr_fmt(
@@ -394,6 +413,7 @@ fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> 
             } else {
                 print_subagent_trace_ownership(&id, &records);
                 let events: Vec<_> = records.into_iter().map(|(_, event)| event).collect();
+                print_subagent_trace_handoff(&sessions_dir, session_id, id);
                 print_subagent_trace_detail(id, &events);
             }
         }
@@ -471,12 +491,73 @@ fn print_subagent_trace_summary(id: u64, events: &[wyj_tools::trace::TraceEvent]
                 status = if *is_error { "failed" } else { "done" };
                 elapsed = *elapsed_secs;
             }
-            TE::ToolEnd { .. } | TE::Control { .. } => {}
+            TE::ToolEnd { .. } | TE::Control { .. } | TE::Assistant { .. } => {}
         }
     }
     println!(
         "a{id}  {agent_type}({description})  [{status}]  {elapsed:.1}s  {tool_calls} tool calls  ↑{in_tok} ↓{out_tok}"
     );
+}
+
+/// 打印交接物（若有）。这是 `subagent-trace` 与「这个 agent 到底做到哪了」
+/// 之间最直接的对应关系——trace 只有工具动作，交接物才有结论与终态。
+fn print_subagent_trace_handoff(sessions_dir: &std::path::Path, session_id: &str, id: u64) {
+    use wyj_tools::handoff::{read_handoff, HandoffStatus};
+
+    let Some(handoff) = read_handoff(sessions_dir, session_id, id) else {
+        // 没有交接物 = 收尾代码没跑过（进程被硬杀）。此时消息增量日志是唯一
+        // 能还原「做到哪了」的来源，别让它白躺在盘上。
+        if let Some(recovered) =
+            wyj_tools::message_log::recover_progress(sessions_dir, session_id, id)
+        {
+            println!("--- no handoff (process killed before cleanup) ---");
+            println!(
+                "  recovered from message log: {} messages{}",
+                recovered.message_count,
+                if recovered.incomplete {
+                    " (log incomplete)"
+                } else {
+                    ""
+                }
+            );
+            if !recovered.conclusion.trim().is_empty() {
+                println!(
+                    "  last position: {}",
+                    recovered.conclusion.replace('\n', "\n    ")
+                );
+            }
+            println!();
+        }
+        return;
+    };
+    let status = match handoff.status {
+        HandoffStatus::Completed => "completed",
+        HandoffStatus::Interrupted => "interrupted",
+        HandoffStatus::TurnLimit => "turn limit",
+        HandoffStatus::Failed => "failed",
+    };
+    println!("--- handoff: {status} ---");
+    if let Some(reason) = &handoff.reason {
+        println!("  reason: {reason}");
+    }
+    if !handoff.conclusion.trim().is_empty() {
+        println!(
+            "  last position: {}",
+            handoff.conclusion.replace('\n', "\n    ")
+        );
+    }
+    let d = &handoff.digest;
+    if !d.files_modified.is_empty() {
+        println!("  modified: {}", d.files_modified.join(", "));
+    }
+    if !d.files_read.is_empty() {
+        println!("  read: {}", d.files_read.join(", "));
+    }
+    if !d.errors.is_empty() {
+        println!("  errors: {}", d.errors.join("; "));
+    }
+    println!("  tool calls: {}", d.total_calls);
+    println!();
 }
 
 fn print_subagent_trace_detail(id: u64, events: &[wyj_tools::trace::TraceEvent]) {
@@ -519,6 +600,9 @@ fn print_subagent_trace_detail(id: u64, events: &[wyj_tools::trace::TraceEvent])
                 output_tokens,
             } => {
                 println!("  usage: ↑{input_tokens} ↓{output_tokens}");
+            }
+            TE::Assistant { text } => {
+                println!("  [say] {text}");
             }
             TE::Control { action, accepted } => {
                 println!("  control: {action} accepted={accepted}");
@@ -1747,6 +1831,17 @@ async fn main() -> Result<()> {
         }
         .with_max_concurrent(cfg.subagent.max_concurrent),
     );
+    // 消息增量日志：正常结束/ESC 中断由任务与 Hub 写交接物，**进程被硬杀**
+    // （SIGKILL / 关终端 / 断电）时两者都不执行，只剩这份边产生边落盘的记录
+    // 还能重建「做到哪了」。开关跟随 `trace_enabled`——两者服务同一类诊断需求，
+    // 没有理由一个开一个关。
+    let sub_agent_message_log = cfg.subagent.trace_enabled.then(|| {
+        Arc::new(wyj_tools::message_log::MessageLogWriter::spawn(
+            config_base.join("sessions"),
+            session_id.clone(),
+            wyj_tools::message_log::DEFAULT_MAX_BYTES_PER_AGENT,
+        ))
+    });
     // 当前已连接 MCP 工具的共享快照：`-p`/`--headless`/TUI 三种模式各自的
     // MCP 连接时机不同，但都在工具注册成功时 push 进这个句柄，供子 Agent
     // 工厂与 `/model` 重建共同读取（子 Agent 只能看到 spawn 时刻已连好的）。
@@ -1760,15 +1855,22 @@ async fn main() -> Result<()> {
         evolution_store.clone(),
         workspace_cas.clone(),
     );
-    registry.register_arc(Arc::new(
-        SubAgentTool::new_shared(shared_agent_defs.clone(), sub_agent_hub.clone(), {
-            let f = sub_agent_factory.clone();
-            move |def| f(def)
-        })
-        .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-        .with_session_id(session_id.clone())
-        .with_max_depth(cfg.subagent.max_depth),
-    ));
+    registry.register_arc(Arc::new({
+        let mut tool =
+            SubAgentTool::new_shared(shared_agent_defs.clone(), sub_agent_hub.clone(), {
+                let f = sub_agent_factory.clone();
+                move |def| f(def)
+            })
+            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
+            .with_session_id(session_id.clone())
+            .with_max_depth(cfg.subagent.max_depth)
+            // 交接物落盘根目录：与 trace 同一个 `sessions/`，文件名后缀不同。
+            .with_sessions_dir(config_base.join("sessions"));
+        if let Some(log) = sub_agent_message_log.clone() {
+            tool = tool.with_message_log(log);
+        }
+        tool
+    }));
 
     // -p（单次问答）模式：仍在启动时连接 MCP server，但只等一个远小于
     // `MCP_CONNECT_TIMEOUT` 的宽限期（见 `MCP_STARTUP_GRACE`）——`-p` 是真正的
@@ -2053,6 +2155,9 @@ async fn main() -> Result<()> {
                     );
                 }
                 E::ToolEnd { .. } | E::Usage { .. } => {}
+                // 中间落点不刷屏：headless 只关心开始/工具/结束三类行，
+                // 每轮 assistant 文本已经在 Done 的最终结果里体现。
+                E::Assistant { .. } => {}
                 E::Control {
                     id,
                     action,
@@ -2173,6 +2278,7 @@ async fn main() -> Result<()> {
     let todo_store_for_rebuild = todo_store.clone();
     let agent_defs_for_rebuild = shared_agent_defs.clone();
     let hub_for_rebuild = sub_agent_hub.clone();
+    let message_log_for_rebuild = sub_agent_message_log.clone();
     let store_for_rebuild = session_store_arc.clone();
     let sid_for_rebuild = session_id.clone();
     let cwd_for_rebuild = cwd.clone();
@@ -2313,15 +2419,20 @@ async fn main() -> Result<()> {
             evolution_store_for_rebuild.clone(),
             workspace_cas_for_rebuild.clone(),
         );
-        reg.register_arc(Arc::new(
-            SubAgentTool::new_shared(
+        reg.register_arc(Arc::new({
+            let mut tool = SubAgentTool::new_shared(
                 agent_defs_for_rebuild.clone(),
                 hub_for_rebuild.clone(),
                 move |def| sub_factory(def),
             )
             .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-            .with_session_id(sid_for_rebuild.clone()),
-        ));
+            .with_session_id(sid_for_rebuild.clone())
+            .with_sessions_dir(config_base.join("sessions"));
+            if let Some(log) = message_log_for_rebuild.clone() {
+                tool = tool.with_message_log(log);
+            }
+            tool
+        }));
         for def in reg.definitions() {
             if let Some(t) = reg.get(&def.name) {
                 new_agent.register_tool(t);

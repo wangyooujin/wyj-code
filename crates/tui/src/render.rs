@@ -2501,6 +2501,12 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
         )));
     }
 
+    // 交接摘要：未完成（中断/触顶/失败）时，这是「做到哪了」最快的一眼——
+    // trace 里有全部工具动作，但要滚很久才知道停在哪；结论与改过的文件在这里。
+    if let Some(handoff) = state.sub_agents.get(&id).and_then(|s| s.handoff.as_ref()) {
+        push_sub_agent_handoff_lines(&mut lines, handoff, detail_width);
+    }
+
     // 正文：优先 trace（含工具入参/出参），落盘 trace 缺失时才退回面板那份摘要流水。
     let events = state.sub_agent_trace_events(id);
     match events {
@@ -2615,6 +2621,103 @@ fn push_wrapped_detail_line(
     }
 }
 
+/// 交接摘要块：未完成状态下「做到哪了」的一屏速览。
+///
+/// 只渲染**结论性**信息（状态、停下的原因、最后陈述、改过的文件、错误）。
+/// 读过的文件只给计数——一屏塞 30 个路径既挤又没用，需要细看时下面就是 trace。
+fn push_sub_agent_handoff_lines(
+    lines: &mut Vec<Line<'static>>,
+    handoff: &wyj_tools::handoff::SubAgentHandoff,
+    detail_width: usize,
+) {
+    use wyj_tools::handoff::HandoffStatus;
+
+    let (status_label, style) = match handoff.status {
+        HandoffStatus::Completed => (wyj_i18n::tr("subagents.status_completed"), Theme::dim()),
+        HandoffStatus::Interrupted => {
+            (wyj_i18n::tr("subagents.status_interrupted"), Theme::error())
+        }
+        HandoffStatus::TurnLimit => (wyj_i18n::tr("subagents.status_turn_limit"), Theme::error()),
+        HandoffStatus::Failed => (wyj_i18n::tr("subagents.status_failed"), Theme::error()),
+    };
+    push_wrapped_detail_line(
+        lines,
+        &wyj_i18n::tr_fmt(
+            "subagents.handoff_line",
+            &[
+                ("status", &status_label),
+                ("calls", &handoff.digest.total_calls.to_string()),
+            ],
+        ),
+        "",
+        style,
+        detail_width,
+    );
+    if let Some(reason) = &handoff.reason {
+        push_wrapped_detail_line(lines, "reason", reason, Theme::dim(), detail_width);
+    }
+    if !handoff.conclusion.trim().is_empty() {
+        push_wrapped_detail_line(
+            lines,
+            "last position",
+            &handoff.conclusion,
+            Theme::tool_result(),
+            detail_width,
+        );
+    } else {
+        push_wrapped_detail_line(
+            lines,
+            "last position",
+            &wyj_i18n::tr("subagent.handoff_no_conclusion"),
+            Theme::dim(),
+            detail_width,
+        );
+    }
+    if !handoff.digest.files_modified.is_empty() {
+        push_wrapped_detail_line(
+            lines,
+            "modified",
+            &handoff.digest.files_modified.join(", "),
+            Theme::dim(),
+            detail_width,
+        );
+    }
+    if !handoff.digest.files_read.is_empty() {
+        push_wrapped_detail_line(
+            lines,
+            &wyj_i18n::tr_fmt(
+                "subagents.handoff_files_read",
+                &[("count", &handoff.digest.files_read.len().to_string())],
+            ),
+            "",
+            Theme::dim(),
+            detail_width,
+        );
+    }
+    if !handoff.digest.errors.is_empty() {
+        push_wrapped_detail_line(
+            lines,
+            "errors",
+            &handoff.digest.errors.join("; "),
+            Theme::error(),
+            detail_width,
+        );
+    }
+    if handoff.status.is_incomplete() {
+        push_wrapped_detail_line(
+            lines,
+            "",
+            &wyj_i18n::tr("subagents.handoff_hint"),
+            Theme::info(),
+            detail_width,
+        );
+    }
+    lines.push(Line::from(Span::styled(
+        "─".repeat(detail_width.min(120)),
+        Theme::dim(),
+    )));
+}
+
 fn push_sub_agent_trace_lines(
     lines: &mut Vec<Line<'static>>,
     events: &[TraceEvent],
@@ -2708,6 +2811,11 @@ fn push_sub_agent_trace_lines(
                     Theme::dim(),
                     detail_width,
                 );
+            }
+            TraceEvent::Assistant { text } => {
+                // 每轮落点：这是详情面板里唯一能看出「它得出了什么」的地方，
+                // 工具行只说明「它做了什么」。
+                push_wrapped_detail_line(lines, "say", text, Theme::dim(), detail_width);
             }
             TraceEvent::Control { action, accepted } => {
                 push_wrapped_detail_line(
@@ -6890,6 +6998,7 @@ mod tool_result_fold_tests {
             has_result: status != SubAgentStatus::Running,
             finished_at: (status != SubAgentStatus::Running).then(Instant::now),
             final_result: (status == SubAgentStatus::Done).then(|| "done".to_string()),
+            handoff: None,
         }
     }
 
