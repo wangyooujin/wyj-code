@@ -12,6 +12,77 @@
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-18
+
+### 折叠了工具，模型就以为它不存在；转着圈，界面上却看不出在干什么
+
+本次改动分别指向几种「界面上看着正常、实际信息量为零」的状态。
+
+### ① lazy 折叠的工具必须在提示词里点名
+
+工具总数超过 `model_runtime.lazy_tools_threshold`（默认 12）后，未在
+`ALWAYS_VISIBLE_TOOL_SCHEMAS` 里的 schema 不再发送；而提示词此前只列「本次直接
+可调用」的名单，模型把「不在列表里」读成「本会话没有这个工具」——实测 MCP
+`codegraph` 的 8 个工具自接入起从未被调用过一次。
+
+修法：`LazyToolState::hidden_sources()` 按 source 分组计数（`builtin` /
+`mcp:<server>`），由 `prompts::current_tool_availability_block` 追加一行
+`Hidden but available via ToolSearch: … folded, not missing`。三条约束：只报来源
+与数量、绝不展开 schema（否则折叠白做）；折叠列表为空时输出与旧版**逐字节相同**
+（否则每次工具增减都会打掉 prompt cache）；被搜索命中转 sticky 的工具不再计入。
+
+### ② `/model` 的「仅本会话使用」此前只活在内存里
+
+`Session.session_profile` 随 `SessionFile` 落盘，`--resume` 后继续生效；优先级
+`--profile` > 会话级 > routing 默认，`/clear` 刻意不清除它。`/config` 等面板写盘
+仍用全局默认值，避免把临时分组固化成全局配置；分支会话继承父会话的临时分组。
+
+### ③ `!` bash 输出改为全文
+
+此前是「标题行 + 三行预览 + `...`」：用户**亲手敲**的命令，输出却按屏幕高度被裁掉
+4/5。现删除三行预览，长行折行不丢字，空输出回落 `(no output)`；每帧折行代价由
+`ChatMessage::render_cache` 按宽度缓存收掉，成为「折叠态一律不得触碰 content」
+不变式的第三处显式豁免。
+
+### ④ 标题栏不再复述聊天区最后一条
+
+`ToolStart` 用**同一个** `display` 字符串同时写 `current_op` 与聊天流的 ToolCall
+消息，而标题栏直接回显 `current_op`——于是工具执行期间底部那行与聊天区最后一条
+**逐字节相同**，只有 spinner 在动，看起来像界面卡住。
+
+分工改为「聊天区答在做什么动作，标题栏答为哪件事、第几步」：新增
+`AppState.current_tool_name`（只存工具名，参数留给聊天区）与
+`AppState.turn_step_no`（本轮步数，`ToolStart` 自增、`begin_turn_timing` /
+`begin_background_task` 归零；刻意不复用跨轮累计的 `tool_call_count`）。优先级
+变为 对话框 → InProgress todo 任务名（意图）→ 工具名 → `current_op` 原文（仅
+`/compact` 等无聊天区对应的后台任务）→ 排队 → 思考中。步号并入 label 而非独立段，
+因为窄屏下 `build_thinking_title` 只对 label 做省略号截断，独立段会被整段先丢掉。
+
+### ⑤ 推理轮数触顶：先收尾交付，再硬中止
+
+现场证据（`sess-1792289788` 的 `turn_limit` 存档逐轮核对）：收尾指令确实送达且格式
+完整，模型接下来 5 轮的 thinking 里**零次**提到轮数——它正沉浸在自己刚发现的线索
+上，连发工具耗光宽限，第 201 轮 `bail!`，工作树里已落地的改动全被折成一句报错。
+另有两处口径问题：turn 计的是 LLM 往返而非工作量（该会话 285 条 assistant 消息里
+282 条只有 1 个 `tool_use`，「200 轮」实际只买得起约 200 次工具调用）。
+
+宽限窗口内 `wrap_up_sent` 为真时，模型发起的每个工具调用**不执行**，直接回一条
+`tools_closed_turn_budget_exhausted` 的 tool_result——不弹框、不碰工作树，但模型
+下一轮能读到自己那次调用被拒的证据，比再追加一段说明有分量。刻意**不发空 tools
+数组**：`tools` 位于 prompt 缓存前缀最前端，改它会把整段历史（触顶时实测约 42 万
+token）从 cache_read 打回全价。硬中止路径保留，现在只在「连着 5 轮拿到工具被拒的
+证据、仍不交出最终回答」时触发。
+
+### 其他
+
+- `Profile` 默认 `max_tokens` 8192 → 32000（代码默认值、README、配置参考与根规约
+  示例同步）。
+- 修正多处规约文件里已过期与自相矛盾的陈述（store 的权限模型整段是旧版副本、
+  core 的 AGENTS.md reminder 落点写反、cli 的 `require_provider` 调用点数、
+  tui 的对话框数量与重复段落、根文件 `doc/plan/` 目录名拼错）。
+
+**1515 个 workspace 测试**（1390 → 1515）+ clippy `-D warnings` 全绿。
+
 ## [0.3.4] - 2026-10-15
 
 ### MiniMax `/anthropic` 线协议接线：reasoning_effort 从死配置变成真档位
