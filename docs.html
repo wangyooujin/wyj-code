@@ -275,8 +275,8 @@
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.7 · 折叠的工具、复述的标题栏、被裁掉的输出</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次三件事都指向同一种状态：界面上看着正常，实际信息量为零。<br><br><strong class="text-amber-400">① 折叠掉的工具，模型以为不存在</strong>。工具总数超过 <code>lazy_tools_threshold</code> 后，未在常驻名单里的 schema 不再发送，而提示词此前只列「本次直接可调用」的名单——模型把「不在列表」读成「本会话没有这个工具」，实测 MCP <code>codegraph</code> 的 8 个工具自接入起<strong>一次都没被调用</strong>。现由 <code>LazyToolState::hidden_sources()</code> 按来源分组计数，提示词追加一行点名「已折叠但可经 ToolSearch 取回」；只报来源与数量、绝不展开 schema，折叠列表为空时输出与旧版<strong>逐字节相同</strong>（否则每次工具增减都会打掉 prompt cache）。<br><br><strong class="text-amber-400">② 「仅本会话使用」只活在内存里</strong>。<code>Session.session_profile</code> 现在随会话落盘，<code>--resume</code> 后继续生效，优先级 <code>--profile</code> &gt; 会话级 &gt; routing 默认；<code>/config</code> 等面板写盘仍用全局默认值，避免把临时分组固化成全局配置，分支会话继承父会话的临时分组。<br><br><strong class="text-amber-400">③ 标题栏与聊天区最后一条一模一样</strong>。<code>ToolStart</code> 用<strong>同一个</strong> <code>display</code> 字符串同时写 <code>current_op</code> 与聊天流的工具行，而标题栏直接回显 <code>current_op</code>——工具执行期间底部那行与输出区最后一条<strong>逐字节相同</strong>，只有 spinner 在动，看起来像卡住。现改为「聊天区答在做什么动作，标题栏答为哪件事、第几步」：新增只存工具名的 <code>current_tool_name</code> 与本轮步数 <code>turn_step_no</code>（刻意不复用跨轮累计的 <code>tool_call_count</code>），优先级变为 对话框 → 进行中任务名 → 工具名 → 后台任务标签 → 排队 → 思考中。<br><br><strong class="text-amber-400">④ 用户亲手敲的命令，输出被裁掉 4/5</strong>。<code>!</code> bash 输出删除三行预览改全文渲染，长行折行不丢字，每帧折行代价由 <code>render_cache</code> 按宽度缓存收掉。<br><br><strong class="text-amber-400">⑤ 触顶时先收尾交付，再硬中止</strong>。现场证据显示收尾指令送达后模型 5 轮 thinking 里<strong>零次</strong>提到轮数，最终 <code>bail!</code> 把已落地的改动折成一句报错。现宽限窗口内每个工具调用不执行、直接回一条「工具已关闭」的结果，让模型下一轮读到自己被拒的证据；刻意不发空 tools 数组——它位于缓存前缀最前端，改它会把 42 万 token 历史从 cache_read 打回全价。<strong>1515 个 workspace 测试</strong>（1390 → 1515）+ clippy <code>-D warnings</code> 全绿。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.8 · 中断也能说清做到哪，标题栏不再复述步号</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本次三块改动共用一个判据：<strong>能还原的必须是结论，不是过程截图</strong>。<br><br><strong class="text-amber-400">① 中断的子 Agent 只回一句「已中止」</strong>。ESC 中断时已完成轮次的产出全丢，硬杀进程则连一句话都没有。新增 <code>tools::handoff</code>：<code>SubAgentHandoff{status, reason, conclusion, digest, elapsed_secs}</code> 与 <code>ToolDigest</code> 落盘 <code>a&lt;id&gt;.handoff.json</code>，运行期快照边跑边记、由 <code>SubAgentHub::abort()</code> <strong>前</strong>补写——abort 之后任务收尾代码不会执行，这是中断场景唯一可行的路径。中断改为「产出 + 中断标记」一并回填；trace 新增每轮末文本（保头 4KB），因为 <code>ToolStart</code>/<code>ToolEnd</code> 只说明读了什么，说明不了由此得出了什么。<br><br><strong class="text-amber-400">② 硬杀进程没有兜底</strong>。交接物只覆盖「进程还活着」的中断。新增 <code>Session.message_sink</code> 与 <code>MessageLogWriter</code> 写 <code>a&lt;id&gt;.messages.jsonl</code>，三种事件 <code>Appended</code>/<code>UpdatedLast</code>/<code>Replaced</code> <strong>必须区分</strong>：<code>push_user_blocks_merged</code> 与 <code>prepend_to_last_user</code> 原地改最后一条 user 消息，而压缩与 context editing 整段替换、必须打 snapshot 锚点。<code>replay()</code> 从最后一个 snapshot 起算，半行跳过并置 <code>incomplete</code>；<code>recover_progress()</code> 在无交接物时还原最后一轮 assistant 文本。<br><br><strong class="text-amber-400">③ 标题栏的「第 N 步」</strong>。步号既不回答"还剩多少"也不回答"在做什么"，且 <code>ToolEnd</code> 不清它——两次工具调用之间的纯思考阶段会显示「第 3 步 · 思考中」，此时耗时已回落成整轮；模型一次发多个并行工具时步号还会跳号。label 改映射动词短语（<code>Bash</code> → 运行命令，中英各 19 条），未收录的回落注册名，拼错 key 也不把 <code>tool_activity.xxx</code> 露给用户。<br><br><strong class="text-amber-400">④ 子 Agent 编排加固</strong>。<code>disallowedTools</code>（先减后取交集）、<code>omitClaudeMd</code>、<code>max_depth</code>（触顶时<strong>不注册</strong> Agent 工具，而不是留一个每次调用都报错的工具）、<code>max_concurrent</code>（超限排队不失败）；子 Agent 输出统一按 <code>&lt;subagent-report&gt;</code> 定界，不可信文本过 <code>escape_harness_markers</code>，<code>confirm_denial_reason</code> 区分「无审批通道」与「用户主动拒绝」。<strong>1548 个 workspace 测试</strong>（1515 → 1548）+ clippy <code>-D warnings</code> 全绿。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -320,7 +320,7 @@
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.7" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v0.3.7 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.8" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v0.3.8 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -328,7 +328,7 @@
 
   <div class="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
     <div class="arch-node reveal rounded-lg p-4">
-      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">1515</p>
+      <p class="font-display font-bold text-xl text-amber-400" data-i18n="delivery.tests.value">1548</p>
       <p class="mt-1 text-xs text-paper/45 leading-relaxed" data-i18n="delivery.tests.label">workspace 通过 + 公网专项通过</p>
     </div>
     <div class="arch-node reveal rounded-lg p-4" style="transition-delay:30ms">
@@ -359,8 +359,19 @@
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-        <span class="font-display font-bold text-phosphor">v0.3.7</span>
+        <span class="font-display font-bold text-phosphor">v0.3.8</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v038"><strong class="text-amber-400">中断的子 Agent 丢掉了「已经做到哪」，标题栏在复述一个步号</strong>。ESC 中断的 agent 此前只回一句「已中止」，已完成轮的产出全丢；硬杀进程则连一句话都没有。① <strong>交接物</strong>：新增 <code>tools::handoff</code>，<code>SubAgentHandoff{status, reason, conclusion, digest, elapsed_secs}</code> 落盘 <code>a&lt;id&gt;.handoff.json</code>；运行期快照边跑边记、由 <code>abort()</code> <strong>前</strong>补写（abort 之后收尾代码不会执行，这是中断场景唯一可行路径），中断改为「产出 + 中断标记」一并回填。trace 新增每轮末文本（保头 4KB）——<code>ToolStart</code>/<code>ToolEnd</code> 只说明读了什么，说明不了由此得出了什么。② <strong>消息增量日志</strong>：交接物只覆盖进程还活着的中断，新增 <code>Session.message_sink</code> 与 <code>MessageLogWriter</code> 写 <code>a&lt;id&gt;.messages.jsonl</code>；<code>Appended</code>/<code>UpdatedLast</code>/<code>Replaced</code> 三种事件必须区分——原地改最后一条 user 消息与压缩整段替换是两回事，后者要打 snapshot 锚点，<code>replay()</code> 从最后一个 snapshot 起算、半行跳过并置 incomplete。③ <strong>标题栏去掉「第 N 步」</strong>：步号既不回答"还剩多少"也不回答"在做什么"，<code>ToolEnd</code> 不清它会让纯思考阶段显示「第 3 步 · 思考中」，并发工具还会跳号；label 改映射动词短语（<code>Bash</code> → 运行命令）。④ <strong>子 Agent 编排加固</strong>：<code>disallowedTools</code>、<code>omitClaudeMd</code>、<code>max_depth</code>（触顶时<strong>不注册</strong>工具，而不是留一个每次调用都报错的工具）、<code>max_concurrent</code>，输出统一按 <code>&lt;subagent-report&gt;</code> 定界并转义仿冒的 harness 标签。<strong>1548 个 workspace 测试</strong>（1515 → 1548）+ clippy <code>-D warnings</code> 全绿。</p>
+      </div>
+    </div>
+
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+        <span class="font-display font-bold text-phosphor">v0.3.7</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一公开版</span>
         </div>
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v037"><strong class="text-amber-400">折叠的工具、复述的标题栏、被裁掉的输出</strong>。① <strong>折叠掉的工具模型以为不存在</strong>：工具数超过阈值后 schema 不再发送，而提示词只列「本次直接可调用」的名单，模型把「不在列表」读成「本会话没有」——实测 MCP <code>codegraph</code> 的 8 个工具自接入起一次都没被调用。现按 source 分组计数并追加一行「已折叠但可经 ToolSearch 取回」，只报来源与数量、绝不展开 schema，折叠为空时输出与旧版逐字节相同（否则每次工具增减都打掉 prompt cache）。② <strong>「仅本会话使用」只活在内存里</strong>：<code>session_profile</code> 随会话落盘、<code>--resume</code> 后仍生效，面板写盘仍用全局默认值，避免把临时分组固化。③ <strong>标题栏与聊天区最后一条逐字节相同</strong>：<code>ToolStart</code> 用同一个 <code>display</code> 字符串同时写 <code>current_op</code> 与工具行，标题栏又直接回显它，于是只有 spinner 在动、看着像卡住。改为「聊天区答动作，标题栏答意图与步数」，新增 <code>current_tool_name</code> 与本轮 <code>turn_step_no</code>。④ <strong><code>!</code> bash 输出改全文</strong>，用户亲手敲的命令不再按屏幕高度裁掉 4/5。⑤ <strong>触顶先收尾再硬中止</strong>：宽限窗口内工具调用不执行、直接回一条「工具已关闭」的结果，让模型读到自己被拒的证据；不发空 tools 数组，避免把 42 万 token 历史从 cache_read 打回全价。<strong>1515 个 workspace 测试</strong>（1390 → 1515）+ clippy <code>-D warnings</code> 全绿。</p>
       </div>
