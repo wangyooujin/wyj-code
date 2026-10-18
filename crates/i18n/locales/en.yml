@@ -90,9 +90,6 @@ thinking:
 # 切换 locale 后看起来只翻译了一半。
 spinner:
   thinking: "Thinking"
-  # Title-bar step prefix: {n} counts tool calls started in this turn, rendered
-  # as e.g. "Step 3 · fix login bug · 4.2s · 12k↑".
-  step: "Step {n} ·"
   waiting_approval: "Waiting for approval"
   reviewing_plan: "Reviewing plan"
   queuing_message: "Queuing message"
@@ -107,6 +104,31 @@ spinner:
 # Live output block of a running tool (tail lines only)
 live_output:
   omitted: "⋮ {count} more lines of output above"
+
+# Verb phrases for the input title-bar spinner: the title bar answers "what is
+# happening", the ⏺ row in the chat answers "on what" (the arguments). Neither
+# shows raw tool registration names, so users need not know the tool roster.
+# Unlisted tools fall back to the registration name (render::tool_activity_label).
+tool_activity:
+  bash: "Running command"
+  read: "Reading file"
+  write: "Writing file"
+  edit: "Editing file"
+  glob: "Finding files"
+  grep: "Searching code"
+  webfetch: "Fetching page"
+  websearch: "Searching web"
+  agent: "Delegating task"
+  todo: "Updating tasks"
+  ask: "Waiting for you"
+  plan: "Preparing plan"
+  tool_search: "Finding tools"
+  code_search: "Searching codebase"
+  memory: "Updating memory"
+  bash_output: "Reading background output"
+  kill_shell: "Stopping background job"
+  context_recall: "Recalling context"
+  computer: "Driving the desktop"
 
 # Backend tag appended to tool lines: Grep is the only tool that splits
 # across two search backends.
@@ -391,7 +413,7 @@ agents:
   tools_all: "all standard tools"
   source_line: "Source: {source}"
   builtin_tag: "built-in"
-  reload_note: "Custom definitions are read from *.md files under ~/.claude/agents/ and the project's .claude/agents/ (frontmatter: name/description/tools/model; model is a profile name). This list re-reads from disk, but the type list registered with the model is fixed at startup — restart after adding/changing definitions."
+  reload_note: "Custom definitions are read from *.md files under ~/.wyj-code/agents/ and the project's .wyj-code/agents/ (frontmatter: name/description/tools/disallowed_tools/model/omit_claude_md; model is a profile name). This list re-reads from disk, but the type list registered with the model is fixed at startup — restart after adding/changing definitions."
   dialog:
     title: "Agent Types"
     empty: "No agent types available"

@@ -376,6 +376,29 @@ impl ToolContext for ToolCtx {
         }
     }
 
+    fn confirm_denial_reason(&self, name: &str) -> Option<String> {
+        // 只有「无 UI 通道」这一条 fail-closed 分支需要额外解释：它和用户主动
+        // 点拒绝在 `confirm_tool` 里返回同一个 `false`，但对模型而言是两件事
+        // ——前者根本没人可问，后者有人看过并否决了。其余路径的拒绝都是真实
+        // 用户决定，交给调用方的通用措辞。
+        //
+        // 判据与 `confirm_tool` 逐分支对齐：非 Auto / 已项目授权 都会在
+        // `confirm_tool` 里直接返回 true，根本走不到拒绝分支。
+        if !matches!(&*self.permission_mode.read().unwrap(), PermissionMode::Auto) {
+            return None;
+        }
+        if self.always_allowed.read().unwrap().contains(name) {
+            return None;
+        }
+        if self.ui_ask_tx.is_some() {
+            return None;
+        }
+        Some(
+            "该执行面没有交互式审批通道（子 Agent / headless / 定时任务），本次操作无人可批准，因此未执行。请不要重试同一操作；改用不需要审批的方式完成任务，或如实说明受阻原因。"
+                .to_string(),
+        )
+    }
+
     fn needs_dialog(&self, name: &str) -> bool {
         // 判据与 confirm_tool 的两个「直接放行」分支严格对齐，差一个字就会
         // 出现「Agent 以为不弹框、把多个调用排进并发组，结果同时弹出 N 个
@@ -732,6 +755,47 @@ mod tests {
             !ctx.confirm_tool("Bash", "ls -la").await,
             "子 Agent ctx 没有 ui_ask_tx，闸门判 AskUser 时必须 fail-closed"
         );
+    }
+
+    /// fail-closed 的拒绝必须与「用户点了拒绝」区分开。
+    ///
+    /// 两者在 `confirm_tool` 里都返回 `false`，但对模型是两件事：前者根本没人
+    /// 可问（应改用免审批路径或如实汇报受阻），后者有人看过并否决了（应停下
+    /// 来问原因）。没有这个区分时，模型会以为「用户拒绝了」，于是换个参数反复
+    /// 重试，在一个永远不可能被批准的上下文里空转。
+    #[tokio::test]
+    async fn denial_reason_distinguishes_missing_channel_from_human_deny() {
+        let cwd = std::env::temp_dir();
+
+        // 子 Agent / headless：没有审批通道 → 给出「无人可批准」的具体原因
+        let ctx = ToolCtx::new(&cwd);
+        ctx.set_execution_surface(wyj_core::ExecutionSurface::SubAgent);
+        ctx.set_permission_mode(PermissionMode::Auto);
+        let reason = ctx
+            .confirm_denial_reason("Bash")
+            .expect("无 UI 通道时必须给出可区分的原因");
+        assert!(reason.contains("没有交互式审批通道"), "实际: {reason}");
+
+        // 有真实 UI 通道时，「拒绝」只能来自用户 → 不覆盖通用措辞
+        let mut ctx = ToolCtx::new(&cwd);
+        ctx.set_permission_mode(PermissionMode::Auto);
+        let (tx, _rx) = mpsc::channel(8);
+        ctx.ui_ask_tx = Some(tx);
+        assert!(ctx.confirm_denial_reason("Bash").is_none());
+
+        // 非 Auto 模式压根不会走到拒绝分支，同样不覆盖
+        let ctx = ToolCtx::new(&cwd);
+        ctx.set_permission_mode(PermissionMode::AutoApprove);
+        assert!(ctx.confirm_denial_reason("Bash").is_none());
+
+        // 已项目授权的工具会直接放行，也不该被标成「无人可批准」
+        let ctx = ToolCtx::new(&cwd);
+        ctx.set_permission_mode(PermissionMode::Auto);
+        ctx.always_allowed
+            .write()
+            .unwrap()
+            .insert("Bash".to_string());
+        assert!(ctx.confirm_denial_reason("Bash").is_none());
     }
 
     /// Bypass 派生的子 Agent 全放行，不受上面那条约束影响。
