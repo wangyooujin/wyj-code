@@ -238,6 +238,11 @@ pub fn elide_tool_results(
         batched += 1;
     }
 
+    // 外部化是**原地改写**历史中的消息内容，不是追加。不通知 sink，增量日志
+    // 里会永远留着那段被移出的大文本，重放时既占空间又与运行时状态不符。
+    if stats.elided > 0 {
+        session.emit_replaced();
+    }
     stats
 }
 

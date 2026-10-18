@@ -39,6 +39,12 @@ subagent:
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
   builtin_plan_desc: "规划 Agent：只读分析代码并产出分步实施计划"
+  handoff_interrupted: "子 Agent 已被中断（任务未完成）"
+  handoff_turn_limit: "子 Agent 推理轮数触顶（任务未完成）"
+  handoff_failed: "子 Agent 执行失败（任务未完成）"
+  handoff_completed: "已完成"
+  handoff_unavailable: "（无交接记录）"
+  handoff_no_conclusion: "（中断前没有留下文字结论，可查看执行轨迹了解做到哪一步）"
 
 subagents:
   desc: "打开子 Agent 聚合面板，查看本会话（含 /resume 恢复的历史会话）每个子 Agent 的完整执行详情"
@@ -46,6 +52,14 @@ subagents:
   not_found: "未找到子 Agent a{id}（本会话不存在该 id）"
   empty: "本会话暂无子 Agent 记录"
   headless_unsupported: "[headless 模式不支持 /subagents 面板，请用 `wyj-code subagent-trace <session-id> [id]` 查看落盘的执行轨迹]"
+  status_completed: "已完成"
+  status_interrupted: "已中断"
+  status_turn_limit: "轮数触顶"
+  status_failed: "失败"
+  handoff_line: "交接：{status} · 工具调用 {calls} 次"
+  handoff_files_modified: "已修改 {count} 个文件"
+  handoff_files_read: "已读 {count} 个文件"
+  handoff_hint: "· 任务未完成，可按交接摘要继续"
 
 shell:
   panel_title: " 后台任务 [{count}] "

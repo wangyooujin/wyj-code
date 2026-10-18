@@ -41,6 +41,8 @@
 
     **`confirm_tool` 拒绝的两类语义必须分开**：`ToolContext::confirm_denial_reason`（默认 `None`）让拒绝带上具体原因。子 Agent / headless 没有 `ui_ask_tx` 时 `confirm_tool` fail-closed，过去回灌的是「用户拒绝执行该操作」——模型以为有人看过并否决了，于是换参数反复重试；实际上根本没人可问。现在这条分支返回「该执行面没有交互式审批通道……请不要重试同一操作」，而真正的人为拒绝仍走 `USER_DENIED_REASON`。新增 fail-closed 分支时必须同步覆盖这个方法。
 
+    **子 Agent 中断 = 交接，不是恢复**（2026-10-18，设计见 `doc/plan/subagent-handoff-plan.md`）：未完成（中断/触顶/失败）时回填的不是裸错误，而是 `prompts::subagent_handoff_body` 外壳——最后陈述的位置 + 工具摘要（改了哪些文件、跑过什么、卡在什么错误）+ **显式三选一**（自己续 / 重派新 agent / 报给用户）。三选一必须写成封闭枚举：开放式建议实测退化成不做决定，而模型的默认「不决定」是「我接手」，正好把子 Agent 本该隔离的上下文灌回主对话。三条不变式：① **中断必须保留已完成轮的产出**（旧实现直接 `outputs.join` 整个丢弃，只回一句「子 Agent 被中断」——最需要交接时把唯一有价值的信息扔了）；② **进度必须边跑边记**，因为 `interrupt()`/`abort_foreground()` 会 `JoinHandle::abort()` 取消 future，任务自己的收尾代码一行都不会执行，中断交接物只能由 `SubAgentHub` 从 `HandoffProgress` 共享快照补写；③ **前台与后台共用同一份渲染好的外壳**（经 `SubAgentEvent::Done.handoff_body` 传递），否则同一个中断在 TUI 与 headless 下会给模型两种不同的暗示。明确**不做 resume**：重放子 Agent 历史与「把噪音挡在主上下文之外」的设计初衷冲突，Claude Code 的 Explore/Plan 同样是一次性、不返回 id。
+
 
 19. **统一通知通道（v0.2.23+）**：`wyj_core::notify`（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免 `wyj-cli`/`wyj-tui` 之间的反向依赖循环）覆盖 4 类事件 × 2 类 sink：
     - **事件源**：`TurnFinished` / `TurnError` / `SubAgentDone`（仅后台 `run_in_background: true`）/ `ScheduleFailed`；ACP/daemon 长跑后端故意不接通知（`crates/cli/src/acp.rs` `SessionEvent::TurnFinished => {}` 注释里写明原因）。

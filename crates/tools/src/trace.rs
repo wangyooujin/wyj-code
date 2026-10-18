@@ -28,6 +28,11 @@ pub const OUTPUT_HEAD_BYTES: usize = 20_000;
 pub const OUTPUT_TAIL_BYTES: usize = 10_000;
 /// 单个子 Agent trace 文件默认字节上限，超限后续事件停写（`SubAgentCfg::trace_max_bytes_per_agent` 可覆盖）。
 pub const DEFAULT_MAX_TRACE_FILE_BYTES: u64 = 256 * 1024;
+/// 单轮 assistant 文本落 trace 时的头部保留字节数。
+///
+/// 与 `Done.result` 的 20K+10K 不同，这里刻意只保头：交接时真正需要的是
+/// 「这一轮得出了什么」的开头结论，而不是最后一段客套总结。
+pub const ASSISTANT_HEAD_BYTES: usize = 4_000;
 
 /// 子 Agent 执行轨迹事件（落盘用，字段为完整数据，非 UI 摘要）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +62,18 @@ pub enum TraceEvent {
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+    },
+    /// 子 Agent 每轮结束时交出的 assistant 文本。
+    ///
+    /// **为什么必须记**：`ToolStart`/`ToolEnd` 只说明「它读了什么、搜了什么」，
+    /// 说明不了「它由此得出了什么」。而接手中断任务时，前者可再生（重读一次
+    /// 就好，而且文件可能已经变了），后者不可再生——一条推导出来的结论无法
+    /// 从原始输入重新推导。
+    ///
+    /// 只记**每轮最后一次**文本（不是流式增量）：增量会让 trace 体积翻几倍，
+    /// 而交接需要的正是那段落点。
+    Assistant {
+        text: String,
     },
     Control {
         action: String,
