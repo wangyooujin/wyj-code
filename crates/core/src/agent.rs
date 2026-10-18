@@ -2267,6 +2267,48 @@ impl Agent {
                         }
                     }
                 }
+                // 收尾窗口内**关闭工具**。
+                //
+                // 为什么不能只靠上面那条 `<turn-budget-reminder>`：实测里它被完整
+                // 送达了（523 字，位置正确，紧跟在 tool_result 之后），模型下一轮
+                // 的 thinking 里却**零次提到轮数**——它正沉浸在自己刚发现的一条线
+                // 索上。软性请求在模型沉浸态里不产生任何约束力，于是宽限 5 轮被
+                // 逐轮耗光，最后仍然 `bail!`，把已经做完的活判成一句报错。
+                //
+                // 这里把每个调用直接回成一条「工具已关闭」的 tool_result：不执行、
+                // 不弹框、不碰工作树，但模型下一轮能读到**自己那次调用被拒**的
+                // 证据。证据比追加一段说明有分量得多。
+                //
+                // 刻意**不发空 tools 数组**：那确实更硬，但 `tools` 位于 prompt
+                // 缓存前缀的最前端，改它会把整段历史（触顶时实测约 42 万 token）
+                // 从 cache_read 打回全价重算——为一次收尾付这个代价不划算。回一条
+                // 结果不动请求体，缓存照常命中。
+                if wrap_up_sent {
+                    for (idx, id, name, _input) in calls.drain(..) {
+                        let feedback = serde_json::json!({
+                            "error": "tools_closed_turn_budget_exhausted",
+                            "turn": turn,
+                            "max_turns": max_turns,
+                            "instruction": "本轮工具循环的轮数预算已用尽，工具已关闭。\
+                                            不要再发起任何工具调用；现在直接输出最终消息：\
+                                            已完成什么、验证了什么、还剩什么、下一步具体做什么。",
+                        })
+                        .to_string();
+                        if let Some(cb) = &self.tool_cb {
+                            cb(ToolEvent::End {
+                                id: id.clone(),
+                                name: name.clone(),
+                                is_error: true,
+                                elapsed_secs: 0.0,
+                                output: feedback.clone(),
+                            });
+                        }
+                        tool_results.push((
+                            idx,
+                            (id, wyj_api::types::ToolResultContent::Text(feedback), true),
+                        ));
+                    }
+                }
                 let mut touched_dirs: Vec<std::path::PathBuf> = vec![];
                 if self.claude_md.is_some() {
                     for (_, _, name, input) in &calls {
@@ -4197,6 +4239,61 @@ mod tests {
             })
             .count();
         assert_eq!(notices, 1, "收尾指令只应注入一次，实际 {notices} 次");
+    }
+
+    /// 收尾窗口内工具**真的被关闭**：无视收尾指令的模型，其调用不再被执行，
+    /// 而是回一条 `tools_closed_turn_budget_exhausted`。
+    ///
+    /// 这条钉的是 2026-10-18 事故的根因：一条 285 次调用的会话在第 196 轮
+    /// 收到了格式正确、位置正确的收尾指令，模型仍然连发 5 轮工具（285 条
+    /// assistant 消息里 282 条只有 1 个 tool_use），宽限被耗光后 `bail!`。
+    /// 软性提醒在模型沉浸态里不产生约束力，所以框架必须自己关闸。
+    ///
+    /// 断言用「工具总共执行了几次」而不是「回合是否成功」：后者在硬中止路径上
+    /// 同样是 `Err`，分不出修复前后的差别。
+    #[tokio::test]
+    async fn tools_are_closed_during_the_wrap_up_window() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(BudgetAwareProvider {
+            calls: AtomicUsize::new(0),
+            seen_reminder: AtomicBool::new(false),
+            ignore_reminder: true,
+        });
+        let mut agent = Agent::new(provider.clone()).with_max_turns(8);
+        agent.register_tool(Arc::new(GatedTool {
+            name: "Edit",
+            needs_permission: false,
+            runs: runs.clone(),
+        }));
+        let mut session = Session::new();
+
+        let _ = agent
+            .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+            .await;
+
+        // 工具只在 wrap_up_at **之前**的轮次执行；wrap_up_at 那一轮注入提醒的
+        // 同时就关闸，所以执行次数是 `wrap_up_at - 1`，被关掉的是余下全部。
+        let wrap_up_at = 8 - TURN_LIMIT_GRACE;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            wrap_up_at - 1,
+            "收尾窗口内的工具调用必须被关闭，实际执行了 {} 次",
+            runs.load(Ordering::SeqCst)
+        );
+        let closed = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| {
+                matches!(b, ContentBlock::ToolResult { content: ToolResultContent::Text(text), .. }
+                    if text.contains("tools_closed_turn_budget_exhausted"))
+            })
+            .count();
+        assert_eq!(
+            closed,
+            8 - wrap_up_at + 1,
+            "宽限窗口的每一轮都应回一条「工具已关闭」，实际 {closed} 条"
+        );
     }
 
     /// 宽限窗口从 `max_turns - TURN_LIMIT_GRACE` 起算：留出的轮数必须够
