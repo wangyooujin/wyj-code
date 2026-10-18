@@ -90,6 +90,9 @@ thinking:
 # 切换 locale 后看起来只翻译了一半。
 spinner:
   thinking: "Thinking"
+  # Title-bar step prefix: {n} counts tool calls started in this turn, rendered
+  # as e.g. "Step 3 · fix login bug · 4.2s · 12k↑".
+  step: "Step {n} ·"
   waiting_approval: "Waiting for approval"
   reviewing_plan: "Reviewing plan"
   queuing_message: "Queuing message"
