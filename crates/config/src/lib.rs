@@ -253,7 +253,7 @@ impl Default for Profile {
             base_url: String::new(),
             api_key: None,
             api_key_env: None,
-            max_tokens: 8192,
+            max_tokens: 32_000,
             context_window: 200_000,
             vision: true,
             thinking_budget: None,
