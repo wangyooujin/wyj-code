@@ -22976,15 +22976,20 @@ mod profile_dialog_onboarding_tests {
         Arc::new(|_cfg: &Config, _model: &str| anyhow::bail!("boom"))
     }
 
-    fn session_deps() -> (
+    fn session_wiring() -> (
         Arc<tokio::sync::mpsc::Sender<AgentEvent>>,
         Arc<std::sync::Mutex<wyj_tools::TodoStore>>,
-        Arc<std::sync::RwLock<Arc<Agent>>>,
-        Arc<Mutex<Session>>,
     ) {
         (
-            tokio::sync::mpsc::channel(16).0,
-            Arc::new(std::sync::Mutex::new(wyj_tools::TodoStore { items: vec![] })),
+            Arc::new(tokio::sync::mpsc::channel(16).0),
+            Arc::new(std::sync::Mutex::new(wyj_tools::TodoStore {
+                items: vec![],
+            })),
+        )
+    }
+
+    fn agent_and_session() -> (Arc<std::sync::RwLock<Arc<Agent>>>, Arc<Mutex<Session>>) {
+        (
             Arc::new(std::sync::RwLock::new(Arc::new(Agent::new(Arc::new(
                 wyj_api::MissingKeyProvider,
             ))))),
@@ -22992,12 +22997,9 @@ mod profile_dialog_onboarding_tests {
         )
     }
 
-    fn switch(
-        state: &mut AppState,
-        name: &str,
-        rebuild: &super::RebuildFn,
-    ) -> bool {
-        let (tx, todos, agent, session) = session_deps();
+    fn switch(state: &mut AppState, name: &str, rebuild: &super::RebuildFn) -> bool {
+        let (tx, todos) = session_wiring();
+        let (agent, session) = agent_and_session();
         super::apply_session_profile(
             state,
             super::ProfileSessionAction::Use(name.to_string()),
@@ -23049,11 +23051,7 @@ mod profile_dialog_onboarding_tests {
         state.config = cfg.clone();
         state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
         let api_key_idx = super::profile_field_idx("settings.field.api_key").unwrap();
-        state
-            .profile_dialog
-            .as_mut()
-            .unwrap()
-            .entries[0]
+        state.profile_dialog.as_mut().unwrap().entries[0]
             .set_text_value(api_key_idx, "sk-half-typed".to_string());
 
         assert!(switch(&mut state, "beta", &rebuild_ok()));
@@ -23063,7 +23061,7 @@ mod profile_dialog_onboarding_tests {
             state
                 .profile_dialog
                 .as_ref()
-                .and_then(|d| d.entries[0].text_value(api_key_idx)),
+                .map(|d| d.entries[0].text_value(api_key_idx)),
             Some("sk-half-typed"),
             "面板必须留下，用户才有地方按 Ctrl+S 保住这次编辑"
         );
@@ -23095,7 +23093,8 @@ mod profile_dialog_onboarding_tests {
         state.session_profile_override = Some("beta".to_string());
         state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
 
-        let (tx, todos, agent, session) = session_deps();
+        let (tx, todos) = session_wiring();
+        let (agent, session) = agent_and_session();
         super::adopt_session_profile(
             &mut state,
             Some("beta".to_string()),
