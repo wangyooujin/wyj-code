@@ -214,6 +214,32 @@ pub trait Command: Send + Sync {
     fn needs_background(&self) -> bool {
         false
     }
+    /// 该命令能否在 Agent 回合进行中（`is_thinking`）**立即执行**。
+    ///
+    /// 背景：Agent 忙碌时按 Enter 提交的内容默认进 `pending_queue` 排队投递给模型
+    /// （`tui::app` 的 Enter 分支）。而 `/model` 这类命令根本没有"内容"可投递——
+    /// 排给模型等于把字面的 `/model` 当成一句用户消息发出去，右下角还会冒出
+    /// "1 条已排队"。TUI 因此在 `is_thinking` 时先查本方法：为 true 的命令照常
+    /// dispatch，其余维持排队。
+    ///
+    /// **默认 false，且必须保持默认 false**——误标一条的代价是让它在回合中途起新
+    /// 回合 / 改写正在被回合持有的 session：
+    ///
+    /// - 返回 `RunPrompt` 的命令（`/bug`、`/review`、`/pr-comments`）会起新回合；
+    /// - 返回 `ClearHistory` / `StartNewSession` / `Rewind` / `BranchSession` /
+    ///   `ResumeSession` / `CompactHistory` 的命令会改会话历史或当前会话身份；
+    /// - 需要 `begin_background_task` 的命令（`/checkpoint`、`/evolve` 的确认动作）
+    ///   会把 `AppState::current_task` 覆盖成自己的 handle，正在跑的回合从此
+    ///   **失去 ESC 中断能力**（task 仍在跑，但句柄已被丢弃）；
+    /// - 返回 `Output` 却读 `ctx.estimated_tokens` / `context_audit` 的命令
+    ///   （`/cost`、`/context`）在忙碌时拿不到 session 锁，只能拿到降级 ctx，
+    ///   数据会静默失真。
+    ///
+    /// 只有"打开面板 / 切纯运行期开关"这类既不碰 session 也不起回合的命令才覆写为
+    /// true。新增命令时按上面四条逐一排除，不要靠"看起来像面板"来判断。
+    fn runs_while_busy(&self) -> bool {
+        false
+    }
     async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult>;
 }
 
@@ -241,6 +267,14 @@ impl CommandRegistry {
         self.commands
             .get(name)
             .is_some_and(|cmd| cmd.needs_background())
+    }
+
+    /// 该命令是否声明了 [`Command::runs_while_busy`]（TUI 据此在回合进行中照常执行，
+    /// 而不是把 `/xxx` 当成一条消息排队投递给模型）。
+    pub fn runs_while_busy(&self, name: &str) -> bool {
+        self.commands
+            .get(name)
+            .is_some_and(|cmd| cmd.runs_while_busy())
     }
 
     /// 从 "/foo bar" 里取出命令名（不含 `/`、不含参数）。非 slash 输入返回 `None`。
@@ -301,5 +335,104 @@ impl CommandRegistry {
 impl Default for CommandRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod busy_whitelist_tests {
+    use super::*;
+    use crate::builtin::standard_registry;
+
+    /// 回合进行中可执行的白名单是**精确集合**，不多不少。
+    ///
+    /// 多一条的危险见 [`Command::runs_while_busy`] 的四条排除理由；少一条则是
+    /// 用户现场那条 `/model`：命令被当成消息排队给模型。这条断言把"少"和"多"
+    /// 一起钉死，新增内置命令时会被迫在这里表态。
+    #[test]
+    fn busy_whitelist_is_exactly_the_panel_commands() {
+        let reg = standard_registry();
+        let mut actual: Vec<&str> = reg
+            .list()
+            .iter()
+            .filter(|c| c.runs_while_busy())
+            .map(|c| c.name())
+            .collect();
+        actual.sort_unstable();
+        // evolve / resume / mouse 刻意**不在**白名单：evolve 的确认动作要建工作区
+        // 快照并 spawn 后台 task，会把 AppState::current_task 覆盖成自己的 handle，
+        // 正在跑的回合从此失去 ESC 中断能力；resume 会切走当前会话身份。
+        let mut expected = vec![
+            "agent-control",
+            "agents",
+            "computer",
+            "config",
+            "cwd",
+            "doctor",
+            "extensions",
+            "help",
+            "hooks",
+            "mcp",
+            "memory",
+            "mode",
+            "model",
+            "plugins",
+            "quit",
+            "schedule",
+            "sessions",
+            "shells",
+            "skills",
+            "subagents",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    /// 四条排除理由逐条钉死：不许把会起新回合 / 改会话 / 读 session 统计 /
+    /// 抢 `current_task` 的命令挪进白名单。
+    #[test]
+    fn no_turn_spawning_or_history_mutating_command_is_whitelisted() {
+        let reg = standard_registry();
+        for name in [
+            // 起新回合
+            "bug",
+            "review",
+            "pr-comments",
+            // 改会话历史或当前会话身份
+            "clear",
+            "compact",
+            "new",
+            "checkpoint",
+            "rewind",
+            "branch",
+            "resume",
+            // 读 session 统计，忙碌时只能拿到降级 ctx
+            "cost",
+            "context",
+            // 确认动作要 begin_background_task，会覆盖 current_task 句柄
+            "evolve",
+            // 写文件，与回合并行可能撞
+            "init",
+        ] {
+            assert!(
+                !reg.runs_while_busy(name),
+                "/{name} 不得在回合进行中执行，理由见 Command::runs_while_busy"
+            );
+        }
+    }
+
+    /// 白名单里的命令都不能同时是后台命令：`needs_background` 的执行路径会
+    /// `begin_background_task` + 覆盖 `current_task`，与"回合继续跑"直接冲突。
+    #[test]
+    fn busy_whitelist_never_overlaps_needs_background() {
+        let reg = standard_registry();
+        for cmd in reg.list() {
+            if cmd.runs_while_busy() {
+                assert!(
+                    !cmd.needs_background(),
+                    "/{} 同时标了 runs_while_busy 与 needs_background",
+                    cmd.name()
+                );
+            }
+        }
     }
 }
