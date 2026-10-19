@@ -1257,7 +1257,7 @@ fn render_chat_message(
                 for wrapped in wrap_line(l, max_content_width.saturating_sub(2).max(1)) {
                     lines.push(Line::from(Span::styled(
                         format!("  {wrapped}"),
-                        Style::default(),
+                        Theme::body(),
                     )));
                 }
             }
@@ -1596,7 +1596,10 @@ fn render_tool_result_preview(
             if first {
                 Theme::error()
             } else {
-                Theme::dim()
+                // 非首行降到次级正文而不是 dim：错误块展开后常有几十行，
+                // dim 在暗底上已接近「看不清」，而用户恰恰需要读完它才能
+                // 判断这次失败要不要处理。
+                Theme::text_dim()
             }
         } else {
             Theme::tool_result()
@@ -1816,7 +1819,7 @@ fn render_diff_rows(
         if let DiffRowRole::Meta = row.role {
             out.push(Line::from(Span::styled(
                 format!("{indent}{}", row.text),
-                Theme::dim(),
+                Theme::muted(),
             )));
             continue;
         }
@@ -1830,7 +1833,9 @@ fn render_diff_rows(
         let style = match row.role {
             DiffRowRole::Removed => Theme::error(),
             DiffRowRole::Added => Theme::success(),
-            DiffRowRole::Context => Theme::dim(),
+            // 上下文行是「代码」，不是「旁注」：用次级正文而不是 `dim()`。
+            // 旧值（#999 灰）与增删行同处一屏时，未改动的代码看起来像是被禁用。
+            DiffRowRole::Context => Theme::text_dim(),
             DiffRowRole::Meta => unreachable!(),
         };
         for (seg, wrapped) in wrap_line(row.text, body_width).into_iter().enumerate() {
@@ -8870,7 +8875,8 @@ fn foo() {}
         // 否则"新增=好/删除=坏"这套视觉语言会分裂成两套近似色。
         assert_eq!(lines[3].spans[1].style, Theme::error());
         assert_eq!(lines[4].spans[1].style, Theme::success());
-        assert_eq!(lines[5].spans[1].style, Theme::dim());
+        // 上下文行是次级正文而不是 dim：未改动的代码不该看起来像被禁用。
+        assert_eq!(lines[5].spans[1].style, Theme::text_dim());
         assert!(
             !rendered.iter().any(|line| line.contains("已替换")),
             "回执头不该出现在 diff 里"
@@ -9153,8 +9159,8 @@ fn foo() {}
         );
         assert_eq!(
             lines[2].spans[0].style,
-            Theme::dim(),
-            "其余行降为 dim，避免整块刷红"
+            Theme::text_dim(),
+            "其余行降为次级正文，避免整块刷红"
         );
     }
 

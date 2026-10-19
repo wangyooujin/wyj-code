@@ -17,6 +17,7 @@ pub struct ThemePalette {
     pub text_dim: Color,
     pub border: Color,
     pub code_fg: Color,
+    pub inline_code: Color,
     pub selected_bg: Color,
     // ── 以下按「用途」而非「颜色」命名 ────────────────────────────────────
     // 槽位是按"这一处该长什么样"切的，不是按"它是青的还是蓝的"。同一个青色
@@ -55,6 +56,7 @@ impl Default for ThemePalette {
             text_dim: Theme::TEXT_DIM,
             border: Theme::BORDER,
             code_fg: Theme::CODE_FG,
+            inline_code: Theme::INLINE_CODE,
             selected_bg: Theme::SELECTED_BG,
             plan: Theme::PLAN,
             danger: Theme::DANGER,
@@ -99,6 +101,7 @@ impl ThemePalette {
                 "textdim" | "dimtext" | "mutedtext" => palette.text_dim = color,
                 "border" => palette.border = color,
                 "codefg" | "codeforeground" => palette.code_fg = color,
+                "inlinecode" | "inline" => palette.inline_code = color,
                 "codekeyword" | "syntaxkeyword" => palette.code_keyword = color,
                 "codestring" | "syntaxstring" => palette.code_string = color,
                 "codenumber" | "syntaxnumber" => palette.code_number = color,
@@ -193,6 +196,7 @@ impl ThemePalette {
             text_dim: f(self.text_dim),
             border: f(self.border),
             code_fg: f(self.code_fg),
+            inline_code: f(self.inline_code),
             selected_bg: f(self.selected_bg),
             plan: f(self.plan),
             danger: f(self.danger),
@@ -362,49 +366,60 @@ pub struct Theme;
 
 impl Theme {
     // ── 语义颜色（RGB 精确值）─────────────────────────────────────────────────
-    pub const SUCCESS: Color = Color::Rgb(78, 186, 101); // 绿色
-    pub const ERROR: Color = Color::Rgb(255, 107, 128); // 红色
-    pub const WARNING: Color = Color::Rgb(200, 155, 30); // 琥珀
-    pub const CLAUDE: Color = Color::Rgb(215, 119, 87); // 品牌橙（助手/spinner）
-    pub const INACTIVE: Color = Color::Rgb(153, 153, 153); // 灰色（dim/border）
-    pub const SUGGESTION: Color = Color::Rgb(177, 185, 249); // 蓝紫（用户前缀/权限）
-    pub const TEXT: Color = Color::Rgb(255, 255, 255); // 白色
-    /// 次级正文：比 `TEXT` 更淡，用于「描述性」文字（如补全项的说明）。
-    /// 此前是散在 render.rs 里的 `Rgb(180,200,255)` 孤儿色——与 TEXT 同义却
-    /// 不可调，插件主题改不动它。
-    pub const TEXT_DIM: Color = Color::Rgb(180, 200, 255);
-    pub const BORDER: Color = Color::Rgb(102, 102, 102); // 深灰边框
-    pub const CODE_FG: Color = Color::Rgb(147, 165, 255); // 代码块内容浅蓝
-                                                          // ── 用途型槽位（值等于本轮迁移前的硬编码色，故观感完全不变）────────────
+    //
+    // 色板设计见 `doc/plan/color-system-redesign.md`：冷灰中性底 + 暖橙品牌点缀
+    // （One Dark / Tokyo Night 路线）。三条取值原则：
+    //   1. 正文不用纯白——把亮度预算留给强调色；
+    //   2. 层级靠**明度四档**（text / text_dim / inactive / muted）+ border，不靠增加色相；
+    //   3. 品牌橙只出现在品牌标识、光标、当前选中这类小面积位置。
+    // 设计基准背景是 `#1E2127`；对比度数值按该底色计算。
+    pub const SUCCESS: Color = Color::Rgb(152, 195, 121); // #98C379
+    pub const ERROR: Color = Color::Rgb(224, 108, 117); // #E06C75
+    pub const WARNING: Color = Color::Rgb(229, 192, 123); // #E5C07B
+    pub const CLAUDE: Color = Color::Rgb(217, 142, 95); // #D98E5F 品牌橙（助手/spinner）
+    pub const INACTIVE: Color = Color::Rgb(122, 131, 151); // #7A8397 主 dim
+    pub const SUGGESTION: Color = Color::Rgb(169, 184, 240); // #A9B8F0 用户前缀/权限
+    pub const TEXT: Color = Color::Rgb(215, 218, 224); // #D7DAE0 正文
+    /// 次级正文：比 `TEXT` 弱一档，用于「描述性」文字（工具结果、补全说明、
+    /// h3 以下标题、引用正文）。
+    pub const TEXT_DIM: Color = Color::Rgb(160, 168, 184); // #A0A8B8
+    pub const BORDER: Color = Color::Rgb(57, 64, 79); // #39404F 深灰边框
+    pub const CODE_FG: Color = Color::Rgb(171, 178, 191); // #ABB2BF 代码块正文
+    /// 行内代码：正文里的一个标识符，需要轻微跳出但不能有背景色。
+    /// 与代码块正文分开是因为两者的阅读场景不同——整块代码要低饱和，
+    /// 行内片段要可辨识；旧实现复用 `code_fg` 的浅蓝，会和用户前缀撞色。
+    pub const INLINE_CODE: Color = Color::Rgb(229, 192, 123); // #E5C07B
+                                                              // ── 用途型槽位 ───────────────────────────────────────────────────────────
     /// 计划相关：计划块标题、`[plan]` 芯片、计划模式的输入框边框、计划批准面板
-    pub const PLAN: Color = Color::Blue;
-    /// 危险语义：**bypass 三处**（状态栏芯片 + 标题栏 + 输入框边框）与破坏性确认
-    pub const DANGER: Color = Color::Red;
+    pub const PLAN: Color = Color::Rgb(199, 146, 234); // #C792EA
+    /// 危险语义：**bypass 三处**（状态栏芯片 + 标题栏 + 输入框边框）与破坏性确认。
+    /// 比 `ERROR` 更沉、更硬：`error` 是「这件事失败了」，`danger` 是「你正在关闭安全网」。
+    pub const DANGER: Color = Color::Rgb(229, 72, 77); // #E5484D
     /// 输入提示：`@file` 引用高亮、补全面板选中项、输入框内联 hint
-    pub const HINT: Color = Color::Cyan;
+    pub const HINT: Color = Color::Rgb(86, 182, 194); // #56B6C2
     /// 中性提示：System 标记、thinking 实时行、「下方还有新消息」、运行中任务行
-    pub const INFO: Color = Color::Cyan;
-    /// 排队消息提示（状态栏右侧的 ●）
-    pub const QUEUE: Color = Color::Cyan;
-    /// 选中项前景：压在 [HINT / INFO] 底色之上，故用终端最深色
-    pub const SELECTION_FG: Color = Color::Black;
+    pub const INFO: Color = Color::Rgb(97, 175, 239); // #61AFEF
+    /// 排队消息提示（状态栏右侧的 ●）。与 `HINT` 同色：两者同属「输入侧」提示。
+    pub const QUEUE: Color = Color::Rgb(86, 182, 194); // #56B6C2
+    /// 选中项前景：压在已知亮底之上，故用终端最深色（RGB 而非具名色，
+    /// 否则 `relative_luminance` 只能取中性 0.5，`ensure_contrast` 的判断失真）
+    pub const SELECTION_FG: Color = Color::Rgb(22, 25, 31); // #16191F
     /// 块状光标的字符前景（光标背景用品牌橙）
-    pub const CURSOR: Color = Color::White;
-    /// 极弱化的次要标记（Todo 的待办圆圈、「待发送：」标签）。
+    pub const CURSOR: Color = Color::Rgb(26, 29, 35); // #1A1D23
+    /// 极弱化的次要标记（行号、Todo 的待办圆圈、「待发送：」标签、URL 注释）。
     ///
-    /// 与 [Self::INACTIVE] **不是同一档**：后者是 RGB 灰（#999999，浅色系里的
-    /// 主 dim 色），本槽位保留 ANSI DarkGray 以维持迁移前的观感。把它并进
-    /// `inactive` 会让这几处整体亮一档——收敛批次只搬颜色，不改观感。
-    pub const MUTED: Color = Color::DarkGray;
-    pub const CODE_KEYWORD: Color = Color::Cyan;
-    pub const CODE_STRING: Color = Color::Green;
-    pub const CODE_NUMBER: Color = Color::Yellow;
-    pub const CODE_COMMENT: Color = Color::DarkGray;
+    /// 与 [Self::INACTIVE] **不是同一档**：后者是主 dim（正文弱化），本槽位是
+    /// 结构性的「附注」，再暗一档。两者合并会让行号与状态栏混成同一层。
+    pub const MUTED: Color = Color::Rgb(90, 98, 116); // #5A6274
+    pub const CODE_KEYWORD: Color = Color::Rgb(198, 120, 221); // #C678DD
+    pub const CODE_STRING: Color = Color::Rgb(152, 195, 121); // #98C379
+    pub const CODE_NUMBER: Color = Color::Rgb(209, 154, 102); // #D19A66
+    pub const CODE_COMMENT: Color = Color::Rgb(107, 114, 128); // #6B7280
     /// 列表/管理面板里"当前选中行"的通用背景色：中深灰，与终端默认底色拉开
     /// 足够对比度，在黑色/深色终端背景下能清楚看到选中条，同时不像饱和色（原先
     /// 部分面板用的 Color::Blue）那样过于刺眼。全应用统一用这一个值（而非各面板
     /// 各自选色），是 v0.2.4 为解决"选中态视觉语言不一致导致不好辨认"问题引入的。
-    pub const SELECTED_BG: Color = Color::Rgb(66, 66, 66);
+    pub const SELECTED_BG: Color = Color::Rgb(42, 49, 64); // #2A3140
 
     pub fn success_color() -> Color {
         active_palette().read().unwrap().success
@@ -494,6 +509,10 @@ impl Theme {
         active_palette().read().unwrap().code_fg
     }
 
+    pub fn inline_code_color() -> Color {
+        active_palette().read().unwrap().inline_code
+    }
+
     pub fn selected_bg_color() -> Color {
         active_palette().read().unwrap().selected_bg
     }
@@ -519,9 +538,12 @@ impl Theme {
         Style::default().fg(Self::claude_color())
     }
 
-    /// 工具结果正常内容
+    /// 工具结果正常内容。
+    ///
+    /// 用次级正文而非 `suggestion`：工具输出是屏幕上出现频率最高的长文本，
+    /// 染成蓝紫会让它比正文更抢眼，而它恰恰是「读一眼确认」的内容。
     pub fn tool_result() -> Style {
-        Style::default().fg(Self::suggestion_color())
+        Style::default().fg(Self::text_dim_color())
     }
 
     /// 成功状态（✓）
@@ -617,6 +639,11 @@ impl Theme {
         Style::default().fg(Self::code_fg_color())
     }
 
+    /// 行内代码（正文里的一个标识符，带反引号、无背景色）
+    pub fn inline_code() -> Style {
+        Style::default().fg(Self::inline_code_color())
+    }
+
     // ── 用途型样式 ───────────────────────────────────────────────────────────
     //
     // 命名一律按**这一处画的是什么**取，而不是按颜色取。收敛硬编码色时若写成
@@ -708,15 +735,15 @@ impl Theme {
 
     // ── 欢迎页 logo 专用（橙→黄渐变 + 整块反色填充）───────────────────────────
     /// 渐变起点：品牌橙（与 CLAUDE 同色，确保 logo 起始色与品牌一致）
-    pub const WELCOME_LOGO_GRADIENT_START: Color = Color::Rgb(215, 119, 87);
+    pub const WELCOME_LOGO_GRADIENT_START: Color = Color::Rgb(217, 142, 95);
     /// 渐变中点：橙黄过渡色（用于渐变插值 + 整块背景填充）
-    pub const WELCOME_LOGO_GRADIENT_MID: Color = Color::Rgb(225, 160, 85);
+    pub const WELCOME_LOGO_GRADIENT_MID: Color = Color::Rgb(224, 164, 107);
     /// 渐变终点：暖黄
-    pub const WELCOME_LOGO_GRADIENT_END: Color = Color::Rgb(240, 200, 80);
+    pub const WELCOME_LOGO_GRADIENT_END: Color = Color::Rgb(232, 192, 122);
 
     // ── 欢迎页新增元素（tips / 示例提问 / 快捷键）───────────────────────────
     /// tips 提示行强调色：柔和琥珀黄，呼应 💡 图标，与 WARNING 语义色区分开
-    pub const WELCOME_TIP: Color = Color::Rgb(229, 192, 123);
+    pub const WELCOME_TIP: Color = Color::Rgb(217, 179, 108);
 
     pub fn welcome_logo_gradient_start_color() -> Color {
         active_palette().read().unwrap().welcome_logo_gradient_start
