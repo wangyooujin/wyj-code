@@ -373,13 +373,39 @@ impl WorkspaceCas {
             if stats.total_bytes <= total_budget {
                 break;
             }
+            // 删除前在锁内复核 ref_count：扫描与删除之间可能有一次 `intern`
+            // 把这个 blob 的引用数从 0 抬到 1（同一份 checkpoint 内容被重新
+            // 写入），而 gc 的候选名单是**扫描那一刻**的快照。不复核就会删掉
+            // 正在被使用的 blob，表现为 restore 时静默回退到 inline。
+            //
+            // 这一步在 gc 跑在后台线程（启动期异步化）之后从「理论窗口」变成
+            // 真实窗口：`intern` 走 `lock_hash` 拿的是同一把 per-hash 锁。
+            let guard = match self.lock_hash(hash, "gc CAS blob") {
+                Ok(guard) => guard,
+                Err(error) => {
+                    tracing::warn!("GC 取锁失败 {hash}: {error}");
+                    continue;
+                }
+            };
+            let still_unused = std::fs::read(meta_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<CasMeta>(&bytes).ok())
+                .map(|current| current.ref_count == 0)
+                .unwrap_or(false);
+            if !still_unused {
+                // 已被引用（或 meta 已消失）：不再是回收候选。
+                drop(guard);
+                continue;
+            }
             if let Err(error) = std::fs::remove_file(blob_path) {
                 tracing::warn!("GC blob 删除失败 {}: {error}", blob_path.display());
+                drop(guard);
                 continue;
             }
             if let Err(error) = std::fs::remove_file(meta_path) {
                 tracing::warn!("GC meta 删除失败 {}: {error}", meta_path.display());
             }
+            drop(guard);
             stats.deleted_blobs += 1;
             stats.freed_bytes += meta.size;
             stats.total_bytes = stats.total_bytes.saturating_sub(meta.size);
@@ -692,5 +718,45 @@ mod tests {
         assert!(stats.deleted_blobs >= 1, "至少应删 1 个 0-ref blob");
         // h3 应仍在
         assert!(cas.get(&h3).is_ok());
+    }
+
+    /// gc 跑在后台线程（启动期异步化）后，「扫描 → 删除」之间可能有一次
+    /// `intern` 把 ref_count 从 0 抬回 1。没有锁内复核就会删掉正在被引用的
+    /// blob，表现为 restore 静默退化。
+    ///
+    /// 这里用真实并发复现该窗口：gc 持锁期间起一个 intern，两者必须串行化，
+    /// 结果要么 blob 被删（intern 后写入新的）、要么 blob 活着——**绝不能出现
+    /// 「meta 说 ref_count=1 但实体已被删」**。
+    #[test]
+    fn gc_never_deletes_a_blob_that_gained_a_reference() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let cas = Arc::new(cas_with_root(dir.path()));
+        let hash = cas.intern(b"contended").unwrap();
+        cas.release(&hash).unwrap();
+
+        let gc_cas = Arc::clone(&cas);
+        let gc = std::thread::spawn(move || gc_cas.gc(0).unwrap());
+
+        // 与 gc 抢占同一个 per-hash 锁
+        for _ in 0..200 {
+            let _ = cas.intern(b"contended");
+        }
+
+        let _ = gc.join().unwrap();
+
+        // 无论哪一边赢，meta 与实体必须一致：ref_count > 0 就必须有实体。
+        let meta = std::fs::read(cas.meta_path(&hash)).ok();
+        let meta_ref = meta
+            .and_then(|b| serde_json::from_slice::<CasMeta>(&b).ok())
+            .map(|m| m.ref_count)
+            .unwrap_or(0);
+        if meta_ref > 0 {
+            assert!(
+                cas.get(&hash).is_ok(),
+                "ref_count={meta_ref} 但实体已被 gc 删除 —— 锁内复核失效"
+            );
+        }
     }
 }

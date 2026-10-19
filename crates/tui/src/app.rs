@@ -14078,6 +14078,11 @@ fn retarget_agent_session(
 ///    `config.save()`（`/config` 改语言、`/memory` 切开关）把临时分组固化。
 ///
 /// 失败时**不改任何状态**：用户仍在原来的端点上，只是多一条错误提示。
+///
+/// 返回值 = 本次是否真的换了生效端点。调用方（主循环）据此决定**收起
+/// `/model` 面板**：切换是面板唯一要交付的东西，留着它就等于留一个不再有
+/// 待办的浮层，而它仍然吞掉全部按键（拦截条件 `state.profile_dialog.is_some()`
+/// 与渲染条件同源，见 [`finish_session_profile_switch`]）。
 #[allow(clippy::too_many_arguments)]
 fn apply_session_profile(
     state: &mut AppState,
@@ -14090,12 +14095,12 @@ fn apply_session_profile(
     session_store: Option<&Arc<SessionStore>>,
     current_session_id: &str,
     session: &Arc<Mutex<Session>>,
-) {
+) -> bool {
     // `Save`（「设为当前」执行后的保存意图）不在这里处理——`profile_try_save`
     // 需要的句柄组合与 `set_session_profile` 不同，由调用方（/model 面板的
     // 菜单分支）拦截后直接走 `profile_try_save`。
     if matches!(action, ProfileSessionAction::Save) {
-        return;
+        return false;
     }
     let desired = match action {
         ProfileSessionAction::Use(name) => Some(name),
@@ -14114,11 +14119,34 @@ fn apply_session_profile(
         session_store,
         current_session_id,
         session,
-    );
+    )
+}
+
+/// 「仅本会话使用 / 恢复跟随全局」执行成功后收起 `/model` 面板。
+///
+/// 三条「立刻改变生效端点」的出口里只有「设为当前」会在成功后关面板，
+/// 会话级两条漏了：菜单收起（`dialog.menu = None`）后面板本体还挂在屏幕上，
+/// 而它的渲染条件（`render.rs` 的 `if let Some(dialog) = &state.profile_dialog`）
+/// 与按键拦截条件（主循环的 `if state.profile_dialog.is_some()`）同源——
+/// 于是一个没有待办的浮层继续吞掉全部按键，用户看着输入框的光标却打不进字。
+///
+/// 面板里有未保存的字段草稿时**不关**：会话级切换刻意不写盘，直接关等于
+/// 静默丢掉用户刚敲进去的 Key。草稿的正常出口是 Ctrl+S 或 Esc 的三选一
+/// 确认，不能被一次端点切换顺手抹掉；此时面板仍在，`dialog.session_profile`
+/// 已更新，再次打开头行菜单就能看到「已在使用」与「恢复跟随全局」。
+fn finish_session_profile_switch(state: &mut AppState) {
+    if state.profile_dialog.as_ref().is_some_and(|d| d.is_dirty()) {
+        return;
+    }
+    state.input_owner = None;
+    state.profile_dialog = None;
 }
 
 /// [`apply_session_profile`] 的实际实现，`notify = false` 供会话切换复用
 /// （那里已经有一条「已切换至会话 …」的提示，再来一条只会是噪音）。
+///
+/// 返回值同 [`apply_session_profile`]：重建 Agent 失败时为 `false`（此时状态
+/// 完全没动，调用方应保留面板让用户看见 `profile.switch_failed`）。
 #[allow(clippy::too_many_arguments)]
 fn set_session_profile(
     state: &mut AppState,
@@ -14132,7 +14160,7 @@ fn set_session_profile(
     session_store: Option<&Arc<SessionStore>>,
     current_session_id: &str,
     session: &Arc<Mutex<Session>>,
-) {
+) -> bool {
     // 名字必须能在当前全局配置里解析到：分组被改名/删除后，旧会话文件里的
     // 名字会指向不存在的东西，静默回落全局比在下一轮请求时 400 更可解释。
     let desired = desired.filter(|name| state.config.profile_by_name(name).is_some());
@@ -14153,7 +14181,7 @@ fn set_session_profile(
                     "profile.switch_failed",
                     &[("err", &e.to_string())],
                 )));
-            return;
+            return false;
         }
     };
     let new_agent = new_agent.append_system(system_prompt_extra.trim_start().to_string());
@@ -14173,13 +14201,14 @@ fn set_session_profile(
     }
 
     if !notify {
-        return;
+        return true;
     }
     let msg = match &desired {
         Some(name) => wyj_i18n::tr_fmt("profile.session_switched", &[("name", name)]),
         None => wyj_i18n::tr("profile.session_follow_global").to_string(),
     };
     state.messages.push(ChatMessage::assistant(msg));
+    true
 }
 
 /// 会话切换（新建 / 切历史 / branch）后把生效分组换成目标会话自己的那个。
@@ -14200,6 +14229,14 @@ fn adopt_session_profile(
     current_session_id: &str,
     session: &Arc<Mutex<Session>>,
 ) {
+    // 面板里的 entries 是**打开那一刻**的 config 快照，会话一换就过期：里面
+    // 的「设为当前 / 保存」会拿旧快照覆盖新会话读到的配置。面板的正常出口
+    // （Esc 三选一）走不到这里——这些调用点都在面板关闭后才可能执行，但
+    // 后台 branch 提交（`current_session_id` 变化）那条路径与面板无关，
+    // 所以这里无条件收起，而不是赌"面板一定没开"。
+    state.input_owner = None;
+    state.profile_dialog = None;
+
     let target = target.filter(|name| state.config.profile_by_name(name).is_some());
     if target == state.session_profile_override {
         // 同一个分组：不必重建 Agent（重建会换掉 provider 句柄，正在跑的
@@ -14207,7 +14244,7 @@ fn adopt_session_profile(
         state.set_session_profile_in_session(session, target);
         return;
     }
-    set_session_profile(
+    let _ = set_session_profile(
         state,
         target,
         false,
@@ -17468,19 +17505,21 @@ async fn tui_main(
                                         state.input_owner = None;
                                         state.profile_dialog = None;
                                     }
-                                } else {
-                                    apply_session_profile(
-                                        &mut state,
-                                        action,
-                                        &agent_tx,
-                                        &rebuild_fn,
-                                        &system_prompt_extra,
-                                        &todo_store,
-                                        &shared_agent,
-                                        session_store.as_ref(),
-                                        &current_session_id,
-                                        &session,
-                                    );
+                                } else if apply_session_profile(
+                                    &mut state,
+                                    action,
+                                    &agent_tx,
+                                    &rebuild_fn,
+                                    &system_prompt_extra,
+                                    &todo_store,
+                                    &shared_agent,
+                                    session_store.as_ref(),
+                                    &current_session_id,
+                                    &session,
+                                ) {
+                                    // 与 Ctrl+S / 「设为当前」同一收口：切换落地即收起
+                                    // 面板，否则留下一个没有待办却仍吞按键的浮层。
+                                    finish_session_profile_switch(&mut state);
                                 }
                             }
                             continue;
@@ -22920,6 +22959,159 @@ mod profile_dialog_onboarding_tests {
             action,
             Some(super::ProfileSessionAction::Use(cfg.active_profile.clone())),
             "会话级切换必须走自己的通道"
+        );
+    }
+
+    // ── 切换成功后必须收起 /model 面板 ─────────────────────────────────────
+
+    fn rebuild_ok() -> super::RebuildFn {
+        // 占位 Provider：测试只关心 rebuild 成功这条分支，真实请求路径不会被
+        // 触发（`MissingKeyProvider` 每次调用都返回缺 Key 错误）。
+        Arc::new(|_cfg: &Config, _model: &str| {
+            Ok(Agent::new(Arc::new(wyj_api::MissingKeyProvider)))
+        })
+    }
+
+    fn rebuild_failing() -> super::RebuildFn {
+        Arc::new(|_cfg: &Config, _model: &str| anyhow::bail!("boom"))
+    }
+
+    fn session_deps() -> (
+        Arc<tokio::sync::mpsc::Sender<AgentEvent>>,
+        Arc<std::sync::Mutex<wyj_tools::TodoStore>>,
+        Arc<std::sync::RwLock<Arc<Agent>>>,
+        Arc<Mutex<Session>>,
+    ) {
+        (
+            tokio::sync::mpsc::channel(16).0,
+            Arc::new(std::sync::Mutex::new(wyj_tools::TodoStore { items: vec![] })),
+            Arc::new(std::sync::RwLock::new(Arc::new(Agent::new(Arc::new(
+                wyj_api::MissingKeyProvider,
+            ))))),
+            Arc::new(Mutex::new(Session::new())),
+        )
+    }
+
+    fn switch(
+        state: &mut AppState,
+        name: &str,
+        rebuild: &super::RebuildFn,
+    ) -> bool {
+        let (tx, todos, agent, session) = session_deps();
+        super::apply_session_profile(
+            state,
+            super::ProfileSessionAction::Use(name.to_string()),
+            &tx,
+            rebuild,
+            "",
+            &todos,
+            &agent,
+            None,
+            "sid",
+            &session,
+        )
+    }
+
+    /// 「仅本会话使用」执行后面板必须消失。
+    ///
+    /// 回归：三条「立刻改变生效端点」的出口里只有「设为当前」在成功后关面板，
+    /// 会话级两条漏了。面板的渲染条件（`render.rs`）与按键拦截条件（主循环）
+    /// 都挂在 `state.profile_dialog.is_some()` 上，于是切换成功后留下一个
+    /// 没有待办却继续吞掉全部按键的浮层——用户看着输入框光标在闪，却打不进
+    /// 字，只能靠 Esc 才发现面板还在。
+    #[test]
+    fn use_for_session_closes_the_profile_dialog() {
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+
+        assert!(switch(&mut state, "beta", &rebuild_ok()), "重建应当成功");
+        super::finish_session_profile_switch(&mut state);
+
+        assert_eq!(
+            state.session_profile_override.as_deref(),
+            Some("beta"),
+            "本会话生效的分组应当已经写进 AppState"
+        );
+        assert!(
+            state.profile_dialog.is_none(),
+            "切换成功后 /model 面板必须收起，否则它继续吞掉全部按键"
+        );
+    }
+
+    /// 面板里有未保存的字段草稿时不能顺手关掉：会话级切换刻意不写盘，
+    /// 直接关等于静默丢掉用户刚敲进去的 Key。
+    #[test]
+    fn a_session_switch_never_discards_unsaved_field_edits() {
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+        let api_key_idx = super::profile_field_idx("settings.field.api_key").unwrap();
+        state
+            .profile_dialog
+            .as_mut()
+            .unwrap()
+            .entries[0]
+            .set_text_value(api_key_idx, "sk-half-typed".to_string());
+
+        assert!(switch(&mut state, "beta", &rebuild_ok()));
+        super::finish_session_profile_switch(&mut state);
+
+        assert_eq!(
+            state
+                .profile_dialog
+                .as_ref()
+                .and_then(|d| d.entries[0].text_value(api_key_idx)),
+            Some("sk-half-typed"),
+            "面板必须留下，用户才有地方按 Ctrl+S 保住这次编辑"
+        );
+    }
+
+    /// 切换失败时保持面板：用户得留在面板里才看得到 `profile.switch_failed`。
+    #[test]
+    fn a_failed_switch_keeps_the_panel_open() {
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+
+        assert!(
+            !switch(&mut state, "beta", &rebuild_failing()),
+            "重建失败不能宣称切换成功，否则调用方会关掉面板"
+        );
+        assert_eq!(state.session_profile_override, None, "失败时不得改生效值");
+        assert!(state.profile_dialog.is_some());
+    }
+
+    /// 会话切换后同一个分组会走 `adopt_session_profile` 的早退分支（不重建
+    /// Agent），面板同样必须收起——它的 entries 是打开那一刻的 config 快照。
+    #[test]
+    fn switching_sessions_closes_a_stale_profile_panel() {
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.session_profile_override = Some("beta".to_string());
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+
+        let (tx, todos, agent, session) = session_deps();
+        super::adopt_session_profile(
+            &mut state,
+            Some("beta".to_string()),
+            &tx,
+            &rebuild_failing(),
+            "",
+            &todos,
+            &agent,
+            None,
+            "sid",
+            &session,
+        );
+
+        assert!(
+            state.profile_dialog.is_none(),
+            "换会话后面板里的分组快照已过期，必须收起"
         );
     }
 
