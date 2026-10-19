@@ -358,9 +358,9 @@ mod busy_whitelist_tests {
             .map(|c| c.name())
             .collect();
         actual.sort_unstable();
-        // evolve / resume / mouse 刻意**不在**白名单：evolve 的确认动作要建工作区
-        // 快照并 spawn 后台 task，会把 AppState::current_task 覆盖成自己的 handle，
-        // 正在跑的回合从此失去 ESC 中断能力；resume 会切走当前会话身份。
+        // evolve / resume 刻意**不在**白名单：evolve 的确认动作要建工作区快照并
+        // spawn 后台 task，会把 AppState::current_task 覆盖成自己的 handle，正在跑
+        // 的回合从此失去 ESC 中断能力；resume 会切走当前会话身份。
         let mut expected = vec![
             "agent-control",
             "agents",
@@ -375,6 +375,7 @@ mod busy_whitelist_tests {
             "memory",
             "mode",
             "model",
+            "mouse",
             "plugins",
             "quit",
             "schedule",

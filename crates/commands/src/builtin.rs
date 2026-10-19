@@ -1477,6 +1477,9 @@ pub struct MouseCmd;
 
 #[async_trait]
 impl Command for MouseCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "mouse"
     }
