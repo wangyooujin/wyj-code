@@ -4,13 +4,22 @@
 
 **槽位按「用途」命名，不按颜色命名。** 同一个青色同时出现在 `@file` 引用、System 标记、排队提示、补全选中底色四处，它们是四种语义：亮色主题下输入提示可能要变亮、System 标记可能要变深，留一个 `cyan` 槽位就只能四处一起变。历史上 `render.rs` 里散着 70+ 处 `Color::Cyan`，插件换肤只换得动一半——这不是主题写得不好，是**根本没有主题**，那些字面量谁也管不着。
 
+**取值原则（完整色板与设计依据见 `doc/plan/color-system-redesign.md`）**：冷灰中性底 + 暖橙品牌点缀，设计基准背景 `#1E2127`。四条不能回退的取值规则：
+
+1. **层级靠明度四档，不靠增加色相**：`text`（`#D7DAE0`）> `text_dim`（`#A0A8B8`）> `inactive`（`#7A8397`）> `muted`（`#5A6274`），`border`（`#39404F`）是最弱的结构线。正文**不用纯白**，把亮度预算留给强调色。
+2. **品牌橙只出现在小面积**：assistant 前缀、工具调用行、h1、选中行前景、光标底、状态栏 `◆`。正文、工具结果、列表 bullet、代码一律不染品牌色——旧实现把橙铺到 bullet 和工具结果上，整屏偏暖且失去强调作用。
+3. **语义色成对、同明度**：`success` `#98C379` / `error` `#E06C75` / `warning` `#E5C07B` / `danger` `#E5484D`。`danger` 比 `error` 更沉更硬：前者是常驻模式标识（bypass），后者是内容失败。
+4. **全部槽位都是 RGB**。具名色（`Cyan` / `Red` / `DarkGray`）的真实 RGB 由用户终端主题决定，同屏色温对不上，且非 truecolor 降级对它们无效。`selection_fg` 也必须是 RGB，否则 `relative_luminance` 只能取中性 0.5，`ensure_contrast` 的判断失真。
+
 三条硬规则，**新增颜色前先读**：
 
 1. **生产代码里不许出现裸 `Color::`**（含 `Color::Reset` / `Color::Indexed`）。一律换成 `Theme::xxx()` 或 `Theme::xxx_color()`。唯一例外是欢迎页 logo 的渐变插值，它走 `Theme::rgb_components_or` / `Theme::rgb_from_components`。钉子：`theme_tests::no_hardcoded_colors_outside_theme`（扫描 `render.rs` / `markdown.rs` / `welcome.rs` / `hyperlink.rs` / `input.rs` / `app.rs` 的生产区，跳过 `#[cfg(test)] mod` 与注释行）。这条能落地是因为它检查**源码文本**而非运行时行为——真想写别的颜色，作者得先来改这条规则，那一刻就已经是有意识的决定。
 2. **新增槽位必须同时接三处**：`ThemePalette` 字段 + `Default` + `from_json` 的 match 分支 + getter/Style 方法。`from_json` 对未知键是**静默忽略**的（插件主题不能因为拼错一个键就整份作废），漏接的代价是"主题半截生效且无任何报错"。钉子：`theme_tests::every_palette_slot_is_wired_to_a_json_key`（每个槽位一个互不相同的 RGB，逐字段验接上了）。
 3. **颜色断言断槽位，不断具体值**。`assert_eq!(style, Theme::success())` 而不是 `assert_eq!(style, Style::default().fg(Color::Green))`——后者会在主题换色时集体变红，且挡不住"两处用了同一个绿的近似色"。真要钉具体色值时，钉在 `theme.rs` 的常量表上。
 
-`theme.rs` 里有三组容易混的槽位：**`inactive`（RGB 灰 #999999，主 dim）/ `muted`（ANSI DarkGray，Todo 圆圈与「待发送：」这类标记）/ `border`（深灰 #666666，框线）**。合并它们会让对应元素整体亮一档；`muted` 与 `inactive` 不是同一档，`code_*` 四件套只服务于 `highlight_code_line` 那个自研词法着色器（零语法高亮依赖的边界所在）。
+`theme.rs` 里有三组容易混的槽位：**`inactive`（`#7A8397`，主 dim：状态栏、thinking、未闭合围栏）/ `muted`（`#5A6274`，结构性附注：行号、Todo 圆圈、「待发送：」标签、URL 注释）/ `border`（`#39404F`，框线、表格网格、引用竖线、分隔线）**。合并它们会让对应元素整体亮一档；`muted` 与 `inactive` 不是同一档，`code_*` 四件套只服务于 `highlight_code_line` 那个自研词法着色器（零语法高亮依赖的边界所在）。
+
+**`inline_code` 是独立槽位，不要合并回 `code_fg`**：代码块正文是「整块代码」，需要低饱和以保持可读（`#ABB2BF`）；行内代码是「正文里的一个标识符」，需要轻微跳出但**不能有背景色**（`#E5C07B` 琥珀）。旧实现两者共用 `code_fg` 的浅蓝，结果行内代码与用户前缀 `❯`、权限对话框撞成一片蓝紫。
 
 **以下视觉语言是刻意定下的，不要"顺手优化"**：`⏺`（工具调用）与 `⎿`（结果/思考折叠头）图标体系、蓝色 user 前缀（`suggestion` 槽位）、左对齐不居中、消息块之间固定空一行、代码块**无背景色无卡片**（只有左边线 `│` + 顶栏语言标签的纯文本形态）、**引用块顶格**（`│ ` 不额外缩进，`│` 本身就是层级标记）。它们不是"还没来不及设计"，是产品选择。注意与「Markdown 排版」那节并不冲突：块间距是**块之间**留白，缩进体系是**块内部**的事；段落 / 列表 / 表格 / 代码块统一 2 格起，标题与引用块顶格是刻意的。
 
@@ -91,6 +100,8 @@
 2. **每个 `spec.key` 必须真的在 `zh.yml` / `en.yml` 里有条目**。rust-i18n 缺 key 时**原样回显 key**（不 panic、不告警），历史 bug 就是这样在面板上渲染出 `settings.field.reasoning_effort` 字面量。测试 `every_profile_field_label_key_resolves` 钉死。
 3. **思考字段按线协议分流**：`thinking_budget` / `interleaved_thinking` 只在 Anthropic 线显示，`reasoning_effort` / `thinking_switch` 只在 OpenAI 线显示。两边的参数互不相认，同时平铺只会诱导用户配一个必然被 catalog 丢弃的死字段。可见性过滤在 `ProfileDialog::visible_field_idxs` 里做，**不能只在渲染层做**——`rows()`、键位、光标三者必须看到同一份可见列表，否则方向键会跳到看不见的行上。
 4. **Enum 字段的候选首项必须是空串**（`enum_choices` 自动加）。`reasoning_effort` / `thinking_switch` 在配置里是 `Option<String>`，空串是唯一能表达 `None` 的形态；去掉它用户就再也回不到"跟随端点默认"。
+
+**`max_tools_per_turn` 是枚举字段，新建分组预填 4**：候选固定为「（默认）/ 1 / 2 / 4 / 8」（`MAX_TOOLS_PER_TURN_CHOICES`），草稿侧存 `String`、空串写回 `None`。**预填 4 不是随手取的数**——`None` 会让 `model_catalog` 按 vendor 猜出的 `max_tools_per_turn = 1` 直接生效，而静态目录对所有非 anthropic/openai vendor 一律判 1，于是国内模型新建分组后每轮只能发一个工具调用、一次只能派生一个 subagent。已有分组仍保留原值（`from_profile` 原样透传），用户清空即可回到端点默认。测试 `new_profile_from_template_prefills_four_tools_per_turn` / `max_tools_per_turn_enum_cycles_and_clears_to_none` 钉死。
 
 **Model 字段的 Enter 直达拉取**：`ProfileFieldKind::Model` 按 Enter 直接发起 `fetch_model_ids`（`profile_start_fetch_models`），结果菜单**首项固定是「手动输入」**；拉取失败/为空时也弹这个单项目菜单。不能只把拉取挂在菜单里——第三方的 `/models` 常常不支持，用户必须随时能退回手填。选中模型后会调 `autofill_capacity_from_catalog`，只用 `wyj_api::known_model_capacity` 的静态表补 `context_window` / `max_tokens`，且**只覆盖空值或默认值（200000 / 32000）**，用户手改过的数字不动。供应商的 `/models` 接口不返回容量元数据，所以这里没有 live probe 路径。
 
