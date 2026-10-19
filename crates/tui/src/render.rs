@@ -23,7 +23,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    },
     Frame,
 };
 use std::collections::HashMap;
@@ -2536,6 +2538,46 @@ fn visible_chat_lines(
     lines
 }
 
+/// 内容区右侧的应用内滚动条。
+///
+/// alternate screen 里终端**没有**自己的滚动条（真正的原生滚动条只存在于主屏
+/// scrollback，而那套 Inline 方案已因画面撕裂被放弃两次），所以这里画一条与
+/// less/vim 观感一致的细条：轨道 `│`、滑块 `┃`，不带上下箭头。
+///
+/// 参数语义与 [`Paragraph::scroll`] 一致：
+/// - `position`：从正文第一行往下跳过的行数（0 = 顶部）；
+/// - `max_scroll`：可滚动的最大偏移（内容高度 − 视口高度）；为 0 表示装得下，
+///   此时不画——一个永远满格的滚动条只会误导用户去拖它；
+/// - `viewport`：视口物理行数，决定滑块长度。
+///
+/// 只在 `area.width >= 3` 时绘制，占最右 1 列。`chat_content_width` 已经
+/// 预留了 2 列边距，因此滚动条不会压到正文。
+fn draw_scrollbar(f: &mut Frame, area: Rect, position: usize, max_scroll: usize, viewport: usize) {
+    if max_scroll == 0 || area.width < 3 || area.height == 0 {
+        return;
+    }
+    let track = Rect {
+        x: area.x + area.width - 1,
+        y: area.y,
+        width: 1,
+        height: area.height,
+    };
+    let mut state = ScrollbarState::new(max_scroll + viewport)
+        .position(position.min(max_scroll))
+        .viewport_content_length(viewport.max(1));
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_symbol("┃")
+            .track_symbol(Some("│"))
+            .begin_symbol(None)
+            .end_symbol(None)
+            .thumb_style(Theme::dim())
+            .track_style(Theme::border()),
+        track,
+        &mut state,
+    );
+}
+
 fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let max_content_width = chat_content_width(area.width);
     let lines = build_pending_chat_lines(state, max_content_width);
@@ -2570,6 +2612,9 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((intra.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, area);
+    if state.show_scrollbar {
+        draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height);
+    }
 
     if state.unseen_messages {
         let hint = Paragraph::new(Line::from(Span::styled(
@@ -2720,6 +2765,21 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
         max_scroll,
     );
     f.render_widget(para.scroll((scroll_y, 0)), area);
+    if state.show_scrollbar {
+        // 末行留给固定提示，滚动条也只覆盖正文那一段，避免滑块长度把提示行算进去。
+        draw_scrollbar(
+            f,
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: body_height,
+            },
+            scroll_y as usize,
+            max_scroll as usize,
+            body_height as usize,
+        );
+    }
 
     // 用户主动上滚后视口脱离实时尾部：正文下方还会持续堆新事件，用提示行说明
     // 「往下还有内容」以及如何回到跟随态，免得看起来像子 Agent 卡住不动了。
@@ -10169,6 +10229,62 @@ mod chat_viewport_tests {
         assert!(
             text.contains("wrapped-09"),
             "最后一条消息必须完整落在视口内:\n{text}"
+        );
+    }
+
+    /// 右侧滚动条：内容装不下时出现，随滚动位置移动。
+    #[test]
+    fn scrollbar_appears_only_when_content_overflows_and_tracks_scroll() {
+        let mut state = history_state(200);
+        state.chat_follow_tail = false;
+        state.chat_scroll = 0;
+        let top = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+        assert!(
+            top.lines().any(|line| line.ends_with('┃')),
+            "长内容必须画出滚动条滑块:\n{top}"
+        );
+
+        state.chat_scroll = state.chat_max_scroll;
+        let bottom = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+        assert!(
+            bottom.lines().any(|line| line.ends_with('┃')),
+            "滚到底后滑块仍应可见:\n{bottom}"
+        );
+        // 滑块位置必须真的变了：顶部时首行是滑块，底部时首行是轨道。
+        let top_first = top.lines().next().unwrap_or_default();
+        let bottom_first = bottom.lines().next().unwrap_or_default();
+        assert_ne!(
+            top_first.ends_with('┃'),
+            bottom_first.ends_with('┃'),
+            "滚动位置变化时滑块位置必须跟随:\n top={top_first:?}\nbottom={bottom_first:?}"
+        );
+    }
+
+    /// 内容装得下时不画滚动条：满格滑块会误导用户去拖它。
+    #[test]
+    fn scrollbar_is_hidden_when_content_fits() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        state
+            .messages
+            .push(ChatMessage::system("short".to_string()));
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+        assert!(
+            !text.contains('┃') && !text.contains('│'),
+            "短内容不应出现滚动条:\n{text}"
+        );
+    }
+
+    /// `[ui].scrollbar = false` 时完全不画。
+    #[test]
+    fn scrollbar_respects_the_ui_switch() {
+        let mut state = history_state(200);
+        state.chat_follow_tail = false;
+        state.show_scrollbar = false;
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+        assert!(
+            !text.contains('┃') && !text.contains('│'),
+            "开关关闭时不应画滚动条:\n{text}"
         );
     }
 }

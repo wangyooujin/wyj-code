@@ -256,6 +256,7 @@ help:
     - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
+    - `/mouse` — 切换鼠标捕获：开启后滚轮滚动内容区（拖选复制需按住 Option），关闭后交还终端原生拖选
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开项目记忆面板（AGENTS.md / CLAUDE.md 等规约文件）
@@ -295,8 +296,10 @@ help:
     - `Ctrl+U` — 删除光标到行首
     - `Ctrl+W` — 删除前一个词
     - `↑` / `↓` — 浏览输入历史；多行输入中先移动光标，到首行/末行后切换历史
+    - `Shift+↑` — 进入内容区（优先运行中的子 Agent，其次任务列表、后台任务、聊天区）；`Esc` 逐级返回输入框
     - `PageUp` / `PageDown` — 上下翻阅当前会话内容
-    - `鼠标拖拽` — 直接选中终端文字，无需按住 Shift
+    - `鼠标滚轮` — 上下翻阅内容区（右侧细滚动条指示位置）；`/mouse` 可切换鼠标捕获
+    - `Option+拖拽` — 鼠标捕获开启时选中文字复制（关闭捕获后直接拖拽即可）
     - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
     - `Command+点击` / `Ctrl+点击` — 打开回复中的本地文件路径或网页链接
     - `/` — 命令补全（Tab 确认，Esc 取消）
@@ -791,6 +794,12 @@ mode:
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
   current: "当前模式: {mode}（可选: auto / plan / bypass）"
   unknown: "未知模式 '{args}'。可选：auto / plan / bypass"
+
+mouse:
+  desc: "切换鼠标捕获：开启后滚轮可滚动聊天区（代价是拖选复制需按住 Option），关闭后完全交还终端"
+  on: "鼠标捕获已开启：滚轮可滚动内容区，拖选复制请按住 Option。再用 /mouse 可关闭。"
+  off: "鼠标捕获已关闭：终端原生拖选复制恢复（无需 Option），但 macOS Terminal.app 下滚轮将不再滚动内容区。"
+  headless_unsupported: "[headless 模式没有鼠标交互，/mouse 无效果]"
 
 auto:
   mode_notice: "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。"

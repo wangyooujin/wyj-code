@@ -671,6 +671,43 @@ impl Default for ToolsCfg {
     }
 }
 
+/// `[ui]` 节 —— TUI 展示区的交互开关。
+///
+/// `mouse_capture` 是 2026-10 那次取舍的落点：alternate screen 里终端自己的
+/// 滚动条不存在，滚轮能否滚动完全取决于应用是否开启鼠标报告（DEC 1000/1002/
+/// 1006）。macOS Terminal.app 不支持 DEC mode 1007（alternate screen 滚轮转
+/// 方向键），因此在「不开启鼠标捕获」的前提下，Terminal.app 的滚轮事件**根本
+/// 不会送达应用**——这是「滚轮完全没反应」的唯一根因。
+///
+/// 开启的代价：终端原生拖选复制需要按住 Option（多数终端在应用开启鼠标报告后
+/// 的既定行为）。这个代价由用户选择接受，故默认开启，并保留 `/mouse` 与
+/// `mouse_capture = false` 两条随时退回的通道。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiCfg {
+    /// 是否开启鼠标报告，让滚轮/拖拽事件进入应用。
+    ///
+    /// - `true`（默认）：滚轮滚动聊天区与子 Agent 详情；拖选复制需按住 Option。
+    /// - `false`：完全交还终端（拖选无需修饰键），滚轮只对支持 DEC 1007 的终端
+    ///   （Ghostty 直连）有效，Terminal.app 下无反应。
+    ///
+    /// 运行时可用 `/mouse` 切换，不写回配置文件。
+    pub mouse_capture: bool,
+    /// 是否在内容区右侧绘制应用内细滚动条（`│`/`┃`，less/vim 观感）。
+    ///
+    /// 只在内容超出视口时出现，宽度 < 3 列的终端不画。
+    pub scrollbar: bool,
+}
+
+impl Default for UiCfg {
+    fn default() -> Self {
+        Self {
+            mouse_capture: true,
+            scrollbar: true,
+        }
+    }
+}
+
 /// `crates/sandbox/` 已删除，下方所有 `Sandbox*Cfg` 字段仍保留只为兼容
 /// `~/.wyj-code/config.toml` 历史配置文件（旧 block 不会被 serde 报错），
 /// 运行时整块忽略，不再映射到任何 ToolCtx 状态。读取后会在 Config::load
@@ -1030,6 +1067,9 @@ pub struct Config {
     /// 工具注册门控（[tools] 节）
     #[serde(default)]
     pub tools: ToolsCfg,
+    /// TUI 展示区交互开关（[ui] 节）
+    #[serde(default)]
+    pub ui: UiCfg,
     /// WebSearch 搜索 provider（目前支持 "tavily"）
     #[serde(default = "default_search_provider")]
     pub search_provider: String,
@@ -1190,6 +1230,7 @@ impl Default for Config {
             auto_mode: AutoModeCfg::default(),
             agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
+            ui: UiCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
@@ -1281,6 +1322,7 @@ impl From<LegacyConfigV0> for Config {
             auto_mode: AutoModeCfg::default(),
             agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
+            ui: UiCfg::default(),
             search_provider: default_search_provider(),
             search_api_key: None,
             runtime_api_key: None,
