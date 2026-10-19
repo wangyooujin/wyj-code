@@ -162,6 +162,33 @@ pub struct Session {
     pub session_profile: Option<String>,
     /// 最近一次模型往返的时延画像（`/context` 面板展示）。
     pub latency: TurnLatency,
+    /// 字符启发式估算相对真实 prompt token 的校准系数（EWMA）。
+    ///
+    /// `None` = 还没有可用样本，按 1.0 处理。用 `Option` 而不是「默认 1.0 的
+    /// f32」是因为 `Session` 用 `#[derive(Default)]`：`f32::default()` 是 0.0，
+    /// 悄悄把系数变成 0 会让所有压缩阈值判定失效，而这类默认值错误在测试里
+    /// 极难发现。`None` 让「未校准」成为一个显式状态。
+    ///
+    /// `estimate_text_tokens` 是启发式：CJK 按 1.5/字、其余按 1/3 字符，对
+    /// 代码 / JSON / 多语言混排的实际偏差可达数十个百分点，而压缩阈值是按
+    /// **比例**切的硬线。偏低时压缩触发过晚（真实上下文已接近窗口上限才动手，
+    /// 也可能先撞 400）；偏高时压缩触发过早（还没到该压的时候就把现场摘要了）。
+    ///
+    /// 每轮请求成功后用 provider 上报的真实 prompt token 与估算值求比值，
+    /// 再做指数滑动平均（旧值权重 0.9）：单轮抖动不该改变阈值判定，而偏差
+    /// 一旦是系统性的，几轮之内就会收敛到真值附近。
+    ///
+    /// 只在 `[0.5, 2.0]` 区间内采信样本——落在区间外的比值几乎一定意味着
+    /// 端点上报口径不同（某些兼容端点把 cache_read 算进 prompt_tokens、
+    /// 或者干脆不上报），拿它做校准会让阈值漂到不可预期的位置。
+    pub input_estimate_ratio: Option<f32>,
+    /// provider 亲口报告过上下文超限时记下的真实输入量。
+    ///
+    /// 配置里的 `context_window` 是**裸 u32、无探测兜底**，填错（比如端点
+    /// 实际只有 256K 却写了 1M）会让压缩阈值落在根本摸不到的位置，两道防线
+    /// 同时失效，只剩 400 兜底。这个字段让「被端点拒绝过一次」这件事变成
+    /// 后续判定有效窗口的依据：`min(configured, hint * 1.05)`。
+    pub overflow_window_hint: Option<u32>,
     /// 消息增量落盘回调（可选）。每条消息进入 `messages` 时同步调用一次。
     ///
     /// **为什么需要在 `Session` 上开口子**：子 Agent 跑在一个纯内存的
@@ -278,6 +305,79 @@ impl Session {
         Self::default()
     }
 
+    /// 当前生效的估算校准系数（未校准时为 1.0）。
+    pub fn estimate_ratio(&self) -> f32 {
+        self.input_estimate_ratio.unwrap_or(1.0)
+    }
+
+    /// 用一次真实请求用量更新校准系数。
+    ///
+    /// `real_prompt_tokens` 必须是**完整 prompt**（全价 input + 缓存命中 +
+    /// 缓存写入）。OpenAI 侧 `input_tokens` 已被 `saturating_sub(cached)`
+    /// 处理过，只拿它当真实值会系统性低估，进而把系数越压越低。
+    ///
+    /// 三道护栏：
+    ///   1. 估算值太小（< 1000 token）不采样——分母小的时候整数启发式的
+    ///      相对误差本来就大，采进来只会让系数抖；
+    ///   2. 比值落在 `[0.5, 2.0]` 之外直接丢弃——那不是估算偏差，是端点
+    ///      上报口径不同（或干脆编了个数）；
+    ///   3. EWMA 权重 0.1：系统性偏差几轮内收敛，单轮抖动不会改写阈值。
+    pub fn observe_prompt_tokens(&mut self, real_prompt_tokens: u32) {
+        let prompt_estimate = self
+            .context_audit
+            .total()
+            .saturating_sub(self.context_audit.output_reserve);
+        if prompt_estimate < 1_000 || real_prompt_tokens == 0 {
+            return;
+        }
+        let ratio = real_prompt_tokens as f32 / prompt_estimate as f32;
+        if !(0.5..=2.0).contains(&ratio) {
+            tracing::debug!(
+                real_prompt_tokens,
+                prompt_estimate,
+                ratio,
+                "prompt token 实测/估算比值落在合理区间外，丢弃该校准样本"
+            );
+            return;
+        }
+        let next = match self.input_estimate_ratio {
+            Some(previous) => previous * 0.9 + ratio * 0.1,
+            None => ratio,
+        };
+        self.input_estimate_ratio = Some(next.clamp(0.5, 2.0));
+    }
+
+    /// 本会话实际生效的上下文窗口。
+    ///
+    /// 配置值优先，但**被端点拒绝过一次之后**以实测为准：`min(configured,
+    /// hint)`。`context_window` 是裸配置、没有探测兜底，填成远大于真实窗口
+    /// 的值时，压缩阈值会落在一个永远摸不到的位置，两道防线同时失效——只剩
+    /// 400 兜底，而 400 每回合只能恢复一次。
+    ///
+    /// 刻意**不**给 hint 加余量：请求被拒证明「真实窗口 < 这次 prompt」，
+    /// 往下压是安全方向；往上放大 5% 反而可能再撞一次 400。
+    pub fn effective_context_window(&self, configured: u32) -> u32 {
+        match self.overflow_window_hint {
+            Some(hint) if hint > 0 => configured.min(hint),
+            _ => configured,
+        }
+    }
+
+    /// 记下「这次请求被端点以上下文超限为由拒绝」。
+    ///
+    /// 只往小取：连续撞两次时，较严的那次才是真实窗口的上界，而
+    /// [`Self::overflow_window_hint`] 是公开字段——在调用点写 `min` 等于把
+    /// 「只许收紧」这条不变量交给每个调用方各自维护。
+    pub fn note_context_overflow(&mut self, real_prompt_tokens: u32) {
+        if real_prompt_tokens == 0 {
+            return;
+        }
+        self.overflow_window_hint = Some(match self.overflow_window_hint {
+            Some(previous) => previous.min(real_prompt_tokens),
+            None => real_prompt_tokens,
+        });
+    }
+
     /// 清空对话与本次用量，但保留当前 session 的 checkpoint/branch 血缘。
     /// `/clear` 不是创建新 session，不能把分支归属悄悄抹掉。
     ///
@@ -295,12 +395,19 @@ impl Session {
         // 同理：会话级分组是「这个会话跑在哪套端点上」，不是对话内容。
         // `/clear` 只清消息，不该顺手把用户刚选的会话级模型丢掉。
         let session_profile = self.session_profile.clone();
+        // 估算校准系数与「端点拒绝过」的实测窗口同样描述运行环境：这轮踩过的
+        // 坑（估算偏低 / 配置窗口填大了）不会因为换了个话题就消失，清掉等于
+        // 让新对话从头再失准一遍。
+        let input_estimate_ratio = self.input_estimate_ratio;
+        let overflow_window_hint = self.overflow_window_hint;
         *self = Self {
             current_checkpoint_id,
             branch_parent_session_id,
             branch_parent_checkpoint_id,
             prompt_cache_state,
             session_profile,
+            input_estimate_ratio,
+            overflow_window_hint,
             ..Self::default()
         };
     }
@@ -529,6 +636,8 @@ impl Session {
         self.sub_cache_read_tokens = file.sub_cache_read_tokens;
         self.sub_cache_write_tokens = file.sub_cache_write_tokens;
         self.prompt_cache_state = file.prompt_cache_state;
+        self.input_estimate_ratio = file.input_estimate_ratio;
+        self.overflow_window_hint = file.overflow_window_hint;
         self.compact_count = file.compact_count;
         self.context_edit_freed_tokens = file.context_edit_freed_tokens;
         self.session_profile = file.session_profile.clone();
@@ -597,6 +706,107 @@ mod tests {
             "已配对的历史不得被二次修补"
         );
         assert_eq!(session.messages.len(), after_first);
+    }
+
+    // ── 估算校准与有效窗口 ──────────────────────────────────────────────
+
+    fn session_with_audit(prompt_estimate: u32) -> Session {
+        let mut session = Session::new();
+        session.context_audit = crate::compact::ContextAudit {
+            system_tokens: prompt_estimate,
+            tool_schema_tokens: 0,
+            history_tokens: 0,
+            output_reserve: 32_000,
+            framing_tokens: 0,
+            window: 0,
+            reclaimable_tool_result_tokens: 0,
+        };
+        session
+    }
+
+    /// 未校准时系数必须是 1.0：阈值判定此时与旧版逐字节相同。
+    #[test]
+    fn estimate_ratio_defaults_to_one() {
+        let session = Session::new();
+        assert_eq!(session.input_estimate_ratio, None);
+        assert_eq!(session.estimate_ratio(), 1.0);
+    }
+
+    /// 估算偏低时系数要往上走：压缩阈值跟着上移，压缩才会在真正接近窗口
+    /// 之前触发，而不是先撞 400。
+    #[test]
+    fn observe_prompt_tokens_tracks_a_systematic_underestimate() {
+        let mut session = session_with_audit(100_000);
+        // 真实是估算的 1.4 倍 → 系数应逐步向 1.4 靠
+        for _ in 0..40 {
+            session.observe_prompt_tokens(140_000);
+        }
+        let ratio = session.estimate_ratio();
+        assert!(
+            (1.3..=1.5).contains(&ratio),
+            "系数应收敛到实测偏差附近，实测 {ratio}"
+        );
+    }
+
+    /// 区间外的样本（端点把 cache 算进 prompt、或干脆编数）必须丢弃：
+    /// 照单全收会让压缩阈值漂到不可预期的位置。
+    #[test]
+    fn observe_prompt_tokens_ignores_out_of_range_samples() {
+        let mut session = session_with_audit(100_000);
+        session.input_estimate_ratio = Some(1.0);
+        session.observe_prompt_tokens(100_000_000);
+        assert_eq!(session.estimate_ratio(), 1.0, "越界样本必须被丢弃");
+        session.observe_prompt_tokens(0);
+        assert_eq!(session.estimate_ratio(), 1.0, "零上报必须被丢弃");
+    }
+
+    /// 分母太小时不采样：整数启发式在小规模上的相对误差天然很大，采进来
+    /// 只会让系数抖动。
+    #[test]
+    fn observe_prompt_tokens_skips_tiny_estimates() {
+        let mut session = session_with_audit(500);
+        session.input_estimate_ratio = Some(1.0);
+        session.observe_prompt_tokens(100_000);
+        assert_eq!(session.estimate_ratio(), 1.0);
+    }
+
+    /// 端点拒绝过一次之后，有效窗口必须按实测收紧——否则 `context_window`
+    /// 写成 1M 而真实只有 256K 时，两道防线会一起落在够不着的位置。
+    #[test]
+    fn overflow_hint_shrinks_the_effective_window() {
+        let mut session = Session::new();
+        assert_eq!(session.effective_context_window(1_000_000), 1_000_000);
+        session.note_context_overflow(256_000);
+        assert_eq!(session.effective_context_window(1_000_000), 256_000);
+        // 配置值更小时依然以配置为准（hint 只是上界证据，不是真相覆盖）
+        assert_eq!(session.effective_context_window(128_000), 128_000);
+    }
+
+    /// 只往小取：连续撞两次时记住更严的那个。
+    #[test]
+    fn overflow_hint_only_ever_shrinks() {
+        let mut session = Session::new();
+        session.note_context_overflow(400_000);
+        session.note_context_overflow(200_000);
+        assert_eq!(session.overflow_window_hint, Some(200_000));
+        assert_eq!(session.effective_context_window(1_000_000), 200_000);
+        // 0 是「没量到」，不能把已学到的窗口上界抹成 0
+        session.note_context_overflow(0);
+        assert_eq!(session.overflow_window_hint, Some(200_000));
+    }
+
+    /// `/clear` 换对话，但端点不会变——校准系数描述的是「这套端点 + 这类
+    /// 内容下估算偏多少」，抹掉它等于让新对话从头再失准一遍。
+    #[test]
+    fn clear_conversation_keeps_the_estimate_calibration() {
+        let mut session = session_with_audit(100_000);
+        session.input_estimate_ratio = Some(1.25);
+        session.overflow_window_hint = Some(300_000);
+        session.push_user("某个问题");
+        session.clear_conversation();
+        assert_eq!(session.estimate_ratio(), 1.25);
+        assert_eq!(session.overflow_window_hint, Some(300_000));
+        assert!(session.messages.is_empty(), "对话本身仍然要清空");
     }
 
     #[test]
