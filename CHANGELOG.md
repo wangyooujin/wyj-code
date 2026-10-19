@@ -10,7 +10,7 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
-## [未发布]
+## [0.3.11] - 2026-10-19
 
 ### macOS Terminal.app 里滚轮完全没反应、Shift+↑ 进不去子 Agent
 
@@ -49,11 +49,56 @@
   现在判定改为 `contains(SHIFT)` 且排除 Ctrl/Alt/Cmd，并前移到补全拦截之前；
   Chat 焦点下只在「下方面板真的存在」时才抢键，避免正在滚历史时被跳到会话末尾。
 
-测试：`wyj-tui` 436 项、`wyj-commands` 72 项全部通过；新增钉子
+测试：`wyj-tui` 438 项、`wyj-commands` 75 项全部通过；新增钉子
 `mouse_capture_enables_only_wheel_and_drag_reporting`、
 `shift_up_from_chat_focus_still_enters_running_sub_agent`、三个滚动条渲染测试，
 以及选区链路（`selection_text_*`、`double_click_selects_a_whole_path`、
 `selection_paints_only_inside_the_content_area`、`drag_is_clamped_to_the_content_area`）。
+
+### 回合执行中 `/model` 只是排了个队，状态栏还露出半个括号
+
+- **忙碌期的 slash 命令根本没进 dispatch**。Agent 正在跑时按 Enter 走的是
+  `Enter && state.is_thinking` 分支，该分支只把内容排进 steer 队列投递给模型——
+  于是 `/model` 被当成一句用户消息字面发给模型，右下角同时冒出「1 条已排队」。
+  斜杠补全在忙碌时照常工作，所以打得出、选得出、唯独执行不了。
+  - 新增 `Command::runs_while_busy`（默认 **false**，且必须保持默认 false）与
+    `CommandRegistry::runs_while_busy`；四条排除理由写在该方法文档里：起新回合 /
+    改会话历史 / 抢 `current_task` 句柄致回合失去 ESC 中断 / 读 session 统计
+  - 20 条面板类命令显式 opt-in（`/model` `/mcp` `/config` `/memory` `/sessions`
+    `/help` …，含本次新增的 `/mouse`），`/cost` `/context` `/clear` `/compact`
+    `/evolve` `/resume` 按字面排队不变
+  - Enter 分支先问 `draft_runs_while_busy`：整条 trim 后不含换行、解析得出命令名、
+    且注册为白名单，才走正常 dispatch
+  - `CommandContext` 在拿不到 session 锁时**降级构造**而非跳过——跳过等于用户按
+    `/model` 只看到一句「会话忙」
+- **右下角那个孤零零的 `(` 是被裁掉的半截全角括号**。`draw_status` 用
+  `chars().count()` 算宽度，而中文与全宽符号是双宽：`● 1 条已排队（等待送达）`
+  char 数 14 / 显示宽度 24，少预留 10 列 → 右端溢出硬切，切点正落在全角 `（` 中间。
+  此类 bug 只在中文下暴露（英文文案全 ASCII，char 数恰等于显示宽度）。
+  - 宽度一律走 `char_display_width`；两段排版收进 `status_bar_layout`，右段优先保、
+    cwd 吃剩余预算、右段自身塞不下时**整段丢弃**而不硬切
+
+### 补全选中后回车不生效、`/model` 设为当前要记得按 Ctrl+S
+
+- **slash 补全只拦 ↑/↓/Tab/Esc**：↑↓ 选中后按 Enter 直接落穿提交输入框里的不完整
+  原文，选中项从未写回。Enter 现在复用 Tab 的填入语义（写回输入框并补尾随空格）；
+  输入框已等于选中命令时放行提交，避免「填入后还要再按一次回车」
+- **`/model` 的「设为当前」只改草稿**，还要用户记得按 Ctrl+S，忘按即静默丢失。
+  新增 `ProfileSessionAction::Save` 变体，菜单执行后交回主循环走与 Ctrl+S 完全
+  相同的 `profile_try_save`（校验 → 写盘 → 重建 agent），成功自动关面板，失败留在
+  面板显示 error。「仅本会话使用」仍走自己的通道、不写 `config.toml`
+- **表单自由输入的文字是近黑色**：`freetext_line` 把普通字符前景误设为
+  `Theme::cursor()`（`#1A1D23`，光标格专用深色），深色终端下与背景几乎同色。
+  改回正文槽位 `Theme::body()`，光标格的橙色反色块保持不变
+
+测试：`wyj-tui` 438 项、`wyj-commands` 75 项全部通过；新增钉子
+`busy_whitelist_is_exactly_the_panel_commands`、
+`busy_enter_branch_checks_the_whitelist_before_queueing`、
+`status_bar_queue_hint_is_never_cut_in_half`、
+`enter_with_completions_open_fills_the_selected_command`、
+`activate_menu_item_asks_the_main_loop_to_save`。
+
+本版全量：**1641 个 workspace 测试通过**（1608 → 1641）。
 
 ## [0.3.10] - 2026-10-19
 
