@@ -7618,6 +7618,115 @@ fn clear_composer(state: &mut AppState, input: &mut InputBox) {
 }
 
 #[cfg(test)]
+mod busy_slash_tests {
+    use super::*;
+
+    /// 回合进行中，面板类命令必须走正常 dispatch；会改历史 / 起新回合 / 读 session
+    /// 统计的命令不得放行。
+    ///
+    /// 这是用户现场那条 `/model` 的直接回归：旧实现忙碌期 Enter 一律排队，于是
+    /// `/model` 被当成一句用户消息发给模型，右下角同时冒出"1 条已排队"。
+    #[test]
+    fn panel_commands_run_while_the_turn_is_in_flight() {
+        let registry = wyj_commands::builtin::standard_registry();
+
+        for draft in ["/model", "/mcp", "/config", "/skills", "/sessions", "/help"] {
+            assert!(
+                draft_runs_while_busy(&registry, draft),
+                "{draft} 应在回合进行中照常执行，而不是排队给模型"
+            );
+        }
+
+        for draft in ["/cost", "/context", "/clear", "/compact", "/rewind", "/bug"] {
+            assert!(
+                !draft_runs_while_busy(&registry, draft),
+                "{draft} 会改会话 / 起新回合 / 读 session 统计，不得在回合进行中执行"
+            );
+        }
+    }
+
+    /// 只有**整条**草稿是一条命令时才放行：正文里提到命令名、多行输入第一行
+    /// 恰好是命令，都不是命令。
+    #[test]
+    fn only_a_whole_single_line_command_is_dispatched() {
+        let registry = wyj_commands::builtin::standard_registry();
+        for draft in ["", "把 /model 的面板打开", "/model\n再补一句", "/modelize"] {
+            assert!(
+                !draft_runs_while_busy(&registry, draft),
+                "{draft:?} 不是一条完整命令，不该按命令执行"
+            );
+        }
+    }
+
+    /// 主循环的 Enter 分支顺序是这条不变式本身：白名单必须先于排队分支命中。
+    /// 只改 `busy_slash` 的计算却忘了改条件、或把两个分支调换，都会退回到
+    /// "忙碌期一律排队"，且不会有任何编译错误。
+    #[test]
+    fn busy_enter_branch_checks_the_whitelist_before_queueing() {
+        let lines: Vec<&str> = include_str!("app.rs").lines().collect();
+        // 按「行首就是」匹配，避免命中本测试源码里那句字符串字面量
+        // （`include_str!` 把测试自己也包进来了）。
+        let whitelist = lines
+            .iter()
+            .position(|l| {
+                l.trim_start().starts_with(
+                    "} else if key.code == KeyCode::Enter && (!state.is_thinking || busy_slash)",
+                )
+            })
+            .expect("Enter 分支应放行 busy_slash 白名单命令");
+        let queue = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("} else if key.code == KeyCode::Enter && state.is_thinking {")
+            })
+            .expect("忙碌期 Enter 仍应有排队分支");
+        assert!(
+            whitelist < queue,
+            "白名单分支必须排在排队分支之前（同一 if-else 链上先命中者生效）"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("draft_runs_while_busy(&cmd_registry")),
+            "busy_slash 必须由 draft_runs_while_busy 推导"
+        );
+    }
+
+    /// CommandContext 在回合进行中必须**降级构造**而不是跳过命令执行。
+    ///
+    /// 拿不到 session 锁时若 `continue`，用户按 `/model` 会看到一句"会话忙"却什么
+    /// 也没发生——比排队更难解释。
+    #[test]
+    fn busy_command_still_runs_when_the_session_lock_is_held() {
+        let lines: Vec<&str> = include_str!("app.rs").lines().collect();
+        // `) = match try_session_lock(...)` 只在 CommandContext 的统计元组处出现
+        // 一次（另外几处都写成 `let sess = match ...`）。按「行首就是」匹配，避免
+        // 命中本测试源码里那句字符串字面量（`include_str!` 把测试自己也包进来了）。
+        let lock = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with(") = match try_session_lock(&session) {")
+            })
+            .expect("CommandContext 的统计元组应按 session 锁取值");
+        let ctx = (lock..)
+            .find(|offset| lines[*offset].contains("let cmd_ctx = CommandContext"))
+            .expect("命令执行路径应构造 CommandContext");
+        assert!(lock < ctx, "锁的获取必须在 ctx 构造之前");
+        let window = lines[lock..ctx].join("\n");
+        assert!(
+            !window.contains("continue;"),
+            "回合进行中执行白名单命令不得因拿不到锁而跳过：\n{window}"
+        );
+        assert!(
+            window.contains("None =>"),
+            "拿不到 session 锁时应有降级分支（None =>），而不是直接返回"
+        );
+    }
+}
+
+#[cfg(test)]
 mod clipboard_paste_tests {
     use super::*;
     use wyj_tools::SubAgentHub;
@@ -14072,6 +14181,25 @@ fn expand_at_refs_to_attachments(
     }
 }
 
+/// Agent 忙碌时，这条 composer 草稿是否应**照常作为 slash 命令执行**，
+/// 而不是排进 `pending_queue` 投递给模型。
+///
+/// 判定只看三件事，且必须同时成立：
+///
+/// 1. 整条草稿 trim 后**不含换行**——多行输入里第一行恰好是 `/model` 时它并不是
+///    命令（后面还跟着正文），跟空闲时 `dispatch` 的语义保持一致；
+/// 2. 首个 token 解析得出命令名（`CommandRegistry::command_name`）；
+/// 3. 该命令注册为 [`wyj_commands::registry::Command::runs_while_busy`]。
+///
+/// 白名单为什么必须逐个声明、默认 false，见该方法上的四条排除理由。
+fn draft_runs_while_busy(registry: &CommandRegistry, draft: &str) -> bool {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return false;
+    }
+    registry.runs_while_busy(CommandRegistry::command_name(trimmed).unwrap_or(""))
+}
+
 /// 根据输入框内容更新 slash 补全候选列表
 fn update_slash_completions(
     state: &mut AppState,
@@ -17849,6 +17977,12 @@ async fn tui_main(
                             && !key.modifiers.contains(KeyModifiers::SHIFT)
                             && !key.modifiers.contains(KeyModifiers::CONTROL)
                             && crate::input::trailing_backslash_before_cursor(&input));
+                    // 回合进行中按 Enter：默认排队投递给模型，**但面板类 slash 命令
+                    // 照常执行**。`/model` 这类命令没有"内容"可投递，排给模型等于把
+                    // 字面的 `/model` 当成一句用户消息发出去（用户实测还会同时在右下角
+                    // 冒出"1 条已排队"，看起来像排队失败）。判定见 `draft_runs_while_busy`。
+                    let busy_slash =
+                        state.is_thinking && draft_runs_while_busy(&cmd_registry, &input.text());
                     if newline {
                         if key.code == KeyCode::Enter
                             && !key.modifiers.contains(KeyModifiers::SHIFT)
@@ -17858,7 +17992,7 @@ async fn tui_main(
                         }
                         input.insert_newline();
                         state.slash_completions.clear();
-                    } else if key.code == KeyCode::Enter && !state.is_thinking {
+                    } else if key.code == KeyCode::Enter && (!state.is_thinking || busy_slash) {
                         if composer_has_content(&state, &input) {
                             // 附件占位符的位置只存在于输入框内部（`take()` 之后
                             // 标记就没了），先留一份快照给聊天区展示用。
@@ -18015,44 +18149,61 @@ async fn tui_main(
                                 compact_count,
                                 context_edit,
                                 sub_usage,
-                            ) = {
-                                let sess = match try_session_lock(&session) {
-                                    Some(sess) => sess,
-                                    None => {
-                                        state.notify_session_busy();
-                                        continue;
-                                    }
-                                };
-                                // 优先用 Agent 侧算好的 request 级分解（与自动压缩
-                                // 阈值同源）；本会话还没发过模型请求时才退回
-                                // messages-only 估算。
-                                let audit = if sess.context_audit.total() > 0 {
-                                    Some(sess.context_audit)
-                                } else {
-                                    None
-                                };
-                                let estimated = audit
-                                    .map(|a| a.total())
-                                    .unwrap_or_else(|| wyj_core::estimate_tokens(&sess.messages));
-                                (
-                                    audit,
-                                    estimated,
-                                    sess.total_cache_read_tokens,
-                                    sess.total_cache_write_tokens,
-                                    sess.api_calls,
-                                    sess.prompt_cache_state,
-                                    sess.compact_count,
+                            ) = match try_session_lock(&session) {
+                                Some(sess) => {
+                                    // 优先用 Agent 侧算好的 request 级分解（与自动压缩
+                                    // 阈值同源）；本会话还没发过模型请求时才退回
+                                    // messages-only 估算。
+                                    let audit = if sess.context_audit.total() > 0 {
+                                        Some(sess.context_audit)
+                                    } else {
+                                        None
+                                    };
+                                    let estimated = audit.map(|a| a.total()).unwrap_or_else(|| {
+                                        wyj_core::estimate_tokens(&sess.messages)
+                                    });
                                     (
-                                        wyj_core::context_edit::elided_count(&sess.messages) as u32,
-                                        sess.context_edit_freed_tokens,
-                                    ),
-                                    // 子 Agent 用量取自 Session 的累加器而非
-                                    // `state.sub_*`：后者只收 SubAgentEvent 的
-                                    // input/output，**不含 cache_read**，且
-                                    // `/resume` 后归零。子 Agent 的开销大头恰恰是
-                                    // 缓存命中，丢掉它 /cost 会少算一大截。
-                                    sess.sub_usage(),
-                                )
+                                        audit,
+                                        estimated,
+                                        sess.total_cache_read_tokens,
+                                        sess.total_cache_write_tokens,
+                                        sess.api_calls,
+                                        sess.prompt_cache_state,
+                                        sess.compact_count,
+                                        (
+                                            wyj_core::context_edit::elided_count(&sess.messages)
+                                                as u32,
+                                            sess.context_edit_freed_tokens,
+                                        ),
+                                        // 子 Agent 用量取自 Session 的累加器而非
+                                        // `state.sub_*`：后者只收 SubAgentEvent 的
+                                        // input/output，**不含 cache_read**，且
+                                        // `/resume` 后归零。子 Agent 的开销大头恰恰是
+                                        // 缓存命中，丢掉它 /cost 会少算一大截。
+                                        sess.sub_usage(),
+                                    )
+                                }
+                                None => {
+                                    // 回合进行中：session 被回合 task 整段持锁，这里必须
+                                    // **降级而不是 continue**——continue 等于命令根本不执行，
+                                    // 用户按 `/model` 会看到一句"会话忙"却什么也没发生。
+                                    //
+                                    // 走到这里的只有 `runs_while_busy` 白名单命令（面板类），
+                                    // 它们不读这些统计字段；读统计的 `/cost`、`/context`
+                                    // 不在白名单内，因此不会静默拿到一份失真的数据。
+                                    // 压缩次数是 AppState 上的运行期计数，回合期间也准。
+                                    (
+                                        None,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        state.compact_count,
+                                        (0, 0),
+                                        wyj_core::session::SubUsage::default(),
+                                    )
+                                }
                             };
                             let cmd_ctx = CommandContext {
                                 cwd: cwd.clone(),
@@ -19240,7 +19391,15 @@ async fn tui_main(
                             }
                         }
                     } else if key.code == KeyCode::Enter && state.is_thinking {
-                        // Agent 忙碌期间提交 → 排队，不打断当前操作
+                        // Agent 忙碌期间提交 → 排队，不打断当前操作。
+                        //
+                        // 面板类 slash 命令**不会落到这里**：它们在上面的 Enter 分支
+                        // 就被 `draft_runs_while_busy` 拦去正常 dispatch 了。所以本分支
+                        // 里的内容一定是"要发给模型的正文"，`/` 开头也不例外——
+                        // 非白名单命令（`/cost`、`/clear`、`/bug`…）按字面排队，
+                        // 这与空闲时 `dispatch` 返回未知命令的行为不同，是刻意的：
+                        // 排队只是"晚点执行"，不会丢内容。
+                        //
                         if !input.is_empty()
                             || !state.pending_attachments.is_empty()
                             || !state.pending_pastes.is_empty()
