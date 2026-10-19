@@ -94,6 +94,18 @@ todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**�
                                 # schema，模型目录里看不到它。简单任务为主、
                                 # 或用强模型跑短任务时设 false 更划算。
 
+[ui]                            # TUI 展示区交互（v0.3.10+）
+mouse_capture = true           # 是否开启鼠标报告（DEC 1000/1002/1006），让滚轮与
+                                # 拖拽事件进入应用。**默认开启**。
+                                # 为什么必须开：alternate screen 里终端没有自己的滚动条，
+                                # 滚轮能否滚动取决于应用是否收到鼠标事件；而 macOS
+                                # Terminal.app 不支持 DEC mode 1007（alternate screen
+                                # 滚轮转方向键），不开捕获时滚轮**完全没反应**。
+                                # 代价：终端原生拖选复制需按住 Option（Cmd+C 不受影响）。
+                                # 运行时可用 /mouse 切换，不写回配置文件。
+scrollbar = true               # 内容区右侧是否绘制应用内细滚动条（│ / ┃，less/vim 观感）。
+                                # 只在内容超出视口时出现，宽度 < 3 列的终端不画。
+
 [context_edit]                   # tool-result context editing（v0.2.26+）：
                                 # 超阈值时先把过期工具输出外部化到 CAS，
                                 # **清理优先于整段摘要**（对齐 Claude Code 的

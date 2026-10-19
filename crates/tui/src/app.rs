@@ -6523,6 +6523,11 @@ mod navigation_focus_tests {
             KeyCode::Up,
             KeyModifiers::SHIFT,
         )));
+        // 终端可能把额外修饰位一起报上来，不能因为多一位就漏掉。
+        assert!(is_content_focus_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::SHIFT | KeyModifiers::META,
+        )));
         assert!(!is_content_focus_key(KeyEvent::new(
             KeyCode::Up,
             KeyModifiers::NONE,
@@ -6535,6 +6540,40 @@ mod navigation_focus_tests {
             KeyCode::Up,
             KeyModifiers::CONTROL,
         )));
+        // 带 Ctrl/Alt/Cmd 的组合不抢系统快捷键
+        for extra in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert!(!is_content_focus_key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::SHIFT | extra,
+            )));
+        }
+    }
+
+    /// 从聊天区滚动态按 Shift+↑ 必须还能跳到正在跑的子 Agent。
+    ///
+    /// `UiFocus::Chat` 是「滚动过聊天区」的常态焦点，旧实现把它当成「已在
+    /// 内容区」直接早退，于是子 Agent 在跑也进不去。
+    #[test]
+    fn shift_up_from_chat_focus_still_enters_running_sub_agent() {
+        let mut state = make_state();
+        state
+            .messages
+            .push(ChatMessage::user("message".to_string()));
+        state
+            .sub_agents
+            .insert(9, sub_agent(SubAgentStatus::Running));
+        state.ui_focus = UiFocus::Chat;
+        state.chat_scroll = 3;
+        state.chat_max_scroll = 10;
+        state.chat_follow_tail = false;
+
+        assert!(state.enter_content_focus());
+        assert_eq!(state.ui_focus, UiFocus::SubAgents);
+        assert_eq!(state.selected_sub_agent, Some(9));
     }
 
     fn todo(id: &str, status: TodoStatus) -> wyj_tools::todo::TodoItem {
@@ -7296,8 +7335,18 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
             || key.modifiers.contains(KeyModifiers::SUPER))
 }
 
+/// 从输入框进入内容区的快捷键：`Shift+↑`。
+///
+/// 用 `contains(SHIFT)` + 排除其余修饰键，而不是 `modifiers == SHIFT`：部分
+/// 终端（macOS Terminal.app 在开启鼠标报告后、iTerm2 的某些配置）会把 Shift
+/// 与 Caps Lock/Num Lock 之类的锁定位一起报上来，严格相等会把这类事件漏掉，
+/// 表现为「按了没反应」。带 Ctrl/Alt/Cmd 的组合仍不触发，免得抢系统快捷键。
 fn is_content_focus_key(key: KeyEvent) -> bool {
-    key.code == KeyCode::Up && key.modifiers == KeyModifiers::SHIFT
+    key.code == KeyCode::Up
+        && key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 /// 单行文字直接留在输入框即可；只有真正包含换行的批量粘贴才需要瞬时提示。
@@ -8866,6 +8915,13 @@ pub struct AppState {
     pub chat_follow_tail: bool,
     /// 是否有新消息在用户查看历史时到达。
     pub unseen_messages: bool,
+    /// 是否开启鼠标报告（滚轮/拖拽进入应用）。见 `config::UiCfg::mouse_capture`。
+    ///
+    /// 主循环每帧比对它与「已应用到终端的值」，变化时发开/关序列；`/mouse`
+    /// 只改这里，不写回配置文件。
+    pub mouse_capture: bool,
+    /// 是否在内容区右侧绘制应用内滚动条（见 `config::UiCfg::scrollbar`）。
+    pub show_scrollbar: bool,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     /// 最近一次模型往返的时延画像，由 `AgentEvent::TurnDone` 从 session 带回来，
@@ -9149,6 +9205,8 @@ impl AppState {
             chat_max_scroll: 0,
             chat_follow_tail: true,
             unseen_messages: false,
+            mouse_capture: config.ui.mouse_capture,
+            show_scrollbar: config.ui.scrollbar,
             total_input_tokens: 0,
             session_latency: wyj_core::session::TurnLatency::default(),
             total_output_tokens: 0,
@@ -10023,8 +10081,12 @@ impl AppState {
 
     /// 从输入框显式进入内容区。优先选择离输入框最近且当前可见的运行中 SubAgent
     /// 面板，其次是内联 Todo，最后是聊天区底部。
+    ///
+    /// **`UiFocus::Chat` 不算「已经进入」**：滚动聊天区（PageUp/滚轮）会把焦点
+    /// 留在 Chat，若这里早退，用户在「滚过聊天区之后」按 Shift+↑ 就永远跳不到
+    /// 正在跑的子 Agent 面板——这正是「Shift+↑ 没反应」的第二个根因。
     fn enter_content_focus(&mut self) -> bool {
-        if self.content_focus_active() {
+        if self.content_focus_active() && self.ui_focus != UiFocus::Chat {
             return true;
         }
 
@@ -12055,18 +12117,45 @@ fn await_quit_key_release(wheel_routing: TerminalWheelRouting) {
     }
 }
 
-/// 进入全屏 TUI，但明确关闭鼠标捕获：鼠标由终端原生处理，用户可直接拖选文字，
-/// 不需要按住 Shift/Option，松开修饰键后选区也不会被应用鼠标事件立即冲掉。
+/// 鼠标报告模式：只开「按下/抬起 + 拖拽 + SGR 坐标」，**刻意不开 1003**。
+///
+/// - `1000h` 普通按钮跟踪：滚轮与点击都能上报；
+/// - `1002h` 拖拽跟踪：按住左键移动（未来做拖选/滚动条拖动的基础）；
+/// - `1006h` SGR 坐标：列号 > 223 时仍准确（旧的 X10 编码会在宽终端截断）。
+///
+/// 为什么不开 `1003h`（全移动上报）：触控板轻微移动就会持续产生事件，主循环
+/// 每个事件重绘一帧，等于把 CPU 拖满。当前需求只有滚轮，没有悬停高亮。
+const ENABLE_WHEEL_MOUSE_REPORTING: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+
+/// 按需开关鼠标报告。`false` 走 crossterm 的 `DisableMouseCapture`（幂等，
+/// 连 1003 一起关），保证从「开启」退回「关闭」时没有残留模式。
+fn set_mouse_capture<W: Write>(writer: &mut W, enabled: bool) -> io::Result<()> {
+    if enabled {
+        // 先全部关一遍再按需打开：`/mouse` 反复切换时不会把 1003 之类的
+        // 历史残留模式留在终端里。
+        execute!(
+            writer,
+            DisableMouseCapture,
+            Print(ENABLE_WHEEL_MOUSE_REPORTING)
+        )
+    } else {
+        execute!(writer, DisableMouseCapture)
+    }
+}
+
+/// 进入全屏 TUI。
+///
+/// `mouse_capture` 为 false 时明确关闭鼠标捕获：鼠标由终端原生处理，用户可
+/// 直接拖选文字，不需要按住 Shift/Option。为 true 时开启最小鼠标报告
+/// （见 [`ENABLE_WHEEL_MOUSE_REPORTING`]），滚轮事件才会送进应用——这是
+/// macOS Terminal.app 下唯一能滚动的途径（它不支持 DEC mode 1007）。
 fn enter_terminal_screen<W: Write>(
     writer: &mut W,
     wheel_routing: TerminalWheelRouting,
+    mouse_capture: bool,
 ) -> io::Result<()> {
-    execute!(
-        writer,
-        EnableBracketedPaste,
-        DisableMouseCapture,
-        EnterAlternateScreen
-    )?;
+    execute!(writer, EnableBracketedPaste, EnterAlternateScreen)?;
+    set_mouse_capture(writer, mouse_capture)?;
     match wheel_routing {
         TerminalWheelRouting::GhosttyKeyReleases => execute!(
             writer,
@@ -12256,7 +12345,8 @@ mod terminal_screen_tests {
     #[test]
     fn startup_disables_mouse_capture_for_direct_terminal_selection() {
         let mut output = Vec::new();
-        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
+        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases, false)
+            .unwrap();
 
         for disabled_mode in [
             b"\x1b[?1000l".as_slice(),
@@ -12298,12 +12388,59 @@ mod terminal_screen_tests {
         assert!(contains_bytes(&output, b"\x1b[?1049l"));
     }
 
+    /// 开启鼠标捕获时只发「按下/抬起 + 拖拽 + SGR」三种模式。
+    ///
+    /// 1003（全移动上报）**必须缺席**：触控板轻微移动就会持续产生事件，
+    /// 主循环每个事件重绘一帧。这条钉子防止有人图省事直接抄 crossterm 的
+    /// `EnableMouseCapture`（它把 1000/1002/1003/1015/1006 全打开）。
+    #[test]
+    fn mouse_capture_enables_only_wheel_and_drag_reporting() {
+        let mut output = Vec::new();
+        enter_terminal_screen(
+            &mut output,
+            TerminalWheelRouting::SuppressSyntheticArrows,
+            true,
+        )
+        .unwrap();
+
+        for enabled_mode in [
+            b"\x1b[?1000h".as_slice(),
+            b"\x1b[?1002h".as_slice(),
+            b"\x1b[?1006h".as_slice(),
+        ] {
+            assert!(
+                contains_bytes(&output, enabled_mode),
+                "开启鼠标捕获必须打开该模式: {output:?}"
+            );
+        }
+        assert!(
+            !contains_bytes(&output, b"\x1b[?1003h"),
+            "不得开启 1003 全移动上报（触控板会打满主循环）: {output:?}"
+        );
+
+        // 关闭时把三个模式全部收回，不残留。
+        output.clear();
+        set_mouse_capture(&mut output, false).unwrap();
+        for disabled_mode in [
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1002l".as_slice(),
+            b"\x1b[?1003l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+        ] {
+            assert!(
+                contains_bytes(&output, disabled_mode),
+                "关闭鼠标捕获必须收回该模式: {output:?}"
+            );
+        }
+    }
+
     #[test]
     fn external_editor_handoff_pops_and_restores_tui_keyboard_protocols() {
         let mut output = Vec::new();
         leave_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
         let resume_at = output.len();
-        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases).unwrap();
+        enter_terminal_screen(&mut output, TerminalWheelRouting::GhosttyKeyReleases, false)
+            .unwrap();
 
         let suspended = &output[..resume_at];
         assert!(contains_bytes(suspended, b"\x1b[<1u"));
@@ -12319,7 +12456,12 @@ mod terminal_screen_tests {
     #[test]
     fn unsupported_terminal_suppresses_alternate_scroll_arrow_translation() {
         let mut output = Vec::new();
-        enter_terminal_screen(&mut output, TerminalWheelRouting::SuppressSyntheticArrows).unwrap();
+        enter_terminal_screen(
+            &mut output,
+            TerminalWheelRouting::SuppressSyntheticArrows,
+            false,
+        )
+        .unwrap();
         assert!(contains_bytes(
             &output,
             SAVE_AND_DISABLE_ALTERNATE_SCROLL.as_bytes()
@@ -12498,13 +12640,15 @@ pub async fn run_tui(
     // 结构上不会撞上 Inline 撑满高度时那个 tmux/部分终端下的光标查询竞态
     // （历史教训见 crates/tui/CLAUDE.md）。聊天区因此天然贴着窗口顶部铺开、
     // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
-    // 历史消息永远留在 `AppState.messages`，由 PageUp/PageDown 与终端滚轮分流
-    // 后的内容滚动入口翻看；滚轮绝不得进入 Composer 输入历史。
-    // 鼠标捕获必须保持关闭，让终端原生拖选/复制无需 Shift 且选区能在松键后保留。
-    // 回复链接继续通过 OSC 8 交给终端处理 Command/Ctrl+点击；事件分支只作为某些
-    // 终端仍主动上报修饰键点击时的防御性兜底，不为此开启鼠标报告模式。
+    // 历史消息永远留在 `AppState.messages`，由 PageUp/PageDown 与滚轮驱动的内容
+    // 滚动入口翻看；滚轮绝不得进入 Composer 输入历史。
+    // 鼠标捕获是否开启由 `[ui].mouse_capture` 决定（默认开）：alternate screen 里
+    // 终端没有自己的滚动条，macOS Terminal.app 又不支持 DEC mode 1007，不开捕获
+    // 时滚轮**完全不会送达应用**。开启的代价是拖选复制需按住 Option；`/mouse`
+    // 与配置项都能退回。链接继续通过 OSC 8 交给终端处理 Command/Ctrl+点击。
     let wheel_routing = TerminalWheelRouting::detect();
-    enter_terminal_screen(&mut stdout, wheel_routing)?;
+    let initial_mouse_capture = config.ui.mouse_capture;
+    enter_terminal_screen(&mut stdout, wheel_routing, initial_mouse_capture)?;
     // 标记已进入 alternate screen：panic hook 据此决定是否还原终端。
     // 见 `crates/tui/src/panic_guard.rs`。
     crate::panic_guard::mark_active();
@@ -12704,6 +12848,7 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     terminal: &mut Terminal<B>,
     path: &std::path::Path,
     wheel_routing: TerminalWheelRouting,
+    mouse_capture: bool,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -12721,7 +12866,7 @@ async fn open_path_in_editor<B: ratatui::backend::Backend + std::io::Write>(
     .await;
 
     enable_raw_mode()?;
-    enter_terminal_screen(terminal.backend_mut(), wheel_routing)?;
+    enter_terminal_screen(terminal.backend_mut(), wheel_routing, mouse_capture)?;
     terminal.clear()?;
 
     match status {
@@ -14262,8 +14407,16 @@ async fn tui_main(
     let mut mcp_tool_names: Vec<String> = Vec::new();
     // 让下面第一次判断立刻成立（否则首帧被节流挡掉，MCP 工具要等 1 秒才出现）。
     let mut last_external_refresh = Instant::now() - EXTERNAL_REFRESH_INTERVAL;
+    // 已经应用到终端的鼠标报告状态。`/mouse` 只改 `state.mouse_capture`，
+    // 这里每帧比对后发一次终端序列——幂等，且不必在命令分支里持有 backend。
+    let mut applied_mouse_capture = state.mouse_capture;
 
     loop {
+        if state.mouse_capture != applied_mouse_capture {
+            set_mouse_capture(terminal.backend_mut(), state.mouse_capture)?;
+            applied_mouse_capture = state.mouse_capture;
+        }
+
         // Ctrl+C 首次按下超过 3 秒未确认则重置
         if let Some(t) = state.last_ctrl_c {
             if t.elapsed() > Duration::from_secs(3) {
@@ -15638,9 +15791,13 @@ async fn tui_main(
                                 };
                                 match action {
                                     MemoryRowAction::Open(path) => {
-                                        let result =
-                                            open_path_in_editor(terminal, &path, wheel_routing)
-                                                .await;
+                                        let result = open_path_in_editor(
+                                            terminal,
+                                            &path,
+                                            wheel_routing,
+                                            state.mouse_capture,
+                                        )
+                                        .await;
                                         if let Some(dialog) = &mut state.memory_dialog {
                                             match result {
                                                 Ok(()) => dialog.error = None,
@@ -17364,6 +17521,28 @@ async fn tui_main(
                         continue;
                     }
 
+                    // 输入框 → 内容区的显式入口。必须排在补全列表拦截**之前**：
+                    // 补全列表开着时裸 ↑ 归补全，但 Shift+↑ 是「进内容区」的
+                    // 专用键，被补全分支 `continue` 吃掉的话用户按了没反应。
+                    // 更上层的模态面板（Session Picker / input_owner / 各类 dialog）
+                    // 都已先拦截，不会被这里抢键。
+                    //
+                    // `Chat` 焦点只有在下方面板真的存在时才抢键：否则「正在滚动
+                    // 历史时按 Shift+↑」会突然跳到会话末尾（`focus_chat_edge`），
+                    // 那不是用户按这个组合的意图。
+                    let shift_up = is_content_focus_key(key);
+                    let chat_has_panel_below = state.ui_focus == UiFocus::Chat
+                        && (state.has_running_sub_agents()
+                            || state
+                                .current_todos
+                                .as_deref()
+                                .is_some_and(|items| !items.is_empty())
+                            || state.has_running_shells());
+                    if shift_up && (!state.content_focus_active() || chat_has_panel_below) {
+                        let _ = state.enter_content_focus();
+                        continue;
+                    }
+
                     // ② @ 文件选取器拦截 ↑/↓/Tab/Enter/Esc
                     if !state.file_completions.is_empty() {
                         let fc_len = state.file_completions.len();
@@ -17435,13 +17614,7 @@ async fn tui_main(
                         }
                     }
 
-                    // 输入框 → 内容区的显式入口。补全列表、配置输入框和各类模态面板
-                    // 都在更高优先级已经拦截，因此不会被这里抢键。
-                    let shift_up = is_content_focus_key(key);
-                    if shift_up && !state.content_focus_active() {
-                        let _ = state.enter_content_focus();
-                        continue;
-                    }
+                    // 输入框 → 内容区的显式入口已在补全列表之前处理（见上）。
 
                     // 内容区获得焦点后，普通 ↑/↓ 用于连续导航：Chat、Todo、
                     // SubAgent 在各自边界自然跨区；TodoDetail 内则改为逐行滚动。
@@ -18881,6 +19054,18 @@ async fn tui_main(
                                             .map(|m| m.content.clone());
                                         state.schedule_dialog =
                                             Some(ScheduleDialog::new(&state.cwd, last_user_prompt));
+                                    }
+                                    Ok(CommandResult::ToggleMouseCapture) => {
+                                        // 只翻转状态：真正写终端的序列由主循环每帧比对后发，
+                                        // 命令分支不持有 backend，也就不可能和绘制交错。
+                                        state.mouse_capture = !state.mouse_capture;
+                                        state.messages.push(ChatMessage::system(
+                                            if state.mouse_capture {
+                                                wyj_i18n::tr("mouse.on")
+                                            } else {
+                                                wyj_i18n::tr("mouse.off")
+                                            },
+                                        ));
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;
