@@ -12,12 +12,10 @@ use wyj_core::{
     ExecutionSurface, HistoryEntry, HistoryStore, HookRunner, MemoryStore, MemoryV3Store, Session,
     SessionFile, SessionFileMeta, SessionStore, SummaryGenerator, ToolEvent,
 };
-use wyj_tools::{
-    AskQuestionTool, MemoryTool, PermissionMode, SubAgentTool, TodoStore, TodoWriteTool, ToolCtx,
-    ToolRegistry,
-};
+use wyj_tools::{MemoryTool, PermissionMode, TodoStore, ToolCtx, ToolRegistry};
 
 mod acp;
+mod assembly;
 mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
@@ -1700,17 +1698,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 始终注册全部工具（模式过滤在运行时由 ToolCtx.permission_mode 负责，支持运行时切换）
-    let mut registry = ToolRegistry::standard();
-    registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
-    if let Some(memory) = &memory_v3_store {
-        registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
-        // CAS 可用时必须注册 ContextRecall：否则被外部化的工具输出对模型
-        // 就是不可逆的损失（尤其 Bash / WebFetch 重跑也拿不回）。
-        if let Some(t) = wyj_tools::context_recall::tool_for_cas(workspace_cas.clone()) {
-            registry.register_arc(Arc::new(t));
-        }
-    }
+    // 工具注册表**整体**由 `assembly::build_tool_registry` 构造，见下方
+    // sub_agent_factory 就绪之后的那一处调用。分散在这里逐个 register 的旧写法
+    // 与 `/model` 重建路径那份拷贝曾经长期各自演化（`with_max_depth` 就只在
+    // 首建侧存在），现在收敛到单一函数。
+    //
+    // 工具注册表在 sub_agent_factory 就绪后由 `assembly::build_tool_registry` 一次性
+    // 构造（见下方）。模式过滤在运行时由 ToolCtx.permission_mode 负责，支持热切换。
+    // 始终注册全部工具：模式不影响「注册哪些」，只影响「调用时是否放行」。
 
     // 初始工具上下文权限（headless/single-shot 模式用；TUI 模式在 spawn 闭包内动态创建）
     let mut tool_ctx = ToolCtx::new(&cwd);
@@ -1806,22 +1801,15 @@ async fn main() -> Result<()> {
     // 工具不产生 schema，模型目录里根本看不到，模型也就不会浪费 LLM 往返去更新它。
     // todo_store 仍无条件构造并向下传递：TUI 的 TodoUpdate 事件链路要读它，
     // 且开启开关后的 rebuild_fn 复用同一个 store。
-    if cfg.tools.todo_enabled {
-        registry.register_arc(Arc::new(TodoWriteTool::new(todo_store.clone())));
-    }
-    registry.register_arc(Arc::new(AskQuestionTool::new()));
+    // 注册动作在下面 `build_tool_registry` 里按 `[tools].todo_enabled` 门控。
 
-    // WebSearch：仅当配置了搜索 API Key 时注册（否则模型看不到该工具，避免误调）
-    if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
-        registry.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
-    }
-    // computer-use：仅 macOS/Windows + vision profile + Anthropic provider；
-    // 返回值决定下面是否追加 COMPUTER_USE_HINT（教模型用 Bash 启动应用）
-    let computer_use_enabled = register_computer_tool_if_enabled(&mut registry, &cfg);
-    // WindowCapture：独立工具，注册门槛与 computer-use 完全一致（同样要把
-    // 截图作为 image block 塞进 tool_result），见该函数文档。
-    register_window_capture_tool_if_enabled(&mut registry, &cfg);
-    register_app_computer_tool_if_enabled(&mut registry, &cfg);
+    // computer-use 是否启用：注册动作同样在下面统一做，这里只需要结果决定是否
+    // 追加 COMPUTER_USE_HINT（教模型用 Bash 启动应用）。先空跑一次注册函数拿到
+    // 判定，避免为了一个 bool 把整个注册顺序提前。
+    let computer_use_enabled = {
+        let mut probe = ToolRegistry::standard();
+        register_computer_tool_if_enabled(&mut probe, &cfg)
+    };
 
     // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
     // + 已启用插件贡献的 agent 定义 + --plugin-dir 临时加载的 agent 定义
@@ -1870,22 +1858,30 @@ async fn main() -> Result<()> {
         evolution_store.clone(),
         workspace_cas.clone(),
     );
-    registry.register_arc(Arc::new({
-        let mut tool =
-            SubAgentTool::new_shared(shared_agent_defs.clone(), sub_agent_hub.clone(), {
-                let f = sub_agent_factory.clone();
-                move |def| f(def)
-            })
-            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-            .with_session_id(session_id.clone())
-            .with_max_depth(cfg.subagent.max_depth)
-            // 交接物落盘根目录：与 trace 同一个 `sessions/`，文件名后缀不同。
-            .with_sessions_dir(config_base.join("sessions"));
-        if let Some(log) = sub_agent_message_log.clone() {
-            tool = tool.with_message_log(log);
-        }
-        tool
-    }));
+    // 工具注册表在此**一次性**构造完毕：首建与 `/model` 重建共用
+    // `assembly::build_tool_registry`，保证两条路径看到的工具集合逐字一致。
+    let computer_registrars = assembly::ComputerRegistrars {
+        computer: register_computer_tool_if_enabled,
+        window_capture: register_window_capture_tool_if_enabled,
+        app_computer: register_app_computer_tool_if_enabled,
+    };
+    let registry_deps = assembly::RegistryDeps {
+        cfg: &cfg,
+        code_index: code_index.clone(),
+        memory_v3: memory_v3_store.clone(),
+        workspace_cas: workspace_cas.clone(),
+        todo_store: todo_store.clone(),
+        agent_defs: shared_agent_defs.clone(),
+        sub_agent_hub: sub_agent_hub.clone(),
+        sub_agent_factory: sub_agent_factory.clone(),
+        session_id: session_id.clone(),
+        sessions_dir: config_base.join("sessions"),
+        message_log: sub_agent_message_log.clone(),
+        mcp_tools: mcp_tools.clone(),
+    };
+    // `mut`：MCP server 是异步连上的，连上一个就往共享快照和注册表各登记一次
+    // （重建路径则是在重建那一刻读快照，两条路径的终态一致）。
+    let mut registry = assembly::build_tool_registry(&registry_deps, &computer_registrars);
 
     // -p（单次问答）模式：仍在启动时连接 MCP server，但只等一个远小于
     // `MCP_CONNECT_TIMEOUT` 的宽限期（见 `MCP_STARTUP_GRACE`）——`-p` 是真正的
@@ -2087,60 +2083,37 @@ async fn main() -> Result<()> {
         agent = agent.append_system(wyj_core::prompts::NON_INTERACTIVE);
     }
 
-    agent = agent
-        .with_claude_md(claude_md_loader.clone())
-        .with_hooks(hook_runner.clone());
-
-    if let Some(store) = &checkpoint_store {
-        agent = agent.with_checkpoint_store(store.clone());
-    }
-
-    if let Some(mem) = memory_store {
-        agent = agent.with_memory(mem);
-    }
-    if let Some(memory) = memory_v3_store {
-        agent = agent.with_memory_v3(memory);
-    }
-    if let Some(evolution) = evolution_store {
-        agent = agent.with_evolution(evolution);
-    }
-    agent =
-        agent.with_capability_cache(Some(Arc::new(wyj_api::CapabilityCache::new(&config_base))));
-    // runtime ContentBlock 截断兜底：把 `cfg.persist_cap` 注入 Agent，
-    // 在每次 `provider.stream()` 之前按同一上限（与 `SessionStore::save`
-    // / `SessionStore::load` 共用）对 `session.messages` 做截断，防止长
-    // `ContentBlock::Text` / `ToolResult` 撞穿模型上下文窗口。
     // 进程级累计统计：Agent 被 `/model` 重建后仍能延续同一份数字。
     let context_edit_totals =
         std::sync::Arc::new(wyj_core::context_edit::ContextEditTotals::default());
-    agent = agent.with_persist_cap(Some(cfg.persist_cap.clone()));
-    // tool-result context editing：超阈值时先把过期工具输出外部化到 CAS，
-    // 清理得动就不跑整段摘要。CAS 不可用（目录不可写）时整体降级关闭。
-    agent = agent.with_context_edit(build_context_edit_cfg(
-        &cfg,
-        workspace_cas.clone(),
-        context_edit_totals.clone(),
-    ));
-    // 编辑后自动校验：项目在 `.wyj-code/settings.json` 里声明了 `verify.command`
-    // 才生效，没声明则这里挂 None —— 一次子进程都不跑，对零配置项目零成本。
-    agent = agent.with_verify(wyj_core::verify::load_verify_cfg(&cwd));
+    let capability_cache = Arc::new(wyj_api::CapabilityCache::new(&config_base));
 
-    for def in registry.definitions() {
-        let name = def.name.clone();
-        if let Some(t) = registry.get(&name) {
-            agent.register_tool(t);
-        }
+    // 配置尾部与 `/model` 重建共用 `assembly::SharedAgentConfig`：两条路径此前
+    // 各自维护一份，漏掉任何一项都不是编译错误而是「切个模型后静默降级」。
+    agent = assembly::SharedAgentConfig {
+        cfg: &cfg,
+        cwd: &cwd,
+        claude_md: claude_md_loader.clone(),
+        hooks: hook_runner.clone(),
+        checkpoint_store: checkpoint_store.clone(),
+        memory_store: memory_store.clone(),
+        memory_v3: memory_v3_store.clone(),
+        evolution: evolution_store.clone(),
+        capability_cache: capability_cache.clone(),
+        // tool-result context editing：超阈值时先把过期工具输出外部化到 CAS，
+        // 清理得动就不跑整段摘要。CAS 不可用（目录不可写）时整体降级关闭。
+        context_edit: build_context_edit_cfg(
+            &cfg,
+            workspace_cas.clone(),
+            context_edit_totals.clone(),
+        ),
+        // 已在上面按首建顺序追加过（Plan / computer-use / TodoWrite 三段），
+        // 这里传 None 避免二次 append。
+        plugin_output_style: None,
     }
-    if enable_lazy_tool_schemas {
-        agent.enable_lazy_tools(
-            ["Read", "Glob", "Grep", "AskQuestion", "Memory"]
-                .into_iter()
-                .map(str::to_string),
-            cfg.model_runtime.lazy_tools_threshold,
-            cfg.model_runtime.lazy_tools_top_k,
-            cfg.model_runtime.lazy_tools_sticky_turns,
-        );
-    }
+    .apply(agent);
+
+    assembly::attach_tools(&mut agent, &registry, &cfg, enable_lazy_tool_schemas);
 
     // headless/single-shot 模式：子 Agent 进度以纯文本行打印到 stderr
     if cli.headless || cli.prompt.is_some() {
@@ -2302,6 +2275,9 @@ async fn main() -> Result<()> {
     let mcp_tools_for_rebuild = mcp_tools.clone();
     let workspace_cas_for_rebuild = workspace_cas.clone();
     let context_edit_totals_for_rebuild = context_edit_totals.clone();
+    // 首建与重建共用同一个 CapabilityCache 实例：它缓存模型能力探测结果，重建
+    // 换模型后仍能命中已探过的条目，也不必重复读 catalog。
+    let capability_cache_for_rebuild = Arc::new(wyj_api::CapabilityCache::new(&config_base));
     let code_index_for_rebuild = code_index.clone();
     let plugin_output_style_for_rebuild = plugin_output_style.clone();
     // rebuild_fn 必须注入 skill 名单：`/model` 热切换与设置面板保存都会重建
@@ -2331,62 +2307,59 @@ async fn main() -> Result<()> {
             new_model,
             &wyj_i18n::resolve_locale(cfg.language.as_deref()),
         );
-        let mut new_agent = Agent::new(provider)
-            .with_system(wyj_core::prompts::main_system_prompt(&env_info))
-            .with_skills(collect_skill_entries(
+        let mut new_agent = Agent::new(provider);
+        new_agent = assembly::AgentCoreConfig {
+            env_info,
+            // rebuild_fn 必须注入 skill 名单：`/model` 热切换与设置面板保存都会
+            // 重建 Agent，不注入的话 `{skills}` 占位会残留、模型重新变回「我不知道
+            // 有哪些 skill」。
+            //
+            // **在闭包内重算**而不是捕获首建那一份（v0.2.28 修正）：捕获的是不可变
+            // 快照，`/skills` 面板 enable/disable、项目级 skill 信任批准之后重建
+            // 都刷不到新名单——会出现「斜杠能敲、模型永远不知道」的不一致。
+            skills: collect_skill_entries(
                 &skill_home_for_rebuild,
                 &cwd_for_rebuild,
                 local_plugin_for_rebuild.as_ref(),
-            ))
-            .with_git_snapshot(wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild))
-            // 必须与上面 EnvInfo 一起重算，否则 /config 热切 language 只换 UI
-            // 文案，尾部提醒还挂着旧语言。
-            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-            .with_max_tokens(cfg.active_profile().max_tokens)
-            .with_context_window(cfg.active_profile().context_window)
-            .with_max_turns(cfg.agent.max_turns)
-            .with_model_capabilities(model_capabilities)
-            .with_route_identity(
-                cfg.active_profile().name.clone(),
-                model_resolution.identity.vendor,
-                new_model.to_string(),
-            )
-            .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
-            .with_thinking(
-                cfg.active_profile().thinking_budget,
-                cfg.active_profile().interleaved_thinking,
-            )
-            .with_reasoning_effort(cfg.active_profile().effective_reasoning_effort())
-            .with_thinking_switch(cfg.active_profile().effective_thinking_switch())
-            .with_claude_md(claude_md_for_rebuild.clone())
-            .with_hooks(hook_runner_for_rebuild.clone());
-        if let Some(style) = &plugin_output_style_for_rebuild {
-            new_agent = new_agent.append_system(style.clone());
+            ),
+            locale: wyj_i18n::resolve_locale(cfg.language.as_deref()),
+            git_snapshot: wyj_core::prompts::git_status_snapshot(&cwd_for_rebuild),
+            max_tokens: cfg.active_profile().max_tokens,
+            context_window: cfg.active_profile().context_window,
+            max_turns: cfg.agent.max_turns,
+            capabilities: model_capabilities,
+            route_profile: cfg.active_profile().name.clone(),
+            route_vendor: model_resolution.identity.vendor,
+            model_name: new_model.to_string(),
+            fallback_routes,
+            cross_provider_fallback: cfg.routing.cross_provider_fallback,
+            thinking_budget: cfg.active_profile().thinking_budget,
+            interleaved_thinking: cfg.active_profile().interleaved_thinking,
+            reasoning_effort: cfg.active_profile().effective_reasoning_effort(),
+            thinking_switch: cfg.active_profile().effective_thinking_switch(),
         }
-        if let Some(store) = &checkpoint_store_for_rebuild {
-            new_agent = new_agent.with_checkpoint_store(store.clone());
-        }
-        // runtime ContentBlock 截断兜底：`/model` 重建 agent 时同样把
-        // `cfg.persist_cap` 注入,确保切换 Profile 后仍按同一上限守住
-        // 单次 stream 不会撞穿模型上下文窗口。
-        new_agent = new_agent.with_persist_cap(Some(cfg.persist_cap.clone()));
-        new_agent = new_agent.with_context_edit(build_context_edit_cfg(
+        .apply(new_agent);
+        // 配置尾部（persist cap / context editing / verify / 三个 store /
+        // capability cache）与首建走同一个函数：`/model` 热切换漏掉任何一项都不会
+        // 有任何报错，只会在切换之后静默降级。
+        new_agent = assembly::SharedAgentConfig {
             cfg,
-            workspace_cas_for_rebuild.clone(),
-            context_edit_totals_for_rebuild.clone(),
-        ));
-        // `/model` 热切换会重建 Agent，漏掉这里会让「项目声明了 verify 但切个
-        // 模型就没了校验」——而且只在切换之后才犯，最难复现。
-        new_agent = new_agent.with_verify(wyj_core::verify::load_verify_cfg(&cwd_for_rebuild));
-        if let Some(mem) = &memory_store_for_rebuild {
-            new_agent = new_agent.with_memory(mem.clone());
+            cwd: &cwd_for_rebuild,
+            claude_md: claude_md_for_rebuild.clone(),
+            hooks: hook_runner_for_rebuild.clone(),
+            checkpoint_store: checkpoint_store_for_rebuild.clone(),
+            memory_store: memory_store_for_rebuild.clone(),
+            memory_v3: memory_v3_for_rebuild.clone(),
+            evolution: evolution_store_for_rebuild.clone(),
+            capability_cache: capability_cache_for_rebuild.clone(),
+            context_edit: build_context_edit_cfg(
+                cfg,
+                workspace_cas_for_rebuild.clone(),
+                context_edit_totals_for_rebuild.clone(),
+            ),
+            plugin_output_style: plugin_output_style_for_rebuild.clone(),
         }
-        if let Some(memory) = &memory_v3_for_rebuild {
-            new_agent = new_agent.with_memory_v3(memory.clone());
-        }
-        if let Some(evolution) = &evolution_store_for_rebuild {
-            new_agent = new_agent.with_evolution(evolution.clone());
-        }
+        .apply(new_agent);
         if let Some(store) = &store_for_rebuild {
             let title_provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
                 .unwrap_or_else(|e| {
@@ -2398,71 +2371,35 @@ async fn main() -> Result<()> {
                 .with_summary(gen)
                 .with_session_id(sid_for_rebuild.clone());
         }
-        let mut reg = ToolRegistry::standard();
-        reg.register_arc(Arc::new(wyj_core::CodeSearchTool::new(
-            code_index_for_rebuild.clone(),
-        )));
-        // 与初始 registry 同一道门控：`/model` 热切换与设置面板保存都走这里，
-        // 漏掉会让用户关了开关却仍然看得见工具（v0.2.22 Jev 事故同款）。
-        if cfg.tools.todo_enabled {
-            reg.register_arc(Arc::new(TodoWriteTool::new(todo_store_for_rebuild.clone())));
-        }
-        reg.register_arc(Arc::new(AskQuestionTool::new()));
-        if let Some(memory) = &memory_v3_for_rebuild {
-            reg.register_arc(Arc::new(MemoryTool::new(memory.clone())));
-            if let Some(t) =
-                wyj_tools::context_recall::tool_for_cas(workspace_cas_for_rebuild.clone())
-            {
-                reg.register_arc(Arc::new(t));
-            }
-        }
-        if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
-            reg.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
-        }
-        register_computer_tool_if_enabled(&mut reg, cfg);
-        register_window_capture_tool_if_enabled(&mut reg, cfg);
-        register_app_computer_tool_if_enabled(&mut reg, cfg);
-        for tool in mcp_tools_for_rebuild.read().unwrap().iter() {
-            reg.register_arc(tool.clone());
-        }
-        let sub_factory = make_sub_agent_factory(
-            cfg.clone(),
-            claude_md_for_rebuild.clone(),
-            mcp_tools_for_rebuild.clone(),
-            code_index_for_rebuild.clone(),
-            memory_v3_for_rebuild.clone(),
-            evolution_store_for_rebuild.clone(),
-            workspace_cas_for_rebuild.clone(),
+        // 工具注册表与首建走同一个 `build_tool_registry`：`/model` 之前这里是一份
+        // 独立拷贝，与首建各自演化出了差异（`with_max_depth` 只在首建侧存在、
+        // lazy 工具名单各写一份）。合成一处后「切个模型工具就变了」不再可能。
+        let reg = assembly::build_tool_registry(
+            &assembly::RegistryDeps {
+                cfg,
+                code_index: code_index_for_rebuild.clone(),
+                memory_v3: memory_v3_for_rebuild.clone(),
+                workspace_cas: workspace_cas_for_rebuild.clone(),
+                todo_store: todo_store_for_rebuild.clone(),
+                agent_defs: agent_defs_for_rebuild.clone(),
+                sub_agent_hub: hub_for_rebuild.clone(),
+                sub_agent_factory: make_sub_agent_factory(
+                    cfg.clone(),
+                    claude_md_for_rebuild.clone(),
+                    mcp_tools_for_rebuild.clone(),
+                    code_index_for_rebuild.clone(),
+                    memory_v3_for_rebuild.clone(),
+                    evolution_store_for_rebuild.clone(),
+                    workspace_cas_for_rebuild.clone(),
+                ),
+                session_id: sid_for_rebuild.clone(),
+                sessions_dir: config_base.join("sessions"),
+                message_log: message_log_for_rebuild.clone(),
+                mcp_tools: mcp_tools_for_rebuild.clone(),
+            },
+            &computer_registrars,
         );
-        reg.register_arc(Arc::new({
-            let mut tool = SubAgentTool::new_shared(
-                agent_defs_for_rebuild.clone(),
-                hub_for_rebuild.clone(),
-                move |def| sub_factory(def),
-            )
-            .with_response_language(wyj_i18n::resolve_locale(cfg.language.as_deref()))
-            .with_session_id(sid_for_rebuild.clone())
-            .with_sessions_dir(config_base.join("sessions"));
-            if let Some(log) = message_log_for_rebuild.clone() {
-                tool = tool.with_message_log(log);
-            }
-            tool
-        }));
-        for def in reg.definitions() {
-            if let Some(t) = reg.get(&def.name) {
-                new_agent.register_tool(t);
-            }
-        }
-        if enable_lazy_tool_schemas {
-            new_agent.enable_lazy_tools(
-                ["Read", "Glob", "Grep", "AskQuestion", "Memory"]
-                    .into_iter()
-                    .map(str::to_string),
-                cfg.model_runtime.lazy_tools_threshold,
-                cfg.model_runtime.lazy_tools_top_k,
-                cfg.model_runtime.lazy_tools_sticky_turns,
-            );
-        }
+        assembly::attach_tools(&mut new_agent, &reg, cfg, enable_lazy_tool_schemas);
         Ok(new_agent)
     });
 
@@ -3998,6 +3935,66 @@ async fn repl(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    /// 首建与 `/model` 重建必须给模型**同一个**工具集合。
+    ///
+    /// 这条不是「重构洁癖」：两条装配链历史上各自演化，`SubAgentTool` 的
+    /// `with_max_depth` 就只在首建侧存在——按一次 `/model`，子 Agent 嵌套深度
+    /// 静默退回默认值，全程无任何报错。现在两条路径共用
+    /// `assembly::build_tool_registry`，本测试把「共用」这件事本身钉住：
+    /// 任何一侧绕过它重新手写注册表，本测试立刻失败。
+    #[test]
+    fn assembly_registry_is_the_single_source_for_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Arc::new(
+            Config::load_file_only_at(&dir.path().join("config.toml")).unwrap_or_default(),
+        );
+
+        let deps = assembly::RegistryDeps {
+            cfg: cfg.as_ref(),
+            code_index: Arc::new(
+                wyj_core::ProjectCodeIndex::new(dir.path(), dir.path().join(".wyj-index")).unwrap(),
+            ),
+            memory_v3: None,
+            workspace_cas: None,
+            todo_store: Arc::new(Mutex::new(TodoStore::default())),
+            agent_defs: Arc::new(std::sync::RwLock::new(Vec::new())),
+            sub_agent_hub: Arc::new(wyj_tools::SubAgentHub::new()),
+            // 工厂只在子 Agent 真正派生时被调用；本测试只验工具注册表形状，
+            // 所以返回 Err 即可（派生前不会走到）。
+            sub_agent_factory: Arc::new(|_def: &wyj_core::AgentDefinition| {
+                Err::<Agent, anyhow::Error>(anyhow::anyhow!("test"))
+            }),
+            session_id: "sess".into(),
+            sessions_dir: dir.path().to_path_buf(),
+            message_log: None,
+            mcp_tools: Arc::new(std::sync::RwLock::new(Vec::new())),
+        };
+        let no_computers = assembly::ComputerRegistrars {
+            computer: |_reg, _cfg| false,
+            window_capture: |_reg, _cfg| {},
+            app_computer: |_reg, _cfg| {},
+        };
+
+        let first = assembly::build_tool_registry(&deps, &no_computers);
+        let second = assembly::build_tool_registry(&deps, &no_computers);
+
+        let names = |r: &ToolRegistry| -> Vec<String> {
+            let mut n: Vec<String> = r.definitions().into_iter().map(|d| d.name).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(&first), names(&second));
+
+        // 基础工具集必须真的在：否则上面那条断言会「两边都空所以相等」。
+        let got = names(&first);
+        for expected in ["Read", "Bash", "Edit", "Write", "Glob", "Grep", "Agent"] {
+            assert!(
+                got.iter().any(|n| n == expected),
+                "{expected} 缺失: {got:?}"
+            );
+        }
+    }
 
     #[test]
     fn collect_skill_entries_reads_global_skills_and_sorts_them() {
