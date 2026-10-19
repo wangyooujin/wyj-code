@@ -1349,10 +1349,6 @@ async fn main() -> Result<()> {
     let cwd = resolve_cwd(cli.cwd)?;
     let config_base = wyj_config::config_dir()?;
 
-    // 启动期一次性磁盘占用提示。`OnceLock` 保证进程内只触发一次,
-    // 避免每个 LLM 回合都打日志污染终端。
-    wyj_core::disk_usage::warn_if_over_budget(&config_base, cfg.storage.disk_usage_warn_bytes);
-
     // --plugin-dir is an explicit, process-local development plugin. Runtime contributions use
     // the same activation path as installed plugins but are never persisted.
     let local_plugin: Option<wyj_store::lockfile::PluginContributions> = match &cli.plugin_dir {
@@ -1498,23 +1494,40 @@ async fn main() -> Result<()> {
     // 而 ref_count 靠"会话结束时逐个 release"归零 —— 两个机制缺一，pool 就是
     // 无界增长。此前 `cas_total_bytes` / `cas_gc_on_start` 因"无消费点"被删，
     // 现在 `core::context_edit` 让它们有了真实消费点。
-    if cfg.storage.cas_gc_on_start {
-        if let Some(cas) = workspace_cas.as_ref() {
-            if cfg.storage.cas_total_bytes > 0 {
-                match cas.gc(cfg.storage.cas_total_bytes) {
-                    Ok(stats) if stats.deleted_blobs > 0 => tracing::debug!(
-                        "CAS gc: 扫描 {} 个 blob / {} 字节，回收 {} 个 / {} 字节",
-                        stats.scanned_blobs,
-                        stats.total_bytes,
-                        stats.deleted_blobs,
-                        stats.freed_bytes
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!("CAS gc 失败: {error}"),
+    //
+    // 与磁盘占用扫描一起放进后台任务：`gc` 要遍历整个 blob 池，启动时
+    // `~/.wyj-code` 到 1-5GB 就是秒级阻塞，而此刻终端已被接管、第一帧还没画出来
+    // ——用户看到的是一段纯黑屏。
+    let cas_gc_enabled = cfg.storage.cas_gc_on_start && cfg.storage.cas_total_bytes > 0;
+    let cas_gc_budget = cfg.storage.cas_total_bytes;
+    let cas_for_gc = workspace_cas.clone();
+    // 磁盘占用提示同样放后台：`disk_usage::scan` 递归 7 棵子树，也是同步全量 IO。
+    let disk_warn_bytes = cfg.storage.disk_usage_warn_bytes;
+    let config_base_for_gc = config_base.clone();
+    let startup_io = std::thread::Builder::new()
+        .name("wyj-startup-io".into())
+        .spawn(move || {
+            // CAS 先做：它会删文件，让随后的占用统计反映回收后的真实值。
+            if cas_gc_enabled {
+                if let Some(cas) = cas_for_gc.as_ref() {
+                    match cas.gc(cas_gc_budget) {
+                        Ok(stats) if stats.deleted_blobs > 0 => tracing::debug!(
+                            "CAS gc: 扫描 {} 个 blob / {} 字节，回收 {} 个 / {} 字节",
+                            stats.scanned_blobs,
+                            stats.total_bytes,
+                            stats.deleted_blobs,
+                            stats.freed_bytes
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("CAS gc 失败: {error}"),
+                    }
                 }
             }
-        }
-    }
+            wyj_core::disk_usage::warn_if_over_budget(&config_base_for_gc, disk_warn_bytes);
+        })?;
+    // 启动期这段 IO 不参与任何启动决策，detach 掉即可：进程先跑起来，IO 在后台
+    // 慢慢扫。错误无处可报，但函数体里全部是 tracing，不需要返回值。
+    drop(startup_io);
     // checkpoint 构造配置注入进程全局。TUI 侧有 7 处构造点必须走
     // `CheckpointStore::configured`,否则会退回裸 `new()` 的"不限条数 +
     // 不接 CAS"语义 —— `attach_agent_session` 更会覆盖掉这里装配好的
