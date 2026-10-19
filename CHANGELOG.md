@@ -10,6 +10,102 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.10] - 2026-10-19
+
+### 长会话越压越失忆，估算从不回头看实测
+
+三条改动共用一个判据：**阈值与面板必须同源，估计值必须能被真实数据修正**。
+
+### ① 压缩锚点放宽到工具轮起点，止住「越压越失忆」
+
+一次提交跑几十轮工具时，消息序列是 `user → assistant(tool_use) → user(tool_result) × N`，
+中间**没有任何新的真实 user 发言**。旧实现只认真实 user 边界，截断点会一路回退到 0、触发
+`reset_entire_session`——连最近那截 `compact_keep_budget` 的工作现场也一起丢掉，历史只剩一条
+摘要。模型随即重新探索目录、重读刚读过的文件，又填满，再重置：长会话重复劳动的全部机制。
+
+- `compact::safe_keep_from` 现在把 assistant(tool_use) 也当作合法边界，前提是它的全部
+  tool_use 在历史里都有对应 tool_result、且切点前一条不含 tool_use（否则摘要请求会带悬空
+  tool_use 被 provider 拒绝）
+- 保留量上限 32K → 128K：1M 窗口下旧值把 900K 历史压成约 48K，压缩比 18:1，省下的 token
+  又以工具往返的形式花回去，还多付一次压缩的 LLM 往返。压缩的目的不是「压到最小」，是
+  「压到阈值以下且不再丢现场」。200K 窗口仍是 25K，行为与旧版逐字节相同
+- `COMPACT_ACK` 改为条件化：仅当保留段首条是 user 时插入。首条是 assistant(tool_use) 时插
+  ACK 会变成两条连续 assistant 且拆散 use/result 配对
+
+### ② 估算校准：用 provider 上报的真实 prompt token 反推偏差
+
+`estimate_text_tokens` 是字符启发式（CJK 1.5/字、其余 1/3 字符），对代码 / JSON / 多语言
+混排的偏差可达数十个百分点，而压缩阈值是一个**按比例的硬线**——估算偏低 30% 就意味着在 1M
+窗口上要等到真实 910K 才动手。每轮请求成功后用 provider 上报的**完整 prompt**（`input +
+cache_read + cache_write`，只取最后一条 usage，重试会多次回填）除以估算值做 EWMA：
+
+- 比值落在 `[0.5, 2.0]` 之外的样本直接丢弃——那几乎一定是端点上报口径不同，不是估算偏差
+- 估算值 < 1000 token 不采样，分母小的时候整数启发式的相对误差本来就大
+- EWMA 权重 0.1：系统性偏差几轮内收敛，单轮抖动不该改写阈值
+- 字段用 `Option<f32>` 而不是「默认 1.0 的 f32」：`Session` 是 `#[derive(Default)]`，
+  `f32::default()` 是 0.0，悄悄变成 0 会让所有阈值判定失效
+- `/context` 面板仍展示原始估算，只有压缩判定走 `calibrated_total(ratio)`
+
+### ③ 有效窗口：把「端点拒绝过一次」变成后续判定的依据
+
+`context_window` 是裸 u32、没有 live probe 兜底。填大了（把 256K 写成 1M）压缩与 context
+editing 两道防线会一起落在根本够不着的位置，只剩 400 兜底。撞 `ContextLengthExceeded` 时记下
+`overflow_window_hint`，后续 `effective_context_window` 取 `min(configured, hint * 1.05)`。
+
+两个字段都随 `SessionFile` 落盘、且 `/clear` 保留（它们描述的是运行环境而不是对话内容）——
+resume 之后从 1.0 重新学，等于在历史已经最长、最需要阈值准确的时候先失准一段。
+
+### ④ `/context` 与 `/cost` 的分母改取「本次判定实际用的窗口」
+
+端点拒绝过一次之后有效窗口会收紧到远小于配置值，而面板若还按配置值算，用户看到的就是一个
+**永远触发不到的阈值**：面板写着「占用 12% / 阈值 900K」，压缩其实早在 256K 那条线上就该触发。
+`ContextAudit` 增加 `window` 字段（builder 式 `with_window`），展示侧统一走
+`effective_window(fallback)`——这正是 0.2.26 消灭过的「同一个事实两套口径」换个地方复发。
+
+### ⑤ 压缩阈值判定与循环收敛同口径
+
+`compact_session_until_fit` 的收敛判断退回 messages-only 不再允许：进入条件与收敛判断都用调用方
+传入的 `measure`（请求级 `ContextAudit`），一轮压缩减幅不足 5% 即停手（`MIN_PROGRESS_RATIO`）。
+压缩路径补上 `context_audit` 重算——旧快照不刷新的话，下一轮 usage 入账时的校准采样会拿压缩前的
+旧估算当分母，把系数系统性压低、阈值越推越晚。
+
+### ⑥ TUI 配色系统重做：具名色收敛到 RGB，层级靠明度不靠色相
+
+`theme.rs` 是全仓唯一允许出现颜色字面量的文件，27 个槽位与插件主题覆盖机制本身没问题，问题出
+在取值上。完整色板与设计依据见新增的 `doc/plan/color-system-redesign.md`（基准背景 `#1E2127`）。
+
+- **11 个 RGB + 12 个 ANSI 具名色 → 全部 RGB**：`plan=Blue`、`danger=Red`、`hint`/`info`/
+  `queue=Cyan`、`muted=DarkGray`、代码高亮四件套。具名色的真实 RGB 由用户终端主题决定，同屏
+  「终端配的青」与「写死的橙」色温对不上；非 truecolor 降级也只对 RGB 生效，具名色永远保持
+  原样——换台机器、换套终端主题观感就变一次，插件主题作者无法预期
+- **层级靠明度四档**：`text`(`#D7DAE0`) > `text_dim`(`#A0A8B8`) > `inactive`(`#7A8397`) >
+  `muted`(`#5A6274`)，`border`(`#39404F`) 为最弱结构线。约 12 个色相收敛到「冷灰中性底 + 暖橙
+  品牌点缀」，正文不用纯白，把亮度预算留给强调色
+- **工具结果正文从蓝紫 `#B1B9F9` 改回中性**：工具输出恰恰是屏幕上出现频率最高的长文本，此前比
+  正文更彩更亮；品牌橙也从 bullet 与工具结果上收回来，只留 assistant 前缀、工具调用行、h1、
+  选中行前景、光标底、状态栏 `◆` 这几处小面积位置
+- **新增 `inline_code` 槽位**（`#E5C07B`）：代码块正文是「整块代码」要低饱和，行内代码是「正文
+  里的一个标识符」要轻微跳出但不能有背景色。旧实现共用 `code_fg` 的浅蓝，行内代码与用户前缀
+  `❯`、权限对话框撞成一片蓝紫
+- **渲染层不再透传终端前景色**：`markdown.rs` / `render.rs` 里所有 `Style::default()` 改走
+  `Theme::body()`。同时修正三处层级倒挂——引用正文与 h3–h6 小标题从 `inactive` 提到 `text_dim`
+  （旧值 `#999` 在暗底上几乎读不出来）、diff 上下文行从 `dim` 提到 `text_dim`（未改动的代码不该
+  看起来像被禁用）、表格竖线改走独立的 `border` 槽位
+
+### ⑦ `/model` 面板开放每轮工具数上限，新建分组预填 4
+
+静态模型目录对所有非 anthropic/openai vendor 一律判 `max_tools_per_turn = 1`，而 profile 里该
+字段留空（`None`）意味着「跟随端点默认」——这个按 vendor 的猜测于是直接生效。后果是新建的国内
+模型分组每轮只能发一个工具调用、一次只能派生一个 subagent，即使端点完全支持并行。
+
+- 字段开放为 Enum「（默认）/ 1 / 2 / 4 / 8」，与 `reasoning_effort` / `thinking_switch` 同构
+- 从厂商模板新建分组时预填 4；已有分组保留原值，清空即可回到端点默认
+- 用枚举而不是自由文本：非法数字会被 `to_profile` 的 `parse().ok()` 静默吞成 `None`，用户填了
+  却看不到任何效果
+- 同步补 `settings.field.max_tools_per_turn` 的 i18n 与 `docs/reference/config.md` 条目
+
+测试：1608 个 workspace 测试通过（1588 → 1608）。
+
 ## [0.3.9] - 2026-10-19
 
 ### 压缩在历史最贵的那一刻付了全价，长会话滚几下就卡
