@@ -3852,7 +3852,10 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Theme::plan())
-        .title(Span::styled(" / 命令 & Skill ", Theme::plan()));
+        .title(Span::styled(
+            " / 命令 & Skill  ↑↓ 选择  Tab/Enter 填入  Esc 关闭 ",
+            Theme::plan(),
+        ));
 
     let inner = block.inner(area);
     f.render_widget(block, area);

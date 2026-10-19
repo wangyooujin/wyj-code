@@ -972,7 +972,7 @@ profile:
   headless_unsupported: "[headless 模式不支持 /model 管理分组，请在 TUI 模式下使用]"
   dialog:
     hint1: "  ↑↓ 移动  Enter 编辑/拉取模型列表/切换  ←→ 循环切换枚举"
-    hint2: "  Ctrl+S 保存  Esc 关闭"
+    hint2: "  Ctrl+S 保存（菜单「设为当前」后自动保存）  Esc 关闭（有未保存修改时会询问）"
     editing_placeholder: "编辑中，见下方输入框"
     add_new_row: "新建分组"
   menu:
