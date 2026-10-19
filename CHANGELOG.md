@@ -10,6 +10,40 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [未发布]
+
+### macOS Terminal.app 里滚轮完全没反应、Shift+↑ 进不去子 Agent
+
+三处问题各有独立的根因，但都属于「展示区交互」这一层。
+
+- **鼠标滚轮（根因：DEC mode 1007 在 Terminal.app 不受支持）**。alternate screen 里
+  终端没有自己的滚动条，滚轮能否滚动完全取决于应用是否收到鼠标事件；而此前启动时
+  无条件 `DisableMouseCapture`，Terminal.app 又不做 mode 1007 的滚轮转方向键，于是
+  滚轮事件**根本不会送达应用**——不是滚动逻辑坏了，是事件没到。
+  - 新增 `[ui].mouse_capture`（默认 `true`）与 `/mouse` 运行时开关。开启时只发
+    最小报告序列 `1000h + 1002h + 1006h`，**刻意不发 `1003h`**：全移动上报会让触控板
+    轻微移动就持续产生事件、主循环每事件重绘一帧
+  - 代价是终端原生拖选复制需按住 Option（Cmd+C 不受影响）；`/mouse` 关闭后完全
+    交还终端，恢复无需修饰键的拖选
+  - 状态翻转与终端序列解耦：命令分支只改 `AppState.mouse_capture`，主循环每帧比对
+    后发序列，幂等且不与绘制交错
+- **应用内滚动条**。真正的原生滚动条只存在于主屏 scrollback（Inline 方案已因画面
+  撕裂被放弃两次），因此在内容区最右 1 列画 `│`/`┃`（less/vim 观感），滑块位置随
+  `chat_scroll` 与子 Agent 详情滚动同步。只在内容超出视口时出现；`[ui].scrollbar`
+  可关。
+- **`Shift+↑` 进不去子 Agent**。三个独立原因叠加：
+  1. 判定用 `modifiers == SHIFT` 严格相等，终端多报一位修饰键就静默失效；
+  2. 判定位置在 `@` 文件补全 / slash 补全拦截之后，补全列表开着时 `Up` 被补全分支
+     吃掉；
+  3. `enter_content_focus` 把 `UiFocus::Chat` 当作「已在内容区」直接早退——滚动过
+     聊天区（PageUp/滚轮）后焦点就停在 Chat，于是「子 Agent 正在跑也进不去」稳定复现。
+  现在判定改为 `contains(SHIFT)` 且排除 Ctrl/Alt/Cmd，并前移到补全拦截之前；
+  Chat 焦点下只在「下方面板真的存在」时才抢键，避免正在滚历史时被跳到会话末尾。
+
+测试：`wyj-tui` 414 项、`wyj-commands` 71 项全部通过；新增钉子
+`mouse_capture_enables_only_wheel_and_drag_reporting`、
+`shift_up_from_chat_focus_still_enters_running_sub_agent` 与三个滚动条渲染测试。
+
 ## [0.3.10] - 2026-10-19
 
 ### 长会话越压越失忆，估算从不回头看实测

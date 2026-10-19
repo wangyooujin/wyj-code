@@ -106,6 +106,11 @@ pub enum CommandResult {
     /// 打开定时任务面板（/schedule 命令触发）。headless 不支持，提示改用
     /// `wyj-code schedule` CLI 子命令。
     OpenScheduleDialog,
+    /// 切换鼠标捕获开关（/mouse 命令触发）。
+    ///
+    /// 只改运行期状态，不写回 `config.toml`。开启后滚轮进入应用（代价是拖选
+    /// 复制需按住 Option），关闭后完全交还终端。
+    ToggleMouseCapture,
 }
 
 #[derive(Debug, Clone)]

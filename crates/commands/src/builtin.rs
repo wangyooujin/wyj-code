@@ -1422,6 +1422,27 @@ impl Command for ModeCmd {
     }
 }
 
+// ── /mouse ──────────────────────────────────────────────────────────────────
+
+/// 切换鼠标捕获。只发结果，具体状态由 TUI 主循环翻转并写回终端。
+pub struct MouseCmd;
+
+#[async_trait]
+impl Command for MouseCmd {
+    fn name(&self) -> &str {
+        "mouse"
+    }
+    fn description(&self) -> String {
+        tr("mouse.desc")
+    }
+    fn usage(&self) -> String {
+        "/mouse".to_string()
+    }
+    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        Ok(CommandResult::ToggleMouseCapture)
+    }
+}
+
 // ── /cwd ─────────────────────────────────────────────────────────────────────
 
 pub struct CwdCmd;
@@ -1934,6 +1955,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
+    reg.register(Arc::new(MouseCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
     reg.register(Arc::new(SessionsCmd));
@@ -1995,6 +2017,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(ModelCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
+    reg.register(Arc::new(MouseCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
     reg.register(Arc::new(SessionsCmd));
@@ -2017,7 +2040,9 @@ pub fn standard_registry_with_skills(
 mod help_tests {
     use super::*;
 
-    fn ctx_with_dynamic(dynamic_commands: Vec<(String, String, String)>) -> CommandContext {
+    pub(super) fn ctx_with_dynamic(
+        dynamic_commands: Vec<(String, String, String)>,
+    ) -> CommandContext {
         CommandContext {
             cwd: std::path::PathBuf::new(),
             model: String::new(),
@@ -2366,6 +2391,23 @@ mod subagents_tests {
         // 否则用户根本无从发现（/help 是唯一入口）。
         let reg = standard_registry();
         assert!(reg.get("shells").is_some(), "/shells 必须注册进命令表");
+    }
+
+    /// `/mouse` 必须注册，且 `/help` 里能看到它——它是用户发现这个开关的唯一入口。
+    #[tokio::test]
+    async fn mouse_command_is_registered_and_documented_in_help() {
+        let reg = standard_registry();
+        assert!(reg.get("mouse").is_some(), "/mouse 必须注册进命令表");
+
+        let ctx = super::help_tests::ctx_with_dynamic(vec![]);
+        let CommandResult::Output(text) = HelpCmd.run("", &ctx).await.unwrap() else {
+            panic!("expected Output");
+        };
+        assert!(text.contains("/mouse"), "/help 必须列出 /mouse");
+        assert!(
+            text.contains("Shift+↑"),
+            "/help 必须列出进入内容区的 Shift+↑"
+        );
     }
 }
 

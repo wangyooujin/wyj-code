@@ -3875,6 +3875,9 @@ async fn repl(
                 Ok(CommandResult::OpenScheduleDialog) => {
                     println!("{}", wyj_i18n::tr("schedule.headless_unsupported"));
                 }
+                Ok(CommandResult::ToggleMouseCapture) => {
+                    println!("{}", wyj_i18n::tr("mouse.headless_unsupported"));
+                }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),
             }
