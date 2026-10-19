@@ -14,6 +14,9 @@ pub struct HelpCmd;
 
 #[async_trait]
 impl Command for HelpCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "help"
     }
@@ -352,6 +355,9 @@ pub struct AgentControlCmd;
 
 #[async_trait]
 impl Command for AgentControlCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "agent-control"
     }
@@ -717,6 +723,9 @@ pub struct McpCmd;
 
 #[async_trait]
 impl Command for McpCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "mcp"
     }
@@ -737,6 +746,9 @@ pub struct ScheduleCmd;
 
 #[async_trait]
 impl Command for ScheduleCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "schedule"
     }
@@ -757,6 +769,9 @@ pub struct SkillsCmd;
 
 #[async_trait]
 impl Command for SkillsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "skills"
     }
@@ -777,6 +792,9 @@ pub struct PluginsCmd;
 
 #[async_trait]
 impl Command for PluginsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "plugins"
     }
@@ -797,6 +815,9 @@ pub struct ExtensionsCmd;
 
 #[async_trait]
 impl Command for ExtensionsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "extensions"
     }
@@ -853,6 +874,9 @@ pub fn format_agents_text(defs: &[wyj_core::AgentDefinition]) -> String {
 
 #[async_trait]
 impl Command for AgentsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "agents"
     }
@@ -879,6 +903,9 @@ pub struct SubAgentsCmd;
 
 #[async_trait]
 impl Command for SubAgentsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "subagents"
     }
@@ -909,6 +936,9 @@ pub struct ShellsCmd;
 
 #[async_trait]
 impl Command for ShellsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "shells"
     }
@@ -953,6 +983,9 @@ pub struct HooksCmd;
 
 #[async_trait]
 impl Command for HooksCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "hooks"
     }
@@ -1021,6 +1054,9 @@ pub struct MemoryCmd;
 
 #[async_trait]
 impl Command for MemoryCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "memory"
     }
@@ -1071,6 +1107,9 @@ pub struct DoctorCmd;
 
 #[async_trait]
 impl Command for DoctorCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "doctor"
     }
@@ -1185,6 +1224,9 @@ pub struct ComputerCmd;
 
 #[async_trait]
 impl Command for ComputerCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "computer"
     }
@@ -1380,6 +1422,9 @@ pub struct ModelCmd;
 
 #[async_trait]
 impl Command for ModelCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "model"
     }
@@ -1407,6 +1452,9 @@ pub struct ModeCmd;
 
 #[async_trait]
 impl Command for ModeCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "mode"
     }
@@ -1449,6 +1497,9 @@ pub struct CwdCmd;
 
 #[async_trait]
 impl Command for CwdCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "cwd"
     }
@@ -1628,6 +1679,9 @@ pub struct ConfigCmd;
 
 #[async_trait]
 impl Command for ConfigCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "config"
     }
@@ -1673,6 +1727,9 @@ pub struct SessionsCmd;
 
 #[async_trait]
 impl Command for SessionsCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "sessions"
     }
@@ -1693,6 +1750,9 @@ pub struct QuitCmd;
 
 #[async_trait]
 impl Command for QuitCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
     fn name(&self) -> &str {
         "quit"
     }
