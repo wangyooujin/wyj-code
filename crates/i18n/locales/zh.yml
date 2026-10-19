@@ -928,6 +928,7 @@ settings:
     base_url: "Base URL"
     api_key: "API Key"
     max_tokens: "Max Tokens"
+    max_tools_per_turn: "每轮工具数上限"
     context_window: "上下文长度"
     thinking_budget: "思考预算"
     interleaved_thinking: "交错思考"

@@ -96,20 +96,24 @@ impl Command for ContextCmd {
         tr("context.usage")
     }
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
-        let window = ctx.context_window;
         let mut text = format!("{}{}\n\n", crate::cost_view::INDENT, tr("context.header"));
 
-        let Some(audit) = ctx.context_audit.filter(|_| window > 0) else {
+        let Some(audit) = ctx.context_audit.filter(|a| a.total() > 0) else {
             text.push_str(&tr("context.empty"));
             return Ok(CommandResult::Output(text));
         };
+        // 分母必须是**本次判定实际用的窗口**，不是配置里的那个。端点拒绝过
+        // 一次之后有效窗口会收紧（见 `Session::effective_context_window`），
+        // 此时按配置值算出来的「占用率 / 阈值」是一个永远触发不到的数字——
+        // 面板与决策不同源，用户就会照着它判断「离压缩还早得很」。
+        let window = audit.effective_window(ctx.context_window);
+        if window == 0 {
+            text.push_str(&tr("context.empty"));
+            return Ok(CommandResult::Output(text));
+        }
 
         let total = audit.total();
-        let pct = if window > 0 {
-            total as f64 / window as f64 * 100.0
-        } else {
-            0.0
-        };
+        let pct = total as f64 / window as f64 * 100.0;
         // 压缩阈值 = 窗口 - buffer。buffer 必须覆盖输出预留，否则压缩完
         // 再加 max_tokens 还是会撞穿（见 compact_trigger_buffer）。
         let buffer = wyj_core::compact::compact_trigger_buffer(window, audit.output_reserve);
@@ -632,23 +636,29 @@ impl Command for CostCmd {
             .context_audit
             .map(|audit| audit.total())
             .unwrap_or(ctx.estimated_tokens);
-        if ctx.context_window > 0 {
+        // 分母同样取**本次判定实际用的窗口**：端点拒绝过一次之后有效窗口会
+        // 收紧到远小于配置值，此时按配置值算出的百分比会小到看不出危险。
+        let ctx_window = ctx
+            .context_audit
+            .map(|audit| audit.effective_window(ctx.context_window))
+            .unwrap_or(ctx.context_window);
+        if ctx_window > 0 {
             // 条 + 数字合并成一行：拆两行会让本就高的面板再高一截，而
             // 「占了多少 / 一共多少」本就该一眼同框。后缀必须**先算出来传
             // 给 context_bar** 参与格数预算——否则条按满格渲染、再把长
             // 后缀拼在后面，窄终端必然超宽。
-            let pct = fmt_pct(ctx_estimated as f64 / ctx.context_window as f64 * 100.0);
+            let pct = fmt_pct(ctx_estimated as f64 / ctx_window as f64 * 100.0);
             let detail = tr_fmt(
                 "cost.context_detail_line",
                 &[
                     ("pct", &pct),
                     ("used", &fmt_int(u64::from(ctx_estimated))),
-                    ("window", &fmt_int(u64::from(ctx.context_window))),
+                    ("window", &fmt_int(u64::from(ctx_window))),
                 ],
             );
             if let Some(bar) = context_bar(
                 ctx_estimated,
-                ctx.context_window,
+                ctx_window,
                 width.saturating_sub(indent_w),
                 &tr("cost.bar_full"),
                 &tr("cost.bar_empty"),
@@ -2238,6 +2248,7 @@ mod subagents_tests {
             history_tokens: 100_000,
             output_reserve: 8_192,
             framing_tokens: 300,
+            window: 0,
             reclaimable_tool_result_tokens: 0,
         };
         let ctx = ctx_with_audit(Some(audit), 200_000);
@@ -2257,10 +2268,49 @@ mod subagents_tests {
         }
     }
 
+    /// `/context` 的分母与阈值必须取**本次判定实际用的窗口**，不是配置值。
+    ///
+    /// 端点拒绝过一次之后有效窗口会收紧（`Session::effective_context_window`），
+    /// 此时面板若还按配置值算，用户看到的是一个永远触发不到的阈值——压缩其实
+    /// 早在另一个线上就会触发。这与 v0.2.26 消灭的「同一个事实两套口径」是
+    /// 同一种病换个地方复发。
+    #[tokio::test]
+    async fn context_panel_uses_the_effective_window_not_the_configured_one() {
+        let audit = wyj_core::compact::ContextAudit {
+            system_tokens: 2_000,
+            tool_schema_tokens: 5_000,
+            history_tokens: 100_000,
+            output_reserve: 32_000,
+            framing_tokens: 300,
+            reclaimable_tool_result_tokens: 0,
+            // 端点实测：这份会话实际只被允许 160K
+            window: 160_000,
+        };
+        // 配置里写着 1M（典型的「填大了」）
+        let ctx = ctx_with_audit(Some(audit), 1_000_000);
+        match ContextCmd.run("", &ctx).await.unwrap() {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
+                let flat = text.replace(',', "");
+                // 阈值 = 160K - max(32000+8192, 16000) = 119808
+                assert!(
+                    flat.contains("119808"),
+                    "阈值必须按有效窗口算，而不是配置的 1M: {text}"
+                );
+                assert!(
+                    !flat.contains("900000"),
+                    "不应再出现按配置窗口算出的阈值: {text}"
+                );
+                assert!(flat.contains("160000"), "窗口本身应显示有效值: {text}");
+            }
+            other => panic!("expected Output(Plain), got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn context_panel_surfaces_reclaimable_tool_results() {
         let audit = wyj_core::compact::ContextAudit {
             history_tokens: 100_000,
+            window: 0,
             reclaimable_tool_result_tokens: 23_100,
             ..Default::default()
         };
@@ -2409,6 +2459,7 @@ mod cost_tests {
                 history_tokens: 40_738,
                 output_reserve: 32_000,
                 framing_tokens: 200,
+                window: 0,
                 reclaimable_tool_result_tokens: 0,
             }),
             ..base_ctx()
@@ -2616,6 +2667,7 @@ mod cost_tests {
                 history_tokens: 175_000,
                 output_reserve: 32_000,
                 framing_tokens: 200,
+                window: 0,
                 reclaimable_tool_result_tokens: 0,
             }),
             ..full_ctx(64)

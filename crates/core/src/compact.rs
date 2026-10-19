@@ -18,8 +18,15 @@ use crate::session::Session;
 /// 比例与量级参照 Goose 的 `compute_tool_call_cutoff`（`3 × limit / 20000`
 /// clamp 到 10–500）——保留量必须随窗口线性伸缩，否则小窗口被压垮、
 /// 大窗口浪费。
+///
+/// **上限为什么从 32K 提到 128K**：旧上限在 1M 窗口下把 900K 历史压成
+/// 约 32K + 16K 摘要，压缩比 18:1，实测后果是「压缩后模型明显失忆、重新
+/// grep 刚 grep 过的目录、重新读刚读过的文件」——省下的 token 又以工具
+/// 往返的形式花回去，还多付一次压缩的 LLM 往返。压缩保留量的目的不是
+/// 「压到最小」，而是「压到阈值以下且不再丢现场」：窗口越大，能留的现场
+/// 就该越多。200K 窗口仍是 25K（行为与旧版逐字节相同）。
 fn compact_keep_budget(context_window: u32) -> u32 {
-    (context_window / 8).clamp(4_000, 32_000)
+    (context_window / 8).clamp(8_000, 128_000)
 }
 
 /// 低于这个条数就不再压：没有足够的历史值得花一次 LLM 往返。
@@ -105,6 +112,15 @@ pub struct ContextAudit {
     /// 不删除**——第 3 批的 tool_result context editing 才真的回收它；
     /// 现在先让 `/context` 能如实告诉用户有多少是"可回收"的。
     pub reclaimable_tool_result_tokens: u32,
+    /// 本次请求**按多少窗口做的判定**（`Session::effective_context_window`
+    /// 的结果；通常等于配置值，端点拒绝过才会更小）。`0` = 未记录。
+    ///
+    /// 为什么放在度量结构里而不是另开一个字段：占用率、阈值、`/context`
+    /// 面板必须与**同一次判定**同源。端点把一份 256K 窗口的请求拒了之后，
+    /// 有效窗口会收紧到远小于配置值——此时若面板还按配置值算出「占用率
+    /// 30% / 阈值 900K」，用户看到的就是一个永远触发不到的阈值，而这正是
+    /// v0.2.26 消灭过的「同一个事实两套口径」换个地方复发。
+    pub window: u32,
 }
 
 /// 保留全文的最近工具调用数，与 Anthropic `clear_tool_uses_20250919`
@@ -119,6 +135,23 @@ impl ContextAudit {
             .saturating_add(self.history_tokens)
             .saturating_add(self.output_reserve)
             .saturating_add(self.framing_tokens)
+    }
+
+    /// 用**实测校准系数**修正后的上下文占用。
+    ///
+    /// 只修正 prompt 部分（system / 工具 schema / 历史 / framing），
+    /// `output_reserve` 是配置里的 `max_tokens`，不是猜出来的，不能被缩放。
+    ///
+    /// `ratio` 来自 [`crate::session::Session::input_estimate_ratio`]：每轮
+    /// 请求成功后用 provider 上报的真实 prompt token 反推「估算偏低/偏高多少」。
+    /// 为什么需要它：`estimate_text_tokens` 是字符启发式，对代码 / JSON /
+    /// 多语言混排的偏差可达数十个百分点，而压缩阈值是一个**硬比例**——
+    /// 估算偏低 30% 就意味着在 1M 窗口上要等到真实 910K 才触发压缩，
+    /// 撞 400 的概率与「明明还早却已压缩」的误触发都在这个偏差里。
+    pub fn calibrated_total(&self, ratio: f32) -> u32 {
+        let prompt = self.total().saturating_sub(self.output_reserve);
+        let scaled = (prompt as f32 * ratio.clamp(0.5, 2.0)).round() as u32;
+        scaled.saturating_add(self.output_reserve)
     }
 
     pub fn from_request(
@@ -150,6 +183,28 @@ impl ContextAudit {
             output_reserve: max_output_tokens,
             framing_tokens: message_overhead.saturating_add(REQUEST_OVERHEAD_TOKENS),
             reclaimable_tool_result_tokens: reclaimable_tool_result_tokens(messages),
+            window: 0,
+        }
+    }
+
+    /// 记录本次判定使用的**有效窗口**（[`crate::session::Session::effective_context_window`]）。
+    ///
+    /// 做成 builder 而不是 `from_request` 的第五个参数：`from_request` 的
+    /// 四项是「按内容算出来的量」，窗口是「按运行环境定的量」，两者的生命周期
+    /// 不同——测试与若干调用点只关心前者，强行让它们传窗口只会得到一堆无意义
+    /// 的 0。
+    pub fn with_window(mut self, window: u32) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// 取本次判定实际使用的窗口，`fallback` 用于「本会话还没发过请求」
+    /// （`window == 0`）的场合。
+    pub fn effective_window(&self, fallback: u32) -> u32 {
+        if self.window > 0 {
+            self.window
+        } else {
+            fallback
         }
     }
 }
@@ -454,20 +509,32 @@ pub async fn compact_session(
             }],
         }];
     } else {
-        session.messages = vec![
-            Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: crate::prompts::compact_summary_message(messages_removed, &summary),
-                }],
-            },
-            Message {
+        session.messages = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: crate::prompts::compact_summary_message(messages_removed, &summary),
+            }],
+        }];
+        // 确认语只在**保留段以 user 开头**时才需要：那时摘要(user) 后面直接
+        // 跟 user 会破坏角色交替，得插一条 assistant 隔开。
+        //
+        // 保留段以 assistant(tool_use) 开头时（P0-1 新增的工具轮起点边界）
+        // 绝不能插：那会变成 `summary(user) → ack(assistant) → tool_use
+        // (assistant)` 两条连续 assistant，且 ack 与 tool_use 之间没有任何
+        // user 内容——provider 侧既违反交替，`tool_result` 也不再紧跟其
+        // `tool_use`。此时 `summary(user) → assistant(tool_use)` 本身就是
+        // 合法的一轮。
+        let tail_starts_with_assistant = to_keep
+            .first()
+            .is_some_and(|m| matches!(m.role, Role::Assistant));
+        if !tail_starts_with_assistant {
+            session.messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text {
                     text: crate::prompts::COMPACT_ACK.to_string(),
                 }],
-            },
-        ];
+            });
+        }
         session.messages.extend(to_keep);
     }
     // 压缩是「整段历史被替换」，增量日志必须收到一次全量快照——否则重放时
@@ -498,18 +565,33 @@ pub async fn compact_session(
 /// `prefix` 透传给每一次 pass。**只在第一次 pass 有价值**（第二次起历史已被
 /// 上一次的摘要替换，前缀自然不再与主对话一致），但仍然照传：多传一个
 /// 已经失配的前缀不会让缓存变差，只会回到「全 miss」这个基线。
+///
+/// **`measure` 必须与调用方的进入条件同口径**。历史上这里用
+/// [`estimate_tokens`]（messages-only）判断收敛，而进入条件是请求级估算
+/// （`ContextAudit::total()`，含 system + 工具 schema + 输出预留）。两者能差
+/// 4~5 万 token，于是「进入时判定超标 → 压一轮 → 用低口径判定还是超标 →
+/// 再压一轮」空跑第 2、3 轮，而每一轮都会把上一轮刚保留的尾部原文再摘要
+/// 一次——压缩次数多、现场丢得多，正是长会话「越压越失忆」的放大器之一。
+///
+/// **停滞即停手**：一轮压缩至少要把测量值降下来 5%，否则视为「压不动」
+/// （只剩摘要 + 少量保留原文时必然如此）。没有这条，`MAX_COMPACT_PASSES`
+/// 会对着同一段压不动的历史连开三次 LLM 往返，且每次都会再丢一点原文。
 pub async fn compact_session_until_fit(
     session: &mut Session,
     provider: &dyn Provider,
     context_window: u32,
-    estimated: u32,
     threshold: u32,
     prefix: Option<CompactPrefix<'_>>,
+    measure: impl Fn(&[Message]) -> u32,
 ) -> CompactUntilFitOutcome {
     const MAX_COMPACT_PASSES: usize = 3;
+    /// 一轮压缩至少要把测量值降这么多比例，否则直接停手。
+    const MIN_PROGRESS_RATIO: f64 = 0.05;
+
     let mut last_result: Option<Result<CompactResult>> = None;
+    let mut before = measure(&session.messages);
     for pass in 0..MAX_COMPACT_PASSES {
-        let current = estimate_tokens(&session.messages);
+        let current = measure(&session.messages);
         if current <= threshold {
             return CompactUntilFitOutcome {
                 final_estimated: current,
@@ -521,6 +603,24 @@ pub async fn compact_session_until_fit(
         match compact_session(session, provider, context_window, prefix).await {
             Ok(result) => {
                 last_result = Some(Ok(result));
+                let after = measure(&session.messages);
+                let required = (before as f64 * (1.0 - MIN_PROGRESS_RATIO)).ceil() as u32;
+                if after >= required {
+                    tracing::debug!(
+                        before,
+                        after,
+                        required,
+                        pass,
+                        "压缩进展不足 5%，停止继续压缩（剩下的只能交给单块截断兜底）"
+                    );
+                    return CompactUntilFitOutcome {
+                        final_estimated: after,
+                        passes: pass + 1,
+                        last_result: last_result.and_then(|r| r.ok()),
+                        last_error: None,
+                    };
+                }
+                before = after;
             }
             Err(error) => {
                 // 「消息数过少」/「找不到安全边界」是『已无可压缩』的合法
@@ -534,14 +634,14 @@ pub async fn compact_session_until_fit(
                         "compact 已无可压缩空间，把控制权交回调用方由 truncate 兜底"
                     );
                     return CompactUntilFitOutcome {
-                        final_estimated: estimate_tokens(&session.messages),
+                        final_estimated: measure(&session.messages),
                         passes: pass,
                         last_result: last_result.and_then(|r| r.ok()),
                         last_error: None,
                     };
                 }
                 return CompactUntilFitOutcome {
-                    final_estimated: estimate_tokens(&session.messages),
+                    final_estimated: measure(&session.messages),
                     passes: pass,
                     last_result: None,
                     last_error: Some(error.to_string()),
@@ -549,8 +649,10 @@ pub async fn compact_session_until_fit(
             }
         }
     }
+    // 直接用最新测量值，不能用进入时的 `estimated` 去 cap——那是压缩**前**的
+    // 快照，用它取 min 会让「压完仍超标」的返回值假装已经降下来了。
     CompactUntilFitOutcome {
-        final_estimated: estimated.min(estimate_tokens(&session.messages)),
+        final_estimated: measure(&session.messages),
         passes: MAX_COMPACT_PASSES,
         last_result: last_result.and_then(|r| r.ok()),
         last_error: None,
@@ -578,20 +680,100 @@ fn is_user_turn_boundary(msg: &Message) -> bool {
             .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
 }
 
-/// 从「保留最近 N 条」的朴素截断点回退到最近的真实用户发言边界：按固定条数
+/// 判断消息是否是一个**完整的工具轮起点**，可以作为压缩截断点。
+///
+/// 为什么需要这一类边界：一次提交跑几十轮工具时，消息序列是
+/// `user → assistant(tool_use) → user(tool_result) × N`，中间**没有任何新的
+/// 真实用户发言**。只认 [`is_user_turn_boundary`] 会让截断点一路回退到 0，
+/// 触发 [`compact_session`] 的 `reset_entire_session`——连最近那截
+/// `compact_keep_budget` 的工作现场也一起丢掉，压缩比退化成「全量重置」。
+/// 这是「压缩后模型明显失忆、重新读文件」的直接机制。
+///
+/// 安全条件：assistant 消息里**所有** `tool_use` 的 id 都必须能在后续历史里
+/// 找到对应的 `tool_result`。只要有一个悬空，从这条消息开始保留就会把
+/// use/result 配对拆到摘要两侧，provider 直接拒绝。
+fn is_tool_round_start(
+    msg: &Message,
+    later_result_ids: &std::collections::HashSet<String>,
+) -> bool {
+    if !matches!(msg.role, Role::Assistant) {
+        return false;
+    }
+    let mut has_tool_use = false;
+    for block in &msg.content {
+        if let ContentBlock::ToolUse { id, .. } = block {
+            has_tool_use = true;
+            if !later_result_ids.contains(id) {
+                return false;
+            }
+        }
+    }
+    has_tool_use
+}
+
+/// 从全部消息里收集 `tool_result` 的 `tool_use_id`。
+///
+/// 只建一次、供整个回退过程复用：回退是 O(条数) 的，每步重建集合会退化成
+/// O(n²)，长会话（几千条消息）上足以让压缩前的准备阶段变成肉眼可见的停顿。
+/// 有效历史里 `tool_result` 必然出现在其 `tool_use` 之后，所以用全集判定
+/// 「配对完整」是安全的；顺序错乱的畸形历史不属于本函数要处理的范围
+/// （那种历史本来就会被 `repair_dangling_tool_uses` 与 provider 拒绝）。
+fn collect_tool_result_ids(messages: &[Message]) -> std::collections::HashSet<String> {
+    messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 在 `idx` 处切开后，**被压缩的那一段**（`messages[..idx]`）是否自洽。
+///
+/// 唯一要排除的形态：被压缩段的最后一条是含 `tool_use` 的 assistant，而它的
+/// `tool_result` 落在保留段里。摘要请求会带着一个悬空 tool_use 发给 provider，
+/// 直接被判非法——压缩于是失败，而这条路径恰好发生在「历史已经很长」时。
+/// 回退一格即可绕开（前一条是自己的 tool_result 或其之前的消息）。
+fn can_cut_before(messages: &[Message], idx: usize) -> bool {
+    if idx == 0 {
+        return true;
+    }
+    !messages[idx - 1]
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+}
+
+/// 从「保留最近 N 条」的朴素截断点回退到最近的安全边界：按固定条数
 /// 截断可能正好切在工具结果消息或助手消息上，这样拼接摘要
 /// （[User(摘要), Assistant(确认), ...保留部分]）时要么破坏 user/assistant
 /// 角色交替、要么拆散 tool_use/tool_result 配对，导致压缩后请求被 Provider
 /// 拒绝或模型上下文残缺——表现为"压缩后模型不知道该做什么"。
-/// 第一条消息必然是真实用户发言，故只要 messages 非空就不会返回 `None`
-/// （除非连第一条都不满足，理论上不可能发生）。
+///
+/// 安全边界有两种：
+///   1. 不含 tool_result 的 user 消息（真实用户发言）；
+///   2. 一个**工具轮起点** assistant 消息，且它的全部 tool_use 都能在历史里
+///      找到对应 tool_result（[`is_tool_round_start`]）。
+///
+/// 第二类是「单轮长任务」不再全量重置的关键：从工具轮中间切开虽然安全
+/// （配对完整），但会丢掉这轮已经做过的工作；从工具轮起点切开则保住整轮。
 fn safe_keep_from(messages: &[Message], keep_recent: usize) -> Option<usize> {
     let total = messages.len();
+    if total == 0 {
+        return Some(0);
+    }
+    let result_ids = collect_tool_result_ids(messages);
     let mut keep_from = total.saturating_sub(keep_recent);
-    while keep_from > 0 && !is_user_turn_boundary(&messages[keep_from]) {
+    let is_boundary = |idx: usize| {
+        let candidate = &messages[idx];
+        (is_user_turn_boundary(candidate) || is_tool_round_start(candidate, &result_ids))
+            && can_cut_before(messages, idx)
+    };
+    while keep_from > 0 && !is_boundary(keep_from) {
         keep_from -= 1;
     }
-    if keep_from == 0 && !messages.is_empty() && !is_user_turn_boundary(&messages[0]) {
+    if keep_from == 0 && !is_boundary(0) {
         return None;
     }
     Some(keep_from)
@@ -1064,26 +1246,140 @@ mod tests {
     }
 
     /// 朴素按固定条数截断会正好切在 assistant(tool_use) 之后、
-    /// user(tool_result) 之前——回退逻辑必须往前找到更早的真实用户发言，
-    /// 而不是把 keep_from 落在工具结果消息或助手消息上。
+    /// user(tool_result) 之前——回退逻辑不能把 keep_from 落在工具结果消息上
+    /// （会把 use/result 拆到摘要两侧），但**可以**落在工具轮起点
+    /// assistant(tool_use) 上。后者是 P0-1 新增的：单轮长任务里没有新的
+    /// 真实 user 发言，只认 user 边界会让 keep_from 一路退到 0，把刚做完的
+    /// 整轮工作也一起摘要掉。
     #[test]
     fn safe_keep_from_backs_off_tool_result_boundary() {
         let messages = vec![
             user_text("请帮我读一下这个文件"), // 0: 真实用户边界
-            assistant_tool_use(),              // 1
+            assistant_tool_use(),              // 1: 工具轮起点
             user_tool_result(),                // 2
-            assistant_tool_use(),              // 3
+            assistant_tool_use(),              // 3: 工具轮起点
             user_tool_result(),                // 4
-            assistant_tool_use(),              // 5
+            assistant_tool_use(),              // 5: 工具轮起点
             user_tool_result(),                // 6
         ];
         // 朴素 keep_from = 7 - 3 = 4，正好落在 user_tool_result 上（idx 4）
         let keep_from = safe_keep_from(&messages, 3).expect("应能找到安全边界");
         assert!(
-            is_user_turn_boundary(&messages[keep_from]),
-            "回退后的截断点必须是真实用户发言，而非 tool_result 或 assistant 消息"
+            !matches!(
+                messages[keep_from].content.first(),
+                Some(ContentBlock::ToolResult { .. })
+            ),
+            "截断点不能落在 tool_result 上"
         );
-        assert_eq!(keep_from, 0, "本例中只有 idx 0 是真实用户发言边界");
+        assert_eq!(
+            keep_from, 3,
+            "应回退到最近一个工具轮起点，而不是继续退到 0 把整轮丢掉"
+        );
+        assert!(is_tool_round_start(
+            &messages[keep_from],
+            &collect_tool_result_ids(&messages)
+        ));
+    }
+
+    /// 核心回归：单轮长任务（只有首条真实 user 发言 + 几十轮工具）压缩后
+    /// **不能**退化成 `reset_entire_session`，必须保住尾部工作现场。
+    #[test]
+    fn compaction_keeps_the_trailing_tool_round_instead_of_resetting() {
+        let mut messages = vec![user_text("重构这个模块")];
+        for i in 0..20 {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("t{i}"),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({ "file_path": format!("src/f{i}.rs") }),
+                }],
+            });
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: ToolResultContent::text("x".repeat(400)),
+                    is_error: false,
+                }],
+            });
+        }
+        let keep_from = safe_keep_from_budget(&messages, 2_000).expect("单轮长任务也必须有边界");
+        assert!(keep_from > 0, "不能退化成全量重置");
+        assert!(
+            is_tool_round_start(&messages[keep_from], &collect_tool_result_ids(&messages)),
+            "保留段必须从一个完整的工具轮开始"
+        );
+        // 保留段里的每个 tool_use 都能找到自己的 tool_result
+        let kept = &messages[keep_from..];
+        for (idx, msg) in kept.iter().enumerate() {
+            for block in &msg.content {
+                if let ContentBlock::ToolUse { id, .. } = block {
+                    assert!(
+                        kept[idx + 1..]
+                            .iter()
+                            .flat_map(|m| m.content.iter())
+                            .any(|b| matches!(
+                                b,
+                                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                            )),
+                        "保留段的 tool_use {id} 没有对应 tool_result"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 尾部恰好以 assistant(tool_use) 开头时不能再插 `COMPACT_ACK`——那会
+    /// 产生两条连续 assistant，provider 直接拒绝。
+    #[tokio::test]
+    async fn compaction_does_not_insert_ack_when_tail_starts_with_assistant() {
+        let mut session = Session::new();
+        session.push_user("先读文件");
+        // 10 轮 × 约 1000 token 的 tool_result：总量必须超过 keep 预算
+        // （8K 窗口下 clamp 到 8_000），否则会出现「全部保留 → keep_from=0
+        // → 退化成整体重置」，测不到 ACK 条件化这条路径。
+        for i in 0..10 {
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("t{i}"),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({}),
+                }],
+            });
+            session.messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: ToolResultContent::text("y".repeat(3_000)),
+                    is_error: false,
+                }],
+            });
+        }
+        // 小窗口 + 小预算 → 一定会保留尾部工具轮，且首条是 assistant
+        compact_session(&mut session, &StaticSummaryProvider, 8_000, None)
+            .await
+            .expect("应能压缩");
+        assert!(
+            session.messages.len() >= 2,
+            "应保留摘要 + 尾部工具轮，实际 {} 条",
+            session.messages.len()
+        );
+        for pair in session.messages.windows(2) {
+            assert!(
+                pair[0].role != pair[1].role,
+                "压缩后出现连续同角色消息：{:?} → {:?}",
+                pair[0].role,
+                pair[1].role
+            );
+        }
+        assert!(
+            !session.messages.iter().any(|m| {
+                matches!(m.content.first(), Some(ContentBlock::Text { text }) if text == crate::prompts::COMPACT_ACK)
+            }),
+            "尾部以 assistant 开头时不应插入确认语"
+        );
     }
 
     #[test]
@@ -1124,15 +1420,15 @@ mod tests {
             &mut session,
             &StaticSummaryProvider,
             200_000,
-            estimated,
             threshold,
             None,
+            estimate_tokens,
         )
         .await;
         assert_eq!(outcome.passes, 0);
         assert!(outcome.last_result.is_none());
         assert!(outcome.last_error.is_none());
-        assert_eq!(outcome.final_estimated, estimated);
+        assert_eq!(outcome.final_estimated, estimate_tokens(&session.messages));
     }
 
     /// 兜底回归:即便 compact 第一次没把消息压回阈值(heuristic 偏低 /
@@ -1159,9 +1455,9 @@ mod tests {
             &mut session,
             &StaticSummaryProvider,
             200_000,
-            estimated,
             threshold,
             None,
+            estimate_tokens,
         )
         .await;
         // 必须循环过 compact——v0.2.19 之前『0 轮就裸发』的回归根因。
@@ -1178,6 +1474,127 @@ mod tests {
             outcome.final_estimated < estimated,
             "compact 必须实际减少 token; 起始 {estimated}, 最终 {}",
             outcome.final_estimated
+        );
+    }
+
+    /// 口径回归：循环内的收敛判断必须与进入条件同口径。
+    ///
+    /// 旧实现用 messages-only 的 `estimate_tokens` 对比**请求级**阈值，两者差
+    /// 的 system + 工具 schema + 输出预留有 4~5 万 token——于是一次压缩早已
+    /// 把真实请求压进阈值，循环却判定「还超标」，白跑第 2、3 轮，每一轮都把
+    /// 上一轮刚保留的尾部原文再摘要一次。
+    ///
+    /// 这里用「measure = messages 估算 + 5 万固定开销」的口径复现：真正被压到
+    /// 阈值下之后必须是 0 次额外 pass。
+    #[tokio::test]
+    async fn until_fit_uses_the_callers_measurement_not_messages_only() {
+        const FIXED_OVERHEAD: u32 = 50_000;
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+            });
+        }
+        let measure = |messages: &[Message]| estimate_tokens(messages) + FIXED_OVERHEAD;
+        let threshold = measure(&session.messages);
+        let outcome = compact_session_until_fit(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            threshold,
+            None,
+            &measure,
+        )
+        .await;
+        assert_eq!(
+            outcome.passes, 0,
+            "首次测量已在阈值内时不该白跑任何一轮 compact"
+        );
+        assert_eq!(outcome.final_estimated, measure(&session.messages));
+    }
+
+    /// 停滞熔断：一轮压缩若压不下 5%，继续压只是对着同一段历史反复烧 LLM
+    /// 往返（`MAX_COMPACT_PASSES` 上限 3 次），而且每次都会再丢一点原文。
+    /// 构造一个「压完几乎不变」的场景：历史只剩摘要体量的内容，压到
+    /// `reset_entire_session` 之后再压就只会撞上 `TooFewMessages`。
+    #[tokio::test]
+    async fn until_fit_stops_when_a_pass_makes_no_progress() {
+        // 摘要 provider 返回一条固定的长摘要：压完的体积基本等于压之前的
+        // 体积，天然构成「压不动」。
+        struct BulkySummaryProvider;
+        #[async_trait::async_trait]
+        impl Provider for BulkySummaryProvider {
+            async fn stream(
+                &self,
+                _system: &wyj_api::SystemPrompt<'_>,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::provider::EventStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+            async fn complete(
+                &self,
+                _system: &wyj_api::SystemPrompt<'_>,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::types::CompletionResult> {
+                Ok(wyj_api::types::CompletionResult {
+                    content: vec![ContentBlock::Text {
+                        text: "## Task & Intent\n".to_string() + &"摘要内容".repeat(50),
+                    }],
+                    stop_reason: wyj_api::types::StopReason::EndTurn,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })
+            }
+        }
+
+        let mut session = Session::new();
+        session.push_user("重构整个模块");
+        for i in 0..3 {
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("t{i}"),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({}),
+                }],
+            });
+            session.messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: ToolResultContent::text("结果".repeat(200)),
+                    is_error: false,
+                }],
+            });
+        }
+        let before = estimate_tokens(&session.messages);
+        // 阈值定在「几乎不可能达到」的位置，逼它走满多轮。
+        let outcome =
+            compact_session_until_fit(&mut session, &BulkySummaryProvider, 200_000, 1, None, |m| {
+                estimate_tokens(m)
+            })
+            .await;
+        assert!(outcome.last_error.is_none(), "熔断不是错误");
+        assert!(
+            outcome.passes <= 2,
+            "压不动时必须停手，实测跑了 {} 轮",
+            outcome.passes
+        );
+        assert!(
+            estimate_tokens(&session.messages) < before,
+            "至少第一轮要真的压下去一点"
         );
     }
 
@@ -1227,9 +1644,9 @@ mod tests {
             &mut session,
             &FailingProvider,
             200_000,
-            estimated,
             threshold,
             None,
+            estimate_tokens,
         )
         .await;
         assert!(outcome.last_error.is_some(), "LLM 失败必须透传");
@@ -1245,15 +1662,14 @@ mod tests {
         let mut session = Session::new();
         // 总消息数 <= 8 → compact_session 会 bail "消息数量过少"
         session.messages.push(user_text("hello"));
-        let estimated = estimate_tokens(&session.messages);
         let threshold = 1; // 永远低于,触发 compact
         let outcome = compact_session_until_fit(
             &mut session,
             &StaticSummaryProvider,
             200_000,
-            estimated,
             threshold,
             None,
+            estimate_tokens,
         )
         .await;
         assert!(outcome.last_error.is_none(), "已无可压缩不是错误");
@@ -1468,11 +1884,63 @@ mod tests {
         assert!(audit.history_tokens > 0);
     }
 
+    /// `effective_window` 的语义：记录了就用记录的，没记录才回落——面板与
+    /// 决策共用同一个分母就是靠它。
+    #[test]
+    fn effective_window_prefers_the_recorded_one() {
+        let audit = ContextAudit::default().with_window(256_000);
+        assert_eq!(audit.effective_window(1_000_000), 256_000);
+        let never_requested = ContextAudit::default();
+        assert_eq!(never_requested.window, 0);
+        assert_eq!(never_requested.effective_window(200_000), 200_000);
+    }
+
+    /// `calibrated_total` 只缩放 prompt 部分——`output_reserve` 是配置里的
+    /// `max_tokens`，不是估出来的，按真实 token 折算没有意义。
+    #[test]
+    fn calibrated_total_scales_prompt_but_never_the_output_reserve() {
+        let audit = ContextAudit {
+            system_tokens: 10_000,
+            tool_schema_tokens: 5_000,
+            history_tokens: 25_000,
+            output_reserve: 32_000,
+            framing_tokens: 100,
+            window: 0,
+            reclaimable_tool_result_tokens: 0,
+        };
+        assert_eq!(audit.calibrated_total(1.0), audit.total());
+        assert_eq!(audit.calibrated_total(1.3), 52_130 + 32_000);
+        assert_eq!(audit.calibrated_total(0.5), 20_050 + 32_000);
+    }
+
+    /// 校准系数被 clamp 在 `[0.5, 2.0]`：超出这个区间几乎一定意味着端点
+    /// 上报口径不同（把 cache 算进了 prompt、或干脆编数），照单全收会让
+    /// 压缩阈值漂到不可预期的位置。
+    #[test]
+    fn calibrated_total_clamps_out_of_range_ratios() {
+        let audit = ContextAudit {
+            system_tokens: 10_000,
+            tool_schema_tokens: 0,
+            history_tokens: 30_000,
+            output_reserve: 0,
+            framing_tokens: 0,
+            window: 0,
+            reclaimable_tool_result_tokens: 0,
+        };
+        assert_eq!(audit.calibrated_total(9.9), 80_000);
+        assert_eq!(audit.calibrated_total(0.01), 20_000);
+    }
+
     /// 压缩保留预算必须随窗口伸缩——固定条数 / 固定绝对值在两端都会出错。
+    ///
+    /// 上限 128K 是 v0.3.10 起的新值：旧上限 32K 在 1M 窗口下把历史压成
+    /// 约 48K（压缩比 18:1），实测表现为「压缩后模型明显失忆、重新读文件」。
+    /// 200K 窗口保持 25K 不变，因此常见配置的行为与旧版一致。
     #[test]
     fn compact_keep_budget_scales_and_clamps() {
-        assert_eq!(compact_keep_budget(8_000), 4_000);
+        assert_eq!(compact_keep_budget(8_000), 8_000);
         assert_eq!(compact_keep_budget(200_000), 25_000);
-        assert_eq!(compact_keep_budget(1_000_000), 32_000);
+        assert_eq!(compact_keep_budget(1_000_000), 125_000);
+        assert_eq!(compact_keep_budget(4_000_000), 128_000);
     }
 }
