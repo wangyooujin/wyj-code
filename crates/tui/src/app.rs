@@ -7422,7 +7422,171 @@ pub(crate) struct PasteHint {
     pub(crate) cursor_col: usize,
 }
 
+/// 应用内文本选区，坐标是**屏幕绝对坐标**（含宽字符）。
+///
+/// 为什么必须有它：一旦开启鼠标报告，终端就不会再处理拖选——事件全部进应用，
+/// 终端自己的选区缓冲区是空的。Claude Code 的 fullscreen 模式也是这么做的：
+/// 应用内选、松开即写系统剪贴板。反过来「不开鼠标报告」则滚轮在 Terminal.app
+/// 下彻底失效（它不支持 DEC 1007）。两者不可兼得，只能在应用内把选择补回来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextSelection {
+    /// 按下左键的锚点
+    pub anchor: (u16, u16),
+    /// 当前拖动到的位置（含）
+    pub cursor: (u16, u16),
+    /// 拖选是否仍在进行（松开后为 false，选区保留用于高亮与复制）
+    pub dragging: bool,
+}
+
+impl TextSelection {
+    fn new(anchor: (u16, u16)) -> Self {
+        Self {
+            anchor,
+            cursor: anchor,
+            dragging: true,
+        }
+    }
+
+    /// 归一化后的 `(起, 止)`：无论从下往上还是从上往下拖，取的都是同一段。
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let (ax, ay) = self.anchor;
+        let (cx, cy) = self.cursor;
+        if (ay, ax) <= (cy, cx) {
+            ((ax, ay), (cx, cy))
+        } else {
+            ((cx, cy), (ax, ay))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.anchor == self.cursor
+    }
+
+    /// 该格是否落在选区内（含首尾）。
+    pub(crate) fn contains(&self, x: u16, y: u16) -> bool {
+        let (start, end) = self.ordered();
+        let point = (y, x);
+        (start.1, start.0) <= point && point <= (end.1, end.0)
+    }
+}
+
 const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
+/// 复制提示在状态栏停留的时长。
+const SELECTION_NOTICE_DURATION: Duration = Duration::from_millis(1500);
+/// 双击判定窗口：同一位置两次按下间隔小于它就按「选词」处理。
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// 一屏聊天区文本快照的一行。
+///
+/// **每行只存一个 `String`**，而不是「每格一个 String」：内容区 120×40 就是
+/// 4800 次分配，而主循环空闲时也按 50ms 轮询重绘——这个量级会直接体现在
+/// 空闲 CPU 上。这里 `starts` 记下每格在 `text` 里的起始字节偏移，复制时按
+/// 字节区间切片即可。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScreenRow {
+    pub y: u16,
+    pub text: String,
+    /// `(屏幕列, 该格在 `text` 中的起始字节偏移)`；宽字符的续格不占条目。
+    pub starts: Vec<(u16, usize)>,
+}
+
+impl ScreenRow {
+    /// 取 `[from, to]` 列区间内的文字（含两端）。
+    ///
+    /// 起点 = 第一个 `x >= from` 的格；终点 = 第一个 `x > to` 的格的起点（即
+    /// 最后一格覆盖内容的右边界）。宽字符只登记起始列，落在它的续格上会顺延
+    /// 到下一格——半个宽字符没有意义，宁可少选一个。
+    fn slice(&self, from: u16, to: u16) -> &str {
+        let start = self
+            .starts
+            .iter()
+            .find(|(x, _)| *x >= from)
+            .map(|(_, offset)| *offset);
+        let Some(start) = start else {
+            return "";
+        };
+        let end = self
+            .starts
+            .iter()
+            .find(|(x, _)| *x > to)
+            .map(|(_, offset)| *offset)
+            .unwrap_or(self.text.len());
+        if start >= end {
+            return "";
+        }
+        self.text.get(start..end).unwrap_or("")
+    }
+}
+
+/// 双击选词的边界字符：把路径、URL、`path:line:col` 当作一个整体。
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '_' | '-' | '.' | '/' | '\\' | ':' | '@' | '#' | '%' | '+' | '=' | '~' | '&' | '?'
+        )
+}
+
+/// 把选区还原成文字。
+///
+/// 三条容易写错的地方：
+/// 1. **跨行只在选区覆盖处换行**：首行从起点取到行尾、末行从行首取到终点。
+///    整行整行地拼会把左右两侧的留白也复制进去。
+/// 2. **行尾空白要 trim_end**：内容区右边距是补出来的空格，不裁掉的话每行都
+///    拖一串尾巴，粘进终端/编辑器里全是多余空白。
+/// 3. **单行选区不 trim_start**：用户可能只想复制缩进后的片段（代码块），
+///    左端是他亲手点出来的边界。
+pub(crate) fn selection_text(sel: &TextSelection, rows: &[ScreenRow]) -> String {
+    let ((sx, sy), (ex, ey)) = sel.ordered();
+    let mut out = Vec::new();
+    for row in rows.iter().filter(|r| r.y >= sy && r.y <= ey) {
+        let from = if row.y == sy { sx } else { 0 };
+        let to = if row.y == ey { ex } else { u16::MAX };
+        out.push(row.slice(from, to).trim_end().to_string());
+    }
+    // 末尾的纯空行没有信息量（用户拖到内容区底部时会带进来），去掉。
+    while out.last().is_some_and(|line| line.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// 双击时把落点所在的「词」扩展成选区。
+///
+/// 词边界用 [`is_word_char`]：它把 `src/app.rs:123`、URL、`--flag=value` 都算
+/// 一个整体，与 iTerm2 的词边界取向一致。落在空白上时退化成该格本身，不让
+/// 双击变成「什么都没选中」。
+fn word_bounds_at(rows: &[ScreenRow], x: u16, y: u16) -> ((u16, u16), (u16, u16)) {
+    let Some(row) = rows.iter().find(|r| r.y == y) else {
+        return ((x, y), (x, y));
+    };
+    let idx = match row.starts.iter().position(|(cx, _)| *cx == x) {
+        Some(i) => i,
+        None => return ((x, y), (x, y)),
+    };
+    // 每格在 `text` 里的切片就是它自己的字符（宽字符也只占一个 entry）。
+    let char_at = |i: usize| -> Option<char> {
+        let (_, start) = *row.starts.get(i)?;
+        let end = row
+            .starts
+            .get(i + 1)
+            .map(|(_, offset)| *offset)
+            .unwrap_or(row.text.len());
+        row.text.get(start..end)?.chars().next()
+    };
+    if !char_at(idx).is_some_and(is_word_char) {
+        return ((x, y), (x, y));
+    }
+    let mut start = idx;
+    while start > 0 && char_at(start - 1).is_some_and(is_word_char) {
+        start -= 1;
+    }
+    let mut end = idx;
+    while char_at(end + 1).is_some_and(is_word_char) {
+        end += 1;
+    }
+    ((row.starts[start].0, y), (row.starts[end].0, y))
+}
 
 /// 超过任一阈值就把粘贴的长文本折叠成 `[Pasted text #n +N lines]` 占位符。
 ///
@@ -8886,6 +9050,160 @@ mod clipboard_paste_tests {
                 && second == "second"
         ));
     }
+
+    // ── 应用内文本选择 ────────────────────────────────────────────────
+
+    fn row(y: u16, text: &str, start_x: u16) -> ScreenRow {
+        let mut row = ScreenRow {
+            y,
+            ..Default::default()
+        };
+        for (i, ch) in text.chars().enumerate() {
+            row.starts.push((start_x + i as u16, row.text.len()));
+            row.text.push(ch);
+        }
+        row
+    }
+
+    fn sel(anchor: (u16, u16), cursor: (u16, u16)) -> TextSelection {
+        TextSelection {
+            anchor,
+            cursor,
+            dragging: false,
+        }
+    }
+
+    /// 单行选区只取覆盖的列，两侧留白不带进来。
+    #[test]
+    fn selection_text_takes_only_the_covered_columns() {
+        let rows = vec![row(0, "hello world", 0)];
+        let text = selection_text(&sel((6, 0), (10, 0)), &rows);
+        assert_eq!(text, "world");
+    }
+
+    /// 跨行时首行从起点到行尾、末行从行首到终点，中间整行全取。
+    #[test]
+    fn selection_text_splits_lines_at_the_selection_edges() {
+        let rows = vec![
+            row(0, "alpha beta", 0),
+            row(1, "gamma", 0),
+            row(2, "delta", 0),
+        ];
+        let text = selection_text(&sel((6, 0), (3, 2)), &rows);
+        assert_eq!(text, "beta\ngamma\ndelt");
+    }
+
+    /// 从下往上拖与从上往下拖必须得到同一段文字。
+    #[test]
+    fn selection_text_is_direction_agnostic() {
+        let rows = vec![row(0, "abc", 0), row(1, "def", 0)];
+        let forward = selection_text(&sel((1, 0), (1, 1)), &rows);
+        let backward = selection_text(&sel((1, 1), (1, 0)), &rows);
+        assert_eq!(forward, backward);
+        assert_eq!(forward, "bc\nde");
+    }
+
+    /// 行尾补白要裁掉：屏幕右侧的空格不是内容。
+    #[test]
+    fn selection_text_trims_trailing_padding() {
+        let rows = vec![row(0, "hi        ", 0)];
+        let text = selection_text(&sel((0, 0), (9, 0)), &rows);
+        assert_eq!(text, "hi");
+    }
+
+    /// 宽字符只登记起始列，落在续格上时顺延到下一格——绝不能切出半个字。
+    #[test]
+    fn selection_text_never_splits_a_wide_character() {
+        // "中文" 在屏幕上占 0,1 / 2,3 四列，但快照里只有 (0,"中") 与 (2,"文")。
+        let mut row = ScreenRow {
+            y: 0,
+            ..Default::default()
+        };
+        for (x, ch) in [(0u16, '中'), (2, '文')] {
+            row.starts.push((x, row.text.len()));
+            row.text.push(ch);
+        }
+        let rows = vec![row];
+
+        // 终点落在 "中" 的续格（列 1）上：仍取完整的一个字。
+        assert_eq!(selection_text(&sel((0, 0), (1, 0)), &rows), "中");
+        // 起点落在续格上：从下一个字开始，不产生乱码。
+        assert_eq!(selection_text(&sel((1, 0), (3, 0)), &rows), "文");
+    }
+
+    /// 选区左端不 trim：代码缩进是用户亲手点出来的边界，不能替他裁掉。
+    #[test]
+    fn selection_text_keeps_leading_indentation() {
+        let rows = vec![row(0, "    let x = 1;", 0)];
+        let text = selection_text(&sel((4, 0), (14, 0)), &rows);
+        assert_eq!(text, "let x = 1;");
+    }
+
+    /// 双击把路径/URL 当成一个词，而不是按 `/` `.` 切开。
+    #[test]
+    fn double_click_selects_a_whole_path() {
+        let rows = vec![row(0, "see src/app.rs:123 now", 0)];
+        let (start, end) = word_bounds_at(&rows, 7, 0); // 落在 "app"
+        let text = selection_text(&sel(start, end), &rows);
+        assert_eq!(text, "src/app.rs:123");
+    }
+
+    /// 双击落在空白上退化成该格，不能变成空选区。
+    #[test]
+    fn double_click_on_whitespace_stays_on_that_cell() {
+        let rows = vec![row(0, "a b", 0)];
+        let (start, end) = word_bounds_at(&rows, 1, 0);
+        assert_eq!(start, end);
+    }
+
+    /// 拖拽必须被夹在内容区里：鼠标滑到输入框上不能把输入框选进来。
+    #[test]
+    fn drag_is_clamped_to_the_content_area() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.selection = Some(TextSelection::new((2, 2)));
+
+        state.update_selection(100, 100);
+        let sel = state.selection.unwrap();
+        assert_eq!(sel.cursor, (39, 9));
+
+        state.update_selection(0, 0);
+        assert_eq!(state.selection.unwrap().cursor, (0, 0));
+    }
+
+    /// 内容区之外按下左键不建立选区（输入框/状态栏里点击不该出现高亮）。
+    #[test]
+    fn click_outside_the_content_area_does_not_start_a_selection() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.begin_selection(5, 30, &[]);
+        assert!(state.selection.is_none());
+    }
+
+    /// 有浮层时不允许应用内拖选：`frame_rows` 抓的是叠加后的画面，
+    /// 拖出来的会是面板边框与提示文字。
+    #[test]
+    fn modal_overlay_blocks_selection() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.session_picker = Some(SessionPickerState {
+            sessions: Vec::new(),
+            selected: 0,
+        });
+        state.begin_selection(5, 5, &[]);
+        assert!(state.selection.is_none());
+    }
+
+    /// 空白拖拽（按下就松）不产生选区，也不该尝试写剪贴板。
+    #[test]
+    fn a_click_without_drag_leaves_no_selection() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.begin_selection(5, 5, &[]);
+        assert!(state.selection.is_some());
+        state.end_selection(&[]);
+        assert!(state.selection.is_none());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9065,6 +9383,19 @@ pub struct AppState {
     pub mouse_capture: bool,
     /// 是否在内容区右侧绘制应用内滚动条（见 `config::UiCfg::scrollbar`）。
     pub show_scrollbar: bool,
+    /// 聊天/详情内容区本帧占用的屏幕矩形，由渲染层每帧回写。
+    ///
+    /// 应用内拖选需要知道「哪些格子属于正文」：输入框、状态栏、底部面板都不能
+    /// 被选进来，否则一次从上到下的拖选会把边框和提示文字一起复制。
+    pub(crate) chat_area: ratatui::layout::Rect,
+    /// 进行中的鼠标拖选。`None` 表示没有选区。
+    pub(crate) selection: Option<TextSelection>,
+    /// 上一次左键按下的时刻与位置，用于识别双击（选词）。
+    pub(crate) last_click: Option<(Instant, u16, u16)>,
+    /// 复制结果的瞬时提示（文案, 过期时刻），显示在状态栏右侧。
+    pub(crate) selection_notice: Option<(String, Instant)>,
+    /// 上一帧内容区的屏幕文本快照（`ScreenRow`），复制选区时按它还原文字。
+    pub(crate) frame_rows: Vec<ScreenRow>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
     /// 最近一次模型往返的时延画像，由 `AgentEvent::TurnDone` 从 session 带回来，
@@ -9350,6 +9681,11 @@ impl AppState {
             unseen_messages: false,
             mouse_capture: config.ui.mouse_capture,
             show_scrollbar: config.ui.scrollbar,
+            chat_area: ratatui::layout::Rect::default(),
+            selection: None,
+            last_click: None,
+            selection_notice: None,
+            frame_rows: Vec::new(),
             total_input_tokens: 0,
             session_latency: wyj_core::session::TurnLatency::default(),
             total_output_tokens: 0,
@@ -9596,6 +9932,182 @@ impl AppState {
             if msg.id == 0 {
                 msg.id = self.next_message_id;
                 self.next_message_id += 1;
+            }
+        }
+    }
+
+    // ── 应用内文本选择 ────────────────────────────────────────────────
+    //
+    // 开鼠标报告后终端不再处理拖选，选区必须在应用内完成。三个入口：
+    // `begin_selection`（左键按下）/ `update_selection`（拖拽）/ `end_selection`
+    // （松开，写剪贴板）。高亮与复制都走同一份屏幕快照，保证「选到的就是看到的」。
+
+    /// 左键按下：建立新选区；同一位置 400ms 内第二次按下按双击选词处理。
+    pub(crate) fn begin_selection(&mut self, x: u16, y: u16, rows: &[ScreenRow]) {
+        // 有浮层时不做应用内选择：`frame_rows` 抓的是叠加后的最终画面，
+        // 此时拖选会选中浮层里的文字，但浮层自己有选中行/高亮语义，两者打架。
+        if self.has_modal_overlay() {
+            self.selection = None;
+            return;
+        }
+        if !self
+            .chat_area
+            .contains(ratatui::layout::Position::new(x, y))
+        {
+            self.selection = None;
+            return;
+        }
+        let now = Instant::now();
+        let is_double = self.last_click.is_some_and(|(at, lx, ly)| {
+            lx == x && ly == y && now.duration_since(at) <= DOUBLE_CLICK_WINDOW
+        });
+        self.last_click = Some((now, x, y));
+
+        if is_double {
+            let (start, end) = word_bounds_at(rows, x, y);
+            self.selection = Some(TextSelection {
+                anchor: start,
+                cursor: end,
+                dragging: false,
+            });
+            // 双击即复制（与 Claude Code / iTerm2 一致：双击选词后松手就可用）。
+            self.copy_selection(rows);
+        } else {
+            self.selection = Some(TextSelection::new((x, y)));
+        }
+        self.selection_notice = None;
+    }
+
+    /// 拖拽：更新选区末端。拖到内容区外时夹到边界（这是「拖出屏幕继续选」
+    /// 的最小可用版本，不做自动滚动）。
+    pub(crate) fn update_selection(&mut self, x: u16, y: u16) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        if !sel.dragging {
+            return;
+        }
+        let area = self.chat_area;
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let cx = x.clamp(area.x, area.x + area.width - 1);
+        let cy = y.clamp(area.y, area.y + area.height - 1);
+        sel.cursor = (cx, cy);
+    }
+
+    /// 松开左键：结束拖选并把文字写入系统剪贴板。
+    pub(crate) fn end_selection(&mut self, rows: &[ScreenRow]) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        // 双击路径在按下时就已经复制并把 `dragging` 置假；随后的松开事件
+        // 不该再复制一遍（内容相同，但状态栏提示会闪两次）。
+        if !sel.dragging {
+            return;
+        }
+        sel.dragging = false;
+        if sel.is_empty() {
+            self.selection = None;
+            return;
+        }
+        self.copy_selection(rows);
+    }
+
+    /// 把当前选区按屏幕快照还原成文字并写剪贴板。
+    ///
+    /// 行的拼接规则：同一行内按列顺序取字符；跨行时**只对选区真正覆盖的部分**
+    /// 加换行——首行从选区起点到行尾、末行从行首到选区终点、中间整行全取。
+    /// 这避免了「复制一段文字却带出两侧的空白与边框」。
+    pub(crate) fn copy_selection(&mut self, rows: &[ScreenRow]) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let text = selection_text(&sel, rows);
+        if text.is_empty() {
+            self.selection = None;
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
+            Ok(()) => {
+                self.selection_notice = Some((
+                    wyj_i18n::tr_fmt(
+                        "selection.copied",
+                        &[("chars", &text.chars().count().to_string())],
+                    ),
+                    Instant::now() + SELECTION_NOTICE_DURATION,
+                ));
+            }
+            Err(e) => {
+                self.selection_notice = Some((
+                    wyj_i18n::tr_fmt("selection.copy_failed", &[("error", &e.to_string())]),
+                    Instant::now() + SELECTION_NOTICE_DURATION,
+                ));
+            }
+        }
+    }
+
+    /// 清除选区（按任意导航键 / 内容变化时）。
+    pub(crate) fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// 当前是否有覆盖在聊天区之上的浮层。
+    ///
+    /// 只用于「要不要允许应用内拖选」这一个判断：浮层有自己的选中行与高亮，
+    /// 在里面拖选会把面板边框、提示行一起复制出来，语义混乱。底部常驻面板
+    /// （权限确认、计划批准等）不算——它们不覆盖内容区。
+    pub(crate) fn has_modal_overlay(&self) -> bool {
+        self.session_picker.is_some()
+            || self.settings_dialog.is_some()
+            || self.profile_dialog.is_some()
+            || self.memory_dialog.is_some()
+            || self.evolution_dialog.is_some()
+            || self.mcp_dialog.is_some()
+            || self.skills_dialog.is_some()
+            || self.plugins_dialog.is_some()
+            || self.agents_dialog.is_some()
+            || self.extensions_dialog.is_some()
+            || self.schedule_dialog.is_some()
+    }
+
+    /// 从渲染后的 Buffer 抓一屏文本快照，供选区复制使用。
+    ///
+    /// 只取内容区（`chat_area`），跳过右侧滚动条列——否则复制出来的每行末尾都
+    /// 挂着 `│`/`┃`。宽字符占两格，第二格在 ratatui 里是空 symbol，跳过即可。
+    ///
+    /// 分配策略：每行一个 `String` + 一个 `(列, 偏移)` 数组，复用上一帧的容量。
+    /// 主循环空闲时也按 50ms 轮询重绘，逐格 `to_string()` 会在内容区 120×40 时
+    /// 每帧产生近 5000 次分配，直接体现在空闲 CPU 上。
+    pub(crate) fn capture_frame_rows(&mut self, buffer: &ratatui::buffer::Buffer) {
+        let area = self.chat_area.intersection(buffer.area);
+        if area.width == 0 || area.height == 0 {
+            self.frame_rows.clear();
+            return;
+        }
+        // 最右 1 列是滚动条，不参与选文。
+        let right = if self.show_scrollbar && area.width >= 3 {
+            area.right() - 1
+        } else {
+            area.right()
+        };
+        let rows = area.height as usize;
+        self.frame_rows.truncate(rows);
+        for (i, y) in (area.top()..area.bottom()).enumerate() {
+            if i == self.frame_rows.len() {
+                self.frame_rows.push(ScreenRow::default());
+            }
+            let row = &mut self.frame_rows[i];
+            row.y = y;
+            row.text.clear();
+            row.starts.clear();
+            for x in area.left()..right {
+                let symbol = buffer[(x, y)].symbol();
+                if symbol.is_empty() {
+                    continue;
+                }
+                row.starts.push((x, row.text.len()));
+                row.text.push_str(symbol);
             }
         }
     }
@@ -14716,6 +15228,14 @@ async fn tui_main(
         {
             state.paste_hint = None;
         }
+        // 复制提示同理：它只在状态栏停留一秒半，不留常驻噪音。
+        if state
+            .selection_notice
+            .as_ref()
+            .is_some_and(|(_, at)| *at <= Instant::now())
+        {
+            state.selection_notice = None;
+        }
 
         // ── 后台任务轮询 ──────────────────────────────────────────────
         // 退出中（should_quit）时必须整段跳过：kill_all() 会给所有 Running job
@@ -15028,8 +15548,31 @@ async fn tui_main(
                             }
                         }
                     }
-                    MouseEventKind::ScrollUp => state.scroll_focus_lines(-3),
-                    MouseEventKind::ScrollDown => state.scroll_focus_lines(3),
+                    // 应用内拖选：按下建锚点、拖拽扩范围、松开写剪贴板。
+                    // 开鼠标报告后终端不再处理选择，这条路径是「直接拖选复制」的
+                    // 唯一实现（Claude Code fullscreen 同款）。
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let rows = std::mem::take(&mut state.frame_rows);
+                        state.begin_selection(mouse.column, mouse.row, &rows);
+                        state.frame_rows = rows;
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        state.update_selection(mouse.column, mouse.row);
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        let rows = std::mem::take(&mut state.frame_rows);
+                        state.end_selection(&rows);
+                        state.frame_rows = rows;
+                    }
+                    MouseEventKind::ScrollUp => {
+                        // 滚动会让屏幕上原本选中的文字错位，选区必须一起作废。
+                        state.clear_selection();
+                        state.scroll_focus_lines(-3)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        state.clear_selection();
+                        state.scroll_focus_lines(3)
+                    }
                     _ => {}
                 },
                 Event::Key(key)
@@ -15037,6 +15580,10 @@ async fn tui_main(
                 {
                     // 任意按键都清除粘贴提示（提示本就是瞬时的）
                     state.paste_hint = None;
+                    // 选区是「刚才那次鼠标操作」的产物。保留它会让高亮看起来像
+                    // 卡住的样式；导航键（PageUp 等）尤其如此——用户按下去是要
+                    // 翻页，不是要继续选。Esc 也走这条，无需单独分支。
+                    state.clear_selection();
 
                     // ⓪ Session Picker 拦截（最高优先级，思考中时不允许打开）
                     if state.session_picker.is_some() {

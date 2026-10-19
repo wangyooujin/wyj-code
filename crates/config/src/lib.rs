@@ -2374,6 +2374,24 @@ context_window = 200000
         assert_eq!(AgentMode::Auto.label(), "auto");
     }
 
+    /// `[ui]` 缺省时两个开关都开：滚轮可用 + 滚动条可见。
+    ///
+    /// `mouse_capture` 默认 `true` 是**功能前提**而不是审美选择——macOS
+    /// Terminal.app 不支持 DEC 1007，不开捕获时滚轮事件根本到不了应用。
+    /// 老配置文件里没有 `[ui]` 节，必须靠 `#[serde(default)]` 落到这里的默认值。
+    #[test]
+    fn ui_cfg_defaults_to_mouse_capture_and_scrollbar_on() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.ui.mouse_capture);
+        assert!(cfg.ui.scrollbar);
+
+        // 显式关闭要能生效（用户可能想换回终端原生拖选）。
+        let cfg: Config =
+            toml::from_str("[ui]\nmouse_capture = false\nscrollbar = false\n").unwrap();
+        assert!(!cfg.ui.mouse_capture);
+        assert!(!cfg.ui.scrollbar);
+    }
+
     /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器。
     ///
     /// `manual` / `default` / `normal` 是历史遗留拼法，手动模式合并进 auto 后

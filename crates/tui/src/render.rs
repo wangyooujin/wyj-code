@@ -641,6 +641,9 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 时才会重新写入准确值，避免本帧未展示（面板未聚焦/无选中）时残留上一帧的旧值。
     state.sub_agent_detail_max_scroll = 0;
     state.shell_detail_max_scroll = 0;
+    // 内容区矩形回写：应用内拖选要知道哪些格子属于正文（见
+    // `AppState::capture_frame_rows`）。输入框/状态栏/底部面板一律不算。
+    state.chat_area = chunks[0];
     // 选中子 Agent 后内容区切换为它的执行内容；↑↓ 在运行中的子 Agent 之间切换，
     // Esc / ↑ 越界回到输入框时恢复聊天流。
     if state.ui_focus == UiFocus::SubAgents && state.selected_sub_agent.is_some() {
@@ -756,6 +759,52 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         &state.cwd,
         &state.hyperlink_registry,
     );
+
+    // 抓一屏文本快照供应用内复制使用。`linkify_buffer` 只改样式不改 symbol，
+    // 放在它之后也能拿到同样的字符；先抓只是为了少一层耦合。
+    //
+    // 只在鼠标捕获开启时抓：关闭捕获时用户根本无法建立选区（`Event::Mouse`
+    // 不会到达），这份快照纯属浪费——每帧要复制内容区全部 cell 的字符串。
+    if state.mouse_capture {
+        state.capture_frame_rows(f.buffer_mut());
+    }
+
+    // 选区高亮放在最后：它要压过链接下划线等既有样式，否则选中一片带链接的
+    // 文字时只有链接那几格没有底色。
+    if let Some(selection) = state.selection {
+        paint_selection(f.buffer_mut(), &selection, chunks[0]);
+    }
+}
+
+/// 给选区内的格子铺底色。
+///
+/// 只改背景 + 用 [`Theme::ensure_contrast`] 校正前景：这是**背景已知**的少数
+/// 场合之一，选中的文字必须仍然可读（浅色主题下尤其明显）。
+///
+/// 只画在内容区里（`state.chat_area`）：选区坐标虽然已经夹过边界，但滚动后
+/// 内容区高度可能变小，残留的旧坐标不该把输入框也染上底色。
+fn paint_selection(
+    buffer: &mut ratatui::buffer::Buffer,
+    selection: &crate::app::TextSelection,
+    area: Rect,
+) {
+    let bg = Theme::selected_bg_color();
+    let area = buffer.area.intersection(area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if !selection.contains(x, y) {
+                continue;
+            }
+            let cell = &mut buffer[(x, y)];
+            // 宽字符的续格 symbol 为空，给它上色不会产生视觉宽度，跳过即可
+            // （宽字符本身的背景色会覆盖它占的两列）。
+            if cell.symbol().is_empty() {
+                continue;
+            }
+            cell.set_bg(bg);
+            cell.set_fg(crate::theme::ensure_contrast(cell.fg, bg));
+        }
+    }
 }
 
 /// 底部面板类型与高度
@@ -4000,6 +4049,17 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
                 .fg(Theme::queue_color())
                 .add_modifier(Modifier::BOLD),
         )
+    } else if let Some((notice, expires_at)) = &state.selection_notice {
+        if *expires_at > std::time::Instant::now() {
+            (
+                notice.clone(),
+                Style::default()
+                    .fg(Theme::success_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (String::new(), Theme::dim())
+        }
     } else if state.ctrl_c_pressed {
         (
             "ctrl+c again to exit".to_string(),
@@ -10461,5 +10521,43 @@ mod chat_viewport_tests {
             !text.contains('┃') && !text.contains('│'),
             "开关关闭时不应画滚动条:\n{text}"
         );
+    }
+
+    /// 选区高亮必须真的落在屏幕上，且只落在内容区里。
+    #[test]
+    fn selection_paints_only_inside_the_content_area() {
+        let mut state = history_state(5);
+        state.chat_follow_tail = false;
+        state.chat_scroll = 0;
+        state.selection = Some(crate::app::TextSelection {
+            anchor: (2, 0),
+            cursor: (6, 1),
+            dragging: false,
+        });
+
+        let cells = crate::test_support::frame_cells_with_styles(
+            |f| draw(f, &mut state, &InputBox::new()),
+            60,
+            20,
+        );
+        let selected_bg = Theme::selected_bg_color();
+        // 内容区前两行被选中
+        for x in 2..=6 {
+            for y in 0..=1u16 {
+                assert_eq!(
+                    cells[y as usize][x as usize].bg, selected_bg,
+                    "({x},{y}) 应带选区底色"
+                );
+            }
+        }
+        // 输入框/状态栏区域不得被染色
+        for y in 16..20u16 {
+            for x in 0..60u16 {
+                assert_ne!(
+                    cells[y as usize][x as usize].bg, selected_bg,
+                    "({x},{y}) 在内容区之外，不该有选区底色"
+                );
+            }
+        }
     }
 }
