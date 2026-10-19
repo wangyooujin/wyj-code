@@ -163,25 +163,14 @@ impl ContextAudit {
         const REQUEST_OVERHEAD_TOKENS: u32 = 64;
         const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 
-        // system 分 stable / volatile 两段（见 wyj_api::SystemPrompt），估算时按
-        // 拼接后的完整文本计，与实际发送的字节保持一致。
-        let system_tokens = estimate_text_tokens(&system.combined()) as u32;
-        let message_overhead = (messages.len() as u32).saturating_mul(MESSAGE_OVERHEAD_TOKENS);
-        let tool_tokens = tools.iter().fold(0u32, |total, tool| {
-            let schema = tool.input_schema.to_string();
-            total.saturating_add(
-                (estimate_text_tokens(&tool.name)
-                    + estimate_text_tokens(&tool.description)
-                    + estimate_text_tokens(&schema)) as u32,
-            )
-        });
-
         Self {
-            system_tokens,
-            tool_schema_tokens: tool_tokens,
+            system_tokens: estimate_system_tokens(system) as u32,
+            tool_schema_tokens: estimate_tools_tokens(tools),
             history_tokens: estimate_tokens(messages),
             output_reserve: max_output_tokens,
-            framing_tokens: message_overhead.saturating_add(REQUEST_OVERHEAD_TOKENS),
+            framing_tokens: (messages.len() as u32)
+                .saturating_mul(MESSAGE_OVERHEAD_TOKENS)
+                .saturating_add(REQUEST_OVERHEAD_TOKENS),
             reclaimable_tool_result_tokens: reclaimable_tool_result_tokens(messages),
             window: 0,
         }
@@ -207,6 +196,52 @@ impl ContextAudit {
             fallback
         }
     }
+}
+
+/// system prompt 的 token 估算，**不拼接 stable + volatile**。
+///
+/// 旧实现调 `system.combined()`：主提示词本身就有几万 token，一次工具轮里
+/// `from_request` 最多被调用 10 次（context editing 的 measure 闭包 + 压缩判定
+/// + 阈值判定），等于每轮把整个系统提示重新分配、逐字符扫 10 遍。
+///
+/// 分段估算与拼接后估算**完全等价**：`estimate_text_tokens` 是逐字符的纯
+/// 函数，拼接只多出一个 `\n\n`（非 CJK，贡献 0）。
+pub fn estimate_system_tokens(system: &wyj_api::SystemPrompt<'_>) -> usize {
+    estimate_text_tokens(system.stable) + estimate_text_tokens(system.volatile)
+}
+
+/// 工具定义的 token 估算，按**工具名缓存**。
+///
+/// 每个工具的 `input_schema.to_string()` 是一次完整 JSON 序列化——本仓库
+/// 工具集（未含 MCP）就能到几万字符，而 `from_request` 每轮最多调 10 次、
+/// 每次遍历 `tools.len()` 个工具，几百次重复序列化同样的字符串。
+///
+/// 缓存键用工具名：同一进程内 schema 变了（`Agent::refresh_tool_definitions`、
+/// MCP 重连）会重新算并覆盖旧值，代价只是「用新值覆盖旧值」，不会有陈旧读。
+pub fn estimate_tools_tokens(tools: &[ToolDefinition]) -> u32 {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    tools.iter().fold(0u32, |total, tool| {
+        let tokens = match cache.get(&tool.name) {
+            Some(tokens) => *tokens,
+            None => {
+                let schema = tool.input_schema.to_string();
+                let tokens = (estimate_text_tokens(&tool.name)
+                    + estimate_text_tokens(&tool.description)
+                    + estimate_text_tokens(&schema)) as u32;
+                cache.insert(tool.name.clone(), tokens);
+                tokens
+            }
+        };
+        total.saturating_add(tokens)
+    })
 }
 
 /// 历史中「超出最近 [`RECLAIM_KEEP_RECENT_TOOL_CALLS`] 个工具调用」的

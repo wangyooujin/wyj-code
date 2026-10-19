@@ -76,7 +76,12 @@ pub const MCP_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_sec
 pub struct McpBridgeTool {
     tool_name: String,
     remote_tool_name: String,
+    server_name: String,
     definition: ToolDefinition,
+    /// MCP 协议的 `readOnlyHint`。**缺省按 false 处理**（保守）：绝大多数 server
+    /// 不声明 annotations，把「没声明」当成只读等于让任意第三方 server 的写操作
+    /// 绕过审批。
+    read_only: bool,
     client: Arc<Mutex<McpHandle>>,
 }
 
@@ -88,6 +93,25 @@ impl Tool for McpBridgeTool {
 
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
+    }
+
+    /// MCP 工具默认**需要**权限确认。
+    ///
+    /// 修复前这里落到 `Tool::needs_permission` 的默认 `false`，于是 Auto 模式下
+    /// 模型可以直接调用任意已连接 server 的任何工具（含写文件、发消息、改数据库）
+    /// 而完全不弹窗——`needs_permission` 是审批链的第一道闸，它返回 false 时
+    /// `Agent::ensure_tool_permission` 直接 `Ok(())`，后面的 AutoGate 与
+    /// `confirm_tool` 都不会被调用。
+    ///
+    /// 只信任 server 显式声明的 `readOnlyHint == Some(true)`；未声明一律按有副作用处理。
+    fn needs_permission(&self, _input: &Value) -> bool {
+        !self.read_only
+    }
+
+    fn action_summary(&self, input: &Value) -> String {
+        let args = serde_json::to_string(input).unwrap_or_default();
+        let args = crate::bridge::summarize_args(&args);
+        format!("{} · {}{args}", self.server_name, self.remote_tool_name)
     }
 
     async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
@@ -222,10 +246,13 @@ async fn build_bridges(client: McpHandle, server_name: &str) -> Result<Vec<McpBr
             input_schema: schema,
             native: None,
         };
+        let read_only = annotations_mark_read_only(mcp_tool.annotations.as_ref());
         bridges.push(McpBridgeTool {
             tool_name,
             remote_tool_name,
+            server_name: server_name.to_string(),
             definition: def,
+            read_only,
             client: client.clone(),
         });
     }
@@ -248,6 +275,27 @@ fn sanitize_server_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// 只有显式 `readOnlyHint == Some(true)` 才算只读；未声明或 `Some(false)` 都按
+/// 有副作用处理。抽成纯函数便于单测（`ToolAnnotations` 是 `#[non_exhaustive]`，
+/// 只能从 `Default` 构造）。
+fn annotations_mark_read_only(annotations: Option<&rmcp::model::ToolAnnotations>) -> bool {
+    annotations.and_then(|a| a.read_only_hint) == Some(true)
+}
+
+/// 权限弹窗里的参数摘要：截断到一屏可读的长度。
+fn summarize_args(raw: &str) -> String {
+    const MAX: usize = 120;
+    if raw.is_empty() || raw == "{}" || raw == "null" {
+        return String::new();
+    }
+    let clipped: String = raw.chars().take(MAX).collect();
+    if clipped.chars().count() < raw.chars().count() {
+        format!(" {clipped}…")
+    } else {
+        format!(" {clipped}")
+    }
 }
 
 #[cfg(test)]
@@ -305,5 +353,34 @@ mod tests {
         // 正确包装成 Err 而不是 panic，不依赖任何真实 MCP server。
         let cfg = stdio_cfg(Some("wyj-code-definitely-not-a-real-binary-xyz"));
         expect_err_containing(&cfg, "启动 MCP 子进程失败").await;
+    }
+
+    /// 未声明 annotations 的 MCP 工具必须走审批。
+    #[test]
+    fn only_explicit_read_only_hint_skips_permission() {
+        use rmcp::model::ToolAnnotations;
+
+        assert!(!annotations_mark_read_only(None));
+
+        let mut unset = ToolAnnotations::default();
+        unset.read_only_hint = None;
+        assert!(!annotations_mark_read_only(Some(&unset)));
+
+        let mut declared_write = ToolAnnotations::default();
+        declared_write.read_only_hint = Some(false);
+        assert!(!annotations_mark_read_only(Some(&declared_write)));
+
+        let mut declared_read = ToolAnnotations::default();
+        declared_read.read_only_hint = Some(true);
+        assert!(annotations_mark_read_only(Some(&declared_read)));
+    }
+
+    #[test]
+    fn action_summary_truncates_large_arguments() {
+        let short = summarize_args("{}");
+        assert!(short.is_empty());
+        let long = summarize_args(&"x".repeat(500));
+        assert!(long.ends_with('…'));
+        assert!(long.chars().count() <= 122);
     }
 }

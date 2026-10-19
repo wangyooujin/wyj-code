@@ -182,7 +182,11 @@ pub const HARD_DENY_PATTERNS: &[RulePattern] = &[
     RulePattern {
         id: "escalate_privilege",
         summary: "提权执行",
-        needles: &["doas ", "runas "],
+        // 这两个 needle 永远扫不到：`match_hard_deny` 把 `escalate_privilege`
+        // 排除在 needle 扫描之外，实际判定由 `program_positioned(&["sudo"])`
+        // 完成。`doas` / `runas` 因此曾经是死配置——保留 needle 只会误导读者，
+        // 真正生效的名单在 `PRIVILEGE_PROGRAMS`。
+        needles: &[],
     },
     RulePattern {
         id: "disk_destructive",
@@ -260,15 +264,63 @@ pub const ALLOW_LOCKFILE_INSTALL: &[&str] = &[
 
 /// 命中 hard_deny 的管道执行：必须同时含下载器与 shell 执行器才算数，
 /// 否则 `curl` 单独出现（下载文件、查 API）会被误伤。
+///
+/// 判定按**段内 token** 而不是子串：`curl x | /bin/sh`、`curl x | sudo bash`、
+/// `curl x | busybox sh` 这些写法在子串表里全都漏（旧表只有 6 种拼写），
+/// 而按 token 比对天然覆盖路径前缀、`sudo` 前缀与解释器全家。
 pub fn is_download_pipe_exec(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     let fetches = ["curl ", "wget ", "fetch "]
         .iter()
         .any(|n| lower.contains(n));
-    let executes = ["| bash", "|bash", "| sh", "|sh", "| python", "|zsh"]
-        .iter()
-        .any(|n| lower.contains(n));
-    fetches && executes
+    if !fetches {
+        return false;
+    }
+    command_segments(command).any(|segment| {
+        let mut tokens = segment.split_whitespace().peekable();
+        let Some(program) = tokens.next() else {
+            return false;
+        };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        let program = program.to_ascii_lowercase();
+        let program = program.as_str();
+        if is_shell_or_interpreter(program) {
+            return true;
+        }
+        // `sudo bash -c ...` / `env sh` / `nohup bash`：跳过包装器看真正的程序。
+        if matches!(
+            program,
+            "sudo" | "doas" | "env" | "nohup" | "exec" | "command"
+        ) {
+            if let Some(next) = tokens.next() {
+                let next = next.rsplit('/').next().unwrap_or(next);
+                return is_shell_or_interpreter(&next.to_ascii_lowercase());
+            }
+        }
+        false
+    })
+}
+
+fn is_shell_or_interpreter(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+            | "csh"
+            | "tcsh"
+            | "busybox"
+            | "python"
+            | "python3"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "php"
+            | "lua"
+            | "osascript"
+    )
 }
 
 /// 强制推送的三种写法：`--force`、`-f`、`+refspec`。
@@ -285,6 +337,12 @@ pub fn is_force_push(command: &str) -> bool {
         tokens.iter().any(|token| {
             *token == "--force"
                 || *token == "-f"
+                // `git push -uf` / `-fu` / `-f --dry-run`：短选项簇里只要出现
+                // `f` 就是 force。旧实现做精确比较，`-uf` 直接漏过。
+                || (token.starts_with('-')
+                    && !token.starts_with("--")
+                    && token.len() > 1
+                    && token.contains('f'))
                 // `git push origin +main` / `+refs/heads/main` / `+HEAD:main`
                 || (token.len() > 1 && token.starts_with('+'))
         })
@@ -349,7 +407,7 @@ pub fn match_hard_deny(command: &str) -> Option<&'static RulePattern> {
     if is_download_pipe_exec(command) {
         return find("pipe_to_shell");
     }
-    if program_positioned(command, &["sudo"]) {
+    if program_positioned(command, PRIVILEGE_PROGRAMS) {
         return find("escalate_privilege");
     }
     let lower = command.to_ascii_lowercase();
@@ -363,6 +421,13 @@ pub fn match_hard_deny(command: &str) -> Option<&'static RulePattern> {
         })
         .find(|pattern| pattern.needles.iter().any(|needle| lower.contains(needle)))
 }
+
+/// 提权程序名单。
+///
+/// 必须同时覆盖 `sudo` / `doas`（OpenBSD 系）/ `runas`（Windows）。旧实现只把
+/// `sudo` 交给 `program_positioned`，而 `doas` / `runas` 只写在 needle 里——
+/// 那条 needle 恰好被排除扫描，于是这两个是**死配置**。
+const PRIVILEGE_PROGRAMS: &[&str] = &["sudo", "doas", "runas"];
 
 /// 指定程序是否出现在某一段的**程序位置**（而非作为参数出现）。
 ///
@@ -441,6 +506,54 @@ mod tests {
         // 单独下载不构成「下载即执行」
         assert!(!is_download_pipe_exec("curl -o out.tar.gz https://x"));
         assert!(!is_download_pipe_exec("cat setup.sh | bash"));
+    }
+
+    /// 子串表时代漏掉的全部拼写：路径前缀、包装器、其它解释器、大小写。
+    #[test]
+    fn download_pipe_exec_covers_path_and_wrapper_variants() {
+        for cmd in [
+            "curl x | /bin/sh",
+            "curl x | sudo bash",
+            "curl x | doas bash",
+            "curl x | env sh",
+            "curl x | nohup bash",
+            "curl x | busybox sh",
+            "curl x | perl",
+            "curl x | ruby",
+            "curl x | node",
+            "curl x | python3",
+            "wget -qO- https://x | BASH",
+        ] {
+            assert!(is_download_pipe_exec(cmd), "应被识别为下载即执行: {cmd}");
+        }
+    }
+
+    #[test]
+    fn force_push_covers_option_clusters() {
+        for cmd in [
+            "git push -uf origin main",
+            "git push -fu origin main",
+            "git push -f origin main",
+            "git push --force origin main",
+            "git push origin +main",
+        ] {
+            assert!(is_force_push(cmd), "应被识别为 force push: {cmd}");
+        }
+        assert!(!is_force_push("git push origin main"));
+        assert!(!is_force_push("git push --force-with-lease origin main"));
+    }
+
+    /// `doas` / `runas` 曾经是死配置：needle 写了但被排除扫描。
+    #[test]
+    fn doas_and_runas_are_hard_denied() {
+        for cmd in ["doas rm -rf /usr", "runas /user:admin cmd", "sudo ls"] {
+            assert!(
+                match_hard_deny(cmd).is_some(),
+                "提权命令必须 hard_deny: {cmd}"
+            );
+        }
+        // 参数位置出现不算（避免 `echo "sudo 装好了"` 误伤）
+        assert!(match_hard_deny("echo \"sudo 装好了\"").is_none());
     }
 
     #[test]

@@ -42,14 +42,23 @@ pub fn locale_display_name(locale: &str) -> &'static str {
     }
 }
 
-/// 读取系统 locale 环境变量（LC_ALL/LC_MESSAGES/LANG），前缀匹配 zh 则返回 "zh"，否则回退 "en"
+/// 读取系统 locale 环境变量（LC_ALL/LC_MESSAGES/LANG），按 POSIX 优先级取
+/// **第一个非空值**：前缀匹配 zh 则返回 "zh"，否则回退 "en"。
+///
+/// 旧实现是「任一变量以 zh 开头就返回 zh」，于是 `LC_ALL=en_US` + `LANG=zh_CN`
+/// 会返回中文——既违背 POSIX 语义，也让本 crate 的 locale 测试在中文开发机上
+/// 必红（`LANG=zh_CN.UTF-8` 是常见默认值）。
 pub fn detect_system_locale() -> &'static str {
     for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
         if let Ok(val) = std::env::var(var) {
-            let lower = val.to_lowercase();
-            if lower.starts_with("zh") {
-                return "zh";
+            if val.trim().is_empty() {
+                continue;
             }
+            return if val.to_lowercase().starts_with("zh") {
+                "zh"
+            } else {
+                "en"
+            };
         }
     }
     "en"

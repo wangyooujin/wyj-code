@@ -31,6 +31,38 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 pub struct BashTool;
 
+/// 子进程组守卫：工具 future 被 abort / panic / 提前 return 时杀掉整个进程组。
+///
+/// 为什么不是只加 `kill_on_drop(true)`：那个只杀直接子进程（bash 本体）。
+/// `bash -c "cargo test"` 的 cargo / rustc 是 bash 的子孙，bash 一死它们就
+/// 被 init 收养继续跑——ESC 掉一条 `cargo test` 之后机器仍被占满，用户看到的
+/// 「已中断」与真实状态不符。
+struct ProcessGroupGuard {
+    #[cfg(unix)]
+    pgid: u32,
+}
+
+impl ProcessGroupGuard {
+    fn new(pgid: u32) -> Self {
+        Self {
+            #[cfg(unix)]
+            pgid,
+        }
+    }
+
+    /// 正常结束时调用：进程已经退出，不再需要兜底杀组。
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        crate::bash_session::signal_group(self.pgid, "KILL");
+    }
+}
+
 /// 实时推送的节流闸门 + 两路输出的累计缓冲。
 ///
 /// 两个 pump 共享一份「上次推送时刻 + 当时的累计字节数」：间隔没到、或这两
@@ -265,7 +297,11 @@ impl BashTool {
             .current_dir(ctx.cwd())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            // 工具 future 被 abort（ESC 中断 / 心跳看门狗）时，tokio 默认**不杀**
+            // 子进程：bash 会继续跑到自然结束。`kill_on_drop` 至少保证 bash 本体
+            // 死掉，进程组由下面的 `ProcessGroupGuard` 兜底。
+            .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
 
@@ -279,6 +315,10 @@ impl BashTool {
             Err(e) => return Ok(ToolResult::err(format!("执行失败: {e}"))),
         };
         let pgid = child.id().unwrap_or(0);
+        // abort 路径的兜底：future 被 drop 时 guard 跟着 drop，把整个进程组杀掉。
+        // 只靠 `kill_on_drop` 不够——它只杀 bash 本体，`bash -c "cargo test"`
+        // 派生的 cargo / rustc 会留成孤儿。
+        let group_guard = ProcessGroupGuard::new(pgid);
 
         // 管道必须自己抽：`wait()` 不读管道，子进程写满 64KB pipe buffer 后
         // 会与这里互等，死锁。这条与是否推送实时输出无关，两条路径都需要。
@@ -341,6 +381,8 @@ impl BashTool {
 
         let status = match waited {
             Err(_) => {
+                // 超时路径已经做过 TERM → KILL，guard 无需再兜底。
+                group_guard.disarm();
                 return Ok(ToolResult::err(format!(
                     "命令超时（{}s）: {}",
                     timeout, inp.command
@@ -349,6 +391,8 @@ impl BashTool {
             Ok(Err(e)) => return Ok(ToolResult::err(format!("执行失败: {e}"))),
             Ok(Ok(st)) => st,
         };
+        // 子进程已退出；显式解除守卫，避免对一个可能被系统复用的 pgid 发信号。
+        group_guard.disarm();
 
         let stdout = String::from_utf8_lossy(&bufs.stdout.lock().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&bufs.stderr.lock().unwrap()).into_owned();
@@ -575,6 +619,34 @@ mod tests {
         assert!(
             !marker.exists(),
             "超时后进程组必须被杀干净，子进程仍在写文件：{}",
+            marker.display()
+        );
+    }
+
+    /// ESC / 心跳看门狗走的是 `future.abort()`：子进程组必须跟着死，
+    /// 否则 `bash -c "cargo test"` 的子孙会在中断后继续跑满 CPU。
+    #[tokio::test]
+    async fn aborting_the_tool_future_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("abort-marker");
+        let ctx = TestContext::plain(dir.path().to_path_buf());
+        let cmd = format!("( sleep 2; echo late > {} ) & wait", marker.display());
+
+        let handle = tokio::spawn(async move {
+            BashTool
+                .run(serde_json::json!({"command": cmd, "timeout": 30}), &ctx)
+                .await
+        });
+        // 让 bash 真正起来并派生 sleep 子进程。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        // 子进程若存活，会在 2s 后写文件；杀干净则永不出现。
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            !marker.exists(),
+            "abort 之后进程组必须被杀干净：{}",
             marker.display()
         );
     }

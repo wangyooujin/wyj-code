@@ -73,6 +73,19 @@ pub fn acquire(path: &Path, what: &str) -> Result<FileLock> {
     imp::acquire(path, what)
 }
 
+/// 非阻塞获取：锁已被别人持有就立刻返回 `Ok(None)`，不等待。
+///
+/// 与 [`acquire`] 的区别只有语义，不是另一套实现——定时任务的防重入需要的是
+/// 「有人在跑就放弃这次触发」，而不是排队 30 秒后报错。排队会让 cron 把本该
+/// 跳过的触发变成一串等待中的进程。
+pub fn try_acquire(path: &Path, what: &str) -> Result<Option<FileLock>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create lock directory {}", parent.display()))?;
+    }
+    imp::try_acquire(path, what)
+}
+
 /// `path` 若是当前进程自己持有的锁，释放它；否则什么都不做。
 ///
 /// 用于「上次崩溃留下的孤儿锁」自愈：调用方在 `acquire` 失败后调用本函数再重试一次。
@@ -174,6 +187,36 @@ mod imp {
         let _ = fs::remove_file(path);
         Ok(())
     }
+
+    pub fn try_acquire(path: &Path, what: &str) -> Result<Option<FileLock>> {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open lock file {}", path.display()))?;
+        let fd = file.as_raw_fd();
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            let contended = matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            );
+            if contended {
+                return Ok(None);
+            }
+            return Err(error).with_context(|| format!("lock {what} at {}", path.display()));
+        }
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{}", std::process::id());
+        Ok(Some(FileLock {
+            path: path.to_path_buf(),
+            file,
+        }))
+    }
 }
 
 // ── 非 unix: 锁文件 + 陈旧兜底 ───────────────────────────────────────────────
@@ -225,6 +268,31 @@ mod imp {
                 _ => Err(error),
             })
             .with_context(|| format!("remove stale lock {}", path.display()))
+    }
+
+    pub fn try_acquire(path: &Path, what: &str) -> Result<Option<FileLock>> {
+        use std::io::Write;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                Ok(Some(FileLock {
+                    path: path.to_path_buf(),
+                    acquired: true,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if is_stale(path) {
+                    let _ = fs::remove_file(path);
+                    return Ok(None);
+                }
+                Ok(None)
+            }
+            Err(error) => Err(error).with_context(|| format!("lock {what} at {}", path.display())),
+        }
     }
 
     fn is_stale(path: &Path) -> bool {

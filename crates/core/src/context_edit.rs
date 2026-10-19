@@ -26,7 +26,7 @@
 //! 不能凭空消失）。
 
 use anyhow::{Context, Result};
-use wyj_api::types::{ContentBlock, Message, ToolResultContent};
+use wyj_api::types::{ContentBlock, Message, ToolResultContent, ToolResultPart};
 
 use crate::session::Session;
 use crate::workspace_cas::WorkspaceCas;
@@ -39,11 +39,40 @@ pub const ELIDED_MARKER: &str = "[context-edited]";
 /// 用白名单而非黑名单是刻意的：新增工具默认**不**被清理，需要显式加进来。清理的
 /// 误删代价（模型以为自己没做过某事）远高于漏删的收益。
 ///
-/// - `Read` / `Grep` / `Glob`：确定性只读，丢了可以重跑，但重跑也有代价（时间 +
-///   token），能召回就比重跑好。
-/// - `Bash` / `WebFetch`：一次性执行，**重跑拿不回原文**，是外部化收益最高、
-///   也最需要 `ContextRecall` 的一类。
-pub const ELIDABLE_TOOLS: &[&str] = &["Read", "Grep", "Glob", "Bash", "WebFetch"];
+/// - `Read` / `Grep` / `Glob` / `CodeSearch`：确定性只读，丢了可以重跑，但重跑也有
+///   代价（时间 + token），能召回就比重跑好。
+/// - `Bash` / `WebFetch` / `WebSearch`：一次性执行，**重跑拿不回原文**，是外部化
+///   收益最高、也最需要 `ContextRecall` 的一类。
+/// - `Agent`：子 Agent 的最终结论。重跑它等于让子 Agent 重做一遍调研；而它在
+///   重度使用子 Agent 的会话里往往就是最大的几块内容。此前 `Agent` 不在名单里，
+///   于是这类会话永远 `elided == 0`（见 [`elide_tool_results`] 的早退分支），
+///   只能退到有损的 `compact` 摘要。
+/// - `mcp__*`：MCP server 的返回值同样可能巨大且不可重跑。`MCP` 桥接工具的实际
+///   名字统一带 `mcp_{server}__{tool}` 前缀（见 `mcp::bridge::build_bridges`），
+///   这里按前缀匹配而不是枚举具体工具。
+///
+/// 仍**不**在名单里的：`Write` / `Edit` / `NotebookEdit`（写操作的回执重跑一次
+/// 就会再次落盘，是有副作用的重复执行）、`BashOutput`（小结果为主）。
+pub const ELIDABLE_TOOLS: &[&str] = &[
+    "Read",
+    "Grep",
+    "Glob",
+    "CodeSearch",
+    "Bash",
+    "WebFetch",
+    "WebSearch",
+    "Agent",
+];
+
+/// 按前缀匹配的 MCP 工具名（MCP server 的返回值也可能巨大且不可重跑）。
+pub const ELIDABLE_TOOL_PREFIXES: &[&str] = &["mcp__"];
+
+pub fn is_elidable_tool(tool_name: &str) -> bool {
+    ELIDABLE_TOOLS.contains(&tool_name)
+        || ELIDABLE_TOOL_PREFIXES
+            .iter()
+            .any(|prefix| tool_name.starts_with(prefix))
+}
 
 /// 单次调用的清理参数。
 #[derive(Debug, Clone, Copy)]
@@ -113,9 +142,9 @@ pub struct ElisionStats {
     pub blobs: Vec<String>,
 }
 
-/// 工具名是否在允许清理的白名单里。
+/// 工具名是否在允许清理的白名单里（精确名或 MCP 前缀）。
 pub fn is_elidable(tool_name: &str) -> bool {
-    ELIDABLE_TOOLS.contains(&tool_name)
+    is_elidable_tool(tool_name)
 }
 
 /// 从消息列表里建立 `tool_use_id → 工具名` 映射。
@@ -211,7 +240,17 @@ pub fn elide_tool_results(
         let text = match content {
             ToolResultContent::Text(t) => t.clone(),
             ToolResultContent::Blocks(v) => serde_json::to_string(v).unwrap_or_default(),
-            ToolResultContent::Parts(_) => continue,
+            // Parts 里混着图片与文本：图片必须留着（模型要能看见），只把其中
+            // 的文本段拼起来走同一条外部化路径。拼出来的哈希取回时是纯文本，
+            // 足够——`ContextRecall` 的用途是召回**可读内容**。
+            ToolResultContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    ToolResultPart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
         if text.len() < opts.min_bytes {
             continue;
@@ -227,7 +266,23 @@ pub fn elide_tool_results(
         let ContentBlock::ToolResult { content, .. } = &mut session.messages[mi].content[bi] else {
             unreachable!("上面已匹配过 ToolResult");
         };
-        *content = ToolResultContent::Text(placeholder);
+        match content {
+            ToolResultContent::Parts(parts) => {
+                // 保留图片段，只把文本段换成占位符。
+                let mut replaced = false;
+                for part in parts.iter_mut() {
+                    if let ToolResultPart::Text { text, .. } = part {
+                        *text = placeholder.clone();
+                        replaced = true;
+                        break;
+                    }
+                }
+                if !replaced {
+                    continue;
+                }
+            }
+            _ => *content = ToolResultContent::Text(placeholder),
+        }
         let after = crate::compact::estimate_block_tokens(&session.messages[mi].content[bi]) as u32;
 
         stats.elided += 1;
@@ -479,10 +534,22 @@ mod tests {
 
     #[test]
     fn elidable_tools_are_covered() {
-        for tool in ["Read", "Grep", "Glob", "Bash", "WebFetch"] {
+        for tool in [
+            "Read",
+            "Grep",
+            "Glob",
+            "CodeSearch",
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+            "Agent",
+            "mcp__postgres__query",
+            "mcp__github__create_pr",
+        ] {
             assert!(is_elidable(tool), "{tool} 应在白名单里");
         }
-        for tool in ["Edit", "Write", "Memory", "Agent"] {
+        // 写操作回执被清理会让模型以为自己没改过 → 重做。
+        for tool in ["Edit", "Write", "NotebookEdit", "Memory"] {
             assert!(!is_elidable(tool), "{tool} 不应被清理");
         }
     }

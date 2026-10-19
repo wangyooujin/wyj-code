@@ -242,6 +242,18 @@ async fn run_task(id: &str, _manual: bool) -> Result<()> {
     // schedule 子进程可能被系统 crontab 直接唤起，绕过 main.rs 的 init 路径。
     // init 是幂等的（OnceLock first-wins），所以重复调用安全。
     notify_emit_init_default_if_needed();
+
+    // 防重入：`*/5 * * * *` 的任务若某次跑 20 分钟，cron 会再叠 4 个完整
+    // agent 进程（每个还带自己的 MCP 子进程与工具进程树）。旧实现从不检查
+    // 「上一次还在跑」，`record_run_start` 还会被后一次无条件覆盖。
+    // 锁必须**在进程存活期间一直持有**，所以 guard 贯穿整个 run_task。
+    let lock_path = task_lock_path(id)?;
+    let Some(_run_lock) = wyj_config::filelock::try_acquire(&lock_path, "schedule task run")?
+    else {
+        eprintln!("定时任务 {id} 上一次仍在运行，跳过本次触发");
+        return Ok(());
+    };
+
     let manifest = schedule::load()?;
     let task = manifest
         .tasks
@@ -334,6 +346,31 @@ fn notify_emit_init_default_if_needed() {
     wyj_core::notify::init(&wyj_core::notify::NotifyCfg::default());
 }
 
+/// 定时任务防重入锁文件路径。
+fn task_lock_path(id: &str) -> Result<PathBuf> {
+    Ok(schedule::schedule_dir()?
+        .join("locks")
+        .join(format!("{id}.lock")))
+}
+
+/// 对整个进程组发信号。cli 不引用 `tools` crate（保持 crate 边界），
+/// unix 下走外部 `kill` 系统调用，与 `tools::bash_session::signal_group` 同语义。
+#[cfg(unix)]
+fn kill_process_group(pgid: u32, sig: &str) {
+    if pgid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(format!("-{pgid}"))
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(pgid: u32, _sig: &str) {
+    let _ = pgid;
+}
+
 fn prepare_log_file(id: &str, cfg: &wyj_config::StorageRetentionCfg) -> Result<PathBuf> {
     let log_dir = schedule::schedule_dir()?.join("logs").join(id);
     std::fs::create_dir_all(&log_dir).context("创建定时任务日志目录失败")?;
@@ -388,15 +425,45 @@ async fn spawn_headless(
         .arg("--cwd")
         .arg(task_cwd)
         .arg("--allowed-tools")
-        .arg(permissions.allowed_tools.join(","));
-    let status = command
+        .arg(permissions.allowed_tools.join(","))
+        // 卡住的 headless 会永久占住这次 cron 触发（以及防重入锁），
+        // 之后的触发全部被跳过。超时后连整个进程组一起杀掉。
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        .status()
-        .await
-        .context("等待 wyj-code -p 子进程失败")?;
-    Ok(status)
+        .spawn()
+        .context("启动 wyj-code -p 子进程失败")?;
+    let pgid = child.id().unwrap_or(0);
+
+    match tokio::time::timeout(SCHEDULE_RUN_TIMEOUT, child.wait()).await {
+        Ok(result) => result.context("等待 wyj-code -p 子进程失败"),
+        Err(_) => {
+            // 超时：整组 TERM → KILL，与 Bash 工具同一套三段式。
+            #[cfg(unix)]
+            kill_process_group(pgid, "TERM");
+            if tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                .await
+                .is_err()
+            {
+                #[cfg(unix)]
+                kill_process_group(pgid, "KILL");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            }
+            anyhow::bail!(
+                "定时任务子进程超过 {} 分钟未结束，已终止",
+                SCHEDULE_RUN_TIMEOUT.as_secs() / 60
+            )
+        }
+    }
 }
+
+/// 定时任务单次执行的硬超时。定时任务多是「跑一次测试 / 整理一次文档」，
+/// 30 分钟足够；再长基本是卡在某个交互提示或网络请求上。
+const SCHEDULE_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn latest_session_id_for(task_cwd: &Path) -> Option<String> {
     let dir = wyj_config::config_dir().ok()?.join("sessions");
