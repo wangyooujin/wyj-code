@@ -10,6 +10,103 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.9] - 2026-10-19
+
+### 压缩在历史最贵的那一刻付了全价，长会话滚几下就卡
+
+本次几条改动共用一个判据：**缓存/复用的前提是"前缀逐字节相同"，不是"看起来一样"**。
+
+### ① 压缩请求复用主对话前缀
+
+压缩发生在历史最长、最贵的那一刻，而旧实现从零构造请求：`COMPACT_SYSTEM` + 一条
+塞满整段历史文本的 user 消息。前缀与主对话毫无关系，provider 的前缀缓存**一次都
+命中不了**——DeepSeek 缓存命中价是 miss 的 1/50，Anthropic 是 1/10，一次 180K 的
+压缩差价就是数量级的。
+
+`compact_session` 新增 `prefix: Option<CompactPrefix>`：
+
+- `agent.rs` 传入**本次 stream 用的同一个** `SystemPrompt`（stable + volatile）与
+  同一份 `request_tools`。压缩请求的前缀必须逐字节等于主对话前缀，换成
+  `COMPACT_SYSTEM` 或省略 tools 都会让整段历史全价重发
+- messages 直接用 `session.messages[..keep_from]` 的切片，一字不改写；尾部追加一条
+  **新的** user 消息（`prompts::compact_instructions()`）。合并进最后一条已有消息会
+  让缓存命中点随之后退
+- `prefix: None` 退回 v0.3.8 的独立请求形态——供恢复期预压缩（拿不到 Agent 的
+  system/tools）与不缓存端点的场景使用
+
+### ② 区分「客户端断点」与「端点自动缓存」
+
+旧实现只有 `ExplicitBreakpoints` 一条判据，于是所有 OpenAI 协议端点（含 DeepSeek
+官方）都被记成 `Unsupported`。这不影响发请求，但污染了所有"这个端点有没有缓存"的
+下游判断——最直接的就是压缩该不该复用前缀。
+
+- 新增 `ModelCapabilities::reuses_prompt_prefix()`：`ExplicitBreakpoints` 与
+  `Automatic` 都返回 true，`Unsupported` 返回 false
+- `model_catalog` 为 `openai` / `deepseek` 官方端点补记 `PromptCacheMode::Automatic`
+  （DeepSeek 的磁盘缓存默认开启、请求里不需要任何字段）；MiniMax/GLM/Qwen/豆包/
+  Ollama/vLLM 仍保守记 `Unsupported`，否则会给它们多发一整段历史
+- 用户显式 `prompt_cache = false` 仍优先于静态目录
+
+### ③ 发送路径只截断副本，不再原地改写历史
+
+`persist_cap` 此前直接 `truncate_messages(&mut session.messages, cfg)`——历史本身是
+prompt cache 的前缀，原地改写会让后续每一轮的 `cache_read` 从被截断的位置起归零，
+且不可逆。
+
+- 新增 `serialize::messages_need_truncation` 探针：绝大多数轮次零拷贝，命中才克隆一份
+  历史、截断副本后发出去，`session.messages` 保持原文
+- 每次重试前重算（`context_overflow` 分支会改写 `session.messages`，复用上一轮副本
+  会把压缩前的历史又发一遍）
+- 落盘路径仍按原样截断副本，磁盘上限不变
+
+### ④ 工具输出溢出落盘（`tools::spill`）
+
+Bash 30KB / WebFetch 50KB 的上限是必须有的，但硬截断有两个真实损失：报错细节常常
+既不在头也不在尾（一行夹在 3000 行日志里），模型只能重跑 `npm install` / `cargo test`
+这种几分钟且可能有副作用的命令；旧标记也不告诉它"还有多少没看到"。
+
+`spill_truncated(text, head, tail, label)` 把全文写进 `<config_dir>/spill/`（0600、
+写入前脱敏、7 天 TTL 顺手清理），只回头尾 + 可读路径。模型据此可以 `Read`/`Grep`
+任意片段——上下文成本不变，信息不再丢失。落盘失败退回纯截断，绝不改变工具结果。
+WebFetch 同时从「只留开头」改回头尾 7:3。
+
+### ⑤ 聊天区视口窗口化
+
+旧实现每帧把**整个会话历史**塞进 `Paragraph`：`line_count()` 全量折行一遍，绘制时
+`Paragraph::scroll` 再全量折行一遍——**scroll 只跳过绘制、不跳过折行**。长会话下这
+两趟 O(历史) 就是「滚几下就卡死」的直接来源；而 `scroll` 是 `u16`，历史超过 65535
+物理行后底部内容根本滚不到。
+
+拆成 `logical_line_height`（先 `Line::width()` 快判，只有超宽行才跑 `WordWrapper`）/
+`locate_scroll_start`（物理行偏移 → 逻辑行下标 + 行内偏移）/ `visible_chat_lines`
+（只截出覆盖视口的连续区间）三段，输入从 O(历史) 降到 O(视口)。高度仍按**物理行**
+算，否则贴底时最后几条会被裁掉。
+
+### ⑥ thinking 走 markdown，标题栏显示实时速率
+
+thinking 正文此前逐行纯文本输出，`- ` / `1.` / `**` / 围栏全部字面落地，空行还被
+整批过滤，段落边界随之消失。改走 `render_thinking_markdown`：段内软换行保留、围栏
+退化成 `│` 引用式纯文本（不画方框不加行号）、整块 `Theme::dim()` 基色、外层只缩进
+4 格；展开态按宽度缓存，流式态只喂尾部 15 行。流式取尾会补被切掉的未闭合围栏，
+否则闭合行会被当成新的开启行、吞掉后面所有思考。
+
+标题栏新增 `{N} tok/s`（`StreamRateMeter`）：最近 2 秒滑动窗口，分母只算首 token
+之后的生成时长（TTFT/prefill 不算），增量 token 用浮点版
+`estimate_text_tokens_f64` 估算（整数版对单字符片段是 `1/3=0`，逐 delta 累加永远是 0）。
+`ToolStart` / `TurnDone` / `Error` / 中断 / 新回合五处必须 `reset()`。
+
+### ⑦ `/model` 分组面板字段规格化
+
+新增 `ProfileFieldSpec` / `ProfileFieldKind` / `ProfileFieldScope`，渲染、键位、校验
+统一从规格表派生，按 wire protocol 显隐 anthropic / openai 专属字段（思考预算 vs 思考
+强度、思考开关）。模型名字段 Enter 直接拉取 `/models` 列表（首项仍是"手动输入"兜底），
+命中静态容量表时自动回填 `context_window` / `max_tokens`——供应商的 `/models` 不返回
+任何容量元数据，只能靠这张保守表。修正 Anthropic `base_url` 以 `/v1` 结尾时拼出
+`/v1/v1/models`。
+
+测试：1588 个 workspace 测试通过（1548 → 1588）。
+
+
 ## [0.3.8] - 2026-10-18
 
 ### 中断的子 Agent 丢掉了「已经做到哪」，标题栏在复述一个步号
