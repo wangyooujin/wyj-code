@@ -27,6 +27,12 @@ vision = true                # 模型是否支持图片输入；false 时图片�
 # openai_stream_options = false # OpenAI-compatible 第三方端点可显式关闭 stream_options.include_usage
 # thinking_budget = 8000     # extended thinking 预算 token；不写/0 = 关闭（思考计入 output 计费）
 # interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
+# reasoning_effort = "medium" # OpenAI 线 thinking 档位：low/medium/high/xhigh/max/adaptive。
+                              # 只有 vendor 的 ThinkingSpec::effort_levels 收录该档位才会真正上送，
+                              # 其余被丢弃并在日志里 warn（`wyj-code model doctor` 可查）。
+# thinking_switch = "enabled" # OpenAI 线 thinking.type 显式覆盖：enabled/disabled/adaptive。
+                              # 不写 = 由 adapter 按模型默认决定。MiniMax M3.1 发 disabled 会 400，
+                              # adapter 会降级成"不发该字段"。
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空（或空串）自动检测系统 locale；决定 UI 文案 **与模型输出语言**（含 thinking）
 search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）

@@ -435,10 +435,17 @@ pub const SUBAGENT_PLAN_DESC: &str = "A research agent used to gather context be
 
 pub const COMPACT_SYSTEM: &str = "You are a conversation summarizer for a coding agent. Produce structured, information-dense summaries that allow seamless continuation of the work.";
 
-/// 压缩摘要指令（结构化分节模板）。`{conversation}` 处拼对话文本。
-pub fn compact_prompt(conversation: &str) -> String {
-    format!(
-        r#"Summarize the conversation below so the coding agent can continue the work seamlessly. Write the summary in the language the user was using. Use exactly these sections:
+/// 压缩指令正文（**不含**对话内容）。
+///
+/// 两条压缩路径共用这一段，防止措辞漂移：
+///   * [`compact_prompt`]：无前缀复用时把对话文本拼在末尾（旧路径）；
+///   * [`compact_instruction`]：复用主对话前缀时只发这一条——对话本身已经在
+///     请求的 messages 里，再拼一份等于把整段历史发两遍。
+///
+/// 措辞写成 "so far" 而不是 "below"：前者对「上文即对话」的复用路径成立，
+/// 对「对话附在末尾」的旧路径也不违和。
+pub fn compact_instructions() -> &'static str {
+    r#"Summarize the conversation so far so the coding agent can continue the work seamlessly. Write the summary in the language the user was using. Respond with the summary text only — do not call any tools. Use exactly these sections:
 
 ## Task & Intent
 What the user is trying to accomplish and why.
@@ -466,10 +473,18 @@ Any instructions, corrections, or constraints the user expressed.
 
 Preserve exact file paths, function names, command lines, and error messages verbatim — do not paraphrase them.
 
-Runtime-state boundary: tool availability, permission mode, environment variables, DNS state, and one-off connection failures are volatile. Do not turn them into durable constraints or instructions. If they are needed to explain unfinished work, label them as an observed past result that must be re-checked against the next request's current runtime block.
+Runtime-state boundary: tool availability, permission mode, environment variables, DNS state, and one-off connection failures are volatile. Do not turn them into durable constraints or instructions. If they are needed to explain unfinished work, label them as an observed past result that must be re-checked against the next request's current runtime block."#
+}
 
-Conversation:
-{conversation}"#
+/// 无前缀复用时的完整压缩提示：指令 + 对话文本。
+///
+/// 保留这条路径是因为并非所有 provider 都能让辅助调用复用主对话前缀
+/// （见 `compact::compact_session` 的选择逻辑）。对话文本已按
+/// [`crate::compact::messages_to_text`] 压成摘要友好的形态。
+pub fn compact_prompt(conversation: &str) -> String {
+    format!(
+        "{}\n\nConversation:\n{conversation}",
+        compact_instructions()
     )
 }
 

@@ -1670,7 +1670,10 @@ async fn main() -> Result<()> {
             // `MissingApiKey` 占位 provider 不能跑 compact;直接跳过,让用户
             // 走完 ProfileDialog 后再触发 on-demand 压缩即可。
             if let InitialProvider::Ready(p) = &initial_provider {
-                match wyj_core::compact_session(&mut tmp, p.as_ref(), window).await {
+                // 恢复期预压缩拿不到 Agent 的 system/tools（还没构造），因此
+                // 走无前缀复用路径：`None`。代价是这一次压缩全价，但它发生在
+                // 会话开始前、且只有一次，不影响交互期的缓存命中。
+                match wyj_core::compact_session(&mut tmp, p.as_ref(), window, None).await {
                     Ok(r) => eprintln!(
                         "{}",
                         wyj_i18n::tr_fmt(

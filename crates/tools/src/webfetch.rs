@@ -152,10 +152,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!(
-            "{}…（已截断，原长 {} 字节）",
-            crate::textutil::truncate_str(s, max),
-            s.len()
-        )
+        // 只保留开头会让长文档的结论段彻底丢失，而网页正文的有效信息常常在
+        // 中后段。走 spill：头尾各半 + 完整内容落盘，模型可按需 Read 取回。
+        crate::spill::spill_truncated(s, max * 7 / 10, max * 3 / 10, "webfetch")
     }
 }

@@ -165,6 +165,22 @@ impl ModelCapabilities {
             quirks: Vec::new(),
         }
     }
+
+    /// 这个端点是否会**自动**复用请求前缀（不需要客户端发 `cache_control`）。
+    ///
+    /// 与 [`PromptCacheMode::ExplicitBreakpoints`] 是两件事：后者要客户端在每个
+    /// 断点显式标注，前者由端点自己按前缀匹配（DeepSeek 磁盘缓存、OpenAI 自动
+    /// prompt caching）。
+    ///
+    /// 调用方关心的是**「重复发送同一段前缀会不会更便宜」**这个行为问题，两种
+    /// 机制都满足它，因此两者都返回 true。`Unsupported` 返回 false。
+    ///
+    /// 用途：决定压缩这类**辅助请求**要不要复用主对话前缀。复用会发更多 token
+    /// （旧实现只发文本化摘要），只有在端点真的按前缀计费时才划算——对不缓存的
+    /// 端点复用反而是净损失。
+    pub fn reuses_prompt_prefix(&self) -> bool {
+        !matches!(self.prompt_cache.value, PromptCacheMode::Unsupported)
+    }
 }
 
 #[cfg(test)]
