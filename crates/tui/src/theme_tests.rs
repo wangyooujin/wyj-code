@@ -90,6 +90,10 @@ fn production_source(file: &str) -> String {
         "hyperlink.rs" => include_str!("hyperlink.rs"),
         "input.rs" => include_str!("input.rs"),
         "app.rs" => include_str!("app.rs"),
+        // 从 render.rs 拆出的对话框子模块：**必须一起登记**。漏了它，
+        // 近 3000 行绘制代码就脱离这条配色守卫，而这正是它当初被拆出来的那
+        // 部分实现。
+        "render/dialogs.rs" => include_str!("render/dialogs.rs"),
         other => panic!("未登记的待扫描文件 `{other}`"),
     };
     match source.find("#[cfg(test)]") {
@@ -114,6 +118,7 @@ fn no_hardcoded_colors_outside_theme() {
         ("hyperlink.rs", production_source("hyperlink.rs")),
         ("input.rs", production_source("input.rs")),
         ("app.rs", production_source("app.rs")),
+        ("render/dialogs.rs", production_source("render/dialogs.rs")),
     ];
 
     // `Color::Rgb(` 只在 welcome.rs 的 logo 渐变里合法（它 match 分量、算插值）
