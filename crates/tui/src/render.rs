@@ -6,15 +6,18 @@ use crate::app::{
     ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
-    ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog, ScheduleInputField,
-    ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState, SettingsDialog,
-    SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay, SubAgentStatus,
-    SubAgentUiState, SubToolLine, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
-    PROFILE_API_KEY_FIELD_IDX, PROFILE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_LABEL_KEYS,
-    SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_LABEL_KEYS,
+    ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
+    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState,
+    SettingsDialog, SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay,
+    SubAgentStatus, SubAgentUiState, SubToolLine, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
+    PROFILE_FIELD_SPECS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT,
+    SETTINGS_FIELD_LABEL_KEYS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
-use crate::markdown::{render_markdown, render_streaming_markdown};
+use crate::markdown::{
+    display_width, render_markdown, render_streaming_markdown, render_streaming_thinking_markdown,
+    render_thinking_markdown,
+};
 use crate::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -961,7 +964,7 @@ struct ChatRenderCtx<'a> {
 ///
 /// 定这个值是终端高度的直觉：够看清一段命令在干什么，又不至于把屏幕刷满。
 /// 完整正文始终保留在工具结果里，跑完后自动收起，需要回看再按 Ctrl+O。
-const LIVE_TAIL_LINES: usize = 30;
+const LIVE_TAIL_LINES: usize = 15;
 
 /// 取正文尾部最多 [`LIVE_TAIL_LINES`] 行，并返回被截掉的行数。
 ///
@@ -979,6 +982,38 @@ fn live_tail(body: &str) -> (Vec<&str>, usize) {
         .collect();
     lines.reverse();
     (lines, skipped)
+}
+
+/// 被 `live_tail` 切掉的那段前缀里，是否留下了**未闭合**的围栏。
+///
+/// 只扫被丢掉的前缀，代价与尾部窗口无关。判据与 `markdown::split_unclosed_fence`
+/// 同源：按行数围栏开合，最后仍处于开启状态即视为未闭合。命中时流式尾部要补
+/// 一个开启行——否则尾部里的那个闭合围栏会被 markdown 当成新的开启围栏，
+/// 把它后面的所有正常思考都吞进代码块。
+fn fence_open_before(body: &str, skipped: usize) -> bool {
+    if skipped == 0 {
+        return false;
+    }
+    let mut open: Option<char> = None;
+    for line in body.lines().take(skipped) {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        let Some(marker) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') else {
+            continue;
+        };
+        let run = trimmed.chars().take_while(|c| *c == marker).count();
+        if run < 3 {
+            continue;
+        }
+        open = match open {
+            Some(current) if current == marker => None,
+            Some(current) => Some(current),
+            None => Some(marker),
+        };
+    }
+    open.is_some()
 }
 
 /// 渲染「正在执行」的工具实时输出块，挂在对应 ⏺ 行下方。
@@ -1030,7 +1065,7 @@ fn render_live_tool_output(lines: &mut Vec<Line<'static>>, tail: &str, ctx: &Cha
 
 /// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
 /// （`ChatMessage::Thinking`）两条数据路径共用同一个渲染入口。
-struct ThinkingRenderOpts {
+struct ThinkingRenderOpts<'a> {
     /// 仍在流式累积：只画一行状态，**完全不碰 `content`**。
     live: bool,
     /// 定稿后是否展开正文。
@@ -1040,6 +1075,12 @@ struct ThinkingRenderOpts {
     elapsed_secs: Option<f64>,
     /// 实时 spinner 帧序号（`live` 时注入 `thinking.running` 的 `{frame}`）。
     spinner_frame: usize,
+    /// 展开态正文的按宽度缓存（复用 `ChatMessage::render_cache`）。
+    ///
+    /// thinking 展开后走完整 markdown 解析，长思考几十行、历史里又有十几段，
+    /// 每帧重解析一次就是与 assistant 消息同一类的浪费；而它一旦定稿正文
+    /// 不再变化，正是缓存的最佳对象。`None` = 不缓存（测试与一次性渲染）。
+    cache: Option<&'a crate::app::RenderCache>,
 }
 
 fn clean_thinking_lines(content: &str) -> Vec<&str> {
@@ -1065,7 +1106,7 @@ fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     content: &str,
     max_content_width: usize,
-    opts: ThinkingRenderOpts,
+    opts: ThinkingRenderOpts<'_>,
 ) {
     if opts.live {
         // `{frame}` 由渲染层注入当前 spinner 帧：i18n 文案里写死 `⠋` 会让这行
@@ -1083,17 +1124,26 @@ fn render_thinking_block(
         }
         let (tail_lines, skipped) = live_tail(body);
         let width = max_content_width.saturating_sub(4).max(1);
-        for line in tail_lines {
-            if line.is_empty() {
+        // 尾部同样是 markdown：流式期间模型已经在写列表 / 围栏了，逐行原样
+        // 输出会让这几行在半秒内先"乱"一遍再变整齐，比不格式化更刺眼。
+        // 输入是尾部 30 行，解析成本与整段思考长度无关。
+        let mut tail_text = tail_lines.join("\n");
+        // 取尾可能把围栏的**开启行**切掉，只剩闭合行。markdown 会把它当成
+        // 新的开启行，把后面所有正常思考都吃进代码块。补一个开启行把它配平。
+        if fence_open_before(body, skipped) {
+            tail_text.insert_str(0, "```\n");
+        }
+        let mut rendered: Vec<Line<'static>> = vec![];
+        render_streaming_thinking_markdown(&mut rendered, &tail_text, width);
+        for line in &mut rendered {
+            if line.spans.is_empty() {
                 continue;
             }
-            for wrapped in wrap_line(line, width) {
-                lines.push(Line::from(Span::styled(
-                    format!("    {wrapped}"),
-                    Theme::dim(),
-                )));
-            }
+            let mut spans = vec![Span::raw("    ")];
+            spans.append(&mut line.spans);
+            *line = Line::from(spans);
         }
+        lines.append(&mut rendered);
         if skipped > 0 {
             lines.push(Line::from(Span::styled(
                 format!(
@@ -1132,14 +1182,42 @@ fn render_thinking_block(
         return;
     }
     // 展开即全文：用户主动行为，不再截断；超出视口由既有的 chat_scroll 滚动。
-    for line in clean_lines {
-        for wrapped in wrap_line(line, max_content_width.saturating_sub(4).max(1)) {
-            lines.push(Line::from(Span::styled(
-                format!("    {wrapped}"),
-                Theme::dim(),
-            )));
+    //
+    // 正文走 markdown 而不是逐行纯文本：真实 thinking 里约 15% 的行带 `- ` /
+    // `1.` / `|` / `**` / 围栏，原样打出来就是一屏"乱码"。行数统计仍用
+    // `clean_lines`（去空行的原始行数），那是元信息，与这里的渲染无关。
+    let width = max_content_width.saturating_sub(4).max(1);
+    let mut rendered = match opts.cache {
+        Some(cache) => {
+            let mut cache = cache.borrow_mut();
+            match cache.as_ref() {
+                Some((w, cached)) if *w == width => cached.clone(),
+                _ => {
+                    let mut fresh: Vec<Line<'static>> = vec![];
+                    render_thinking_markdown(&mut fresh, content, width);
+                    *cache = Some((width, fresh));
+                    cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+                }
+            }
         }
+        None => {
+            let mut fresh: Vec<Line<'static>> = vec![];
+            render_thinking_markdown(&mut fresh, content, width);
+            fresh
+        }
+    };
+    // 统一缩进 4 格：thinking 是挂在 `⎿` 行下方的旁白，顶格会让它与正文
+    // 平起平坐；而 markdown 自己已经处理了块内层级（bullet / 引用 / 代码），
+    // 这里只加一层外层缩进，不参与块内排版。
+    for line in &mut rendered {
+        if line.spans.is_empty() {
+            continue;
+        }
+        let mut spans = vec![Span::raw("    ")];
+        spans.append(&mut line.spans);
+        *line = Line::from(spans);
     }
+    lines.append(&mut rendered);
 }
 
 /// 渲染单条消息（追加到 `lines`）。从 `draw_chat` 提炼出来，保证完整消息流、
@@ -1226,6 +1304,7 @@ fn render_chat_message(
                     expanded: ctx.output_expanded,
                     elapsed_secs: msg.thinking_elapsed_secs,
                     spinner_frame: ctx.spinner_frame,
+                    cache: Some(&msg.render_cache),
                 },
             );
         }
@@ -1895,6 +1974,7 @@ pub(crate) fn build_pending_chat_lines(
                 expanded: state.output_expanded,
                 elapsed_secs: state.thinking_started.map(|t| t.elapsed().as_secs_f64()),
                 spinner_frame: state.spinner_frame,
+                cache: None,
             },
         );
     }
@@ -2010,7 +2090,6 @@ fn push_inline_todo_lines(
     // 凭据且不落盘，所以用户主动 Ctrl+T 时必须还能把它叫回来。
     if all_done && collapsed {
         lines.push(Line::from(vec![
-            Span::styled("  TodoWrite", Theme::tool_call()),
             Span::styled("  ", Theme::dim()),
             Span::styled(
                 title,
@@ -2025,7 +2104,6 @@ fn push_inline_todo_lines(
     }
 
     lines.push(Line::from(vec![
-        Span::styled("  TodoWrite", Theme::tool_call()),
         Span::styled("  ", Theme::dim()),
         Span::styled(
             title,
@@ -2398,31 +2476,95 @@ pub fn chat_content_width(frame_width: u16) -> usize {
     frame_width.saturating_sub(2) as usize
 }
 
+/// 一条逻辑行在 `width` 列下占几行物理行。
+///
+/// markdown 层已经按内容宽度预折行（见 `crates/tui/CLAUDE.md`「Markdown 排版：
+/// 七条不可回退的规则」），所以绝大多数逻辑行天然不超过视口宽度——一次
+/// `Line::width()`（逐 span 的 `UnicodeWidthStr` 求和）就能判定为 1 行。
+/// 这比 `Paragraph::line_count()` 便宜一个量级：后者对**全历史**跑一遍
+/// `WordWrapper`，逐 grapheme 迭代并逐行分配。
+///
+/// 只有 System 通知、工具标题、Preformatted 这类不参与 markdown 折行的
+/// 超宽内容才会真正走到 `WordWrapper`，每帧也就那么几行。
+fn logical_line_height(line: &Line<'_>, width: u16) -> usize {
+    let width = width.max(1);
+    if line.width() <= width as usize {
+        return 1;
+    }
+    Paragraph::new(Text::from(vec![line.clone()]))
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
+/// 物理行偏移 → (起始逻辑行下标, 该逻辑行内已被滚过的物理行数)。
+fn locate_scroll_start(heights: &[u16], scroll: usize) -> (usize, usize) {
+    let mut acc = 0usize;
+    for (idx, height) in heights.iter().enumerate() {
+        let height = *height as usize;
+        if acc + height > scroll {
+            return (idx, scroll - acc);
+        }
+        acc += height;
+    }
+    (heights.len(), 0)
+}
+
+/// 从第 `first` 条逻辑行起，截出覆盖 `need` 个物理行的连续区间。
+fn visible_chat_lines(
+    mut lines: Vec<Line<'static>>,
+    heights: &[u16],
+    first: usize,
+    need: usize,
+) -> Vec<Line<'static>> {
+    if first >= lines.len() || need == 0 {
+        return Vec::new();
+    }
+    let mut covered = 0usize;
+    let mut end = first;
+    while end < lines.len() && covered < need {
+        covered += heights[end] as usize;
+        end += 1;
+    }
+    lines.drain(..first);
+    lines.truncate(end - first);
+    lines
+}
+
 fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let max_content_width = chat_content_width(area.width);
     let lines = build_pending_chat_lines(state, max_content_width);
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
 
-    let content_line_count = para.line_count(area.width.max(1)).min(u16::MAX as usize) as u16;
-    let content_height = content_line_count.min(area.height).max(1);
-    let content_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: area.height,
-    };
+    // 高度测量与滚动上限：一次逐行的宽度检查，而不是 `Paragraph::line_count()`。
+    // `line_count` 会对全部历史跑一遍 `WordWrapper`，而 `Paragraph::scroll` 只跳过
+    // **绘制**、不跳过折行——旧实现因此每帧付两趟全历史折行，成本随会话长度线性
+    // 增长。滚轮事件密集时（每个事件一帧）就是用户看到的「滚几下就卡死」。
+    let heights: Vec<u16> = lines
+        .iter()
+        .map(|line| logical_line_height(line, area.width).min(u16::MAX as usize) as u16)
+        .collect();
+    let total_height: usize = heights.iter().map(|h| *h as usize).sum();
 
-    let max_scroll = content_line_count.saturating_sub(content_height) as usize;
-    state.chat_view_height = content_height as usize;
+    let content_height = total_height.min(area.height as usize).max(1);
+    let max_scroll = total_height.saturating_sub(content_height);
+    state.chat_view_height = content_height;
     state.chat_max_scroll = max_scroll;
     if state.chat_follow_tail {
         state.chat_scroll = max_scroll;
     } else {
         state.chat_scroll = state.chat_scroll.min(max_scroll);
     }
-    let scroll_y = state.chat_scroll.min(u16::MAX as usize) as u16;
-    let para = para.scroll((scroll_y, 0));
-    f.render_widget(para, content_area);
+
+    // 只把覆盖视口的那几条逻辑行交给 `Paragraph`：预折行已经把每行的高度算好，
+    // 这里按累积高度定位首行，再把 `scroll` 换算成行内偏移。渲染成本从
+    // O(全部历史) 降到 O(视口行数)，且 `scroll` 始终小于一屏，不会再在大历史
+    // 里撞上 `u16` 上限。
+    let (first, intra) = locate_scroll_start(&heights, state.chat_scroll);
+    let visible = visible_chat_lines(lines, &heights, first, intra + area.height as usize);
+    let para = Paragraph::new(Text::from(visible))
+        .wrap(Wrap { trim: false })
+        .scroll((intra.min(u16::MAX as usize) as u16, 0));
+    f.render_widget(para, area);
 
     if state.unseen_messages {
         let hint = Paragraph::new(Line::from(Span::styled(
@@ -3133,6 +3275,23 @@ fn title_token_text(state: &AppState) -> String {
     )
 }
 
+/// 标题栏的实时生成速率（`42 tok/s`）；不在生成中时返回空串。
+///
+/// 精度按量级收敛：< 10 tok/s 保留一位小数（3.5 与 4 是有区别的，弱模型 /
+/// 长思考时恰恰落在这个区间），其余取整——生成中末位小数每帧都在跳，
+/// 反而看不清量级。
+fn title_stream_rate_text(state: &AppState) -> String {
+    let Some(rate) = state.stream_rate.rate() else {
+        return String::new();
+    };
+    let rate = if rate < 10.0 {
+        format!("{rate:.1}")
+    } else {
+        format!("{rate:.0}")
+    };
+    wyj_i18n::tr_fmt("spinner.stream_rate", &[("rate", rate.as_str())])
+}
+
 /// 输入框标题栏 thinking 指示器的基础文案（即"这一步在做什么"，不含 spinner 帧）。
 ///
 /// 优先级（从最具辨识度到默认）：
@@ -3278,15 +3437,18 @@ fn queue_hint_text(state: &AppState) -> String {
 /// 「我的补充还没送达」，与 `queue_hint_text` 上方"这正是用户最需要看到的信息"
 /// 的判断正好相反（实测 80 列以下就已发生）。
 ///
-/// 保留优先级（rank 越大越留得住）：`tokens`(0) < `elapsed`(1) < `queue`(2)。
-/// token 是本轮用量、另有 `/cost` 可查，耗时可由状态栏旁证，唯独排队提示一旦
-/// 整段消失用户就无从确认自己的补充有没有被接收。
+/// 保留优先级（rank 越大越留得住）：`tokens`(0) < `elapsed`(1) < `rate`(2)
+/// < `queue`(3)。token 是本轮用量、另有 `/cost` 可查；耗时可由状态栏旁证；
+/// 速率是"服务端现在到底多快"的唯一现场证据，比前两者更该留下；唯独排队
+/// 提示一旦整段消失用户就无从确认自己的补充有没有被接收。
 ///
 /// 全部丢完仍超宽时，最后才对 `label` 做省略号截断——它是唯一不可丢弃的一段。
+#[allow(clippy::too_many_arguments)]
 fn build_thinking_title(
     frame: char,
     label: &str,
     queue: &str,
+    rate: &str,
     elapsed: &str,
     tokens: &str,
     budget: usize,
@@ -3297,10 +3459,16 @@ fn build_thinking_title(
     // 每段自身的宽度 + " · " 分隔符
     let seg_w = |s: &str| s.chars().map(char_display_width).sum::<usize>() + 3;
 
-    // (保留优先级, 文本)，Vec 顺序即显示顺序：耗时 → token → 排队提示
-    let mut optional: Vec<(usize, &str)> = vec![(1, elapsed), (0, tokens)];
+    // (保留优先级, 文本)，Vec 顺序即显示顺序：耗时 → 速率 → token → 排队提示。
+    // 速率插在耗时之后而不是末尾：它是「这一秒多快」，与「这一步跑了多久」
+    // 属于同一类时效信息；token 是本轮累计，放最后。
+    let mut optional: Vec<(usize, &str)> = vec![(1, elapsed)];
+    if !rate.is_empty() {
+        optional.push((2, rate));
+    }
+    optional.push((0, tokens));
     if !queue.is_empty() {
-        optional.push((2, queue));
+        optional.push((3, queue));
     }
 
     let cost = |segs: &[(usize, &str)]| segs.iter().map(|(_, s)| seg_w(s)).sum::<usize>();
@@ -3386,6 +3554,7 @@ fn draw_input(
         let frame = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()];
         let label = thinking_status_label(state);
         let elapsed = crate::app::format_hms(current_step_elapsed_secs(state));
+        let rate = title_stream_rate_text(state);
         let tokens = title_token_text(state);
         // 排队中：挂在标题栏而不是只靠状态栏右对齐那一句——窄终端上右对齐
         // 会被左边的「模型 · 模式 · cwd」挤掉后半句（实测只剩「…将在」），
@@ -3393,7 +3562,15 @@ fn draw_input(
         // `build_thinking_title` 按优先级整段丢弃，而不是从尾部截掉它。
         let queue = queue_hint_text(state);
         (
-            build_thinking_title(frame, &label, &queue, &elapsed, &tokens, title_budget),
+            build_thinking_title(
+                frame,
+                &label,
+                &queue,
+                &rate,
+                &elapsed,
+                &tokens,
+                title_budget,
+            ),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
@@ -6215,16 +6392,21 @@ fn draw_profile_dialog(
             }
             ProfileRow::Field(entry_idx, f_idx) => {
                 let entry = &dialog.entries[*entry_idx];
-                let label = wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*f_idx]);
+                let spec = &PROFILE_FIELD_SPECS[*f_idx];
+                let label = wyj_i18n::tr(spec.key);
                 let value = if editing {
                     wyj_i18n::tr("profile.dialog.editing_placeholder")
-                } else if *f_idx == PROFILE_API_KEY_FIELD_IDX {
+                } else if matches!(spec.kind, ProfileFieldKind::Secret) {
                     mask_secret(entry.text_value(*f_idx))
                 } else {
                     entry.display_value(*f_idx)
                 };
                 let cursor = if selected_row { "▶" } else { " " };
-                format!("{cursor}     {label:<label_width$}{value}")
+                // 标签列必须按**显示宽度**补空格：中文标签（"上下文长度"）每个
+                // 汉字占 2 列，`{:<width$}` 数的是 char 数，中英混排时值列会错位。
+                let pad = label_width.saturating_sub(display_width(&label));
+                let padding = " ".repeat(pad);
+                format!("{cursor}     {label}{padding}{value}")
             }
             ProfileRow::AddNew => {
                 let cursor = if selected_row { "▶" } else { " " };
@@ -7301,7 +7483,7 @@ mod tool_result_fold_tests {
         // （不能再有 ─ 分隔线、条目列表和 ctrl+t 展开提示）。
         let head = rendered
             .iter()
-            .position(|l| l.contains("TodoWrite"))
+            .position(|l| l.contains(&wyj_i18n::tr("spinner.todo_done")))
             .expect("面板未渲染");
         let tail = &rendered[head..];
         assert_eq!(
@@ -7355,7 +7537,7 @@ mod tool_result_fold_tests {
 
         let head = rendered
             .iter()
-            .position(|l| l.contains("TodoWrite"))
+            .position(|l| l.contains(&wyj_i18n::tr("spinner.todo_done")))
             .expect("面板未渲染");
         let tail = &rendered[head..];
         assert!(
@@ -7410,7 +7592,7 @@ mod tool_result_fold_tests {
 
         let head = rendered
             .iter()
-            .position(|l| l.contains("TodoWrite"))
+            .position(|l| l.contains(&wyj_i18n::tr("spinner.todo_title")))
             .expect("面板未渲染");
         let tail = &rendered[head..];
         assert!(
@@ -7809,6 +7991,29 @@ mod tool_result_fold_tests {
     }
 
     #[test]
+    fn title_stream_rate_text_hides_when_idle_and_formats_by_magnitude() {
+        // 空闲态（工具执行 / 回合间隙）不得显示速率：`StreamRateMeter` 的
+        // 空样本与 stale 判定都返回 None，标题栏必须整段不出现。
+        let state = make_state();
+        assert_eq!(title_stream_rate_text(&state), "");
+
+        // 低速保留一位小数（3.5 与 4 对弱模型是两种体验），高速取整。
+        let mut state = make_state();
+        state.stream_rate.samples.push_back((Instant::now(), 7.0));
+        state.stream_rate.burst_started = Some(Instant::now() - std::time::Duration::from_secs(2));
+        state.stream_rate.last_delta_at = Some(Instant::now());
+        let text = title_stream_rate_text(&state);
+        assert!(text.contains("3.5") && text.contains("tok/s"), "{text:?}");
+
+        let mut state = make_state();
+        state.stream_rate.samples.push_back((Instant::now(), 84.0));
+        state.stream_rate.burst_started = Some(Instant::now() - std::time::Duration::from_secs(2));
+        state.stream_rate.last_delta_at = Some(Instant::now());
+        let text = title_stream_rate_text(&state);
+        assert!(text.contains("42") && !text.contains('.'), "{text:?}");
+    }
+
+    #[test]
     fn thinking_status_label_prefers_tool_activity_over_op_arguments() {
         // 回归钉子：标题栏曾直接回显 `current_op`（`"Bash(cargo test -p wyj-core)"`），
         // 而聊天区最后一条恰好也是这个字符串 —— 用户看到的就是"底部把上面那条
@@ -7916,25 +8121,96 @@ mod tool_result_fold_tests {
         // 提示恰好拼在最后 —— 窄屏下第一个消失的必然是「我的补充还没送达」。
         // 现在按整段丢弃 + 优先级：token 先丢，耗时次之，排队提示最后。
         let queue = "2 queued (Bash(sleep 540) running)";
-        let wide = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 200);
-        assert!(wide.contains(queue) && wide.contains("1.5s") && wide.contains("1,000↑"));
+        let rate = "42 tok/s";
+        let wide = build_thinking_title(
+            '⠋',
+            "Bash(cargo test)",
+            queue,
+            rate,
+            "1.5s",
+            "1,000↑ 40↓",
+            200,
+        );
+        assert!(
+            wide.contains(queue)
+                && wide.contains("1.5s")
+                && wide.contains(rate)
+                && wide.contains("1,000↑")
+        );
+        // 速率紧跟耗时、排在 token 之前（时效信息聚在一起，累计量放最后）
+        let rate_pos = wide.find(rate).expect("应含速率");
+        let elapsed_pos = wide.find("1.5s").expect("应含耗时");
+        let tokens_pos = wide.find("1,000↑").expect("应含 token");
+        assert!(
+            elapsed_pos < rate_pos && rate_pos < tokens_pos,
+            "顺序应为 耗时 → 速率 → token：{wide:?}"
+        );
 
-        // 逐级丢段的预算阈值：全量 76 列 → 丢 token 后 63 → 丢耗时后 56
-        let mid = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 66);
+        // 逐级丢段的预算阈值（全量 86 列）：丢 token → 74 → 丢耗时 → 67
+        // → 丢速率 → 56 → 丢排队提示 → 20
+        let mid = build_thinking_title(
+            '⠋',
+            "Bash(cargo test)",
+            queue,
+            rate,
+            "1.5s",
+            "1,000↑ 40↓",
+            80,
+        );
         assert!(!mid.contains("1,000↑"), "token 应先被丢：{mid:?}");
         assert!(mid.contains(queue), "排队提示必须留下：{mid:?}");
         assert!(mid.contains("1.5s"), "耗时仍应保留：{mid:?}");
+        assert!(mid.contains(rate), "速率仍应保留：{mid:?}");
 
-        let tight = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 58);
+        let tight = build_thinking_title(
+            '⠋',
+            "Bash(cargo test)",
+            queue,
+            rate,
+            "1.5s",
+            "1,000↑ 40↓",
+            70,
+        );
         assert!(
             !tight.contains("1.5s"),
             "耗时应在排队提示之前被丢：{tight:?}"
         );
+        assert!(tight.contains(rate), "速率比耗时更该留下：{tight:?}");
         assert!(tight.contains(queue), "排队提示是最后可丢的段：{tight:?}");
 
-        // 再窄一档才轮到排队提示，且它消失后耗时也不回来（不是"轮换显示"）
-        let tiny = build_thinking_title('⠋', "Bash(cargo test)", queue, "1.5s", "1,000↑ 40↓", 40);
-        assert!(!tiny.contains(queue) && !tiny.contains("1.5s"), "{tiny:?}");
+        // 再窄一档轮到速率，且它消失后耗时也不回来（不是"轮换显示"）
+        let narrower = build_thinking_title(
+            '⠋',
+            "Bash(cargo test)",
+            queue,
+            rate,
+            "1.5s",
+            "1,000↑ 40↓",
+            60,
+        );
+        assert!(
+            !narrower.contains(rate),
+            "速率的保留优先级低于排队提示：{narrower:?}"
+        );
+        assert!(
+            narrower.contains(queue),
+            "排队提示是最后可丢的段：{narrower:?}"
+        );
+
+        // 最后一档才轮到排队提示
+        let tiny = build_thinking_title(
+            '⠋',
+            "Bash(cargo test)",
+            queue,
+            rate,
+            "1.5s",
+            "1,000↑ 40↓",
+            50,
+        );
+        assert!(
+            !tiny.contains(queue) && !tiny.contains(rate) && !tiny.contains("1.5s"),
+            "{tiny:?}"
+        );
     }
 
     #[test]
@@ -7946,6 +8222,7 @@ mod tool_result_fold_tests {
                 '⠋',
                 "Bash(cargo test -p wyj-core --all-features)",
                 "3 queued",
+                "42 tok/s",
                 "1m 5s",
                 "12,345↑ 678↓",
                 budget,
@@ -7954,17 +8231,30 @@ mod tool_result_fold_tests {
             assert!(w <= budget, "预算 {budget} 下溢出到 {w} 列：{title:?}");
         }
         // 极窄预算下 label 至少留下 spinner 帧本身，不整段消失。
-        let tiny = build_thinking_title('⠋', "Bash(cargo test)", "", "1.5s", "1,000↑", 6);
+        let tiny = build_thinking_title('⠋', "Bash(cargo test)", "", "", "1.5s", "1,000↑", 6);
         assert!(tiny.contains('⠋'), "极窄下仍应保留 spinner 帧：{tiny:?}");
     }
 
     #[test]
     fn build_thinking_title_without_queue_matches_legacy_layout() {
-        // 无排队时的排版与旧实现逐字符一致（回归保护：底部进度条的形态是
-        // 用户长期习惯的，改版不该顺手改掉）。
+        // 无排队、无速率时的排版与旧实现逐字符一致（回归保护：底部进度条的
+        // 形态是用户长期习惯的，改版不该顺手改掉）。速率只在真正生成中才出现，
+        // 空串必须整段不占位——否则每个工具执行阶段都会多出两个分隔符。
         assert_eq!(
-            build_thinking_title('⠋', "Read(src/app.rs)", "", "3.2s", "1,024↑ 40↓", 200),
+            build_thinking_title('⠋', "Read(src/app.rs)", "", "", "3.2s", "1,024↑ 40↓", 200),
             " ⠋ Read(src/app.rs) · 3.2s · 1,024↑ 40↓ "
+        );
+        assert_eq!(
+            build_thinking_title(
+                '⠋',
+                "Read(src/app.rs)",
+                "",
+                "42 tok/s",
+                "3.2s",
+                "1,024↑ 40↓",
+                200
+            ),
+            " ⠋ Read(src/app.rs) · 3.2s · 42 tok/s · 1,024↑ 40↓ "
         );
     }
 
@@ -7984,6 +8274,7 @@ mod tool_result_fold_tests {
                     expanded: false,
                     elapsed_secs: None,
                     spinner_frame: frame,
+                    cache: None,
                 },
             );
             rendered_text(lines).join("\n")
@@ -8014,6 +8305,7 @@ mod tool_result_fold_tests {
             "spinner.waiting_approval",
             "spinner.reviewing_plan",
             "spinner.queuing_message",
+            "spinner.stream_rate",
             "spinner.queue_pending",
             "spinner.todo_title",
             "spinner.todo_done",
@@ -8038,6 +8330,11 @@ mod tool_result_fold_tests {
         assert!(
             op.contains("Bash(x)"),
             "queue_op_running 丢了 {{op}}：{op:?}"
+        );
+        let rate = wyj_i18n::tr_fmt("spinner.stream_rate", &[("rate", "42")]);
+        assert!(
+            rate.contains("42") && rate.contains("tok/s"),
+            "stream_rate 丢了 {{rate}} 或单位：{rate:?}"
         );
         let running = wyj_i18n::tr_fmt(
             "thinking.running",
@@ -8239,6 +8536,144 @@ mod tool_result_fold_tests {
     }
 
     #[test]
+    fn thinking_expanded_renders_markdown_structure_instead_of_literal_markers() {
+        // 真实 thinking 里约 15% 的行带 `- ` / `1.` / `|` / 围栏。原实现逐行
+        // 纯文本输出，这些标记原样打在屏幕上，整块看起来像乱码。
+        let body = "\
+关键点：
+1. 第一点
+2. 第二点
+
+- **粗体条目**
+- 普通条目
+
+```rust
+fn foo() {}
+```
+
+| 列一 | 列二 |
+|------|------|
+| a    | b    |";
+        let mut thinking = message(MessageRole::Thinking, body);
+        thinking.thinking_elapsed_secs = Some(3.0);
+        let rendered = render_messages_with_output_expanded(&[thinking], 70, true);
+        let all = rendered.join("\n");
+
+        // 有序列表：`1. ` 变成渲染出的序号，而不是原样保留
+        assert!(all.contains("1. 第一点"), "{all}");
+        // 无序列表：`- ` 变成 bullet
+        assert!(all.contains("• "), "{all}");
+        assert!(!all.contains("- **"), "列表标记应被解析：{all}");
+        // 围栏：thinking 里退化成 `│` 引用式，不画带行号的方框
+        assert!(all.contains("│ fn foo() {}"), "{all}");
+        assert!(!all.contains("╭─"), "thinking 的围栏不该画方框：{all}");
+        // 表格：走网格而不是原样 `| a | b |`
+        assert!(!all.contains("|------|"), "表格分隔行应被消费：{all}");
+        assert!(all.contains("┌") || all.contains("│ 列一"), "{all}");
+        // 粗体标记不落地
+        assert!(!all.contains("**"), "粗体标记应被消费：{all}");
+    }
+
+    #[test]
+    fn thinking_keeps_intra_paragraph_line_breaks() {
+        // 模型的思考是一行一个念头。正文那条「段内换行折叠成空格」的规则
+        // 会把它们揉成一整段，层次全没了。
+        let mut thinking = message(MessageRole::Thinking, "第一行\n第二行\n第三行");
+        thinking.thinking_elapsed_secs = Some(1.0);
+        let rendered = render_messages_with_output_expanded(&[thinking], 60, true);
+
+        assert_eq!(rendered.len(), 4, "{rendered:?}");
+        assert!(rendered[1].ends_with("第一行"), "{}", rendered[1]);
+        assert!(rendered[2].ends_with("第二行"), "{}", rendered[2]);
+        assert!(rendered[3].ends_with("第三行"), "{}", rendered[3]);
+    }
+
+    #[test]
+    fn thinking_body_is_indented_exactly_four_columns() {
+        // 外层缩进只补一层：markdown 内部对顶层段落不再补 2 格（否则叠加成
+        // 6 格，比列表 bullet 还靠右，层级关系反了）。
+        let mut thinking = message(MessageRole::Thinking, "普通段落");
+        thinking.thinking_elapsed_secs = Some(1.0);
+        let rendered = render_messages_with_output_expanded(&[thinking], 60, true);
+
+        assert_eq!(rendered[1], "    普通段落", "{rendered:?}");
+    }
+
+    #[test]
+    fn thinking_body_render_is_cached_by_width() {
+        // 展开态走完整 markdown 解析，历史里几十段 thinking 每帧重解析就是
+        // 与 assistant 消息同一类的浪费。缓存按宽度失效。
+        let mut thinking = message(MessageRole::Thinking, "第一段\n\n第二段");
+        thinking.thinking_elapsed_secs = Some(1.0);
+        let first = render_messages_with_output_expanded(std::slice::from_ref(&thinking), 60, true);
+        assert!(
+            thinking.render_cache.borrow().is_some(),
+            "首次渲染应写入缓存"
+        );
+
+        let width = thinking.render_cache.borrow().as_ref().unwrap().0;
+        let second = render_messages_with_output_expanded(&[thinking], 60, true);
+        assert_eq!(first, second);
+        assert_eq!(width, 60 - 4, "缓存键应是正文可用宽度");
+    }
+
+    #[test]
+    fn live_thinking_tail_is_formatted_too() {
+        // 流式期间模型已经在写列表，逐行原样输出会让这几行先"乱"一遍再变整齐。
+        let mut lines = vec![];
+        render_thinking_block(
+            &mut lines,
+            "先想想\n\n1. 第一步\n2. 第二步",
+            80,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: false,
+                elapsed_secs: None,
+                spinner_frame: 0,
+                cache: None,
+            },
+        );
+        let text = rendered_text(lines).join("\n");
+        assert!(text.contains("1. 第一步"), "{text}");
+        assert!(!text.contains("1. 第一步\n2."), "不应原样堆叠：{text}");
+    }
+
+    #[test]
+    fn live_thinking_tail_closes_a_fence_cut_by_the_tail_window() {
+        // 取尾可能只留下围栏的闭合行。markdown 会把它当成新的开启行，把
+        // 后面所有正常思考吞进代码块——补一个开启行配平。
+        let body = format!(
+            "```\n{}\n```\n这行必须是普通思考，不能被吞进代码块",
+            (1..=LIVE_TAIL_LINES)
+                .map(|i| format!("code-{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let mut lines = vec![];
+        render_thinking_block(
+            &mut lines,
+            &body,
+            80,
+            ThinkingRenderOpts {
+                live: true,
+                expanded: false,
+                elapsed_secs: None,
+                spinner_frame: 0,
+                cache: None,
+            },
+        );
+        let text = rendered_text(lines);
+        // 末行是「上面还有 N 行」提示；正文最后一行的普通思考必须是独立一行。
+        let body: Vec<&String> = text.iter().filter(|l| !l.contains("more lines")).collect();
+        let last = body.last().unwrap();
+        assert!(
+            last.contains("普通思考"),
+            "围栏配平失败，尾部被当成代码块：{text:?}"
+        );
+        assert!(!last.contains("│"), "尾行不该带代码块左边线：{last}");
+    }
+
+    #[test]
     fn thinking_without_elapsed_omits_the_seconds_placeholder() {
         // `/resume` 恢复的旧会话没有耗时记录（该字段从未持久化过），
         // 不能显示一个假的 "0.0s"
@@ -8269,21 +8704,28 @@ mod tool_result_fold_tests {
                 expanded: false,
                 elapsed_secs: Some(3.0),
                 spinner_frame: 0,
+                cache: None,
             },
         );
 
         let text = rendered_text(lines);
-        // 状态行 + 30 行尾部 + 1 行截断提示
+        // 状态行 + 尾窗行 + 1 行截断提示
         assert_eq!(text.len(), LIVE_TAIL_LINES + 2, "{}", text.len());
         // 首行是状态行（文案走 i18n，这里只断言它不含正文）
         assert!(!text[0].contains("line-"), "{}", text[0]);
         // 尾部是最新内容，不是开头
         let last = &text[LIVE_TAIL_LINES];
         assert!(last.contains("line-5000"), "{}", last);
-        assert!(text[1].contains("line-4971"), "{}", text[1]);
+        // 尾窗第一行与被折叠行数都由 LIVE_TAIL_LINES 推出：改尾窗不必手改这两处
+        let first_tail = 5_000 - LIVE_TAIL_LINES + 1;
+        assert!(
+            text[1].contains(&format!("line-{first_tail}")),
+            "{}",
+            text[1]
+        );
         assert!(!text[1].contains("line-1 "), "不应渲染开头内容");
         assert!(
-            text[text.len() - 1].contains("4970"),
+            text[text.len() - 1].contains(&(5_000 - LIVE_TAIL_LINES).to_string()),
             "截断提示应给出被折叠的行数：{}",
             text[text.len() - 1]
         );
@@ -8301,6 +8743,7 @@ mod tool_result_fold_tests {
                 expanded: false,
                 elapsed_secs: None,
                 spinner_frame: 0,
+                cache: None,
             },
         );
         assert_eq!(rendered_text(lines).len(), 1, "空缓冲只出状态行");
@@ -8880,7 +9323,7 @@ mod tool_result_fold_tests {
 
         assert_eq!(rendered.len(), LIVE_TAIL_LINES + 2, "{}", rendered.len());
         assert!(
-            rendered[rendered.len() - 1].contains("99970"),
+            rendered[rendered.len() - 1].contains(&(100_000 - LIVE_TAIL_LINES).to_string()),
             "末行应是截断提示：{}",
             rendered[rendered.len() - 1]
         );
@@ -9606,6 +10049,120 @@ mod cost_panel_render_tests {
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "表格列对齐被破坏: {widths:?}\n{raw}"
+        );
+    }
+}
+
+/// 聊天区视口滑动的回归钉子。
+///
+/// 旧实现每帧把**整个会话历史**交给 `Paragraph`：`line_count()` 全量折行一次，
+/// `Paragraph::scroll` 在绘制时再全量折行一次（scroll 只跳过绘制、不跳过折行）。
+/// 长会话下这两趟 O(历史) 是滚轮卡顿的直接来源，且 `scroll` 是 `u16`，历史超过
+/// 65535 物理行后底部内容根本滚不到。现在先按逻辑行算高度，只把覆盖视口的
+/// 那几条交给 `Paragraph`。
+#[cfg(test)]
+mod chat_viewport_tests {
+    use super::*;
+    use crate::app::ChatMessage;
+    use crate::test_support::{make_state, render_to_text};
+
+    #[test]
+    fn logical_line_height_counts_wrapped_physical_rows() {
+        assert_eq!(logical_line_height(&Line::from("x".repeat(100)), 40), 3);
+        assert_eq!(logical_line_height(&Line::from("short"), 40), 1);
+        // 宽度为 0 时按 1 列兜底，不能除零也不能返回 0。
+        assert!(logical_line_height(&Line::from("abc"), 0) >= 1);
+    }
+
+    #[test]
+    fn locate_scroll_start_maps_physical_offset_to_logical_line() {
+        let heights = [1u16, 3, 1];
+        assert_eq!(locate_scroll_start(&heights, 0), (0, 0));
+        assert_eq!(locate_scroll_start(&heights, 1), (1, 0));
+        assert_eq!(locate_scroll_start(&heights, 2), (1, 1));
+        assert_eq!(locate_scroll_start(&heights, 4), (2, 0));
+        assert_eq!(locate_scroll_start(&heights, 5), (3, 0));
+    }
+
+    fn history_state(count: usize) -> AppState {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        for i in 0..count {
+            state
+                .messages
+                .push(ChatMessage::system(format!("msg-{i:03}")));
+        }
+        state
+    }
+
+    /// 直接从渲染管线量出「全部历史折算成多少物理行」，避免测试里硬编码
+    /// 消息块之间的空行等排版细节。
+    fn total_physical_height(state: &mut AppState, width: u16) -> usize {
+        build_pending_chat_lines(state, chat_content_width(width))
+            .iter()
+            .map(|line| logical_line_height(line, width))
+            .sum()
+    }
+
+    #[test]
+    fn long_history_renders_only_the_tail_when_following() {
+        let mut state = history_state(200);
+        state.chat_follow_tail = true;
+        let total = total_physical_height(&mut state, 60);
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+
+        assert!(text.contains("msg-199"), "贴底时应看到最后一条:\n{text}");
+        assert!(
+            !text.contains("msg-000"),
+            "视口外的历史不应参与绘制:\n{text}"
+        );
+        assert_eq!(state.chat_view_height, 20);
+        assert_eq!(state.chat_max_scroll, total - 20);
+    }
+
+    #[test]
+    fn scrolling_up_shows_earlier_history() {
+        let mut state = history_state(200);
+        state.chat_follow_tail = false;
+        state.chat_scroll = 0;
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+
+        assert!(text.contains("msg-000"), "滚到顶部应看到第一条:\n{text}");
+        assert!(
+            !text.contains("msg-199"),
+            "非贴底时不应把尾部拽进视口:\n{text}"
+        );
+    }
+
+    /// 折行高度必须计入 `max_scroll`：否则贴底时最后几条会被裁掉。
+    #[test]
+    fn wrapped_lines_contribute_their_physical_height() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        // 每条 200 字符的系统消息在 60 列下会折成多行。
+        for i in 0..10 {
+            state.messages.push(ChatMessage::system(format!(
+                "wrapped-{i:02}-{}",
+                "x".repeat(200)
+            )));
+        }
+        state.chat_follow_tail = true;
+
+        let logical = build_pending_chat_lines(&mut state, chat_content_width(60)).len();
+        let total = total_physical_height(&mut state, 60);
+        assert!(
+            total > logical,
+            "长行必须折算成多行物理行: logical={logical} total={total}"
+        );
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+
+        assert_eq!(state.chat_max_scroll, total - 20);
+        assert!(
+            text.contains("wrapped-09"),
+            "最后一条消息必须完整落在视口内:\n{text}"
         );
     }
 }

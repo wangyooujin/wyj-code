@@ -569,9 +569,9 @@ impl Agent {
     /// 配置运行时 `ContentBlock` 字节截断上限（与 `SessionStore::save` /
     /// `SessionStore::load` 共用同一份 `PersistCapCfg`）。None 关闭 runtime
     /// 截断；非 None 时 `run_turn_with_injection_inner` 在每次
-    /// `provider.stream()` 之前对 `session.messages` 调
-    /// `serialize::truncate_messages`,防止长 user/assistant 纯文本块撞穿
-    /// 模型上下文窗口。
+    /// `provider.stream()` 之前检查是否有块超限，**有则克隆一份历史做截断**
+    /// 后只把副本发出去——`session.messages` 本身保持原文，避免改写 prompt
+    /// cache 的前缀。
     pub fn with_persist_cap(mut self, cap: Option<wyj_config::PersistCapCfg>) -> Self {
         self.persist_cap = cap;
         self
@@ -1656,6 +1656,36 @@ impl Agent {
                     estimated_before
                 };
 
+                // 前缀复用**只对会按前缀计费的端点划算**：复用会把完整历史
+                // 发一遍（旧路径只发文本化摘要），端点若不做前缀缓存，这就是
+                // 净增 token。判据走 `reuses_prompt_prefix()`，它同时覆盖
+                // Anthropic 的显式断点与 DeepSeek/OpenAI 的自动缓存。
+                //
+                // 在两条压缩路径（阈值触发 / 上下文超限恢复）之间共用：两处若
+                // 判据不一致，会出现「平时省钱、撞穿时全价」的隐性割裂。
+                let compact_prefix = if route
+                    .capabilities
+                    .as_ref()
+                    .map(|caps| caps.reuses_prompt_prefix())
+                    // 没有能力快照时按「乐观复用」处理：`capabilities` 为 None
+                    // 只出现在测试与未解析 profile 的路径上，真实运行一定有。
+                    .unwrap_or(true)
+                {
+                    Some(crate::compact::CompactPrefix {
+                        // 与本次 stream 用的是**同一个** `request_system` /
+                        // `request_tools`：压缩请求的前缀必须逐字节等于主对话
+                        // 前缀，provider 的前缀缓存才命中得了。换成
+                        // `COMPACT_SYSTEM` 或省略 tools 会让整段历史全价重发。
+                        system: wyj_api::SystemPrompt {
+                            stable: &system_stable,
+                            volatile: &request_system_volatile,
+                        },
+                        tools: &request_tools,
+                    })
+                } else {
+                    None
+                };
+
                 if estimated > compact_threshold {
                     // 循环压缩：单次 compact 不一定够（heuristic 偏低 /
                     // reasoning 模型一轮回巨长 / 上次摘要本身偏长）；
@@ -1669,6 +1699,7 @@ impl Agent {
                         route.context_window,
                         estimated,
                         compact_threshold,
+                        compact_prefix,
                     )
                     .await;
                     if let Some(error) = outcome.last_error {
@@ -1704,9 +1735,11 @@ impl Agent {
                 // persist_cap 的 text_* 字段对每块独立做 head+tail 截断,
                 // 与 save()/load() 共用同一上限,确保本轮 stream 不会撞穿
                 // 262K / 200K 之类 endpoint 硬上限。
-                if let Some(cfg) = self.persist_cap.as_ref() {
-                    crate::serialize::truncate_messages(&mut session.messages, cfg);
-                }
+                //
+                // **只截副本，不改 `session.messages`**（见下面 `outbound` 处）：
+                // 历史本身是 prompt cache 的前缀，原地改写会让后续每一轮的
+                // `cache_read` 从被截断的位置起归零，且不可逆。落盘路径
+                // （`SessionStore::save`）仍按原样截断副本，磁盘上限不变。
 
                 const MAX_STREAM_RETRIES: u32 = 2;
                 let mut stream_retries: u32 = 0;
@@ -1730,11 +1763,31 @@ impl Agent {
                     // 「点了回车到屏幕开始动」里最容易变慢、最少被看见的一段。
                     let attempt_started = Instant::now();
                     let mut ttft_ms: Option<u64> = None;
+                    // 每次尝试前重算「本轮实际发出去的消息」：`context_overflow`
+                    // 分支会改写 `session.messages`，复用上一轮的副本会让重试
+                    // 发回压缩前的历史。绝大多数情况下不需要截断，走零拷贝。
+                    let capped_messages: Option<Vec<wyj_api::types::Message>> =
+                        self.persist_cap.as_ref().and_then(|cfg| {
+                            if crate::serialize::messages_need_truncation(&session.messages, cfg) {
+                                let mut copy = session.messages.clone();
+                                crate::serialize::truncate_messages(&mut copy, cfg);
+                                tracing::warn!(
+                                    "发送前对超限块做了临时截断（仅本次请求生效，历史原文保留）"
+                                );
+                                Some(copy)
+                            } else {
+                                None
+                            }
+                        });
+                    let outbound_messages: &[wyj_api::types::Message] = match &capped_messages {
+                        Some(copy) => copy,
+                        None => &session.messages,
+                    };
                     let mut stream = match route
                         .provider
                         .stream(
                             &request_system,
-                            &session.messages,
+                            outbound_messages,
                             &request_tools,
                             &effective_opts,
                         )
@@ -1760,6 +1813,9 @@ impl Agent {
                                     session,
                                     route.provider.as_ref(),
                                     route.context_window,
+                                    // 与主压缩路径同一判据：不缓存的端点不走
+                                    // 前缀复用，避免把整段历史全价重发一遍。
+                                    compact_prefix,
                                 )
                                 .await
                                 {
@@ -3002,13 +3058,66 @@ impl Agent {
     }
 
     /// 手动触发上下文压缩（供 /compact 命令使用）
+    ///
+    /// 走前缀复用路径：`system` 按与 `run_turn` 相同的规则拼（主提示、记忆快照、
+    /// 规约祖先链），`tools` 用当前工具集。**可能失配**——`run_turn` 里 tools
+    /// 还会按 route 能力与 lazy 折叠裁剪，这里没有那层上下文。失配的代价只是
+    /// 缓存不命中，回到改动前的全价行为，不会影响摘要正确性。
     pub async fn compact_context(
         &self,
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
-        use crate::compact::compact_session;
+        use crate::compact::{compact_session, CompactPrefix};
         let route = self.route_at(self.active_route_index());
-        compact_session(session, route.provider.as_ref(), route.context_window).await
+
+        let mut system_stable = self.system_prompt.clone();
+        let memory_snapshot = self.memory_snapshot_text(session);
+        if !memory_snapshot.is_empty() {
+            system_stable.push_str("\n\n");
+            system_stable.push_str(&memory_snapshot);
+        }
+        if let Some(loader) = &self.claude_md {
+            if let Some(reminder) = loader.turn_reminder() {
+                system_stable.push_str("\n\n");
+                system_stable.push_str(&reminder);
+            }
+        }
+        let request_tools: Vec<ToolDefinition> = self
+            .tools
+            .iter()
+            .filter(|definition| {
+                self.lazy_tool_state
+                    .as_ref()
+                    .map(|state| state.visible(&definition.name))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+
+        compact_session(
+            session,
+            route.provider.as_ref(),
+            route.context_window,
+            // 与 `run_turn` 内两条压缩路径同一判据：不缓存的端点退回独立请求
+            // 形态，避免把整段历史全价重发一遍。
+            if route
+                .capabilities
+                .as_ref()
+                .map(|caps| caps.reuses_prompt_prefix())
+                .unwrap_or(true)
+            {
+                Some(CompactPrefix {
+                    system: wyj_api::SystemPrompt {
+                        stable: &system_stable,
+                        volatile: "",
+                    },
+                    tools: &request_tools,
+                })
+            } else {
+                None
+            },
+        )
+        .await
     }
 }
 

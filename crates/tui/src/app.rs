@@ -106,6 +106,14 @@ pub enum MessageRole {
     Preformatted,
 }
 
+/// 按宽度缓存的正文渲染结果：`(可用宽度, 已渲染行)`。
+///
+/// 服务两类「定稿后内容不再变化」的正文：Assistant 的 markdown
+/// （`render_markdown`）、`!` bash 的折行结果与展开态 thinking。消息定稿后
+/// 缓存避免每帧（约 20fps）对全部历史重跑解析/折行，长对话下这是交互延迟的
+/// 主要来源。宽度变化时自动失效。
+pub type RenderCache = std::cell::RefCell<Option<(usize, Vec<ratatui::text::Line<'static>>)>>;
+
 /// 渲染用消息
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -129,17 +137,12 @@ pub struct ChatMessage {
     pub display_summary: String,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
     pub sub_agent_id: Option<u64>,
-    /// 按宽度缓存的正文渲染结果（`(宽度, 渲染行)`）。
-    ///
-    /// 服务两类「定稿后内容不再变化」的正文：Assistant 的 markdown
-    /// （`render_markdown`）与 `!` bash 的折行结果。消息定稿后缓存避免每帧
-    /// （约 20fps）对全部历史重跑解析/折行，长对话下这是交互延迟的主要来源。
-    /// 宽度变化时自动失效。
+    /// 按宽度缓存的正文渲染结果，见 [`RenderCache`]。
     ///
     /// 名字里的 `render` 是刻意的：一旦正文被折叠/截断（曾经的三行预览）就
     /// 没有缓存的必要——被丢掉的那部分根本不必算；这个字段存在的前提就是
     /// 「全文都要画」。
-    pub render_cache: std::cell::RefCell<Option<(usize, Vec<ratatui::text::Line<'static>>)>>,
+    pub render_cache: RenderCache,
 }
 
 impl ChatMessage {
@@ -385,6 +388,167 @@ pub(crate) fn fmt_tokens(n: u32) -> String {
         format!("{},{:03}", n / 1000, n % 1000)
     } else {
         n.to_string()
+    }
+}
+
+/// 速率滑动窗口长度。太短会把每个 chunk 的抖动放大，太长会让「模型突然变慢」
+/// 延迟好几秒才看得出来。
+pub(crate) const STREAM_RATE_WINDOW: Duration = Duration::from_secs(2);
+/// 超过这么久没有新的生成增量，就认为当前请求已经不在吐 token（多半在生成
+/// 工具参数或已经结束），标题栏不再显示速率——显示一个冻结的旧值比不显示更糟。
+pub(crate) const STREAM_RATE_STALE_AFTER: Duration = Duration::from_millis(1500);
+/// 分母下限：首个增量刚到时样本太少，`tokens / 几十毫秒` 会算出几百 tok/s 的
+/// 假峰值。低于这个时长的生成段直接不显示速率，等它跑稳。
+const STREAM_RATE_MIN_BURST: Duration = Duration::from_millis(50);
+
+/// 流式生成速率表（tok/s）。
+///
+/// 三条口径对齐业界常见做法：
+/// 1. **只算生成、不算 prefill**：计时从首个增量开始，TTFT 不进分母，否则
+///    首 token 前的排队/建连时间会把速率压成个位数。
+/// 2. **滑动窗口而不是整段平均**：整段平均会被一次长停顿永久拖低，瞬时值又
+///    抖得没法读；最近 [`STREAM_RATE_WINDOW`] 秒的窗口两头都避开。
+/// 3. **按字符估算 token**：真实 usage 要等请求结束才回来，赶不上「实时」；
+///    增量用 [`wyj_core::estimate_text_tokens_f64`]（CJK 1.5、其余 1/3 token/字）。
+///    逐 delta 累加必须用浮点版，整数版在单字符片段上会整段除成 0。
+#[derive(Debug, Default)]
+pub struct StreamRateMeter {
+    /// `(到达时刻, 估算 token 增量)`，按时间递增，超出窗口的从队首弹出。
+    pub(crate) samples: VecDeque<(Instant, f64)>,
+    /// 当前生成段第一个增量的时刻（TTFT 之后），速率分母从这里起算。
+    pub(crate) burst_started: Option<Instant>,
+    /// 最近一次生成增量的时刻，用于判定速率是否已经过期。
+    pub(crate) last_delta_at: Option<Instant>,
+}
+
+impl StreamRateMeter {
+    /// 记录一段流式增量。`ThinkingDelta` 与 `TextDelta` 都要记——两者都是模型
+    /// 在吐 token，用户看到的也是同一个 spinner。
+    pub(crate) fn note(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        self.burst_started.get_or_insert(now);
+        self.last_delta_at = Some(now);
+        self.samples
+            .push_back((now, wyj_core::estimate_text_tokens_f64(text)));
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > STREAM_RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// 生成段结束（请求收尾 / 开始跑工具 / 中断 / 新回合）时清空。
+    /// 不清的话，工具执行的那几十秒会被算进「最近 2 秒」，速率瞬间塌成 0。
+    pub(crate) fn reset(&mut self) {
+        self.samples.clear();
+        self.burst_started = None;
+        self.last_delta_at = None;
+    }
+
+    /// 当前速率（tok/s）。`None` = 不在生成中，标题栏应整段不显示。
+    pub(crate) fn rate(&self) -> Option<f64> {
+        let last = self.last_delta_at?;
+        if last.elapsed() > STREAM_RATE_STALE_AFTER {
+            return None;
+        }
+        let started = self.burst_started?;
+        let elapsed = started.elapsed();
+        if elapsed < STREAM_RATE_MIN_BURST {
+            return None;
+        }
+        let tokens: f64 = self
+            .samples
+            .iter()
+            .filter(|(t, _)| last.duration_since(*t) <= STREAM_RATE_WINDOW)
+            .map(|(_, n)| *n)
+            .sum();
+        // 生成段短于窗口时用实际时长（首 token 之后的平均值）；长于窗口时固定
+        // 用窗口长度（最近两秒的瞬时速率）。样本本身已按窗口裁剪，分子分母同源。
+        let denom = elapsed.as_secs_f64().min(STREAM_RATE_WINDOW.as_secs_f64());
+        (denom > 0.0).then(|| tokens / denom)
+    }
+}
+
+#[cfg(test)]
+mod stream_rate_tests {
+    use super::{StreamRateMeter, STREAM_RATE_WINDOW};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn notes_fractional_tokens_so_small_deltas_do_not_round_to_zero() {
+        // 回归钉子：整数版估算对单个 ASCII 字符是 1/3 = 0，一帧几十个小 delta
+        // 累加完仍是 0——速率会永远显示 0 tok/s。
+        let mut m = StreamRateMeter::default();
+        for _ in 0..300 {
+            m.note("a");
+        }
+        let tokens: f64 = m.samples.iter().map(|(_, n)| *n).sum();
+        assert!(
+            (tokens - 100.0).abs() < 1.0,
+            "300 个 ASCII 字符应估 ~100 token，实际 {tokens}"
+        );
+    }
+
+    #[test]
+    fn rate_is_none_before_the_burst_settles() {
+        let mut m = StreamRateMeter::default();
+        m.note("hello");
+        assert_eq!(m.rate(), None, "首个增量刚到时不应给出假峰值");
+    }
+
+    #[test]
+    fn rate_divides_by_actual_burst_duration_when_shorter_than_window() {
+        let mut m = StreamRateMeter::default();
+        // 手工构造一个已经跑了 1 秒的生成段：300 个字符 ≈ 100 token → ~100 tok/s。
+        let started = Instant::now() - Duration::from_secs(1);
+        m.burst_started = Some(started);
+        m.last_delta_at = Some(Instant::now());
+        m.samples.push_back((started, 50.0));
+        m.samples.push_back((Instant::now(), 50.0));
+        let rate = m.rate().expect("应给出速率");
+        assert!(
+            (rate - 100.0).abs() < 1.0,
+            "1 秒 100 token 应约 100 tok/s，实际 {rate}"
+        );
+    }
+
+    #[test]
+    fn rate_uses_window_not_whole_burst_for_long_generations() {
+        let mut m = StreamRateMeter::default();
+        let started = Instant::now() - Duration::from_secs(10);
+        m.burst_started = Some(started);
+        m.last_delta_at = Some(Instant::now());
+        // 只留下最近窗口内的样本：2 秒 60 token → 30 tok/s（而不是整段 10 秒的 6）。
+        m.samples.push_back((Instant::now(), 60.0));
+        let rate = m.rate().expect("应给出速率");
+        let expected = 60.0 / STREAM_RATE_WINDOW.as_secs_f64();
+        assert!(
+            (rate - expected).abs() < 1.0,
+            "应约 {expected} tok/s，实际 {rate}"
+        );
+    }
+
+    #[test]
+    fn reset_and_staleness_both_hide_the_rate() {
+        let mut m = StreamRateMeter::default();
+        let started = Instant::now() - Duration::from_secs(1);
+        m.burst_started = Some(started);
+        m.last_delta_at = Some(Instant::now());
+        m.samples.push_back((started, 50.0));
+        assert!(m.rate().is_some());
+
+        m.reset();
+        assert_eq!(m.rate(), None, "生成段结束后不得继续显示旧速率");
+
+        m.burst_started = Some(started);
+        m.last_delta_at = Some(Instant::now() - Duration::from_secs(5));
+        m.samples.push_back((started, 50.0));
+        assert_eq!(m.rate(), None, "超过 stale 阈值后不得显示冻结的旧速率");
     }
 }
 
@@ -1963,35 +2127,140 @@ pub fn settings_field_kind(_idx: usize) -> SettingsFieldKind {
 
 // ── 分组（Profile）管理面板：/model 命令触发 ──────────────────────────────────
 
-/// 单个分组的可编辑字段数（provider/model/plan_model/exec_model/base_url/api_key/
-/// max_tokens/context_window/reasoning_effort/thinking_switch）
-pub const PROFILE_FIELD_COUNT: usize = 10;
+/// 分组面板单个字段的交互形态。
+///
+/// 与 `SettingsFieldKind` 分开：后者服务 `/config`（只剩 log_level / language 两个
+/// 枚举），语义是"Enter/←→ 切换 vs 进入编辑"；这里的形态更细，且**渲染、键位、
+/// 校验三处都从它派生**，不再靠散落的 `idx == 5` 之类魔数判断。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFieldKind {
+    /// 接口类型（Anthropic Messages / OpenAI Chat Completions），Enter 或 ←→ 循环
+    Provider,
+    /// 普通文本：Enter 借用底部输入框
+    Text,
+    /// 敏感文本：同 Text，但渲染打码
+    Secret,
+    /// 模型名：Enter 直接拉取服务器模型列表（菜单首项仍是"手动输入"兜底）
+    Model,
+    /// 固定候选值循环切换；空串表示"不设置，用端点默认"
+    Enum(&'static [&'static str]),
+    /// 布尔开关
+    Bool,
+}
 
-/// 分组字段对应的 i18n label key，复用 /config 时代已有的 settings.field.* key
-pub const PROFILE_FIELD_LABEL_KEYS: [&str; PROFILE_FIELD_COUNT] = [
-    "settings.field.provider",
-    "settings.field.model",
-    "settings.field.plan_model",
-    "settings.field.exec_model",
-    "settings.field.base_url",
-    "settings.field.api_key",
-    "settings.field.max_tokens",
-    "settings.field.context_window",
-    "settings.field.reasoning_effort",
-    "settings.field.thinking_switch",
+/// 字段在哪种线协议下才有意义。Anthropic 线只认 `thinking.budget_tokens`，
+/// OpenAI 线只认 `reasoning_effort` / `thinking.type`——把两边字段同时平铺出来
+/// 只会诱导用户去配一个必然被 catalog 丢弃的项。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProfileFieldScope {
+    Always,
+    AnthropicWire,
+    OpenAiWire,
+}
+
+pub struct ProfileFieldSpec {
+    /// i18n label key（同时作为 `text_value` 的分派键，见下方的 key match）
+    pub key: &'static str,
+    pub kind: ProfileFieldKind,
+    pub scope: ProfileFieldScope,
+}
+
+const fn field(
+    key: &'static str,
+    kind: ProfileFieldKind,
+    scope: ProfileFieldScope,
+) -> ProfileFieldSpec {
+    ProfileFieldSpec { key, kind, scope }
+}
+
+/// `reasoning_effort` 的全档位。真正能上送哪些由 vendor 决定（`ThinkingSpec::
+/// effort_levels`），渲染时会再按 vendor 过滤一次——这里只保证值是 wire 可识别的。
+const REASONING_EFFORT_CHOICES: &[&str] = &["low", "medium", "high", "xhigh", "max", "adaptive"];
+
+/// `thinking.type` 候选。`adaptive` 只有 MiniMax M3.1 认，其余 vendor 选它会被
+/// adapter 折算成默认形态（不会 400），因此仍列出。
+const THINKING_SWITCH_CHOICES: &[&str] = &["enabled", "disabled", "adaptive"];
+
+/// 分组面板的字段表——**顺序即渲染顺序**，也是唯一真相源。
+///
+/// 插入/重排字段只需改这张表：`text_value`/`set_text_value`/`display_value` 按
+/// `key` 分派（不是按下标），渲染与键位按 `kind` 分派，可见性按 `scope` 过滤。
+/// 历史版本把同样的信息抄在 6 个平行数组里，插一个字段要改 8 处且漏一处就是
+/// 静默错位（`settings.field.reasoning_effort` 这种 key 漏配也是这么来的）。
+pub const PROFILE_FIELD_SPECS: &[ProfileFieldSpec] = &[
+    field(
+        "settings.field.provider",
+        ProfileFieldKind::Provider,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.base_url",
+        ProfileFieldKind::Text,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.api_key",
+        ProfileFieldKind::Secret,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.model",
+        ProfileFieldKind::Model,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.plan_model",
+        ProfileFieldKind::Model,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.exec_model",
+        ProfileFieldKind::Model,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.context_window",
+        ProfileFieldKind::Text,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.max_tokens",
+        ProfileFieldKind::Text,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.thinking_budget",
+        ProfileFieldKind::Text,
+        ProfileFieldScope::AnthropicWire,
+    ),
+    field(
+        "settings.field.interleaved_thinking",
+        ProfileFieldKind::Bool,
+        ProfileFieldScope::AnthropicWire,
+    ),
+    field(
+        "settings.field.reasoning_effort",
+        ProfileFieldKind::Enum(REASONING_EFFORT_CHOICES),
+        ProfileFieldScope::OpenAiWire,
+    ),
+    field(
+        "settings.field.thinking_switch",
+        ProfileFieldKind::Enum(THINKING_SWITCH_CHOICES),
+        ProfileFieldScope::OpenAiWire,
+    ),
 ];
 
-/// api_key 字段索引（渲染时需要打码）
-pub const PROFILE_API_KEY_FIELD_IDX: usize = 5;
+pub const PROFILE_FIELD_COUNT: usize = PROFILE_FIELD_SPECS.len();
 
-/// model/plan_model/exec_model 字段索引集合（这几个字段支持"拉取模型列表"）
-pub const PROFILE_MODEL_FIELD_IDXS: [usize; 3] = [1, 2, 3];
+/// 按 key 查字段下标。找不到返回 None（字段表与调用点不同步时据此暴露，
+/// 而不是静默落到下标 0 去改 provider）。
+pub fn profile_field_idx(key: &str) -> Option<usize> {
+    PROFILE_FIELD_SPECS.iter().position(|s| s.key == key)
+}
 
-pub fn profile_field_kind(idx: usize) -> SettingsFieldKind {
-    match idx {
-        0 => SettingsFieldKind::Enum, // provider
-        _ => SettingsFieldKind::Text,
-    }
+/// api_key 字段下标（渲染打码、onboarding 光标预置共用）
+pub fn profile_api_key_field_idx() -> usize {
+    profile_field_idx("settings.field.api_key").expect("字段表必须含 api_key")
 }
 
 /// 单个分组的编辑草稿
@@ -2014,8 +2283,9 @@ pub struct ProfileEntryDraft {
     pub context_window: String,
     /// 是否支持图片输入（面板暂不暴露编辑入口，仅透传保留原值）
     pub vision: bool,
-    /// thinking 配置（面板暂不暴露编辑入口，仅透传保留原值）
-    pub thinking_budget: Option<u32>,
+    /// Anthropic 协议 extended thinking 预算（空串 = 不设置）。存字符串而非
+    /// `Option<u32>`：面板要能表达"用户正在输入的中间态"，且校验与写盘分离。
+    pub thinking_budget: String,
     pub interleaved_thinking: bool,
     pub prompt_cache: Option<bool>,
     pub openai_stream_options: Option<bool>,
@@ -2047,7 +2317,7 @@ impl ProfileEntryDraft {
             max_tokens: p.max_tokens.to_string(),
             context_window: p.context_window.to_string(),
             vision: p.vision,
-            thinking_budget: p.thinking_budget,
+            thinking_budget: p.thinking_budget.map(|b| b.to_string()).unwrap_or_default(),
             interleaved_thinking: p.interleaved_thinking,
             prompt_cache: p.prompt_cache,
             openai_stream_options: p.openai_stream_options,
@@ -2081,7 +2351,7 @@ impl ProfileEntryDraft {
             max_tokens: "32000".to_string(),
             context_window: "200000".to_string(),
             vision: t.vision,
-            thinking_budget: None,
+            thinking_budget: String::new(),
             interleaved_thinking: true,
             prompt_cache: t.prompt_cache,
             openai_stream_options: t.openai_stream_options,
@@ -2101,32 +2371,43 @@ impl ProfileEntryDraft {
         }
     }
 
+    /// 按字段表下标读取文本值。`Provider` / `Bool` 字段没有文本形态，返回空串——
+    /// 它们各有专用的读写入口（`display_value` / `toggle_bool_field`）。
     pub fn text_value(&self, idx: usize) -> &str {
-        match idx {
-            1 => &self.model,
-            2 => &self.plan_model,
-            3 => &self.exec_model,
-            4 => &self.base_url,
-            5 => &self.api_key,
-            6 => &self.max_tokens,
-            7 => &self.context_window,
-            8 => &self.reasoning_effort,
-            9 => &self.thinking_switch,
+        let Some(spec) = PROFILE_FIELD_SPECS.get(idx) else {
+            return "";
+        };
+        // 按 key 分派而非按下标：字段表重排时这里无需同步。
+        match spec.key {
+            "settings.field.model" => &self.model,
+            "settings.field.plan_model" => &self.plan_model,
+            "settings.field.exec_model" => &self.exec_model,
+            "settings.field.base_url" => &self.base_url,
+            "settings.field.api_key" => &self.api_key,
+            "settings.field.max_tokens" => &self.max_tokens,
+            "settings.field.context_window" => &self.context_window,
+            "settings.field.thinking_budget" => &self.thinking_budget,
+            "settings.field.reasoning_effort" => &self.reasoning_effort,
+            "settings.field.thinking_switch" => &self.thinking_switch,
             _ => "",
         }
     }
 
     fn set_text_value(&mut self, idx: usize, value: String) {
-        match idx {
-            1 => self.model = value,
-            2 => self.plan_model = value,
-            3 => self.exec_model = value,
-            4 => self.base_url = value,
-            5 => self.api_key = value,
-            6 => self.max_tokens = value,
-            7 => self.context_window = value,
-            8 => self.reasoning_effort = value,
-            9 => self.thinking_switch = value,
+        let Some(spec) = PROFILE_FIELD_SPECS.get(idx) else {
+            return;
+        };
+        match spec.key {
+            "settings.field.model" => self.model = value,
+            "settings.field.plan_model" => self.plan_model = value,
+            "settings.field.exec_model" => self.exec_model = value,
+            "settings.field.base_url" => self.base_url = value,
+            "settings.field.api_key" => self.api_key = value,
+            "settings.field.max_tokens" => self.max_tokens = value,
+            "settings.field.context_window" => self.context_window = value,
+            "settings.field.thinking_budget" => self.thinking_budget = value,
+            "settings.field.reasoning_effort" => self.reasoning_effort = value,
+            "settings.field.thinking_switch" => self.thinking_switch = value,
             _ => {}
         }
     }
@@ -2135,26 +2416,106 @@ impl ProfileEntryDraft {
         self.provider_idx = cycle_index(self.provider_idx, 2, forward);
     }
 
+    /// 当前字段的可切换候选值。空切片 = 该字段不是 Enum。
+    ///
+    /// 首项固定为空串（"不设置，用端点默认"）——配置里 `reasoning_effort` 与
+    /// `thinking_switch` 都是 `Option<String>`，必须留出回到 `None` 的路径，
+    /// 否则用户一旦点错就再也回不到"跟随端点默认"。
+    fn enum_choices(&self, idx: usize) -> Vec<&'static str> {
+        let Some(spec) = PROFILE_FIELD_SPECS.get(idx) else {
+            return Vec::new();
+        };
+        let ProfileFieldKind::Enum(choices) = spec.kind else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(choices.len() + 1);
+        out.push("");
+        out.extend_from_slice(choices);
+        out
+    }
+
+    fn cycle_enum_field(&mut self, idx: usize, forward: bool) {
+        let choices = self.enum_choices(idx);
+        if choices.is_empty() {
+            return;
+        }
+        let current = self.text_value(idx);
+        let pos = choices.iter().position(|c| *c == current).unwrap_or(0);
+        let next = cycle_index(pos, choices.len(), forward);
+        self.set_text_value(idx, choices[next].to_string());
+    }
+
+    fn toggle_bool_field(&mut self, idx: usize) {
+        let Some(spec) = PROFILE_FIELD_SPECS.get(idx) else {
+            return;
+        };
+        if spec.key == "settings.field.interleaved_thinking" {
+            self.interleaved_thinking = !self.interleaved_thinking;
+        }
+    }
+
     pub fn display_value(&self, idx: usize) -> String {
-        match idx {
-            0 => {
+        let Some(spec) = PROFILE_FIELD_SPECS.get(idx) else {
+            return String::new();
+        };
+        match spec.kind {
+            ProfileFieldKind::Provider => {
                 if self.provider_idx == 0 {
                     "Anthropic".to_string()
                 } else {
                     "OpenAI".to_string()
                 }
             }
+            ProfileFieldKind::Bool => {
+                if self.interleaved_thinking {
+                    wyj_i18n::tr("profile.value.on")
+                } else {
+                    wyj_i18n::tr("profile.value.off")
+                }
+            }
+            ProfileFieldKind::Enum(_) => {
+                let raw = self.text_value(idx);
+                if raw.is_empty() {
+                    // 空串在 Enum 里表达的是"跟随端点默认"，直接显示成空会让人
+                    // 以为字段没接上；用显式文案代替。
+                    wyj_i18n::tr("profile.value.default")
+                } else {
+                    raw.to_string()
+                }
+            }
             _ => self.text_value(idx).to_string(),
         }
     }
 
-    /// 校验 max_tokens/context_window 是否为合法 u32，非法则返回 i18n key
+    /// 选中模型后按静态目录补全容量字段。
+    ///
+    /// 只填「空或仍是默认值」的字段：`context_window == 200000` /
+    /// `max_tokens == 32000` 是面板新建时的默认值，用户没动过它们才代表
+    /// "可以帮我填"；改过的数字不能被静默覆盖。
+    fn autofill_capacity_from_catalog(&mut self) {
+        let Some(cap) = wyj_api::known_model_capacity(&self.model) else {
+            return;
+        };
+        if self.context_window.trim().is_empty() || self.context_window.trim() == "200000" {
+            self.context_window = cap.context_window.to_string();
+        }
+        if self.max_tokens.trim().is_empty() || self.max_tokens.trim() == "32000" {
+            self.max_tokens = cap.max_output_tokens.to_string();
+        }
+    }
+
+    /// 校验数值字段。非法则返回 i18n key。
     fn validate(&self) -> Option<&'static str> {
         if self.max_tokens.trim().parse::<u32>().is_err() {
             return Some("settings.error.invalid_max_tokens");
         }
         if self.context_window.trim().parse::<u32>().is_err() {
             return Some("settings.error.invalid_context_window");
+        }
+        if !self.thinking_budget.trim().is_empty()
+            && self.thinking_budget.trim().parse::<u32>().is_err()
+        {
+            return Some("settings.error.invalid_thinking_budget");
         }
         None
     }
@@ -2186,7 +2547,11 @@ impl ProfileEntryDraft {
             max_tokens: self.max_tokens.trim().parse().unwrap_or(32_000),
             context_window: self.context_window.trim().parse().unwrap_or(200_000),
             vision: self.vision,
-            thinking_budget: self.thinking_budget,
+            thinking_budget: if self.thinking_budget.trim().is_empty() {
+                None
+            } else {
+                self.thinking_budget.trim().parse().ok()
+            },
             interleaved_thinking: self.interleaved_thinking,
             prompt_cache: self.prompt_cache,
             openai_stream_options: self.openai_stream_options,
@@ -2292,11 +2657,47 @@ impl ProfileDialog {
             .position(|p| p.name == cfg.active_profile)
             .unwrap_or(0);
         d.expanded = Some(active_idx);
-        // rows() = [Header(active_idx), Field(active_idx,0), ..., Field(active_idx,9), AddNew]
-        // Header 占 1 行,Field(active_idx, k) 占 1 行 → api_key (k=5) 是下标 1+5 = 6
-        d.cursor = 1 + PROFILE_API_KEY_FIELD_IDX;
+        // rows() = [Header(active_idx), 各可见字段行..., AddNew]
+        d.cursor = 1 + profile_api_key_field_idx();
         d.clamp_cursor();
         d
+    }
+
+    /// 某分组当前应展示的字段下标（按字段表顺序）。
+    ///
+    /// `scope` 过滤在这里做，而不是在渲染层——键位处理、光标移动、`rows()`
+    /// 三者必须看到同一份可见列表，否则按方向键会跳到看不见的行上去。
+    pub fn visible_field_idxs(&self, entry_idx: usize) -> Vec<usize> {
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return Vec::new();
+        };
+        let wire = Self::wire_for_provider(entry.provider_idx);
+        PROFILE_FIELD_SPECS
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| match spec.scope {
+                ProfileFieldScope::Always => true,
+                ProfileFieldScope::AnthropicWire => {
+                    matches!(wire, wyj_config::WireProtocol::AnthropicMessages)
+                }
+                ProfileFieldScope::OpenAiWire => {
+                    matches!(wire, wyj_config::WireProtocol::OpenAiChatCompletions)
+                }
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// provider 决定的线协议。用户没在配置里显式写 `wire_protocol` 时，
+    /// 它总是跟随 provider——面板里也只有 provider 这一个可切换项，
+    /// 所以直接用同样的推导规则，不读 `entry.wire_protocol`（那个字段面板
+    /// 不编辑，却可能被旧配置写成与 provider 不一致，届时隐藏规则会错乱）。
+    fn wire_for_provider(provider_idx: usize) -> wyj_config::WireProtocol {
+        if provider_idx == 0 {
+            wyj_config::WireProtocol::AnthropicMessages
+        } else {
+            wyj_config::WireProtocol::OpenAiChatCompletions
+        }
     }
 
     /// 是否存在未保存的修改（Esc 关闭前的脏检查）
@@ -2310,7 +2711,7 @@ impl ProfileDialog {
         for i in 0..self.entries.len() {
             rows.push(ProfileRow::Header(i));
             if self.expanded == Some(i) {
-                for f in 0..PROFILE_FIELD_COUNT {
+                for f in self.visible_field_idxs(i) {
                     rows.push(ProfileRow::Field(i, f));
                 }
             }
@@ -2423,25 +2824,8 @@ impl ProfileDialog {
                 ];
                 Some(ActionMenu::new(row, items))
             }
-            ProfileRow::Field(_, f) if PROFILE_MODEL_FIELD_IDXS.contains(&f) => {
-                let items = vec![
-                    ActionMenuItem {
-                        label: wyj_i18n::tr("profile.menu.manual_edit"),
-                        action: ProfileMenuAction::Field(ProfileFieldAction::ManualEdit),
-                        dangerous: false,
-                        disabled: false,
-                        disabled_reason: None,
-                    },
-                    ActionMenuItem {
-                        label: wyj_i18n::tr("profile.menu.fetch_models"),
-                        action: ProfileMenuAction::Field(ProfileFieldAction::FetchFromServer),
-                        dangerous: false,
-                        disabled: false,
-                        disabled_reason: None,
-                    },
-                ];
-                Some(ActionMenu::new(row, items))
-            }
+            // Model 字段的 Enter 不再经过这里：它直接发起拉取，列表首项再兜底
+            // 「手动输入」（见 `profile_start_fetch_models`）。
             _ => None,
         }
     }
@@ -2529,7 +2913,15 @@ impl InputOwner {
             InputOwner::Profile(ProfileInputField::Field { field_idx, .. }) => (
                 wyj_i18n::tr_fmt(
                     "dialog.input_owner.profile_field",
-                    &[("field", &wyj_i18n::tr(PROFILE_FIELD_LABEL_KEYS[*field_idx]))],
+                    &[(
+                        "field",
+                        &wyj_i18n::tr(
+                            PROFILE_FIELD_SPECS
+                                .get(*field_idx)
+                                .map(|s| s.key)
+                                .unwrap_or(""),
+                        ),
+                    )],
                 ),
                 Theme::claude_color(),
             ),
@@ -2820,6 +3212,59 @@ fn profile_handle_menu_key(
     None
 }
 
+/// 发起一次模型列表拉取。Enter 直达（Model 字段）与菜单项共用这条路径。
+fn profile_start_fetch_models(
+    state: &mut AppState,
+    agent_tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    entry_idx: usize,
+    field_idx: usize,
+) {
+    let Some(entry) = state
+        .profile_dialog
+        .as_ref()
+        .and_then(|d| d.entries.get(entry_idx))
+        .cloned()
+    else {
+        return;
+    };
+    let api_key = entry.api_key.clone();
+    if api_key.trim().is_empty() {
+        if let Some(dialog) = &mut state.profile_dialog {
+            dialog.error = Some(wyj_i18n::tr("profile.fetch.need_api_key"));
+        }
+        return;
+    }
+    let provider = entry.provider();
+    let base_url = if entry.base_url.trim().is_empty() {
+        match provider {
+            wyj_config::Provider::Anthropic => "https://api.anthropic.com".to_string(),
+            wyj_config::Provider::OpenAI => "https://api.openai.com/v1".to_string(),
+        }
+    } else {
+        entry.base_url.clone()
+    };
+    if let Some(dialog) = &mut state.profile_dialog {
+        dialog.overlay = ProfileOverlay::FetchingModels {
+            entry_idx,
+            field_idx,
+        };
+        dialog.error = None;
+    }
+    let tx = agent_tx.clone();
+    tokio::spawn(async move {
+        let result = wyj_api::fetch_model_ids(&provider, &base_url, &api_key)
+            .await
+            .map_err(|e| e.to_string());
+        let _ = tx
+            .send(AgentEvent::ModelsFetched {
+                entry_idx,
+                field_idx,
+                result,
+            })
+            .await;
+    });
+}
+
 fn profile_execute_menu_action(
     state: &mut AppState,
     action: ProfileMenuAction,
@@ -2899,48 +3344,7 @@ fn profile_execute_menu_action(
             let ProfileRow::Field(entry_idx, field_idx) = target else {
                 return;
             };
-            let Some(entry) = state
-                .profile_dialog
-                .as_ref()
-                .map(|d| d.entries[entry_idx].clone())
-            else {
-                return;
-            };
-            let api_key = entry.api_key.clone();
-            if api_key.trim().is_empty() {
-                if let Some(dialog) = &mut state.profile_dialog {
-                    dialog.error = Some(wyj_i18n::tr("profile.fetch.need_api_key"));
-                }
-                return;
-            }
-            let provider = entry.provider();
-            let base_url = if entry.base_url.trim().is_empty() {
-                match provider {
-                    wyj_config::Provider::Anthropic => "https://api.anthropic.com".to_string(),
-                    wyj_config::Provider::OpenAI => "https://api.openai.com/v1".to_string(),
-                }
-            } else {
-                entry.base_url.clone()
-            };
-            if let Some(dialog) = &mut state.profile_dialog {
-                dialog.overlay = ProfileOverlay::FetchingModels {
-                    entry_idx,
-                    field_idx,
-                };
-            }
-            let tx = agent_tx.clone();
-            tokio::spawn(async move {
-                let result = wyj_api::fetch_model_ids(&provider, &base_url, &api_key)
-                    .await
-                    .map_err(|e| e.to_string());
-                let _ = tx
-                    .send(AgentEvent::ModelsFetched {
-                        entry_idx,
-                        field_idx,
-                        result,
-                    })
-                    .await;
-            });
+            profile_start_fetch_models(state, agent_tx, entry_idx, field_idx);
         }
         ProfileMenuAction::ModelChoice(i) => {
             let ProfileRow::Field(entry_idx, field_idx) = target else {
@@ -2949,6 +3353,9 @@ fn profile_execute_menu_action(
             if let Some(dialog) = &mut state.profile_dialog {
                 if let Some(name) = dialog.pending_models.get(i).cloned() {
                     dialog.entries[entry_idx].set_text_value(field_idx, name);
+                    // 选中模型后顺手把容量字段填成目录给出的已知值。只填空的或
+                    // 仍是默认值的字段——用户明确改过的数字不能被自动值覆盖。
+                    dialog.entries[entry_idx].autofill_capacity_from_catalog();
                 }
             }
         }
@@ -8575,6 +8982,11 @@ pub struct AppState {
     pub turn_live_input_tokens: u32,
     /// 本轮实时累计的 output tokens（与 `turn_live_input_tokens` 同源同节奏）
     pub turn_live_output_tokens: u32,
+    /// 流式生成速率表（标题栏 `xx tok/s`）。只服务显示，不参与任何决策。
+    ///
+    /// 生命周期跟着「生成段」而不是跟着回合：`ToolStart`、回合收尾、中断都会
+    /// 清空——工具执行期间模型没在吐 token，继续显示上一个速率就是在骗人。
+    pub stream_rate: StreamRateMeter,
     /// 最近一轮 AI 交互耗时。当前轮运行时由 `turn_start_time` 实时计算，完成后落这里。
     pub last_turn_elapsed_secs: Option<f64>,
     /// 最近一轮 AI 交互输入 token 增量。
@@ -8767,6 +9179,7 @@ impl AppState {
             turn_start_output_tokens: 0,
             turn_live_input_tokens: 0,
             turn_live_output_tokens: 0,
+            stream_rate: StreamRateMeter::default(),
             last_turn_elapsed_secs: None,
             last_turn_input_tokens: 0,
             last_turn_output_tokens: 0,
@@ -8850,6 +9263,8 @@ impl AppState {
         // 的开销带进新一轮标题栏（表现为"刚发消息就显示几万 token"）。
         self.turn_live_input_tokens = 0;
         self.turn_live_output_tokens = 0;
+        // 新回合从 TTFT 开始重新计时：上一轮的速率与这一轮毫无关系。
+        self.stream_rate.reset();
     }
 
     fn begin_new_turn(&mut self) {
@@ -8915,6 +9330,7 @@ impl AppState {
         self.turn_start_output_tokens = 0;
         self.turn_live_input_tokens = 0;
         self.turn_live_output_tokens = 0;
+        self.stream_rate.reset();
         self.last_turn_elapsed_secs = None;
         self.last_turn_input_tokens = 0;
         self.last_turn_output_tokens = 0;
@@ -10028,6 +10444,7 @@ impl AppState {
             }
         }
         self.reconcile_sub_agent_selection();
+        self.stream_rate.reset();
         if self.is_thinking {
             if self.streaming_buf.is_empty() {
                 self.streaming_buf = "[已中断]".to_string();
@@ -10290,6 +10707,7 @@ impl AppState {
             AgentEvent::TextDelta(d) => {
                 // thinking 结束、正文开始：先折叠思考行
                 self.flush_thinking();
+                self.stream_rate.note(&d);
                 self.streaming_buf.push_str(&d);
                 self.note_new_chat_content();
             }
@@ -10297,6 +10715,9 @@ impl AppState {
                 if self.thinking_buf.is_empty() {
                     self.thinking_started = Some(std::time::Instant::now());
                 }
+                // thinking 也是模型在吐 token，且用户看到的是同一个 spinner，
+                // 速率必须把它算进去——否则开思考的模型会一直显示 0 tok/s。
+                self.stream_rate.note(&d);
                 self.thinking_buf.push_str(&d);
                 self.note_new_chat_content();
             }
@@ -10326,6 +10747,9 @@ impl AppState {
                 let display = format!("{display}{}", tool_backend_badge(&name));
                 self.current_op = Some(display.clone());
                 self.current_tool_name = Some(name.clone());
+                // 模型已经停止生成、开始调工具：速率归零。工具可能跑几十秒，
+                // 期间继续显示上一个 tok/s 就是在报一个已经不存在的事实。
+                self.stream_rate.reset();
                 // 步骤计时起点：并发多个工具时后到的 ToolStart 会覆盖成最后一个，
                 // 与 `current_op` 保持同一口径（标题栏只展示"最近开始的那一步"）。
                 self.current_op_started = Some(Instant::now());
@@ -10413,6 +10837,7 @@ impl AppState {
 
             AgentEvent::TurnDone => {
                 self.flush_streaming();
+                self.stream_rate.reset();
                 self.is_thinking = false;
                 self.current_op = None;
                 self.current_tool_name = None;
@@ -10652,6 +11077,7 @@ impl AppState {
 
             AgentEvent::Error(e) => {
                 self.flush_streaming();
+                self.stream_rate.reset();
                 if let Some(start) = self.turn_start_time.take() {
                     self.last_turn_elapsed_secs = Some(start.elapsed().as_secs_f64());
                     self.last_turn_input_tokens = self
@@ -10849,22 +11275,57 @@ impl AppState {
                     );
                     if matches_pending {
                         dialog.overlay = ProfileOverlay::None;
+                        // 拉取失败/为空时也要给出「手动输入」入口，否则 Model 字段
+                        // 的 Enter 永远只会重试拉取，端点不支持 /models 的用户就
+                        // 再也改不了模型名了。
+                        let manual_only = || {
+                            ActionMenu::new(
+                                ProfileRow::Field(entry_idx, field_idx),
+                                vec![ActionMenuItem {
+                                    label: format!(
+                                        "✎ {}",
+                                        wyj_i18n::tr("profile.menu.manual_edit")
+                                    ),
+                                    action: ProfileMenuAction::Field(
+                                        ProfileFieldAction::ManualEdit,
+                                    ),
+                                    dangerous: false,
+                                    disabled: false,
+                                    disabled_reason: None,
+                                }],
+                            )
+                        };
                         match result {
                             Ok(models) if models.is_empty() => {
                                 dialog.error = Some(wyj_i18n::tr("profile.fetch.empty"));
+                                dialog.menu = Some(manual_only());
                             }
                             Ok(models) => {
-                                let items = models
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, name)| ActionMenuItem {
+                                // 首项固定「手动输入」：第三方的 /models 常常
+                                // 不全或干脆不支持，用户必须随时能退回手填。
+                                // 它的 action 不带下标（`ManualEdit`），不会与
+                                // `pending_models` 的 0-based 下标冲突。
+                                let mut items = vec![ActionMenuItem {
+                                    label: format!(
+                                        "✎ {}",
+                                        wyj_i18n::tr("profile.menu.manual_edit")
+                                    ),
+                                    action: ProfileMenuAction::Field(
+                                        ProfileFieldAction::ManualEdit,
+                                    ),
+                                    dangerous: false,
+                                    disabled: false,
+                                    disabled_reason: None,
+                                }];
+                                items.extend(models.iter().enumerate().map(|(i, name)| {
+                                    ActionMenuItem {
                                         label: name.clone(),
                                         action: ProfileMenuAction::ModelChoice(i),
                                         dangerous: false,
                                         disabled: false,
                                         disabled_reason: None,
-                                    })
-                                    .collect();
+                                    }
+                                }));
                                 dialog.pending_models = models;
                                 dialog.menu = Some(ActionMenu::new(
                                     ProfileRow::Field(entry_idx, field_idx),
@@ -10874,6 +11335,7 @@ impl AppState {
                             Err(e) => {
                                 dialog.error =
                                     Some(wyj_i18n::tr_fmt("profile.fetch.failed", &[("err", &e)]));
+                                dialog.menu = Some(manual_only());
                             }
                         }
                     }
@@ -16261,22 +16723,29 @@ async fn tui_main(
                                     dialog.error = None;
                                 }
                             }
-                            KeyCode::Left => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    if let ProfileRow::Field(entry_idx, f) = dialog.selected_row() {
-                                        if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
-                                        {
-                                            dialog.entries[entry_idx].cycle_provider(false);
-                                        }
+                            KeyCode::Left | KeyCode::Right => {
+                                let forward = key.code == KeyCode::Right;
+                                let target = state.profile_dialog.as_ref().and_then(|d| {
+                                    match d.selected_row() {
+                                        ProfileRow::Field(entry_idx, f) => Some((entry_idx, f)),
+                                        _ => None,
                                     }
-                                }
-                            }
-                            KeyCode::Right => {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    if let ProfileRow::Field(entry_idx, f) = dialog.selected_row() {
-                                        if matches!(profile_field_kind(f), SettingsFieldKind::Enum)
-                                        {
-                                            dialog.entries[entry_idx].cycle_provider(true);
+                                });
+                                if let Some((entry_idx, f)) = target {
+                                    if let Some(dialog) = &mut state.profile_dialog {
+                                        match PROFILE_FIELD_SPECS.get(f).map(|s| s.kind) {
+                                            Some(ProfileFieldKind::Provider) => {
+                                                dialog.entries[entry_idx].cycle_provider(forward)
+                                            }
+                                            Some(ProfileFieldKind::Enum(_)) => dialog.entries
+                                                [entry_idx]
+                                                .cycle_enum_field(f, forward),
+                                            Some(ProfileFieldKind::Bool) => {
+                                                dialog.entries[entry_idx].toggle_bool_field(f)
+                                            }
+                                            // Text/Secret/Model：文本字段没有"切换"语义，
+                                            // 与旧行为一致（←→ 无动作）。
+                                            _ => {}
                                         }
                                     }
                                 }
@@ -16290,41 +16759,59 @@ async fn tui_main(
                                         }
                                     }
                                     Some(ProfileRow::Field(entry_idx, f)) => {
-                                        if PROFILE_MODEL_FIELD_IDXS.contains(&f) {
-                                            // model/plan_model/exec_model：先弹"手动编辑 /
-                                            // 从服务器拉取列表"小菜单（原 Ctrl+L 并入此处）。
-                                            if let Some(dialog) = &mut state.profile_dialog {
-                                                dialog.menu = dialog.build_menu();
+                                        let kind = PROFILE_FIELD_SPECS.get(f).map(|s| s.kind);
+                                        match kind {
+                                            Some(ProfileFieldKind::Model) => {
+                                                // 模型名：Enter 直接拉服务器列表。
+                                                // 拉取失败或需要手填时不阻塞——结果菜单
+                                                // 首项固定是「手动输入」（见 AgentEvent::ModelsFetched
+                                                // 的菜单构造）。
+                                                profile_start_fetch_models(
+                                                    &mut state, &agent_tx, entry_idx, f,
+                                                );
                                             }
-                                        } else if matches!(
-                                            profile_field_kind(f),
-                                            SettingsFieldKind::Enum
-                                        ) {
-                                            // provider：Enter 循环切换，与 Left/Right 等价，
-                                            // 已经是方向键交互，不纳入菜单化/借用输入框。
-                                            if let Some(dialog) = &mut state.profile_dialog {
-                                                dialog.entries[entry_idx].cycle_provider(true);
+                                            Some(ProfileFieldKind::Provider) => {
+                                                if let Some(dialog) = &mut state.profile_dialog {
+                                                    dialog.entries[entry_idx].cycle_provider(true);
+                                                    // provider 换了，可见字段集合跟着变，
+                                                    // 光标可能落在被隐藏的行上。
+                                                    dialog.clamp_cursor();
+                                                }
                                             }
-                                        } else {
-                                            // base_url/api_key/max_tokens/context_window：
-                                            // 直接借用底部输入框，不经过小菜单。
-                                            let prefill = state
-                                                .profile_dialog
-                                                .as_ref()
-                                                .map(|d| {
-                                                    d.entries[entry_idx].text_value(f).to_string()
-                                                })
-                                                .unwrap_or_default();
-                                            if let Some(dialog) = &mut state.profile_dialog {
-                                                dialog.live_input = InputBox::new();
-                                                dialog.live_input.insert_text(&prefill);
+                                            Some(ProfileFieldKind::Enum(_))
+                                            | Some(ProfileFieldKind::Bool) => {
+                                                if let Some(dialog) = &mut state.profile_dialog {
+                                                    match kind {
+                                                        Some(ProfileFieldKind::Enum(_)) => dialog
+                                                            .entries[entry_idx]
+                                                            .cycle_enum_field(f, true),
+                                                        _ => dialog.entries[entry_idx]
+                                                            .toggle_bool_field(f),
+                                                    }
+                                                }
                                             }
-                                            state.input_owner = Some(InputOwner::Profile(
-                                                ProfileInputField::Field {
-                                                    entry_idx,
-                                                    field_idx: f,
-                                                },
-                                            ));
+                                            _ => {
+                                                // Text/Secret：借用底部输入框。
+                                                let prefill = state
+                                                    .profile_dialog
+                                                    .as_ref()
+                                                    .map(|d| {
+                                                        d.entries[entry_idx]
+                                                            .text_value(f)
+                                                            .to_string()
+                                                    })
+                                                    .unwrap_or_default();
+                                                if let Some(dialog) = &mut state.profile_dialog {
+                                                    dialog.live_input = InputBox::new();
+                                                    dialog.live_input.insert_text(&prefill);
+                                                }
+                                                state.input_owner = Some(InputOwner::Profile(
+                                                    ProfileInputField::Field {
+                                                        entry_idx,
+                                                        field_idx: f,
+                                                    },
+                                                ));
+                                            }
                                         }
                                     }
                                     Some(ProfileRow::AddNew) => {
@@ -20907,17 +21394,14 @@ mod profile_dialog_onboarding_tests {
         };
         let d = ProfileDialog::new_for_onboarding(&cfg);
         assert_eq!(d.expanded, Some(0), "默认展开 active profile(0)");
-        // Header(active_idx) + Field(active_idx,0) + ... + Field(active_idx,5) = 6 行
-        assert_eq!(
-            d.cursor,
-            1 + PROFILE_API_KEY_FIELD_IDX,
-            "光标应预置到 api_key 字段"
-        );
-        // 该行确实指向 api_key(下标 = PROFILE_API_KEY_FIELD_IDX)
+        // Header(active_idx) + 各可见字段行；api_key 必须恰好落在这一行
+        let api_key_idx = super::profile_api_key_field_idx();
+        assert_eq!(d.cursor, 1 + api_key_idx, "光标应预置到 api_key 字段");
+        // 该行确实指向 api_key
         let rows = d.rows();
         if let Some(crate::app::ProfileRow::Field(entry, field)) = rows.get(d.cursor) {
             assert_eq!(*entry, 0);
-            assert_eq!(*field, PROFILE_API_KEY_FIELD_IDX);
+            assert_eq!(*field, api_key_idx);
         } else {
             panic!("cursor 指向的行不是 Field(active_idx, api_key)");
         }
@@ -21068,6 +21552,221 @@ mod profile_dialog_onboarding_tests {
         state.session_profile_override = Some("deleted-profile".to_string());
         assert_eq!(state.effective_config().active_profile, "default");
         assert!(state.session_profile_active().is_none());
+    }
+
+    // ── 字段表不变量（声明式重构后只在这一处钉死） ──────────────────────────
+
+    /// 每个字段的 i18n key 必须真的能解析。
+    ///
+    /// 回归点：`settings.field.reasoning_effort` / `thinking_switch` 曾只被字段表
+    /// 引用、locale 里根本没有条目，rust-i18n 缺 key 时**原样回显 key**，面板上
+    /// 于是出现了 `settings.field.reasoning_effort` 这串字面量。缺翻译不会 panic、
+    /// 不会告警，只能靠这条断言兜住。
+    #[test]
+    fn every_profile_field_label_key_resolves() {
+        for spec in super::PROFILE_FIELD_SPECS {
+            let label = wyj_i18n::tr(spec.key);
+            assert_ne!(
+                label, spec.key,
+                "字段 {} 的 i18n label 缺失（渲染成字面量）",
+                spec.key
+            );
+            assert!(!label.trim().is_empty(), "字段 {} 的 label 为空", spec.key);
+        }
+    }
+
+    /// 字段表里每个 key 都要在 `text_value` / `set_text_value` 里有对应分支，
+    /// 否则该字段在面板里永远是空串、且编辑结果被静默丢弃。
+    #[test]
+    fn every_profile_field_round_trips_through_text_accessors() {
+        for (idx, spec) in super::PROFILE_FIELD_SPECS.iter().enumerate() {
+            let is_text = matches!(
+                spec.kind,
+                super::ProfileFieldKind::Text
+                    | super::ProfileFieldKind::Secret
+                    | super::ProfileFieldKind::Model
+                    | super::ProfileFieldKind::Enum(_)
+            );
+            if !is_text {
+                continue;
+            }
+            let mut draft =
+                super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+            draft.set_text_value(idx, "probe-value".to_string());
+            assert_eq!(
+                draft.text_value(idx),
+                "probe-value",
+                "字段 {} 的读写分支不一致",
+                spec.key
+            );
+        }
+    }
+
+    /// 顺序即渲染顺序：接口类型 → 连接 → 模型 → 容量 → 思考。
+    ///
+    /// 这条断言把「先选 API 类型，再填 base_url/model，再填容量，最后是思考」
+    /// 的交互决策钉在测试里，避免下次重排时无意改回旧顺序。
+    #[test]
+    fn profile_field_order_follows_the_setup_flow() {
+        let keys: Vec<&str> = super::PROFILE_FIELD_SPECS.iter().map(|s| s.key).collect();
+        let pos = |k: &str| keys.iter().position(|x| *x == k).unwrap();
+        assert!(
+            pos("settings.field.provider") < pos("settings.field.base_url"),
+            "接口类型必须在 base_url 之前: {keys:?}"
+        );
+        assert!(
+            pos("settings.field.base_url") < pos("settings.field.model"),
+            "base_url 必须在 model 之前: {keys:?}"
+        );
+        assert!(
+            pos("settings.field.model") < pos("settings.field.context_window"),
+            "model 必须在容量字段之前: {keys:?}"
+        );
+        assert!(
+            pos("settings.field.context_window") < pos("settings.field.reasoning_effort"),
+            "容量字段必须在思考字段之前: {keys:?}"
+        );
+    }
+
+    /// 思考字段按线协议分流：Anthropic 线隐藏 effort/switch，OpenAI 线隐藏
+    /// budget/interleaved。
+    ///
+    /// 两边的参数互不相认（`thinking_budget` 在 OpenAI web 上没有语义，
+    /// `reasoning_effort` 在 Anthropic Messages 上是死字段），同时平铺只会
+    /// 诱导用户去配一个必然被 catalog 丢弃的项。
+    #[test]
+    fn thinking_fields_are_scoped_to_their_wire_protocol() {
+        let cfg = Config::default();
+        let mut dialog = super::ProfileDialog::new(&cfg, None);
+        let anthropic_idx = super::profile_field_idx("settings.field.thinking_budget").unwrap();
+        let effort_idx = super::profile_field_idx("settings.field.reasoning_effort").unwrap();
+        let switch_idx = super::profile_field_idx("settings.field.thinking_switch").unwrap();
+        let interleaved_idx =
+            super::profile_field_idx("settings.field.interleaved_thinking").unwrap();
+
+        let entry = 0;
+        dialog.entries[entry].provider_idx = 0; // Anthropic
+        let visible = dialog.visible_field_idxs(entry);
+        assert!(
+            visible.contains(&anthropic_idx),
+            "Anthropic 线应显示思考预算"
+        );
+        assert!(
+            visible.contains(&interleaved_idx),
+            "Anthropic 线应显示交错思考"
+        );
+        assert!(
+            !visible.contains(&effort_idx),
+            "Anthropic 线不应显示 thinking effort"
+        );
+        assert!(
+            !visible.contains(&switch_idx),
+            "Anthropic 线不应显示 thinking switch"
+        );
+
+        dialog.entries[entry].provider_idx = 1; // OpenAI
+        let visible = dialog.visible_field_idxs(entry);
+        assert!(visible.contains(&effort_idx), "OpenAI 线应显示思考强度");
+        assert!(visible.contains(&switch_idx), "OpenAI 线应显示思考开关");
+        assert!(
+            !visible.contains(&anthropic_idx),
+            "OpenAI 线不应显示思考预算"
+        );
+        assert!(
+            !visible.contains(&interleaved_idx),
+            "OpenAI 线不应显示交错思考"
+        );
+
+        // 与 provider 无关的字段在两种线协议下都要在。
+        for key in [
+            "settings.field.provider",
+            "settings.field.base_url",
+            "settings.field.api_key",
+            "settings.field.model",
+            "settings.field.context_window",
+            "settings.field.max_tokens",
+        ] {
+            let idx = super::profile_field_idx(key).unwrap();
+            assert!(
+                dialog.visible_field_idxs(entry).contains(&idx),
+                "{key} 在 OpenAI 线下应可见"
+            );
+        }
+    }
+
+    /// 枚举字段的候选必须首项为空串（回到 `None` 的路径），且循环能回到起点。
+    ///
+    /// 没有空串这一项时，用户一旦把 `thinking_switch` 从「默认」点成 `enabled`，
+    /// 就再也回不到"跟随端点默认"——配置里该字段是 `Option<String>`，
+    /// 空串是唯一能表达 `None` 的形态。
+    #[test]
+    fn enum_fields_keep_a_way_back_to_the_unset_value() {
+        let mut draft =
+            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let idx = super::profile_field_idx("settings.field.reasoning_effort").unwrap();
+        let choices = draft.enum_choices(idx);
+        assert_eq!(
+            choices.first(),
+            Some(&""),
+            "首项必须是「未设置」: {choices:?}"
+        );
+        assert!(choices.len() >= 3, "至少要有若干档位: {choices:?}");
+
+        // 从空开始逐步前进，走满一圈必须回到空。
+        let start = draft.text_value(idx).to_string();
+        for _ in 0..choices.len() {
+            draft.cycle_enum_field(idx, true);
+        }
+        assert_eq!(draft.text_value(idx), start, "循环一圈未回到起点");
+    }
+
+    /// thinking_budget 的草稿是字符串，写盘时必须正确映射回 `Option<u32>`。
+    #[test]
+    fn thinking_budget_draft_maps_to_option_u32() {
+        let mut draft =
+            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let idx = super::profile_field_idx("settings.field.thinking_budget").unwrap();
+
+        draft.set_text_value(idx, String::new());
+        assert_eq!(draft.to_profile().thinking_budget, None, "空串应写回 None");
+
+        draft.set_text_value(idx, "8000".to_string());
+        assert_eq!(draft.to_profile().thinking_budget, Some(8_000));
+
+        draft.set_text_value(idx, "abc".to_string());
+        assert_eq!(
+            draft.validate(),
+            Some("settings.error.invalid_thinking_budget"),
+            "非数字必须被校验拦下，而不是静默写回 None"
+        );
+    }
+
+    /// 选中模型后，容量字段只在「用户没动过」时被自动填。
+    #[test]
+    fn catalog_autofill_only_overwrites_untouched_defaults() {
+        let mut draft =
+            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        draft.context_window = "200000".to_string();
+        draft.max_tokens = "32000".to_string();
+        draft.model = "claude-sonnet-4-5".to_string();
+        draft.autofill_capacity_from_catalog();
+        assert_eq!(draft.context_window, "200000");
+        assert_eq!(draft.max_tokens, "32000");
+
+        // 用户手改过的值不能被覆盖。
+        draft.context_window = "100000".to_string();
+        draft.max_tokens = "4096".to_string();
+        draft.autofill_capacity_from_catalog();
+        assert_eq!(draft.context_window, "100000");
+        assert_eq!(draft.max_tokens, "4096");
+
+        // 命中未知模型时保持原样。
+        draft.context_window = "200000".to_string();
+        draft.max_tokens = "32000".to_string();
+        draft.model = "totally-unknown-model".to_string();
+        draft.autofill_capacity_from_catalog();
+        assert_eq!(draft.context_window, "200000");
+        assert_eq!(draft.max_tokens, "32000");
     }
 }
 

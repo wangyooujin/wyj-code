@@ -48,7 +48,8 @@ pub use checkpoint::{
 pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile};
 pub use code_index::{CodeSearchTool, ProjectCodeIndex};
 pub use compact::{
-    compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_tokens,
+    compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_text_tokens_f64,
+    estimate_tokens,
 };
 pub use eval::{EvalCaseResult, EvalRunMetadata, EvalSummary, EvalTaskCategory};
 pub use evolution::{

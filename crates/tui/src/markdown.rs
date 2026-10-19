@@ -1016,6 +1016,15 @@ struct Ctx {
     /// 当前段落是否「像一张正在逐行写出来的表格」（每个非空行都以 `|` 开头）。
     /// 只在流式期间参与渲染：段内换行对普通文本应当折叠成空格，对半张表则是灾难。
     pipe_paragraph: bool,
+    /// thinking 模式（见 [`render_thinking_markdown`]）：软换行保留成真实换行，
+    /// 代码块退化成 `│` 引用式纯文本而不是带行号的方框。
+    ///
+    /// 这两条都不是"更好看"，而是 thinking 与正文的**语义差异**：正文的段内换行
+    /// 是排版噪音（应该由折行器重新排版），thinking 的换行是思考的**断句**
+    /// （模型一行一个念头，合并成一段反而读不出层次）；正文的代码块是要照着
+    /// 执行的代码，thinking 里的围栏多数只是路径 / 命令片段，套一个方框会让它
+    /// 比周围思考还显眼。
+    thinking: bool,
 }
 
 impl Ctx {
@@ -1047,19 +1056,37 @@ impl Ctx {
             def_desc: false,
             pending_blank: false,
             pipe_paragraph: false,
+            thinking: false,
         }
     }
 
     fn cur_style(&self) -> Style {
-        let mut s = Style::default();
+        // thinking 的正文基调是灰的：它是一段旁白，不是用户要读的结论。所有
+        // 派生样式都从这个基色出发，因此 `**粗体**` / 标题 / 引用在 thinking
+        // 里只体现修饰（BOLD/ITALIC），不会突然跳成白色或品牌橙。
+        let mut s = if self.thinking {
+            Theme::dim()
+        } else {
+            Style::default()
+        };
         if self.code_span {
-            return s.fg(Theme::code_fg_color());
+            // thinking 里的行内代码不加蓝：反引号本身已经足以标示，再换成亮色
+            // 会让零散提到的一个标识符比整段思考还抢眼。
+            return if self.thinking {
+                s
+            } else {
+                s.fg(Theme::code_fg_color())
+            };
         }
         if let Some(lvl) = self.heading {
-            s = match lvl {
-                1 => s.fg(Theme::claude_color()).add_modifier(Modifier::BOLD),
-                2 => s.fg(Theme::text_color()).add_modifier(Modifier::BOLD),
-                _ => s.fg(Theme::inactive_color()).add_modifier(Modifier::BOLD),
+            s = if self.thinking {
+                s.add_modifier(Modifier::BOLD)
+            } else {
+                match lvl {
+                    1 => s.fg(Theme::claude_color()).add_modifier(Modifier::BOLD),
+                    2 => s.fg(Theme::text_color()).add_modifier(Modifier::BOLD),
+                    _ => s.fg(Theme::inactive_color()).add_modifier(Modifier::BOLD),
+                }
             };
         } else if self.blockquote > 0 {
             s = s.fg(Theme::inactive_color());
@@ -1165,6 +1192,8 @@ impl Ctx {
         }
         let base = match self.list_stack.last() {
             Some(state) => state.leader,
+            // thinking 的顶层缩进由调用方统一补（同 `block_prefix`）
+            None if self.thinking => 0,
             None => 2,
         };
         if base > 0 {
@@ -1226,8 +1255,12 @@ impl Ctx {
         } else if self.def_title {
             head.push(Span::raw("  "));
             cont.push(Span::raw("  "));
-        } else if self.heading.is_none() && self.blockquote == 0 {
-            // 普通段落(无 list 包裹)加 2 空格与 User 消息视觉对齐
+        } else if self.heading.is_none() && self.blockquote == 0 && !self.thinking {
+            // 普通段落(无 list 包裹)加 2 空格与 User 消息视觉对齐。
+            //
+            // thinking 模式不加：那一层缩进由调用方统一补（见
+            // `render_thinking_block`），两处都加就是 6 格，比列表 bullet
+            // 还靠右，层级关系正好反了。
             head.push(Span::raw("  "));
             cont.push(Span::raw("  "));
         }
@@ -1294,6 +1327,10 @@ impl Ctx {
 
     fn emit_code_block(&mut self, lines: &mut Vec<Line<'static>>) {
         self.ensure_blank(lines);
+        if self.thinking {
+            self.emit_thinking_code_block(lines);
+            return;
+        }
         if self.code_lang.is_empty() {
             if let Some(rows) = parse_timeline_rows(&self.code_buf) {
                 let body_styles = [Theme::code_body(), Style::default()];
@@ -1384,6 +1421,29 @@ impl Ctx {
             Theme::border(),
         ));
         lines.push(Line::from(bottom));
+    }
+
+    /// thinking 里的围栏：只留一条 `│` 左边线 + 原文，不画方框、不加行号。
+    ///
+    /// 正文的代码块是"要照着执行的代码"，方框与行号帮得上忙；thinking 里的围栏
+    /// 多数是路径、命令片段、半截伪代码——套上带行号的 `╭─╮` 之后，它比周围
+    /// 思考亮一大截，而真正要看的是思考本身。左边线保留，是为了让"这一段是
+    /// 引用的原样内容"与普通思考行仍然可分。
+    fn emit_thinking_code_block(&mut self, lines: &mut Vec<Line<'static>>) {
+        let indent = self.block_indent();
+        let indent_width: usize = indent
+            .iter()
+            .map(|s| display_width(s.content.as_ref()))
+            .sum::<usize>();
+        let body_width = self.max_width.saturating_sub(indent_width + 2).max(8);
+        for raw_line in self.code_buf.lines() {
+            for wrapped in wrap_dw(raw_line, body_width) {
+                let mut spans = indent.clone();
+                spans.push(Span::styled("│ ", Theme::border()));
+                spans.push(Span::styled(wrapped, Theme::dim()));
+                lines.push(Line::from(spans));
+            }
+        }
     }
 
     /// 渲染整个表格（在 End(Table) 时调用）
@@ -1497,7 +1557,38 @@ fn normalize_malformed_heading_tables(text: &str) -> Cow<'_, str> {
 ///
 /// `max_width`：可用字符宽度（用于内容换行和表格列宽计算）。
 pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: usize) {
-    render_markdown_inner(lines, text, max_width, false)
+    render_markdown_inner(lines, text, max_width, false, false)
+}
+
+/// thinking 正文的渲染入口：Markdown 结构照常解析，但整块按「旁白」处理。
+///
+/// 与 [`render_markdown`] 的三处差异都来自同一件事——thinking 是模型**边想边写**
+/// 的草稿，不是要交给用户执行的成品：
+///
+/// 1. **段内换行保留**（`Event::SoftBreak` 走 `push_break`）。模型的思考天然一行
+///    一个念头，正文那条"段内换行折叠成空格"的规则会把它们揉成一整段。
+/// 2. **围栏退化成 `│` 引用式纯文本**：thinking 里的围栏多半是路径 / 命令片段，
+///    套上带行号的方框会比周围思考更抢眼。
+/// 3. **整块走 `Theme::dim()` 基色**：只保留 BOLD / ITALIC 这类修饰，不换颜色。
+///
+/// 列表、标题、表格、行内代码照常渲染——它们恰恰是「乱」的主要来源：原实现把
+/// `- ` / `1.` / `|` / `**` 原样打在屏幕上，而真实思考里约 15% 的行带这些结构。
+pub fn render_thinking_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: usize) {
+    render_markdown_inner(lines, text, max_width, false, true)
+}
+
+/// 流式 thinking 的入口：尾部片段按中间态渲染。
+///
+/// 与 [`render_streaming_markdown`] 同源（未闭合围栏不画框），额外打开
+/// thinking 的两条规则（软换行保留、围栏退化成引用式）。流式期间每帧只喂
+/// 尾部 [`render::LIVE_TAIL_LINES`] 行，输入有硬上界，解析成本与整段思考
+/// 的长度无关。
+pub fn render_streaming_thinking_markdown(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    max_width: usize,
+) {
+    render_markdown_inner(lines, text, max_width, true, true)
 }
 
 /// **流式期间**的渲染入口。差异只有两处，且都只在未定稿时生效——定稿走
@@ -1510,7 +1601,7 @@ pub fn render_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: us
 /// 当成**已完成的**结构，于是围栏一开就画出完整边框、表格一成形就整体重排，
 /// 用户看着内容在一帧帧地"变形"。等它闭合反而是最后一件事。
 pub fn render_streaming_markdown(lines: &mut Vec<Line<'static>>, text: &str, max_width: usize) {
-    render_markdown_inner(lines, text, max_width, true)
+    render_markdown_inner(lines, text, max_width, true, false)
 }
 
 fn render_markdown_inner(
@@ -1518,6 +1609,7 @@ fn render_markdown_inner(
     text: &str,
     max_width: usize,
     streaming: bool,
+    thinking: bool,
 ) {
     // 五项都开：STRIKETHROUGH 早就开着却没有对应分支（文本保留、无修饰），
     // TASKLISTS 不开的话 `- [ ]` 原样显示成字面量——模型**很爱**用任务列表
@@ -1538,6 +1630,7 @@ fn render_markdown_inner(
     };
     let parser = Parser::new_ext(parseable, opts);
     let mut c = Ctx::new(max_width);
+    c.thinking = thinking;
 
     for event in parser {
         match event {
@@ -1826,7 +1919,13 @@ fn render_markdown_inner(
             Event::SoftBreak => {
                 // 正在逐行输出的表格：段内换行必须保留成换行，否则三行表会被
                 // 压成一行，读起来像乱码。普通段落照旧折叠成空格。
-                if streaming && c.pipe_paragraph {
+                //
+                // thinking 同理，且理由更强：模型的思考本来就是一行一个念头，
+                // 合并成一段后层次全没了（见 `Ctx.thinking` 的注释）。用
+                // `push_break` 而不是 `flush`：前者在**同一段内**分段，bullet
+                // 与续行缩进仍由 `block_prefix` 统一处理；后者会提前消耗
+                // `cur_bullet`，列表项的后续行会退化成无 bullet 的普通段落。
+                if c.thinking || (streaming && c.pipe_paragraph) {
                     c.push_break();
                 } else {
                     c.push_text(" ");

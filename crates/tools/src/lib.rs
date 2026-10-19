@@ -22,6 +22,7 @@ pub mod memory;
 pub mod message_log;
 mod read;
 pub mod registry;
+pub mod spill;
 pub mod sub_agent;
 pub mod textutil;
 pub mod todo;

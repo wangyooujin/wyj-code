@@ -188,8 +188,17 @@ fn base_capabilities(
     // 真的带了 cache_control——自相矛盾还会让人以为缓存没生效。
     //
     // 因此：用户在 profile 里显式写了 `prompt_cache` 就按 UserOverride 采信
-    // （他比静态目录更清楚自己的端点）；没写才回落到"官方端点支持、第三方
-    // 保守视为不支持"的协议默认值。
+    // （他比静态目录更清楚自己的端点）；没写才回落到下面的协议默认值。
+    //
+    // **两个维度必须分开**（2026-10 修正）：
+    //   * `ExplicitBreakpoints` = 客户端发 `cache_control` 才缓存（Anthropic 形态）；
+    //   * `Automatic` = 端点自己按前缀自动缓存，**客户端什么都不用发**
+    //     （DeepSeek 磁盘缓存 / OpenAI 自动 prompt caching）。
+    //
+    // 旧实现只有前者的判据，于是所有 OpenAI 协议端点（含 DeepSeek 官方）都被
+    // 记成 `Unsupported`。这不影响发请求（本来也不发 cache_control），但它污染了
+    // 所有"这个端点有没有缓存"的下游判断——最直接的就是压缩请求该不该复用主
+    // 对话前缀：按 `Unsupported` 分流会让 DeepSeek 白白退回全价重发。
     //
     // ⚠️ 注意置信度：第三方端点的"支持"是**用户断言**，不是实测。真伪由
     // `AnthropicProvider` 的 400 自动降级裁决，结果回写到 `/cost` 与
@@ -208,6 +217,15 @@ fn base_capabilities(
         ),
         None if profile.effective_prompt_cache() => {
             static_cap(PromptCacheMode::ExplicitBreakpoints)
+        }
+        // OpenAI 线协议下能确认「端点自动缓存」的两家：官方 OpenAI 与
+        // DeepSeek（`Context Caching on Disk`，默认开启、无需任何请求字段）。
+        // 其余第三方（MiniMax/GLM/Moonshot/Qwen/火山/Ollama/vLLM）保守记
+        // Unsupported——它们即使有缓存也不在文档里承诺前缀语义。
+        None if matches!(wire_protocol, WireProtocol::OpenAiChatCompletions)
+            && matches!(vendor, "openai" | "deepseek") =>
+        {
+            static_cap(PromptCacheMode::Automatic)
         }
         None => protocol_cap(PromptCacheMode::Unsupported),
     };
@@ -711,6 +729,84 @@ mod parallel_policy_tests {
         let caps = ModelCatalog::resolve(&minimax_profile(), None).capabilities;
         assert_eq!(caps.prompt_cache.value, PromptCacheMode::Unsupported);
         assert_eq!(caps.prompt_cache.source, CapabilitySource::ProtocolDefault);
+    }
+
+    /// DeepSeek 走 OpenAI 协议，缓存是**端点自动**做的（`Context Caching on
+    /// Disk`，默认开启、请求里不需要任何字段）。旧实现把这类端点一律记成
+    /// `Unsupported`，导致所有「这个端点会不会复用前缀」的下游判断都误判——
+    /// 压缩请求因此白白放弃前缀复用，退回全价重发整段历史。
+    #[test]
+    fn deepseek_official_endpoint_reports_automatic_prompt_cache() {
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("deepseek".to_string()),
+            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
+            model: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            ..Profile::default()
+        };
+        let caps = ModelCatalog::resolve(&profile, None).capabilities;
+        assert_eq!(
+            caps.prompt_cache.value,
+            PromptCacheMode::Automatic,
+            "DeepSeek 的缓存由端点自动完成，不是客户端断点"
+        );
+        assert!(
+            caps.reuses_prompt_prefix(),
+            "自动缓存端点必须被判定为「会复用前缀」"
+        );
+    }
+
+    /// 同协议、但不在文档里承诺前缀语义的第三方（MiniMax/GLM/Qwen/本地推理）
+    /// 仍记 `Unsupported`——否则压缩请求会给它们多发一整段历史。
+    #[test]
+    fn openai_compatible_third_parties_stay_unsupported() {
+        for (vendor, base_url) in [
+            (
+                "alibaba",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+            ("ollama", "http://127.0.0.1:11434/v1"),
+            ("vllm", "http://127.0.0.1:8000/v1"),
+        ] {
+            let profile = Profile {
+                provider: Provider::OpenAI,
+                vendor: Some(vendor.to_string()),
+                wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
+                model: "some-model".to_string(),
+                base_url: base_url.to_string(),
+                ..Profile::default()
+            };
+            let caps = ModelCatalog::resolve(&profile, None).capabilities;
+            assert_eq!(
+                caps.prompt_cache.value,
+                PromptCacheMode::Unsupported,
+                "{vendor} 不应被判定为自动缓存端点"
+            );
+            assert!(
+                !caps.reuses_prompt_prefix(),
+                "{vendor} 不应复用压缩前缀（会给它多发一整段历史）"
+            );
+        }
+    }
+
+    /// 显式关缓存时，即便是 DeepSeek 也必须退回 `Unsupported`：用户 override
+    /// 优先于静态目录，这是既有约定。
+    #[test]
+    fn explicit_opt_out_beats_automatic_cache_detection() {
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("deepseek".to_string()),
+            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
+            model: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            prompt_cache: Some(false),
+            ..Profile::default()
+        };
+        let caps = ModelCatalog::resolve(&profile, None).capabilities;
+        assert_eq!(caps.prompt_cache.value, PromptCacheMode::Unsupported);
+        assert!(!caps.reuses_prompt_prefix());
     }
 
     /// 静态目录对第三方端点的判定保持不变——本次改动不得偷偷改变任何人的默认行为。

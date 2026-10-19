@@ -4,7 +4,7 @@
 
 `wyj-code` 启动时若 `Config::api_key()` 返回 Err,**TUI 默认入口**会自动打开
 `ProfileDialog`(`AppState::profile_dialog`),焦点预置到 active profile 的
-`api_key` 字段(`PROFILE_API_KEY_FIELD_IDX = 5`)。用户填写后 Ctrl+S,
+`api_key` 字段(`profile_api_key_field_idx()`)。用户填写后 Ctrl+S,
 `profile_try_save` 会写盘 + chmod 0600 + 通过 `rebuild_fn` 重建 `shared_agent`,
 无需重启。
 
