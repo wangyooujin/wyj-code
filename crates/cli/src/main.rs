@@ -170,6 +170,14 @@ enum Commands {
     /// 的提交者。`trust-mcp` 仍只管 MCP——信任决策逐类可见。
     #[command(name = "trust-skills", about = wyj_i18n::tr("cli.trust_skills_about"))]
     TrustSkills,
+    /// 批准当前项目级 hooks / verify（`.wyj-code/settings.json`）的信任确认。
+    /// 这两块的 `command` 都会被 `sh -c` 直接执行，随 `git clone` 落地；
+    /// 未批准前会被静默跳过。
+    #[command(
+        name = "trust-hooks",
+        about = "Approve project-level hooks/verify commands"
+    )]
+    TrustHooks,
     /// 一次性批准项目级的 MCP server 与 skill（配 cron 定时任务前用这个）。
     #[command(name = "trust", about = wyj_i18n::tr("cli.trust_about"))]
     Trust,
@@ -1193,6 +1201,10 @@ async fn main() -> Result<()> {
             Commands::TrustSkills => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return trust_cmd::run_with_scope(&cwd, trust_cmd::TrustScope::Skills).await;
+            }
+            Commands::TrustHooks => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                return trust_cmd::run_with_scope(&cwd, trust_cmd::TrustScope::Hooks).await;
             }
             Commands::Trust => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);

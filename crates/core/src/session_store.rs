@@ -318,6 +318,35 @@ impl SessionStore {
             &path,
             crate::secret::redact_sensitive_text(&json).as_bytes(),
         )
+        .inspect(|_| self.write_meta(&owned))
+    }
+
+    /// 旁路元数据文件路径：`list()` 只需要 `SessionMeta` 那十来个标量，
+    /// 没必要为了它们解析整份 transcript。
+    fn meta_path(&self, session_id: &str) -> PathBuf {
+        self.dir.join(format!("{session_id}.meta.json"))
+    }
+
+    /// 写元数据旁路文件。
+    ///
+    /// 与 `.json` 的关系是**派生关系**：真正的权威是 `.json`，meta 只为列表
+    /// 服务。写 meta 失败绝不能让 save 失败（否则一次磁盘配额波动就会丢会话），
+    /// 所以只 warn。
+    fn write_meta(&self, file: &SessionFile) {
+        let meta = SessionMeta::from(file.clone());
+        let json = match serde_json::to_string(&meta) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!("session meta 序列化失败 {}: {e}", file.session_id);
+                return;
+            }
+        };
+        if let Err(e) = crate::serialize::write_atomic(
+            &self.meta_path(&file.session_id),
+            crate::secret::redact_sensitive_text(&json).as_bytes(),
+        ) {
+            tracing::warn!("session meta 写入失败 {}: {e}", file.session_id);
+        }
     }
 
     /// 声明「本进程正在使用这个会话」，返回的守卫 drop 时自动撤销声明。
@@ -365,20 +394,42 @@ impl SessionStore {
     }
 
     /// 列出所有会话，按时间戳倒序排列（最新在前）
+    ///
+    /// **只读 `.meta.json` 旁路文件**，不为取十个标量字段解析整份 transcript——
+    /// 长会话的 `.json` 动辄几 MB，几百个会话就是几百 MB 读盘 + 全量 JSON 解析，
+    /// 而 `/resume` 面板只要标题和时间。meta 缺失（老会话、或 meta 写失败）时
+    /// 回退到解析 `.json`，保证升级后老会话仍然可见。
     pub fn list(&self) -> Result<Vec<SessionMeta>> {
         let mut metas = Vec::new();
         for entry in std::fs::read_dir(&self.dir)?.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(file) = serde_json::from_str::<SessionFile>(&content) {
-                        metas.push(SessionMeta::from(file));
-                    }
-                }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if stem.ends_with(".meta") {
+                continue;
+            }
+            if let Some(meta) = self.load_meta(stem) {
+                metas.push(meta);
             }
         }
         metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(metas)
+    }
+
+    /// 读一个会话的元数据，优先旁路文件。
+    fn load_meta(&self, session_id: &str) -> Option<SessionMeta> {
+        if let Ok(content) = std::fs::read_to_string(self.meta_path(session_id)) {
+            if let Ok(meta) = serde_json::from_str::<SessionMeta>(&content) {
+                return Some(meta);
+            }
+        }
+        let content = std::fs::read_to_string(self.path(session_id)).ok()?;
+        let file: SessionFile = serde_json::from_str(&content).ok()?;
+        Some(SessionMeta::from(file))
     }
 
     /// 返回最近一次会话
@@ -387,13 +438,20 @@ impl SessionStore {
     }
 
     /// 列出属于 `cwd` 所在项目（git 仓库根，非 git 回退 cwd）的会话，时间倒序。
+    ///
     /// 会话按项目隔离：不同仓库互不可见，同仓库不同子目录视为同一项目。
+    /// 先按 `cwd` 字符串去重再算 `project_key`——后者会做一次 `canonicalize`
+    /// 系统调用，几百个会话逐条算就是几百次 syscall。
     pub fn list_for_project(&self, cwd: &Path) -> Result<Vec<SessionMeta>> {
         let target = crate::project::project_key(cwd);
+        let mut seen = std::collections::HashSet::new();
         Ok(self
             .list()?
             .into_iter()
-            .filter(|m| crate::project::project_key(Path::new(&m.cwd)) == target)
+            .filter(|m| {
+                seen.insert(m.cwd.clone())
+                    && crate::project::project_key(Path::new(&m.cwd)) == target
+            })
             .collect())
     }
 
@@ -632,6 +690,41 @@ mod tests {
             session_profile: None,
             context_edit_freed_tokens: 0,
         }
+    }
+
+    /// `list()` 必须读旁路 meta，而不是为取十个标量解析整份 transcript。
+    /// 断言方式：把正文写成**非法 JSON**——走 meta 路径照样列得出来，
+    /// 走 `.json` 路径必然解析失败。
+    #[test]
+    fn list_reads_sidecar_meta_without_parsing_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .save(&mk_file("s1", dir.path(), "2026-01-01T00:00:00Z"))
+            .unwrap();
+
+        // 正文损坏，meta 完好 → 仍必须列出
+        std::fs::write(dir.path().join("s1.json"), "{ not json at all").unwrap();
+
+        let metas = store.list().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id, "s1");
+        assert_eq!(metas[0].title, "s1");
+    }
+
+    /// meta 缺失（老会话升级前落盘）时回退解析 `.json`，老会话不能消失。
+    #[test]
+    fn list_falls_back_to_transcript_when_meta_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .save(&mk_file("s2", dir.path(), "2026-01-02T00:00:00Z"))
+            .unwrap();
+        std::fs::remove_file(dir.path().join("s2.meta.json")).unwrap();
+
+        let metas = store.list().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].session_id, "s2");
     }
 
     /// v0.2.28 之前落盘的会话文件没有这 6 个计量字段。必须仍能读出来，

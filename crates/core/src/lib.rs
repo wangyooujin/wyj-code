@@ -13,6 +13,7 @@ pub mod evolution;
 pub mod frontmatter;
 pub mod history;
 pub mod hooks;
+pub mod hooks_trust;
 pub mod interfaces;
 pub mod memory;
 pub mod memory_v3;
@@ -62,6 +63,7 @@ pub use history::{new_session_id, now_iso, HistoryEntry, HistoryStore};
 pub use hooks::{
     load_effective_hooks, HookCommand, HookMatcherEntry, HookOutcome, HookRunner, HooksSettings,
 };
+pub use hooks_trust::ProjectHooksTrust;
 pub use interfaces::{
     CodeIndex, CodeIndexStatus, CodeMatch, CodeQuery, ExecutionWorkspace, ExecutionWorkspaceKind,
     ExecutionWorkspaceManager, ExecutionWorkspaceRequest, SessionControl, SessionEvent,
@@ -77,8 +79,9 @@ pub use memory_v3::{
     TaskStep, MEMORY_V3_SCHEMA_VERSION,
 };
 pub use permission::{
-    safe_resolve_write_target, DenyReason, ExecutionSurface, PermissionMode, PermissionPolicy,
-    PermissionPrompt, PermissionRequest, PermissionVerdict,
+    check_read_target, is_protected_read_target, safe_resolve_write_target, DenyReason,
+    ExecutionSurface, PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest,
+    PermissionVerdict,
 };
 pub use project::{project_key, project_root, same_project};
 pub use secret::{redact_sensitive_text, REDACTED_SECRET};

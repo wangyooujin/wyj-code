@@ -141,15 +141,12 @@ impl SteerQueue {
 /// 两个数指同一件事却长期不等，`/context` 又声称"与压缩决策同源"——
 /// 压缩用的是审计口径，本函数算出来的累计值就与真正发出去的量对不上。
 /// 现在统一到审计口径。
+///
+/// 直接转发到 `compact::estimate_tools_tokens`：两处各自维护一份「按工具
+/// 序列化 schema 再估 token」的逻辑是缓存失效的温床（改了审计口径忘了改这里，
+/// `/context` 与 `/cost` 又劈叉）。缓存也共用一份。
 fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> u32 {
-    tools.iter().fold(0u32, |total, tool| {
-        let schema = tool.input_schema.to_string();
-        total.saturating_add(
-            (crate::compact::estimate_text_tokens(&tool.name)
-                + crate::compact::estimate_text_tokens(&tool.description)
-                + crate::compact::estimate_text_tokens(&schema)) as u32,
-        )
-    })
+    crate::compact::estimate_tools_tokens(tools)
 }
 
 /// 主提示词和基础工作流会直接引用这些工具；lazy schema 只能隐藏可选集成，
@@ -809,7 +806,7 @@ impl Agent {
         &self,
         session: &mut Session,
         cwd: &std::path::Path,
-        messages: Vec<wyj_api::types::Message>,
+        messages: std::sync::Arc<Vec<wyj_api::types::Message>>,
         kind: crate::checkpoint::CheckpointKind,
         name: Option<String>,
     ) {
@@ -1392,7 +1389,8 @@ impl Agent {
         // 调用方在进入 run_turn 前已 push 本次真实用户消息；checkpoint 保存其
         // 之前的完整对话与当前工作树，确保 /rewind 可以回到提交前边界。
         if !session.messages.is_empty() {
-            let previous_messages = session.messages[..session.messages.len() - 1].to_vec();
+            let previous_messages =
+                Arc::new(session.messages[..session.messages.len() - 1].to_vec());
             self.create_checkpoint(
                 session,
                 ctx.cwd(),
@@ -1473,7 +1471,7 @@ impl Agent {
                 self.create_checkpoint(
                     session,
                     ctx.cwd(),
-                    session.messages.clone(),
+                    Arc::new(session.messages.clone()),
                     crate::checkpoint::CheckpointKind::TurnLimit,
                     Some(format!("推理轮数触顶前自动存档（{max_turns} 轮）")),
                 )
@@ -2515,11 +2513,11 @@ impl Agent {
                         .unwrap_or(false)
                 });
                 if has_side_effect {
-                    let pre_tool_messages = session
-                        .messages
-                        .get(..session.messages.len().saturating_sub(1))
-                        .unwrap_or_default()
-                        .to_vec();
+                    // PreTool 快照排除最后一条（本次工具调用的 assistant 消息），
+                    // PostTool 直接复用**整段**历史——两者只需一次深拷贝。
+                    let pre_tool_messages = Arc::new(
+                        session.messages[..session.messages.len().saturating_sub(1)].to_vec(),
+                    );
                     self.create_checkpoint(
                         session,
                         ctx.cwd(),
@@ -2594,7 +2592,7 @@ impl Agent {
                     session.push_tool_result(id, output, is_error);
                 }
                 if has_side_effect {
-                    let post_tool_messages = session.messages.clone();
+                    let post_tool_messages = Arc::new(session.messages.clone());
                     self.create_checkpoint(
                         session,
                         ctx.cwd(),

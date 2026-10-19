@@ -88,8 +88,49 @@ impl BackgroundJob {
 
 #[derive(Default)]
 pub struct BashSessionManager {
-    jobs: Mutex<HashMap<String, Arc<BackgroundJob>>>,
+    jobs: Arc<Mutex<HashMap<String, Arc<BackgroundJob>>>>,
     next_id: AtomicUsize,
+}
+
+/// 已退出的后台任务保留多少个的输出缓冲。
+///
+/// `jobs` 本身只增不减（面板要能列出历史任务），但每个 job 的缓冲上限是
+/// 2MB——长会话里跑过几百条后台命令就是几百 MB 常驻。这里在任务退出时做一次
+/// 淘汰：按 id 顺序保留最近 N 个已退出任务的输出（用户刚 `BashOutput` 完的那
+/// 几个仍在），更早的只清缓冲、保留元数据。
+///
+/// 保留 8 个而不是 1 个：并发跑 `cargo test` + `npm run dev` 这类组合很常见，
+/// 清得太激进会让「刚跑完、还没来得及读」的输出凭空消失。
+const EXITED_BUFFER_RETENTION: usize = 8;
+
+fn release_old_exited_buffers(jobs: &Mutex<HashMap<String, Arc<BackgroundJob>>>) {
+    let guard = jobs.lock().unwrap();
+    // id 形如 `bash_<n>`，按数值排序才是真正的启动顺序。
+    let mut exited: Vec<(usize, String)> = guard
+        .iter()
+        .filter(|(_, job)| job.status() != JobStatus::Running)
+        .map(|(id, _)| (job_seq(id), id.clone()))
+        .collect();
+    if exited.len() <= EXITED_BUFFER_RETENTION {
+        return;
+    }
+    exited.sort_by_key(|(seq, _)| *seq);
+    let evict = exited.len() - EXITED_BUFFER_RETENTION;
+    for (_, id) in exited.into_iter().take(evict) {
+        if let Some(job) = guard.get(&id) {
+            let mut buf = job.buffer.lock().unwrap();
+            buf.data = String::new();
+            buf.data.shrink_to_fit();
+            buf.read_offset = 0;
+        }
+    }
+}
+
+fn job_seq(id: &str) -> usize {
+    id.rsplit('_')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 impl BashSessionManager {
@@ -167,12 +208,14 @@ impl BashSessionManager {
         // 等待进程退出，更新状态
         {
             let job = job.clone();
+            let jobs = self.jobs.clone();
             tokio::spawn(async move {
                 let code = match child.wait().await {
                     Ok(st) => st.code().unwrap_or(-1),
                     Err(_) => -1,
                 };
                 *job.status.lock().unwrap() = JobStatus::Exited(code);
+                release_old_exited_buffers(&jobs);
             });
         }
 
@@ -382,5 +425,37 @@ mod tests {
         }
         // 上限足够大时内容完整
         assert!(job.tail(1024).contains("中文中文中文"));
+    }
+
+    /// 已退出任务的缓冲要按数量淘汰，否则长会话里每个历史 job 都常驻 2MB。
+    #[tokio::test]
+    async fn exited_job_buffers_are_evicted_beyond_retention() {
+        let mgr = BashSessionManager::default();
+        let total = EXITED_BUFFER_RETENTION + 3;
+        let mut ids = Vec::new();
+        for _ in 0..total {
+            let id = mgr
+                .spawn("echo payload", std::path::Path::new("/tmp"))
+                .unwrap();
+            ids.push(id);
+        }
+        // 等全部退出并触发淘汰
+        for _ in 0..100 {
+            if mgr.running_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 最早的几个缓冲被清空，最近的仍保留
+        assert!(mgr.get(&ids[0]).unwrap().tail(1024).is_empty());
+        let last = mgr.get(ids.last().unwrap()).unwrap();
+        assert!(
+            last.tail(1024).contains("payload"),
+            "最近退出的任务必须保留输出供 BashOutput 读取"
+        );
+        // 元数据不淘汰：面板仍能列出历史任务
+        assert!(mgr.get(&ids[0]).is_some());
     }
 }

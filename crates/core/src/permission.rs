@@ -277,28 +277,16 @@ fn canonicalize_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn is_protected_write_target(path: &Path) -> bool {
-    let components: Vec<String> = path
-        .components()
-        .filter_map(|component| component.as_os_str().to_str())
-        .map(|component| component.to_ascii_lowercase())
-        .collect();
-    if components.iter().any(|component| component == ".git") {
+    if path_has_protected_component(path) {
         return true;
     }
-    if let Some(index) = components
-        .iter()
-        .position(|component| component == ".wyj-code")
-    {
-        if components.get(index + 1).map(String::as_str) != Some("plans") {
-            return true;
-        }
-    }
+    let components = lower_components(path);
     let file_name = components.last().map(String::as_str).unwrap_or_default();
     file_name == ".env"
         || file_name.starts_with(".env.")
         || matches!(
             file_name,
-            "credentials" | ".netrc" | "id_rsa" | "id_ed25519"
+            "credentials" | ".netrc" | ".npmrc" | "authorized_keys" | "id_rsa" | "id_ed25519"
         )
         || matches!(
             Path::new(file_name)
@@ -306,6 +294,105 @@ fn is_protected_write_target(path: &Path) -> bool {
                 .and_then(|ext| ext.to_str()),
             Some("pem" | "key" | "p12" | "pfx")
         )
+}
+
+/// 写入与读取共用的「结构性敏感位置」判定：仓库元数据、wyj-code 自身状态、
+/// 以及用户级凭据目录。
+///
+/// 抽成一张表是因为 Read 与 Write 曾经各写一半——Read 根本没有校验，而 Write
+/// 的清单又缺 `~/.ssh` 这类目录级目标（只按文件名匹配 `id_rsa` 会漏掉任意命名
+/// 的私钥，例如 `~/.ssh/mykey`）。两边共用同一份判定才不会再次漂移。
+fn path_has_protected_component(path: &Path) -> bool {
+    let components = lower_components(path);
+    if components.iter().any(|component| component == ".git") {
+        return true;
+    }
+    if let Some(index) = components
+        .iter()
+        .position(|component| component == ".wyj-code")
+    {
+        // `.wyj-code/plans` 是 Plan 模式的合法写目标；除此之外（含 config.toml）
+        // 一律视为受保护。
+        if components.get(index + 1).map(String::as_str) != Some("plans") {
+            return true;
+        }
+    }
+    const PROTECTED_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker"];
+    components
+        .iter()
+        .any(|component| PROTECTED_DIRS.contains(&component.as_str()))
+}
+
+fn lower_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(|component| component.to_ascii_lowercase())
+        .collect()
+}
+
+/// 读取侧是否命中凭据路径。
+///
+/// Read 刻意不做到 cwd 围栏（用户明确选择只加黑名单）：读工作目录之外的项目
+/// 文件是常见且必要的操作。真正要挡的是**凭据与密钥**——它们既不该进模型
+/// 上下文，也不该经工具结果落进会话文件。
+pub fn is_protected_read_target(path: &Path) -> bool {
+    if path_has_protected_component(path) {
+        return true;
+    }
+    let components = lower_components(path);
+    let file_name = components.last().map(String::as_str).unwrap_or_default();
+    let protected_file = file_name == ".netrc"
+        || file_name == ".npmrc"
+        || file_name == ".pypirc"
+        || file_name == ".git-credentials"
+        || file_name == "credentials"
+        || file_name == "authorized_keys";
+    if protected_file {
+        return true;
+    }
+    // `id_rsa` / `id_ed25519` / `id_ecdsa` / `id_dsa` 的私钥形态；`.pub` 是公钥，
+    // 读它没有风险。
+    let is_private_key_name = file_name.starts_with("id_") && !file_name.ends_with(".pub");
+    is_private_key_name
+        || matches!(
+            Path::new(file_name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("pem" | "key" | "p12" | "pfx")
+        )
+}
+
+/// 对任意原始路径做「能否安全读取」判定：先按 `..` 规则解析，再套黑名单。
+///
+/// 与 `safe_resolve_write_target` 的区别是**不**要求路径落在项目内，也**不**
+/// 拒绝绝对路径——只拒绝凭据位置与无法解析的路径。
+pub fn check_read_target(cwd: &Path, raw: &str) -> Result<PathBuf, DenyReason> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains('\0') {
+        return Err(DenyReason::new(
+            "invalid_read_target",
+            "读取路径为空或包含 NUL",
+        ));
+    }
+    let path = Path::new(raw);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let resolved = canonicalize_existing_or_parent(&candidate).map_err(|error| {
+        DenyReason::new(
+            "read_target_resolution_failed",
+            format!("无法安全解析读取路径：{error}"),
+        )
+    })?;
+    if is_protected_read_target(&resolved) {
+        return Err(DenyReason::new(
+            "protected_read_target",
+            format!("拒绝读取凭据路径：{}", resolved.display()),
+        ));
+    }
+    Ok(resolved)
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
@@ -493,6 +580,44 @@ mod tests {
             )),
             PermissionVerdict::Allow
         ));
+    }
+
+    #[test]
+    fn read_target_denies_credentials_but_allows_project_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join("notes.md"), "ok").unwrap();
+        std::fs::create_dir_all(repo.path().join(".ssh")).unwrap();
+        std::fs::write(repo.path().join(".ssh/mykey"), "private").unwrap();
+        std::fs::write(repo.path().join(".ssh/id_ed25519.pub"), "public").unwrap();
+        let cwd = repo.path();
+
+        for denied in [
+            ".ssh/mykey",
+            ".ssh/id_ed25519.pub", // 位于 .ssh 目录内，整目录受保护
+            ".aws/credentials",
+            ".kube/config",
+            ".docker/config.json",
+            ".npmrc",
+            ".netrc",
+            "id_rsa",
+            "server.pem",
+        ] {
+            assert!(
+                check_read_target(cwd, denied).is_err(),
+                "读取 {denied} 必须被拒绝"
+            );
+        }
+
+        for allowed in ["notes.md", "src/lib.rs", "README.md"] {
+            assert!(
+                check_read_target(cwd, allowed).is_ok(),
+                "读取 {allowed} 不应被拒绝"
+            );
+        }
+
+        // 绝对路径同样适用（Read 不要求落在项目内，只挡凭据位置）。
+        assert!(check_read_target(cwd, "/etc/hosts").is_ok());
     }
 
     /// Auto 的 `Allow` 不能被误读成「无交互面也放行」：headless 下 `evaluate`
