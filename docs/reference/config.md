@@ -33,6 +33,10 @@ vision = true                # 模型是否支持图片输入；false 时图片�
 # thinking_switch = "enabled" # OpenAI 线 thinking.type 显式覆盖：enabled/disabled/adaptive。
                               # 不写 = 由 adapter 按模型默认决定。MiniMax M3.1 发 disabled 会 400，
                               # adapter 会降级成"不发该字段"。
+# max_tools_per_turn = 4     # 每次回复最多并行几个工具调用。不写 = 由模型目录/探测结果决定
+                              # （静态目录对非 anthropic/openai vendor 一律判 1）。`/model` 面板
+                              # 里是枚举「默认 / 1 / 2 / 4 / 8」，新建分组预填 4；清空即回到端点默认。
+                              # env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先（runtime override，不写盘）。
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空（或空串）自动检测系统 locale；决定 UI 文案 **与模型输出语言**（含 thinking）
 search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）
