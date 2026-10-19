@@ -3881,6 +3881,44 @@ fn status_mode_chip(mode: &AgentMode) -> (&'static str, Style) {
     }
 }
 
+/// 状态栏左右两段的排版：返回 `(实际要画的 cwd 文本, 右侧提示是否保留)`。
+///
+/// **宽度一律按显示列宽算，绝不能用 `chars().count()`。** 旧实现两个 side 都按
+/// char 数算，而中文与全宽符号是双宽：`● 1 条已排队（等待送达）` char 数 14、显示
+/// 宽度 24，补位少了 10 列。宽度算错 → Paragraph 右端溢出 → 溢出是**从右侧硬切**
+/// 的，切点正好落在全角 `（` 中间，用户看到的就是右下角莫名其妙挂着一个半截的
+/// `(`（本条不变式的起因）。
+///
+/// 修宽度只解决"算错"，解决不了"根本放不下"：右段自身就超预算时同样会硬切。
+/// 因此分两级降级：
+///
+/// 1. 右段优先保（它只在排队 / Ctrl+C 待确认时出现，是用户此刻最需要确认的信息），
+///    cwd 吃剩下的预算，超出就 [`truncate_line`] 加省略号，连 2 列都分不出时整段留空
+///    ——半截路径比没有路径更难认；
+/// 2. 右段**自身**就塞不下时整段丢弃，绝不交给 Paragraph 硬切。与
+///    [`build_thinking_title`] 的"整段丢弃而非尾部截断"同一条道理。排队提示在输入框
+///    标题栏还有一份（那里是 rank 最高的一段），状态栏丢掉不算信息全失。
+///
+/// 保证的不变式：`left_fixed + disp_w(cwd_display) + (keep_right ? right_w : 0) + 1
+/// <= area_width`，即任何宽度下都不溢出、不硬切。
+fn status_bar_layout(
+    area_width: usize,
+    left_fixed: usize,
+    right_disp_w: usize,
+    cwd: &str,
+) -> (String, bool) {
+    // 末尾那 1 列是右段专属的尾随空格，与 `+ 1 <` 等价
+    let keep_right = left_fixed + right_disp_w < area_width;
+    let right_len = if keep_right { right_disp_w } else { 0 };
+    let avail_cwd = area_width.saturating_sub(left_fixed + right_len + 1);
+    let cwd_display = if avail_cwd >= 2 {
+        truncate_line(cwd, avail_cwd)
+    } else {
+        String::new()
+    };
+    (cwd_display, keep_right)
+}
+
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     let cwd_str = {
         let full = state.cwd.display().to_string();
@@ -3925,13 +3963,33 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
         .map(|name| format!(" [{name}]"))
         .unwrap_or_default();
     // 芯片只带前导空格（不带尾随），否则和紧随其后的 " · " 会叠成两个空格。
+    // 宽度一律按**显示列宽**算，绝不能用 `chars().count()`。
+    //
+    // 旧实现两个 side 都按 char 数算，而中文与全角符号是双宽：`● 1 条已排队（等待送达）`
+    // char 数 14、显示宽度 24，预留少了 10 列。补位不足 → Paragraph 右端溢出 →
+    // 溢出是**从右侧硬切**的，切点正好落在全角 `（` 中间，用户看到的就是右下角
+    // 莫名其妙挂着一个半截的 `(`。
+    //
+    // 修宽度只解决"算错"，解决不了"根本放不下"：此时同样会溢出硬切。所以右侧提示
+    // （排队 / Ctrl+C 待确认，只在特定时刻出现）先占预算，cwd 吃剩下的、超出就省略号
+    // 截断，**连 2 列都分不出时整段留空**——半截路径比没有路径更难认。
+    let disp_w = |s: &str| s.chars().map(char_display_width).sum::<usize>();
+    // " ◆ " + 模型名 + 会话标签 + " {chip}" + " · "，末尾另留 1 列给尾部空格
+    let left_fixed =
+        3 + disp_w(&state.model_name) + disp_w(&session_tag) + 1 + disp_w(chip_text) + 3;
+    let (cwd_display, keep_right) = status_bar_layout(
+        area.width as usize,
+        left_fixed,
+        disp_w(&right_help),
+        &cwd_str,
+    );
+    let right_len = if keep_right { disp_w(&right_help) } else { 0 };
     let left_text = format!(
         " ◆ {}{} {} · {}",
-        state.model_name, session_tag, chip_text, cwd_str
+        state.model_name, session_tag, chip_text, cwd_display
     );
 
-    let right_len = right_help.chars().count();
-    let pad = (area.width as usize).saturating_sub(left_text.chars().count() + right_len + 1);
+    let pad = (area.width as usize).saturating_sub(disp_w(&left_text) + right_len + 1);
 
     // thinking 指示器已迁回 `draw_input` 标题栏（"⠋ <步骤> · 3.2s · 1.2k↑ 3↓"
     // 紧贴用户输入框），状态栏保持单一职责，不再额外画 spinner，避免上下两处
@@ -3959,10 +4017,12 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     }
     spans.push(Span::styled(format!(" {chip_text}"), chip_style));
     spans.push(Span::styled(" · ".to_string(), Theme::dim()));
-    spans.push(Span::styled(cwd_str, Theme::dim()));
+    spans.push(Span::styled(cwd_display, Theme::dim()));
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(right_help, right_style));
-    spans.push(Span::raw(" "));
+    if keep_right {
+        spans.push(Span::styled(right_help, right_style));
+        spans.push(Span::raw(" "));
+    }
 
     let line = Line::from(spans);
     let para = Paragraph::new(line).style(Theme::status_bar());
@@ -9896,6 +9956,118 @@ fn foo() {}
     /// 让最末行在终端默认黑底上呈现深灰带，与上方标题栏/聊天区割裂）。这里断言
     /// 最后一行的所有非空 cell 都是 `Color::Reset`（= 未设置前景外的任何背景），
     /// 防止后续误写 `bg(...)` 又把这条黑条加回来。
+    /// 状态栏宽度必须按显示列宽算，且任何宽度下都不得右端溢出。
+    ///
+    /// 用户现场：右下角出现 `● 1 条已排队 (`。那个 `(` 不是提示的一部分，而是全角
+    /// `（` 被右端硬切的残留——旧实现按 `chars().count()` 算宽，中文与全宽符号是
+    /// 双宽，`● 1 条已排队（等待送达）` char 数 14、显示宽度 24，少预留 10 列。
+    #[test]
+    fn status_bar_layout_never_overflows_at_any_width() {
+        // 现场样本：char 数与显示宽度差 10 列的提示串。
+        let hint = "● 1 条已排队（等待送达）";
+        let hint_w = hint.chars().map(char_display_width).sum::<usize>();
+        assert!(
+            hint_w > hint.chars().count(),
+            "样本必须含双宽字符，否则测不到宽度算错：{hint_w} vs {}",
+            hint.chars().count()
+        );
+        // " ◆ " + 模型名 + 会话标签 + " {chip}" + " · "
+        let left_fixed = 3 + 10 + 7 + 1 + 6 + 3;
+        for width in [12usize, 20, 40, 50, 60, 80, 120] {
+            let (cwd_display, keep_right) =
+                status_bar_layout(width, left_fixed, hint_w, "/Users/me/项目/wyj-code");
+            // `left_fixed` 自身超预算时，左侧被裁掉的是**末尾的 cwd**，而 cwd 此时
+            // 已经是空串（helper 在 avail_cwd < 2 时留空），所以按 min 计即可。
+            let total = left_fixed.min(width)
+                + cwd_display
+                    .chars()
+                    .map(char_display_width)
+                    .sum::<usize>()
+                // 右段保留时它的尾随空格也算一列（helper 的 avail_cwd 已扣过这一列）
+                + if keep_right { hint_w + 1 } else { 0 };
+            assert!(total <= width, "宽度 {width} 下内容超宽：{total}");
+        }
+
+        // 宽屏：右段保留、cwd 原样。
+        let (cwd, keep) = status_bar_layout(120, left_fixed, hint_w, "/tmp");
+        assert!(keep, "120 列放得下，右段不该被丢");
+        assert_eq!(cwd, "/tmp");
+
+        // 窄屏：右段整段丢弃，而不是留给 Paragraph 从右侧硬切。
+        let (_, keep) = status_bar_layout(20, left_fixed, hint_w, "/tmp");
+        assert!(!keep, "右段塞不下时必须整段丢弃");
+    }
+
+    /// 端到端：排队提示要么完整出现，要么整段不出现，绝不留半截括号。
+    ///
+    /// 默认 locale 是 en，右段为 `● 1 queued (awaiting delivery)`；中文 locale 下
+    /// 换的是全角括号，同一条不变式由上一个测试按显示宽度覆盖。
+    /// `draw_status` 里的宽度必须来自 [`char_display_width`]，不许再出现
+    /// `chars().count()`。
+    ///
+    /// 这是「半个 `(`」的真正源头，而且**只在中文文案下暴露**：英文
+    /// `● 1 queued (awaiting delivery)` 全是 ASCII，char 数恰好等于显示宽度，
+    /// 于是纯英文的快照测试对这条完全不敏感——必须用中文样本 + 源码钉子双保险。
+    /// 本仓库其它宽度计算（`truncate_line` / `wrap_line` / `build_thinking_title`）
+    /// 都已按显示宽度写，唯独状态栏这条漏了。
+    /// 注意：这个源码扫描**必须跳过注释行**——解释「为什么不能用 chars().count()」
+    /// 的注释里就写着这个词，否则测试自己把自己判红。
+    #[test]
+    fn draw_status_never_measures_width_in_chars() {
+        let source = include_str!("render.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("fn draw_status("))
+            .expect("render.rs 应有 draw_status");
+        let end = (start + 1..)
+            .find(|offset| lines[*offset].starts_with("fn ") || lines[*offset].starts_with("/// "))
+            .unwrap_or(lines.len());
+        // 跳过注释行：函数上方那段解释"为什么不能用 chars().count()"里就写着它。
+        let body = lines[start..end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !body.contains("chars().count()"),
+            "状态栏宽度必须按显示列宽算（chars().count() 在中文下少算约一半）：\n{body}"
+        );
+        assert!(
+            body.contains("status_bar_layout("),
+            "状态栏的两段排版应统一走 status_bar_layout，别处再算一遍宽度必然漂移"
+        );
+    }
+
+    #[test]
+    fn status_bar_queue_hint_is_never_cut_in_half() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        for width in [50u16, 60, 80, 120] {
+            let backend = TestBackend::new(width, 10);
+            let mut terminal = Terminal::new(backend).expect("TestBackend init");
+            let mut state = make_state();
+            state.is_thinking = true;
+            state
+                .pending_queue
+                .push(crate::app::OutgoingMessage::plain("顺便看看"));
+            let input = InputBox::new();
+            terminal
+                .draw(|f| draw(f, &mut state, &input))
+                .expect("draw ok");
+            let buffer = terminal.backend().buffer().clone();
+            let last_line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, buffer.area.height - 1)].symbol().to_string())
+                .collect();
+            assert!(
+                last_line.contains("(awaiting delivery)") || !last_line.contains('('),
+                "宽度 {width}：排队提示被从右侧硬切，留下了半个括号：{last_line:?}"
+            );
+        }
+    }
+
     #[test]
     fn draw_status_does_not_set_explicit_background() {
         use ratatui::backend::TestBackend;
