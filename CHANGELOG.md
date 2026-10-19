@@ -23,10 +23,19 @@
   - 新增 `[ui].mouse_capture`（默认 `true`）与 `/mouse` 运行时开关。开启时只发
     最小报告序列 `1000h + 1002h + 1006h`，**刻意不发 `1003h`**：全移动上报会让触控板
     轻微移动就持续产生事件、主循环每事件重绘一帧
-  - 代价是终端原生拖选复制需按住 Option（Cmd+C 不受影响）；`/mouse` 关闭后完全
-    交还终端，恢复无需修饰键的拖选
-  - 状态翻转与终端序列解耦：命令分支只改 `AppState.mouse_capture`，主循环每帧比对
-    后发序列，幂等且不与绘制交错
+  - **应用内拖选**（与滚轮同一次改动）：开鼠标报告后终端不再处理拖选，事件全进
+    应用，终端自己的选区缓冲区是空的——这就是「Ghostty 必须按 Shift 才能选、
+    Terminal.app 无论 `/mouse` 开关都选不了」的直接原因。现在应用自己实现选择：
+    拖拽选中、松开即写系统剪贴板，双击选词（`src/app.rs:123`、URL 整体），
+    任意按键或滚轮清除选区，状态栏显示「已复制 N 个字符」。
+    - 选区数据源是**渲染后的屏幕快照**（`capture_frame_rows` 抓内容区 Buffer），
+      不是消息模型——从 `messages` 反推会得到没有折行、没有折叠态的另一份文本
+    - 坐标夹在内容区矩形内，输入框/状态栏/底部面板不会被选进来；有浮层时直接
+      拒绝建立选区
+    - 高亮画在最后一层并过 `ensure_contrast`，压过链接下划线
+  - 代价与取舍：`/mouse` 关闭后恢复终端原生拖选（此时 Terminal.app 下滚轮失效）。
+    「不按 Option 拖选」与「滚轮可用」在 Terminal.app 上互斥——它既不支持 DEC 1007，
+    终端原生选择又要求应用不开鼠标报告。两全的唯一路径就是应用内选择。
 - **应用内滚动条**。真正的原生滚动条只存在于主屏 scrollback（Inline 方案已因画面
   撕裂被放弃两次），因此在内容区最右 1 列画 `│`/`┃`（less/vim 观感），滑块位置随
   `chat_scroll` 与子 Agent 详情滚动同步。只在内容超出视口时出现；`[ui].scrollbar`
@@ -40,9 +49,11 @@
   现在判定改为 `contains(SHIFT)` 且排除 Ctrl/Alt/Cmd，并前移到补全拦截之前；
   Chat 焦点下只在「下方面板真的存在」时才抢键，避免正在滚历史时被跳到会话末尾。
 
-测试：`wyj-tui` 414 项、`wyj-commands` 71 项全部通过；新增钉子
+测试：`wyj-tui` 436 项、`wyj-commands` 72 项全部通过；新增钉子
 `mouse_capture_enables_only_wheel_and_drag_reporting`、
-`shift_up_from_chat_focus_still_enters_running_sub_agent` 与三个滚动条渲染测试。
+`shift_up_from_chat_focus_still_enters_running_sub_agent`、三个滚动条渲染测试，
+以及选区链路（`selection_text_*`、`double_click_selects_a_whole_path`、
+`selection_paints_only_inside_the_content_area`、`drag_is_clamped_to_the_content_area`）。
 
 ## [0.3.10] - 2026-10-19
 

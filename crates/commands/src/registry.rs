@@ -340,7 +340,6 @@ impl Default for CommandRegistry {
 
 #[cfg(test)]
 mod busy_whitelist_tests {
-    use super::*;
     use crate::builtin::standard_registry;
 
     /// 回合进行中可执行的白名单是**精确集合**，不多不少。
