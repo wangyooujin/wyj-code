@@ -4310,7 +4310,7 @@ fn freetext_line(input: &InputBox, row: usize, line: &str, max_w: usize) -> Line
                 Theme::selection_on(Theme::claude_color()).add_modifier(Modifier::BOLD),
             ));
         } else {
-            spans.push(Span::styled(ch.to_string(), Theme::cursor()));
+            spans.push(Span::styled(ch.to_string(), Theme::body()));
         }
     }
     // 光标停在行尾（插入态）：补一个反色空格，否则看不出还能继续打字
