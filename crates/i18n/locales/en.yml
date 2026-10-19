@@ -977,7 +977,7 @@ profile:
   headless_unsupported: "[headless mode doesn't support /model profile management, use TUI mode instead]"
   dialog:
     hint1: "  ↑↓ Move  Enter Edit/Fetch models/Toggle  ←→ Cycle enum values"
-    hint2: "  Ctrl+S Save  Esc Close"
+    hint2: "  Ctrl+S Save (auto-saved after \"Set active\")  Esc Close (asks if unsaved)"
     editing_placeholder: "Editing, see the input box below"
     add_new_row: "New profile"
   menu:

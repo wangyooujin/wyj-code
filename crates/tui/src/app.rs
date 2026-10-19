@@ -3133,12 +3133,17 @@ pub enum ProfileMenuAction {
 /// 需要重建 Agent（`rebuild_fn` 只在主循环作用域内可见），所以菜单分发只把
 /// 意图返回给调用方，由主循环统一执行——与 `Step::Execute` 里其余纯内存动作
 /// 分开，避免把 `rebuild_fn`/`session_store` 一路透传进菜单函数。
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ProfileSessionAction {
     /// 仅本会话使用该分组（不写 config.toml）。
     Use(String),
     /// 取消会话级覆盖，恢复跟随全局默认分组。
     FollowGlobal,
+    /// 草稿已改好（如「设为当前」），请主循环走 `profile_try_save` 落盘。
+    /// 菜单函数拿不到 `rebuild_fn`/`session_store`，只能把意图交回主循环——
+    /// 与上面两个变体同一条通道。这样「设为当前」选中即保存，用户不再需要
+    /// 记住 Ctrl+S。
+    Save,
 }
 
 /// `/model` 面板操作菜单的按键分发，结构与 `mcp_handle_menu_key` 完全对称。
@@ -3219,8 +3224,8 @@ fn profile_handle_menu_key(
             if let Some(dialog) = &mut state.profile_dialog {
                 dialog.menu = None;
             }
-            // 「仅本会话使用 / 恢复跟随全局」需要重建 Agent，交给主循环执行；
-            // 其余动作纯改面板内存，就地完成。
+            // 「仅本会话使用 / 恢复跟随全局 / 设为当前后保存」需要重建 Agent 或
+            // 落盘，交给主循环执行；其余动作纯改面板内存，就地完成。
             match action {
                 ProfileMenuAction::Header(ProfileHeaderAction::UseForSession) => {
                     let ProfileRow::Header(entry_idx) = target else {
@@ -3235,6 +3240,15 @@ fn profile_handle_menu_key(
                 }
                 ProfileMenuAction::Header(ProfileHeaderAction::FollowGlobal) => {
                     return Some(ProfileSessionAction::FollowGlobal);
+                }
+                ProfileMenuAction::Header(ProfileHeaderAction::Activate) => {
+                    // 「设为当前」选完即保存：旧流程只改 active_idx 草稿、还要求
+                    // 用户再记一次 Ctrl+S，忘按就静默丢失。这里执行后就把保存
+                    // 意图交回主循环走 `profile_try_save`（含名字/Key 校验，失败
+                    // 留在面板展示 error）。注意它保存的是全局默认值，与
+                    // UseForSession「仅本会话、不写盘」的语义仍是两条路径。
+                    profile_execute_menu_action(state, action, target, agent_tx);
+                    return Some(ProfileSessionAction::Save);
                 }
                 other => profile_execute_menu_action(state, other, target, agent_tx),
             }
@@ -6712,6 +6726,26 @@ mod navigation_focus_tests {
         assert!(state.close_panel_focus());
         assert_eq!(state.ui_focus, UiFocus::Composer);
         assert_eq!(input.display_lines(), &["keep this draft"]);
+    }
+
+    /// 补全列表打开时按 Enter 必须把选中项**填入**输入框，而不是提交
+    /// 输入框里的不完整原文——旧行为是 Enter 直接落穿提交，于是 ↑↓ 选
+    /// 中的命令从未生效，用户还得手动改对命令名。
+    #[test]
+    fn enter_with_completions_open_fills_the_selected_command() {
+        assert!(slash_completion_enter_fills("/mo", "/model"));
+        assert!(slash_completion_enter_fills("/", "/help"));
+        // 带参数的中途形态：填入等于丢掉已打参数，因此这里只覆盖前缀形态。
+        let filled = slash_completion_input("/model");
+        assert_eq!(filled.display_lines(), &["/model "]);
+    }
+
+    /// 已经填好的形态（Tab 刚填过、或手输与选中项完全一致）必须放行提交，
+    /// 否则用户会经历「回车 → 只填入 → 再回车才执行」的多余一步。
+    #[test]
+    fn enter_lets_through_once_the_input_already_equals_the_selection() {
+        assert!(!slash_completion_enter_fills("/model ", "/model"));
+        assert!(!slash_completion_enter_fills("/model", "/model"));
     }
 
     #[test]
@@ -13428,9 +13462,16 @@ fn apply_session_profile(
     current_session_id: &str,
     session: &Arc<Mutex<Session>>,
 ) {
+    // `Save`（「设为当前」执行后的保存意图）不在这里处理——`profile_try_save`
+    // 需要的句柄组合与 `set_session_profile` 不同，由调用方（/model 面板的
+    // 菜单分支）拦截后直接走 `profile_try_save`。
+    if matches!(action, ProfileSessionAction::Save) {
+        return;
+    }
     let desired = match action {
         ProfileSessionAction::Use(name) => Some(name),
         ProfileSessionAction::FollowGlobal => None,
+        ProfileSessionAction::Save => None,
     };
     set_session_profile(
         state,
@@ -14049,6 +14090,28 @@ fn update_slash_completions(
         state.slash_completions.clear();
         state.slash_selected = 0;
     }
+}
+
+/// 补全列表把选中命令写回输入框时用的新 `InputBox`：命令名 + 一个尾随空格，
+/// 让用户直接接着打参数。Tab 与 Enter 共用这一条构造，避免两处各自逐字插入
+/// 后慢慢走偏。
+fn slash_completion_input(selected: &str) -> InputBox {
+    let mut input = InputBox::new();
+    for c in selected.chars() {
+        input.insert_char(c);
+    }
+    input.insert_char(' ');
+    input
+}
+
+/// 补全列表打开时按 Enter：应当**填入选中项**而不是提交输入框原文。
+///
+/// 判据是「输入框 trim 后的文本是否已经等于选中命令」：
+/// - `/mo` + 选中 `/model` → 不等，填入后停住，用户接着打参数；
+/// - `/model `（Tab 刚填过、或手输全一致）→ 相等，放行提交，
+///   否则用户会经历「填入 → 再按一次回车才执行」的多余一步。
+fn slash_completion_enter_fills(current: &str, selected: &str) -> bool {
+    current.trim_end() != selected
 }
 
 /// 未信任的项目级 server 被静默排除在外——一旦用户在信任确认面板里批准
@@ -16703,18 +16766,39 @@ async fn tui_main(
                             if let Some(action) =
                                 profile_handle_menu_key(&mut state, key.code, &agent_tx)
                             {
-                                apply_session_profile(
-                                    &mut state,
-                                    action,
-                                    &agent_tx,
-                                    &rebuild_fn,
-                                    &system_prompt_extra,
-                                    &todo_store,
-                                    &shared_agent,
-                                    session_store.as_ref(),
-                                    &current_session_id,
-                                    &session,
-                                );
+                                if matches!(action, ProfileSessionAction::Save) {
+                                    // 「设为当前」执行完毕后的保存意图：走与 Ctrl+S
+                                    // 完全相同的 `profile_try_save`（校验 → 写盘 →
+                                    // 重建 agent），成功自动关面板，失败留在面板
+                                    // 展示 error。
+                                    let saved = profile_try_save(
+                                        &mut state,
+                                        &agent_tx,
+                                        &rebuild_fn,
+                                        &system_prompt_extra,
+                                        &todo_store,
+                                        &shared_agent,
+                                        session_store.as_ref(),
+                                        &current_session_id,
+                                    );
+                                    if saved {
+                                        state.input_owner = None;
+                                        state.profile_dialog = None;
+                                    }
+                                } else {
+                                    apply_session_profile(
+                                        &mut state,
+                                        action,
+                                        &agent_tx,
+                                        &rebuild_fn,
+                                        &system_prompt_extra,
+                                        &todo_store,
+                                        &shared_agent,
+                                        session_store.as_ref(),
+                                        &current_session_id,
+                                        &session,
+                                    );
+                                }
                             }
                             continue;
                         }
@@ -17596,14 +17680,28 @@ async fn tui_main(
                             KeyCode::Tab => {
                                 let selected =
                                     state.slash_completions[state.slash_selected].0.clone();
-                                input = InputBox::new();
-                                for c in selected.chars() {
-                                    input.insert_char(c);
-                                }
-                                input.insert_char(' ');
+                                input = slash_completion_input(&selected);
                                 state.slash_completions.clear();
                                 state.slash_selected = 0;
                                 continue;
+                            }
+                            // Enter 复用 Tab 的填入语义：↑↓ 选中的命令写回输入框
+                            // 并补空格，而不是提交输入框里的不完整原文。若输入框
+                            // 已经是「命令 + 空格」的形态（Tab 刚填过、或手输完
+                            // 全一致），则落穿走正常提交，避免「填入后还要再按
+                            // 一次回车」。
+                            KeyCode::Enter => {
+                                let selected =
+                                    state.slash_completions[state.slash_selected].0.clone();
+                                if slash_completion_enter_fills(&input.text(), &selected) {
+                                    input = slash_completion_input(&selected);
+                                    state.slash_completions.clear();
+                                    state.slash_selected = 0;
+                                    continue;
+                                }
+                                state.slash_completions.clear();
+                                state.slash_selected = 0;
+                                // 落穿：不带 continue，让下方 Enter 分支提交
                             }
                             KeyCode::Esc => {
                                 state.slash_completions.clear();
@@ -21581,6 +21679,17 @@ mod mcp_dialog_tests {
 mod profile_dialog_onboarding_tests {
     use super::*;
 
+    fn make_state() -> AppState {
+        AppState::new(
+            PathBuf::from("/tmp"),
+            "test-model".to_string(),
+            200_000,
+            AgentMode::Auto,
+            Config::default(),
+            Arc::new(wyj_tools::SubAgentHub::new()),
+        )
+    }
+
     /// `ProfileEntryDraft::to_profile` 是逐字段**重建**一个新 Profile，不是原地改字段。
     /// 任何只加在 `wyj_config::Profile` 上、却没在 draft 上透传的字段，都会在用户
     /// 每次 Ctrl+S 保存 ProfileDialog 时被静默重置成默认值，且没有任何报错。
@@ -21993,6 +22102,110 @@ mod profile_dialog_onboarding_tests {
             draft.validate(),
             Some("settings.error.invalid_thinking_budget"),
             "非数字必须被校验拦下，而不是静默写回 None"
+        );
+    }
+
+    /// 两个分组的配置：验证「切到别的分组」必须先有一个可切的。
+    fn two_profile_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.profiles.push(wyj_config::Profile {
+            name: "beta".to_string(),
+            ..wyj_config::Profile::default()
+        });
+        cfg
+    }
+
+    /// 菜单「设为当前」必须**同时**改草稿并交回保存意图（`Save`）。
+    ///
+    /// 旧行为只改 `active_idx` 草稿、还要用户自己记得按 Ctrl+S，忘按就是
+    /// 静默丢失——这正是 /model 面板最常见的误操作。
+    #[test]
+    fn activate_menu_item_asks_the_main_loop_to_save() {
+        // 两个分组才能验证「切换到别的分组后保存」——默认配置只有一个。
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+        // 光标落到第 2 个分组的头行，并打开它的操作菜单。
+        let dialog = state.profile_dialog.as_mut().unwrap();
+        dialog.cursor = 1;
+        dialog.menu = dialog.build_menu();
+
+        let menu_len = state
+            .profile_dialog
+            .as_ref()
+            .and_then(|d| d.menu.as_ref())
+            .map(|m| m.items.len())
+            .unwrap_or(0);
+        assert!(menu_len > 0, "头行应能生成操作菜单");
+
+        // 移到「设为当前」那一项并确认。
+        let activate_pos = state
+            .profile_dialog
+            .as_ref()
+            .and_then(|d| d.menu.as_ref())
+            .and_then(|m| {
+                m.items.iter().position(|it| {
+                    it.action
+                        == super::ProfileMenuAction::Header(super::ProfileHeaderAction::Activate)
+                })
+            })
+            .unwrap();
+        if let Some(m) = state.profile_dialog.as_mut().and_then(|d| d.menu.as_mut()) {
+            m.selected = activate_pos;
+        }
+
+        let tx = tokio::sync::mpsc::channel(16).0;
+        let action = super::profile_handle_menu_key(&mut state, KeyCode::Enter, &tx);
+
+        assert_eq!(
+            action,
+            Some(super::ProfileSessionAction::Save),
+            "「设为当前」应交回保存意图，而不是留草稿等 Ctrl+S"
+        );
+        assert_eq!(
+            state.profile_dialog.as_ref().map(|d| d.active_idx),
+            Some(1),
+            "草稿里的当前分组应已切到第 2 个"
+        );
+    }
+
+    /// 对照项：同一菜单里的「仅本会话使用」仍走会话通道，绝不能混进 `Save`
+    /// ——它**不写 config.toml**，合并两条路径会把临时分组固化成全局默认。
+    #[test]
+    fn use_for_session_stays_off_the_save_channel() {
+        let cfg = two_profile_config();
+        let mut state = make_state();
+        state.config = cfg.clone();
+        state.profile_dialog = Some(super::ProfileDialog::new(&cfg, None));
+        let dialog = state.profile_dialog.as_mut().unwrap();
+        dialog.cursor = 0;
+        dialog.menu = dialog.build_menu();
+
+        let session_pos = state
+            .profile_dialog
+            .as_ref()
+            .and_then(|d| d.menu.as_ref())
+            .and_then(|m| {
+                m.items.iter().position(|it| {
+                    it.action
+                        == super::ProfileMenuAction::Header(
+                            super::ProfileHeaderAction::UseForSession,
+                        )
+                })
+            })
+            .unwrap();
+        if let Some(m) = state.profile_dialog.as_mut().and_then(|d| d.menu.as_mut()) {
+            m.selected = session_pos;
+        }
+
+        let tx = tokio::sync::mpsc::channel(16).0;
+        let action = super::profile_handle_menu_key(&mut state, KeyCode::Enter, &tx);
+
+        assert_eq!(
+            action,
+            Some(super::ProfileSessionAction::Use(cfg.active_profile.clone())),
+            "会话级切换必须走自己的通道"
         );
     }
 
