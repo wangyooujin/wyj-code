@@ -2181,6 +2181,19 @@ const REASONING_EFFORT_CHOICES: &[&str] = &["low", "medium", "high", "xhigh", "m
 /// adapter 折算成默认形态（不会 400），因此仍列出。
 const THINKING_SWITCH_CHOICES: &[&str] = &["enabled", "disabled", "adaptive"];
 
+/// `max_tools_per_turn` 候选。用枚举而不是自由文本：该字段一旦写成非法数字，
+/// `to_profile` 的 `parse().ok()` 会把它静默吞成 `None`（= 回落端点默认），
+/// 用户填了却看不到任何效果。空串由 `enum_choices` 自动补在首项，表示
+/// "跟随端点默认"。
+const MAX_TOOLS_PER_TURN_CHOICES: &[&str] = &["1", "2", "4", "8"];
+
+/// 从模板新建分组时预填的每轮工具数上限。
+///
+/// 静态目录把所有非 anthropic/openai vendor 一律判成 `max_tools_per_turn = 1`，
+/// 而 `None` 会让这个猜测直接生效——新建的国内模型分组于是永远只能一次发一个
+/// 工具调用。预填 4 把这个默认值显式写进 profile，用户清空即可回到端点默认。
+const NEW_PROFILE_MAX_TOOLS_PER_TURN: usize = 4;
+
 /// 分组面板的字段表——**顺序即渲染顺序**，也是唯一真相源。
 ///
 /// 插入/重排字段只需改这张表：`text_value`/`set_text_value`/`display_value` 按
@@ -2226,6 +2239,11 @@ pub const PROFILE_FIELD_SPECS: &[ProfileFieldSpec] = &[
     field(
         "settings.field.max_tokens",
         ProfileFieldKind::Text,
+        ProfileFieldScope::Always,
+    ),
+    field(
+        "settings.field.max_tools_per_turn",
+        ProfileFieldKind::Enum(MAX_TOOLS_PER_TURN_CHOICES),
         ProfileFieldScope::Always,
     ),
     field(
@@ -2293,9 +2311,10 @@ pub struct ProfileEntryDraft {
     pub reasoning_effort: String,
     /// OpenAI-vendor thinking.type 字符串（enabled/disabled/auto/adaptive）
     pub thinking_switch: String,
-    /// 每轮并行工具数上限（面板暂不暴露编辑入口，仅透传保留原值）。
+    /// 每轮工具数上限。存字符串而非 `Option<usize>`：面板里它是 Enum 字段，
+    /// 空串表达「跟随端点默认」，与 `reasoning_effort` / `thinking_switch` 同构。
     /// 漏在这里会被 `to_profile` 静默重置成 None 且无任何报错。
-    pub max_tools_per_turn: Option<usize>,
+    pub max_tools_per_turn: String,
 }
 
 impl ProfileEntryDraft {
@@ -2323,7 +2342,10 @@ impl ProfileEntryDraft {
             openai_stream_options: p.openai_stream_options,
             reasoning_effort: p.reasoning_effort.clone().unwrap_or_default(),
             thinking_switch: p.thinking_switch.clone().unwrap_or_default(),
-            max_tools_per_turn: p.max_tools_per_turn,
+            max_tools_per_turn: p
+                .max_tools_per_turn
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
         }
     }
 
@@ -2355,9 +2377,10 @@ impl ProfileEntryDraft {
             interleaved_thinking: true,
             prompt_cache: t.prompt_cache,
             openai_stream_options: t.openai_stream_options,
-            // 从厂商模板新建的 profile 不继承覆盖值：模板描述的是端点默认形状，
-            // 并行工具数该由探测或用户显式决定。
-            max_tools_per_turn: None,
+            // 新建分组预填 4：静态目录对国内 vendor 一律判成 1（每轮只能发一个
+            // 工具调用），`None` 会让这个按 vendor 的猜测直接生效。显式写入后
+            // 用户可在面板里改成其它档位，或清空回到端点默认。
+            max_tools_per_turn: NEW_PROFILE_MAX_TOOLS_PER_TURN.to_string(),
             reasoning_effort: String::new(),
             thinking_switch: String::new(),
         }
@@ -2389,6 +2412,7 @@ impl ProfileEntryDraft {
             "settings.field.thinking_budget" => &self.thinking_budget,
             "settings.field.reasoning_effort" => &self.reasoning_effort,
             "settings.field.thinking_switch" => &self.thinking_switch,
+            "settings.field.max_tools_per_turn" => &self.max_tools_per_turn,
             _ => "",
         }
     }
@@ -2408,6 +2432,7 @@ impl ProfileEntryDraft {
             "settings.field.thinking_budget" => self.thinking_budget = value,
             "settings.field.reasoning_effort" => self.reasoning_effort = value,
             "settings.field.thinking_switch" => self.thinking_switch = value,
+            "settings.field.max_tools_per_turn" => self.max_tools_per_turn = value,
             _ => {}
         }
     }
@@ -2565,7 +2590,13 @@ impl ProfileEntryDraft {
             } else {
                 Some(self.thinking_switch.trim().to_string())
             },
-            max_tools_per_turn: self.max_tools_per_turn,
+            // 枚举只产出合法数字；仍走 `parse().ok()` 兜底，避免未来改成文本
+            // 输入后写盘一个解析不了的字符串（那会静默变成 None）。
+            max_tools_per_turn: if self.max_tools_per_turn.trim().is_empty() {
+                None
+            } else {
+                self.max_tools_per_turn.trim().parse().ok()
+            },
         }
     }
 }
@@ -21386,6 +21417,44 @@ mod profile_dialog_onboarding_tests {
         }
     }
 
+    /// 新建分组必须预填 4，否则 `None` 会让静态目录按 vendor 猜出的
+    /// `max_tools_per_turn = 1` 直接生效——国内模型分组因此永远只能一轮发一个
+    /// 工具调用，派生 subagent 也就一次只能起一个。
+    #[test]
+    fn new_profile_from_template_prefills_four_tools_per_turn() {
+        for template in wyj_api::PROFILE_TEMPLATES {
+            let draft = ProfileEntryDraft::from_template(template, &[]);
+            assert_eq!(
+                draft.to_profile().max_tools_per_turn,
+                Some(4),
+                "模板 {} 新建的分组应预填 4",
+                template.key
+            );
+        }
+    }
+
+    /// 该字段是枚举：候选首项为空串（回落端点默认），其余为合法数字，
+    /// 循环一圈必须回到起点，且清空后写盘是 `None` 而不是 0。
+    #[test]
+    fn max_tools_per_turn_enum_cycles_and_clears_to_none() {
+        let mut draft = ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let idx = super::profile_field_idx("settings.field.max_tools_per_turn").unwrap();
+        assert_eq!(
+            draft.enum_choices(idx),
+            vec!["", "1", "2", "4", "8"],
+            "枚举候选必须包含「未设置」首项"
+        );
+
+        let start = draft.text_value(idx).to_string();
+        for _ in 0..draft.enum_choices(idx).len() {
+            draft.cycle_enum_field(idx, true);
+        }
+        assert_eq!(draft.text_value(idx), start, "循环一圈未回到起点");
+
+        draft.set_text_value(idx, String::new());
+        assert_eq!(draft.to_profile().max_tools_per_turn, None);
+    }
+
     #[test]
     fn new_for_onboarding_focuses_on_api_key_field() {
         let cfg = Config {
@@ -21685,6 +21754,7 @@ mod profile_dialog_onboarding_tests {
             "settings.field.model",
             "settings.field.context_window",
             "settings.field.max_tokens",
+            "settings.field.max_tools_per_turn",
         ] {
             let idx = super::profile_field_idx(key).unwrap();
             assert!(
