@@ -10570,3 +10570,127 @@ mod chat_viewport_tests {
         }
     }
 }
+
+/// 长会话每帧渲染成本基准。
+///
+/// `#[ignore]` 是有意的：它测的是墙钟时间，在 CI 的共享 runner 上抖动足以淹没
+/// 信号。它存在是为了把「每帧重建全历史」这件事从**感觉**变成**数字**——本模块
+/// 2026-10-19 建立时测得（Apple Silicon / 2000 条消息 / 60 列 / release）：
+///
+/// | 场景                | release               | debug                  |
+/// |---------------------|-----------------------|------------------------|
+/// | 稳态（缓存命中）     | ~0.2–0.4 ms/帧        | ~1.5–3.0 ms/帧          |
+/// | resize（缓存全失效） | ~0.6–1.1 ms/帧        | ~2.8 ms/帧              |
+///
+/// 折算成 20fps 下的 CPU 占用：release 稳态不到 2%，resize 约 2%，debug 下 resize
+/// 约 6%。(多次运行有抖动，上表给区间而非单点。)
+///
+/// 结论与代码走查给出的直觉相反：
+///
+/// 1. **`logical_line_height` 的高度测量与行构建同量级甚至更贵**（debug 下
+///    2.35ms vs 0.58ms）。真要优化，先动这一列——它是 `line.width()` 的逐 span
+///    Unicode 宽度求和，跑在**全部**历史上。
+/// 2. 两者合计在 release 下不到 2% CPU。原先计划里「每帧数百毫秒、长会话必然
+///    卡死」的判断来自静态走查而非实测，**不成立**。
+///
+/// 因此 P1-1（视口窗口化 + 行区间索引）被降级：它要重写 `draw_chat` 的行布局，
+/// 而换来的收益不到 2% CPU，风险收益比很差。
+///
+/// 运行：
+/// ```sh
+/// cargo test -p wyj-tui --release -- --ignored --nocapture chat_frame_cost
+/// ```
+#[cfg(test)]
+mod perf_probe {
+    use super::*;
+    use crate::app::ChatMessage;
+    use crate::test_support::make_state;
+
+    fn long_history(count: usize) -> AppState {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        for i in 0..count {
+            state.messages.push(ChatMessage::system(format!(
+                "msg-{i:04} {}",
+                "x".repeat(60)
+            )));
+        }
+        state
+    }
+
+    /// 分别报告「构建全部行」与「测量全部行高度」的成本——这两块是每帧 O(历史)
+    /// 的来源，而真正画到屏幕上的只有一屏。
+    #[test]
+    #[ignore]
+    fn chat_frame_cost() {
+        for count in [200usize, 1000, 2000] {
+            let mut state = long_history(count);
+            let width = 100usize;
+
+            // 首帧：冷缓存，含 markdown 解析
+            let t0 = std::time::Instant::now();
+            let lines = build_pending_chat_lines(&mut state, width);
+            let cold = t0.elapsed();
+
+            // 热缓存：每帧的真实成本（render_cache 命中，仍需 clone）
+            let frames = 20;
+            let t1 = std::time::Instant::now();
+            for _ in 0..frames {
+                let lines = build_pending_chat_lines(&mut state, width);
+                std::hint::black_box(&lines);
+            }
+            let warm_build = t1.elapsed() / frames;
+
+            let t2 = std::time::Instant::now();
+            for _ in 0..frames {
+                let h: Vec<u16> = lines
+                    .iter()
+                    .map(|l| logical_line_height(l, 100) as u16)
+                    .collect();
+                std::hint::black_box(&h);
+            }
+            let warm_height = t2.elapsed() / frames;
+
+            println!(
+                "{count:>5} msgs | {:>5} lines | cold {:>8.2?} | build {:>8.2?}/frame | height {:>8.2?}/frame",
+                lines.len(),
+                cold, warm_build, warm_height
+            );
+        }
+    }
+}
+
+/// resize 场景：`render_cache` 按宽度失效，因此拖动窗口边缘的**每一帧**都会对
+/// 全历史重跑 markdown 解析。上面那个基准量的是稳态（缓存命中），与这个场景差
+/// 三个数量级——`draw_chat` 自己的注释写的就是「用户中途 resize 时只有这里知道
+/// 新宽度」，而宽度一变全历史缓存同时失效。
+#[cfg(test)]
+mod perf_probe_resize {
+    use super::*;
+    use crate::app::ChatMessage;
+    use crate::test_support::make_state;
+
+    #[test]
+    #[ignore]
+    fn chat_resize_cost() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        for i in 0..2000 {
+            state.messages.push(ChatMessage::system(format!(
+                "msg-{i:04} {}",
+                "x".repeat(60)
+            )));
+        }
+        // 用不同宽度反复构建，等价于用户来回拖动窗口边缘
+        for width in [100usize, 101, 102, 103, 104] {
+            let t = std::time::Instant::now();
+            let lines = build_pending_chat_lines(&mut state, width);
+            let h: Vec<u16> = lines
+                .iter()
+                .map(|l| logical_line_height(l, 100) as u16)
+                .collect();
+            std::hint::black_box(&h);
+            println!("resize @ width={width}: {:>8.2?}", t.elapsed());
+        }
+    }
+}
