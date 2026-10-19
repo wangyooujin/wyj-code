@@ -129,6 +129,19 @@ pub struct SessionFile {
     /// 也避免将来加枚举值时反序列化失败。
     #[serde(default)]
     pub prompt_cache_state: u8,
+    /// 字符启发式估算的校准系数（实测 prompt token / 估算值）。
+    ///
+    /// 必须落盘：它描述的是「这套端点 + 这类内容下估算偏多少」，是一个需要
+    /// 若干轮样本才收敛的量。`--resume` 后从 1.0 重新学，等于每次恢复会话都
+    /// 先经历一段阈值失准期——而这恰好发生在历史已经很长的时候。
+    #[serde(default)]
+    pub input_estimate_ratio: Option<f32>,
+    /// 端点亲口拒绝过一次时记下的真实 prompt 规模，用于收紧有效窗口。
+    ///
+    /// 必须落盘：否则 resume 之后压缩阈值又回到那个「配置写的、够不着」的
+    /// 位置，同一个 400 每回合复现一次。
+    #[serde(default)]
+    pub overflow_window_hint: Option<u32>,
 }
 
 /// `SessionFile::prompt_cache_state` 的取值。序列化为 u8 以保持
@@ -189,6 +202,8 @@ impl SessionFile {
             sub_cache_read_tokens: session.sub_cache_read_tokens,
             sub_cache_write_tokens: session.sub_cache_write_tokens,
             prompt_cache_state: session.prompt_cache_state,
+            input_estimate_ratio: session.input_estimate_ratio,
+            overflow_window_hint: session.overflow_window_hint,
             compact_count: session.compact_count,
             context_edit_freed_tokens: session.context_edit_freed_tokens,
             elided_blobs: session.elided_blobs.clone(),
@@ -423,6 +438,8 @@ impl SessionStore {
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
             messages: checkpoint.messages.clone(),
             routing_events: vec![],
             current_checkpoint_id: Some(checkpoint.id.clone()),
@@ -602,6 +619,8 @@ mod tests {
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
             messages: vec![],
             routing_events: vec![],
             current_checkpoint_id: None,
@@ -652,6 +671,8 @@ mod tests {
         s.tool_schema_tokens = 5_000;
         s.tool_schema_tokens_saved = 1_500;
         s.prompt_cache_state = prompt_cache_state::DOWNGRADED;
+        s.input_estimate_ratio = Some(1.28);
+        s.overflow_window_hint = Some(262_144);
         s.compact_count = 2;
         s.context_edit_freed_tokens = 9_000;
         s.messages.push(wyj_api::types::Message::user("hi"));
@@ -674,6 +695,8 @@ mod tests {
         assert_eq!(file.tool_schema_tokens, 5_000);
         assert_eq!(file.tool_schema_tokens_saved, 1_500);
         assert_eq!(file.prompt_cache_state, prompt_cache_state::DOWNGRADED);
+        assert_eq!(file.input_estimate_ratio, Some(1.28));
+        assert_eq!(file.overflow_window_hint, Some(262_144));
         assert_eq!(file.compact_count, 2);
         assert_eq!(file.context_edit_freed_tokens, 9_000);
 
@@ -687,6 +710,10 @@ mod tests {
         assert_eq!(restored.tool_schema_tokens, 5_000);
         assert_eq!(restored.tool_schema_tokens_saved, 1_500);
         assert_eq!(restored.prompt_cache_state, prompt_cache_state::DOWNGRADED);
+        // 校准系数与撞线证据必须跟着会话走：resume 后从 1.0 重学，等于在最需要
+        // 阈值准确的时候（历史已经很长）先失准一段。
+        assert_eq!(restored.input_estimate_ratio, Some(1.28));
+        assert_eq!(restored.overflow_window_hint, Some(262_144));
         assert_eq!(restored.compact_count, 2);
         assert_eq!(restored.context_edit_freed_tokens, 9_000);
     }
@@ -848,6 +875,8 @@ mod tests {
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
             messages: vec![Message::user("first"), Message::assistant_text("answer")],
             routing_events: vec![],
             current_checkpoint_id: None,
@@ -914,6 +943,8 @@ mod tests {
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
             prompt_cache_state: prompt_cache_state::OFF,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
             messages: vec![Message::user(format!("credential: {secret}"))],
             routing_events: Vec::new(),
             current_checkpoint_id: None,

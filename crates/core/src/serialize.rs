@@ -607,6 +607,8 @@ mod tests {
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
             prompt_cache_state: crate::session_store::prompt_cache_state::OFF,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
             messages: vec![Message {
                 role: wyj_api::types::Role::User,
                 content: vec![ApiContentBlock::Text {

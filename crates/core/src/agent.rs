@@ -435,6 +435,18 @@ pub struct Agent {
     /// 兼容 `Agent: Clone`（TUI `/model` 重建与模式切换都会 clone），
     /// 同时让重建出的 Agent 继承同一份缓存。
     memory_snapshot: Arc<std::sync::Mutex<MemorySnapshotCache>>,
+    /// **最近一次真实请求**的 system volatile 段全文（见
+    /// `SystemPrompt` 的 stable/volatile 分段约定）。
+    ///
+    /// 存在的唯一理由是手动 `/compact`：压缩请求要复用主对话前缀才能命中
+    /// provider 的缓存，而 volatile 段里装着「本轮触达目录的规约 reminder」
+    /// 「工具可用性名单」「语言提醒」——它们在回合之外**无法重建**（子目录
+    /// reminder 由 `maybe_dir_reminder` 按首次触达注入，`seen_dirs` 是全局去重的，
+    /// 第二个回合起就再也拿不到了）。旧实现干脆传 `volatile: ""`，缓存必 miss。
+    ///
+    /// 缓存「上一次真正发出去的字节」是唯一能做到逐字节一致的做法；没有历史
+    /// 请求（新会话第一条就 `/compact`）时退回按当前 route 现拼。
+    last_request_volatile: Arc<std::sync::Mutex<String>>,
 }
 
 /// 跨会话记忆快照的重算间隔（按用户轮次分桶）。
@@ -544,6 +556,7 @@ impl Agent {
             active_route: Arc::new(AtomicUsize::new(0)),
             thinking_cb: None,
             memory_snapshot: Arc::new(std::sync::Mutex::new(MemorySnapshotCache::default())),
+            last_request_volatile: Arc::new(std::sync::Mutex::new(String::new())),
             hook_runner: None,
             checkpoint_store: None,
             loop_guard: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -994,6 +1007,83 @@ impl Agent {
             .min(self.fallback_routes.len())
     }
 
+    /// 本次请求**实际发送**的工具集：先按 route 能力裁剪（端点不支持工具
+    /// 调用 / 不认严格 schema），再按 lazy 折叠状态过滤。
+    ///
+    /// 返回 `(实际发送, 折叠前的全量)` 两个列表——后者只用于算「因折叠省下
+    /// 多少 schema token」，与请求内容无关。
+    ///
+    /// 必须由 `run_turn` 与 `compact_context` **共用**：压缩请求的 tools 段
+    /// 排在缓存前缀里，少一个工具、或者换一种 schema 简化写法，整段前缀就
+    /// 全价重发。旧实现在 `compact_context` 里只按 lazy 状态过滤，漏掉了能力
+    /// 裁剪，正是这种「两处各写一半」的典型。
+    fn tools_for_request(&self, route: &AgentRoute) -> (Vec<ToolDefinition>, Vec<ToolDefinition>) {
+        let candidate: Vec<ToolDefinition> = match &route.capabilities {
+            Some(capabilities) if !capabilities.tool_calling.value => Vec::new(),
+            Some(capabilities) if !capabilities.strict_tool_schema.value => self
+                .tools
+                .iter()
+                .map(crate::tool_arguments::simplified_tool_definition)
+                .collect(),
+            _ => self.tools.clone(),
+        };
+        let sent = candidate
+            .iter()
+            .filter(|definition| {
+                self.lazy_tool_state
+                    .as_ref()
+                    .map(|state| state.visible(&definition.name))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        (sent, candidate)
+    }
+
+    /// 把「与内容无关、每轮可变」的 volatile 三段按真实请求的顺序追加到
+    /// `out`：模型兼容 suffix → 工具可用性名单 → 语言提醒。
+    ///
+    /// 语言提醒必须在最后（它的全部价值就是位置，见
+    /// `response_language_reminder_is_the_last_system_section`）。抽出成
+    /// 公共函数是为了让 `compact_context` 能复用同一份拼装——压缩请求的
+    /// system 必须与主对话逐字节相同才能命中缓存。
+    fn push_request_volatile_tail(
+        &self,
+        route: &AgentRoute,
+        request_tools: &[ToolDefinition],
+        out: &mut String,
+    ) {
+        if let Some(capabilities) = &route.capabilities {
+            let suffix = wyj_api::PromptPolicy::compatibility_suffix(capabilities);
+            if !suffix.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(suffix);
+            }
+        }
+        let attached_tool_names = request_tools
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<Vec<_>>();
+        // 被 lazy 折叠掉的部分必须点名：只报「本次直接可调用」的名单，
+        // 模型会把「不在列表里」读成「本会话没有这个工具」（实测 MCP
+        // codegraph 的 8 个工具因此从未被调用过）。分组只报来源与数量，
+        // 不展开 schema——展开就退化成不折叠。
+        let hidden_sources = self
+            .lazy_tool_state
+            .as_ref()
+            .map(|state| state.hidden_sources())
+            .unwrap_or_default();
+        out.push_str("\n\n");
+        out.push_str(&crate::prompts::current_tool_availability_block(
+            &attached_tool_names,
+            &hidden_sources,
+        ));
+        if let Some(language) = &self.response_language {
+            out.push_str("\n\n");
+            out.push_str(&crate::prompts::response_language_reminder(language));
+        }
+    }
+
     fn fallback_error_kind(error: &anyhow::Error) -> Option<wyj_api::ProviderErrorKind> {
         error
             .downcast_ref::<wyj_api::ProviderError>()
@@ -1149,17 +1239,17 @@ impl Agent {
         request_system: &wyj_api::SystemPrompt<'_>,
         request_tools: &[ToolDefinition],
         max_output_tokens: u32,
+        ratio: f32,
+        window: u32,
     ) -> u32 {
         use crate::context_edit::elide_tool_results;
         use std::sync::atomic::Ordering;
 
-        let mut estimate = ContextAudit::from_request(
-            request_system,
-            &session.messages,
-            request_tools,
-            max_output_tokens,
-        )
-        .total();
+        let measure = |messages: &[wyj_api::types::Message]| -> u32 {
+            ContextAudit::from_request(request_system, messages, request_tools, max_output_tokens)
+                .calibrated_total(ratio)
+        };
+        let mut estimate = measure(&session.messages);
 
         // 软阈值不得高于硬阈值，否则软阈值形同虚设（等于退回旧的单阈值行为）。
         let start_threshold = soft_threshold.min(compact_threshold);
@@ -1193,25 +1283,21 @@ impl Agent {
                 freed_tokens = stats.freed_tokens,
                 "context editing: 已把过期工具输出外部化到 CAS"
             );
-            estimate = ContextAudit::from_request(
-                request_system,
-                &session.messages,
-                request_tools,
-                max_output_tokens,
-            )
-            .total();
+            estimate = measure(&session.messages);
         }
 
         // 清理改变了历史构成，审计快照必须同步刷新，否则 `/context` 面板和
-        // 下一次阈值判定会拿着清理前的数字。
+        // 下一次阈值判定会拿着清理前的数字。窗口一并带上：`/context` 显示的
+        // 阈值必须与本次判定同源（见 `ContextAudit::window`）。
         let audit = ContextAudit::from_request(
             request_system,
             &session.messages,
             request_tools,
             max_output_tokens,
-        );
+        )
+        .with_window(window);
         session.context_audit = audit;
-        audit.total()
+        audit.calibrated_total(ratio)
     }
 
     /// 取本次请求要拼进 system 稳定前缀的跨会话记忆快照。
@@ -1489,15 +1575,11 @@ impl Agent {
             let (blocks, stop_reason, used_route) = 'route_attempt: loop {
                 let route = self.route_at(route_index);
                 // stable 段跨 route 复用（内容本就与 route 无关）；每轮变化的
-                // 部分（模型兼容 suffix + 当前工具可用性）归入 volatile。
+                // 部分（本轮触达目录的规约 reminder + suffix + 工具可用性
+                // + 语言提醒）归入 volatile，尾部三段由 `push_request_volatile_tail`
+                // 统一拼装——手动 `/compact` 要复现同一份字节，顺序与内容
+                // 分两处写就是下一次失配的起点。
                 let mut request_system_volatile = system_volatile.clone();
-                if let Some(capabilities) = &route.capabilities {
-                    let suffix = wyj_api::PromptPolicy::compatibility_suffix(capabilities);
-                    if !suffix.is_empty() {
-                        request_system_volatile.push_str("\n\n");
-                        request_system_volatile.push_str(suffix);
-                    }
-                }
                 // effort 能不能上送由 `wyj_api::normalize_effort` 单独裁决：它查的是
                 // vendor 的 `effort_levels`，不是 `ModelCapabilities` 里那个**单值**
                 // `ThinkingMode` 标签——后者既记不下 Qwen 这种 budget/effort 都认的
@@ -1545,57 +1627,23 @@ impl Agent {
                         interleaved: route.interleaved_thinking,
                     }
                 };
-                let candidate_tools: Vec<ToolDefinition> = match &route.capabilities {
-                    Some(capabilities) if !capabilities.tool_calling.value => Vec::new(),
-                    Some(capabilities) if !capabilities.strict_tool_schema.value => self
-                        .tools
-                        .iter()
-                        .map(crate::tool_arguments::simplified_tool_definition)
-                        .collect(),
-                    _ => self.tools.clone(),
-                };
+                let (request_tools, candidate_tools) = self.tools_for_request(&route);
                 let all_schema_tokens = estimate_tool_schema_tokens(&candidate_tools);
-                let request_tools: Vec<ToolDefinition> = candidate_tools
-                    .into_iter()
-                    .filter(|definition| {
-                        self.lazy_tool_state
-                            .as_ref()
-                            .map(|state| state.visible(&definition.name))
-                            .unwrap_or(true)
-                    })
-                    .collect();
-                let attached_tool_names = request_tools
-                    .iter()
-                    .map(|definition| definition.name.as_str())
-                    .collect::<Vec<_>>();
-                // 被 lazy 折叠掉的部分必须点名：只报「本次直接可调用」的名单，
-                // 模型会把「不在列表里」读成「本会话没有这个工具」（实测 MCP
-                // codegraph 的 8 个工具因此从未被调用过）。分组只报来源与数量，
-                // 不展开 schema——展开就退化成不折叠。
-                let hidden_sources = self
-                    .lazy_tool_state
-                    .as_ref()
-                    .map(|state| state.hidden_sources())
-                    .unwrap_or_default();
-                request_system_volatile.push_str("\n\n");
-                request_system_volatile.push_str(&crate::prompts::current_tool_availability_block(
-                    &attached_tool_names,
-                    &hidden_sources,
-                ));
-                // 语言提醒必须是 system prompt 的**最后一段**：它存在的全部理由
-                // 就是位置（`<env>` 里的语言事实在中段，被记忆快照 + CLAUDE.md
-                // reminder 压在后面几万 token）。谁在它后面再追加东西，就把这个
-                // 不变量打破了——`response_language_reminder_is_the_last_system
-                // section` 那条测试就是钉这里的。
-                if let Some(language) = &self.response_language {
-                    request_system_volatile.push_str("\n\n");
-                    request_system_volatile
-                        .push_str(&crate::prompts::response_language_reminder(language));
-                }
+                self.push_request_volatile_tail(
+                    &route,
+                    &request_tools,
+                    &mut request_system_volatile,
+                );
                 let request_system = wyj_api::SystemPrompt {
                     stable: &system_stable,
                     volatile: &request_system_volatile,
                 };
+                // 存下「本次真正发出去的 volatile 字节」：手动 `/compact` 在回合之外
+                // 重建不了子目录 reminder（`seen_dirs` 全局去重，第二个回合起就没
+                // 有了），只能靠这份快照才能与主对话前缀逐字节一致、命中缓存。
+                if let Ok(mut slot) = self.last_request_volatile.lock() {
+                    *slot = request_system_volatile.clone();
+                }
                 let sent_schema_tokens = estimate_tool_schema_tokens(&request_tools);
                 // 两个口径必须并存，含义不同：
                 // · `last` = 本次请求实际发送的量（稳态），与
@@ -1621,18 +1669,26 @@ impl Agent {
                     &request_tools,
                     opts.max_tokens,
                 );
-                let estimated_before = context_audit.total();
-                session.context_audit = context_audit;
-                let compact_threshold = route.context_window.saturating_sub(
-                    compact_trigger_buffer(route.context_window, opts.max_tokens),
-                );
+                // 阈值判定用**校准后**的估算：字符启发式对代码 / JSON / 多语言
+                // 混排的偏差可达数十个百分点，而阈值是按比例切的硬线。系数来自
+                // 每轮请求成功后 provider 上报的真实 prompt token（见
+                // `Session::observe_prompt_tokens`），未校准时就是 1.0，行为与
+                // 旧版逐字节相同。
+                let ratio = session.estimate_ratio();
+                let estimated_before = context_audit.calibrated_total(ratio);
+                // 有效窗口：配置值，但被端点拒绝过就按实测值收紧。`context_window`
+                // 是裸配置，填大了两道防线会一起落在够不着的位置。
+                let effective_window = session.effective_context_window(route.context_window);
+                session.context_audit = context_audit.with_window(effective_window);
+                let compact_threshold = effective_window
+                    .saturating_sub(compact_trigger_buffer(effective_window, opts.max_tokens));
                 // 软阈值：context editing 的**动手线**，与上面的压缩硬阈值分开。
                 // 硬阈值决定"何时停手"，软阈值决定"何时开始"——1M 窗口下硬阈值
                 // 在 900K，等它触发意味着整段历史被原样重发了几百趟。
                 // `soft_limit_ratio = 0` 时取 u32::MAX，条件退化成
                 // `estimated_before > compact_threshold`，与改动前完全一致。
                 let soft_threshold =
-                    soft_threshold_tokens(route.context_window, self.context_edit.as_ref());
+                    soft_threshold_tokens(effective_window, self.context_edit.as_ref());
 
                 // 清理优先于摘要：超阈值时先把过期的工具输出外部化掉（更便宜、
                 // 不产生幻觉、更保真），清理后仍超标才跑整段摘要。对齐 Claude
@@ -1649,6 +1705,8 @@ impl Agent {
                             &request_system,
                             &request_tools,
                             opts.max_tokens,
+                            ratio,
+                            effective_window,
                         ),
                         None => estimated_before,
                     }
@@ -1693,13 +1751,29 @@ impl Agent {
                     // 落入阈值或 compact 自身失败,把硬上限（撞穿模型
                     // 上下文窗口）的风险从『靠运气不撞』降到『最多 3 轮
                     // LLM round-trip 收敛』。
+                    //
+                    // 收敛判据必须与进入条件**同口径**：进入用的是请求级
+                    // `ContextAudit::total()`（含 system / 工具 schema / 输出
+                    // 预留），若循环内退回 messages-only 的 `estimate_tokens`，
+                    // 两者相差的 4~5 万 token 会让它误判「还没压够」，白跑第
+                    // 2、3 轮——而每多跑一轮就会把上一轮刚保留的尾部原文再
+                    // 摘要一次，这正是长会话越压越失忆的放大器。
+                    let measure_request = |messages: &[wyj_api::types::Message]| -> u32 {
+                        ContextAudit::from_request(
+                            &request_system,
+                            messages,
+                            &request_tools,
+                            opts.max_tokens,
+                        )
+                        .calibrated_total(ratio)
+                    };
                     let outcome = compact_session_until_fit(
                         session,
                         route.provider.as_ref(),
-                        route.context_window,
-                        estimated,
+                        effective_window,
                         compact_threshold,
                         compact_prefix,
+                        &measure_request,
                     )
                     .await;
                     if let Some(error) = outcome.last_error {
@@ -1727,6 +1801,17 @@ impl Agent {
                                 compact_threshold
                             );
                         }
+                        // 压缩改写了整段历史，审计快照必须立刻重算：否则
+                        // ① `/context` 面板显示的仍是压缩前的占用；
+                        // ② 下一次 usage 入账时的校准采样会拿压缩前的旧估算
+                        // 当分母，把系数系统性压低、阈值越推越晚。
+                        session.context_audit = ContextAudit::from_request(
+                            &request_system,
+                            &session.messages,
+                            &request_tools,
+                            opts.max_tokens,
+                        )
+                        .with_window(effective_window);
                     }
                 }
 
@@ -1744,6 +1829,9 @@ impl Agent {
                 const MAX_STREAM_RETRIES: u32 = 2;
                 let mut stream_retries: u32 = 0;
                 let mut retry_spent_ms: u64 = 0;
+                // 输出预留不随 thinking 降级改变，但 `opts` 在这里已被移进
+                // `effective_opts`，留一份标量给下面的超限判定用。
+                let request_max_tokens = opts.max_tokens;
                 let mut effective_opts = opts;
                 let mut parameter_degraded = false;
                 // provider 报「上下文超限」时的强制恢复：阈值估算只是启发式，
@@ -1808,11 +1896,24 @@ impl Agent {
                                     .unwrap_or(false);
                             if context_overflow {
                                 context_recovered = true;
+                                // 记下这次被拒的真实 prompt 规模：配置里的
+                                // `context_window` 是裸值，端点说「太长」就是它
+                                // 唯一一次给的实测证据。后续有效窗口按
+                                // `min(configured, hint)` 收紧，否则阈值会一直
+                                // 落在够不着的位置，每回合都要撞一次 400 才能压。
+                                let rejected = ContextAudit::from_request(
+                                    &request_system,
+                                    outbound_messages,
+                                    &request_tools,
+                                    request_max_tokens,
+                                )
+                                .calibrated_total(ratio);
+                                session.note_context_overflow(rejected);
                                 on_text(&wyj_i18n::tr("agent.context_overflow"));
                                 match crate::compact::compact_session(
                                     session,
                                     route.provider.as_ref(),
-                                    route.context_window,
+                                    effective_window,
                                     // 与主压缩路径同一判据：不缓存的端点不走
                                     // 前缀复用，避免把整段历史全价重发一遍。
                                     compact_prefix,
@@ -1843,6 +1944,17 @@ impl Agent {
                                         );
                                     }
                                 }
+                                // 压缩改写了历史，审计快照必须跟着刷新，否则
+                                // ① 重试请求后的校准采样会拿压缩前的旧估算当分母，
+                                // 把系数系统性压低、阈值越推越晚；
+                                // ② `/context` 面板显示的仍是压缩前的占用。
+                                session.context_audit = ContextAudit::from_request(
+                                    &request_system,
+                                    &session.messages,
+                                    &request_tools,
+                                    request_max_tokens,
+                                )
+                                .with_window(effective_window);
                                 continue;
                             }
                             let safe_parameter = error
@@ -2076,6 +2188,19 @@ impl Agent {
                             // 流完整结束：usage 一次性入账。供应商返回的 input_tokens
                             // 仅含未命中缓存的（全价）部分，缓存命中（0.1x）与缓存
                             // 写入（1.25x）单独累计用于 /cost 展示。
+                            //
+                            // 校准采样只取**最后一条**：重试路径可能在同一轮回填多次
+                            // usage，累加会把真实 prompt 抬高一倍，系数随之被系统性
+                            // 高估——而系数直接进压缩阈值判定。
+                            let real_prompt = pending_usage
+                                .last()
+                                .map(|(input, _, cache_read, cache_write)| {
+                                    input
+                                        .saturating_add(*cache_read)
+                                        .saturating_add(*cache_write)
+                                })
+                                .unwrap_or(0);
+                            session.observe_prompt_tokens(real_prompt);
                             for (input, output, cache_read, cache_write) in pending_usage {
                                 session.add_usage(input, output);
                                 session.add_cache_usage(cache_read, cache_write);
@@ -3059,10 +3184,19 @@ impl Agent {
 
     /// 手动触发上下文压缩（供 /compact 命令使用）
     ///
-    /// 走前缀复用路径：`system` 按与 `run_turn` 相同的规则拼（主提示、记忆快照、
-    /// 规约祖先链），`tools` 用当前工具集。**可能失配**——`run_turn` 里 tools
-    /// 还会按 route 能力与 lazy 折叠裁剪，这里没有那层上下文。失配的代价只是
-    /// 缓存不命中，回到改动前的全价行为，不会影响摘要正确性。
+    /// 走前缀复用路径：system 与 tools 必须与主对话**逐字节相同**才能命中
+    /// provider 缓存，而缓存命中率就是这条路径的全部理由（DeepSeek 命中价是
+    /// miss 的 1/50）。三条曾经各写一半、现在共用同一处的地方：
+    ///
+    /// 1. `tools` 走 [`Self::tools_for_request`]——含 route 能力裁剪与 lazy
+    ///    折叠，与 `run_turn` 完全一致；
+    /// 2. `volatile` 优先取**最近一次真实请求发出去的字节**
+    ///    （[`Self::last_request_volatile`]）。回合之外重建不出子目录规约
+    ///    reminder——`ClaudeMdLoader::seen_dirs` 是全局去重的，第二个回合起
+    ///    就再也拿不到它，而它在真实请求里是 volatile 的第一段。没有历史请求
+    ///    时（新会话第一条就 `/compact`）才现拼尾部三段；
+    /// 3. 窗口走 [`Session::effective_context_window`]，与自动压缩同一份判定
+    ///    依据。旧实现直接用配置值，于是「手动压过之后自动压缩的阈值又变了」。
     pub async fn compact_context(
         &self,
         session: &mut Session,
@@ -3082,22 +3216,26 @@ impl Agent {
                 system_stable.push_str(&reminder);
             }
         }
-        let request_tools: Vec<ToolDefinition> = self
-            .tools
-            .iter()
-            .filter(|definition| {
-                self.lazy_tool_state
-                    .as_ref()
-                    .map(|state| state.visible(&definition.name))
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
+        let (request_tools, _) = self.tools_for_request(&route);
+        let snapshot = self
+            .last_request_volatile
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        let volatile = if snapshot.is_empty() {
+            // 从未发过请求：按当前 route 现拼尾部三段。此时不存在子目录
+            // reminder（本轮还没触达过任何目录），因此与真实请求一致。
+            let mut fresh = String::new();
+            self.push_request_volatile_tail(&route, &request_tools, &mut fresh);
+            fresh
+        } else {
+            snapshot
+        };
 
         compact_session(
             session,
             route.provider.as_ref(),
-            route.context_window,
+            session.effective_context_window(route.context_window),
             // 与 `run_turn` 内两条压缩路径同一判据：不缓存的端点退回独立请求
             // 形态，避免把整段历史全价重发一遍。
             if route
@@ -3109,7 +3247,7 @@ impl Agent {
                 Some(CompactPrefix {
                     system: wyj_api::SystemPrompt {
                         stable: &system_stable,
-                        volatile: "",
+                        volatile: &volatile,
                     },
                     tools: &request_tools,
                 })
@@ -7040,6 +7178,137 @@ mod tests {
             text.contains("tool_call_incomplete") && text.contains("MaxTokens"),
             "兜底结果应说明未完成及原因，实际: {text}"
         );
+    }
+
+    // ── 手动 /compact 的前缀与主对话同源 ──────────────────────────────
+
+    /// 同时捕获 `stream`（主对话请求）与 `complete`（压缩请求）收到的
+    /// system 两段 + 工具名单，用来逐字节比对两者。
+    #[derive(Default)]
+    struct PrefixProbeProvider {
+        stream_prefix: std::sync::Mutex<Option<(String, String, Vec<String>)>>,
+        complete_prefix: std::sync::Mutex<Option<(String, String, Vec<String>)>>,
+    }
+
+    impl PrefixProbeProvider {
+        fn snapshot(
+            system: &wyj_api::SystemPrompt<'_>,
+            tools: &[ToolDefinition],
+        ) -> (String, String, Vec<String>) {
+            (
+                system.stable.to_string(),
+                system.volatile.to_string(),
+                tools.iter().map(|t| t.name.clone()).collect(),
+            )
+        }
+
+        fn stream_prefix(&self) -> (String, String, Vec<String>) {
+            self.stream_prefix
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("应至少有一次 stream")
+        }
+
+        fn complete_prefix(&self) -> (String, String, Vec<String>) {
+            self.complete_prefix
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("压缩应发出一次 complete")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for PrefixProbeProvider {
+        async fn stream(
+            &self,
+            system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<EventStream> {
+            *self.stream_prefix.lock().unwrap() = Some(Self::snapshot(system, tools));
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn complete(
+            &self,
+            system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            tools: &[ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::types::CompletionResult> {
+            *self.complete_prefix.lock().unwrap() = Some(Self::snapshot(system, tools));
+            Ok(wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text {
+                    text: "## Task & Intent\n继续。".to_string(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    /// 手动 `/compact` 的前缀必须与主对话请求**逐字节相同**，否则压缩请求
+    /// （一次动辄几百 K token）在 provider 侧完全 miss 缓存——而「让压缩复用
+    /// 主对话前缀」正是这条路径存在的全部理由。
+    ///
+    /// 旧实现的两个失配点：`volatile` 写死空串，`tools` 只按 lazy 折叠过滤而
+    /// 漏掉 route 能力裁剪。本测试把两者一起钉死。
+    #[tokio::test]
+    async fn manual_compaction_reuses_the_exact_main_request_prefix() {
+        let probe = Arc::new(PrefixProbeProvider::default());
+        let mut agent = Agent::new(probe.clone() as Arc<dyn Provider>);
+        agent.register_tool(Arc::new(SleepTool));
+        // 子目录规约 reminder 只有「本轮触达过目录」时才会进 volatile，
+        // 这段真实请求里不含它；要断言的是**两条路径字节相同**，而不是
+        // 各自等于某个固定值。
+        let mut session = Session::new();
+        session.push_user("读一下文件");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+        session.push_user("再看一个");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        agent
+            .compact_context(&mut session)
+            .await
+            .expect("手动压缩应成功");
+
+        let (s_stable, s_volatile, s_tools) = probe.stream_prefix();
+        let (c_stable, c_volatile, c_tools) = probe.complete_prefix();
+        assert_eq!(
+            c_stable, s_stable,
+            "压缩请求的 system stable 段必须与主对话相同"
+        );
+        assert_eq!(
+            c_volatile, s_volatile,
+            "压缩请求的 volatile 段必须与主对话相同（不可写死空串）"
+        );
+        assert!(
+            !s_volatile.is_empty(),
+            "本用例必须真的带上 volatile 才有意义"
+        );
+        assert_eq!(
+            c_tools, s_tools,
+            "压缩请求的工具清单必须与主对话相同（少一个就整段缓存失效）"
+        );
+        assert!(s_tools.contains(&"Sleep".to_string()));
     }
 
     // ── 记忆快照分桶缓存 ───────────────────────────────────────────────
