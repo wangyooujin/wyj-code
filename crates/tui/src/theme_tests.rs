@@ -25,6 +25,7 @@ const SLOTS: &[&str] = &[
     "text_dim",
     "border",
     "code_fg",
+    "inline_code",
     "selected_bg",
     "plan",
     "danger",
@@ -56,6 +57,7 @@ fn slot_color(slot: &str) -> Color {
         "text_dim" => Theme::TEXT_DIM,
         "border" => Theme::BORDER,
         "code_fg" => Theme::CODE_FG,
+        "inline_code" => Theme::INLINE_CODE,
         "selected_bg" => Theme::SELECTED_BG,
         "plan" => Theme::PLAN,
         "danger" => Theme::DANGER,
@@ -150,7 +152,7 @@ fn no_hardcoded_colors_outside_theme() {
 fn every_palette_slot_is_wired_to_a_json_key() {
     let mut colors = serde_json::Map::new();
     for (idx, slot) in SLOTS.iter().enumerate() {
-        // idx 参与颜色取值，保证 27 个槽位两两不同；且刻意不等于任何默认值
+        // idx 参与颜色取值，保证所有槽位两两不同；且刻意不等于任何默认值
         let v = 10 + idx * 8;
         colors.insert((*slot).to_string(), json!([v, v, v]));
     }
@@ -170,6 +172,7 @@ fn every_palette_slot_is_wired_to_a_json_key() {
             "text_dim" => palette.text_dim,
             "border" => palette.border,
             "code_fg" => palette.code_fg,
+            "inline_code" => palette.inline_code,
             "selected_bg" => palette.selected_bg,
             "plan" => palette.plan,
             "danger" => palette.danger,
@@ -229,6 +232,7 @@ fn every_slot_is_degraded_not_just_some_of_them() {
             "text_dim" => base.text_dim = color,
             "border" => base.border = color,
             "code_fg" => base.code_fg = color,
+            "inline_code" => base.inline_code = color,
             "selected_bg" => base.selected_bg = color,
             "plan" => base.plan = color,
             "danger" => base.danger = color,
@@ -310,6 +314,7 @@ fn field(palette: &ThemePalette, slot: &str) -> Color {
         "text_dim" => palette.text_dim,
         "border" => palette.border,
         "code_fg" => palette.code_fg,
+        "inline_code" => palette.inline_code,
         "selected_bg" => palette.selected_bg,
         "plan" => palette.plan,
         "danger" => palette.danger,
@@ -346,4 +351,121 @@ fn default_palette_matches_the_constant_table() {
             "槽位 `{slot}` 的默认值与常量表不一致"
         );
     }
+}
+
+/// ④ 色板必须在设计基准背景上可读。
+///
+/// 这条钉住的是 `doc/plan/color-system-redesign.md` 的取值承诺：正文层四档
+/// 在 `#1E2127` 上逐级变弱但都还能读，语义色则必须至少达到「加粗短标签」
+/// 的 WCAG 门槛。**为什么需要它**：改色号是最容易被"顺手调亮一点"的地方，
+/// 而亮度一旦失守，用户看到的是「某些字在深色终端里糊成一片」，
+/// 却很难联想到是某次提交动了 `theme.rs` 里的一个数字。
+#[test]
+fn palette_stays_readable_on_the_dark_reference_background() {
+    // 设计基准背景（One Dark / Tokyo Night 一类的冷灰暗底）
+    let bg = Color::Rgb(30, 33, 39);
+
+    let contrast = |fg: Color| {
+        let (r1, g1, b1) = rgb(fg);
+        let (r2, g2, b2) = rgb(bg);
+        (luminance(r1, g1, b1) + 0.05) / (luminance(r2, g2, b2) + 0.05)
+    };
+
+    // 正文与次级正文：长文阅读，按 WCAG AA 正文门槛
+    for (name, color) in [("text", Theme::TEXT), ("text_dim", Theme::TEXT_DIM)] {
+        let ratio = contrast(color);
+        assert!(
+            ratio >= 4.5,
+            "`{name}` 在基准背景上的对比度只有 {ratio:.2}:1，长文阅读需要 ≥ 4.5:1"
+        );
+    }
+
+    // 弱化与极弱标记：非正文，但也不能低到看不见
+    for (name, color) in [("inactive", Theme::INACTIVE), ("muted", Theme::MUTED)] {
+        let ratio = contrast(color);
+        assert!(
+            ratio >= 2.0,
+            "`{name}` 在基准背景上的对比度只有 {ratio:.2}:1，已低到无法辨认"
+        );
+    }
+
+    // 语义色：用于图标与短标签，门槛取 3.0（与 `ensure_contrast` 一致）
+    for (name, color) in [
+        ("success", Theme::SUCCESS),
+        ("error", Theme::ERROR),
+        ("warning", Theme::WARNING),
+        ("claude", Theme::CLAUDE),
+        ("suggestion", Theme::SUGGESTION),
+        ("danger", Theme::DANGER),
+        ("hint", Theme::HINT),
+        ("info", Theme::INFO),
+        ("queue", Theme::QUEUE),
+        ("plan", Theme::PLAN),
+        ("code_fg", Theme::CODE_FG),
+        ("inline_code", Theme::INLINE_CODE),
+        ("code_keyword", Theme::CODE_KEYWORD),
+        ("code_string", Theme::CODE_STRING),
+        ("code_number", Theme::CODE_NUMBER),
+        ("code_comment", Theme::CODE_COMMENT),
+    ] {
+        let ratio = contrast(color);
+        assert!(
+            ratio >= 3.0,
+            "`{name}` 在基准背景上的对比度只有 {ratio:.2}:1，低于 3.0 的短标签门槛"
+        );
+    }
+}
+
+fn rgb(color: Color) -> (f64, f64, f64) {
+    match color {
+        Color::Rgb(r, g, b) => (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0),
+        other => panic!("对比度测试只接受 RGB 槽位，实际 {other:?}"),
+    }
+}
+
+fn luminance(r: f64, g: f64, b: f64) -> f64 {
+    let f = |v: f64| {
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+}
+
+/// ⑤ 正文层必须是四档明度递进，且品牌色不能铺到正文上。
+///
+/// 色板的核心承诺是「层级靠明度、不靠色相」。这条把它变成可执行的断言：
+/// 任何一次调整若让 `text_dim` 比 `text` 还亮、或让正文重新用上品牌橙，
+/// 都会立刻变红，而不是等用户反馈「看着有点乱」。
+#[test]
+fn neutral_ramp_descends_and_body_text_is_not_branded() {
+    let lum = |c: Color| {
+        let (r, g, b) = rgb(c);
+        luminance(r, g, b)
+    };
+    assert!(
+        lum(Theme::TEXT) > lum(Theme::TEXT_DIM),
+        "正文必须比次级正文亮"
+    );
+    assert!(
+        lum(Theme::TEXT_DIM) > lum(Theme::INACTIVE),
+        "次级正文必须比 dim 亮"
+    );
+    assert!(
+        lum(Theme::INACTIVE) > lum(Theme::MUTED),
+        "dim 必须比极弱标记亮"
+    );
+    assert!(
+        lum(Theme::BORDER) < lum(Theme::MUTED),
+        "框线是最弱的一档，不能比正文层更亮"
+    );
+
+    // 工具结果与正文同级（次级正文），不能是品牌色 / 强调色
+    assert_eq!(Theme::tool_result(), Theme::text_dim());
+    assert_eq!(
+        Theme::body(),
+        ratatui::style::Style::default().fg(Theme::TEXT)
+    );
 }

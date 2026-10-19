@@ -488,7 +488,9 @@ fn table_row_lines(
                 ));
                 let text = wrapped[i].get(line_idx).map(String::as_str).unwrap_or("");
                 let align = aligns.get(i).cloned().unwrap_or(Alignment::Left);
-                let style = cell_styles.get(i).cloned().unwrap_or_default();
+                // 单元格默认用正文色，而不是 `Style::default()`（透传终端前景色）：
+                // 表格内容与正文属于同一层，颜色必须由主题决定。
+                let style = cell_styles.get(i).cloned().unwrap_or_else(Theme::body);
                 spans.push(Span::styled(pad_dw(text, width, align), style));
             }
             spans.push(Span::styled(" │", Theme::border()));
@@ -597,7 +599,7 @@ fn emit_flat_table(
     }
 
     if let Some(header) = header {
-        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let bold = Theme::body().add_modifier(Modifier::BOLD);
         emit_row(
             lines,
             header,
@@ -608,7 +610,10 @@ fn emit_flat_table(
         );
     }
     for row in rows {
-        emit_row(lines, row, body_styles, indent, avail, sep_w);
+        let row_styles: Vec<Style> = (0..row.len())
+            .map(|i| body_styles.get(i).cloned().unwrap_or_else(Theme::body))
+            .collect();
+        emit_row(lines, row, &row_styles, indent, avail, sep_w);
     }
 }
 
@@ -671,7 +676,7 @@ fn emit_grid_table(
     lines.push(border_line('┌', '┬', '┐'));
 
     if let Some(header) = header {
-        let header_styles = vec![Style::default().add_modifier(Modifier::BOLD); ncols];
+        let header_styles = vec![Theme::body().add_modifier(Modifier::BOLD); ncols];
         lines.extend(table_row_lines(
             header,
             &col_w,
@@ -1067,15 +1072,18 @@ impl Ctx {
         let mut s = if self.thinking {
             Theme::dim()
         } else {
-            Style::default()
+            // 正文显式取 `text` 槽位，而不是 `Style::default()`（透传终端前景色）：
+            // 主题是一个封闭的色板，正文颜色必须能被插件主题改到，也不该随
+            // 用户终端的前景色漂移——否则冷灰配色会在别人的终端里变成暖白。
+            Theme::body()
         };
         if self.code_span {
-            // thinking 里的行内代码不加蓝：反引号本身已经足以标示，再换成亮色
+            // thinking 里的行内代码不加色：反引号本身已经足以标示，再换成亮色
             // 会让零散提到的一个标识符比整段思考还抢眼。
             return if self.thinking {
                 s
             } else {
-                s.fg(Theme::code_fg_color())
+                s.fg(Theme::inline_code_color())
             };
         }
         if let Some(lvl) = self.heading {
@@ -1085,11 +1093,15 @@ impl Ctx {
                 match lvl {
                     1 => s.fg(Theme::claude_color()).add_modifier(Modifier::BOLD),
                     2 => s.fg(Theme::text_color()).add_modifier(Modifier::BOLD),
-                    _ => s.fg(Theme::inactive_color()).add_modifier(Modifier::BOLD),
+                    // h3–h6 是「小标题」，比正文弱一档而不是弱两档：
+                    // 旧实现用 `inactive`（#999）在暗底上与正文差距过大，
+                    // 深色终端里几乎读不出来。
+                    _ => s.fg(Theme::text_dim_color()).add_modifier(Modifier::BOLD),
                 }
             };
         } else if self.blockquote > 0 {
-            s = s.fg(Theme::inactive_color());
+            // 引用是「另一种正文」，不是「更弱的正文」——用次级正文而不是 dim。
+            s = s.fg(Theme::text_dim_color());
         }
         // 定义列表的术语加粗：终端里没有「术语 / 说明」的语义标记，
         // 两者只差一级缩进的话读起来就是两段普通文字。
@@ -1188,7 +1200,7 @@ impl Ctx {
     fn block_indent(&self) -> Vec<Span<'static>> {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for _ in 0..self.blockquote {
-            spans.push(Span::styled("│ ", Theme::dim()));
+            spans.push(Span::styled("│ ", Theme::border()));
         }
         let base = match self.list_stack.last() {
             Some(state) => state.leader,
@@ -1217,8 +1229,8 @@ impl Ctx {
         // 块引用竖线前缀。**续行必须重放**：竖线只画在首行的话，引用块一折行
         // 就和普通段落再也分不出来了。
         for _ in 0..self.blockquote {
-            head.push(Span::styled("│ ", Theme::dim()));
-            cont.push(Span::styled("│ ", Theme::dim()));
+            head.push(Span::styled("│ ", Theme::border()));
+            cont.push(Span::styled("│ ", Theme::border()));
         }
 
         // 列表 leader(嵌套累积:每层 = 父层 leader + 父层 bullet 宽度 + 1 空格)
@@ -1232,7 +1244,7 @@ impl Ctx {
             }
             let bullet_w = display_width(&bullet);
             cont.push(Span::raw(" ".repeat(bullet_w)));
-            head.push(Span::styled(bullet, Theme::assistant_prefix()));
+            head.push(Span::styled(bullet, Theme::text_dim()));
         } else if let Some(state) = self.list_stack.last() {
             // list 内的纯段落(无 Item 包装的 loose 内容)按当前层 leader 缩进
             if state.leader > 0 {
@@ -1333,7 +1345,7 @@ impl Ctx {
         }
         if self.code_lang.is_empty() {
             if let Some(rows) = parse_timeline_rows(&self.code_buf) {
-                let body_styles = [Theme::code_body(), Style::default()];
+                let body_styles = [Theme::code_body(), Theme::body()];
                 let indent = self.block_indent();
                 emit_grid_table(
                     lines,
@@ -1642,16 +1654,29 @@ fn render_markdown_inner(
                     HeadingLevel::H2 => 2,
                     _ => 3,
                 });
-                let prefix = match level {
-                    HeadingLevel::H1 => "█ ",
-                    HeadingLevel::H2 => "▌ ",
+                let (prefix, prefix_style) = match level {
+                    HeadingLevel::H1 => ("█ ", Theme::assistant_prefix()),
+                    HeadingLevel::H2 => (
+                        "▌ ",
+                        Style::default()
+                            .fg(Theme::text_color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     // h3–h6 共用一个前缀：终端没有字号可用，层级只能靠缩进表现。
                     // 逐级加宽前缀（`▎` × n）会让深层标题顶到第 6 列，比标题本身
                     // 还要显眼，深层小标题在长文档里本来就该最不显眼。
-                    _ => "▎ ",
+                    //
+                    // 前缀色与正文色一致：旧实现所有标题前缀都用品牌橙，于是
+                    // 「▎ 小标题」的橙色前缀比它自己的灰色正文还亮，层级读起来
+                    // 正好反了。
+                    _ => (
+                        "▎ ",
+                        Style::default()
+                            .fg(Theme::text_dim_color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 };
-                c.cur
-                    .push((prefix.to_string(), Theme::assistant_prefix(), false));
+                c.cur.push((prefix.to_string(), prefix_style, false));
             }
             Event::End(TagEnd::Heading(_)) => {
                 c.flush(lines);
@@ -1839,7 +1864,7 @@ fn render_markdown_inner(
                     // 在链接文字后追加灰色 URL 注释。**必须走 push_text**：它带着
                     // `in_table` 分支，直接 `cur.push` 会让表格里的链接把 URL 甩到
                     // 表格外面（`emit_table` 是 `&self`，不会顺手 flush 掉残留）。
-                    c.push_styled_text(&format!(" ({url})"), Theme::dim());
+                    c.push_styled_text(&format!(" ({url})"), Theme::muted());
                 }
             }
 
@@ -1870,7 +1895,7 @@ fn render_markdown_inner(
                 // 行内代码：用 ` 包裹显示。与链接 URL 同理，必须走 `push_styled_text`
                 // 才能落进表格单元格——旧实现直接 `cur.push`，于是表格里的
                 // `常量名` 被留下在 cur 里，等表格结束后和下一段粘成一行。
-                let style = Style::default().fg(Theme::code_fg_color());
+                let style = Theme::inline_code();
                 c.push_styled_text(&format!("`{text}`"), style);
             }
 
@@ -1945,7 +1970,7 @@ fn render_markdown_inner(
                 c.ensure_blank(lines);
                 lines.push(Line::from(Span::styled(
                     "─".repeat(max_width.min(60)),
-                    Theme::dim(),
+                    Theme::border(),
                 )));
                 c.pending_blank = true;
             }
@@ -2011,7 +2036,7 @@ fn render_unclosed_fence(lines: &mut Vec<Line<'static>>, tail: &str, max_width: 
         for wrapped in wrap_dw(raw, max_width.saturating_sub(4).max(1)) {
             lines.push(Line::from(Span::styled(
                 format!("  {wrapped}"),
-                Theme::dim(),
+                Theme::text_dim(),
             )));
         }
     }
@@ -2085,7 +2110,8 @@ mod tests {
         assert_eq!(first_row.spans[1].style, Theme::border());
         assert_eq!(first_row.spans[2].style, Theme::code_body());
         assert_eq!(first_row.spans[3].style, Theme::border());
-        assert_eq!(first_row.spans[4].style, Style::default());
+        // 第二列是普通正文，走 `Theme::body()` 而不是透传终端前景色
+        assert_eq!(first_row.spans[4].style, Theme::body());
         assert_eq!(first_row.spans.last().unwrap().style, Theme::border());
     }
 
@@ -2741,7 +2767,8 @@ mod tests {
         let body = &lines[3];
         assert_eq!(body.spans[0].style, Style::default());
         assert_eq!(body.spans[1].style, Theme::border());
-        assert_eq!(body.spans[2].style, Style::default());
+        // 单元格是正文层，颜色由主题决定，不随终端前景色漂移
+        assert_eq!(body.spans[2].style, Theme::body());
         assert_eq!(body.spans.last().unwrap().style, Theme::border());
     }
 
