@@ -259,7 +259,7 @@ help:
     - `/agents` — List available subagent types (built-in + custom *.md definitions)
     - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/shells [id]` — Open the background shell panel to watch live output of Bash tasks started with run_in_background; pass an id (e.g. bash_1) to jump directly to it
-    - `/mouse` — Toggle mouse capture: on, the wheel scrolls the content area (drag-select needs Option); off, selection is handled natively by the terminal
+    - `/mouse` — Toggle mouse capture: on, the wheel scrolls the content area and drag-select copies automatically; off, selection is handled natively by the terminal
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
@@ -302,7 +302,8 @@ help:
     - `Shift+↑` — Enter the content area (running sub-agents first, then todos, background shells, chat); `Esc` walks back to the composer
     - `PageUp` / `PageDown` — Page through the current conversation
     - `Mouse wheel` — Scroll the content area (the thin scrollbar on the right shows the position); `/mouse` toggles mouse capture
-    - `Option+drag` — Select text while mouse capture is on (plain drag works when it is off)
+    - `Drag` — Select text in the content area; releasing copies it to the system clipboard. Double-click selects a word (a whole path or URL)
+    - `Esc` — Clear the current selection (any key also clears it)
     - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
     - `Command+Click` / `Ctrl+Click` — Open local file paths or web links in responses
     - `/` — Command completion (Tab to confirm, Esc to cancel)
@@ -799,10 +800,14 @@ mode:
   unknown: "Unknown mode '{args}'. Options: auto / plan / bypass"
 
 mouse:
-  desc: "Toggle mouse capture: on, the wheel scrolls the conversation (drag-select needs Option); off, the terminal handles the mouse natively"
-  on: "Mouse capture enabled: the wheel scrolls the content area; hold Option to drag-select text. Run /mouse again to turn it off."
+  desc: "Toggle mouse capture: on, the wheel scrolls the conversation and drag-select copies automatically; off, the terminal handles the mouse natively"
+  on: "Mouse capture enabled: the wheel scrolls the content area, and dragging selects text that copies on release (double-click selects a word). Run /mouse again to turn it off."
   off: "Mouse capture disabled: native terminal drag-select is back (no Option needed), but the wheel no longer scrolls the content area on macOS Terminal.app."
   headless_unsupported: "[headless mode has no mouse interaction; /mouse has no effect]"
+
+selection:
+  copied: "Copied {chars} characters"
+  copy_failed: "Copy failed: {error}"
 
 auto:
   mode_notice: "Auto mode is active: most actions no longer prompt. A local rule layer plus a model classifier decide before an action runs, and anything the gate is unsure about still prompts you. Dangerous actions are blocked outright and stay blocked even when the classifier is off. Press Shift+Tab to reach plan / bypass."

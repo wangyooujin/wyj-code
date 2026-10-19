@@ -72,3 +72,19 @@ fn frame_cells(f: impl FnOnce(&mut Frame), width: u16, height: u16) -> Vec<Strin
         })
         .collect::<Vec<_>>()
 }
+
+/// 与 [`render_to_text`] 同一帧，但保留每个 cell 的样式。
+///
+/// 选区、hover 高亮这类「只改样式不改字符」的行为没法用文本断言，只能看色值。
+pub(crate) fn frame_cells_with_styles(
+    f: impl FnOnce(&mut Frame),
+    width: u16,
+    height: u16,
+) -> Vec<Vec<ratatui::buffer::Cell>> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("TestBackend init");
+    terminal.draw(f).expect("draw should not panic");
+    let buf = terminal.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].clone()).collect())
+        .collect()
+}
