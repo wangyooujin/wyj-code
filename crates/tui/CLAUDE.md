@@ -1,5 +1,22 @@
 # crates/tui
 
+## 模块地图（2026-10-19 拆分）
+
+| 文件 | 承载 | 说明 |
+|---|---|---|
+| `app.rs`（22330） | 状态定义 + `impl AppState` 主体 + `tui_main` 主循环 | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
+| `app/navigation.rs`（584） | 选区、滚动、焦点、输入历史召回 | 动线而非数据：只读 `self`，不碰 IO |
+| `app/panels.rs`（650） | Todo / 子 Agent / 后台 Shell 面板状态与导航 | 三者共享同一条不变式：面板列出的东西必须和后台真实存活的��致 |
+| `render.rs`（7771） | 聊天区、输入框、状态栏、滚动条、排版助手 | 助手被 dialogs 依赖，留在父模块 |
+| `render/dialogs.rs`（3002） | 全部对话框与浮层 | 纯绘制，彼此不共享可变状态 |
+
+**拆分的边界规则**：子模块是父模块的子级，因此能访问私有字段；Rust 允许同一 crate 内把 inherent impl 拆到多个模块。被父模块调用的方法提升为 `pub(super)`，其余保持私有。**拆分是纯搬移，不改任何逻辑**——编译器会抓出所有漏改，任何需要"顺手调一下"的地方都说明切错了边界。
+
+**两个必须跟着改的清单**（漏了就是静默失去覆盖）：
+
+1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。
+2. 源码文本扫描类测试用 `include_str!` 定位函数。**判定函数范围必须按花括号配平**，不要用「下一个顶格 `fn ` / `/// `」这类行前缀启发式——函数体内的语句没有顶格 `fn `，那个启发式会一路扫到文件末尾。`draw_status_never_measures_width_in_chars` 曾因此把后续函数的代码当成被检验函数的正文。
+
 ## 配色：全部走 `Theme` 槽位，`theme.rs` 是唯一允许定义颜色的文件
 
 **槽位按「用途」命名，不按颜色命名。** 同一个青色同时出现在 `@file` 引用、System 标记、排队提示、补全选中底色四处，它们是四种语义：亮色主题下输入提示可能要变亮、System 标记可能要变深，留一个 `cyan` 槽位就只能四处一起变。历史上 `render.rs` 里散着 70+ 处 `Color::Cyan`，插件换肤只换得动一半——这不是主题写得不好，是**根本没有主题**，那些字面量谁也管不着。
@@ -13,7 +30,7 @@
 
 三条硬规则，**新增颜色前先读**：
 
-1. **生产代码里不许出现裸 `Color::`**（含 `Color::Reset` / `Color::Indexed`）。一律换成 `Theme::xxx()` 或 `Theme::xxx_color()`。唯一例外是欢迎页 logo 的渐变插值，它走 `Theme::rgb_components_or` / `Theme::rgb_from_components`。钉子：`theme_tests::no_hardcoded_colors_outside_theme`（扫描 `render.rs` / `markdown.rs` / `welcome.rs` / `hyperlink.rs` / `input.rs` / `app.rs` 的生产区，跳过 `#[cfg(test)] mod` 与注释行）。这条能落地是因为它检查**源码文本**而非运行时行为——真想写别的颜色，作者得先来改这条规则，那一刻就已经是有意识的决定。
+1. **生产代码里不许出现裸 `Color::`**（含 `Color::Reset` / `Color::Indexed`）。一律换成 `Theme::xxx()` 或 `Theme::xxx_color()`。唯一例外是欢迎页 logo 的渐变插值，它走 `Theme::rgb_components_or` / `Theme::rgb_from_components`。钉子：`theme_tests::no_hardcoded_colors_outside_theme`（扫描 `render.rs` / `render/dialogs.rs` / `markdown.rs` / `welcome.rs` / `hyperlink.rs` / `input.rs` / `app.rs` 的生产区，跳过 `#[cfg(test)] mod` 与注释行）。这条能落地是因为它检查**源码文本**而非运行时行为——真想写别的颜色，作者得先来改这条规则，那一刻就已经是有意识的决定。
 2. **新增槽位必须同时接三处**：`ThemePalette` 字段 + `Default` + `from_json` 的 match 分支 + getter/Style 方法。`from_json` 对未知键是**静默忽略**的（插件主题不能因为拼错一个键就整份作废），漏接的代价是"主题半截生效且无任何报错"。钉子：`theme_tests::every_palette_slot_is_wired_to_a_json_key`（每个槽位一个互不相同的 RGB，逐字段验接上了）。
 3. **颜色断言断槽位，不断具体值**。`assert_eq!(style, Theme::success())` 而不是 `assert_eq!(style, Style::default().fg(Color::Green))`——后者会在主题换色时集体变红，且挡不住"两处用了同一个绿的近似色"。真要钉具体色值时，钉在 `theme.rs` 的常量表上。
 
