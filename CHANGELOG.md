@@ -10,6 +10,162 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.12] - 2026-10-19
+
+### 凭据读得到、hooks 无门控、Agent 装配有两份
+
+本版以**安全边界**为主，附带一次启动性能改造、一次装配收敛，以及 TUI 三刀结构
+拆分。所有安全条目都经代码取证，逐条带回归测试——多数不是「模型行为不对」，
+而是**框架默认值给了不该给的权限**。
+
+### ① Read 工具零路径校验，私钥会经工具结果落进会话记录
+
+`Read` 此前不做任何路径校验、且在 Auto 下默认免确认：模型一次「读一下
+`~/.ssh/id_rsa`」就能把私钥原文写进 `tool_result`，再随会话、checkpoint、
+trace 一路落盘。新增 `permission::check_read_target` 挡住 `~/.ssh`、`~/.aws`、
+`~/.kube`、`~/.docker`、`.npmrc`、`.netrc`、任意 `id_*` 私钥与
+`.pem`/`.key`/`.p12`/`.pfx`。
+
+读写共用一张受保护路径表（`path_has_protected_component`），Write 侧补齐
+**目录级**目标——只按文件名匹配 `id_rsa` 会漏掉 `~/.ssh/mykey` 这类任意命名的
+私钥。
+
+### ② hooks / verify.command 随 git clone 落地，是与 mcp.toml 同级的 RCE 面
+
+`<git-root>/.wyj-code/settings.json` 随 `git clone` 落到用户机器上，其中
+`hooks.*.command` 与 `verify.command` 都被 `sh -c` 执行——这条面此前完全没有
+门控（`store/CLAUDE.md` 早已把它记为已知缺口）。新增 `core::hooks_trust`：
+指纹只覆盖这两个键，批准记录落**仓库外**的 `projects/<key>/hooks_trust.json`，
+CLI 入口 `trust-hooks` 并入 `trust`。顺带修掉 hooks 超时不杀进程、输出无上限。
+
+### ③ MCP 工具的 needs_permission 未实现，落到默认 false
+
+MCP 侧没实现 `needs_permission`，于是取 trait 默认值 `false`——Auto 模式下模型
+可以**无确认**调用任意 server 的写操作。现在只信任 server 显式声明的
+`readOnlyHint == Some(true)`，未声明一律按有副作用处理。
+
+### ④ WebFetch 无 scheme/host 校验、无重定向管控、响应体无上限
+
+补 scheme/host 校验、内网与环回与云元数据地址拒绝、**逐跳重校验**（重定向
+目标同样要过一遍）、2MB 流式截断（超限中断下载而不是先收下再截）。
+
+### ⑤ secret 脱敏与 auto_rules 的绕过补漏
+
+脱敏补 AWS `AKIA` / `ghp_` / `xoxb-` / JWT / PEM 块 / 连接串密码，并加前缀预筛
+——挂点是几 MB 的落盘 JSON，三条正则各扫一遍全文不便宜。
+
+`auto_rules` 里 `curl x | /bin/sh`、`git push -uf`、`doas`/`runas` 曾是**死配置**
+（needle 恰好落在被排除的扫描范围里）。管道判定从子串表改为按 token 切分。
+
+### ⑥ 长会话的资源与渲染开销
+
+- ESC 中断走 `future.abort()` 时 Bash 子进程组不杀，`cargo test` 的子孙继续跑满
+  CPU：补 `ProcessGroupGuard`
+- `BashSessionManager.jobs` 只增不减，每个常驻 2MB 缓冲：保留最近 8 个已退出
+  任务的输出，元数据不淘汰
+- `schedule run` 从不检查「上一次还在跑」，`*/5` 任务会叠 4 个完整 agent 进程：
+  补 `filelock::try_acquire` 防重入 + 30 分钟执行超时
+- `SessionStore::list` 为取 10 个标量字段解析每份完整 transcript：改走
+  `.meta.json` 旁路，缺 meta 时回退解析保证老会话可见
+- `ContextAudit` 每工具轮最多重算 10 次全历史 + 30 次 schema 序列化：system
+  分段估算、工具 schema 按名缓存（与 `agent.rs` 共用同一份口径）
+- checkpoint 在干净工作树上复用上一份 git 快照，省掉 `add -A`/`write-tree`/
+  `commit-tree`；未配 persist cap 时不再无条件深拷贝整段历史
+- context_edit 白名单只有 5 个工具，Agent/MCP 结果永不清理，导致这类会话永远
+  `elided == 0`、被迫退到有损摘要：补齐并支持 Parts 形态只清文本段
+- 子 Agent 详情面板每帧深拷贝整个 trace（上限 256KiB）并对全部行跑 `line_count`：
+  改 `Arc` 共享 + 与聊天区共用窗口化渲染
+- hyperlink linkify 每帧几十次同步 stat 与 O(links×cells) 双循环：加路径存在性
+  缓存与二分定位
+
+顺带修两个既有缺陷：`detect_system_locale` 违反 POSIX 优先级（中文机器上必红）；
+受保护路径的 `doas`/`runas` needle 从未生效。
+
+### ⑦ Agent 装配收敛到单一入口，`/model` 不再静默降级
+
+首建与 `/model` 重建此前是两份各自独立的装配链，各自几十处 `with_xxx` 调用。
+漏掉任何一项都**不是编译错误、也不是测试失败**，而是「按 /model 之后静默降级」
+——代码里已经因此留下过两处现场注记（`with_verify` / `with_skills` 各自记录过
+一次真实漏项）。
+
+新增 `crates/cli/src/assembly.rs`：`build_tool_registry`（两条路径共用的工具
+注册表构造）、`SharedAgentConfig::apply`（persist cap / context editing /
+verify / store / capability cache）、`AgentCoreConfig::apply`（system / skills /
+预算 / 路由 / thinking）、`attach_tools`（挂载 + lazy schema 折叠——lazy 工具
+名单此前两侧各写一份，切换模型后模型看到的工具集合会变）。
+
+顺带修掉一个至今仍在的真实分歧：`SubAgentTool` 的 `with_max_depth` 只挂在首建
+侧，重建侧漏掉——**按一次 /model，子 Agent 嵌套深度静默退回默认值**，全程无
+任何报错。回归测试 `assembly_registry_is_the_single_source_for_both_paths` 钉住
+「共用」这件事本身：任何一侧绕过 `build_tool_registry` 手写注册表，测试立刻
+失败。
+
+### ⑧ 启动期全量磁盘 IO 移到后台线程
+
+`disk_usage::scan` 递归统计 `~/.wyj-code` 下 7 棵子树、CAS gc 遍历整个 blob
+池，两者都是同步全量 IO，且都发生在**终端已被接管、第一帧还没画出来**的时刻
+——`~/.wyj-code` 到 1-5GB 时用户看到的是一段纯黑屏。两者都不参与任何启动
+决策（前者只 warn，后者只是回收），因此合并到一个后台线程顺序执行：先 gc
+（它会删文件）再统计占用，让数字反映回收后的真实值。
+
+随之暴露并修掉一个原本理论化的窗口：gc 的候选名单是**扫描那一刻**的快照，
+而它删除前不复核 ref_count。原来 gc 跑在启动路径上、此时还没有任何 intern 在
+跑，所以碰不上；改成后台线程后，「扫描 → 删除」之间就可能有一次 intern 把某个
+blob 的引用数从 0 抬回 1，删掉它会让 restore 静默退化到 inline。现在删除前取
+同一把 per-hash 锁并重新读 meta 复核。回归测试
+`gc_never_deletes_a_blob_that_gained_a_reference` 用真实并发复现该窗口并钉住
+不变式：meta 说 ref_count > 0 就必须拿得到实体。
+
+### ⑨ TUI 三刀结构拆分，以及一个被实测推翻的性能假设
+
+`render.rs` 10563 行、`app.rs` 23327 行——改一处要重编整个文件，且两者的回归
+钉子互相看不见。
+
+- `render/dialogs.rs`（约 3000 行）：抽出权限、信任、Plan 批准、会话选择、
+  设置、记忆、演化、MCP、Skills、Plugins、Agents、Extensions、Profile、
+  Schedule 等全部绘制函数。父模块用一行 `use dialogs::*` 保持 `draw()` 分发
+  点逐字不变
+- `app/navigation.rs`（584 行）：应用内文本选择、聊天区与详情面板滚动、会话
+  首尾跳转、输入历史召回、附件/粘贴块清理——都是「只读 self、不碰 IO」的
+  动线逻辑
+- `app/panels.rs`（650 行）：Todo / 子 Agent / 后台 Shell 三类侧边面板的状态
+  与导航。放一起是因为它们共享同一条不变式：**面板列出的东西必须和后台真实
+  存活的东西一致**，`poll_shells` / `reconcile_*_selection` 就是这条不变式的
+  执行点
+
+拆分顺带暴露并修掉两处既有的脆弱测试：`draw_status_never_measures_width_in_chars`
+用「下一个顶格 fn / ///」判定函数结束（函数体内的语句没有顶格 `fn `，那个启发式
+会一路扫到文件末尾，把后面其它函数的代码当成 `draw_status` 的内容）——改为一对
+花括号配平；`theme_tests::production_source` 有一个待扫描文件白名单，漏登记
+`dialogs.rs` 就会让这近 3000 行绘制代码脱离「生产代码不许出现裸 `Color::`」的
+守卫，而它恰恰是当初要被拆出来的那部分。
+
+**一个被实测推翻的假设**：原计划把「TUI 每帧重建全部历史」列为剩余最大的一项，
+判断依据是代码走查得出的「每帧数百毫秒、长会话必然卡死」。新增两个 `#[ignore]`
+基准（墙钟在共享 CI runner 上抖动过大，只供本地跑），2026-10-19 在 Apple
+Silicon / 2000 条消息 / 60 列实测：
+
+|                | release            | debug             |
+| -------------- | ------------------ | ----------------- |
+| 稳态(缓存命中) | ~0.2–0.4 ms/帧     | ~1.5–3.0 ms/帧    |
+| resize(全失效) | ~0.6–1.1 ms/帧     | ~2.8 ms/帧        |
+
+20fps 折算：release 稳态不到 2% CPU，resize 约 2%，debug 下 resize 约 6%。
+**结论与直觉相反，也与走查结论相反**：`logical_line_height` 的高度测量与行构建
+同量级甚至更贵（debug 下 2.35ms vs 0.58ms，它是 `line.width()` 的逐 span
+Unicode 宽度求和，跑在全部历史上），而两者合计在 release 下不到 2% CPU，达不到
+「卡死」的程度。因此 P1-1（视口窗口化 + 行区间索引）**降级**——它要重写
+`draw_chat` 的行布局，换来的收益不到 2% CPU，风险收益比很差。本版只落基准与
+结论，不做该重构；基准本身也是防回归的价值：日后任何人把这条路径改慢，数字
+会说话。
+
+测试：`cargo test --workspace` **1673 项通过 / 0 失败**（1641 → 1673），
+`cargo fmt --check` 通过，clippy 零新增告警。新增钉子
+`gc_never_deletes_a_blob_that_gained_a_reference`、
+`assembly_registry_is_the_single_source_for_both_paths`，以及凭据路径、
+hooks 信任、MCP readOnlyHint、WebFetch SSRF/体积上限、进程组回收等一批安全
+回归测试。
+
 ## [0.3.11] - 2026-10-19
 
 ### macOS Terminal.app 里滚轮完全没反应、Shift+↑ 进不去子 Agent
