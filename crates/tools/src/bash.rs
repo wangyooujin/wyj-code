@@ -10,8 +10,6 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolCallMeta, ToolContext, ToolOutputChunk, ToolResult};
 
-use crate::textutil::truncate_head_tail;
-
 const MAX_OUTPUT: usize = 30_000; // 输出截断阈值（字符）
 const TIMEOUT_SECS: u64 = 120;
 
@@ -369,20 +367,22 @@ impl BashTool {
             MAX_OUTPUT.saturating_sub(stderr.len()).max(MAX_OUTPUT / 2)
         };
         if !stdout.is_empty() {
-            result.push_str(&truncate_head_tail(
+            result.push_str(&crate::spill::spill_truncated(
                 &stdout,
                 stdout_budget * 6 / 10,
                 stdout_budget * 4 / 10,
+                "bash-stdout",
             ));
         }
         if !stderr.is_empty() {
             if !result.is_empty() {
                 result.push_str("\n--- stderr ---\n");
             }
-            result.push_str(&truncate_head_tail(
+            result.push_str(&crate::spill::spill_truncated(
                 &stderr,
                 stderr_budget * 6 / 10,
                 stderr_budget * 4 / 10,
+                "bash-stderr",
             ));
         }
         if result.is_empty() {

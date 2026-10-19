@@ -271,6 +271,24 @@ pub fn estimate_text_tokens(text: &str) -> usize {
     (cjk * 3 / 2) + (other / 3)
 }
 
+/// 浮点版文本 token 估算，供**按增量累加**的调用方使用（如 TUI 的流式速率）。
+///
+/// 不能拿 [`estimate_text_tokens`] 逐 delta 累加：那条路径按片段做整数除法，
+/// 单个 ASCII 字符是 `1 / 3 = 0`，一帧几十个小 delta 加完仍是 0——整段消息的
+/// 粗估没有这个问题（片段足够长），所以整数版保持原语义不动。
+pub fn estimate_text_tokens_f64(text: &str) -> f64 {
+    let mut cjk = 0usize;
+    let mut other = 0usize;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk as f64 * 1.5 + other as f64 / 3.0
+}
+
 /// 判断字符是否为 CJK 统一表意文字或常见全角字符（中日韩）。
 fn is_cjk(ch: char) -> bool {
     matches!(ch as u32,
@@ -288,11 +306,37 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
+/// 压缩调用可复用的主对话前缀。
+///
+/// **为什么值得单独做一个结构体**：压缩请求若从零构造（`COMPACT_SYSTEM` +
+/// 一条塞满整段历史的 user 消息），前缀与主对话毫无关系，provider 的前缀缓存
+/// 一次都命中不了——而压缩恰恰发生在历史最长、最贵的那一刻。DeepSeek 的
+/// 缓存命中价是 miss 的 1/50，Anthropic 是 1/10，一次 180K 的压缩差价就是
+/// 数量级的。
+///
+/// 复用条件是「压缩请求的前缀与主对话**逐字节相同**」：
+///   * `system` 必须是本轮真实发出去的 stable 段（记忆快照 / 规约链都在里面，
+///     换成 `COMPACT_SYSTEM` 就从第一个 token 起分叉）；
+///   * `tools` 必须是本轮真实发出去的 schema 列表（工具段在缓存前缀里排在
+///     历史**之前**，少一个工具就整段失效）。
+///
+/// 消息前缀由 [`compact_session`] 自己从 `session.messages[..keep_from]` 切，
+/// 不放进本结构体——否则调用方要同时持有 `&session.messages` 和 `&mut session`。
+#[derive(Clone, Copy)]
+pub struct CompactPrefix<'a> {
+    pub system: wyj_api::SystemPrompt<'a>,
+    pub tools: &'a [ToolDefinition],
+}
+
 /// 压缩会话：调用 LLM 生成摘要，替换旧消息，保留最近若干条。
+///
+/// `prefix` 为 `None` 时退回「独立请求」形态（`COMPACT_SYSTEM` + 文本化历史），
+/// 行为与 v0.3.8 完全一致；给出 `Some` 时走前缀复用路径。
 pub async fn compact_session(
     session: &mut Session,
     provider: &dyn Provider,
     context_window: u32,
+    prefix: Option<CompactPrefix<'_>>,
 ) -> Result<CompactResult> {
     let total = session.messages.len();
     if total < COMPACT_MIN_MESSAGES {
@@ -317,31 +361,61 @@ pub async fn compact_session(
         )
     };
     let before_tokens = estimate_tokens(&session.messages);
-
-    let conv_text = messages_to_text(to_compact);
-    // 这里就把长度取出来：`to_compact` 对 `session.messages` 的不可变借用必须
-    // 在下面 `session.add_usage(...)`（可变借用）之前结束，否则借用检查器
-    // 判定冲突。取完长度后 `to_compact` 不再被使用，NLL 即刻结束该借用。
     let messages_removed = to_compact.len();
     let messages_kept = to_keep.len();
-    let prompt = crate::prompts::compact_prompt(&conv_text);
-
-    let req = vec![Message {
-        role: Role::User,
-        content: vec![ContentBlock::Text { text: prompt }],
-    }];
 
     // 摘要 token 上限：取上下文窗口的 1/10，但不超过 16000
     let summary_max_tokens = (context_window / 10).min(16_000);
 
-    let result = provider
-        .complete(
-            &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
-            &req,
-            &[],
-            &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
-        )
-        .await?;
+    let result = match prefix {
+        Some(prefix) => {
+            // ── 前缀复用路径 ──
+            // 请求 = 「主对话前缀」+ 尾部一条指令。前缀逐字节等于本轮真实请求
+            // 的开头，因此 provider 的前缀缓存能命中到指令之前；指令本身按
+            // 全价计，但它只有几百 token。
+            //
+            // 两个必须守住的点：
+            //   1. `messages` 直接用 `session.messages[..keep_from]` 的切片，
+            //      不重新序列化、不做任何改写——任何一处改写都会让前缀失配。
+            //   2. 尾部指令走一条**新的 user 消息**，不合并进最后一条已有消息。
+            //      合并会改写前缀的最后一个元素，缓存命中点随之后退到它之前。
+            //
+            // `reset_entire_session` 时前缀为空（`keep_from == 0`），复用没有
+            // 意义但也没有害处：请求退化成「一条 user 指令」，与旧路径等价。
+            let mut req: Vec<Message> = to_compact.to_vec();
+            req.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: crate::prompts::compact_instructions().to_string(),
+                }],
+            });
+            provider
+                .complete(
+                    &prefix.system,
+                    &req,
+                    prefix.tools,
+                    &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                )
+                .await?
+        }
+        None => {
+            // ── 独立请求路径（无前缀可复用） ──
+            let conv_text = messages_to_text(to_compact);
+            let prompt = crate::prompts::compact_prompt(&conv_text);
+            let req = vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: prompt }],
+            }];
+            provider
+                .complete(
+                    &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
+                    &req,
+                    &[],
+                    &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                )
+                .await?
+        }
+    };
 
     // 压缩本身是一次真实的 LLM 往返，必须计入用量。旧实现直接丢弃
     // `CompletionResult` 的 usage 字段（也不累加 `api_calls`），导致
@@ -420,12 +494,17 @@ pub async fn compact_session(
 ///
 /// 故意不引入指数退避或 sleep——compact 是 LLM round-trip,本来就要等,
 /// 加 sleep 只会让失败时回退更慢。
+///
+/// `prefix` 透传给每一次 pass。**只在第一次 pass 有价值**（第二次起历史已被
+/// 上一次的摘要替换，前缀自然不再与主对话一致），但仍然照传：多传一个
+/// 已经失配的前缀不会让缓存变差，只会回到「全 miss」这个基线。
 pub async fn compact_session_until_fit(
     session: &mut Session,
     provider: &dyn Provider,
     context_window: u32,
     estimated: u32,
     threshold: u32,
+    prefix: Option<CompactPrefix<'_>>,
 ) -> CompactUntilFitOutcome {
     const MAX_COMPACT_PASSES: usize = 3;
     let mut last_result: Option<Result<CompactResult>> = None;
@@ -439,7 +518,7 @@ pub async fn compact_session_until_fit(
                 last_error: None,
             };
         }
-        match compact_session(session, provider, context_window).await {
+        match compact_session(session, provider, context_window, prefix).await {
             Ok(result) => {
                 last_result = Some(Ok(result));
             }
@@ -811,7 +890,7 @@ mod tests {
             });
         }
         let original_len = session.messages.len();
-        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000)
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
             .await
             .expect("tool-only turn should compact safely");
 
@@ -842,7 +921,7 @@ mod tests {
             });
         }
         let before = estimate_tokens(&session.messages);
-        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000)
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
             .await
             .expect("normal multi-turn session should compact");
         let after = estimate_tokens(&session.messages);
@@ -850,6 +929,138 @@ mod tests {
         assert_eq!(result.tokens_saved_estimate, before - after);
         assert!(result.messages_removed > 0);
         assert!(after < before);
+    }
+
+    /// 前缀复用路径：压缩请求的 system / tools / messages 必须**逐字节等于**
+    /// 主对话前缀，否则 provider 的前缀缓存一次都命中不了。
+    ///
+    /// 这条测试钉的是三个具体失败形态（都会静默退化成全价、不报错）：
+    ///   1. system 换回 `COMPACT_SYSTEM`（从第一个 token 起分叉）；
+    ///   2. tools 传空（工具段排在历史之前，少一个就整段失效）；
+    ///   3. messages 不是 `session.messages[..keep_from]` 而是重新文本化的历史。
+    #[tokio::test]
+    async fn compact_with_prefix_reuses_the_exact_main_conversation_prefix() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Capture {
+            system: String,
+            tools: Vec<String>,
+            messages: Vec<Message>,
+        }
+
+        struct CapturingProvider {
+            captured: Arc<Mutex<Capture>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for CapturingProvider {
+            async fn stream(
+                &self,
+                _system: &wyj_api::SystemPrompt<'_>,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::provider::EventStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+
+            async fn complete(
+                &self,
+                system: &wyj_api::SystemPrompt<'_>,
+                messages: &[Message],
+                tools: &[ToolDefinition],
+                _opts: &wyj_api::provider::RequestOptions,
+            ) -> Result<wyj_api::types::CompletionResult> {
+                let mut guard = self.captured.lock().unwrap();
+                guard.system = system.combined();
+                guard.tools = tools.iter().map(|t| t.name.clone()).collect();
+                guard.messages = messages.to_vec();
+                Ok(wyj_api::types::CompletionResult {
+                    content: vec![ContentBlock::Text {
+                        text: "## Task & Intent\n摘要".to_string(),
+                    }],
+                    stop_reason: wyj_api::types::StopReason::EndTurn,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                })
+            }
+        }
+
+        let mut session = Session::new();
+        // 每条 20K 字符 ≈ 6.7K token，6 轮远超 keep 预算（200K 窗口下 25K），
+        // 这样 `keep_from > 0`，才真正走到「前缀复用」而不是整体重置。
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(20_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let original = session.messages.clone();
+        let keep_from = safe_keep_from_budget(&session.messages, compact_keep_budget(200_000))
+            .expect("应有安全边界");
+        assert!(keep_from > 0, "本用例必须落在前缀复用路径，而非整体重置");
+        let expected_prefix = original[..keep_from].to_vec();
+
+        let captured = Arc::new(Mutex::new(Capture::default()));
+        let provider = CapturingProvider {
+            captured: captured.clone(),
+        };
+        let tools = vec![ToolDefinition {
+            name: "Read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({"path": {"type": "string"}}),
+            native: None,
+        }];
+        let system_text = "main system prompt with memory snapshot";
+        compact_session(
+            &mut session,
+            &provider,
+            200_000,
+            Some(CompactPrefix {
+                system: wyj_api::SystemPrompt::stable_only(system_text),
+                tools: &tools,
+            }),
+        )
+        .await
+        .expect("前缀复用路径应成功");
+
+        let guard = captured.lock().unwrap();
+        assert_eq!(guard.system, system_text, "system 必须是主对话的 stable 段");
+        assert_eq!(guard.tools, vec!["Read".to_string()], "tools 必须原样传递");
+        assert_eq!(
+            guard.messages.len(),
+            expected_prefix.len() + 1,
+            "请求 = 主对话前缀 + 一条指令，不能把历史重新文本化"
+        );
+        // `Message` 没有 `PartialEq`，逐条比 role + 文本 + 块数即可覆盖
+        // 「是否被重新文本化 / 是否被改写」这两个真实失败形态。
+        for (index, (got, want)) in guard.messages[..expected_prefix.len()]
+            .iter()
+            .zip(expected_prefix.iter())
+            .enumerate()
+        {
+            assert_eq!(got.role, want.role, "第 {index} 条角色被改写");
+            assert_eq!(
+                got.content.len(),
+                want.content.len(),
+                "第 {index} 条块数被改写"
+            );
+            assert_eq!(got.text(), want.text(), "第 {index} 条正文被改写");
+        }
+        let tail = guard.messages.last().unwrap();
+        assert!(tail.text().contains("Summarize the conversation so far"));
+        assert!(
+            !tail.text().contains("Conversation:"),
+            "复用路径不得再把对话文本拼进指令（那等于发两遍历史）"
+        );
     }
 
     /// 朴素按固定条数截断会正好切在 assistant(tool_use) 之后、
@@ -915,6 +1126,7 @@ mod tests {
             200_000,
             estimated,
             threshold,
+            None,
         )
         .await;
         assert_eq!(outcome.passes, 0);
@@ -949,6 +1161,7 @@ mod tests {
             200_000,
             estimated,
             threshold,
+            None,
         )
         .await;
         // 必须循环过 compact——v0.2.19 之前『0 轮就裸发』的回归根因。
@@ -1016,6 +1229,7 @@ mod tests {
             200_000,
             estimated,
             threshold,
+            None,
         )
         .await;
         assert!(outcome.last_error.is_some(), "LLM 失败必须透传");
@@ -1039,6 +1253,7 @@ mod tests {
             200_000,
             estimated,
             threshold,
+            None,
         )
         .await;
         assert!(outcome.last_error.is_none(), "已无可压缩不是错误");
@@ -1127,7 +1342,7 @@ mod tests {
         // 回归背景：旧实现直接丢弃 `CompletionResult` 的 usage，也不累加
         // `api_calls`，`/cost` 与 WYJ_STATS_JSON 因此系统性低估真实花费。
         let mut session = multi_turn_session();
-        compact_session(&mut session, &UsageSummaryProvider, 200_000)
+        compact_session(&mut session, &UsageSummaryProvider, 200_000, None)
             .await
             .expect("normal multi-turn session should compact");
         assert_eq!(session.total_input_tokens, 1_234);
@@ -1147,6 +1362,7 @@ mod tests {
             &mut session,
             &StaticSummaryProvider,
             200_000,
+            None,
         ))
         .expect_err("只有 1 条消息时应报跳过");
         assert_eq!(

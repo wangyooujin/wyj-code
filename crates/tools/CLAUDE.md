@@ -6,6 +6,14 @@
 根目录 `CLAUDE.md` 只留跨 crate 的通则与索引，本目录的实现细节全部沉在这里。
 
 
+## 工具输出溢出（spill）
+
+`tools::spill`：超限输出**落盘**而不是直接丢弃中段。`spill_truncated(text, head, tail, label)` 在 `text.len() > head + tail` 时把全文写进 `<config_dir>/spill/<毫秒戳>-<label>-<hash8>.txt`（0600，写入前过 `wyj_core::redact_sensitive_text`），返回文本保留原 `[truncated N bytes]` 标记并把路径并进同一行——模型据此可以 `Read`/`Grep` 那个文件按需取回任意片段，而不是重跑命令（`cargo test` / `npm install` 重跑一次就是几分钟，还可能已产生副作用）。
+
+三条不变式：① **落盘失败绝不改变工具结果**——`write_spill` 返回 `None` 时退回纯截断（`truncate_head_tail` 的原样输出），不报错、不降级成空串；② **返回值不比截断更大**：路径并进原标记行，不额外增加行数；③ **不做内容去重**：文件名带时间戳，同一命令重跑两次落到不同文件，避免并发下"刚才那个文件"被另一个调用改写。目录内超过 7 天的文件在下次写入时顺手清掉（`SPILL_TTL_SECS`），避免 `spill/` 无限增长。
+
+接入点：`bash.rs`（stdout / stderr 各自独立落盘，预算仍是 `MAX_OUTPUT` 的 6:4 头尾）、`webfetch.rs`（`MAX_CONTENT = 50_000` 时按 7:3 落盘——网页正文的有效信息常常在中后段，只留开头会丢掉结论）。与 `core::context_edit` 分工不同：那边处理**历史里已经存在**的工具结果（事后 CAS 外部化 + `ContextRecall`），这边处理**刚刚产生**的输出（事前落盘 + 普通 `Read`）。
+
 ## Grep 工具的两级实现
 
 `tools::grep` 刻意做成**两级、对外行为一致**的搜索后端，测试里 `assert_both_ways` 对同一输入断言两条路径的输出一致：

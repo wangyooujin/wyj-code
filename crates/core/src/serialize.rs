@@ -206,6 +206,72 @@ pub fn truncate_messages(messages: &mut [Message], cfg: &PersistCapCfg) {
     }
 }
 
+/// 这批消息里是否有**任何**块会因 `cfg` 被改写。
+///
+/// 存在的唯一理由是让发送路径能「按需克隆」：`truncate_messages` 是原地改写，
+/// 而原地改写历史会永久破坏前缀缓存（见 `agent.rs` 发送路径的注释）。绝大多数
+/// 消息都不超限，每轮无脑 clone 整个历史是纯浪费；先用本函数探一次，命中才克隆。
+///
+/// 判据刻意**偏保守**（宁可多克隆一次也不漏判）：`ToolUse` / `Blocks` 走的是
+/// 估算式裁剪（`shrink_json_to_budget` 带 `SHRINK_SLACK`），这里只比序列化
+/// 长度与预算，会略微高估需要截断的比例——高估的代价是一次 clone，漏判的代价
+/// 是请求撞穿窗口。
+pub fn messages_need_truncation(messages: &[Message], cfg: &PersistCapCfg) -> bool {
+    if !is_persist_cap_active(cfg) {
+        return false;
+    }
+    messages.iter().any(|msg| {
+        msg.content
+            .iter()
+            .any(|block| block_exceeds_cap(block, cfg))
+    })
+}
+
+fn block_exceeds_cap(block: &ApiContentBlock, cfg: &PersistCapCfg) -> bool {
+    let text_over = |text: &str| -> bool {
+        (cfg.text_head_bytes > 0 || cfg.text_tail_bytes > 0)
+            && text.len() > cfg.text_head_bytes.saturating_add(cfg.text_tail_bytes)
+    };
+    let tool_over = |text: &str| -> bool {
+        (cfg.tool_result_head_bytes > 0 || cfg.tool_result_tail_bytes > 0)
+            && text.len()
+                > cfg
+                    .tool_result_head_bytes
+                    .saturating_add(cfg.tool_result_tail_bytes)
+    };
+    match block {
+        ApiContentBlock::ToolResult { content, .. } => match content {
+            ToolResultContent::Text(text) => tool_over(text),
+            ToolResultContent::Parts(parts) => parts.iter().any(|part| match part {
+                ToolResultPart::Text { text } => tool_over(text),
+                ToolResultPart::Image { .. } => false,
+            }),
+            ToolResultContent::Blocks(values) => {
+                if cfg.tool_result_head_bytes == 0 && cfg.tool_result_tail_bytes == 0 {
+                    return false;
+                }
+                let budget = cfg
+                    .tool_result_head_bytes
+                    .saturating_add(cfg.tool_result_tail_bytes);
+                serde_json::to_string(values)
+                    .map(|s| s.len() > budget)
+                    .unwrap_or(false)
+            }
+        },
+        ApiContentBlock::Text { text } => text_over(text),
+        // thinking / reasoning_details 永不截断（见 `truncate_content_block`）
+        ApiContentBlock::Thinking { .. }
+        | ApiContentBlock::RedactedThinking { .. }
+        | ApiContentBlock::Image { .. } => false,
+        ApiContentBlock::ToolUse { input, .. } => {
+            cfg.tool_use_input_bytes > 0
+                && serde_json::to_string(input)
+                    .map(|s| s.len() > cfg.tool_use_input_bytes)
+                    .unwrap_or(false)
+        }
+    }
+}
+
 fn is_persist_cap_active(cfg: &PersistCapCfg) -> bool {
     cfg.tool_result_head_bytes != 0
         || cfg.tool_result_tail_bytes != 0
@@ -580,6 +646,77 @@ mod tests {
         };
         assert_eq!(from_file, from_slice);
         assert!(from_file < 30_000);
+    }
+
+    /// `messages_need_truncation` 是发送路径「按需克隆」的闸门：漏判会让
+    /// 请求撞穿窗口，误判只是多克隆一次。这里双向钉住——超限必须报 true，
+    /// 未超限必须报 false（否则每轮都白克隆整个历史）。
+    #[test]
+    fn messages_need_truncation_detects_only_over_budget_blocks() {
+        let cfg = PersistCapCfg {
+            tool_result_head_bytes: 1_000,
+            tool_result_tail_bytes: 500,
+            thinking_bytes: 0,
+            reasoning_details_bytes: 0,
+            tool_use_input_bytes: 0,
+            text_head_bytes: 64,
+            text_tail_bytes: 32,
+        };
+        let small = vec![Message {
+            role: wyj_api::types::Role::User,
+            content: vec![
+                ApiContentBlock::Text {
+                    text: "短文本".to_string(),
+                },
+                ApiContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: ToolResultContent::text("短结果"),
+                    is_error: false,
+                },
+            ],
+        }];
+        assert!(
+            !messages_need_truncation(&small, &cfg),
+            "未超限时必须零拷贝"
+        );
+
+        let big_text = vec![Message {
+            role: wyj_api::types::Role::User,
+            content: vec![ApiContentBlock::Text {
+                text: "Y".repeat(30_000),
+            }],
+        }];
+        assert!(
+            messages_need_truncation(&big_text, &cfg),
+            "超限文本必须检出"
+        );
+
+        let big_tool = vec![Message {
+            role: wyj_api::types::Role::User,
+            content: vec![ApiContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: ToolResultContent::text("Z".repeat(30_000)),
+                is_error: false,
+            }],
+        }];
+        assert!(
+            messages_need_truncation(&big_tool, &cfg),
+            "超限工具结果必须检出"
+        );
+
+        // thinking 永不截断，所以无论多长都不能触发克隆。
+        let huge_thinking = vec![Message {
+            role: wyj_api::types::Role::Assistant,
+            content: vec![ApiContentBlock::Thinking {
+                thinking: "思".repeat(50_000),
+                signature: "sig".to_string(),
+                reasoning_details: None,
+            }],
+        }];
+        assert!(
+            !messages_need_truncation(&huge_thinking, &cfg),
+            "thinking 不参与截断，不能因它触发整段历史克隆"
+        );
     }
 
     #[test]
