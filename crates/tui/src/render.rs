@@ -2804,16 +2804,25 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
 
     // 末行留给固定的返回/滚动提示，不随正文滚动。
     let body_height = area.height.saturating_sub(1).max(1);
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    let total = para.line_count(area.width.max(1)).min(u16::MAX as usize) as u16;
-    let max_scroll = total.saturating_sub(body_height);
-    state.sub_agent_detail_max_scroll = max_scroll;
+    // 与聊天区同一套窗口化：`Paragraph::line_count` 会对**全部**行跑一遍
+    // `WordWrapper`，而 trace 最长 256KiB，面板开着时每帧都为看不见的部分付折行。
+    // 这里先用廉价的宽度检查算出每行高度，只有超宽行才真去折。
+    let heights: Vec<u16> = lines
+        .iter()
+        .map(|line| logical_line_height(line, area.width).min(u16::MAX as usize) as u16)
+        .collect();
+    let total_height: usize = heights.iter().map(|h| *h as usize).sum();
+    let max_scroll = total_height.saturating_sub(body_height as usize);
+    state.sub_agent_detail_max_scroll = max_scroll.min(u16::MAX as usize) as u16;
     let scroll_y = resolve_detail_scroll(
         &mut state.sub_agent_detail_scroll,
         &mut state.sub_agent_detail_follow_tail,
-        max_scroll,
+        state.sub_agent_detail_max_scroll,
     );
-    f.render_widget(para.scroll((scroll_y, 0)), area);
+    let (first, intra) = locate_scroll_start(&heights, scroll_y as usize);
+    let visible = visible_chat_lines(lines, &heights, first, intra + body_height as usize);
+    let para = Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false });
+    f.render_widget(para.scroll((intra.min(u16::MAX as usize) as u16, 0)), area);
     if state.show_scrollbar {
         // 末行留给固定提示，滚动条也只覆盖正文那一段，避免滑块长度把提示行算进去。
         draw_scrollbar(
@@ -2825,14 +2834,14 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
                 height: body_height,
             },
             scroll_y as usize,
-            max_scroll as usize,
+            state.sub_agent_detail_max_scroll as usize,
             body_height as usize,
         );
     }
 
     // 用户主动上滚后视口脱离实时尾部：正文下方还会持续堆新事件，用提示行说明
     // 「往下还有内容」以及如何回到跟随态，免得看起来像子 Agent 卡住不动了。
-    let detached = scroll_y < max_scroll;
+    let detached = scroll_y < state.sub_agent_detail_max_scroll;
     let hint = Paragraph::new(Line::from(Span::styled(
         if detached {
             wyj_i18n::tr("subagent.content_more_below")

@@ -72,7 +72,12 @@ impl Tool for ReadTool {
 
     async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let inp: Input = serde_json::from_value(input)?;
-        let path = resolve_path(ctx.cwd(), &inp.file_path);
+        // 凭据路径在解析阶段就拒绝：它们既不该进模型上下文，也不该随工具结果
+        // 落进会话文件（session / checkpoint / trace 三处都会持久化）。
+        let path = match wyj_core::check_read_target(ctx.cwd(), &inp.file_path) {
+            Ok(path) => path,
+            Err(reason) => return Ok(ToolResult::err(format!("安全检查失败：{}", reason.message))),
+        };
 
         if !path.exists() {
             return Ok(ToolResult::err(format!("文件不存在: {}", path.display())));
@@ -155,15 +160,6 @@ impl Tool for ReadTool {
     }
 }
 
-fn resolve_path(cwd: &std::path::Path, p: &str) -> std::path::PathBuf {
-    let pb = std::path::Path::new(p);
-    if pb.is_absolute() {
-        pb.to_path_buf()
-    } else {
-        cwd.join(pb)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +239,9 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.content.is_empty());
-        assert!(tracker.has_read(&path.to_string_lossy()));
+        // Read 现在记录的是 canonicalize 后的路径（与 `Write`/`Edit` 的
+        // `resolve_write_target` 同源），macOS 上 `/var/...` 会变成 `/private/var/...`。
+        let canonical = path.canonicalize().unwrap();
+        assert!(tracker.has_read(&canonical.to_string_lossy()));
     }
 }

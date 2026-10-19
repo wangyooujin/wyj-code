@@ -19,14 +19,16 @@ use std::io::{self, Write};
 use std::path::Path;
 use wyj_store::project_trust::{self, TrustStatus};
 
-/// `trust-mcp` / `trust-skills` / `trust` 的作用范围
+/// `trust-mcp` / `trust-skills` / `trust-hooks` / `trust` 的作用范围
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustScope {
     /// 只管 MCP server（`trust-mcp` 的历史行为，逐字保留）
     Mcp,
     /// 只管项目级 skill
     Skills,
-    /// 两者都管（`trust`）
+    /// 只管项目级 hooks / verify（`settings.json` 里的可执行命令）
+    Hooks,
+    /// 全部（`trust`）
     All,
 }
 
@@ -40,6 +42,9 @@ pub async fn run_with_scope(cwd: &Path, scope: TrustScope) -> Result<()> {
     }
     if matches!(scope, TrustScope::Skills | TrustScope::All) {
         run_skills(cwd)?;
+    }
+    if matches!(scope, TrustScope::Hooks | TrustScope::All) {
+        run_hooks(cwd)?;
     }
     Ok(())
 }
@@ -81,6 +86,40 @@ fn run_mcp(cwd: &Path) -> Result<()> {
                 println!("已批准，之后（含无人值守场景）会正常连接这些 server。");
             } else {
                 println!("已取消，这些 server 仍不会被连接。");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_hooks(cwd: &Path) -> Result<()> {
+    use wyj_core::hooks_trust::{self, ProjectHooksTrust};
+
+    match hooks_trust::project_trust_status(cwd) {
+        ProjectHooksTrust::NotDeclared => {
+            println!("当前项目没有声明 hooks / verify（.wyj-code/settings.json 为空），无需批准。");
+            Ok(())
+        }
+        ProjectHooksTrust::Trusted => {
+            println!("当前项目级 hooks / verify 已批准过，且内容未变化。");
+            Ok(())
+        }
+        ProjectHooksTrust::Pending => {
+            println!("以下项目级命令尚未批准，批准前会被静默跳过：");
+            println!("  来源: <git-root>/.wyj-code/settings.json 与 settings.local.json");
+            println!("  涉及: hooks.*.command（PreToolUse/PostToolUse/UserPromptSubmit/Stop）");
+            println!("        verify.command（每次 Edit/Write 后自动执行）");
+            println!("这些命令会以当前用户身份经 `sh -c` 执行，等同仓库作者在你的机器上运行。");
+            print!("批准以上命令？[y/N] ");
+            io::stdout().flush().ok();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            let answer = input.trim().to_lowercase();
+            if answer == "y" || answer == "yes" {
+                hooks_trust::approve(cwd)?;
+                println!("已批准，之后（含无人值守场景）这些 hooks / verify 会正常执行。");
+            } else {
+                println!("已取消，这些命令仍不会执行。");
             }
             Ok(())
         }

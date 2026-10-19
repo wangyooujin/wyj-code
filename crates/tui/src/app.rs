@@ -9587,7 +9587,7 @@ pub struct AppState {
     /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
     pub sub_agents: BTreeMap<u64, SubAgentUiState>,
     /// 当前会话的子 Agent trace 事件缓存，按子 Agent id 索引。
-    pub sub_agent_trace_cache: BTreeMap<u64, Vec<TraceEvent>>,
+    pub sub_agent_trace_cache: BTreeMap<u64, Arc<Vec<TraceEvent>>>,
     /// 当前 TUI 对应的 session id，供 /subagents 详情按需读取 trace 文件。
     pub current_session_id: String,
     /// session 文件目录，也是子 Agent trace 旁路文件所在根目录。
@@ -11161,15 +11161,23 @@ impl AppState {
             .collect()
     }
 
-    pub fn sub_agent_trace_events(&mut self, id: u64) -> Option<Vec<TraceEvent>> {
+    pub fn sub_agent_trace_events(&mut self, id: u64) -> Option<Arc<Vec<TraceEvent>>> {
         if !self.sub_agent_trace_cache.contains_key(&id) {
             let sessions_dir = self.sessions_dir.as_ref()?;
             let path = wyj_tools::trace::trace_file(sessions_dir, &self.current_session_id, id);
             if let Ok(events) = wyj_tools::trace::read_trace(&path) {
-                self.sub_agent_trace_cache.insert(id, events);
+                self.sub_agent_trace_cache.insert(id, Arc::new(events));
             }
         }
+        // 返回 `Arc` 克隆而不是深拷贝：详情面板每帧调用一次，trace 上限 256KiB，
+        // 深拷贝等于每帧搬一次整个子 Agent 执行轨迹。
         self.sub_agent_trace_cache.get(&id).cloned()
+    }
+
+    /// 追加一条 trace 事件。`Arc::make_mut` 在只有一个持有者时就地追加，
+    /// 不触发拷贝；详情面板那一帧的读者结束后引用计数回落到 1。
+    fn trace_push(&mut self, id: u64, event: TraceEvent) {
+        Arc::make_mut(self.sub_agent_trace_cache.entry(id).or_default()).push(event);
     }
 
     /// 中断当前正在运行的 Agent，保留已输出内容并标记 [已中断]
@@ -12443,15 +12451,15 @@ impl AppState {
                 // 落盘 trace 关联用，TUI 内存态摘要不需要
                 parent_tool_use_id,
             } => {
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::Started {
+                self.trace_push(
+                    id,
+                    TraceEvent::Started {
                         agent_type: agent_type.clone(),
                         description: description.clone(),
                         background,
                         parent_tool_use_id,
-                    });
+                    },
+                );
                 // FIFO 绑定最早一条未绑定的 Agent ToolCall 消息，并把内容改写为 类型(描述)
                 if let Some(msg) = self.messages.iter_mut().find(|m| {
                     matches!(m.role, MessageRole::ToolCall)
@@ -12491,14 +12499,14 @@ impl AppState {
                 input,
             } => {
                 let (input_json, truncated) = wyj_tools::trace::truncate_input(&input);
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::ToolStart {
+                self.trace_push(
+                    id,
+                    TraceEvent::ToolStart {
                         tool_name: tool_name.clone(),
                         input_json,
                         truncated,
-                    });
+                    },
+                );
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.tool_calls += 1;
                     let short_name = tool_display_name(&tool_name);
@@ -12528,16 +12536,16 @@ impl AppState {
                 output,
             } => {
                 let (output, truncated) = wyj_tools::trace::truncate_output(&output);
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::ToolEnd {
+                self.trace_push(
+                    id,
+                    TraceEvent::ToolEnd {
                         tool_name: tool_name.clone(),
                         is_error,
                         elapsed_secs,
                         output,
                         truncated,
-                    });
+                    },
+                );
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.current_tool = None;
                     if let Some(line) = s
@@ -12556,13 +12564,13 @@ impl AppState {
                 input_tokens,
                 output_tokens,
             } => {
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::Usage {
+                self.trace_push(
+                    id,
+                    TraceEvent::Usage {
                         input_tokens,
                         output_tokens,
-                    });
+                    },
+                );
                 self.sub_input_tokens += input_tokens;
                 self.sub_output_tokens += output_tokens;
                 if let Some(s) = self.sub_agents.get_mut(&id) {
@@ -12573,29 +12581,29 @@ impl AppState {
             E::Assistant { id, text } => {
                 // 只进内存态 trace 缓存（详情面板用），不驱动聊天区：
                 // 聊天区只展示子 Agent 的最终结果，中间落点属于详情。
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::Assistant {
+                self.trace_push(
+                    id,
+                    TraceEvent::Assistant {
                         text: wyj_tools::textutil::truncate_head_tail(
                             &text,
                             wyj_tools::trace::ASSISTANT_HEAD_BYTES,
                             0,
                         ),
-                    });
+                    },
+                );
             }
             E::Control {
                 id,
                 action,
                 accepted,
             } => {
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::Control {
+                self.trace_push(
+                    id,
+                    TraceEvent::Control {
                         action: action.clone(),
                         accepted,
-                    });
+                    },
+                );
                 if accepted && action == "interrupt" {
                     if let Some(agent) = self.sub_agents.get_mut(&id) {
                         agent.status = SubAgentStatus::Interrupted;
@@ -12616,14 +12624,14 @@ impl AppState {
                 background,
                 handoff_body,
             } => {
-                self.sub_agent_trace_cache
-                    .entry(id)
-                    .or_default()
-                    .push(TraceEvent::Done {
+                self.trace_push(
+                    id,
+                    TraceEvent::Done {
                         result: result.clone(),
                         is_error,
                         elapsed_secs,
-                    });
+                    },
+                );
                 if let Some(s) = self.sub_agents.get_mut(&id) {
                     s.status = if is_error {
                         SubAgentStatus::Failed

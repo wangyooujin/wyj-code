@@ -244,7 +244,10 @@ async fn run_one(cmd: &HookCommand, payload_json: &str) -> HookOutcome {
     process
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // 超时路径只放弃等待是不够的：`wait_with_output()` 的 future 被 drop
+        // 后子进程会继续跑到底，而调用方以为这条 hook 已经结束了。
+        .kill_on_drop(true);
 
     let mut child = match process.spawn() {
         Ok(c) => c,
@@ -271,6 +274,8 @@ async fn run_one(cmd: &HookCommand, payload_json: &str) -> HookOutcome {
                 return HookOutcome::Passthrough;
             }
         };
+
+    let output = cap_output(output);
 
     let stdout_text = String::from_utf8_lossy(&output.stdout);
     if let Ok(parsed) = serde_json::from_str::<HookStdout>(stdout_text.trim()) {
@@ -301,6 +306,31 @@ async fn run_one(cmd: &HookCommand, payload_json: &str) -> HookOutcome {
     }
 }
 
+/// hook 输出上限。stdout 只用于解析一个 JSON 对象，stderr 只用于 Block 原因，
+/// 两者都远小于此；`wait_with_output()` 原本会把 `yes` 这类无限输出的 hook
+/// 整个读进内存。
+const MAX_HOOK_OUTPUT_BYTES: usize = 64 * 1024;
+
+fn cap_output(mut output: std::process::Output) -> std::process::Output {
+    output.stdout = cap_bytes(output.stdout, MAX_HOOK_OUTPUT_BYTES);
+    output.stderr = cap_bytes(output.stderr, MAX_HOOK_OUTPUT_BYTES);
+    output
+}
+
+/// 保留头部与尾部各一半：JSON 解析看的是头，错误原因常常在尾。
+fn cap_bytes(bytes: Vec<u8>, max: usize) -> Vec<u8> {
+    if bytes.len() <= max {
+        return bytes;
+    }
+    let head = max / 2;
+    let tail = max - head;
+    let mut out = Vec::with_capacity(max + 32);
+    out.extend_from_slice(&bytes[..head]);
+    out.extend_from_slice(b"\n... [hook output truncated] ...\n");
+    out.extend_from_slice(&bytes[bytes.len() - tail..]);
+    out
+}
+
 #[cfg(unix)]
 fn build_command(command: &str) -> Command {
     let mut c = Command::new("sh");
@@ -317,15 +347,45 @@ fn build_command(command: &str) -> Command {
 
 /// 三源合并后的生效 hooks 配置。每次调用都重新读盘（与 `ClaudeMdLoader`
 /// 同一哲学：内容不缓存，保证运行期间编辑立即生效）。
+///
+/// **项目级两源先过信任门控**：`<git-root>/.wyj-code/settings.json` 与
+/// `settings.local.json` 随仓库一起落地，其中的 `command` 会被 `sh -c` 直接
+/// 执行。未批准时整块跳过（只保留用户级 hooks），并 warn 一次——`-p` / cron
+/// 没有 TTY，阻塞式确认会挂死。
 pub fn load_effective_hooks(cwd: &Path) -> HooksSettings {
     let mut paths = Vec::new();
     if let Ok(global) = wyj_config::global_config_dir() {
         paths.push(global.join("settings.json"));
     }
-    let root = wyj_config::project_root(cwd);
-    paths.push(root.join(".wyj-code").join("settings.json"));
-    paths.push(root.join(".wyj-code").join("settings.local.json"));
+    if project_hooks_trusted(cwd) {
+        let root = wyj_config::project_root(cwd);
+        paths.push(root.join(".wyj-code").join("settings.json"));
+        paths.push(root.join(".wyj-code").join("settings.local.json"));
+    }
     merge_sources(&paths)
+}
+
+/// 项目级 hooks / verify 是否已获批准；未批准时打一次 warn。
+///
+/// `Once` 按项目根去重：同一进程里 `run_turn` 每轮都会重新读盘，不节流会把
+/// 同一条警告刷满日志。
+fn project_hooks_trusted(cwd: &Path) -> bool {
+    use std::sync::{Mutex, OnceLock};
+
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    if crate::hooks_trust::project_trusted(cwd) {
+        return true;
+    }
+    let root = wyj_config::project_root(cwd);
+    let warned = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut seen = warned.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(root.clone()) {
+        tracing::warn!(
+            project = %root.display(),
+            "项目级 hooks / verify 未获信任，已跳过；运行 `wyj-code trust hooks` 批准"
+        );
+    }
+    false
 }
 
 fn merge_sources(paths: &[PathBuf]) -> HooksSettings {

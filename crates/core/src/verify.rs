@@ -107,14 +107,20 @@ pub struct VerifyOutcome {
 }
 
 /// 读三源合并后的 verify 配置。没有可用命令 / 显式关闭 → None。
+///
+/// **项目级两源先过信任门控**（与 `hooks::load_effective_hooks` 同一判据）：
+/// `verify.command` 同样会被 `sh -c` 直接执行，随 `git clone` 落地的仓库不该
+/// 在用户批准前就能跑任意命令。
 pub fn load_verify_cfg(cwd: &Path) -> Option<VerifyCfg> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Ok(global) = wyj_config::global_config_dir() {
         paths.push(global.join("settings.json"));
     }
-    let root = wyj_config::project_root(cwd);
-    paths.push(root.join(".wyj-code").join("settings.json"));
-    paths.push(root.join(".wyj-code").join("settings.local.json"));
+    if crate::hooks_trust::project_trusted(cwd) {
+        let root = wyj_config::project_root(cwd);
+        paths.push(root.join(".wyj-code").join("settings.json"));
+        paths.push(root.join(".wyj-code").join("settings.local.json"));
+    }
 
     let mut cfg: Option<VerifyCfg> = None;
     for path in &paths {
@@ -268,10 +274,16 @@ mod tests {
         std::fs::write(p, body).unwrap();
     }
 
+    /// 项目级 verify 声明在批准前不会生效（`hooks_trust` 门控）。
+    fn write_trusted_settings(dir: &Path, name: &str, body: &str) {
+        write_settings(dir, name, body);
+        crate::hooks_trust::approve(dir).unwrap();
+    }
+
     #[test]
     fn a_project_declaring_a_command_is_verified() {
         let tmp = tempfile::tempdir().unwrap();
-        write_settings(
+        write_trusted_settings(
             tmp.path(),
             "settings.json",
             r#"{"verify":{"command":"true"}}"#,
@@ -280,6 +292,19 @@ mod tests {
         assert_eq!(cfg.command, "true");
         assert!(cfg.enabled);
         assert_eq!(cfg.timeout_ms, DEFAULT_TIMEOUT_MS);
+    }
+
+    /// 未批准的项目级 verify 必须完全跳过——它随 `git clone` 落地，
+    /// 批准前执行等于仓库作者能跑任意命令。
+    #[test]
+    fn unapproved_project_verify_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_settings(
+            tmp.path(),
+            "settings.json",
+            r#"{"verify":{"command":"true"}}"#,
+        );
+        assert!(load_verify_cfg(tmp.path()).is_none());
     }
 
     #[test]

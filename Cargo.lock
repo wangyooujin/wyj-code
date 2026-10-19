@@ -1051,15 +1051,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
-name = "encoding_rs"
-version = "0.8.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "endi"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3346,7 +3337,7 @@ dependencies = [
  "process-wrap",
  "reqwest 0.13.4",
  "rmcp-macros",
- "schemars 1.2.1",
+ "schemars",
  "serde",
  "serde_json",
  "sse-stream",
@@ -3514,18 +3505,6 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "dyn-clone",
- "schemars_derive 0.8.22",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
@@ -3533,21 +3512,9 @@ dependencies = [
  "chrono",
  "dyn-clone",
  "ref-cast",
- "schemars_derive 1.2.1",
+ "schemars_derive",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn",
 ]
 
 [[package]]
@@ -5257,8 +5224,6 @@ version = "0.3.11"
 dependencies = [
  "anyhow",
  "async-trait",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -5268,7 +5233,6 @@ dependencies = [
  "wyj-core",
  "wyj-i18n",
  "wyj-store",
- "wyj-tools",
 ]
 
 [[package]]
@@ -5386,7 +5350,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
- "encoding_rs",
  "futures",
  "globset",
  "ignore",
@@ -5395,15 +5358,14 @@ dependencies = [
  "regex-automata",
  "regex-syntax",
  "reqwest 0.12.28",
- "schemars 0.8.22",
  "scraper",
  "serde",
  "serde_json",
  "similar",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "wyj-api",
  "wyj-computer",
  "wyj-config",

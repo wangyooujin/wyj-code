@@ -349,16 +349,22 @@ impl CheckpointStore {
             .display()
             .to_string();
         let truncated_messages: Vec<Message> = {
-            // 落盘前做持久化截断(tool_result / thinking / tool_use.input)
-            let mut owned = messages.to_vec();
-            if let Some(cfg) = current_checkpoint_persist_cap() {
-                for msg in &mut owned {
-                    for block in &mut msg.content {
-                        crate::serialize::truncate_content_block(block, &cfg);
+            // 落盘前做持久化截断(tool_result / thinking / tool_use.input)。
+            // **没有配置上限时不拷贝**：`truncate_content_block` 只在有 cap 时才
+            // 生效，历史上无条件 `to_vec()` 让每个工具调用的 checkpoint 多付一次
+            // 整段历史深拷贝（长会话里工具输出动辄 MB 级）。
+            match current_checkpoint_persist_cap() {
+                Some(cfg) => {
+                    let mut owned = messages.to_vec();
+                    for msg in &mut owned {
+                        for block in &mut msg.content {
+                            crate::serialize::truncate_content_block(block, &cfg);
+                        }
                     }
+                    owned
                 }
+                None => messages.to_vec(),
             }
-            owned
         };
         let workspace = self.capture_workspace_with_delta(&cwd_root, cwd)?;
         let checkpoint = Checkpoint {
@@ -407,7 +413,18 @@ impl CheckpointStore {
         cwd_root: &str,
         cwd: &Path,
     ) -> Result<WorkspaceSnapshot> {
-        let snapshot = capture_workspace(cwd, self.cas.as_deref())?;
+        // 上一次 checkpoint 的 git 快照：工作树没变时 `capture_git` 可以直接
+        // 复用它，省掉 add -A / write-tree / commit-tree 三次全树哈希。
+        let previous_git = self
+            .load_manifest()
+            .ok()
+            .and_then(|manifest| pick_baseline(&manifest, cwd_root))
+            .and_then(|id| self.load(&id).ok())
+            .and_then(|cp| match cp.workspace {
+                WorkspaceSnapshot::Git(snapshot) => Some(snapshot),
+                _ => None,
+            });
+        let snapshot = capture_workspace(cwd, self.cas.as_deref(), previous_git.as_ref())?;
         // Git snapshot 永远全量(轻量,object_id 引用)
         if matches!(snapshot, WorkspaceSnapshot::Git(_)) {
             return Ok(snapshot);
@@ -627,9 +644,13 @@ fn validate_checkpoint_id(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn capture_workspace(cwd: &Path, cas: Option<&WorkspaceCas>) -> Result<WorkspaceSnapshot> {
+fn capture_workspace(
+    cwd: &Path,
+    cas: Option<&WorkspaceCas>,
+    previous_git: Option<&GitSnapshot>,
+) -> Result<WorkspaceSnapshot> {
     if let Some(root) = git_root(cwd) {
-        return Ok(WorkspaceSnapshot::Git(capture_git(&root)?));
+        return Ok(WorkspaceSnapshot::Git(capture_git(&root, previous_git)?));
     }
     Ok(WorkspaceSnapshot::Files(capture_files(cwd, cas)?))
 }
@@ -649,7 +670,7 @@ fn git_root(cwd: &Path) -> Option<PathBuf> {
         .ok()
 }
 
-fn capture_git(root: &Path) -> Result<GitSnapshot> {
+fn capture_git(root: &Path, previous: Option<&GitSnapshot>) -> Result<GitSnapshot> {
     let temp_index = std::env::temp_dir().join(format!(
         "wyj-checkpoint-index-{}-{}",
         std::process::id(),
@@ -664,6 +685,24 @@ fn capture_git(root: &Path) -> Result<GitSnapshot> {
         vec!["read-tree", "--empty"]
     };
     let result = (|| {
+        // 快路径：工作区相对 HEAD 干净，且本次会话已经有过一次 git 快照。
+        // 此时 `add -A` + `write-tree` + `commit-tree` 会产出与上一次**完全相同**的
+        // tree/commit，直接复用即可——省下 3 个 git 子进程与一次全树哈希。
+        //
+        // 每轮工具调用固定建 2 个 checkpoint（PreTool / PostTool），而只读工具
+        // （Bash 跑测试、Grep、Read）根本不碰工作树：这正是「每个工具调用都卡
+        // 一下」的主要来源。判据是一次 `git status --porcelain`，比哈希便宜得多。
+        if let Some(previous) = previous.filter(|p| p.head == head) {
+            if !has_worktree_changes(root)? {
+                return Ok(GitSnapshot {
+                    repo_root: root.to_path_buf(),
+                    head: previous.head.clone(),
+                    tree: previous.tree.clone(),
+                    commit: previous.commit.clone(),
+                    files: previous.files.clone(),
+                });
+            }
+        }
         git_status(root, Some(&temp_index), &read_tree_args)?;
         git_status(root, Some(&temp_index), &["add", "-A", "--", "."])?;
         let tree = git_output(root, Some(&temp_index), &["write-tree"])?
@@ -685,6 +724,15 @@ fn capture_git(root: &Path) -> Result<GitSnapshot> {
     })();
     let _ = std::fs::remove_file(&temp_index);
     result
+}
+
+/// 工作区相对 HEAD 有没有任何改动。
+///
+/// 一次 `git status --porcelain`：空输出即干净。比 `git diff` 便宜，且不需要
+/// 临时 index——这里只判断「有没有变」，不需要知道「变成了什么」。
+fn has_worktree_changes(root: &Path) -> Result<bool> {
+    let output = git_output(root, None, &["status", "--porcelain"])?;
+    Ok(!output.trim().is_empty())
 }
 
 fn git_commit_tree(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<String> {
@@ -761,7 +809,8 @@ fn preview_workspace(
                 current_root == snapshot.repo_root,
                 "checkpoint belongs to a different git repository"
             );
-            let current = capture_git(&current_root)?;
+            // 恢复时必须采一份**当下**的真实状态，不能复用任何缓存快照。
+            let current = capture_git(&current_root, None)?;
             let output = git_output_bytes(
                 &current_root,
                 None,
@@ -1291,6 +1340,40 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// 工作树干净时 `capture_git` 必须复用上一份快照（跳过 add -A /
+    /// write-tree / commit-tree）；工作树一变就必须重新采。
+    #[test]
+    fn clean_worktree_reuses_the_previous_git_snapshot() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        std::fs::write(repo.path().join("a.txt"), "one").unwrap();
+        git(repo.path(), &["add", "a.txt"]);
+        git(repo.path(), &["commit", "-m", "base"]);
+        let root = git_root(repo.path()).unwrap();
+
+        let first = capture_git(&root, None).unwrap();
+
+        // 干净工作树：复用同一 commit/tree
+        let reused = capture_git(&root, Some(&first)).unwrap();
+        assert_eq!(reused.commit, first.commit);
+        assert_eq!(reused.tree, first.tree);
+
+        // 工作树有改动：必须重新采集
+        std::fs::write(repo.path().join("a.txt"), "two").unwrap();
+        let changed = capture_git(&root, Some(&first)).unwrap();
+        assert_ne!(changed.commit, first.commit);
+
+        // 改回来（相对 HEAD 又干净）：仍应复用旧快照——因为它就是当下的真实状态
+        std::fs::write(repo.path().join("a.txt"), "one").unwrap();
+        let back = capture_git(&root, Some(&first)).unwrap();
+        assert_eq!(back.commit, first.commit);
     }
 
     #[test]

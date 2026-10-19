@@ -232,14 +232,27 @@ pub(crate) fn linkify_buffer(
     let mut targets = HashMap::new();
     let link_style = Theme::hint().add_modifier(Modifier::UNDERLINED);
 
+    // `visible_cells` 按 (y, x) 升序，二分找每条 link 的起点，再用「起点行号」
+    // 作为下界线性推进——最坏 O(cells + links)，取代原来的 O(links × cells)。
+    // 一屏几十条链接 × 几千个格子就是每帧上百万次比较，链接越多越卡。
+    let first_cell_in_range = |range: &Range<usize>| -> usize {
+        visible_cells.partition_point(|cell| cell.bytes.end <= range.start)
+    };
+    let mut next_hint = 0usize;
     for link in links {
-        for cell in visible_cells
-            .iter()
-            .filter(|cell| ranges_overlap(&cell.bytes, &link.bytes))
-        {
-            buffer[(cell.x, cell.y)].set_style(link_style);
-            targets.insert((cell.x, cell.y), link.target.clone());
+        let mut idx = first_cell_in_range(&link.bytes).max(next_hint);
+        while idx < visible_cells.len() {
+            let cell = &visible_cells[idx];
+            if cell.bytes.start >= link.bytes.end {
+                break;
+            }
+            if ranges_overlap(&cell.bytes, &link.bytes) {
+                buffer[(cell.x, cell.y)].set_style(link_style);
+                targets.insert((cell.x, cell.y), link.target.clone());
+            }
+            idx += 1;
         }
+        next_hint = idx;
     }
     registry.replace(targets);
 }
@@ -516,6 +529,48 @@ fn trim_path_token(raw: &str) -> Option<(&str, usize, usize)> {
     (start < end).then(|| (&raw[start..end], start, raw.len() - end))
 }
 
+/// 路径存在性缓存：(命中表, 插入顺序队列)。
+///
+/// 队列用于容量上限下的 FIFO 淘汰——Map 自身无序，靠它挑「最老」的那条。
+type PathExistsCache = (
+    std::collections::HashMap<PathBuf, bool>,
+    std::collections::VecDeque<PathBuf>,
+);
+
+/// 本地路径存在性缓存。
+///
+/// `linkify_buffer` **每帧**运行，一屏里可能有几十个路径 token，于是每帧几十次
+/// 同步 `stat`。在网络盘 / NFS / 元数据慢的卷上，这直接表现为「光标卡顿」，
+/// 而且成本与是否真的在拖选无关（`draw()` 无条件调用）。
+///
+/// 缓存在进程内、按路径复用，容量有上限并按插入顺序淘汰。误判的代价只是
+/// 「一个不存在的路径没画成链接」或「一个新出现的路径要等下一轮才成链接」，
+/// 不影响任何功能。
+fn cached_path_exists(path: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    const CAPACITY: usize = 512;
+    static CACHE: OnceLock<Mutex<PathExistsCache>> = OnceLock::new();
+
+    let cache =
+        CACHE.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let (map, order) = &mut *guard;
+    if let Some(&known) = map.get(path) {
+        return known;
+    }
+    let exists = path.exists();
+    if map.len() >= CAPACITY {
+        if let Some(oldest) = order.pop_front() {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(path.to_path_buf(), exists);
+    order.push_back(path.to_path_buf());
+    exists
+}
+
 fn local_file_target(displayed: &str, cwd: &Path) -> Option<String> {
     if displayed.contains("://") || displayed.len() > 4096 {
         return None;
@@ -525,7 +580,7 @@ fn local_file_target(displayed: &str, cwd: &Path) -> Option<String> {
         return None;
     }
     let path = resolve_local_path(path_text, cwd)?;
-    if !path.exists() {
+    if !cached_path_exists(&path) {
         return None;
     }
     Some(file_uri(&path, line, column))
