@@ -25,6 +25,8 @@
 
 **Bypass 三处同色为 `danger`**（状态栏芯片 + 标题栏 `[bypass] Enter to send` + 输入框边框）：它等价于"本次会话跳过全部权限确认"，黄色偏中性、承担不了提醒职责。钉子 `draw_status_labels_every_mode_and_paints_bypass_red` 会扫出全屏两处 `[bypass]` 文字**与输入框底边框框角**三处，逐一断言等于 `Theme::danger_color()`——只查状态栏等于没查。
 
+**状态栏两段排版：宽度按显示列宽，右段放不下就整段丢**（`render::draw_status` + `render::status_bar_layout`）。旧实现用 `chars().count()` 算左右两段宽度，而中文与全宽符号是双宽——`● 1 条已排队（等待送达）` char 数 14、显示宽度 24，补位少 10 列 → `Paragraph` 右端溢出 → 溢出是**从右侧硬切**，切点落在全角 `（` 中间，用户看到的就是右下角挂着一个半截的 `(`。这类 bug **只在中文文案下暴露**：英文 `● 1 queued (awaiting delivery)` 全 ASCII，char 数恰好等于显示宽度，纯英文快照对它完全不敏感。三条硬规则：① 任何宽度计算都走 `char_display_width`，`draw_status` 内不许再出现 `chars().count()`；② 两段排版只由 `status_bar_layout` 一处算，别处重算必然漂移；③ 分级降级：右段（排队 / Ctrl+C 待确认，只在特定时刻出现）优先保，cwd 吃剩余预算、超出加省略号、连 2 列都分不出时整段留空；右段**自身**塞不下时整段丢弃，绝不交给 Paragraph 硬切——半个括号不提示任何事，只会让用户以为界面画坏了（排队提示在输入框标题栏还有一份，那里是 `build_thinking_title` 里 rank 最高的一段）。
+
 **状态栏不得设置显式背景色**（`Color::Reset` 以外的一切 `bg`）：深灰带与上方标题栏割裂成两块色块。钉子 `draw_status_does_not_set_explicit_background`。
 
 ## 终端能力降级：能力兜底，不是再美化一遍
