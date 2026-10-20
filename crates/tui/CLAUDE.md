@@ -1,20 +1,38 @@
 # crates/tui
 
-## 模块地图（2026-10-19 拆分）
+## 模块地图（2026-10-19 首次拆分 / 2026-10-20 二次拆分）
 
 | 文件 | 承载 | 说明 |
 |---|---|---|
-| `app.rs`（22330） | 状态定义 + `impl AppState` 主体 + `tui_main` 主循环 | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
+| `app.rs`（11559） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
+| `app/events.rs`（1251） | `apply_agent_event` / `apply_sub_agent_event`：Agent 事件 → UI 状态 | 只写状态，不读终端尺寸、不排版；事件顺序不变量都在这一个函数里 |
+| `app/profile_panel.rs`（1972） | `/model` 分组面板 | 字段表 `PROFILE_FIELD_SPECS` 是唯一真相源，渲染/键位/校验三处都从它派生 |
+| `app/skills_panel.rs`（1113） | `/skills` 面板 | 含 SkillHub 搜索与本地/注册表两个来源的分流 |
+| `app/schedule_panel.rs`（877） | `/schedule` 面板 | 草稿式编辑，Ctrl+S 才写盘并同步 crontab |
+| `app/mcp_panel.rs`（692） | `/mcp` 面板 | server 信任与连接状态 |
+| `app/plugins_panel.rs`（594） | `/plugins` 面板 | 插件激活/停用 |
+| `app/dialogs.rs`（1133） | AskQuestion / PlanApproval / ExecModeConfirm / SessionConflict 四个模态框 | 共享 `InProgressAnswer`；自由输入统一走 `render::freetext_line` |
+| `app/settings_dialogs.rs`（434） | Settings / Memory / Evolution 三个治理面板 | Evolution 的四视图与二次确认状态在这里 |
+| `app/clipboard.rs`（1878） | 剪贴板、附件、输入框文本操作、应用内选区 | 粘贴折叠成 `PasteBlock` 的判据见 `paste_text_should_fold` |
+| `app/tool_view.rs`（329） | 工具展示辅助：显示名、参数摘要、结果摘要 | 纯字符串整形，消息构造时算好并存下，渲染层不重算 |
+| `app/terminal.rs`（556） | 终端控制：备用屏幕、鼠标上报、滚轮路由、退出按键释放 | 直接写 ANSI 序列，是 TUI 与终端之间的全部契约面 |
+| `app/menu.rs`（220） | `InputOwner` / `FlatRow` / `ActionMenu` | 各面板共享的「方向键菜单 + 借用底部输入框」基础设施 |
+| `app/agents_panel.rs`（107） | Agents / Extensions 两个列表型面板 | 只有行选中与动作菜单，没有输入框借用 |
 | `app/navigation.rs`（584） | 选区、滚动、焦点、输入历史召回 | 动线而非数据：只读 `self`，不碰 IO |
 | `app/panels.rs`（650） | Todo / 子 Agent / 后台 Shell 面板状态与导航 | 三者共享同一条不变式：面板列出的东西必须和后台真实存活的��致 |
+| `app/util.rs`（36） | `cycle_index` / `is_new_todo_round` / `split_evenly` | 跨面板复用的纯函数 |
 | `render.rs`（7771） | 聊天区、输入框、状态栏、滚动条、排版助手 | 助手被 dialogs 依赖，留在父模块 |
 | `render/dialogs.rs`（3002） | 全部对话框与浮层 | 纯绘制，彼此不共享可变状态 |
+
+**拆分的第二波原则**：面板类代码按「一个命令一个文件」切，切分点是 `app.rs` 里的 `// ── <面板>：/<命令> 命令触发` 注释段。这些段自带完整的类型 + 键位处理 + 执行动作，**段内不引用段外的私有项**（若有，先抽到 `util.rs` 或 `menu.rs`）。整段搬走时连同它的 `#[cfg(test)] mod` 一起搬，否则测试访问的私有字段要先提升可见性——那是拆分边界切错的信号。
+
+**`tui_main`（约 5300 行）仍是已知债务**：事件循环本身没拆，理由是它没有测试覆盖，而拆循环体必然重排借用与 await 点。继续拆它之前应先补主循环级测试（当前只有 `busy_slash_tests` 的静态顺序钉子）。
 
 **拆分的边界规则**：子模块是父模块的子级，因此能访问私有字段；Rust 允许同一 crate 内把 inherent impl 拆到多个模块。被父模块调用的方法提升为 `pub(super)`，其余保持私有。**拆分是纯搬移，不改任何逻辑**——编译器会抓出所有漏改，任何需要"顺手调一下"的地方都说明切错了边界。
 
 **两个必须跟着改的清单**（漏了就是静默失去覆盖）：
 
-1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。
+1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。2026-10-20 已把 `app/` 下全部 16 个子模块补进白名单（此前只有 `app.rs` 本身在列，拆走的内容一直无人扫描）。**该函数对未登记文件是 `panic!` 而非静默跳过**——新增文件后第一次跑测试就会红，不会悄悄漏。
 2. 源码文本扫描类测试用 `include_str!` 定位函数。**判定函数范围必须按花括号配平**，不要用「下一个顶格 `fn ` / `/// `」这类行前缀启发式——函数体内的语句没有顶格 `fn `，那个启发式会一路扫到文件末尾。`draw_status_never_measures_width_in_chars` 曾因此把后续函数的代码当成被检验函数的正文。
 
 ## 配色：全部走 `Theme` 槽位，`theme.rs` 是唯一允许定义颜色的文件
