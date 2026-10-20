@@ -2135,6 +2135,12 @@ pub struct AppState {
     pub sub_agents: BTreeMap<u64, SubAgentUiState>,
     /// 当前会话的子 Agent trace 事件缓存，按子 Agent id 索引。
     pub sub_agent_trace_cache: BTreeMap<u64, Arc<Vec<TraceEvent>>>,
+    /// 子 Agent 详情视图的聊天化消息缓存（见 `refresh_sub_agent_detail_cache`）。
+    ///
+    /// 详情视图每帧都要把执行轨迹翻译成 `ChatMessage` 序列再交给聊天区渲染管线，
+    /// 而助手文本的 markdown 解析是这里最贵的一步。轨迹只追加，所以「事件条数」
+    /// 就是完整的版本号：条数没变就直接复用上一帧的翻译结果。
+    pub sub_agent_detail_cache: Option<SubAgentDetailCache>,
     /// 当前 TUI 对应的 session id，供 /subagents 详情按需读取 trace 文件。
     pub current_session_id: String,
     /// session 文件目录，也是子 Agent trace 旁路文件所在根目录。
@@ -2198,6 +2204,7 @@ mod profile_panel;
 mod schedule_panel;
 mod settings_dialogs;
 mod skills_panel;
+mod sub_agent_view;
 mod terminal;
 mod tool_view;
 mod util;
@@ -2214,6 +2221,7 @@ pub use profile_panel::*;
 pub use schedule_panel::*;
 pub use settings_dialogs::*;
 pub use skills_panel::*;
+pub(crate) use sub_agent_view::*;
 use terminal::*;
 pub(crate) use tool_view::*;
 pub(crate) use util::*;
@@ -2338,6 +2346,7 @@ impl AppState {
             pending_queue: vec![],
             sub_agents: BTreeMap::new(),
             sub_agent_trace_cache: BTreeMap::new(),
+            sub_agent_detail_cache: None,
             current_session_id: String::new(),
             sessions_dir: None,
             selected_sub_agent: None,
@@ -2485,6 +2494,7 @@ impl AppState {
         self.pending_queue.clear();
         self.sub_agents.clear();
         self.sub_agent_trace_cache.clear();
+        self.sub_agent_detail_cache = None;
         self.selected_sub_agent = None;
         self.sub_agent_detail_open = false;
         self.reset_sub_agent_detail_view();
@@ -5532,6 +5542,11 @@ async fn tui_main(
                                         // Schedule 借用同 Profile，不对应任何需要
                                         // 重置的 overlay。
                                     }
+                                    InputOwner::Settings(_) => {
+                                        // Settings 借用同 Profile：字段编辑直接借用
+                                        // 输入框，Esc 只需清空 live_input + 归还
+                                        // input_owner（上面已做），面板本身保持打开。
+                                    }
                                 }
                             }
                             KeyCode::Enter => {
@@ -5761,6 +5776,17 @@ async fn tui_main(
                                                 .set_text_value(field_idx, value);
                                         }
                                     }
+                                    InputOwner::Settings(SettingsInputField::Field {
+                                        field_idx,
+                                    }) => {
+                                        let value = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if let Some(dialog) = &mut state.settings_dialog {
+                                            dialog.draft.set_text_value(field_idx, value);
+                                            dialog.error = None;
+                                        }
+                                    }
                                     InputOwner::Schedule(ScheduleInputField::Field {
                                         task_idx,
                                         field_idx,
@@ -5831,7 +5857,7 @@ async fn tui_main(
                         continue;
                     }
 
-                    // ⓪.5 设置面板拦截（/config 命令触发，现仅 log_level/language 两个枚举字段）
+                    // ⓪.5 设置面板拦截（/config 命令触发）
                     if state.settings_dialog.is_some() {
                         match key.code {
                             KeyCode::Up => {
@@ -5856,16 +5882,64 @@ async fn tui_main(
                                     dialog.draft.cycle_enum(idx, false);
                                 }
                             }
-                            KeyCode::Right | KeyCode::Enter => {
+                            KeyCode::Right => {
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     let idx = dialog.selected;
                                     dialog.draft.cycle_enum(idx, true);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // 按字段形态分派：枚举原地循环，文本/数字/密钥借用
+                                // 底部主输入框。此前所有字段都是枚举，Enter 与
+                                // Right 同义；加入 search 文本字段后必须分开。
+                                let target = state.settings_dialog.as_ref().map(|d| {
+                                    (
+                                        d.selected,
+                                        SETTINGS_FIELD_SPECS
+                                            .get(d.selected)
+                                            .map(|s| s.kind)
+                                            .unwrap_or(SettingsFieldKind::Text),
+                                    )
+                                });
+                                match target {
+                                    Some((idx, SettingsFieldKind::Enum(_))) => {
+                                        if let Some(dialog) = &mut state.settings_dialog {
+                                            dialog.draft.cycle_enum(idx, true);
+                                        }
+                                    }
+                                    Some((idx, _)) => {
+                                        let prefill = state
+                                            .settings_dialog
+                                            .as_ref()
+                                            .map(|d| d.draft.text_value(idx).to_string())
+                                            .unwrap_or_default();
+                                        if let Some(dialog) = &mut state.settings_dialog {
+                                            dialog.live_input = InputBox::new();
+                                            dialog.live_input.insert_text(&prefill);
+                                        }
+                                        state.input_owner =
+                                            Some(InputOwner::Settings(SettingsInputField::Field {
+                                                field_idx: idx,
+                                            }));
+                                    }
+                                    None => {}
                                 }
                             }
                             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 let mut should_close = false;
                                 if let Some(dialog) = &mut state.settings_dialog {
                                     {
+                                        if let Some((key, args)) = dialog.draft.validate() {
+                                            let refs: Vec<(&str, &str)> = args
+                                                .iter()
+                                                .map(|(k, v)| (*k, v.as_str()))
+                                                .collect();
+                                            dialog.error = Some(wyj_i18n::tr_fmt(key, &refs));
+                                            // 校验失败：保留面板与已填内容，只展示错误，
+                                            // 让用户改完再存。`continue` 跳过本轮事件处理
+                                            // （面板不关闭）。
+                                            continue;
+                                        }
                                         let new_cfg = dialog.draft.to_config(&state.config);
                                         match new_cfg.save() {
                                             Ok(()) => {
@@ -8433,6 +8507,7 @@ async fn tui_main(
                                 prompt_cache_state,
                                 compact_count,
                                 context_edit,
+                                prompt_drift,
                                 sub_usage,
                             ) = match try_session_lock(&session) {
                                 Some(sess) => {
@@ -8460,6 +8535,7 @@ async fn tui_main(
                                                 as u32,
                                             sess.context_edit_freed_tokens,
                                         ),
+                                        sess.prompt_drift_since_resume.clone(),
                                         // 子 Agent 用量取自 Session 的累加器而非
                                         // `state.sub_*`：后者只收 SubAgentEvent 的
                                         // input/output，**不含 cache_read**，且
@@ -8486,6 +8562,10 @@ async fn tui_main(
                                         0,
                                         state.compact_count,
                                         (0, 0),
+                                        // 回合进行中拿不到 session，漂移信息一并降级为
+                                        // None（= 不知道）。`/context` 不在 `runs_while_busy`
+                                        // 白名单里，这条分支实际不会被它命中。
+                                        None::<wyj_core::prompt_fingerprint::PromptDrift>,
                                         wyj_core::session::SubUsage::default(),
                                     )
                                 }
@@ -8503,6 +8583,7 @@ async fn tui_main(
                                 context_window,
                                 estimated_tokens: estimated,
                                 context_audit: audit,
+                                prompt_drift,
                                 last_latency: state.session_latency,
                                 compact_count,
                                 context_edit,

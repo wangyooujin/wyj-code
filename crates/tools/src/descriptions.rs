@@ -17,7 +17,7 @@ pub const GREP: &str = "Searches file contents with a regular expression. Respec
 
 pub const WEBFETCH: &str = "Fetches a URL and converts the page to plain text (HTML tags stripped, capped at 50KB). Good for docs, READMEs, and API references. Cannot execute JavaScript, so client-rendered pages may come back empty. Can run in parallel with other read-only calls.";
 
-pub const WEBSEARCH: &str = "Searches the web and returns the top results (title, URL, and a short snippet) plus a synthesized answer when available. Use it for current events, up-to-date facts, library/API docs, or anything beyond your training cutoff; follow up with WebFetch to read a specific result in full. Can run in parallel with other read-only calls.";
+pub const WEBSEARCH: &str = "Searches the web and returns ranked results — title, URL, a short snippet, and the publish date when the backend provides one — plus a synthesized answer when available. Use it for current events, up-to-date facts, library/API docs, or anything beyond your training cutoff. Results are snippets, not page content: follow up with WebFetch on the most promising URL to read it in full. Narrow with `include_domains` and the recency `time_range` rather than restating the query. Can run in parallel with other read-only calls.";
 
 pub const TODO_WRITE: &str = "Create and update a task list for the current session. Each call replaces the whole list, so always pass every item. Only one task may be in_progress at a time. status: pending | in_progress | completed.";
 
@@ -89,6 +89,16 @@ pub const FIELD_WEBFETCH_URL: &str = "The URL to fetch (http/https)";
 
 pub const FIELD_WEBSEARCH_QUERY: &str =
     "The search query. Prefer specific, keyword-rich queries over full sentences.";
+pub const FIELD_WEBSEARCH_MAX_RESULTS: &str =
+    "Maximum number of results to return (default 5, max 10)";
+pub const FIELD_WEBSEARCH_TOPIC: &str =
+    "Search index to use. `news` surfaces timely articles, `finance` market data; default `general`. Not supported by every backend — an unsupported value is rejected rather than silently downgraded.";
+pub const FIELD_WEBSEARCH_TIME_RANGE: &str =
+    "Restrict results to a recency window: day, week, month, or year. Omit to search all time.";
+pub const FIELD_WEBSEARCH_INCLUDE_DOMAINS: &str =
+    "Only return results from these domains, e.g. [\"docs.rs\", \"rust-lang.org\"]. Use for authoritative sources instead of adding `site:` to the query.";
+pub const FIELD_WEBSEARCH_EXCLUDE_DOMAINS: &str =
+    "Never return results from these domains. Use to filter out SEO farms or paywalled aggregators.";
 
 /// `ContextRecall` 工具描述（英文常量，不走 i18n —— 模型行为不应随 locale 漂移）。
 ///

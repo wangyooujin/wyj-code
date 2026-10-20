@@ -554,6 +554,7 @@ mod tests {
                     plugin_agent_paths: vec![],
                     hooks_enabled: false,
                     dynamic_commands: vec![],
+                    prompt_drift: None,
                 },
             )
             .await

@@ -37,6 +37,12 @@ subagent:
   content_more_below: "↓ 下方有新事件 · PgDn 回到底部恢复跟随"
   inline_running: "运行中 · {elapsed} · ↑{tokens} tokens · {count} 次工具调用"
   detail_running: "运行中，当前动作："
+  detail_running_idle: "运行中，尚未调用任何工具"
+  output_truncated: "（输出过长，已截断）"
+  control_line: "控制指令 {action} · 已接受：{accepted}"
+  reason_line: "停下的原因：{text}"
+  tool_log_done: "完成"
+  tool_log_failed: "失败"
   builtin_general_desc: "通用子任务 Agent：可读写文件、执行命令，适合多步骤的独立子任务"
   builtin_explore_desc: "只读探索 Agent（Read/Glob/Grep/WebFetch）：适合大范围代码调研、只需结论的场景"
   builtin_plan_desc: "规划 Agent：只读分析代码并产出分步实施计划"
@@ -45,7 +51,7 @@ subagent:
   handoff_failed: "子 Agent 执行失败（任务未完成）"
   handoff_completed: "已完成"
   handoff_unavailable: "（无交接记录）"
-  handoff_no_conclusion: "（中断前没有留下文字结论，可查看执行轨迹了解做到哪一步）"
+  handoff_no_conclusion: "无文字结论"
 
 subagents:
   desc: "打开子 Agent 聚合面板，查看本会话（含 /resume 恢复的历史会话）每个子 Agent 的完整执行详情"
@@ -59,8 +65,7 @@ subagents:
   status_failed: "失败"
   handoff_line: "交接：{status} · 工具调用 {calls} 次"
   handoff_files_modified: "已修改 {count} 个文件"
-  handoff_files_read: "已读 {count} 个文件"
-  handoff_hint: "· 任务未完成，可按交接摘要继续"
+  handoff_conclusion: "结论：{text}"
 
 shell:
   panel_title: " 后台任务 [{count}] "
@@ -369,6 +374,14 @@ context:
   latency: "上一趟请求 · 首 token {ttft} · 生成 {total}（已扣除重试耗时）"
   latency_retry: "上一趟请求发生过重试：其中 {spent} 花在重试与退避上，不是推理耗时"
   edited: "已清理过期工具结果 {count} 条 · 释放约 {saved} tokens（用 ContextRecall 按 hash 取回原文）"
+  prompt_drift_header: "prompt 指纹：与上次运行相比有变化"
+  prompt_drift_previous: "基准指纹记录于 {at}"
+  prompt_drift_main: "主提示词（含 <env>）：{old_bytes} → {new_bytes} bytes"
+  prompt_drift_tools: "工具定义：{old_bytes} → {new_bytes} bytes"
+  prompt_drift_added: "新增工具：{names}"
+  prompt_drift_removed: "移除工具：{names}"
+  prompt_drift_same: "prompt 指纹：与上次运行一致（主提示词与工具定义均未变）"
+  prompt_drift_none: "prompt 指纹：本会话此前未记录，下一轮请求后建立基准"
 
 cost:
   desc: "显示本会话 token 用量与费用估算"
@@ -734,6 +747,8 @@ doctor:
   config_dir_err: "  ✗  配置目录    {err}"
   provider: "  ✓  供应商      {provider}"
   model: "  ✓  模型        {model}"
+  search_ok: "  ✓  网页搜索    {provider}"
+  search_unavailable: "  -  网页搜索    未启用（{reason}）"
   claude_md_ok: "  ✓  项目规约   {paths}"
   claude_md_missing: "  ✗  项目规约   未找到（运行 /init 可生成 AGENTS.md）"
   memory_dir_with_count: "  ✓  记忆目录    {path} ({count} 条)"
@@ -785,6 +800,8 @@ status:
   parallel_tools_capped: "max_tools_per_turn = {current} 低于该端点支持的上限（{supported}）。每多一趟往返就重发一遍完整上下文，是输入成本的一阶驱动因素。"
   other_profiles: "其他分组: {names}"
   mcp_servers: "MCP servers: {count}"
+  search_configured: "WebSearch: {provider}（已配置，工具可用）"
+  search_unavailable: "WebSearch: 未启用（{reason}）"
   # headless REPL / `-p` / ACP stdio / daemon TCP 四个非 UI 入口在缺 Key 时
   # 退出的附加提示:引导用户去 TUI 完成首次配置,或设置环境变量后重试。
   api_key_missing_onboarding_headless: |-
@@ -923,6 +940,7 @@ dialog:
     plugins_add_local: "[Plugins] 输入本地插件路径 (Enter 提交 / Esc 取消)"
     profile_rename: "[Model] 重命名分组 (Enter 提交 / Esc 取消)"
     profile_field: "[Model] 编辑 {field} (Enter 提交 / Esc 取消)"
+    settings_field: "[Config] 编辑 {field} (Enter 提交 / Esc 取消)"
     schedule_field: "[定时任务] 编辑 {field} (Enter 提交 / Esc 取消)"
     schedule_freq_daily: "[定时任务] 输入时间 HH:MM (Enter 提交 / Esc 取消)"
     schedule_freq_hourly: "[定时任务] 输入分钟 0-59 (Enter 提交 / Esc 取消)"
@@ -934,7 +952,7 @@ dialog:
 
 settings:
   title: "配置设置"
-  hint: "  ↑↓ 移动  Enter/←→ 切换  Ctrl+S 保存  Esc 取消"
+  hint: "  ↑↓ 移动  Enter 编辑/切换  ←→ 切换  Ctrl+S 保存  Esc 取消"
   saved: "配置已保存"
   save_failed: "配置保存失败: {err}"
   rebuild_failed: "配置已保存，但重建连接失败: {err}（当前会话仍使用旧配置，重启后生效）"
@@ -955,10 +973,15 @@ settings:
     thinking_switch: "思考开关"
     log_level: "日志级别"
     language: "语言"
+    search_provider: "搜索后端"
+    search_api_key: "搜索 API Key"
+    search_max_results: "搜索结果条数"
   error:
     invalid_max_tokens: "Max Tokens 必须是正整数"
     invalid_context_window: "上下文长度必须是正整数"
     invalid_thinking_budget: "思考预算必须是正整数（留空表示不开启）"
+    invalid_search_max_results: "搜索结果条数必须是 1-10 之间的整数（当前 {value}）"
+    empty_search_provider: "搜索后端不能为空（可选 tavily / brave）"
 
 profile:
   title: "调用分组管理"

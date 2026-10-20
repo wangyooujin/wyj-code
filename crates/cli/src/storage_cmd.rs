@@ -187,6 +187,78 @@ fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
         println!("  损坏 {}: {reason}", path.display());
     }
 
+    // ── 4. 损坏的 checkpoint 文件 ──
+    //
+    // manifest 只是索引，真正的内容在 `<id>.json`。此前 doctor 只查 manifest，
+    // 于是「索引完好、内容读不出」这一整类损坏完全不可见——2026-10-20 实测有
+    // 120 个 checkpoint（约 133 MB）因脱敏正则破坏 JSON 结构而永久读不出，
+    // 而 `doctor` 报的是「损坏 0 个」。
+    //
+    // 只报不删：这些文件仍占着磁盘，但删不删是用户的决定。
+    // `storage prune --yes` 会顺带清理（见 `run_prune`）。
+    let mut broken_checkpoints = Vec::new();
+    let mut checkpoint_files = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".checkpoints") {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let file_path = file.path();
+                if file_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if file_path.file_name().is_some_and(|n| n == "manifest.json") {
+                    continue;
+                }
+                checkpoint_files += 1;
+                let Ok(content) = std::fs::read(&file_path) else {
+                    broken_checkpoints.push((file_path, "读取失败".to_string()));
+                    continue;
+                };
+                if let Err(error) = serde_json::from_slice::<serde_json::Value>(&content) {
+                    broken_checkpoints.push((file_path, error.to_string()));
+                }
+            }
+        }
+    }
+    let broken_bytes: u64 = broken_checkpoints
+        .iter()
+        .filter_map(|(path, _)| std::fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .sum();
+    println!(
+        "checkpoint 文件: {} 个,损坏 {} 个 / {} 字节",
+        checkpoint_files,
+        broken_checkpoints.len(),
+        broken_bytes
+    );
+    for (path, reason) in broken_checkpoints.iter().take(5) {
+        println!("  损坏 {}: {reason}", path.display());
+    }
+    if broken_checkpoints.len() > 5 {
+        println!("  ... 另有 {} 个未列出", broken_checkpoints.len() - 5);
+    }
+    if !broken_checkpoints.is_empty() {
+        if cfg.storage.checkpoints_per_session > 0 {
+            println!("  提示:`storage prune --yes` 会删除损坏的 checkpoint(内容已不可恢复)");
+        } else {
+            // prune 的 checkpoint 段整体受 `checkpoints_per_session > 0` 门控
+            // （0 = 不限条数，等同关闭该子系统的清理），此时上面的建议不成立。
+            println!(
+                "  提示:当前 storage.checkpoints_per_session = 0(不限条数),prune 不会处理 \
+                 checkpoint;把它们临时设为正数后运行 `storage prune --yes`"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -205,10 +277,27 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
     let sessions_dir = config_base.join("sessions");
 
     // ── checkpoint:按 session 淘汰超限的最老 checkpoint ──
-    // `checkpoints_per_session` 上限由 `CheckpointStore::enforce_retention`
-    // 实现(它只在 store 打开时被调用),这里对每个 session 主动触发一次。
+    //
+    // **必须带 `with_max_per_session` 和 `with_cas`**：`CheckpointStore::new()`
+    // 给的 `max_per_session` 是 0，而 `enforce_retention` 在 0 时第一行就
+    // `return Ok(())`——此前这里正是用 `new()`，所以 `storage prune` 的 checkpoint
+    // 分支**从未真正删过任何东西**（配置写着 20，实际目录里 33/39 条的残留就是证据）。
+    //
+    // `with_cas` 同样必需：修好外化之后，checkpoint 的历史正文只有 `cas://`
+    // 占位符，删除时必须 `release` 对应 blob，否则 CAS 池只增不减。
     let mut checkpoint_sessions = 0usize;
+    let mut checkpoint_dropped = 0usize;
+    let mut checkpoint_failed = 0usize;
+    let mut checkpoint_reexternalized = 0usize;
+    let mut checkpoint_freed = 0u64;
+    let mut corrupt_removed = 0usize;
+    let mut corrupt_freed = 0u64;
     if storage.checkpoints_per_session > 0 {
+        let cas = wyj_core::workspace_cas::WorkspaceCas::open_silently(
+            &config_base.join("cas"),
+            storage.cas_max_blob_bytes,
+        )
+        .map(std::sync::Arc::new);
         if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -219,28 +308,170 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
                     continue;
                 };
                 checkpoint_sessions += 1;
-                if dry_run {
-                    continue;
-                }
-                match wyj_core::CheckpointStore::new(&sessions_dir, session_id) {
-                    Ok(store) => {
-                        if let Err(error) = store.enforce_retention() {
-                            tracing::warn!("checkpoint 保留策略执行失败 {session_id}: {error}");
-                        }
-                    }
+                let mut store = match wyj_core::CheckpointStore::new(&sessions_dir, session_id) {
+                    Ok(store) => store.with_max_per_session(storage.checkpoints_per_session),
                     Err(error) => {
                         tracing::warn!("打开 checkpoint 目录失败 {session_id}: {error}");
+                        checkpoint_failed += 1;
+                        continue;
+                    }
+                };
+                if let Some(cas) = cas.clone() {
+                    store = store.with_cas(cas);
+                }
+                let before = store.list().map(|list| list.len()).unwrap_or(0);
+                if dry_run {
+                    // dry-run 只报计划，不改动 manifest / 不删文件。
+                    let over = before.saturating_sub(storage.checkpoints_per_session);
+                    checkpoint_dropped += over;
+                    // 损坏数也要报：它是「删不删」这个决定的一部分，
+                    // dry-run 报不出来就等于让用户盲选。
+                    if let Ok((count, freed)) = store.scan_corrupt() {
+                        corrupt_removed += count;
+                        corrupt_freed += freed;
+                    }
+                    continue;
+                }
+                // **先清损坏、再外化、最后裁剪**。
+                //
+                // 顺序理由：
+                // · 损坏文件先清掉，`reexternalize_in_place` 就不必逐个尝试
+                //   解析它们（它会 warn 并跳过，但那次读盘是白费的）。
+                // · 外化必须在裁剪之前：裁剪会删掉最老的 checkpoint，若先删再
+                //   外化，被删那批里内联的 base64 就白丢了「本来能省下来」的
+                //   机会。反过来（先外化后裁剪）的代价只是对将被淘汰的条目多做
+                //   一次 intern + release（两者相抵，净零）。
+                match store.purge_corrupt() {
+                    Ok((count, freed)) => {
+                        corrupt_removed += count;
+                        corrupt_freed += freed;
+                    }
+                    Err(error) => {
+                        tracing::warn!("清理损坏 checkpoint 失败 {session_id}: {error}");
+                        checkpoint_failed += 1;
+                    }
+                }
+                match store.reexternalize_in_place() {
+                    Ok((count, freed)) => {
+                        checkpoint_reexternalized += count;
+                        checkpoint_freed += freed;
+                    }
+                    Err(error) => {
+                        tracing::warn!("checkpoint 重新外化失败 {session_id}: {error}");
+                        checkpoint_failed += 1;
+                    }
+                }
+                match store.enforce_retention() {
+                    Ok(()) => {
+                        let after = store.list().map(|list| list.len()).unwrap_or(before);
+                        checkpoint_dropped += before.saturating_sub(after);
+                    }
+                    Err(error) => {
+                        tracing::warn!("checkpoint 保留策略执行失败 {session_id}: {error}");
+                        checkpoint_failed += 1;
                     }
                 }
             }
         }
     }
     println!(
-        "checkpoint: {} 个 session 目录,上限 {} 条/session{}",
+        "checkpoint: {} 个 session 目录,上限 {} 条/session,{} {} 条{}",
         checkpoint_sessions,
         storage.checkpoints_per_session,
-        if dry_run { "(未执行)" } else { "" }
+        if dry_run { "将删除" } else { "已删除" },
+        checkpoint_dropped,
+        if checkpoint_failed > 0 {
+            format!("({checkpoint_failed} 个目录失败)")
+        } else {
+            String::new()
+        }
     );
+    if !dry_run {
+        // 存量外化是「同一件事的另一半」：裁剪减条数，外化减单条体积。
+        // 实测最重的一个 session 20 条共 813 MB（单条 42 MB），条数早已
+        // 在上限内，能省的只有内联字节。
+        println!(
+            "checkpoint: 重新外化 {} 个文件,释放 {} 字节",
+            checkpoint_reexternalized, checkpoint_freed
+        );
+    }
+    if corrupt_removed > 0 {
+        println!(
+            "checkpoint: {} {} 个损坏文件,{} {} 字节{}",
+            if dry_run { "发现" } else { "已删除" },
+            corrupt_removed,
+            if dry_run { "可释放" } else { "释放" },
+            corrupt_freed,
+            if dry_run {
+                "(内容已不可恢复)"
+            } else {
+                ""
+            }
+        );
+    }
+
+    // ── 损坏的 session 文件 ──
+    //
+    // 与 checkpoint 的损坏同源（脱敏正则破坏 JSON 结构），但对用户更致命：
+    // 这是完整对话历史，损坏等于该会话永久打不开。doctor 已能检出，这里负责清。
+    //
+    // 只删**确认无法解析**的：能解析的一个都不碰。删除前不做备份——`prune --yes`
+    // 本身就是显式确认动作，且这些内容已不可读（保留一个读不出的文件没有意义）。
+    let mut broken_sessions_removed = 0usize;
+    let mut broken_sessions_freed = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // `.meta.json` 是旁路元数据，不是 session 正文。
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".meta.json") {
+                continue;
+            }
+            let Ok(content) = std::fs::read(&path) else {
+                continue;
+            };
+            if serde_json::from_slice::<serde_json::Value>(&content).is_ok() {
+                continue;
+            }
+            if dry_run {
+                broken_sessions_removed += 1;
+                broken_sessions_freed += content.len() as u64;
+                continue;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    broken_sessions_removed += 1;
+                    broken_sessions_freed += content.len() as u64;
+                    // 配套的 meta 旁路文件也一并清掉，否则 `list()` 会列出一个
+                    // 点进去就报错的会话。
+                    let meta = path.with_extension("meta.json");
+                    let _ = std::fs::remove_file(&meta);
+                }
+                Err(error) => {
+                    tracing::warn!("删除损坏 session 失败 {}: {error}", path.display());
+                }
+            }
+        }
+    }
+    if broken_sessions_removed > 0 {
+        println!(
+            "session: {} {} 个损坏文件,{} {} 字节{}",
+            if dry_run { "发现" } else { "已删除" },
+            broken_sessions_removed,
+            if dry_run { "可释放" } else { "释放" },
+            broken_sessions_freed,
+            if dry_run {
+                "(内容已不可恢复,加 --yes 删除)"
+            } else {
+                ""
+            }
+        );
+    }
 
     // ── CAS blob:按总量上限回收 ref_count == 0 的 blob ──
     if storage.cas_total_bytes > 0 {

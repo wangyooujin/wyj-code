@@ -21,6 +21,15 @@ pub enum InputOwner {
     Plugins(PluginsInputField),
     Profile(ProfileInputField),
     Schedule(ScheduleInputField),
+    /// `/config` 面板的文本字段编辑借用态（search api_key / max_results）。
+    Settings(SettingsInputField),
+}
+
+/// `/config` 面板可借用输入框的文本字段。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SettingsInputField {
+    /// 字段下标（`SETTINGS_FIELD_SPECS` 顺序）
+    Field { field_idx: usize },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +126,21 @@ impl InputOwner {
                 }),
                 Theme::claude_color(),
             ),
+            InputOwner::Settings(SettingsInputField::Field { field_idx }) => (
+                wyj_i18n::tr_fmt(
+                    "dialog.input_owner.settings_field",
+                    &[(
+                        "field",
+                        &wyj_i18n::tr(
+                            SETTINGS_FIELD_SPECS
+                                .get(*field_idx)
+                                .map(|s| s.key)
+                                .unwrap_or(""),
+                        ),
+                    )],
+                ),
+                Theme::claude_color(),
+            ),
         }
     }
 
@@ -130,6 +154,7 @@ impl InputOwner {
             InputOwner::Plugins(_) => state.plugins_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Schedule(_) => state.schedule_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Settings(_) => state.settings_dialog.as_mut().map(|d| &mut d.live_input),
         }
     }
 
@@ -141,6 +166,7 @@ impl InputOwner {
             InputOwner::Plugins(_) => state.plugins_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Schedule(_) => state.schedule_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Settings(_) => state.settings_dialog.as_ref().map(|d| &d.live_input),
         }
     }
 
