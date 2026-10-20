@@ -254,8 +254,10 @@ pub fn clip_output(s: &str, max_bytes: usize) -> String {
     }
     let head_budget = max_bytes / 2;
     let tail_budget = max_bytes - head_budget;
+    // 头部向下取整、尾部向上取整：两边保留的字节数都不超过各自预算。
+    // 此前尾部也用 floor，保留长度会超出 `tail_budget` 最多 3 字节。
     let head_end = crate::textutil::floor_char_boundary(s, head_budget);
-    let tail_start = crate::textutil::floor_char_boundary(s, s.len() - tail_budget);
+    let tail_start = crate::textutil::ceil_char_boundary(s, s.len() - tail_budget);
     format!(
         "{}\n…[verify] 中间 {} 字节已省略…\n{}",
         &s[..head_end],

@@ -92,11 +92,6 @@ impl AgentMode {
         }
     }
 
-    /// 全部可选模式名，供 `--permission-mode` 的报错文案与 `/mode` 提示共用。
-    pub fn all_labels() -> &'static [&'static str] {
-        &["auto", "plan", "bypass"]
-    }
-
     /// Plan 模式下进入执行层复核的工具集；Write/Bash 不代表任意写入获批。
     pub fn allowed_tools(&self) -> Option<&'static [&'static str]> {
         match self {

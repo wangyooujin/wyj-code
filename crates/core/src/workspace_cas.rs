@@ -140,7 +140,7 @@ impl WorkspaceCas {
         let meta = self.meta_path(&hash);
 
         let _guard = self.lock_hash(&hash, "intern CAS blob")?;
-        let now = now_iso();
+        let now = epoch_seconds();
         if blob.exists() {
             // 已存在:原子地 ref_count++ 并刷新 last_ref_at
             self.bump_ref_count(&meta, &now)?;
@@ -311,10 +311,11 @@ impl WorkspaceCas {
     ///
     /// 注意:本方法当前**没有任何生产调用点**(仅单测使用),因此
     /// `~/.wyj-code/cas` 目前是只增不减的。此前用
-    /// `StorageRetentionCfg.cas_total_bytes` / `cas_gc_on_start` 描述
-    /// "Phase 4 GC" 的文档与配置项已一并删除 —— 那些配置项从上线起就没有
-    /// 消费点,留着会让人误以为存在自动回收。接线时同步在
-    /// `StorageRetentionCfg` 里加回对应字段与实现。
+    /// 按 `total_budget` 回收超出预算的 blob（LRU 淘汰）。
+    ///
+    /// 生产调用点：进程启动时 `cli/main.rs` 按 `StorageRetentionCfg.cas_total_bytes`
+    /// 跑一次；`storage prune` 也会调它。只回收 `ref_count == 0` 的 blob，
+    /// 因此依赖会话结束时逐个 `release`——两个机制缺一，pool 就会无界增长。
     pub fn gc(&self, total_budget: u64) -> Result<GcStats> {
         let walker = self.root.join("sha256");
         if !walker.exists() {
@@ -447,7 +448,12 @@ fn write_meta_atomic(path: &Path, value: &CasMeta) -> Result<()> {
     Ok(())
 }
 
-fn now_iso() -> String {
+/// CAS 条目时间戳：`epoch:<unix 秒>`。
+///
+/// **不是 ISO 时间**——这个函数此前叫 `now_iso`，与 `crate::history::now_iso()`
+/// 同名却产出完全不同的格式（`epoch:1789...` vs `2026-10-20T08:45:00Z`），
+/// 读代码时极易误用。改名后语义自明。
+fn epoch_seconds() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

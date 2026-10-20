@@ -106,6 +106,10 @@ impl ClaudeMdLoader {
 
     /// 每轮对话开始时调用：重新读盘拼出完整的 `<system-reminder>` 文本，
     /// 无任何文件时返回 None。
+    ///
+    /// **同步版本**：会阻塞当前线程。`run_turn` 这类 async 上下文请用
+    /// [`Self::turn_reminder_async`]——规约文件链动辄几十 KB，每轮都要
+    /// 同步读盘，在 async 运行时里做会占住 worker 线程。
     pub fn turn_reminder(&self) -> Option<String> {
         let mut sections: Vec<(ClaudeMdSource, PathBuf, String)> = vec![];
         if let Some(g) = &self.global_dir {
@@ -125,6 +129,42 @@ impl ClaudeMdLoader {
             "The following project memory files apply to the current project. Follow their instructions.",
             &sections,
         ))
+    }
+
+    /// [`Self::turn_reminder`] 的异步版本：把同步读盘放进 `spawn_blocking`，
+    /// 不占住 async 运行时的 worker 线程。
+    ///
+    /// **不缓存内容**：每轮仍然重新读盘，运行期间编辑规约文件立即生效
+    /// （这是本模块的既有语义，见模块文档）。这里只改「在哪个线程读」，
+    /// 不改「什么时候读」。
+    pub async fn turn_reminder_async(&self) -> Option<String> {
+        // `ClaudeMdLoader` 只含 `PathBuf` / `Mutex<HashSet>`，可跨线程移动；
+        // 但 `turn_reminder` 借用 `self`，因此克隆一份廉价的状态再搬进去。
+        let global_dir = self.global_dir.clone();
+        let chain_dirs = self.chain_dirs.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sections: Vec<(ClaudeMdSource, PathBuf, String)> = vec![];
+            if let Some(g) = &global_dir {
+                if let Some(text) = load_dir_files(g) {
+                    sections.push((ClaudeMdSource::Global, g.clone(), text));
+                }
+            }
+            for d in &chain_dirs {
+                if let Some(text) = load_dir_files(d) {
+                    sections.push((ClaudeMdSource::Project, d.clone(), text));
+                }
+            }
+            if sections.is_empty() {
+                return None;
+            }
+            Some(wrap_reminder(
+                "The following project memory files apply to the current project. Follow their instructions.",
+                &sections,
+            ))
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// 工具触达新目录时调用：从该目录**逐级向上**找，直到项目根，沿途注入每个
@@ -282,10 +322,9 @@ fn truncate_rule_text(text: &str) -> String {
     if text.len() <= MAX_RULE_FILE_BYTES {
         return text.to_string();
     }
-    let mut end = MAX_RULE_FILE_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    // 边界回退走 `crate::textutil::floor_char_boundary`（全仓唯一实现），
+    // 不再手写一份相同的循环。
+    let end = crate::textutil::floor_char_boundary(text, MAX_RULE_FILE_BYTES);
     format!(
         "{}\n\n[truncated: this rules file is {} bytes; only the first {} bytes were loaded]",
         &text[..end],

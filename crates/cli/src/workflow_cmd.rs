@@ -489,7 +489,7 @@ fn prepare_workflow_workspace_at(
         CheckpointStore::configured(&config.join("sessions"), format!("workflow-{}", spec.id))?;
     let checkpoint = checkpoint_store.create(
         &repository_root,
-        &[],
+        Vec::new(),
         CheckpointKind::Manual,
         Some(format!("workflow {} worktree base", spec.id)),
     )?;

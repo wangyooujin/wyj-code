@@ -225,14 +225,6 @@ impl PluginRuntimeCatalog {
         }
         results
     }
-
-    pub fn start_lsp(&self, name: &str) -> Result<Child> {
-        let spec = self
-            .lsp_servers
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown plugin LSP server: {name}"))?;
-        spawn_process(spec, true)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

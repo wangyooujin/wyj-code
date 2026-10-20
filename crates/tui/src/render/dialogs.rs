@@ -1157,6 +1157,24 @@ pub(super) fn scroll_window_start(total: usize, cursor: usize, visible: usize) -
     }
 }
 
+/// 带固定尾部的正文窗口：返回 `(起始行, 可见行数)`，保证 `cursor` 落在窗口内。
+///
+/// 面板高度一律被屏幕高度封顶，所以"有多少行？"和"屏幕能放几行？"必须分开算。
+/// `footer_rows` 是尾部固定区（分隔线 / 错误行 / 操作提示），它不参与滚动；
+/// 正文窗口吃掉剩下的高度。**每个 `rows()` + Paragraph 的面板都必须走这里**——
+/// 少走一处的表现就是「光标能移到屏幕外、尾部提示被裁掉」，而渲染代码看上去
+/// 完全正常（Paragraph 从不 scroll，超出部分静默丢弃）。菜单类浮层 `footer_rows`
+/// 传 0。
+pub(super) fn body_window(
+    total: usize,
+    cursor: usize,
+    inner_rows: u16,
+    footer_rows: usize,
+) -> (usize, usize) {
+    let visible = (inner_rows as usize).saturating_sub(footer_rows).max(1);
+    (scroll_window_start(total, cursor, visible), visible)
+}
+
 pub(super) fn draw_mcp_dialog(
     f: &mut Frame,
     dialog: &McpDialog,
@@ -2437,7 +2455,21 @@ pub(super) fn draw_profile_dialog(
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (row_idx, row) in rows.iter().enumerate() {
+    // 正文行必须按光标开窗：面板高度被屏幕封顶后，旧实现把 `rows()` 全量塞进一个
+    // 从不 `.scroll()` 的 Paragraph，超出 inner 的部分连同尾部的「+ 新建分组」和
+    // 两条提示一起被裁掉——而 `cursor` 仍能一路往下走，于是用户看到的是一个没有
+    // ▶ 的静态列表（分组多、或展开字段多时必现）。尾部 4 行（分隔线 + 错误行 +
+    // 两条提示）固定常驻，正文窗口只吃剩下的高度；窗口起点每帧按光标重算，与
+    // mcp/skills/plugins 列表共用同一个助手。
+    const FOOTER_LINES: usize = 4;
+    let (window_start, visible_rows) =
+        body_window(rows.len(), dialog.cursor, inner.height, FOOTER_LINES);
+    for (row_idx, row) in rows
+        .iter()
+        .enumerate()
+        .skip(window_start)
+        .take(visible_rows)
+    {
         let selected_row = row_idx == dialog.cursor;
         let editing = Some(*row) == editing_row;
 
@@ -2618,7 +2650,18 @@ pub(super) fn draw_schedule_dialog(
 
     let now = chrono::Utc::now();
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (row_idx, row) in rows.iter().enumerate() {
+    // 与 `draw_profile_dialog` 同一处结构：高度被屏幕封顶后，全量塞进无 scroll 的
+    // Paragraph 会让光标走到屏幕外、末尾「+ 新建任务」和两条提示一起被裁掉。
+    // 尾部 4 行（分隔线 + 错误行 + 两条提示）固定常驻，正文按光标开窗。
+    const FOOTER_LINES: usize = 4;
+    let (window_start, visible_rows) =
+        body_window(rows.len(), dialog.cursor, inner.height, FOOTER_LINES);
+    for (row_idx, row) in rows
+        .iter()
+        .enumerate()
+        .skip(window_start)
+        .take(visible_rows)
+    {
         let selected_row = row_idx == dialog.cursor;
         let editing = Some(*row) == editing_row;
 
@@ -2763,10 +2806,20 @@ pub(super) fn draw_profile_list_overlay(
     items: Vec<String>,
     selected: usize,
 ) {
+    let total = items.len();
     let width = (area.width * 6 / 10).clamp(40, 90).min(area.width);
-    let height = ((items.len() as u16) + 2)
+    let height = ((total as u16) + 2)
         .min(area.height.saturating_sub(2))
         .max(4);
+    // 与操作菜单同一条规则：高度被屏幕封顶后必须按选中项开窗，否则超出 inner
+    // 的条目（以及它们的 ▶）会被 Paragraph 静默裁掉。模板/未保存确认这些列表
+    // 目前都不长，但"不长"不是不变式——入口在这里，就别留第二套写法。
+    let (start, visible) = body_window(total, selected, height.saturating_sub(2), 0);
+    let scroll_hint = if total > visible {
+        format!(" · {}/{}", (selected + 1).min(total), total)
+    } else {
+        String::new()
+    };
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let overlay_area = Rect::new(x, y, width, height);
@@ -2776,7 +2829,7 @@ pub(super) fn draw_profile_list_overlay(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
-            format!(" {} ", wyj_i18n::tr(title_key)),
+            format!(" {}{scroll_hint} ", wyj_i18n::tr(title_key)),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
@@ -2788,6 +2841,8 @@ pub(super) fn draw_profile_list_overlay(
     let lines: Vec<Line<'static>> = items
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, item)| {
             let marker = if i == selected { "▶ " } else { "  " };
             let text = truncate_line(&format!("{marker}{item}"), w);
@@ -2829,9 +2884,23 @@ pub(super) fn draw_action_menu<T, A: PartialEq>(
     let width = (anchor.width * 7 / 10)
         .clamp(36, 72)
         .min(area.width.saturating_sub(4));
-    let height = ((menu.items.len() as u16) + 2)
+    let total = menu.items.len();
+    let height = ((total as u16) + 2)
         .min(area.height.saturating_sub(4))
         .max(4);
+    // 高度被屏幕封顶后，条目必须**按光标位置开窗**：旧实现把全部 items 交给一个
+    // 从不 `.scroll()` 的 Paragraph，超出 inner 的部分被直接裁掉，而 `selected`
+    // 照样能一路往下走——于是 `/model` 拉回上百个模型时，光标和 ▶ 高亮一起走到
+    // 屏幕外，现场表现就是"按 ↓ 列表不动、下面的选项永远看不见"（选择其实已经
+    // 生效，用户在盲选）。窗口起点每帧按光标重算，与 mcp/skills/plugins 列表共用
+    // `scroll_window_start`，无需在 `ActionMenu` 里新增滚动状态。
+    let (start, visible) = body_window(total, menu.selected, height.saturating_sub(2), 0);
+    // 有内容在窗口外时在标题里给出位置，否则用户不知道"下面还有"。
+    let scroll_hint = if total > visible {
+        format!(" · {}/{}", menu.selected + 1, total)
+    } else {
+        String::new()
+    };
     // **贴着父面板摆放，而不是叠在它身上。** 之前子菜单和父面板用的是同一个
     // `area`（整屏）居中，两者坐标完全重合，父面板的文字从弹窗左右两侧露出来
     // （实测第二行 profile 被切掉一半），看起来像渲染错位而不是"打开了一个
@@ -2855,7 +2924,7 @@ pub(super) fn draw_action_menu<T, A: PartialEq>(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Theme::claude_color()))
         .title(Span::styled(
-            format!(" {title} "),
+            format!(" {title}{scroll_hint} "),
             Style::default()
                 .fg(Theme::claude_color())
                 .add_modifier(Modifier::BOLD),
@@ -2868,6 +2937,8 @@ pub(super) fn draw_action_menu<T, A: PartialEq>(
         .items
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, item)| {
             let marker = if i == menu.selected { "▶ " } else { "  " };
             let mut text = format!("{marker}{}", item.label);
@@ -2999,4 +3070,192 @@ pub(super) fn parse_iso_to_secs(s: &str) -> Option<u64> {
         .copied()
         .unwrap_or(0);
     Some((y_days + mo_days + day.saturating_sub(1)) * 86400 + h * 3600 + m * 60 + sec)
+}
+
+#[cfg(test)]
+mod dialog_window_scroll_tests {
+    use super::*;
+    use crate::app::{ActionMenu, ActionMenuItem, ProfileDialog};
+    use crate::test_support::render_to_text;
+    use wyj_config::{Config, Profile};
+
+    fn item(label: String, action: u8) -> ActionMenuItem<u8> {
+        ActionMenuItem {
+            label,
+            action,
+            dangerous: false,
+            disabled: false,
+            disabled_reason: None,
+        }
+    }
+
+    fn render_menu(menu: &ActionMenu<(), u8>, width: u16, height: u16) -> String {
+        render_to_text(
+            |f| {
+                draw_action_menu(
+                    f,
+                    Rect::new(0, 0, width, height),
+                    Rect::new(10, 2, 60, 18),
+                    "models",
+                    menu,
+                )
+            },
+            width,
+            height,
+        )
+    }
+
+    /// 用户现场：`/model` 的模型下拉有上百条，光标走到第 N 行后旧实现只画
+    /// `items[0..inner]`，选中项与 ▶ 一起消失在屏幕外，按 ↓ 看起来毫无反应。
+    #[test]
+    fn long_action_menu_scrolls_to_keep_the_selected_item_visible() {
+        let items = (0..60u8)
+            .map(|i| item(format!("model-{i:02}"), i))
+            .collect();
+        let mut menu = ActionMenu::new((), items);
+        menu.selected = 50;
+
+        let text = render_menu(&menu, 80, 24);
+        let selected_line = text
+            .lines()
+            .find(|l| l.contains("model-50"))
+            .unwrap_or_else(|| panic!("selected item model-50 is off screen:\n{text}"));
+
+        // 高亮必须跟着选中项一起进窗口，而不是留在屏幕外的某一行上。
+        assert!(
+            selected_line.contains('▶'),
+            "no cursor on {selected_line:?}"
+        );
+        // 80x24 的菜单 inner 是 18 行：窗口应落在 33..=50。
+        assert!(text.contains("model-33"), "window did not scroll:\n{text}");
+        assert!(
+            !text.contains("model-32"),
+            "window start should be 33, found model-32:\n{text}"
+        );
+        assert!(
+            !text.contains("model-00"),
+            "first page should be scrolled away:\n{text}"
+        );
+        // 标题里的位置指示让用户知道"下面还有"。
+        assert!(text.contains("51/60"), "missing scroll indicator:\n{text}");
+    }
+
+    /// 短菜单（绝大多数面板的行操作菜单）保持原样：全部可见、不出现位置指示。
+    #[test]
+    fn short_action_menu_renders_every_item_without_scrolling() {
+        let items = (0..3u8).map(|i| item(format!("row-{i}"), i)).collect();
+        let menu = ActionMenu::new((), items);
+
+        let text = render_menu(&menu, 80, 24);
+        for i in 0..3 {
+            assert!(
+                text.contains(&format!("row-{i}")),
+                "missing row-{i}:\n{text}"
+            );
+        }
+        assert!(!text.contains("1/3"), "no indicator needed:\n{text}");
+    }
+
+    fn many_profiles_dialog(count: usize) -> ProfileDialog {
+        let mut cfg = Config::default();
+        cfg.profiles = (0..count)
+            .map(|i| Profile {
+                name: format!("prof-{i:02}"),
+                ..Profile::default()
+            })
+            .collect();
+        cfg.active_profile = cfg.profiles[0].name.clone();
+        let mut dialog = ProfileDialog::new_for_onboarding(&cfg);
+        dialog.expanded = None;
+        dialog.cursor = dialog.rows().len() - 1;
+        dialog
+    }
+
+    /// 同一个根因的第二个落点：分组面板的分组一多，旧实现把全部行塞进无 scroll
+    /// 的 Paragraph，光标走到屏幕外、末尾「+ 新建分组」和两条提示一起被裁掉。
+    #[test]
+    fn profile_rows_scroll_to_keep_cursor_and_footer_visible() {
+        let dialog = many_profiles_dialog(40);
+        assert_eq!(dialog.rows().len(), 41); // 40 头行 + 新建行
+
+        let text = render_to_text(
+            |f| draw_profile_dialog(f, &dialog, None, Rect::new(0, 0, 80, 24)),
+            80,
+            24,
+        );
+
+        let add_new = wyj_i18n::tr("profile.dialog.add_new_row");
+        let add_line = text
+            .lines()
+            .find(|l| l.contains(&add_new))
+            .unwrap_or_else(|| panic!("add-new row is off screen:\n{text}"));
+        assert!(add_line.contains('▶'), "no cursor on {add_line:?}");
+
+        // 窗口起点 = 40 + 1 - 16 = 25，因此 prof-25 在、prof-24 不在。
+        assert!(text.contains("prof-25"), "window did not scroll:\n{text}");
+        assert!(
+            !text.contains("prof-24"),
+            "window start should be 25:\n{text}"
+        );
+        assert!(
+            !text.contains("prof-00"),
+            "first page should be gone:\n{text}"
+        );
+
+        // 尾部固定区（分隔线 + 错误行 + 两条提示）不得被正文挤掉。
+        let hint2: String = wyj_i18n::tr("profile.dialog.hint2")
+            .chars()
+            .take(8)
+            .collect();
+        assert!(text.contains(&hint2), "footer hint2 is missing:\n{text}");
+    }
+
+    /// 模板/未保存确认这类列表浮层是同一个入口：条目超出封顶高度时，
+    /// 选中项同样必须留在窗口内（模板列表当前不长，但写法不该有两套）。
+    #[test]
+    fn list_overlay_scrolls_to_keep_the_selected_item_visible() {
+        let items: Vec<String> = (0..40).map(|i| format!("item-{i:02}")).collect();
+        let text = render_to_text(
+            |f| {
+                draw_profile_list_overlay(
+                    f,
+                    Rect::new(0, 0, 80, 24),
+                    "profile.overlay.template_title",
+                    items.clone(),
+                    30,
+                )
+            },
+            80,
+            24,
+        );
+
+        let selected_line = text
+            .lines()
+            .find(|l| l.contains("item-30"))
+            .unwrap_or_else(|| panic!("selected item item-30 is off screen:\n{text}"));
+        assert!(
+            selected_line.contains('▶'),
+            "no cursor on {selected_line:?}"
+        );
+        // 80x24：inner 20 行，窗口应落在 11..=30。
+        assert!(text.contains("item-11"), "window did not scroll:\n{text}");
+        assert!(
+            !text.contains("item-10"),
+            "window start should be 11:\n{text}"
+        );
+        assert!(text.contains("31/40"), "missing scroll indicator:\n{text}");
+    }
+
+    /// 分组少时不动窗口：仍从第一行画起，行为与修复前一致。
+    #[test]
+    fn small_profile_dialog_starts_at_the_first_row() {
+        let dialog = many_profiles_dialog(3);
+        let text = render_to_text(
+            |f| draw_profile_dialog(f, &dialog, None, Rect::new(0, 0, 80, 24)),
+            80,
+            24,
+        );
+        assert!(text.contains("prof-00"));
+        assert!(text.contains(&wyj_i18n::tr("profile.dialog.add_new_row")));
+    }
 }

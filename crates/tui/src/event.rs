@@ -214,15 +214,6 @@ pub enum McpConnFailReason {
     Timeout,
 }
 
-/// 来自 UI 的用户事件（保留定义，目前未使用）
-#[derive(Debug, Clone)]
-pub enum UiEvent {
-    Submit(String),
-    ScrollUp,
-    ScrollDown,
-    Quit,
-}
-
 /// 检测是否是立即退出快捷键 (Ctrl+D)
 pub fn is_quit(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL))

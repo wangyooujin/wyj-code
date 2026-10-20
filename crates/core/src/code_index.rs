@@ -83,11 +83,6 @@ impl ProjectCodeIndex {
         })
     }
 
-    pub fn with_max_file_bytes(mut self, bytes: u64) -> Self {
-        self.max_file_bytes = bytes.max(4096);
-        self
-    }
-
     pub fn rebuild(&self) -> Result<CodeIndexStatus> {
         let _guard = self.build_lock.lock().unwrap();
         self.rebuild_locked()?;

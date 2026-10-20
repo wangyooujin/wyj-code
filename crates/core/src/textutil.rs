@@ -30,6 +30,87 @@ pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
     end
 }
 
+/// 把 `idx` **向上**取到 `s` 中最近的 char boundary（`>= idx`）。保证返回值满足
+/// `s.is_char_boundary(idx) == true`。
+///
+/// 与 [`floor_char_boundary`] 方向相反，用途也不同：
+///
+/// - **头部**截断用 floor（`&s[..end]`，长度 `<= budget`）。
+/// - **尾部**截断用 ceil（`&s[start..]`，长度 `<= budget`）——尾部起点必须
+///   向上挪，留在预算之内。
+///
+/// - `idx >= s.len()`：原样返回 `s.len()`（末尾也是合法 boundary）。
+/// - `idx == 0`：原样返回 `0`（`0` 永远是 boundary）。
+/// - 否则：若 `idx` 已落在 boundary 上，原样返回；否则线性向后进到最近的
+///   boundary。最坏情况前进 3 字节（UTF-8 单字符最长 4 字节）。
+pub fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    if s.is_char_boundary(idx) {
+        return idx;
+    }
+    let mut start = idx;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    start
+}
+
+/// 按字节上限截断，保证不切断多字节字符。`s.len() <= max_bytes` 时原样借用返回。
+///
+/// **全仓唯一的字节截断实现**：`core/serialize.rs` 与 `core/memory.rs` 此前
+/// 各带一份手写副本（连循环体都逐行相同）。三处副本对**尾部**边界的处理
+/// 并不一致——`core/verify.rs::clip_output` 用 floor 取尾部起点，保留的字节数
+/// 会**超出** `tail_budget` 最多 3 字节；这里用 ceil（正确方向），与
+/// `core/serialize.rs` / `tools/textutil.rs` 的原行为一致。
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    let end = floor_char_boundary(s, max_bytes);
+    &s[..end]
+}
+
+/// 保头保尾截断：超限时保留开头 `head_bytes` + 结尾 `tail_bytes`，
+/// 中间以标记替代。适合命令输出（报错信息几乎总在尾部）与子 Agent 结果
+/// （结论按约定在尾部）。
+///
+/// 边界方向：头部用 [`floor_char_boundary`]（向下），尾部用
+/// [`ceil_char_boundary`]（向上）——两边保留下来的字节数都**不超过**各自的
+/// 预算。尾部若用 floor，保留长度会超出 `tail_bytes` 最多 3 字节。
+pub fn truncate_head_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    if s.len() <= head_bytes + tail_bytes {
+        return s.to_string();
+    }
+    let head_end = floor_char_boundary(s, head_bytes);
+    let tail_start = ceil_char_boundary(s, s.len().saturating_sub(tail_bytes));
+    let omitted = s.len() - head_end - (s.len() - tail_start);
+    format!(
+        "{head}\n…[truncated {omitted} bytes]…\n{tail}",
+        head = &s[..head_end],
+        tail = &s[tail_start..]
+    )
+}
+
+/// 按**字符数**截断（不是字节数）。
+///
+/// `ellipsis` 决定是否在末尾追加 `…`：
+/// - `true`：截断后追加省略号（总字符数 = `max + 1`）。
+/// - `false`：直接截断，不追加（总字符数 = `max`）。
+///
+/// 两种模式此前在仓库里各有一份实现（`core/summary.rs` 不带省略号，
+/// `core/memory.rs` / `core/compact.rs` / `tools/sub_agent.rs` 带），
+/// 名字相同、语义不同，读代码时很容易误以为它们等价。
+pub fn truncate_chars(s: &str, max: usize, ellipsis: bool) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    if ellipsis {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// 反制「子 Agent / 后台任务输出冒充 harness 消息」的定界转义。
 ///
 /// 子 Agent 的最终报告可能原样包含它读到的网页、日志或第三方 README，
@@ -102,6 +183,55 @@ mod tests {
     fn escape_harness_markers_leaves_ordinary_text_untouched() {
         let input = "读取 crates/core/src/agent.rs:1298 后，结论是 < 10 次调用。\n";
         assert_eq!(escape_harness_markers(input), input);
+    }
+
+    /// 截断不变量：保留下来的字节数**不超过**预算。
+    ///
+    /// 尾部边界必须**向上**取整（ceil）——用 floor 的话 `&s[start..]` 的长度
+    /// 会超出 `tail_bytes` 最多 3 字节。此前 `core/verify.rs::clip_output`
+    /// 就是这么错的。
+    #[test]
+    fn truncate_head_tail_never_exceeds_the_byte_budget() {
+        // "中" 是 3 字节：任何字节预算都不落在 char boundary 上，最容易越界。
+        let s = "中".repeat(1000);
+        for (head, tail) in [(100, 100), (7, 3), (1, 1), (64, 64)] {
+            let out = truncate_head_tail(&s, head, tail);
+            let body: String = out
+                .lines()
+                .filter(|l| !l.starts_with('…') && !l.is_empty())
+                .collect();
+            assert!(
+                body.len() <= head + tail,
+                "head={head} tail={tail} 保留 {} 字节，超预算",
+                body.len()
+            );
+        }
+    }
+
+    /// 头部截断同样不超预算。
+    #[test]
+    fn truncate_str_never_exceeds_the_byte_budget() {
+        let s = "中".repeat(1000);
+        for budget in [1usize, 2, 3, 7, 100, 999] {
+            let out = truncate_str(&s, budget);
+            assert!(out.len() <= budget, "budget={budget} 得到 {}", out.len());
+            // 必须是合法 char boundary（否则后续 &str 切片会 panic）
+            assert!(s.is_char_boundary(out.len()));
+        }
+    }
+
+    /// `ceil_char_boundary` 向上取整且不越过字符串末尾。
+    #[test]
+    fn ceil_char_boundary_moves_forward_to_a_boundary() {
+        let s = "中中"; // 6 字节，boundary 在 0/3/6
+        assert_eq!(ceil_char_boundary(s, 0), 0);
+        assert_eq!(ceil_char_boundary(s, 1), 3);
+        assert_eq!(ceil_char_boundary(s, 2), 3);
+        assert_eq!(ceil_char_boundary(s, 3), 3);
+        assert_eq!(ceil_char_boundary(s, 4), 6);
+        assert_eq!(ceil_char_boundary(s, 6), 6);
+        assert_eq!(ceil_char_boundary(s, 99), 6);
+        assert!(s.is_char_boundary(ceil_char_boundary(s, 4)));
     }
 
     #[test]

@@ -179,10 +179,10 @@ fn summarize_input(input: &Value) -> String {
         "query",
     ] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
-            return truncate_chars(s, 60);
+            return wyj_core::textutil::truncate_chars(s, 60, true);
         }
     }
-    truncate_chars(&input.to_string(), 60)
+    wyj_core::textutil::truncate_chars(&input.to_string(), 60, true)
 }
 
 /// 把工具摘要渲染成交接外壳里的一小段事实清单。
@@ -288,15 +288,6 @@ fn last_assistant_text<'a>(messages: impl Iterator<Item = &'a wyj_api::types::Me
         }
     }
     out
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max).collect();
-        format!("{head}…")
-    }
 }
 
 /// 该 agent 类型定义是否可能被授予有外部副作用的工具。
@@ -654,7 +645,7 @@ impl SubAgentTool {
         let description = inp
             .description
             .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| truncate_chars(&inp.prompt, 40));
+            .unwrap_or_else(|| wyj_core::textutil::truncate_chars(&inp.prompt, 40, true));
 
         // 在第一次 await 之前同步发出 Started，保证前端收到的 Started 顺序
         // 与父 Agent 的 ToolStart 顺序一致（FIFO 配对的前提）。

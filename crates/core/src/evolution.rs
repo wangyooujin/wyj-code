@@ -33,6 +33,19 @@ const HEALTH_FILE: &str = "health.json";
 const USAGE_FILE: &str = "usage.json";
 const AUDIT_FILE: &str = "audit.jsonl";
 
+/// 纳秒精度、带时区偏移的 RFC3339 时间戳。
+///
+/// 本模块的时间字段（episode 的 `started_at`/`finished_at`、candidate 的
+/// `created_at`/`updated_at`）会被 `DateTime::parse_from_rfc3339` 解析，且
+/// 需要在同一秒内区分多条记录，因此保留纳秒精度。
+///
+/// 此前这 17 处是内联的 `now_rfc3339()`，散落各处读不出「同一批
+/// 落盘记录用同一种格式」这个约定。名字与 `crate::history::now_iso()` 明确
+/// 区分——后者是秒级、无偏移的另一种格式，两者不能混用。
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeOutcome {
@@ -47,13 +60,6 @@ pub enum EpisodeOutcome {
 impl EpisodeOutcome {
     pub fn supports_repository_learning(self) -> bool {
         self == Self::VerifiedSuccess
-    }
-
-    pub fn supports_user_preference(self) -> bool {
-        matches!(
-            self,
-            Self::VerifiedSuccess | Self::AcceptedSuccess | Self::Partial
-        )
     }
 }
 
@@ -195,14 +201,6 @@ pub struct EvolutionMemory {
     pub use_count: u64,
     pub contradicts: Vec<String>,
     pub supersedes: Vec<String>,
-}
-
-/// 供 `list_memories` 兼容桩使用的最小化返回类型。v0.2.14 后 Evolution 不再
-/// 持有普通 Memory 索引；TUI/CLI 调用站点若读到 `Vec<EvolutionMemoryStub>`，
-/// 应当作空列表处理，让用户改用 `/memory` 面板（v3）做事实/状态管理。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EvolutionMemoryStub {
-    pub schema_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,7 +495,7 @@ impl EvolutionStore {
             branch: git_text(&self.repository_root, &["branch", "--show-current"]),
             head: git_text(&self.repository_root, &["rev-parse", "HEAD"]),
             goal_summary: bounded_redacted(goal, 800),
-            started_at: Utc::now().to_rfc3339(),
+            started_at: now_rfc3339(),
             started: Instant::now(),
             profile: profile.into(),
             vendor: vendor.into(),
@@ -566,7 +564,7 @@ impl EvolutionStore {
             head: capture.head,
             goal_summary: capture.goal_summary,
             started_at: capture.started_at,
-            finished_at: Utc::now().to_rfc3339(),
+            finished_at: now_rfc3339(),
             duration_ms: capture.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             outcome,
             confidence,
@@ -609,7 +607,7 @@ impl EvolutionStore {
             head: capture.head,
             goal_summary: capture.goal_summary,
             started_at: capture.started_at,
-            finished_at: Utc::now().to_rfc3339(),
+            finished_at: now_rfc3339(),
             duration_ms: capture.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             outcome: EpisodeOutcome::Cancelled,
             confidence: 100,
@@ -862,7 +860,7 @@ impl EvolutionStore {
             positive,
             reason: reason.map(|value| bounded_redacted(&value, 1_000)),
             explicit,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: now_rfc3339(),
         });
         index
             .pending_analysis_episodes
@@ -930,7 +928,7 @@ impl EvolutionStore {
             .with_context(|| format!("candidate not found: {candidate_id}"))?;
         candidate.status = CandidateStatus::Rejected;
         candidate.rejection_reason = reason.map(|value| bounded_redacted(&value, 1_000));
-        candidate.updated_at = Utc::now().to_rfc3339();
+        candidate.updated_at = now_rfc3339();
         crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("reject_candidate", Some(candidate_id), "")
     }
@@ -952,7 +950,7 @@ impl EvolutionStore {
             .with_context(|| format!("candidate not found: {candidate_id}"))?;
         candidate.status = CandidateStatus::Active;
         candidate.activated_path = activated_path;
-        candidate.updated_at = Utc::now().to_rfc3339();
+        candidate.updated_at = now_rfc3339();
         crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("activate_candidate", Some(candidate_id), "")
     }
@@ -969,7 +967,7 @@ impl EvolutionStore {
             .find(|candidate| candidate.id == candidate_id)
             .with_context(|| format!("candidate not found: {candidate_id}"))?;
         candidate.status = CandidateStatus::RolledBack;
-        candidate.updated_at = Utc::now().to_rfc3339();
+        candidate.updated_at = now_rfc3339();
         crate::serialize::write_json_atomic(&self.dir.join(CANDIDATE_INDEX_FILE), &index)?;
         self.append_audit_unlocked("rollback_candidate", Some(candidate_id), "")
     }
@@ -1019,8 +1017,8 @@ impl EvolutionStore {
                 .filter_map(|path| self.build_citation(&path.to_string_lossy()).ok())
                 .collect(),
             external_context: episode.external_context,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
             last_validated_at: None,
             last_used_at: None,
             use_count: 0,
@@ -1045,7 +1043,7 @@ impl EvolutionStore {
             .expect("evolution write lock poisoned");
         let mut index = self.load_candidate_index_unlocked();
         if !index.candidates.iter().any(|candidate| candidate.id == id) {
-            let now = Utc::now().to_rfc3339();
+            let now = now_rfc3339();
             index.candidates.push(EvolutionCandidate {
                 schema_version: EVOLUTION_SCHEMA_VERSION,
                 id: id.clone(),
@@ -1258,7 +1256,7 @@ impl EvolutionStore {
             .unwrap_or_default();
         push_unique(&mut evidence_episode_ids, episode.id.clone());
         push_unique(&mut evidence_session_ids, episode.session_id.clone());
-        let now = Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let created_at = existing
             .map(|position| index.candidates[position].created_at.clone())
             .unwrap_or_else(|| now.clone());
@@ -1633,7 +1631,7 @@ impl EvolutionStore {
         let mut health: EvolutionHealth = read_json_or_default(&self.dir.join(HEALTH_FILE));
         health.consecutive_failures = 0;
         health.last_error = None;
-        health.last_success_at = Some(Utc::now().to_rfc3339());
+        health.last_success_at = Some(now_rfc3339());
         health.notice_pending = false;
         crate::serialize::write_json_atomic(&self.dir.join(HEALTH_FILE), &health)
     }
@@ -1662,7 +1660,7 @@ impl EvolutionStore {
             &self.dir.join(AUDIT_FILE),
             &AuditEvent {
                 schema_version: EVOLUTION_SCHEMA_VERSION,
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: now_rfc3339(),
                 action: action.to_string(),
                 target_id: target_id.map(str::to_string),
                 detail: bounded_redacted(detail, 1_000),
@@ -1818,7 +1816,7 @@ fn governance_workflow_memory(
     episode: &Episode,
     project_id: &str,
 ) -> EvolutionMemory {
-    let now = Utc::now().to_rfc3339();
+    let now = now_rfc3339();
     EvolutionMemory {
         schema_version: EVOLUTION_SCHEMA_VERSION,
         id: id.to_string(),
@@ -1913,7 +1911,7 @@ fn build_skill_eval(memory: &EvolutionMemory, description: &str) -> SkillEvalRep
         && memory.evidence_episode_ids.len() >= 3
         && memory.evidence_session_ids.len() >= 2;
     SkillEvalReport {
-        generated_at: Utc::now().to_rfc3339(),
+        generated_at: now_rfc3339(),
         cases,
         structural_pass,
         historical_successes: memory.evidence_episode_ids.len(),
@@ -2647,8 +2645,8 @@ mod tests {
             user_quote: None,
             citations: Vec::new(),
             external_context: false,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
             last_validated_at: None,
             last_used_at: None,
             use_count: 0,

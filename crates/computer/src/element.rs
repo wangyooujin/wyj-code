@@ -406,11 +406,6 @@ pub fn execute_with_element(
     imp::execute_with_element(target, budget, reference, action)
 }
 
-/// 遍历 AX 树并只做列举（不保留任何跨调用状态）。
-pub fn snapshot_elements_standalone(target: &WindowTarget) -> Result<ElementSnapshot> {
-    snapshot_elements(target, &TraversalBudget::default())
-}
-
 #[cfg(target_os = "macos")]
 use macos as imp;
 

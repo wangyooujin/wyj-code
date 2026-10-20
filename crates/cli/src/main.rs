@@ -149,7 +149,7 @@ enum Commands {
         #[command(subcommand)]
         command: skillhub_cmd::SkillHubCommand,
     },
-    /// 按 TTL + 字节上限本地存储治理(Phase 4)。
+    /// 本地存储治理:status 查占用 / doctor 查异常 / prune 按 retention 上限清理。
     #[command(
         name = "storage",
         about = "Inspect and prune local ~/.wyj-code storage"
@@ -1040,12 +1040,23 @@ fn build_fallback_routes(
                 }
             };
             Some(
-                wyj_core::AgentRoute::new(name, resolution.identity.vendor, model, provider)
-                    .with_capabilities(resolution.capabilities)
-                    .with_limits(profile.max_tokens, profile.context_window)
-                    .with_thinking(profile.thinking_budget, profile.interleaved_thinking)
-                    .with_reasoning_effort(profile.effective_reasoning_effort())
-                    .with_thinking_switch(profile.effective_thinking_switch()),
+                wyj_core::AgentRoute::new(
+                    name,
+                    resolution.identity.vendor,
+                    model,
+                    // base_url 与 wire_protocol 参与 ModelIdentity：前者是
+                    // capability_cache fingerprint 的一部分，后者决定
+                    // ThinkingSpec 查哪张表。漏传会让 fallback 端点与主端点
+                    // 共用同一份能力缓存，并拿到错档的 effort 规格。
+                    resolution.identity.base_url,
+                    resolution.identity.wire_protocol,
+                    provider,
+                )
+                .with_capabilities(resolution.capabilities)
+                .with_limits(profile.max_tokens, profile.context_window)
+                .with_thinking(profile.thinking_budget, profile.interleaved_thinking)
+                .with_reasoning_effort(profile.effective_reasoning_effort())
+                .with_thinking_switch(profile.effective_thinking_switch()),
             )
         })
         .collect()
@@ -1185,6 +1196,61 @@ async fn main() -> Result<()> {
     let profile_was_explicit = cli.profile.is_some();
     let mut runtime_command = None;
 
+    // `--profile` 在**子命令分发之前**应用。
+    //
+    // 此前它在分发之后（见下方 `if let Some(name) = cli.profile.take()`），
+    // 于是所有**立即 return** 的子命令（extensions / evolve / memory /
+    // schedule / skillhub / storage / trust* / model / session / workspace /
+    // workflow / review）都读不到它——`--profile nonexistent model doctor`
+    // 甚至不报错，静默用 active profile。校验也一并提前：分组不存在时
+    // 立即报错，而不是等到某个子命令恰好用到它。
+    if let Some(name) = cli.profile.clone() {
+        if !cfg.profiles.iter().any(|p| p.name == name) {
+            eprintln!(
+                "{}",
+                wyj_i18n::tr_fmt("cli.profile_not_found", &[("name", &name)])
+            );
+            std::process::exit(1);
+        }
+        // 仅覆盖本次运行使用的分组，不落盘、不改 active_profile 持久值
+        cfg.active_profile = name;
+    }
+
+    // `--plugin-dir` 只对**运行期路径**有意义（TUI / ACP / daemon / workflow
+    // run）：它把一个本地开发插件的贡献（MCP server / skills / agents /
+    // themes）注入本次进程。extensions / evolve / memory / storage /
+    // trust* / model / session / workspace / review 这些子命令**不加载**
+    // MCP 与 skills，因此该参数对它们无效——此前是静默忽略（用户以为
+    // 生效了）。现在明确报错。
+    if cli.plugin_dir.is_some() {
+        let plugin_dir_unsupported = matches!(
+            cli.command,
+            Some(
+                Commands::Extensions { .. }
+                    | Commands::Evolve { .. }
+                    | Commands::Memory { .. }
+                    | Commands::Schedule { .. }
+                    | Commands::SkillHub { .. }
+                    | Commands::Storage { .. }
+                    | Commands::TrustMcp
+                    | Commands::TrustSkills
+                    | Commands::TrustHooks
+                    | Commands::Trust
+                    | Commands::Model { .. }
+                    | Commands::Session { .. }
+                    | Commands::Workspace { .. }
+                    | Commands::Review { .. }
+            )
+        );
+        if plugin_dir_unsupported {
+            eprintln!(
+                "--plugin-dir 只对运行期入口有效(TUI / acp / daemon / workflow run);\
+                 当前子命令不加载 MCP 与 skills,该参数无效"
+            );
+            std::process::exit(2);
+        }
+    }
+
     if let Some(cmd) = cli.command.take() {
         match cmd {
             Commands::Acp => runtime_command = Some(RuntimeCommand::Acp),
@@ -1296,17 +1362,8 @@ async fn main() -> Result<()> {
         .with_env_filter(filter)
         .init();
 
-    if let Some(name) = cli.profile.take() {
-        if !cfg.profiles.iter().any(|p| p.name == name) {
-            eprintln!(
-                "{}",
-                wyj_i18n::tr_fmt("cli.profile_not_found", &[("name", &name)])
-            );
-            std::process::exit(1);
-        }
-        // 仅覆盖本次运行使用的分组，不落盘、不改 active_profile 持久值
-        cfg.active_profile = name;
-    }
+    // `--profile` 已在子命令分发之前应用（见上），此处不再重复处理。
+    let _ = cli.profile.take();
 
     if cli.config_status {
         let status_cwd = resolve_cwd(cli.cwd.clone())?;
@@ -1392,6 +1449,11 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    // 注入 storage 配置供 plugin 的 `.git` gc 决策使用（`maybe_run_git_gc`）。
+    // 此前 `set_plugin_storage_cfg` 全仓零调用，`PLUGIN_STORAGE_CFG` 恒为
+    // `None`——`maybe_run_git_gc` 第一行就 return 了，插件仓库的 reflog /
+    // object pack 永久累积，从不清理。
+    wyj_store::plugin_install::set_plugin_storage_cfg(cfg.storage.clone());
     let local_runtime = cli
         .plugin_dir
         .as_deref()
@@ -1780,11 +1842,15 @@ async fn main() -> Result<()> {
     } else {
         ExecutionSurface::TuiInteractive
     });
+    // `--allow-plan-write` 解析出的绝对路径。TUI 每回合自建 ToolCtx（策略表是
+    // 空的），必须把这批授权一并传进去，否则该参数在 TUI 入口下静默失效。
+    let mut plan_write_grants: Vec<std::path::PathBuf> = Vec::new();
     for path in &cli.allow_plan_write {
         let resolved = tool_ctx
             .allow_plan_document(path)
             .map_err(|error| anyhow::anyhow!("--allow-plan-write {}: {error}", path.display()))?;
         eprintln!("allow-plan-write: {}", resolved.display());
+        plan_write_grants.push(resolved);
     }
 
     // Hooks 生命周期自动化：按 `~/.claude/settings.json` + 项目 `.claude/settings.json`
@@ -1803,43 +1869,23 @@ async fn main() -> Result<()> {
             )
         );
     }
-    let mut initial_permission = match &mode {
-        AgentMode::Plan => {
-            let set: std::collections::HashSet<String> = [
-                "Read",
-                "Glob",
-                "Grep",
-                "CodeSearch",
-                "WebFetch",
-                "WebSearch",
-                "AskQuestion",
-                "Write",
-                "Edit",
-                "Bash",
-                "BashOutput",
-                "ExitPlanMode",
-                "Memory",
-                "Agent",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            PermissionMode::Plan(set)
-        }
-        AgentMode::Bypass => PermissionMode::AutoApprove,
-        AgentMode::Auto => PermissionMode::Auto,
-    };
-    if !cli.allowed_tools.is_empty() {
-        let explicit: std::collections::HashSet<String> =
-            cli.allowed_tools.iter().cloned().collect();
-        initial_permission = match initial_permission {
-            PermissionMode::Plan(base) => {
-                PermissionMode::Plan(base.intersection(&explicit).cloned().collect())
-            }
-            _ => PermissionMode::Allowlist(explicit),
-        };
-    }
+    // 权限模式走 core 的统一入口：`permission_mode_for` 出模式白名单，
+    // `restrict_to_allowed_tools` 叠加 `--allowed-tools`。此前 CLI 与 TUI
+    // 各维护一份 Plan 白名单字面量且已经漂移（CLI 有 `Memory` 无
+    // `TodoWrite`，TUI 反之），同一个模式在两种入口下放行的工具集不同。
+    let cli_allowed_tools: std::collections::HashSet<String> =
+        cli.allowed_tools.iter().cloned().collect();
+    let initial_permission = wyj_core::permission::restrict_to_allowed_tools(
+        wyj_core::permission::permission_mode_for(&mode),
+        &cli_allowed_tools,
+    );
     tool_ctx.set_permission_mode(initial_permission);
+    // TUI 入口要用同一份约束：它自建 ctx、自算权限模式，CLI 这边算好的
+    // `initial_permission` 传不过去（值会在 TUI 切模式时被重算覆盖）。
+    let permission_constraints = wyj_tui::app::PermissionConstraints {
+        allowed_tools: cli_allowed_tools,
+        plan_write_grants,
+    };
 
     let todo_store = Arc::new(Mutex::new(TodoStore::default()));
     // 任务列表默认不注册（对齐 Claude Code v2.1.233 / Codex v0.152.0）。未注册的
@@ -2065,6 +2111,8 @@ async fn main() -> Result<()> {
             cfg.active_profile().name.clone(),
             model_resolution.identity.vendor,
             model_name.clone(),
+            model_resolution.identity.base_url,
+            model_resolution.identity.wire_protocol,
         )
         .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
         .with_thinking(
@@ -2389,8 +2437,10 @@ async fn main() -> Result<()> {
             max_turns: cfg.agent.max_turns,
             capabilities: model_capabilities,
             route_profile: cfg.active_profile().name.clone(),
-            route_vendor: model_resolution.identity.vendor,
+            route_vendor: model_resolution.identity.vendor.clone(),
             model_name: new_model.to_string(),
+            route_base_url: model_resolution.identity.base_url.clone(),
+            route_wire_protocol: model_resolution.identity.wire_protocol.clone(),
             fallback_routes,
             cross_provider_fallback: cfg.routing.cross_provider_fallback,
             thinking_budget: cfg.active_profile().thinking_budget,
@@ -2690,6 +2740,7 @@ async fn main() -> Result<()> {
                     owner_pid,
                 },
             ),
+            permission_constraints,
         )
         .await
     };
@@ -2949,7 +3000,13 @@ fn make_sub_agent_factory(
             .with_context_window(p.context_window)
             .with_max_turns(cfg.agent.max_turns)
             .with_model_capabilities(model_capabilities)
-            .with_route_identity(p.name.clone(), model_resolution.identity.vendor, model)
+            .with_route_identity(
+                p.name.clone(),
+                model_resolution.identity.vendor.clone(),
+                model,
+                model_resolution.identity.base_url.clone(),
+                model_resolution.identity.wire_protocol.clone(),
+            )
             .with_fallback_routes(fallback_routes, cfg.routing.cross_provider_fallback)
             .with_thinking(p.thinking_budget, p.interleaved_thinking)
             .with_reasoning_effort(p.effective_reasoning_effort())
@@ -3141,7 +3198,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
             let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id)?;
             let checkpoint = store.create(
                 Path::new(&file.cwd),
-                &file.messages,
+                file.messages.clone(),
                 wyj_core::CheckpointKind::Manual,
                 name,
             )?;
@@ -3174,7 +3231,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
             }
             let protection = store.create(
                 &cwd,
-                &file.messages,
+                file.messages.clone(),
                 wyj_core::CheckpointKind::PreRewind,
                 Some(format!("before rewind {checkpoint_id}")),
             )?;
@@ -3227,7 +3284,7 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
                 }
                 store.create(
                     &cwd,
-                    &file.messages,
+                    file.messages.clone(),
                     wyj_core::CheckpointKind::PreRewind,
                     Some(format!("before branch restore {checkpoint_id}")),
                 )?;
@@ -3579,7 +3636,7 @@ async fn repl(
                     Some(store) => {
                         let checkpoint = store.create(
                             &cwd,
-                            &session.messages,
+                            session.messages.clone(),
                             wyj_core::CheckpointKind::Manual,
                             name,
                         )?;
@@ -3612,7 +3669,7 @@ async fn repl(
                     }
                     let protection = store.create(
                         &cwd,
-                        &session.messages,
+                        session.messages.clone(),
                         wyj_core::CheckpointKind::PreRewind,
                         Some(format!("before rewind {id}")),
                     )?;
@@ -3664,7 +3721,7 @@ async fn repl(
                         }
                         store.create(
                             &cwd,
-                            &session.messages,
+                            session.messages.clone(),
                             wyj_core::CheckpointKind::PreRewind,
                             Some(format!("before branch restore {id}")),
                         )?;

@@ -206,11 +206,6 @@ impl SkillHubClient {
         }
         Ok(buf)
     }
-
-    /// 搜索 → 精确定位单个技能 → 下载，一步到位。
-    pub async fn fetch_archive(&self, skill: &SkillHubSkill) -> Result<Vec<u8>> {
-        self.download(&skill.slug, &skill.namespace).await
-    }
 }
 
 fn normalize(item: SearchItem) -> SkillHubSkill {

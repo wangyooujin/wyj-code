@@ -1859,7 +1859,7 @@ async fn execute_evolution_action(
                 .clone();
             let checkpoint = checkpoint_store.create(
                 cwd,
-                &messages,
+                messages.clone(),
                 wyj_core::CheckpointKind::Manual,
                 Some(format!("before Evolution approval {id}")),
             )?;
@@ -1990,7 +1990,7 @@ async fn run_rewind_in_background(
         }
         let protection = store.create(
             &cwd,
-            &current_messages,
+            current_messages.clone(),
             wyj_core::CheckpointKind::PreRewind,
             Some(format!("before rewind {io_id}")),
         )?;
@@ -2078,7 +2078,7 @@ async fn run_branch_in_background(
                 }
                 store.create(
                     &cwd,
-                    &current_messages,
+                    current_messages.clone(),
                     wyj_core::CheckpointKind::PreRewind,
                     Some(format!("before branch restore {io_id}")),
                 )?;
@@ -2110,19 +2110,6 @@ async fn run_branch_in_background(
         messages: branch.messages,
         turns,
     })
-}
-
-/// 设置面板/分组面板里可编辑字段的类型
-pub enum SettingsFieldKind {
-    /// 枚举字段：Enter/Left/Right 原地循环切换
-    Enum,
-    /// 文本字段：Enter 进入行内编辑
-    Text,
-}
-
-pub fn settings_field_kind(_idx: usize) -> SettingsFieldKind {
-    // /config 现仅剩 log_level/language，两者都是枚举字段
-    SettingsFieldKind::Enum
 }
 
 // ── 分组（Profile）管理面板：/model 命令触发 ──────────────────────────────────
@@ -2994,12 +2981,6 @@ impl InputOwner {
                 Theme::claude_color(),
             ),
         }
-    }
-
-    /// 是否"边输入边驱动重算"（目前只有 Mcp::BrowseSearch 的实时过滤）；
-    /// false 则是"提交式"，仅在 Enter 时触发动作。
-    pub fn is_live_filter(&self) -> bool {
-        matches!(self, InputOwner::Mcp(McpInputField::BrowseSearch))
     }
 
     /// 取出该字段对应的可变草稿 InputBox —— 统一指向各 dialog 自己持有的
@@ -4026,13 +4007,12 @@ fn schedule_execute_menu_action(
             if let Some(id) = id {
                 if let Ok(exe) = std::env::current_exe() {
                     tokio::spawn(async move {
-                        // --manual 仅为兼容 v0.2.5 预发布 CLI；headless 前台接管
-                        // 已统一失败关闭，后台 app_computer 可与用户并行。
+                        // headless 前台接管已统一失败关闭，后台 app_computer
+                        // 可与用户并行。
                         let _ = tokio::process::Command::new(exe)
                             .arg("schedule")
                             .arg("run")
                             .arg(&id)
-                            .arg("--manual")
                             .stdout(std::process::Stdio::null())
                             .stderr(std::process::Stdio::null())
                             .status()
@@ -12117,6 +12097,11 @@ pub async fn run_tui(
     // 本次 resume 的会话正被另一个 wyj-code 实例使用（`(session_id, owner_pid)`）。
     // 非 None 时启动横幅之后立刻弹窗让用户决定：接管 / 只读 / 退出。
     session_conflict: Option<SessionConflictInfo>,
+    // CLI 启动参数带来的权限约束。`--allowed-tools` 与 `--allow-plan-write`
+    // 之前只写进 CLI 侧那份 `ToolCtx`，而 TUI 自建 ctx、自算权限模式，
+    // 于是这两个参数在 TUI 入口下静默失效（Plan 模式尤其致命：它的存在
+    // 意义恰恰主要在 TUI 里）。
+    permission_constraints: PermissionConstraints,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -12167,6 +12152,7 @@ pub async fn run_tui(
         needs_api_key_onboarding,
         workspace_cas,
         session_conflict,
+        permission_constraints,
     )
     .await;
 
@@ -12510,7 +12496,7 @@ fn spawn_plan_approval_checkpoint(
         let mut sess = session.lock().await;
         if let Ok(checkpoint) = store.create(
             &cwd,
-            &sess.messages,
+            sess.messages.clone(),
             wyj_core::CheckpointKind::PlanApproval,
             Some("before plan approval".to_string()),
         ) {
@@ -12568,6 +12554,8 @@ fn spawn_agent_turn(
     // 主 Agent 空闲期间积累的后台任务结果 reminder（子 Agent / 后台 shell）
     preface_reminders: Vec<String>,
     plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    // CLI 启动参数带来的权限约束（`--allowed-tools` / `--allow-plan-write`）。
+    permission_constraints: PermissionConstraints,
 ) -> (TurnTask, Arc<wyj_core::SteerQueue>) {
     // 共享注入队列：主 Agent 与（经 ToolContext 拿到的）前台子 Agent 排空的是
     // 同一份，谁先到工具轮边界谁取走——子 Agent 在跑时，用户补充的内容插进
@@ -12621,6 +12609,10 @@ fn spawn_agent_turn(
         ctx.permission_mode = shared_permission;
         ctx.auto_gate = auto_gate;
         ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+        // `--allow-plan-write` 的文档授权：ctx 每回合新建，策略表是空的，
+        // 必须每次重新注入，否则 Plan 模式下「本轮授权的单个文档」这条
+        // 放行路径在 TUI 里永远不成立。
+        permission_constraints.apply_to_ctx(&ctx);
         // 逐调用权限确认：按当前项目载入「始终允许」列表并设定持久化路径
         if let Ok(config_base) = wyj_config::config_dir() {
             ctx.load_allowed_tools(&config_base);
@@ -12728,37 +12720,56 @@ impl Drop for RestorePermissionOnDrop {
     }
 }
 
-/// 根据 AgentMode 构建对应的 PermissionMode
-fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
-    match mode {
-        AgentMode::Plan => {
-            let set: HashSet<String> = [
-                "Read",
-                "Glob",
-                "Grep",
-                "CodeSearch",
-                "WebFetch",
-                "WebSearch",
-                "AskQuestion",
-                "Write",        // 仅 doc/plan、docs/plan、.wyj-code/plans 或本轮授权文档
-                "Edit",         // 与 Write 使用同一执行层路径策略
-                "Bash",         // 只读命令由 PermissionPolicy 强制判定
-                "BashOutput",   // 后台任务输出读取（纯读）
-                "ExitPlanMode", // 提交计划并请求批准（计划文本作为参数直传，不落盘）
-                "TodoWrite",    // 任务追踪，plan 模式同样有用
-                "Agent",        // 子 Agent（继承同一白名单，不会绕过 plan 模式限制）
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            PermissionMode::Plan(set)
-        }
-        AgentMode::Bypass => PermissionMode::AutoApprove,
-        // Auto 在 `evaluate` 层放行，判定全部落在
-        // `Agent::ensure_tool_permission`：先问 AutoGate，只有闸门判 AskUser /
-        // 没装闸门 / 分类器已降级时才落到 `confirm_tool` 弹窗。
-        AgentMode::Auto => PermissionMode::Auto,
+/// CLI 启动参数带来的权限约束。
+///
+/// 存在的理由：`--allowed-tools` 与 `--allow-plan-write` 之前只写进 CLI 侧
+/// 那份 `ToolCtx`，而 TUI 每回合自建 `ToolCtx`、权限模式又自己算一份
+/// （`mode_to_permission`）——两个参数在 TUI 入口下**静默失效**：不报错、
+/// 不警告，用户只会看到「参数写了但没反应」。
+///
+/// 之所以在 TUI 侧重新施加而不是让 CLI 直接下发算好的 `PermissionMode`：
+/// TUI 允许运行中切换模式（Shift+Tab / `/mode` / Plan 审批），每次切换都要
+/// 重算权限模式。只下发「最终权限模式」的话，切一次模式就把 CLI 的约束
+/// 冲掉了；下发「约束」本身才能在每次重算后重新施加。
+#[derive(Debug, Clone, Default)]
+pub struct PermissionConstraints {
+    /// `--allowed-tools`：本次进程显式授权的工具名。非空时收窄权限模式。
+    pub allowed_tools: HashSet<String>,
+    /// `--allow-plan-write`：本轮明确授权写入的文档（已按 cwd 解析为绝对路径）。
+    pub plan_write_grants: Vec<PathBuf>,
+}
+
+impl PermissionConstraints {
+    /// 由运行模式算出**最终**权限模式（模式白名单 ∩ CLI 显式名单）。
+    pub fn permission_for(&self, mode: &AgentMode) -> PermissionMode {
+        wyj_core::permission::restrict_to_allowed_tools(
+            mode_to_permission(mode),
+            &self.allowed_tools,
+        )
     }
+
+    /// 把 `--allow-plan-write` 的授权写进 ctx 的权限策略。
+    ///
+    /// TUI 每回合新建 `ToolCtx`，其 `permission_policy` 是全新的空策略，
+    /// 所以每次建 ctx 后都要重新注入一遍。
+    pub fn apply_to_ctx(&self, ctx: &wyj_tools::ToolCtx) {
+        for path in &self.plan_write_grants {
+            // 路径在 CLI 侧已解析过一次（`safe_resolve_write_target` + 扩展名
+            // 检查），这里再解析一次是幂等的；解析失败说明 cwd 变了，
+            // 跳过即可——放行一个解析不了的路径只会让策略表里多一条死条目。
+            let _ = ctx.allow_plan_document(path);
+        }
+    }
+}
+
+/// 根据 AgentMode 构建对应的 PermissionMode
+///
+/// 走 `wyj_core::permission::permission_mode_for` 这一个入口：Plan 白名单
+/// 必须与 CLI 侧完全一致，此前两边各写一份字面量且已经漂移（CLI 有
+/// `Memory` 无 `TodoWrite`，TUI 反之），同一个模式在两种入口下放行的
+/// 工具集不同。
+fn mode_to_permission(mode: &AgentMode) -> PermissionMode {
+    wyj_core::permission::permission_mode_for(mode)
 }
 
 fn format_tui_model_doctor(report: &wyj_api::ModelDoctorReport) -> String {
@@ -13102,13 +13113,17 @@ fn attach_agent_session(
 /// 都不会遗漏 shared_permission 的更新。shared_permission 与正在运行的
 /// turn 共享同一个 Arc<RwLock<..>>，因此这里的写入对当轮剩余的工具调用
 /// 立即生效，无需等待下一轮 spawn_agent_turn。
+///
+/// `constraints` 必须参与重算：CLI 的 `--allowed-tools` 是**进程级**约束，
+/// 切模式不能把它冲掉（否则用户按一下 Shift+Tab 就绕过了自己给的限制）。
 async fn switch_mode(
     shared_mode: &Arc<tokio::sync::Mutex<AgentMode>>,
     shared_permission: &Arc<std::sync::RwLock<PermissionMode>>,
     new_mode: AgentMode,
+    constraints: &PermissionConstraints,
 ) {
     *shared_mode.lock().await = new_mode.clone();
-    *shared_permission.write().unwrap() = mode_to_permission(&new_mode);
+    *shared_permission.write().unwrap() = constraints.permission_for(&new_mode);
 }
 
 /// 模式切换后同步闸门的分类器开关。
@@ -13802,11 +13817,21 @@ async fn tui_main(
     workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
     // resume 到的会话正被另一个实例使用；非 None 则启动后弹窗让用户裁决。
     session_conflict: Option<SessionConflictInfo>,
+    // CLI 启动参数带来的权限约束（`--allowed-tools` / `--allow-plan-write`）。
+    permission_constraints: PermissionConstraints,
 ) -> Result<Option<String>> {
+    // 主循环与各 turn task 都要读它（切模式时重算、建 ctx 时注入 plan 授权），
+    // 所以内部持一份 clone，参数本身留给调用方。
+    let permission_constraints = permission_constraints.clone();
     let shared_mode = Arc::new(tokio::sync::Mutex::new(mode.clone()));
     // 与 shared_mode 同步更新的实时权限句柄，见 switch_mode() 与 spawn_agent_turn()
     // 顶部说明：解决"运行中切换模式对本轮已生效"的问题。
-    let shared_permission = Arc::new(std::sync::RwLock::new(mode_to_permission(&mode)));
+    //
+    // 初值经 `permission_constraints` 收窄：CLI 的 `--allowed-tools` 在 TUI
+    // 入口下也必须生效（此前只写进 CLI 侧那份 ctx，TUI 入口静默失效）。
+    let shared_permission = Arc::new(std::sync::RwLock::new(
+        permission_constraints.permission_for(&mode),
+    ));
     // Auto 模式闸门：整个会话一份，随 ctx 派生传给子 Agent（降级阈值因此
     // 全局共享）。建不出来时传 `None` —— auto 模式会退化成逐次弹窗。
     let auto_gate = Some(wyj_core::auto_mode::build_gate(
@@ -14199,6 +14224,7 @@ async fn tui_main(
                 ui_ask_tx.clone(),
                 reminders,
                 plugin_runtime.clone(),
+                permission_constraints.clone(),
             );
             state.current_task = Some(task);
             state.injector = Some(injector);
@@ -14247,6 +14273,7 @@ async fn tui_main(
                 ui_ask_tx.clone(),
                 std::mem::take(&mut state.pending_bg_reminders),
                 plugin_runtime.clone(),
+                permission_constraints.clone(),
             );
             state.current_task = Some(task);
             state.injector = Some(injector);
@@ -16837,8 +16864,13 @@ async fn tui_main(
                                     // 切换至执行模式；switch_mode 同步更新 shared_permission，
                                     // 对正在运行的这一轮（ExitPlanMode 调用所在的 turn）立即生效。
                                     let new_mode = AgentMode::Auto;
-                                    switch_mode(&shared_mode, &shared_permission, new_mode.clone())
-                                        .await;
+                                    switch_mode(
+                                        &shared_mode,
+                                        &shared_permission,
+                                        new_mode.clone(),
+                                        &permission_constraints,
+                                    )
+                                    .await;
                                     state.mode = new_mode;
                                     // Agent 会继续执行后续工具，恢复 spinner；批准分支
                                     // 也负责把 is_thinking 写回 true（PlanApprovalRequest
@@ -16887,8 +16919,13 @@ async fn tui_main(
                                         session_store.as_ref(),
                                     );
                                     let new_mode = AgentMode::Auto;
-                                    switch_mode(&shared_mode, &shared_permission, new_mode.clone())
-                                        .await;
+                                    switch_mode(
+                                        &shared_mode,
+                                        &shared_permission,
+                                        new_mode.clone(),
+                                        &permission_constraints,
+                                    )
+                                    .await;
                                     state.mode = new_mode;
                                     state.messages.push(ChatMessage::system(
                                         "已切换至执行模式。".to_string(),
@@ -16912,6 +16949,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
+                                        permission_constraints.clone(),
                                     );
                                     state.current_task = Some(task);
                                     state.injector = Some(injector);
@@ -16938,6 +16976,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
+                                        permission_constraints.clone(),
                                     );
                                     state.current_task = Some(task);
                                     state.injector = Some(injector);
@@ -17369,7 +17408,13 @@ async fn tui_main(
                     if key.code == KeyCode::BackTab {
                         let new_mode = cycle_mode(&state.mode);
                         let label = new_mode.label();
-                        switch_mode(&shared_mode, &shared_permission, new_mode.clone()).await;
+                        switch_mode(
+                            &shared_mode,
+                            &shared_permission,
+                            new_mode.clone(),
+                            &permission_constraints,
+                        )
+                        .await;
                         state.mode = new_mode;
                         state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
                             "mode.switched",
@@ -17480,8 +17525,13 @@ async fn tui_main(
                             // ── /plan 命令：直接切换至 plan 模式 ────────────
                             if trimmed == "/plan" {
                                 let new_mode = AgentMode::Plan;
-                                switch_mode(&shared_mode, &shared_permission, new_mode.clone())
-                                    .await;
+                                switch_mode(
+                                    &shared_mode,
+                                    &shared_permission,
+                                    new_mode.clone(),
+                                    &permission_constraints,
+                                )
+                                .await;
                                 state.mode = new_mode;
                                 state.messages.push(ChatMessage::system(wyj_i18n::tr(
                                     "mode.switched_to_plan",
@@ -17514,8 +17564,13 @@ async fn tui_main(
                                 match AgentMode::parse(args) {
                                     Some(m) => {
                                         let label = m.label();
-                                        switch_mode(&shared_mode, &shared_permission, m.clone())
-                                            .await;
+                                        switch_mode(
+                                            &shared_mode,
+                                            &shared_permission,
+                                            m.clone(),
+                                            &permission_constraints,
+                                        )
+                                        .await;
                                         // 显式 `/mode auto` 是「重试」的表态：
                                         // 恢复本次会话因拦截过多而停用的分类器。
                                         sync_gate_classifier(auto_gate.as_ref(), &m, true).await;
@@ -17958,7 +18013,7 @@ async fn tui_main(
                                                                 store_c
                                                                     .create(
                                                                         &cwd_c,
-                                                                        &messages,
+                                                                        messages.clone(),
                                                                         wyj_core::CheckpointKind::Manual,
                                                                         name,
                                                                     )
@@ -18261,6 +18316,10 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
+                                        // async move 会把外层变量搬进闭包，先 clone 一份
+                                        // 留在闭包外用（下一轮循环还要再取）。
+                                        let permission_constraints_c =
+                                            permission_constraints.clone();
 
                                         let task = spawn_turn_task(async move {
                                             let mut sess = session_c.lock().await;
@@ -18276,6 +18335,8 @@ async fn tui_main(
                                                 Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c;
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+                                            // 同 spawn_agent_turn：plan 文档授权要每回合重注入。
+                                            permission_constraints_c.apply_to_ctx(&ctx);
                                             let turn_agent =
                                                 plan_turn_agent(&agent_c, &current_mode);
                                             let tx2 = tx.clone();
@@ -18389,6 +18450,10 @@ async fn tui_main(
                                         let shared_permission_c = shared_permission.clone();
                                         let ui_ask_tx_clone = ui_ask_tx.clone();
                                         let plugin_runtime_c = plugin_runtime.clone();
+                                        // async move 会把外层变量搬进闭包，先 clone 一份
+                                        // 留在闭包外用（下一轮循环还要再取）。
+                                        let permission_constraints_c =
+                                            permission_constraints.clone();
 
                                         let task = spawn_turn_task(async move {
                                             let mut sess = session_c.lock().await;
@@ -18404,6 +18469,8 @@ async fn tui_main(
                                                 Some(Arc::new(wyj_core::SubUsageTotals::default()));
                                             ctx.permission_mode = shared_permission_c.clone();
                                             ctx.ui_ask_tx = Some(ui_ask_tx_clone);
+                                            // 同 spawn_agent_turn：plan 文档授权要每回合重注入。
+                                            permission_constraints_c.apply_to_ctx(&ctx);
                                             let turn_agent =
                                                 plan_turn_agent(&agent_c, &current_mode);
 
@@ -18800,6 +18867,7 @@ async fn tui_main(
                                         ui_ask_tx.clone(),
                                         std::mem::take(&mut state.pending_bg_reminders),
                                         plugin_runtime.clone(),
+                                        permission_constraints.clone(),
                                     );
                                     state.current_task = Some(task);
                                     state.injector = Some(injector);
@@ -22403,5 +22471,106 @@ mod skills_registry_tests {
             TURN_STALL_TIMEOUT > wyj_api::stream_guard::DEFAULT_STREAM_IDLE_TIMEOUT * 2,
             "应显著大于流级 idle 看门狗，让工具侧超时先触发"
         );
+    }
+}
+
+#[cfg(test)]
+mod schedule_dialog_window_tests {
+    use super::*;
+    use crate::test_support::{make_state, render_to_text};
+    use std::path::PathBuf;
+    use wyj_store::schedule::ScheduleTask;
+
+    fn task(i: usize) -> ScheduleTask {
+        ScheduleTask {
+            id: format!("t{i}"),
+            name: format!("task-{i:02}"),
+            prompt: "p".to_string(),
+            cron: "0 9 * * *".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            enabled: true,
+            needs_permission_review: false,
+            permissions: Default::default(),
+            notify_on_failure: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_run: None,
+        }
+    }
+
+    /// 与 `/model` 分组面板同一个根因的第三处：任务一多，`rows()` 全量塞进无
+    /// scroll 的 Paragraph，光标走到屏幕外、末尾「+ 新建任务」和提示被裁掉。
+    #[test]
+    fn schedule_rows_scroll_to_keep_cursor_and_footer_visible() {
+        let count = 40;
+        let tasks: Vec<ScheduleTask> = (0..count).map(task).collect();
+        let mut state = make_state();
+        state.schedule_dialog = Some(ScheduleDialog {
+            saved_snapshot: tasks.clone(),
+            tasks,
+            cursor: count, // 末行「+ 新建任务」
+            expanded: None,
+            overlay: ScheduleOverlay::None,
+            error: None,
+            live_input: crate::input::InputBox::new(),
+            menu: None,
+            default_cwd: PathBuf::from("/tmp"),
+            last_user_prompt: None,
+        });
+
+        let input = crate::input::InputBox::new();
+        let text = render_to_text(|f| crate::render::draw(f, &mut state, &input), 80, 24);
+
+        let add_new = format!("+ {}", wyj_i18n::tr("schedule.dialog.add_new_row"));
+        let add_line = text
+            .lines()
+            .find(|l| l.contains(&add_new))
+            .unwrap_or_else(|| panic!("add-new row is off screen:\n{text}"));
+        assert!(add_line.contains('▶'), "no cursor on {add_line:?}");
+
+        // rows = 41，inner = 20，正文窗口 16 行 → 起点 25，task-25..task-39 可见。
+        assert!(text.contains("task-39"), "window did not scroll:\n{text}");
+        assert!(
+            !text.contains("task-24"),
+            "window start should be 25:\n{text}"
+        );
+        assert!(
+            !text.contains("task-00"),
+            "first page should be gone:\n{text}"
+        );
+
+        // 尾部固定区（分隔线 + 错误行 + 两条提示）不得被正文挤掉。
+        let hint2: String = wyj_i18n::tr("schedule.dialog.hint2")
+            .chars()
+            .take(8)
+            .collect();
+        assert!(text.contains(&hint2), "footer hint2 is missing:\n{text}");
+    }
+
+    /// 任务少时行为不变：从第一行画起。
+    #[test]
+    fn small_schedule_dialog_starts_at_the_first_row() {
+        let tasks: Vec<ScheduleTask> = (0..3).map(task).collect();
+        let mut state = make_state();
+        state.schedule_dialog = Some(ScheduleDialog {
+            saved_snapshot: tasks.clone(),
+            tasks,
+            cursor: 0,
+            expanded: None,
+            overlay: ScheduleOverlay::None,
+            error: None,
+            live_input: crate::input::InputBox::new(),
+            menu: None,
+            default_cwd: PathBuf::from("/tmp"),
+            last_user_prompt: None,
+        });
+        let input = crate::input::InputBox::new();
+        let text = render_to_text(|f| crate::render::draw(f, &mut state, &input), 80, 24);
+        assert!(text.contains("task-00"));
+        assert!(text.contains("task-02"));
+        assert!(text.contains(&format!(
+            "+ {}",
+            wyj_i18n::tr("schedule.dialog.add_new_row")
+        )));
     }
 }
