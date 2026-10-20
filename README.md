@@ -232,10 +232,10 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 
 - 内置工具：Read / Write / Edit / Bash（带 sandbox）/ Glob / Grep / WebFetch / WebSearch /
   SubAgent / Computer / AppComputer。
-- WebSearch 仅在配置 `search_api_key` 时注册；Computer 仅 macOS/Windows 编译且需
-  vision + Anthropic profile。
-- TodoWrite 任务列表**默认不注册**（`[tools].todo_enabled = false`，对齐 Claude Code
-  v2.1.233 与 Codex CLI v0.152.0）；弱模型 / 自托管场景可显式开启。
+- WebSearch 仅在配置了 `[search].api_key`（或环境变量 `WYJ_CODE_SEARCH_API_KEY`）时注册，
+  后端可选 Tavily / Brave；Computer 仅 macOS/Windows 编译且需 vision + Anthropic profile。
+- TodoWrite 任务列表**默认注册**（`[tools].todo_enabled = true`）；弱模型 / 自托管场景
+  可显式关闭。
 - SubAgent 类型：内置 general-purpose / Explore（只读）/ Plan + 用户自定义六层合并链。
 
 ### 工程化工作流
