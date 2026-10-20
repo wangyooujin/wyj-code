@@ -57,11 +57,10 @@ impl Tool for GlobTool {
         let inp: Input = serde_json::from_value(input)?;
         let root = match &inp.path {
             Some(p) => {
-                let pb = std::path::Path::new(p);
-                if pb.is_absolute() {
-                    pb.to_path_buf()
-                } else {
-                    ctx.cwd().join(pb)
+                // 与 Grep 同源：批量读取的凭据保护必须落在根校验 + 遍历过滤两处。
+                match wyj_core::check_search_root(ctx.cwd(), p) {
+                    Ok(root) => root,
+                    Err(reason) => return Ok(ToolResult::err(reason.message)),
                 }
             }
             None => ctx.cwd().to_path_buf(),
@@ -89,6 +88,13 @@ impl Tool for GlobTool {
                 // 会让它去读 `<worktree>/.git/info/exclude`——那是个文件，一条规则都
                 // 加载不到。managed worktree 里的表现是：主仓库 exclude 掉的目录被遍历。
                 .require_git(wyj_config::gitignore::is_inside_git_repo(&root))
+                // 凭据目录整棵剪掉：Glob 会遍历整棵树，只校验根挡不住
+                // 「根是家目录、`.ssh` 在下面」这一形态。
+                .filter_entry(|e| {
+                    !e.file_name()
+                        .to_str()
+                        .is_some_and(wyj_core::is_protected_dir_component)
+                })
                 .build();
 
             for entry in walker {

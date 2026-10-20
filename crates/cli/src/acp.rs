@@ -98,7 +98,9 @@ async fn serve_listener(
     loop {
         let (stream, peer) = listener.accept().await?;
         let (reader, writer) = stream.into_split();
-        let agent = agent.clone();
+        // 每个连接拿一份独立模板：模板本身不跑回合，但它会被
+        // `create_session` 继续派生，逐层共享的 `Arc` 状态没有理由跨连接保留。
+        let agent = agent.fork_for_new_session();
         let context = context.fork_for_surface(ExecutionSurface::AcpClient);
         let cwd = cwd.clone();
         let store = session_store.clone();
@@ -479,7 +481,13 @@ async fn create_session(
     if state.sessions.read().await.contains_key(&session_id) {
         bail!("session already exists: {session_id}")
     }
-    let mut agent = state.agent_template.clone();
+    // **不能**用 `agent_template.clone()`：`Agent: Clone` 是浅拷贝，会把
+    // `turn_permission_grants` / `loop_guard` / `memory_snapshot` /
+    // `last_request_volatile` / `title_attempted` / `active_route` 这些
+    // **回合级**可变状态跨会话共享。daemon 里多个会话并行时，表现为
+    // 「A 批准过的 Bash 让 B 免检」「A 的死循环检测跳过 B 的调用」
+    // 「A 的规约 reminder 被 B 的 /compact 当缓存前缀复用」。
+    let mut agent = state.agent_template.fork_for_new_session();
     agent.set_session_id(session_id.clone());
     let mut context = state
         .context_template

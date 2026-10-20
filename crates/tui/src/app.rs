@@ -8133,6 +8133,27 @@ mod clipboard_paste_tests {
             "autosave 分支不得 `continue`：那会跳过 ui_ask 消费与 event::poll()，\
              整个输入层在回合运行期间全程停摆"
         );
+        // 存盘必须 fire-and-forget：`save` 是同步 IO + 跨进程文件锁（最坏
+        // 等 30 秒），主循环 `.await` 它等于把整帧钉住——与直接调 `save`
+        // 的现场相同，只是换了个线程在等。
+        //
+        // 判据是「`save_async` 的 await 是否落在 `tokio::spawn` 的闭包内」：
+        // 闭包里的 await 在独立 task 上跑，不阻塞主循环；闭包外则是主循环在等。
+        // 只看非注释行——注释里必然会提到这两个词来解释原因。
+        let mut in_spawn = 0i32;
+        let mut violating = false;
+        for line in body.iter().filter(|l| !l.trim_start().starts_with("//")) {
+            if line.contains("tokio::spawn") {
+                in_spawn += 1;
+            }
+            if line.contains("save_async") && line.contains(".await") && in_spawn == 0 {
+                violating = true;
+            }
+        }
+        assert!(
+            !violating,
+            "autosave 不得在主循环里 await 存盘：界面会停在当前帧直到文件锁释放"
+        );
     }
 
     /// 取出 `tui_main` 的函数体行（不含签名与收尾大括号）。
@@ -14319,8 +14340,23 @@ async fn tui_main(
                                 title_generated,
                             },
                         );
+                        // **丢到后台 task，主循环不 await**：`save` 是同步 IO +
+                        // 跨进程文件锁（`filelock` 最坏等 30 秒）。即使挪进
+                        // `spawn_blocking`，主循环若 `.await` 它，界面照样停在
+                        // 这一帧——和直接调 `save` 的现场一模一样，只是换了个
+                        // 线程在等。存盘是「尽力而为」的副作用，晚完成不影响
+                        // 任何可见状态，因此 fire-and-forget 才是正确形状。
+                        //
+                        // `sf` 是 owned 快照，与 `sess` 已无借用关系（上面
+                        // 先 `drop(sess)` 释放锁），可以安全送进 `'static` task。
+                        drop(sess);
                         if state.session_persist_allowed() {
-                            let _ = store.save(&sf);
+                            let store = store.clone();
+                            tokio::spawn(async move {
+                                if let Err(error) = store.save_async(sf).await {
+                                    tracing::warn!("会话保存失败: {error}");
+                                }
+                            });
                         }
                     }
                 } else {

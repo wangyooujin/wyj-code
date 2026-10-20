@@ -255,6 +255,10 @@ impl From<SessionFile> for SessionMeta {
 }
 
 /// 会话文件存储（~/.wyj-code/sessions/）
+///
+/// `Clone` 只复制一个 `PathBuf`，用于 `save_async` 把 owned 副本交给
+/// `spawn_blocking`（那里要求 `'static`）。
+#[derive(Clone)]
 pub struct SessionStore {
     dir: PathBuf,
 }
@@ -316,6 +320,27 @@ impl SessionStore {
             wyj_config::filelock::acquire(&self.lock_path(&file.session_id), "session file")?;
         crate::serialize::write_atomic(&path, crate::secret::redact_cow(&json).as_bytes())
             .inspect(|_| self.write_meta(&owned))
+    }
+
+    /// [`Self::save`] 的 async 包装：把阻塞 IO（含最长 30 秒的跨进程锁等待）
+    /// 挪出 tokio worker 线程。
+    ///
+    /// 为什么必须这样：`save` 内部是同步 `fs` + `filelock::acquire`，而后者在
+    /// 锁被占用时是 `std::thread::sleep` 轮询（`filelock.rs` 的 `RETRY_INTERVAL`），
+    /// 最长等 `ACQUIRE_TIMEOUT` = 30 秒。TUI 主循环的 autosave 分支在 async
+    /// 上下文里直接调 `save`，双实例争用同一会话时会把整个 worker 线程钉住——
+    /// 界面停止重绘、按键不再处理，连 ESC 都救不回来（主循环停在 `terminal.draw`
+    /// 之后、`event::poll` 之前）。
+    ///
+    /// 走 `spawn_blocking` 而不是把 `save` 本身改成 async：`save` 还被
+    /// `summary.rs` 等同步路径调用，保持同步签名才能不牵动那些调用点。
+    pub async fn save_async(&self, file: SessionFile) -> Result<()> {
+        // `SessionFile` 是 owned：`spawn_blocking` 要求 `'static`。
+        // 调用方本来就要构造一份（autosave 从 `&Session` 派生），不额外付出克隆。
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.save(&file))
+            .await
+            .map_err(|error| anyhow::anyhow!("会话保存任务异常退出: {error}"))?
     }
 
     /// 旁路元数据文件路径：`list()` 只需要 `SessionMeta` 那十来个标量，

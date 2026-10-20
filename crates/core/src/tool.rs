@@ -192,6 +192,18 @@ pub trait ToolContext: Send + Sync {
     fn resolve_write_target(&self, raw: &str) -> std::result::Result<std::path::PathBuf, String> {
         Err(format!("当前工具上下文未授权写入目标：{raw}"))
     }
+    /// [`ToolContext::is_allowed`] 返回 false 时的**具体原因**，供 Agent 回灌给模型。
+    ///
+    /// 没有这一条，模型只会收到「工具 `Bash` 在当前模式下不被允许」——那是一条
+    /// 关于**模式**的陈述，模型的合理反应是换个模式或绕开工具重试。而真正的原因
+    /// 可能是「命中硬性禁止规则：丢弃未提交改动」（与模式无关、重试无意义）或
+    /// 「Plan 模式只能写入 doc/plan」（该换路径）。两种失败需要的后续行为相反，
+    /// 措辞必须能区分。
+    ///
+    /// 纯查询、无副作用；返回 `None` 时调用方退回通用文案。
+    fn denial_reason(&self, _name: &str, _input: &Value) -> Option<String> {
+        None
+    }
     /// 子 Agent 用量的共享累加器（见 [`crate::session::SubUsageTotals`]）。
     ///
     /// 子 Agent 在**自己的 `Session`** 上跑，用量天然与主会话的 `total_*`

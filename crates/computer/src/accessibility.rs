@@ -707,13 +707,3 @@ pub fn find_window_element(target: &crate::target::WindowTarget) -> Result<Optio
     }
     Ok(Some(window))
 }
-
-/// 借用一个已持有的元素，产出 +1 引用。
-///
-/// 借用语义：调用方保证原句柄存活，这里只做 +1，不转移所有权。
-/// 不能用 `from_raw`——那会把「接管所有权」的错误语义用到借用指针上，
-/// 导致引用计数多加一次、最终过度释放（B 期实测会 SIGTRAP）。
-fn handle_of(element: &AXUIElement) -> AXUIElementRef {
-    // SAFETY: `element` 借用自一个存活的 `CFRetained`，retain 只做 +1。
-    unsafe { CFRetained::retain(NonNull::from(element)) }
-}
