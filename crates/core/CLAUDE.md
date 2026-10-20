@@ -8,6 +8,16 @@
 
 ## 核心数据流（Agent 循环、记忆与注入）
 
+**`agent.rs` 的拆分边界（2026-10-20）**：原 7859 行的 `agent.rs` 现在拆成三个文件，切分依据是「是否碰 `self` / 是否与回合生命周期绑定」。
+
+| 文件 | 承载 | 边界规则 |
+|---|---|---|
+| `agent.rs`（约 3500） | `Agent` 定义、`run_turn` 系列、工具执行链路（`run_tool` / `exec_tool_call`）、hook 回填、权限判定 | 与回合调度绑定的都留在这里——它们需要 `self` 的可变借用或回合内状态 |
+| `agent/helpers.rs`（约 330） | 哈希与死循环检测、会话事件 id 派生、记忆快照组装、续跑判定 | **纯函数**：输入 → 输出，不碰 `self`、不碰 IO、不持有状态 |
+| `agent/tests.rs`（约 4000） | 全部 `#[cfg(test)]` | 通过父模块的 `use helpers::*` 与字段可见性访问被测逻辑 |
+
+**不要为了行数把 `run_tool` / `append_hook_feedback` / `touched_dir` 挪走**：它们看着像自由函数，实际与「本回合已授权」「本回合触达的目录」这些回合级状态耦合，搬出去就得把这些状态一并传递，反而制造第二份真相。测试模块之所以能整体搬走，是因为 `pub(super)` 让它在父模块视野内与内联测试等价。
+
 
 1. **Tool trait**（`core::tool`）：所有工具实现 `async fn run(input: Value, ctx: &dyn ToolContext) -> Result<ToolResult>`，由 `tools::ToolRegistry` 统一管理。
 
