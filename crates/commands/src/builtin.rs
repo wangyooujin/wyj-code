@@ -220,6 +220,62 @@ impl Command for ContextCmd {
             }
         }
 
+        // prompt 指纹漂移：回答「这次 resume 和上次运行注入的东西一样吗」。
+        // 三种状态必须分开显示，否则用户会误读：
+        //   None                → 没数据（升级前的老会话 / 还没发请求）
+        //   Some(空)            → 确认一致
+        //   Some(有 section)    → 变了，并指出是哪一段、增减了什么工具
+        match ctx.prompt_drift.as_ref() {
+            None => {
+                text.push('\n');
+                text.push_str(&tr("context.prompt_drift_none"));
+            }
+            Some(drift) if drift.is_empty() => {
+                text.push('\n');
+                text.push_str(&tr("context.prompt_drift_same"));
+            }
+            Some(drift) => {
+                text.push('\n');
+                text.push_str(&tr("context.prompt_drift_header"));
+                text.push('\n');
+                text.push_str(&tr_fmt(
+                    "context.prompt_drift_previous",
+                    &[("at", &drift.previous_recorded_at)],
+                ));
+                for section in &drift.sections {
+                    text.push('\n');
+                    let key = match section.name.as_str() {
+                        wyj_core::prompt_fingerprint::SECTION_MAIN => "context.prompt_drift_main",
+                        _ => "context.prompt_drift_tools",
+                    };
+                    text.push_str(&tr_fmt(
+                        key,
+                        &[
+                            ("old_bytes", &section.previous_bytes.to_string()),
+                            ("new_bytes", &section.current_bytes.to_string()),
+                        ],
+                    ));
+                    // 工具名集合的增减是最有信息量的一条：只说「digest 变了」
+                    // 用户还得自己去翻配置。同名工具改描述时两行为空，此时
+                    // digest 变化本身就说明是内容改写。
+                    if !section.added_tools.is_empty() {
+                        text.push('\n');
+                        text.push_str(&tr_fmt(
+                            "context.prompt_drift_added",
+                            &[("names", &section.added_tools.join(", "))],
+                        ));
+                    }
+                    if !section.removed_tools.is_empty() {
+                        text.push('\n');
+                        text.push_str(&tr_fmt(
+                            "context.prompt_drift_removed",
+                            &[("names", &section.removed_tools.join(", "))],
+                        ));
+                    }
+                }
+            }
+        }
+
         // 表格必须原样输出：走 `Output` 会被 markdown 当段落重新折行，
         // 上面那列对齐会全部作废。
         Ok(CommandResult::OutputPlain(text.trim_end().to_string()))
@@ -1174,6 +1230,17 @@ impl Command for DoctorCmd {
             &[("provider", &cfg.provider().to_string())],
         ));
         lines.push(tr_fmt("doctor.model", &[("model", &ctx.model)]));
+
+        // WebSearch：[search] 节配好了就报后端，没配就说明原因。这一项是为了让
+        // 「工具怎么不见了」能在一条命令里得到答案——未配置时它压根不注册，
+        // 模型侧完全看不到，用户只能靠诊断输出发现。
+        match cfg.search_provider_issue() {
+            None => lines.push(tr_fmt(
+                "doctor.search_ok",
+                &[("provider", cfg.effective_search_provider())],
+            )),
+            Some(issue) => lines.push(tr_fmt("doctor.search_unavailable", &[("reason", &issue)])),
+        }
 
         // 项目规约文件（全局 + 祖先链，按 AGENTS.md → CLAUDE.md → … 回退）
         let claude_md_files = wyj_core::discover_files(&ctx.cwd);
@@ -2145,6 +2212,7 @@ mod help_tests {
             plugin_agent_paths: vec![],
             hooks_enabled: false,
             dynamic_commands,
+            prompt_drift: None,
         }
     }
 
@@ -2228,6 +2296,7 @@ mod agents_tests {
             plugin_agent_paths: vec![],
             hooks_enabled: false,
             dynamic_commands: vec![],
+            prompt_drift: None,
         }
     }
 
@@ -2276,6 +2345,7 @@ mod subagents_tests {
             plugin_agent_paths: vec![],
             hooks_enabled: false,
             dynamic_commands: vec![],
+            prompt_drift: None,
         }
     }
 
@@ -2556,6 +2626,7 @@ mod cost_tests {
             plugin_agent_paths: vec![],
             hooks_enabled: false,
             dynamic_commands: vec![],
+            prompt_drift: None,
         }
     }
 

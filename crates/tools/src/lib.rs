@@ -23,13 +23,13 @@ pub mod memory;
 pub mod message_log;
 mod read;
 pub mod registry;
+pub mod search;
 pub mod spill;
 pub mod sub_agent;
 pub mod textutil;
 pub mod todo;
 pub mod trace;
 mod webfetch;
-mod websearch;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod window_capture;
 mod write;
@@ -51,10 +51,10 @@ pub use exit_plan_mode::ExitPlanModeTool;
 pub use grep::backend_label as grep_backend_label;
 pub use memory::MemoryTool;
 pub use registry::ToolRegistry;
+pub use search::{build_backend, SearchBackend, WebSearchTool};
 pub use sub_agent::{AgentFactory, SharedAgentDefinitions, SubAgentTool};
 pub use todo::{TodoStore, TodoWriteTool};
 pub use trace::{TraceEvent, TraceWriter};
-pub use websearch::WebSearchTool;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use window_capture::WindowCaptureTool;
 pub use wyj_core::tool::{Tool, ToolResult};

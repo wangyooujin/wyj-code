@@ -22,6 +22,7 @@ pub mod memory_v3;
 pub mod notify;
 pub mod permission;
 pub mod project;
+pub mod prompt_fingerprint;
 pub mod prompts;
 pub mod secret;
 pub mod serialize;

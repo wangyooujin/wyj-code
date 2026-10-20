@@ -399,11 +399,21 @@ pub fn externalize_block_with(block: &mut ApiContentBlock, cas: Option<&Workspac
             let original_len = thinking.len();
             match cas.intern(thinking.as_bytes()) {
                 Ok(hash) => {
-                    *thinking = format!(
-                        "[externalized to cas://{}, {} bytes]",
-                        &hash[..12],
-                        original_len
-                    );
+                    // **必须存完整 64 字符 hash**。旧版写的是 `&hash[..12]`，
+                    // 看起来只是省几个字节的展示优化，实际上让外化**不可逆**：
+                    // `WorkspaceCas::get` 要求完整 SHA-256 hex（内部
+                    // `debug_assert_eq!(hash.len(), 64)`，release 下则直接拼出
+                    // 一个不存在的 blob 路径），12 字符永远取不回来。
+                    //
+                    // 后果是长 thinking 在 resume 后变成一句
+                    // "[externalized to cas://abc123, 24000 bytes]"——模型丢掉了
+                    // 推理链，而这段文本还被当作原样内容回传给端点（Anthropic 线
+                    // 要求 thinking 连同 signature 原样回传）。
+                    //
+                    // 与 image 分支保持一致：占位符里放完整 hash，体积代价 64 字节
+                    // 换可恢复性。
+                    *thinking =
+                        format!("[externalized to {CAS_URI_PREFIX}{hash}, {original_len} bytes]");
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -438,10 +448,21 @@ pub fn materialize_block_with(block: &mut ApiContentBlock, cas: Option<&Workspac
                     if let Some(hash) = data.strip_prefix(CAS_URI_PREFIX) {
                         match cas.get(hash) {
                             Ok(bytes) => {
-                                // 假定 data 是 base64 字符串;把原始字节重新 base64 编码
-                                use base64::engine::general_purpose::STANDARD;
-                                use base64::Engine as _;
-                                *data = STANDARD.encode(&bytes);
+                                // **存进去的是什么就还原什么**。`externalize_block_with`
+                                // 存的是 `data`（一个 base64 字符串）的 UTF-8 字节，
+                                // 所以这里必须 `String::from_utf8`，不能再 base64 编一次。
+                                //
+                                // 旧实现是 `STANDARD.encode(&bytes)`，即把字符串字节当
+                                // 二进制又编码一层：存 `"AAAA…"`、取回 `"QUFB…"`，内容
+                                // 错乱且体积膨胀 4/3。它长期没被发现，是因为
+                                // `materialize_block_with` 在生产代码里**零调用点**——只有
+                                // 单测，而单测喂的是真二进制数据，往返恰好自洽。
+                                match String::from_utf8(bytes) {
+                                    Ok(base64) => *data = base64,
+                                    Err(error) => tracing::warn!(
+                                        "CAS image materialize 失败 (hash={hash}): 不是合法 UTF-8: {error}"
+                                    ),
+                                }
                             }
                             Err(error) => {
                                 tracing::warn!("CAS image materialize 失败 (hash={hash}): {error}");
@@ -597,6 +618,7 @@ mod tests {
             elided_blobs: vec![],
             session_profile: None,
             context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
         };
         let mut messages = session_file.messages.clone();
         let cfg = PersistCapCfg {
@@ -797,7 +819,6 @@ mod tests {
     fn materialize_roundtrip_restores_image() {
         let (_dir, cas) = make_test_cas();
         let original_data = "P".repeat(64 * 1024);
-        let original_bytes = original_data.as_bytes().to_vec();
         let mut block = ContentBlock::ToolResult {
             tool_use_id: "t3".to_string(),
             content: ToolResultContent::Parts(vec![ToolResultPart::Image {
@@ -829,11 +850,14 @@ mod tests {
         let ToolResultPart::Image { data: restored, .. } = &parts[0] else {
             panic!()
         };
-        // 还原后是 base64 编码
-        use base64::engine::general_purpose::STANDARD;
-        use base64::Engine as _;
-        let decoded = STANDARD.decode(restored).unwrap();
-        assert_eq!(decoded, original_bytes);
+        // **往返必须逐字节相同**：`externalize` 存的是 `data` 这个 base64 字符串
+        // 的 UTF-8 字节，`materialize` 就该把它原样取回来。
+        //
+        // 旧版这里断言的是「restored 解码后等于 original_data 的字节」——那正好
+        // 把旧实现的两次错位（存字符串字节、取回时又 base64 编一次）抵消掉了，
+        // 所以 bug 一直没暴露。这个测试的形状本身就是证据：真的正确实现不需要
+        // 经过 base64 解码这一步。
+        assert_eq!(restored, &original_data);
     }
 
     #[test]

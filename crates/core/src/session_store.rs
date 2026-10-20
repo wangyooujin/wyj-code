@@ -142,6 +142,20 @@ pub struct SessionFile {
     /// 位置，同一个 400 每回合复现一次。
     #[serde(default)]
     pub overflow_window_hint: Option<u32>,
+    /// **上一次运行**发出请求时的 system prompt 指纹（见
+    /// [`crate::prompt_fingerprint`]）。
+    ///
+    /// 落盘的唯一目的是「resume 后能回答『这次和上次注入的东西一样吗』」。
+    /// 同一个会话隔天再开，模型行为变了而没有任何地方能解释——记忆快照、
+    /// 规约链、Skill 名单、工具集、主提示词都会随环境与版本漂移，四者叠加
+    /// 足以让同一个 `--resume` 出来的上下文差出几千 token。
+    ///
+    /// 只存指纹不存全文：全文等于给 system prompt 造第二份事实来源，且本仓库
+    /// 的 prompt 30KB+、会话文件每轮整份重写。
+    ///
+    /// `None` = 本会话还没有落过指纹（新版首次启动 / 升级前的老会话）。
+    #[serde(default)]
+    pub prompt_fingerprint: Option<crate::prompt_fingerprint::PromptFingerprint>,
 }
 
 /// `SessionFile::prompt_cache_state` 的取值。序列化为 u8 以保持
@@ -213,6 +227,9 @@ impl SessionFile {
             branch_parent_session_id: session.branch_parent_session_id.clone(),
             branch_parent_checkpoint_id: session.branch_parent_checkpoint_id.clone(),
             messages: session.messages.clone(),
+            // 指纹由 `Agent` 每轮写进 `Session`，这里原样搬运——不在此处重新采集：
+            // 采集需要本次请求的真实 tools / system 字节，`Session` 看不到它们。
+            prompt_fingerprint: session.prompt_fingerprint.clone(),
         }
     }
 }
@@ -311,15 +328,33 @@ impl SessionStore {
                 crate::serialize::externalize_block(block);
             }
         }
-        let json = serde_json::to_string(&owned)?;
+        // **脱敏必须在序列化之前、作用于结构而不是文本**。
+        //
+        // 此前这里是对 `serde_json::to_string` 之后的**文本**跑 `redact_cow`，
+        // 而那条正则的前缀 `\\?["']?` 会把 JSON 转义引号 `\"` 拆开，留下未转义的
+        // 裸引号 —— 整个文件随即解析失败（实测 120 个 checkpoint / 133 MB 因此
+        // 永久损坏）。
+        //
+        // 顺序不能反：先脱敏再 `to_string`。序列化器随后会把值里的一切按 JSON
+        // 规则转义，结构天然不会被破坏。
+        //
+        // **必须覆盖整份 structure 而不是只处理 `messages`**：旧实现对整份 JSON
+        // 跑正则，顺带覆盖了 `title` / `last_preview` / `routing_events` 等顶层
+        // 字段。手工逐字段列举的做法会在新增字段时静默漏掉——走
+        // `to_value` → 递归脱敏 → `to_string` 才能保证「凡字符串皆覆盖」，
+        // 与旧的文本级覆盖面等价而结构安全。
+        //
+        // 多一次 `Value` 转换的内存成本：会话文件本来就整份序列化，量级相同。
+        let mut as_value = serde_json::to_value(&owned)?;
+        crate::secret::redact_json_value(&mut as_value);
+        let json = serde_json::to_string(&as_value)?;
         let path = self.path(&file.session_id);
         // 两个进程 resume 同一个 session 时，此前是裸 `fs::write` 整文件截断：
         // 并发写会截出半截 JSON，`load` 直接 Err，该会话再也恢复不了。锁把写入
         // 串行化，tmp+rename 保证任何时刻磁盘上的文件都是完整的一版。
         let _guard =
             wyj_config::filelock::acquire(&self.lock_path(&file.session_id), "session file")?;
-        crate::serialize::write_atomic(&path, crate::secret::redact_cow(&json).as_bytes())
-            .inspect(|_| self.write_meta(&owned))
+        crate::serialize::write_atomic(&path, json.as_bytes()).inspect(|_| self.write_meta(&owned))
     }
 
     /// [`Self::save`] 的 async 包装：把阻塞 IO（含最长 30 秒的跨进程锁等待）
@@ -355,7 +390,11 @@ impl SessionStore {
     /// 服务。写 meta 失败绝不能让 save 失败（否则一次磁盘配额波动就会丢会话），
     /// 所以只 warn。
     fn write_meta(&self, file: &SessionFile) {
-        let meta = SessionMeta::from(file.clone());
+        // 先脱敏再序列化，理由同 `save`：对序列化后的文本跑正则会把 JSON 的
+        // 转义引号拆开。`SessionMeta` 只有几个标量字段，改成结构化的成本极低。
+        let mut meta = SessionMeta::from(file.clone());
+        meta.title = crate::secret::redact_sensitive_text(&meta.title);
+        meta.last_preview = crate::secret::redact_sensitive_text(&meta.last_preview);
         let json = match serde_json::to_string(&meta) {
             Ok(json) => json,
             Err(e) => {
@@ -363,10 +402,9 @@ impl SessionStore {
                 return;
             }
         };
-        if let Err(e) = crate::serialize::write_atomic(
-            &self.meta_path(&file.session_id),
-            crate::secret::redact_cow(&json).as_bytes(),
-        ) {
+        if let Err(e) =
+            crate::serialize::write_atomic(&self.meta_path(&file.session_id), json.as_bytes())
+        {
             tracing::warn!("session meta 写入失败 {}: {e}", file.session_id);
         }
     }
@@ -408,10 +446,24 @@ impl SessionStore {
         // 落盘文件里 context editing 清理过的工具结果是占位符（体积小），原文在
         // CAS。Resume 的语义是「新会话从完整上下文开始」——这里把原文还原回内存，
         // 之后随会话增长再逐步被重新清理。blob 已被 gc 时保留占位符。
-        crate::context_edit::materialize_elided(
-            &mut file.messages,
-            crate::serialize::current_externalize_cas().as_deref(),
-        );
+        let cas = crate::serialize::current_externalize_cas();
+        crate::context_edit::materialize_elided(&mut file.messages, cas.as_deref());
+        // `save()` 还做过第二类外化：超大 image（base64 > 32KB）与长 thinking
+        // （> 16KB）被换成 `cas://<hash>`。这两类必须在这里对称还原，否则
+        // resume 后 model 收到的是字面量 `cas://abc...`，而不是图片或思考原文
+        // ——`materialize_block_with` 此前**零生产调用点**（只被单测引用），
+        // 这条链路一直是断的。
+        //
+        // 顺序无所谓（两类占位符前缀不同、互不匹配），放在 `materialize_elided`
+        // 之后是为了让「工具结果整体占位」优先还原：整块 JSON 里可能还嵌着
+        // 图片占位，先展开外层再逐块还原内层更直观。
+        if cas.is_some() {
+            for message in &mut file.messages {
+                for block in &mut message.content {
+                    crate::serialize::materialize_block_with(block, cas.as_deref());
+                }
+            }
+        }
         Ok(file)
     }
 
@@ -530,6 +582,7 @@ impl SessionStore {
             elided_blobs: vec![],
             session_profile,
             context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
         };
         self.save(&file)?;
         Ok(file)
@@ -650,6 +703,74 @@ mod tests {
         assert!(leftovers.is_empty(), "unexpected temp files: {leftovers:?}");
     }
 
+    /// resume 必须把 `cas://` 占位符还原成真实内容。
+    ///
+    /// 回归钉子：`materialize_block_with` 此前**零生产调用点**（只被单测引用），
+    /// 于是 `save` 外化出去的图片与长 thinking 在 `--resume` 之后仍是字面量
+    /// `cas://<hash>`——模型收到一串 URL 而不是图片。这条测试同时钉住
+    /// 「存什么还原什么」，不经过第二次 base64 编码。
+    #[test]
+    fn load_materializes_externalized_images_and_thinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_dir.path(), 0).unwrap(),
+        );
+
+        let image_b64 = "QUJD".repeat(16 * 1024); // 64KB base64
+        let long_thinking = "想".repeat(8 * 1024); // 24KB UTF-8
+        let mut file = mk_file("sess-cas", Path::new("/tmp"), "2026-01-01T00:00:00Z");
+        file.messages = vec![Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: wyj_api::types::ToolResultContent::Parts(vec![
+                        wyj_api::types::ToolResultPart::Image {
+                            media_type: "image/png".to_string(),
+                            data: image_b64.clone(),
+                        },
+                    ]),
+                    is_error: false,
+                },
+                ContentBlock::Thinking {
+                    thinking: long_thinking.clone(),
+                    signature: "sig".to_string(),
+                    reasoning_details: None,
+                },
+            ],
+        }];
+
+        // 落盘路径读全局 CAS，先注入再还原。
+        crate::serialize::set_externalize_cas(Some(cas));
+        let result = std::panic::catch_unwind(|| {
+            store.save(&file).unwrap();
+            let raw = std::fs::read_to_string(store.path("sess-cas")).unwrap();
+            assert!(raw.contains("cas://"), "落盘应外化成占位符");
+            let loaded = store.load("sess-cas").unwrap();
+            match &loaded.messages[0].content[0] {
+                ContentBlock::ToolResult {
+                    content: wyj_api::types::ToolResultContent::Parts(parts),
+                    ..
+                } => match &parts[0] {
+                    wyj_api::types::ToolResultPart::Image { data, .. } => {
+                        assert_eq!(data, &image_b64)
+                    }
+                    other => panic!("unexpected part: {other:?}"),
+                },
+                other => panic!("unexpected block: {other:?}"),
+            }
+            match &loaded.messages[0].content[1] {
+                ContentBlock::Thinking { thinking, .. } => assert_eq!(thinking, &long_thinking),
+                other => panic!("unexpected block: {other:?}"),
+            }
+            // 返回原值，避免 catch_unwind 之后全局状态未复位。
+        });
+        crate::serialize::set_externalize_cas(None);
+        result.unwrap();
+    }
+
     /// 占用检测只看「另一个活着的进程」，不能被本进程自己或死进程误导。
     #[test]
     fn active_owner_ignores_this_process_and_dead_pids() {
@@ -711,6 +832,7 @@ mod tests {
             elided_blobs: vec![],
             session_profile: None,
             context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
         }
     }
 
@@ -831,6 +953,47 @@ mod tests {
         assert_eq!(restored.overflow_window_hint, Some(262_144));
         assert_eq!(restored.compact_count, 2);
         assert_eq!(restored.context_edit_freed_tokens, 9_000);
+    }
+
+    /// `/resume` 是在**同一个** `Session` 实例上调用 `restore_usage_from` 切换
+    /// 会话的。只搬 `prompt_fingerprint` 而不重置检测状态，会让 `Agent` 里
+    /// `if !session.prompt_fingerprint_checked` 直接跳过首轮检测，而 `/context`
+    /// 继续显示**上一个会话**的漂移结论——张冠李戴比不显示更糟。
+    #[test]
+    fn restore_usage_from_resets_prompt_drift_detection_state() {
+        let mut s = Session::new();
+        s.messages.push(wyj_api::types::Message::user("hi"));
+        let file = SessionFile::from_session(
+            &s,
+            SessionFileMeta {
+                session_id: "s2".to_string(),
+                title: "t".to_string(),
+                last_preview: "p".to_string(),
+                cwd: "/tmp".to_string(),
+                timestamp: "2026-07-01T00:00:00Z".to_string(),
+                turns: 1,
+                title_generated: false,
+            },
+        );
+
+        let mut restored = Session::new();
+        // 模拟「本进程已经跑过一轮、且上一个会话留下了漂移结论」。
+        restored.prompt_fingerprint_checked = true;
+        restored.prompt_drift_since_resume = Some(crate::prompt_fingerprint::PromptDrift {
+            previous_recorded_at: "2026-06-01T00:00:00Z".to_string(),
+            sections: Vec::new(),
+        });
+
+        restored.restore_usage_from(&file);
+
+        assert!(
+            !restored.prompt_fingerprint_checked,
+            "切换会话后必须重新做一次漂移检测"
+        );
+        assert!(
+            restored.prompt_drift_since_resume.is_none(),
+            "上一个会话的漂移结论不能带到新会话"
+        );
     }
 
     /// 会话级分组必须完整走完「内存 Session → SessionFile → 磁盘 → 恢复」，
@@ -1002,6 +1165,7 @@ mod tests {
             elided_blobs: vec![],
             session_profile: None,
             context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
         };
         store.save(&parent).unwrap();
         let checkpoints =
@@ -1070,6 +1234,7 @@ mod tests {
             elided_blobs: vec![],
             session_profile: None,
             context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
         };
         store.save(&file).unwrap();
         let raw = std::fs::read_to_string(store.path("secret-session")).unwrap();

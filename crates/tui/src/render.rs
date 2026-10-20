@@ -21,10 +21,10 @@ use crate::app::{
     PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
     ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
     ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState,
-    SettingsDialog, SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay,
-    SubAgentStatus, SubAgentUiState, SubToolLine, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
-    PROFILE_FIELD_SPECS, SCHEDULE_FIELD_LABEL_KEYS, SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT,
-    SETTINGS_FIELD_LABEL_KEYS,
+    SettingsDialog, SettingsFieldKind, SettingsInputField, SkillsBrowseSource, SkillsDialog,
+    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
+    TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SCHEDULE_FIELD_LABEL_KEYS,
+    SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
 use crate::markdown::{
@@ -47,7 +47,6 @@ use wyj_config::AgentMode;
 use wyj_core::tool::{AskQuestionSpec, QuestionAnswer};
 use wyj_core::ClaudeMdSource;
 use wyj_tools::todo::{is_todo_collapsible, TodoStatus};
-use wyj_tools::trace::TraceEvent;
 
 /// 将 @token 渲染为青色高亮 Span，其余部分为普通文本
 fn highlight_at_refs(line: &str) -> Line<'static> {
@@ -718,7 +717,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 
     // 设置面板叠加在最顶层
     if let Some(dialog) = &state.settings_dialog {
-        draw_settings_dialog(f, dialog, area);
+        draw_settings_dialog(f, dialog, state.input_owner, area);
     }
 
     // 分组管理面板叠加在最顶层
@@ -966,44 +965,6 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
 }
 
 // ─── 对话区 ──────────────────────────────────────────────────────────────────
-
-/// 渲染子 Agent 的内部工具调用明细行（⏺ 工具名(参数) ✓/✗ 耗时）。
-/// 只被 agents 面板详情区调用（与聊天流的 ToolResult 渲染是两条独立路径）。
-fn push_sub_agent_tool_log(
-    lines: &mut Vec<Line<'static>>,
-    tool_log: &[SubToolLine],
-    max_content_width: usize,
-) {
-    for tl in tool_log {
-        let (mark, mark_style) = match (tl.elapsed_secs, tl.is_error) {
-            (None, _) => ("…".to_string(), Theme::dim()),
-            (Some(e), true) => (format!("✗ {}", format_hms(e)), Theme::error()),
-            (Some(e), false) => (format!("✓ {}", format_hms(e)), Theme::success()),
-        };
-        let display_name = crate::app::tool_display_name(&tl.tool_name);
-        let call = if tl.arg_summary.is_empty() {
-            display_name
-        } else {
-            format!("{display_name}({})", tl.arg_summary)
-        };
-        // 与主聊天流同一口径：Grep 行尾标出这次跑的是 rg 还是内置 Rust 实现
-        let call = format!("{call}{}", crate::app::tool_backend_badge(&tl.tool_name));
-        lines.push(Line::from(vec![
-            Span::styled("       ⏺ ", Theme::tool_call()),
-            Span::styled(
-                truncate_line(&call, max_content_width.saturating_sub(20)),
-                Theme::dim(),
-            ),
-            Span::styled(format!("  {mark}"), mark_style),
-        ]));
-    }
-    if !tool_log.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("       {}", "─".repeat(max_content_width.saturating_sub(8))),
-            Theme::dim(),
-        )));
-    }
-}
 
 /// `render_chat_message` 渲染单条消息时需要的跨消息共享只读上下文。
 struct ChatRenderCtx<'a> {
@@ -2721,6 +2682,11 @@ pub(crate) fn resolve_detail_scroll(
 /// 执行内容不再挤在底部面板的详情带里：那条带子受 `bottom_panel_size` 的高度预算
 /// 限制，列表本身还要占行，实际几乎永远显示不全。滚动语义见
 /// [`resolve_detail_scroll`]：默认贴底跟随新事件，PageUp/PgDn 翻阅后停在历史位置。
+///
+/// **正文复用聊天区的渲染管线**（`render_message_range`）：执行轨迹先被翻译成
+/// 与主聊天流同构的 `ChatMessage` 序列（见 `app::sub_agent_view`），于是子 Agent
+/// 的执行过程与聊天流长得一模一样——`⏺ 工具名(参数)` 标题行、`⎿` 结果行、
+/// markdown 正文、Ctrl+O 折叠/展开。详情视图自己那套 `in:` / `out:` 平铺已经删掉。
 fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     let Some(id) = state.selected_sub_agent else {
         draw_chat(f, state, area);
@@ -2759,60 +2725,46 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     // 交接摘要：未完成（中断/触顶/失败）时，这是「做到哪了」最快的一眼——
     // trace 里有全部工具动作，但要滚很久才知道停在哪；结论与改过的文件在这里。
     if let Some(handoff) = state.sub_agents.get(&id).and_then(|s| s.handoff.as_ref()) {
-        push_sub_agent_handoff_lines(&mut lines, handoff, detail_width);
+        push_sub_agent_handoff_line(&mut lines, handoff, detail_width);
     }
 
-    // 正文：优先 trace（含工具入参/出参），落盘 trace 缺失时才退回面板那份摘要流水。
-    let events = state.sub_agent_trace_events(id);
-    match events {
-        Some(events) if !events.is_empty() => {
-            push_sub_agent_trace_lines(&mut lines, &events, detail_width);
-        }
-        _ => {
-            let (tool_log, current_tool, status, final_result) = state
-                .sub_agents
-                .get(&id)
-                .map(|s| {
-                    (
-                        s.tool_log.clone(),
-                        s.current_tool.clone(),
-                        s.status,
-                        s.final_result.clone(),
-                    )
-                })
-                .unwrap_or_else(|| (Vec::new(), None, SubAgentStatus::Running, None));
-            push_sub_agent_tool_log(&mut lines, &tool_log, detail_width);
-            if let Some(cur) = &current_tool {
-                push_wrapped_detail_line(
-                    &mut lines,
-                    &wyj_i18n::tr("subagent.detail_running"),
-                    cur,
-                    Theme::dim(),
-                    detail_width,
-                );
-            }
-            match status {
-                SubAgentStatus::Running => {}
-                SubAgentStatus::Done | SubAgentStatus::Failed => {
-                    let style = if status == SubAgentStatus::Failed {
-                        Theme::error()
-                    } else {
-                        Theme::tool_result()
-                    };
-                    let result = final_result.unwrap_or_else(|| wyj_i18n::tr("subagent.no_output"));
-                    push_wrapped_detail_line(&mut lines, "result", &result, style, detail_width);
-                }
-                SubAgentStatus::Interrupted => {
-                    push_wrapped_detail_line(
-                        &mut lines,
-                        "status",
-                        &wyj_i18n::tr("subagent.interrupted"),
-                        Theme::error(),
-                        detail_width,
-                    );
-                }
-            }
-        }
+    // 正文：翻译成聊天消息序列后交给聊天区管线渲染。工具结果默认折叠成一行
+    // `⏺ 工具名(参数)`，Ctrl+O 展开全文——与主聊天区同一套折叠语义。
+    state.refresh_sub_agent_detail_cache(id);
+    let detail_messages = state
+        .sub_agent_detail_cache
+        .as_ref()
+        .map(|c| c.messages.as_slice())
+        .unwrap_or(&[]);
+    let output_expanded = state.output_expanded;
+    let spinner_frame = state.spinner_frame;
+    let mut is_first_user = true;
+    lines.extend(render_message_range(
+        MessageRangeRenderArgs {
+            messages: detail_messages,
+            range: 0..detail_messages.len(),
+            max_content_width: detail_width,
+            sub_agents: &state.sub_agents,
+            spinner_frame,
+            output_expanded,
+            // 子 Agent 的内部工具输出不走主会话的实时通道：它的实时输出由
+            // 轨迹里的 ToolEnd 落盘事件承担。
+            live_tool_out: &HashMap::new(),
+        },
+        &mut is_first_user,
+    ));
+
+    // 一条消息都没有（刚起来、还没调用过任何工具）：给一行状态，而不是空白。
+    if detail_messages.is_empty() {
+        let text = match state
+            .sub_agents
+            .get(&id)
+            .and_then(|s| s.current_tool.clone())
+        {
+            Some(cur) => format!("{} {cur}", wyj_i18n::tr("subagent.detail_running")),
+            None => wyj_i18n::tr("subagent.detail_running_idle"),
+        };
+        lines.push(Line::from(Span::styled(format!("  {text}"), Theme::dim())));
     }
 
     // 末行留给固定的返回/滚动提示，不随正文滚动。
@@ -2874,37 +2826,19 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     );
 }
 
-fn push_wrapped_detail_line(
-    lines: &mut Vec<Line<'static>>,
-    label: &str,
-    text: &str,
-    style: Style,
-    width: usize,
-) {
-    let prefix = if label.is_empty() {
-        "  ".to_string()
-    } else {
-        format!("  {label}: ")
-    };
-    let available = width.saturating_sub(prefix.len()).max(1);
-    for (idx, wrapped) in wrap_line(text, available).into_iter().enumerate() {
-        let line_prefix = if idx == 0 {
-            prefix.clone()
-        } else {
-            "  ".to_string() + &" ".repeat(label.len() + 2)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{line_prefix}{wrapped}"),
-            style,
-        )));
-    }
-}
-
-/// 交接摘要块：未完成状态下「做到哪了」的一屏速览。
+/// 交接摘要：**一行**结论。
 ///
-/// 只渲染**结论性**信息（状态、停下的原因、最后陈述、改过的文件、错误）。
-/// 读过的文件只给计数——一屏塞 30 个路径既挤又没用，需要细看时下面就是 trace。
-fn push_sub_agent_handoff_lines(
+/// 曾经是一整块（状态 / 原因 / 结论 / 改过的文件 / 错误逐行铺开），在工具流水
+/// 前面占掉大半屏，而「做到哪了」真正需要的只有状态、次数与结论。现在收敛成
+/// 聊天风格的一行 `⎿` 行——与工具行同一套前缀，视觉上属于同一条消息流。
+///
+/// 顺序是「状态 → 次数 → 改动文件 → 结论」：前几段定长，结论是唯一的变长段，
+/// 按**剩余宽度**截断——状态与次数一定看得见，结论拿剩下的那几列。
+///
+/// **停下的原因不在这行里**：它多半是一整段 provider 报错，塞进来会把结论挤没，
+/// 而它本来就在正文里（终态结果 `Done.result` 的最后一段就是那句报错，见
+/// `sub_agent.rs` 的 `outputs.push(run_failed)`）。
+fn push_sub_agent_handoff_line(
     lines: &mut Vec<Line<'static>>,
     handoff: &wyj_tools::handoff::SubAgentHandoff,
     detail_width: usize,
@@ -2919,223 +2853,46 @@ fn push_sub_agent_handoff_lines(
         HandoffStatus::TurnLimit => (wyj_i18n::tr("subagents.status_turn_limit"), Theme::error()),
         HandoffStatus::Failed => (wyj_i18n::tr("subagents.status_failed"), Theme::error()),
     };
-    push_wrapped_detail_line(
-        lines,
-        &wyj_i18n::tr_fmt(
-            "subagents.handoff_line",
-            &[
-                ("status", &status_label),
-                ("calls", &handoff.digest.total_calls.to_string()),
-            ],
-        ),
-        "",
-        style,
-        detail_width,
-    );
-    if let Some(reason) = &handoff.reason {
-        push_wrapped_detail_line(lines, "reason", reason, Theme::dim(), detail_width);
-    }
-    if !handoff.conclusion.trim().is_empty() {
-        push_wrapped_detail_line(
-            lines,
-            "last position",
-            &handoff.conclusion,
-            Theme::tool_result(),
-            detail_width,
-        );
-    } else {
-        push_wrapped_detail_line(
-            lines,
-            "last position",
-            &wyj_i18n::tr("subagent.handoff_no_conclusion"),
-            Theme::dim(),
-            detail_width,
-        );
-    }
-    if !handoff.digest.files_modified.is_empty() {
-        push_wrapped_detail_line(
-            lines,
-            "modified",
-            &handoff.digest.files_modified.join(", "),
-            Theme::dim(),
-            detail_width,
-        );
-    }
-    if !handoff.digest.files_read.is_empty() {
-        push_wrapped_detail_line(
-            lines,
-            &wyj_i18n::tr_fmt(
-                "subagents.handoff_files_read",
-                &[("count", &handoff.digest.files_read.len().to_string())],
-            ),
-            "",
-            Theme::dim(),
-            detail_width,
-        );
-    }
-    if !handoff.digest.errors.is_empty() {
-        push_wrapped_detail_line(
-            lines,
-            "errors",
-            &handoff.digest.errors.join("; "),
-            Theme::error(),
-            detail_width,
-        );
-    }
-    if handoff.status.is_incomplete() {
-        push_wrapped_detail_line(
-            lines,
-            "",
-            &wyj_i18n::tr("subagents.handoff_hint"),
-            Theme::info(),
-            detail_width,
-        );
-    }
-    lines.push(Line::from(Span::styled(
-        "─".repeat(detail_width.min(120)),
-        Theme::dim(),
-    )));
-}
 
-fn push_sub_agent_trace_lines(
-    lines: &mut Vec<Line<'static>>,
-    events: &[TraceEvent],
-    detail_width: usize,
-) {
-    for ev in events {
-        match ev {
-            TraceEvent::Started {
-                agent_type,
-                description,
-                background,
-                ..
-            } => {
-                let bg = if *background { " background" } else { "" };
-                push_wrapped_detail_line(
-                    lines,
-                    "start",
-                    &format!("{agent_type}({description}){bg}"),
-                    Theme::dim(),
-                    detail_width,
-                );
-            }
-            TraceEvent::ToolStart {
-                tool_name,
-                input_json,
-                truncated,
-            } => {
-                push_wrapped_detail_line(
-                    lines,
-                    "tool",
-                    &format!(
-                        "{tool_name} input{}",
-                        if *truncated { " [truncated]" } else { "" }
-                    ),
-                    Theme::tool_call(),
-                    detail_width,
-                );
-                for l in input_json.lines() {
-                    push_wrapped_detail_line(lines, "in", l, Theme::dim(), detail_width);
-                }
-            }
-            TraceEvent::ToolEnd {
-                tool_name,
-                is_error,
-                elapsed_secs,
-                output,
-                truncated,
-            } => {
-                let style = if *is_error {
-                    Theme::error()
-                } else {
-                    Theme::tool_result()
-                };
-                push_wrapped_detail_line(
-                    lines,
-                    "done",
-                    &format!(
-                        "{tool_name} · {}{}",
-                        format_hms(*elapsed_secs),
-                        if *truncated { " [truncated]" } else { "" }
-                    ),
-                    style,
-                    detail_width,
-                );
-                if output.is_empty() {
-                    push_wrapped_detail_line(
-                        lines,
-                        "out",
-                        "(no output)",
-                        Theme::dim(),
-                        detail_width,
-                    );
-                } else {
-                    for l in output.lines() {
-                        push_wrapped_detail_line(lines, "out", l, style, detail_width);
-                    }
-                }
-            }
-            TraceEvent::Usage {
-                input_tokens,
-                output_tokens,
-            } => {
-                push_wrapped_detail_line(
-                    lines,
-                    "usage",
-                    &format!(
-                        "↑{} ↓{}",
-                        fmt_tokens(*input_tokens),
-                        fmt_tokens(*output_tokens)
-                    ),
-                    Theme::dim(),
-                    detail_width,
-                );
-            }
-            TraceEvent::Assistant { text } => {
-                // 每轮落点：这是详情面板里唯一能看出「它得出了什么」的地方，
-                // 工具行只说明「它做了什么」。
-                push_wrapped_detail_line(lines, "say", text, Theme::dim(), detail_width);
-            }
-            TraceEvent::Control { action, accepted } => {
-                push_wrapped_detail_line(
-                    lines,
-                    "control",
-                    &format!("{action} · accepted={accepted}"),
-                    if *accepted {
-                        Theme::dim()
-                    } else {
-                        Theme::error()
-                    },
-                    detail_width,
-                );
-            }
-            TraceEvent::Done {
-                result,
-                is_error,
-                elapsed_secs,
-            } => {
-                let style = if *is_error {
-                    Theme::error()
-                } else {
-                    Theme::tool_result()
-                };
-                push_wrapped_detail_line(
-                    lines,
-                    "result",
-                    &format!(
-                        "{} · {}",
-                        if *is_error { "failed" } else { "done" },
-                        format_hms(*elapsed_secs)
-                    ),
-                    style,
-                    detail_width,
-                );
-                for l in result.lines() {
-                    push_wrapped_detail_line(lines, "", l, style, detail_width);
-                }
-            }
+    let mut parts: Vec<String> = vec![wyj_i18n::tr_fmt(
+        "subagents.handoff_line",
+        &[
+            ("status", &status_label),
+            ("calls", &handoff.digest.total_calls.to_string()),
+        ],
+    )];
+    if !handoff.digest.files_modified.is_empty() {
+        parts.push(wyj_i18n::tr_fmt(
+            "subagents.handoff_files_modified",
+            &[("count", &handoff.digest.files_modified.len().to_string())],
+        ));
+    }
+
+    // 结论：交接物里最有价值的部分——它不可再生（工具调用可以重读，结论推导不出来）。
+    let conclusion = handoff.conclusion.trim();
+    if conclusion.is_empty() {
+        if handoff.status.is_incomplete() {
+            // 没留下结论时说清楚「没留下」，别让人以为这一行漏了内容。
+            parts.push(wyj_i18n::tr("subagent.handoff_no_conclusion"));
+        }
+    } else {
+        let label = wyj_i18n::tr_fmt("subagents.handoff_conclusion", &[("text", "")]);
+        let prefix_width: usize = parts.iter().map(|p| display_width(p)).sum::<usize>()
+            + (parts.len() - 1) * 3 /* " · " */;
+        // 减 6 是给 `  ⎿ ` 前缀留的位；不足 8 列就别塞结论了（半个词更没用）。
+        let budget = detail_width.saturating_sub(6 + prefix_width + 3 + display_width(&label));
+        if budget >= 8 {
+            parts.push(format!("{label}{}", truncate_line(conclusion, budget)));
         }
     }
+
+    lines.push(Line::from(vec![
+        Span::styled("  ⎿ ", Theme::dim()),
+        Span::styled(
+            truncate_line(&parts.join(" · "), detail_width.saturating_sub(6)),
+            style,
+        ),
+    ]));
 }
 
 /// 底部固定面板：子 Agent 总览，支持上下选中 + 展开详情（工具流水 + 最终结果/状态）。
@@ -4313,8 +4070,9 @@ mod plan_approval_render_tests {
 #[cfg(test)]
 mod tool_result_fold_tests {
     use super::*;
-    use crate::app::ShellStatus;
+    use crate::app::{ShellStatus, SubToolLine};
     use crate::test_support::{make_state, message, render_to_text, rendered_text};
+    use wyj_tools::trace::TraceEvent;
     // 生产代码不再出现裸 `Color`（见 theme_tests.rs 的扫描钉子）；测试需要它
     // 来断言"渲染结果确实用了某个具体颜色"。
     use ratatui::style::Color;
@@ -4931,6 +4689,177 @@ mod tool_result_fold_tests {
         assert!(
             text.contains("WebFetch(url)"),
             "内容区应显示当前动作：\n{text}"
+        );
+    }
+
+    /// 详情视图的正文必须走**聊天区那条渲染管线**：工具调用是 `⏺ 工具名(参数)`
+    /// 一行，工具正文默认折叠，Ctrl+O 才展开；助手文本按 markdown 渲染。
+    ///
+    /// 这条钉住「详情视图不再自己平铺 trace」——旧实现把 `out:` / `in:` 逐行
+    /// 铺开，一次 Read 的输出就是几百行字符墙。
+    #[test]
+    fn sub_agent_detail_renders_trace_through_the_chat_pipeline() {
+        let mut state = make_state();
+        state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));
+        state.sub_agent_trace_cache.insert(
+            1,
+            std::sync::Arc::new(vec![
+                TraceEvent::Started {
+                    agent_type: "Explore".into(),
+                    description: "find the needle".into(),
+                    background: false,
+                    parent_tool_use_id: None,
+                },
+                TraceEvent::ToolStart {
+                    tool_name: "Grep".into(),
+                    input_json: r#"{"pattern":"needle","path":"."}"#.into(),
+                    truncated: false,
+                },
+                TraceEvent::ToolEnd {
+                    tool_name: "Grep".into(),
+                    is_error: false,
+                    elapsed_secs: 0.4,
+                    output: "src/a.rs:12: needle found".into(),
+                    truncated: false,
+                },
+                TraceEvent::Assistant {
+                    text: "needle is defined in src/a.rs".into(),
+                },
+                TraceEvent::Done {
+                    result: "conclusion: needle lives in src/a.rs".into(),
+                    is_error: false,
+                    elapsed_secs: 1.2,
+                },
+            ]),
+        );
+        state.selected_sub_agent = Some(1);
+        state.sub_agent_detail_open = true;
+        state.ui_focus = UiFocus::SubAgents;
+
+        let collapsed =
+            render_to_text(|f| draw_sub_agent_content(f, &mut state, f.area()), 100, 30);
+        assert!(
+            collapsed.contains("⏺ Grep(needle in .)"),
+            "工具调用应按聊天区口径渲染成一行：\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("needle found"),
+            "折叠态不得露出工具正文：\n{collapsed}"
+        );
+        assert!(
+            collapsed.contains("needle is defined in src/a.rs"),
+            "助手文本应进正文：\n{collapsed}"
+        );
+
+        state.output_expanded = true;
+        let expanded = render_to_text(|f| draw_sub_agent_content(f, &mut state, f.area()), 100, 30);
+        assert!(
+            expanded.contains("needle found"),
+            "Ctrl+O 之后应展开工具正文：\n{expanded}"
+        );
+    }
+
+    /// 交接摘要收敛成**一行**聊天风格的结论。
+    ///
+    /// 旧实现是一整块（状态 / 原因 / 结论 / 文件 / 错误逐行铺开），在工具流水
+    /// 前面占掉大半屏。
+    #[test]
+    fn sub_agent_handoff_is_a_single_chat_style_line() {
+        let mut state = make_state();
+        let mut sub = sub_agent(SubAgentStatus::Interrupted);
+        sub.handoff = Some(wyj_tools::handoff::SubAgentHandoff {
+            version: wyj_tools::handoff::HANDOFF_VERSION,
+            id: 1,
+            agent_type: "general-purpose".into(),
+            description: "test task".into(),
+            background: false,
+            status: wyj_tools::handoff::HandoffStatus::Interrupted,
+            reason: Some("provider timeout".into()),
+            conclusion: "half of the work is done".into(),
+            digest: wyj_tools::handoff::ToolDigest::default(),
+            elapsed_secs: 3.0,
+        });
+        state.sub_agents.insert(1, sub);
+        state.selected_sub_agent = Some(1);
+        state.sub_agent_detail_open = true;
+        state.ui_focus = UiFocus::SubAgents;
+
+        let text = render_to_text(|f| draw_sub_agent_content(f, &mut state, f.area()), 100, 30);
+
+        let handoff_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("half of the work is done"))
+            .collect();
+        assert_eq!(handoff_lines.len(), 1, "交接摘要应只有一行：\n{text}");
+        // 停下的原因不进这一行（它多半是一整段报错，会把结论挤没），
+        // 而是作为一条系统通知进正文。
+        assert!(
+            text.contains("provider timeout"),
+            "停下的原因应在正文里：\n{text}"
+        );
+    }
+
+    /// 详情视图的消息翻译必须缓存：轨迹每帧都在被读，而每段助手文本的 markdown
+    /// 解析是这里最贵的一步。轨迹没变就不该重建。
+    #[test]
+    fn sub_agent_detail_messages_are_cached_until_the_trace_grows() {
+        let mut state = make_state();
+        state
+            .sub_agents
+            .insert(1, sub_agent(SubAgentStatus::Running));
+        state.sub_agent_trace_cache.insert(
+            1,
+            std::sync::Arc::new(vec![TraceEvent::Started {
+                agent_type: "Explore".into(),
+                description: "cached".into(),
+                background: false,
+                parent_tool_use_id: None,
+            }]),
+        );
+
+        state.refresh_sub_agent_detail_cache(1);
+        let first = state
+            .sub_agent_detail_cache
+            .as_ref()
+            .map(|c| c.messages.len())
+            .unwrap_or(0);
+        assert_eq!(first, 0, "只有 Started 事件时没有可展示的消息");
+
+        // 轨迹没变 → 缓存命中，消息条数不变
+        state.refresh_sub_agent_detail_cache(1);
+        assert_eq!(
+            state
+                .sub_agent_detail_cache
+                .as_ref()
+                .map(|c| c.messages.len())
+                .unwrap_or(0),
+            first
+        );
+
+        // 轨迹长了一条 → 缓存失效并重建
+        state.sub_agent_trace_cache.insert(
+            1,
+            std::sync::Arc::new(vec![
+                TraceEvent::Started {
+                    agent_type: "Explore".into(),
+                    description: "cached".into(),
+                    background: false,
+                    parent_tool_use_id: None,
+                },
+                TraceEvent::Assistant {
+                    text: "说一句".into(),
+                },
+            ]),
+        );
+        state.refresh_sub_agent_detail_cache(1);
+        assert_eq!(
+            state
+                .sub_agent_detail_cache
+                .as_ref()
+                .map(|c| c.messages.len())
+                .unwrap_or(0),
+            1,
+            "轨迹长了一条就该重建出新的消息"
         );
     }
 
@@ -7391,6 +7320,7 @@ mod cost_panel_render_tests {
             context_window: 200_000,
             estimated_tokens: 159_164,
             context_audit: None,
+            prompt_drift: None,
             last_latency: Default::default(),
             compact_count: 0,
             context_edit: (0, 0),

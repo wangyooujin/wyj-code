@@ -118,6 +118,22 @@ pub fn redact_sensitive_text(input: &str) -> String {
 }
 
 /// 借用版：没有 secret 形态时返回 `Cow::Borrowed`，避免落盘路径上的整串复制。
+///
+/// # ⚠️ 只可用于未序列化的文本，不可用于 JSON 文档
+///
+/// 本函数对传入文本做正则替换，而 `assignment_pattern` / `password_pattern`
+/// 的前缀含 `\\?["']?`——它会咬住一个反斜杠 + 一个引号。把它用在**已序列化的
+/// JSON 文本**上时，JSON 的转义引号 `\"` 会被拆开：反斜杠留在 `captures[1]`
+/// 里回填，而结尾的 `"` 被匹配掉却不回填。结果是输出里出现一个**未转义的裸
+/// 引号**，字符串提前终止，整个文件解析失败。
+///
+/// 实测（2026-10-20）：`~/.wyj-code/sessions` 下 120 个 checkpoint（约 133 MB）
+/// 因此损坏，`serde_json` 报 `Invalid \escape`，永久读不出。
+///
+/// 修正则治不了本：只要还对序列化后的文本做替换，任何 `\` + 引号的组合都可能
+/// 被改写，而在 JSON 里「改写引号」就等于破坏结构。落盘 JSON 一律改用
+/// [`redact_json_value`]（值级递归，会话与 checkpoint 两条落盘路径共用）。
+/// 本函数保留给**字段值 / 单行文本**路径：memory / evolution / trace。
 pub fn redact_cow(input: &str) -> Cow<'_, str> {
     if !might_contain_secret(input) {
         return Cow::Borrowed(input);
@@ -141,6 +157,101 @@ pub fn redact_cow(input: &str) -> Cow<'_, str> {
         })
         .into_owned()
         .into()
+}
+
+/// 对任意 JSON 值做**结构安全**的脱敏：只改写 string 叶子，不碰 JSON 语法。
+///
+/// 这是落盘路径的正确入口。与 [`redact_cow`] 的区别是关键：
+/// `redact_cow` 作用在序列化后的**文本**上，正则可能改写引号与反斜杠；
+/// 本函数作用在**已反序列化的值**上，改写只发生在字符串内容里，
+/// 之后由序列化器统一转义，JSON 结构不会被破坏。
+///
+/// 覆盖两种形态：
+/// - 值为字符串 → 直接脱敏；
+/// - 值为对象 → 按 key 名判断是否**整值替换**（`api_key` / `token` /
+///   `password` 等字段名本身可信，值再短也该遮）；
+/// - 数组 / 嵌套对象 → 递归。
+///
+/// **跳过两类内容块**（整块不动）：
+/// - `thinking` / `redacted_thinking`：正文必须连同 `signature` 原样回传，
+///   改写一个字节就会让两端的签名校验失配（同 `persist_cap` 不截断 thinking
+///   的理由）。这两类正文是模型自己生成的，不是用户粘贴的凭据来源。
+/// - `image`：`data` 是 base64，改写任意字符都会损坏图片，而且 base64 字母表
+///   里不含文本形态的凭据。
+///
+/// 就地修改，避免为几 MB 的会话再复制一份。
+pub fn redact_json_value(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => {
+            if let Cow::Owned(redacted) = redact_cow(text) {
+                *text = redacted;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item);
+            }
+        }
+        Value::Object(map) => {
+            // 判据必须同时看 `type` 与块的特征字段：用户数据（tool_use 的
+            // input JSON）里也可能有 `"type": "image"` 这种字段，只看 type
+            // 会把它整块跳过，等于漏掉一次脱敏。
+            let opaque = match map.get("type").and_then(Value::as_str) {
+                Some("thinking") => map.contains_key("thinking"),
+                Some("redacted_thinking") => map.contains_key("data"),
+                Some("image") => map.contains_key("source"),
+                _ => false,
+            };
+            if opaque {
+                return;
+            }
+            for (key, item) in map.iter_mut() {
+                // 字段名可信时整值替换：值可能短于正则阈值（`password = "abc"`），
+                // 但它出现在一个明确的凭据字段下，语义上没有别的解释。
+                if is_credential_field_name(key) && value_is_nonempty(item) {
+                    *item = Value::String(REDACTED_SECRET.to_string());
+                    continue;
+                }
+                redact_json_value(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn value_is_nonempty(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        _ => true,
+    }
+}
+
+/// 字段名是否本身就是凭据语义。**必须整词匹配**，否则 `token_count`
+/// 这类常见字段会被大面积误伤（与 `password_pattern` 的阈值放宽同一考量）。
+fn is_credential_field_name(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    let normalized = lower.replace(['-', ' '], "_");
+    matches!(
+        normalized.as_str(),
+        "api_key"
+            | "apikey"
+            | "api_secret"
+            | "secret"
+            | "secret_key"
+            | "client_secret"
+            | "access_token"
+            | "refresh_token"
+            | "auth_token"
+            | "bearer_token"
+            | "private_key"
+            | "signing_key"
+            | "password"
+            | "passwd"
+            | "pwd"
+    )
 }
 
 #[cfg(test)]
@@ -199,5 +310,45 @@ mod tests {
             redact_cow("token = abcdefghijklmnop"),
             std::borrow::Cow::Owned(_)
         ));
+    }
+
+    /// thinking 必须连同 signature 原样回传：脱敏改一个字节，resume 后签名校验
+    /// 就会失配。旧实现（文本级 `redact_cow`）在这里是**改**的，等于把会话写坏；
+    /// 值级脱敏必须显式跳过。
+    #[test]
+    fn thinking_blocks_are_never_rewritten() {
+        let secret = format!("sk-{}", "A".repeat(32));
+        let mut value = serde_json::json!({
+            "type": "thinking",
+            "thinking": format!("用户的 key 是 {secret}"),
+            "signature": "sig=="
+        });
+        redact_json_value(&mut value);
+        assert_eq!(value["thinking"], format!("用户的 key 是 {secret}"));
+    }
+
+    /// image 的 data 是 base64，改写任意字符都会损坏图片。
+    #[test]
+    fn image_blocks_are_never_rewritten() {
+        let data = format!("{}{}", "QUJD".repeat(4), "train"); // 含预筛 needle 也无所谓
+        let mut value = serde_json::json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": "image/png", "data": data }
+        });
+        redact_json_value(&mut value);
+        assert_eq!(value["source"]["data"], data);
+    }
+
+    /// 跳过判据不能只看 `type`：用户 tool_use 的 input 里也可能有
+    /// `"type": "image"`，那属于普通数据，必须照常脱敏。
+    #[test]
+    fn user_json_that_happens_to_use_an_image_type_is_still_redacted() {
+        let secret = format!("sk-{}", "B".repeat(32));
+        let mut value = serde_json::json!({
+            "type": "image",
+            "note": format!("api_key={secret}")
+        });
+        redact_json_value(&mut value);
+        assert!(!value["note"].as_str().unwrap().contains(&secret));
     }
 }

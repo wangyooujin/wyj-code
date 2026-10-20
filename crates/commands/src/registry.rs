@@ -186,6 +186,13 @@ pub struct CommandContext {
     /// "自定义命令"分组。`(name, description, usage)`，由调用方在构造本结构体前用
     /// `cmd_registry.list()` 过滤 `is_dynamic()` 算好传入。
     pub dynamic_commands: Vec<(String, String, String)>,
+    /// resume 后第一次请求测得的 system prompt 漂移（见
+    /// [`wyj_core::prompt_fingerprint`]）。
+    ///
+    /// `None` = 还没发起请求，或落盘没有指纹可比（升级前的老会话）。
+    /// `Some(空)` = 比过了、完全一致——**与 `None` 是两种不同的结论**，
+    /// `/context` 必须把它们分开显示：一个是"不知道"，一个是"确认没变"。
+    pub prompt_drift: Option<wyj_core::prompt_fingerprint::PromptDrift>,
 }
 
 /// Slash 命令 trait

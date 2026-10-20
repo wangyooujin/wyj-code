@@ -1788,6 +1788,30 @@ impl Agent {
                     stable: &system_stable,
                     volatile: &request_system_volatile,
                 };
+                // 采集「本次真正发出去的 prompt 由什么构成」。`main` 只用
+                // `self.system_prompt`（不含记忆/规约），这样版本升级与 locale
+                // 变化才是这一段的唯一变量——把它们混进来，drift 就永远非空。
+                let fingerprint = crate::prompt_fingerprint::PromptFingerprint::capture(
+                    self.system_prompt.as_ref(),
+                    &memory_snapshot,
+                    reminder.as_deref().unwrap_or(""),
+                    &request_system_volatile,
+                    &request_tools,
+                );
+                // **只在进程内第一次发请求时做一次漂移检测**。落盘的那份指纹
+                // 来自上一次运行（`restore_usage_from` 带进来的），这就是对比
+                // 基准；从第二轮起 `session.prompt_fingerprint` 已经是本进程的
+                // 值，再比只会恒等——而「同一个进程内 prompt 变了」不是这个功能
+                // 要回答的问题（memory 分桶 / 规约重读导致的差异已被排除在
+                // `COMPARABLE_SECTIONS` 之外）。
+                if !session.prompt_fingerprint_checked {
+                    session.prompt_fingerprint_checked = true;
+                    if let Some(previous) = session.prompt_fingerprint.as_ref() {
+                        let drift = previous.drift(&fingerprint);
+                        session.prompt_drift_since_resume = Some(drift);
+                    }
+                }
+                session.prompt_fingerprint = Some(fingerprint);
                 // 存下「本次真正发出去的 volatile 字节」：手动 `/compact` 在回合之外
                 // 重建不了子目录 reminder（`seen_dirs` 全局去重，第二个回合起就没
                 // 有了），只能靠这份快照才能与主对话前缀逐字节一致、命中缓存。

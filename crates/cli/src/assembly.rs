@@ -83,9 +83,13 @@ pub fn build_tool_registry(
     }
     registry.register_arc(Arc::new(AskQuestionTool::new()));
 
-    // WebSearch：仅当配置了搜索 API Key 时注册（否则模型看不到，避免误调）
-    if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
-        registry.register_arc(Arc::new(WebSearchTool::new(key)));
+    // WebSearch：仅当 `[search]` 配置可用（后端已声明且 key 存在）时注册。未配置时
+    // 模型看不到该工具，避免它调用一个必然失败的工具白跑一趟。
+    if let Some(backend) = wyj_tools::build_backend(cfg) {
+        registry.register_arc(Arc::new(
+            WebSearchTool::new(backend, cfg.search.max_results)
+                .with_default_domains(&cfg.search.allowed_domains, &cfg.search.blocked_domains),
+        ));
     }
 
     (computers.computer)(&mut registry, cfg);

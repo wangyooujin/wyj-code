@@ -680,6 +680,55 @@ impl Default for ToolsCfg {
     }
 }
 
+/// `[search]` 节 —— WebSearch 工具的后端与请求默认值。
+///
+/// 为什么从顶层扁平字段收拢成子节：`search_provider` / `search_api_key` 曾是两个
+/// 顶层字段，其中 `search_provider` **全仓没有任何读取点**——用户改了它毫无效果，
+/// 是典型的"配置项幻象"（配置存在、UI 能编辑、代码从不消费）。改成子节后有
+/// [`Config::search_provider_issue`] 这个单一判定入口，选到不认识的 provider 会
+/// 显式报错而不是静默回退。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchCfg {
+    /// 搜索后端：`"tavily"`（默认）或 `"brave"`。
+    pub provider: String,
+    /// 后端 API Key。优先读环境变量 `WYJ_CODE_SEARCH_API_KEY`（见
+    /// [`Config::search_api_key`]）；未配置时 WebSearch 工具不注册，模型看不到它。
+    pub api_key: Option<String>,
+    /// 单次搜索请求超时（秒）。
+    pub timeout_secs: u64,
+    /// 模型未显式指定 `max_results` 时使用的条数。
+    pub max_results: u32,
+    /// 默认白名单域名（模型可用 `include_domains` 覆盖）。
+    pub allowed_domains: Vec<String>,
+    /// 默认黑名单域名（模型可用 `exclude_domains` 覆盖）。
+    pub blocked_domains: Vec<String>,
+    /// Brave 的 `search_lang`（ISO 639-1）。空串 = 不指定，用后端默认值。
+    pub language: String,
+    /// 是否开启安全搜索（Brave 映射为 `safesearch=strict`）。
+    pub safe_search: bool,
+}
+
+impl Default for SearchCfg {
+    fn default() -> Self {
+        Self {
+            provider: "tavily".to_string(),
+            api_key: None,
+            timeout_secs: 30,
+            max_results: 5,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            language: String::new(),
+            safe_search: true,
+        }
+    }
+}
+
+impl SearchCfg {
+    /// 已知后端列表，供错误信息与诊断输出使用。
+    pub const KNOWN_PROVIDERS: &'static [&'static str] = &["tavily", "brave"];
+}
+
 /// `[ui]` 节 —— TUI 展示区的交互开关。
 ///
 /// `mouse_capture` 是 2026-10 那次取舍的落点：alternate screen 里终端自己的
@@ -1079,13 +1128,14 @@ pub struct Config {
     /// TUI 展示区交互开关（[ui] 节）
     #[serde(default)]
     pub ui: UiCfg,
-    /// WebSearch 搜索 provider（目前支持 "tavily"）
-    #[serde(default = "default_search_provider")]
-    pub search_provider: String,
-    /// WebSearch API Key（优先从环境变量 WYJ_CODE_SEARCH_API_KEY 读取）。
-    /// 未配置时 WebSearch 工具不会注册，模型看不到该工具。
+    /// WebSearch 后端与请求默认值（[search] 节）
     #[serde(default)]
-    pub search_api_key: Option<String>,
+    pub search: SearchCfg,
+    /// 仅运行期存在的搜索 API Key；serde 永不读写。与 `runtime_api_key` 同理：
+    /// 环境变量覆盖必须落在 `#[serde(skip)]` 槽位上，否则用户打开设置面板保存时
+    /// 会把 key 物化进 config.toml。
+    #[serde(skip)]
+    pub runtime_search_api_key: Option<String>,
     /// 仅运行期存在的 API Key；serde 永不读写，避免环境变量被设置面板落盘。
     #[serde(skip)]
     pub runtime_api_key: Option<String>,
@@ -1205,10 +1255,6 @@ fn default_true() -> bool {
     true
 }
 
-fn default_search_provider() -> String {
-    "tavily".to_string()
-}
-
 /// API Key 环境变量名校验：首字符必须为字母或下划线，后续字符允许字母、数字、下划线。
 /// 不强制 ASCII 大写——允许小写、混合大小写，因为用户经常在 `~/.bashrc` / `~/.zshrc`
 /// 里写 `export model_minimax=...`、`export MiniMax_API_KEY=...` 之类。
@@ -1240,8 +1286,8 @@ impl Default for Config {
             agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
             ui: UiCfg::default(),
-            search_provider: default_search_provider(),
-            search_api_key: None,
+            search: SearchCfg::default(),
+            runtime_search_api_key: None,
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
@@ -1249,6 +1295,35 @@ impl Default for Config {
             loaded_baseline: None,
         }
     }
+}
+
+/// 把旧版顶层的 `search_provider` / `search_api_key` 搬进 `[search]` 节。
+///
+/// 返回是否发生了迁移（调用方据此打一次 warn）。规则：
+///   * 目标是**已存在**的 `[search].provider` / `[search].api_key` 时保留之（新的显式
+///     配置优先于旧字段）；
+///   * 无论是否搬运成功，旧的顶层键都会**删除**——留着它们只会让用户以为还生效。
+fn migrate_legacy_search_fields(value: &mut toml::Value) -> bool {
+    let Some(table) = value.as_table_mut() else {
+        return false;
+    };
+    let legacy_provider = table.remove("search_provider");
+    let legacy_key = table.remove("search_api_key");
+    if legacy_provider.is_none() && legacy_key.is_none() {
+        return false;
+    }
+    let section = table
+        .entry("search".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let Some(section) = section.as_table_mut() {
+        if let Some(provider) = legacy_provider {
+            section.entry("provider".to_string()).or_insert(provider);
+        }
+        if let Some(key) = legacy_key {
+            section.entry("api_key".to_string()).or_insert(key);
+        }
+    }
+    true
 }
 
 /// 旧版（v0）扁平配置结构，仅用于 `Config::load()` 里一次性迁移旧 config.toml。
@@ -1333,8 +1408,8 @@ impl From<LegacyConfigV0> for Config {
             agent: AgentCfg::default(),
             tools: ToolsCfg::default(),
             ui: UiCfg::default(),
-            search_provider: default_search_provider(),
-            search_api_key: None,
+            search: SearchCfg::default(),
+            runtime_search_api_key: None,
             runtime_api_key: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
@@ -1417,12 +1492,12 @@ impl Config {
                     .and_then(|name| std::env::var(name).ok())
                     .filter(|key| !key.is_empty())
             });
-        // WebSearch key：环境变量优先
-        if let Ok(key) = std::env::var("WYJ_CODE_SEARCH_API_KEY") {
-            if !key.is_empty() {
-                cfg.search_api_key = Some(key);
-            }
-        }
+        // WebSearch key：**写进 serde 跳过的运行期槽位**，与 api_key 同理。
+        // 早先的实现直接覆盖 `search_api_key` 普通字段，于是用户只要打开一次设置
+        // 面板并保存，环境变量里的 key 就被物化进了 config.toml。
+        cfg.runtime_search_api_key = std::env::var("WYJ_CODE_SEARCH_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
         Ok(cfg)
     }
 
@@ -1438,10 +1513,21 @@ impl Config {
         let mut cfg: Config = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)
                 .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
-            let value: toml::Value = toml::from_str(&content)
+            let mut value: toml::Value = toml::from_str(&content)
                 .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?;
             if value.get("profiles").is_some() {
-                toml::from_str(&content)
+                // 旧顶层 `search_provider` / `search_api_key` 一次性迁到 `[search]` 节。
+                // 必须在反序列化**之前**改写 toml::Value：`Config` 里已没有这两个字段，
+                // 残留的旧键会被 serde 静默忽略——用户会看到「key 还在文件里，工具却不灵」。
+                if migrate_legacy_search_fields(&mut value) {
+                    tracing::warn!(
+                        "配置里的 search_provider / search_api_key 已迁移到 [search] 节 \
+                         （provider / api_key）；下次保存配置即会写回新格式: {}",
+                        config_path.display()
+                    );
+                }
+                value
+                    .try_into()
                     .with_context(|| format!("解析配置文件失败: {}", config_path.display()))?
             } else {
                 let legacy: LegacyConfigV0 = toml::from_str(&content)
@@ -1476,6 +1562,56 @@ impl Config {
             .flatten();
 
         Ok(cfg)
+    }
+
+    /// 返回 WebSearch 后端的有效 API Key。
+    ///
+    /// 优先环境变量（已落进 `runtime_search_api_key`），其次 `[search].api_key`。
+    /// 返回 `None` 表示未配置——调用方据此**不注册** WebSearch 工具（而不是注册一个
+    /// 必然失败的工具让模型白跑一趟）。
+    pub fn search_api_key(&self) -> Option<&str> {
+        self.runtime_search_api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .or_else(|| self.search.api_key.as_deref().filter(|k| !k.is_empty()))
+    }
+
+    /// 生效的搜索后端名。空串按默认（`tavily`）处理——诊断输出需要一个具体的
+    /// 名字，直接把空串渲染成「WebSearch: （已配置）」会让用户以为配置掉了。
+    pub fn effective_search_provider(&self) -> &str {
+        let provider = self.search.provider.trim();
+        if provider.is_empty() {
+            "tavily"
+        } else {
+            provider
+        }
+    }
+
+    /// 搜索后端的配置问题，`None` 表示配置可用。三类返回值：
+    ///   * provider 名字不在已知列表 → 显式报错（**绝不静默回退**到默认后端）；
+    ///   * provider 非空但未配置 API Key → 提示去哪配；
+    ///   * 其它情况（含"有 key 但 provider 为空，按默认 tavily 处理"）→ `None`。
+    ///
+    /// 这个方法是 "provider 是否被消费" 的单一判定入口：`build_backend`、
+    /// `/doctor`、`--config-status` 都调它，避免三处各写一套判断后互相漂移。
+    pub fn search_provider_issue(&self) -> Option<String> {
+        let provider = self.search.provider.trim();
+        let known = SearchCfg::KNOWN_PROVIDERS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(provider));
+        // 空串按默认后端（tavily）处理，兼容手写配置时留空。
+        if !provider.is_empty() && !known {
+            return Some(format!(
+                "[search].provider = \"{provider}\" 不是已知后端；可用值：{}",
+                SearchCfg::KNOWN_PROVIDERS.join(" / ")
+            ));
+        }
+        if self.search_api_key().is_none() {
+            return Some(
+                "未配置 [search].api_key（或环境变量 WYJ_CODE_SEARCH_API_KEY）".to_string(),
+            );
+        }
+        None
     }
 
     /// 返回激活分组的有效 API Key，若无则报错。
@@ -2516,5 +2652,154 @@ allow = ["$defaults", "允许推送到 staging"]
         assert!(cfg.auto_mode.classify_all_shell);
         assert_eq!(cfg.auto_mode.max_consecutive_blocks, 1);
         assert_eq!(cfg.auto_mode.allow, vec!["$defaults", "允许推送到 staging"]);
+    }
+}
+
+#[cfg(test)]
+mod search_cfg_tests {
+    use super::{Config, SearchCfg};
+
+    #[test]
+    fn legacy_flat_search_fields_migrate_into_the_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+active_profile = "default"
+search_provider = "brave"
+search_api_key = "tvly-legacy"
+
+[[profiles]]
+name = "default"
+provider = "anthropic"
+model = "claude-opus-4-8"
+base_url = ""
+api_key = "placeholder"
+max_tokens = 32000
+context_window = 200000
+"#,
+        )
+        .unwrap();
+
+        let cfg = Config::load_file_only_at(&path).unwrap();
+        assert_eq!(cfg.search.provider, "brave");
+        assert_eq!(cfg.search_api_key(), Some("tvly-legacy"));
+
+        // 保存后旧顶层键必须消失，否则用户会以为它们还是生效的。
+        cfg.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("search_provider"), "{saved}");
+        assert!(!saved.contains("search_api_key"), "{saved}");
+        assert!(saved.contains("[search]"), "{saved}");
+        // 迁移后的值仍然可读。
+        let reloaded = Config::load_file_only_at(&path).unwrap();
+        assert_eq!(reloaded.search.provider, "brave");
+        assert_eq!(reloaded.search_api_key(), Some("tvly-legacy"));
+    }
+
+    #[test]
+    fn explicit_search_section_wins_over_legacy_flat_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+active_profile = "default"
+search_provider = "brave"
+search_api_key = "legacy-key"
+
+[search]
+provider = "tavily"
+api_key = "new-key"
+
+[[profiles]]
+name = "default"
+provider = "anthropic"
+model = "claude-opus-4-8"
+base_url = ""
+api_key = "placeholder"
+max_tokens = 32000
+context_window = 200000
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load_file_only_at(&path).unwrap();
+        assert_eq!(cfg.search.provider, "tavily");
+        assert_eq!(cfg.search_api_key(), Some("new-key"));
+    }
+
+    /// 早先的实现把 env 直接覆盖到普通字段 `search_api_key` 上，于是「打开设置面板
+    /// 保存一次」就会把环境变量里的 key 物化进 config.toml。落在 `#[serde(skip)]`
+    /// 槽位后，落盘与读取两端都必须正确。
+    #[test]
+    fn search_runtime_key_is_not_materialized_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let config = Config {
+            runtime_search_api_key: Some("tvly-from-env".to_string()),
+            ..Config::default()
+        };
+        config.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("tvly-from-env"), "{saved}");
+        assert_eq!(config.search_api_key(), Some("tvly-from-env"));
+    }
+
+    #[test]
+    fn search_provider_issue_flags_unknown_backends_and_missing_keys() {
+        // 未知 provider：显式报错，绝不静默回退。
+        let cfg = Config {
+            search: SearchCfg {
+                provider: "duckduckgo".to_string(),
+                api_key: Some("k".to_string()),
+                ..SearchCfg::default()
+            },
+            ..Config::default()
+        };
+        let issue = cfg.search_provider_issue().unwrap();
+        assert!(issue.contains("duckduckgo"), "{issue}");
+        assert!(issue.contains("tavily"), "{issue}");
+
+        // provider 合法但缺 key。
+        let cfg = Config {
+            search: SearchCfg {
+                provider: "tavily".to_string(),
+                ..SearchCfg::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.search_provider_issue().unwrap().contains("api_key"));
+
+        // 空白 provider 也按缺 key 报（provider 本身有默认值兜底）。
+        let cfg = Config {
+            search: SearchCfg {
+                provider: String::new(),
+                ..SearchCfg::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.search_provider_issue().unwrap().contains("api_key"));
+
+        // 空 provider + 有 key → 视为可用，并按默认后端展示名。
+        let cfg = Config {
+            search: SearchCfg {
+                provider: String::new(),
+                api_key: Some("k".to_string()),
+                ..SearchCfg::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.search_provider_issue().is_none());
+        assert_eq!(cfg.effective_search_provider(), "tavily");
+    }
+
+    /// 默认配置下没有 key → 工具不注册。这是「模型看不到必然失败的工具」的前提。
+    #[test]
+    fn default_config_has_no_search_key() {
+        let cfg = Config::default();
+        assert!(cfg.search_api_key().is_none());
+        assert_eq!(cfg.effective_search_provider(), "tavily");
+        assert!(cfg.search_provider_issue().is_some());
     }
 }
