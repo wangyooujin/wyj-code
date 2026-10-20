@@ -314,11 +314,8 @@ impl SessionStore {
         // 串行化，tmp+rename 保证任何时刻磁盘上的文件都是完整的一版。
         let _guard =
             wyj_config::filelock::acquire(&self.lock_path(&file.session_id), "session file")?;
-        crate::serialize::write_atomic(
-            &path,
-            crate::secret::redact_sensitive_text(&json).as_bytes(),
-        )
-        .inspect(|_| self.write_meta(&owned))
+        crate::serialize::write_atomic(&path, crate::secret::redact_cow(&json).as_bytes())
+            .inspect(|_| self.write_meta(&owned))
     }
 
     /// 旁路元数据文件路径：`list()` 只需要 `SessionMeta` 那十来个标量，
@@ -343,7 +340,7 @@ impl SessionStore {
         };
         if let Err(e) = crate::serialize::write_atomic(
             &self.meta_path(&file.session_id),
-            crate::secret::redact_sensitive_text(&json).as_bytes(),
+            crate::secret::redact_cow(&json).as_bytes(),
         ) {
             tracing::warn!("session meta 写入失败 {}: {e}", file.session_id);
         }
@@ -987,7 +984,7 @@ mod tests {
         let summary = checkpoints
             .create(
                 workspace.path(),
-                &parent.messages[..1],
+                parent.messages[..1].to_vec(),
                 crate::checkpoint::CheckpointKind::Manual,
                 Some("branch point".to_string()),
             )

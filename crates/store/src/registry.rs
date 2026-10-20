@@ -140,14 +140,6 @@ impl RegistryClient {
         Self::new(REGISTRY_BASE_URL)
     }
 
-    pub async fn list_servers(
-        &self,
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<RegistryListResponse> {
-        self.list_servers_impl(cursor, limit, None).await
-    }
-
     async fn list_servers_impl(
         &self,
         cursor: Option<&str>,

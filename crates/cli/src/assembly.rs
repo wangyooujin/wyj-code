@@ -191,6 +191,11 @@ pub struct AgentCoreConfig {
     pub route_profile: String,
     pub route_vendor: String,
     pub model_name: String,
+    /// 当前 route 的 base_url（不含密钥）。参与 capability_cache fingerprint，
+    /// 漏传会让同 vendor+model 的不同端点共用同一份能力缓存。
+    pub route_base_url: String,
+    /// 当前 route 的线协议。决定 `ThinkingSpec::for_vendor` 查哪张规格表。
+    pub route_wire_protocol: wyj_config::WireProtocol,
     pub fallback_routes: Vec<AgentRoute>,
     pub cross_provider_fallback: bool,
     pub thinking_budget: Option<u32>,
@@ -213,7 +218,13 @@ impl AgentCoreConfig {
             .with_context_window(self.context_window)
             .with_max_turns(self.max_turns)
             .with_model_capabilities(self.capabilities)
-            .with_route_identity(self.route_profile, self.route_vendor, self.model_name)
+            .with_route_identity(
+                self.route_profile,
+                self.route_vendor,
+                self.model_name,
+                self.route_base_url,
+                self.route_wire_protocol,
+            )
             .with_fallback_routes(self.fallback_routes, self.cross_provider_fallback)
             .with_thinking(self.thinking_budget, self.interleaved_thinking)
             .with_reasoning_effort(self.reasoning_effort)

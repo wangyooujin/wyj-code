@@ -323,15 +323,24 @@ pub fn set_enabled(id: &str, enabled: bool) -> Result<ScheduleTask> {
     update_task(id, |t| t.enabled = enabled)
 }
 
+/// 复核任务权限。
+///
+/// `enable` 为 `None` 表示**保持任务当前的启用状态不变**。此前签名是
+/// `enable: bool` 且无条件 `task.enabled = enable`——而 CLI 的 `--enable`
+/// 是 `SetTrue` 布尔（缺省 false），于是「只改权限、不碰启用状态」这个
+/// 最自然的操作反而把任务**禁用**了。现在用 `Option<bool>` 区分三态：
+/// `Some(true)` 启用、`Some(false)` 禁用、`None` 不动。
 pub fn review_permissions(
     id: &str,
     permissions: SchedulePermissions,
-    enable: bool,
+    enable: Option<bool>,
 ) -> Result<ScheduleTask> {
     update_task(id, |task| {
         task.permissions = permissions;
         task.needs_permission_review = false;
-        task.enabled = enable;
+        if let Some(enabled) = enable {
+            task.enabled = enabled;
+        }
     })
 }
 

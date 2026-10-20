@@ -142,11 +142,6 @@ pub struct ElisionStats {
     pub blobs: Vec<String>,
 }
 
-/// 工具名是否在允许清理的白名单里（精确名或 MCP 前缀）。
-pub fn is_elidable(tool_name: &str) -> bool {
-    is_elidable_tool(tool_name)
-}
-
 /// 从消息列表里建立 `tool_use_id → 工具名` 映射。
 ///
 /// `ContentBlock::ToolResult` **不携带工具名**（只有 `tool_use_id`），所以保护规则
@@ -233,7 +228,7 @@ pub fn elide_tool_results(
             // 找不到对应的 ToolUse（历史会话文件可能缺块）：保守不清理。
             continue;
         };
-        if !is_elidable(tool_name) {
+        if !is_elidable_tool(tool_name) {
             continue;
         }
 
@@ -546,11 +541,11 @@ mod tests {
             "mcp__postgres__query",
             "mcp__github__create_pr",
         ] {
-            assert!(is_elidable(tool), "{tool} 应在白名单里");
+            assert!(is_elidable_tool(tool), "{tool} 应在白名单里");
         }
         // 写操作回执被清理会让模型以为自己没改过 → 重做。
         for tool in ["Edit", "Write", "NotebookEdit", "Memory"] {
-            assert!(!is_elidable(tool), "{tool} 不应被清理");
+            assert!(!is_elidable_tool(tool), "{tool} 不应被清理");
         }
     }
 

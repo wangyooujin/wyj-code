@@ -854,7 +854,7 @@ fn messages_to_text(messages: &[Message]) -> String {
                         if text.contains("<system-reminder>") {
                             None
                         } else {
-                            Some(truncate_chars(text, 600))
+                            Some(crate::textutil::truncate_chars(text, 600, true))
                         }
                     }
                     ContentBlock::ToolUse { name, .. } => Some(format!("[工具调用: {name}]")),
@@ -862,9 +862,11 @@ fn messages_to_text(messages: &[Message]) -> String {
                         content, is_error, ..
                     } => {
                         let text = match content {
-                            ToolResultContent::Text(t) => truncate_chars(t, 400),
+                            ToolResultContent::Text(t) => {
+                                crate::textutil::truncate_chars(t, 400, true)
+                            }
                             ToolResultContent::Parts(_) => {
-                                truncate_chars(&content.display_text(), 400)
+                                crate::textutil::truncate_chars(&content.display_text(), 400, true)
                             }
                             ToolResultContent::Blocks(_) => "[复杂内容]".to_string(),
                         };
@@ -880,7 +882,10 @@ fn messages_to_text(messages: &[Message]) -> String {
                     // 后续轮次重新起跑（既丢失已付出的推理，也让输出语言漂移）。
                     // 长思考按 truncate_chars 截断，避免摘要被单轮 reasoning 撑爆。
                     ContentBlock::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
-                        Some(format!("[思考] {}", truncate_chars(thinking, 400)))
+                        Some(format!(
+                            "[思考] {}",
+                            crate::textutil::truncate_chars(thinking, 400, true)
+                        ))
                     }
                     // 加密的 redacted 块没有可读内容，只能占位。
                     ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => {
@@ -892,15 +897,6 @@ fn messages_to_text(messages: &[Message]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-        format!("{}…", &s[..end])
-    }
 }
 
 #[cfg(test)]

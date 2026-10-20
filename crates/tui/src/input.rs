@@ -674,15 +674,6 @@ impl InputBox {
         self.lines[row].insert(byte, marker);
     }
 
-    /// 返回光标相对于输入框的绝对显示列偏移（用于渲染光标）
-    ///
-    /// 注意：返回的是**终端显示列宽**（CJK 全角=2，其余=1），
-    /// 不是字符索引。计算时遍历光标左侧所有字符按 `char_width` 求和。
-    pub fn cursor_display_col(&self) -> usize {
-        let line = &self.lines[self.cursor_row];
-        line.chars().take(self.cursor_col).map(char_width).sum()
-    }
-
     pub fn display_lines(&self) -> &[String] {
         &self.lines
     }

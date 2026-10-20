@@ -208,8 +208,6 @@ pub struct AutoGateImpl {
     classifier_off: AtomicBool,
     counters: Mutex<AutoCounters>,
     usage: Mutex<AutoClassifierUsage>,
-    /// 用户这一轮的原始请求，由 Agent 在回合入口写入。
-    user_goal: Mutex<String>,
 }
 
 impl AutoGateImpl {
@@ -220,7 +218,6 @@ impl AutoGateImpl {
             classifier_off: AtomicBool::new(false),
             counters: Mutex::new(AutoCounters::default()),
             usage: Mutex::new(AutoClassifierUsage::default()),
-            user_goal: Mutex::new(String::new()),
         }
     }
 
@@ -240,13 +237,6 @@ impl AutoGateImpl {
             return Some("分类器连续拦截过多，已停用");
         }
         None
-    }
-
-    /// 记录本轮用户请求。分类器判断「是否超出请求范围」时需要它。
-    pub fn set_user_goal(&self, goal: &str) {
-        if let Ok(mut slot) = self.user_goal.lock() {
-            *slot = goal.to_string();
-        }
     }
 
     pub fn usage(&self) -> AutoClassifierUsage {
@@ -359,30 +349,20 @@ impl AutoGateImpl {
     /// 大概率复现同一个坏输出；必须让第二次请求的输入**真的不同**（多一句
     /// "只吐 JSON"），重试才可能翻盘。
     fn build_prompt(&self, request: &AutoReviewRequest, retry: bool) -> String {
-        // 必须读 `request.user_goal`（调用方每轮填好），不是 `self.user_goal`。
+        // 读 `request.user_goal`（调用方每轮填好）。分类器 prompt 的第 2 层
+        // （soft deny 可被「用户明确要求」豁免）与第 4 层（explicit user intent）
+        // 都要求「用户的请求直接具体地描述了这个动作」——读不到用户说了什么，
+        // 它对任何需要判断的动作只能按「不确定就 deny」走。
         //
-        // 后者是接线 bug 的产物：`set_user_goal` 全仓零调用方，而 Agent 一直
-        // 在 `AutoReviewRequest.user_goal` 里认真填了本轮请求。结果是
-        // `<user_request>` **恒为字面量 `(unknown)`**。而分类器 prompt 的第 2
-        // 层（soft deny 可被「用户明确要求」豁免）与第 4 层（explicit user
-        // intent）都要求「用户的请求直接具体地描述了这个动作」——读不到用户
-        // 说了什么，它对任何需要判断的动作只能按「不确定就 deny」走。
-        //
-        // 回退到 `self.user_goal` 是为了不破坏显式设置过它的调用方（目前没有，
-        // 但它是 pub API）。
+        // 曾经这里读的是 `self.user_goal`（一个由 `set_user_goal` 写入的
+        // 进程级字段），而那个 setter 全仓零调用方——于是 `<user_request>`
+        // 恒为字面量 `(unknown)`。现在只有 `request.user_goal` 一条来源，
+        // 填不上时同样退化为 `(unknown)`。
         let request_goal = request.user_goal.trim();
-        let stored_goal = self
-            .user_goal
-            .lock()
-            .ok()
-            .map(|guard| guard.trim().to_string());
-        let goal = if !request_goal.is_empty() {
-            request_goal
+        let goal = if request_goal.is_empty() {
+            "(unknown)"
         } else {
-            match stored_goal.as_deref() {
-                Some(stored) if !stored.is_empty() => stored,
-                _ => "(unknown)",
-            }
+            request_goal
         };
         let mut out = String::new();
         out.push_str("<user_request>\n");

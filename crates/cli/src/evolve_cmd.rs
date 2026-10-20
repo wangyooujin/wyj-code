@@ -84,7 +84,7 @@ fn checkpoint_before_activation(cwd: &Path, id: &str) -> Result<String> {
     let store = CheckpointStore::configured(&sessions, format!("evolution-approval-{id}"))?;
     let summary = store.create(
         cwd,
-        &[],
+        Vec::new(),
         CheckpointKind::Manual,
         Some(format!("before Evolution approval {id}")),
     )?;

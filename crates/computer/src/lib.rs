@@ -66,16 +66,6 @@ impl Capture {
         use base64::Engine as _;
         STANDARD.encode(&self.png)
     }
-
-    /// 本次截图对应的坐标换算器（目标坐标 → 物理像素坐标）。
-    pub fn coord_scaler(&self) -> scale::CoordScaler {
-        scale::CoordScaler::new(
-            self.physical_width,
-            self.physical_height,
-            self.target_width,
-            self.target_height,
-        )
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

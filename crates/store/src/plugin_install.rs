@@ -32,16 +32,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use wyj_config::{McpServerConfig, McpTransport};
 
-pub struct PluginInstallRequest {
-    /// 已解析好的最终 manifest（marketplace.json 内联覆盖已合并）。
-    pub manifest: PluginManifest,
-    pub source: PluginSource,
-    pub marketplace_id: Option<String>,
-    pub marketplace_location: Option<String>,
-    pub scope: InstallScope,
-    pub name_override: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub struct PluginInstallReport {
     pub name: String,
@@ -170,12 +160,6 @@ fn current_plugin_storage_cfg() -> Option<wyj_config::StorageRetentionCfg> {
         .read()
         .expect("plugin storage cfg lock poisoned")
         .clone()
-}
-
-fn plugin_storage_cfg_from_config() -> wyj_config::StorageRetentionCfg {
-    wyj_config::Config::load()
-        .map(|cfg| cfg.storage)
-        .unwrap_or_default()
 }
 
 /// CLI 装配阶段调用一次:把当前用户 storage 配置注入到 plugin 路径,供
@@ -634,57 +618,6 @@ fn finalize_plugin_install(
         mcp_count: contributes.mcp_servers.len(),
         skipped_capabilities: contributes.skipped_capabilities,
     })
-}
-
-async fn install_plugin_under(
-    plugins_root: &Path,
-    req: &PluginInstallRequest,
-    cwd: &Path,
-) -> Result<PluginInstallReport> {
-    set_plugin_storage_cfg(plugin_storage_cfg_from_config());
-    let name = req
-        .name_override
-        .clone()
-        .unwrap_or_else(|| req.manifest.name.clone());
-    let marketplace_id = req
-        .marketplace_id
-        .clone()
-        .unwrap_or_else(|| "local".to_string());
-    let marketplace_cache_dir = match &req.marketplace_location {
-        Some(loc) if Path::new(loc).exists() => Some(PathBuf::from(loc)),
-        Some(loc) => Some(plugin_marketplace_cache_dir_under(plugins_root, loc)),
-        None => None,
-    };
-
-    let plugin_root = materialize_plugin_source_under(
-        plugins_root,
-        &req.source,
-        &marketplace_id,
-        marketplace_cache_dir.as_deref(),
-        &name,
-    )
-    .await?;
-
-    let origin = PluginInstallOrigin::Marketplace {
-        marketplace_id,
-        marketplace_location: req.marketplace_location.clone().unwrap_or_default(),
-    };
-    finalize_plugin_install(
-        &name,
-        &req.manifest,
-        plugin_root,
-        &req.source,
-        origin,
-        req.scope,
-        cwd,
-    )
-}
-
-/// 安装（首次写入）或"覆盖式重装"（同 scope 同名已存在直接覆盖）。要求
-/// `req.manifest` 已经是最终解析好的 manifest（marketplace 内联覆盖已合并）——
-/// TUI Browse→Install 流程请用 [`resolve_and_install_from_marketplace`]。
-pub async fn install_plugin(req: &PluginInstallRequest, cwd: &Path) -> Result<PluginInstallReport> {
-    install_plugin_under(&plugins_root()?, req, cwd).await
 }
 
 /// TUI Browse→Install 流程的高层入口：物化 source → 读取插件自己的

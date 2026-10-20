@@ -1,12 +1,15 @@
-//! `wyj-code storage` 子命令:本地存储治理(Phase 4)。
+//! `wyj-code storage` 子命令:本地存储治理。
 //!
 //! ## 子命令
 //!
 //! - `status`  列出 ~/.wyj-code 下各子系统的占用 Top-N(sessions/checkpoints/cas/evolution/memory-v3)
-//! - `doctor`  检查 orphan blob / 损坏 manifest / 老 v1 schema 等异常
-//! - `prune`   按 TTL + 字节上限 LRU 删除过期项
+//! - `doctor`  检查损坏的 session 文件 / orphan CAS blob / 损坏的 checkpoint manifest
+//! - `prune`   按 retention 上限清理(checkpoint 淘汰超限最老条目、CAS 回收 ref_count==0 的 blob)
 //!
-//! 详细设计见 `~/.claude/plans/nested-wobbling-rain.md` 的 M4 节。
+//! `doctor` 与 `prune` 此前都是 TODO 桩:命令能跑、什么都没做,连参数都被
+//! 原样丢弃。现在两者都真正接线到已有的 retention / 统计实现。
+//!
+//! `prune` 默认只报计划(不删除),确认后加 `--yes` 实际执行。
 
 use anyhow::Result;
 use clap::Subcommand;
@@ -25,11 +28,15 @@ pub enum StorageCommand {
     /// 检查异常(orphan blob / 损坏 manifest / 老 v1 schema)
     #[command(name = "doctor")]
     Doctor,
-    /// 按 TTL + 字节上限清理(--dry-run 默认)
+    /// 按 retention 上限清理(checkpoint / CAS blob),默认只报计划
     #[command(name = "prune")]
     Prune {
-        /// 仅打印计划,不实际删除
-        #[arg(long, default_value = "true")]
+        /// 只报计划,不实际删除(默认开)
+        ///
+        /// 用 `ArgAction::Set` + `default_value_t` 而非 `SetTrue`：`SetTrue`
+        /// 的 bool 缺席恒为 true、无法置 false,`--dry-run=false` 会被 clap
+        /// 判成 "unexpected value"。这里改成取值型,`--dry-run false` 可用。
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
         dry_run: bool,
         /// 实际删除(覆盖 --dry-run)
         #[arg(long, conflicts_with = "dry_run")]
@@ -86,15 +93,186 @@ fn run_status(config_base: &Path, _cfg: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_doctor(_config_base: &Path, _cfg: &Config) -> Result<()> {
+/// 存储健康检查。
+///
+/// 此前是纯 TODO 桩：命令存在、能跑、什么都没查。现在真正检查三件能查
+/// 出来的事：
+/// 1. **损坏的 session 文件**（JSON 解析失败）——`/resume` 会直接报错。
+/// 2. **orphan CAS blob**（`ref_count == 0` 且不在 LRU 保留集内）——占着
+///    磁盘不释放。
+/// 3. **checkpoint manifest 损坏**——`/rewind` 会看不到该会话的存档。
+fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
     println!("=== wyj-code storage doctor ===");
-    println!("(TODO Phase 4:检查 orphan blob / 损坏 manifest / 老 v1 schema)");
+
+    // ── 1. 损坏的 session 文件 ──
+    let sessions_dir = config_base.join("sessions");
+    let mut broken_sessions = Vec::new();
+    let mut session_count = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            session_count += 1;
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                broken_sessions.push((path, "读取失败".to_string()));
+                continue;
+            };
+            if let Err(error) = serde_json::from_str::<serde_json::Value>(&content) {
+                broken_sessions.push((path, error.to_string()));
+            }
+        }
+    }
+    println!(
+        "session 文件: {} 个,损坏 {} 个",
+        session_count,
+        broken_sessions.len()
+    );
+    for (path, reason) in broken_sessions.iter().take(10) {
+        println!("  损坏 {}: {reason}", path.display());
+    }
+    if broken_sessions.len() > 10 {
+        println!("  ... 另有 {} 个未列出", broken_sessions.len() - 10);
+    }
+
+    // ── 2. orphan CAS blob ──
+    match wyj_core::workspace_cas::WorkspaceCas::open_silently(
+        &config_base.join("cas"),
+        cfg.storage.cas_max_blob_bytes,
+    ) {
+        Some(cas) => match cas.stats() {
+            Ok(stats) => {
+                println!(
+                    "CAS blob: {} 个 / {} 字节,其中 orphan {} 个 / {} 字节",
+                    stats.total_blobs, stats.total_bytes, stats.orphan_blobs, stats.orphan_bytes
+                );
+                if stats.orphan_blobs > 0 {
+                    println!("  提示:`storage prune` 会回收 ref_count == 0 的 blob");
+                }
+            }
+            Err(error) => println!("CAS 统计失败: {error}"),
+        },
+        None => println!("CAS: 未启用(目录不可用)"),
+    }
+
+    // ── 3. 损坏的 checkpoint manifest ──
+    let mut broken_manifests = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(session_id) = name.strip_suffix(".checkpoints") else {
+                continue;
+            };
+            let manifest_path = path.join("manifest.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+                broken_manifests.push((manifest_path, "读取失败".to_string()));
+                continue;
+            };
+            if let Err(error) = serde_json::from_str::<serde_json::Value>(&content) {
+                broken_manifests.push((manifest_path, error.to_string()));
+            } else {
+                let _ = session_id;
+            }
+        }
+    }
+    println!("checkpoint manifest: 损坏 {} 个", broken_manifests.len());
+    for (path, reason) in broken_manifests.iter().take(10) {
+        println!("  损坏 {}: {reason}", path.display());
+    }
+
     Ok(())
 }
 
-fn run_prune(_config_base: &Path, _cfg: &Config, _dry_run: bool) -> Result<()> {
+/// 清理可按 retention 上限收口的子系统。
+///
+/// 此前这里是纯 TODO 桩:两个参数(`--dry-run` / `--yes`)被 clap 解析、绑定、
+/// 求值,然后原样丢掉——`storage prune` 与 `storage prune --yes` 的输出逐字
+/// 相同。现在真正接线到已有的 retention 实现。
+fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
     println!("=== wyj-code storage prune ===");
-    println!("(TODO Phase 4:按 TTL + 字节上限 LRU 删,默认 --dry-run)");
+    if dry_run {
+        println!("(dry-run:只报计划,不删除。确认无误后加 --yes 实际执行)");
+    }
+
+    let storage = &cfg.storage;
+    let sessions_dir = config_base.join("sessions");
+
+    // ── checkpoint:按 session 淘汰超限的最老 checkpoint ──
+    // `checkpoints_per_session` 上限由 `CheckpointStore::enforce_retention`
+    // 实现(它只在 store 打开时被调用),这里对每个 session 主动触发一次。
+    let mut checkpoint_sessions = 0usize;
+    if storage.checkpoints_per_session > 0 {
+        if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(session_id) = name.strip_suffix(".checkpoints") else {
+                    continue;
+                };
+                checkpoint_sessions += 1;
+                if dry_run {
+                    continue;
+                }
+                match wyj_core::CheckpointStore::new(&sessions_dir, session_id) {
+                    Ok(store) => {
+                        if let Err(error) = store.enforce_retention() {
+                            tracing::warn!("checkpoint 保留策略执行失败 {session_id}: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!("打开 checkpoint 目录失败 {session_id}: {error}");
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "checkpoint: {} 个 session 目录,上限 {} 条/session{}",
+        checkpoint_sessions,
+        storage.checkpoints_per_session,
+        if dry_run { "(未执行)" } else { "" }
+    );
+
+    // ── CAS blob:按总量上限回收 ref_count == 0 的 blob ──
+    if storage.cas_total_bytes > 0 {
+        match wyj_core::workspace_cas::WorkspaceCas::open_silently(
+            &config_base.join("cas"),
+            storage.cas_max_blob_bytes,
+        ) {
+            Some(cas) => {
+                if dry_run {
+                    println!(
+                        "cas: 上限 {} 字节(dry-run 未执行 gc)",
+                        storage.cas_total_bytes
+                    );
+                } else {
+                    match cas.gc(storage.cas_total_bytes) {
+                        Ok(stats) => println!(
+                            "cas: 回收 {} 个 blob / {} 字节,当前 {} 字节",
+                            stats.deleted_blobs, stats.freed_bytes, stats.total_bytes
+                        ),
+                        Err(error) => {
+                            tracing::warn!("CAS gc 失败: {error}");
+                            println!("cas: gc 失败 ({error})");
+                        }
+                    }
+                }
+            }
+            None => println!("cas: 未启用(目录不可用)"),
+        }
+    } else {
+        println!("cas: 总量上限为 0,跳过");
+    }
+
     Ok(())
 }
 

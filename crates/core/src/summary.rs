@@ -107,7 +107,7 @@ fn first_user_text(messages: &[Message]) -> String {
                 if let ContentBlock::Text { text } = block {
                     let t = text.trim();
                     if !t.is_empty() {
-                        return truncate_chars(t, 500);
+                        return crate::textutil::truncate_chars(t, 500, false);
                     }
                 }
             }
@@ -124,7 +124,7 @@ fn last_assistant_text(messages: &[Message]) -> String {
                 if let ContentBlock::Text { text } = block {
                     let t = text.trim();
                     if !t.is_empty() {
-                        return truncate_chars(t, 500);
+                        return crate::textutil::truncate_chars(t, 500, false);
                     }
                 }
             }
@@ -145,16 +145,6 @@ fn clean_title(raw: &str) -> String {
         format!("{}…", chars[..59].iter().collect::<String>())
     } else {
         trimmed.to_string()
-    }
-}
-
-/// 截断字符串到指定字符数
-fn truncate_chars(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() > max {
-        chars[..max].iter().collect()
-    } else {
-        s.to_string()
     }
 }
 
@@ -194,9 +184,12 @@ mod tests {
 
     #[test]
     fn test_truncate_chars() {
-        assert_eq!(truncate_chars("abc", 5), "abc");
-        assert_eq!(truncate_chars("abcdef", 3), "abc");
-        assert_eq!(truncate_chars("你好世界", 2), "你好");
+        assert_eq!(crate::textutil::truncate_chars("abc", 5, false), "abc");
+        assert_eq!(crate::textutil::truncate_chars("abcdef", 3, false), "abc");
+        assert_eq!(
+            crate::textutil::truncate_chars("你好世界", 2, false),
+            "你好"
+        );
     }
 
     #[test]

@@ -309,13 +309,6 @@ impl CheckpointStore {
         })
     }
 
-    /// 注入单 session checkpoint 上限(0 = 不限)。`create()` 末尾会自动调
-    /// `enforce_retention()` 淘汰超限最老 checkpoint + 同步 manifest。
-    pub fn with_max_per_session(mut self, max: usize) -> Self {
-        self.max_per_session = max;
-        self
-    }
-
     /// 注入 CAS 池(builder 模式)。CAS root 不可用时 capture_files 走 inline 兜底,
     /// 不阻断 checkpoint 写入。
     pub fn with_cas(mut self, cas: Arc<WorkspaceCas>) -> Self {
@@ -331,10 +324,16 @@ impl CheckpointStore {
         &self.dir
     }
 
+    /// `messages` 是**owned** 的历史快照，调用方负责 clone。
+    ///
+    /// 之所以要 owned 而非 `&[Message]`：落盘前要做 persist cap 截断
+    /// （`truncate_content_block` 需要可变副本），此前接收 `&[Message]` 再
+    /// 内部 `to_vec()`——于是**调用方的 clone 完全白费**，一次 checkpoint
+    /// 要付两次整段历史的深拷贝。改为 owned 后调用方的 clone 变成唯一一次。
     pub fn create(
         &self,
         cwd: &Path,
-        messages: &[Message],
+        mut messages: Vec<Message>,
         kind: CheckpointKind,
         name: Option<String>,
     ) -> Result<CheckpointSummary> {
@@ -350,20 +349,19 @@ impl CheckpointStore {
             .to_string();
         let truncated_messages: Vec<Message> = {
             // 落盘前做持久化截断(tool_result / thinking / tool_use.input)。
-            // **没有配置上限时不拷贝**：`truncate_content_block` 只在有 cap 时才
-            // 生效，历史上无条件 `to_vec()` 让每个工具调用的 checkpoint 多付一次
-            // 整段历史深拷贝（长会话里工具输出动辄 MB 级）。
+            // **没有配置上限时直接用调用方给的 owned 副本**：多一次 `to_vec()`
+            // 会让每个工具调用的 checkpoint 多付一次整段历史深拷贝
+            // （长会话里工具输出动辄 MB 级）。
             match current_checkpoint_persist_cap() {
                 Some(cfg) => {
-                    let mut owned = messages.to_vec();
-                    for msg in &mut owned {
+                    for msg in &mut messages {
                         for block in &mut msg.content {
                             crate::serialize::truncate_content_block(block, &cfg);
                         }
                     }
-                    owned
+                    messages
                 }
-                None => messages.to_vec(),
+                None => messages,
             }
         };
         let workspace = self.capture_workspace_with_delta(&cwd_root, cwd)?;
@@ -1307,7 +1305,7 @@ fn git_output_bytes(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<
 /// tmp + rename 的原子替换逻辑委托给 `serialize::write_atomic`，全仓只此一份。
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let json = serde_json::to_string(value)?;
-    crate::serialize::write_atomic(path, crate::secret::redact_sensitive_text(&json).as_bytes())
+    crate::serialize::write_atomic(path, crate::secret::redact_cow(&json).as_bytes())
 }
 
 /// 进程内全局 `PersistCapCfg` —— 由 CLI 装配阶段 `set_checkpoint_persist_cap`
@@ -1397,7 +1395,7 @@ mod tests {
         let checkpoint = store
             .create(
                 repo.path(),
-                &[],
+                Vec::new(),
                 CheckpointKind::Manual,
                 Some("before".into()),
             )
@@ -1439,7 +1437,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(sessions.path(), "s1").unwrap();
         let checkpoint = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         std::fs::write(root.path().join("a.txt"), "two").unwrap();
         store
@@ -1458,8 +1456,14 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(sessions.path(), "s1").unwrap();
         let before = vec![Message::user("before")];
+        let before_for_checkpoint = before.clone();
         let summary = store
-            .create(root.path(), &before, CheckpointKind::Manual, None)
+            .create(
+                root.path(),
+                before_for_checkpoint,
+                CheckpointKind::Manual,
+                None,
+            )
             .unwrap();
 
         std::fs::write(root.path().join("a.txt"), "after").unwrap();
@@ -1487,7 +1491,7 @@ mod tests {
         let summary = store
             .create(
                 root.path(),
-                &[Message::user(format!("credential: {secret}"))],
+                vec![Message::user(format!("credential: {secret}"))],
                 CheckpointKind::Manual,
                 None,
             )
@@ -1507,7 +1511,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(sessions.path(), "sensitive-files").unwrap();
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let checkpoint = store.load(&summary.id).unwrap();
         let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
@@ -1541,7 +1545,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(sessions.path(), "gitignore-non-git").unwrap();
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let checkpoint = store.load(&summary.id).unwrap();
         let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
@@ -1588,7 +1592,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         let store = CheckpointStore::new(sessions.path(), "gitignore-worktree").unwrap();
         let summary = store
-            .create(&worktree, &[], CheckpointKind::Manual, None)
+            .create(&worktree, Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let checkpoint = store.load(&summary.id).unwrap();
         let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
@@ -1619,7 +1623,7 @@ mod tests {
         let store = CheckpointStore::new(sessions.path(), "byte-budget").unwrap();
         let start = std::time::Instant::now();
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let elapsed = start.elapsed();
 
@@ -1660,7 +1664,7 @@ mod tests {
             .unwrap()
             .with_cas(cas.clone());
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
 
         let cp_path = store.checkpoint_path(&summary.id);
@@ -1688,7 +1692,7 @@ mod tests {
         std::fs::write(root.path().join("a.txt"), "hello").unwrap();
         let store = CheckpointStore::new(sessions.path(), "inline-test").unwrap();
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let checkpoint = store.load(&summary.id).unwrap();
         let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {
@@ -1775,14 +1779,14 @@ mod tests {
             .with_cas(cas);
         // 第一个:必须是 Files (baseline)
         let s1 = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let cp1 = store.load(&s1.id).unwrap();
         assert!(matches!(cp1.workspace, WorkspaceSnapshot::Files(_)));
         // 改 1 个文件 → 第二个应是 Delta
         std::fs::write(root.path().join("f005.txt"), "MODIFIED content for file 5").unwrap();
         let s2 = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let cp2 = store.load(&s2.id).unwrap();
         let WorkspaceSnapshot::Delta(delta) = &cp2.workspace else {
@@ -1821,7 +1825,7 @@ mod tests {
             .with_cas(cas);
         // baseline
         let s0 = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         // 3 次连续小改动 → 3 个 delta
         for round in 1..=3 {
@@ -1833,7 +1837,7 @@ mod tests {
                 .unwrap();
             }
             store
-                .create(root.path(), &[], CheckpointKind::Manual, None)
+                .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
                 .unwrap();
         }
         // 拿最后(第 4 个)checkpoint,应能 resolve 到完整 snapshot
@@ -1860,7 +1864,7 @@ mod tests {
         std::fs::write(root_b.path().join("b.txt"), "beta").unwrap();
         let store = CheckpointStore::new(sessions.path(), "cwd-test").unwrap();
         let s_a = store
-            .create(root_a.path(), &[], CheckpointKind::Manual, None)
+            .create(root_a.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         assert!(matches!(
             store.load(&s_a.id).unwrap().workspace,
@@ -1868,7 +1872,7 @@ mod tests {
         ));
         // 切到 root_b
         let s_b = store
-            .create(root_b.path(), &[], CheckpointKind::Manual, None)
+            .create(root_b.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         assert!(
             matches!(
@@ -1903,12 +1907,12 @@ mod tests {
             .with_cas(cas);
         // 1) baseline
         let _s1 = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         // 2) 改 d03.txt 触发 Delta
         std::fs::write(root.path().join("d03.txt"), "delta content 3 MODIFIED").unwrap();
         let s2 = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         // 3) 把 d03.txt 改成"非 MODIFIED 的脏内容",然后 preview 应识别差异
         std::fs::write(root.path().join("d03.txt"), "USER_DIRTY").unwrap();
@@ -1942,7 +1946,7 @@ mod tests {
             .unwrap()
             .with_cas(cas.clone());
         let summary = store
-            .create(root.path(), &[], CheckpointKind::Manual, None)
+            .create(root.path(), Vec::new(), CheckpointKind::Manual, None)
             .unwrap();
         let checkpoint = store.load(&summary.id).unwrap();
         let WorkspaceSnapshot::Files(snapshot) = checkpoint.workspace else {

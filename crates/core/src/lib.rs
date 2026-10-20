@@ -8,13 +8,15 @@ pub mod code_index;
 pub mod compact;
 pub mod context_edit;
 pub mod disk_usage;
-pub mod eval;
 pub mod evolution;
 pub mod frontmatter;
 pub mod history;
 pub mod hooks;
 pub mod hooks_trust;
-pub mod interfaces;
+// 内部模块：公共 API 只走下面的扁平 re-export。全仓无人用
+// `wyj_core::interfaces::` 这条路径，两条并行的公共路径只会让「改类型要改
+// 几处」变得不确定。
+mod interfaces;
 pub mod memory;
 pub mod memory_v3;
 pub mod notify;
@@ -52,7 +54,6 @@ pub use compact::{
     compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_text_tokens_f64,
     estimate_tokens,
 };
-pub use eval::{EvalCaseResult, EvalRunMetadata, EvalSummary, EvalTaskCategory};
 pub use evolution::{
     CandidateKind, CandidatePayload, CandidateStatus, Episode, EpisodeCapture, EpisodeEvidence,
     EpisodeOutcome, EvidenceKind, EvolutionCandidate, EvolutionFeedback, EvolutionHealth,
@@ -83,8 +84,8 @@ pub use permission::{
     ExecutionSurface, PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest,
     PermissionVerdict,
 };
-pub use project::{project_key, project_root, same_project};
-pub use secret::{redact_sensitive_text, REDACTED_SECRET};
+pub use project::{project_key, project_root};
+pub use secret::{redact_cow, redact_sensitive_text, REDACTED_SECRET};
 pub use session::{RoutingEvent, Session, SharedSubUsage, SubUsage, SubUsageTotals};
 pub use session_runtime::{AgentSessionRuntime, SessionEventEmitter, TurnOutcome};
 pub use session_store::{

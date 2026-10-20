@@ -55,32 +55,10 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
     write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
-/// 按字节上限截断，保证不切断多字节字符。`s.len() <= max_bytes` 时原样借用返回。
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// 保头保尾截断：超限时保留开头 `head_bytes` + 结尾 `tail_bytes`,
-/// 中间以标记替代。适合命令输出(报错信息几乎总在尾部)。
-fn truncate_head_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
-    if s.len() <= head_bytes + tail_bytes {
-        return s.to_string();
-    }
-    let head = truncate_str(s, head_bytes);
-    let mut start = s.len() - tail_bytes;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    let omitted = s.len() - head.len() - (s.len() - start);
-    format!("{head}\n…[truncated {omitted} bytes]…\n{}", &s[start..])
-}
+// 截断统一走 `crate::textutil`（全仓唯一实现）：此处曾带一份逐行相同的手写
+// 副本，但 `truncate_head_tail` 的尾部起点**向上**走（`start += 1`），会超出
+// `tail_bytes` 预算最多 3 字节——与 `core::verify::clip_output` 的结果不一致。
+use crate::textutil::{truncate_head_tail, truncate_str};
 
 /// 单次 `shrink_json_to_budget` 调用的最大裁剪轮数。
 const SHRINK_MAX_ROUNDS: usize = 32;
@@ -488,11 +466,6 @@ pub fn materialize_block_with(block: &mut ApiContentBlock, cas: Option<&Workspac
         }
         _ => {}
     }
-}
-
-/// 兼容 wrapper:从 global CAS 读取(生产代码使用)。
-pub fn materialize_block(block: &mut ApiContentBlock) {
-    materialize_block_with(block, current_externalize_cas().as_deref());
 }
 
 #[cfg(test)]
