@@ -903,6 +903,35 @@ fn model_for_routing_role(profile: &wyj_config::Profile, role: RoutingRole) -> S
     }
 }
 
+/// 构建辅助模型的 provider（会话标题生成、跨会话记忆提取）。
+///
+/// 与主模型**同分组**构建，只覆盖模型名——因此共用同一张 API Key、同一个端点、
+/// 同一家供应商。辅助调用会收到对话内容片段，跨供应商路由等于把内容发给
+/// 另一家服务商，这正是 `[routing].cross_provider_fallback = false` 想守住
+/// 的边界。
+///
+/// 留空 `aux_model` → 返回 `None`，辅助调用走主 provider（默认行为）。
+/// 构建失败（模型名非法 / 端点不可达）→ 返回 `None` 并告警，**不中断启动**：
+/// 辅助模型是优化项，不是正确性依赖，退回主模型即可。
+fn build_aux_provider(cfg: &Config) -> Option<Arc<dyn wyj_api::provider::Provider>> {
+    let profile = cfg.active_profile();
+    let aux_model = profile
+        .aux_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())?;
+    match wyj_api::build_provider_from_profile(profile, Some(aux_model)) {
+        Ok(provider) => {
+            tracing::info!("辅助模型已启用: {aux_model}");
+            Some(provider)
+        }
+        Err(e) => {
+            tracing::warn!("辅助模型 `{aux_model}` provider 构建失败: {e}，回退到主模型");
+            None
+        }
+    }
+}
+
 fn configured_route_names(cfg: &Config, role: RoutingRole) -> Vec<String> {
     let mut names = Vec::new();
     for name in cfg.routing.roles.for_role(role) {
@@ -1302,6 +1331,9 @@ async fn main() -> Result<()> {
         }
         if let Some(m) = &active.exec_model {
             println!("{}", wyj_i18n::tr_fmt("status.exec_model", &[("model", m)]));
+        }
+        if let Some(m) = &active.aux_model {
+            println!("{}", wyj_i18n::tr_fmt("status.aux_model", &[("model", m)]));
         }
         println!(
             "{}",
@@ -2240,21 +2272,36 @@ async fn main() -> Result<()> {
         agent
     };
 
+    // 辅助模型 provider（会话标题生成、跨会话记忆提取）。未配置 `aux_model`
+    // 时为 `None`，两条路径都退回主 provider，行为与改动前完全一致。
+    //
+    // 装在 Agent 上（而不是只在标题生成器里）——记忆提取是后台路径，不依赖
+    // SessionStore，必须在「没有 session store」的分支上也拿到辅助 provider。
+    let aux_provider = build_aux_provider(&cfg);
+    let agent = agent.with_aux_provider(aux_provider.clone());
+
     // 配置会话标题生成器：持有 SessionStore 引用，首轮后后台生成标题写盘
     let agent = if let Some(store) = &session_store_arc {
         // 首次启动缺 API Key 的引导路径:cfg 里仍无 Key,SummaryGenerator
         // 构造的二次 build_provider() 必然 Err,与其 expect 炸 panic,不如
         // 干脆跳过 SummaryGenerator 装配 —— ProfileDialog 保存并 rebuild
         // 后用户进入 chat,首轮仍会自动触发标题生成路径,届时 API Key 已就位。
+        //
+        // 标题生成是典型的辅助调用：短提示词、独立 system prompt、不复用主
+        // 对话前缀 → 换模型不打穿主会话的 prompt cache。优先用辅助模型。
         let provider = match &initial_provider {
             InitialProvider::MissingApiKey => provider_arc.clone(),
             InitialProvider::Ready(_) => {
-                wyj_api::build_provider_from_profile(cfg.active_profile(), None).unwrap_or_else(
-                    |e| {
-                        tracing::warn!("标题生成器 provider 构建失败: {e}，回退到主 provider");
-                        wyj_api::build_provider(&cfg).expect("主 provider 已在启动时构建成功")
-                    },
-                )
+                if let Some(aux) = aux_provider.clone() {
+                    aux
+                } else {
+                    wyj_api::build_provider_from_profile(cfg.active_profile(), None).unwrap_or_else(
+                        |e| {
+                            tracing::warn!("标题生成器 provider 构建失败: {e}，回退到主 provider");
+                            wyj_api::build_provider(&cfg).expect("主 provider 已在启动时构建成功")
+                        },
+                    )
+                }
             }
         };
         let gen = Arc::new(SummaryGenerator::new(store.clone(), provider));
@@ -2373,12 +2420,20 @@ async fn main() -> Result<()> {
             plugin_output_style: plugin_output_style_for_rebuild.clone(),
         }
         .apply(new_agent);
+        // 重建时重新装配辅助 provider：`/model` 面板改的是**分组配置**，
+        // 辅助模型是分组级字段，改完必须立即生效，不能等到下次启动。
+        let aux_provider = build_aux_provider(cfg);
+        new_agent = new_agent.with_aux_provider(aux_provider.clone());
         if let Some(store) = &store_for_rebuild {
-            let title_provider = wyj_api::build_provider_from_profile(cfg.active_profile(), None)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("重建后标题生成器 provider 构建失败: {e}");
-                    wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
-                });
+            // 标题生成优先用辅助模型（短提示词、独立 system prompt）。
+            let title_provider = match aux_provider {
+                Some(aux) => aux,
+                None => wyj_api::build_provider_from_profile(cfg.active_profile(), None)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("重建后标题生成器 provider 构建失败: {e}");
+                        wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
+                    }),
+            };
             let gen = Arc::new(SummaryGenerator::new(store.clone(), title_provider));
             new_agent = new_agent
                 .with_summary(gen)

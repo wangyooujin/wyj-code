@@ -394,32 +394,44 @@ impl Command for AgentControlCmd {
 
 pub struct CostCmd;
 
-// (input_per_mtok, output_per_mtok) in USD
+// (前缀, input_per_mtok, output_per_mtok, cache_read_ratio) in USD
 //
 // 硬编码单价，随官方调价可能过时——这是已知的未决项（计划 U3）。查不到单价时
 // **必须显式提示**而不是静默降级成"只有 token 数"：用户看到没有金额时无法区分
 // 「真的免费」和「我没查到」。
-static PRICES: &[(&str, f64, f64)] = &[
-    ("claude-opus-4", 15.0, 75.0),
-    ("claude-opus-3", 15.0, 75.0),
-    ("claude-sonnet-4", 3.0, 15.0),
-    ("claude-sonnet-3", 3.0, 15.0),
-    ("claude-haiku-4", 0.8, 4.0),
-    ("claude-haiku-3", 0.25, 1.25),
-    // MiniMax M3.x / M2.x 走 Anthropic 兼容端点，单价远低于 Anthropic 同档：
-    // input $0.30/M、output $1.20/M；缓存命中按 0.1x、写入按 1.25x 由
-    // `CostCmd` 单独换算。放在列表里是因为第三方端点默认**不**开启缓存
+//
+// **匹配是子串匹配（`contains`），因此顺序即优先级**：更精确的前缀必须排在
+// 更宽的前缀之前，否则 `MiniMax-M3.1-Flash-Preview` 会先命中 `minimax-m3`
+// 而被算成 M3 的价（贵一倍）。
+static PRICES: &[(&str, f64, f64, f64)] = &[
+    ("claude-opus-4", 15.0, 75.0, 0.1),
+    ("claude-opus-3", 15.0, 75.0, 0.1),
+    ("claude-sonnet-4", 3.0, 15.0, 0.1),
+    ("claude-sonnet-3", 3.0, 15.0, 0.1),
+    ("claude-haiku-4", 0.8, 4.0, 0.1),
+    ("claude-haiku-3", 0.25, 1.25, 0.1),
+    // MiniMax 走 Anthropic 兼容端点，单价远低于 Anthropic 同档。
+    //
+    // 官方价（人民币/百万 tokens，2026-10 核对，按 7.0 折美元）：
+    //   M3.1-Flash  输入 1.00 / 输出 4.00 / 缓存读 0.10（= 输入价的 0.1x）
+    //   M3          输入 2.10 / 输出 8.40 / 缓存读 0.42（= 输入价的 0.2x，>512k 输入翻倍）
+    // M3.1-Flash 的条目**必须排在 `minimax-m3` 之前**（子串匹配，顺序即优先级）。
+    // M3 用的是低档价（≤512k 输入）；超长输入按 2 倍计费，本表不区分。
+    //
+    // 放在列表里是因为第三方端点默认**不**开启缓存
     // （见 `Profile::effective_prompt_cache`），未显式配置时全额按 input 计。
-    ("minimax-m3", 0.30, 1.20),
-    ("minimax-m2", 0.30, 1.20),
+    ("minimax-m3.1-flash", 0.15, 0.60, 0.1),
+    ("minimax-m3", 0.30, 1.20, 0.2),
+    ("minimax-m2", 0.30, 1.20, 0.1),
 ];
 
-fn lookup_price(model: &str) -> Option<(f64, f64)> {
+/// 查到模型单价：`(input_per_mtok, output_per_mtok, cache_read_ratio)`。
+fn lookup_price(model: &str) -> Option<(f64, f64, f64)> {
     let model_lower = model.to_lowercase();
     PRICES
         .iter()
-        .find(|(prefix, _, _)| model_lower.contains(prefix))
-        .map(|(_, i, o)| (*i, *o))
+        .find(|(prefix, _, _, _)| model_lower.contains(prefix))
+        .map(|(_, i, o, cr)| (*i, *o, *cr))
 }
 
 #[async_trait]
@@ -454,20 +466,22 @@ impl Command for CostCmd {
         let unknown = tr("cost.unknown");
 
         // ── 金额换算 ──────────────────────────────────────────────────────
-        // 缓存命中按 0.1x 输入价、缓存写入按 1.25x 输入价。`cache_write_known`
-        // 为 false 时用 None 占位而不是折算成 0 —— 端点不上报 ≠ 不计费。
+        // 缓存读取按**该模型自己的**倍率折算（Anthropic 与 MiniMax M3.1-Flash 是
+        // 输入价的 0.1x，MiniMax M3 是 0.2x），缓存写入按 1.25x 输入价。
+        // `cache_write_known` 为 false 时用 None 占位而不是折算成 0 ——
+        // 端点不上报 ≠ 不计费。
         let (input_cost, output_cost, cache_read_cost, cache_write_cost, sub_costs) = match prices {
-            Some((ip, op)) => {
+            Some((ip, op, cache_read_ratio)) => {
                 let sub = (
                     ctx.sub_input_tokens as f64 / 1_000_000.0 * ip,
                     ctx.sub_output_tokens as f64 / 1_000_000.0 * op,
-                    ctx.sub_cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1,
+                    ctx.sub_cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
                     ctx.sub_cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
                 );
                 (
                     ctx.input_tokens as f64 / 1_000_000.0 * ip,
                     ctx.output_tokens as f64 / 1_000_000.0 * op,
-                    ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * 0.1,
+                    ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
                     ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
                     sub,
                 )
@@ -2840,5 +2854,55 @@ mod cost_tests {
             !text.contains(&tr("cost.unknown")),
             "缓存已停用时不该出现未上报占位符:\n{text}"
         );
+    }
+
+    // ── 单价表 ──────────────────────────────────────────────────────────
+
+    /// `MiniMax-M3.1-Flash` 必须是 M3.1-Flash 的价（$0.15/M），**不能**被
+    /// 宽前缀 `minimax-m3` 抢先命中而算成 $0.30/M——那是两倍的偏差，会让
+    /// 「用了更便宜的辅助模型」在 `/cost` 里看起来反而更贵。
+    ///
+    /// 匹配是子串匹配、顺序即优先级，所以这条钉的是**表里的顺序**。
+    #[test]
+    fn minimax_m31_flash_is_priced_as_flash_not_as_m3() {
+        let (input, output, _) = lookup_price("MiniMax-M3.1-Flash-Preview").expect("应有单价");
+        assert!(
+            (input - 0.15).abs() < f64::EPSILON,
+            "M3.1-Flash 输入价应为 0.15，实际 {input}"
+        );
+        assert!(
+            (output - 0.60).abs() < f64::EPSILON,
+            "M3.1-Flash 输出价应为 0.60，实际 {output}"
+        );
+    }
+
+    /// M3 自己的价不能被 M3.1-Flash 的条目抢走。
+    #[test]
+    fn minimax_m3_keeps_its_own_price() {
+        let (input, output, _) = lookup_price("MiniMax-M3").expect("应有单价");
+        assert!(
+            (input - 0.30).abs() < f64::EPSILON,
+            "M3 输入价应为 0.30，实际 {input}"
+        );
+        assert!(
+            (output - 1.20).abs() < f64::EPSILON,
+            "M3 输出价应为 1.20，实际 {output}"
+        );
+    }
+
+    /// 缓存读取倍率是**按模型**的：M3.1-Flash 是 0.1x，M3 是 0.2x。
+    /// 写死 0.1x 会把 M3 的缓存费用少算一半。
+    #[test]
+    fn cache_read_ratio_differs_between_minimax_models() {
+        let (_, _, flash_ratio) = lookup_price("MiniMax-M3.1-Flash").expect("应有单价");
+        let (_, _, m3_ratio) = lookup_price("MiniMax-M3").expect("应有单价");
+        assert!((flash_ratio - 0.1).abs() < f64::EPSILON);
+        assert!((m3_ratio - 0.2).abs() < f64::EPSILON);
+    }
+
+    /// 未知模型仍然查不到单价（不能因为放宽匹配而误命中）。
+    #[test]
+    fn unknown_model_still_has_no_price() {
+        assert!(lookup_price("some-unlisted-model").is_none());
     }
 }
