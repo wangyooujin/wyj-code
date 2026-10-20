@@ -796,12 +796,21 @@ impl Agent {
     }
 
     /// 根据当前路由的模型标识推导实际生效的最大推理轮数。
-    /// Reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking
-    /// 等）在工具循环中容易陷入 reasoning-token 黑洞：每轮 reasoning 块
-    /// 计入 output tokens 但不一定推进工具调用决策。给它们一个保守的
-    /// 32 轮硬上限，普通模型保留 self.max_turns 默认值。
+    ///
+    /// 判据见 [`helpers::max_turns_for_model`]：模型名命中 `reasoner` / `-r1`，
+    /// 或该端点**思考根本关不掉**（如 MiniMax M2.x/M3.1、Qwen `-thinking`），
+    /// 一律压到 32 轮；其余保留 `self.max_turns`（默认 200）。
+    ///
+    /// 必须带上 vendor 与 wire：`ThinkingSpec::for_vendor` 的查表键就是这三个
+    /// 维度，只传 model 会让 Anthropic 线的 MiniMax 落到 OpenAI 线的规格上，
+    /// 判据随之漂移。
     fn max_turns_for_route(&self, model: &str) -> usize {
-        max_turns_for_model(self.max_turns, model)
+        max_turns_for_model(
+            self.max_turns,
+            &self.route_vendor,
+            &self.route_wire_protocol,
+            model,
+        )
     }
 
     /// 在默认系统提示末尾追加额外内容（如 Plan 模式限制说明）
@@ -1562,11 +1571,11 @@ impl Agent {
             }
         }
 
-        // 国产 reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking
-        // 等）在工具循环中可能陷入 reasoning-token 黑洞：每轮 thinking 块会
-        // 计入 output tokens，但 reasoning 不一定推进工具调用决策。给它们
-        // 一个保守的 32 轮硬上限，普通模型保留 self.max_turns（默认 200）
-        // 兜底。
+        // 思考关不掉的模型（DeepSeek `deepseek-reasoner`、MiniMax M2.x/M3.1、
+        // Qwen `-thinking` 等）在工具循环中可能陷入 reasoning-token 黑洞：每轮
+        // thinking 块会全量计入 output tokens，但 reasoning 不一定推进工具调用
+        // 决策。给它们一个保守的 32 轮硬上限，普通模型保留 self.max_turns
+        // （默认 200）兜底。判据见 `helpers::max_turns_for_model`。
         let max_turns = self.max_turns_for_route(&self.route_model);
 
         // 触顶前的**收尾宽限**。触顶不是「任务失败」，而是「这一轮该交付了」：

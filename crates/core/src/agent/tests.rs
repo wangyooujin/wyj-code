@@ -100,18 +100,103 @@ impl ToolContext for FakeCtx {
 /// DeepSeek `deepseek-reasoner` 应触发 reasoning 模型熔断,降到 32 轮。
 #[test]
 fn max_turns_caps_reasoner_model_at_32() {
-    assert_eq!(max_turns_for_model(200, "deepseek-reasoner"), 32);
-    assert_eq!(max_turns_for_model(200, "DeepSeek-Reasoner"), 32);
-    assert_eq!(max_turns_for_model(200, "deepseek-R1"), 32);
-    assert_eq!(max_turns_for_model(200, "deepseek-r1-distill-qwen-7b"), 32);
+    let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
+    assert_eq!(
+        max_turns_for_model(200, "deepseek", &openai, "deepseek-reasoner"),
+        32
+    );
+    assert_eq!(
+        max_turns_for_model(200, "deepseek", &openai, "DeepSeek-Reasoner"),
+        32
+    );
+    assert_eq!(
+        max_turns_for_model(200, "deepseek", &openai, "deepseek-R1"),
+        32
+    );
+    assert_eq!(
+        max_turns_for_model(200, "deepseek", &openai, "deepseek-r1-distill-qwen-7b"),
+        32
+    );
 }
 
 /// 普通模型保留调用方传入的默认值,不受熔断影响。
 #[test]
 fn max_turns_keeps_default_for_normal_models() {
-    assert_eq!(max_turns_for_model(200, "deepseek-chat"), 200);
-    assert_eq!(max_turns_for_model(200, "claude-opus-4-5"), 200);
-    assert_eq!(max_turns_for_model(64, "qwen3-coder-plus"), 64);
+    let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
+    let anthropic = wyj_config::WireProtocol::AnthropicMessages;
+    assert_eq!(
+        max_turns_for_model(200, "deepseek", &openai, "deepseek-chat"),
+        200
+    );
+    assert_eq!(
+        max_turns_for_model(200, "anthropic", &anthropic, "claude-opus-4-5"),
+        200
+    );
+    assert_eq!(
+        max_turns_for_model(64, "alibaba", &openai, "qwen3-coder-plus"),
+        64
+    );
+}
+
+/// **思考关不掉的端点同样要压到 32 轮**，哪怕模型名里既没有 `reasoner`
+/// 也没有 `-r1`。
+///
+/// 回归的是 v0.3.15 之前的真实事故：`MiniMax-M3.1-Flash` 单个用户回合跑了
+/// 163 次 API 往返、35.6 万 output token，收尾提醒要到第 196 轮才注入。
+/// 旧判据只看模型名，这类端点一律拿到默认 200 轮，等于允许模型在单回合里
+/// 做 200 次完整深度推理。
+#[test]
+fn max_turns_caps_endpoints_that_cannot_disable_thinking() {
+    let anthropic = wyj_config::WireProtocol::AnthropicMessages;
+    let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
+
+    // MiniMax `/anthropic`：M3.1 发 disabled 直接 400、M2.x 发了不生效。
+    for model in ["MiniMax-M3.1-Flash-Preview", "MiniMax-M2.7"] {
+        assert_eq!(
+            max_turns_for_model(200, "minimax", &anthropic, model),
+            32,
+            "{model}: /anthropic 端点的思考关不掉"
+        );
+    }
+    // OpenAI 线的 M2.x 同样强制思考（thinking.type 恒为 adaptive）。
+    assert_eq!(
+        max_turns_for_model(200, "minimax", &openai, "MiniMax-M2.7"),
+        32
+    );
+    // Qwen `-thinking` / 豆包 `-thinking` / Moonshot `-code` 均为强制思考后缀。
+    assert_eq!(
+        max_turns_for_model(200, "alibaba", &openai, "qwen3-max-thinking"),
+        32
+    );
+    assert_eq!(
+        max_turns_for_model(200, "volcengine", &openai, "doubao-seed-1.6-thinking"),
+        32
+    );
+    assert_eq!(
+        max_turns_for_model(200, "moonshot", &openai, "kimi-k2-code"),
+        32
+    );
+}
+
+/// 能关掉思考的端点**不**被这条判据误伤——否则同一个 vendor 的普通模型会被
+/// 无差别压到 32 轮，正常长任务反而做不完。
+#[test]
+fn max_turns_does_not_cap_endpoints_that_can_disable_thinking() {
+    let anthropic = wyj_config::WireProtocol::AnthropicMessages;
+    let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
+
+    // MiniMax M3（非 3.1）：thinking.type=disabled 真的生效。
+    assert_eq!(
+        max_turns_for_model(200, "minimax", &anthropic, "MiniMax-M3"),
+        200
+    );
+    // Moonshot k2.5/2.6 无强制后缀 → 允许关闭。
+    assert_eq!(
+        max_turns_for_model(200, "moonshot", &openai, "kimi-k2.5"),
+        200
+    );
+    // GLM 可关闭。
+    assert_eq!(max_turns_for_model(200, "zhipu", &openai, "glm-5.2"), 200);
 }
 
 /// fnv_hash_value 对 Object 的 key 顺序不敏感,数组保持原序。
