@@ -736,8 +736,13 @@ pub(super) fn mask_secret(s: &str) -> String {
     format!("{prefix}...")
 }
 
-pub(super) fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area: Rect) {
-    // 2 字段（log_level/language）+ 分隔线 + 错误行 + 提示行
+pub(super) fn draw_settings_dialog(
+    f: &mut Frame,
+    dialog: &SettingsDialog,
+    input_owner: Option<InputOwner>,
+    area: Rect,
+) {
+    // 字段行 + 分隔线 + 错误行 + 提示行
     let content_lines = SETTINGS_FIELD_COUNT as u16 + 3;
     let height = (content_lines + 2).min(area.height.saturating_sub(2));
     let width = (area.width * 6 / 10).clamp(50, 90).min(area.width);
@@ -763,15 +768,28 @@ pub(super) fn draw_settings_dialog(f: &mut Frame, dialog: &SettingsDialog, area:
     let w = inner.width as usize;
     let label_width = 18usize;
 
+    // 当前被借用输入框编辑的字段：该行不显示实时值，改显示占位提示（真正的
+    // 输入渲染在底部主输入框），与 /model 面板同款处理。
+    let editing_field = match input_owner {
+        Some(InputOwner::Settings(SettingsInputField::Field { field_idx })) => Some(field_idx),
+        _ => None,
+    };
+
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (idx, key) in SETTINGS_FIELD_LABEL_KEYS
+    for (idx, spec) in SETTINGS_FIELD_SPECS
         .iter()
         .enumerate()
         .take(SETTINGS_FIELD_COUNT)
     {
-        let label = wyj_i18n::tr(key);
+        let label = wyj_i18n::tr(spec.key);
         let selected = idx == dialog.selected;
-        let value = dialog.draft.display_value(idx);
+        let value = if editing_field == Some(idx) {
+            wyj_i18n::tr("profile.dialog.editing_placeholder")
+        } else if matches!(spec.kind, SettingsFieldKind::Secret) {
+            mask_secret(dialog.draft.text_value(idx))
+        } else {
+            dialog.draft.display_value(idx)
+        };
 
         let marker = if selected { "▶ " } else { "  " };
         let text = format!("{marker}{label:<label_width$}{value}");

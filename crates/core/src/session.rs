@@ -160,6 +160,26 @@ pub struct Session {
     /// 仍以 `config.toml` 为唯一事实来源，避免会话文件里留下一份会漂移的副本。
     /// 分组被改名或删除时，恢复侧按「找不到就回落全局」处理。
     pub session_profile: Option<String>,
+    /// 最近一次请求实际发出的 system prompt 指纹（见
+    /// [`crate::prompt_fingerprint`]）。
+    ///
+    /// **由 `Agent` 在每次发出请求时写入，随 `SessionFile` 落盘**。它的全部
+    /// 价值在跨进程：同一会话隔天 `--resume`，模型行为变了而没有任何地方能
+    /// 解释——记忆快照按 10 轮分桶、规约链每轮重读盘、Skill 名单与工具集随
+    /// 配置漂移、版本升级整体换掉主提示。`context_audit` 只给 token 总量，
+    /// 答不出「哪一段变了」。
+    pub prompt_fingerprint: Option<crate::prompt_fingerprint::PromptFingerprint>,
+    /// 本次进程内是否已用落盘指纹做过一次漂移检测。
+    ///
+    /// 用独立布尔而不是「`prompt_drift_since_resume.is_none()`」判断：后者把
+    /// 「还没检测」和「检测过、没差异」压成同一个状态，于是每轮都重算一次
+    /// （虽然结果恒等，但每轮都在跟上一轮自己比）。
+    pub prompt_fingerprint_checked: bool,
+    /// resume 后第一次请求时测得的 prompt 漂移。
+    ///
+    /// `None` = 还没跑过请求，或落盘没有指纹可比（升级前的老会话）。
+    /// `Some(空)` = 比过了，两个可比 section 完全一致。
+    pub prompt_drift_since_resume: Option<crate::prompt_fingerprint::PromptDrift>,
     /// 最近一次模型往返的时延画像（`/context` 面板展示）。
     pub latency: TurnLatency,
     /// 字符启发式估算相对真实 prompt token 的校准系数（EWMA）。
@@ -645,6 +665,15 @@ impl Session {
         self.current_checkpoint_id = file.current_checkpoint_id.clone();
         self.branch_parent_session_id = file.branch_parent_session_id.clone();
         self.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id.clone();
+        self.prompt_fingerprint = file.prompt_fingerprint.clone();
+        // **切换会话时必须把「本进程已检测过」与「上一个会话的漂移结论」一起清掉**。
+        // `/resume` 是在同一个 `Session` 实例上调用本方法的（`app.rs` 的会话切换
+        // 分支），只搬指纹会让 `Agent` 的 `if !prompt_fingerprint_checked` 直接跳过
+        // 检测，而 `/context` 拿到的 `prompt_drift_since_resume` 仍是上一个会话的
+        // 值——张冠李戴比不显示更糟。启动路径（新 `Session`）这两项本来就是默认值，
+        // 在方法里重置对它们无副作用。
+        self.prompt_fingerprint_checked = false;
+        self.prompt_drift_since_resume = None;
     }
 }
 

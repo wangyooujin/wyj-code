@@ -1432,6 +1432,21 @@ async fn main() -> Result<()> {
                 &[("count", &effective_count.to_string())]
             )
         );
+        // WebSearch 后端：配好了报后端名，没配就报原因。未配置时该工具不注册，
+        // 模型完全看不到它，所以这里必须给出一句可执行的解释。
+        match cfg.search_provider_issue() {
+            None => println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.search_configured",
+                    &[("provider", cfg.effective_search_provider())]
+                )
+            ),
+            Some(issue) => println!(
+                "{}",
+                wyj_i18n::tr_fmt("status.search_unavailable", &[("reason", &issue)])
+            ),
+        }
         return Ok(());
     }
 
@@ -3062,10 +3077,13 @@ fn make_sub_agent_factory(
                 sub_registry.register_arc(Arc::new(t));
             }
         }
-        // WebSearch：与主 Agent 同样的"仅配置了 search_api_key 才注册"语义，
+        // WebSearch：与主 Agent 同样的「`[search]` 配置可用才注册」语义，
         // 让子 Agent 类型定义（如 general-purpose 的 tools: None）能拿到它。
-        if let Some(key) = cfg.search_api_key.as_deref().filter(|k| !k.is_empty()) {
-            sub_registry.register_arc(Arc::new(wyj_tools::WebSearchTool::new(key)));
+        if let Some(backend) = wyj_tools::build_backend(&cfg) {
+            sub_registry.register_arc(Arc::new(
+                wyj_tools::WebSearchTool::new(backend, cfg.search.max_results)
+                    .with_default_domains(&cfg.search.allowed_domains, &cfg.search.blocked_domains),
+            ));
         }
         // MCP：读取 spawn 此刻已连接成功的快照；此后才连完的 server，本次
         // 创建的子 Agent 看不到（与主 Agent「界面先开、后台陆续补」同款权衡）。
@@ -3606,6 +3624,7 @@ async fn repl(
                 .total()
                 .max(wyj_core::estimate_tokens(&session.messages)),
             context_audit: (session.context_audit.total() > 0).then_some(session.context_audit),
+            prompt_drift: session.prompt_drift_since_resume.clone(),
             compact_count: session.compact_count,
             context_edit: (
                 wyj_core::context_edit::elided_count(&session.messages) as u32,
@@ -4345,7 +4364,13 @@ mod cli_tests {
 
     fn registry_with_mcp_and_websearch() -> ToolRegistry {
         let mut r = ToolRegistry::standard();
-        r.register_arc(Arc::new(wyj_tools::WebSearchTool::new("dummy-key")));
+        // 工具身份与后端无关：这里只为「注册表里存在 WebSearch」这个前提，
+        // 用真后端 + 哑 key 即可（不会真的发请求）。
+        let backend = Arc::new(wyj_tools::search::TavilyBackend::new(
+            reqwest::Client::new(),
+            "dummy-key",
+        ));
+        r.register_arc(Arc::new(wyj_tools::WebSearchTool::new(backend, 5)));
         r.register_arc(Arc::new(FakeMcpTool("mcp_echo")));
         r
     }

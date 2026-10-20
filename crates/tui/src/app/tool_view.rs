@@ -139,6 +139,10 @@ pub(super) fn tool_display_arg(name: &str, input: &serde_json::Value) -> String 
             let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
             trunc(url.to_string(), 55)
         }
+        "websearch" => {
+            let q = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            trunc(q.to_string(), 55)
+        }
         _ => String::new(),
     }
 }
@@ -186,6 +190,23 @@ pub(super) fn tool_result_summary(name: &str, output: &str, is_error: bool) -> S
             format!("{n} files")
         }
         "webfetch" => format!("fetched {} bytes", output.len()),
+        "websearch" => {
+            // 结果行形如 `1. 标题`，数出编号行即为条数。零条时给明确措辞，
+            // 免得用户看到 `0 results` 以为是工具坏了。
+            let n = output
+                .lines()
+                .filter(|l| {
+                    l.trim_start().split_once('.').is_some_and(|(head, _)| {
+                        !head.is_empty() && head.chars().all(|c| c.is_ascii_digit())
+                    })
+                })
+                .count();
+            if n == 0 {
+                "no results".to_string()
+            } else {
+                format!("{n} results")
+            }
+        }
         _ => trunc1(
             first_informative_line(output)
                 .or_else(|| output.lines().next())

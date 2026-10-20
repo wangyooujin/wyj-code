@@ -38,6 +38,12 @@ subagent:
   content_more_below: "↓ new events below · PgDn to return to live tail"
   inline_running: "running · {elapsed} · ↑{tokens} tokens · {count} tool uses"
   detail_running: "running, current action:"
+  detail_running_idle: "running, no tool call yet"
+  output_truncated: "(output truncated)"
+  control_line: "control {action} · accepted: {accepted}"
+  reason_line: "why it stopped: {text}"
+  tool_log_done: "done"
+  tool_log_failed: "failed"
   builtin_general_desc: "General-purpose agent: can read/write files and run commands; for multi-step self-contained sub-tasks"
   builtin_explore_desc: "Read-only exploration agent (Read/Glob/Grep/WebFetch): for broad code searches where only the conclusion is needed"
   builtin_plan_desc: "Planning agent: analyzes code read-only and produces a step-by-step implementation plan"
@@ -46,7 +52,7 @@ subagent:
   handoff_failed: "The sub-agent failed (task NOT complete)"
   handoff_completed: "completed"
   handoff_unavailable: "(no handoff record)"
-  handoff_no_conclusion: "(no written conclusion before it stopped; see the trace for how far it got)"
+  handoff_no_conclusion: "no written conclusion"
 
 subagents:
   desc: "Open the sub-agent panel to inspect each sub-agent's full execution detail in this session (including sessions restored via /resume)"
@@ -60,8 +66,7 @@ subagents:
   status_failed: "failed"
   handoff_line: "handoff: {status} · {calls} tool calls"
   handoff_files_modified: "modified {count} file(s)"
-  handoff_files_read: "read {count} file(s)"
-  handoff_hint: "· task NOT complete; continue from the handoff summary"
+  handoff_conclusion: "conclusion: {text}"
 
 shell:
   panel_title: " shells [{count}] "
@@ -369,6 +374,14 @@ context:
   summary: "Total {total} / {window} tokens ({pct}%) · auto-compact threshold {threshold}"
   reclaimable: "Reclaimable older tool results: {tokens} tokens (full text of the last {kept} tool calls is kept)"
   edited: "Externalized {count} stale tool results · freed about {saved} tokens (use ContextRecall with the hash to get the original back)"
+  prompt_drift_header: "Prompt fingerprint: changed since the previous run"
+  prompt_drift_previous: "Baseline fingerprint recorded at {at}"
+  prompt_drift_main: "Main prompt (incl. <env>): {old_bytes} → {new_bytes} bytes"
+  prompt_drift_tools: "Tool definitions: {old_bytes} → {new_bytes} bytes"
+  prompt_drift_added: "Tools added: {names}"
+  prompt_drift_removed: "Tools removed: {names}"
+  prompt_drift_same: "Prompt fingerprint: identical to the previous run (main prompt and tool definitions unchanged)"
+  prompt_drift_none: "Prompt fingerprint: not recorded yet for this session; the next request establishes the baseline"
   compacted: "Auto-compacted {times} time(s) in this session"
   latency: "Last request · first token {ttft} · generation {total} (retry time excluded)"
   latency_retry: "The request above was retried; {spent} was spent on the retry/backoff, not on inference"
@@ -737,6 +750,8 @@ doctor:
   config_dir_err: "  ✗  Config dir   {err}"
   provider: "  ✓  Provider     {provider}"
   model: "  ✓  Model        {model}"
+  search_ok: "  ✓  Web search   {provider}"
+  search_unavailable: "  -  Web search   disabled ({reason})"
   claude_md_ok: "  ✓  Memory files  {paths}"
   claude_md_missing: "  ✗  Memory files  not found (run /init to generate AGENTS.md)"
   memory_dir_with_count: "  ✓  Memory dir   {path} ({count} entries)"
@@ -788,6 +803,8 @@ status:
   parallel_tools_capped: "max_tools_per_turn = {current} is below what this endpoint supports ({supported}). Each extra round-trip re-sends the whole context, so this is the first-order driver of input cost."
   other_profiles: "Other profiles: {names}"
   mcp_servers: "MCP servers: {count}"
+  search_configured: "WebSearch: {provider} (configured, tool available)"
+  search_unavailable: "WebSearch: disabled ({reason})"
   # headless REPL / `-p` / ACP stdio / daemon TCP exit hint when API Key
   # is missing: point users at the TUI onboarding flow or env var fallback.
   api_key_missing_onboarding_headless: |-
@@ -928,6 +945,7 @@ dialog:
     plugins_add_local: "[Plugins] Enter local plugin path (Enter to submit / Esc to cancel)"
     profile_rename: "[Model] Rename profile (Enter to submit / Esc to cancel)"
     profile_field: "[Model] Edit {field} (Enter to submit / Esc to cancel)"
+    settings_field: "[Config] Edit {field} (Enter to submit / Esc to cancel)"
     schedule_field: "[Schedule] Edit {field} (Enter to submit / Esc to cancel)"
     schedule_freq_daily: "[Schedule] Enter time as HH:MM (Enter to submit / Esc to cancel)"
     schedule_freq_hourly: "[Schedule] Enter minute 0-59 (Enter to submit / Esc to cancel)"
@@ -939,7 +957,7 @@ dialog:
 
 settings:
   title: "Settings"
-  hint: "  ↑↓ Move  Enter/←→ Toggle  Ctrl+S Save  Esc Cancel"
+  hint: "  ↑↓ Move  Enter Edit/Toggle  ←→ Toggle  Ctrl+S Save  Esc Cancel"
   saved: "Settings saved"
   save_failed: "Failed to save settings: {err}"
   rebuild_failed: "Settings saved, but reconnecting failed: {err} (this session still uses the old config; the new config takes effect after restart)"
@@ -960,10 +978,15 @@ settings:
     thinking_switch: "Thinking switch"
     log_level: "Log level"
     language: "Language"
+    search_provider: "Search backend"
+    search_api_key: "Search API key"
+    search_max_results: "Search results"
   error:
     invalid_max_tokens: "Max tokens must be a positive integer"
     invalid_context_window: "Context window must be a positive integer"
     invalid_thinking_budget: "Thinking budget must be a positive integer (leave blank to disable)"
+    invalid_search_max_results: "Search results must be an integer between 1 and 10 (currently {value})"
+    empty_search_provider: "Search backend must not be empty (tavily / brave)"
 
 profile:
   title: "Call Profiles"

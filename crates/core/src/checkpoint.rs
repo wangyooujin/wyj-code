@@ -316,6 +316,17 @@ impl CheckpointStore {
         self
     }
 
+    /// 设置单 session 保留上限(builder 模式，0 = 不限)。
+    ///
+    /// `new()` 给的是 0，而 `enforce_retention` 在 `max_per_session == 0` 时
+    /// 直接返回——所以**用 `new()` 构造的 store 调 `enforce_retention` 是空操作**。
+    /// 生产路径必须走 `configured()`（从进程全局读配置）；这条 builder 是给
+    /// 测试与 `storage prune` 这类「按显式参数跑一次裁剪」的调用方用的。
+    pub fn with_max_per_session(mut self, max_per_session: usize) -> Self {
+        self.max_per_session = max_per_session;
+        self
+    }
+
     pub fn cas(&self) -> Option<&WorkspaceCas> {
         self.cas.as_deref()
     }
@@ -347,22 +358,37 @@ impl CheckpointStore {
             .unwrap_or_else(|_| cwd.to_path_buf())
             .display()
             .to_string();
+        // 落盘前两步**都必须做**，且顺序固定：先按 persist_cap 截断文本，再把
+        // 超大二进制/image 外化到 CAS。
+        //
+        // **为什么 externalize 这一步曾经缺失、代价有多大**：`SessionStore::save`
+        // 一直有 `externalize_block`，而 `CheckpointStore::create` 只有
+        // `truncate_content_block`。`truncate` 对 `ToolResultPart::Image` 明确
+        // 不动（"避免引入运行时去重逻辑"，见 `serialize::truncate_tool_result`），
+        // 于是**同一批工具截图在保留的 20 个 checkpoint 里各存一份完整 base64**。
+        // 实测（2026-10-20）：`~/.wyj-code/sessions` 3.02 GB 中 checkpoint 占
+        // 2.93 GB，其中内联 base64 图片 1.21 GB（40%）、image 块另有 0.28 GB。
+        // 而 CAS 池同期只有 310 MB（零引用仅 21 MB）——内容寻址池本来是健康的，
+        // 膨胀全在 checkpoint 内联。
+        //
+        // 外化后盘上留 `cas://<hash>` 占位，restore 时由
+        // `materialize_block_with` 原样还原（与 session 的 resume 语义一致）。
+        // CAS 不可写时 `externalize_block_with` 内部只 warn 并保留原值，不阻断
+        // checkpoint 写入。
         let truncated_messages: Vec<Message> = {
-            // 落盘前做持久化截断(tool_result / thinking / tool_use.input)。
-            // **没有配置上限时直接用调用方给的 owned 副本**：多一次 `to_vec()`
-            // 会让每个工具调用的 checkpoint 多付一次整段历史深拷贝
-            // （长会话里工具输出动辄 MB 级）。
-            match current_checkpoint_persist_cap() {
-                Some(cfg) => {
-                    for msg in &mut messages {
-                        for block in &mut msg.content {
-                            crate::serialize::truncate_content_block(block, &cfg);
-                        }
+            // **没有配置上限时也要走外化**，所以不能只在 `Some(cfg)` 分支里处理。
+            // 反过来说，`PersistCapCfg` 全零时仍需要外化——这正是此前漏掉的形态。
+            let cap = current_checkpoint_persist_cap();
+            let cas = self.cas.as_deref();
+            for msg in &mut messages {
+                for block in &mut msg.content {
+                    if let Some(cfg) = cap.as_ref() {
+                        crate::serialize::truncate_content_block(block, cfg);
                     }
-                    messages
+                    crate::serialize::externalize_block_with(block, cas);
                 }
-                None => messages,
             }
+            messages
         };
         let workspace = self.capture_workspace_with_delta(&cwd_root, cwd)?;
         let checkpoint = Checkpoint {
@@ -417,7 +443,7 @@ impl CheckpointStore {
             .load_manifest()
             .ok()
             .and_then(|manifest| pick_baseline(&manifest, cwd_root))
-            .and_then(|id| self.load(&id).ok())
+            .and_then(|id| self.load_raw(&id).ok())
             .and_then(|cp| match cp.workspace {
                 WorkspaceSnapshot::Git(snapshot) => Some(snapshot),
                 _ => None,
@@ -437,7 +463,7 @@ impl CheckpointStore {
             return Ok(WorkspaceSnapshot::Files(after));
         };
         // 加载父 checkpoint 的完整 file snapshot
-        let parent_cp = match self.load(&parent_id) {
+        let parent_cp = match self.load_raw(&parent_id) {
             Ok(cp) => cp,
             Err(error) => {
                 tracing::warn!(
@@ -474,6 +500,161 @@ impl CheckpointStore {
     pub fn enforce_retention(&self) -> Result<()> {
         self.mutate_manifest(|manifest| self.prune_manifest_locked(manifest))
             .map(|_| ())
+    }
+
+    /// 把已落盘的 checkpoint **重新外化**一遍，返回 `(处理数, 释放字节数)`。
+    ///
+    /// # 为什么需要这个（而 `create` 的修复不够）
+    ///
+    /// `create` 修好之后只影响**新写入**。存量 checkpoint 是旧版本写的，
+    /// 里面内联着完整 base64——实测 `~/.wyj-code/sessions` 3.02 GB 中
+    /// 1.21 GB 是这类图片，且**同一条记录在 20 个快照里各存一份**。
+    /// 这些文件不会因为「以后新写的变小了」而缩小。
+    ///
+    /// 本方法对每个 checkpoint 文件做一次「读 → 外化 → 原子写回」，不改
+    /// `messages` 的语义、不动 manifest、不删任何条目——纯粹把内联字节换成
+    /// `cas://` 占位符。副作用是 `intern` 让对应 blob 的 ref_count +1，而
+    /// `prune_manifest_locked` 淘汰时已经会 `release`，两者对称。
+    ///
+    /// **幂等**：已经外化过的 block 前缀是 `cas://`，`externalize_block_with`
+    /// 不会二次处理（`data.len() <= 32*1024` 的检查之外，`cas://` 前缀本身
+    /// 也远短于阈值）。
+    ///
+    /// 不可解析的 checkpoint（旧 schema / 损坏）跳过并计入返回值之外，
+    /// 由调用方从日志看。
+    pub fn reexternalize_in_place(&self) -> Result<(usize, u64)> {
+        let Some(cas) = self.cas.clone() else {
+            anyhow::bail!("reexternalize 需要 CAS 池；当前 store 未接 CAS");
+        };
+        let summary = self.list()?;
+        let mut processed = 0usize;
+        let mut freed = 0u64;
+        for entry in summary {
+            let path = self.checkpoint_path(&entry.id);
+            let Ok(before_bytes) = std::fs::metadata(&path).map(|m| m.len()) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                tracing::warn!("读取 checkpoint 失败: {}", path.display());
+                continue;
+            };
+            let mut checkpoint: Checkpoint = match serde_json::from_slice(&bytes) {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    tracing::warn!("checkpoint 解析失败，跳过 {}: {error}", path.display());
+                    continue;
+                }
+            };
+            let mut changed = false;
+            for message in &mut checkpoint.messages {
+                for block in &mut message.content {
+                    let original = serde_json::to_string(block).map(|s| s.len()).unwrap_or(0);
+                    crate::serialize::externalize_block_with(block, Some(cas.as_ref()));
+                    let after = serde_json::to_string(block).map(|s| s.len()).unwrap_or(0);
+                    if after < original {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                continue;
+            }
+            write_json_atomic(&path, &checkpoint)?;
+            let after_bytes = std::fs::metadata(&path)
+                .map(|m| m.len())
+                .unwrap_or(before_bytes);
+            freed += before_bytes.saturating_sub(after_bytes);
+            processed += 1;
+        }
+        Ok((processed, freed))
+    }
+
+    /// 列出内容已损坏（无法解析）的 checkpoint，**不改动任何文件**。
+    ///
+    /// 供 `storage doctor` / `prune --dry-run` 报计划用：删不删是用户的决定，
+    /// 但「有多少、占多少」必须先看得见。返回 `(个数, 字节数)`。
+    ///
+    /// 与 [`Self::purge_corrupt`] 的区别只是不落地——两者共用同一判据
+    /// （`serde_json::from_slice::<Checkpoint>` 失败，或条目在 manifest 里
+    /// 而文件不存在）。
+    pub fn scan_corrupt(&self) -> Result<(usize, u64)> {
+        let manifest = self.load_manifest()?;
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for entry in &manifest.checkpoints {
+            let path = self.checkpoint_path(&entry.id);
+            match std::fs::read(&path) {
+                Ok(content) => {
+                    if serde_json::from_slice::<Checkpoint>(&content).is_err() {
+                        count += 1;
+                        bytes += content.len() as u64;
+                    }
+                }
+                // 条目在 manifest 里但文件不存在：也是僵尸，计入。
+                Err(_) => count += 1,
+            }
+        }
+        Ok((count, bytes))
+    }
+
+    /// 删除**内容已损坏**（无法解析）的 checkpoint 文件，并同步清掉 manifest
+    /// 里的对应条目。返回 `(删除数, 释放字节数)`。
+    ///
+    /// # 为什么必须同时清 manifest
+    ///
+    /// 只删文件会留下「manifest 说还在、文件已经没了」的僵尸条目：`/rewind`
+    /// 的目标列表里会出现选不中的项，`load` 才报错——用户看到的是一个坏掉的
+    /// 回滚点而不是「这个点已经没了」。反过来只清 manifest 不删文件则是纯垃圾
+    /// 占盘。两者必须在**同一个临界区**里完成。
+    ///
+    /// # 为什么会损坏
+    ///
+    /// 2026-10-20 实测 120 个（约 133 MB）：`write_json_atomic` 曾对**序列化后
+    /// 的文本**跑 `redact_cow`，而那条正则的前缀 `\\?["']?` 会拆开 JSON 转义
+    /// 引号，留下裸引号导致文件不可解析。该写入路径已改为结构化脱敏
+    /// （见 `Secret::redact_json_value`），但**已经写坏的这些无法修复**——
+    /// 原始 URL 与引号边界已经丢失，只能删除。
+    pub fn purge_corrupt(&self) -> Result<(usize, u64)> {
+        let manifest = self.load_manifest()?;
+        // 判据与 `scan_corrupt` 必须一致（含「文件不存在的僵尸条目」）。
+        // 这里内联一份而不是调用 `scan_corrupt`：后者返回的是计数，
+        // 而删除需要具体 id 集合。
+        let mut ids: BTreeSet<String> = BTreeSet::new();
+        for entry in &manifest.checkpoints {
+            let path = self.checkpoint_path(&entry.id);
+            let corrupt = match std::fs::read(&path) {
+                Ok(content) => serde_json::from_slice::<Checkpoint>(&content).is_err(),
+                Err(_) => true,
+            };
+            if corrupt {
+                ids.insert(entry.id.clone());
+            }
+        }
+        if ids.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut removed = 0usize;
+        let mut freed = 0u64;
+        self.mutate_manifest(|manifest| {
+            for id in &ids {
+                let path = self.checkpoint_path(id);
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    // 文件本就不存在（僵尸条目）：只清 manifest，不计删除数。
+                    continue;
+                };
+                if let Err(error) = std::fs::remove_file(&path) {
+                    tracing::warn!("删除损坏 checkpoint 失败 {}: {error}", path.display());
+                } else {
+                    freed += meta.len();
+                    removed += 1;
+                }
+            }
+            manifest
+                .checkpoints
+                .retain(|entry| !ids.contains(&entry.id));
+            Ok(())
+        })?;
+        Ok((removed, freed))
     }
 
     /// 保留上限之内的裁剪逻辑。**必须在 [`Self::mutate_manifest`] 的临界区内调用**
@@ -515,6 +696,20 @@ impl CheckpointStore {
             if dropped < drop_count && !foreign_live.contains(&entry.id) {
                 validate_checkpoint_id(&entry.id)?;
                 let path = self.checkpoint_path(&entry.id);
+                // **删除前先释放它引用的 CAS blob**。checkpoint 一旦外化
+                // （image / thinking），它的历史正文只有 `cas://` 占位符，真正的
+                // 数据在 CAS 池里。只删文件不 release，那些 blob 的 ref_count
+                // 永远停在 ≥1，`WorkspaceCas::gc` 永远删不掉——用「删 checkpoint
+                // 省磁盘」换「CAS 无界增长」，总量不减反增。
+                //
+                // 顺序：先 release 再删文件。反过来一旦删成功而 release 失败
+                // （进程被 kill 在这个窗口），blob 就永久失去引用者，只能等
+                // 人工 `storage prune` 之外的路径处理。先 release 最坏是计数多减
+                // 一次（文件还在、内容仍可读）——这与 `release` 的幂等语义一致。
+                if let (Some(cas), Ok(checkpoint)) = (self.cas.as_deref(), self.load_raw(&entry.id))
+                {
+                    release_checkpoint_cas_refs(cas, &checkpoint.messages);
+                }
                 if let Err(error) = std::fs::remove_file(&path) {
                     // 删不掉就留在 manifest 里：manifest 有条目而文件在，是无害的
                     // （`load` 能读出来）；反过来才是数据损坏。
@@ -540,6 +735,28 @@ impl CheckpointStore {
     }
 
     pub fn load(&self, checkpoint_id: &str) -> Result<Checkpoint> {
+        let mut checkpoint = self.load_raw(checkpoint_id)?;
+        // 与 `create` 的 externalize 对称：盘上超大 image / 长 thinking 是
+        // `cas://<hash>` 占位，回滚对话时要还原成真实内容，否则 `/rewind` 之后
+        // 模型看到的是字面量 URL。blob 已被 gc 时 `materialize_block_with` 保留
+        // 占位符（可诊断，不静默变成空）。
+        //
+        // 只在本方法还原、不在 `load_raw` 里还原：`capture_workspace_with_delta`
+        // 等内部调用只需要 `workspace` 字段，对整段历史做一遍 blob 读取是纯浪费
+        // ——长会话一次 checkpoint 就可能触发几十次 CAS 读盘。
+        if self.cas.is_some() {
+            let cas = self.cas.as_deref();
+            for message in &mut checkpoint.messages {
+                for block in &mut message.content {
+                    crate::serialize::materialize_block_with(block, cas);
+                }
+            }
+        }
+        Ok(checkpoint)
+    }
+
+    /// 只反序列化、不做 CAS 还原。内部「只关心 `workspace`」的调用点走这里。
+    fn load_raw(&self, checkpoint_id: &str) -> Result<Checkpoint> {
         validate_checkpoint_id(checkpoint_id)?;
         let path = self.checkpoint_path(checkpoint_id);
         let bytes =
@@ -1294,7 +1511,7 @@ fn git_output_bytes(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<
     Ok(output.stdout)
 }
 
-/// checkpoint 的 JSON 落盘：**紧凑**格式 + 敏感信息脱敏。
+/// checkpoint 的 JSON 落盘：**紧凑**格式 + 结构安全的敏感信息脱敏。
 ///
 /// 与 `serialize::write_json_atomic` 的两点差异都是有意的，别顺手统一掉：
 /// 1. 脱敏 —— checkpoint 会快照整个 workspace（含未提交的源码），比会话文件
@@ -1302,10 +1519,73 @@ fn git_output_bytes(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<
 /// 2. 紧凑（`to_string` 而非 pretty）—— 每个 checkpoint 含一份完整 workspace 快照，
 ///    而保留条数由 `max_per_session` 控制（默认 21），缩进带来的膨胀会直接换成磁盘。
 ///
+/// **脱敏走 `serde_json::Value` 而不是对文本跑正则**。此前这里是
+/// `redact_cow(&json)`，那条正则的前缀 `\\?["']?` 会咬住 JSON 转义引号 `\"` 的
+/// 反斜杠，而结尾引号被匹配掉却不回填——文件里于是出现未转义的裸引号，
+/// **整个 checkpoint 解析失败**。实测（2026-10-20）有 120 个 checkpoint /
+/// 约 133 MB 因此永久损坏（`Invalid \escape`）。
+///
+/// 转成 `Value` 再递归脱敏多一次内存拷贝，但换到的是「结构不可能被破坏」：
+/// 改写只发生在 string 内容里，引号由序列化器统一处理。checkpoint 落盘本来
+/// 就不是热路径，这个代价可以接受。
+///
 /// tmp + rename 的原子替换逻辑委托给 `serialize::write_atomic`，全仓只此一份。
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_string(value)?;
-    crate::serialize::write_atomic(path, crate::secret::redact_cow(&json).as_bytes())
+    let mut as_value = serde_json::to_value(value)?;
+    crate::secret::redact_json_value(&mut as_value);
+    let json = serde_json::to_string(&as_value)?;
+    crate::serialize::write_atomic(path, json.as_bytes())
+}
+
+/// 释放一份 checkpoint 历史里所有 `cas://` 引用。
+///
+/// 与 `create` 的外化成对：外化时 `intern` 让 ref_count +1，checkpoint 被淘汰
+/// （retention 裁剪 / 用户手动删）时必须 `release` 让计数 -1，否则
+/// `WorkspaceCas::gc` 只回收 `ref_count == 0` 的 blob，这些数据会**永远**留在
+/// 池子里。这是「checkpoint 删了、磁盘却没少」的成因。
+///
+/// 只处理本函数认识的两种外化形态（image 的 `cas://<hash>`、thinking 的
+/// `[externalized to cas://<hash>, N bytes]`）。解析失败一律跳过而不是报错：
+/// 这里处在删除路径上，一个畸形 checkpoint 不该阻止其它 checkpoint 被回收。
+fn release_checkpoint_cas_refs(cas: &WorkspaceCas, messages: &[Message]) {
+    for block in messages.iter().flat_map(|m| m.content.iter()) {
+        match block {
+            wyj_api::types::ContentBlock::ToolResult {
+                content: wyj_api::types::ToolResultContent::Parts(parts),
+                ..
+            } => {
+                for part in parts {
+                    if let wyj_api::types::ToolResultPart::Image { data, .. } = part {
+                        if let Some(hash) = data.strip_prefix(crate::serialize::CAS_URI_PREFIX) {
+                            if let Err(error) = cas.release(hash) {
+                                tracing::warn!("释放 checkpoint image blob 失败 {hash}: {error}");
+                            }
+                        }
+                    }
+                }
+            }
+            wyj_api::types::ContentBlock::Thinking { thinking, .. } => {
+                const PREFIX: &str = "[externalized to ";
+                let Some(rest) = thinking.strip_prefix(PREFIX) else {
+                    continue;
+                };
+                let Some(rest) = rest.strip_prefix(crate::serialize::CAS_URI_PREFIX) else {
+                    continue;
+                };
+                // 占位符形态：`cas://<64hex>, N bytes]`
+                let Some(hash) = rest.split(',').next().map(str::trim) else {
+                    continue;
+                };
+                if hash.len() != 64 {
+                    continue;
+                }
+                if let Err(error) = cas.release(hash) {
+                    tracing::warn!("释放 checkpoint thinking blob 失败 {hash}: {error}");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 进程内全局 `PersistCapCfg` —— 由 CLI 装配阶段 `set_checkpoint_persist_cap`
@@ -1482,6 +1762,274 @@ mod tests {
         );
     }
 
+    /// 损坏的 checkpoint 能被检出并清理，且**同时清掉 manifest 条目**。
+    ///
+    /// 只删文件不同步 manifest 会留下僵尸条目：`/rewind` 列表里出现选不中的
+    /// 项，用户看到的是一个坏掉的回滚点而不是「这个点已经没了」。
+    #[test]
+    fn purge_corrupt_removes_both_file_and_manifest_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "corrupt").unwrap();
+
+        // 一份正常 checkpoint
+        let good = store
+            .create(
+                root.path(),
+                vec![Message::user("fine")],
+                CheckpointKind::Manual,
+                None,
+            )
+            .unwrap();
+        // 一份手工写坏的（模拟脱敏正则破坏 JSON 结构）
+        let bad_id = "corrupt000000000";
+        let bad_path = store.checkpoint_path(bad_id);
+        std::fs::write(&bad_path, br#"{"version":1,"id":"x","broken":"#).unwrap();
+        store
+            .mutate_manifest(|manifest| {
+                manifest.checkpoints.push(CheckpointSummary {
+                    id: bad_id.to_string(),
+                    name: None,
+                    kind: CheckpointKind::Manual,
+                    timestamp: "2026-01-02T00:00:00Z".to_string(),
+                    message_count: 1,
+                    cwd_root: root.path().display().to_string(),
+                    baseline_id: None,
+                    owner_pid: std::process::id(),
+                });
+                Ok(())
+            })
+            .unwrap();
+
+        // 扫描：只报不改
+        let (count, bytes) = store.scan_corrupt().unwrap();
+        assert_eq!(count, 1, "应检出 1 个损坏文件");
+        assert!(bytes > 0);
+        assert!(bad_path.exists(), "scan_corrupt 不得删文件");
+
+        // 清理：文件与 manifest 条目都消失
+        let (removed, freed) = store.purge_corrupt().unwrap();
+        assert_eq!(removed, 1);
+        assert!(freed > 0);
+        assert!(!bad_path.exists(), "损坏文件应被删除");
+        let remaining = store.list().unwrap();
+        assert_eq!(remaining.len(), 1, "manifest 应只剩正常那条");
+        assert_eq!(remaining[0].id, good.id);
+        assert!(
+            store.checkpoint_path(&good.id).exists(),
+            "正常 checkpoint 不受影响"
+        );
+    }
+
+    /// 存量 checkpoint 能被就地重新外化，且**幂等**。
+    ///
+    /// 这是给「代码修好之后已写在盘上的那批」用的：`create` 的修复只影响
+    /// 新写入，存量文件里的内联 base64 不会自己变小。
+    #[test]
+    fn reexternalize_shrinks_legacy_inline_checkpoints_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_dir.path(), 0).unwrap(),
+        );
+
+        // 先造一份「旧版本写的」checkpoint：手工构造 Checkpoint 并直接落盘，
+        // 绕过 `create` 的外化（模拟修复前产出）。
+        let store = CheckpointStore::new(sessions.path(), "legacy")
+            .unwrap()
+            .with_cas(cas.clone());
+        let big = "D".repeat(64 * 1024);
+        let checkpoint = Checkpoint {
+            version: CHECKPOINT_VERSION,
+            id: "legacy0000000000".to_string(),
+            session_id: "legacy".to_string(),
+            name: None,
+            kind: CheckpointKind::Manual,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            messages: vec![Message {
+                role: wyj_api::types::Role::User,
+                content: vec![wyj_api::types::ContentBlock::ToolResult {
+                    tool_use_id: "t1".to_string(),
+                    content: wyj_api::types::ToolResultContent::Parts(vec![
+                        wyj_api::types::ToolResultPart::Image {
+                            media_type: "image/png".to_string(),
+                            data: big.clone(),
+                        },
+                    ]),
+                    is_error: false,
+                }],
+            }],
+            workspace: WorkspaceSnapshot::Files(FileSnapshot {
+                root: root.path().to_path_buf(),
+                files: BTreeMap::new(),
+                complete: true,
+                skipped_files: 0,
+                sensitive_files_skipped: 0,
+                captured_bytes: 0,
+            }),
+        };
+        let path = store.checkpoint_path(&checkpoint.id);
+        write_json_atomic(&path, &checkpoint).unwrap();
+        // 直接写 manifest，让 `list()` 能看见它。
+        store
+            .mutate_manifest(|manifest| {
+                manifest.checkpoints.push(CheckpointSummary {
+                    id: checkpoint.id.clone(),
+                    name: None,
+                    kind: CheckpointKind::Manual,
+                    timestamp: checkpoint.timestamp.clone(),
+                    message_count: 1,
+                    cwd_root: root.path().display().to_string(),
+                    baseline_id: None,
+                    owner_pid: std::process::id(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().len();
+        assert!(before > 64 * 1024, "初始应内联完整 base64: {before}");
+
+        let (count, freed) = store.reexternalize_in_place().unwrap();
+        assert_eq!(count, 1, "应处理 1 个文件");
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(freed > 0, "应报告释放字节");
+        assert!(after < before / 2, "文件应显著缩小: {before} -> {after}");
+
+        // 幂等：再跑一次不该有任何变化。
+        let (count2, freed2) = store.reexternalize_in_place().unwrap();
+        assert_eq!(count2, 0, "已外化的文件不应重复处理");
+        assert_eq!(freed2, 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), after);
+    }
+
+    /// checkpoint 被 retention 淘汰时必须 release 它引用的 CAS blob。
+    ///
+    /// 否则「删 checkpoint 省磁盘」会换出「CAS 无界增长」：blob 的 ref_count
+    /// 永远停在 ≥1，`WorkspaceCas::gc` 只回收 `ref_count == 0`，那些数据永远
+    /// 留在池子里，总量不减反增。
+    #[test]
+    fn retention_releases_cas_blobs_of_dropped_checkpoints() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_dir.path(), 0).unwrap(),
+        );
+        // 上限 1：每建一个新 checkpoint 就淘汰最老的那个。
+        let store = CheckpointStore::new(sessions.path(), "retention-cas")
+            .unwrap()
+            .with_cas(cas.clone())
+            .with_max_per_session(1);
+
+        // 两份内容**不同**的外化 image：不同 hash，才能分别观察各自的引用计数。
+        let message = |fill: char| Message {
+            role: wyj_api::types::Role::User,
+            content: vec![wyj_api::types::ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: wyj_api::types::ToolResultContent::Parts(vec![
+                    wyj_api::types::ToolResultPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: fill.to_string().repeat(64 * 1024),
+                    },
+                ]),
+                is_error: false,
+            }],
+        };
+
+        let first = store
+            .create(
+                root.path(),
+                vec![message('B')],
+                CheckpointKind::Manual,
+                None,
+            )
+            .unwrap();
+        assert_eq!(cas.stats().unwrap().orphan_blobs, 0, "第一份 blob 有引用");
+
+        store
+            .create(
+                root.path(),
+                vec![message('C')],
+                CheckpointKind::AutoUser,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            !store.checkpoint_path(&first.id).exists(),
+            "最老的 checkpoint 应被 retention 删除"
+        );
+        // 第一份 blob 已无引用者 -> 进入 orphan，可被 gc 回收。
+        // 第二个 checkpoint 的那份仍有 1 个引用，不算 orphan。
+        let stats = cas.stats().unwrap();
+        assert_eq!(
+            stats.orphan_blobs, 1,
+            "被淘汰 checkpoint 的 blob 应已 release，另一个仍在用：{stats:?}"
+        );
+    }
+
+    /// checkpoint 里的超大 image 必须外化到 CAS，而不是在每个快照里内联一份。
+    ///
+    /// 回归钉子：`create` 曾经只有 `truncate_content_block`，而它对
+    /// `ToolResultPart::Image` 明确不动（"避免引入运行时去重逻辑"）。于是同一批
+    /// 工具截图在保留的 20 个 checkpoint 里各存一份完整 base64 —— 实测占
+    /// `~/.wyj-code/sessions` 的 40%（1.21 GB / 3.02 GB）。
+    #[test]
+    fn large_images_are_externalized_instead_of_inlined() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cas_dir = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(
+            crate::workspace_cas::WorkspaceCas::open(cas_dir.path(), 0).unwrap(),
+        );
+        let store = CheckpointStore::new(sessions.path(), "img-session")
+            .unwrap()
+            .with_cas(cas.clone());
+
+        // 64KB base64：超过 externalize 的 32KB 阈值。
+        let big = "A".repeat(64 * 1024);
+        let message = Message {
+            role: wyj_api::types::Role::User,
+            content: vec![wyj_api::types::ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                content: wyj_api::types::ToolResultContent::Parts(vec![
+                    wyj_api::types::ToolResultPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: big.clone(),
+                    },
+                ]),
+                is_error: false,
+            }],
+        };
+        let summary = store
+            .create(root.path(), vec![message], CheckpointKind::Manual, None)
+            .unwrap();
+
+        let raw = std::fs::read_to_string(store.checkpoint_path(&summary.id)).unwrap();
+        assert!(
+            !raw.contains(&big),
+            "checkpoint 不应内联完整 base64（这正是 1.2GB 膨胀的来源）"
+        );
+        assert!(
+            raw.contains(crate::serialize::CAS_URI_PREFIX),
+            "应留下 cas:// 占位符"
+        );
+
+        // 读回来必须还原成原始数据，否则 `/rewind` 之后模型看到的是字面量 URL。
+        let loaded = store.load(&summary.id).unwrap();
+        match &loaded.messages[0].content[0] {
+            wyj_api::types::ContentBlock::ToolResult {
+                content: wyj_api::types::ToolResultContent::Parts(parts),
+                ..
+            } => match &parts[0] {
+                wyj_api::types::ToolResultPart::Image { data, .. } => assert_eq!(data, &big),
+                other => panic!("unexpected part: {other:?}"),
+            },
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
     #[test]
     fn checkpoint_messages_are_redacted_before_persistence() {
         let root = tempfile::tempdir().unwrap();
@@ -1499,6 +2047,45 @@ mod tests {
         let raw = std::fs::read_to_string(store.checkpoint_path(&summary.id)).unwrap();
         assert!(!raw.contains(&secret));
         assert!(raw.contains(crate::secret::REDACTED_SECRET));
+        // **脱敏后必须仍是合法 JSON**。这是原 bug 缺的那条断言：此前只查
+        // 「不含明文 secret」，而恰恰是脱敏本身把 JSON 结构改坏了——120 个
+        // checkpoint 因此永久读不出。断言「能解析回来」才是真正的不变量。
+        let reparsed: Checkpoint =
+            serde_json::from_str(&raw).expect("脱敏后的 checkpoint 必须是合法 JSON");
+        assert_eq!(reparsed.id, summary.id);
+    }
+
+    /// 脱敏不能破坏 JSON 结构：明文 secret 出现在**含引号与反斜杠的上下文**里
+    /// 时（真实的 `curl -H "X-Token: ..."` 形态），仍必须产出可解析的 JSON。
+    ///
+    /// 这是 120 个 checkpoint 损坏事故的最小复现形态：旧实现用正则替换
+    /// **序列化后的文本**，把 `\"` 拆成 `\` + 消失的引号，留下裸引号。
+    #[test]
+    fn redaction_keeps_json_parseable_with_quoted_secret_context() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "quote-session").unwrap();
+        let secret = format!("{}{}", "sk-test-", "F".repeat(24));
+        // 关键：secret 前面有 `-H \"X-Subscription-Token: ` 这种带转义引号的上下文：
+        // 与真实事故现场一致——HTTP 客户端命令行把 header 值用引号括起来。
+        let payload =
+            format!("req -H \\\"X-Subscription-Token: {secret}\\\" https://example.invalid");
+        let summary = store
+            .create(
+                root.path(),
+                vec![Message::user(payload)],
+                CheckpointKind::Manual,
+                None,
+            )
+            .unwrap();
+        let raw = std::fs::read_to_string(store.checkpoint_path(&summary.id)).unwrap();
+        assert!(!raw.contains(&secret), "明文 secret 不应落盘");
+        let reparsed = serde_json::from_str::<Checkpoint>(&raw);
+        assert!(
+            reparsed.is_ok(),
+            "带引号上下文的 secret 脱敏后 JSON 必须仍可解析，实际: {:?}",
+            reparsed.err()
+        );
     }
 
     #[test]

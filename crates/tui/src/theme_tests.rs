@@ -107,6 +107,7 @@ fn production_source(file: &str) -> String {
         "app/schedule_panel.rs" => include_str!("app/schedule_panel.rs"),
         "app/settings_dialogs.rs" => include_str!("app/settings_dialogs.rs"),
         "app/skills_panel.rs" => include_str!("app/skills_panel.rs"),
+        "app/sub_agent_view.rs" => include_str!("app/sub_agent_view.rs"),
         "app/terminal.rs" => include_str!("app/terminal.rs"),
         "app/tool_view.rs" => include_str!("app/tool_view.rs"),
         "app/util.rs" => include_str!("app/util.rs"),
@@ -165,6 +166,10 @@ fn no_hardcoded_colors_outside_theme() {
         (
             "app/skills_panel.rs",
             production_source("app/skills_panel.rs"),
+        ),
+        (
+            "app/sub_agent_view.rs",
+            production_source("app/sub_agent_view.rs"),
         ),
         ("app/terminal.rs", production_source("app/terminal.rs")),
         ("app/tool_view.rs", production_source("app/tool_view.rs")),

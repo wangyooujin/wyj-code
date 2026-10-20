@@ -1652,6 +1652,7 @@ mod tests {
                 branch_parent_session_id: None,
                 branch_parent_checkpoint_id: None,
                 title_generated: false,
+                prompt_fingerprint: None,
             })
             .unwrap();
         let (client, server) = tokio::io::duplex(64 * 1024);
