@@ -57,12 +57,7 @@ pub struct FileLock {
     file: fs::File,
 }
 
-impl FileLock {
-    /// 锁的持有者 pid。用于向用户解释「谁在占着这个状态文件」。
-    pub fn holder_pid(&self) -> Option<u32> {
-        read_holder_pid(&self.path)
-    }
-}
+impl FileLock {}
 
 /// 获取 `path` 的跨进程排他锁。`what` 是人类可读的锁用途，只出现在错误信息里。
 pub fn acquire(path: &Path, what: &str) -> Result<FileLock> {

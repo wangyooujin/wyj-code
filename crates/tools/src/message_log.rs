@@ -117,15 +117,16 @@ impl MessageLogWriter {
                         messages,
                     },
                 };
-                let mut line = match serde_json::to_string(&record) {
+                let line = match serde_json::to_string(&record) {
                     Ok(line) => line,
                     Err(_) => continue,
                 };
                 // 与 trace 同一套脱敏：工具输出里可能带 token / 私钥。
-                line = wyj_core::redact_sensitive_text(&line);
-                line.push('\n');
+                // 借用版：没有 secret 形态时直接写原串字节，不复制整份内容。
+                let redacted = wyj_core::redact_cow(&line);
+                let line_len = redacted.len() as u64 + 1; // 加上行尾 '\n'
                 let used = written.entry(id).or_insert(0);
-                if *used + line.len() as u64 > max_bytes_per_agent {
+                if *used + line_len > max_bytes_per_agent {
                     // 停写前留一条标记：读侧据此知道「这份日志不完整」，
                     // 而不是把截断后的历史当成真实历史。
                     let marker = MessageRecord::Truncated {
@@ -142,8 +143,10 @@ impl MessageLogWriter {
                     stopped.insert(id);
                     continue;
                 }
-                *used += line.len() as u64;
-                append(&dir.join(format!("a{id}.messages.jsonl")), line.as_bytes());
+                *used += line_len;
+                let path = dir.join(format!("a{id}.messages.jsonl"));
+                append(&path, redacted.as_bytes());
+                append(&path, b"\n");
             }
         });
         Self { tx }

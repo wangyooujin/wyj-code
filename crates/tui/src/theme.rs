@@ -629,11 +629,6 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
-    /// 代码块标记行（```）
-    pub fn code_fence() -> Style {
-        Style::default().fg(Self::inactive_color())
-    }
-
     /// 代码块内容行
     pub fn code_body() -> Style {
         Style::default().fg(Self::code_fg_color())
@@ -726,11 +721,6 @@ impl Theme {
         Style::default()
             .fg(Self::code_comment_color())
             .add_modifier(Modifier::ITALIC)
-    }
-
-    /// 状态栏品牌标志 ◆ 的颜色
-    pub fn claude_brand() -> Style {
-        Style::default().fg(Self::claude_color())
     }
 
     // ── 欢迎页 logo 专用（橙→黄渐变 + 整块反色填充）───────────────────────────

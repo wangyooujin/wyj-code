@@ -22,11 +22,6 @@ pub fn project_key(path: &Path) -> String {
     format!("{}-{:08x}", sanitize(dir_name), h.finish() as u32)
 }
 
-/// 判定两个路径是否属于同一项目（同一 git 仓库根，或非 git 下同一目录）。
-pub fn same_project(a: &Path, b: &Path) -> bool {
-    project_root(a) == project_root(b)
-}
-
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -51,7 +46,6 @@ mod tests {
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         assert_eq!(project_root(&sub), tmp.canonicalize().unwrap());
         // 子目录与仓库根属于同一项目
-        assert!(same_project(&sub, &tmp));
         assert_eq!(project_key(&sub), project_key(&tmp));
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -64,7 +58,6 @@ mod tests {
         std::fs::create_dir_all(r1.join(".git")).unwrap();
         std::fs::create_dir_all(r2.join(".git")).unwrap();
         assert_ne!(project_key(&r1), project_key(&r2));
-        assert!(!same_project(&r1, &r2));
         std::fs::remove_dir_all(&base).ok();
     }
 }

@@ -2,35 +2,16 @@
 //!
 //! 旧实现 `&s[..max]` 按字节切片，`max` 落在多字节字符（中文/emoji）中间
 //! 会直接 panic；这里统一回退到最近的 char boundary。
+//!
+//! **实现已上收到 `wyj_core::textutil`**：本模块此前带一份手写副本，而
+//! `core/serialize.rs` 还各有一份逐行相同的实现（三处重复）。且副本的
+//! `truncate_head_tail` 尾部起点**向上**走（`start += 1`），会超出
+//! `tail_bytes` 预算最多 3 字节——与 `core::verify::clip_output` 不一致。
+//! 现在全部走 core 的实现，尾部**向下**回退，保证不超预算。
+//!
+//! 本模块保留是为了不改动 `crate::textutil::truncate_str(...)` 的调用写法。
 
-/// 按字节上限截断，保证不切断多字节字符。`s.len() <= max_bytes` 时原样借用返回。
-pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// 保头保尾截断：超限时保留开头 `head_bytes` + 结尾 `tail_bytes`，
-/// 中间以标记替代。适合命令输出（报错信息几乎总在尾部）与子 Agent 结果
-/// （结论按约定在尾部）。
-pub fn truncate_head_tail(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
-    if s.len() <= head_bytes + tail_bytes {
-        return s.to_string();
-    }
-    let head = truncate_str(s, head_bytes);
-    // 尾部起点同样回退到 char boundary（向后走不会越过 tail_bytes 预算）
-    let mut start = s.len() - tail_bytes;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    let omitted = s.len() - head.len() - (s.len() - start);
-    format!("{head}\n…[truncated {omitted} bytes]…\n{}", &s[start..])
-}
+pub use wyj_core::textutil::{truncate_head_tail, truncate_str};
 
 #[cfg(test)]
 mod tests {

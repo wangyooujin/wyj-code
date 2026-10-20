@@ -6,6 +6,71 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Plan 模式进入执行层复核的工具集。
+///
+/// **唯一真相源**：CLI（`--permission-mode plan`）与 TUI（Shift+Tab 切到
+/// Plan）都必须用这一份。此前两边各写一份字面量且已经漂移——CLI 那份有
+/// `Memory` 没有 `TodoWrite`，TUI 那份有 `TodoWrite` 没有 `Memory`，
+/// 于是同一个模式在两种入口下的可写范围不同。
+///
+/// `Write` / `Edit` 在名单里**不代表**任意写入获批：执行层还要过
+/// `PermissionPolicy::plan_write_allowed` 的路径策略（只允许 doc/plan、
+/// docs/plan、.wyj-code/plans 与本轮明确授权的单个文档）。
+pub const PLAN_ALLOWED_TOOLS: &[&str] = &[
+    "Read",
+    "Glob",
+    "Grep",
+    "CodeSearch",
+    "WebFetch",
+    "WebSearch",
+    "AskQuestion",
+    "Write",
+    "Edit",
+    "Bash",
+    "BashOutput",
+    "ExitPlanMode",
+    "TodoWrite",
+    "Memory",
+    "Agent",
+];
+
+/// 由运行模式推导初始权限模式。
+///
+/// 单一入口保证 CLI 与 TUI 的行为一致：两者此前各自维护一份 Plan 白名单
+/// 字面量（且已漂移），任何一边新增工具都要记得同步另一边，漏了就静默
+/// 少放行一个工具。
+pub fn permission_mode_for(mode: &wyj_config::AgentMode) -> PermissionMode {
+    match mode {
+        wyj_config::AgentMode::Plan => {
+            PermissionMode::Plan(PLAN_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect())
+        }
+        wyj_config::AgentMode::Bypass => PermissionMode::AutoApprove,
+        wyj_config::AgentMode::Auto => PermissionMode::Auto,
+    }
+}
+
+/// 把「本次进程显式授权的工具名」叠加到已有权限模式上。
+///
+/// - Plan 模式：与 Plan 白名单**取交集**（显式名单更窄）。
+/// - 其他模式：整个模式退化为 `Allowlist(显式名单)`——只有名单内的工具
+///   被放行，其余一律拒绝。
+///
+/// 空名单 = 不施加任何额外限制，原样返回。
+pub fn restrict_to_allowed_tools(
+    mode: PermissionMode,
+    allowed_tools: &HashSet<String>,
+) -> PermissionMode {
+    if allowed_tools.is_empty() {
+        return mode;
+    }
+    match mode {
+        PermissionMode::Plan(base) => {
+            PermissionMode::Plan(base.intersection(allowed_tools).cloned().collect())
+        }
+        _ => PermissionMode::Allowlist(allowed_tools.clone()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Auto 模式（唯一需要判定的日常模式）：「要不要问人」交给
@@ -735,6 +800,66 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    /// Plan 白名单是 CLI 与 TUI 的**唯一真相源**。
+    ///
+    /// 此前两边各写一份字面量且已经漂移：CLI 那份有 `Memory` 没有
+    /// `TodoWrite`，TUI 那份有 `TodoWrite` 没有 `Memory`——同一个模式在
+    /// 两种入口下放行的工具集不同。这条钉子防止再漂移。
+    #[test]
+    fn plan_allowlist_contains_both_todo_write_and_memory() {
+        assert!(PLAN_ALLOWED_TOOLS.contains(&"TodoWrite"));
+        assert!(PLAN_ALLOWED_TOOLS.contains(&"Memory"));
+        // 名单里不能有重复项（否则交集运算的行为依赖顺序）。
+        let mut sorted = PLAN_ALLOWED_TOOLS.to_vec();
+        sorted.sort_unstable();
+        let unique = sorted.len();
+        sorted.dedup();
+        assert_eq!(sorted.len(), unique, "Plan 白名单里有重复工具名");
+    }
+
+    /// `--allowed-tools` 在 Plan 模式下是**取交集**（显式名单更窄）。
+    #[test]
+    fn restrict_narrows_the_plan_allowlist() {
+        let mode = permission_mode_for(&wyj_config::AgentMode::Plan);
+        let restricted = restrict_to_allowed_tools(
+            mode,
+            &HashSet::from(["Read".to_string(), "Write".to_string()]),
+        );
+        match restricted {
+            PermissionMode::Plan(allowed) => {
+                assert!(allowed.contains("Read"));
+                assert!(allowed.contains("Write"));
+                assert!(!allowed.contains("Bash"), "交集后不应保留未列出的工具");
+            }
+            other => panic!("Plan 模式收窄后应仍是 Plan，实际 {other:?}"),
+        }
+    }
+
+    /// 非 Plan 模式下，显式名单让整个模式退化为 `Allowlist`。
+    #[test]
+    fn restrict_turns_other_modes_into_allowlist() {
+        let explicit = HashSet::from(["Read".to_string()]);
+        for mode in [wyj_config::AgentMode::Auto, wyj_config::AgentMode::Bypass] {
+            let restricted = restrict_to_allowed_tools(permission_mode_for(&mode), &explicit);
+            match restricted {
+                PermissionMode::Allowlist(allowed) => {
+                    assert_eq!(allowed, explicit);
+                }
+                other => panic!("{mode:?} 收窄后应是 Allowlist，实际 {other:?}"),
+            }
+        }
+    }
+
+    /// 空名单 = 不施加额外限制。
+    #[test]
+    fn restrict_with_empty_allowlist_is_identity() {
+        let mode = permission_mode_for(&wyj_config::AgentMode::Plan);
+        assert_eq!(
+            restrict_to_allowed_tools(mode.clone(), &HashSet::new()),
+            mode
+        );
     }
 
     #[cfg(unix)]

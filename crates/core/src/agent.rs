@@ -225,18 +225,32 @@ pub struct AgentRoute {
 }
 
 impl AgentRoute {
+    /// `base_url` 与 `wire_protocol` 是**必传**参数，不是可选的 builder 后缀。
+    ///
+    /// 两者都参与 `ModelIdentity` 的构造，而 `ModelIdentity` 又是
+    /// capability_cache 的 fingerprint 输入与 thinking spec 的查表键：
+    /// 少了 base_url → 同 vendor+model 的不同端点共用同一份 cache 文件，一个
+    /// 端点的 4xx 拒绝记录会连带禁掉另一个端点的参数；少了 wire_protocol →
+    /// `ThinkingSpec::for_vendor` 按 OpenAI 线查表，Anthropic 线的端点会拿到
+    /// 错档的 effort 规格。
+    ///
+    /// 做成必传而不是 `with_identity()` 后缀，是为了让「漏接线」在编译期暴露：
+    /// 之前 `with_identity` 零调用，两个字段恒为空串 / OpenAI，症状要等端点
+    /// 返回 400 才看得见。
     pub fn new(
         profile_name: impl Into<String>,
         vendor: impl Into<String>,
         model: impl Into<String>,
+        base_url: impl Into<String>,
+        wire_protocol: wyj_config::WireProtocol,
         provider: Arc<dyn Provider>,
     ) -> Self {
         Self {
             profile_name: profile_name.into(),
             vendor: vendor.into(),
             model: model.into(),
-            base_url: String::new(),
-            wire_protocol: wyj_config::WireProtocol::OpenAiChatCompletions,
+            base_url: base_url.into(),
+            wire_protocol,
             provider,
             capabilities: None,
             max_tokens: 8192,
@@ -276,17 +290,6 @@ impl AgentRoute {
         self.thinking_switch = switch.filter(|value| !value.is_empty());
         self
     }
-
-    /// 设置 base_url 与 wire_protocol（capability_cache fingerprint 推导需要）
-    pub fn with_identity(
-        mut self,
-        base_url: impl Into<String>,
-        wire_protocol: wyj_config::WireProtocol,
-    ) -> Self {
-        self.base_url = base_url.into();
-        self.wire_protocol = wire_protocol;
-        self
-    }
 }
 
 /// 由 `[context_edit].soft_limit_ratio` 算出 context editing 的**动手线**。
@@ -315,7 +318,7 @@ fn soft_threshold_tokens(
 #[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn Provider>,
-    system_prompt: String,
+    system_prompt: Arc<str>,
     tools: Vec<ToolDefinition>,
     tool_impls: HashMap<String, Arc<dyn Tool>>,
     tool_argument_pipeline: ToolArgumentPipeline,
@@ -428,6 +431,14 @@ pub struct Agent {
     /// 项目声明的校验命令（`verify::load_verify_cfg` 读 `.wyj-code/settings.json`）。
     /// `None` = 该项目没有声明 = **一次子进程都不跑**，这是默认值。
     verify_cfg: Option<Arc<crate::verify::VerifyCfg>>,
+    /// 本进程是否已尝试过生成会话标题。
+    ///
+    /// 标题只在首轮生成一次，`SummaryGenerator::generate_title` 内部靠
+    /// `SessionFile.title_generated` 挡住第二次 LLM 调用——但**磁盘 IO 挡不住**：
+    /// 每次调用都要 `store.load()` 重读并解析整个 session JSON，而调用点在
+    /// 每个回合收尾都会走一遍。加上这个标志后，每进程只尝试一次，
+    /// 省掉每轮一次全量 session 文件的读 + 解析。
+    title_attempted: Arc<std::sync::atomic::AtomicBool>,
     /// 运行时 `ContentBlock` 字节截断配置(由 CLI/TUI 装配时注入),作用:
     /// 在 `run_turn_with_injection_inner` 调用 `provider.stream()` 之前对
     /// `session.messages` 做与磁盘 save 路径等价的截断,避免长
@@ -529,7 +540,7 @@ impl Agent {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
         Self {
             provider,
-            system_prompt: default_system_prompt(),
+            system_prompt: Arc::from(default_system_prompt()),
             tools: vec![],
             tool_impls: HashMap::new(),
             tool_argument_pipeline: ToolArgumentPipeline::default(),
@@ -575,6 +586,7 @@ impl Agent {
             turn_user_goal: Arc::new(std::sync::Mutex::new(String::new())),
             capability_cache: None,
             verify_cfg: None,
+            title_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persist_cap: None,
             context_edit: None,
         }
@@ -657,15 +669,26 @@ impl Agent {
         self
     }
 
+    /// 设置主路由的身份信息。
+    ///
+    /// `base_url` 与 `wire_protocol` 必传：它们会被 `route_at()` 拷进
+    /// `AgentRoute`，再由 `ModelIdentity` 喂给 capability_cache 的 fingerprint
+    /// 与 `ThinkingSpec::for_vendor` 的查表。漏传的症状是「同 vendor+model 的
+    /// 不同端点互相污染能力缓存」和「Anthropic 线端点拿到 OpenAI 线的 effort
+    /// 规格」——两者都要等端点真的回 400 才暴露。
     pub fn with_route_identity(
         mut self,
         profile_name: impl Into<String>,
         vendor: impl Into<String>,
         model: impl Into<String>,
+        base_url: impl Into<String>,
+        wire_protocol: wyj_config::WireProtocol,
     ) -> Self {
         self.route_profile_name = profile_name.into();
         self.route_vendor = vendor.into();
         self.route_model = model.into();
+        self.route_base_url = base_url.into();
+        self.route_wire_protocol = wire_protocol;
         self
     }
 
@@ -691,7 +714,7 @@ impl Agent {
     }
 
     pub fn with_system(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = prompt.into();
+        self.system_prompt = Arc::from(prompt.into());
         self
     }
 
@@ -737,8 +760,13 @@ impl Agent {
     pub fn append_system(mut self, extra: impl Into<String>) -> Self {
         let e = extra.into();
         if !e.is_empty() {
-            self.system_prompt.push_str("\n\n");
-            self.system_prompt.push_str(&e);
+            // 装配期改写：此时通常独占（refcount==1），`Arc::from` 会直接
+            // 复用原缓冲，不额外拷贝。
+            let mut buffer = String::with_capacity(self.system_prompt.len() + e.len() + 2);
+            buffer.push_str(&self.system_prompt);
+            buffer.push_str("\n\n");
+            buffer.push_str(&e);
+            self.system_prompt = Arc::from(buffer);
         }
         self
     }
@@ -757,9 +785,10 @@ impl Agent {
     /// [`prompts::MAIN`]: crate::prompts::MAIN
     pub fn with_skills(mut self, skills: Vec<crate::prompts::SkillEntry>) -> Self {
         let catalog = crate::prompts::render_skill_catalog(&skills);
-        self.system_prompt = self
+        let replaced = self
             .system_prompt
             .replace(crate::prompts::SKILL_CATALOG_PLACEHOLDER, &catalog);
+        self.system_prompt = Arc::from(replaced);
         self
     }
 
@@ -815,10 +844,6 @@ impl Agent {
         self
     }
 
-    pub fn claude_md_ref(&self) -> Option<&Arc<ClaudeMdLoader>> {
-        self.claude_md.as_ref()
-    }
-
     /// 装配 Hooks 执行器（子 Agent 不调用此方法，`hook_runner` 保持 `None`）
     pub fn with_hooks(mut self, runner: Arc<HookRunner>) -> Self {
         self.hook_runner = Some(runner);
@@ -834,11 +859,17 @@ impl Agent {
         self.checkpoint_store = Some(store);
     }
 
+    /// 落一份 checkpoint。
+    ///
+    /// `messages` 是**owned** 的历史快照：`spawn_blocking` 要求 `'static`，
+    /// 且 `CheckpointStore::create` 内部还会再拷一份（落盘前的 persist cap
+    /// 截断需要可变副本）。因此调用方只在**真的要存**时才 clone——
+    /// 没有 store 时整段历史一次都不该复制。
     async fn create_checkpoint(
         &self,
         session: &mut Session,
         cwd: &std::path::Path,
-        messages: std::sync::Arc<Vec<wyj_api::types::Message>>,
+        messages: Vec<wyj_api::types::Message>,
         kind: crate::checkpoint::CheckpointKind,
         name: Option<String>,
     ) {
@@ -846,7 +877,7 @@ impl Agent {
             return;
         };
         let cwd = cwd.to_path_buf();
-        match tokio::task::spawn_blocking(move || store.create(&cwd, &messages, kind, name)).await {
+        match tokio::task::spawn_blocking(move || store.create(&cwd, messages, kind, name)).await {
             Ok(Ok(summary)) => {
                 session.current_checkpoint_id = Some(summary.id.clone());
                 self.emit_session_event(crate::SessionEvent::CheckpointChanged {
@@ -966,20 +997,6 @@ impl Agent {
                 state.upsert(definition);
             }
         }
-    }
-
-    /// 追加单个工具（用于 per-turn 动态注册，如 ExitPlanMode）
-    pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.register_tool(tool);
-        self
-    }
-
-    /// 批量注册工具
-    pub fn with_tool_impls(mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> Self {
-        for t in tools {
-            self.register_tool(t);
-        }
-        self
     }
 
     /// 仅暴露核心工具 schema；其他工具通过 ToolSearch 命中后按会话 sticky。
@@ -1404,25 +1421,44 @@ impl Agent {
         //     放在断点之后：旧实现把它 `push_str` 到 system 末尾并注释说
         //     「只增不减，前缀仍可缓存」——这是错的，追加在断点**之后**同样会
         //     改变断点处的前缀哈希，导致每命中一个新目录就整段全价重算。
-        let mut system_stable = self.system_prompt.clone();
+        // system prompt 含完整 CLAUDE.md 链（本仓库 30KB+）。它被 `Arc<str>`
+        // 共享，装配完成后不再改写——本轮**只在真的需要追加时**才复制一份，
+        // 否则直接借用（`Cow::Borrowed`），省掉每轮一次 30KB+ 的深拷贝。
         let memory_snapshot = self.memory_snapshot_text(session);
-        if !memory_snapshot.is_empty() {
-            system_stable.push_str("\n\n");
-            system_stable.push_str(&memory_snapshot);
-        }
-        if let Some(loader) = &self.claude_md {
-            if let Some(reminder) = loader.turn_reminder() {
-                system_stable.push_str("\n\n");
-                system_stable.push_str(&reminder);
+        // 读盘走 `spawn_blocking`（见 `turn_reminder_async` 的说明）：规约文件
+        // 链动辄几十 KB，每轮同步读盘会占住 async 运行时的 worker 线程。
+        let reminder = match self.claude_md.as_ref() {
+            Some(loader) => loader.turn_reminder_async().await,
+            None => None,
+        };
+        let system_stable = if memory_snapshot.is_empty() && reminder.is_none() {
+            std::borrow::Cow::Borrowed(self.system_prompt.as_ref())
+        } else {
+            let mut buffer =
+                String::with_capacity(self.system_prompt.len() + memory_snapshot.len() + 64);
+            buffer.push_str(&self.system_prompt);
+            if !memory_snapshot.is_empty() {
+                buffer.push_str("\n\n");
+                buffer.push_str(&memory_snapshot);
             }
-        }
+            if let Some(reminder) = reminder.as_deref() {
+                buffer.push_str("\n\n");
+                buffer.push_str(reminder);
+            }
+            std::borrow::Cow::Owned(buffer)
+        };
         let mut system_volatile = String::new();
 
         // 调用方在进入 run_turn 前已 push 本次真实用户消息；checkpoint 保存其
         // 之前的完整对话与当前工作树，确保 /rewind 可以回到提交前边界。
-        if !session.messages.is_empty() {
-            let previous_messages =
-                Arc::new(session.messages[..session.messages.len() - 1].to_vec());
+        //
+        // `checkpoint_store` 为 None 时**整段历史不复制**：`previous_messages`
+        // 是整段会话历史的深拷贝（每条 message + 每个 ContentBlock + 工具
+        // 输出），在长会话里这是每轮最贵的一次分配，而没有 store 时它
+        // 算完就丢。判据放在这里（而不是 `create_checkpoint` 内部）才能
+        // 真的省掉这次 clone。
+        if !session.messages.is_empty() && self.checkpoint_store.is_some() {
+            let previous_messages = session.messages[..session.messages.len() - 1].to_vec();
             self.create_checkpoint(
                 session,
                 ctx.cwd(),
@@ -1503,7 +1539,7 @@ impl Agent {
                 self.create_checkpoint(
                     session,
                     ctx.cwd(),
-                    Arc::new(session.messages.clone()),
+                    session.messages.clone(),
                     crate::checkpoint::CheckpointKind::TurnLimit,
                     Some(format!("推理轮数触顶前自动存档（{max_turns} 轮）")),
                 )
@@ -2034,7 +2070,7 @@ impl Agent {
                             }
                             if let Some((next, kind)) = self.advance_route(route_index, &error) {
                                 session.routing_events.push(crate::session::RoutingEvent {
-                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                    timestamp: crate::history::now_iso(),
                                     from_profile: route.profile_name.clone(),
                                     to_profile: next.profile_name.clone(),
                                     error_kind: kind,
@@ -2254,7 +2290,7 @@ impl Agent {
                     Err(error) => {
                         if let Some((next, kind)) = self.advance_route(route_index, &error) {
                             session.routing_events.push(crate::session::RoutingEvent {
-                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                timestamp: crate::history::now_iso(),
                                 from_profile: route.profile_name.clone(),
                                 to_profile: next.profile_name.clone(),
                                 error_kind: kind,
@@ -2545,11 +2581,19 @@ impl Agent {
                         .unwrap_or(false)
                 });
                 if has_side_effect {
-                    // PreTool 快照排除最后一条（本次工具调用的 assistant 消息），
-                    // PostTool 直接复用**整段**历史——两者只需一次深拷贝。
-                    let pre_tool_messages = Arc::new(
-                        session.messages[..session.messages.len().saturating_sub(1)].to_vec(),
-                    );
+                    // PreTool 快照排除最后一条（本次工具调用的 assistant 消息）。
+                    //
+                    // PostTool 拿的是**完整**历史（多一条 assistant 消息与本轮
+                    // tool_result），无法与本快照共享前缀——`push_user_blocks_merged`
+                    // 在多个 tool_result 时会把后一个**合并**进前一个（长度不变、
+                    // 内容变），拼增量会丢内容。因此这里仍各付一次全量深拷贝。
+                    //
+                    // 真正省掉的是 store 内部那次多余的 `to_vec()`：此前
+                    // `CheckpointStore::create` 收 `&[Message]` 再自己拷一份，
+                    // 调用方的 clone 纯属白费。现在 create 收 owned 副本，
+                    // 调用方那次 clone 就是唯一一次。
+                    let pre_tool_messages =
+                        session.messages[..session.messages.len().saturating_sub(1)].to_vec();
                     self.create_checkpoint(
                         session,
                         ctx.cwd(),
@@ -2624,7 +2668,12 @@ impl Agent {
                     session.push_tool_result(id, output, is_error);
                 }
                 if has_side_effect {
-                    let post_tool_messages = Arc::new(session.messages.clone());
+                    // PostTool 需要**完整**历史（含 assistant 消息与本轮
+                    // tool_result），不能拿 PreTool 的前缀拼增量：多个
+                    // tool_result 时 `push_user_blocks_merged` 会把后一个
+                    // **合并**进前一个创建的 User 消息（长度不变、内容变），
+                    // 那种情况下"尾部增量"是空的，拼出来的快照会丢内容。
+                    let post_tool_messages = session.messages.clone();
                     self.create_checkpoint(
                         session,
                         ctx.cwd(),
@@ -2850,18 +2899,26 @@ impl Agent {
                 // 首轮后触发后台标题生成（若已配置 SummaryGenerator 且有 session_id）
                 if let Some(gen) = self.summary.as_ref().cloned() {
                     if let Some(sid) = self.session_id.clone() {
-                        let msgs = session.messages.clone();
-                        let title_cb = self.title_cb.clone();
-                        tokio::spawn(async move {
-                            // 标题不影响正确性，只影响侧栏可读性，让它排在
-                            // 交互请求之后毫无代价。
-                            tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
-                            if let Some(title) = gen.generate_title(&sid, &msgs).await {
-                                if let Some(cb) = title_cb {
-                                    cb(title);
+                        // 每进程只尝试一次：再往后 `generate_title` 只会
+                        // `store.load()` 重读整个 session JSON 后被
+                        // `title_generated` 挡掉——纯浪费的磁盘 IO。
+                        if self
+                            .title_attempted
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            let msgs = session.messages.clone();
+                            let title_cb = self.title_cb.clone();
+                            tokio::spawn(async move {
+                                // 标题不影响正确性，只影响侧栏可读性，让它排在
+                                // 交互请求之后毫无代价。
+                                tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
+                                if let Some(title) = gen.generate_title(&sid, &msgs).await {
+                                    if let Some(cb) = title_cb {
+                                        cb(title);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
                 }
                 break;
@@ -3236,18 +3293,32 @@ impl Agent {
         use crate::compact::{compact_session, CompactPrefix};
         let route = self.route_at(self.active_route_index());
 
-        let mut system_stable = self.system_prompt.clone();
+        // `Arc` 共享：system prompt 含完整 CLAUDE.md 链（本仓库 30KB+），
+        // 每轮克隆一份是纯浪费。装配完成后它不再被改写，共享安全。
+        // 同 run_turn：无追加时零拷贝借用（见那里的说明）。
         let memory_snapshot = self.memory_snapshot_text(session);
-        if !memory_snapshot.is_empty() {
-            system_stable.push_str("\n\n");
-            system_stable.push_str(&memory_snapshot);
-        }
-        if let Some(loader) = &self.claude_md {
-            if let Some(reminder) = loader.turn_reminder() {
-                system_stable.push_str("\n\n");
-                system_stable.push_str(&reminder);
+        // 读盘走 `spawn_blocking`（见 `turn_reminder_async` 的说明）：规约文件
+        // 链动辄几十 KB，每轮同步读盘会占住 async 运行时的 worker 线程。
+        let reminder = match self.claude_md.as_ref() {
+            Some(loader) => loader.turn_reminder_async().await,
+            None => None,
+        };
+        let system_stable = if memory_snapshot.is_empty() && reminder.is_none() {
+            std::borrow::Cow::Borrowed(self.system_prompt.as_ref())
+        } else {
+            let mut buffer =
+                String::with_capacity(self.system_prompt.len() + memory_snapshot.len() + 64);
+            buffer.push_str(&self.system_prompt);
+            if !memory_snapshot.is_empty() {
+                buffer.push_str("\n\n");
+                buffer.push_str(&memory_snapshot);
             }
-        }
+            if let Some(reminder) = reminder.as_deref() {
+                buffer.push_str("\n\n");
+                buffer.push_str(reminder);
+            }
+            std::borrow::Cow::Owned(buffer)
+        };
         let (request_tools, _) = self.tools_for_request(&route);
         let snapshot = self
             .last_request_volatile
@@ -6408,11 +6479,35 @@ mod tests {
         model: &str,
         effort: &str,
     ) -> Option<Option<String>> {
+        effort_seen_by_provider_on_wire(
+            vendor,
+            model,
+            effort,
+            wyj_config::WireProtocol::OpenAiChatCompletions,
+        )
+        .await
+    }
+
+    /// `wire_protocol` 显式传入：它决定 `ThinkingSpec::for_vendor` 查哪张表，
+    /// 漏传就会退回 OpenAI 线——那正是本次修复的 bug（Anthropic 线端点拿到
+    /// OpenAI 线的 effort 档位）。
+    async fn effort_seen_by_provider_on_wire(
+        vendor: &str,
+        model: &str,
+        effort: &str,
+        wire: wyj_config::WireProtocol,
+    ) -> Option<Option<String>> {
         let seen: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
         let agent = Agent::new(Arc::new(EffortRecordingProvider {
             seen: Arc::clone(&seen),
         }))
-        .with_route_identity("test".to_string(), vendor.to_string(), model.to_string())
+        .with_route_identity(
+            "test".to_string(),
+            vendor.to_string(),
+            model.to_string(),
+            "https://example.test/v1",
+            wire,
+        )
         .with_reasoning_effort(Some(effort.to_string()));
         let mut session = Session::new();
         session.push_user("hi");
@@ -6448,6 +6543,44 @@ mod tests {
     async fn switch_only_vendor_does_not_receive_effort() {
         assert_eq!(
             effort_seen_by_provider("zhipu", "glm-4.6", "high").await,
+            Some(None)
+        );
+    }
+
+    /// 回归：`wire_protocol` 必须真的参与查表。
+    ///
+    /// 修复前 `Agent.route_wire_protocol` 恒为 `OpenAiChatCompletions`
+    /// （`with_identity` 零调用），于是 Anthropic 线的 MiniMax M3.1 Flash
+    /// 拿到的是 OpenAI 线的 spec —— 那里刻意避开了 `medium` / `xhigh`，
+    /// 于是这两个档位被静默丢弃，用户配的 effort 到不了端点。
+    ///
+    /// 同一模型换到 Anthropic 线后 `medium` 必须能发出去。
+    #[tokio::test]
+    async fn anthropic_wire_unlocks_the_vendor_specific_effort_levels() {
+        assert_eq!(
+            effort_seen_by_provider_on_wire(
+                "minimax",
+                "MiniMax-M3.1-Flash-Preview",
+                "medium",
+                wyj_config::WireProtocol::AnthropicMessages,
+            )
+            .await,
+            Some(Some("medium".to_string()))
+        );
+    }
+
+    /// 同上但走 OpenAI 线：`medium` 不在该 vendor 的档位集合里，必须不发出去。
+    /// 两条断言一起钉住「查表由 wire 决定」，而不是「MiniMax 一律认 medium」。
+    #[tokio::test]
+    async fn openai_wire_keeps_the_narrower_effort_levels() {
+        assert_eq!(
+            effort_seen_by_provider_on_wire(
+                "minimax",
+                "MiniMax-M3.1-Flash-Preview",
+                "medium",
+                wyj_config::WireProtocol::OpenAiChatCompletions,
+            )
+            .await,
             Some(None)
         );
     }
@@ -6494,6 +6627,8 @@ mod tests {
             "deepseek".to_string(),
             "deepseek".to_string(),
             "deepseek-v4-pro".to_string(),
+            "https://deepseek.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
         )
         .with_reasoning_effort(Some("high".to_string()))
         .with_thinking_switch(Some("enabled".to_string()));
@@ -6542,6 +6677,8 @@ mod tests {
             "backup",
             "minimax",
             "backup-model",
+            "https://backup.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
             Arc::new(CountingEndTurnProvider {
                 calls: backup_calls.clone(),
             }),
@@ -6550,7 +6687,13 @@ mod tests {
             kind: wyj_api::ProviderErrorKind::RateLimited,
             calls: primary_calls.clone(),
         }))
-        .with_route_identity("primary", "minimax", "primary-model")
+        .with_route_identity(
+            "primary",
+            "minimax",
+            "primary-model",
+            "https://primary.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
+        )
         .with_fallback_routes(vec![backup], false);
         let mut session = Session::new();
         session.push_user("hi");
@@ -6578,6 +6721,8 @@ mod tests {
             "backup",
             "minimax",
             "backup-model",
+            "https://backup.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
             Arc::new(CountingEndTurnProvider {
                 calls: backup_calls.clone(),
             }),
@@ -6586,7 +6731,13 @@ mod tests {
             kind: wyj_api::ProviderErrorKind::Authentication,
             calls: Arc::new(AtomicUsize::new(0)),
         }))
-        .with_route_identity("primary", "minimax", "primary-model")
+        .with_route_identity(
+            "primary",
+            "minimax",
+            "primary-model",
+            "https://primary.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
+        )
         .with_fallback_routes(vec![backup], false);
         let mut session = Session::new();
         session.push_user("hi");
@@ -6605,10 +6756,18 @@ mod tests {
             "backup",
             "another-vendor",
             "backup-model",
+            "https://backup.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
             Arc::new(EndTurnProvider),
         );
         let agent = Agent::new(Arc::new(EndTurnProvider))
-            .with_route_identity("primary", "minimax", "primary-model")
+            .with_route_identity(
+                "primary",
+                "minimax",
+                "primary-model",
+                "https://primary.test/v1",
+                wyj_config::WireProtocol::OpenAiChatCompletions,
+            )
             .with_fallback_routes(vec![backup], false);
         assert!(agent.fallback_routes.is_empty());
     }

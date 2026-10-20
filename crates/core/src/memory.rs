@@ -498,13 +498,19 @@ fn messages_to_text(messages: &[Message]) -> String {
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(truncate_chars(text, 500)),
+                    ContentBlock::Text { text } => {
+                        Some(crate::textutil::truncate_chars(text, 500, true))
+                    }
                     ContentBlock::ToolUse { name, .. } => Some(format!("[调用: {name}]")),
                     ContentBlock::ToolResult { content, .. } => match content {
-                        ToolResultContent::Text(t) => Some(truncate_chars(t, 200)),
-                        ToolResultContent::Parts(_) => {
-                            Some(truncate_chars(&content.display_text(), 200))
+                        ToolResultContent::Text(t) => {
+                            Some(crate::textutil::truncate_chars(t, 200, true))
                         }
+                        ToolResultContent::Parts(_) => Some(crate::textutil::truncate_chars(
+                            &content.display_text(),
+                            200,
+                            true,
+                        )),
                         ToolResultContent::Blocks(_) => None,
                     },
                     ContentBlock::Image { .. } => None,
@@ -590,26 +596,9 @@ fn frontmatter_field(content: &str, field: &str) -> Option<String> {
     None
 }
 
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-        format!("{}…", &s[..end])
-    }
-}
-
-/// 返回不超过 `max_bytes` 的 UTF-8 前缀，保证不在多字节字符中间截断。
-fn truncate_utf8_to_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
+// 截断统一走 `crate::textutil::truncate_str`（全仓唯一实现）：此处曾带一份
+// 逐行相同的手写副本。
+use crate::textutil::truncate_str as truncate_utf8_to_bytes;
 
 #[cfg(test)]
 mod tests {

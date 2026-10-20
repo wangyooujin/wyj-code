@@ -590,7 +590,7 @@ impl MemoryV3Store {
             None
         };
 
-        let now = now_iso();
+        let now = now_rfc3339();
         let id = format!("mem_{}", Uuid::new_v4().simple());
         if let Some(old_id) = &supersedes {
             if let Some(old) = records.iter_mut().find(|record| &record.id == old_id) {
@@ -1051,7 +1051,7 @@ impl MemoryV3Store {
             anyhow::bail!("只能 confirm 处于 Pending 状态的 Global 候选: {id}");
         }
         record.status = MemoryClaimStatus::Active;
-        record.updated_at = now_iso();
+        record.updated_at = now_rfc3339();
         let updated = record.clone();
         crate::serialize::write_json_atomic(&path, &records)?;
         self.append_audit_locked(
@@ -1092,12 +1092,12 @@ impl MemoryV3Store {
             blocked_reason: record.blocked_reason.clone(),
         });
         record.status = MemoryClaimStatus::Rejected;
-        record.updated_at = now_iso();
+        record.updated_at = now_rfc3339();
         let updated = record.clone();
         crate::serialize::write_json_atomic(&path, &records)?;
 
         let mut history = load_rejected_history(&self.rejected_history_path())?;
-        let now = now_iso();
+        let now = now_rfc3339();
         if let Some(existing) = history
             .entries
             .iter_mut()
@@ -1142,13 +1142,13 @@ impl MemoryV3Store {
             };
             let old_id = records[index].supersedes.clone();
             records[index].status = MemoryClaimStatus::Rejected;
-            records[index].updated_at = now_iso();
+            records[index].updated_at = now_rfc3339();
             if let Some(old_id) = old_id {
                 if let Some(old) = records.iter_mut().find(|record| record.id == old_id) {
                     if old.superseded_by.as_deref() == Some(id) {
                         old.status = MemoryClaimStatus::Active;
                         old.superseded_by = None;
-                        old.updated_at = now_iso();
+                        old.updated_at = now_rfc3339();
                     }
                 }
             }
@@ -1214,7 +1214,7 @@ impl MemoryV3Store {
         }) {
             return Ok(None);
         }
-        let now = now_iso();
+        let now = now_rfc3339();
         let id = format!("job_{}", Uuid::new_v4().simple());
         jobs.push(MemoryJob {
             id: id.clone(),
@@ -1405,7 +1405,7 @@ impl MemoryV3Store {
         for job in &mut jobs {
             if job.status == MemoryJobStatus::Running {
                 job.status = MemoryJobStatus::Pending;
-                job.updated_at = now_iso();
+                job.updated_at = now_rfc3339();
                 changed = true;
             }
         }
@@ -1426,7 +1426,7 @@ impl MemoryV3Store {
         };
         job.status = MemoryJobStatus::Running;
         job.attempts = job.attempts.saturating_add(1);
-        job.updated_at = now_iso();
+        job.updated_at = now_rfc3339();
         let claimed = job.clone();
         crate::serialize::write_json_atomic(&self.jobs_path(), &jobs)?;
         Ok(Some(claimed))
@@ -1450,7 +1450,7 @@ impl MemoryV3Store {
             job.status = MemoryJobStatus::Completed;
             job.last_error = None;
         }
-        job.updated_at = now_iso();
+        job.updated_at = now_rfc3339();
         crate::serialize::write_json_atomic(&self.jobs_path(), &jobs)
     }
 
@@ -1534,7 +1534,7 @@ impl MemoryV3Store {
             id: format!("audit_{}", Uuid::new_v4().simple()),
             action: action.to_string(),
             record_id: record_id.to_string(),
-            at: now_iso(),
+            at: now_rfc3339(),
             detail: redact_sensitive_text(detail),
         });
         crate::serialize::write_json_atomic(&self.audit_path(), &events)
@@ -1551,7 +1551,7 @@ impl MemoryV3Store {
             self.project_root.display(),
             self.project_key,
             pending_count,
-            now_iso()
+            now_rfc3339()
         );
         let mut records = records;
         records.sort_by(|a, b| {
@@ -1602,7 +1602,7 @@ impl MemoryV3Store {
         self.worker_running.store(false, Ordering::Relaxed);
 
         // 用 RFC3339-friendly 时间戳（冒号不能出现在文件名里），与 plan 一致。
-        let ts = now_iso().replace(':', "").replace('+', "p");
+        let ts = now_rfc3339().replace(':', "").replace('+', "p");
         let backup_dir = self
             .base_dir
             .join("backups")
@@ -1665,7 +1665,7 @@ impl MemoryV3Store {
 
         // 写 reset marker。
         let marker = ResetMarker {
-            reset_at: now_iso(),
+            reset_at: now_rfc3339(),
             schema_version: MEMORY_V3_SCHEMA_VERSION,
         };
         let marker_path = self.base_dir.join("reset_marker.json");
@@ -1687,7 +1687,7 @@ impl MemoryV3Store {
             reset_marker: marker_path,
             moved_files,
             rejected_history_preserved,
-            cleared_at: now_iso(),
+            cleared_at: now_rfc3339(),
         })
     }
 }
@@ -1999,7 +1999,12 @@ fn parse_timestamp(value: &str) -> Result<DateTime<chrono::FixedOffset>> {
     Ok(DateTime::parse_from_rfc3339(value)?)
 }
 
-fn now_iso() -> String {
+/// 纳秒精度、带时区偏移的 RFC3339 时间戳。
+///
+/// 与 `crate::history::now_iso()`（秒级、无偏移）**格式不同**：本模块的
+/// 时间字段会经 `parse_timestamp` 走 `DateTime::parse_from_rfc3339` 解析，
+/// 且需要在同一秒内区分多条记录，因此必须保留纳秒精度。
+fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
 }
 
@@ -2126,19 +2131,22 @@ fn messages_to_evidence_text(messages: &[Message]) -> String {
                 .content
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(truncate_chars(text, 2_000)),
+                    ContentBlock::Text { text } => {
+                        Some(crate::textutil::truncate_chars(text, 2_000, true))
+                    }
                     ContentBlock::ToolUse { name, input, .. } => Some(format!(
                         "[tool_use {name}: {}]",
-                        truncate_chars(&input.to_string(), 600)
+                        crate::textutil::truncate_chars(&input.to_string(), 600, true)
                     )),
                     ContentBlock::ToolResult { content, .. } => Some(format!(
                         "[tool_result: {}]",
-                        truncate_chars(
+                        crate::textutil::truncate_chars(
                             &match content {
                                 ToolResultContent::Text(text) => text.clone(),
                                 _ => content.display_text(),
                             },
-                            1_000
+                            1_000,
+                            true
                         )
                     )),
                     ContentBlock::Image { .. } => Some("[image evidence attached]".to_string()),
@@ -2150,18 +2158,6 @@ fn messages_to_evidence_text(messages: &[Message]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let end = value
-        .char_indices()
-        .nth(limit)
-        .map(|(index, _)| index)
-        .unwrap_or(value.len());
-    format!("{}…", &value[..end])
 }
 
 fn stable_text_hash(text: &str) -> u64 {

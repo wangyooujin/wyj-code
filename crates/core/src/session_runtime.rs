@@ -1,7 +1,7 @@
 //! Frontend-neutral session actor used by daemon and ACP adapters.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{bail, Result};
 use tokio::sync::{broadcast, oneshot};
@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use wyj_api::types::ContentBlock;
 
 use crate::tool::ToolContext;
-use crate::{Agent, Session, SessionControl, SessionEvent, SessionEventEnvelope};
+use crate::{Agent, Session, SessionEvent, SessionEventEnvelope};
 
 #[derive(Clone)]
 pub struct SessionEventEmitter {
@@ -51,8 +51,6 @@ pub struct TurnOutcome {
     pub error: Option<String>,
 }
 
-type ControlHandler = Arc<dyn Fn(&SessionControl) -> Result<()> + Send + Sync>;
-
 pub struct AgentSessionRuntime {
     session_id: String,
     agent: Agent,
@@ -60,7 +58,6 @@ pub struct AgentSessionRuntime {
     session: tokio::sync::Mutex<Session>,
     emitter: SessionEventEmitter,
     running: Mutex<Option<JoinHandle<()>>>,
-    control_handler: RwLock<Option<ControlHandler>>,
 }
 
 impl AgentSessionRuntime {
@@ -83,7 +80,6 @@ impl AgentSessionRuntime {
             session: tokio::sync::Mutex::new(session),
             emitter,
             running: Mutex::new(None),
-            control_handler: RwLock::new(None),
         })
     }
 
@@ -97,13 +93,6 @@ impl AgentSessionRuntime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEventEnvelope> {
         self.emitter.subscribe()
-    }
-
-    pub fn set_control_handler(
-        &self,
-        handler: impl Fn(&SessionControl) -> Result<()> + Send + Sync + 'static,
-    ) {
-        *self.control_handler.write().unwrap() = Some(Arc::new(handler));
     }
 
     pub fn submit_text(self: &Arc<Self>, text: String) -> Result<oneshot::Receiver<TurnOutcome>> {
@@ -165,26 +154,6 @@ impl AgentSessionRuntime {
         }
         *self.session.lock().await = session;
         Ok(())
-    }
-
-    pub fn control(
-        self: &Arc<Self>,
-        control: SessionControl,
-    ) -> Result<Option<oneshot::Receiver<TurnOutcome>>> {
-        match control {
-            SessionControl::Submit { text } => self.submit_text(text).map(Some),
-            SessionControl::Interrupt | SessionControl::Close => {
-                self.interrupt();
-                Ok(None)
-            }
-            other => {
-                let handler = self.control_handler.read().unwrap().clone();
-                match handler {
-                    Some(handler) => handler(&other).map(|_| None),
-                    None => bail!("session control is not supported by this frontend: {other:?}"),
-                }
-            }
-        }
     }
 
     pub async fn session_snapshot(&self) -> Session {

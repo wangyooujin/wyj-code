@@ -76,8 +76,12 @@ pub enum ScheduleCommand {
         id: String,
         #[arg(long, value_delimiter = ',')]
         allowed_tools: Vec<String>,
-        #[arg(long)]
-        enable: bool,
+        /// 启用/禁用任务。不给则**保持当前状态不变**。
+        ///
+        /// 此前是 `SetTrue` 布尔（缺省 false），不带该参数反而把任务禁用
+        /// ——「只复核权限」这个最自然的用法变成了「顺手禁用」。
+        #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        enable: Option<bool>,
         #[arg(long)]
         json: bool,
     },
@@ -88,14 +92,7 @@ pub enum ScheduleCommand {
     },
     /// Execute one task immediately. This is the command the system crontab
     /// actually invokes; not meant for interactive use.
-    Run {
-        id: String,
-        /// Retained for CLI compatibility with v0.2.5 prereleases. Foreground
-        /// computer-use is now fail-closed in every headless/scheduled run,
-        /// while background app_computer may safely run alongside the user.
-        #[arg(long)]
-        manual: bool,
-    },
+    Run { id: String },
 }
 
 pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
@@ -205,7 +202,7 @@ pub async fn run(command: ScheduleCommand, cwd: &Path) -> Result<()> {
                 );
             }
         }
-        ScheduleCommand::Run { id, manual } => run_task(&id, manual).await?,
+        ScheduleCommand::Run { id } => run_task(&id).await?,
     }
     Ok(())
 }
@@ -238,7 +235,7 @@ fn sync_and_warn() -> Result<()> {
     Ok(())
 }
 
-async fn run_task(id: &str, _manual: bool) -> Result<()> {
+async fn run_task(id: &str) -> Result<()> {
     // schedule 子进程可能被系统 crontab 直接唤起，绕过 main.rs 的 init 路径。
     // init 是幂等的（OnceLock first-wins），所以重复调用安全。
     notify_emit_init_default_if_needed();

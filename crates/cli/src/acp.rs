@@ -617,7 +617,7 @@ async fn rewind_session(
     let mut current = entry.runtime.session_snapshot().await;
     let protection = checkpoints.create(
         &entry.cwd,
-        &current.messages,
+        current.messages.clone(),
         CheckpointKind::PreRewind,
         Some(format!("before ACP rewind {checkpoint_id}")),
     )?;
@@ -691,7 +691,7 @@ async fn branch_session(
         let current = entry.runtime.session_snapshot().await;
         checkpoints.create(
             &entry.cwd,
-            &current.messages,
+            current.messages.clone(),
             CheckpointKind::PreRewind,
             Some(format!("before ACP branch restore {checkpoint_id}")),
         )?;
@@ -1733,7 +1733,7 @@ mod tests {
         let checkpoint = checkpoints
             .create(
                 cwd.path(),
-                &[Message::user("before")],
+                vec![Message::user("before")],
                 CheckpointKind::Manual,
                 Some("before".to_string()),
             )

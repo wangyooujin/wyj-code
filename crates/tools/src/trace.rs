@@ -205,27 +205,30 @@ impl TraceWriter {
                 if over_limit.contains(&id) {
                     continue;
                 }
-                let Ok(mut line) = serde_json::to_string(&TraceRecord {
+                let Ok(line) = serde_json::to_string(&TraceRecord {
                     pid: std::process::id(),
                     event: ev,
                 }) else {
                     continue;
                 };
-                line = wyj_core::redact_sensitive_text(&line);
-                line.push('\n');
+                // 借用版脱敏：没有 secret 形态时 `Cow::Borrowed`，直接写原串
+                // 字节即可，不必先复制出一份完整副本（工具输出动辄几十 KB）。
+                let redacted = wyj_core::redact_cow(&line);
+                let line_len = redacted.len() as u64 + 1; // 加上行尾 '\n'
                 let used = written_bytes.entry(id).or_insert(0);
-                if *used + line.len() as u64 > max_bytes_per_agent {
+                if *used + line_len > max_bytes_per_agent {
                     over_limit.insert(id);
                     continue;
                 }
-                *used += line.len() as u64;
+                *used += line_len;
                 let path = dir.join(format!("a{id}.jsonl"));
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&path)
                 {
-                    let _ = f.write_all(line.as_bytes());
+                    let _ = f.write_all(redacted.as_bytes());
+                    let _ = f.write_all(b"\n");
                 }
             }
         });

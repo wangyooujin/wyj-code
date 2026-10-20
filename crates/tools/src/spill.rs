@@ -73,8 +73,9 @@ fn write_spill(label: &str, text: &str) -> Option<PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    file.write_all(wyj_core::redact_sensitive_text(text).as_bytes())
-        .ok()?;
+    // 借用版脱敏：没有 secret 形态时 `Cow::Borrowed`，直接写原串的字节，
+    // 不必先复制出一份完整副本（溢出内容动辄几百 KB）。
+    file.write_all(wyj_core::redact_cow(text).as_bytes()).ok()?;
     Some(path)
 }
 
