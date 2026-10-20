@@ -10,6 +10,213 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.13] - 2026-10-20
+
+### 权限底线被绕过、状态跨会话串味、模型把预算全花在思考上
+
+本版三条主线：**权限强制层下沉**（此前「本轮已授权」能整段绕过禁止层）、
+**跨会话状态隔离**（daemon/ACP 多会话共享回合级可变状态）、以及**回合收尾
+不再静默**（输出预算被 reasoning 吃满时不再「跑几轮就停住、什么都不说」）。
+附带一次模型分层（辅助模型）、一次全仓死代码审计，以及两个 god object 的拆分。
+
+### ① P0：`hard_deny` 可被「本轮已授权」整段绕过
+
+`hard_deny` 此前只挂在 `AutoGate::review`，而 `ensure_tool_permission` 的
+`turn_granted` 短路会**跳过 review**。Bash 的本轮授权键是裸工具名，于是同一
+回合里跑过任意一条 `git log` 之后，`git reset --hard` / `curl x | bash` /
+`git push --force` 全部**零拦截**执行——而 `curl|bash` 恰恰是 `hard_deny`
+明文禁止的那一条。
+
+- 判定下沉到 `PermissionPolicy::evaluate`，**排在模式分派之前**，且不读任何
+  授权状态：授权只能免除「问人」，不能免除「禁止」
+- 新增 `ToolContext::denial_reason()`，拒绝理由回灌模型时区分「换个模式就行」
+  与「这条命令永远不行」
+- Bypass（AutoApprove）不再放行 `hard_deny`：免的是「询问」，不是「禁止」
+
+钉子：`permission::tests::hard_deny_is_enforced_regardless_of_grants_and_mode`、
+`ctx::tests::hard_deny_survives_turn_grants_and_returns_a_specific_reason`。
+
+### ② P0：凭据保护只覆盖 Read/Write，Grep/Glob 完全敞开
+
+v0.3.12 给 `Read` 加了 `check_read_target`，但 `Grep`/`Glob`/`CodeSearch`
+**遍历整棵树**、显式 `--hidden`、`needs_permission` 走 trait 默认 `false`——一条
+`Grep(pattern: "PRIVATE KEY", path: "~")` 就能把 `~/.ssh/id_rsa` 读进上下文
+再随会话落盘。绕过的不是「检查写得不全」，是**检查根本没挂在这条路上**。
+
+- 分两层：**根校验** `check_search_root()`（根本身落在受保护子树里直接拒绝，
+  避免白跑一趟后把「未找到」当结论）+ **遍历过滤**（`WalkBuilder::filter_entry` /
+  rg 的 `-g '!**/.ssh/**'`，挡住「根是家目录、凭据在下面」这一形态）
+- Read / Write / Grep / Glob / CodeSearch / Bash 六条路径共用
+  `permission::PROTECTED_DIR_NAMES` 同一张表
+- `CodeSearch` 额外在 `index_file()` 里再挡一次——`invalidate()` 走单文件增量
+  重建、不经过遍历器，而索引是**持久化**的
+- `auto_rules::references_protected_dir()` 改为按**路径组件**判定，补上
+  `cat ~/.ssh` 这类不带尾斜杠的缺口（此前 needle 带尾斜杠，整片漏过）
+
+钉子：`grep::tests::protected_dirs_are_never_searched_by_either_backend`（rg
+与 native 两条后端都要过）、`auto_rules::tests::credential_dirs_are_blocked_even_without_trailing_slash`。
+
+### ③ P0：daemon/ACP 多会话共享回合级可变状态
+
+`Agent: Clone` 是**浅拷贝**，而 `create_session` 直接 clone 模板——授权集 /
+死循环窗口 / 记忆快照 / volatile 前缀 / 标题标志 / fallback 下标全部**跨会话
+串味**：A 会话批准过的工具，在 B 会话里也放行。
+
+- 新增 `Agent::fork_for_new_session()` 跨会话派生并重置全部回合级状态；
+  `Clone` 保持原语义（同一会话内重建要继承）
+
+### ④ 输出预算被 reasoning 吃满 → 回合静默停住
+
+长会话「跑几轮后突然停住、没有任何提示」的根因是收尾判据**把 thinking 当成了
+可见输出**：旧判据 `assistant_blocks.is_empty()` 在纯 thinking 回复下为 false，
+于是 `stop_reason == MaxTokens` 时循环直接 `break` → `TurnFinished` → `Ok(())`。
+用户侧只看到「停住了」，没有原因、没有解法。
+
+现在按**可见输出**（非空白 Text 或 ToolUse）判定，并分成三条路径：
+
+- 撞 `MaxTokens` 且无可见输出 → **丢弃本条回复**（不 push 进历史，否则下一轮
+  揣着空 signature 的 thinking 在同样预算上继续撞线），放大 `max_tokens`
+  （受 `capabilities.max_output_tokens` 封顶）并降一档 reasoning effort 后
+  **重试一次**。重试标志声明在回合循环**之外**——放里面会被重置成无限重试
+- 重试后仍只有 thinking → 丢弃并输出 `agent.output_without_visible_content`，
+  带原因与调参建议
+- 有正文但撞 `MaxTokens` → 不重试，输出 `agent.output_truncated` 说明正文被
+  硬切断
+
+降档按 vendor 的 `effort_levels` 表取前一档，**不走** `max→high→medium→low`
+的字符串阶梯：Moonshot k3 只有 low/high/max，硬阶梯会落到端点不认的 medium 上
+被 adapter 静默丢弃，等于降档从未发生。
+
+钉子：`truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history`、
+`persistent_truncation_is_reported_instead_of_ending_silently`、
+`thinking_only_end_turn_is_reported_without_retry`、
+`visible_output_hitting_max_tokens_is_reported_but_not_retried`。
+
+### ⑤ 分组级辅助模型 `aux_model`：把低风险辅助调用切到小模型
+
+主会话缓存命中率实测 87%，无差别换模型会击穿这个优势；但会话标题生成、跨会话
+记忆提取这类「短提示词 + 独立 system prompt + 不复用主对话前缀」的调用，换模型
+对主缓存零影响——这部分是纯浪费。
+
+- `Profile` 新增 `aux_model`（`Option<String>`，与 `plan_model`/`exec_model`
+  同型）：留空 = 辅助调用也用主模型，**默认行为零变化**
+- `Agent` 新增 `aux_provider`；记忆提取（v2 与 v3）改走
+  `aux_provider_or_route()`，未配辅助模型时回退 active route（保留既有
+  fallback 语义）；构建失败告警并退回主 provider，不中断启动
+- 顺带修掉 `/cost` 的一处计价错位：`PRICES` 的子串匹配会让
+  `MiniMax-M3.1-Flash-Preview` 被 `minimax-m3` 抢先命中、算成贵一倍的价；
+  缓存读取倍率改为按模型条目携带（M3 是 0.2x，此前写死 0.1x 把 M3 的缓存
+  费用少算了一半）
+
+四条硬边界：① **上下文压缩绝不用辅助模型**——压缩逐字节复用主对话
+system+tools 前缀来命中 prompt cache，换模型等于缓存归零、整段历史全价重发
+（钉子 `compaction_never_uses_the_auxiliary_provider`）；② 两个辅助调用各自用
+独立短 system prompt，不打穿主会话缓存；③ 必须同 vendor 同端点同 Key——辅助
+调用会收到对话内容片段，跨供应商等于把内容发给另一家服务商；④ 辅助调用失败
+不牵连主流程（标题静默跳过、记忆 debug 吞掉、构建失败回退）。
+
+### ⑥ 全仓死代码审计：两个被死代码掩盖的活 bug
+
+Rust 的 `dead_code` lint 对 `pub` 项不生效，**clippy 零警告 ≠ 没有死代码**。
+按「提取全仓 pub 符号 → `rg -w` 统计 token 次数 → 计数 == 1 即只出现在定义处
+→ 人工排除 serde 派生 / trait 实现 / `cfg(test)`」全量扫描，复扫后「仅出现 1 次
+的 pub 符号」归零（fn 层与类型层）。
+
+两个被死代码掩盖的**活 bug**：
+
+- `AgentRoute` 的 `base_url` / `wire_protocol` **永不赋值**。`AgentRoute::new`
+  硬编码空串 + `OpenAiChatCompletions`，唯一的覆盖入口 `with_identity` 零调用。
+  后果一：`capability_cache` 的 fingerprint 把 `base_url` 计入哈希，同
+  vendor+model 的**不同端点共用同一份 cache 文件**，一个端点的 4xx 拒绝记录会
+  连带禁掉另一个端点的参数。后果二：`ThinkingSpec::for_vendor` 的第一个判别量
+  就是 wire，**Anthropic 线的 MiniMax 端点拿到 OpenAI 线 spec**，effort 档位被
+  错误裁剪。修法是**接线**不是删代码：`base_url` + `wire_protocol` 改为必传
+  参数（漏接线在编译期暴露），删掉 `with_identity`，在 `cli/main.rs` 三处接线
+- plugin 的 `.git` **从不 gc**。`set_plugin_storage_cfg` 全仓零调用，
+  `PLUGIN_STORAGE_CFG` 恒为 `None`，`maybe_run_git_gc` 第一行就 return，插件
+  仓库的 reflog / object pack 永久累积。装配阶段真正注入 storage 配置
+
+一批**静默失效**的 CLI 参数一并修掉（此前不报错、不警告，用户只看到「参数写了
+没反应」）：
+
+- `--allowed-tools` / `--allow-plan-write` 在 TUI 默认入口**完全不生效**——CLI
+  只写进自己那份 `ToolCtx`，TUI 自建 ctx、自算权限模式。新增
+  `tui::PermissionConstraints` 全链路传递；`switch_mode` 重算时重新施加约束，
+  否则**按一下 Shift+Tab 就绕过了自己给的限制**
+- `--profile` 对所有立即 return 的子命令不生效（应用点在子命令分发之后）；
+  校验与应用一并前移
+- `--plugin-dir` 对不加载 MCP 与 skills 的子命令静默忽略 → 改为明确报错
+- `schedule run --manual` 值传入形参 `_manual`，零效果 → 删参数
+- `schedule review` 的 `--enable` 缺省 false，**不带该参数反而把任务禁用** →
+  改 `Option<bool>`，缺省保持原状态
+- `storage prune` / `doctor` 是 TODO 桩，参数被解析后原样丢弃 → prune 真正接
+  checkpoint retention 与 CAS gc，doctor 真正检查损坏 session / orphan CAS
+  blob / 损坏 manifest
+
+重复实现收敛：字节安全截断原有 5 份手写（serialize / memory / claude_md /
+tools 各带一份），收敛到 `core::textutil`；尾部边界必须**向上取整**（ceil），
+用 floor 会超出预算最多 3 字节——`verify::clip_output` 正是这么错的，一并修。
+`truncate_chars` 原有 5 份同名两种语义，统一为带 ellipsis 开关的单一实现；
+三个同名 `now_iso` 实为三种格式，按语义改名区分。CLI 与 TUI 的 Plan 白名单
+此前各写一份且**已经漂移**（CLI 有 Memory 无 TodoWrite，TUI 反之），统一到
+`core::permission::PLAN_ALLOWED_TOOLS`。
+
+性能：checkpoint_store 为 None 时仍每轮深拷贝整段历史（判据前移）；
+`CheckpointStore::create` 收 `&[Message]` 再内部 `to_vec`，深拷贝从两次降为
+一次；system_prompt 每轮克隆一份 30KB+ 的 CLAUDE.md 链（改 `Arc<str>` + `Cow`，
+无追加时零拷贝借用）；`ClaudeMdLoader::turn_reminder` 在 async 上下文同步读盘
+（新增 `turn_reminder_async` 走 `spawn_blocking`）；标题生成每轮 `store.load()`
+重读并解析整个 session JSON（加 `title_attempted` 标志，每进程只试一次）。
+
+顺带修掉一条「优化写在永不生效的路径上」：`redact_cow` 的 Cow 优化此前六个
+落盘调用点全用会拷贝的 `redact_sensitive_text`。
+
+### ⑦ 两个 god object 拆分：`agent.rs` 与 `app.rs`
+
+- `crates/core/src/agent.rs` 7859 → 3507 行：不碰 `self` 的纯辅助函数迁至
+  `agent/helpers.rs`，测试整体迁至 `agent/tests.rs`；`run_tool` /
+  `append_hook_feedback` / `touched_dir` 留在主文件——它们与「本回合已授权」
+  「本回合触达的目录」等回合级状态耦合，搬走会制造第二份真相
+- `crates/tui/src/app.rs` 22612 → 11559 行，按「一个命令一个文件」拆出 13 个
+  子模块：events（Agent 事件 → UI 状态）、profile / skills / schedule / mcp /
+  plugins 五个面板、dialogs、settings_dialogs、clipboard、tool_view、terminal、
+  menu、agents_panel、util
+- `apply_agent_event` 单独成文件：它是 `tui_main` 之外最长的单个函数，只写状态
+  不排版
+- `theme_tests` 补登记 `app/` 下全部 16 个子模块：此前拆走的绘制代码一直**不在
+  配色守卫内**
+
+纯物理搬移，逻辑零改动。
+
+### ⑧ Memory v2 收敛为 v3 的降级路径，不再并存构造
+
+三套记忆（v2 / v3 / evolution）长期并存，其中 **v2 在 v3 存在时是死代码**：Agent
+的注入与提取都是 `memory_v3 → evolution → memory(v2)` 的 if-else 链，v3 一旦
+装上，v2 那段一行都不会执行。但它此前仍**无条件构造**——每次启动 `create_dir_all`
+一个目录、`/memory` 面板的开关还要同时写它，白付一份磁盘 IO 与一处永远没有
+读者的状态。
+
+- CLI 装配改为「v3 没建成才构造 v2」。保留 v2 的唯一理由是 v3 构造失败（磁盘
+  不可写、jobs.json 损坏）时不能连记忆能力一起消失；此时它是有意义的兜底，语义
+  从「并存的第二套实现」变成「**降级路径**」
+- 新增钉子 `memory_injection_prefers_v3_then_evolution_then_v2`：钉住 if-else 链
+  的顺序（改成叠加或调换顺序不会有任何编译错误提示）
+
+evolution 未动：它与 v3 是互补分工（Episode 记录 + 治理分析），不是重复实现。
+
+### ⑨ 顺带修掉的几处
+
+- `Write`/`Edit` 改**原子写**（tmp + rename，保留原权限位），修 ESC 中断留下
+  截断源码
+- `SessionStore::save_async()` 把阻塞 IO + 最长 30s 文件锁挪出 tokio worker；
+  TUI autosave 改 fire-and-forget 并加静态钉子
+- `MessageLogWriter` 无界队列改有界（256），满了丢弃并节流告警
+
+### ⑩ 测试与静态检查
+
+`cargo test --workspace` **1715 项通过 / 0 失败**（1673 → 1715），
+`cargo fmt --check` 通过，`cargo clippy --workspace --all-targets` 无新增告警。
+
 ## [0.3.12] - 2026-10-19
 
 ### 凭据读得到、hooks 无门控、Agent 装配有两份
