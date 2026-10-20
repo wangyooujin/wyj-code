@@ -228,8 +228,8 @@
 <section id="websearch" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06] scroll-mt-20">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="websearch.kicker">Built-in Web Search</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="websearch.title">内置网页搜索 WebSearch</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="websearch.desc">模型的知识有截止日期，你的代码库没有。WebSearch 让它在动手之前先去查「现在这个 API 到底怎么用」「这个 CVE 影响哪些版本」「最新版有没有 breaking change」——查完再动手，而不是拿训练时的记忆硬写。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="websearch.docs.title">内置网页搜索 WebSearch</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="websearch.docs.desc">模型的知识有截止日期，你的代码库没有。WebSearch 让它在动手之前先去查「现在这个 API 到底怎么用」「这个 CVE 影响哪些版本」「最新版有没有 breaking change」——查完再动手，而不是拿训练时的记忆硬写。</p>
     <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="websearch.desc2">它是<strong>内置</strong>的：不是需要自己起的 MCP server，不是让模型自己拼 curl 的 shell 命令，而是和 Read / Grep / WebFetch 并列的一个正式工具。配一个搜索服务的 API Key，模型立刻就多出一双能看世界的眼睛。</p>
   </div>
 
@@ -344,7 +344,7 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
     <div class="reveal" style="transition-delay:40ms">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.services">服务层 · Services</p>
       <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tools <span class="text-paper/30">· wyj-tools</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tools">Read/Write/Edit/Bash/Glob/Grep/WebFetch/TodoWrite 等工具实现</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/tools <span class="text-paper/30">· wyj-tools</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.tools">Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/TodoWrite 等工具实现</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/computer <span class="text-paper/30">· wyj-computer</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.computer">Computer-use 系统层：截图 + 鼠标键盘输入合成，坐标缩放数学独立可测</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/commands <span class="text-paper/30">· wyj-commands</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.commands">Slash 命令注册表与内置命令（/help、/compact 等）</p></div>
         <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/mcp <span class="text-paper/30">· wyj-mcp</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.mcp">MCP 客户端桥接（stdio / http 传输）</p></div>
