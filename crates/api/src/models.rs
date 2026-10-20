@@ -47,12 +47,18 @@ pub fn known_model_capacity(model: &str) -> Option<ModelCapacity> {
         ("claude-3-5", ModelCapacity::new(200_000, 8_192)),
         ("claude-3", ModelCapacity::new(200_000, 4_096)),
         // ── OpenAI ──
+        // gpt-5 系是 reasoning 模型：输出预算**同时覆盖 reasoning tokens**，
+        // 因此这里给的是端点允许的最大完成量（Chat Completions 的
+        // `max_completion_tokens` 语义），不是"可见文本上限"。
+        ("gpt-5.1", ModelCapacity::new(400_000, 128_000)),
+        ("gpt-5", ModelCapacity::new(400_000, 128_000)),
         ("gpt-4.1", ModelCapacity::new(1_047_576, 32_768)),
         ("gpt-4o", ModelCapacity::new(128_000, 16_384)),
         ("gpt-4-turbo", ModelCapacity::new(128_000, 4_096)),
         ("gpt-3.5", ModelCapacity::new(16_385, 4_096)),
-        ("o1", ModelCapacity::new(200_000, 32_768)),
-        ("o3", ModelCapacity::new(200_000, 32_768)),
+        ("o4-mini", ModelCapacity::new(200_000, 100_000)),
+        ("o3", ModelCapacity::new(200_000, 100_000)),
+        ("o1", ModelCapacity::new(200_000, 100_000)),
         // ── 国内厂商 ──
         ("deepseek-chat", ModelCapacity::new(64_000, 8_192)),
         ("deepseek-reasoner", ModelCapacity::new(64_000, 8_192)),
