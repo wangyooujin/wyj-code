@@ -190,6 +190,8 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 
 **时延画像**（`session::TurnLatency`）：记录 TTFT、生成耗时、重试开销三个分量，`/context` 展示。扩展思考开启时**首个 thinking delta 也算 TTFT**——用户盯的是第一个 token 动没动，不是「第一个正文字符」。重试开销单列，因为「等 90 秒」里若有 60 秒是退避重试，那就是可优化的网络/配额问题而非模型慢，混在一起会误导排查方向。
 
+**输出预算被 reasoning 吃满 ≠ 空响应，也绝不静默收尾**（`agent.rs` 收尾判定 + `helpers::has_visible_output`）：判「这一轮说没说话」只能看**可见输出**（非空白 Text 或 ToolUse），thinking / redacted_thinking 是中间过程，它非空不能证明有回答。旧判据 `assistant_blocks.is_empty()` 把纯 thinking 回复当正常结束，于是 `stop_reason == MaxTokens` 时循环直接 `break` → `TurnFinished` → `Ok(())`，用户侧只有「跑了几轮就停住，没有任何提示」。现在的三分支：① 撞 `MaxTokens` 且无可见输出 → 丢弃本条（**不 push**，否则下一轮揣着空 signature 的 thinking 继续在同样预算上撞线）、放大 `max_tokens`（受 `capabilities.max_output_tokens` 封顶）并降一档 reasoning 后重试**一次**（`truncation_retry_used` 声明在回合循环之外，放里面会被重置成无限重试）；② 重试后仍只有 thinking → 丢弃并输出 `agent.output_without_visible_content`（带原因与调参建议）；③ 有正文但撞 `MaxTokens` → 不重试，输出 `agent.output_truncated` 说明正文被硬切断。降档必须**按 vendor 的 `effort_levels` 表取前一档**（`helpers::downgrade_reasoning_effort`），不能走 `max→high→medium→low` 字符串阶梯——Moonshot k3 只有 low/high/max，阶梯会落到端点不认的 medium 上被静默丢弃。钉子：`truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history`、`persistent_truncation_is_reported_instead_of_ending_silently`、`thinking_only_end_turn_is_reported_without_retry`、`visible_output_hitting_max_tokens_is_reported_but_not_retried`。
+
 ## 重试幂等性：一条必须守住的不变量
 
 
