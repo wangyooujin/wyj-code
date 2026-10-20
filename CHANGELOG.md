@@ -10,6 +10,100 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.15] - 2026-10-20
+
+### 思考强度跨协议打通，官方端点不再缺臂，同 chunk 丢字修复
+
+v0.3.14 之后的思考专项。`reasoning_effort` 此前在两条线上各有死角：Anthropic 线
+的官方端点根本不支持 effort，OpenAI 线的官方臂压根不存在——同一份配置换个协议
+或换个厂商就变成死配置，只在日志里留一条 dropped。本版把思考档位统一成**协议无关**
+的旋钮，并修掉响应侧一处「模型说了话、界面少一段」的丢字缺陷。
+
+### ① 官方 Anthropic 原生支持 effort
+
+- `ThinkingSpec::anthropic_native(model)` 按**型号**给档位集合：Opus 4.8/4.7/5 系与
+  Sonnet 5 系五档全量（low/medium/high/xhigh/max）、Opus 4.6 / Sonnet 4.6 到 max、
+  Opus 4.5 / Sonnet 4.5 到 high、3.x / 4.0 不支持（档位集合留空 → 记成可见的
+  dropped，而不是发出去换 400）
+- adapter 把 effort 发成 `output_config.effort`（与 MiniMax `/anthropic` 端点同构）；
+  此前 `AnthropicNativeAdapter` 只读 `thinking.budget_tokens`，`reasoning_effort`
+  在 Anthropic 线上是**死配置**
+- 新增 `ThinkingSpec::budget_and_effort_coexist`：官方文档明确 effort 与 thinking
+  可以一起用——budget 限**思考**的 token 数，effort 限**整个响应**的投入档位，
+  两个旋钮控制不同维度。互斥端点（Qwen 协议明确禁止同传）行为不变
+- **版本号解析只认 1 位次版本**：真实型号的次版本都是一位（4.5/4.6/4.7/4.8/5.5），
+  日期段是 8 位（`claude-opus-4-20250514`）。不设这道闸，`claude-3-5-sonnet-20241022`
+  会把日期当主版本，把 3.5 误判成「5 系 → 五档全量」
+- 钉子：`anthropic_effort_levels_are_per_model` / `official_anthropic_emits_output_config_effort`
+  / `official_anthropic_sends_budget_and_effort_together` /
+  `official_anthropic_effort_survives_the_catalog_layer`（端到端）
+
+### ② 官方 OpenAI（o 系列 / gpt-5 系）此前完全没有臂
+
+- `ThinkingSpec::for_vendor` 缺 `(OpenAiChatCompletions, "openai")` 臂，一律落到
+  `generic_openai()` 的 `ThinkingControl::Disabled`，于是三层连锁失效：catalog 把
+  `capabilities.thinking` 标成 Unsupported → `agent.rs` 在**到达 provider 之前**
+  就把 `reasoning_effort` 滤成 `None` → 即便漏过，`apply_thinking_to_openai_body`
+  也会因 `control == Disabled` 直接 return。结果是 `provider = "openai"` 的 profile
+  配 effort 成为**死配置**
+- 新增 `openai_official(model)` + `OpenAiOfficialAdapter`，三条硬约束：
+  ① **只发**顶层 `reasoning_effort`，绝不写 `thinking` / `enable_thinking` /
+  `thinking_budget`（官方判成未知参数直接 400）；② `echo_back_in_messages` 必须
+  **false**（官方 Chat Completions 不返回也不接受回传 `reasoning_content`，照抄
+  DeepSeek 臂会 400）；③ 档位**不收 `minimal`**（`gpt-5.1+` 不认），
+  `o1-mini` / `o3-mini` 早代档位集合为空 → 记成可见的 dropped
+- `text_only()` 辅助调用在这条线上降级成 `reasoning_effort: "low"`（**不是**
+  `"none"`，`o1`/`o3` 不认），否则不发字段＝端点按默认档位跑满 reasoning，
+  正是「预算被思考吃光、可见文本为空」的历史故障形态
+- 钉子：`official_openai_effort_survives_the_catalog_layer` /
+  `official_openai_writes_reasoning_effort` / `official_openai_never_echoes_reasoning`
+
+### ③ 响应侧 reasoning 字段名二选一
+
+- `Delta` 同时收 `reasoning_content`（DeepSeek / GLM / Qwen 的既有约定）与
+  `reasoning`（vLLM / SGLang / GPT-OSS / OpenRouter 的新约定，依据 vLLM RFC
+  #27755 与 GPT-OSS 发布时 OpenAI 对 Chat Completions 的指导；迁移期 vLLM 会把
+  `reasoning_content` 显式置 **null**）。只认前者会让整条新线**思考永不可见**
+- 择一而非拼接：同 chunk 两者都非空时以 `reasoning_content` 优先，否则同一段
+  思考 emit 两次（TUI 上重影）；判据用「非空」而非 `is_none()`（部分网关发空串）
+- **解析 ≠ 回传**：`echo_back_in_messages` 对 vLLM / ollama 仍为 false——响应里
+  有这个字段不代表回传不会 400
+
+### ④ 同 chunk 多字段不再互斥（丢字修复）
+
+- `stream_events_from_chunk` 旧实现把 `finish_reason` / `content` / `tool_calls`
+  写成一条 `else if` 链，只处理第一个命中者。端点把正文（或工具参数）与
+  `finish_reason` 合并进同一 chunk 时，后两者被**静默丢弃**——表现为「模型明明
+  说了话，界面少一段正文」
+- 现在三者**互不排斥**，发射顺序固定为 **reasoning → content → tool_calls →
+  MessageStop**：收尾信号必须最后，否则回合收尾会盖掉同 chunk 的最后一段输出
+- 钉子：`content_and_finish_reason_in_same_chunk_are_both_emitted` /
+  `content_tool_calls_and_finish_reason_in_same_chunk_are_all_emitted` /
+  `reasoning_content_and_finish_reason_in_same_chunk_are_both_emitted`
+
+### ⑤ 配套：配置面与轮数上限
+
+- profile 面板的 `reasoning_effort` 由 `OpenAiWire` 改为 `Always`——Anthropic 线
+  此前**根本不显示**该字段，用户无从配置，这正是「Anthropic 线上 effort 是死
+  配置」在 UI 层的根因
+- `--config-status` 新增 `max_tokens` 超过静态目录输出上限的提示：目录给的是保守
+  **下限**，用户填的值可能正确反映更新的型号，因此只提示、不静默改写
+- **思考关不掉的端点同样压到 32 轮**：旧判据只认模型名（`reasoner` / `-r1`），
+  于是 MiniMax M2.x/M3.1、Qwen `-thinking`、豆包 `-thinking`、Moonshot `-code`
+  这些端点仍按 200 轮放行——每一轮工具循环都跑一遍最深推理
+- 删除零消费者的 `ThinkingSpec::lock_sampling_params`（请求体从不写
+  temperature/top_p，remove 是空操作）
+
+### ⑥ 文档
+
+- `crates/api/CLAUDE.md`：新增「一个 SSE chunk 里的多个字段必须各自独立处理」一节，
+  并把 Anthropic / OpenAI 官方臂的约束写进既有条目
+- `docs/reference/config.md`：`reasoning_effort` 标注为**协议无关**（OpenAI 线发顶层
+  `reasoning_effort`、Anthropic 线发 `output_config.effort`），补官方 OpenAI 的
+  档位边界与「多数端点与 budget 互斥、官方 Anthropic 可同用」的说明
+
+**1838 个 workspace 测试**（1802 → 1838）。
+
 ## [0.3.14] - 2026-10-20
 
 ### 搜索后端可选、prompt 漂移可见、存储清理真正能跑、prompt cache 不再自击穿
