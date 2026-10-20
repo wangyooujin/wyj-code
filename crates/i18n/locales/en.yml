@@ -172,6 +172,9 @@ agent:
   turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
   dangling_tool_uses_repaired: "\n[Repaired {count} tool call(s) left without a result by an earlier interruption — they were never executed]\n"
   empty_completion: "\n[Empty response from the model (no text, no tool call). This usually means the endpoint rejected the request — try again, or `/clear` to start a new session if it keeps happening.]\n"
+  output_truncated_retrying: "\n[This response was truncated by max_tokens with thinking only — retrying once with a larger output budget and lower reasoning effort…]\n"
+  output_without_visible_content: "\n[The model produced no visible reply this turn (thinking only) and the turn ended. Reasoning usually consumed the output budget — raise max_tokens or lower reasoning_effort, then send again.]\n"
+  output_truncated: "\n[The reply hit the max_tokens output limit and may be cut off — raise max_tokens or lower reasoning_effort and retry if you need the complete result.]\n"
   turn_budget_wrap_up: "\n[Tool loop for this submission has used {turn}/{max} turns — the model has been asked to stop calling tools and summarize its progress now]\n"
   invalid_arguments_wrap_up: "\n[Tool arguments failed validation several turns in a row — the model has been asked to fix the argument shape or switch approaches, and deliver its current progress]\n"
 

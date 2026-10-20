@@ -169,6 +169,9 @@ agent:
   turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
   dangling_tool_uses_repaired: "\n[已为此前中断遗留的 {count} 个无结果工具调用补上占位结果（它们从未真正执行）]\n"
   empty_completion: "\n[模型返回了空响应（没有文本、没有工具调用）。通常是端点拒绝了这次请求——可以重试；若反复出现，用 `/clear` 开一个新会话。]\n"
+  output_truncated_retrying: "\n[本轮输出被 max_tokens 截断、只剩思考过程，已放大输出预算并降低 reasoning 强度后重试一次…]\n"
+  output_without_visible_content: "\n[模型这一轮没有给出任何可见正文（只有思考过程），回合已结束。原因通常是输出预算被 reasoning 吃满——可把 max_tokens 调大或降低 reasoning_effort 后再发一次。]\n"
+  output_truncated: "\n[回复达到了 max_tokens 输出上限，正文可能被截断——需要完整结果时把 max_tokens 调大或降低 reasoning_effort 后再试。]\n"
   turn_budget_wrap_up: "\n[本次提交的工具循环已用掉 {turn}/{max} 轮，已要求模型停止调用工具并立即总结当前进度]\n"
   invalid_arguments_wrap_up: "\n[工具参数连续校验失败，已要求模型修正参数形态或改用其他方案，并交付当前进度]\n"
 
