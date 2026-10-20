@@ -94,6 +94,22 @@ fn production_source(file: &str) -> String {
         // 近 3000 行绘制代码就脱离这条配色守卫，而这正是它当初被拆出来的那
         // 部分实现。
         "render/dialogs.rs" => include_str!("render/dialogs.rs"),
+        "app/agents_panel.rs" => include_str!("app/agents_panel.rs"),
+        "app/clipboard.rs" => include_str!("app/clipboard.rs"),
+        "app/dialogs.rs" => include_str!("app/dialogs.rs"),
+        "app/events.rs" => include_str!("app/events.rs"),
+        "app/mcp_panel.rs" => include_str!("app/mcp_panel.rs"),
+        "app/menu.rs" => include_str!("app/menu.rs"),
+        "app/navigation.rs" => include_str!("app/navigation.rs"),
+        "app/panels.rs" => include_str!("app/panels.rs"),
+        "app/plugins_panel.rs" => include_str!("app/plugins_panel.rs"),
+        "app/profile_panel.rs" => include_str!("app/profile_panel.rs"),
+        "app/schedule_panel.rs" => include_str!("app/schedule_panel.rs"),
+        "app/settings_dialogs.rs" => include_str!("app/settings_dialogs.rs"),
+        "app/skills_panel.rs" => include_str!("app/skills_panel.rs"),
+        "app/terminal.rs" => include_str!("app/terminal.rs"),
+        "app/tool_view.rs" => include_str!("app/tool_view.rs"),
+        "app/util.rs" => include_str!("app/util.rs"),
         other => panic!("未登记的待扫描文件 `{other}`"),
     };
     match source.find("#[cfg(test)]") {
@@ -119,6 +135,40 @@ fn no_hardcoded_colors_outside_theme() {
         ("input.rs", production_source("input.rs")),
         ("app.rs", production_source("app.rs")),
         ("render/dialogs.rs", production_source("render/dialogs.rs")),
+        (
+            "app/agents_panel.rs",
+            production_source("app/agents_panel.rs"),
+        ),
+        ("app/clipboard.rs", production_source("app/clipboard.rs")),
+        ("app/dialogs.rs", production_source("app/dialogs.rs")),
+        ("app/events.rs", production_source("app/events.rs")),
+        ("app/mcp_panel.rs", production_source("app/mcp_panel.rs")),
+        ("app/menu.rs", production_source("app/menu.rs")),
+        ("app/navigation.rs", production_source("app/navigation.rs")),
+        ("app/panels.rs", production_source("app/panels.rs")),
+        (
+            "app/plugins_panel.rs",
+            production_source("app/plugins_panel.rs"),
+        ),
+        (
+            "app/profile_panel.rs",
+            production_source("app/profile_panel.rs"),
+        ),
+        (
+            "app/schedule_panel.rs",
+            production_source("app/schedule_panel.rs"),
+        ),
+        (
+            "app/settings_dialogs.rs",
+            production_source("app/settings_dialogs.rs"),
+        ),
+        (
+            "app/skills_panel.rs",
+            production_source("app/skills_panel.rs"),
+        ),
+        ("app/terminal.rs", production_source("app/terminal.rs")),
+        ("app/tool_view.rs", production_source("app/tool_view.rs")),
+        ("app/util.rs", production_source("app/util.rs")),
     ];
 
     // `Color::Rgb(` 只在 welcome.rs 的 logo 渐变里合法（它 match 分量、算插值）
