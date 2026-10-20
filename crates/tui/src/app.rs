@@ -2232,6 +2232,11 @@ pub const PROFILE_FIELD_SPECS: &[ProfileFieldSpec] = &[
         ProfileFieldScope::Always,
     ),
     field(
+        "settings.field.aux_model",
+        ProfileFieldKind::Model,
+        ProfileFieldScope::Always,
+    ),
+    field(
         "settings.field.context_window",
         ProfileFieldKind::Text,
         ProfileFieldScope::Always,
@@ -2293,6 +2298,10 @@ pub struct ProfileEntryDraft {
     pub model: String,
     pub plan_model: String,
     pub exec_model: String,
+    /// 辅助模型（空串 = 不设置，辅助调用走主模型）。只作用于会话标题生成
+    /// 与跨会话记忆提取，**不影响上下文压缩**——压缩要复用主对话前缀才能
+    /// 命中 prompt cache。
+    pub aux_model: String,
     pub base_url: String,
     pub api_key: String,
     /// 设置面板不读取或展示环境变量值，只透传 secret reference 名称。
@@ -2330,6 +2339,7 @@ impl ProfileEntryDraft {
             model: p.model.clone(),
             plan_model: p.plan_model.clone().unwrap_or_default(),
             exec_model: p.exec_model.clone().unwrap_or_default(),
+            aux_model: p.aux_model.clone().unwrap_or_default(),
             base_url: p.base_url.clone(),
             api_key: p.api_key.clone().unwrap_or_default(),
             api_key_env: p.api_key_env.clone(),
@@ -2367,6 +2377,7 @@ impl ProfileEntryDraft {
             model: t.example_model.to_string(),
             plan_model: String::new(),
             exec_model: String::new(),
+            aux_model: String::new(),
             base_url: t.base_url.to_string(),
             api_key: String::new(),
             api_key_env: None,
@@ -2405,6 +2416,7 @@ impl ProfileEntryDraft {
             "settings.field.model" => &self.model,
             "settings.field.plan_model" => &self.plan_model,
             "settings.field.exec_model" => &self.exec_model,
+            "settings.field.aux_model" => &self.aux_model,
             "settings.field.base_url" => &self.base_url,
             "settings.field.api_key" => &self.api_key,
             "settings.field.max_tokens" => &self.max_tokens,
@@ -2425,6 +2437,7 @@ impl ProfileEntryDraft {
             "settings.field.model" => self.model = value,
             "settings.field.plan_model" => self.plan_model = value,
             "settings.field.exec_model" => self.exec_model = value,
+            "settings.field.aux_model" => self.aux_model = value,
             "settings.field.base_url" => self.base_url = value,
             "settings.field.api_key" => self.api_key = value,
             "settings.field.max_tokens" => self.max_tokens = value,
@@ -2561,6 +2574,11 @@ impl ProfileEntryDraft {
                 None
             } else {
                 Some(self.exec_model.clone())
+            },
+            aux_model: if self.aux_model.trim().is_empty() {
+                None
+            } else {
+                Some(self.aux_model.clone())
             },
             base_url: self.base_url.clone(),
             api_key: if self.api_key.trim().is_empty() {
@@ -21268,6 +21286,28 @@ mod profile_dialog_onboarding_tests {
         }
     }
 
+    /// 辅助模型在 ProfileDialog 往返中必须原样保留。
+    ///
+    /// `to_profile` 是逐字段**重建**一个新 Profile，任何只加在 `Profile` 上
+    /// 却没在 draft 上透传的字段，都会在用户每次 Ctrl+S 保存时被静默重置成
+    /// 默认值（= 辅助模型消失，且没有任何报错）。
+    #[test]
+    fn profile_dialog_round_trip_preserves_aux_model() {
+        for requested in [None, Some("MiniMax-M3.1-Flash-Preview".to_string())] {
+            let profile = wyj_config::Profile {
+                name: "default".to_string(),
+                aux_model: requested.clone(),
+                ..wyj_config::Profile::default()
+            };
+            let restored = ProfileEntryDraft::from_profile(&profile).to_profile();
+            assert_eq!(
+                restored.aux_model, requested,
+                "aux_model 在 ProfileDialog 往返中丢失: {requested:?} → {:?}",
+                restored.aux_model
+            );
+        }
+    }
+
     /// 新建分组必须预填 4，否则 `None` 会让静态目录按 vendor 猜出的
     /// `max_tools_per_turn = 1` 直接生效——国内模型分组因此永远只能一轮发一个
     /// 工具调用，派生 subagent 也就一次只能起一个。
@@ -21545,6 +21585,43 @@ mod profile_dialog_onboarding_tests {
         assert!(
             pos("settings.field.context_window") < pos("settings.field.reasoning_effort"),
             "容量字段必须在思考字段之前: {keys:?}"
+        );
+    }
+
+    /// 辅助模型：面板里留空 → 写盘为 `None`（辅助调用走主模型）；
+    /// 填了值 → 原样写进 profile。
+    ///
+    /// 空串必须落成 `None` 而不是 `Some("")`——后者会让 `build_aux_provider`
+    /// 拿到一个空模型名、构造出一个永远失败的 provider。
+    #[test]
+    fn aux_model_is_written_back_as_none_when_left_blank() {
+        let mut draft =
+            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let idx = super::profile_field_idx("settings.field.aux_model").expect("字段表应含该项");
+
+        // 模板新建的分组没有辅助模型 → 空串 → None
+        assert_eq!(draft.text_value(idx), "");
+        assert_eq!(draft.to_profile().aux_model, None);
+
+        // 填了值 → 原样带出去
+        draft.set_text_value(idx, "MiniMax-M3.1-Flash-Preview".to_string());
+        assert_eq!(
+            draft.to_profile().aux_model.as_deref(),
+            Some("MiniMax-M3.1-Flash-Preview")
+        );
+    }
+
+    /// 辅助模型是**分组级**字段，不是模式级：它不分 Plan / Exec，两种模式下
+    /// 指向的都是同一个模型。面板里它属于常规字段（scope = Always）。
+    #[test]
+    fn aux_model_is_always_visible_regardless_of_wire_protocol() {
+        let spec = super::PROFILE_FIELD_SPECS
+            .iter()
+            .find(|s| s.key == "settings.field.aux_model")
+            .expect("字段表应含该项");
+        assert!(
+            matches!(spec.scope, super::ProfileFieldScope::Always),
+            "辅助模型不受线协议限制"
         );
     }
 

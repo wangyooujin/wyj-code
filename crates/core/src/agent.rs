@@ -327,6 +327,17 @@ pub struct Agent {
     context_window: u32,
     /// 跨会话记忆存储（可选）
     memory: Option<Arc<MemoryStore>>,
+    /// 辅助模型 provider（可选）。
+    ///
+    /// 只用于**短提示词、低风险**的辅助调用：跨会话记忆提取。这类请求用
+    /// 自己的短 system prompt（`prompts::MEMORY_SYSTEM`），**不复用主对话的
+    /// system + tools 前缀**，因此换模型不会让主会话的 prompt cache 失效。
+    ///
+    /// **上下文压缩（compact）绝不使用它**：压缩请求逐字节复用主对话前缀来
+    /// 命中缓存，换模型等于前缀不等 → 缓存归零 → 整段历史全价重发。
+    ///
+    /// `None` = 辅助调用也走主 provider。
+    aux_provider: Option<Arc<dyn Provider>>,
     /// Memory v3 是普通跨会话事实、偏好、状态和历史的主控制/数据面。模型通过
     /// Memory 工具自主探索；Agent 只注入少量相关 claim 并提交耐久提取任务。
     memory_v3: Option<Arc<MemoryV3Store>>,
@@ -529,6 +540,7 @@ impl Agent {
             max_turns: 200,
             context_window: 200_000,
             memory: None,
+            aux_provider: None,
             memory_v3: None,
             evolution: None,
             claude_md: None,
@@ -754,6 +766,26 @@ impl Agent {
     pub fn with_memory(mut self, mem: Arc<MemoryStore>) -> Self {
         self.memory = Some(mem);
         self
+    }
+
+    /// 设置辅助模型的 provider。
+    ///
+    /// 仅作用于跨会话记忆提取（短提示词、独立 system prompt，不复用主对话
+    /// 前缀）。**不影响 compact**——压缩必须用主 provider 才能命中前缀缓存。
+    /// `None` 或不调用 = 辅助调用走主 provider。
+    pub fn with_aux_provider(mut self, provider: Option<Arc<dyn Provider>>) -> Self {
+        self.aux_provider = provider;
+        self
+    }
+
+    /// 辅助调用实际使用的 provider：优先辅助模型，其次当前 active route。
+    ///
+    /// 次选取 active route 而非 `self.provider`，是为了保留既有的 fallback
+    /// 语义——主模型切换到备用路由时，没配辅助模型的会话也跟着切过去。
+    fn aux_provider_or_route(&self) -> Arc<dyn Provider> {
+        self.aux_provider
+            .clone()
+            .unwrap_or_else(|| self.route_at(self.active_route_index()).provider)
     }
 
     pub fn memory_ref(&self) -> Option<&Arc<MemoryStore>> {
@@ -2789,7 +2821,9 @@ impl Agent {
                             .unwrap_or_else(|| "ephemeral".to_string());
                         match memory.enqueue_extraction(&session_id, &session.messages) {
                             Ok(Some(_)) => {
-                                let provider = self.route_at(self.active_route_index()).provider;
+                                // 记忆提取用辅助模型（若有）：短提示词 + 独立 system
+                                // prompt，不复用主对话前缀，换模型不打穿主会话缓存。
+                                let provider = self.aux_provider_or_route();
                                 tokio::spawn(async move {
                                     tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
                                     if let Err(error) = memory.drain_jobs(provider).await {
@@ -2802,7 +2836,7 @@ impl Agent {
                         }
                     } else if self.evolution.is_none() {
                         if let Some(mem) = self.memory.as_ref().cloned() {
-                            let provider = self.route_at(self.active_route_index()).provider;
+                            let provider = self.aux_provider_or_route();
                             let msgs = session.messages.clone();
                             tokio::spawn(async move {
                                 tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
@@ -7307,6 +7341,56 @@ mod tests {
             "压缩请求的工具清单必须与主对话相同（少一个就整段缓存失效）"
         );
         assert!(s_tools.contains(&"Sleep".to_string()));
+    }
+
+    // ── 辅助模型不得影响上下文压缩 ──────────────────────────────────────
+
+    /// 配了辅助模型之后，**压缩仍然必须走主 provider**。
+    ///
+    /// 压缩请求的全部价值在于逐字节复用主对话的 system + tools 前缀来命中
+    /// prompt cache；一旦换成辅助模型，前缀不再相等，缓存归零，整段历史
+    /// （长会话里动辄几十万 token）全价重发——省下的一次标题生成费用，
+    /// 换回来的是一次数量级更大的浪费。
+    ///
+    /// 这条测试钉的是「压缩路径不碰 `aux_provider`」这条不变式。
+    #[tokio::test]
+    async fn compaction_never_uses_the_auxiliary_provider() {
+        let probe = Arc::new(PrefixProbeProvider::default());
+        // 辅助 provider 是一个**独立**的探针：它一旦被压缩路径调用，
+        // `aux.complete_prefix` 就会拿到值。
+        let aux = Arc::new(PrefixProbeProvider::default());
+
+        let mut agent = Agent::new(probe.clone() as Arc<dyn Provider>)
+            .with_aux_provider(Some(aux.clone() as Arc<dyn Provider>));
+        agent.register_tool(Arc::new(SleepTool));
+
+        let mut session = Session::new();
+        session.push_user("读一下文件");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+        session.push_user("再看一个");
+        agent
+            .run_turn(&mut session, &FakeCtx, &mut |_| {})
+            .await
+            .unwrap();
+
+        agent
+            .compact_context(&mut session)
+            .await
+            .expect("手动压缩应成功");
+
+        assert!(
+            aux.complete_prefix.lock().unwrap().is_none(),
+            "压缩请求不得发给辅助模型——换模型会让前缀缓存失效"
+        );
+        // 压缩确实走了主 provider（否则上面那句断言会因为「压根没压缩」而假通过）。
+        let (c_stable, c_volatile, c_tools) = probe.complete_prefix();
+        let (s_stable, s_volatile, s_tools) = probe.stream_prefix();
+        assert_eq!(c_stable, s_stable, "压缩前缀必须与主对话同源");
+        assert_eq!(c_volatile, s_volatile, "压缩前缀必须与主对话同源");
+        assert_eq!(c_tools, s_tools, "压缩前缀必须与主对话同源");
     }
 
     // ── 记忆快照分桶缓存 ───────────────────────────────────────────────
