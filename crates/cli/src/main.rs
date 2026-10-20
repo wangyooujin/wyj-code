@@ -1643,14 +1643,6 @@ async fn main() -> Result<()> {
     // Phase 3:把 CAS 注入到 externalize,落盘前把超大 image / thinking 移到 CAS。
     wyj_core::serialize::set_externalize_cas(workspace_cas.clone());
 
-    let memory_store = MemoryStore::new(&config_base, &cwd)
-        .map(|m| {
-            m.set_enabled(cfg.auto_memory_enabled);
-            m.with_storage_retention(cfg.storage.clone())
-        })
-        .map(Arc::new)
-        .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
-        .ok();
     let memory_v3_store = MemoryV3Store::new(&config_base, &cwd)
         .map(|store| {
             store.set_enabled(cfg.auto_memory_enabled);
@@ -1659,6 +1651,31 @@ async fn main() -> Result<()> {
         .map(Arc::new)
         .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
         .ok();
+    // Memory v2 只在 v3 **没建成**时才构造。
+    //
+    // 三套记忆并存是历史遗留：v1/v2 是「提取成 .md + 注入 MEMORY.md 索引」，
+    // v3 是「结构化 claim + 后台 job」。`Agent` 的注入与提取都是
+    // `memory_v3 → evolution → memory(v2)` 的 if-else 链，v3 一旦存在，v2
+    // **一行都不会执行**。但此前它仍无条件构造：每次启动 `create_dir_all`
+    // 一个目录、`/memory` 面板的开关还要同时写它，白付一份磁盘 IO 与一处
+    // 永远不会有读者的状态。
+    //
+    // 保留它（而非删除）的理由只有一个：v3 构造失败（磁盘不可写、jobs.json
+    // 损坏）时不能连记忆能力一起消失。那是极少数情况，此时 v2 是有意义的兜底。
+    // 它不再是「并存的第二套实现」——`Agent` 里那条 else-if 分支现在只在
+    // v3 为 None 时可达，语义从「并存」变成「降级」。
+    let memory_store = if memory_v3_store.is_none() {
+        MemoryStore::new(&config_base, &cwd)
+            .map(|m| {
+                m.set_enabled(cfg.auto_memory_enabled);
+                m.with_storage_retention(cfg.storage.clone())
+            })
+            .map(Arc::new)
+            .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
+            .ok()
+    } else {
+        None
+    };
     let evolution_store = if cfg.evolution.enabled {
         EvolutionStore::new(&config_base, &cwd, cfg.evolution.clone())
             .map(Arc::new)

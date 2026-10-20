@@ -15486,14 +15486,17 @@ async fn tui_main(
                                             .unwrap_or(true);
                                         state.config.auto_memory_enabled = new_value;
                                         let save_result = state.config.save();
-                                        if let Some(memory) =
-                                            shared_agent.read().unwrap().memory_v3_ref()
+                                        // 两个 store 互斥存在（v3 建成时 v2 不构造，
+                                        // 见 CLI 装配），这里照写两份是为了在 v3
+                                        // 降级到 v2 的少数情况下开关仍然生效。
                                         {
-                                            memory.set_enabled(new_value);
-                                        }
-                                        if let Some(mem) = shared_agent.read().unwrap().memory_ref()
-                                        {
-                                            mem.set_enabled(new_value);
+                                            let agent = shared_agent.read().unwrap();
+                                            if let Some(memory) = agent.memory_v3_ref() {
+                                                memory.set_enabled(new_value);
+                                            }
+                                            if let Some(mem) = agent.memory_ref() {
+                                                mem.set_enabled(new_value);
+                                            }
                                         }
                                         if let Some(dialog) = &mut state.memory_dialog {
                                             dialog.auto_memory_enabled = new_value;
