@@ -143,7 +143,7 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 `persist_cap.thinking_bytes`——它现在完全无效。
 
 
-**已知缺口**:`sessions/*.json`、`<session_id>.checkpoints/`、`<session_id>.subagents/` 三者**没有任何自动或手动回收路径**(`storage prune` / `doctor` 仍是 TODO 桩);顶层 warn 超阈值时只会提示手动删目录。`cas/` 已在 v0.2.26 接入回收链路(`storage.cas_total_bytes` + `cas_gc_on_start` 启动时 gc;会话被丢弃时逐个 `release` 让 `ref_count` 归零,否则 gc 永远删不掉),但 gc **只在进程启动时跑一次**,长跑进程内不回收。`checkpoint_bytes_per_session` / `checkpoint_ttl_days` 仍因从无消费点保持删除。
+**已知缺口**（v0.3.14 更新）：`sessions/*.json` 与 `<session_id>.checkpoints/` **已接上回收链路**——`storage doctor` 检查损坏的 session / checkpoint 内容（manifest 完好但正文解析失败这一整类），`storage prune --yes` 清理损坏文件并执行 checkpoint retention / 存量外化。注意 prune 的 checkpoint 段整体受 `storage.checkpoints_per_session > 0` 门控（0 = 不限条数），此时损坏文件只报不删，doctor 的输出会显式给出这个提示。**仍无回收路径的是 `<session_id>.subagents/`**（trace / handoff / messages 三类文件随会话增长，只能手动删目录）；顶层 warn 超阈值时也只会提示手动删目录。`cas/` 已在 v0.2.26 接入回收链路(`storage.cas_total_bytes` + `cas_gc_on_start` 启动时 gc;会话被丢弃时逐个 `release` 让 `ref_count` 归零,否则 gc 永远删不掉),但 gc **只在进程启动时跑一次**,长跑进程内不回收。`checkpoint_bytes_per_session` / `checkpoint_ttl_days` 仍因从无消费点保持删除。
 
 
 **实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
@@ -175,6 +175,8 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 - **英文 thinking 会自我强化，验证必须开新会话**。Anthropic 线协议把 thinking 块连 `signature` 原样回传（`anthropic.rs::to_api_messages`），压缩时 thinking 也以 `[思考]` 进摘要——历史里一旦是英文 CoT，后续每轮的上下文里就是英文推理链，继续英文。这解释了为什么是「**一直**英文」而不是偶尔英文。**任何语言相关改动都必须 resume 之外的新会话验证**，老会话本身就是英文先验的产物。
 
 **压缩不再丢弃 thinking**（`compact.rs::messages_to_text`）：此前 `ContentBlock::Thinking` 一律 `None`，理由是「内部推理，非对话事实」。这个理由在压缩场景下站不住——摘要是压缩后**唯一**的续跑上下文，丢掉推理链等于每轮重新起跑：既丢掉已付出的推理，也让输出语言在压缩点后漂移。现按 `[思考] <truncate_chars(400)>` 纳入摘要文本，空 thinking 与 `RedactedThinking` 只留占位；配套在 `compact_prompt` 模板加 `## Key Reasoning` 一节，指示摘要器只提炼**最终答案里看不见**的推理（排除掉的方案、读代码发现的约束），没有就不输出该节，避免把整段 reasoning 原样倒灌进摘要。单测 `thinking_reaches_compaction_text` / `long_thinking_is_truncated_in_compaction_text` / `empty_and_redacted_thinking_produce_placeholder_only`。
+
+**system prompt 指纹只在「同一配置下应当稳定」的两段上比**（`core::prompt_fingerprint`，v0.3.14）：同一个会话隔天 `--resume`，模型行为可能明显不同，而此前没有任何地方能回答「当时注入的是什么」。每轮请求采集 `main`（`Agent::system_prompt`，含 `<env>`）与 `tools`（本次真正发送、已过能力裁剪与 lazy 折叠的定义集合）两段摘要——`sha256` 前 16 hex + 原始字节数 + 工具名有序集合，**只存指纹不存全文**（全文等于给 system prompt 造第二份事实来源，且会话文件每轮整份重写）。`memory` / `project_rules` / `volatile` 三段仍采集进结构但**不参与对比**：前两者每轮本来就该变，比对只会产生噪音。指纹随 `SessionFile` 落盘，resume 后**第一次**请求与落盘基线比对，结果进 `session.prompt_drift_since_resume`，由 `/context` 分三态展示（`None` = 不知道 / `Some(空)` = 确认一致 / `Some(sections)` = 变了哪一段、工具增删了什么）。**`restore_usage_from` 必须同时重置 `prompt_fingerprint_checked` 与 `prompt_drift_since_resume`**——`/resume` 在同一个 `Session` 实例上换内容，只搬指纹会让首轮检测被 `if !checked` 跳过、面板继续显示上一个会话的结论（钉子 `restore_usage_from_resets_prompt_drift_detection_state`）。
 
 
 ## 效率与自愈（v0.3.1）

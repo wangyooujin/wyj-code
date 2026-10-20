@@ -14,6 +14,17 @@
 
 接入点：`bash.rs`（stdout / stderr 各自独立落盘，预算仍是 `MAX_OUTPUT` 的 6:4 头尾）、`webfetch.rs`（`MAX_CONTENT = 50_000` 时按 7:3 落盘——网页正文的有效信息常常在中后段，只留开头会丢掉结论）。与 `core::context_edit` 分工不同：那边处理**历史里已经存在**的工具结果（事后 CAS 外部化 + `ContextRecall`），这边处理**刚刚产生**的输出（事前落盘 + 普通 `Read`）。
 
+## WebSearch：可插拔后端与「显式失败」
+
+`tools::search`（`mod.rs` + `tavily.rs` + `brave.rs`）把 WebSearch 拆成「工具层做校验与渲染、后端层只发请求」两层，`SearchBackend` trait 只有 `name` / `supports_topic` / `search` 三个方法：
+
+- **构造唯一入口是 `build_backend(cfg)`**：未知 provider **显式报错并返回 `None`**（绝不静默回退到默认后端），未配置 key 也返回 `None` —— 这两种 `None` 的语义不同，由 `Config::search_provider_issue()` 给出面向用户的解释（`/doctor`、`--config-status` 共用同一判定）。返回 `None` 时工具**不注册**，模型看不到一个必然失败的工具。
+- **参数非法一律报错**：`topic` / `time_range` 解析失败直接回 `ToolResult::err`；后端不支持 `topic`（Brave 只有 freshness）时也**明确拒绝**而不是悄悄降级成通用搜索——「模型以为在搜新闻、实际拿到通用结果」比报错更糟。
+- **域名过滤**：配置 `[search].allowed_domains` / `blocked_domains` 是**默认值**，模型显式给 `include_domains` / `exclude_domains` 时**覆盖**（不是并集：并集会让模型既无法临时放开黑名单，也无法收窄白名单）。两处都过 `clean_domains`（去 scheme / 路径 / 前导 `*.`、小写化、去重）。
+- **错误分类决定「下一步该谁做」**：`Auth` / `BadRequest` 直接回灌模型（重试无用）；`RateLimited` 保留 `Retry-After` 秒数；只有 `Transient` 退避重试一次。超时与 UA 由 `[search].timeout_secs` 与固定 UA 构造的 `reqwest::Client` 承担。
+- **输出侧**：结果先拼装、再 `escape_harness_markers`（搜索结果来自不可信网页，不能让它伪造 harness 标记）、最后 `spill_truncated` 落盘（7:3 头尾，与 `webfetch` 一致）。Tavily 没有分页标记，`more_available` 恒 false；Brave 按「返回条数 == 请求条数」推断。
+- 注册点三处共用 `build_tool_registry`：主 Agent（`cli::assembly`）、子 Agent 工厂（`cli::make_sub_agent_factory`）、`/model` 重建。三处都必须带 `with_default_domains(...)`，漏一处就是「主 Agent 生效、子 Agent 不生效」的静默漂移。
+
 ## Grep 工具的两级实现
 
 `tools::grep` 刻意做成**两级、对外行为一致**的搜索后端，测试里 `assert_both_ways` 对同一输入断言两条路径的输出一致：

@@ -10,6 +10,102 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.14] - 未发布
+
+### 搜索后端可选、prompt 漂移可见、存储清理真正能跑
+
+v0.3.13 发布后的收尾批次，四件事：WebSearch 从单一 Tavily 后端扩成
+Tavily / Brave 可选并收拢成 `[search]` 子节；新增 system prompt 指纹，回答
+「同一个会话隔天 resume，这次注入的东西和上次一样吗」；`storage prune` /
+`doctor` 从 TODO 桩真正接上 checkpoint 与 session 的回收链路；子 Agent 详情
+视图重做（从日志字符墙改成复用聊天区的渲染管线）。
+
+### ① WebSearch：双后端 + `[search]` 子节
+
+- 后端抽象为 `SearchBackend`（`crates/tools/src/search/`），Tavily 与 Brave 各一个实现；
+  `build_backend` 是唯一的构造入口，未知 provider **显式报错而不是静默回退**，
+  未配置 key 则不注册工具（模型看不到必然失败的工具）
+- 新增参数 `topic`（general/news/finance）、`time_range`（day/week/month/year）、
+  `include_domains` / `exclude_domains`。后端不支持某个参数时**明确报错**，
+  不静默降级——模型以为在搜「新闻」，实际拿到通用结果比报错更糟
+- 错误分四类（认证 / 限流 / 参数 / 瞬时）决定「下一步该谁做」，只有瞬时错误退避重试一次
+- 配置从顶层 `search_provider` / `search_api_key` 收拢到 `[search]` 子节并自动迁移；
+  `search_provider` 此前**全仓零读取点**（改了毫无效果），现在由
+  `Config::search_provider_issue()` 单一判定，`/doctor` 与 `--config-status` 共用
+- `allowed_domains` / `blocked_domains` 作为默认域名过滤接进工具（模型显式给
+  `include_domains` / `exclude_domains` 时覆盖配置默认，而不是并集）
+- `[search].api_key` 的环境变量覆盖落在 `#[serde(skip)]` 槽位，打开设置面板
+  保存不会把 env 里的 key 物化进 `config.toml`
+
+### ② system prompt 指纹与 `/context` 漂移报告
+
+- 新增 `core::prompt_fingerprint`：每轮请求采集 `main`（主提示 + `<env>`）与
+  `tools` 两段摘要（sha256 前 16 hex + 字节数），随 `SessionFile` 落盘
+- resume 后第一次请求与落盘基线比对，`/context` 显示「一致 / 变了哪一段 /
+  工具增删了哪些」。记忆快照与规约链**不参与比较**——它们本来就该每轮变，
+  报差异只是噪音
+- **切换会话时必须重置检测状态**：`/resume` 在同一个 `Session` 实例上换内容，
+  只搬指纹会让首轮检测被跳过、面板继续显示上一个会话的结论
+- 钉子：`prompt_fingerprint::tests::*`、
+  `session_store::tests::restore_usage_from_resets_prompt_drift_detection_state`
+
+### ③ `storage prune` / `doctor` 真正接线
+
+- `prune` 的 checkpoint 分支此前用 `CheckpointStore::new()`（`max_per_session = 0`
+  且无 CAS），而 `enforce_retention` 在 0 时直接返回——**从未删过任何东西**。
+  现在带上上限与 CAS 池，依次执行「清损坏 → 存量外化 → 裁剪保留」
+- `doctor` 新增损坏 checkpoint 检查（manifest 完好但内容读不出这一整类此前完全不可见）；
+  `prune --yes` 顺带清理损坏的 session 与 checkpoint（内容已不可恢复）
+- 实测触发源：120 个 checkpoint（约 133 MB）因脱敏正则破坏 JSON 结构而永久读不出
+- 脱敏改**结构化**：对序列化后的文本跑正则会把 `\"` 拆成裸引号，导致整份文件
+  解析失败。现在先 `to_value` → 递归脱敏 → `to_string`，JSON 结构不可能被破坏；
+  `thinking` / `image` 块整块跳过（改写会破坏签名校验与 base64）
+- 顺带修 CAS 外化的两处不可逆：占位符只存 12 字符 hash（永远取不回）、
+  image 还原时二次 base64 编码（内容错乱）；`materialize_block_with` 此前
+  **零生产调用点**，现在 resume 与 rewind 两条路径都接上
+
+### ④ 子 Agent 详情视图复用聊天区的渲染管线
+
+子 Agent 详情视图（`/subagents` 里选中一项后的内容区）此前把执行轨迹**逐行平铺**：
+`in:` / `out:` 前缀一行一条，一次 `Read` 的输出就是几百行 `path:line-content`。
+它没有层级、不能折叠、没有 markdown——与其说是「子 Agent 在干什么」，不如说是一面
+日志字符墙。
+
+现在改为**翻译而非重画**：新增 `crates/tui/src/app/sub_agent_view.rs`，把落盘轨迹
+（`TraceEvent`）翻译成与主聊天流同构的 `ChatMessage` 序列，再交给聊天区那条
+`render_message_range` 管线。于是子 Agent 的执行过程与主聊天流**长得一模一样**：
+
+- `⏺ 工具名(参数)` 标题行 + `⎿` 结果行；工具结果默认折叠成一行，`Ctrl+O` 展开
+  全文（跟随主聊天区的 `output_expanded`，同一套折叠语义）
+- `Read` 的行号前缀照旧被 `strip_read_line_number` 剥掉；`Edit`/`Write` 的 diff
+  照旧内联可见；助手文本按 markdown 渲染
+- 旧的 `push_sub_agent_trace_lines` / `push_sub_agent_tool_log` 两条平铺路径删除
+
+三条工程约束：
+
+- **配对规则**：`ToolStart` 先进待配对表，结果事件按工具名取走最早那条还没配上的
+  同名调用；结果行插到调用行**紧后面**——渲染管线靠「相邻且序号相同」把两者
+  认成一块，插到别处会退化成两行各自独立的 `⏺` / `⎿`
+- **翻译结果必须缓存**（`AppState::sub_agent_detail_cache`）：轨迹里每次工具输出
+  都可能有几十 KB，每帧重建等于每帧搬一遍全部输出、再把每段助手文本的 markdown
+  重解析一次。轨迹只追加，所以「事件条数」就是完整的版本号
+- **终态结果要去重**：`Done.result` 是各轮助手文本的拼接，逐轮文本已各自成条，
+  不剥掉就会让人把同一段话读两遍；剥完剩下的才是新信息（报错 / 中断说明）
+
+交接摘要同时收敛成**一行**聊天风格的结论（状态 · 调用次数 · 改动文件数 ·
+结论，结论按剩余宽度截断）。「停下的原因」不再挤在这一行里（多半是一整段
+provider 报错，会把结论挤没），改为作为一条系统通知进正文。
+
+钉子：`sub_agent_view::tests::*`（配对 / 并发 / 去重 / 缺结果）、
+`render::tool_result_fold_tests::sub_agent_detail_renders_trace_through_the_chat_pipeline`、
+`::sub_agent_handoff_is_a_single_chat_style_line`、
+`::sub_agent_detail_messages_are_cached_until_the_trace_grows`。
+
+### ⑤ 测试与静态检查
+
+`cargo test --workspace` **1795 项通过 / 0 失败**（1715 → 1795），
+`cargo fmt --check` 通过，`cargo clippy --workspace --all-targets` 无新增告警。
+
 ## [0.3.13] - 2026-10-20
 
 ### 权限底线被绕过、状态跨会话串味、模型把预算全花在思考上
