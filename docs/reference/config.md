@@ -40,8 +40,16 @@ vision = true                # 模型是否支持图片输入；false 时图片�
                               # env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先（runtime override，不写盘）。
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空（或空串）自动检测系统 locale；决定 UI 文案 **与模型输出语言**（含 thinking）
-search_provider = "tavily"   # WebSearch 搜索 provider（目前支持 tavily）
-search_api_key = ""          # WebSearch API Key，优先读环境变量 WYJ_CODE_SEARCH_API_KEY；未配置则 WebSearch 工具不注册（模型看不到）
+
+[search]                     # WebSearch 工具的后端与请求默认值（未配置 api_key 则工具不注册，模型看不到）
+provider = "tavily"          # 后端：tavily / brave。写成未知值会显式报错，不会静默回退
+api_key = ""                 # API Key，优先读环境变量 WYJ_CODE_SEARCH_API_KEY（env 覆盖不会写回本文件）
+timeout_secs = 30            # 单次搜索请求超时（秒）
+max_results = 5              # 模型未显式指定时返回的条数（硬上限 10）
+# allowed_domains = []       # 默认白名单域名（模型可用 include_domains 覆盖）
+# blocked_domains = []       # 默认黑名单域名（模型可用 exclude_domains 覆盖）
+language = ""                # Brave 的 search_lang（ISO 639-1），留空用后端默认值；tavily 忽略
+safe_search = true           # 安全搜索（Brave 映射为 safesearch=strict）
 
 [subagent]
 default_profile = ""         # 子 Agent 默认 Profile 名，留空沿用主 Agent 当前分组

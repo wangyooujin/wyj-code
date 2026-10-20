@@ -4,7 +4,7 @@
 
 | 文件 | 承载 | 说明 |
 |---|---|---|
-| `app.rs`（11559） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
+| `app.rs`（11639） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
 | `app/events.rs`（1251） | `apply_agent_event` / `apply_sub_agent_event`：Agent 事件 → UI 状态 | 只写状态，不读终端尺寸、不排版；事件顺序不变量都在这一个函数里 |
 | `app/profile_panel.rs`（1972） | `/model` 分组面板 | 字段表 `PROFILE_FIELD_SPECS` 是唯一真相源，渲染/键位/校验三处都从它派生 |
 | `app/skills_panel.rs`（1113） | `/skills` 面板 | 含 SkillHub 搜索与本地/注册表两个来源的分流 |
@@ -12,17 +12,18 @@
 | `app/mcp_panel.rs`（692） | `/mcp` 面板 | server 信任与连接状态 |
 | `app/plugins_panel.rs`（594） | `/plugins` 面板 | 插件激活/停用 |
 | `app/dialogs.rs`（1133） | AskQuestion / PlanApproval / ExecModeConfirm / SessionConflict 四个模态框 | 共享 `InProgressAnswer`；自由输入统一走 `render::freetext_line` |
-| `app/settings_dialogs.rs`（434） | Settings / Memory / Evolution 三个治理面板 | Evolution 的四视图与二次确认状态在这里 |
+| `app/settings_dialogs.rs`（716） | Settings / Memory / Evolution 三个治理面板 | Evolution 的四视图与二次确认状态在这里 |
 | `app/clipboard.rs`（1878） | 剪贴板、附件、输入框文本操作、应用内选区 | 粘贴折叠成 `PasteBlock` 的判据见 `paste_text_should_fold` |
-| `app/tool_view.rs`（329） | 工具展示辅助：显示名、参数摘要、结果摘要 | 纯字符串整形，消息构造时算好并存下，渲染层不重算 |
+| `app/tool_view.rs`（350） | 工具展示辅助：显示名、参数摘要、结果摘要 | 纯字符串整形，消息构造时算好并存下，渲染层不重算 |
+| `app/sub_agent_view.rs`（535） | 子 Agent 详情视图的数据准备：执行轨迹 → 聊天消息序列 | 只做翻译不碰绘制；详情视图复用聊天区渲染管线的唯一入口 |
 | `app/terminal.rs`（556） | 终端控制：备用屏幕、鼠标上报、滚轮路由、退出按键释放 | 直接写 ANSI 序列，是 TUI 与终端之间的全部契约面 |
-| `app/menu.rs`（220） | `InputOwner` / `FlatRow` / `ActionMenu` | 各面板共享的「方向键菜单 + 借用底部输入框」基础设施 |
+| `app/menu.rs`（246） | `InputOwner` / `FlatRow` / `ActionMenu` | 各面板共享的「方向键菜单 + 借用底部输入框」基础设施 |
 | `app/agents_panel.rs`（107） | Agents / Extensions 两个列表型面板 | 只有行选中与动作菜单，没有输入框借用 |
 | `app/navigation.rs`（584） | 选区、滚动、焦点、输入历史召回 | 动线而非数据：只读 `self`，不碰 IO |
 | `app/panels.rs`（650） | Todo / 子 Agent / 后台 Shell 面板状态与导航 | 三者共享同一条不变式：面板列出的东西必须和后台真实存活的��致 |
 | `app/util.rs`（36） | `cycle_index` / `is_new_todo_round` / `split_evenly` | 跨面板复用的纯函数 |
-| `render.rs`（7771） | 聊天区、输入框、状态栏、滚动条、排版助手 | 助手被 dialogs 依赖，留在父模块 |
-| `render/dialogs.rs`（3002） | 全部对话框与浮层 | 纯绘制，彼此不共享可变状态 |
+| `render.rs`（7701） | 聊天区、输入框、状态栏、滚动条、排版助手 | 助手被 dialogs 依赖，留在父模块 |
+| `render/dialogs.rs`（3279） | 全部对话框与浮层 | 纯绘制，彼此不共享可变状态 |
 
 **拆分的第二波原则**：面板类代码按「一个命令一个文件」切，切分点是 `app.rs` 里的 `// ── <面板>：/<命令> 命令触发` 注释段。这些段自带完整的类型 + 键位处理 + 执行动作，**段内不引用段外的私有项**（若有，先抽到 `util.rs` 或 `menu.rs`）。整段搬走时连同它的 `#[cfg(test)] mod` 一起搬，否则测试访问的私有字段要先提升可见性——那是拆分边界切错的信号。
 
@@ -32,7 +33,7 @@
 
 **两个必须跟着改的清单**（漏了就是静默失去覆盖）：
 
-1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。2026-10-20 已把 `app/` 下全部 16 个子模块补进白名单（此前只有 `app.rs` 本身在列，拆走的内容一直无人扫描）。**该函数对未登记文件是 `panic!` 而非静默跳过**——新增文件后第一次跑测试就会红，不会悄悄漏。
+1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。2026-10-20 已把 `app/` 下全部 16 个子模块补进白名单（此前只有 `app.rs` 本身在列，拆走的内容一直无人扫描），2026-10-20 新增 `app/sub_agent_view.rs` 时同步登记。**该函数对未登记文件是 `panic!` 而非静默跳过**——新增文件后第一次跑测试就会红，不会悄悄漏。
 2. 源码文本扫描类测试用 `include_str!` 定位函数。**判定函数范围必须按花括号配平**，不要用「下一个顶格 `fn ` / `/// `」这类行前缀启发式——函数体内的语句没有顶格 `fn `，那个启发式会一路扫到文件末尾。`draw_status_never_measures_width_in_chars` 曾因此把后续函数的代码当成被检验函数的正文。
 
 ## 配色：全部走 `Theme` 槽位，`theme.rs` 是唯一允许定义颜色的文件
@@ -90,7 +91,14 @@
 
 **shells / subagents 面板只列运行中的条目（v0.2.30+）**：两个面板的口径统一为「只显示 `Running`」，完成即从列表消失——对齐 Claude Code。**唯一口径分别是 `AppState::running_shells()` 与 `AppState::visible_sub_agents()`**，`draw_shell_panel` / `draw_sub_agents_panel` / `bottom_panel_size` / `shell_panel_height` / `move_selected_*` / `focus_*_edge` / `/shells` 与 `/subagents` 的定位逻辑**全部**必须走它们，不要有第二处直接遍历 `state.shells` / `state.sub_agents` 做展示决策——**两套口径漂移一次就会复现「列表里有个按不动的幽灵行」**。底层 `state.shells`（Vec，只增不减）与 `state.sub_agents`（BTreeMap）**保留全部条目**：退出状态要留在里面等 `poll_shells` 读、自动唤醒 reminder 也要读，面板只是不再展示它们。移除条目的动作挂在状态翻转处（`poll_shells` 检出退出、`E::Done`、interrupt 控制、ESC 中断），每次翻转后调 `reconcile_shell_selection` / `reconcile_sub_agent_selection`：选中项若已不在列表里就落到最后一个运行项，一个都不剩时收起面板并把 `ui_focus` 交还 `Composer`（否则焦点悬空在看不见的一行上，用户按 ↑↓ 才发现出事了）。**已完成的条目并非不可查**：子 Agent 完整轨迹仍落盘，可用 `wyj-code subagent-trace <session> [id]` 读；shell 输出早已通过 `bg_shell_done_reminder` 回灌模型、聊天流也留了 `bash_N 已退出` 记录。
 
-**子 Agent 详情顶部固定先渲染交接摘要**（`render::push_sub_agent_handoff_lines`）：终态行 + 停下原因 + 最后一轮结论 + 改过的文件 + 错误。理由不是「好看」——trace 里有几百条工具动作，用户滚到底才知道停在哪，而 `conclusion` 与 `files_modified` 恰恰是唯一能一眼说明「做到哪了」的东西。`SubAgentUiState.handoff` 从 `a<id>.handoff.json` 读回（`Done` 事件只带模型侧外壳，人读的摘要不在里面），`reload_persisted_sub_agents` 也按 `list_handoff_ids` 补齐只在交接物里出现的 agent，并在 trace 缺失时用交接物重建一条最小记录——**别让「有记录但看不到」比没有更让人困惑**。
+**子 Agent 详情视图复用聊天区的渲染管线**（2026-10-20，v0.3.13）。此前详情视图自己把 trace 逐行铺开（`in:` / `out:` 前缀一行一条），那份文本墙既没有层级也不能折叠——一次 `Read` 的输出就是几百行 `path:line-content`，读起来像日志倾倒。现在改成**翻译而非重画**：
+
+- `app/sub_agent_view.rs` 把执行轨迹（`TraceEvent`）翻译成与主聊天流同构的 `ChatMessage` 序列（工具调用 / 工具结果 / 助手文本 / 系统通知），`render::draw_sub_agent_content` 再把它交给 `render_message_range`——**同一条管线，同一套折叠语义**：工具结果默认折叠成一行 `⏺ Grep(...)`，`Ctrl+O` 展开全文；`Read` 的行号前缀照旧被 `strip_read_line_number` 剥掉；`Edit`/`Write` 的 diff 照旧内联可见。旧的 `push_sub_agent_trace_lines` / `push_sub_agent_tool_log` 两条平铺路径**已删除**，不要复活。
+- **配对规则**：`ToolStart` 先进待配对表，结果事件按**工具名**取走最早那条还没配上的同名调用（子 Agent 的工具可以并发，同名并发只能按顺序配）。结果行插到调用行**紧后面**——渲染管线靠「相邻且序号相同」把两者认成一块，插到别处会退化成两行各自独立的 `⏺` / `⎿`。
+- **翻译结果必须缓存**（`AppState::sub_agent_detail_cache`）：轨迹里每次工具输出都可能有几十 KB，每帧重建等于每帧搬一遍全部输出、再把每段助手文本的 markdown 重解析一次。轨迹是**只追加**的，所以「事件条数」就是完整的版本号（`SubAgentDetailVersion`），条数没变就直接复用上一帧的翻译结果。
+- **交接摘要收敛成一行**（`render::push_sub_agent_handoff_line`）：状态 → 工具调用次数 → 改动文件数 → 结论。前几段定长，结论按**剩余宽度**截断，保证状态与次数一定看得见。**停下的原因不进这一行**（多半是一整段 provider 报错，塞进来会把结论挤没），它作为一条系统通知进正文（`subagent.reason_line`；有落盘轨迹时它本来就在终态结果 `Done.result` 的最后一段里）。理由不是「好看」——轨迹里有几百条工具动作，用户滚到底才知道停在哪，而 `conclusion` 与 `files_modified` 恰恰是唯一能一眼说明「做到哪了」的东西。`SubAgentUiState.handoff` 从 `a<id>.handoff.json` 读回（`Done` 事件只带模型侧外壳，人读的摘要不在里面），`reload_persisted_sub_agents` 也按 `list_handoff_ids` 补齐只在交接物里出现的 agent，并在 trace 缺失时用交接物重建一条最小记录——**别让「有记录但看不到」比没有更让人困惑**。
+- **终态结果要去重**（`sub_agent_view::strip_rendered_turns`）：`TraceEvent::Done.result` 是各轮助手文本的拼接（`sub_agent.rs` 的 `outputs.join("\n\n")`），逐轮文本已经各自成条——不剥掉就会让人把同一段话读两遍。剥完剩下的才是新信息：出错时的报错、中断时的「已被中断」说明。逐轮文本落盘时被截到 4KB、终态结果里那份可能有 20KB，对不上时剥不掉、整段再出现一次，这是有意的降级（与其猜边界把内容切碎，不如原样展示）。
+- 落盘轨迹缺失时退回面板那份工具流水（`messages_from_tool_log`）：流水只有工具名 / 参数摘要 / 耗时，没有输出正文，所以结果行是空的——展开后看到的是一行状态摘要，而不是（并不存在的）输出。
 
 **Thinking 三条不可回退的理由**（`render.rs::render_thinking_block`）：① 折叠头用 `⎿`(U+23BF) 而非旧实现的 `✻`(U+273B)，后者属 Dingbats 区，终端字体覆盖率低一个量级，缺字形时画成豆腐块；② 行数统计的是**去空行后的原始行数**，与屏幕上的**视觉行数**（折行后再截断）没有对应关系，所以它只能当元信息、不能当"下面还有多少内容"的提示；③ 流式期间（`live: true`）**只取 `content` 尾部 `LIVE_TAIL_LINES` 行**——旧实现每帧把整个 `thinking_buf` 重新折行一遍、再只取前 3 行扔掉，长 thinking 下是纯浪费；反过来「一个字符都不碰」又让用户看不见模型在想什么。现在的做法是两头兼顾：`str::rsplit` 是反向惰性迭代器，取尾部 N 行只解码 N 行，代价与 `content` 长度无关。**钉子 `live_thinking_block_shows_tail_only_and_stays_cheap`**——把 `rsplit` 改回 `lines()` 或改成全文折行再截断，行数断言会立刻变红。耗时来自 `AppState.thinking_started`（`flush_thinking` 在清空前算出并落到 `ChatMessage::thinking_elapsed_secs`；该字段自 ThinkingDelta 首块写入后曾长期只有写点零读点），`/resume` 的旧会话没有耗时，故有 `thinking.done_no_elapsed` 分支而不是显示假的 `0.0s`。
 

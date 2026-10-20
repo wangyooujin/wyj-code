@@ -154,7 +154,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 首次 400 会自动降级（不中断会话），本进程内停用缓存并在 `/cost` 显示降级原因。
 
 `[notify]` / `[storage]` / `[persist_cap]` / `[evolution]` / `[subagent]` / `[context_edit]` /
-`[computer_use]` / `[tools]` 等块的完整字段与默认值见 `docs/reference/config.md`。
+`[computer_use]` / `[tools]` / `[search]` 等块的完整字段与默认值见 `docs/reference/config.md`。
 
 ## Architecture
 
@@ -165,7 +165,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | `crates/config` | `wyj-config` | 配置加载（`~/.wyj-code/config.toml`）、MCP 配置结构 |
 | `crates/api` | `wyj-api` | LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析 |
 | `crates/core` | `wyj-core` | Agent 推理循环、Session runtime/events、HistoryStore、MemoryStore、权限、checkpoint、workspace/workflow 接口与本地 CodeIndex |
-| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer；WebSearch 仅在配置 search_api_key 时注册，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/BashOutput/KillShell/Glob/Grep/WebFetch/WebSearch/TodoWrite/AskQuestion/ExitPlanMode/SubAgent/Computer；WebSearch 仅在 `[search]` 配置可用（api_key 存在且 provider 已知）时注册，后端可选 Tavily / Brave，Computer 仅 macOS/Windows 编译且需 vision+Anthropic profile；descriptions.rs 英文工具描述、textutil.rs 安全截断、bash_session.rs 后台任务单例）|
 | `crates/computer` | `wyj-computer` | computer-use 系统层：`xcap` 截图 + `enigo` 输入合成（两者内部已各自分派 macOS/Windows，本 crate 不再手写 target_os 分支），坐标缩放数学（`scale` 模块，平台无关可测）；仅 `[target.'cfg(any(macos, windows))']` 拉取真实依赖，其余平台编译进桩实现 |
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
