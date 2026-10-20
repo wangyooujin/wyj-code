@@ -1574,6 +1574,14 @@ impl Agent {
         let mut invalid_argument_wrap_up_sent = false;
         // 收尾指令只注入一次；注入后模型仍不交出最终回答，才落到硬中止。
         let mut wrap_up_sent = false;
+        // 输出预算被 thinking 吃干净时（`stop_reason == MaxTokens` 且整条
+        // 回复只有 thinking 块）自动重试**一次**：临时放大输出预算并把
+        // reasoning effort 降一档，把预算从思考让回正文。只做一次是因为
+        // 端点真的只肯给这么多时，第二次一样会撞线，反复重试只会烧钱。
+        // 声明在循环外：重试要 `continue` 整个回合循环，放里面会被重置成
+        // false 从而变成无限重试。
+        let mut truncation_retry_used = false;
+        let mut truncation_retry = false;
         loop {
             turn += 1;
             if turn > max_turns {
@@ -1710,7 +1718,7 @@ impl Agent {
                     .as_deref()
                     .and_then(|effort| wyj_api::normalize_effort(&route_identity, effort))
                     .map(str::to_string);
-                let opts = if let Some(capabilities) = &route.capabilities {
+                let mut opts = if let Some(capabilities) = &route.capabilities {
                     // 能力快照可能已经把 thinking 整体禁掉（用户 override，或上一次
                     // 端点 4xx 被 `CapabilityCache` 记成 rejected）。端点已经亲口说过
                     // 不认，这时静态 spec 不作数。
@@ -1741,6 +1749,34 @@ impl Agent {
                         interleaved: route.interleaved_thinking,
                     }
                 };
+                // 截断重试：预算翻倍（不超过端点声明的上限）并降一档 reasoning
+                // effort。两个动作都做——只放大预算救不回「模型把新预算又全花在
+                // 思考上」，只降 effort 则在某些端点上不改变实际输出上限。
+                // `opts` 每轮 attempt 重建，标志在这里消费完即清，不会溢到下一轮。
+                if truncation_retry {
+                    truncation_retry = false;
+                    let doubled = opts.max_tokens.saturating_mul(2);
+                    opts.max_tokens = match &route.capabilities {
+                        Some(cap) => doubled.min(cap.max_output_tokens),
+                        None => doubled,
+                    };
+                    if let Some(current) = opts.reasoning_effort.as_deref() {
+                        let spec = wyj_api::ThinkingSpec::for_vendor(
+                            &route_identity.vendor,
+                            &route_identity.wire_protocol,
+                            &route_identity.model,
+                        );
+                        if let Some(lower) = downgrade_reasoning_effort(spec.effort_levels, current)
+                        {
+                            opts.reasoning_effort = Some(lower.to_string());
+                        }
+                    }
+                    tracing::info!(
+                        max_tokens = opts.max_tokens,
+                        effort = opts.reasoning_effort.as_deref().unwrap_or("-"),
+                        "上一条回复被 max_tokens 截断且没有可见内容，放大输出预算后重试"
+                    );
+                }
                 let (request_tools, candidate_tools) = self.tools_for_request(&route);
                 let all_schema_tokens = estimate_tool_schema_tokens(&candidate_tools);
                 self.push_request_volatile_tail(
@@ -2518,7 +2554,29 @@ impl Agent {
             // 当成功就表现为「说了话就没反应」且无从排查。先把事实记下来，
             // 由回合收尾处决定要不要惊动用户。
             let empty_completion = assistant_blocks.is_empty();
-            session.push_assistant(assistant_blocks);
+            let visible_output = has_visible_output(&assistant_blocks);
+            // 输出预算被 thinking 吃干净：`MaxTokens` 截断 + 整条回复只有
+            // thinking 块。这时把它 push 进历史只会让下一次请求揣着一条空
+            // signature 的 thinking 继续在同样预算上重演，所以**不 push**，
+            // 放大预算后重新生成一次。只重试一次：第二次仍撞线同样丢弃，
+            // 并在收尾处明确告诉用户，而不是静默结束回合。
+            let truncated_without_output = stop_reason == StopReason::MaxTokens && !visible_output;
+            if truncated_without_output && !truncation_retry_used {
+                truncation_retry_used = true;
+                truncation_retry = true;
+                tracing::warn!(
+                    model = %used_route.model,
+                    max_tokens = used_route.max_tokens,
+                    "模型输出被 max_tokens 截断且只有 thinking，丢弃本条回复并重试一次"
+                );
+                on_text(&wyj_i18n::tr("agent.output_truncated_retrying"));
+                continue;
+            }
+            // 第二次仍撞线：这条同样只有 thinking，落库只会让下一轮揣着
+            // 它继续在同样的预算上撞线，直接丢弃（收尾处已明确告知用户）。
+            if !truncated_without_output {
+                session.push_assistant(assistant_blocks);
+            }
 
             let has_tool_calls = stop_reason == StopReason::ToolUse && !pending_tools.is_empty();
 
@@ -2886,6 +2944,28 @@ impl Agent {
                         "模型返回了空响应（无文本、无 thinking、无 tool_use），回合按成功收尾"
                     );
                     on_text(&wyj_i18n::tr("agent.empty_completion"));
+                } else if !visible_output {
+                    // 「只有 thinking」同样是空响应。旧判据只看整个块列表是否
+                    // 为空，thinking 非空就算「模型说了话」，于是输出预算被
+                    // reasoning 吃干净时回合静默收尾——这正是「长会话跑几轮
+                    // 就停住、没有任何提示」的成因。自动重试也救不回来时，
+                    // 必须把原因和解法明确写出来。
+                    tracing::warn!(
+                        model = %used_route.model,
+                        max_tokens = used_route.max_tokens,
+                        stop_reason = ?stop_reason,
+                        "回复只有 thinking / redacted_thinking，没有可见内容，回合按成功收尾"
+                    );
+                    on_text(&wyj_i18n::tr("agent.output_without_visible_content"));
+                } else if stop_reason == StopReason::MaxTokens {
+                    // 有正文但同样撞了输出上限：正文是被硬切断的。旧实现
+                    // 把它当正常结束——用户看到半句话，没有任何解释。
+                    tracing::warn!(
+                        model = %used_route.model,
+                        max_tokens = used_route.max_tokens,
+                        "回复达到 max_tokens 上限，正文可能被截断，回合按成功收尾"
+                    );
+                    on_text(&wyj_i18n::tr("agent.output_truncated"));
                 }
             }
 

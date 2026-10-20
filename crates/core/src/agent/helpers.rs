@@ -22,6 +22,36 @@ pub(super) fn session_agent_event_id(call_id: &str) -> u64 {
         })
 }
 
+/// assistant 消息里有没有**用户能看见**的内容。
+///
+/// thinking / redacted_thinking 只是模型的中间过程：它们非空不能证明这一轮
+/// 「说了话」。这正是「长会话跑几轮后突然停住、没有任何提示」的成因——
+/// 输出预算被 reasoning 吃干净后，回复只剩 thinking 块，旧判据
+/// `blocks.is_empty()` 认为「不是空响应」，循环按正常结束收尾。
+pub(super) fn has_visible_output(blocks: &[ContentBlock]) -> bool {
+    blocks.iter().any(|block| match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        ContentBlock::ToolUse { .. } => true,
+        _ => false,
+    })
+}
+
+/// 输出被截断重试时把 reasoning effort 降到该厂商支持的下一档。
+///
+/// 不能按 `max → high → medium → low` 的字符串阶梯硬走：各 vendor 的
+/// `effort_levels` 并不一致（Moonshot k3 只有 low/high/max），硬阶梯会
+/// 落在一个端点不认的档位上，被 adapter 静默丢弃——等于降档从未发生，
+/// 第二次重试大概率又被 reasoning 吃光预算。因此直接在档位表里取前一档。
+///
+/// `None` 表示已是最低档，或当前值不在这张表里（保持原值即可）。
+pub(super) fn downgrade_reasoning_effort(
+    levels: &[wyj_api::ReasoningEffort],
+    current: &str,
+) -> Option<&'static str> {
+    let index = levels.iter().position(|level| level.as_str() == current)?;
+    index.checked_sub(1).map(|prev| levels[prev].as_str())
+}
+
 /// Reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking、R1
 /// 蒸馏系列 `-r1` 后缀）在工具循环中容易陷入 reasoning-token 黑洞：每轮
 /// reasoning 块计入 output tokens 但不一定推进工具调用决策。给它们一个

@@ -4001,3 +4001,265 @@ fn memory_snapshot_is_shared_across_agent_clones() {
         "clone 出来的 Agent 应复用同一份快照缓存"
     );
 }
+
+// ── 输出预算被 reasoning 吃满：长会话「跑几轮后静默停住」 ────────────────
+
+/// 按预置脚本逐次回放事件，并记录每次请求**实际发出**的输出参数。
+struct TruncatedScriptProvider {
+    script: Mutex<Vec<Vec<StreamEvent>>>,
+    seen: Mutex<Vec<(u32, Option<String>)>>,
+}
+
+impl TruncatedScriptProvider {
+    fn new(script: Vec<Vec<StreamEvent>>) -> Self {
+        Self {
+            script: Mutex::new(script),
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<(u32, Option<String>)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// 「输出预算全花在 thinking 上」的回复形态：只有 thinking，没有文本/工具。
+fn thinking_only(reason: StopReason) -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::ThinkingStart,
+        StreamEvent::ThinkingDelta("先想很久，但一个字的正文都没留下".into()),
+        StreamEvent::MessageStop {
+            stop_reason: reason,
+        },
+    ]
+}
+
+#[async_trait::async_trait]
+impl Provider for TruncatedScriptProvider {
+    async fn stream(
+        &self,
+        _system: &wyj_api::SystemPrompt<'_>,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+        opts: &wyj_api::provider::RequestOptions,
+    ) -> Result<EventStream> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((opts.max_tokens, opts.reasoning_effort.clone()));
+        let events = {
+            let mut script = self.script.lock().unwrap();
+            if script.is_empty() {
+                vec![StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }]
+            } else {
+                script.remove(0)
+            }
+        };
+        Ok(Box::pin(futures::stream::iter(
+            events
+                .into_iter()
+                .map(Ok)
+                .collect::<Vec<Result<StreamEvent>>>(),
+        )))
+    }
+}
+
+fn truncation_test_agent(provider: std::sync::Arc<TruncatedScriptProvider>) -> Agent {
+    Agent::new(provider)
+        .with_route_identity(
+            "test",
+            "deepseek",
+            "deepseek-v4-pro",
+            "https://example.test/v1",
+            wyj_config::WireProtocol::OpenAiChatCompletions,
+        )
+        .with_max_tokens(1024)
+        .with_reasoning_effort(Some("high".to_string()))
+}
+
+/// 核心回归：thinking-only + MaxTokens 必须自动重试一次，且被截断的那条回复
+/// **不能落进历史**——否则下一轮揣着同一条纯 thinking 消息，在同样的预算上
+/// 再撞一次，表现就是「长会话跑几轮后静默停住」。
+#[tokio::test]
+async fn truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history() {
+    let provider = std::sync::Arc::new(TruncatedScriptProvider::new(vec![
+        thinking_only(StopReason::MaxTokens),
+        vec![
+            StreamEvent::TextDelta("完成".into()),
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+    ]));
+    let agent = truncation_test_agent(provider.clone());
+    let mut session = Session::new();
+    push_user_text(&mut session, "继续");
+    let mut visible = String::new();
+
+    agent
+        .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        provider.requests(),
+        vec![
+            (1024, Some("high".to_string())),
+            (2048, Some("medium".to_string())),
+        ],
+        "只重试一次，且同时放大预算并降一档 reasoning"
+    );
+    assert_eq!(session.messages.len(), 2, "user + 最终 assistant");
+    let last = session.messages.last().unwrap();
+    assert!(
+        matches!(
+            last.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "完成"
+        ),
+        "被截断的纯 thinking 回复不能进历史：{:?}",
+        last.content
+    );
+    assert!(visible.contains("完成"));
+}
+
+/// 重试后仍然只有 thinking：必须把原因和解法打给用户，且不再重试。
+#[tokio::test]
+async fn persistent_truncation_is_reported_instead_of_ending_silently() {
+    let provider = std::sync::Arc::new(TruncatedScriptProvider::new(vec![
+        thinking_only(StopReason::MaxTokens),
+        thinking_only(StopReason::MaxTokens),
+    ]));
+    let agent = truncation_test_agent(provider.clone());
+    let mut session = Session::new();
+    push_user_text(&mut session, "继续");
+    let mut visible = String::new();
+
+    agent
+        .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+        .await
+        .unwrap();
+
+    assert_eq!(provider.requests().len(), 2, "最多重试一次，不得反复烧钱");
+    assert!(visible.contains(&wyj_i18n::tr("agent.output_truncated_retrying")));
+    assert!(visible.contains(&wyj_i18n::tr("agent.output_without_visible_content")));
+    assert_eq!(
+        session.messages.len(),
+        1,
+        "两条都只有 thinking，一条都不该进历史"
+    );
+}
+
+/// 没撞 MaxTokens 的纯 thinking 回复是端点偶发，不重试，但同样必须告知。
+#[tokio::test]
+async fn thinking_only_end_turn_is_reported_without_retry() {
+    let provider = std::sync::Arc::new(TruncatedScriptProvider::new(vec![thinking_only(
+        StopReason::EndTurn,
+    )]));
+    let agent = truncation_test_agent(provider.clone());
+    let mut session = Session::new();
+    push_user_text(&mut session, "继续");
+    let mut visible = String::new();
+
+    agent
+        .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+        .await
+        .unwrap();
+
+    assert_eq!(provider.requests().len(), 1, "不是截断就不该重试");
+    assert!(visible.contains(&wyj_i18n::tr("agent.output_without_visible_content")));
+    assert!(!visible.contains(&wyj_i18n::tr("agent.output_truncated_retrying")));
+}
+
+/// 有正文但撞了 MaxTokens：正文是被硬切断的，不重试（重试只会拿到另一截），
+/// 但必须告诉用户「这不是完整回答」。
+#[tokio::test]
+async fn visible_output_hitting_max_tokens_is_reported_but_not_retried() {
+    let provider = std::sync::Arc::new(TruncatedScriptProvider::new(vec![vec![
+        StreamEvent::TextDelta("只写了半句".into()),
+        StreamEvent::MessageStop {
+            stop_reason: StopReason::MaxTokens,
+        },
+    ]]));
+    let agent = truncation_test_agent(provider.clone());
+    let mut session = Session::new();
+    push_user_text(&mut session, "继续");
+    let mut visible = String::new();
+
+    agent
+        .run_turn(&mut session, &FakeCtx, &mut |text| visible.push_str(text))
+        .await
+        .unwrap();
+
+    assert_eq!(provider.requests().len(), 1);
+    assert!(visible.contains("只写了半句"));
+    assert!(visible.contains(&wyj_i18n::tr("agent.output_truncated")));
+}
+
+#[test]
+fn has_visible_output_ignores_thinking_and_blank_text() {
+    assert!(!has_visible_output(&[]));
+    assert!(!has_visible_output(&[ContentBlock::Text {
+        text: "  \n\t".into()
+    },]));
+    assert!(!has_visible_output(&[ContentBlock::Thinking {
+        thinking: "想了很久".into(),
+        signature: String::new(),
+        reasoning_details: None,
+    }]));
+    assert!(!has_visible_output(&[ContentBlock::RedactedThinking {
+        data: "enc".into()
+    }]));
+    assert!(has_visible_output(&[ContentBlock::Text {
+        text: "正文".into()
+    }]));
+    assert!(has_visible_output(&[ContentBlock::ToolUse {
+        id: "t1".into(),
+        name: "Read".into(),
+        input: serde_json::json!({}),
+    }]));
+}
+
+#[test]
+fn downgrade_reasoning_effort_walks_the_vendor_table() {
+    let deepseek = wyj_api::ThinkingSpec::for_vendor(
+        "deepseek",
+        &wyj_config::WireProtocol::OpenAiChatCompletions,
+        "deepseek-v4-pro",
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(deepseek.effort_levels, "max"),
+        Some("high")
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(deepseek.effort_levels, "high"),
+        Some("medium")
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(deepseek.effort_levels, "low"),
+        None,
+        "已是最低档"
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(deepseek.effort_levels, "adaptive"),
+        None,
+        "不在该厂商档位表里的值保持原样"
+    );
+
+    // Moonshot k3 只有 low/high/max：硬编码 max→high→medium 阶梯会落到
+    // 端点不认的 medium 上被静默丢弃，必须按表取前一档。
+    let k3 = wyj_api::ThinkingSpec::for_vendor(
+        "moonshot",
+        &wyj_config::WireProtocol::OpenAiChatCompletions,
+        "kimi-k3",
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(k3.effort_levels, "high"),
+        Some("low")
+    );
+    assert_eq!(
+        downgrade_reasoning_effort(k3.effort_levels, "max"),
+        Some("high")
+    );
+}
