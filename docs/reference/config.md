@@ -272,6 +272,33 @@ aux_model = "MiniMax-M3.1-Flash-Preview"   # 留空 = 辅助调用也用 MiniMax
 | MiniMax-M3.1-Flash | 1.00 | 4.00 | 0.10（0.1x） |
 | MiniMax-M3 | 2.10 | 8.40 | 0.42（0.2x） |
 
+### 网页搜索（WebSearch）
+
+**`[search]` 节**配置内置网页搜索工具（`WebSearch`）的后端与请求默认值。它是 wyj-code 的**内置工具**——不是 MCP server、不是让模型自己拼 `curl` 的 shell 命令，而是与 Read / Grep / WebFetch 并列的一个正式工具。
+
+```toml
+[search]
+provider = "tavily"          # 后端：tavily / brave
+api_key = ""                 # 优先读环境变量 WYJ_CODE_SEARCH_API_KEY
+timeout_secs = 30
+max_results = 5              # 模型未显式指定时返回的条数（硬上限 10）
+```
+
+**两种「不注册」的语义必须分开**（`Config::search_provider_issue` 是唯一判定入口，`/doctor` 与 `--config-status` 都基于它）：
+
+| 情况 | 行为 | 原因 |
+|---|---|---|
+| 没有 API Key | **工具不注册**，模型目录里看不到它 | 预期行为——模型不该看到一个必然失败的工具，不浪费一次 LLM 往返 |
+| provider 名字写错 | **显式报错**，绝不静默回退到默认后端 | 配置错误必须被看见；静默回退会让用户以为用的是 Brave |
+
+**Key 只进请求头**（Tavily 走 `Authorization`，Brave 走 `X-Subscription-Token`），绝不放进请求体——body 会被代理日志与错误上报完整打印，头不会。`WYJ_CODE_SEARCH_API_KEY` 的值**不会**被写回 `config.toml`。
+
+**后端差异是显式的**：`BraveBackend::supports_topic()` 返回 `false`，模型请求 `topic` 时工具层**直接报错**而不是静默忽略——静默忽略会让模型以为「新闻检索」生效了，实际拿到的是通用结果。归一化模型（`SearchRequest` / `SearchHit` / `SearchResponse`）是两家的并集，新增后端只需实现 `SearchBackend`，不必碰工具定义、权限名单、i18n 与 TUI 渲染。
+
+**模型可用的六个参数**：`query`（必填）、`max_results`、`topic`（general / news / finance）、`time_range`（day / week / month / year）、`include_domains` / `exclude_domains`。模型显式给域名过滤时**以模型为准（覆盖，不是并集）**：并集会让模型既无法临时放开配置里的黑名单，也无法把白名单收窄成自己需要的几个域——两种用法都是排障时的常见需求。
+
+**外部文本按不可信输入处理**：结果统一过 `escape_harness_markers` 才能回填给模型（否则网页正文里的 `</system-reminder>` 或行首 `Human:` 能伪造 harness 结构与对话轮次）；超长输出走 spill 落盘而非硬截断，模型可用 Read 取回被省略的中后段。瞬时错误（`Transient`）退避重试一次，限流 / 认证 / 参数错误**不重试**——重试只会更快烧掉配额或拿到同样的错误。
+
 ### Hooks 自动化系统
 
 **Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v0.2.27 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
