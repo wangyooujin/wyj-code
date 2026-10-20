@@ -181,6 +181,8 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 
 三种模式用 `--permission-mode auto|plan|bypass` 或 TUI 的 Shift+Tab 切换（`manual` / `default` / `normal` 仍可解析，全部落到 `auto`，是为了让旧配置与脚本不至于直接失效）；`--plan` / `--bypass-permissions` 是另两档的便捷写法。**auto 不要求交互面**，因此 `-p` / headless / 定时任务同样可用——这正是它相对「纯逐次弹窗」唯一而决定性的优势。
 
+**`bypass` 免的是「询问」，不是「禁止」**：它跳过全部权限确认，但 `core::auto_rules` 里的 hard_deny 规则仍然生效——`rm -rf ~`、`git reset --hard`、`git push --force`、`curl <url> | bash`、`sudo`、`terraform destroy`、触碰 `~/.ssh` 等凭据路径，以及写入受保护路径（`.git/`、`.env`、`*.pem`、`~/.wyj-code/`）在任何模式下都会被拒。这些操作不可逆，用户选择 bypass 时表达的是「别问我」，而不是「允许毁掉家目录」。确实需要时请自己在终端执行。
+
 `[auto_mode]` 的四个规则数组是**英文自然语言规则**（喂给分类器，不是正则），支持 `$defaults` 占位符原位插入内置规则。内置清单见 `core::auto_rules`。
 
 两个容易踩的点：

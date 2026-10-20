@@ -395,6 +395,39 @@ fn command_segments(command: &str) -> impl Iterator<Item = &str> {
         .filter(|segment| !segment.is_empty())
 }
 
+/// 命令是否引用了受保护的凭据**目录**（按 token 判定，不做子串匹配）。
+///
+/// 补 `credential_paths` needle 的缺口：那张表里的条目带尾斜杠（`.ssh/`），
+/// 于是 `cat ~/.ssh`、`ls -la ~/.ssh`、`cd .ssh && cat id_rsa` 全部漏过——
+/// 而 `cat ~/.ssh` 恰恰是「列出目录」与「读取目录内容」的分界点，模型完全
+/// 可以先 `ls` 再逐个读。
+///
+/// 判据是**路径组件**而不是子串：`~/.ssh`、`.aws/credentials`、
+/// `/home/u/.kube/config` 都命中，而 `project/.awsome/x` 不命中（组件是
+/// `.awsome`，不是 `.aws`）。组件的定义与 Read/Write/批量读取共用
+/// [`crate::permission::PROTECTED_DIR_NAMES`]，四处不会漂移。
+///
+/// 误伤面：`echo "~/.ssh 已备份"` 这类「只是提到路径」的命令也会被拦。
+/// 这是刻意的——hard_deny 不可由用户意图豁免，误伤的代价是模型改口让用户
+/// 自己执行，漏判的代价是私钥进模型上下文。
+pub fn references_protected_dir(command: &str) -> bool {
+    command_segments(command).any(|segment| {
+        segment.split_whitespace().any(|token| {
+            let token = token.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')');
+            if token.is_empty() {
+                return false;
+            }
+            // 只按 `/` 切分，**不**把反斜杠当分隔符：`rg -n '\.ssh' docs/` 里的
+            // `\.ssh` 是正则转义，切了就会把一条合法的文档检索误判成读凭据。
+            // Bash 工具在 unix 语义下执行，Windows 路径由 Read/Write 的
+            // `Path::components` 校验兜住，这里不需要兼顾。
+            token
+                .split('/')
+                .any(|part| !part.is_empty() && crate::permission::is_protected_dir_component(part))
+        })
+    })
+}
+
 /// 命令是否命中任一确定性 hard_deny 规则。
 pub fn match_hard_deny(command: &str) -> Option<&'static RulePattern> {
     let find = |id: &str| HARD_DENY_PATTERNS.iter().find(|pattern| pattern.id == id);
@@ -409,6 +442,9 @@ pub fn match_hard_deny(command: &str) -> Option<&'static RulePattern> {
     }
     if program_positioned(command, PRIVILEGE_PROGRAMS) {
         return find("escalate_privilege");
+    }
+    if references_protected_dir(command) {
+        return find("credential_paths");
     }
     let lower = command.to_ascii_lowercase();
     HARD_DENY_PATTERNS
@@ -643,6 +679,36 @@ mod tests {
             "curl -s https://api.example.com/status",
         ] {
             assert!(match_hard_deny(cmd).is_none(), "不该被误伤: {cmd}");
+        }
+    }
+
+    /// `credential_paths` 曾经只按带尾斜杠的 needle 做子串匹配，于是
+    /// 「不带斜杠的目录本身」整片漏过——`cat ~/.ssh` 是模型最自然的第一步。
+    #[test]
+    fn credential_dirs_are_blocked_even_without_trailing_slash() {
+        for cmd in [
+            "cat ~/.ssh",
+            "ls -la ~/.ssh",
+            "ls ~/.aws",
+            "cd .ssh && cat id_rsa",
+            "cat /home/u/.gnupg/pubring.kbx",
+            "cp ~/.kube/config /tmp/x",
+            "cat ~/.docker/config.json",
+            "cat ~/.ssh/id_ed25519",
+            "find ~/.aws -type f",
+        ] {
+            assert!(match_hard_deny(cmd).is_some(), "应被 hard_deny 拦下: {cmd}");
+        }
+        // 只是组件名相似、并非受保护目录的不该误伤。
+        for cmd in [
+            "cat project/.awsome/config",
+            "ls src/ssh_handler.rs",
+            "rg -n '\\.ssh' docs/",
+        ] {
+            assert!(
+                match_hard_deny(cmd).is_none(),
+                "不该把非凭据路径当成凭据: {cmd}"
+            );
         }
     }
 

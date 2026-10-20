@@ -4,6 +4,7 @@ pub mod agent_hub;
 #[cfg(target_os = "macos")]
 pub mod app_computer;
 pub mod ask_question;
+mod atomic_write;
 mod bash;
 mod bash_output;
 pub mod bash_session;

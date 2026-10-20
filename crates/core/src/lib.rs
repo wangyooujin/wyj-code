@@ -80,9 +80,10 @@ pub use memory_v3::{
     TaskStep, MEMORY_V3_SCHEMA_VERSION,
 };
 pub use permission::{
-    check_read_target, is_protected_read_target, safe_resolve_write_target, DenyReason,
-    ExecutionSurface, PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest,
-    PermissionVerdict,
+    check_read_target, check_search_root, is_protected_dir_component, is_protected_dir_tree,
+    is_protected_read_target, safe_resolve_write_target, DenyReason, ExecutionSurface,
+    PermissionMode, PermissionPolicy, PermissionPrompt, PermissionRequest, PermissionVerdict,
+    PROTECTED_DIR_NAMES,
 };
 pub use project::{project_key, project_root};
 pub use secret::{redact_cow, redact_sensitive_text, REDACTED_SECRET};
