@@ -14,6 +14,7 @@ provider = "anthropic"       # 或 "openai"
 model = "claude-opus-4-8"
 plan_model = ""              # Plan 模式专用模型，留空则使用 model
 exec_model = ""              # Exec/Bypass 模式专用模型，留空则使用 model
+# aux_model = ""             # 辅助模型（留空则辅助调用也用 model）。见下方「辅助模型」节
 base_url = ""                # 留空使用供应商默认端点
 max_tokens = 32000
 context_window = 200000
@@ -212,12 +213,46 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 - **执行顺序**：编辑工具成功 → `PostToolUse` hook → 项目 verify。hook 的反馈（格式化、lint 提示）先到，verify 看到的是 hook 已经处理过的工作树。编辑工具**自身失败**时不跑 verify——失败原因已经在工具结果里了，再跑一遍命令只是浪费。
 - **有界**：默认超时 120s（`timeout_secs` 可覆盖），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model` 热重建。
 
+### 辅助模型（aux_model）
+
+**`aux_model`**：把**低风险、短提示词**的辅助调用切到更便宜/更快的模型。留空 = 辅助调用也用 `model`（默认行为，不配就没有任何代价）。
+
+```toml
+[[profiles]]
+name = "default"
+model = "MiniMax-M3"
+aux_model = "MiniMax-M3.1-Flash-Preview"   # 留空 = 辅助调用也用 MiniMax-M3
+```
+
+生效的辅助调用点（**只有这两个**）：
+
+| 调用点 | 位置 | 提示词规模 |
+|---|---|---|
+| 会话标题生成 | `core::summary` | 短常量，上限 256 output token |
+| 跨会话记忆提取 | `core::memory` / `core::memory_v3` | 最近 20 条消息文本（有界） |
+
+**四条不可回退的约束**：
+
+1. **上下文压缩（compact）绝不用辅助模型**。压缩请求逐字节复用主对话的 system + tools 前缀来命中 prompt cache（`core::agent` 的 `CompactPrefix`），换模型等于前缀不等 → 缓存归零 → 整段历史全价重发。长会话里这一次重发比所有辅助调用的总开销大一个数量级。测试 `compaction_never_uses_the_auxiliary_provider` 钉住这条。
+2. **换模型不打穿主会话缓存**。两个辅助调用各自用**独立的短 system prompt**（`prompts::MEMORY_SYSTEM` 等），不复用主对话前缀，因此主会话 87% 的缓存命中率不受影响。
+3. **必须同分组、同端点、同 Key**。辅助模型会收到对话内容片段，跨供应商路由等于把这些内容发给另一家服务商——这与 `[routing].cross_provider_fallback = false` 守的是同一条边界。
+4. **辅助调用失败不牵连主流程**。标题生成失败 → 静默跳过；记忆提取失败 → `tracing::debug!` 吞掉；provider 构建失败 → 告警并退回主模型。三条路径都不会中断主对话。
+
+**thinking 不是「更便宜」的保证**：辅助调用用 `RequestOptions::text_only(N)`，本身不发 thinking 参数，但端点默认行为仍在——MiniMax M3.1 在 Anthropic 端点**关不掉** thinking（`thinking.rs` 的 `user_can_disable: false`），M3 则可以。选 M3.1-Flash 意味着 thinking token 照计，最终费用以 `/cost` 实测为准，不要只看标价。
+
+**单价参考**（MiniMax 官方，人民币/百万 tokens；`/cost` 表按 7.0 折算美元）：
+
+| 模型 | 输入 | 输出 | 缓存读取 |
+|---|---|---|---|
+| MiniMax-M3.1-Flash | 1.00 | 4.00 | 0.10（0.1x） |
+| MiniMax-M3 | 2.10 | 8.40 | 0.42（0.2x） |
+
 ### Hooks 自动化系统
 
 **Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v0.2.27 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
 
 ### /config 面板
 
-**`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`）已迁移到 `/model` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空（或空串）则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文；解析统一走 `wyj_i18n::resolve_locale`。
+**`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`/`aux_model`）已迁移到 `/model` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空（或空串）则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文；解析统一走 `wyj_i18n::resolve_locale`。
 
 `language` 同时决定**模型输出语言**，不只是 UI 文案：解析结果经 `prompts::EnvInfo::collect` 进入 system prompt 的 `<env>` 块（`Response language: Chinese (zh)`），并由 `prompts::sub_agent_language_section` 追加给子 Agent（子 Agent 的 system prompt 是整体替换，拿不到 `<env>` 块）。i18n 本身仍只覆盖用户可见 UI 文案（TUI 对话框、slash 命令输出、CLI --help/--config-status），模型侧提示词（system prompt、工具描述等）为英文常量不走 i18n（见上方"模型侧提示词"节），工具内部错误消息等仍为中文，待后续阶段迁移。

@@ -181,6 +181,19 @@ pub struct Profile {
     /// Exec/Bypass 模式专用模型（留空则使用 model）
     #[serde(default)]
     pub exec_model: Option<String>,
+    /// 辅助模型（留空则辅助调用也用 model）。
+    ///
+    /// 只作用于**短提示词、低风险**的辅助调用：会话标题生成、跨会话记忆提取。
+    /// 这类请求不复用主对话的 system prompt 前缀，因此换模型不会让主会话的
+    /// prompt cache 失效。
+    ///
+    /// **不作用于上下文压缩（compact）**：压缩请求逐字节复用主对话的 system +
+    /// tools 前缀来命中缓存，换模型等于前缀不等 → 缓存归零 → 整段历史全价重发。
+    ///
+    /// 必须与本分组同 vendor、同端点（共用同一张 API Key）。辅助模型会收到
+    /// 对话内容片段，跨供应商路由等于把这些内容发给另一家服务商。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aux_model: Option<String>,
     /// API 端点（留空使用供应商默认值）
     #[serde(default)]
     pub base_url: String,
@@ -250,6 +263,7 @@ impl Default for Profile {
             model: "claude-opus-4-8".to_string(),
             plan_model: None,
             exec_model: None,
+            aux_model: None,
             base_url: String::new(),
             api_key: None,
             api_key_env: None,
@@ -1294,6 +1308,7 @@ impl From<LegacyConfigV0> for Config {
                 model: legacy.model,
                 plan_model: legacy.plan_model,
                 exec_model: legacy.exec_model,
+                aux_model: None,
                 base_url: legacy.base_url,
                 api_key: legacy.api_key,
                 api_key_env: None,
@@ -1851,6 +1866,7 @@ mod valid_env_name_tests {
                 model: "MiniMax-M3".to_string(),
                 plan_model: None,
                 exec_model: None,
+                aux_model: None,
                 base_url: "https://api.minimax.chat/v1".to_string(),
                 api_key: None,
                 api_key_env: Some("model_minimax".to_string()),
@@ -1885,6 +1901,74 @@ mod valid_env_name_tests {
         std::env::remove_var("WYJ_CODE_API_KEY");
 
         assert_eq!(resolved.as_deref(), Some("lowercase-key-from-bashrc"));
+    }
+}
+
+#[cfg(test)]
+mod aux_model_cfg_tests {
+    use super::{Config, Profile};
+
+    /// 旧配置里没有 `aux_model` 这项 → 必须读成 `None`（辅助调用走主模型），
+    /// 而不是解析失败或被静默填成主模型名。
+    #[test]
+    fn a_profile_without_aux_model_means_use_the_main_model() {
+        let cfg: Config = toml::from_str(
+            r#"
+active_profile = "main"
+
+[[profiles]]
+name = "main"
+provider = "anthropic"
+model = "claude-opus-4-8"
+base_url = ""
+api_key = "placeholder"
+max_tokens = 32000
+context_window = 200000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.active_profile().aux_model, None);
+    }
+
+    /// `aux_model` 写进 TOML 后必须原样读回来（写盘 → 读盘往返）。
+    #[test]
+    fn aux_model_survives_a_toml_round_trip() {
+        let cfg: Config = toml::from_str(
+            r#"
+active_profile = "main"
+
+[[profiles]]
+name = "main"
+provider = "anthropic"
+model = "MiniMax-M3"
+aux_model = "MiniMax-M3.1-Flash-Preview"
+base_url = "https://api.minimaxi.com/anthropic"
+api_key = "placeholder"
+max_tokens = 32000
+context_window = 200000
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.active_profile().aux_model.as_deref(),
+            Some("MiniMax-M3.1-Flash-Preview")
+        );
+
+        // 序列化回去再读一次，值不能丢。
+        let text = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            reparsed.active_profile().aux_model.as_deref(),
+            Some("MiniMax-M3.1-Flash-Preview")
+        );
+    }
+
+    /// 默认值是 `None`（不配置辅助模型 = 全部走主模型）。
+    #[test]
+    fn the_default_profile_has_no_aux_model() {
+        assert_eq!(Profile::default().aux_model, None);
     }
 }
 
