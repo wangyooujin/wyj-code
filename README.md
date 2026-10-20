@@ -45,6 +45,7 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 - [安装](#安装)
 - [快速开始](#快速开始)
 - [核心特性](#核心特性)
+- [内置网页搜索 WebSearch](#内置网页搜索-websearch)
 - [配置](#配置)
 - [项目资源](#项目资源)
 - [架构](#架构)
@@ -64,8 +65,8 @@ wyj-code 把 AI coding 的核心能力放进一个**可审计、可扩展、可�
   流式思考实时可见；`/cost`、`/context` 按显示宽度自适应排版，中英文都对齐。
 - **多模型 + 双协议**：供应商、线协议与模型能力分开建模，同一套工具可连接官方 API、
   国内模型与本地兼容端点。
-- **Agent 与工具系统**：内置代码搜索、文件编辑、Bash、Web、Computer Use 与 SubAgent，
-  并支持 MCP、Skill、Plugin、Hooks 与自定义 slash 命令。
+- **Agent 与工具系统**：内置代码搜索、文件编辑、Bash、**内置网页搜索**、Web、Computer Use
+  与 SubAgent，并支持 MCP、Skill、Plugin、Hooks 与自定义 slash 命令。
 - **工程化工作流**：checkpoint / rewind / branch、隔离 Git worktree、Workflow DAG、
   ACP adapter、本地 daemon session、机器可读 Review。
 - **安全执行**：权限审批 + OS sandbox 分层；headless、定时任务与 SubAgent 在没有
@@ -232,8 +233,9 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 
 - 内置工具：Read / Write / Edit / Bash（带 sandbox）/ Glob / Grep / WebFetch / WebSearch /
   SubAgent / Computer / AppComputer。
-- WebSearch 仅在配置了 `[search].api_key`（或环境变量 `WYJ_CODE_SEARCH_API_KEY`）时注册，
-  后端可选 Tavily / Brave；Computer 仅 macOS/Windows 编译且需 vision + Anthropic profile。
+- **WebSearch** 内置网页搜索：配一个 Key 就能用，无需 MCP、无需外挂脚本；后端可选
+  Tavily / Brave。详见下方[「内置网页搜索 WebSearch」](#内置网页搜索-websearch)。
+- Computer 仅 macOS/Windows 编译且需 vision + Anthropic profile。
 - TodoWrite 任务列表**默认注册**（`[tools].todo_enabled = true`）；弱模型 / 自托管场景
   可显式关闭。
 - SubAgent 类型：内置 general-purpose / Explore（只读）/ Plan + 用户自定义六层合并链。
@@ -268,6 +270,84 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 
 ---
 
+## 内置网页搜索 WebSearch
+
+> **模型的知识有截止日期，你的代码库没有。**
+> WebSearch 让 wyj-code 在改代码之前先去查「现在这个 API 到底怎么用」「这个 CVE 影响哪些版本」
+> 「这个库的最新版有没有 breaking change」——查完再动手，而不是拿训练时的记忆硬写。
+
+wyj-code 内置网页搜索，**不是外挂脚本、不是 MCP、不是让模型自己拼 curl**。配一个搜索服务
+的 API Key，模型立刻就多出一双能看世界的眼睛：一个后端抽象、两套实现（Tavily / Brave）、
+六个可调参数、全部走审计与权限链路。
+
+### 三分钟启用
+
+```toml
+# ~/.wyj-code/config.toml
+[search]
+provider = "tavily"          # 或 "brave"
+api_key = "tvly-xxxxxxxx"    # 也可以走环境变量，不落盘
+```
+
+或者干脆不落盘：
+
+```bash
+export WYJ_CODE_SEARCH_API_KEY="tvly-xxxxxxxx"
+```
+
+重启 wyj-code，敲 `/doctor` 确认这一行：
+
+```
+  ✓  网页搜索    tavily
+```
+
+**就这样。** 没有插件要装、没有 MCP server 要配、没有 JSON schema 要手写。
+
+### 它能做什么
+
+| 能力 | 说明 |
+|---|---|
+| **时事与时效内容** | `topic = news` / `time_range = day\|week\|month\|year`，查「今天」「本周」的版本发布、安全通告、breaking change |
+| **按域收敛** | `include_domains` / `exclude_domains` 限定官方文档、issue tracker、源码仓库，屏蔽 SEO 农场 |
+| **两套后端随你选** | Tavily（含 LLM 生成的问答式摘要）、Brave（含 `safesearch` 与 `search_lang`）；换后端只改一行 `provider` |
+| **不传 Key 进请求体** | API Key 只进请求头——body 会被代理日志完整打印，头不会 |
+| **结果可深读** | 搜索给的是「标题 + 链接 + 摘要」，模型可以用内置 `WebFetch` 直接读全文，两步接力 |
+
+### 开发者最常用的四个场景
+
+1. **升级依赖前先查 breaking change**
+   > 「`cargo update` 到最新版本之前，先搜一下 tokio 1.5x 有哪些 breaking change。」
+   模型会先搜官方 release notes 与 issue，列出风险点，再决定要不要动 `Cargo.toml`。
+
+2. **排查只在最新版出现的报错**
+   > 「这个 `ConnectionClosed` 错误只在最新版本出现，搜一下是不是已知的 upstream issue。」
+   搜完拿到 issue 编号与讨论串，再回到你的代码里定位。
+
+3. **查框架的当下最佳实践**
+   > 「现在写 Rust HTTP 服务，官方推荐哪种错误处理中间件？」
+   搜索把「过时的博客答案」和「当前官方文档」分开，模型按需 WebFetch 读全文。
+
+4. **安全通告与依赖漏洞**
+   > 「我们用的 `openssl` 版本有没有已知的严重漏洞？」
+   搜 CVE 与发行说明，输出带链接的清单——可审计、可复查。
+
+### 为什么值得单独说一句
+
+- **不塞进 MCP 生态**：很多工具把搜索做成需要自己起的 MCP server，wyj-code 直接内置，
+  装完即用、少一个进程、少一份配置、少一类「为什么它今天突然不见了」的问题。
+- **配错会显式报错，不会静默退化**：provider 名字写错 → 直接告诉你「不是已知后端」；
+  没配 Key → **干脆不注册这个工具**，模型看不到一个注定失败的入口，不浪费一次 LLM 往返。
+- **外部文本当作不可信输入处理**：搜索结果统一过 harness marker 转义，网页正文里的
+  `</system-reminder>` 之类无法伪造对话结构；超长输出 spill 落盘、模型可 Read 取回。
+- **零遥测不打折**：搜索请求是你自己发给你自己的搜索服务，wyj-code 不做中间商、
+  不上报、不留痕。
+
+> **想现在就试？** 装好 wyj-code、配好搜索 Key，然后直接问一句：
+> 「搜一下 Rust 1.90 有什么 breaking change。」
+> 搜索调用会在 TUI 里像其他工具一样**逐行展开给你看**——你看得见它查了什么、点了哪个链接。
+
+---
+
 ## 配置
 
 完整配置字段、环境变量、各 Profile 模板与 Storage caps 见 [`CLAUDE.md`](./CLAUDE.md) 的
@@ -290,6 +370,11 @@ language = ""                     # "en"/"zh"，留空自动检测系统 locale
 
 # API Key 优先从环境变量 WYJ_CODE_API_KEY 读取；配置文件不要写明文 key
 # 多个 Profile 通过 TUI 内 /model 管理；详见 CLAUDE.md "Profile" 节
+
+[search]                         # 内置网页搜索 WebSearch（不配 api_key 则工具不注册）
+provider = "tavily"              # 后端：tavily / brave
+api_key = ""                     # 优先读环境变量 WYJ_CODE_SEARCH_API_KEY（不落盘）
+max_results = 5                  # 模型未显式指定时返回的条数（硬上限 10）
 
 [subagent]
 default_profile = ""              # 子 Agent 默认 Profile
@@ -369,9 +454,10 @@ Schedule、Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/arch
 |---|---|
 | 项目 Pages 主页 | <https://wangyooujin.github.io/wyj-code/> |
 | 在线安装页面 | <https://wangyooujin.github.io/wyj-code/#install> |
-| 在线功能介绍 | <https://wangyooujin.github.io/wyj-code/#features> |
-| 在线架构介绍 | <https://wangyooujin.github.io/wyj-code/#architecture> |
-| 在线版本记录 | <https://wangyooujin.github.io/wyj-code/#changelog> |
+| 在线功能介绍 | <https://wangyooujin.github.io/wyj-code/docs.html#features> |
+| **在线网页搜索介绍** | <https://wangyooujin.github.io/wyj-code/docs.html#websearch> |
+| 在线架构介绍 | <https://wangyooujin.github.io/wyj-code/docs.html#architecture> |
+| 在线版本记录 | <https://wangyooujin.github.io/wyj-code/docs.html#changelog> |
 | GitHub Releases | <https://github.com/wangyooujin/wyj-code/releases> |
 | 仓库更新日志 | [`CHANGELOG.md`](./CHANGELOG.md) |
 | 架构详细文档 | [`doc/architecture.md`](./doc/architecture.md) |
@@ -389,6 +475,8 @@ GitHub Pages 源文件位于 [`site/`](./site/)；一键安装脚本入口为
 
 - **无隐式遥测**：只有显式模型请求、Web 工具或 MCP 调用会访问网络。
 - **API Key 安全**：优先从环境变量读取，配置诊断只显示掩码信息；TUI 写盘后自动 `chmod 0600`。
+- **搜索 Key 只进请求头**：`[search].api_key` 与 `WYJ_CODE_SEARCH_API_KEY` 都只写进
+  HTTP header，绝不放进请求体——body 会被代理日志完整打印，头不会。
 - **`--bypass-permissions`**：只跳过普通交互确认，**不**关闭 OS sandbox，**不**覆盖 protected deny。
 - **无 UI 时的默认拒绝**：Headless、Schedule、SubAgent 没有真实 UI 时不会自动批准写文件、
   执行命令或控制电脑等副作用操作。

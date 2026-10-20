@@ -48,6 +48,7 @@
     </a>
     <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
       <a href="#demo" class="hover:text-amber-500 transition-colors" data-i18n="nav.demo">演示</a>
+      <a href="#websearch" class="hover:text-amber-500 transition-colors" data-i18n="nav.websearch">网页搜索</a>
       <a href="#audience" class="hover:text-amber-500 transition-colors" data-i18n="nav.audience">适合谁</a>
       <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
       <a href="docs.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.docs">文档</a>
@@ -101,6 +102,7 @@
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">Rust 1.80+</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">MIT OR Apache-2.0</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">macOS · Linux · Windows</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs text-amber-500 border-amber-500/20" data-i18n="hero.badge.websearch">内置网页搜索</span>
       </div>
     </div>
 
@@ -184,6 +186,81 @@
   </div>
 </section>
 
+
+<!-- WEBSEARCH -->
+<section id="websearch" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+    <div class="reveal max-w-2xl">
+      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="websearch.kicker">Built-in Web Search</p>
+      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="websearch.title">给它一双能看世界的眼睛</h2>
+      <p class="mt-4 text-paper/55" data-i18n="websearch.desc">模型的知识有截止日期，你的代码库没有。WebSearch 让它在动手之前先查清楚——查完再写，而不是拿训练时的记忆硬写。</p>
+    </div>
+
+    <div class="mt-12 grid lg:grid-cols-[1.05fr_0.95fr] gap-12 items-start">
+      <!-- TERMINAL DEMO -->
+      <div class="reveal min-w-0">
+        <div class="term-window rounded-xl overflow-hidden">
+          <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
+            <span class="term-dot bg-[#ff5f57]"></span>
+            <span class="term-dot bg-[#febc2e]"></span>
+            <span class="term-dot bg-[#28c840]"></span>
+            <span class="ml-3 text-xs text-paper/35">wyj-code — zsh</span>
+          </div>
+          <div class="p-4 sm:p-5 text-[12px] leading-[1.55] text-paper/85 overflow-x-auto">
+            <div class="flex gap-2">
+              <span class="shrink-0 text-amber-400 font-semibold">You</span>
+              <span data-i18n="websearch.demo.user">升级 tokio 到最新版之前，先搜一下有哪些 breaking change</span>
+            </div>
+
+            <div class="mt-3">
+              <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="websearch.demo.search">调用工具 <span class="text-paper">WebSearch</span></span></div>
+              <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="websearch.demo.q1">搜索: tokio 1.5 breaking changes</span></div>
+              <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="websearch.demo.q2">搜索: tokio 1.0 release notes breaking</span></div>
+              <div class="mt-2 pl-4 rounded-lg border border-white/[0.1] bg-ink-950/70 px-3 py-2 text-[11px] leading-relaxed">
+                <p class="text-paper/70" data-i18n="websearch.demo.result.title">1. Tokio v1.0.0 — Announcing Tokio 1.0</p>
+                <p class="mt-1 text-paper/45 truncate" data-i18n="websearch.demo.result.url">tokio.rs/blog/announcing-tokio-1-0</p>
+                <p class="mt-1.5 text-paper/50" data-i18n="websearch.demo.result.snippet">Runtime::block_on is no longer reentrant…</p>
+              </div>
+              <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="websearch.demo.fetch">调用工具 <span class="text-paper">WebFetch</span> · 读取全文</span></div>
+              <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="websearch.demo.done">已归纳 3 处不兼容改动，落在 src/net/ 与 src/runtime/</span></div>
+            </div>
+          </div>
+        </div>
+        <p class="mt-4 text-xs text-paper/35 leading-relaxed" data-i18n="websearch.demo.note">搜索调用和普通工具一样逐行展开给你看——你看得见它查了什么、读了哪个链接，而不是只拿到一段结论。</p>
+      </div>
+
+      <!-- VALUE PROP -->
+      <div class="reveal min-w-0" style="transition-delay:80ms">
+        <div class="card rounded-xl p-7">
+          <h3 class="font-semibold text-phosphor" data-i18n="websearch.props.title">三分钟启用，零插件</h3>
+          <p class="mt-3 text-sm text-paper/60 leading-relaxed" data-i18n="websearch.props.desc">不是外挂脚本，不是 MCP server，不是让模型自己拼 curl。配一个 Key，模型立刻多出一个搜索工具。</p>
+          <div class="mt-5 code-block rounded-lg relative">
+            <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-websearch-cfg" data-copy-text="[search]
+provider = &quot;tavily&quot;
+api_key = &quot;tvly-xxxxxxxx&quot;" aria-label="copy">
+              <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
+            </button>
+            <pre class="px-4 py-3 pr-12 text-[12px] leading-[1.7] overflow-x-auto"><code id="code-websearch-cfg" data-i18n="websearch.code.quick"><span class="text-paper/35"># ~/.wyj-code/config.toml</span>
+[search]
+provider = <span class="text-phosphor">"tavily"</span>      <span class="text-paper/35"># 或 "brave"</span>
+api_key  = <span class="text-phosphor">"tvly-xxxxxxxx"</span></code></pre>
+          </div>
+          <p class="mt-3 text-xs text-paper/40 leading-relaxed" data-i18n="websearch.props.env">不想落盘就设 <code class="text-amber-400">WYJ_CODE_SEARCH_API_KEY</code>；重启后敲 <code class="text-amber-400">/doctor</code> 看到「✓ 网页搜索」就算好了。</p>
+        </div>
+
+        <ul class="mt-5 space-y-3 text-sm text-paper/60 leading-relaxed">
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="websearch.props.l1"><strong class="text-paper/80">按主题与时间收敛</strong>：news / finance 主题，日/周/月/年时效窗口，再加 include / exclude 域名过滤，官方文档与 issue tracker 优先，SEO 农场靠边站</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="websearch.props.l2"><strong class="text-paper/80">两套后端随你换</strong>：Tavily 带问答式摘要，Brave 带 safesearch 与语言参数，换后端只改一行 provider</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="websearch.props.l3"><strong class="text-paper/80">Key 只进请求头</strong>：body 会被代理日志完整打印，头不会——搜索 Key 的处理方式和模型 Key 一样谨慎</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="websearch.props.l4"><strong class="text-paper/80">配错会说话</strong>：provider 写错直接告诉你「不是已知后端」；没配 Key 就干脆不注册，模型看不到注定失败的入口</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="websearch.props.l5"><strong class="text-paper/80">搜索结果当不可信输入</strong>：统一过 harness marker 转义，网页正文伪造不了对话结构；超长内容落盘，模型能原样取回</span></li>
+        </ul>
+
+        <a href="docs.html#websearch" class="inline-block mt-6 text-sm text-amber-500 hover:text-amber-400 transition-colors" data-i18n="websearch.props.more">看完整能力清单与配置项 →</a>
+      </div>
+    </div>
+  </div>
+</section>
 
 <!-- AUDIENCE -->
 <section id="audience" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">
