@@ -707,6 +707,47 @@ impl Agent {
         self
     }
 
+    /// 为**另一个会话**派生一份 Agent：共享配置与不可变资源，重置全部回合级
+    /// 可变状态。
+    ///
+    /// `Agent: Clone` 是浅拷贝——`Arc<Mutex<..>>` 字段被**共享**而非复制。这对
+    /// 「同一会话内重建」（TUI `/model`、模式切换）正是想要的：重建出的 Agent
+    /// 应当继承同一份记忆快照缓存与授权集。但对 **daemon/ACP 的多会话**是错的：
+    /// `create_session` 直接 `agent_template.clone()`，于是
+    ///
+    /// - `turn_permission_grants` 共享 → 会话 A 批准过的 Bash 让会话 B 的 Bash
+    ///   免检，且每个回合入口的 `clear()` 会**互相清空对方**的授权；
+    /// - `loop_guard` 共享 → A 的重复调用把 B 的同名同参调用判成死循环并跳过；
+    /// - `memory_snapshot` / `last_request_volatile` 共享 → A 的规约 reminder
+    ///   全文被 B 的 `/compact` 当作前缀复用，跨会话内容串味；
+    /// - `title_attempted` 共享 → 整个 daemon 只有一个会话能生成标题；
+    /// - `active_route` 共享 → A 的主模型 429 切到 fallback，B 跟着换端点。
+    ///
+    /// 这些字段的共同点是**语义上属于一次会话**，而不是属于进程。需要跨会话
+    /// 共享的（provider、工具表、记忆库、hooks、checkpoint store、能力缓存）
+    /// 仍是 `Arc` 克隆，不复制。
+    ///
+    /// 新增回合级字段时**必须**在这里一并重置，否则它会悄悄漏进新会话——
+    /// 钉子：`agent::tests::fork_for_new_session_isolates_turn_scoped_state`。
+    pub fn fork_for_new_session(&self) -> Self {
+        let mut forked = self.clone();
+        forked.loop_guard = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        forked.turn_permission_grants =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        forked.turn_user_goal = Arc::new(std::sync::Mutex::new(String::new()));
+        forked.memory_snapshot = Arc::new(std::sync::Mutex::new(MemorySnapshotCache::default()));
+        forked.last_request_volatile = Arc::new(std::sync::Mutex::new(String::new()));
+        forked.title_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        forked.active_route = Arc::new(AtomicUsize::new(0));
+        // 会话标识与标题回调属于「本会话」：派生方负责重新设置。
+        forked.session_id = None;
+        forked.title_cb = None;
+        // 事件回调同理——`AgentSessionRuntime::new` 会按新会话重新接线，
+        // 沿用父会话的回调会把 B 的事件投进 A 的广播通道。
+        forked.session_event_cb = None;
+        forked
+    }
+
     /// 注册 thinking 文本增量回调
     pub fn with_thinking_callback(mut self, cb: impl Fn(&str) + Send + Sync + 'static) -> Self {
         self.thinking_cb = Some(Arc::new(cb));
@@ -3154,8 +3195,13 @@ impl Agent {
                 // protected path 等强制策略。
                 HookOutcome::Approve => {
                     if !ctx.is_allowed(&name, &input) {
-                        let msg =
-                            format!("工具 `{name}` 被强制权限策略拒绝；hook approve 无权绕过");
+                        // hook 只能替代「询问」，不能替代「禁止」——理由同下。
+                        let reason = ctx
+                            .denial_reason(&name, &input)
+                            .unwrap_or_else(|| "被强制权限策略拒绝".to_string());
+                        let msg = format!(
+                            "工具 `{name}` 被强制权限策略拒绝；hook approve 无权绕过：{reason}"
+                        );
                         (msg.clone(), ToolResultContent::Text(msg), true)
                     } else {
                         run_tool(&t, input, ctx, &meta).await
@@ -3163,7 +3209,13 @@ impl Agent {
                 }
                 HookOutcome::Passthrough | HookOutcome::Continue { .. } => {
                     if !ctx.is_allowed(&name, &input) {
-                        let msg = format!("工具 `{name}` 在当前模式下不被允许");
+                        // 带具体原因：hard_deny 与 Plan 白名单是两种完全不同的
+                        // 失败，「换个模式就好」和「这条命令永远不行」必须能区分，
+                        // 否则模型会对着一条硬禁止规则反复换写法重试。
+                        let reason = ctx
+                            .denial_reason(&name, &input)
+                            .unwrap_or_else(|| format!("工具 `{name}` 在当前模式下不被允许"));
+                        let msg = format!("工具 `{name}` 被强制权限策略拒绝：{reason}");
                         (msg.clone(), ToolResultContent::Text(msg), true)
                     } else if let Err(reason) =
                         self.ensure_tool_permission(&name, &t, &input, ctx).await
@@ -3903,6 +3955,79 @@ mod tests {
                 "app_computer",
                 serde_json::json!({"action": "click", "window_id": 1})
             )
+        );
+    }
+
+    /// **跨会话派生必须隔离回合级可变状态**——这条钉住 P0 回归。
+    ///
+    /// `Agent: Clone` 是浅拷贝，`Arc<Mutex<..>>` 字段被共享。这对「同一会话内
+    /// 重建」（TUI `/model`）是对的，对 daemon/ACP 的多会话是错的：会话 A 的
+    /// 授权、死循环窗口、记忆快照、volatile 前缀、标题标志、fallback 路由下标
+    /// 全部会漏进会话 B。
+    ///
+    /// 断言方式：先在父 Agent 上写入每种状态，再派生，确认派生体是干净的、
+    /// 且**写派生体不影响父体**（双向隔离，不是只清空一次）。
+    #[test]
+    fn fork_for_new_session_isolates_turn_scoped_state() {
+        let parent = Agent::new(Arc::new(EndTurnProvider));
+
+        // ① 父体写入回合级状态。
+        parent.grant_for_turn("Bash", &serde_json::json!({"command": "git log"}));
+        parent
+            .loop_guard
+            .lock()
+            .unwrap()
+            .push_back(("Read".to_string(), 42));
+        *parent.turn_user_goal.lock().unwrap() = "父会话的目标".to_string();
+        *parent.last_request_volatile.lock().unwrap() = "父会话的规约 reminder".to_string();
+        parent.title_attempted.store(true, Ordering::Release);
+        parent.active_route.store(2, Ordering::Release);
+        {
+            let mut cache = parent.memory_snapshot.lock().unwrap();
+            cache.bucket = Some(7);
+            cache.text = "父会话记忆".to_string();
+        }
+        assert!(parent.turn_granted("Bash", &serde_json::json!({"command": "x"})));
+
+        // ② 派生体：全部回合级状态都必须是干净的。
+        let child = parent.fork_for_new_session();
+        assert!(
+            !child.turn_granted("Bash", &serde_json::json!({"command": "x"})),
+            "子会话不得继承父会话的本轮授权（否则 A 批准的 Bash 让 B 免检）"
+        );
+        assert!(
+            child.loop_guard.lock().unwrap().is_empty(),
+            "死循环窗口必须隔离"
+        );
+        assert_eq!(*child.turn_user_goal.lock().unwrap(), "");
+        assert_eq!(*child.last_request_volatile.lock().unwrap(), "");
+        assert!(!child.title_attempted.load(Ordering::Acquire));
+        assert_eq!(
+            child.active_route.load(Ordering::Acquire),
+            0,
+            "fallback 路由下标必须隔离"
+        );
+        assert!(child.memory_snapshot.lock().unwrap().bucket.is_none());
+        assert_eq!(child.session_id, None, "会话标识属于本会话，派生方重新设置");
+        assert!(
+            child.session_event_cb.is_none(),
+            "事件回调必须由新会话重新接线"
+        );
+
+        // ③ 反向隔离：写子体不影响父体。
+        child.grant_for_turn("Bash", &serde_json::json!({"command": "npm test"}));
+        assert!(
+            parent.turn_granted("Bash", &serde_json::json!({"command": "x"})),
+            "子会话的授权不得回流到父会话"
+        );
+        assert_eq!(parent.loop_guard.lock().unwrap().len(), 1);
+        assert!(parent.title_attempted.load(Ordering::Acquire));
+        assert_eq!(parent.active_route.load(Ordering::Acquire), 2);
+
+        // ④ 应当共享的**不是**回合级状态：provider / 工具表 / 记忆库仍是同一份。
+        assert!(
+            Arc::ptr_eq(&parent.provider, &child.provider),
+            "provider 应共享"
         );
     }
 

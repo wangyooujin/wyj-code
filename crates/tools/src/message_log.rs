@@ -86,12 +86,24 @@ pub fn message_log_file(sessions_dir: &Path, session_id: &str, id: u64) -> PathB
 /// 后台消息日志写手：与 [`crate::trace::TraceWriter`] 同构（单线程串行消费，
 /// 调用方零阻塞），只是写入的是消息而不是 trace 事件。
 pub struct MessageLogWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<(u64, MessageEvent)>,
+    tx: tokio::sync::mpsc::Sender<(u64, MessageEvent)>,
 }
+
+/// 写手队列容量。
+///
+/// **有界**是刻意的。此前用 `unbounded_channel`，而每个 `Appended` 事件都携带
+/// 一份**完整的 `Message`**（工具结果动辄几百 KB）：主 Agent 跑工具循环时事件
+/// 产生速率远高于单线程写盘的消费速率，队列就会无界增长——一次长会话在写盘
+/// 被磁盘 IO 拖慢时能把内存吃到 GB 级。这是「落盘是尽力而为」这条设计意图
+/// 的直接推论：既然允许丢，就没有理由为队列留一个无界的水位。
+///
+/// 取 256：正常回合的事件量远低于此（写盘是 append，单条毫秒级），只有磁盘
+/// 卡住时才会触顶，此时丢事件比撑爆内存正确。
+const QUEUE_CAPACITY: usize = 256;
 
 impl MessageLogWriter {
     pub fn spawn(sessions_dir: PathBuf, session_id: String, max_bytes_per_agent: u64) -> Self {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, MessageEvent)>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, MessageEvent)>(QUEUE_CAPACITY);
         tokio::spawn(async move {
             let dir = trace_dir(&sessions_dir, &session_id);
             if std::fs::create_dir_all(&dir).is_err() {
@@ -154,10 +166,26 @@ impl MessageLogWriter {
 
     /// 生成某个子 Agent 的 sink。`try_send` 满则丢弃——落盘是尽力而为，
     /// 绝不能因为写日志把子 Agent 拖住。
+    ///
+    /// **队列满时的语义边界**：丢弃会让日志缺失中间事件，而读侧无法从文件
+    /// 本身感知（`replay` 的 `incomplete` 只认「解析失败」与显式 truncated
+    /// 标记）。这是刻意接受的——`MessageLog` 是**旁路**，权威历史始终是
+    /// `session.json`；为一次磁盘卡顿去写一个假的「历史已清空」事件，
+    /// 会把一份不完整的日志变成一份**错误的**日志，那更糟。
     pub fn sink_for(&self, id: u64) -> MessageSink {
         let tx = self.tx.clone();
         std::sync::Arc::new(move |event: MessageEvent| {
-            let _ = tx.send((id, event));
+            if tx.try_send((id, event)).is_err() {
+                // 节流：队列打满期间可能每秒触发上百次，只报第一次。
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        agent_id = id,
+                        "消息日志写盘跟不上，队列已满，本次及后续事件将被丢弃（权威历史仍在 session.json）"
+                    );
+                }
+            }
         })
     }
 }

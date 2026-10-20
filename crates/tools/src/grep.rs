@@ -152,11 +152,12 @@ impl Tool for GrepTool {
 
         let root = match &inp.path {
             Some(p) => {
-                let pb = std::path::Path::new(p);
-                if pb.is_absolute() {
-                    pb.to_path_buf()
-                } else {
-                    ctx.cwd().join(pb)
+                // 批量读取没有 `file_path` 可校验，保护必须落在「根」与「每个
+                // 遍历条目」两处。这里只挡根本身就在凭据子树里的情况
+                // （`path: "~/.ssh"`），家目录这类合法根由下面的遍历过滤兜。
+                match wyj_core::check_search_root(ctx.cwd(), p) {
+                    Ok(root) => root,
+                    Err(reason) => return Ok(ToolResult::err(reason.message)),
                 }
             }
             None => ctx.cwd().to_path_buf(),
@@ -273,6 +274,16 @@ fn rg_backend(root: &Path, spec: &SearchSpec) -> Option<(Vec<String>, bool)> {
         OsString::from("-g"),
         OsString::from("!.git/**"),
     ];
+    // 凭据目录在**任何层级**都必须排除：`--hidden` 会连 `.ssh` 一起遍历，
+    // 而 ripgrep 的 `-g '!dir'` 只匹配根层，必须写成 `**/` 前缀才跨层生效
+    // （实测 `-g '!**/.ssh/**'` 能挡住 `sub/.ssh/id_rsa`）。
+    //
+    // 与原生兜底路径的 `filter_entry` 同源（都取自
+    // `wyj_core::PROTECTED_DIR_NAMES`），两条后端不能给出不同结果。
+    for dir in wyj_core::PROTECTED_DIR_NAMES {
+        args.push(OsString::from("-g"));
+        args.push(OsString::from(format!("!**/{dir}/**")));
+    }
     if spec.case_sensitive {
         args.push(OsString::from("--case-sensitive"));
     } else {
@@ -451,7 +462,16 @@ fn native_search(spec: &SearchSpec) -> (Vec<String>, bool) {
         // 有时搜得到、有时搜不到。
         .require_git(wyj_config::gitignore::is_inside_git_repo(&spec.root))
         .threads(threads)
-        .filter_entry(|e| e.file_name() != OsStr::new(".git"));
+        .filter_entry(|e| {
+            // `.git` 是噪音；凭据目录是安全问题——两者都在遍历时整棵剪掉。
+            // `filter_entry` 返回 false 时 ignore crate 不再下钻该子树，
+            // 所以不需要再对每个文件单独判断父目录。
+            let name = e.file_name();
+            name != OsStr::new(".git")
+                && !name
+                    .to_str()
+                    .is_some_and(wyj_core::is_protected_dir_component)
+        });
     builder.build_parallel().run(|| {
         let acc = &acc;
         let prefilter = Arc::clone(&prefilter);
@@ -815,5 +835,44 @@ mod tests {
         assert!(build_prefilter("", true).is_none());
         assert!(build_prefilter("a*", true).is_none());
         assert!(build_prefilter("[0-9]+", true).is_none());
+    }
+
+    /// **凭据目录必须在两条后端上都被排除**——这条钉住 P0 回归。
+    ///
+    /// 事故形态：`Read` 有 `check_read_target`，而 `Grep` 的 root 直接接受
+    /// 任意路径且显式 `--hidden`，于是 `Grep(pattern: "PRIVATE KEY",
+    /// path: "~")` 能把 `~/.ssh/id_rsa` 原文读进模型上下文。保护面此前按
+    /// **工具名**切分，而工具集合是可扩展的——同一条缺口在 MCP 工具上也存在。
+    ///
+    /// 断言两层：根落在凭据子树里直接拒绝；根是合法父目录时，遍历过滤负责
+    /// 跳过其中任意深度的凭据目录（`sub/.ssh` 也要挡住）。
+    #[tokio::test]
+    async fn protected_dirs_are_never_searched_by_either_backend() {
+        let dir = fixture_dir();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".ssh/id_rsa"), "SECRETMATCH\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("sub/.aws")).unwrap();
+        std::fs::write(dir.path().join("sub/.aws/credentials"), "SECRETMATCH\n").unwrap();
+        std::fs::write(dir.path().join("public.txt"), "SECRETMATCH\n").unwrap();
+
+        // ① 根本身在凭据子树里 → 直接拒绝，不白跑一趟。
+        for root in [".ssh", ".ssh/id_rsa", "sub/.aws"] {
+            let out = run_grep(json!({"pattern": "SECRETMATCH", "path": root}), dir.path()).await;
+            assert!(
+                out.contains("拒绝"),
+                "在 {root} 内搜索应被拒绝，实际输出: {out}"
+            );
+        }
+
+        // ② 根是合法父目录 → 遍历过滤生效，只留非凭据文件。
+        let out = assert_both_ways(json!({"pattern": "SECRETMATCH"}), dir.path()).await;
+        assert!(out.contains("public.txt"), "普通文件仍应被搜到");
+        assert!(!out.contains("id_rsa"), "凭据文件绝不能出现在结果里: {out}");
+        assert!(
+            !out.contains("credentials"),
+            "嵌套凭据目录同样要挡住: {out}"
+        );
+
+        std::fs::remove_dir_all(dir.path()).ok();
     }
 }

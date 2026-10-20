@@ -105,7 +105,9 @@ impl Tool for WriteTool {
 
         // 写入前读取旧内容（若存在），用于生成 diff
         let old_content = tokio::fs::read_to_string(&path).await.ok();
-        tokio::fs::write(&path, inp.content.as_bytes()).await?;
+        // 原子覆盖：`tokio::fs::write` 是 open(TRUNC)+write，被 ESC 中断或
+        // 看门狗 abort 时会留下**截断的源码文件**。详见 `atomic_write` 模块。
+        crate::atomic_write::write_file_atomic(&path, inp.content.as_bytes()).await?;
         self.tracker.mark_read(&path_str);
 
         let detail = match &old_content {

@@ -372,6 +372,16 @@ fn walk_files(root: &Path) -> ignore::Walk {
         .git_exclude(true)
         .ignore(true)
         .require_git(wyj_config::gitignore::is_inside_git_repo(root))
+        // 凭据目录整棵剪掉。索引是**持久化**的：一旦 `.ssh/id_rsa` 进了索引，
+        // 之后每次 CodeSearch 都可能把它的内容当普通文本检索出来，且清索引
+        // 之前一直存在。入口校验（`check_search_root`）只能挡搜索根，
+        // 挡不住「根是仓库、`.aws` 在仓库子目录里」这种形态。
+        .filter_entry(|entry| {
+            !entry
+                .file_name()
+                .to_str()
+                .is_some_and(crate::permission::is_protected_dir_component)
+        })
         .build()
 }
 
@@ -390,6 +400,11 @@ fn build_files(root: &Path, max_file_bytes: u64) -> Result<BTreeMap<PathBuf, Ind
 }
 
 fn index_file(root: &Path, path: &Path, max_file_bytes: u64) -> Result<Option<IndexedFile>> {
+    // 与 `walk_files` 同一道过滤：`invalidate` 走的是**单文件**增量重建，
+    // 不经过遍历器，一个落在 `.ssh/` 里的路径照样会被索引进去。
+    if crate::permission::is_protected_dir_tree(path) {
+        return Ok(None);
+    }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.len() > max_file_bytes {
         return Ok(None);

@@ -121,7 +121,8 @@ impl Tool for EditTool {
             content.replacen(&inp.old_string as &str, &inp.new_string, 1)
         };
 
-        tokio::fs::write(&path, new_content.as_bytes()).await?;
+        // 原子覆盖，理由同 Write：被中断时不能留下截断的源码文件。
+        crate::atomic_write::write_file_atomic(&path, new_content.as_bytes()).await?;
 
         let replaced = if inp.replace_all { count } else { 1 };
         let diff = make_diff(&content, &new_content, MAX_DIFF_LINES);
