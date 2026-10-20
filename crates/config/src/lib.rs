@@ -543,6 +543,15 @@ pub struct ModelRuntimeCfg {
     pub tool_argument_retries: usize,
     pub lazy_tools_threshold: usize,
     pub lazy_tools_top_k: usize,
+    /// 工具搜索命中的**排序加权**窗口（回合数），不再决定工具是否可见。
+    ///
+    /// 语义在 v0.3.14 收窄过：旧实现用同一个计时器管「可见性」，到期就把
+    /// 工具从请求里拿掉——而 Anthropic 的缓存前缀物理顺序是
+    /// `tools → system → messages`，官方明确「会话中途增删 tools 会让 tools
+    /// 缓存及其后的 system、messages 全部失效」。于是每 N 个回合就作废一次
+    /// 整段 prompt cache，代价远大于省下的那点 schema token。现在可见性
+    /// **单调不减**（`LazyToolState::exposed`），本字段只管「刚用过的工具在
+    /// 搜索结果里排得更前」。
     pub lazy_tools_sticky_turns: u64,
 }
 

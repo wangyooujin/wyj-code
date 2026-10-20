@@ -98,10 +98,31 @@ pub struct CompactResult {
 /// 现在压缩决策、展示、`/context` 面板全部共用这一个结构体。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ContextAudit {
-    /// system prompt（主提示 + env + 记忆快照 + 项目规约祖先链）。
+    /// system prompt 合计（= `system_stable_tokens` + `system_volatile_tokens`）。
     pub system_tokens: u32,
+    /// system prompt 的 **stable 段**（主提示 + env + 记忆快照 + 项目规约祖先链）。
+    ///
+    /// 单独拆出来是因为它决定 Anthropic 缓存前缀的一半：stable 段字节不变，
+    /// `tools + stable` 整段命中缓存。另一段（volatile）一变，**messages 断点**
+    /// 失效（system 位于 messages 之前，而该断点覆盖 tools + system + messages
+    /// 前缀），整段历史全价重算——所以「哪一段在变」比「system 一共多大」
+    /// 更有诊断价值。
+    pub system_stable_tokens: u32,
+    /// system prompt 的 **volatile 段**（模型兼容 suffix → 工具可用性名单 →
+    /// 语言提醒）。
+    ///
+    /// 子目录规约 reminder 曾在这里累积，导致每命中一个新目录就整段历史
+    /// 全价重算；它已改走历史注入，因此这一段现在是**每轮结构相同**的。
+    pub system_volatile_tokens: u32,
     /// 本次实际发送的工具定义（已扣除 lazy tool 折叠的部分）。
     pub tool_schema_tokens: u32,
+    /// 本次请求**实际发送**的工具个数。
+    ///
+    /// 与 `tool_schema_tokens` 分开是因为两者回答不同的问题：token 回答
+    /// 「多贵」，个数回答「目录多大」。后者决定 tools 段的缓存前缀规模，
+    /// 而 Anthropic 明确规定会话中途增删 tools 会作废 tools 缓存**及其后
+    /// 的全部内容**——所以这个数字只该单调不减。
+    pub tool_count: u32,
     /// 会话历史（messages）。
     pub history_tokens: u32,
     /// 输出预留 `max_tokens`。
@@ -163,9 +184,14 @@ impl ContextAudit {
         const REQUEST_OVERHEAD_TOKENS: u32 = 64;
         const MESSAGE_OVERHEAD_TOKENS: u32 = 4;
 
+        let system_stable_tokens = estimate_text_tokens(system.stable) as u32;
+        let system_volatile_tokens = estimate_text_tokens(system.volatile) as u32;
         Self {
             system_tokens: estimate_system_tokens(system) as u32,
+            system_stable_tokens,
+            system_volatile_tokens,
             tool_schema_tokens: estimate_tools_tokens(tools),
+            tool_count: tools.len() as u32,
             history_tokens: estimate_tokens(messages),
             output_reserve: max_output_tokens,
             framing_tokens: (messages.len() as u32)
@@ -195,6 +221,41 @@ impl ContextAudit {
         } else {
             fallback
         }
+    }
+
+    /// 面板要显示的 system 明细 `(stable, volatile)`。
+    ///
+    /// `None` = **拆分信息缺失**，调用方应回退到 `system_tokens` 合计。两种
+    /// 形态必须区分开：否则面板会显示 `stable = 0 / volatile = 0` 却仍报一个
+    /// 非零的 system 合计。
+    ///
+    /// `ContextAudit` 是**进程内**状态、不随 `SessionFile` 落盘，所以实际
+    /// 触发回退的是「本会话还没发过请求」（默认值全 0）与「system 本来就是
+    /// 空的」这两种情形，而不是「老会话缺字段」。
+    pub fn system_split(&self) -> Option<(u32, u32)> {
+        if self.system_stable_tokens + self.system_volatile_tokens > 0 {
+            Some((self.system_stable_tokens, self.system_volatile_tokens))
+        } else {
+            None
+        }
+    }
+
+    /// 面板上**各明细行之和**，必须等于 [`Self::total`]。
+    ///
+    /// 存在的意义是让「合计」那行可验：用户把各行加起来必须得到同一个数，
+    /// 否则第一反应是面板算错了。拆分形态与回退形态都要对上，因此这个方法
+    /// 与面板的取数路径共用 [`Self::system_split`]——两处各写一半就会在
+    /// 「stable + volatile 恰好为 0」这种边界上分叉。
+    pub fn parts_sum(&self) -> u32 {
+        let system = match self.system_split() {
+            Some((stable, volatile)) => stable.saturating_add(volatile),
+            None => self.system_tokens,
+        };
+        system
+            .saturating_add(self.tool_schema_tokens)
+            .saturating_add(self.history_tokens)
+            .saturating_add(self.output_reserve)
+            .saturating_add(self.framing_tokens)
     }
 }
 
@@ -1938,6 +1999,7 @@ mod tests {
             framing_tokens: 100,
             window: 0,
             reclaimable_tool_result_tokens: 0,
+            ..Default::default()
         };
         assert_eq!(audit.calibrated_total(1.0), audit.total());
         assert_eq!(audit.calibrated_total(1.3), 52_130 + 32_000);
@@ -1957,9 +2019,46 @@ mod tests {
             framing_tokens: 0,
             window: 0,
             reclaimable_tool_result_tokens: 0,
+            ..Default::default()
         };
         assert_eq!(audit.calibrated_total(9.9), 80_000);
         assert_eq!(audit.calibrated_total(0.01), 20_000);
+    }
+
+    /// 面板各明细行之和必须等于合计行——用户把各行加起来得得到同一个数，
+    /// 否则第一反应是「面板算错了」。拆分形态（stable + volatile 两行）要
+    /// 对上，回退形态（system 合计单行）也要对上。
+    #[test]
+    fn the_panel_parts_add_up_to_the_total() {
+        let audit = ContextAudit {
+            system_tokens: 120,
+            system_stable_tokens: 100,
+            system_volatile_tokens: 20,
+            tool_schema_tokens: 300,
+            tool_count: 7,
+            history_tokens: 400,
+            output_reserve: 50,
+            framing_tokens: 10,
+            ..Default::default()
+        };
+        assert_eq!(audit.system_split(), Some((100, 20)));
+        assert_eq!(audit.parts_sum(), audit.total());
+    }
+
+    /// 老会话 / 未发过请求的 audit 没有 stable / volatile 两个字段：面板必须
+    /// 回退成 system 合计**单行**，而不是显示成 0 / 0 却仍报一个非零合计。
+    #[test]
+    fn an_audit_without_the_split_falls_back_to_the_system_total() {
+        let audit = ContextAudit {
+            system_tokens: 120,
+            tool_schema_tokens: 300,
+            history_tokens: 400,
+            output_reserve: 50,
+            framing_tokens: 10,
+            ..Default::default()
+        };
+        assert_eq!(audit.system_split(), None);
+        assert_eq!(audit.parts_sum(), audit.total());
     }
 
     /// 压缩保留预算必须随窗口伸缩——固定条数 / 固定绝对值在两端都会出错。

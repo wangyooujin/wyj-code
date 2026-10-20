@@ -749,6 +749,7 @@ mod tests {
             framing_tokens: 0,
             window: 0,
             reclaimable_tool_result_tokens: 0,
+            ..Default::default()
         };
         session
     }
