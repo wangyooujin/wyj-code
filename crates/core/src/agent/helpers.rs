@@ -52,20 +52,46 @@ pub(super) fn downgrade_reasoning_effort(
     index.checked_sub(1).map(|prev| levels[prev].as_str())
 }
 
-/// Reasoning 模型（DeepSeek `deepseek-reasoner`、Qwen3-Max-Thinking、R1
-/// 蒸馏系列 `-r1` 后缀）在工具循环中容易陷入 reasoning-token 黑洞：每轮
+/// 思考关不掉的模型在工具循环中容易陷入 reasoning-token 黑洞：每轮
 /// reasoning 块计入 output tokens 但不一定推进工具调用决策。给它们一个
 /// 保守的 32 轮硬上限，普通模型保留调用方传入的默认值。
 ///
+/// **判据有两层，缺一不可**：
+///
+/// 1. 模型名命中 `reasoner` / `-r1`（DeepSeek reasoner、R1 蒸馏系列）；
+/// 2. vendor × wire × model 的 [`ThinkingSpec`] 表明**思考根本无法关闭**
+///    （`user_can_disable == false` 或 `ignore_disabled_when_forced`）。
+///
+/// 第 2 层是 v0.3.15 补的。旧实现只认模型名，于是 MiniMax M2.x / M3.1
+/// （`/anthropic` 端点发 `disabled` 直接 400）、Qwen `-thinking`、豆包
+/// `-thinking`、Moonshot `-code` 这些**强制思考**的端点全都落到默认
+/// 200 轮——而它们的每一轮都要完整跑一遍深度推理。实测一条
+/// `MiniMax-M3.1-Flash` 会话：单个用户回合 163 次 API 往返、35.6 万
+/// output token、墙钟 30 分钟以上，收尾提醒要到第 196 轮才注入，等于
+/// 前 195 轮没有任何「该收敛了」的信号。名字里既没有 `reasoner` 也没有
+/// `-r1`，旧判据完全看不见它。
+///
+/// 判据刻意走 `ThinkingSpec` 而不是再列一份 vendor 白名单：那张表已经是
+/// 「这个端点能不能关思考」的唯一真值来源（thinking adapter 与 catalog 都
+/// 只认它），在这里另写一份必然漂移——加一个 vendor 就要改两处。
+///
 /// 抽成 free function 以便单测覆盖（不必构造完整 Agent）。
-pub(super) fn max_turns_for_model(default_max_turns: usize, model: &str) -> usize {
+pub(super) fn max_turns_for_model(
+    default_max_turns: usize,
+    vendor: &str,
+    wire: &wyj_config::WireProtocol,
+    model: &str,
+) -> usize {
     const REASONING_MAX_TURNS: usize = 32;
     let lower = model.to_ascii_lowercase();
     if lower.contains("reasoner") || lower.contains("-r1") {
-        REASONING_MAX_TURNS
-    } else {
-        default_max_turns
+        return REASONING_MAX_TURNS;
     }
+    let spec = wyj_api::ThinkingSpec::for_vendor(vendor, wire, model);
+    if !spec.user_can_disable || spec.ignore_disabled_when_forced {
+        return REASONING_MAX_TURNS;
+    }
+    default_max_turns
 }
 
 /// 对 `serde_json::Value` 做规范化后做 FNV-1a 64-bit 哈希。Object 的 key

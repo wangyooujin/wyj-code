@@ -211,7 +211,9 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 
 ## 推理轮数触顶不再等于失败
 
-`max_turns_for_model` 对 reasoning 模型压到 32 轮、普通模型 200 轮（`[agent].max_turns` 可覆盖普通模型那一档）。
+`max_turns_for_model(default, vendor, wire, model)` 有**两层判据**，命中任一即压到 32 轮，否则 200 轮（`[agent].max_turns` 只覆盖后一档）：① 模型名含 `reasoner` / `-r1`；② `ThinkingSpec::for_vendor(..)` 表明该端点**思考关不掉**（`!user_can_disable` 或 `ignore_disabled_when_forced`）——MiniMax M2.x/M3.1、Qwen `-thinking`、豆包 `-thinking`、Moonshot `-code` 全在这个集合里。
+
+**为什么加第 2 层（v0.3.15）**：旧判据只认模型名，于是所有「强制思考」的第三方端点都拿到默认 200 轮。实测一条 `MiniMax-M3.1-Flash`（`/anthropic` 端点）会话：**单个用户回合 163 次 API 往返、35.6 万 output token、墙钟 30 分钟以上**，收尾提醒要到第 196 轮才注入——前 195 轮没有任何收敛信号，一个回合可以合法地跑 200 次完整深度推理。判据刻意复用 `ThinkingSpec` 而不是另立 vendor 白名单：那张表已是「能不能关思考」的唯一真值来源（thinking adapter 与 catalog 都只认它），在这里再写一份必然漂移。单测：`max_turns_caps_endpoints_that_cannot_disable_thinking`、`max_turns_does_not_cap_endpoints_that_can_disable_thinking`（后者防误伤 MiniMax M3 / Kimi k2.5 / GLM）。
 
 **事故（2026-10-15）**：一次跨十几个文件的重构在第 200 轮触顶，抛出的却是 `bail!` —— 用户看到一句红色「超过最大推理轮数 200」，而工作树里那 143 次 Edit、85 次 Bash、81 次 Read 全都已经落地，错误率仅 6%，**没有一轮是空转**。翻出触顶时刻的 `turn_limit` checkpoint 逐轮核对后确认：模型一直在干有效工作，只是没人告诉它「该停了，该总结了」。
 

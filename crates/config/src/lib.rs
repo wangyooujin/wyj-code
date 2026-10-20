@@ -638,7 +638,10 @@ pub struct AgentCfg {
     /// 最长耗时，两者都不影响死循环保护——那由 `loop_guard` 独立承担。
     ///
     /// 推理模型（DeepSeek `deepseek-reasoner` 等）另有更保守的 32 轮熔断，
-    /// 不受本值影响。
+    /// 不受本值影响。**思考关不掉的端点同样如此**——判据走
+    /// `ThinkingSpec::for_vendor`，覆盖 MiniMax M2.x/M3.1、Qwen `-thinking`、
+    /// 豆包 `-thinking`、Moonshot `-code`。理由：它们的每一轮都是一次完整
+    /// 深度推理，实测一条 MiniMax 会话单回合跑了 163 轮、墙钟 30 分钟以上。
     pub max_turns: usize,
 }
 
