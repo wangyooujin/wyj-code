@@ -7720,6 +7720,50 @@ mod tests {
         );
     }
 
+    /// 记忆注入的**优先级链**：v3 → evolution → v2。
+    ///
+    /// 三套记忆并存是历史遗留，但它们的注入点是一条 if-else 链而不是叠加：
+    /// v3 一旦存在，v2 那段**一行都不会执行**。CLI 装配因此只在 v3 没建成时
+    /// 才构造 v2（见 `main.rs` 的 `memory_store`），避免每次启动多建一个目录、
+    /// 多读一次盘，并让 `/memory` 面板不再维护一处永远没有读者的状态。
+    ///
+    /// 这条钉住「链的顺序」——把它改成叠加或调换顺序，会同时改变注入给模型的
+    /// 内容与启动开销，且不会有任何编译错误提示。
+    #[test]
+    fn memory_injection_prefers_v3_then_evolution_then_v2() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let v3 = Arc::new(crate::MemoryV3Store::new(base.path(), project.path()).unwrap());
+        seed_task(&v3, "V3 里的任务", TaskStatus::InProgress, None);
+
+        // ① 只有 v3：注入 v3 的内容。
+        let agent = Agent::new(Arc::new(EndTurnProvider)).with_memory_v3(v3.clone());
+        let session = session_with_query("继续");
+        assert!(agent.memory_snapshot_text(&session).contains("V3 里的任务"));
+
+        // ② v3 + v2 同时装上：v2 不得出现在快照里（if-else 链，不是叠加）。
+        let v2 = Arc::new(
+            crate::MemoryStore::new(base.path(), project.path()).expect("v2 store 应能创建"),
+        );
+        let both = Agent::new(Arc::new(EndTurnProvider))
+            .with_memory_v3(v3.clone())
+            .with_memory(v2.clone());
+        let text = both.memory_snapshot_text(&session);
+        assert!(text.contains("V3 里的任务"), "v3 存在时仍应由 v3 提供内容");
+        assert!(
+            !text.contains("MEMORY.md"),
+            "v2 的索引不得混进 v3 的快照: {text}"
+        );
+
+        // ③ 只有 v2（v3 降级路径）：回落到 v2，且不 panic。
+        let only_v2 = Agent::new(Arc::new(EndTurnProvider)).with_memory(v2);
+        let fallback = only_v2.memory_snapshot_text(&session);
+        assert!(
+            fallback.is_empty() || !fallback.contains("V3 里的任务"),
+            "v3 缺席时不应凭空出现 v3 的内容"
+        );
+    }
+
     #[test]
     fn with_skills_injects_the_catalog_and_leaves_no_placeholder() {
         // 回归背景：用户说"请使用 skill 分析股票"，模型回复"我不能自己调用

@@ -34,7 +34,7 @@
     **发送前截断只截副本**（`serialize::messages_need_truncation`，v0.3.9）：旧实现在每次 `provider.stream()` 前对 `session.messages` **原地**调 `truncate_messages`，而历史本身是 prompt cache 的前缀——一旦有块超限，从第一个被截断的位置起后续每一轮 `cache_read` 归零，且原文再也回不来（不可逆）。现改为：先 `messages_need_truncation` 探一次（绝大多数轮次零命中、零拷贝），命中才克隆一份历史、截断副本、只把副本发出去；`session.messages` 保持原文。落盘路径（`SessionStore::save`）仍按原样截断副本，磁盘体积上限不变。检测判据刻意偏保守（宁可多克隆一次也不漏判），`thinking` / `reasoning_details` 永不触发（它们本来就不参与截断）。
 
 
-4. **跨会话记忆**（`core::memory::MemoryStore`）：每轮对话结束后 `tokio::spawn` 后台提取记忆，写入 `~/.wyj-code/memory/<project-id>/`；下次启动时读取 MEMORY.md 索引注入 system prompt；可被 `Config.auto_memory_enabled`（`/memory` 面板切换）关闭。
+4. **跨会话记忆**：当前主线是 `core::memory_v3::MemoryV3Store`（`~/.wyj-code/memory-v3/`，结构化 claim + 后台 job + 项目/全局两层）。`core::memory::MemoryStore`（`~/.wyj-code/memory/<project-id>/`，MEMORY.md 索引 + 每 kind 一个 `.md`）是**降级路径**，不是并存的第二套实现——`Agent` 的注入与提取是 `memory_v3 → evolution → memory(v2)` 的 if-else 链，v3 一旦存在，v2 一行都不执行。CLI 装配因此只在 v3 构造失败时才构造 v2（`main.rs` 的 `memory_store`），避免每次启动多建一个目录、多读一次盘。开关是 `Config.auto_memory_enabled`（`/memory` 面板切换），对两个 store 都写。钉子：`agent::tests::memory_injection_prefers_v3_then_evolution_then_v2`。
 
 
 5. **AGENTS.md / CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 AGENTS.md 系内容用 `wrap_reminder` 包成 `<system-reminder>`，**追加进 system prompt 的 stable 段**（不是当轮 user 消息）；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载，结果进 **volatile 段**——放在缓存断点之后，避免每命中一个新目录就整段前缀全价重算。配套说明见根 `CLAUDE.md` 的「Configuration」与「System prompt 分段」两节。
