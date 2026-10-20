@@ -65,8 +65,11 @@ pub struct RequestOptions {
     /// Extended thinking 预算 token 数；None/0 = 关闭
     /// Anthropic 原生 / Qwen / Doubao 等支持 budget_tokens 的 vendor 走这里
     pub thinking_budget: Option<u32>,
-    /// OpenAI-vendor `reasoning_effort` 档位（low/medium/high/max/xhigh/auto），
-    /// DeepSeek/Qwen 互斥分支/Moonshot k3 等走这里
+    /// `reasoning_effort` 档位（low/medium/high/max/xhigh）。
+    ///
+    /// **协议无关**：OpenAI 线发顶层 `reasoning_effort` 字段，Anthropic 线发
+    /// `output_config.effort`（官方 Anthropic 与 MiniMax `/anthropic` 端点同构）。
+    /// DeepSeek/Qwen 互斥分支/Moonshot k3 等走 OpenAI 形态。
     pub reasoning_effort: Option<String>,
     /// OpenAI-vendor `thinking.type` 字符串（enabled/disabled/auto/adaptive）。
     /// 由 profile.thinking_switch 直接透传，agent 层负责拼装；adapter 内部决定
@@ -111,6 +114,10 @@ impl RequestOptions {
         let (thinking_budget, reasoning_effort) = match &plan.reasoning {
             crate::request_plan::ReasoningRequest::BudgetTokens(budget) => (Some(*budget), None),
             crate::request_plan::ReasoningRequest::Effort(effort) => (None, Some(effort.clone())),
+            // 官方 Anthropic：budget 与 effort 控制不同维度，两个旋钮一起下发。
+            crate::request_plan::ReasoningRequest::BudgetAndEffort { budget, effort } => {
+                (Some(*budget), Some(effort.clone()))
+            }
             crate::request_plan::ReasoningRequest::Disabled
             | crate::request_plan::ReasoningRequest::ProviderNative => (None, None),
         };
@@ -144,6 +151,12 @@ pub trait Provider: Send + Sync {
     /// 存在的理由：`/cost` 看到 cache_read 恒为 0 时，**无法区分**"用户没配
     /// 缓存"和"配了但这个端点根本不支持"——这两种情况的用户动作完全相反。
     /// 默认 0 表示"不支持/未启用"；支持缓存的 provider 覆盖它。
+    ///
+    /// **两条线都必须覆盖**：Anthropic 跟一个运行时降级位（首次 400 后置
+    /// DOWNGRADED），OpenAI 线按 catalog 的 `PromptCacheMode` 回报 ON/OFF。
+    /// 自动缓存端点（OpenAI 官方 / DeepSeek）尤其容易漏——它们不发任何请求
+    /// 字段，看起来"没有可报的状态"，但 `/cost` 与 `usage` 里明明确确有
+    /// `cached_tokens`，不覆盖就会让用户看到「命中缓存却显示未启用」。
     fn prompt_cache_state(&self) -> u8 {
         0
     }

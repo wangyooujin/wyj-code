@@ -27,10 +27,22 @@ vision = true                # 模型是否支持图片输入；false 时图片�
                               # 本进程内停用缓存并在 /cost 里显示降级原因。
 # openai_stream_options = false # OpenAI-compatible 第三方端点可显式关闭 stream_options.include_usage
 # thinking_budget = 8000     # extended thinking 预算 token；不写/0 = 关闭（思考计入 output 计费）
-# interleaved_thinking = true # 工具调用轮之间允许交错思考（budget 开启时生效）
-# reasoning_effort = "medium" # OpenAI 线 thinking 档位：low/medium/high/xhigh/max/adaptive。
+# interleaved_thinking = true # 工具调用轮之间允许交错思考。**Anthropic 线专属**（OpenAI 线不发
+                              # interleaved-thinking beta，此处配了也不生效）。生效条件是「本轮真的发出了
+                              # thinking 字段」，因此 MiniMax `/anthropic` 的 adaptive 形态（无 budget）同样成立。
+# reasoning_effort = "medium" # thinking 投入档位：low/medium/high/xhigh/max。**协议无关**——
+                              # OpenAI 线发顶层 `reasoning_effort` 字段，Anthropic 线发
+                              # `output_config.effort`（官方 Anthropic 与 MiniMax `/anthropic`
+                              # 端点同构），同一份 profile 换协议不必改配置。
+                              # **官方 OpenAI（o 系列 / gpt-5 系）同样生效**，但档位只到 high
+                              # （`minimal` 在 gpt-5.1+ 不被接受、`xhigh`/`max` 仅部分新型号），
+                              # `o1-mini` / `o3-mini` 完全不支持——越界档位记成可见的 dropped。
                               # 只有 vendor 的 ThinkingSpec::effort_levels 收录该档位才会真正上送，
                               # 其余被丢弃并在日志里 warn（`wyj-code model doctor` 可查）。
+                              # 与 thinking_budget 的关系按端点而定：多数端点两者互斥（Qwen 协议
+                              # 明确禁止同传），官方 Anthropic 则可同时用——budget 限**思考**的
+                              # token 数，effort 限**整个响应**的投入档位，两者控制不同维度。
+                              # 官方 OpenAI 没有 budget 旋钮：配了 thinking_budget 会被记成 dropped。
 # thinking_switch = "enabled" # OpenAI 线 thinking.type 显式覆盖：enabled/disabled/adaptive。
                               # 不写 = 由 adapter 按模型默认决定。MiniMax M3.1 发 disabled 会 400，
                               # adapter 会降级成"不发该字段"。

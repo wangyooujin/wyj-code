@@ -1754,6 +1754,13 @@ impl Agent {
                         }),
                         reasoning_effort: reasoning_effort.filter(|_| !blocked),
                         thinking_switch: route.thinking_switch.clone().filter(|_| !blocked),
+                        // 两道判据**不重复**：catalog 的是「这个端点有没有
+                        // interleaved 能力」（含用户 4xx 后被
+                        // `apply_rejected_parameters` 关掉的记录），provider 侧
+                        // 的是「本次是否真的发出了 thinking 字段」（MiniMax
+                        // `/anthropic` 的 `adaptive` 形态没有 budget，只能看
+                        // `patch.thinking.is_some()`）。少任何一道都会出错：
+                        // 少了 catalog 这道，被端点拒过的 beta 会反复重发。
                         interleaved: route.interleaved_thinking
                             && capabilities.interleaved_thinking.value,
                     }

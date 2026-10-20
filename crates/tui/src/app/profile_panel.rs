@@ -27,9 +27,15 @@ pub enum ProfileFieldKind {
     Bool,
 }
 
-/// 字段在哪种线协议下才有意义。Anthropic 线只认 `thinking.budget_tokens`，
-/// OpenAI 线只认 `reasoning_effort` / `thinking.type`——把两边字段同时平铺出来
-/// 只会诱导用户去配一个必然被 catalog 丢弃的项。
+/// 字段在哪种线协议下才有意义。
+///
+/// * `thinking_budget` / `interleaved_thinking` —— Anthropic 线专属：OpenAI
+///   Chat Completions 没有 `budget_tokens` 语义。
+/// * `thinking_switch` —— OpenAI 线专属：Anthropic 线的开关旋钮是
+///   `thinking.budget_tokens`（`thinking.type` 只有 enabled/disabled 两态，
+///   且官方端点不接受 disabled），`thinking_switch` 在那边无处落地。
+/// * `reasoning_effort` —— **两条线都有**：OpenAI 线发顶层 `reasoning_effort`，
+///   Anthropic 线发 `output_config.effort`。它是协议无关的思考投入档位。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProfileFieldScope {
     Always,
@@ -144,7 +150,12 @@ pub const PROFILE_FIELD_SPECS: &[ProfileFieldSpec] = &[
     field(
         "settings.field.reasoning_effort",
         ProfileFieldKind::Enum(REASONING_EFFORT_CHOICES),
-        ProfileFieldScope::OpenAiWire,
+        // **两种线协议都显示**：`reasoning_effort` 现在是协议无关的——
+        // OpenAI 线发顶层 `reasoning_effort`，Anthropic 线发 `output_config.effort`
+        // （官方 Anthropic 与 MiniMax `/anthropic` 端点同构）。此前它被标成
+        // `OpenAiWire`，于是 Anthropic 线下这个字段**根本不显示**，用户无从
+        // 配置——那正是「Anthropic 线上 effort 是死配置」的 UI 层根因。
+        ProfileFieldScope::Always,
     ),
     field(
         "settings.field.thinking_switch",
@@ -1572,12 +1583,14 @@ mod profile_dialog_onboarding_tests {
         );
     }
 
-    /// 思考字段按线协议分流：Anthropic 线隐藏 effort/switch，OpenAI 线隐藏
+    /// 思考字段按线协议分流：Anthropic 线隐藏 switch，OpenAI 线隐藏
     /// budget/interleaved。
     ///
-    /// 两边的参数互不相认（`thinking_budget` 在 OpenAI web 上没有语义，
-    /// `reasoning_effort` 在 Anthropic Messages 上是死字段），同时平铺只会
-    /// 诱导用户去配一个必然被 catalog 丢弃的项。
+    /// **`reasoning_effort` 两条线都显示**——它是协议无关的思考投入档位
+    /// （OpenAI 线发顶层 `reasoning_effort`，Anthropic 线发
+    /// `output_config.effort`）。此前它被标成 `OpenAiWire`，Anthropic 线下
+    /// **根本不显示**：用户没法配，配了也不生效——这是「Anthropic 线上 effort
+    /// 是死配置」在 UI 层的根因。
     #[test]
     fn thinking_fields_are_scoped_to_their_wire_protocol() {
         let cfg = Config::default();
@@ -1600,12 +1613,12 @@ mod profile_dialog_onboarding_tests {
             "Anthropic 线应显示交错思考"
         );
         assert!(
-            !visible.contains(&effort_idx),
-            "Anthropic 线不应显示 thinking effort"
+            visible.contains(&effort_idx),
+            "Anthropic 线应显示思考强度（output_config.effort）"
         );
         assert!(
             !visible.contains(&switch_idx),
-            "Anthropic 线不应显示 thinking switch"
+            "Anthropic 线不应显示 thinking switch（那边的旋钮是 budget）"
         );
 
         dialog.entries[entry].provider_idx = 1; // OpenAI

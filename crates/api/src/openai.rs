@@ -30,8 +30,17 @@ pub struct OpenAIProvider {
     supports_vision: bool,
     /// vendor 名（deepseek / alibaba / zhipu / ...）；用于 thinking adapter dispatch
     vendor: String,
-    /// wire_protocol（OpenAI 兼容端点均为 OpenAiChatCompletions；保留字段）
+    /// 本实现**实际**使用的线协议。
+    ///
+    /// 恒为 `OpenAiChatCompletions`——`OpenAIProvider` 只会打
+    /// `{base_url}/chat/completions`。profile 若声明了 `open_ai_responses`，
+    /// 构造期会告警一次并在此归一到真实协议；不归一的话 identity 会把
+    /// `ThinkingSpec::for_vendor` / `adapter_for` 引到没有实现的 `Responses`
+    /// 分支（落到 generic → thinking 全关），形成「配置能选、行为静默变」。
     wire_protocol: WireProtocol,
+    /// 端点是否会复用请求前缀（catalog 判定的 `PromptCacheMode`）。
+    /// 用于 `prompt_cache_state()` 回报真实状态，见该方法的注释。
+    prompt_cache_mode: crate::PromptCacheMode,
     /// Profile 与 catalog 能力对比后被静默丢弃的参数（用户在 Profile 里设了
     /// vendor 不识别的 thinking_budget/reasoning_effort）。每个请求 stream()
     /// 入口 logging 一次，避免静默降级对用户不可见。
@@ -52,6 +61,20 @@ impl OpenAIProvider {
             .clone()
             .unwrap_or_else(|| infer_vendor(&profile.base_url, model));
         let dropped_parameters = RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
+        let resolved = crate::ModelCatalog::resolve(profile, Some(model));
+        // 声明了 Responses 但本 provider 只会说 Chat Completions：告警一次，
+        // 然后按**真实**协议构造 identity。静默保留会让 capability_cache 的
+        // fingerprint 与实际请求不符，thinking spec 也会查错表。
+        let declared = profile.effective_wire_protocol();
+        if !matches!(declared, WireProtocol::OpenAiChatCompletions) {
+            tracing::warn!(
+                vendor = %vendor,
+                model = %model,
+                declared = %declared,
+                "当前没有 `{}` 线协议实现，已按 `open_ai_chat_completions` 发送",
+                declared
+            );
+        }
         Ok(Self {
             client: crate::stream_guard::build_client()?,
             api_key,
@@ -60,7 +83,8 @@ impl OpenAIProvider {
             stream_options: profile.effective_openai_stream_options_for_model(model),
             supports_vision: profile.vision,
             vendor,
-            wire_protocol: profile.effective_wire_protocol(),
+            wire_protocol: WireProtocol::OpenAiChatCompletions,
+            prompt_cache_mode: resolved.capabilities.prompt_cache.value,
             dropped_parameters,
         })
     }
@@ -187,6 +211,21 @@ struct Delta {
     /// 标准无此字段，serde 默认忽略未知字段；国产 reasoning 模型会回填。
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// OpenAI 官方 Responses 风格的 `reasoning` 字段（**不带** `_content` 后缀）。
+    ///
+    /// OpenRouter 这类聚合网关、以及 GPT-OSS 之后的 vLLM / SGLang，在
+    /// `chat/completions` 上都改用这个字段名——实测同一道题 OpenRouter 返回
+    /// `reasoning` 4873 字符 / `reasoning_tokens` 1327，而 `reasoning_content`
+    /// 字段**根本不存在**。旧实现只认 `reasoning_content`，于是这些端点的思考
+    /// 内容被 serde 静默丢弃：既不显示给用户，也不进历史，跨轮推理链断锚——
+    /// **同一份 profile 换到 OpenAI 线，thinking「看起来消失了」有很大一部分
+    /// 是这个字段名没被认**，而不是模型真的不思考。
+    ///
+    /// 与 `reasoning_content` 的关系：厂商只写其中一个（迁移期的 vLLM 会把
+    /// `reasoning_content` 置成 null），同 chunk 两者都非空时由
+    /// `stream_events_from_chunk` 择一，**不拼接**——拼接会让重影。
+    #[serde(default)]
+    reasoning: Option<String>,
     /// MiniMax `reasoning_details` 字段——结构化 reasoning 块数组（每项含
     /// `{type, text, id}` 等），用于多轮工具调用场景的 reasoning 完整回传。
     /// 国产其它 vendor 一般不写；serde 容忍缺失。
@@ -413,6 +452,9 @@ fn usage_event(usage: UsageData) -> StreamEvent {
 /// reasoning_content（DeepSeek `deepseek-reasoner` 等）独立于 finish_reason /
 /// content / tool_calls，因为它常与 content 在同一 chunk 出现，且 reasoning
 /// 应在 content 之前上屏以模拟 Claude 原生 thinking 体验。
+///
+/// content / tool_calls / finish_reason 三者也相互独立：某些端点会把正文或
+/// 工具参数与 finish_reason 合并进同一个 chunk，此时三者都必须被处理。
 fn stream_events_from_chunk(
     tool_map: &mut std::collections::HashMap<usize, PendingToolCall>,
     chunk: SseChunk,
@@ -420,12 +462,36 @@ fn stream_events_from_chunk(
     let mut events = vec![];
 
     if let Some(choice) = chunk.choices.into_iter().next() {
-        // 1. reasoning_content 独立分支（DeepSeek 等 reasoning 模型）。
-        //    若与 content 同 chunk，优先 reasoning 后 content，模拟 thinking-then-text。
-        if let Some(text) = choice.delta.reasoning_content {
-            if !text.is_empty() {
-                events.push(StreamEvent::ThinkingDelta(text));
-            }
+        // 1. 推理文本独立分支。若与 content 同 chunk，优先推理后 content，
+        //    模拟 thinking-then-text。
+        //
+        //    两个字段名**互不替代**，厂商只写其中一个：
+        //      * `reasoning_content` —— DeepSeek / GLM / Qwen 等的既有约定；
+        //      * `reasoning` —— vLLM / SGLang / GPT-OSS / OpenRouter 的新约定
+        //        （vLLM RFC #27755，依据 GPT-OSS 发布时 OpenAI 对 Chat
+        //        Completions 的指导）。迁移期 vLLM 会把 `reasoning_content`
+        //        显式置为 **null**，内容全在 `reasoning` 里。
+        //
+        //    同一 chunk 两者都非空时以 `reasoning_content` 优先，否则同一段思考
+        //    会被 emit 两次——TUI 上表现为思考内容重影。
+        //
+        //    判据用「非空」而不是 `is_none()`：部分网关发的是空串而非 null，
+        //    那种形态同样必须让位给 `reasoning`。
+        let reasoning_text = choice
+            .delta
+            .reasoning_content
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                choice
+                    .delta
+                    .reasoning
+                    .as_deref()
+                    .filter(|text| !text.is_empty())
+            })
+            .map(str::to_string);
+        if let Some(text) = reasoning_text {
+            events.push(StreamEvent::ThinkingDelta(text));
         }
 
         // 1b. reasoning_details 数组项（MiniMax `reasoning_details`）——
@@ -437,16 +503,21 @@ fn stream_events_from_chunk(
             }
         }
 
-        // 2. finish_reason / content / tool_calls 走原互斥逻辑。
-        if let Some(fr) = choice.finish_reason {
-            events.push(StreamEvent::MessageStop {
-                stop_reason: parse_stop_reason(&fr),
-            });
-        } else if let Some(text) = choice.delta.content {
+        // 2. content / tool_calls / finish_reason 三者**相互独立**，不再互斥。
+        //
+        //    旧实现是一条 else-if 链，只处理第一个命中者：某端点把 content 与
+        //    finish_reason（或 tool_calls）放进同一 chunk 时，后者被静默丢弃——
+        //    表现为「模型明明说了话，界面却少一段正文」。这类端点形态确实存在
+        //    （部分网关把最后一段文本与 finish_reason 合并成一个 chunk）。
+        //
+        //    发射顺序固定为 **content → tool_calls → finish_reason**：同 chunk 的
+        //    正文与工具参数必须先于 MessageStop，否则回合收尾会盖掉最后一段输出。
+        if let Some(text) = choice.delta.content {
             if !text.is_empty() {
                 events.push(StreamEvent::TextDelta(text));
             }
-        } else if let Some(tcs) = choice.delta.tool_calls {
+        }
+        if let Some(tcs) = choice.delta.tool_calls {
             for tc in tcs {
                 let idx = tc.index;
                 let pending = tool_map.entry(idx).or_default();
@@ -474,6 +545,11 @@ fn stream_events_from_chunk(
                 }
             }
         }
+        if let Some(fr) = choice.finish_reason {
+            events.push(StreamEvent::MessageStop {
+                stop_reason: parse_stop_reason(&fr),
+            });
+        }
     }
 
     // 3. usage 最后发：精确账本永远跟随 message stop 之后。
@@ -485,6 +561,17 @@ fn stream_events_from_chunk(
 }
 
 // ── Body 构造（独立函数以便单测） ──────────────────────────────────────────────
+
+/// 该端点是否只认 `max_completion_tokens`（而非 `max_tokens`）。
+///
+/// 判据刻意**只认官方 OpenAI**：即便某个第三方也支持新名，保留 `max_tokens`
+/// 对它们是无害的（老字段在兼容端点上仍是标准），而反过来一刀切会把
+/// DeepSeek / MiniMax / GLM / Qwen / 火山的全部请求打断。这是一个
+/// 「错了代价不对称」的判断，必须站在保守侧。
+fn uses_max_completion_tokens(identity: &ModelIdentity) -> bool {
+    identity.wire_protocol == WireProtocol::OpenAiChatCompletions
+        && crate::thinking::normalize_vendor(&identity.vendor) == "openai"
+}
 
 /// 构造 OpenAI Chat Completions 请求 body Map。vendor-specific thinking
 /// 字段由 `apply_thinking_to_openai_body` 在此调用后 mutate。
@@ -552,7 +639,20 @@ fn build_openai_request_body(
             ),
         );
     }
-    body_map.insert("max_tokens".to_string(), Value::Number(max_tokens.into()));
+    // 输出上限字段名因端点而异：
+    //   * 官方 OpenAI（o1/o3/o4-mini/gpt-5 这些 reasoning 模型）**只认**
+    //     `max_completion_tokens`，传 `max_tokens` 会作为「不支持的参数」直接
+    //     400；而且这个上限**同时覆盖 reasoning tokens**，语义与本项目的
+    //     `max_tokens`（总输出预算）一致。
+    //   * 第三方（DeepSeek / MiniMax / GLM / Qwen / 火山）文档里仍是
+    //     `max_tokens`，一刀切会打断全部国产模板。
+    // **两者不能同时发**：官方会把 `max_tokens` 判成非法参数。
+    let max_tokens_key = if uses_max_completion_tokens(identity) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    body_map.insert(max_tokens_key.to_string(), Value::Number(max_tokens.into()));
     body_map.insert("stream".to_string(), Value::Bool(true));
     if stream_options {
         body_map.insert(
@@ -576,6 +676,28 @@ fn build_openai_request_body(
 
 #[async_trait]
 impl Provider for OpenAIProvider {
+    /// Chat Completions 的缓存由**端点自己**按前缀做（OpenAI 自动 prompt
+    /// caching、DeepSeek `Context Caching on Disk`），客户端不发任何字段，
+    /// 因此这里只能回报 catalog 的判定，而不是像 Anthropic 那样跟一个运行时
+    /// 降级位。
+    ///
+    /// 不覆盖的后果不只是「显示不对」：`agent.rs` 每轮把
+    /// `session.prompt_cache_state` 同步成这里的返回值，默认实现恒 0 →
+    /// `/cost` 在 DeepSeek/OpenAI 命中缓存时仍显示「未启用」，与 catalog 判定的
+    /// `Automatic`、以及 `usage_event` 已经读到的 `cached_tokens` 三处互相矛盾。
+    ///
+    /// **永远不返回 `DOWNGRADED`**：那一档的语义是「客户端发的断点被端点拒绝」，
+    /// 这条线根本不发断点。
+    fn prompt_cache_state(&self) -> u8 {
+        use crate::anthropic::{PROMPT_CACHE_STATE_OFF, PROMPT_CACHE_STATE_ON};
+        match self.prompt_cache_mode {
+            crate::PromptCacheMode::Automatic | crate::PromptCacheMode::ExplicitBreakpoints => {
+                PROMPT_CACHE_STATE_ON
+            }
+            crate::PromptCacheMode::Unsupported => PROMPT_CACHE_STATE_OFF,
+        }
+    }
+
     async fn stream(
         &self,
         system: &crate::provider::SystemPrompt<'_>,
@@ -707,6 +829,7 @@ mod tests {
                 delta: Delta {
                     content: None,
                     reasoning_content: None,
+                    reasoning: None,
                     reasoning_details: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index: 0,
@@ -744,6 +867,7 @@ mod tests {
                 delta: Delta {
                     content: None,
                     reasoning_content: Some("Step 1: read Cargo.toml".to_string()),
+                    reasoning: None,
                     tool_calls: None,
                     ..Delta::default()
                 },
@@ -769,6 +893,7 @@ mod tests {
                 delta: Delta {
                     content: Some("Answer: 42".to_string()),
                     reasoning_content: Some("Compute 6*7".to_string()),
+                    reasoning: None,
                     tool_calls: None,
                     ..Delta::default()
                 },
@@ -794,6 +919,7 @@ mod tests {
                 delta: Delta {
                     content: None,
                     reasoning_content: None,
+                    reasoning: None,
                     reasoning_details: Some(vec![
                         serde_json::json!({"type": "reasoning.text", "text": "step 1", "id": "r1"}),
                         serde_json::json!({"type": "reasoning.text", "text": "step 2", "id": "r2"}),
@@ -833,6 +959,7 @@ mod tests {
                 delta: Delta {
                     content: Some("answer".to_string()),
                     reasoning_content: Some("plan".to_string()),
+                    reasoning: None,
                     reasoning_details: Some(vec![
                         serde_json::json!({"type": "reasoning.text", "text": "details"}),
                     ]),
@@ -861,6 +988,7 @@ mod tests {
                 delta: Delta {
                     content: Some("ok".to_string()),
                     reasoning_content: None,
+                    reasoning: None,
                     reasoning_details: None,
                     tool_calls: None,
                 },
@@ -882,6 +1010,7 @@ mod tests {
                 delta: Delta {
                     content: Some("hi".to_string()),
                     reasoning_content: Some(String::new()),
+                    reasoning: None,
                     tool_calls: None,
                     ..Delta::default()
                 },
@@ -893,6 +1022,113 @@ mod tests {
         let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "hi"));
+    }
+
+    /// 端点把正文与 finish_reason 放进同一 chunk 时，正文**不能**被丢弃。
+    ///
+    /// 旧实现是一条 else-if 链：`finish_reason` 先命中，正文与工具参数被整段
+    /// 吞掉——表现为「模型明明说了话，界面少一段正文」。
+    #[test]
+    fn content_and_finish_reason_in_same_chunk_are_both_emitted() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: Some("final answer".to_string()),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_details: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "final answer"));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+    }
+
+    /// 正文 + 工具参数 + finish_reason 同 chunk：三者都发射，且顺序固定为
+    /// content → tool_calls → MessageStop（收尾信号必须最后）。
+    #[test]
+    fn content_tool_calls_and_finish_reason_in_same_chunk_are_all_emitted() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: Some("calling tool".to_string()),
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_details: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_x".to_string()),
+                        function: Some(FunctionDelta {
+                            name: Some("Read".to_string()),
+                            arguments: Some(r#"{"path":"a.rs"}"#.to_string()),
+                        }),
+                    }]),
+                },
+                finish_reason: Some("tool_calls".to_string()),
+            }],
+            usage: None,
+        };
+
+        let mut tool_map = std::collections::HashMap::new();
+        let events = stream_events_from_chunk(&mut tool_map, chunk);
+        assert_eq!(events.len(), 4);
+        assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "calling tool"));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::ToolUseStart { ref id, ref name } if id == "call_x" && name == "Read"
+        ));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::ToolUseDelta { ref id, ref json_delta }
+                if id == "call_x" && json_delta == r#"{"path":"a.rs"}"#
+        ));
+        assert!(matches!(
+            &events[3],
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse
+            }
+        ));
+    }
+
+    /// 思考 + 正文 + finish_reason 同 chunk：reasoning 仍排最前，正文不再被
+    /// finish_reason 吞掉。
+    #[test]
+    fn reasoning_content_and_finish_reason_in_same_chunk_are_both_emitted() {
+        let chunk = SseChunk {
+            choices: vec![Choice {
+                delta: Delta {
+                    content: Some("answer".to_string()),
+                    reasoning_content: Some("thinking".to_string()),
+                    reasoning: None,
+                    reasoning_details: None,
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], StreamEvent::ThinkingDelta(t) if t == "thinking"));
+        assert!(matches!(&events[1], StreamEvent::TextDelta(t) if t == "answer"));
+        assert!(matches!(
+            &events[2],
+            StreamEvent::MessageStop {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
     }
 
     /// 当 supports_vision=true 时,user message 中的 Image 块应序列化为
@@ -1014,6 +1250,109 @@ mod tests {
         assert!(json.get("reasoning_details").is_none());
     }
 
+    /// `reasoning` 字段（OpenAI 官方 Responses 风格 / OpenRouter 等网关）
+    /// 必须被解析成 thinking——此前只认 `reasoning_content`，于是这些端点的
+    /// 思考内容被 serde 静默丢弃：不显示给用户，也不进历史，跨轮推理链断锚。
+    ///
+    /// 实测（2026-10）：OpenRouter 同一道题返回 `reasoning` 4873 字符 /
+    /// `reasoning_tokens` 1327，而 `reasoning_content` 字段**根本不存在**。
+    #[test]
+    fn reasoning_field_is_parsed_into_thinking_delta() {
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"2","reasoning":"先算 1+1"}}]}"#,
+        )
+        .unwrap();
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ThinkingDelta(text) if text == "先算 1+1"
+            )),
+            "reasoning 字段必须被当成 thinking 上屏：{events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(t) if t == "2")));
+    }
+
+    /// 两个字段名都出现时**不得重复计入**同一段思考——`reasoning_content`
+    /// 优先，`reasoning` 只在它缺位时补位。
+    #[test]
+    fn reasoning_and_reasoning_content_are_not_double_counted() {
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"来自 reasoning 字段","reasoning_content":"来自 reasoning_content 字段"}}]}"#,
+        )
+        .unwrap();
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        let thinking: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking,
+            vec!["来自 reasoning_content 字段"],
+            "两个字段同时出现时只应计入一段：{thinking:?}"
+        );
+    }
+
+    /// vLLM / SGLang 迁移期的真实形态：`reasoning_content` 显式置 **null**、
+    /// 内容全在 `reasoning` 里。旧实现只认前者，这条线等于完全没有思考。
+    ///
+    /// 与 `reasoning_and_reasoning_content_are_not_double_counted` 互补：
+    /// 那条钉「都非空只取一个」，这条钉「前者为 null 不能让后者被吞」。
+    /// 两种形态在真实网关上都出现过，缺任一条都会让修复只对一半流量生效。
+    #[test]
+    fn null_reasoning_content_does_not_swallow_reasoning_field() {
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"vLLM 的思考","reasoning_content":null}}]}"#,
+        )
+        .unwrap();
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ThinkingDelta(text) if text == "vLLM 的思考"
+            )),
+            "reasoning_content 为 null 时 reasoning 必须补位：{events:?}"
+        );
+    }
+
+    /// 空串形态同样不能让位失败：有些网关发 `reasoning_content: ""` 而非 null。
+    #[test]
+    fn empty_string_reasoning_content_does_not_swallow_reasoning_field() {
+        let chunk: SseChunk = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning":"空串兜底","reasoning_content":""}}]}"#,
+        )
+        .unwrap();
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ThinkingDelta(t) if t == "空串兜底")));
+    }
+
+    /// **解析出来 ≠ 要回传**：vLLM / ollama 的 `echo_back_in_messages` 仍为
+    /// false，`reasoning` 只用于上屏与落盘，不能顺手打开回传——它们收这个
+    /// 字段会 400。这条钉住「可见性」与「回传」两个维度不被合并。
+    #[test]
+    fn vllm_reasoning_is_visible_but_never_echoed() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "vLLM 的思考".to_string(),
+                signature: String::new(),
+                reasoning_details: None,
+            }],
+        }];
+        // echo_reasoning=false 由 ThinkingSpec::vllm 的 response_fields 决定。
+        let api = to_api_messages(&msgs, false, false);
+        let json = serde_json::to_value(&api[0]).unwrap();
+        assert!(json.get("reasoning_content").is_none(), "{json}");
+        assert!(json.get("reasoning").is_none(), "{json}");
+    }
+
     /// MiniMax 的 `reasoning_details` 与 `reasoning_content` 同时回传。
     #[test]
     fn assistant_echoes_minimax_reasoning_details() {
@@ -1082,6 +1421,289 @@ mod tests {
                 "vendor={vendor} 的 reasoning 回传判定不符预期"
             );
         }
+    }
+
+    // ── 官方 OpenAI 线（o 系列 / gpt-5 系）──
+
+    /// 官方端点只认 `max_completion_tokens`。传 `max_tokens` 会被判成
+    /// 「不支持的参数」直接 400——这是把 `provider = "openai"` 配进来的用户
+    /// 必然撞上的第一个错误，而不是什么边缘情况。
+    #[test]
+    fn official_openai_body_uses_max_completion_tokens() {
+        let id = identity_for("openai", "gpt-5");
+        let opts = crate::provider::RequestOptions {
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            true,
+            true,
+        );
+        assert_eq!(body["max_completion_tokens"], 4096);
+        assert!(
+            body.get("max_tokens").is_none(),
+            "两条字段不能同时发：官方会把 max_tokens 判成非法参数"
+        );
+    }
+
+    /// 第三方模板必须保持 `max_tokens`——一刀切会打断全部国产端点。
+    #[test]
+    fn third_party_body_keeps_max_tokens() {
+        for (vendor, model) in [
+            ("deepseek", "deepseek-chat"),
+            ("minimax", "MiniMax-M3"),
+            ("alibaba", "qwen3-coder-plus"),
+            ("zhipu", "glm-4.6"),
+            ("volcengine", "doubao-seed-1-6"),
+            ("moonshot", "kimi-k3"),
+        ] {
+            let id = identity_for(vendor, model);
+            let opts = crate::provider::RequestOptions {
+                max_tokens: 4096,
+                ..Default::default()
+            };
+            let body = build_openai_request_body(
+                &id,
+                &crate::provider::SystemPrompt::stable_only("sys"),
+                &[],
+                &[],
+                &opts,
+                false,
+                true,
+            );
+            assert_eq!(body["max_tokens"], 4096, "{vendor}/{model}");
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "{vendor}/{model} 不该收到官方专属字段"
+            );
+        }
+    }
+
+    /// 官方线配 `reasoning_effort` 必须真的写进 body——此前 `for_vendor` 没有
+    /// `"openai"` 臂，落到 generic 的 `Disabled`，effort 在**到达 provider 之前**
+    /// 就被 catalog 层滤成 None，用户改配置毫无效果。
+    #[test]
+    fn official_openai_writes_reasoning_effort() {
+        let id = identity_for("openai", "o3");
+        let opts = crate::provider::RequestOptions {
+            max_tokens: 4096,
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            true,
+            true,
+        );
+        assert_eq!(body["reasoning_effort"], "high");
+        // 官方线上除 reasoning_effort 之外**不得**出现任何 thinking 家族字段。
+        for forbidden in ["thinking", "enable_thinking", "thinking_budget"] {
+            assert!(
+                body.get(forbidden).is_none(),
+                "官方端点不认识 `{forbidden}`，发了就是 400：{body:?}"
+            );
+        }
+    }
+
+    /// 辅助调用（`text_only`）在官方线上必须降级成低档位而不是「什么都不发」：
+    /// 不发字段＝端点按默认档位跑满 reasoning，正是历史故障「预算被思考吃光、
+    /// 可见文本为空」的形态。
+    #[test]
+    fn official_openai_text_only_downgrades_to_low_effort() {
+        let id = identity_for("openai", "o3");
+        let opts = crate::provider::RequestOptions::text_only(512);
+        let body = build_openai_request_body(
+            &id,
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &[],
+            &[],
+            &opts,
+            true,
+            true,
+        );
+        assert_eq!(
+            body["reasoning_effort"], "low",
+            "text_only 必须收敛到低档位，否则 reasoning 会把预算吃满"
+        );
+    }
+
+    /// 早期 `o1-mini` / `o3-mini` 不认 `reasoning_effort`：档位集合留空，
+    /// 因此 body 里不能出现该字段（否则 400）。
+    ///
+    /// 这里必须连 `text_only()` 一起钉——辅助调用（compact / 分类器 / 标题）
+    /// 走的正是那条路径，`thinking_switch = "disabled"` 若被降级成
+    /// `reasoning_effort: "low"` 就是 400。
+    #[test]
+    fn official_openai_early_minis_omit_reasoning_effort() {
+        for model in ["o1-mini", "o3-mini"] {
+            let id = identity_for("openai", model);
+            for opts in [
+                crate::provider::RequestOptions {
+                    max_tokens: 4096,
+                    reasoning_effort: Some("high".to_string()),
+                    ..Default::default()
+                },
+                crate::provider::RequestOptions::text_only(512),
+            ] {
+                let body = build_openai_request_body(
+                    &id,
+                    &crate::provider::SystemPrompt::stable_only("sys"),
+                    &[],
+                    &[],
+                    &opts,
+                    true,
+                    true,
+                );
+                assert!(
+                    body.get("reasoning_effort").is_none(),
+                    "{model} 不支持 reasoning_effort（opts={opts:?}）：{body:?}"
+                );
+            }
+        }
+    }
+
+    /// 官方 spec **不得**声明回传 reasoning：照抄 DeepSeek 臂会打开
+    /// `echo_back_in_messages`，而官方 Chat Completions 收这个字段就 400。
+    #[test]
+    fn official_openai_never_echoes_reasoning() {
+        let spec = crate::ThinkingSpec::for_vendor(
+            "openai",
+            &WireProtocol::OpenAiChatCompletions,
+            "gpt-5",
+        );
+        assert!(!spec.response_fields.echo_back_in_messages);
+        assert!(!spec.response_fields.reasoning_content);
+
+        // 端到端：assistant 的 thinking 块不能变成请求里的 reasoning_content。
+        let opts = crate::provider::RequestOptions {
+            max_tokens: 4096,
+            ..Default::default()
+        };
+        let body = build_openai_request_body(
+            &identity_for("openai", "gpt-5"),
+            &crate::provider::SystemPrompt::stable_only("sys"),
+            &assistant_with_thinking(),
+            &[],
+            &opts,
+            true,
+            true,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        let assistant = msgs.iter().find(|m| m["role"] == "assistant").unwrap();
+        assert!(assistant.get("reasoning_content").is_none(), "{assistant}");
+        assert!(assistant.get("reasoning_details").is_none(), "{assistant}");
+    }
+
+    // ── 缓存状态回报（P0-2）──
+
+    /// 构造一个指定 vendor / 模型的 provider，只用于读 `prompt_cache_state`。
+    fn provider_for(vendor: &str, model: &str) -> OpenAIProvider {
+        let profile = wyj_config::Profile {
+            provider: wyj_config::Provider::OpenAI,
+            vendor: Some(vendor.to_string()),
+            model: model.to_string(),
+            base_url: "https://example.com".to_string(),
+            ..wyj_config::Profile::default()
+        };
+        let cfg = wyj_config::Config {
+            active_profile: profile.name.clone(),
+            profiles: vec![profile],
+            runtime_api_key: Some("sk-test".to_string()),
+            ..wyj_config::Config::default()
+        };
+        OpenAIProvider::with_model(&cfg, model).expect("provider 构造不应依赖网络")
+    }
+
+    /// DeepSeek 的缓存由端点自动完成（`Context Caching on Disk`），
+    /// `usage_event` 也确实读到了 `cached_tokens`。此前 `OpenAIProvider`
+    /// 没覆盖 `prompt_cache_state()`，用的是默认 0，于是 `agent.rs` 每轮把
+    /// 会话状态刷成「未启用」——`/cost` 在明明命中缓存时显示未启用，
+    /// 与 catalog 判定的 `Automatic` 自相矛盾。
+    #[test]
+    fn deepseek_endpoint_reports_cache_on() {
+        use crate::anthropic::{PROMPT_CACHE_STATE_OFF, PROMPT_CACHE_STATE_ON};
+        let provider = provider_for("deepseek", "deepseek-chat");
+        assert_eq!(provider.prompt_cache_state(), PROMPT_CACHE_STATE_ON);
+        assert_ne!(provider.prompt_cache_state(), PROMPT_CACHE_STATE_OFF);
+    }
+
+    /// 用 profile 显式关掉时必须回报未启用——用户 override 优先于静态判定。
+    #[test]
+    fn explicit_cache_opt_out_reports_cache_off() {
+        use crate::anthropic::PROMPT_CACHE_STATE_OFF;
+        let profile = wyj_config::Profile {
+            provider: wyj_config::Provider::OpenAI,
+            vendor: Some("deepseek".to_string()),
+            model: "deepseek-chat".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            prompt_cache: Some(false),
+            ..wyj_config::Profile::default()
+        };
+        let cfg = wyj_config::Config {
+            active_profile: profile.name.clone(),
+            profiles: vec![profile],
+            runtime_api_key: Some("sk-test".to_string()),
+            ..wyj_config::Config::default()
+        };
+        let provider = OpenAIProvider::with_model(&cfg, "deepseek-chat").unwrap();
+        assert_eq!(provider.prompt_cache_state(), PROMPT_CACHE_STATE_OFF);
+    }
+
+    /// 不承诺前缀语义的第三方端点仍报未启用——不能为了「有缓存了」而
+    /// 对所有 OpenAI 兼容端点一律报 ON。
+    #[test]
+    fn third_party_endpoint_reports_cache_off() {
+        use crate::anthropic::PROMPT_CACHE_STATE_OFF;
+        for (vendor, model) in [
+            ("minimax", "MiniMax-M3"),
+            ("alibaba", "qwen3-coder-plus"),
+            ("zhipu", "glm-4.6"),
+            ("vllm", "qwen3"),
+        ] {
+            let provider = provider_for(vendor, model);
+            assert_eq!(
+                provider.prompt_cache_state(),
+                PROMPT_CACHE_STATE_OFF,
+                "{vendor}/{model} 不该被报成已缓存"
+            );
+        }
+    }
+
+    /// 声明了 `open_ai_responses` 但实现只有 Chat Completions：identity 必须
+    /// 归一成**真实**协议。否则 `ThinkingSpec::for_vendor` 会按 Responses 查表
+    /// （无对应臂 → generic → thinking 全关），且 capability_cache 的
+    /// fingerprint 与实际请求不符。
+    #[test]
+    fn declared_responses_protocol_is_normalized_to_the_one_we_speak() {
+        let profile = wyj_config::Profile {
+            provider: wyj_config::Provider::OpenAI,
+            vendor: Some("openai".to_string()),
+            model: "o3".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            wire_protocol: Some(WireProtocol::OpenAiResponses),
+            ..wyj_config::Profile::default()
+        };
+        let cfg = wyj_config::Config {
+            active_profile: profile.name.clone(),
+            profiles: vec![profile],
+            runtime_api_key: Some("sk-test".to_string()),
+            ..wyj_config::Config::default()
+        };
+        let provider = OpenAIProvider::with_model(&cfg, "o3").unwrap();
+        assert_eq!(
+            provider.identity().wire_protocol,
+            WireProtocol::OpenAiChatCompletions,
+            "identity 必须报告实际发送的协议"
+        );
     }
 
     // ── build_openai_request_body 与 thinking adapter 的集成单测 ──

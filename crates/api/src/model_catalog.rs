@@ -231,15 +231,35 @@ fn base_capabilities(
     };
     let stream_usage = profile.effective_openai_stream_options_for_model(model)
         || matches!(wire_protocol, WireProtocol::AnthropicMessages);
+    // 先算出来：`thinking` 随后会被 move 进 `ModelCapabilities`。
+    let interleaved_supported = profile.interleaved_thinking
+        && !matches!(thinking.value, ThinkingMode::Unsupported)
+        && matches!(wire_protocol, WireProtocol::AnthropicMessages);
 
     ModelCapabilities {
         context_window: profile.context_window,
+        // **刻意不按静态容量表夹紧**。`known_model_capacity()` 给的是
+        // **保守下限**（见该函数文档：只收录能确定下限的常见族），用它压
+        // 用户配置方向是反的——用户填 64k 而端点确实支持时会被静默压到
+        // 表的 32k，属于「静默改用户配置」，与 `context_window` 的既有做法
+        // （`--config-status` 只告警不改值）不一致。
+        //
+        // 已知超限的提示走 `--config-status`（`max_tokens` 超过静态表上限时
+        // 告警）。这里的值恒等于 profile，因此下方 `request_plan` /
+        // `agent.rs` 的 `.min(capabilities.max_output_tokens)` 目前是恒等式；
+        // 它并非死代码——探针快照（`apply_probed_capabilities`）会整体替换
+        // 本结构，届时 `.min()` 才真正起约束作用。
         max_output_tokens: profile.max_tokens,
         vision: static_cap(profile.vision),
         thinking,
-        interleaved_thinking: static_cap(
-            profile.interleaved_thinking && profile.thinking_budget.unwrap_or(0) > 0,
-        ),
+        // 判据是「用户想开」×「该端点有思考能力」，**不再要求配了
+        // thinking_budget**。旧判据 `budget > 0` 与 provider 侧脱节：
+        // `anthropic.rs` 早已改成看 `patch.thinking.is_some()`，而 MiniMax
+        // `/anthropic` 的 `adaptive` 形态由显式 switch 触发、**没有 budget**，
+        // 于是 profile 开了 interleaved 却在 agent 层被置 false，beta 永远发不出。
+        // 「本次到底发不发」是 provider 的单点判断（见 `RequestOptions::interleaved`
+        // 的文档注释），catalog 只表达「这个端点有没有这个能力」。
+        interleaved_thinking: static_cap(interleaved_supported),
         prompt_cache,
         stream_usage: static_cap(stream_usage),
         tool_calling: static_cap(tool_calling),
@@ -665,6 +685,66 @@ mod parallel_policy_tests {
             base_url: "https://api.minimaxi.com/anthropic".to_string(),
             ..Profile::default()
         }
+    }
+
+    /// `interleaved_thinking` 能力必须跟着**思考控制形态**走，而不是跟着
+    /// `thinking_budget > 0` 走。
+    ///
+    /// 回归背景：MiniMax `/anthropic` 的 `adaptive` 形态由显式 switch 触发、
+    /// **没有 budget**。旧判据要求 `budget > 0`，于是 profile 明明开了
+    /// `interleaved_thinking`，catalog 却报 false，`agent.rs` 据此把
+    /// `opts.interleaved` 置 false —— provider 侧那道 `patch.thinking.is_some()`
+    /// 的判据永远等不到 true，beta 永远发不出去。
+    #[test]
+    fn interleaved_capability_follows_thinking_control_not_budget() {
+        let profile = Profile {
+            interleaved_thinking: true,
+            // 关键：**不配** budget。
+            thinking_budget: None,
+            ..minimax_profile()
+        };
+        let caps = ModelCatalog::resolve(&profile, None).capabilities;
+        assert_ne!(
+            caps.thinking.value,
+            ThinkingMode::Unsupported,
+            "MiniMax /anthropic 的 adaptive 形态有思考能力"
+        );
+        assert!(
+            caps.interleaved_thinking.value,
+            "没有 budget 不代表没有思考；interleaved 能力不该被 budget 判据连坐"
+        );
+    }
+
+    /// 反过来：用户没开就是没开，不能因为端点有能力就自作主张打开。
+    #[test]
+    fn interleaved_capability_stays_off_when_user_did_not_ask() {
+        let profile = Profile {
+            interleaved_thinking: false,
+            thinking_budget: Some(4096),
+            ..minimax_profile()
+        };
+        let caps = ModelCatalog::resolve(&profile, None).capabilities;
+        assert!(!caps.interleaved_thinking.value);
+    }
+
+    /// OpenAI 线没有 interleaved-thinking 这个概念（那是 Anthropic 专属 beta），
+    /// 即便 profile 打开也必须报 false。
+    #[test]
+    fn interleaved_is_never_claimed_on_the_openai_wire() {
+        let profile = Profile {
+            provider: Provider::OpenAI,
+            vendor: Some("deepseek".to_string()),
+            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
+            model: "deepseek-v4-pro".to_string(),
+            base_url: "https://api.deepseek.com".to_string(),
+            interleaved_thinking: true,
+            ..Profile::default()
+        };
+        let caps = ModelCatalog::resolve(&profile, None).capabilities;
+        assert!(
+            !caps.interleaved_thinking.value,
+            "OpenAI 线不发 interleaved-thinking beta"
+        );
     }
 
     fn tmp_cache(tag: &str) -> (PathBuf, CapabilityCache) {
