@@ -95,6 +95,9 @@ max_turns = 200                 # 单次用户提交内允许的最大推理轮�
                                 # 迁移）可调高；调低它限制的是**单次提交**的最长耗时。
                                 # 死循环保护由 loop_guard 独立承担，不受本值影响；
                                 # reasoning 模型另有 32 轮熔断，也不受本值影响。
+                                # **思考关不掉的端点同样压到 32 轮**（判据走 ThinkingSpec：
+                                # MiniMax M2.x/M3.1、Qwen/豆包的 -thinking、Moonshot 的 -code）。
+                                # 它们的每轮都是一次完整深度推理，单回合 200 轮可达半小时以上。
 
 [tools]                          # 工具注册门控（v0.2.27+）
 todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认开启**

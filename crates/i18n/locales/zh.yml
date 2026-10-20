@@ -801,6 +801,7 @@ status:
   api_key_error: "API Key: {err}"
   context_window_unverified: "上下文窗口 {window} tokens 未经探测验证。自动压缩要到约 {trigger} tokens 才触发，期间工具输出全量累积；若真实窗口更小，请调低 `context_window` 让清理与压缩真正生效。"
   parallel_tools_capped: "max_tools_per_turn = {current} 低于该端点支持的上限（{supported}）。每多一趟往返就重发一遍完整上下文，是输入成本的一阶驱动因素。"
+  high_effort_on_forced_thinking: "reasoning_effort = {effort}，而 `{model}` 的思考关不掉：每一轮工具循环都会完整跑一遍最深推理，单次提交可能持续十几分钟到半小时以上。长任务建议降到 `medium`，或拆成多次提交。"
   other_profiles: "其他分组: {names}"
   mcp_servers: "MCP servers: {count}"
   search_configured: "WebSearch: {provider}（已配置，工具可用）"

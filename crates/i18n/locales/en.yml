@@ -804,6 +804,7 @@ status:
   api_key_error: "API Key: {err}"
   context_window_unverified: "Context window {window} tokens is unverified (not probed). Auto-compact will not fire until ~{trigger} tokens, so tool results accumulate in full. If the real window is smaller, lower `context_window` to make trimming and compaction happen."
   parallel_tools_capped: "max_tools_per_turn = {current} is below what this endpoint supports ({supported}). Each extra round-trip re-sends the whole context, so this is the first-order driver of input cost."
+  high_effort_on_forced_thinking: "reasoning_effort = {effort} while `{model}` cannot turn thinking off: every tool-loop turn runs a full-depth reasoning pass, so a single submission can take 10-30 minutes. Lower it to `medium` for long tasks, or split them into several submissions."
   other_profiles: "Other profiles: {names}"
   mcp_servers: "MCP servers: {count}"
   search_configured: "WebSearch: {provider} (configured, tool available)"

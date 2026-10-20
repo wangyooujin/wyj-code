@@ -353,6 +353,53 @@ fn print_config_hints(active: &wyj_config::Profile) {
             );
         }
     }
+
+    // 3) 高 effort 档 + 思考关不掉的端点：单轮时延的乘数。
+    //    `reasoning_effort` 直接决定该端点每轮思考多长，而思考关不掉的端点
+    //    （MiniMax M2.x/M3.1、Qwen/豆包 `-thinking`…）无法用 `disabled` 降下来。
+    //    两者叠加 = 每个工具轮都要完整跑一遍最深的推理，实测一条
+    //    `MiniMax-M3.1-Flash` 会话单回合 163 轮、墙钟 30 分钟以上。这里只提示、
+    //    不改写——effort 是用户显式意图，且没有"安全的"自动档位。
+    if let Some(cannot_disable) = thinking_cannot_be_disabled(active) {
+        if let Some(effort) = active.effective_reasoning_effort() {
+            if is_high_effort(&effort) {
+                println!(
+                    "{}",
+                    wyj_i18n::tr_fmt(
+                        "status.high_effort_on_forced_thinking",
+                        &[("effort", &effort), ("model", &cannot_disable)]
+                    )
+                );
+            }
+        }
+    }
+}
+
+/// 该 profile 的端点**能否关掉思考**。可以关（或没有思考能力）时返回 `None`；
+/// 关不掉时返回模型名，供提示文案点名。
+///
+/// 判据与 `core::agent::helpers::max_turns_for_model` 同源：都走
+/// `ThinkingSpec::for_vendor(vendor, wire, model)`。分开两处会漂移——那边压
+/// 轮数、这边提示 effort，判的却是同一件事。
+fn thinking_cannot_be_disabled(profile: &wyj_config::Profile) -> Option<String> {
+    // vendor 推导走 catalog：`profile.vendor` 未写时按 base_url + model 名推断，
+    // 与真实请求路径（`ModelCatalog::resolve_with_cache`）用的是同一份逻辑。
+    let identity = wyj_api::model_catalog::ModelCatalog::resolve(profile, None).identity;
+    let spec = wyj_api::ThinkingSpec::for_vendor(
+        &identity.vendor,
+        &identity.wire_protocol,
+        &identity.model,
+    );
+    (!spec.user_can_disable || spec.ignore_disabled_when_forced).then(|| profile.model.clone())
+}
+
+/// 该 effort 档是否属于「深度思考」。`max` / `xhigh` / `high` 都算——它们对
+/// 强制思考的端点意味着每轮都跑满，正是用户抱怨「一直想」的那一档。
+fn is_high_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_ascii_lowercase().as_str(),
+        "high" | "max" | "xhigh"
+    )
 }
 
 /// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
@@ -4254,6 +4301,68 @@ mod cli_tests {
     fn sandbox_report_was_removed_with_os_sandbox() {
         // 占位测试：原本的 `sandbox_report_exposes_one_shot_host_execution_boundaries`
         // 随 OS sandbox 一起移除。保留这条占位，避免后续误把 sandbox_report 复活。
+    }
+
+    // ── `--config-status` 的「高 effort + 思考关不掉」提示 ──
+
+    fn profile_with(
+        provider: wyj_config::Provider,
+        model: &str,
+        base_url: &str,
+    ) -> wyj_config::Profile {
+        wyj_config::Profile {
+            provider,
+            model: model.to_string(),
+            base_url: base_url.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// 强制思考的端点必须被点出来——这是「一直想」最直观的一阶成因。
+    #[test]
+    fn forced_thinking_endpoints_are_detected() {
+        for (model, base_url) in [
+            ("MiniMax-M3.1-Flash", "https://api.minimaxi.com/anthropic"),
+            ("MiniMax-M2.7", "https://api.minimaxi.com/anthropic"),
+        ] {
+            let profile = profile_with(wyj_config::Provider::Anthropic, model, base_url);
+            assert!(
+                thinking_cannot_be_disabled(&profile).is_some(),
+                "{model}: /anthropic 端点思考关不掉，必须被识别"
+            );
+        }
+    }
+
+    /// 能关掉思考的端点**不得**被误报，否则提示会变成噪音、用户很快学会无视它。
+    #[test]
+    fn disableable_thinking_endpoints_are_not_flagged() {
+        let m3 = profile_with(
+            wyj_config::Provider::Anthropic,
+            "MiniMax-M3",
+            "https://api.minimaxi.com/anthropic",
+        );
+        assert!(
+            thinking_cannot_be_disabled(&m3).is_none(),
+            "M3 的 thinking.type=disabled 真的生效，不该提示"
+        );
+
+        let claude = profile_with(
+            wyj_config::Provider::Anthropic,
+            "claude-opus-4-5",
+            "https://api.anthropic.com",
+        );
+        assert!(thinking_cannot_be_disabled(&claude).is_none());
+    }
+
+    /// 只有 `high` / `xhigh` / `max` 算深度思考；`low` / `medium` 不提示。
+    #[test]
+    fn only_high_effort_levels_trigger_the_hint() {
+        for level in ["high", "max", "xhigh", " HIGH ", "XHigh"] {
+            assert!(is_high_effort(level), "{level} 应算高 effort");
+        }
+        for level in ["low", "medium", "minimal", ""] {
+            assert!(!is_high_effort(level), "{level} 不该提示");
+        }
     }
 
     #[test]
