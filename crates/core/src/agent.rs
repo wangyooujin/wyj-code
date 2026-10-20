@@ -1047,7 +1047,9 @@ impl Agent {
         }
     }
 
-    /// 仅暴露核心工具 schema；其他工具通过 ToolSearch 命中后按会话 sticky。
+    /// 仅暴露核心工具 schema；其他工具通过 ToolSearch 命中后**永久暴露**
+    /// （可见性单调不减，见 `LazyToolState::exposed`——schema 一旦发给模型
+    /// 就不得收回，收回会让 tools 数组中途缩水进而作废整段 prompt cache）。
     pub fn enable_lazy_tools(
         &mut self,
         core_tools: impl IntoIterator<Item = String>,
@@ -1465,10 +1467,14 @@ impl Agent {
         //     规约文件每轮重读盘但字节级稳定，因此这段只在「记忆跨桶」或
         //     「用户改了规约文件」时才失效缓存。
         //
-        //   * `system_volatile` —— 循环内累积的子目录规约 reminder。
-        //     放在断点之后：旧实现把它 `push_str` 到 system 末尾并注释说
-        //     「只增不减，前缀仍可缓存」——这是错的，追加在断点**之后**同样会
-        //     改变断点处的前缀哈希，导致每命中一个新目录就整段全价重算。
+        //   * `system_volatile` —— 尾部三段（模型兼容 suffix → 工具可用性
+        //     名单 → 语言提醒），由 `push_request_volatile_tail` 统一拼装。
+        //     放在断点之后：旧实现把子目录规约 reminder 也 `push_str` 到
+        //     这里并注释说「只增不减，前缀仍可缓存」——这是错的，system 段
+        //     任何字节变化都会让 **messages 断点**失效（system 位于
+        //     messages 之前，而该断点覆盖 tools + system + messages 前缀），
+        //     每命中一个新目录就整段历史全价重算。子目录 reminder 因此改
+        //     走**历史注入**（见工具轮循环里的 `maybe_dir_reminder`）。
         // system prompt 含完整 CLAUDE.md 链（本仓库 30KB+）。它被 `Arc<str>`
         // 共享，装配完成后不再改写——本轮**只在真的需要追加时**才复制一份，
         // 否则直接借用（`Cow::Borrowed`），省掉每轮一次 30KB+ 的深拷贝。
@@ -1495,7 +1501,6 @@ impl Agent {
             }
             std::borrow::Cow::Owned(buffer)
         };
-        let mut system_volatile = String::new();
 
         // 调用方在进入 run_turn 前已 push 本次真实用户消息；checkpoint 保存其
         // 之前的完整对话与当前工作树，确保 /rewind 可以回到提交前边界。
@@ -1697,11 +1702,14 @@ impl Agent {
             let (blocks, stop_reason, used_route) = 'route_attempt: loop {
                 let route = self.route_at(route_index);
                 // stable 段跨 route 复用（内容本就与 route 无关）；每轮变化的
-                // 部分（本轮触达目录的规约 reminder + suffix + 工具可用性
-                // + 语言提醒）归入 volatile，尾部三段由 `push_request_volatile_tail`
-                // 统一拼装——手动 `/compact` 要复现同一份字节，顺序与内容
-                // 分两处写就是下一次失配的起点。
-                let mut request_system_volatile = system_volatile.clone();
+                // 部分（suffix + 工具可用性 + 语言提醒）归入 volatile，尾部三段
+                // 由 `push_request_volatile_tail` 统一拼装——手动 `/compact` 要
+                // 复现同一份字节，顺序与内容分两处写就是下一次失配的起点。
+                //
+                // 声明必须在**循环内**：`push_request_volatile_tail` 是累加式
+                // 的 `push_str`，放在循环外会让 fallback 切 route 后的第二次
+                // attempt 把上一段内容再叠一遍。
+                let mut request_system_volatile = String::new();
                 // effort 能不能上送由 `wyj_api::normalize_effort` 单独裁决：它查的是
                 // vendor 的 `effort_levels`，不是 `ModelCapabilities` 里那个**单值**
                 // `ThinkingMode` 标签——后者既记不下 Qwen 这种 budget/effort 都认的
@@ -1812,9 +1820,10 @@ impl Agent {
                     }
                 }
                 session.prompt_fingerprint = Some(fingerprint);
-                // 存下「本次真正发出去的 volatile 字节」：手动 `/compact` 在回合之外
-                // 重建不了子目录 reminder（`seen_dirs` 全局去重，第二个回合起就没
-                // 有了），只能靠这份快照才能与主对话前缀逐字节一致、命中缓存。
+                // 存下「本次真正发出去的 volatile 字节」：手动 `/compact` 必须与
+                // 主对话前缀**逐字节相同**才能命中缓存，而尾部三段依赖本次
+                // route 的能力快照与当时的工具集合。子目录规约 reminder 已改
+                // 走历史注入，不再是 volatile 的一部分。
                 if let Ok(mut slot) = self.last_request_volatile.lock() {
                     *slot = request_system_volatile.clone();
                 }
@@ -2842,10 +2851,25 @@ impl Agent {
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的规约文件，
-                // 追加到 system 的 **volatile 段**（而非稳定前缀、也不注入 user
-                // 消息）。这样历史消息保持干净、避免跨轮重复发送，seen_dirs 去重
-                // 保证每条只追加一次；更重要的是它位于 cache breakpoint 之后，
-                // 命中新目录不会让稳定前缀整段全价重算。
+                // 追加到**历史**（而不是 system 的 volatile 段）。
+                //
+                // 为什么必须走历史：Anthropic 的缓存前缀物理顺序是
+                // `tools → system → messages`，system 块位于 messages **之前**，
+                // 而 messages 断点覆盖的是「tools + system + messages 前缀」。
+                // 因此 system 段任何字节变化都会让 messages 断点失效，
+                // **整段历史全价重算**——每命中一个新目录就付一次全量重算，
+                // 代价远大于 reminder 本身。旧注释说「位于 cache breakpoint
+                // 之后，所以命中新目录不会让稳定前缀整段全价重算」，那说的
+                // 只是 stable 断点；messages 断点在 system 之后，照样被作废。
+                //
+                // 走历史则相反：system 保持字节不变 → 前缀哈希不变 → 历史
+                // 断点照常命中，只有新追加的那条消息是新的。DeepSeek Harness
+                // 的 in-history system prompt update 走的正是这条路。
+                //
+                // 注入形态：合并进最后一条 user 消息（此刻它装着本轮的
+                // tool_result），与工具结果同处一条 user 消息，维持角色严格
+                // 交替——这条通道 SteerQueue 注入已经在用，形态是现成的。
+                // `seen_dirs` 去重保证每个目录只追加一次。
                 if let Some(loader) = &self.claude_md {
                     let mut new_reminders = String::new();
                     for dir in &touched_dirs {
@@ -2855,7 +2879,9 @@ impl Agent {
                         }
                     }
                     if !new_reminders.is_empty() {
-                        system_volatile.push_str(&new_reminders);
+                        session.push_user_blocks_merged(vec![ContentBlock::Text {
+                            text: new_reminders,
+                        }]);
                     }
                 }
             } else if !pending_tools.is_empty() {
@@ -3443,10 +3469,11 @@ impl Agent {
     /// 1. `tools` 走 [`Self::tools_for_request`]——含 route 能力裁剪与 lazy
     ///    折叠，与 `run_turn` 完全一致；
     /// 2. `volatile` 优先取**最近一次真实请求发出去的字节**
-    ///    （[`Self::last_request_volatile`]）。回合之外重建不出子目录规约
-    ///    reminder——`ClaudeMdLoader::seen_dirs` 是全局去重的，第二个回合起
-    ///    就再也拿不到它，而它在真实请求里是 volatile 的第一段。没有历史请求
-    ///    时（新会话第一条就 `/compact`）才现拼尾部三段；
+    ///    （[`Self::last_request_volatile`]）。尾部三段依赖本次 route 的能力
+    ///    快照与当时的工具集合，回合之外现拼可能与主对话对不上。没有历史
+    ///    请求时（新会话第一条就 `/compact`）才现拼；
+    ///    子目录规约 reminder 已改走**历史注入**，它随 messages 前缀一起
+    ///    被复用，不再需要在这里重建；
     /// 3. 窗口走 [`Session::effective_context_window`]，与自动压缩同一份判定
     ///    依据。旧实现直接用配置值，于是「手动压过之后自动压缩的阈值又变了」。
     pub async fn compact_context(
