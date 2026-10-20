@@ -48,6 +48,7 @@
     </a>
     <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
       <a href="#features" class="hover:text-amber-500 transition-colors" data-i18n="nav.features">高级功能</a>
+      <a href="#websearch" class="hover:text-amber-500 transition-colors" data-i18n="nav.websearch">网页搜索</a>
       <a href="#architecture" class="hover:text-amber-500 transition-colors" data-i18n="nav.architecture">架构</a>
       <a href="#security" class="hover:text-amber-500 transition-colors" data-i18n="nav.security">安全模型</a>
       <a href="#changelog" class="hover:text-amber-500 transition-colors" data-i18n="nav.changelog">变更记录</a>
@@ -137,7 +138,12 @@
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-plug"/></svg>
       <h3 class="mt-4 font-semibold" data-i18n="feature.mcp.title">可插拔 MCP</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.mcp.desc">内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / TodoWrite，并可桥接任意外部 MCP server。</p>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.mcp.desc">内置 Bash / Read / Write / Edit / Glob / Grep / WebFetch / WebSearch / TodoWrite，并可桥接任意外部 MCP server。</p>
+    </div>
+    <div class="card reveal rounded-xl p-6">
+      <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-globe"/></svg>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.websearch.title">内置网页搜索 WebSearch</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.websearch.desc">配一个 Key 就有：Tavily / Brave 双后端、主题与时效窗口、按域过滤，搜索结果可直接交给 WebFetch 读全文。未知 provider 显式报错，未配 Key 则不注册。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-compress"/></svg>
@@ -213,6 +219,107 @@
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
       <h3 class="mt-4 font-semibold" data-i18n="feature.jev.title">Jev 决策 API（v0.2.22）</h3>
       <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.jev.desc">TypeSafe System One 决策模型作独立 tool：意图路由 / 分类 / guardrails / 置信度标注，输出结构化 answers + probabilities；<code class="text-amber-400">/decision</code> slash 命令做连通性诊断，三层硬封顶（state 大小 / question 数 / 日预算）防失控。</p>
+    </div>
+  </div>
+</section>
+
+
+<!-- WEBSEARCH -->
+<section id="websearch" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="websearch.kicker">Built-in Web Search</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="websearch.title">内置网页搜索 WebSearch</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="websearch.desc">模型的知识有截止日期，你的代码库没有。WebSearch 让它在动手之前先去查「现在这个 API 到底怎么用」「这个 CVE 影响哪些版本」「最新版有没有 breaking change」——查完再动手，而不是拿训练时的记忆硬写。</p>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="websearch.desc2">它是<strong>内置</strong>的：不是需要自己起的 MCP server，不是让模型自己拼 curl 的 shell 命令，而是和 Read / Grep / WebFetch 并列的一个正式工具。配一个搜索服务的 API Key，模型立刻就多出一双能看世界的眼睛。</p>
+  </div>
+
+  <div class="mt-12 grid lg:grid-cols-2 gap-4">
+    <!-- ENABLE -->
+    <div class="card reveal rounded-xl p-7">
+      <h3 class="font-semibold text-phosphor" data-i18n="websearch.enable.title">三分钟启用</h3>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.enable.desc">在全局配置里加一段 <code class="text-amber-400">[search]</code> 就行。</p>
+      <div class="mt-5 code-block rounded-lg relative">
+        <button class="copy-btn absolute top-2.5 right-2.5 p-1.5 rounded-md" data-copy-target="code-ws-enable" data-copy-text="[search]
+provider = &quot;tavily&quot;
+api_key = &quot;tvly-xxxxxxxx&quot;
+max_results = 5" aria-label="copy">
+          <svg viewBox="0 0 24 24" class="w-3.5 h-3.5"><use href="#i-copy"/></svg>
+        </button>
+        <pre class="px-4 py-3 pr-12 text-[12px] leading-[1.7] overflow-x-auto"><code id="code-ws-enable" data-i18n="websearch.code.enable"><span class="text-paper/35"># ~/.wyj-code/config.toml</span>
+[search]
+provider  = <span class="text-phosphor">"tavily"</span>   <span class="text-paper/35"># 或 "brave"</span>
+api_key   = <span class="text-phosphor">"tvly-xxxxxxxx"</span>
+max_results = <span class="text-phosphor">5</span>        <span class="text-paper/35"># 硬上限 10</span></code></pre>
+      </div>
+      <p class="mt-4 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.enable.env">不想把 Key 写进文件，就用环境变量——环境变量的值<strong>不会</strong>被写回配置文件：</p>
+      <div class="mt-3 code-block rounded-lg">
+        <pre class="px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code>export <span class="text-phosphor">WYJ_CODE_SEARCH_API_KEY</span>="tvly-xxxxxxxx"</code></pre>
+      </div>
+      <p class="mt-4 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.enable.doctor">重启后敲 <code class="text-amber-400">/doctor</code>，看到这一行就算好了：</p>
+      <div class="mt-3 code-block rounded-lg">
+        <pre class="px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code data-i18n="websearch.code.doctor"><span class="text-phosphor">  ✓</span>  网页搜索    tavily</code></pre>
+      </div>
+      <p class="mt-4 text-xs text-paper/40 leading-relaxed" data-i18n="websearch.enable.note">没配 Key 时<strong>工具压根不注册</strong>——模型看不到一个注定失败的入口，不浪费一次 LLM 往返。provider 名字写错则显式报错，绝不静默回退到默认后端。</p>
+    </div>
+
+    <!-- CAPABILITIES -->
+    <div class="card reveal rounded-xl p-7" style="transition-delay:60ms">
+      <h3 class="font-semibold text-phosphor" data-i18n="websearch.caps.title">它能做什么</h3>
+      <ul class="mt-5 space-y-4 text-sm text-paper/60 leading-relaxed">
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l1"><strong class="text-paper/80">主题与时效</strong>：<code class="text-amber-400">topic</code> 支持 general / news / finance，<code class="text-amber-400">time_range</code> 支持 day / week / month / year——查「今天」「本周」的版本发布与安全通告</span>
+        </li>
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l2"><strong class="text-paper/80">按域收敛</strong>：<code class="text-amber-400">include_domains</code> / <code class="text-amber-400">exclude_domains</code> 限定官方文档、issue tracker、源码仓库，屏蔽 SEO 农场；配置里的默认白/黑名单模型可临时覆盖</span>
+        </li>
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l3"><strong class="text-paper/80">双后端</strong>：Tavily（带 LLM 生成的问答式摘要与相关度评分）、Brave（带 <code class="text-amber-400">safesearch</code> 与 <code class="text-amber-400">search_lang</code>）。后端不支持某参数时<strong>明确报错</strong>而不是静默忽略</span>
+        </li>
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l4"><strong class="text-paper/80">搜索 → 深读两步接力</strong>：搜索给「标题 + 链接 + 摘要」，模型再用内置 <code class="text-amber-400">WebFetch</code> 读全文，同一轮里完成</span>
+        </li>
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l5"><strong class="text-paper/80">Key 只进请求头</strong>：body 会被代理日志完整打印，头不会。瞬时故障退避重试一次，限流与认证错误不重试</span>
+        </li>
+        <li class="flex gap-3">
+          <span class="text-phosphor shrink-0">·</span>
+          <span data-i18n="websearch.caps.l6"><strong class="text-paper/80">外部文本按不可信处理</strong>：结果统一过 harness marker 转义，网页正文伪造不了对话结构；超长输出落盘，模型可用 Read 取回</span>
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- USE CASES -->
+  <div class="mt-16">
+    <div class="reveal max-w-2xl">
+      <h3 class="font-display font-bold text-2xl sm:text-3xl" data-i18n="websearch.usecases.title">开发者最常用的四个场景</h3>
+    </div>
+    <div class="mt-8 grid sm:grid-cols-2 gap-4">
+      <div class="card reveal rounded-xl p-6">
+        <div class="font-display font-extrabold text-amber-500 text-2xl">01</div>
+        <h4 class="mt-3 font-semibold" data-i18n="websearch.usecases.1.title">升级依赖前先查 breaking change</h4>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.usecases.1.desc">「<code class="text-amber-400">cargo update</code> 之前先搜一下 tokio 1.5x 有哪些 breaking change。」模型先搜官方 release notes 与 issue，列出风险点，再决定动不动 <code class="text-amber-400">Cargo.toml</code>。</p>
+      </div>
+      <div class="card reveal rounded-xl p-6" style="transition-delay:60ms">
+        <div class="font-display font-extrabold text-amber-500 text-2xl">02</div>
+        <h4 class="mt-3 font-semibold" data-i18n="websearch.usecases.2.title">排查只在最新版出现的报错</h4>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.usecases.2.desc">「这个 <code class="text-amber-400">ConnectionClosed</code> 错误只在最新版本出现，搜一下是不是已知的 upstream issue。」拿到 issue 编号与讨论串，再回到你的代码里定位。</p>
+      </div>
+      <div class="card reveal rounded-xl p-6" style="transition-delay:120ms">
+        <div class="font-display font-extrabold text-amber-500 text-2xl">03</div>
+        <h4 class="mt-3 font-semibold" data-i18n="websearch.usecases.3.title">查框架的当下最佳实践</h4>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.usecases.3.desc">「现在写 Rust HTTP 服务，官方推荐哪种错误处理中间件？」搜索把过时的博客答案和当前官方文档分开，模型按需 WebFetch 读全文。</p>
+      </div>
+      <div class="card reveal rounded-xl p-6" style="transition-delay:180ms">
+        <div class="font-display font-extrabold text-amber-500 text-2xl">04</div>
+        <h4 class="mt-3 font-semibold" data-i18n="websearch.usecases.4.title">安全通告与依赖漏洞</h4>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="websearch.usecases.4.desc">「我们用的 <code class="text-amber-400">openssl</code> 版本有没有已知的严重漏洞？」搜 CVE 与发行说明，输出带链接的清单——可审计、可复查。</p>
+      </div>
     </div>
   </div>
 </section>
