@@ -19,6 +19,22 @@ pub struct LazyToolState {
 struct LazyToolInner {
     catalog: HashMap<String, ToolCatalogEntry>,
     core: HashSet<String>,
+    /// 会话内**曾经**暴露过 schema 的工具。
+    ///
+    /// 这一层是**单调**的：只增不减，直到工具被真正卸载（`remove`）。
+    /// 它存在的唯一理由是保护 prompt cache —— Anthropic 的缓存前缀物理顺序
+    /// 是 `tools → system → messages`，官方文档明写「不要在会话中途增删或
+    /// 重排 tools，任何改动都会让 tools 缓存及其后的 system、messages 全部
+    /// 失效」。旧实现用 `sticky` 兼管可见性，`sticky_turns`（默认 3）到期后
+    /// 工具从请求里消失，代价是**整段 prompt 缓存全部作废**——比它省下的
+    /// 那点 schema token 贵几个数量级。
+    ///
+    /// 「可被模型调用」和「搜索时排前面」是两种不同的诉求：前者一旦给出就
+    /// 不该收回（收回等于让模型上一轮还能调、这一轮突然不能调），后者应当
+    /// 有新鲜度窗口。因此拆成 `exposed`（单调，管可见性）与 `sticky`
+    /// （带过期，管搜索加权）两层。
+    exposed: HashSet<String>,
+    /// 工具名 → 最后使用轮次。**只用于搜索排序加权**，不决定可见性。
     sticky: HashMap<String, u64>,
     current_turn: u64,
     top_k: usize,
@@ -97,6 +113,7 @@ impl LazyToolState {
             inner: Arc::new(RwLock::new(LazyToolInner {
                 catalog: HashMap::new(),
                 core: core.into_iter().collect(),
+                exposed: HashSet::new(),
                 sticky: HashMap::new(),
                 current_turn: 0,
                 top_k: top_k.clamp(1, 12),
@@ -121,8 +138,16 @@ impl LazyToolState {
         let mut inner = self.inner.write().unwrap();
         inner.catalog.remove(name);
         inner.sticky.remove(name);
+        // 工具被真正卸载（插件移除 / 重新注册）时，可见性必须跟着收回，
+        // 否则 `visible` 会为已不存在的工具放行，而 `tools_for_request` 又是
+        // 按 `self.tools` 过滤的，两边对不上。
+        inner.exposed.remove(name);
     }
 
+    /// 新回合开始：轮次 +1，并让**搜索加权**的 sticky 记录过期。
+    ///
+    /// 刻意**不**动 `exposed` —— 已暴露过的工具在本会话内保持可见，请求里的
+    /// tools 数组因此单调不减，prompt cache 不会被中途作废。
     pub fn begin_task_turn(&self) {
         let mut inner = self.inner.write().unwrap();
         inner.current_turn = inner.current_turn.saturating_add(1);
@@ -133,17 +158,43 @@ impl LazyToolState {
             .retain(|_, last_used| current.saturating_sub(*last_used) <= sticky_turns);
     }
 
+    /// 显式暴露某个工具的 schema：从这一刻起它在本会话内**永久可见**。
+    ///
+    /// 可见性是单调的（见 `exposed` 字段），因为 schema 一旦发给模型就
+    /// 不得收回——收回会让 tools 数组中途缩水，进而让整段 prompt cache
+    /// 失效。工具被真正卸载时由 [`Self::remove`] 收回。
+    pub fn expose(&self, name: &str) {
+        let mut inner = self.inner.write().unwrap();
+        Self::expose_locked(&mut inner, name);
+    }
+
+    fn expose_locked(inner: &mut LazyToolInner, name: &str) {
+        if inner.catalog.contains_key(name) {
+            inner.exposed.insert(name.to_string());
+        }
+    }
+
     pub fn mark_used(&self, name: &str) {
         let mut inner = self.inner.write().unwrap();
         if inner.catalog.contains_key(name) && !inner.core.contains(name) && name != "ToolSearch" {
             let current = inner.current_turn;
             inner.sticky.insert(name.to_string(), current);
+            Self::expose_locked(&mut inner, name);
         }
     }
 
+    /// 本次请求里这个工具的 schema 会不会被发出去。
+    ///
+    /// 判定**单调**：`core` 常驻、`exposed` 只增不减，因此同一个会话内
+    /// 可见集合只增不减 —— 这是保护 Anthropic prompt cache 的硬约束
+    /// （见 `LazyToolInner::exposed`）。
     pub fn visible(&self, name: &str) -> bool {
         let inner = self.inner.read().unwrap();
-        inner.core.contains(name) || inner.sticky.contains_key(name) || name == "ToolSearch"
+        Self::is_visible(&inner, name)
+    }
+
+    fn is_visible(inner: &LazyToolInner, name: &str) -> bool {
+        inner.core.contains(name) || inner.exposed.contains(name) || name == "ToolSearch"
     }
 
     /// 本次请求被 lazy 折叠掉的工具，按 source 分组计数（source 升序）。
@@ -159,10 +210,7 @@ impl LazyToolState {
         let mut counts: HashMap<String, usize> = HashMap::new();
         for entry in inner.catalog.values() {
             let name = &entry.definition.name;
-            let visible = inner.core.contains(name)
-                || inner.sticky.contains_key(name)
-                || name == "ToolSearch";
-            if !visible {
+            if !Self::is_visible(&inner, name) {
                 *counts.entry(entry.source.clone()).or_insert(0) += 1;
             }
         }
@@ -246,6 +294,12 @@ impl LazyToolState {
                 .iter()
                 .map(|entry| (entry.definition.name.clone(), current)),
         );
+        // 命中的工具从这一刻起**永久可见**（直到被 `remove`）：schema 一旦
+        // 发出去就不得收回，否则 tools 数组中途缩水会让整段 prompt cache
+        // 失效。`sticky` 的过期只影响搜索排序加权。
+        for entry in &entries {
+            Self::expose_locked(&mut inner, &entry.definition.name);
+        }
         entries
     }
 }
@@ -408,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn sticky_tools_expire_and_removed_tools_disappear_immediately() {
+    fn exposed_tools_stay_visible_after_the_sticky_window_expires() {
         let state = LazyToolState::new(["Read".to_string()], 2, 2);
         for name in ["Read", "Bash", "WebFetch"] {
             state.upsert(ToolDefinition {
@@ -426,12 +480,62 @@ mod tests {
         state.begin_task_turn();
         state.begin_task_turn();
         assert!(state.visible("Bash"));
+        // sticky 的新鲜度窗口已过，但 schema **已经发出去过**，不得收回：
+        // 收回会让 tools 数组中途缩水，进而让整段 prompt cache 失效。
         state.begin_task_turn();
-        assert!(!state.visible("Bash"));
+        assert!(state.visible("Bash"));
 
         state.search("WebFetch", 8, None, &[], None);
         assert!(state.visible("WebFetch"));
+        // 工具被真正卸载时，可见性才跟着收回。
         state.remove("WebFetch");
         assert!(!state.visible("WebFetch"));
+    }
+
+    /// 可见集合必须**单调不减**——这是保护 Anthropic prompt cache 的硬约束。
+    ///
+    /// Anthropic 的缓存前缀物理顺序是 `tools → system → messages`，官方文档
+    /// 明写「不要在会话中途增删或重排 tools，任何改动都会让 tools 缓存及其后
+    /// 的 system、messages 全部失效」。所以本会话内一旦暴露过某个工具的
+    /// schema，它就必须一直留在请求里。
+    #[test]
+    fn the_visible_tool_set_never_shrinks_within_a_session() {
+        let state = LazyToolState::new(["Read".to_string()], 8, 1);
+        for name in ["Read", "Bash", "WebFetch", "Grep"] {
+            state.upsert(ToolDefinition {
+                name: name.to_string(),
+                description: name.to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                native: None,
+            });
+        }
+
+        let snapshot = |state: &LazyToolState| -> Vec<String> {
+            let mut names: Vec<String> = ["Read", "Bash", "WebFetch", "Grep", "ToolSearch"]
+                .into_iter()
+                .filter(|name| state.visible(name))
+                .map(|name| name.to_string())
+                .collect();
+            names.sort();
+            names
+        };
+
+        let mut previous = snapshot(&state);
+        assert_eq!(previous, vec!["Read", "ToolSearch"]);
+
+        for turn in 0..12 {
+            state.begin_task_turn();
+            if turn % 2 == 0 {
+                state.search("Grep", 8, None, &[], None);
+            } else {
+                state.search("WebFetch", 8, None, &[], None);
+            }
+            let current = snapshot(&state);
+            assert!(
+                current.len() >= previous.len(),
+                "可见工具集合在第 {turn} 轮缩水了：{previous:?} → {current:?}"
+            );
+            previous = current;
+        }
     }
 }

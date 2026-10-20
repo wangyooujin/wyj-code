@@ -125,17 +125,57 @@ impl Command for ContextCmd {
         // 列宽按**显示宽度**算，不能用 `{label:<18}`——那是按字符个数补的，
         // 中文标签每字占 2 列，补出来的列自然歪（"System prompt" 13 字符补到
         // 18 = 18 列，"工具定义" 4 字符补到 18 = 16 列，差 2 列）。
-        let rows: Vec<crate::cost_view::Row> = [
-            (tr("context.system"), audit.system_tokens),
-            (tr("context.tools"), audit.tool_schema_tokens),
-            (tr("context.history"), audit.history_tokens),
-            (tr("context.output"), audit.output_reserve),
-            (tr("context.framing"), audit.framing_tokens),
-        ]
-        .into_iter()
-        .map(|(label, value)| crate::cost_view::Row::new(label, u64::from(value), None))
-        .collect();
-        let mut rows = rows;
+        //
+        // system 拆成 stable / volatile 两**行**（而不是「一行合计 + 两行子项」）：
+        // 后者会让 Total 与各行之和对不上——用户心算出的数比面板上的合计大
+        // 一截，第一反应是面板算错了。拆开则各项之和恰好等于 Total。
+        //
+        // 拆分信息缺失时（老会话落盘的 audit 没有这两个字段）回退成单行合计，
+        // 否则会显示成 stable=0 / volatile=0 却仍报一个非零的 system 合计。
+        // 取数形态由 `ContextAudit::system_split` 统一定义，面板与
+        // `parts_sum`（合计行可验性）共用同一处判定。
+        let mut rows: Vec<crate::cost_view::Row> = Vec::new();
+        match audit.system_split() {
+            Some((stable, volatile)) => {
+                rows.push(crate::cost_view::Row::new(
+                    tr("context.system_stable"),
+                    u64::from(stable),
+                    None,
+                ));
+                rows.push(crate::cost_view::Row::new(
+                    tr("context.system_volatile"),
+                    u64::from(volatile),
+                    None,
+                ));
+            }
+            None => {
+                rows.push(crate::cost_view::Row::new(
+                    tr("context.system"),
+                    u64::from(audit.system_tokens),
+                    None,
+                ));
+            }
+        }
+        rows.push(crate::cost_view::Row::new(
+            tr("context.tools"),
+            u64::from(audit.tool_schema_tokens),
+            None,
+        ));
+        rows.push(crate::cost_view::Row::new(
+            tr("context.history"),
+            u64::from(audit.history_tokens),
+            None,
+        ));
+        rows.push(crate::cost_view::Row::new(
+            tr("context.output"),
+            u64::from(audit.output_reserve),
+            None,
+        ));
+        rows.push(crate::cost_view::Row::new(
+            tr("context.framing"),
+            u64::from(audit.framing_tokens),
+            None,
+        ));
         rows.push(crate::cost_view::Row::total(
             tr("context.total"),
             u64::from(total),
@@ -155,6 +195,18 @@ impl Command for ContextCmd {
                 ("threshold", &fmt_num(threshold)),
             ],
         ));
+
+        // 工具个数：tools 数组位于 Anthropic 缓存前缀的**最前端**，官方明确
+        // 「会话中途增删或重排 tools 会让 tools 缓存及其后的 system、messages
+        // 全部失效」。所以「本次发了几个工具」是判断缓存是否健康的直接指标
+        // ——它应当只增不减，中途缩水就意味着整段缓存被作废过一次。
+        if audit.tool_count > 0 {
+            text.push('\n');
+            text.push_str(&tr_fmt(
+                "context.tools_count",
+                &[("count", &audit.tool_count.to_string())],
+            ));
+        }
 
         // 可回收的旧工具结果：目前**只统计不删除**（第 3 批的 context editing
         // 才会真的回收），如实告知用户有多少是"已经用不上但仍占着窗口"的。
@@ -2422,6 +2474,7 @@ mod subagents_tests {
             framing_tokens: 300,
             window: 0,
             reclaimable_tool_result_tokens: 0,
+            ..Default::default()
         };
         let ctx = ctx_with_audit(Some(audit), 200_000);
         let result = ContextCmd.run("", &ctx).await.unwrap();
@@ -2440,6 +2493,86 @@ mod subagents_tests {
         }
     }
 
+    /// 面板必须把 system 拆成 stable / volatile 两行，并报出工具个数。
+    ///
+    /// 前者回答「哪一段在变」：volatile 段一变，Anthropic 的 messages 断点
+    /// 失效（system 位于 messages 之前，而该断点覆盖 tools + system +
+    /// messages 前缀），其后整段历史全价重算。后者回答「缓存前缀有多大」：
+    /// tools 数组在缓存前缀最前端，集合只增不减才不会作废缓存。
+    #[tokio::test]
+    async fn context_panel_splits_the_system_prompt_and_reports_the_tool_count() {
+        let audit = wyj_core::compact::ContextAudit {
+            system_tokens: 1_200,
+            system_stable_tokens: 1_000,
+            system_volatile_tokens: 200,
+            tool_schema_tokens: 3_000,
+            tool_count: 19,
+            history_tokens: 40_000,
+            output_reserve: 8_192,
+            framing_tokens: 300,
+            ..Default::default()
+        };
+        let ctx = ctx_with_audit(Some(audit), 200_000);
+        match ContextCmd.run("", &ctx).await.unwrap() {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
+                let line_of = |label: &str| -> String {
+                    text.lines()
+                        .find(|l| l.contains(label))
+                        .unwrap_or_default()
+                        .replace(',', "")
+                };
+                let stable = line_of(&tr("context.system_stable"));
+                assert!(stable.contains("1000"), "stable 明细不对: {stable}");
+                let volatile = line_of(&tr("context.system_volatile"));
+                assert!(volatile.contains("200"), "volatile 明细不对: {volatile}");
+                // `tr_fmt` 会把模板里的 {count} 替换掉，所以锚点要用**替换后**
+                // 的整句，而不是模板本身。
+                let tools_anchor = tr("context.tools_count").replace("{count}", "19");
+                assert!(text.contains(&tools_anchor), "工具个数未显示: {text}");
+                // 各明细行之和必须与合计一致——用户心算得通才信这个面板。
+                let flat = text.replace(',', "");
+                assert!(
+                    flat.contains(&audit.parts_sum().to_string()),
+                    "合计与各行之和不一致: {text}"
+                );
+                assert_eq!(audit.parts_sum(), audit.total());
+            }
+            other => panic!("expected Output(Plain), got {other:?}"),
+        }
+    }
+
+    /// 老会话落盘的 audit 没有 stable / volatile 字段：面板必须回退成
+    /// system 合计**单行**，而不是显示成 0 / 0 却仍报一个非零合计。
+    #[tokio::test]
+    async fn context_panel_falls_back_to_one_system_row_without_the_split() {
+        let audit = wyj_core::compact::ContextAudit {
+            system_tokens: 2_000,
+            tool_schema_tokens: 5_000,
+            history_tokens: 100_000,
+            output_reserve: 8_192,
+            framing_tokens: 300,
+            ..Default::default()
+        };
+        let ctx = ctx_with_audit(Some(audit), 200_000);
+        match ContextCmd.run("", &ctx).await.unwrap() {
+            CommandResult::OutputPlain(text) | CommandResult::Output(text) => {
+                assert!(
+                    text.contains(&tr("context.system")),
+                    "缺少 system 行: {text}"
+                );
+                assert!(
+                    !text.contains(&tr("context.system_stable")),
+                    "拆分信息缺失时不该显示 stable 行: {text}"
+                );
+                let flat = text.replace(',', "");
+                assert!(
+                    flat.contains(&audit.parts_sum().to_string()),
+                    "合计与各行之和不一致: {text}"
+                );
+            }
+            other => panic!("expected Output(Plain), got {other:?}"),
+        }
+    }
     /// `/context` 的分母与阈值必须取**本次判定实际用的窗口**，不是配置值。
     ///
     /// 端点拒绝过一次之后有效窗口会收紧（`Session::effective_context_window`），
@@ -2457,6 +2590,7 @@ mod subagents_tests {
             reclaimable_tool_result_tokens: 0,
             // 端点实测：这份会话实际只被允许 160K
             window: 160_000,
+            ..Default::default()
         };
         // 配置里写着 1M（典型的「填大了」）
         let ctx = ctx_with_audit(Some(audit), 1_000_000);
@@ -2645,7 +2779,10 @@ mod cost_tests {
             context_window: 200_000,
             context_audit: Some(wyj_core::compact::ContextAudit {
                 system_tokens: 6_400,
+                system_stable_tokens: 6_100,
+                system_volatile_tokens: 300,
                 tool_schema_tokens: 8_044,
+                tool_count: 19,
                 history_tokens: 40_738,
                 output_reserve: 32_000,
                 framing_tokens: 200,
@@ -2853,7 +2990,10 @@ mod cost_tests {
         let high = render(&CommandContext {
             context_audit: Some(wyj_core::compact::ContextAudit {
                 system_tokens: 6_400,
+                system_stable_tokens: 6_100,
+                system_volatile_tokens: 300,
                 tool_schema_tokens: 8_044,
+                tool_count: 19,
                 history_tokens: 175_000,
                 output_reserve: 32_000,
                 framing_tokens: 200,

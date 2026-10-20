@@ -421,6 +421,155 @@ async fn no_response_language_means_no_reminder() {
     );
 }
 
+/// 只回报路径的假 "Write" 工具。
+///
+/// 子目录 reminder 的触发只依赖 `touched_dir` 从入参里读到的 `file_path`，
+/// 不真的落盘——测试要的是「哪个目录被触达」，不是文件内容。
+struct FakeWriteTool;
+
+#[async_trait::async_trait]
+impl Tool for FakeWriteTool {
+    fn name(&self) -> &str {
+        "Write"
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "Write".into(),
+            description: "fake write".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "required": ["file_path"],
+                "properties": {"file_path": {"type": "string"}},
+                "additionalProperties": false
+            }),
+            native: None,
+        }
+    }
+    async fn run(&self, _input: serde_json::Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult::ok("written".to_string()))
+    }
+}
+
+/// 记录每次请求的 system 全文与历史里的全部文本；第一轮返回一个 Write 调用。
+struct RecordingSystemAndMessages {
+    seen: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+    calls: AtomicUsize,
+    write_path: String,
+}
+
+#[async_trait::async_trait]
+impl Provider for RecordingSystemAndMessages {
+    async fn stream(
+        &self,
+        system: &wyj_api::SystemPrompt<'_>,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+        _opts: &wyj_api::provider::RequestOptions,
+    ) -> Result<EventStream> {
+        let history: String = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|block| match block {
+                wyj_api::types::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.seen
+            .lock()
+            .unwrap()
+            .push((system.combined().to_string(), history));
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events: Vec<Result<StreamEvent>> = if n == 0 {
+            vec![
+                Ok(StreamEvent::ToolUseStart {
+                    id: "w1".into(),
+                    name: "Write".into(),
+                }),
+                Ok(StreamEvent::ToolUseDelta {
+                    id: "w1".into(),
+                    json_delta: format!(r#"{{"file_path":"{}"}}"#, self.write_path),
+                }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                }),
+            ]
+        } else {
+            vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                }),
+            ]
+        };
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// 子目录规约 reminder 必须走**历史注入**，不能进 system 段。
+///
+/// Anthropic 的缓存前缀物理顺序是 `tools → system → messages`：system 块位于
+/// messages **之前**，而 messages 断点覆盖「tools + system + messages 前缀」。
+/// 因此 system 段任何字节变化都会让 **messages 断点失效**，整段历史全价
+/// 重算——每命中一个新目录就付一次全量重算，代价远大于 reminder 本身。
+/// 旧实现把它 `push_str` 到 system 的 volatile 段，注释说「位于 cache
+/// breakpoint 之后所以不会全价重算」——那说的只是 stable 断点，messages
+/// 断点在 system 之后，照样被作废。
+///
+/// 走历史则相反：system 字节不变 → 前缀哈希不变 → 历史断点照常命中，
+/// 只有新追加的那条消息是新的。DeepSeek Harness 的 in-history system prompt
+/// update 走的正是这条路。
+#[tokio::test]
+async fn a_subdirectory_rule_reminder_goes_into_the_history_not_the_system_prompt() {
+    const MARKER: &str = "SUBRULE-ONLY-IN-THE-SUBDIR";
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    let sub = project.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("CLAUDE.md"), format!("# sub\n\n{MARKER}\n")).unwrap();
+
+    let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut agent = Agent::new(Arc::new(RecordingSystemAndMessages {
+        seen: seen.clone(),
+        calls: AtomicUsize::new(0),
+        write_path: sub.join("note.txt").to_string_lossy().to_string(),
+    }))
+    .with_system("MAIN-STUB")
+    .with_claude_md(Arc::new(crate::claude_md::ClaudeMdLoader::new(&project)));
+    agent.register_tool(Arc::new(FakeWriteTool));
+
+    let mut session = Session::new();
+    session.push_user("go");
+    agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.len(),
+        2,
+        "应发两轮请求（工具轮 + 收尾轮），实际 {}",
+        seen.len()
+    );
+    let (system, history) = &seen[1];
+    assert!(
+        history.contains(MARKER),
+        "子目录规约没有进历史，模型根本看不到它: {history}"
+    );
+    // 这条断言是上面「不在 system 里」那条的**前提**：只有当 system 确实
+    // 带着 volatile 段发出去时，「volatile 里有它 ⇒ system 里有它」才成立，
+    // 「system 里没有它」才是有意义的结论而不是恒真。
+    assert!(
+        system.contains("<current-tool-availability>"),
+        "system 未包含 volatile 段，本用例的 system 断言无法证伪: {system}"
+    );
+    assert!(
+        !system.contains(MARKER),
+        "子目录规约混进了 system 段——每命中一个新目录就会让整段历史全价重算: {system}"
+    );
+}
+
 /// 幂等性不变量：**框架层的任何重试都不得重复执行工具**。
 ///
 /// 这是 P2-9 审查的结论，用测试钉住而不是只写在注释里。理由：Agent 里所有
@@ -1887,6 +2036,62 @@ fn lazy_tools_never_hide_the_core_execution_surface() {
         );
     }
     assert!(!state.visible("mcp__optional__lookup"));
+}
+
+/// 请求里实际发送的工具数组必须**单调不减**。
+///
+/// Anthropic 明确规定：会话中途增删或重排 tools 会让 tools 缓存**及其后的
+/// system、messages 全部失效**。旧实现让 `sticky_turns`（默认 3）到期后把
+/// 工具从请求里拿掉，等于每几个回合就作废一次整段 prompt cache——代价远
+/// 大于它省下的那点 schema token。
+#[tokio::test]
+async fn the_tools_sent_in_a_request_never_shrink_within_a_session() {
+    let mut agent = Agent::new(Arc::new(EndTurnProvider));
+    for name in [
+        "Read",
+        "Bash",
+        "mcp__optional__lookup",
+        "mcp__optional__fetch",
+    ] {
+        agent.register_tool(Arc::new(NamedTool(name)));
+    }
+    assert!(agent.enable_lazy_tools(Vec::<String>::new(), 0, 8, 3));
+    let state = agent.lazy_tool_state.as_ref().unwrap().clone();
+    let route = agent.route_at(0);
+
+    let (before, _) = agent.tools_for_request(&route);
+    assert!(
+        !before.iter().any(|d| d.name == "mcp__optional__lookup"),
+        "折叠的工具不该在第一次请求里: {before:?}"
+    );
+
+    // 搜索命中 → 该工具的 schema 从此可见
+    state.begin_task_turn();
+    state.expose("mcp__optional__lookup");
+    let (after_search, _) = agent.tools_for_request(&route);
+    assert!(
+        after_search
+            .iter()
+            .any(|d| d.name == "mcp__optional__lookup"),
+        "命中过的工具应当可见: {after_search:?}"
+    );
+
+    // 熬过 sticky 的新鲜度窗口：可见性**不能**因此收回
+    for _ in 0..8 {
+        state.begin_task_turn();
+    }
+    let (after_expiry, _) = agent.tools_for_request(&route);
+    assert_eq!(
+        after_expiry.len(),
+        after_search.len(),
+        "工具集合缩水了——这会让整段 prompt cache 作废一次: {after_search:?} → {after_expiry:?}"
+    );
+    assert!(
+        after_expiry
+            .iter()
+            .any(|d| d.name == "mcp__optional__lookup"),
+        "命中过的工具必须一直可见: {after_expiry:?}"
+    );
 }
 
 #[async_trait::async_trait]

@@ -12,13 +12,15 @@
 
 ## [0.3.14] - 未发布
 
-### 搜索后端可选、prompt 漂移可见、存储清理真正能跑
+### 搜索后端可选、prompt 漂移可见、存储清理真正能跑、prompt cache 不再自击穿
 
-v0.3.13 发布后的收尾批次，四件事：WebSearch 从单一 Tavily 后端扩成
+v0.3.13 发布后的收尾批次，五件事：WebSearch 从单一 Tavily 后端扩成
 Tavily / Brave 可选并收拢成 `[search]` 子节；新增 system prompt 指纹，回答
 「同一个会话隔天 resume，这次注入的东西和上次一样吗」；`storage prune` /
 `doctor` 从 TODO 桩真正接上 checkpoint 与 session 的回收链路；子 Agent 详情
-视图重做（从日志字符墙改成复用聊天区的渲染管线）。
+视图重做（从日志字符墙改成复用聊天区的渲染管线）；**prompt cache 前缀按
+Anthropic 的物理顺序重排**，工具集合单调化、每轮变动的规约 reminder 改走
+历史注入。
 
 ### ① WebSearch：双后端 + `[search]` 子节
 
@@ -101,9 +103,39 @@ provider 报错，会把结论挤没），改为作为一条系统通知进正�
 `::sub_agent_handoff_is_a_single_chat_style_line`、
 `::sub_agent_detail_messages_are_cached_until_the_trace_grows`。
 
-### ⑤ 测试与静态检查
+### ⑤ prompt cache：工具集合单调化 + 变动内容改走历史注入
 
-`cargo test --workspace` **1795 项通过 / 0 失败**（1715 → 1795），
+Anthropic 官方文档写明的缓存前缀物理顺序是 `tools → system → messages`，
+由此推出两条此前被违反的硬约束。**本节的核心认知**：「哪些内容会变」比
+「内容有多大」更决定成本——一个每轮都变的小段落，代价是整段历史全价重算。
+
+- **工具数组必须单调不减**。官方明写「不要在会话中途增删或重排 tools，任何
+  改动都会让 tools 缓存**及其后的 system、messages 全部失效**」——tools 在
+  最前端，它一变三段全废。旧实现让 `sticky_turns`（默认 3）到期就把工具从
+  请求里摘掉，等于每几个回合作废一次整段缓存。现在 `LazyToolState` 拆成
+  `exposed`（单调，管可见性）与 `sticky`（带过期，管搜索排序加权）两层，
+  `[model_runtime].lazy_tools_sticky_turns` 的语义随之收窄为「排序加权窗口」
+- **system 段任何字节变化都会让 messages 断点失效**。system 位于 messages
+  之前，而 messages 断点覆盖「tools + system + messages 前缀」——所以旧注释
+  「volatile 在 stable 断点之后所以不会全价重算」只保住了 stable，整段历史
+  照样要重算。子目录 AGENTS.md reminder 因此从 system 的 volatile 段改为
+  **注入历史**（合并进最后一条 user 消息，与工具结果同处一条，维持角色交替），
+  与 DeepSeek Harness 的 in-history system prompt update 同一路子
+- **`/context` 面板分项与这套结构同源**：`ContextAudit` 拆出
+  `system_stable_tokens` / `system_volatile_tokens` / `tool_count`，面板按
+  stable / volatile 两行展示并报出工具个数；**各明细行之和必须等于合计行**，
+  这条不变量由 `ContextAudit::parts_sum` 保证（拆分信息缺失时回退成 system
+  合计单行）
+
+钉子：`tool_search::tests::the_visible_tool_set_never_shrinks_within_a_session`、
+`agent::tests::the_tools_sent_in_a_request_never_shrink_within_a_session`、
+`agent::tests::a_subdirectory_rule_reminder_goes_into_the_history_not_the_system_prompt`、
+`compact::tests::the_panel_parts_add_up_to_the_total`、
+`commands::builtin::context_panel_splits_the_system_prompt_and_reports_the_tool_count`。
+
+### ⑥ 测试与静态检查
+
+`cargo test --workspace` **1802 项通过 / 0 失败**（1795 → 1802），
 `cargo fmt --check` 通过，`cargo clippy --workspace --all-targets` 无新增告警。
 
 ## [0.3.13] - 2026-10-20
