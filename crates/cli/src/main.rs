@@ -320,7 +320,26 @@ fn print_config_hints(active: &wyj_config::Profile) {
         );
     }
 
-    // 2) 并发工具数被显式压到端点能力之下。
+    // 2) `max_tokens` 超过该模型静态目录给出的输出上限。
+    //    不去静默改写：`known_model_capacity()` 给的是保守**下限**，
+    //    用户填的值可能正确地反映了一个更新的型号。这里只提示，让他自己核。
+    if let Some(capacity) = wyj_api::known_model_capacity(&active.model) {
+        if active.max_tokens > capacity.max_output_tokens {
+            println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.max_tokens_above_catalog",
+                    &[
+                        ("current", &active.max_tokens.to_string()),
+                        ("supported", &capacity.max_output_tokens.to_string()),
+                        ("model", &active.model),
+                    ]
+                )
+            );
+        }
+    }
+
+    // 3) 并发工具数被显式压到端点能力之下。
     //    比较的基准必须是**端点本身的能力**（静态目录 + live probe），不能直接问
     //    目录要数字——`resolve_with_cache` 末尾会应用 `max_tools_per_turn` 覆盖，
     //    问它只会拿回用户自己的设置，拿自己跟自己比永远相等。

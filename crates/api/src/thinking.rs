@@ -21,7 +21,7 @@
 //! - `ReasoningEffort`：内部档位枚举（`low / medium / high / max / xhigh` 等），
 //!   与各家 enum 值有简单映射，**不**对外暴露在 `ThinkingMode` / `ReasoningRequest` 里。
 //! - `ThinkingSpec`：vendor 静态声明的 thinking 形态（含 user_can_disable、
-//!   lock_sampling_params、response_fields 等运行期提示）。
+//!   response_fields 等运行期提示）。
 //! - `ThinkingAdapter`：trait，每个 vendor 一个 `&'static` 实例。`adapter_for()`
 //!   按 `(wire_protocol, vendor)` 静态分派，避免 vtable 成本。
 //! - `apply_*_thinking` 自由函数：provider 在序列化请求体后调用，把 thinking 参数
@@ -140,12 +140,20 @@ pub struct ThinkingSpec {
     pub control: ThinkingControl,
     /// 用户 profile 显式关闭时，是否允许（false = vendor 强制开，profile 设 None 也开）
     pub user_can_disable: bool,
-    /// 思考启用时是否锁住 sampling 参数（DeepSeek/GLM 启用 thinking 后忽略 temperature/top_p）
-    pub lock_sampling_params: bool,
     /// 该 vendor 是否原生支持 token 预算（false = 只支持 type 开关或 effort 档）
     pub budget_tokens_supported: bool,
     /// 该 vendor 支持哪些 effort 档位（空切片 = 不支持 effort）
     pub effort_levels: &'static [ReasoningEffort],
+    /// `budget_tokens` 与 `effort` 是否**可同时生效**（而非互斥）。
+    ///
+    /// 互斥是常态：Qwen 协议明确规定 `thinking_budget` 与 `reasoning_effort`
+    /// 不能同传，DeepSeek 的 `reasoning_effort` 顶层字段与 `thinking.type` 也
+    /// 各占一个旋钮。官方 Anthropic 是例外——文档明确说 effort 与 thinking 可以
+    /// 一起用（Opus 4.5 上 effort 配合 `budget_tokens`），两个旋钮控制的是
+    /// 不同维度：budget 限**思考**的 token 数，effort 限**整个响应**的投入档位。
+    ///
+    /// 置 true 时，`request_plan` 不会因为 budget 存在就短路掉 effort。
+    pub budget_and_effort_coexist: bool,
     pub response_fields: ThinkingResponseFields,
     /// 用户传 `disabled` 时是否被静默忽略（true = MiniMax M2.x / DeepSeek reasoner）
     pub ignore_disabled_when_forced: bool,
@@ -160,11 +168,12 @@ impl ThinkingSpec {
             model.to_ascii_lowercase().as_str(),
         ) {
             // ── Anthropic 协议 ──
-            (WireProtocol::AnthropicMessages, "anthropic", _) => Self::anthropic_native(),
+            (WireProtocol::AnthropicMessages, "anthropic", m) => Self::anthropic_native(m),
             (WireProtocol::AnthropicMessages, "minimax", m) => Self::minimax_anthropic(m),
             (WireProtocol::AnthropicMessages, _, _) => Self::anthropic_compatible(),
 
             // ── OpenAI 协议 + 各国产 vendor ──
+            (WireProtocol::OpenAiChatCompletions, "openai", m) => Self::openai_official(m),
             (WireProtocol::OpenAiChatCompletions, "deepseek", m) => Self::deepseek(m),
             (WireProtocol::OpenAiChatCompletions, "alibaba", m) => Self::qwen(m),
             (WireProtocol::OpenAiChatCompletions, "zhipu", _) => Self::glm(),
@@ -183,13 +192,29 @@ impl ThinkingSpec {
 
     // ── 各种 spec factory ──
 
-    pub const fn anthropic_native() -> Self {
+    /// 官方 Anthropic（Claude）系列的 spec。
+    ///
+    /// 官方协议现在**原生支持 effort**（`output_config.effort`），档位与
+    /// MiniMax 的 `/anthropic` 端点同构（low/medium/high/xhigh/max）——这是
+    /// 2026 年 Anthropic 官方新增的能力，与 OpenAI 系的 `reasoning_effort`
+    /// 语义对齐：**同一个 profile 字段 `reasoning_effort`，不论走 Anthropic
+    /// 线还是 OpenAI 线都能生效**，不必为协议差异写两份配置。
+    ///
+    /// 档位按型号区分（官方文档「Effort levels」节）：
+    /// * Opus 4.8 / 4.7 / 5 / 5.5、Sonnet 5 / 5.5、Haiku 5.5、Fable / Mythos 系
+    ///   ——五档全量（low/medium/high/xhigh/max）；
+    /// * Opus 4.6 / Sonnet 4.6 ——到 max 为止（无 xhigh）；
+    /// * Opus 4.5 / Sonnet 4.5 ——到 high 为止（无 xhigh/max）。
+    ///
+    /// 旧型号（3.x / 4.0 等）不支持 effort，档位集合留空 → `request_plan`
+    /// 把 profile 的 `reasoning_effort` 记成可见的 dropped，而不是发出去换 400。
+    pub fn anthropic_native(model: &str) -> Self {
         Self {
             control: ThinkingControl::BudgetOnly,
             user_can_disable: true,
-            lock_sampling_params: false,
             budget_tokens_supported: true,
-            effort_levels: &[],
+            effort_levels: anthropic_effort_levels(model),
+            budget_and_effort_coexist: true,
             response_fields: ThinkingResponseFields {
                 reasoning_content: false,
                 reasoning_details: false,
@@ -205,12 +230,77 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::BudgetOnly,
             user_can_disable: true,
-            lock_sampling_params: false,
             budget_tokens_supported: true,
             effort_levels: &[],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: false,
                 reasoning_details: false,
+                echo_back_in_messages: false,
+            },
+            ignore_disabled_when_forced: false,
+        }
+    }
+
+    /// 官方 OpenAI（o 系列 / gpt-5 系）在 **Chat Completions** 上的 spec。
+    ///
+    /// 此前 `for_vendor` 没有 `"openai"` 臂，一律落到 `generic_openai()` 的
+    /// `ThinkingControl::Disabled`，于是三层连锁失效：
+    /// ① catalog 把 `capabilities.thinking` 标成 `Unsupported`；
+    /// ② `agent.rs` 的 `blocked` 判据因此在**到达 provider 之前**就把
+    ///    `reasoning_effort` 滤成 `None`；
+    /// ③ 即便漏过 ②，`apply_thinking_to_openai_body` 也会在 `control ==
+    ///    Disabled` 时直接 return。
+    /// 结果：`provider = "openai"` 的 profile 配 `reasoning_effort` 是**死配置**，
+    /// 只在日志里留一条 dropped。这与 DeepSeek / Qwen / MiniMax 上 effort 生效
+    /// 形成尖锐对比，也是「两套 API 逻辑不一致」里最明显的一处。
+    ///
+    /// 形态上官方只有一个旋钮：顶层 `reasoning_effort`。**没有** `thinking.type`、
+    /// 没有 `thinking_budget`、响应里也**不返回** `reasoning_content`（那是国产
+    /// 兼容端点的约定），因此 `echo_back_in_messages` 必须为 false——照抄
+    /// DeepSeek 臂把它打开，官方端点会因未知字段直接 400。
+    ///
+    /// 档位刻意**不收 `minimal`**：`gpt-5.1+` 明确不认它（官方文档「Reasoning
+    /// effort」节），放进白名单等于预埋一个 400。`o1-mini` / `o3-mini` 早代
+    /// 完全不支持 `reasoning_effort`，档位集合留空 → `request_plan` 记成可见的
+    /// dropped，而不是发出去换 400。
+    fn openai_official(model: &str) -> Self {
+        let m = model.to_ascii_lowercase();
+        let effort_levels: &'static [ReasoningEffort] =
+            if m.contains("o1-mini") || m.contains("o3-mini") {
+                // 早代（o1-mini / o3-mini）不支持 reasoning_effort。
+                &[]
+            } else if m.contains("codex-max") {
+                // gpt-5.1-codex-max 是唯一支持 xhigh 的 codex 变体。
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::XHigh,
+                ]
+            } else {
+                // 其余 o 系列 / gpt-5 系：low/medium/high。
+                // `xhigh` / `max` 只在更新的型号上开放，且不同代际边界不一致——
+                // 宁可少开两档（记成可见 dropped），也不发一个会 400 的档位。
+                &[
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ]
+            };
+        Self {
+            // 官方没有 `thinking.type` 开关，只有 effort 一个旋钮。
+            control: ThinkingControl::EffortOnly,
+            // 不发字段 = 用端点默认，因此用户「关思考」在这条线上不成立
+            // （若要关必须显式传 `"none"`，见 adapter）。
+            user_can_disable: true,
+            budget_tokens_supported: false,
+            effort_levels,
+            budget_and_effort_coexist: false,
+            response_fields: ThinkingResponseFields {
+                reasoning_content: false,
+                reasoning_details: false,
+                // 官方 Chat Completions 不返回、也不接受回传 reasoning_content。
                 echo_back_in_messages: false,
             },
             ignore_disabled_when_forced: false,
@@ -223,7 +313,6 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::SwitchPlusEffort,
             user_can_disable: !force_on,
-            lock_sampling_params: true,
             budget_tokens_supported: false,
             effort_levels: &[
                 ReasoningEffort::Low,
@@ -231,6 +320,7 @@ impl ThinkingSpec {
                 ReasoningEffort::High,
                 ReasoningEffort::Max,
             ],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: true,
                 reasoning_details: false,
@@ -247,7 +337,6 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::SwitchPlusBudget,
             user_can_disable: !force_on,
-            lock_sampling_params: false,
             budget_tokens_supported: true,
             effort_levels: &[
                 ReasoningEffort::Low,
@@ -255,6 +344,7 @@ impl ThinkingSpec {
                 ReasoningEffort::High,
                 ReasoningEffort::XHigh,
             ],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: true,
                 reasoning_details: false,
@@ -268,9 +358,9 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::SwitchOnly,
             user_can_disable: true,
-            lock_sampling_params: true, // GLM 启用 thinking 后 temperature 被忽略
             budget_tokens_supported: false,
             effort_levels: &[],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: true,
                 reasoning_details: false,
@@ -285,9 +375,9 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::SwitchPlusBudget,
             user_can_disable: !force_on,
-            lock_sampling_params: false,
             budget_tokens_supported: true,
             effort_levels: &[],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: true,
                 reasoning_details: false,
@@ -303,13 +393,13 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::EffortOnly,
                 user_can_disable: true,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[
                     ReasoningEffort::Low,
                     ReasoningEffort::High,
                     ReasoningEffort::Max,
                 ],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: false,
@@ -323,9 +413,9 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: !force_on,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: false,
@@ -356,9 +446,9 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: false,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: MINIMAX_M31_ANTHROPIC_EFFORT_LEVELS,
+                budget_and_effort_coexist: false,
                 // Anthropic 线协议下 `response_fields` 当前无消费者
                 // （只有 `openai.rs::to_api_messages` 读它），仍按端点真实行为填写，
                 // 以免将来接线时又出现「catalog 说一套、adapter 做另一套」。
@@ -374,11 +464,11 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: !is_m2,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 // M3 / M2.x 的 `/anthropic` 端点不认 output_config.effort，档位集合
                 // 留空 = request_plan 把 profile 的 reasoning_effort 记成可见 dropped。
                 effort_levels: &[],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: true,
@@ -398,9 +488,9 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: false,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: true,
@@ -412,13 +502,13 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchPlusEffort,
                 user_can_disable: true,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[
                     ReasoningEffort::Low,
                     ReasoningEffort::High,
                     ReasoningEffort::Max,
                 ],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: true,
@@ -435,9 +525,9 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: true,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: false,
@@ -455,9 +545,9 @@ impl ThinkingSpec {
             Self {
                 control: ThinkingControl::SwitchOnly,
                 user_can_disable: true,
-                lock_sampling_params: false,
                 budget_tokens_supported: false,
                 effort_levels: &[],
+                budget_and_effort_coexist: false,
                 response_fields: ThinkingResponseFields {
                     reasoning_content: true,
                     reasoning_details: false,
@@ -474,9 +564,9 @@ impl ThinkingSpec {
         Self {
             control: ThinkingControl::Disabled,
             user_can_disable: true,
-            lock_sampling_params: false,
             budget_tokens_supported: false,
             effort_levels: &[],
+            budget_and_effort_coexist: false,
             response_fields: ThinkingResponseFields {
                 reasoning_content: false,
                 reasoning_details: false,
@@ -487,7 +577,12 @@ impl ThinkingSpec {
     }
 }
 
-fn normalize_vendor(vendor: &str) -> &'static str {
+/// vendor 名归一（别名 → 规范名）。
+///
+/// `pub(crate)` 是因为 `openai.rs` 也要用它判「是否官方 OpenAI 端点」——
+/// 别名表若在两处各写一份，`vendor = "OpenAI"` / `"openai"` 这种差异会让
+/// 判据静默失效。
+pub(crate) fn normalize_vendor(vendor: &str) -> &'static str {
     match vendor.trim().to_ascii_lowercase().as_str() {
         "glm" | "zhipu" | "zai" | "z.ai" => "zhipu",
         "kimi" | "moonshot" => "moonshot",
@@ -617,6 +712,7 @@ pub fn adapter_for(identity: &ModelIdentity) -> &'static dyn ThinkingAdapter {
             }
         }
         (WireProtocol::AnthropicMessages, _) => &AnthropicCompatibleAdapter,
+        (WireProtocol::OpenAiChatCompletions, "openai") => &OpenAiOfficialAdapter,
         (WireProtocol::OpenAiChatCompletions, "deepseek") => &DeepSeekOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, "alibaba") => &QwenOpenAiAdapter,
         (WireProtocol::OpenAiChatCompletions, "zhipu") => &ZhipuOpenAiAdapter,
@@ -653,11 +749,18 @@ impl ThinkingAdapter for AnthropicNativeAdapter {
 
     fn apply_anthropic(
         &self,
-        _identity: &ModelIdentity,
+        identity: &ModelIdentity,
         opts: &RequestOptions,
     ) -> AnthropicThinkingPatch {
-        // 官方 Anthropic：只有 `enabled` + `budget_tokens` 这一种形态，且思考
-        // 预算必须显式给出（省略 thinking 字段 = 关闭思考）。
+        // 官方 Anthropic 有**两个**思考旋钮：
+        // * `thinking.budget_tokens` —— 思考本身的 token 预算（extended thinking）；
+        // * `output_config.effort` —— 整个响应（正文 + 工具调用 + 思考）的
+        //   投入档位（low/medium/high/xhigh/max），与 OpenAI 系的
+        //   `reasoning_effort` 语义对齐。
+        //
+        // 两者**互补而非互斥**：官方文档明确说 effort 与 thinking 可以同时用
+        // （Opus 4.5 上 effort 配合 budget_tokens 一起用）。所以这里两个都发，
+        // 而不是二选一。
         let budget = opts.thinking_budget.filter(|b| *b > 0);
         let mut patch = AnthropicThinkingPatch {
             thinking: budget.map(|b| json!({"type": "enabled", "budget_tokens": b})),
@@ -665,6 +768,14 @@ impl ThinkingAdapter for AnthropicNativeAdapter {
             output_config: None,
             ignored: Vec::new(),
         };
+        // effort 走 `output_config.effort`。档位判据统一走 `normalize_effort`
+        // （即 spec 的 `effort_levels`），不在本 adapter 里维护第二份白名单。
+        if let Some(raw) = opts.reasoning_effort.as_deref() {
+            match normalize_effort(identity, raw) {
+                Some(level) => patch.output_config = Some(json!({ "effort": level })),
+                None => patch.ignored.push("reasoning_effort"),
+            }
+        }
         // 这条线协议的开关**只有 budget 一个旋钮**，profile 的 thinking_switch
         // 无处落地。两种静默覆盖都要记进 ignored：配了 `disabled` 却仍发出
         // `enabled`（thinking 照开）、配了 `enabled` 却没有 budget（thinking
@@ -718,6 +829,105 @@ impl ThinkingAdapter for AnthropicCompatibleAdapter {
         // 路径的兼容模式也按"无 beta"对待。
         false
     }
+}
+
+/// 官方 Anthropic（Claude）系列的 effort 档位集合，按型号分档。
+///
+/// Anthropic 官方协议在 2026 年新增 `output_config.effort`（与 MiniMax 的
+/// `/anthropic` 端点同构），但**各型号支持的档位不同**——档位越界会被端点
+/// 判为非法参数（400），所以这张表必须逐型号精确，不能一律给五档。
+///
+/// 依据官方文档「Effort levels」节：
+/// * 五档全量（low/medium/high/xhigh/max）：Opus 4.8 / 4.7 / 5 / 5.5、
+///   Sonnet 5 / 5.5、Haiku 5.5、Fable 5 / 5.1、Mythos 5 / 5.1、Mythos Preview；
+/// * 到 max 为止（无 xhigh）：Opus 4.6、Sonnet 4.6；
+/// * 到 high 为止（无 xhigh/max）：Opus 4.5、Sonnet 4.5；
+/// * 更早的 3.x / 4.0 系列不支持 effort。
+///
+/// **判据只认版本段**：`contains("opus")` / `contains("sonnet")` 这类**系列名**
+/// 是稳定的；但 `flash` / `fast` 之类营销词不是版本证据，不能参与分档。
+///
+/// 未识别的型号一律返回**空切片**（不支持 effort）——宁可让 `request_plan`
+/// 把用户的 effort 记成可见的 dropped，也不能发一个大概率 400 的参数。
+fn anthropic_effort_levels(model: &str) -> &'static [ReasoningEffort] {
+    /// 五档全量。
+    const ALL: &[ReasoningEffort] = &[
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ];
+    /// 到 max 为止（无 xhigh）。
+    const TO_MAX: &[ReasoningEffort] = &[
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Max,
+    ];
+    /// 到 high 为止（无 xhigh/max）。
+    const TO_HIGH: &[ReasoningEffort] = &[
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+
+    let m = model.to_ascii_lowercase();
+    // 3.x / 4.0 系列在任何 effort 支持之前 —— 早退，避免后面的「4.5」误命中。
+    let is_claude = m.contains("claude");
+    if !is_claude {
+        return &[];
+    }
+    // Fable / Mythos 是 Anthropic 的虚构系列名（官方文档里的 effort 支持表
+    // 同样按它们分档），与 Opus/Sonnet/Haiku 并列。
+    let series = ["opus", "sonnet", "haiku", "fable", "mythos"]
+        .iter()
+        .find(|name| m.contains(*name))
+        .copied();
+    let Some(series) = series else {
+        return &[];
+    };
+
+    // 抽出版本号：`claude-opus-4-8-20260514` → `4.8`；`claude-opus-5` → `5`。
+    let version = model_version_segment(&m, series);
+    match (series, version) {
+        // 5 系（Opus 5 / 5.5、Sonnet 5 / 5.5、Haiku 5.5、Fable/Mythos 5/5.1）
+        ("opus" | "sonnet" | "haiku" | "fable" | "mythos", Some((major, _))) if major >= 5 => ALL,
+        // 4.8 / 4.7：五档全量。
+        ("opus", Some((4, Some(8)))) | ("opus", Some((4, Some(7)))) => ALL,
+        // 4.6：到 max 为止。
+        ("opus" | "sonnet", Some((4, Some(6)))) => TO_MAX,
+        // 4.5：到 high 为止。
+        ("opus" | "sonnet", Some((4, Some(5)))) => TO_HIGH,
+        _ => &[],
+    }
+}
+
+/// 从模型名里抽出 `<series>` 之后的版本号，返回 `(主版本, 次版本)`。
+///
+/// 次版本为 `None` 表示只识别到主版本（如 `claude-opus-5`）。
+/// 找不到时返回 `None`（调用方据此判「不支持 effort」）。
+///
+/// **只认 1 位次版本**：真实型号的次版本都是一位（4.5 / 4.6 / 4.7 / 4.8 / 5.5），
+/// 而日期段是 8 位（`claude-opus-4-20250514`）。不设这道闸，`claude-3-5-sonnet-
+/// 20241022` 这种把日期排在系列名**之后**的老命名会把 20241022 当成主版本，
+/// 于是 3.5 型号被误判成「5 系 → 五档全量」。
+fn model_version_segment(model: &str, series: &str) -> Option<(u32, Option<u32>)> {
+    let after = model.split_once(series)?.1;
+    let mut parts = after
+        .split(['-', '_', '.'])
+        .skip_while(|part| part.is_empty())
+        .filter(|part| !part.is_empty());
+    let major: u32 = parts.next()?.parse().ok()?;
+    // 主版本只可能是 1 位（3 / 4 / 5）；8 位日期段直接排除。
+    if major > 9 {
+        return None;
+    }
+    let minor = parts
+        .next()
+        .filter(|part| part.len() == 1)
+        .and_then(|part| part.parse::<u32>().ok());
+    Some((major, minor))
 }
 
 /// MiniMax `/anthropic` 端点（**仅 M3.1**）支持的 effort 档位全量。
@@ -830,6 +1040,53 @@ impl ThinkingAdapter for AnthropicMinimaxAdapter {
     }
 
     fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
+        false
+    }
+}
+
+/// 官方 OpenAI（o 系列 / gpt-5 系，Chat Completions 形态）。
+///
+/// 官方这条线只有一个旋钮：顶层 `reasoning_effort`。因此本 adapter
+/// **绝不**写 `thinking` / `enable_thinking` / `thinking_budget`——它们都会
+/// 被判成未知字段并 400（官方文档「Unsupported parameters」明确列出
+/// `max_tokens` 与 reasoning 模型不兼容，`thinking` 更不在此列）。
+///
+/// 与 `MoonshotOpenAiAdapter` 的区别值得注意：那边在没有 effort 时会退化写
+/// `thinking.type`，直接复用会让官方端点收到它不认识的字段。这也是本 adapter
+/// 独立存在而不是复用别人的原因。
+///
+/// `text_only()`（辅助调用：compact / 记忆提取 / auto 分类器 / 标题摘要）在这条
+/// 线上发的是 `thinking_switch = "disabled"`。官方没有开关字段，但**不能就这样
+/// 当作没配**——不发字段时端点按默认档位跑满 reasoning，那正是「预算全被思考
+/// 吃掉、可见文本为空」的历史故障形态。这里降级成 `reasoning_effort: "low"`：
+/// 这是能表达「少想一点」的最接近语义，且所有 o 系列 / gpt-5 系都认。
+/// 不写 `"none"`——`o1`/`o3` 不认它，会是 400。
+struct OpenAiOfficialAdapter;
+
+impl ThinkingAdapter for OpenAiOfficialAdapter {
+    fn apply_openai(&self, body: &mut Map<String, Value>, opts: &RequestOptions) {
+        // 档位已在 `apply_thinking_to_openai_body` 里由 `normalize_effort`
+        // 收敛过：到这里能拿到的一定是 `spec.effort_levels` 里的值，收到即写入。
+        if let Some(effort) = opts.reasoning_effort.as_deref() {
+            body.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.to_string()),
+            );
+            return;
+        }
+        // 没有可用档位但用户明确要求关思考：o 系列的「关」只能表达成低档位。
+        if switch_says_off(opts) {
+            body.insert(
+                "reasoning_effort".to_string(),
+                Value::String(ReasoningEffort::Low.as_str().to_string()),
+            );
+        }
+        // 显式 `enabled` 且无档位：不写任何字段（= 端点默认档位）。
+        // 官方没有「开启」字段，写了也没处落，强行塞 `thinking` 只会 400。
+    }
+
+    fn emit_interleaved_beta(&self, _is_official: bool) -> bool {
+        // interleaved-thinking beta 是 Anthropic 专属；OpenAI 线永远不发。
         false
     }
 }
@@ -1154,6 +1411,13 @@ pub fn apply_thinking_to_openai_body(
             sanitized.thinking_switch = Some("enabled".to_string());
         }
     }
+    // **EffortOnly 且档位集合为空**：该型号既不认 `reasoning_effort`，也没有任何
+    // 开关字段可写（`o1-mini` / `o3-mini` 正是这种）。此时必须**什么都不发**。
+    // 不清掉 `thinking_switch`，官方 adapter 会把 `text_only()` 的 `disabled`
+    // 降级成 `reasoning_effort: "low"` —— 而这两代不认该字段，直接 400。
+    if matches!(spec.control, ThinkingControl::EffortOnly) && spec.effort_levels.is_empty() {
+        sanitized.thinking_switch = None;
+    }
     adapter.apply_openai(body, &sanitized);
 }
 
@@ -1331,6 +1595,12 @@ mod tests {
         assert_eq!(spec.control, ThinkingControl::BudgetOnly);
         assert!(spec.budget_tokens_supported);
         assert!(spec.user_can_disable);
+        // Opus 4.8 官方支持 effort，且 budget 与 effort 是两个独立旋钮（可共存）。
+        assert!(spec.budget_and_effort_coexist);
+        assert_eq!(
+            spec.effort_levels, MINIMAX_M31_ANTHROPIC_EFFORT_LEVELS,
+            "Opus 4.8 与 M3.1 一样是五档全量"
+        );
     }
 
     #[test]
@@ -1390,7 +1660,6 @@ mod tests {
         let spec =
             ThinkingSpec::for_vendor("zhipu", &WireProtocol::OpenAiChatCompletions, "glm-4.6");
         assert_eq!(spec.control, ThinkingControl::SwitchOnly);
-        assert!(spec.lock_sampling_params);
         assert!(!spec.budget_tokens_supported);
     }
 
@@ -1999,6 +2268,145 @@ mod tests {
             "max_tokens 兜底靠这个结构化字段，不许再从 Value 里反解键名"
         );
         assert!(patch.output_config.is_none());
+    }
+
+    // ── 官方 Anthropic 的 effort 支持 ──
+    //
+    // 回归背景（2026-10）：`reasoning_effort` 此前在 Anthropic 线上是**死配置**
+    // ——`anthropic_native()` 的 `effort_levels` 是空切片，adapter 也从不读
+    // `opts.reasoning_effort`，于是用户配的 effort 被 catalog 记成 dropped 后
+    // 彻底消失。同一份 profile 换到 OpenAI 线则 effort 生效，两条线的思考量
+    // 因此完全对不上。官方协议现已原生支持 `output_config.effort`，这里把它接上。
+
+    /// 官方 Anthropic：`reasoning_effort` 必须真的变成 `output_config.effort`。
+    #[test]
+    fn official_anthropic_emits_output_config_effort() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.output_config,
+            Some(json!({"effort": "high"})),
+            "Anthropic 线的 reasoning_effort 必须是活的配置，不能是死配置"
+        );
+        assert!(patch.ignored.is_empty(), "{:?}", patch.ignored);
+    }
+
+    /// budget 与 effort 是**两个独立旋钮**（官方文档明确说可以一起用）：
+    /// budget 限思考的 token 数，effort 限整个响应的投入档位。
+    #[test]
+    fn official_anthropic_sends_budget_and_effort_together() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_budget: Some(4096),
+                reasoning_effort: Some("medium".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.thinking,
+            Some(json!({"type": "enabled", "budget_tokens": 4096})),
+            "budget 仍是原生形态"
+        );
+        assert_eq!(
+            patch.output_config,
+            Some(json!({"effort": "medium"})),
+            "effort 不能因为 budget 存在就被吃掉"
+        );
+        assert!(patch.ignored.is_empty(), "{:?}", patch.ignored);
+    }
+
+    /// 档位越界必须变成**可见的 dropped**，而不是发出去换 400。
+    #[test]
+    fn official_anthropic_drops_unsupported_effort_level() {
+        // Opus 4.5 只到 high：xhigh / max 会被端点判非法。
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-5",
+        );
+        for level in ["xhigh", "max"] {
+            let patch = apply_anthropic_thinking(
+                &id,
+                &RequestOptions {
+                    reasoning_effort: Some(level.to_string()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(patch.output_config, None, "{level} 不该上送");
+            assert!(patch.ignored.contains(&"reasoning_effort"), "{level}");
+        }
+    }
+
+    /// 各型号的档位集合必须精确——发一个端点不认的档位就是 400。
+    #[test]
+    fn anthropic_effort_levels_are_per_model() {
+        let levels = |model: &str| {
+            ThinkingSpec::for_vendor("anthropic", &WireProtocol::AnthropicMessages, model)
+                .effort_levels
+                .to_vec()
+        };
+        // 五档全量。
+        assert_eq!(levels("claude-opus-4-8").len(), 5);
+        assert_eq!(levels("claude-opus-4-7").len(), 5);
+        assert_eq!(levels("claude-opus-5").len(), 5);
+        assert_eq!(levels("claude-sonnet-5-5").len(), 5);
+        assert_eq!(levels("claude-haiku-5-5").len(), 5);
+        // 到 max（无 xhigh）。
+        assert_eq!(levels("claude-opus-4-6").len(), 4);
+        assert_eq!(levels("claude-sonnet-4-6").len(), 4);
+        // 到 high（无 xhigh/max）。
+        assert_eq!(levels("claude-opus-4-5").len(), 3);
+        assert_eq!(levels("claude-sonnet-4-5").len(), 3);
+        // 老型号不支持 effort。
+        assert!(levels("claude-3-5-sonnet-20241022").is_empty());
+        assert!(levels("claude-3-7-sonnet-20250219").is_empty());
+        // 非 Claude 型号（第三方 Anthropic 兼容端点走别的分支）。
+        assert!(levels("glm-4.6").is_empty());
+    }
+
+    /// 官方 Anthropic 的 effort 必须真的落到 `RequestOptions` 里——
+    /// `request_plan` 层（catalog 依据 `effort_levels` 裁决）不能把它当死配置丢掉。
+    #[test]
+    fn official_anthropic_effort_survives_the_catalog_layer() {
+        let profile = wyj_config::Profile {
+            name: "anthropic".to_string(),
+            provider: wyj_config::Provider::Anthropic,
+            base_url: "https://api.anthropic.com".to_string(),
+            model: "claude-opus-4-8".to_string(),
+            vendor: Some("anthropic".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let plan = crate::request_plan::RequestPlan::from_profile(&profile, None);
+        assert!(
+            !plan
+                .dropped_parameters
+                .iter()
+                .any(|d| d.name == "reasoning_effort"),
+            "effort 被 catalog 层丢掉了：{:?}",
+            plan.dropped_parameters
+        );
+
+        let opts = RequestOptions::from_request_plan(&plan);
+        let id = identity("anthropic", WireProtocol::AnthropicMessages, &profile.model);
+        let patch = apply_anthropic_thinking(&id, &opts);
+        assert_eq!(patch.output_config, Some(json!({"effort": "high"})));
     }
 
     #[test]

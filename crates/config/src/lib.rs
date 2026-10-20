@@ -220,10 +220,18 @@ pub struct Profile {
     /// OpenAI 协议 stream_options.include_usage 能力。None = 按 base_url/provider/model 自动判断。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_stream_options: Option<bool>,
-    /// OpenAI-vendor `reasoning_effort` 档位（low/medium/high/max/xhigh/adaptive）。
-    /// 与 `thinking_budget` 互斥：同时设置时按 adapter 决定取舍（Qwen 强制互斥，
-    /// DeepSeek/Moonshot k3 仅 effort，Doubao/GLM 仅 switch）。
-    /// env var `WYJ_CODE_THINKING_EFFORT` 优先（runtime override，不写盘）。
+    /// `reasoning_effort` 档位（low/medium/high/max/xhigh）。
+    ///
+    /// **协议无关**：OpenAI 线发顶层 `reasoning_effort` 字段，Anthropic 线
+    /// 发 `output_config.effort`（官方 Anthropic 与 MiniMax `/anthropic` 端点
+    /// 同构）——同一份 profile 换协议不必改配置。
+    ///
+    /// 与 `thinking_budget` 的关系按端点而定：多数端点两者互斥（Qwen 协议
+    /// 明确禁止同传），官方 Anthropic 则**可以同时用**——budget 限**思考**的
+    /// token 数，effort 限**整个响应**的投入档位，两者控制不同维度。
+    ///
+    /// 档位越界（端点不认该档）会被记成可见的 `dropped_parameter`，不会发出去
+    /// 换 400。env var `WYJ_CODE_THINKING_EFFORT` 优先（runtime override，不写盘）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     /// OpenAI-vendor `thinking.type` 字符串显式覆盖（enabled/disabled/auto/adaptive）。
