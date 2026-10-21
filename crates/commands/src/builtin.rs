@@ -1357,11 +1357,21 @@ pub struct ComputerCmd;
 
 #[async_trait]
 impl Command for ComputerCmd {
-    fn runs_while_busy(&self) -> bool {
-        true
-    }
+    /// 刻意**不**进忙碌期白名单：本命令要跑一串系统调用（截图 / 窗口枚举 /
+    /// Event Tap 快照），见 [`Self::needs_background`]。白名单与后台执行互斥
+    /// （`registry::tests::busy_whitelist_never_overlaps_needs_background`），
+    /// 而「把主循环卡住」的代价比「回合结束后才能跑诊断」大得多。
     fn name(&self) -> &str {
         "computer"
+    }
+    /// 每一项探测都是**系统调用**：截图、窗口枚举（实测 40~80ms）、光标位置、
+    /// Event Tap 快照。inline 执行会把 TUI 主循环整段占住——期间不重绘、不读
+    /// 按键，连 ESC 都按不动；叠加到秒级时用户看到的就是「命令卡死」。
+    ///
+    /// 丢后台 task 后结果经 `AgentEvent::BackgroundCommandDone` 回主循环渲染，
+    /// 输入全程可读。
+    fn needs_background(&self) -> bool {
+        true
     }
     fn description(&self) -> String {
         tr("computer.desc")
@@ -1369,16 +1379,26 @@ impl Command for ComputerCmd {
     fn usage(&self) -> String {
         "/computer".to_string()
     }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+    async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        use crate::cost_view::{DiagPanel, Level};
         use wyj_config::{Config, ForegroundFallback, Provider};
 
-        let mut lines = vec![tr("computer.header")];
+        let mut panel =
+            DiagPanel::new(tr("computer.header")).section(tr("computer.section_config"));
 
         let os = std::env::consts::OS;
         if wyj_computer::SUPPORTED {
-            lines.push(tr_fmt("computer.platform_supported", &[("os", os)]));
+            panel = panel.row(
+                Level::Ok,
+                tr("computer.label_platform"),
+                tr_fmt("computer.platform_supported", &[("os", os)]),
+            );
         } else {
-            lines.push(tr_fmt("computer.platform_unsupported", &[("os", os)]));
+            panel = panel.row(
+                Level::Err,
+                tr("computer.label_platform"),
+                tr_fmt("computer.platform_unsupported", &[("os", os)]),
+            );
         }
 
         // 门控逻辑需与 `cli::register_computer_tool_if_enabled` 的真实注册条件
@@ -1386,20 +1406,33 @@ impl Command for ComputerCmd {
         // 注册该工具对不上。
         let cfg = Config::load()?;
         let profile = cfg.active_profile();
+        let label_registration = tr("computer.label_registration");
 
         if !wyj_computer::SUPPORTED {
-            lines.push(tr("computer.not_registered_platform"));
+            panel = panel.row(
+                Level::Err,
+                label_registration.clone(),
+                tr("computer.not_registered_platform"),
+            );
         } else if !profile.vision {
-            lines.push(tr("computer.not_registered_vision"));
+            panel = panel.row(
+                Level::Err,
+                label_registration.clone(),
+                tr("computer.not_registered_vision"),
+            );
         } else if !matches!(profile.provider, Provider::Anthropic) {
-            lines.push(tr_fmt(
-                "computer.not_registered_provider",
-                &[("provider", &profile.provider.to_string())],
-            ));
+            panel = panel.row(
+                Level::Err,
+                label_registration.clone(),
+                tr_fmt(
+                    "computer.not_registered_provider",
+                    &[("provider", &profile.provider.to_string())],
+                ),
+            );
         } else if profile.is_official_anthropic_endpoint() {
-            lines.push(tr("computer.mode_native"));
+            panel = panel.row(Level::Ok, label_registration, tr("computer.mode_native"));
         } else {
-            lines.push(tr("computer.mode_custom"));
+            panel = panel.row(Level::Ok, label_registration, tr("computer.mode_custom"));
         }
 
         let fallback = match cfg.computer_use.foreground_fallback {
@@ -1407,46 +1440,77 @@ impl Command for ComputerCmd {
             ForegroundFallback::Ask => "ask",
             ForegroundFallback::IdleOnly => "idle_only",
         };
-        lines.push(tr_fmt(
-            "computer.foreground_policy",
-            &[
-                ("policy", fallback),
-                ("quiet_ms", &cfg.computer_use.quiet_period_ms.to_string()),
-                ("max_defer", &cfg.computer_use.max_defer_secs.to_string()),
-            ],
-        ));
+        panel = panel.row(
+            Level::Info,
+            tr("computer.label_foreground"),
+            tr_fmt(
+                "computer.foreground_policy",
+                &[
+                    ("policy", fallback),
+                    ("quiet_ms", &cfg.computer_use.quiet_period_ms.to_string()),
+                    ("max_defer", &cfg.computer_use.max_defer_secs.to_string()),
+                ],
+            ),
+        );
 
+        panel = panel.section(tr("computer.section_background"));
+        let label_background = tr("computer.label_background");
         #[cfg(target_os = "macos")]
         {
-            lines.push(tr("computer.background_supported"));
+            panel = panel.row(
+                Level::Ok,
+                label_background,
+                tr("computer.background_supported"),
+            );
             if wyj_computer::accessibility::is_process_trusted() {
-                lines.push(tr("computer.ax_trusted"));
+                panel = panel.row(
+                    Level::Ok,
+                    tr("computer.label_accessibility"),
+                    tr("computer.ax_trusted"),
+                );
             } else {
                 // 这是**用户显式敲 `/computer`** 的路径，是唯一适合主动弹
                 // 系统授权框的地方：工具内部一律只做只读检查，否则 headless
                 // / cron 会弹一个没人看的框，反复调用还会被系统当成骚扰。
                 wyj_computer::accessibility::request_trust_prompt();
-                lines.push(tr("computer.ax_untrusted"));
+                panel = panel.row(
+                    Level::Err,
+                    tr("computer.label_accessibility"),
+                    tr("computer.ax_untrusted"),
+                );
             }
             // 多显示器：截图/区域截取按显示器定位，副屏原点可以为负。
-            match wyj_computer::displays() {
-                Ok(displays) => lines.push(tr_fmt(
-                    "computer.displays",
-                    &[("count", &displays.len().to_string())],
-                )),
-                Err(error) => lines.push(tr_fmt(
-                    "computer.displays_failed",
-                    &[("error", &error.to_string())],
-                )),
-            }
+            panel = match wyj_computer::displays() {
+                Ok(displays) => panel.row(
+                    Level::Ok,
+                    tr("computer.label_displays"),
+                    tr_fmt(
+                        "computer.displays",
+                        &[("count", &displays.len().to_string())],
+                    ),
+                ),
+                Err(error) => panel.row(
+                    Level::Err,
+                    tr("computer.label_displays"),
+                    tr_fmt("computer.displays_failed", &[("error", &error.to_string())]),
+                ),
+            };
         }
         #[cfg(not(target_os = "macos"))]
-        lines.push(tr("computer.background_unavailable"));
+        {
+            panel = panel.row(
+                Level::Info,
+                label_background,
+                tr("computer.background_unavailable"),
+            );
+        }
 
         // 实时探测（截图/光标）即使工具未注册也照跑：既能帮用户提前定位权限
         // 问题（先解决系统权限，再切换 profile 满足注册条件），也不需要
         // 真的注册一份 ComputerTool 才能自检。
         if wyj_computer::SUPPORTED {
+            panel = panel.section(tr("computer.section_probe"));
+            let label_monitor = tr("computer.label_input_monitor");
             let initial_status = wyj_computer::activity::ensure_monitor();
             if initial_status == wyj_computer::activity::InputMonitorStatus::Starting {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1457,110 +1521,163 @@ impl Command for ComputerCmd {
                         .external_idle_secs
                         .map(|idle| format!("{idle:.2}"))
                         .unwrap_or_else(|| "n/a".to_string());
-                    lines.push(tr_fmt(
-                        "computer.input_monitor",
-                        &[
-                            ("status", snapshot.monitor_status.label()),
-                            ("idle", &idle),
-                            (
-                                "seq",
-                                &snapshot
-                                    .external_event_seq
-                                    .map(|seq| seq.to_string())
-                                    .unwrap_or_else(|| "n/a".to_string()),
-                            ),
-                        ],
-                    ));
+                    panel = panel.row(
+                        Level::Info,
+                        label_monitor.clone(),
+                        tr_fmt(
+                            "computer.input_monitor",
+                            &[
+                                ("status", snapshot.monitor_status.label()),
+                                ("idle", &idle),
+                                (
+                                    "seq",
+                                    &snapshot
+                                        .external_event_seq
+                                        .map(|seq| seq.to_string())
+                                        .unwrap_or_else(|| "n/a".to_string()),
+                                ),
+                            ],
+                        ),
+                    );
                     if let Some(error) = snapshot.monitor_error {
-                        lines.push(tr_fmt("computer.input_monitor_error", &[("err", &error)]));
+                        panel = panel.row(
+                            Level::Err,
+                            label_monitor.clone(),
+                            tr_fmt("computer.input_monitor_error", &[("err", &error)]),
+                        );
                     }
                 }
-                Err(error) => lines.push(tr_fmt(
-                    "computer.input_monitor_error",
-                    &[("err", &error.to_string())],
-                )),
+                Err(error) => {
+                    panel = panel.row(
+                        Level::Err,
+                        label_monitor,
+                        tr_fmt(
+                            "computer.input_monitor_error",
+                            &[("err", &error.to_string())],
+                        ),
+                    );
+                }
             }
 
-            match wyj_computer::target::list_windows() {
-                Ok(windows) => lines.push(tr_fmt(
-                    "computer.window_count",
-                    &[("count", &windows.len().to_string())],
-                )),
-                Err(error) => lines.push(tr_fmt(
-                    "computer.window_error",
-                    &[("err", &error.to_string())],
-                )),
-            }
+            panel = match wyj_computer::target::list_windows() {
+                Ok(windows) => panel.row(
+                    Level::Ok,
+                    tr("computer.label_windows"),
+                    tr_fmt(
+                        "computer.window_count",
+                        &[("count", &windows.len().to_string())],
+                    ),
+                ),
+                Err(error) => panel.row(
+                    Level::Err,
+                    tr("computer.label_windows"),
+                    tr_fmt("computer.window_error", &[("err", &error.to_string())]),
+                ),
+            };
 
             let metrics = wyj_computer::telemetry::snapshot();
-            lines.push(tr_fmt(
-                "computer.telemetry_paths",
-                &[
-                    ("background", &metrics.background_actions.to_string()),
-                    ("targeted", &metrics.targeted_pid_events.to_string()),
-                    ("foreground", &metrics.foreground_actions.to_string()),
-                    (
-                        "auto_fallback",
-                        &metrics.automatic_foreground_fallbacks.to_string(),
+            panel = panel
+                .row(
+                    Level::Info,
+                    tr("computer.label_paths"),
+                    tr_fmt(
+                        "computer.telemetry_paths",
+                        &[
+                            ("background", &metrics.background_actions.to_string()),
+                            ("targeted", &metrics.targeted_pid_events.to_string()),
+                            ("foreground", &metrics.foreground_actions.to_string()),
+                            (
+                                "auto_fallback",
+                                &metrics.automatic_foreground_fallbacks.to_string(),
+                            ),
+                        ],
                     ),
-                ],
-            ));
-            lines.push(tr_fmt(
-                "computer.telemetry_guards",
-                &[
-                    ("preempted", &metrics.preempted_by_user.to_string()),
-                    ("changed", &metrics.target_changed.to_string()),
-                    ("requires", &metrics.requires_foreground.to_string()),
-                    ("fuses", &metrics.background_focus_fuses.to_string()),
-                ],
-            ));
+                )
+                .row(
+                    Level::Info,
+                    tr("computer.label_guards"),
+                    tr_fmt(
+                        "computer.telemetry_guards",
+                        &[
+                            ("preempted", &metrics.preempted_by_user.to_string()),
+                            ("changed", &metrics.target_changed.to_string()),
+                            ("requires", &metrics.requires_foreground.to_string()),
+                            ("fuses", &metrics.background_focus_fuses.to_string()),
+                        ],
+                    ),
+                );
 
-            match wyj_computer::primary_display_size() {
+            panel = match wyj_computer::primary_display_size() {
                 Ok(d) => {
                     let (tw, th) = wyj_computer::scale::fit_within(
                         d.physical_width,
                         d.physical_height,
                         wyj_computer::DEFAULT_MAX_DIM,
                     );
-                    lines.push(tr_fmt(
-                        "computer.display_ok",
-                        &[
-                            ("pw", &d.physical_width.to_string()),
-                            ("ph", &d.physical_height.to_string()),
-                            ("tw", &tw.to_string()),
-                            ("th", &th.to_string()),
-                        ],
-                    ));
+                    panel.row(
+                        Level::Ok,
+                        tr("computer.label_display"),
+                        tr_fmt(
+                            "computer.display_ok",
+                            &[
+                                ("pw", &d.physical_width.to_string()),
+                                ("ph", &d.physical_height.to_string()),
+                                ("tw", &tw.to_string()),
+                                ("th", &th.to_string()),
+                            ],
+                        ),
+                    )
                 }
-                Err(e) => lines.push(tr_fmt("computer.display_err", &[("err", &e.to_string())])),
-            }
+                Err(e) => panel.row(
+                    Level::Err,
+                    tr("computer.label_display"),
+                    tr_fmt("computer.display_err", &[("err", &e.to_string())]),
+                ),
+            };
 
-            match wyj_computer::capture_primary(64) {
-                Ok(cap) => lines.push(tr_fmt(
-                    "computer.screenshot_ok",
-                    &[("bytes", &cap.png.len().to_string())],
-                )),
-                Err(e) => lines.push(tr_fmt(
-                    "computer.screenshot_err",
-                    &[("err", &e.to_string())],
-                )),
-            }
+            panel = match wyj_computer::capture_primary(64) {
+                Ok(cap) => panel.row(
+                    Level::Ok,
+                    tr("computer.label_screenshot"),
+                    tr_fmt(
+                        "computer.screenshot_ok",
+                        &[("bytes", &cap.png.len().to_string())],
+                    ),
+                ),
+                Err(e) => panel.row(
+                    Level::Err,
+                    tr("computer.label_screenshot"),
+                    tr_fmt("computer.screenshot_err", &[("err", &e.to_string())]),
+                ),
+            };
 
-            match wyj_computer::cursor_location() {
-                Ok((x, y)) => lines.push(tr_fmt(
-                    "computer.input_ok",
-                    &[("x", &x.to_string()), ("y", &y.to_string())],
-                )),
-                Err(e) => lines.push(tr_fmt("computer.input_err", &[("err", &e.to_string())])),
-            }
+            panel = match wyj_computer::cursor_location() {
+                Ok((x, y)) => panel.row(
+                    Level::Ok,
+                    tr("computer.label_cursor"),
+                    tr_fmt(
+                        "computer.input_ok",
+                        &[("x", &x.to_string()), ("y", &y.to_string())],
+                    ),
+                ),
+                Err(e) => panel.row(
+                    Level::Err,
+                    tr("computer.label_cursor"),
+                    tr_fmt("computer.input_err", &[("err", &e.to_string())]),
+                ),
+            };
 
             // 光标位置读取成功不代表输入合成一定生效：macOS 未授权「辅助功能」
             // 时 Enigo::new() 往往仍会成功，点击/按键被系统静默丢弃、不报错，
             // 这种失败模式没有错误可捕获，只能靠固定提醒兜底。
-            lines.push(tr("computer.accessibility_hint"));
+            panel = panel.hint(tr("computer.label_hint"), tr("computer.accessibility_hint"));
         }
 
-        Ok(CommandResult::Output(lines.join("\n")))
+        // 必须走 `OutputPlain`：这是**排版好的面板**，交给 markdown 渲染会被
+        // 当段落重新折行，列对齐全部作废（旧版就是 `Output`，实测标签列散架）。
+        Ok(CommandResult::OutputPlain(
+            panel.render(ctx.terminal_width).trim_end().to_string(),
+        ))
     }
 }
 
