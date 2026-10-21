@@ -72,6 +72,185 @@ const SHORTCUT_HINTS: &[&str] = &[
     "welcome.hint.quit",
 ];
 
+/// 常用命令速查的 i18n key，按**优先级从高到低**排列
+///
+/// **窄终端降级时从末尾开始整条丢弃**，而不是把一条命令拦腰截断——半截的
+/// `/prof` 比没有这条更糟：用户会以为有个叫 `/prof` 的命令。
+///
+/// 顺序即丢弃顺序（末尾先丢），所以最常用的三条排在最前：窄终端下用户
+/// 看到的永远是 `/profile` `/model` `/effort`。
+const COMMAND_HINTS: &[&str] = &[
+    "welcome.cmd.profile",
+    "welcome.cmd.model",
+    "welcome.cmd.effort",
+    "welcome.cmd.help",
+    "welcome.cmd.compact",
+    "welcome.cmd.clear",
+];
+
+/// 常用命令区块的表头 i18n key
+const COMMAND_HEADER_KEY: &str = "welcome.cmd_header";
+
+/// 常用命令区块每行列数（2 列）。
+///
+/// 单列会让区块从 3 行涨到 6 行，把 logo 往下顶；两列在 60 列终端上仍然
+/// 放得下（最宽的一对是 46 列），且读起来是「一行两条」的对照关系。
+const COMMAND_COLUMNS: usize = 2;
+
+/// 两列之间的间隔（空格数）。
+const COMMAND_COLUMN_GAP: usize = 4;
+
+/// 命令名与它自己的说明之间的间隔（空格数）。
+///
+/// 与 [`COMMAND_COLUMN_GAP`] 分开：前者是「格与格之间」，后者是「一条命令
+/// 的名与说明之间」——后者更紧，命令名与说明读起来是同一组。
+const COMMAND_DESC_GAP: usize = 2;
+
+/// 一条常用命令：命令名（ASCII）与说明（可翻译）。
+struct CommandEntry {
+    cmd: String,
+    desc: String,
+}
+
+/// 命令区块里的一格：命令名（含对齐用的尾随空格）与说明（含尾随空格）。
+///
+/// 两段分开存，是为了渲染时给它们**不同的颜色**——命令名亮、说明暗，
+/// 用户扫视时先看到「有哪些命令」，再决定看不看说明。
+#[derive(Clone)]
+struct CommandCell {
+    cmd: String,
+    desc: String,
+}
+
+/// 解析常用命令清单：每条 i18n 文案形如 `/profile 切换分组端点`，
+/// 以**第一个空格**切分——命令名本身是 ASCII，不翻译；其后是说明，走 i18n。
+fn command_entries() -> Vec<CommandEntry> {
+    COMMAND_HINTS
+        .iter()
+        .map(|key| {
+            let raw = tr(key);
+            match raw.split_once(' ') {
+                Some((cmd, desc)) => CommandEntry {
+                    cmd: cmd.to_string(),
+                    desc: desc.trim().to_string(),
+                },
+                None => CommandEntry {
+                    cmd: raw,
+                    desc: String::new(),
+                },
+            }
+        })
+        .collect()
+}
+
+/// 把命令清单排成「每行最多 [`COMMAND_COLUMNS`] 列」的行。
+///
+/// 返回 `None` 表示**这批命令在给定宽度下放不下**，调用方据此丢弃优先级
+/// 最低的条目后重试。宽度计算用显示列宽（中文占 2 列），不是 char 数。
+///
+/// **列优先分配**：左列先装满（`COMMAND_HINTS` 的前三名 = 最高优先级），
+/// 右列装剩下的。这样窄终端降级时是**先丢掉整个右列**、左列三条原样保留
+/// ——而不是行优先截断那样在中间留下半空的行。
+///
+/// **行数固定**：命中的是「6 条 ÷ 每行 2 条 = 3 行」这个固定高度，放不下时
+/// 是**格子留空**而不是整行消失。欢迎页总高度因此与终端宽度无关——聊天区
+/// 高度测量与滚动位置不会因为「窄终端少两行命令」而漂移。
+///
+/// `keep` 是**按优先级从前往后**保留的条目数（`COMMAND_HINTS` 的顺序即
+/// 优先级），因此丢弃总是发生在末尾。
+fn layout_command_rows(
+    entries: &[CommandEntry],
+    keep: usize,
+    available: usize,
+) -> Option<Vec<Vec<CommandCell>>> {
+    let total_rows = entries.len().div_ceil(COMMAND_COLUMNS);
+
+    // 列优先分配：左列先满，右列装剩余。
+    let left_count = keep.min(total_rows);
+    let right_count = keep.saturating_sub(left_count).min(total_rows);
+    let col_counts = [left_count, right_count];
+
+    // 每列的命令名 / 说明各自对齐：取该列最宽者，其余补空格。
+    let mut cmd_w = [0usize; COMMAND_COLUMNS];
+    let mut desc_w = [0usize; COMMAND_COLUMNS];
+    let mut offset = 0usize;
+    for col in 0..COMMAND_COLUMNS {
+        for entry in entries.iter().skip(offset).take(col_counts[col]) {
+            cmd_w[col] = cmd_w[col].max(display_width(&entry.cmd));
+            desc_w[col] = desc_w[col].max(display_width(&entry.desc));
+        }
+        offset += col_counts[col];
+    }
+
+    // 用到的列数：右列有内容才占位。
+    let used_cols = col_counts.iter().filter(|c| **c > 0).count();
+    let col_widths: Vec<usize> = (0..used_cols)
+        .map(|i| cmd_w[i] + COMMAND_DESC_GAP + desc_w[i])
+        .collect();
+    let total: usize =
+        col_widths.iter().sum::<usize>() + COMMAND_COLUMN_GAP * used_cols.saturating_sub(1);
+    if total > available {
+        return None;
+    }
+
+    let mut out: Vec<Vec<CommandCell>> = Vec::with_capacity(total_rows);
+    // 每列的起始下标（左列从 0 起，右列在左列之后）。
+    let mut col_start = [0usize; COMMAND_COLUMNS];
+    col_start[0] = 0;
+    col_start[1] = col_counts[0];
+    for row in 0..total_rows {
+        let mut cells: Vec<CommandCell> = Vec::with_capacity(COMMAND_COLUMNS);
+        for col in 0..COMMAND_COLUMNS {
+            if row >= col_counts[col] {
+                continue;
+            }
+            let entry = &entries[col_start[col] + row];
+            let cw = display_width(&entry.cmd);
+            let dw = display_width(&entry.desc);
+            // 说明补白**只为了让下一列的起点对齐**——所以只有「本行后面还有
+            // 一格」时才补；行内最后一格的补白只是行尾空格，纯噪音。
+            let has_next_in_row = col + 1 < COMMAND_COLUMNS && row < col_counts[col + 1];
+            let desc_padding = if has_next_in_row {
+                " ".repeat(desc_w[col].saturating_sub(dw))
+            } else {
+                String::new()
+            };
+            cells.push(CommandCell {
+                cmd: format!("{}{}", entry.cmd, " ".repeat(cmd_w[col] - cw)),
+                desc: format!("{}{}", entry.desc, desc_padding),
+            });
+        }
+        out.push(cells);
+    }
+    Some(out)
+}
+
+/// 一段文本的显示列宽（中文按 2 列计）。
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+/// 命令区块的行数（常量，与终端宽度无关）。
+fn command_rows() -> usize {
+    COMMAND_HINTS.len().div_ceil(COMMAND_COLUMNS)
+}
+
+/// 排版命令清单：从「全部保留」开始逐步丢弃优先级最低的条目，直到放得下。
+///
+/// **行数恒定**：返回的 vec 长度永远是 [`command_rows`]——放不下时是**格子
+/// 留空**而不是整行消失，因此欢迎页总高度不随终端宽度漂移。
+fn command_block_lines(available: usize) -> Vec<Vec<CommandCell>> {
+    let entries = command_entries();
+    for keep in (0..=entries.len()).rev() {
+        if let Some(rows) = layout_command_rows(&entries, keep, available) {
+            return rows;
+        }
+    }
+    // 理论上不可达：keep=0 时总宽为 0，永远放得下。保底仍返回等高空行，
+    // 以免这一行的行数意外变化。
+    (0..command_rows()).map(|_| Vec::new()).collect()
+}
+
 /// 根据外部熵值选取一个 tip 索引，纯函数、无副作用，便于单测。
 pub fn pick_tip_index(seed: u64) -> usize {
     (seed as usize) % TIPS.len()
@@ -100,6 +279,7 @@ const ASCII_LOGO: &[&str] = &[
 /// - 1 行版本号（左缩进 `CONTENT_INDENT`，dim 灰，紧贴 logo 下方）
 /// - `SECTION_BLANK_LINES` 行间隔
 /// - 1 行 tip（💡 + 轮播文案，dim 琥珀色）
+/// - 常用命令区块：1 行表头 + `COMMAND_HINTS.len() / COMMAND_COLUMNS` 行条目
 /// - 1 行快捷键速查（dim，窄终端下按优先级渐进丢弃 segment）
 ///
 /// **宽度契约**：返回的每一行显示宽度都 `<= area_width`。旧实现有三处溢出
@@ -107,7 +287,8 @@ const ASCII_LOGO: &[&str] = &[
 /// 整块丢弃导致要么超宽要么整行消失），窄终端下会被 Paragraph 从右侧硬切，
 /// 切点落在半截字符上。
 pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static>> {
-    let total = TOP_BLANK_LINES + ASCII_LOGO.len() + 1 + SECTION_BLANK_LINES + 1 + 1;
+    let total =
+        TOP_BLANK_LINES + ASCII_LOGO.len() + 1 + SECTION_BLANK_LINES + 1 + 1 + command_rows() + 1;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(total);
 
     // 整行宽度预算 = 终端宽度。**缩进本身也算在内**——旧实现把缩进当
@@ -169,7 +350,30 @@ pub fn render_welcome(ctx: &WelcomeContext, area_width: u16) -> Vec<Line<'static
         Theme::welcome_tip(),
     )));
 
-    // 5) 快捷键速查行（窄终端下按优先级渐进丢弃 segment）
+    // 5) 常用命令区块：表头 + 两列条目。
+    //
+    // 放在 tip 之后、快捷键行之前——tip 是「今天知道一件事」，命令清单是
+    // 「随时要用的入口」，后者更该靠近输入框。
+    let header = tr(COMMAND_HEADER_KEY);
+    lines.push(Line::from(Span::styled(
+        format!("{indent}{}", truncate_line(&header, available)),
+        Theme::muted(),
+    )));
+    for cells in command_block_lines(available) {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(indent)];
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" ".repeat(COMMAND_COLUMN_GAP)));
+            }
+            // 命令名亮（正文色）、说明暗（dim）：扫视时先看到命令名。
+            spans.push(Span::styled(cell.cmd.clone(), Theme::body()));
+            spans.push(Span::raw(" ".repeat(COMMAND_DESC_GAP)));
+            spans.push(Span::styled(cell.desc.clone(), Theme::dim()));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // 6) 快捷键速查行（窄终端下按优先级渐进丢弃 segment）
     let shortcuts_text = shortcuts_line(available);
     lines.push(Line::from(Span::styled(
         format!("{indent}{shortcuts_text}"),
@@ -321,14 +525,41 @@ mod tests {
     fn render_welcome_total_lines_is_fixed() {
         let ctx = sample_ctx();
         let lines = render_welcome(&ctx, 120);
-        let expected = TOP_BLANK_LINES + ASCII_LOGO.len() + 1 + SECTION_BLANK_LINES + 1 + 1;
+        let expected = TOP_BLANK_LINES
+            + ASCII_LOGO.len()
+            + 1
+            + SECTION_BLANK_LINES
+            + 1
+            + 1
+            + command_rows()
+            + 1;
         assert_eq!(
             lines.len(),
             expected,
-            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 版本 1 + 间隔 {SECTION_BLANK_LINES} + tip 1 + 快捷键 1）",
+            "欢迎页应固定 {} 行（顶留白 {TOP_BLANK_LINES} + logo {} + 版本 1 + 间隔 {SECTION_BLANK_LINES} + tip 1 + 命令表头 1 + 命令 {} + 快捷键 1）",
             expected,
-            ASCII_LOGO.len()
+            ASCII_LOGO.len(),
+            command_rows()
         );
+    }
+
+    /// 命令区块的行数：**与终端宽度无关**。
+    ///
+    /// 窄终端下命令是被**整条丢弃**的（不是整行消失），所以区块高度恒定。
+    /// 欢迎页总高度因此是常量，聊天区的高度测量与滚动位置不会随宽度漂移。
+    #[test]
+    fn command_block_height_does_not_depend_on_terminal_width() {
+        let ctx = sample_ctx();
+        let base = render_welcome(&ctx, 200).len();
+        for width in [4u16, 8, 12, 20, 30, 40, 60, 80, 120, 200] {
+            let lines = render_welcome(&ctx, width);
+            assert_eq!(
+                lines.len(),
+                base,
+                "宽度 {width} 下欢迎页行数应与 200 列一致（实际 {} vs {base}）",
+                lines.len()
+            );
+        }
     }
 
     #[test]
@@ -573,6 +804,70 @@ mod tests {
         );
     }
 
+    /// 常用命令区块：表头 + 两条主命令必须在页面上。
+    ///
+    /// 用户拿到欢迎页后的第一反应是「有哪些命令可用」——`/profile` `/model`
+    /// `/effort` 是本次改动点名要出现的三条。
+    #[test]
+    fn welcome_page_lists_the_common_commands() {
+        let ctx = sample_ctx();
+        let lines = render_welcome(&ctx, 120);
+        let header = collect_text(&lines[command_header_idx()]);
+        assert!(
+            header.contains(&tr(COMMAND_HEADER_KEY)),
+            "命令区块应有表头「{}」；实际：{:?}",
+            tr(COMMAND_HEADER_KEY),
+            header
+        );
+        let body: String = lines[command_first_idx()..shortcuts_line_idx()]
+            .iter()
+            .map(collect_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for key in [
+            "welcome.cmd.profile",
+            "welcome.cmd.model",
+            "welcome.cmd.effort",
+        ] {
+            // i18n 原文是「命令名 + 单空格 + 说明」，渲染时命令名与说明之间
+            // 是 2 空格（对齐用），所以**分两段**断言而不是比整条原文。
+            let raw = tr(key);
+            let (cmd, desc) = raw.split_once(' ').expect("命令文案应为「名 + 说明」");
+            assert!(
+                body.contains(cmd) && body.contains(desc),
+                "命令区块应包含 {} / {}；实际：{:?}",
+                cmd,
+                desc,
+                body
+            );
+        }
+    }
+
+    /// 窄终端下命令被**整条丢弃**，不得出现半截命令名。
+    ///
+    /// 半截的 `/prof` 比没有这条更糟：用户会以为有个叫 `/prof` 的命令。
+    #[test]
+    fn narrow_terminal_drops_whole_commands_never_truncates_them() {
+        let ctx = sample_ctx();
+        for width in [4u16, 8, 12, 20, 30, 40, 50, 60] {
+            let lines = render_welcome(&ctx, width);
+            for row in lines[command_first_idx()..shortcuts_line_idx()].iter() {
+                let text = collect_text(row);
+                for entry in command_entries() {
+                    // 只允许「完整出现」或「完全不出现」，不允许前缀残留。
+                    let appears_partial = entry.cmd.starts_with('/')
+                        && text.contains(&entry.cmd[..entry.cmd.len().min(4)])
+                        && !text.contains(&entry.cmd);
+                    assert!(
+                        !appears_partial,
+                        "宽度 {width} 下出现了半截命令 {:?}：{:?}",
+                        entry.cmd, text
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn render_welcome_shortcuts_row_degrades_on_narrow_width() {
         let ctx = sample_ctx();
@@ -637,11 +932,18 @@ mod tests {
     #[test]
     fn welcome_page_has_no_suggestion_prompt_line() {
         let lines = render_welcome(&sample_ctx(), 120);
-        let expected_len = TOP_BLANK_LINES + ASCII_LOGO.len() + 1 + SECTION_BLANK_LINES + 1 + 1;
+        let expected_len = TOP_BLANK_LINES
+            + ASCII_LOGO.len()
+            + 1
+            + SECTION_BLANK_LINES
+            + 1
+            + 1
+            + command_rows()
+            + 1;
         assert_eq!(
             lines.len(),
             expected_len,
-            "欢迎页总行数应等于「留白 + logo + 版本 + 间隔 + tip + 快捷键」，\
+            "欢迎页总行数应等于「留白 + logo + 版本 + 间隔 + tip + 命令表头 + 命令 + 快捷键」，\
              不含示例提问行"
         );
         for (i, line) in lines.iter().enumerate() {
@@ -778,7 +1080,17 @@ mod tests {
         version_line_idx() + 1 + SECTION_BLANK_LINES
     }
 
-    fn shortcuts_line_idx() -> usize {
+    /// 常用命令区块的表头行下标（紧跟 tip 行）。
+    fn command_header_idx() -> usize {
         tip_line_idx() + 1
+    }
+
+    /// 常用命令区块的第一行条目下标。
+    fn command_first_idx() -> usize {
+        command_header_idx() + 1
+    }
+
+    fn shortcuts_line_idx() -> usize {
+        command_first_idx() + command_rows()
     }
 }

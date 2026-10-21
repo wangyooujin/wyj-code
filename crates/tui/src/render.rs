@@ -7902,21 +7902,27 @@ mod system_message_wrap_tests {
     /// 几乎没有空格，于是它一路撑到接近行尾才折回来，把「+ 模型分类器」这类
     /// 词组拦腰截断。实测第一行末尾是「由本地规则 +」、第二行开头是「模型
     /// 分类器在执行前判定…」，读起来像乱码。
+    ///
+    /// 样例取 `auto.degraded_to_confirm`（分类器降级提示）——它是当前系统
+    /// 通知里最长的中文段落，能真正触发折行。
     #[test]
     fn system_message_does_not_split_a_chinese_phrase_across_lines() {
-        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。";
-        let lines = render_system(content, 100);
+        let content = "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。";
+        let lines = render_system(content, 60);
         // 折行后所有文字都还在（不丢字）
         assert_eq!(
             body_of(&lines).replace(' ', ""),
             content.replace(' ', ""),
             "折行不应丢失或改变任何字符"
         );
-        // 「+ 模型分类器」必须完整地待在同一行
-        let has_intact = lines
-            .iter()
-            .any(|l| l.contains("+ 模型分类器") || l.contains("模型分类器在执行前判定"));
-        assert!(has_intact, "「模型分类器」不应被拆到两行；实际：{lines:?}");
+        // 「危险命令仍按硬规则拦截」必须完整地待在同一行
+        let has_intact = lines.iter().any(|l| {
+            l.contains("危险命令仍按硬规则拦截") || l.contains("其余操作改为逐次弹窗确认")
+        });
+        assert!(
+            has_intact,
+            "「危险命令仍按硬规则拦截」不应被拆到两行；实际：{lines:?}"
+        );
     }
 
     /// ASCII 词（`Shift+Tab`）不得被拆开。
@@ -7925,9 +7931,9 @@ mod system_message_wrap_tests {
     /// 用户根本认不出那是什么键。
     #[test]
     fn system_message_keeps_ascii_key_names_intact() {
-        let content =
-            "危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
-        for width in [60usize, 80, 100, 120] {
+        // 与 `auto.mode_notice` 的现行文案一致（启动时的 auto 模式提示）。
+        let content = "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。";
+        for width in [40usize, 60, 80, 100, 120] {
             let lines = render_system(content, width);
             let has_intact = lines.iter().any(|l| l.contains("Shift+Tab"));
             assert!(
@@ -7940,7 +7946,7 @@ mod system_message_wrap_tests {
     /// 折行后每行都不得超宽，且总行数合理。
     #[test]
     fn system_message_lines_never_exceed_the_content_width() {
-        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
+        let content = "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。";
         for width in [40usize, 60, 80, 100, 120] {
             let lines = render_system(content, width);
             for (i, line) in lines.iter().enumerate() {
@@ -7957,8 +7963,8 @@ mod system_message_wrap_tests {
     /// 收尾标点不得落在行首（中文排版禁则）。
     #[test]
     fn system_message_never_starts_a_line_with_closing_punctuation() {
-        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
-        for width in [40usize, 50, 60, 80, 100] {
+        let content = "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。";
+        for width in [30usize, 40, 50, 60, 80, 100] {
             let lines = render_system(content, width);
             for (i, line) in lines.iter().enumerate() {
                 // 首行有 "  ⚙ " 前缀，从标记之后看内容起点
