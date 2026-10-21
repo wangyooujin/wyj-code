@@ -1,0 +1,1 @@
+在 text 模块新增 `pub fn word_count(text: &str) -> usize`（按空白切分计数，全空白返回 0）与 `pub fn longest_word(text: &str) -> &str`（返回最长单词；长度相同取最先出现的那个；无单词时返回空串）。再在 report 模块新增 `pub fn describe_text(text: &str) -> String`，返回形如 `words=3 longest=hello` 的字符串。为每个新增行为各写至少一个单元测试。完成后确认 cargo test 全部通过。

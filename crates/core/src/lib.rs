@@ -1,3 +1,4 @@
+pub mod acceptance;
 pub mod agent;
 pub mod agent_def;
 pub mod auto_mode;

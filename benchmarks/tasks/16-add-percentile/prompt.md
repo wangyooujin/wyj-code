@@ -1,0 +1,1 @@
+在 stats 模块新增 `pub fn percentile(values: &[f64], p: f64) -> f64`：p 取 0..=100，返回按线性插值计算的第 p 百分位；空切片返回 0.0，p 越界时 clamp 到 [0, 100]。再在 report 模块的 `summarize` 输出末尾追加 ` p90=<值>`（保留两位小数）。为新增行为写至少两个单元测试（含边界 p=0 与 p=100）。完成后确认 cargo test 全部通过。

@@ -230,7 +230,7 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 {
   "verify": {
     "command": "cargo test -p wyj-core",
-    "timeout_secs": 120
+    "timeout_ms": 120000
   }
 }
 ```
@@ -240,7 +240,35 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 三条设计约束：
 - **零配置成本**：没有声明 `verify.command` 时，`verify.rs` 直接 early-return，**不探测 `npm`/`cargo` 是否存在、不启动任何 shell、不产生任何输出**。绝大多数项目不会配这个键，不配就没有任何代价。
 - **执行顺序**：编辑工具成功 → `PostToolUse` hook → 项目 verify。hook 的反馈（格式化、lint 提示）先到，verify 看到的是 hook 已经处理过的工作树。编辑工具**自身失败**时不跑 verify——失败原因已经在工具结果里了，再跑一遍命令只是浪费。
-- **有界**：默认超时 120s（`timeout_secs` 可覆盖），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model`·`/profile` 热重建。
+- **有界**：默认超时 120s（`timeout_ms` 可覆盖，单位毫秒），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model`·`/profile` 热重建。
+
+### 验收门禁（acceptance）
+
+**项目级**、与 `verify` 同一套 `.wyj-code/settings.json` 体系与合并顺序（全局 → 项目 → `settings.local.json`）：
+
+```json
+{
+  "acceptance": {
+    "max_retries": 2,
+    "criteria": [
+      { "id": "tests-pass",  "kind": "command",       "command": "cargo test -p wyj-core" },
+      { "id": "no-debug",   "kind": "grep_absent",   "pattern": "dbg!\\(", "paths": ["src"] },
+      { "id": "changelog",  "kind": "file_contains", "path": "CHANGELOG.md", "needle": "0.3.16" },
+      { "id": "new-tests",  "kind": "grep_present",  "pattern": "#\\[test\\]", "paths": ["tests"] }
+    ]
+  }
+}
+```
+
+**它改的是什么**：在 `verify` 之前，「任务完成」的定义是**模型说了完成**——模型输出最终文本，回合就结束。这条等式是整条链上最贵的漏洞：模型意识不到功能没有端到端跑通，让它自己评自己的活，它会「自信地夸赞明显平庸的作品」。`acceptance` 把这个定义换成**框架判定**：模型要结束回合时，框架先跑一遍判据；不通过就不让回合结束，把**证据**（不是评语）回灌给模型让它继续修。
+
+四条设计约束：
+- **零假设**：没声明 `[acceptance]` 时，`core::acceptance` 完全不参与——不 spawn 子进程、不读文件、不改变任何行为。`enabled: false` 或判据列表为空同样等于没有。`max_retries` 默认 2，即「发现漏改 → 修 → 再验」给两次机会。
+- **判据必须是框架能判的**：只收录不需要模型参与的判定（命令退出码、文件存在、文件包含字面量、目录下的正则匹配）。需要语义判定的验收（例如「这个 UI 真的能用吗」）**不在本机制内**——弱验证下加宽候选几乎无用，验收对象与最终验收对象不对齐时 verifier 甚至是负收益。先把能自动判的判准，再考虑让模型去判。
+- **信任门控**：`command` 判据会被 `sh -c` 直接执行，与 `verify.command` **同级**的任意命令执行面。项目级的 `[acceptance]` 块因此与 `hooks`/`verify` 一起过 `core::hooks_trust`（`wyj-code trust`）：未批准前整块跳过。指纹覆盖 `hooks`/`verify`/`acceptance` 三个键——既有项目没有 `[acceptance]` 块时指纹逐字节不变（批准记录不受影响），新增该块则需重新批准。
+- **有界**：路径一律相对工作目录解析且必须落在工作目录内（逃出去判为无效）；失败详情只回报**文件路径与行号**，不回显匹配到的内容——报告要回灌进模型上下文，不应成为绕过凭据保护的读文件通道。判据本身配错时**恒判不通过**（fail-closed）：一条被静默跳过的判据会让门禁强度打折，比明确失败更危险。
+
+**三条边界**：① **Plan 模式跳过**——计划模式本就不改文件，判据必然失败；② **重试预算耗尽 → 按「未完成」交付**，既不静默放行也不无限重试；③ **声明了但解析失败 → 在收尾时明确报给用户**，绝不静默把门禁关掉。实现见 `core::acceptance`（`load_acceptance_cfg` / `run_acceptance`），装配点 `cli::assembly::SharedAgentConfig::apply`。
 
 ### 辅助模型（aux_model）
 

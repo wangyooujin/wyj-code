@@ -1,0 +1,1 @@
+这个项目里 `report` 模块直接 `use crate::stats::{avg, median}` 并在函数体里硬编码格式串，导致新增统计量时要改多处。请做一次跨文件重构：把 `summarize` 拆成「采集数据 → 渲染」两步，新增一个 `pub struct Summary { pub name: String, pub n: usize, pub avg: f64, pub median: f64 }` 与 `pub fn summarize_data(name: &str, values: &[f64]) -> Summary`，让 `summarize` 基于它渲染。保持 `summarize` 的现有输出逐字符不变。完成后确认 cargo test 全部通过（原有断言必须仍然通过）。

@@ -4553,3 +4553,242 @@ fn downgrade_reasoning_effort_walks_the_vendor_table() {
         Some("high")
     );
 }
+
+// ── 验收门禁（acceptance gate）─────────────────────────────────────────
+
+/// 验收门禁用的 ctx：工作目录可指定，权限模式可指定。
+struct AcceptanceCtx {
+    cwd: std::path::PathBuf,
+    mode: Option<crate::permission::PermissionMode>,
+}
+#[async_trait::async_trait]
+impl ToolContext for AcceptanceCtx {
+    fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+    fn is_allowed(&self, _name: &str, _input: &serde_json::Value) -> bool {
+        true
+    }
+    fn permission_mode(&self) -> Option<crate::permission::PermissionMode> {
+        self.mode.clone()
+    }
+}
+
+/// 构造一条必然失败的判据（目标文件不存在）。
+fn failing_acceptance_cfg(max_retries: u32) -> crate::acceptance::AcceptanceLoad {
+    crate::acceptance::AcceptanceLoad {
+        cfg: Some(crate::acceptance::AcceptanceCfg {
+            criteria: vec![crate::acceptance::AcceptanceCriterion {
+                id: "must-exist".into(),
+                kind: crate::acceptance::CriterionKind::FileExists {
+                    path: "must-exist.txt".into(),
+                },
+                invalid: None,
+            }],
+            max_retries,
+        }),
+        error: None,
+    }
+}
+
+/// 验收不通过时，**回合不许结束**：框架把失败证据回灌给模型，模型再跑一轮。
+///
+/// 这是「任务完成 = 模型说了完成」这个等式被打破的那一步。断言三件事：
+/// provider 被多调用了一次（循环真的续上了）、证据进了历史、用户看得见提示。
+#[tokio::test]
+async fn a_failing_acceptance_criterion_keeps_the_turn_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(CountingEndTurnProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::new(provider.clone()).with_acceptance(failing_acceptance_cfg(1));
+    let mut session = Session::new();
+    let mut visible = String::new();
+
+    agent
+        .run_turn(
+            &mut session,
+            &AcceptanceCtx {
+                cwd: tmp.path().to_path_buf(),
+                mode: None,
+            },
+            &mut |text| visible.push_str(text),
+        )
+        .await
+        .expect("回合不应报错");
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "验收失败后必须让模型再跑一轮（1 次重试 + 1 次收尾）"
+    );
+    assert!(
+        session.messages.iter().any(|m| {
+            m.content.iter().any(|b| match b {
+                ContentBlock::Text { text } => text.contains("<acceptance-failures"),
+                _ => false,
+            })
+        }),
+        "失败证据必须进历史，让模型能读到"
+    );
+    assert!(
+        visible.contains("must-exist"),
+        "用户必须看见是哪条判据没过：{visible}"
+    );
+}
+
+/// 重试预算耗尽后按「未完成」交付：既不无限重试，也不静默放行。
+#[tokio::test]
+async fn the_acceptance_retry_budget_is_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(CountingEndTurnProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::new(provider.clone()).with_acceptance(failing_acceptance_cfg(2));
+    let mut session = Session::new();
+    let mut visible = String::new();
+
+    agent
+        .run_turn(
+            &mut session,
+            &AcceptanceCtx {
+                cwd: tmp.path().to_path_buf(),
+                mode: None,
+            },
+            &mut |text| visible.push_str(text),
+        )
+        .await
+        .expect("回合不应报错");
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "预算是 2 次重试：初次 + 2 次重试后收尾，共 3 次请求"
+    );
+    // 提示文案随 locale 变，断言必须与 i18n 输出比对而不是写死中文。
+    let exhausted = wyj_i18n::tr_fmt(
+        "agent.acceptance_exhausted",
+        &[("failed", "1"), ("total", "1"), ("ids", "must-exist")],
+    );
+    assert!(
+        visible.contains(&exhausted),
+        "预算耗尽必须明确告诉用户：{visible}"
+    );
+    assert!(
+        visible.contains("must-exist"),
+        "预算耗尽时必须点名是哪条判据没过：{visible}"
+    );
+}
+
+/// 判据全过 → 正常收尾，provider 只被调用一次。
+#[tokio::test]
+async fn a_passing_acceptance_criterion_ends_the_turn_normally() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("must-exist.txt"), "ok").unwrap();
+    let provider = Arc::new(CountingEndTurnProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::new(provider.clone()).with_acceptance(failing_acceptance_cfg(2));
+    let mut session = Session::new();
+    let mut visible = String::new();
+
+    agent
+        .run_turn(
+            &mut session,
+            &AcceptanceCtx {
+                cwd: tmp.path().to_path_buf(),
+                mode: None,
+            },
+            &mut |text| visible.push_str(text),
+        )
+        .await
+        .expect("回合不应报错");
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "判据全过就不该续跑"
+    );
+    assert!(
+        !session
+            .messages
+            .iter()
+            .any(|m| m.content.iter().any(|b| match b {
+                ContentBlock::Text { text } => text.contains("<acceptance-failures"),
+                _ => false,
+            })),
+        "通过时不该注入失败报告"
+    );
+}
+
+/// Plan 模式跳过门禁：计划模式本就不改文件，判据必然失败，让它失败只会把模型
+/// 困在「反复改计划」里出不去。
+#[tokio::test]
+async fn plan_mode_skips_the_acceptance_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(CountingEndTurnProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::new(provider.clone()).with_acceptance(failing_acceptance_cfg(2));
+    let mut session = Session::new();
+    let mut visible = String::new();
+
+    agent
+        .run_turn(
+            &mut session,
+            &AcceptanceCtx {
+                cwd: tmp.path().to_path_buf(),
+                mode: Some(crate::permission::PermissionMode::Plan(Default::default())),
+            },
+            &mut |text| visible.push_str(text),
+        )
+        .await
+        .expect("回合不应报错");
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Plan 模式不跑门禁，也就不该续跑"
+    );
+    assert!(
+        !visible.contains("must-exist"),
+        "Plan 模式不该报验收失败：{visible}"
+    );
+}
+
+/// 声明了 `[acceptance]` 但解析失败 → 收尾时明确报给用户，**绝不静默关掉门禁**。
+#[tokio::test]
+async fn a_broken_acceptance_block_is_reported_to_the_user() {
+    let tmp = tempfile::tempdir().unwrap();
+    let provider = Arc::new(CountingEndTurnProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let agent = Agent::new(provider.clone()).with_acceptance(crate::acceptance::AcceptanceLoad {
+        cfg: None,
+        error: Some("settings.json: acceptance 块结构非法".into()),
+    });
+    let mut session = Session::new();
+    let mut visible = String::new();
+
+    agent
+        .run_turn(
+            &mut session,
+            &AcceptanceCtx {
+                cwd: tmp.path().to_path_buf(),
+                mode: None,
+            },
+            &mut |text| visible.push_str(text),
+        )
+        .await
+        .expect("回合不应报错");
+
+    assert_eq!(
+        provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "配置坏了不该续跑"
+    );
+    assert!(
+        visible.contains("结构非法"),
+        "配置坏了必须让用户看见：{visible}"
+    );
+}

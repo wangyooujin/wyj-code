@@ -1,0 +1,9 @@
+{
+  "acceptance": {
+    "max_retries": 2,
+    "criteria": [
+      { "id": "tests-pass", "kind": "command", "command": "cargo test --quiet" },
+      { "id": "changelog-updated", "kind": "file_contains", "path": "CHANGELOG.md", "needle": "## [Unreleased]" }
+    ]
+  }
+}

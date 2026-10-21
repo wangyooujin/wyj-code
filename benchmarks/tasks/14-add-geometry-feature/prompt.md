@@ -1,0 +1,1 @@
+在 geometry 模块新增 `pub struct Circle { pub radius: f64 }`，带 `area()` 与 `circumference()` 两个方法；`area()` 对负半径返回 0.0（与 `circle_area` 一致），`circumference()` 同样如此。再新增 `pub fn largest_circle(radii: &[f64]) -> Option<Circle>`：返回半径最大的圆，空切片返回 None。为每个新增行为各写至少一个单元测试。完成后确认 cargo test 全部通过。

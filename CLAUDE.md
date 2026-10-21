@@ -109,6 +109,22 @@ cargo fmt                        # 格式化（max_width = 100，见 rustfmt.tom
 cargo clippy                     # lint
 ```
 
+**改了 harness 要跑评测基线，`cargo test` 覆盖不到。** prompt / 工具描述 / 工具可见性 /
+压缩清理策略 / 验收门禁这些改动的效果，不在任何单测的断言里：
+
+```bash
+cargo build --release
+benchmarks/verify-tasks.sh          # 任务集自检，零 API 费用
+benchmarks/run.sh --repeat 3        # 20 个任务 × 3 次
+benchmarks/compare.sh <baseline> <candidate>
+```
+
+纪律三条：**一次只改一个组件**、**每组 ≥3 次重复**、**至少 2 个模型对照**。详见
+`benchmarks/README.md`。理由：外部受控实验里 harness 的方差可达模型方差的 7.8 倍，且
+**很多 harness 改动是负收益**（verifier 在某些基准 −0.8pp、多候选搜索 −5.6pp）——没有基线
+就只能靠感觉判断。`gate_blocks` 是门禁**实际拦截**次数，比「配置里写了 `[acceptance]`」
+更能证明它真的跑了。
+
 **不要把 `[profile.dev]` / `[profile.test]` 的 `incremental` 改回 `true`**（2026-10-11 实测定位，详见 Cargo.toml 内注释）。Rust 增量编译把每个 codegen unit 的目标文件写进 `target/debug/deps/*.o`，文件名带 metadata hash；源码一改整个 crate 换新 hash → 写出一批全新文件名的 `.o`，**被取代的旧 `.o` 原地保留、cargo 从不回收**。本仓库一次完整构建产出 10,465 个 `.o`（0.70 GB，全来自 11 个工作区 crate），实测「touch core + cargo build」单轮新增 1,807 个 `.o` / 359 MB，折算 ≈ 7 GB/天——与实际观察到的 `target/` 膨胀到 **225 GB / 134 万文件**吻合。代价不只是占盘：cargo 每次调用都要 stat 全部产物判断新鲜度，实测真·无变更 build 的地板成本随文件数线性增长（4.2 GB / 1.07 万文件 = 0.66 s，134 万文件就是分钟级）。关掉后 `.o` 不再散落，产物按 metadata hash 稳定命名并原地覆盖，实测连续多轮编辑 **+0 文件 / +0 MB**，全量冷构建 2.2 GB。配套 `debug = "line-tables-only"`（保留行号供 panic backtrace，去掉变量值）把每个 `.o` 从 ~70 KB 压到量级更小；需要 lldb 看变量时临时改回 `debug = 1` 即可。
 
 ## Git 提交约定
@@ -225,6 +241,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 29 | 编辑后自动验证闭环（项目声明 `verify.command` 才生效） | `core::verify` | `crates/core` |
 | 30 | 每轮时延画像（TTFT / 生成 / 重试开销） | `core::session::TurnLatency` + `/context` | `crates/core` + `crates/commands` |
 | 31 | 推理轮数触顶：先收尾交付，再硬中止存档 | `CheckpointKind::TurnLimit` + `TURN_LIMIT_GRACE` | `crates/core` |
+| 32 | 验收门禁：模型说「完成」不算完成，框架判完才算 | `core::acceptance` + `core::agent` 收尾门禁 | `crates/core` + `crates/cli` |
 
 **跨 crate 改动的两条硬约定**：
 

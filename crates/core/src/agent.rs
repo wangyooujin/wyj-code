@@ -438,6 +438,16 @@ pub struct Agent {
     /// 项目声明的校验命令（`verify::load_verify_cfg` 读 `.wyj-code/settings.json`）。
     /// `None` = 该项目没有声明 = **一次子进程都不跑**，这是默认值。
     verify_cfg: Option<Arc<crate::verify::VerifyCfg>>,
+    /// 项目声明的验收契约（`acceptance::load_acceptance_cfg`）。
+    ///
+    /// `None` = 该项目没有声明 = **验收机制完全不参与**（零假设，见
+    /// `crate::acceptance` 的模块文档）。
+    acceptance_cfg: Option<Arc<crate::acceptance::AcceptanceCfg>>,
+    /// 「声明了 `[acceptance]` 但解析失败」的原因。
+    ///
+    /// 单独存一栏是为了让这一档**能被用户看见**：静默把门禁关掉，用户会以为
+    /// 门禁生效了。收尾时在模型正要宣布完成的那一刻报出来，正是它该被发现的时刻。
+    acceptance_error: Option<String>,
     /// 本进程是否已尝试过生成会话标题。
     ///
     /// 标题只在首轮生成一次，`SummaryGenerator::generate_title` 内部靠
@@ -593,6 +603,8 @@ impl Agent {
             turn_user_goal: Arc::new(std::sync::Mutex::new(String::new())),
             capability_cache: None,
             verify_cfg: None,
+            acceptance_cfg: None,
+            acceptance_error: None,
             title_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persist_cap: None,
             context_edit: None,
@@ -633,6 +645,19 @@ impl Agent {
     /// 「声明了但 enabled=false」统一收敛成 `None`，省得每个装配点各判一次。
     pub fn with_verify(mut self, cfg: Option<crate::verify::VerifyCfg>) -> Self {
         self.verify_cfg = cfg.filter(|c| c.enabled).map(Arc::new);
+        self
+    }
+
+    /// 装配验收契约（完成门禁）。
+    ///
+    /// 传入 `acceptance::load_acceptance_cfg()` 的原始返回值即可——本方法负责把
+    /// 「没声明」「声明了但解析失败」「声明了但判据为空」三档分开：前两档都不装
+    /// 门禁，但第二档会把原因存进 `acceptance_error`，收尾时明确报给用户。
+    ///
+    /// 与 `with_verify` 同样的 `filter` 口味：调用方不必自己判三档。
+    pub fn with_acceptance(mut self, load: crate::acceptance::AcceptanceLoad) -> Self {
+        self.acceptance_cfg = load.cfg.map(Arc::new);
+        self.acceptance_error = load.error;
         self
     }
 
@@ -1595,6 +1620,9 @@ impl Agent {
 
         let mut turn = 0;
         let mut invalid_argument_rounds = 0usize;
+        // 验收不通过后已经让模型重试了几轮。声明在循环外：门禁重试要
+        // `continue` 整个回合循环，放里面会被重置成 0 从而变成无限重试。
+        let mut acceptance_retries = 0u32;
         // 收尾指令只注入一次；注入后仍继续用同样方式撞校验，才落到硬中止。
         let mut invalid_argument_wrap_up_sent = false;
         // 收尾指令只注入一次；注入后模型仍不交出最终回答，才落到硬中止。
@@ -3047,6 +3075,78 @@ impl Agent {
             }
 
             if !has_tool_calls && !got_injection {
+                // ── 验收门禁（acceptance gate）────────────────────────────
+                // 「任务完成」在这里不再等于「模型说了完成」。
+                //
+                // 详见 `crate::acceptance` 的模块文档：模型要结束回合时，框架先跑
+                // 一遍项目声明的验收判据；不通过就不让回合结束，把**证据**（不是
+                // 评语）回灌给模型让它继续修。
+                //
+                // 三条边界，缺一不可：
+                // ① **Plan 模式跳过**——计划模式本就不改文件，判据必然失败，让它
+                //    失败只会把模型困在「反复改计划」里出不去。
+                // ② **重试预算耗尽 → 按「未完成」交付**——既不静默放行，也不无限
+                //    重试。判据通过时照常收尾（模型可能已经修好了）。
+                // ③ **声明了但解析失败 → 明确报给用户**——绝不静默把门禁关掉：
+                //    用户以为门禁生效了，实际没有，比没有门禁更危险。
+                if let Some(cfg) = self.acceptance_cfg.clone() {
+                    let in_plan_mode = matches!(
+                        ctx.permission_mode(),
+                        Some(crate::permission::PermissionMode::Plan(_))
+                    );
+                    if !in_plan_mode {
+                        let outcome = crate::acceptance::run_acceptance(&cfg, ctx.cwd()).await;
+                        if outcome.passed() {
+                            on_text(&wyj_i18n::tr_fmt(
+                                "agent.acceptance_passed",
+                                &[("total", &outcome.total.to_string())],
+                            ));
+                        } else {
+                            let failed = outcome.failures.len();
+                            let total = outcome.total;
+                            // 判据 id 是技术标识符，不走 i18n——用户需要知道
+                            // **是哪一条**没过，而不是「有一条没过」。
+                            let ids = outcome
+                                .failures
+                                .iter()
+                                .map(|f| f.id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            if acceptance_retries < cfg.max_retries {
+                                acceptance_retries += 1;
+                                session.push_user_blocks_merged(vec![ContentBlock::Text {
+                                    text: outcome.report(),
+                                }]);
+                                on_text(&wyj_i18n::tr_fmt(
+                                    "agent.acceptance_failed",
+                                    &[
+                                        ("failed", &failed.to_string()),
+                                        ("total", &total.to_string()),
+                                        ("ids", &ids),
+                                    ],
+                                ));
+                                // `continue` 回到回合循环顶部，模型带着证据再跑一轮。
+                                // 本轮**不会**走到下面的记忆提取——任务还没完成，
+                                // 此刻提取记忆等于把半成品当成事实记下来。
+                                continue;
+                            }
+                            on_text(&wyj_i18n::tr_fmt(
+                                "agent.acceptance_exhausted",
+                                &[
+                                    ("failed", &failed.to_string()),
+                                    ("total", &total.to_string()),
+                                    ("ids", &ids),
+                                ],
+                            ));
+                        }
+                    }
+                } else if let Some(reason) = self.acceptance_error.as_deref() {
+                    on_text(&wyj_i18n::tr_fmt(
+                        "agent.acceptance_config_error",
+                        &[("reason", reason)],
+                    ));
+                }
+
                 // 记忆/标题提取是「LLM 辅助调用」，和主循环共用同一个 provider、
                 // 同一把连接、同一份 rate limit。`tokio::spawn` 让它不阻塞
                 // 当前轮是对的，但**不解决它抢配额**：用户在工具跑完后几秒内
