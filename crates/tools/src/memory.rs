@@ -10,16 +10,31 @@ use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 use wyj_core::{
     MemoryClaimKind, MemoryClaimScope, MemoryEvidence, MemorySource, MemorySourceKind,
-    MemoryV3Store, MemoryWriteRequest, TaskStatus, TaskStep,
+    MemoryV3Store, MemoryWriteRequest, SessionStore, TaskStatus, TaskStep,
 };
 
 pub struct MemoryTool {
     store: Arc<MemoryV3Store>,
+    /// 跨会话原始 transcript 检索的入口。
+    ///
+    /// `Option`：headless 一次性命令、部分测试与 `subagent-trace` 之类不装
+    /// SessionStore 的路径拿不到它。缺失时 `search_sessions` action 返回明确
+    /// 错误而不是静默空结果——静默空会让人以为「历史上真的没聊过」。
+    sessions: Option<Arc<SessionStore>>,
 }
 
 impl MemoryTool {
     pub fn new(store: Arc<MemoryV3Store>) -> Self {
-        Self { store }
+        Self {
+            store,
+            sessions: None,
+        }
+    }
+
+    /// 挂上跨会话检索能力（需要 `~/.wyj-code/sessions/` 的那份 store）。
+    pub fn with_sessions(mut self, sessions: Arc<SessionStore>) -> Self {
+        self.sessions = Some(sessions);
+        self
     }
 }
 
@@ -77,16 +92,16 @@ impl Tool for MemoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name().to_string(),
-            description: "Search and manage durable cross-session memory claims. Two scopes only: `global` (cross-project, requires user natural-language confirmation via `confirm_global_candidate` before activation) and `project` (auto-managed for the current working directory). Search before recurring/continuation work; write project facts directly; write inferences only as expiring hypotheses. Use `kind: \"task\"` to track ongoing work and recovery points (Project scope only, requires task_status); use supersede for changed state, forget to undo a bad write, and reject_global_candidate when the user does not want a pending Global preference promoted. Reference claims never enter the Project Brief, so prefer facts over reference for hot context.".to_string(),
+            description: "Search and manage durable cross-session memory claims. Two scopes only: `global` (cross-project, requires user natural-language confirmation via `confirm_global_candidate` before activation) and `project` (auto-managed for the current working directory). Search before recurring/continuation work; write project facts directly; write inferences only as expiring hypotheses. When claims do not answer a question about past work, use `search_sessions` to look inside this project's raw conversation transcripts — claims are extracted summaries and may have missed details, while transcripts hold the original wording and command output. Use `kind: \"task\"` to track ongoing work and recovery points (Project scope only, requires task_status); use supersede for changed state, forget to undo a bad write, and reject_global_candidate when the user does not want a pending Global preference promoted. Reference claims never enter the Project Brief, so prefer facts over reference for hot context.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["search", "read", "write", "supersede", "forget", "status", "list_pending_global_candidates", "confirm_global_candidate", "reject_global_candidate"],
+                        "enum": ["search", "search_sessions", "read", "write", "supersede", "forget", "status", "list_pending_global_candidates", "confirm_global_candidate", "reject_global_candidate"],
                         "description": "Operation to perform"
                     },
-                    "query": {"type": "string", "description": "search: semantic/lexical query in the user's language"},
+                    "query": {"type": "string", "description": "search: semantic/lexical query in the user's language; search_sessions: words to look for in past conversation transcripts"},
                     "recent_context": {"type": "string", "description": "search: recent task/topic, especially for 'continue' requests"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                     "id": {"type": "string", "description": "read/forget target, or supersede predecessor"},
@@ -154,7 +169,7 @@ impl Tool for MemoryTool {
         true
     }
 
-    async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
+    async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let input: Input = serde_json::from_value(input)?;
         // store 上的所有错误（schema 校验失败、fingerprint 被拒、id 不存在等）
         // 都是正常业务错误，必须返回 ToolResult::err 让模型看到可读错误文本，
@@ -178,6 +193,23 @@ impl Tool for MemoryTool {
                     query,
                     input.recent_context.as_deref(),
                     input.limit,
+                )))
+            }
+            "search_sessions" => {
+                let query = input
+                    .query
+                    .as_deref()
+                    .context("search_sessions 需要 query")?;
+                let Some(sessions) = &self.sessions else {
+                    return Ok(ToolResult::err(
+                        "当前运行环境未挂载会话存储，search_sessions 不可用；请改用 search 查询已提取的记忆 claim。",
+                    ));
+                };
+                let limit = input.limit.unwrap_or(8);
+                Ok(map_store(sessions.search_for_project(
+                    ctx.cwd(),
+                    query,
+                    limit,
                 )))
             }
             "read" => {
@@ -520,5 +552,96 @@ mod tests {
         // 库不被任何动作改变。
         let status = store.status().unwrap();
         assert_eq!(status.active_records, 0);
+    }
+
+    #[tokio::test]
+    async fn search_sessions_finds_history_when_claims_are_empty() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryV3Store::new(base.path(), project.path()).unwrap());
+        let sessions_dir = project.path().join("sessions");
+        let sessions = Arc::new(wyj_core::SessionStore::new(sessions_dir.clone()).unwrap());
+
+        // 一条只存在于原始 transcript、从未被提取成 claim 的事实。
+        let mut file = wyj_core::SessionFile {
+            session_id: "hist-1".to_string(),
+            title: "上次排查".to_string(),
+            last_preview: String::new(),
+            cwd: project.path().display().to_string(),
+            timestamp: "2026-10-01T00:00:00Z".to_string(),
+            turns: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            api_calls: 0,
+            tool_schema_tokens: 0,
+            tool_schema_tokens_saved: 0,
+            tool_schema_tokens_last: 0,
+            sub_input_tokens: 0,
+            sub_output_tokens: 0,
+            sub_cache_read_tokens: 0,
+            sub_cache_write_tokens: 0,
+            prompt_cache_state: 0,
+            input_estimate_ratio: None,
+            overflow_window_hint: None,
+            messages: vec![
+                wyj_api::types::Message::user("登录接口一直 401，最后发现是时区问题"),
+                wyj_api::types::Message::user(
+                    "结论：把容器 TZ 从 UTC 改成 Asia/Shanghai 之后签名就匹配了",
+                ),
+            ],
+            routing_events: Vec::new(),
+            current_checkpoint_id: None,
+            branch_parent_session_id: None,
+            branch_parent_checkpoint_id: None,
+            title_generated: true,
+            compact_count: 0,
+            elided_blobs: Vec::new(),
+            session_profile: None,
+            session_effort: None,
+            context_edit_freed_tokens: 0,
+            prompt_fingerprint: None,
+        };
+        // 让会话被归到当前项目（cwd 决定 project_key）。
+        file.cwd = project.path().display().to_string();
+        sessions.save(&file).unwrap();
+
+        let tool = MemoryTool::new(store.clone()).with_sessions(sessions);
+        let ctx = TestCtx(project.path().to_path_buf());
+
+        // claim 层确实是空的——这正是 search_sessions 存在的理由。
+        let claim_search = tool
+            .run(json!({"action":"search","query":"时区"}), &ctx)
+            .await
+            .unwrap();
+        assert!(claim_search.content.trim() == "[]" || claim_search.content.is_empty());
+
+        let found = tool
+            .run(json!({"action":"search_sessions","query":"时区"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!found.is_error, "{}", found.content);
+        assert!(
+            found.content.contains("Asia/Shanghai") || found.content.contains("401"),
+            "原始 transcript 检索应返回命中片段：{}",
+            found.content
+        );
+    }
+
+    #[tokio::test]
+    async fn search_sessions_without_store_reports_clearly() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryV3Store::new(base.path(), project.path()).unwrap());
+        let tool = MemoryTool::new(store); // 没有 with_sessions
+        let ctx = TestCtx(project.path().to_path_buf());
+
+        let result = tool
+            .run(json!({"action":"search_sessions","query":"任何东西"}), &ctx)
+            .await
+            .unwrap();
+        assert!(result.is_error, "缺存储时必须明确报错而不是返回空结果");
+        assert!(result.content.contains("未挂载会话存储"));
     }
 }

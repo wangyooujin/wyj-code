@@ -33,6 +33,9 @@ pub struct RegistryDeps<'a> {
     pub cfg: &'a wyj_config::Config,
     pub code_index: Arc<dyn wyj_core::CodeIndex>,
     pub memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
+    /// 跨会话原始 transcript 检索入口。缺失时 Memory 工具的 `search_sessions`
+    /// action 明确报不可用（而不是静默空结果）。
+    pub sessions: Option<Arc<wyj_core::SessionStore>>,
     pub workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
     pub todo_store: Arc<Mutex<wyj_tools::todo::TodoStore>>,
     pub agent_defs: wyj_tools::SharedAgentDefinitions,
@@ -68,7 +71,14 @@ pub fn build_tool_registry(
     )));
 
     if let Some(memory) = &deps.memory_v3 {
-        registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+        // 会话检索与 claim 检索挂在同一个工具上：模型判断「查记忆」时不该
+        // 还要先分清「查提取过的事实」还是「翻原始对话」——一次调用先试
+        // search，找不到再 search_sessions 是更自然的用法。
+        let mut tool = MemoryTool::new(memory.clone());
+        if let Some(sessions) = &deps.sessions {
+            tool = tool.with_sessions(sessions.clone());
+        }
+        registry.register_arc(Arc::new(tool));
         // CAS 可用时必须注册 ContextRecall：否则被外部化的工具输出对模型就是
         // 不可逆的损失（尤其 Bash / WebFetch 重跑也拿不回）。
         if let Some(t) = wyj_tools::context_recall::tool_for_cas(deps.workspace_cas.clone()) {

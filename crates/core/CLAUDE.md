@@ -46,6 +46,14 @@
 
 4. **跨会话记忆**：当前主线是 `core::memory_v3::MemoryV3Store`（`~/.wyj-code/memory-v3/`，结构化 claim + 后台 job + 项目/全局两层）。`core::memory::MemoryStore`（`~/.wyj-code/memory/<project-id>/`，MEMORY.md 索引 + 每 kind 一个 `.md`）是**降级路径**，不是并存的第二套实现——`Agent` 的注入与提取是 `memory_v3 → evolution → memory(v2)` 的 if-else 链，v3 一旦存在，v2 一行都不执行。CLI 装配因此只在 v3 构造失败时才构造 v2（`main.rs` 的 `memory_store`），避免每次启动多建一个目录、多读一次盘。开关是 `Config.auto_memory_enabled`（`/memory` 面板切换），对两个 store 都写。钉子：`agent::tests::memory_injection_prefers_v3_then_evolution_then_v2`。
 
+   **退役（aging）按「留存分」而不是写入时间**：`records_max` 触顶时按 `retention_score(record, now)` 降序保留，分数 = 写入新鲜度 × 0.30 + 使用强度 × 0.70（`memory_v3.rs` 的 `retention_score`）。使用强度 = `log(access_count)` × 最近访问衰减，两个新字段 `MemoryRecord.access_count` / `last_accessed_at` 承载。**这个权重的理由**：只按 `updated_at` 会淘汰反了——「三个月没改但每次开工都要查」的项目约定，会先于「昨天随手写、此后再无人问」的记录出局。权重必须让使用强度**显著**压过新鲜度，`retention_score_prefers_used_over_merely_recent` 用 150 天/30 次访问 vs 1 天/0 次把这条钉死；把新鲜度权重提到与使用强度相当，这个测试立刻红。`Superseded` 仍永不被淘汰（审计链）。
+
+   **访问计数走增量日志 `projects/<key>/access.json`，不直接改 `records.json`**：后者是几 MB 单文件，一次检索命中就整体读+解析+重写一遍，代价与收益完全不成比例。`search` / `read` 只写日志（`record_access` 返回日志里的增量，调用方把它加到 records 基数上再回填给调用者），GC 在截断**之前**先 `take_access_log()` 合并进 records 并清空。顺序不能反：淘汰打分需要刚合并进来的计数。失败只 `tracing::warn`——检索结果比统计数据重要。
+
+   **跨会话原始 transcript 检索**：`SessionStore::search` / `search_for_project`（`crates/core/src/session_store.rs`），入口是 Memory 工具的 `search_sessions` action。它与 claim 层互补：claim 是模型抽出的事实（提取漏了就永久丢失），transcript 是可回到原文的原始对话。索引取舍（三个都踩过坑）：**文本全量**；**工具调用**索引参数（`Bash(git log …)` 是「当时在查什么」的最佳线索）；**工具结果只索引开头 `TOOL_RESULT_INDEX_BYTES = 800` 字节**——全不索引会让「最需要回溯的报错文本」恰好查不到，全量索引会让 idf 塌掉；**thinking 不索引**。每会话最多 `MAX_HITS_PER_SESSION = 2` 条命中，否则一个跑了一整天的会话会把结果列表占满、其它会话一条都进不来。给模型的入口只走 `search_for_project`（会话按 git 根隔离的既有约定）。它是 O(全部会话) 的读盘 + JSON 解析，**不得**放进每轮自动注入路径。
+
+   **检索的词法底座统一在 `core::lexical`**：`tokenize`（CJK 1~3-gram + ≤12 字整段 token）/ `term_frequencies` / `Bm25Scorer`。此前 `memory_v3::search`、`pick_top`、`session_store::search` 各有一份等价实现，分词规则一改就要改三处。**精确短语加分（+5.0）不能省**：中文四字术语在长句里被切成 n-gram 后每个词元的 idf 都接近 0，「原文里逐字出现」这个最强信号会输给「碎词出现得多」的噪声段落——`session_store` 一开始漏了这一步，测试直接抓出来了。
+
 
 4b. **会话级状态的两个字段，持久化策略故意不同**（v0.3.16）：
 
@@ -154,7 +162,7 @@
 | Evolution（per project） | 100 MiB + 28-180 天 TTLs | `evolution.retention_*` / `evolution.max_project_store_bytes` |
 | Session checkpoints | 20 / session | `storage.checkpoints_per_session` |
 | Memory v2 `.md` | 200 / kind | `storage.memory_v2_md_per_kind` |
-| Memory v3 `records.json` | 5000 条(Superseded 永保留) | `storage.memory_v3_records_max` |
+| Memory v3 `records.json` | 5000 条(Superseded 永保留) | `storage.memory_v3_records_max`（淘汰按 `retention_score`，见上文第 4 条；不是按 `updated_at`） |
 | Memory v3 `jobs.json` | 32 pending | `storage.memory_v3_jobs_max` |
 | Memory v3 `rejected_history.json` | 500 条 | `storage.memory_v3_rejected_history_max` |
 | Schedule 日志 | 50 文件 / task | `storage.schedule_logs_per_task` |
