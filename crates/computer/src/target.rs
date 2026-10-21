@@ -58,6 +58,9 @@ impl WindowTarget {
     /// `frame=(1902,574,19x500)` 在 1920 宽的窗口里映射出截图坐标 2853——
     /// 直接交给模型会让它点一个不存在的位置。因此越界一律夹取到捕获边界内，
     /// 由调用方决定是丢弃还是保留（[`crate::element`] 选择丢弃）。
+    ///
+    /// **要用它判断「元素在不在窗口内」请用 [`Self::global_to_screenshot_strict`]**：
+    /// 本函数夹取之后永远返回 `Some`，因此对「是否越界」这个问题没有答案。
     pub fn global_to_screenshot(&self, gx: f64, gy: f64) -> Option<(f64, f64)> {
         if self.target_width == 0 || self.target_height == 0 {
             return None;
@@ -76,6 +79,40 @@ impl WindowTarget {
             sx.clamp(0.0, f64::from(self.target_width - 1)),
             sy.clamp(0.0, f64::from(self.target_height - 1)),
         ))
+    }
+
+    /// 同 [`Self::global_to_screenshot`]，但**完全落在窗口外的点返回 `None`**。
+    ///
+    /// 这个区别决定元素列表里有没有假元素。`global_to_screenshot` 会把越界
+    /// 坐标夹到边界上，于是「窗口外的元素」在截图坐标里表现为**紧贴边缘的
+    /// 一排元素**——模型看到它们、点了它们，落点却是窗口边框。实测 Ghostty
+    /// 滚动条映射出 2853（窗口宽 1280）就是这个形态。
+    ///
+    /// 部分越界仍然夹取：元素被窗口裁掉一半是完全正常的状态（滚动区边缘的
+    /// 按钮、被工具栏压住一半的控件），把它丢掉会让模型找不到本该存在的控件。
+    /// 只有**整个点**在窗口外才视为不可见。
+    pub fn global_to_screenshot_strict(&self, gx: f64, gy: f64) -> Option<(f64, f64)> {
+        if gx < f64::from(self.x)
+            || gy < f64::from(self.y)
+            || gx > f64::from(self.x) + f64::from(self.width)
+            || gy > f64::from(self.y) + f64::from(self.height)
+        {
+            return None;
+        }
+        self.global_to_screenshot(gx, gy)
+    }
+
+    /// 元素矩形是否与窗口矩形有非空交集。
+    ///
+    /// 判定「这个元素还看得见吗」必须看**矩形相交**而不是中心点：一个横跨
+    /// 窗口边界的大控件（比如整行表格）中心可能在窗口外，但它明明露着半截。
+    /// [`Self::global_to_screenshot_strict`] 只解决点的问题，这里解决矩形的。
+    pub fn rect_intersects_window(&self, gx: f64, gy: f64, width: f64, height: f64) -> bool {
+        let (wx0, wy0) = (f64::from(self.x), f64::from(self.y));
+        let (wx1, wy1) = (wx0 + f64::from(self.width), wy0 + f64::from(self.height));
+        let (ex0, ey0) = (gx, gy);
+        let (ex1, ey1) = (gx + width.max(0.0), gy + height.max(0.0));
+        ex1 > wx0 && ex0 < wx1 && ey1 > wy0 && ey0 < wy1
     }
 }
 
@@ -351,5 +388,56 @@ mod tests {
             (500.0, 350.0)
         );
         assert!(target.screenshot_to_global(400, 0).is_err());
+    }
+
+    fn window() -> WindowTarget {
+        WindowTarget {
+            window_id: 1,
+            pid: 2,
+            app_name: "App".into(),
+            title: "Title".into(),
+            x: 100,
+            y: 50,
+            width: 800,
+            height: 600,
+            target_width: 400,
+            target_height: 300,
+            generation: 3,
+            focused: false,
+        }
+    }
+
+    /// 这条钉住「窗口外的元素必须被判为不可见」——否则模型会看到一排贴在
+    /// 截图边缘的假元素，点了却落在窗口边框上。
+    #[test]
+    fn global_to_screenshot_strict_rejects_points_outside_the_window() {
+        let t = window();
+        // 窗口内：正常映射。
+        assert!(t.global_to_screenshot_strict(500.0, 350.0).is_some());
+        // 边界上（含端点）：仍算窗口内。
+        assert!(t.global_to_screenshot_strict(100.0, 50.0).is_some());
+        assert!(t.global_to_screenshot_strict(900.0, 650.0).is_some());
+        // 实机数据：Ghostty 滚动条 frame=(1902,574) 在 1920 宽的窗口里
+        // 映射出截图坐标 2853，远超截图宽 1280。
+        assert!(t.global_to_screenshot_strict(1902.0, 574.0).is_none());
+        // 负坐标（副屏在左侧）同理。
+        assert!(t.global_to_screenshot_strict(-50.0, 300.0).is_none());
+        // 而宽松版本对同样的点仍返回夹取结果——这正是两者必须区分的原因。
+        assert!(t.global_to_screenshot(1902.0, 574.0).is_some());
+    }
+
+    #[test]
+    fn rect_intersects_window_covers_partial_and_fully_outside_cases() {
+        let t = window();
+        // 完全在内。
+        assert!(t.rect_intersects_window(200.0, 100.0, 50.0, 50.0));
+        // 横跨右边界：中心点在窗口外，但确实露着半截，不能丢。
+        assert!(t.rect_intersects_window(880.0, 100.0, 100.0, 50.0));
+        // 完全在右边界之外。
+        assert!(!t.rect_intersects_window(1000.0, 100.0, 50.0, 50.0));
+        // 仅贴边（无面积重叠）。
+        assert!(!t.rect_intersects_window(900.0, 100.0, 50.0, 50.0));
+        // 完全在左边界之外。
+        assert!(!t.rect_intersects_window(0.0, 100.0, 50.0, 50.0));
     }
 }

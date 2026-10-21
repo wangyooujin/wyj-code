@@ -14,6 +14,19 @@ use std::ptr::NonNull;
 const AX_PRESS: &str = "AXPress";
 const AX_INCREMENT: &str = "AXIncrement";
 const AX_DECREMENT: &str = "AXDecrement";
+/// 弹出元素的上下文菜单（右键菜单）。
+///
+/// 这是**唯一**能不合成右键事件就打开上下文菜单的途径。`menu.rs` 只覆盖
+/// 菜单栏，而菜单栏里根本没有「复制图片」「添加到播放列表」这类动作——
+/// 它们只存在于右键菜单。此前这条路径完全缺失，于是「右键」成了 GUI
+/// 任务里唯一必须退回全局事件的操作。
+const AX_SHOW_MENU: &str = "AXShowMenu";
+/// 把元素滚动到可见区域内。
+///
+/// 元素在滚动区外时 `AXPress` 会返回 `ActionUnsupported`——不是「这个控件
+/// 不能按」，而是「它现在不在可见范围里」。没有这一步，模型只能靠滚轮
+/// 盲滚再重新列举，而滚多少完全靠猜。
+const AX_SCROLL_TO_VISIBLE: &str = "AXScrollToVisible";
 const AX_VALUE: &str = "AXValue";
 const AX_SELECTED_TEXT: &str = "AXSelectedText";
 const AX_ROLE: &str = "AXRole";
@@ -59,6 +72,38 @@ pub fn set_messaging_timeout(seconds: f32) {
 pub fn is_process_trusted() -> bool {
     // SAFETY: parameterless system query.
     unsafe { AXIsProcessTrusted() }
+}
+
+/// 查询辅助功能授权，并在未授权时**弹出系统授权框**。
+///
+/// # 为什么只在显式入口调用
+///
+/// `kAXTrustedCheckOptionPrompt` 一旦为真，系统会在该进程下一次被检查时弹出
+/// 「"wyj-code"想要控制这台电脑」的对话框。这个弹窗是模态级打扰：
+///
+/// - 它不受 TUI 控制，用户可能正在终端里看别的东西；
+/// - headless / cron / 子 Agent 场景下弹一个没人看的框毫无意义；
+/// - 反复调用会让系统把它当成骚扰，macOS 会静默拒绝后续请求。
+///
+/// 所以本函数**只由用户显式触发的路径**调用：`/computer` 诊断命令。
+/// 工具内部一律走只读的 [`is_process_trusted`]，失败时返回
+/// `accessibility_permission_required` 让模型停下并告知用户。
+///
+/// 返回值表示**当前**是否已授权（提示是异步的，不改变本次返回值）。
+pub fn request_trust_prompt() -> bool {
+    use objc2_application_services::{kAXTrustedCheckOptionPrompt, AXIsProcessTrustedWithOptions};
+    use objc2_core_foundation::{CFBoolean, CFDictionary, CFRetained, CFString, CFType};
+
+    // SAFETY: `kAXTrustedCheckOptionPrompt` 是系统提供的静态字符串常量。
+    let key: &CFString = unsafe { kAXTrustedCheckOptionPrompt };
+    let value: CFRetained<CFType> = CFBoolean::new(true).into();
+    let values: [&CFType; 1] = [&value];
+    let options: CFRetained<CFDictionary<CFString, CFType>> =
+        CFDictionary::from_slices(&[key], &values);
+    // 非泛型 `CFDictionary` 是这个 API 的入参类型，做一次类型擦除。
+    let options: &CFDictionary = options.as_opaque();
+    // SAFETY: options 的键是 CFString、值是 CFBoolean，符合文档要求的类型。
+    unsafe { AXIsProcessTrustedWithOptions(Some(options)) }
 }
 
 fn require_trusted() -> Result<()> {
@@ -250,6 +295,47 @@ pub fn press_handle(handle: &AXUIElement) -> Result<()> {
     press_chain(&chain)
 }
 
+/// 对已解析的元素句柄弹出上下文菜单（`AXShowMenu`）。
+///
+/// # 为什么只尝试元素本身，不上溯父链
+///
+/// `AXPress` 需要上溯是因为「按钮的文字子节点」本身不可按，真正的目标是
+/// 它的祖先。`AXShowMenu` 不同：它作用在**容器**上（列表行、图片、文本
+/// 选区），而这些容器通常就是元素本身；上溯到父容器反而会弹出「整个列表」
+/// 的菜单而不是「这一行」的菜单——那会让模型选到一个语义完全不同的动作。
+///
+/// 因此这里只试元素本身，失败就如实报错并建议模型改用坐标右键
+/// （`click` + `click_kind: right`），后者能精确命中。
+pub fn show_menu_handle(handle: &AXUIElement) -> Result<()> {
+    require_trusted()?;
+    let action = CFString::from_str(AX_SHOW_MENU);
+    // SAFETY: `handle` 由调用方保证在本次调用期间存活；perform_action 只借用。
+    let error = unsafe { handle.perform_action(&action) };
+    if error == AXError::Success {
+        return Ok(());
+    }
+    bail!(
+        "requires_foreground_takeover: this element does not expose AXShowMenu (AXError({})); \
+         use `click` with `click_kind: right` at the element's centre instead",
+        error.0
+    )
+}
+
+/// 把元素滚动到可见区域内（`AXScrollToVisible`）。
+///
+/// 返回 `Ok(true)` 表示滚动动作被接受；`Ok(false)` 表示该元素不支持
+/// （不一定是错误：很多元素本来就在可见区内，不需要滚动）。
+///
+/// 调用方应在 `AXPress` 失败**之后**、改用坐标**之前**尝试它：元素在
+/// 滚动区外时 `AXPress` 报的是 `ActionUnsupported`，而那不代表控件不可按。
+pub fn scroll_to_visible_handle(handle: &AXUIElement) -> Result<bool> {
+    require_trusted()?;
+    let action = CFString::from_str(AX_SCROLL_TO_VISIBLE);
+    // SAFETY: `handle` 由调用方保证在本次调用期间存活；perform_action 只借用。
+    let error = unsafe { handle.perform_action(&action) };
+    Ok(error == AXError::Success)
+}
+
 /// 对已解析的元素句柄写入文本（AXValue / AXSelectedText）。
 pub fn set_text_handle(handle: &AXUIElement, text: &str) -> Result<&'static str> {
     require_trusted()?;
@@ -385,7 +471,12 @@ pub fn scroll(pid: u32, x: f64, y: f64, direction: &str, amount: u32) -> Result<
 /// 一次 `copy_multiple_attribute_values` 读回的属性集合。
 ///
 /// 遍历性能的全部来源：逐属性读 3000 节点 = 15000 次 IPC（访达实测 18.2s），
-/// 批量读降到每节点 2 次（实测 9.3s）。
+/// 批量读把每节点的固定开销压到 **2 次**（1 次批量 + 1 次 `copy_action_names`），
+/// 使 400 节点的遍历落在 1.2s 级别。
+///
+/// 三个属性（`AXChildren` / `AXIdentifier` / `AXMenuItemCmdChar`）曾经是事后
+/// 单独读的，那等于把「每节点 2 次」直接加到 5 次——它们是普通属性，批量读
+/// 对「该属性不存在」的节点只是多一个数组槽位，代价为零。
 pub struct BatchAttributes {
     pub role: Option<String>,
     pub title: Option<String>,
@@ -398,6 +489,8 @@ pub struct BatchAttributes {
     pub position: Option<(f64, f64)>,
     /// `AXSize`，全局逻辑点。
     pub size: Option<(f64, f64)>,
+    /// 恒为 `false`。真正的值由 [`settable_flags`] 在保留判定之后补读，
+    /// 因为 `AXUIElementIsAttributeSettable` 没有批量接口。
     pub settable: bool,
     pub selected_text_settable: bool,
     pub actions: Vec<String>,
@@ -430,8 +523,20 @@ impl BatchAttributes {
     }
 }
 
-/// 批量读取的属性名，顺序与 [`BatchAttributes`] 的解析下标一一对应。
-const BATCH_ATTRS: [&str; 9] = [
+/// 批量读取的属性名，顺序与 [`batch_attributes`] 的解析下标一一对应。
+///
+/// # 为什么这里要尽量多装
+///
+/// 每多一个属性就多一次跨进程往返，而遍历是**逐节点**的：400 个节点的遍历
+/// 里，每多 1 次 IPC 就多 400 次往返（实测约 0.4ms/次，即 +160ms）。因此凡是
+/// 「大部分节点都可能有、且形状固定」的属性都应该塞进这一批，而不是事后用
+/// `copy_attribute_value` 单独读。
+///
+/// `AXIdentifier` / `AXMenuItemCmdChar` 曾经是单独读的（注释理由是「只有菜单
+/// 类元素才有，会拖慢所有节点」）——那个理由站不住：批量读对「该属性不存在」
+/// 的节点只多一次数组槽位，代价为零；而单独读对**每个**节点都多一次完整
+/// 往返。这两项在控件节点上确实多半为空，但在菜单项上正是关键信息。
+const BATCH_ATTRS: [&str; 12] = [
     "AXRole",
     "AXTitle",
     "AXDescription",
@@ -441,10 +546,12 @@ const BATCH_ATTRS: [&str; 9] = [
     "AXSelected",
     "AXPosition",
     "AXSize",
+    // 子节点数组一并批量读：它是遍历的骨架，每个节点都要，单独读等于把
+    // 「每节点 2 次 IPC」直接翻倍。
+    "AXChildren",
+    "AXIdentifier",
+    "AXMenuItemCmdChar",
 ];
-
-const AX_IDENTIFIER: &str = "AXIdentifier";
-const AX_MENU_ITEM_CMD_CHAR: &str = "AXMenuItemCmdChar";
 
 /// 把 `CFRetained<CFType>` 降级成字符串属性。
 fn as_string(value: &CFRetained<CFType>) -> Option<String> {
@@ -486,11 +593,18 @@ fn as_ax_pair(value: &CFRetained<CFType>, kind: AXValueType) -> Option<(f64, f64
 /// `copy_multiple_attribute_values` 的 `options` 传 `empty()`：单个属性失败
 /// 不会中断整批（错误以 `kAXValueAXErrorType` 占位在对应位置），这对
 /// 「有些节点没有 AXValue / AXPosition」是必需的。
+///
+/// # 本函数的 IPC 预算：2 次
+///
+/// 批量读 1 次 + `copy_action_names` 1 次。刻意**不**再读 `settable`
+/// （见下）也不重复检查授权——后者本地开销虽小，但遍历 400 个节点就白跑
+/// 400 次，由调用方在循环外查一次即可。
+///
+/// 注意 `settable` 字段在本函数返回时**恒为 false**：它由调用方在保留判定
+/// 之后用 [`settable_flags`] 补读。任何直接使用 `BatchAttributes::settable`
+/// 却不补读的代码都会拿到错误结论。
 pub fn batch_attributes(element: &AXUIElement) -> BatchAttributes {
     let mut out = BatchAttributes::empty();
-    if !is_process_trusted() {
-        return out;
-    }
 
     let names: CFRetained<CFMutableArray<CFString>> =
         CFMutableArray::with_capacity(BATCH_ATTRS.len());
@@ -546,18 +660,48 @@ pub fn batch_attributes(element: &AXUIElement) -> BatchAttributes {
         if let Some(value) = at(8) {
             out.size = as_ax_pair(&value, AXValueType::CGSize);
         }
+        // 槽位 9：`AXChildren` 是 CFArray。批量读成功时它已经是 +1 owned
+        // 的元素数组，直接逐个 downcast，不需要再发一次 copy。
+        if let Some(value) = at(9) {
+            if let Some(array) = value.downcast_ref::<CFArray>() {
+                // SAFETY: AX 数组属性的元素全部是 CFType。
+                let typed: &CFArray<CFType> = unsafe { array.cast_unchecked::<CFType>() };
+                out.children = typed
+                    .to_vec()
+                    .into_iter()
+                    .filter_map(|item: CFRetained<CFType>| item.downcast::<AXUIElement>().ok())
+                    .collect();
+            }
+        }
+        if let Some(value) = at(10) {
+            out.identifier = as_string(&value);
+        }
+        if let Some(value) = at(11) {
+            out.shortcut = as_string(&value);
+        }
     }
 
-    out.settable = is_settable(element, AX_VALUE);
-    out.selected_text_settable = is_settable(element, AX_SELECTED_TEXT);
+    // `settable` 刻意**不在这里读**：`AXUIElementIsAttributeSettable` 没有批量
+    // 接口，每读一次就是一次往返。而它只对「最终会展示给模型的元素」有意义
+    // ——`should_keep` 会淘汰掉绝大多数访问过的节点（同花顺实测可交互率 1%）。
+    // 由调用方在保留判定之后调 [`settable_flags`] 补读，IPC 次数从「每节点 2 次」
+    // 降到「每保留元素 2 次」。
+    //
+    // `is_process_trusted()` 同理不在这里调：它虽然是本地调用，但每次遍历
+    // 400 个节点就白跑 400 次。由 [`crate::element`] 的遍历入口统一检查。
     out.actions = action_names(element);
-    out.children = child_elements(element);
-    // 这两个属性只有菜单类元素才有，不参与批量读取（会拖慢所有节点）。
-    out.identifier = copy_string_attribute(element, AX_IDENTIFIER).ok().flatten();
-    out.shortcut = copy_string_attribute(element, AX_MENU_ITEM_CMD_CHAR)
-        .ok()
-        .flatten();
     out
+}
+
+/// 补读两个 `settable` 标志（各一次 IPC）。
+///
+/// 只有通过 `should_keep` 保留的元素才需要它——模型据此决定 `set_text` 走
+/// AX 写入还是剪贴板粘贴。
+pub fn settable_flags(element: &AXUIElement) -> (bool, bool) {
+    (
+        is_settable(element, AX_VALUE),
+        is_settable(element, AX_SELECTED_TEXT),
+    )
 }
 
 /// 取得一个 application 元素（菜单栏挂在它下面）。

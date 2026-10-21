@@ -3010,11 +3010,32 @@ fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Conf
         return;
     }
     wyj_computer::activity::ensure_monitor();
-    registry.register_arc(Arc::new(wyj_tools::app_computer::AppComputerTool::new(
+    // AX 消息超时：系统默认 6 秒。目标 App 的 AX 线程挂起时（窗口刚关闭、
+    // App 卡顿、元素已失效），`CFRelease` 会一直等，最终让**我们的**进程
+    // SIGTRAP 崩掉——真机实测 Chrome 上遍历 22 个元素后集中释放必然触发
+    // （exit 133），而 AXPress 本身是成功的。调短它把「等不到」变成「及时
+    // 失败」，把崩溃换成可处理的错误。
+    //
+    // 放在注册点而不是 `element.rs` 内部：这是**进程级全局**设置，每次调用
+    // 都设一遍纯属浪费，而注册只发生一次（`/model` 重建会再走一遍，无害）。
+    wyj_computer::accessibility::set_messaging_timeout(AX_MESSAGING_TIMEOUT_SECS);
+    let mut tool = wyj_tools::app_computer::AppComputerTool::new(
         wyj_tools::computer::DEFAULT_MAX_DIM,
         std::time::Duration::from_millis(cfg.computer_use.quiet_period_ms),
-    )));
+    );
+    if cfg.computer_use.auto_screenshot {
+        tool = tool.with_auto_screenshot(cfg.computer_use.auto_screenshot_max_dim);
+    }
+    registry.register_arc(Arc::new(tool));
 }
+
+/// AX 单次跨进程消息的超时（秒）。
+///
+/// 2 秒的依据：`TraversalBudget::max_duration` 是 2000ms，单次消息若超过整个
+/// 遍历预算就毫无意义；而正常 App 的 AX 响应在毫秒级，2 秒足够容纳一次偶发
+/// 卡顿。再短（如 0.5s）会在访达这类大树上产生误判。
+#[cfg(target_os = "macos")]
+const AX_MESSAGING_TIMEOUT_SECS: f32 = 2.0;
 
 #[cfg(not(target_os = "macos"))]
 fn register_app_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) {}

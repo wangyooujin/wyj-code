@@ -488,6 +488,19 @@ pub struct ComputerUseCfg {
     pub max_defer_secs: u64,
     /// 前台兼容动作结束后是否尝试恢复原观察上下文。
     pub restore_context: bool,
+    /// 变更类动作成功后是否自动附带一张目标窗口截图。
+    ///
+    /// 这是「动作 → 观察」闭环的关键：`app_computer` 的动作只回一句文本，
+    /// 模型必须自己再调一次 `screenshot` 才知道界面对不对，而它经常不会——
+    /// 于是拿着过时的界面状态继续往下点。自动附图把这次往返省掉。
+    ///
+    /// 默认开启。代价是每次变更动作多约 1000~1600 input token（一张 960
+    /// 长边的 PNG），长任务里累积可观，可用本开关关掉。
+    pub auto_screenshot: bool,
+    /// 自动附图的长边像素上限。刻意低于观察用的 `max_dim`（1280）：
+    /// 附图只是「确认界面变了没有」，不需要看清小字，需要看清时模型会
+    /// 显式调 `screenshot` 或 `zoom`。
+    pub auto_screenshot_max_dim: u32,
 }
 
 /// `[auto_mode]` 节 — Auto 权限模式的判定策略（对齐 Claude Code auto mode）。
@@ -867,6 +880,8 @@ impl Default for ComputerUseCfg {
             quiet_period_ms: 2_000,
             max_defer_secs: 30,
             restore_context: true,
+            auto_screenshot: true,
+            auto_screenshot_max_dim: 960,
         }
     }
 }
