@@ -1,8 +1,8 @@
 # wyj-code 使用国内大模型 vs Claude Code / Codex 深度对比分析
 
-> **报告日期**:2026-08-23
-> **数据时效**:2025-09 至 2026-08
-> **维护责任**:wyj-code 维护组
+> **报告日期**:2026-08-23  
+> **数据时效**:2025-09 至 2026-08  
+> **维护责任**:wyj-code 维护组  
 > **本报告不包含实测 benchmark**,所有结论均来自公开网络资料、社区用户分享与 wyj-code 代码层事实复核
 
 ---
@@ -19,19 +19,19 @@
 
 ### 三层对比表
 
-| 维度 | Claude Code 原生 + Claude Sonnet/Opus | wyj-code + 国产模型(DeepSeek/GLM/Kimi/Qwen) | Codex + GPT/Codex |
-|---|---|---|---|
-| **协议层** | Anthropic Messages 原生(thinking、cache_control、native computer_20251124 全部支持) | 双 Provider:Anthropic 兼容路径(完整)+ OpenAI Chat Completions(降级) | OpenAI Responses / Chat Completions,reasoning_effort 参数体系 |
-| **工具调用稳定性** | 极高(Anthropic 模型训练时即对齐 schema) | 国产 Bilingual 单工具路径已对齐 schema、简化字段;DeepSeek V3 ≈ GLM-4.6 ≈ Claude,但豆包/Qwen 偶发 schema 报错 | OpenAI 协议稳定性同 wyj-code OpenAI 路径 |
-| **多轮 Agent 鲁棒性** | Claude 原生最强,几乎不死循环 | DeepSeek V3 ≈ GLM-4.6;R1/Qwen3-Max-Thinking 需手动关 thinking 或打补丁 prompt | reasoning_effort=high 可缓解但不根除 |
-| **Extended Thinking** | 原生 beta(`interleaved-thinking-2025-05-14`)+ signature 回传 | Anthropic 路径同 Claude;OpenAI 路径**直接忽略** thinking_*(协议层硬限制) | Responses API 原生支持 reasoning |
-| **Computer-use / Vision** | 原生 `computer_20251124` + 截图内嵌 tool_result | Anthropic 路径完整;OpenAI 路径注册即占位(name only),"名存实亡" | Responses API 支持 vision 但不走 tool 通道 |
-| **长上下文** | 200K 实测 ~150K | 200K 实测 7-8 折;DeepSeek V4-Pro / 小米 MiMo 是 500K+ 主场 | GPT-5 上下文窗口与 Claude 接近 |
-| **价格(输出 $/M)** | Sonnet 4.5 = $15,Opus 4.5 = $75 | DeepSeek V3.2-Exp $0.41,GLM-4.6 $1.74-2.20,豆包 lite ¥0.6 | GPT-5 区间,具体未公开 |
-| **中文能力** | 优于 GPT,但不及国产母语级 | 国产 commit message / 中文 docstring / 中文 API 命名显著优于 Claude | 中文弱于 Claude |
-| **成本控制工具** | Claude Code 自带 `/cost` | wyj-code `/cost` 单列子 Agent 用量;`trace_max_bytes_per_agent` 防 trace 爆盘;`cross_provider_fallback=false` 防误投 | Codex CLI 自带统计 |
-| **Hooks / Skills / SubAgent** | 全套对齐 | 全套对齐 + 国产厂商踩坑防御(`prompt_cache=false` 强制等) | 较薄 |
-| **最佳使用场景** | 复杂架构、跨文件疑难 Bug、computer-use | 日常 CRUD、单测、200K 中等文档、中文 commit、批量小任务 | 通用编码任务,reasoning-heavy |
+| 维度                            | Claude Code 原生 + Claude Sonnet/Opus                                         | wyj-code + 国产模型(DeepSeek/GLM/Kimi/Qwen)                                                                  | Codex + GPT/Codex                                         |
+| ----------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| **协议层**                       | Anthropic Messages 原生(thinking、cache_control、native computer_20251124 全部支持) | 双 Provider:Anthropic 兼容路径(完整)+ OpenAI Chat Completions(降级)                                               | OpenAI Responses / Chat Completions,reasoning_effort 参数体系 |
+| **工具调用稳定性**                   | 极高(Anthropic 模型训练时即对齐 schema)                                               | 国产 Bilingual 单工具路径已对齐 schema、简化字段;DeepSeek V3 ≈ GLM-4.6 ≈ Claude,但豆包/Qwen 偶发 schema 报错                   | OpenAI 协议稳定性同 wyj-code OpenAI 路径                          |
+| **多轮 Agent 鲁棒性**              | Claude 原生最强,几乎不死循环                                                          | DeepSeek V3 ≈ GLM-4.6;R1/Qwen3-Max-Thinking 需手动关 thinking 或打补丁 prompt                                    | reasoning_effort=high 可缓解但不根除                             |
+| **Extended Thinking**         | 原生 beta(`interleaved-thinking-2025-05-14`)+ signature 回传                    | Anthropic 路径同 Claude;OpenAI 路径**直接忽略** thinking\_*(协议层硬限制)                                               | Responses API 原生支持 reasoning                              |
+| **Computer-use / Vision**     | 原生 `computer_20251124` + 截图内嵌 tool_result                                   | Anthropic 路径完整;OpenAI 路径注册即占位(name only),"名存实亡"                                                          | Responses API 支持 vision 但不走 tool 通道                       |
+| **长上下文**                      | 200K 实测 ~150K                                                               | 200K 实测 7-8 折;DeepSeek V4-Pro / 小米 MiMo 是 500K+ 主场                                                       | GPT-5 上下文窗口与 Claude 接近                                    |
+| **价格(输出 $/M)**                | Sonnet 4.5 = $15,Opus 4.5 = $75                                             | DeepSeek V3.2-Exp $0.41,GLM-4.6 $1.74-2.20,豆包 lite ¥0.6                                                  | GPT-5 区间,具体未公开                                            |
+| **中文能力**                      | 优于 GPT,但不及国产母语级                                                             | 国产 commit message / 中文 docstring / 中文 API 命名显著优于 Claude                                                  | 中文弱于 Claude                                               |
+| **成本控制工具**                    | Claude Code 自带 `/cost`                                                      | wyj-code `/cost` 单列子 Agent 用量;`trace_max_bytes_per_agent` 防 trace 爆盘;`cross_provider_fallback=false` 防误投 | Codex CLI 自带统计                                            |
+| **Hooks / Skills / SubAgent** | 全套对齐                                                                        | 全套对齐 + 国产厂商踩坑防御(`prompt_cache=false` 强制等)                                                                | 较薄                                                        |
+| **最佳使用场景**                    | 复杂架构、跨文件疑难 Bug、computer-use                                                 | 日常 CRUD、单测、200K 中等文档、中文 commit、批量小任务                                                                     | 通用编码任务,reasoning-heavy                                    |
 
 ---
 
@@ -61,7 +61,7 @@
 - `crates/api/src/doctor.rs` — `/model doctor` 输出
 - `crates/api/src/models.rs` — `PROFILE_TEMPLATES`(GLM / Volcengine / MiniMax / Kimi / DeepSeek / Qwen / Ollama / vLLM / Custom)
 - `crates/api/src/retry.rs` — 流前重试与指数退避
-- `crates/config/src/lib.rs` — Provider / WireProtocol / Profile / ModelRuntimeCfg / RoutingCfg / is_official_anthropic_endpoint / effective_*
+- `crates/config/src/lib.rs` — Provider / WireProtocol / Profile / ModelRuntimeCfg / RoutingCfg / is_official_anthropic_endpoint / effective\_*
 - `crates/core/src/compact.rs` — `estimate_text_tokens`(CJK 1.5/字、其余 0.25/字、image ≈ b64×3/4/750,封顶 1600)+ `compact_session`
 - `crates/core/src/agent.rs` — run_turn / run_turn_with_injection 在每轮按 route.capabilities 翻译 RequestOptions + 简化 schema
 - `crates/core/src/prompts.rs` — main_system_prompt + `<env>` + git_status_snapshot + COMPUTER_USE_HINT
@@ -81,29 +81,30 @@
 
 ### 2.1 主流厂商代表模型价位表(2025-Q4 至 2026-Q3)
 
-| 厂商 | 模型 | 开源/闭源 | 上下文 | 输入 ($/M) | 输出 ($/M) | Function Calling | Extended Thinking | Vision | Prompt Caching | 备注 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| DeepSeek | **V3.2-Exp** (2025-09) | 开源 (MIT) | 164K | 0.27 | 0.41 | ✅ | DSA 稀疏注意力 | ❌ | ✅ ($0.028/M hit) | 价格屠夫 |
-| DeepSeek | V3.1-Terminus (2025-09) | 开源 | 163.8K | 0.27 | 0.95 | ✅ | ✅ | ❌ | ✅ | — |
-| DeepSeek | R1-0528 (2025-05) | 开源 (MIT) | 128K–164K | 0.14 | 2.19 | ✅ | ✅ 强(显式 `<think>`) | ❌ | ✅ ($0.014/M hit) | 多轮工具循环需关 thinking |
-| 智谱 | **GLM-4.6** (2025-09-30) | 开源 (MIT) | 200K(1M Beta) | 0.43–0.60 | 1.74–2.20 | ✅(parallel) | ✅ | ❌ | ✅ | 性价比第二档,GLM Coding Plan ¥20/月 |
-| 智谱 | GLM-4.5 (2025-07) | 开源 (MIT) | 128K | 0.40–0.60 | 1.60–2.20 | ✅ | ✅ | ❌ | ✅ | — |
-| 智谱 | GLM-4.5 Air | 开源 | 128K | 0.13 | 0.85 | ✅ | — | ❌ | — | 低价档 |
-| 智谱 | GLM-4.7 (2025-12) | 开源 | 200K | — | — | ✅ | — | ❌ | — | 公开数据少 |
-| 月之暗面 | **Kimi K2** (2025-07) | 开源(权重) | 128K | 0.15 / 0.60 | 2.50 | ✅ | 较弱 | ❌ | ✅ | 官方 Anthropic 兼容端点可用 |
-| 月之暗面 | Kimi K2-0905 / K2.5 / K2.6 | 开源 + 闭源 | 256K–262K | 0.55 | 2.20 | ✅ | — | ❌ | ✅ | 长文档主场 |
-| 阿里 | **Qwen3-Coder-Plus** (2025-10) | 闭源 | 262K | 1.00 | 5.00 | ✅ | ❌ | ❌ | ✅ | 百炼有 Anthropic 兼容端点 |
-| 阿里 | Qwen3-Max-Thinking (2025-09) | 闭源 | 256K | 1.20 | 6.00 | ✅ | ✅ | ❌ | ✅ | SWE-bench Verified 73.4% |
-| 字节 | **Doubao-1.5-Coder-Pro** | 闭源 | — | ~$0.42(¥3/M) | ~$0.83(¥6/M) | ✅ | 弱/无 | — | — | 火山引擎 Ark |
-| 字节 | Doubao-1.5-Coder-lite | 闭源 | — | ~$0.04(¥0.30/M) | ~$0.08(¥0.60/M) | ✅ | — | — | — | 极致低价 |
-| MiniMax | abab-6.5s / M2 | 闭源 | 200K | — | — | ✅ | — | — | — | wyj-code `minimax` profile 模板默认 |
-| 零一万物 | Yi-Lightning (2024-10) | 闭源 | 16K | ¥0.99/M | 同价 | ✅ | — | — | — | 上下文偏短 |
-| 百度 | 文心 4.5 / X1 Turbo | 闭源 | 128K | — | — | ✅ | ✅ X1 reasoning | — | — | 编码数据稀缺 |
-| 小米 | MiMo-V2.5-Pro | 闭源 | 1M | — | — | ✅ | ✅ | — | — | 500K+ 主场 |
-| (参考) | Claude Sonnet 4.5 | 闭源 | 200K | 3.00 | 15.00 | ✅ | ✅(原生) | ✅ | ✅ | — |
-| (参考) | Claude Opus 4.5 | 闭源 | 200K | 15.00 | 75.00 | ✅ | ✅(原生) | ✅ | ✅ | — |
+| 厂商       | 模型                             | 开源/闭源    | 上下文           | 输入 ($/M)        | 输出 ($/M)        | Function Calling | Extended Thinking | Vision | Prompt Caching   | 备注                              |
+| -------- | ------------------------------ | -------- | ------------- | --------------- | --------------- | ---------------- | ----------------- | ------ | ---------------- | ------------------------------- |
+| DeepSeek | **V3.2-Exp** (2025-09)         | 开源 (MIT) | 164K          | 0.27            | 0.41            | ✅                | DSA 稀疏注意力         | ❌      | ✅ ($0.028/M hit) | 价格屠夫                            |
+| DeepSeek | V3.1-Terminus (2025-09)        | 开源       | 163.8K        | 0.27            | 0.95            | ✅                | ✅                 | ❌      | ✅                | —                               |
+| DeepSeek | R1-0528 (2025-05)              | 开源 (MIT) | 128K–164K     | 0.14            | 2.19            | ✅                | ✅ 强(显式 `<think>`) | ❌      | ✅ ($0.014/M hit) | 多轮工具循环需关 thinking               |
+| 智谱       | **GLM-4.6** (2025-09-30)       | 开源 (MIT) | 200K(1M Beta) | 0.43–0.60       | 1.74–2.20       | ✅(parallel)      | ✅                 | ❌      | ✅                | 性价比第二档,GLM Coding Plan ¥20/月    |
+| 智谱       | GLM-4.5 (2025-07)              | 开源 (MIT) | 128K          | 0.40–0.60       | 1.60–2.20       | ✅                | ✅                 | ❌      | ✅                | —                               |
+| 智谱       | GLM-4.5 Air                    | 开源       | 128K          | 0.13            | 0.85            | ✅                | —                 | ❌      | —                | 低价档                             |
+| 智谱       | GLM-4.7 (2025-12)              | 开源       | 200K          | —               | —               | ✅                | —                 | ❌      | —                | 公开数据少                           |
+| 月之暗面     | **Kimi K2** (2025-07)          | 开源(权重)   | 128K          | 0.15 / 0.60     | 2.50            | ✅                | 较弱                | ❌      | ✅                | 官方 Anthropic 兼容端点可用             |
+| 月之暗面     | Kimi K2-0905 / K2.5 / K2.6     | 开源 + 闭源  | 256K–262K     | 0.55            | 2.20            | ✅                | —                 | ❌      | ✅                | 长文档主场                           |
+| 阿里       | **Qwen3-Coder-Plus** (2025-10) | 闭源       | 262K          | 1.00            | 5.00            | ✅                | ❌                 | ❌      | ✅                | 百炼有 Anthropic 兼容端点              |
+| 阿里       | Qwen3-Max-Thinking (2025-09)   | 闭源       | 256K          | 1.20            | 6.00            | ✅                | ✅                 | ❌      | ✅                | SWE-bench Verified 73.4%        |
+| 字节       | **Doubao-1.5-Coder-Pro**       | 闭源       | —             | ~$0.42(¥3/M)    | ~$0.83(¥6/M)    | ✅                | 弱/无               | —      | —                | 火山引擎 Ark                        |
+| 字节       | Doubao-1.5-Coder-lite          | 闭源       | —             | ~$0.04(¥0.30/M) | ~$0.08(¥0.60/M) | ✅                | —                 | —      | —                | 极致低价                            |
+| MiniMax  | abab-6.5s / M2                 | 闭源       | 200K          | —               | —               | ✅                | —                 | —      | —                | wyj-code `minimax` profile 模板默认 |
+| 零一万物     | Yi-Lightning (2024-10)         | 闭源       | 16K           | ¥0.99/M         | 同价              | ✅                | —                 | —      | —                | 上下文偏短                           |
+| 百度       | 文心 4.5 / X1 Turbo              | 闭源       | 128K          | —               | —               | ✅                | ✅ X1 reasoning    | —      | —                | 编码数据稀缺                          |
+| 小米       | MiMo-V2.5-Pro                  | 闭源       | 1M            | —               | —               | ✅                | ✅                 | —      | —                | 500K+ 主场                        |
+| (参考)     | Claude Sonnet 4.5              | 闭源       | 200K          | 3.00            | 15.00           | ✅                | ✅(原生)             | ✅      | ✅                | —                               |
+| (参考)     | Claude Opus 4.5                | 闭源       | 200K          | 15.00           | 75.00           | ✅                | ✅(原生)             | ✅      | ✅                | —                               |
 
 **Sources**:
+
 - DeepSeek V3.2-Exp: <https://api-docs.deepseek.com/news/news250929> / <https://therouter.ai/models/deepseek--deepseek-v3.2-exp/>
 - DeepSeek R1-0528 + prompt cache: <https://api-docs.deepseek.com/>(cache hit $0.014/M)
 - GLM-4.5/4.6: <https://z.ai/blog/glm-4.6> / <https://lmspeed.net/model/glm-4-6> / <https://aibreaking.org/blog/glm-4-6-china-coding-champion>
@@ -126,17 +127,18 @@
 
 ### 2.3 基准成绩矩阵
 
-| 基准 | GLM-4.6 | Qwen3-Max-Thinking | DeepSeek V3.2-Exp | Kimi K2 | Claude Sonnet 4 | Claude Sonnet 4.5 |
-|---|---|---|---|---|---|---|
-| **SWE-bench Verified** | 68.0% | 73.4% | 67.8–73.1%(视配置) | 51.8–65.8% | 67.8% | 77.2% |
-| **LiveCodeBench v6** | 82.8%(无工具)/ 84.5%(带工具) | Top 5 | 74.1 | — | — | — |
-| **HumanEval Pass@1** | ~90% | 96.6%(自报) | 92.0% | — | — | — |
-| **BFCL v4** | GLM-4.5 **#1**(超 Opus 4.1) | — | — | — | Opus 4.1 #2 | — |
-| **Codeforces rating** | — | — | 2386 | — | — | — |
-| **TerminalBench** | — | — | 37.7 | — | — | — |
-| **CC-Bench(智谱自建 74 任务)** | vs Sonnet 4 胜率 48.6% | — | — | 53.9% wins vs Sonnet 4 | — | — |
+| 基准                       | GLM-4.6                    | Qwen3-Max-Thinking | DeepSeek V3.2-Exp | Kimi K2                | Claude Sonnet 4 | Claude Sonnet 4.5 |
+| ------------------------ | -------------------------- | ------------------ | ----------------- | ---------------------- | --------------- | ----------------- |
+| **SWE-bench Verified**   | 68.0%                      | 73.4%              | 67.8–73.1%(视配置)   | 51.8–65.8%             | 67.8%           | 77.2%             |
+| **LiveCodeBench v6**     | 82.8%(无工具)/ 84.5%(带工具)     | Top 5              | 74.1              | —                      | —               | —                 |
+| **HumanEval Pass@1**     | ~90%                       | 96.6%(自报)          | 92.0%             | —                      | —               | —                 |
+| **BFCL v4**              | GLM-4.5 **#1**(超 Opus 4.1) | —                  | —                 | —                      | Opus 4.1 #2     | —                 |
+| **Codeforces rating**    | —                          | —                  | 2386              | —                      | —               | —                 |
+| **TerminalBench**        | —                          | —                  | 37.7              | —                      | —               | —                 |
+| **CC-Bench(智谱自建 74 任务)** | vs Sonnet 4 胜率 48.6%       | —                  | —                 | 53.9% wins vs Sonnet 4 | —               | —                 |
 
 **Sources**:
+
 - SWE-bench Verified: <https://www.swebench.com/> / <https://z.ai/blog/glm-4.6> / <https://docs.together.ai/docs/qwen3-max-preview>
 - LiveCodeBench: <https://livecodebench.github.io>
 - BFCL: <https://gorilla.cs.berkeley.edu/leaderboard.html>
@@ -144,6 +146,7 @@
 - CC-Bench: <https://lmspeed.net/model/glm-4-6>
 
 **关键提醒**:基准测的是**基座模型**或**模型 + 配套 scaffolding**的得分,不能直接等同于"在 Claude Code / Cursor / Cline 中实战的体验"。真实 IDE 表现还会受 prompt caching、tool schema 设计、上下文管理、UI 反馈影响。SWE-bench Verified 分数会因 scaffolding(多轮 vs 单轮、是否用 SWE-agent 框架、是否用 test-time scaling)浮动 5-10 个百分点。
+
 
 ### 2.4 IDE / 编辑器生态支持现状
 
@@ -253,6 +256,7 @@ wyj-code 用 `Provider` enum 二分派发(Anthropic | OpenAI),trait 单方法 `s
 - `simplified_tool_definition`(`core/src/tool_arguments.rs`)简化 schema 防国内代理对 `$schema/additionalProperties:false/anyOf/format:"uri"` 等敏感字段的解析失败
 - `PromptPolicy::compatibility_suffix` 注入双语"每次最多调一个工具,参数必须是仅含 schema 字段的严格 JSON 对象"提示
 - `usage_event` 已在 `anthropic.rs:601-614` 双源提取(`MessageStart.usage` 和 `MessageDelta.usage`),**为了兼容 MiniMax、GLM 等只在 message_delta 返回真实用量的端点**
+
 
 #### 国内 vs Claude 真实差距
 
@@ -484,6 +488,7 @@ DeepSeek V4-Flash 实测(CowAgent 框架):6 个场景全一次跑通,**零死循
 | Opus | DeepSeek R1-0528 / Qwen3-Max-Thinking | 复杂架构、跨文件疑难 Bug |
 | Sonnet | DeepSeek V3.2-Exp / GLM-4.6 / Qwen3-Coder-Plus | 编程上下文理解、单文件重构、单元测试 |
 | Haiku | GLM-4.5 Air / Qwen3-Coder-Flash / Doubao-1.5-Coder-lite | 低成本高频检索、批量小任务 |
+
 
 ### 6.2 wyj-code 实操配置示例(可直接复制)
 
@@ -749,6 +754,7 @@ fallback_profiles = ["glm-fallback", "claude-fallback"]
 - MiniMax: <https://api.minimaxi.com/>
 
 ### 9.2 基准与排行
+
 
 - SWE-bench Verified: <https://www.swebench.com/>
 - LiveCodeBench: <https://livecodebench.github.io>
