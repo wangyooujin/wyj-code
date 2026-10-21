@@ -20,6 +20,20 @@ pub enum MemoryCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 在历史会话的原始 transcript 里检索：claim 层提取漏掉时的回溯入口。
+    ///
+    /// 与 `search` 互补——`search` 查模型提取出的 claim，本命令查原始对话原文
+    /// （含当时的工具调用参数与报错）。默认只看当前项目（git 仓库根）的会话。
+    SearchSessions {
+        query: String,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// 放开「只看当前项目」的隔离，检索全部本地会话。
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// 写入一条完整 MemoryWriteRequest JSON；用于迁移、审计和自动化。
     Write {
         #[arg(long)]
@@ -91,6 +105,36 @@ pub fn run(command: MemoryCommand, cwd: &Path, enabled: bool) -> Result<()> {
                             .observed_at
                             .as_deref()
                             .unwrap_or("unknown")
+                    );
+                }
+            }
+        }
+        MemoryCommand::SearchSessions {
+            query,
+            limit,
+            all_projects,
+            json,
+        } => {
+            let sessions = wyj_core::SessionStore::new(base.join("sessions"))?;
+            let hits = if all_projects {
+                sessions.search(&query, limit)?
+            } else {
+                sessions.search_for_project(cwd, &query, limit)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            } else if hits.is_empty() {
+                println!("No matching messages in past sessions.");
+            } else {
+                for hit in hits {
+                    println!(
+                        "{:.2}  [{}] {}  #{} ({})\n  {}",
+                        hit.score,
+                        hit.session_id,
+                        hit.title,
+                        hit.message_index,
+                        hit.role,
+                        hit.snippet.replace('\n', " ")
                     );
                 }
             }

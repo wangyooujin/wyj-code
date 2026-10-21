@@ -3,6 +3,7 @@
 //! 模型通过 Memory 工具决定何时探索和写入；本模块只执行作用域、来源、TTL、
 //! 脱敏、supersede、原子落盘和外部指令隔离等确定性约束。
 
+use crate::lexical::{term_frequencies, Bm25Scorer};
 use crate::{project_key, project_root, redact_sensitive_text};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -136,6 +137,20 @@ pub struct MemoryRecord {
     pub task_steps: Vec<TaskStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// 被检索命中的累计次数（`search` / `read` 计入，Brief 渲染不计）。
+    ///
+    /// 存在的唯一理由是给 GC 一个「这条记忆还有人用」的信号：淘汰时若只看
+    /// `updated_at`，一条三个月没被写入但每次开工都要查的记忆，会先于一条
+    /// 昨天刚写过、此后再无人问的记录被丢掉——恰好丢反了。
+    #[serde(default)]
+    pub access_count: u32,
+    /// 最近一次被检索命中的时间（RFC3339）。与 `access_count` 配对：
+    /// 前者算「用得多不多」，后者算「最近有没有人用」，两者都进淘汰打分。
+    ///
+    /// 刻意**不**在命中时刷新 `updated_at`——那个字段是「内容最后一次变化」
+    /// 的语义，supersede 链与 `INDEX.md` 排序都依赖它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +237,16 @@ pub enum MemoryJobStatus {
     Running,
     Completed,
     Failed,
+}
+
+/// 访问日志的一条：`access.json` 是 `id → AccessEntry` 的增量映射，
+/// GC 合并进 `records.json` 后清空。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AccessEntry {
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +424,10 @@ impl MemoryV3Store {
             return Ok(());
         };
 
+        // 0. 先合并访问日志：命中次数是淘汰打分的输入，必须在截断之前落进 records。
+        //    `access.json` 是增量日志（见 `record_access`），合并完就清空。
+        let access_log = self.take_access_log()?;
+
         // 1. records.json —— 双 scope 各一遍
         for scope in [MemoryClaimScope::Project, MemoryClaimScope::Global] {
             let path = self.records_path(scope);
@@ -410,7 +439,20 @@ impl MemoryV3Store {
             records.retain(|r| !is_expired(r));
             let mut changed = records.len() != before;
 
-            // 总量 cap:Superseded 永保留;其余按 updated_at 降序保留最新 max 条
+            // 把增量访问日志合并进对应记录（未命中的 id 留在日志里等下次）。
+            if !access_log.is_empty() {
+                for record in &mut records {
+                    if let Some(entry) = access_log.get(&record.id) {
+                        record.access_count = record.access_count.saturating_add(entry.count);
+                        if entry.last_at > record.last_accessed_at {
+                            record.last_accessed_at = entry.last_at.clone();
+                        }
+                        changed = true;
+                    }
+                }
+            }
+
+            // 总量 cap：Superseded 永保留；其余按**留存分**降序保留。
             if cfg.memory_v3_records_max > 0 && records.len() > cfg.memory_v3_records_max {
                 let superseded: Vec<MemoryRecord> = records
                     .iter()
@@ -421,7 +463,14 @@ impl MemoryV3Store {
                     .into_iter()
                     .filter(|r| r.status != MemoryClaimStatus::Superseded)
                     .collect();
-                active.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                let now = Utc::now();
+                active.sort_by(|a, b| {
+                    retention_score(b, now)
+                        .partial_cmp(&retention_score(a, now))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // 分数相同时退回「谁更新」——保证结果确定，不依赖排序稳定性。
+                        .then_with(|| b.updated_at.cmp(&a.updated_at))
+                });
                 let keep = cfg.memory_v3_records_max.saturating_sub(superseded.len());
                 active.truncate(keep);
                 records = active.into_iter().chain(superseded).collect();
@@ -630,6 +679,8 @@ impl MemoryV3Store {
             task_status: request.task_status,
             task_steps: request.task_steps,
             blocked_reason: request.blocked_reason,
+            access_count: 0,
+            last_accessed_at: None,
         };
         records.push(record.clone());
         crate::serialize::write_json_atomic(&path, &records)?;
@@ -645,11 +696,28 @@ impl MemoryV3Store {
         Ok(record)
     }
 
+    /// 读取单条记忆。命中同样计入访问统计——模型「读过并据此行动」和
+    /// 「搜索命中」对留存价值是同一种信号。
     pub fn read(&self, id: &str) -> Result<Option<MemoryRecord>> {
-        Ok(self
+        let mut found = self
             .all_accessible_records()?
             .into_iter()
-            .find(|record| record.id == id))
+            .find(|record| record.id == id);
+        if let Some(record) = found.as_mut() {
+            let now = now_rfc3339();
+            match self.record_access(&[id.to_string()], &now) {
+                Ok(totals) => {
+                    // `totals` 是**增量日志**里的累计值（自上次 GC 起），records
+                    // 里存的是上次 GC 合并后的基数，两者相加才是真实总次数。
+                    if let Some(delta) = totals.get(id) {
+                        record.access_count = record.access_count.saturating_add(*delta);
+                    }
+                    record.last_accessed_at = Some(now);
+                }
+                Err(error) => tracing::warn!("Memory v3 访问计数写入失败: {error}"),
+            }
+        }
+        Ok(found)
     }
 
     pub fn search(
@@ -674,43 +742,20 @@ impl MemoryV3Store {
 
         let expanded = expanded_query(query, recent_context);
         let query_terms = term_frequencies(&expanded);
-        let document_terms: Vec<HashMap<String, usize>> = records
-            .iter()
-            .map(|record| term_frequencies(&record_search_text(record)))
-            .collect();
-        let average_len = document_terms
-            .iter()
-            .map(|terms| terms.values().sum::<usize>() as f32)
-            .sum::<f32>()
-            / document_terms.len().max(1) as f32;
-        let mut document_frequency: HashMap<&str, usize> = HashMap::new();
-        for term in query_terms.keys() {
-            let count = document_terms
-                .iter()
-                .filter(|terms| terms.contains_key(term))
-                .count();
-            document_frequency.insert(term.as_str(), count);
-        }
+        let search_texts: Vec<String> = records.iter().map(record_search_text).collect();
+        let scorer = Bm25Scorer::new(&search_texts);
 
-        let total_documents = records.len();
         let mut hits = Vec::new();
-        for (record, terms) in records.into_iter().zip(document_terms) {
-            let mut score = 0.0f32;
+        for (doc, (record, search_text)) in records
+            .into_iter()
+            .zip(search_texts.into_iter())
+            .enumerate()
+        {
+            let mut score = scorer.score(doc, &query_terms);
             let mut reasons = Vec::new();
-            let doc_len = terms.values().sum::<usize>() as f32;
-            for (term, query_count) in &query_terms {
-                let tf = *terms.get(term).unwrap_or(&0) as f32;
-                if tf == 0.0 {
-                    continue;
-                }
-                let df = *document_frequency.get(term.as_str()).unwrap_or(&0) as f32;
-                let idf = ((total_documents as f32 - df + 0.5) / (df + 0.5) + 1.0).ln();
-                let denominator = tf + 1.2 * (0.25 + 0.75 * doc_len / average_len.max(1.0));
-                score += idf * (tf * 2.2 / denominator) * (*query_count as f32).sqrt();
-            }
 
             let query_trimmed = query.trim().to_lowercase();
-            let haystack = record_search_text(&record).to_lowercase();
+            let haystack = search_text.to_lowercase();
             if query_trimmed.chars().count() >= 2 && haystack.contains(&query_trimmed) {
                 score += 5.0;
                 reasons.push("exact_phrase".to_string());
@@ -751,7 +796,57 @@ impl MemoryV3Store {
                 .then_with(|| b.record.updated_at.cmp(&a.record.updated_at))
         });
         hits.truncate(limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 50));
+        // 命中的记忆记一次访问：GC 靠这个信号区分「没人写但一直有人查」与
+        // 「刚写过再没人看」。失败只告警——检索结果比统计数据重要得多。
+        let touched: Vec<String> = hits.iter().map(|hit| hit.record.id.clone()).collect();
+        let now = now_rfc3339();
+        match self.record_access(&touched, &now) {
+            Ok(totals) => {
+                for hit in &mut hits {
+                    // 同 `read`：records 里的基数 + 日志增量才是真实次数。
+                    if let Some(delta) = totals.get(&hit.record.id) {
+                        hit.record.access_count = hit.record.access_count.saturating_add(*delta);
+                    }
+                    hit.record.last_accessed_at = Some(now.clone());
+                }
+            }
+            Err(error) => tracing::warn!("Memory v3 访问计数写入失败: {error}"),
+        }
         Ok(hits)
+    }
+
+    /// 累加访问计数，返回**本次调用之后**各 id 在增量日志里的累计值。
+    ///
+    /// 刻意写独立的 `access.json` 增量日志而**不是**直接改 `records.json`：
+    /// 后者是几 MB 的单文件，一次检索命中就整体读+解析+重写一遍，代价与收益
+    /// 完全不成比例。日志在 [`Self::run_gc_unlocked`] 里合并进 records 后清空，
+    /// 而 GC 本来就伴随一次 records 重写。
+    ///
+    /// 返回值是调用方回填 `MemoryRecord.access_count` 的依据：records 里的值
+    /// 停在上次 GC，日志里的增量才是「现在真实的次数」。
+    ///
+    /// `now` 由调用方传入而不是内部取一次：同一批命中必须共享同一个时间戳，
+    /// 否则同一秒内的若干条会因纳秒差异排出无意义的先后。
+    pub fn record_access(&self, ids: &[String], now: &str) -> Result<HashMap<String, u32>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let _guard = self.write_critical();
+        self.record_access_locked(ids, now)
+    }
+
+    fn record_access_locked(&self, ids: &[String], now: &str) -> Result<HashMap<String, u32>> {
+        let path = self.access_log_path();
+        let mut log = load_json_or_default::<HashMap<String, AccessEntry>>(&path)?;
+        let mut totals = HashMap::new();
+        for id in ids {
+            let entry = log.entry(id.clone()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_at = Some(now.to_string());
+            totals.insert(id.clone(), entry.count);
+        }
+        crate::serialize::write_json_atomic(&path, &log)?;
+        Ok(totals)
     }
 
     pub fn context_snapshot(&self, query_context: &str) -> String {
@@ -1388,6 +1483,37 @@ impl MemoryV3Store {
         self.project_dir().join("jobs.json")
     }
 
+    /// 访问计数增量日志。放项目目录而非 base 根：Global scope 的访问也记在
+    /// 「这个项目怎么用全局记忆」的语境下，不同项目各算各的更贴近真实使用强度。
+    fn access_log_path(&self) -> PathBuf {
+        self.project_dir().join("access.json")
+    }
+
+    /// 读取并清空访问日志。
+    ///
+    /// 只在 GC 里调用（GC 持有写锁）。读失败返回空表而不是向上抛：访问统计坏掉
+    /// 不该让 GC 整个跳过——过期与溢出淘汰比统计数据重要。
+    ///
+    /// **不删文件、改写空表**：`access.json` 的存在本身就是「这里有增量待合并」
+    /// 的信号，删了下次 `record_access` 还得重建目录项。
+    fn take_access_log(&self) -> Result<HashMap<String, AccessEntry>> {
+        let path = self.access_log_path();
+        if !path.exists() {
+            return Ok(HashMap::new());
+        }
+        let log = match load_json_or_default::<HashMap<String, AccessEntry>>(&path) {
+            Ok(log) => log,
+            Err(error) => {
+                tracing::warn!("访问日志解析失败，本次跳过合并并重置: {error}");
+                HashMap::new()
+            }
+        };
+        if !log.is_empty() {
+            crate::serialize::write_json_atomic(&path, &HashMap::<String, AccessEntry>::new())?;
+        }
+        Ok(log)
+    }
+
     fn audit_path(&self) -> PathBuf {
         self.project_dir().join("audit.json")
     }
@@ -1854,69 +1980,6 @@ fn is_continuation_query(query: &str) -> bool {
     )
 }
 
-fn term_frequencies(text: &str) -> HashMap<String, usize> {
-    let mut frequencies = HashMap::new();
-    for token in tokenize(text) {
-        *frequencies.entry(token).or_insert(0) += 1;
-    }
-    frequencies
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut ascii = String::new();
-    let mut non_ascii = Vec::new();
-    let flush_ascii = |ascii: &mut String, tokens: &mut Vec<String>| {
-        let token = ascii.trim_matches(['-', '_']).to_lowercase();
-        if token.chars().count() >= 2 {
-            tokens.push(token);
-        }
-        ascii.clear();
-    };
-    let flush_non_ascii = |chars: &mut Vec<char>, tokens: &mut Vec<String>| {
-        if chars.is_empty() {
-            return;
-        }
-        if chars.len() <= 12 {
-            tokens.push(chars.iter().collect::<String>());
-        }
-        for width in 1..=3 {
-            if chars.len() < width {
-                continue;
-            }
-            for window in chars.windows(width) {
-                let token = window.iter().collect::<String>();
-                if width > 1 || !is_cjk_stop_token(&token) {
-                    tokens.push(token);
-                }
-            }
-        }
-        chars.clear();
-    };
-    for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            flush_non_ascii(&mut non_ascii, &mut tokens);
-            ascii.push(ch);
-        } else if !ch.is_ascii() && !ch.is_whitespace() && !ch.is_ascii_punctuation() {
-            flush_ascii(&mut ascii, &mut tokens);
-            non_ascii.push(ch);
-        } else {
-            flush_ascii(&mut ascii, &mut tokens);
-            flush_non_ascii(&mut non_ascii, &mut tokens);
-        }
-    }
-    flush_ascii(&mut ascii, &mut tokens);
-    flush_non_ascii(&mut non_ascii, &mut tokens);
-    tokens
-}
-
-fn is_cjk_stop_token(token: &str) -> bool {
-    matches!(
-        token,
-        "的" | "了" | "是" | "我" | "你" | "再" | "一" | "下" | "和"
-    )
-}
-
 fn record_search_text(record: &MemoryRecord) -> String {
     let kind_terms = match record.kind {
         MemoryClaimKind::Instruction => "instruction rule 指令 规则",
@@ -1984,6 +2047,57 @@ fn recency_boost(record: &MemoryRecord) -> f32 {
         .num_days()
         .max(0) as f32;
     (1.0 - days / 90.0).clamp(0.0, 1.0)
+}
+
+/// 淘汰时的「留存分」：越高越该留下。
+///
+/// 两个维度缺一不可：
+/// - **写入新鲜度**（`updated_at`）：刚写的内容更可能反映当前事实。
+/// - **使用强度**（`access_count` × 最近访问衰减）：被反复检索的记忆在证明它
+///   有用于当前工作流，哪怕很久没被改写。
+///
+/// 权重是 0.30 / 0.70，刻意让使用强度显著压过写入新鲜度。这条比例由
+/// `retention_score_prefers_used_over_merely_recent` 钉住：一条 150 天前写下、
+/// 但被查过 30 次的约定，必须排在一条昨天写下、此后无人问的记录之前。若把
+/// 新鲜度权重提到与使用强度相当，这个断言立刻失败——而这正是修复前
+/// 「只按 updated_at 淘汰」的那个缺陷的翻版。
+///
+/// 权重和恰好为 1，便于把分数读作「留存概率的粗略代理」。
+///
+/// 无访问记录的新记忆拿到的是新鲜度那一半（0.30），高于「一年没动过且没人查」
+/// 的 0 分，低于任何最近被用过的东西——这正是期望行为。
+fn retention_score(record: &MemoryRecord, now: DateTime<Utc>) -> f32 {
+    let freshness = parse_timestamp(&record.updated_at)
+        .ok()
+        .map(|updated| {
+            let days = (now - updated.with_timezone(&Utc)).num_days().max(0) as f32;
+            // 半衰期约 90 天：三个月前的写入仍保留一半权重。
+            (1.0 - days / 180.0).clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.5);
+
+    let usage = if record.access_count == 0 {
+        0.0
+    } else {
+        // 次数用 log 压缩：1 次与 2 次的差别远大于 100 次与 101 次。
+        // 除数是 2.0 而不是 3.0：30 次访问就已经接近饱和，因为 `records_max`
+        // 触顶时绝大多数记录的访问次数是个位数到两位数。
+        let frequency = ((record.access_count as f32) + 1.0).ln() / 10.0_f32.ln() / 2.0;
+        let recency = record
+            .last_accessed_at
+            .as_deref()
+            .and_then(|value| parse_timestamp(value).ok())
+            .map(|last| {
+                let days = (now - last.with_timezone(&Utc)).num_days().max(0) as f32;
+                // 半衰期约 60 天：访问比写入衰减更快，因为「最近谁用过」比
+                // 「什么时候写的」更贴当前工作流。
+                (1.0 - days / 120.0).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0);
+        (frequency.clamp(0.0, 1.0) * recency).clamp(0.0, 1.0)
+    };
+
+    freshness * 0.30 + usage * 0.70
 }
 
 fn is_expired(record: &MemoryRecord) -> bool {
@@ -3039,5 +3153,199 @@ mod tests {
         assert_eq!(marker.schema_version, MEMORY_V3_SCHEMA_VERSION);
         assert!(!marker.reset_at.is_empty());
         let _ = project;
+    }
+
+    // ---- 访问计数与访问加权淘汰 ----
+
+    fn fact_request(title: &str, content: &str) -> MemoryWriteRequest {
+        MemoryWriteRequest {
+            kind: MemoryClaimKind::Fact,
+            scope: MemoryClaimScope::Project,
+            title: title.to_string(),
+            content: content.to_string(),
+            entities: Vec::new(),
+            tags: Vec::new(),
+            source: MemorySource {
+                kind: MemorySourceKind::Tool,
+                locator: format!("tool:{title}"),
+                observed_at: Some("2026-08-20T09:30:00+08:00".to_string()),
+            },
+            evidence: Vec::new(),
+            confidence: 0.9,
+            expires_at: None,
+            supersedes: None,
+            task_status: None,
+            task_steps: Vec::new(),
+            blocked_reason: None,
+        }
+    }
+
+    fn tight_retention(max: usize) -> wyj_config::StorageRetentionCfg {
+        wyj_config::StorageRetentionCfg {
+            memory_v3_records_max: max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn search_bumps_access_log_and_gc_merges_it_into_records() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(fact_request(
+                "构建命令",
+                "cargo build --release 产出 target/release",
+            ))
+            .unwrap();
+        assert_eq!(record.access_count, 0, "新写入不带访问计数");
+
+        let hits = store.search("cargo build", None, None).unwrap();
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].record.access_count, 1, "返回的 hit 应已含本次计数");
+
+        // 增量日志在内存 records 之外，GC 是它落地的时机。
+        store.run_gc().unwrap();
+        let reloaded = store.read(&record.id).unwrap().unwrap();
+        // read 本身也会 +1，所以这里是 1（GC 合并）+ 1（本次 read）。
+        assert_eq!(reloaded.access_count, 2);
+        assert!(reloaded.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn read_is_counted_as_an_access() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(fact_request("端口", "默认监听 127.0.0.1:61337"))
+            .unwrap();
+        store.read(&record.id).unwrap().unwrap();
+        store.read(&record.id).unwrap().unwrap();
+        let after = store.read(&record.id).unwrap().unwrap();
+        // 三次 read 都在返回前把本次算进去，所以第三次看到的是 2 + 1 = 3。
+        assert_eq!(after.access_count, 3);
+    }
+
+    /// 核心回归钉子：**「很久没写但一直被查」不该先于「刚写过但没人看」被淘汰**。
+    ///
+    /// 修复前 GC 只按 `updated_at` 降序截断，一条三个月前写下、但每次开工都被
+    /// 检索到的项目事实，会先于一条昨天随手写下、此后再无人问的记录被丢掉。
+    #[test]
+    fn gc_keeps_frequently_accessed_record_over_newer_untouched_one() {
+        let (_base, _project, store) = store();
+        let mut store = store;
+        store = store.with_storage_retention(tight_retention(2));
+
+        // 老记录：写入时间往前拨 120 天，但被反复访问。
+        let mut old = store
+            .upsert(fact_request("老约定", "测试必须用 pytest -q"))
+            .unwrap();
+        old.updated_at = (Utc::now() - Duration::days(120)).to_rfc3339();
+        old.access_count = 40;
+        old.last_accessed_at = Some(Utc::now().to_rfc3339());
+        let path = store.project_records_path();
+        let mut records: Vec<MemoryRecord> = load_json_or_default(&path).unwrap();
+        for record in &mut records {
+            if record.id == old.id {
+                *record = old.clone();
+            }
+        }
+        crate::serialize::write_json_atomic(&path, &records).unwrap();
+
+        // 新记录：昨天写，从没被访问过。
+        let mut fresh = store
+            .upsert(fact_request("临时笔记", "看一眼的随手记录"))
+            .unwrap();
+        fresh.updated_at = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let path = store.project_records_path();
+        let mut records: Vec<MemoryRecord> = load_json_or_default(&path).unwrap();
+        for record in &mut records {
+            if record.id == fresh.id {
+                *record = fresh.clone();
+            }
+        }
+        crate::serialize::write_json_atomic(&path, &records).unwrap();
+
+        // 第三条把库顶到 cap：淘汰时必须留下「被用了 40 次的老约定」。
+        store
+            .upsert(fact_request("第三条", "凑数用，两个老记录争一个位置"))
+            .unwrap();
+
+        let survivors: Vec<String> = store
+            .all_accessible_records()
+            .unwrap()
+            .into_iter()
+            .map(|record| record.title)
+            .collect();
+        assert!(
+            survivors.contains(&"老约定".to_string()),
+            "被反复访问的记忆不该被写入时间淘汰：{survivors:?}"
+        );
+        assert!(
+            !survivors.contains(&"临时笔记".to_string()),
+            "近期写入但从未被使用、且老化到无分量的记录应先出局：{survivors:?}"
+        );
+    }
+
+    #[test]
+    fn retention_score_prefers_used_over_merely_recent() {
+        let now = Utc::now();
+        let mut used = fact_record("used");
+        used.updated_at = (now - Duration::days(150)).to_rfc3339();
+        used.access_count = 30;
+        used.last_accessed_at = Some(now.to_rfc3339());
+
+        let mut recent = fact_record("recent");
+        recent.updated_at = (now - Duration::days(1)).to_rfc3339();
+        recent.access_count = 0;
+
+        assert!(
+            retention_score(&used, now) > retention_score(&recent, now),
+            "使用强度应压过单纯的写入新鲜度"
+        );
+    }
+
+    #[test]
+    fn retention_score_never_goes_negative_for_ancient_records() {
+        let now = Utc::now();
+        let mut ancient = fact_record("ancient");
+        ancient.updated_at = (now - Duration::days(3650)).to_rfc3339();
+        ancient.access_count = 3;
+        ancient.last_accessed_at = Some((now - Duration::days(3650)).to_rfc3339());
+        let score = retention_score(&ancient, now);
+        assert!(
+            (0.0..=1.1).contains(&score),
+            "留存分必须落在 [0, 1] 附近，实得 {score}"
+        );
+    }
+
+    /// 构造一条最小可用记录，专供 `retention_score` 这类纯函数测试。
+    fn fact_record(title: &str) -> MemoryRecord {
+        MemoryRecord {
+            schema_version: MEMORY_V3_SCHEMA_VERSION,
+            id: format!("mem_{title}"),
+            kind: MemoryClaimKind::Fact,
+            scope: MemoryClaimScope::Project,
+            scope_key: "test".to_string(),
+            title: title.to_string(),
+            content: String::new(),
+            entities: Vec::new(),
+            tags: Vec::new(),
+            source: MemorySource {
+                kind: MemorySourceKind::Tool,
+                locator: "test".to_string(),
+                observed_at: None,
+            },
+            evidence: Vec::new(),
+            confidence: 1.0,
+            status: MemoryClaimStatus::Active,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+            expires_at: None,
+            supersedes: None,
+            superseded_by: None,
+            task_status: None,
+            task_steps: Vec::new(),
+            blocked_reason: None,
+            access_count: 0,
+            last_accessed_at: None,
+        }
     }
 }
