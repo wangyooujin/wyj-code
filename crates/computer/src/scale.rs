@@ -21,23 +21,58 @@ pub fn fit_within(width: u32, height: u32, max_dim: u32) -> (u32, u32) {
     (w, h)
 }
 
-/// 把一个可能越界/坐标颠倒的矩形 `[x0, y0, x1, y1)` 钳制到 `width x height`
-/// 的屏幕边界内，返回 `(clamped_x0, clamped_y0, crop_width, crop_height)`；
-/// 裁剪结果至少 1x1，避免退化成空矩形。`capture_region`（zoom 动作）用它
-/// 决定实际要截取的物理像素范围。
+/// 一个显示器在全局逻辑坐标系里的位置与尺寸。
+///
+/// 原点可以是**负数**：macOS 允许多显示器任意排布，副屏放在主屏左侧或
+/// 上方时原点就是负的。旧实现把裁剪矩形硬钳到 `[0, width)`，副屏在左侧时
+/// 整块区域被压成 0 宽——不是报错，是静默返回一张 1x1 的图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayBounds {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl DisplayBounds {
+    pub fn right(&self) -> i32 {
+        self.x.saturating_add(self.width as i32)
+    }
+
+    pub fn bottom(&self) -> i32 {
+        self.y.saturating_add(self.height as i32)
+    }
+
+    /// 全局逻辑坐标点是否落在这块显示器内（含左上边界、不含右下边界，
+    /// 与 `clamp_region` 的半开区间语义一致）。
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.right() && y >= self.y && y < self.bottom()
+    }
+}
+
+/// 把一个可能越界/坐标颠倒的矩形 `[x0, y0, x1, y1)`（**全局逻辑坐标**）
+/// 钳制到显示器 `bounds` 内，返回 `(clamped_x0, clamped_y0, crop_width,
+/// crop_height)`——前两项是**全局**坐标，调用方要减去 `bounds.x/y` 才是
+/// 显示器内的偏移。
+///
+/// 裁剪结果至少 1x1，避免退化成空矩形。支持负原点（副屏在左/上方）。
 pub fn clamp_region(
     x0: i32,
     y0: i32,
     x1: i32,
     y1: i32,
-    width: u32,
-    height: u32,
-) -> (u32, u32, u32, u32) {
-    let cx0 = x0.clamp(0, width.saturating_sub(1) as i32) as u32;
-    let cy0 = y0.clamp(0, height.saturating_sub(1) as i32) as u32;
-    let cx1 = x1.clamp(cx0 as i32 + 1, width as i32) as u32;
-    let cy1 = y1.clamp(cy0 as i32 + 1, height as i32) as u32;
-    (cx0, cy0, cx1 - cx0, cy1 - cy0)
+    bounds: DisplayBounds,
+) -> (i32, i32, u32, u32) {
+    let cx0 = x0.clamp(bounds.x, bounds.right().saturating_sub(1));
+    let cy0 = y0.clamp(bounds.y, bounds.bottom().saturating_sub(1));
+    let cx1 = x1.clamp(cx0.saturating_add(1), bounds.right());
+    let cy1 = y1.clamp(cy0.saturating_add(1), bounds.bottom());
+    (
+        cx0,
+        cy0,
+        (cx1 - cx0).max(1) as u32,
+        (cy1 - cy0).max(1) as u32,
+    )
 }
 
 /// 把一个已经在"点"（逻辑坐标系，即 `Monitor::width()/height()` 这类 macOS
@@ -219,10 +254,30 @@ mod tests {
         );
     }
 
+    /// 主屏（原点 0,0，1920x1080）：现有行为的基线。
+    fn primary() -> DisplayBounds {
+        DisplayBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }
+    }
+
+    /// 副屏放在主屏**左侧**：原点是负的。这是旧实现完全失效的场景。
+    fn left_secondary() -> DisplayBounds {
+        DisplayBounds {
+            x: -1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }
+    }
+
     #[test]
     fn clamp_region_passes_through_a_valid_rect() {
         assert_eq!(
-            clamp_region(100, 200, 400, 500, 1920, 1080),
+            clamp_region(100, 200, 400, 500, primary()),
             (100, 200, 300, 300)
         );
     }
@@ -231,8 +286,23 @@ mod tests {
     fn clamp_region_clamps_negative_and_overflowing_corners() {
         // 左上角越界到负数、右下角越界超出屏幕
         assert_eq!(
-            clamp_region(-50, -50, 3000, 3000, 1920, 1080),
+            clamp_region(-50, -50, 3000, 3000, primary()),
             (0, 0, 1920, 1080)
+        );
+    }
+
+    /// 副屏在左侧：负坐标是**合法**的，必须原样保留而不是钳到 0。
+    /// 旧实现会把整块区域压成 1x1，静默返回错误内容。
+    #[test]
+    fn clamp_region_supports_displays_with_negative_origin() {
+        assert_eq!(
+            clamp_region(-1800, 100, -1700, 200, left_secondary()),
+            (-1800, 100, 100, 100)
+        );
+        // 矩形完全落在副屏外（在主屏范围内）时，钳到副屏边界。
+        assert_eq!(
+            clamp_region(0, 100, 200, 200, left_secondary()),
+            (-1, 100, 1, 100)
         );
     }
 
@@ -241,11 +311,11 @@ mod tests {
         // 两角重合、或颠倒（x1<x0/y1<y0），仍应给出锚定在 (x0,y0) 的至少 1x1
         // 裁剪区域，不会因为反向区间导致 panic 或空矩形
         assert_eq!(
-            clamp_region(500, 500, 500, 500, 1920, 1080),
+            clamp_region(500, 500, 500, 500, primary()),
             (500, 500, 1, 1)
         );
         assert_eq!(
-            clamp_region(500, 500, 100, 100, 1920, 1080),
+            clamp_region(500, 500, 100, 100, primary()),
             (500, 500, 1, 1)
         );
     }
@@ -253,9 +323,22 @@ mod tests {
     #[test]
     fn clamp_region_handles_corner_at_screen_edge() {
         assert_eq!(
-            clamp_region(1900, 1060, 1920, 1080, 1920, 1080),
+            clamp_region(1900, 1060, 1920, 1080, primary()),
             (1900, 1060, 20, 20)
         );
+    }
+
+    #[test]
+    fn display_bounds_containment_is_half_open() {
+        let bounds = left_secondary();
+        // 左上边界含、右下边界不含（与 clamp_region 的半开区间一致）。
+        assert!(bounds.contains(-1920, 0));
+        assert!(bounds.contains(-1, 1079));
+        assert!(!bounds.contains(0, 0), "x=0 已属于主屏");
+        assert!(!bounds.contains(-1920, 1080));
+        assert!(!bounds.contains(-1921, 0));
+        assert_eq!(bounds.right(), 0);
+        assert_eq!(bounds.bottom(), 1080);
     }
 
     #[test]

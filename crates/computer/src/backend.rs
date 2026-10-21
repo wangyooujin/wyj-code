@@ -17,6 +17,40 @@ fn primary_monitor() -> Result<Monitor> {
         .ok_or_else(|| anyhow!("未检测到任何显示器"))
 }
 
+fn to_bounds(monitor: &Monitor) -> Result<scale::DisplayBounds> {
+    Ok(scale::DisplayBounds {
+        x: monitor.x().context("读取显示器 x 失败")?,
+        y: monitor.y().context("读取显示器 y 失败")?,
+        width: monitor.width().context("读取显示器宽度失败")?,
+        height: monitor.height().context("读取显示器高度失败")?,
+    })
+}
+
+/// 所有显示器在**全局逻辑坐标系**里的位置与尺寸（含负原点）。
+///
+/// 只用于诊断与区域截图的定位；截取主屏仍走 [`primary_monitor`]。
+pub fn displays() -> Result<Vec<scale::DisplayBounds>> {
+    Monitor::all()
+        .context("枚举显示器失败")?
+        .iter()
+        .map(to_bounds)
+        .collect()
+}
+
+/// 找出包含全局逻辑坐标 `(x, y)` 的显示器。
+///
+/// 多显示器下「截取区域」必须知道区域落在**哪块**屏上：旧实现一律截主屏，
+/// 于是副屏上的坐标会被钳到主屏边界，静默返回错误内容。
+pub fn display_containing(x: i32, y: i32) -> Result<Option<(Monitor, scale::DisplayBounds)>> {
+    for monitor in Monitor::all().context("枚举显示器失败")? {
+        let bounds = to_bounds(&monitor)?;
+        if bounds.contains(x, y) {
+            return Ok(Some((monitor, bounds)));
+        }
+    }
+    Ok(None)
+}
+
 pub fn primary_display_size() -> Result<DisplaySize> {
     let m = primary_monitor()?;
     Ok(DisplaySize {
@@ -72,11 +106,14 @@ pub fn capture_primary(max_dim: u32) -> Result<Capture> {
     encode_capture(img, physical_width, physical_height, max_dim)
 }
 
-/// 截取主显示器后裁剪到"点"坐标系（`Monitor::width()/height()`/点击坐标系）
-/// 下的矩形 `[x0, y0, x1, y1)`，自动钳制到屏幕边界，只在裁剪结果仍超过
-/// `max_dim` 时才下采样——多数"放大看细节"的场景裁剪区域本就远小于
+/// 截取**包含给定全局逻辑矩形的那块显示器**，再裁剪到该矩形，只在裁剪结果
+/// 仍超过 `max_dim` 时才下采样——多数"放大看细节"的场景裁剪区域本就远小于
 /// `max_dim`，因此能拿到比全屏缩略图高得多的有效分辨率，用于看清小字/
 /// 密集数字表格（zoom 动作，见 `tools::computer::ComputerTool`）。
+///
+/// **多显示器**：矩形可以落在任意一块屏上（原点允许为负）。旧实现一律截
+/// 主屏，副屏上的坐标会被 `clamp_region` 压到主屏边界，静默返回错误内容。
+/// 这里先按矩形中心找到目标显示器；中心不在任何屏上时退回主屏。
 ///
 /// **Retina/HiDPI 换算**：入参 `x0..y1` 是"点"坐标系（与点击坐标系一致，
 /// 由 `CoordScaler::to_physical` 产出），但截图 API 返回的是原生像素图
@@ -85,20 +122,31 @@ pub fn capture_primary(max_dim: u32) -> Result<Capture> {
 /// 先按"点"坐标系钳制，再用 [`scale::scale_region_to_pixels`] 换算成像素
 /// 坐标系后才裁剪，从根上避免这个问题。
 pub fn capture_region(x0: i32, y0: i32, x1: i32, y1: i32, max_dim: u32) -> Result<Capture> {
-    let m = primary_monitor()?;
-    let logical_width = m.width().context("读取显示器宽度失败")?;
-    let logical_height = m.height().context("读取显示器高度失败")?;
+    // 用矩形中心定位显示器：跨屏矩形没有唯一归属，中心是最稳定的近似。
+    let centre_x = x0.saturating_add((x1 - x0) / 2);
+    let centre_y = y0.saturating_add((y1 - y0) / 2);
+    let (m, bounds) = match display_containing(centre_x, centre_y)? {
+        Some(found) => found,
+        None => {
+            let m = primary_monitor()?;
+            let bounds = to_bounds(&m)?;
+            (m, bounds)
+        }
+    };
+
     let rgba = m
         .capture_image()
         .context("截图失败（macOS 需授予屏幕录制权限）")?;
     let img = DynamicImage::ImageRgba8(rgba);
     let (pixel_width, pixel_height) = (img.width(), img.height());
 
-    let (cx0, cy0, crop_w, crop_h) =
-        scale::clamp_region(x0, y0, x1, y1, logical_width, logical_height);
+    // 钳制结果是**全局**坐标；减掉显示器原点才是图内偏移。
+    let (cx0, cy0, crop_w, crop_h) = scale::clamp_region(x0, y0, x1, y1, bounds);
+    let local_x = (cx0 - bounds.x).max(0) as u32;
+    let local_y = (cy0 - bounds.y).max(0) as u32;
     let (px_x0, px_y0, px_w, px_h) = scale::scale_region_to_pixels(
-        (cx0, cy0, crop_w, crop_h),
-        (logical_width, logical_height),
+        (local_x, local_y, crop_w, crop_h),
+        (bounds.width, bounds.height),
         (pixel_width, pixel_height),
     );
 

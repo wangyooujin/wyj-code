@@ -147,6 +147,30 @@ pub fn key(pid: u32, combo: &str) -> Result<()> {
     validate_focus_unchanged(before)
 }
 
+/// 向目标进程投递 `cmd+V`，让它把剪贴板内容粘贴进当前焦点控件。
+///
+/// # 为什么这条路径是必要的
+///
+/// 逐字符投递（[`type_char`]）对非 ASCII 文字必然失败，而 AX 写入对自绘应用
+/// 也必然失败——两条路都不通时，中文输入就成了死胡同。粘贴绕开了「合成每个
+/// 字符」这个方向：它是应用层的语义动作，不关心内容是什么文字，因此中文、
+/// 日文、emoji 全都走同一条路。
+///
+/// # 调用方必须先写好剪贴板
+///
+/// 本函数**只负责发按键**，不碰剪贴板。写入与恢复由
+/// [`crate::clipboard::ClipboardGuard`] 负责——那个守卫保证用户的剪贴板
+/// 在动作结束后复原，是这条路径能成立的前提。
+///
+/// # 为什么还要求前台 PID 不变
+///
+/// 键盘事件虽然直达目标 PID，但 `cmd+V` 的「粘贴」由目标进程自己处理；
+/// 如果这几毫秒里前台换了人，说明有第三方在抢，此时目标进程的焦点控件可能
+/// 已经不是调用方以为的那个。
+pub fn paste(pid: u32) -> Result<()> {
+    key(pid, "cmd+v")
+}
+
 /// 逐字符向目标进程投递按键。
 ///
 /// **只支持 ASCII 可打印字符**。中文、日文等非拉丁文字**无法**用这种方式
@@ -288,6 +312,18 @@ mod tests {
         assert!(parse_key("cmd+not-a-key+s").is_err());
         assert!(parse_key("a+b").is_err());
         assert!(parse_key("cmd+shift").is_err());
+    }
+
+    /// 剪贴板粘贴依赖 `cmd+v` 能被解析成「带 Command 修饰的 V」。
+    /// 这条解析一旦漂移，中文输入整条通道会静默失效——`paste()` 内部就是
+    /// `key(pid, "cmd+v")`，没有第二处可回退的定义。
+    #[test]
+    fn paste_combo_resolves_to_command_v() {
+        let (code, flags) = parse_key("cmd+v").unwrap();
+        // ANSI 布局里 V 是 keycode 9。
+        assert_eq!(code, 9);
+        assert!(flags.contains(CGEventFlags::MaskCommand));
+        assert!(!flags.contains(CGEventFlags::MaskShift));
     }
 
     /// 字母与数字的键位映射是后台输入的基础：错了就是「点了搜索框但搜的是别的

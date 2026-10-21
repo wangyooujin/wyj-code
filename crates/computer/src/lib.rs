@@ -9,11 +9,14 @@
 pub mod accessibility;
 pub mod activity;
 #[cfg(target_os = "macos")]
+pub mod clipboard;
+#[cfg(target_os = "macos")]
 pub mod cursor_click;
 #[cfg(target_os = "macos")]
 pub mod element;
 #[cfg(target_os = "macos")]
 pub mod menu;
+pub mod occlusion;
 pub mod scale;
 pub mod target;
 #[cfg(target_os = "macos")]
@@ -85,11 +88,19 @@ pub fn capture_primary(max_dim: u32) -> Result<Capture> {
     imp::capture_primary(max_dim)
 }
 
-/// 截取主显示器后裁剪到物理像素矩形 `[x0, y0, x1, y1)`（自动钳制到屏幕边界）；
-/// 只在裁剪结果仍超过 `max_dim` 时才下采样。用于"放大看细节"（zoom 动作）——
-/// 裁剪区域通常远小于整屏，因此能拿到比全屏缩略图高得多的有效分辨率。
+/// 截取包含给定全局逻辑矩形的那块显示器，再裁剪到该矩形（自动钳制到该
+/// 显示器的边界）；只在裁剪结果仍超过 `max_dim` 时才下采样。用于"放大看
+/// 细节"（zoom 动作）——裁剪区域通常远小于整屏，因此能拿到比全屏缩略图
+/// 高得多的有效分辨率。
+///
+/// 多显示器：矩形可以落在任意一块屏上（原点允许为负）。
 pub fn capture_region(x0: i32, y0: i32, x1: i32, y1: i32, max_dim: u32) -> Result<Capture> {
     imp::capture_region(x0, y0, x1, y1, max_dim)
+}
+
+/// 所有显示器在全局逻辑坐标系里的位置与尺寸（含负原点）。
+pub fn displays() -> Result<Vec<scale::DisplayBounds>> {
+    imp::displays()
 }
 
 /// 按窗口标题/所属 App 名称（不区分大小写，包含匹配）查找一个未最小化的
