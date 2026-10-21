@@ -149,7 +149,7 @@ pub struct Session {
     pub current_checkpoint_id: Option<String>,
     pub branch_parent_session_id: Option<String>,
     pub branch_parent_checkpoint_id: Option<String>,
-    /// 本会话临时使用的分组名（`/model` 面板里「仅本会话使用」）。
+    /// 本会话临时使用的分组名（`/profile` 面板里「仅本会话使用」）。
     ///
     /// 与 `Config.active_profile` 是**两个不同的东西**：后者是写进
     /// `~/.wyj-code/config.toml` 的全局默认值，改了会影响下次启动和其它项目；
@@ -160,6 +160,18 @@ pub struct Session {
     /// 仍以 `config.toml` 为唯一事实来源，避免会话文件里留下一份会漂移的副本。
     /// 分组被改名或删除时，恢复侧按「找不到就回落全局」处理。
     pub session_profile: Option<String>,
+    /// 本会话的思考强度档位（`/effort` 设置）。
+    ///
+    /// **随会话落盘**，`--resume` 后继续生效——思考档位是「这个任务要想
+    /// 多深」的工作状态，换个任务就该换档，不该每次都重设一遍。
+    ///
+    /// 但它**不写 `config.toml`**：档位属于「这次对话怎么跑」，不属于
+    /// 「这个分组是什么端点」。
+    ///
+    /// 取值是档位名（`low` / `medium` / `high` / `xhigh` / `max` /
+    /// `adaptive`）或特殊的 `"off"`（彻底关思考）。`None` = 跟随分组里
+    /// 配的 `reasoning_effort`。
+    pub session_effort: Option<String>,
     /// 最近一次请求实际发出的 system prompt 指纹（见
     /// [`crate::prompt_fingerprint`]）。
     ///
@@ -415,6 +427,8 @@ impl Session {
         // 同理：会话级分组是「这个会话跑在哪套端点上」，不是对话内容。
         // `/clear` 只清消息，不该顺手把用户刚选的会话级模型丢掉。
         let session_profile = self.session_profile.clone();
+        // 思考档位同理：它是「这次对话要想多深」，换话题不代表要换档。
+        let session_effort = self.session_effort.clone();
         // 估算校准系数与「端点拒绝过」的实测窗口同样描述运行环境：这轮踩过的
         // 坑（估算偏低 / 配置窗口填大了）不会因为换了个话题就消失，清掉等于
         // 让新对话从头再失准一遍。
@@ -426,6 +440,7 @@ impl Session {
             branch_parent_checkpoint_id,
             prompt_cache_state,
             session_profile,
+            session_effort,
             input_estimate_ratio,
             overflow_window_hint,
             ..Self::default()
@@ -661,6 +676,7 @@ impl Session {
         self.compact_count = file.compact_count;
         self.context_edit_freed_tokens = file.context_edit_freed_tokens;
         self.session_profile = file.session_profile.clone();
+        self.session_effort = file.session_effort.clone();
         self.routing_events = file.routing_events.clone();
         self.current_checkpoint_id = file.current_checkpoint_id.clone();
         self.branch_parent_session_id = file.branch_parent_session_id.clone();

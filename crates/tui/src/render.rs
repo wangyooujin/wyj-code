@@ -15,11 +15,11 @@ use dialogs::*;
 
 use crate::app::{
     fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
-    AskQuestionStage, Attachment, ChatMessage, EvolutionDialog, EvolutionRow,
+    AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EvolutionDialog, EvolutionRow,
     ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
-    McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, PermissionDialog,
-    PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab, ProfileDialog,
-    ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
+    McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog,
+    PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
+    ProfileDialog, ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
     ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState,
     SettingsDialog, SettingsFieldKind, SettingsInputField, SkillsBrowseSource, SkillsDialog,
     SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
@@ -763,6 +763,16 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         draw_schedule_dialog(f, dialog, state.input_owner, area);
     }
 
+    // 模型选择面板叠加在最顶层（/model）
+    if let Some(dialog) = &state.model_picker {
+        draw_model_picker(f, dialog, area);
+    }
+
+    // 思考强度面板叠加在最顶层（/effort）
+    if let Some(dialog) = &state.effort_picker {
+        draw_effort_picker(f, dialog, area);
+    }
+
     // 所有浮层都完成后再扫描最终 Buffer，避免被面板覆盖的聊天链接仍落在坐标表中。
     // backend 会在 Buffer diff 之后注入 OSC 8，不影响这里的宽度与换行计算。
     crate::hyperlink::linkify_buffer(
@@ -1447,10 +1457,34 @@ fn render_chat_message(
             } else {
                 ("  ⚙ ", Theme::info())
             };
-            lines.push(Line::from(vec![
-                Span::styled(marker, style),
-                Span::styled(msg.content.clone(), style),
-            ]));
+            // System 通知**不走 markdown**（它不是 markdown 文本），但仍需要
+            // 中文友好的折行。直接丢给 `Paragraph::wrap` 的 `WordWrapper` 会在
+            // 空格处断行，而中文段落几乎没有空格——它会一路撑到接近行尾再折
+            // 回来，把词组拦腰截断（实测「…由本地规则 +」/「模型分类器在执行前
+            // 判定…」），`Shift+Tab` 也会被拆成 `Shift+` / `Tab`。
+            //
+            // 这里复用 markdown 的折行引擎（`wrap_plain_text_spans`）：宽字符
+            // 逐字可断、ASCII 词整词不断，并遵守中文排版禁则。
+            //
+            // 标记 `  ⚙ ` 占 4 列（2 空格 + ⚙ 2 列 + 空格），首行可用宽度相应
+            // 减 4；续行不重复标记，直接顶格（与 markdown 段落续行同款）。
+            let marker_width = char_display_width('⚙') + 3; // ⚙(2) + 前导 2 空格 + 后随 1 空格
+            let first_avail = max_content_width.saturating_sub(marker_width).max(1);
+            let mut wrapped = crate::markdown::wrap_plain_text_spans(
+                &[(msg.content.clone(), style)],
+                first_avail,
+            );
+            if wrapped.is_empty() {
+                wrapped.push(Vec::new());
+            }
+            for (i, line) in wrapped.into_iter().enumerate() {
+                let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.len() + 1);
+                if i == 0 {
+                    spans.push(Span::styled(marker, style));
+                }
+                spans.extend(line.into_iter().map(|(text, s)| Span::styled(text, s)));
+                lines.push(Line::from(spans));
+            }
         }
         MessageRole::Preformatted => {
             // 逐行原样渲染：换行是排版的一部分，折行会毁掉列对齐。
@@ -1930,18 +1964,11 @@ fn render_collapsed_diff_preview(
 
 /// 渲染欢迎页所有行。供 [`build_pending_chat_lines`] 与高度测量复用，避免两处
 /// `WelcomeContext` 构造 drift。
+///
+/// 欢迎页只承载「品牌 + 操作提示」：model / cwd 由状态栏常驻，示例提问引导
+/// 与输入框重复，都不进欢迎页。
 pub(crate) fn welcome_lines(state: &AppState, max_content_width: usize) -> Vec<Line<'static>> {
     let ctx = crate::welcome::WelcomeContext {
-        model: state.model_name.clone(),
-        cwd: shorten_home_path(&state.cwd.display().to_string()),
-        profile: {
-            let p = &state.config.active_profile;
-            if p == "default" {
-                None
-            } else {
-                Some(p.clone())
-            }
-        },
         tip_index: state.welcome_tip_idx,
     };
     crate::welcome::render_welcome(&ctx, max_content_width as u16)
@@ -2516,6 +2543,11 @@ pub fn chat_content_width(frame_width: u16) -> usize {
 ///
 /// 只有 System 通知、工具标题、Preformatted 这类不参与 markdown 折行的
 /// 超宽内容才会真正走到 `WordWrapper`，每帧也就那么几行。
+///
+/// System 通知原本也在这里被折（它整段塞进一个 span，交给 `WordWrapper`，
+/// 而 `WordWrapper` 只在空格处断行——中文段落几乎没有空格，会把词组拦腰
+/// 截断）。现在 System 消息在**渲染期**就用 markdown 的折行引擎折好了
+/// （`markdown::wrap_plain_text_spans`），不再流到这里。
 fn logical_line_height(line: &Line<'_>, width: u16) -> usize {
     let width = width.max(1);
     if line.width() <= width as usize {
@@ -3811,15 +3843,10 @@ fn status_bar_layout(
 }
 
 fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
-    let cwd_str = {
-        let full = state.cwd.display().to_string();
-        let home = std::env::var("HOME").unwrap_or_default();
-        if !home.is_empty() && full.starts_with(&home) {
-            format!("~{}", &full[home.len()..])
-        } else {
-            full
-        }
-    };
+    // cwd 缩短复用 `dialogs::shorten_home_path`（同一份实现）：此前这里内联了
+    // 一份完全相同的拷贝，两处各自维护 `$HOME` 前缀规则，改一处忘另一处
+    // 就会出现「状态栏显示 ~/x、对话框显示 /Users/x」的不一致。
+    let cwd_str = shorten_home_path(&state.cwd.display().to_string());
 
     let (right_help, right_style) = if !state.pending_queue.is_empty() {
         (
@@ -3876,9 +3903,45 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     // （排队 / Ctrl+C 待确认，只在特定时刻出现）先占预算，cwd 吃剩下的、超出就省略号
     // 截断，**连 2 列都分不出时整段留空**——半截路径比没有路径更难认。
     let disp_w = |s: &str| s.chars().map(char_display_width).sum::<usize>();
-    // " ◆ " + 模型名 + 会话标签 + " {chip}" + " · "，末尾另留 1 列给尾部空格
-    let left_fixed =
-        3 + disp_w(&state.model_name) + disp_w(&session_tag) + 1 + disp_w(chip_text) + 3;
+    // 思考档位段：会话级 `/effort` 覆盖优先，否则用分组里配的 `reasoning_effort`。
+    //
+    // **两种情况整段不显示**：
+    // 1. 用户从没设过档位（会话级 None 且分组也没配）——没设过的东西不该占地方；
+    // 2. 当前端点根本不认 effort（`effort_levels` 为空，如 GLM 只认开关）——
+    //    这时显示一个永远发不出去的值是纯误导。
+    let effort_text = state
+        .session_effort_active()
+        .map(|level| level.to_string())
+        .or_else(|| {
+            state
+                .effective_config()
+                .active_profile()
+                .reasoning_effort
+                .clone()
+        })
+        .filter(|level| !level.trim().is_empty());
+    // 端点是否认档位：用能力表判（与 provider 序列化请求体同一张表）。
+    let effort_supported = effort_text.as_deref().map(|level| {
+        if level == "off" {
+            // 「关闭思考」是开关不是档位，任何支持思考的端点都认。
+            return true;
+        }
+        let cfg = state.effective_config();
+        let (levels, _) = crate::app::resolve_effort_choices(&cfg, &state.model_name);
+        levels.iter().any(|l| l == level)
+    });
+    let effort_segment = match (effort_text.as_deref(), effort_supported) {
+        (Some(level), Some(true)) => format!("{level} "),
+        _ => String::new(),
+    };
+    // " ◆ " + 模型名 + 会话标签 + " {chip}" + " · " + effort 段，末尾另留 1 列给尾部空格
+    let left_fixed = 3
+        + disp_w(&state.model_name)
+        + disp_w(&session_tag)
+        + 1
+        + disp_w(chip_text)
+        + 3
+        + disp_w(&effort_segment);
     let (cwd_display, keep_right) = status_bar_layout(
         area.width as usize,
         left_fixed,
@@ -3887,8 +3950,8 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     );
     let right_len = if keep_right { disp_w(&right_help) } else { 0 };
     let left_text = format!(
-        " ◆ {}{} {} · {}",
-        state.model_name, session_tag, chip_text, cwd_display
+        " ◆ {}{} {} · {}{}",
+        state.model_name, session_tag, chip_text, effort_segment, cwd_display
     );
 
     let pad = (area.width as usize).saturating_sub(disp_w(&left_text) + right_len + 1);
@@ -3919,6 +3982,10 @@ fn draw_status(f: &mut Frame, state: &AppState, area: Rect) {
     }
     spans.push(Span::styled(format!(" {chip_text}"), chip_style));
     spans.push(Span::styled(" · ".to_string(), Theme::dim()));
+    if !effort_segment.is_empty() {
+        // 思考档位与模型名同档（dim）：它是模型的一个属性，不是另一条状态。
+        spans.push(Span::styled(effort_segment, Theme::dim()));
+    }
     spans.push(Span::styled(cwd_display, Theme::dim()));
     spans.push(Span::raw(" ".repeat(pad)));
     if keep_right {
@@ -4924,10 +4991,12 @@ mod tool_result_fold_tests {
             })
             .collect::<Vec<_>>();
 
+        // 锚点用版本号行：logo 每字符一个 span（渐变着色），拼出来的
+        // 单行文本里 "WYJ-CODE" 并不连续，按子串找会落空。
         let welcome_idx = rendered
             .iter()
-            .position(|line| line.contains("test-model"))
-            .expect("welcome model line should be present");
+            .position(|line| line.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))))
+            .expect("welcome version line should be present");
         let system_idx = rendered
             .iter()
             .position(|line| line.contains("MCP connected"))
@@ -4954,10 +5023,12 @@ mod tool_result_fold_tests {
             })
             .collect::<Vec<_>>();
 
+        // 锚点用版本号行：logo 每字符一个 span（渐变着色），拼出来的
+        // 单行文本里 "WYJ-CODE" 并不连续，按子串找会落空。
         let welcome_idx = rendered
             .iter()
-            .position(|line| line.contains("test-model"))
-            .expect("welcome model line should be present");
+            .position(|line| line.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))))
+            .expect("welcome version line should be present");
         let user_idx = rendered
             .iter()
             .position(|line| line.contains("hello"))
@@ -4983,10 +5054,12 @@ mod tool_result_fold_tests {
             })
             .collect::<Vec<_>>();
 
+        // 锚点用版本号行：logo 每字符一个 span（渐变着色），拼出来的
+        // 单行文本里 "WYJ-CODE" 并不连续，按子串找会落空。
         let welcome_idx = rendered
             .iter()
-            .position(|line| line.contains("test-model"))
-            .expect("welcome model line should be present");
+            .position(|line| line.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))))
+            .expect("welcome version line should be present");
         let user_idx = rendered
             .iter()
             .position(|line| line.contains("hello"))
@@ -7068,6 +7141,80 @@ fn foo() {}
         );
     }
 
+    /// 状态栏的思考档位段：**设了就显示，没设就不显示**。
+    ///
+    /// 两种「不显示」必须区分开：
+    /// 1. 用户从没设过档位 → 不显示（没设过的东西不该占状态栏的地方）；
+    /// 2. 端点根本不认 effort → 不显示（显示一个永远发不出去的值是误导）。
+    ///
+    /// 位置在 cwd **前**（`◆ model [auto] · high ~/proj`）。
+    #[test]
+    fn status_bar_shows_the_thinking_level_only_when_it_is_in_effect() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        fn status_line(mutate: impl Fn(&mut AppState)) -> String {
+            let backend = TestBackend::new(120, 10);
+            let mut terminal = Terminal::new(backend).expect("TestBackend init");
+            let mut state = make_state();
+            state.is_thinking = false;
+            // 用一个**真实**的 Claude 型号：`test-model` 认不出系列，
+            // 能力表里 effort 档位是空的（这本身是正确行为——认不出的
+            // 型号不该显示一个发不出去的档位）。
+            state.model_name = "claude-opus-4-8".to_string();
+            mutate(&mut state);
+            let input = InputBox::new();
+            terminal
+                .draw(|f| draw(f, &mut state, &input))
+                .expect("draw ok");
+            let buffer = terminal.backend().buffer().clone();
+            let row = buffer.area.height - 1;
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, row)].symbol().to_string())
+                .collect()
+        }
+
+        // ① 没设过档位 → 状态栏里不该出现任何档位片段。
+        let line = status_line(|_| {});
+        assert!(
+            !line.contains("high") && !line.contains("low") && !line.contains("medium"),
+            "未设档位时状态栏不该出现档位文本，实际: {line:?}"
+        );
+
+        // ② 设了档位 → 出现在 cwd 之前。
+        let line = status_line(|state| {
+            state.session_effort_override = Some("high".to_string());
+        });
+        let level_at = line.find("high").expect("档位应显示在状态栏");
+        let cwd_at = line.rfind('/').expect("工作目录应显示在状态栏");
+        assert!(level_at < cwd_at, "档位应在工作目录之前，实际: {line:?}");
+    }
+
+    /// 「关闭思考」（`off`）也要显示——它是**用户显式设的**状态，
+    /// 不是「没设」。
+    #[test]
+    fn status_bar_shows_the_off_level_when_thinking_is_disabled() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(120, 10);
+        let mut terminal = Terminal::new(backend).expect("TestBackend init");
+        let mut state = make_state();
+        state.is_thinking = false;
+        state.model_name = "claude-opus-4-8".to_string();
+        state.session_effort_override = Some("off".to_string());
+        let input = InputBox::new();
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+        let buffer = terminal.backend().buffer().clone();
+        let row = buffer.area.height - 1;
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect();
+        assert!(line.contains("off"), "off 应显示在状态栏，实际: {line:?}");
+    }
+
     /// 状态栏不应再设置显式背景色（之前 `Theme::status_bar()` 用 `Rgb(30, 30, 30)`
     /// 让最末行在终端默认黑底上呈现深灰带，与上方标题栏/聊天区割裂）。这里断言
     /// 最后一行的所有非空 cell 都是 `Color::Reset`（= 未设置前景外的任何背景），
@@ -7456,24 +7603,26 @@ mod chat_viewport_tests {
     fn wrapped_lines_contribute_their_physical_height() {
         let mut state = make_state();
         state.welcome_frozen = true;
-        // 每条 200 字符的系统消息在 60 列下会折成多行。
+        // 每条 200 字符的消息在 60 列下会折成多行。
         for i in 0..10 {
-            state.messages.push(ChatMessage::system(format!(
-                "wrapped-{i:02}-{}",
-                "x".repeat(200)
-            )));
+            let mut msg = ChatMessage::system(format!("wrapped-{i:02}-{}", "x".repeat(200)));
+            msg.role = MessageRole::User;
+            state.messages.push(msg);
         }
         state.chat_follow_tail = true;
 
-        let logical = build_pending_chat_lines(&mut state, chat_content_width(60)).len();
         let total = total_physical_height(&mut state, 60);
-        assert!(
-            total > logical,
-            "长行必须折算成多行物理行: logical={logical} total={total}"
-        );
 
         let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
 
+        // 滚动上限必须按**物理行数**算：贴底时视口要正好落在内容末尾，
+        // 最后一条消息不能被裁掉。
+        //
+        // 这条测试不钉「逻辑行数 < 物理行数」这个中间量：它依赖「渲染期
+        // 没折行」的前提，而 System 消息现在已在渲染期按显示宽度折好行
+        // （`wrap_plain_text_spans`），User 消息走 `wrap_line` 同样折好——
+        // 所有消息类型的逻辑行都天生不超过视口宽度，中间量恒等。真正要守
+        // 住的是**结果**：贴底时最后一条完整可见。
         assert_eq!(state.chat_max_scroll, total - 20);
         assert!(
             text.contains("wrapped-09"),
@@ -7696,6 +7845,136 @@ mod perf_probe_resize {
                 .collect();
             std::hint::black_box(&h);
             println!("resize @ width={width}: {:>8.2?}", t.elapsed());
+        }
+    }
+}
+
+/// System 通知的中文折行：必须走 markdown 的折行引擎，不能交给
+/// `Paragraph::wrap` 的 `WordWrapper`。
+#[cfg(test)]
+mod system_message_wrap_tests {
+    use super::*;
+    use crate::test_support::rendered_text;
+
+    /// 构造一条 System 消息并渲染，返回**该消息自己的**纯文本行。
+    ///
+    /// 不能直接用 `build_pending_chat_lines` 的全部输出：那一屏里还有欢迎页
+    /// （logo / 版本号 / tip / 快捷键），断言会被无关内容干扰。这里把欢迎页
+    /// 冻掉，这一屏就只剩本条 System 消息。
+    ///
+    /// 行**保留**首行的 `  ⚙ ` 标记前缀（`  ⚠ ` 用于错误变体）——各断言按
+    /// 自己的需要处理它：文字完整性断言要剥掉它，标点禁则断言要跳过它。
+    fn render_system(content: &str, width: usize) -> Vec<String> {
+        let mut state = crate::test_support::make_state();
+        state.welcome_frozen = true;
+        state
+            .messages
+            .push(ChatMessage::system(content.to_string()));
+        rendered_text(build_pending_chat_lines(&mut state, width))
+    }
+
+    /// System 消息首行标记前缀的 **char 数**：`  ⚙ ` = 2 空格 + ⚙ + 1 空格 = 4。
+    ///
+    /// 用 char 数而不是显示列数（5）：`body_of` 是按 `chars().skip()` 剥前缀的，
+    /// 而 `chars().skip()` 走的是 char 边界，两者必须同口径。注意 `⚙` 的**显示
+    /// 宽度**是 2 列、**char 数**是 1——`render.rs` 的宽度预算里按 2 列算。
+    const MARKER_CHARS: usize = 4;
+
+    /// 剥掉首行标记后的正文（用于文字完整性比较）。
+    fn body_of(lines: &[String]) -> String {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.chars().skip(MARKER_CHARS).collect::<String>()
+                } else {
+                    l.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// **中文段落不得在词组中间被截断。**
+    ///
+    /// 旧实现把整段塞进一个 span 交给 `WordWrapper`，它只在空格处断行——中文
+    /// 几乎没有空格，于是它一路撑到接近行尾才折回来，把「+ 模型分类器」这类
+    /// 词组拦腰截断。实测第一行末尾是「由本地规则 +」、第二行开头是「模型
+    /// 分类器在执行前判定…」，读起来像乱码。
+    #[test]
+    fn system_message_does_not_split_a_chinese_phrase_across_lines() {
+        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。";
+        let lines = render_system(content, 100);
+        // 折行后所有文字都还在（不丢字）
+        assert_eq!(
+            body_of(&lines).replace(' ', ""),
+            content.replace(' ', ""),
+            "折行不应丢失或改变任何字符"
+        );
+        // 「+ 模型分类器」必须完整地待在同一行
+        let has_intact = lines
+            .iter()
+            .any(|l| l.contains("+ 模型分类器") || l.contains("模型分类器在执行前判定"));
+        assert!(has_intact, "「模型分类器」不应被拆到两行；实际：{lines:?}");
+    }
+
+    /// ASCII 词（`Shift+Tab`）不得被拆开。
+    ///
+    /// `WordWrapper` 会把 `Shift+Tab` 切成 `Shift+` / `Tab`——按键名被拆开后
+    /// 用户根本认不出那是什么键。
+    #[test]
+    fn system_message_keeps_ascii_key_names_intact() {
+        let content =
+            "危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
+        for width in [60usize, 80, 100, 120] {
+            let lines = render_system(content, width);
+            let has_intact = lines.iter().any(|l| l.contains("Shift+Tab"));
+            assert!(
+                has_intact,
+                "宽度 {width} 下 `Shift+Tab` 被拆开了；实际：{lines:?}"
+            );
+        }
+    }
+
+    /// 折行后每行都不得超宽，且总行数合理。
+    #[test]
+    fn system_message_lines_never_exceed_the_content_width() {
+        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
+        for width in [40usize, 60, 80, 100, 120] {
+            let lines = render_system(content, width);
+            for (i, line) in lines.iter().enumerate() {
+                let w: usize = line.chars().map(char_display_width).sum();
+                assert!(
+                    w <= width,
+                    "宽度 {width} 下第 {} 行超宽（{w} 列）：{line:?}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// 收尾标点不得落在行首（中文排版禁则）。
+    #[test]
+    fn system_message_never_starts_a_line_with_closing_punctuation() {
+        let content = "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。";
+        for width in [40usize, 50, 60, 80, 100] {
+            let lines = render_system(content, width);
+            for (i, line) in lines.iter().enumerate() {
+                // 首行有 "  ⚙ " 前缀，从标记之后看内容起点
+                let content_start = if i == 0 { MARKER_CHARS } else { 0 };
+                let rest: String = line.chars().skip(content_start).collect();
+                if let Some(first) = rest.chars().next() {
+                    assert!(
+                        !matches!(
+                            first,
+                            '，' | '。' | '、' | '；' | '：' | '？' | '！' | '…' | '）' | '】'
+                        ),
+                        "宽度 {width} 下第 {} 行以收尾标点 {first:?} 开头：{line:?}",
+                        i + 1
+                    );
+                }
+            }
         }
     }
 }

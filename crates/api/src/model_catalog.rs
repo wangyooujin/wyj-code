@@ -55,11 +55,10 @@ impl ModelCatalog {
         cache: Option<&CapabilityCache>,
     ) -> CatalogResolution {
         let model = model_override.unwrap_or(&profile.model);
-        let vendor = profile
-            .vendor
-            .as_deref()
-            .map(normalize_vendor)
-            .unwrap_or_else(|| infer_vendor(profile, model));
+        // vendor 一律由 base_url + 模型名推断（`Profile.vendor` 字段已移除）。
+        // 归一化（`glm`→`zhipu`、`kimi`→`moonshot` 等别名）在这里做一次，
+        // 让下游拿到的是 `ThinkingSpec::for_vendor` 认识的那一套标准名。
+        let vendor = normalize_vendor(&infer_vendor(profile, model));
         let wire_protocol = profile.effective_wire_protocol();
         let identity = ModelIdentity {
             vendor: vendor.clone(),
@@ -452,42 +451,15 @@ fn resolved_base_url(profile: &Profile) -> String {
     }
 }
 
+/// vendor 推导。**唯一实现在 `crate::models::infer_vendor`**——这里保留一个
+/// 薄转发只是为了让本文件的调用点读起来短。
+///
+/// 历史上这里有一份独立副本，与 `openai.rs` / `anthropic.rs` 的两份副本
+/// 互不一致；`Profile.vendor` 字段移除后三者会开始分歧（官方 OpenAI 端点
+/// 被推成 `"custom"` → `max_completion_tokens` 用错 → 400）。
+/// 详见 `crate::models::infer_vendor` 的文档注释。
 fn infer_vendor(profile: &Profile, model: &str) -> String {
-    let base_url = profile.base_url.to_ascii_lowercase();
-    if base_url.contains("127.0.0.1:11434") || base_url.contains("localhost:11434") {
-        return "ollama".to_string();
-    }
-    if base_url.contains("vllm") {
-        return "vllm".to_string();
-    }
-    let haystack = format!("{} {}", base_url, model.to_ascii_lowercase());
-    for (needle, vendor) in [
-        ("minimax", "minimax"),
-        ("bigmodel", "zhipu"),
-        ("z.ai", "zhipu"),
-        ("glm", "zhipu"),
-        ("moonshot", "moonshot"),
-        ("kimi", "moonshot"),
-        ("deepseek", "deepseek"),
-        ("dashscope", "alibaba"),
-        ("aliyun", "alibaba"),
-        ("qwen", "alibaba"),
-        ("volces", "volcengine"),
-        ("doubao", "volcengine"),
-    ] {
-        if haystack.contains(needle) {
-            return vendor.to_string();
-        }
-    }
-    if profile.is_official_anthropic_endpoint() {
-        "anthropic".to_string()
-    } else if profile.provider == Provider::OpenAI
-        && (profile.base_url.trim().is_empty() || profile.base_url.contains("api.openai.com"))
-    {
-        "openai".to_string()
-    } else {
-        "custom".to_string()
-    }
+    crate::models::infer_vendor(profile, model)
 }
 
 fn normalize_vendor(vendor: &str) -> String {
@@ -583,7 +555,6 @@ mod tests {
         // Anthropic 官方端点 → BudgetTokens
         let profile = Profile {
             provider: Provider::Anthropic,
-            vendor: Some("anthropic".to_string()),
             model: "claude-opus-4-8".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             ..Profile::default()
@@ -594,7 +565,6 @@ mod tests {
         // Qwen SwitchPlusBudget + budget_tokens_supported=true → BudgetTokens
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("alibaba".to_string()),
             model: "qwen3-coder-plus".to_string(),
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string(),
             ..Profile::default()
@@ -605,7 +575,6 @@ mod tests {
         // DeepSeek SwitchPlusEffort → Effort
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("deepseek".to_string()),
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             ..Profile::default()
@@ -616,7 +585,6 @@ mod tests {
         // GLM SwitchOnly → Effort
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("zhipu".to_string()),
             model: "glm-4.6".to_string(),
             base_url: "https://open.bigmodel.cn/api/paas/v4".to_string(),
             ..Profile::default()
@@ -627,7 +595,6 @@ mod tests {
         // Ollama 非 think 模型 → Unsupported
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("ollama".to_string()),
             model: "llama3".to_string(),
             base_url: "http://127.0.0.1:11434/v1".to_string(),
             ..Profile::default()
@@ -638,30 +605,12 @@ mod tests {
         // MiniMax M3 SwitchOnly → Effort
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("minimax".to_string()),
             model: "MiniMax-M3".to_string(),
             base_url: "https://api.minimaxi.com/v1".to_string(),
             ..Profile::default()
         };
         let res = ModelCatalog::resolve(&profile, None);
         assert_eq!(res.capabilities.thinking.value, ThinkingMode::Effort);
-    }
-
-    #[test]
-    fn explicit_vendor_and_wire_protocol_win_over_inference() {
-        let profile = Profile {
-            provider: Provider::OpenAI,
-            vendor: Some("minimax".to_string()),
-            wire_protocol: Some(WireProtocol::AnthropicMessages),
-            base_url: "https://proxy.invalid".to_string(),
-            ..Profile::default()
-        };
-        let resolution = ModelCatalog::resolve(&profile, None);
-        assert_eq!(resolution.identity.vendor, "minimax");
-        assert_eq!(
-            resolution.identity.wire_protocol,
-            WireProtocol::AnthropicMessages
-        );
     }
 }
 
@@ -679,8 +628,6 @@ mod parallel_policy_tests {
     fn minimax_profile() -> Profile {
         Profile {
             provider: Provider::Anthropic,
-            vendor: Some("minimax".to_string()),
-            wire_protocol: Some(WireProtocol::AnthropicMessages),
             model: "MiniMax-M3.1-Flash-Preview".to_string(),
             base_url: "https://api.minimaxi.com/anthropic".to_string(),
             ..Profile::default()
@@ -733,8 +680,6 @@ mod parallel_policy_tests {
     fn interleaved_is_never_claimed_on_the_openai_wire() {
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("deepseek".to_string()),
-            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
             model: "deepseek-v4-pro".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             interleaved_thinking: true,
@@ -819,8 +764,6 @@ mod parallel_policy_tests {
     fn deepseek_official_endpoint_reports_automatic_prompt_cache() {
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("deepseek".to_string()),
-            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             ..Profile::default()
@@ -852,8 +795,6 @@ mod parallel_policy_tests {
         ] {
             let profile = Profile {
                 provider: Provider::OpenAI,
-                vendor: Some(vendor.to_string()),
-                wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
                 model: "some-model".to_string(),
                 base_url: base_url.to_string(),
                 ..Profile::default()
@@ -877,8 +818,6 @@ mod parallel_policy_tests {
     fn explicit_opt_out_beats_automatic_cache_detection() {
         let profile = Profile {
             provider: Provider::OpenAI,
-            vendor: Some("deepseek".to_string()),
-            wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             prompt_cache: Some(false),
@@ -920,7 +859,6 @@ mod parallel_policy_tests {
     fn explicit_one_overrides_even_a_reference_endpoint() {
         let profile = Profile {
             provider: Provider::Anthropic,
-            vendor: Some("anthropic".to_string()),
             model: "claude-opus-4-8".to_string(),
             base_url: String::new(),
             max_tools_per_turn: Some(1),

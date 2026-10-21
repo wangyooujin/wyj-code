@@ -200,14 +200,44 @@ impl AppState {
                 cfg.active_profile = name.clone();
             }
         }
+        // 会话级思考档位必须跟着走：任何一次重建 Agent（切分组、切模型、
+        // 改设置）都要保住当前档位，否则用户设了 high、切个模型就悄悄
+        // 回落成端点默认。
+        cfg.runtime_session_effort = self.session_effort_override.clone();
         cfg
     }
 
-    /// 会话级分组当前是否生效（用于状态栏与 `/model` 面板提示）。
+    /// 会话级分组当前是否生效（用于状态栏与 `/profile` 面板提示）。
     pub fn session_profile_active(&self) -> Option<&str> {
         self.session_profile_override
             .as_deref()
             .filter(|name| self.config.profile_by_name(name).is_some())
+    }
+
+    /// 本会话生效的思考档位（`/effort` 设置）。
+    ///
+    /// `None` = 跟随分组里配的 `reasoning_effort`（此时状态栏不显示
+    /// effort 片段——用户没设过，就不该占地方）。
+    ///
+    /// 注意它与 `session_effort_override`（内存态，用于重建 Agent）的关系：
+    /// 前者是**落盘态**（`Session.session_effort`），后者是**运行态**。
+    /// 状态栏读前者，重建 Agent 读后者——两者由 `/effort` 的执行路径同时
+    /// 写入，理论上恒等；分开是因为「读状态栏」不该去拿 session 锁。
+    pub fn session_effort_active(&self) -> Option<&str> {
+        self.session_effort_override.as_deref()
+    }
+
+    /// 把思考档位写入内存 Session（落盘时由 `SessionFile::from_session` 带走）。
+    pub(super) fn set_session_effort_in_session(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        value: Option<String>,
+    ) {
+        // 主循环里不能 await：拿不到锁说明回合正在跑，而回合本身是持锁者。
+        // 思考档位只影响下一轮请求，晚一帧写入没有副作用，直接跳过即可。
+        if let Some(mut sess) = try_session_lock(session) {
+            sess.session_effort = value;
+        }
     }
 
     /// 把会话级分组写入内存 Session（落盘时由 `SessionFile::from_session` 带走）。

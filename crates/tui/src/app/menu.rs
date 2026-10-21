@@ -23,6 +23,18 @@ pub enum InputOwner {
     Schedule(ScheduleInputField),
     /// `/config` 面板的文本字段编辑借用态（search api_key / max_results）。
     Settings(SettingsInputField),
+    /// `/model` 面板的「手动输入模型名」借用态。
+    ///
+    /// 端点不一定实现 `/models` 接口（第三方代理常见），拉不到列表时
+    /// 用户仍要能直接敲模型名——这一项是那个场景的唯一出路。
+    Model(ModelInputField),
+}
+
+/// `/model` 面板可借用输入框的场景。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ModelInputField {
+    /// 手动输入模型名
+    ManualName,
 }
 
 /// `/config` 面板可借用输入框的文本字段。
@@ -141,6 +153,10 @@ impl InputOwner {
                 ),
                 Theme::claude_color(),
             ),
+            InputOwner::Model(ModelInputField::ManualName) => (
+                wyj_i18n::tr("dialog.input_owner.model_manual"),
+                Theme::claude_color(),
+            ),
         }
     }
 
@@ -155,6 +171,7 @@ impl InputOwner {
             InputOwner::Profile(_) => state.profile_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Schedule(_) => state.schedule_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Settings(_) => state.settings_dialog.as_mut().map(|d| &mut d.live_input),
+            InputOwner::Model(_) => state.model_picker.as_mut().map(|d| &mut d.live_input),
         }
     }
 
@@ -167,6 +184,7 @@ impl InputOwner {
             InputOwner::Profile(_) => state.profile_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Schedule(_) => state.schedule_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Settings(_) => state.settings_dialog.as_ref().map(|d| &d.live_input),
+            InputOwner::Model(_) => state.model_picker.as_ref().map(|d| &d.live_input),
         }
     }
 

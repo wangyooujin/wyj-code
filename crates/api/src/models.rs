@@ -1,11 +1,206 @@
-//! 分组（Profile）新建模板，以及"拉取模型列表"辅助函数。
-//!
-//! 模板里的 base_url/model 取自各供应商公开文档，仅作为新建分组时的预填起点——
-//! 供应商随时可能调整接口地址或下线旧模型，用户创建后应自行核对。
+//! 「vendor 推断」与「拉取模型列表」两件事的归属地。
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use wyj_config::{Provider, WireProtocol};
+use wyj_config::{Profile, Provider};
+
+/// **全仓唯一的 vendor 推导入口**。
+///
+/// 背景：这份实现此前存在**三份互不一致的副本**——`model_catalog.rs`、
+/// `openai.rs`、`anthropic.rs` 各写一份。三者 needle 表不同、兜底不同：
+/// `openai.rs` 缺 `api.openai.com` 判定（官方 OpenAI 端点会被推成
+/// `"custom"`），`anthropic.rs` 缺 deepseek/qwen/volcengine/ollama/vllm
+/// 且兜底返回 `"anthropic"`。
+///
+/// 那时无害，因为 `Profile.vendor` 显式写死时三者拿到的是同一个值。
+/// **一旦 `Profile.vendor` 字段被移除，三者就会开始分歧**——最直接的后果是
+/// 官方 OpenAI 端点在 `openai.rs` 里被推成 `"custom"`，于是
+/// `uses_max_completion_tokens` 误判为「非官方 OpenAI」，把 `max_tokens`
+/// 而不是 `max_completion_tokens` 发出去，官方 reasoning 模型直接 400。
+///
+/// 所以这里收敛成一份权威实现，needle 表取三方**并集**（宁可多认一个
+/// vendor，也不要让同一个端点在两处推成不同结果），兜底统一为 `"custom"`
+/// ——「认不出来」与「认成 anthropic 官方」是两回事，前者不会误开官方端点
+/// 专属的行为（interleaved beta / max_completion_tokens / 五档 effort）。
+///
+/// 特判必须排在 needle 表之前：ollama / vllm 的判定靠端口号与路径，
+/// 而它们的模型名可能含 `qwen`（`qwen3-coder`）——若先跑 needle 表，
+/// 本地 ollama 会被认成阿里云。
+pub fn infer_vendor(profile: &Profile, model: &str) -> String {
+    let base_url = profile.base_url.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+
+    // ── ① 本地端点：靠端口 / 路径判定，优先于任何模型名 needle ──
+    //
+    // 两个判定都必须在 needle 表之前：本地推理服务跑的模型名往往含
+    // `qwen`（`qwen3-coder`）——若先跑 needle 表，本地 ollama 会被认成阿里云。
+    //
+    // vLLM 额外认端口 8000：它的默认监听端口（`--port 8000`），而
+    // `http://127.0.0.1:8000/v1` 这个地址**不含 "vllm" 字样**——只靠路径
+    // 匹配的话，它会掉进 needle 表被模型名带偏（`qwen3` → 阿里云）。
+    // 这正是旧模板靠显式 `vendor = "vllm"` 兜住、移除该字段后暴露出来的洞。
+    if base_url.contains("127.0.0.1:11434") || base_url.contains("localhost:11434") {
+        return "ollama".to_string();
+    }
+    if base_url.contains("vllm")
+        || base_url.contains("127.0.0.1:8000")
+        || base_url.contains("localhost:8000")
+    {
+        return "vllm".to_string();
+    }
+
+    // ── ② base_url 留空 = 走 provider 的官方默认端点 ──
+    //
+    // 无歧义，且必须在下面的模型名规则之前：OpenAI 的微调模型 ID 带冒号
+    //（`ft:gpt-4o:acme:123`），若先看模型名会把它误判成「带命名空间的
+    // 聚合路由」。
+    if base_url.trim().is_empty() {
+        return match profile.provider {
+            Provider::Anthropic => "anthropic".to_string(),
+            Provider::OpenAI => "openai".to_string(),
+        };
+    }
+
+    // ── ③ 端点**域名**命中厂商官方域名 → 该厂商 ──
+    //
+    // 这一层是**无歧义**的：域名属于谁，就按谁的 thinking 规格发字段。
+    // 它排在模型名规则之前，正是为了让「厂商官方端点 + 带前缀的模型名」
+    // 仍然走厂商臂（后者是聚合路由的形态，不是厂商自己的）。
+    let host = host_of(&base_url);
+    for (domain, vendor) in VENDOR_DOMAINS {
+        if host_matches(&host, domain) {
+            return vendor.to_string();
+        }
+    }
+
+    // ── ④ 聚合路由 / 模型中转 → `custom` ──
+    //
+    // OpenRouter / larprouter / openscale 这类中转端点把多家厂商的模型聚在
+    // 一起转发，模型 ID 带厂商前缀（`minimax/minimax-m3.1-flash:free`、
+    // `deepseek/deepseek-v4.1-flash-1017`），但**不认**厂商专属的 thinking
+    // 字段——发 `thinking.type` / `reasoning_split` / `output_config.effort`
+    // 过去多半 400。
+    //
+    // 两条判据，缺一不可：
+    // a) 域名特征词（`router` / `oneapi` / `newapi` / …）；
+    // b) **模型名带命名空间分隔符**（`/` 或 `:`）——聚合路由的模型 ID 几乎
+    //    都带厂商前缀，而厂商官方模型名不带（`claude-opus-4-8`、
+    //    `deepseek-chat`）。这条覆盖了词表穷举不到的域名（用户的
+    //    `api.openscale.so` 就是这类）。
+    //
+    // 代价是**信息损失**：一个中转端点若用的是**无前缀**的模型 ID
+    //（`deepseek-v4.1-flash`），它与厂商官方端点就再也区分不出来了 ——
+    // 旧配置里靠显式 `vendor = "custom"` 兜住的那个信息，随字段移除而消失。
+    // 只能靠域名特征词兜（`larprouter.com` 命中 `router`）。
+    if is_aggregator_endpoint(&host) || has_vendor_namespace(&model) {
+        return "custom".to_string();
+    }
+
+    // ── ⑤ 模型名 needle → 该厂商 ──
+    //
+    // 兜底到这里说明端点不是任何厂商的官方域名（自建代理 / 公司网关），
+    // 那就按模型名猜——与旧实现同源。
+    let haystack = format!("{base_url} {model}");
+    for (needle, vendor) in [
+        ("minimax", "minimax"),
+        ("bigmodel", "zhipu"),
+        ("z.ai", "zhipu"),
+        ("glm", "zhipu"),
+        ("moonshot", "moonshot"),
+        ("kimi", "moonshot"),
+        ("deepseek", "deepseek"),
+        ("dashscope", "alibaba"),
+        ("aliyun", "alibaba"),
+        ("qwen", "alibaba"),
+        ("volces", "volcengine"),
+        ("doubao", "volcengine"),
+        ("ollama", "ollama"),
+    ] {
+        if haystack.contains(needle) {
+            return vendor.to_string();
+        }
+    }
+
+    "custom".to_string()
+}
+
+/// 厂商**官方域名**表。命中即按该厂商处理，无歧义。
+///
+/// 用**域名精确匹配**（`host == domain` 或 `host` 以 `.domain` 结尾）而不是
+/// 子串包含——`z.ai` 若是子串匹配，`siz.ai` 之类无关域名会被误伤。
+const VENDOR_DOMAINS: &[(&str, &str)] = &[
+    ("api.anthropic.com", "anthropic"),
+    ("api.openai.com", "openai"),
+    ("api.minimaxi.com", "minimax"),
+    ("api.minimax.chat", "minimax"),
+    ("api.deepseek.com", "deepseek"),
+    ("api.moonshot.cn", "moonshot"),
+    ("open.bigmodel.cn", "zhipu"),
+    ("bigmodel.cn", "zhipu"),
+    ("z.ai", "zhipu"),
+    ("dashscope.aliyuncs.com", "alibaba"),
+    ("aliyuncs.com", "alibaba"),
+    ("volces.com", "volcengine"),
+    ("volcengine.com", "volcengine"),
+];
+
+/// 从 base_url 里取出主机名（小写，不含端口）。
+fn host_of(base_url: &str) -> String {
+    let without_scheme = base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url);
+    // 去掉路径与可能的凭据段。
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(without_scheme.split('/').next().unwrap_or(without_scheme));
+    // 去掉端口。
+    host.split(':').next().unwrap_or(host).to_string()
+}
+
+/// 主机名是否等于该域名，或以 `.` + 该域名结尾（子域）。
+fn host_matches(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// 该端点是否是**聚合路由 / 模型中转**（OpenRouter、oneapi、new-api 等）。
+///
+/// 判据是域名里的特征词。刻意保守：宁可把某个真厂商端点误判成 `custom`
+/// （thinking 全关，最多是少了思考档位），也不能把聚合路由误判成某厂商
+/// （发错字段直接 400）。
+fn is_aggregator_endpoint(host: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "openrouter",
+        "router",
+        "oneapi",
+        "newapi",
+        "new-api",
+        "openai-hub",
+        "ai-gateway",
+        "aigateway",
+        "api-hub",
+        "apihub",
+        "anyrouter",
+        "siliconflow",
+        "closeai",
+        "openscale",
+    ];
+    MARKERS.iter().any(|marker| host.contains(marker))
+}
+
+/// 模型名是否带**命名空间分隔符**（`/` 或 `:`）。
+///
+/// 聚合路由的模型 ID 几乎都带厂商前缀（`minimax/minimax-m3.1-flash:free`、
+/// `deepseek/deepseek-v4.1-flash-1017`），而厂商官方模型名不带
+/// （`claude-opus-4-8`、`deepseek-chat`）。这条是聚合路由判定里唯一能覆盖
+/// 未知域名的信号。
+fn has_vendor_namespace(model: &str) -> bool {
+    model.contains('/') || model.contains(':')
+}
 
 /// 已知模型的容量组合（上下文窗口 / 单次输出上限）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,144 +280,6 @@ pub fn known_model_capacity(model: &str) -> Option<ModelCapacity> {
         .find(|(prefix, _)| m.starts_with(prefix) || m.contains(prefix))
         .map(|(_, cap)| *cap)
 }
-
-/// 新建分组时可选的内置模板。
-pub struct ProfileTemplate {
-    /// 模板标识（同时作为新建分组的默认名称）
-    pub key: &'static str,
-    /// 展示名称
-    pub label: &'static str,
-    pub provider: Provider,
-    pub vendor: &'static str,
-    pub wire_protocol: WireProtocol,
-    pub base_url: &'static str,
-    pub example_model: &'static str,
-    /// 供应商特殊说明，展示在模板选择器里
-    pub note: &'static str,
-    pub vision: bool,
-    pub prompt_cache: Option<bool>,
-    pub openai_stream_options: Option<bool>,
-}
-
-pub const PROFILE_TEMPLATES: &[ProfileTemplate] = &[
-    ProfileTemplate {
-        key: "glm",
-        label: "GLM（智谱/Z.ai Coding Plan）",
-        provider: Provider::Anthropic,
-        vendor: "zhipu",
-        wire_protocol: WireProtocol::AnthropicMessages,
-        base_url: "https://open.bigmodel.cn/api/anthropic",
-        example_model: "glm-5.2",
-        note: "prompt_cache 强制 false（第三方 Anthropic 兼容端点）；interleaved_thinking 不支持；usage 来自 message_delta",
-        vision: false,
-        prompt_cache: Some(false),
-        openai_stream_options: None,
-    },
-    ProfileTemplate {
-        key: "volcengine",
-        label: "火山引擎（Ark Agent 计划）",
-        provider: Provider::OpenAI,
-        vendor: "volcengine",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "https://ark.cn-beijing.volces.com/api/v3",
-        example_model: "doubao-seed-1-6",
-        note: "模型名通常是控制台创建的推理接入点 ID（形如 ep-xxxxxxxx-xxxxx），非固定模型名；openai_stream_options=false（Ark 不支持 stream_options.include_usage）",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(false),
-    },
-    ProfileTemplate {
-        key: "minimax",
-        label: "MiniMax（Coding Plan）",
-        provider: Provider::OpenAI,
-        vendor: "minimax",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "https://api.minimaxi.com/v1",
-        example_model: "MiniMax-M2",
-        note: "openai_stream_options=true（依赖供应商返回精确 usage,usage 仅在最后 message_delta chunk 出现）",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(true),
-    },
-    ProfileTemplate {
-        key: "kimi",
-        label: "Kimi（Moonshot Coding Plan）",
-        provider: Provider::Anthropic,
-        vendor: "moonshot",
-        wire_protocol: WireProtocol::AnthropicMessages,
-        base_url: "https://api.moonshot.cn/anthropic",
-        example_model: "kimi-k2-turbo-preview",
-        note: "prompt_cache 强制 false（第三方 Anthropic 兼容端点）；interleaved_thinking 不支持",
-        vision: false,
-        prompt_cache: Some(false),
-        openai_stream_options: None,
-    },
-    ProfileTemplate {
-        key: "deepseek",
-        label: "DeepSeek（官方计费 API）",
-        provider: Provider::OpenAI,
-        vendor: "deepseek",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "https://api.deepseek.com",
-        example_model: "deepseek-chat",
-        note: "deepseek-reasoner 模型返回 reasoning_content 字段（v0.2.16+ 自动落盘为 thinking 块）；reasoner 多轮工具循环默认 max_turns=32；usage 仅在最后 message_delta chunk 出现",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(true),
-    },
-    ProfileTemplate {
-        key: "qwen-bailian",
-        label: "通义千问（阿里云百炼）",
-        provider: Provider::OpenAI,
-        vendor: "alibaba",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        example_model: "qwen3-coder-plus",
-        note: "静态兼容模板；请以百炼控制台当前可用模型为准；Qwen3-Coder 系列不支持 extended thinking",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(true),
-    },
-    ProfileTemplate {
-        key: "ollama",
-        label: "Ollama（实验性 OpenAI 兼容）",
-        provider: Provider::OpenAI,
-        vendor: "ollama",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "http://127.0.0.1:11434/v1",
-        example_model: "qwen3-coder",
-        note: "能力取决于本地模型；创建后请运行 model doctor probe；openai_stream_options=false（Ollama 不支持 stream_options.include_usage）",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(false),
-    },
-    ProfileTemplate {
-        key: "vllm",
-        label: "vLLM（实验性 OpenAI 兼容）",
-        provider: Provider::OpenAI,
-        vendor: "vllm",
-        wire_protocol: WireProtocol::OpenAiChatCompletions,
-        base_url: "http://127.0.0.1:8000/v1",
-        example_model: "",
-        note: "能力取决于 served model 和启动参数；创建后请运行 model doctor probe；openai_stream_options=false（vLLM 不支持 stream_options.include_usage）",
-        vision: false,
-        prompt_cache: None,
-        openai_stream_options: Some(false),
-    },
-    ProfileTemplate {
-        key: "custom",
-        label: "自定义",
-        provider: Provider::Anthropic,
-        vendor: "custom",
-        wire_protocol: WireProtocol::AnthropicMessages,
-        base_url: "",
-        example_model: "",
-        note: "完全开放,用户自配;建议 prompt_cache/openai_stream_options/vision 与 base_url 协议匹配;非官方 Anthropic 端点 prompt_cache 应显式 false",
-        vision: true,
-        prompt_cache: None,
-        openai_stream_options: None,
-    },
-];
 
 #[derive(Deserialize)]
 struct OpenAiModelsResponse {
@@ -344,5 +401,244 @@ mod capacity_tests {
             known_model_capacity("  Claude-Opus-4  "),
             known_model_capacity("claude-opus-4")
         );
+    }
+}
+
+/// `infer_vendor` 的回归钉子。
+///
+/// 这份实现此前有**三份互不一致的副本**（`model_catalog.rs` /
+/// `openai.rs` / `anthropic.rs`），needle 表与兜底各不相同。`Profile.vendor`
+/// 显式写死时三者结果相同，字段一移除就立刻分歧——最直接的后果是官方
+/// OpenAI 端点在 `openai.rs` 里被推成 `"custom"`，于是
+/// `uses_max_completion_tokens` 误判，把 `max_tokens` 而不是
+/// `max_completion_tokens` 发出去，官方 reasoning 模型直接 400。
+///
+/// 下面两组断言各钉一个方向：
+/// ① 常见端点必须推出正确的 vendor；
+/// ② **兜底必须是 `"custom"`**——认不出来与「认成 anthropic 官方」是两回事，
+///    后者会误开官方端点专属的行为（interleaved beta / 五档 effort）。
+#[cfg(test)]
+mod infer_vendor_tests {
+    use super::*;
+
+    fn profile(provider: Provider, base_url: &str) -> Profile {
+        Profile {
+            provider,
+            base_url: base_url.to_string(),
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn known_endpoints_resolve_to_their_vendor() {
+        for (provider, base_url, model, expected) in [
+            (
+                Provider::Anthropic,
+                "https://api.anthropic.com",
+                "claude-opus-4-8",
+                "anthropic",
+            ),
+            (
+                Provider::OpenAI,
+                "https://api.openai.com/v1",
+                "gpt-5",
+                "openai",
+            ),
+            (
+                Provider::Anthropic,
+                "https://open.bigmodel.cn/api/anthropic",
+                "glm-5.2",
+                "zhipu",
+            ),
+            (
+                Provider::OpenAI,
+                "https://ark.cn-beijing.volces.com/api/v3",
+                "doubao-seed-1-6",
+                "volcengine",
+            ),
+            (
+                Provider::OpenAI,
+                "https://api.minimaxi.com/v1",
+                "MiniMax-M2",
+                "minimax",
+            ),
+            (
+                Provider::Anthropic,
+                "https://api.moonshot.cn/anthropic",
+                "kimi-k2-turbo-preview",
+                "moonshot",
+            ),
+            (
+                Provider::OpenAI,
+                "https://api.deepseek.com",
+                "deepseek-chat",
+                "deepseek",
+            ),
+            (
+                Provider::OpenAI,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "qwen3-coder-plus",
+                "alibaba",
+            ),
+            (
+                Provider::OpenAI,
+                "http://127.0.0.1:11434/v1",
+                "qwen3-coder",
+                "ollama",
+            ),
+            (
+                Provider::OpenAI,
+                "http://127.0.0.1:8000/v1",
+                "qwen3",
+                "vllm",
+            ),
+        ] {
+            let p = profile(provider, base_url);
+            assert_eq!(
+                infer_vendor(&p, model),
+                expected,
+                "{base_url} + {model} 应推出 {expected}"
+            );
+        }
+    }
+
+    /// 认不出来的端点一律 `custom`——**绝不能**兜底成 `"anthropic"`。
+    ///
+    /// `"anthropic"` 兜底会让第三方兼容端点拿到官方端点的能力表
+    /// （五档 effort / interleaved beta），而它们只认开关。
+    #[test]
+    fn unknown_endpoints_fall_back_to_custom_not_anthropic() {
+        let p = profile(Provider::Anthropic, "https://proxy.invalid/anthropic");
+        assert_eq!(infer_vendor(&p, "some-model"), "custom");
+    }
+
+    /// 本地端点必须**先于**模型名 needle 判定：ollama 跑的模型可能叫
+    /// `qwen3-coder`（含 `qwen` → 阿里云），但它不是阿里云。
+    #[test]
+    fn local_endpoints_win_over_model_name_needles() {
+        let p = profile(Provider::OpenAI, "http://127.0.0.1:11434/v1");
+        assert_eq!(infer_vendor(&p, "qwen3-coder"), "ollama");
+    }
+
+    /// **聚合路由必须判 `"custom"`，不能按模型名的厂商前缀认厂商。**
+    ///
+    /// OpenRouter 这类中转端点的模型 ID 带厂商前缀
+    /// （`minimax/minimax-m3.1-flash:free`），但它们**不认**厂商专属的
+    /// thinking 字段（`thinking.type` / `reasoning_split` /
+    /// `output_config.effort`）——按 minimax 处理就会发错字段换 400。
+    ///
+    /// 这条在移除 `Profile.vendor` 配置项之前是被用户的显式
+    /// `vendor = "custom"` 兜住的；字段一移除就必须由推导自己认出来。
+    ///
+    /// 下面这组样本取自**用户真实的 config.toml**——包括两个词表穷举不到的
+    /// 域名（`api.openscale.so` / `192.168.5.5:7863`），它们靠「模型名带
+    /// 命名空间分隔符」这条兜住。
+    #[test]
+    fn aggregator_routers_are_custom_even_when_the_model_id_names_a_vendor() {
+        for (base_url, model) in [
+            (
+                "https://openrouter.ai/api/v1",
+                "minimax/minimax-m3.1-flash:free",
+            ),
+            ("https://larprouter.com/v1", "deepseek-v4.1-flash"),
+            (
+                "https://api.openscale.so/v1",
+                "deepseek/deepseek-v4.1-flash-1017",
+            ),
+            ("http://192.168.5.5:7863/v1", "global:deepseek-v4.1-flash"),
+        ] {
+            let p = profile(Provider::OpenAI, base_url);
+            assert_eq!(
+                infer_vendor(&p, model),
+                "custom",
+                "{base_url} 是聚合路由，不该按模型名前缀认厂商"
+            );
+        }
+    }
+
+    /// 真厂商端点不受聚合路由判定影响。
+    #[test]
+    fn real_vendor_endpoints_are_not_mistaken_for_aggregators() {
+        let p = profile(Provider::OpenAI, "https://api.minimaxi.com/v1");
+        assert_eq!(infer_vendor(&p, "MiniMax-M2"), "minimax");
+    }
+
+    /// **厂商官方端点 + 带前缀的模型名**仍走厂商臂——域名是无歧义的。
+    ///
+    /// 这条与上一条互为对照：同样是带命名空间的模型名，端点是谁的域名
+    /// 决定按谁的 thinking 规格发字段。
+    #[test]
+    fn an_official_vendor_domain_wins_over_the_model_id_shape() {
+        let p = profile(Provider::OpenAI, "https://api.minimaxi.com/v1");
+        assert_eq!(infer_vendor(&p, "minimax/minimax-m3.1-flash"), "minimax");
+    }
+
+    /// `base_url` 留空 = 走 provider 的官方默认端点，无歧义。
+    ///
+    /// 这一条必须在「模型名带命名空间」判定**之前**：OpenAI 的微调模型 ID
+    /// 带冒号（`ft:gpt-4o:acme:123`），若顺序反了会被误判成聚合路由。
+    #[test]
+    fn a_blank_base_url_means_the_official_endpoint() {
+        let anthropic = profile(Provider::Anthropic, "");
+        assert_eq!(infer_vendor(&anthropic, "claude-opus-4-8"), "anthropic");
+        let openai = profile(Provider::OpenAI, "");
+        assert_eq!(infer_vendor(&openai, "ft:gpt-4o:acme:123"), "openai");
+    }
+
+    /// **移除 `Profile.vendor` 后，用户真实配置的推导结果必须与旧显式值一致。**
+    ///
+    /// 这组样本逐条取自一位用户的 `~/.wyj-code/config.toml`（6 个分组），
+    /// `expected` 就是他原先手写的 `vendor`（没写的按推导补）。字段移除后
+    /// 推导必须给出**同一个** vendor——否则他升级即行为变化，而变化的方向
+    /// 可能是「给中转端点发厂商专属字段」→ 400。
+    #[test]
+    fn a_real_users_profiles_resolve_to_the_same_vendors_as_before() {
+        for (provider, base_url, model, expected) in [
+            // 厂商官方端点
+            (
+                Provider::Anthropic,
+                "https://api.minimaxi.com/anthropic",
+                "MiniMax-M3.1-Flash",
+                "minimax",
+            ),
+            (
+                Provider::OpenAI,
+                "https://api.deepseek.com",
+                "deepseek-flash",
+                "deepseek",
+            ),
+            // 聚合路由 / 模型中转（原配置里都是显式 vendor = "custom"）
+            (
+                Provider::OpenAI,
+                "https://openrouter.ai/api/v1",
+                "minimax/minimax-m3.1-flash:free",
+                "custom",
+            ),
+            (
+                Provider::OpenAI,
+                "http://192.168.5.5:7863/v1",
+                "global:deepseek-v4.1-flash",
+                "custom",
+            ),
+            (
+                Provider::OpenAI,
+                "https://larprouter.com/v1",
+                "deepseek-v4.1-flash",
+                "custom",
+            ),
+            (
+                Provider::OpenAI,
+                "https://api.openscale.so/v1",
+                "deepseek/deepseek-v4.1-flash-1017",
+                "custom",
+            ),
+        ] {
+            let p = profile(provider, base_url);
+            assert_eq!(
+                infer_vendor(&p, model),
+                expected,
+                "{base_url} + {model} 应推出 {expected}（与移除 vendor 字段前一致）"
+            );
+        }
     }
 }

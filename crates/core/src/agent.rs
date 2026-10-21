@@ -699,6 +699,17 @@ impl Agent {
         self
     }
 
+    /// 替换主 provider。
+    ///
+    /// 供 headless 模式的 `/model <名>` 用：那里没有 TUI 的 `rebuild_fn`，
+    /// 只能就地换掉 provider。**只换 provider 不换 route identity**——
+    /// vendor / wire / base_url 仍指向旧模型的能力规格，所以调用方必须
+    /// 同时用 [`Agent::with_route_identity`] 更新它们。
+    pub fn with_provider(mut self, provider: Arc<dyn Provider>) -> Self {
+        self.provider = provider;
+        self
+    }
+
     /// 注册同角色 fallback。调用方负责按配置顺序传入；这里再次执行 vendor
     /// 边界过滤，防止未来新增调用点意外绕过 `cross_provider_fallback = false`。
     pub fn with_fallback_routes(
