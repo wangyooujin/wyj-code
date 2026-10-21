@@ -746,11 +746,7 @@ impl MemoryV3Store {
         let scorer = Bm25Scorer::new(&search_texts);
 
         let mut hits = Vec::new();
-        for (doc, (record, search_text)) in records
-            .into_iter()
-            .zip(search_texts.into_iter())
-            .enumerate()
-        {
+        for (doc, (record, search_text)) in records.into_iter().zip(search_texts).enumerate() {
             let mut score = scorer.score(doc, &query_terms);
             let mut reasons = Vec::new();
 
