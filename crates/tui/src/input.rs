@@ -164,6 +164,34 @@ pub fn apply_edit_key(input: &mut InputBox, key: &KeyEvent) -> bool {
     }
 }
 
+/// 该按键是不是「往输入框里敲一个字」。
+///
+/// 唯一的判据是**修饰位**：带 Ctrl / Alt / Cmd(`SUPER`) / `META` / `HYPER`
+/// 的字符键都有应用层含义或属于系统快捷键（`Cmd+C` 复制、`Cmd+V` 粘贴、
+/// `Alt+←` 按词移动…），一律不许当正文插入。`SHIFT` 刻意不在此列——它已经
+/// 体现在 `KeyCode` 里（Shift+a 上报的就是 `Char('A')`），排除它会让大写
+/// 字母全打不进去。
+///
+/// 缺了这层判定的后果是实打实的：macOS 上选中内容区后按 `Cmd+C`，Kitty
+/// 键盘协议把它报成 `Char('c') + SUPER`（见 `app::enter_terminal_screen`
+/// 压的 `DISAMBIGUATE_ESCAPE_CODES`），主循环只认 `CONTROL`，于是 `c` 被
+/// 原样插进输入框，看上去像「复制把 c 打进去了」。
+pub fn plain_char(key: &KeyEvent) -> Option<char> {
+    if key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER,
+    ) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
 /// 终端列宽：CJK 全角字符=2，其余=1
 pub fn char_width(c: char) -> usize {
     let cp = c as u32;
@@ -821,6 +849,44 @@ mod tests {
         assert_eq!(
             InputBox::line_visual_rows(&line, width),
             InputBox::wrap_for_render(&line, width).len()
+        );
+    }
+
+    /// `Cmd+C` 绝不能是「往输入框敲一个 c」。
+    ///
+    /// 现场：鼠标选中内容区后按 Command+C，输入框里凭空多出一个 `c`。macOS 的
+    /// Kitty 键盘协议把它报成 `Char('c') + SUPER`（`app::enter_terminal_screen`
+    /// 压的 `DISAMBIGUATE_ESCAPE_CODES`），而主循环只过滤了 `CONTROL`。
+    #[test]
+    fn modified_char_keys_are_never_plain_text() {
+        assert_eq!(
+            plain_char(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Some('c')
+        );
+        // Shift 已体现在 KeyCode 里，不能排除，否则大写字母全打不进去
+        assert_eq!(
+            plain_char(&KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT)),
+            Some('C')
+        );
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER, // macOS 的 Cmd
+            KeyModifiers::META,
+            KeyModifiers::HYPER,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                plain_char(&KeyEvent::new(KeyCode::Char('c'), modifiers)),
+                None,
+                "{modifiers:?} + c 是快捷键，不是正文"
+            );
+        }
+        // 非字符键一律不是正文
+        assert_eq!(
+            plain_char(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
         );
     }
 }

@@ -5324,6 +5324,21 @@ async fn tui_main(
                 {
                     // 任意按键都清除粘贴提示（提示本就是瞬时的）
                     state.paste_hint = None;
+
+                    // `Cmd+C` / `Ctrl+Shift+C`：复制应用内选区。**必须排在下面
+                    // 的 `clear_selection()` 之前**——选区正是要复制的东西，晚
+                    // 一步就只剩空选区。没有选区时同样吞掉这个键，不让它继续
+                    // 下坠：macOS 的 Kitty 键盘协议把它报成 `Char('c') + SUPER`，
+                    // 一旦落进字符插入分支，输入框里就会凭空多出一个 `c`。
+                    if is_clipboard_copy_key(key) {
+                        if state.selection.is_some() {
+                            let rows = std::mem::take(&mut state.frame_rows);
+                            state.copy_selection(&rows);
+                            state.frame_rows = rows;
+                        }
+                        continue;
+                    }
+
                     // 选区是「刚才那次鼠标操作」的产物。保留它会让高亮看起来像
                     // 卡住的样式；导航键（PageUp 等）尤其如此——用户按下去是要
                     // 翻页，不是要继续选。Esc 也走这条，无需单独分支。
@@ -5913,7 +5928,7 @@ async fn tui_main(
                                     }
                                 }
                             }
-                            KeyCode::Char(c) => {
+                            KeyCode::Char(c) if crate::input::plain_char(&key) == Some(c) => {
                                 if let Some(ib) = owner.live_input_mut(&mut state) {
                                     if !crate::input::apply_edit_key(ib, &key) {
                                         ib.insert_char(c);
@@ -10151,7 +10166,11 @@ async fn tui_main(
                                 }
                                 _ => {}
                             }
-                        } else {
+                        } else if let Some(c) = crate::input::plain_char(&key) {
+                            // 只有「裸字符」（至多带 Shift）才是正文。带 Cmd / Alt /
+                            // Meta 的字符键是系统或应用快捷键——典型的是 macOS 的
+                            // Cmd+C：Kitty 键盘协议把它报成 `Char('c') + SUPER`，
+                            // 这里若照插不误，输入框里就会凭空多出一个 `c`。
                             state.history_idx = None;
                             state.history_draft = None;
                             input.insert_char(c);
