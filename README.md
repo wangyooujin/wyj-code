@@ -1,6 +1,6 @@
 # wyj-code
 
-[![Release](https://img.shields.io/badge/release-v0.3.16-2ee6a4.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.16)
+[![Release](https://img.shields.io/badge/release-v0.3.17-2ee6a4.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.17)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
@@ -21,7 +21,7 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 [贡献指南](./CONTRIBUTING.md)
 
 > **版本状态**：最新公开版本
-> [v0.3.16](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.16)。
+> [v0.3.17](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.17)。
 > 历史 tag 保持不可移动，一键安装脚本始终下载 GitHub 最新公开 Release。
 >
 > **⚠️ v0.2.28 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
