@@ -2,6 +2,7 @@ _version: 1
 command:
   unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
   background_unsupported: "命令 /{name} 声明为后台执行，但返回了 TUI 无法直接渲染的结果类型：{result}"
+  busy_rejected: "回合进行中，/{name} 未执行：这条命令会改会话内容，不能排进当前回合。等回合结束后再回车，或按 ESC 中断后再执行。"
 skill:
   invoked: "使用 skill: /{name}"
   run:
@@ -880,7 +881,7 @@ selection:
   copy_failed: "复制失败：{error}"
 
 auto:
-  mode_notice: "当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。Shift+Tab 在 plan / bypass 之间切换。"
+  mode_notice: "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。"
   degraded_to_confirm: "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。"
 
 cwd:
@@ -1110,6 +1111,15 @@ welcome:
     compact: '/compact 压缩上下文'
     mode: 'Shift+Tab 切换模式'
     quit: 'Ctrl+C 退出'
+  # 常用命令速查（欢迎页区块）。命令名保持 ASCII 不翻译，说明走 i18n。
+  cmd_header: '常用命令'
+  cmd:
+    profile: '/profile 切换分组端点'
+    model: '/model 切换模型'
+    effort: '/effort 思考强度档位'
+    compact: '/compact 压缩上下文'
+    clear: '/clear 清空对话'
+    help: '/help 全部命令'
   version: 'v{version}'
 
 notify:

@@ -1204,6 +1204,21 @@ impl AppState {
                 background,
                 handoff_body,
             } => {
+                // 会话归属过滤：`reset_for_new_session`（`/new`、`/clear`、resume
+                // 切会话）会 `sub_agents.clear()`，所以「这个 id 不在表里」= 它
+                // 属于**上一段会话**。此时既不能注入 reminder、也不能弹通知——
+                // 它们会落到 `pending_bg_reminders`，而主循环的自动唤醒判据
+                // （`app.rs` 的 `!is_thinking && !pending_bg_reminders.is_empty()`）
+                // 只看「有没有待注入内容」，不认来源，于是新会话第一帧就起一轮
+                // 模型请求。这正是「/new 之后 AI 还在继续调用」的形状：旧会话的
+                // 后台子 Agent 跑完了，reminder 顺着新会话的自动唤醒灌了进去。
+                //
+                // 放在事件入口而不是注入前：SubAgentHub 的 `event_cb` 是全局的，
+                // 通道里可能积压着 reset 之前发出的 Done，逐条丢弃最省事。
+                // 未来新增后台生产者只要走 `sub_agents` 登记，就自动被这条覆盖。
+                if !self.sub_agents.contains_key(&id) {
+                    return;
+                }
                 self.trace_push(
                     id,
                     TraceEvent::Done {

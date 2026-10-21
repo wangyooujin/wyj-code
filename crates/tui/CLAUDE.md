@@ -184,16 +184,38 @@
 
 **页面上不得出现 model / cwd**——状态栏已常驻 `◆ <模型> [模式] · <cwd>`（每帧都在）。欢迎页再写一遍就是同一个事实占两个位置：用户读状态栏时它被欢迎页的同名文本稀释，欢迎页因此多占两行却没多给信息。状态栏答「我现在在哪 / 我以什么身份在跑」，欢迎页答「这是什么 / 从哪开始」，职责不重叠。示例提问引导行（`Try "fix this bug" or ask anything…`）同样删除——它与正下方的输入框说的是同一件事，重复即噪音。
 
-**当前布局**（`render_welcome`，共 11 行）：
+**当前布局**（`render_welcome`，共 15 行）：
 
 ```
 (1 行留白)
 WYJ-CODE 艺术字 × 5 行     ← 品牌区
-v0.3.15                     ← 品牌区，紧贴 logo
+v0.3.16                     ← 品牌区，紧贴 logo
 (2 行留白)                  ← 唯一的分组边界
 💡 <轮播 tip>               ← 提示区
+常用命令                     ← 提示区：常用命令区块表头
+/profile  切换分组端点       /model  切换模型
+/effort   思考强度档位       /help   全部命令
+/compact  压缩上下文         /clear  清空对话
 /help · Shift+Tab · /compact · Ctrl+C
 ```
+
+**「常用命令」区块（v0.3.16 起）**：欢迎页底部常驻一份速查表，替代原先那段
+冗长的 auto 模式说明（那段已压成 `auto.mode_notice` 一句短句）。四条规则：
+
+1. **命令名不翻译**（`/profile` 是字面量），**说明走 i18n**（`welcome.cmd.*`）。
+   两者在 `welcome.rs` 里按**第一个空格**切分——`command_entries()` 是唯一
+   切分点。
+2. **两列布局**：命令名用 `Theme::body()`、说明用 `Theme::dim()`，名与说明
+   之间 2 空格（`COMMAND_DESC_GAP`）、列与列之间 4 空格（`COMMAND_COLUMN_GAP`）。
+3. **窄终端整条丢弃，绝不截断命令名**——半截的 `/prof` 比没有这条更糟：用户
+   会以为有个叫 `/prof` 的命令。丢弃顺序 = `COMMAND_HINTS` 的逆序（末尾先丢），
+   所以最常用的 `/profile` `/model` `/effort` 永远在。
+4. **区块行数恒定**（6 条 ÷ 2 列 = 3 行）：放不下时是**格子留空**而不是整行
+   消失。欢迎页总高度因此与终端宽度无关——聊天区高度测量与滚动位置不会漂移。
+
+钉子：`welcome::tests::command_block_height_does_not_depend_on_terminal_width`、
+`welcome_page_lists_the_common_commands`、
+`narrow_terminal_drops_whole_commands_never_truncates_them`。
 
 两条分组规则：**logo 与版本号同属品牌区、必须紧密相邻**（figlet 原输出的第 6 行是整行空格、不是字形，已裁掉）；**品牌区与提示区之间留 2 行**（1 行在 5 行高的 logo 之后会被读成 logo 的下沿）。左缩进固定 2 空格（`CONTENT_INDENT`），与聊天区助手正文（`markdown::Ctx::block_indent` 的 base=2）同列起首。
 
@@ -208,16 +230,18 @@ v0.3.15                     ← 品牌区，紧贴 logo
 
 System 消息（`  ⚙ ` / `  ⚠ ` 标记那类，典型是启动时的 `auto.mode_notice`）**不走 markdown 渲染**，但**必须用 markdown 的折行引擎**折行：`markdown::wrap_plain_text_spans(&[(text, style)], avail)`。
 
-**为什么不能交给 `Paragraph::wrap`**：`Wrap { trim: false }` 走 ratatui 的 `WordWrapper`，它**只在空格处断行**。中文段落几乎没有空格，于是 WordWrapper 一路撑到接近行尾才折回来，把词组拦腰截断。实测（100 列）：
+**为什么不能交给 `Paragraph::wrap`**：`Wrap { trim: false }` 走 ratatui 的 `WordWrapper`，它**只在空格处断行**。中文段落几乎没有空格，于是 WordWrapper 一路撑到接近行尾才折回来，把词组拦腰截断。实测（100 列，样例取 `auto.degraded_to_confirm`）：
 
 ```
-旧：|  ⚙ 当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 +|
-    |模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。…|
-新：|  ⚙ 当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会|
-    |逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。…|
+旧：|  ⚙ auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，|
+    |其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。…|
+新：|  ⚙ auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。|
+    |用 /mode auto 可重新启用分类器。…|
 ```
 
 `WordWrapper` 还会把 `Shift+Tab` 拆成 `Shift+` / `Tab`（按键名被拆开就认不出了），把 `plan / bypass` 里的斜杠留在行尾。
+
+**启动时的 `auto.mode_notice` 已压成一句短句**（v0.3.16）：「auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。」——原来的三行长文把欢迎页压得像免责声明；这句在 100 列下单行放得下，长中文折行的验证改由 `auto.degraded_to_confirm` 承担（`render.rs` 的四个 `system_message_*` 钉子已同步换成新文案）。
 
 **新引擎的三条性质**（都来自 `markdown.rs` 的 `tokenize_atoms` + `wrap_spans`）：宽字符（汉字 / 全角标点 / emoji）逐字之间可断；ASCII 词（`Shift+Tab`）整词不断；遵守中文排版禁则（收尾标点不落行首、开括号不悬行尾）。
 
@@ -246,7 +270,8 @@ System 消息（`  ⚙ ` / `  ⚠ ` 标记那类，典型是启动时的 `auto.m
     - **ESC 保护**：`AppState.auto_wake_paused` 在 `interrupt()` 置 true、`begin_new_turn()` 清 false——用户主动打断意味着"先别继续"，此时后台任务完成也不该自动唤醒（会显得不听话）。
     - **只读快照 API**（`bash_session.rs::BackgroundJob::tail(max_bytes)`）：面板每帧要读输出，但 `read_new()` 推进的是 `BashOutput` 工具的增量读游标，两者共用会互相抢内容（面板看到空白、工具看到"无新输出"）。`tail` 按 char boundary 收口（中文/emoji 安全）且**不推进游标**。**新写 UI 侧读输出时不要用 `read_new()`。**
     - **退出误唤醒**：`kill_all()`（`app.rs` 退出路径 + `cli/main.rs` headless）给所有 Running job 发 SIGKILL，但 `spawn_prepared` 里的 `child.wait()` task 仍会把它们翻成 `Exited(-1)`。轮询检测**必须**用 `!state.should_quit` 守卫拦在前面，否则退出那一帧会把每个后台任务都误判为"刚完成"并触发唤醒。
-    - **两级生命周期粒度**：`begin_new_turn()`（每轮对话）**刻意不清** `shells`——dev server 等任务跨轮次持续存在，在这儿清会让它们从面板凭空消失；真正作废的是 `reset_for_new_session()`（`/clear`/新会话/resume），那里进程本身也已被 `kill_all` 收走。
+    - **两级生命周期粒度**：`begin_new_turn()`（每轮对话）**刻意不清** `shells`——dev server 等任务跨轮次持续存在，在这儿清会让它们从面板凭空消失；真正作废的是 `reset_for_new_session()`（`/clear`/新会话/resume），它现在自己就做三件事：`hub.abort_all()`、记 `stale_shells` 后 `BashSessionManager::global().kill_all()`、清表。**「进程本身由退出路径的 kill_all 收走」是错的**（v0.3.17 修）：`/new` 走不到退出路径，旧会话的 dev server/watcher 会继续跑并继续写文件。
+    - **`/new` 之后 AI 还在继续调用**（v0.3.17 修，两个独立根因，都得修）：① **忙碌期把 slash 命令当正文排队**——`runs_while_busy` 默认 false 是对的（`/new` 绝不能中途改会话），但落点不能是 `queue.push(InjectionKind::UserMessage)`：那等于把字面的 `/new` 当用户消息发给模型并让它再跑一轮。现在 Enter 分支用 `draft_is_known_command` 把「已注册命令」单独判出来，明确拒绝 + `command.busy_rejected` 提示，输入框内容保持原样，ESC 后可重试；只有非命令正文与未知命令才排队。② **清表不作废生产者**——`pending_bg_reminders` 的自动唤醒判据只看「有没有待注入内容」，不认来源会话，于是旧会话的后台子 Agent Done / 后台 shell 退出通知会灌进新会话并起一轮模型请求。修法是两层归属过滤：`apply_sub_agent_event` 的 `E::Done` 在 `sub_agents` 里查不到该 id（`reset_for_new_session` 已清表）就整段 `return`，连 trace 都不写；shell 侧靠 `AppState::stale_shells`，`poll_shells` 见到就跳过——**只 kill 不记黑名单没用**，`BashSessionManager::jobs` 只增不减，下一帧会走 `None => push(Running)` 把 `Exited(-1)` 的旧 job 当新任务登记回来并上报一次「刚完成」，等于把唤醒重新制造一遍。钉子：`busy_drafts_separate_commands_from_plain_text`、`done_from_a_reset_session_never_revives_the_agent`、`reset_for_new_session_retires_background_shells`、`poll_shells_ignores_shells_retired_by_the_previous_session`（另有反向对照 `poll_shells_still_reports_jobs_it_does_not_know_about`，防止 `sync_once` 假通过）。
     - **面板优先级**（`render.rs::bottom_panel_size`）：`Shells` 与 `SubAgents` 互斥（底部只有一个位置），规则是**用户焦点优先，其次按"有运行中任务"**。两者常同时跑（派 agent 改代码 + 自己起 dev server），固定先后会让其中一方永远看不见也按不了 k。跨区链条 `Chat ↓ → Todos ↓ → SubAgents ↓ → Shells`，`UiFocus` 需在 6 处 match 里同步加分支（`move_focus_selection` / `scroll_focus_lines` / `content_focus_active` / `enter_content_focus` / `leave_content_focus` / `toggle_focused_content_detail` / `close_panel_focus`）。
     - **`Shift+↑` 进入内容区：三个容易踩回去的坑**（v0.3.11 修）。① 判定必须用 `contains(SHIFT)` + 排除 `CONTROL|ALT|SUPER`，**不能**用 `modifiers == SHIFT`——部分终端会带上额外修饰位，严格相等会让按键静默失效；② 判定位置必须在 `file_completions` / `slash_completions` 拦截**之前**，否则补全列表开着时 `KeyCode::Up` 被补全分支 `continue` 吃掉；③ `enter_content_focus` 的早退条件必须排除 `UiFocus::Chat`——滚动聊天区（PageUp/滚轮）会把焦点留在 Chat，把 Chat 当成「已在内容区」就会让「子 Agent 正在跑但进不去」稳定复现。主循环侧的触发条件因此是 `!content_focus_active() || (ui_focus == Chat && 下方面板存在)`：Chat 焦点下没有下方面板时不抢键，避免「正在滚历史时按 Shift+↑ 突然跳到会话末尾」。钉子：`only_shift_up_is_the_explicit_content_focus_shortcut`、`shift_up_from_chat_focus_still_enters_running_sub_agent`。
     - **子 Agent 执行内容占内容区，不占面板**（v0.3.3）：选中子 Agent（`Shift+↑` / `↑↓` / `/subagents`）后 `draw()` 把 `chunks[0]` 从 `draw_chat` 换成 `draw_sub_agent_content`，底部面板退化成纯列表 + 选中高亮。**不要再把 trace 塞回面板**：面板高度受 `bottom_panel_size` 预算限制，且列表本身要占行，`ui_focus == SubAgents` 分支给的高度恒等于 `list_rows + 2`，任何"详情区"布局判断（旧的 `inner.height > list_rows`）恒为 false —— 这就是曾经"选中子 Agent 后一片空白"的根因。后台 shell 面板**仍用面板内详情区**（`draw_shell_panel`），两者刻意不对称：shell 详情是实时输出尾巴，量小；subagent trace 是完整工具入参/出参，需要整屏。
