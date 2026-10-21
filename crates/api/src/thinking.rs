@@ -626,6 +626,50 @@ pub fn normalize_effort(identity: &ModelIdentity, raw: &str) -> Option<&'static 
         .then_some(parsed.as_str())
 }
 
+/// 该 endpoint **真正支持**的 effort 档位列表（按档位从弱到强排序）。
+///
+/// 供 `/effort` 面板用：只列端点认的档位，避免用户挑了一个会被静默丢弃的
+/// 值（DeepSeek 没有 `xhigh`、GLM 根本不认 effort）。空切片 = 该端点
+/// 整体不支持档位（只认开关），面板此时只显示「关闭思考」这一项。
+///
+/// 排序是**按档位强弱**而不是按 `effort_levels` 的原始顺序——后者是
+/// 各 vendor 表里手写的，顺序不保证（`moonshot` 的表是 low/high/max，
+/// `anthropic` 的是 low/medium/high/xhigh/max）。面板要的是一条从弱到强的
+/// 阶梯，用户上下键走下来才知道自己在往哪调。
+pub fn supported_effort_levels(identity: &ModelIdentity) -> Vec<ReasoningEffort> {
+    let spec = ThinkingSpec::for_vendor(&identity.vendor, &identity.wire_protocol, &identity.model);
+    // 档位强弱顺序：minimal < low < medium < high < xhigh < max。
+    // `adaptive` 不在阶梯上（它是「服务端自己决定」的语义，不是强度），
+    // 但端点认它就该列出来——放在阶梯末尾。
+    const LADDER: &[ReasoningEffort] = &[
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::XHigh,
+        ReasoningEffort::Max,
+    ];
+    let mut out: Vec<ReasoningEffort> = LADDER
+        .iter()
+        .copied()
+        .filter(|level| spec.effort_levels.contains(level))
+        .collect();
+    if spec.effort_levels.contains(&ReasoningEffort::Adaptive) {
+        out.push(ReasoningEffort::Adaptive);
+    }
+    out
+}
+
+/// 该 endpoint 是否允许用户**关闭**思考。
+///
+/// 判据是 `ThinkingSpec::user_can_disable`：有些端点（MiniMax M2.x、
+/// DeepSeek reasoner）会忽略用户传的 `disabled`，此时面板不该给出
+/// 「关闭思考」这一项——给了也关不掉。
+pub fn can_disable_thinking(identity: &ModelIdentity) -> bool {
+    let spec = ThinkingSpec::for_vendor(&identity.vendor, &identity.wire_protocol, &identity.model);
+    spec.user_can_disable && !matches!(spec.control, ThinkingControl::Disabled)
+}
+
 // ── ThinkingAdapter trait + dispatch ─────────────────────────────────────────
 
 // ── Anthropic 线协议下的 thinking 字段 ─────────────────────────────────────
@@ -2389,7 +2433,6 @@ mod tests {
             provider: wyj_config::Provider::Anthropic,
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-opus-4-8".to_string(),
-            vendor: Some("anthropic".to_string()),
             reasoning_effort: Some("high".to_string()),
             ..Default::default()
         };
@@ -2523,7 +2566,6 @@ mod tests {
             provider: wyj_config::Provider::Anthropic,
             base_url: "https://api.minimaxi.com/anthropic".to_string(),
             model: "MiniMax-M3.1-Flash-Preview".to_string(),
-            vendor: Some("minimax".to_string()),
             reasoning_effort: Some(effort.to_string()),
             ..Default::default()
         }

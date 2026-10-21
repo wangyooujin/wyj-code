@@ -814,13 +814,6 @@ impl Theme {
             Color::Indexed(i) => CrosstermColor::AnsiValue(i),
         }
     }
-
-    /// 示例提问建议行样式：dim + 斜体，区别于输入框真实 placeholder
-    pub fn welcome_suggestion() -> Style {
-        Style::default()
-            .fg(Self::inactive_color())
-            .add_modifier(Modifier::ITALIC)
-    }
 }
 
 #[cfg(test)]

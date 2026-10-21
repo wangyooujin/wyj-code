@@ -80,6 +80,12 @@ pub enum AgentEvent {
         field_idx: usize,
         result: Result<Vec<String>, String>,
     },
+    /// `/model` 面板拉取当前分组端点的模型列表结果。
+    ///
+    /// 与 `ModelsFetched` 分开是因为归属不同：那个是分组面板里**编辑某个
+    /// 分组的 model 字段**时的拉取（要带 entry_idx / field_idx 回填），
+    /// 这个是 `/model` 面板**切换当前模型**时的拉取（结果直接进选择列表）。
+    ModelListFetched { result: Result<Vec<String>, String> },
     /// 子 Agent 生命周期事件（SubAgentHub 汇聚转发）
     SubAgent(wyj_tools::SubAgentEvent),
     /// 用户在后台任务面板按 `k` 终止某个任务后，kill 流程完成的通知

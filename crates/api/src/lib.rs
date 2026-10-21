@@ -25,17 +25,15 @@ pub use model_catalog::{
     apply_parallel_policy, CatalogResolution, ModelCatalog, VerificationStatus,
     DEFAULT_PARALLEL_MAX_TOOLS,
 };
-pub use models::{
-    fetch_model_ids, known_model_capacity, ModelCapacity, ProfileTemplate, PROFILE_TEMPLATES,
-};
+pub use models::{fetch_model_ids, infer_vendor, known_model_capacity, ModelCapacity};
 pub use openai::OpenAIProvider;
 pub use prompt_policy::PromptPolicy;
 pub use provider::{Provider, SystemPrompt};
 pub use request_plan::*;
 pub use thinking::{
-    adapter_for, apply_thinking_to_openai_body, normalize_effort, should_emit_interleaved_beta,
-    supports_effort, ReasoningEffort, ThinkingAdapter, ThinkingControl, ThinkingResponseFields,
-    ThinkingSpec,
+    adapter_for, apply_thinking_to_openai_body, can_disable_thinking, normalize_effort,
+    should_emit_interleaved_beta, supported_effort_levels, supports_effort, ReasoningEffort,
+    ThinkingAdapter, ThinkingControl, ThinkingResponseFields, ThinkingSpec,
 };
 pub use types::*;
 

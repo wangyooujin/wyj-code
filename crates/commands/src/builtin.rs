@@ -1564,8 +1564,53 @@ impl Command for ComputerCmd {
     }
 }
 
+// ── /profile ──────────────────────────────────────────────────────────────────
+
+/// `/profile` — 调用分组管理（对应 CLI 的 `--profile <name>`）。
+///
+/// 与 `/model` 的分工：**分组 = 一整套端点凭据**（provider / base_url /
+/// api_key / 容量），**模型 = 分组下的某一个模型名**。两者作用域也不同：
+/// 分组写 `config.toml`（全局），模型只改内存（仅本次会话生效）。
+pub struct ProfileCmd;
+
+#[async_trait]
+impl Command for ProfileCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "profile"
+    }
+    fn description(&self) -> String {
+        tr("profile.desc")
+    }
+    fn usage(&self) -> String {
+        "/profile [profile-name] | /profile doctor [profile-name]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        if args.trim().is_empty() {
+            return Ok(CommandResult::OpenProfileDialog);
+        }
+        let mut parts = args.split_whitespace();
+        if parts.next() == Some("doctor") {
+            return Ok(CommandResult::ModelDoctor(parts.next().map(str::to_string)));
+        }
+        Ok(CommandResult::SwitchProfile(args.trim().to_string()))
+    }
+}
+
 // ── /model ────────────────────────────────────────────────────────────────────
 
+/// `/model` — 切换当前分组下的模型。
+///
+/// **只存内存**，不写 `config.toml`、不落会话文件：`--resume` 后回到
+/// profile 里配置的模型。理由是这个命令的全部价值就是「为手头这个任务
+/// 临时换个模型」——写进全局配置会污染其它项目，也会让「当前在跑哪个
+/// 模型」这件事在会话恢复后变得不可解释。
+///
+/// 生效范围是**当前模式实际读的那个字段**（auto/bypass → `exec_model`，
+/// plan → `plan_model`；为空时回退 `model`），所以 plan 模式挑的模型
+/// 不会顺手改掉 auto 模式用的那个。
 pub struct ModelCmd;
 
 #[async_trait]
@@ -1580,17 +1625,51 @@ impl Command for ModelCmd {
         tr("model.desc")
     }
     fn usage(&self) -> String {
-        "/model [profile-name] | /model doctor [profile-name]".to_string()
+        "/model [model-name]".to_string()
     }
     async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
         if args.trim().is_empty() {
-            return Ok(CommandResult::OpenProfileDialog);
+            return Ok(CommandResult::OpenModelPicker);
         }
-        let mut parts = args.split_whitespace();
-        if parts.next() == Some("doctor") {
-            return Ok(CommandResult::ModelDoctor(parts.next().map(str::to_string)));
+        Ok(CommandResult::SwitchModel(args.trim().to_string()))
+    }
+}
+
+// ── /effort ───────────────────────────────────────────────────────────────────
+
+/// `/effort` — 调整思考强度档位。
+///
+/// 档位**随会话落盘**（`--resume` 后继续生效），但**不写 `config.toml`**：
+/// 思考档位是「这个任务要多想一点」的工作状态，与「这个分组是什么端点」
+/// 是两回事。
+///
+/// 档位列表按**当前模型的能力表**过滤（`ThinkingSpec::effort_levels`）：
+/// Claude 有五档、GLM 只认开关、MiniMax M3 只有 low/high/max——
+/// 列出端点不认的档位只会被静默丢弃，用户还以为设上了。
+///
+/// `off` 的语义是「彻底关思考」：`reasoning_effort` 清空 +
+/// `thinking_switch` 置 `disabled`。
+pub struct EffortCmd;
+
+#[async_trait]
+impl Command for EffortCmd {
+    fn runs_while_busy(&self) -> bool {
+        true
+    }
+    fn name(&self) -> &str {
+        "effort"
+    }
+    fn description(&self) -> String {
+        tr("effort.desc")
+    }
+    fn usage(&self) -> String {
+        "/effort [level|off]".to_string()
+    }
+    async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
+        if args.trim().is_empty() {
+            return Ok(CommandResult::OpenEffortPicker);
         }
-        Ok(CommandResult::SwitchProfile(args.trim().to_string()))
+        Ok(CommandResult::SetEffort(args.trim().to_ascii_lowercase()))
     }
 }
 
@@ -2163,7 +2242,9 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
+    reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));
+    reg.register(Arc::new(EffortCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(MouseCmd));
@@ -2225,7 +2306,9 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
     reg.register(Arc::new(ComputerCmd));
+    reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));
+    reg.register(Arc::new(EffortCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
     reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(MouseCmd));

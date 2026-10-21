@@ -654,6 +654,30 @@ impl AppState {
                 }
             }
 
+            AgentEvent::ModelListFetched { result } => {
+                if let Some(dialog) = &mut self.model_picker {
+                    if dialog.loading {
+                        dialog.loading = false;
+                        match result {
+                            Ok(mut models) => {
+                                // 拉到的模型按名称排序：供应商返回顺序不保证，
+                                // 用户在列表里是按名字找模型的。
+                                models.sort();
+                                dialog.models = models;
+                                dialog.selected = 0;
+                                dialog.error = None;
+                            }
+                            Err(e) => {
+                                // 拉不到不是死路：「手动输入」那一项始终在，
+                                // 端点不实现 /models 的用户照样能切模型。
+                                dialog.error =
+                                    Some(wyj_i18n::tr_fmt("model.picker.failed", &[("err", &e)]));
+                            }
+                        }
+                    }
+                }
+            }
+
             AgentEvent::McpRegistryFetched { result } => {
                 if let Some(dialog) = &mut self.mcp_dialog {
                     if matches!(dialog.overlay, McpOverlay::Searching) {

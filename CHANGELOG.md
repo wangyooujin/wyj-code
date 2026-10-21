@@ -10,6 +10,74 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [Unreleased]
+
+### 模型配置体系拆分：`/profile` · `/model` · `/effort`
+
+此前 `/model` 一个命令背了三件事：管理调用分组、切分组、切模型。新版拆成三个
+职责单一、**作用域互不相同**的命令：
+
+| 命令 | 职责 | 作用域 | 落盘 |
+|---|---|---|---|
+| `/profile` | 分组管理（= CLI `--profile <name>` 对应的那套端点凭据） | 全局默认 | 写 `config.toml` |
+| `/model` | 切换当前分组下的**模型** | **仅内存** | 不写 config、不落会话文件 |
+| `/effort` | 思考强度档位 | **随会话** | 落会话文件，不写 config |
+
+### ① 删掉 9 个内置模板，新建分组改空白表单
+
+GLM / 火山 / MiniMax / Kimi / DeepSeek / 通义 / Ollama / vLLM / 自定义九套模板
+连同「模板选择器」浮层一并移除。模板的实质作用是预填端点与供应商特征，但这些值
+全都可以由用户自己填——模板反而把「我用的是哪家」固化成了二选一的菜单，而真实
+世界的私有代理根本不在列表里。现在新建分组直接插入一条**空白**草稿并进入重命名。
+
+### ② `Profile.vendor` / `Profile.wire_protocol` 移除，vendor 改为推断
+
+vendor 一律由 `base_url` + 模型名推断，线协议由 `provider` 唯一决定。
+
+**这次改动的前置条件是收敛 vendor 推导**：仓库里此前有**三份互不一致**的
+`infer_vendor` 副本（`model_catalog.rs` / `openai.rs` / `anthropic.rs`），needle 表与
+兜底各不相同。字段显式写死时三者结果相同，字段一移除就立刻分歧——官方 OpenAI
+端点在 `openai.rs` 里会被推成 `"custom"`，于是 `uses_max_completion_tokens` 误判，
+把 `max_tokens` 而不是 `max_completion_tokens` 发出去，官方 reasoning 模型直接 400。
+现已收敛为 `wyj_api::models::infer_vendor` 单一实现（needle 取三方并集，兜底统一
+`"custom"`，本地端点特判排在 needle 表之前）。
+
+旧 config.toml 里的 `vendor =` / `wire_protocol =` 两行**静默忽略**（无
+`deny_unknown_fields`），下次 `config.save()` 时随 `profiles` 数组整体替换而消失。
+
+### ③ `/model` 面板：拉端点模型列表
+
+面板从**当前生效分组**的端点拉 `/models`，失败时保留「手动输入」入口（第三方代理
+常不实现该接口）。切换只改**当前模式实际读的那个字段**（auto/bypass →
+`exec_model`，plan → `plan_model`，为空时回退 `model`）——plan 模式挑模型不会顺手
+改掉 auto 模式用的那个。
+
+### ④ `/effort`：档位按端点能力过滤
+
+面板只列**当前模型真正支持**的档位（`ThinkingSpec::effort_levels`）：Claude 五档、
+DeepSeek 四档、MiniMax M3 三档、GLM 根本不认 effort（只认开关）。列出端点不认的
+档位只会被静默丢弃，用户还以为设上了。`off` 的语义是**彻底关思考**（effort 清空
++ `thinking_switch = disabled`），`thinking_budget` 不动——官方 Anthropic 上两者
+控制不同维度，可以共存。
+
+### ⑤ 状态栏显示当前思考强度
+
+`◆ model [auto] · high ~/proj`。**两种情况整段不显示**：用户从没设过档位（没设过
+的东西不该占地方）、当前端点根本不认 effort（显示一个永远发不出去的值是误导）。
+`off` 要显示——那是显式状态而非「没设」。判据与 provider 序列化请求体用的是同一张
+能力表，避免「状态栏说 high、请求里被静默丢掉」。
+
+### ⑥ 其它
+
+- `/profile` 面板的 onboarding 文案、`/help` 条目、i18n desc 全部同步改名
+- 忙碌期白名单（`runs_while_busy`）新增 `/profile` 与 `/effort`——`busy_whitelist_tests`
+  是**精确集合**断言，多一条少一条都红
+- headless REPL 里 `/model <名>` 与 `/effort <档位>` **可以正常执行**（只改内存 +
+  重建 Agent，无 UI 依赖），只有面板形态给出提示
+- 钉子：`models::infer_vendor_tests` / `session_store::session_effort_survives_save_load_round_trip`
+  / `render::status_bar_shows_the_thinking_level_only_when_it_is_in_effect` /
+  `app::model_panel` 与 `app::effort_panel` 各自的形状测试
+
 ## [0.3.15] - 2026-10-20
 
 ### 思考强度跨协议打通，官方端点不再缺臂，同 chunk 丢字修复

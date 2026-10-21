@@ -162,11 +162,22 @@ mod tests {
 
     /// OpenAI 协议 + 指定 vendor —— `Profile::default()` 是 Anthropic 协议，
     /// 那样所有 vendor 都会落到 `anthropic_compatible`，测不到 effort 分支。
+    ///
+    /// vendor 不再是配置项，改为由 `base_url` + 模型名**推断**。所以这里必须
+    /// 同时给出能推导出目标 vendor 的 base_url —— 推导入口是
+    /// `wyj_api::models::infer_vendor`（全仓唯一一份）。
     fn profile_for(vendor: &str, model: &str, effort: &str) -> Profile {
+        let base_url = match vendor {
+            "openai" => "https://api.openai.com/v1",
+            "alibaba" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "deepseek" => "https://api.deepseek.com",
+            "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+            other => panic!("测试辅助函数未覆盖 vendor {other}"),
+        };
         Profile {
             provider: wyj_config::Provider::OpenAI,
-            vendor: Some(vendor.to_string()),
             model: model.to_string(),
+            base_url: base_url.to_string(),
             reasoning_effort: Some(effort.to_string()),
             ..Profile::default()
         }
@@ -261,7 +272,6 @@ mod tests {
     fn official_anthropic_sends_budget_and_effort_together() {
         let mut profile = Profile {
             provider: wyj_config::Provider::Anthropic,
-            vendor: Some("anthropic".to_string()),
             model: "claude-opus-4-8".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             reasoning_effort: Some("high".to_string()),
@@ -289,7 +299,6 @@ mod tests {
     fn effort_on_an_unsupported_anthropic_model_is_dropped_visibly() {
         let mut profile = Profile {
             provider: wyj_config::Provider::Anthropic,
-            vendor: Some("anthropic".to_string()),
             model: "claude-3-5-sonnet-20241022".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             reasoning_effort: Some("high".to_string()),
@@ -352,9 +361,11 @@ mod tests {
 
     #[test]
     fn unsupported_reasoning_is_dropped_visibly() {
+        // base_url 指向一个认不出来的第三方端点 → vendor 推成 "custom"，
+        // 而 custom 的 ThinkingSpec 是 `Disabled`（什么思考参数都不支持）。
         let profile = Profile {
             thinking_budget: Some(1024),
-            vendor: Some("custom".to_string()),
+            base_url: "https://proxy.invalid".to_string(),
             ..Profile::default()
         };
         let mut caps = ModelCapabilities::conservative(64_000, 8_192);

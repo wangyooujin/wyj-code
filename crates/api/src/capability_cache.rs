@@ -376,7 +376,6 @@ mod tests {
     fn rejected_thinking_marks_catalog_thinking_unsupported() {
         let dir = tempfile::tempdir().unwrap();
         let profile = Profile {
-            vendor: Some("deepseek".to_string()),
             base_url: "https://api.deepseek.com".to_string(),
             model: "deepseek-v4-pro".to_string(),
             thinking_budget: Some(8000),

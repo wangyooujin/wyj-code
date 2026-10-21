@@ -6,6 +6,58 @@
 根目录 `CLAUDE.md` 只留跨 crate 的通则与索引，本目录的实现细节全部沉在这里。
 
 
+## vendor 推断：全仓唯一一份
+
+`Profile.vendor` 配置项**已移除**（v0.3.16），vendor 一律由 `base_url` + 模型名**推断**，
+实现只有一份：`api/src/models.rs::infer_vendor(profile, model)`。
+
+**为什么必须收敛成一份**：这份实现此前存在**三份互不一致的副本**——`model_catalog.rs`、
+`openai.rs`、`anthropic.rs` 各写一份，needle 表与兜底各不相同（`openai.rs` 缺
+`api.openai.com` 判定，`anthropic.rs` 缺 deepseek/qwen/volcengine/ollama/vllm 且兜底
+返回 `"anthropic"`）。那时无害，因为 `Profile.vendor` 显式写死时三者拿到同一个值；
+**字段一移除三者立刻分歧**——最直接的后果是官方 OpenAI 端点在 `openai.rs` 里被推成
+`"custom"`，于是 `uses_max_completion_tokens` 误判为「非官方 OpenAI」，把
+`max_tokens` 而不是 `max_completion_tokens` 发出去，官方 reasoning 模型直接 400。
+
+**五条分层规则**（顺序本身就是不变式，改动时必须连带想清楚先后）：
+
+1. **本地端点**（ollama 靠端口 11434，vLLM 靠路径或端口 8000）→ 本地推理。
+   必须排在 needle 表之前：它们的模型名往往含 `qwen`（`qwen3-coder`），
+   先跑 needle 表会被认成阿里云。vLLM 的默认地址 `http://127.0.0.1:8000/v1`
+   **不含 "vllm" 字样**——只靠路径匹配的话它会掉进 needle 表，正是旧模板靠
+   显式 `vendor = "vllm"` 兜住、移除该字段后暴露出来的洞。
+2. **`base_url` 留空** → `provider` 的官方默认端点。无歧义，且必须排在
+   「模型名带命名空间」之前：OpenAI 的微调模型 ID 带冒号
+   （`ft:gpt-4o:acme:123`），顺序反了会被误判成聚合路由。
+3. **端点域名命中厂商官方域名表**（`VENDOR_DOMAINS`，**精确匹配**或子域
+   匹配，不用子串包含——`z.ai` 子串匹配会误伤 `siz.ai`）→ 该厂商。
+   这一层无歧义，排在模型名规则之前正是为了让「厂商官方端点 + 带前缀的
+   模型名」仍走厂商臂。
+4. **聚合路由 / 模型中转** → `"custom"`。两条判据取或：域名特征词
+   （`router` / `oneapi` / `newapi` / `siliconflow` / `openscale` …）**或**
+   **模型名带命名空间分隔符**（`/` 或 `:`）。
+   理由：OpenRouter 这类中转端点的模型 ID 带厂商前缀
+   （`minimax/minimax-m3.1-flash:free`），按模型名认厂商就会给不认
+   `thinking.type` / `reasoning_split` / `output_config.effort` 的中转端点
+   发厂商专属字段 → **400**。「带分隔符」这条覆盖了词表穷举不到的域名。
+   **代价（信息损失）**：中转端点若用**无前缀**的模型 ID
+   （`deepseek-v4.1-flash`），就与厂商官方端点再也区分不开——旧配置里靠显式
+   `vendor = "custom"` 兜住的那个信息随字段移除而消失，只能靠域名特征词兜。
+5. **模型名 needle**（三方并集，宁可多认一个也不要让同一端点在两处推成不同
+   结果）→ 该厂商。兜底到这里说明端点不是任何厂商的官方域名（自建代理 /
+   公司网关），按模型名猜——与旧实现同源。
+   **兜底必须是 `"custom"`**：「认不出来」与「认成 anthropic 官方」是两回事，
+   后者会误开官方端点专属的行为（interleaved beta / `max_completion_tokens` /
+   五档 effort）。
+
+线协议（`wire_protocol`）配置项**同步移除**，由 `provider` 唯一决定
+（`Profile::effective_wire_protocol`）。`WireProtocol` 枚举本身保留
+（`OpenAiResponses` / `QwenNative` / `Gemini` 变体），只是没有配置入口了。
+
+**移除字段时必须验证「零行为变化」**：推导结果要与用户原先手写的 `vendor`
+**逐条一致**。钉子 `a_real_users_profiles_resolve_to_the_same_vendors_as_before`
+用一位用户真实 config.toml 的 6 个分组样本（含 4 个聚合路由）逐条比对。
+
 ## System prompt 分段与 prompt cache
 
 

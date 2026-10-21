@@ -68,10 +68,7 @@ impl AnthropicProvider {
         let api_key = cfg.api_key()?.to_string();
         let base_url = cfg.resolved_base_url().trim_end_matches('/').to_string();
         let profile = cfg.active_profile();
-        let vendor = profile
-            .vendor
-            .clone()
-            .unwrap_or_else(|| infer_vendor(&profile.base_url, model).to_string());
+        let vendor = crate::models::infer_vendor(profile, model);
         let dropped_parameters =
             crate::request_plan::RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
         let is_official = profile.is_official_anthropic_endpoint();
@@ -101,28 +98,6 @@ impl AnthropicProvider {
             wire_protocol: WireProtocol::AnthropicMessages,
         }
     }
-}
-
-/// vendor 推导（fallback）。当 profile 没声明 vendor 时按 base_url + model 名粗略回退。
-fn infer_vendor(base_url: &str, model: &str) -> &'static str {
-    let base_url = base_url.to_ascii_lowercase();
-    let model = model.to_ascii_lowercase();
-    let haystack = format!("{} {}", base_url, model);
-    for (needle, vendor) in [
-        ("api.anthropic.com", "anthropic"),
-        ("bigmodel", "zhipu"),
-        ("z.ai", "zhipu"),
-        ("glm", "zhipu"),
-        ("minimax", "minimax"),
-        ("minimaxi.com", "minimax"),
-        ("moonshot", "moonshot"),
-        ("kimi", "moonshot"),
-    ] {
-        if haystack.contains(needle) {
-            return vendor;
-        }
-    }
-    "anthropic" // 协议是 anthropic 但 vendor 未知
 }
 
 // ── 请求/响应类型 ────────────────────────────────────────────────────────────

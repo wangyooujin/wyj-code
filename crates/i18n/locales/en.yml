@@ -273,7 +273,9 @@ help:
     - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
     - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
     - `/evolve` — Open the evolution governance center (Active / Candidates / Episodes / Health)
-    - `/model [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly (persisted as the global default). Inside the manager, press Enter on a profile → "Use for this session" applies it to the current session only: nothing is written to config.toml, and the choice is stored in the session file so `--resume` keeps using it
+    - `/profile [profile]` — Manage call profiles; no arg opens the manager, with a name switches directly (persisted as the global default). Inside the manager, press Enter on a profile → "Use for this session" applies it to the current session only: nothing is written to config.toml, and the choice is stored in the session file so `--resume` keeps using it
+    - `/model [model]` — Switch the model of the current profile; no arg opens the model picker (fetches the available model list from the endpoint), with a name switches directly. **Session-only**: nothing is written to config.toml and it is not stored in the session file, so `--resume` returns to the profile's configured model. Only the model field actually used by the current mode is affected
+    - `/effort [level]` — Adjust reasoning effort; no arg opens the level picker (listing only the levels the current endpoint really supports), with a level switches directly, `off` disables thinking. Stored in the session file so `--resume` keeps using it, but never written to config.toml
     - `/mcp` — Manage MCP servers (browse/search the Registry, install/upgrade/uninstall, global or project scope)
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
@@ -815,10 +817,32 @@ status:
   # headless REPL / `-p` / ACP stdio / daemon TCP exit hint when API Key
   # is missing: point users at the TUI onboarding flow or env var fallback.
   api_key_missing_onboarding_headless: |-
-    Run `wyj-code` to open the interactive setup, fill in your API key in the /model panel, then press Ctrl+S to save (no restart required). Alternatively, set the `WYJ_CODE_API_KEY` environment variable and retry.
+    Run `wyj-code` to open the interactive setup, fill in your API key in the /profile panel, then press Ctrl+S to save (no restart required). Alternatively, set the `WYJ_CODE_API_KEY` environment variable and retry.
 
 model:
-  desc: "Manage call profiles: /model opens the profile manager, /model <name> switches directly"
+  desc: "Switch the model of the current profile: /model opens the model picker, /model <name> switches directly (session-only, not written to config)"
+  switched: "Model switched to {name}"
+  switch_failed: "[switch failed] {err}"
+  picker:
+    title: "Select a model"
+    manual: "Type a model name manually…"
+    loading: "Fetching the model list…"
+    failed: "Failed to fetch the model list: {err} (you can type a model name manually)"
+    need_api_key: "Fill in the API Key in the /profile panel before fetching the model list"
+    headless_unsupported: "[headless mode has no /model panel; use /model <name> to switch directly]"
+
+profile:
+  desc: "Manage call profiles: /profile opens the profile manager, /profile <name> switches directly (persisted as the global default)"
+
+effort:
+  desc: "Adjust reasoning effort: /effort opens the level picker (only levels the current endpoint supports), /effort <level> switches directly, /effort off disables thinking (session-scoped)"
+  switched: "Reasoning effort switched to {level}"
+  unsupported_level: "The current endpoint does not support the level '{level}' (supported: {supported})"
+  picker:
+    title: "Reasoning effort"
+    off: "Disable thinking"
+    none_supported: "The current endpoint does not support reasoning levels (on/off only)"
+    headless_unsupported: "[headless mode has no /effort panel; use /effort <level> to switch directly]"
 
 mode:
   desc: "Switch run mode: /mode [auto|plan|bypass]"
@@ -950,8 +974,9 @@ dialog:
     skills_search: "[Skills] Enter a keyword to search the registry (Enter to search / Esc to cancel)"
     plugins_add_marketplace: "[Plugins] Enter marketplace URL (Enter to submit / Esc to cancel)"
     plugins_add_local: "[Plugins] Enter local plugin path (Enter to submit / Esc to cancel)"
-    profile_rename: "[Model] Rename profile (Enter to submit / Esc to cancel)"
-    profile_field: "[Model] Edit {field} (Enter to submit / Esc to cancel)"
+    profile_rename: "[Profile] Rename profile (Enter to submit / Esc to cancel)"
+    profile_field: "[Profile] Edit {field} (Enter to submit / Esc to cancel)"
+    model_manual: "[Model] Type the model name (Enter to submit / Esc to cancel)"
     settings_field: "[Config] Edit {field} (Enter to submit / Esc to cancel)"
     schedule_field: "[Schedule] Edit {field} (Enter to submit / Esc to cancel)"
     schedule_freq_daily: "[Schedule] Enter time as HH:MM (Enter to submit / Esc to cancel)"
@@ -1014,7 +1039,7 @@ profile:
   session_follow_global: "Back to following the global profile (session only; config not written)"
   switch_failed: "[Switch failed] {err}"
   not_found: "Profile '{name}' not found"
-  headless_unsupported: "[headless mode doesn't support /model profile management, use TUI mode instead]"
+  headless_unsupported: "[headless mode doesn't support /profile management, use TUI mode instead]"
   dialog:
     hint1: "  ↑↓ Move  Enter Edit/Fetch models/Toggle  ←→ Cycle enum values"
     hint2: "  Ctrl+S Save (auto-saved after \"Set active\")  Esc Close (asks if unsaved)"
@@ -1055,9 +1080,10 @@ profile:
     unsaved_cancel: "Cancel"
 
 welcome:
-  placeholder: 'Try "fix this bug" or ask anything…'
-  # 旧的 greeting key 已废弃，欢迎页改为展示 Profile/Model + cwd 两行信息看板
-  greeting: ''
+  # The old greeting / placeholder keys are retired:
+  #   - greeting: the welcome page is now a brand block plus a hints block
+  #   - placeholder: the sample-prompt line duplicated the input box
+  # model / cwd are not here either — the status bar keeps them permanently.
   tip_0: '/compact manually compresses the context to save tokens'
   tip_1: '/clear wipes the conversation to start a fresh task'
   tip_2: 'Type @ in your message to quickly reference a file in the project'
