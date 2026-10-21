@@ -22,11 +22,28 @@ pub enum CommandResult {
     OutputPlain(String),
     /// 清空对话历史
     ClearHistory,
-    /// 打开分组（Profile）管理面板（/model 无参触发）
+    /// 打开分组（Profile）管理面板（/profile 无参触发）
     OpenProfileDialog,
     ModelDoctor(Option<String>),
-    /// 按名切换激活分组（/model <name> 触发）
+    /// 按名切换激活分组（/profile <name> 触发）
     SwitchProfile(String),
+    /// 打开模型选择面板（/model 无参触发）。
+    ///
+    /// 面板从当前分组的端点拉 `/models` 列表，失败时回退手填。
+    OpenModelPicker,
+    /// 切换当前分组下的模型（/model <model-name> 触发）。
+    ///
+    /// **只改内存**：不写 `config.toml`、不落会话文件。生效范围是当前
+    /// 模式实际读的那个模型字段。
+    SwitchModel(String),
+    /// 打开思考强度档位面板（/effort 无参触发）。
+    ///
+    /// 面板只列当前端点**真正支持**的档位。
+    OpenEffortPicker,
+    /// 设置思考强度档位（/effort <level|off> 触发）。
+    ///
+    /// 档位随会话落盘，不写 `config.toml`。
+    SetEffort(String),
     /// 手动触发上下文压缩
     CompactHistory,
     CreateCheckpoint {
@@ -374,6 +391,7 @@ mod busy_whitelist_tests {
             "config",
             "cwd",
             "doctor",
+            "effort",
             "extensions",
             "help",
             "hooks",
@@ -383,6 +401,7 @@ mod busy_whitelist_tests {
             "model",
             "mouse",
             "plugins",
+            "profile",
             "quit",
             "schedule",
             "sessions",

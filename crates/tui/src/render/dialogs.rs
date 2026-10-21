@@ -2578,24 +2578,6 @@ pub(super) fn draw_profile_dialog(
 
     match &dialog.overlay {
         ProfileOverlay::None => {}
-        ProfileOverlay::TemplatePicker { selected } => {
-            draw_profile_list_overlay(
-                f,
-                area,
-                "profile.overlay.template_title",
-                wyj_api::PROFILE_TEMPLATES
-                    .iter()
-                    .map(|t| {
-                        if t.note.is_empty() {
-                            t.label.to_string()
-                        } else {
-                            format!("{}  ({})", t.label, t.note)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-                *selected,
-            );
-        }
         ProfileOverlay::FetchingModels { .. } => {
             draw_profile_text_overlay(
                 f,
@@ -2875,6 +2857,73 @@ pub(super) fn draw_profile_list_overlay(
         })
         .collect();
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// `/model` 面板：模型选择列表（拉取中 / 拉取失败 / 正常列表三态）。
+///
+/// 复用 `draw_profile_list_overlay` 的通用单选列表浮层——它已经是与
+/// Profile 无关的通用件（`/schedule` 也在用），不必再造一个。
+pub(super) fn draw_model_picker(f: &mut Frame, dialog: &ModelPickerDialog, area: Rect) {
+    if dialog.loading {
+        draw_profile_text_overlay(
+            f,
+            area,
+            "model.picker.title",
+            &wyj_i18n::tr("model.picker.loading"),
+        );
+        return;
+    }
+    let items: Vec<String> = (0..dialog.item_count())
+        .map(|i| {
+            let label = dialog.item_label(i);
+            // 当前生效的模型标出来：用户要确认「现在跑的是哪个」。
+            if i < dialog.models.len() && dialog.models[i] == dialog.current_model {
+                format!("● {label}")
+            } else {
+                label
+            }
+        })
+        .collect();
+    draw_profile_list_overlay(f, area, "model.picker.title", items, dialog.selected);
+    // 拉取失败时把错误画在列表下方——错误信息比列表更重要（用户要据此
+    // 决定是手填还是换个端点），但它不该把列表整个顶掉。
+    if let Some(err) = &dialog.error {
+        let width = (area.width * 6 / 10).clamp(40, 90).min(area.width);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + area.height.saturating_sub(3);
+        let err_area = Rect::new(x, y, width, 1);
+        let para = Paragraph::new(Line::from(Span::styled(
+            truncate_line(err, err_area.width as usize),
+            Theme::error(),
+        )));
+        f.render_widget(para, err_area);
+    }
+}
+
+/// `/effort` 面板：思考档位列表。
+pub(super) fn draw_effort_picker(f: &mut Frame, dialog: &EffortPickerDialog, area: Rect) {
+    if dialog.item_count() == 0 {
+        // 端点整体不支持档位（只认开关）时，面板不该是个空壳。
+        draw_profile_text_overlay(
+            f,
+            area,
+            "effort.picker.title",
+            &wyj_i18n::tr("effort.picker.none_supported"),
+        );
+        return;
+    }
+    let items: Vec<String> = (0..dialog.item_count())
+        .map(|i| {
+            let label = dialog.item_label(i);
+            // 当前生效档位标出来。
+            if dialog.current.as_deref() == Some(dialog.item_value(i).as_deref().unwrap_or("")) {
+                format!("● {label}")
+            } else {
+                label
+            }
+        })
+        .collect();
+    draw_profile_list_overlay(f, area, "effort.picker.title", items, dialog.selected);
 }
 
 /// 三个面板(`/mcp`/`/skills`/`/plugins`)共用的"操作菜单"浮层：选中某一行按 Enter

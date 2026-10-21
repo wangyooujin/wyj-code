@@ -356,6 +356,49 @@ fn take_atoms(line: &mut Vec<Atom>) -> Vec<(String, Style)> {
     out
 }
 
+/// 把一段带样式的纯文本按显示宽度折成多行，**不解释任何 markdown 语法**。
+///
+/// 与 [`render_markdown`] 的区别：那个函数把文本当 markdown 解析（标题、列表、
+/// 表格…），这个函数只做折行——用于**内容是普通散文、但同样需要中文友好断行**
+/// 的场合（当前唯一调用方是 TUI 的 System 通知消息）。
+///
+/// ## 为什么不用 ratatui 的 `Wrap`
+///
+/// `Paragraph::wrap(Wrap { trim: false })` 走的是 `WordWrapper`，它**只在空格
+/// 处断行**。中文段落几乎没有空格，于是 WordWrapper 会一路撑到接近行尾才折
+/// 回来，把词组拦腰截断——「…由本地规则 +」/「模型分类器在执行前判定…」这种
+/// 切法读起来像乱码。`WordWrapper` 还会把 `Shift+Tab` 拆成 `Shift+` / `Tab`。
+///
+/// 本函数走的是 markdown 自己的折行引擎（[`tokenize_atoms`] + [`wrap_spans`]）：
+/// 宽字符（汉字 / 全角标点 / emoji）逐字之间可断，ASCII 词（`Shift+Tab`）整词
+/// 不断，并遵守中文排版禁则（收尾标点不落行首、开括号不悬行尾）。
+///
+/// # 参数
+///
+/// - `chunks`：`(文本, 样式)` 序列，按出现顺序拼接后折行。
+/// - `avail`：每行可用的**显示列数**（中文算 2 列）。
+///
+/// # 返回
+///
+/// 每行一组 `(文本, 样式)`，可直接 `Line::from(spans)` 渲染。
+pub fn wrap_plain_text_spans(
+    chunks: &[(String, Style)],
+    avail: usize,
+) -> Vec<Vec<(String, Style)>> {
+    wrap_spans(chunks, avail)
+}
+
+/// [`wrap_plain_text_spans`] 的单样式便捷版：整段文本用同一个样式。
+pub fn wrap_plain_text(text: &str, style: Style, avail: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    wrap_plain_text_spans(&[(text.to_string(), style)], avail)
+        .into_iter()
+        .map(|line| line.into_iter().map(|(t, _)| t).collect())
+        .collect()
+}
+
 // ── 表格渲染 ──────────────────────────────────────────────────────────────────
 
 fn table_border(widths: &[usize], l: char, m: char, r: char, f: char) -> String {

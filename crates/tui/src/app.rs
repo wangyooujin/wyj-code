@@ -2025,8 +2025,12 @@ pub struct AppState {
     pub session_picker: Option<SessionPickerState>,
     /// 设置面板（/config 命令触发时 Some）
     pub settings_dialog: Option<SettingsDialog>,
-    /// 分组管理面板（/model 无参命令触发时 Some）
+    /// 分组管理面板（/profile 无参命令触发时 Some）
     pub profile_dialog: Option<ProfileDialog>,
+    /// 模型选择面板（/model 无参命令触发时 Some）
+    pub model_picker: Option<ModelPickerDialog>,
+    /// 思考强度面板（/effort 无参命令触发时 Some）
+    pub effort_picker: Option<EffortPickerDialog>,
     /// AGENTS.md 记忆面板（/memory 命令触发时 Some）
     pub memory_dialog: Option<MemoryDialog>,
     /// 证据化自进化治理中心（/evolve 命令触发时 Some）
@@ -2121,16 +2125,31 @@ pub struct AppState {
     /// 当前生效的完整配置（/config 设置面板的数据来源与保存目标）
     ///
     /// 这里的 `active_profile` 始终是**全局默认值**（`config.toml` 里的值）。
-    /// 会话级分组（`/model` 面板「仅本会话使用」）另存于
+    /// 会话级分组（`/profile` 面板「仅本会话使用」）另存于
     /// [`AppState::session_profile_override`]，由 [`AppState::effective_config`]
     /// 在构造 Provider 时叠加——这样任何一次 `config.save()` 都不会把临时
     /// 分组固化成全局默认值。
     pub config: Config,
-    /// 会话级分组覆盖（`/model` 面板「仅本会话使用」），`None` = 跟随全局。
+    /// 会话级分组覆盖（`/profile` 面板「仅本会话使用」），`None` = 跟随全局。
     ///
     /// 只在当前会话生效，随 `SessionFile.session_profile` 落盘，`--resume`
     /// 后继续生效；新会话 / 切换到别的会话时会被换成那个会话自己的值。
     pub session_profile_override: Option<String>,
+    /// 会话级模型覆盖（`/model` 面板切换的模型），`None` = 跟随分组配置。
+    ///
+    /// **只存内存**：不写 `config.toml`、不落会话文件——`--resume` 后回到
+    /// 分组里配置的模型。理由见 `app/model_panel.rs` 的模块注释。
+    ///
+    /// 它与 `session_profile_override` 的持久化策略**故意不同**：
+    /// 分组是「这个会话跑在哪套端点上」（会话的属性，落盘）；
+    /// 模型是「为手头这个任务临时换个模型」（临时态，不落盘）。
+    pub session_model_override: Option<String>,
+    /// 会话级思考档位覆盖（`/effort` 设置），`None` = 跟随分组配置。
+    ///
+    /// **随会话落盘**（`Session.session_effort`），`--resume` 后继续生效。
+    /// 与 `session_model_override` 相反——思考档位是「这个任务要想多深」的
+    /// 工作状态，不该每次恢复会话都重设一遍。
+    pub session_effort_override: Option<String>,
     /// 子 Agent 实时状态（key = Hub 分配的 id，BTreeMap 保证面板按启动顺序排列）
     pub sub_agents: BTreeMap<u64, SubAgentUiState>,
     /// 当前会话的子 Agent trace 事件缓存，按子 Agent id 索引。
@@ -2194,9 +2213,11 @@ pub struct AppState {
 mod agents_panel;
 mod clipboard;
 mod dialogs;
+mod effort_panel;
 mod events;
 mod mcp_panel;
 mod menu;
+mod model_panel;
 mod navigation;
 mod panels;
 mod plugins_panel;
@@ -2214,8 +2235,10 @@ mod util;
 pub(crate) use agents_panel::*;
 pub(crate) use clipboard::*;
 pub use dialogs::*;
+pub use effort_panel::*;
 pub use mcp_panel::*;
 pub use menu::*;
+pub use model_panel::*;
 pub use plugins_panel::*;
 pub use profile_panel::*;
 pub use schedule_panel::*;
@@ -2310,6 +2333,8 @@ impl AppState {
             session_picker: None,
             settings_dialog: None,
             profile_dialog: None,
+            model_picker: None,
+            effort_picker: None,
             memory_dialog: None,
             evolution_dialog: None,
             mcp_dialog: None,
@@ -2319,8 +2344,12 @@ impl AppState {
             extensions_dialog: None,
             schedule_dialog: None,
             save_needed: false,
+            // 会话级思考档位从 config 的运行期槽位初始化——CLI 启动时从
+            // 会话文件读出来放进去的（`--resume` 后继续生效）。
+            session_effort_override: config.runtime_session_effort.clone(),
             config,
             session_profile_override: None,
+            session_model_override: None,
             pending_attachments: vec![],
             pending_pastes: vec![],
             file_completions: vec![],
@@ -5380,6 +5409,10 @@ async fn tui_main(
                                             &current_session_id,
                                             &session,
                                         );
+                                        // 同理：思考档位也是会话的属性，新会话
+                                        // 回落跟随分组配置。
+                                        state.session_effort_override = None;
+                                        state.set_session_effort_in_session(&session, None);
                                         state
                                             .messages
                                             .push(ChatMessage::system("已开始新会话".to_string()));
@@ -5473,6 +5506,15 @@ async fn tui_main(
                                                         &current_session_id,
                                                         &session,
                                                     );
+                                                    // 思考档位同理：它是会话的属性，
+                                                    // 跟着目标会话走（B 没记录就回落
+                                                    // 跟随分组配置）。
+                                                    state.session_effort_override =
+                                                        file.session_effort.clone();
+                                                    state.set_session_effort_in_session(
+                                                        &session,
+                                                        file.session_effort.clone(),
+                                                    );
                                                     state.messages.push(ChatMessage::system(
                                                         format!(
                                                             "已切换至会话 {}  共 {} 轮对话",
@@ -5544,6 +5586,11 @@ async fn tui_main(
                                     }
                                     InputOwner::Settings(_) => {
                                         // Settings 借用同 Profile：字段编辑直接借用
+                                        // 输入框，Esc 只需清空 live_input + 归还
+                                        // input_owner（上面已做），面板本身保持打开。
+                                    }
+                                    InputOwner::Model(_) => {
+                                        // Model 借用同 Profile：手填模型名直接借用
                                         // 输入框，Esc 只需清空 live_input + 归还
                                         // input_owner（上面已做），面板本身保持打开。
                                     }
@@ -5740,6 +5787,27 @@ async fn tui_main(
                                             }
                                         } else if let Some(dialog) = &mut state.plugins_dialog {
                                             dialog.overlay = PluginOverlay::None;
+                                        }
+                                    }
+                                    InputOwner::Model(ModelInputField::ManualName) => {
+                                        // 手填模型名：端点不实现 /models 时唯一的出路。
+                                        let name = text.unwrap_or_default();
+                                        owner.clear_live_input(&mut state);
+                                        state.input_owner = None;
+                                        if !name.trim().is_empty()
+                                            && apply_session_model(
+                                                &mut state,
+                                                name,
+                                                &agent_tx,
+                                                &rebuild_fn,
+                                                &system_prompt_extra,
+                                                &todo_store,
+                                                &shared_agent,
+                                                session_store.as_ref(),
+                                                &current_session_id,
+                                            )
+                                        {
+                                            state.model_picker = None;
                                         }
                                     }
                                     InputOwner::Profile(ProfileInputField::Rename {
@@ -7275,78 +7343,6 @@ async fn tui_main(
                             continue;
                         }
 
-                        // ── 新建分组模板选择器（不是 ActionMenu：这是"选一个模板创建新
-                        // entry"，选中后触发的是"新增+进入重命名借用"的复合动作，不是
-                        // 对已有条目执行菜单项）
-                        if matches!(
-                            state.profile_dialog.as_ref().unwrap().overlay,
-                            ProfileOverlay::TemplatePicker { .. }
-                        ) {
-                            let mut pending_rename: Option<(usize, String)> = None;
-                            if let Some(dialog) = &mut state.profile_dialog {
-                                if let ProfileOverlay::TemplatePicker { selected } =
-                                    &mut dialog.overlay
-                                {
-                                    match key.code {
-                                        KeyCode::Up => {
-                                            if *selected > 0 {
-                                                *selected -= 1;
-                                            }
-                                        }
-                                        KeyCode::Down => {
-                                            if *selected + 1 < wyj_api::PROFILE_TEMPLATES.len() {
-                                                *selected += 1;
-                                            }
-                                        }
-                                        KeyCode::Enter => {
-                                            let idx = *selected;
-                                            let existing_names: Vec<String> = dialog
-                                                .entries
-                                                .iter()
-                                                .map(|e| e.name.clone())
-                                                .collect();
-                                            let template = &wyj_api::PROFILE_TEMPLATES[idx];
-                                            let new_entry = ProfileEntryDraft::from_template(
-                                                template,
-                                                &existing_names,
-                                            );
-                                            let suggested_name = new_entry.name.clone();
-                                            dialog.entries.push(new_entry);
-                                            let new_idx = dialog.entries.len() - 1;
-                                            dialog.expanded = Some(new_idx);
-                                            dialog.overlay = ProfileOverlay::None;
-                                            // 不依赖行数算术反推新头行位置（加了固定
-                                            // AddNew 尾行后容易差 1），直接搜索。
-                                            dialog.cursor = dialog
-                                                .rows()
-                                                .iter()
-                                                .position(|r| *r == ProfileRow::Header(new_idx))
-                                                .unwrap_or(0);
-                                            pending_rename = Some((new_idx, suggested_name));
-                                        }
-                                        KeyCode::Esc => {
-                                            dialog.overlay = ProfileOverlay::None;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            // 新建后立即进入重命名借用态，而不是让用户自己发现"重命名"
-                            // 菜单项——`dialog` 的可变借用已在上面的块内结束，这里才能
-                            // 安全地写 state.input_owner（同一时刻不能双重可变借用 state）。
-                            if let Some((new_idx, suggested_name)) = pending_rename {
-                                if let Some(dialog) = &mut state.profile_dialog {
-                                    dialog.live_input = InputBox::new();
-                                    dialog.live_input.insert_text(&suggested_name);
-                                }
-                                state.input_owner =
-                                    Some(InputOwner::Profile(ProfileInputField::Rename {
-                                        entry_idx: new_idx,
-                                    }));
-                            }
-                            continue;
-                        }
-
                         // ── Esc 未保存修改三选一确认
                         if matches!(
                             state.profile_dialog.as_ref().unwrap().overlay,
@@ -7546,9 +7542,48 @@ async fn tui_main(
                                         }
                                     }
                                     Some(ProfileRow::AddNew) => {
+                                        // 新建分组 = 直接插入一条**空白**草稿，
+                                        // 随后进入重命名借用态。原先这里会先弹
+                                        // 「模板选择器」（9 个内置供应商），让用户
+                                        // 先选模板再改名——模板预填的 vendor /
+                                        // wire_protocol 已随配置字段移除，而
+                                        // base_url / provider / key / model
+                                        // 本来就得自己填，那一步纯属多余。
+                                        let mut pending_rename: Option<(usize, String)> = None;
                                         if let Some(dialog) = &mut state.profile_dialog {
-                                            dialog.overlay =
-                                                ProfileOverlay::TemplatePicker { selected: 0 };
+                                            let existing_names: Vec<String> = dialog
+                                                .entries
+                                                .iter()
+                                                .map(|e| e.name.clone())
+                                                .collect();
+                                            let new_entry =
+                                                ProfileEntryDraft::blank(&existing_names);
+                                            let suggested_name = new_entry.name.clone();
+                                            dialog.entries.push(new_entry);
+                                            let new_idx = dialog.entries.len() - 1;
+                                            dialog.expanded = Some(new_idx);
+                                            // 不依赖行数算术反推新头行位置（加了固定
+                                            // AddNew 尾行后容易差 1），直接搜索。
+                                            dialog.cursor = dialog
+                                                .rows()
+                                                .iter()
+                                                .position(|r| *r == ProfileRow::Header(new_idx))
+                                                .unwrap_or(0);
+                                            pending_rename = Some((new_idx, suggested_name));
+                                        }
+                                        // 新建后立即进入重命名借用态，而不是让用户
+                                        // 自己发现"重命名"菜单项——`dialog` 的可变
+                                        // 借用已在上面的块内结束，这里才能安全地写
+                                        // state.input_owner（同一时刻不能双重可变借用
+                                        // state）。
+                                        if let Some((new_idx, suggested_name)) = pending_rename {
+                                            if let Some(dialog) = &mut state.profile_dialog {
+                                                dialog.live_input = InputBox::new();
+                                                dialog.live_input.insert_text(&suggested_name);
+                                            }
+                                            state.input_owner = Some(InputOwner::Profile(
+                                                ProfileInputField::Rename { entry_idx: new_idx },
+                                            ));
                                         }
                                     }
                                     None => {}
@@ -7567,6 +7602,110 @@ async fn tui_main(
                                 );
                                 if saved {
                                     state.profile_dialog = None;
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.62 模型选择面板拦截（/model 无参命令触发）
+                    if state.model_picker.is_some() {
+                        // 手填模型名的文本输入走 ⓪.1 输入借用拦截
+                        // （state.input_owner == Some(Model(_))），不会进入这里。
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.input_owner = None;
+                                state.model_picker = None;
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.model_picker {
+                                    dialog.move_up();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.model_picker {
+                                    dialog.move_down();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // 末项是「手动输入」：借用底部输入框让用户敲名字。
+                                // 端点不实现 /models 时这是唯一的出路。
+                                let manual = state
+                                    .model_picker
+                                    .as_ref()
+                                    .map(|d| d.selected_model().is_none())
+                                    .unwrap_or(false);
+                                if manual {
+                                    if let Some(dialog) = &mut state.model_picker {
+                                        dialog.live_input = InputBox::new();
+                                        dialog.manual_entry = true;
+                                    }
+                                    state.input_owner =
+                                        Some(InputOwner::Model(ModelInputField::ManualName));
+                                } else {
+                                    let picked = state
+                                        .model_picker
+                                        .as_ref()
+                                        .and_then(|d| d.selected_model().map(str::to_string));
+                                    if let Some(model) = picked {
+                                        if apply_session_model(
+                                            &mut state,
+                                            model,
+                                            &agent_tx,
+                                            &rebuild_fn,
+                                            &system_prompt_extra,
+                                            &todo_store,
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                        ) {
+                                            state.model_picker = None;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // ⓪.63 思考强度面板拦截（/effort 无参命令触发）
+                    if state.effort_picker.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                state.effort_picker = None;
+                            }
+                            KeyCode::Up => {
+                                if let Some(dialog) = &mut state.effort_picker {
+                                    dialog.move_up();
+                                }
+                            }
+                            KeyCode::Down => {
+                                if let Some(dialog) = &mut state.effort_picker {
+                                    dialog.move_down();
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let picked = state
+                                    .effort_picker
+                                    .as_ref()
+                                    .and_then(|d| d.item_value(d.selected));
+                                if let Some(level) = picked {
+                                    if apply_session_effort(
+                                        &mut state,
+                                        level,
+                                        &agent_tx,
+                                        &rebuild_fn,
+                                        &system_prompt_extra,
+                                        &todo_store,
+                                        &shared_agent,
+                                        session_store.as_ref(),
+                                        &current_session_id,
+                                        &session,
+                                    ) {
+                                        state.effort_picker = None;
+                                    }
                                 }
                             }
                             _ => {}
@@ -8850,6 +8989,10 @@ async fn tui_main(
                                                 &current_session_id,
                                                 &session,
                                             );
+                                            // 同理：思考档位也是会话的属性，新会话
+                                            // 回落跟随分组配置。
+                                            state.session_effort_override = None;
+                                            state.set_session_effort_in_session(&session, None);
                                             state.messages.push(ChatMessage::system(
                                                 wyj_i18n::tr("new.started").to_string(),
                                             ));
@@ -9150,6 +9293,60 @@ async fn tui_main(
                                                     );
                                                 }
                                             }
+                                        }
+                                    }
+                                    Ok(CommandResult::OpenModelPicker) => {
+                                        // 打开模型选择面板并**立即发起拉取**。
+                                        // 拉取走后台 task（网络请求不能在主循环里
+                                        // await，见 crates/tui/CLAUDE.md 第 19 条），
+                                        // 结果经 AgentEvent::ModelListFetched 回来。
+                                        state.model_picker =
+                                            Some(ModelPickerDialog::new(state.model_name.clone()));
+                                        model_start_fetch_models(&mut state, &agent_tx);
+                                    }
+                                    Ok(CommandResult::SwitchModel(model)) => {
+                                        if apply_session_model(
+                                            &mut state,
+                                            model,
+                                            &agent_tx,
+                                            &rebuild_fn,
+                                            &system_prompt_extra,
+                                            &todo_store,
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                        ) {
+                                            state.model_picker = None;
+                                            state.input_owner = None;
+                                        }
+                                    }
+                                    Ok(CommandResult::OpenEffortPicker) => {
+                                        // 档位列表按**当前模型**的能力表过滤：
+                                        // 只列端点真正认的档位，否则用户挑了一个
+                                        // 会被静默丢弃的值还以为设上了。
+                                        let cfg = state.effective_config();
+                                        let (levels, can_disable) =
+                                            resolve_effort_choices(&cfg, &state.model_name);
+                                        state.effort_picker = Some(EffortPickerDialog::new(
+                                            levels,
+                                            can_disable,
+                                            state.session_effort_active().map(str::to_string),
+                                        ));
+                                    }
+                                    Ok(CommandResult::SetEffort(level)) => {
+                                        if apply_session_effort(
+                                            &mut state,
+                                            level,
+                                            &agent_tx,
+                                            &rebuild_fn,
+                                            &system_prompt_extra,
+                                            &todo_store,
+                                            &shared_agent,
+                                            session_store.as_ref(),
+                                            &current_session_id,
+                                            &session,
+                                        ) {
+                                            state.effort_picker = None;
                                         }
                                     }
                                     Ok(CommandResult::OpenSessionPicker) => {

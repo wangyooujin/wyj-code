@@ -56,25 +56,9 @@ impl OpenAIProvider {
         let api_key = cfg.api_key()?.to_string();
         let base_url = cfg.resolved_base_url().trim_end_matches('/').to_string();
         let profile = cfg.active_profile();
-        let vendor = profile
-            .vendor
-            .clone()
-            .unwrap_or_else(|| infer_vendor(&profile.base_url, model));
+        let vendor = crate::models::infer_vendor(profile, model);
         let dropped_parameters = RequestPlan::from_profile(profile, Some(model)).dropped_parameters;
         let resolved = crate::ModelCatalog::resolve(profile, Some(model));
-        // 声明了 Responses 但本 provider 只会说 Chat Completions：告警一次，
-        // 然后按**真实**协议构造 identity。静默保留会让 capability_cache 的
-        // fingerprint 与实际请求不符，thinking spec 也会查错表。
-        let declared = profile.effective_wire_protocol();
-        if !matches!(declared, WireProtocol::OpenAiChatCompletions) {
-            tracing::warn!(
-                vendor = %vendor,
-                model = %model,
-                declared = %declared,
-                "当前没有 `{}` 线协议实现，已按 `open_ai_chat_completions` 发送",
-                declared
-            );
-        }
         Ok(Self {
             client: crate::stream_guard::build_client()?,
             api_key,
@@ -97,37 +81,6 @@ impl OpenAIProvider {
             wire_protocol: self.wire_protocol.clone(),
         }
     }
-}
-
-/// vendor 推导（fallback）。完整版在 `model_catalog.rs::infer_vendor`；这里仅
-/// 当 profile 没声明 vendor 时做粗略回退，避免 stream() 因空 vendor 而
-/// 走不到 vendor-specific thinking adapter。
-fn infer_vendor(base_url: &str, model: &str) -> String {
-    let base_url = base_url.to_ascii_lowercase();
-    let model = model.to_ascii_lowercase();
-    let haystack = format!("{} {}", base_url, model);
-    for (needle, vendor) in [
-        ("minimax", "minimax"),
-        ("bigmodel", "zhipu"),
-        ("z.ai", "zhipu"),
-        ("glm", "zhipu"),
-        ("moonshot", "moonshot"),
-        ("kimi", "moonshot"),
-        ("deepseek", "deepseek"),
-        ("dashscope", "alibaba"),
-        ("aliyun", "alibaba"),
-        ("qwen", "alibaba"),
-        ("volces", "volcengine"),
-        ("doubao", "volcengine"),
-        ("127.0.0.1:11434", "ollama"),
-        ("ollama", "ollama"),
-        ("vllm", "vllm"),
-    ] {
-        if haystack.contains(needle) {
-            return vendor.to_string();
-        }
-    }
-    "custom".to_string()
 }
 
 // ── 请求/响应类型 ────────────────────────────────────────────────────────────
@@ -1606,12 +1559,22 @@ mod tests {
     // ── 缓存状态回报（P0-2）──
 
     /// 构造一个指定 vendor / 模型的 provider，只用于读 `prompt_cache_state`。
+    ///
+    /// vendor 不再是配置项，改为由 `base_url` + 模型名**推断**，所以这里
+    /// 必须给出能推导出目标 vendor 的 base_url。
     fn provider_for(vendor: &str, model: &str) -> OpenAIProvider {
+        let base_url = match vendor {
+            "deepseek" => "https://api.deepseek.com",
+            "minimax" => "https://api.minimaxi.com/v1",
+            "alibaba" => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "zhipu" => "https://open.bigmodel.cn/api/paas/v4",
+            "vllm" => "http://127.0.0.1:8000/v1",
+            other => panic!("测试辅助函数未覆盖 vendor {other}"),
+        };
         let profile = wyj_config::Profile {
             provider: wyj_config::Provider::OpenAI,
-            vendor: Some(vendor.to_string()),
             model: model.to_string(),
-            base_url: "https://example.com".to_string(),
+            base_url: base_url.to_string(),
             ..wyj_config::Profile::default()
         };
         let cfg = wyj_config::Config {
@@ -1642,7 +1605,6 @@ mod tests {
         use crate::anthropic::PROMPT_CACHE_STATE_OFF;
         let profile = wyj_config::Profile {
             provider: wyj_config::Provider::OpenAI,
-            vendor: Some("deepseek".to_string()),
             model: "deepseek-chat".to_string(),
             base_url: "https://api.deepseek.com".to_string(),
             prompt_cache: Some(false),
@@ -1676,34 +1638,6 @@ mod tests {
                 "{vendor}/{model} 不该被报成已缓存"
             );
         }
-    }
-
-    /// 声明了 `open_ai_responses` 但实现只有 Chat Completions：identity 必须
-    /// 归一成**真实**协议。否则 `ThinkingSpec::for_vendor` 会按 Responses 查表
-    /// （无对应臂 → generic → thinking 全关），且 capability_cache 的
-    /// fingerprint 与实际请求不符。
-    #[test]
-    fn declared_responses_protocol_is_normalized_to_the_one_we_speak() {
-        let profile = wyj_config::Profile {
-            provider: wyj_config::Provider::OpenAI,
-            vendor: Some("openai".to_string()),
-            model: "o3".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            wire_protocol: Some(WireProtocol::OpenAiResponses),
-            ..wyj_config::Profile::default()
-        };
-        let cfg = wyj_config::Config {
-            active_profile: profile.name.clone(),
-            profiles: vec![profile],
-            runtime_api_key: Some("sk-test".to_string()),
-            ..wyj_config::Config::default()
-        };
-        let provider = OpenAIProvider::with_model(&cfg, "o3").unwrap();
-        assert_eq!(
-            provider.identity().wire_protocol,
-            WireProtocol::OpenAiChatCompletions,
-            "identity 必须报告实际发送的协议"
-        );
     }
 
     // ── build_openai_request_body 与 thinking adapter 的集成单测 ──

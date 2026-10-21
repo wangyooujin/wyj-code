@@ -183,9 +183,6 @@ pub struct ProfileEntryDraft {
     pub name: String,
     /// 0 = Anthropic, 1 = OpenAI
     pub provider_idx: usize,
-    /// v0.2.8 能力运行时字段；设置面板尚未暴露编辑入口，仅透传保留。
-    pub vendor: Option<String>,
-    pub wire_protocol: Option<wyj_config::WireProtocol>,
     pub model: String,
     pub plan_model: String,
     pub exec_model: String,
@@ -225,8 +222,6 @@ impl ProfileEntryDraft {
                 wyj_config::Provider::Anthropic => 0,
                 wyj_config::Provider::OpenAI => 1,
             },
-            vendor: p.vendor.clone(),
-            wire_protocol: p.wire_protocol.clone(),
             model: p.model.clone(),
             plan_model: p.plan_model.clone().unwrap_or_default(),
             exec_model: p.exec_model.clone().unwrap_or_default(),
@@ -250,35 +245,47 @@ impl ProfileEntryDraft {
         }
     }
 
-    pub(super) fn from_template(t: &wyj_api::ProfileTemplate, existing_names: &[String]) -> Self {
-        let mut name = t.key.to_string();
+    /// 空白的新分组草稿。
+    ///
+    /// 此前这里有一整套「内置模板」（GLM / 火山 / MiniMax / Kimi / DeepSeek /
+    /// 通义 / Ollama / vLLM / 自定义），新建分组要先选模板、再改名。模板的
+    /// 作用其实是**预填端点与供应商特征**（base_url / vendor / wire_protocol /
+    /// prompt_cache / openai_stream_options / vision），但这些值全都可以由
+    /// 用户自己填 —— 模板反而把「我用的是哪家」固化成了二选一的菜单，
+    /// 而真实世界的私有代理根本不在列表里。
+    ///
+    /// 模板承载的 `vendor` / `wire_protocol` 语义已随配置字段一并移除：
+    /// vendor 由 `base_url` + 模型名**推断**（`wyj_api::models::infer_vendor`），
+    /// 线协议由 `provider` 唯一决定。所以现在只需要一张空白表单：
+    /// 用户填 provider → base_url → api_key → model 即可。
+    ///
+    /// `provider_idx` 默认 0（Anthropic）——面板首项就是 provider 字段，
+    /// 按 Enter 或 ←→ 即可切到 OpenAI。
+    pub(super) fn blank(existing_names: &[String]) -> Self {
+        // 名字冲突时自动加后缀，避免用户在改名那一步撞上重复名校验。
+        let mut name = "new".to_string();
         let mut n = 2;
         while existing_names.iter().any(|e| e == &name) {
-            name = format!("{}-{}", t.key, n);
+            name = format!("new-{n}");
             n += 1;
         }
         Self {
             name,
-            provider_idx: match t.provider {
-                wyj_config::Provider::Anthropic => 0,
-                wyj_config::Provider::OpenAI => 1,
-            },
-            vendor: Some(t.vendor.to_string()),
-            wire_protocol: Some(t.wire_protocol.clone()),
-            model: t.example_model.to_string(),
+            provider_idx: 0,
+            model: String::new(),
             plan_model: String::new(),
             exec_model: String::new(),
             aux_model: String::new(),
-            base_url: t.base_url.to_string(),
+            base_url: String::new(),
             api_key: String::new(),
             api_key_env: None,
             max_tokens: "32000".to_string(),
             context_window: "200000".to_string(),
-            vision: t.vision,
+            vision: true,
             thinking_budget: String::new(),
             interleaved_thinking: true,
-            prompt_cache: t.prompt_cache,
-            openai_stream_options: t.openai_stream_options,
+            prompt_cache: None,
+            openai_stream_options: None,
             // 新建分组预填 4：静态目录对国内 vendor 一律判成 1（每轮只能发一个
             // 工具调用），`None` 会让这个按 vendor 的猜测直接生效。显式写入后
             // 用户可在面板里改成其它档位，或清空回到端点默认。
@@ -453,8 +460,6 @@ impl ProfileEntryDraft {
         wyj_config::Profile {
             name: self.name.clone(),
             provider: self.provider(),
-            vendor: self.vendor.clone(),
-            wire_protocol: self.wire_protocol.clone(),
             model: self.model.clone(),
             plan_model: if self.plan_model.trim().is_empty() {
                 None
@@ -515,10 +520,6 @@ impl ProfileEntryDraft {
 /// 确认、模型选择复用 `dialog.menu`），不再需要专属浮层变体。
 pub enum ProfileOverlay {
     None,
-    /// 新建分组模板选择器
-    TemplatePicker {
-        selected: usize,
-    },
     /// 拉取模型列表中（entry_idx 的 field_idx 字段）
     FetchingModels {
         entry_idx: usize,
@@ -530,7 +531,7 @@ pub enum ProfileOverlay {
     },
 }
 
-/// 分组管理面板状态（/model 无参命令触发）
+/// 分组管理面板状态（/profile 无参命令触发）
 pub struct ProfileDialog {
     pub entries: Vec<ProfileEntryDraft>,
     /// 保存后将写入 Config.active_profile 的 entries 下标
@@ -1270,23 +1271,43 @@ mod profile_dialog_onboarding_tests {
     /// `max_tools_per_turn = 1` 直接生效——国内模型分组因此永远只能一轮发一个
     /// 工具调用，派生 subagent 也就一次只能起一个。
     #[test]
-    fn new_profile_from_template_prefills_four_tools_per_turn() {
-        for template in wyj_api::PROFILE_TEMPLATES {
-            let draft = ProfileEntryDraft::from_template(template, &[]);
-            assert_eq!(
-                draft.to_profile().max_tools_per_turn,
-                Some(4),
-                "模板 {} 新建的分组应预填 4",
-                template.key
-            );
-        }
+    fn new_profile_prefills_four_tools_per_turn() {
+        let draft = ProfileEntryDraft::blank(&[]);
+        assert_eq!(
+            draft.to_profile().max_tools_per_turn,
+            Some(4),
+            "新建的分组应预填 4"
+        );
+    }
+
+    /// 新建分组的草稿必须是**空白**的：除了有明确理由的默认值
+    /// （容量、并行工具数、thinking 交错），其余字段一律留空——
+    /// 端点、Key、模型名都要用户自己填。
+    #[test]
+    fn new_profile_starts_blank() {
+        let draft = ProfileEntryDraft::blank(&[]);
+        assert!(draft.base_url.is_empty(), "端点应留空由用户填");
+        assert!(draft.api_key.is_empty(), "Key 应留空由用户填");
+        assert!(draft.model.is_empty(), "模型名应留空由用户填");
+        assert!(draft.reasoning_effort.is_empty(), "思考档位应留空跟随端点");
+        assert!(draft.thinking_switch.is_empty(), "思考开关应留空跟随端点");
+        // provider 默认 Anthropic，面板首项就是 provider 字段，可现场切换
+        assert_eq!(draft.provider_idx, 0);
+    }
+
+    /// 名字冲突时自动加后缀，避免用户在改名那一步撞上重复名校验。
+    #[test]
+    fn new_profile_name_avoids_collisions() {
+        let existing = vec!["new".to_string(), "new-2".to_string()];
+        let draft = ProfileEntryDraft::blank(&existing);
+        assert_eq!(draft.name, "new-3");
     }
 
     /// 该字段是枚举：候选首项为空串（回落端点默认），其余为合法数字，
     /// 循环一圈必须回到起点，且清空后写盘是 `None` 而不是 0。
     #[test]
     fn max_tools_per_turn_enum_cycles_and_clears_to_none() {
-        let mut draft = ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let mut draft = ProfileEntryDraft::blank(&[]);
         let idx = super::profile_field_idx("settings.field.max_tools_per_turn").unwrap();
         assert_eq!(
             draft.enum_choices(idx),
@@ -1508,8 +1529,7 @@ mod profile_dialog_onboarding_tests {
             if !is_text {
                 continue;
             }
-            let mut draft =
-                super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+            let mut draft = super::ProfileEntryDraft::blank(&[]);
             draft.set_text_value(idx, "probe-value".to_string());
             assert_eq!(
                 draft.text_value(idx),
@@ -1553,8 +1573,7 @@ mod profile_dialog_onboarding_tests {
     /// 拿到一个空模型名、构造出一个永远失败的 provider。
     #[test]
     fn aux_model_is_written_back_as_none_when_left_blank() {
-        let mut draft =
-            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let mut draft = super::ProfileEntryDraft::blank(&[]);
         let idx = super::profile_field_idx("settings.field.aux_model").expect("字段表应含该项");
 
         // 模板新建的分组没有辅助模型 → 空串 → None
@@ -1659,8 +1678,7 @@ mod profile_dialog_onboarding_tests {
     /// 空串是唯一能表达 `None` 的形态。
     #[test]
     fn enum_fields_keep_a_way_back_to_the_unset_value() {
-        let mut draft =
-            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let mut draft = super::ProfileEntryDraft::blank(&[]);
         let idx = super::profile_field_idx("settings.field.reasoning_effort").unwrap();
         let choices = draft.enum_choices(idx);
         assert_eq!(
@@ -1681,8 +1699,7 @@ mod profile_dialog_onboarding_tests {
     /// thinking_budget 的草稿是字符串，写盘时必须正确映射回 `Option<u32>`。
     #[test]
     fn thinking_budget_draft_maps_to_option_u32() {
-        let mut draft =
-            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let mut draft = super::ProfileEntryDraft::blank(&[]);
         let idx = super::profile_field_idx("settings.field.thinking_budget").unwrap();
 
         draft.set_text_value(idx, String::new());
@@ -1958,8 +1975,7 @@ mod profile_dialog_onboarding_tests {
     /// 选中模型后，容量字段只在「用户没动过」时被自动填。
     #[test]
     fn catalog_autofill_only_overwrites_untouched_defaults() {
-        let mut draft =
-            super::ProfileEntryDraft::from_template(&wyj_api::PROFILE_TEMPLATES[0], &[]);
+        let mut draft = super::ProfileEntryDraft::blank(&[]);
         draft.context_window = "200000".to_string();
         draft.max_tokens = "32000".to_string();
         draft.model = "claude-sonnet-4-5".to_string();

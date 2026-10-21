@@ -47,6 +47,30 @@
 4. **跨会话记忆**：当前主线是 `core::memory_v3::MemoryV3Store`（`~/.wyj-code/memory-v3/`，结构化 claim + 后台 job + 项目/全局两层）。`core::memory::MemoryStore`（`~/.wyj-code/memory/<project-id>/`，MEMORY.md 索引 + 每 kind 一个 `.md`）是**降级路径**，不是并存的第二套实现——`Agent` 的注入与提取是 `memory_v3 → evolution → memory(v2)` 的 if-else 链，v3 一旦存在，v2 一行都不执行。CLI 装配因此只在 v3 构造失败时才构造 v2（`main.rs` 的 `memory_store`），避免每次启动多建一个目录、多读一次盘。开关是 `Config.auto_memory_enabled`（`/memory` 面板切换），对两个 store 都写。钉子：`agent::tests::memory_injection_prefers_v3_then_evolution_then_v2`。
 
 
+4b. **会话级状态的两个字段，持久化策略故意不同**（v0.3.16）：
+
+    | 字段 | 语义 | 落盘？ | 理由 |
+    |---|---|---|---|
+    | `Session.session_profile` | 这个会话跑在哪套**分组**（端点凭据）上 | ✅ 随 `SessionFile` | 「这个会话用哪套端点」是会话的属性——不落盘的话 `--resume` 后悄悄换回全局默认端点，而聊天记录里全是另一个模型的产出 |
+    | `Session.session_effort` | 这个会话的**思考强度档位** | ✅ 随 `SessionFile` | 「这次对话要想多深」是工作状态，不该每次恢复会话都重设一遍 |
+    | `AppState.session_model_override`（TUI 内存态，**不**在 `Session` 里） | 为手头这个任务临时换的**模型** | ❌ | 「临时换个模型」写进全局配置会污染其它项目，写进会话文件则让「当前在跑哪个模型」在恢复后不可解释 |
+
+    **两个必须守住的点**：① `Session::clear_conversation()` 的**保留白名单**里必须同时有
+    `session_profile` 与 `session_effort`——`/clear` 换的是对话内容，不是端点与思考深度，
+    抹掉它们等于用户刚挑好的设置在清空对话后凭空消失。② `SessionFile` 的两个字段都带
+    `#[serde(default)]`：旧会话文件没有它们必须读成 `None`（= 跟随全局配置），而不是让
+    所有历史会话打不开。钉子：`session_store::session_effort_survives_save_load_round_trip` /
+    `legacy_session_file_without_session_effort_loads_as_none` /
+    `clear_conversation_keeps_session_effort` / `clear_conversation_keeps_session_profile`。
+
+    档位的生效优先级是 **env > 会话级 > profile 字段**（`Config::effective_reasoning_effort`
+    / `effective_thinking_switch`）。env 最高是因为 `WYJ_CODE_THINKING_EFFORT` 的本意就是
+    「这次运行一律用这个档位」，任何面板操作都不该盖掉它。会话级用 `"off"` 表示
+    **彻底关思考**（`reasoning_effort` 清空 + `thinking_switch = "disabled"`），
+    `thinking_budget` 不动——官方 Anthropic 上 effort 与 budget 控制不同维度，可以共存。
+
+
+
 5. **AGENTS.md / CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 AGENTS.md 系内容用 `wrap_reminder` 包成 `<system-reminder>`，**追加进 system prompt 的 stable 段**（不是当轮 user 消息）；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载，结果**注入历史**（合并进最后一条 user 消息）——**v0.3.14 改，原先进 system 的 volatile 段**。改的理由是缓存前缀的物理顺序：Anthropic 的 system 块位于 messages **之前**，而 messages 断点覆盖「tools + system + messages 前缀」，所以 system 段任何字节变化都会让**整段历史全价重算**；旧注释说「volatile 在断点之后所以不会全价重算」只对 stable 断点成立，messages 断点照样被作废。走历史则前缀字节不变、历史断点照常命中，只有新追加的那条消息是新的（DeepSeek Harness 的 in-history system prompt update 走同一条路）。`seen_dirs` 全局去重保证每个目录只注入一次。配套说明见根 `CLAUDE.md` 的「Configuration」与「System prompt 分段」两节。
 
 
@@ -100,7 +124,7 @@
 
 23. **Skill 不是模型可调用的工具，但名单会注入模型上下文（v0.2.27+）**：skill 在 wyj-code 里是**用户侧的 slash 命令**（`commands::skill::load_skills` 返回 `Vec<Arc<dyn Command>>` 进 `CommandRegistry`，服务 TUI 的 `/xxx` 补全），**不是模型可调用的东西**——全仓库无 `Skill` 工具，`ALWAYS_VISIBLE_TOOL_SCHEMAS` 里也没有。**由此产生的真实故障**：用户说"使用 skill 帮我分析股票"时，模型对 wyj-code 的 skill 机制一无所知，凭 Claude Code 的训练先验跑去 `ls ~/.claude/skills/`（那里有 `investmentguru` 等 20 个 skill），而 wyj-code 的 skill 只在 `~/.wyj-code/skills/` + `<git-root>/.wyj-code/skills/`，代码里**没有任何读 `.claude/` 的路径**（v0.2.24 已删除 `load_native_mcp` / `native_mcp_names`）——即模型凭猜测找到了一个 wyj-code 根本不读的目录，而 `~/.wyj-code/skills/hithink-finance` 就躺在旁边看不见。
     - **v0.2.27 首次处置**：在 `prompts::MAIN` 加 `# Skills` 一节讲清三件事——skill 只存在于那两个目录、由**用户**用 `/xxx` 调用（显式否认存在 `Skill` 工具，避免模型反复尝试调用不存在的工具）、被要求"用 skill"时**不要自己去翻目录**、尤其禁止读/列/搜 `~/.claude/skills/` 等 `.claude` 路径。
-    - **v0.2.27 二次处置：注入名单**。只禁检索、不给数据，模型唯一既诚实又不违规的回答就是把禁令复述给用户——真实表现是"我不能自己调用 skill——skill 必须由你用斜杠命令触发"，用户依然不知道该敲哪条命令。**这是提示词的禁令/数据不匹配**：第 33 行禁掉了获取名单的途径，第 34 行却要求输出一个它无从得知的名字。修法是仿子 Agent 类型那条现成通路（`tools/src/sub_agent.rs:309` 的 `SUB_AGENT_TEMPLATE.replace("{types}", &types)`），给 skill 补上同等出口：`prompts::MAIN` 的 `# Skills` 段留 `{skills}` 占位（`prompts::SKILL_CATALOG_PLACEHOLDER`），`Agent::with_skills(Vec<SkillEntry>)` 替换之，名单由 `prompts::render_skill_catalog` 渲染。CLI 侧 `main.rs::collect_skill_entries` 调 `load_skills` 取数并**按 name 排序**（`load_skills` 内部是 `HashMap::into_values()`，不排序会让 system prompt 每次启动字节不同、连带打穿 prompt cache），注入点两处：`main.rs` 主 Agent 构造链 + `rebuild_fn` 内（`/model` 热切换与设置面板保存都会重建 Agent，漏了会重新退回"我不知道有哪些 skill"）。**必须直接调 `load_skills` 而不是从 `CommandRegistry::list()` 筛 `is_dynamic()`**——registry 是「skill 先注册、内置命令后覆盖同名」，已确认 `review` skill 会被内置 `ReviewCmd` 顶掉，从 registry 筛会漏。**不做 `Skill` 工具化**：见下条。
+    - **v0.2.27 二次处置：注入名单**。只禁检索、不给数据，模型唯一既诚实又不违规的回答就是把禁令复述给用户——真实表现是"我不能自己调用 skill——skill 必须由你用斜杠命令触发"，用户依然不知道该敲哪条命令。**这是提示词的禁令/数据不匹配**：第 33 行禁掉了获取名单的途径，第 34 行却要求输出一个它无从得知的名字。修法是仿子 Agent 类型那条现成通路（`tools/src/sub_agent.rs:309` 的 `SUB_AGENT_TEMPLATE.replace("{types}", &types)`），给 skill 补上同等出口：`prompts::MAIN` 的 `# Skills` 段留 `{skills}` 占位（`prompts::SKILL_CATALOG_PLACEHOLDER`），`Agent::with_skills(Vec<SkillEntry>)` 替换之，名单由 `prompts::render_skill_catalog` 渲染。CLI 侧 `main.rs::collect_skill_entries` 调 `load_skills` 取数并**按 name 排序**（`load_skills` 内部是 `HashMap::into_values()`，不排序会让 system prompt 每次启动字节不同、连带打穿 prompt cache），注入点两处：`main.rs` 主 Agent 构造链 + `rebuild_fn` 内（`/model`·`/profile` 热切换与设置面板保存都会重建 Agent，漏了会重新退回"我不知道有哪些 skill"）。**必须直接调 `load_skills` 而不是从 `CommandRegistry::list()` 筛 `is_dynamic()`**——registry 是「skill 先注册、内置命令后覆盖同名」，已确认 `review` skill 会被内置 `ReviewCmd` 顶掉，从 registry 筛会漏。**不做 `Skill` 工具化**：见下条。
     - **名单会话内冻结**（落在 system prompt 的 stable 段，prompt cache 照常命中）。代价是用户在 `/skills` 面板中途禁用某 skill 后本会话名单不更新，模型仍可能推荐那个命令——这是刻意取舍，放进 volatile 段能实时但每轮要为名单全价重算上千 token。测试 `skill_section_tells_model_skills_are_user_invoked_slash_commands` + `render_skill_catalog` 系列 + `with_skills_injects_the_catalog_and_leaves_no_placeholder` 锁死。
     - **v0.2.28 三次处置：禁令必须写成行为禁令 + `<env>` 补 home 目录**。注入名单解决了「模型不知道有哪些 skill」，但 2026-10-09 实测发现**路径枚举式禁令根本拦不住**：第 33 行只写「禁止读 `~/.claude/skills/` 或任何 `.claude` 路径」，模型换个目录就绕过去了——它去读**正确**的 `~/.wyj-code/skills/`（提示词自己告诉它这个目录），只是把 home 编成了 `/Users/dev`。会话记录里它自己写了 `"Actually more efficient: Read the file directly at /Users/dev/.wyj-code/skills/hithink-finance/SKILL.md. But I don't know the home dir."`，然后据此断言「skill 实际未安装」。同批会话里还编了 `D:\dev\data-platform`、`C:\Users\Alex\...`——中文训练数据的路径模式泄漏。两处修法：① `# Skills` 段的禁令从「禁某几个具体路径」升级为「**禁止一切自发检索 skill 目录**（逐一点名易误检索的三个目录 + 明确禁止 reconstructed from memory or guessed），名单是唯一合法信息来源」；② `<env>` 块（`prompts::EnvInfo`）新增 `home` 字段，让模型知道 `~` 的真实绝对路径——**不加它模型只能猜**，且它与 `cwd` 一样是会话内恒定字段，进 prompt cache 的 stable 段不增加重算成本。测试 `env_block_always_reports_a_home_directory` + `skill_section_...` 里对四个易误检索路径的逐条断言锁死。
     - **为什么不做 `Skill` 工具**（根治方案已评估但暂缓）：注册模型可调用的 `Skill` 工具需要处理五个跨 crate 约束——① skill 正文走 `tool_result` 会被 `persist_cap` 截断到 20KB head + 10KB tail（`config::serialize::truncate_tool_result`），而 `hithink-finance/SKILL.md` 大概率超限，模型会读到中间被挖空的残缺指令，**比现状更糟**；② frontmatter 的 `allowed-tools` 靠 `CommandResult::RunPromptScoped` + TUI 侧 `RestorePermissionOnDrop` 的 RAII 生效，`Tool::run` 拿不到该通道，带工具白名单的 skill 通过模型调用会**静默失效**；③ `select_sub_agent_tools` 在 `AgentDefinition.tools` 为 `None` 时全放行，Skill 会被子 Agent 继承（Claude Code 的做法是子 Agent 禁用）；④ 首次加载 skill 会写入 prompt cache，每轮换 skill 是一次 1.25x 写入；⑤ skill 文件可能来自 marketplace，作为 tool_result 回给模型是一条**当前完全没有信任门控**的 prompt injection 面（同 `mcp.toml` 有 `trust-mcp` 批准，而 skill 这条链路没有）。合计约 350 行 / 2-3 天，且要改 `ToolContext` trait、`serialize.rs` 截断策略、子 Agent 工具语义三处架构。名单注入已经把"模型不知道有哪些 skill"这个真实痛点解决掉了，工具化剩下的只是"少让用户敲一次斜杠命令"，收益远小于上述五条代价。

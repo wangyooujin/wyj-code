@@ -1820,6 +1820,17 @@ async fn main() -> Result<()> {
             // `build_provider` 在启动阶段直接失败，而用户其实没做错什么。
             .filter(|name| cfg.profile_by_name(name).is_some())
     };
+    // 会话级思考档位（`/effort` 设置）：随会话落盘，`--resume` 后继续生效。
+    //
+    // 它**不**受 `--profile` 影响：档位与分组是两件独立的事——显式指定
+    // `--profile` 换的是「用哪套端点」，而档位说的是「这个任务要想多深」，
+    // 后者跟着会话走更合理（用户为这个会话挑的思考深度不该因为换了条
+    // 命令行参数就丢掉）。
+    let session_effort: Option<String> = session_store_arc
+        .as_ref()
+        .and_then(|store| store.load(&session_id).ok())
+        .and_then(|file| file.session_effort)
+        .filter(|level| !level.trim().is_empty());
     // `cfg` 从这一刻起代表**本次运行实际生效**的配置（可能带会话级覆盖），
     // 供 Provider 构建与模型选择使用；写盘一律用 `global_cfg`（见下）。
     if let Some(name) = &session_profile_override {
@@ -1827,6 +1838,11 @@ async fn main() -> Result<()> {
     } else if !profile_was_explicit {
         cfg.active_profile = global_cfg.active_profile.clone();
     }
+    // 档位进运行期槽位（`#[serde(skip)]`，绝不落 config.toml）。
+    cfg.runtime_session_effort = session_effort.clone();
+    // 传给 TUI 的那份也要带上：`AppState::new` 从 `config.runtime_session_effort`
+    // 初始化 `session_effort_override`（状态栏与 Agent 重建都读它）。
+    global_cfg.runtime_session_effort = session_effort.clone();
     // 传给 TUI 的 config 必须携带**全局默认值**：`/config` `/memory` 等面板
     // 保存时写的是它。生效值由 `state.session_profile_override` 在构造
     // Provider 时叠加（`AppState::effective_config`）。
@@ -2217,8 +2233,8 @@ async fn main() -> Result<()> {
             cfg.active_profile().thinking_budget,
             cfg.active_profile().interleaved_thinking,
         )
-        .with_reasoning_effort(cfg.active_profile().effective_reasoning_effort())
-        .with_thinking_switch(cfg.active_profile().effective_thinking_switch());
+        .with_reasoning_effort(cfg.effective_reasoning_effort())
+        .with_thinking_switch(cfg.effective_thinking_switch());
 
     // system_prompt_extra 记录 append_system() 追加的内容（原样，含前导 "\n\n"），
     // 供 TUI 侧重建 Agent 时在默认提示词后原样拼回这些追加内容（目前含 Plan 模式
@@ -2543,8 +2559,8 @@ async fn main() -> Result<()> {
             cross_provider_fallback: cfg.routing.cross_provider_fallback,
             thinking_budget: cfg.active_profile().thinking_budget,
             interleaved_thinking: cfg.active_profile().interleaved_thinking,
-            reasoning_effort: cfg.active_profile().effective_reasoning_effort(),
-            thinking_switch: cfg.active_profile().effective_thinking_switch(),
+            reasoning_effort: cfg.effective_reasoning_effort(),
+            thinking_switch: cfg.effective_thinking_switch(),
         }
         .apply(new_agent);
         // 配置尾部（persist cap / context editing / verify / 三个 store /
@@ -3900,6 +3916,80 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenProfileDialog) | Ok(CommandResult::SwitchProfile(_)) => {
                     println!("{}", wyj_i18n::tr("profile.headless_unsupported"));
+                }
+                Ok(CommandResult::OpenModelPicker) => {
+                    println!("{}", wyj_i18n::tr("model.picker.headless_unsupported"));
+                }
+                Ok(CommandResult::OpenEffortPicker) => {
+                    println!("{}", wyj_i18n::tr("effort.picker.headless_unsupported"));
+                }
+                Ok(CommandResult::SwitchModel(model)) => {
+                    // headless 下**必须能执行**：切模型只是改内存 + 重建 Agent，
+                    // 没有任何 UI 依赖。headless REPL 里用户敲 `/model <名>`
+                    // 就是要换模型，不该被一句「不支持」挡回去。
+                    //
+                    // 与 TUI 的差别：TUI 的会话级模型覆盖**不落盘**，
+                    // headless 同样不落盘（改的是本次运行内存里的 Config）。
+                    let mut candidate = cfg.clone();
+                    candidate.set_model_for_mode(&mode, &model);
+                    match wyj_api::build_provider_with_model(&candidate, &model) {
+                        Ok(provider) => {
+                            let mut updated = (**shared_agent.read().unwrap()).clone();
+                            updated = updated.with_provider(provider);
+                            *shared_agent.write().unwrap() = Arc::new(updated);
+                            println!(
+                                "{}",
+                                wyj_i18n::tr_fmt("model.switched", &[("name", &model)])
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "{}",
+                                wyj_i18n::tr_fmt("model.switch_failed", &[("err", &e.to_string())])
+                            );
+                        }
+                    }
+                }
+                Ok(CommandResult::SetEffort(level)) => {
+                    // 同上：档位切换不需要 UI。
+                    //
+                    // **档位合法性仍要校验**：给端点不认的档位只会被静默丢弃，
+                    // 用户还以为设上了。这里按当前模型的能力表裁决，并明确
+                    // 告诉用户支持哪些档位。
+                    let mut candidate = cfg.clone();
+                    if level != "off" {
+                        let resolution =
+                            wyj_api::ModelCatalog::resolve(candidate.active_profile(), None);
+                        let levels = wyj_api::supported_effort_levels(&resolution.identity);
+                        if !levels.iter().any(|l| l.as_str() == level) {
+                            let supported = if levels.is_empty() {
+                                wyj_i18n::tr("effort.picker.none_supported").to_string()
+                            } else {
+                                levels
+                                    .iter()
+                                    .map(|l| l.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" / ")
+                            };
+                            println!(
+                                "{}",
+                                wyj_i18n::tr_fmt(
+                                    "effort.unsupported_level",
+                                    &[("level", &level), ("supported", &supported)]
+                                )
+                            );
+                            continue;
+                        }
+                    }
+                    candidate.runtime_session_effort = Some(level.clone());
+                    let mut updated = (**shared_agent.read().unwrap()).clone();
+                    updated = updated.with_reasoning_effort(candidate.effective_reasoning_effort());
+                    updated = updated.with_thinking_switch(candidate.effective_thinking_switch());
+                    *shared_agent.write().unwrap() = Arc::new(updated);
+                    println!(
+                        "{}",
+                        wyj_i18n::tr_fmt("effort.switched", &[("level", &level)])
+                    );
                 }
                 Ok(CommandResult::ModelDoctor(profile_name)) => {
                     let live_cfg = wyj_config::Config::load().unwrap_or_else(|_| cfg.clone());

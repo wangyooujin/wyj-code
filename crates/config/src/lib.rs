@@ -161,13 +161,6 @@ pub struct Profile {
     pub name: String,
     /// LLM 供应商格式（anthropic 或 openai）
     pub provider: Provider,
-    /// 模型厂商或部署平台，例如 anthropic、minimax、zhipu、moonshot。
-    /// 旧配置缺失时由模型目录和端点推导；不影响旧 provider 的客户端选择。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub vendor: Option<String>,
-    /// 端点实际使用的线协议。缺失时与旧 provider 保持一致。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wire_protocol: Option<WireProtocol>,
     /// 默认模型名称
     pub model: String,
     /// Plan 模式专用模型（留空则使用 model）
@@ -261,8 +254,6 @@ impl Default for Profile {
         Self {
             name: "default".to_string(),
             provider: Provider::Anthropic,
-            vendor: None,
-            wire_protocol: None,
             model: "claude-opus-4-8".to_string(),
             plan_model: None,
             exec_model: None,
@@ -285,12 +276,16 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// 在不改变旧配置行为的前提下得到有效线协议。
+    /// 端点实际使用的线协议。**由 `provider` 唯一决定**。
+    ///
+    /// 此前这里还有一层 `Option<WireProtocol>` 覆盖（用户可显式写
+    /// `wire_protocol = "..."`），现已随该字段一并移除——线协议是"用哪种
+    /// 请求格式说话"，与 `provider` 是同一个决定，写两遍只会打架。
     pub fn effective_wire_protocol(&self) -> WireProtocol {
-        self.wire_protocol.clone().unwrap_or(match self.provider {
+        match self.provider {
             Provider::Anthropic => WireProtocol::AnthropicMessages,
             Provider::OpenAI => WireProtocol::OpenAiChatCompletions,
-        })
+        }
     }
 
     /// 当前 profile 是否指向真正的 Anthropic 官方端点，而非仅仅"说 Anthropic
@@ -363,7 +358,6 @@ impl Profile {
             None => self.thinking_switch.clone(),
         }
     }
-
     /// 有效 `max_tools_per_turn`：env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先，否则 profile。
     /// 非法值（0 / 非数字）视为未设置并回落到 profile，不让一次手滑的 env 把
     /// 能力关掉——`0` 若被当成"关并行"会和 `Some(1)` 语义混淆，宁可什么都不做。
@@ -1174,6 +1168,17 @@ pub struct Config {
     /// 仅运行期存在的 API Key；serde 永不读写，避免环境变量被设置面板落盘。
     #[serde(skip)]
     pub runtime_api_key: Option<String>,
+    /// 仅运行期存在的**会话级思考档位**（`/effort` 设置）；serde 永不读写。
+    ///
+    /// 为什么不落进 `config.toml`：档位是「这次对话要想多深」的工作状态，
+    /// 不是「这个分组是什么端点」的一部分。它随**会话文件**落盘
+    /// （`Session.session_effort`），但绝不进全局配置。
+    ///
+    /// 之所以放在 `Config` 而不是单独传参：Agent 重建的入口是
+    /// `RebuildFn(&Config, &str)`，而档位必须参与 `effective_reasoning_effort()`
+    /// 的优先级裁决（env > 会话级 > profile）。放这里就不用改那条签名。
+    #[serde(skip)]
+    pub runtime_session_effort: Option<String>,
     /// 各子系统 retention / cap / rotation 配置(`[storage]` 节)。
     /// 全部字段 opt-out,0 = 关闭。
     #[serde(default)]
@@ -1324,6 +1329,7 @@ impl Default for Config {
             search: SearchCfg::default(),
             runtime_search_api_key: None,
             runtime_api_key: None,
+            runtime_session_effort: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             notify: NotifyCfg::default(),
@@ -1408,8 +1414,6 @@ impl From<LegacyConfigV0> for Config {
             profiles: vec![Profile {
                 name: "default".to_string(),
                 provider: legacy.provider,
-                vendor: None,
-                wire_protocol: None,
                 model: legacy.model,
                 plan_model: legacy.plan_model,
                 exec_model: legacy.exec_model,
@@ -1446,6 +1450,7 @@ impl From<LegacyConfigV0> for Config {
             search: SearchCfg::default(),
             runtime_search_api_key: None,
             runtime_api_key: None,
+            runtime_session_effort: None,
             storage: StorageRetentionCfg::default(),
             persist_cap: PersistCapCfg::default(),
             notify: NotifyCfg::default(),
@@ -1491,6 +1496,93 @@ impl Config {
             // Auto 与 Bypass 共用 exec 模型：两者对模型能力的要求相同，
             // 差别只在权限判定，不值得让用户为切换模式再配一个模型。
             AgentMode::Auto | AgentMode::Bypass => p.exec_model.as_deref().unwrap_or(&p.model),
+        }
+    }
+
+    /// 当前模式下**实际生效**的模型字段名。
+    ///
+    /// `model_for_mode` 只返回模型名，调用方无法知道它来自哪个字段——
+    /// 而「会话级模型覆盖」必须精确改写那个字段，否则会出现"改了
+    /// `exec_model` 但当前是 plan 模式、看起来没生效"这类假象。
+    ///
+    /// 判定规则与 `model_for_mode` **严格一致**：
+    /// - plan 模式 → `plan_model`（为空时回退 `model`）
+    /// - auto / bypass → `exec_model`（为空时回退 `model`）
+    pub fn model_field_for_mode(&self, mode: &AgentMode) -> &'static str {
+        let p = self.active_profile();
+        match mode {
+            AgentMode::Plan => {
+                if p.plan_model.is_some() {
+                    "plan_model"
+                } else {
+                    "model"
+                }
+            }
+            AgentMode::Auto | AgentMode::Bypass => {
+                if p.exec_model.is_some() {
+                    "exec_model"
+                } else {
+                    "model"
+                }
+            }
+        }
+    }
+
+    /// 把当前模式实际生效的那个模型字段设为 `model`。
+    ///
+    /// 只改一个字段（见 [`Config::model_field_for_mode`]），其余模式专属模型
+    /// 原样保留——用户在 auto 模式挑的模型不该顺手改掉 plan 模式用的那个。
+    pub fn set_model_for_mode(&mut self, mode: &AgentMode, model: &str) {
+        let field = self.model_field_for_mode(mode);
+        let p = self.active_profile_mut();
+        match field {
+            "plan_model" => p.plan_model = Some(model.to_string()),
+            "exec_model" => p.exec_model = Some(model.to_string()),
+            _ => p.model = model.to_string(),
+        }
+    }
+
+    /// 本次运行实际生效的 `reasoning_effort`：**env > 会话级 > profile**。
+    ///
+    /// 三级优先级的理由：
+    /// 1. `WYJ_CODE_THINKING_EFFORT` 是用户在 shell 里显式设的运行期开关，
+    ///    优先级最高——它本意就是「这次运行一律用这个档位」，任何面板操作
+    ///    都不该盖掉它；
+    /// 2. 其次是本会话的 `/effort` 覆盖（`runtime_session_effort`）；
+    /// 3. 最后才是分组里配的 `reasoning_effort`。
+    ///
+    /// `off` 的特殊语义：**彻底关思考** —— `reasoning_effort` 返回 `None`，
+    /// `thinking_switch` 返回 `Some("disabled")`。
+    pub fn effective_reasoning_effort(&self) -> Option<String> {
+        if let Some(value) = std::env::var("WYJ_CODE_THINKING_EFFORT")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value);
+        }
+        match self.runtime_session_effort.as_deref() {
+            Some("off") => None,
+            Some(level) if !level.trim().is_empty() => Some(level.to_string()),
+            _ => self.active_profile().effective_reasoning_effort(),
+        }
+    }
+
+    /// 本次运行实际生效的 `thinking_switch`：**env > 会话级 > profile**。
+    ///
+    /// 会话级档位是 `off` 时返回 `Some("disabled")`（彻底关思考）；
+    /// 其它档位**不覆盖** profile 里的 `thinking_switch`——档位与开关是
+    /// 两个独立旋钮：官方 Anthropic 上 effort 与 thinking budget 可以共存，
+    /// 用户配了 `thinking_switch = "enabled"` 不该被 `/effort high` 抹掉。
+    pub fn effective_thinking_switch(&self) -> Option<String> {
+        if let Some(value) = std::env::var("WYJ_CODE_THINKING_SWITCH")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value);
+        }
+        match self.runtime_session_effort.as_deref() {
+            Some("off") => Some("disabled".to_string()),
+            _ => self.active_profile().effective_thinking_switch(),
         }
     }
 }
@@ -1983,7 +2075,7 @@ mod valid_env_name_tests {
     /// `valid_env_name` 是私有函数——只能从同 crate 的测试访问。
     /// 通过 `Config::load` 走真实路径比较稳，但环境变量是进程级副作用，
     /// 单测里直接用 `valid_env_name` 测纯函数更轻、可重复。
-    use super::{valid_env_name, Config, Profile, Provider, WireProtocol};
+    use super::{valid_env_name, Config, Profile, Provider};
 
     #[test]
     fn accepts_classic_uppercase_names() {
@@ -2027,8 +2119,6 @@ mod valid_env_name_tests {
             profiles: vec![Profile {
                 name: "minimax".to_string(),
                 provider: Provider::OpenAI,
-                vendor: Some("minimax".to_string()),
-                wire_protocol: Some(WireProtocol::OpenAiChatCompletions),
                 model: "MiniMax-M3".to_string(),
                 plan_model: None,
                 exec_model: None,
@@ -2231,33 +2321,20 @@ context_window = 32000
         assert!(p.effective_openai_stream_options());
     }
 
+    /// 旧配置里写了 `vendor` / `wire_protocol` 两项（它们已从 `Profile`
+    /// 移除）→ **加载必须不报错**，且这两行被静默忽略。
+    ///
+    /// `Config` / `Profile` 都没有 `deny_unknown_fields`，所以未知键直接丢弃。
+    /// 用户看到的是"文件里还写着但代码不读"——下一次 `config.save()` 时
+    /// `profiles` 数组被整体替换，这两行会从文件里消失。
+    ///
+    /// 这与仓库里删字段的既有惯例一致（如 `StorageRetentionCfg`）：
+    /// 静默忽略 + 无需迁移代码，代价是配置文件里会短暂留下一行无效配置。
     #[test]
-    fn old_profile_without_vendor_or_wire_protocol_remains_compatible() {
+    fn legacy_vendor_and_wire_protocol_keys_are_silently_ignored() {
         let p: Profile = toml::from_str(
             r#"
 name = "legacy"
-provider = "openai"
-model = "deepseek-chat"
-base_url = "https://api.deepseek.com"
-max_tokens = 8192
-context_window = 64000
-"#,
-        )
-        .unwrap();
-
-        assert_eq!(p.vendor, None);
-        assert_eq!(p.wire_protocol, None);
-        assert_eq!(
-            p.effective_wire_protocol(),
-            WireProtocol::OpenAiChatCompletions
-        );
-    }
-
-    #[test]
-    fn explicit_wire_protocol_takes_precedence_over_legacy_provider() {
-        let p: Profile = toml::from_str(
-            r#"
-name = "dual-protocol"
 provider = "openai"
 vendor = "minimax"
 wire_protocol = "anthropic_messages"
@@ -2269,8 +2346,12 @@ context_window = 200000
         )
         .unwrap();
 
-        assert_eq!(p.vendor.as_deref(), Some("minimax"));
-        assert_eq!(p.effective_wire_protocol(), WireProtocol::AnthropicMessages);
+        // 线协议现在**只**由 provider 决定 —— 旧配置里显式写的
+        // `anthropic_messages` 不再有任何效力。
+        assert_eq!(
+            p.effective_wire_protocol(),
+            WireProtocol::OpenAiChatCompletions
+        );
     }
 
     #[test]

@@ -70,13 +70,22 @@ pub struct SessionFile {
     /// 丢弃时能逐个 `release` —— CAS 的 `gc` 只回收 `ref_count == 0` 的 blob。
     #[serde(default)]
     pub elided_blobs: Vec<String>,
-    /// 本会话临时使用的调用分组名（`/model` 面板「仅本会话使用」）。
+    /// 本会话临时使用的调用分组名（`/profile` 面板「仅本会话使用」）。
     ///
     /// `None` = 跟随 `Config.active_profile`。落盘是为了 `--resume` 后继续
     /// 用同一套端点/模型——否则用户为这个项目临时挑的模型，一恢复就悄悄
     /// 变回全局默认值，而聊天记录里全是另一个模型的产出。
     #[serde(default)]
     pub session_profile: Option<String>,
+    /// 本会话的思考强度档位（`/effort` 设置）。
+    ///
+    /// 落盘是为了 `--resume` 后继续用同一档思考强度：思考档位是「这个任务
+    /// 要想多深」的工作状态，不该每次恢复会话都要重设一遍。
+    ///
+    /// 旧会话文件没有这个字段 → `#[serde(default)]` 让它读成 `None`
+    /// （= 跟随分组配置），而不是让所有历史会话打不开。
+    #[serde(default)]
+    pub session_effort: Option<String>,
     /// 本会话 context editing 累计释放的估算 token。
     #[serde(default)]
     pub context_edit_freed_tokens: u32,
@@ -222,6 +231,7 @@ impl SessionFile {
             context_edit_freed_tokens: session.context_edit_freed_tokens,
             elided_blobs: session.elided_blobs.clone(),
             session_profile: session.session_profile.clone(),
+            session_effort: session.session_effort.clone(),
             routing_events: session.routing_events.clone(),
             current_checkpoint_id: session.current_checkpoint_id.clone(),
             branch_parent_session_id: session.branch_parent_session_id.clone(),
@@ -542,10 +552,11 @@ impl SessionStore {
         let session_id = crate::history::new_session_id();
         // 分支继承父会话的临时分组：分支是「在同一次上下文里另开一条线」，
         // 换回全局默认端点会让后续对话与已有的模型产出错配。
-        let session_profile = self
-            .load(parent_session_id)
-            .ok()
-            .and_then(|f| f.session_profile);
+        //
+        // 思考档位同理：分支延续的是同一条思路的延续，思考深度也应该延续。
+        let parent = self.load(parent_session_id).ok();
+        let session_profile = parent.as_ref().and_then(|f| f.session_profile.clone());
+        let session_effort = parent.as_ref().and_then(|f| f.session_effort.clone());
         let file = SessionFile {
             session_id,
             title: extract_title(&checkpoint.messages),
@@ -581,6 +592,7 @@ impl SessionStore {
             compact_count: 0,
             elided_blobs: vec![],
             session_profile,
+            session_effort,
             context_edit_freed_tokens: 0,
             prompt_fingerprint: None,
         };
@@ -831,6 +843,7 @@ mod tests {
             compact_count: 0,
             elided_blobs: vec![],
             session_profile: None,
+            session_effort: None,
             context_edit_freed_tokens: 0,
             prompt_fingerprint: None,
         }
@@ -1051,6 +1064,60 @@ mod tests {
         assert_eq!(s.session_profile.as_deref(), Some("minimax"));
     }
 
+    /// 思考档位必须完整走完「内存 Session → SessionFile → 磁盘 → 恢复」，
+    /// 否则 `--resume` 后档位悄悄回落，用户以为设上了高思考其实没有。
+    #[test]
+    fn session_effort_survives_save_load_round_trip() {
+        let base = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(base.path().join("sessions")).unwrap();
+        let mut session = Session::new();
+        session.push_user("hello");
+        session.session_effort = Some("high".to_string());
+
+        let file = SessionFile::from_session(
+            &session,
+            SessionFileMeta {
+                session_id: "se".to_string(),
+                title: "t".to_string(),
+                last_preview: "p".to_string(),
+                cwd: base.path().display().to_string(),
+                timestamp: "2026-10-21T00:00:00Z".to_string(),
+                turns: 1,
+                title_generated: false,
+            },
+        );
+        assert_eq!(file.session_effort.as_deref(), Some("high"));
+        store.save(&file).unwrap();
+
+        let loaded = store.load("se").unwrap();
+        assert_eq!(loaded.session_effort.as_deref(), Some("high"));
+
+        let mut restored = Session::new();
+        restored.restore_usage_from(&loaded);
+        assert_eq!(restored.session_effort.as_deref(), Some("high"));
+    }
+
+    /// 旧会话文件没有这个字段，必须反序列化成 `None` 而不是报错——
+    /// 否则升级后所有历史会话都打不开。
+    #[test]
+    fn legacy_session_file_without_session_effort_loads_as_none() {
+        let mut value =
+            serde_json::to_value(mk_file("old", Path::new("/tmp"), "2026-07-01T00:00:00Z"))
+                .unwrap();
+        value.as_object_mut().unwrap().remove("session_effort");
+        let file: SessionFile = serde_json::from_value(value).unwrap();
+        assert_eq!(file.session_effort, None);
+    }
+
+    /// `/clear` 换的是对话内容，不是思考深度：档位必须留下来。
+    #[test]
+    fn clear_conversation_keeps_session_effort() {
+        let mut s = Session::new();
+        s.session_effort = Some("high".to_string());
+        s.clear_conversation();
+        assert_eq!(s.session_effort.as_deref(), Some("high"));
+    }
+
     /// 计量字段此前只活在内存里，`/resume` 后 `/cost` 的缓存与调用次数恒为 0。
     /// 这条钉住 save→load 往返不再丢数据。
     #[test]
@@ -1164,6 +1231,7 @@ mod tests {
             compact_count: 0,
             elided_blobs: vec![],
             session_profile: None,
+            session_effort: None,
             context_edit_freed_tokens: 0,
             prompt_fingerprint: None,
         };
@@ -1233,6 +1301,7 @@ mod tests {
             compact_count: 0,
             elided_blobs: vec![],
             session_profile: None,
+            session_effort: None,
             context_edit_freed_tokens: 0,
             prompt_fingerprint: None,
         };

@@ -4,9 +4,11 @@
 
 | 文件 | 承载 | 说明 |
 |---|---|---|
-| `app.rs`（11639） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
-| `app/events.rs`（1251） | `apply_agent_event` / `apply_sub_agent_event`：Agent 事件 → UI 状态 | 只写状态，不读终端尺寸、不排版；事件顺序不变量都在这一个函数里 |
-| `app/profile_panel.rs`（1972） | `/model` 分组面板 | 字段表 `PROFILE_FIELD_SPECS` 是唯一真相源，渲染/键位/校验三处都从它派生 |
+| `app.rs`（11829） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
+| `app/events.rs`（1299） | `apply_agent_event` / `apply_sub_agent_event`：Agent 事件 → UI 状态 | 只写状态，不读终端尺寸、不排版；事件顺序不变量都在这一个函数里 |
+| `app/profile_panel.rs`（1992） | `/profile` 分组面板 | 字段表 `PROFILE_FIELD_SPECS` 是唯一真相源，渲染/键位/校验三处都从它派生 |
+| `app/model_panel.rs`（233） | `/model` 模型选择面板 | 拉端点 `/models` 列表；切换**只存内存**（不写 config、不落会话文件） |
+| `app/effort_panel.rs`（216） | `/effort` 思考档位面板 | 档位按当前模型的 `ThinkingSpec::effort_levels` 过滤；档位**随会话落盘** |
 | `app/skills_panel.rs`（1113） | `/skills` 面板 | 含 SkillHub 搜索与本地/注册表两个来源的分流 |
 | `app/schedule_panel.rs`（877） | `/schedule` 面板 | 草稿式编辑，Ctrl+S 才写盘并同步 crontab |
 | `app/mcp_panel.rs`（692） | `/mcp` 面板 | server 信任与连接状态 |
@@ -64,6 +66,8 @@
 **状态栏两段排版：宽度按显示列宽，右段放不下就整段丢**（`render::draw_status` + `render::status_bar_layout`）。旧实现用 `chars().count()` 算左右两段宽度，而中文与全宽符号是双宽——`● 1 条已排队（等待送达）` char 数 14、显示宽度 24，补位少 10 列 → `Paragraph` 右端溢出 → 溢出是**从右侧硬切**，切点落在全角 `（` 中间，用户看到的就是右下角挂着一个半截的 `(`。这类 bug **只在中文文案下暴露**：英文 `● 1 queued (awaiting delivery)` 全 ASCII，char 数恰好等于显示宽度，纯英文快照对它完全不敏感。三条硬规则：① 任何宽度计算都走 `char_display_width`，`draw_status` 内不许再出现 `chars().count()`；② 两段排版只由 `status_bar_layout` 一处算，别处重算必然漂移；③ 分级降级：右段（排队 / Ctrl+C 待确认，只在特定时刻出现）优先保，cwd 吃剩余预算、超出加省略号、连 2 列都分不出时整段留空；右段**自身**塞不下时整段丢弃，绝不交给 Paragraph 硬切——半个括号不提示任何事，只会让用户以为界面画坏了（排队提示在输入框标题栏还有一份，那里是 `build_thinking_title` 里 rank 最高的一段）。
 
 **状态栏不得设置显式背景色**（`Color::Reset` 以外的一切 `bg`）：深灰带与上方标题栏割裂成两块色块。钉子 `draw_status_does_not_set_explicit_background`。
+
+**状态栏的思考档位段（`/effort`）在 cwd 之前，两种情况整段不显示**（`◆ model [auto] · high ~/proj`）：① 用户从没设过档位（会话级 None 且分组也没配）——没设过的东西不该占地方；② 当前端点根本不认 effort（`ThinkingSpec::effort_levels` 为空，如 GLM 只认开关）——显示一个永远发不出去的值是纯误导。判据与 provider 序列化请求体用的是**同一张能力表**（`wyj_api::supported_effort_levels`），避免「状态栏说 high、请求里被静默丢掉」。`off`（用户显式关思考）**要显示**——那是显式状态，不是「没设」。这段的显示列宽必须算进 `left_fixed` 预算（同上面那条 `char_display_width` 硬规则）。钉子 `status_bar_shows_the_thinking_level_only_when_it_is_in_effect` / `status_bar_shows_the_off_level_when_thinking_is_disabled`。
 
 ## 终端能力降级：能力兜底，不是再美化一遍
 
@@ -158,7 +162,7 @@
 3. **思考字段按线协议分流**：`thinking_budget` / `interleaved_thinking` 只在 Anthropic 线显示，`reasoning_effort` / `thinking_switch` 只在 OpenAI 线显示。两边的参数互不相认，同时平铺只会诱导用户配一个必然被 catalog 丢弃的死字段。可见性过滤在 `ProfileDialog::visible_field_idxs` 里做，**不能只在渲染层做**——`rows()`、键位、光标三者必须看到同一份可见列表，否则方向键会跳到看不见的行上。
 4. **Enum 字段的候选首项必须是空串**（`enum_choices` 自动加）。`reasoning_effort` / `thinking_switch` 在配置里是 `Option<String>`，空串是唯一能表达 `None` 的形态；去掉它用户就再也回不到"跟随端点默认"。
 
-**`max_tools_per_turn` 是枚举字段，新建分组预填 4**：候选固定为「（默认）/ 1 / 2 / 4 / 8」（`MAX_TOOLS_PER_TURN_CHOICES`），草稿侧存 `String`、空串写回 `None`。**预填 4 不是随手取的数**——`None` 会让 `model_catalog` 按 vendor 猜出的 `max_tools_per_turn = 1` 直接生效，而静态目录对所有非 anthropic/openai vendor 一律判 1，于是国内模型新建分组后每轮只能发一个工具调用、一次只能派生一个 subagent。已有分组仍保留原值（`from_profile` 原样透传），用户清空即可回到端点默认。测试 `new_profile_from_template_prefills_four_tools_per_turn` / `max_tools_per_turn_enum_cycles_and_clears_to_none` 钉死。
+**`max_tools_per_turn` 是枚举字段，新建分组预填 4**：候选固定为「（默认）/ 1 / 2 / 4 / 8」（`MAX_TOOLS_PER_TURN_CHOICES`），草稿侧存 `String`、空串写回 `None`。**预填 4 不是随手取的数**——`None` 会让 `model_catalog` 按 vendor 猜出的 `max_tools_per_turn = 1` 直接生效，而静态目录对所有非 anthropic/openai vendor 一律判 1，于是国内模型新建分组后每轮只能发一个工具调用、一次只能派生一个 subagent。已有分组仍保留原值（`from_profile` 原样透传），用户清空即可回到端点默认。测试 `new_profile_prefills_four_tools_per_turn` / `max_tools_per_turn_enum_cycles_and_clears_to_none` 钉死。
 
 **Model 字段的 Enter 直达拉取**：`ProfileFieldKind::Model` 按 Enter 直接发起 `fetch_model_ids`（`profile_start_fetch_models`），结果菜单**首项固定是「手动输入」**；拉取失败/为空时也弹这个单项目菜单。不能只把拉取挂在菜单里——第三方的 `/models` 常常不支持，用户必须随时能退回手填。选中模型后会调 `autofill_capacity_from_catalog`，只用 `wyj_api::known_model_capacity` 的静态表补 `context_window` / `max_tokens`，且**只覆盖空值或默认值（200000 / 32000）**，用户手改过的数字不动。供应商的 `/models` 接口不返回容量元数据，所以这里没有 live probe 路径。
 
@@ -173,6 +177,55 @@
 **`/evolve` 治理中心**：`EvolutionDialog` 固定提供 Active / Candidates / Episodes / Health 四视图，Tab/Shift+Tab 循环，列表与右侧 evidence/detail 保持独立滚动，PageUp/PageDown 只移动详情。Approve、Reject、Forget、Rollback 都必须先进入 `EvolutionConfirmAction` 二次确认；切换视图、Esc 或完成动作后清空确认状态，避免旧确认落到新选中项。Episode 的 good/bad feedback、external include 与 manual skillize 可以直接执行，但必须在面板中展示成功或错误结果；Skill 批准前先创建 checkpoint，默认只安装到 project scope，任何 Skill/lockfile/candidate 状态写入失败都调用生成 Skill 回滚。对话框 reload 只能刷新下一次视图快照，不能改变正在执行的 Agent 回合 Evolution context。
 
 **`open_path_in_editor`**（`/memory` 面板"用 $EDITOR 打开"）挂起 TUI 时无条件 `LeaveAlternateScreen` + `disable_raw_mode`、编辑完成后 `EnterAlternateScreen` + `enable_raw_mode` + `terminal.clear()`——这个函数写的时候就已经假设调用时处于 alternate screen（原先只在 Fullscreen 对话框打开期间才会被调用），现在全程都在 alternate screen，前置假设依然成立，不需要改。
+
+## 欢迎页（`welcome.rs`）：只承载「品牌 + 操作提示」两块
+
+**页面上不得出现 model / cwd**——状态栏已常驻 `◆ <模型> [模式] · <cwd>`（每帧都在）。欢迎页再写一遍就是同一个事实占两个位置：用户读状态栏时它被欢迎页的同名文本稀释，欢迎页因此多占两行却没多给信息。状态栏答「我现在在哪 / 我以什么身份在跑」，欢迎页答「这是什么 / 从哪开始」，职责不重叠。示例提问引导行（`Try "fix this bug" or ask anything…`）同样删除——它与正下方的输入框说的是同一件事，重复即噪音。
+
+**当前布局**（`render_welcome`，共 11 行）：
+
+```
+(1 行留白)
+WYJ-CODE 艺术字 × 5 行     ← 品牌区
+v0.3.15                     ← 品牌区，紧贴 logo
+(2 行留白)                  ← 唯一的分组边界
+💡 <轮播 tip>               ← 提示区
+/help · Shift+Tab · /compact · Ctrl+C
+```
+
+两条分组规则：**logo 与版本号同属品牌区、必须紧密相邻**（figlet 原输出的第 6 行是整行空格、不是字形，已裁掉）；**品牌区与提示区之间留 2 行**（1 行在 5 行高的 logo 之后会被读成 logo 的下沿）。左缩进固定 2 空格（`CONTENT_INDENT`），与聊天区助手正文（`markdown::Ctx::block_indent` 的 base=2）同列起首。
+
+**宽度契约：每一行的显示宽度都必须 `<= area_width`**。这是硬约束，不是建议——超宽的行会被 `Paragraph` 从右侧硬切，切点落在半截字符上（项目里已因此出过「右下角挂着半个括号」的事故）。预算必须把**缩进和图标都算在内**：旧实现只对正文算预算，于是窄终端下 `缩进 + 💡 ` 那一段就超宽（宽度 4 时 `  💡 ` 是 5 列）。`💡` 是双宽 emoji，连同后随空格共 **3 列**，放不下时整个图标省略、只留文案。
+
+**窄终端下 logo 只能切到完整字母的边界**。figlet 艺术字里一个字母横跨若干列（`O` 占 6 列），按列硬切会切出半圆——比整块裁掉更难认。`LOGO_LETTER_BOUNDARIES`（`W`=13 / `WY`=20 / `WYJ`=23 / `WYJ-C`=35 / `WYJ-CO`=39 / `WYJ-COD`=45 / `WYJ-CODE`=52）由 `figlet -f standard` 逐前缀实测得出，`snap_to_letter_boundary()` 把可用宽度收敛到最大的可容纳边界；一个字母都放不下时整块留白。
+
+钉子：`welcome::tests::no_line_exceeds_the_given_width_at_any_terminal_size`（4..200 列 × 全部 tip 逐行验宽）、`logo_is_truncated_at_whole_letter_boundaries`、`logo_disappears_entirely_when_not_even_one_letter_fits`、`welcome_page_does_not_repeat_the_status_bar_model_and_cwd`、`welcome_page_has_no_suggestion_prompt_line`、`version_line_has_no_blank_line_between_it_and_the_logo`。
+
+
+## System 通知的折行：走 markdown 折行引擎，不要交给 `WordWrapper`
+
+System 消息（`  ⚙ ` / `  ⚠ ` 标记那类，典型是启动时的 `auto.mode_notice`）**不走 markdown 渲染**，但**必须用 markdown 的折行引擎**折行：`markdown::wrap_plain_text_spans(&[(text, style)], avail)`。
+
+**为什么不能交给 `Paragraph::wrap`**：`Wrap { trim: false }` 走 ratatui 的 `WordWrapper`，它**只在空格处断行**。中文段落几乎没有空格，于是 WordWrapper 一路撑到接近行尾才折回来，把词组拦腰截断。实测（100 列）：
+
+```
+旧：|  ⚙ 当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 +|
+    |模型分类器在执行前判定；闸门拿不准时仍会逐次弹窗问你。…|
+新：|  ⚙ 当前为 auto 模式：大多数操作不再逐次弹窗，由本地规则 + 模型分类器在执行前判定；闸门拿不准时仍会|
+    |逐次弹窗问你。危险操作会被硬拦下，不受分类器停用影响。…|
+```
+
+`WordWrapper` 还会把 `Shift+Tab` 拆成 `Shift+` / `Tab`（按键名被拆开就认不出了），把 `plan / bypass` 里的斜杠留在行尾。
+
+**新引擎的三条性质**（都来自 `markdown.rs` 的 `tokenize_atoms` + `wrap_spans`）：宽字符（汉字 / 全角标点 / emoji）逐字之间可断；ASCII 词（`Shift+Tab`）整词不断；遵守中文排版禁则（收尾标点不落行首、开括号不悬行尾）。
+
+**System 消息的标记只出现在首行**，续行顶格（与 markdown 段落续行同款）。标记 `  ⚙ ` 占 5 显示列（2 空格 + ⚙ 2 列 + 1 空格），首行可用宽度 = 内容宽度 − 5。**注意两套口径**：`⚙` 的显示宽度是 2 列、char 数是 1——算宽度预算用 2 列，剥前缀用 char 数。
+
+**新增 System 消息类型时同理**：任何塞进单个 span 的长文本都会踩 `WordWrapper` 的坑。
+
+钉子：`render::system_message_wrap_tests::{system_message_does_not_split_a_chinese_phrase_across_lines, system_message_keeps_ascii_key_names_intact, system_message_lines_never_exceed_the_content_width, system_message_never_starts_a_line_with_closing_punctuation}`。
+
+**副作用**：`logical_line_height` 的快判（`Line::width() <= 视口宽度` → 1 行）现在对 System 消息也成立，因为渲染期已折好行。`chat_viewport_tests::wrapped_lines_contribute_their_physical_height` 因此**不再钉「逻辑行数 < 物理行数」这个中间量**（该中间量依赖「渲染期未折行」的前提，已不成立），改为直接钉结果：贴底时最后一条消息完整可见。
 
 
 ## 终端 panic 还原与字符边界安全

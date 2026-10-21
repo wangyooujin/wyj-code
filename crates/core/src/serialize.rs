@@ -617,6 +617,7 @@ mod tests {
             compact_count: 0,
             elided_blobs: vec![],
             session_profile: None,
+            session_effort: None,
             context_edit_freed_tokens: 0,
             prompt_fingerprint: None,
         };
