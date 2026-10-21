@@ -290,6 +290,162 @@ pub struct SessionStore {
     dir: PathBuf,
 }
 
+/// 跨会话检索命中的一条消息。
+///
+/// 与记忆 claim 层是互补关系：claim 是模型抽出的事实，这里是可以回到原文的
+/// 原始对话片段。模型在 claim 层找不到（提取时漏了、或只存在于当时的工具输出里）
+/// 时，这是唯一的回溯入口。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSearchHit {
+    pub session_id: String,
+    pub title: String,
+    pub timestamp: String,
+    /// 消息在 `SessionFile.messages` 里的下标。配合 `session_id` 可直接定位。
+    pub message_index: usize,
+    pub role: String,
+    /// 命中片段（命中位置前后各若干字符），不是整条消息——一条 Bash 输出
+    /// 可能几十 KB，整条返回会把调用方的上下文一次灌满。
+    pub snippet: String,
+    pub score: f32,
+}
+
+/// 检索时单个会话最多贡献多少条命中。
+///
+/// 不设上限的话，一个跑了一整天的会话会用几十条相近命中把结果列表占满，
+/// 其余会话连一条都进不来——而跨会话检索的价值恰恰在「找到别的会话」。
+const MAX_HITS_PER_SESSION: usize = 2;
+/// 单条会话在索引里的正文上限。超出部分截断：会话文件里最长的往往是
+/// 被 `PersistCapCfg` 截过一轮的工具输出，再往后都是低信息量的重复日志。
+const MAX_SESSION_INDEX_BYTES: usize = 256 * 1024;
+/// snippet 的目标长度（字符数，非字节）。
+const SNIPPET_CHARS: usize = 240;
+
+/// 单条消息里工具结果参与索引的最大字节数。
+///
+/// 工具结果要**部分**入索引：一条 panic 栈、一句报错常常只存在于工具输出里，
+/// 完全不索引等于「最需要回溯的东西恰好查不到」。但整段入索引会让 idf 塌掉
+/// （每个词都在某段日志里出现过），所以只留开头这一段——报错与结论都在开头，
+/// 尾部通常是重复的堆栈行。需要全文时走 `ContextRecall`（CAS 仍持有）。
+const TOOL_RESULT_INDEX_BYTES: usize = 800;
+
+/// 一条消息在检索索引里的形态。
+struct SearchDoc {
+    message_index: usize,
+    role: String,
+    text: String,
+}
+
+/// 把会话切成可检索的消息文档。
+///
+/// 索引什么、不索引什么是有取舍的（三个教训来自实测）：
+/// - **文本**：全量索引，这是对话的骨架。
+/// - **工具调用**：索引参数（`Bash(git log --oneline -20)` 是「当时在查什么」
+///   的最佳线索）。
+/// - **工具结果**：只索引开头 [`TOOL_RESULT_INDEX_BYTES`] 字节。完全索引会让
+///   idf 塌掉；完全不索引则让「最需要回溯的报错文本」恰好查不到。
+/// - **thinking**：不索引。它是推理草稿，不是可被引用的事实。
+fn index_session(file: &SessionFile) -> Vec<SearchDoc> {
+    let mut docs = Vec::new();
+    let mut budget = MAX_SESSION_INDEX_BYTES;
+    for (index, message) in file.messages.iter().enumerate() {
+        let mut text = String::new();
+        for block in &message.content {
+            match block {
+                ContentBlock::Text { text: block_text } => {
+                    text.push_str(block_text);
+                    text.push('\n');
+                }
+                // 工具**调用**要索引：它是「当时在查什么」的最佳线索
+                // （`Bash(git log --oneline -20)`）。工具**结果**不索引。
+                ContentBlock::ToolUse { name, input, .. } => {
+                    text.push_str(name);
+                    text.push(' ');
+                    text.push_str(&input.to_string());
+                    text.push('\n');
+                }
+                ContentBlock::ToolResult { content, .. } => {
+                    // 工具结果只收录开头一段，理由见 TOOL_RESULT_INDEX_BYTES。
+                    let summary = content.display_text();
+                    let cut = crate::textutil::floor_char_boundary(
+                        &summary,
+                        summary.len().min(TOOL_RESULT_INDEX_BYTES),
+                    );
+                    text.push_str(&summary[..cut]);
+                    text.push('\n');
+                }
+                ContentBlock::Image { .. }
+                | ContentBlock::Thinking { .. }
+                | ContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let bytes = trimmed.len();
+        if bytes > budget {
+            if budget == 0 {
+                break;
+            }
+            // 截断点必须落在字符边界，否则 `&str[..n]` 会 panic。
+            let cut = crate::textutil::floor_char_boundary(trimmed, budget);
+            docs.push(SearchDoc {
+                message_index: index,
+                role: role_label(&message.role),
+                text: trimmed[..cut].to_string(),
+            });
+            break;
+        }
+        budget -= bytes;
+        docs.push(SearchDoc {
+            message_index: index,
+            role: role_label(&message.role),
+            text: trimmed.to_string(),
+        });
+    }
+    docs
+}
+
+fn role_label(role: &Role) -> String {
+    match role {
+        Role::User => "user".to_string(),
+        Role::Assistant => "assistant".to_string(),
+    }
+}
+
+/// 取命中词周围的片段。
+///
+/// 命中词找不到时（分词是一回事、`contains` 是另一回事：CJK n-gram 命中不代表
+/// 原始子串存在）退回**开头**而不是整条消息——开头通常含标题/结论，比中间截断
+/// 更有信息量。
+fn snippet_around(text: &str, query_lower: &str) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= SNIPPET_CHARS {
+        return text.to_string();
+    }
+    let lowered = text.to_lowercase();
+    let hit_byte = if query_lower.is_empty() {
+        None
+    } else {
+        lowered.find(query_lower)
+    };
+    let Some(hit_byte) = hit_byte else {
+        return text.chars().take(SNIPPET_CHARS).collect::<String>() + "…";
+    };
+    // 命中点前后的字符偏移：先把字节偏移换算成字符偏移，避免在多字节
+    // 字符上切出半个 UTF-8 序列。
+    let prefix_chars = text[..hit_byte].chars().count();
+    let start_chars = prefix_chars.saturating_sub(SNIPPET_CHARS / 3);
+    let mut snippet: String = text.chars().skip(start_chars).take(SNIPPET_CHARS).collect();
+    if start_chars > 0 {
+        snippet.insert(0, '…');
+    }
+    if start_chars + SNIPPET_CHARS < total_chars {
+        snippet.push('…');
+    }
+    snippet
+}
+
 impl SessionStore {
     pub fn new(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
@@ -548,6 +704,133 @@ impl SessionStore {
     /// 返回当前项目最近一次会话（供 `-c/--continue` 恢复当前项目而非全局最新）。
     pub fn last_for_project(&self, cwd: &Path) -> Result<Option<SessionMeta>> {
         Ok(self.list_for_project(cwd)?.into_iter().next())
+    }
+
+    /// 跨会话全文检索：在历史 transcript 里找命中消息。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 记忆 claim 层是**提取结果**——模型提取时漏掉的事实永久丢失，而工具输出
+    /// 里的细节（某次测试的真实报错、某条命令的完整输出）基本不会被提取成 claim。
+    /// 但原始 transcript 一直在 `sessions/<id>.json` 里躺着，此前只有
+    /// `list / last` 这类按时间的入口，等于「存了但查不到」。
+    ///
+    /// ## 为什么不是向量检索
+    ///
+    /// 与 `memory_v3::search` 同一个判断：本地词法（CJK n-gram + BM25）在
+    /// 「同一批专有名词反复出现」的编码场景里精度足够，且不需要 embedding 服务。
+    ///
+    /// ## 代价
+    ///
+    /// 每次检索都重读并解析全部会话 JSON（`list()` 只读 `.meta.json`，这里不行）。
+    /// 会话数是几十到几百量级、单个文件被 `PersistCapCfg` 限过体积，实测可接受；
+    /// 但它是 O(全部会话) 的操作，不该放进每轮自动注入的路径——只供显式查询。
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchHit>> {
+        self.search_with(query, limit, None)
+    }
+
+    /// 限定在当前项目（git 仓库根）内的跨会话检索。
+    ///
+    /// 与 `list_for_project` 同一套隔离语义：不同仓库的会话互不可见。给模型的
+    /// 入口只应该走这个版本——全库检索会把「另一个项目里做过什么」带进当前
+    /// 项目的上下文，既噪声大也不符合会话按项目隔离的既有约定。
+    pub fn search_for_project(
+        &self,
+        cwd: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionSearchHit>> {
+        self.search_with(query, limit, Some(cwd))
+    }
+
+    fn search_with(
+        &self,
+        query: &str,
+        limit: usize,
+        project: Option<&Path>,
+    ) -> Result<Vec<SessionSearchHit>> {
+        let query_terms = crate::lexical::term_frequencies(query);
+        if query_terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let query_lower = query.trim().to_lowercase();
+
+        let metas = match project {
+            Some(cwd) => self.list_for_project(cwd)?,
+            None => self.list()?,
+        };
+
+        // 先收集所有 (会话, 消息) 的检索文本，再一次性建 BM25 索引。
+        let mut docs: Vec<(SessionMeta, Vec<SearchDoc>)> = Vec::new();
+        for meta in metas {
+            let Ok(file) = self.load(&meta.session_id) else {
+                // 单个会话损坏不该让整次检索失败——历史文件在升级/并发写入后
+                // 偶有解析不了的，跳过它继续找别的。
+                continue;
+            };
+            let docs_for_session = index_session(&file);
+            if !docs_for_session.is_empty() {
+                docs.push((meta, docs_for_session));
+            }
+        }
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let texts: Vec<String> = docs
+            .iter()
+            .flat_map(|(_, messages)| messages.iter().map(|doc| doc.text.clone()))
+            .collect();
+        let scorer = crate::lexical::Bm25Scorer::new(&texts);
+
+        let mut hits: Vec<SessionSearchHit> = Vec::new();
+        let mut doc_index = 0usize;
+        for (meta, messages) in docs {
+            let mut per_session: Vec<SessionSearchHit> = Vec::new();
+            for message in messages {
+                let mut score = scorer.score(doc_index, &query_terms);
+                doc_index += 1;
+                // 精确短语加分：BM25 只数词元，而中文查询词（如四字术语）在长句里
+                // 会被切碎成 n-gram，各词元的 idf 都被拉低到接近 0，于是「原文里
+                // 逐字出现」这个最强信号反而输给「碎词出现得多」的噪声段落。
+                // 与 `memory_v3::search` 的 `exact_phrase` 同一权重、同一理由。
+                if query_lower.chars().count() >= 2
+                    && message.text.to_lowercase().contains(&query_lower)
+                {
+                    score += 5.0;
+                }
+                // 0.35 与 `memory_v3::search` 同一门槛：低于它说明只命中了
+                // 一两个高频 n-gram，属于噪声。
+                if score <= 0.35 {
+                    continue;
+                }
+                per_session.push(SessionSearchHit {
+                    session_id: meta.session_id.clone(),
+                    title: meta.title.clone(),
+                    timestamp: meta.timestamp.clone(),
+                    message_index: message.message_index,
+                    role: message.role.clone(),
+                    snippet: snippet_around(&message.text, &query_lower),
+                    score,
+                });
+            }
+            per_session.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            per_session.truncate(MAX_HITS_PER_SESSION);
+            hits.extend(per_session);
+        }
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.timestamp.cmp(&a.timestamp))
+        });
+        hits.truncate(limit.clamp(1, 50));
+        Ok(hits)
     }
 
     pub fn branch_from_checkpoint(
@@ -1225,7 +1508,11 @@ mod tests {
 
         let listed = store.list_for_project(&repo).unwrap();
         let ids: Vec<&str> = listed.iter().map(|m| m.session_id.as_str()).collect();
-        assert_eq!(ids, vec!["s3", "s2", "s1"], "同一 cwd 的会话必须全部列出且时间倒序");
+        assert_eq!(
+            ids,
+            vec!["s3", "s2", "s1"],
+            "同一 cwd 的会话必须全部列出且时间倒序"
+        );
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1348,5 +1635,201 @@ mod tests {
         assert!(store.load("secret-session").unwrap().messages[0]
             .text()
             .contains(crate::secret::REDACTED_SECRET));
+    }
+
+    // ---- 跨会话检索 ----
+
+    fn mk_search_file(id: &str, ts: &str, texts: &[&str]) -> SessionFile {
+        let mut file = mk_file(id, Path::new("/tmp/proj"), ts);
+        file.title = format!("标题-{id}");
+        file.messages = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: vec![ContentBlock::Text {
+                    text: (*text).to_string(),
+                }],
+            })
+            .collect();
+        file
+    }
+
+    #[test]
+    fn session_search_finds_message_in_other_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .save(&mk_search_file(
+                "s1",
+                "2026-10-01T00:00:00Z",
+                &["今天重构了渲染管线", "把行高改成按字号推导"],
+            ))
+            .unwrap();
+        store
+            .save(&mk_search_file(
+                "s2",
+                "2026-10-02T00:00:00Z",
+                &["在讨论依赖注入", "顺便记下渲染管线的缓存策略"],
+            ))
+            .unwrap();
+
+        let hits = store.search("渲染管线", 8).unwrap();
+        assert!(!hits.is_empty(), "跨会话检索应命中");
+        assert!(hits.iter().any(|h| h.session_id == "s2"));
+        // 片段必须带上下文，而不是只回显查询词本身。
+        assert!(hits
+            .iter()
+            .any(|h| h.snippet.contains("缓存策略") || h.snippet.contains("行高")));
+    }
+
+    #[test]
+    fn session_search_respects_per_session_hit_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        // 单个会话里塞 10 条同样命中「渲染管线」的消息。
+        let noisy: Vec<String> = (0..10).map(|i| format!("渲染管线 第{i}次讨论")).collect();
+        let refs: Vec<&str> = noisy.iter().map(|s| s.as_str()).collect();
+        store
+            .save(&mk_search_file("noisy", "2026-10-01T00:00:00Z", &refs))
+            .unwrap();
+        store
+            .save(&mk_search_file(
+                "quiet",
+                "2026-10-02T00:00:00Z",
+                &["渲染管线的另一处记录"],
+            ))
+            .unwrap();
+
+        let hits = store.search("渲染管线", 8).unwrap();
+        let from_noisy = hits.iter().filter(|h| h.session_id == "noisy").count();
+        assert!(
+            from_noisy <= MAX_HITS_PER_SESSION,
+            "单个会话的命中必须被限流，否则会把其它会话挤掉：{from_noisy}"
+        );
+        assert!(
+            hits.iter().any(|h| h.session_id == "quiet"),
+            "被限流的噪音会话不该让安静会话消失"
+        );
+    }
+
+    #[test]
+    fn session_search_indexes_tool_calls_and_only_the_head_of_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let mut file = mk_file("s-tool", Path::new("/tmp/proj"), "2026-10-03T00:00:00Z");
+        // 结果开头放一个独特的标记，尾部（远超 TOOL_RESULT_INDEX_BYTES）再放一个。
+        let mut body = String::from("结果开头标记 奇美拉错误码\n");
+        body.push_str(&"填充日志行重复内容\n".repeat(400));
+        body.push_str("尾部独有标记 雪貂回溯点\n");
+        assert!(body.len() > TOOL_RESULT_INDEX_BYTES * 2);
+
+        file.messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "cargo test --features 量子纠缠"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: wyj_api::types::ToolResultContent::Text(body),
+                    is_error: true,
+                }],
+            },
+        ];
+        store.save(&file).unwrap();
+
+        // 1) 工具调用参数可检索：它是「当时在查什么」的最佳线索。
+        assert!(
+            !store.search("量子纠缠", 8).unwrap().is_empty(),
+            "工具调用参数应可检索"
+        );
+        // 2) 结果开头的报错信息可检索——这是「最需要回溯却最容易被漏掉」的部分。
+        assert!(
+            !store.search("奇美拉错误码", 8).unwrap().is_empty(),
+            "工具结果开头应可检索"
+        );
+        // 3) 结果尾部超出预算的部分不入索引（否则 idf 会被日志洪水冲垮）。
+        assert!(
+            store.search("雪貂回溯点", 8).unwrap().is_empty(),
+            "超出 TOOL_RESULT_INDEX_BYTES 的尾部不该进索引"
+        );
+    }
+
+    #[test]
+    fn session_search_for_project_excludes_other_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut mine = mk_search_file("mine", "2026-10-01T00:00:00Z", &["共享词汇 甲"]);
+        mine.cwd = inside.path().to_string_lossy().to_string();
+        store.save(&mine).unwrap();
+        let mut other = mk_search_file("other", "2026-10-02T00:00:00Z", &["共享词汇 乙"]);
+        other.cwd = outside.path().to_string_lossy().to_string();
+        store.save(&other).unwrap();
+
+        let hits = store
+            .search_for_project(inside.path(), "共享词汇", 8)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "mine");
+        // 全库检索仍然看得到两个。
+        assert_eq!(store.search("共享词汇", 8).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn session_search_skips_unparseable_session_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .save(&mk_search_file(
+                "good",
+                "2026-10-01T00:00:00Z",
+                &["可检索内容"],
+            ))
+            .unwrap();
+        std::fs::write(store.path("broken"), b"{ not json").unwrap();
+        // meta 也写一份，让 list() 能发现它（否则它根本不会进入检索流程）。
+        std::fs::write(
+            store.meta_path("broken"),
+            serde_json::to_vec(&SessionMeta {
+                session_id: "broken".to_string(),
+                title: "broken".to_string(),
+                last_preview: String::new(),
+                cwd: "/tmp/proj".to_string(),
+                timestamp: "2026-10-02T00:00:00Z".to_string(),
+                turns: 1,
+                input_tokens: 0,
+                output_tokens: 0,
+                title_generated: false,
+                branch_parent_session_id: None,
+                branch_parent_checkpoint_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let hits = store.search("可检索内容", 8).unwrap();
+        assert_eq!(hits.len(), 1, "损坏的会话文件应被跳过而不是让整次检索失败");
+        assert_eq!(hits[0].session_id, "good");
+    }
+
+    #[test]
+    fn snippet_stays_bounded_and_keeps_utf8_boundary() {
+        let long = "渲染管线".repeat(500);
+        let snippet = snippet_around(&long, "渲染管线");
+        assert!(snippet.chars().count() <= SNIPPET_CHARS + 2);
+        // 不能有半个字符（构造时若按字节切会直接 panic；这里再验一次内容完整）。
+        assert!(snippet.chars().all(|c| "渲染管线…".contains(c)));
     }
 }

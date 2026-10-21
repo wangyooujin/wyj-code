@@ -2074,6 +2074,7 @@ async fn main() -> Result<()> {
         cfg: &cfg,
         code_index: code_index.clone(),
         memory_v3: memory_v3_store.clone(),
+        sessions: session_store_arc.clone(),
         workspace_cas: workspace_cas.clone(),
         todo_store: todo_store.clone(),
         agent_defs: shared_agent_defs.clone(),
@@ -2611,6 +2612,7 @@ async fn main() -> Result<()> {
                 cfg,
                 code_index: code_index_for_rebuild.clone(),
                 memory_v3: memory_v3_for_rebuild.clone(),
+                sessions: store_for_rebuild.clone(),
                 workspace_cas: workspace_cas_for_rebuild.clone(),
                 todo_store: todo_store_for_rebuild.clone(),
                 agent_defs: agent_defs_for_rebuild.clone(),
@@ -3173,7 +3175,15 @@ fn make_sub_agent_factory(
         let mut sub_registry = ToolRegistry::standard();
         sub_registry.register_arc(Arc::new(wyj_core::CodeSearchTool::new(code_index.clone())));
         if let Some(memory) = &memory_v3 {
-            sub_registry.register_arc(Arc::new(MemoryTool::new(memory.clone())));
+            let mut tool = MemoryTool::new(memory.clone());
+            // 子 Agent（尤其 Explore）比主 Agent 更常需要「这个仓库以前怎么做的」，
+            // 而它拿不到主会话的 transcript——跨会话检索对它是唯一的历史入口。
+            if let Ok(sessions) =
+                wyj_core::SessionStore::new(wyj_config::config_dir()?.join("sessions"))
+            {
+                tool = tool.with_sessions(Arc::new(sessions));
+            }
+            sub_registry.register_arc(Arc::new(tool));
             // 子 Agent 同样需要召回：清理发生在**主**会话历史里，子 Agent
             // 读到的 transcript 也含占位符。
             if let Some(t) = wyj_tools::context_recall::tool_for_cas(workspace_cas.clone()) {
@@ -4294,6 +4304,7 @@ mod cli_tests {
                 wyj_core::ProjectCodeIndex::new(dir.path(), dir.path().join(".wyj-index")).unwrap(),
             ),
             memory_v3: None,
+            sessions: None,
             workspace_cas: None,
             todo_store: Arc::new(Mutex::new(TodoStore::default())),
             agent_defs: Arc::new(std::sync::RwLock::new(Vec::new())),

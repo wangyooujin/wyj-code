@@ -18,6 +18,7 @@ pub mod hooks_trust;
 // `wyj_core::interfaces::` 这条路径，两条并行的公共路径只会让「改类型要改
 // 几处」变得不确定。
 mod interfaces;
+pub mod lexical;
 pub mod memory;
 pub mod memory_v3;
 pub mod notify;
@@ -93,7 +94,7 @@ pub use session::{RoutingEvent, Session, SharedSubUsage, SubUsage, SubUsageTotal
 pub use session_runtime::{AgentSessionRuntime, SessionEventEmitter, TurnOutcome};
 pub use session_store::{
     extract_preview, extract_title, prompt_cache_state, SessionFile, SessionFileMeta, SessionMeta,
-    SessionStore,
+    SessionSearchHit, SessionStore,
 };
 pub use summary::SummaryGenerator;
 pub use textutil::escape_harness_markers;
