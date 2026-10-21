@@ -547,9 +547,18 @@ impl AppState {
     ///
     /// 选中项可能指向已不存在的 id（理论上不会发生，jobs map 只增不减），
     /// 这里顺手把选中态收敛到仍在运行的条目上，避免焦点悬空。
+    ///
+    /// `stale_shells` 里的 id 一律跳过：它们是上一段会话遗留的 job，
+    /// `reset_for_new_session` 已把它们从 `shells` 里清掉并 kill。不跳过的话
+    /// 下一帧就会走 `None => push(Running)` 把它们当新任务登记回来，再在同一
+    /// 帧翻成 `Exited` 上报一次，于是新会话凭空收到一条「后台任务已完成」并
+    /// 触发自动唤醒。见 `AppState::stale_shells` 的字段注释。
     pub fn poll_shells(&mut self) -> Vec<String> {
         let mut newly_exited = Vec::new();
         for (id, command, status) in wyj_tools::BashSessionManager::global().list() {
+            if self.stale_shells.contains(&id) {
+                continue;
+            }
             let idx = match self.shells.iter().position(|s| s.id == id) {
                 Some(i) => i,
                 None => {

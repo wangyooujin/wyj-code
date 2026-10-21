@@ -1787,6 +1787,36 @@ mod busy_slash_tests {
         }
     }
 
+    /// 忙碌期「这不是白名单命令」必须细分成两种落点：**已注册**的命令直接拒绝，
+    /// 其余（正文、未知命令、skill 名）才排队投递给模型。
+    ///
+    /// 现场回归：旧实现把 `/new` 一并排队，等于把字面的 `/new` 当用户消息发给
+    /// 模型并让它再跑一轮——用户看到的就是「已经开了新会话，AI 还在继续调用」。
+    #[test]
+    fn busy_drafts_separate_commands_from_plain_text() {
+        let registry = wyj_commands::builtin::standard_registry();
+
+        // 已注册但不是白名单 ⇒ 拒绝执行，绝不排队
+        for draft in ["/new", "/clear", "/compact", "/rewind", "/cost", "/bug"] {
+            assert!(
+                !draft_runs_while_busy(&registry, draft),
+                "{draft} 不能在回合中途执行"
+            );
+            assert!(
+                draft_is_known_command(&registry, draft),
+                "{draft} 是已注册命令，必须走「明确拒绝」而不是排队给模型"
+            );
+        }
+
+        // 未知命令 / 普通正文 ⇒ 交给排队分支
+        for draft in ["/不存在的命令", "please look at /new", "/model\n再补一句"] {
+            assert!(
+                !draft_is_known_command(&registry, draft),
+                "{draft:?} 不是已注册命令，应作为正文排队"
+            );
+        }
+    }
+
     /// 主循环的 Enter 分支顺序是这条不变式本身：白名单必须先于排队分支命中。
     /// 只改 `busy_slash` 的计算却忘了改条件、或把两个分支调换，都会退回到
     /// "忙碌期一律排队"，且不会有任何编译错误。
@@ -2182,6 +2212,15 @@ pub struct AppState {
     /// 后台 shell 任务（Vec 保持 spawn 顺序，见 ShellUiState 注释）。
     /// 数据源是 `BashSessionManager::global()`，由主循环每帧 `poll_shells()` 同步。
     pub shells: Vec<ShellUiState>,
+    /// 上一段会话遗留的后台 shell id：`reset_for_new_session` 记下它，`poll_shells`
+    /// 见到这些 id 一律跳过，既不重新登记也不上报退出。
+    ///
+    /// 为什么需要它：`BashSessionManager` 是**进程级单例**，`jobs` 只增不减。
+    /// `/new` 清掉 `shells` 之后，下一帧 `poll_shells` 会把仍存活的旧 job 当成
+    /// 「新 spawn」重新登记（`None => push(Running)`），再在同一帧翻成 `Exited`
+    /// 上报一次，于是 `pending_bg_reminders` 又被写进内容、自动唤醒照样触发。
+    /// 清表 + 不杀进程，等于把「刚完成」重新制造一遍。
+    pub stale_shells: HashSet<String>,
     /// shell 面板当前选中项（按 id 存而非 index，避免列表变动时错位）
     pub selected_shell: Option<String>,
     /// 选中 shell 是否已展开详情（实时输出）
@@ -2385,6 +2424,7 @@ impl AppState {
             sub_agent_detail_follow_tail: true,
             pending_bg_reminders: vec![],
             shells: Vec::new(),
+            stale_shells: HashSet::new(),
             selected_shell: None,
             shell_detail_open: false,
             shell_detail_scroll: 0,
@@ -2528,9 +2568,27 @@ impl AppState {
         self.sub_agent_detail_open = false;
         self.reset_sub_agent_detail_view();
         self.pending_bg_reminders.clear();
-        // 会话级重置：后台任务属于「上一段会话的现场」，随会话一起作废
-        // （进程本身由退出路径的 kill_all 收走）。与 begin_new_turn 的
-        // 「跨轮次保留」是刻意区分的两级粒度。
+        // 会话级重置：后台任务属于「上一段会话的现场」，随会话一起作废；
+        // 与 begin_new_turn 的「跨轮次保留」是刻意区分的两级粒度。
+        //
+        // 但仅仅清表是不够的——这里的漏点正是用户现场「/new 之后 AI 还在继续
+        // 自动干活」：清掉 `sub_agents`/`shells` 只是让 UI 看不见它们，真正的
+        // 生产者还在跑，跑完照样发 Done 事件 / 退出通知，落进
+        // `pending_bg_reminders`，被新会话的自动唤醒捡走并起一轮模型请求。
+        // 所以三件事必须一起做，缺一不可：
+        //
+        // 1. `hub.abort_all()` 真的停掉后台子 Agent；
+        // 2. 记下遗留 shell id 再 `kill_all()`：光杀不记没用，下一帧
+        //    `poll_shells` 会把 `Exited(-1)` 的旧 job 当新任务重新登记并上报
+        //    一次「刚完成」（`stale_shells` 就是那个过滤器）；
+        // 3. Done 事件侧的会话归属过滤见 `app/events.rs::apply_sub_agent_event`。
+        self.hub.abort_all();
+        {
+            let manager = wyj_tools::BashSessionManager::global();
+            self.stale_shells
+                .extend(manager.list().into_iter().map(|(id, _, _)| id));
+            manager.kill_all();
+        }
         self.shells.clear();
         self.selected_shell = None;
         self.shell_detail_open = false;
@@ -4427,6 +4485,31 @@ fn draft_runs_while_busy(registry: &CommandRegistry, draft: &str) -> bool {
         return false;
     }
     registry.runs_while_busy(CommandRegistry::command_name(trimmed).unwrap_or(""))
+}
+
+/// 忙碌期这条草稿是不是**一条已注册的 slash 命令**（但不允许此刻执行）。
+///
+/// 与 [`draft_runs_while_busy`] 是同一条判定的两半：那个问「能不能现在就执行」，
+/// 这个问「它压根就是条命令吗」。合起来才能把三种输入分开——
+///
+/// - 白名单命令：立刻 dispatch；
+/// - **其余命令：拒绝执行，不能排队**（本函数命中）；
+/// - 普通正文：照常排队投递给模型。
+///
+/// 为什么中间那类必须拒绝而不是排队：排队的实现是把草稿当**用户消息**塞进
+/// `SteerQueue`（`InjectionKind::UserMessage`），模型收到的是字面的 `/new`、
+/// `/clear`、`/compact` 文本。用户想要的是执行指令，实际结果是模型读到一句
+/// 指令文本并据此再跑一轮——`/new` 的现场就是这个形状：明明开了新会话，
+/// AI 却继续调用。注释里"排队只是晚点执行"的假设对**指令性**命令并不成立。
+fn draft_is_known_command(registry: &CommandRegistry, draft: &str) -> bool {
+    let trimmed = draft.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') {
+        return false;
+    }
+    let Some(name) = CommandRegistry::command_name(trimmed) else {
+        return false;
+    };
+    registry.get(name).is_some()
 }
 
 /// 根据输入框内容更新 slash 补全候选列表
@@ -9985,13 +10068,31 @@ async fn tui_main(
                         // Agent 忙碌期间提交 → 排队，不打断当前操作。
                         //
                         // 面板类 slash 命令**不会落到这里**：它们在上面的 Enter 分支
-                        // 就被 `draft_runs_while_busy` 拦去正常 dispatch 了。所以本分支
-                        // 里的内容一定是"要发给模型的正文"，`/` 开头也不例外——
-                        // 非白名单命令（`/cost`、`/clear`、`/bug`…）按字面排队，
-                        // 这与空闲时 `dispatch` 返回未知命令的行为不同，是刻意的：
-                        // 排队只是"晚点执行"，不会丢内容。
+                        // 就被 `draft_runs_while_busy` 拦去正常 dispatch 了。
                         //
-                        if !input.is_empty()
+                        // 其余**已注册**的 slash 命令同样不该落进来排队：排队是把它
+                        // 当用户消息塞进 SteerQueue，模型读到的是字面的 `/new` 之类
+                        // 文本并据此再跑一轮，于是「明明开了新会话，AI 却继续调用」。
+                        // 这类命令要么改会话历史（`/new` `/clear` `/rewind` `/branch`
+                        // `/resume`）、要么改正在跑的会话（`/compact`），都不能在
+                        // 回合中途执行，那就明确拒绝并提示，而不是静默转成一条消息。
+                        // 输入框内容保持原样，用户 ESC 掉回合后可以直接回车重试。
+                        //
+                        // 剩下的才是"要发给模型的正文"，`/` 开头也不例外——未知命令
+                        // （模型侧 skill 名、拼错的命令）按字面排队，与空闲时
+                        // `dispatch` 返回未知命令的行为不同，是刻意的：排队只是
+                        // "晚点发给模型"，不会丢内容。
+                        //
+                        let draft = input.text();
+                        if draft_is_known_command(&cmd_registry, &draft) {
+                            state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
+                                "command.busy_rejected",
+                                &[(
+                                    "name",
+                                    CommandRegistry::command_name(draft.trim()).unwrap_or(""),
+                                )],
+                            )));
+                        } else if !input.is_empty()
                             || !state.pending_attachments.is_empty()
                             || !state.pending_pastes.is_empty()
                         {
@@ -10545,6 +10646,49 @@ mod sub_agent_ui_tests {
         assert_eq!(
             state.sub_agents.get(&1).unwrap().status,
             SubAgentStatus::Done
+        );
+    }
+
+    /// `/new` 现场回归：上一段会话遗留的后台子 Agent 跑完后，Done 事件不得再
+    /// 往新会话的 `pending_bg_reminders` 里灌内容。
+    ///
+    /// `reset_for_new_session` 清掉 `sub_agents`，事件的 Done 到达时查不到这个
+    /// id——这就是「它属于上一段会话」的判据。放行的后果是自动唤醒
+    /// （`!is_thinking && !pending_bg_reminders.is_empty()`）在新会话第一帧起一轮
+    /// 模型请求，用户看到的就是「已经 /new 了，AI 还在继续调用」。
+    #[test]
+    fn done_from_a_reset_session_never_revives_the_agent() {
+        let mut state = make_state();
+        tool_start(&mut state, "call-1");
+        started(&mut state, 1, "后台任务", true);
+        state.reset_for_new_session();
+        assert!(state.sub_agents.is_empty(), "新会话应清掉子 Agent 表");
+
+        state.apply_agent_event(AgentEvent::SubAgent(SubAgentEvent::Done {
+            id: 1,
+            agent_type: "Explore".to_string(),
+            description: "后台任务".to_string(),
+            result: "调查结论".to_string(),
+            is_error: false,
+            elapsed_secs: 1.2,
+            background: true,
+            handoff_body: None,
+        }));
+
+        assert!(
+            state.pending_bg_reminders.is_empty(),
+            "旧会话的 Done 不得进入新会话的自动唤醒队列"
+        );
+        assert!(
+            state.messages.iter().all(|m| !m.content.contains("a1")),
+            "旧会话的 Done 也不得往新会话聊天流里插通知"
+        );
+        assert!(
+            state
+                .sub_agent_trace_cache
+                .get(&1)
+                .is_none_or(|events| events.is_empty()),
+            "被过滤的事件连 trace 都不该写入"
         );
     }
 
@@ -11659,9 +11803,15 @@ mod shell_panel_tests {
     /// 把 `AppState::poll_shells` 的核心逻辑抽出来单测：内部依赖
     /// `BashSessionManager::global()`（进程级单例），测试里换成显式传入的
     /// manager，避免污染全局状态。
+    ///
+    /// 必须与 `poll_shells` 逐条对齐（含 `stale_shells` 过滤），否则测试通过
+    /// 也证明不了线上那条路径。
     fn sync_once(state: &mut AppState, mgr: &BashSessionManager) -> Vec<String> {
         let mut newly_exited = Vec::new();
         for (id, command, status) in mgr.list() {
+            if state.stale_shells.contains(&id) {
+                continue;
+            }
             let idx = match state.shells.iter().position(|s| s.id == id) {
                 Some(i) => i,
                 None => {
@@ -11722,6 +11872,95 @@ mod shell_panel_tests {
         assert!(state.shells.is_empty(), "新会话应作废上一段的后台任务");
         assert!(state.selected_shell.is_none());
         assert!(!state.shell_detail_open);
+    }
+
+    /// `/new` 现场回归：清表必须连带**作废生产者**，并把它们的 id 记进
+    /// `stale_shells`。
+    ///
+    /// 只 `shells.clear()` 的话，进程级 `BashSessionManager` 里的 job 还在跑；
+    /// 下一帧 `poll_shells` 会把它们当新任务重新登记，紧接着翻成 `Exited` 上报
+    /// → `pending_bg_reminders` → 新会话自动唤醒起一轮模型请求。所以这里同时
+    /// 断言「真的杀了」与「记了黑名单」。
+    #[tokio::test]
+    async fn reset_for_new_session_retires_background_shells() {
+        let id = BashSessionManager::global()
+            .spawn("sleep 30", Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(
+            BashSessionManager::global().get(&id).unwrap().status(),
+            JobStatus::Running
+        );
+
+        let mut state = make_state();
+        state.shells.push(running_shell(&id));
+        state.reset_for_new_session();
+
+        assert!(
+            state.stale_shells.contains(&id),
+            "遗留 job 的 id 必须进 stale_shells，否则下一帧会被重新登记"
+        );
+        assert!(state.shells.is_empty());
+        // kill_all 发 SIGKILL 后状态由 child.wait() 的 task 翻，给几帧时间。
+        let job = BashSessionManager::global().get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_ne!(
+            job.status(),
+            JobStatus::Running,
+            "新会话必须真的收掉上一段的后台进程，而不只是从面板上抹掉"
+        );
+    }
+
+    /// `poll_shells` 必须跳过 `stale_shells`：否则被 kill 的旧 job 会以
+    /// `Exited(-1)` 重新登记并上报一次「刚完成」，等于把唤醒重新制造一遍。
+    #[tokio::test]
+    async fn poll_shells_ignores_shells_retired_by_the_previous_session() {
+        let mgr = BashSessionManager::default();
+        let id = mgr.spawn("echo done; exit 0", Path::new("/tmp")).unwrap();
+        let job = mgr.get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_ne!(job.status(), JobStatus::Running, "任务应已退出");
+
+        let mut state = make_state();
+        state.stale_shells.insert(id.clone());
+
+        let reported = sync_once(&mut state, &mgr);
+
+        assert!(reported.is_empty(), "stale job 的退出不得上报");
+        assert!(
+            !state.shells.iter().any(|s| s.id == id),
+            "stale job 不得被重新登记进面板"
+        );
+    }
+
+    /// 反向对照：**同一份快照**在没有 stale 标记时必须照常上报。否则上面的测试
+    /// 会因为「`sync_once` 压根不工作」而假通过。
+    #[tokio::test]
+    async fn poll_shells_still_reports_jobs_it_does_not_know_about() {
+        let mgr = BashSessionManager::default();
+        let id = mgr.spawn("echo done; exit 0", Path::new("/tmp")).unwrap();
+        let job = mgr.get(&id).unwrap();
+        for _ in 0..50 {
+            if job.status() != JobStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let mut state = make_state();
+        let reported = sync_once(&mut state, &mgr);
+
+        assert_eq!(reported, vec![id.clone()], "非 stale 的退出必须照常上报");
+        assert_eq!(state.shells[0].id, id);
     }
 
     // ── 焦点导航 ──────────────────────────────────────────────────────

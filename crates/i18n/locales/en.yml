@@ -2,6 +2,7 @@ _version: 1
 command:
   unknown: "Unknown command: /{name}  (type /help to see all commands)"
   background_unsupported: "Command /{name} is declared background-executed but returned a result type the TUI cannot render directly: {result}"
+  busy_rejected: "Turn in progress — /{name} was not run: it rewrites conversation state, so it cannot be queued into the running turn. Press Enter again once the turn ends, or press ESC to interrupt first."
 skill:
   invoked: "Using skill: /{name}"
   run:
@@ -883,7 +884,7 @@ selection:
   copy_failed: "Copy failed: {error}"
 
 auto:
-  mode_notice: "Auto mode is active: most actions no longer prompt. A local rule layer plus a model classifier decide before an action runs, and anything the gate is unsure about still prompts you. Dangerous actions are blocked outright and stay blocked even when the classifier is off. Press Shift+Tab to reach plan / bypass."
+  mode_notice: "Auto mode: most actions run without prompting; dangerous ones are still blocked. Shift+Tab switches to plan / bypass."
   degraded_to_confirm: "The auto classifier blocked too many actions in a row, so the model classifier has been switched off: dangerous commands are still blocked by the hard rules, and everything else now asks you one by one. Run /mode auto to turn the classifier back on."
 
 cwd:
@@ -1115,6 +1116,16 @@ welcome:
     compact: '/compact to shrink context'
     mode: 'Shift+Tab to switch mode'
     quit: 'Ctrl+C to quit'
+  # Common command cheat-sheet (welcome page block). Command names stay ASCII;
+  # only the descriptions are translated.
+  cmd_header: 'Common commands'
+  cmd:
+    profile: '/profile switch endpoint group'
+    model: '/model switch model'
+    effort: '/effort thinking effort'
+    compact: '/compact shrink context'
+    clear: '/clear wipe the chat'
+    help: '/help all commands'
   version: 'v{version}'
 
 notify:
