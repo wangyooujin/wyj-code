@@ -43,11 +43,15 @@ vision = true                # 模型是否支持图片输入；false 时图片�
                               # 明确禁止同传），官方 Anthropic 则可同时用——budget 限**思考**的
                               # token 数，effort 限**整个响应**的投入档位，两者控制不同维度。
                               # 官方 OpenAI 没有 budget 旋钮：配了 thinking_budget 会被记成 dropped。
+                              # **会话级覆盖**：`/effort <档位>` 临时改档，只随**会话文件**落盘
+                              # （`--resume` 后继续生效），**绝不写本文件**。生效优先级是
+                              # env（`WYJ_CODE_THINKING_EFFORT`）> 会话级 > 本字段。
+                              # `/effort off` = 彻底关思考（effort 清空 + thinking_switch=disabled）。
 # thinking_switch = "enabled" # OpenAI 线 thinking.type 显式覆盖：enabled/disabled/adaptive。
                               # 不写 = 由 adapter 按模型默认决定。MiniMax M3.1 发 disabled 会 400，
                               # adapter 会降级成"不发该字段"。
 # max_tools_per_turn = 4     # 每次回复最多并行几个工具调用。不写 = 由模型目录/探测结果决定
-                              # （静态目录对非 anthropic/openai vendor 一律判 1）。`/model` 面板
+                              # （静态目录对非 anthropic/openai vendor 一律判 1）。`/profile` 面板
                               # 里是枚举「默认 / 1 / 2 / 4 / 8」，新建分组预填 4；清空即回到端点默认。
                               # env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先（runtime override，不写盘）。
 log_level = "warn"           # 调试时设为 "debug"
@@ -236,7 +240,7 @@ wyj-code 只有**一个日常模式** `auto`（历史上的 `manual` 已并入�
 三条设计约束：
 - **零配置成本**：没有声明 `verify.command` 时，`verify.rs` 直接 early-return，**不探测 `npm`/`cargo` 是否存在、不启动任何 shell、不产生任何输出**。绝大多数项目不会配这个键，不配就没有任何代价。
 - **执行顺序**：编辑工具成功 → `PostToolUse` hook → 项目 verify。hook 的反馈（格式化、lint 提示）先到，verify 看到的是 hook 已经处理过的工作树。编辑工具**自身失败**时不跑 verify——失败原因已经在工具结果里了，再跑一遍命令只是浪费。
-- **有界**：默认超时 120s（`timeout_secs` 可覆盖），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model` 热重建。
+- **有界**：默认超时 120s（`timeout_secs` 可覆盖），输出按文本预算截断，`sh -c`（Unix）/ `cmd /C`（Windows）执行。实现见 `core::verify`（`load_verify_cfg` / `run_verify`），装配点 `cli/main.rs` 的初次构建与 `/model`·`/profile` 热重建。
 
 ### 辅助模型（aux_model）
 
@@ -329,6 +333,6 @@ auto_screenshot_max_dim = 960      # 附图的长边像素上限（低于观察�
 
 ### /config 面板
 
-**`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`/`aux_model`）已迁移到 `/model` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空（或空串）则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文；解析统一走 `wyj_i18n::resolve_locale`。
+**`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`/`aux_model`）已迁移到 `/profile` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空（或空串）则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文；解析统一走 `wyj_i18n::resolve_locale`。
 
 `language` 同时决定**模型输出语言**，不只是 UI 文案：解析结果经 `prompts::EnvInfo::collect` 进入 system prompt 的 `<env>` 块（`Response language: Chinese (zh)`），并由 `prompts::sub_agent_language_section` 追加给子 Agent（子 Agent 的 system prompt 是整体替换，拿不到 `<env>` 块）。i18n 本身仍只覆盖用户可见 UI 文案（TUI 对话框、slash 命令输出、CLI --help/--config-status），模型侧提示词（system prompt、工具描述等）为英文常量不走 i18n（见上方"模型侧提示词"节），工具内部错误消息等仍为中文，待后续阶段迁移。
