@@ -10,6 +10,128 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [0.3.17] - 2026-10-21
+
+### 记忆不再只有「提取过的事实」，`/new` 之后 AI 不再自己继续干活
+
+v0.3.16 之后的两条线：**记忆的召回面补齐**（claim 层抽漏的事实、以及当时工具输出
+里的原文，现在都查得回来，且淘汰不再只看写入时间），以及 **`/new` 的会话边界真正
+成立**（此前清表只清了 UI，生产者和队列都还在，于是新会话第一帧自己起了一轮模型
+请求）。
+
+### 跨会话原文检索：claim 抽漏时回到原话
+
+`MemoryV3Store` 存的是模型**提取出来的事实**——提取时漏掉的细节永久丢失，而当时
+用来定位问题的工具输出（某次测试的真实报错、`git log` 的参数、一条完整的 curl）
+基本不会被提取成 claim。但原始 transcript 一直躺在 `sessions/<id>.json` 里，此前
+只有按时间的 `list` / `last` 入口，等于「存了但查不到」。
+
+新增 `SessionStore::search` / `search_for_project`，两个入口：Memory 工具的
+`search_sessions` action（模型直接用）与 `wyj-code memory search-sessions <query>`
+（人直接用，`--all-projects` 放开项目隔离、`--json` 出结构化结果）。检索走本地
+词法（CJK n-gram + BM25），与 claim 层同一个判断：编码场景里「同一批专有名词反复
+出现」，词法精度足够，不需要 embedding 服务。
+
+索引取舍，三条都是踩过坑才定下来的：
+
+- **文本全量**、**工具调用索引参数**（`Bash(git log --oneline -20)` 是「当时在查
+  什么」的最佳线索）、**thinking 不索引**（推理草稿不是可引用的事实）。
+- **工具结果只索引开头 800 字节**。全不索引会让「最需要回溯的报错文本」恰好查不到；
+  全量索引会让 idf 塌掉——每个词都在某段日志里出现过，于是真正的结论段反而排不上。
+  需要全文时走 `ContextRecall`（CAS 仍持有）。
+- **每会话最多 2 条命中**。不设上限的话，一个跑了一整天的会话会用几十条相近命中
+  把结果列表占满，其余会话一条都进不来——而跨会话检索的价值恰恰在「找到别的会话」。
+
+给模型的入口只走 `search_for_project`（会话按 git 根隔离的既有约定）；它要重读并
+解析全部会话 JSON，是 O(全部会话) 的操作，**不得**放进每轮自动注入的路径。单个
+会话文件损坏不影响整次检索，跳过继续。`snippet` 按字符边界截取并在命中词附近取窗，
+命中词找不到时退回开头。钉子：
+`session_search_skips_unparseable_session_files`、`session_search_respects_per_session_hit_cap`、
+`session_search_indexes_tool_calls_and_only_the_head_of_tool_results`、
+`snippet_stays_bounded_and_keeps_utf8_boundary`。
+
+### 记忆淘汰改为「留存分」：被反复查的，不该先于刚写过但没人看的出局
+
+`records_max` 触顶时旧实现只按 `updated_at` 降序截断。这条规则**淘汰反了**：一条
+三个月没改、但每次开工都要查的项目约定（「测试必须用 pytest -q」），会先于一条昨天
+随手写下、此后再无人问的记录被丢掉。
+
+现在按 `retention_score = 写入新鲜度 × 0.30 + 使用强度 × 0.70` 降序保留。使用强度
+= `log(访问次数)` × 最近访问衰减（半衰期 60 天，比写入的 180 天更快——「最近谁用过」
+比「什么时候写的」更贴当前工作流）。权重刻意让使用强度显著压过新鲜度，
+`retention_score_prefers_used_over_merely_recent` 用「150 天前写下但被查 30 次」对
+「1 天前写下但零访问」钉死这条比例。新增两个字段
+`MemoryRecord.access_count` / `last_accessed_at`，`search` 与 `read` 都计入——
+「搜索命中」和「读过并据此行动」对留存价值是同一种信号。`updated_at` **不**在命中时
+刷新：那是「内容最后一次变化」，supersede 链与 `INDEX.md` 排序都依赖它。
+
+访问计数不直接改 `records.json`，而是写增量日志 `projects/<key>/access.json`：前者
+是几 MB 单文件，一次检索命中就整体读 + 解析 + 重写一遍，代价与收益完全不成比例。
+GC 在截断**之前**先合并日志并清空（顺序不能反：淘汰打分需要刚合并进来的计数）；
+`access.json` 的**存在本身**就是「有增量待合并」的信号，所以合并后改写空表而不删文件。
+写失败只 `tracing::warn`——检索结果比统计数据重要。
+
+### 词法底座收敛到 `core::lexical`
+
+`tokenize`（CJK 1~3-gram + ≤12 字整段 token）/ `term_frequencies` / `Bm25Scorer`。
+此前 `memory_v3::search`、`project_brief` 的 `pick_top`、`session_store::search`
+各有一份等价实现，分词规则一改要改三处。**精确短语加分（+5.0）必须留着**：中文
+四字术语被切成 n-gram 后每个词元的 idf 都接近 0，「原文里逐字出现」这个最强信号会
+输给「碎词出现得多」的噪声段落——新写的会话检索一开始就漏了这一步，测试直接抓出来。
+
+### `/new` 之后 AI 还在继续调用：两个独立根因
+
+**① 忙碌期把 slash 命令当正文排队。** `runs_while_busy` 默认 false 是对的（`/new`
+绝不能中途改会话），但落点错了：排队是把草稿当**用户消息**塞进 `SteerQueue`，模型
+收到的是字面的 `/new`、`/clear` 文本并据此再跑一轮。注释里「排队只是晚点执行」的
+假设对**指令性**命令并不成立。现在 Enter 分支用 `draft_is_known_command` 把「已注册
+命令」单独判出来：明确拒绝 + `command.busy_rejected` 提示，输入框内容保持原样，ESC
+掉回合后可直接回车重试；只有非命令正文与未知命令（skill 名、拼错的命令）才排队。
+钉子：`busy_drafts_separate_commands_from_plain_text`。
+
+**② 清表不作废生产者。** 自动唤醒的判据只看「有没有待注入内容」
+（`!is_thinking && !pending_bg_reminders.is_empty()`），不认来源会话，于是旧会话的
+后台子 Agent Done / 后台 shell 退出通知会灌进新会话并起一轮模型请求。修法是两层
+归属过滤：
+
+- 子 Agent：`apply_sub_agent_event` 的 `Done` 在 `sub_agents` 里查不到该 id 就整段
+  `return`（`reset_for_new_session` 已清表），连 trace 都不写。放在事件入口而不是注入前
+  ——Hub 的 `event_cb` 是全局的，通道里可能积压着 reset 之前发出的 Done。
+- 后台 shell：新增 `AppState::stale_shells`，`reset_for_new_session` 先记下遗留 id 再
+  `kill_all()`。**只 kill 不记黑名单没用**：`BashSessionManager::jobs` 只增不减，
+  下一帧 `poll_shells` 会走 `None => push(Running)` 把 `Exited(-1)` 的旧 job 当新任务
+  登记回来，紧接着翻成 `Exited` 上报一次「刚完成」，等于把唤醒重新制造一遍。
+
+同时补上 `hub.abort_all()`。「进程本身由退出路径的 kill_all 收走」是错的——`/new`
+走不到退出路径，旧会话的 dev server / watcher 会继续跑并继续写文件。钉子：
+`done_from_a_reset_session_never_revives_the_agent`、
+`reset_for_new_session_retires_background_shells`、
+`poll_shells_ignores_shells_retired_by_the_previous_session`，另有反向对照
+`poll_shells_still_reports_jobs_it_does_not_know_about` 防止 `sync_once` 假通过。
+
+### 欢迎页：常用命令速查取代那段安全说明
+
+原来欢迎页底部挂着一整段 auto 模式说明，把页面压得像免责声明；那段已压成
+`auto.mode_notice` 一句短句（「auto 模式：多数操作自动放行，危险操作仍会硬拦。
+Shift+Tab 切 plan / bypass。」），腾出的位置换成本次点名要有的 `/profile` ·
+`/model` · `/effort` 速查表。四条规则：命令名不翻译、说明走 i18n；两列布局（命令名
+亮、说明暗）；**窄终端整条丢弃，绝不截断命令名**——半截的 `/prof` 比没有这条更糟，
+用户会以为有个叫 `/prof` 的命令；**区块行数恒定**，放不下时是格子留空而不是整行
+消失，于是欢迎页总高度与终端宽度无关，聊天区高度测量与滚动位置不会漂移。钉子：
+`welcome_page_lists_the_common_commands`、
+`narrow_terminal_drops_whole_commands_never_truncates_them`、
+`command_block_height_does_not_depend_on_terminal_width`。
+
+### 其它
+
+- 系统消息折行的四个 `system_message_*` 钉子换到新文案：`auto.degraded_to_confirm`
+  现在是通知里最长的中文段落，长中文折行改由它承担验证
+- 文档：`crates/core/CLAUDE.md` 补留存分、访问增量日志、会话检索索引取舍、词法
+  底座四条；`crates/tui/CLAUDE.md` 补常用命令区块的四条规则与 `/new` 的两个根因
+  （并订正「进程本身由退出路径的 kill_all 收走」这句错话）
+
+**1962 个 workspace 测试**（1936 → 1962）。
+
 ## [0.3.16] - 2026-10-21
 
 ### 完成不再由模型自己宣布，computer-use 不再卡死，配置面拆成三条命令
