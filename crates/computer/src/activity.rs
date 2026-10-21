@@ -123,6 +123,15 @@ mod imp {
 
     const ANY_INPUT_EVENT_TYPE: CGEventType = CGEventType(u32::MAX);
     const SCREEN_LOCKED_KEY: &str = "CGSSessionScreenIsLocked";
+
+    /// seqlock 无锁读的最大重试次数。
+    ///
+    /// 必须是**有界**的：writer 是 Event Tap 回调，人类持续移动鼠标时它每秒
+    /// 能进入几千次，读者「读到偶数 epoch → 被 writer 打断 → 前后不一致」
+    /// 的循环可以无限重复。耗尽后走持锁读兜底（见
+    /// `stable_external_snapshot`），把最坏时延从「秒级活锁」压到一次
+    /// mutex 获取。
+    const SEQLOCK_MAX_ATTEMPTS: usize = 64;
     const RECENT_EVENT_CAPACITY: usize = 512;
 
     #[derive(Debug, Clone, Copy)]
@@ -215,7 +224,7 @@ mod imp {
     }
 
     fn stable_external_snapshot(state: &MonitorState) -> (Instant, u64, u64) {
-        loop {
+        for _ in 0..SEQLOCK_MAX_ATTEMPTS {
             let epoch_before = state.epoch.load(Ordering::Acquire);
             if epoch_before % 2 != 0 {
                 std::hint::spin_loop();
@@ -231,6 +240,31 @@ mod imp {
             }
             std::hint::spin_loop();
         }
+
+        // ── 重试耗尽：退化为持锁读，绝不再自旋 ────────────────────────────
+        //
+        // 旧实现是**无界**自旋，这在外部输入事件率高于读者单次读取耗时时会
+        // 活锁：writer（Event Tap 回调）把 epoch 置奇数 → 读者刚拿到偶数就被
+        // 打断 → 永远凑不齐「前后一致」的窗口。实测 32 个并发读者 + 鼠标
+        // 高速移动时，单次 `snapshot()` 最长阻塞 **8 秒**，而 `/computer`
+        // 是在 TUI 主循环里 inline 调用的——主循环一停就不重绘、不读按键，
+        // 用户看到的就是「命令卡死，按什么都没反应」。
+        //
+        // 正确性不受影响：writer 的全部写入（`last_external_at` /
+        // `recent_events`）都在同一把 Mutex 内，所以**持锁读到的必然是完整
+        // 状态**——seqlock 的无锁读只是优化，一致性本来就来自那把锁。
+        //
+        // 唯一的不确定性是 `event_seq`（它在锁外自增，可能领先于我们手里
+        // 这份 `external` 快照）。对租约而言「序号偏大」是安全方向：调用方
+        // 拿到更大的 seq 只会更保守地判定「期间有输入」。因此这里把 epoch
+        // 归一到偶数再返回，保持「返回即完整」这个对外契约不变。
+        let external = lock_unpoisoned(&state.external);
+        let event_seq = state.external_event_seq.load(Ordering::Acquire);
+        (
+            external.last_external_at,
+            event_seq,
+            state.epoch.load(Ordering::Acquire) & !1,
+        )
     }
 
     pub fn ensure_monitor() -> InputMonitorStatus {
@@ -588,6 +622,43 @@ mod imp {
                 kind: ExternalEventKind::MonitorGap,
             }]);
             assert!(recent_events_conflict(&gap, 10, region(), false));
+        }
+
+        /// 回归：读者**不得**无界自旋。
+        ///
+        /// 现场是 Event Tap 每秒灌几千个鼠标事件、读者在 TUI 主循环里 inline
+        /// 调 `snapshot()`，旧实现单次调用最长阻塞 **8 秒**——主循环一停就不
+        /// 重绘、不读按键，用户看到的就是「`/computer` 卡死，按什么都没反应」。
+        ///
+        /// 这里把场景**确定性**地构造成最坏形态：writer 停在写入中间态
+        /// （epoch 为奇数）且长期不回来。旧实现在这个输入下会永久自旋，新
+        /// 实现走有界重试 + 持锁兜底，必须立即返回。
+        ///
+        /// 用 watchdog 而不是直接 join：旧实现是**死循环**，直接等会把测试
+        /// 挂住；超时断言才能给出可读的失败原因。
+        #[test]
+        fn snapshot_reader_never_spins_unbounded_while_a_writer_is_mid_update() {
+            use std::sync::mpsc;
+            use std::time::Duration;
+
+            let state = Arc::new(MonitorState::new());
+            state.status.store(STATUS_RUNNING, Ordering::Release);
+            let expected = Instant::now();
+            lock_unpoisoned(&state.external).last_external_at = expected;
+            // writer 已进入写入：epoch 置奇数后不再推进。
+            state.epoch.store(1, Ordering::Release);
+
+            let reader_state = Arc::clone(&state);
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(stable_external_snapshot(&reader_state));
+            });
+
+            let (last_external_at, _, epoch) = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("读者在 writer 停在写入中间态时永久自旋（旧实现的 8 秒卡死就是这样来的）");
+            assert_eq!(last_external_at, expected, "持锁兜底应读到真实快照");
+            assert_eq!(epoch % 2, 0, "对外契约：返回的 epoch 必须归一为偶数");
         }
     }
 }

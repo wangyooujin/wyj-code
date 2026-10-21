@@ -384,10 +384,12 @@ mod busy_whitelist_tests {
         // evolve / resume 刻意**不在**白名单：evolve 的确认动作要建工作区快照并
         // spawn 后台 task，会把 AppState::current_task 覆盖成自己的 handle，正在跑
         // 的回合从此失去 ESC 中断能力；resume 会切走当前会话身份。
+        //
+        // computer 也不在：它跑一串系统调用（截图 / 窗口枚举 / Event Tap 快照），
+        // 必须走 `needs_background` 的后台路径，而两者互斥（见下一条测试）。
         let mut expected = vec![
             "agent-control",
             "agents",
-            "computer",
             "config",
             "cwd",
             "doctor",
