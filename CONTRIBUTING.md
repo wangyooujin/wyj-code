@@ -27,6 +27,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+**改了 harness 相关的东西，还要跑评测基线。** prompt、工具描述、工具可见性、
+压缩/清理策略、验收门禁——这些改动的效果**不在 `cargo test` 的覆盖范围里**：
+`cargo test` 验证代码正确性，评测基线验证模型能力。两者是不同的东西。
+
+```bash
+cargo build --release
+benchmarks/verify-tasks.sh          # 先自检任务集，不花 API 费用
+benchmarks/run.sh --repeat 3        # 至少 3 次重复
+benchmarks/compare.sh <baseline> <candidate>
+```
+
+三条纪律：**一次只改一个组件**、**每组至少 3 次重复**、**至少 2 个模型对照**。
+理由与完整任务清单见 `benchmarks/README.md`。
+
+> 为什么这条值得写进贡献指南：外部受控实验里 harness 的方差可达模型方差的 7.8 倍，
+> 而**很多 harness 改动是负收益**（verifier 在某些基准上是 −0.8pp，多候选搜索是 −5.6pp）。
+> 没有基线，这些改动只能靠感觉判断。
+
 ## Crate 职责
 
 | Crate | 名称 | 职责 |

@@ -1,0 +1,1 @@
+在 vector 模块的 `Vec2` 上新增两个方法：`scale(self, factor: f64) -> Vec2`（每个分量乘 factor）和 `lerp(self, other: &Vec2, t: f64) -> Vec2`（线性插值，t=0 返回 self、t=1 返回 other）。再在 report 模块新增 `pub fn describe_vec(v: &Vec2) -> String`，返回形如 `len=5.00 unit=(0.60, 0.80)` 的字符串（分量与长度都保留两位小数）。为每个新增行为各写至少一个单元测试。完成后确认 cargo test 全部通过。

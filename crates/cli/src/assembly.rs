@@ -165,7 +165,11 @@ impl SharedAgentConfig<'_> {
             .with_context_edit(self.context_edit)
             // 项目在 `.wyj-code/settings.json` 声明了 `verify.command` 才生效，
             // 没声明则挂 None —— 零配置项目零成本。
-            .with_verify(wyj_core::verify::load_verify_cfg(self.cwd));
+            .with_verify(wyj_core::verify::load_verify_cfg(self.cwd))
+            // 验收契约（完成门禁）：同样零假设，没声明 `[acceptance]` 就完全不参与。
+            // 解析失败时 `AcceptanceLoad.error` 会带着原因进 Agent，收尾时明确
+            // 报给用户——门禁「看起来没生效」必须比「没门禁」更显眼。
+            .with_acceptance(wyj_core::acceptance::load_acceptance_cfg(self.cwd));
         if let Some(mem) = &self.memory_store {
             agent = agent.with_memory(mem.clone());
         }

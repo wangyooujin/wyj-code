@@ -226,6 +226,26 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 
 **输出预算被 reasoning 吃满 ≠ 空响应，也绝不静默收尾**（`agent.rs` 收尾判定 + `helpers::has_visible_output`）：判「这一轮说没说话」只能看**可见输出**（非空白 Text 或 ToolUse），thinking / redacted_thinking 是中间过程，它非空不能证明有回答。旧判据 `assistant_blocks.is_empty()` 把纯 thinking 回复当正常结束，于是 `stop_reason == MaxTokens` 时循环直接 `break` → `TurnFinished` → `Ok(())`，用户侧只有「跑了几轮就停住，没有任何提示」。现在的三分支：① 撞 `MaxTokens` 且无可见输出 → 丢弃本条（**不 push**，否则下一轮揣着空 signature 的 thinking 继续在同样预算上撞线）、放大 `max_tokens`（受 `capabilities.max_output_tokens` 封顶）并降一档 reasoning 后重试**一次**（`truncation_retry_used` 声明在回合循环之外，放里面会被重置成无限重试）；② 重试后仍只有 thinking → 丢弃并输出 `agent.output_without_visible_content`（带原因与调参建议）；③ 有正文但撞 `MaxTokens` → 不重试，输出 `agent.output_truncated` 说明正文被硬切断。降档必须**按 vendor 的 `effort_levels` 表取前一档**（`helpers::downgrade_reasoning_effort`），不能走 `max→high→medium→low` 字符串阶梯——Moonshot k3 只有 low/high/max，阶梯会落到端点不认的 medium 上被静默丢弃。钉子：`truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history`、`persistent_truncation_is_reported_instead_of_ending_silently`、`thinking_only_end_turn_is_reported_without_retry`、`visible_output_hitting_max_tokens_is_reported_but_not_retried`。
 
+## 验收门禁：把「任务完成」从模型的自我声明换成框架判定
+
+**为什么需要它**（`acceptance.rs`）：在 `verify` 之前，「任务完成」的定义是**模型说了完成**——模型输出最终文本，回合就结束。这条等式是整条链上最贵的漏洞：模型**意识不到**功能没有端到端跑通（Anthropic 2025-11 的原话观察）；让模型自己评自己的活，它会「自信地夸赞明显平庸的作品」（Anthropic 2026-03）。而外部受控实验（arXiv:2605.23950）里，三个 harness 配置之间**最大**的一段差距（H2→H3）就来自「闭合验证与恢复回路」。`acceptance` 提供那条回路的**前半段**：一组**框架可判定**的验收判据。
+
+**它和 `verify` 的分工**：`verify` 是**编辑后**的局部反馈（改完就跑一次编译）；`acceptance` 是**收尾时**的整体判定（模型要结束回合时，框架判它到底做没做完）。两者不可互相替代——`cargo check` 通过不等于功能跑通，模型自述「已完成」也不等于达成。
+
+**判据必须框架能判**：`CriterionKind` 只收录 `command`（退出码）、`file_exists`、`file_contains`（字面量）、`grep_present` / `grep_absent`（正则）。**刻意不收录需要模型语义判断的判据**——弱验证下加宽候选几乎无用（arXiv:2609.39982：N=4→8 只从 49.32% 提到 51.02%），verifier 的验收对象与最终验收对象不对齐时甚至是负收益（arXiv:2603.25723：SWE −0.8pp / OSWorld 0.0pp）。**先把能自动判的判准，再考虑让模型去判**——后者是下一刀的工作。
+
+**收尾门禁的接线点**（`agent.rs`）：`if !has_tool_calls && !got_injection {` 块顶部、`break` 之前。模型停止 → 跑判据 → 全过则 `on_text(验收通过)` 正常收尾；有失败项则把 `<acceptance-failures>` 报告经 `push_user_blocks_merged` 注入（与工具结果同处一条 user 消息，维持角色交替）、`on_text(验收未通过)`、**`continue`** 回到回合循环顶部让模型带着证据再跑一轮。三条边界缺一不可：① **Plan 模式跳过**（`ctx.permission_mode()` 是 `Plan(_)`）——计划模式本就不改文件，判据必然失败，让它失败只会把模型困在反复改计划里；② **重试预算耗尽 → 按「未完成」交付**（`acceptance_retries` 声明在回合循环**之外**，放里面会被重置成无限重试）；③ **声明了但解析失败 → 收尾时明确报给用户**（`acceptance_error` 单独存一栏），绝不静默把门禁关掉。
+
+**`continue` 会跳过本轮的记忆提取**——这是刻意的：任务还没完成，此刻提取记忆等于把半成品当成事实记下来。
+
+**回灌的是证据不是评语**：命令的退出码与输出尾部、命中的 `文件:行号`（**不回显匹配到的内容**——报告要进模型上下文，不应成为绕过凭据保护的读文件通道）。这对应 arXiv:2605.23950 里 H1→H2 增益的机制之一——「结构化错误反馈」降低控制噪声，而不是加一层更严厉的措辞。
+
+**零假设与边界**（与 `verify` 同源）：没声明 `[acceptance]` 时模块完全不参与（不 spawn、不读文件、不改行为）；`enabled: false` 或判据为空同样等于没有；路径一律相对**工作目录**解析且必须落在工作目录内，逃出去判为无效；**判据本身配错时恒判不通过**（fail-closed）——一条被静默跳过的判据会让门禁强度打折，比明确失败更危险。
+
+**信任门控**：`command` 判据会被 `sh -c` 直接执行，与 `verify.command` **同级**的任意命令执行面，因此项目级 `[acceptance]` 块与 `hooks` / `verify` 一起过 `core::hooks_trust`（指纹覆盖三个键，但**只纳入文件里确实存在的键**——既有项目没有该块时指纹逐字节不变，批准记录不受影响）。详见 `crates/store/CLAUDE.md` 第 17 条。
+
+**钉子**：`agent::tests::a_failing_acceptance_criterion_keeps_the_turn_alive`（失败 → 回合不许结束 + 证据进历史）、`the_acceptance_retry_budget_is_bounded`（预算是 2 次重试 → 3 次请求）、`a_passing_acceptance_criterion_ends_the_turn_normally`（通过 → 只调一次）、`plan_mode_skips_the_acceptance_gate`、`a_broken_acceptance_block_is_reported_to_the_user`；`acceptance::tests` 覆盖零假设 / 信任门控 / fail-closed / 路径越界 / 超时。
+
 ## 重试幂等性：一条必须守住的不变量
 
 

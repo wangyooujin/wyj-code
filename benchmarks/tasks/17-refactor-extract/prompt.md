@@ -1,0 +1,1 @@
+这个项目的 `text::truncate` 语义有个隐含假设：它总是追加 `…`。请在不改变现有行为的前提下，新增 `pub fn truncate_with(text: &str, max: usize, ellipsis: &str) -> String`（省略号可自定义，传空串则不追加），并把 `truncate` 改为调用它的薄封装。要求：`truncate` 的现有测试全部仍然通过；新增测试至少覆盖「自定义省略号」与「空省略号」两种情形。完成后确认 cargo test 全部通过。
