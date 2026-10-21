@@ -125,6 +125,20 @@ pub(super) fn is_clipboard_paste_key(key: KeyEvent) -> bool {
             || key.modifiers.contains(KeyModifiers::SUPER))
 }
 
+/// 应用内选区的复制键：`Cmd+C`（macOS）或 `Ctrl+Shift+C`（其余平台终端惯例）。
+///
+/// **刻意不含裸 `Ctrl+C`**——它在本程序里是「中断回合 / 清空草稿 / 二次确认
+/// 退出」，抢过来会让长回合无法中断。
+///
+/// 这个判定必须排在主循环 `state.clear_selection()` **之前**：选区正是要复制的
+/// 东西，晚一步就只剩一个空选区。
+pub(super) fn is_clipboard_copy_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'C'))
+        && (key.modifiers.contains(KeyModifiers::SUPER)
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT)))
+}
+
 /// 从输入框进入内容区的快捷键：`Shift+↑`。
 ///
 /// 用 `contains(SHIFT)` + 排除其余修饰键，而不是 `modifiers == SHIFT`：部分
@@ -1094,6 +1108,46 @@ mod clipboard_paste_tests {
         });
 
         assert!(!state.unseen_messages);
+    }
+
+    /// `Cmd+C` 是「复制选区」，**不是**「往输入框敲一个 c」。
+    ///
+    /// 现场：鼠标选中内容区后按 Command+C，输入框里凭空冒出一个 `c`。根因是主
+    /// 循环的字符插入分支只过滤了 `CONTROL`，而 macOS 的 Kitty 键盘协议把 Cmd+C
+    /// 报成 `Char('c') + SUPER`。修法两层：① 这里识别出复制键并**先于**
+    /// `clear_selection()` 消费掉（选区正是要复制的东西）；② 字符插入统一走
+    /// `input::plain_char`，任何带修饰位的字符键都不再当正文（钉子见
+    /// `input::tests::modified_char_keys_are_never_plain_text`）。
+    #[test]
+    fn cmd_c_is_a_copy_shortcut_not_a_typed_c() {
+        // macOS 的 Cmd+C
+        assert!(is_clipboard_copy_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::SUPER,
+        )));
+        assert!(is_clipboard_copy_key(KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        )));
+        // 其余平台终端惯例：Ctrl+Shift+C
+        assert!(is_clipboard_copy_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        // 裸 Ctrl+C 必须留给「中断回合 / 二次确认退出」，不能被复制抢走
+        assert!(!is_clipboard_copy_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!is_clipboard_copy_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+        // 复制键本身也不能被当成要插入的正文
+        assert_eq!(
+            crate::input::plain_char(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER)),
+            None
+        );
     }
 
     #[test]
