@@ -7,3 +7,10 @@
 .wyj/
 site/dist/
 site/node_modules/
+
+# benchmark fixture 是独立 crate，构建产物不该进仓库
+benchmarks/fixtures/*/target/
+
+# benchmark 跑批产物：每批次一条 jsonl，体积小但数量会无限增长。
+# 需要长期保留的基线请显式 `git add -f`（当前保留 2026-10-21 的 gate-off / gate-on 两份）。
+benchmarks/results/*.jsonl

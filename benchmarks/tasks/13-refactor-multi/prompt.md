@@ -1,0 +1,1 @@
+把整个项目的 `avg` 重命名为 `mean` 之外，还要把 `Vec2::norm` 重命名为 `length`、`Vec2::norm_sq` 重命名为 `length_sq`。包括定义、所有调用点、测试与文档注释中的引用，全部同步更新。完成后项目中不应再出现 `avg` / `norm` / `norm_sq` 这三个标识符（注意 `norm_sq` 是 `norm` 的前缀，检查时要精确匹配），且 cargo test 全部通过。
