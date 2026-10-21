@@ -524,17 +524,23 @@ impl SessionStore {
     /// 列出属于 `cwd` 所在项目（git 仓库根，非 git 回退 cwd）的会话，时间倒序。
     ///
     /// 会话按项目隔离：不同仓库互不可见，同仓库不同子目录视为同一项目。
-    /// 先按 `cwd` 字符串去重再算 `project_key`——后者会做一次 `canonicalize`
-    /// 系统调用，几百个会话逐条算就是几百次 syscall。
+    ///
+    /// ⚠️ 去重的一定是**中间量**（`cwd` → `project_key` 的换算结果），不是会话。
+    /// 此前这里写的是 `seen.insert(m.cwd.clone()) && ...`：`HashSet::insert` 对
+    /// 已存在的键返回 `false`，于是同一个 `cwd` 下从第二条会话起全被过滤掉——
+    /// 而日常使用中一个项目的绝大多数会话共享同一个 `cwd`，`/resume` 面板于是
+    /// 只剩一条，看起来像"历史会话丢了"。`canonicalize` 的 syscall 成本该用
+    /// 缓存消除，不能用丢会话的方式消除。
     pub fn list_for_project(&self, cwd: &Path) -> Result<Vec<SessionMeta>> {
         let target = crate::project::project_key(cwd);
-        let mut seen = std::collections::HashSet::new();
+        let mut keys: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         Ok(self
             .list()?
             .into_iter()
             .filter(|m| {
-                seen.insert(m.cwd.clone())
-                    && crate::project::project_key(Path::new(&m.cwd)) == target
+                *keys
+                    .entry(m.cwd.clone())
+                    .or_insert_with(|| crate::project::project_key(Path::new(&m.cwd)) == target)
             })
             .collect())
     }
@@ -1190,6 +1196,36 @@ mod tests {
             store.last_for_project(&repo_a).unwrap().unwrap().session_id,
             "a1"
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 同一个 `cwd` 下的**所有**会话都必须列出。
+    ///
+    /// 这条钉的是 `list_for_project` 曾经把 `HashSet::insert(cwd) && 归属判定`
+    /// 写成短路条件：insert 对重复键返回 false，于是同一次 `list_for_project`
+    /// 调用里，同一 `cwd` 只有第一条会话能通过过滤，其余被静默丢弃——
+    /// `/resume` 面板只剩一条，用户看到的现象就是"历史会话全没了"。
+    /// 因为日常使用中一个项目的会话几乎共享同一个 `cwd`，这个 bug 在只保存
+    /// 一条会话的测试里完全隐形（见 `list_for_project_filters_by_git_root`）。
+    #[test]
+    fn list_for_project_keeps_every_session_sharing_a_cwd() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-multi-{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let store = SessionStore::new(base.join("sessions")).unwrap();
+
+        for (id, ts) in [
+            ("s1", "2026-07-06T10:00:00Z"),
+            ("s2", "2026-07-06T11:00:00Z"),
+            ("s3", "2026-07-06T12:00:00Z"),
+        ] {
+            store.save(&mk_file(id, &repo, ts)).unwrap();
+        }
+
+        let listed = store.list_for_project(&repo).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|m| m.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["s3", "s2", "s1"], "同一 cwd 的会话必须全部列出且时间倒序");
 
         std::fs::remove_dir_all(&base).ok();
     }
