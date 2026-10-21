@@ -10,7 +10,19 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
-## [Unreleased]
+## [0.3.16] - 2026-10-21
+
+### 完成不再由模型自己宣布，computer-use 不再卡死，配置面拆成三条命令
+
+v0.3.15 之后的一轮集中收拾，主线是**把「说完成了」和「真的完成了」分开**：新增
+框架侧验收门禁与 20 任务评测基线。而基线给出的第一个结论是个反直觉的：门禁在当前
+任务集上**一次都没触发，收益为零**——这比「上了个功能就宣布提升」诚实得多，也正好
+说明为什么 harness 改动必须先有基线。
+
+其余三块：`/model` 一个命令背三件事的问题拆成 `/profile` · `/model` · `/effort`；
+computer-use 修掉一个必现卡死（seqlock 读者无界自旋）与三条「文档写了、实现没做」
+的正确性缺陷，并补上动作-观察闭环；TUI 选中内容区后按 `Cmd+C` 不再往输入框里打
+一个 `c`。
 
 ### 验收门禁：模型说「完成」不算完成，框架判完才算
 
@@ -77,6 +89,15 @@
 
 `compare.sh` 改为按 task 聚合重复记录（成功率 = 通过数/总数），修掉了「最后一条覆盖前面」
 的老问题。顺带修 `01-fix-bug/setup.sh` 的 `sed -i ''`（BSD 专有语法，Linux CI 上会失败）。
+
+**首轮实测推翻了这次改动的假设**：20 个任务 × 门禁开/关各跑一遍，两组都是 **20/20**，
+`gate_blocks` 全为 **0**——门禁一次都没触发。结论写进
+`doc/plan/harness-capability-analysis.md` §7.4，并把缺口 G1（无闭合验证回路）从「已证实」
+降级为「在饱和任务集上不成立，需先提高难度再测」。
+
+这不是白做：`gate_blocks` 这个指标正是为了区分「配了门禁」与「门禁真的跑过」而加的，没它
+只会看到两个相同的成功率然后误判成「门禁无害也无用」；它也正好说明为什么 harness 改动必须
+先有基线——否则一个零收益的改动会以「提升了可靠性」的名义写进 release note。
 
 `CONTRIBUTING.md` 新增一条：**改了 harness 相关的东西要跑评测基线**——prompt、工具描述、
 工具可见性、压缩策略这些改动的效果不在 `cargo test` 的覆盖范围里。
@@ -146,6 +167,70 @@ DeepSeek 四档、MiniMax M3 三档、GLM 根本不认 effort（只认开关）�
 - 钉子：`models::infer_vendor_tests` / `session_store::session_effort_survives_save_load_round_trip`
   / `render::status_bar_shows_the_thinking_level_only_when_it_is_in_effect` /
   `app::model_panel` 与 `app::effort_panel` 各自的形状测试
+
+### computer-use：一个必现卡死、三条「文档写了、实现没做」、一套动作-观察闭环
+
+**① `/computer` 必现卡死**。三处根因叠加，前两条直接表现为「执行后整屏冻结、按什么都
+没反应」：
+
+- `activity::stable_external_snapshot` 是 `loop {}` 无界自旋。writer 是 macOS Event Tap
+  回调，移动鼠标时每秒进入几千次，「读到偶数 epoch → 被 writer 打断 → 前后不一致」可以
+  无限重复且没有退路。实测 8 核机器上 8 读者并发最坏 3.7s、32 读者 8.0s。现在
+  `SEQLOCK_MAX_ATTEMPTS = 64` 次后退化为持锁读——一致性本来就来自那把 Mutex，无锁读
+  只是优化；兜底路径把 epoch 归一为偶数后返回，维持「返回即完整」的对外契约。
+- `/computer` 在 TUI 主循环 inline 执行，而每一项探测都是系统调用（截图、窗口枚举
+  40~80ms、光标位置、Event Tap 快照），叠加到秒级就把主循环整段占住。改为
+  `needs_background() = true`，结果经 `AgentEvent::BackgroundCommandDone` 回填。
+- 排版写在 i18n 模板里靠空格凑列宽，标签长短不一时散架；`ℹ️` 带 U+FE0F 按 2 列渲染而
+  `unicode-width` 只算 1 列，其后整段右移一格。改走 `cost_view::DiagPanel` 按显示宽度
+  算列宽，图标统一为确定 1 列的 `✓ / ✗ / ! / •`，长解释**折行**而不是截断。
+
+**② 三条 P0 正确性缺陷**（都属「注释里写着、函数体没调用」）：
+
+- `tree_id` 含遍历时刻、每次 `list_elements` 都不同，而 `root_fingerprint` 传的是
+  `app_name`——与树内容无关的常量。于是 `execute_with_element` 只要序号仍在范围内就照
+  点，正是 Anthropic ref 契约禁止的按序号盲点。新增 `content_fingerprint` 覆盖过滤后
+  的元素序列（role/title/value + 取整几何 + 状态位 + actions）：亚像素抖动不失效，换位置
+  / 换标题 / 换顺序必须失效。
+- `cursor_click` 的前台 PID 校验只写在模块注释里，`execute` 一次都没调用。这类缺陷只在
+  真有人抢前台时暴露。现在 warp 前与点击后各校验一次。
+- 越界元素判定从「中心点」改为「矩形相交」。`global_to_screenshot` 夹取后永远返回
+  `Some`，旧判据几乎永不触发——实测 Ghostty 滚动条映射出截图坐标 2853（窗口宽 1280），
+  在元素列表里表现为紧贴边缘的一排假元素。
+
+**③ 动作-观察闭环**：新增遮挡检测（只在坐标降级点生效——AX 语义动作被遮挡也照样有效，
+不能一刀切）、动作后自动附图（`[computer_use].auto_screenshot`，默认 true，连续 20 次
+未截图强制附图兜底）、`wait` 动作（≤3000ms，只读免权限）、元素路径 AX 失败仅在
+`requires_foreground_takeover` 类错误上降级到坐标（`target_changed` /
+`preempted_by_user` 一律不降级）、剪贴板文本通道（`set_text` 改为 AXValue → 剪贴板 +
+cmd+V → 逐字符三级降级，`ClipboardGuard` RAII 保证复原）、`drag` 的 12 步插值、
+`show_menu`、`AXScrollToVisible`、多显示器负原点支持。
+
+### TUI：`Cmd+C` 复制选区，不再把 `c` 打进输入框
+
+选中内容区后按 Command+C，输入框里凭空多出一个 `c`。根因是主循环的字符插入分支只过滤
+了 `CONTROL`，而 `enter_terminal_screen` 压的 Kitty `DISAMBIGUATE_ESCAPE_CODES` 会把
+Cmd+C 报成 `Char('c') + SUPER`。两层修法缺一不可：
+
+- 新增 `input::plain_char()` 作为「裸字符」判定的**唯一入口**，排除
+  `CONTROL|ALT|SUPER|META|HYPER`。`SHIFT` 刻意留着——它已体现在 `KeyCode` 里
+  （Shift+a 上报的就是 `Char('A')`），排除会让大写字母全打不进去。所有 `insert_char`
+  入口（主输入框、AskQuestion / PlanApproval 弹窗、`input_owner` 借用态）统一改走它。
+- 新增 `clipboard::is_clipboard_copy_key()`（`Cmd+C` 或 `Ctrl+Shift+C`），在主循环里
+  **先于** `state.clear_selection()` 消费——选区正是要复制的东西，晚一步只剩空选区。
+  裸 `Ctrl+C` 不在此列：它在本程序里是「中断回合 / 清空草稿 / 二次确认退出」。
+
+钉子：`input::tests::modified_char_keys_are_never_plain_text`、
+`clipboard_paste_tests::cmd_c_is_a_copy_shortcut_not_a_typed_c`。
+
+### 其它
+
+- 官网：WebSearch 从工具清单里的一条提成独立章节（README 含三分钟启用、能力表、
+  四个真实场景；docs.html 同口径），并修掉三条指向 `#features` / `#architecture` /
+  `#changelog` 的失效 Pages 链接——那些锚点只在 `docs.html` 上存在
+- 文档：`crates/tui/CLAUDE.md` 补「带修饰位的字符键一律不是正文」这条横切规则
+
+**1936 个 workspace 测试**（1838 → 1936）。
 
 ## [0.3.15] - 2026-10-20
 
