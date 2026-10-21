@@ -284,9 +284,9 @@ impl AskQuestionDialog {
     /// 带修饰键的统一入口（主循环用）。`handle_key` 只剩裸 `KeyCode` 的老签名，
     /// 保留给既有单测与"语义不变"的调用方。
     pub fn handle_key_event(&mut self, key: KeyEvent) -> AskQuestionKeyOutcome {
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        // 「裸字符」判定的唯一入口：带 Cmd/Alt/Meta 的字符键是系统或应用快捷键
+        // （macOS 上 Cmd+C 就是 `Char('c') + SUPER`），不许当正文插入。
+        let plain_char = crate::input::plain_char(&key);
         if let InProgressAnswer::FreeText { input, .. } = &mut self.current {
             // 编辑键（Backspace/Delete/左右/Home/End/Ctrl+A/E/K/U/W/Alt+←→
             // Shift+Enter…）与主输入框**同一份实现**，不再只有左右和退格
@@ -325,7 +325,7 @@ impl AskQuestionDialog {
                     }
                     return AskQuestionKeyOutcome::Continue;
                 }
-                KeyCode::Char(c) if plain => {
+                KeyCode::Char(c) if plain_char == Some(c) => {
                     input.insert_char(c);
                     return AskQuestionKeyOutcome::Continue;
                 }
@@ -337,11 +337,9 @@ impl AskQuestionDialog {
         // 选项态：敲任意非空白字符直接进"其他"输入框。
         // 比 ↓↓ 再回车少两步，也不用先看清选项列表（Claude Code 那边目前仍要
         // ↓ 到 Other 行才能打字，这里是更快的等价路径；↓+Enter 那条路保留不变）。
-        if plain {
-            if let KeyCode::Char(c) = key.code {
-                if !c.is_whitespace() && self.enter_other_with_char(c) {
-                    return AskQuestionKeyOutcome::Continue;
-                }
+        if let Some(c) = plain_char {
+            if !c.is_whitespace() && self.enter_other_with_char(c) {
+                return AskQuestionKeyOutcome::Continue;
             }
         }
         self.handle_key(key.code)
@@ -499,9 +497,8 @@ impl PlanApprovalDialog {
 
     /// 带修饰键的统一入口（主循环用）。编辑键与主输入框同一份实现。
     pub fn handle_key_event(&mut self, key: KeyEvent) -> PlanApprovalOutcome {
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        // 同 AskQuestion：带 Cmd/Alt/Meta 的字符键是快捷键，不是正文。
+        let plain_char = crate::input::plain_char(&key);
         if let InProgressAnswer::FreeText { input, .. } = &mut self.current {
             if crate::input::apply_edit_key(input, &key) {
                 return PlanApprovalOutcome::Continue;
@@ -534,29 +531,25 @@ impl PlanApprovalDialog {
                     }
                     return PlanApprovalOutcome::Continue;
                 }
-                KeyCode::Char(c) if plain => {
+                KeyCode::Char(c) if plain_char == Some(c) => {
                     input.insert_char(c);
                     return PlanApprovalOutcome::Continue;
                 }
                 _ => {}
             }
-        } else if plain {
+        } else if let Some(c) = plain_char {
             // 选项态直接打字 = 走"手动输入反馈"那条路（虚拟位 index 2），
             // 少一次 ↓↓ + 回车；↓+Enter 那条路保留不变。
-            if let KeyCode::Char(c) = key.code {
-                if !c.is_whitespace() {
-                    let prior = std::mem::replace(
-                        &mut self.current,
-                        InProgressAnswer::Single { cursor: 2 },
-                    );
-                    let mut input = InputBox::new();
-                    input.insert_char(c);
-                    self.current = InProgressAnswer::FreeText {
-                        prior: Box::new(prior),
-                        input,
-                    };
-                    return PlanApprovalOutcome::Continue;
-                }
+            if !c.is_whitespace() {
+                let prior =
+                    std::mem::replace(&mut self.current, InProgressAnswer::Single { cursor: 2 });
+                let mut input = InputBox::new();
+                input.insert_char(c);
+                self.current = InProgressAnswer::FreeText {
+                    prior: Box::new(prior),
+                    input,
+                };
+                return PlanApprovalOutcome::Continue;
             }
         }
         self.handle_key(key.code)
