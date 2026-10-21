@@ -1422,7 +1422,22 @@ impl Command for ComputerCmd {
             if wyj_computer::accessibility::is_process_trusted() {
                 lines.push(tr("computer.ax_trusted"));
             } else {
+                // 这是**用户显式敲 `/computer`** 的路径，是唯一适合主动弹
+                // 系统授权框的地方：工具内部一律只做只读检查，否则 headless
+                // / cron 会弹一个没人看的框，反复调用还会被系统当成骚扰。
+                wyj_computer::accessibility::request_trust_prompt();
                 lines.push(tr("computer.ax_untrusted"));
+            }
+            // 多显示器：截图/区域截取按显示器定位，副屏原点可以为负。
+            match wyj_computer::displays() {
+                Ok(displays) => lines.push(tr_fmt(
+                    "computer.displays",
+                    &[("count", &displays.len().to_string())],
+                )),
+                Err(error) => lines.push(tr_fmt(
+                    "computer.displays_failed",
+                    &[("error", &error.to_string())],
+                )),
             }
         }
         #[cfg(not(target_os = "macos"))]

@@ -34,6 +34,9 @@
 //!   Event Tap 误判成「用户抢占」**（见 `activity::event_tap_callback`）。
 //! - 执行前后校验前台 PID：光标瞬移不该改变前台，若变了说明有第三方在抢，
 //!   立刻报 `preempted_by_user` 而不是继续。
+//! - **调用方还必须在降级前确认目标窗口没被遮挡**（`occlusion::occlusion_of`）：
+//!   本模块按屏幕坐标发 HID 事件，命中测试走 z-order，窗口被盖住时点中的是
+//!   上面那个窗口。这个判断不能在本模块做——它不知道「目标窗口」是哪个。
 //! - 光标位置**无条件复原**，包括中途出错时——用 RAII 保证，绝不把用户的光标
 //!   留在别人的窗口里。
 //!
@@ -201,10 +204,21 @@ impl Drop for CursorRestore {
 ///
 /// 前台应用在整个过程中不变：窗口服务器把「谁在前台」与「事件投给谁」分开
 /// 处理，点击非激活窗口通常不会夺走前台（与点击 Dock 图标、菜单栏的行为一致）。
+///
+/// # 前台 PID 校验
+///
+/// 进入时记下前台 PID，点击前后各校验一次：变了说明有第三方（用户或别的
+/// 自动化）在这几毫秒里抢了前台，此刻发出的点击可能落进一个与调用方预期
+/// 完全不同的上下文，所以**宁可报错也不点**。文档里写了这条边界很久，
+/// 但实现曾经漏掉——它只在「有人抢前台」时才暴露，常规测试根本触发不到。
 pub fn execute(x: f64, y: f64, kind: ClickKind) -> Result<String> {
+    let frontmost_before = crate::accessibility::frontmost_pid()?;
     let before = cursor_position()?;
     let mut restore = CursorRestore::arm(before);
 
+    // warp 本身不产生事件，但它是整个动作的第一个可观察副作用；先校验一次
+    // 再 warp，避免「已经挪了光标才发现该中止」。
+    ensure_frontmost_unchanged(frontmost_before)?;
     let source = source()?;
     warp(x, y)?;
 
@@ -235,6 +249,10 @@ pub fn execute(x: f64, y: f64, kind: ClickKind) -> Result<String> {
     warp(before.x, before.y)?;
     restore.armed = false;
 
+    // 点击已发出，但「前台被抢」这个事实仍然要报：调用方需要知道这次点击
+    // 可能落在了错误的窗口上，而不是收到一句「clicked」就继续往下走。
+    ensure_frontmost_unchanged(frontmost_before)?;
+
     crate::telemetry::record_background_action();
     Ok(format!(
         "{} clicked at ({}, {}) via cursor warp; the cursor was restored to ({}, {}) \
@@ -244,6 +262,172 @@ pub fn execute(x: f64, y: f64, kind: ClickKind) -> Result<String> {
         y,
         before.x,
         before.y
+    ))
+}
+
+/// 前台 PID 与进入时不一致即报 `preempted_by_user`。
+fn ensure_frontmost_unchanged(expected: u32) -> Result<()> {
+    let current = crate::accessibility::frontmost_pid()?;
+    if current != expected {
+        bail!(
+            "preempted_by_user: the foreground application changed ({expected} -> {current}) \
+             while the cursor warp click was in flight; do not retry automatically"
+        );
+    }
+    Ok(())
+}
+
+/// 拖拽路径的插值步数。
+///
+/// 不能只发 `down` + `up` 两个事件：绝大多数 App 在 `mouseDragged` 上做命中
+/// 与吸附（访达的文件移动、滑块、文本选择、画布的框选），一次「瞬移」的
+/// 拖拽会被识别成「在起点按下、在终点抬起」而**不是**拖拽，于是一部分应用
+/// 什么都没发生、另一部分把它当成两次点击。
+///
+/// 12 步是折中：步数太少（<5）时部分 App 的吸附阈值会漏判；步数太多则每步
+/// 一次 IPC，长距离拖拽的耗时线性上升。每步之间 sleep 1ms，让 App 的事件
+/// 循环有机会处理——连续无间隔地灌事件在实测中会被合并成一次。
+const DRAG_STEPS: usize = 12;
+
+/// 拖拽过程中鼠标按钮的 RAII 释放守卫。
+///
+/// 拖拽比点击危险得多：`mouseDown` 之后若在 `mouseUp` 之前早退（`?`、panic、
+/// 前台被抢），鼠标会**一直处于按下状态**——用户此后每一次移动都在拖拽，
+/// 整个桌面不可用。这与 `backend::PressedMouse` 是同一个失效模式。
+struct ButtonRelease {
+    released: bool,
+}
+
+impl ButtonRelease {
+    fn arm() -> Self {
+        Self { released: false }
+    }
+}
+
+impl Drop for ButtonRelease {
+    fn drop(&mut self) {
+        if !self.released {
+            // 尽力释放：用左键 up 兜底。真正的 kind 已在正常路径用对了，
+            // 这里只在异常路径上做保底，避免鼠标卡在按下态。
+            let _ = release_button(CGMouseButton::Left);
+        }
+    }
+}
+
+/// 发一次「按钮抬起」，不关心配对的是哪个按钮。
+fn release_button(button: CGMouseButton) -> Result<()> {
+    let source = source()?;
+    let point = cursor_position()?;
+    let event_type = match button {
+        CGMouseButton::Right => CGEventType::RightMouseUp,
+        CGMouseButton::Center => CGEventType::OtherMouseUp,
+        _ => CGEventType::LeftMouseUp,
+    };
+    let event = CGEvent::new_mouse_event(Some(&source), event_type, point, button)
+        .ok_or_else(|| anyhow!("failed to create mouse-up event"))?;
+    mark(&event);
+    CGEvent::set_flags(Some(&event), CGEventFlags::empty());
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+    Ok(())
+}
+
+/// 沿 `from -> to` 生成插值点（含两端）。
+///
+/// 纯函数，便于单测：拖拽落点算错是「文件被拖到错误目录」这种破坏性失败，
+/// 必须能脱离真机验证。
+pub fn drag_path(from: (f64, f64), to: (f64, f64), steps: usize) -> Vec<(f64, f64)> {
+    let steps = steps.max(1);
+    (0..=steps)
+        .map(|index| {
+            let t = index as f64 / steps as f64;
+            (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t)
+        })
+        .collect()
+}
+
+/// 从 `from` 拖拽到 `to`（全局屏幕逻辑坐标），结束后把光标复原到原位。
+///
+/// # 与点击共享的全部安全边界
+///
+/// 拖拽不是「点击的变体」而是更强的能力（能移动文件、能改滑块、能重排
+/// 列表），因此**一条都不能少**：调用方先拿 `InputLease`、事件带
+/// `INPUT_EVENT_MARKER`、前后校验前台 PID、光标无条件复原。额外多一条
+/// [`ButtonRelease`]——鼠标键必须在任何退出路径上释放。
+///
+/// # 为什么必须在开始前确认没被遮挡
+///
+/// 拖拽的起点由调用方（`app_computer`）用遮挡检测把关；本函数拿不到
+/// 「目标窗口」概念，无法自己判断。这一条不能省：拖拽起点落在遮挡窗口上时，
+/// 移动的是那个窗口里的东西，破坏性远大于点错一次。
+pub fn execute_drag(from: (f64, f64), to: (f64, f64), kind: ClickKind) -> Result<String> {
+    let frontmost_before = crate::accessibility::frontmost_pid()?;
+    let before = cursor_position()?;
+    let mut restore = CursorRestore::arm(before);
+    ensure_frontmost_unchanged(frontmost_before)?;
+
+    let source = source()?;
+    let button = kind.button();
+    let down_type = kind.down_type();
+    let dragged_type = match button {
+        CGMouseButton::Right => CGEventType::RightMouseDragged,
+        CGMouseButton::Center => CGEventType::OtherMouseDragged,
+        _ => CGEventType::LeftMouseDragged,
+    };
+
+    // 起点：warp 过去，然后按下。
+    warp(from.0, from.1)?;
+    let down = CGEvent::new_mouse_event(
+        Some(&source),
+        down_type,
+        CGPoint {
+            x: from.0,
+            y: from.1,
+        },
+        button,
+    )
+    .ok_or_else(|| anyhow!("failed to create mouse-down event"))?;
+    mark(&down);
+    CGEvent::set_integer_value_field(Some(&down), CGEventField::MouseEventClickState, 0);
+    CGEvent::set_flags(Some(&down), CGEventFlags::empty());
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&down));
+
+    // 从这一刻起鼠标处于按下态，任何早退都必须先释放。
+    let mut release = ButtonRelease::arm();
+
+    for (x, y) in drag_path(from, to, DRAG_STEPS).into_iter().skip(1) {
+        // 每一步都校验前台：拖拽持续数十毫秒，正是用户最容易插进来的窗口。
+        ensure_frontmost_unchanged(frontmost_before)?;
+        warp(x, y)?;
+        let event = CGEvent::new_mouse_event(Some(&source), dragged_type, CGPoint { x, y }, button)
+            .ok_or_else(|| anyhow!("failed to create mouse-dragged event"))?;
+        mark(&event);
+        CGEvent::set_flags(Some(&event), CGEventFlags::empty());
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+        // 让 App 的事件循环有机会处理这一步；连续无间隔地灌事件会被合并。
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    let up = CGEvent::new_mouse_event(
+        Some(&source),
+        kind.up_type(),
+        CGPoint { x: to.0, y: to.1 },
+        button,
+    )
+    .ok_or_else(|| anyhow!("failed to create mouse-up event"))?;
+    mark(&up);
+    CGEvent::set_flags(Some(&up), CGEventFlags::empty());
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&up));
+    release.released = true;
+
+    warp(before.x, before.y)?;
+    restore.armed = false;
+    ensure_frontmost_unchanged(frontmost_before)?;
+
+    crate::telemetry::record_background_action();
+    Ok(format!(
+        "dragged from ({}, {}) to ({}, {}) in {DRAG_STEPS} steps via cursor warp; \
+         the cursor was restored to ({}, {}) and the foreground app was not changed",
+        from.0, from.1, to.0, to.1, before.x, before.y
     ))
 }
 
@@ -273,6 +457,39 @@ mod tests {
         assert_eq!(ClickKind::Left.count(), 1);
         // 双击必须是左键：右键双击在 macOS 上没有可移植语义。
         assert_eq!(ClickKind::DoubleLeft.button(), CGMouseButton::Left);
+    }
+
+    /// 拖拽路径必须**包含两端**且严格单调——落点算错是「文件被拖到错误目录」
+    /// 这种破坏性失败，不能靠真机试出来。
+    #[test]
+    fn drag_path_spans_both_endpoints_in_order() {
+        let path = drag_path((0.0, 0.0), (120.0, 60.0), 12);
+        assert_eq!(path.len(), 13, "含两端应为 steps + 1 个点");
+        assert_eq!(path.first(), Some(&(0.0, 0.0)));
+        assert_eq!(path.last(), Some(&(120.0, 60.0)));
+        // 中点落在正中。
+        assert_eq!(path[6], (60.0, 30.0));
+        // 每一步都朝终点推进（不能出现回退）。
+        for pair in path.windows(2) {
+            assert!(pair[1].0 >= pair[0].0, "{pair:?}");
+            assert!(pair[1].1 >= pair[0].1, "{pair:?}");
+        }
+    }
+
+    /// 反向拖拽（右下 -> 左上）同样必须落在两端，坐标不能因为插值方向被钳住。
+    #[test]
+    fn drag_path_supports_reverse_directions() {
+        let path = drag_path((100.0, 200.0), (20.0, 40.0), 4);
+        assert_eq!(path.first(), Some(&(100.0, 200.0)));
+        assert_eq!(path.last(), Some(&(20.0, 40.0)));
+        assert_eq!(path[2], (60.0, 120.0));
+    }
+
+    /// `steps = 0` 不能产生空路径或除零——退化时至少给出起止两点。
+    #[test]
+    fn drag_path_never_degenerates() {
+        let path = drag_path((1.0, 2.0), (3.0, 4.0), 0);
+        assert_eq!(path, vec![(1.0, 2.0), (3.0, 4.0)]);
     }
 
     /// 真机验证：光标瞬移点击后**必须回到原位**。

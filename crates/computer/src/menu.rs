@@ -37,6 +37,15 @@ use std::time::Instant;
 
 /// 菜单遍历预算。与 [`crate::element::TraversalBudget`] 同源，但菜单树是
 /// **静态**的（不像窗口控件树会随交互变化），所以可以给得更宽。
+///
+/// # 分层枚举下预算仍然必要
+///
+/// 只读一层看起来不可能超预算——但「一层」不等于「几项」：实测访达的
+/// 「窗口」菜单展开后有 300+ 项，而每一项都要 2~3 次 IPC。没有闸门时
+/// 一次 `expand` 就能把工具卡住好几秒，而 `list_menus` 是模型很常调的动作。
+///
+/// 计数是**本次调用**的累计值，不是整棵树的：分层设计下每次调用只碰一层，
+/// 跨调用的累计没有意义（每次都是独立请求）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MenuBudget {
     pub max_depth: u16,
@@ -52,10 +61,45 @@ impl Default for MenuBudget {
             max_depth: 8,
             // 实测：访达的菜单树节点数 > 8000（每个 AXMenuBarItem 还有一个
             // AXMenu 子节点，AXMenuItem 又各自带子容器），且全量遍历要 3 秒+
-            // ——远超可接受的交互延迟。
+            // ——远超可接受的交互延迟。分层之后单层远低于此，但单层仍可能
+            // 有几百项，所以保留这个上限。
             max_nodes: 8000,
             max_duration: std::time::Duration::from_millis(3000),
         }
+    }
+}
+
+/// 一次分层枚举的遍历计数器，供 [`MenuBudget`] 判定。
+///
+/// 独立成结构体而不是传裸 `&mut usize`：节点数与起点时刻必须**成组**演进，
+/// 新增一条预算就得同时改这里和所有调用点，编译器才帮得上忙。
+struct BudgetTracker<'a> {
+    budget: &'a MenuBudget,
+    visited: usize,
+    started: Instant,
+    truncated: bool,
+}
+
+impl<'a> BudgetTracker<'a> {
+    fn new(budget: &'a MenuBudget) -> Self {
+        Self {
+            budget,
+            visited: 0,
+            started: Instant::now(),
+            truncated: false,
+        }
+    }
+
+    /// 记一个节点；返回 `false` 表示预算已耗尽，调用方必须停止枚举。
+    fn visit(&mut self) -> bool {
+        if self.visited >= self.budget.max_nodes
+            || self.started.elapsed() >= self.budget.max_duration
+        {
+            self.truncated = true;
+            return false;
+        }
+        self.visited += 1;
+        true
     }
 }
 
@@ -166,9 +210,10 @@ pub fn list_level(
     let root = accessibility::find_application_element(target.pid)?
         .ok_or_else(|| anyhow::anyhow!("target_changed: this app exposes no menu bar"))?;
 
+    let mut tracker = BudgetTracker::new(budget);
     let items = match parent {
-        None => top_level_items(&root, budget)?,
-        Some(reference) => children_of(&root, reference, budget)?,
+        None => top_level_items(&root, &mut tracker)?,
+        Some(reference) => children_of(&root, reference, &mut tracker)?,
     };
 
     Ok(MenuSnapshot {
@@ -181,8 +226,10 @@ pub fn list_level(
         ),
         has_children: items.iter().any(|item| item.has_children),
         items,
-        truncated: false,
-        visited: 0,
+        // 如实报告：`truncated` 曾经硬编码 false，于是模型完全不知道
+        // 自己拿到的是残缺列表，会以为「菜单里没有这一项」。
+        truncated: tracker.truncated,
+        visited: tracker.visited,
         elapsed_ms: started.elapsed().as_millis() as u64,
         menu_available: true,
     })
@@ -200,10 +247,18 @@ fn menu_bar(root: &objc2_application_services::AXUIElement) -> Option<AXUIElemen
 /// 「一层」指某个 `AXMenuBarItem` 下的那个 `AXMenu` 容器（macOS 的固定结构：
 /// 菜单栏项 → AXMenu → AXMenuItem 们）。只展开一层，不深入——这正是
 /// 分层遍历能把 3 秒降到毫秒级的原因。
-fn items_of_container(container: &AXUIElementRef) -> Vec<MenuItem> {
+fn items_of_container(
+    container: &AXUIElementRef,
+    mut tracker: Option<&mut BudgetTracker<'_>>,
+) -> Vec<MenuItem> {
     let attrs = accessibility::batch_attributes(container);
     let mut items = Vec::new();
     for child in &attrs.children {
+        if let Some(tracker) = tracker.as_deref_mut() {
+            if !tracker.visit() {
+                break;
+            }
+        }
         let child_attrs = accessibility::batch_attributes(child);
         let role = child_attrs.role.clone().unwrap_or_default();
         if !matches!(role.as_str(), "AXMenuItem" | "AXMenuBarItem") {
@@ -242,7 +297,7 @@ fn items_of_container(container: &AXUIElementRef) -> Vec<MenuItem> {
 /// 顶级菜单：菜单栏项 + 它们的子菜单标题。
 fn top_level_items(
     root: &objc2_application_services::AXUIElement,
-    _budget: &MenuBudget,
+    tracker: &mut BudgetTracker<'_>,
 ) -> Result<Vec<MenuItem>> {
     let Some(bar) = menu_bar(root) else {
         return Ok(Vec::new());
@@ -250,6 +305,9 @@ fn top_level_items(
     let bar_attrs = accessibility::batch_attributes(&bar);
     let mut items = Vec::new();
     for bar_item in &bar_attrs.children {
+        if !tracker.visit() {
+            break;
+        }
         let attrs = accessibility::batch_attributes(bar_item);
         let title = accessibility::normalize_label(attrs.title.clone());
         // 菜单栏项的 AXIdentifier 多为空（实测 Safari 只有部分菜单有）。
@@ -276,7 +334,7 @@ fn top_level_items(
 fn children_of(
     root: &objc2_application_services::AXUIElement,
     reference: MenuRef,
-    _budget: &MenuBudget,
+    tracker: &mut BudgetTracker<'_>,
 ) -> Result<Vec<MenuItem>> {
     let Some(bar) = menu_bar(root) else {
         return Ok(Vec::new());
@@ -298,7 +356,7 @@ fn children_of(
         if accessibility::batch_attributes(container).role.as_deref() != Some("AXMenu") {
             continue;
         }
-        for mut item in items_of_container(container) {
+        for mut item in items_of_container(container, Some(&mut *tracker)) {
             let label = item.title.clone().unwrap_or_default();
             item.depth = 1;
             item.path = if parent_path.is_empty() {
@@ -364,7 +422,10 @@ pub fn press_menu_path(target: &WindowTarget, path: &[MenuRef]) -> Result<String
                     labels.join(" → ")
                 )
             })?;
-        let items = items_of_container(&container);
+        // `press_menu_path` 不设预算：它要按序号定位，截断会让序号错位到
+        // 另一个菜单项上——那比慢几百毫秒糟得多。这是「宁可慢，不可错」
+        // 的一处刻意例外。
+        let items = items_of_container(&container, None);
         let item = items.get(step.0 as usize).ok_or_else(|| {
             anyhow::anyhow!(
                 "target_changed: menu item {} is not present (that level has {} items); call list_menus again",
@@ -518,5 +579,49 @@ mod tests {
         assert!(budget.max_duration >= std::time::Duration::from_millis(1500));
         // 实测最深 4-5 层。
         assert!(budget.max_depth >= 6);
+    }
+
+    /// 预算必须真的能停下遍历，并把 `truncated` 置位——此前这个参数带 `_`
+    /// 前缀、`truncated` 硬编码 false，模型完全不知道自己拿到的是残缺列表。
+    #[test]
+    fn the_budget_tracker_stops_and_flags_truncation() {
+        let tight = MenuBudget {
+            max_depth: 8,
+            max_nodes: 3,
+            max_duration: std::time::Duration::from_secs(10),
+        };
+        let mut tracker = BudgetTracker::new(&tight);
+        assert!(tracker.visit(), "第 1 个节点应放行");
+        assert!(tracker.visit(), "第 2 个节点应放行");
+        assert!(tracker.visit(), "第 3 个节点应放行");
+        assert!(!tracker.visit(), "超出 max_nodes 必须停下");
+        assert!(tracker.truncated, "停下时必须置位 truncated");
+        assert_eq!(tracker.visited, 3, "计数不该把被拒的那次算进去");
+    }
+
+    /// 宽预算下不应误报截断：`truncated` 恒真的实现会让模型以为每次都被砍。
+    #[test]
+    fn a_generous_budget_never_reports_truncation() {
+        let budget = MenuBudget::default();
+        let mut tracker = BudgetTracker::new(&budget);
+        for _ in 0..50 {
+            assert!(tracker.visit());
+        }
+        assert!(!tracker.truncated);
+        assert_eq!(tracker.visited, 50);
+    }
+
+    /// 耗时预算同样生效（不能只靠节点数：单次 IPC 卡住时节点数不会增长）。
+    #[test]
+    fn the_duration_budget_also_stops_the_tracker() {
+        let tight = MenuBudget {
+            max_depth: 8,
+            max_nodes: 1_000_000,
+            max_duration: std::time::Duration::from_millis(0),
+        };
+        let mut tracker = BudgetTracker::new(&tight);
+        // 起点时刻在 `new()` 里，`elapsed()` 已经 >= 0ms。
+        assert!(!tracker.visit());
+        assert!(tracker.truncated);
     }
 }

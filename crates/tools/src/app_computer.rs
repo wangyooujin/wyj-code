@@ -15,23 +15,82 @@ use wyj_computer::element::{ElementAction, ElementRef, TraversalBudget};
 use wyj_computer::target::WindowTarget;
 use wyj_core::tool::{Tool, ToolContext, ToolResult};
 
+/// 一次 `list_elements` 留下的、动作侧需要的全部可 `Send` 观察信息。
+#[derive(Debug, Clone, Default)]
+struct ElementObservation {
+    /// 产生这批 ref 的那次遍历的 id。
+    tree_id: u64,
+    /// 那一次遍历的树内容指纹，动作前用来检测界面是否已经漂移。
+    content_fingerprint: u64,
+    /// 每个 ref 在截图坐标空间里的中心点，下标即 `ElementRef` 的序号。
+    ///
+    /// 存它是为了让「AX 动作在这个元素上必然失败」时能降级到坐标点击：
+    /// 元素明明在树里、`frame` 也有，只是不支持 `AXPress`（自绘控件常见），
+    /// 这时让模型自己去查坐标再发一次 `click` 是纯粹多出来的往返。
+    ///
+    /// 只存两个 `i32`，不存 AX 句柄——`AXUIElement` 非 `Send`/`Sync`，一旦
+    /// 进这张表整个工具就无法跨线程共享。
+    centers: Vec<Option<(i32, i32)>>,
+    /// 产生这批 ref 时用的过滤条件。
+    ///
+    /// **必须原样传给动作路径**：`element_ref` 的序号是「过滤后列表里的第
+    /// N 个」，动作时若改用无过滤遍历，同一个 `e3` 会指向完整树里的另一个
+    /// 元素——ref 契约禁止的按序号盲点。
+    query: ElementQuerySnapshot,
+}
+
+/// [`ElementQuery`] 的可克隆快照（原类型含 `Vec<String>`，本身可克隆，
+/// 这里单独命名是为了让「这是观察记录的一部分」在类型上可见）。
+type ElementQuerySnapshot = wyj_computer::element::ElementQuery;
+
+impl ElementObservation {
+    fn center_of(&self, reference: ElementRef) -> Option<(i32, i32)> {
+        self.centers.get(reference.0 as usize).copied().flatten()
+    }
+}
+
 pub struct AppComputerTool {
     max_dim: u32,
     focused_quiet_period: Duration,
     observations: Mutex<HashMap<u32, WindowTarget>>,
-    /// 每个窗口最近一次 `list_elements` 的 `tree_id`，供动作校验 ref 是否过期。
+    /// 每个窗口最近一次 `list_elements` 的观察记录，供动作校验 ref 是否过期。
     ///
-    /// **只存 `tree_id`，不存 AX 句柄**：`AXUIElement` 不是 `Send`/`Sync`
+    /// **只存可 `Send` 的纯数据，不存 AX 句柄**：`AXUIElement` 不是 `Send`/`Sync`
     /// （底层 `UnsafeCell`），存进本工具的 `Mutex` 会让 `Arc<dyn Tool>` 失去
     /// 跨线程可用性。句柄的定位与使用因此完全下沉到 `wyj_computer::element`
     /// 内部完成（见 [`element_mutation`]）。
-    element_tree_ids: Mutex<HashMap<u32, u64>>,
+    ///
+    /// 存的是**两项**而不是只有 `tree_id`：`tree_id` 含遍历时刻，只能证明
+    /// 「这个 ref 来自哪一次观察」；真正能检测「观察之后界面变了」的是
+    /// `content_fingerprint`。只校验前者等于放行按序号盲点。
+    element_observations: Mutex<HashMap<u32, ElementObservation>>,
     /// 每个窗口最近一次 `list_menus` 的 `tree_id`，同理用于菜单引用的 stale 校验。
     menu_tree_ids: Mutex<HashMap<u32, u64>>,
     /// 某 App/动作若曾在没有人类输入的情况下抢走前台，本会话立即熔断该
     /// 组合，避免同一种不兼容后台动作反复打扰用户。
     incompatible_actions: Mutex<HashSet<(String, String)>>,
+    /// 变更动作成功后是否自动附带一张窗口截图，见 [`Self::with_auto_screenshot`]。
+    auto_screenshot: Option<u32>,
+    /// 自上次截图以来的连续变更动作数，用于 `MAX_ACTIONS_WITHOUT_SCREENSHOT`。
+    mutations_since_screenshot: Mutex<HashMap<u32, u32>>,
 }
+
+/// 连续变更动作的上限。超过之后即使 `auto_screenshot` 关闭也强制附图一次。
+///
+/// 旧 `computer` 工具早就有这条保护（`computer.rs` 的
+/// `MAX_ACTIONS_WITHOUT_SCREENSHOT`），`app_computer` 从上线起一直缺。它防的
+/// 是同一个失效模式：模型连续盲点十几下、每步都「成功」，直到某一步点到
+/// 完全不相干的地方才停下来问「为什么没反应」——那时已经无从回溯哪一步开始
+/// 偏的。
+const MAX_ACTIONS_WITHOUT_SCREENSHOT: u32 = 20;
+
+/// `wait` 动作的上限。
+///
+/// 设上限是因为这个动作在回合里是**同步阻塞**的：模型误判一次「等 30 秒」，
+/// 用户就真的盯着一个不动的界面 30 秒，而且这期间 ESC 只能取消整回合。3000ms
+/// 覆盖界面过渡动画与本地加载，更长的情况该用 `wait` 多调几次、每次之间截图
+/// 确认——那才是模型真正需要的行为。
+const MAX_WAIT_MS: u64 = 3000;
 
 impl AppComputerTool {
     pub fn new(max_dim: u32, focused_quiet_period: Duration) -> Self {
@@ -39,10 +98,23 @@ impl AppComputerTool {
             max_dim,
             focused_quiet_period,
             observations: Mutex::new(HashMap::new()),
-            element_tree_ids: Mutex::new(HashMap::new()),
+            element_observations: Mutex::new(HashMap::new()),
             menu_tree_ids: Mutex::new(HashMap::new()),
             incompatible_actions: Mutex::new(HashSet::new()),
+            auto_screenshot: None,
+            mutations_since_screenshot: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 开启「变更动作后自动附带截图」，`max_dim` 为附图的长边像素上限。
+    ///
+    /// 为什么这件事必须由工具自己做、而不是靠提示词要求模型「记得截图」：
+    /// 模型对「我刚刚做了什么」有强烈的一致性倾向，它更愿意相信自己的动作
+    /// 成功了，而不是主动去验证。让工具在回执里直接给出**动作之后的画面**，
+    /// 是把验证从「模型的自觉」变成「协议的默认」。
+    pub fn with_auto_screenshot(mut self, max_dim: u32) -> Self {
+        self.auto_screenshot = Some(max_dim);
+        self
     }
 
     fn screenshot(&self, input: &Value) -> ToolResult {
@@ -65,6 +137,11 @@ impl AppComputerTool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(window_id, target.clone());
+        // 显式截图本身就是一次观察，连续动作计数归零。
+        self.mutations_since_screenshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(window_id, 0);
         let display = serde_json::to_string_pretty(&serde_json::json!({
             "window": target,
             "capture": {
@@ -209,7 +286,7 @@ impl AppComputerTool {
             Ok(target) => target,
             Err(error) => return error_result(error),
         };
-        let (x, y) = match required_coordinate(input) {
+        let (x, y) = match required_coordinate(input, "coordinate") {
             Ok(coordinate) => coordinate,
             Err(error) => return error_result(error),
         };
@@ -254,13 +331,25 @@ impl AppComputerTool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(window_id, target.clone());
+        // `list_elements` 也附截图，同样是一次观察。
+        self.mutations_since_screenshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(window_id, 0);
 
-        let snapshot =
-            match wyj_computer::element::snapshot_elements(&target, &TraversalBudget::default()) {
-                Ok(snapshot) => snapshot,
-                Err(error) => return error_result(error),
-            };
-        // 必须记录 tree_id，否则下面所有 `element_ref` 动作都会因
+        let query = match parse_element_query(input) {
+            Ok(query) => query,
+            Err(error) => return error_result(error),
+        };
+        let snapshot = match wyj_computer::element::snapshot_elements_with(
+            &target,
+            &TraversalBudget::default(),
+            &query,
+        ) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return error_result(error),
+        };
+        // 必须记录观察结果，否则下面所有 `element_ref` 动作都会因
         // `no element snapshot` 而恒定失败——`resolve_element` 拿这个值校验
         // 引用的新鲜度，它只可能由 `list_elements` 写入（`list_menus` 写的是
         // 另一张 `menu_tree_ids` 表，两者互不通用）。
@@ -268,26 +357,29 @@ impl AppComputerTool {
         // 这是个静默 bug：写在这里之前，`element_ref` 路线从上线起一次都没能
         // 执行成功，而工具描述与 system prompt 都把它称作「首选」。现有单测
         // 只覆盖「从未 list 过」的 None 分支，正好测不到「list 过却仍然为空」。
-        self.element_tree_ids
+        self.element_observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(window_id, snapshot.tree_id);
+            .insert(
+                window_id,
+                ElementObservation {
+                    tree_id: snapshot.tree_id,
+                    content_fingerprint: snapshot.content_fingerprint,
+                    centers: snapshot
+                        .elements
+                        .iter()
+                        .map(|element| {
+                            element.frame_in_screenshot.map(|frame| {
+                                let (x, y) = frame.center();
+                                (x.round() as i32, y.round() as i32)
+                            })
+                        })
+                        .collect(),
+                    query: query.clone(),
+                },
+            );
 
-        let mut display = serde_json::to_string_pretty(&serde_json::json!({
-            "tree_id": snapshot.tree_id,
-            "root_available": snapshot.root_available,
-            "count": snapshot.elements.len(),
-            "truncated": snapshot.truncated,
-            "filtered_out": snapshot.filtered_out,
-            "visited": snapshot.visited,
-            "elapsed_ms": snapshot.elapsed_ms,
-            "capture": {
-                "target_width": capture.target_width,
-                "target_height": capture.target_height,
-            },
-            "elements": snapshot.elements,
-        }))
-        .unwrap_or_else(|_| format!("[list_elements window_id={window_id}]"));
+        let mut display = render_element_list(&snapshot, &capture, wants_json(input));
 
         if !snapshot.root_available {
             display.push_str(
@@ -428,39 +520,25 @@ impl AppComputerTool {
             return error_result(error);
         }
         match action_result {
-            Ok(content) => ToolResult::ok(content),
+            Ok(content) => self.with_after_screenshot(&current, content),
             Err(error) => error_result(error),
         }
     }
 
     fn click(&self, input: &Value) -> ToolResult {
+        let kind = click_kind_from(input);
         if has_element_ref(input) {
-            return self.element_mutation(input, "click", ElementAction::Press);
+            return self.element_mutation(
+                input,
+                "click",
+                ElementAction::Press,
+                Some(|target: &WindowTarget, x: f64, y: f64| {
+                    click_with_fallback(target, x, y, kind)
+                }),
+            );
         }
         self.coordinate_mutation(input, "click", |target, x, y| {
-            // AXPress → 光标瞬移点击，是**自动降级**而非二选一。
-            //
-            // 为什么不要求模型自己判断该走哪条：判断依据是「这个 App 的 AX 树
-            // 有没有元素」，那是**运行时事实**，模型看不见也猜不准。让模型先试
-            // AXPress、失败了再自己改用另一个 action，等于把一次必然失败的往返
-            // 写进每个 GUI 任务的必经之路。
-            //
-            // 实测（微信 v4.1.15，原生 AppKit 自绘）：窗口内 5×5 网格 hit-test
-            // 25/25 全部返回 kAXErrorNotImplemented，AX 路线对该应用**必然**
-            // 失败；而它恰恰是最常见的中文桌面应用之一。
-            match wyj_computer::accessibility::press(target.pid, x, y) {
-                Ok(()) => Ok("clicked with AXPress".to_string()),
-                Err(ax_error) => {
-                    let kind = click_kind_from(input);
-                    wyj_computer::cursor_click::execute(x, y, kind).map(|detail| {
-                        format!(
-                            "clicked via cursor warp: {detail}. \
-                             AXPress was tried first and failed ({ax_error}) because this app \
-                             exposes no accessibility element at these coordinates."
-                        )
-                    })
-                }
-            }
+            click_with_fallback(target, x, y, kind)
         })
     }
 
@@ -470,33 +548,17 @@ impl AppComputerTool {
             None => return ToolResult::err("missing required field `text`"),
         };
         if has_element_ref(input) {
-            return self.element_mutation(input, "set_text", ElementAction::SetText(text));
+            return self.element_mutation(
+                input,
+                "set_text",
+                ElementAction::SetText(text),
+                Some(|target: &WindowTarget, x: f64, y: f64| {
+                    type_text_with_fallback(target, x, y, text)
+                }),
+            );
         }
         self.coordinate_mutation(input, "set_text", |target, x, y| {
-            // AXValue 写入 → 定向 PID 按键，与 click 同构的自动降级。
-            //
-            // 微信这类自绘应用里，坐标处往往**根本没有** AX 元素（hit-test 直接
-            // 失败），所以不能只对「元素存在但不可写」降级——必须把「压根没有
-            // 元素」也纳入降级条件，否则文本输入会成为整条链路上唯一无法
-            // 绕过的断点（能点开却打不了字）。
-            match wyj_computer::accessibility::set_text(target.pid, x, y, text) {
-                Ok(attribute) => Ok(format!("set text using {attribute}")),
-                Err(ax_error) => {
-                    // 逐字符用定向按键发出去：post_to_pid 的键盘事件**确实能**
-                    // 送达后台 App 的焦点控件（实测阳性对照），这与鼠标事件的
-                    // 静默丢弃是两种不同结果——键盘不经过窗口服务器的命中测试。
-                    for character in text.chars() {
-                        wyj_computer::targeted_event::type_char(target.pid, character)?;
-                    }
-                    Ok(format!(
-                        "typed {} characters via target PID keystrokes at ({x}, {y}). \
-                         The accessibility write failed ({ax_error}) because this app exposes \
-                         no settable accessibility element there; the click that focused the \
-                         field must have succeeded first.",
-                        text.chars().count()
-                    ))
-                }
-            }
+            type_text_with_fallback(target, x, y, text)
         })
     }
 
@@ -516,19 +578,12 @@ impl AppComputerTool {
                 input,
                 "scroll",
                 ElementAction::Scroll { direction, amount },
+                Some(|target: &WindowTarget, _x: f64, _y: f64| {
+                    scroll_with_fallback(target, direction, amount)
+                }),
             );
         }
         self.coordinate_mutation(input, "scroll", |target, x, y| {
-            // AX 语义滚动 → 定向 PID 滚轮，是**两级串联的降级**而非硬依赖。
-            //
-            // 之前写成 `accessibility::scroll(...)?`：它在内部先做
-            // `element_at(pid,x,y)` 命中测试，微信这类自绘 AppKit 应用返回
-            // kAXErrorNotImplemented(-25208)，`?` 直接把整个调用短路掉，
-            // 后面的定向 PID 滚轮永远到不了——于是「不依赖 AX 的滚动能力
-            // 其实存在但不可达」。
-            //
-            // 降级必须处理「hit-test 本身就失败」这一档：它不是「元素不支持
-            // 该 AX action」（那是 `Ok(false)`），而是压根没找到元素。
             match wyj_computer::accessibility::scroll(target.pid, x, y, direction, amount) {
                 Ok(true) => Ok(format!(
                     "scrolled {direction} x{amount} using Accessibility"
@@ -541,6 +596,107 @@ impl AppComputerTool {
                     ))
                 }
             }
+        })
+    }
+
+    /// 从 `from` 拖到 `to`（截图坐标空间）。
+    ///
+    /// # 为什么不走元素寻址
+    ///
+    /// 拖拽天然是**两个点**之间的关系，而 `element_ref` 只指向一个元素。
+    /// 即使两端都用 ref 表达，AX 也没有跨元素的拖拽动作（`AXPress` 按下之后
+    /// 无法把「按住状态」转移到另一个元素上），所以最终还是落到坐标事件。
+    /// 因此这里只接受坐标，但**接受两端都带 ref 的可选参数**用于校验目标
+    /// 是否还在原位——那个校验由调用方在 `list_elements` 之后自行完成。
+    ///
+    /// # 安全边界比点击更严
+    ///
+    /// 拖拽能移动文件、改滑块、重排列表，破坏性远大于点错一次。因此：
+    /// 起点必须先过遮挡检测（起点落在别的窗口上时拖走的是别人的东西）、
+    /// 全程持有 `InputLease`、每一步校验前台 PID、鼠标键在**任何**退出路径
+    /// 上释放（`cursor_click::ButtonRelease`）。
+    fn drag(&self, input: &Value) -> ToolResult {
+        let target = match self.resolve_observation(input) {
+            Ok(target) => target,
+            Err(error) => return error_result(error),
+        };
+        let from = match required_coordinate(input, "from") {
+            Ok(coordinate) => coordinate,
+            Err(error) => return error_result(error),
+        };
+        let to = match required_coordinate(input, "to") {
+            Ok(coordinate) => coordinate,
+            Err(error) => return error_result(error),
+        };
+        let (from_x, from_y) = match target.screenshot_to_global(from.0, from.1) {
+            Ok(coordinate) => coordinate,
+            Err(error) => return error_result(error),
+        };
+        let (to_x, to_y) = match target.screenshot_to_global(to.0, to.1) {
+            Ok(coordinate) => coordinate,
+            Err(error) => return error_result(error),
+        };
+        let kind = click_kind_from(input);
+
+        let (lease, frontmost_before) = match self.begin_mutation(&target, "drag") {
+            Ok(guard) => guard,
+            Err(error) => return error_result(error),
+        };
+        // 起点遮挡检测与点击同源：HID 事件按 z-order 命中，窗口被盖住时
+        // 拖走的是盖住它的那个窗口里的东西。
+        if let Some(occluder) = wyj_computer::occlusion::occlusion_of(target.window_id)
+            .ok()
+            .flatten()
+        {
+            return error_result(anyhow!(
+                "requires_foreground_takeover: the target window is covered by another window \
+                 (id {}, pid {}) so a drag would grab content from that window instead. \
+                 Bring the target window to the front first",
+                occluder.window_id,
+                occluder.pid
+            ));
+        }
+        let action_result =
+            wyj_computer::cursor_click::execute_drag((from_x, from_y), (to_x, to_y), kind);
+        wyj_computer::telemetry::record_background_action();
+        if let Err(error) = self.finish_mutation(&target, "drag", &lease, frontmost_before) {
+            return error_result(error);
+        }
+        match action_result {
+            Ok(content) => self.with_after_screenshot(&target, content),
+            Err(error) => error_result(error),
+        }
+    }
+
+    /// 弹出元素或坐标处的上下文菜单（右键菜单）。
+    ///
+    /// # 为什么单独做一个 action
+    ///
+    /// `click` 带 `click_kind: right` 也能右键，但它走的是**坐标**路径
+    /// （光标瞬移 + HID 事件）。而 `AXShowMenu` 是语义动作：不移动光标、
+    /// 不依赖命中测试、被遮挡也照样生效。两条路各有适用面，不能互相替代
+    /// ——自绘应用（微信）没有 AX 元素，只能用坐标右键；而原生列表行用
+    /// `AXShowMenu` 更准（坐标右键可能因为行内嵌套控件而弹错层级的菜单）。
+    ///
+    /// # 菜单弹出后是独立窗口
+    ///
+    /// 上下文菜单不由 `app_computer` 的 `window_id` 覆盖。模型必须重新
+    /// `window_capture list` 找到那个菜单窗口，再用新 id 操作。这一点写在
+    /// 工具描述里，否则模型会以为「右键了但什么都没发生」。
+    fn show_menu(&self, input: &Value) -> ToolResult {
+        if has_element_ref(input) {
+            return self.element_mutation(
+                input,
+                "show_menu",
+                ElementAction::ShowMenu,
+                Some(|target: &WindowTarget, x: f64, y: f64| {
+                    click_with_fallback(target, x, y, wyj_computer::cursor_click::ClickKind::Right)
+                }),
+            );
+        }
+        let kind = wyj_computer::cursor_click::ClickKind::Right;
+        self.coordinate_mutation(input, "show_menu", |target, x, y| {
+            click_with_fallback(target, x, y, kind)
         })
     }
 
@@ -565,25 +721,32 @@ impl AppComputerTool {
         if let Err(error) = action_result {
             return error_result(error);
         }
-        ToolResult::ok(format!("sent key `{combo}` to pid {}", target.pid))
+        self.with_after_screenshot(&target, format!("sent key `{combo}` to pid {}", target.pid))
     }
 
-    /// 把 `element_ref` 解析成活的 AX 元素句柄，并强制校验 `tree_id`。
+    /// 校验 `element_ref` 属于最近一次 `list_elements`，并取出那次的观察记录。
     ///
     /// stale 契约（对齐 Anthropic `ref`）：`element_ref` 只在产生它的那一次
     /// `list_elements` 里有效。窗口变了（generation 不符）、模型传了旧的 /
     /// 凭空编的 `tree_id`、或该 ref 超出当时的元素数，一律报
     /// `target_changed` 并要求重新列举——**绝不按序号回到当前树里盲找**，
     /// 那会把动作打到模型从未见过的控件上。
-    fn resolve_element(&self, target: &WindowTarget, input: &Value) -> Result<ElementRef> {
+    ///
+    /// 返回的 [`ElementObservation`] 还要传给 `execute_with_element`：那里的
+    /// 指纹比对才真正挡住「树变了但序号还在范围内」这一档。
+    fn resolve_element(
+        &self,
+        target: &WindowTarget,
+        input: &Value,
+    ) -> Result<(ElementRef, ElementObservation)> {
         let reference = parse_element_ref(input)?;
         let tree_id = required_u64(input, "tree_id")?;
         let current = self
-            .element_tree_ids
+            .element_observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&target.window_id)
-            .copied();
+            .cloned();
         let current = current.ok_or_else(|| {
             anyhow!(
                 "target_changed: no element snapshot for window {}; call list_elements again",
@@ -593,10 +756,11 @@ impl AppComputerTool {
         // stale 契约的核心：ref 只能配合产生它的那次 tree_id 使用。
         // 对不上就要求重新列举，绝不按序号回到当前树里盲找元素。
         anyhow::ensure!(
-            current == tree_id,
-            "target_changed: tree_id {tree_id} is stale (the last list_elements returned {current}); call list_elements again"
+            current.tree_id == tree_id,
+            "target_changed: tree_id {tree_id} is stale (the last list_elements returned {}); call list_elements again",
+            current.tree_id
         );
-        Ok(reference)
+        Ok((reference, current))
     }
 
     /// 句柄寻址的变更动作统一入口。
@@ -604,18 +768,34 @@ impl AppComputerTool {
     /// 与坐标版本共用同一套安全闸门（`begin_mutation` 拿输入租约 +
     /// `finish_mutation` 校验前台未被抢走），这是本仓库最不该被绕过的一条
     /// 不变式：换一种寻址方式不等于换一种权限语义。
-    fn element_mutation(
+    ///
+    /// # 为什么带 `degrade`
+    ///
+    /// 元素在树里、几何也有，只是不支持对应的 AX 动作——自绘控件（微信）
+    /// 和只读文本框都会这样。坐标路径对同一情形早已自动降级（AXPress 失败
+    /// 就瞬移点击），元素路径却直接 `bail`，于是**换一种更精确的寻址方式
+    /// 反而变成更弱的能力**。模型被迫自己把 ref 换算回坐标再发一次，等于
+    /// 把一次必然成功的操作拆成两趟、还多给它一次算错的机会。
+    ///
+    /// 降级只在错误**确实是结构性的**时候发生（`requires_foreground_takeover`）。
+    /// `target_changed` / `preempted_by_user` / 权限缺失都**不降级**：那些是
+    /// 「你现在不该动手」，换个寻址方式并不能让它变安全。
+    fn element_mutation<F>(
         &self,
         input: &Value,
         action_name: &str,
         action: ElementAction<'_>,
-    ) -> ToolResult {
+        degrade: Option<F>,
+    ) -> ToolResult
+    where
+        F: FnOnce(&WindowTarget, f64, f64) -> Result<String>,
+    {
         let target = match self.resolve_observation(input) {
             Ok(target) => target,
             Err(error) => return error_result(error),
         };
-        let reference = match self.resolve_element(&target, input) {
-            Ok(reference) => reference,
+        let (reference, observation) = match self.resolve_element(&target, input) {
+            Ok(resolved) => resolved,
             Err(error) => return error_result(error),
         };
 
@@ -624,20 +804,53 @@ impl AppComputerTool {
             Err(error) => return error_result(error),
         };
         // 重新遍历并按序号定位：句柄绝不跨 crate 边界（AXUIElement 非 Send/Sync），
-        // 定位与使用都在 `wyj_computer` 内部一次完成。
+        // 定位与使用都在 `wyj_computer` 内部一次完成。指纹一并传进去，让
+        // 「树变了但序号还在范围内」在真正执行动作之前被拒掉。
         let action_result = wyj_computer::element::execute_with_element(
             &target,
             &TraversalBudget::default(),
             reference,
             action,
+            Some(observation.content_fingerprint),
+            // 必须复用当次 `list_elements` 的过滤条件：ref 序号是「过滤后
+            // 列表里的第 N 个」，用无过滤遍历会点到另一个元素。
+            Some(&observation.query),
         );
         wyj_computer::telemetry::record_background_action();
         if let Err(error) = self.finish_mutation(&target, action_name, &lease, frontmost_before) {
             return error_result(error);
         }
         match action_result {
-            Ok(content) => ToolResult::ok(content),
-            Err(error) => error_result(error),
+            Ok(content) => self.with_after_screenshot(&target, content),
+            Err(error) => {
+                let message = error.to_string();
+                let structural = message.contains("requires_foreground_takeover");
+                let (Some(degrade), true) = (degrade, structural) else {
+                    return error_result(error);
+                };
+                let Some((x, y)) = observation.center_of(reference) else {
+                    // 元素没有截图坐标（AX 不给几何）。降级无从谈起，把原始
+                    // 错误交回模型——它至少知道这个控件结构上点不动。
+                    return error_result(error);
+                };
+                let (global_x, global_y) = match target.screenshot_to_global(x, y) {
+                    Ok(coordinate) => coordinate,
+                    Err(error) => return error_result(error),
+                };
+                match degrade(&target, global_x, global_y) {
+                    Ok(content) => self.with_after_screenshot(
+                        &target,
+                        format!(
+                            "{content}\n\nThe element itself has no usable Accessibility action \
+                             ({message}); the action was performed at its centre ({x}, {y}) in the \
+                             screenshot coordinate space instead."
+                        ),
+                    ),
+                    Err(fallback_error) => error_result(anyhow!(
+                        "{fallback_error}\n\nThe element-level action also failed: {message}"
+                    )),
+                }
+            }
         }
     }
 
@@ -649,7 +862,7 @@ impl AppComputerTool {
             Ok(target) => target,
             Err(error) => return error_result(error),
         };
-        let (x, y) = match required_coordinate(input) {
+        let (x, y) = match required_coordinate(input, "coordinate") {
             Ok(coordinate) => coordinate,
             Err(error) => return error_result(error),
         };
@@ -667,13 +880,232 @@ impl AppComputerTool {
             return error_result(error);
         }
         match action_result {
-            Ok(content) => ToolResult::ok(content),
+            Ok(content) => self.with_after_screenshot(&target, content),
             Err(error) => error_result(error),
+        }
+    }
+
+    /// 变更动作成功后的统一收尾：按需附一张「动作之后」的窗口截图。
+    ///
+    /// 三条不变式：
+    ///
+    /// 1. **只在成功路径调用**。失败回执里塞一张截图会把错误信息挤到次要
+    ///    位置，而错误恰恰是模型最需要读的东西。
+    /// 2. **附图失败绝不改变工具结果**。截图可能因为窗口关闭、屏幕锁定、
+    ///    权限被撤而失败——那时回执仍然必须是「动作成功」这个事实，只是
+    ///    没有附图（与 `tools::spill` 落盘失败的处理同一条原则）。
+    /// 3. **连续动作上限是兜底而非补充**。`auto_screenshot` 关掉时也要在
+    ///    `MAX_ACTIONS_WITHOUT_SCREENSHOT` 处强制附一张，否则关掉开关就等于
+    ///    关掉了整条验证链。
+    fn with_after_screenshot(&self, target: &WindowTarget, content: String) -> ToolResult {
+        let count = {
+            let mut counts = self
+                .mutations_since_screenshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = counts.entry(target.window_id).or_insert(0);
+            *slot += 1;
+            *slot
+        };
+        let forced = count >= MAX_ACTIONS_WITHOUT_SCREENSHOT;
+        // 强制档用观察用的 `max_dim`：既然是被迫补看一次，就给足分辨率。
+        let max_dim = match (self.auto_screenshot, forced) {
+            (_, true) => Some(self.max_dim),
+            (Some(configured), false) => Some(configured),
+            (None, false) => None,
+        };
+        let Some(max_dim) = max_dim else {
+            return ToolResult::ok(content);
+        };
+
+        let mut display = content;
+        match wyj_computer::target::capture_window_by_id(target.window_id, max_dim) {
+            Ok((_, capture)) => {
+                self.mutations_since_screenshot
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(target.window_id, 0);
+                if forced {
+                    display.push_str(&format!(
+                        "\n\nThis is mutation #{MAX_ACTIONS_WITHOUT_SCREENSHOT} since the last \
+                         screenshot; the attached capture is what the window looks like now. \
+                         Verify the task state before continuing."
+                    ));
+                }
+                ToolResult::with_parts(
+                    display,
+                    vec![ToolResultPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: capture.png_base64(),
+                    }],
+                )
+            }
+            Err(error) => {
+                // 截图失败不改变结果语义，只在文本里说明一句。
+                display.push_str(&format!(
+                    "\n\n[the action succeeded but the follow-up screenshot failed: {error}]"
+                ));
+                ToolResult::ok(display)
+            }
         }
     }
 }
 
-const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids, then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` and `scroll` degrade the same way. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus. `key` and unsupported semantic scrolling are posted only to the target PID. On `target_changed`, capture again. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying.";
+/// 在全局坐标处点击：先试 AXPress，失败才降级到光标瞬移。
+///
+/// # 为什么是自动降级而不是让模型二选一
+///
+/// 判断依据是「这个 App 的 AX 树在这一点上有没有元素」，那是**运行时事实**，
+/// 模型看不见也猜不准。让模型先试 AXPress、失败了再自己改用另一种 action，
+/// 等于把一次必然失败的往返写进每个 GUI 任务的必经之路。
+///
+/// 实测（微信 v4.1.15，原生 AppKit 自绘）：窗口内 5×5 网格 hit-test 25/25
+/// 全部返回 `kAXErrorNotImplemented`，AX 路线对该应用**必然**失败；而它恰恰
+/// 是最常见的中文桌面应用之一。
+///
+/// 坐标点击与元素寻址共用本函数，这样「元素路径降级」与「坐标路径降级」
+/// 走的是同一段逻辑，不会各自演化出不同的安全边界。
+fn click_with_fallback(
+    target: &WindowTarget,
+    x: f64,
+    y: f64,
+    kind: wyj_computer::cursor_click::ClickKind,
+) -> Result<String> {
+    match wyj_computer::accessibility::press(target.pid, x, y) {
+        Ok(()) => Ok("clicked with AXPress".to_string()),
+        Err(ax_error) => {
+            // 降级到光标瞬移前必须确认目标窗口没被遮挡。
+            //
+            // 两条路径的「命中」机制完全不同：截图是窗口级快照（被盖住也照样
+            // 能截到自己的内容），而光标瞬移发出的是 HID 事件，由窗口服务器
+            // 按 z-order 分发。窗口被盖住时，模型看到的是目标窗口、点中的是
+            // 上面那个窗口——最典型的触发是「另存为」sheet。这种错配比直接
+            // 报错糟糕得多：模型会以为点了没反应，然后反复重试同一个坐标。
+            //
+            // 注意只在**降级点**检查，不能提到 `begin_mutation` 里当通用前置：
+            // AXPress 按元素寻址、不经窗口服务器命中测试，被遮挡也照样生效。
+            if let Some(occluder) = wyj_computer::occlusion::occlusion_of(target.window_id)? {
+                return Err(anyhow!(
+                    "requires_foreground_takeover: the target window is covered by another \
+                     window (id {}, pid {}) so a coordinate click would hit that window instead; \
+                     AXPress failed ({ax_error}). Bring the target window to the front or act on \
+                     the covering window instead",
+                    occluder.window_id,
+                    occluder.pid
+                ));
+            }
+            wyj_computer::cursor_click::execute(x, y, kind).map(|detail| {
+                format!(
+                    "clicked via cursor warp: {detail}. \
+                     AXPress was tried first and failed ({ax_error}) because this app \
+                     exposes no accessibility element at these coordinates."
+                )
+            })
+        }
+    }
+}
+
+/// 在全局坐标处写入文本：AXValue → 剪贴板粘贴 → 定向 PID 逐字符按键。
+///
+/// # 三级降级的顺序是有理由的
+///
+/// 1. **AXValue / AXSelectedText**：最干净——不碰剪贴板、不碰键盘、不依赖
+///    焦点。可写的原生控件（`AXTextField`、`AXTextArea`）走这条。
+/// 2. **剪贴板 + `cmd+V`**：覆盖**所有**文字（中文、日文、emoji），代价是
+///    短暂借用用户的剪贴板。自绘应用（微信）和任何不暴露可写 AX 属性的
+///    控件都靠这条。
+/// 3. **逐字符定向按键**：只在**全 ASCII** 时可用，作为剪贴板失败的兜底。
+///    它比粘贴更「轻」（不动剪贴板），但对非 ASCII 必然失败。
+///
+/// 顺序不能反：把逐字符放前面会让每个中文输入都先失败一次再降级，白白多付
+/// 一趟；把剪贴板放第一则会为本来能 AX 写入的普通控件无谓地动用户的剪贴板。
+fn type_text_with_fallback(target: &WindowTarget, x: f64, y: f64, text: &str) -> Result<String> {
+    // 第 1 档：AX 写入。
+    match wyj_computer::accessibility::set_text(target.pid, x, y, text) {
+        Ok(attribute) => Ok(format!("set text using {attribute}")),
+        // 第 2 档：剪贴板粘贴。AX 失败是常态（自绘应用在目标点不做
+        // hit-test），所以这一档才是主路径，不是兜底。
+        Err(ax_error) => match paste_via_clipboard(target.pid, text) {
+            Ok(detail) => Ok(format!(
+                "{detail} The accessibility write failed ({ax_error}) because this app \
+                 exposes no settable accessibility element there; the click that focused \
+                 the field must have succeeded first."
+            )),
+            // 第 3 档：逐字符。只在全 ASCII 时可能成功；非 ASCII 会在这里
+            // 拿到一个明确的错误，而不是静默丢字。
+            Err(clipboard_error) => {
+                for character in text.chars() {
+                    wyj_computer::targeted_event::type_char(target.pid, character).map_err(
+                        |typing_error| {
+                            anyhow!(
+                                "{typing_error}\n\nBoth earlier attempts failed: \
+                                 accessibility write ({ax_error}), clipboard paste \
+                                 ({clipboard_error})."
+                            )
+                        },
+                    )?;
+                }
+                Ok(format!(
+                    "typed {} characters via target PID keystrokes at ({x}, {y}). \
+                     The accessibility write failed ({ax_error}) and clipboard paste failed \
+                     ({clipboard_error}); the click that focused the field must have \
+                     succeeded first.",
+                    text.chars().count()
+                ))
+            }
+        },
+    }
+}
+
+/// 把 `text` 写进剪贴板并向目标 PID 发 `cmd+V`，随后无条件恢复原剪贴板。
+///
+/// 恢复失败**不影响返回值**：粘贴已经发生，回执必须是「成功」；剪贴板没还原
+/// 是另一个问题，只在文本里说明一句（与 `tools::spill` 落盘失败同一条原则）。
+fn paste_via_clipboard(pid: u32, text: &str) -> Result<String> {
+    let guard = wyj_computer::clipboard::ClipboardGuard::write(text)
+        .map_err(|error| anyhow!("could not prepare the system clipboard: {error}"))?;
+    let restorable = guard.is_restorable();
+    wyj_computer::targeted_event::paste(pid)
+        .map_err(|error| anyhow!("could not send cmd+V to the target process: {error}"))?;
+    let restore_error = guard.restore_now().err();
+    Ok(match (restorable, restore_error) {
+        (true, None) => format!(
+            "pasted {} characters from the clipboard",
+            text.chars().count()
+        ),
+        (true, Some(error)) => format!(
+            "pasted {} characters from the clipboard (the previous clipboard content could not \
+             be restored: {error})",
+            text.chars().count()
+        ),
+        // 原本剪贴板里没有文本（图片/文件）：我们无从还原它的原始类型，
+        // 必须让模型知道用户丢了什么东西。
+        (false, _) => format!(
+            "pasted {} characters from the clipboard. The clipboard previously held no text \
+             (it may have contained an image or files, which could not be restored)",
+            text.chars().count()
+        ),
+    })
+}
+
+/// 语义滚动：先试 AX increment/decrement，失败才降级到定向 PID 滚轮。
+///
+/// 之前写成 `accessibility::scroll(...)?`：它在内部先做 `element_at(pid,x,y)`
+/// 命中测试，微信这类自绘 AppKit 应用返回 `kAXErrorNotImplemented(-25208)`，
+/// `?` 直接把整个调用短路掉，后面的定向 PID 滚轮永远到不了——于是「不依赖
+/// AX 的滚动能力其实存在但不可达」。
+///
+/// 降级必须覆盖「hit-test 本身就失败」这一档：它不是「元素不支持该 AX
+/// action」（那是 `Ok(false)`），而是压根没找到元素。
+fn scroll_with_fallback(target: &WindowTarget, direction: &str, amount: u32) -> Result<String> {
+    wyj_computer::targeted_event::scroll(target.pid, direction, amount)?;
+    Ok(format!(
+        "scrolled {direction} x{amount} using target PID event \
+         (the element itself exposes no AX scroll action)"
+    ))
+}
+
+const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying.";
 
 #[async_trait]
 impl Tool for AppComputerTool {
@@ -690,7 +1122,7 @@ impl Tool for AppComputerTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list_windows", "screenshot", "list_elements", "list_menus", "inspect_element", "click", "set_text", "press_menu", "key", "scroll"]
+                        "enum": ["list_windows", "screenshot", "list_elements", "list_menus", "inspect_element", "wait", "click", "drag", "show_menu", "set_text", "press_menu", "key", "scroll"]
                     },
                     "window_id": {"type": "integer", "minimum": 0},
                     "generation": {"type": "integer", "minimum": 0},
@@ -717,13 +1149,55 @@ impl Tool for AppComputerTool {
                         "minItems": 2,
                         "maxItems": 2
                     },
+                    "from": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "Drag start point in screenshot coordinates. Requires `to`."
+                    },
+                    "to": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "Drag end point in screenshot coordinates. Requires `from`."
+                    },
                     "text": {"type": "string"},
                     "key": {"type": "string"},
                     "scroll_direction": {
                         "type": "string",
                         "enum": ["up", "down", "left", "right"]
                     },
-                    "scroll_amount": {"type": "integer", "minimum": 1, "maximum": 20}
+                    "scroll_amount": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "format": {
+                        "type": "string",
+                        "enum": ["compact", "json"],
+                        "description": "Output format for `list_elements`. Defaults to `compact` (one aligned line per element, ~10x fewer tokens). Use `json` only when you need every field verbatim for debugging."
+                    },
+                    "region": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 4,
+                        "maxItems": 4,
+                        "description": "For `list_elements`: keep only elements intersecting this rectangle [x0, y0, x1, y1] in screenshot coordinates. Use it when the full list is truncated or too long."
+                    },
+                    "role_filter": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "For `list_elements`: keep only these roles (case-insensitive, `AX` prefix optional, substring match — e.g. \"button\" matches AXButton and AXToolbarButton)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "For `list_elements`: return at most this many elements. When the list is cut, the result reports has_more=true."
+                    },
+                    "ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3000,
+                        "description": "How long `wait` should pause, in milliseconds (max 3000). Use it after an action that starts an animation or a load, then screenshot to see the settled state."
+                    }
                 },
                 "required": ["action"]
             }),
@@ -735,7 +1209,12 @@ impl Tool for AppComputerTool {
         !matches!(
             input.get("action").and_then(Value::as_str),
             Some(
-                "list_windows" | "screenshot" | "list_elements" | "list_menus" | "inspect_element"
+                "list_windows"
+                    | "screenshot"
+                    | "list_elements"
+                    | "list_menus"
+                    | "inspect_element"
+                    | "wait"
             )
         )
     }
@@ -787,6 +1266,11 @@ impl Tool for AppComputerTool {
                 parts.push(format!("at ({x}, {y})"));
             }
         }
+        // 拖拽的两端都要进摘要：auto 分类器只看这段文本，「drag」一个词
+        // 完全看不出是把什么东西从哪儿拖到哪儿。
+        if let Some(path) = describe_drag_path(input) {
+            parts.push(path);
+        }
         format!(
             "{} (background, does not move the pointer permanently)",
             parts.join(" ")
@@ -813,8 +1297,22 @@ impl Tool for AppComputerTool {
             "inspect_element" => self.inspect(&input),
             "list_elements" => self.list_elements(&input),
             "list_menus" => self.list_menus(&input),
+            "wait" => {
+                let ms = input
+                    .get("ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(500)
+                    .clamp(1, MAX_WAIT_MS);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                ToolResult::ok(format!(
+                    "waited {ms}ms. Take a screenshot now to see the settled state; \
+                     do not assume the previous screenshot is still current."
+                ))
+            }
             "press_menu" => self.press_menu(&input),
             "click" => self.click(&input),
+            "drag" => self.drag(&input),
+            "show_menu" => self.show_menu(&input),
             "set_text" => self.set_text(&input),
             "key" => self.key(&input),
             "scroll" => self.scroll(&input),
@@ -910,24 +1408,270 @@ fn parse_menu_path(input: &Value) -> Result<Vec<wyj_computer::menu::MenuRef>> {
         .collect()
 }
 
-fn required_coordinate(input: &Value) -> Result<(i32, i32)> {
+/// 解析一个 `[x, y]` 坐标字段。
+///
+/// `field` 是字段名：`click`/`scroll` 用 `coordinate`，`drag` 用 `from`/`to`。
+/// 错误消息必须带上真实字段名——模型收到「missing `coordinate`」而它明明
+/// 传了 `from`，只会让它重新猜一遍参数而不是改正。
+fn required_coordinate(input: &Value, field: &str) -> Result<(i32, i32)> {
     let coordinate = input
-        .get("coordinate")
+        .get(field)
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("missing required field `coordinate`"))?;
+        .ok_or_else(|| anyhow!("missing required field `{field}`"))?;
     anyhow::ensure!(
         coordinate.len() == 2,
-        "`coordinate` must contain exactly 2 integers"
+        "`{field}` must contain exactly 2 integers"
     );
     let x = coordinate[0]
         .as_i64()
         .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| anyhow!("invalid coordinate x"))?;
+        .ok_or_else(|| anyhow!("invalid `{field}` x"))?;
     let y = coordinate[1]
         .as_i64()
         .and_then(|value| i32::try_from(value).ok())
-        .ok_or_else(|| anyhow!("invalid coordinate y"))?;
+        .ok_or_else(|| anyhow!("invalid `{field}` y"))?;
     Ok((x, y))
+}
+
+/// `list_elements` 是否要求原始 JSON（调试用）。
+///
+/// 默认走紧凑行文本：pretty JSON 对 100 个元素是 ~80KB，而同样的信息用
+/// 对齐行只要 ~6KB。模型读两种格式的准确率没有差别，但 token 差 10 倍，
+/// 而 `list_elements` 是 GUI 任务的**每一步**都会调的工具。
+fn wants_json(input: &Value) -> bool {
+    input
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| format.eq_ignore_ascii_case("json"))
+}
+
+/// 把一次元素快照渲染成给模型看的文本。
+///
+/// 两种格式：
+///
+/// - **紧凑行**（默认）：表头一行给出 `tree_id` / 尺寸 / 统计，随后每个元素
+///   一行，字段定宽对齐，空字段直接省略。模型要的是「哪个 ref 是什么控件、
+///   在哪儿、能不能点」，多余的 `"value": null` 只是在烧 token。
+/// - **pretty JSON**（`"format":"json"`）：完整字段，供排障时肉眼比对。
+///
+/// 提取成自由函数是为了能脱离真机单测——这个函数决定了模型**看得见什么**，
+/// 漏掉 `tree_id` 会让所有后续动作失败，漏掉 `frame_in_screenshot` 会让
+/// 坐标降级无从下手。
+fn render_element_list(
+    snapshot: &wyj_computer::element::ElementSnapshot,
+    capture: &wyj_computer::Capture,
+    as_json: bool,
+) -> String {
+    if as_json {
+        return serde_json::to_string_pretty(&serde_json::json!({
+            "tree_id": snapshot.tree_id,
+            "content_fingerprint": snapshot.content_fingerprint,
+            "root_available": snapshot.root_available,
+            "count": snapshot.elements.len(),
+            "truncated": snapshot.truncated,
+            "has_more": snapshot.has_more,
+            "filtered_out": snapshot.filtered_out,
+            "visited": snapshot.visited,
+            "elapsed_ms": snapshot.elapsed_ms,
+            "capture": {
+                "target_width": capture.target_width,
+                "target_height": capture.target_height,
+            },
+            "elements": snapshot.elements,
+        }))
+        .unwrap_or_else(|_| format!("[list_elements window_id={}]", snapshot.window_id));
+    }
+
+    let mut out = format!(
+        "tree_id={} window={} capture={}x{} elements={} visited={} filtered_out={} elapsed={}ms\n",
+        snapshot.tree_id,
+        snapshot.window_id,
+        capture.target_width,
+        capture.target_height,
+        snapshot.elements.len(),
+        snapshot.visited,
+        snapshot.filtered_out,
+        snapshot.elapsed_ms,
+    );
+    if snapshot.truncated {
+        out.push_str("truncated=true (the traversal budget was hit; some elements are missing)\n");
+    }
+    if snapshot.has_more {
+        out.push_str(
+            "has_more=true (the `limit` cut the list short; raise it or narrow with `region`)\n",
+        );
+    }
+    out.push_str("ref  role                @centre      size      text / state\n");
+    for element in &snapshot.elements {
+        out.push_str(&format_element_line(element));
+        out.push('\n');
+    }
+    out
+}
+
+/// 单个元素的紧凑行。
+///
+/// 列：`ref` / `role`（去掉 `AX` 前缀）/ 截图坐标中心 / 尺寸 / 文本与状态。
+///
+/// 中心点而不是左上角：模型要的是「点哪儿」，不是「矩形从哪儿开始」。
+/// 尺寸保留是因为「按钮只有 4x4」与「按钮 200x40」对模型是两种不同的东西。
+fn format_element_line(element: &wyj_computer::element::ElementInfo) -> String {
+    // 去掉 `AX` 前缀：`AXButton` → `Button`。前缀是 macOS 的实现细节，
+    // 每个元素都重复它纯属浪费列宽。
+    let raw_role = element.role.as_deref().unwrap_or("-");
+    let role = raw_role.strip_prefix("AX").unwrap_or(raw_role);
+    let (centre, size) = match element.frame_in_screenshot {
+        Some(frame) => {
+            let (x, y) = frame.center();
+            (
+                format!("({:.0},{:.0})", x, y),
+                format!("{:.0}x{:.0}", frame.width, frame.height),
+            )
+        }
+        // 没有截图坐标的元素仍然要列出来：它能被 element_ref 操作，只是
+        // 不能降级到坐标。
+        None => ("-".to_string(), "-".to_string()),
+    };
+
+    let mut text = String::new();
+    // 优先 title，退回 description，再退回 value——同一个控件在不同 App 里
+    // 只有一个字段有内容，三个都打会重复。
+    let label = element
+        .title
+        .as_deref()
+        .or(element.description.as_deref())
+        .or(element.value.as_deref());
+    if let Some(label) = label {
+        text.push_str(&format!("{:?}", crate::textutil::truncate_str(label, 60)));
+    }
+    let mut states: Vec<&str> = Vec::new();
+    if element.focused == Some(true) {
+        states.push("focused");
+    }
+    if element.selected == Some(true) {
+        states.push("selected");
+    }
+    if element.enabled == Some(false) {
+        states.push("disabled");
+    }
+    if element.value_settable || element.selected_text_settable {
+        states.push("settable");
+    }
+    if !element.actions.iter().any(|action| action == "AXPress") {
+        // 明确标出「不能按」：模型据此决定要不要退回坐标。
+        states.push("no-press");
+    }
+    if !states.is_empty() {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push('[');
+        text.push_str(&states.join(","));
+        text.push(']');
+    }
+
+    format!(
+        "{:<4} {:<19} {:<12} {:<9} {}",
+        element.reference.to_string(),
+        crate::textutil::truncate_str(role, 19),
+        centre,
+        size,
+        text
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// 解析 `list_elements` 的收窄参数。
+///
+/// 三个参数都是可选的；任何一个格式不对都**显式报错**而不是静默忽略——
+/// 静默忽略会让模型以为「只看了这个区域」，实际拿到的是全窗口列表，
+/// 它据此下的判断全部偏掉。
+fn parse_element_query(input: &Value) -> Result<wyj_computer::element::ElementQuery> {
+    let region = match input.get("region").and_then(Value::as_array) {
+        Some(rect) => {
+            anyhow::ensure!(
+                rect.len() == 4,
+                "`region` must be [x0, y0, x1, y1] in screenshot coordinates"
+            );
+            let number = |index: usize, name: &str| -> Result<f64> {
+                rect[index]
+                    .as_f64()
+                    .ok_or_else(|| anyhow!("invalid `region` {name}"))
+            };
+            let (x0, y0, x1, y1) = (
+                number(0, "x0")?,
+                number(1, "y0")?,
+                number(2, "x1")?,
+                number(3, "y1")?,
+            );
+            anyhow::ensure!(x1 > x0 && y1 > y0, "`region` must have x1 > x0 and y1 > y0");
+            Some(wyj_computer::element::Frame {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            })
+        }
+        None => None,
+    };
+
+    let role_filter = match input.get("role_filter") {
+        Some(value) => {
+            let list = value
+                .as_array()
+                .ok_or_else(|| anyhow!("`role_filter` must be an array of role names"))?;
+            let mut roles = Vec::with_capacity(list.len());
+            for item in list {
+                let role = item
+                    .as_str()
+                    .ok_or_else(|| anyhow!("`role_filter` entries must be strings"))?;
+                anyhow::ensure!(
+                    !role.trim().is_empty(),
+                    "`role_filter` entries must not be empty"
+                );
+                roles.push(role.to_string());
+            }
+            // 空数组等同于「不返回任何元素」，对模型永远是错误意图——
+            // 当成没传更安全。
+            if roles.is_empty() {
+                None
+            } else {
+                Some(roles)
+            }
+        }
+        None => None,
+    };
+
+    let limit = match input.get("limit").and_then(Value::as_u64) {
+        Some(limit) => {
+            anyhow::ensure!(limit > 0, "`limit` must be at least 1");
+            Some(limit as usize)
+        }
+        None => None,
+    };
+
+    Ok(wyj_computer::element::ElementQuery {
+        region,
+        role_filter,
+        limit,
+    })
+}
+
+/// 把 `from`/`to` 渲染成权限摘要里的一段文字。两端缺一就返回 `None`。
+fn describe_drag_path(input: &Value) -> Option<String> {
+    let pair = |field: &str| {
+        let array = input.get(field).and_then(Value::as_array)?;
+        Some((
+            array.first().and_then(Value::as_i64)?,
+            array.get(1).and_then(Value::as_i64)?,
+        ))
+    };
+    let (from, to) = (pair("from")?, pair("to")?);
+    Some(format!(
+        "dragging from ({}, {}) to ({}, {})",
+        from.0, from.1, to.0, to.1
+    ))
 }
 
 fn error_result(error: impl std::fmt::Display) -> ToolResult {
@@ -961,6 +1705,67 @@ fn error_result(error: impl std::fmt::Display) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyj_computer::element::{ElementInfo, ElementSnapshot, Frame};
+
+    /// 构造一个带几何的按钮，供渲染测试使用。
+    fn element(reference: u32, role: &str, title: Option<&str>, with_press: bool) -> ElementInfo {
+        ElementInfo {
+            reference: ElementRef(reference),
+            depth: 1,
+            role: Some(role.to_string()),
+            title: title.map(str::to_string),
+            description: None,
+            value: None,
+            enabled: Some(true),
+            focused: None,
+            selected: None,
+            actions: if with_press {
+                vec!["AXPress".to_string()]
+            } else {
+                Vec::new()
+            },
+            value_settable: false,
+            selected_text_settable: false,
+            frame: Some(Frame {
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 40.0,
+            }),
+            frame_in_screenshot: Some(Frame {
+                x: 10.0,
+                y: 20.0,
+                width: 40.0,
+                height: 40.0,
+            }),
+        }
+    }
+
+    fn snapshot_with(elements: Vec<ElementInfo>) -> ElementSnapshot {
+        ElementSnapshot {
+            window_id: 7,
+            generation: 3,
+            tree_id: 42,
+            content_fingerprint: 99,
+            elements,
+            truncated: false,
+            filtered_out: 0,
+            visited: 1,
+            root_available: true,
+            elapsed_ms: 1,
+            has_more: false,
+        }
+    }
+
+    fn capture() -> wyj_computer::Capture {
+        wyj_computer::Capture {
+            physical_width: 1600,
+            physical_height: 1200,
+            target_width: 800,
+            target_height: 600,
+            png: Vec::new(),
+        }
+    }
 
     #[test]
     fn definition_is_custom_and_explains_its_fallback() {
@@ -1003,7 +1808,290 @@ mod tests {
         assert!(!tool.needs_permission(&serde_json::json!({"action": "screenshot"})));
         // 列举元素只读 AX 树，不动输入，必须与截图同属免权限档。
         assert!(!tool.needs_permission(&serde_json::json!({"action": "list_elements"})));
+        // `wait` 只是睡眠，没有任何输入副作用。
+        assert!(!tool.needs_permission(&serde_json::json!({"action": "wait", "ms": 500})));
         assert!(tool.needs_permission(&serde_json::json!({"action": "click"})));
+    }
+
+    /// `wait` 必须出现在 schema 里并带 `ms` 字段——模型看不见的 action 等于
+    /// 不存在，它会继续在动画中途截图然后误判界面状态。
+    #[test]
+    fn definition_exposes_the_wait_action() {
+        let definition = AppComputerTool::new(1280, Duration::from_secs(2)).definition();
+        let actions = definition.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|a| a == "wait"));
+        assert!(definition.input_schema["properties"].get("ms").is_some());
+        // 描述必须告诉模型「动作成功会附截图」与「先 wait 再截图」，
+        // 否则它仍然会凭旧截图推断结果。
+        assert!(definition.description.contains("fresh screenshot"));
+        assert!(definition.description.contains("`wait`"));
+        // 跨窗口重发现：对话框是独立窗口，不在旧窗口的截图里。
+        assert!(definition.description.contains("window_capture"));
+    }
+
+    /// 描述必须写明剪贴板通道存在且会借用剪贴板——模型要能预判「打了这句话
+    /// 会发生什么」，用户也要能理解为什么剪贴板会短暂变化。
+    #[test]
+    fn the_description_states_the_clipboard_channel_and_its_cost() {
+        let definition = AppComputerTool::new(1280, Duration::from_secs(2)).definition();
+        assert!(
+            definition.description.contains("clipboard paste"),
+            "描述必须说明存在剪贴板粘贴通道"
+        );
+        assert!(
+            definition.description.contains("Chinese"),
+            "必须说明这条通道覆盖非拉丁文字——这正是它存在的理由"
+        );
+        assert!(
+            definition.description.contains("restored afterwards"),
+            "必须说明剪贴板会被恢复，否则用户无法判断代价"
+        );
+    }
+
+    /// 拖拽是**副作用最强的动作**（能移动文件、改滑块），必须与 click 同权限档，
+    /// 且 schema 里要暴露 `from`/`to`——模型看不见的参数等于不存在。
+    #[test]
+    fn drag_is_exposed_and_requires_permission() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let definition = tool.definition();
+        let actions = definition.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|a| a == "drag"));
+        assert!(definition.input_schema["properties"].get("from").is_some());
+        assert!(definition.input_schema["properties"].get("to").is_some());
+        assert!(tool.needs_permission(&serde_json::json!({
+            "action": "drag",
+            "from": [10, 20],
+            "to": [30, 40],
+        })));
+        // 描述必须说明插值存在——模型要知道这不是「按下+抬起」两下。
+        assert!(definition.description.contains("interpolated steps"));
+    }
+
+    /// 权限摘要必须带上拖拽两端：auto 分类器只看这段文字，一个「drag」
+    /// 完全看不出是把什么东西从哪儿拖到哪儿。
+    #[test]
+    fn action_summary_shows_both_drag_endpoints() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let summary = tool.action_summary(&serde_json::json!({
+            "action": "drag",
+            "window_id": 5,
+            "from": [10, 20],
+            "to": [300, 400],
+        }));
+        assert!(summary.contains("dragging from (10, 20)"), "{summary}");
+        assert!(summary.contains("to (300, 400)"), "{summary}");
+        // 只给一端时不该渲染出半句。
+        let partial = tool.action_summary(&serde_json::json!({
+            "action": "drag",
+            "window_id": 5,
+            "from": [10, 20],
+        }));
+        assert!(!partial.contains("dragging from"), "{partial}");
+    }
+
+    /// `required_coordinate` 的错误消息必须带真实字段名：模型收到
+    /// 「missing `coordinate`」而它明明传了 `from`，只会重新猜参数。
+    #[test]
+    fn coordinate_errors_name_the_actual_field() {
+        let error = required_coordinate(&serde_json::json!({}), "from")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`from`"), "{error}");
+        let error = required_coordinate(&serde_json::json!({"to": [1]}), "to")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`to`"), "{error}");
+        assert!(error.contains("exactly 2 integers"), "{error}");
+    }
+
+    /// 紧凑格式必须**保住 tree_id**：漏掉它，模型后续每一个动作都会
+    /// `target_changed`，整条 GUI 任务直接卡死。
+    #[test]
+    fn compact_rendering_keeps_the_tree_id_and_geometry() {
+        let snapshot = snapshot_with(vec![element(0, "AXButton", Some("Save"), true)]);
+        let text = render_element_list(&snapshot, &capture(), false);
+        assert!(text.contains("tree_id=42"), "{text}");
+        assert!(text.contains("window=7"), "{text}");
+        assert!(text.contains("capture=800x600"), "{text}");
+        // 元素行：ref / role（去掉 AX 前缀）/ 中心点 / 尺寸 / 标题。
+        assert!(text.contains("e0"), "{text}");
+        assert!(text.contains("Button"), "{text}");
+        assert!(!text.contains("AXButton"), "role 前缀应被去掉：{text}");
+        assert!(text.contains("(30,40)"), "应给出中心点而不是左上角：{text}");
+        assert!(text.contains("\"Save\""), "{text}");
+    }
+
+    /// 紧凑格式必须比 pretty JSON 小一个量级——这是这次改动的全部目的。
+    #[test]
+    fn compact_rendering_is_far_smaller_than_json() {
+        let elements: Vec<_> = (0..40)
+            .map(|index| element(index, "AXButton", Some("Some Button Label"), true))
+            .collect();
+        let snapshot = snapshot_with(elements);
+        let compact = render_element_list(&snapshot, &capture(), false);
+        let json = render_element_list(&snapshot, &capture(), true);
+        assert!(
+            compact.len() * 4 < json.len(),
+            "紧凑格式应至少小 4 倍：compact={} json={}",
+            compact.len(),
+            json.len()
+        );
+    }
+
+    /// `format: json` 仍然给出完整字段（排障用）。
+    #[test]
+    fn json_rendering_keeps_every_field() {
+        let snapshot = snapshot_with(vec![element(0, "AXButton", Some("Save"), true)]);
+        let text = render_element_list(&snapshot, &capture(), true);
+        assert!(text.contains("\"tree_id\": 42"), "{text}");
+        assert!(text.contains("\"content_fingerprint\""), "{text}");
+        assert!(text.contains("\"frame_in_screenshot\""), "{text}");
+        assert!(text.contains("\"AXButton\""), "{text}");
+    }
+
+    /// `no-press` 标记必须出现：它直接决定模型该不该退回坐标路线。
+    #[test]
+    fn an_element_without_axpress_is_flagged() {
+        let mut with_press = element(0, "AXButton", Some("Save"), true);
+        with_press.actions = vec!["AXPress".into()];
+        let mut without_press = element(1, "AXStaticText", Some("Label"), true);
+        without_press.actions = Vec::new();
+        let snapshot = snapshot_with(vec![with_press, without_press]);
+        let text = render_element_list(&snapshot, &capture(), false);
+        let lines: Vec<&str> = text.lines().collect();
+        let press_line = lines.iter().find(|line| line.starts_with("e0")).unwrap();
+        let no_press_line = lines.iter().find(|line| line.starts_with("e1")).unwrap();
+        assert!(!press_line.contains("no-press"), "{press_line}");
+        assert!(no_press_line.contains("no-press"), "{no_press_line}");
+    }
+
+    /// 没有截图坐标的元素仍要列出（它能被 ref 操作），只是坐标列显示 `-`。
+    #[test]
+    fn an_element_without_geometry_is_still_listed() {
+        let mut item = element(0, "AXButton", Some("Save"), true);
+        item.frame_in_screenshot = None;
+        let snapshot = snapshot_with(vec![item]);
+        let text = render_element_list(&snapshot, &capture(), false);
+        let line = text.lines().find(|line| line.starts_with("e0")).unwrap();
+        assert!(line.contains("-"), "{line}");
+        assert!(line.contains("\"Save\""), "{line}");
+    }
+
+    #[test]
+    fn format_flag_only_accepts_json_explicitly() {
+        assert!(!wants_json(&serde_json::json!({})));
+        assert!(!wants_json(&serde_json::json!({"format": "compact"})));
+        assert!(wants_json(&serde_json::json!({"format": "json"})));
+        assert!(wants_json(&serde_json::json!({"format": "JSON"})));
+    }
+
+    /// 收窄参数必须是**全有或全无**：给了就按它过滤，格式不对就报错。
+    /// 静默忽略最糟——模型以为只看了某区域，实际拿到全窗口列表。
+    #[test]
+    fn element_query_parsing_accepts_the_documented_shapes() {
+        let query = parse_element_query(&serde_json::json!({
+            "region": [10, 20, 300, 400],
+            "role_filter": ["Button", "TextField"],
+            "limit": 50,
+        }))
+        .unwrap();
+        let region = query.region.expect("region");
+        assert_eq!(
+            (region.x, region.y, region.width, region.height),
+            (10.0, 20.0, 290.0, 380.0)
+        );
+        assert_eq!(query.role_filter.as_ref().unwrap().len(), 2);
+        assert_eq!(query.limit, Some(50));
+
+        // 全都不给 = 不过滤。
+        let query = parse_element_query(&serde_json::json!({})).unwrap();
+        assert!(query.region.is_none());
+        assert!(query.role_filter.is_none());
+        assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn element_query_parsing_rejects_malformed_input() {
+        // 区域必须是 4 个数且 x1>x0 / y1>y0。
+        for bad in [
+            serde_json::json!({"region": [1, 2, 3]}),
+            serde_json::json!({"region": [100, 20, 10, 400]}),
+            serde_json::json!({"region": ["a", 2, 3, 4]}),
+        ] {
+            assert!(parse_element_query(&bad).is_err(), "{bad}");
+        }
+        // role_filter 必须是字符串数组。
+        assert!(parse_element_query(&serde_json::json!({"role_filter": "Button"})).is_err());
+        assert!(parse_element_query(&serde_json::json!({"role_filter": [1]})).is_err());
+        // limit 至少 1。
+        assert!(parse_element_query(&serde_json::json!({"limit": 0})).is_err());
+    }
+
+    /// 空 `role_filter` 数组当成「没传」：空过滤等于「什么都不返回」，
+    /// 那对模型永远是错误意图。
+    #[test]
+    fn an_empty_role_filter_means_no_filter() {
+        let query = parse_element_query(&serde_json::json!({"role_filter": []})).unwrap();
+        assert!(query.role_filter.is_none());
+    }
+
+    /// 右键上下文菜单必须可得，且必须告诉模型「菜单是独立窗口」——
+    /// 不说这一点，模型会以为右键没生效。
+    #[test]
+    fn show_menu_is_exposed_and_requires_permission() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let definition = tool.definition();
+        let actions = definition.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|a| a == "show_menu"));
+        // 弹菜单有副作用（可能改状态），与 click 同权限档。
+        assert!(tool.needs_permission(&serde_json::json!({
+            "action": "show_menu",
+            "window_id": 5,
+            "coordinate": [10, 20],
+        })));
+        assert!(
+            definition.description.contains("show_menu"),
+            "描述必须提到这个 action"
+        );
+        assert!(
+            definition.description.contains("separate window"),
+            "必须说明菜单是独立窗口，否则模型会以为没生效"
+        );
+    }
+
+    /// 自动截图开关是**加性**的：不调用 `with_auto_screenshot` 时行为与从前
+    /// 完全一致，避免 `[computer_use].auto_screenshot = false` 意外变成
+    /// 「每步都附图」。
+    #[test]
+    fn auto_screenshot_is_opt_in() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        assert_eq!(tool.auto_screenshot, None);
+        let tool = tool.with_auto_screenshot(960);
+        assert_eq!(tool.auto_screenshot, Some(960));
+    }
+
+    /// 元素观察必须留下每个 ref 的截图坐标，否则「AX 动作结构性失败」时
+    /// 降级无坐标可用，只能把错误原样丢回模型。
+    #[test]
+    fn observation_records_element_centres_for_degradation() {
+        let observation = ElementObservation {
+            tree_id: 1,
+            content_fingerprint: 2,
+            centers: vec![Some((10, 20)), None, Some((300, 400))],
+            query: wyj_computer::element::ElementQuery::default(),
+        };
+        assert_eq!(observation.center_of(ElementRef(0)), Some((10, 20)));
+        // 没有几何的元素降级不了，必须如实返回 None 而不是编一个 (0,0)。
+        assert_eq!(observation.center_of(ElementRef(1)), None);
+        assert_eq!(observation.center_of(ElementRef(2)), Some((300, 400)));
+        // 越界序号同样返回 None。
+        assert_eq!(observation.center_of(ElementRef(99)), None);
     }
 
     #[test]
@@ -1083,6 +2171,57 @@ mod tests {
             .to_string();
         assert!(error.contains("no element snapshot"), "{error}");
         assert!(error.contains("list_elements"), "{error}");
+    }
+
+    /// 只校验 `tree_id` 是不够的：`tree_id` 含遍历时刻，模型完全可以拿着一个
+    /// **正确但过期**的 tree_id 回来。这条测试钉住「观察记录必须带内容指纹」，
+    /// 否则 `execute_with_element` 就退化成按序号盲点。
+    #[test]
+    fn observation_carries_the_content_fingerprint_for_drift_detection() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let target = WindowTarget {
+            window_id: 7,
+            pid: 42,
+            app_name: "App".into(),
+            title: "T".into(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+            target_width: 400,
+            target_height: 300,
+            generation: 3,
+            focused: false,
+        };
+        tool.element_observations.lock().unwrap().insert(
+            7,
+            ElementObservation {
+                tree_id: 11,
+                content_fingerprint: 0xdead_beef,
+                centers: vec![None; 8],
+                query: wyj_computer::element::ElementQuery::default(),
+            },
+        );
+        let (reference, observation) = tool
+            .resolve_element(
+                &target,
+                &serde_json::json!({"element_ref": "e3", "tree_id": 11}),
+            )
+            .unwrap();
+        assert_eq!(reference, ElementRef(3));
+        assert_eq!(observation.tree_id, 11);
+        // 指纹必须原样带出，动作侧才能拿它去和当前树比对。
+        assert_eq!(observation.content_fingerprint, 0xdead_beef);
+
+        // tree_id 对不上仍然要拒——两道校验都不能少。
+        let error = tool
+            .resolve_element(
+                &target,
+                &serde_json::json!({"element_ref": "e3", "tree_id": 12}),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stale"), "{error}");
     }
 
     #[test]

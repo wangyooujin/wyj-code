@@ -299,6 +299,30 @@ max_results = 5              # 模型未显式指定时返回的条数（硬上�
 
 **外部文本按不可信输入处理**：结果统一过 `escape_harness_markers` 才能回填给模型（否则网页正文里的 `</system-reminder>` 或行首 `Human:` 能伪造 harness 结构与对话轮次）；超长输出走 spill 落盘而非硬截断，模型可用 Read 取回被省略的中后段。瞬时错误（`Transient`）退避重试一次，限流 / 认证 / 参数错误**不重试**——重试只会更快烧掉配额或拿到同样的错误。
 
+### Computer-use（桌面 GUI 控制）
+
+**`[computer_use]` 节**配置桌面 GUI 控制工具（`computer` / `app_computer` / `window_capture`）。三个工具默认在 macOS + `vision = true` + `provider = "anthropic"` 时注册；`app_computer` 是否用原生 `computer_20251124` 声明另由「是否官方端点」决定，与 `effective_prompt_cache()` 共用同一判定。
+
+```toml
+[computer_use]
+foreground_fallback = "disabled"   # 旧 computer 工具的前台接管策略：disabled / ask / idle_only
+quiet_period_ms = 2000             # 获得输入租约前必须连续无外部输入的时长
+max_defer_secs = 30                # 等待用户空闲的最长时间，到期失败关闭
+restore_context = true             # 前台兼容动作结束后恢复原观察上下文
+auto_screenshot = true             # 变更动作成功后自动附带一张目标窗口截图
+auto_screenshot_max_dim = 960      # 附图的长边像素上限（低于观察用的 1280）
+```
+
+**`auto_screenshot` 是「动作 → 观察」闭环的核心**。`app_computer` 的变更动作（`click` / `set_text` / `key` / `scroll` / `press_menu`）成功后会附一张**动作之后**的窗口截图，模型不必自己再调一次 `screenshot` 才知道界面变了没有。关掉它并不会关掉整条验证链：连续 20 次变更动作没有截图时（`MAX_ACTIONS_WITHOUT_SCREENSHOT`）仍会强制附一张。三条不变式——只在成功路径附图（失败时错误信息更重要）、附图失败绝不改变工具结果语义、附图分辨率刻意低于观察用的 `max_dim`（它只是「确认界面变了没有」，要看清小字时模型会显式 `screenshot` 或 `zoom`）。
+
+**`auto_screenshot = true` 的 token 代价**：每张 960 长边的 PNG 约 1000~1600 input token。长 GUI 任务里累积可观，需要控制成本时关掉，改由提示词驱动的按需截图。
+
+**`foreground_fallback` 的三档语义**：`disabled`（默认）下旧 `computer` 的变更动作直接返回 `requires_foreground_takeover`；`ask` 每次变更弹一次确认（要求真实 TUI 交互通道，headless / cron / 子 Agent 一律拒绝）；`idle_only` 只按安静期执行。三者都仍受 `InputArbiter` 与前台 PID 校验约束，且都不会让 `app_computer` 的失败静默回退到全局输入。
+
+**权限**：`computer` / `app_computer` 属 `PROJECT_APPROVE_ONCE_TOOLS`——首次按 y/Enter/a 即写入当前项目的 `allowed_tools.json`，同项目后续动作与重开项目都不再确认，不同项目仍隔离，拒绝不落盘。两者**互不隐式授权**：批准后台工具不等于批准前台全局输入。
+
+**诊断**：`/computer` 报告平台/vision/provider 门控结果、AX 授权、InputArbiter 状态、前台回退配置、稳定窗口数量、截图与全局输入探测，以及只存在当前进程内的路径计数与熔断计数（`automatic_foreground_fallbacks` 是显式恒零不变量）。它不依赖工具是否真的注册成功。
+
 ### Hooks 自动化系统
 
 **Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v0.2.27 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
