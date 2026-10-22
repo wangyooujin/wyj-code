@@ -65,7 +65,17 @@ pub enum EvolveCommand {
 }
 
 fn store(cfg: &Config, cwd: &Path) -> Result<EvolutionStore> {
-    EvolutionStore::new(&wyj_config::config_dir()?, cwd, cfg.evolution.clone())
+    let base = wyj_config::config_dir()?;
+    // 与 TUI 装配同 scope：`storage.scope = "project"` 时演化记录在工作副本里。
+    let (state_roots, _) =
+        wyj_config::layout::resolve_project_state_roots(&cfg.storage.scope, &base, cwd);
+    EvolutionStore::with_root_and_legacy(
+        &state_roots.evolution,
+        Some(&wyj_config::layout::evolution_root(&base)),
+        &wyj_config::layout::memory_root(&base),
+        cwd,
+        cfg.evolution.clone(),
+    )
 }
 
 fn print_value(value: &serde_json::Value, json: bool) -> Result<()> {
@@ -79,12 +89,13 @@ fn print_value(value: &serde_json::Value, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn checkpoint_before_activation(cwd: &Path, id: &str) -> Result<String> {
+fn checkpoint_before_activation(cwd: &Path, id: &str, storage_scope: &str) -> Result<String> {
     // checkpoint 与它保护的会话同目录（按项目分），否则 `--resume` 找不到它。
-    let sessions = wyj_config::layout::project_sessions_dir(
-        &wyj_config::config_dir()?,
-        &wyj_core::project_key(cwd),
-    );
+    // 会话根跟随 `storage.scope`：选 project 时会话在工作副本里，用 home 根
+    // 会写出一个永远不会被 `/rewind` 看到的孤立 checkpoint。
+    let (sessions_root, _, _) =
+        wyj_config::layout::resolve_runtime_roots(storage_scope, &wyj_config::config_dir()?, cwd);
+    let sessions = sessions_root.join(wyj_core::project_key(cwd));
     let store = CheckpointStore::configured(&sessions, format!("evolution-approval-{id}"))?;
     let summary = store.create(
         cwd,
@@ -242,7 +253,7 @@ pub async fn run(command: EvolveCommand, json: bool, cwd: &Path, cfg: &Config) -
                 ),
                 "candidate must be proposed or validated before approval"
             );
-            let checkpoint = checkpoint_before_activation(cwd, &id)?;
+            let checkpoint = checkpoint_before_activation(cwd, &id, &cfg.storage.scope)?;
             let activated_path = match &candidate.payload {
                 CandidatePayload::Rule { .. } => None,
                 CandidatePayload::Skill {

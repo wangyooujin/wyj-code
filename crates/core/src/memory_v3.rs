@@ -333,7 +333,21 @@ struct MemoryWriteGuard<'a> {
 
 #[derive(Clone)]
 pub struct MemoryV3Store {
+    /// Global 层根：`global/`、`rejected_history.json`、`reset_marker.json`、
+    /// `backups/`、跨进程锁 `store.lock` 都挂在这里。
     base_dir: PathBuf,
+    /// 项目层根：`<projects_root>/<project_key>/`。默认是 `base_dir/projects`，
+    /// `storage.scope = "project"` 时由调用方指到 `<git-root>/.wyj-code/local/`
+    /// 下——项目记忆跟着工作副本走，Global 层仍留在 home。
+    projects_root: PathBuf,
+    /// 旧项目层根（home 下的 `memory-v3/projects`）。只在
+    /// [`Self::with_roots_and_legacy`] 显式给出时存在，用于**读取回退**。
+    ///
+    /// 切到 `project` 档位时旧记忆还在 home：不回退的话用户看到的是「记忆
+    /// 突然空了」，而自动搬文件属于不可逆操作，不该在升级后的第一次启动里
+    /// 静默发生。回退只在**新位置还没有 records.json 时**生效，第一次写入
+    /// 会把旧记录整体带到新位置（旧文件保留，可逆）。
+    legacy_projects_root: Option<PathBuf>,
     project_root: PathBuf,
     project_key: String,
     enabled: Arc<AtomicBool>,
@@ -344,11 +358,49 @@ pub struct MemoryV3Store {
 }
 
 impl MemoryV3Store {
+    /// 默认布局：`<base_dir>/memory-v3/` 同时承载 Global 与项目层。
     pub fn new(base_dir: &Path, cwd: &Path) -> Result<Self> {
+        let root = base_dir.join("memory-v3");
+        let projects = root.join("projects");
+        Self::with_roots(&root, &projects, cwd)
+    }
+
+    /// 分别指定 Global 根与项目层根。
+    ///
+    /// 跨进程锁**仍挂在 `base_dir`**（见 [`Self::write_critical`]）：
+    /// `global/records.json` 与 `rejected_history.json` 是跨项目共用的单文件，
+    /// 锁挂在项目层根上就退化成各锁各的。
+    pub fn with_roots(base_dir: &Path, projects_root: &Path, cwd: &Path) -> Result<Self> {
+        Self::with_roots_and_legacy(base_dir, projects_root, None, cwd)
+    }
+
+    /// 同 [`Self::with_roots`]，额外给出旧项目层根作**只读回退**。
+    ///
+    /// `storage.scope = "project"` 首次生效时，home 下还留着上一次的
+    /// `memory-v3/projects/<key>/`。不回退会让用户看到「记忆突然空了」——
+    /// 而自动搬文件是不可逆操作，不该在升级后的第一次启动里静默发生。
+    ///
+    /// 回退的边界（三条，都必要）：
+    /// 1. 只在**新位置还没有 `records.json`** 时从旧目录**复制**一份过去——
+    ///    一旦新位置写过，旧目录就不再参与，否则「forget 掉一条」会在重启后
+    ///    从旧文件复活。
+    /// 2. 复制发生在构造期，后续所有读写路径都只认新位置，不需要到处加分支。
+    /// 3. 旧目录**不删不改**，用户后悔时删掉新目录即可回到旧状态。
+    pub fn with_roots_and_legacy(
+        base_dir: &Path,
+        projects_root: &Path,
+        legacy_projects_root: Option<&Path>,
+        cwd: &Path,
+    ) -> Result<Self> {
         let root = project_root(cwd);
         let key = project_key(&root);
+        let legacy = legacy_projects_root
+            .map(|legacy| legacy.join(&key))
+            .filter(|legacy| *legacy != projects_root.join(&key));
         let store = Self {
-            base_dir: base_dir.join("memory-v3"),
+            base_dir: base_dir.to_path_buf(),
+            projects_root: projects_root.to_path_buf(),
+            legacy_projects_root: legacy,
             project_root: root,
             project_key: key,
             enabled: Arc::new(AtomicBool::new(true)),
@@ -358,8 +410,39 @@ impl MemoryV3Store {
         };
         fs::create_dir_all(store.base_dir.join("global"))?;
         fs::create_dir_all(store.project_dir())?;
+        store.seed_from_legacy();
         store.recover_interrupted_jobs()?;
         Ok(store)
+    }
+
+    /// 新位置还是空的、旧位置有内容时，把旧项目目录整份复制过来。
+    ///
+    /// 只复制**不删**：这是「升级后第一次启动」的兜底，不是迁移工具；
+    /// 真要把数据收拢走 `storage migrate`。
+    fn seed_from_legacy(&self) {
+        let Some(legacy) = self.legacy_projects_root.as_ref() else {
+            return;
+        };
+        // 新位置已经有 records.json → 用户已经在新位置工作过，旧目录不再参与。
+        if self.project_records_path().exists() {
+            return;
+        }
+        if !legacy.join("records.json").exists() {
+            return;
+        }
+        match crate::serialize::copy_missing_tree(legacy, &self.project_dir()) {
+            Ok(()) => tracing::info!(
+                "Memory v3: 从 {} 回填旧项目记忆到 {}（旧目录保留）",
+                legacy.display(),
+                self.project_dir().display()
+            ),
+            // 回填失败不该让启动失败：本次记忆为空，但工具本身可用。
+            Err(error) => tracing::warn!(
+                "Memory v3 回填旧项目记忆失败（{} → {}）: {error}",
+                legacy.display(),
+                self.project_dir().display()
+            ),
+        }
     }
 
     /// 注入 retention 配置（CLI 装配阶段调用一次）。后续 `upsert` /
@@ -1472,7 +1555,7 @@ impl MemoryV3Store {
     }
 
     fn project_dir(&self) -> PathBuf {
-        self.base_dir.join("projects").join(&self.project_key)
+        self.projects_root.join(&self.project_key)
     }
 
     fn jobs_path(&self) -> PathBuf {
@@ -1754,10 +1837,19 @@ impl MemoryV3Store {
             }
             let metadata = fs::metadata(&src)?;
             let bytes = metadata.len();
-            let relative = src
-                .strip_prefix(&self.base_dir)
-                .unwrap_or(&src)
-                .to_path_buf();
+            // `project_dir` 可能不在 `base_dir` 之下（`storage.scope = project`
+            // 时它在工作副本里），此时 `strip_prefix` 会失败——而 `Path::join`
+            // 遇到绝对路径会**整体替换**，备份文件会被写回原位置，等于什么都没搬。
+            // 因此项目层显式落到 `projects/<key>/` 前缀下，两条分支都能得到相对路径。
+            let relative = if let Ok(rel) = src.strip_prefix(&self.base_dir) {
+                rel.to_path_buf()
+            } else if let Ok(rel) = src.strip_prefix(&self.projects_root) {
+                PathBuf::from("projects").join(rel)
+            } else {
+                src.file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("unknown"))
+            };
             let dst = backup_dir.join(&relative);
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
@@ -2478,6 +2570,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// `with_roots` 把项目层与 Global 层拆到两处时，两者各落各的，
+    /// 且跨进程锁仍在 Global 根上（否则不同项目各锁各的，全局层照样撞）。
+    #[test]
+    fn split_roots_keep_global_and_project_layers_apart() {
+        let base = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let projects_root = tempfile::tempdir().unwrap();
+        let store = MemoryV3Store::with_roots(
+            &base.path().join("memory-v3"),
+            projects_root.path(),
+            project.path(),
+        )
+        .unwrap();
+
+        store
+            .upsert(holdings_request(
+                "招商银行 1000股",
+                "2026-08-20T09:30:00+08:00",
+            ))
+            .unwrap();
+
+        // 项目层落在显式给的根下，不在 Global 根的 projects/ 里
+        assert!(store
+            .project_records_path()
+            .starts_with(projects_root.path()));
+        assert!(store.project_records_path().is_file());
+        assert!(!base
+            .path()
+            .join("memory-v3")
+            .join("projects")
+            .join(&store.project_key)
+            .exists());
+
+        // Global 层与锁仍挂在 base_dir
+        assert_eq!(
+            store.global_records_path(),
+            base.path().join("memory-v3").join("global/records.json")
+        );
+        assert!(base.path().join("memory-v3").join("store.lock").is_file());
     }
 
     #[test]

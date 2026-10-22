@@ -450,17 +450,50 @@ struct EvolutionWriteGuard<'a> {
 
 impl EvolutionStore {
     pub fn new(base_dir: &Path, cwd: &Path, cfg: EvolutionCfg) -> Result<Self> {
+        let root = base_dir.join("evolution");
+        let legacy = base_dir.join("memory");
+        Self::with_root(&root, &legacy, cwd, cfg)
+    }
+
+    /// 显式指定 Evolution 根与 legacy memory 根。
+    ///
+    /// `storage.scope = "project"` 时调用方把 `evolution_root` 指到
+    /// `<git-root>/.wyj-code/local/evolution`，让演化记录跟着工作副本走。
+    /// `legacy_root` 只在 `migrate_legacy` 的预览里用到，v0.2.14 起该路径
+    /// 恒为空，但保留参数以免破坏既有调用语义。
+    pub fn with_root(
+        evolution_root: &Path,
+        legacy_root: &Path,
+        cwd: &Path,
+        cfg: EvolutionCfg,
+    ) -> Result<Self> {
+        Self::with_root_and_legacy(evolution_root, None, legacy_root, cwd, cfg)
+    }
+
+    /// 同 [`Self::with_root`]，额外给出旧 Evolution 根作**只读回填**。
+    ///
+    /// 与 `MemoryV3Store::with_roots_and_legacy` 同一套语义与理由：切到
+    /// `project` 档位后，home 下的 `evolution/<key>/` 不再被读到，不回填会让
+    /// `/evolve` 显示「一条情景都没有」。回填只在新位置还没有
+    /// `candidates/index.json` 时发生，旧目录不删不改。
+    pub fn with_root_and_legacy(
+        evolution_root: &Path,
+        legacy_evolution_root: Option<&Path>,
+        legacy_root: &Path,
+        cwd: &Path,
+        cfg: EvolutionCfg,
+    ) -> Result<Self> {
         let repository_root = project_root(cwd);
         // v0.2.14 收敛：Evolution 不再维护 legacy memory dir（普通 Memory 已
         // 完全迁出 v3）。保留字段避免破坏外部 `EvolutionStore.directory()`
         // 等 API；实际读取时永远为空。
-        let legacy_dir = base_dir.join("memory").join(project_id(&repository_root));
         let project_id = project_id(&repository_root);
-        let dir = base_dir.join("evolution").join(&project_id);
+        let legacy_dir = legacy_root.join(&project_id);
+        let dir = evolution_root.join(&project_id);
         for child in ["episodes", "candidates", "feedback"] {
             fs::create_dir_all(dir.join(child))?;
         }
-        Ok(Self {
+        let store = Self {
             legacy_dir,
             dir,
             repository_root,
@@ -469,7 +502,40 @@ impl EvolutionStore {
             cfg,
             write_lock: Arc::new(Mutex::new(())),
             activity_generation: Arc::new(AtomicU64::new(0)),
-        })
+        };
+        if let Some(legacy) = legacy_evolution_root {
+            store.seed_from_legacy(&legacy.join(&store.project_id));
+        }
+        Ok(store)
+    }
+
+    /// 新位置还是空的、旧位置有内容时，把旧项目目录整份复制过来。
+    ///
+    /// 判据用 `candidates/index.json`（每次启动都会写）而不是目录是否为空：
+    /// 新位置刚构造时 `episodes/` 等三个子目录已被建出来，空目录无法区分
+    /// 「从没用过」与「用过但还没写索引」。
+    fn seed_from_legacy(&self, legacy: &Path) {
+        if legacy == self.dir {
+            return;
+        }
+        if self.dir.join(CANDIDATE_INDEX_FILE).exists() {
+            return;
+        }
+        if !legacy.join(CANDIDATE_INDEX_FILE).exists() {
+            return;
+        }
+        match crate::serialize::copy_missing_tree(legacy, &self.dir) {
+            Ok(()) => tracing::info!(
+                "Evolution: 从 {} 回填旧演化记录到 {}（旧目录保留）",
+                legacy.display(),
+                self.dir.display()
+            ),
+            Err(error) => tracing::warn!(
+                "Evolution 回填旧演化记录失败（{} → {}）: {error}",
+                legacy.display(),
+                self.dir.display()
+            ),
+        }
     }
 
     pub fn directory(&self) -> &Path {

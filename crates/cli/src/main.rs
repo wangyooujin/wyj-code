@@ -421,16 +421,49 @@ fn is_high_effort(effort: &str) -> bool {
     )
 }
 
+/// 跨项目定位某个会话落在哪个会话目录。
+///
+/// 先找 home 下的 `sessions/<project_key>/`，再找 `storage.scope = "project"`
+/// 时当前工作副本的 `<git-root>/.wyj-code/local/sessions/<project_key>/`。
+/// 两处都找是因为 `session` / `subagent-trace` 这类命令只拿到 session id，
+/// 而「该会话属于哪个项目」本身就是它们要回答的问题——只搜一处会让另一半
+/// 会话表现为「不存在」。
+fn locate_session_dir(session_id: &str, cfg: &wyj_config::Config) -> Result<PathBuf> {
+    let base = wyj_config::config_dir()?;
+    let home_root = wyj_config::layout::sessions_root(&base);
+    let mut candidates = vec![SessionStore::locate_in_root(&home_root, session_id)];
+    if let Ok(cwd) = std::env::current_dir() {
+        let (project_root, _, _) =
+            wyj_config::layout::resolve_runtime_roots(&cfg.storage.scope, &base, &cwd);
+        let located = SessionStore::locate_in_root(&project_root, session_id);
+        if located != project_root {
+            candidates.push(located);
+        }
+    }
+    // 找到「真的有这个会话」的那一处；都没有时退回 home 根，让上层按既有
+    // 路径报「会话不存在」而不是抛一个路径错误。
+    let file_name = format!("{session_id}.json");
+    Ok(candidates
+        .iter()
+        .find(|dir| dir.join(&file_name).exists())
+        .cloned()
+        .unwrap_or(home_root))
+}
+
 /// `wyj-code subagent-trace <session_id> [<sub_id>] [--json]`：纯读命令，
 /// 打印落盘的子 Agent trace（见 `wyj_tools::trace`）。不带 sub_id 列出该会话
 /// 全部子 Agent 概览；带 sub_id 打印完整工具序列 + 全文 input/output + 最终结果，
 /// `--json` 直接吐原始 JSONL 供管道处理。
-fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> Result<()> {
+fn run_subagent_trace_cmd(
+    session_id: &str,
+    sub_id: Option<u64>,
+    json: bool,
+    cfg: &wyj_config::Config,
+) -> Result<()> {
     use wyj_tools::trace::{list_trace_ids, read_trace_by_process, trace_file};
 
     // trace 与 handoff 跟会话同目录，所以先跨项目定位会话落在哪个项目目录。
-    let sessions_root = wyj_config::layout::sessions_root(&wyj_config::config_dir()?);
-    let sessions_dir = SessionStore::locate_in_root(&sessions_root, session_id);
+    let sessions_dir = locate_session_dir(session_id, cfg)?;
 
     match sub_id {
         None => {
@@ -1330,7 +1363,7 @@ async fn main() -> Result<()> {
                 session_id,
                 sub_id,
                 json,
-            } => return run_subagent_trace_cmd(&session_id, sub_id, json),
+            } => return run_subagent_trace_cmd(&session_id, sub_id, json, &cfg),
             Commands::Usage {
                 since,
                 project,
@@ -1346,7 +1379,7 @@ async fn main() -> Result<()> {
             }
             Commands::Memory { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-                return memory_cmd::run(command, &cwd, cfg.auto_memory_enabled);
+                return memory_cmd::run(command, &cwd, cfg.auto_memory_enabled, &cfg.storage.scope);
             }
             Commands::SkillHub { command } => {
                 return skillhub_cmd::run(command).await;
@@ -1376,7 +1409,7 @@ async fn main() -> Result<()> {
                 return storage_cmd::run(command, &config_base, &cfg);
             }
             Commands::Model { command } => return run_model_command(command, &cfg).await,
-            Commands::Session { command } => return run_session_command(command),
+            Commands::Session { command } => return run_session_command(command, &cfg),
             Commands::Workspace { command } => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return workspace_cmd::run(command, &cwd);
@@ -1560,11 +1593,30 @@ async fn main() -> Result<()> {
         &plugin_runtime,
     ));
 
+    // 运行状态的落盘范围。`storage.scope = "project"` 时会话、历史，以及记忆 /
+    // 演化 / 索引 / 工作流的**项目层**跟着工作副本走
+    // （`<git-root>/.wyj-code/local/`），选它会先确保该目录被 git 忽略——
+    // transcript 里是工具输出原文，漏一次 `git add -A` 就是永久泄漏。
+    //
+    // 四组项目状态根必须与会话同一 scope：只搬会话会让「历史在这个副本、
+    // 记忆在 home」，换 clone 之后模型记得上一个副本的结论却读不到这个副本的历史。
+    let (sessions_root, history_root, storage_scope) =
+        wyj_config::layout::resolve_runtime_roots(&cfg.storage.scope, &config_base, &cwd);
+    let (state_roots, _) =
+        wyj_config::layout::resolve_project_state_roots(&cfg.storage.scope, &config_base, &cwd);
+    if storage_scope == wyj_config::layout::StorageScope::Project {
+        tracing::debug!(
+            "storage.scope = project，会话落在 {}",
+            sessions_root.display()
+        );
+    }
+
     // 索引目录按**项目根**分组：此前传的是 `cwd`，从仓库子目录启动就会指向
     // 另一个索引目录，同一项目两套索引各自演化。
     let base_code_index: Arc<dyn wyj_core::CodeIndex> = Arc::new(wyj_core::ProjectCodeIndex::new(
         &cwd,
-        wyj_config::layout::indexes_root(&config_base)
+        state_roots
+            .indexes
             .join(wyj_core::project_key(&cwd))
             .join("lexical-v1.json"),
     )?);
@@ -1575,19 +1627,8 @@ async fn main() -> Result<()> {
             plugin_processes.clone(),
         ));
 
-    // 运行状态的落盘范围。`storage.scope = "project"` 时会话与历史跟着工作
-    // 副本走（`<git-root>/.wyj-code/local/`），选它会先确保该目录被 git 忽略——
-    // transcript 里是工具输出原文，漏一次 `git add -A` 就是永久泄漏。
-    let (sessions_root, history_root, storage_scope) =
-        wyj_config::layout::resolve_runtime_roots(&cfg.storage.scope, &config_base, &cwd);
-    if storage_scope == wyj_config::layout::StorageScope::Project {
-        tracing::debug!(
-            "storage.scope = project，会话落在 {}",
-            sessions_root.display()
-        );
-    }
     let history_store = HistoryStore::for_project(history_root, &cwd).ok();
-    let session_store = SessionStore::for_project(sessions_root, &cwd).ok();
+    let session_store = SessionStore::for_project(sessions_root.clone(), &cwd).ok();
 
     // 根据 --continue/-c 或 --resume 恢复历史会话。
     // `session_conflict` 记下「该会话正被另一个实例使用」，交给 TUI 在启动横幅之后
@@ -1720,6 +1761,14 @@ async fn main() -> Result<()> {
     // 会话 TTL 与陈旧锁回收：两者都是「文件数量」无界增长，与 CAS 的「字节数」
     // 无界增长是两类问题，但回收时机相同（启动一次，后台跑）。
     let retention_cfg = cfg.storage.clone();
+    // `storage.scope = "project"` 时会话不在 `config_base` 之下，只扫 home 会让
+    // TTL 对那批会话完全空转——用户设了 30 天却一条都不删，且没有任何提示。
+    let extra_sessions_roots: Vec<PathBuf> =
+        if storage_scope == wyj_config::layout::StorageScope::Project {
+            vec![sessions_root.clone()]
+        } else {
+            Vec::new()
+        };
     // 磁盘占用提示同样放后台：`disk_usage::scan` 递归 7 棵子树，也是同步全量 IO。
     let disk_warn_bytes = cfg.storage.disk_usage_warn_bytes;
     let config_base_for_gc = config_base.clone();
@@ -1744,7 +1793,12 @@ async fn main() -> Result<()> {
             }
             // 会话 TTL + 陈旧锁：必须在 CAS gc **之后**，因为 gc 会释放一批
             // blob 对应的锁文件。顺序反过来会让这一轮多扫一遍刚变成陈旧的锁。
-            match wyj_core::retention::run(&config_base_for_gc, &retention_cfg, false) {
+            match wyj_core::retention::run_with_extra_sessions(
+                &config_base_for_gc,
+                &extra_sessions_roots,
+                &retention_cfg,
+                false,
+            ) {
                 Ok(stats) if !stats.is_empty() => tracing::debug!(
                     "保留策略: 删除 {} 个会话 / {} 字节，{} 个陈旧锁 / {} 字节",
                     stats.sessions_removed,
@@ -1789,14 +1843,19 @@ async fn main() -> Result<()> {
     // Phase 3:把 CAS 注入到 externalize,落盘前把超大 image / thinking 移到 CAS。
     wyj_core::serialize::set_externalize_cas(workspace_cas.clone());
 
-    let memory_v3_store = MemoryV3Store::new(&config_base, &cwd)
-        .map(|store| {
-            store.set_enabled(cfg.auto_memory_enabled);
-            store.with_storage_retention(cfg.storage.clone())
-        })
-        .map(Arc::new)
-        .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
-        .ok();
+    let memory_v3_store = MemoryV3Store::with_roots_and_legacy(
+        &wyj_config::layout::memory_v3_root(&config_base),
+        &state_roots.memory_projects,
+        Some(&wyj_config::layout::memory_v3_root(&config_base).join("projects")),
+        &cwd,
+    )
+    .map(|store| {
+        store.set_enabled(cfg.auto_memory_enabled);
+        store.with_storage_retention(cfg.storage.clone())
+    })
+    .map(Arc::new)
+    .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
+    .ok();
     // Memory v2 只在 v3 **没建成**时才构造。
     //
     // 三套记忆并存是历史遗留：v1/v2 是「提取成 .md + 注入 MEMORY.md 索引」，
@@ -1823,10 +1882,16 @@ async fn main() -> Result<()> {
         None
     };
     let evolution_store = if cfg.evolution.enabled {
-        EvolutionStore::new(&config_base, &cwd, cfg.evolution.clone())
-            .map(Arc::new)
-            .map_err(|error| tracing::warn!("Evolution 存储初始化失败: {error}"))
-            .ok()
+        EvolutionStore::with_root_and_legacy(
+            &state_roots.evolution,
+            Some(&wyj_config::layout::evolution_root(&config_base)),
+            &wyj_config::layout::memory_root(&config_base),
+            &cwd,
+            cfg.evolution.clone(),
+        )
+        .map(Arc::new)
+        .map_err(|error| tracing::warn!("Evolution 存储初始化失败: {error}"))
+        .ok()
     } else {
         None
     };
@@ -3429,18 +3494,17 @@ fn parse_rewind_scope(scope: &str) -> wyj_core::RewindScope {
     }
 }
 
-fn run_session_command(command: SessionCommand) -> Result<()> {
+fn run_session_command(command: SessionCommand, cfg: &wyj_config::Config) -> Result<()> {
     // `session` 子命令的每个动作都显式带 session id，进程没有项目上下文可依赖，
     // 因此先跨项目定位该会话落在哪个项目目录，再在**那个目录**上开 store。
     // 直接用根目录开 store 会让 checkpoint 平铺到 `sessions/` 根下。
-    let sessions_root = wyj_config::layout::sessions_root(&wyj_config::config_dir()?);
     let first_id = match &command {
         SessionCommand::Checkpoint { session_id, .. }
         | SessionCommand::Checkpoints { session_id }
         | SessionCommand::Rewind { session_id, .. }
         | SessionCommand::Branch { session_id, .. } => session_id.clone(),
     };
-    let sessions = SessionStore::new(SessionStore::locate_in_root(&sessions_root, &first_id))?;
+    let sessions = SessionStore::new(locate_session_dir(&first_id, cfg)?)?;
     match command {
         SessionCommand::Checkpoint { session_id, name } => {
             let file = sessions.load(&session_id)?;

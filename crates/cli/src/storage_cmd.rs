@@ -56,19 +56,64 @@ pub enum StorageCommand {
 }
 
 pub fn run(command: StorageCommand, config_base: &Path, cfg: &Config) -> Result<()> {
+    // `storage.scope = "project"` 时会话 / 记忆 / 演化不在 `config_base` 之下。
+    // 只扫 home 会让 `status` 报 0、`prune` 清不到、`doctor` 报「损坏 0 个」——
+    // 三种「看起来一切正常」的静默失效。这里统一算出额外要扫的根。
+    let extra = extra_scope_roots(config_base, cfg);
     match command {
-        StorageCommand::Status { json } => run_status(config_base, cfg, json),
-        StorageCommand::Doctor => run_doctor(config_base, cfg),
+        StorageCommand::Status { json } => run_status(config_base, cfg, &extra, json),
+        StorageCommand::Doctor => run_doctor(config_base, cfg, &extra),
         StorageCommand::Prune { dry_run, yes } => {
             let effective_dry = !yes && dry_run;
-            run_prune(config_base, cfg, effective_dry)
+            run_prune(config_base, cfg, &extra, effective_dry)
         }
         StorageCommand::Migrate { dry_run, yes } => run_migrate(config_base, !yes && dry_run),
     }
 }
 
-fn run_status(config_base: &Path, _cfg: &Config, json: bool) -> Result<()> {
-    let report = collect_status(config_base)?;
+/// 当前工作目录下、`storage.scope = "project"` 带来的额外根。
+///
+/// `home` 档位返回全空的 [`ExtraScopeRoots`]——此时所有状态都在 `config_base`
+/// 之下，与改动前行为逐字节一致。
+struct ExtraScopeRoots {
+    sessions: Option<PathBuf>,
+    memory_projects: Option<PathBuf>,
+    evolution: Option<PathBuf>,
+}
+
+fn extra_scope_roots(config_base: &Path, cfg: &Config) -> ExtraScopeRoots {
+    let Ok(cwd) = std::env::current_dir() else {
+        return ExtraScopeRoots {
+            sessions: None,
+            memory_projects: None,
+            evolution: None,
+        };
+    };
+    let (state_roots, scope) =
+        wyj_config::layout::resolve_project_state_roots(&cfg.storage.scope, config_base, &cwd);
+    if scope != wyj_config::layout::StorageScope::Project {
+        return ExtraScopeRoots {
+            sessions: None,
+            memory_projects: None,
+            evolution: None,
+        };
+    }
+    let (sessions_root, _, _) =
+        wyj_config::layout::resolve_runtime_roots(&cfg.storage.scope, config_base, &cwd);
+    ExtraScopeRoots {
+        sessions: Some(sessions_root),
+        memory_projects: Some(state_roots.memory_projects),
+        evolution: Some(state_roots.evolution),
+    }
+}
+
+fn run_status(
+    config_base: &Path,
+    _cfg: &Config,
+    extra: &ExtraScopeRoots,
+    json: bool,
+) -> Result<()> {
+    let report = collect_status(config_base, extra)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -113,13 +158,13 @@ fn run_status(config_base: &Path, _cfg: &Config, json: bool) -> Result<()> {
 /// 2. **orphan CAS blob**（`ref_count == 0` 且不在 LRU 保留集内）——占着
 ///    磁盘不释放。
 /// 3. **checkpoint manifest 损坏**——`/rewind` 会看不到该会话的存档。
-fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
+fn run_doctor(config_base: &Path, cfg: &Config, extra: &ExtraScopeRoots) -> Result<()> {
     println!("=== wyj-code storage doctor ===");
 
     // ── 1. 损坏的 session 文件 ──
     let mut broken_sessions = Vec::new();
     let mut session_count = 0usize;
-    for sessions_dir in session_dirs(config_base) {
+    for sessions_dir in session_dirs(config_base, extra) {
         let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
             continue;
         };
@@ -170,7 +215,15 @@ fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
                     stats.total_blobs, stats.total_bytes, stats.orphan_blobs, stats.orphan_bytes
                 );
                 if stats.orphan_blobs > 0 {
-                    println!("  提示:`storage prune` 会回收 ref_count == 0 的 blob");
+                    // 别写成「prune 会回收这些」——`WorkspaceCas::gc` 在总量
+                    // **未超过** `cas_total_bytes` 时直接 `budget_ok` 返回，
+                    // 一个 orphan 都不删。实测 1440 个 orphan / 21 MB 在
+                    // 893 MB 的池子里原地躺了很久，而 doctor 一直说会回收。
+                    println!(
+                        "  提示:prune 只在 CAS 总量超过 storage.cas_total_bytes 时才回收\
+                         ref_count == 0 的 blob；当前未超限，这些 orphan 会保留（下次被 \
+                         intern 命中即复用）"
+                    );
                 }
             }
             Err(error) => println!("CAS 统计失败: {error}"),
@@ -180,7 +233,7 @@ fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
 
     // ── 3. 损坏的 checkpoint manifest ──
     let mut broken_manifests = Vec::new();
-    for (_, path, session_id) in checkpoint_dirs(config_base) {
+    for (_, path, session_id) in checkpoint_dirs(config_base, extra) {
         let manifest_path = path.join("manifest.json");
         if !manifest_path.exists() {
             continue;
@@ -211,7 +264,7 @@ fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
     // `storage prune --yes` 会顺带清理（见 `run_prune`）。
     let mut broken_checkpoints = Vec::new();
     let mut checkpoint_files = 0usize;
-    for (_, path, _) in checkpoint_dirs(config_base) {
+    for (_, path, _) in checkpoint_dirs(config_base, extra) {
         let Ok(files) = std::fs::read_dir(&path) else {
             continue;
         };
@@ -271,7 +324,12 @@ fn run_doctor(config_base: &Path, cfg: &Config) -> Result<()> {
 /// 此前这里是纯 TODO 桩:两个参数(`--dry-run` / `--yes`)被 clap 解析、绑定、
 /// 求值,然后原样丢掉——`storage prune` 与 `storage prune --yes` 的输出逐字
 /// 相同。现在真正接线到已有的 retention 实现。
-fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
+fn run_prune(
+    config_base: &Path,
+    cfg: &Config,
+    extra: &ExtraScopeRoots,
+    dry_run: bool,
+) -> Result<()> {
     println!("=== wyj-code storage prune ===");
     if dry_run {
         println!("(dry-run:只报计划,不删除。确认无误后加 --yes 实际执行)");
@@ -301,7 +359,7 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
             storage.cas_max_blob_bytes,
         )
         .map(std::sync::Arc::new);
-        for (session_dir, _path, session_id) in checkpoint_dirs(config_base) {
+        for (session_dir, _path, session_id) in checkpoint_dirs(config_base, extra) {
             checkpoint_sessions += 1;
             let mut store = match wyj_core::CheckpointStore::new(&session_dir, &session_id) {
                 Ok(store) => store.with_max_per_session(storage.checkpoints_per_session),
@@ -317,8 +375,17 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
             let before = store.list().map(|list| list.len()).unwrap_or(0);
             if dry_run {
                 // dry-run 只报计划，不改动 manifest / 不删文件。
-                let over = before.saturating_sub(storage.checkpoints_per_session);
-                checkpoint_dropped += over;
+                //
+                // 必须用 `estimate_retention_drops` 而不是 `before - max`：后者
+                // 把「别人活着的」与「owner_pid == 0 的旧条目」也算成可删，
+                // 实测某会话报「将删除 23 条」而 `--yes` 实删 0 条。
+                match store.estimate_retention_drops() {
+                    Ok(drops) => checkpoint_dropped += drops,
+                    Err(error) => {
+                        tracing::warn!("预估 checkpoint 淘汰数失败 {session_id}: {error}");
+                        checkpoint_failed += 1;
+                    }
+                }
                 // 损坏数也要报：它是「删不删」这个决定的一部分，
                 // dry-run 报不出来就等于让用户盲选。
                 if let Ok((count, freed)) = store.scan_corrupt() {
@@ -413,7 +480,7 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
     // 本身就是显式确认动作，且这些内容已不可读（保留一个读不出的文件没有意义）。
     let mut broken_sessions_removed = 0usize;
     let mut broken_sessions_freed = 0u64;
-    for sessions_dir in session_dirs(config_base) {
+    for sessions_dir in session_dirs(config_base, extra) {
         let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
             continue;
         };
@@ -470,6 +537,46 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         );
     }
 
+    // ── 无主的 checkpoint / subagent 旁路目录 ──
+    //
+    // 会话正文被删（TTL、手工清理、损坏清理）后，`<sid>.checkpoints/` 与
+    // `<sid>.subagents/` 会原地留下——实测 177 个这样的目录。它们不在任何
+    // manifest 的视野里（`CheckpointStore` 只从会话正文进入），所以上面几段
+    // 一条都清不到，只会在 `storage status` 里显示成一堆「0 字节会话」。
+    //
+    // 两道保护，缺一不可：
+    // 1. **宽限期**：另一个进程可能刚建好旁路目录、还没写出会话正文，此时
+    //    「没有 `<sid>.json`」是正常中间态，不是孤儿。
+    // 2. **manifest 里有活着的 owner_pid** 就不动：那条会话的 `/rewind` 目标
+    //    正被别的终端用着，删掉等于让它凭空消失。
+    let mut orphan_dirs_removed = 0usize;
+    let mut orphan_dirs_freed = 0u64;
+    for path in orphan_sidecar_dirs(config_base, extra, ORPHAN_SIDECAR_GRACE) {
+        let bytes = dir_size(&path);
+        orphan_dirs_removed += 1;
+        orphan_dirs_freed += bytes;
+        if dry_run {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&path) {
+            tracing::warn!("删除无主旁路目录失败 {}: {error}", path.display());
+        }
+    }
+    if orphan_dirs_removed > 0 {
+        println!(
+            "session: {} {} 个无主旁路目录(checkpoint/subagent),{} {} 字节{}",
+            if dry_run { "发现" } else { "已删除" },
+            orphan_dirs_removed,
+            if dry_run { "可释放" } else { "释放" },
+            orphan_dirs_freed,
+            if dry_run {
+                "(对应会话正文已不存在,加 --yes 删除)"
+            } else {
+                ""
+            }
+        );
+    }
+
     // ── CAS blob:按总量上限回收 ref_count == 0 的 blob ──
     if storage.cas_total_bytes > 0 {
         match wyj_core::workspace_cas::WorkspaceCas::open_silently(
@@ -484,10 +591,22 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
                     );
                 } else {
                     match cas.gc(storage.cas_total_bytes) {
-                        Ok(stats) => println!(
-                            "cas: 回收 {} 个 blob / {} 字节,当前 {} 字节",
-                            stats.deleted_blobs, stats.freed_bytes, stats.total_bytes
-                        ),
+                        Ok(stats) => {
+                            if stats.deleted_blobs == 0 && stats.scanned_blobs > 0 {
+                                // 未超 budget 时 `gc` 一行都不删，但「回收 0 个 / 0 字节」
+                                // 看起来像「没有垃圾可收」，与真相（有 orphan 但不超限）
+                                // 不是一回事，必须说清。
+                                println!(
+                                    "cas: 当前 {} 字节未超过上限 {}，gc 未回收（orphan 会保留待复用）",
+                                    stats.total_bytes, storage.cas_total_bytes
+                                );
+                            } else {
+                                println!(
+                                    "cas: 回收 {} 个 blob / {} 字节,当前 {} 字节",
+                                    stats.deleted_blobs, stats.freed_bytes, stats.total_bytes
+                                );
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!("CAS gc 失败: {error}");
                             println!("cas: gc 失败 ({error})");
@@ -519,7 +638,15 @@ fn run_prune(config_base: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         );
     }
     if retention_cfg.sessions_ttl_days > 0 || retention_cfg.stale_lock_ttl_days > 0 {
-        match wyj_core::retention::run(config_base, &retention_cfg, dry_run) {
+        // `project` 档位下会话在工作副本里，必须一并交给 retention，
+        // 否则这里报「将删除 0 个」而磁盘上明明有一堆过期会话。
+        let extra_roots: Vec<PathBuf> = extra.sessions.iter().cloned().collect();
+        match wyj_core::retention::run_with_extra_sessions(
+            config_base,
+            &extra_roots,
+            &retention_cfg,
+            dry_run,
+        ) {
             Ok(stats) => {
                 if retention_cfg.sessions_ttl_days > 0 {
                     println!(
@@ -575,9 +702,9 @@ struct SessionEntry {
     checkpoint_count: u64,
 }
 
-fn collect_status(config_base: &Path) -> Result<StatusReport> {
+fn collect_status(config_base: &Path, extra: &ExtraScopeRoots) -> Result<StatusReport> {
     let mut report = StatusReport::default();
-    for sessions_dir in session_dirs(config_base) {
+    for sessions_dir in session_dirs(config_base, extra) {
         if !sessions_dir.is_dir() {
             continue;
         }
@@ -649,8 +776,26 @@ fn collect_status(config_base: &Path) -> Result<StatusReport> {
     }
     report.memory_v3_bytes = dir_size_if_exists(&wyj_config::layout::memory_v3_root(config_base));
     report.memory_v3_files = file_count_if_exists(&wyj_config::layout::memory_v3_root(config_base));
+    // `project` 档位下记忆 / 演化在工作副本里，不加上这一段 `status` 会
+    // 少报这两块占用，用户按它判断「该不该清」时看到的是残缺数字。
+    if let Some(projects) = &extra.memory_projects {
+        report.memory_v3_bytes = report
+            .memory_v3_bytes
+            .saturating_add(dir_size_if_exists(projects));
+        report.memory_v3_files = report
+            .memory_v3_files
+            .saturating_add(file_count_if_exists(projects));
+    }
     report.evolution_bytes = dir_size_if_exists(&wyj_config::layout::evolution_root(config_base));
     report.evolution_files = file_count_if_exists(&wyj_config::layout::evolution_root(config_base));
+    if let Some(evolution) = &extra.evolution {
+        report.evolution_bytes = report
+            .evolution_bytes
+            .saturating_add(dir_size_if_exists(evolution));
+        report.evolution_files = report
+            .evolution_files
+            .saturating_add(file_count_if_exists(evolution));
+    }
     report.projects_bytes = dir_size_if_exists(&wyj_config::layout::projects_root(config_base));
     report.projects_files = file_count_if_exists(&wyj_config::layout::projects_root(config_base));
     Ok(report)
@@ -661,10 +806,17 @@ fn collect_status(config_base: &Path) -> Result<StatusReport> {
 /// 会话已按项目分目录（`sessions/<project_key>/`），而 `status` / `doctor` /
 /// `prune` 都必须同时看到新布局和根目录下尚未迁移的旧平铺文件——只扫一层会让
 /// `doctor` 报「损坏 0 个」而磁盘上明明有坏文件，`prune` 更是完全清不到。
-fn session_dirs(config_base: &Path) -> Vec<PathBuf> {
-    let root = wyj_config::layout::sessions_root(config_base);
-    let mut dirs = vec![root.clone()];
-    if let Ok(entries) = std::fs::read_dir(&root) {
+fn session_dirs(config_base: &Path, extra: &ExtraScopeRoots) -> Vec<PathBuf> {
+    let mut roots = vec![wyj_config::layout::sessions_root(config_base)];
+    if let Some(extra_root) = &extra.sessions {
+        roots.push(extra_root.clone());
+    }
+    let mut dirs = Vec::new();
+    for root in roots {
+        dirs.push(root.clone());
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if !path.is_dir() {
@@ -689,9 +841,9 @@ fn session_dirs(config_base: &Path) -> Vec<PathBuf> {
 ///
 /// 第三项是 `CheckpointStore` 需要的「会话 id」——checkpoint 目录名是
 /// `<session_id>.checkpoints`，去掉后缀即可。
-fn checkpoint_dirs(config_base: &Path) -> Vec<(PathBuf, PathBuf, String)> {
+fn checkpoint_dirs(config_base: &Path, extra: &ExtraScopeRoots) -> Vec<(PathBuf, PathBuf, String)> {
     let mut found = Vec::new();
-    for sessions_dir in session_dirs(config_base) {
+    for sessions_dir in session_dirs(config_base, extra) {
         let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
             continue;
         };
@@ -1159,6 +1311,102 @@ fn recover_project_root(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// 收集「会话正文已不存在」的旁路目录：`<sid>.checkpoints/` 与
+/// `<sid>.subagents/`。
+///
+/// 抽成独立函数是为了能被单测直接覆盖——孤儿判定有三条容易写错的边界
+/// （宽限期、manifest 活 owner、正文存在即跳过），塞在 `run_prune` 里就只能
+/// 靠「跑一遍真命令看输出」验证。
+fn orphan_sidecar_dirs(
+    config_base: &Path,
+    extra: &ExtraScopeRoots,
+    grace: std::time::Duration,
+) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for sessions_dir in session_dirs(config_base, extra) {
+        let Ok(entries) = std::fs::read_dir(&sessions_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Some(session_id) = name
+                .strip_suffix(".checkpoints")
+                .or_else(|| name.strip_suffix(".subagents"))
+            else {
+                continue;
+            };
+            if sessions_dir.join(format!("{session_id}.json")).exists() {
+                continue;
+            }
+            if !is_older_than(&path, grace) {
+                continue;
+            }
+            if checkpoint_dir_has_live_owner(&path) {
+                continue;
+            }
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// 无主旁路目录的宽限期。
+///
+/// 另一个进程可能刚建好 `<sid>.checkpoints/`、还没写出 `<sid>.json`，此时
+/// 「没有会话正文」是正常中间态。1 小时足够覆盖一次会话创建，又短到不会让
+/// 真正的孤儿长期堆积。
+const ORPHAN_SIDECAR_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// 目录的 mtime 是否早于 `grace` 之前。
+///
+/// 用 mtime 而非 ctime：旁路目录里每写一个 checkpoint 都会刷新 mtime，所以
+/// 「mtime 很新」本身就意味着有进程在动它。
+fn is_older_than(path: &Path, grace: std::time::Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > grace)
+        .unwrap_or(false)
+}
+
+/// 旁路目录的 manifest 里是否还有**活着的** owner。
+///
+/// 只认 `.checkpoints/manifest.json`（`.subagents/` 没有 manifest）。读不出、
+/// 解析失败一律视为「没有活 owner」——损坏的 manifest 对应的会话正文也已经
+/// 不存在了，留着只是垃圾。
+///
+/// 按 `serde_json::Value` 读而不是反序列化成 `CheckpointManifest`：后者是
+/// `core` 的私有结构，为「读一个 pid」把它导出到公开 API 不划算。
+fn checkpoint_dir_has_live_owner(path: &Path) -> bool {
+    let Ok(content) = std::fs::read(path.join("manifest.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&content) else {
+        return false;
+    };
+    value
+        .get("checkpoints")
+        .and_then(|list| list.as_array())
+        .map(|list| {
+            list.iter().any(|entry| {
+                entry
+                    .get("owner_pid")
+                    .and_then(|pid| pid.as_u64())
+                    .filter(|pid| *pid != 0 && *pid <= u32::MAX as u64)
+                    .is_some_and(|pid| wyj_config::filelock::is_process_alive(pid as u32))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn dir_size(path: &Path) -> u64 {
     let mut total: u64 = 0;
     if let Ok(rd) = std::fs::read_dir(path) {
@@ -1200,4 +1448,127 @@ fn file_count_if_exists(path: &Path) -> u64 {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extra_none() -> ExtraScopeRoots {
+        ExtraScopeRoots {
+            sessions: None,
+            memory_projects: None,
+            evolution: None,
+        }
+    }
+
+    /// 把目录 mtime 拨到 `age` 之前，绕过宽限期判定。
+    fn age_dir(path: &Path, age: std::time::Duration) {
+        let when = std::time::SystemTime::now() - age;
+        let file = std::fs::File::open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    fn write_session(dir: &Path, id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{id}.json")), "{}").unwrap();
+        std::fs::create_dir_all(dir.join(format!("{id}.checkpoints"))).unwrap();
+        std::fs::create_dir_all(dir.join(format!("{id}.subagents"))).unwrap();
+    }
+
+    /// 会话正文在 → 旁路目录不是孤儿；正文没了且过了宽限期 → 两个目录都算孤儿。
+    #[test]
+    fn orphan_sidecars_require_a_missing_session_body() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = wyj_config::layout::project_sessions_dir(base.path(), "v1-repo-0123");
+        write_session(&dir, "alive");
+        std::fs::create_dir_all(dir.join("dead.checkpoints")).unwrap();
+        std::fs::create_dir_all(dir.join("dead.subagents")).unwrap();
+        age_dir(
+            &dir.join("dead.checkpoints"),
+            std::time::Duration::from_secs(7200),
+        );
+        age_dir(
+            &dir.join("dead.subagents"),
+            std::time::Duration::from_secs(7200),
+        );
+
+        let found = orphan_sidecar_dirs(base.path(), &extra_none(), ORPHAN_SIDECAR_GRACE);
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_string))
+            .collect();
+        assert_eq!(names.len(), 2, "实得 {names:?}");
+        assert!(names.contains(&"dead.checkpoints".to_string()));
+        assert!(names.contains(&"dead.subagents".to_string()));
+        assert!(!names.iter().any(|name| name.starts_with("alive")));
+    }
+
+    /// 宽限期内不动：另一个进程可能刚建好目录、还没写出会话正文。
+    #[test]
+    fn fresh_orphan_sidecars_survive_the_grace_period() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = wyj_config::layout::project_sessions_dir(base.path(), "v1-repo-0123");
+        std::fs::create_dir_all(dir.join("just-created.checkpoints")).unwrap();
+
+        assert!(orphan_sidecar_dirs(base.path(), &extra_none(), ORPHAN_SIDECAR_GRACE).is_empty());
+        // 同一份目录，宽限期放宽到 0 就应被认出
+        assert_eq!(
+            orphan_sidecar_dirs(base.path(), &extra_none(), std::time::Duration::ZERO).len(),
+            1
+        );
+    }
+
+    /// manifest 里还有活着的 owner 时不动：那条会话的 `/rewind` 目标正被别人用着。
+    #[test]
+    fn sidecars_with_a_live_manifest_owner_are_kept() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = wyj_config::layout::project_sessions_dir(base.path(), "v1-repo-0123");
+        let cp = dir.join("busy.checkpoints");
+        std::fs::create_dir_all(&cp).unwrap();
+        // 用当前进程 pid 冒充「活着的 owner」——它必然存活。
+        std::fs::write(
+            cp.join("manifest.json"),
+            format!(
+                r#"{{"version":1,"checkpoints":[{{"id":"c1","owner_pid":{}}}]}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        age_dir(&cp, std::time::Duration::from_secs(7200));
+
+        assert!(
+            orphan_sidecar_dirs(base.path(), &extra_none(), ORPHAN_SIDECAR_GRACE).is_empty(),
+            "活 owner 的旁路目录不能被当作孤儿"
+        );
+    }
+
+    /// `project` 档位下额外根也要被扫到——否则 TTL 与孤儿清理对那批会话全空转。
+    #[test]
+    fn extra_sessions_root_is_scanned_too() {
+        let base = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let extra_root = local.path().join("sessions");
+        // `extra.sessions` 与 `sessions_root()` 同粒度（其下直接是 `<project_key>/`），
+        // 因此这里自己拼，不能再用 `project_sessions_dir`（它会再加一层 `sessions/`）。
+        let dir = extra_root.join("v1-repo-0123");
+        std::fs::create_dir_all(dir.join("dead.checkpoints")).unwrap();
+        age_dir(
+            &dir.join("dead.checkpoints"),
+            std::time::Duration::from_secs(7200),
+        );
+
+        // 不传 extra → 扫不到
+        assert!(orphan_sidecar_dirs(base.path(), &extra_none(), ORPHAN_SIDECAR_GRACE).is_empty());
+
+        let extra = ExtraScopeRoots {
+            sessions: Some(extra_root),
+            memory_projects: None,
+            evolution: None,
+        };
+        assert_eq!(
+            orphan_sidecar_dirs(base.path(), &extra, ORPHAN_SIDECAR_GRACE).len(),
+            1
+        );
+    }
 }
