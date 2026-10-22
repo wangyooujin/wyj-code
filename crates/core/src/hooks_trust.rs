@@ -159,6 +159,36 @@ pub fn approve(cwd: &Path) -> Result<()> {
     std::fs::write(&path, content).with_context(|| format!("写入信任记录失败: {}", path.display()))
 }
 
+/// 删除某个 cwd 对应的**整个**项目状态目录（`~/.wyj-code/projects/<key>/`）。
+///
+/// 仅测试用：`trust_record_path` 系列硬编码真实 `config_dir()`，而测试的 cwd 是
+/// tempdir，每个用例都会在 `projects/` 下留一个只装着 trust 文件的空壳目录。
+/// 2026-10-22 清理时发现积累到 4500+ 个，全是历次 `cargo test` 留下的。调用方
+/// 的 cwd 是专属 tempdir，`project_key` 由它派生，删除只影响该用例自己。
+#[cfg(test)]
+pub(crate) fn remove_project_state_for_tests(cwd: &Path) {
+    let key = crate::project_key(cwd);
+    if let Ok(config_base) = wyj_config::config_dir() {
+        let _ = std::fs::remove_dir_all(config_base.join("projects").join(key));
+    }
+}
+
+/// [`remove_project_state_for_tests`] 的 RAII 版本，drop 时清理。
+///
+/// 测试里 `let _cleanup = ProjectStateCleanup::new(tmp.path());` 一行搞定收尾；
+/// 放在函数尾部的写法会在 tempdir 还活着时就把痕迹删了，顺序上无碍（tempdir
+/// 在 `/tmp`，项目状态在 `~/.wyj-code`，互不相干），但 RAII 让断言失败提前返回
+/// 的路径也能收到尾。
+#[cfg(test)]
+pub(crate) struct ProjectStateCleanupForTests<'a>(pub &'a Path);
+
+#[cfg(test)]
+impl Drop for ProjectStateCleanupForTests<'_> {
+    fn drop(&mut self) {
+        remove_project_state_for_tests(self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +331,7 @@ mod tests {
             r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo hi"}]}]}}"#,
         )
         .unwrap();
+        let _cleanup = ProjectStateCleanupForTests(dir.path());
 
         approve(dir.path()).unwrap();
         let path = trust_record_path(dir.path()).unwrap();

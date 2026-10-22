@@ -756,38 +756,78 @@ impl SearchCfg {
     pub const KNOWN_PROVIDERS: &'static [&'static str] = &["tavily", "brave"];
 }
 
+/// 鼠标报告（DEC 1000/1002/1006）的开关策略。
+///
+/// alternate screen 里终端自己的滚动条不存在，滚轮能否滚动完全取决于应用是否
+/// 收到鼠标事件；而 macOS Terminal.app 不支持 DEC mode 1007（alternate screen
+/// 滚轮转方向键），所以**不开捕获时 Terminal.app 的滚轮事件根本不会送达应用**。
+/// 应用因此把滚轮、拖选、双击选词、滚动条拖动全部自己实现（见 `crates/tui`），
+/// 让「滚轮 + 直接拖选复制」同时成立——这是本枚举默认 `Auto` 的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MouseMode {
+    /// 默认：按终端能力自动决定。只有 `TERM` 缺失、空串或 `dumb` 这类明确不支持
+    /// 鼠标上报的环境才关闭，其余一律开启。
+    #[default]
+    Auto,
+    /// 强制开启：滚轮与拖选都进应用。
+    On,
+    /// 强制关闭：完全交还终端。终端原生拖选恢复（无需按 Option），代价是
+    /// Terminal.app 下滚轮不再滚动内容区（只有支持 DEC 1007 的终端仍可用）。
+    Off,
+}
+
+impl MouseMode {
+    /// 给定 `TERM` 值判定最终是否开启鼠标报告。纯函数，便于钉住自动检测规则。
+    pub fn resolve(self, term: Option<&str>) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => !matches!(term.map(str::trim), None | Some("") | Some("dumb")),
+        }
+    }
+
+    /// 按当前进程环境判定。
+    pub fn detect(self) -> bool {
+        self.resolve(std::env::var("TERM").ok().as_deref())
+    }
+}
+
 /// `[ui]` 节 —— TUI 展示区的交互开关。
-///
-/// `mouse_capture` 是 2026-10 那次取舍的落点：alternate screen 里终端自己的
-/// 滚动条不存在，滚轮能否滚动完全取决于应用是否开启鼠标报告（DEC 1000/1002/
-/// 1006）。macOS Terminal.app 不支持 DEC mode 1007（alternate screen 滚轮转
-/// 方向键），因此在「不开启鼠标捕获」的前提下，Terminal.app 的滚轮事件**根本
-/// 不会送达应用**——这是「滚轮完全没反应」的唯一根因。
-///
-/// 开启的代价：终端原生拖选复制需要按住 Option（多数终端在应用开启鼠标报告后
-/// 的既定行为）。这个代价由用户选择接受，故默认开启，并保留 `/mouse` 与
-/// `mouse_capture = false` 两条随时退回的通道。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiCfg {
-    /// 是否开启鼠标报告，让滚轮/拖拽事件进入应用。
+    /// 鼠标报告策略（`"auto"` / `"on"` / `"off"`），默认 `auto`。
     ///
-    /// - `true`（默认）：滚轮滚动聊天区与子 Agent 详情；拖选复制需按住 Option。
-    /// - `false`：完全交还终端（拖选无需修饰键），滚轮只对支持 DEC 1007 的终端
-    ///   （Ghostty 直连）有效，Terminal.app 下无反应。
-    ///
-    /// 运行时可用 `/mouse` 切换，不写回配置文件。
-    pub mouse_capture: bool,
+    /// 应用自己实现滚轮滚动、拖选复制与滚动条拖动，所以开启捕获不再意味着
+    /// 「失去拖选」——`off` 只留给「想用终端原生选区与自身滚动缓冲」的场景。
+    pub mouse: MouseMode,
+    /// 已废弃：v0.3.18 前的布尔开关，`true` 等价 `mouse = "on"`、`false` 等价
+    /// `mouse = "off"`。仅为旧配置文件保留，不参与写回。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mouse_capture: Option<bool>,
     /// 是否在内容区右侧绘制应用内细滚动条（`│`/`┃`，less/vim 观感）。
     ///
-    /// 只在内容超出视口时出现，宽度 < 3 列的终端不画。
+    /// 只在内容超出视口时出现，宽度 < 3 列的终端不画；出现后可用鼠标拖动。
     pub scrollbar: bool,
+}
+
+impl UiCfg {
+    /// 本次运行实际生效的鼠标报告开关：旧字段显式写过就尊重它，否则按 `mouse`
+    /// 三态判定（`auto` 走终端能力检测）。
+    pub fn resolved_mouse(&self) -> bool {
+        match (self.mouse, self.mouse_capture) {
+            (MouseMode::Auto, Some(legacy)) => legacy,
+            (mode, _) => mode.detect(),
+        }
+    }
 }
 
 impl Default for UiCfg {
     fn default() -> Self {
         Self {
-            mouse_capture: true,
+            mouse: MouseMode::Auto,
+            mouse_capture: None,
             scrollbar: true,
         }
     }
@@ -2231,8 +2271,8 @@ context_window = 200000
 #[cfg(test)]
 mod subagent_cfg_tests {
     use super::{
-        ComputerUseCfg, Config, EvolutionCfg, ForegroundFallback, Profile, Provider, RoutingRole,
-        SubAgentCfg, WireProtocol,
+        ComputerUseCfg, Config, EvolutionCfg, ForegroundFallback, MouseMode, Profile, Provider,
+        RoutingRole, SubAgentCfg, UiCfg, WireProtocol,
     };
 
     #[test]
@@ -2705,22 +2745,48 @@ context_window = 200000
         assert_eq!(AgentMode::Auto.label(), "auto");
     }
 
-    /// `[ui]` 缺省时两个开关都开：滚轮可用 + 滚动条可见。
+    /// `[ui]` 缺省时：鼠标走自动检测（常见终端都开）+ 滚动条可见。
     ///
-    /// `mouse_capture` 默认 `true` 是**功能前提**而不是审美选择——macOS
-    /// Terminal.app 不支持 DEC 1007，不开捕获时滚轮事件根本到不了应用。
     /// 老配置文件里没有 `[ui]` 节，必须靠 `#[serde(default)]` 落到这里的默认值。
     #[test]
-    fn ui_cfg_defaults_to_mouse_capture_and_scrollbar_on() {
+    fn ui_cfg_defaults_to_auto_mouse_and_scrollbar_on() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert!(cfg.ui.mouse_capture);
+        assert_eq!(cfg.ui.mouse, MouseMode::Auto);
         assert!(cfg.ui.scrollbar);
+        // 常见终端（xterm-256color / screen / tmux）都判定为开启。
+        assert!(cfg.ui.mouse.resolve(Some("xterm-256color")));
+        assert!(cfg.ui.mouse.resolve(Some("screen-256color")));
+        // 明确不支持鼠标上报的环境关闭。
+        assert!(!cfg.ui.mouse.resolve(Some("dumb")));
+        assert!(!cfg.ui.mouse.resolve(None));
+    }
 
-        // 显式关闭要能生效（用户可能想换回终端原生拖选）。
-        let cfg: Config =
-            toml::from_str("[ui]\nmouse_capture = false\nscrollbar = false\n").unwrap();
-        assert!(!cfg.ui.mouse_capture);
+    /// 三态显式取值要能生效，且优先级高于自动检测。
+    #[test]
+    fn ui_cfg_mouse_mode_parses_and_overrides_detection() {
+        let cfg: Config = toml::from_str("[ui]\nmouse = \"off\"\n").unwrap();
+        assert_eq!(cfg.ui.mouse, MouseMode::Off);
+        assert!(!cfg.ui.mouse.resolve(Some("xterm-256color")));
+
+        let cfg: Config = toml::from_str("[ui]\nmouse = \"on\"\nscrollbar = false\n").unwrap();
+        assert_eq!(cfg.ui.mouse, MouseMode::On);
+        assert!(cfg.ui.mouse.resolve(Some("dumb")));
         assert!(!cfg.ui.scrollbar);
+    }
+
+    /// 旧字段 `mouse_capture` 仍要生效（用户可能还没改配置），但不会被写回。
+    #[test]
+    fn legacy_mouse_capture_field_still_applies_and_is_not_serialized() {
+        let cfg: Config = toml::from_str("[ui]\nmouse_capture = false\n").unwrap();
+        assert_eq!(cfg.ui.mouse, MouseMode::Auto);
+        assert!(!cfg.ui.resolved_mouse());
+
+        let cfg: Config = toml::from_str("[ui]\nmouse_capture = true\n").unwrap();
+        assert!(cfg.ui.resolved_mouse());
+
+        // 写回时不再出现旧键，避免「删不掉的配置项」。
+        let text = toml::to_string(&UiCfg::default()).unwrap();
+        assert!(!text.contains("mouse_capture"), "{text}");
     }
 
     /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器。

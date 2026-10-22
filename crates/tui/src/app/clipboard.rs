@@ -192,6 +192,20 @@ pub(crate) struct PasteHint {
     pub(crate) cursor_col: usize,
 }
 
+/// 选区所在的区域。
+///
+/// 拖选只在**起手区域**内进行：聊天区与输入框的文本来源不同（一个是渲染后的
+/// 屏幕快照，一个是输入框的折行结果），允许跨区拖选就得回答「拼接处算不算
+/// 输入框边框」这类没有一致答案的问题。限制在起手区域，复制出来的永远是
+/// 单一区域的纯文本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectionArea {
+    /// 内容区（聊天流 / 子 Agent 详情）。
+    Chat,
+    /// 输入框正文（不含边框）。
+    Composer,
+}
+
 /// 应用内文本选区，坐标是**屏幕绝对坐标**（含宽字符）。
 ///
 /// 为什么必须有它：一旦开启鼠标报告，终端就不会再处理拖选——事件全部进应用，
@@ -200,21 +214,44 @@ pub(crate) struct PasteHint {
 /// 下彻底失效（它不支持 DEC 1007）。两者不可兼得，只能在应用内把选择补回来。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TextSelection {
+    /// 选区所属区域，决定夹取边界、高亮范围与取文字的屏幕快照。
+    pub area: SelectionArea,
     /// 按下左键的锚点
     pub anchor: (u16, u16),
     /// 当前拖动到的位置（含）
     pub cursor: (u16, u16),
+    /// 建立选区时所在区域的纵向滚动偏移。
+    ///
+    /// 坐标本身是屏幕坐标，滚动会让文字移走而坐标不动。记下建立时的偏移，
+    /// 渲染与复制时按 `当前偏移 - scroll_anchor` 反向平移，选区就能**跟着文字
+    /// 走**——滚轮不再需要清空选区。
+    pub scroll_anchor: usize,
     /// 拖选是否仍在进行（松开后为 false，选区保留用于高亮与复制）
     pub dragging: bool,
 }
 
 impl TextSelection {
-    pub(super) fn new(anchor: (u16, u16)) -> Self {
+    pub(super) fn new(area: SelectionArea, anchor: (u16, u16), scroll_anchor: usize) -> Self {
         Self {
+            area,
             anchor,
             cursor: anchor,
+            scroll_anchor,
             dragging: true,
         }
+    }
+
+    /// 按纵向滚动差量平移后的选区。
+    ///
+    /// `delta` = 当前滚动偏移 − 建立时的偏移；滚动偏移增大意味着内容上移，
+    /// 所以屏幕行要减去同一个量。平移可能把行推到区域外（负值），调用方在
+    /// 绘制与取文时按区域矩形裁剪即可。
+    pub(crate) fn shifted(&self, delta: i32) -> ((i32, i32), (i32, i32)) {
+        let (start, end) = self.ordered();
+        (
+            (start.0 as i32, start.1 as i32 - delta),
+            (end.0 as i32, end.1 as i32 - delta),
+        )
     }
 
     /// 归一化后的 `(起, 止)`：无论从下往上还是从上往下拖，取的都是同一段。
@@ -231,13 +268,6 @@ impl TextSelection {
     pub(super) fn is_empty(&self) -> bool {
         self.anchor == self.cursor
     }
-
-    /// 该格是否落在选区内（含首尾）。
-    pub(crate) fn contains(&self, x: u16, y: u16) -> bool {
-        let (start, end) = self.ordered();
-        let point = (y, x);
-        (start.1, start.0) <= point && point <= (end.1, end.0)
-    }
 }
 
 pub(super) const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
@@ -245,6 +275,77 @@ pub(super) const PASTE_HINT_DURATION: Duration = Duration::from_millis(1500);
 pub(super) const SELECTION_NOTICE_DURATION: Duration = Duration::from_millis(1500);
 /// 双击判定窗口：同一位置两次按下间隔小于它就按「选词」处理。
 pub(super) const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
+
+/// 滚动条控制的是哪一块滚动状态。
+///
+/// 内容区在不同焦点下画的是不同的东西（聊天流 / 子 Agent 详情），两者各有独立
+/// 的偏移与跟随标志，拖动时必须落到对应那一份上。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbarTarget {
+    /// 聊天流（`chat_scroll`）。
+    Chat,
+    /// 子 Agent 详情（`sub_agent_detail_scroll`）。
+    SubAgentDetail,
+}
+
+/// 滚动条拖动所需的几何信息，由渲染层每帧回写。
+///
+/// 拖动比例换算只依赖这几个数，与具体是聊天区还是详情面板无关——所以两边
+/// 共用同一份结构，渲染侧各填各的。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollbarMetrics {
+    /// 轨道矩形（宽 1 列）。
+    pub area: ratatui::layout::Rect,
+    /// 滑块顶部相对轨道顶部的行偏移。
+    pub thumb_top: usize,
+    /// 滑块长度（至少 1）。
+    pub thumb_len: usize,
+    /// 可滚动最大偏移。
+    pub max_scroll: usize,
+    /// 拖动落到哪一份滚动状态上。
+    pub target: ScrollbarTarget,
+}
+
+impl ScrollbarMetrics {
+    /// 复制一份并指向另一个滚动目标（渲染侧先建通用几何，再标注归属）。
+    pub fn for_target(self, target: ScrollbarTarget) -> Self {
+        Self { target, ..self }
+    }
+
+    /// 落在 `y` 行时滑块顶部应该在的位置（按比例映射，夹进轨道）。
+    pub fn thumb_top_for(&self, y: u16) -> usize {
+        let track = self.area.height as usize;
+        (y.saturating_sub(self.area.y) as usize).min(track.saturating_sub(1))
+    }
+
+    /// 滑块顶部 → 滚动偏移。
+    ///
+    /// 滑块可移动的行程是 `轨道长 − 滑块长`，对应偏移行程 `0..=max_scroll`。
+    /// 行程为 0（内容刚好装下或滑块占满轨道）时恒为 0。
+    pub fn scroll_for_thumb_top(&self, thumb_top: usize) -> usize {
+        let track = self.area.height as usize;
+        let travel = track.saturating_sub(self.thumb_len);
+        if travel == 0 || self.max_scroll == 0 {
+            return 0;
+        }
+        let top = thumb_top.min(travel);
+        // 四舍五入，避免最后一格差一点到不了底。
+        (top * self.max_scroll + travel / 2) / travel
+    }
+}
+
+/// 正在进行的滚动条拖动。
+///
+/// 按下时记下「按下点在滑块内的相对位置」，拖动时按 `y - grab_offset` 换算目标
+/// 偏移。**不能**直接用按下点当滑块中心：滑块有长度，用户往往抓在它中间偏上
+/// 或偏下的位置，用按下点定位会让滑块在第一次拖动时「跳一下」。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScrollbarDrag {
+    /// 按下点在滑块内的相对位置（0 = 滑块顶部）。
+    pub grab_offset: usize,
+    /// 按下时的几何快照；拖动期间不随渲染刷新，保证换算稳定。
+    pub metrics: ScrollbarMetrics,
+}
 
 /// 一屏聊天区文本快照的一行。
 ///
@@ -299,6 +400,10 @@ pub(super) fn is_word_char(ch: char) -> bool {
 
 /// 把选区还原成文字。
 ///
+/// `delta` 是「当前滚动偏移 − 选区建立时的偏移」：滚动后选区要跟着文字走，
+/// 所以取文时先把选区按同一个差量平移，再按平移后的屏幕行取快照。传 0 表示
+/// 选区建立后没滚动过（绝大多数情况）。
+///
 /// 三条容易写错的地方：
 /// 1. **跨行只在选区覆盖处换行**：首行从起点取到行尾、末行从行首取到终点。
 ///    整行整行地拼会把左右两侧的留白也复制进去。
@@ -306,12 +411,26 @@ pub(super) fn is_word_char(ch: char) -> bool {
 ///    拖一串尾巴，粘进终端/编辑器里全是多余空白。
 /// 3. **单行选区不 trim_start**：用户可能只想复制缩进后的片段（代码块），
 ///    左端是他亲手点出来的边界。
-pub(crate) fn selection_text(sel: &TextSelection, rows: &[ScreenRow]) -> String {
-    let ((sx, sy), (ex, ey)) = sel.ordered();
+pub(crate) fn selection_text(sel: &TextSelection, rows: &[ScreenRow], delta: i32) -> String {
+    let ((sx, sy), (ex, ey)) = sel.shifted(delta);
     let mut out = Vec::new();
-    for row in rows.iter().filter(|r| r.y >= sy && r.y <= ey) {
-        let from = if row.y == sy { sx } else { 0 };
-        let to = if row.y == ey { ex } else { u16::MAX };
+    for row in rows
+        .iter()
+        .filter(|r| (r.y as i32) >= sy && (r.y as i32) <= ey)
+    {
+        let from = if row.y as i32 == sy {
+            sx.max(0) as u16
+        } else {
+            0
+        };
+        let to = if row.y as i32 == ey {
+            ex.clamp(0, u16::MAX as i32) as u16
+        } else {
+            u16::MAX
+        };
+        if from > to {
+            continue;
+        }
         out.push(row.slice(from, to).trim_end().to_string());
     }
     // 末尾的纯空行没有信息量（用户拖到内容区底部时会带进来），去掉。
@@ -1792,8 +1911,10 @@ mod clipboard_paste_tests {
 
     fn sel(anchor: (u16, u16), cursor: (u16, u16)) -> TextSelection {
         TextSelection {
+            area: SelectionArea::Chat,
             anchor,
             cursor,
+            scroll_anchor: 0,
             dragging: false,
         }
     }
@@ -1802,7 +1923,7 @@ mod clipboard_paste_tests {
     #[test]
     fn selection_text_takes_only_the_covered_columns() {
         let rows = vec![row(0, "hello world", 0)];
-        let text = selection_text(&sel((6, 0), (10, 0)), &rows);
+        let text = selection_text(&sel((6, 0), (10, 0)), &rows, 0);
         assert_eq!(text, "world");
     }
 
@@ -1814,7 +1935,7 @@ mod clipboard_paste_tests {
             row(1, "gamma", 0),
             row(2, "delta", 0),
         ];
-        let text = selection_text(&sel((6, 0), (3, 2)), &rows);
+        let text = selection_text(&sel((6, 0), (3, 2)), &rows, 0);
         assert_eq!(text, "beta\ngamma\ndelt");
     }
 
@@ -1822,8 +1943,8 @@ mod clipboard_paste_tests {
     #[test]
     fn selection_text_is_direction_agnostic() {
         let rows = vec![row(0, "abc", 0), row(1, "def", 0)];
-        let forward = selection_text(&sel((1, 0), (1, 1)), &rows);
-        let backward = selection_text(&sel((1, 1), (1, 0)), &rows);
+        let forward = selection_text(&sel((1, 0), (1, 1)), &rows, 0);
+        let backward = selection_text(&sel((1, 1), (1, 0)), &rows, 0);
         assert_eq!(forward, backward);
         assert_eq!(forward, "bc\nde");
     }
@@ -1832,7 +1953,7 @@ mod clipboard_paste_tests {
     #[test]
     fn selection_text_trims_trailing_padding() {
         let rows = vec![row(0, "hi        ", 0)];
-        let text = selection_text(&sel((0, 0), (9, 0)), &rows);
+        let text = selection_text(&sel((0, 0), (9, 0)), &rows, 0);
         assert_eq!(text, "hi");
     }
 
@@ -1851,16 +1972,16 @@ mod clipboard_paste_tests {
         let rows = vec![row];
 
         // 终点落在 "中" 的续格（列 1）上：仍取完整的一个字。
-        assert_eq!(selection_text(&sel((0, 0), (1, 0)), &rows), "中");
+        assert_eq!(selection_text(&sel((0, 0), (1, 0)), &rows, 0), "中");
         // 起点落在续格上：从下一个字开始，不产生乱码。
-        assert_eq!(selection_text(&sel((1, 0), (3, 0)), &rows), "文");
+        assert_eq!(selection_text(&sel((1, 0), (3, 0)), &rows, 0), "文");
     }
 
     /// 选区左端不 trim：代码缩进是用户亲手点出来的边界，不能替他裁掉。
     #[test]
     fn selection_text_keeps_leading_indentation() {
         let rows = vec![row(0, "    let x = 1;", 0)];
-        let text = selection_text(&sel((4, 0), (14, 0)), &rows);
+        let text = selection_text(&sel((4, 0), (14, 0)), &rows, 0);
         assert_eq!(text, "let x = 1;");
     }
 
@@ -1869,7 +1990,7 @@ mod clipboard_paste_tests {
     fn double_click_selects_a_whole_path() {
         let rows = vec![row(0, "see src/app.rs:123 now", 0)];
         let (start, end) = word_bounds_at(&rows, 7, 0); // 落在 "app"
-        let text = selection_text(&sel(start, end), &rows);
+        let text = selection_text(&sel(start, end), &rows, 0);
         assert_eq!(text, "src/app.rs:123");
     }
 
@@ -1881,12 +2002,13 @@ mod clipboard_paste_tests {
         assert_eq!(start, end);
     }
 
-    /// 拖拽必须被夹在内容区里：鼠标滑到输入框上不能把输入框选进来。
+    /// 拖拽必须被夹在起手区域内：从内容区起手时，鼠标滑到输入框上不能把
+    /// 输入框选进来。
     #[test]
-    fn drag_is_clamped_to_the_content_area() {
+    fn drag_is_clamped_to_the_starting_area() {
         let mut state = make_state();
         state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
-        state.selection = Some(TextSelection::new((2, 2)));
+        state.selection = Some(TextSelection::new(SelectionArea::Chat, (2, 2), 0));
 
         state.update_selection(100, 100);
         let sel = state.selection.unwrap();
@@ -1896,13 +2018,39 @@ mod clipboard_paste_tests {
         assert_eq!(state.selection.unwrap().cursor, (0, 0));
     }
 
-    /// 内容区之外按下左键不建立选区（输入框/状态栏里点击不该出现高亮）。
+    /// 输入框里起手的拖选夹在输入框正文区内，不会把聊天区一起选中。
     #[test]
-    fn click_outside_the_content_area_does_not_start_a_selection() {
+    fn composer_drag_stays_inside_the_composer() {
         let mut state = make_state();
         state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.composer_area = ratatui::layout::Rect::new(0, 20, 40, 3);
+        state.selection = Some(TextSelection::new(SelectionArea::Composer, (5, 21), 0));
+
+        state.update_selection(5, 0);
+        assert_eq!(state.selection.unwrap().cursor, (5, 20));
+
+        state.update_selection(5, 100);
+        assert_eq!(state.selection.unwrap().cursor, (5, 22));
+    }
+
+    /// 内容区之外按下左键不建立选区（状态栏里点击不该出现高亮）。
+    #[test]
+    fn click_outside_the_selectable_areas_does_not_start_a_selection() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.composer_area = ratatui::layout::Rect::new(0, 20, 40, 3);
         state.begin_selection(5, 30, &[]);
         assert!(state.selection.is_none());
+    }
+
+    /// 输入框内按下要返回目标文本位置，供主循环把光标移过去。
+    #[test]
+    fn clicking_the_composer_reports_the_target_position() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.composer_area = ratatui::layout::Rect::new(0, 20, 40, 3);
+        assert_eq!(state.begin_selection(7, 21, &[]), Some((7, 21)));
+        assert_eq!(state.selection.unwrap().area, SelectionArea::Composer);
     }
 
     /// 有浮层时不允许应用内拖选：`frame_rows` 抓的是叠加后的画面，
@@ -1928,5 +2076,108 @@ mod clipboard_paste_tests {
         assert!(state.selection.is_some());
         state.end_selection(&[]);
         assert!(state.selection.is_none());
+    }
+
+    /// 滚动之后选区跟着文字走：滚过 `delta` 行，高亮区间整体上移同样的行数。
+    #[test]
+    fn selection_follows_the_content_when_scrolled() {
+        let mut state = make_state();
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        state.chat_max_scroll = 100;
+        state.selection = Some(TextSelection::new(SelectionArea::Chat, (2, 4), 0));
+
+        state.chat_scroll = 3;
+        let sel = state.selection.unwrap();
+        assert_eq!(state.selection_scroll_delta(&sel), 3);
+        let ((_, sy), _) = sel.shifted(3);
+        assert_eq!(sy, 1, "内容上移 3 行，选区跟着上移到第 1 行");
+    }
+
+    /// 滚动条几何换算：滑块顶部 → 偏移，且两端能取到 0 与 max。
+    #[test]
+    fn scrollbar_metrics_map_thumb_position_to_offset() {
+        let metrics = ScrollbarMetrics {
+            area: ratatui::layout::Rect::new(79, 0, 1, 20),
+            thumb_top: 0,
+            thumb_len: 5,
+            max_scroll: 60,
+            target: ScrollbarTarget::Chat,
+        };
+        assert_eq!(metrics.scroll_for_thumb_top(0), 0);
+        // 行程 = 20 - 5 = 15，滑块到底 = 60。
+        assert_eq!(metrics.scroll_for_thumb_top(15), 60);
+        // 中途按比例。
+        assert_eq!(metrics.scroll_for_thumb_top(5), 20);
+    }
+
+    /// 轨道比滑块还短时（内容刚好装下）拖动不产生滚动。
+    #[test]
+    fn scrollbar_metrics_are_inert_when_content_fits() {
+        let metrics = ScrollbarMetrics {
+            area: ratatui::layout::Rect::new(79, 0, 1, 5),
+            thumb_top: 0,
+            thumb_len: 5,
+            max_scroll: 0,
+            target: ScrollbarTarget::Chat,
+        };
+        assert_eq!(metrics.scroll_for_thumb_top(3), 0);
+    }
+
+    /// 快照只在滚动条**真的画出来**时跳过最右列。
+    ///
+    /// 内容装得下时滚动条不画，那一列就是正文——无条件跳过会让最右一个字符
+    /// 永远复制不出来（`[ui].scrollbar = true` 只是「允许画」，不是「画了」）。
+    #[test]
+    fn frame_capture_keeps_the_last_column_when_no_scrollbar_is_drawn() {
+        let mut state = make_state();
+        state.show_scrollbar = true;
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 10, 2);
+        state.content_scrollbar = None;
+
+        let buffer = ratatui::buffer::Buffer::with_lines(["abcdefghij", "klmnopqrst"]);
+        state.capture_frame_rows(&buffer);
+        assert!(
+            state.frame_rows.iter().any(|r| r.text.contains('j')),
+            "没画滚动条时最右列属于正文: {:?}",
+            state.frame_rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+
+        // 画了滚动条：最右列是装饰，必须排除。
+        state.content_scrollbar = Some(ScrollbarMetrics {
+            area: ratatui::layout::Rect::new(9, 0, 1, 2),
+            thumb_top: 0,
+            thumb_len: 2,
+            max_scroll: 0,
+            target: ScrollbarTarget::Chat,
+        });
+        state.capture_frame_rows(&buffer);
+        assert!(
+            state.frame_rows.iter().all(|r| !r.text.contains('j')),
+            "画了滚动条时最右列不参与选文"
+        );
+    }
+
+    /// 快照跨帧复用容量时不能残留上一帧的行。
+    ///
+    /// 两段区域（内容区 + 输入框）各写一段，行数随窗口大小变化；如果只在末尾
+    /// `truncate` 而没清旧内容，缩小的那一帧会把上一帧的尾部行留在快照里，
+    /// 复制时凭空多出几行已经不在屏幕上的文字。
+    #[test]
+    fn frame_capture_does_not_leak_rows_from_a_larger_previous_frame() {
+        let mut state = make_state();
+        state.show_scrollbar = false;
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 5, 4);
+        state.composer_area = ratatui::layout::Rect::default();
+
+        let tall = ratatui::buffer::Buffer::with_lines(["aaaaa", "bbbbb", "ccccc", "ddddd"]);
+        state.capture_frame_rows(&tall);
+        assert_eq!(state.frame_rows.len(), 4);
+
+        // 窗口变矮：只剩两行，旧的两行必须消失。
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 5, 2);
+        state.capture_frame_rows(&tall);
+        assert_eq!(state.frame_rows.len(), 2);
+        assert_eq!(state.frame_rows[0].text, "aaaaa");
+        assert_eq!(state.frame_rows[1].text, "bbbbb");
     }
 }

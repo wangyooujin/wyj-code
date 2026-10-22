@@ -248,6 +248,7 @@ main:
   session_resumed_last: "Resumed last session {id} ({count} messages)"
   session_in_use: "Warning: session {id} may still be in use by wyj-code process {pid}. Saving from both processes overwrites each other's messages. To work in parallel, start an isolated instance with `wyj-code workspace create`."
   session_in_use_headless: "Session {id} is being used by another wyj-code process ({pid}). Refusing to resume: headless mode has nobody to ask, and continuing would silently overwrite the other instance's messages. Start a fresh session, or stop the other process first."
+  instances_share_cwd: "Note: another wyj-code process ({pids}) is working in the **same directory**. You will both see each other's uncommitted changes, and `/rewind` will overwrite edits the other instance has not checkpointed. To work on code in parallel, start an isolated instance with `wyj-code workspace create --branch <name>`."
   resume_compacted: "Resumed history was long; pre-compacted ({count} old messages removed)"
   no_session_history: "No session history yet, starting a new session."
   mode_info_plan: " [plan mode: read-only tools only]"
@@ -272,7 +273,6 @@ help:
     - `/agents` — List available subagent types (built-in + custom *.md definitions)
     - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/shells [id]` — Open the background shell panel to watch live output of Bash tasks started with run_in_background; pass an id (e.g. bash_1) to jump directly to it
-    - `/mouse` — Toggle mouse capture: on, the wheel scrolls the content area and drag-select copies automatically; off, selection is handled natively by the terminal
     - `/doctor` — Diagnose environment (API Key / config / memory)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
@@ -316,9 +316,10 @@ help:
     - `↑` / `↓` — Browse input history; in multiline input, move the cursor first and cross into history only at the first/last line
     - `Shift+↑` — Enter the content area (running sub-agents first, then todos, background shells, chat); `Esc` walks back to the composer
     - `PageUp` / `PageDown` — Page through the current conversation
-    - `Mouse wheel` — Scroll the content area (the thin scrollbar on the right shows the position); `/mouse` toggles mouse capture
-    - `Drag` — Select text in the content area; releasing copies it to the system clipboard. Double-click selects a word (a whole path or URL)
-    - `Esc` — Clear the current selection (any key also clears it)
+    - `Mouse wheel` — Scroll the content area; with the pointer over the composer it scrolls the draft itself
+    - `Drag` — Select text in the content area or the composer; releasing copies it to the system clipboard. Double-click selects a whole word (paths/URLs stay intact). The selection follows the text when you scroll; `Esc` or any key clears it
+    - `Click the composer` — The cursor jumps to the click position, like a normal editor
+    - `Drag the right scrollbar` — Jump straight to that position; clicking the track jumps too
     - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
     - `Command+Click` / `Ctrl+Click` — Open local file paths or web links in responses
     - `/` — Command completion (Tab to confirm, Esc to cancel)
@@ -872,12 +873,6 @@ mode:
   switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
   current: "Current mode: {mode} (options: auto / plan / bypass)"
   unknown: "Unknown mode '{args}'. Options: auto / plan / bypass"
-
-mouse:
-  desc: "Toggle mouse capture: on, the wheel scrolls the conversation and drag-select copies automatically; off, the terminal handles the mouse natively"
-  on: "Mouse capture enabled: the wheel scrolls the content area, and dragging selects text that copies on release (double-click selects a word). Run /mouse again to turn it off."
-  off: "Mouse capture disabled: native terminal drag-select is back (no Option needed), but the wheel no longer scrolls the content area on macOS Terminal.app."
-  headless_unsupported: "[headless mode has no mouse interaction; /mouse has no effect]"
 
 selection:
   copied: "Copied {chars} characters"

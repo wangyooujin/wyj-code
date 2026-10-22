@@ -89,6 +89,22 @@ fn input_with_placeholders(
     attachments: &[Attachment],
     pastes: &[crate::app::PasteBlock],
 ) -> InputBox {
+    input_with_placeholders_mapped(input, attachments, pastes).0
+}
+
+/// [`input_with_placeholders`] 的带映射版本：额外返回「显示列 → 原始列」表。
+///
+/// 鼠标点击输入框时，屏幕坐标只能反查到**展开后**的字符位置，而真正要改的是
+/// 原始 `InputBox` 的 `cursor_col`（那里是 `ATTACHMENT_MARKER` 这样的原子标记）。
+/// 没有这张表，点一下 `[Image #1]` 就会把光标放到标签内部——一个不存在的列。
+///
+/// 表与 `display.lines` 同形：`map[row][i]` 是显示行第 `i` 个字符位置（光标
+/// 位置，0..=len）对应的原始列号。占位符标签内部的每个位置都映射到标记本身。
+fn input_with_placeholders_mapped(
+    input: &InputBox,
+    attachments: &[Attachment],
+    pastes: &[crate::app::PasteBlock],
+) -> (InputBox, Vec<Vec<usize>>) {
     let mut attachment_labels = Vec::with_capacity(attachments.len());
     let mut image_number = 0usize;
     for attachment in attachments {
@@ -113,18 +129,24 @@ fn input_with_placeholders(
         .collect();
 
     let mut display = input.clone();
+    let mut map: Vec<Vec<usize>> = Vec::with_capacity(input.lines.len());
     let mut attachment_idx = 0usize;
     let mut paste_idx = 0usize;
     for (row, source) in input.lines.iter().enumerate() {
         let chars = source.chars().collect::<Vec<_>>();
         let mut rendered = String::new();
+        // `rendered.len()` 是**字符数**，与 map 的下标同一套语义。
+        let mut rendered_chars = 0usize;
+        let mut row_map: Vec<usize> = Vec::new();
         let mut mapped_cursor = None;
 
         for col in 0..=chars.len() {
             if row == input.cursor_row && col == input.cursor_col {
-                mapped_cursor = Some(rendered.chars().count());
+                mapped_cursor = Some(rendered_chars);
             }
             if col == chars.len() {
+                // 行尾位置也要能被点到（点在最后一个字右边）。
+                row_map.push(col);
                 break;
             }
 
@@ -134,6 +156,8 @@ fn input_with_placeholders(
                 PASTE_MARKER => paste_labels.get(paste_idx),
                 _ => {
                     rendered.push(ch);
+                    row_map.push(col);
+                    rendered_chars += 1;
                     continue;
                 }
             };
@@ -146,20 +170,31 @@ fn input_with_placeholders(
                 continue;
             };
 
+            // 映射表的规则是「每写一个显示字符就记一条，最后补行尾」——所以
+            // 标记本身不单独占一条：标签的起始位置就是标记所在列（有前置空格
+            // 时是那个空格，否则是标签首字符）。
             if rendered
                 .chars()
                 .last()
                 .is_some_and(|ch| !ch.is_whitespace())
             {
                 rendered.push(' ');
+                row_map.push(col);
+                rendered_chars += 1;
             }
-            rendered.push_str(label);
+            for label_char in label.chars() {
+                rendered.push(label_char);
+                row_map.push(col);
+                rendered_chars += 1;
+            }
             let next = chars.get(col + 1).copied();
             if next.is_none()
                 || next.is_some_and(is_atomic_marker)
                 || next.is_some_and(|ch| !ch.is_whitespace())
             {
                 rendered.push(' ');
+                row_map.push(col);
+                rendered_chars += 1;
             }
         }
 
@@ -167,6 +202,7 @@ fn input_with_placeholders(
         if let Some(cursor_col) = mapped_cursor {
             display.cursor_col = cursor_col;
         }
+        map.push(row_map);
     }
 
     // 兼容升级前已存在但没有编辑器标记的瞬时附件状态；新粘贴路径不会进入这里。
@@ -176,8 +212,14 @@ fn input_with_placeholders(
         if display.cursor_row == 0 {
             display.cursor_col += prefix.chars().count();
         }
+        // 这段补丁只在旧状态出现；映射表整体右移，全部指回原始第 0 列。
+        if let Some(first) = map.first_mut() {
+            let mut padded = vec![0usize; prefix.chars().count()];
+            padded.extend(first.iter().copied());
+            *first = padded;
+        }
     }
-    display
+    (display, map)
 }
 
 /// 聊天区里那条用户消息的展示文本——**与输入框走同一条投影线**。
@@ -253,6 +295,40 @@ mod attachment_input_tests {
             "describe this [Image #1] ".chars().count()
         );
         assert_eq!(input.text(), "describe this");
+    }
+
+    /// 占位符展开要同时产出「显示列 → 原始列」映射：点标签任何位置都落回标记本身。
+    ///
+    /// 少了这张表，鼠标点 `[Image #1]` 会把光标放到标签内部——原始 `InputBox`
+    /// 里根本不存在的列。
+    #[test]
+    fn placeholder_mapping_points_back_to_the_marker() {
+        let mut input = InputBox::new();
+        input.insert_text("ab");
+        input.insert_attachment_marker();
+        input.insert_text("cd");
+        let attachments = vec![Attachment::Image {
+            media_type: "image/png".to_string(),
+            data: "encoded".to_string(),
+            preview_label: "320×180".to_string(),
+        }];
+
+        let (display, map) = input_with_placeholders_mapped(&input, &attachments, &[]);
+        let rendered: Vec<char> = display.lines[0].chars().collect();
+        assert_eq!(map.len(), 1);
+        assert_eq!(
+            map[0].len(),
+            rendered.len() + 1,
+            "映射表长度 = 字符数 + 1（含行尾位置）"
+        );
+
+        // 原始第 2 列是附件标记；展开后它占一整段标签，整段都映射回 2。
+        let label_start = rendered.iter().position(|c| *c == '[').unwrap();
+        assert_eq!(map[0][label_start], 2);
+        let label_end = rendered.iter().rposition(|c| *c == ']').unwrap();
+        assert_eq!(map[0][label_end], 2);
+        // 标签之后的字符回到标记后面的原始列；行尾是原始长度（a b 标记 c d = 5）。
+        assert_eq!(map[0][rendered.len()], 5);
     }
 
     /// 用户报的核心症状：输入框里是 `[Image #1]`（还带粘贴位置），发出去
@@ -610,7 +686,13 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     } else {
         &[]
     };
-    let display_input = input_with_placeholders(input, display_attachments, &state.pending_pastes);
+    let (display_input, display_map) =
+        input_with_placeholders_mapped(input, display_attachments, &state.pending_pastes);
+    // 鼠标点选输入框要按屏幕上看到的位置定位光标，所以把这份展开结果与映射表
+    // 存进 state（`AppState::composer_text_pos_at` 消费）。借用态在 `draw_input`
+    // 里会再清空一次。
+    state.composer_display = display_input.clone();
+    state.composer_display_map = display_map;
     let paste_hint_position = state.paste_hint.as_ref().map(|hint| {
         let mut hint_input = input.clone();
         hint_input.cursor_row = hint
@@ -794,7 +876,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     // 选区高亮放在最后：它要压过链接下划线等既有样式，否则选中一片带链接的
     // 文字时只有链接那几格没有底色。
     if let Some(selection) = state.selection {
-        paint_selection(f.buffer_mut(), &selection, chunks[0]);
+        paint_selection(f.buffer_mut(), &selection, state);
     }
 }
 
@@ -803,18 +885,35 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
 /// 只改背景 + 用 [`Theme::ensure_contrast`] 校正前景：这是**背景已知**的少数
 /// 场合之一，选中的文字必须仍然可读（浅色主题下尤其明显）。
 ///
-/// 只画在内容区里（`state.chat_area`）：选区坐标虽然已经夹过边界，但滚动后
-/// 内容区高度可能变小，残留的旧坐标不该把输入框也染上底色。
+/// 范围按选区所属区域算（内容区或输入框正文），且已按滚动差量平移过——滚动
+/// 之后选区跟着文字走，不会残留在旧位置。
 fn paint_selection(
     buffer: &mut ratatui::buffer::Buffer,
     selection: &crate::app::TextSelection,
-    area: Rect,
+    state: &crate::app::AppState,
 ) {
     let bg = Theme::selected_bg_color();
+    let area = match selection.area {
+        crate::app::SelectionArea::Chat => state.chat_area,
+        crate::app::SelectionArea::Composer => state.composer_area,
+    };
     let area = buffer.area.intersection(area);
+    let delta = state.selection_scroll_delta(selection);
+    let (start, end) = selection.shifted(delta);
     for y in area.top()..area.bottom() {
+        let point_y = y as i32;
+        if point_y < start.1 || point_y > end.1 {
+            continue;
+        }
+        let from = if point_y == start.1 { start.0 } else { 0 };
+        let to = if point_y == end.1 {
+            end.0
+        } else {
+            u16::MAX as i32
+        };
         for x in area.left()..area.right() {
-            if !selection.contains(x, y) {
+            let point_x = x as i32;
+            if point_x < from || point_x > to {
                 continue;
             }
             let cell = &mut buffer[(x, y)];
@@ -2607,9 +2706,18 @@ fn visible_chat_lines(
 ///
 /// 只在 `area.width >= 3` 时绘制，占最右 1 列。`chat_content_width` 已经
 /// 预留了 2 列边距，因此滚动条不会压到正文。
-fn draw_scrollbar(f: &mut Frame, area: Rect, position: usize, max_scroll: usize, viewport: usize) {
+///
+/// 返回值是本帧滑块的几何信息（轨道矩形 / 滑块位置与长度 / 最大偏移），调用方
+/// 存进 `AppState` 供鼠标拖动换算。没画时返回 `None`。
+fn draw_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    position: usize,
+    max_scroll: usize,
+    viewport: usize,
+) -> Option<crate::app::ScrollbarMetrics> {
     if max_scroll == 0 || area.width < 3 || area.height == 0 {
-        return;
+        return None;
     }
     let track = Rect {
         x: area.x + area.width - 1,
@@ -2631,6 +2739,22 @@ fn draw_scrollbar(f: &mut Frame, area: Rect, position: usize, max_scroll: usize,
         track,
         &mut state,
     );
+    // 滑块几何与 ratatui 内部的 `part_lengths` 同源：轨道长 `h`、视口 `v`、
+    // 内容长 `max_scroll + v`，滑块起点 = pos * h / (max_scroll + v)。
+    let content = max_scroll + viewport.max(1);
+    let thumb_top =
+        (position.min(max_scroll) * track.height as usize + content / 2) / content.max(1);
+    let thumb_top = thumb_top.min(track.height.saturating_sub(1) as usize);
+    let thumb_len =
+        ((viewport.max(1) * track.height as usize + content / 2) / content.max(1)).max(1);
+    Some(crate::app::ScrollbarMetrics {
+        area: track,
+        thumb_top,
+        thumb_len,
+        max_scroll,
+        // 默认归属聊天流；子 Agent 详情在调用点用 `for_target` 覆盖。
+        target: crate::app::ScrollbarTarget::Chat,
+    })
 }
 
 fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
@@ -2667,9 +2791,11 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((intra.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, area);
-    if state.show_scrollbar {
-        draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height);
-    }
+    state.content_scrollbar = if state.show_scrollbar {
+        draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height)
+    } else {
+        None
+    };
 
     if state.unseen_messages {
         let hint = Paragraph::new(Line::from(Span::styled(
@@ -2820,8 +2946,8 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
     let visible = visible_chat_lines(lines, &heights, first, intra + body_height as usize);
     let para = Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false });
     f.render_widget(para.scroll((intra.min(u16::MAX as usize) as u16, 0)), area);
-    if state.show_scrollbar {
-        // 末行留给固定提示，滚动条也只覆盖正文那一段，避免滑块长度把提示行算进去。
+    // 末行留给固定提示，滚动条也只覆盖正文那一段，避免滑块长度把提示行算进去。
+    state.content_scrollbar = if state.show_scrollbar {
         draw_scrollbar(
             f,
             Rect {
@@ -2833,8 +2959,11 @@ fn draw_sub_agent_content(f: &mut Frame, state: &mut AppState, area: Rect) {
             scroll_y as usize,
             state.sub_agent_detail_max_scroll as usize,
             body_height as usize,
-        );
-    }
+        )
+        .map(|metrics| metrics.for_target(crate::app::ScrollbarTarget::SubAgentDetail))
+    } else {
+        None
+    };
 
     // 用户主动上滚后视口脱离实时尾部：正文下方还会持续堆新事件，用提示行说明
     // 「往下还有内容」以及如何回到跟随态，免得看起来像子 Agent 卡住不动了。
@@ -3419,7 +3548,7 @@ fn build_thinking_title(
 
 fn draw_input(
     f: &mut Frame,
-    state: &AppState,
+    state: &mut AppState,
     input: &InputBox,
     area: Rect,
     paste_hint_position: Option<(usize, usize)>,
@@ -3428,6 +3557,11 @@ fn draw_input(
     // 整个函数改画 dialog 自己的 live_input 草稿，边框/标题变色 + 嵌入提示文字，
     // 提交/取消后 `state.input_owner` 归 None，下一帧自动恢复聊天输入框外观。
     if let Some(owner) = state.input_owner {
+        // 借用态不接受鼠标点选：草稿属于 dialog，光标由它自己管；先清空正文区，
+        // 避免点击落在一个已经不属于聊天输入框的矩形里。
+        state.composer_area = Rect::default();
+        state.composer_display = InputBox::new();
+        state.composer_display_map.clear();
         let borrowed = owner.live_input(state);
         let (prompt, color) = owner.prompt();
         let block = Block::default()
@@ -3552,6 +3686,8 @@ fn draw_input(
 
     let inner = block.inner(area);
     f.render_widget(block, area);
+    // 正文区矩形回写：鼠标点选输入框时按它做命中判定，也用它抓选文快照。
+    state.composer_area = inner;
 
     let text_style = if is_bang {
         Style::default().fg(Theme::success_color())
@@ -3577,7 +3713,24 @@ fn draw_input(
             .map(|seg| highlight_at_refs(&seg))
             .collect()
     };
-    let para = Paragraph::new(Text::from(lines)).style(text_style);
+    // 视口滚动：`input_height` 最多 8 行正文，内容更多时必须按光标位置开窗，
+    // 否则第 9 行之后永远画不出来、光标贴底不跟随（旧实现靠折叠长粘贴规避）。
+    let total_visual = lines.len();
+    let viewport = inner.height as usize;
+    let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
+    // 只有**光标动过**才把视口拉过去。用户用滚轮翻看长草稿时光标不动，
+    // 每帧强制跟随会让滚轮立刻失效（滚一格就被拽回来）。
+    let cursor_moved = state.composer_last_cursor != Some((vis_row, vis_col));
+    state.composer_last_cursor = Some((vis_row, vis_col));
+    let scroll = if cursor_moved {
+        composer_scroll_for(&mut state.composer_scroll, vis_row, total_visual, viewport)
+    } else {
+        state
+            .composer_scroll
+            .min(total_visual.saturating_sub(viewport.max(1)))
+    };
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(viewport).collect();
+    let para = Paragraph::new(Text::from(visible)).style(text_style);
     f.render_widget(para, inner);
 
     // is_thinking 时仍然调用末尾的 `f.set_cursor_position`：用户在 AI 思考中向
@@ -3588,10 +3741,10 @@ fn draw_input(
     // ratatui 会隐藏光标，实际上只是不调 `set_cursor_position`、让终端光标
     // 停留在上一次成功位置不动，导致用户主观感觉"光标卡住/错位"。
 
-    // 光标位置：考虑长行折行后的视觉坐标
-    let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
+    // 光标位置：考虑长行折行后的视觉坐标，并减去视口滚动偏移。
     let cursor_x = (inner.x + vis_col as u16).min(inner.x + inner.width.saturating_sub(1));
-    let cursor_y = (inner.y + vis_row as u16).min(inner.y + inner.height.saturating_sub(1));
+    let cursor_y =
+        inner.y + (vis_row.saturating_sub(scroll) as u16).min(inner.height.saturating_sub(1));
 
     // 多行文字粘贴的瞬时提示。图片/文件使用输入框内持久占位符，不再叠加提示。
     if let Some(hint) = &state.paste_hint {
@@ -3600,7 +3753,9 @@ fn draw_input(
                 paste_hint_position.unwrap_or((hint.cursor_row, hint.cursor_col));
             let (hint_row, hint_col) =
                 input.visual_pos_for(source_row, source_col, inner.width as usize);
-            if hint_row < inner.height as usize {
+            // 提示跟着视口走：滚出窗口时不画，避免压在别的行上。
+            if hint_row >= scroll && hint_row < scroll + inner.height as usize {
+                let hint_row = hint_row - scroll;
                 let max_w = inner.width.saturating_sub(hint_col as u16) as usize;
                 let text = if max_w == 0 {
                     String::new()
@@ -3625,6 +3780,37 @@ fn draw_input(
     }
 
     f.set_cursor_position(Position::new(cursor_x, cursor_y));
+}
+
+/// 输入框视口滚动偏移的收敛：保证光标所在视觉行始终可见。
+///
+/// 输入框高度上限是 10 行（含 2 行边框 → 正文 8 行）。内容超出时必须开窗，
+/// 否则第 9 行之后永远画不出来、光标贴底不跟随——旧实现靠把长粘贴折叠成
+/// 占位符来规避这个缺陷，而手写多行（`Shift+Enter`）根本绕不开。
+///
+/// 规则只有两条：光标在窗口上方就滚到它、在下方就把窗口下移刚好露出它；
+/// 其余情况保持不动，避免打字时整块内容无谓地抖动。
+fn composer_scroll_for(
+    scroll: &mut usize,
+    cursor_row: usize,
+    total: usize,
+    viewport: usize,
+) -> usize {
+    if viewport == 0 {
+        *scroll = 0;
+        return 0;
+    }
+    let max_scroll = total.saturating_sub(viewport);
+    let current = (*scroll).min(max_scroll);
+    let next = if cursor_row < current {
+        cursor_row
+    } else if cursor_row >= current + viewport {
+        cursor_row + 1 - viewport
+    } else {
+        current
+    };
+    *scroll = next.min(max_scroll);
+    *scroll
 }
 
 // ─── @ 文件选取器下拉 ─────────────────────────────────────────────────────────
@@ -7693,8 +7879,10 @@ mod chat_viewport_tests {
         state.chat_follow_tail = false;
         state.chat_scroll = 0;
         state.selection = Some(crate::app::TextSelection {
+            area: crate::app::SelectionArea::Chat,
             anchor: (2, 0),
             cursor: (6, 1),
+            scroll_anchor: 0,
             dragging: false,
         });
 
@@ -7982,5 +8170,38 @@ mod system_message_wrap_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod composer_viewport_tests {
+    use super::*;
+
+    /// 光标在窗口下方时窗口下移刚好露出它；在上方时滚到它。
+    ///
+    /// 这条钉住「第 9 行之后画不出来」那个老缺陷：`Paragraph` 没有滚动、从第
+    /// 0 行起画，正文 8 行以外的内容永远看不见，光标还会贴底不跟随。
+    #[test]
+    fn scroll_follows_the_cursor_into_view() {
+        let mut scroll = 0usize;
+        // 光标已在窗口内：不动。
+        assert_eq!(composer_scroll_for(&mut scroll, 3, 20, 8), 0);
+        // 光标到窗口下沿之外：窗口下移刚好露出它。
+        assert_eq!(composer_scroll_for(&mut scroll, 10, 20, 8), 3);
+        // 光标回到窗口上方：窗口跟到光标。
+        assert_eq!(composer_scroll_for(&mut scroll, 1, 20, 8), 1);
+    }
+
+    /// 内容装得下时永远不滚动，且滚动偏移不会超出上限。
+    #[test]
+    fn scroll_is_clamped_to_content() {
+        let mut scroll = 0usize;
+        assert_eq!(composer_scroll_for(&mut scroll, 0, 5, 8), 0);
+        assert_eq!(composer_scroll_for(&mut scroll, 4, 5, 8), 0);
+
+        // 内容 20 行、视口 8 行 → 上限 12。
+        assert_eq!(composer_scroll_for(&mut scroll, 19, 20, 8), 12);
+        scroll = 99;
+        assert_eq!(composer_scroll_for(&mut scroll, 19, 20, 8), 12);
     }
 }

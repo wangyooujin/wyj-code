@@ -96,7 +96,7 @@ pub(super) const ENABLE_WHEEL_MOUSE_REPORTING: &str = "\x1b[?1000h\x1b[?1002h\x1
 /// 连 1003 一起关），保证从「开启」退回「关闭」时没有残留模式。
 pub(super) fn set_mouse_capture<W: Write>(writer: &mut W, enabled: bool) -> io::Result<()> {
     if enabled {
-        // 先全部关一遍再按需打开：`/mouse` 反复切换时不会把 1003 之类的
+        // 先全部关一遍再按需打开：从编辑器返回等重入场景不会把 1003 之类的
         // 历史残留模式留在终端里。
         execute!(
             writer,

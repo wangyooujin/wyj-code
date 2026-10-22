@@ -716,6 +716,7 @@ mod tests {
             "settings.json",
             r#"{"acceptance":{"criteria":[{"id":"t","kind":"command","command":"true"}]}}"#,
         );
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let load = load_acceptance_cfg(tmp.path());
         assert!(load.error.is_none(), "{:?}", load.error);
         let cfg = load.cfg.expect("应当解析出验收契约");
@@ -753,6 +754,7 @@ mod tests {
             "settings.json",
             r#"{"acceptance":{"enabled":false,"criteria":[{"id":"t","kind":"command","command":"true"}]}}"#,
         );
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let load = load_acceptance_cfg(tmp.path());
         assert!(load.cfg.is_none());
     }
@@ -765,6 +767,7 @@ mod tests {
             "settings.json",
             r#"{"acceptance":{"criteria":[]}}"#,
         );
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let load = load_acceptance_cfg(tmp.path());
         assert!(load.cfg.is_none());
     }
@@ -777,6 +780,7 @@ mod tests {
             "settings.json",
             r#"{"acceptance":{"criteria":"not-a-list"}}"#,
         );
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let load = load_acceptance_cfg(tmp.path());
         assert!(load.cfg.is_none());
         assert!(load.error.is_some(), "解析失败必须能被看见");
@@ -790,6 +794,7 @@ mod tests {
             "settings.json",
             r#"{"acceptance":{"criteria":[{"id":"bad","kind":"grep_absent","pattern":"([unclosed"}]}}"#,
         );
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let load = load_acceptance_cfg(tmp.path());
         let cfg = load.cfg.expect("应当解析出验收契约");
         assert!(cfg.criteria[0].invalid.is_some());
