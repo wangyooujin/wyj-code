@@ -143,7 +143,7 @@ benchmarks/compare.sh <baseline> <candidate>
 - 同步要求：新增命令的 PR/提交里就应包含对应的 `/help` 条目，不要留到后续补；若临时不希望暴露（如调试命令），应在 `/help` 中显式标注「内部/调试」而非直接省略。
 - 命令文案需走 i18n（`tr()` key），与 `/help` 其余条目一致，不可硬编码中文。
 - **动态命令（Skill / 项目级自定义命令）是上述约定的例外**：这类命令运行时从磁盘发现、因人而异，不可能写死进静态 `help.body` 模板。`Command` trait 的 `is_dynamic()` 默认方法（仅 `SkillCommand` 覆盖为 `true`）标记这类命令，`CommandContext.dynamic_commands` 由调用方在构造 ctx 前用 `cmd_registry.list()` 过滤好传入，`HelpCmd` 渲染完静态模板后在末尾追加一个「自定义命令」分组（i18n key: `help.custom_commands_header`）。两者互不冲突，新增静态内置命令仍必须遵守上面的硬性约定。v0.2.24 起 Skill 来源收敛到 `~/.wyj-code/skills/` + `<git-root>/.wyj-code/skills/`，不再读取 `~/.claude/commands/` / `<cwd>/.claude/commands/`，动态命令扫描范围同步收敛。
-- **回合进行中（`is_thinking`）的 slash 命令**：忙碌时按 Enter 默认把内容排进 `pending_queue` 投递给模型，而 `/model` 这类命令**没有内容可投递**——排给模型等于把字面的 `/model` 当成一句用户消息发出去，右下角同时冒出"1 条已排队"（用户现场）。因此 TUI 在 Enter 分支先问 `Command::runs_while_busy`：为 true 的**面板类**命令（`/model` `/profile` `/effort` `/mcp` `/config` `/skills` `/plugins` `/agents` `/memory` `/sessions` `/schedule` `/help` `/mode` `/cwd` `/doctor` `/hooks` `/shells` `/subagents` `/computer` `/agent-control` `/extensions` `/quit`）照常 dispatch，其余维持排队。**该方法默认 false，且必须保持默认 false**，四条排除理由见其文档注释（起新回合 / 改会话历史 / 抢 `current_task` 句柄导致回合失去 ESC 中断 / 读 session 统计）。`/cost` `/context` 刻意不在白名单：忙碌时 session 被回合整段持锁，只能拿到降级 ctx（统计字段全 0），与其给一份静默失真的数字，不如让用户等回合结束。CommandContext 拿不到锁时**降级构造而不是跳过执行**——跳过等于用户按 `/model` 只看到一句"会话忙"。钉子：`app::busy_slash_tests`（白名单判定 + 主循环分支顺序）、`commands::registry::busy_whitelist_tests`（白名单**精确集合**断言，多一条少一条都红）。
+- **回合进行中（`is_thinking`）的 slash 命令**：忙碌时按 Enter 默认把内容排进 `pending_queue` 投递给模型，而 `/model` 这类命令**没有内容可投递**——排给模型等于把字面的 `/model` 当成一句用户消息发出去，右下角同时冒出"1 条已排队"（用户现场）。因此 TUI 在 Enter 分支先问 `Command::runs_while_busy`：为 true 的**面板类**命令（`/model` `/profile` `/effort` `/mcp` `/config` `/skills` `/plugins` `/agents` `/memory` `/sessions` `/help` `/mode` `/cwd` `/doctor` `/hooks` `/shells` `/subagents` `/computer` `/agent-control` `/extensions` `/quit`）照常 dispatch，其余维持排队。**该方法默认 false，且必须保持默认 false**，四条排除理由见其文档注释（起新回合 / 改会话历史 / 抢 `current_task` 句柄导致回合失去 ESC 中断 / 读 session 统计）。`/cost` `/context` 刻意不在白名单：忙碌时 session 被回合整段持锁，只能拿到降级 ctx（统计字段全 0），与其给一份静默失真的数字，不如让用户等回合结束。CommandContext 拿不到锁时**降级构造而不是跳过执行**——跳过等于用户按 `/model` 只看到一句"会话忙"。钉子：`app::busy_slash_tests`（白名单判定 + 主循环分支顺序）、`commands::registry::busy_whitelist_tests`（白名单**精确集合**断言，多一条少一条都红）。
 - **三个模型相关命令的职责边界与作用域**（v0.3.16 拆分，此前 `/model` 一个命令背了三件事）：
 
   | 命令 | 职责 | 作用域 | 落盘 |
@@ -203,7 +203,7 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换（`tr()`/`set_locale()`）|
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
-| `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置与安装数据层；`plugin_runtime` 事务式激活 hooks/styles/themes/channels/LSP/monitors/settings/userConfig，持久 LSP client 提供 `workspace/symbol`；schedule/cron_sync、lockfile 与 marketplace 同样在此。v0.2.24 起移除 `import` 子模块（/import 命令下线）与 `wyj-config::codex` 兼容层（Codex 导入能力下线） |
+| `crates/store` | `wyj-store` | MCP/Skill/Plugin 配置与安装数据层；`plugin_runtime` 事务式激活 hooks/styles/themes/channels/LSP/monitors/settings/userConfig，持久 LSP client 提供 `workspace/symbol`；lockfile 与 marketplace 同样在此。v0.2.24 起移除 `import` 子模块（/import 命令下线）与 `wyj-config::codex` 兼容层（Codex 导入能力下线） |
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框 |
 | `crates/cli` | 二进制入口 | 组装所有 crate，解析 CLI 参数，启动 TUI/REPL/单次模式 |
 
@@ -228,7 +228,6 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 | 13 | TUI 聊天区渲染 | `crates/tui` | `crates/tui` |
 | 14 | Hooks 生命周期自动化（4 个事件，同步 shell out） | `core::hooks::HookRunner` | `crates/core` |
 | 15 | Computer-use 桌面 GUI 控制 | `tools::computer` / `tools::app_computer` | `crates/tools` |
-| 16 | 定时任务系统（crontab 唤起 headless 子进程） | `store::schedule` / `store::cron_sync` | `crates/store` |
 | 17 | 项目级 `.wyj-code` 发现 + MCP/skill 信任门控 | `config::project_root` + `store::project_trust` | `crates/store` |
 | 18 | TUI 终端 panic 还原 + char-boundary 安全 | `tui::panic_guard` / `core::textutil` | `crates/tui` |
 | 19 | 统一通知通道（bell + 桌面通知） | `core::notify` | `crates/core` |

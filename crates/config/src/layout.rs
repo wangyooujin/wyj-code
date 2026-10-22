@@ -31,7 +31,7 @@
 //! ├── workspaces/<project_key>/  workflows/<project_key>/
 //! ├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
 //! │   └── instances/  meta.json
-//! ├── cas/  spill/  schedule/  logs/  model-capabilities/
+//! ├── cas/  spill/  logs/  model-capabilities/
 //! ```
 //!
 //! `sessions` / `history` 从「全局平铺」改成「按项目分目录」是 v0.3.18 的改动，
@@ -42,7 +42,7 @@
 //! `indexes`）改落到 `<git-root>/.wyj-code/local/`，跟着工作副本走。
 //! **`memory-v3/global/`、`projects/<key>/`（信任门控）、`cas/`、
 //! `workspaces/`、`workflows/` 与各类全局运行时残留（`spill` / `logs` /
-//! `schedule` / `model-capabilities`）不跟随**：前两者放回仓库等于让被信任的
+//! `model-capabilities`）不跟随**：前两者放回仓库等于让被信任的
 //! 仓库自己改掉批准标记，`cas/` 是跨项目去重池（`gc` 是全局 LRU），
 //! `workspaces/` 与 `workflows/` 描述的是本机运行态（worktree 路径、进程 pid），
 //! 跨机器复制没有意义。
@@ -117,7 +117,6 @@ subdir! {
     workspaces_root => "workspaces",
     workflows_root => "workflows",
     cas_root => "cas",
-    schedule_root => "schedule",
     spill_root => "spill",
     logs_root => "logs",
     plugins_root => "plugins",

@@ -1,6 +1,6 @@
 //! 统一通知通道（v0.2.23+）
 //!
-//! 覆盖 4 类事件源（TUI/CLI 回合完成 / 错误、后台子 Agent 完成、定时任务失败），
+//! 覆盖 3 类事件源（TUI/CLI 回合完成 / 错误、后台子 Agent 完成），
 //! 通过 [`BellSink`]（stderr `\x07`）和 [`DesktopSink`]（macOS `osascript` / Linux
 //! `notify-send` / Windows PowerShell BurntToast）两类 sink 通知用户。
 //!
@@ -11,14 +11,13 @@
 //! - **rate-limit**——同类事件按 `cfg.rate_limit_seconds` 最小间隔去重，防滥用
 //! - **i18n**——`title` / `body` 模板在 dispatcher 层渲染，sink 只看最终字符串
 //!
-//! ## 触发点清单（7 sites）
+//! ## 触发点清单（6 sites）
 //! 1. TUI `apply_agent_event(TurnDone)` — `crates/tui/src/app.rs:7394` 之后
 //! 2. TUI `apply_agent_event(Error)` — `crates/tui/src/app.rs:7416` 之后
 //! 3. TUI 后台子 Agent `SubAgentDone` — `crates/tui/src/app.rs:8052` 之后
 //! 4. CLI `-p` 单回合完成 — `crates/cli/src/main.rs` 内 `RuntimeCommand::Prompt` 路径
 //! 5. CLI headless REPL 回合完成 — `crates/cli/src/main.rs` 内 `--headless` 循环
 //! 6. Daemon ACP 回合完成 — **故意不接**（daemon 无人值守，参见 CLAUDE.md [notify]）
-//! 7. cron schedule 任务失败 — `crates/cli/src/schedule_cmd.rs:267/292/299`
 //!
 //! ## env override
 //! - `WYJ_CODE_NOTIFY_OFF=1` — master 全关（最高优先级）
@@ -51,10 +50,9 @@ static DISPATCHER: Mutex<Option<NotifyDispatcher>> = Mutex::new(None);
 
 // ── 事件类型 ───────────────────────────────────────────────────────────────
 
-/// 4 类事件的强类型枚举。事件源（7 sites）发出，dispatcher 在 `emit` 内根据
+/// 3 类事件的强类型枚举。事件源（6 sites）发出，dispatcher 在 `emit` 内根据
 /// `kind()` 路由到对应 gate / rate-limit / sink。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Step 1 仅走 ScheduleFailed；Step 3/4 接 TUI/CLI 触发点后自动消除
 pub enum NotificationEvent {
     /// 主回合正常完成（CLI `-p` / REPL / TUI 回合）。
     TurnFinished {
@@ -69,8 +67,6 @@ pub enum NotificationEvent {
     },
     /// 后台子 Agent 完成（`run_in_background: true` 的 Agent 工具调用）。
     SubAgentDone { agent_id: String, summary: String },
-    /// cron schedule 任务失败。
-    ScheduleFailed { task_name: String, error: String },
 }
 
 impl NotificationEvent {
@@ -79,7 +75,6 @@ impl NotificationEvent {
             Self::TurnFinished { .. } => NotificationKind::TurnFinished,
             Self::TurnError { .. } => NotificationKind::TurnError,
             Self::SubAgentDone { .. } => NotificationKind::SubAgentDone,
-            Self::ScheduleFailed { .. } => NotificationKind::ScheduleFailed,
         }
     }
 
@@ -88,7 +83,6 @@ impl NotificationEvent {
         match self {
             Self::TurnFinished { .. } | Self::TurnError { .. } => "cli",
             Self::SubAgentDone { .. } => "subagent",
-            Self::ScheduleFailed { .. } => "schedule",
         }
     }
 }
@@ -98,7 +92,6 @@ pub enum NotificationKind {
     TurnFinished,
     TurnError,
     SubAgentDone,
-    ScheduleFailed,
 }
 
 // ── Dispatcher payload ─────────────────────────────────────────────────────
@@ -174,7 +167,6 @@ impl NotifyDispatcher {
             NotificationKind::TurnFinished => events.turn_finished,
             NotificationKind::TurnError => events.turn_error,
             NotificationKind::SubAgentDone => events.subagent_done,
-            NotificationKind::ScheduleFailed => events.schedule_failure,
         }
     }
 
@@ -235,18 +227,6 @@ impl NotifyDispatcher {
                     source,
                 }
             }
-            NotificationEvent::ScheduleFailed { task_name, error } => {
-                let body = wyj_i18n::tr_fmt(
-                    "notify.body.schedule_failed",
-                    &[("task_name", &task_name), ("error", &error)],
-                );
-                NotificationPayload {
-                    kind,
-                    title: title_for(kind),
-                    body,
-                    source,
-                }
-            }
         }
     }
 }
@@ -256,7 +236,6 @@ fn title_for(kind: NotificationKind) -> String {
         NotificationKind::TurnFinished => "notify.title.turn_finished",
         NotificationKind::TurnError => "notify.title.turn_error",
         NotificationKind::SubAgentDone => "notify.title.subagent_done",
-        NotificationKind::ScheduleFailed => "notify.title.schedule_failed",
     })
 }
 
@@ -516,13 +495,13 @@ mod tests {
         let sinks: Vec<Box<dyn NotificationSink>> =
             vec![Box::new(rec1.clone()), Box::new(rec2.clone())];
         init_with_sinks(&NotifyCfg::default(), sinks);
-        emit(NotificationEvent::ScheduleFailed {
-            task_name: "test-task".to_string(),
+        emit(NotificationEvent::TurnError {
             error: "boom".to_string(),
+            session_id: None,
         });
         assert_eq!(rec1.received().len(), 1);
         assert_eq!(rec2.received().len(), 1);
-        assert!(rec1.received()[0].1.contains("test-task"));
+        assert!(rec1.received()[0].1.contains("boom"));
         assert!(rec2.received()[0].1.contains("boom"));
     }
 
@@ -669,7 +648,6 @@ mod tests {
             cfg.events.subagent_done,
             "subagent_done 用户选择 opt-out 默认开"
         );
-        assert!(cfg.events.schedule_failure);
         assert_eq!(cfg.rate_limit_seconds, 30);
         assert!(!cfg.include_session_id);
     }

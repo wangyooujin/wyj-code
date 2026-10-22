@@ -28,7 +28,7 @@
   - [Agent 定义](#agent-定义)
   - [Hooks 生命周期自动化](#hooks-生命周期自动化)
 - [TUI / Headless / ACP / Daemon 入口](#tui-headless-acp-daemon-入口)
-- [Computer-use 与 Schedule](#computer-use-与-schedule)
+- [Computer-use](#computer-use)
 - [Storage caps](#storage-caps)
 - [进一步阅读](#进一步阅读)
 
@@ -41,9 +41,9 @@ wyj-code 的架构决策围绕以下硬约束展开，违反任何一条都需�
 1. **本地优先**——配置、会话、执行轨迹、记忆全部在 `~/.wyj-code/`；无隐式遥测，无崩溃上报，模型请求以外的出站网络必须由用户显式触发。
 2. **供应商、协议、能力分离**——`Provider` 负责认证与端点，`WireProtocol` 决定序列化（Anthropic Messages / OpenAI Chat Completions），`ModelCapabilities` 描述模型行为面（thinking、vision、parallel_tool_calls 等）。三者解耦后同一套工具可在官方 API、国内厂商、协议兼容端点之间切换。
 3. **证据化**——所有跨会话学习（Memory v3、Rule/Skill 候选）必须有可验证的 Episode 证据，且默认情况下 Rule/Skill 永不自动激活。
-4. **失败关闭**——headless、schedule、SubAgent 在没有交互通道时默认拒绝写文件、执行命令、控制电脑等副作用操作；OS sandbox 是兜底而非主防线。
+4. **失败关闭**——headless、SubAgent 在没有交互通道时默认拒绝写文件、执行命令、控制电脑等副作用操作；OS sandbox 是兜底而非主防线。
 5. **数据面收敛**——同一类用户状态只有一份权威存储（如 Memory v3 收敛为 Global / Project 两层后，Evolution 不再维护平行 Memory 数据层）。
-6. **增量可恢复**——跨进程的工作（SubAgent trace、定时任务日志、Skill 安装）必须用原子写（temp + rename）或事务式写入，进程中断后下一进程能从上一致状态继续。
+6. **增量可恢复**——跨进程的工作（SubAgent trace、Skill 安装）必须用原子写（temp + rename）或事务式写入，进程中断后下一进程能从上一致状态继续。
 
 ---
 
@@ -61,7 +61,7 @@ Cargo workspace 包含 11 个 crate，按"配置 → API → 核心 → 工具 �
 | `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令（/help、/compact、/model、/agents、/evolve 等）|
 | `crates/i18n` | `wyj-i18n` | 多语言资源（`rust-i18n` 封装，`en`/`zh` 内嵌 YAML）与运行时语言切换 |
 | `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio/http 传输）|
-| `crates/store` | `wyj-store` | MCP / Skill / Plugin 配置与安装数据层、`extensions` 命令族、`schedule` 与 `cron_sync`、lockfile、marketplace |
+| `crates/store` | `wyj-store` | MCP / Skill / Plugin 配置与安装数据层、`extensions` 命令族、lockfile、marketplace |
 | `crates/tui` | `wyj-tui` | ratatui TUI：渲染、输入框、权限确认对话框、panic 兜底还原 |
 | `crates/cli` | 二进制入口 | 解析 CLI 参数，组装所有 crate；启动 TUI / Headless REPL / 单次 `-p` 模式 / ACP adapter / daemon |
 
@@ -355,7 +355,7 @@ Checkpoint 支持：
 - 全局 `~/.wyj-code/config.toml` 的 `[[mcp_servers]]`
 - 项目级 `<git-root>/.wyj-code/mcp.toml` 与 `<cwd>/.mcp.json`
 
-**项目级 MCP 信任确认**（v0.2.5，`store::project_trust`）：项目级 server 计算指纹（按 name 排序后规范序列化再 sha256），未信任时静默排除；批准记录必须落在仓库控制不到的位置 `~/.wyj-code/projects/<project_key>/mcp_trust.json`。CLI `wyj-code trust-mcp [--cwd <dir>]` 做交互式批准；TUI 启动检测到 Pending 时渲染 `BottomPanel::ProjectTrust`；headless/cron 无 UI 通道时一律跳过未信任 server 并打印一次提示（避免 stdin 阻塞）。
+**项目级 MCP 信任确认**（v0.2.5，`store::project_trust`）：项目级 server 计算指纹（按 name 排序后规范序列化再 sha256），未信任时静默排除；批准记录必须落在仓库控制不到的位置 `~/.wyj-code/projects/<project_key>/mcp_trust.json`。CLI `wyj-code trust-mcp [--cwd <dir>]` 做交互式批准；TUI 启动检测到 Pending 时渲染 `BottomPanel::ProjectTrust`；headless 无 UI 通道时一律跳过未信任 server 并打印一次提示（避免 stdin 阻塞）。
 
 **项目级 skill 信任确认**（v0.2.28，`store::skill_trust`）：`<git-root>/.wyj-code/skills/` 随 `git clone` 落地、内容由仓库作者控制，skill 正文是纯文本指令、敲 `/xxx` 后整段作为 user message 进入对话成为模型指令（且其 `description` 自 v0.2.27 起已注入 system prompt，模型会主动推荐这些命令）。门控强度与 `project_trust` 对齐：只覆盖项目级来源，批准记录落 `~/.wyj-code/projects/<project_key>/skill_trust.json`（复用 `project_trust::project_trust_record_path`，同样必须在仓库内容控制不到的位置）。
 
@@ -408,7 +408,7 @@ Checkpoint 支持：
 |---|---|---|
 | **TUI**（默认）| `wyj-code` | ratatui 渲染、流式 Markdown、权限对话框、SubAgent 面板、Profile/MCP/Skill/Settings 等设置面板 |
 | **Headless REPL** | `wyj-code --headless` | stdin/stdout REPL，无 TUI 渲染，权限默认拒绝副作用操作 |
-| **单次问答** | `wyj-code -p "..."` | 一次性 prompt 跑完即退，常被脚本/cron 调用 |
+| **单次问答** | `wyj-code -p "..."` | 一次性 prompt 跑完即退，常被脚本调用 |
 | **ACP adapter** | `wyj-code acp` | stdio adapter，连接结束时清理所属 session |
 | **全局 daemon** | `wyj-code daemon --listen 127.0.0.1:61337` | TCP 连接之间共享进程级 session map，断线不终止 session；扩展 `_wyj/session/list` / `_wyj/session/control` 使用 schema version 2，覆盖 text/thinking/tool/usage/error/turn finished 以及 PermissionRequested、DiffAvailable、CheckpointChanged、AgentStateChanged 事件 |
 
@@ -420,7 +420,7 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
 
 ---
 
-## Computer-use 与 Schedule
+## Computer-use
 
 ### Computer-use（v0.2.1+，仅 macOS/Windows 编译）
 
@@ -430,14 +430,7 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
   - `native=false`：声明为普通 custom 工具，`description`/`input_schema` 动态嵌入实际下采样分辨率，用于第三方兼容端点。
 - 注册门控：平台 `#[cfg]` + `Profile.vision` + `provider == Anthropic` + 端点官方判定，缺一不注册。
 - 物理像素 vs 逻辑像素：macOS Retina 上 `xcap::Monitor` 返回"点"（逻辑），实际截到的是像素；裁剪 / 截图链路必须按"点→像素"换算（`scale::scale_region_to_pixels`），但点击坐标统一用"点"（`enigo` 坐标系）。
-- v0.2.5 人机互不干扰架构：默认后台目标化执行（`tools::app_computer`），全局前台输入降级为显式兼容模式 `[computer_use].foreground_fallback = disabled|ask|idle_only`，默认 `disabled`；headless/cron/子 Agent 一律禁止前台接管。
-
-### Schedule（v0.2.5）
-
-- 数据层 `store::schedule`：标准 5 段 cron 表达式，原子写到 `~/.wyj-code/schedule/tasks.json`。
-- 同步层 `store::cron_sync::sync_crontab`：只替换 `crontab -l` 输出里 `# BEGIN/END wyj-code schedule` 标记的区块，标记外内容原样保留；首次同步前自动备份原始 crontab。
-- 触发层：复用 `wyj-code -p` 入口（`tokio::process::Command` 子进程调用自身二进制），stdout/stderr 重定向到 `schedule/logs/<task-id>/<ts>.log`。
-- computer-use 安全边界由工具自身承担：headless/cron 没有交互通道，旧 `computer` 变更动作无条件失败关闭。
+- v0.2.5 人机互不干扰架构：默认后台目标化执行（`tools::app_computer`），全局前台输入降级为显式兼容模式 `[computer_use].foreground_fallback = disabled|ask|idle_only`，默认 `disabled`；headless/子 Agent 一律禁止前台接管。
 
 ---
 
@@ -453,8 +446,6 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
 | Memory v3 `records.json` | 5000 条（Superseded 永保留）| `storage.memory_v3_records_max` |
 | Memory v3 `jobs.json` | 32 pending | `storage.memory_v3_jobs_max` |
 | Memory v3 `rejected_history.json` | 500 条 | `storage.memory_v3_rejected_history_max` |
-| Schedule 日志 | 50 文件 / task | `storage.schedule_logs_per_task` |
-| Schedule `run.log` | 10 MiB × 3 rotations | `storage.schedule_run_log_*` |
 | 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days` |
 | Sub-agent trace | 256 KiB / agent | `subagent.trace_max_bytes_per_agent` |
@@ -463,7 +454,7 @@ TUI 永久运行在 `Viewport::Fullscreen`，输入框/状态栏贴住窗口底�
 
 容量清理不得自动删除 Active candidate 或 Active/Pinned Memory。
 
-**实现位置**：Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`；Phase 2 截断在 `crates/core/src/serialize.rs`（`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`）；Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`，CLI 启动路径调一次，进程内 `OnceLock` 保证单进程只 warn 一次。
+**实现位置**：Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/plugin_install.rs` + `crates/core/src/workspace.rs`；Phase 2 截断在 `crates/core/src/serialize.rs`（`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`）；Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`，CLI 启动路径调一次，进程内 `OnceLock` 保证单进程只 warn 一次。
 
 ---
 

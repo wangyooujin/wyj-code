@@ -20,7 +20,6 @@ pub enum InputOwner {
     Skills(SkillsInputField),
     Plugins(PluginsInputField),
     Profile(ProfileInputField),
-    Schedule(ScheduleInputField),
     /// `/config` 面板的文本字段编辑借用态（search api_key / max_results）。
     Settings(SettingsInputField),
     /// `/model` 面板的「手动输入模型名」借用态。
@@ -119,25 +118,6 @@ impl InputOwner {
                 ),
                 Theme::claude_color(),
             ),
-            InputOwner::Schedule(ScheduleInputField::Field { field_idx, .. }) => (
-                wyj_i18n::tr_fmt(
-                    "dialog.input_owner.schedule_field",
-                    &[(
-                        "field",
-                        &wyj_i18n::tr(SCHEDULE_FIELD_LABEL_KEYS[*field_idx]),
-                    )],
-                ),
-                Theme::claude_color(),
-            ),
-            InputOwner::Schedule(ScheduleInputField::Frequency { kind, .. }) => (
-                wyj_i18n::tr(match kind {
-                    ScheduleFrequencyKind::Daily => "dialog.input_owner.schedule_freq_daily",
-                    ScheduleFrequencyKind::Hourly => "dialog.input_owner.schedule_freq_hourly",
-                    ScheduleFrequencyKind::Weekly => "dialog.input_owner.schedule_freq_weekly",
-                    ScheduleFrequencyKind::Custom => "dialog.input_owner.schedule_freq_custom",
-                }),
-                Theme::claude_color(),
-            ),
             InputOwner::Settings(SettingsInputField::Field { field_idx }) => (
                 wyj_i18n::tr_fmt(
                     "dialog.input_owner.settings_field",
@@ -169,7 +149,6 @@ impl InputOwner {
             InputOwner::Skills(_) => state.skills_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Plugins(_) => state.plugins_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_mut().map(|d| &mut d.live_input),
-            InputOwner::Schedule(_) => state.schedule_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Settings(_) => state.settings_dialog.as_mut().map(|d| &mut d.live_input),
             InputOwner::Model(_) => state.model_picker.as_mut().map(|d| &mut d.live_input),
         }
@@ -182,7 +161,6 @@ impl InputOwner {
             InputOwner::Skills(_) => state.skills_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Plugins(_) => state.plugins_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Profile(_) => state.profile_dialog.as_ref().map(|d| &d.live_input),
-            InputOwner::Schedule(_) => state.schedule_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Settings(_) => state.settings_dialog.as_ref().map(|d| &d.live_input),
             InputOwner::Model(_) => state.model_picker.as_ref().map(|d| &d.live_input),
         }

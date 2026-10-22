@@ -120,9 +120,6 @@ pub enum CommandResult {
     /// `Some(id)` 直接选中并展开该任务的实时输出；`None` 定位到最近一个任务
     /// （TUI 侧实现；headless 不支持面板）。
     OpenShellsPanel(Option<String>),
-    /// 打开定时任务面板（/schedule 命令触发）。headless 不支持，提示改用
-    /// `wyj-code schedule` CLI 子命令。
-    OpenScheduleDialog,
 }
 
 #[derive(Debug, Clone)]
@@ -399,7 +396,6 @@ mod busy_whitelist_tests {
             "plugins",
             "profile",
             "quit",
-            "schedule",
             "sessions",
             "shells",
             "skills",

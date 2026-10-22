@@ -216,9 +216,9 @@ cli:
   subagent_trace_session_id_help: "Session id (e.g. sess-1719723000)"
   subagent_trace_sub_id_help: "Sub-agent id (the number the Hub assigned, e.g. 3); omit to list all sub-agents in the session"
   subagent_trace_json_help: "Print the raw JSONL (for piping); only takes effect when a sub-agent id is given"
-  trust_mcp_about: "Approve trust for the current project's project-scoped MCP servers (.wyj-code/mcp.toml/.mcp.json); run this before setting up scheduled tasks"
+  trust_mcp_about: "Approve trust for the current project's project-scoped MCP servers (.wyj-code/mcp.toml/.mcp.json)"
   trust_skills_about: "Approve trust for the current project's project-scoped skills (.wyj-code/skills/); their bodies come from the repo author and are handed to the model as instructions"
-  trust_about: "Approve trust for both project-scoped MCP servers and skills; run this before setting up scheduled tasks"
+  trust_about: "Approve trust for both project-scoped MCP servers and skills"
 
 update:
   checking: "Checking for the latest version…"
@@ -285,7 +285,6 @@ help:
     - `/skills` — Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
     - `/extensions` — Inspect and diagnose Skill / MCP / Plugin resources
-    - `/schedule` — Manage scheduled tasks (cron-triggered prompts); auto-syncs into the system crontab on macOS/Linux
     - `/hooks` — List currently active Hooks (grouped by event)
     - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
     - `/mode [mode]` — Switch run mode (auto / plan / bypass); no arg shows the current mode
@@ -560,60 +559,6 @@ mcp:
     uninstall_failed: "Uninstall failed: {err}"
     upgrade_failed: "Upgrade failed: {err}"
     manual_no_upgrade: "Manually configured entries have no version info and can't be upgraded"
-
-schedule:
-  desc: "Manage scheduled tasks (cron-triggered prompts, e.g. a daily news digest or trading review)"
-  headless_unsupported: "[headless mode doesn't support the /schedule panel — use `wyj-code schedule` CLI subcommands instead]"
-  title: "Scheduled Tasks"
-  new_task_default_name: "New task"
-  run_now:
-    triggered: "Triggered — check back later for the result (last run status/session)"
-  field:
-    name: "Name"
-    prompt: "Prompt"
-    cron: "Cron"
-    cwd: "Working dir"
-    notify_on_failure: "Notify on failure"
-    allowed_tools: "Allowed tools"
-  dialog:
-    hint1: "  ↑↓ Move  Enter Action menu  Ctrl+S Save"
-    hint2: "  Esc Close"
-    editing_placeholder: "Editing, see the input box below"
-    add_new_row: "New task"
-    "on": "on"
-    "off": "off"
-    invalid_cron_short: "invalid cron"
-  menu:
-    expand: "Expand fields"
-    collapse: "Collapse fields"
-    enable: "Enable"
-    disable: "Disable"
-    run_now: "Run now"
-    run_now_needs_save: "Save changes to this task before running it"
-    review_permissions: "Confirm permission manifest"
-    permissions_reviewed: "Permissions already reviewed"
-    delete: "Delete"
-    edit: "Edit"
-    toggle: "Toggle"
-    freq_daily: "Daily at a fixed time"
-    freq_hourly: "Every hour at a fixed minute"
-    freq_weekly: "Weekly on a fixed day/time"
-    freq_custom: "Custom cron expression (advanced)"
-    new_blank: "New blank task"
-    new_from_session: "New task from the current conversation"
-  permissions:
-    review_complete: "Permission manifest confirmed; the task remains disabled until you explicitly enable it."
-  error:
-    empty_name: "Task name cannot be empty"
-    empty_prompt: "Prompt cannot be empty"
-    empty_cwd: "Working directory cannot be empty"
-    invalid_cron: "Invalid cron expression: {err}"
-    save_failed: "Failed to save schedule tasks: {err}"
-    bad_time_format: "Expected HH:MM, e.g. 08:00"
-    bad_minute_format: "Expected a minute number 0-59"
-    bad_weekly_format: "Expected \"<weekday 0-6> HH:MM\", e.g. \"1 20:30\" (0=Sunday)"
-  overlay:
-    sync_error_title: "Crontab sync failed"
 
 skills:
   desc: "Manage Skills (add a git marketplace source, browse/install/upgrade/uninstall)"
@@ -995,11 +940,6 @@ dialog:
     profile_field: "[Profile] Edit {field} (Enter to submit / Esc to cancel)"
     model_manual: "[Model] Type the model name (Enter to submit / Esc to cancel)"
     settings_field: "[Config] Edit {field} (Enter to submit / Esc to cancel)"
-    schedule_field: "[Schedule] Edit {field} (Enter to submit / Esc to cancel)"
-    schedule_freq_daily: "[Schedule] Enter time as HH:MM (Enter to submit / Esc to cancel)"
-    schedule_freq_hourly: "[Schedule] Enter minute 0-59 (Enter to submit / Esc to cancel)"
-    schedule_freq_weekly: "[Schedule] Enter \"<weekday 0-6> HH:MM\", 0=Sunday (Enter to submit / Esc to cancel)"
-    schedule_freq_custom: "[Schedule] Enter a standard 5-field cron expression (Enter to submit / Esc to cancel)"
   action_menu:
     confirm_question: "Are you sure you want to \"{action}\"?"
     confirm_hint: "Enter/y confirm   Esc/n cancel"
@@ -1128,9 +1068,7 @@ notify:
     turn_finished: "wyj-code turn finished"
     turn_error: "wyj-code turn error"
     subagent_done: "wyj-code subagent finished"
-    schedule_failed: "wyj-code schedule task failed"
   body:
     turn_finished: "Duration {duration_ms}ms. {summary}"
     turn_error: "{error}"
     subagent_done: "Agent {agent_id}. {summary}"
-    schedule_failed: "Task {task_name}. {error}"

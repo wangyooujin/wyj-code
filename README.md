@@ -27,7 +27,7 @@ Qwen/百炼、豆包/火山及其他协议兼容端点。
 > **⚠️ v0.2.28 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
 > 显式信任批准。首次启动会弹出信任面板，**不批准则这些 skill 不加载**（斜杠补全
 > 里不出现，模型也看不见、不会推荐）。批准记录落在仓库外，内容变化后需重新批准。
-> 配 cron 定时任务前可先跑 `wyj-code trust`（或 `trust-skills`）一次性批准。
+> 需要用到项目级 skill 时可先跑 `wyj-code trust`（或 `trust-skills`）一次性批准。
 >
 > **⚠️ v0.2.27 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
 > `AGENTS.md`，wyj-code 不再读取任何 `.claude/` 路径。把仓库根的 `CLAUDE.md`
@@ -253,7 +253,7 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 
 - 权限模型：Normal（每次确认）/ Bypass（全部放行）/ Plan（白名单限制）。
 - `AllowAlways` 写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`，跨会话生效。
-- OS sandbox：macOS Seatbelt / Linux bubblewrap；headless、schedule、SubAgent 没有真实 UI 时
+- OS sandbox：macOS Seatbelt / Linux bubblewrap；headless、SubAgent 没有真实 UI 时
   默认拒绝写文件、执行命令、控制电脑等副作用操作。
 - 项目级 MCP server 需经 `wyj-code trust-mcp` 手动批准；批准记录落在仓库控制不到的
   `~/.wyj-code/projects/<project_key>/mcp_trust.json`。
@@ -417,7 +417,6 @@ args = ["--flag"]
 | `~/.wyj-code/sessions/` | 本地会话、checkpoint 与 SubAgent trace |
 | `~/.wyj-code/cas/` | CAS Blob Pool（v0.2.20+，内容寻址会话快照）|
 | `~/.wyj-code/evolution/` | Episode、Memory v3、Rule/Skill 候选数据 |
-| `~/.wyj-code/schedule/` | 定时任务清单 + crontab 标记区块 |
 | `~/.wyj-code/projects/<project_key>/` | 项目级 `allowed_tools.json` 与 `mcp_trust.json` |
 | `<repo>/.wyj-code/` | 项目级 settings / MCP / Skill / Agent 资源 |
 
@@ -433,8 +432,8 @@ CLI 治理入口：
 
 整体架构、Workspace crate 布局、Agent 推理循环、Provider / WireProtocol / Capability
 三层模型、上下文管理（compact、AGENTS.md 注入、Memory v3）、CAS 会话存储、权限模型、
-SubAgent 编排、MCP/Skill/Plugin/Hooks 扩展点、TUI/Headless/ACP/Daemon 入口、Computer-use 与
-Schedule、Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/architecture.md)。
+SubAgent 编排、MCP/Skill/Plugin/Hooks 扩展点、TUI/Headless/ACP/Daemon 入口、Computer-use、
+Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/architecture.md)。
 
 更细的实现细节、版本演进中的"教训"注释与"为什么这样设计"的背景说明在
 [`CLAUDE.md`](./CLAUDE.md)——那是同时喂给 Claude Code 的项目上下文，是最权威、更新最及时的
@@ -478,12 +477,11 @@ GitHub Pages 源文件位于 [`site/`](./site/)；一键安装脚本入口为
 - **搜索 Key 只进请求头**：`[search].api_key` 与 `WYJ_CODE_SEARCH_API_KEY` 都只写进
   HTTP header，绝不放进请求体——body 会被代理日志完整打印，头不会。
 - **`--bypass-permissions`**：只跳过普通交互确认，**不**关闭 OS sandbox，**不**覆盖 protected deny。
-- **无 UI 时的默认拒绝**：Headless、Schedule、SubAgent 没有真实 UI 时不会自动批准写文件、
+- **无 UI 时的默认拒绝**：Headless、SubAgent 没有真实 UI 时不会自动批准写文件、
   执行命令或控制电脑等副作用操作。
 - **Checkpoint 范围**：只能恢复会话和文件，**不**能撤销网络请求、数据库写入或已经发送的
   外部消息。
-- **项目级 MCP 信任**：未信任的项目级 server 静默排除，不阻塞 UI-less 场景（`-p` / `--headless`
-  / `schedule run`）。
+- **项目级 MCP 信任**：未信任的项目级 server 静默排除，不阻塞 UI-less 场景（`-p` / `--headless`）。
 
 发现安全问题时，请**不要**在 Issue 里附带真实凭据、私有 endpoint 或敏感日志。可以先
 在 [GitHub Issue](https://github.com/wangyooujin/wyj-code/issues) 提交经过脱敏的报告。

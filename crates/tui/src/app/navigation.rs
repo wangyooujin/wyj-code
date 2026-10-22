@@ -278,7 +278,6 @@ impl AppState {
             || self.plugins_dialog.is_some()
             || self.agents_dialog.is_some()
             || self.extensions_dialog.is_some()
-            || self.schedule_dialog.is_some()
     }
 
     /// 从渲染后的 Buffer 抓一屏文本快照，供选区复制使用。
