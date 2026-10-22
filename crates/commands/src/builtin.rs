@@ -862,29 +862,6 @@ impl Command for McpCmd {
     }
 }
 
-// ── /schedule ─────────────────────────────────────────────────────────────────
-
-pub struct ScheduleCmd;
-
-#[async_trait]
-impl Command for ScheduleCmd {
-    fn runs_while_busy(&self) -> bool {
-        true
-    }
-    fn name(&self) -> &str {
-        "schedule"
-    }
-    fn description(&self) -> String {
-        tr("schedule.desc")
-    }
-    fn usage(&self) -> String {
-        "/schedule".to_string()
-    }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        Ok(CommandResult::OpenScheduleDialog)
-    }
-}
-
 // ── /skills ───────────────────────────────────────────────────────────────────
 
 pub struct SkillsCmd;
@@ -2346,7 +2323,6 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(McpCmd));
-    reg.register(Arc::new(ScheduleCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(ExtensionsCmd));
@@ -2409,7 +2385,6 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(InitCmd));
     reg.register(Arc::new(ConfigCmd));
     reg.register(Arc::new(McpCmd));
-    reg.register(Arc::new(ScheduleCmd));
     reg.register(Arc::new(SkillsCmd));
     reg.register(Arc::new(PluginsCmd));
     reg.register(Arc::new(ExtensionsCmd));

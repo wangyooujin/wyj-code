@@ -2103,8 +2103,6 @@ pub struct AppState {
     pub agents_dialog: Option<AgentsDialog>,
     /// 统一 Skill/MCP/Plugin 资源面板（/extensions 命令触发时 Some）
     pub extensions_dialog: Option<ExtensionsDialog>,
-    /// 定时任务面板（/schedule 命令触发时 Some）
-    pub schedule_dialog: Option<ScheduleDialog>,
     /// 标记当前轮次完成后需保存 session 文件
     pub save_needed: bool,
     /// 待发送附件列表（图片或文件，发送时附到消息）
@@ -2289,7 +2287,6 @@ mod navigation;
 mod panels;
 mod plugins_panel;
 mod profile_panel;
-mod schedule_panel;
 mod settings_dialogs;
 mod skills_panel;
 mod sub_agent_view;
@@ -2308,7 +2305,6 @@ pub use menu::*;
 pub use model_panel::*;
 pub use plugins_panel::*;
 pub use profile_panel::*;
-pub use schedule_panel::*;
 pub use settings_dialogs::*;
 pub use skills_panel::*;
 pub(crate) use sub_agent_view::*;
@@ -2416,7 +2412,6 @@ impl AppState {
             plugins_dialog: None,
             agents_dialog: None,
             extensions_dialog: None,
-            schedule_dialog: None,
             save_needed: false,
             // 会话级思考档位从 config 的运行期槽位初始化——CLI 启动时从
             // 会话文件读出来放进去的（`--resume` 后继续生效）。
@@ -5749,10 +5744,6 @@ async fn tui_main(
                                         // 独立浮层），Esc 只需清空 live_input +
                                         // 归还 input_owner（上面已做）。
                                     }
-                                    InputOwner::Schedule(_) => {
-                                        // Schedule 借用同 Profile，不对应任何需要
-                                        // 重置的 overlay。
-                                    }
                                     InputOwner::Settings(_) => {
                                         // Settings 借用同 Profile：字段编辑直接借用
                                         // 输入框，Esc 只需清空 live_input + 归还
@@ -6022,39 +6013,6 @@ async fn tui_main(
                                         if let Some(dialog) = &mut state.settings_dialog {
                                             dialog.draft.set_text_value(field_idx, value);
                                             dialog.error = None;
-                                        }
-                                    }
-                                    InputOwner::Schedule(ScheduleInputField::Field {
-                                        task_idx,
-                                        field_idx,
-                                    }) => {
-                                        let value = text.unwrap_or_default();
-                                        owner.clear_live_input(&mut state);
-                                        state.input_owner = None;
-                                        if let Some(dialog) = &mut state.schedule_dialog {
-                                            dialog.set_field_text(task_idx, field_idx, value);
-                                            dialog.error = None;
-                                        }
-                                    }
-                                    InputOwner::Schedule(ScheduleInputField::Frequency {
-                                        task_idx,
-                                        kind,
-                                    }) => {
-                                        let value = text.unwrap_or_default();
-                                        owner.clear_live_input(&mut state);
-                                        state.input_owner = None;
-                                        match schedule_parse_frequency_input(kind, &value) {
-                                            Ok(cron_expr) => {
-                                                if let Some(dialog) = &mut state.schedule_dialog {
-                                                    dialog.tasks[task_idx].cron = cron_expr;
-                                                    dialog.error = None;
-                                                }
-                                            }
-                                            Err(msg) => {
-                                                if let Some(dialog) = &mut state.schedule_dialog {
-                                                    dialog.error = Some(msg);
-                                                }
-                                            }
                                         }
                                     }
                                 }
@@ -7875,147 +7833,6 @@ async fn tui_main(
                                     ) {
                                         state.effort_picker = None;
                                     }
-                                }
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // ⓪.61 定时任务面板拦截（/schedule 命令触发）
-                    if state.schedule_dialog.is_some() {
-                        // 字段编辑/频率输入的文本输入统一走上面的 ⓪.1 输入借用拦截
-                        // （state.input_owner == Some(Schedule(_))），不会进入这里。
-
-                        if state.schedule_dialog.as_ref().unwrap().menu.is_some() {
-                            schedule_handle_menu_key(&mut state, key.code);
-                            continue;
-                        }
-
-                        // ── 保存成功但 crontab 同步失败：纯提示，Esc/Enter 收起
-                        if matches!(
-                            state.schedule_dialog.as_ref().unwrap().overlay,
-                            ScheduleOverlay::SyncError { .. }
-                        ) {
-                            if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                                if let Some(dialog) = &mut state.schedule_dialog {
-                                    dialog.overlay = ScheduleOverlay::None;
-                                }
-                            }
-                            continue;
-                        }
-
-                        // ── Esc 未保存修改三选一确认
-                        if matches!(
-                            state.schedule_dialog.as_ref().unwrap().overlay,
-                            ScheduleOverlay::UnsavedChanges { .. }
-                        ) {
-                            enum Choice {
-                                None,
-                                SaveClose,
-                                DiscardClose,
-                                BackToPanel,
-                            }
-                            let mut choice = Choice::None;
-                            if let Some(dialog) = &mut state.schedule_dialog {
-                                if let ScheduleOverlay::UnsavedChanges { selected } =
-                                    &mut dialog.overlay
-                                {
-                                    match key.code {
-                                        KeyCode::Up => {
-                                            if *selected > 0 {
-                                                *selected -= 1;
-                                            }
-                                        }
-                                        KeyCode::Down => {
-                                            if *selected + 1 < 3 {
-                                                *selected += 1;
-                                            }
-                                        }
-                                        KeyCode::Enter => {
-                                            choice = match *selected {
-                                                0 => Choice::SaveClose,
-                                                1 => Choice::DiscardClose,
-                                                _ => Choice::BackToPanel,
-                                            };
-                                        }
-                                        KeyCode::Esc => {
-                                            dialog.overlay = ScheduleOverlay::None;
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            match choice {
-                                Choice::None => {}
-                                Choice::SaveClose => {
-                                    let saved = schedule_try_save(&mut state);
-                                    let sync_failed = matches!(
-                                        state.schedule_dialog.as_ref().map(|d| &d.overlay),
-                                        Some(ScheduleOverlay::SyncError { .. })
-                                    );
-                                    if saved && !sync_failed {
-                                        state.input_owner = None;
-                                        state.schedule_dialog = None;
-                                    } else if let Some(dialog) = &mut state.schedule_dialog {
-                                        if !sync_failed {
-                                            dialog.overlay = ScheduleOverlay::None;
-                                        }
-                                    }
-                                }
-                                Choice::DiscardClose => {
-                                    state.input_owner = None;
-                                    state.schedule_dialog = None;
-                                }
-                                Choice::BackToPanel => {
-                                    if let Some(dialog) = &mut state.schedule_dialog {
-                                        dialog.overlay = ScheduleOverlay::None;
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-
-                        // ── 无 overlay/菜单：方向键导航 ─────────────────────────
-                        match key.code {
-                            KeyCode::Esc => {
-                                if let Some(dialog) = &mut state.schedule_dialog {
-                                    if dialog.is_dirty() {
-                                        dialog.overlay =
-                                            ScheduleOverlay::UnsavedChanges { selected: 0 };
-                                    } else {
-                                        state.schedule_dialog = None;
-                                    }
-                                }
-                            }
-                            KeyCode::Up => {
-                                if let Some(dialog) = &mut state.schedule_dialog {
-                                    dialog.cursor = dialog.cursor.saturating_sub(1);
-                                    dialog.error = None;
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Some(dialog) = &mut state.schedule_dialog {
-                                    let len = dialog.rows().len();
-                                    if dialog.cursor + 1 < len {
-                                        dialog.cursor += 1;
-                                    }
-                                    dialog.error = None;
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if let Some(dialog) = &mut state.schedule_dialog {
-                                    dialog.menu = dialog.build_menu();
-                                }
-                            }
-                            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                let saved = schedule_try_save(&mut state);
-                                let sync_failed = matches!(
-                                    state.schedule_dialog.as_ref().map(|d| &d.overlay),
-                                    Some(ScheduleOverlay::SyncError { .. })
-                                );
-                                if saved && !sync_failed {
-                                    state.schedule_dialog = None;
                                 }
                             }
                             _ => {}
@@ -10037,16 +9854,6 @@ async fn tui_main(
                                     }
                                     Ok(CommandResult::OpenShellsPanel(target_id)) => {
                                         apply_open_shells_panel(&mut state, target_id);
-                                    }
-                                    Ok(CommandResult::OpenScheduleDialog) => {
-                                        let last_user_prompt = state
-                                            .messages
-                                            .iter()
-                                            .rev()
-                                            .find(|m| matches!(m.role, MessageRole::User))
-                                            .map(|m| m.content.clone());
-                                        state.schedule_dialog =
-                                            Some(ScheduleDialog::new(&state.cwd, last_user_prompt));
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;

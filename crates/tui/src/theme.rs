@@ -568,7 +568,7 @@ impl Theme {
 
     /// 列表/管理面板里"当前选中行"的通用样式（品牌橙前景 + 深灰背景 + 加粗）。
     /// Todo 列表、子 Agent 面板、会话选择器、斜杠命令补全、Profile/Mcp/Skills/
-    /// Plugins/Extensions/Import/Schedule/Agents 等全部管理面板的列表行选中态
+    /// Plugins/Extensions/Import/Agents 等全部管理面板的列表行选中态
     /// 统一走这一个函数，避免各处各自定义颜色导致视觉语言不一致。
     pub fn selected_row() -> Style {
         let bg = Self::selected_bg_color();

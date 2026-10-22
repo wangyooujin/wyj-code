@@ -31,7 +31,7 @@ WYJ_CODE_HOME=/Volumes/external/wyj-state wyj-code
 ├── workspaces/<project_key>/  workflows/<project_key>/
 ├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
 │   └── instances/  meta.json
-└── cas/  spill/  schedule/  logs/
+└── cas/  spill/  logs/
 ```
 
 `project_key` 形如 `v1-wyj-code-1f367bbfb19407b9`（目录名 + SHA-256 前 16 位），
@@ -79,7 +79,7 @@ scope = "home"      # 默认。"project" = 会话与历史跟着工作副本走
 `~/.wyj-code/projects/<key>/`（信任门控必须在仓库外，否则被信任的仓库能自己改掉
 批准标记）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、`workspaces/` 与
 `workflows/`（本机运行态：worktree 路径、进程 pid）、`spill/`、`logs/`、
-`schedule/`、`model-capabilities/`。
+`model-capabilities/`。
 
 **切换不会让状态凭空消失**：新位置还没有记录时，启动会把 home 下的旧项目目录
 复制一份过来（不覆盖已有文件、不删源）。要真正收拢数据仍请手工搬目录——这不是
@@ -263,7 +263,7 @@ soft_limit_ratio = 0.55       # **软阈值**：上下文占用超过窗口的�
                                 # 不改「何时停手」：降到硬阈值以下才停。
 
 [notify]                      # 统一通知通道（v0.2.23+）：TUI/CLI 回合完成 / 错误、
-                              # 后台子 Agent 完成、cron schedule 失败统一派发到
+                              # 后台子 Agent 完成统一派发到
                               # 终端响铃（stderr \x07）与桌面通知（macOS osascript /
                               # Linux notify-send / Windows PowerShell BurntToast）。
                               # 零新第三方依赖。详见 `wyj_core::notify` 模块文档。
@@ -274,13 +274,12 @@ rate_limit_seconds = 30      # 同类事件最小间隔去重；0 = 关闭
 enabled = false              # 终端响铃 opt-in 默认关（TUI 共享场景避免扰民）
 
 [notify.desktop]
-enabled = true               # 桌面通知 opt-out 默认开（后台子 Agent / cron 失败场景必须通知）
+enabled = true               # 桌面通知 opt-out 默认开（后台子 Agent 场景必须通知）
 
 [notify.events]
 turn_finished = true         # CLI `-p` / REPL / TUI 回合正常完成
 turn_error = true            # 主回合出错
 subagent_done = true         # 后台子 Agent 完成（run_in_background: true）；前台调用不通知
-schedule_failure = true      # cron schedule 任务失败
 
 # include_session_id = false   # body 末尾追加 `[session:<id>]`，默认关闭（body 短）
 
@@ -455,7 +454,7 @@ auto_screenshot_max_dim = 960      # 附图的长边像素上限（低于观察�
 
 **`auto_screenshot = true` 的 token 代价**：每张 960 长边的 PNG 约 1000~1600 input token。长 GUI 任务里累积可观，需要控制成本时关掉，改由提示词驱动的按需截图。
 
-**`foreground_fallback` 的三档语义**：`disabled`（默认）下旧 `computer` 的变更动作直接返回 `requires_foreground_takeover`；`ask` 每次变更弹一次确认（要求真实 TUI 交互通道，headless / cron / 子 Agent 一律拒绝）；`idle_only` 只按安静期执行。三者都仍受 `InputArbiter` 与前台 PID 校验约束，且都不会让 `app_computer` 的失败静默回退到全局输入。
+**`foreground_fallback` 的三档语义**：`disabled`（默认）下旧 `computer` 的变更动作直接返回 `requires_foreground_takeover`；`ask` 每次变更弹一次确认（要求真实 TUI 交互通道，headless / 子 Agent 一律拒绝）；`idle_only` 只按安静期执行。三者都仍受 `InputArbiter` 与前台 PID 校验约束，且都不会让 `app_computer` 的失败静默回退到全局输入。
 
 **权限**：`computer` / `app_computer` 属 `PROJECT_APPROVE_ONCE_TOOLS`——首次按 y/Enter/a 即写入当前项目的 `allowed_tools.json`，同项目后续动作与重开项目都不再确认，不同项目仍隔离，拒绝不落盘。两者**互不隐式授权**：批准后台工具不等于批准前台全局输入。
 

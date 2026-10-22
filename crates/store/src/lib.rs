@@ -7,7 +7,6 @@
 //! 配置信息写入本地文件（config.toml、`.wyj-code/mcp.toml`、`.md`、lockfile），绝不
 //! shell out 执行 `npm install`/`pip install` 之类的依赖安装命令。
 
-pub mod cron_sync;
 pub mod extensions;
 pub mod lockfile;
 pub mod marketplace;
@@ -17,7 +16,6 @@ pub mod plugin_manifest;
 pub mod plugin_runtime;
 pub mod project_trust;
 pub mod registry;
-pub mod schedule;
 pub mod self_update;
 pub mod skill_install;
 pub mod skill_trust;

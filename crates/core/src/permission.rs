@@ -89,7 +89,7 @@ pub enum PermissionMode {
     Auto,
     /// 显式 bypass。跳过询问，但不绕过受保护路径。
     AutoApprove,
-    /// Headless/schedule 的显式工具白名单。
+    /// Headless 的显式工具白名单。
     Allowlist(HashSet<String>),
     /// Plan 模式：工具名白名单之外，还强制只读 Bash 和文档写路径策略。
     Plan(HashSet<String>),
@@ -103,7 +103,6 @@ pub enum ExecutionSurface {
     AcpClient,
     SinglePrompt,
     HeadlessRepl,
-    Schedule,
     SubAgent,
     Hook,
 }

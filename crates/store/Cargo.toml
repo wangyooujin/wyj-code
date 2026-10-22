@@ -24,7 +24,6 @@ flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
 uuid.workspace = true
-cron.workspace = true
 jsonschema.workspace = true
 url.workspace = true
 futures.workspace = true
