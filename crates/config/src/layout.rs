@@ -36,6 +36,16 @@
 //!
 //! `sessions` / `history` 从「全局平铺」改成「按项目分目录」是 v0.3.18 的改动，
 //! 见 `crates/cli/src/storage_cmd.rs` 的 `migrate` 子命令。
+//!
+//! `storage.scope = "project"` 时，上表的 `sessions` / `history` 以及
+//! [`ProjectStateRoots`] 里的三组（`memory-v3/projects`、`evolution`、
+//! `indexes`）改落到 `<git-root>/.wyj-code/local/`，跟着工作副本走。
+//! **`memory-v3/global/`、`projects/<key>/`（信任门控）、`cas/`、
+//! `workspaces/`、`workflows/` 与各类全局运行时残留（`spill` / `logs` /
+//! `schedule` / `model-capabilities`）不跟随**：前两者放回仓库等于让被信任的
+//! 仓库自己改掉批准标记，`cas/` 是跨项目去重池（`gc` 是全局 LRU），
+//! `workspaces/` 与 `workflows/` 描述的是本机运行态（worktree 路径、进程 pid），
+//! 跨机器复制没有意义。
 
 use std::path::{Path, PathBuf};
 
@@ -240,6 +250,61 @@ pub fn ensure_project_local_gitignored(cwd: &Path) {
     }
 }
 
+/// 项目级状态根，**不含** `<project_key>` 那一层。
+///
+/// 只收「跟着工作副本走有意义」的三类：
+///
+/// * `memory_projects` —— 模型学到的项目事实；
+/// * `evolution` —— 演化情景与候选；
+/// * `indexes` —— 代码索引（派生缓存，重建无副作用，放项目内只是省一次全量重建）。
+///
+/// **刻意不收**的两类：`workflows/` 里是本机某进程正在跑的 workflow 实时快照
+/// （含 pid），跨机器复制无意义，与 `workspaces/` 的 worktree 同性质；
+/// `memory-v3/global` 是跨项目共用的单文件，跟着某个项目走等于把它私有化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectStateRoots {
+    pub memory_projects: PathBuf,
+    pub evolution: PathBuf,
+    pub indexes: PathBuf,
+}
+
+impl ProjectStateRoots {
+    /// 按 scope 给出三组根目录，**不创建目录、不写 gitignore**。
+    pub fn for_scope(scope: StorageScope, config_base: &Path, cwd: &Path) -> Self {
+        match scope {
+            StorageScope::Home => Self {
+                memory_projects: memory_v3_root(config_base).join("projects"),
+                evolution: evolution_root(config_base),
+                indexes: indexes_root(config_base),
+            },
+            StorageScope::Project => {
+                // 项目内保持与 home 相同的子目录名，只是把根换成 `local/`。
+                // 记忆那层仍留 `memory-v3/projects`：`clear_all` 用相对路径
+                // 记录被搬走的文件，形状一致能少一处特判。
+                let local = project_local_dir(cwd);
+                Self {
+                    memory_projects: local.join("memory-v3").join("projects"),
+                    evolution: local.join("evolution"),
+                    indexes: local.join("indexes"),
+                }
+            }
+        }
+    }
+}
+
+/// 解析 `storage.scope`：未知值**降级为 home 并告警**，绝不让启动失败。
+fn parse_scope_or_warn(scope_value: &str) -> StorageScope {
+    match StorageScope::parse(scope_value) {
+        Some(scope) => scope,
+        None => {
+            tracing::warn!(
+                "storage.scope = {scope_value:?} 无法识别（只支持 \"home\" / \"project\"），按 \"home\" 处理"
+            );
+            StorageScope::Home
+        }
+    }
+}
+
 /// 解析 `storage.scope` 并给出 `(sessions_root, history_root)`。
 ///
 /// 把这段判断集中在这里，是因为它有两处非显然的副作用：`project` 分支会
@@ -252,15 +317,7 @@ pub fn resolve_runtime_roots(
     config_base: &Path,
     cwd: &Path,
 ) -> (PathBuf, PathBuf, StorageScope) {
-    let scope = match StorageScope::parse(scope_value) {
-        Some(scope) => scope,
-        None => {
-            tracing::warn!(
-                "storage.scope = {scope_value:?} 无法识别（只支持 \"home\" / \"project\"），按 \"home\" 处理"
-            );
-            StorageScope::Home
-        }
-    };
+    let scope = parse_scope_or_warn(scope_value);
     match scope {
         StorageScope::Home => (sessions_root(config_base), history_root(config_base), scope),
         StorageScope::Project => {
@@ -269,6 +326,23 @@ pub fn resolve_runtime_roots(
             (local.join("sessions"), local.join("history"), scope)
         }
     }
+}
+
+/// 解析 `storage.scope` 并给出 [`ProjectStateRoots`]（含实际生效的 scope）。
+///
+/// 与 [`resolve_runtime_roots`] 同样在 `project` 分支确保 `local/` 被 git 忽略：
+/// `memory` / `evolve` / `workflow` 这些子命令不会经过启动期的
+/// `resolve_runtime_roots`，只调本函数也必须拿到同样的保护。
+pub fn resolve_project_state_roots(
+    scope_value: &str,
+    config_base: &Path,
+    cwd: &Path,
+) -> (ProjectStateRoots, StorageScope) {
+    let scope = parse_scope_or_warn(scope_value);
+    if scope == StorageScope::Project {
+        ensure_project_local_gitignored(cwd);
+    }
+    (ProjectStateRoots::for_scope(scope, config_base, cwd), scope)
 }
 
 #[cfg(test)]
@@ -411,5 +485,51 @@ mod tests {
             resolve_runtime_roots("projcet", config_base.path(), repo.path());
         assert_eq!(scope, StorageScope::Home);
         assert_eq!(sessions, config_base.path().join("sessions"));
+    }
+
+    /// 三组项目状态根同样随 scope 切换，且 `project` 分支自动带 gitignore。
+    ///
+    /// 这条钉的是「子命令也要跟着走」：`memory` / `evolve` 不经过启动期的
+    /// `resolve_runtime_roots`，只调本函数。若它不写 gitignore，从 CLI 子命令
+    /// 首次创建的 `local/` 目录就会缺保护。
+    #[test]
+    fn resolve_project_state_roots_follows_scope() {
+        let repo = tempfile::tempdir().unwrap();
+        let config_base = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+
+        let (home, scope) = resolve_project_state_roots("home", config_base.path(), repo.path());
+        assert_eq!(scope, StorageScope::Home);
+        assert_eq!(
+            home.memory_projects,
+            config_base.path().join("memory-v3/projects")
+        );
+        assert_eq!(home.evolution, config_base.path().join("evolution"));
+        assert_eq!(home.indexes, config_base.path().join("indexes"));
+
+        let (project, scope) =
+            resolve_project_state_roots("project", config_base.path(), repo.path());
+        assert_eq!(scope, StorageScope::Project);
+        let local = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join(".wyj-code")
+            .join("local");
+        assert_eq!(
+            project.memory_projects,
+            local.join("memory-v3").join("projects")
+        );
+        assert_eq!(project.evolution, local.join("evolution"));
+        assert_eq!(project.indexes, local.join("indexes"));
+        // 只解析路径 + 写 gitignore，不该顺手把业务目录建出来
+        assert!(local.join(".gitignore").is_file());
+        assert!(!project.evolution.exists());
+
+        // 拼错同样降级为 home
+        let (fallback, scope) =
+            resolve_project_state_roots("projcet", config_base.path(), repo.path());
+        assert_eq!(scope, StorageScope::Home);
+        assert_eq!(fallback.evolution, config_base.path().join("evolution"));
     }
 }

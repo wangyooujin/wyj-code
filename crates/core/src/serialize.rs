@@ -55,6 +55,35 @@ pub fn write_json_atomic<T: Serialize + ?Sized>(path: &Path, value: &T) -> Resul
     write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
+/// 把 `src` 下的文件复制进 `dst`，**已存在的同名文件不覆盖**。
+///
+/// 用途是「新位置为空时从旧位置回填」——`storage.scope` 从 `home` 切到
+/// `project` 后，记忆与演化记录还在 home，不回填等于升级后状态凭空消失。
+/// 三个刻意的取舍：
+///
+/// 1. **不覆盖**：新位置里已有的文件是用户在当前档位下刚写的，旧文件不该盖回去。
+/// 2. **不删源**：回填不是迁移。用户后悔时删掉新目录即可回到旧状态。
+/// 3. **不 follow symlink、不保留权限**：这两件事各有专门工具，回填只需要内容。
+pub fn copy_missing_tree(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let target = dst.join(name);
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            fs::create_dir_all(&target)?;
+            copy_missing_tree(&path, &target)?;
+        } else if meta.is_file() && !target.exists() {
+            fs::copy(&path, &target)
+                .map_err(|error| anyhow::anyhow!("复制 {} 失败: {error}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 // 截断统一走 `crate::textutil`（全仓唯一实现）：此处曾带一份逐行相同的手写
 // 副本，但 `truncate_head_tail` 的尾部起点**向上**走（`start += 1`），会超出
 // `tail_bytes` 预算最多 3 字节——与 `core::verify::clip_output` 的结果不一致。
