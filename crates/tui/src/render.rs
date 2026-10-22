@@ -1,8 +1,8 @@
 //! 对话渲染与布局。
 //!
 //! 拆分说明：
-//! - `dialogs.rs` —— 对话框与浮层（权限、信任、Profile、MCP、Skills、Plugins、
-//!   Schedule 等）。纯绘制，不共享可变状态。
+//! - `dialogs.rs` —— 对话框与浮层（权限、信任、Profile、MCP、Skills、Plugins
+//!   等）。纯绘制，不共享可变状态。
 //! - 本文件 —— 聊天区、输入框、状态栏、滚动条与所有共用的排版助手
 //!   （折行、高度测量、markdown 调度）。这些助手被上面两者共同依赖，所以留在
 //!   父模块，由子模块 `use super::*` 继承。
@@ -19,12 +19,11 @@ use crate::app::{
     ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog,
     PermissionDialog, PlanApprovalDialog, PluginOverlay, PluginsDialog, PluginsDialogTab,
-    ProfileDialog, ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow, ScheduleDialog,
-    ScheduleInputField, ScheduleOverlay, ScheduleRow, SessionConflictDialog, SessionPickerState,
-    SettingsDialog, SettingsFieldKind, SettingsInputField, SkillsBrowseSource, SkillsDialog,
-    SkillsDialogTab, SkillsOverlay, SubAgentStatus, SubAgentUiState, TodoExecutionEntry,
-    TodoRuntimeStats, UiFocus, PROFILE_FIELD_SPECS, SCHEDULE_FIELD_LABEL_KEYS,
-    SCHEDULE_FIELD_NOTIFY, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
+    ProfileDialog, ProfileFieldKind, ProfileInputField, ProfileOverlay, ProfileRow,
+    SessionConflictDialog, SessionPickerState, SettingsDialog, SettingsFieldKind,
+    SettingsInputField, SkillsBrowseSource, SkillsDialog, SkillsDialogTab, SkillsOverlay,
+    SubAgentStatus, SubAgentUiState, TodoExecutionEntry, TodoRuntimeStats, UiFocus,
+    PROFILE_FIELD_SPECS, SETTINGS_FIELD_COUNT, SETTINGS_FIELD_SPECS,
 };
 use crate::input::{is_atomic_marker, InputBox, ATTACHMENT_MARKER, PASTE_MARKER};
 use crate::markdown::{
@@ -841,9 +840,6 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     }
 
     // 定时任务面板叠加在最顶层
-    if let Some(dialog) = &state.schedule_dialog {
-        draw_schedule_dialog(f, dialog, state.input_owner, area);
-    }
 
     // 模型选择面板叠加在最顶层（/model）
     if let Some(dialog) = &state.model_picker {

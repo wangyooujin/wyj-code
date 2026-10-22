@@ -82,7 +82,7 @@
 5. **AGENTS.md / CLAUDE.md 注入**（`core::claude_md::ClaudeMdLoader`）：`Agent::run_turn` 每轮开始时调用 `turn_reminder()` 重新读盘，把全局 + 祖先链的 AGENTS.md 系内容用 `wrap_reminder` 包成 `<system-reminder>`，**追加进 system prompt 的 stable 段**（不是当轮 user 消息）；工具执行循环里对新触达目录调用 `maybe_dir_reminder()` 做子目录动态加载，结果**注入历史**（合并进最后一条 user 消息）——**v0.3.14 改，原先进 system 的 volatile 段**。改的理由是缓存前缀的物理顺序：Anthropic 的 system 块位于 messages **之前**，而 messages 断点覆盖「tools + system + messages 前缀」，所以 system 段任何字节变化都会让**整段历史全价重算**；旧注释说「volatile 在断点之后所以不会全价重算」只对 stable 断点成立，messages 断点照样被作废。走历史则前缀字节不变、历史断点照常命中，只有新追加的那条消息是新的（DeepSeek Harness 的 in-history system prompt update 走同一条路）。`seen_dirs` 全局去重保证每个目录只注入一次。配套说明见根 `CLAUDE.md` 的「Configuration」与「System prompt 分段」两节。
 
 
-8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在**工具轮边界**排空注入队列、合并进当前或续接的 user 回合。注入负载是 `core::SteerQueue`（共享队列）里的 `Vec<ContentBlock>` + `InjectionKind`。三条不变式：① **回显在提交那一刻就发生**（`AppState::enqueue_message` 内部 `push_user`），不等 Agent 排空——排空点在工具轮边界，前台子 Agent / 长 Bash 期间可能几十分钟不排空，回显跟着等就等于「我打的字被吞了」；`AgentEvent::Injected` 只负责出队，不重复画。② **主 Agent 与前台子 Agent 排空同一份队列**：前台 `SubAgentTool::run()` 会 `await` 整个子 Agent，而子 Agent 此前完全没有注入通道，用户在它跑的过程中补充的要求既进不了子 Agent、也进不了被工具调用堵住的主 Agent（实测一个 12 分钟的子 Agent = 12 分钟白等）。现经 `ToolContext::steer_queue()` 把队列带进子 Agent（`ToolCtx.steer_queue`，嵌套子 Agent 同享），子 Agent 在跑 → 补充内容插进**子 Agent 自己的**下一轮；子 Agent 已返回 → 插进主 Agent 的下一轮。**谁先到边界谁取走**，因此一条内容只会被投递一次。③ **子 Agent 只取 `UserMessage`**（`SteerQueue::drain_user_messages`）：`SystemReminder` 装的是后台子 Agent / 后台 shell 的完成通知，那是**给主 Agent 的结论**，进了子 Agent 的会话既答非所问，又会让主 Agent 永远收不到（子 Agent 返回时队列已空）。队列的 `push` / `drain` 都是 `&self`（内部 `std::sync::Mutex`）：主 Agent 与工具侧要同时持有 `Arc` 句柄，`&mut` 接收端做不到。headless / cron / 后台子 Agent 为 `None`，行为不变。UI 侧提示在**标题栏与状态栏**（`render::queue_hint_text`，点名当前正在跑的工具）；只放状态栏右对齐会在窄终端被「模型 · 模式 · cwd」挤掉后半句，而「我的补充还没送达」正是最该看见的信息。
+8. **会话中补充消息注入**：TUI 场景下 Agent 忙碌时用户按 Enter 提交的新消息不会打断当前轮次，而是进入 `AppState.pending_queue`，由 `core::agent::Agent::run_turn_with_injection`（而非普通 `run_turn`）在**工具轮边界**排空注入队列、合并进当前或续接的 user 回合。注入负载是 `core::SteerQueue`（共享队列）里的 `Vec<ContentBlock>` + `InjectionKind`。三条不变式：① **回显在提交那一刻就发生**（`AppState::enqueue_message` 内部 `push_user`），不等 Agent 排空——排空点在工具轮边界，前台子 Agent / 长 Bash 期间可能几十分钟不排空，回显跟着等就等于「我打的字被吞了」；`AgentEvent::Injected` 只负责出队，不重复画。② **主 Agent 与前台子 Agent 排空同一份队列**：前台 `SubAgentTool::run()` 会 `await` 整个子 Agent，而子 Agent 此前完全没有注入通道，用户在它跑的过程中补充的要求既进不了子 Agent、也进不了被工具调用堵住的主 Agent（实测一个 12 分钟的子 Agent = 12 分钟白等）。现经 `ToolContext::steer_queue()` 把队列带进子 Agent（`ToolCtx.steer_queue`，嵌套子 Agent 同享），子 Agent 在跑 → 补充内容插进**子 Agent 自己的**下一轮；子 Agent 已返回 → 插进主 Agent 的下一轮。**谁先到边界谁取走**，因此一条内容只会被投递一次。③ **子 Agent 只取 `UserMessage`**（`SteerQueue::drain_user_messages`）：`SystemReminder` 装的是后台子 Agent / 后台 shell 的完成通知，那是**给主 Agent 的结论**，进了子 Agent 的会话既答非所问，又会让主 Agent 永远收不到（子 Agent 返回时队列已空）。队列的 `push` / `drain` 都是 `&self`（内部 `std::sync::Mutex`）：主 Agent 与工具侧要同时持有 `Arc` 句柄，`&mut` 接收端做不到。headless / 后台子 Agent 为 `None`，行为不变。UI 侧提示在**标题栏与状态栏**（`render::queue_hint_text`，点名当前正在跑的工具）；只放状态栏右对齐会在窄终端被「模型 · 模式 · cwd」挤掉后半句，而「我的补充还没送达」正是最该看见的信息。
 
 
 10. **Managed Worktree + Workflow**（v0.2.9，`core::workspace` / `core::workflow` + `cli::{workspace_cmd,workflow_cmd}`）：`workspace create/list/diff/accept/dispose` 管理独立 Git worktree，接受前防御 symlink、父 HEAD 前进、用户并发修改和 binary 漏洞。Workflow 支持 validate/run/status/control、DAG 并行、token budget、human approval、pause/resume/retry/skip/cancel；拥有 Write/Edit/Bash 且配置 write roots 的 Agent/Review 节点从当前脏工作区 checkpoint 自动隔离，每个 worktree 内重建 CodeIndex，成功和失败都保留现场供显式 review/accept/dispose。
@@ -100,13 +100,13 @@
     **子 Agent 中断 = 交接，不是恢复**（2026-10-18，设计见 `doc/plan/subagent-handoff-plan.md`）：未完成（中断/触顶/失败）时回填的不是裸错误，而是 `prompts::subagent_handoff_body` 外壳——最后陈述的位置 + 工具摘要（改了哪些文件、跑过什么、卡在什么错误）+ **显式三选一**（自己续 / 重派新 agent / 报给用户）。三选一必须写成封闭枚举：开放式建议实测退化成不做决定，而模型的默认「不决定」是「我接手」，正好把子 Agent 本该隔离的上下文灌回主对话。三条不变式：① **中断必须保留已完成轮的产出**（旧实现直接 `outputs.join` 整个丢弃，只回一句「子 Agent 被中断」——最需要交接时把唯一有价值的信息扔了）；② **进度必须边跑边记**，因为 `interrupt()`/`abort_foreground()` 会 `JoinHandle::abort()` 取消 future，任务自己的收尾代码一行都不会执行，中断交接物只能由 `SubAgentHub` 从 `HandoffProgress` 共享快照补写；③ **前台与后台共用同一份渲染好的外壳**（经 `SubAgentEvent::Done.handoff_body` 传递），否则同一个中断在 TUI 与 headless 下会给模型两种不同的暗示。明确**不做 resume**：重放子 Agent 历史与「把噪音挡在主上下文之外」的设计初衷冲突，Claude Code 的 Explore/Plan 同样是一次性、不返回 id。
 
 
-19. **统一通知通道（v0.2.23+）**：`wyj_core::notify`（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免 `wyj-cli`/`wyj-tui` 之间的反向依赖循环）覆盖 4 类事件 × 2 类 sink：
-    - **事件源**：`TurnFinished` / `TurnError` / `SubAgentDone`（仅后台 `run_in_background: true`）/ `ScheduleFailed`；ACP/daemon 长跑后端故意不接通知（`crates/cli/src/acp.rs` `SessionEvent::TurnFinished => {}` 注释里写明原因）。
-    - **触发点（7 sites 实际用 6 + daemon 故意跳过 1）**：(a) TUI `apply_agent_event(TurnDone)` 与 (b) `apply_agent_event(Error)` 在 `crates/tui/src/app.rs`，(c) 后台子 Agent 完成（`background=true` 分支），(d) CLI `-p` 单回合完成 与 (e) CLI `--headless` REPL 回合在 `crates/cli/src/main.rs`，(f) cron schedule 任务失败三处在 `crates/cli/src/schedule_cmd.rs`。TUI 与 CLI 共用同一份 dispatcher（`DISPATCHER: Mutex<Option<NotifyDispatcher>>`，`init` 走 first-wins 保护、env override 阶段读取），同一 root session 派生路径天然继承同一份 cfg。
+19. **统一通知通道（v0.2.23+）**：`wyj_core::notify`（从 `wyj_cli::notify` 上迁到 `wyj_core` 供 TUI + CLI 双向共用，避免 `wyj-cli`/`wyj-tui` 之间的反向依赖循环）覆盖 3 类事件 × 2 类 sink：
+    - **事件源**：`TurnFinished` / `TurnError` / `SubAgentDone`（仅后台 `run_in_background: true`）；ACP/daemon 长跑后端故意不接通知（`crates/cli/src/acp.rs` `SessionEvent::TurnFinished => {}` 注释里写明原因）。
+    - **触发点（6 sites 实际用 5 + daemon 故意跳过 1）**：(a) TUI `apply_agent_event(TurnDone)` 与 (b) `apply_agent_event(Error)` 在 `crates/tui/src/app.rs`，(c) 后台子 Agent 完成（`background=true` 分支），(d) CLI `-p` 单回合完成 与 (e) CLI `--headless` REPL 回合在 `crates/cli/src/main.rs`。TUI 与 CLI 共用同一份 dispatcher（`DISPATCHER: Mutex<Option<NotifyDispatcher>>`，`init` 走 first-wins 保护、env override 阶段读取），同一 root session 派生路径天然继承同一份 cfg。
     - **Sink**：`BellSink` 写 stderr `\x07`（raw mode 只影响 stdin line discipline，stderr 不在 alt-screen 范围，跨平台通用）；`DesktopSink` 三平台 `cfg(target_os)` 分支：macOS `osascript -e 'display notification ... with title ...'`、Linux `notify-send --app-name=wyj-code`、Windows PowerShell BurntToast（缺失模块静默 fallback）。所有 sink 失败 swallow + 首次失败 `tracing::debug!` 一次（`OnceLock` 防洪水）。
-    - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done,schedule_failure}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::runtime_api_key` 的 env 不回写语义）。
+    - **Config 挂载**：顶层 `[notify]` block（`enabled` opt-out 默认开 / `bell.enabled` opt-in 默认关 / `desktop.enabled` opt-out 默认开 / `events.{turn_finished,turn_error,subagent_done}` opt-out 默认开 / `rate_limit_seconds=30` / `include_session_id=false`）。env override 最小集：`WYJ_CODE_NOTIFY_OFF=1` master 全关（最高优先级）、`WYJ_CODE_NOTIFY_BELL=0/1`、`WYJ_CODE_NOTIFY_DESKTOP=0/1`——env 在 `init` 阶段读取，**绝不写回 cfg**（仿 `Config::runtime_api_key` 的 env 不回写语义）。
     - **i18n**：title + body 模板统一走 `wyj_i18n::tr("notify.title.*")` / `tr_fmt("notify.body.*")`，模型/工具侧提示词仍为英文常量（CLAUDE.md 「模型侧提示词」节），通知 UI 文案与现有 i18n key 体系一致；`include_session_id=true` 时 body 末尾追加 `[session:<id>]`，总长被 200 字符上限收口（`append_session_id` 内部按 `chars().take(N)` 安全截断）。
-    - **进程级初始化路径**：`cli::main()` 构造 `Config` 后立刻 `wyj_core::notify::init(&cfg.notify)`，TUI/CLI -p/REPL 共享这条；`wyj-code schedule run <id>` 子进程路径在 `schedule_cmd::notify_emit_init_default_if_needed()` 用 `NotifyCfg::default()` 兜底 init（cron 触发不在 `main()` 装配链路里，但因主开关 + desktop 默认开，行为对用户透明）。
+    - **进程级初始化路径**：`cli::main()` 构造 `Config` 后立刻 `wyj_core::notify::init(&cfg.notify)`，TUI/CLI -p/REPL 共享这条。
 
 
 21. **System prompt 拆 stable / volatile 两段（v0.2.25+）**：修 Anthropic prompt cache 自我击穿。`Provider::stream/complete` 的 `system` 参数从 `&str` 改为 `&SystemPrompt<'_>`（`api/src/provider.rs`，含 `stable_only()` / `combined()` / `is_empty()`）。**背景**：旧签名迫使整个 system 压成一个字符串，Anthropic 侧只能发单个 text 块且断点打在块尾，而 system 里混了大量每轮会变的内容（工具可用性、模型兼容 suffix、Project Brief），任一变化都让整段 1.6k~5k token 全价重算。**注意**：旧注释"reminder 只增不减、前缀仍可缓存"是**错的**——追加在断点之后同样改写前缀哈希。`build_system_blocks()` 只在 stable 块末尾打 `cache_control: EPHEMERAL`；断点预算 system 1 + tools 1 + 历史 1 = 3（Anthropic 上限 4）。OpenAI 侧无 system 块概念，用 `combined()` 拼成单条 system 消息。辅助 LLM 调用（记忆提取 / 标题摘要 / Evolution 候选提取）一律 `SystemPrompt::stable_only(...)`。**记忆快照分桶**：`MEMORY_SNAPSHOT_REFRESH_TURNS = 10`，Project Brief 按 `user_turns / 10` 分桶缓存（原本每轮重算相关性排序并拼进稳定前缀，等于每轮改写前缀）——代价是新提取的记忆最迟 10 轮后可见。
@@ -165,8 +165,6 @@
 | Memory v3 `records.json` | 5000 条(Superseded 永保留) | `storage.memory_v3_records_max`（淘汰按 `retention_score`，见上文第 4 条；不是按 `updated_at`） |
 | Memory v3 `jobs.json` | 32 pending | `storage.memory_v3_jobs_max` |
 | Memory v3 `rejected_history.json` | 500 条 | `storage.memory_v3_rejected_history_max` |
-| Schedule 日志 | 50 文件 / task | `storage.schedule_logs_per_task` |
-| Schedule `run.log` | 10 MiB × 3 rotations | `storage.schedule_run_log_*` |
 | 插件 `.git` | 7 天间隔 `git gc` | `storage.plugin_gc_interval_days` |
 | Workspace worktrees | 30 天 prune | `storage.workspace_worktree_max_age_days`（由 `cli::workspace_cmd::manager` 接上 `with_storage_retention`，此前是零调用死代码；`workspace list` 交叉 `git worktree list --porcelain` 报健康度，`--reconcile` 清失效 manifest） |
 | CAS blob pool（context editing 外部化的工具输出 + checkpoint 文件快照） | 1 GiB，启动时 gc | `storage.cas_total_bytes` / `storage.cas_gc_on_start` |
@@ -186,7 +184,7 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 **已知缺口**（v0.3.14 更新）：`sessions/*.json` 与 `<session_id>.checkpoints/` **已接上回收链路**——`storage doctor` 检查损坏的 session / checkpoint 内容（manifest 完好但正文解析失败这一整类），`storage prune --yes` 清理损坏文件并执行 checkpoint retention / 存量外化。注意 prune 的 checkpoint 段整体受 `storage.checkpoints_per_session > 0` 门控（0 = 不限条数），此时损坏文件只报不删，doctor 的输出会显式给出这个提示。**仍无回收路径的是 `<session_id>.subagents/`**（trace / handoff / messages 三类文件随会话增长，只能手动删目录）；顶层 warn 超阈值时也只会提示手动删目录。`cas/` 已在 v0.2.26 接入回收链路(`storage.cas_total_bytes` + `cas_gc_on_start` 启动时 gc;会话被丢弃时逐个 `release` 让 `ref_count` 归零,否则 gc 永远删不掉),但 gc **只在进程启动时跑一次**,长跑进程内不回收。`checkpoint_bytes_per_session` / `checkpoint_ttl_days` 仍因从无消费点保持删除。
 
 
-**实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
+**实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/plugin_install.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
 
 
 ## 落盘布局（v0.3.19）
@@ -204,7 +202,7 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 ├── workspaces/<project_key>/  workflows/<project_key>/
 ├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
 │   └── instances/  meta.json
-└── cas/  spill/  schedule/  logs/
+└── cas/  spill/  logs/
 ```
 
 **项目键必须稳定**（`core::project::project_key`）：`v1-<目录名>-<sha256 前 16 位>`。三条硬约束：
@@ -230,7 +228,7 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 - `layout::resolve_runtime_roots` → `(sessions_root, history_root, scope)`，粒度是「目录里直接放文件」。
 - `layout::resolve_project_state_roots` → `ProjectStateRoots { memory_projects, evolution, indexes }`，粒度是「目录里再放一个 `<project_key>/`」。`project` 档位下它同样会写 gitignore——`memory` / `evolve` 等子命令不经过启动期装配，只调本函数也必须拿到保护。
 
-**不跟随 scope 的四类，理由都是硬约束不是口味**：`memory-v3/global/`（跨项目共用的单文件，跟某个项目走等于私有化）、`projects/<key>/`（信任门控必须在仓库外）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、`workspaces/` 与 `workflows/`（本机运行态：worktree 路径、进程 pid，跨机器复制无意义）。`spill` / `logs` / `schedule` / `model-capabilities` 同理。
+**不跟随 scope 的四类，理由都是硬约束不是口味**：`memory-v3/global/`（跨项目共用的单文件，跟某个项目走等于私有化）、`projects/<key>/`（信任门控必须在仓库外）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、`workspaces/` 与 `workflows/`（本机运行态：worktree 路径、进程 pid，跨机器复制无意义）。`spill` / `logs` / `model-capabilities` 同理。
 
 **`storage` 子命令与 `retention` 必须同时扫两处**：`project` 档位下会话不在 `config_base` 之下，只扫 home 会让 `status` 报 0、`prune` 清不到、TTL 完全空转（用户设了 30 天却一条不删且没有任何提示）。接线点是 `storage_cmd::extra_scope_roots`（`home` 档位返回全空，行为与改动前逐字节一致）与 `retention::run_with_extra_sessions`。同理 `session` / `subagent-trace` 这类「只拿到 session id」的命令走 `locate_session_dir`，两处都找。
 

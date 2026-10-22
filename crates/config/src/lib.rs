@@ -1031,15 +1031,6 @@ pub struct StorageRetentionCfg {
     /// Memory v3 `rejected_history.json` 保留条数(0 = 不限)。
     pub memory_v3_rejected_history_max: usize,
 
-    /// 调度任务日志每个 task 保留文件数(0 = 不限)。
-    pub schedule_logs_per_task: usize,
-
-    /// 共享 `run.log` rotate 触发阈值(0 = 不限)。
-    pub schedule_run_log_size_bytes: u64,
-
-    /// 共享 `run.log` rotate 副本数。
-    pub schedule_run_log_rotations: usize,
-
     /// 插件 `.git` 做 `git gc --prune=now` 的间隔天数(0 = 关闭)。
     pub plugin_gc_interval_days: u32,
 
@@ -1114,9 +1105,6 @@ impl Default for StorageRetentionCfg {
             memory_v3_records_max: 5_000,
             memory_v3_jobs_max: 32,
             memory_v3_rejected_history_max: 500,
-            schedule_logs_per_task: 50,
-            schedule_run_log_size_bytes: 10 * 1024 * 1024,
-            schedule_run_log_rotations: 3,
             plugin_gc_interval_days: 7,
             workspace_worktree_max_age_days: 30,
             disk_usage_warn_bytes: 5 * 1024 * 1024 * 1024,
@@ -1292,7 +1280,7 @@ pub struct Config {
 
 /// `[notify]` 配置块（v0.2.23+）—— 统一通知通道的横切配置。
 ///
-/// 覆盖 TUI/CLI/Schedule 三个子系统共用的 4 类事件（TUI 回合完成/错误、
+/// 覆盖 TUI/CLI 两个子系统共用的 3 类事件（TUI 回合完成/错误、
 /// 后台子 Agent 完成、cron 任务失败），通过 [`NotifyBellCfg`] 与
 /// [`NotifyDesktopCfg`] 两个 sink 通道发到用户面前：
 ///
@@ -1343,7 +1331,6 @@ pub struct NotifyEventsCfg {
     pub turn_finished: bool,
     pub turn_error: bool,
     pub subagent_done: bool,
-    pub schedule_failure: bool,
 }
 
 impl Default for NotifyCfg {
@@ -1371,7 +1358,6 @@ impl Default for NotifyEventsCfg {
             turn_finished: true,
             turn_error: true,
             subagent_done: true,
-            schedule_failure: true,
         }
     }
 }
@@ -2627,7 +2613,6 @@ context_window = 200000
             cfg.events.subagent_done,
             "subagent_done 用户选择 opt-out 默认开（后台离开终端最该被提醒）"
         );
-        assert!(cfg.events.schedule_failure);
         assert_eq!(cfg.rate_limit_seconds, 30);
         assert!(!cfg.include_session_id);
     }
@@ -2656,7 +2641,6 @@ context_window = 200000
         assert!(!cfg.notify.events.turn_finished);
         assert!(cfg.notify.events.turn_error);
         assert!(cfg.notify.events.subagent_done);
-        assert!(cfg.notify.events.schedule_failure);
         assert_eq!(cfg.notify.rate_limit_seconds, 30);
     }
 

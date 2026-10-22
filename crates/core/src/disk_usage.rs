@@ -17,7 +17,6 @@ pub struct DiskUsageReport {
     pub memory_v2: u64,
     pub memory_v3: u64,
     pub evolution: u64,
-    pub schedule_logs: u64,
     pub plugins: u64,
     pub workspaces: u64,
     pub other: u64,
@@ -30,7 +29,6 @@ impl DiskUsageReport {
             + self.memory_v2
             + self.memory_v3
             + self.evolution
-            + self.schedule_logs
             + self.plugins
             + self.workspaces
             + self.other
@@ -42,7 +40,6 @@ impl DiskUsageReport {
             ("memory-v3", self.memory_v3),
             ("evolution", self.evolution),
             ("memory-v2", self.memory_v2),
-            ("schedule-logs", self.schedule_logs),
             ("plugins", self.plugins),
             ("workspaces", self.workspaces),
         ];
@@ -79,7 +76,6 @@ pub fn scan(config_base: &Path) -> DiskUsageReport {
         memory_v2: dir_size(&config_base.join("memory")),
         memory_v3: dir_size(&config_base.join("memory-v3")),
         evolution: dir_size(&config_base.join("evolution")),
-        schedule_logs: dir_size(&config_base.join("schedule")),
         plugins: dir_size(&config_base.join("plugins")),
         workspaces: dir_size(&config_base.join("workspaces")),
         ..DiskUsageReport::default()

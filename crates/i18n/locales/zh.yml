@@ -213,9 +213,9 @@ cli:
   subagent_trace_session_id_help: "会话 id（如 sess-1719723000）"
   subagent_trace_sub_id_help: "子 Agent id（Hub 分配的数字，如 3；留空则列出该会话全部子 Agent 概览）"
   subagent_trace_json_help: "直接输出原始 JSONL（供管道处理），仅在指定了子 Agent id 时生效"
-  trust_mcp_about: "批准当前项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）的信任确认，供配置定时任务前手动批准"
+  trust_mcp_about: "批准当前项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）的信任确认"
   trust_skills_about: "批准当前项目级 skill（.wyj-code/skills/）的信任确认；这些 skill 的正文来自本仓库提交者，执行时整段交给模型"
-  trust_about: "一次性批准当前项目级的 MCP server 与 skill，供配置定时任务前手动批准"
+  trust_about: "一次性批准当前项目级的 MCP server 与 skill"
 
 update:
   checking: "正在检查最新版本…"
@@ -282,7 +282,6 @@ help:
     - `/skills` — 管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
     - `/extensions` — 统一查看并诊断 Skill / MCP / Plugin 资源
-    - `/schedule` — 管理定时任务（cron 触发的 prompt），macOS/Linux 下保存后自动同步进系统 crontab
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
     - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
     - `/mode [模式]` — 切换运行模式（auto / plan / bypass）；无参数则显示当前模式
@@ -557,60 +556,6 @@ mcp:
     uninstall_failed: "卸载失败: {err}"
     upgrade_failed: "升级失败: {err}"
     manual_no_upgrade: "手动配置项没有版本信息，无法升级"
-
-schedule:
-  desc: "管理定时任务（cron 触发的 prompt，比如每日新闻摘要或交易复盘）"
-  headless_unsupported: "[headless 模式不支持 /schedule 面板，请改用 `wyj-code schedule` CLI 子命令]"
-  title: "定时任务"
-  new_task_default_name: "新任务"
-  run_now:
-    triggered: "已触发立即执行，可稍后回面板查看运行结果（状态/关联 session）"
-  field:
-    name: "名称"
-    prompt: "Prompt"
-    cron: "Cron 表达式"
-    cwd: "工作目录"
-    notify_on_failure: "失败时通知"
-    allowed_tools: "允许工具"
-  dialog:
-    hint1: "  ↑↓ 移动  Enter 操作菜单  Ctrl+S 保存"
-    hint2: "  Esc 关闭"
-    editing_placeholder: "编辑中，见下方输入框"
-    add_new_row: "新建任务"
-    "on": "开"
-    "off": "关"
-    invalid_cron_short: "cron 非法"
-  menu:
-    expand: "展开字段"
-    collapse: "收起字段"
-    enable: "启用"
-    disable: "停用"
-    run_now: "立即运行一次"
-    run_now_needs_save: "请先保存该任务的改动再运行"
-    review_permissions: "确认当前权限清单"
-    permissions_reviewed: "权限清单已审查"
-    delete: "删除"
-    edit: "编辑"
-    toggle: "切换"
-    freq_daily: "每天固定时间"
-    freq_hourly: "每小时固定分钟"
-    freq_weekly: "每周固定星期与时间"
-    freq_custom: "自定义 cron 表达式（高级）"
-    new_blank: "新建空白任务"
-    new_from_session: "从当前对话固化为模板"
-  permissions:
-    review_complete: "权限清单已确认；任务保持禁用，请检查后再显式启用。"
-  error:
-    empty_name: "任务名称不能为空"
-    empty_prompt: "Prompt 不能为空"
-    empty_cwd: "工作目录不能为空"
-    invalid_cron: "非法 cron 表达式：{err}"
-    save_failed: "保存定时任务失败：{err}"
-    bad_time_format: "格式应为 HH:MM，如 08:00"
-    bad_minute_format: "应输入 0-59 之间的分钟数"
-    bad_weekly_format: "格式应为「<星期 0-6> HH:MM」，如 \"1 20:30\"（0=周日）"
-  overlay:
-    sync_error_title: "同步 crontab 失败"
 
 skills:
   desc: "管理 Skill（添加 git marketplace 源、浏览/安装/升级/卸载）"
@@ -990,11 +935,6 @@ dialog:
     profile_field: "[分组] 编辑 {field} (Enter 提交 / Esc 取消)"
     model_manual: "[模型] 输入模型名 (Enter 提交 / Esc 取消)"
     settings_field: "[Config] 编辑 {field} (Enter 提交 / Esc 取消)"
-    schedule_field: "[定时任务] 编辑 {field} (Enter 提交 / Esc 取消)"
-    schedule_freq_daily: "[定时任务] 输入时间 HH:MM (Enter 提交 / Esc 取消)"
-    schedule_freq_hourly: "[定时任务] 输入分钟 0-59 (Enter 提交 / Esc 取消)"
-    schedule_freq_weekly: "[定时任务] 输入「<星期 0-6> HH:MM」，0=周日 (Enter 提交 / Esc 取消)"
-    schedule_freq_custom: "[定时任务] 输入标准 5 段 cron 表达式 (Enter 提交 / Esc 取消)"
   action_menu:
     confirm_question: "确定要「{action}」吗？"
     confirm_hint: "Enter/y 确认   Esc/n 取消"
@@ -1122,9 +1062,7 @@ notify:
     turn_finished: "wyj-code 回合完成"
     turn_error: "wyj-code 回合出错"
     subagent_done: "wyj-code 子 Agent 完成"
-    schedule_failed: "wyj-code 定时任务失败"
   body:
     turn_finished: "耗时 {duration_ms} 毫秒。{summary}"
     turn_error: "{error}"
     subagent_done: "子 Agent {agent_id}。{summary}"
-    schedule_failed: "任务 {task_name}。{error}"

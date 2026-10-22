@@ -20,7 +20,6 @@ mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
 mod review_cmd;
-mod schedule_cmd;
 mod skillhub_cmd;
 mod storage_cmd;
 mod trust_cmd;
@@ -131,13 +130,6 @@ enum Commands {
         #[command(subcommand)]
         command: memory_cmd::MemoryCommand,
     },
-    /// 管理定时任务（增删改查 + 同步系统 crontab）；`schedule run <id>` 是真正
-    /// 被 crontab 调用的执行入口，对应 TUI 内 `/schedule` 面板的 headless 版本。
-    #[command(name = "schedule", about = "Manage scheduled tasks (cron-triggered)")]
-    Schedule {
-        #[command(subcommand)]
-        command: schedule_cmd::ScheduleCommand,
-    },
     /// HTTP 技能注册表（SkillHub）的搜索/预览/安装，`/skills` 面板 Browse tab 的
     /// headless 等价物。安装第三方技能前会展示来源、作者、版本与包内容摘要，
     /// 非交互环境需显式 `--yes`。
@@ -159,7 +151,7 @@ enum Commands {
         command: storage_cmd::StorageCommand,
     },
     /// 批准当前项目级 MCP server（`.wyj-code/mcp.toml`/`.mcp.json`）的信任确认。
-    /// 无 UI 通道的场景（`-p`/`--headless`/`schedule run`）会跳过未批准的
+    /// 无 UI 通道的场景（`-p`/`--headless`）会跳过未批准的
     /// 项目级 server 而不连接，配 cron 任务前先用这个命令批准一次。
     #[command(name = "trust-mcp", about = wyj_i18n::tr("cli.trust_mcp_about"))]
     TrustMcp,
@@ -1301,7 +1293,7 @@ async fn main() -> Result<()> {
     //
     // 此前它在分发之后（见下方 `if let Some(name) = cli.profile.take()`），
     // 于是所有**立即 return** 的子命令（extensions / evolve / memory /
-    // schedule / skillhub / storage / trust* / model / session / workspace /
+    // skillhub / storage / trust* / model / session / workspace /
     // workflow / review）都读不到它——`--profile nonexistent model doctor`
     // 甚至不报错，静默用 active profile。校验也一并提前：分组不存在时
     // 立即报错，而不是等到某个子命令恰好用到它。
@@ -1330,7 +1322,6 @@ async fn main() -> Result<()> {
                 Commands::Extensions { .. }
                     | Commands::Evolve { .. }
                     | Commands::Memory { .. }
-                    | Commands::Schedule { .. }
                     | Commands::SkillHub { .. }
                     | Commands::Storage { .. }
                     | Commands::TrustMcp
@@ -1383,10 +1374,6 @@ async fn main() -> Result<()> {
             }
             Commands::SkillHub { command } => {
                 return skillhub_cmd::run(command).await;
-            }
-            Commands::Schedule { command } => {
-                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
-                return schedule_cmd::run(command, &cwd).await;
             }
             Commands::TrustMcp => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
@@ -4337,9 +4324,6 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenShellsPanel(_)) => {
                     println!("{}", wyj_i18n::tr("shells.headless_unsupported"));
-                }
-                Ok(CommandResult::OpenScheduleDialog) => {
-                    println!("{}", wyj_i18n::tr("schedule.headless_unsupported"));
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),
