@@ -10,7 +10,28 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
-## [未发布]
+## [0.3.19] - 2026-10-22
+
+### 移除：定时任务子系统
+
+`schedule` 子系统整体下线：`crates/store/src/schedule.rs`、`cron_sync.rs` 与 TUI 的
+`/schedule` 面板、CLI `schedule` 子命令及 `cron` 依赖一并删除；通知通道去掉
+`ScheduleFailed` 事件（3 类事件源），`ExecutionSurface` 去掉 `Schedule`，storage
+retention 的 schedule 日志配置项与 `~/.wyj-code/schedule` 目录布局同步清理。本机
+crontab 里的托管区块需手工移除。
+
+### 修复：工具 schema 简化把同名参数一并删掉
+
+`simplify_schema_value` 原来对整个 JSON 树无差别删除 `$schema` / `title` /
+`description` / `default` / `examples`，而这些键在 `properties` 字典里是**参数名**——
+删掉等于把该参数从可调用契约里抹除。第三方端点（`strict_tool_schema = false`）走
+简化路径，于是 `Memory` 的 `title`、`SubAgent` / `AskQuestion` 的 `description` 在
+schema 里消失，模型不知道参数存在而漏传，表现为任务结束后连报「write/supersede
+需要 title」。
+
+- 新增 `SCHEMA_MAP_KEYWORDS`：`properties` / `patternProperties` / `$defs` /
+  `definitions` / `dependentSchemas` 只递归值、保留键。
+- `enum` / `const` 下的对象是字面量数据，不再被递归改写。
 
 ### 修复：已批准的项目级 skill 每次启动都被重新追问
 
