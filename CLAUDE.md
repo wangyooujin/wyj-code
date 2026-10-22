@@ -70,8 +70,11 @@ cargo run -- review run --base HEAD^ --head HEAD --json # 本地 diff 审查证�
 | 冲突面 | 手段 |
 |---|---|
 | 两个 agent 同时改同一批源码 | `workspace create --branch <名字>` 开独立 worktree（唯一真隔离） |
-| 共享状态文件互相覆盖 | `config::filelock` 跨进程锁（锁住在最底层 crate，因为 `Config::save` 自己就是 load→改→save）+ `serialize::write_atomic` 原子替换（会话 / 授权名单 / memory-v3 全局层） |
+| **同一 checkout 起了两个实例** | `core::instance` 工作目录注册表（`~/.wyj-code/projects/<key>/instances/<pid>-<uuid>.json`，`InstanceGuard` drop 时删除）。启动时若同 cwd 还有存活实例，打印 `main.instances_share_cwd` 告警并给出 `workspace create` 的出路；`/rewind` 的 `RewindPreview.shared_peers` 非空时**强制确认**——`restore_files` 走 `git restore --worktree` 直接覆盖文件，对方没有 checkpoint 可退。判据是**同 cwd**，不是同项目：worktree 里文件物理隔离，不该报冲突 |
+| 共享状态文件互相覆盖 | `config::filelock` 跨进程锁（锁住在最底层 crate，因为 `Config::save` 自己就是 load→改→save）+ `serialize::write_atomic` 原子替换（会话 / 授权名单 / memory-v3 全局层 / evolution / 代码索引） |
 | 两个进程 resume 同一会话 | 启动时检出占用并告警（`SessionStore::active_owner`）。锁只能防写坏，防不了「整文件覆盖」语义上的丢更新，所以并行必须换会话 |
+
+**索引与 evolution 的写不能只加锁，还要合并**：两者都是「读整份 JSON → 改 → 整份写回」的单文件状态。只加跨进程锁只能保证不写坏，挡不住 A 拿着旧快照把 B 刚写进去的条目整份覆盖。`ProjectCodeIndex::persist` 的增量路径（`invalidate`）因此额外做**按 mtime/len 取新**的磁盘合并，全量重建则不合并（重建结果是权威快照）；`invalidate` 原来还是裸 `fs::write`，半截 JSON 会让另一个实例静默全量重建。`EvolutionStore::write_critical` 是进程内 Mutex + 跨进程锁双层，跨进程侧**分段重试 500ms 后降级**而非 `acquire` 阻塞 30 秒——它的写点有从 TUI 主流程直接调的。
 
 ```bash
 # 1) 开一个隔离实例（worktree 落在 ~/.wyj-code/workspaces/<project_id>/worktrees/）
@@ -140,7 +143,7 @@ benchmarks/compare.sh <baseline> <candidate>
 - 同步要求：新增命令的 PR/提交里就应包含对应的 `/help` 条目，不要留到后续补；若临时不希望暴露（如调试命令），应在 `/help` 中显式标注「内部/调试」而非直接省略。
 - 命令文案需走 i18n（`tr()` key），与 `/help` 其余条目一致，不可硬编码中文。
 - **动态命令（Skill / 项目级自定义命令）是上述约定的例外**：这类命令运行时从磁盘发现、因人而异，不可能写死进静态 `help.body` 模板。`Command` trait 的 `is_dynamic()` 默认方法（仅 `SkillCommand` 覆盖为 `true`）标记这类命令，`CommandContext.dynamic_commands` 由调用方在构造 ctx 前用 `cmd_registry.list()` 过滤好传入，`HelpCmd` 渲染完静态模板后在末尾追加一个「自定义命令」分组（i18n key: `help.custom_commands_header`）。两者互不冲突，新增静态内置命令仍必须遵守上面的硬性约定。v0.2.24 起 Skill 来源收敛到 `~/.wyj-code/skills/` + `<git-root>/.wyj-code/skills/`，不再读取 `~/.claude/commands/` / `<cwd>/.claude/commands/`，动态命令扫描范围同步收敛。
-- **回合进行中（`is_thinking`）的 slash 命令**：忙碌时按 Enter 默认把内容排进 `pending_queue` 投递给模型，而 `/model` 这类命令**没有内容可投递**——排给模型等于把字面的 `/model` 当成一句用户消息发出去，右下角同时冒出"1 条已排队"（用户现场）。因此 TUI 在 Enter 分支先问 `Command::runs_while_busy`：为 true 的**面板类**命令（`/model` `/profile` `/effort` `/mcp` `/config` `/skills` `/plugins` `/agents` `/memory` `/sessions` `/schedule` `/help` `/mode` `/cwd` `/doctor` `/hooks` `/shells` `/subagents` `/computer` `/agent-control` `/extensions` `/mouse` `/quit`）照常 dispatch，其余维持排队。**该方法默认 false，且必须保持默认 false**，四条排除理由见其文档注释（起新回合 / 改会话历史 / 抢 `current_task` 句柄导致回合失去 ESC 中断 / 读 session 统计）。`/cost` `/context` 刻意不在白名单：忙碌时 session 被回合整段持锁，只能拿到降级 ctx（统计字段全 0），与其给一份静默失真的数字，不如让用户等回合结束。CommandContext 拿不到锁时**降级构造而不是跳过执行**——跳过等于用户按 `/model` 只看到一句"会话忙"。钉子：`app::busy_slash_tests`（白名单判定 + 主循环分支顺序）、`commands::registry::busy_whitelist_tests`（白名单**精确集合**断言，多一条少一条都红）。
+- **回合进行中（`is_thinking`）的 slash 命令**：忙碌时按 Enter 默认把内容排进 `pending_queue` 投递给模型，而 `/model` 这类命令**没有内容可投递**——排给模型等于把字面的 `/model` 当成一句用户消息发出去，右下角同时冒出"1 条已排队"（用户现场）。因此 TUI 在 Enter 分支先问 `Command::runs_while_busy`：为 true 的**面板类**命令（`/model` `/profile` `/effort` `/mcp` `/config` `/skills` `/plugins` `/agents` `/memory` `/sessions` `/schedule` `/help` `/mode` `/cwd` `/doctor` `/hooks` `/shells` `/subagents` `/computer` `/agent-control` `/extensions` `/quit`）照常 dispatch，其余维持排队。**该方法默认 false，且必须保持默认 false**，四条排除理由见其文档注释（起新回合 / 改会话历史 / 抢 `current_task` 句柄导致回合失去 ESC 中断 / 读 session 统计）。`/cost` `/context` 刻意不在白名单：忙碌时 session 被回合整段持锁，只能拿到降级 ctx（统计字段全 0），与其给一份静默失真的数字，不如让用户等回合结束。CommandContext 拿不到锁时**降级构造而不是跳过执行**——跳过等于用户按 `/model` 只看到一句"会话忙"。钉子：`app::busy_slash_tests`（白名单判定 + 主循环分支顺序）、`commands::registry::busy_whitelist_tests`（白名单**精确集合**断言，多一条少一条都红）。
 - **三个模型相关命令的职责边界与作用域**（v0.3.16 拆分，此前 `/model` 一个命令背了三件事）：
 
   | 命令 | 职责 | 作用域 | 落盘 |

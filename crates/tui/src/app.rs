@@ -1953,10 +1953,11 @@ pub struct AppState {
     pub chat_follow_tail: bool,
     /// 是否有新消息在用户查看历史时到达。
     pub unseen_messages: bool,
-    /// 是否开启鼠标报告（滚轮/拖拽进入应用）。见 `config::UiCfg::mouse_capture`。
+    /// 是否开启鼠标报告（滚轮/拖拽进入应用），启动时由
+    /// [`config::UiCfg::resolved_mouse`] 一次判定，运行期不再变化。
     ///
-    /// 主循环每帧比对它与「已应用到终端的值」，变化时发开/关序列；`/mouse`
-    /// 只改这里，不写回配置文件。
+    /// 应用自己实现滚轮、拖选、双击选词与滚动条拖动，所以开启捕获不再意味着
+    /// 「失去拖选」。`/mouse` 已下线，要改只能改配置里的 `[ui].mouse`。
     pub mouse_capture: bool,
     /// 是否在内容区右侧绘制应用内滚动条（见 `config::UiCfg::scrollbar`）。
     pub show_scrollbar: bool,
@@ -1965,13 +1966,40 @@ pub struct AppState {
     /// 应用内拖选需要知道「哪些格子属于正文」：输入框、状态栏、底部面板都不能
     /// 被选进来，否则一次从上到下的拖选会把边框和提示文字一起复制。
     pub(crate) chat_area: ratatui::layout::Rect,
+    /// 输入框**正文区**（边框内侧）本帧占用的屏幕矩形，由 `draw_input` 回写。
+    ///
+    /// 点选输入框时用它做命中判定；边框、标题栏都不算。
+    pub(crate) composer_area: ratatui::layout::Rect,
+    /// 本帧实际渲染的输入框内容（已展开附件/粘贴占位符）。
+    ///
+    /// 鼠标点击要按**屏幕上看到的位置**定位光标，而占位符展开后宽度与原始
+    /// `InputBox` 里的原子标记不同，只能拿渲染用的这份来算视觉坐标。
+    pub(crate) composer_display: crate::input::InputBox,
+    /// `composer_display` 的每个显示列对应的原始 `InputBox` 列号。
+    ///
+    /// `None` 表示该显示列落在占位符标签内部，映射到标记本身的位置。
+    pub(crate) composer_display_map: Vec<Vec<usize>>,
+    /// 输入框正文的纵向滚动偏移（视觉行）。内容超过 8 行时窗口跟随光标。
+    pub(crate) composer_scroll: usize,
+    /// 上一帧光标的视觉位置 `(行, 列)`，用于判断「光标动过没有」。
+    ///
+    /// 只有光标动过才把视口拉回光标处；否则用户用滚轮翻看长草稿时，每帧都会被
+    /// 强制拽回去，滚轮等于失效。
+    pub(crate) composer_last_cursor: Option<(usize, usize)>,
+    /// 内容区滚动条本帧的几何信息（没绘制时为 `None`）。点中它即开始拖动。
+    pub(crate) content_scrollbar: Option<ScrollbarMetrics>,
+    /// 正在拖动的滚动条（按下时记下起点，拖动时按比例换算偏移）。
+    pub(crate) scrollbar_drag: Option<ScrollbarDrag>,
     /// 进行中的鼠标拖选。`None` 表示没有选区。
     pub(crate) selection: Option<TextSelection>,
     /// 上一次左键按下的时刻与位置，用于识别双击（选词）。
     pub(crate) last_click: Option<(Instant, u16, u16)>,
     /// 复制结果的瞬时提示（文案, 过期时刻），显示在状态栏右侧。
     pub(crate) selection_notice: Option<(String, Instant)>,
-    /// 上一帧内容区的屏幕文本快照（`ScreenRow`），复制选区时按它还原文字。
+    /// 上一帧**可选中区域**的屏幕文本快照（聊天区 + 输入框正文）。
+    ///
+    /// 两段区域的 y 范围互不重叠，按 `ScreenRow.y` 过滤即可各取所需。复制选区
+    /// 时按它还原文字。
     pub(crate) frame_rows: Vec<ScreenRow>,
     pub total_input_tokens: u32,
     pub total_output_tokens: u32,
@@ -2328,9 +2356,16 @@ impl AppState {
             chat_max_scroll: 0,
             chat_follow_tail: true,
             unseen_messages: false,
-            mouse_capture: config.ui.mouse_capture,
+            mouse_capture: config.ui.resolved_mouse(),
             show_scrollbar: config.ui.scrollbar,
             chat_area: ratatui::layout::Rect::default(),
+            composer_area: ratatui::layout::Rect::default(),
+            composer_display: InputBox::new(),
+            composer_display_map: Vec::new(),
+            composer_scroll: 0,
+            composer_last_cursor: None,
+            content_scrollbar: None,
+            scrollbar_drag: None,
             selection: None,
             last_click: None,
             selection_notice: None,
@@ -3005,12 +3040,13 @@ pub async fn run_tui(
     // 输入框/状态栏贴着窗口底部，不再有"内容不够高、底部留空白"的问题。
     // 历史消息永远留在 `AppState.messages`，由 PageUp/PageDown 与滚轮驱动的内容
     // 滚动入口翻看；滚轮绝不得进入 Composer 输入历史。
-    // 鼠标捕获是否开启由 `[ui].mouse_capture` 决定（默认开）：alternate screen 里
-    // 终端没有自己的滚动条，macOS Terminal.app 又不支持 DEC mode 1007，不开捕获
-    // 时滚轮**完全不会送达应用**。开启的代价是拖选复制需按住 Option；`/mouse`
-    // 与配置项都能退回。链接继续通过 OSC 8 交给终端处理 Command/Ctrl+点击。
+    // 鼠标捕获是否开启由 `[ui].mouse` 三态决定（`auto` 按 `TERM` 检测）：alternate
+    // screen 里终端没有自己的滚动条，macOS Terminal.app 又不支持 DEC mode 1007，
+    // 不开捕获时滚轮**完全不会送达应用**。开启后拖选、双击选词、滚动条拖动都由
+    // 应用内实现，所以不再有「开了捕获就不能拖选复制」的取舍。链接继续通过
+    // OSC 8 交给终端处理 Command/Ctrl+点击。
     let wheel_routing = TerminalWheelRouting::detect();
-    let initial_mouse_capture = config.ui.mouse_capture;
+    let initial_mouse_capture = config.ui.resolved_mouse();
     enter_terminal_screen(&mut stdout, wheel_routing, initial_mouse_capture)?;
     // 标记已进入 alternate screen：panic hook 据此决定是否还原终端。
     // 见 `crates/tui/src/panic_guard.rs`。
@@ -3758,6 +3794,19 @@ fn format_rewind_preview(preview: &wyj_core::RewindPreview) -> String {
         preview.checkpoint_id,
         preview.affected_files.len()
     )];
+    if !preview.shared_peers.is_empty() {
+        // 放在文件清单之前：这是决定「要不要确认」的那一条，
+        // 埋在 50 个路径后面等于没写。
+        lines.push(format!(
+            "⚠️ 另一个 wyj-code 实例（pid {}）正在同一工作目录里运行，回滚会覆盖它尚未存档的编辑",
+            preview
+                .shared_peers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     lines.extend(
         preview
             .affected_files
@@ -4920,16 +4969,8 @@ async fn tui_main(
     let mut mcp_tool_names: Vec<String> = Vec::new();
     // 让下面第一次判断立刻成立（否则首帧被节流挡掉，MCP 工具要等 1 秒才出现）。
     let mut last_external_refresh = Instant::now() - EXTERNAL_REFRESH_INTERVAL;
-    // 已经应用到终端的鼠标报告状态。`/mouse` 只改 `state.mouse_capture`，
-    // 这里每帧比对后发一次终端序列——幂等，且不必在命令分支里持有 backend。
-    let mut applied_mouse_capture = state.mouse_capture;
 
     loop {
-        if state.mouse_capture != applied_mouse_capture {
-            set_mouse_capture(terminal.backend_mut(), state.mouse_capture)?;
-            applied_mouse_capture = state.mouse_capture;
-        }
-
         // Ctrl+C 首次按下超过 3 秒未确认则重置
         if let Some(t) = state.last_ctrl_c {
             if t.elapsed() > Duration::from_secs(3) {
@@ -5378,27 +5419,57 @@ async fn tui_main(
                     // 应用内拖选：按下建锚点、拖拽扩范围、松开写剪贴板。
                     // 开鼠标报告后终端不再处理选择，这条路径是「直接拖选复制」的
                     // 唯一实现（Claude Code fullscreen 同款）。
+                    //
+                    // 落在输入框里的按下额外返回目标文本位置：输入框由主循环持有，
+                    // `AppState` 改不了它，只能把位置算好在这里落下去。
                     MouseEventKind::Down(MouseButton::Left) => {
                         let rows = std::mem::take(&mut state.frame_rows);
-                        state.begin_selection(mouse.column, mouse.row, &rows);
+                        let composer_pos = state.begin_selection(mouse.column, mouse.row, &rows);
                         state.frame_rows = rows;
+                        if let Some((x, y)) = composer_pos {
+                            if let Some((row, col)) = state.composer_text_pos_at(x, y) {
+                                input.cursor_row = row.min(input.lines.len().saturating_sub(1));
+                                input.cursor_col =
+                                    col.min(input.lines[input.cursor_row].chars().count());
+                                state.history_idx = None;
+                            }
+                        }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        state.update_selection(mouse.column, mouse.row);
+                        if state.scrollbar_drag.is_some() {
+                            state.drag_scrollbar(mouse.row);
+                        } else {
+                            state.update_selection(mouse.column, mouse.row);
+                        }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
+                        if state.scrollbar_drag.is_some() {
+                            state.end_scrollbar_drag();
+                        }
                         let rows = std::mem::take(&mut state.frame_rows);
                         state.end_selection(&rows);
                         state.frame_rows = rows;
                     }
+                    // 滚轮滚动**不清选区**：选区记了建立时的滚动偏移，渲染与复制
+                    // 时按差量平移，高亮跟着文字走。见 `TextSelection::shifted`。
+                    //
+                    // 指针落在输入框上时滚输入框自己的视口（内容装得下才回落到
+                    // 聊天区），否则滚当前焦点区。
                     MouseEventKind::ScrollUp => {
-                        // 滚动会让屏幕上原本选中的文字错位，选区必须一起作废。
-                        state.clear_selection();
-                        state.scroll_focus_lines(-3)
+                        let on_composer = state
+                            .composer_area
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+                        if !(on_composer && state.scroll_composer_lines(-3)) {
+                            state.scroll_focus_lines(-3);
+                        }
                     }
                     MouseEventKind::ScrollDown => {
-                        state.clear_selection();
-                        state.scroll_focus_lines(3)
+                        let on_composer = state
+                            .composer_area
+                            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+                        if !(on_composer && state.scroll_composer_lines(3)) {
+                            state.scroll_focus_lines(3);
+                        }
                     }
                     _ => {}
                 },
@@ -9976,18 +10047,6 @@ async fn tui_main(
                                             .map(|m| m.content.clone());
                                         state.schedule_dialog =
                                             Some(ScheduleDialog::new(&state.cwd, last_user_prompt));
-                                    }
-                                    Ok(CommandResult::ToggleMouseCapture) => {
-                                        // 只翻转状态：真正写终端的序列由主循环每帧比对后发，
-                                        // 命令分支不持有 backend，也就不可能和绘制交错。
-                                        state.mouse_capture = !state.mouse_capture;
-                                        state.messages.push(ChatMessage::system(
-                                            if state.mouse_capture {
-                                                wyj_i18n::tr("mouse.on")
-                                            } else {
-                                                wyj_i18n::tr("mouse.off")
-                                            },
-                                        ));
                                     }
                                     Ok(CommandResult::Quit) | Ok(CommandResult::None) => {
                                         state.should_quit = true;

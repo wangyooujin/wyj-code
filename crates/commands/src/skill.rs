@@ -833,6 +833,17 @@ mod tests {
             ProjectSkillsGate::Blocked
         );
 
+        // approve_skills 写真实 config_dir，用例结束收尾（同 project_trust::tests::Cleanup）。
+        struct Cleanup<'a>(&'a std::path::Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let key = wyj_core::project_key(self.0);
+                if let Ok(config_base) = wyj_config::config_dir() {
+                    let _ = std::fs::remove_dir_all(config_base.join("projects").join(key));
+                }
+            }
+        }
+        let _cleanup = Cleanup(cwd.path());
         wyj_store::skill_trust::approve_skills(cwd.path()).unwrap();
         assert_eq!(
             ProjectSkillsGate::resolve(cwd.path()),

@@ -245,6 +245,7 @@ main:
   session_resumed_last: "已恢复上次会话 {id}（{count} 条消息）"
   session_in_use: "警告：会话 {id} 可能仍被 wyj-code 进程 {pid} 使用。两边各自保存会互相覆盖消息；要并行推进请改用 `wyj-code workspace create` 开独立 worktree 实例。"
   session_in_use_headless: "会话 {id} 正被另一个 wyj-code 进程（{pid}）使用，拒绝恢复：headless 模式下没有人可以询问，继续下去等于静默覆盖另一个实例的消息。请改开新会话，或先停掉另一个进程。"
+  instances_share_cwd: "注意：另一个 wyj-code 进程（{pids}）正在**同一个目录**里工作。两边会互相看到对方的未提交改动，`/rewind` 也会覆盖对方尚未存档的编辑。要并行改代码，请改用 `wyj-code workspace create --branch <名字>` 开独立 worktree。"
   resume_compacted: "恢复的会话历史较长，已预压缩（移除 {count} 条旧消息）"
   no_session_history: "暂无历史会话，将开始新会话。"
   mode_info_plan: " [plan 模式：仅只读工具]"
@@ -269,7 +270,6 @@ help:
     - `/agents` — 列出可用的 subagent 类型（内置 + 自定义 *.md 定义）
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
-    - `/mouse` — 切换鼠标捕获：开启后滚轮滚动内容区、直接拖选即复制，关闭后交还终端原生拖选
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开项目记忆面板（AGENTS.md / CLAUDE.md 等规约文件）
@@ -313,9 +313,10 @@ help:
     - `↑` / `↓` — 浏览输入历史；多行输入中先移动光标，到首行/末行后切换历史
     - `Shift+↑` — 进入内容区（优先运行中的子 Agent，其次任务列表、后台任务、聊天区）；`Esc` 逐级返回输入框
     - `PageUp` / `PageDown` — 上下翻阅当前会话内容
-    - `鼠标滚轮` — 上下翻阅内容区（右侧细滚动条指示位置）；`/mouse` 可切换鼠标捕获
-    - `拖拽` — 选中内容区文字，松开即自动复制到系统剪贴板；双击选中一个词（路径/URL 整体）
-    - `Esc` — 取消当前选区（任意按键也会清除）
+    - `鼠标滚轮` — 上下翻阅内容区；指针在输入框上时翻阅输入框自身（长草稿）
+    - `拖拽` — 选中内容区或输入框里的文字，松开即自动复制到系统剪贴板；双击选中一个词（路径/URL 整体）。滚动后选区跟着文字走，`Esc` 或任意按键清除
+    - `点击输入框` — 光标跳到点击位置，像普通编辑器一样接着打字
+    - `拖动右侧滚动条` — 直接跳到对应位置；点轨道也能跳转
     - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
     - `Command+点击` / `Ctrl+点击` — 打开回复中的本地文件路径或网页链接
     - `/` — 命令补全（Tab 确认，Esc 取消）
@@ -869,12 +870,6 @@ mode:
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
   current: "当前模式: {mode}（可选: auto / plan / bypass）"
   unknown: "未知模式 '{args}'。可选：auto / plan / bypass"
-
-mouse:
-  desc: "切换鼠标捕获：开启后滚轮可滚动聊天区、可直接拖选并自动复制；关闭后完全交还终端"
-  on: "鼠标捕获已开启：滚轮滚动内容区，直接拖选文字即自动复制（双击选词）。再用 /mouse 可关闭。"
-  off: "鼠标捕获已关闭：终端原生拖选复制恢复（无需 Option），但 macOS Terminal.app 下滚轮将不再滚动内容区。"
-  headless_unsupported: "[headless 模式没有鼠标交互，/mouse 无效果]"
 
 selection:
   copied: "已复制 {chars} 个字符"

@@ -1657,6 +1657,33 @@ async fn main() -> Result<()> {
             None => None,
         };
 
+    // 工作目录级占有登记。会话租约只管「同一个 session id 被两边 resume」，
+    // 而新会话各起各的 id、互不冲突，却对着**同一份 checkout** 跑 Edit /
+    // cargo test / rewind —— 这类冲突此前完全静默。这里登记本进程，拿到
+    // 「启动时已经有人在同一目录跑」的快照，交给下面打一句告警；
+    // `/rewind` 侧另有实时查询（`instance::live_peers`）来升级为强制确认。
+    //
+    // 与 `_session_claim` 同理必须持有到 main 结束，登记表才能在正常退出时清掉。
+    let (_instance_guard, instance_peers) =
+        match wyj_core::InstanceGuard::register(&config_base, &cwd, &session_id) {
+            Ok((guard, peers)) => (Some(guard), peers),
+            Err(error) => {
+                tracing::warn!("登记实例失败（不影响本次运行）: {error}");
+                (None, Vec::new())
+            }
+        };
+    if !instance_peers.is_empty() {
+        let pids = instance_peers
+            .iter()
+            .map(|peer| peer.pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "{}",
+            wyj_i18n::tr_fmt("main.instances_share_cwd", &[("pids", &pids)])
+        );
+    }
+
     // CAS blob pool:按 SHA-256 内容寻址去重 checkpoint 内 workspace 文件字节。
     // 21 checkpoint × 256 文件 = 5376 份冗余 → 256 份唯一,实测单 session 从
     // 223MB 降到 < 5MB。CAS root 不可写时 capture_files 走 inline 兜底。
@@ -1707,9 +1734,17 @@ async fn main() -> Result<()> {
     // `CheckpointStore::configured`,否则会退回裸 `new()` 的"不限条数 +
     // 不接 CAS"语义 —— `attach_agent_session` 更会覆盖掉这里装配好的
     // store,导致切换过模型后 checkpoint 不再封顶、文件快照不走 CAS 去重。
+    //
+    // `non_interactive` 决定「同一工作目录还有别的实例时，文件回滚是确认还是拒绝」：
+    // 只有 TUI 能真的把预览摆到人面前按确认，`-p` / headless / 定时任务里的
+    // `confirmed = true` 是调用方写死的，它不代表任何同意。ACP 有真实
+    // `session/request_permission` 往返，算交互；daemon 不是（连接方可能早已断开）。
+    let checkpoint_non_interactive =
+        !(is_tui_mode || matches!(runtime_command, Some(RuntimeCommand::Acp)));
     wyj_core::checkpoint::set_checkpoint_config(wyj_core::checkpoint::CheckpointConfig {
         max_per_session: cfg.storage.checkpoints_per_session,
         cas: workspace_cas.clone(),
+        non_interactive: checkpoint_non_interactive,
     });
     let checkpoint_store = session_store_arc.as_ref().and_then(|store| {
         wyj_core::CheckpointStore::configured(store.dir(), session_id.clone())
@@ -3311,6 +3346,20 @@ fn rewind_preview_text(preview: &wyj_core::RewindPreview) -> String {
         preview.checkpoint_id,
         preview.affected_files.len()
     )];
+    if !preview.shared_peers.is_empty() {
+        // 放在文件清单**之前**：这是决定「要不要按 --force」的那一条，
+        // 埋在 50 个路径后面等于没写。
+        lines.push(format!(
+            "WARNING: another wyj-code instance (pid {}) is running in this working tree; \
+             restoring files overwrites edits it has not checkpointed",
+            preview
+                .shared_peers
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     lines.extend(
         preview
             .affected_files
@@ -3362,6 +3411,10 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
             scope,
             force,
         } => {
+            // 这里**不**标记 `non_interactive`：`--force` 是人在终端里亲手敲的，
+            // 与 `-p` / 定时任务里写死的 `confirmed = true` 不是一回事。同一工作
+            // 目录上有别的实例时，preview 会点名对方 pid 并把 `--force` 变成必需，
+            // 用户按需决定即可。
             let mut file = sessions.load(&session_id)?;
             let cwd = PathBuf::from(&file.cwd);
             let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id)?;
@@ -4171,9 +4224,6 @@ async fn repl(
                 }
                 Ok(CommandResult::OpenScheduleDialog) => {
                     println!("{}", wyj_i18n::tr("schedule.headless_unsupported"));
-                }
-                Ok(CommandResult::ToggleMouseCapture) => {
-                    println!("{}", wyj_i18n::tr("mouse.headless_unsupported"));
                 }
                 Ok(CommandResult::Quit) | Ok(CommandResult::None) => break,
                 Err(e) => eprintln!("[命令错误] {e}"),

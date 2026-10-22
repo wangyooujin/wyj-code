@@ -114,6 +114,18 @@ mod tests {
     use super::*;
     use wyj_config::McpTransport;
 
+    /// `approve` 硬编码写真实 `~/.wyj-code/projects/<key>/`；测试 cwd 是 tempdir，
+    /// 每跑一次就在那里留一个空壳项目目录（实测积累过 4500+ 个）。用例结束清掉。
+    struct Cleanup<'a>(&'a Path);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let key = wyj_core::project_key(self.0);
+            if let Ok(config_base) = wyj_config::config_dir() {
+                let _ = std::fs::remove_dir_all(config_base.join("projects").join(key));
+            }
+        }
+    }
+
     fn mcp(name: &str, command: &str) -> McpServerConfig {
         McpServerConfig {
             name: name.to_string(),
@@ -138,6 +150,7 @@ mod tests {
     #[test]
     fn pending_until_approved_then_trusted() {
         let dir = tempfile::tempdir().unwrap();
+        let _cleanup = Cleanup(dir.path());
         wyj_config::save_project_mcp(dir.path(), &[mcp("postgres", "npx")]).unwrap();
 
         assert!(matches!(trust_status(dir.path()), TrustStatus::Pending(_)));
@@ -149,6 +162,7 @@ mod tests {
     #[test]
     fn changing_content_after_approval_goes_back_to_pending() {
         let dir = tempfile::tempdir().unwrap();
+        let _cleanup = Cleanup(dir.path());
         wyj_config::save_project_mcp(dir.path(), &[mcp("postgres", "npx")]).unwrap();
         approve(dir.path()).unwrap();
         assert!(matches!(trust_status(dir.path()), TrustStatus::Trusted));

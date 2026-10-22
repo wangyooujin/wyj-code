@@ -14,6 +14,7 @@ pub mod frontmatter;
 pub mod history;
 pub mod hooks;
 pub mod hooks_trust;
+pub mod instance;
 // 内部模块：公共 API 只走下面的扁平 re-export。全仓无人用
 // `wyj_core::interfaces::` 这条路径，两条并行的公共路径只会让「改类型要改
 // 几处」变得不确定。
@@ -68,6 +69,7 @@ pub use hooks::{
     load_effective_hooks, HookCommand, HookMatcherEntry, HookOutcome, HookRunner, HooksSettings,
 };
 pub use hooks_trust::ProjectHooksTrust;
+pub use instance::{live_peers, InstanceGuard, InstanceRecord};
 pub use interfaces::{
     CodeIndex, CodeIndexStatus, CodeMatch, CodeQuery, ExecutionWorkspace, ExecutionWorkspaceKind,
     ExecutionWorkspaceManager, ExecutionWorkspaceRequest, SessionControl, SessionEvent,

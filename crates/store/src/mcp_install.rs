@@ -823,6 +823,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = wyj_config::Config::default();
         wyj_config::save_project_mcp(dir.path(), &[stdio_server("project-tool", "npx")]).unwrap();
+        // approve 写真实 config_dir，用例结束收尾（同 project_trust::tests::Cleanup）。
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let key = wyj_core::project_key(self.0);
+                if let Ok(config_base) = wyj_config::config_dir() {
+                    let _ = std::fs::remove_dir_all(config_base.join("projects").join(key));
+                }
+            }
+        }
+        let _cleanup = Cleanup(dir.path());
         crate::project_trust::approve(dir.path()).unwrap();
 
         let (trusted, pending) = effective_mcp_servers_trust_split(&cfg, dir.path());
