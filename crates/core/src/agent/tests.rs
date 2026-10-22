@@ -97,26 +97,28 @@ impl ToolContext for FakeCtx {
     }
 }
 
-/// DeepSeek `deepseek-reasoner` 应触发 reasoning 模型熔断,降到 32 轮。
+/// DeepSeek `deepseek-reasoner` 应触发 reasoning 模型熔断，落到传入的熔断值。
 #[test]
-fn max_turns_caps_reasoner_model_at_32() {
+fn max_turns_caps_reasoner_model_at_the_forced_budget() {
     let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
-    assert_eq!(
-        max_turns_for_model(200, "deepseek", &openai, "deepseek-reasoner"),
-        32
-    );
-    assert_eq!(
-        max_turns_for_model(200, "deepseek", &openai, "DeepSeek-Reasoner"),
-        32
-    );
-    assert_eq!(
-        max_turns_for_model(200, "deepseek", &openai, "deepseek-R1"),
-        32
-    );
-    assert_eq!(
-        max_turns_for_model(200, "deepseek", &openai, "deepseek-r1-distill-qwen-7b"),
-        32
-    );
+    for model in [
+        "deepseek-reasoner",
+        "DeepSeek-Reasoner",
+        "deepseek-R1",
+        "deepseek-r1-distill-qwen-7b",
+    ] {
+        assert_eq!(
+            max_turns_for_model(200, 32, "deepseek", &openai, model),
+            32,
+            "{model}"
+        );
+        // 熔断值来自配置，不是常量：同一个模型换个预算就该跟着变。
+        assert_eq!(
+            max_turns_for_model(200, 96, "deepseek", &openai, model),
+            96,
+            "{model}: 熔断值必须可配置"
+        );
+    }
 }
 
 /// 普通模型保留调用方传入的默认值,不受熔断影响。
@@ -125,15 +127,15 @@ fn max_turns_keeps_default_for_normal_models() {
     let openai = wyj_config::WireProtocol::OpenAiChatCompletions;
     let anthropic = wyj_config::WireProtocol::AnthropicMessages;
     assert_eq!(
-        max_turns_for_model(200, "deepseek", &openai, "deepseek-chat"),
+        max_turns_for_model(200, 64, "deepseek", &openai, "deepseek-chat"),
         200
     );
     assert_eq!(
-        max_turns_for_model(200, "anthropic", &anthropic, "claude-opus-4-5"),
+        max_turns_for_model(200, 64, "anthropic", &anthropic, "claude-opus-4-5"),
         200
     );
     assert_eq!(
-        max_turns_for_model(64, "alibaba", &openai, "qwen3-coder-plus"),
+        max_turns_for_model(64, 32, "alibaba", &openai, "qwen3-coder-plus"),
         64
     );
 }
@@ -153,27 +155,27 @@ fn max_turns_caps_endpoints_that_cannot_disable_thinking() {
     // MiniMax `/anthropic`：M3.1 发 disabled 直接 400、M2.x 发了不生效。
     for model in ["MiniMax-M3.1-Flash-Preview", "MiniMax-M2.7"] {
         assert_eq!(
-            max_turns_for_model(200, "minimax", &anthropic, model),
+            max_turns_for_model(200, 32, "minimax", &anthropic, model),
             32,
             "{model}: /anthropic 端点的思考关不掉"
         );
     }
     // OpenAI 线的 M2.x 同样强制思考（thinking.type 恒为 adaptive）。
     assert_eq!(
-        max_turns_for_model(200, "minimax", &openai, "MiniMax-M2.7"),
+        max_turns_for_model(200, 32, "minimax", &openai, "MiniMax-M2.7"),
         32
     );
     // Qwen `-thinking` / 豆包 `-thinking` / Moonshot `-code` 均为强制思考后缀。
     assert_eq!(
-        max_turns_for_model(200, "alibaba", &openai, "qwen3-max-thinking"),
+        max_turns_for_model(200, 32, "alibaba", &openai, "qwen3-max-thinking"),
         32
     );
     assert_eq!(
-        max_turns_for_model(200, "volcengine", &openai, "doubao-seed-1.6-thinking"),
+        max_turns_for_model(200, 32, "volcengine", &openai, "doubao-seed-1.6-thinking"),
         32
     );
     assert_eq!(
-        max_turns_for_model(200, "moonshot", &openai, "kimi-k2-code"),
+        max_turns_for_model(200, 32, "moonshot", &openai, "kimi-k2-code"),
         32
     );
 }
@@ -187,16 +189,19 @@ fn max_turns_does_not_cap_endpoints_that_can_disable_thinking() {
 
     // MiniMax M3（非 3.1）：thinking.type=disabled 真的生效。
     assert_eq!(
-        max_turns_for_model(200, "minimax", &anthropic, "MiniMax-M3"),
+        max_turns_for_model(200, 32, "minimax", &anthropic, "MiniMax-M3"),
         200
     );
     // Moonshot k2.5/2.6 无强制后缀 → 允许关闭。
     assert_eq!(
-        max_turns_for_model(200, "moonshot", &openai, "kimi-k2.5"),
+        max_turns_for_model(200, 32, "moonshot", &openai, "kimi-k2.5"),
         200
     );
     // GLM 可关闭。
-    assert_eq!(max_turns_for_model(200, "zhipu", &openai, "glm-5.2"), 200);
+    assert_eq!(
+        max_turns_for_model(200, 32, "zhipu", &openai, "glm-5.2"),
+        200
+    );
 }
 
 /// fnv_hash_value 对 Object 的 key 顺序不敏感,数组保持原序。
@@ -1223,6 +1228,57 @@ async fn tools_are_closed_during_the_wrap_up_window() {
         closed,
         8 - wrap_up_at + 1,
         "宽限窗口的每一轮都应回一条「工具已关闭」，实际 {closed} 条"
+    );
+    assert!(
+        session.turn_truncated,
+        "收尾提醒注入后必须在 session 上留下 turn_truncated 标记——\
+         UI 靠它区分「做完了」和「预算用尽被迫交付」"
+    );
+}
+
+/// 正常结束（模型自己不再调工具）时**不能**留下 `turn_truncated`。
+///
+/// 这个标记的语义是「本轮被框架关闸」，误报会让 UI 在真正做完时也拒绝
+/// 补全 todo、并多起一轮续跑。
+#[tokio::test]
+async fn a_normally_finished_turn_is_not_marked_truncated() {
+    let mut agent = Agent::new(Arc::new(EndTurnProvider)).with_max_turns(64);
+    agent.register_tool(Arc::new(GatedTool {
+        name: "Edit",
+        needs_permission: false,
+        runs: Arc::new(AtomicUsize::new(0)),
+    }));
+    let mut session = Session::new();
+
+    let _ = agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await;
+
+    assert!(!session.turn_truncated, "没进收尾窗口的回合不该被标成截断");
+}
+
+/// `turn_truncated` 是**单回合**事实：上一回合撞顶不能污染下一回合。
+///
+/// 残留 true 的后果很具体：用户在撞顶后打「继续」，那一轮明明正常做完，
+/// UI 却因为标记还在而保留 in_progress、再起一轮续跑。
+#[tokio::test]
+async fn a_previous_truncated_turn_does_not_poison_the_next_one() {
+    let mut agent = Agent::new(Arc::new(EndTurnProvider)).with_max_turns(64);
+    agent.register_tool(Arc::new(GatedTool {
+        name: "Edit",
+        needs_permission: false,
+        runs: Arc::new(AtomicUsize::new(0)),
+    }));
+    let mut session = Session::new();
+    session.turn_truncated = true;
+
+    let _ = agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await;
+
+    assert!(
+        !session.turn_truncated,
+        "回合入口必须重置这个标记，否则上一轮的截断状态会传染"
     );
 }
 

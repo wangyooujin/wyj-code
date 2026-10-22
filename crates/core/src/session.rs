@@ -232,6 +232,17 @@ pub struct Session {
     /// 与 `trace::TraceWriter` 同一套做法。`Arc` + `dyn` 而非泛型，是因为
     /// `Session` 到处都是按值克隆的，泛型会污染几乎每个签名。
     pub message_sink: Option<MessageSink>,
+    /// 本轮是否因**推理轮数预算用尽**而被迫收尾（`wrap_up_sent` 已置位）。
+    ///
+    /// 存在的理由：回合正常结束与「轮数被关闸」在 Agent 眼里都是
+    /// `Ok(())`，上层只看到「模型不再调工具了」，无法区分
+    /// 「活干完了」和「预算没了，工具被框架关掉」。这个区别对 UI 至关重要：
+    /// 前者应当把遗留的 `InProgress` 补成 `Completed`，后者必须原样保留
+    /// ——否则任务明明做到一半，面板却打了勾（实测现场）。
+    ///
+    /// 每回合入口重置，由 `run_turn_with_injection_inner` 在注入收尾提醒的
+    /// 同时置位。**不落盘**：它是单回合的瞬时事实，`--resume` 时没有意义。
+    pub turn_truncated: bool,
 }
 
 /// 增量消息事件：落盘侧据此决定「追加一行」还是「改写最后一行」。

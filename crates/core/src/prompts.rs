@@ -326,6 +326,37 @@ Reply with one JSON object and nothing else:
 /// Codex v0.152.0 的「todo 脚手架默认关闭」。
 pub const TODO_HINT: &str = "For multi-step tasks (roughly three or more distinct steps), use TodoWrite to keep a visible task list: create it once at the start, then update it as you make progress, marking exactly one task in_progress at a time and moving to the next only after the current one is done. Skip it for single-step tasks.";
 
+/// 自动续跑时注入的续跑指令（框架生成，不是用户说的话）。
+///
+/// 触发条件是「上一回合被推理轮数预算关闸收尾，且任务清单里还有未完成项」。
+/// 文本必须做三件事，缺一不可：
+///
+/// 1. **点明这不是用户新提的要求**，否则模型会以为自己被打断后又被催了一次；
+/// 2. **给出剩余项的具体 id 与内容**——只报一个数量，模型下一轮往往重新调
+///    一次 TodoWrite 把整个清单重写一遍，白烧一轮；
+/// 3. **要求它接着上一轮的现场继续**：模型并不知道自己上一轮是被截断的，
+///    容易把已经做完的工作从头再做一遍。
+///
+/// 走 user 消息通道（与 SteerQueue 注入同一形态），维持角色严格交替。
+pub fn todo_resume_notice(unfinished: &[(String, String)]) -> String {
+    let mut items = String::new();
+    for (id, content) in unfinished {
+        items.push_str(&format!("- [{id}] {content}\n"));
+    }
+    format!(
+        "<todo-resume>\n\
+         This is NOT a new user request. The previous turn was stopped because the \
+         tool-loop turn budget ran out — the framework closed the tools and asked you \
+         to deliver a progress report. The task itself is unfinished.\n\n\
+         Unfinished items on your own task list:\n{items}\n\
+         Continue from where the previous turn stopped. Do not restart finished work and \
+         do not rewrite the task list from scratch. Pick up the first unfinished item, \
+         finish it, mark it completed, then move to the next. Update the list with \
+         TodoWrite as you go.\n\
+         </todo-resume>"
+    )
+}
+
 /// computer-use 工具已注册时追加：launching apps via GUI hunting (Spotlight/
 /// Start menu/desktop icons) is slow and unreliable — the model otherwise
 /// tends to take one screenshot, see an empty desktop, and give up instead of
@@ -667,6 +698,25 @@ Conversation:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 续跑指令必须带三样东西：不是新请求、剩余项的具体内容、接着上一轮做。
+    ///
+    /// 少任何一条都会退化成已知的坏行为：缺①模型以为用户催它、缺②模型重写
+    /// 整份清单白烧一轮、缺③模型把已完成的活从头再做一遍。
+    #[test]
+    fn todo_resume_notice_names_each_unfinished_item() {
+        let notice = todo_resume_notice(&[
+            ("t3".to_string(), "写全局材质库".to_string()),
+            ("t4".to_string(), "并行派发 6 个 Sub-agent".to_string()),
+        ]);
+        assert!(notice.starts_with("<todo-resume>"));
+        assert!(notice.ends_with("</todo-resume>"));
+        assert!(notice.contains("This is NOT a new user request"));
+        assert!(notice.contains("- [t3] 写全局材质库"));
+        assert!(notice.contains("- [t4] 并行派发 6 个 Sub-agent"));
+        assert!(notice.contains("Do not restart finished work"));
+        assert!(notice.contains("TodoWrite"));
+    }
 
     /// 未完成的交接必须**显式给三选一**。
     ///

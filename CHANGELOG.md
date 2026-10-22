@@ -12,6 +12,43 @@
 
 ## [未发布]
 
+### 修复：已批准的项目级 skill 每次启动都被重新追问
+
+TUI 启动时只要 `.wyj-code/skills/` 里有条目就弹「待信任确认」面板，**与信任状态
+无关**。后果是一边 `ProjectSkillsGate::resolve` 早已放行（skill 正常加载、模型名单里
+也有）、一边面板每次启动都在问，用户只能理解成「信任没记住」。根因是这一处判据与
+CLI 侧的第二份判据不同步：CLI 判了 `!pending.is_empty() && !project_skills_trusted`，
+TUI 只抄了前半句。
+
+- **信任状态改为四态**：`NoProjectSkills` / `Trusted` / `NeverApproved` / `Changed`，
+  `SkillTrustStatus::needs_prompt()` 是唯一判定入口，TUI 与 CLI 都走它，不再各写一份
+  条件。
+- **区分「从没批准」与「批准后内容变了」**：只有后者才解释变了什么。批准记录新增
+  `approved_files`（相对路径 → 单条目 sha256），`changed_since_approval` 据此列出
+  变化条目；旧记录没有这个字段照样读得出来（`#[serde(default)]`），不会因为升级
+  让全部已批准项目退回「从未批准」。这份映射**只用于解释**，门控判定仍只看整树指纹。
+- `approve_skills` 改为原子落盘：半截 JSON 会被读成「从未批准」，把已信任的 skill
+  静默踢出加载名单。
+
+### 修复：skill 的运行产物会把刚批准的信任作废
+
+项目级 skill 的指纹覆盖 `skills/` 整棵树（安全不变式：`references/` 是经已批准
+SKILL.md 可达的二阶注入面，只哈希 `SKILL.md` 会直接打开这个洞）。但不少 skill 天生
+往自己目录里写运行产物——下载的 BGM、缓存、模型文件——写一次指纹就变一次，于是
+「信任一次」被自己的产物作废，跑完流水线下次启动又被追问。
+
+**没有**用「忽略某些目录」来绕：忽略名单若由 skill 作者声明（例如 frontmatter
+`data-dirs`），作者就能在 SKILL.md 一字不动的前提下换掉被忽略文件的内容，正好把
+上面那条不变式重新拆掉。改为把可写产物搬出受信任树：
+
+- `config::layout::project_skill_data_root` = `<data_root>/projects/<key>/skill-data`，
+  与信任记录同侧、**仓库内容控制不到**，写它既不影响指纹也不会被 `git pull` 覆盖。
+- 前台 Bash **与后台 shell 都**经 `WYJ_CODE_SKILL_DATA` 拿到这个目录（两侧共用
+  `bash::project_skill_data_root` 一份实现，避免「前台有、转后台就没了」），skill
+  脚本就此有了受支持的落点（目录不预先创建，没用到它的命令不会多出空目录）。
+  `store::skill_trust::ensure_project_skill_data_dir` 供内部调用，skill 名会把路径
+  分隔符与 `..` 规整掉。
+
 ### 落盘布局：会话与历史按项目分目录
 
 `~/.wyj-code/sessions/` 此前是**全局平铺**（680 个文件 / 2.5 GB 堆在一层），靠每条
@@ -158,6 +195,33 @@ dry-run 用 `before - max` 估算 checkpoint 淘汰数，而 `enforce_retention`
   （实测 1440 个 orphan / 21 MB 在 893 MB 的池子里躺了很久）。
 - `storage prune --yes` 在未超限时打「回收 0 个 / 0 字节」，读起来像「没有垃圾」，
   实际是「有 orphan 但不超限」。现在明确说清是哪种。
+
+### 修复：任务没做完就停下来，且任务列表状态与事实不符
+
+实测一条 `MiniMax-M3.1-Flash` 会话（寺庙场景搭建）：连续三个用户回合都在**第 28 轮**
+被强制收尾，每次都是一份阶段总结 + 用户手打「继续」。同一条会话里 216 条消息只有
+一次 `TodoWrite`，面板停在 `[2/7]`；而收尾时 `TurnDone` 又无条件把 `in_progress`
+补成 `completed`，于是「明明还剩五项」和「面板全打勾」同时出现。
+
+三个根因，彼此独立：
+
+1. **强制思考端点的熔断写死 32 轮**。`turn` 计的是 LLM 往返次数，不是工作量，而这类
+   端点几乎「一轮一个工具调用」——32 轮只够约 32 次工具调用，中型任务必然被切成好几段。
+   现在改为 `[agent].forced_thinking_max_turns`（**默认 64**），与 `max_turns` 分开配置。
+   死循环保护不依赖这个值（`loop_guard` 独立承担），它只是成本闸。
+2. **「正常收尾」与「预算用尽被迫收尾」在框架眼里完全一样**（都是 `Ok(())`），于是
+   UI 只能一律按「做完了」处理。新增 `Session::turn_truncated`（单回合事实、不落盘），
+   注入收尾提醒时置位，随 `AgentEvent::TurnDone { truncated }` 传到 TUI。
+   `truncated == true` 时**保留** `in_progress`，不再打勾。
+3. **撞顶之后没有续跑通道**，用户必须手打「继续」；而新一轮的 `begin_new_turn` 还会
+   把清单连同耗时/token 统计一起清空。新增自动续跑：清单里仍有未完成项时，主循环自动
+   起一轮，注入 `prompts::todo_resume_notice`（列出剩余项的 id + 内容，并声明「这不是
+   新的用户请求、不要重写清单、接着上一轮做」）。续跑回合走
+   `begin_continuation_turn()`，**保留**清单与统计。
+
+边界：`auto_wake_paused`（用户按过 ESC）不续跑；有排队消息时让位给用户；续跑上限
+`TODO_RESUME_LIMIT = 8`（`todo_resume_count`），触顶后停下并说明原因——否则「模型每轮
+都撞顶、清单每轮都不更新」会变成无限自动循环。用户自己发消息与切会话都会清零计数。
 
 ## [0.3.18] - 2026-10-22
 

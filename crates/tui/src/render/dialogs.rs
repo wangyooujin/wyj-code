@@ -177,9 +177,13 @@ pub(super) fn draw_project_trust_panel(
 /// 项目级 skill 信任面板。展示内容取自
 /// `wyj_commands::skill::project_skill_infos`（走与真正加载完全相同的 walk），
 /// 因此这里列的命令名与批准后实际生效的完全一致。
+///
+/// `changed` 是上次批准后变化的条目（相对路径）。非空时额外列一行解释，因为此时
+/// 面板的成因是「你批准过，但内容又变了」——不说明的话用户只会觉得「怎么又问了」。
 pub(super) fn draw_skill_trust_panel(
     f: &mut Frame,
     infos: &[wyj_commands::skill::ProjectSkillInfo],
+    changed: &[String],
     area: Rect,
 ) {
     let block = Block::default()
@@ -196,6 +200,26 @@ pub(super) fn draw_skill_trust_panel(
     let mut lines: Vec<Line<'static>> = vec![Line::from(Span::raw(wyj_i18n::tr(
         "dialog.skill_trust_intro",
     )))];
+    if !changed.is_empty() {
+        // 全部列出会在大仓库里撑爆面板，这里给前 3 条 + 计数，面板高度固定
+        lines.push(Line::from(Span::styled(
+            truncate_chars(
+                &wyj_i18n::tr("dialog.skill_trust_changed")
+                    .replace("{count}", &changed.len().to_string())
+                    .replace(
+                        "{items}",
+                        &changed
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("、"),
+                    ),
+                inner.width as usize,
+            ),
+            Theme::dim(),
+        )));
+    }
     for info in infos {
         lines.push(Line::from(Span::raw(truncate_chars(
             &format!("  · /{}: {}", info.name, info.description),

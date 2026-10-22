@@ -763,7 +763,7 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
         }
         BottomPanel::SkillTrust => {
             if let Some(infos) = &state.pending_skill_trust {
-                draw_skill_trust_panel(f, infos, chunks[1]);
+                draw_skill_trust_panel(f, infos, &state.pending_skill_trust_changes, chunks[1]);
             }
         }
         BottomPanel::ExecModeConfirm => {
@@ -997,8 +997,9 @@ fn bottom_panel_size(state: &AppState, area_height: u16) -> (u16, BottomPanel) {
         // 高度必须覆盖 intro 的折行（窄屏下 2-3 行）+ 条目 + 空行 + hint。
         // intro 长度随语言不同、还会随宽度折行，这里给足余量而不是精算——
         // 宁可面板略高，也不要把 `[y] 信任并启用` 这行操作提示裁掉
-        // （裁掉的话用户根本不知道该怎么应答）。
-        let rows = (infos.len() as u16).min(6) + 9;
+        // （裁掉的话用户根本不知道该怎么应答）。内容变化说明行非空时再 +1。
+        let extra = u16::from(!state.pending_skill_trust_changes.is_empty());
+        let rows = (infos.len() as u16).min(6) + 9 + extra;
         return (rows.min(area_height), BottomPanel::SkillTrust);
     }
     if state.exec_mode_confirm.is_some() {
@@ -4605,6 +4606,20 @@ mod tool_result_fold_tests {
 
         assert!(height > 0);
         assert!(matches!(panel, BottomPanel::SkillTrust));
+    }
+
+    /// 内容变化说明行会让面板多占一行——面板高度少算一行就会把操作提示裁掉，
+    /// 用户不知道按什么键应答。这里钉死这个 +1。
+    #[test]
+    fn skill_trust_panel_reserves_a_row_for_the_changed_hint() {
+        let mut state = make_state();
+        state.pending_skill_trust = Some(vec![skill_info("review", "Review code")]);
+        let (without, _) = bottom_panel_size(&state, 60);
+
+        state.pending_skill_trust_changes = vec!["review/references/x.md".to_string()];
+        let (with_changes, _) = bottom_panel_size(&state, 60);
+
+        assert_eq!(with_changes, without + 1);
     }
 
     /// 两者都是安全门槛，MCP 能执行任意命令、级别更高，必须先弹。

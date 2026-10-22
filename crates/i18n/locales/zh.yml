@@ -121,6 +121,9 @@ spinner:
   todo_done: "任务已完成"
   todo_expand: "  （Ctrl+T 展开）"
   todo_collapse: "  （Ctrl+T 折叠）"
+  todo_budget_resume: "[本轮工具轮数预算用尽，任务列表还剩 {count} 项未完成——正在自动续跑]"
+  todo_auto_resume: "[自动续跑 {round}：接着完成剩余的 {count} 项任务]"
+  todo_resume_exhausted: "[自动续跑已达上限，仍有 {count} 项未完成。可手动输入「继续」，或调高 [agent].forced_thinking_max_turns / [agent].max_turns 后重试]"
 
 # 正在执行的工具的实时输出块（只显示尾部若干行）
 live_output:
@@ -906,6 +909,7 @@ dialog:
   project_trust_hint: "  [y] 信任并连接   [n/Esc] 本次跳过（下次启动会再次询问）"
   skill_trust_title: " ⚠ 项目级 skill 待信任确认 "
   skill_trust_intro: "以下斜杠命令来自本仓库的 .wyj-code/skills/，由仓库作者编写。未信任前它们不会出现在补全里，模型也不知道它们存在。信任后每次执行都会把整段正文作为指令交给模型："
+  skill_trust_changed: "⚠ 你上次已批准过，之后有 {count} 个条目变化（{items}…）。重新批准后不再询问，直到内容再变。"
   skill_trust_hint: "  [y] 信任并启用   [n/Esc] 本次跳过（下次启动会再次询问）"
   ask_question_title: " ◆ Agent 提问 "
   ask_question_overview_title: " ◆ 访谈总览 "

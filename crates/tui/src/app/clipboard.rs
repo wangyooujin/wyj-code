@@ -842,7 +842,9 @@ mod clipboard_paste_tests {
     /// 挪到发送之后，这条立刻变红。
     #[test]
     fn every_turn_task_releases_the_session_lock_before_terminal_events() {
-        const SEND: &str = "tx.send(AgentEvent::TurnDone).await;";
+        // 发送点按「含 `AgentEvent::TurnDone {` 且随后几行内出现 `.await;`」识别：
+        // 事件带了 `truncated` 字段后是多行结构体字面量，不能再按整行匹配。
+        const SEND: &str = "AgentEvent::TurnDone {";
         let source = include_str!("../app.rs");
         let lines: Vec<&str> = source.lines().collect();
 
@@ -854,9 +856,15 @@ mod clipboard_paste_tests {
             {
                 segment_start = idx;
             }
-            // 真实发送点：`tx.send(...)` 且整行以 `.await;` 结尾。
-            // （按整行匹配，避免把本测试源码里的字符串字面量当成发送点。）
-            if !(line.contains(SEND) && line.trim_end().ends_with(".await;")) {
+            if !line.contains(SEND) || line.trim_start().starts_with("//") {
+                continue;
+            }
+            // 真实发送点：后续 4 行内必须出现整行以 `.await;` 结尾的语句。
+            // （按结构匹配，避免把本测试源码里的字符串字面量当成发送点。）
+            let is_send = lines[idx..lines.len().min(idx + 5)]
+                .iter()
+                .any(|l| l.trim_end().ends_with(".await;"));
+            if !is_send {
                 continue;
             }
             let segment = lines[segment_start..idx].join("\n");

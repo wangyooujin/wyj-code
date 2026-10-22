@@ -30,9 +30,16 @@ WYJ_CODE_HOME=/Volumes/external/wyj-state wyj-code
 ├── evolution/<project_key>/  indexes/<project_key>/
 ├── workspaces/<project_key>/  workflows/<project_key>/
 ├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
-│   └── instances/  meta.json
+│   ├── instances/  meta.json
+│   └── skill-data/<skill>/       # 项目级 skill 的可写产物（不参与信任指纹）
 └── cas/  spill/  logs/
 ```
+
+`projects/<key>/skill-data/` 是给项目级 skill **写运行产物**的地方（下载的素材、
+缓存、中间文件）。项目级 skill 的信任指纹覆盖仓库内 `.wyj-code/skills/` 整棵树，
+写回那棵树的任何产物都会让刚批准的信任失效、下次启动重新追问；把产物写到这里
+既不影响指纹，也不会被 `git pull` 覆盖。脚本里用 `$WYJ_CODE_SKILL_DATA` 拿到该路径
+（前台与后台 Bash 都会注入；目录不预先创建，需要时自己 `mkdir -p`）。
 
 `project_key` 形如 `v1-wyj-code-1f367bbfb19407b9`（目录名 + SHA-256 前 16 位），
 按 **git 仓库根**归一：同一仓库的任意子目录、以及带 `--project-root` 指回主仓库的
@@ -211,11 +218,18 @@ max_turns = 200                 # 单次用户提交内允许的最大推理轮�
                                 # 立即总结当前进度（见架构节「推理轮数触顶不再等于失败」），
                                 # 本值只决定那道宽限从第几轮开始。超长任务（如跨几十个文件的
                                 # 迁移）可调高；调低它限制的是**单次提交**的最长耗时。
-                                # 死循环保护由 loop_guard 独立承担，不受本值影响；
-                                # reasoning 模型另有 32 轮熔断，也不受本值影响。
-                                # **思考关不掉的端点同样压到 32 轮**（判据走 ThinkingSpec：
-                                # MiniMax M2.x/M3.1、Qwen/豆包的 -thinking、Moonshot 的 -code）。
-                                # 它们的每轮都是一次完整深度推理，单回合 200 轮可达半小时以上。
+                                # 死循环保护由 loop_guard 独立承担，不受本值影响。
+forced_thinking_max_turns = 64  # 强制思考端点的单回合熔断轮数。**默认 64**（v0.3.19+）。
+                                # 判据走 ThinkingSpec：模型名含 reasoner / -r1，或端点
+                                # **思考根本关不掉**（MiniMax M2.x/M3.1、Qwen/豆包的
+                                # -thinking、Moonshot 的 -code）。这类端点每轮都是一次完整
+                                # 深度推理，实测单回合 163 轮 / 35.6 万 output token /
+                                # 半小时以上，所以默认值比 max_turns 保守。
+                                # v0.3.19 之前写死 32，代价是「一轮一个工具调用」的端点
+                                # 在中型任务上必然撞顶（第 28 轮就关闸），任务被切成好几段、
+                                # 用户每次都得手打「继续」。调高它买的是「单轮能推进多远」，
+                                # 代价是单次提交的最长耗时与 token 上限。
+                                # 死循环保护同样由 loop_guard 独立承担。
 
 [tools]                          # 工具注册门控（v0.2.27+）
 todo_enabled = true            # 是否注册 TodoWrite 任务列表工具。**默认开启**
