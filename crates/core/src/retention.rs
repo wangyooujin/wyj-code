@@ -153,7 +153,7 @@ fn purge_sessions(
     let mut removed = 0usize;
     let mut freed = 0u64;
     for (dir, mut group) in by_project {
-        group.sort_by(|a, b| b.1.cmp(&a.1));
+        group.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         for (index, (session_id, mtime)) in group.into_iter().enumerate() {
             if index < keep_recent {
                 continue;
