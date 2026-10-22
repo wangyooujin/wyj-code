@@ -129,22 +129,9 @@ impl ProjectCodeIndex {
         match build_files(&self.root, self.max_file_bytes) {
             Ok(files) => {
                 let revision = git_revision(&self.root);
-                let fingerprint = workspace_fingerprint(&self.root);
-                let persisted = PersistedIndex {
-                    schema_version: INDEX_SCHEMA_VERSION,
-                    root: self.root.clone(),
-                    fingerprint,
-                    revision: revision.clone(),
-                    files: files.values().cloned().collect(),
-                };
-                if let Some(parent) = self.state_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let tmp = self
-                    .state_path
-                    .with_extension(format!("json.tmp-{}", std::process::id()));
-                fs::write(&tmp, serde_json::to_vec(&persisted)?)?;
-                fs::rename(&tmp, &self.state_path)?;
+                // 全量重建是权威快照：不合并磁盘上的既有条目，否则「本进程扫描期间
+                // 已被删除的文件」会被磁盘那份原封不动复活，下次加载又判定不新鲜。
+                self.persist(&files, revision.clone(), false)?;
                 let mut state = self.state.write().unwrap();
                 state.files = files;
                 state.revision = revision;
@@ -159,6 +146,45 @@ impl ProjectCodeIndex {
                 Err(error)
             }
         }
+    }
+
+    /// 索引落盘。跨进程锁 + 与磁盘现状合并 + 原子替换，三者缺一不可。
+    ///
+    /// 此前这里（以及 `invalidate` 的裸 `fs::write`）把整个索引当成进程私有状态：
+    /// 两个实例开在同一工作区时，A 的 `invalidate`（只改一个文件）会把 B 刚写进去的
+    /// 改动整份覆盖回去；B 的裸写又可能被 A 读到半截 —— 解析失败一次就等于**静默
+    /// 全量重建**，对本仓库 13 万行是秒级甚至十秒级开销，且看起来毫无原因。
+    ///
+    /// `merge_existing = false` 用于全量重建（权威快照）；`true` 用于 `invalidate`
+    /// 这类只覆盖部分路径的增量写，此时磁盘上其他路径的条目可能比本进程内存里的新。
+    fn persist(
+        &self,
+        files: &BTreeMap<PathBuf, IndexedFile>,
+        revision: Option<String>,
+        merge_existing: bool,
+    ) -> Result<()> {
+        if let Some(parent) = self.state_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _guard = wyj_config::filelock::acquire(&self.lock_path(), "code index")?;
+        let mut merged = files.clone();
+        if merge_existing {
+            merge_newer_entries(&self.root, &self.state_path, &mut merged);
+        }
+        let persisted = PersistedIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            root: self.root.clone(),
+            fingerprint: workspace_fingerprint(&self.root),
+            revision,
+            files: merged.into_values().collect(),
+        };
+        crate::serialize::write_atomic(&self.state_path, &serde_json::to_vec(&persisted)?)
+    }
+
+    /// 索引文件的跨进程写锁。与索引同目录，`.lock` 后缀避免被 `persisted_files_are_current`
+    /// 或上游 glob 当成索引正文。
+    fn lock_path(&self) -> PathBuf {
+        self.state_path.with_extension("json.lock")
     }
 
     fn indexed_search(&self, query: &CodeQuery) -> Result<Vec<CodeMatch>> {
@@ -262,17 +288,13 @@ impl CodeIndex for ProjectCodeIndex {
         }
         state.ready = true;
         state.last_error = None;
-        let persisted = PersistedIndex {
-            schema_version: INDEX_SCHEMA_VERSION,
-            root: self.root.clone(),
-            fingerprint: workspace_fingerprint(&self.root),
-            revision: state.revision.clone(),
-            files: state.files.values().cloned().collect(),
-        };
-        if let Some(parent) = self.state_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&self.state_path, serde_json::to_vec(&persisted)?)?;
+        let files = state.files.clone();
+        let revision = state.revision.clone();
+        drop(state);
+        // 增量写：磁盘上其他路径的条目可能比本进程内存里的新（另一个实例刚改过），
+        // 必须合并而不是整份覆盖，否则对方下次搜索会看到旧内容，且 fingerprint
+        // 已被本进程改写、不会触发重建，它就一直错下去。
+        self.persist(&files, revision, true)?;
         Ok(())
     }
 }
@@ -701,6 +723,37 @@ fn filesystem_fingerprint(root: &Path) -> Option<String> {
     Some(format!("filesystem:{:x}", hasher.finalize()))
 }
 
+/// 把磁盘上的索引条目并入 `into`，规则是「每个路径取字节与 mtime 都更新的那一份」。
+///
+/// 只在增量写（[`ProjectCodeIndex::persist`] 的 `merge_existing`）里调用。这里的
+/// 风险是**用陈旧内存覆盖别人的新内容**：本进程上次 `invalidate` 之后，另一个实例
+/// 可能已经改过同一个文件。比 mtime 是最省的判据——索引里本来就存了 `len` 与
+/// `modified_millis`，无需读文件正文。
+///
+/// 磁盘索引读不出来（半截 JSON / schema 过期 / 换了项目根）时直接放弃合并，
+/// 让本次写入成为唯一权威——总比把过期条目塞回新索引好。
+fn merge_newer_entries(root: &Path, state_path: &Path, into: &mut BTreeMap<PathBuf, IndexedFile>) {
+    let Ok(bytes) = fs::read(state_path) else {
+        return;
+    };
+    let Ok(persisted) = serde_json::from_slice::<PersistedIndex>(&bytes) else {
+        return;
+    };
+    if persisted.schema_version != INDEX_SCHEMA_VERSION || persisted.root != root {
+        return;
+    }
+    for file in persisted.files {
+        // MSRV 1.80：这里不能用 `Option::is_none_or`（1.82 才有）。
+        let newer = match into.get(&file.path) {
+            None => true,
+            Some(mine) => (file.modified_millis, file.len) > (mine.modified_millis, mine.len),
+        };
+        if newer {
+            into.insert(file.path.clone(), file);
+        }
+    }
+}
+
 fn persisted_files_are_current(root: &Path, files: &[IndexedFile]) -> bool {
     files.iter().all(|file| {
         let Ok(metadata) = fs::symlink_metadata(root.join(&file.path)) else {
@@ -788,6 +841,58 @@ mod tests {
                 limit: 5,
             })
             .is_err());
+    }
+
+    /// 增量写必须与磁盘合并：另一个实例在本进程上次落盘之后改过的路径，
+    /// 不能因为本进程只 invalidate 了一个文件就被整份覆盖回去。
+    #[test]
+    fn incremental_invalidate_keeps_entries_written_by_another_instance() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let cache_path = cache.path().join("index.json");
+        fs::write(root.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+
+        // 实例 A：只见过 a.rs，索引落盘为 {a}。
+        let a = ProjectCodeIndex::new(root.path(), &cache_path).unwrap();
+        a.search(&CodeQuery {
+            text: "alpha".to_string(),
+            path_prefix: None,
+            language: None,
+            limit: 5,
+        })
+        .unwrap();
+
+        // 实例 B：多出一个 b.rs，全量重建把 {a,b} 写进同一个索引文件。
+        fs::write(root.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let b = ProjectCodeIndex::new(root.path(), &cache_path).unwrap();
+        b.search(&CodeQuery {
+            text: "beta".to_string(),
+            path_prefix: None,
+            language: None,
+            limit: 5,
+        })
+        .unwrap();
+
+        // 实例 A 的增量写：它内存里没有 b.rs，合并前会把 B 的条目抹掉。
+        fs::write(root.path().join("a.rs"), "pub fn alpha_v2() {}\n").unwrap();
+        a.invalidate(&[PathBuf::from("a.rs")]).unwrap();
+
+        let reloaded = ProjectCodeIndex::new(root.path(), &cache_path).unwrap();
+        let paths: Vec<_> = reloaded
+            .search(&CodeQuery {
+                text: "beta".to_string(),
+                path_prefix: None,
+                language: None,
+                limit: 5,
+            })
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.path)
+            .collect();
+        assert!(
+            paths.iter().any(|path| path.ends_with("b.rs")),
+            "增量写不能覆盖另一个实例写进同一索引的条目: {paths:?}"
+        );
     }
 
     #[test]

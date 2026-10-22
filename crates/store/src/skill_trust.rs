@@ -163,6 +163,19 @@ pub fn approve_skills(cwd: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `approve_skills` 硬编码写真实 `~/.wyj-code/projects/<key>/`；测试 cwd 是
+    /// tempdir，每跑一次就在那里留一个空壳项目目录（实测积累过 4500+ 个）。
+    /// 用例结束清掉。
+    struct Cleanup<'a>(&'a Path);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            let key = wyj_core::project_key(self.0);
+            if let Ok(config_base) = wyj_config::config_dir() {
+                let _ = std::fs::remove_dir_all(config_base.join("projects").join(key));
+            }
+        }
+    }
+
     /// 建一个 `<tmp>/.wyj-code/skills/` 下的 skill，返回 tmpdir（测试结束自动清理）
     fn skills_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -185,6 +198,7 @@ mod tests {
     #[test]
     fn empty_project_skills_dir_is_trusted() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         // 目录存在但没有条目 → 没有可被注入的内容，不需要门控
         assert!(project_skills_trusted(dir.path()));
     }
@@ -192,6 +206,7 @@ mod tests {
     #[test]
     fn pending_until_approved_then_trusted() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         write_skill(dir.path(), "review", "---\nname: review\n---\nReview code.");
 
         assert!(!project_skills_trusted(dir.path()), "未批准前应为 false");
@@ -203,6 +218,7 @@ mod tests {
     #[test]
     fn changing_skill_body_after_approval_goes_back_to_pending() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         write_skill(dir.path(), "review", "Review code.");
         approve_skills(dir.path()).unwrap();
         assert!(project_skills_trusted(dir.path()));
@@ -215,6 +231,7 @@ mod tests {
     #[test]
     fn adding_a_new_skill_after_approval_goes_back_to_pending() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         write_skill(dir.path(), "review", "Review code.");
         approve_skills(dir.path()).unwrap();
         assert!(project_skills_trusted(dir.path()));
@@ -250,6 +267,7 @@ mod tests {
     #[test]
     fn fingerprint_changes_when_reference_doc_changes() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         write_skill(
             dir.path(),
             "hithink",
@@ -279,6 +297,7 @@ mod tests {
     #[test]
     fn fingerprint_ignores_mtime_and_permissions() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         let skill = dir.path().join(".wyj-code/skills/x/SKILL.md");
         write_skill(dir.path(), "x", "# skill");
         let before = compute_project_skill_fingerprint(dir.path());
@@ -306,6 +325,7 @@ mod tests {
     #[test]
     fn trust_record_lives_outside_the_repository() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         write_skill(dir.path(), "review", "Review.");
         approve_skills(dir.path()).unwrap();
 
@@ -329,6 +349,7 @@ mod tests {
     #[test]
     fn symlink_target_is_hashed_not_followed() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("payload.md"), "outside v1").unwrap();
 
@@ -360,6 +381,7 @@ mod tests {
     #[test]
     fn symlink_loop_terminates() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         let loop_dir = dir.path().join(".wyj-code/skills/loop");
         std::fs::create_dir_all(&loop_dir).unwrap();
         // loop/self -> loop
@@ -371,6 +393,7 @@ mod tests {
     #[test]
     fn nested_namespaced_skill_changes_fingerprint() {
         let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
         let nested = dir.path().join(".wyj-code/skills/a/b/SKILL.md");
         std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
         std::fs::write(&nested, "# ns skill").unwrap();

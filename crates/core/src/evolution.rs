@@ -33,6 +33,11 @@ const HEALTH_FILE: &str = "health.json";
 const USAGE_FILE: &str = "usage.json";
 const AUDIT_FILE: &str = "audit.jsonl";
 
+/// 等 evolution 跨进程锁的上限。临界区只做「读一份 JSON、改、写回」，正常竞争
+/// 毫秒级就能拿到；这里给足余量，同时保证 TUI 主流程最多被拖这么久。
+const CROSS_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+const CROSS_LOCK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// 纳秒精度、带时区偏移的 RFC3339 时间戳。
 ///
 /// 本模块的时间字段（episode 的 `started_at`/`finished_at`、candidate 的
@@ -429,6 +434,20 @@ pub struct EvolutionStore {
     workers: Arc<Semaphore>,
 }
 
+/// Evolution 写入的守卫：同时持进程内 `Mutex` 与跨进程文件锁。
+///
+/// 只有进程内 `Mutex` 时，两个 wyj-code 实例（同一项目、两个新会话）会各自
+/// 「读整份 index → 改 → 整份写回」：candidates / feedback index 都是单文件，
+/// 后写者把先写者刚分析出的 Rule/Skill 候选整条抹掉，而 evolution 记的正是
+/// 「模型学到了什么」，丢了没有第二次机会重算。用法与
+/// `memory_v3::MemoryV3Store::write_critical` 保持一致。
+struct EvolutionWriteGuard<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    /// 拿不到跨进程锁时降级为 `None`（仅进程内保护 + 告警）。evolution 是后台
+    /// 治理子系统，为它把主流程卡 30 秒再报错，代价大于一次偶发丢更新。
+    _cross: Option<wyj_config::filelock::FileLock>,
+}
+
 impl EvolutionStore {
     pub fn new(base_dir: &Path, cwd: &Path, cfg: EvolutionCfg) -> Result<Self> {
         let repository_root = project_root(cwd);
@@ -455,6 +474,59 @@ impl EvolutionStore {
 
     pub fn directory(&self) -> &Path {
         &self.dir
+    }
+
+    /// 获取「进程内 + 跨进程」双重排他写锁。
+    ///
+    /// **临界区内不得再调用任何会自己加锁的方法**（`load_candidate_index` /
+    /// `load_feedback_index` / `enforce_retention_and_capacity` / 另一个
+    /// `write_critical`）：unix 的 `flock` 绑定在打开的文件描述符上，同一进程再从
+    /// 另一个 fd 上取同一把锁会自锁 30 秒后报超时。所有 `*_unlocked` 版本的读函数
+    /// 就是为此存在的。
+    fn write_critical(&self) -> EvolutionWriteGuard<'_> {
+        // 持锁线程 panic 后 Mutex 会被 poison，但磁盘上的索引不会因此不一致，
+        // poison 一次不该让之后每一轮治理分析都失败。
+        let local = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // **不能直接 `acquire`**：它在锁被占用时会阻塞最多 30 秒，而 evolution 的
+        // 写点（反馈、审批、容量裁剪）有的是从 TUI 主流程直接调的——让界面为一个
+        // 后台治理写完等半分钟，比偶尔丢一轮候选更糟。改成分段重试：临界区本身
+        // 只是「读一份 JSON、改、写回」，正常竞争在毫秒级就能拿到，重试够覆盖它；
+        // 超过 [`CROSS_LOCK_RETRY_BUDGET`] 才降级为仅进程内保护并告警，与
+        // `memory_v3` 的 best-effort 取向一致。
+        let deadline = std::time::Instant::now() + CROSS_LOCK_RETRY_BUDGET;
+        let cross = loop {
+            match wyj_config::filelock::try_acquire(&self.cross_lock_path(), "evolution store") {
+                Ok(Some(guard)) => break Some(guard),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(CROSS_LOCK_RETRY_INTERVAL);
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        "evolution store 正被另一个实例写入，等满 {CROSS_LOCK_RETRY_BUDGET:?} 后退化为仅进程内保护"
+                    );
+                    break None;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "获取 evolution 跨进程锁失败，本次写入仅受进程内锁保护: {error}"
+                    );
+                    break None;
+                }
+            }
+        };
+        EvolutionWriteGuard {
+            _local: local,
+            _cross: cross,
+        }
+    }
+
+    /// 跨进程锁文件。放在项目 evolution 目录内而非根目录：不同项目的候选/反馈
+    /// 互不相干，共用一把锁只会让两个项目无谓排队。
+    fn cross_lock_path(&self) -> PathBuf {
+        self.dir.join("store.lock")
     }
 
     pub fn project_id(&self) -> &str {
@@ -849,10 +921,7 @@ impl EvolutionStore {
         reason: Option<String>,
         explicit: bool,
     ) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_feedback_index_unlocked();
         index.feedback.retain(|item| item.episode_id != episode_id);
         index.feedback.push(EvolutionFeedback {
@@ -880,10 +949,7 @@ impl EvolutionStore {
                 .any(|episode| episode.id == episode_id),
             "episode not found: {episode_id}"
         );
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_feedback_index_unlocked();
         index.included_episodes.insert(episode_id.to_string());
         index
@@ -916,10 +982,7 @@ impl EvolutionStore {
     }
 
     pub fn reject_candidate(&self, candidate_id: &str, reason: Option<String>) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_candidate_index_unlocked();
         let candidate = index
             .candidates
@@ -938,10 +1001,7 @@ impl EvolutionStore {
         candidate_id: &str,
         activated_path: Option<PathBuf>,
     ) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_candidate_index_unlocked();
         let candidate = index
             .candidates
@@ -956,10 +1016,7 @@ impl EvolutionStore {
     }
 
     pub fn rollback_candidate(&self, candidate_id: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_candidate_index_unlocked();
         let candidate = index
             .candidates
@@ -1037,10 +1094,7 @@ impl EvolutionStore {
                 .to_string(),
         );
         let id = format!("cand-skill-manual-{}", short_hash(episode.id.as_bytes()));
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_candidate_index_unlocked();
         if !index.candidates.iter().any(|candidate| candidate.id == id) {
             let now = now_rfc3339();
@@ -1227,10 +1281,7 @@ impl EvolutionStore {
             }
             _ => unreachable!("governance mode filters ordinary memory kinds"),
         };
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_candidate_index_unlocked();
         let existing = index
             .candidates
@@ -1413,10 +1464,7 @@ impl EvolutionStore {
     }
 
     fn load_candidate_index(&self) -> CandidateIndex {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         self.load_candidate_index_unlocked()
     }
 
@@ -1425,10 +1473,7 @@ impl EvolutionStore {
     }
 
     fn load_feedback_index(&self) -> FeedbackIndex {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         self.load_feedback_index_unlocked()
     }
 
@@ -1437,10 +1482,7 @@ impl EvolutionStore {
     }
 
     fn mark_pending_analysis(&self, episode_id: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_feedback_index_unlocked();
         index
             .pending_analysis_episodes
@@ -1449,20 +1491,14 @@ impl EvolutionStore {
     }
 
     fn clear_pending_analysis(&self, episode_id: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_feedback_index_unlocked();
         index.pending_analysis_episodes.remove(episode_id);
         crate::serialize::write_json_atomic(&self.dir.join(FEEDBACK_INDEX_FILE), &index)
     }
 
     fn take_pending_analysis(&self) -> Vec<String> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut index = self.load_feedback_index_unlocked();
         let pending = std::mem::take(&mut index.pending_analysis_episodes)
             .into_iter()
@@ -1475,10 +1511,7 @@ impl EvolutionStore {
     }
 
     fn enforce_retention_and_capacity(&self) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let now = Utc::now();
 
         let episodes_dir = self.dir.join("episodes");
@@ -1609,10 +1642,7 @@ impl EvolutionStore {
     }
 
     fn record_usage(&self, tokens: u32, wall_secs: u64) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut usage: DailyUsage = read_json_or_default(&self.dir.join(USAGE_FILE));
         let today = Utc::now().date_naive().to_string();
         if usage.date != today {
@@ -1624,10 +1654,7 @@ impl EvolutionStore {
     }
 
     fn record_health_success(&self) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut health: EvolutionHealth = read_json_or_default(&self.dir.join(HEALTH_FILE));
         health.consecutive_failures = 0;
         health.last_error = None;
@@ -1637,10 +1664,7 @@ impl EvolutionStore {
     }
 
     fn record_health_failure(&self, error: &str) -> Result<()> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .expect("evolution write lock poisoned");
+        let _guard = self.write_critical();
         let mut health: EvolutionHealth = read_json_or_default(&self.dir.join(HEALTH_FILE));
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.last_error = Some(bounded_redacted(error, 1_000));

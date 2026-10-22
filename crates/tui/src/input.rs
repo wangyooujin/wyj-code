@@ -800,6 +800,58 @@ impl InputBox {
             .map(|i| chars[bounds[i]..bounds[i + 1]].iter().collect())
             .collect()
     }
+
+    /// [`Self::visual_pos_for`] 的**反函数**：视觉坐标 → 逻辑 `(row, col)`。
+    ///
+    /// 鼠标点选输入框时用它把屏幕格子换算成编辑位置。`visual_row` 超出内容末尾
+    /// 时夹到最后一个字符之后；`visual_col` 落在某折行段的中间时取最近的字符
+    /// 边界（宽字符占两列，点右半格仍算命中该字符之前/之后由取整方向决定）。
+    ///
+    /// 注意 `col` 是**字符索引**，不是显示列——与 `cursor_col` 同一套语义。
+    pub fn text_pos_for_visual(
+        &self,
+        visual_row: usize,
+        visual_col: usize,
+        width: usize,
+    ) -> (usize, usize) {
+        if width == 0 {
+            let row = visual_row.min(self.lines.len().saturating_sub(1));
+            let col = visual_col.min(self.lines[row].chars().count());
+            return (row, col);
+        }
+        let mut remaining = visual_row;
+        for (row, line) in self.lines.iter().enumerate() {
+            let rows = Self::line_visual_rows(line, width);
+            if remaining >= rows {
+                remaining -= rows;
+                continue;
+            }
+            let bounds = Self::wrap_boundaries(line, width);
+            // 第 `remaining` 个视觉行覆盖 `bounds[remaining]..bounds[remaining+1]`。
+            let seg = remaining.min(bounds.len().saturating_sub(2));
+            let seg_start = bounds[seg];
+            let seg_end = bounds[seg + 1];
+            let chars: Vec<char> = line.chars().collect();
+            let mut display_col = 0usize;
+            let mut col = seg_start;
+            while col < seg_end {
+                let w = char_width(chars[col]);
+                // 点在该字符的左半边或更左：停在它前面。
+                if display_col + w > visual_col {
+                    break;
+                }
+                display_col += w;
+                col += 1;
+            }
+            return (row, col);
+        }
+        // 落在所有内容之下：定位到最后一个字符之后。
+        let row = self.lines.len().saturating_sub(1);
+        (
+            row,
+            self.lines.get(row).map(|l| l.chars().count()).unwrap_or(0),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -850,6 +902,49 @@ mod tests {
             InputBox::line_visual_rows(&line, width),
             InputBox::wrap_for_render(&line, width).len()
         );
+    }
+
+    /// `text_pos_for_visual` 必须是 `visual_pos_for` 的反函数。
+    ///
+    /// 鼠标点选输入框全靠它把屏幕格子换算成编辑位置；算错一格，光标就落到
+    /// 用户没点的地方。逐字符来回换算一遍即可覆盖折行、宽字符与行尾。
+    #[test]
+    fn text_pos_for_visual_inverts_visual_pos_for() {
+        let mut ib = InputBox::new();
+        for line in ["hello world", "测试中文换行", "a", ""] {
+            if !ib.is_empty() || ib.lines.len() > 1 {
+                ib.insert_newline();
+            }
+            for ch in line.chars() {
+                ib.insert_char(ch);
+            }
+        }
+        let width = 7;
+        for row in 0..ib.lines.len() {
+            let len = ib.lines[row].chars().count();
+            for col in 0..=len {
+                let (vr, vc) = ib.visual_pos_for(row, col, width);
+                assert_eq!(
+                    ib.text_pos_for_visual(vr, vc, width),
+                    (row, col),
+                    "第 {row} 行第 {col} 列往返换算不一致"
+                );
+            }
+        }
+    }
+
+    /// 点在宽字符的右半格仍归到该字符之前，不会跳到下一个字符。
+    #[test]
+    fn text_pos_for_visual_keeps_wide_chars_whole() {
+        let mut ib = InputBox::new();
+        ib.insert_char('中');
+        ib.insert_char('文');
+        assert_eq!(ib.text_pos_for_visual(0, 0, 20), (0, 0));
+        // 列 1 是「中」的右半格 → 仍停在「中」之前。
+        assert_eq!(ib.text_pos_for_visual(0, 1, 20), (0, 0));
+        assert_eq!(ib.text_pos_for_visual(0, 2, 20), (0, 1));
+        // 超出内容末尾：夹到最后一个字符之后。
+        assert_eq!(ib.text_pos_for_visual(9, 99, 20), (0, 2));
     }
 
     /// `Cmd+C` 绝不能是「往输入框敲一个 c」。

@@ -205,6 +205,14 @@ pub struct RewindPreview {
     pub requires_confirmation: bool,
     pub snapshot_complete: bool,
     pub note: Option<String>,
+    /// 同一工作目录上还活着的**其他** wyj-code 实例 pid（见 [`crate::instance`]）。
+    ///
+    /// 回滚走 `git restore --worktree`，直接覆盖磁盘上的文件，完全不感知这些实例
+    /// 手里的改动——对方既没有 checkpoint 记录，也无从得知自己刚写的半成品被换成了
+    /// 旧版本。非空时 [`RewindPreview::requires_confirmation`] 恒为 `true`：不是禁止，
+    /// 是必须让人明确看着这个事实点一次确认。
+    #[serde(default)]
+    pub shared_peers: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -216,6 +224,11 @@ pub struct CheckpointStore {
     /// 可选 CAS 池。capture_files / restore_files_snapshot 走 CAS 减少 checkpoint 体积。
     /// None 表示不接 CAS(测试或回滚场景),全部 inline_bytes。
     cas: Option<Arc<WorkspaceCas>>,
+    /// 本进程所处的执行面**无人可问**（headless / `-p` / 定时任务 / 子 Agent）。
+    ///
+    /// 见 [`CheckpointStore::restore_files`]：同一工作目录上还有别的实例时，
+    /// 「有没有人能被问一句」决定的是**拒绝还是确认**，不是提示的措辞。
+    non_interactive: bool,
 }
 
 /// 进程内 checkpoint 构造配置,由 CLI 装配阶段 `set_checkpoint_config` 注入,
@@ -237,6 +250,10 @@ pub struct CheckpointConfig {
     pub max_per_session: usize,
     /// 可选 CAS 池,用于 capture_files / restore_files_snapshot 去重。
     pub cas: Option<Arc<WorkspaceCas>>,
+    /// 本进程的交互面是否**无人可问**（headless / `-p` / 定时任务 / 子 Agent）。
+    /// 与 `permission::ExecutionSurface::is_interactive` 同源语义，只是 checkpoint
+    /// 层拿不到那个枚举，故由装配阶段平移注入。
+    pub non_interactive: bool,
 }
 
 static CHECKPOINT_CONFIG: std::sync::Mutex<Option<CheckpointConfig>> = std::sync::Mutex::new(None);
@@ -291,7 +308,14 @@ impl CheckpointStore {
         let mut store = Self::new(sessions_dir, session_id)?;
         store.max_per_session = cfg.max_per_session;
         store.cas = cfg.cas;
+        store.non_interactive = cfg.non_interactive;
         Ok(store)
+    }
+
+    /// 显式声明「本进程没有人可以被问一句」。
+    pub fn with_non_interactive(mut self, non_interactive: bool) -> Self {
+        self.non_interactive = non_interactive;
+        self
     }
 }
 
@@ -306,6 +330,7 @@ impl CheckpointStore {
             dir,
             max_per_session: 0,
             cas: None,
+            non_interactive: false,
         })
     }
 
@@ -777,6 +802,14 @@ impl CheckpointStore {
 
     /// 写回 checkpoint 文件状态。调用方必须先展示 [`RewindPreview`]，只有用户
     /// 显式确认后才传 `confirmed = true`；无变化时不要求确认。
+    ///
+    /// **同一工作目录上还有别的存活实例时，无人可问就必须拒绝**（`non_interactive`
+    /// 为真，即 headless / `-p` / 定时任务 / 子 Agent）。确认门只对「有人能看着
+    /// 预览按下确认」有意义；无人值守的运行里 `confirmed = true` 是调用方写死的，
+    /// 它不构成任何同意。此时继续 `git restore` 等于单方面覆盖另一个实例尚未
+    /// checkpoint 的编辑——对方的改动既没备份，也无从得知。
+    ///
+    /// 这与 `main.session_in_use_headless` 同一取向：拒绝比静默毁掉别人的工作安全。
     pub fn restore_files(
         &self,
         checkpoint_id: &str,
@@ -785,6 +818,20 @@ impl CheckpointStore {
     ) -> Result<RewindPreview> {
         let checkpoint = self.load(checkpoint_id)?;
         let preview = preview_workspace(&checkpoint, cwd, self.cas.as_deref(), &self.dir)?;
+        if !preview.shared_peers.is_empty() && self.non_interactive {
+            anyhow::bail!(
+                "refusing to restore files: another wyj-code instance (pid {}) is working in \
+                 this tree, and this run has no interactive surface to confirm overwriting its \
+                 uncommitted edits; stop the other instance, or run the rewind from an \
+                 interactive session",
+                preview
+                    .shared_peers
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if preview.requires_confirmation && !confirmed {
             anyhow::bail!(
                 "rewind affects {} file(s); explicit confirmation required",
@@ -1016,6 +1063,49 @@ fn preview_workspace(
     cas: Option<&WorkspaceCas>,
     self_dir: &Path,
 ) -> Result<RewindPreview> {
+    let mut preview = preview_workspace_inner(checkpoint, cwd, cas, self_dir)?;
+    annotate_shared_peers(&mut preview, cwd);
+    Ok(preview)
+}
+
+/// 把「同一工作目录上还有别的实例在跑」这一事实写进预览。
+///
+/// 只在**真的会覆盖文件**（`affected_files` 非空）时升级为「必须确认」：没有文件
+/// 受影响时 `restore_files` 一个字节都不写，此时多要一次确认只会让人习惯性按 y。
+fn annotate_shared_peers(preview: &mut RewindPreview, cwd: &Path) {
+    if preview.affected_files.is_empty() {
+        return;
+    }
+    preview.shared_peers = crate::instance::live_peers(cwd)
+        .into_iter()
+        .map(|record| record.pid)
+        .collect();
+    if preview.shared_peers.is_empty() {
+        return;
+    }
+    preview.requires_confirmation = true;
+    let peers = preview
+        .shared_peers
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let warning = format!(
+        "another wyj-code instance (pid {peers}) is running in this same working tree; \
+         restoring files will overwrite edits it has not checkpointed"
+    );
+    preview.note = Some(match preview.note.take() {
+        Some(existing) => format!("{existing}; {warning}"),
+        None => warning,
+    });
+}
+
+fn preview_workspace_inner(
+    checkpoint: &Checkpoint,
+    cwd: &Path,
+    cas: Option<&WorkspaceCas>,
+    self_dir: &Path,
+) -> Result<RewindPreview> {
     match &checkpoint.workspace {
         WorkspaceSnapshot::Git(snapshot) => {
             let current_root =
@@ -1052,6 +1142,7 @@ fn preview_workspace(
                 note: Some(
                     "Git index is not modified; external side effects are not restored".into(),
                 ),
+                shared_peers: Vec::new(),
             })
         }
         WorkspaceSnapshot::Files(snapshot) => {
@@ -1072,6 +1163,7 @@ fn preview_workspace(
                         "non-git snapshot exceeded limits; rewind covers captured files only".into()
                     }
                 }),
+                shared_peers: Vec::new(),
             })
         }
         WorkspaceSnapshot::Delta(_delta) => {
@@ -1086,6 +1178,7 @@ fn preview_workspace(
                 affected_files,
                 snapshot_complete: resolved.complete,
                 note: Some("delta snapshot resolved across parent chain".into()),
+                shared_peers: Vec::new(),
             })
         }
     }
@@ -1652,6 +1745,119 @@ mod tests {
         std::fs::write(repo.path().join("a.txt"), "one").unwrap();
         let back = capture_git(&root, Some(&first)).unwrap();
         assert_eq!(back.commit, first.commit);
+    }
+
+    /// 同一工作目录上还有别的实例时，回滚**必须**升级为显式确认，并把对方 pid
+    /// 写进预览。回滚是 `git restore` 直接覆盖文件，对方没有任何 checkpoint 可退。
+    #[test]
+    fn preview_warns_when_another_instance_shares_the_working_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "base").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "base"]);
+
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "s-shared").unwrap();
+        let checkpoint = store
+            .create(
+                repo.path(),
+                Vec::new(),
+                CheckpointKind::Manual,
+                Some("before".into()),
+            )
+            .unwrap();
+        // 干净工作区：没有文件受影响，此时不该因为「有别人」就多要一次确认。
+        let clean = store.preview_files(&checkpoint.id, repo.path()).unwrap();
+        assert!(!clean.requires_confirmation);
+        assert!(clean.shared_peers.is_empty());
+
+        // 模拟另一个实例登记在同一 checkout 上。登记落在真实 `~/.wyj-code` 下，
+        // 但 project_key 由本测试专属的 tempdir 派生，用例之间互不影响。
+        // pid 用 1：本进程自己的登记会被 `collect` 过滤掉。
+        let config_base = wyj_config::config_dir().unwrap();
+        let peer_record = crate::instance::register_foreign_for_tests(&config_base, repo.path(), 1);
+
+        std::fs::write(repo.path().join("tracked.txt"), "changed").unwrap();
+        let preview = store.preview_files(&checkpoint.id, repo.path()).unwrap();
+        assert!(
+            preview.requires_confirmation,
+            "有别的实例在同一 checkout 上时，回滚必须要求确认"
+        );
+        assert!(
+            !preview.shared_peers.is_empty(),
+            "预览必须点名对方 pid，用户才能判断该不该继续"
+        );
+        assert!(preview
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("another wyj-code instance")));
+        crate::instance::remove_for_tests(&peer_record);
+    }
+
+    /// 无人可问时必须**拒绝**，而不是「确认一下就行」。
+    ///
+    /// `confirmed = true` 在 headless / `-p` / 定时任务里是调用方写死的常量，它不
+    /// 代表任何人的同意。此时同一 checkout 上还有别的实例，继续 `git restore`
+    /// 等于单方面抹掉对方尚未 checkpoint 的编辑。
+    #[test]
+    fn non_interactive_rewind_refuses_when_another_instance_shares_the_tree() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(
+            repo.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        std::fs::write(repo.path().join("tracked.txt"), "base").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "base"]);
+
+        let sessions = tempfile::tempdir().unwrap();
+        let interactive = CheckpointStore::new(sessions.path(), "s-ni").unwrap();
+        let checkpoint = interactive
+            .create(
+                repo.path(),
+                Vec::new(),
+                CheckpointKind::Manual,
+                Some("before".into()),
+            )
+            .unwrap();
+
+        let config_base = wyj_config::config_dir().unwrap();
+        let peer_record = crate::instance::register_foreign_for_tests(&config_base, repo.path(), 1);
+        std::fs::write(repo.path().join("tracked.txt"), "changed").unwrap();
+
+        // 交互面：显式确认后可以继续（这是 TUI 的路径）。
+        interactive
+            .restore_files(&checkpoint.id, repo.path(), true)
+            .expect("interactive + confirmed 应当放行");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "base"
+        );
+
+        std::fs::write(repo.path().join("tracked.txt"), "changed again").unwrap();
+        let headless = interactive.clone().with_non_interactive(true);
+        let error = headless
+            .restore_files(&checkpoint.id, repo.path(), true)
+            .expect_err("无人可问 + 有别的实例，必须拒绝");
+        assert!(
+            error.to_string().contains("refusing to restore files"),
+            "拒绝理由要说清是别人的改动会被覆盖: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "changed again",
+            "拒绝时一个字节都不能写"
+        );
+
+        crate::instance::remove_for_tests(&peer_record);
     }
 
     #[test]
@@ -2571,6 +2777,7 @@ mod tests {
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 7,
             cas: None,
+            non_interactive: false,
         });
         let store = CheckpointStore::configured(sessions.path(), "s-injected").unwrap();
         assert_eq!(store.max_per_session, 7);
@@ -2587,10 +2794,12 @@ mod tests {
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 3,
             cas: None,
+            non_interactive: false,
         });
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 5,
             cas: None,
+            non_interactive: false,
         });
         let store = CheckpointStore::configured(sessions.path(), "s-replace").unwrap();
         assert_eq!(store.max_per_session, 5, "后一次注入应覆盖前一次");

@@ -290,6 +290,8 @@ mod tests {
             "settings.json",
             r#"{"verify":{"command":"true"}}"#,
         );
+        // approve 落在真实 config_dir 下，用例结束收尾（见 hooks_trust 的说明）。
+        let _cleanup = crate::hooks_trust::ProjectStateCleanupForTests(tmp.path());
         let cfg = load_verify_cfg(tmp.path()).expect("应当解析出 verify 配置");
         assert_eq!(cfg.command, "true");
         assert!(cfg.enabled);
