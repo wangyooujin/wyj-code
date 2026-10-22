@@ -527,6 +527,40 @@ impl CheckpointStore {
             .map(|_| ())
     }
 
+    /// 预估 [`Self::enforce_retention`] 会删掉几条，**不改动任何文件**。
+    ///
+    /// 判据必须与 `prune_manifest_locked` 完全一致，否则 dry-run 会骗人：
+    /// 实测某会话 manifest 有 33 条、上限 10，dry-run 报「将删除 23 条」，
+    /// 而 `--yes` 报「已删除 0 条」——那 33 条的 `owner_pid` 全是 0（旧版本
+    /// 写的），`prune_manifest_locked` 把 `owner_pid == 0` 当成「可能活着」
+    /// 保守保留，dry-run 却只算了 `before - max`。
+    ///
+    /// 用**不可删条数**反推而不是复制一份淘汰逻辑：后者会随 retention 规则
+    /// 演进而漂移，前者只依赖 `prune_manifest_locked` 自己维护的那个判据。
+    pub fn estimate_retention_drops(&self) -> Result<usize> {
+        if self.max_per_session == 0 {
+            return Ok(0);
+        }
+        let manifest = self.load_manifest()?;
+        let self_pid = std::process::id();
+        // 与 `prune_manifest_locked` 的 `foreign_live` **逐字对应**：别人创建的
+        // 且（pid 未知为 0 或仍存活）。自己创建的条目不算保护对象——那边会把
+        // 它们照常淘汰。
+        let foreign_live = manifest
+            .checkpoints
+            .iter()
+            .filter(|entry| entry.owner_pid != self_pid)
+            .filter(|entry| {
+                entry.owner_pid == 0 || wyj_config::filelock::is_process_alive(entry.owner_pid)
+            })
+            .count();
+        Ok(manifest
+            .checkpoints
+            .len()
+            .saturating_sub(foreign_live)
+            .saturating_sub(self.max_per_session))
+    }
+
     /// 把已落盘的 checkpoint **重新外化**一遍，返回 `(处理数, 释放字节数)`。
     ///
     /// # 为什么需要这个（而 `create` 的修复不够）
@@ -2938,5 +2972,56 @@ mod tests {
             .path()
             .join("s-prune.checkpoints/cp1.json")
             .is_file());
+    }
+
+    /// `estimate_retention_drops` 必须与 `enforce_retention` 的实际删除数一致。
+    ///
+    /// 这条钉的是 dry-run 的诚实性：此前 dry-run 算 `before - max`，把
+    /// `owner_pid == 0` 的旧条目也算成可删，实测某会话报「将删除 23 条」而
+    /// `--yes` 实删 0 条。
+    #[test]
+    fn estimate_matches_actual_retention_drops() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::new(sessions.path(), "s-est").unwrap();
+        store.max_per_session = 1;
+        let mut manifest = CheckpointManifest::default();
+        // 3 条 owner_pid == 0（旧版本写的，保守视为可能活着）+ 2 条自己创建的
+        for (i, owner) in [0u32, 0, 0, std::process::id(), std::process::id()]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("cp{i}");
+            std::fs::write(
+                sessions.path().join(format!("s-est.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: owner,
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-est.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let estimated = store.estimate_retention_drops().unwrap();
+        let before = store.list().unwrap().len();
+        store.enforce_retention().unwrap();
+        let actual = before - store.list().unwrap().len();
+        assert_eq!(
+            estimated, actual,
+            "dry-run 预估 {estimated} 条，实际删除 {actual} 条——两者必须同源"
+        );
+        // 3 条 owner_pid==0 被保守保留，自己创建的 2 条只能留 1 条
+        assert_eq!(actual, 1);
     }
 }

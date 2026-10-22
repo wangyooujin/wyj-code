@@ -65,6 +65,26 @@ scope = "home"      # 默认。"project" = 会话与历史跟着工作副本走
 - 多 worktree 时每个 worktree 一份独立会话，`-c` 只看到当前 worktree 的；
 - 会话体积会进入 `git status` 的 stat 成本。
 
+同一个开关还作用于**记忆 / 演化 / 代码索引的项目层**：
+
+| 跟随 scope | 落到 `<git-root>/.wyj-code/local/` 下的 |
+|---|---|
+| 会话 | `sessions/<project_key>/` |
+| 历史 | `history/<project_key>/history.jsonl` |
+| 记忆（项目层） | `memory-v3/projects/<project_key>/` |
+| 演化 | `evolution/<project_key>/` |
+| 代码索引 | `indexes/<project_key>/lexical-v1.json` |
+
+**不跟随的**（各有硬约束）：`memory-v3/global/`（跨项目共用单文件）、
+`~/.wyj-code/projects/<key>/`（信任门控必须在仓库外，否则被信任的仓库能自己改掉
+批准标记）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、`workspaces/` 与
+`workflows/`（本机运行态：worktree 路径、进程 pid）、`spill/`、`logs/`、
+`schedule/`、`model-capabilities/`。
+
+**切换不会让状态凭空消失**：新位置还没有记录时，启动会把 home 下的旧项目目录
+复制一份过来（不覆盖已有文件、不删源）。要真正收拢数据仍请手工搬目录——这不是
+迁移工具。
+
 定义类配置（`mcp.toml`、`settings.toml`、`skills/`、`agents/`）不受这个开关影响。
 
 #### 会话与锁的保留策略

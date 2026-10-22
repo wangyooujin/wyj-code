@@ -224,7 +224,17 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 
 ### 落盘范围可选（`storage.scope`）
 
-默认 `"home"`。设成 `"project"` 时**会话与历史**改放 `<git-root>/.wyj-code/local/`，跟着工作副本走；选它时会自动写两道 gitignore（`local/.gitignore` 内容 `*` + 仓库根 `.gitignore` 追加 `.wyj-code/local/`），因为 transcript 是工具输出原文，漏一次 `git add -A` 就是永久泄漏。代价：多 worktree 时每个 worktree 一份独立会话（`-c` 行为变），以及会话体积进入 `git status` 的 stat 成本。**定义类配置（`mcp.toml`/`skills`/`agents`）不受这个开关影响**，它们本来就在仓库内。解析入口是 `layout::resolve_runtime_roots`——CLI 不再自己拼路径，否则「拼错的值降级为 home 并告警」这条只能靠启动真进程来测。
+默认 `"home"`。设成 `"project"` 时**会话、历史，以及记忆 / 演化 / 代码索引的项目层**改放 `<git-root>/.wyj-code/local/`，跟着工作副本走；选它时会自动写两道 gitignore（`local/.gitignore` 内容 `*` + 仓库根 `.gitignore` 追加 `.wyj-code/local/`），因为 transcript 是工具输出原文，漏一次 `git add -A` 就是永久泄漏。代价：多 worktree 时每个 worktree 一份独立会话与记忆（`-c` 行为变），以及会话体积进入 `git status` 的 stat 成本。**定义类配置（`mcp.toml`/`skills`/`agents`）不受这个开关影响**，它们本来就在仓库内。
+
+两个解析入口，分工不同，**都不要在调用方自己拼路径**：
+- `layout::resolve_runtime_roots` → `(sessions_root, history_root, scope)`，粒度是「目录里直接放文件」。
+- `layout::resolve_project_state_roots` → `ProjectStateRoots { memory_projects, evolution, indexes }`，粒度是「目录里再放一个 `<project_key>/`」。`project` 档位下它同样会写 gitignore——`memory` / `evolve` 等子命令不经过启动期装配，只调本函数也必须拿到保护。
+
+**不跟随 scope 的四类，理由都是硬约束不是口味**：`memory-v3/global/`（跨项目共用的单文件，跟某个项目走等于私有化）、`projects/<key>/`（信任门控必须在仓库外）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、`workspaces/` 与 `workflows/`（本机运行态：worktree 路径、进程 pid，跨机器复制无意义）。`spill` / `logs` / `schedule` / `model-capabilities` 同理。
+
+**`storage` 子命令与 `retention` 必须同时扫两处**：`project` 档位下会话不在 `config_base` 之下，只扫 home 会让 `status` 报 0、`prune` 清不到、TTL 完全空转（用户设了 30 天却一条不删且没有任何提示）。接线点是 `storage_cmd::extra_scope_roots`（`home` 档位返回全空，行为与改动前逐字节一致）与 `retention::run_with_extra_sessions`。同理 `session` / `subagent-trace` 这类「只拿到 session id」的命令走 `locate_session_dir`，两处都找。
+
+**切档位不能「状态凭空消失」**：`MemoryV3Store::with_roots_and_legacy` / `EvolutionStore::with_root_and_legacy` 在新位置还没有 `records.json`（记忆）或 `candidates/index.json`（演化）时，把 home 下旧项目目录**复制**过来。三条边界：① 判据看的是「新位置有没有标志文件」而不是目录是否为空——构造期已经建了空子目录；② `copy_missing_tree` **不覆盖**已有文件（新位置刚写的记录不该被旧文件盖回去）；③ 旧目录**不删不改**，删掉新目录即可回到旧状态。这不是迁移工具，真收拢走手工搬。
 
 ### 无界增长的两类回收：会话 TTL 与陈旧锁
 

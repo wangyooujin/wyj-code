@@ -54,9 +54,19 @@ pub enum MemoryCommand {
     },
 }
 
-pub fn run(command: MemoryCommand, cwd: &Path, enabled: bool) -> Result<()> {
+pub fn run(command: MemoryCommand, cwd: &Path, enabled: bool, storage_scope: &str) -> Result<()> {
     let base = wyj_config::config_dir()?;
-    let store = MemoryV3Store::new(&base, cwd)?;
+    // 记忆的项目层与会话同 scope：`storage.scope = "project"` 时读
+    // `<git-root>/.wyj-code/local/` 下那份，否则 TUI 写在项目内、CLI 读 home，
+    // 表现为「记忆突然空了」。
+    let (state_roots, _) =
+        wyj_config::layout::resolve_project_state_roots(storage_scope, &base, cwd);
+    let store = MemoryV3Store::with_roots_and_legacy(
+        &wyj_config::layout::memory_v3_root(&base),
+        &state_roots.memory_projects,
+        Some(&wyj_config::layout::memory_v3_root(&base).join("projects")),
+        cwd,
+    )?;
     store.set_enabled(enabled);
     match command {
         MemoryCommand::Status { json } => {
@@ -118,8 +128,12 @@ pub fn run(command: MemoryCommand, cwd: &Path, enabled: bool) -> Result<()> {
             // `search`（不带项目过滤）走 `list_all`，会扫遍所有项目目录 +
             // 根目录下的旧平铺文件；`search_for_project` 则只留在当前项目。
             // 两者都用 `for_project` 构造的 store，避免单目录模式看不到项目子目录。
-            let sessions =
-                wyj_core::SessionStore::for_project(wyj_config::layout::sessions_root(&base), cwd)?;
+            //
+            // 会话根同样要跟随 `storage.scope`：选 project 时 transcript 在
+            // 工作副本里，用 home 根会检索到空集。
+            let (sessions_root, _, _) =
+                wyj_config::layout::resolve_runtime_roots(storage_scope, &base, cwd);
+            let sessions = wyj_core::SessionStore::for_project(sessions_root, cwd)?;
             let hits = if all_projects {
                 sessions.search(&query, limit)?
             } else {

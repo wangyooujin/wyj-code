@@ -51,10 +51,28 @@ impl CleanupStats {
 ///
 /// `dry_run = true` 时只统计不删除，供 `storage prune` 的计划输出用。
 pub fn run(data_root: &Path, cfg: &StorageRetentionCfg, dry_run: bool) -> Result<CleanupStats> {
+    run_with_extra_sessions(data_root, &[], cfg, dry_run)
+}
+
+/// 同 [`run`]，额外扫描 `extra_sessions_roots`。
+///
+/// `storage.scope = "project"` 时会话落在 `<git-root>/.wyj-code/local/sessions/`，
+/// 不在 `data_root` 之下。只扫 `data_root` 会让 TTL 清理对那批会话完全空转
+/// ——用户设了 30 天却一条都不删，且没有任何提示。
+///
+/// `extra` 里的每一项是**会话根**（其下是 `<project_key>/` 子目录），与
+/// [`wyj_config::layout::sessions_root`] 同粒度。
+pub fn run_with_extra_sessions(
+    data_root: &Path,
+    extra_sessions_roots: &[PathBuf],
+    cfg: &StorageRetentionCfg,
+    dry_run: bool,
+) -> Result<CleanupStats> {
     let mut stats = CleanupStats::default();
     if cfg.sessions_ttl_days > 0 {
         let session_stats = purge_sessions(
             data_root,
+            extra_sessions_roots,
             cfg.sessions_ttl_days,
             cfg.sessions_keep_recent,
             dry_run,
@@ -63,7 +81,12 @@ pub fn run(data_root: &Path, cfg: &StorageRetentionCfg, dry_run: bool) -> Result
         stats.session_bytes_freed = session_stats.1;
     }
     if cfg.stale_lock_ttl_days > 0 {
-        let lock_stats = purge_stale_locks(data_root, cfg.stale_lock_ttl_days, dry_run)?;
+        let lock_stats = purge_stale_locks(
+            data_root,
+            extra_sessions_roots,
+            cfg.stale_lock_ttl_days,
+            dry_run,
+        )?;
         stats.locks_removed = lock_stats.0;
         stats.lock_bytes_freed = lock_stats.1;
     }
@@ -78,6 +101,7 @@ pub fn run(data_root: &Path, cfg: &StorageRetentionCfg, dry_run: bool) -> Result
 /// 目录，`storage status` 里显示成一堆「0 字节会话」。
 fn purge_sessions(
     data_root: &Path,
+    extra_sessions_roots: &[PathBuf],
     ttl_days: u32,
     keep_recent: usize,
     dry_run: bool,
@@ -89,7 +113,11 @@ fn purge_sessions(
 
     // 收集全部会话：(目录, session_id, mtime)。
     let mut sessions: Vec<(PathBuf, String, SystemTime)> = Vec::new();
-    for dir in session_dirs(&sessions_root) {
+    for dir in session_dirs(&sessions_root).into_iter().chain(
+        extra_sessions_roots
+            .iter()
+            .flat_map(|root| session_dirs(root)),
+    ) {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -189,7 +217,12 @@ fn session_dirs(sessions_root: &Path) -> Vec<PathBuf> {
 ///
 /// 「无人持有」的判定用 `flock` 试拿，而不是看 pid：pid 会被复用，而 flock
 /// 是内核维护的真实持有状态。试拿失败说明另一个进程正在用，直接跳过。
-fn purge_stale_locks(data_root: &Path, ttl_days: u32, dry_run: bool) -> Result<(usize, u64)> {
+fn purge_stale_locks(
+    data_root: &Path,
+    extra_sessions_roots: &[PathBuf],
+    ttl_days: u32,
+    dry_run: bool,
+) -> Result<(usize, u64)> {
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(u64::from(ttl_days) * 86_400))
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -214,7 +247,14 @@ fn purge_stale_locks(data_root: &Path, ttl_days: u32, dry_run: bool) -> Result<(
     }
 
     // ── sessions/*.json.lock 与 *.json.owner ──
-    for dir in session_dirs(&wyj_config::layout::sessions_root(data_root)) {
+    for dir in session_dirs(&wyj_config::layout::sessions_root(data_root))
+        .into_iter()
+        .chain(
+            extra_sessions_roots
+                .iter()
+                .flat_map(|root| session_dirs(root)),
+        )
+    {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };

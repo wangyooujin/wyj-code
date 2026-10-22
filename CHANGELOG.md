@@ -98,6 +98,67 @@ scope = "home"      # 默认
 会变，以及会话体积进入 `git status` 的 stat 成本。定义类配置（`mcp.toml`、
 `skills/`、`agents/`）不受影响。
 
+**`project` 档位现在也覆盖记忆 / 演化 / 代码索引的项目层**。此前只搬会话与历史，
+留下「历史在这个副本、记忆在 home」的割裂语义：换 clone 之后模型记得上一个副本
+的结论，却读不到这个副本的历史。
+
+- 新增 `layout::resolve_project_state_roots` → `ProjectStateRoots { memory_projects,
+  evolution, indexes }`，与 `resolve_runtime_roots` 并列；`project` 分支同样写
+  gitignore，因为 `memory` / `evolve` 子命令不经过启动期装配。
+- `MemoryV3Store::with_roots` / `EvolutionStore::with_root` 允许把项目层与 Global
+  层分开放——`memory-v3/global/` 仍是跨项目共用的单文件，跨进程锁也仍挂在
+  Global 根，否则不同项目各锁各的，全局层照样撞。
+- **不跟随的四类**（硬约束）：`memory-v3/global/`、`~/.wyj-code/projects/<key>/`
+  （信任门控在仓库外）、`cas/`（跨项目去重池，`gc` 是全局 LRU）、
+  `workspaces/` 与 `workflows/`（worktree 路径 + 进程 pid，跨机器复制无意义）。
+- **`storage` 子命令与 `retention` 现在扫两处**。`project` 档位下会话不在
+  `config_base` 之下，只扫 home 会让 `status` 报 0、`prune` 清不到、会话 TTL
+  完全空转。`home` 档位返回空列表，行为与改动前逐字节一致。
+- **`session` / `subagent-trace` 走 `locate_session_dir`**：这类命令只拿到
+  session id，两处都找，否则另一半会话表现为「不存在」。
+- **切换后不会「记忆突然空了」**：`with_roots_and_legacy` / `with_root_and_legacy`
+  在新位置还是空的时候，把 home 下旧项目目录**复制**一份过来（不覆盖已有文件、
+  不删源）。这是「升级后第一次启动」的兜底，不是迁移工具——真要把数据收拢仍走
+  手工搬目录。
+
+### `storage prune` 回收无主旁路目录
+
+会话正文被删（TTL、手工清理、损坏清理）后，`<sid>.checkpoints/` 与
+`<sid>.subagents/` 会原地留下——实测 177 个这样的目录、5 MB 级。它们不在任何
+manifest 的视野里（`CheckpointStore` 只从会话正文进入），此前一条清理路径都
+碰不到，只在 `storage status` 里显示成一堆「0 字节会话」。
+
+新增两段保护，缺一不可：
+
+- **宽限期 1 小时**：另一个进程可能刚建好旁路目录、还没写出 `<sid>.json`，
+  此时「没有会话正文」是正常中间态。
+- **manifest 里有活着的 `owner_pid` 就不动**：那条会话的 `/rewind` 目标正被
+  别的终端用着。判定复用 `filelock::is_process_alive`，与
+  `CheckpointStore::prune_manifest_locked` 同一套判据。
+
+dry-run 如实报条数与字节。钉子：`storage_cmd::tests::orphan_sidecars_*` 三条
+（正文存在即跳过 / 宽限期内不动 / 活 owner 保留）与
+`extra_sessions_root_is_scanned_too`。
+
+### 修复：`storage prune` 的 dry-run 报假数
+
+dry-run 用 `before - max` 估算 checkpoint 淘汰数，而 `enforce_retention` 会
+额外跳过「别人创建的且 pid 未知或仍存活」的条目。实测某会话 manifest 33 条、
+上限 10，dry-run 报「将删除 23 条」，`--yes` 报「已删除 0 条」——那 33 条的
+`owner_pid` 全是 0（旧版本写的）。
+
+新增 `CheckpointStore::estimate_retention_drops`，判据与
+`prune_manifest_locked` 的 `foreign_live` 逐字对应（只读、不改任何文件）。
+钉子：`checkpoint::tests::estimate_matches_actual_retention_drops` 直接断言
+「预估 == 实删」。
+
+同时修正两处**说反了**的提示：
+- `storage doctor` 说「`storage prune` 会回收 ref_count == 0 的 blob」，但
+  `WorkspaceCas::gc` 在总量**未超过** `cas_total_bytes` 时直接返回，一个都不删
+  （实测 1440 个 orphan / 21 MB 在 893 MB 的池子里躺了很久）。
+- `storage prune --yes` 在未超限时打「回收 0 个 / 0 字节」，读起来像「没有垃圾」，
+  实际是「有 orphan 但不超限」。现在明确说清是哪种。
+
 ## [0.3.18] - 2026-10-22
 
 ### 鼠标交互重做：输入框也能选、能复制，滚轮不再吞掉选区
