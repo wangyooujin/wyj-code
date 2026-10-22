@@ -189,6 +189,60 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 **实现位置**:Phase 1 retention/cap 在 `crates/core/src/{checkpoint,memory,memory_v3}.rs` + `crates/store/src/{cron_sync,plugin_install}.rs` + `crates/core/src/workspace.rs`;Phase 2 截断在 `crates/core/src/serialize.rs`(`SessionStore::save` + `CheckpointStore::create` 落盘前调 `truncate_session_for_persistence`);Phase 3 disk_usage 提示在 `crates/core/src/disk_usage.rs`,CLI 启动路径调一次,进程内 `OnceLock` 保证单进程只 warn 一次。
 
 
+## 落盘布局（v0.3.19）
+
+**所有目录名的唯一来源是 `wyj_config::layout`**（`crates/config/src/layout.rs`）。新增落盘位置先在那里登记，调用方只拿函数、不写字符串字面量——此前 `join("sessions")` 这类字面量散在 20 多个文件共 140 余处，任何布局调整都变成逐文件考古，漏一处就是「数据莫名消失」且无报错。
+
+```
+<data_root>/                      # 默认 ~/.wyj-code，可由 WYJ_CODE_HOME 覆盖
+├── config.toml  settings.json  AGENTS.md  installed.json
+├── skills/  agents/  plugins/  marketplaces/  model-capabilities/
+├── sessions/<project_key>/       # 会话 + .meta.json + .json.lock/.owner + <sid>.checkpoints/ + <sid>.subagents/
+├── history/<project_key>/history.jsonl
+├── memory-v3/{global,projects/<key>}/
+├── evolution/<project_key>/  indexes/<project_key>/
+├── workspaces/<project_key>/  workflows/<project_key>/
+├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
+│   └── instances/  meta.json
+└── cas/  spill/  schedule/  logs/
+```
+
+**项目键必须稳定**（`core::project::project_key`）：`v1-<目录名>-<sha256 前 16 位>`。三条硬约束：
+1. **不用 `DefaultHasher`**——std 明确不保证跨 Rust 版本稳定，换工具链会让全部项目键漂移、状态静默丢失。旧算法保留为 `legacy_project_key` / `legacy_path_hash`，**只供 `storage migrate` 使用**。
+2. **必须带 `v1-` 前缀**，将来算法再变时能同时识别两代目录。
+3. **`memory::project_id` 已改为委托 `project_key`**。此前它直接哈希传入路径、不做仓库根归一，于是从子目录启动时 `memory/`、`indexes/` 与 `projects/`、`memory-v3/` 目录名不一致——同一项目状态被拆成两处。同理 `code_index` 的构造点此前传的是 `cwd`，现改传 `project_key`。
+
+**`sessions` / `history` 已按项目分目录**，但**保留旧平铺文件的读取兜底**：`SessionStore::list()` 会并上根目录下属于当前项目的 `.json`，`HistoryStore::recent()` 会并上根目录 `history.jsonl` 里属于当前项目的行。这条不能删——升级后没跑 `storage migrate` 的用户，`/resume` 与 `/history` 突然变空比报错更难解释。
+
+**`SessionStore` 的双模式**：`new(dir)` 是单目录模式（`root == dir`，测试与 ACP 用），`for_project(root, cwd)` 是按项目分目录。`locate()` 在分目录模式下会跨项目找会话，**写回原目录**——`--resume` 一个属于 A 仓库的会话、进程 cwd 在 B 仓库时，写进 B 会让它从 A 消失又在 B 凭空出现。钉子：`session_store::tests::resume_from_other_project_writes_back_to_original_directory`。
+
+**`storage` 的 status / doctor / prune 必须扫「根目录 + 全部项目子目录」**（`session_dirs()`），且要跳过 `<sid>.checkpoints/`、`<sid>.subagents/` 这类旁路目录。只扫一层会让 doctor 报「损坏 0 个」而磁盘上明明有坏文件。
+
+**`storage migrate [--dry-run|--yes]`**：默认只报计划。搬三类：① 会话**整组**（`.json` + `.meta.json` + `.json.lock` + `.json.owner` + `.checkpoints/` + `.subagents/`，按 meta 里的 `cwd` 算键）——只搬 `.json` 会让 checkpoint 与 trace 留在根目录，`/rewind` 与 `subagent-trace` 静默失效；② `history.jsonl` 按行拆；③ `projects/`、`memory-v3/projects/`、`evolution/`、`indexes/`、`workspaces/`、`workflows/` 下的旧键目录改名（旧键无法反推路径，只能靠 `meta.json` / `instances/*.json` 的 `cwd` 恢复，恢复不出来的报 `skipped` 并保持原样）。全程用 `rename`（同盘原子）而非复制后删。
+
+**为什么会话不进仓库**：transcript 里是工具输出原文（`.env` 内容、命令回显、密钥），进 git 等于泄漏；`sessions` 实测 2.5 GB 级，也不该让 `git status` 去 stat。`allowed_tools.json` 与三个 `*_trust.json` 同理**必须**留在 `~/.wyj-code/projects/<key>/`——放进 `<git-root>/.wyj-code/` 的话，被信任的仓库自己就能改掉「已批准」标记，门控形同虚设。
+
+### 落盘范围可选（`storage.scope`）
+
+默认 `"home"`。设成 `"project"` 时**会话与历史**改放 `<git-root>/.wyj-code/local/`，跟着工作副本走；选它时会自动写两道 gitignore（`local/.gitignore` 内容 `*` + 仓库根 `.gitignore` 追加 `.wyj-code/local/`），因为 transcript 是工具输出原文，漏一次 `git add -A` 就是永久泄漏。代价：多 worktree 时每个 worktree 一份独立会话（`-c` 行为变），以及会话体积进入 `git status` 的 stat 成本。**定义类配置（`mcp.toml`/`skills`/`agents`）不受这个开关影响**，它们本来就在仓库内。解析入口是 `layout::resolve_runtime_roots`——CLI 不再自己拼路径，否则「拼错的值降级为 home 并告警」这条只能靠启动真进程来测。
+
+### 无界增长的两类回收：会话 TTL 与陈旧锁
+
+`StorageRetentionCfg` 里新增三个字段（`crates/core/src/retention.rs`）：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `sessions_ttl_days` | **0（关闭）** | 删早于 N 天的会话（整组：正文 + meta + lock + owner + `.checkpoints/` + `.subagents/`） |
+| `sessions_keep_recent` | 5 | 每个项目无条件保留最新 N 条，防「三个月没动的项目被删光」 |
+| `stale_lock_ttl_days` | 7 | 删 `cas/locks/` 与 `sessions/*.json.lock` / `*.json.owner` 里无人持有且超期的 |
+
+**会话 TTL 默认关闭**是刻意的：删历史不可逆，不该在升级后第一次启动里静默发生。想开自己设 30/90；想立刻清一次走 `storage prune`（它读同一组配置，未设时按 30 天，且 dry-run 与 `--yes` 用同一个值）。锁清理默认开——锁文件内容只有 pid，删错零数据损失。
+
+**探测持有状态必须用 `filelock::is_locked`，不能用 `try_acquire`**：后者拿到锁会 `set_len(0)` 写 pid，刷新 mtime，于是「探测」本身把目标变成「刚刚用过」——实测症状是 dry-run 报「将删除 1 个」、`--yes` 报「已删除 0 个」，文件永远清不掉。`is_locked` 用只读 fd 试拿 `LOCK_EX|LOCK_NB` 后立刻 `LOCK_UN`，零副作用。钉子：`filelock::tests::is_locked_probe_has_no_side_effects`。
+
+清理在进程启动的后台线程里跑一次（`wyj-startup-io`），**必须排在 CAS gc 之后**——gc 会释放一批 blob，对应的锁文件才是这一轮该清的。
+
+
 ## 模型侧提示词
 
 

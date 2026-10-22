@@ -523,16 +523,14 @@ fn messages_to_text(messages: &[Message]) -> String {
         .join("\n")
 }
 
+/// 项目标识。**与 [`crate::project::project_key`] 是同一个东西**。
+///
+/// 历史上这里另有一套算法（直接哈希传入路径、不做仓库根归一），于是从仓库
+/// 子目录启动时 `memory/`、`indexes/` 的目录名会与 `projects/`、`memory-v3/`
+/// 不一致——同一份项目状态被拆成两处，且没有任何报错。现在统一委托，两套
+/// 目录名重新对齐；旧目录由 `storage migrate` 搬运。
 pub fn project_id(path: &Path) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    path.hash(&mut h);
-    let dir_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "root".to_string());
-    format!("{}-{:08x}", sanitize(&dir_name), h.finish() as u32)
+    crate::project::project_key(path)
 }
 
 fn sanitize(s: &str) -> String {

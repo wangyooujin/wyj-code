@@ -10,6 +10,94 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [未发布]
+
+### 落盘布局：会话与历史按项目分目录
+
+`~/.wyj-code/sessions/` 此前是**全局平铺**（680 个文件 / 2.5 GB 堆在一层），靠每条
+会话里的 `cwd` 字段做逻辑隔离。后果是：删一个项目要手工挑文件、备份粒度只能整库、
+`/resume` 要扫全量、`storage status` 也看不出「哪个项目占了盘」。
+
+现在改成 `<data_root>/sessions/<project_key>/`，历史同理。收益是删除/备份/统计
+都变成一次目录操作。**旧数据不会被自动搬**——读取侧有兜底（`list()` 仍会并上根
+目录下属于当前项目的文件），但要真正收拢请跑一次：
+
+```bash
+wyj-code storage migrate          # 只报计划
+wyj-code storage migrate --yes    # 实际搬迁
+```
+
+- **`project_key` 换成 SHA-256 + `v1-` 前缀**。旧实现用 `std::collections::hash_map::
+  DefaultHasher`，而 std 明确不保证它跨 Rust 版本稳定——换工具链就可能让全部项目
+  目录名漂移、状态静默丢失。旧算法保留为 `legacy_project_key` / `legacy_path_hash`，
+  只供迁移使用。
+- **修掉 `memory::project_id` 与 `code_index` 的目录漂移**：它们此前直接哈希 `cwd`
+  而不做仓库根归一，于是从子目录启动时 `memory/`、`indexes/` 的目录名与
+  `projects/`、`memory-v3/` 不一致，同一份项目状态被拆成两处。现在统一走
+  `project_key`。
+- **`--resume` 别的仓库的会话时写回原目录**，不再因为当前 `cwd` 不同而把它搬走。
+- **新增 `WYJ_CODE_HOME`**：整个状态目录可重定向（外置盘、独立测试环境）。
+- **新增 `crates/config/src/layout.rs`**：`~/.wyj-code` 下所有目录名的唯一来源。
+  此前 `join("sessions")` 这类字面量散在 20 多个文件共 140 余处。
+- **`storage status` / `doctor` / `prune` 改为扫「根目录 + 全部项目子目录」**。
+  只扫一层会让 doctor 在分目录后报「损坏 0 个」而磁盘上明明有坏文件。
+
+### 迁移必须整组搬会话文件
+
+一个会话在旧布局里散成最多 6 个同级条目（`.json`、`.meta.json`、`.json.lock`、
+`.json.owner`、`.checkpoints/`、`.subagents/`）。只搬 `.json` 会让 checkpoint 与
+子 Agent trace 留在根目录，`/rewind` 与 `subagent-trace` 静默失效且不报错。
+
+### 无界增长的两类回收：会话 TTL 与陈旧锁
+
+`sessions/` 680 个文件 / 2.5 GB、`cas/locks/` 10641 个 / 42 MB、
+`sessions/*.json.lock` 238 个、`*.json.owner` 65 个——这些此前**没有任何回收
+路径**。`storage` 那套 cap 只管单文件大小与单子系统条数，管不到「文件数量」。
+
+新增 `crates/core/src/retention.rs` 与三个配置字段：
+
+```toml
+[storage]
+sessions_ttl_days = 0        # 0 = 不自动删（默认）；设 30/90 启用
+sessions_keep_recent = 5     # 每个项目无条件保留最新 N 条
+stale_lock_ttl_days = 7      # 陈旧锁清理
+```
+
+- **会话 TTL 默认关闭**。删历史不可逆，不该在升级后第一次启动里静默发生。
+  想立刻清一次用 `wyj-code storage prune`（dry-run）→ `--yes`。
+- **`sessions_keep_recent` 是 TTL 的必要配套**：纯 TTL 会把「三个月没动的项目
+  里唯一那批会话」删光。
+- **删除整组**：正文 + meta + lock + owner + `.checkpoints/` + `.subagents/`。
+  只删正文会留下孤儿 checkpoint 目录。
+- **锁清理默认开**：锁文件内容只有 pid，删错零数据损失。只删「无人持有」的
+  ——用 `flock` 试拿判定，不看 pid（pid 会被复用）。
+- 清理在启动后台线程跑一次，**排在 CAS gc 之后**（gc 释放的 blob 对应的锁
+  才是这一轮该清的）。
+
+### 修复：`filelock::try_acquire` 做探测会把目标刷新成「刚刚用过」
+
+陈旧锁清理最初用 `try_acquire` 探测持有状态，而它在拿到锁后会 `set_len(0)`
+写入自己的 pid——**刷新了 mtime**。于是 dry-run 报「将删除 1 个」、紧接着
+`--yes` 报「已删除 0 个」，文件永远清不掉。
+
+新增零副作用的 `filelock::is_locked`：只读 fd 试拿 `LOCK_EX|LOCK_NB` 后立刻
+`LOCK_UN`，不写 pid、不动 mtime、不创建文件。钉子：
+`filelock::tests::is_locked_probe_has_no_side_effects`。
+
+### 新增 `storage.scope`：会话可以跟着工作副本走
+
+```toml
+[storage]
+scope = "home"      # 默认
+# scope = "project" # 会话与历史放 <git-root>/.wyj-code/local/
+```
+
+选 `project` 时会自动写两道 gitignore（`local/.gitignore` 内容 `*`，仓库根
+`.gitignore` 追加 `.wyj-code/local/`）——transcript 里是工具输出原文，漏一次
+`git add -A` 就是永久泄漏。代价是多 worktree 时各有一份独立会话、`-c` 行为
+会变，以及会话体积进入 `git status` 的 stat 成本。定义类配置（`mcp.toml`、
+`skills/`、`agents/`）不受影响。
+
 ## [0.3.18] - 2026-10-22
 
 ### 鼠标交互重做：输入框也能选、能复制，滚轮不再吞掉选区

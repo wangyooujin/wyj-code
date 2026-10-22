@@ -281,12 +281,19 @@ impl From<SessionFile> for SessionMeta {
     }
 }
 
-/// 会话文件存储（~/.wyj-code/sessions/）
+/// 会话文件存储（`<data_root>/sessions/<project_key>/`）
 ///
-/// `Clone` 只复制一个 `PathBuf`，用于 `save_async` 把 owned 副本交给
+/// `Clone` 只复制两个 `PathBuf`，用于 `save_async` 把 owned 副本交给
 /// `spawn_blocking`（那里要求 `'static`）。
 #[derive(Clone)]
 pub struct SessionStore {
+    /// 会话根目录（`<data_root>/sessions`）。
+    ///
+    /// 之所以要留着它而不只存项目子目录：`--resume <id>`、`memory search
+    /// --all-projects`、`usage` 都需要跨项目定位会话。单目录模式下它与
+    /// `dir` 相同（既有测试与 ACP 直接传一个临时目录进来）。
+    root: PathBuf,
+    /// 当前项目的会话目录（`<root>/<project_key>`，单目录模式下等于 `root`）。
     dir: PathBuf,
 }
 
@@ -447,30 +454,108 @@ fn snippet_around(text: &str, query_lower: &str) -> String {
 }
 
 impl SessionStore {
+    /// 单目录模式：所有会话平铺在 `dir` 下。
+    ///
+    /// 保留给「目录由调用方完全掌控」的场景（测试、ACP 的临时会话目录），
+    /// 以及迁移前的旧布局。生产路径应走 [`Self::for_project`]。
     pub fn new(dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            root: dir.clone(),
+            dir,
+        })
+    }
+
+    /// 按项目分目录模式：会话落在 `<root>/<project_key>/`。
+    ///
+    /// `root` 是数据根下的 `sessions/`；`cwd` 用来算项目键（内部走
+    /// `project::project_key`，即 git 仓库根粒度，子目录与 worktree 只要
+    /// `--project-root` 指对就归到同一项目）。
+    pub fn for_project(root: PathBuf, cwd: &Path) -> Result<Self> {
+        let key = crate::project::project_key(cwd);
+        Self::for_project_key(root, &key)
+    }
+
+    /// 同 [`Self::for_project`]，但项目键由调用方给定（迁移、跨项目工具用）。
+    pub fn for_project_key(root: PathBuf, project_key: &str) -> Result<Self> {
+        let dir = root.join(project_key);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { root, dir })
     }
 
     fn path(&self, session_id: &str) -> PathBuf {
-        self.dir.join(format!("{session_id}.json"))
+        self.locate(session_id).join(format!("{session_id}.json"))
     }
 
     /// 会话写入的锁文件。与 `.json` 同目录，避免和 checkpoint 的旁路存储混淆。
     fn lock_path(&self, session_id: &str) -> PathBuf {
-        self.dir.join(format!("{session_id}.json.lock"))
+        self.locate(session_id)
+            .join(format!("{session_id}.json.lock"))
     }
 
     /// 会话占用租约文件。与写入锁分开：写入锁的持有周期是一次 save，租约是整个
     /// 会话生命周期，两者语义完全不同。
     fn claim_path(&self, session_id: &str) -> PathBuf {
-        self.dir.join(format!("{session_id}.json.owner"))
+        self.locate(session_id)
+            .join(format!("{session_id}.json.owner"))
     }
 
-    /// 会话文件所在目录（`~/.wyj-code/sessions/`），供旁路存储（如子 Agent
-    /// trace，见 `wyj_tools::trace`）按同一根目录 + `session_id` 定位文件。
+    /// 当前项目的会话目录，供旁路存储（如子 Agent trace，见 `wyj_tools::trace`）
+    /// 按同一根目录 + `session_id` 定位文件。
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 某个会话实际所在的目录（会跨项目查找）。旁路存储（trace / handoff /
+    /// message log）必须用它而不是 [`Self::dir`]：`--resume` 一个别的仓库的
+    /// 会话时，trace 跟着写在那个仓库的目录下才是对的。
+    pub fn dir_for_session(&self, session_id: &str) -> PathBuf {
+        self.locate(session_id)
+    }
+
+    /// 会话根目录（`<data_root>/sessions`）。跨项目定位会话时用它。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// 是否处于「按项目分目录」模式。单目录模式下 `root == dir`。
+    pub fn is_project_scoped(&self) -> bool {
+        self.root != self.dir
+    }
+
+    /// 全部项目子目录（单目录模式返回空）。迁移与 `usage` 汇总用。
+    pub fn project_dirs(&self) -> Result<Vec<PathBuf>> {
+        if !self.is_project_scoped() {
+            return Ok(Vec::new());
+        }
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&self.root)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        Ok(dirs)
+    }
+
+    /// 在会话根目录下定位某个会话所在的目录（跨项目）。
+    ///
+    /// 给「只有 session id、连当前项目都不知道」的只读入口用：
+    /// `wyj-code subagent-trace <session_id>`。找不到时返回根目录本身。
+    pub fn locate_in_root(root: &Path, session_id: &str) -> PathBuf {
+        let file_name = format!("{session_id}.json");
+        if root.join(&file_name).exists() {
+            return root.to_path_buf();
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return root.to_path_buf();
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.is_dir() && dir.join(&file_name).exists() {
+                return dir;
+            }
+        }
+        root.to_path_buf()
     }
 
     pub fn save(&self, file: &SessionFile) -> Result<()> {
@@ -547,7 +632,32 @@ impl SessionStore {
     /// 旁路元数据文件路径：`list()` 只需要 `SessionMeta` 那十来个标量，
     /// 没必要为了它们解析整份 transcript。
     fn meta_path(&self, session_id: &str) -> PathBuf {
-        self.dir.join(format!("{session_id}.meta.json"))
+        self.locate(session_id)
+            .join(format!("{session_id}.meta.json"))
+    }
+
+    /// 定位某个会话所属的目录。
+    ///
+    /// 单目录模式恒为 `dir`。按项目分目录模式下先看当前项目，再逐个项目目录
+    /// 找——`--resume <id>` 允许恢复**另一个仓库**的会话，若只在当前项目目录里
+    /// 找，跨项目恢复会直接报「会话不存在」，而错误信息完全指不到真正的原因。
+    ///
+    /// 找不到时回退 `dir`：调用方随后的读写会自然失败，错误信息里带的是当前
+    /// 项目路径，比一个凭空构造的路径更容易理解。
+    fn locate(&self, session_id: &str) -> PathBuf {
+        if !self.is_project_scoped() {
+            return self.dir.clone();
+        }
+        let file_name = format!("{session_id}.json");
+        if self.dir.join(&file_name).exists() {
+            return self.dir.clone();
+        }
+        for dir in self.project_dirs().unwrap_or_default() {
+            if dir.join(&file_name).exists() {
+                return dir;
+            }
+        }
+        self.dir.clone()
     }
 
     /// 写元数据旁路文件。
@@ -633,41 +743,89 @@ impl SessionStore {
         Ok(file)
     }
 
-    /// 列出所有会话，按时间戳倒序排列（最新在前）
+    /// 列出**当前项目**的会话，按时间戳倒序排列（最新在前）。
     ///
     /// **只读 `.meta.json` 旁路文件**，不为取十个标量字段解析整份 transcript——
     /// 长会话的 `.json` 动辄几 MB，几百个会话就是几百 MB 读盘 + 全量 JSON 解析，
     /// 而 `/resume` 面板只要标题和时间。meta 缺失（老会话、或 meta 写失败）时
     /// 回退到解析 `.json`，保证升级后老会话仍然可见。
+    ///
+    /// 按项目分目录模式下还会**顺带读根目录下平铺的旧文件**（只取属于当前项目
+    /// 的那些）。这条兼容分支不能省：用户升级后若还没跑 `storage migrate`，
+    /// `/resume` 会突然空掉，而「历史会话全丢了」是最难让用户相信「只是换了目录」
+    /// 的一种症状。
     pub fn list(&self) -> Result<Vec<SessionMeta>> {
-        let mut metas = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)?.flatten() {
-            let path = entry.path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
+        let mut metas = self.list_in(&self.dir);
+        if self.is_project_scoped() {
+            let Some(key) = self.dir.file_name().and_then(|n| n.to_str()) else {
+                return Ok(metas);
             };
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if stem.ends_with(".meta") {
-                continue;
-            }
-            if let Some(meta) = self.load_meta(stem) {
-                metas.push(meta);
-            }
+            metas.extend(self.list_legacy_flat(key));
         }
         metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        metas.dedup_by(|a, b| a.session_id == b.session_id);
         Ok(metas)
     }
 
-    /// 读一个会话的元数据，优先旁路文件。
-    fn load_meta(&self, session_id: &str) -> Option<SessionMeta> {
-        if let Ok(content) = std::fs::read_to_string(self.meta_path(session_id)) {
+    /// 列出**全部项目**的会话。跨项目检索 / `usage` / 迁移用。
+    ///
+    /// 单目录模式下等价于 [`Self::list`]。
+    pub fn list_all(&self) -> Result<Vec<SessionMeta>> {
+        if !self.is_project_scoped() {
+            return self.list();
+        }
+        let mut metas = Vec::new();
+        for dir in self.project_dirs()? {
+            metas.extend(self.list_in(&dir));
+        }
+        metas.extend(self.list_legacy_flat_any());
+        metas.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        metas.dedup_by(|a, b| a.session_id == b.session_id);
+        Ok(metas)
+    }
+
+    /// 列出单个目录下的会话（不递归、不排序）。
+    fn list_in(&self, dir: &Path) -> Vec<SessionMeta> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    return None;
+                }
+                let stem = path.file_stem().and_then(|s| s.to_str())?;
+                if stem.ends_with(".meta") {
+                    return None;
+                }
+                self.load_meta_in(dir, stem)
+            })
+            .collect()
+    }
+
+    /// 根目录下平铺的旧会话文件里，属于 `key` 的那些。
+    fn list_legacy_flat(&self, key: &str) -> Vec<SessionMeta> {
+        self.list_in(&self.root)
+            .into_iter()
+            .filter(|meta| crate::project::project_key(Path::new(&meta.cwd)) == key)
+            .collect()
+    }
+
+    /// 根目录下平铺的**全部**旧会话文件（迁移与全库检索用）。
+    fn list_legacy_flat_any(&self) -> Vec<SessionMeta> {
+        self.list_in(&self.root)
+    }
+
+    fn load_meta_in(&self, dir: &Path, session_id: &str) -> Option<SessionMeta> {
+        let meta_path = dir.join(format!("{session_id}.meta.json"));
+        if let Ok(content) = std::fs::read_to_string(&meta_path) {
             if let Ok(meta) = serde_json::from_str::<SessionMeta>(&content) {
                 return Some(meta);
             }
         }
-        let content = std::fs::read_to_string(self.path(session_id)).ok()?;
+        let content = std::fs::read_to_string(dir.join(format!("{session_id}.json"))).ok()?;
         let file: SessionFile = serde_json::from_str(&content).ok()?;
         Some(SessionMeta::from(file))
     }
@@ -680,6 +838,10 @@ impl SessionStore {
     /// 列出属于 `cwd` 所在项目（git 仓库根，非 git 回退 cwd）的会话，时间倒序。
     ///
     /// 会话按项目隔离：不同仓库互不可见，同仓库不同子目录视为同一项目。
+    ///
+    /// 按项目分目录模式下这层过滤是**冗余的**（目录本身就是边界），但保留它：
+    /// 它同时兜住了根目录下平铺的旧文件，也让 `list_for_project` 在两种模式下
+    /// 语义完全一致——上层不需要知道当前是哪套布局。
     ///
     /// ⚠️ 去重的一定是**中间量**（`cwd` → `project_key` 的换算结果），不是会话。
     /// 此前这里写的是 `seen.insert(m.cwd.clone()) && ...`：`HashSet::insert` 对
@@ -757,7 +919,7 @@ impl SessionStore {
 
         let metas = match project {
             Some(cwd) => self.list_for_project(cwd)?,
-            None => self.list()?,
+            None => self.list_all()?,
         };
 
         // 先收集所有 (会话, 消息) 的检索文本，再一次性建 BM25 索引。
@@ -1831,5 +1993,163 @@ mod tests {
         assert!(snippet.chars().count() <= SNIPPET_CHARS + 2);
         // 不能有半个字符（构造时若按字节切会直接 panic；这里再验一次内容完整）。
         assert!(snippet.chars().all(|c| "渲染管线…".contains(c)));
+    }
+
+    // ── 按项目分目录 ──
+
+    /// 分目录模式下每个项目一个子目录，`list` 只看得到自己的。
+    #[test]
+    fn project_scoped_store_separates_directories() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_a = base.join("repoA");
+        let repo_b = base.join("repoB");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        let sessions_root = base.join("sessions");
+
+        let store_a = SessionStore::for_project(sessions_root.clone(), &repo_a).unwrap();
+        let store_b = SessionStore::for_project(sessions_root.clone(), &repo_b).unwrap();
+        assert!(store_a.is_project_scoped());
+        assert_ne!(store_a.dir(), store_b.dir());
+
+        store_a
+            .save(&mk_file("a1", &repo_a, "2026-07-06T10:00:00Z"))
+            .unwrap();
+        store_b
+            .save(&mk_file("b1", &repo_b, "2026-07-06T11:00:00Z"))
+            .unwrap();
+
+        let ids = |store: &SessionStore| -> Vec<String> {
+            store
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|m| m.session_id)
+                .collect()
+        };
+        assert_eq!(ids(&store_a), vec!["a1"]);
+        assert_eq!(ids(&store_b), vec!["b1"]);
+        // 全库视角两者都在
+        let mut all = ids(&store_a);
+        all.extend(ids(&store_b));
+        all.sort();
+        assert_eq!(all, vec!["a1", "b1"]);
+        assert_eq!(store_a.list_all().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 升级后没跑 `storage migrate` 时，根目录下平铺的旧会话必须仍然可见——
+    /// 否则 `/resume` 突然变空，用户会以为历史全丢了。
+    #[test]
+    fn project_scoped_list_still_sees_legacy_flat_files() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_a = base.join("repoA");
+        let repo_b = base.join("repoB");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        let sessions_root = base.join("sessions");
+
+        // 旧布局：直接写在根目录
+        let flat = SessionStore::new(sessions_root.clone()).unwrap();
+        flat.save(&mk_file("old-a", &repo_a, "2026-07-06T09:00:00Z"))
+            .unwrap();
+        flat.save(&mk_file("old-b", &repo_b, "2026-07-06T08:00:00Z"))
+            .unwrap();
+
+        let store_a = SessionStore::for_project(sessions_root.clone(), &repo_a).unwrap();
+        let listed: Vec<String> = store_a
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.session_id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec!["old-a"],
+            "旧平铺文件里只有属于 repoA 的那条应该出现"
+        );
+
+        // 新会话写进项目子目录，两者在列表里共存
+        store_a
+            .save(&mk_file("new-a", &repo_a, "2026-07-07T09:00:00Z"))
+            .unwrap();
+        let listed: Vec<String> = store_a
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.session_id)
+            .collect();
+        assert_eq!(listed, vec!["new-a", "old-a"]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--resume` 一个属于别的仓库的会话时，必须写回**它原来的**项目目录，
+    /// 不能因为当前 `cwd` 是另一个仓库就搬过去。
+    #[test]
+    fn resume_from_other_project_writes_back_to_original_directory() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo_a = base.join("repoA");
+        let repo_b = base.join("repoB");
+        std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+        let sessions_root = base.join("sessions");
+
+        let store_a = SessionStore::for_project(sessions_root.clone(), &repo_a).unwrap();
+        store_a
+            .save(&mk_file("a1", &repo_a, "2026-07-06T10:00:00Z"))
+            .unwrap();
+
+        // 在 repoB 里跑，但操作的是 repoA 的会话
+        let store_b = SessionStore::for_project(sessions_root.clone(), &repo_b).unwrap();
+        let mut file = store_b.load("a1").unwrap();
+        file.title = "edited from repoB".to_string();
+        store_b.save(&file).unwrap();
+
+        // 写回原处：repoA 目录里有它，repoB 目录里没有
+        assert!(store_a.dir().join("a1.json").exists());
+        assert!(!store_b.dir().join("a1.json").exists());
+        assert_eq!(store_a.load("a1").unwrap().title, "edited from repoB");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 单目录模式（测试与 ACP 用）必须保持原样：`root == dir`，不额外套一层。
+    #[test]
+    fn single_directory_mode_has_no_extra_nesting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        assert!(!store.is_project_scoped());
+        assert_eq!(store.dir(), store.root());
+        assert!(store.project_dirs().unwrap().is_empty());
+    }
+
+    /// `locate_in_root` 给只带 session id 的只读命令用：跨项目找到即可。
+    #[test]
+    fn locate_in_root_finds_a_session_in_any_project_directory() {
+        let base = std::env::temp_dir().join(format!("wyj-sess-locate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let sessions_root = base.join("sessions");
+
+        let store = SessionStore::for_project(sessions_root.clone(), &repo).unwrap();
+        store
+            .save(&mk_file("target", &repo, "2026-07-06T10:00:00Z"))
+            .unwrap();
+
+        let found = SessionStore::locate_in_root(&sessions_root, "target");
+        assert_eq!(found, store.dir());
+        // 找不到时回退根目录，而不是凭空构造路径
+        assert_eq!(
+            SessionStore::locate_in_root(&sessions_root, "missing"),
+            sessions_root
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

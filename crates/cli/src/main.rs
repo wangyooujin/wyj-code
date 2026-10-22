@@ -428,7 +428,9 @@ fn is_high_effort(effort: &str) -> bool {
 fn run_subagent_trace_cmd(session_id: &str, sub_id: Option<u64>, json: bool) -> Result<()> {
     use wyj_tools::trace::{list_trace_ids, read_trace_by_process, trace_file};
 
-    let sessions_dir = wyj_config::config_dir()?.join("sessions");
+    // trace 与 handoff 跟会话同目录，所以先跨项目定位会话落在哪个项目目录。
+    let sessions_root = wyj_config::layout::sessions_root(&wyj_config::config_dir()?);
+    let sessions_dir = SessionStore::locate_in_root(&sessions_root, session_id);
 
     match sub_id {
         None => {
@@ -1558,11 +1560,12 @@ async fn main() -> Result<()> {
         &plugin_runtime,
     ));
 
+    // 索引目录按**项目根**分组：此前传的是 `cwd`，从仓库子目录启动就会指向
+    // 另一个索引目录，同一项目两套索引各自演化。
     let base_code_index: Arc<dyn wyj_core::CodeIndex> = Arc::new(wyj_core::ProjectCodeIndex::new(
         &cwd,
-        config_base
-            .join("indexes")
-            .join(wyj_core::project_id(&cwd))
+        wyj_config::layout::indexes_root(&config_base)
+            .join(wyj_core::project_key(&cwd))
             .join("lexical-v1.json"),
     )?);
     let code_index: Arc<dyn wyj_core::CodeIndex> =
@@ -1572,8 +1575,19 @@ async fn main() -> Result<()> {
             plugin_processes.clone(),
         ));
 
-    let history_store = HistoryStore::new(config_base.join("history")).ok();
-    let session_store = SessionStore::new(config_base.join("sessions")).ok();
+    // 运行状态的落盘范围。`storage.scope = "project"` 时会话与历史跟着工作
+    // 副本走（`<git-root>/.wyj-code/local/`），选它会先确保该目录被 git 忽略——
+    // transcript 里是工具输出原文，漏一次 `git add -A` 就是永久泄漏。
+    let (sessions_root, history_root, storage_scope) =
+        wyj_config::layout::resolve_runtime_roots(&cfg.storage.scope, &config_base, &cwd);
+    if storage_scope == wyj_config::layout::StorageScope::Project {
+        tracing::debug!(
+            "storage.scope = project，会话落在 {}",
+            sessions_root.display()
+        );
+    }
+    let history_store = HistoryStore::for_project(history_root, &cwd).ok();
+    let session_store = SessionStore::for_project(sessions_root, &cwd).ok();
 
     // 根据 --continue/-c 或 --resume 恢复历史会话。
     // `session_conflict` 记下「该会话正被另一个实例使用」，交给 TUI 在启动横幅之后
@@ -1703,6 +1717,9 @@ async fn main() -> Result<()> {
     let cas_gc_enabled = cfg.storage.cas_gc_on_start && cfg.storage.cas_total_bytes > 0;
     let cas_gc_budget = cfg.storage.cas_total_bytes;
     let cas_for_gc = workspace_cas.clone();
+    // 会话 TTL 与陈旧锁回收：两者都是「文件数量」无界增长，与 CAS 的「字节数」
+    // 无界增长是两类问题，但回收时机相同（启动一次，后台跑）。
+    let retention_cfg = cfg.storage.clone();
     // 磁盘占用提示同样放后台：`disk_usage::scan` 递归 7 棵子树，也是同步全量 IO。
     let disk_warn_bytes = cfg.storage.disk_usage_warn_bytes;
     let config_base_for_gc = config_base.clone();
@@ -1724,6 +1741,19 @@ async fn main() -> Result<()> {
                         Err(error) => tracing::warn!("CAS gc 失败: {error}"),
                     }
                 }
+            }
+            // 会话 TTL + 陈旧锁：必须在 CAS gc **之后**，因为 gc 会释放一批
+            // blob 对应的锁文件。顺序反过来会让这一轮多扫一遍刚变成陈旧的锁。
+            match wyj_core::retention::run(&config_base_for_gc, &retention_cfg, false) {
+                Ok(stats) if !stats.is_empty() => tracing::debug!(
+                    "保留策略: 删除 {} 个会话 / {} 字节，{} 个陈旧锁 / {} 字节",
+                    stats.sessions_removed,
+                    stats.session_bytes_freed,
+                    stats.locks_removed,
+                    stats.lock_bytes_freed
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!("保留策略执行失败: {error}"),
             }
             wyj_core::disk_usage::warn_if_over_budget(&config_base_for_gc, disk_warn_bytes);
         })?;
@@ -2060,12 +2090,19 @@ async fn main() -> Result<()> {
     let agent_defs = Arc::new(wyj_core::load_agent_defs(&cwd, &plugin_agent_paths));
     let shared_agent_defs: wyj_tools::SharedAgentDefinitions =
         Arc::new(std::sync::RwLock::new((*agent_defs).clone()));
+    // 子 Agent 旁路文件（trace / handoff / 消息日志）与主会话**同目录**。
+    // 会话已按项目分目录，这里必须问 store 而不是自己拼 `sessions/`——
+    // 否则 trace 会平铺到根目录，`subagent-trace` 跨项目定位时找不到它。
+    let sessions_dir = session_store_arc
+        .as_ref()
+        .map(|store| store.dir().to_path_buf())
+        .unwrap_or_else(|| wyj_config::layout::sessions_root(&config_base));
     // 子 Agent 执行轨迹落盘（`SubAgentCfg::trace_enabled`，默认开启）：与
     // TUI/headless 共用同一个 Hub，`emit()` 集中接入，两端自动获得持久化能力。
     let sub_agent_hub = Arc::new(
         if cfg.subagent.trace_enabled {
             wyj_tools::SubAgentHub::new().with_trace(
-                config_base.join("sessions"),
+                sessions_dir.clone(),
                 session_id.clone(),
                 cfg.subagent.trace_max_bytes_per_agent,
             )
@@ -2080,7 +2117,7 @@ async fn main() -> Result<()> {
     // 没有理由一个开一个关。
     let sub_agent_message_log = cfg.subagent.trace_enabled.then(|| {
         Arc::new(wyj_tools::message_log::MessageLogWriter::spawn(
-            config_base.join("sessions"),
+            sessions_dir.clone(),
             session_id.clone(),
             wyj_tools::message_log::DEFAULT_MAX_BYTES_PER_AGENT,
         ))
@@ -2097,6 +2134,7 @@ async fn main() -> Result<()> {
         memory_v3_store.clone(),
         evolution_store.clone(),
         workspace_cas.clone(),
+        session_store_arc.clone(),
     );
     // 工具注册表在此**一次性**构造完毕：首建与 `/model` 重建共用
     // `assembly::build_tool_registry`，保证两条路径看到的工具集合逐字一致。
@@ -2116,7 +2154,7 @@ async fn main() -> Result<()> {
         sub_agent_hub: sub_agent_hub.clone(),
         sub_agent_factory: sub_agent_factory.clone(),
         session_id: session_id.clone(),
-        sessions_dir: config_base.join("sessions"),
+        sessions_dir: sessions_dir.clone(),
         message_log: sub_agent_message_log.clone(),
         mcp_tools: mcp_tools.clone(),
     };
@@ -2660,9 +2698,10 @@ async fn main() -> Result<()> {
                     memory_v3_for_rebuild.clone(),
                     evolution_store_for_rebuild.clone(),
                     workspace_cas_for_rebuild.clone(),
+                    store_for_rebuild.clone(),
                 ),
                 session_id: sid_for_rebuild.clone(),
-                sessions_dir: config_base.join("sessions"),
+                sessions_dir: sessions_dir.clone(),
                 message_log: message_log_for_rebuild.clone(),
                 mcp_tools: mcp_tools_for_rebuild.clone(),
             },
@@ -3096,6 +3135,7 @@ fn register_app_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Co
 /// 构建子 Agent 工厂：按 agent 定义解析 Profile 与模型，注册按定义过滤后的工具集。
 /// 模型解析优先级：定义的 model 字段（Profile 名）→ [subagent].explore_profile（仅
 /// Explore 类型）→ [subagent].default_profile → 主 Agent 当前激活分组的 Normal 模型。
+#[allow(clippy::too_many_arguments)]
 fn make_sub_agent_factory(
     cfg: Config,
     claude_md: Arc<wyj_core::ClaudeMdLoader>,
@@ -3104,6 +3144,10 @@ fn make_sub_agent_factory(
     memory_v3: Option<Arc<wyj_core::MemoryV3Store>>,
     evolution: Option<Arc<wyj_core::EvolutionStore>>,
     workspace_cas: Option<Arc<wyj_core::workspace_cas::WorkspaceCas>>,
+    // 主会话的 `SessionStore`。子 Agent 的 Memory 工具靠它做跨会话检索；
+    // 直接传 store 而不是「根目录 + cwd」是为了让子 Agent 与主会话看到
+    // **同一个**项目边界，而不是各自再算一遍项目键。
+    sessions: Option<Arc<wyj_core::SessionStore>>,
 ) -> wyj_tools::AgentFactory {
     Arc::new(move |def: &wyj_core::AgentDefinition| {
         let routing_role = if def.name.eq_ignore_ascii_case("explore") {
@@ -3213,10 +3257,8 @@ fn make_sub_agent_factory(
             let mut tool = MemoryTool::new(memory.clone());
             // 子 Agent（尤其 Explore）比主 Agent 更常需要「这个仓库以前怎么做的」，
             // 而它拿不到主会话的 transcript——跨会话检索对它是唯一的历史入口。
-            if let Ok(sessions) =
-                wyj_core::SessionStore::new(wyj_config::config_dir()?.join("sessions"))
-            {
-                tool = tool.with_sessions(Arc::new(sessions));
+            if let Some(sessions) = &sessions {
+                tool = tool.with_sessions(sessions.clone());
             }
             sub_registry.register_arc(Arc::new(tool));
             // 子 Agent 同样需要召回：清理发生在**主**会话历史里，子 Agent
@@ -3388,7 +3430,17 @@ fn parse_rewind_scope(scope: &str) -> wyj_core::RewindScope {
 }
 
 fn run_session_command(command: SessionCommand) -> Result<()> {
-    let sessions = SessionStore::new(wyj_config::config_dir()?.join("sessions"))?;
+    // `session` 子命令的每个动作都显式带 session id，进程没有项目上下文可依赖，
+    // 因此先跨项目定位该会话落在哪个项目目录，再在**那个目录**上开 store。
+    // 直接用根目录开 store 会让 checkpoint 平铺到 `sessions/` 根下。
+    let sessions_root = wyj_config::layout::sessions_root(&wyj_config::config_dir()?);
+    let first_id = match &command {
+        SessionCommand::Checkpoint { session_id, .. }
+        | SessionCommand::Checkpoints { session_id }
+        | SessionCommand::Rewind { session_id, .. }
+        | SessionCommand::Branch { session_id, .. } => session_id.clone(),
+    };
+    let sessions = SessionStore::new(SessionStore::locate_in_root(&sessions_root, &first_id))?;
     match command {
         SessionCommand::Checkpoint { session_id, name } => {
             let file = sessions.load(&session_id)?;

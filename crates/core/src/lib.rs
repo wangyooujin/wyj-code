@@ -27,6 +27,7 @@ pub mod permission;
 pub mod project;
 pub mod prompt_fingerprint;
 pub mod prompts;
+pub mod retention;
 pub mod secret;
 pub mod serialize;
 pub mod session;
