@@ -153,6 +153,13 @@ impl BashSessionManager {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // 与前台 Bash 同源：项目级 skill 的指纹覆盖 `skills/` 整棵树，脚本必须
+        // 有个不参与指纹的落点，否则跑一次流水线就把刚批准的信任作废。**前台
+        // 有、转后台没有**会让"同一个 skill 换个跑法行为就变"，因此两边共用
+        // `bash::project_skill_data_root`（唯一实现，不在这里另拼路径）。
+        if let Ok(dir) = crate::bash::project_skill_data_root(cwd) {
+            cmd.env(crate::bash::SKILL_DATA_ENV, dir);
+        }
         #[cfg(unix)]
         cmd.process_group(0);
 

@@ -127,16 +127,40 @@ fn run_hooks(cwd: &Path) -> Result<()> {
 }
 
 fn run_skills(cwd: &Path) -> Result<()> {
+    use wyj_store::SkillTrustStatus;
+
     let disabled = wyj_store::disabled_skill_names(cwd);
     let infos = wyj_commands::skill::project_skill_infos(cwd, &disabled);
+
+    match wyj_store::skill_trust_status(cwd) {
+        SkillTrustStatus::NoProjectSkills | SkillTrustStatus::Trusted => {
+            if infos.is_empty() {
+                println!(
+                    "当前项目没有需要批准的项目级 skill（.wyj-code/skills/ 为空或全部被禁用）。"
+                );
+            } else {
+                println!("当前项目级 skill 已批准过，且内容未变化。");
+            }
+            return Ok(());
+        }
+        SkillTrustStatus::NeverApproved | SkillTrustStatus::Changed => {}
+    }
 
     if infos.is_empty() {
         println!("当前项目没有需要批准的项目级 skill（.wyj-code/skills/ 为空或全部被禁用）。");
         return Ok(());
     }
-    if wyj_store::skill_trust::project_skills_trusted(cwd) {
-        println!("当前项目级 skill 已批准过，且内容未变化。");
-        return Ok(());
+    if wyj_store::skill_trust_status(cwd) == SkillTrustStatus::Changed {
+        let changed = wyj_store::changed_since_approval(cwd);
+        if !changed.is_empty() {
+            println!("上次批准后以下条目发生了变化（git pull 或 skill 自身的运行产物）：");
+            for item in changed.iter().take(20) {
+                println!("  ~ {item}");
+            }
+            if changed.len() > 20 {
+                println!("  … 另有 {} 个条目", changed.len() - 20);
+            }
+        }
     }
 
     println!("以下项目级 skill 尚未批准（内容来自本仓库，作者为仓库提交者）：");

@@ -333,6 +333,10 @@ pub struct Agent {
     lazy_tool_state: Option<crate::tool_search::LazyToolState>,
     max_tokens: u32,
     max_turns: usize,
+    /// 强制思考端点的单回合熔断轮数（`[agent].forced_thinking_max_turns`）。
+    /// 与 `max_turns` 分开是因为两者判据不同：这个只作用于「思考关不掉」的
+    /// 端点，见 [`helpers::max_turns_for_model`]。
+    forced_thinking_max_turns: usize,
     /// 模型最大上下文窗口（token 数），用于触发自动压缩
     context_window: u32,
     /// 跨会话记忆存储（可选）
@@ -566,6 +570,7 @@ impl Agent {
             max_tokens: 8192,
             // 真正的成本/时长上限由每轮 token 预算触发的自动压缩承担；这里仅防止模型死循环
             max_turns: 200,
+            forced_thinking_max_turns: 64,
             context_window: 200_000,
             memory: None,
             aux_provider: None,
@@ -831,11 +836,22 @@ impl Agent {
         self
     }
 
+    /// 设置强制思考端点的单回合熔断轮数（默认 64）。
+    ///
+    /// 与 [`Self::with_max_turns`] 的区别只在判据：本值只在
+    /// [`helpers::max_turns_for_model`] 判定「思考关不掉」时生效。写死 32 的
+    /// 代价见该函数的文档。
+    pub fn with_forced_thinking_max_turns(mut self, n: usize) -> Self {
+        self.forced_thinking_max_turns = n;
+        self
+    }
+
     /// 根据当前路由的模型标识推导实际生效的最大推理轮数。
     ///
     /// 判据见 [`helpers::max_turns_for_model`]：模型名命中 `reasoner` / `-r1`，
     /// 或该端点**思考根本关不掉**（如 MiniMax M2.x/M3.1、Qwen `-thinking`），
-    /// 一律压到 32 轮；其余保留 `self.max_turns`（默认 200）。
+    /// 一律压到 `forced_thinking_max_turns`（默认 64）；其余保留
+    /// `self.max_turns`（默认 200）。
     ///
     /// 必须带上 vendor 与 wire：`ThinkingSpec::for_vendor` 的查表键就是这三个
     /// 维度，只传 model 会让 Anthropic 线的 MiniMax 落到 OpenAI 线的规格上，
@@ -843,6 +859,7 @@ impl Agent {
     fn max_turns_for_route(&self, model: &str) -> usize {
         max_turns_for_model(
             self.max_turns,
+            self.forced_thinking_max_turns,
             &self.route_vendor,
             &self.route_wire_protocol,
             model,
@@ -1489,6 +1506,10 @@ impl Agent {
         if let Some(state) = &self.lazy_tool_state {
             state.begin_task_turn();
         }
+        // 回合级的「被轮数截断」标记从零开始。它是单回合事实：上一回合撞顶
+        // 不代表这一回合也会，残留 true 会让 UI 在本回合正常完成时仍拒绝
+        // 补全 todo 状态。
+        session.turn_truncated = false;
 
         // 本轮权限授权从零开始。放在这里而不是工具轮循环里：进入本函数的
         // 每一个调用点都是「一次用户提交」（TUI 每次 Enter / 子 Agent 每个任务），
@@ -1610,8 +1631,9 @@ impl Agent {
         // 思考关不掉的模型（DeepSeek `deepseek-reasoner`、MiniMax M2.x/M3.1、
         // Qwen `-thinking` 等）在工具循环中可能陷入 reasoning-token 黑洞：每轮
         // thinking 块会全量计入 output tokens，但 reasoning 不一定推进工具调用
-        // 决策。给它们一个保守的 32 轮硬上限，普通模型保留 self.max_turns
-        // （默认 200）兜底。判据见 `helpers::max_turns_for_model`。
+        // 决策。给它们一个保守的熔断上限（`[agent].forced_thinking_max_turns`，
+        // 默认 64），普通模型保留 self.max_turns（默认 200）兜底。
+        // 判据见 `helpers::max_turns_for_model`。
         let max_turns = self.max_turns_for_route(&self.route_model);
 
         // 触顶前的**收尾宽限**。触顶不是「任务失败」，而是「这一轮该交付了」：
@@ -1678,6 +1700,10 @@ impl Agent {
             // 就落到上面的硬中止——那才是真正该报错的情形。
             if !wrap_up_sent && turn >= wrap_up_at {
                 wrap_up_sent = true;
+                // 记到 session 上：上层（TUI）据此区分「正常交付」与「预算
+                // 用尽被迫交付」——只有前者才该把遗留的 in_progress todo
+                // 补成 completed。见 `Session::turn_truncated` 的注释。
+                session.turn_truncated = true;
                 let notice = format!(
                     "<turn-budget-reminder remaining=\"{}\">\n\
                      You have used {turn} of {max_turns} tool-loop turns for this request, \

@@ -161,6 +161,15 @@ pub fn project_meta_path(root: &Path, project_key: &str) -> PathBuf {
     project_trust_dir(root, project_key).join("meta.json")
 }
 
+/// 项目级 skill 的运行产物目录：`<root>/projects/<project_key>/skill-data`。
+///
+/// 与 [`project_trust_dir`] 同侧、**在仓库内容控制不到的位置**。skill 的指纹覆盖
+/// `<git-root>/.wyj-code/skills/` 整棵树，任何写回那棵树的产物都会让刚批准的指纹
+/// 失效；把可写数据放这里，既不动指纹也不会被下一次 `git pull` 覆盖。
+pub fn project_skill_data_root(root: &Path, project_key: &str) -> PathBuf {
+    project_trust_dir(root, project_key).join("skill-data")
+}
+
 /// 运行状态的落盘范围。
 ///
 /// 默认 [`StorageScope::Home`]：状态集中在 `<data_root>/` 下按项目分目录。

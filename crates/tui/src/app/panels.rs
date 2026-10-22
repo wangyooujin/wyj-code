@@ -22,6 +22,21 @@ impl AppState {
             .collect()
     }
 
+    /// 清单里所有**未完成**项（pending + in_progress），按 id 与内容返回。
+    ///
+    /// 唯一的消费者是自动续跑：被轮数预算截断的回合结束后，主循环据此生成
+    /// 续跑指令（见 `prompts::todo_resume_notice`）。**必须带上内容而不只是
+    /// 数量**——只报数量时模型往往重写整份清单，白烧一轮。
+    pub(super) fn unfinished_todos(&self) -> Vec<(String, String)> {
+        self.current_todos
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|t| t.status != TodoStatus::Completed)
+            .map(|t| (t.id.clone(), t.content.clone()))
+            .collect()
+    }
+
     pub(super) fn link_message_to_active_todos(&mut self, message_id: u64) {
         for todo_id in self.active_todo_ids() {
             let follow_detail_tail = self.ui_focus == UiFocus::TodoDetail

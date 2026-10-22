@@ -1039,6 +1039,39 @@ fn configured_route_names(cfg: &Config, role: RoutingRole) -> Vec<String> {
     names
 }
 
+/// 无交互通道时（`-p` / `--headless`）的项目级 skill 未信任提示。
+///
+/// 三处调用点（`-p` 单次、REPL 启动、TUI 尚无）此前各自复制了一遍「取 infos、
+/// 判 `!pending.is_empty() && !project_skills_trusted`、拼名字」的逻辑。复制的
+/// 后果是 TUI 那边漏了第二半条件（只看条目非空就弹窗），于是已批准的项目每次
+/// 启动都被追问。统一到这里，判定与提示都不再有第二份。
+///
+/// **绝不**做 stdin 阻塞式确认：`-p` 常被脚本/cron 无 TTY 调用，阻塞会挂起。
+fn warn_untrusted_project_skills(cwd: &std::path::Path) {
+    use wyj_store::SkillTrustStatus;
+    let status = wyj_store::skill_trust_status(cwd);
+    if !status.needs_prompt() {
+        return;
+    }
+    let disabled = wyj_store::disabled_skill_names(cwd);
+    let pending = wyj_commands::skill::project_skill_infos(cwd, &disabled);
+    if pending.is_empty() {
+        return;
+    }
+    let mut names: Vec<_> = pending.iter().map(|i| i.name.clone()).collect();
+    names.sort();
+    match status {
+        SkillTrustStatus::Changed => eprintln!(
+            "[以下项目级 skill 的内容在批准后发生了变化，本次未加载: {}；确认无误后运行 `wyj-code trust-skills` 重新批准]",
+            names.join(", ")
+        ),
+        _ => eprintln!(
+            "[以下项目级 skill 尚未信任批准，本次未加载: {}；运行 `wyj-code trust-skills` 批准]",
+            names.join(", ")
+        ),
+    }
+}
+
 /// 采集本会话要注入模型上下文的 skill 名单。
 ///
 /// 直接调 `load_skills` 而**不是**从 `CommandRegistry::list()` 里筛
@@ -2231,18 +2264,7 @@ async fn main() -> Result<()> {
         // 先在 TUI 里批准一次，或运行 `wyj-code trust-mcp` 批准。
         // 项目级 skill 未信任：同样静默排除并提示一次。**绝不**做 stdin 阻塞式
         // 确认——`-p` 常被脚本/cron 无 TTY 调用，阻塞会挂起。
-        {
-            let disabled = wyj_store::disabled_skill_names(&cwd);
-            let pending = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
-            if !pending.is_empty() && !wyj_store::skill_trust::project_skills_trusted(&cwd) {
-                let mut names: Vec<_> = pending.iter().map(|i| i.name.clone()).collect();
-                names.sort();
-                eprintln!(
-                    "[以下项目级 skill 尚未信任批准，本次未加载: {}；运行 `wyj-code trust-skills` 批准]",
-                    names.join(", ")
-                );
-            }
-        }
+        warn_untrusted_project_skills(&cwd);
         let (mut effective_mcp_servers, untrusted_servers) =
             wyj_store::mcp_install::effective_mcp_servers_trust_split(&cfg, &cwd);
         if !untrusted_servers.is_empty() {
@@ -2346,6 +2368,7 @@ async fn main() -> Result<()> {
         .with_max_tokens(cfg.active_profile().max_tokens)
         .with_context_window(cfg.active_profile().context_window)
         .with_max_turns(cfg.agent.max_turns)
+        .with_forced_thinking_max_turns(cfg.agent.forced_thinking_max_turns)
         .with_model_capabilities(model_capabilities)
         .with_route_identity(
             cfg.active_profile().name.clone(),
@@ -2675,6 +2698,7 @@ async fn main() -> Result<()> {
             max_tokens: cfg.active_profile().max_tokens,
             context_window: cfg.active_profile().context_window,
             max_turns: cfg.agent.max_turns,
+            forced_thinking_max_turns: cfg.agent.forced_thinking_max_turns,
             capabilities: model_capabilities,
             route_profile: cfg.active_profile().name.clone(),
             route_vendor: model_resolution.identity.vendor.clone(),
@@ -3267,6 +3291,7 @@ fn make_sub_agent_factory(
             .with_max_tokens(p.max_tokens)
             .with_context_window(p.context_window)
             .with_max_turns(cfg.agent.max_turns)
+            .with_forced_thinking_max_turns(cfg.agent.forced_thinking_max_turns)
             .with_model_capabilities(model_capabilities)
             .with_route_identity(
                 p.name.clone(),
@@ -3748,18 +3773,7 @@ async fn repl(
     // 与 `-p` 单次模式一致：未信任的项目级 MCP server 只提示一次，不在每轮
     // reconcile 时重复刷屏（`effective_mcp_servers_for_runtime` 本身已经在
     // 每轮静默排除它们，这里只是让用户知道"为什么少了几个工具"）。
-    {
-        let disabled = wyj_store::disabled_skill_names(&cwd);
-        let pending = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
-        if !pending.is_empty() && !wyj_store::skill_trust::project_skills_trusted(&cwd) {
-            let mut names: Vec<_> = pending.iter().map(|i| i.name.clone()).collect();
-            names.sort();
-            eprintln!(
-                "[以下项目级 skill 尚未信任批准，本次未加载: {}；运行 `wyj-code trust-skills` 批准]",
-                names.join(", ")
-            );
-        }
-    }
+    warn_untrusted_project_skills(&cwd);
     if let wyj_store::TrustStatus::Pending(servers) = wyj_store::project_trust::trust_status(&cwd) {
         let mut names: Vec<_> = servers.iter().map(|s| s.name.clone()).collect();
         names.sort();

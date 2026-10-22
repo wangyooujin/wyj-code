@@ -54,7 +54,7 @@ pub(super) fn downgrade_reasoning_effort(
 
 /// 思考关不掉的模型在工具循环中容易陷入 reasoning-token 黑洞：每轮
 /// reasoning 块计入 output tokens 但不一定推进工具调用决策。给它们一个
-/// 保守的 32 轮硬上限，普通模型保留调用方传入的默认值。
+/// 保守的硬上限，普通模型保留调用方传入的默认值。
 ///
 /// **判据有两层，缺一不可**：
 ///
@@ -75,21 +75,27 @@ pub(super) fn downgrade_reasoning_effort(
 /// 「这个端点能不能关思考」的唯一真值来源（thinking adapter 与 catalog 都
 /// 只认它），在这里另写一份必然漂移——加一个 vendor 就要改两处。
 ///
+/// 熔断值本身**不再写死**（v0.3.19）：`forced_max_turns` 由
+/// `[agent].forced_thinking_max_turns` 传入。写死 32 的后果是「一轮一个
+/// 工具调用」的端点在中型任务上必然撞顶——实测连续三个回合都在第 28 轮
+/// （`32 - TURN_LIMIT_GRACE`）被关闸，任务被切成好几段，用户每次都得
+/// 手打「继续」。死循环保护由 `loop_guard` 独立承担，这个值只是成本闸。
+///
 /// 抽成 free function 以便单测覆盖（不必构造完整 Agent）。
 pub(super) fn max_turns_for_model(
     default_max_turns: usize,
+    forced_max_turns: usize,
     vendor: &str,
     wire: &wyj_config::WireProtocol,
     model: &str,
 ) -> usize {
-    const REASONING_MAX_TURNS: usize = 32;
     let lower = model.to_ascii_lowercase();
     if lower.contains("reasoner") || lower.contains("-r1") {
-        return REASONING_MAX_TURNS;
+        return forced_max_turns;
     }
     let spec = wyj_api::ThinkingSpec::for_vendor(vendor, wire, model);
     if !spec.user_can_disable || spec.ignore_disabled_when_forced {
-        return REASONING_MAX_TURNS;
+        return forced_max_turns;
     }
     default_max_turns
 }

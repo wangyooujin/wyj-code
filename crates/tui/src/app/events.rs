@@ -147,7 +147,7 @@ impl AppState {
                 });
             }
 
-            AgentEvent::TurnDone => {
+            AgentEvent::TurnDone { truncated } => {
                 self.flush_streaming();
                 self.stream_rate.reset();
                 self.is_thinking = false;
@@ -159,22 +159,55 @@ impl AppState {
                 // 先对齐排队镜像再清 injector：那之后就拿不到共享队列了
                 self.reconcile_pending_queue();
                 self.injector = None;
-                // 回合已正常结束（`stop_reason != tool_use`，模型已产出最终回答）：
-                // 任何仍处于 InProgress 的 todo 都视为已完成。否则 UI 会卡在
-                // "[N/N] ⋯ xxx" 这种永远不收口的"进行中"状态（即便 todo_stats
-                // 不再累加耗时，已渲染行的状态字段读不到 Completed 也会显示 ⋯），
-                // 直到下一次 TodoWrite 才有机会刷新——而很多模型会在最后一次回答
-                // 里直接出最终输出，不再调用一次 TodoWrite 把最后一项标 completed，
-                // 于是用户看到"AI 已回完，但任务列表还显示进行中"的割裂感。
-                // 走与 TodoUpdate handler 里 was_in_progress → not_in_progress 同款
-                // started_at → elapsed_secs 收口，统计数字保持连续。
-                if let Some(items) = self.current_todos.as_mut() {
-                    for item in items.iter_mut() {
-                        if item.status == TodoStatus::InProgress {
-                            item.status = TodoStatus::Completed;
-                            if let Some(s) = self.todo_stats.get_mut(&item.id) {
-                                if let Some(start) = s.started_at.take() {
-                                    s.elapsed_secs += start.elapsed().as_secs_f64();
+                if truncated {
+                    // 被推理轮数预算关闸收尾：任务**没有**做完，只是框架把工具
+                    // 关掉了。这里绝不能把 in_progress 补成 completed——那正是
+                    // 「AI 说做完了、面板全打勾，实际还剩一半」的来源。
+                    //
+                    // 改成保留 in_progress 并记下「待续跑」标记，由主循环在
+                    // 空闲帧自动起下一轮（见 `todo_resume_pending`）。用户的
+                    // 观感从「停住等我说继续」变成「这一轮预算用完，自动接上」。
+                    //
+                    // **只有确实还有未完成项才续跑**：模型可能在撞顶那一轮已经
+                    // 把清单全部标成 completed，此时再续一轮就是白白多烧一个
+                    // 完整回合。
+                    let unfinished = self.unfinished_todos();
+                    let over_budget = self.todo_resume_count >= TODO_RESUME_LIMIT;
+                    self.todo_resume_pending = !unfinished.is_empty() && !over_budget;
+                    if !unfinished.is_empty() {
+                        if over_budget {
+                            self.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                                "spinner.todo_resume_exhausted",
+                                &[("count", &unfinished.len().to_string())],
+                            )));
+                        } else {
+                            self.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                                "spinner.todo_budget_resume",
+                                &[("count", &unfinished.len().to_string())],
+                            )));
+                        }
+                    }
+                } else {
+                    // 回合已正常结束（`stop_reason != tool_use`，模型已产出最终
+                    // 回答）：任何仍处于 InProgress 的 todo 都视为已完成。否则
+                    // UI 会卡在 "[N/N] ⋯ xxx" 这种永远不收口的"进行中"状态（即便
+                    // todo_stats 不再累加耗时，已渲染行的状态字段读不到 Completed
+                    // 也会显示 ⋯），直到下一次 TodoWrite 才有机会刷新——而很多
+                    // 模型会在最后一次回答里直接出最终输出，不再调用一次 TodoWrite
+                    // 把最后一项标 completed，于是用户看到"AI 已回完，但任务列表
+                    // 还显示进行中"的割裂感。
+                    //
+                    // 走与 TodoUpdate handler 里 was_in_progress → not_in_progress
+                    // 同款 started_at → elapsed_secs 收口，统计数字保持连续。
+                    self.todo_resume_pending = false;
+                    if let Some(items) = self.current_todos.as_mut() {
+                        for item in items.iter_mut() {
+                            if item.status == TodoStatus::InProgress {
+                                item.status = TodoStatus::Completed;
+                                if let Some(s) = self.todo_stats.get_mut(&item.id) {
+                                    if let Some(start) = s.started_at.take() {
+                                        s.elapsed_secs += start.elapsed().as_secs_f64();
+                                    }
                                 }
                             }
                         }

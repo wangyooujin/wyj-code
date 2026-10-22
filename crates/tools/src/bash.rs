@@ -10,6 +10,29 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use wyj_api::types::ToolDefinition;
 use wyj_core::tool::{Tool, ToolCallMeta, ToolContext, ToolOutputChunk, ToolResult};
 
+/// 项目级「可写产物根」：`<data_root>/projects/<key>/skill-data`。
+///
+/// 导出的环境变量名是 [`SKILL_DATA_ENV`]。**目录不在这里创建**——没用到它的
+/// 命令不该在磁盘上多出一层空目录；需要写的脚本自己 `mkdir -p`。
+///
+/// 前台与后台 shell 共用同一个实现（`bash_session::spawn_prepared` 也调它）：
+/// 两处各写一份的话，症状是「前台跑有产物根、转后台就没了」，而 skill 脚本
+/// 用哪种方式跑由模型决定，用户根本无从预期。
+pub(crate) fn project_skill_data_root(cwd: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let key = wyj_core::project_key(cwd);
+    Ok(wyj_config::layout::project_skill_data_root(
+        &wyj_config::config_dir()?,
+        &key,
+    ))
+}
+
+/// Bash 子进程里指向 [`project_skill_data_root`] 的环境变量名。
+///
+/// skill 脚本应把下载物 / 缓存 / 中间文件写到这里，**而不是写回自己的
+/// `.wyj-code/skills/<name>/`**：那棵树整体参与信任指纹，写一次就会让刚批准的
+/// 信任失效，下次启动又被追问一遍。
+pub(crate) const SKILL_DATA_ENV: &str = "WYJ_CODE_SKILL_DATA";
+
 const MAX_OUTPUT: usize = 30_000; // 输出截断阈值（字符）
 const TIMEOUT_SECS: u64 = 120;
 
@@ -297,11 +320,20 @@ impl BashTool {
             .current_dir(ctx.cwd())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // 工具 future 被 abort（ESC 中断 / 心跳看门狗）时，tokio 默认**不杀**
-            // 子进程：bash 会继续跑到自然结束。`kill_on_drop` 至少保证 bash 本体
-            // 死掉，进程组由下面的 `ProcessGroupGuard` 兜底。
-            .kill_on_drop(true);
+            .stderr(std::process::Stdio::piped());
+        // 项目级「可写产物根」：`<data_root>/projects/<key>/skill-data`。
+        //
+        // 存在的理由只有一个——项目级 skill 的指纹覆盖 `skills/` 整棵树（安全
+        // 不变式），所以**任何写回自己目录的运行产物都会让刚批准的信任失效**。
+        // 让脚本有个受支持的落点，用户才有办法摆脱"跑一次流水线、重新批准一次"
+        // 的死循环。目录**不主动创建**：没用到它的命令不该多出目录。
+        if let Ok(dir) = project_skill_data_root(ctx.cwd()) {
+            command.env(SKILL_DATA_ENV, dir);
+        }
+        // 工具 future 被 abort（ESC 中断 / 心跳看门狗）时，tokio 默认**不杀**
+        // 子进程：bash 会继续跑到自然结束。`kill_on_drop` 至少保证 bash 本体
+        // 死掉，进程组由下面的 `ProcessGroupGuard` 兜底。
+        command.kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
 
@@ -727,6 +759,72 @@ mod tests {
             .unwrap();
         assert!(!result.is_error);
         assert_eq!(result.content, "plain");
+    }
+
+    /// 前台 Bash 必须把产物根暴露给子进程。
+    ///
+    /// 项目级 skill 的指纹覆盖 `skills/` 整棵树，脚本若把下载物写回自己目录，
+    /// 刚批准的信任立刻失效、下次启动又被追问。这条环境变量是给脚本的**受支持
+    /// 落点**；它必须真的传进子进程，否则文档里写的出路等于不存在。
+    #[tokio::test]
+    async fn foreground_bash_exposes_skill_data_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = TestContext::plain(dir.path().to_path_buf());
+        let result = BashTool
+            .run(
+                serde_json::json!({"command": format!("printf %s \"${SKILL_DATA_ENV}\"")}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            !result.content.trim().is_empty(),
+            "子进程必须拿到 {SKILL_DATA_ENV}，否则 skill 产物没有受支持的落点"
+        );
+        // 落点必须在仓库内容控制不到的位置，否则写它照样改指纹
+        let expected = project_skill_data_root(dir.path()).unwrap();
+        assert_eq!(result.content.trim(), expected.to_string_lossy());
+        assert!(
+            !expected.starts_with(dir.path()),
+            "产物根不得落在仓库内：{}",
+            expected.display()
+        );
+    }
+
+    /// 后台 shell 也必须拿到产物根。
+    ///
+    /// 前台有、后台没有的后果是「同一个 skill 换个跑法行为就变」——用哪种方式跑
+    /// 由模型决定，用户无从预期。这条钉死两侧同源。
+    #[tokio::test]
+    async fn background_shell_exposes_skill_data_root() {
+        let dir = tempfile::tempdir().unwrap();
+        // 用**独立实例**而不是 `global()`：全局单例与其它用例共享，那边收尾时的
+        // `kill_all()` 会把本用例刚起的任务一起 SIGKILL，`cargo test` 并行跑时
+        // 必然偶发失败（实测如此）。
+        let manager = crate::bash_session::BashSessionManager::default();
+        let id = manager
+            .spawn(&format!("printf %s \"${SKILL_DATA_ENV}\""), dir.path())
+            .unwrap();
+
+        // 后台输出是异步累积的，轮询等它落地。用 `tail`（只读快照、不推进读游标）
+        // 而不是 `read_new`——后者会消耗输出，若将来同一进程里还有人读就丢了。
+        let mut text = String::new();
+        for _ in 0..100 {
+            if let Some(job) = manager.get(&id) {
+                text = job.tail(4096);
+                if text.contains("projects") {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        manager.kill_all();
+
+        assert!(
+            text.contains("projects"),
+            "后台 shell 未拿到 {SKILL_DATA_ENV}，输出: {text:?}"
+        );
     }
 
     #[tokio::test]
