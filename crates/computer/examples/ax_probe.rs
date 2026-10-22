@@ -16,6 +16,7 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 mod probe {
     use anyhow::{Context, Result};
     use objc2_application_services::{
