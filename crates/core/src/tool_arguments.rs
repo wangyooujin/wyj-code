@@ -19,14 +19,38 @@ pub fn simplified_tool_definition(definition: &ToolDefinition) -> ToolDefinition
     simplified
 }
 
+/// schema 对象上可以安全丢弃的注解关键字。
+const SCHEMA_ANNOTATIONS: [&str; 5] = ["$schema", "title", "description", "default", "examples"];
+
+/// 值是「属性名 → schema」字典的关键字。
+///
+/// 这里的**键**是用户/工具自己定义的字段名，不是 JSON Schema 关键字：
+/// `{"properties": {"title": {...}}}` 里的 `title` 是「叫 title 的参数」，
+/// 把它当注解删掉等于把该参数从可调用契约里抹除。此前一律按关键字删除，
+/// 导致 `Memory` 的 `title`、`SubAgent` 的 `description` 在第三方端点上
+/// 从 schema 中消失，模型不知其存在而漏传（表现为「write 需要 title」）。
+const SCHEMA_MAP_KEYWORDS: [&str; 5] = [
+    "properties",
+    "patternProperties",
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+];
+
 fn simplify_schema_value(value: &mut Value) {
     match value {
         Value::Object(object) => {
-            for annotation in ["$schema", "title", "description", "default", "examples"] {
+            for annotation in SCHEMA_ANNOTATIONS {
                 object.remove(annotation);
             }
-            for child in object.values_mut() {
-                simplify_schema_value(child);
+            for (key, child) in object.iter_mut() {
+                if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
+                    simplify_schema_map(child);
+                } else if matches!(key.as_str(), "enum" | "const") {
+                    // 字面量里的对象是**数据**，不是 schema；删键会改写取值。
+                } else {
+                    simplify_schema_value(child);
+                }
             }
         }
         Value::Array(values) => {
@@ -35,6 +59,15 @@ fn simplify_schema_value(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// 只递归字典的值，保留键（键是属性名）。
+fn simplify_schema_map(value: &mut Value) {
+    if let Value::Object(map) = value {
+        for child in map.values_mut() {
+            simplify_schema_value(child);
+        }
     }
 }
 
@@ -824,5 +857,76 @@ mod tests {
             json!(["safe"])
         );
         assert_eq!(simplified.input_schema["additionalProperties"], false);
+    }
+
+    fn simplified(schema: Value) -> Value {
+        simplified_tool_definition(&ToolDefinition {
+            name: "Echo".to_string(),
+            description: String::new(),
+            input_schema: schema,
+            native: None,
+        })
+        .input_schema
+    }
+
+    /// `properties` / `$defs` 这类字典里的**键是属性名**，不是 schema 关键字。
+    /// 曾把 `"title"` 当注解连同整个属性定义删掉，模型因此不知道 `Memory`
+    /// 有 `title` 参数（运行时报「write/supersede 需要 title」）。
+    #[test]
+    fn properties_named_like_annotations_survive_simplification() {
+        let schema = simplified(json!({
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string", "description": "noise"},
+                "default": {"type": "boolean"},
+                "examples": {"type": "array", "items": {"type": "string"}}
+            }
+        }));
+        let properties = &schema["properties"];
+        assert_eq!(properties["title"], json!({"type": "string"}));
+        assert_eq!(properties["description"], json!({"type": "string"}));
+        assert_eq!(properties["default"], json!({"type": "boolean"}));
+        assert_eq!(properties["examples"]["type"], json!("array"));
+        // 属性**内部**的 description 仍属注解，照删。
+        assert!(properties["description"].get("description").is_none());
+    }
+
+    #[test]
+    fn nested_property_maps_keep_their_keys() {
+        let schema = simplified(json!({
+            "type": "object",
+            "properties": {
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"quote": {"type": "string"}, "title": {"type": "string"}}
+                    }
+                }
+            },
+            "$defs": {"Inner": {"type": "object", "properties": {"title": {"type": "string"}}}}
+        }));
+        assert!(schema["properties"]["evidence"]["items"]["properties"]
+            .get("title")
+            .is_some());
+        assert!(schema["$defs"]["Inner"]["properties"]
+            .get("title")
+            .is_some());
+    }
+
+    /// `enum` / `const` 里的对象是**取值**不是 schema，删键会改写模型的合法输入。
+    #[test]
+    fn enum_literals_are_data_and_never_rewritten() {
+        let schema = simplified(json!({
+            "type": "object",
+            "properties": {
+                "mode": {"enum": [{"title": "a", "description": "b"}]}
+            }
+        }));
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            json!([{"title": "a", "description": "b"}])
+        );
     }
 }
