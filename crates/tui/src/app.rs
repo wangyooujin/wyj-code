@@ -1923,6 +1923,10 @@ pub struct AppState {
     /// 项目级 skill 的待批准条目（`.wyj-code/skills/` 随 git clone 落地、
     /// 内容由仓库作者控制）。为 `Some` 时这些 skill 未进注册表也不在模型名单里。
     pub pending_skill_trust: Option<Vec<wyj_commands::skill::ProjectSkillInfo>>,
+    /// 上次批准后变化的条目（相对路径）。仅当 [`Self::pending_skill_trust`] 的成因是
+    /// 「批准过但内容变了」时非空，用于在面板上解释为什么又问一次；从没批准过的
+    /// 项目留空。与 `pending_skill_trust` 同生命周期。
+    pub pending_skill_trust_changes: Vec<String>,
     /// 启动横幅之后弹出的「会话正被另一个实例使用」裁决框。为 `Some` 时会话历史
     /// 已经载入聊天区，但**尚未决定要不要写回**——按键裁决前不产生任何落盘。
     pub session_conflict: Option<SessionConflictDialog>,
@@ -2235,6 +2239,26 @@ pub struct AppState {
     pub sub_agent_detail_follow_tail: bool,
     /// 后台子 Agent 完成时主 Agent 空闲，暂存的 system-reminder，下轮起手注入
     pub pending_bg_reminders: Vec<String>,
+    /// 上一回合被**推理轮数预算**关闸收尾，且任务清单里仍有未完成项。
+    ///
+    /// 主循环在空闲帧看到它为真就自动起一轮续跑（见 `run_tui` 的
+    /// 「清单未完成 → 自动续跑」段），用户不必再手打「继续」。
+    ///
+    /// 与 `pending_bg_reminders` 分开的原因：那个的语义是「后台任务的结果
+    /// 要回灌」，注入的正文本身就是模型需要读的内容；这里注入的是**框架的
+    /// 续跑指令**，正文由 `prompts::todo_resume_notice` 生成，两者混用一个
+    /// 队列会让「后台 shell 跑完了」和「上一轮预算用尽」在 UI 上无法区分。
+    pub todo_resume_pending: bool,
+    /// 本次用户提交内已经自动续跑了几轮。
+    ///
+    /// 防的是「模型每轮都撞顶、清单每轮都不更新」这个形态：没有上限的话，
+    /// `TurnDone { truncated: true }` 每轮都会重新置位 `todo_resume_pending`，
+    /// 主循环于是无限起新回合，静默烧钱且用户看不出它在空转。超过
+    /// [`TODO_RESUME_LIMIT`] 就停下并把「为什么停」写进聊天区。
+    ///
+    /// 用户在 `begin_new_turn`（自己发消息）时重置为 0——「这次提交的预算用
+    /// 完了」不等于「下一个任务也不许续跑」。
+    pub todo_resume_count: u32,
     /// 后台 shell 任务（Vec 保持 spawn 顺序，见 ShellUiState 注释）。
     /// 数据源是 `BashSessionManager::global()`，由主循环每帧 `poll_shells()` 同步。
     pub shells: Vec<ShellUiState>,
@@ -2339,6 +2363,7 @@ impl AppState {
             permission_dialog: None,
             pending_mcp_trust: None,
             pending_skill_trust: None,
+            pending_skill_trust_changes: Vec::new(),
             session_conflict: None,
             read_only_session: false,
             ask_question_dialog: None,
@@ -2453,6 +2478,8 @@ impl AppState {
             sub_agent_detail_max_scroll: 0,
             sub_agent_detail_follow_tail: true,
             pending_bg_reminders: vec![],
+            todo_resume_pending: false,
+            todo_resume_count: 0,
             shells: Vec::new(),
             stale_shells: HashSet::new(),
             selected_shell: None,
@@ -2523,16 +2550,38 @@ impl AppState {
     }
 
     fn begin_new_turn(&mut self) {
-        self.current_todos = None;
-        self.todo_panel_expanded = false;
-        self.selected_todo_id = None;
-        self.todo_detail_open = false;
-        self.todo_detail_scroll = 0;
-        self.todo_detail_max_scroll = 0;
-        self.todo_stats.clear();
-        self.todo_execution_logs.clear();
-        // 用户主动发了消息 = 恢复对自动唤醒的信任（此前可能是 ESC 打断后暂停的）
-        self.auto_wake_paused = false;
+        self.begin_turn_lifecycle(true);
+    }
+
+    /// 自动续跑回合的起手：与 [`Self::begin_new_turn`] 唯一的差别是**保留**
+    /// 任务清单与它的统计。
+    ///
+    /// 为什么不能复用 `begin_new_turn`：它把 `current_todos` 连同 `todo_stats`
+    /// / `todo_execution_logs` 一起清空（语义是「上一轮的任务板对新一轮没有
+    /// 参考价值」）。但续跑恰恰相反——这一轮就是上一轮的延续，清掉之后
+    /// 面板会消失、耗时/token 统计从零重来，用户看到的是「又开了一个新任务」。
+    fn begin_continuation_turn(&mut self) {
+        self.begin_turn_lifecycle(false);
+    }
+
+    fn begin_turn_lifecycle(&mut self, clear_todos: bool) {
+        if clear_todos {
+            self.current_todos = None;
+            self.todo_panel_expanded = false;
+            self.selected_todo_id = None;
+            self.todo_detail_open = false;
+            self.todo_detail_scroll = 0;
+            self.todo_detail_max_scroll = 0;
+            self.todo_stats.clear();
+            self.todo_execution_logs.clear();
+            // 用户主动发了消息 = 恢复对自动唤醒的信任（此前可能是 ESC 打断后暂停的）
+            self.auto_wake_paused = false;
+            // 用户自己开口了，「续跑上一轮」这件事就不再成立：不清的话，那条
+            // 标记会一直挂到用户这一轮结束之后，凭空多起一个续跑回合。
+            // 续跑计数同理——「这次提交的预算用完了」不等于「下一个任务也不许续跑」。
+            self.todo_resume_pending = false;
+            self.todo_resume_count = 0;
+        }
         // 刻意**不**清 shells：后台任务（dev server / watcher / 长跑构建）的
         // 生命周期跨对话轮次，新一轮对话不代表它们结束了。在这儿清会让正在
         // 运行的任务从面板上凭空消失，用户既看不到输出也按不了 k。
@@ -2574,6 +2623,10 @@ impl AppState {
         self.todo_detail_scroll = 0;
         self.todo_stats.clear();
         self.todo_execution_logs.clear();
+        // 切会话 / `/clear` 之后上一轮的「待续跑」不再有任何意义：续跑指令
+        // 引用的清单 id 属于被丢弃的会话，续跑会把死数据灌进新会话。
+        self.todo_resume_pending = false;
+        self.todo_resume_count = 0;
         self.agents_dialog = None;
         self.extensions_dialog = None;
         self.clear_pending_uploads();
@@ -3313,6 +3366,14 @@ async fn build_user_blocks(text: String, attachments: Vec<Attachment>) -> Vec<Co
 /// 可用 `WYJ_CODE_TURN_STALL_SECS` 覆盖（0 = 关闭看门狗）。
 pub const TURN_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
 
+/// 一次用户提交内最多自动续跑几轮（清单未完成 → 自动接上）。
+///
+/// 取 8 的理由：单回合预算默认 64 轮（强制思考端点），一次续跑就是再买
+/// 一份同样大小的预算；8 轮续跑已经把「一个提交」撑到 500+ 次工具调用，
+/// 超过它更可能是**清单本身有问题**（模型反复撞顶、每轮都不更新状态），
+/// 而不是任务真的这么长。到点停下并把原因写进聊天区，比无限自动循环诚实。
+pub const TODO_RESUME_LIMIT: u32 = 8;
+
 /// 实际生效的回合静默阈值（首次读取时解析环境变量，之后固定）。
 pub fn turn_stall_timeout() -> std::time::Duration {
     static STALL: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
@@ -3596,6 +3657,9 @@ fn spawn_agent_turn(
                 "error": turn_result.as_ref().err().map(ToString::to_string),
             }),
         );
+        // 锁内取「本轮是否被轮数预算截断」：放锁后 sess 不可再读，而 UI 要靠
+        // 这个布尔决定「补全 todo」还是「保留 in_progress 并续跑」。
+        let turn_truncated = sess.turn_truncated;
         // ── 必须在发终态事件**之前**放掉 session 锁 ──────────────────
         // 终态事件走的是**阻塞式** send（通道容量 256），而 UI 收到 TurnDone
         // 后会把 `save_needed` 置位，主循环下一帧就去 `session.lock().await`
@@ -3606,7 +3670,11 @@ fn spawn_agent_turn(
         match turn_result {
             Ok(_) => {
                 let _ = tx.send(usage).await;
-                let _ = tx.send(AgentEvent::TurnDone).await;
+                let _ = tx
+                    .send(AgentEvent::TurnDone {
+                        truncated: turn_truncated,
+                    })
+                    .await;
             }
             Err(e) => {
                 let _ = tx.send(AgentEvent::Error(e.to_string())).await;
@@ -4910,11 +4978,24 @@ async fn tui_main(
     // 项目级 skill 信任确认：与 MCP 同构，同样只在启动时检查一次。载荷取自
     // `project_skill_infos`（走与真正加载完全相同的 walk），确保面板列的名字与
     // 批准后实际生效的名字一致。全部被 disabled 时不弹空面板。
+    //
+    // **判定必须问信任状态，不能只看"有没有条目"**：只判 `!infos.is_empty()` 会
+    // 让已批准的项目每次启动都重新追问（`ProjectSkillsGate::resolve` 那边其实
+    // 已经放行了、skill 也照常加载，弹窗纯属多余）。判定收在
+    // `SkillTrustStatus::needs_prompt`，与 CLI 提示同源。
     {
-        let disabled = wyj_store::disabled_skill_names(&cwd);
-        let infos = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
-        if !infos.is_empty() {
-            state.pending_skill_trust = Some(infos);
+        let status = wyj_store::skill_trust_status(&cwd);
+        if status.needs_prompt() {
+            let disabled = wyj_store::disabled_skill_names(&cwd);
+            let infos = wyj_commands::skill::project_skill_infos(&cwd, &disabled);
+            if !infos.is_empty() {
+                state.pending_skill_trust = Some(infos);
+                // 只有"批准过但内容变了"才解释变了什么；从没批准过的项目列一堆
+                // 文件差异毫无意义（全是新增）。
+                if status == wyj_store::SkillTrustStatus::Changed {
+                    state.pending_skill_trust_changes = wyj_store::changed_since_approval(&cwd);
+                }
+            }
         }
     }
 
@@ -5149,6 +5230,68 @@ async fn tui_main(
                 state.messages.push(ChatMessage::system(wyj_i18n::tr(
                     "auto.degraded_to_confirm",
                 )));
+            }
+        }
+
+        // ── 清单未完成 → 自动续跑 ────────────────────────────────────
+        // 上一回合是被**推理轮数预算**关闸收尾的，不是模型自己判断做完了。
+        // 在 `TurnDone { truncated: true }` 里置位 `todo_resume_pending`，
+        // 这里补起一轮，把「停住等用户打『继续』」变成「自动接上」。
+        //
+        // 排在后台唤醒**之前**：两者都要起一轮，先处理更急的——用户刚看到的
+        // 是「任务列表还剩 3 项」，后台 shell 的结果可以等下一帧。
+        //
+        // 三条边界：
+        // ① `auto_wake_paused`（用户按过 ESC）时不续跑——打断就是「先别继续」；
+        // ② 用户有排队消息时不续跑，交给下面的排队分支（那里会把
+        //    `pending_bg_reminders` 一并带走，续跑指令不该和用户的话抢同一轮）；
+        // ③ 续跑指令**只注入一次**：无论这一轮是否又被截断，都由下一轮的
+        //    `TurnDone` 重新置位，不在这里自行重试——否则「模型反复撞顶 +
+        //    清单永远不更新」会变成无限自动循环。
+        if !state.is_thinking
+            && state.todo_resume_pending
+            && !state.auto_wake_paused
+            && state.pending_queue.is_empty()
+        {
+            let unfinished = state.unfinished_todos();
+            state.todo_resume_pending = false;
+            if unfinished.is_empty() {
+                // 清单在最后一刻被模型标完了：不续跑。
+            } else {
+                state.todo_resume_count += 1;
+                state.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                    "spinner.todo_auto_resume",
+                    &[
+                        ("count", &unfinished.len().to_string()),
+                        (
+                            "round",
+                            &format!("{}/{}", state.todo_resume_count, TODO_RESUME_LIMIT),
+                        ),
+                    ],
+                )));
+                // 保留清单与统计：这一轮是上一轮的延续，不是新任务。
+                state.begin_continuation_turn();
+                state.is_thinking = true;
+                state.spinner_frame = 0;
+                state.begin_turn_timing();
+                let agent_c = shared_agent.read().unwrap().clone();
+                let (task, injector) = spawn_agent_turn(
+                    None, // 自动续跑：续跑指令即这一轮唯一的 user 输入
+                    vec![],
+                    agent_c,
+                    session.clone(),
+                    agent_tx.clone(),
+                    cwd.clone(),
+                    shared_mode.clone(),
+                    shared_permission.clone(),
+                    auto_gate.clone(),
+                    ui_ask_tx.clone(),
+                    vec![wyj_core::prompts::todo_resume_notice(&unfinished)],
+                    plugin_runtime.clone(),
+                    permission_constraints.clone(),
+                );
+                state.current_task = Some(task);
+                state.injector = Some(injector);
             }
         }
 
@@ -8163,6 +8306,7 @@ async fn tui_main(
                                     tracing::warn!("写入项目级 skill 信任记录失败: {e}");
                                 }
                                 state.pending_skill_trust = None;
+                                state.pending_skill_trust_changes.clear();
                                 // ① 重建命令注册表 —— 不做这步的症状是"按了 y 但
                                 //    `/xxx` 还是敲不出来"，且没有任何报错。
                                 {
@@ -8191,6 +8335,7 @@ async fn tui_main(
                             | KeyCode::Char('d')
                             | KeyCode::Char('D') => {
                                 state.pending_skill_trust = None;
+                                state.pending_skill_trust_changes.clear();
                                 state.messages.push(ChatMessage::system(
                                     "已跳过，这些项目 skill 本次不加载（下次启动会重新询问）。"
                                         .to_string(),
@@ -9451,11 +9596,16 @@ async fn tui_main(
                                             // 发终态事件前先放锁，理由同 `spawn_agent_turn`
                                             // （阻塞式 send + UI 侧 `session.lock().await`
                                             //  = 环形等待，界面永久冻结）。
+                                            let turn_truncated = sess.turn_truncated;
                                             drop(sess);
                                             match run_result {
                                                 Ok(_) => {
                                                     let _ = tx.send(usage).await;
-                                                    let _ = tx.send(AgentEvent::TurnDone).await;
+                                                    let _ = tx
+                                                        .send(AgentEvent::TurnDone {
+                                                            truncated: turn_truncated,
+                                                        })
+                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     let _ = tx
@@ -9605,11 +9755,16 @@ async fn tui_main(
                                             // 发终态事件前先放锁，理由同 `spawn_agent_turn`
                                             // （阻塞式 send + UI 侧 `session.lock().await`
                                             //  = 环形等待，界面永久冻结）。
+                                            let turn_truncated = sess.turn_truncated;
                                             drop(sess);
                                             match run_result {
                                                 Ok(_) => {
                                                     let _ = tx.send(usage).await;
-                                                    let _ = tx.send(AgentEvent::TurnDone).await;
+                                                    let _ = tx
+                                                        .send(AgentEvent::TurnDone {
+                                                            truncated: turn_truncated,
+                                                        })
+                                                        .await;
                                                 }
                                                 Err(e) => {
                                                     let _ = tx
@@ -11334,7 +11489,7 @@ mod todo_stats_tests {
         let c_started = state.todo_stats.get("c").and_then(|s| s.started_at);
         assert!(c_started.is_some(), "InProgress todo 必须有 started_at");
 
-        state.apply_agent_event(AgentEvent::TurnDone);
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
 
         let items = state
             .current_todos
@@ -11346,7 +11501,7 @@ mod todo_stats_tests {
         assert_eq!(
             items[2].status,
             TodoStatus::Completed,
-            "TurnDone 必须把遗留的 InProgress 改为 Completed"
+            "正常收尾时 TurnDone 必须把遗留的 InProgress 改为 Completed"
         );
         let c_stats = state.todo_stats.get("c").expect("c 的 stats 必须保留");
         assert!(
@@ -11357,6 +11512,121 @@ mod todo_stats_tests {
             c_stats.elapsed_secs > 0.0,
             "elapsed_secs 必须把 started_at 段累加进来"
         );
+        assert!(!state.todo_resume_pending, "正常收尾不该触发自动续跑");
+    }
+
+    /// 被**轮数预算**关闸收尾时，遗留的 InProgress **必须原样保留**，并置位
+    /// 自动续跑标记。
+    ///
+    /// 回归的是真实现场：`MiniMax-M3.1-Flash` 上连续三个回合都在第 28 轮被
+    /// 关闸，而 `TurnDone` 无条件补全，面板显示全勾、实际还剩一半任务。
+    #[test]
+    fn truncated_turn_keeps_in_progress_and_requests_resume() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::InProgress),
+            todo("c", TodoStatus::Pending),
+        ]));
+
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: true });
+
+        let items = state
+            .current_todos
+            .as_deref()
+            .expect("截断回合同样不应清空 current_todos");
+        assert_eq!(items[0].status, TodoStatus::Completed);
+        assert_eq!(
+            items[1].status,
+            TodoStatus::InProgress,
+            "被轮数截断时任务没做完，绝不能补成 Completed"
+        );
+        assert_eq!(items[2].status, TodoStatus::Pending);
+        assert!(
+            state.todo_resume_pending,
+            "截断且仍有未完成项时必须请求续跑"
+        );
+        let b_stats = state.todo_stats.get("b").expect("b 的 stats 必须保留");
+        assert!(
+            b_stats.started_at.is_some(),
+            "started_at 必须保留：续跑后这段耗时还要接着累加"
+        );
+        assert_eq!(state.unfinished_todos().len(), 2);
+    }
+
+    /// 截断但清单恰好已全部完成时不续跑——白白多烧一个完整回合。
+    #[test]
+    fn truncated_turn_with_all_done_does_not_request_resume() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::Completed),
+            todo("b", TodoStatus::Completed),
+        ]));
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: true });
+        assert!(!state.todo_resume_pending, "没有未完成项时不该续跑");
+    }
+
+    /// 续跑次数触顶后不再自动续跑。
+    ///
+    /// 防的是「模型每轮都撞顶、清单每轮都不更新」：没有这道闸，每个
+    /// `TurnDone { truncated: true }` 都会重新置位续跑标记，主循环于是无限
+    /// 起新回合，静默烧钱且用户看不出它在空转。
+    #[test]
+    fn resume_requests_stop_at_the_limit() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![todo(
+            "a",
+            TodoStatus::InProgress,
+        )]));
+
+        state.todo_resume_count = TODO_RESUME_LIMIT - 1;
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: true });
+        assert!(state.todo_resume_pending, "还没触顶时应当继续续跑");
+
+        state.todo_resume_count = TODO_RESUME_LIMIT;
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: true });
+        assert!(!state.todo_resume_pending, "触顶后必须停下，不能再起新回合");
+        // 清单本身仍要如实保留未完成状态
+        assert_eq!(
+            state.current_todos.as_deref().unwrap()[0].status,
+            TodoStatus::InProgress
+        );
+    }
+
+    /// 用户自己发消息会重置续跑计数：「这次提交的预算用完了」不等于
+    /// 「下一个任务也不许续跑」。
+    #[test]
+    fn user_initiated_turn_resets_the_resume_budget() {
+        let mut state = make_state();
+        state.todo_resume_count = TODO_RESUME_LIMIT;
+        state.todo_resume_pending = true;
+        state.begin_new_turn();
+        assert_eq!(state.todo_resume_count, 0);
+        assert!(!state.todo_resume_pending);
+    }
+
+    /// 续跑回合的起手必须**保留**清单与统计——它清空就成了「又开了一个新任务」。
+    #[test]
+    fn continuation_turn_keeps_todo_state_while_new_turn_clears_it() {
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::TodoUpdate(vec![
+            todo("a", TodoStatus::InProgress),
+            todo("b", TodoStatus::Pending),
+        ]));
+
+        state.begin_continuation_turn();
+        assert!(state.current_todos.is_some(), "续跑回合必须保留任务清单");
+        assert!(
+            !state.todo_stats.is_empty(),
+            "续跑回合必须保留每条任务的运行时统计"
+        );
+
+        state.begin_new_turn();
+        assert!(
+            state.current_todos.is_none(),
+            "用户主动发起的新回合仍要清空清单"
+        );
+        assert!(state.todo_stats.is_empty());
     }
 
     /// TurnDone 在没有遗留 InProgress 时 no-op：不丢失数据、不修改已完成项。
@@ -11367,7 +11637,7 @@ mod todo_stats_tests {
             todo("a", TodoStatus::Completed),
             todo("b", TodoStatus::Completed),
         ]));
-        state.apply_agent_event(AgentEvent::TurnDone);
+        state.apply_agent_event(AgentEvent::TurnDone { truncated: false });
         let items = state.current_todos.as_deref().unwrap();
         assert_eq!(items[0].status, TodoStatus::Completed);
         assert_eq!(items[1].status, TodoStatus::Completed);

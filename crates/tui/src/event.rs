@@ -29,8 +29,13 @@ pub enum AgentEvent {
         action_summary: String,
         response_tx: tokio::sync::oneshot::Sender<wyj_tools::PermissionDecision>,
     },
-    /// Agent 一轮完成
-    TurnDone,
+    /// Agent 一轮完成。
+    ///
+    /// `truncated` = 本轮是被**推理轮数预算**关闸收尾的（框架注入了收尾提醒
+    /// 并关闭了工具），而不是模型自己判断做完了。上层据此区分两种「结束」：
+    /// 正常收尾才可以把遗留的 in_progress 任务补成 completed；被截断时必须
+    /// 原样保留，并触发续跑。
+    TurnDone { truncated: bool },
     /// Agent 出错
     Error(String),
     /// Token 用量（覆盖式更新）。`compact_count` 是本会话自动压缩次数，供状态栏

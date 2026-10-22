@@ -51,6 +51,22 @@
     **消息增量日志**（`tools::message_log`，与交接物互补而非替代）：上面三条写入路径**都要求进程还活着**——`SIGKILL`、关终端、断电、OOM killer 时一行收尾代码都不会跑。`a<id>.messages.jsonl` 解决这一档：`Session::message_sink` 在每条消息进入 `messages` 的**同一刻**回调，后台写手 `MessageLogWriter` 串行落盘（与 `TraceWriter` 同构、调用方零阻塞），`SubAgentTool::with_message_log` 把它挂到子 Agent 的 `Session` 上。三个事件而非「一条消息」是必须的：`Appended` / `UpdatedLast` / `Replaced`——`push_user_blocks_merged`（工具结果合并）与 `prepend_to_last_user`（每轮规约注入）都**原地改最后一条 user 消息**，只追加不认改写会让日志永久停在残缺状态；压缩与 context editing 是**整段替换**，必须打 `snapshot` 锚点，否则重放会把压缩前后拼成一个从未存在过的历史。读侧 `replay()` 从最后一个 snapshot 起算，半行（被 kill 时最后一行）跳过并置 `incomplete`。`recover_progress()` 是硬杀场景的兜底入口，`subagent-trace` 在「没有交接物但日志有内容」时打 `no handoff (process killed before cleanup)` 并吐出最后一轮 assistant 文本。开关跟随 `[subagent].trace_enabled`。**注意它只是恢复现场，不是恢复会话**：子 Agent 仍然不会被 resume，主 Agent 拿到的依旧只有结论。
 
 
+## Bash 子进程的产物根（`WYJ_CODE_SKILL_DATA`）
+
+前台 Bash（`bash.rs`）与后台 shell（`bash_session.rs::spawn_prepared`）都往子进程注入
+`WYJ_CODE_SKILL_DATA`，值来自 `bash::project_skill_data_root`（`<data_root>/projects/<key>/skill-data`，路径本身的唯一来源是 `config::layout::project_skill_data_root`）。
+
+它存在的理由**只**有一个：项目级 skill 的信任指纹覆盖仓库内 `.wyj-code/skills/` 整棵树
+（安全不变式，见 `crates/store/CLAUDE.md`），脚本若把下载物 / 缓存 / 中间文件写回自己的
+目录，跑一次流水线就会让刚批准的信任失效、下次启动重新追问。给脚本一个仓库控制不到的
+可写落点，是这条死循环唯一的出路。
+
+三条约束：① **两侧必须同源**——只用前台有、后台没有，会让「同一个 skill 换个跑法行为
+就变」，而用哪种跑法是模型决定的，用户无从预期（测试 `foreground_bash_exposes_skill_data_root` / `background_shell_exposes_skill_data_root` 各钉一半）；② **不预先创建目录**，
+没用到它的命令不该在磁盘上多出空目录；③ **不要改成「指纹忽略某些目录」**——忽略名单若
+来自 skill 作者（frontmatter 之类），作者就能在 SKILL.md 一字不动的前提下换掉被忽略文件
+的内容，直接重新打开 `references/` 那条二阶注入面。
+
 ## Computer-use 桌面 GUI 控制
 
 

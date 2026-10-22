@@ -122,6 +122,9 @@ spinner:
   todo_done: "Tasks complete"
   todo_expand: "  (ctrl+t to expand)"
   todo_collapse: "  (ctrl+t to collapse)"
+  todo_budget_resume: "[Tool-loop turn budget exhausted with {count} task(s) unfinished — resuming automatically]"
+  todo_auto_resume: "[Auto-resume {round}: continuing with the remaining {count} task(s)]"
+  todo_resume_exhausted: "[Auto-resume limit reached, {count} task(s) still unfinished. Type \"continue\" to go on, or raise [agent].forced_thinking_max_turns / [agent].max_turns]"
 
 # Live output block of a running tool (tail lines only)
 live_output:
@@ -911,6 +914,7 @@ dialog:
   project_trust_hint: "  [y] Trust and connect   [n/Esc] Skip for now (asked again on next launch)"
   skill_trust_title: " ⚠ Project Skills Need Trust "
   skill_trust_intro: "The following slash commands come from this repository's .wyj-code/skills/ and were written by the repo author. Until trusted they are absent from completions and unknown to the model. Once trusted, running one hands its entire body to the model as instructions:"
+  skill_trust_changed: "⚠ You approved these before; {count} entries changed since ({items}…). Re-approving stops the prompt until the content changes again."
   skill_trust_hint: "  [y] Trust and enable   [n/Esc] Skip for now (asked again on next launch)"
   ask_question_title: " ◆ Agent Question "
   ask_question_overview_title: " ◆ Interview Overview "

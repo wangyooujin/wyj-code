@@ -325,9 +325,11 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 
 ## 推理轮数触顶不再等于失败
 
-`max_turns_for_model(default, vendor, wire, model)` 有**两层判据**，命中任一即压到 32 轮，否则 200 轮（`[agent].max_turns` 只覆盖后一档）：① 模型名含 `reasoner` / `-r1`；② `ThinkingSpec::for_vendor(..)` 表明该端点**思考关不掉**（`!user_can_disable` 或 `ignore_disabled_when_forced`）——MiniMax M2.x/M3.1、Qwen `-thinking`、豆包 `-thinking`、Moonshot `-code` 全在这个集合里。
+`max_turns_for_model(default, forced, vendor, wire, model)` 有**两层判据**，命中任一即落到 `forced` 轮，否则 `default` 轮：① 模型名含 `reasoner` / `-r1`；② `ThinkingSpec::for_vendor(..)` 表明该端点**思考关不掉**（`!user_can_disable` 或 `ignore_disabled_when_forced`）——MiniMax M2.x/M3.1、Qwen `-thinking`、豆包 `-thinking`、Moonshot `-code` 全在这个集合里。两个值分别来自 `[agent].max_turns`（默认 200）与 `[agent].forced_thinking_max_turns`（默认 64）。
 
-**为什么加第 2 层（v0.3.15）**：旧判据只认模型名，于是所有「强制思考」的第三方端点都拿到默认 200 轮。实测一条 `MiniMax-M3.1-Flash`（`/anthropic` 端点）会话：**单个用户回合 163 次 API 往返、35.6 万 output token、墙钟 30 分钟以上**，收尾提醒要到第 196 轮才注入——前 195 轮没有任何收敛信号，一个回合可以合法地跑 200 次完整深度推理。判据刻意复用 `ThinkingSpec` 而不是另立 vendor 白名单：那张表已是「能不能关思考」的唯一真值来源（thinking adapter 与 catalog 都只认它），在这里再写一份必然漂移。单测：`max_turns_caps_endpoints_that_cannot_disable_thinking`、`max_turns_does_not_cap_endpoints_that_can_disable_thinking`（后者防误伤 MiniMax M3 / Kimi k2.5 / GLM）。
+**熔断值必须可配置，不能写死**（v0.3.19）。此前 `forced` 是常量 32，代价在实测里非常具体：一条 `MiniMax-M3.1-Flash` 会话连续三个用户回合都在第 **28** 轮（`32 - TURN_LIMIT_GRACE`）被关闸收尾，每次都是一份阶段总结 + 用户手打「继续」。这类端点几乎「一轮一个工具调用」，32 轮只够约 32 次工具调用，中型任务必然被切成好几段。32 当初是为「防 reasoning-token 黑洞」设的，但它同时成了正常任务的分段器，代价远大于收益。默认提到 64 之后，同一个任务的单轮预算翻倍；死循环保护**不依赖这个值**（`loop_guard` 独立承担），它只是成本闸。
+
+**为什么加第 2 层判据（v0.3.15）**：旧判据只认模型名，于是所有「强制思考」的第三方端点都拿到默认 200 轮。实测一条 `MiniMax-M3.1-Flash`（`/anthropic` 端点）会话：**单个用户回合 163 次 API 往返、35.6 万 output token、墙钟 30 分钟以上**，收尾提醒要到第 196 轮才注入——前 195 轮没有任何收敛信号，一个回合可以合法地跑 200 次完整深度推理。判据刻意复用 `ThinkingSpec` 而不是另立 vendor 白名单：那张表已是「能不能关思考」的唯一真值来源（thinking adapter 与 catalog 都只认它），在这里再写一份必然漂移。单测：`max_turns_caps_endpoints_that_cannot_disable_thinking`、`max_turns_does_not_cap_endpoints_that_can_disable_thinking`（后者防误伤 MiniMax M3 / Kimi k2.5 / GLM）、`max_turns_caps_reasoner_model_at_the_forced_budget`（钉住熔断值来自配置而非常量）。
 
 **事故（2026-10-15）**：一次跨十几个文件的重构在第 200 轮触顶，抛出的却是 `bail!` —— 用户看到一句红色「超过最大推理轮数 200」，而工作树里那 143 次 Edit、85 次 Bash、81 次 Read 全都已经落地，错误率仅 6%，**没有一轮是空转**。翻出触顶时刻的 `turn_limit` checkpoint 逐轮核对后确认：模型一直在干有效工作，只是没人告诉它「该停了，该总结了」。
 
@@ -344,4 +346,26 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 - **只注入一次**（`wrap_up_sent`）。否则模型可以靠无视指令 + 反复注入给自己续命，「最多 N 轮」形同虚设；无视指令的模型下一轮就落到硬中止，那才是真正该报错的形态。
 - **硬中止仍然保留**，且仍在 `bail!` 前落一份 `CheckpointKind::TurnLimit` 存档（存「撞上限那一刻已经做成什么样」）。工具已经关闸，所以它现在只在「模型连着 5 轮拿到工具被拒的证据、仍不交出最终回答」时触发——那才是真死循环。`checkpoint_store` 为 `None` 时静默跳过：存不了档不能让中止行为变成别的样子。
 - **触顶即失败是错的，触顶即静默同样是错的**。宽限窗口内 `agent.turn_budget_wrap_up` 会明说「已用掉 N/M 轮，已要求模型停止调用工具并总结」，用户看到的是「这一轮到此为止，这是阶段成果」，而不是意外。
+
+## 撞顶之后：截断标记与自动续跑（v0.3.19）
+
+撞顶收尾在 Agent 眼里是 `Ok(())`——上层只看到「模型不再调工具了」，**分不出「活干完了」和「预算没了、工具被框架关掉」**。这个区别直接决定 UI 该做什么：
+
+- 正常收尾 → 把遗留的 `in_progress` todo 补成 `completed`（模型常在最后一轮直接出最终回答，不再调一次 TodoWrite）；
+- 被截断 → **必须原样保留**，否则任务明明做到一半，面板却打了勾（实测现场：连续三个回合都在第 28 轮被关闸，面板显示全勾、实际还剩一半）。
+
+`Session::turn_truncated` 就是这条事实的载体：`run_turn_with_injection_inner` 入口重置为 `false`，注入 `<turn-budget-reminder>` 的同时置 `true`，TUI 在发 `TurnDone` 前锁内取出来，塞进 `AgentEvent::TurnDone { truncated }`。**不落盘**——它是单回合的瞬时事实，`--resume` 时没有意义。
+
+TUI 侧两条分支（`app/events.rs` 的 `TurnDone` handler）：
+
+- `truncated == false`：沿用旧行为补全 in_progress，并清掉续跑标记；
+- `truncated == true`：保留 in_progress，若清单里仍有未完成项就置 `todo_resume_pending`。
+
+主循环（`run_tui`）看到 `todo_resume_pending && !is_thinking && !auto_wake_paused && pending_queue.is_empty()` 就自动起一轮，注入 `prompts::todo_resume_notice(&unfinished)`。三个关键约束：
+
+- **续跑回合不清清单**：走 `begin_continuation_turn()`（= `begin_turn_lifecycle(false)`），保留 `current_todos` / `todo_stats` / `todo_execution_logs`。复用 `begin_new_turn()` 会让面板消失、统计从零重来，用户看到的是「又开了一个新任务」。
+- **续跑指令必须带具体条目**（id + 内容，不只是数量），并显式声明「这不是新的用户请求」「不要重写清单」「接着上一轮做」。少任何一条都会退化成已知的坏行为：模型以为被催、重写整份清单白烧一轮、把已完成的活从头再做一遍。
+- **有上限**：`TODO_RESUME_LIMIT = 8`（`todo_resume_count` 计数）。没有这道闸时「模型每轮都撞顶、清单每轮都不更新」会让主循环无限起新回合、静默烧钱。触顶后停下并写一条 `spinner.todo_resume_exhausted` 说明原因。用户自己发消息（`begin_new_turn`）与切会话（`reset_for_new_session`）都会把计数与标记一起清零。
+
+钉子：`truncated_turn_keeps_in_progress_and_requests_resume`、`truncated_turn_with_all_done_does_not_request_resume`、`resume_requests_stop_at_the_limit`、`continuation_turn_keeps_todo_state_while_new_turn_clears_it`（TUI 侧）；`a_normally_finished_turn_is_not_marked_truncated`、`a_previous_truncated_turn_does_not_poison_the_next_one`、`tools_are_closed_during_the_wrap_up_window`（core 侧）；`todo_resume_notice_names_each_unfinished_item`（prompt 文本）。
 

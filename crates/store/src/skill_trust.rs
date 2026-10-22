@@ -19,12 +19,51 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillTrustRecord {
     approved_fingerprint: String,
     approved_at: DateTime<Utc>,
+    /// 批准时每个文件的 sha256（相对路径 → 摘要）。
+    ///
+    /// 只用于**解释**「为什么又问了一次」（列出变化的文件），不参与是否信任的
+    /// 判定——判定仍然只看 `approved_fingerprint`。旧记录没有这个字段时按空表
+    /// 处理（`#[serde(default)]`），已批准的记录不会因此失效。
+    #[serde(default)]
+    approved_files: BTreeMap<String, String>,
+}
+
+/// 项目级 skill 的信任状态。
+///
+/// **`NeverApproved` 与 `Changed` 必须分开**：前者是「从没问过」，后者是「问过、
+/// 批准过，但内容后来又变了」。两者的用户动作都是重新批准，但只有后者需要解释
+/// 一句「变了什么」——否则用户面对一个自己明明批准过的 skill 又被追问，只会
+/// 认为工具坏了（实测反馈正是如此）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillTrustStatus {
+    /// 目录不存在或没有任何条目：没有可被注入的内容，不需要门控。
+    NoProjectSkills,
+    /// 已批准当前内容指纹。
+    Trusted,
+    /// 有内容，但从没批准过。
+    NeverApproved,
+    /// 批准过，之后内容变了（`git pull` 带入新提交，或 skill 自己的脚本把
+    /// 运行产物写回了受控目录）。
+    Changed,
+}
+
+impl SkillTrustStatus {
+    /// 是否应当向用户追问一次。
+    ///
+    /// **这是「要不要弹窗 / 要不要提示」的唯一判定入口**，TUI 面板与 CLI 提示
+    /// 都必须走它。历史上 TUI 启动分支只判了「`project_skill_infos` 非空」，
+    /// 漏掉这一半条件，于是已批准的项目每次启动都被重新追问——`ProjectSkillsGate`
+    /// 那边其实早已放行，弹窗纯属多余。把判定收成方法，谁也不能再只写半句。
+    pub fn needs_prompt(self) -> bool {
+        matches!(self, Self::NeverApproved | Self::Changed)
+    }
 }
 
 /// 整棵 skill 目录树的累计哈希预算。极端恶意仓库塞几个 GB 时不会让每次启动
@@ -40,6 +79,61 @@ fn project_skills_dir(cwd: &Path) -> PathBuf {
 
 fn trust_path(cwd: &Path) -> Result<PathBuf> {
     crate::project_trust::project_trust_record_path(cwd, "skill_trust.json")
+}
+
+/// 项目级 skill 的**运行产物目录**：`~/.wyj-code/projects/<key>/skill-data/<skill>/`。
+///
+/// # 为什么需要它
+///
+/// 指纹覆盖 `<git-root>/.wyj-code/skills/` 整棵树（安全不变式，见 `collect_entries`），
+/// 于是**任何写回该树的运行产物都会让刚批准的指纹失效**：典型形态是 skill 首次
+/// 运行时把下载的 BGM / 缓存 / 模型文件放进自己的 `assets/`，跑完一次流水线，
+/// 下次启动就又被要求重新批准——用户看到的是"明明刚点过信任，怎么又问了"。
+///
+/// 这条约束不能靠"指纹跳过某些目录"来绕：忽略名单若来自 skill 自己（frontmatter
+/// 或目录内文件），作者只要把它写进清单，就能在 SKILL.md 一字不动的前提下换掉
+/// 被忽略的文件内容，重新打开 `references/` 那条二阶注入面。**产物必须搬出受信任
+/// 的内容树，而不是让指纹对它们闭眼**。
+///
+/// 路径落在 `projects/<key>/` 下（仓库内容控制不到），因此写入它既不影响指纹，
+/// 也不会被下一次 `git pull` 覆盖。
+///
+/// `skill` 会被规整成安全目录名：路径分隔符与 `..` 一律转义，杜绝借 skill 名
+/// 逃逸到上级目录。
+pub fn project_skill_data_dir(cwd: &Path, skill: &str) -> Result<PathBuf> {
+    let key = wyj_core::project_key(cwd);
+    Ok(
+        wyj_config::layout::project_skill_data_root(&wyj_config::config_dir()?, &key)
+            .join(sanitize_skill_name(skill)),
+    )
+}
+
+/// 同 [`project_skill_data_dir`]，但确保目录存在。skill 脚本可直接拿它当输出根。
+pub fn ensure_project_skill_data_dir(cwd: &Path, skill: &str) -> Result<PathBuf> {
+    let dir = project_skill_data_dir(cwd, skill)?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("创建 skill 产物目录失败: {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// 只保留字母数字与 `-_.`，其余字符（含 `/`、`\`、`:`）一律替换为 `-`；
+/// 全点串（`.` / `..`）额外加前缀，避免拼出上跳路径。
+fn sanitize_skill_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        format!("skill{cleaned}")
+    } else {
+        cleaned
+    }
 }
 
 fn load_record(cwd: &Path) -> Option<SkillTrustRecord> {
@@ -104,16 +198,7 @@ pub fn compute_project_skill_fingerprint(cwd: &Path) -> String {
     let mut hasher = Sha256::new();
     let mut budget = MAX_FINGERPRINT_BYTES;
     for (rel, abs) in files {
-        let payload: Vec<u8> = match std::fs::symlink_metadata(&abs).map(|m| m.file_type()) {
-            Ok(ft) if ft.is_symlink() => std::fs::read_link(&abs)
-                .map(|p| p.display().to_string().into_bytes())
-                .unwrap_or_else(|_| b"<broken-symlink>".to_vec()),
-            Ok(ft) if ft.is_file() => {
-                std::fs::read(&abs).unwrap_or_else(|_| b"<unreadable>".to_vec())
-            }
-            // 目录也入哈希：增删一个空目录应当改变指纹
-            _ => b"<special>".to_vec(),
-        };
+        let payload = entry_payload(&abs);
         // 长度前缀消歧：`a.md` + `bc` 与 `a.mdb` + `c` 不会碰撞
         hasher.update((rel.len() as u64).to_le_bytes());
         hasher.update(rel.as_bytes());
@@ -128,23 +213,112 @@ pub fn compute_project_skill_fingerprint(cwd: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// 项目级 skill 是否可以进入本次加载名单。
+/// 单个条目参与哈希的字节：符号链接取 link target 字符串、普通文件取内容、
+/// 目录/特殊文件取占位符。与 [`compute_project_skill_fingerprint`] 同源。
+fn entry_payload(abs: &Path) -> Vec<u8> {
+    match std::fs::symlink_metadata(abs).map(|m| m.file_type()) {
+        Ok(ft) if ft.is_symlink() => std::fs::read_link(abs)
+            .map(|p| p.display().to_string().into_bytes())
+            .unwrap_or_else(|_| b"<broken-symlink>".to_vec()),
+        Ok(ft) if ft.is_file() => std::fs::read(abs).unwrap_or_else(|_| b"<unreadable>".to_vec()),
+        // 目录也入哈希：增删一个空目录应当改变指纹
+        _ => b"<special>".to_vec(),
+    }
+}
+
+/// 逐条目摘要（相对路径 → 该条目单项的 sha256），预算规则与整树指纹一致。
 ///
-/// 目录不存在 / 目录里没有任何条目 → `true`（没有可被注入的内容，不需要门控）。
-/// 已批准当前指纹 → `true`。
-/// 存在内容但从未批准、或内容自批准后变化过（含"被 git pull 悄悄替换过"）→ `false`。
-pub fn project_skills_trusted(cwd: &Path) -> bool {
+/// **只用于解释「变了什么」，不参与信任判定**——判定仍只看整树指纹，所以这份
+/// 映射无论怎么改都不会放宽门控。
+fn entry_digests(cwd: &Path) -> BTreeMap<String, String> {
+    let root = project_skills_dir(cwd);
+    let mut files = Vec::new();
+    collect_entries(&root, &root, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = BTreeMap::new();
+    let mut budget = MAX_FINGERPRINT_BYTES;
+    for (rel, abs) in files {
+        let payload = entry_payload(&abs);
+        let take = payload.len().min(budget as usize);
+        let mut hasher = Sha256::new();
+        hasher.update((rel.len() as u64).to_le_bytes());
+        hasher.update(rel.as_bytes());
+        hasher.update((payload.len() as u64).to_le_bytes());
+        hasher.update(&payload[..take]);
+        if take < payload.len() {
+            hasher.update(b"\x00TRUNCATED");
+        }
+        budget = budget.saturating_sub(take as u64);
+        out.insert(rel, format!("{:x}", hasher.finalize()));
+    }
+    out
+}
+
+/// 项目级 skill 的当前信任状态。
+///
+/// 目录不存在 / 目录里没有任何条目 → [`SkillTrustStatus::NoProjectSkills`]。
+/// 已批准当前指纹 → [`SkillTrustStatus::Trusted`]。
+/// 存在内容但从未批准 → [`SkillTrustStatus::NeverApproved`]。
+/// 批准过但内容已变 → [`SkillTrustStatus::Changed`]。
+pub fn trust_status(cwd: &Path) -> SkillTrustStatus {
     let root = project_skills_dir(cwd);
     let mut probe = Vec::new();
     collect_entries(&root, &root, &mut probe);
     if probe.is_empty() {
-        return true;
+        return SkillTrustStatus::NoProjectSkills;
     }
-    let current = compute_project_skill_fingerprint(cwd);
-    load_record(cwd).is_some_and(|r| r.approved_fingerprint == current)
+    let Some(record) = load_record(cwd) else {
+        return SkillTrustStatus::NeverApproved;
+    };
+    if record.approved_fingerprint == compute_project_skill_fingerprint(cwd) {
+        SkillTrustStatus::Trusted
+    } else {
+        SkillTrustStatus::Changed
+    }
 }
 
-/// 批准当前项目级 skill 内容（写入当前指纹 + 时间戳）。
+/// 项目级 skill 是否可以进入本次加载名单。
+///
+/// 只回答「现在能不能加载」这一个布尔问题。需要区分「从没批准」与「批准后变过」
+/// 的调用方（TUI 面板文案、CLI 提示）请直接用 [`trust_status`]，不要在这里加分支。
+pub fn project_skills_trusted(cwd: &Path) -> bool {
+    matches!(
+        trust_status(cwd),
+        SkillTrustStatus::NoProjectSkills | SkillTrustStatus::Trusted
+    )
+}
+
+/// 上次批准后新增 / 修改 / 删除的条目（相对路径，已排序），供 UI 解释「为什么又问」。
+///
+/// 相对路径只以 `/` 分隔、不带任何标签文案——文案归 UI 层（要走 i18n）。
+/// 旧记录没有 `approved_files` 时返回空表：那时无法解释差异，不必硬编。
+pub fn changed_since_approval(cwd: &Path) -> Vec<String> {
+    let Some(record) = load_record(cwd) else {
+        return Vec::new();
+    };
+    if record.approved_files.is_empty() {
+        return Vec::new();
+    }
+    let current = entry_digests(cwd);
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|(rel, digest)| record.approved_files.get(*rel) != Some(*digest))
+        .map(|(rel, _)| rel.clone())
+        .chain(
+            record
+                .approved_files
+                .keys()
+                .filter(|rel| !current.contains_key(*rel))
+                .cloned(),
+        )
+        .collect();
+    changed.sort();
+    changed.dedup();
+    changed
+}
+
+/// 批准当前项目级 skill 内容（写入当前指纹 + 时间戳 + 逐条目摘要）。
 pub fn approve_skills(cwd: &Path) -> Result<()> {
     let path = trust_path(cwd)?;
     if let Some(parent) = path.parent() {
@@ -154,9 +328,13 @@ pub fn approve_skills(cwd: &Path) -> Result<()> {
     let record = SkillTrustRecord {
         approved_fingerprint: compute_project_skill_fingerprint(cwd),
         approved_at: Utc::now(),
+        approved_files: entry_digests(cwd),
     };
     let content = serde_json::to_string_pretty(&record).context("序列化信任记录失败")?;
-    std::fs::write(&path, content).with_context(|| format!("写入信任记录失败: {}", path.display()))
+    // 原子替换：另一实例同时在读这份记录时，不该看到半截 JSON（读到解析失败会
+    // 被当成「从未批准」，从而把已信任的项目级 skill 静默踢出加载名单）。
+    wyj_core::serialize::write_atomic(&path, content.as_bytes())
+        .with_context(|| format!("写入信任记录失败: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -193,6 +371,8 @@ mod tests {
     fn no_project_skills_dir_is_trusted() {
         let dir = tempfile::tempdir().unwrap();
         assert!(project_skills_trusted(dir.path()));
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::NoProjectSkills);
+        assert!(!trust_status(dir.path()).needs_prompt());
     }
 
     #[test]
@@ -201,6 +381,7 @@ mod tests {
         let _cleanup = Cleanup(dir.path());
         // 目录存在但没有条目 → 没有可被注入的内容，不需要门控
         assert!(project_skills_trusted(dir.path()));
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::NoProjectSkills);
     }
 
     #[test]
@@ -210,9 +391,129 @@ mod tests {
         write_skill(dir.path(), "review", "---\nname: review\n---\nReview code.");
 
         assert!(!project_skills_trusted(dir.path()), "未批准前应为 false");
+        assert_eq!(
+            trust_status(dir.path()),
+            SkillTrustStatus::NeverApproved,
+            "从没批准过必须是 NeverApproved，不能与「批准后变了」混为一谈"
+        );
 
         approve_skills(dir.path()).unwrap();
         assert!(project_skills_trusted(dir.path()));
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::Trusted);
+        assert!(!trust_status(dir.path()).needs_prompt());
+    }
+
+    /// **本仓库实测 bug 的钉子**：已批准的项目不能再弹信任面板。
+    ///
+    /// 原先 TUI 启动分支只判「`project_skill_infos` 非空」就弹窗，与门控状态
+    /// （`ProjectSkillsGate::resolve`）脱钩——skill 明明已加载可用，面板却每次
+    /// 启动都重新追问。这里钉死「已批准 → 不需要 prompt」这一半。
+    #[test]
+    fn approved_project_never_needs_a_prompt() {
+        let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
+        write_skill(dir.path(), "douyin-ai-daily", "---\nname: d\n---\nbody");
+        approve_skills(dir.path()).unwrap();
+
+        // 反复查也不该翻脸（每次启动都会查一次）
+        for _ in 0..3 {
+            assert!(!trust_status(dir.path()).needs_prompt());
+            assert!(project_skills_trusted(dir.path()));
+        }
+        assert!(
+            changed_since_approval(dir.path()).is_empty(),
+            "没变过就不该报告任何变化"
+        );
+    }
+
+    /// 批准后内容变化必须能被解释：「变了哪些文件」要列得出来。
+    #[test]
+    fn changed_status_and_changed_entries_are_reported() {
+        let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
+        write_skill(dir.path(), "review", "Review code.");
+        let refs = dir.path().join(".wyj-code/skills/review/references");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("notes.md"), "v1").unwrap();
+        approve_skills(dir.path()).unwrap();
+
+        // 只改 references/：状态翻成 Changed，且能准确指出是哪个文件
+        std::fs::write(refs.join("notes.md"), "v2").unwrap();
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::Changed);
+        assert!(trust_status(dir.path()).needs_prompt());
+        assert_eq!(
+            changed_since_approval(dir.path()),
+            vec!["review/references/notes.md".to_string()]
+        );
+
+        // 新增文件同样要报出来
+        std::fs::write(refs.join("extra.md"), "new").unwrap();
+        let changed = changed_since_approval(dir.path());
+        assert!(changed.contains(&"review/references/extra.md".to_string()));
+    }
+
+    /// 旧记录没有 `approved_files` 字段时，反序列化不得失败——否则所有已批准
+    /// 的项目在升级后都会退回「从未批准」。
+    #[test]
+    fn legacy_record_without_file_digests_still_loads() {
+        let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
+        write_skill(dir.path(), "review", "Review code.");
+        let path = trust_path(dir.path()).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let fingerprint = compute_project_skill_fingerprint(dir.path());
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"approved_fingerprint":"{fingerprint}","approved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::Trusted);
+        // 无从解释差异时返回空表，而不是硬编一堆「变化」
+        assert!(changed_since_approval(dir.path()).is_empty());
+    }
+
+    /// 产物目录必须落在仓库内容控制不到的位置，且写它不影响指纹。
+    #[test]
+    fn skill_data_dir_is_outside_the_content_tree_and_does_not_change_fingerprint() {
+        let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
+        write_skill(dir.path(), "douyin-ai-daily", "# skill");
+        approve_skills(dir.path()).unwrap();
+        let before = compute_project_skill_fingerprint(dir.path());
+
+        let data = ensure_project_skill_data_dir(dir.path(), "douyin-ai-daily").unwrap();
+        std::fs::write(data.join("bgm.mp3"), b"big binary blob").unwrap();
+
+        assert!(!data.starts_with(dir.path()), "产物目录不得落在仓库内");
+        assert_eq!(
+            before,
+            compute_project_skill_fingerprint(dir.path()),
+            "写产物目录不得改变受信任内容的指纹"
+        );
+        assert_eq!(trust_status(dir.path()), SkillTrustStatus::Trusted);
+    }
+
+    /// skill 名里的路径分隔符与上跳段必须被规整掉，不能借此逃出 skill-data。
+    #[test]
+    fn skill_data_dir_sanitizes_traversal_names() {
+        let dir = skills_dir();
+        let _cleanup = Cleanup(dir.path());
+        let base = project_skill_data_dir(dir.path(), "..").unwrap();
+        let base_parent = base.parent().unwrap();
+        assert_eq!(base.file_name().unwrap().to_str().unwrap(), "skill..");
+
+        for evil in ["../../etc/passwd", "a/b", "..\\..\\win"] {
+            let p = project_skill_data_dir(dir.path(), evil).unwrap();
+            assert_eq!(
+                p.parent().unwrap(),
+                base_parent,
+                "`{evil}` 不得逃出 skill-data 目录：{}",
+                p.display()
+            );
+        }
     }
 
     #[test]

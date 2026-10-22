@@ -653,17 +653,38 @@ pub struct AgentCfg {
     /// 开始。调高它等于给「超长任务」更多预算，调低它限制的是**单次提交**的
     /// 最长耗时，两者都不影响死循环保护——那由 `loop_guard` 独立承担。
     ///
-    /// 推理模型（DeepSeek `deepseek-reasoner` 等）另有更保守的 32 轮熔断，
-    /// 不受本值影响。**思考关不掉的端点同样如此**——判据走
-    /// `ThinkingSpec::for_vendor`，覆盖 MiniMax M2.x/M3.1、Qwen `-thinking`、
-    /// 豆包 `-thinking`、Moonshot `-code`。理由：它们的每一轮都是一次完整
-    /// 深度推理，实测一条 MiniMax 会话单回合跑了 163 轮、墙钟 30 分钟以上。
+    /// 推理模型（DeepSeek `deepseek-reasoner` 等）与**思考关不掉的端点**
+    /// （MiniMax M2.x/M3.1、Qwen `-thinking`、豆包 `-thinking`、Moonshot
+    /// `-code`，判据走 `ThinkingSpec::for_vendor`）另有一道更保守的熔断，
+    /// 由 [`Self::forced_thinking_max_turns`] 决定，不受本值影响。理由：
+    /// 它们的每一轮都是一次完整深度推理，实测一条 MiniMax 会话单回合跑了
+    /// 163 轮、墙钟 30 分钟以上。
     pub max_turns: usize,
+    /// 强制思考端点的单回合熔断轮数。**默认 64**。
+    ///
+    /// 这一档的语义与 `max_turns` 相同（触顶前仍有 `TURN_LIMIT_GRACE` 轮
+    /// 收尾宽限），只是默认值更保守。
+    ///
+    /// **为什么从写死的 32 提上来（v0.3.19）**：`turn` 计的是 LLM 往返次数，
+    /// 不是工作量，而这类端点几乎「一轮一个工具调用」。实测一条
+    /// `MiniMax-M3.1-Flash` 会话里连续三个用户回合都在第 28 轮
+    /// （`32 - TURN_LIMIT_GRACE`）被关闸收尾，用户看到的是一份阶段总结加
+    /// 一句「继续」——任务本身只需再多十几次工具调用就能做完。32 这个值当初
+    /// 是为「防 reasoning-token 黑洞」设的，但它同时把正常的中型任务切成了
+    /// 好几段，代价远大于收益。
+    ///
+    /// 死循环保护**不依赖这个值**：`loop_guard`（同工具同参数重复 3 次）是
+    /// 独立的一层。本值只是成本闸，调高它买的是「单轮能推进多远」，代价是
+    /// 单次提交的最长耗时与 token 上限。
+    pub forced_thinking_max_turns: usize,
 }
 
 impl Default for AgentCfg {
     fn default() -> Self {
-        Self { max_turns: 200 }
+        Self {
+            max_turns: 200,
+            forced_thinking_max_turns: 64,
+        }
     }
 }
 
@@ -2684,6 +2705,23 @@ context_window = 200000
     fn a_partial_agent_block_keeps_the_default_budget() {
         let cfg: Config = toml::from_str("[agent]\n").unwrap();
         assert_eq!(cfg.agent.max_turns, 200);
+        assert_eq!(cfg.agent.forced_thinking_max_turns, 64);
+    }
+
+    /// 强制思考端点的熔断轮数可配置，且老配置（只有 `max_turns`）不会
+    /// 把它带成 0——那会让这类端点的每个回合都在第 1 轮就触顶。
+    #[test]
+    fn forced_thinking_max_turns_defaults_and_is_overridable() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.agent.forced_thinking_max_turns, 64);
+
+        let cfg: Config = toml::from_str("[agent]\nmax_turns = 300\n").unwrap();
+        assert_eq!(cfg.agent.max_turns, 300);
+        assert_eq!(cfg.agent.forced_thinking_max_turns, 64);
+
+        let cfg: Config = toml::from_str("[agent]\nforced_thinking_max_turns = 120\n").unwrap();
+        assert_eq!(cfg.agent.max_turns, 200);
+        assert_eq!(cfg.agent.forced_thinking_max_turns, 120);
     }
 
     #[test]

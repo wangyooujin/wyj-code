@@ -205,6 +205,8 @@ pub struct AgentCoreConfig {
     pub max_tokens: u32,
     pub context_window: u32,
     pub max_turns: usize,
+    /// 强制思考端点的单回合熔断轮数（`[agent].forced_thinking_max_turns`）。
+    pub forced_thinking_max_turns: usize,
     pub capabilities: wyj_api::capabilities::ModelCapabilities,
     pub route_profile: String,
     pub route_vendor: String,
@@ -235,6 +237,7 @@ impl AgentCoreConfig {
             .with_max_tokens(self.max_tokens)
             .with_context_window(self.context_window)
             .with_max_turns(self.max_turns)
+            .with_forced_thinking_max_turns(self.forced_thinking_max_turns)
             .with_model_capabilities(self.capabilities)
             .with_route_identity(
                 self.route_profile,
