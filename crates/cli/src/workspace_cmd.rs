@@ -282,9 +282,8 @@ fn format_reconcile_report(report: &ReconcileReport) -> String {
 
 fn manager(repository_root: &Path) -> Result<GitWorktreeManager> {
     let manager = GitWorktreeManager::new(
-        wyj_config::config_dir()?
-            .join("workspaces")
-            .join(wyj_core::project_id(repository_root)),
+        wyj_config::layout::workspaces_root(&wyj_config::config_dir()?)
+            .join(wyj_core::project_key(repository_root)),
     )?;
     // 接上 `storage.workspace_worktree_max_age_days`。此前 `with_storage_retention`
     // 是零调用的死代码，而配置项被文档写成生效 cap —— 文档在骗人。

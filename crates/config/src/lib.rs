@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub mod filelock;
 pub mod gitignore;
+pub mod layout;
 pub mod project_mcp;
 pub mod project_settings;
 pub use project_mcp::{
@@ -1063,10 +1064,46 @@ pub struct StorageRetentionCfg {
     /// 是否在进程启动时跑一次 `WorkspaceCas::gc(cas_total_bytes)`。
     /// 关掉可省掉启动期一次全池目录遍历（blob 多时是毫秒级 IO）。
     pub cas_gc_on_start: bool,
+
+    /// 会话文件保留天数（0 = 永不自动删除，旧行为）。
+    ///
+    /// 对应 Claude Code 的 `cleanupPeriodDays`。只删**早于**该天数的会话及其
+    /// checkpoint / subagent 旁路目录；最近一条会话永远保留，避免把「唯一一次
+    /// 会话」删掉。清理在进程启动时跑一次（与 CAS gc 同批），不阻塞主流程。
+    pub sessions_ttl_days: u32,
+
+    /// 会话清理时额外保留的最近条数（按项目计）。0 = 不额外保留。
+    ///
+    /// TTL 单独用会有一个陷阱：一个项目可能三个月没动过，但里面的会话正是
+    /// 用户想回头看的。给每个项目留 N 条最新的，删掉的只是「又老又不新」的。
+    pub sessions_keep_recent: usize,
+
+    /// 陈旧锁文件保留天数（0 = 不清理）。
+    ///
+    /// 覆盖 `cas/locks/` 与 `sessions/*.json.lock` / `*.json.owner`。
+    /// 这些文件在 unix 上由内核释放 flock，但**文件本身**不会被删除——实测
+    /// `cas/locks/` 攒到 10641 个 / 42 MB，`sessions/` 下 238 个 `.lock` 与
+    /// 65 个 `.owner` 残留。只删「mtime 超过 N 天且无人持有」的。
+    pub stale_lock_ttl_days: u32,
+
+    /// 运行状态的落盘范围：`"home"`（默认）或 `"project"`。
+    ///
+    /// `"project"` 把会话与历史改放到 `<git-root>/.wyj-code/local/`，让状态
+    /// 跟着工作副本走；选它时会自动写 gitignore 防止 `git add -A` 泄漏
+    /// transcript。代价见 [`layout::StorageScope`] 的文档。
+    ///
+    /// 用字符串而不是枚举：配置是 TOML，未知值应当**降级为默认并告警**，
+    /// 而不是让整个 `config.toml` 解析失败。
+    #[serde(default = "default_storage_scope")]
+    pub scope: String,
     // 曾经存在的 2 个 Phase 4 字段(`checkpoint_bytes_per_session` /
     // `checkpoint_ttl_days`)仍无消费点,保持删除:留着只会让人误以为存在
     // 对应的清理逻辑。`#[serde(default)]` + 无 `deny_unknown_fields`,
     // 用户既有配置里写了这些键会被静默忽略,不影响加载。
+}
+
+fn default_storage_scope() -> String {
+    "home".to_string()
 }
 
 impl Default for StorageRetentionCfg {
@@ -1088,6 +1125,14 @@ impl Default for StorageRetentionCfg {
             // 单个会话可控；跨会话累积靠 gc 在启动时按 LRU 收口。
             cas_total_bytes: 1024 * 1024 * 1024,
             cas_gc_on_start: true,
+            // **默认关闭**。自动删历史会话是不可逆操作，不该在升级后的第一次
+            // 启动里静默发生——用户会以为「历史丢了」。想开的话自己设成 30/90。
+            // 想立刻清理一次走 `wyj-code storage prune --yes`（它读同一组配置）。
+            sessions_ttl_days: 0,
+            sessions_keep_recent: 5,
+            // 锁文件是纯垃圾（内容只有 pid），默认清理没有数据风险。
+            stale_lock_ttl_days: 7,
+            scope: default_storage_scope(),
         }
     }
 }
@@ -1950,6 +1995,8 @@ pub(crate) fn write_atomic(path: &std::path::Path, content: &str) -> Result<()> 
 }
 
 /// 返回配置目录路径（~/.wyj-code），若不存在则创建。
+///
+/// 数据根可由 `WYJ_CODE_HOME` 覆盖，见 [`layout::data_root_in`]。
 pub fn config_dir() -> Result<PathBuf> {
     let user_dirs = UserDirs::new().ok_or_else(|| anyhow::anyhow!("无法获取用户主目录"))?;
     let dir = global_config_dir_in(user_dirs.home_dir());
@@ -1963,8 +2010,11 @@ pub fn config_dir() -> Result<PathBuf> {
 
 /// 给定 home 下的全局配置目录（`<home>/.wyj-code`）。纯路径拼接、不创建目录、
 /// 不查真实主目录，供 `load_skills` 等以 home 为注入参数的 API 使用。
+///
+/// 只有当 `home` 就是本进程真实主目录时才接受 `WYJ_CODE_HOME` 覆盖——传
+/// tempdir 的测试路径必须保持隔离，理由见 [`layout::data_root_for_home`]。
 pub fn global_config_dir_in(home: &Path) -> PathBuf {
-    home.join(".wyj-code")
+    layout::data_root_for_home(home)
 }
 
 /// 返回当前进程的项目根：显式 override 优先，否则从 `cwd` 向上查找项目清单或

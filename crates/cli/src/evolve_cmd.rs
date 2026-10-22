@@ -80,7 +80,11 @@ fn print_value(value: &serde_json::Value, json: bool) -> Result<()> {
 }
 
 fn checkpoint_before_activation(cwd: &Path, id: &str) -> Result<String> {
-    let sessions = wyj_config::config_dir()?.join("sessions");
+    // checkpoint 与它保护的会话同目录（按项目分），否则 `--resume` 找不到它。
+    let sessions = wyj_config::layout::project_sessions_dir(
+        &wyj_config::config_dir()?,
+        &wyj_core::project_key(cwd),
+    );
     let store = CheckpointStore::configured(&sessions, format!("evolution-approval-{id}"))?;
     let summary = store.create(
         cwd,

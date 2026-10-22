@@ -9,6 +9,88 @@
 
 配置文件：`~/.wyj-code/config.toml`，API Key 优先读取环境变量 `WYJ_CODE_API_KEY`。
 
+### 数据根与落盘布局
+
+整个状态目录默认是 `~/.wyj-code`，可用环境变量 **`WYJ_CODE_HOME`** 指向别处
+（外置盘、独立测试环境）。它是进程级决定，对所有子系统一致生效：
+
+```bash
+WYJ_CODE_HOME=/Volumes/external/wyj-state wyj-code
+```
+
+路径模板（唯一来源是 `wyj_config::layout`，见 `crates/config/src/layout.rs`）：
+
+```
+<data_root>/
+├── config.toml  settings.json  AGENTS.md  installed.json
+├── skills/  agents/  plugins/  marketplaces/  model-capabilities/
+├── sessions/<project_key>/       # 会话 + .meta.json + .checkpoints/ + .subagents/
+├── history/<project_key>/history.jsonl
+├── memory-v3/{global,projects/<key>}/
+├── evolution/<project_key>/  indexes/<project_key>/
+├── workspaces/<project_key>/  workflows/<project_key>/
+├── projects/<project_key>/{allowed_tools,mcp_trust,skill_trust,hooks_trust}.json
+│   └── instances/  meta.json
+└── cas/  spill/  schedule/  logs/
+```
+
+`project_key` 形如 `v1-wyj-code-1f367bbfb19407b9`（目录名 + SHA-256 前 16 位），
+按 **git 仓库根**归一：同一仓库的任意子目录、以及带 `--project-root` 指回主仓库的
+worktree，都归到同一个 key。
+
+**升级到按项目分目录的版本后**，旧数据仍在根目录，功能不会坏（读取有兜底），
+但建议跑一次迁移：
+
+```bash
+wyj-code storage migrate          # 只报计划
+wyj-code storage migrate --yes    # 实际搬迁（rename，同盘原子）
+```
+
+迁移搬三类：会话整组文件、`history.jsonl` 按行拆分、旧项目键目录改名。无法确定
+归属的条目会报 `skipped` 并保持原样。
+
+#### 落盘范围：`storage.scope`
+
+```toml
+[storage]
+scope = "home"      # 默认。"project" = 会话与历史跟着工作副本走
+```
+
+`scope = "project"` 时，会话与历史改放 `<git-root>/.wyj-code/local/`，同时自动写
+两道 gitignore（`local/.gitignore` 内容 `*`，仓库根 `.gitignore` 追加
+`.wyj-code/local/`）。选它的理由是「换机器/换 clone 就带走对话历史」，代价是：
+
+- transcript 里是工具输出原文，漏一次 `git add -A` 就是永久泄漏（gitignore 是
+  自动写的，但**不要手工删**）；
+- 多 worktree 时每个 worktree 一份独立会话，`-c` 只看到当前 worktree 的；
+- 会话体积会进入 `git status` 的 stat 成本。
+
+定义类配置（`mcp.toml`、`settings.toml`、`skills/`、`agents/`）不受这个开关影响。
+
+#### 会话与锁的保留策略
+
+```toml
+[storage]
+sessions_ttl_days = 0        # 0 = 不自动删（默认）。设 30/90 启用
+sessions_keep_recent = 5     # 每个项目无条件保留最新 N 条
+stale_lock_ttl_days = 7      # 删 cas/locks/ 与 sessions/*.lock 里无人持有且超期的
+```
+
+`sessions_ttl_days` **默认 0**：删历史不可逆，不该在升级后第一次启动里静默发生。
+想立刻清一次用 `wyj-code storage prune`（dry-run）看计划，`--yes` 执行；未设置时
+`prune` 按 30 天算，且 dry-run 与 `--yes` 用同一个值。
+
+`sessions_keep_recent` 是 TTL 的必要配套：纯 TTL 会把「三个月没动的项目里唯一那批
+会话」删光，而那恰恰是最想回看的。
+
+删除一个会话会连同它的 `.meta.json`、`.json.lock`、`.json.owner`、
+`.checkpoints/`、`.subagents/` 一起删——只删正文会留下孤儿 checkpoint 目录。
+
+**项目级定义**（可提交、随 clone 落地）仍在 `<git-root>/.wyj-code/`：`mcp.toml`、
+`settings.toml`、`settings.json`、`skills/`、`agents/`、`installed.json`。
+`allowed_tools.json` 与 `*_trust.json` **不在**这里——它们记录「用户批准过什么」，
+放进仓库等于让仓库自己改掉批准标记。
+
 ```toml
 provider = "anthropic"       # 或 "openai"
 model = "claude-opus-4-8"
