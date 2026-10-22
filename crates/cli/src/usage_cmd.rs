@@ -3,7 +3,7 @@
 //! 为什么需要它：v0.2.28 之前 token 计量只存在于 `/cost` 的单会话视图里，且
 //! `cache_read_tokens` / `api_calls` 根本不落盘（`/resume` 后归零）。于是
 //! 「这个月一共烧了多少 token、每次模型调用平均带多少上下文」这类问题在
-//! 磁盘上无解。本命令直接扫 `~/.wyj-code/sessions/*.json` 做聚合，
+//! 磁盘上无解。本命令直接扫 `<data_root>/sessions/`（含项目子目录）做聚合，
 //! 是 token 治理的**基线来源**——所有优化都要拿它做前后对比。
 //!
 //! 纯读：不打开任何会话、不写盘、不碰运行中状态。
@@ -138,12 +138,16 @@ pub struct UsageReport {
     sessions_without_api_calls: usize,
 }
 
-/// 汇总 `sessions_dir` 下所有会话。支持按日期与项目过滤。
+/// 汇总 `sessions_root` 下所有会话（递归一层项目子目录）。支持按日期与项目过滤。
 ///
 /// 过滤按**文件内 `timestamp` 字段**判断，而不是文件 mtime：mtime 会被
 /// `/resume`、备份恢复、手动拷贝改写，用它做历史统计会静默串档。
+///
+/// 遍历必须同时覆盖「项目子目录」与「根目录下平铺的旧文件」：升级后没跑
+/// `storage migrate` 的用户，历史数据全在根目录，只扫子目录会让 `usage`
+/// 报 0 消耗——比报错更糟，因为看起来像真的没花过 token。
 pub fn collect(
-    sessions_dir: &Path,
+    sessions_root: &Path,
     since: Option<&str>,
     project: Option<&str>,
 ) -> Result<UsageReport> {
@@ -152,15 +156,37 @@ pub fn collect(
     let mut by_project: BTreeMap<String, UsageTotals> = BTreeMap::new();
     let mut sessions_without_api_calls = 0usize;
 
-    let entries = std::fs::read_dir(sessions_dir)
-        .with_context(|| format!("读取会话目录失败：{}", sessions_dir.display()))?;
+    let entries = std::fs::read_dir(sessions_root)
+        .with_context(|| format!("读取会话目录失败：{}", sessions_root.display()))?;
 
+    // 先收集待读的会话文件：项目子目录下的一层 `.json` + 根目录下的 `.json`。
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        // 子 Agent trace 与 checkpoint 是目录/其他后缀，一并跳过。
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
+        if path.is_dir() {
+            // `<sid>.checkpoints/`、`<sid>.subagents/` 是同级的旁路目录，
+            // 里面的 `.json` 不是会话，别把它们当会话统计。
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if name.ends_with(".checkpoints") || name.ends_with(".subagents") {
+                continue;
+            }
+            if let Ok(inner) = std::fs::read_dir(&path) {
+                for item in inner.flatten() {
+                    let inner_path = item.path();
+                    if is_session_file(&inner_path) {
+                        files.push(inner_path);
+                    }
+                }
+            }
+        } else if is_session_file(&path) {
+            files.push(path);
         }
+    }
+
+    for path in files {
         // 单个坏文件不能让整条命令失败：跳过并继续统计其余会话。
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
@@ -203,9 +229,20 @@ pub fn collect(
     })
 }
 
+/// 是否是会话 transcript 文件（排除 `.meta.json` 旁路文件）。
+fn is_session_file(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    !stem.ends_with(".meta")
+}
+
 pub fn run(since: Option<String>, project: Option<String>, json: bool) -> Result<()> {
-    let sessions_dir = wyj_config::config_dir()?.join("sessions");
-    let report = collect(&sessions_dir, since.as_deref(), project.as_deref())?;
+    let sessions_root = wyj_config::layout::sessions_root(&wyj_config::config_dir()?);
+    let report = collect(&sessions_root, since.as_deref(), project.as_deref())?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -391,6 +428,17 @@ mod tests {
             )
             .unwrap();
         }
+
+        /// 写进项目子目录（新布局）。
+        fn write_in_project(&self, project: &str, id: &str, body: serde_json::Value) {
+            let dir = self.dir.join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{id}.json")),
+                serde_json::to_string_pretty(&body).unwrap(),
+            )
+            .unwrap();
+        }
     }
 
     impl Drop for Fixture {
@@ -412,6 +460,43 @@ mod tests {
             "api_calls": calls,
             "messages": [],
         })
+    }
+
+    /// 会话改成按项目分目录后，`usage` 必须把项目子目录里的也算进去。
+    ///
+    /// 这条同时覆盖旧布局：根目录下平铺的文件仍在统计范围内——升级后没跑
+    /// `storage migrate` 的用户不该看到「这个月 0 消耗」。
+    #[test]
+    fn aggregates_across_project_subdirectories_and_legacy_flat_files() {
+        let fx = Fixture::new("nested");
+        fx.write_in_project(
+            "v1-repo-0123456789abcdef",
+            "n1",
+            session_json("2026-10-01T00:00:00Z", "/repo", 1000, 100, 2),
+        );
+        fx.write_in_project(
+            "v1-other-fedcba9876543210",
+            "n2",
+            session_json("2026-10-02T00:00:00Z", "/other", 2000, 200, 3),
+        );
+        // 旧布局遗留
+        fx.write(
+            "legacy",
+            session_json("2026-09-01T00:00:00Z", "/repo", 500, 50, 1),
+        );
+
+        let r = collect(&fx.dir, None, None).unwrap();
+        assert_eq!(r.total.sessions, 3);
+        assert_eq!(r.total.input_tokens, 3500);
+        assert_eq!(r.total.api_calls, 6);
+        // 按项目仍能区分
+        assert_eq!(r.by_project.len(), 2);
+
+        // 子目录里的 `.meta.json` 不是会话，不能被当成一条记录
+        let dir = fx.dir.join("v1-repo-0123456789abcdef");
+        std::fs::write(dir.join("n1.meta.json"), "{}").unwrap();
+        let r = collect(&fx.dir, None, None).unwrap();
+        assert_eq!(r.total.sessions, 3, ".meta.json 不应计入会话数");
     }
 
     #[test]

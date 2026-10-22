@@ -485,8 +485,12 @@ fn prepare_workflow_workspace_at(
     if !is_git {
         return Ok(None);
     }
+    // 会话按项目分目录后，workflow 的 checkpoint 也要落在**所属项目**的目录里；
+    // 落在根目录会让 `subagent-trace` / `session` 子命令跨项目定位不到它。
+    let sessions_dir =
+        wyj_config::layout::project_sessions_dir(config, &wyj_core::project_key(&repository_root));
     let checkpoint_store =
-        CheckpointStore::configured(&config.join("sessions"), format!("workflow-{}", spec.id))?;
+        CheckpointStore::configured(&sessions_dir, format!("workflow-{}", spec.id))?;
     let checkpoint = checkpoint_store.create(
         &repository_root,
         Vec::new(),
@@ -497,15 +501,17 @@ fn prepare_workflow_workspace_at(
     let WorkspaceSnapshot::Git(snapshot) = loaded.workspace else {
         return Ok(None);
     };
-    let project = wyj_core::project_id(&repository_root);
+    let project = wyj_core::project_key(&repository_root);
     Ok(Some(WorkflowWorkspace {
         manager: Arc::new(GitWorktreeManager::new(
-            config.join("workspaces").join(&project),
+            wyj_config::layout::workspaces_root(config).join(&project),
         )?),
         repository_root,
         base_revision: snapshot.commit,
         parent_checkpoint_id: checkpoint.id,
-        index_root: config.join("indexes").join(project).join("workflow"),
+        index_root: wyj_config::layout::indexes_root(config)
+            .join(project)
+            .join("workflow"),
     }))
 }
 
@@ -544,9 +550,10 @@ pub fn load_spec(path: &Path) -> Result<WorkflowSpec> {
 }
 
 fn state_dir(cwd: &Path) -> Result<PathBuf> {
-    Ok(wyj_config::config_dir()?
-        .join("workflows")
-        .join(wyj_core::project_id(&wyj_core::project_root(cwd))))
+    Ok(
+        wyj_config::layout::workflows_root(&wyj_config::config_dir()?)
+            .join(wyj_core::project_key(&wyj_core::project_root(cwd))),
+    )
 }
 
 fn validate_id(id: &str) -> Result<()> {

@@ -115,7 +115,11 @@ pub fn run(command: MemoryCommand, cwd: &Path, enabled: bool) -> Result<()> {
             all_projects,
             json,
         } => {
-            let sessions = wyj_core::SessionStore::new(base.join("sessions"))?;
+            // `search`（不带项目过滤）走 `list_all`，会扫遍所有项目目录 +
+            // 根目录下的旧平铺文件；`search_for_project` 则只留在当前项目。
+            // 两者都用 `for_project` 构造的 store，避免单目录模式看不到项目子目录。
+            let sessions =
+                wyj_core::SessionStore::for_project(wyj_config::layout::sessions_root(&base), cwd)?;
             let hits = if all_projects {
                 sessions.search(&query, limit)?
             } else {

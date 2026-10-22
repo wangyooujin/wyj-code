@@ -88,6 +88,20 @@ pub fn release_self(path: &Path) -> Result<()> {
     imp::release_self(path)
 }
 
+/// 只读探测：`path` 当前是否被**别的进程**持有排他锁。
+///
+/// 与 [`try_acquire`] 的区别是**零副作用**。`try_acquire` 拿到锁之后会
+/// `set_len(0)` 再写入自己的 pid，这会刷新 mtime——用它做「陈旧锁清理」的
+/// 探测，探测动作本身就把目标变成「刚刚用过」，于是那些锁永远清不掉。
+/// 实测症状：`storage prune` 的 dry-run 报「将删除 1 个」，紧接着 `--yes`
+/// 报「已删除 0 个」，文件原封不动。
+///
+/// 实现上只 `open` 一个只读 fd 试拿 `LOCK_EX|LOCK_NB`：unix 的 `flock` 与
+/// fd 的读写模式无关，只读 fd 同样可以拿排他锁；拿到即说明无人持有。
+pub fn is_locked(path: &Path) -> bool {
+    imp::is_locked(path)
+}
+
 /// 读取锁文件里记录的持有者 pid（非 unix 实现才有意义）。
 pub fn read_holder_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path)
@@ -212,6 +226,22 @@ mod imp {
             file,
         }))
     }
+
+    /// 只读探测持有状态：不写 pid、不动 mtime、不创建文件。
+    pub fn is_locked(path: &Path) -> bool {
+        // 文件不存在 = 没人持有（也就没什么可删的，调用方会跳过）。
+        let Ok(file) = fs::File::open(path) else {
+            return false;
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // 拿到就立刻放开：只读 fd 也能拿排他锁，这个锁不影响别人。
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            true
+        }
+    }
 }
 
 // ── 非 unix: 锁文件 + 陈旧兜底 ───────────────────────────────────────────────
@@ -296,6 +326,11 @@ mod imp {
             .map(|modified| modified.elapsed().unwrap_or_default() > STALE_AFTER)
             .unwrap_or(false)
     }
+
+    /// 非 unix 的锁是「文件存在即持有」，因此探测就是看文件在不在。
+    pub fn is_locked(path: &Path) -> bool {
+        path.exists()
+    }
 }
 
 impl Drop for FileLock {
@@ -345,6 +380,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _a = acquire(&dir.path().join("a.lock"), "a").unwrap();
         let _b = acquire(&dir.path().join("b.lock"), "b").unwrap();
+    }
+
+    /// `is_locked` 必须零副作用：不创建文件、不改 mtime。
+    ///
+    /// 这条钉的是一个实测 bug：陈旧锁清理用 `try_acquire` 做探测，而它会
+    /// 写 pid 刷新 mtime，于是「探测」本身把目标变成「刚刚用过」——
+    /// dry-run 报「将删除 1 个」，`--yes` 报「已删除 0 个」，文件永远清不掉。
+    #[test]
+    fn is_locked_probe_has_no_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.lock");
+        std::fs::write(&path, "999\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400 * 30);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert!(!is_locked(&path), "无人持有");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "探测不能刷新 mtime"
+        );
+
+        // 真的有人持有时要报 true，且同样不改 mtime。
+        let guard = acquire(&path, "test").unwrap();
+        let held_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(is_locked(&path), "被持有时必须探测到");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            held_mtime
+        );
+        drop(guard);
+    }
+
+    /// 不存在的锁文件不该被判成「被持有」——清理路径会据此跳过，无害；
+    /// 但判成 true 会让调用方误以为有活进程。
+    #[test]
+    fn is_locked_on_missing_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_locked(&dir.path().join("nope.lock")));
     }
 
     /// 同一个锁在**另一个进程**上必须真的互斥 —— 进程内的 Mutex 在这里帮不上忙，

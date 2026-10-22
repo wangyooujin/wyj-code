@@ -463,8 +463,11 @@ async fn spawn_headless(
 const SCHEDULE_RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 fn latest_session_id_for(task_cwd: &Path) -> Option<String> {
-    let dir = wyj_config::config_dir().ok()?.join("sessions");
-    let store = wyj_core::SessionStore::new(dir).ok()?;
+    let store = wyj_core::SessionStore::for_project(
+        wyj_config::layout::sessions_root(&wyj_config::config_dir().ok()?),
+        task_cwd,
+    )
+    .ok()?;
     store
         .last_for_project(task_cwd)
         .ok()
