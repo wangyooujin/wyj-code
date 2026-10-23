@@ -52,10 +52,28 @@ pub struct TraversalBudget {
 
 impl Default for TraversalBudget {
     /// 实测依据：3000 节点 ≈ 9.3s，故 400 节点 ≈ 1.2s；截图固定开销 2.1s
-    /// 留出余量故取 2s。同花顺的表格单元格埋在深层嵌套里，depth 不能低于 10。
+    /// 留出余量故取 2s。
+    ///
+    /// **`max_depth` 从 10 调到 24（2026-10-23 实测）**：深度 10 会漏掉
+    /// Web/自绘应用的绝大部分树。实测深度直方图：
+    ///
+    /// | App | 总节点 | 深度 ≤10 | 最大深度 |
+    /// |---|---|---|---|
+    /// | Chrome | 2783 | **81（3%）** | 18 |
+    /// | 抖音 | 1158 | **36（3%）** | 23 |
+    /// | 访达 | 240 | 240（100%） | 7 |
+    /// | 同花顺 | 20001 | 20000（100%） | 7 |
+    ///
+    /// WebView 的 DOM 包装层每层只贡献一个 `AXGroup`，真正的控件与文本都在
+    /// 13~16 层。深度 10 时 Chrome 只访问到 81 个节点、1 个文本节点；放到 24
+    /// 后同样的 400 节点预算能访问 400 个节点、82 控件 + 40 文本（实测
+    /// `crates/computer/examples/` 的临时探针）。24 是实测最大深度 23 的上界，
+    /// 再高只会撞节点预算而不会多拿到东西。**深度本身不是成本**——耗时由
+    /// 访问节点数决定（Chrome 400 节点 depth=24 为 0.032s，depth=10 为
+    /// 0.013s，差值完全来自访问数 81→400）。
     fn default() -> Self {
         Self {
-            max_depth: 10,
+            max_depth: 24,
             max_nodes: 400,
             max_duration: std::time::Duration::from_millis(2000),
             max_children_per_node: 50,
@@ -63,6 +81,14 @@ impl Default for TraversalBudget {
         }
     }
 }
+
+/// 同父节点下同类文本 role 的默认上限，仅 `include_text` 打开时生效。
+///
+/// 取值来自实测：Chrome 有 1151 个 `AXStaticText`，访达 56 个，抖音 240 个。
+/// 8 个远不够描述一个网页；40 个在 400 节点预算内刚好能覆盖一屏可见文本
+/// （实测 Chrome 40 行 ≈ 7.3KB，约 2k token）。调高到 120 会让同样的窗口
+/// 输出 15KB+，而模型并不会因为多读 80 行就判断更准。
+pub const DEFAULT_TEXT_QUOTA: usize = 40;
 
 /// 单次快照内稳定的元素引用。仅在同一次 `list_elements` 的返回内有效。
 ///
@@ -279,6 +305,32 @@ pub fn is_interesting_role(role: Option<&str>) -> bool {
     )
 }
 
+/// 该元素是**纯文本节点**（只提供内容、不提供交互）。
+///
+/// 与 [`is_interesting_role`] 的分工：那个白名单是「这个元素能不能被操作」，
+/// 本函数是「这个元素能不能被读」。二者正交——`AXLink` 两边都算，`AXButton`
+/// 只算前者，`AXStaticText` 只算后者。
+///
+/// **为什么它必须是独立的一类**：实测（2026-10-23，本机）文本节点占
+/// 各应用树的绝大部分。
+///
+/// | App | `AXStaticText` | 其中带文本 | 采集耗时（全量） |
+/// |---|---|---|---|
+/// | Chrome | 1151 | 1151 | 0.21s |
+/// | 抖音 | 240 | 240 | 0.13s |
+/// | 访达 | 56 | 56 | 0.06s |
+/// | 同花顺 | 15 | 15 | 0.92s（表格是 3953 个 `AXTextField`） |
+///
+/// 也就是说网页正文、列表条目、表格单元的文字**本来就在系统里、带精确坐标**，
+/// 而旧白名单一个都不给模型——模型只能靠看 1280 宽的下采样截图去认字。
+///
+/// `AXCell` / `AXRow` 刻意**不在**此列：它们是容器，`AXValue` 实测 100% 为空
+/// （Chrome 341 个 `AXCell`、访达 67 个、同花顺 989 个 `AXRow`，带文本数全为 0），
+/// 放进来只会白占配额。
+pub fn is_text_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXStaticText" | "AXHeading" | "AXListMarker"))
+}
+
 /// 判定单个元素是否保留所需的全部输入。
 ///
 /// 刻意收成结构体而不是七个平铺参数：这些字段必须**成组**演进（新增一个
@@ -293,16 +345,24 @@ pub struct KeepContext<'a> {
     /// 本元素是全树中该 role 的第几个（从 0 开始）。
     pub role_siblings_so_far: usize,
     pub max_siblings_per_role: usize,
+    /// 本次调用是否把纯文本节点也算进来（[`ElementQuery::include_text`]）。
+    ///
+    /// 计数配额由调用方按**独立的一份** [`RoleBudget`] 管理，不与控件共享
+    /// ——否则 40 个文本节点会把 8 个按钮的名额挤掉。
+    pub include_text: bool,
 }
 
 /// 元素是否应进入输出列表。
 ///
-/// 三条规则，从实测数据反推：
+/// 四条规则，从实测数据反推：
 /// 1. 必须有实际内容——纯装饰节点永远丢弃；
-/// 2. 必须可交互或是有意义的控件 role（[`is_interesting_role`]）；
+/// 2. 必须可交互或是有意义的控件 role（[`is_interesting_role`]），**或者**
+///    在 `include_text` 下是有文本的纯文本节点（[`is_text_role`]）；
 /// 3. 同类 role 超过阈值时只保留前 N 个（[`TraversalBudget`] 的
 ///    `max_siblings_per_role`）——这是同花顺 1% 可交互率的直接对策：
-///    2349 个 `AXTextField` 是行情表格数据，不压掉就会淹没上下文。
+///    2349 个 `AXTextField` 是行情表格数据，不压掉就会淹没上下文；
+/// 4. 文本节点单独一份配额（调用方传 `max_siblings_per_role` 为文本上限），
+///    默认 [`DEFAULT_TEXT_QUOTA`]。
 ///
 /// 纯函数，便于单测；调用方用 [`RoleBudget`] 维护计数。
 pub fn should_keep(context: KeepContext<'_>) -> bool {
@@ -315,7 +375,8 @@ pub fn should_keep(context: KeepContext<'_>) -> bool {
             return false;
         }
     }
-    if !is_interesting_role(context.role) {
+    let readable = context.include_text && is_text_role(context.role);
+    if !is_interesting_role(context.role) && !readable {
         return false;
     }
     context.role_siblings_so_far < context.max_siblings_per_role
@@ -464,6 +525,15 @@ pub struct ElementQuery {
     pub role_filter: Option<Vec<String>>,
     /// 最多返回多少个元素。达到上限即停止收集并置 `has_more`。
     pub limit: Option<usize>,
+    /// 是否把纯文本节点（[`is_text_role`]）也列出来。
+    ///
+    /// 默认 `false`：默认输出的是「能点什么」，文本会把列表撑大且绝大多数
+    /// 任务不需要。模型要读内容时显式打开——这是它唯一能拿到**精确坐标 +
+    /// 原文**的通道，比看 1280 宽的下采样截图认字可靠得多。
+    ///
+    /// 文本节点与控件节点**各自独立配额**（见 [`DEFAULT_TEXT_QUOTA`]），
+    /// 所以打开它不会挤掉可交互元素。
+    pub include_text: bool,
 }
 
 /// 把 role 名归一化：去空白、去大小写敏感的 `AX` 前缀、转小写。
@@ -769,6 +839,11 @@ mod macos {
         // 共享池下，「同类 role 超过 N 个」是全树语义——对「表格单元格会把
         // 上下文淹没」这个真实问题也正是需要的语义。
         let mut siblings = RoleBudget::default();
+        // 文本节点用**独立**的一份配额：两者共用一个 RoleBudget 时 40 个
+        // `AXStaticText` 不会挤掉按钮（role 键不同），但把文本上限与控件上限
+        // 混在同一个 `max_siblings_per_role` 里会让「按钮最多 8 个」这条规则
+        // 的语义变得依赖 role 名，改一侧就影响另一侧。分开更直白。
+        let mut text_siblings = RoleBudget::default();
 
         while let Some((node, depth)) = queue.pop_front() {
             if visited >= budget.max_nodes {
@@ -827,13 +902,24 @@ mod macos {
                 && query.accepts_role(role.as_deref())
                 && query.accepts_frame(frame_in_screenshot);
             if in_scope {
-                let sibling_index = siblings.take(role.as_deref());
+                // 文本节点从独立配额里取号，控件的阈值规则保持原样。
+                let is_text = super::is_text_role(role.as_deref());
+                let sibling_index = if is_text {
+                    text_siblings.take(role.as_deref())
+                } else {
+                    siblings.take(role.as_deref())
+                };
                 if super::should_keep(super::KeepContext {
                     role: role.as_deref(),
                     has_content: has_content(&attrs),
                     frame_in_screenshot,
                     role_siblings_so_far: sibling_index,
-                    max_siblings_per_role: budget.max_siblings_per_role,
+                    max_siblings_per_role: if is_text {
+                        super::DEFAULT_TEXT_QUOTA
+                    } else {
+                        budget.max_siblings_per_role
+                    },
+                    include_text: query.include_text,
                 }) {
                     // `limit` 是调用方主动限流：达到上限就停，并置 `has_more`。
                     // 不能只是「不 push 继续遍历」——那会把整棵树走完再丢掉，
@@ -1006,7 +1092,65 @@ mod tests {
             frame_in_screenshot: frame,
             role_siblings_so_far: siblings,
             max_siblings_per_role: 8,
+            include_text: false,
         })
+    }
+
+    fn keep_text(
+        role: Option<&str>,
+        has_content: bool,
+        frame: Option<Frame>,
+        siblings: usize,
+    ) -> bool {
+        should_keep(KeepContext {
+            role,
+            has_content,
+            frame_in_screenshot: frame,
+            role_siblings_so_far: siblings,
+            max_siblings_per_role: DEFAULT_TEXT_QUOTA,
+            include_text: true,
+        })
+    }
+
+    /// `include_text` 必须真的把静态文本放出来，且**只在**打开时放。
+    ///
+    /// 这条是「模型能不能读屏幕文字」的唯一开关。关掉时 `AXStaticText` 必须
+    /// 仍然被拒——否则默认输出会突然膨胀（Chrome 单窗口 1151 个文本节点）。
+    #[test]
+    fn include_text_gates_static_text_nodes() {
+        let solid = Frame {
+            x: 0.0,
+            y: 0.0,
+            width: 40.0,
+            height: 14.0,
+        };
+        for role in ["AXStaticText", "AXHeading", "AXListMarker"] {
+            assert!(is_text_role(Some(role)), "{role} 应被识别为文本节点");
+            // 关：仍然丢弃（默认输出的语义不变）。
+            assert!(
+                !keep(Some(role), true, Some(solid), 0),
+                "{role} 关闭时不应保留"
+            );
+            // 开：保留。
+            assert!(
+                keep_text(Some(role), true, Some(solid), 0),
+                "{role} 打开时应保留"
+            );
+            // 无内容仍丢弃——空文本节点没有任何价值。
+            assert!(!keep_text(Some(role), false, Some(solid), 0));
+        }
+        // 容器 role 不在文本白名单里：实测 AXValue 全为空。
+        assert!(!is_text_role(Some("AXCell")));
+        assert!(!is_text_role(Some("AXRow")));
+        // 文本配额用尽即停。
+        assert!(!keep_text(
+            Some("AXStaticText"),
+            true,
+            Some(solid),
+            DEFAULT_TEXT_QUOTA
+        ));
+        // 控件 role 不受 `include_text` 影响。
+        assert!(keep_text(Some("AXButton"), true, Some(solid), 0));
     }
 
     #[test]
@@ -1095,8 +1239,12 @@ mod tests {
         // 3000 节点 ≈ 9.3s，故 400 节点 ≈ 1.2s。
         assert_eq!(b.max_nodes, 400);
         assert_eq!(b.max_duration, std::time::Duration::from_millis(2000));
-        // 同花顺的行情单元格埋在深层嵌套里。
-        assert!(b.max_depth >= 10);
+        // 深度必须盖住 WebView 的 DOM 包装层。实测 Chrome 最大深度 18、
+        // 抖音 23，深度 10 时两者都只能访问到 3% 的树。
+        assert!(
+            b.max_depth >= 24,
+            "WebView 的 AX 树最深实测 23 层，低于它只能看到 3% 的节点"
+        );
         assert_eq!(b.max_siblings_per_role, 8);
     }
 

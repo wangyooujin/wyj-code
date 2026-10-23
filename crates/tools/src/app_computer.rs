@@ -302,6 +302,197 @@ impl AppComputerTool {
         }
     }
 
+    /// 用系统 OCR 读出窗口里的文字（带像素坐标）。
+    ///
+    /// # 这是**兜底**通道，不是首选
+    ///
+    /// 有 AX 文本时用 `list_elements` + `include_text`：那条路 0.2~0.9 秒、
+    /// 文本直接来自系统语义树、无识别误差。`read_text` 只在 AX 树空洞时才有
+    /// 价值——原生自绘应用（微信）、canvas 图表、视频字幕、图片里的文字。
+    ///
+    /// # 为什么必须传原始像素图
+    ///
+    /// 实测同一张 4K 截屏：原始像素下识别 114 行、中文基本完整；缩到 1280
+    /// 宽后错字明显增加（`Fille` / `seripts` / `pubLish`），而**耗时不变**
+    /// （0.91s 是固定底价）。因此这里刻意用 `u32::MAX` 关闭下采样，代价是
+    /// 多传几十毫秒的截图，换来可用得多的识别结果。
+    ///
+    /// # 结果必须标注是机器识别
+    ///
+    /// 置信度实测常落在 0.3~0.5，中文尤其容易串行（「标普500ETF」会读成
+    /// 「さ标普500ETF南方」）。因此回执里逐行给置信度，并在末尾明确告诉
+    /// 模型「这是 OCR，不是原文，数值要二次核对」——否则模型会把它当成
+    /// 读到的确定事实。
+    fn read_text(&self, input: &Value) -> ToolResult {
+        let window_id = match required_u32(input, "window_id") {
+            Ok(value) => value,
+            Err(error) => return error_result(error),
+        };
+        if let Some(generation) = input.get("generation").and_then(Value::as_u64) {
+            if let Err(error) = wyj_computer::target::validate_window_target(window_id, generation)
+            {
+                return error_result(error);
+            }
+        }
+        // 阈值只接受 [0,1]；传 `"0.4"` 这类字符串说明模型理解偏了，显式报错
+        // 而不是静默当成 0（那会让它以为过滤掉了噪音、实际没有）。
+        let min_confidence = match input.get("min_confidence") {
+            Some(value) => {
+                let raw = match value.as_f64() {
+                    Some(raw) => raw,
+                    None => return error_result("`min_confidence` must be a number"),
+                };
+                if !(0.0..=1.0).contains(&raw) {
+                    return error_result("`min_confidence` must be between 0 and 1");
+                }
+                raw as f32
+            }
+            None => 0.0,
+        };
+
+        // 不缩放：OCR 的准确率依赖原始像素，而耗时是固定底价。
+        let (target, capture) =
+            match wyj_computer::target::capture_window_by_id(window_id, u32::MAX) {
+                Ok(result) => result,
+                Err(error) => return error_result(error),
+            };
+        self.observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(window_id, target.clone());
+        // `read_text` 同样附截图，也算一次观察——连续变更计数归零，
+        // 否则模型连做 20 次只读观察后会被迫多付一张强制截图。
+        self.mutations_since_screenshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(window_id, 0);
+
+        let result = match wyj_computer::ocr::recognize_png(&capture.png) {
+            Ok(result) => result,
+            Err(error) => return error_result(error),
+        };
+        let kept = result
+            .lines
+            .iter()
+            .filter(|line| line.confidence >= min_confidence)
+            .count();
+
+        let mut display = format!(
+            "tree_id=none (OCR reads pixels, not the accessibility tree — use `list_elements` \
+             with `include_text:true` when the app exposes text) window={} image={}x{} \
+             lines={} kept={} elapsed={}ms\n",
+            window_id,
+            result.image_width,
+            result.image_height,
+            result.lines.len(),
+            kept,
+            result.elapsed_ms
+        );
+        display.push_str("conf  @centre        text\n");
+        // 按阅读顺序排序：先纵后横。Vision 返回的顺序大致按置信度，直接给
+        // 模型会得到一堆跳跃的行——而模型读表格/列表时依赖上下文的先后。
+        let mut lines: Vec<_> = result
+            .lines
+            .iter()
+            .filter(|line| line.confidence >= min_confidence)
+            .collect();
+        lines.sort_by_key(|line| (line.center.1 / 8, line.center.0));
+        for line in &lines {
+            display.push_str(&format!(
+                "{:.2}  ({:>5},{:>5})  {}\n",
+                line.confidence, line.center.0, line.center.1, line.text
+            ));
+        }
+        if result.truncated {
+            display.push_str(&format!(
+                "\nTruncated at {} lines. Narrow the window or read a smaller region.\n",
+                wyj_computer::ocr::MAX_LINES
+            ));
+        }
+        display.push_str(
+            "\nThese lines were recognized from pixels, not read from the UI model. \
+             Confidence is per-line; Chinese and dense digits are the least reliable \
+             (a number that looks right can still be a misread). Verify before acting \
+             on a value. Coordinates are pixel positions in this capture — the same \
+             space `coordinate` actions accept for this window.\n\
+             以下文本由 OCR 从像素识别而来，不是从界面模型读到的。数值与中文尤其容易误识，\
+             据此操作前请二次核对。坐标是本截图内的像素坐标，可直接用于 `coordinate` 动作。",
+        );
+
+        ToolResult::with_parts(
+            display,
+            vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: capture.png_base64(),
+            }],
+        )
+    }
+
+    /// 执行一条编译期固定的 AppleScript recipe。
+    ///
+    /// # 为什么这是 action 而不是独立工具
+    ///
+    /// 它做的是「控制某个应用」，与 `app_computer` 同一职责面，因此复用同一套
+    /// 权限确认（`needs_permission` 里刻意**不**放行）：每次调用都要用户点头。
+    /// 独立工具会得到另一份 `allowed_tools.json` 条目，用户可以整体放行它，
+    /// 那正是这条路径最不该拥有的自由度。
+    ///
+    /// # 交互面是硬前置
+    ///
+    /// 首次调用某个目标 App 时 macOS 会弹一次 TCC 模态框。headless / 子 Agent /
+    /// 定时任务里没人能点它，调用会挂到超时——因此这里显式要求交互面，与
+    /// `computer` 的 `requires_foreground_takeover` 判据同源。
+    fn run_recipe(&self, input: &Value, ctx: &dyn ToolContext) -> ToolResult {
+        if !ctx.supports_interactive_confirmation() {
+            return error_result(
+                "requires_foreground_takeover: recipes may prompt for macOS Automation \
+                 permission, which needs a person to accept the system dialog. This \
+                 execution surface has no interactive confirmation channel.",
+            );
+        }
+        let name = match input.get("recipe").and_then(Value::as_str) {
+            Some(name) => name,
+            None => return error_result("`run_recipe` requires a `recipe` name"),
+        };
+        let recipe = match wyj_computer::applescript::require(name) {
+            Ok(recipe) => recipe,
+            Err(error) => return error_result(error),
+        };
+        let args: Vec<String> = match input.get("args") {
+            Some(value) => match value.as_array() {
+                Some(items) => {
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        match item.as_str() {
+                            Some(text) => out.push(text.to_string()),
+                            None => return error_result("`args` entries must be strings"),
+                        }
+                    }
+                    out
+                }
+                None => return error_result("`args` must be an array of strings"),
+            },
+            // 少数 recipe 可能零参数；目前表里没有，但不要在这里写死前提。
+            None => Vec::new(),
+        };
+        if let Err(error) = wyj_computer::applescript::validate_args(recipe, &args) {
+            return error_result(error);
+        }
+
+        match wyj_computer::applescript::run(recipe, &args) {
+            Ok(output) => {
+                let mut display = format!("recipe `{name}` completed: {}", output.stdout);
+                if !output.stderr.is_empty() {
+                    // 脚本成功但有 stderr（比如 Finder 的警告）时一并给出：
+                    // 模型需要知道「做成了，但有异常」。
+                    display.push_str(&format!("\nstderr: {}", output.stderr));
+                }
+                ToolResult::ok(display)
+            }
+            Err(error) => error_result(error),
+        }
+    }
+
     /// 列出目标窗口 AX 树里的语义元素。
     ///
     /// 这是 grounding 的主力入口：模型据此用 `element_ref` 指元素，而不是在
@@ -1005,20 +1196,30 @@ fn click_with_fallback(
     }
 }
 
-/// 在全局坐标处写入文本：AXValue → 剪贴板粘贴 → 定向 PID 逐字符按键。
+/// 在全局坐标处写入文本：AXValue → 剪贴板粘贴 → 定向 Unicode → 逐字符按键。
 ///
-/// # 三级降级的顺序是有理由的
+/// # 四级降级的顺序是有理由的
 ///
 /// 1. **AXValue / AXSelectedText**：最干净——不碰剪贴板、不碰键盘、不依赖
 ///    焦点。可写的原生控件（`AXTextField`、`AXTextArea`）走这条。
 /// 2. **剪贴板 + `cmd+V`**：覆盖**所有**文字（中文、日文、emoji），代价是
 ///    短暂借用用户的剪贴板。自绘应用（微信）和任何不暴露可写 AX 属性的
 ///    控件都靠这条。
-/// 3. **逐字符定向按键**：只在**全 ASCII** 时可用，作为剪贴板失败的兜底。
-///    它比粘贴更「轻」（不动剪贴板），但对非 ASCII 必然失败。
+/// 3. **定向 PID Unicode**（[`wyj_computer::targeted_event::type_text`]）：
+///    事件里携带文本本身，非 ASCII 也能走，**不动用户剪贴板**。排在剪贴板
+///    之后是因为它无法自证（`CGEventPostToPid` 返回 void，App 静默丢弃时
+///    调用方仍拿到成功），而剪贴板路径的覆盖面已经被实测验证过。
+/// 4. **逐字符定向按键**：只在**全 ASCII** 时可用，作为最后兜底。
 ///
 /// 顺序不能反：把逐字符放前面会让每个中文输入都先失败一次再降级，白白多付
 /// 一趟；把剪贴板放第一则会为本来能 AX 写入的普通控件无谓地动用户的剪贴板。
+///
+/// # 为什么第 3 档不是「非 ASCII 专属」
+///
+/// 理论上它值得排到第 2 档（不动剪贴板是实打实的好处），但那会把**每次**
+/// 文本写入都推进一条无法自证的路径：第 2 档的剪贴板粘贴至少留下「应用主动
+/// 读了剪贴板」这条语义证据，第 3 档什么都没有。取舍是「少动一次剪贴板」
+/// ↔ 「多一次静默失败的可能」，在这里后者更贵。
 fn type_text_with_fallback(target: &WindowTarget, x: f64, y: f64, text: &str) -> Result<String> {
     // 第 1 档：AX 写入。
     match wyj_computer::accessibility::set_text(target.pid, x, y, text) {
@@ -1031,27 +1232,40 @@ fn type_text_with_fallback(target: &WindowTarget, x: f64, y: f64, text: &str) ->
                  exposes no settable accessibility element there; the click that focused \
                  the field must have succeeded first."
             )),
-            // 第 3 档：逐字符。只在全 ASCII 时可能成功；非 ASCII 会在这里
-            // 拿到一个明确的错误，而不是静默丢字。
+            // 第 3 档：定向 Unicode。不动剪贴板，非 ASCII 也能走。
             Err(clipboard_error) => {
-                for character in text.chars() {
-                    wyj_computer::targeted_event::type_char(target.pid, character).map_err(
-                        |typing_error| {
-                            anyhow!(
-                                "{typing_error}\n\nBoth earlier attempts failed: \
-                                 accessibility write ({ax_error}), clipboard paste \
-                                 ({clipboard_error})."
-                            )
-                        },
-                    )?;
-                }
-                Ok(format!(
-                    "typed {} characters via target PID keystrokes at ({x}, {y}). \
+                match wyj_computer::targeted_event::type_text(target.pid, text) {
+                    Ok(()) => Ok(format!(
+                        "typed {} characters via target PID unicode events at ({x}, {y}). \
                      The accessibility write failed ({ax_error}) and clipboard paste failed \
                      ({clipboard_error}); the click that focused the field must have \
-                     succeeded first.",
-                    text.chars().count()
-                ))
+                     succeeded first. Verify with a screenshot — this channel cannot \
+                     confirm that the target app consumed the events.",
+                        text.chars().count()
+                    )),
+                    // 第 4 档：逐字符。只在全 ASCII 时可能成功；非 ASCII 会在这里
+                    // 拿到一个明确的错误，而不是静默丢字。
+                    Err(unicode_error) => {
+                        for character in text.chars() {
+                            wyj_computer::targeted_event::type_char(target.pid, character)
+                                .map_err(|typing_error| {
+                                    anyhow!(
+                                        "{typing_error}\n\nAll earlier attempts failed: \
+                                     accessibility write ({ax_error}), clipboard paste \
+                                     ({clipboard_error}), target PID unicode \
+                                     ({unicode_error})."
+                                    )
+                                })?;
+                        }
+                        Ok(format!(
+                            "typed {} characters via target PID keystrokes at ({x}, {y}). \
+                         The accessibility write failed ({ax_error}) and clipboard paste failed \
+                         ({clipboard_error}); the click that focused the field must have \
+                         succeeded first.",
+                            text.chars().count()
+                        ))
+                    }
+                }
             }
         },
     }
@@ -1105,7 +1319,7 @@ fn scroll_with_fallback(target: &WindowTarget, direction: &str, amount: u32) -> 
     ))
 }
 
-const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying.";
+const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. When you need to *read* text rather than click it, prefer `list_elements` with `include_text:true` — the text comes from the accessibility tree, so it is exact. Only when the app exposes no text at all (self-drawn canvases, images, video captions) use `read_text`, which runs on-device OCR over the window pixels and returns every line with a per-line confidence and pixel coordinates; treat those results as a machine reading, not as ground truth, and re-check numbers before acting on them. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying. A few operations cannot be expressed through the accessibility tree at all — naming a brand-new Finder folder, creating a note whose body is rich text, opening a URL without driving the address bar. For those, `run_recipe` runs one of a small fixed set of automation scripts shipped with the binary: you pick the recipe name and pass its positional `args`, and the arguments travel as data rather than being spliced into the script, so quoting in them is harmless. The first time a recipe drives a given app macOS shows an Automation permission dialog that a person must accept, so recipes only run on interactive surfaces; if that permission is refused you get `appleevents_permission_required` and must not retry.";
 
 #[async_trait]
 impl Tool for AppComputerTool {
@@ -1122,7 +1336,7 @@ impl Tool for AppComputerTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list_windows", "screenshot", "list_elements", "list_menus", "inspect_element", "wait", "click", "drag", "show_menu", "set_text", "press_menu", "key", "scroll"]
+                        "enum": ["list_windows", "screenshot", "list_elements", "list_menus", "inspect_element", "read_text", "wait", "click", "drag", "show_menu", "set_text", "press_menu", "key", "scroll", "run_recipe"]
                     },
                     "window_id": {"type": "integer", "minimum": 0},
                     "generation": {"type": "integer", "minimum": 0},
@@ -1192,6 +1406,26 @@ impl Tool for AppComputerTool {
                         "minimum": 1,
                         "description": "For `list_elements`: return at most this many elements. When the list is cut, the result reports has_more=true."
                     },
+                    "include_text": {
+                        "type": "boolean",
+                        "description": "For `list_elements`: also list static text nodes (AXStaticText, AXHeading, AXListMarker) with their exact positions, up to 40 per window. This is the reliable way to read on-screen text — far more accurate than reading it off a downsampled screenshot. Text nodes have their own quota, so they never crowd out interactable controls. Defaults to false."
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "For `read_text`: drop recognized lines below this confidence (default 0). Recognition is statistical — raise it (e.g. 0.4) to suppress misread noise when you need reliable values, lower it to keep faint or small text."
+                    },
+                    "recipe": {
+                        "type": "string",
+                        "enum": ["finder_new_folder", "notes_new_note", "chrome_open_url"],
+                        "description": "For `run_recipe`: which fixed automation to run. These are compile-time scripts shipped with the binary — you choose the recipe and its arguments, never the script text. Prefer normal `app_computer` actions for anything they can already do; use a recipe only for the specific cases where the accessibility tree cannot express the operation."
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "For `run_recipe`: positional arguments. finder_new_folder takes [parent_posix_path, folder_name]; notes_new_note takes [title, body]; chrome_open_url takes [url]. Arguments are passed as data, not spliced into the script, so quotes and semicolons in them are harmless."
+                    },
                     "ms": {
                         "type": "integer",
                         "minimum": 1,
@@ -1214,6 +1448,7 @@ impl Tool for AppComputerTool {
                     | "list_elements"
                     | "list_menus"
                     | "inspect_element"
+                    | "read_text"
                     | "wait"
             )
         )
@@ -1271,13 +1506,28 @@ impl Tool for AppComputerTool {
         if let Some(path) = describe_drag_path(input) {
             parts.push(path);
         }
+        // recipe 也一样：`run_recipe` 单独一个词完全看不出要跑什么、带什么
+        // 参数，而这段文本是 auto 分类器唯一的输入。
+        if let Some(recipe) = input.get("recipe").and_then(Value::as_str) {
+            parts.push(format!("recipe={recipe}"));
+        }
+        if let Some(args) = input.get("args").and_then(Value::as_array) {
+            let rendered: Vec<String> = args
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|arg| format!("{arg:?}"))
+                .collect();
+            if !rendered.is_empty() {
+                parts.push(format!("args=[{}]", rendered.join(", ")));
+            }
+        }
         format!(
             "{} (background, does not move the pointer permanently)",
             parts.join(" ")
         )
     }
 
-    async fn run(&self, input: Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
+    async fn run(&self, input: Value, ctx: &dyn ToolContext) -> Result<ToolResult> {
         let action = input
             .get("action")
             .and_then(Value::as_str)
@@ -1297,6 +1547,8 @@ impl Tool for AppComputerTool {
             "inspect_element" => self.inspect(&input),
             "list_elements" => self.list_elements(&input),
             "list_menus" => self.list_menus(&input),
+            "read_text" => self.read_text(&input),
+            "run_recipe" => self.run_recipe(&input, ctx),
             "wait" => {
                 let ms = input
                     .get("ms")
@@ -1542,7 +1794,18 @@ fn format_element_line(element: &wyj_computer::element::ElementInfo) -> String {
         .or(element.description.as_deref())
         .or(element.value.as_deref());
     if let Some(label) = label {
-        text.push_str(&format!("{:?}", crate::textutil::truncate_str(label, 60)));
+        // 纯文本节点放宽到 120（= `element::MAX_FIELD_CHARS`）：控件标签是
+        // 几个词，而文本节点的价值就在内容本身——截到 60 会把一段话腰斩成
+        // 「无法据此判断」的半句。120 仍是源码侧已经截断过的长度，不会失控。
+        let limit = if wyj_computer::element::is_text_role(element.role.as_deref()) {
+            wyj_computer::element::MAX_FIELD_CHARS
+        } else {
+            60
+        };
+        text.push_str(&format!(
+            "{:?}",
+            crate::textutil::truncate_str(label, limit)
+        ));
     }
     let mut states: Vec<&str> = Vec::new();
     if element.focused == Some(true) {
@@ -1557,8 +1820,14 @@ fn format_element_line(element: &wyj_computer::element::ElementInfo) -> String {
     if element.value_settable || element.selected_text_settable {
         states.push("settable");
     }
-    if !element.actions.iter().any(|action| action == "AXPress") {
+    if !element.actions.iter().any(|action| action == "AXPress")
+        && !wyj_computer::element::is_text_role(element.role.as_deref())
+    {
         // 明确标出「不能按」：模型据此决定要不要退回坐标。
+        //
+        // 纯文本节点不标：它们**本来**就不能按，每一行都挂一个 `no-press`
+        // 只是噪音。role 名（`StaticText` / `Heading` / `ListMarker`）已经
+        // 足够说明它只能读。
         states.push("no-press");
     }
     if !states.is_empty() {
@@ -1651,10 +1920,21 @@ fn parse_element_query(input: &Value) -> Result<wyj_computer::element::ElementQu
         None => None,
     };
 
+    // `include_text` 只接受真布尔。用 `as_bool()` 而不是 `unwrap_or(false)`：
+    // 传了 `"true"`（字符串）说明模型对 schema 的理解已经偏了，静默当 false
+    // 会让它以为打开了文本通道、实际拿到一份纯控件列表。
+    let include_text = match input.get("include_text") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow!("`include_text` must be a boolean"))?,
+        None => false,
+    };
+
     Ok(wyj_computer::element::ElementQuery {
         region,
         role_filter,
         limit,
+        include_text,
     })
 }
 
@@ -1808,9 +2088,51 @@ mod tests {
         assert!(!tool.needs_permission(&serde_json::json!({"action": "screenshot"})));
         // 列举元素只读 AX 树，不动输入，必须与截图同属免权限档。
         assert!(!tool.needs_permission(&serde_json::json!({"action": "list_elements"})));
+        // `read_text` 只截图 + 跑 OCR，不碰输入，同样免权限。
+        assert!(!tool.needs_permission(&serde_json::json!({"action": "read_text"})));
         // `wait` 只是睡眠，没有任何输入副作用。
         assert!(!tool.needs_permission(&serde_json::json!({"action": "wait", "ms": 500})));
         assert!(tool.needs_permission(&serde_json::json!({"action": "click"})));
+        // recipe 会驱动别的应用、还可能弹 TCC 模态框，**必须**逐次确认。
+        assert!(
+            tool.needs_permission(
+                &serde_json::json!({"action": "run_recipe", "recipe": "chrome_open_url"})
+            ),
+            "run_recipe 绝不能进入免确认白名单：它执行的是自己编译的脚本，\
+             但仍会真实改动用户的其他应用"
+        );
+    }
+
+    /// recipe 的 schema `enum` 必须与 `wyj_computer::applescript::RECIPES`
+    /// **逐项一致**。
+    ///
+    /// 两处各写一份必然会漂移：加了 recipe 却忘了改 schema，模型永远看不到
+    /// 那条；删了 recipe 却留着 enum，模型会调用一个必然报错的 op。schema 的
+    /// `enum` 在部分客户端还会被忽略，所以描述文本里也必须有指引。
+    #[test]
+    fn recipe_enum_matches_the_shipped_table() {
+        let definition = AppComputerTool::new(1280, Duration::from_secs(2)).definition();
+        let declared: Vec<&str> = definition.input_schema["properties"]["recipe"]["enum"]
+            .as_array()
+            .expect("recipe enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let shipped = wyj_computer::applescript::op_names();
+        assert_eq!(
+            declared, shipped,
+            "schema 里的 recipe 清单必须与 applescript::RECIPES 完全一致"
+        );
+        // `run_recipe` 必须在 action enum 里，且 `args` 字段存在。
+        let actions = definition.input_schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(actions.iter().any(|a| a == "run_recipe"));
+        assert!(definition.input_schema["properties"].get("args").is_some());
+        // 描述必须说明「参数是数据、不会被拼进脚本」与「首次会弹授权框」，
+        // 前者决定模型敢不敢传带引号的值，后者决定它知不知道失败可能来自用户。
+        assert!(definition.description.contains("run_recipe"));
+        assert!(definition.description.contains("Automation permission"));
     }
 
     /// `wait` 必须出现在 schema 里并带 `ms` 字段——模型看不见的 action 等于
@@ -1954,11 +2276,17 @@ mod tests {
     }
 
     /// `no-press` 标记必须出现：它直接决定模型该不该退回坐标路线。
+    ///
+    /// **纯文本节点是刻意的例外**：`AXStaticText` / `AXHeading` /
+    /// `AXListMarker` 本来就不能按，每行挂一个 `no-press` 只是噪音，role
+    /// 名已经说明了它只能读。所以这里用一个「看起来能按、实际没有 AXPress」
+    /// 的控件来验证这条标记，而不是拿文本节点当反例。
     #[test]
     fn an_element_without_axpress_is_flagged() {
         let mut with_press = element(0, "AXButton", Some("Save"), true);
         with_press.actions = vec!["AXPress".into()];
-        let mut without_press = element(1, "AXStaticText", Some("Label"), true);
+        // `AXToolbarButton` 属于控件白名单，但没有 AXPress → 必须标出来。
+        let mut without_press = element(1, "AXToolbarButton", Some("Label"), true);
         without_press.actions = Vec::new();
         let snapshot = snapshot_with(vec![with_press, without_press]);
         let text = render_element_list(&snapshot, &capture(), false);
@@ -1967,6 +2295,36 @@ mod tests {
         let no_press_line = lines.iter().find(|line| line.starts_with("e1")).unwrap();
         assert!(!press_line.contains("no-press"), "{press_line}");
         assert!(no_press_line.contains("no-press"), "{no_press_line}");
+    }
+
+    /// 纯文本节点不标 `no-press`，且文本截断上限放宽到 120 字符。
+    ///
+    /// 两条都是 `include_text` 配套的展示规则：模型要能一眼区分「这是可读的
+    /// 内容」和「这是不能按的控件」，而文本的价值在内容本身——截到 60 会把
+    /// 一段话腰斩成无法据此判断的半句。
+    ///
+    /// 注意 `truncate_str` 的第二个参数是**字节**上限（见 `core::textutil`），
+    /// 所以这里用 ASCII 验证长度语义，用中文验证「比控件宽松」这一定性结论。
+    #[test]
+    fn static_text_lines_skip_no_press_and_keep_more_characters() {
+        // ASCII：100 字节 < 120，完整保留。
+        let mut ascii = element(0, "AXStaticText", Some(&"x".repeat(100)), true);
+        ascii.actions = Vec::new();
+        let snapshot = snapshot_with(vec![ascii]);
+        let text = render_element_list(&snapshot, &capture(), false);
+        let line = text.lines().find(|line| line.starts_with("e0")).unwrap();
+        assert!(!line.contains("no-press"), "{line}");
+        // 100 个字符完整保留（控件的 60 字节上限会把它砍到 60）。
+        assert!(line.contains(&"x".repeat(100)), "{line}");
+
+        // 中文 100 个字符 = 300 字节，超过 120 必须被截断——但仍比控件的
+        // 60 字节宽松得多（同样输入，控件只会留下 20 个汉字）。
+        let mut cjk = element(0, "AXStaticText", Some(&"字".repeat(100)), true);
+        cjk.actions = Vec::new();
+        let snapshot = snapshot_with(vec![cjk]);
+        let text = render_element_list(&snapshot, &capture(), false);
+        let line = text.lines().find(|line| line.starts_with("e0")).unwrap();
+        assert!(line.matches('字').count() > 20, "{line}");
     }
 
     /// 没有截图坐标的元素仍要列出（它能被 ref 操作），只是坐标列显示 `-`。

@@ -3187,6 +3187,10 @@ fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Conf
     // 放在注册点而不是 `element.rs` 内部：这是**进程级全局**设置，每次调用
     // 都设一遍纯属浪费，而注册只发生一次（`/model` 重建会再走一遍，无害）。
     wyj_computer::accessibility::set_messaging_timeout(AX_MESSAGING_TIMEOUT_SECS);
+    // OCR 预热：模型加载约 22 秒，**绝不能同步跑**（TUI 会卡死）。后台线程
+    // 只跑一次（`Once` 保护），`read_text` 真正被调用时通常已经热了；没热
+    // 也只影响第一次调用。实测空白图不触发模型加载，所以预热图必须有文字。
+    wyj_computer::ocr::warm_up_in_background();
     let mut tool = wyj_tools::app_computer::AppComputerTool::new(
         wyj_tools::computer::DEFAULT_MAX_DIM,
         std::time::Duration::from_millis(cfg.computer_use.quiet_period_ms),

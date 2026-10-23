@@ -10,6 +10,80 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
+## [Unreleased]
+
+### 修复：`frontmost_pid` 在 macOS 26+ 恒失败（P0）
+
+真机实测 macOS 27.0.1 上 system-wide 元素的 `AXFocusedApplication` /
+`AXFocusedUIElement` **恒定返回 `kAXErrorCannotComplete(-25204)`**，任何前台
+应用、任何时刻都一样。而前台 PID 是 `app_computer` 全部变更动作（`begin_mutation`
+/ `finish_mutation`）、`cursor_click` 与 `targeted_event` 的前置检查——只留 AX
+一条路意味着「点一下」「输入一段字」全都在这类系统上第一步就报
+`target_changed`，工具整体不可用。
+
+`frontmost_pid()` 现在先试 AX（仍是「真正持有键盘焦点」的最权威来源），失败
+退回 `NSWorkspace.frontmostApplication`；两条都失败仍 fail-closed。放宽的只有
+「用哪条路读」，没有放宽「读不到就拒绝执行」。
+
+### 修复：`list_elements` 看不到 Web / 自绘应用的绝大部分树
+
+`TraversalBudget::max_depth` 从 10 提到 24。实测深度直方图：Chrome 2783 个节点
+里只有 **81 个（3%）在深度 10 以内**（最大深度 18）、抖音 1158 个里 36 个（3%）
+（最大深度 23），而访达与同花顺 100% 在 7 层内。WebView 的 DOM 包装层每层只贡献
+一个 `AXGroup`，真正的控件在 13~16 层。同样 400 节点预算下，Chrome 从「81 节点 /
+1 个文本」变成「400 节点 / 82 控件 + 40 文本」。深度本身不是成本——耗时由访问
+节点数决定。
+
+### 新增：`app_computer` 的 `include_text` —— 让模型读到屏幕上的字
+
+`list_elements` 新增 `include_text` 参数。打开后把 `AXStaticText` / `AXHeading`
+/ `AXListMarker` 一并列出，带精确坐标。这是**读文本的首选通道**：实测 Chrome
+窗口内 1151 个 `AXStaticText` 全部有文本、全量遍历 0.21s，此前一个都不给模型，
+它只能看 1280 宽的下采样截图去认字。
+
+文本节点用**独立配额**（`DEFAULT_TEXT_QUOTA = 40`），不与控件共享，所以打开它
+不会挤掉按钮。`AXCell` / `AXRow` 刻意不收：实测 `AXValue` 100% 为空。
+
+### 新增：`app_computer` 的 `read_text` —— 系统 OCR 兜底
+
+用 `objc2-vision` 调 `VNRecognizeTextRequest`，零第三方依赖。只在 AX 树空洞时
+有价值：原生自绘应用（微信）、canvas 图表、视频字幕、图片里的文字。
+
+实测决定了三个设计点：`accurate` 档有约 0.9s 固定底价（与图像大小几乎无关）→
+做成**显式 action** 而非每次动作后自动跑；`fast` 档在缩放图上漏检 4/5 → 不用它
+换速度；缩图显著降低质量而耗时不变 → 刻意关闭下采样。回执逐行给置信度、按阅读
+顺序排序，并明确声明「这是 OCR 不是原文，数值要二次核对」。
+
+预热必须用**含文字**的图：2×2 空白图只花 248ms、完全不触发模型加载，第一次真实
+调用仍要 22s。改用 `assets/ocr-warmup.png` 后预热确实加载模型，之后 0.62s。预热
+在注册点走后台线程（`Once` 保护），不阻塞 TUI。
+
+### 新增：`app_computer` 的 `run_recipe` —— AppleScript 白名单
+
+**不提供通用脚本执行**。只有一张编译期固定的 recipe 表，模型能选 op 名与参数值，
+脚本正文永远来自源码。三条理由源自实测：`System Events` 的 UI scripting 能力不
+超过已有 native AX 却慢 2~10 倍且没有坐标；`execute javascript` 在 Chrome 与
+Safari 上**都默认关闭**；通用脚本会绕过 `hard_deny`（`osascript` 本就因
+`curl | osascript` 被列为解释器）。
+
+参数经 `--` 之后的 argv 传递。实测把 `evil"; do shell script "touch /tmp/PWNED"; --`
+作为文件夹名传入，结果只是原样产生一个同名文件夹——参数是数据，拼进脚本文本才是
+注入。
+
+首批三条：`finder_new_folder`（能命名新文件夹，AX 做不到）、`notes_new_note`
+（建富文本正文的笔记）、`chrome_open_url`（不驱动地址栏）。失败三分类：
+`appleevents_permission_required`（TCC 拒绝，重试无用）/ `recipe_target_unavailable`
+（目标未运行）/ `recipe_failed`。要求交互面——首次调用会弹系统模态框。
+
+### 新增：定向 Unicode 文本输入（`set_text` 第四档）
+
+`targeted_event::type_text` 用 `CGEventKeyboardSetUnicodeString` + `CGEventPostToPid`，
+真机验证目标**失焦**时仍能把中文完整送进控件。`set_text` 降级链扩为四级：
+AX 写入 → 剪贴板粘贴 → 定向 Unicode → 逐字符（仅 ASCII）。
+
+定向 Unicode 排在剪贴板之后是刻意的：它无法自证（`CGEventPostToPid` 返回 void），
+而剪贴板路径至少留下「应用主动读了剪贴板」这条语义证据。
+
 ## [0.3.19] - 2026-10-22
 
 ### 移除：定时任务子系统
