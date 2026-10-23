@@ -37,6 +37,7 @@ cargo build --release            # 构建 release 版本 → target/release/wyj-
 cargo run                        # 启动 TUI 模式
 cargo run -- --headless          # 启动 headless REPL 模式
 cargo run -- -p "your prompt"    # 单次问答（不启动 TUI）
+cargo run -- run /explain <目标>  # 一次性执行一条斜杠命令 / Skill（不读 stdin，跑完即退出）
 cargo run -- --config-status     # 查看当前配置和 API Key 状态
 cargo run -- --cwd <dir>         # 指定工作目录（默认当前目录）
 cargo run -- --plan              # 以 Plan 模式启动（仅只读工具）
