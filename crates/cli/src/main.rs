@@ -20,6 +20,7 @@ mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
 mod review_cmd;
+mod run_cmd;
 mod skillhub_cmd;
 mod storage_cmd;
 mod trust_cmd;
@@ -140,6 +141,23 @@ enum Commands {
     SkillHub {
         #[command(subcommand)]
         command: skillhub_cmd::SkillHubCommand,
+    },
+    /// 一次性执行一条斜杠命令 / Skill。
+    ///
+    /// 与 headless REPL 的分工：REPL 是多轮交互（读 stdin），本命令是**脚本化
+    /// 的一次性调用**——不读 stdin、跑完即退出，退出码反映命令是否成功。
+    /// 命令本体走的是和会话里敲 `/xxx` 完全相同的注册表与分发链路，因此
+    /// skill 的 `$ARGUMENTS` 展开、`allowed-tools` / `model` frontmatter 都照常生效。
+    #[command(name = "run", about = wyj_i18n::tr("cli.run_about"))]
+    Run {
+        /// 要执行的命令（`/name` 或 `name` 均可）；其后的参数原样传给命令。
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            help = wyj_i18n::tr("cli.run_command_help")
+        )]
+        command: Vec<String>,
     },
     /// 本地存储治理:status 查占用 / doctor 查异常 / prune 按 retention 上限清理。
     #[command(
@@ -1376,6 +1394,10 @@ async fn main() -> Result<()> {
         }
     }
 
+    // `wyj-code run <command>` 的命令文本（已归一化成 `/name args` 形式）。
+    // None = 本次运行不是 `run` 入口。
+    let mut run_command: Option<String> = None;
+
     if let Some(cmd) = cli.command.take() {
         match cmd {
             Commands::Acp => runtime_command = Some(RuntimeCommand::Acp),
@@ -1383,6 +1405,9 @@ async fn main() -> Result<()> {
                 runtime_command = Some(RuntimeCommand::Daemon { listen })
             }
             Commands::Update { yes } => return update_cmd::run(yes).await,
+            Commands::Run { command } => {
+                run_command = Some(run_cmd::normalize_command(&command));
+            }
             Commands::SubagentTrace {
                 session_id,
                 sub_id,
@@ -1450,6 +1475,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // `run` 与 `-p` 是同一类入口：单轮、非交互、跑完即退出。它们共用同一套
+    // 执行表面（SinglePrompt）、同一套 agent 装配分支与同一套尾部流程。
+    let single_shot = cli.prompt.is_some() || run_command.is_some();
+    if cli.prompt.is_some() && run_command.is_some() {
+        eprintln!("`-p` 与 `run` 不能同时使用：前者是纯文本提问，后者是斜杠命令");
+        std::process::exit(2);
+    }
+
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
     // TUI 交互模式下绝不能让 tracing 写向 stdout/stderr：crossterm 的 alternate
@@ -1463,8 +1496,7 @@ async fn main() -> Result<()> {
         Some(RuntimeCommand::Acp | RuntimeCommand::Daemon { .. })
     );
     let is_runtime_mode = runtime_command.is_some();
-    let is_tui_mode =
-        !is_runtime_mode && !cli.headless && cli.prompt.is_none() && !cli.config_status;
+    let is_tui_mode = !is_runtime_mode && !cli.headless && !single_shot && !cli.config_status;
     let log_writer = if is_tui_mode {
         match open_tui_log_file() {
             Ok(file) => tracing_subscriber::fmt::writer::BoxMakeWriter::new(move || {
@@ -2019,7 +2051,9 @@ async fn main() -> Result<()> {
                     "main.api_key_missing_for",
                     &[(
                         "entry",
-                        if cli.prompt.is_some() {
+                        if run_command.is_some() {
+                            "run command"
+                        } else if cli.prompt.is_some() {
                             "single prompt (-p)"
                         } else if cli.headless {
                             "headless REPL"
@@ -2095,7 +2129,7 @@ async fn main() -> Result<()> {
         &cfg,
         Arc::clone(&provider_arc),
     ));
-    tool_ctx.set_execution_surface(if cli.prompt.is_some() {
+    tool_ctx.set_execution_surface(if single_shot {
         ExecutionSurface::SinglePrompt
     } else if is_protocol_mode {
         ExecutionSurface::AcpClient
@@ -2257,7 +2291,7 @@ async fn main() -> Result<()> {
     // 有多轮机会，交给 `repl()` 内部完全对称于 TUI 的"后台连接 + 每轮非阻塞
     // 排空结果"方案（见 repl() 内 shared_agent 部分），不阻塞任何一轮。
     // TUI 交互模式同样不在这里连接，交给 tui_main 在界面已经可用之后于后台连接。
-    if cli.prompt.is_some() {
+    if single_shot {
         // 未信任的项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）在这里一律
         // 跳过、不连接：`-p` 常被脚本/cron 无 TTY 调用，没有交互通道可以弹窗
         // 确认，静默放行等于让克隆到的陌生仓库能无感执行任意命令。用户需要
@@ -2435,7 +2469,7 @@ async fn main() -> Result<()> {
     // headless/单次问答模式没有 UI 可交互，AskQuestion 会被自动取消：
     // 告知模型不要调用该工具，直接给出假设并继续（不写入 system_prompt_extra，
     // 因为该变量只服务于 TUI 运行时重建 Agent，headless/-p 路径不会触发重建）。
-    if cli.headless || cli.prompt.is_some() {
+    if cli.headless || single_shot {
         agent = agent.append_system(wyj_core::prompts::NON_INTERACTIVE);
     }
 
@@ -2472,7 +2506,7 @@ async fn main() -> Result<()> {
     assembly::attach_tools(&mut agent, &registry, &cfg, enable_lazy_tool_schemas);
 
     // headless/single-shot 模式：子 Agent 进度以纯文本行打印到 stderr
-    if cli.headless || cli.prompt.is_some() {
+    if cli.headless || single_shot {
         sub_agent_hub.set_event_cb(|ev| {
             use wyj_tools::SubAgentEvent as E;
             match ev {
@@ -2537,7 +2571,7 @@ async fn main() -> Result<()> {
     }
 
     // headless/single-shot 模式：注册格式化工具事件输出到 stderr
-    if cli.headless || cli.prompt.is_some() {
+    if cli.headless || single_shot {
         let mode_info = match mode {
             AgentMode::Plan => wyj_i18n::tr("main.mode_info_plan"),
             AgentMode::Bypass => wyj_i18n::tr("main.mode_info_bypass"),
@@ -2549,7 +2583,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let agent = if cli.headless || cli.prompt.is_some() {
+    let agent = if cli.headless || single_shot {
         agent
             // thinking 以暗灰打到 stderr，不进 stdout（保持管道输出纯净）
             .with_thinking_callback(|d| {
@@ -2841,120 +2875,66 @@ async fn main() -> Result<()> {
         }
         session.messages = initial_messages;
         session.push_user(prompt);
-        let turns = session.messages.len();
-        let started = std::time::Instant::now();
-        let turn_result = agent
-            .run_turn(&mut session, &tool_ctx, &mut |d| {
-                print!("{d}");
-                let _ = io::stdout().flush();
-            })
-            .await;
-        emit_plugin_turn_event(
-            &plugin_runtime,
-            if turn_result.is_ok() {
-                "turn_finished"
-            } else {
-                "turn_error"
-            },
-            &session_id,
-            &cwd,
-            &session,
-            turn_result.as_ref().err().map(ToString::to_string),
-        )
-        .await;
-        // 统一通知：CLI -p 回合完成 / 错误
-        match &turn_result {
-            Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
-                duration_ms: started.elapsed().as_millis() as u64,
-                summary: format!("-p ({turns} msgs)"),
-                session_id: Some(session_id.clone()),
-            }),
-            Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
-                error: e.to_string(),
-                session_id: Some(session_id.clone()),
-            }),
+        let env = SingleTurnEnv {
+            plugin_runtime: plugin_runtime.clone(),
+            session_store: session_store_arc.clone(),
+            history_store,
+            sub_agent_hub: sub_agent_hub.clone(),
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            entry_label: "-p".to_string(),
+        };
+        run_one_turn(&agent, &mut session, &tool_ctx, context_window, &env).await
+    } else if let Some(cmd_text) = run_command.as_deref() {
+        // `wyj-code run /xxx`：一次性执行一条斜杠命令 / Skill。
+        //
+        // 与 `-p` 的差别只在「输入从哪来」：`-p` 收一段纯文本，本命令收一条
+        // 斜杠命令，走的是和会话里敲 `/xxx` 完全相同的注册表与分发链路。
+        require_provider(&initial_provider, "run command")?;
+        let mut session = Session::new();
+        if let Some(file) = session_store_arc
+            .as_ref()
+            .and_then(|store| store.load(&session_id).ok())
+        {
+            session.restore_usage_from(&file);
         }
-        turn_result?;
-        println!();
-        // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
-        // 供 benchmarks/run.sh 解析做改进前后对比。先补一个换行：thinking
-        // 增量用 eprint!（无换行）输出，否则 JSON 会被拼接到思考文本尾部。
-        if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
-            let full_input = session
-                .total_input_tokens
-                .saturating_add(session.total_cache_read_tokens)
-                .saturating_add(session.total_cache_write_tokens);
-            let cache_hit_ratio = if full_input > 0 {
-                session.total_cache_read_tokens as f64 / full_input as f64
-            } else {
-                0.0
-            };
-            let context_tokens = wyj_core::estimate_tokens(&session.messages);
-            eprintln!();
-            eprintln!(
-                "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"tool_schema_tokens\":{},\"tool_schema_tokens_total\":{},\"tool_schema_tokens_saved\":{},\"sub_input_tokens\":{},\"sub_output_tokens\":{},\"sub_cache_read_tokens\":{},\"sub_cache_write_tokens\":{},\"duration_secs\":{:.1}}}",
-                session.total_input_tokens,
-                session.total_output_tokens,
-                session.total_cache_read_tokens,
-                session.total_cache_write_tokens,
-                full_input,
-                cache_hit_ratio,
-                context_tokens,
-                context_window,
-                session.api_calls,
-                // 稳态口径（最近一次请求实际发送量），与 /context 面板同源。
-                session.tool_schema_tokens_last,
-                // 累加口径（本会话为工具定义总共付出的量）。
-                session.tool_schema_tokens,
-                session.tool_schema_tokens_saved,
-                session.sub_input_tokens,
-                session.sub_output_tokens,
-                session.sub_cache_read_tokens,
-                session.sub_cache_write_tokens,
-                started.elapsed().as_secs_f64()
-            );
+        session.messages = initial_messages;
+        let env = SingleTurnEnv {
+            plugin_runtime: plugin_runtime.clone(),
+            session_store: session_store_arc.clone(),
+            history_store,
+            sub_agent_hub: sub_agent_hub.clone(),
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+            entry_label: format!("run {cmd_text}"),
+        };
+        let mut plugin_skill_sources = wyj_store::plugin_install::enabled_plugin_skill_paths(&cwd);
+        if let Some(local) = &local_plugin {
+            plugin_skill_sources.extend(local.skill_paths.clone());
         }
-        // 结束前等待全部后台子 Agent 完成（结果由 Done 事件回调打印）
-        let bg_count = sub_agent_hub.background_count();
-        if bg_count > 0 {
-            eprintln!(
-                "{}",
-                wyj_i18n::tr_fmt("subagent.waiting_bg", &[("count", &bg_count.to_string())])
-            );
+        let mut plugin_agent_paths = wyj_store::plugin_install::enabled_plugin_agent_paths(&cwd);
+        if let Some(local) = &local_plugin {
+            plugin_agent_paths.extend(local.agent_paths.clone());
         }
-        sub_agent_hub.wait_background().await;
-        // 杀掉全部后台 Bash 任务的进程组，防止孤儿进程
-        wyj_tools::BashSessionManager::global().kill_all();
-        // 升级版会话统计
-        let in_tok = session.total_input_tokens;
-        let out_tok = session.total_output_tokens;
-        eprintln!("\n── {} ──", wyj_i18n::tr("main.session_stats"));
-        eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
-        if let Some(hs) = &history_store {
-            let _ = hs.append(&HistoryEntry {
-                timestamp: now_iso(),
-                session_id: session_id.clone(),
-                input_tokens: in_tok,
-                output_tokens: out_tok,
-                turns,
-                cwd: cwd.display().to_string(),
-            });
-        }
-        if let Some(store) = &session_store_arc {
-            let _ = store.save(&SessionFile::from_session(
-                &session,
-                SessionFileMeta {
-                    session_id: session_id.clone(),
-                    title: extract_title(&session.messages),
-                    last_preview: extract_preview(&session.messages),
-                    cwd: cwd.display().to_string(),
-                    timestamp: now_iso(),
-                    turns,
-                    title_generated: false,
-                },
-            ));
-        }
-        Ok(())
+        let effective_mcp_count =
+            effective_mcp_servers_for_runtime(&cfg, &cwd, local_plugin.as_ref()).len();
+        run_cmd::execute(run_cmd::RunRequest {
+            text: cmd_text.to_string(),
+            agent,
+            rebuild_fn: rebuild_fn.clone(),
+            tool_ctx,
+            session: &mut session,
+            cfg: &cfg,
+            mode: &mode,
+            cwd: &cwd,
+            plugin_skill_sources,
+            plugin_agent_paths,
+            effective_mcp_count,
+            hooks_enabled: !cli.no_hooks,
+            context_window,
+            env: &env,
+        })
+        .await
     } else if cli.headless {
         require_provider(&initial_provider, "headless REPL")?;
         repl(
@@ -3717,6 +3697,147 @@ async fn emit_plugin_turn_event(
             tracing::warn!("plugin channel {} failed: {}", result.name, result.output);
         }
     }
+}
+
+/// 单轮（非交互）执行的公共环境。
+///
+/// `-p` 与 `run` 共用：两条入口的尾部行为（插件事件、通知、token 统计、
+/// 会话落盘）必须一致，否则同一个 skill 在两条路径上的用量与落盘结果会分叉。
+pub(crate) struct SingleTurnEnv {
+    pub plugin_runtime: Arc<wyj_store::plugin_runtime::PluginRuntimeCatalog>,
+    pub session_store: Option<Arc<SessionStore>>,
+    pub history_store: Option<HistoryStore>,
+    pub sub_agent_hub: Arc<wyj_tools::SubAgentHub>,
+    pub session_id: String,
+    pub cwd: PathBuf,
+    /// 通知摘要里显示的入口名（`-p` / `run /xxx`）。
+    pub entry_label: String,
+}
+
+/// 跑一个单轮，并把一次性入口共有的尾部流程收在这里：
+/// 插件事件 → 统一通知 → token 统计 → 会话落盘。
+///
+/// 抽出来而不是各写一份，是因为 `-p` 与 `run` 的**唯一**区别是输入从哪来
+/// （一段纯文本 vs 一条斜杠命令）；尾部一旦分叉，两条路径的用量统计就会对不上。
+async fn run_one_turn(
+    agent: &Agent,
+    session: &mut Session,
+    tool_ctx: &ToolCtx,
+    context_window: u32,
+    env: &SingleTurnEnv,
+) -> Result<()> {
+    let turns = session.messages.len();
+    let started = std::time::Instant::now();
+    let turn_result = agent
+        .run_turn(session, tool_ctx, &mut |d| {
+            print!("{d}");
+            let _ = io::stdout().flush();
+        })
+        .await;
+    emit_plugin_turn_event(
+        &env.plugin_runtime,
+        if turn_result.is_ok() {
+            "turn_finished"
+        } else {
+            "turn_error"
+        },
+        &env.session_id,
+        &env.cwd,
+        session,
+        turn_result.as_ref().err().map(ToString::to_string),
+    )
+    .await;
+    // 统一通知：单轮回合完成 / 错误
+    match &turn_result {
+        Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
+            duration_ms: started.elapsed().as_millis() as u64,
+            summary: format!("{} ({turns} msgs)", env.entry_label),
+            session_id: Some(env.session_id.clone()),
+        }),
+        Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
+            error: e.to_string(),
+            session_id: Some(env.session_id.clone()),
+        }),
+    }
+    turn_result?;
+    println!();
+    // 评测基准：WYJ_STATS_JSON=1 时向 stderr 输出一行机器可读统计，
+    // 供 benchmarks/run.sh 解析做改进前后对比。先补一个换行：thinking
+    // 增量用 eprint!（无换行）输出，否则 JSON 会被拼接到思考文本尾部。
+    if std::env::var("WYJ_STATS_JSON").is_ok_and(|v| v == "1") {
+        let full_input = session
+            .total_input_tokens
+            .saturating_add(session.total_cache_read_tokens)
+            .saturating_add(session.total_cache_write_tokens);
+        let cache_hit_ratio = if full_input > 0 {
+            session.total_cache_read_tokens as f64 / full_input as f64
+        } else {
+            0.0
+        };
+        let context_tokens = wyj_core::estimate_tokens(&session.messages);
+        eprintln!();
+        eprintln!(
+            "{{\"input_tokens\":{},\"output_tokens\":{},\"cache_read_tokens\":{},\"cache_write_tokens\":{},\"full_input_tokens\":{},\"cache_hit_ratio\":{:.4},\"context_tokens\":{},\"context_window\":{},\"api_calls\":{},\"tool_schema_tokens\":{},\"tool_schema_tokens_total\":{},\"tool_schema_tokens_saved\":{},\"sub_input_tokens\":{},\"sub_output_tokens\":{},\"duration_secs\":{:.1}}}",
+            session.total_input_tokens,
+            session.total_output_tokens,
+            session.total_cache_read_tokens,
+            session.total_cache_write_tokens,
+            full_input,
+            cache_hit_ratio,
+            context_tokens,
+            context_window,
+            session.api_calls,
+            // 稳态口径（最近一次请求实际发送量），与 /context 面板同源。
+            session.tool_schema_tokens_last,
+            // 累加口径（本会话为工具定义总共付出的量）。
+            session.tool_schema_tokens,
+            session.tool_schema_tokens_saved,
+            session.sub_input_tokens,
+            session.sub_output_tokens,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    // 结束前等待全部后台子 Agent 完成（结果由 Done 事件回调打印）
+    let bg_count = env.sub_agent_hub.background_count();
+    if bg_count > 0 {
+        eprintln!(
+            "{}",
+            wyj_i18n::tr_fmt("subagent.waiting_bg", &[("count", &bg_count.to_string())])
+        );
+    }
+    env.sub_agent_hub.wait_background().await;
+    // 杀掉全部后台 Bash 任务的进程组，防止孤儿进程
+    wyj_tools::BashSessionManager::global().kill_all();
+    // 升级版会话统计
+    let in_tok = session.total_input_tokens;
+    let out_tok = session.total_output_tokens;
+    eprintln!("\n── {} ──", wyj_i18n::tr("main.session_stats"));
+    eprintln!("  tokens: {in_tok}↑ {out_tok}↓");
+    if let Some(hs) = &env.history_store {
+        let _ = hs.append(&HistoryEntry {
+            timestamp: now_iso(),
+            session_id: env.session_id.clone(),
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            turns,
+            cwd: env.cwd.display().to_string(),
+        });
+    }
+    if let Some(store) = &env.session_store {
+        let _ = store.save(&SessionFile::from_session(
+            session,
+            SessionFileMeta {
+                session_id: env.session_id.clone(),
+                title: extract_title(&session.messages),
+                last_preview: extract_preview(&session.messages),
+                cwd: env.cwd.display().to_string(),
+                timestamp: now_iso(),
+                turns,
+                title_generated: false,
+            },
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4679,6 +4800,33 @@ mod cli_tests {
         let cli = Cli::try_parse_from(["wyj-code", "-p", "hello", "--resume", "abc123"]).unwrap();
         assert_eq!(cli.prompt.as_deref(), Some("hello"));
         assert_eq!(cli.resume.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn run_subcommand_keeps_the_command_and_its_arguments() {
+        let cli = Cli::try_parse_from(["wyj-code", "run", "/explain", "crates/core/src/agent.rs"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Run { command }) => {
+                assert_eq!(
+                    command,
+                    vec![
+                        "/explain".to_string(),
+                        "crates/core/src/agent.rs".to_string()
+                    ]
+                );
+                assert_eq!(
+                    run_cmd::normalize_command(&command),
+                    "/explain crates/core/src/agent.rs"
+                );
+            }
+            other => panic!("expected Run subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_subcommand_requires_a_command() {
+        assert!(Cli::try_parse_from(["wyj-code", "run"]).is_err());
     }
 
     #[test]
