@@ -38,15 +38,16 @@ ProfileDialog 浮层在事件循环里拦截所有用户输入,`agent.run_turn` 
 打开期间不会被调用;`profile_try_save` 成功后 `rebuild_fn` 替换掉 `shared_agent`,
 占位 Provider 被丢弃。
 
-### 非 TUI 入口的 guard(5 处)
+### 非 TUI 入口的 guard(6 处)
 
-`crates/cli/src/main.rs::require_provider(initial, entry_label)`,在以下 5 处调用:
+`crates/cli/src/main.rs::require_provider(initial, entry_label)`,在以下 6 处调用:
 
 - `RuntimeCommand::Acp` → `"acp"`
 - `RuntimeCommand::Daemon { .. }` → `"daemon"`
 - `RuntimeCommand::WorkflowRun { .. }` → `"workflow run"`
 - `cli.prompt.is_some()` → `"single prompt (-p)"`
 - `cli.headless` → `"headless REPL"`
+- `run_command.is_some()` → `"run command"`
 
 `TUI` 分支(`wyj_tui::run_tui`)末尾传 `needs_api_key_onboarding = matches!(initial_provider, InitialProvider::MissingApiKey)`,由 `tui_main` 内部 `AppState::new` 之后立即 `state.profile_dialog = Some(ProfileDialog::new_for_onboarding(&state.config))`。
 
