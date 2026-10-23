@@ -151,10 +151,10 @@ pub fn key(pid: u32, combo: &str) -> Result<()> {
 ///
 /// # 为什么这条路径是必要的
 ///
-/// 逐字符投递（[`type_char`]）对非 ASCII 文字必然失败，而 AX 写入对自绘应用
-/// 也必然失败——两条路都不通时，中文输入就成了死胡同。粘贴绕开了「合成每个
-/// 字符」这个方向：它是应用层的语义动作，不关心内容是什么文字，因此中文、
-/// 日文、emoji 全都走同一条路。
+/// 逐字符投递（[`type_char`]）只覆盖 ASCII，而 AX 写入对自绘应用必然失败——
+/// 两条路都不通时，中文输入就成了死胡同。粘贴绕开了「合成每个字符」这个
+/// 方向：它是应用层的语义动作，不关心内容是什么文字，因此中文、日文、
+/// emoji 全都走同一条路。
 ///
 /// # 调用方必须先写好剪贴板
 ///
@@ -171,16 +171,106 @@ pub fn paste(pid: u32) -> Result<()> {
     key(pid, "cmd+v")
 }
 
+/// 单块 Unicode 文本最多携带的 UTF-16 code unit 数。
+///
+/// 20 与 enigo 的实测值一致（`enigo-0.6.1/src/macos/macos_impl.rs` 按 20 字符
+/// 切片）。实测本机 macOS 27 上整串 40 个字一次性投递也能完整到达，但块越小
+/// 越不容易在长文本上触发「只保留最后一段」的旧行为，没有理由冒险放大。
+const UNICODE_CHUNK_UNITS: usize = 20;
+
+/// 把文本切成若干块，每块的 UTF-16 长度不超过 [`UNICODE_CHUNK_UNITS`]。
+///
+/// **必须按 `char` 边界切、不能按字节**：emoji 与中文在 UTF-16 里分别是
+/// 2 个与 1 个 code unit，按字节切会把一个字符劈成两个无效的代理项。
+///
+/// 单个 `char` 的 UTF-16 长度上限是 2，块上限 20，所以永远不会出现
+/// 「一个字符比块还大」的情况——这也是不需要 `if` 处理超长单字符的原因。
+fn unicode_chunks(text: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut units = 0usize;
+    for character in text.chars() {
+        let width = character.len_utf16();
+        if units + width > UNICODE_CHUNK_UNITS && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            units = 0;
+        }
+        current.push(character);
+        units += width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// 向目标进程投递任意 Unicode 文本（逐块 `CGEventKeyboardSetUnicodeString`）。
+///
+/// # 与 [`type_char`] 的分工
+///
+/// `type_char` 走的是**键位表**：它发的是「按下 ANSI 布局里编号 N 的那个物理
+/// 键」，所以只能表示键盘上真有的字符，中文/日文/emoji 一律无解。
+/// 本函数走的是 `CGEventKeyboardSetUnicodeString`：事件里携带的是**文本本身**，
+/// 与键位无关，因此能覆盖任意脚本。
+///
+/// # 实测依据（2026-10-23，本机 macOS 27.0.1）
+///
+/// 用 `NSTextView` 探针验证了两种情况，文本都完整进入控件：
+///
+/// - 目标在前台：`post_to_pid` + Unicode → 控件内容 `中文输入测试ABC123`
+/// - 目标**失焦**（前台切到别处）：`post_to_pid` + Unicode → 控件内容
+///   `…后台的中文` 完整追加
+///
+/// 这条实测推翻了本模块旧注释里「除标准 ASCII 外的字符绝大多数 App 都不消费
+/// 该字段」的判断——那句是针对**逐字符**形态说的：逐字符时每个事件只带一个
+/// 非 ASCII 字符，App 容易把它当 IME 中间态丢掉；整块携带时没有这个问题。
+///
+/// # 为什么仍然不是第一选择
+///
+/// 它无法自证：`CGEventPostToPid` 返回 void，事件被目标 App 静默丢弃时调用方
+/// 拿到的仍是成功。剪贴板粘贴有同样的缺陷，但剪贴板路径多一层「应用要主动
+/// 读剪贴板」的语义，覆盖过的 App 更多。因此工具层的降级链把它排在剪贴板
+/// **之后**、逐字符**之前**——比剪贴板轻（不动用户剪贴板、不需要目标持有
+/// 焦点），比逐字符通用（非 ASCII 也能走）。
+pub fn type_text(pid: u32, text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let before = crate::accessibility::frontmost_pid()?;
+    let source = source()?;
+    for chunk in unicode_chunks(text) {
+        let units: Vec<u16> = chunk.encode_utf16().collect();
+        for is_down in [true, false] {
+            // keycode 0 是占位：真正的内容由下面的 unicode payload 决定。
+            // 与 enigo 的 `Key::Unicode` 分支同一做法。
+            let event = CGEvent::new_keyboard_event(Some(&source), 0, is_down)
+                .ok_or_else(|| anyhow!("failed to create target unicode event"))?;
+            mark(&event);
+            // SAFETY: `units` 的生命周期覆盖整个调用，指针与长度同源。
+            unsafe {
+                CGEvent::keyboard_set_unicode_string(
+                    Some(&event),
+                    units.len() as _,
+                    units.as_ptr(),
+                );
+            }
+            CGEvent::post_to_pid(pid as libc::pid_t, Some(&event));
+        }
+        crate::telemetry::record_targeted_pid_event();
+        validate_focus_unchanged(before)?;
+    }
+    Ok(())
+}
+
 /// 逐字符向目标进程投递按键。
 ///
-/// **只支持 ASCII 可打印字符**。中文、日文等非拉丁文字**无法**用这种方式
-/// 输入：`CGEventKeyboardSetUnicodeString` 虽能携带任意 Unicode，但除标准
-/// ASCII 外的字符绝大多数 App 都不消费该字段，而是走 IME 合成路径——那需要
-/// 目标进程处于前台、或至少持有 IME 上下文。因此非 ASCII 字符一律报错，
-/// 让调用方明确知道「这条路走不通」，而不是静默丢字。
+/// **只支持 ASCII 可打印字符**：它发的是键位表里的物理键，非拉丁文字没有
+/// 对应键位。要输入中文/日文/emoji 请用 [`type_text`]（携带文本本身）或
+/// 剪贴板粘贴；非 ASCII 字符在这里一律报错，让调用方明确知道「这条路走不通」，
+/// 而不是静默丢字。
 ///
-/// 逐字符而不是整串：整串的 `CGEventKeyboardSetUnicodeString` 在部分 App 里
-/// 只有最后一个字符生效，逐字符是实测更稳的形态。
+/// 逐字符而不是整串：本函数是**键位**通道，每个字符对应一个独立的物理键，
+/// 天然只能一个一个发。整串文本由 [`type_text`] 走 unicode 通道。
 pub fn type_char(pid: u32, character: char) -> Result<()> {
     let (code, flags) = char_to_keycode(character).ok_or_else(|| {
         anyhow!(
@@ -426,5 +516,51 @@ mod tests {
             );
         }
         assert!(type_char(0, '望').is_err());
+    }
+
+    /// 分块必须按 `char` 边界，且每块 UTF-16 长度不超过上限。
+    ///
+    /// 按字节切会把中文/emoji 劈成无效代理项——那是一类「输入框里出现问号」
+    /// 的静默错误，只有真机输入才看得见。
+    #[test]
+    fn unicode_chunks_never_split_a_character() {
+        for text in [
+            "",
+            "a",
+            "中文输入测试",
+            "😀😀😀",
+            "a中😀b",
+            &"x".repeat(57),
+            &"中".repeat(57),
+        ] {
+            let chunks = unicode_chunks(text);
+            assert_eq!(
+                chunks.concat(),
+                text,
+                "分块后拼回必须与原文本完全一致：{text:?}"
+            );
+            for chunk in &chunks {
+                assert!(
+                    chunk.encode_utf16().count() <= UNICODE_CHUNK_UNITS,
+                    "块 `{chunk}` 超过 {UNICODE_CHUNK_UNITS} 个 code unit"
+                );
+                assert!(!chunk.is_empty(), "不允许产生空块");
+            }
+        }
+    }
+
+    /// emoji 在 UTF-16 里占两个 code unit，块边界必须算得进去。
+    #[test]
+    fn unicode_chunks_account_for_surrogate_pairs() {
+        let emoji = "😀";
+        assert_eq!(emoji.encode_utf16().count(), 2);
+        // 19 个 ASCII + 1 个 emoji = 21 个 code unit > 20，必须切成两块。
+        let text = format!("{}{}", "a".repeat(19), emoji);
+        let chunks = unicode_chunks(&text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[1], emoji);
+        // 19 个 ASCII + 1 个中文 = 20 个 code unit，正好一块。
+        let fits = format!("{}{}", "a".repeat(19), "中");
+        assert_eq!(unicode_chunks(&fits).len(), 1);
     }
 }

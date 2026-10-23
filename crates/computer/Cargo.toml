@@ -26,12 +26,25 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # 这些 crate 已经是 enigo 的传递依赖（Cargo.lock 锁定 0.3.2），声明为直接
 # 依赖不增加编译体积，只是让 wyj-computer 能直接使用系统安全边界。
 [target.'cfg(target_os = "macos")'.dependencies]
+# `objc2` 本体：OCR 与 AppKit 调用需要 `AnyThread`（提供 `alloc`）、`Retained`。
+# 它本就是上面所有 `objc2-*` 的传递依赖，声明为直接依赖不增加编译体积。
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["CGEvent", "CGEventSource", "CGEventTypes", "CGRemoteOperation", "CGSession", "CGWindow", "libc"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFArray", "CFDate", "CFDictionary", "CFMachPort", "CFNumber", "CFRunLoop", "CFString"] }
 objc2-application-services = { version = "0.3", default-features = false, features = ["AXActionConstants", "AXAttributeConstants", "AXError", "AXUIElement", "AXValue", "HIServices", "libc", "objc2-core-graphics"] }
 # 剪贴板文本注入（set_text 对非 ASCII 的唯一可用通道）。
 # `NSPasteboard` 是 AppKit 的一部分，不引入额外的原生依赖。
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard", "NSPasteboardItem", "std"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "std"] }
+#
+# `NSWorkspace` 是 `frontmost_pid` 的**备用**判定：macOS 26+ 实测
+# `AXFocusedApplication` 恒返回 `kAXErrorCannotComplete(-25204)`，而前台 PID
+# 是所有后台定向动作的前置安全条件——只剩 AX 一条路等于整个工具在真机上
+# 全面拒绝执行。`NSWorkspace.frontmostApplication` 是 Apple 文档里
+# 「当前接收键盘事件的应用」的官方定义，且不需要任何额外 TCC 授权。
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSData", "NSArray", "NSDictionary", "std"] }
+# 系统 OCR（`VNRecognizeTextRequest`）。只在 AX 树空洞时用——微信这类原生
+# 自绘应用既不暴露元素、也无法 hit-test，读屏就只剩视觉这一条路。不引入
+# 任何第三方 OCR 依赖，只链接系统 Vision.framework。
+objc2-vision = { version = "0.3", default-features = false, features = ["VNRequestHandler", "VNRequest", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "objc2-core-foundation"] }
 
 [dev-dependencies]
