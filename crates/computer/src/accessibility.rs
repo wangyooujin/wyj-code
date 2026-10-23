@@ -4,6 +4,7 @@
 //! 激活应用。坐标由 [`crate::target::WindowTarget`] 从最近窗口截图映射而来。
 
 use anyhow::{anyhow, bail, Result};
+use objc2_app_kit::NSWorkspace;
 use objc2_application_services::{
     AXCopyMultipleAttributeOptions, AXError, AXIsProcessTrusted, AXUIElement, AXValue, AXValueType,
 };
@@ -145,20 +146,69 @@ fn element_pid(element: &AXUIElement) -> Result<u32> {
     u32::try_from(pid).map_err(|_| anyhow!("AX element returned invalid pid {pid}"))
 }
 
-/// 通过系统级 Accessibility 元素取得真实前台应用 PID。
+/// 通过 Accessibility 或 `NSWorkspace` 取得真实前台应用 PID。
 ///
-/// 不能用“可见窗口中 is_focused=true”代替：无窗口应用、系统面板或窗口枚举
-/// 短暂失败时会得到 `None`，从而把前台变化误判为“前后都没变”。后台动作把
-/// 前台不变当作硬安全条件，因此这里在无法精确取得 PID 时失败关闭。
+/// # 为什么必须有两条路（2026-10-23 修 P0）
+///
+/// 旧实现只用 system-wide 元素的 `AXFocusedApplication`。实测本机 macOS
+/// 27.0.1（Build 26A434）上它**恒定返回 `kAXErrorCannotComplete(-25204)`**：
+///
+/// ```text
+/// AXFocusedApplication -> -25204 nil
+/// AXFocusedUIElement   -> -25204 nil
+/// NSWorkspace 前台      -> 访达/653 或 Chrome/1341（每次都对）
+/// ```
+///
+/// 而前台 PID 是 `app_computer` 每一个变更动作的**前置条件**
+/// （`begin_mutation` / `finish_mutation`）以及 `cursor_click`、
+/// `targeted_event` 的前后校验点。因此单靠 AX 意味着：在这台机器上，
+/// 「点一下」「输入一段字」这类动作全部在第一步就报
+/// `target_changed: copy AXFocusedApplication failed`——工具整个不可用。
+///
+/// # 顺序与降级语义
+///
+/// 仍然**先试 AX**：它是「真正持有键盘焦点」的最权威来源（能区分同一 App
+/// 的多个窗口、能反映系统面板）。只有它取不到时才退到
+/// `NSWorkspace.frontmostApplication`——Apple 文档对后者的定义就是「当前
+/// 接收键盘事件的应用」，语义一致且不需要额外 TCC 授权。
+///
+/// **不是「随便找个能用的」**：两条路都失败仍然返回错误（失败关闭）。这里
+/// 放宽的只有「用哪条路读」，没有放宽「读不到就拒绝执行」。
+///
+/// # 不能用「可见窗口中 is_focused=true」代替
+///
+/// `WindowTarget::focused` 来自 `NSWorkspace.activeApplication().pid`，是
+/// **应用级**判断：同一个前台 App 的所有窗口都为 true（同花顺这类多窗口
+/// 交易软件的主界面+行情浮窗会同时命中），无法回答「哪一个窗口在收输入」。
+/// 那是 `target.rs::frontmost_window` 用 z-order 解决的问题，与本函数正交。
 pub fn frontmost_pid() -> Result<u32> {
     require_trusted()?;
     // SAFETY: 创建系统级 AX 根元素，不激活或修改任何应用。
     let system = unsafe { AXUIElement::new_system_wide() };
-    let focused = copy_attribute(&system, AX_FOCUSED_APPLICATION)?
-        .ok_or_else(|| anyhow!("target_changed: AXFocusedApplication is unavailable"))?
-        .downcast::<AXUIElement>()
-        .map_err(|_| anyhow!("target_changed: AXFocusedApplication returned an invalid type"))?;
-    element_pid(&focused)
+    if let Some(pid) = copy_attribute(&system, AX_FOCUSED_APPLICATION)
+        .ok()
+        .flatten()
+        .and_then(|value| value.downcast::<AXUIElement>().ok())
+        .and_then(|element| element_pid(&element).ok())
+    {
+        return Ok(pid);
+    }
+    workspace_frontmost_pid().ok_or_else(|| {
+        anyhow!(
+            "target_changed: could not determine the frontmost application (both \
+             AXFocusedApplication and NSWorkspace.frontmostApplication failed)"
+        )
+    })
+}
+
+/// `NSWorkspace.frontmostApplication` 的 PID。
+///
+/// 独立成函数是为了让 [`frontmost_pid`] 的降级路径可读，也方便真机探针
+/// 单独验证这一条腿。
+fn workspace_frontmost_pid() -> Option<u32> {
+    let workspace = NSWorkspace::sharedWorkspace();
+    let application = workspace.frontmostApplication()?;
+    u32::try_from(application.processIdentifier()).ok()
 }
 
 /// 恢复一个已知应用为前台。只供用户明确开启的 foreground compatibility

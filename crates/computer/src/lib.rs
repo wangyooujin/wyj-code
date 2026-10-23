@@ -9,6 +9,8 @@
 pub mod accessibility;
 pub mod activity;
 #[cfg(target_os = "macos")]
+pub mod applescript;
+#[cfg(target_os = "macos")]
 pub mod clipboard;
 #[cfg(target_os = "macos")]
 pub mod cursor_click;
@@ -17,6 +19,8 @@ pub mod element;
 #[cfg(target_os = "macos")]
 pub mod menu;
 pub mod occlusion;
+#[cfg(target_os = "macos")]
+pub mod ocr;
 pub mod scale;
 pub mod target;
 #[cfg(target_os = "macos")]
