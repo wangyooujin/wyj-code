@@ -1,0 +1,744 @@
+<!doctype html>
+<html lang="zh-CN" class="overflow-x-hidden">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>wyj-code 配置参考 — 全部参数与环境变量</title>
+<meta name="description" content="wyj-code 完整配置参考：调用分组、思考预算、上下文清理、存储回收、Auto 权限分类器、通知、自进化与全部环境变量，逐字段给出类型、默认值与行为说明。" />
+<link rel="icon" href="favicon.svg" type="image/svg+xml" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body class="relative overflow-x-hidden selection:bg-amber-500">
+
+<!-- icon sprite -->
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-github" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.1.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.05-.72.08-.7.08-.7 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.7 1.26 3.36.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.19-3.08-.12-.29-.52-1.46.11-3.04 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.79 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.58.23 2.75.11 3.04.74.8 1.19 1.83 1.19 3.08 0 4.41-2.7 5.38-5.27 5.67.42.36.78 1.07.78 2.16 0 1.56-.01 2.82-.01 3.2 0 .31.2.66.79.55A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></symbol>
+</svg>
+
+<div class="fixed inset-0 -z-10 grid-layer"></div>
+<div class="fixed inset-0 -z-10 noise-layer pointer-events-none"></div>
+<div class="fixed -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[600px] -z-10 rounded-full blur-3xl opacity-[0.12]" style="background: radial-gradient(closest-side, #ffb454, transparent);"></div>
+
+<!-- NAV -->
+<header class="sticky top-0 z-40 backdrop-blur-md bg-ink-900/80 border-b border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 h-16 flex items-center justify-between">
+    <a href="index.html" class="flex items-center gap-2.5 shrink-0">
+      <svg viewBox="0 0 64 64" class="w-7 h-7"><rect width="64" height="64" rx="14" fill="#14171a"/><path d="M14 22 L28 32 L14 42" fill="none" stroke="#ffb454" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="38" width="18" height="6" rx="2" fill="#ffb454"/></svg>
+      <span class="font-display font-bold tracking-tight text-lg">wyj-code</span>
+    </a>
+    <nav class="hidden md:flex items-center gap-7 text-sm text-paper/65">
+      <a href="index.html#demo" class="hover:text-amber-500 transition-colors" data-i18n="nav.demo">演示</a>
+      <a href="index.html#websearch" class="hover:text-amber-500 transition-colors" data-i18n="nav.websearch">网页搜索</a>
+      <a href="docs.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.docs">文档</a>
+      <a href="config.html" class="text-amber-500" data-i18n="nav.config">配置</a>
+      <a href="index.html#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
+    </nav>
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-1 text-xs font-medium">
+        <button class="lang-btn px-1.5 py-1" data-lang="zh">中文</button>
+        <span class="text-paper/20">/</span>
+        <button class="lang-btn px-1.5 py-1" data-lang="en">EN</button>
+      </div>
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="btn-ghost hidden sm:flex items-center gap-2 px-3.5 py-2 rounded-lg text-sm">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-github"/></svg>
+        <span data-i18n="nav.github">GitHub</span>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- INTRO -->
+<section class="relative max-w-6xl mx-auto px-5 sm:px-8 pt-16 sm:pt-24 pb-10">
+  <div class="reveal max-w-3xl">
+    <div class="inline-flex items-center gap-2 badge-pill rounded-full px-3.5 py-1.5 text-xs mb-7">
+      <span class="w-1.5 h-1.5 rounded-full bg-phosphor"></span>
+      <span data-i18n="cfg.kicker">配置参考</span>
+    </div>
+    <h1 class="font-display font-extrabold leading-[1.05] tracking-tight text-4xl sm:text-5xl" data-i18n="cfg.title">每一个参数，都能解释为什么</h1>
+    <p class="mt-6 text-lg text-paper/70 leading-relaxed" data-i18n="cfg.desc">全局配置只有一个文件：<code class="text-amber-400">~/.wyj-code/config.toml</code>。下面按分节列出全部字段——类型、默认值、以及它到底影响哪条代码路径。绝大多数人只需要前两节。</p>
+  </div>
+
+  <div class="mt-10 reveal grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+    <a href="#quickstart" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.quick">最小可用配置</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.quick.desc">三行就能跑起来</p>
+    </a>
+    <a href="#profiles" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.profiles">调用分组</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.profiles.desc">端点 / 模型 / 思考 / 缓存</p>
+    </a>
+    <a href="#storage" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.storage">存储与回收</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.storage.desc">别让 ~/.wyj-code 长到几十 GB</p>
+    </a>
+    <a href="#auto" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.auto">Auto 权限</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.auto.desc">什么会自动放行、什么永远不行</p>
+    </a>
+    <a href="#project" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.project">项目级配置</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.project.desc">可提交、随 clone 落地的那部分</p>
+    </a>
+    <a href="#env" class="arch-node rounded-lg p-4 block">
+      <p class="font-mono text-sm text-amber-400" data-i18n="cfg.index.env">环境变量</p>
+      <p class="mt-1 text-sm text-paper/55" data-i18n="cfg.index.env.desc">15 个运行期开关</p>
+    </a>
+  </div>
+</section>
+
+<!-- QUICKSTART -->
+<section id="quickstart" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.quick.kicker">Quickstart</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.quick.title">最小可用配置</h2>
+    <p class="mt-4 text-paper/55" data-i18n="cfg.quick.desc">总共三行：端点协议、模型名、Key 走环境变量。其余全是默认值，不写就生效。</p>
+  </div>
+
+  <div class="mt-8 grid lg:grid-cols-2 gap-4">
+    <div class="code-block rounded-xl relative reveal">
+      <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-cfg-min" data-copy-text="provider = &quot;anthropic&quot;
+model = &quot;claude-opus-4-8&quot;
+context_window = 200000" aria-label="copy">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+      </button>
+      <pre class="p-5 pr-14 text-[13px] leading-[1.8] overflow-x-auto"><code id="code-cfg-min"><span class="text-paper/35"># ~/.wyj-code/config.toml</span>
+provider = <span class="text-phosphor">"anthropic"</span>
+model = <span class="text-phosphor">"claude-opus-4-8"</span>
+context_window = <span class="text-phosphor">200000</span>   <span class="text-paper/35"># 必须填真实值</span></code></pre>
+    </div>
+    <div class="card rounded-xl p-6 reveal">
+      <h3 class="font-semibold text-phosphor" data-i18n="cfg.quick.env.title">Key 建议走环境变量</h3>
+      <div class="mt-4 code-block rounded-lg">
+        <pre class="px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code>export <span class="text-phosphor">WYJ_CODE_API_KEY</span>="sk-..."</code></pre>
+      </div>
+      <p class="mt-4 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.quick.env.desc">环境变量优先级最高，且<strong>永远不会被写回 config.toml</strong>——即使你之后打开 <code class="text-amber-400">/profile</code> 面板保存了一次。想落盘又不想写明文，就配 <code class="text-amber-400">api_key_env = "MY_KEY_VAR"</code> 引用变量名。</p>
+      <div class="mt-5 rounded-lg border border-amber-500/25 bg-amber-500/[0.05] p-4">
+        <p class="text-sm text-paper/70 leading-relaxed" data-i18n="cfg.quick.ctx.warn"><strong class="text-amber-400">最容易犯的错</strong>：把 <code>context_window</code> 填成一个未验证的超大值。压缩阈值与清理阈值都由它推算——填成 1,000,000 而实际只有 200k，两套保护等于从未运行，工具输出会全量累积、每趟重发整段历史。<code>--config-status</code> 对 &gt;500k 的值会给告警。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FILES -->
+<section id="files" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.files.kicker">Layout</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.files.title">文件与数据根</h2>
+    <p class="mt-4 text-paper/55" data-i18n="cfg.files.desc">数据根默认 <code class="text-amber-400">~/.wyj-code</code>，可用 <code class="text-amber-400">WYJ_CODE_HOME</code> 整体指向外置盘。它是进程级决定，所有子系统一致生效。</p>
+  </div>
+
+  <div class="mt-8 grid lg:grid-cols-2 gap-4">
+    <div class="code-block rounded-xl reveal">
+      <pre class="p-5 text-[12px] leading-[1.75] overflow-x-auto"><code>&lt;data_root&gt;/
+├── config.toml  settings.json  AGENTS.md  installed.json
+├── skills/  agents/  plugins/  marketplaces/  model-capabilities/
+├── sessions/&lt;project_key&gt;/       <span class="text-paper/35"># 会话 + .checkpoints/ + .subagents/</span>
+├── history/&lt;project_key&gt;/history.jsonl
+├── memory-v3/{global,projects/&lt;key&gt;}/
+├── evolution/&lt;project_key&gt;/  indexes/&lt;project_key&gt;/
+├── workspaces/&lt;project_key&gt;/  workflows/&lt;project_key&gt;/
+├── projects/&lt;project_key&gt;/
+│   ├── allowed_tools.json  mcp_trust.json  skill_trust.json  hooks_trust.json
+│   ├── instances/  meta.json
+│   └── skill-data/&lt;skill&gt;/       <span class="text-paper/35"># 项目级 skill 的可写产物</span>
+└── cas/  spill/  logs/</code></pre>
+    </div>
+    <div class="space-y-4">
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold" data-i18n="cfg.files.key.title">project_key 怎么算</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.files.key.desc">形如 <code class="text-amber-400">v1-wyj-code-1f367bbfb19407b9</code>（目录名 + SHA-256 前 16 位），按 <strong>git 仓库根</strong>归一。同一仓库的任意子目录、以及带 <code class="text-amber-400">--project-root</code> 指回主仓库的 worktree，都归到同一个 key——所以从 <code>src/</code> 启动仍能看到根目录的会话与授权名单。</p>
+      </div>
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold" data-i18n="cfg.files.scope.title">storage.scope：状态跟不跟着仓库走</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.files.scope.desc"><code class="text-amber-400">"home"</code>（默认）全部放数据根；<code class="text-amber-400">"project"</code> 把会话、历史、项目层记忆、演化、代码索引改放 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/local/</code>，并自动写两道 gitignore。选它的理由是「换机器 / 换 clone 就带走对话历史」，代价是 transcript 里是工具输出原文——漏一次 <code>git add -A</code> 就是永久泄漏。<strong>信任门控目录与 CAS 池永不跟随</strong>：前者必须在仓库控制不到的位置，后者是跨项目去重池。</p>
+      </div>
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold" data-i18n="cfg.files.migrate.title">从旧版升级</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.files.migrate.desc">旧数据仍在数据根时功能不会坏（读取有兜底），但建议跑一次迁移：<code class="text-amber-400">wyj-code storage migrate</code> 只报计划，加 <code class="text-amber-400">--yes</code> 实际搬迁（rename，同盘原子）。无法确定归属的条目报 <code>skipped</code> 并保持原样。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PROFILES -->
+<section id="profiles" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.profiles.kicker">Profiles</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.profiles.title">调用分组 [[profiles]]</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.profiles.desc">一个分组 = 一套完整的「端点 + 凭据 + 能力」。TUI 里 <code class="text-amber-400">/profile</code> 管理整套分组（写盘），<code class="text-amber-400">/model</code> 只切当前分组下的模型（仅内存），<code class="text-amber-400">/effort</code> 管思考档位（随会话落盘）。三者职责刻意分开。</p>
+  </div>
+
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>name</code></td><td><code>"default"</code></td><td data-i18n="cfg.p.name">分组名，组内唯一。<code>--profile &lt;name&gt;</code> 可一次性指定本次运行用哪套，不改变全局默认。</td></tr>
+      <tr><td><code>provider</code></td><td><code>"anthropic"</code> / <code>"openai"</code></td><td data-i18n="cfg.p.provider">选择客户端实现，<strong>线协议由它唯一决定</strong>。vendor 不再单独配置，由 base_url + 模型名推断。</td></tr>
+      <tr><td><code>model</code></td><td><code>"claude-opus-4-8"</code></td><td data-i18n="cfg.p.model">默认模型。auto 与 plan 模式在未配专用模型时都用它。</td></tr>
+      <tr><td><code>plan_model</code></td><td><code>""</code></td><td data-i18n="cfg.p.plan_model">Plan 模式专用模型，留空回退 <code>model</code>。<code>/model</code> 在 plan 模式下只改这个字段。</td></tr>
+      <tr><td><code>exec_model</code></td><td><code>""</code></td><td data-i18n="cfg.p.exec_model">Auto / Bypass 模式专用模型，留空回退 <code>model</code>。两者共用同一个字段——差别在权限判定，不在模型能力要求。</td></tr>
+      <tr><td><code>aux_model</code></td><td><code>""</code></td><td data-i18n="cfg.p.aux_model">辅助模型，只作用于两个调用点：会话标题生成、跨会话记忆提取。它们各自用独立短 system prompt，<strong>不复用主对话前缀</strong>，因此换模型不会打穿主会话缓存。<strong>上下文压缩绝不用它</strong>——压缩要逐字节复用主前缀来命中缓存，换模型等于缓存归零、整段历史全价重发。</td></tr>
+      <tr><td><code>base_url</code></td><td><code>""</code></td><td data-i18n="cfg.p.base_url">端点地址，留空用供应商默认。第三方兼容端点填到 <code>/anthropic</code> 或 <code>/v1</code> 一层即可。</td></tr>
+      <tr><td><code>api_key</code></td><td><code>null</code></td><td data-i18n="cfg.p.api_key">明文 Key，不推荐。落盘后文件会被设为 <code>0600</code>，但仍是明文；优先用下一行或环境变量。</td></tr>
+      <tr><td><code>api_key_env</code></td><td><code>null</code></td><td data-i18n="cfg.p.api_key_env">引用一个环境变量名，运行时取值。<strong>推荐</strong>：配置里只有变量名，密文留在 shell / 密钥管理器里。</td></tr>
+      <tr><td><code>max_tokens</code></td><td><code>32000</code></td><td data-i18n="cfg.p.max_tokens">单轮输出预算。思考 token 也计在内——推理模型的预算黑洞常在这里。输出被吃满且无可见内容时会放大预算重试一次。</td></tr>
+      <tr><td><code>context_window</code></td><td><code>200000</code></td><td data-i18n="cfg.p.context_window">模型真实上下文窗口，<strong>必须填真实值</strong>。压缩硬阈值 = <code>window - max(max_tokens+8192, window/10)</code>，清理软阈值 = <code>window × 0.55</code>，都由它推算。它是裸 u32，没有 live probe 兜底。</td></tr>
+      <tr><td><code>vision</code></td><td><code>true</code></td><td data-i18n="cfg.p.vision">模型是否支持图片输入。false 时图片降级为占位文本，避免非多模态端点收到 image 块直接 400。</td></tr>
+      <tr><td><code>thinking_budget</code></td><td><code>null</code></td><td data-i18n="cfg.p.thinking_budget">扩展思考预算 token。<code>0</code> / 不写 = 关闭。思考计入 output 计费。</td></tr>
+      <tr><td><code>interleaved_thinking</code></td><td><code>true</code></td><td data-i18n="cfg.p.interleaved">工具轮之间允许交错思考。<strong>Anthropic 线专属</strong>——OpenAI 线不发该 beta，配了也不生效。生效前提是本轮真的发出了 thinking 字段。</td></tr>
+      <tr><td><code>prompt_cache</code></td><td><code>null</code>（跟随端点）</td><td data-i18n="cfg.p.prompt_cache"><code>null</code> = 按端点类型判定：官方 Anthropic 开；第三方 Anthropic 兼容端点（MiniMax / GLM / Kimi）默认关——它们实现了 <code>cache_control</code>，但对未知 <code>anthropic-beta</code> 头常直接 400，故第三方开启时只发 <code>cache_control</code>、不发 beta 头。端点连 <code>cache_control</code> 也不认时首次 400 自动降级，并在 <code>/cost</code> 显示原因。</td></tr>
+      <tr><td><code>openai_stream_options</code></td><td><code>null</code></td><td data-i18n="cfg.p.stream_options">是否发 <code>stream_options.include_usage</code>。<code>null</code> = 按端点自动判断；不认这个字段的兼容端点显式关掉即可。</td></tr>
+      <tr><td><code>reasoning_effort</code></td><td><code>null</code></td><td data-i18n="cfg.p.effort">思考投入档位 <code>low / medium / high / xhigh / max</code>，<strong>协议无关</strong>：OpenAI 线发顶层 <code>reasoning_effort</code>，Anthropic 线发 <code>output_config.effort</code>。端点不认的档位记成可见的 dropped 而不是发出去换 400。<strong>生效优先级：env &gt; 会话级 <code>/effort</code> &gt; 本字段</strong>。</td></tr>
+      <tr><td><code>thinking_switch</code></td><td><code>null</code></td><td data-i18n="cfg.p.thinking_switch">OpenAI 线 <code>thinking.type</code> 显式覆盖：<code>enabled / disabled / adaptive</code>。不写 = 由 adapter 按模型默认决定（MiniMax M3.1 发 disabled 会 400，adapter 会降级成不发该字段）。</td></tr>
+      <tr><td><code>max_tools_per_turn</code></td><td><code>null</code></td><td data-i18n="cfg.p.max_tools">每次回复最多并行几个工具调用。<code>null</code> = 由模型目录 / 探测结果决定，而静态目录对非 anthropic/openai vendor 一律判 1——MiniMax / GLM / Kimi 等实际能并发的端点会被静默锁成每轮一次往返。这个字段是逃生舱：<code>model doctor --probe full</code> 通过后显式放开。</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="mt-6 reveal rounded-xl border border-phosphor/20 bg-phosphor/[0.04] p-6">
+    <p class="text-sm text-paper/65 leading-relaxed" data-i18n="cfg.profiles.note"><strong class="text-phosphor">旧字段会被静默忽略</strong>：<code>vendor</code> 与 <code>wire_protocol</code> 已移除（vendor 改为推断、协议由 provider 决定）。旧 config.toml 里留着这两行不会报错，下次 <code>config.save()</code> 时随 <code>profiles</code> 数组整体替换而消失。</p>
+  </div>
+</section>
+
+<!-- TOP LEVEL -->
+<section id="top-level" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-2xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.top.kicker">Top Level</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.top.title">顶层字段</h2>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>active_profile</code></td><td><code>"default"</code></td><td data-i18n="cfg.t.active_profile">当前激活的分组名，必须在 <code>[[profiles]]</code> 里有同名项，否则回退到第一项。</td></tr>
+      <tr><td><code>log_level</code></td><td><code>"warn"</code></td><td data-i18n="cfg.t.log_level">日志级别，调试时设 <code>"debug"</code>。<code>/config</code> 面板也能改它。</td></tr>
+      <tr><td><code>language</code></td><td><code>""</code>（自动检测）</td><td data-i18n="cfg.t.language"><code>"en"</code> / <code>"zh"</code>。留空按系统 locale 检测。它<strong>同时决定 UI 文案与模型输出语言</strong>（含 thinking）——解析结果会进 system prompt 的 <code>&lt;env&gt;</code> 块。</td></tr>
+      <tr><td><code>auto_memory_enabled</code></td><td><code>true</code></td><td data-i18n="cfg.t.auto_memory">跨会话记忆自动提取。<code>/memory</code> 面板可切换。关掉后不再每轮后台提取，但已有 claim 仍可检索。</td></tr>
+      <tr><td><code>mcp_servers</code></td><td><code>[]</code></td><td data-i18n="cfg.t.mcp">全局 MCP server 列表，见下方 <code>[[mcp_servers]]</code> 节。项目级同名条目会覆盖全局。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- SEARCH -->
+<section id="search" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.search.kicker">Search</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.search.title">[search] 内置网页搜索</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.search.desc">它是<strong>内置工具</strong>，不是 MCP server、不是让模型自己拼 curl。没配 Key 时<strong>干脆不注册这个工具</strong>——模型看不到一个注定失败的入口，不浪费一次 LLM 往返。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>provider</code></td><td><code>"tavily"</code></td><td data-i18n="cfg.s.provider">后端：<code>tavily</code> / <code>brave</code>。写成未知值会<strong>显式报错</strong>，绝不静默回退——否则你会以为自己用的是 Brave。</td></tr>
+      <tr><td><code>api_key</code></td><td><code>null</code></td><td data-i18n="cfg.s.api_key">后端 Key，优先读环境变量 <code>WYJ_CODE_SEARCH_API_KEY</code>（env 值不会写回本文件）。Key 只进请求头，<strong>绝不进请求体</strong>——body 会被代理日志完整打印。</td></tr>
+      <tr><td><code>timeout_secs</code></td><td><code>30</code></td><td data-i18n="cfg.s.timeout">单次搜索请求超时（秒）。瞬时故障退避重试一次；限流 / 认证 / 参数错误不重试。</td></tr>
+      <tr><td><code>max_results</code></td><td><code>5</code></td><td data-i18n="cfg.s.max_results">模型未显式指定时返回的条数，<strong>硬上限 10</strong>。</td></tr>
+      <tr><td><code>allowed_domains</code></td><td><code>[]</code></td><td data-i18n="cfg.s.allowed">默认白名单域名。模型可用 <code>include_domains</code> <strong>覆盖</strong>（不是并集）——并集会让模型既无法临时放开黑名单，也无法把白名单收窄。</td></tr>
+      <tr><td><code>blocked_domains</code></td><td><code>[]</code></td><td data-i18n="cfg.s.blocked">默认黑名单域名，模型可用 <code>exclude_domains</code> 覆盖。常用它屏蔽 SEO 农场。</td></tr>
+      <tr><td><code>language</code></td><td><code>""</code></td><td data-i18n="cfg.s.language">Brave 的 <code>search_lang</code>（ISO 639-1），留空用后端默认值。Tavily 忽略此项。</td></tr>
+      <tr><td><code>safe_search</code></td><td><code>true</code></td><td data-i18n="cfg.s.safe">安全搜索，Brave 映射为 <code>safesearch=strict</code>。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- SUBAGENT / AGENT / TOOLS / UI -->
+<section id="runtime" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.rt.kicker">Runtime</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.rt.title">Agent 循环与子 Agent</h2>
+  </div>
+
+  <h3 class="mt-10 font-display font-bold text-xl text-amber-400 reveal">[subagent]</h3>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-4 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>default_profile</code></td><td><code>""</code></td><td data-i18n="cfg.sa.default_profile">子 Agent 默认使用的分组，留空沿用主 Agent 当前分组。</td></tr>
+      <tr><td><code>explore_profile</code></td><td><code>""</code></td><td data-i18n="cfg.sa.explore_profile">内置 Explore 类型的专用分组（配便宜模型很划算），留空回退 <code>default_profile</code>。</td></tr>
+      <tr><td><code>trace_enabled</code></td><td><code>true</code></td><td data-i18n="cfg.sa.trace">是否把子 Agent 完整执行轨迹落盘。日志是进程被硬杀时唯一的恢复来源。</td></tr>
+      <tr><td><code>trace_max_bytes_per_agent</code></td><td><code>262144</code></td><td data-i18n="cfg.sa.trace_bytes">单 agent trace 文件上限（默认 256 KiB），超限静默停写。交接物与消息增量日志不受此上限约束。</td></tr>
+      <tr><td><code>max_depth</code></td><td><code>3</code></td><td data-i18n="cfg.sa.max_depth">子 Agent 最大嵌套层数（主 Agent 之下算第一层），<code>1</code> = 禁止嵌套。触顶时 Agent 工具会从该层子 Agent 的工具集里消失，而不是留着报错。</td></tr>
+      <tr><td><code>max_concurrent</code></td><td><code>8</code></td><td data-i18n="cfg.sa.max_concurrent">同时运行的子 Agent 上限，超限的 spawn 排队等待、不失败。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 class="mt-10 font-display font-bold text-xl text-amber-400 reveal">[agent]</h3>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-4 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>max_turns</code></td><td><code>200</code></td><td data-i18n="cfg.a.max_turns">单次用户提交内允许的最大推理轮数（一次 LLM 往返 = 一轮）。默认 200 的本意是「防模型死循环」，不是给正常长任务设工期。距上限还剩 4 轮时会先注入收尾指令，要求模型停止调用工具、立即总结进度——<strong>触顶不再等于失败</strong>。调高它买「单轮能推进多远」，代价是单次提交的最长耗时与 token 上限；死循环保护由 loop_guard 独立承担。</td></tr>
+      <tr><td><code>forced_thinking_max_turns</code></td><td><code>64</code></td><td data-i18n="cfg.a.forced">思考<strong>关不掉</strong>的端点（reasoner / -r1 / MiniMax M2.x-M3.1 / Qwen·豆包 -thinking / Moonshot -code）的单回合熔断轮数。默认比 <code>max_turns</code> 保守得多：这类端点几乎「一轮一个工具调用」，实测单回合能跑到 163 轮 / 35.6 万 output token / 半小时以上。v0.3.19 之前写死 32，代价是中型任务必然撞顶、每次都得手打「继续」。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 class="mt-10 font-display font-bold text-xl text-amber-400 reveal">[tools]</h3>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-4 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>todo_enabled</code></td><td><code>true</code></td><td data-i18n="cfg.tools.todo">是否注册 TodoWrite 任务列表工具。<strong>未注册 = 工具不产生 schema，模型目录里根本看不到它</strong>。改回默认开启的理由：长任务里模型没有外部状态锚点，压缩一发生就不知道自己走过哪条路，而 TodoWrite 是唯一能穿透压缩的显式进度载体。简单任务为主或强模型跑短任务时设 false 更划算。</td></tr>
+    </tbody>
+  </table></div>
+
+  <h3 class="mt-10 font-display font-bold text-xl text-amber-400 reveal">[ui]</h3>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-4 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>mouse</code></td><td><code>"auto"</code></td><td data-i18n="cfg.ui.mouse">鼠标报告三态：<code>auto</code> 按 <code>TERM</code> 判定（只有缺失、空串或 dumb 才关）/<code>on</code>/<code>off</code>。默认开的原因：alternate screen 里终端没有自己的滚动条，而 macOS Terminal.app 不支持 DEC 1007——不开捕获时滚轮<strong>完全没反应</strong>。开启后滚轮、拖选、双击选词、滚动条拖动全部由应用实现，选完自动复制到剪贴板。</td></tr>
+      <tr><td><code>mouse_capture</code></td><td><code>null</code>（废弃）</td><td data-i18n="cfg.ui.mouse_capture">v0.3.18 前的布尔字段，等价于 <code>on</code>/<code>off</code>。仍被识别但<strong>不再写回</strong>，下次保存配置时消失。</td></tr>
+      <tr><td><code>scrollbar</code></td><td><code>true</code></td><td data-i18n="cfg.ui.scrollbar">内容区右侧是否绘制应用内细滚动条（<code>│</code>/<code>┃</code>）。只在内容超出视口时出现，宽度 &lt; 3 列的终端不画；出现后可拖动滑块或点击轨道跳转。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- CONTEXT EDIT -->
+<section id="context" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.ce.kicker">Context</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.ce.title">[context_edit] 上下文清理优先于摘要</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.ce.desc">超阈值时先把过期工具输出外部化到 CAS（无损，可召回），<strong>清理得动就不跑整段摘要</strong>。摘要是有损的，而且贵；外部化只是把原文挪到磁盘并留一个可取回的占位符。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>enabled</code></td><td><code>true</code></td><td data-i18n="cfg.ce.enabled"><code>false</code> = 完全退回旧行为（只压缩、不清理）。</td></tr>
+      <tr><td><code>protect_recent</code></td><td><code>3</code></td><td data-i18n="cfg.ce.protect_recent">最近 N 个工具结果保留全文。刚看过的输出正在被引用，挪走等于让模型重新读一遍。</td></tr>
+      <tr><td><code>batch_size</code></td><td><code>10</code></td><td data-i18n="cfg.ce.batch_size">单批清理条数。<strong>每批都会击穿一次 prompt cache 前缀</strong>，批太大浪费命中率。</td></tr>
+      <tr><td><code>min_result_bytes</code></td><td><code>2000</code></td><td data-i18n="cfg.ce.min_result_bytes">小于此字节数的结果不清理——省下的 token 还不够一条占位符本身。</td></tr>
+      <tr><td><code>max_batches</code></td><td><code>3</code></td><td data-i18n="cfg.ce.max_batches">单次请求最多连续清理几批，防止「历史里全是可清理项」时一次做掉大手术。</td></tr>
+      <tr><td><code>soft_limit_ratio</code></td><td><code>0.55</code></td><td data-i18n="cfg.ce.soft">软阈值：占用超过窗口这个比例就开始外部化，而不是等撞上压缩硬阈值。<code>0</code> = 关闭。为什么需要它：1M 窗口下硬阈值在 900K，实际会话永远够不着，清理逻辑等于从未运行。软阈值只改「何时开始」，不改「何时停手」——降到硬阈值以下才停；清理不动了仍然交给压缩。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- STORAGE -->
+<section id="storage" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.st.kicker">Storage</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.st.title">[storage] 容量与回收</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.st.desc">全部字段 opt-out：设 <code class="text-amber-400">0</code> 即关闭对应清理，保持旧行为。删除历史不可逆，因此<strong>所有会删数据的项默认都不删</strong>——想清就自己设阈值，或手动跑 <code class="text-amber-400">wyj-code storage prune</code>。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>checkpoints_per_session</code></td><td><code>20</code></td><td data-i18n="cfg.st.checkpoints">单会话 checkpoint 上限，超限按时间淘汰最旧的。</td></tr>
+      <tr><td><code>memory_v2_md_per_kind</code></td><td><code>200</code></td><td data-i18n="cfg.st.mem_v2">Memory v2 每类 <code>.md</code> 文件条数上限。</td></tr>
+      <tr><td><code>memory_v3_records_max</code></td><td><code>5000</code></td><td data-i18n="cfg.st.records_max">Memory v3 <code>records.json</code> 条目上限。<strong>Superseded 状态永远保留</strong>，只对 Active / Pending 淘汰；淘汰按「写入新鲜度 × 0.30 + 使用强度 × 0.70」打分——只按更新时间截断会把「三个月没改但每次开工都要查的约定」先删掉。使用强度依赖访问计数，计数走增量日志 <code>access.json</code>，GC 在截断<strong>之前</strong>先合并日志。</td></tr>
+      <tr><td><code>memory_v3_jobs_max</code></td><td><code>32</code></td><td data-i18n="cfg.st.jobs_max">Memory v3 pending 任务队列上限。</td></tr>
+      <tr><td><code>memory_v3_rejected_history_max</code></td><td><code>500</code></td><td data-i18n="cfg.st.rejected_max">已拒绝项的指纹表条数上限——它的作用是防止同一个候选被反复提议。</td></tr>
+      <tr><td><code>plugin_gc_interval_days</code></td><td><code>7</code></td><td data-i18n="cfg.st.plugin_gc">插件 <code>.git</code> 做 <code>git gc --prune=now</code> 的间隔天数。</td></tr>
+      <tr><td><code>workspace_worktree_max_age_days</code></td><td><code>30</code></td><td data-i18n="cfg.st.worktree">workspace worktree 自动 prune 的过期天数。</td></tr>
+      <tr><td><code>disk_usage_warn_bytes</code></td><td><code>5368709120</code></td><td data-i18n="cfg.st.disk_warn">启动期占用告警阈值（默认 5 GiB）。只在启动日志里 warn 一次，不阻塞。</td></tr>
+      <tr><td><code>cas_max_blob_bytes</code></td><td><code>16777216</code></td><td data-i18n="cfg.st.cas_blob">CAS 单 blob 上限（默认 16 MiB）。超此值的文件不进 CAS，直接 inline 进 checkpoint JSON。</td></tr>
+      <tr><td><code>cas_total_bytes</code></td><td><code>1073741824</code></td><td data-i18n="cfg.st.cas_total">CAS 总量上限（默认 1 GiB）。启动时按 LRU 回收 <code>ref_count == 0</code> 的 blob；会话结束时逐个 release，两个机制缺一都会让 pool 无界增长。</td></tr>
+      <tr><td><code>cas_gc_on_start</code></td><td><code>true</code></td><td data-i18n="cfg.st.cas_gc">启动时是否跑一次 CAS gc。blob 很多时是全池目录遍历（毫秒级），可关掉省这一步。</td></tr>
+      <tr><td><code>sessions_ttl_days</code></td><td><code>0</code></td><td data-i18n="cfg.st.sessions_ttl">会话保留天数，<strong>默认 0 = 永不自动删除</strong>。删历史不可逆，不该在升级后的第一次启动里静默发生。想启用就设 30 / 90。</td></tr>
+      <tr><td><code>sessions_keep_recent</code></td><td><code>5</code></td><td data-i18n="cfg.st.keep_recent">每个项目无条件保留最新 N 条。TTL 的必要配套：纯 TTL 会把「三个月没动的项目里唯一那批会话」删光，而那恰恰最想回看。</td></tr>
+      <tr><td><code>stale_lock_ttl_days</code></td><td><code>7</code></td><td data-i18n="cfg.st.stale_lock">删 <code>cas/locks/</code> 与 <code>sessions/*.lock</code> 里无人持有且超期的。内核会释放 flock，但<strong>文件本身不会被删</strong>——实测能攒到上万个 / 几十 MB。</td></tr>
+      <tr><td><code>scope</code></td><td><code>"home"</code></td><td data-i18n="cfg.st.scope">运行状态落盘范围：<code>home</code> / <code>project</code>。用字符串而非枚举：未知值降级为默认并告警，而不是让整份 config.toml 解析失败。</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="mt-6 grid sm:grid-cols-3 gap-3 reveal">
+    <div class="card rounded-lg p-5">
+      <p class="font-mono text-sm text-amber-400">wyj-code storage status</p>
+      <p class="mt-2 text-sm text-paper/55" data-i18n="cfg.st.cmd.status">各子系统占用与 Top-N，加 <code>--json</code> 可脚本消费。</p>
+    </div>
+    <div class="card rounded-lg p-5">
+      <p class="font-mono text-sm text-amber-400">wyj-code storage doctor</p>
+      <p class="mt-2 text-sm text-paper/55" data-i18n="cfg.st.cmd.doctor">检查异常：orphan blob、损坏 manifest、旧 schema。</p>
+    </div>
+    <div class="card rounded-lg p-5">
+      <p class="font-mono text-sm text-amber-400">wyj-code storage prune</p>
+      <p class="mt-2 text-sm text-paper/55" data-i18n="cfg.st.cmd.prune">按上面这组阈值清理，<strong>默认只报计划</strong>；加 <code>--yes</code> 才真删。dry-run 与执行用同一组值。</p>
+    </div>
+  </div>
+</section>
+
+<!-- PERSIST CAP -->
+<section id="persist" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.pc.kicker">Persist Cap</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.pc.title">[persist_cap] 单块内容上限</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.pc.desc">同一组上限作用于三条路径：落盘（<code>save</code> / <code>checkpoint</code>）、运行时发送给模型、resume 读回。共用一套值是为了避免「落盘截断了、运行时没截断」这种不对称——长文本块在内存里无界累积会直接撞穿模型上下文窗口。<code>0</code> = 不截断该项。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>tool_result_head_bytes</code></td><td><code>20480</code></td><td data-i18n="cfg.pc.tr_head">工具结果文本的 head 上限。</td></tr>
+      <tr><td><code>tool_result_tail_bytes</code></td><td><code>10240</code></td><td data-i18n="cfg.pc.tr_tail">工具结果文本的 tail 上限。保留尾部是因为报错和总结几乎总在最后。</td></tr>
+      <tr><td><code>thinking_bytes</code></td><td><code>0</code>（废弃）</td><td data-i18n="cfg.pc.thinking"><strong>已废弃，不再生效</strong>，保留字段仅为兼容旧配置。原实现按此截断 thinking，但协议要求续轮时把 thinking 块<strong>原样回传</strong>——截断文本却保留 <code>signature</code> 会让签名校验失配，且该改写不可逆。思考体积改由 context_edit / compact 控制。</td></tr>
+      <tr><td><code>reasoning_details_bytes</code></td><td><code>0</code>（废弃）</td><td data-i18n="cfg.pc.reasoning_details"><strong>已废弃，不再生效</strong>，理由同上；额外考虑是原实现会改 <code>text</code> 却保留 <code>id</code>/<code>format</code>，产出结构不自洽的块。</td></tr>
+      <tr><td><code>tool_use_input_bytes</code></td><td><code>65536</code></td><td data-i18n="cfg.pc.tool_use">工具调用参数的 JSON 字符串上限。</td></tr>
+      <tr><td><code>text_head_bytes</code></td><td><code>16384</code></td><td data-i18n="cfg.pc.text_head">纯文本块的 head 上限。默认比 tool_result 更紧：文本信息密度低，长 assistant 总结与用户粘贴的日志都在这里。</td></tr>
+      <tr><td><code>text_tail_bytes</code></td><td><code>8192</code></td><td data-i18n="cfg.pc.text_tail">纯文本块的 tail 上限。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- AUTO MODE -->
+<section id="auto" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.am.kicker">Auto Mode</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.am.title">[auto_mode] 谁来决定问不问你</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.am.desc">wyj-code 只有<strong>一个日常模式</strong> <code>auto</code>（旧的 <code>manual</code> 已并入它，作为兼容别名保留解析）。判定顺序是硬性的：受保护路径 deny → 确定性 allow → 确定性 hard_deny → 模型分类器 → 交回逐次弹窗 → 降级。</p>
+  </div>
+
+  <div class="mt-8 grid md:grid-cols-2 gap-4">
+    <div class="card rounded-xl p-6 reveal">
+      <h3 class="font-semibold text-phosphor" data-i18n="cfg.am.always.title">永远自动放行（零延迟、零成本）</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.am.always.desc">工作目录内的文件写、只读 shell 命令、构建 / 测试命令、lockfile 依赖安装。本地字符串判定，不发模型请求。</p>
+    </div>
+    <div class="card rounded-xl p-6 reveal">
+      <h3 class="font-semibold text-[#ff8a8a]" data-i18n="cfg.am.never.title">任何模式都不放行</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.am.never.desc"><code>curl | bash</code>、<code>rm -rf ~</code>、<code>git push --force</code>、<code>git reset --hard</code>、<code>terraform destroy</code>、<code>sudo &lt;program&gt;</code>、凭据路径（<code>~/.ssh</code> 等）、写入受保护路径（<code>.git/</code>、<code>.env</code>、<code>*.pem</code>、<code>~/.wyj-code/</code>）。<strong>bypass 模式也不豁免</strong>——它免的是「询问」，不是「禁止」。这一层挂在 <code>PermissionPolicy::evaluate</code>，不读任何授权状态：授权只能免除问人，不能免除禁令。</p>
+    </div>
+  </div>
+
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>enabled</code></td><td><code>true</code></td><td data-i18n="cfg.am.enabled">模型分类器总开关。<code>false</code> = 只保留本地确定性规则层，拿不准的一律逐次弹窗（保守模式）。<strong>两条确定性规则排在分类器开关之前</strong>，否则关掉分类器时 <code>curl|bash</code> 只剩一个弹窗、按个 y 就过去了。</td></tr>
+      <tr><td><code>classifier_profile</code></td><td><code>""</code></td><td data-i18n="cfg.am.classifier_profile">分类器用哪个分组。留空 = 复用当前激活分组（此时它的 token 计在主会话里）；填分组名 = 用它单独跑，适合配一个便宜的小模型。</td></tr>
+      <tr><td><code>timeout_secs</code></td><td><code>30</code></td><td data-i18n="cfg.am.timeout">单次分类请求超时。默认 30 而非更小：adaptive thinking 端点光思考就要好几秒。超时与「解析失败」是同一个 fail-closed 出口。</td></tr>
+      <tr><td><code>max_consecutive_blocks</code></td><td><code>3</code></td><td data-i18n="cfg.am.blocks_consecutive">连续被判定拒绝达到该次数 → 自动停用分类器，改为逐次弹窗。</td></tr>
+      <tr><td><code>max_total_blocks</code></td><td><code>20</code></td><td data-i18n="cfg.am.blocks_total">整个会话累计被拒达到该次数 → 同样降级。</td></tr>
+      <tr><td><code>classify_all_shell</code></td><td><code>false</code></td><td data-i18n="cfg.am.classify_all_shell"><code>true</code> 时所有 shell 命令一律送审，不走本地 allow 白名单——更安全，但每条命令都多一次模型往返。</td></tr>
+      <tr><td><code>hard_deny</code></td><td><code>[]</code></td><td data-i18n="cfg.am.hard_deny"><strong>英文自然语言规则</strong>（喂给分类器，不是正则）。数组里出现字面量 <code>"$defaults"</code> 就在该位置插入内置规则，因此自定义项可写在默认项之前或之后，并继续继承后续版本的内置规则更新。<strong>不写 <code>"$defaults"</code> 会整段替换内置规则</strong>——对 allow / environment 通常正是你想要的，对 hard_deny / soft_deny 则会实打实放宽拦截面，启动日志会就此告警。</td></tr>
+      <tr><td><code>soft_deny</code></td><td><code>[]</code></td><td data-i18n="cfg.am.soft_deny">同上。软拒绝：分类器据此判断「这一步虽然在用户大方向上，但这条具体命令不该跑」。</td></tr>
+      <tr><td><code>allow</code></td><td><code>[]</code></td><td data-i18n="cfg.am.allow">同上。用于放行项目特有的安全操作，例如「允许部署到 staging：它与生产隔离且每日重置」。</td></tr>
+      <tr><td><code>environment</code></td><td><code>[]</code></td><td data-i18n="cfg.am.environment">同上。描述你的环境事实（版本控制宿主、云厂商、部署目标），分类器据此判断某条命令是否越界。</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="mt-6 reveal rounded-xl border border-white/[0.08] bg-ink-850/60 p-6">
+    <h3 class="font-semibold" data-i18n="cfg.am.scope.title">放行记忆的粒度按工具分叉</h3>
+    <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="cfg.am.scope.desc"><strong>Bash 按工具名</strong>：批准一次后本轮所有 Bash 免问（长任务里几十条同类命令不该各付一次往返），闸门在复用前仍逐条走 hard_deny 与只读白名单。<strong>其余工具按输入指纹</strong>：<code>Edit</code> 批过 <code>notes.md</code> 不该顺带放行 <code>deploy.sh</code>——用户在为一个文件点头，不等于同意改另一个。</p>
+  </div>
+</section>
+
+<!-- NOTIFY -->
+<section id="notify" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.nt.kicker">Notify</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.nt.title">[notify] 回合结束提醒</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.nt.desc">三件事共用一条通道：主回合完成、主回合出错、后台子 Agent 完成。零新第三方依赖——终端响铃走 <code>\x07</code>，桌面通知走 macOS <code>osascript</code> / Linux <code>notify-send</code> / Windows PowerShell BurntToast。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>enabled</code></td><td><code>true</code></td><td data-i18n="cfg.nt.enabled">总开关（opt-out）。</td></tr>
+      <tr><td><code>rate_limit_seconds</code></td><td><code>30</code></td><td data-i18n="cfg.nt.rate_limit">同类事件的最小发送间隔去重，<code>0</code> = 关闭限流。</td></tr>
+      <tr><td><code>include_session_id</code></td><td><code>false</code></td><td data-i18n="cfg.nt.session_id">是否在通知正文末尾追加 <code>[session:&lt;id&gt;]</code>。默认关：正文很短，加前缀反而挤掉内容。</td></tr>
+      <tr><td><code>bell.enabled</code></td><td><code>false</code></td><td data-i18n="cfg.nt.bell">终端响铃，<strong>opt-in 默认关</strong>——TUI 常开在共享屏幕上，响铃容易扰民。</td></tr>
+      <tr><td><code>desktop.enabled</code></td><td><code>true</code></td><td data-i18n="cfg.nt.desktop">桌面通知，opt-out 默认开。后台子 Agent 跑完时你多半已经切走了窗口。</td></tr>
+      <tr><td><code>events.turn_finished</code></td><td><code>true</code></td><td data-i18n="cfg.nt.turn_finished">主回合正常完成（TUI / REPL / <code>-p</code>）。</td></tr>
+      <tr><td><code>events.turn_error</code></td><td><code>true</code></td><td data-i18n="cfg.nt.turn_error">主回合出错。</td></tr>
+      <tr><td><code>events.subagent_done</code></td><td><code>true</code></td><td data-i18n="cfg.nt.subagent_done">后台子 Agent 完成（<code>run_in_background: true</code>）；前台调用不通知。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- EVOLUTION -->
+<section id="evolution" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.ev.kicker">Evolution</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.ev.title">[evolution] 证据化自进化</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.ev.desc">每个用户目标落盘为一个 Episode，从中生成带 scope、citation、TTL、冲突检测的 Memory，以及 Rule / Skill <strong>候选</strong>。<strong>候选永不自动激活</strong>，必须经 <code class="text-amber-400">/evolve</code> 或 <code class="text-amber-400">wyj-code evolve approve</code> 显式批准。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>enabled</code></td><td><code>true</code></td><td data-i18n="cfg.ev.enabled">总开关。关掉后完全不记录 Episode、不生成候选。</td></tr>
+      <tr><td><code>use_experiences</code></td><td><code>true</code></td><td data-i18n="cfg.ev.use_experiences">是否把历史经验纳入提取上下文。</td></tr>
+      <tr><td><code>suggest_rules</code></td><td><code>true</code></td><td data-i18n="cfg.ev.suggest_rules">是否产出 Rule 候选。</td></tr>
+      <tr><td><code>suggest_skills</code></td><td><code>true</code></td><td data-i18n="cfg.ev.suggest_skills">是否产出 Skill 候选。</td></tr>
+      <tr><td><code>auto_activate_rules</code></td><td><code>false</code></td><td data-i18n="cfg.ev.auto_rules"><strong>默认 false，不建议打开</strong>：Rule 会进 system prompt，自动激活等于让模型自己改自己的行为约束。</td></tr>
+      <tr><td><code>auto_install_skills</code></td><td><code>false</code></td><td data-i18n="cfg.ev.auto_skills">同上，Skill 自动安装默认关。</td></tr>
+      <tr><td><code>allow_self_code_experiments</code></td><td><code>false</code></td><td data-i18n="cfg.ev.self_code">是否允许对自身代码做实验性修改，默认关闭。</td></tr>
+      <tr><td><code>exclude_external_context</code></td><td><code>true</code></td><td data-i18n="cfg.ev.exclude_external">是否把 Web / MCP 等外部上下文排除在演化证据外。默认排除：外部内容不是用户意图的证据，混进来会污染偏好学习。</td></tr>
+      <tr><td><code>infer_feedback</code></td><td><code>true</code></td><td data-i18n="cfg.ev.infer_feedback">是否从后续对话推断隐式反馈（用户重述或修正即负反馈）。</td></tr>
+      <tr><td><code>skill_candidate_min_successes</code></td><td><code>3</code></td><td data-i18n="cfg.ev.min_successes">Skill 候选所需的最少成功次数。</td></tr>
+      <tr><td><code>skill_candidate_min_sessions</code></td><td><code>2</code></td><td data-i18n="cfg.ev.min_sessions">Skill 候选所需的最少独立会话数——一个会话里重复三次只是同一件事做久了。</td></tr>
+      <tr><td><code>idle_delay_secs</code></td><td><code>300</code></td><td data-i18n="cfg.ev.idle_delay">空闲多久后才跑后台演化（秒），避免与前台回合抢模型配额。</td></tr>
+      <tr><td><code>max_background_workers</code></td><td><code>1</code></td><td data-i18n="cfg.ev.workers">后台演化并发 worker 数。</td></tr>
+      <tr><td><code>max_context_bytes</code></td><td><code>8000</code></td><td data-i18n="cfg.ev.context_bytes">单次演化提取喂给模型的上下文字节上限。</td></tr>
+      <tr><td><code>max_daily_tokens</code></td><td><code>50000</code></td><td data-i18n="cfg.ev.daily_tokens">演化每日 token 预算，硬封顶。</td></tr>
+      <tr><td><code>max_daily_wall_secs</code></td><td><code>1800</code></td><td data-i18n="cfg.ev.daily_wall">演化每日墙钟预算（秒），默认 30 分钟。</td></tr>
+      <tr><td><code>max_project_store_bytes</code></td><td><code>104857600</code></td><td data-i18n="cfg.ev.store_bytes">单项目演化数据目录上限（默认 100 MiB），超了走 retention。</td></tr>
+      <tr><td><code>evolution_profile</code></td><td><code>""</code></td><td data-i18n="cfg.ev.profile">演化调用用哪个分组，留空 = 复用当前激活分组。</td></tr>
+      <tr><td><code>retention.repository_fact_stale_days</code></td><td><code>28</code></td><td data-i18n="cfg.ev.r_fact">仓库事实（模块职责、构建命令）多久后算陈旧。</td></tr>
+      <tr><td><code>retention.workflow_stale_days</code></td><td><code>60</code></td><td data-i18n="cfg.ev.r_workflow">工作流记忆的陈旧期。</td></tr>
+      <tr><td><code>retention.user_preference_review_days</code></td><td><code>180</code></td><td data-i18n="cfg.ev.r_pref">用户偏好多久后进入<strong>复审</strong>（不直接删，偏好过期不该被当成错误）。</td></tr>
+      <tr><td><code>retention.failed_episode_days</code></td><td><code>30</code></td><td data-i18n="cfg.ev.r_failed">失败 Episode 保留期。</td></tr>
+      <tr><td><code>retention.candidate_days</code></td><td><code>90</code></td><td data-i18n="cfg.ev.r_candidate">未处理的 Rule / Skill 候选保留期。</td></tr>
+      <tr><td><code>retention.audit_days</code></td><td><code>180</code></td><td data-i18n="cfg.ev.r_audit">审计记录保留期。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- ROUTING + MODEL RUNTIME -->
+<section id="routing" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.ro.kicker">Routing</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.ro.title">[routing] 与 [model_runtime]</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.ro.desc">路由单元是 <strong>Profile 名</strong>而不是裸模型 id——每个候选要能携带自己的 vendor、协议、端点与能力配置。默认<strong>禁止跨 vendor fallback</strong>：把同一份对话在用户未授权时发给另一家供应商，与「辅助模型必须同端点」守的是同一条边界。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>routing.cross_provider_fallback</code></td><td><code>false</code></td><td data-i18n="cfg.ro.cross">是否允许在可恢复错误时跨供应商切换。默认 false。</td></tr>
+      <tr><td><code>routing.roles.explore</code></td><td><code>[]</code></td><td data-i18n="cfg.ro.explore">Explore 角色的候选分组链，按顺序尝试。空 = 用当前激活分组。</td></tr>
+      <tr><td><code>routing.roles.plan</code></td><td><code>[]</code></td><td data-i18n="cfg.ro.plan">规划角色的候选链。</td></tr>
+      <tr><td><code>routing.roles.execute</code></td><td><code>[]</code></td><td data-i18n="cfg.ro.execute">执行角色的候选链。</td></tr>
+      <tr><td><code>routing.roles.review</code></td><td><code>[]</code></td><td data-i18n="cfg.ro.review">评审角色的候选链。</td></tr>
+      <tr><td><code>model_runtime.probe_mode</code></td><td><code>"explicit"</code></td><td data-i18n="cfg.ro.probe_mode">能力探测模式。默认保守：未经探测的能力一律标 <code>static_only</code>，不假装已验证。</td></tr>
+      <tr><td><code>model_runtime.probe_ttl_hours</code></td><td><code>168</code></td><td data-i18n="cfg.ro.probe_ttl">探测结果缓存有效期（默认 7 天），过期后需 <code>doctor --refresh</code> 重探。</td></tr>
+      <tr><td><code>model_runtime.tool_argument_retries</code></td><td><code>2</code></td><td data-i18n="cfg.ro.arg_retries">工具参数解析失败后的重试次数（弱模型常产出半截 JSON）。<code>0</code> = 不重试，直接把错误回灌给模型。</td></tr>
+      <tr><td><code>model_runtime.lazy_tools_threshold</code></td><td><code>12</code></td><td data-i18n="cfg.ro.lazy_threshold">工具总数超过该值时启用 lazy schema：核心工具给完整 schema，其余走 <code>ToolSearch</code> 按需展开。工具少时全量给更省一次往返。</td></tr>
+      <tr><td><code>model_runtime.lazy_tools_top_k</code></td><td><code>8</code></td><td data-i18n="cfg.ro.lazy_top_k">lazy 模式下一轮最多展开几个候选工具。</td></tr>
+      <tr><td><code>model_runtime.lazy_tools_sticky_turns</code></td><td><code>3</code></td><td data-i18n="cfg.ro.lazy_sticky">命中的工具在搜索结果里<strong>排序加权</strong>的回合窗口。<strong>v0.3.14 起不再控制可见性</strong>：工具数组物理排在 prompt cache 前缀最前面，中途摘工具会让整段缓存失效，因此可见性改为单调不减。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- COMPUTER USE -->
+<section id="computer" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.cu.kicker">Computer Use</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.cu.title">[computer_use] 桌面 GUI 控制</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.cu.desc"><code class="text-amber-400">computer</code> / <code class="text-amber-400">app_computer</code> / <code class="text-amber-400">window_capture</code> 三个工具默认在 macOS / Windows + <code>vision = true</code> 时注册。<strong>后台工具优先</strong>：前台接管必须显式配置，不能在后台动作不支持时悄悄降级去抢用户的鼠标键盘。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>foreground_fallback</code></td><td><code>"disabled"</code></td><td data-i18n="cfg.cu.foreground">旧 <code>computer</code> 工具的前台兼容策略三档：<code>disabled</code> 变更动作直接返回 <code>requires_foreground_takeover</code>；<code>ask</code> 每次变更弹一次确认（要求真实 TUI 交互通道，headless / 子 Agent 一律拒绝）；<code>idle_only</code> 只在用户持续空闲时执行。三档都仍受输入仲裁器与前台 PID 校验约束。</td></tr>
+      <tr><td><code>quiet_period_ms</code></td><td><code>2000</code></td><td data-i18n="cfg.cu.quiet">获得前台输入租约前，必须连续没有外部输入的时长。</td></tr>
+      <tr><td><code>max_defer_secs</code></td><td><code>30</code></td><td data-i18n="cfg.cu.defer">等待用户空闲的最长时间，到期<strong>失败关闭</strong>，不强行执行。</td></tr>
+      <tr><td><code>restore_context</code></td><td><code>true</code></td><td data-i18n="cfg.cu.restore">前台兼容动作结束后是否尝试恢复原观察上下文。</td></tr>
+      <tr><td><code>auto_screenshot</code></td><td><code>true</code></td><td data-i18n="cfg.cu.auto_screenshot">变更动作成功后是否自动附一张目标窗口截图。这是「动作 → 观察」闭环的核心：模型不必自己再调一次 screenshot 才知道界面变了没有（它经常不会，于是拿着过时的界面继续往下点）。代价约 1000~1600 input token / 次。关掉也不会关掉整条验证链——连续 20 次变更动作无截图时仍强制附一张。</td></tr>
+      <tr><td><code>auto_screenshot_max_dim</code></td><td><code>960</code></td><td data-i18n="cfg.cu.max_dim">自动附图的长边像素上限。刻意低于观察用的 1280：附图只回答「界面变了没有」，要看清小字时模型会显式 <code>screenshot</code> 或 <code>zoom</code>。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- MCP -->
+<section id="mcp" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.mcp.kicker">MCP</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.mcp.title">[[mcp_servers]] 外部工具服务</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.mcp.desc">全局写在 <code class="text-amber-400">~/.wyj-code/config.toml</code>，项目级写在 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/mcp.toml</code>（同名覆盖全局、不同名追加）。<strong>项目级条目需显式信任批准</strong>——它们随 clone 落地，并且会执行任意命令。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.field">字段</th><th data-i18n="cfg.th.default">类型 / 默认值</th><th data-i18n="cfg.th.desc">说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>name</code></td><td>必填</td><td data-i18n="cfg.mcp.name">服务名，用于日志区分与项目级覆盖判定。</td></tr>
+      <tr><td><code>transport</code></td><td><code>"stdio"</code></td><td data-i18n="cfg.mcp.transport"><code>stdio</code> / <code>streamable_http</code>（旧写法 <code>"http"</code> 仍被接受）。</td></tr>
+      <tr><td><code>command</code></td><td><code>null</code></td><td data-i18n="cfg.mcp.command">stdio：可执行命令。</td></tr>
+      <tr><td><code>args</code></td><td><code>[]</code></td><td data-i18n="cfg.mcp.args">stdio：参数列表。</td></tr>
+      <tr><td><code>env</code></td><td><code>{}</code></td><td data-i18n="cfg.mcp.env">stdio：附加环境变量。</td></tr>
+      <tr><td><code>url</code></td><td><code>null</code></td><td data-i18n="cfg.mcp.url">streamable_http：远端端点。</td></tr>
+      <tr><td><code>headers</code></td><td><code>{}</code></td><td data-i18n="cfg.mcp.headers">streamable_http：请求头。值支持 <code>${ENV_VAR}</code> 引用，渠道凭据不必写进文件。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<!-- PROJECT LEVEL -->
+<section id="project" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.pj.kicker">Project</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.pj.title">项目级配置 &lt;git-root&gt;/.wyj-code/</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.pj.desc">这一层<strong>可以提交、随 clone 落地</strong>，因此「能被仓库作者控制的内容」必须过信任门控。批准记录一律落在仓库控制不到的位置（<code class="text-amber-400">~/.wyj-code/projects/&lt;key&gt;/</code>）——放进仓库等于让仓库自己改掉批准标记。</p>
+  </div>
+
+  <div class="mt-8 grid lg:grid-cols-2 gap-4">
+    <div class="reveal">
+      <div class="cfg-scroll"><table class="cfg-tbl">
+        <thead><tr><th data-i18n="cfg.th.path">路径</th><th data-i18n="cfg.th.purpose">用途</th></tr></thead>
+        <tbody>
+          <tr><td><code>settings.toml</code></td><td data-i18n="cfg.pj.settings_toml"><code>disabled_skills</code> / <code>disabled_mcp_servers</code> 按名禁用开关。</td></tr>
+          <tr><td><code>settings.json</code></td><td data-i18n="cfg.pj.settings_json">Hooks、<code>verify</code>、<code>acceptance</code> 三段（可被 <code>settings.local.json</code> 追加覆盖）。</td></tr>
+          <tr><td><code>mcp.toml</code></td><td data-i18n="cfg.pj.mcp_toml">项目级 MCP server，需 <code>wyj-code trust-mcp</code> 批准。</td></tr>
+          <tr><td><code>skills/</code></td><td data-i18n="cfg.pj.skills">项目级 Skill 与自定义命令（<code>name.md</code> 或 <code>name/SKILL.md</code>），需 <code>trust-skills</code> 批准。</td></tr>
+          <tr><td><code>agents/</code></td><td data-i18n="cfg.pj.agents">项目级 SubAgent 定义。</td></tr>
+          <tr><td><code>local/</code></td><td data-i18n="cfg.pj.local">仅当 <code>storage.scope = "project"</code> 时出现；自动写 gitignore。</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+    <div class="space-y-4">
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold text-phosphor" data-i18n="cfg.pj.verify.title">编辑后自动验证</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.pj.verify.desc">声明 <code>verify.command</code> 后，每次 Edit / Write 成功返回，Agent 立即跑这条命令，把退出码与截断后的输出<strong>回灌给模型</strong>，让它自己看到编译/测试错误并继续修。没声明时<strong>零代价</strong>：不探测、不启 shell、不产出任何输出。</p>
+      </div>
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold text-phosphor" data-i18n="cfg.pj.acceptance.title">验收门禁</h3>
+        <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.pj.acceptance.desc">「任务完成」不再由模型自己宣布。声明 <code>acceptance.criteria</code> 后，模型想结束回合时框架先跑一遍判据；不通过就不让结束，并把<strong>失败证据</strong>（文件与行号，不回显匹配内容）回灌。判据配错时<strong>恒判不通过</strong>——被静默跳过的判据比明确失败更危险。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-6 grid lg:grid-cols-2 gap-4">
+    <div class="code-block rounded-xl relative reveal">
+      <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-cfg-verify" data-copy-text="{
+  &quot;verify&quot;: {
+    &quot;command&quot;: &quot;cargo test -p wyj-core&quot;,
+    &quot;timeout_ms&quot;: 120000
+  }
+}" aria-label="copy">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+      </button>
+      <pre class="p-5 pr-14 text-[12px] leading-[1.8] overflow-x-auto"><code id="code-cfg-verify"><span class="text-paper/35">// .wyj-code/settings.json</span>
+{
+  <span class="text-phosphor">"verify"</span>: {
+    <span class="text-phosphor">"command"</span>: <span class="text-amber-400">"cargo test -p wyj-core"</span>,
+    <span class="text-phosphor">"timeout_ms"</span>: 120000
+  }
+}</code></pre>
+    </div>
+    <div class="code-block rounded-xl relative reveal">
+      <button class="copy-btn absolute top-3 right-3 p-2 rounded-md" data-copy-target="code-cfg-accept" data-copy-text="{
+  &quot;acceptance&quot;: {
+    &quot;max_retries&quot;: 2,
+    &quot;criteria&quot;: [
+      { &quot;id&quot;: &quot;tests-pass&quot;, &quot;kind&quot;: &quot;command&quot;, &quot;command&quot;: &quot;cargo test&quot; },
+      { &quot;id&quot;: &quot;no-debug&quot;, &quot;kind&quot;: &quot;grep_absent&quot;, &quot;pattern&quot;: &quot;dbg!\\(&quot;, &quot;paths&quot;: [&quot;src&quot;] }
+    ]
+  }
+}" aria-label="copy">
+        <svg viewBox="0 0 24 24" class="w-4 h-4"><use href="#i-copy"/></svg>
+      </button>
+      <pre class="p-5 pr-14 text-[12px] leading-[1.8] overflow-x-auto"><code id="code-cfg-accept"><span class="text-paper/35">// .wyj-code/settings.json</span>
+{
+  <span class="text-phosphor">"acceptance"</span>: {
+    <span class="text-phosphor">"max_retries"</span>: 2,
+    <span class="text-phosphor">"criteria"</span>: [
+      { <span class="text-phosphor">"id"</span>: <span class="text-amber-400">"tests-pass"</span>, <span class="text-phosphor">"kind"</span>: <span class="text-amber-400">"command"</span>,
+        <span class="text-phosphor">"command"</span>: <span class="text-amber-400">"cargo test"</span> },
+      { <span class="text-phosphor">"id"</span>: <span class="text-amber-400">"no-debug"</span>, <span class="text-phosphor">"kind"</span>: <span class="text-amber-400">"grep_absent"</span>,
+        <span class="text-phosphor">"pattern"</span>: <span class="text-amber-400">"dbg!\\("</span>, <span class="text-phosphor">"paths"</span>: [<span class="text-amber-400">"src"</span>] }
+    ]
+  }
+}</code></pre>
+    </div>
+  </div>
+
+  <div class="mt-6 reveal rounded-xl border border-white/[0.08] bg-ink-850/60 p-6">
+    <h3 class="font-semibold" data-i18n="cfg.pj.trust.title">三处信任门控，逐类批准</h3>
+    <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="cfg.pj.trust.desc"><code>mcp.toml</code>（执行任意命令）、<code>skills/</code>（正文是指令）、<code>settings.json</code> 的 hooks 与 <code>verify.command</code>（被 <code>sh -c</code> 执行）三处都有显式批准流程：<code class="text-amber-400">wyj-code trust-mcp</code> / <code class="text-amber-400">trust-skills</code> / <code class="text-amber-400">trust-hooks</code>，或 <code class="text-amber-400">trust</code> 一次批三类。<strong>批准一次即可</strong>：内容不变就不再问；内容变了会列出具体变化的文件。skill 指纹覆盖 <code>skills/</code> 整棵树（含 <code>references/</code>）——那是经由已批准 SKILL.md 可达的二阶注入面。运行产物请写 <code class="text-amber-400">$WYJ_CODE_SKILL_DATA</code>，写回自己的目录会让刚批准的信任失效。</p>
+  </div>
+</section>
+
+<!-- ENV -->
+<section id="env" class="max-w-6xl mx-auto px-5 sm:px-8 py-16 border-t border-white/[0.06] scroll-mt-20">
+  <div class="reveal max-w-3xl">
+    <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.env.kicker">Environment</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.env.title">环境变量总表</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="cfg.env.desc">下面这些<strong>只在运行时生效、绝不写回 config.toml</strong>。它们对应的运行时槽位带 <code>#[serde(skip)]</code>，正是为了「打开设置面板保存一次」不会把 secret 物化进文件。</p>
+  </div>
+  <div class="cfg-scroll"><table class="cfg-tbl mt-8 reveal">
+    <thead><tr><th data-i18n="cfg.th.var">变量</th><th data-i18n="cfg.th.effect">作用</th><th data-i18n="cfg.th.note">备注</th></tr></thead>
+    <tbody>
+      <tr><td><code>WYJ_CODE_API_KEY</code></td><td data-i18n="cfg.env.api_key">模型 API Key</td><td data-i18n="cfg.env.api_key.note"><strong>最推荐</strong>的填法；覆盖激活分组的 key，不落盘。</td></tr>
+      <tr><td><code>WYJ_CODE_SEARCH_API_KEY</code></td><td data-i18n="cfg.env.search_key">WebSearch 后端 Key</td><td data-i18n="cfg.env.search_key.note">未配置则<strong>不注册</strong> WebSearch 工具，模型看不到它。</td></tr>
+      <tr><td><code>WYJ_CODE_PROBE_API_KEY</code></td><td data-i18n="cfg.env.probe_key"><code>model doctor --probe</code> 专用 Key</td><td data-i18n="cfg.env.probe_key.note">刻意不复用配置里的 Key：探针要多发请求，用户需自行轮换。</td></tr>
+      <tr><td><code>WYJ_CODE_HOME</code></td><td data-i18n="cfg.env.home">数据根目录</td><td data-i18n="cfg.env.home.note">默认 <code>~/.wyj-code</code>；外置盘 / 独立测试环境用。</td></tr>
+      <tr><td><code>WYJ_CODE_THINKING_EFFORT</code></td><td data-i18n="cfg.env.effort">思考档位</td><td data-i18n="cfg.env.effort.note">优先级<strong>最高</strong>：覆盖会话级 <code>/effort</code> 与 profile 字段。<code>off</code> = 彻底关思考。</td></tr>
+      <tr><td><code>WYJ_CODE_THINKING_SWITCH</code></td><td data-i18n="cfg.env.switch">OpenAI 线 <code>thinking.type</code></td><td data-i18n="cfg.env.switch.note"><code>enabled</code>/<code>disabled</code>/<code>adaptive</code>，覆盖 profile。</td></tr>
+      <tr><td><code>WYJ_CODE_MAX_TOOLS_PER_TURN</code></td><td data-i18n="cfg.env.max_tools">每轮最多并行工具数</td><td data-i18n="cfg.env.max_tools.note">覆盖 profile；用于放开被静态目录误判成 1 的端点。</td></tr>
+      <tr><td><code>WYJ_CODE_NOTIFY_OFF</code></td><td data-i18n="cfg.env.notify_off">通知总开关</td><td data-i18n="cfg.env.notify_off.note"><code>1</code> = 全关，最高优先级。</td></tr>
+      <tr><td><code>WYJ_CODE_NOTIFY_BELL</code></td><td data-i18n="cfg.env.notify_bell">覆盖终端响铃</td><td data-i18n="cfg.env.notify_bell.note"><code>0</code> / <code>1</code>。</td></tr>
+      <tr><td><code>WYJ_CODE_NOTIFY_DESKTOP</code></td><td data-i18n="cfg.env.notify_desktop">覆盖桌面通知</td><td data-i18n="cfg.env.notify_desktop.note"><code>0</code> / <code>1</code>。</td></tr>
+      <tr><td><code>WYJ_CODE_SKILL_DATA</code></td><td data-i18n="cfg.env.skill_data">项目级 skill 的可写产物根</td><td data-i18n="cfg.env.skill_data.note">前台 / 后台 Bash 都会注入；目录不预创建，需要时自己 <code>mkdir -p</code>。</td></tr>
+      <tr><td><code>WYJ_CODE_STREAM_IDLE_SECS</code></td><td data-i18n="cfg.env.stream_idle">SSE 流空闲多久判定卡死</td><td data-i18n="cfg.env.stream_idle.note"><code>0</code> = 关闭看门狗。</td></tr>
+      <tr><td><code>WYJ_CODE_MCP_CALL_SECS</code></td><td data-i18n="cfg.env.mcp_call">单次 MCP 调用超时</td><td data-i18n="cfg.env.mcp_call.note"><code>0</code> = 关闭。</td></tr>
+      <tr><td><code>WYJ_CODE_TURN_STALL_SECS</code></td><td data-i18n="cfg.env.turn_stall">TUI 回合停滞看门狗</td><td data-i18n="cfg.env.turn_stall.note"><code>0</code> = 关闭。</td></tr>
+      <tr><td><code>WYJ_CODE_UPDATE_GOLDEN</code></td><td data-i18n="cfg.env.golden">重新生成 TUI 快照基线</td><td data-i18n="cfg.env.golden.note">仅开发用：<code>=1 cargo test -p wyj-tui golden</code>。</td></tr>
+    </tbody>
+  </table></div>
+  <p class="mt-6 text-sm text-paper/45 leading-relaxed reveal" data-i18n="cfg.env.structural">结构性参数（<code>context_window</code>、<code>max_turns</code>、<code>storage.*</code>）<strong>没有</strong> env 覆盖——改配置应该改文件并留痕；env 只留给「这次运行换个开关」的场景。</p>
+</section>
+
+<!-- RECIPES -->
+<section id="recipes" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-16">
+    <div class="reveal max-w-2xl">
+      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="cfg.rc.kicker">Recipes</p>
+      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.rc.title">三段可以直接抄的配置</h2>
+    </div>
+    <div class="mt-8 grid lg:grid-cols-3 gap-4">
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold text-phosphor" data-i18n="cfg.rc.cheap.title">想省钱：辅助调用换小模型</h3>
+        <pre class="mt-4 code-block rounded-lg px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code>[[profiles]]
+name = "default"
+model = <span class="text-phosphor">"MiniMax-M3"</span>
+aux_model = <span class="text-phosphor">"MiniMax-M3.1-Flash-Preview"</span>
+
+[auto_mode]
+classifier_profile = <span class="text-phosphor">"cheap"</span></code></pre>
+        <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.rc.cheap.desc">两个辅助调用（标题生成、记忆提取）与权限分类器都不复用主对话前缀，换模型对主会话缓存<strong>零影响</strong>。<strong>压缩绝不用辅助模型</strong>。</p>
+      </div>
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold text-phosphor" data-i18n="cfg.rc.long.title">长会话：让清理早点动手</h3>
+        <pre class="mt-4 code-block rounded-lg px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code>[context_edit]
+enabled = true
+soft_limit_ratio = <span class="text-phosphor">0.45</span>
+protect_recent = 5
+
+[storage]
+cas_total_bytes = <span class="text-phosphor">2147483648</span></code></pre>
+        <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.rc.long.desc">外部化是无损且便宜的（无 output token、不幻觉），越早动手，每趟携带的历史越小。CAS 池同时放到 2 GiB 兜住增量。</p>
+      </div>
+      <div class="card rounded-xl p-6 reveal">
+        <h3 class="font-semibold text-phosphor" data-i18n="cfg.rc.strong.title">想更强：放开并发与档位</h3>
+        <pre class="mt-4 code-block rounded-lg px-4 py-3 text-[12px] leading-[1.7] overflow-x-auto"><code>[[profiles]]
+name = "fast"
+provider = <span class="text-phosphor">"anthropic"</span>
+reasoning_effort = <span class="text-phosphor">"high"</span>
+max_tools_per_turn = <span class="text-phosphor">4</span>
+interleaved_thinking = <span class="text-phosphor">true</span>
+
+[agent]
+max_turns = <span class="text-phosphor">320</span></code></pre>
+        <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="cfg.rc.strong.desc">静态目录对国内 vendor 一律判「不支持并发工具」，这个字段是逃生舱；<code>max_turns</code> 调高买的是单次提交能推进多远，代价是最长耗时。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="border-t border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-20 text-center reveal">
+    <h2 class="font-display font-bold text-3xl sm:text-4xl" data-i18n="cfg.cta.title">不知道从哪改起？先跑诊断</h2>
+    <p class="mt-4 text-paper/55 max-w-xl mx-auto" data-i18n="cfg.cta.desc"><code class="text-amber-400">wyj-code --config-status</code> 打印当前分组、Key 状态与超限告警；TUI 里敲 <code class="text-amber-400">/doctor</code> 看环境与扩展的健康度。</p>
+    <div class="mt-8 flex flex-wrap justify-center gap-4">
+      <a href="index.html#install" class="btn-primary rounded-lg px-6 py-3 text-sm" data-i18n="cfg.cta.install">60 秒安装</a>
+      <a href="docs.html" class="btn-ghost rounded-lg px-6 py-3 text-sm" data-i18n="cfg.cta.docs">回到技术文档</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- FOOTER -->
+<footer class="border-t border-white/[0.06]">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-10 flex flex-col sm:flex-row gap-6 sm:items-center sm:justify-between">
+    <div class="flex items-center gap-2.5">
+      <svg viewBox="0 0 64 64" class="w-5 h-5"><rect width="64" height="64" rx="14" fill="#14171a"/><path d="M14 22 L28 32 L14 42" fill="none" stroke="#ffb454" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/><rect x="34" y="38" width="18" height="6" rx="2" fill="#ffb454"/></svg>
+      <span class="text-sm text-paper/50">wyj-code © 2026 owen</span>
+    </div>
+    <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm text-paper/50">
+      <a href="https://github.com/wangyooujin/wyj-code/blob/master/LICENSE-MIT" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">MIT</a>
+      <a href="https://github.com/wangyooujin/wyj-code/blob/master/LICENSE-APACHE" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">Apache-2.0</a>
+      <a href="https://github.com/wangyooujin/wyj-code" target="_blank" rel="noopener" class="hover:text-amber-500 transition-colors">GitHub</a>
+    </div>
+  </div>
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 pb-10 text-xs text-paper/35 leading-relaxed" data-i18n="footer.disclaimer">
+    个人技术作品集项目，基于公开的 Anthropic Messages API、OpenAI Chat Completions API 与 MCP 规范 clean-room 实现，不含任何第三方专有 prompt 或品牌资产，与 Anthropic / OpenAI 官方产品无关联。
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

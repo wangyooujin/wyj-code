@@ -50,8 +50,9 @@
       <a href="#demo" class="hover:text-amber-500 transition-colors" data-i18n="nav.demo">演示</a>
       <a href="#websearch" class="hover:text-amber-500 transition-colors" data-i18n="nav.websearch">网页搜索</a>
       <a href="#audience" class="hover:text-amber-500 transition-colors" data-i18n="nav.audience">适合谁</a>
-      <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
       <a href="docs.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.docs">文档</a>
+      <a href="config.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.config">配置</a>
+      <a href="#install" class="hover:text-amber-500 transition-colors" data-i18n="nav.install">安装</a>
     </nav>
     <div class="flex items-center gap-4">
       <div class="flex items-center gap-1 text-xs font-medium">
@@ -99,64 +100,74 @@
       </div>
 
       <div class="mt-9 flex flex-wrap gap-2.5">
-        <span class="badge-pill rounded-md px-3 py-1.5 text-xs">Rust 1.80+</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs" data-i18n="hero.badge.size">单二进制 · 约 11 MB</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs" data-i18n="hero.badge.boot">冷启动 ~10ms</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs">零遥测</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">MIT OR Apache-2.0</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs">macOS · Linux · Windows</span>
+        <span class="badge-pill rounded-md px-3 py-1.5 text-xs" data-i18n="hero.badge.tests">11 crate · 1962 项测试</span>
         <span class="badge-pill rounded-md px-3 py-1.5 text-xs text-amber-500 border-amber-500/20" data-i18n="hero.badge.websearch">内置网页搜索</span>
       </div>
     </div>
 
-    <!-- DEMO TERMINAL -->
-    <div id="demo" class="relative reveal min-w-0 scroll-mt-24" style="transition-delay:120ms">
-      <div class="term-window rounded-xl overflow-hidden">
-        <div class="flex items-center gap-1.5 px-4 py-3 border-b border-white/[0.06]">
+    <!-- PRODUCT SHOT -->
+    <div class="relative reveal min-w-0" style="transition-delay:120ms">
+      <div class="shot-frame rounded-xl">
+        <div class="flex items-center gap-1.5 px-4 py-2.5 border-b border-white/[0.06]">
           <span class="term-dot bg-[#ff5f57]"></span>
           <span class="term-dot bg-[#febc2e]"></span>
           <span class="term-dot bg-[#28c840]"></span>
-          <span class="ml-3 text-xs text-paper/35">wyj-code — zsh</span>
+          <span class="ml-3 text-xs text-paper/35">wyj-code — 真实终端截图</span>
         </div>
-        <div class="p-4 sm:p-5 text-[12px] leading-[1.55] text-paper/85 overflow-x-auto">
-          <div class="flex items-center gap-2 text-paper/45">
-            <span class="text-phosphor">❯</span><span>wyj-code</span>
-          </div>
-          <div class="mt-2 pb-2.5 border-b border-white/[0.07] text-paper/40">wyj-code v0.3.17 · latest release · static_only</div>
+        <img src="assets/tui-main.png" width="1232" height="580" loading="eager"
+             alt="wyj-code 的终端界面实拍：对话、工具调用与结果同屏" />
+      </div>
+      <p class="mt-4 text-xs text-paper/35 leading-relaxed" data-i18n="shot.caption.hero">不是设计稿，是实际运行截图。工具调用逐条展开、跑完即折叠成一行标题——按 <kbd class="text-paper/60">Ctrl+O</kbd> 可随时展开任意一条的完整内容。</p>
+    </div>
+  </div>
+</section>
 
-          <div class="mt-3 flex gap-2">
-            <span class="shrink-0 text-amber-400 font-semibold">You</span>
-            <span data-i18n="demo.term.user">给所有 HTTP handler 加上 tracing span</span>
-          </div>
+<!-- PRODUCT SHOT (full width) -->
+<section id="demo" class="border-y border-white/[0.06] bg-ink-950/40 scroll-mt-20">
+  <div class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
+    <div class="reveal max-w-2xl">
+      <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="shot.kicker">In Action</p>
+      <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="shot.title">每一步都摊开在你眼前</h2>
+      <p class="mt-4 text-paper/55" data-i18n="shot.desc">它读哪些文件、跑了什么命令、改动了哪几行——全部实时展开。你不必相信一段总结，因为过程本身就是记录。</p>
+    </div>
 
-          <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.search">搜索路由处理器</span></div>
-            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.searchres">找到 31 处，分布在 31 个文件</span></div>
-          </div>
-
-          <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.edit">调用工具 <span class="text-paper">Edit</span> × 31</span></div>
-            <div class="mt-2 ml-4 rounded-lg border border-white/[0.1] bg-ink-950/70 px-3 py-2 text-[11px] leading-relaxed">
-              <p class="text-paper/70" data-i18n="demo.term.confirm.title">允许此次批量编辑？</p>
-              <p class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-paper/45">
-                <span><span class="text-phosphor">[y]</span> <span data-i18n="demo.term.confirm.yes">允许一次</span></span>
-                <span><span class="text-phosphor">[a]</span> <span data-i18n="demo.term.confirm.always">始终允许</span></span>
-                <span><span class="text-paper/35">[d]</span> <span data-i18n="demo.term.confirm.deny">拒绝</span></span>
-              </p>
-            </div>
-            <div class="mt-2 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.written">已写入 <span class="text-phosphor">+214</span> <span class="text-[#ff8a8a]">-37</span></span></div>
-          </div>
-
-          <div class="mt-3">
-            <div class="flex gap-2"><span class="text-amber-400">●</span><span data-i18n="demo.term.run">运行 <span class="text-paper">cargo test</span></span></div>
-            <div class="mt-1 pl-4 flex gap-2 text-phosphor/90"><span>⎿</span><span data-i18n="demo.term.testresult">test result: ok. 148 passed</span><span class="caret animate-blink"></span></div>
-          </div>
+    <div class="mt-10 grid lg:grid-cols-[1.55fr_1fr] gap-8 items-start">
+      <div class="reveal min-w-0">
+        <div class="shot-frame rounded-xl">
+          <img src="assets/tui-session.png" width="1306" height="1074" loading="lazy"
+               alt="wyj-code 一次完整任务的会话全貌" />
+        </div>
+        <p class="mt-4 text-xs text-paper/35 leading-relaxed" data-i18n="shot.caption.session">一次完整任务的会话全貌：思考过程与工具流逐条铺开，长输出折叠成一行标题，需要时再展开。</p>
+      </div>
+      <div class="space-y-4">
+        <div class="card rounded-xl p-6 reveal">
+          <h3 class="font-semibold text-phosphor" data-i18n="shot.l1.title">工具调用逐条展开</h3>
+          <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="shot.l1">每次 Read / Edit / Bash 都留一行标题与可展开的完整结果。长输出不刷屏，但你随时能把任何一条撑开看全文。</p>
+        </div>
+        <div class="card rounded-xl p-6 reveal">
+          <h3 class="font-semibold text-phosphor" data-i18n="shot.l2.title">写文件前先问你</h3>
+          <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="shot.l2">按 <kbd class="text-amber-400">y</kbd> 放行、<kbd class="text-amber-400">a</kbd> 本项目内永久放行、<kbd class="text-amber-400">d</kbd> 拒绝。拒绝的理由会回灌给模型，它会换个思路而不是硬来。</p>
+        </div>
+        <div class="card rounded-xl p-6 reveal">
+          <h3 class="font-semibold text-phosphor" data-i18n="shot.l3.title">随时能打断</h3>
+          <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="shot.l3"><kbd class="text-amber-400">Esc</kbd> 立即中断当前回合并保留已完成的改动；<kbd class="text-amber-400">Ctrl+O</kbd> 展开全部；<kbd class="text-amber-400">Shift+Tab</kbd> 在 auto / plan / bypass 之间切模式。</p>
+        </div>
+        <div class="card rounded-xl p-6 reveal">
+          <h3 class="font-semibold text-phosphor" data-i18n="shot.l4.title">跑完自己验证</h3>
+          <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="shot.l4">前台 Bash 输出按 100ms 节流实时推进，跑完即折叠。项目声明了 <code class="text-amber-400">verify.command</code> 时，每次编辑后框架会自己跑一遍，把报错回灌给模型继续修。</p>
         </div>
       </div>
-      <p class="mt-4 text-xs text-paper/35 leading-relaxed" data-i18n="demo.foldnote">上面是折叠态：每个工具调用只留标题行，长输出不刷屏。按 <kbd class="text-paper/60">Ctrl+O</kbd> 随时展开全文。</p>
     </div>
   </div>
 </section>
 
 <!-- FIVE MINUTES -->
-<section class="max-w-6xl mx-auto px-5 sm:px-8 pb-24">
+<section class="max-w-6xl mx-auto px-5 sm:px-8 py-24">
   <div class="reveal max-w-2xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="quick.kicker">First Five Minutes</p>
     <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="quick.title">装好之后，这四件事都做得到</h2>
@@ -300,7 +311,7 @@ api_key  = <span class="text-phosphor">"tvly-xxxxxxxx"</span></code></pre>
           <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.1">你本来就在终端里工作，希望 AI 的每一步都看得见，而不是收到一个成品 diff</span></li>
           <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.2">你在用国内模型，需要一套统一工具链，而不是为每个厂商单独适配一遍</span></li>
           <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.3">你在意工具链本身——愿意读源码、自己改工具链，甚至自己加一个模型适配</span></li>
-          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.4">你需要定时任务、后台任务与多 Agent 协作，而不是只有一问一答</span></li>
+          <li class="flex gap-3"><span class="text-phosphor shrink-0">·</span><span data-i18n="audience.for.4">你需要后台任务、子 Agent 协作与会话/文件级回滚，而不是只有一问一答</span></li>
         </ul>
       </div>
 
@@ -421,16 +432,16 @@ cargo run -- --config-status</code></pre>
       <p class="mt-2 text-sm text-paper/50" data-i18n="stats.boot">稳态冷启动耗时</p>
     </div>
     <div class="reveal" style="transition-delay:80ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">12<span class="text-amber-500">MB</span></div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.size">release 二进制体积（已 strip）</p>
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">11<span class="text-amber-500">MB</span></div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.size">单平台 release 压缩包（macOS arm64）</p>
     </div>
     <div class="reveal" style="transition-delay:160ms">
       <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">0</div>
       <p class="mt-2 text-sm text-paper/50" data-i18n="stats.telemetry">遥测 / 埋点上报</p>
     </div>
     <div class="reveal" style="transition-delay:240ms">
-      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">4</div>
-      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.principles">条设计原则，无一例外</p>
+      <div class="stat-number font-display font-extrabold text-4xl sm:text-5xl">1962</div>
+      <p class="mt-2 text-sm text-paper/50" data-i18n="stats.tests">项通过的 workspace 测试</p>
     </div>
   </div>
 </section>
