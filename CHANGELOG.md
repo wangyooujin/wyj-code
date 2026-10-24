@@ -12,6 +12,38 @@
 
 ## [Unreleased]
 
+### 新增：`wyj-code export` / `import` 配置备份
+
+换机器时重建一套 `[[profiles]]` 是最烦的手工活，而 `/skills` 里自己攒的
+全局技能也要一个个重新装。新增两个顶层子命令，把这两件事打成一个 `.wyj`
+单文件（zip）：
+
+```bash
+wyj-code export backup.wyj                # 全部 profile + 全局 skills/
+wyj-code import backup.wyj                # 默认 dry-run，只报计划
+wyj-code import backup.wyj --yes          # 实际写入
+```
+
+**备份范围刻意收窄**：只装 `config.toml` 的 `[[profiles]]`/`active_profile`、
+`~/.wyj-code/skills/` 整棵树、以及 `installed.json` 里属于 skill 的那部分元数据。
+`mcp_servers` 与各类全局开关（`[auto_mode]` / `[evolution]` / `[storage]` …）
+**不进包**——它们是对这台机器的策略，被一次「恢复备份」悄悄改掉权限档位与自动
+批准规则，比丢几个配置项的代价大得多。会话、记忆、演化、workspaces 同样不装。
+
+合并规则：profile 按 `name` 合并、同名以归档为准，本机独有的分组原样保留；
+`active_profile` 只在「归档选中的分组本机原本就有」或「本机还是空白配置」
+时才跟随，避免静默把当前会话的端点切到另一个供应商；skill 目录已存在则**整个
+跳过并报告**，绝不覆盖用户手改过的 `SKILL.md`。
+
+归档默认含明文 `api_key`（否则换机后没法直接用），因此写盘后强制 `0600`，
+导出成功时单独打一段醒目警告；`manifest.json` 是正文可读的，改名成 `.zip`
+就能看清包里有什么。导入前先读 `manifest.json` 校验格式版本，不认识的版本
+直接拒绝而不是按老规则硬解析。
+
+zip 的路径穿越 / 绝对路径 / 符号链接 / macOS 打包噪音校验原先只写在
+`skillhub` 里，现抽成 `wyj_store::archive` 供两边共用——这条规则加一处漏
+一处就是任意文件写入。
+
 ### 修复：`frontmost_pid` 在 macOS 26+ 恒失败（P0）
 
 真机实测 macOS 27.0.1 上 system-wide 元素的 `AXFocusedApplication` /

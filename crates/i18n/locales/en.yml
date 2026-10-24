@@ -225,6 +225,25 @@ cli:
   run_about: "Run one slash command / skill once, non-interactively (like typing /xxx in a session, without the REPL loop)"
   run_command_help: "The command to run (`/name` or `name`); remaining arguments are passed through to the command"
 
+backup:
+  export_done: "Exported to {path} ({size}; {profiles} profile(s), {skills} skill(s))"
+  export_profiles: "Profiles: {names}"
+  export_skills: "Skills: {names}"
+  export_secrets_warning: "⚠️ The archive contains **plaintext API keys** for: {names}. This .wyj file is equivalent to your credentials — do not commit it to git or upload it anywhere public (permissions tightened to 0600)."
+  import_source: "Backup source: wyj-code v{version} · {time} · host {host}"
+  import_contains_secrets: "Note: this backup contains plaintext API keys; importing writes them straight into this machine's config.toml."
+  profile_added: "Added profile {name}"
+  profile_replaced: "Overwrote profile {name} (backup wins)"
+  active_profile_switched: "Active profile switched: {old} → {new}"
+  skill_added: "Added skill {name}"
+  skill_skipped: "Skipped skill {name} (already exists locally, not overwritten)"
+  skill_meta_merged: "Merged {count} skill metadata entr(y/ies)"
+  import_nothing_to_do: "Nothing new to import — this machine already matches the backup."
+  dry_run_hint: "That was only a plan; no files were written. Add --yes to apply."
+  confirm_prompt: "Apply the import now? [y/N] "
+  cancelled: "Import cancelled"
+  import_done: "Import complete"
+
 update:
   checking: "Checking for the latest version…"
   up_to_date: "Already on the latest version v{version}"

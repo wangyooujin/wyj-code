@@ -653,6 +653,57 @@ auto_screenshot_max_dim = 960      # 附图的长边像素上限（低于观察�
 
 **Hooks 自动化系统**（格式对齐真实 Claude Code 的 hooks，路径完全自有）：生命周期钩子配置来源与 AGENTS.md 同一哲学。**v0.2.27 起三源全部迁入 `.wyj-code/` 体系**：`~/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`（后者追加不覆盖，local 文件供个人临时覆盖、不提交 git）；原三源 `~/.claude/settings.json` + `<git-root>/.claude/settings.json` + `<git-root>/.claude/settings.local.json` **不再被读取**。仅解析 settings.json 的 `hooks` 键，其它顶层键（真 CC 的 `permissions`/`env` 等）宽容忽略。支持 4 个事件：`PreToolUse`（工具执行前，可 block/approve）、`PostToolUse`（工具执行后，可追加反馈）、`UserPromptSubmit`（用户提交后进入推理前，可 block/追加上下文）、`Stop`（回合结束前，可继续下一轮）。每个 hook 是执行任意 shell 的 `command`，stdin 注入 JSON payload（含 session_id/cwd/event/tool_name/input/response），exit 2 表示 block（stderr 为原因），stdout JSON 可表达更丰富的 `decision`/`reason`/`additionalContext`/`continue`。默认超时 60s，可用 `--no-hooks` 完全禁用；首次检测到非空配置时打印一次性安全提示。实现：`core::hooks::HookRunner` 负责加载/合并/执行，`core::agent::Agent` 在 4 个精确插入点调用，`cli/main.rs` 构造并装配给主 Agent 与 TUI 重建路径，子 Agent 工厂不装配。
 
+### 配置备份：`wyj-code export` / `import`
+
+换机器时不必手抄 `[[profiles]]`，也不必逐个重装全局技能：
+
+```bash
+wyj-code export backup.wyj          # 已存在则拒绝，加 --force 覆盖
+wyj-code import backup.wyj          # 默认 dry-run，只报计划
+wyj-code import backup.wyj --yes    # 实际写入
+```
+
+`.wyj` 是一个 zip，改名成 `.zip` 就能直接查看。包内结构固定：
+
+```
+manifest.json            # 格式版本 / 导出时间 / 主机名 / 是否含明文密钥 / 条目清单
+config.profiles.toml     # 只有 active_profile 与 [[profiles]] 两个字段
+installed.skills.json    # installed.json 里属于 skill 的那部分（可选）
+skills/<name>/...        # 全局 skills/ 整棵树（仅普通文件，符号链接跳过）
+```
+
+**装什么、不装什么**：
+
+| 进包 | 不进包 |
+|---|---|
+| `[[profiles]]` 全部字段（含 `api_key`、`api_key_env`） | `mcp_servers` |
+| `active_profile` | `[auto_mode]` / `[evolution]` / `[storage]` / `[tools]` 等全局开关 |
+| `~/.wyj-code/skills/` 整棵树 | `sessions/`、`history/`、`memory-v3/`、`evolution/`、`workspaces/`、`cas/` |
+| `installed.json` 的 skill 条目（版本/来源/启用状态/`extensions` 索引） | `installed.json` 的 MCP / 插件 / marketplace 源 |
+
+不装全局开关与 MCP 的理由是它们**属于这台机器**：一次「恢复备份」若顺手把
+`[auto_mode]` 或 `[storage]` 盖掉，用户的权限档位与自动批准规则会在没有任何提示
+的情况下改变，代价远大于收益。
+
+**合并语义**（导入）：
+
+- profile 按 `name` 合并，同名以归档为准；本机独有的分组原样保留。
+- `active_profile` 只在两种情况跟随归档：该分组本机原本就有，或本机仍是空白配置
+  （只有一个自动补的空壳 `default`）。否则保持本机现值——不让一次导入静默切换
+  当前会话的端点。
+- skill 目录**已存在就整个跳过并报告**，绝不覆盖。用户手改过的 `SKILL.md` 是
+  用户资产，需要更新就自己删掉再导。
+- `installed.json` 的 skill 条目按 `name` union，同名以归档为准；其它数组不动。
+
+**明文密钥**：归档默认含 `api_key`（换机后开箱即用靠它），写盘后强制 `0600`，
+导出成功时会单独打一段警告。导入前会先读 `manifest.json` 校验格式版本，版本
+不认识就拒绝，而不是按老规则硬解析导致新字段被静默丢弃。
+
+实现：数据层 `wyj_store::bundle`（合并规则、归档格式）、zip 安全校验
+`wyj_store::archive`（与 `skillhub` 共用，拒绝路径穿越/绝对路径/符号链接）、
+profile 片段 `wyj_config::backup::ProfilesFragment`、CLI 出口
+`crates/cli/src/backup_cmd.rs`。
+
 ### /config 面板
 
 **`/config`**：TUI 内 `/config` 打开设置面板（`OpenSettingsDialog`），现仅剩 `log_level`/`language` 两个字段（`SETTINGS_FIELD_COUNT = 2`，`crates/tui/src/app.rs`）；调用相关字段（`provider`/`model`/`base_url`/`api_key`/`plan_model`/`exec_model`/`aux_model`）已迁移到 `/profile` 的 Profile 分组管理器（`ProfileDialog`），按具名 Profile 管理，不再挂在 `/config` 下。`language` 留空（或空串）则回退到自动检测系统 locale（`LANG`/`LC_ALL`），检测不到则用英文；解析统一走 `wyj_i18n::resolve_locale`。

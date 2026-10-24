@@ -494,6 +494,17 @@ pub fn load_global() -> Result<InstalledManifest> {
     load_from(&global_lockfile_path()?)
 }
 
+/// 从**指定路径**读全局 lockfile。供配置备份导入这类需要注入目标路径的
+/// 调用方使用（本 crate 的测试纪律：不触碰真实 `~/.wyj-code`）。
+pub fn load_global_at(path: &Path) -> Result<InstalledManifest> {
+    load_from(path)
+}
+
+/// 写到**指定路径**的全局 lockfile。合并语义与 [`save_global`] 完全一致。
+pub fn save_global_at(path: &Path, manifest: &InstalledManifest) -> Result<()> {
+    save_to(path, manifest)
+}
+
 pub fn load_project(cwd: &Path) -> Result<InstalledManifest> {
     load_from(&project_lockfile_path(cwd))
 }

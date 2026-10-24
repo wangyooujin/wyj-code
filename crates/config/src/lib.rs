@@ -6,11 +6,13 @@ use directories::UserDirs;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod backup;
 pub mod filelock;
 pub mod gitignore;
 pub mod layout;
 pub mod project_mcp;
 pub mod project_settings;
+pub use backup::ProfilesFragment;
 pub use project_mcp::{
     load_project_mcp, merged_mcp_servers, project_mcp_path, save_project_mcp, ProjectMcpConfig,
 };

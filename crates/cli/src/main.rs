@@ -16,6 +16,7 @@ use wyj_tools::{MemoryTool, PermissionMode, TodoStore, ToolCtx, ToolRegistry};
 
 mod acp;
 mod assembly;
+mod backup_cmd;
 mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
@@ -158,6 +159,46 @@ enum Commands {
             help = wyj_i18n::tr("cli.run_command_help")
         )]
         command: Vec<String>,
+    },
+    /// 导出全部 profile 与全局 skill 到单个 `.wyj` 归档（配置备份）。
+    ///
+    /// 与 `storage` 的分工：那个管**本机**的存储占用，这个管**跨机器**的配置搬迁。
+    /// 备份范围刻意只含 profile 与全局 skill——会话、记忆、演化、MCP server 与
+    /// 各类全局开关都不进包，因此导入不会悄悄改掉这台机器的权限档位。
+    #[command(
+        name = "export",
+        about = "Export profiles and global skills to a .wyj archive"
+    )]
+    Export {
+        /// 目标归档路径（如 backup.wyj）。父目录不存在会自动创建。
+        #[arg(help = "Destination archive path, e.g. backup.wyj")]
+        dest: PathBuf,
+        /// 覆盖已存在的目标文件（默认拒绝，避免手滑抹掉上一份备份）
+        #[arg(long, help = "Overwrite an existing archive")]
+        force: bool,
+    },
+    /// 从 `.wyj` 归档恢复 profile 与全局 skill。
+    ///
+    /// 默认只报计划（dry-run），`--yes` 才真正写入。合并规则：profile 按 name
+    /// 合并且同名以归档为准；skill 目录已存在则整个跳过并报告，绝不覆盖。
+    #[command(
+        name = "import",
+        about = "Import profiles and global skills from a .wyj archive"
+    )]
+    Import {
+        /// 归档路径（`wyj-code export` 的产物）
+        #[arg(help = "Source archive path produced by `wyj-code export`")]
+        src: PathBuf,
+        /// 只报计划，不写任何文件（默认开；`--dry-run false` 可显式关掉）
+        ///
+        // 实现注记（不显示给用户）：这里必须用 `ArgAction::Set` +
+        // `default_value_t` 而非 `SetTrue`——`SetTrue` 的 bool 缺席恒为 true、
+        // 无法置 false，`--dry-run=false` 会被 clap 判成 "unexpected value"。
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
+        dry_run: bool,
+        /// 实际写入（覆盖 --dry-run）
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
     },
     /// 本地存储治理:status 查占用 / doctor 查异常 / prune 按 retention 上限清理。
     #[command(
@@ -1374,6 +1415,8 @@ async fn main() -> Result<()> {
                     | Commands::Evolve { .. }
                     | Commands::Memory { .. }
                     | Commands::SkillHub { .. }
+                    | Commands::Export { .. }
+                    | Commands::Import { .. }
                     | Commands::Storage { .. }
                     | Commands::TrustMcp
                     | Commands::TrustSkills
@@ -1448,6 +1491,13 @@ async fn main() -> Result<()> {
             Commands::Trust => {
                 let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
                 return trust_cmd::run_with_scope(&cwd, trust_cmd::TrustScope::All).await;
+            }
+            Commands::Export { dest, force } => {
+                let home = wyj_config::config_dir()?;
+                return backup_cmd::run_export(&cfg, &home, &dest, force);
+            }
+            Commands::Import { src, dry_run, yes } => {
+                return backup_cmd::run_import(&mut cfg, &src, !yes && dry_run);
             }
             Commands::Storage { command } => {
                 let config_base = wyj_config::config_dir()?;
@@ -4827,6 +4877,64 @@ mod cli_tests {
     #[test]
     fn run_subcommand_requires_a_command() {
         assert!(Cli::try_parse_from(["wyj-code", "run"]).is_err());
+    }
+
+    /// `export` 的目标是位置参数，`--force` 默认关。
+    #[test]
+    fn export_subcommand_parses_destination_and_force() {
+        let cli = Cli::try_parse_from(["wyj-code", "export", "backup.wyj"]).unwrap();
+        match cli.command {
+            Some(Commands::Export { dest, force }) => {
+                assert_eq!(dest.to_string_lossy(), "backup.wyj");
+                assert!(!force, "默认不该允许覆盖已有备份");
+            }
+            other => panic!("expected Export subcommand, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["wyj-code", "export", "backup.wyj", "--force"]).unwrap();
+        match cli.command {
+            Some(Commands::Export { force, .. }) => assert!(force),
+            other => panic!("expected Export subcommand, got {other:?}"),
+        }
+    }
+
+    /// `import` 默认 dry-run；`--yes` 与 `--dry-run` 互斥。
+    ///
+    /// 这条钉的是「默认不写盘」这个安全前提：`dry_run` 是取值型 bool，一旦
+    /// 有人把它改回 `SetTrue`，缺席时的默认值会变，导入就变成默认真写配置。
+    #[test]
+    fn import_subcommand_defaults_to_dry_run_and_rejects_conflicting_flags() {
+        let cli = Cli::try_parse_from(["wyj-code", "import", "backup.wyj"]).unwrap();
+        match cli.command {
+            Some(Commands::Import { src, dry_run, yes }) => {
+                assert_eq!(src.to_string_lossy(), "backup.wyj");
+                assert!(dry_run, "导入必须默认只报计划");
+                assert!(!yes);
+            }
+            other => panic!("expected Import subcommand, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["wyj-code", "import", "backup.wyj", "--yes"]).unwrap();
+        match cli.command {
+            Some(Commands::Import { dry_run, yes, .. }) => {
+                assert!(yes);
+                assert!(dry_run, "--yes 只覆盖判定，不把标志本身改掉");
+            }
+            other => panic!("expected Import subcommand, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "wyj-code",
+                "import",
+                "backup.wyj",
+                "--yes",
+                "--dry-run",
+                "true"
+            ])
+            .is_err(),
+            "--yes 与 --dry-run 必须互斥"
+        );
     }
 
     #[test]

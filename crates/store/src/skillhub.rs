@@ -19,6 +19,7 @@
 //! GET**，对同一 URL 发 HEAD 会得到 405，因此这里不能用 HEAD 探大小，改用
 //! `Content-Length` 缺失时退回流式读取上限兜底。
 
+use crate::archive;
 use crate::lockfile::{self, InstallScope, InstalledManifest, InstalledSkillEntry, SkillSource};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -26,7 +27,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// 公共实例的 API 根。自建部署可换成任意同构服务（`/search` + `/download`）。
 pub const SKILLHUB_BASE_URL: &str = "https://api.skillhub.cn/api/v1";
@@ -293,9 +294,9 @@ pub fn preview_archive(archive_bytes: &[u8]) -> Result<SkillArchivePreview> {
         if file.is_dir() {
             continue;
         }
-        let name = safe_entry_name(file.name())
+        let name = archive::safe_entry_name(file.name())
             .with_context(|| format!("技能包含有非法路径条目: {}", file.name()))?;
-        reject_symlink(&file, &name)?;
+        archive::reject_symlink(&file, &name)?;
         preview.file_count += 1;
         preview.total_bytes = preview.total_bytes.saturating_add(file.size());
         if is_executable_path(&name) {
@@ -309,49 +310,10 @@ pub fn preview_archive(archive_bytes: &[u8]) -> Result<SkillArchivePreview> {
 }
 
 // ── 安全解压 ────────────────────────────────────────────────────────────────
-
-/// 校验 zip 条目名，拒绝绝对路径与 `..` 穿越，返回规范化相对路径。
-///
-/// `zip::ZipArchive::enclosed_name()` 也能防穿越，但它是**静默修正**（把 `../`
-/// 剥掉后照常解压），这里要的是**明确拒绝**并告诉用户包有问题，所以自己判。
-fn safe_entry_name(raw: &str) -> Result<String> {
-    let normalized = raw.replace('\\', "/");
-    let trimmed = normalized.trim_start_matches('/');
-    if trimmed.is_empty() {
-        bail!("技能包含有空路径条目");
-    }
-    let mut parts: Vec<&str> = Vec::new();
-    for part in trimmed.split('/') {
-        match part {
-            "" | "." => continue,
-            ".." => bail!("技能包含有路径穿越条目: {raw}"),
-            other => parts.push(other),
-        }
-    }
-    if parts.is_empty() {
-        bail!("技能包含有无效路径条目: {raw}");
-    }
-    if Path::new(trimmed).is_absolute() || trimmed.contains(':') {
-        bail!("技能包含有绝对路径条目: {raw}");
-    }
-    Ok(parts.join("/"))
-}
-
-/// 拒绝符号链接条目：解压出符号链接等于给后续写入开了「任意文件覆盖」的口子。
-fn reject_symlink(file: &zip::read::ZipFile<'_>, name: &str) -> Result<()> {
-    if let Some(mode) = file.unix_mode() {
-        // 0o170000 是 unix 文件类型掩码，0o120000 是 S_IFLNK。
-        if mode & 0o170000 == 0o120000 {
-            bail!("技能包含有符号链接条目: {name}");
-        }
-    }
-    Ok(())
-}
-
-/// 需要跳过的打包噪音（macOS `zip` 产物）。
-fn is_noise_entry(name: &str) -> bool {
-    name.starts_with("__MACOSX/") || name.ends_with("/.DS_Store") || name == ".DS_Store"
-}
+//
+// 条目名校验 / 符号链接拒绝 / 越界二次确认 / macOS 打包噪音的判定全部在
+// [`crate::archive`]——配置备份导入（[`crate::bundle`]）走的是同一套规则。
+// 这里只保留「技能包特有」的部分：条目数上限、解压后体积上限、缺 `SKILL.md`。
 
 /// 把技能包解压到 `dest_dir`。
 ///
@@ -375,15 +337,15 @@ fn extract_archive(archive_bytes: &[u8], dest_dir: &Path) -> Result<SkillArchive
             continue;
         }
         let raw_name = file.name().to_string();
-        let name =
-            safe_entry_name(&raw_name).with_context(|| format!("拒绝非法条目: {raw_name}"))?;
-        if is_noise_entry(&name) {
+        let name = archive::safe_entry_name(&raw_name)
+            .with_context(|| format!("拒绝非法条目: {raw_name}"))?;
+        if archive::is_noise_entry(&name) {
             continue;
         }
-        reject_symlink(&file, &name)?;
+        archive::reject_symlink(&file, &name)?;
 
-        let target =
-            resolve_within(dest_dir, &name).with_context(|| format!("拒绝越界条目: {raw_name}"))?;
+        let target = archive::resolve_within(dest_dir, &name)
+            .with_context(|| format!("拒绝越界条目: {raw_name}"))?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建目录失败: {}", parent.display()))?;
@@ -412,35 +374,6 @@ fn extract_archive(archive_bytes: &[u8], dest_dir: &Path) -> Result<SkillArchive
         bail!("技能包内没有 SKILL.md，不是有效的技能包");
     }
     Ok(preview)
-}
-
-/// 把相对条目路径拼到 `base` 下，并**再确认一次**结果仍在 `base` 内部。
-///
-/// 前面的 `safe_entry_name` 已经挡掉了 `..` 与绝对路径；这里做第二道校验是因为
-/// 「解压任意远程内容」这件事一旦出一次错就是任意文件写入，冗余是故意的。
-fn resolve_within(base: &Path, relative: &str) -> Result<PathBuf> {
-    // 判越界要看**相对部分**，不能看拼好之后的绝对路径——绝对路径必然含
-    // `Component::RootDir`，拿它去比对会误判每一个正常条目。
-    let rel = Path::new(relative);
-    if rel.is_absolute() || rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-        bail!("条目越界: {relative}");
-    }
-    let candidate = base.join(rel);
-    if !normalize_lexically(&candidate).starts_with(normalize_lexically(base)) {
-        bail!("条目越界: {relative}");
-    }
-    Ok(candidate)
-}
-
-fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 // ── 安装编排 ────────────────────────────────────────────────────────────────
@@ -945,9 +878,9 @@ mod tests {
     #[test]
     fn resolve_within_rejects_escaping_paths() {
         let base = Path::new("/tmp/skills/demo");
-        assert!(resolve_within(base, "references/a.md").is_ok());
-        assert!(resolve_within(base, "../evil.md").is_err());
-        assert!(resolve_within(base, "a/../../evil.md").is_err());
+        assert!(archive::resolve_within(base, "references/a.md").is_ok());
+        assert!(archive::resolve_within(base, "../evil.md").is_err());
+        assert!(archive::resolve_within(base, "a/../../evil.md").is_err());
     }
 
     #[test]

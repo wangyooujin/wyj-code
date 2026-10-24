@@ -248,6 +248,8 @@ wyj-code workspace {create,list,diff,accept}        # 隔离 Git worktree
 wyj-code workflow {validate,run,status,control}     # 多 Agent DAG
 wyj-code session {checkpoint,checkpoints,rewind,branch}
 wyj-code review run --base HEAD^ --head HEAD --json
+wyj-code export backup.wyj                       # 导出全部 profile + 全局 skill
+wyj-code import backup.wyj [--yes]               # 恢复（默认 dry-run）
 ```
 
 TUI 内输入 `/help` 查看全部斜杠命令。
