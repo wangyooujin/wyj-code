@@ -2131,6 +2131,42 @@ mod clipboard_paste_tests {
         assert_eq!(metrics.scroll_for_thumb_top(3), 0);
     }
 
+    /// 宽字符的续格不能变成空格混进复制结果。
+    ///
+    /// 现场：在聊天区框选一段中文复制，粘到别处后每个汉字之间都多一个空格
+    /// （`中 文 abc`），看上去像是复制时给每个字加了间距。根因在
+    /// `capture_area_rows`：ratatui 把宽字符写在第 1 格，把紧随其后的续格
+    /// `Cell::reset()` 成 `" "`（`Cell::EMPTY` 的 symbol 就是空格，不是空串），
+    /// 而快照当时是**逐列**扫的，于是每个 CJK 字符后面那个占位格都被当成
+    /// 一个真实空格搬进了 `text`。现在按 symbol 的显示宽度推进，续格根本
+    /// 不会被访问。
+    #[test]
+    fn frame_capture_never_turns_wide_char_padding_into_spaces() {
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let mut state = make_state();
+        state.show_scrollbar = false;
+        state.chat_area = ratatui::layout::Rect::new(0, 0, 20, 1);
+        state.composer_area = ratatui::layout::Rect::default();
+
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 20, 1));
+        Paragraph::new("中文 abc").render(buffer.area, &mut buffer);
+        state.capture_frame_rows(&buffer);
+
+        // 快照按「每格一个字符」记：宽字符只登记起始列，续格不登记。
+        // 偏移是字节偏移（`中` 占 3 字节），所以 0 → 3 → 6 之后才逐字 +1。
+        assert_eq!(
+            state.frame_rows[0].starts[..4],
+            [(0, 0), (2, 3), (4, 6), (5, 7)],
+            "宽字符只占一个 start 条目"
+        );
+        assert_eq!(
+            selection_text(&sel((0, 0), (8, 0)), &state.frame_rows, 0),
+            "中文 abc",
+            "复制结果不能带出行间填充空格"
+        );
+    }
+
     /// 快照只在滚动条**真的画出来**时跳过最右列。
     ///
     /// 内容装得下时滚动条不画，那一列就是正文——无条件跳过会让最右一个字符
