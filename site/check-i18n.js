@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 
 const SITE = __dirname;
-const HTML_FILES = ['index.html', 'docs.html'];
+const HTML_FILES = ['index.html', 'docs.html', 'config.html'];
 
 /** 从 script.js 中稳健地取出 translations 对象字面量并 eval。
  *  用括号计数 + 字符串感知扫描定位结尾，避免按行号/缩进切分（缩进不一致会误报）。 */

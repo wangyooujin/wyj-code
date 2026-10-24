@@ -35,8 +35,10 @@ jobs:
         # HTML 用通配：新增页面漏改这一行时，本地一切正常、线上 404。
         # JS 显式列举 script.js —— 唯一的运行时脚本，check-i18n.js 与
         # tailwind.config.js 是开发文件，不应进生产产物。
+        # assets/ 是截图等静态素材，漏了同样是「本地好好的、线上裂图」。
         run: |
           cp ./*.html ./script.js ./favicon.svg ./*.sh ./*.ps1 dist/
+          cp -R ./assets dist/
 
       - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4

@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title data-i18n="docs.meta.title">wyj-code 文档 — 架构、能力与安全模型</title>
-<meta name="description" content="wyj-code 技术文档：12 个 crate 的分层架构、完整高级功能清单、信任边界与安全模型设计、逐版本变更记录。" />
+<meta name="description" content="wyj-code 技术文档：11 个 crate 的分层架构、完整高级功能清单、信任边界与安全模型设计、逐版本变更记录。" />
 <link rel="icon" href="favicon.svg" type="image/svg+xml" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -51,6 +51,7 @@
       <a href="#websearch" class="hover:text-amber-500 transition-colors" data-i18n="nav.websearch">网页搜索</a>
       <a href="#architecture" class="hover:text-amber-500 transition-colors" data-i18n="nav.architecture">架构</a>
       <a href="#security" class="hover:text-amber-500 transition-colors" data-i18n="nav.security">安全模型</a>
+      <a href="config.html" class="hover:text-amber-500 transition-colors" data-i18n="nav.config">配置</a>
       <a href="#changelog" class="hover:text-amber-500 transition-colors" data-i18n="nav.changelog">变更记录</a>
     </nav>
     <div class="flex items-center gap-4">
@@ -177,8 +178,8 @@
     </div>
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-slash"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.slash.title">自定义 Slash 命令</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.slash.desc">兼容 <code class="text-amber-400">~/.claude/commands/*.md</code> 与项目级命令，六层路径合并加载。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.slash.title">自定义 Slash 命令与 Skill</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.slash.desc">全局 <code class="text-amber-400">~/.wyj-code/skills/</code> 与项目 <code class="text-amber-400">&lt;git-root&gt;/.wyj-code/skills/</code> 四层合并加载，支持单文件 <code class="text-amber-400">name.md</code> 与目录式 <code class="text-amber-400">name/SKILL.md</code>。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-globe"/></svg>
@@ -187,8 +188,8 @@
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:80ms">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-shield"/></svg>
-      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">Fail-closed OS Sandbox</h3>
-      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">macOS Seatbelt + 受控域名代理、Linux bubblewrap；headless 与 SubAgent 无 UI 时拒绝隐式放行。</p>
+      <h3 class="mt-4 font-semibold" data-i18n="feature.privacy.title">Fail-closed 权限模型</h3>
+      <p class="mt-2 text-sm text-paper/55 leading-relaxed" data-i18n="feature.privacy.desc">受保护路径写入在任何模式下都被拒、凭据目录在 Grep/Glob/CodeSearch 遍历时被过滤；headless 与子 Agent 没有真实审批通道时一律 fail-closed。</p>
     </div>
     <div class="card reveal rounded-xl p-6">
       <svg viewBox="0 0 24 24" class="w-6 h-6 text-amber-500"><use href="#i-monitor"/></svg>
@@ -329,7 +330,7 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
 <section id="architecture" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-2xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="arch.kicker">Architecture</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">12 个 crate 的 Rust workspace</h2>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="arch.title">11 个 crate 的 Rust workspace</h2>
     <p class="mt-4 text-paper/55" data-i18n="arch.desc">单一 wyj-code 二进制，职责分层清晰：从上到下依次是入口、服务、核心、基础四层。</p>
   </div>
 
@@ -358,10 +359,9 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
     </div>
     <div class="reveal" style="transition-delay:120ms">
       <p class="text-xs font-bold text-paper/35 uppercase tracking-widest mb-2.5" data-i18n="arch.layer.foundation">基础层 · Foundation</p>
-      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/api <span class="text-paper/30">· wyj-api</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.api">LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/config <span class="text-paper/30">· wyj-config</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.config">配置加载（~/.wyj-code/config.toml）、MCP 配置结构</p></div>
-        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/sandbox <span class="text-paper/30">· wyj-sandbox</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.sandbox">Seatbelt / bubblewrap 命令隔离、凭证 deny-read 与域名级网络边界</p></div>
+      <div class="grid sm:grid-cols-2 gap-3">
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/api <span class="text-paper/30">· wyj-api</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.api">LLM Provider 抽象 trait + Anthropic/OpenAI 双格式实现，SSE 流式解析与断流看门狗</p></div>
+        <div class="arch-node rounded-lg p-4"><p class="font-mono text-sm text-amber-400">crates/config <span class="text-paper/30">· wyj-config</span></p><p class="mt-1 text-sm text-paper/55" data-i18n="arch.config">配置加载与落盘布局（<code>~/.wyj-code/config.toml</code>、<code>layout</code>、项目级 MCP/设置、跨进程文件锁）</p></div>
       </div>
     </div>
   </div>
@@ -382,8 +382,8 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
 <section id="delivery" class="max-w-6xl mx-auto px-5 sm:px-8 py-24 border-t border-white/[0.06]">
   <div class="reveal max-w-3xl">
     <p class="text-amber-500 text-xs font-bold tracking-widest uppercase" data-i18n="delivery.kicker">Delivery Status</p>
-    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.17 · 记忆查得回原话、淘汰不再丢掉常用的、<code>/new</code> 之后 AI 不再自己接着跑</h2>
-    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本版两条线：<strong>记忆召回面补齐</strong>，以及 <strong><code>/new</code> 的会话边界真正成立</strong>。<br><br><strong class="text-amber-400">① 跨会话原文检索</strong>。claim 层存的是模型<strong>提取出来的事实</strong>——提取时漏掉的细节永久丢失，而当时定位问题用的工具输出（某次测试的真实报错、<code>git log</code> 的参数）基本不会被提取成 claim。原始 transcript 一直躺在 <code>sessions/&lt;id&gt;.json</code> 里，此前只有按时间的 <code>list</code> / <code>last</code> 入口，等于「存了但查不到」。新增 <code>SessionStore::search</code> / <code>search_for_project</code>，入口是 Memory 工具的 <code>search_sessions</code> action 与 <code>wyj-code memory search-sessions</code> 子命令。三条索引取舍都是踩过坑才定的：工具<strong>调用</strong>索引参数（那是「当时在查什么」的最佳线索）、工具<strong>结果只索引开头 800 字节</strong>（全不索引让最需要回溯的报错恰好查不到，全量索引让 idf 塌掉）、<strong>每个会话最多 2 条命中</strong>（否则一个跑了一整天的会话会把结果列表占满，其它会话一条都进不来）。<br><br><strong class="text-amber-400">② 淘汰改为「留存分」</strong>。<code>records_max</code> 触顶时旧实现只按 <code>updated_at</code> 截断，于是<strong>淘汰反了</strong>：一条三个月没改、但每次开工都要查的项目约定，会先于一条昨天随手写下、此后再无人问的记录出局。现在按「写入新鲜度 × 0.30 + 使用强度 × 0.70」保留，使用强度 = <code>log(访问次数)</code> × 最近访问衰减。访问计数走增量日志 <code>projects/&lt;key&gt;/access.json</code> 而不是直接改几 MB 的 <code>records.json</code>，GC 在截断<strong>之前</strong>先合并日志——顺序不能反，淘汰打分需要刚合并进来的计数。<br><br><strong class="text-amber-400">③ 词法底座收敛</strong>。<code>tokenize</code> / <code>term_frequencies</code> / <code>Bm25Scorer</code> 统一到新模块 <code>core::lexical</code>；此前三处各写了一份等价实现，分词规则一改就要改三处。精确短语加分（+5.0）保留：中文四字术语切成 n-gram 后每个词元 idf 都接近 0，逐字出现这个最强信号会输给碎词多的噪声段落。<br><br><strong class="text-amber-400">④ <code>/new</code> 之后 AI 还在继续调用：两个独立根因</strong>。其一是忙碌期把 slash 命令当<strong>正文排队</strong>——排队是把草稿当用户消息塞进队列，模型收到字面的 <code>/new</code> 并据此再跑一轮；现在已注册命令明确拒绝并提示，只有非命令正文才排队。其二是<strong>清表不作废生产者</strong>：旧会话的后台子 Agent Done 与后台 shell 退出通知会灌进新会话并触发自动唤醒；子 Agent 侧按「<code>sub_agents</code> 里查不到该 id 就丢弃」，shell 侧新增 <code>stale_shells</code> 黑名单（只 kill 不记没用——job 表只增不减，下一帧会把 <code>Exited(-1)</code> 当新任务登记回来再上报一次）。同时补上 <code>hub.abort_all()</code>。<br><br><strong class="text-amber-400">⑤ 欢迎页常用命令速查</strong>。原来那段冗长的 auto 模式说明压成一句短句，腾出的位置换成 <code>/profile</code> · <code>/model</code> · <code>/effort</code> 速查表。窄终端下命令是<strong>整条丢弃</strong>而不是截断（半截的 <code>/prof</code> 比没有更糟），区块行数恒定——欢迎页总高度与终端宽度无关，聊天区高度测量不会漂移。<br><br><strong>1962 个 workspace 测试</strong>（1936 → 1962）。</p>
+    <h2 class="mt-3 font-display font-bold text-3xl sm:text-4xl" data-i18n="delivery.title">v0.3.20 · 模型终于能读懂屏幕上的字，两个真机卡死也一并修掉</h2>
+    <p class="mt-4 text-paper/55 leading-relaxed" data-i18n="delivery.desc">本版三条线：<strong>computer-use 的读屏能力补齐</strong>，<strong>两个真机 P0</strong>，以及 <strong><code>wyj-code run</code> 让斜杠命令可被脚本调用</strong>。<br><br><strong class="text-amber-400">① 模型看不见屏幕上的字</strong>。此前 AX 树只给控件不给文本，Chrome 窗口里 1151 个 <code>AXStaticText</code> 一个都不给模型，它只能看 1280 宽的下采样截图去认字。<code>list_elements</code> 新增 <code>include_text</code>，把 <code>AXStaticText</code> / <code>AXHeading</code> / <code>AXListMarker</code> 一并列出并带精确坐标——实测 Chrome 窗口全量遍历 0.21s。文本用<strong>独立配额</strong>，打开它不会挤掉按钮。另有 <code>read_text</code>：用 <code>objc2-vision</code> 调系统 OCR，零第三方依赖，只在 AX 树空洞时（原生自绘应用、canvas 图表、视频字幕、图片里的字）才启用；<code>accurate</code> 档有约 0.9s 固定底价，所以做成<strong>显式 action</strong> 而非每次动作后自动跑。回执逐行给置信度并明确声明「这是 OCR 不是原文，数值要二次核对」。<br><br><strong class="text-amber-400">② <code>run_recipe</code>：只给 AppleScript 白名单，不提供通用脚本执行</strong>。AX 做不到的事（新建一个<strong>可命名</strong>的文件夹、建富文本笔记、打开 URL 而不驱动地址栏）用编译期固定的 recipe 表补，模型只选 op 名与参数值，<strong>脚本正文永远来自源码</strong>。通用脚本被否掉的三条理由都是实测的：<code>System Events</code> 的 UI scripting 不超过已有原生 AX 却慢 2~10 倍且没有坐标；<code>execute javascript</code> 在 Chrome 与 Safari 上<strong>都默认关闭</strong>；通用脚本会绕过 <code>hard_deny</code>（<code>osascript</code> 本就因 <code>curl | osascript</code> 被列为解释器）。参数经 <code>--</code> 之后的 argv 传递：把 <code>evil&quot;; do shell script &quot;touch /tmp/PWNED&quot;; --</code> 当文件夹名传进去，结果只是原样产生一个同名文件夹。<br><br><strong class="text-amber-400">③ 两个真机 P0</strong>。其一是 <code>frontmost_pid</code> 在 macOS 26+ 上恒定失败：system-wide 元素的 <code>AXFocusedApplication</code> 恒返回 <code>kAXErrorCannotComplete(-25204)</code>，而前台 PID 是全部变更动作的前置检查，于是「点一下」「输入一段字」第一步就报 <code>target_changed</code>，工具整体不可用。现在先试 AX（仍是「真正持有键盘焦点」的最权威来源），失败退回 <code>NSWorkspace.frontmostApplication</code>，两条都失败仍 fail-closed——放宽的只有「用哪条路读」。其二是 <code>list_elements</code> 看不到 Web / 自绘应用的绝大部分树：<code>max_depth</code> 从 10 提到 24，因为实测 Chrome 2783 个节点里只有 <strong>81 个（3%）</strong>在深度 10 以内，而 WebView 的 DOM 包装层每层只贡献一个 <code>AXGroup</code>、真正的控件在 13~16 层；同样 400 节点预算下从「81 节点 / 1 个文本」变成「400 节点 / 82 控件 + 40 文本」。<br><br><strong class="text-amber-400">④ <code>wyj-code run</code></strong>。一次性执行一条斜杠命令或 Skill，不读 stdin、跑完即退出，退出码反映成功与否；走的是和会话里敲 <code>/xxx</code> 完全相同的注册表与分发链路，因此 skill 的 <code>$ARGUMENTS</code> 展开、<code>allowed-tools</code> / <code>model</code> frontmatter 照常生效。与 headless REPL 的分工：REPL 是多轮交互，<code>run</code> 是<strong>脚本化的一次性调用</strong>。<br><br><code>set_text</code> 的降级链同时扩到四级：AX 写入 → 剪贴板粘贴 → 定向 Unicode → 逐字符（仅 ASCII）。定向 Unicode 用 <code>CGEventKeyboardSetUnicodeString</code> + <code>CGEventPostToPid</code>，真机验证目标<strong>失焦</strong>时仍能把中文完整送进控件。</p>
   </div>
 
   <div class="mt-10 grid md:grid-cols-3 gap-4">
@@ -392,7 +392,7 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
         <h3 class="font-semibold" data-i18n="delivery.p0.title">P0 · 可信执行</h3>
         <span class="badge-pill rounded-full px-2.5 py-1 text-[11px] text-phosphor" data-i18n="delivery.status">已交付</span>
       </div>
-      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p0.desc">国内模型能力目录与 doctor、工具参数修复/schema 校验、Provider 错误分类、权限 fail-closed、Plan 文档写策略与 OS sandbox。</p>
+      <p class="mt-3 text-sm text-paper/55 leading-relaxed" data-i18n="delivery.p0.desc">国内模型能力目录与 doctor、工具参数修复/schema 校验、Provider 错误分类、权限 fail-closed、Plan 文档写策略、受保护路径与凭据目录的双层防护。</p>
     </div>
     <div class="card reveal rounded-xl p-6" style="transition-delay:40ms">
       <div class="flex items-center justify-between gap-3">
@@ -427,7 +427,7 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
         <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="delivery.domestic.desc">完整多工具响应会按保守能力受控串行执行；lazy schema 保留核心编码与 computer-use 工具；headless/daemon 可执行只读桌面观察，变更与未知动作仍失败关闭。没有独立 probe 证据时继续标记 static_only。</p>
       </div>
       <div class="flex flex-wrap lg:justify-end gap-x-5 gap-y-2 text-sm shrink-0">
-        <a href="https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.17" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看 v0.3.17 Release →</a>
+        <a href="https://github.com/wangyooujin/wyj-code/releases/latest" target="_blank" rel="noopener" class="text-amber-500 hover:text-amber-400 transition-colors" data-i18n="delivery.release">查看最新 Release →</a>
         <a href="https://github.com/wangyooujin/wyj-code/blob/master/doc/plan/memory-v3-plan.md" target="_blank" rel="noopener" class="text-paper/55 hover:text-paper/80 transition-colors" data-i18n="delivery.plan">查看完整实施计划 →</a>
       </div>
     </div>
@@ -466,10 +466,32 @@ max_results = <span class="text-phosphor">5</span>        <span class="text-pape
       <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
       <div class="min-w-0">
         <div class="flex items-center gap-3">
-        <span class="font-display font-bold text-phosphor">v0.3.17</span>
+        <span class="font-display font-bold text-phosphor">v0.3.20</span>
           <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.latest">最新公开版</span>
         </div>
-        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v0317"><strong class="text-amber-400">记忆查得回原话、淘汰不再丢掉常用的、<code>/new</code> 之后 AI 不再自己接着跑</strong>。① <strong>跨会话原文检索</strong>：claim 层存的是模型<strong>提取出来的事实</strong>，提取时漏掉的细节永久丢失，而当时定位问题用的工具输出基本不会成为 claim；原始 transcript 一直躺在 <code>sessions/&lt;id&gt;.json</code> 里却只有按时间的入口。新增 <code>SessionStore::search</code> / <code>search_for_project</code>，入口是 Memory 工具的 <code>search_sessions</code> 与 <code>wyj-code memory search-sessions</code>。三条索引取舍：工具<strong>调用</strong>索引参数、工具<strong>结果只索引开头 800 字节</strong>（全不索引让最需要回溯的报错查不到，全量索引让 idf 塌掉）、<strong>每会话最多 2 条命中</strong>（否则一个跑了一整天的会话占满列表）。② <strong>淘汰改为「留存分」</strong>：<code>records_max</code> 触顶时旧实现只按 <code>updated_at</code> 截断，于是淘汰反了——三个月没改但每次开工都要查的约定先于昨天随手写、此后无人问的记录出局；现在按「新鲜度 × 0.30 + 使用强度 × 0.70」保留，访问计数走增量日志 <code>access.json</code>，GC 在截断前先合并。③ <strong>词法底座收敛</strong>到 <code>core::lexical</code>，此前三处各有一份等价实现；精确短语加分保留，否则中文四字术语切成 n-gram 后会输给碎词多的噪声段落。④ <strong><code>/new</code> 之后 AI 还在继续调用</strong>，两个独立根因：忙碌期把 slash 命令当<strong>正文排队</strong>（模型收到字面的 <code>/new</code> 并据此再跑一轮，现在已注册命令明确拒绝）与<strong>清表不作废生产者</strong>（旧会话的子 Agent Done / shell 退出通知灌进新会话触发自动唤醒；子 Agent 按归属过滤，shell 新增 <code>stale_shells</code> 黑名单——只 kill 不记没用，job 表只增不减）。⑤ <strong>欢迎页常用命令速查</strong>：冗长的 auto 说明压成一句，腾出的位置换成 <code>/profile</code> · <code>/model</code> · <code>/effort</code>；窄终端整条丢弃不截断，区块行数恒定。<strong>1962 个 workspace 测试</strong>（1936 → 1962）。</p>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v0320"><strong class="text-amber-400">模型读得到屏幕上的字了，两个真机卡死也修掉了</strong>。① <strong>读屏补齐</strong>：<code>list_elements</code> 新增 <code>include_text</code>，把 <code>AXStaticText</code> / <code>AXHeading</code> / <code>AXListMarker</code> 连同精确坐标一并给出（此前 Chrome 窗口 1151 个文本节点一个都不给模型，它只能看下采样截图认字）；文本用独立配额，不挤占控件名额。新增 <code>read_text</code>：<code>objc2-vision</code> 调系统 OCR，零第三方依赖，只在 AX 树空洞时启用，回执逐行给置信度并声明「这是 OCR 不是原文」。② <strong><code>run_recipe</code> 只给 AppleScript 白名单</strong>：脚本正文永远来自源码，模型只能选 op 与参数；参数经 argv 传递而非拼进脚本，实测注入串只会产生一个同名文件夹。③ <strong>两个真机 P0</strong>：<code>frontmost_pid</code> 在 macOS 26+ 上 AX 恒返回 <code>-25204</code>，导致所有变更动作第一步就 <code>target_changed</code>；现改为 AX 失败退回 <code>NSWorkspace</code>，两条都失败仍 fail-closed。<code>list_elements</code> 的 <code>max_depth</code> 从 10 提到 24——实测 Chrome 只有 <strong>3%</strong> 的节点在 10 层以内，WebView 的真控件在 13~16 层。④ <strong><code>wyj-code run</code></strong>：一次性执行斜杠命令 / Skill，不读 stdin、跑完即退出，走与会话内完全相同的分发链路。<br><br><strong class="text-amber-400">v0.3.19 同批</strong>：定时任务子系统整体下线；<code>simplify_schema_value</code> 不再把 <code>properties</code> 里的<strong>参数名</strong>当注解删掉（第三方端点此前会让模型漏传 <code>title</code> / <code>description</code>）；已批准的项目级 skill 不再每次启动重新追问（信任状态改为四态）；skill 运行产物改落 <code>$WYJ_CODE_SKILL_DATA</code>，不再写坏自己的信任指纹。</p>
+      </div>
+    </div>
+
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+        <span class="font-display font-bold text-phosphor">v0.3.19</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v0319"><strong class="text-amber-400">定时任务下线、schema 简化删掉了参数名、已批准的 skill 每次启动又被追问</strong>。① <strong>定时任务子系统整体移除</strong>：<code>/schedule</code> 面板、CLI <code>schedule</code> 子命令、<code>cron</code> 依赖与通知通道里的 <code>ScheduleFailed</code> 一并删除；本机 crontab 里的托管区块需手工移除。理由是它依赖系统 crontab、与「wyj-code 无常驻进程」这一架构前提始终别扭，而 <code>wyj-code run</code> 已经覆盖了脚本化调用的真实需求。② <strong>工具 schema 简化把同名参数一并删掉</strong>：<code>simplify_schema_value</code> 原先对整个 JSON 树无差别删 <code>title</code> / <code>description</code> / <code>default</code>，而这些键在 <code>properties</code> 字典里是<strong>参数名</strong>——第三方端点（<code>strict_tool_schema = false</code>）走简化路径，于是 <code>Memory</code> 的 <code>title</code>、<code>SubAgent</code> 的 <code>description</code> 从契约里消失，模型不知道参数存在而漏传。新增 <code>SCHEMA_MAP_KEYWORDS</code> 让 <code>properties</code> / <code>$defs</code> 只递归值、保留键。③ <strong>skill 信任改为四态</strong>：<code>NoProjectSkills</code> / <code>Trusted</code> / <code>NeverApproved</code> / <code>Changed</code>，<code>needs_prompt()</code> 是唯一判定入口——此前 TUI 只判「有没有项目级 skill」就弹窗，与信任状态脱钩，症状是<strong>已批准的项目每次启动都被重新追问</strong>。④ <strong>skill 运行产物不再作废自己的信任</strong>：改为写 <code>$WYJ_CODE_SKILL_DATA</code>（在仓库控制不到的位置），既不破坏指纹也不会被 <code>git pull</code> 覆盖。⑤ <strong><code>forced_thinking_max_turns</code> 32 → 64</strong>：思考关不掉的端点几乎「一轮一个工具调用」，32 让中型任务必然撞顶、每次都得手打「继续」。</p>
+      </div>
+    </div>
+
+    <div class="reveal flex gap-6 pb-10 border-l border-white/[0.08] pl-8 relative min-w-0">
+      <span class="absolute -left-[7px] top-1 w-3 h-3 rounded-full bg-phosphor timeline-dot"></span>
+      <div class="min-w-0">
+        <div class="flex items-center gap-3">
+        <span class="font-display font-bold text-phosphor">v0.3.17</span>
+          <span class="badge-pill rounded-full px-2.5 py-0.5 text-[11px]" data-i18n="changelog.previous">上一版</span>
+        </div>
+        <p class="mt-2 text-sm text-paper/60 leading-relaxed" data-i18n="changelog.v0317"><strong class="text-amber-400">记忆查得回原话、淘汰不再丢掉常用的、<code>/new</code> 之后 AI 不再自己接着跑</strong>。① <strong>跨会话原文检索</strong>：claim 层存的是模型<strong>提取出来的事实</strong>，提取时漏掉的细节永久丢失，而当时定位问题用的工具输出基本不会成为 claim；原始 transcript 一直躺在 <code>sessions/&lt;id&gt;.json</code> 里却只有按时间的入口。新增 <code>SessionStore::search</code> / <code>search_for_project</code>，入口是 Memory 工具的 <code>search_sessions</code> 与 <code>wyj-code memory search-sessions</code>。三条索引取舍：工具<strong>调用</strong>索引参数、工具<strong>结果只索引开头 800 字节</strong>（全不索引让最需要回溯的报错查不到，全量索引让 idf 塌掉）、<strong>每会话最多 2 条命中</strong>。② <strong>淘汰改为「留存分」</strong>：<code>records_max</code> 触顶时旧实现只按 <code>updated_at</code> 截断，于是淘汰反了——三个月没改但每次开工都要查的约定先于昨天随手写的记录出局；现在按「新鲜度 × 0.30 + 使用强度 × 0.70」保留，访问计数走增量日志 <code>access.json</code>，GC 在截断前先合并。③ <strong>词法底座收敛</strong>到 <code>core::lexical</code>，此前三处各有一份等价实现；精确短语加分保留，否则中文四字术语切成 n-gram 后会输给碎词多的噪声段落。④ <strong><code>/new</code> 之后 AI 还在继续调用</strong>，两个独立根因：忙碌期把 slash 命令当<strong>正文排队</strong>（模型收到字面的 <code>/new</code> 并据此再跑一轮，现在已注册命令明确拒绝）与<strong>清表不作废生产者</strong>（旧会话的子 Agent Done / shell 退出通知灌进新会话触发自动唤醒）。⑤ <strong>欢迎页常用命令速查</strong>：冗长的 auto 说明压成一句，腾出的位置换成 <code>/profile</code> · <code>/model</code> · <code>/effort</code>；窄终端整条丢弃不截断，区块行数恒定。<strong>1962 个 workspace 测试</strong>（1936 → 1962）。</p>
       </div>
     </div>
 
