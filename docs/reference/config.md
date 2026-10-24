@@ -165,6 +165,31 @@ vision = true                # 模型是否支持图片输入；false 时图片�
                               # env var `WYJ_CODE_MAX_TOOLS_PER_TURN` 优先（runtime override，不写盘）。
 log_level = "warn"           # 调试时设为 "debug"
 language = ""                # "en"/"zh"，留空（或空串）自动检测系统 locale；决定 UI 文案 **与模型输出语言**（含 thinking）
+auto_memory_enabled = true   # 跨会话记忆自动提取（/memory 面板可切换）。false = 不再每轮后台提取
+active_profile = "default"   # 当前激活的分组名，必须在 [[profiles]] 里有同名项
+
+# ── 调用分组：一套完整的端点 + 凭据 + 能力组合 ───────────────────────────────
+# /profile 面板管理整套分组（写本文件）；/model 只切当前分组下的模型（仅内存）。
+[[profiles]]
+name = "default"             # 分组名，唯一。`--profile <name>` 一次性指定本次运行用哪套
+provider = "anthropic"       # anthropic / openai —— 决定用哪个客户端实现（线协议由它唯一决定）
+model = "claude-opus-4-8"
+plan_model = ""              # Plan 模式专用模型，留空则用 model
+exec_model = ""              # Bypass 模式专用模型，留空则用 model
+aux_model = ""              # 辅助模型（标题生成 / 记忆提取），留空则用 model；见「辅助模型」节
+base_url = ""                # 留空使用供应商默认端点
+api_key = ""                 # 不推荐：明文落盘。优先用下一行的 api_key_env 或环境变量
+api_key_env = ""             # 从该环境变量名读取 Key，运行时取值、不写回本文件
+max_tokens = 32000           # 单轮输出预算
+context_window = 200000      # **必须填真实值**：压缩/清理阈值都由它推算，填大了两套保护等于没开
+vision = true                # 模型是否支持图片输入；false 时图片降级为占位文本（防非多模态端点 400）
+thinking_budget = 0          # 扩展思考预算 token；0/不写 = 关闭（思考计入 output 计费）
+interleaved_thinking = true  # 工具轮之间允许交错思考。Anthropic 线专属，OpenAI 线配了不生效
+prompt_cache = true          # 留空 = 跟随端点类型（官方 Anthropic 开、第三方兼容端点关）
+openai_stream_options = false # OpenAI 兼容端点可显式关闭 stream_options.include_usage
+reasoning_effort = "medium"  # low/medium/high/xhigh/max。协议无关（OpenAI 发顶层字段，Anthropic 发 output_config.effort）
+thinking_switch = "enabled"  # OpenAI 线 thinking.type 覆盖：enabled/disabled/adaptive。不写 = 按模型默认
+max_tools_per_turn = 4       # 每次回复最多并行几个工具；不写 = 由模型目录决定（国内 vendor 常判 1）
 
 [search]                     # WebSearch 工具的后端与请求默认值（未配置 api_key 则工具不注册，模型看不到）
 provider = "tavily"          # 后端：tavily / brave。写成未知值会显式报错，不会静默回退
@@ -302,12 +327,162 @@ subagent_done = true         # 后台子 Agent 完成（run_in_background: true�
 #   WYJ_CODE_NOTIFY_BELL=0/1   覆盖 notify.bell.enabled
 #   WYJ_CODE_NOTIFY_DESKTOP=0/1 覆盖 notify.desktop.enabled
 
+[routing]                        # 同角色多候选 Profile 与可恢复错误 fallback
+cross_provider_fallback = false  # **默认 false**：故障切换只在同 vendor 内进行。打开等于允许把
+                                 # 同一段对话在用户未授权时发给另一家供应商——与「辅助模型必须同端点」
+                                 # 守的是同一条边界。确有多家同源端点时才开。
+[routing.roles]                  # 每个角色是一个 **Profile 名**列表（按顺序尝试），不是裸模型 id：
+                                 # 候选要能各自携带自己的 vendor / 协议 / endpoint / 能力配置。
+explore = ["default"]            # Explore 子 Agent 的角色链
+plan = []                        # 规划角色链；空 = 用当前激活分组
+execute = []                     # 执行角色链；空 = 用当前激活分组
+review = []                      # 评审角色链；空 = 用当前激活分组
+
+[model_runtime]                  # 国内模型工具协议与能力探测的保守默认值
+probe_mode = "explicit"          # 能力探测模式：explicit（只在显式请求时探；默认）/ 其它由
+                                 # `wyj-code model doctor` 与 startup 复用。默认值刻意保守：
+                                 # 未经探测的能力一律标 static_only，不假装已验证。
+probe_ttl_hours = 168            # 探测结果缓存有效期（小时）。默认 7 天，过期后 `doctor --refresh` 才重探
+tool_argument_retries = 2        # 工具参数解析失败后的重试次数（弱模型常产出半截 JSON）；
+                                 # 0 = 不重试，直接把错误回灌给模型
+lazy_tools_threshold = 12        # 工具总数超过该值时启用 lazy schema（只给核心工具完整 schema，
+                                 # 其余走 ToolSearch 按需展开）。工具少时全量给更省一次往返
+lazy_tools_top_k = 8             # lazy 模式下一轮最多展开几个候选工具
+lazy_tools_sticky_turns = 3      # 命中的工具在搜索结果里**排序加权**的回合窗口。
+                                 # **v0.3.14 起不再控制可见性**：可见性单调不减，因为工具数组
+                                 # 物理排在 prompt cache 前缀最前面，中途摘工具会让整段缓存失效
+
+[agent]                          # Agent 推理循环参数
+max_turns = 200                  # 单次用户提交内允许的最大推理轮数（一次 LLM 往返 = 一轮）。
+                                 # **默认 200**，本意是「防模型死循环」，不是给正常长任务设工期。
+                                 # 距上限还剩 4 轮时会先注入收尾指令，要求模型停止调用工具、
+                                 # 立即总结当前进度。调高它买「单轮能推进多远」，代价是单次提交
+                                 # 的最长耗时与 token 上限；死循环保护由 loop_guard 独立承担
+forced_thinking_max_turns = 64   # **思考关不掉的端点**（reasoner / -r1 / MiniMax M2.x-M3.1 /
+                                 # Qwen·豆包 -thinking / Moonshot -code）的单回合熔断轮数。
+                                 # 默认 64 而非与 max_turns 齐平：这类端点每轮都是一次完整深度
+                                 # 推理，实测单回合可达 163 轮 / 35.6 万 output token
+
+[tools]
+todo_enabled = true              # 是否注册 TodoWrite 任务列表工具（**默认开启**）。
+                                 # 未注册 = 工具不产生 schema，模型目录里看不到它。
+                                 # 简单任务为主、或用强模型跑短任务时设 false 更划算
+
+[ui]                             # TUI 展示区交互
+mouse = "auto"                   # 鼠标报告策略三态：auto（按 TERM 判定，默认）/ on / off。
+                                 # 默认开的原因：alternate screen 里终端没有自己的滚动条，而
+                                 # macOS Terminal.app 不支持 DEC 1007，不开捕获时滚轮完全没反应。
+                                 # 开启后滚轮、拖选、双击选词、滚动条拖动全部由应用实现
+# mouse_capture = true           # **已废弃**：v0.3.18 前的布尔字段，等价于 on/off，不再写回
+scrollbar = true                 # 内容区右侧是否绘制应用内细滚动条（│/┃）。
+                                 # 只在内容超出视口时出现，宽度 < 3 列的终端不画
+
+[evolution]                      # 基于真实 Episode 的本地自进化
+enabled = true                   # 总开关。关掉后完全不记录 Episode、不生成候选
+use_experiences = true           # 是否把历史经验纳入提取上下文
+suggest_rules = true             # 是否产出 Rule 候选
+suggest_skills = true            # 是否产出 Skill 候选
+auto_activate_rules = false      # **默认 false，且不建议打开**：Rule 会进 system prompt，
+                                 # 自动激活等于让模型自己改自己的行为约束
+auto_install_skills = false      # 同上，Skill 自动安装默认关闭
+allow_self_code_experiments = false  # 是否允许对自身代码做实验性修改，默认关闭
+exclude_external_context = true  # 是否把 Web/MCP 等外部上下文排除在演化证据外（默认排除：
+                                 # 外部内容不是用户意图的证据，混进来会污染偏好学习）
+infer_feedback = true            # 是否从后续对话推断隐式反馈（用户重述/修正即负反馈）
+skill_candidate_min_successes = 3    # Skill 候选所需的最少成功次数
+skill_candidate_min_sessions = 2     # Skill 候选所需的最少独立会话数
+idle_delay_secs = 300            # 空闲多久后才跑后台演化（秒）；避免和前台回合抢模型配额
+max_background_workers = 1       # 后台演化并发 worker 数
+max_context_bytes = 8000         # 单次演化提取喂给模型的上下文字节上限
+max_daily_tokens = 50000         # 演化每日 token 预算（硬封顶，超了当天停跑）
+max_daily_wall_secs = 1800       # 演化每日墙钟预算（秒），默认 30 分钟
+max_project_store_bytes = 104857600  # 单项目演化数据目录上限（字节），默认 100 MiB，超了走 retention
+evolution_profile = ""           # 演化调用用哪个 Profile，留空 = 复用当前激活分组
+[evolution.retention]            # 不同证据类型有效期不同，避免一个统一 TTL 同时误删偏好、放着事实陈旧
+repository_fact_stale_days = 28  # 仓库事实（模块职责、构建命令）多久后算陈旧
+workflow_stale_days = 60         # 工作流记忆的陈旧期
+user_preference_review_days = 180    # 用户偏好多久后进入复审（不直接删）
+failed_episode_days = 30         # 失败 Episode 保留期
+candidate_days = 90              # 未处理的 Rule/Skill 候选保留期
+audit_days = 180                 # 审计记录保留期
+
+[persist_cap]                    # 落盘 / 运行时 / resume 三条路径共用的 ContentBlock 字节上限
+tool_result_head_bytes = 20480   # 工具结果 head 上限，0 = 不截断
+tool_result_tail_bytes = 10240   # 工具结果 tail 上限，0 = 不截断
+thinking_bytes = 0               # **已废弃，不再生效**（保留仅为兼容旧配置）。
+                                 # 原按此截断 thinking，但协议要求续轮时原样回传 thinking 块，
+                                 # 截断文本保留 signature 会让签名校验失配且不可逆
+reasoning_details_bytes = 0      # **已废弃，不再生效**，理由同上
+tool_use_input_bytes = 65536     # ToolUse.input JSON 字符串上限，0 = 不截断
+text_head_bytes = 16384          # 纯文本 ContentBlock 的 head 上限，0 = 不截断
+text_tail_bytes = 8192           # 纯文本 ContentBlock 的 tail 上限，0 = 不截断
+
+[storage]                        # ~/.wyj-code 各子系统 retention / cap / rotation（0 = 关闭该项清理）
+checkpoints_per_session = 20     # 单会话 checkpoint 上限。超限按时间淘汰最旧的
+memory_v2_md_per_kind = 200      # Memory v2 每类 .md 文件条数上限
+memory_v3_records_max = 5000     # Memory v3 records.json 单文件条目上限。Superseded 永远保留，
+                                 # 只对 Active/Pending 按「写入新鲜度 0.30 + 使用强度 0.70」淘汰
+memory_v3_jobs_max = 32          # Memory v3 pending 任务队列上限
+memory_v3_rejected_history_max = 500  # rejected_history.json 条数上限（防止反复提议已拒绝项的那份指纹表）
+plugin_gc_interval_days = 7      # 插件 .git 做 `git gc --prune=now` 的间隔天数
+workspace_worktree_max_age_days = 30  # workspace worktree 自动 prune 的过期天数
+disk_usage_warn_bytes = 5368709120    # 启动期占用告警阈值（默认 5 GiB）
+cas_max_blob_bytes = 16777216    # CAS 单 blob 上限（默认 16 MiB），超此值不进 CAS 直接 inline
+cas_total_bytes = 1073741824     # CAS 总量上限（默认 1 GiB），启动时按 LRU 回收 ref_count == 0 的 blob
+cas_gc_on_start = true           # 启动时是否跑一次 CAS gc。blob 很多时是毫秒级全池遍历，可关
+sessions_ttl_days = 0            # **默认 0 = 不自动删**。删历史不可逆，不该在升级后第一次启动里
+                                 # 静默发生。想启用设 30/90，或手动跑 `wyj-code storage prune --yes`
+                                 # （它读同一组配置；dry-run 与 --yes 用同一个值）
+sessions_keep_recent = 5         # 每个项目无条件保留最新 N 条。TTL 的必要配套：纯 TTL 会把
+                                 # 「三个月没动的项目里唯一那批会话」删光，而那恰恰最想回看
+stale_lock_ttl_days = 7          # 删 cas/locks/ 与 sessions/*.lock 里无人持有且超期的
+                                 # （内核会释放 flock，但文件本身不会被删——实测能攒到上万个小文件）
+scope = "home"                   # 运行状态落盘范围：home（默认，~/.wyj-code/）/ project
+                                 # （会话与历史跟着工作副本走，见上方「落盘范围」节）
+
+# [sandbox]                      # **已整体移除**（crates/sandbox 已删除）。整块运行时被忽略，
+                                 # 读取后会在 Config::load 里打印一次 deprecation 警告。
+                                 # 旧文件里的 enabled / filesystem / network / environment 等字段
+                                 # 不会导致解析失败，但改它们没有任何效果。Bash 直接继承宿主环境。
+                                 # 删掉这一块即可消除警告。
+
 [[mcp_servers]]
-name = "my-server"
-transport = "stdio"
-command = "/path/to/server"
-args = ["--flag"]
+name = "my-server"               # 服务名（日志区分用；项目级同名覆盖全局）
+transport = "stdio"              # stdio / streamable_http（旧写法 "http" 仍被接受）
+command = "/path/to/server"      # stdio：可执行命令
+args = ["--flag"]                # stdio：参数列表
+# env = { KEY = "VALUE" }        # stdio：附加环境变量
+# url = "https://..."            # streamable_http：远端端点
+# headers = { Authorization = "Bearer ${MY_TOKEN}" }  # streamable_http：请求头，
+                                                   # 值支持 ${ENV_VAR} 引用（Key 不落盘）
 ```
+
+### 环境变量总表
+
+配置项优先从文件读；下面这些是**只在运行时生效、绝不写回 `config.toml`** 的进程级开关（`runtime_*`
+槽位带 `#[serde(skip)]`，正是为了「打开设置面板保存」不会把 secret 物化进文件）。
+
+| 变量 | 作用 | 默认 / 备注 |
+|---|---|---|
+| `WYJ_CODE_API_KEY` | 模型 API Key，**最推荐**的填法 | 覆盖激活分组的 key；不落盘 |
+| `WYJ_CODE_SEARCH_API_KEY` | WebSearch 后端 Key | 未配置则**不注册** WebSearch 工具 |
+| `WYJ_CODE_PROBE_API_KEY` | `model doctor --probe` 专用 Key | 刻意不复用配置里的 Key：探针要多发请求，用户需自行轮换 |
+| `WYJ_CODE_HOME` | 数据根目录 | 默认 `~/.wyj-code`；外置盘 / 独立测试环境用 |
+| `WYJ_CODE_THINKING_EFFORT` | 思考档位（low/medium/high/xhigh/max/off） | 优先级最高：覆盖会话级 `/effort` 与 profile 字段 |
+| `WYJ_CODE_THINKING_SWITCH` | OpenAI 线 `thinking.type` | enabled/disabled/adaptive；覆盖 profile |
+| `WYJ_CODE_MAX_TOOLS_PER_TURN` | 每轮最多并行工具数 | 覆盖 profile；用于放开被静态目录误判成 1 的端点 |
+| `WYJ_CODE_NOTIFY_OFF` | 通知总开关 | `1` = 全关（最高优先级） |
+| `WYJ_CODE_NOTIFY_BELL` | 覆盖 `[notify.bell].enabled` | `0`/`1` |
+| `WYJ_CODE_NOTIFY_DESKTOP` | 覆盖 `[notify.desktop].enabled` | `0`/`1` |
+| `WYJ_CODE_SKILL_DATA` | 项目级 skill 的**可写产物根** | 前台 / 后台 Bash 都会注入；目录不预创建，需要时自己 `mkdir -p` |
+| `WYJ_CODE_STREAM_IDLE_SECS` | SSE 流空闲多久判定卡死 | 默认值见 `api::stream_guard`；`0` = 关闭看门狗 |
+| `WYJ_CODE_MCP_CALL_SECS` | 单次 MCP 调用超时 | `0` = 关闭 |
+| `WYJ_CODE_TURN_STALL_SECS` | TUI 回合停滞看门狗 | `0` = 关闭 |
+| `WYJ_CODE_UPDATE_GOLDEN` | 重新生成 TUI 快照基线 | 仅开发用（`=1 cargo test -p wyj-tui golden`） |
+
+> **哪些不该写进环境变量**：`context_window`、`max_turns` 这类「结构性参数」没有 env 覆盖——它们是
+> 配置的一部分，改它应该改文件并留痕；env 只留给「这次运行换个开关」的场景。
+
 
 
 ## 进阶主题

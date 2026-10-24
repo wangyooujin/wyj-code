@@ -1,93 +1,46 @@
 # wyj-code
 
-[![Release](https://img.shields.io/badge/release-v0.3.17-2ee6a4.svg)](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.17)
+[![Release](https://img.shields.io/badge/release-v0.3.20-2ee6a4.svg)](https://github.com/wangyooujin/wyj-code/releases/latest)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#1-安装)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#开源协议)
 [![Pages](https://img.shields.io/badge/Pages-在线主页-22c55e.svg)](https://wangyooujin.github.io/wyj-code/)
+[![Tests](https://img.shields.io/badge/tests-1962%20passing-7ee8b8.svg)](#测试与发版门禁)
 
-**面向真实开发工作的 Rust 终端 AI 编程助手。**
+**跑在你自己的终端里的 Rust AI 编程助手。单二进制、零遥测、1962 项测试。**
 
-wyj-code 提供原生 TUI、代码读写与命令执行、多 Agent 协作、MCP/Skill/Plugin 扩展、
-会话与工作区管理，以及默认安全失败关闭的本地执行环境。同时支持 Anthropic Messages
-和 OpenAI Chat Completions 双协议，可连接 Claude、OpenAI、GLM、MiniMax、Kimi、DeepSeek、
-Qwen/百炼、豆包/火山及其他协议兼容端点。
+![wyj-code TUI](site/assets/tui-main.png)
+
+wyj-code 把 AI coding 的核心能力放进一个**可审计、可扩展、可本地运行**的终端工具：原生 TUI、
+代码读写与命令执行、多 Agent 协作、MCP / Skill / Plugin 扩展、会话快照与隔离 worktree，
+以及默认失败关闭的权限模型。同时支持 Anthropic Messages 与 OpenAI Chat Completions 双协议，
+可连接 Claude、OpenAI、GLM、MiniMax、Kimi、DeepSeek、Qwen / 百炼、豆包 / 火山及其他兼容端点。
 
 [项目主页](https://wangyooujin.github.io/wyj-code/) ·
-[安装页面](https://wangyooujin.github.io/wyj-code/#install) ·
+[在线配置参考](https://wangyooujin.github.io/wyj-code/config.html) ·
+[技术文档](https://wangyooujin.github.io/wyj-code/docs.html) ·
 [GitHub Releases](https://github.com/wangyooujin/wyj-code/releases) ·
 [更新日志](./CHANGELOG.md) ·
-[架构文档](./doc/architecture.md) ·
 [贡献指南](./CONTRIBUTING.md)
 
-> **版本状态**：最新公开版本
-> [v0.3.17](https://github.com/wangyooujin/wyj-code/releases/tag/v0.3.17)。
-> 历史 tag 保持不可移动，一键安装脚本始终下载 GitHub 最新公开 Release。
->
-> **⚠️ v0.2.28 升级必读（BREAKING）**：项目自带的 `.wyj-code/skills/` 现在需要
-> 显式信任批准。首次启动会弹出信任面板，**不批准则这些 skill 不加载**（斜杠补全
-> 里不出现，模型也看不见、不会推荐）。批准记录落在仓库外，内容变化后需重新批准。
-> 需要用到项目级 skill 时可先跑 `wyj-code trust`（或 `trust-skills`）一次性批准。
-> **批准一次即可**：只要内容没变就不会再问；内容变了会明确列出变化的文件。skill 的
-> 运行产物请写 `$WYJ_CODE_SKILL_DATA`（不受信任指纹影响），别写回自己的目录。
->
-> **⚠️ v0.2.27 升级必读（BREAKING）**：项目记忆文件由 `CLAUDE.md` **硬切换**为
-> `AGENTS.md`，wyj-code 不再读取任何 `.claude/` 路径。把仓库根的 `CLAUDE.md`
-> 改名为 `AGENTS.md`（或另建一份），否则 wyj-code 读不到你的项目上下文。
-> 详见下方「架构」节的说明与 [CHANGELOG](./CHANGELOG.md)。
->
-> **国产模型适配报告**：[DeepSeek / GLM / Kimi / Qwen / 豆包 / MiniMax 与 Claude Code / Codex 的能力对照](./doc/analysis/domestic-models-vs-claude-code.md)
-> （基于公开网络资料与社区分享的最佳实践总结，未包含实测 benchmark）。
+---
+
+## 为什么是它
+
+| | |
+|---|---|
+| **单二进制发布** | release 无运行时依赖，`~10ms` 稳态冷启动。装完即用，不留服务进程。 |
+| **每一步都看得见** | 工具调用逐条展开、写文件前弹确认、随时 ESC 打断。不必相信一段总结——过程本身就是记录。 |
+| **11 个 crate / 1962 项测试** | 全量 `cargo test` 通过，`clippy -D warnings` 零告警，5 个平台产物同时发布。 |
+| **零遥测** | 只有显式的模型请求、Web 工具与 MCP 调用会出网。配置 / 会话 / 记忆全在本机。 |
+| **双协议 + 国内模型** | vendor 与线协议分离，一套工具链同时适配官方 API 与国内兼容端点。 |
+| **默认失败关闭** | 受保护路径任何模式都不放行；无审批通道（headless / 子 Agent）时拒绝副作用操作。 |
 
 ---
 
-## 目录
+## 60 秒上手
 
-- [项目介绍](#项目介绍)
-- [安装](#安装)
-- [快速开始](#快速开始)
-- [核心特性](#核心特性)
-- [内置网页搜索 WebSearch](#内置网页搜索-websearch)
-- [配置](#配置)
-- [项目资源](#项目资源)
-- [架构](#架构)
-- [文档与社区](#文档与社区)
-- [安全与隐私](#安全与隐私)
-- [开发与贡献](#开发与贡献)
-- [开源协议](#开源协议)
-
----
-
-## 项目介绍
-
-wyj-code 把 AI coding 的核心能力放进一个**可审计、可扩展、可本地运行**的终端工具：
-
-- **原生终端体验**：单二进制发布，流式 Markdown、代码高亮、多行输入、图片粘贴、
-  diff 预览、Todo、SubAgent 与权限确认界面；长命令的 stdout / stderr 边跑边显示，
-  流式思考实时可见；`/cost`、`/context` 按显示宽度自适应排版，中英文都对齐。
-- **多模型 + 双协议**：供应商、线协议与模型能力分开建模，同一套工具可连接官方 API、
-  国内模型与本地兼容端点。
-- **Agent 与工具系统**：内置代码搜索、文件编辑、Bash、**内置网页搜索**、Web、Computer Use
-  与 SubAgent，并支持 MCP、Skill、Plugin、Hooks 与自定义 slash 命令。
-- **工程化工作流**：checkpoint / rewind / branch、隔离 Git worktree、Workflow DAG、
-  ACP adapter、本地 daemon session、机器可读 Review。
-- **安全执行**：权限审批 + OS sandbox 分层；headless、定时任务与 SubAgent 在没有
-  交互批准时默认拒绝副作用操作。
-- **本地优先**：配置、会话、执行轨迹、记忆保存在本机；无隐式遥测、无崩溃上报。
-- **证据化自进化**：按用户目标记录 Episode，生成带证据的 Memory、Rule、Skill 候选；
-  Rule/Skill 必须人工批准才生效。
-
-本项目基于公开的 Anthropic Messages API、OpenAI API 与 MCP 规范独立实现，
-不包含第三方专有 prompt 或品牌资产。
-
----
-
-## 安装
-
-### 一键安装
-
-安装脚本自动识别 OS 与 CPU 架构，下载最新公开 Release 并校验 SHA-256，
-无需 `sudo` 或管理员权限。
+### 1. 安装
 
 macOS / Linux：
 
@@ -101,113 +54,42 @@ Windows PowerShell：
 irm https://wangyooujin.github.io/wyj-code/install.ps1 | iex
 ```
 
-默认安装位置：
+脚本自动识别平台架构、拉取 GitHub 最新 Release、校验 SHA-256，装到用户目录
+（`~/.local/bin/wyj-code` 或 `%USERPROFILE%\.wyj-code\bin\`），**无需 sudo / 管理员权限**。
+之后用 `wyj-code update` 升级。
 
-- macOS / Linux：`~/.local/bin/wyj-code`
-- Windows：`%USERPROFILE%\.wyj-code\bin\wyj-code.exe`
-
-如不希望执行远程脚本，使用下面的预编译包或源码安装方式。
-
-### 下载预编译包
-
-前往 [GitHub Releases](https://github.com/wangyooujin/wyj-code/releases)，下载对应平台的压缩包：
-
-- macOS：Apple Silicon / Intel
-- Linux：x86_64 / ARM64
-- Windows：x86_64
-
-每个 Release 同时提供独立 checksum 与 `SHA256SUMS`。解压后可运行包内安装脚本，
-也可直接把二进制放入自己的 `PATH`。
-
-### 从源码安装
-
-需要 Git 与 Rust 1.80+：
+不想执行远程脚本？到 [Releases](https://github.com/wangyooujin/wyj-code/releases) 下载对应平台压缩包，
+解压后运行包内 `install.sh` / `install.bat`。也可以从源码装：
 
 ```bash
 git clone https://github.com/wangyooujin/wyj-code.git
-cd wyj-code
-./build.sh install
+cd wyj-code && ./build.sh install     # 需要 Rust 1.80+
 ```
 
-只构建、不安装：
+### 2. 配一个 Key
+
+推荐环境变量（优先级最高，且**永远不会被写回配置文件**，即使你在面板里保存过一次）：
 
 ```bash
-cargo build --release      # 产物在 target/release/wyj-code
-./build.sh package         # 打包到 dist/<binary>-<version>-<platform>
-./build.sh cross linux-x86_64  # 交叉编译（macOS 主机 → Linux x86_64）
-./build.sh release         # 交互确认版本号 → bump + commit + tag + push
+export WYJ_CODE_API_KEY="sk-..."
 ```
 
-### 验证安装
+想落盘又不写明文，就在 `~/.wyj-code/config.toml` 里用 `api_key_env = "MY_KEY_VAR"`
+引用变量名。首次启动若没有 Key，TUI 会自动打开配置面板引导填写。
+
+### 3. 跑起来
 
 ```bash
-wyj-code --version
-wyj-code --config-status   # 查看当前 Profile、模型与 API Key 状态
-wyj-code --help
-wyj-code update            # 检查更新
-```
-
----
-
-## 快速开始
-
-### 1. 配置 API Key
-
-最简单的方式是环境变量（推荐；不会落盘到任何文件）：
-
-macOS / Linux：
-
-```bash
-export WYJ_CODE_API_KEY="<your-api-key>"
-```
-
-Windows PowerShell：
-
-```powershell
-$env:WYJ_CODE_API_KEY = "<your-api-key>"
-```
-
-随后运行 `wyj-code`，在 TUI 内用 `/model` 选择或新建 Profile（供应商 / 协议 / 模型 / API 地址）。
-全局配置文件 `~/.wyj-code/config.toml` 可用 `api_key_env` 引用环境变量名，**不要把真实凭据
-提交到仓库**。
-
-### 2. 启动 wyj-code
-
-```bash
-wyj-code                       # 启动交互式 TUI
-wyj-code --cwd /path/to/proj   # 在指定项目中启动
+wyj-code                       # 交互式 TUI
+wyj-code --cwd /path/to/proj   # 指定项目
+wyj-code -c                    # 恢复上次会话
+wyj-code --plan                # Plan 模式（只读工具 + 计划文档）
 wyj-code -p "分析这个项目"       # 单次问答，不启动 TUI
 wyj-code --headless            # Headless REPL
-wyj-code -c                    # 恢复上次会话
-wyj-code --plan                # 以 Plan 模式启动（仅只读工具）
-wyj-code --bypass-permissions  # 以 Bypass 模式启动（跳过权限确认，不关闭 sandbox）
+wyj-code run /review HEAD~1    # 一次性执行一条斜杠命令 / Skill
 ```
 
-### 3. 常用命令
-
-| 命令 | 用途 |
-|---|---|
-| `wyj-code --config-status` | 查看当前 Profile、模型与 API Key 状态 |
-| `wyj-code model doctor` | 检查模型身份、协议与能力来源 |
-| `wyj-code sandbox` | 查看当前 OS sandbox 与网络隔离状态 |
-| `wyj-code extensions list` | 查看已安装的 Skill、MCP 与 Plugin |
-| `wyj-code workspace list` | 查看隔离 Git worktree |
-| `wyj-code workflow --help` | 多 Agent Workflow 命令族 |
-| `wyj-code session --help` | checkpoint、rewind、branch 命令族 |
-| `wyj-code storage {status,doctor,prune}` | CAS 存储占用诊断与 GC |
-| `wyj-code evolve doctor` | Evolution 配置、预算与健康状态 |
-
-TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
-
-| 命令 | 用途 |
-|---|---|
-| `/model` | 选择或新建 Profile |
-| `/agents` | 列出全部 Agent 类型 |
-| `/subagents` | 查看运行中的子 Agent |
-| `/extensions` | 管理 Skill / MCP / Plugin |
-| `/checkpoint` `/rewind` `/branch` | 会话快照与分支 |
-| `/sandbox` | 查看 sandbox 与网络隔离状态 |
-| `/evolve` | Memory / Rule / Skill 候选治理 |
+`wyj-code --config-status` 打印当前分组、模型与 Key 状态；TUI 内 `/doctor` 检查环境与扩展健康度。
 
 ---
 
@@ -215,199 +97,131 @@ TUI 内输入 `/help` 查看全部 slash 命令；常用入口：
 
 ### 终端体验
 
-- 单二进制 release，无运行时依赖；macOS / Linux / Windows 全平台发布。
-- ratatui TUI：流式 Markdown、代码高亮、多行输入、图片粘贴、diff 预览；
-  前台 Bash 输出按 100ms 节流实时推进，跑完即折叠。
-- 面板类命令（`/cost`、`/context`）走独立排版引擎按**显示宽度**对齐，中英文一致；
-  子 Agent 的 token 用量单列成节并计入合计。
-- 权限确认、AskQuestion 多题面板、ExitPlanMode 计划批准、TUI panic 兜底还原。
+- **ratatui 原生 TUI**：流式 Markdown、代码高亮、多行输入、图片粘贴、diff 预览。
+- **折叠态优先**：每个工具调用只留标题行，`Ctrl+O` 随时展开全文；前台 Bash 输出按 100ms 节流实时推进，跑完即折叠。
+- **应用内鼠标**：滚轮、拖选、双击选词、可拖动滚动条全部由应用实现，松开自动复制到系统剪贴板。
+- **面板按显示宽度排版**：`/cost`、`/context` 中英文都对齐，子 Agent 用量单列成节。
+- **终端不会被打坏**：进程级 panic hook 在崩溃时还原 alternate screen、鼠标捕获与 raw mode。
 
 ### 多模型与双协议
 
-- **Anthropic Messages** 完整支持：thinking、cache_control、原生 `computer_20251124`、
-  tool 内嵌图片回传。
-- **OpenAI Chat Completions** 兼容：reasoning_content、image_url、tool_result 降级；
-  OpenAI 协议本身不支持 tool 内嵌图片，computer-use 在该路径上注册即占位（"名存实亡"）。
-- 已验证或协议兼容：Claude（Opus / Sonnet / Haiku）、OpenAI（GPT-5 / o-series）、
-  DeepSeek（V3 / V4-Pro / R1）、GLM-4.6、Kimi K2、Qwen3-Max、字节豆包、MiniMax 等。
+- **Anthropic Messages** 完整支持：thinking、cache_control、原生 `computer_20251124`、tool 内嵌图片回传。
+- **OpenAI Chat Completions** 兼容：`reasoning_content`、`image_url`、tool_result 降级。
+- **能力与协议分离**：`provider` 决定线协议，vendor 由 `base_url` + 模型名推断，
+  `wyj-code model doctor` 报告每个能力是 `static_only` 还是已实测。
+- **三条命令各管一件事**：`/profile` 管分组（写盘）、`/model` 只切模型（仅内存）、`/effort` 管思考档位（随会话落盘）。
+- **思考档位协议无关**：Anthropic 发 `output_config.effort`，OpenAI 发顶层 `reasoning_effort`；
+  端点不认的档位记成可见的 dropped，而不是发出去换一个 400。
 
 ### Agent 与工具
 
-- 内置工具：Read / Write / Edit / Bash（带 sandbox）/ Glob / Grep / WebFetch / WebSearch /
-  SubAgent / Computer / AppComputer。
-- **WebSearch** 内置网页搜索：配一个 Key 就能用，无需 MCP、无需外挂脚本；后端可选
-  Tavily / Brave。详见下方[「内置网页搜索 WebSearch」](#内置网页搜索-websearch)。
-- Computer 仅 macOS/Windows 编译且需 vision + Anthropic profile。
-- TodoWrite 任务列表**默认注册**（`[tools].todo_enabled = true`）；弱模型 / 自托管场景
-  可显式关闭。
-- SubAgent 类型：内置 general-purpose / Explore（只读）/ Plan + 用户自定义六层合并链。
+- 内置工具：Read / Write / Edit / Bash / Glob / Grep / WebFetch / WebSearch / TodoWrite /
+  AskQuestion / SubAgent / Computer / AppComputer。
+- **WebSearch 内置**：配一个 Key 就能用，无需 MCP、无需外挂脚本；后端可选 Tavily / Brave。
+  详见下方[「内置网页搜索」](#内置网页搜索-websearch)。
+- **Computer-use 读得懂屏幕**（macOS / Windows）：`list_elements` 可带 `include_text`
+  返回每个文本节点的精确坐标，`read_text` 用系统 OCR 兜底自绘应用与图片里的字，
+  `run_recipe` 提供编译期固定的 AppleScript 白名单（脚本正文永不来自模型）。
+- **SubAgent 编排**：内置 general-purpose / Explore / Plan 三种类型，支持嵌套深度上限、并发上限、
+  后台运行与落盘 trace；被 ESC 中断时仍交付「已经做到哪」的交接物。
+- **上下文清理优先于摘要**：过期工具输出先外部化到 CAS（无损、可召回），清理不动了才跑压缩摘要。
 
 ### 工程化工作流
 
-- **会话管理**：checkpoint、rewind、branch、TUI 面板与 CLI 子命令族。
-- **工作区**：隔离 Git worktree（`workspace create/list/diff/accept/dispose`），防御
-  symlink、父 HEAD 前进、用户并发修改与 binary 漏洞。
-- **Workflow**：DAG 并行、token budget、human approval、pause/resume/retry/skip/cancel。
-- **ACP / daemon**：stdio adapter 与 TCP 全局 session registry，schema version 2。
-- **Review**：`wyj-code review run --base HEAD^ --head HEAD --json` 生成可审计 JSON。
+- **会话快照**：`checkpoint` / `rewind` / `branch`，可按 conversation / files / both 三种范围回滚。
+  同一目录存在另一个实例时强制确认——它没有 checkpoint 可退。
+- **隔离 worktree**：`workspace create/list/diff/accept/dispose`，两个 agent 并行改代码而不互踩。
+- **Workflow DAG**：并行、token 预算、人工审批、pause / resume / retry / skip / cancel，
+  有写权限的编码节点自动在独立 worktree 里跑。
+- **ACP / daemon**：stdio adapter 与本地 TCP session registry，前端无关的事件协议。
+- **可审计 Review**：`wyj-code review run --base HEAD^ --head HEAD --json` 产出机器可读证据。
 
-### 安全执行
+### 安全与信任边界
 
-- 权限模型：Normal（每次确认）/ Bypass（全部放行）/ Plan（白名单限制）。
-- `AllowAlways` 写入项目级 `~/.wyj-code/projects/<project_key>/allowed_tools.json`，跨会话生效。
-- OS sandbox：macOS Seatbelt / Linux bubblewrap；headless、SubAgent 没有真实 UI 时
-  默认拒绝写文件、执行命令、控制电脑等副作用操作。
-- 项目级 MCP server 需经 `wyj-code trust-mcp` 手动批准；批准记录落在仓库控制不到的
-  `~/.wyj-code/projects/<project_key>/mcp_trust.json`。
+- **三种模式**：`auto`（默认，本地确定性规则 → 模型分类器 → 逐次弹窗）、`plan`（只读 + 计划文档）、
+  `bypass`（跳过询问，但**不免除禁令**）。`Shift+Tab` 循环切换。
+- **任何模式都不放行**：`curl | bash`、`rm -rf ~`、`git push --force`、`git reset --hard`、
+  `sudo <program>`、凭据路径、写入 `.git/` / `.env` / `*.pem` / `~/.wyj-code/`。
+  这一层挂在权限策略入口，**不读任何授权状态**——授权只能免除问人，不能免除禁令。
+- **凭据保护覆盖批量读取**：`Grep` / `Glob` / `CodeSearch` 有根校验 + 遍历过滤两层，
+  一条 `Grep(pattern: "PRIVATE KEY", path: "~")` 读不到 `~/.ssh/id_rsa`。
+- **项目级资源逐类批准**：`mcp.toml`（执行任意命令）、`skills/`（正文是指令）、
+  `settings.json` 的 hooks 与 `verify.command`（被 `sh -c` 执行）三处都要显式信任，
+  批准记录落在**仓库控制不到**的位置，内容变化后需重新批准。
+  `wyj-code trust-mcp` / `trust-skills` / `trust-hooks`，或 `trust` 一次批三类。
 
 ### 本地优先与证据化
 
-- 配置 / 会话 / 记忆 / 执行轨迹全部在 `~/.wyj-code/`；无隐式遥测。
-- Memory v3：Global / Project 两层作用域，AI 自动管理项目记忆，Global 候选走 Pending +
-  自然语言确认；reject 后指纹写入 `rejected_history.json` 防止反复提议。
-- Evolution：每个用户目标落盘为独立 Episode，生成带 scope、citation、TTL、冲突的 Memory；
-  Rule/Skill 永不自动激活，必须经 `/evolve` 或 `wyj-code evolve approve` 显式批准。
-- Storage caps：Evolution 100 MiB / project、checkpoints 20 / session、CAS Blob LRU、顶层
-  5 GiB 启动一次性 warn；全部 opt-out by `0`。
+- 配置 / 会话 / 记忆 / 执行轨迹全在 `~/.wyj-code/`（可用 `WYJ_CODE_HOME` 整体重定向）；
+  会话默认按项目分目录，`storage prune` 可按阈值回收，**默认不自动删历史**。
+- **Memory v3**：Global / Project 两层作用域，淘汰按「写入新鲜度 × 0.30 + 使用强度 × 0.70」打分，
+  跨会话还能检索原始 transcript。Global 候选走 Pending + 自然语言确认。
+- **Evolution**：每个用户目标落盘为 Episode，生成带 scope / citation / TTL / 冲突检测的 Memory；
+  Rule 与 Skill **永不自动激活**，必须经 `/evolve` 或 `wyj-code evolve approve` 显式批准。
+- **编辑后自动验证**：项目声明 `verify.command` 后，每次 Edit / Write 成功框架立即跑一次，
+  把退出码与截断后的输出回灌给模型自己修。
+- **验收门禁**：声明 `acceptance.criteria` 后，「任务完成」由框架判定——不通过就不让回合结束，
+  并把失败证据（文件与行号）回灌。
 
 ---
 
 ## 内置网页搜索 WebSearch
 
 > **模型的知识有截止日期，你的代码库没有。**
-> WebSearch 让 wyj-code 在改代码之前先去查「现在这个 API 到底怎么用」「这个 CVE 影响哪些版本」
-> 「这个库的最新版有没有 breaking change」——查完再动手，而不是拿训练时的记忆硬写。
 
-wyj-code 内置网页搜索，**不是外挂脚本、不是 MCP、不是让模型自己拼 curl**。配一个搜索服务
-的 API Key，模型立刻就多出一双能看世界的眼睛：一个后端抽象、两套实现（Tavily / Brave）、
-六个可调参数、全部走审计与权限链路。
-
-### 三分钟启用
+它不是外挂脚本、不是 MCP server、也不是让模型自己拼 `curl`——而是和 Read / Grep / WebFetch
+并列的一个正式内置工具。配一个搜索服务的 Key，模型立刻多出一双能看世界的眼睛。
 
 ```toml
 # ~/.wyj-code/config.toml
 [search]
 provider = "tavily"          # 或 "brave"
-api_key = "tvly-xxxxxxxx"    # 也可以走环境变量，不落盘
+api_key = "tvly-xxxxxxxx"    # 也可以走 WYJ_CODE_SEARCH_API_KEY，不落盘
+max_results = 5              # 硬上限 10
 ```
 
-或者干脆不落盘：
-
-```bash
-export WYJ_CODE_SEARCH_API_KEY="tvly-xxxxxxxx"
-```
-
-重启 wyj-code，敲 `/doctor` 确认这一行：
-
-```
-  ✓  网页搜索    tavily
-```
-
-**就这样。** 没有插件要装、没有 MCP server 要配、没有 JSON schema 要手写。
-
-### 它能做什么
+重启后敲 `/doctor`，看到 `✓ 网页搜索 tavily` 就算好了。**没有插件要装、没有 server 要配。**
 
 | 能力 | 说明 |
 |---|---|
-| **时事与时效内容** | `topic = news` / `time_range = day\|week\|month\|year`，查「今天」「本周」的版本发布、安全通告、breaking change |
-| **按域收敛** | `include_domains` / `exclude_domains` 限定官方文档、issue tracker、源码仓库，屏蔽 SEO 农场 |
-| **两套后端随你选** | Tavily（含 LLM 生成的问答式摘要）、Brave（含 `safesearch` 与 `search_lang`）；换后端只改一行 `provider` |
-| **不传 Key 进请求体** | API Key 只进请求头——body 会被代理日志完整打印，头不会 |
-| **结果可深读** | 搜索给的是「标题 + 链接 + 摘要」，模型可以用内置 `WebFetch` 直接读全文，两步接力 |
+| **主题与时效** | `topic` 支持 general / news / finance，`time_range` 支持 day / week / month / year |
+| **按域收敛** | `include_domains` / `exclude_domains` 限定官方文档与 issue tracker，屏蔽 SEO 农场 |
+| **双后端** | Tavily 带问答式摘要，Brave 带 `safesearch` / `search_lang`，换后端只改一行 |
+| **Key 只进请求头** | body 会被代理日志完整打印，头不会 |
+| **搜索 → 深读接力** | 搜索给标题 + 链接 + 摘要，模型再用内置 WebFetch 读全文 |
 
-### 开发者最常用的四个场景
-
-1. **升级依赖前先查 breaking change**
-   > 「`cargo update` 到最新版本之前，先搜一下 tokio 1.5x 有哪些 breaking change。」
-   模型会先搜官方 release notes 与 issue，列出风险点，再决定要不要动 `Cargo.toml`。
-
-2. **排查只在最新版出现的报错**
-   > 「这个 `ConnectionClosed` 错误只在最新版本出现，搜一下是不是已知的 upstream issue。」
-   搜完拿到 issue 编号与讨论串，再回到你的代码里定位。
-
-3. **查框架的当下最佳实践**
-   > 「现在写 Rust HTTP 服务，官方推荐哪种错误处理中间件？」
-   搜索把「过时的博客答案」和「当前官方文档」分开，模型按需 WebFetch 读全文。
-
-4. **安全通告与依赖漏洞**
-   > 「我们用的 `openssl` 版本有没有已知的严重漏洞？」
-   搜 CVE 与发行说明，输出带链接的清单——可审计、可复查。
-
-### 为什么值得单独说一句
-
-- **不塞进 MCP 生态**：很多工具把搜索做成需要自己起的 MCP server，wyj-code 直接内置，
-  装完即用、少一个进程、少一份配置、少一类「为什么它今天突然不见了」的问题。
-- **配错会显式报错，不会静默退化**：provider 名字写错 → 直接告诉你「不是已知后端」；
-  没配 Key → **干脆不注册这个工具**，模型看不到一个注定失败的入口，不浪费一次 LLM 往返。
-- **外部文本当作不可信输入处理**：搜索结果统一过 harness marker 转义，网页正文里的
-  `</system-reminder>` 之类无法伪造对话结构；超长输出 spill 落盘、模型可 Read 取回。
-- **零遥测不打折**：搜索请求是你自己发给你自己的搜索服务，wyj-code 不做中间商、
-  不上报、不留痕。
-
-> **想现在就试？** 装好 wyj-code、配好搜索 Key，然后直接问一句：
-> 「搜一下 Rust 1.90 有什么 breaking change。」
-> 搜索调用会在 TUI 里像其他工具一样**逐行展开给你看**——你看得见它查了什么、点了哪个链接。
+两个刻意的设计：**没配 Key 就干脆不注册这个工具**（模型看不到一个注定失败的入口，不浪费一次往返）；
+**provider 写错则显式报错**，绝不静默回退到默认后端。外部文本统一过 harness marker 转义，
+网页正文里的 `</system-reminder>` 伪造不了对话结构。
 
 ---
 
 ## 配置
 
-完整配置字段、环境变量、各 Profile 模板与 Storage caps 见 [`CLAUDE.md`](./CLAUDE.md) 的
-Configuration 节；架构与数据面背景见 [`doc/architecture.md`](./doc/architecture.md)。
-
-### 全局配置 `~/.wyj-code/config.toml`（节选）
+全局配置只有一个文件：`~/.wyj-code/config.toml`。日常最常改的几项：
 
 ```toml
-provider = "anthropic"            # 或 "openai" / 自定义 Profile
+provider = "anthropic"       # 或 "openai"
 model = "claude-opus-4-8"
-plan_model = ""                   # Plan 模式专用模型，留空则用 model
-exec_model = ""                   # Bypass 模式专用模型，留空则用 model
-base_url = ""                     # 留空使用供应商默认端点
+base_url = ""                # 留空用供应商默认端点
 max_tokens = 32000
-context_window = 200000
-vision = true                     # 模型支持图片输入；false 时图片降级为占位文本
-
-log_level = "warn"                # 调试时设为 "debug"
-language = ""                     # "en"/"zh"，留空自动检测系统 locale
-
-# API Key 优先从环境变量 WYJ_CODE_API_KEY 读取；配置文件不要写明文 key
-# 多个 Profile 通过 TUI 内 /model 管理；详见 CLAUDE.md "Profile" 节
-
-[search]                         # 内置网页搜索 WebSearch（不配 api_key 则工具不注册）
-provider = "tavily"              # 后端：tavily / brave
-api_key = ""                     # 优先读环境变量 WYJ_CODE_SEARCH_API_KEY（不落盘）
-max_results = 5                  # 模型未显式指定时返回的条数（硬上限 10）
-
-[subagent]
-default_profile = ""              # 子 Agent 默认 Profile
-explore_profile = ""              # Explore 类型专用 Profile
-trace_enabled = true              # 子 Agent 完整执行轨迹落盘
-trace_max_bytes_per_agent = 262144 # 单 agent trace 文件字节上限（默认 256KB）
-
-[[mcp_servers]]
-name = "my-server"
-transport = "stdio"
-command = "/path/to/server"
-args = ["--flag"]
+context_window = 200000      # 必须填真实值，压缩与清理阈值都由它推算
+vision = true
+log_level = "warn"
+language = ""                # "en"/"zh"，留空自动检测；同时决定模型输出语言
 ```
 
-### 项目级配置 `<git-root>/.wyj-code/`
+项目级配置在 `<git-root>/.wyj-code/`（可提交、随 clone 落地）：
+`settings.toml`（按名禁用 skill / MCP）、`settings.json`（hooks / verify / acceptance）、
+`mcp.toml`、`skills/`、`agents/`。**项目文件不能覆盖全局模型凭据，也不能静默扩大权限。**
 
-| 文件 | 用途 |
-|---|---|
-| `settings.toml` | `disabled_skills` / `disabled_mcp_servers` 开关 |
-| `mcp.toml` | 项目级 MCP server（需 `wyj-code trust-mcp` 手动批准） |
-| `skills/` | 项目级 Skill 与自定义命令 |
-| `agents/` | 项目级 SubAgent 定义 |
+完整字段说明（21 个 profile 字段、`[search]` / `[subagent]` / `[agent]` / `[ui]` /
+`[context_edit]` / `[storage]` / `[persist_cap]` / `[auto_mode]` / `[notify]` /
+`[evolution]` / `[routing]` / `[model_runtime]` / `[computer_use]` / `[[mcp_servers]]`
+全字段 + 15 个环境变量）：
 
-项目资源从 Git 仓库根目录自动发现；从子目录启动仍用同一份 `.wyj-code/`。
-项目文件不能覆盖全局模型凭据或静默扩大 sandbox 权限。
-
-### 模型侧提示词
-
-主 system prompt、模式追加段（Plan / non-interactive）、子 agent 内置提示、compact 结构化
-摘要模板、记忆提取提示、全部工具描述均为**英文原创常量**，不走 i18n（模型行为不应随 locale
-漂移；末尾 "reply in the user's language" 保证中文用户得到中文回复）。
+- **在线版（推荐）**：<https://wangyooujin.github.io/wyj-code/config.html>
+- **仓库版**：[`docs/reference/config.md`](./docs/reference/config.md)
 
 ---
 
@@ -415,37 +229,90 @@ args = ["--flag"]
 
 | 路径 | 内容 |
 |---|---|
-| `~/.wyj-code/config.toml` | 全局 Profile、模型、语言、sandbox 与运行时配置 |
-| `~/.wyj-code/sessions/` | 本地会话、checkpoint 与 SubAgent trace |
-| `~/.wyj-code/cas/` | CAS Blob Pool（v0.2.20+，内容寻址会话快照）|
-| `~/.wyj-code/evolution/` | Episode、Memory v3、Rule/Skill 候选数据 |
-| `~/.wyj-code/projects/<project_key>/` | 项目级 `allowed_tools.json` 与 `mcp_trust.json` |
+| `~/.wyj-code/config.toml` | 全局 Profile、模型、语言与运行时配置 |
+| `~/.wyj-code/sessions/<project_key>/` | 本地会话、checkpoint 与子 Agent trace |
+| `~/.wyj-code/cas/` | 内容寻址 Blob 池（上下文清理与会话快照共用） |
+| `~/.wyj-code/memory-v3/`、`evolution/` | 跨会话记忆与自进化数据 |
+| `~/.wyj-code/projects/<project_key>/` | 项目级授权名单与三类信任批准记录 |
 | `<repo>/.wyj-code/` | 项目级 settings / MCP / Skill / Agent 资源 |
 
-CLI 治理入口：
+治理入口：
 
-- `wyj-code storage {status,doctor,prune}` —— CAS 占用诊断与 GC
-- `wyj-code extensions {list,doctor,migrate,install,upgrade,enable,disable,remove}` —— Skill/MCP/Plugin 治理
-- `wyj-code evolve {status,list,review,feedback,skillize,approve,reject,rollback,forget,run,include,migrate,export,doctor}` —— Evolution 治理
+```bash
+wyj-code storage {status,doctor,prune,migrate}      # 存储占用诊断、清理与迁移
+wyj-code extensions {list,doctor,install,upgrade}   # Skill / MCP / Plugin 治理
+wyj-code evolve {status,list,approve,reject,doctor} # Memory / Rule / Skill 候选治理
+wyj-code memory {status,search,search-sessions}     # Memory v3 查询与原文回溯
+wyj-code model doctor [--probe full]                # 模型身份、协议与能力来源
+wyj-code workspace {create,list,diff,accept}        # 隔离 Git worktree
+wyj-code workflow {validate,run,status,control}     # 多 Agent DAG
+wyj-code session {checkpoint,checkpoints,rewind,branch}
+wyj-code review run --base HEAD^ --head HEAD --json
+```
+
+TUI 内输入 `/help` 查看全部斜杠命令。
 
 ---
 
 ## 架构
 
-整体架构、Workspace crate 布局、Agent 推理循环、Provider / WireProtocol / Capability
-三层模型、上下文管理（compact、AGENTS.md 注入、Memory v3）、CAS 会话存储、权限模型、
-SubAgent 编排、MCP/Skill/Plugin/Hooks 扩展点、TUI/Headless/ACP/Daemon 入口、Computer-use、
-Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/architecture.md)。
+单一 `wyj-code` 二进制，11 个 crate 分四层：
 
-更细的实现细节、版本演进中的"教训"注释与"为什么这样设计"的背景说明在
-[`CLAUDE.md`](./CLAUDE.md)——那是同时喂给 Claude Code 的项目上下文，是最权威、更新最及时的
-架构参考。
+| Crate | 名称 | 职责 |
+|---|---|---|
+| `crates/cli` | 二进制入口 | 组装全部 crate、解析 CLI 参数，启动 TUI / REPL / ACP / daemon / Workflow |
+| `crates/tui` | `wyj-tui` | ratatui 渲染：消息流、输入框、权限确认、面板、鼠标与选区 |
+| `crates/tools` | `wyj-tools` | 工具实现（Read/Write/Edit/Bash/Grep/WebSearch/SubAgent/Computer…） |
+| `crates/computer` | `wyj-computer` | computer-use 系统层：截图、输入合成、坐标缩放数学 |
+| `crates/commands` | `wyj-commands` | Slash 命令注册表与内置命令 |
+| `crates/mcp` | `wyj-mcp` | MCP 客户端桥接（stdio / streamable http） |
+| `crates/store` | `wyj-store` | 扩展安装与 lockfile、Plugin runtime、信任门控、SkillHub |
+| `crates/i18n` | `wyj-i18n` | 多语言资源与运行时语言切换 |
+| `crates/core` | `wyj-core` | Agent 循环、会话、权限、checkpoint、上下文管理、workspace/workflow |
+| `crates/api` | `wyj-api` | LLM Provider 抽象 + 双协议实现 + SSE 解析与断流看门狗 |
+| `crates/config` | `wyj-config` | 配置加载、落盘布局、项目级 MCP/设置、跨进程文件锁 |
 
-> **注意（v0.2.27 起 BREAKING）**：wyj-code 自己读取的项目记忆文件是 **`AGENTS.md`**
-> （全局 `~/.wyj-code/AGENTS.md` + 仓库根到 cwd 的祖先链），**不再读取 `CLAUDE.md`**，
-> 也不再读取任何 `.claude/` 路径（hooks 三源同样已迁至 `.wyj-code/settings*.json`）。
-> 本仓库的 `CLAUDE.md` 保留下来是给 Claude Code 等工具用的开发文档；若希望
-> **wyj-code 本身**也读到项目上下文，请把内容放进仓库根的 `AGENTS.md`。
+更细的实现细节与「为什么这样设计」的背景在 [`doc/architecture.md`](./doc/architecture.md)
+与 [`CLAUDE.md`](./CLAUDE.md)——后者是本仓库的开发规约，同时喂给编码助手作为项目上下文。
+
+> **注意**：wyj-code 自己读取的项目记忆文件是 **`AGENTS.md`**（全局 `~/.wyj-code/AGENTS.md`
+> + 仓库根到 cwd 的祖先链），回退顺序 `AGENTS.md` → `CLAUDE.md` → `GEMINI.md` → `AGENT.md`，
+> 个人覆盖槽 `AGENTS.local.md` → `CLAUDE.local.md`。**wyj-code 不读取任何 `~/.claude/` 路径。**
+
+---
+
+## 测试与发版门禁
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked     # 1962 项
+cargo build --release
+```
+
+改了 harness（提示词 / 工具描述 / 可见性 / 压缩策略 / 验收门禁）必须跑评测基线：
+
+```bash
+benchmarks/verify-tasks.sh          # 任务集自检，零 API 费用
+benchmarks/run.sh --repeat 3        # 20 个任务 × 3 次
+benchmarks/compare.sh <baseline> <candidate>
+```
+
+纪律：一次只改一个组件、每组 ≥3 次重复、至少 2 个模型对照。详见 [`benchmarks/README.md`](./benchmarks/README.md)。
+
+---
+
+## 安全与隐私
+
+- **无隐式遥测**：只有显式模型请求、Web 工具或 MCP 调用会访问网络，无崩溃上报。
+- **API Key**：优先环境变量；配置诊断只显示掩码；写盘后自动 `chmod 0600`。
+- **搜索 Key 只进请求头**，绝不放进请求体。
+- **`--bypass-permissions`**：只跳过普通交互确认，**不**覆盖 `hard_deny`、受保护路径与凭据目录。
+- **无 UI 时默认拒绝**：headless、子 Agent、`-p` 没有审批通道时不会自动批准副作用操作。
+- **Checkpoint 的边界**：只能恢复会话与文件，**不**能撤销网络请求、数据库写入或已发出的消息。
+
+发现安全问题请**不要**在 Issue 里附带真实凭据、私有 endpoint 或敏感日志，
+先提交经过脱敏的报告到 [GitHub Issues](https://github.com/wangyooujin/wyj-code/issues)。
 
 ---
 
@@ -453,65 +320,25 @@ Storage caps 完整表格，详见 [`doc/architecture.md`](./doc/architecture.md
 
 | 内容 | 路径 |
 |---|---|
-| 项目 Pages 主页 | <https://wangyooujin.github.io/wyj-code/> |
-| 在线安装页面 | <https://wangyooujin.github.io/wyj-code/#install> |
-| 在线功能介绍 | <https://wangyooujin.github.io/wyj-code/docs.html#features> |
-| **在线网页搜索介绍** | <https://wangyooujin.github.io/wyj-code/docs.html#websearch> |
-| 在线架构介绍 | <https://wangyooujin.github.io/wyj-code/docs.html#architecture> |
-| 在线版本记录 | <https://wangyooujin.github.io/wyj-code/docs.html#changelog> |
-| GitHub Releases | <https://github.com/wangyooujin/wyj-code/releases> |
+| 项目主页 | <https://wangyooujin.github.io/wyj-code/> |
+| **在线配置参考** | <https://wangyooujin.github.io/wyj-code/config.html> |
+| 技术文档（架构 / 能力 / 安全模型） | <https://wangyooujin.github.io/wyj-code/docs.html> |
 | 仓库更新日志 | [`CHANGELOG.md`](./CHANGELOG.md) |
 | 架构详细文档 | [`doc/architecture.md`](./doc/architecture.md) |
+| 配置全量参考（Markdown） | [`docs/reference/config.md`](./docs/reference/config.md) |
 | 国产模型适配报告 | [`doc/analysis/domestic-models-vs-claude-code.md`](./doc/analysis/domestic-models-vs-claude-code.md) |
 | 版本规划 | [`doc/plan/`](./doc/plan/) |
 | 开发约束与架构细节 | [`CLAUDE.md`](./CLAUDE.md) |
 | 贡献指南 | [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
 
-GitHub Pages 源文件位于 [`site/`](./site/)；一键安装脚本入口为
-[`site/install.sh`](./site/install.sh) 与 [`site/install.ps1`](./site/install.ps1)。
-
----
-
-## 安全与隐私
-
-- **无隐式遥测**：只有显式模型请求、Web 工具或 MCP 调用会访问网络。
-- **API Key 安全**：优先从环境变量读取，配置诊断只显示掩码信息；TUI 写盘后自动 `chmod 0600`。
-- **搜索 Key 只进请求头**：`[search].api_key` 与 `WYJ_CODE_SEARCH_API_KEY` 都只写进
-  HTTP header，绝不放进请求体——body 会被代理日志完整打印，头不会。
-- **`--bypass-permissions`**：只跳过普通交互确认，**不**关闭 OS sandbox，**不**覆盖 protected deny。
-- **无 UI 时的默认拒绝**：Headless、SubAgent 没有真实 UI 时不会自动批准写文件、
-  执行命令或控制电脑等副作用操作。
-- **Checkpoint 范围**：只能恢复会话和文件，**不**能撤销网络请求、数据库写入或已经发送的
-  外部消息。
-- **项目级 MCP 信任**：未信任的项目级 server 静默排除，不阻塞 UI-less 场景（`-p` / `--headless`）。
-
-发现安全问题时，请**不要**在 Issue 里附带真实凭据、私有 endpoint 或敏感日志。可以先
-在 [GitHub Issue](https://github.com/wangyooujin/wyj-code/issues) 提交经过脱敏的报告。
-
----
-
-## 开发与贡献
-
-欢迎提交 Issue 和 Pull Request。开始开发前请阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)——
-那份文档涵盖 crate 职责、提交约定、`/help` 注册规范、i18n 规则与 PR 流程。
-
-本地基础门禁：
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo build --release
-```
-
-更详细的架构、Agent 数据流、权限模型与开发约束见 [`CLAUDE.md`](./CLAUDE.md) 与
-[`doc/architecture.md`](./doc/architecture.md)。
-
 ---
 
 ## 开源协议
 
-本项目沿用 **MIT OR Apache-2.0** 双重开源许可，使用者可任选其一：
+**MIT OR Apache-2.0** 双重许可，任选其一：
 
 - [`LICENSE-MIT`](./LICENSE-MIT)
 - [`LICENSE-APACHE`](./LICENSE-APACHE)
+
+基于公开的 Anthropic Messages API、OpenAI Chat Completions API 与 MCP 规范独立实现，
+不含第三方专有 prompt 或品牌资产，与 Anthropic / OpenAI 官方产品无关联。

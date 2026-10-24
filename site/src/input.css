@@ -154,4 +154,68 @@
     border-color: rgba(255, 181, 84, 0.45);
     transform: translateY(-2px);
   }
+
+  /* 配置参考页的字段表：窄屏横向滚动，而不是把中文挤成一列一列的字。
+     注意不要给 table 本身设 display:block —— 那会把 tbody/thead 的表格布局
+     一起废掉，单元格会竖着堆。滚动交给外层容器。 */
+  .cfg-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .cfg-tbl {
+    width: 100%;
+    min-width: 640px;
+    border-collapse: collapse;
+    font-size: 0.875rem;
+    line-height: 1.65;
+  }
+  .cfg-tbl thead tr {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .cfg-tbl th {
+    text-align: left;
+    font-weight: 600;
+    color: rgba(243, 239, 228, 0.85);
+    padding: 0.75rem 1rem;
+    white-space: nowrap;
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .cfg-tbl td {
+    padding: 0.75rem 1rem;
+    color: rgba(243, 239, 228, 0.55);
+    vertical-align: top;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  .cfg-tbl td:first-child {
+    white-space: nowrap;
+  }
+  .cfg-tbl tbody tr:hover {
+    background: rgba(255, 255, 255, 0.02);
+  }
+  .cfg-tbl code {
+    font-family: theme('fontFamily.mono');
+    font-size: 0.8125rem;
+    color: #ffc571;
+    white-space: nowrap;
+  }
+  .cfg-tbl td:last-child code {
+    color: rgba(243, 239, 228, 0.75);
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  /* 产品截图：保留终端窗口观感，图片本身负责说服力 */
+  .shot-frame {
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: theme('colors.ink.850');
+    box-shadow: 0 30px 80px -24px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 181, 84, 0.04);
+    overflow: hidden;
+  }
+  .shot-frame img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
 }
