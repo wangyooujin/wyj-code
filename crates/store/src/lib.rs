@@ -7,6 +7,11 @@
 //! 配置信息写入本地文件（config.toml、`.wyj-code/mcp.toml`、`.md`、lockfile），绝不
 //! shell out 执行 `npm install`/`pip install` 之类的依赖安装命令。
 
+//! 内存中的轻量会话状态：`archive` / `bundle` 是配置备份的导出与导入
+//! （`wyj-code export` / `import`），`skillhub` 与它共用同一套 zip 安全校验。
+
+pub mod archive;
+pub mod bundle;
 pub mod extensions;
 pub mod lockfile;
 pub mod marketplace;

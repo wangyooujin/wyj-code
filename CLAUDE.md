@@ -48,6 +48,8 @@ cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
 cargo run -- subagent-trace <session_id> [<sub_id>] [--json]  # 查看落盘的子 Agent 执行轨迹（无 sub_id 列出概览）
 cargo run -- usage [--since YYYY-MM-DD] [--project PATH] [--json]  # 跨会话 token 消耗汇总（消耗率基线来源）
+cargo run -- export backup.wyj       # 导出全部 profile + 全局 skill（含明文 api_key，落盘 0600）
+cargo run -- import backup.wyj       # 恢复，默认 dry-run；--yes 实际写入（profile 按 name 合并、skill 已存在则跳过）
 cargo run -- workspace list      # 列出 managed Git worktree
 cargo run -- workflow validate workflow.json # 校验 Workflow DAG
 cargo run -- workflow run workflow.json      # 运行 DAG；写节点自动隔离

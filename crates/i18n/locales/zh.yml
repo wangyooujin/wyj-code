@@ -222,6 +222,25 @@ cli:
   run_about: "一次性执行一条斜杠命令 / Skill（等价于在会话里敲 /xxx，但不进交互循环）"
   run_command_help: "要执行的命令（/name 或 name 均可），其后的参数原样传给命令"
 
+backup:
+  export_done: "已导出到 {path}（{size}，含 {profiles} 个分组、{skills} 个 skill）"
+  export_profiles: "分组：{names}"
+  export_skills: "Skill：{names}"
+  export_secrets_warning: "⚠️ 归档内含以下分组的**明文 API Key**：{names}。这个 .wyj 文件等同于你的凭据，请勿提交到 git 或上传到公共位置（已按 0600 权限收紧）。"
+  import_source: "备份来源：wyj-code v{version} · {time} · 主机 {host}"
+  import_contains_secrets: "注意：该备份含明文 API Key，导入后会直接写入本机 config.toml。"
+  profile_added: "新增分组 {name}"
+  profile_replaced: "覆盖分组 {name}（以备份为准）"
+  active_profile_switched: "激活分组已切换：{old} → {new}"
+  skill_added: "新增 skill {name}"
+  skill_skipped: "跳过 skill {name}（本机已存在同名，不覆盖）"
+  skill_meta_merged: "合并 {count} 条 skill 安装元数据"
+  import_nothing_to_do: "备份里没有需要新增的内容，本机已是目标状态。"
+  dry_run_hint: "以上只是计划，未写入任何文件。加 --yes 实际执行。"
+  confirm_prompt: "现在执行导入？[y/N] "
+  cancelled: "已取消导入"
+  import_done: "导入完成"
+
 update:
   checking: "正在检查最新版本…"
   up_to_date: "当前已是最新版本 v{version}"
