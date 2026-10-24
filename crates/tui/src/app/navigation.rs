@@ -322,6 +322,14 @@ impl AppState {
     /// 保留它们的堆分配，下一帧 `push_str` / `push` 就不再重新分配。这是
     /// 「空闲时也每 50ms 重绘一帧」下唯一能接受的写法——每帧新建 40 个
     /// `ScreenRow` 会在内容区 120×40 时产生近 5000 次分配。
+    ///
+    /// **必须按 symbol 的显示宽度推进，不能逐列扫**。ratatui 把 `中` 写在第 1
+    /// 格、把紧随其后的续格 `Cell::reset()` 成 `" "`（`Cell::EMPTY` 的
+    /// symbol 就是空格，不是空串），逐列扫会把每个 CJK 字符后面那个占位格
+    /// 也当成一个真实空格搬进 `text`——用户框选中文再粘贴，得到的正文是
+    /// `中 文 abc`，字与字之间凭空多出空格。推进宽度与 ratatui
+    /// `Paragraph::render_text` 完全一致（`unicode_width`，零宽按 1 列算），
+    /// 因此续格根本不会被访问到。
     fn capture_area_rows(
         rows: &mut Vec<ScreenRow>,
         start: usize,
@@ -338,13 +346,15 @@ impl AppState {
             row.y = y;
             row.text.clear();
             row.starts.clear();
-            for x in area.left()..right {
+            let mut x = area.left();
+            while x < right {
                 let symbol = buffer[(x, y)].symbol();
-                if symbol.is_empty() {
-                    continue;
+                let width = unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+                if !symbol.is_empty() {
+                    row.starts.push((x, row.text.len()));
+                    row.text.push_str(symbol);
                 }
-                row.starts.push((x, row.text.len()));
-                row.text.push_str(symbol);
+                x = x.saturating_add(width);
             }
             used += 1;
         }
@@ -638,7 +648,7 @@ impl AppState {
         let viewport = self.composer_area.height as usize;
         let total = self
             .composer_display
-            .visual_height(self.composer_area.width as usize);
+            .visual_height_with_cursor(self.composer_area.width as usize);
         let max_scroll = total.saturating_sub(viewport.max(1));
         if viewport == 0 || max_scroll == 0 {
             return false;
