@@ -704,7 +704,10 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
             input_with_placeholders(&hint_input, display_attachments, &state.pending_pastes);
         (projected.cursor_row, projected.cursor_col)
     });
-    let input_height = (display_input.visual_height(inner_width) as u16 + 2).clamp(3, 10);
+    // 高度必须用 `visual_height_with_cursor`：文字恰好填满一行时，光标自己
+    // 要占下一行首列，按文本算高度会把那一行挤掉（光标被钳回最后一个字符）。
+    let input_height =
+        (display_input.visual_height_with_cursor(inner_width) as u16 + 2).clamp(3, 10);
 
     // 补全列表高度（@ 文件选取器优先于 slash 补全）
     let completion_height = if !state.file_completions.is_empty() {
@@ -3712,7 +3715,9 @@ fn draw_input(
     };
     // 视口滚动：`input_height` 最多 8 行正文，内容更多时必须按光标位置开窗，
     // 否则第 9 行之后永远画不出来、光标贴底不跟随（旧实现靠折叠长粘贴规避）。
-    let total_visual = lines.len();
+    // 总量按**含光标那一格**算：文字恰好填满一行时 `lines.len()` 比真实绘制
+    // 少一行，`composer_scroll_for` 的上限会跟着偏小。
+    let total_visual = input.visual_height_with_cursor(inner.width as usize);
     let viewport = inner.height as usize;
     let (vis_row, vis_col) = input.cursor_visual_pos(inner.width as usize);
     // 只有**光标动过**才把视口拉过去。用户用滚轮翻看长草稿时光标不动，
@@ -8187,6 +8192,7 @@ mod system_message_wrap_tests {
 #[cfg(test)]
 mod composer_viewport_tests {
     use super::*;
+    use crate::test_support::make_state;
 
     /// 光标在窗口下方时窗口下移刚好露出它；在上方时滚到它。
     ///
@@ -8214,5 +8220,58 @@ mod composer_viewport_tests {
         assert_eq!(composer_scroll_for(&mut scroll, 19, 20, 8), 12);
         scroll = 99;
         assert_eq!(composer_scroll_for(&mut scroll, 19, 20, 8), 12);
+    }
+
+    /// 文字正好填满输入框一行时，硬件光标必须换到下一行首列。
+    ///
+    /// 现场：一行打到最后一个字符，光标停在最后一个字上不动，看起来像"输入
+    /// 没换行、光标卡住了"。根因是 `wrap_boundaries` 在「恰好填满」时不产生新
+    /// 段落，`visual_pos_for` 给出 `display_col == width` 这个画不出来的列，
+    /// 渲染层只能把它钳回 `width - 1`。
+    ///
+    /// 输入框贴着终端底部，所以"多出的一行"表现为输入框向上长高一行，
+    /// 屏幕行号保持不变——真正要钉的是**列坐标回到左边界**。
+    #[test]
+    fn filled_composer_wraps_the_hardware_cursor_to_the_next_row() {
+        use ratatui::backend::{Backend, TestBackend};
+        use ratatui::Terminal;
+
+        // 20 列终端 → 输入框正文 18 列（两侧边框各 1 列）。
+        let mut state = make_state();
+        let mut terminal = Terminal::new(TestBackend::new(20, 10)).expect("TestBackend init");
+
+        let mut input = InputBox::new();
+        input.insert_text(&"a".repeat(17));
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+        let (before_x, before_y) = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor")
+            .into();
+
+        let mut input = InputBox::new();
+        input.insert_text(&"a".repeat(18));
+        terminal
+            .draw(|f| draw(f, &mut state, &input))
+            .expect("draw ok");
+        let (after_x, after_y) = terminal
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor")
+            .into();
+
+        assert_eq!(before_x, 18, "未填满时光标紧跟最后一个字符");
+        assert_eq!(after_x, 1, "填满后光标必须回到下一行首列");
+        assert_eq!(after_y, before_y, "输入框向上长高一行，屏幕行号不变");
+
+        let buf = terminal.backend().buffer();
+        assert_eq!(
+            buf[(after_x, after_y)].symbol(),
+            " ",
+            "光标所在格必须是空的——压着字符就说明它没换行"
+        );
+        assert_eq!(buf[(1, after_y)].symbol(), " ", "新行整行都应是空白");
     }
 }

@@ -749,6 +749,35 @@ impl InputBox {
             .max(1)
     }
 
+    /// 光标是否停在「本行恰好填满可视宽度」的行尾。
+    ///
+    /// 终端把一行写满最后一列后，下一个插入点已经落在**下一行首列**；此时
+    /// 光标所在的视觉行与文字所在的视觉行不是同一行。若仍按「最后一段的
+    /// 显示宽度」给列坐标，它就是 `width`——超出可绘制范围，渲染层只能 `min`
+    /// 回最后一格，光标叠在最后一个字符上，用户以为「打了字但没换行」。
+    ///
+    /// 判据三条缺一不可：宽度非零、光标在本行行尾、本行显示宽度恰好等于
+    /// `width`。少最后一列或光标在行中时本来就有空位可放，不成立。
+    pub fn cursor_fills_line(&self, width: usize) -> bool {
+        if width == 0 {
+            return false;
+        }
+        let line = &self.lines[self.cursor_row];
+        self.cursor_col == line.chars().count()
+            && line.chars().map(char_width).sum::<usize>() == width
+    }
+
+    /// [`Self::visual_height`] 加上光标**自己**占的那一格。
+    ///
+    /// 只有光标那一行落在所有文本之后时才多出一行（最后一条内容行被填满）；
+    /// 上文还有别的逻辑行时，那一行本来就已经算在总高度里。渲染高度、视口
+    /// 总行数、滚轮滚动上限都必须用这个口径，否则「文字占满一行」时算出的
+    /// 总量比真实绘制少一行，光标被钳回上一行。
+    pub fn visual_height_with_cursor(&self, width: usize) -> usize {
+        let (row, _) = self.cursor_visual_pos(width);
+        self.visual_height(width).max(row + 1)
+    }
+
     /// 任意 (row, col) 的视觉位置 (visual_row, visual_col)，考虑折行
     pub fn visual_pos_for(&self, row: usize, col: usize, width: usize) -> (usize, usize) {
         if width == 0 {
@@ -782,9 +811,20 @@ impl InputBox {
         (prev_vis_rows + seg, display_col)
     }
 
-    /// 光标的视觉位置 (visual_row, visual_col)，考虑折行
+    /// 光标的视觉位置 (visual_row, visual_col)，考虑折行。
+    ///
+    /// 与 [`Self::visual_pos_for`] 的唯一差别是**行尾填满**的处理：文字正好
+    /// 占满最后一列时，终端把插入点换到下一行首列，而不是停在最后一格。这里
+    /// 让出那一行（`+1, 0`），渲染层才有一格可放光标；否则 `draw_input` 只能
+    /// 把列坐标钳回 `width - 1`，光标叠在最后一个字符上，看起来像「打了字但
+    /// 没换行」。判据集中在 [`Self::cursor_fills_line`]。
     pub fn cursor_visual_pos(&self, width: usize) -> (usize, usize) {
-        self.visual_pos_for(self.cursor_row, self.cursor_col, width)
+        let (row, col) = self.visual_pos_for(self.cursor_row, self.cursor_col, width);
+        if self.cursor_fills_line(width) {
+            (row + 1, 0)
+        } else {
+            (row, col)
+        }
     }
 
     /// 按显示宽度手动折行，供渲染使用：必须与 [`cursor_visual_pos`] 用同一套算法，
@@ -902,6 +942,66 @@ mod tests {
             InputBox::line_visual_rows(&line, width),
             InputBox::wrap_for_render(&line, width).len()
         );
+    }
+
+    /// 文字正好填满整行时，光标必须换到下一行首列，而不是叠在最后一个字符上。
+    ///
+    /// 现场：在一行末尾继续打字，内容刚好占满可视宽度，此时占位符/光标停住
+    /// 不动，用户以为输入丢了。根因是 `wrap_for_render` 贪心切分在「正好填满」
+    /// 时不产生新段落，`visual_pos_for` 于是给出 `display_col == width`——一个
+    /// 画不出来的列，渲染层只能把它钳回 `width - 1`。
+    #[test]
+    fn cursor_moves_to_the_next_row_when_it_fills_the_line() {
+        for (text, width) in [("a".repeat(10), 10), ("测".repeat(5), 10)] {
+            let mut ib = InputBox::new();
+            ib.insert_text(&text);
+            assert!(
+                ib.cursor_fills_line(width),
+                "{text:?} 应被判为填满第 {width} 列"
+            );
+            assert_eq!(
+                ib.cursor_visual_pos(width),
+                (1, 0),
+                "填满一行后光标应在下一行首列"
+            );
+            assert_eq!(ib.visual_height_with_cursor(width), 2, "高度必须多留一行");
+        }
+    }
+
+    /// 少一列、或光标不在行尾时，都不能多占一行——否则每行下面都会凭空多出
+    /// 一条空行，输入框高度来回跳。
+    #[test]
+    fn cursor_stays_on_its_own_row_when_the_line_is_not_full() {
+        let mut ib = InputBox::new();
+        ib.insert_text(&"a".repeat(9));
+        assert_eq!(ib.cursor_visual_pos(10), (0, 9));
+        assert_eq!(ib.visual_height_with_cursor(10), 1);
+
+        let mut ib = InputBox::new();
+        ib.insert_text(&"a".repeat(10));
+        ib.move_to_start_of_line();
+        assert!(!ib.cursor_fills_line(10), "光标不在行尾时不算填满");
+        assert_eq!(ib.cursor_visual_pos(10), (0, 0));
+        assert_eq!(ib.visual_height_with_cursor(10), 1);
+    }
+
+    /// 填满的那一行**不是最后一行**时，多出来的那一行本来就属于下一条逻辑行，
+    /// 不能让整体高度再加一。
+    #[test]
+    fn a_full_line_above_the_last_one_does_not_add_height() {
+        let mut ib = InputBox::new();
+        ib.insert_text(&"a".repeat(10));
+        ib.insert_newline();
+        assert_eq!(ib.visual_height_with_cursor(10), 2, "两行文本 = 两行高度");
+    }
+
+    /// 鼠标点在新位置必须还能反查到「行尾」，来回换算不能漂。
+    #[test]
+    fn the_wrapped_cursor_position_still_maps_back_to_the_line_end() {
+        let mut ib = InputBox::new();
+        ib.insert_text(&"a".repeat(10));
+        let (vr, vc) = ib.cursor_visual_pos(10);
+        assert_eq!(ib.text_pos_for_visual(vr, vc, 10), (0, 10));
     }
 
     /// `text_pos_for_visual` 必须是 `visual_pos_for` 的反函数。
