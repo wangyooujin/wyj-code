@@ -53,7 +53,10 @@ pub use checkpoint::{
     set_checkpoint_config, Checkpoint, CheckpointConfig, CheckpointKind, CheckpointStore,
     CheckpointSummary, RewindPreview, RewindScope, WorkspaceSnapshot,
 };
-pub use claude_md::{discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile};
+pub use claude_md::{
+    audit_rules_files, discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile,
+    RulesFileAudit, RULES_FILE_LIMIT_BYTES, RULES_SIZE_WARN_BYTES,
+};
 pub use code_index::{CodeSearchTool, ProjectCodeIndex};
 pub use compact::{
     compact_session, compact_trigger_buffer, estimate_request_tokens, estimate_text_tokens_f64,

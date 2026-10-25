@@ -7652,6 +7652,7 @@ fn foo() {}
 /// 是裸 `println`，**不经过**这一步，所以只在 headless 验证会全部漏过。
 #[cfg(test)]
 mod cost_panel_render_tests {
+    use super::char_display_width;
     use super::tool_result_fold_tests::render_preformatted;
     use wyj_commands::Command;
 
@@ -7713,6 +7714,84 @@ mod cost_panel_render_tests {
         assert!(
             widths.windows(2).all(|w| w[0] == w[1]),
             "表格列对齐被破坏: {widths:?}\n{raw}"
+        );
+    }
+
+    /// `/doctor` 与 `/cost` 同属「排版即语义」的输出：旧版返回 `Output`，走
+    /// markdown 后所有行被当同一段落折叠成空格（截图里六行挤成一团）。
+    ///
+    /// 这里钉三件事：① 必须走 `OutputPlain`；② 走完渲染管线后**行数不变**；
+    /// ③ 所有状态行的值列起点齐平——后者正是 `DiagPanel` 存在的理由。
+    #[tokio::test]
+    async fn real_doctor_output_survives_the_tui_render_pipeline() {
+        // cwd 指向空目录，让规约体检走「未找到」分支，结果与运行者的仓库无关。
+        let cwd = std::env::temp_dir().join("wyj-code-doctor-render-test");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut ctx = cost_ctx(100);
+        ctx.cwd = cwd;
+
+        let cmd = wyj_commands::builtin::DoctorCmd;
+        let raw = match cmd.run("", &ctx).await.unwrap() {
+            wyj_commands::CommandResult::OutputPlain(text) => text,
+            other => {
+                panic!("/doctor 必须返回 OutputPlain（否则排版会被 markdown 揉碎）: {other:?}")
+            }
+        };
+        let source_lines = raw.lines().count();
+        assert!(source_lines >= 8, "源文本行数异常: {source_lines}\n{raw}");
+
+        // 排版不得回退到 i18n 模板里的硬编码补位空格。
+        assert!(
+            !raw.contains("API Key      未配置"),
+            "排版仍写在 i18n 模板里:\n{raw}"
+        );
+
+        let lines = render_preformatted(&raw, 100);
+        assert_eq!(
+            lines.len(),
+            source_lines,
+            "渲染后行数变了，说明内容被重新折行:\n源:\n{raw}\n渲染:\n{lines:?}"
+        );
+
+        // 行结构固定为 `缩进(2) + 图标(1) + 间距(2) + 标签 + 间距(2) + 值`，
+        // 标签由面板补位到统一宽度。因此「跳过前 5 列后遇到的第一个 ≥2 空格串
+        // 的终点」就是值列起点——标签内部只可能有单个空格（`API Key`）。
+        fn value_col(line: &str) -> Option<usize> {
+            let chars: Vec<char> = line.chars().collect();
+            let mut w = 0;
+            let mut i = 0;
+            while w < 5 && i < chars.len() {
+                w += char_display_width(chars[i]);
+                i += 1;
+            }
+            let mut run = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                if c == ' ' {
+                    run += 1;
+                } else if run >= 2 {
+                    return Some(w);
+                } else {
+                    run = 0;
+                }
+                w += char_display_width(c);
+                i += 1;
+            }
+            None
+        }
+
+        let cols: Vec<usize> = raw
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with('✓') || t.starts_with('!') || t.starts_with('✗') || t.starts_with('•')
+            })
+            .filter_map(value_col)
+            .collect();
+        assert!(cols.len() >= 4, "识别到的状态行太少: {cols:?}\n{raw}");
+        assert!(
+            cols.windows(2).all(|w| w[0] == w[1]),
+            "值列未对齐（标签列宽不一致）: {cols:?}\n{raw}"
         );
     }
 }

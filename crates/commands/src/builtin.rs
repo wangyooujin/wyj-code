@@ -1076,6 +1076,21 @@ fn fmt_num(n: u32) -> String {
     result.chars().rev().collect()
 }
 
+fn human_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 // ── /hooks ───────────────────────────────────────────────────────────────────
 
 pub struct HooksCmd;
@@ -1219,72 +1234,172 @@ impl Command for DoctorCmd {
         "/doctor".to_string()
     }
     async fn run(&self, _args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        use crate::cost_view::{DiagPanel, Level};
         use wyj_config::Config;
         let cfg = Config::load()?;
         let version = env!("CARGO_PKG_VERSION");
 
-        let mut lines = vec![tr_fmt("doctor.header", &[("version", version)])];
+        // 排版全部交给 `DiagPanel`：旧实现把「两格缩进 + 图标 + 补位空格」写进
+        // i18n 模板，中英文标签长度不同就各自散架，值一长还会冲出聊天区
+        // （`Output` 走 markdown 折行，`\n` 被当软换行折叠成空格）。
+        let mut panel = DiagPanel::new(tr_fmt("doctor.title", &[("version", version)]));
 
-        // API Key
-        match cfg.api_key() {
-            Ok(_) => lines.push(tr_fmt(
-                "status.api_key_ok",
-                &[("prefix", &cfg.redacted_api_key().unwrap_or_default())],
-            )),
-            Err(_) => lines.push(tr("doctor.api_key_missing")),
-        }
+        // ── 运行环境 ──
+        panel = panel.section(tr("doctor.section_runtime"));
+        panel = panel.row(
+            Level::Ok,
+            tr("doctor.label_provider"),
+            cfg.provider().to_string(),
+        );
+        panel = panel.row(Level::Ok, tr("doctor.label_model"), ctx.model.clone());
 
-        // 配置文件
-        match wyj_config::config_dir() {
+        panel = match cfg.api_key() {
+            Ok(_) => panel.row(
+                Level::Ok,
+                tr("doctor.label_api_key"),
+                tr_fmt(
+                    "doctor.value_api_key_ok",
+                    &[("prefix", &cfg.redacted_api_key().unwrap_or_default())],
+                ),
+            ),
+            Err(_) => panel.row(
+                Level::Err,
+                tr("doctor.label_api_key"),
+                tr("doctor.value_api_key_missing"),
+            ),
+        };
+
+        panel = match wyj_config::config_dir() {
             Ok(dir) => {
                 let cfg_file = dir.join("config.toml");
+                let path = cfg_file.display().to_string();
                 if cfg_file.exists() {
-                    lines.push(tr_fmt(
-                        "doctor.config_file_ok",
-                        &[("path", &cfg_file.display().to_string())],
-                    ));
+                    panel.row(
+                        Level::Ok,
+                        tr("doctor.label_config_file"),
+                        tr_fmt("doctor.value_config_ok", &[("path", &path)]),
+                    )
                 } else {
-                    lines.push(tr_fmt(
-                        "doctor.config_file_missing",
-                        &[("path", &cfg_file.display().to_string())],
-                    ));
+                    panel.row(
+                        Level::Warn,
+                        tr("doctor.label_config_file"),
+                        tr_fmt("doctor.value_config_missing", &[("path", &path)]),
+                    )
                 }
             }
-            Err(e) => lines.push(tr_fmt("doctor.config_dir_err", &[("err", &e.to_string())])),
-        }
-
-        // Provider + Model
-        lines.push(tr_fmt(
-            "doctor.provider",
-            &[("provider", &cfg.provider().to_string())],
-        ));
-        lines.push(tr_fmt("doctor.model", &[("model", &ctx.model)]));
+            Err(e) => panel.row(
+                Level::Err,
+                tr("doctor.label_config_file"),
+                tr_fmt("doctor.value_config_dir_err", &[("err", &e.to_string())]),
+            ),
+        };
 
         // WebSearch：[search] 节配好了就报后端，没配就说明原因。这一项是为了让
         // 「工具怎么不见了」能在一条命令里得到答案——未配置时它压根不注册，
         // 模型侧完全看不到，用户只能靠诊断输出发现。
-        match cfg.search_provider_issue() {
-            None => lines.push(tr_fmt(
-                "doctor.search_ok",
-                &[("provider", cfg.effective_search_provider())],
-            )),
-            Some(issue) => lines.push(tr_fmt("doctor.search_unavailable", &[("reason", &issue)])),
-        }
+        panel = match cfg.search_provider_issue() {
+            None => panel.row(
+                Level::Ok,
+                tr("doctor.label_search"),
+                tr_fmt(
+                    "doctor.value_search_ok",
+                    &[("provider", cfg.effective_search_provider())],
+                ),
+            ),
+            Some(issue) => panel.row(
+                Level::Info,
+                tr("doctor.label_search"),
+                tr_fmt("doctor.value_search_unavailable", &[("reason", &issue)]),
+            ),
+        };
 
-        // 项目规约文件（全局 + 祖先链，按 AGENTS.md → CLAUDE.md → … 回退）
-        let claude_md_files = wyj_core::discover_files(&ctx.cwd);
-        let existing: Vec<String> = claude_md_files
-            .iter()
-            .filter(|f| f.exists)
-            .map(|f| f.path.display().to_string())
-            .collect();
-        if existing.is_empty() {
-            lines.push(tr("doctor.claude_md_missing"));
+        // ── 项目上下文 ──
+        panel = panel.section(tr("doctor.section_context"));
+
+        // 项目规约文件（全局 + 祖先链，按 AGENTS.md → CLAUDE.md → … 回退）。
+        // 不只报「有没有」：静默截断、僵尸副本、失效 @import 这三种失效都
+        // 不会在运行期产生任何可见信号，只能靠这里暴露出来。
+        let audits = wyj_core::audit_rules_files(&ctx.cwd);
+        if audits.is_empty() {
+            panel = panel.row(
+                Level::Err,
+                tr("doctor.label_rules"),
+                tr("doctor.value_rules_missing"),
+            );
         } else {
-            lines.push(tr_fmt(
-                "doctor.claude_md_ok",
-                &[("paths", &existing.join(", "))],
-            ));
+            let mut total_tokens = 0usize;
+            for a in &audits {
+                total_tokens += a.tokens;
+                let path = a.path.display().to_string();
+                let size = human_bytes(a.bytes);
+                let tokens = a.tokens.to_string();
+                panel = if a.truncated {
+                    panel.row(
+                        Level::Err,
+                        tr("doctor.label_rules"),
+                        tr_fmt(
+                            "doctor.value_rules_truncated",
+                            &[
+                                ("path", &path),
+                                ("size", &size),
+                                ("limit", &human_bytes(wyj_core::RULES_FILE_LIMIT_BYTES)),
+                                ("headings", &a.dropped_headings.join(" / ")),
+                            ],
+                        ),
+                    )
+                } else if a.bytes > wyj_core::RULES_SIZE_WARN_BYTES {
+                    panel.row(
+                        Level::Warn,
+                        tr("doctor.label_rules"),
+                        tr_fmt(
+                            "doctor.value_rules_oversized",
+                            &[("path", &path), ("size", &size), ("tokens", &tokens)],
+                        ),
+                    )
+                } else {
+                    panel.row(
+                        Level::Ok,
+                        tr("doctor.label_rules"),
+                        tr_fmt(
+                            "doctor.value_rules_file",
+                            &[("path", &path), ("size", &size), ("tokens", &tokens)],
+                        ),
+                    )
+                };
+                if !a.shadowed.is_empty() {
+                    let list: Vec<String> =
+                        a.shadowed.iter().map(|p| p.display().to_string()).collect();
+                    panel = panel.row(
+                        Level::Warn,
+                        tr("doctor.label_rules_shadowed"),
+                        tr_fmt(
+                            "doctor.value_rules_shadowed",
+                            &[("shadowed", &list.join(", ")), ("path", &path)],
+                        ),
+                    );
+                }
+                if !a.missing_imports.is_empty() {
+                    panel = panel.row(
+                        Level::Warn,
+                        tr("doctor.label_rules_import"),
+                        tr_fmt(
+                            "doctor.value_rules_bad_import",
+                            &[("path", &path), ("imports", &a.missing_imports.join(", "))],
+                        ),
+                    );
+                }
+            }
+            panel = panel.row(
+                Level::Info,
+                tr("doctor.label_rules_total"),
+                tr_fmt(
+                    "doctor.value_rules_total",
+                    &[
+                        ("count", &audits.len().to_string()),
+                        ("tokens", &total_tokens.to_string()),
+                    ],
+                ),
+            );
         }
 
         // 记忆目录
@@ -1293,38 +1408,53 @@ impl Command for DoctorCmd {
             .join("memory")
             .join(&pid);
         let index_path = mem_dir.join("MEMORY.md");
-        if index_path.exists() {
+        let mem_path = mem_dir.display().to_string();
+        panel = if index_path.exists() {
             let entry_count = std::fs::read_to_string(&index_path)
                 .unwrap_or_default()
                 .lines()
                 .filter(|l| l.starts_with("- ["))
                 .count();
-            lines.push(tr_fmt(
-                "doctor.memory_dir_with_count",
-                &[
-                    ("path", &mem_dir.display().to_string()),
-                    ("count", &entry_count.to_string()),
-                ],
-            ));
+            panel.row(
+                Level::Ok,
+                tr("doctor.label_memory_dir"),
+                tr_fmt(
+                    "doctor.value_memory_with_count",
+                    &[("path", &mem_path), ("count", &entry_count.to_string())],
+                ),
+            )
         } else {
-            lines.push(tr_fmt(
-                "doctor.memory_dir_empty",
-                &[("path", &mem_dir.display().to_string())],
-            ));
-        }
+            panel.row(
+                Level::Info,
+                tr("doctor.label_memory_dir"),
+                tr_fmt("doctor.value_memory_empty", &[("path", &mem_path)]),
+            )
+        };
 
         // MCP servers（合并全局+项目配置、过滤禁用条目后的有效数量）
         let mcp_count = ctx.effective_mcp_count;
-        if mcp_count > 0 {
-            lines.push(tr_fmt(
-                "doctor.mcp_configured",
-                &[("count", &mcp_count.to_string())],
-            ));
+        panel = if mcp_count > 0 {
+            panel.row(
+                Level::Ok,
+                tr("doctor.label_mcp"),
+                tr_fmt(
+                    "doctor.value_mcp_configured",
+                    &[("count", &mcp_count.to_string())],
+                ),
+            )
         } else {
-            lines.push(tr("doctor.mcp_none"));
-        }
+            panel.row(
+                Level::Info,
+                tr("doctor.label_mcp"),
+                tr("doctor.value_mcp_none"),
+            )
+        };
 
-        Ok(CommandResult::Output(lines.join("\n")))
+        // 必须走 `OutputPlain`：这是排版好的面板，交给 markdown 渲染会被当
+        // 段落重新折行，列对齐全部作废（旧版就是 `Output`，实测挤成一团）。
+        Ok(CommandResult::OutputPlain(
+            panel.render(ctx.terminal_width).trim_end().to_string(),
+        ))
     }
 }
 
