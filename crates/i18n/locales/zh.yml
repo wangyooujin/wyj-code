@@ -218,7 +218,7 @@ cli:
   subagent_trace_json_help: "直接输出原始 JSONL（供管道处理），仅在指定了子 Agent id 时生效"
   trust_mcp_about: "批准当前项目级 MCP server（.wyj-code/mcp.toml/.mcp.json）的信任确认"
   trust_skills_about: "批准当前项目级 skill（.wyj-code/skills/）的信任确认；这些 skill 的正文来自本仓库提交者，执行时整段交给模型"
-  trust_about: "一次性批准当前项目级的 MCP server 与 skill"
+  trust_about: "一次性批准当前项目级的 MCP server、skill 与 hooks/verify"
   run_about: "一次性执行一条斜杠命令 / Skill（等价于在会话里敲 /xxx，但不进交互循环）"
   run_command_help: "要执行的命令（/name 或 name 均可），其后的参数原样传给命令"
 

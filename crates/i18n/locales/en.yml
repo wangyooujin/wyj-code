@@ -221,7 +221,7 @@ cli:
   subagent_trace_json_help: "Print the raw JSONL (for piping); only takes effect when a sub-agent id is given"
   trust_mcp_about: "Approve trust for the current project's project-scoped MCP servers (.wyj-code/mcp.toml/.mcp.json)"
   trust_skills_about: "Approve trust for the current project's project-scoped skills (.wyj-code/skills/); their bodies come from the repo author and are handed to the model as instructions"
-  trust_about: "Approve trust for both project-scoped MCP servers and skills"
+  trust_about: "Approve trust for project-scoped MCP servers, skills and hooks/verify at once"
   run_about: "Run one slash command / skill once, non-interactively (like typing /xxx in a session, without the REPL loop)"
   run_command_help: "The command to run (`/name` or `name`); remaining arguments are passed through to the command"
 
