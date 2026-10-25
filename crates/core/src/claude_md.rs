@@ -55,6 +55,26 @@ pub struct DiscoveredFile {
     pub exists: bool,
 }
 
+/// 单份**实际生效**规约文件的体检结果，供 `/doctor` 渲染。
+///
+/// 这里报的是**注入体积**（`@import` 展开之后），不是磁盘上的文件大小——
+/// 两者可以差很多，而真正花 token、真正触发截断的是前者。
+pub struct RulesFileAudit {
+    pub path: PathBuf,
+    pub source: ClaudeMdSource,
+    /// `@import` 展开后的字节数
+    pub bytes: usize,
+    pub tokens: usize,
+    /// 超过 [`MAX_RULE_FILE_BYTES`]，尾部对模型不可见
+    pub truncated: bool,
+    /// 截断后丢失的一、二级标题
+    pub dropped_headings: Vec<String>,
+    /// 同目录同槽位里**存在但不会被注入**的候选（僵尸副本）
+    pub shadowed: Vec<PathBuf>,
+    /// `@import` 指向但解析不到的目标
+    pub missing_imports: Vec<String>,
+}
+
 /// 单个目录内注入的规约文本字节上限。
 ///
 /// 规约是**一次性**注入（`seen_dirs` 去重后不再重发），所以这个上限比记忆快照的
@@ -234,6 +254,95 @@ pub fn discover_files(cwd: &Path) -> Vec<DiscoveredFile> {
     out
 }
 
+/// 规约体积告警线：**不截断**，只提示。业界口径是「单文件 < 150 行」，
+/// 折成中文规约大约就是这个量级；真正硬性截断仍在 [`RULES_FILE_LIMIT_BYTES`]。
+pub const RULES_SIZE_WARN_BYTES: usize = 32 * 1024;
+
+/// 硬截断线，对外暴露供 `/doctor` 渲染（单一真相源在 [`MAX_RULE_FILE_BYTES`]）。
+pub const RULES_FILE_LIMIT_BYTES: usize = MAX_RULE_FILE_BYTES;
+
+/// 体检当前 cwd 会实际注入的每一份规约文件。
+///
+/// 走的是与 [`ClaudeMdLoader::turn_reminder`] **完全相同**的目录链与槽位解析，
+/// 因此「体检报告里的文件」与「模型真正读到的文件」不会漂移。子目录惰性加载
+/// 的文件不在此列——它们取决于运行时触达了哪些目录，无法静态枚举。
+pub fn audit_rules_files(cwd: &Path) -> Vec<RulesFileAudit> {
+    let mut dirs: Vec<(PathBuf, ClaudeMdSource)> = vec![];
+    if let Ok(g) = wyj_config::global_config_dir() {
+        dirs.push((g, ClaudeMdSource::Global));
+    }
+    let root = normalize_lexically(&wyj_config::project_root(cwd));
+    for d in collect_chain(&root, &normalize_lexically(cwd)) {
+        dirs.push((d, ClaudeMdSource::Project));
+    }
+
+    let mut out = vec![];
+    for (dir, source) in dirs {
+        for names in [MEMORY_FILES.as_slice(), MEMORY_LOCAL_FILES.as_slice()] {
+            let Some((path, content)) = resolve_slot(&dir, names) else {
+                continue;
+            };
+            // 同槽位里排在命中项之后、但**实际存在**的候选：它们永远不会被注入，
+            // 却仍会被维护者当作有效规约更新，是最典型的漂移来源。
+            let shadowed = names
+                .iter()
+                .skip_while(|n| dir.join(n) != path)
+                .skip(1)
+                .map(|n| dir.join(n))
+                .filter(|p| p.is_file())
+                .collect();
+
+            out.push(RulesFileAudit {
+                bytes: content.len(),
+                tokens: crate::compact::estimate_text_tokens(&content),
+                truncated: content.len() > MAX_RULE_FILE_BYTES,
+                dropped_headings: dropped_headings(&content),
+                missing_imports: missing_imports(&path),
+                shadowed,
+                path,
+                source,
+            });
+        }
+    }
+    out
+}
+
+/// 扫描一份规约原文里的 `@import`，返回**解析不到**的目标。
+///
+/// 必须读**原文**而非展开结果：`resolve_imports` 在失败时会把 `@token` 原样留下，
+/// 展开后的文本里失败与「本来就想写一个 @ 符号」无法区分。
+fn missing_imports(path: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let re = import_regex();
+    let mut out = vec![];
+    let mut in_fence = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        for caps in re.captures_iter(line) {
+            let token = caps.get(1).unwrap().as_str();
+            // 与 `try_import` 同一套「像不像路径」的判据
+            if !token.contains('/') && !token.ends_with(".md") {
+                continue;
+            }
+            let resolved = resolve_import_path(token, base_dir);
+            if !resolved.map(|p| p.is_file()).unwrap_or(false) {
+                out.push(token.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// 该目录**已经存在**的规约文件名（走与注入完全相同的 `resolve_slot` 解析线）。
 ///
 /// 供 `/init` 决定生成目标：仓库里既然已经有 `CLAUDE.md`，就该更新那一份，
@@ -304,7 +413,7 @@ fn load_dir_files(dir: &Path) -> Option<String> {
     let parts: Vec<String> = [MEMORY_FILES.as_slice(), MEMORY_LOCAL_FILES.as_slice()]
         .iter()
         .filter_map(|names| resolve_slot(dir, names))
-        .map(|(_, content)| truncate_rule_text(&content))
+        .map(|(path, content)| truncate_and_warn(&path, &content))
         .collect();
 
     if parts.is_empty() {
@@ -312,6 +421,40 @@ fn load_dir_files(dir: &Path) -> Option<String> {
     } else {
         Some(parts.join("\n\n"))
     }
+}
+
+/// 超限时**先告警再截断**。静默截断是这里最危险的失败形态：模型看到的是
+/// 一份语法完整、内容完整的规约，它没有任何线索知道尾部还有规则没读到，
+/// 于是会自信地违反那些它从未见过的约定。用户侧同样没有信号——除非有人
+/// 主动跑 `/doctor`。
+fn truncate_and_warn(path: &Path, text: &str) -> String {
+    if text.len() <= MAX_RULE_FILE_BYTES {
+        return text.to_string();
+    }
+    let dropped = dropped_headings(text);
+    tracing::warn!(
+        path = %path.display(),
+        bytes = text.len(),
+        limit = MAX_RULE_FILE_BYTES,
+        dropped_headings = ?dropped,
+        "rules file exceeds the injection limit; its tail is invisible to the model"
+    );
+    truncate_rule_text(text)
+}
+
+/// 截断后丢失的一、二级标题（最多 6 条）。只报章节名而不是字节数，是因为
+/// 「你超了 28KB」没法指导行动，「你丢了『验收门禁』『重试幂等性』」可以。
+fn dropped_headings(text: &str) -> Vec<String> {
+    if text.len() <= MAX_RULE_FILE_BYTES {
+        return vec![];
+    }
+    let end = crate::textutil::floor_char_boundary(text, MAX_RULE_FILE_BYTES);
+    text[end..]
+        .lines()
+        .filter(|l| l.starts_with("# ") || l.starts_with("## "))
+        .map(|l| l.trim_start_matches('#').trim().to_string())
+        .take(6)
+        .collect()
 }
 
 /// 超长规约文本按字节封顶，保留头部并显式标注截断。
@@ -876,5 +1019,81 @@ mod tests {
         assert!(out.contains("[truncated:"));
         assert!(out.starts_with("规"));
         assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    /// 诊断必须点名**丢了哪些章节**：只报「你超了 28KB」无法指导行动，
+    /// 而「验收门禁」「重试幂等性」这种标题一列出来，作者立刻知道该拆哪段。
+    #[test]
+    fn dropped_headings_names_the_sections_after_the_cut() {
+        let mut text = "x".repeat(MAX_RULE_FILE_BYTES + 16);
+        text.push_str("\n## Kept-looking-but-dropped\nbody\n## Another Dropped One\nbody\n");
+        let dropped = dropped_headings(&text);
+        assert_eq!(
+            dropped,
+            vec!["Kept-looking-but-dropped", "Another Dropped One"]
+        );
+        // 未超限时没有任何章节被丢
+        assert!(dropped_headings("## Short\nbody").is_empty());
+    }
+
+    /// 失效 `@import` 必须被诊断出来。运行期它是**静默**的（`try_import`
+    /// 返回 None 就把 `@token` 原样留在文本里），模型会以为自己读到了内容。
+    #[test]
+    fn missing_imports_are_reported_but_valid_ones_are_not() {
+        let dir = unique_dir("audit-imports");
+        std::fs::write(dir.join("real.md"), "real content").unwrap();
+        std::fs::write(
+            dir.join("AGENTS.md"),
+            "see @./real.md and @./gone.md\n\
+             ```\n@./in-fence.md\n```\n\
+             contact me@example.com\n",
+        )
+        .unwrap();
+
+        let missing = missing_imports(&dir.join("AGENTS.md"));
+        assert_eq!(missing, vec!["./gone.md"]);
+    }
+
+    /// 同目录同槽位的僵尸副本：`AGENTS.md` 生效时，`CLAUDE.md` 永远不会被读，
+    /// 但维护者仍在更新它。这是「命中即停」必然带来的漂移面，必须报出来。
+    #[test]
+    fn audit_flags_shadowed_candidates_in_the_same_slot() {
+        let dir = unique_dir("audit-shadowed");
+        std::fs::write(dir.join("AGENTS.md"), "live rules").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "zombie rules").unwrap();
+        std::fs::write(dir.join("AGENTS.local.md"), "personal").unwrap();
+
+        let audits = audit_rules_files(&dir);
+        let main = audits
+            .iter()
+            .find(|a| a.path.ends_with("AGENTS.md"))
+            .expect("AGENTS.md 必须出现在体检结果里");
+        assert_eq!(
+            main.shadowed
+                .iter()
+                .filter_map(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["CLAUDE.md"]
+        );
+        // 个人槽位是另一槽，AGENTS.local.md 不是 AGENTS.md 的副本
+        assert!(audits.iter().any(|a| a.path.ends_with("AGENTS.local.md")));
+    }
+
+    /// 体检口径必须是**注入体积**，与 `load_dir_files` 同源：同一份文件
+    /// 两处算出的字节数不一致，`/doctor` 就会给出误导性的结论。
+    #[test]
+    fn audit_measures_the_same_bytes_the_loader_would_inject() {
+        let dir = unique_dir("audit-bytes");
+        std::fs::write(dir.join("AGENTS.md"), "rule one\nrule two\n").unwrap();
+        let audits = audit_rules_files(&dir);
+        let a = audits
+            .iter()
+            .find(|a| a.path.ends_with("AGENTS.md"))
+            .unwrap();
+        let injected = load_dir_files(&dir).unwrap();
+        assert_eq!(a.bytes, injected.len());
+        assert!(!a.truncated);
+        assert_eq!(a.tokens, crate::compact::estimate_text_tokens(&injected));
     }
 }
