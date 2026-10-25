@@ -38,24 +38,40 @@ cargo run                        # 启动 TUI 模式
 cargo run -- --headless          # 启动 headless REPL 模式
 cargo run -- -p "your prompt"    # 单次问答（不启动 TUI）
 cargo run -- run /explain <目标>  # 一次性执行一条斜杠命令 / Skill（不读 stdin，跑完即退出）
-cargo run -- --config-status     # 查看当前配置和 API Key 状态
+cargo run -- --config-status     # 查看当前配置和 API Key 状态（附降耗提示：超大 context_window / 低 max_tools_per_turn 告警）
 cargo run -- --cwd <dir>         # 指定工作目录（默认当前目录）
-cargo run -- --plan              # 以 Plan 模式启动（仅只读工具）
+cargo run -- --project-root <dir> # 显式指定项目根（无 Git 项目 / worktree 场景必带）
+cargo run -- --plan              # Plan 模式：只读分析 + 受限规划文档写入
 cargo run -- --bypass-permissions # 以 Bypass 模式启动（跳过权限确认）
-cargo run -- --permission-mode bypass # 显式选模式：auto（默认）/ plan / bypass
+cargo run -- --permission-mode bypass # 显式选模式：auto（默认）/ plan / bypass；manual/default/normal 是 auto 的兼容别名
+cargo run -- --allowed-tools "Read,Grep" # 本次进程允许调用的工具名白名单（逗号分隔，仅工具名不授权写入范围）
+cargo run -- --allow-plan-write docs/plan.md # Plan 模式额外放行的文档路径（可重复）
+cargo run -- --profile <name>    # 一次性指定调用分组（不落盘、不改 active_profile；在子命令分发前生效）
+cargo run -- --plugin-dir <dir>  # 加载本地插件目录用于开发调试（仅运行期入口有效，静态子命令会 exit(2)）
 cargo run -- --no-hooks           # 禁用 Hooks 自动化系统
 cargo run -- -c / --continue     # 恢复上一次会话
 cargo run -- --resume <id>       # 恢复指定会话 ID
 cargo run -- subagent-trace <session_id> [<sub_id>] [--json]  # 查看落盘的子 Agent 执行轨迹（无 sub_id 列出概览）
 cargo run -- usage [--since YYYY-MM-DD] [--project PATH] [--json]  # 跨会话 token 消耗汇总（消耗率基线来源）
+cargo run -- update [-y]         # 检查并自更新到 GitHub 最新 release（-y 跳过确认）
+cargo run -- model doctor [profile] [--probe basic|full] # 模型身份/能力诊断；--probe 只认 WYJ_CODE_PROBE_API_KEY，不用 profile key
+cargo run -- session checkpoint <id> [--name N] / checkpoints <id> # 会话 checkpoint 管理与列出
+cargo run -- session rewind <id> <cp> [--scope conversation|files|both] [--force] # 回退（默认 both）
+cargo run -- session branch <id> <cp> [--restore-files] [--force] # 从 checkpoint 开分支
+cargo run -- extensions list|install|upgrade|enable|disable|remove|doctor # Skill/MCP/Plugin 资源管理（--scope project|global）
+cargo run -- evolve status|list|review|feedback|approve|reject|... # 本地证据驱动的演化治理
+cargo run -- memory status|search|search-sessions|write|forget|clear-all # Memory v3 claims 检查/纠正（跟随 storage.scope）
+cargo run -- skillhub search <q> / info <slug> --namespace N / install <slug> --namespace N [--project] [--yes]
 cargo run -- export backup.wyj       # 导出全部 profile + 全局 skill（含明文 api_key，落盘 0600）
-cargo run -- import backup.wyj       # 恢复，默认 dry-run；--yes 实际写入（profile 按 name 合并、skill 已存在则跳过）
+cargo run -- import backup.wyj       # 恢复，默认 dry-run（--dry-run false 或 --yes 实际写入；profile 按 name 合并、skill 已存在则跳过）
+cargo run -- storage status|doctor|prune|migrate # 本机 ~/.wyj-code 存储治理（prune/migrate 默认 dry-run）
+cargo run -- trust / trust-mcp / trust-skills / trust-hooks # 项目级信任批准（trust = 三者全批）
 cargo run -- workspace list      # 列出 managed Git worktree
 cargo run -- workflow validate workflow.json # 校验 Workflow DAG
 cargo run -- workflow run workflow.json      # 运行 DAG；写节点自动隔离
 cargo run -- acp                 # stdin/stdout ACP adapter
 cargo run -- daemon --listen 127.0.0.1:61337 # 全局 session daemon
-cargo run -- review run --base HEAD^ --head HEAD --json # 本地 diff 审查证据
+cargo run -- review run --base HEAD^ --head HEAD [--json] [--fail-on <level>] # 本地 diff 审查证据
 
 ./build.sh                       # 等同 cargo build --release
 ./build.sh package               # 打包到 dist/<binary>-<version>-<platform>
@@ -191,6 +207,18 @@ language = ""                # "en"/"zh"，留空自动检测系统 locale
 
 `[notify]` / `[storage]` / `[persist_cap]` / `[evolution]` / `[subagent]` / `[context_edit]` /
 `[computer_use]` / `[tools]` / `[search]` 等块的完整字段与默认值见 `docs/reference/config.md`。
+
+**环境变量覆盖族**（都不出现在 `-h`，只覆盖本次运行、不落盘）：
+
+| 变量 | 作用 |
+|---|---|
+| `WYJ_CODE_API_KEY` | 覆盖激活分组 API Key（优先级高于 config.toml） |
+| `WYJ_CODE_THINKING_EFFORT` / `WYJ_CODE_THINKING_SWITCH` | 覆盖思考档位/开关（优先级最高，面板操作不盖掉它） |
+| `WYJ_CODE_MAX_TOOLS_PER_TURN` | 覆盖每轮工具数上限 |
+| `WYJ_CODE_SEARCH_API_KEY` | WebSearch 后端（Tavily/Brave）密钥 |
+| `WYJ_CODE_PROBE_API_KEY` | `model doctor --probe` 专用轮换密钥（刻意不用 profile key） |
+| `WYJ_CODE_MCP_CALL_SECS` / `WYJ_CODE_STREAM_IDLE_SECS` / `WYJ_CODE_TURN_STALL_SECS` | MCP 调用 / 流空闲 / 回合停滞超时 |
+| `WYJ_CODE_NOTIFY_OFF` / `_BELL` / `_DESKTOP` | 通知通道开关 |
 
 ## Architecture
 

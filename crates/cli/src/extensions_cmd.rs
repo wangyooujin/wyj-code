@@ -19,7 +19,7 @@ pub enum ExtensionCommand {
         reference: String,
         #[arg(long)]
         source: Option<String>,
-        #[arg(long, default_value = "project")]
+        #[arg(long, default_value = "project", value_parser = ["project", "global"])]
         scope: String,
         #[arg(long)]
         yes: bool,
@@ -29,7 +29,7 @@ pub enum ExtensionCommand {
     /// Upgrade an installed resource from its recorded source.
     Upgrade {
         id: String,
-        #[arg(long, default_value = "project")]
+        #[arg(long, default_value = "project", value_parser = ["project", "global"])]
         scope: String,
         #[arg(long)]
         json: bool,
@@ -42,7 +42,7 @@ pub enum ExtensionCommand {
     /// Enable a resource, for example mcp:postgres or plugin:reviewer.
     Enable {
         id: String,
-        #[arg(long, default_value = "project")]
+        #[arg(long, default_value = "project", value_parser = ["project", "global"])]
         scope: String,
         #[arg(long)]
         json: bool,
@@ -50,7 +50,7 @@ pub enum ExtensionCommand {
     /// Disable a resource.
     Disable {
         id: String,
-        #[arg(long, default_value = "project")]
+        #[arg(long, default_value = "project", value_parser = ["project", "global"])]
         scope: String,
         #[arg(long)]
         json: bool,
@@ -58,7 +58,7 @@ pub enum ExtensionCommand {
     /// Remove a resource from the selected scope.
     Remove {
         id: String,
-        #[arg(long, default_value = "project")]
+        #[arg(long, default_value = "project", value_parser = ["project", "global"])]
         scope: String,
         #[arg(long)]
         json: bool,

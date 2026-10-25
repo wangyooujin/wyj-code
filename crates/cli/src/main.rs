@@ -227,7 +227,7 @@ enum Commands {
         about = "Approve project-level hooks/verify commands"
     )]
     TrustHooks,
-    /// 一次性批准项目级的 MCP server 与 skill（配 cron 定时任务前用这个）。
+    /// 一次性批准项目级的 MCP server、skill 与 hooks/verify（无人值守场景使用前先跑这个）。
     #[command(name = "trust", about = wyj_i18n::tr("cli.trust_about"))]
     Trust,
     /// Inspect model identity, capabilities and optional live compatibility probes.
