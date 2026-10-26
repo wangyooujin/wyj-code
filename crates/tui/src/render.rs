@@ -877,6 +877,58 @@ pub fn draw(f: &mut Frame, state: &mut AppState, input: &InputBox) {
     if let Some(selection) = state.selection {
         paint_selection(f.buffer_mut(), &selection, state);
     }
+
+    // 宽字符与浮层边框的最后一处冲突：**必须在 backend diff 之前**修掉。
+    //
+    // 浮层左边界那一列是整格的 `│`，但它的左邻格可能被下层（聊天/欢迎页）的
+    // 双宽字符占着——那个字符的第一格在框外，第二格恰好就是边框格。Buffer 里
+    // 两格各自"正确"（`息` + `│`），可 ratatui 的 `Buffer::diff` 遍历到宽字符
+    // 时会把 `to_skip` 设成 `width - 1`，紧跟其后的那一格根本不进 diff——边框
+    // 格于是永远画不出来，终端上就是一道缺口。缺在哪些行取决于那一行左侧文字
+    // 的落点，所以它表现为"有的行缺、有的行不缺"，且改终端宽度会换一批行。
+    //
+    // 修法见 `normalize_wide_char_overlaps`。
+    normalize_wide_char_overlaps(f.buffer_mut());
+}
+
+/// 让「跨列符号压到别人的格子」这种布局在 diff 前退化成合法形态。
+///
+/// ratatui 的 `Buffer::diff` 用一个 `to_skip` 游标实现增量输出：遇到宽度 2 的
+/// 符号就把下一格标记为"已被这个符号覆盖"并跳过。它假设宽字符的后继格一定是
+/// 自己 `set_stringn` 时 reset 出来的空格，可绘图是**分层**的——下层先画宽字符
+/// （连同 reset 后继格），上层的浮层随后只覆盖了那一格，于是 Buffer 里留下
+/// 「宽字符 + 可见符号」这种自相矛盾的组合。diff 看到宽字符就跳过，那一格上层的
+/// 内容（边框、文字）永远不会被输出，而它又是 Buffer 里真实存在的。
+///
+/// 这里按「上层优先」把它改回合法布局：后继格已被别的符号占用时，让宽字符自己
+/// 退化成空格（半个字本来就画不出来，留一个空格比留一道缺口干净）。
+fn normalize_wide_char_overlaps(buffer: &mut ratatui::buffer::Buffer) {
+    let area = buffer.area;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let symbol = buffer[(x, y)].symbol();
+            // 快路径：单字节 ASCII 必然是 1 列，逐帧全屏扫描时占绝大多数。
+            if symbol.len() == 1 && symbol.as_bytes()[0].is_ascii() {
+                continue;
+            }
+            let width = unicode_width::UnicodeWidthStr::width(symbol);
+            if width < 2 {
+                continue;
+            }
+            let Some(next_x) = x.checked_add(width as u16 - 1) else {
+                continue;
+            };
+            if next_x >= area.right() {
+                // 跨出右边界的宽字符终端也画不全，退化成空格。
+                buffer[(x, y)].reset();
+                continue;
+            }
+            let occupant = buffer[(next_x, y)].symbol();
+            if !occupant.is_empty() && occupant != " " {
+                buffer[(x, y)].reset();
+            }
+        }
+    }
 }
 
 /// 给选区内的格子铺底色。
@@ -8352,5 +8404,170 @@ mod composer_viewport_tests {
             "光标所在格必须是空的——压着字符就说明它没换行"
         );
         assert_eq!(buf[(1, after_y)].symbol(), " ", "新行整行都应是空白");
+    }
+}
+
+#[cfg(test)]
+mod wide_char_overlap_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Style;
+    use ratatui::Terminal;
+
+    /// `Buffer::diff` 的跳过行为：宽字符的后继格永不输出。
+    ///
+    /// 这是整条缺陷链的起点，单独钉一遍——如果 ratatui 哪天改了这套语义，
+    /// `normalize_wide_char_overlaps` 就成了多余的死代码，届时应删它而不是
+    /// 让两层各自沉默。
+    #[test]
+    fn diff_skips_the_cell_after_a_wide_char() {
+        let area = Rect::new(0, 0, 12, 1);
+        let mut prev = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        prev.set_string(4, 0, "模", Style::default());
+        next.set_string(4, 0, "模", Style::default());
+        next[(5, 0)].set_symbol("│");
+
+        let emitted: Vec<(u16, u16)> = prev
+            .diff(&next)
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        assert!(
+            !emitted.contains(&(5, 0)),
+            "宽字符占着 x=4，x=5 的边框格被 diff 整格跳过：{emitted:?}"
+        );
+    }
+
+    /// 后继格被占用时，宽字符必须让位。
+    #[test]
+    fn a_wide_char_yields_when_its_tail_cell_is_taken() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(0, 0, "息", Style::default());
+        buffer[(1, 0)].set_symbol("│");
+
+        normalize_wide_char_overlaps(&mut buffer);
+
+        assert_eq!(buffer[(1, 0)].symbol(), "│", "上层内容必须留下");
+        assert_eq!(buffer[(0, 0)].symbol(), " ", "宽字符退化成空格，不再跨列");
+    }
+
+    /// 正常宽字符（后继格是它自己的空续格）不受影响。
+    #[test]
+    fn a_healthy_wide_char_is_left_alone() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(0, 0, "息", Style::default());
+
+        normalize_wide_char_overlaps(&mut buffer);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "息");
+        assert_eq!(buffer[(1, 0)].symbol(), " ", "后继格仍是空续格");
+    }
+
+    /// 第 0 列就画不下的宽字符不许跨到右边界之外。
+    #[test]
+    fn a_wide_char_hanging_off_the_right_edge_is_dropped() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(1, 0, "息", Style::default());
+
+        normalize_wide_char_overlaps(&mut buffer);
+
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+    }
+
+    /// 端到端：浮层左边框压在下层宽字符的尾格上时，边框必须真的画出来。
+    ///
+    /// 现场形态是 `/profile` 等所有弹窗的左边框在若干行上缺一格。Buffer 里那一格
+    /// 一直是 `│`（所以快照测试全绿），但 diff 不输出它——必须按 diff 的实际结果
+    /// 断言，只看 Buffer 是抓不到的。
+    #[test]
+    fn a_popup_border_next_to_a_chat_wide_char_reaches_the_terminal() {
+        let area = Rect::new(0, 0, 20, 3);
+        // 上一帧：聊天区把宽字符画在 x=3（占 3-4）。
+        let mut prev = Buffer::empty(area);
+        prev.set_string(3, 1, "息", Style::default());
+        // 本帧：同样的聊天层，浮层左边框落在 x=4。
+        let mut next = Buffer::empty(area);
+        next.set_string(3, 1, "息", Style::default());
+        for y in 0..3 {
+            next[(4, y)].set_symbol("│");
+        }
+        normalize_wide_char_overlaps(&mut next);
+
+        let emitted: Vec<(u16, u16, String)> = prev
+            .diff(&next)
+            .into_iter()
+            .map(|(x, y, c)| (x, y, c.symbol().to_string()))
+            .collect();
+        assert!(
+            emitted
+                .iter()
+                .any(|(x, y, s)| *x == 4 && *y == 1 && s == "│"),
+            "左边框第 1 行没被输出，终端上就是缺口：{emitted:?}"
+        );
+    }
+
+    /// 真实整帧：任何浮层打开后，最终 diff 必须送出完整的左右边框。
+    ///
+    /// 这条覆盖用户实际看到的形态——缺口出现在哪几行取决于下层文字落点，
+    /// 所以按终端宽度 × 高度遍历，逐行验证边框列都被输出。
+    #[test]
+    fn no_popup_border_cell_is_missing_from_the_diff() {
+        use crate::test_support::make_state;
+
+        wyj_i18n::set_locale("zh");
+        let cfg = wyj_config::Config::default();
+        for width in [80u16, 90, 100, 110, 120, 140] {
+            for height in [24u16, 30, 36] {
+                let mut state = make_state();
+                state.config = cfg.clone();
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("TestBackend init");
+                terminal
+                    .draw(|f| draw(f, &mut state, &InputBox::new()))
+                    .expect("first frame");
+                let before = terminal.backend().buffer().clone();
+
+                state.profile_dialog = Some(ProfileDialog::new_for_onboarding(&cfg));
+                // 要断言的是**将被 diff 的那份帧缓冲**，不是 backend 落完盘的结果：
+                // 缺口正是 diff 跳过造成的，从 backend 读回来的那一格早已是空格。
+                let mut after = Buffer::empty(Rect::new(0, 0, width, height));
+                terminal
+                    .draw(|f| {
+                        draw(f, &mut state, &InputBox::new());
+                        after = f.buffer_mut().clone();
+                    })
+                    .expect("second frame");
+
+                let emitted: std::collections::HashSet<(u16, u16)> = before
+                    .diff(&after)
+                    .into_iter()
+                    .map(|(x, y, _)| (x, y))
+                    .collect();
+
+                // 与 `draw_profile_dialog` 同一条宽度公式。
+                let dialog_width = (width * 8 / 10).clamp(60, 110).min(width);
+                let left = (width - dialog_width) / 2;
+                let right = left + dialog_width - 1;
+                for y in 0..height {
+                    for edge in [left, right] {
+                        let symbol = after[(edge, y)].symbol();
+                        if symbol != "│" {
+                            continue;
+                        }
+                        assert!(
+                            emitted.contains(&(edge, y)),
+                            "{width}x{height}: 边框格 ({edge},{y}) 存在于 Buffer 却不在 diff 里，\
+                             终端上就是缺口"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
