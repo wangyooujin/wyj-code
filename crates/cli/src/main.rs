@@ -1732,6 +1732,24 @@ async fn main() -> Result<()> {
     let history_store = HistoryStore::for_project(history_root, &cwd).ok();
     let session_store = SessionStore::for_project(sessions_root.clone(), &cwd).ok();
 
+    // CAS blob pool：按 SHA-256 内容寻址去重 checkpoint 内 workspace 文件字节。
+    // 21 checkpoint × 256 文件 = 5376 份冗余 → 256 份唯一，实测单 session 从
+    // 223MB 降到 < 5MB。CAS root 不可写时 capture_files 走 inline 兜底。
+    //
+    // **必须在 resume 的 `SessionStore::load` 之前创建并注入全局**：
+    // `load` 会调 `materialize_elided` / `materialize_block_with` 把落盘时外化的
+    // `cas://<hash>` 占位符还原成真实 base64，而这两个函数从
+    // `current_externalize_cas()` 读全局 CAS。若 CAS 仍晚到（此前它在这里之后
+    // 才创建），resume 拿到的是字面量 `cas://abc...`，随后 OpenAI provider 把它
+    // 当 base64 拼进 `data:image/...;base64,cas://...`，端点解码 `:` 失败报
+    // `illegal base64 data at input byte 3`——会话恢复后第一次请求即崩。
+    let workspace_cas = wyj_core::workspace_cas::WorkspaceCas::open_silently(
+        &config_base.join("cas"),
+        cfg.storage.cas_max_blob_bytes,
+    )
+    .map(std::sync::Arc::new);
+    wyj_core::serialize::set_externalize_cas(workspace_cas.clone());
+
     // 根据 --continue/-c 或 --resume 恢复历史会话。
     // `session_conflict` 记下「该会话正被另一个实例使用」，交给 TUI 在启动横幅之后
     // 弹窗让用户决定——此时终端还没进 alternate screen，任何提示都还看得见。
@@ -1841,14 +1859,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    // CAS blob pool:按 SHA-256 内容寻址去重 checkpoint 内 workspace 文件字节。
-    // 21 checkpoint × 256 文件 = 5376 份冗余 → 256 份唯一,实测单 session 从
-    // 223MB 降到 < 5MB。CAS root 不可写时 capture_files 走 inline 兜底。
-    let workspace_cas = wyj_core::workspace_cas::WorkspaceCas::open_silently(
-        &config_base.join("cas"),
-        cfg.storage.cas_max_blob_bytes,
-    )
-    .map(std::sync::Arc::new);
+    // CAS blob pool 已在上方 resume 之前创建并注入全局（见「必须在 resume 的
+    // `SessionStore::load` 之前」的注释）。这里只继续挂启动期容量回收。
+    //
     // v0.2.26：CAS 启动期容量回收。`gc` 只回收 `ref_count == 0` 的 blob，
     // 而 ref_count 靠"会话结束时逐个 release"归零 —— 两个机制缺一，pool 就是
     // 无界增长。此前 `cas_total_bytes` / `cas_gc_on_start` 因"无消费点"被删，

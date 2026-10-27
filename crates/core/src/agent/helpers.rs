@@ -10,6 +10,7 @@
 //! 可见性一律 `pub(super)`：只有 `agent` 模块及其子模块（含测试）能看见，
 //! 不进 crate 公共 API。
 
+use crate::compact::estimate_text_tokens;
 use crate::session::Session;
 use wyj_api::types::ContentBlock;
 
@@ -36,20 +37,55 @@ pub(super) fn has_visible_output(blocks: &[ContentBlock]) -> bool {
     })
 }
 
-/// 输出被截断重试时把 reasoning effort 降到该厂商支持的下一档。
+/// 该端点**是否无法关闭思考**（强制思考）。
 ///
-/// 不能按 `max → high → medium → low` 的字符串阶梯硬走：各 vendor 的
-/// `effort_levels` 并不一致（Moonshot k3 只有 low/high/max），硬阶梯会
-/// 落在一个端点不认的档位上，被 adapter 静默丢弃——等于降档从未发生，
-/// 第二次重试大概率又被 reasoning 吃光预算。因此直接在档位表里取前一档。
+/// 判据走 `wyj_api::can_disable_thinking` 的唯一真值来源，而不是在 helpers 里
+/// 再写一份 `user_can_disable` / `control` 的判定——那张表已经是「能不能关」的
+/// 权威，另写一份必然漂移。截断重试与预防性降档都用它分流：关得掉就直接
+/// `text_only` 把思考让位给正文，关不掉才退到降 effort 档位。
+pub(super) fn thinking_cannot_be_disabled(identity: &wyj_api::ModelIdentity) -> bool {
+    !wyj_api::can_disable_thinking(identity)
+}
+
+/// 取 vendor effort 档位表里**最弱**的一档。
 ///
-/// `None` 表示已是最低档，或当前值不在这张表里（保持原值即可）。
-pub(super) fn downgrade_reasoning_effort(
-    levels: &[wyj_api::ReasoningEffort],
-    current: &str,
-) -> Option<&'static str> {
-    let index = levels.iter().position(|level| level.as_str() == current)?;
-    index.checked_sub(1).map(|prev| levels[prev].as_str())
+/// 不能直接取 `levels.first()`：各 vendor 手写的档位表顺序不保证从弱到强
+/// （Moonshot 是 low/high/max、MiniMax M3.1 是 low/medium/high/xhigh/max）。
+/// 这里按固定的强弱阶梯找表里最弱档，确保「把思考压到最低」真正落到最低，
+/// 而不是碰运气取到表里第一个。`adaptive` 不在阶梯上（它是服务端自决语义，
+/// 不是强度），刻意跳过。
+///
+/// 供截断重试（关不掉思考时）与第三层预防性降档共用。
+pub(super) fn lowest_reasoning_effort(levels: &[wyj_api::ReasoningEffort]) -> Option<&'static str> {
+    const LADDER: &[wyj_api::ReasoningEffort] = &[
+        wyj_api::ReasoningEffort::Minimal,
+        wyj_api::ReasoningEffort::Low,
+        wyj_api::ReasoningEffort::Medium,
+        wyj_api::ReasoningEffort::High,
+        wyj_api::ReasoningEffort::XHigh,
+        wyj_api::ReasoningEffort::Max,
+    ];
+    LADDER
+        .iter()
+        .find(|level| levels.contains(level))
+        .map(|level| level.as_str())
+}
+
+/// 历史里**回传的思考链**（`echo_back_in_messages` 的 assistant thinking 块）
+/// 累计的粗估 token 数。第三层预防性降档用它当「长历史」的判据——只统计
+/// thinking / redacted_thinking，因为回传给模型、从而放大下一轮思考长度的
+/// 正是这部分，而不是 tool_result 正文。
+pub(super) fn estimated_thinking_backlog_tokens(session: &Session) -> usize {
+    session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => estimate_text_tokens(thinking),
+            ContentBlock::RedactedThinking { data } => data.len() / 4,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// 思考关不掉的模型在工具循环中容易陷入 reasoning-token 黑洞：每轮
