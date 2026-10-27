@@ -181,6 +181,7 @@ agent:
   output_truncated_retrying: "\n[本轮输出被 max_tokens 截断、只剩思考过程，已放大输出预算并降低 reasoning 强度后重试一次…]\n"
   output_without_visible_content: "\n[模型这一轮没有给出任何可见正文（只有思考过程），回合已结束。原因通常是输出预算被 reasoning 吃满——可把 max_tokens 调大或降低 reasoning_effort 后再发一次。]\n"
   output_truncated: "\n[回复达到了 max_tokens 输出上限，正文可能被截断——需要完整结果时把 max_tokens 调大或降低 reasoning_effort 后再试。]\n"
+  preemptive_thinking_floor: "\n[会话里回传的思考链已经很长，为避免单次输出被思考吃满，已自动把 reasoning 降到最低档。]\n"
   turn_budget_wrap_up: "\n[本次提交的工具循环已用掉 {turn}/{max} 轮，已要求模型停止调用工具并立即总结当前进度]\n"
   invalid_arguments_wrap_up: "\n[工具参数连续校验失败，已要求模型修正参数形态或改用其他方案，并交付当前进度]\n"
   acceptance_passed: "\n[验收通过：{total} 条判据全部满足]\n"

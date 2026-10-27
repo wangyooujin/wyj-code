@@ -4353,7 +4353,7 @@ fn memory_snapshot_is_shared_across_agent_clones() {
 /// 按预置脚本逐次回放事件，并记录每次请求**实际发出**的输出参数。
 struct TruncatedScriptProvider {
     script: Mutex<Vec<Vec<StreamEvent>>>,
-    seen: Mutex<Vec<(u32, Option<String>)>>,
+    seen: Mutex<Vec<(u32, Option<String>, Option<String>)>>,
 }
 
 impl TruncatedScriptProvider {
@@ -4365,6 +4365,15 @@ impl TruncatedScriptProvider {
     }
 
     fn requests(&self) -> Vec<(u32, Option<String>)> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(max_tokens, effort, _)| (*max_tokens, effort.clone()))
+            .collect()
+    }
+
+    fn requests_full(&self) -> Vec<(u32, Option<String>, Option<String>)> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -4392,7 +4401,11 @@ impl Provider for TruncatedScriptProvider {
         self.seen
             .lock()
             .unwrap()
-            .push((opts.max_tokens, opts.reasoning_effort.clone()));
+            .push((
+                opts.max_tokens,
+                opts.reasoning_effort.clone(),
+                opts.thinking_switch.clone(),
+            ));
         let events = {
             let mut script = self.script.lock().unwrap();
             if script.is_empty() {
@@ -4453,9 +4466,19 @@ async fn truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history()
         provider.requests(),
         vec![
             (1024, Some("high".to_string())),
-            (2048, Some("medium".to_string())),
+            (2048, None),
         ],
-        "只重试一次，且同时放大预算并降一档 reasoning"
+        "只重试一次，预算翻倍，且关得掉思考的端点第二次走 text_only 把 effort 清空"
+    );
+    // deepseek-v4-pro 关得掉思考：重试必须把 thinking_switch 置为 disabled，
+    // 让正文独占输出预算，而不是只降一档 effort。
+    assert_eq!(
+        provider.requests_full(),
+        vec![
+            (1024, Some("high".to_string()), None),
+            (2048, None, Some("disabled".to_string())),
+        ],
+        "重试请求必须带 thinking_switch=disabled 关掉思考"
     );
     assert_eq!(session.messages.len(), 2, "user + 最终 assistant");
     let last = session.messages.last().unwrap();
@@ -4568,45 +4591,91 @@ fn has_visible_output_ignores_thinking_and_blank_text() {
 }
 
 #[test]
-fn downgrade_reasoning_effort_walks_the_vendor_table() {
+fn lowest_reasoning_effort_picks_the_weakest_supported_level() {
+    // DeepSeek 档位表 low/medium/high/max → 最低是 low。
     let deepseek = wyj_api::ThinkingSpec::for_vendor(
         "deepseek",
         &wyj_config::WireProtocol::OpenAiChatCompletions,
         "deepseek-v4-pro",
     );
-    assert_eq!(
-        downgrade_reasoning_effort(deepseek.effort_levels, "max"),
-        Some("high")
-    );
-    assert_eq!(
-        downgrade_reasoning_effort(deepseek.effort_levels, "high"),
-        Some("medium")
-    );
-    assert_eq!(
-        downgrade_reasoning_effort(deepseek.effort_levels, "low"),
-        None,
-        "已是最低档"
-    );
-    assert_eq!(
-        downgrade_reasoning_effort(deepseek.effort_levels, "adaptive"),
-        None,
-        "不在该厂商档位表里的值保持原样"
-    );
+    assert_eq!(lowest_reasoning_effort(deepseek.effort_levels), Some("low"));
 
-    // Moonshot k3 只有 low/high/max：硬编码 max→high→medium 阶梯会落到
-    // 端点不认的 medium 上被静默丢弃，必须按表取前一档。
+    // Moonshot k3 档位表 low/high/max → 最低仍是 low（不是表里第一个 max）。
     let k3 = wyj_api::ThinkingSpec::for_vendor(
         "moonshot",
         &wyj_config::WireProtocol::OpenAiChatCompletions,
         "kimi-k3",
     );
-    assert_eq!(
-        downgrade_reasoning_effort(k3.effort_levels, "high"),
-        Some("low")
+    assert_eq!(lowest_reasoning_effort(k3.effort_levels), Some("low"));
+
+    // GLM 不支持 effort：空档位表 → None。
+    let glm = wyj_api::ThinkingSpec::for_vendor(
+        "zhipu",
+        &wyj_config::WireProtocol::OpenAiChatCompletions,
+        "glm-4.6",
     );
-    assert_eq!(
-        downgrade_reasoning_effort(k3.effort_levels, "max"),
-        Some("high")
+    assert_eq!(lowest_reasoning_effort(glm.effort_levels), None);
+}
+
+#[test]
+fn thinking_cannot_be_disabled_tracks_the_vendor_table() {
+    // DeepSeek reasoner 强制思考，关不掉。
+    let reasoner = wyj_api::ModelIdentity {
+        vendor: "deepseek".to_string(),
+        model: "deepseek-reasoner".to_string(),
+        base_url: "https://api.deepseek.com".to_string(),
+        wire_protocol: wyj_config::WireProtocol::OpenAiChatCompletions,
+    };
+    assert!(thinking_cannot_be_disabled(&reasoner));
+
+    // MiniMax M3.1-Flash（/anthropic 线）发 disabled 直接 400，等同关不掉。
+    let m31 = wyj_api::ModelIdentity {
+        vendor: "minimax".to_string(),
+        model: "MiniMax-M3.1-Flash".to_string(),
+        base_url: "https://api.minimaxi.com/anthropic".to_string(),
+        wire_protocol: wyj_config::WireProtocol::AnthropicMessages,
+    };
+    assert!(thinking_cannot_be_disabled(&m31));
+
+    // deepseek-v4-pro 不是强制思考，关得掉。
+    let v4 = wyj_api::ModelIdentity {
+        vendor: "deepseek".to_string(),
+        model: "deepseek-v4-pro".to_string(),
+        base_url: "https://api.deepseek.com".to_string(),
+        wire_protocol: wyj_config::WireProtocol::OpenAiChatCompletions,
+    };
+    assert!(!thinking_cannot_be_disabled(&v4));
+}
+
+#[test]
+fn estimated_thinking_backlog_counts_only_thinking_blocks() {
+    use wyj_api::types::{ContentBlock, Message, Role};
+
+    let thinking = "思".repeat(3000);
+    let session = {
+        let mut s = crate::session::Session::new();
+        push_user_text(&mut s, "hi");
+        s.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: thinking.clone(),
+                    signature: String::new(),
+                    reasoning_details: None,
+                },
+                ContentBlock::Text {
+                    text: "正文不计入".to_string(),
+                },
+            ],
+        });
+        s
+    };
+    let backlog = estimated_thinking_backlog_tokens(&session);
+    assert!(backlog > 0, "thinking 块必须计入 backlog");
+    // 3000 个 CJK 字 × 1.5 token/字 = 4500，正文不在统计内，backlog 应接近 4500。
+    assert!(
+        (4000..=5000).contains(&backlog),
+        "backlog 只算 thinking，正文不混入: {backlog}"
     );
 }
 

@@ -1657,6 +1657,10 @@ impl Agent {
         // false 从而变成无限重试。
         let mut truncation_retry_used = false;
         let mut truncation_retry = false;
+        // 第三层预防性降档的标志：长历史 + 强制思考模型时，主动把思考压到
+        // 最低档，避免「思考链越回传越长 → 单次思考吃满 max_tokens」的正反馈。
+        // 声明在循环外：提示只在第一次触发时发一次，之后每轮静默沿用降档。
+        let mut preemptive_thinking_floor = false;
         loop {
             turn += 1;
             if turn > max_turns {
@@ -1838,32 +1842,87 @@ impl Agent {
                         interleaved: route.interleaved_thinking,
                     }
                 };
-                // 截断重试：预算翻倍（不超过端点声明的上限）并降一档 reasoning
-                // effort。两个动作都做——只放大预算救不回「模型把新预算又全花在
-                // 思考上」，只降 effort 则在某些端点上不改变实际输出上限。
-                // `opts` 每轮 attempt 重建，标志在这里消费完即清，不会溢到下一轮。
-                if truncation_retry {
-                    truncation_retry = false;
-                    let doubled = opts.max_tokens.saturating_mul(2);
-                    opts.max_tokens = match &route.capabilities {
-                        Some(cap) => doubled.min(cap.max_output_tokens),
-                        None => doubled,
-                    };
-                    if let Some(current) = opts.reasoning_effort.as_deref() {
+                // 第三层：长历史 + 强制思考模型 → 预防性把 reasoning 压到最低档。
+                //
+                // 为什么只对「强制思考」模型做：关得掉思考的端点不依赖思考链
+                // 回传（`text_only` 时 `echo_back_in_messages` 也发不出），不会形成
+                // 「思考越回传越长」的正反馈；强制思考模型的思考无法关闭，历史里
+                // 的 thinking 全量回传、又会被下一轮再想一遍，正反馈在这里最明显。
+                //
+                // 判据走「回传思考链的累计粗估」而不是历史总 token：真正放大下一轮
+                // 思考长度的正是 assistant thinking 块，不是 tool_result 正文。
+                //
+                // 只在第一次触发时发提示，之后每轮静默沿用；不等撞线再补救，也不
+                // 降 reasoning 关不掉时的正文预算——那部分仍归上面的截断重试兜底。
+                if !preemptive_thinking_floor
+                    && !truncation_retry
+                    && thinking_cannot_be_disabled(&route_identity)
+                {
+                    let backlog = estimated_thinking_backlog_tokens(session);
+                    // 32K 是「思考链本身已经逼近单次输出预算」的保守门槛：低于它
+                    // 撞线的概率不高，降档反而白损思考质量。
+                    const PREEMPTIVE_THINKING_BACKLOG: usize = 32_000;
+                    if backlog >= PREEMPTIVE_THINKING_BACKLOG {
+                        preemptive_thinking_floor = true;
                         let spec = wyj_api::ThinkingSpec::for_vendor(
                             &route_identity.vendor,
                             &route_identity.wire_protocol,
                             &route_identity.model,
                         );
-                        if let Some(lower) = downgrade_reasoning_effort(spec.effort_levels, current)
-                        {
-                            opts.reasoning_effort = Some(lower.to_string());
+                        if let Some(lowest) = lowest_reasoning_effort(spec.effort_levels) {
+                            opts.reasoning_effort = Some(lowest.to_string());
+                            tracing::warn!(
+                                model = %route_identity.model,
+                                backlog_tokens = backlog,
+                                effort = lowest,
+                                "回传思考链已达 {} tokens，预防性把 reasoning 压到最低档",
+                                PREEMPTIVE_THINKING_BACKLOG
+                            );
+                            on_text(&wyj_i18n::tr("agent.preemptive_thinking_floor"));
                         }
+                    }
+                }
+                // 截断重试：预算翻倍，并把思考彻底让位给正文。
+                //
+                // 两个动作都做——只放大预算救不回「模型把新预算又全花在思考上」，
+                // 只降思考则在某些端点上不改变实际输出上限。
+                //
+                // 预算翻倍**不能用 `capabilities.max_output_tokens` 封顶**：那字段
+                // 目前恒等于用户配置的 `profile.max_tokens`（`model_catalog.rs`），
+                // 用它封顶等于重试发出与第一次完全相同的预算，必然撞同一条线。
+                // 这里翻倍后只做 `saturating_mul` 防溢出，交给 provider 侧去截断
+                // 端点的真实硬上限。
+                //
+                // 思考让位的两步分流：
+                // ① 端点关得掉思考（`can_disable_thinking`）→ `text_only` 把
+                //    budget / effort / switch 全清、`thinking_switch=disabled`，
+                //    让正文独占输出预算；
+                // ② 强制思考（MiniMax M2.x/M3.1、DeepSeek reasoner、Qwen
+                //    `-thinking` 等）关不掉 → 降到该 vendor 档位表里**最弱**的
+                //    一档，而不是只降一档（`high→medium` 对 reasoning 模型几乎
+                //    不改变单次思考长度）。
+                //
+                // `opts` 每轮 attempt 重建，标志在这里消费完即清，不会溢到下一轮。
+                if truncation_retry {
+                    truncation_retry = false;
+                    opts.max_tokens = opts.max_tokens.saturating_mul(2);
+                    let spec = wyj_api::ThinkingSpec::for_vendor(
+                        &route_identity.vendor,
+                        &route_identity.wire_protocol,
+                        &route_identity.model,
+                    );
+                    if thinking_cannot_be_disabled(&route_identity) {
+                        if let Some(lowest) = lowest_reasoning_effort(spec.effort_levels) {
+                            opts.reasoning_effort = Some(lowest.to_string());
+                        }
+                    } else {
+                        opts = wyj_api::provider::RequestOptions::text_only(opts.max_tokens);
                     }
                     tracing::info!(
                         max_tokens = opts.max_tokens,
                         effort = opts.reasoning_effort.as_deref().unwrap_or("-"),
-                        "上一条回复被 max_tokens 截断且没有可见内容，放大输出预算后重试"
+                        switch = opts.thinking_switch.as_deref().unwrap_or("-"),
+                        "上一条回复被 max_tokens 截断且没有可见内容，放大输出预算并让思考让位后重试"
                     );
                 }
                 let (request_tools, candidate_tools) = self.tools_for_request(&route);
