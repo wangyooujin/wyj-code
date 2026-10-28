@@ -73,6 +73,28 @@ benchmarks/compare.sh <baseline> <candidate>
 - 面向用户的文案（TUI 对话框、slash 命令输出、CLI `--help`）需要走 i18n（`tr()` key），
   不要硬编码中文或英文字符串。
 
+## 密钥与凭据
+
+**不要提交任何真实凭据**——API Key、token、私有 endpoint、带密码的连接串都不行，
+包括测试文件、README 示例和注释里的"临时这么写一下"。
+
+本地开发用的密钥放两处之一：
+
+- 环境变量（如 `WYJ_CODE_API_KEY`）；
+- `~/.wyj-code/config.toml`（仓库外的全局配置，不受 git 管理）。
+
+配置类仓库文件（`.wyj-code/settings.toml` 等）只写占位符，例如 `api_key = "your_ark_key"`。
+
+提交前会自动扫描：执行一次 `./scripts/install-git-hooks.sh` 装上 `pre-commit` 钩子
+（需要 `brew install gitleaks`）。CI 的 `secret-scan.yml` 会在每次 push / PR 上
+扫描**全历史**，即使本地用 `--no-verify` 绕过也会被拦下。
+
+规则在 `.gitleaks.toml`。确认是误报（测试里的假 token、占位符）时，把对应模式加进
+`[allowlist]`，而不是关掉扫描。
+
+**已经泄露了怎么办**：先立刻在服务商后台吊销/轮换密钥——清理 git 历史不能让她签发的
+密钥失效。然后再处理历史（`git filter-repo --replace-text`）。
+
 ## 提交 PR
 
 1. Fork 仓库，基于 `master` 建特性分支。

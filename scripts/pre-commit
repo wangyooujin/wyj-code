@@ -1,0 +1,32 @@
+#!/bin/sh
+# 提交前扫描暂存内容里的明文凭据。
+#
+# 由 `./scripts/install-git-hooks.sh` 装到 .git/hooks/pre-commit。
+# 用 `git commit --no-verify` 可以临时绕过，但 CI 上的 secret-scan.yml 仍会拦。
+
+set -e
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: 未安装 gitleaks，跳过密钥扫描。"
+  echo "  macOS: brew install gitleaks"
+  echo "  其他:  https://github.com/gitleaks/gitleaks#installing"
+  exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+if ! gitleaks git --config .gitleaks.toml --staged --no-banner --redact; then
+  cat >&2 <<'EOF'
+
+✗ 密钥扫描拦下了这次提交。
+
+上方列出了被判定为凭据的行。请：
+  1. 把密钥移出仓库（改用环境变量或 ~/.wyj-code/config.toml）
+  2. git add 修改后的文件后重新提交
+
+如果确认是误报（测试里的假 token 等），把它加进 .gitleaks.toml 的 allowlist。
+不要用 --no-verify 绕过——CI 同样会拦，而且真泄露进 git 历史后清理代价极高。
+EOF
+  exit 1
+fi

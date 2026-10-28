@@ -1,0 +1,72 @@
+# gitleaks 配置：本地 pre-commit 与 CI 共用同一份规则。
+#
+# 为什么要自建规则：仓库历史上曾把一个 zshrc 片段（`alias model_xxx='export ...'`）
+# 提交进 git，里面是明文 API Key。gitleaks 默认规则集不认识 Volcengine Ark
+# （`ark-<uuid>-<digits>`）这类私有格式，默认配置下扫不出来。
+#
+# 用 `gitleaks git --config .gitleaks.toml --redact`（历史扫描）或
+# `gitleaks dir --config .gitleaks.toml`（工作区扫描）调用。
+
+title = "wyj-code secret scanning"
+
+[extend]
+# 继承官方默认规则集（AWS / GitHub / Slack / PEM / 通用高熵串等），再叠加本项目规则。
+useDefault = true
+
+[[rules]]
+id = "volcengine-ark-api-key"
+description = "Volcengine Ark API key (ark-<uuid>-<suffix>)"
+regex = '''ark-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9]{4,}'''
+keywords = ["ark-"]
+
+[[rules]]
+id = "minimax-cp-api-key"
+description = "MiniMax Coding Plan API key (sk-cp-...)"
+regex = '''sk-cp-[A-Za-z0-9_-]{8,}'''
+keywords = ["sk-cp-"]
+
+[[rules]]
+id = "tavily-api-key"
+description = "Tavily search API key"
+regex = '''tvly-[A-Za-z0-9]{20,}'''
+keywords = ["tvly-"]
+
+[[rules]]
+id = "anthropic-auth-token-env"
+description = "Anthropic/Ark 兼容端点的 AUTH_TOKEN 明文赋值"
+regex = '''(?i)(?:ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY)\s*[=:]\s*["']?([A-Za-z0-9_\-]{20,})'''
+keywords = ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+
+[[rules]]
+id = "generic-export-credential"
+description = "shell export 中的明文凭据（本仓库历史泄漏正是这种形态）"
+regex = '''(?i)export\s+[A-Z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD)[A-Z0-9_]*\s*=\s*["']([^"'$\s]{16,})["']'''
+keywords = ["export "]
+
+[allowlist]
+description = "已知安全内容 / 测试占位符"
+paths = [
+  # 依赖锁文件里没有凭据
+  '''(?i).*\.lock$''',
+  # 扫描配置自身必须包含规则字面量
+  '''(^|/)\.gitleaks\.toml$''',
+  # 构建产物与依赖目录：`gitleaks dir` 不读 .gitignore，不排掉会把 8GB target/ 全扫一遍
+  '''(^|/)target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.git/''',
+  '''(^|/)dist/''',
+]
+regexTarget = "line"
+regexes = [
+  # AWS 官方文档示例键
+  '''AKIAIOSFODNN7EXAMPLE''',
+  # 占位符形态的键值（`your_ark_key` / `sk-xxx` / `sk-ant-xxx` / `tvly-xxxxxxxx`）
+  '''(?i)(?:your|xxx|placeholder|dummy|fake|example|test)[-_]?(?:key|token|secret)''',
+  '''sk-ant-x{3,}''',
+  '''sk-x{3,}''',
+  '''tvly-x{5,}''',
+  # Rust 测试里用重复字符构造的假 token（"sk-" + "A".repeat(32) 的结果形态）
+  '''sk-[A-Za-z]{32,}''',
+  # 历史清理时写入的脱敏占位符（`REDACTED-VOLCENGINE-ARK-KEY` 等）
+  '''REDACTED[-_A-Z0-9]*''',
+]
