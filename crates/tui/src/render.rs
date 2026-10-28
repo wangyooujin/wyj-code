@@ -2842,7 +2842,27 @@ fn draw_chat(f: &mut Frame, state: &mut AppState, area: Rect) {
     let para = Paragraph::new(Text::from(visible))
         .wrap(Wrap { trim: false })
         .scroll((intra.min(u16::MAX as usize) as u16, 0));
-    f.render_widget(para, area);
+    // 内容不足一屏时**贴底**绘制。聊天区矩形被 `Constraint::Min(3)` 撑到输入框
+    // 上方，若一律从第 0 行画起，剩余高度就整块堆在内容之下；而 Todo 面板是挂在
+    // **聊天流尾部**的（`push_inline_todo_lines`），agents 面板又是贴在底部的固定
+    // 面板（`BottomPanel::SubAgents`），用户看到的就是「tasklist 与 agents 之间
+    // 空出一大段」——空白不属于任何一方，却是两者夹出来的。贴底后聊天流紧贴输入
+    // 框，与 Claude Code 的观感一致；内容超过一屏时 `pad` 恒为 0，滚动语义不变。
+    //
+    // 欢迎页例外：它是空会话的落地画面，`render_welcome` 自己排了
+    // `TOP_BLANK_LINES` 让 logo 落在上 1/3，再贴底会把整页压到窗口下半部。
+    let pad = if should_show_welcome(state) {
+        0
+    } else {
+        area.height
+            .saturating_sub(total_height.min(u16::MAX as usize) as u16)
+    };
+    let content_area = Rect {
+        y: area.y + pad,
+        height: area.height - pad,
+        ..area
+    };
+    f.render_widget(para, content_area);
     state.content_scrollbar = if state.show_scrollbar {
         draw_scrollbar(f, area, state.chat_scroll, max_scroll, content_height)
     } else {
@@ -7725,12 +7745,20 @@ mod cost_panel_render_tests {
             prompt_drift: None,
             last_latency: Default::default(),
             compact_count: 0,
+            compact_generation: 0,
+            cache_attribution: None,
+            reasoning_tokens: 0,
+            api_attempts: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 51_795,
             sub_output_tokens: 31_723,
             sub_cache_read_tokens: 1_159_231,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -8003,6 +8031,64 @@ mod chat_viewport_tests {
         assert!(
             !text.contains('┃') && !text.contains('│'),
             "短内容不应出现滚动条:\n{text}"
+        );
+    }
+
+    /// 内容不足一屏时聊天流必须**贴底**，不能从视口顶部开始排。
+    ///
+    /// 回归背景：用户报告「tasklist 与 agents 面板中间有一大段空白」。根因不是
+    /// 谁多占了高度，而是 `draw_chat` 一律从 `area.y` 起画——Todo 面板挂在聊天流
+    /// 尾部、agents 面板是贴底固定面板，内容装得下时两者之间的空隙就成了用户眼里
+    /// 的「空白区域」。这里钉的是结果：短内容要落在视口最后一行。
+    #[test]
+    fn short_chat_content_is_bottom_aligned() {
+        let mut state = make_state();
+        state.welcome_frozen = true;
+        state
+            .messages
+            .push(ChatMessage::system("only-line".to_string()));
+        state.chat_follow_tail = true;
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 60, 20);
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines.len(), 20, "视口高度不变，贴底只挪内容位置:\n{text}");
+        assert!(
+            !lines[0].contains("only-line"),
+            "内容不应再从视口第一行开始:\n{text}"
+        );
+        assert!(
+            lines[19].contains("only-line") || lines[19].trim().is_empty(),
+            "内容必须贴近视口底部:\n{text}"
+        );
+        // 空行只出现在上方，下方不应残留一片空白。
+        let last_non_blank = lines
+            .iter()
+            .rposition(|l| !l.trim().is_empty())
+            .expect("必须至少有一行内容");
+        assert!(
+            last_non_blank >= 18,
+            "内容底部到视口底部的空隙不应超过 1 行，实际停在 {last_non_blank}:\n{text}"
+        );
+    }
+
+    /// 欢迎页是例外：它自带 `TOP_BLANK_LINES` 让 logo 落在上 1/3，贴底会把整页
+    /// 压到窗口下半部，反而更怪。
+    #[test]
+    fn welcome_page_is_not_bottom_aligned() {
+        let mut state = make_state();
+        state.chat_follow_tail = true;
+
+        let text = render_to_text(|f| draw_chat(f, &mut state, f.area()), 80, 20);
+        let lines: Vec<&str> = text.lines().collect();
+        let first_non_blank = lines
+            .iter()
+            .position(|l| !l.trim().is_empty())
+            .expect("欢迎页必须有内容");
+
+        assert!(
+            first_non_blank <= 2,
+            "欢迎页必须保留顶部留白布局，不能在 {first_non_blank} 行才开始:\n{text}"
         );
     }
 

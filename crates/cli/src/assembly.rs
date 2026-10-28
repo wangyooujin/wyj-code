@@ -156,6 +156,19 @@ pub struct SharedAgentConfig<'a> {
     /// 进程级累计器），这里只负责挂上，避免两条路径各算一次而参数不同。
     pub context_edit: Option<wyj_core::context_edit::ContextEditCfg>,
     pub plugin_output_style: Option<String>,
+    /// 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）的统一用量累加器。
+    ///
+    /// 必须走这里而不是首建路径：`/model` 重建出的 Agent 若拿不到同一个
+    /// `Arc`，换模型之后那些辅助往返就记不进任何地方了。`None` = 未装配
+    /// （测试路径），辅助往返不记账但不影响功能。
+    pub aux_usage: Option<wyj_core::aux_usage::SharedAuxUsage>,
+    /// 会话滚动工作文档。`Some` 时压缩优先 splice 它（省一次全量摘要往返），
+    /// 并每 4 轮增量更新一次。
+    ///
+    /// 走 `SharedAgentConfig` 而不是只在首建时装：`/model` 重建出的 Agent
+    /// 若拿不到同一个文档，压缩就会在换模型后突然退回全量摘要——用户看到
+    /// 的是「换了模型成本就变了」，而真实原因是装配漏了一项。
+    pub session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
 }
 
 impl SharedAgentConfig<'_> {
@@ -189,6 +202,8 @@ impl SharedAgentConfig<'_> {
         if let Some(evolution) = &self.evolution {
             agent = agent.with_evolution(evolution.clone());
         }
+        agent = agent.with_aux_usage(self.aux_usage);
+        agent = agent.with_session_memory(self.session_memory.clone());
         agent.with_capability_cache(Some(self.capability_cache))
     }
 }
@@ -207,6 +222,8 @@ pub struct AgentCoreConfig {
     pub max_turns: usize,
     /// 强制思考端点的单回合熔断轮数（`[agent].forced_thinking_max_turns`）。
     pub forced_thinking_max_turns: usize,
+    /// 花费熔断闸（金额 + 输出 token）。默认全关，见 `wyj_core::budget`。
+    pub budget_limits: wyj_core::budget::BudgetLimits,
     pub capabilities: wyj_api::capabilities::ModelCapabilities,
     pub route_profile: String,
     pub route_vendor: String,
@@ -238,6 +255,7 @@ impl AgentCoreConfig {
             .with_context_window(self.context_window)
             .with_max_turns(self.max_turns)
             .with_forced_thinking_max_turns(self.forced_thinking_max_turns)
+            .with_budget_limits(self.budget_limits)
             .with_model_capabilities(self.capabilities)
             .with_route_identity(
                 self.route_profile,

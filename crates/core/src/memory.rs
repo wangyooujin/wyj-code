@@ -45,6 +45,9 @@ pub struct MemoryStore {
     last_extract_msg_count: std::sync::atomic::AtomicUsize,
     /// Retention 配置（builder 模式注入；None 时 enforce_retention 跳过）
     storage_cfg: std::sync::RwLock<Option<wyj_config::StorageRetentionCfg>>,
+    /// 辅助往返用量累加器（v2 路径只在 v3 构造失败时作为降级启用，
+    /// 但降级路径同样会发 LLM 请求，同样要记账）。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
 }
 
 impl MemoryStore {
@@ -59,7 +62,14 @@ impl MemoryStore {
             context_snapshot: std::sync::OnceLock::new(),
             last_extract_msg_count: std::sync::atomic::AtomicUsize::new(0),
             storage_cfg: std::sync::RwLock::new(None),
+            aux_usage: None,
         })
+    }
+
+    /// 注入辅助往返用量累加器（装配期调用）。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
+        self
     }
 
     /// 注入 retention 配置（CLI 装配阶段调用一次）。后续 `extract_and_save`
@@ -194,6 +204,11 @@ impl MemoryStore {
                 &wyj_api::provider::RequestOptions::text_only(4096),
             )
             .await?;
+
+        // 记账在解析之前：往返已完成、token 已花掉，解析失败不退费。
+        if let Some(sink) = self.aux_usage.as_ref() {
+            sink.record_result(&result);
+        }
 
         let output: String = result
             .content

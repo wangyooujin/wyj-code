@@ -165,6 +165,17 @@ pub struct CommandContext {
     pub last_latency: wyj_core::session::TurnLatency,
     /// 本会话自动压缩发生次数。
     pub compact_count: u32,
+    /// 缓存命中率掉量的归因结论。`None` = 没掉、或样本不足。
+    ///
+    /// 它回答的是「缓存为什么掉了」——这个答案决定用户该做什么
+    /// （改配置 / 关插件 / 什么都不用做，等缓存 TTL 过期即可）。
+    pub cache_attribution: Option<wyj_core::cache_attribution::CacheAttribution>,
+    /// 当前摘要的代际（0 = 未压缩；1 = 首代；2+ = 摘要的摘要）。
+    ///
+    /// 与 `compact_count` 分开：前者是「压了几次」，后者是「摘要叠了几层」。
+    /// 超 [`wyj_core::compact::MAX_COMPACT_GENERATIONS`] 时面板要提示
+    /// 「模型看到的是地图而非记录」——这是用户唯一能察觉保真度下降的地方。
+    pub compact_generation: u32,
     /// 本会话 tool-result context editing 的 `(清理条数, 释放的估算 token)`。
     pub context_edit: (u32, u32),
     pub home_dir: std::path::PathBuf,
@@ -177,10 +188,32 @@ pub struct CommandContext {
     /// 命中；且它只活在内存里，`/resume` 后归零。
     pub sub_input_tokens: u32,
     pub sub_output_tokens: u32,
+    /// 本会话累计**发起过**的模型请求次数（含失败重试）。
+    ///
+    /// 与 `api_calls`（成功往返数）的差值 = 失败/重试次数。它回答
+    /// 「端点在拒绝还是抖动」——与成本口径无关。
+    pub api_attempts: u32,
+    /// 本会话累计的**思考** token（输出的子集，用户不可见）。
+    ///
+    /// Anthropic 线不上报（它的 output 已含 thinking），那里恒为 0——
+    /// 面板据此**不显示**思考占比，而不是显示「思考占 0%」这种误导性数字。
+    pub reasoning_tokens: u32,
     /// 子 Agent 命中的缓存 token（0.1x 计费）。
     pub sub_cache_read_tokens: u32,
     /// 子 Agent 写入的缓存 token（1.25x 计费）。
     pub sub_cache_write_tokens: u32,
+    /// **辅助 LLM 往返**累计用量：标题生成、Auto 权限分类器、记忆提取、
+    /// 演化分析。这些调用走 `aux_model` / `classifier_profile` 指定的另一个
+    /// 端点，单价与主模型不同，因此与 `input_tokens` 分开统计、单独成行。
+    ///
+    /// 旧实现完全不计这部分，`/cost` 因此系统性低估真实花费——Auto 模式下
+    /// 分类器每拦一个工具就是一次完整往返，一次会话几十次很常见。
+    pub aux_input_tokens: u32,
+    pub aux_output_tokens: u32,
+    pub aux_cache_read_tokens: u32,
+    /// 辅助往返次数。与 `api_calls` 分开：后者是主推理循环的趟数，是
+    /// 「每次调用带多少上下文」的分母，混进辅助往返会让它系统性偏低。
+    pub aux_calls: u32,
     /// 合并全局+项目配置、过滤禁用条目后实际会连接的 MCP server 数量
     /// （由调用方用 `wyj_store::mcp_install::effective_mcp_servers` 算好传入，
     /// `crates/commands` 本身不依赖 `wyj-store` 以保持 crate 边界干净）。

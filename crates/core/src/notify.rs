@@ -1,8 +1,9 @@
 //! 统一通知通道（v0.2.23+）
 //!
 //! 覆盖 3 类事件源（TUI/CLI 回合完成 / 错误、后台子 Agent 完成），
-//! 通过 [`BellSink`]（stderr `\x07`）和 [`DesktopSink`]（macOS `osascript` / Linux
-//! `notify-send` / Windows PowerShell BurntToast）两类 sink 通知用户。
+//! 通过 [`BellSink`]（stderr `\x07`）和 [`DesktopSink`]（终端原生 OSC 通知，
+//! 回落到 macOS `osascript` / Linux `notify-send` / Windows PowerShell BurntToast）
+//! 两类 sink 通知用户。
 //!
 //! 设计要点：
 //! - **零第三方依赖**——只用 std + 现成系统命令（`osascript` / `notify-send` / `powershell`）
@@ -10,6 +11,43 @@
 //! - **fail-safe init**——`emit` 在未 `init` 时静默 no-op，调用方永远不需要做空指针保护
 //! - **rate-limit**——同类事件按 `cfg.rate_limit_seconds` 最小间隔去重，防滥用
 //! - **i18n**——`title` / `body` 模板在 dispatcher 层渲染，sink 只看最终字符串
+//!
+//! ## 桌面通知为什么优先走终端 OSC（v0.3.24+）
+//!
+//! 「点通知回到 wyj-code 所在终端」只有一个实现方式：**让终端 App 自己当投递者**。
+//! 终端原生 OSC 通知（`OSC 9` / `OSC 777;notify`）满足这一点，点击横幅由终端激活
+//! 自己的窗口并切到发起通知的标签页。
+//!
+//! 系统命令路径做不到：`osascript -e 'display notification'` 的投递者是
+//! `/usr/bin/osascript`，它的内嵌 Info.plist 声明 `CFBundleIdentifier =
+//! com.apple.osascript`，但磁盘上**没有任何 .app 声明这个 id**（`mdfind` 空、
+//! `path to application id "com.apple.osascript"` 报 `-1728`）。点击时通知中心要
+//! activate 投递者，LaunchServices 解析不到，于是退化成「选择应用/文件」的 open
+//! 面板——用户点了通知却被迫挑文件。改命令行参数救不了：即便解析得到，被激活的
+//! 也是 `osascript`，不是用户所在的终端。
+//!
+//! 因此 `desktop.prefer_terminal`（默认 true）先试终端 OSC，终端不支持 / 在
+//! tmux·Zellij 内 / 无 tty 时**静默回落**系统命令——此时通知仍会弹出，只是点击
+//! 不再跳转。
+//!
+//! ### ⚠️ 终端通知权限被拒时，通知会**整条消失**
+//!
+//! OSC 通道走的是终端 App 自己的通知权限。macOS 上若该权限被拒，终端会在内部
+//! 把它丢掉，**wyj-code 侧完全无法探测**——`/dev/tty` 写入成功，`terminal_notify`
+//! 返回 `Ok`，于是不回落、也不报错。系统日志里的特征是：
+//!
+//! ```text
+//! ghostty: Error while requesting notification authorization:
+//!   Error Domain=UNErrorDomain Code=1 "Notifications are not allowed for this application"
+//! ```
+//!
+//! 排查命令：
+//! `log show --last 60s --predicate 'subsystem CONTAINS[c] "ghostty"'`
+//!
+//! 修复在用户侧：系统设置 → 通知 → 该终端 → 允许通知。确实不想开、又需要通知
+//! 时把 `[notify.desktop] prefer_terminal` 设为 `false` 退回系统命令——此时通知
+//! 能弹出，但点击又会回到「选择应用」面板（见上）。两者不可兼得，OSC 是唯一
+//! 同时满足「能弹出」与「点击回到终端」的路径。
 //!
 //! ## 触发点清单（6 sites）
 //! 1. TUI `apply_agent_event(TurnDone)` — `crates/tui/src/app.rs:7394` 之后
@@ -128,7 +166,9 @@ impl NotifyDispatcher {
             sinks.push(Box::new(BellSink));
         }
         if cfg.desktop.enabled {
-            sinks.push(Box::new(DesktopSink));
+            sinks.push(Box::new(DesktopSink {
+                prefer_terminal: cfg.desktop.prefer_terminal,
+            }));
         }
         Self {
             cfg,
@@ -341,8 +381,27 @@ impl NotificationSink for BellSink {
 
 // ── DesktopSink ────────────────────────────────────────────────────────────
 
-/// 桌面通知 sink。`cfg(target_os)` 分发到 macOS / Linux / Windows 实现。
-struct DesktopSink;
+/// 桌面通知 sink。
+///
+/// 两条投递路径，**先试终端原生、再回落系统命令**：
+///
+/// 1. **终端自带的 OSC 通知**（`OSC 9` / `OSC 777;notify`）——发送者是终端 App
+///    自己，点击横幅会激活该终端窗口并切到发起通知的标签页/面板。这是「点击
+///    通知回到 wyj-code 所在终端」唯一的实现方式。
+/// 2. **系统命令**（macOS `osascript` / Linux `notify-send` / Windows BurntToast）
+///    ——发送者是一个子进程，与用户所在的终端窗口没有任何身份关联。
+///
+/// **为什么 macOS 上必须优先走第 1 条**：`osascript -e 'display notification'`
+/// 的投递者是 `/usr/bin/osascript`。它的内嵌 Info.plist 声明了
+/// `CFBundleIdentifier = com.apple.osascript`，但磁盘上不存在任何声明该 id 的
+/// .app（`mdfind` 为空，`path to application id "com.apple.osascript"` 报
+/// `-1728`）。点击通知时通知中心要激活投递者，LaunchServices 解析不到目标，
+/// 于是退化成一个「选择应用/文件」的 open 面板——现场表现就是用户点了通知却
+/// 被要求挑一个文件。改命令行参数救不了：即便解析得到，被激活的也是
+/// `osascript` 而不是 wyj-code 所在的终端。
+struct DesktopSink {
+    prefer_terminal: bool,
+}
 
 impl NotificationSink for DesktopSink {
     fn name(&self) -> &'static str {
@@ -350,6 +409,14 @@ impl NotificationSink for DesktopSink {
     }
 
     fn send(&self, payload: &NotificationPayload) -> Result<(), String> {
+        if self.prefer_terminal {
+            match terminal_notify(payload) {
+                Ok(()) => return Ok(()),
+                // 终端不支持 / 无 tty：静默回落，首次记一次 debug（每次 emit 都
+                // 记会让 debug 日志被这条淹没）。
+                Err(reason) => note_terminal_fallback_once(&reason),
+            }
+        }
         #[cfg(target_os = "macos")]
         {
             macos_send(payload)
@@ -367,6 +434,112 @@ impl NotificationSink for DesktopSink {
             let _ = payload;
             Err("unsupported platform".to_string())
         }
+    }
+}
+
+/// 终端原生通知的两种线格式。选哪种取决于终端**文档化**支持哪条，而不是
+/// 「哪条更全」——发出去终端不认就是静默丢通知，比缺个标题更糟。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalNotify {
+    /// `OSC 9 ; <text> BEL`（iTerm2 起头，Ghostty 官方文档化的形态）。只有正文，
+    /// 无独立标题，因此调用方把标题拼进正文。
+    Osc9,
+    /// `OSC 777 ; notify ; <title> ; <body> BEL`（rxvt-unicode 起头，WezTerm 官方
+    /// 文档化的形态）。带独立标题。
+    Osc777,
+    /// 终端没有文档化的通知通道，回落系统命令。
+    Unsupported,
+}
+
+/// 终端能力判定。`in_multiplexer` 为真时一律回落：OSC 要穿过 tmux / Zellij 得
+/// 显式开启 passthrough，未开启时序列会被复用器吞掉（静默丢通知），而在此处
+/// 探测「对方有没有配 passthrough」没有可靠手段。
+fn detect_terminal_notify(term_program: Option<&str>, in_multiplexer: bool) -> TerminalNotify {
+    if in_multiplexer {
+        return TerminalNotify::Unsupported;
+    }
+    match term_program
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        // Ghostty 的 OSC 9 是官方文档化的；OSC 777 虽也实现，但没写进 VT 参考。
+        // iTerm2 是 OSC 9 的原始实现方。
+        Some("ghostty") | Some("iterm.app") => TerminalNotify::Osc9,
+        // WezTerm 的 VT 参考里 OSC 9 与 OSC 777 都有且都进表格；用带标题的那条。
+        Some("wezterm") => TerminalNotify::Osc777,
+        // Apple Terminal / VS Code 集成终端没有内置通知通道（VS Code 需要第三方
+        // 扩展解析 OSC），一律回落。
+        _ => TerminalNotify::Unsupported,
+    }
+}
+
+/// 组装 OSC 序列。控制字符（含 `ESC` / `BEL` / 换行）会让终端提前终止序列并把
+/// 残渣当可见字符画到屏幕上，必须剔除。
+fn osc_notification_sequence(support: TerminalNotify, title: &str, body: &str) -> Option<String> {
+    let body = sanitize_osc_field(body);
+    match support {
+        // OSC 9 没有标题字段，把标题并进正文，否则用户只能看到半句话。
+        TerminalNotify::Osc9 => Some(format!(
+            "\x1b]9;{}: {}\x07",
+            sanitize_osc_field(title),
+            body
+        )),
+        // OSC 777 用分号分隔三段；标题里的分号会把它劈成两段，换成空格。
+        TerminalNotify::Osc777 => Some(format!(
+            "\x1b]777;notify;{};{}\x07",
+            sanitize_osc_field(title).replace(';', " "),
+            body
+        )),
+        TerminalNotify::Unsupported => None,
+    }
+}
+
+fn sanitize_osc_field(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+/// 走终端原生通道投递。写 `/dev/tty` 而不是 stdout：TUI 模式下 stdout 由
+/// ratatui 接管，把控制序列插进它的 diff 输出中间没有任何好处；直接开 tty 也
+/// 让 headless / REPL 模式共用同一条路径。
+fn terminal_notify(payload: &NotificationPayload) -> Result<(), String> {
+    let term_program = std::env::var("TERM_PROGRAM").ok();
+    let in_multiplexer = std::env::var_os("TMUX").is_some() || std::env::var_os("ZELLIJ").is_some();
+    let support = detect_terminal_notify(term_program.as_deref(), in_multiplexer);
+    let sequence = osc_notification_sequence(support, &payload.title, &payload.body).ok_or_else(
+        || match (term_program.as_deref(), in_multiplexer) {
+            (Some(program), true) => format!("{program} inside a terminal multiplexer"),
+            (Some(program), false) => format!("{program} has no documented OSC notification"),
+            (None, _) => "TERM_PROGRAM is not set".to_string(),
+        },
+    )?;
+    write_terminal_sequence(&sequence)
+}
+
+#[cfg(unix)]
+fn write_terminal_sequence(sequence: &str) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    let mut tty = OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("open /dev/tty: {e}"))?;
+    tty.write_all(sequence.as_bytes())
+        .map_err(|e| format!("write /dev/tty: {e}"))?;
+    tty.flush().map_err(|e| format!("flush /dev/tty: {e}"))
+}
+
+#[cfg(not(unix))]
+fn write_terminal_sequence(_sequence: &str) -> Result<(), String> {
+    Err("terminal OSC notifications are unsupported on this platform".to_string())
+}
+
+/// 回落只在**首次**记一条 debug：`desktop.enabled=true` 且终端不支持时每次
+/// emit 都会走到这里，逐次记会淹没 debug 日志。
+fn note_terminal_fallback_once(reason: &str) {
+    static NOTED: OnceLock<()> = OnceLock::new();
+    if NOTED.set(()).is_ok() {
+        tracing::debug!(
+            "terminal OSC notification unavailable ({reason}); falling back to the system command"
+        );
     }
 }
 
@@ -642,6 +815,10 @@ mod tests {
         assert!(cfg.enabled);
         assert!(!cfg.bell.enabled, "bell 应 opt-in 默认关");
         assert!(cfg.desktop.enabled, "desktop 应 opt-out 默认开");
+        assert!(
+            cfg.desktop.prefer_terminal,
+            "终端原生通知默认开——系统命令的通知点不开发起它的终端"
+        );
         assert!(cfg.events.turn_finished);
         assert!(cfg.events.turn_error);
         assert!(
@@ -650,5 +827,84 @@ mod tests {
         );
         assert_eq!(cfg.rate_limit_seconds, 30);
         assert!(!cfg.include_session_id);
+    }
+
+    #[test]
+    fn terminal_support_follows_documented_sequences_only() {
+        // Ghostty 的 VT 参考文档化了 OSC 9（OSC 777 也实现但未收录），取文档化那条。
+        assert_eq!(
+            detect_terminal_notify(Some("ghostty"), false),
+            TerminalNotify::Osc9
+        );
+        // iTerm2 是 OSC 9 的原始实现方；TERM_PROGRAM 实际取值是 "iTerm.app"。
+        assert_eq!(
+            detect_terminal_notify(Some("iTerm.app"), false),
+            TerminalNotify::Osc9
+        );
+        // WezTerm 的 VT 参考里 OSC 777 是带独立标题的那条。
+        assert_eq!(
+            detect_terminal_notify(Some("WezTerm"), false),
+            TerminalNotify::Osc777
+        );
+        // Apple Terminal / VS Code 集成终端没有内置通知通道。
+        assert_eq!(
+            detect_terminal_notify(Some("Apple_Terminal"), false),
+            TerminalNotify::Unsupported
+        );
+        assert_eq!(
+            detect_terminal_notify(Some("vscode"), false),
+            TerminalNotify::Unsupported
+        );
+        assert_eq!(
+            detect_terminal_notify(None, false),
+            TerminalNotify::Unsupported
+        );
+    }
+
+    #[test]
+    fn terminal_multiplexer_forces_the_system_fallback() {
+        // OSC 要穿过 tmux / Zellij 得开 passthrough，未开时序列被复用器吞掉——
+        // 静默丢通知比走系统命令更糟，因此一律回落。
+        assert_eq!(
+            detect_terminal_notify(Some("ghostty"), true),
+            TerminalNotify::Unsupported
+        );
+        assert_eq!(
+            detect_terminal_notify(Some("WezTerm"), true),
+            TerminalNotify::Unsupported
+        );
+    }
+
+    #[test]
+    fn osc9_sequence_merges_title_into_the_body() {
+        let seq = osc_notification_sequence(TerminalNotify::Osc9, "标题", "完成了").unwrap();
+        assert_eq!(seq, "\x1b]9;标题: 完成了\x07");
+        assert_eq!(
+            osc_notification_sequence(TerminalNotify::Unsupported, "t", "b"),
+            None
+        );
+    }
+
+    #[test]
+    fn osc777_sequence_keeps_title_and_body_separate() {
+        let seq = osc_notification_sequence(TerminalNotify::Osc777, "标题", "完成了").unwrap();
+        assert_eq!(seq, "\x1b]777;notify;标题;完成了\x07");
+    }
+
+    #[test]
+    fn osc_fields_cannot_terminate_the_sequence_early() {
+        // 正文里的 BEL / ESC 若不剔除，终端会就此终止 OSC，残渣被画到屏幕上。
+        let seq = osc_notification_sequence(
+            TerminalNotify::Osc9,
+            "t\x1b]0;pwned\x07",
+            "body\x07\x1b[31mred",
+        )
+        .unwrap();
+        assert_eq!(seq.matches('\x07').count(), 1, "只允许结尾那一个 BEL");
+        assert_eq!(seq.matches('\x1b').count(), 1, "只允许开头那一个 ESC");
+
+        // OSC 777 的标题里出现分号会把它劈成两个字段。
+        let seq = osc_notification_sequence(TerminalNotify::Osc777, "a;b", "body").unwrap();
+        assert_eq!(seq, "\x1b]777;notify;a b;body\x07");
     }
 }

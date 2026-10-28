@@ -32,6 +32,19 @@ fn compact_keep_budget(context_window: u32) -> u32 {
 /// 低于这个条数就不再压：没有足够的历史值得花一次 LLM 往返。
 const COMPACT_MIN_MESSAGES: usize = 3;
 
+/// 摘要最多允许叠加多少代。
+///
+/// 每次压缩都会把「上一次的摘要消息」连同它后面的原文一起当成本次的输入
+/// （`keep_from > 0` 时摘要必然落在 `to_compact` 段里），于是信息以
+/// 「摘要的摘要」的形式逐代衰减：精确数值、否定知识、先后因果最先死。
+/// `MAX_COMPACT_PASSES` 只挡单次请求内的重复压缩，挡不住跨回合、
+/// 跨小时的长会话累积。
+///
+/// 超过这个代际后不再做「就地再压」，而是走 `compact_reset_note`：
+/// 摘要消息里显式声明「本次是第 N 代」，让模型知道该去 CAS 归档里核原文，
+/// 而不是把一份 N 代摘要当成事实基线继续推理。
+pub const MAX_COMPACT_GENERATIONS: u32 = 4;
+
 /// `compact_session` 的两种「已无可压缩」信号。
 ///
 /// 与真正的失败（LLM 调用报错、摘要为空）区分开，供
@@ -81,12 +94,53 @@ pub fn compact_trigger_buffer(context_window: u32, max_output_tokens: u32) -> u3
         .max(context_window / 10)
 }
 
+/// 压缩硬阈值：上下文估算高于它就触发自动压缩。
+///
+/// 两条不变量必须同时成立，缺一条都会变成用户可见的故障：
+///
+/// 1. **`阈值 + 输出预留 ≤ 窗口`**——否则压缩刚把历史压到阈值以下，下一次
+///    请求仍然必 400（`compact_trigger_buffer` 的文档已解释过这一点）。
+/// 2. **阈值显著大于 0**——否则 `estimated > 阈值` 永远成立。历史被压到只剩
+///    一条摘要时估算仍然是正数，于是**每个回合都判定「超限」并再压一次**，
+///    而每次都是它自己刚写下的摘要，压无可压——这就是「不停压缩」的死循环。
+///
+/// 直接 `window.saturating_sub(buffer)` 在 `max_output_tokens + 8192 >= window`
+/// 时静默返回 0（`saturating_sub` 不会报错），本函数因此加了下限，
+/// 并用 `window - max_output` 把下限夹回不变量 1。
+///
+/// 调用方应在进入压缩之前先按 [`compact_trigger_buffer`] 校验输出预算；
+/// 这里的下限是**最后一道兜底**，不是替代品。
+pub fn compact_threshold(context_window: u32, max_output_tokens: u32) -> u32 {
+    let floor = (context_window / 4).min(context_window.saturating_sub(max_output_tokens));
+    context_window
+        .saturating_sub(compact_trigger_buffer(context_window, max_output_tokens))
+        .max(floor)
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactResult {
     pub messages_removed: usize,
     /// 压缩后保留原文的尾部消息条数（按 token 预算而非固定条数决定）。
     pub messages_kept: usize,
     pub tokens_saved_estimate: u32,
+    /// 被压缩段的归档 CAS hash（`Some` = 原文仍可取回）。
+    ///
+    /// 压缩是整条链路里**唯一的信息不可恢复点**：`context_edit` 把旧工具输出
+    /// 外部化到 CAS 且可用 `ContextRecall` 召回，而压缩直接把消息丢掉。实测
+    /// 有 14 个会话压缩过，用户事后想找「压缩前那段对话里到底写了什么」时
+    /// 无从查起。
+    ///
+    /// 现在把被压缩段的完整 JSON 归档到 CAS，hash 记进 `Session.elided_blobs`
+    /// 参与引用计数回收。`None` = 未接 CAS（测试路径 / CAS 不可写），此时
+    /// 行为与旧版完全一致。
+    pub archived_hash: Option<String>,
+    /// 本次压缩后，摘要处于第几代（1 = 首代摘要，2 = 摘要的摘要……）。
+    ///
+    /// `compact_count` 只回答「压了几次」，而真正决定信息保真度的是
+    /// 「当前这份摘要叠了多少层」。两者不等价：连续压 5 次但每次都
+    /// `reset_entire_session`（keep_from = 0）时历史只剩一份全新摘要，
+    /// 代际并不叠加。
+    pub generation: u32,
 }
 
 /// 一次模型请求的上下文占用分解。
@@ -489,6 +543,64 @@ pub async fn compact_session(
     context_window: u32,
     prefix: Option<CompactPrefix<'_>>,
 ) -> Result<CompactResult> {
+    compact_session_with_archive(session, provider, context_window, prefix, None).await
+}
+
+/// 同 [`compact_session`]，但把被压缩的原始消息归档进 CAS。
+///
+/// 归档动机见 [`CompactResult::archived_hash`]：压缩是全链路唯一的信息不可
+/// 恢复点。归档失败**不阻断**压缩——它只是「事后能不能查原文」的增强，
+/// 而压缩本身是防止请求撞穿窗口的必要动作，优先级更高。
+pub async fn compact_session_with_archive(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+) -> Result<CompactResult> {
+    compact_session_full(session, provider, context_window, prefix, cas, None).await
+}
+
+/// 同 [`compact_session_with_archive`]，但可以复用**会话滚动工作文档**
+/// （[`crate::session_memory`]）代替一次全量摘要往返。
+///
+/// ## 为什么这条路径值得单独存在
+///
+/// 全量摘要的成本与历史长度成正比，而它恰好只在历史最长的时候触发。
+/// 滚动文档把这份成本摊到每 N 轮，压缩时只是**读一个文件**：零 LLM 往返、
+/// 零 output token，而且信息只被摘要过一次（不会「摘要的摘要」）。
+///
+/// ## 什么时候仍然走全量摘要
+///
+/// 文档不可用时（从未更新过、太短、或更新一直在失败）。此刻绝不能因为
+/// 「配置里开了 session memory」就交出一份空摘要——那比压缩本身更伤。
+pub async fn compact_session_with_session_memory(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+    session_memory: Option<&crate::session_memory::SessionMemory>,
+) -> Result<CompactResult> {
+    compact_session_full(
+        session,
+        provider,
+        context_window,
+        prefix,
+        cas,
+        session_memory,
+    )
+    .await
+}
+
+async fn compact_session_full(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+    session_memory: Option<&crate::session_memory::SessionMemory>,
+) -> Result<CompactResult> {
     let total = session.messages.len();
     if total < COMPACT_MIN_MESSAGES {
         return Err(CompactSkip::TooFewMessages(total).into());
@@ -503,11 +615,14 @@ pub async fn compact_session(
     // 不但没变短，还会额外增长两条消息。退化为单条 user 摘要可保留角色合法性，
     // 也让下一次请求从一个可继续的 assistant 回合开始。
     let reset_entire_session = keep_from == 0;
+    // `to_compact` 取 **owned** 副本而不是切片：归档要在压缩往返之后、
+    // 改写历史之前序列化这段原文，而那时 `session` 需要可变借用（记账）。
+    // 用切片会让 `session.add_usage` 与归档的不可变借用冲突。
     let (to_compact, to_keep) = if reset_entire_session {
-        (&session.messages[..], Vec::new())
+        (session.messages.clone(), Vec::new())
     } else {
         (
-            &session.messages[..keep_from],
+            session.messages[..keep_from].to_vec(),
             session.messages[keep_from..].to_vec(),
         )
     };
@@ -515,69 +630,145 @@ pub async fn compact_session(
     let messages_removed = to_compact.len();
     let messages_kept = to_keep.len();
 
+    // ── 摘要代际 ──
+    // 判据是「被压段里有没有一份既有摘要」：有就说明这次是在摘要之上再摘要，
+    // 代际 +1；没有则是首代。
+    //
+    // 为什么看 `to_compact` 而不是 `session.messages[0]`：`keep_from > 0` 时
+    // 既有摘要必然落在被压段；而 `reset_entire_session` 时整个历史都被压，
+    // 首条若无摘要说明这是从零开始的第一次压缩。两种情形用同一个判据即可，
+    // 不必分叉。取最大值而不是首条，是因为极少数情况下历史里可能残留多份
+    // 摘要（历史被手工编辑过），此时以最新那代为准。
+    let previous_generation = to_compact
+        .iter()
+        .filter_map(crate::prompts::summary_generation)
+        .max()
+        .unwrap_or(0);
+    let generation = previous_generation + 1;
+
     // 摘要 token 上限：取上下文窗口的 1/10，但不超过 16000
     let summary_max_tokens = (context_window / 10).min(16_000);
 
-    let result = match prefix {
-        Some(prefix) => {
-            // ── 前缀复用路径 ──
-            // 请求 = 「主对话前缀」+ 尾部一条指令。前缀逐字节等于本轮真实请求
-            // 的开头，因此 provider 的前缀缓存能命中到指令之前；指令本身按
-            // 全价计，但它只有几百 token。
-            //
-            // 两个必须守住的点：
-            //   1. `messages` 直接用 `session.messages[..keep_from]` 的切片，
-            //      不重新序列化、不做任何改写——任何一处改写都会让前缀失配。
-            //   2. 尾部指令走一条**新的 user 消息**，不合并进最后一条已有消息。
-            //      合并会改写前缀的最后一个元素，缓存命中点随之后退到它之前。
-            //
-            // `reset_entire_session` 时前缀为空（`keep_from == 0`），复用没有
-            // 意义但也没有害处：请求退化成「一条 user 指令」，与旧路径等价。
-            let mut req: Vec<Message> = to_compact.to_vec();
-            req.push(Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: crate::prompts::compact_instructions().to_string(),
-                }],
-            });
-            provider
-                .complete(
-                    &prefix.system,
-                    &req,
-                    prefix.tools,
-                    &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
-                )
-                .await?
+    // ── 优先复用滚动工作文档 ──
+    // 走通时省掉一整次全量摘要往返：文档是每 N 轮增量维护出来的，
+    // 信息只被摘要过一次，而且它的体量稳定（≤ MAX_DOC_BYTES），
+    // 不像全量摘要那样「历史越长越贵、越压越薄」。
+    //
+    // **覆盖度是硬前提**：只有文档覆盖到 `keep_from`（= 本次真正会被丢弃的
+    // 那一段）时才能 splice。否则文档里缺的正是即将被删掉的内容，拿它代替
+    // 摘要等于**静默丢掉那段对话**——比多跑一次全量往返昂贵得多。
+    //
+    // 不复用时如实记录原因，而不是静默退化——「开了但没生效」和「没开」
+    // 在 `/context` 上必须是两种不同的结论。
+    let covered_before = session_memory
+        .map(|memory| memory.read_state().covered_messages)
+        .unwrap_or(0);
+    let rolled_doc = session_memory
+        .filter(|memory| memory.covers(keep_from))
+        .and_then(|memory| memory.summary_text());
+    if session_memory.is_some() && rolled_doc.is_none() {
+        tracing::debug!(
+            keep_from,
+            covered = covered_before,
+            "滚动工作文档未覆盖本次压缩段，退回全量摘要"
+        );
+    }
+    // 「有没有发生 LLM 往返」必须由**路径**决定，不能靠 usage 数值反推：
+    // 端点不一定上报 usage（`StaticSummaryProvider` 就返回 0），按数值
+    // 判断会把真实发生过的往返记成 0 次调用。
+    let mut used_rolled_doc = false;
+    let result = match rolled_doc {
+        Some(doc) => {
+            used_rolled_doc = true;
+            tracing::debug!(
+                doc_bytes = doc.len(),
+                "复用会话滚动工作文档，跳过全量摘要往返"
+            );
+            // 记账口径必须与真实往返区分开：这里**没有**发生 LLM 调用，
+            // 所以不 add_usage、不 add_cache_usage、不 api_calls += 1。
+            // 伪造一次用量会让 `/cost` 显示一笔并不存在的花费。
+            wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text { text: doc }],
+                stop_reason: wyj_api::types::StopReason::EndTurn,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            }
         }
-        None => {
-            // ── 独立请求路径（无前缀可复用） ──
-            let conv_text = messages_to_text(to_compact);
-            let prompt = crate::prompts::compact_prompt(&conv_text);
-            let req = vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text { text: prompt }],
-            }];
-            provider
-                .complete(
-                    &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
-                    &req,
-                    &[],
-                    &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
-                )
-                .await?
-        }
+        None => match prefix {
+            Some(prefix) => {
+                // ── 前缀复用路径 ──
+                // 请求 = 「主对话前缀」+ 尾部一条指令。前缀逐字节等于本轮真实请求
+                // 的开头，因此 provider 的前缀缓存能命中到指令之前；指令本身按
+                // 全价计，但它只有几百 token。
+                //
+                // 两个必须守住的点：
+                //   1. `messages` 直接用 `session.messages[..keep_from]` 的切片，
+                //      不重新序列化、不做任何改写——任何一处改写都会让前缀失配。
+                //   2. 尾部指令走一条**新的 user 消息**，不合并进最后一条已有消息。
+                //      合并会改写前缀的最后一个元素，缓存命中点随之后退到它之前。
+                //
+                // `reset_entire_session` 时前缀为空（`keep_from == 0`），复用没有
+                // 意义但也没有害处：请求退化成「一条 user 指令」，与旧路径等价。
+                let mut req: Vec<Message> = to_compact.clone();
+                req.push(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: crate::prompts::compact_instructions().to_string(),
+                    }],
+                });
+                provider
+                    .complete(
+                        &prefix.system,
+                        &req,
+                        prefix.tools,
+                        &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                    )
+                    .await?
+            }
+            None => {
+                // ── 独立请求路径（无前缀可复用） ──
+                let conv_text = messages_to_text(&to_compact);
+                let prompt = crate::prompts::compact_prompt(&conv_text);
+                let req = vec![Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: prompt }],
+                }];
+                provider
+                    .complete(
+                        &wyj_api::SystemPrompt::stable_only(crate::prompts::COMPACT_SYSTEM),
+                        &req,
+                        &[],
+                        &wyj_api::provider::RequestOptions::text_only(summary_max_tokens),
+                    )
+                    .await?
+            }
+        },
     };
 
     // 压缩本身是一次真实的 LLM 往返，必须计入用量。旧实现直接丢弃
     // `CompletionResult` 的 usage 字段（也不累加 `api_calls`），导致
     // `/cost` 与 `WYJ_STATS_JSON` 系统性低估真实花费，压缩越频繁偏差越大。
     // 计入时机放在空摘要检查之前：即使摘要生成失败，这轮 token 也已经花掉了。
-    session.add_usage(result.input_tokens, result.output_tokens);
-    session.add_cache_usage(
-        result.cache_read_input_tokens,
-        result.cache_creation_input_tokens,
-    );
-    session.api_calls += 1;
+    //
+    // 复用滚动文档的那条路径**没有发生调用**：不记 input/output，
+    // 也不 `api_calls += 1`（否则 `/cost` 会显示一笔并不存在的往返）。
+    // 判据是路径标志而非 usage 数值——端点不报 usage 时数值全为 0，
+    // 按数值判断会把真实发生过的往返也记成 0 次。
+    if !used_rolled_doc {
+        session.add_usage(result.input_tokens, result.output_tokens);
+        session.add_cache_usage(
+            result.cache_read_input_tokens,
+            result.cache_creation_input_tokens,
+        );
+        session.api_calls += 1;
+        // 压缩往返也是一次真实的模型请求：它不经过 `provider.stream`
+        // 那条路（所以 `api_attempts` 不会自动 +1），但它同样产生 token，
+        // 必须同时进两个计数，否则「每次调用带多少上下文」的分母会漏它。
+        session.api_attempts += 1;
+    }
 
     let summary: String = result
         .content
@@ -597,20 +788,67 @@ pub async fn compact_session(
         anyhow::bail!("摘要生成失败：模型返回空输出");
     }
 
+    // ── 重建现场：被压缩段里操作过的文件 ─────────────────────────────────
+    //
+    // 压缩后模型只看得到摘要，摘要里不会列出具体文件路径。对齐 Claude Code
+    // 的「What survives compaction」：官方在压缩后按最近修改时间重读最多
+    // 5 个文件。这里做轻量版——只把路径摆进摘要消息，不重读内容（重读要多付
+    // token，且可能读到已变的文件，反而误导）。
+    let touched_files = collect_touched_files(&to_compact);
+
+    // ── 归档被压缩段 ─────────────────────────────────────────────────────
+    //
+    // 放在**改写历史之前**：一旦 `session.messages` 被替换，原文就只剩内存
+    // 里这份临时切片，而它在函数返回时即失效。
+    //
+    // 归档的是 `to_compact`（即将被丢弃的那段）的完整 JSON，不是摘要——
+    // 摘要里已经只有 600 字符正文和 400 字符工具结果（`messages_to_text`
+    // 的截断），不足以回答「压缩前到底写了什么」。
+    //
+    // 失败只 warn：归档是增强项，压缩本身是防止请求撞穿窗口的必要动作。
+    let archived_hash = match cas {
+        Some(cas) => match serde_json::to_vec(&to_compact) {
+            Ok(bytes) => match cas.intern(&bytes) {
+                Ok(hash) => {
+                    // 记进 session 的 blob 引用表，会话结束 / `/clear` 时统一
+                    // release。不记的话 ref_count 永远 ≥1，`WorkspaceCas::gc`
+                    // 永远删不掉这批归档——用「归档」换「CAS 无界增长」。
+                    session.elided_blobs.push(hash.clone());
+                    Some(hash)
+                }
+                Err(error) => {
+                    tracing::warn!("压缩归档写入 CAS 失败: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!("压缩归档序列化失败: {error}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    // 摘要必须带上归档 hash：否则 CAS 里那份原文没有任何入口能取回
+    // （`ContextRecall` 只认 `[context-edited]` 占位符，而压缩是整段删除）。
+    let archive_ref = archived_hash.as_deref();
+    let summary_message = |removed: usize| Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: crate::prompts::compact_summary_message_full(
+                removed,
+                &summary,
+                &touched_files,
+                archive_ref,
+                generation,
+            ),
+        }],
+    };
+
     if reset_entire_session {
-        session.messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: crate::prompts::compact_summary_message(messages_removed, &summary),
-            }],
-        }];
+        session.messages = vec![summary_message(messages_removed)];
     } else {
-        session.messages = vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: crate::prompts::compact_summary_message(messages_removed, &summary),
-            }],
-        }];
+        session.messages = vec![summary_message(messages_removed)];
         // 确认语只在**保留段以 user 开头**时才需要：那时摘要(user) 后面直接
         // 跟 user 会破坏角色交替，得插一条 assistant 隔开。
         //
@@ -636,12 +874,24 @@ pub async fn compact_session(
     // 压缩是「整段历史被替换」，增量日志必须收到一次全量快照——否则重放时
     // 会把压缩前的旧消息和压缩后的新消息拼在一起，拼出一个从未存在过的历史。
     session.emit_replaced();
+    // 覆盖指针必须跟着历史一起重算：`covered_messages` 是**消息下标**，而
+    // 压缩把历史从 N 条换成 M 条。不重置的话，下次 `SessionMemory::update`
+    // 会算出 `covered.min(len) == len` → 增量恒空 → 文档永远不再更新，
+    // 而压缩仍在拿这份越来越旧的文档当摘要。
+    //
+    // 置 0（= 下一次全量重读）而不是置成新长度：保留段（`to_keep`）可能
+    // 尚未进文档，置成新长度会让那段**永远**进不去。
+    if let Some(memory) = session_memory {
+        memory.reset_coverage();
+    }
     let tokens_saved = before_tokens.saturating_sub(estimate_tokens(&session.messages));
 
     Ok(CompactResult {
         messages_removed,
         messages_kept,
         tokens_saved_estimate: tokens_saved,
+        archived_hash,
+        generation,
     })
 }
 
@@ -680,6 +930,88 @@ pub async fn compact_session_until_fit(
     prefix: Option<CompactPrefix<'_>>,
     measure: impl Fn(&[Message]) -> u32,
 ) -> CompactUntilFitOutcome {
+    compact_session_until_fit_full(
+        session,
+        provider,
+        context_window,
+        threshold,
+        prefix,
+        measure,
+        None,
+        None,
+    )
+    .await
+}
+
+/// 同 [`compact_session_until_fit`]，但把每一轮被压缩的原文归档进 CAS。
+///
+/// 循环里每一轮都可能丢一段不同的原文，所以归档是**逐轮**发生的
+/// （`compact_session_with_archive` 每次自己 intern 一个 blob）。
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_session_until_fit_with_archive(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    threshold: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    measure: impl Fn(&[Message]) -> u32,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+) -> CompactUntilFitOutcome {
+    compact_session_until_fit_full(
+        session,
+        provider,
+        context_window,
+        threshold,
+        prefix,
+        measure,
+        cas,
+        None,
+    )
+    .await
+}
+
+/// 同 [`compact_session_until_fit_with_archive`]，并可在第一轮之后复用
+/// 会话滚动工作文档。
+///
+/// 只有**第一轮**会用到文档：一旦压缩发生，历史已被替换成摘要，而
+/// `covered_messages` 指向的是压缩前的条数——第二轮若再取文档，会得到
+/// 与刚写入的摘要互相矛盾的两份叙述。第二轮起一律走全量摘要（此时
+/// 历史已经很短，成本可忽略）。
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_session_until_fit_with_session_memory(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    threshold: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    measure: impl Fn(&[Message]) -> u32,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+    session_memory: Option<&crate::session_memory::SessionMemory>,
+) -> CompactUntilFitOutcome {
+    compact_session_until_fit_full(
+        session,
+        provider,
+        context_window,
+        threshold,
+        prefix,
+        measure,
+        cas,
+        session_memory,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_session_until_fit_full(
+    session: &mut Session,
+    provider: &dyn Provider,
+    context_window: u32,
+    threshold: u32,
+    prefix: Option<CompactPrefix<'_>>,
+    measure: impl Fn(&[Message]) -> u32,
+    cas: Option<&crate::workspace_cas::WorkspaceCas>,
+    session_memory: Option<&crate::session_memory::SessionMemory>,
+) -> CompactUntilFitOutcome {
     const MAX_COMPACT_PASSES: usize = 3;
     /// 一轮压缩至少要把测量值降这么多比例，否则直接停手。
     const MIN_PROGRESS_RATIO: f64 = 0.05;
@@ -696,7 +1028,19 @@ pub async fn compact_session_until_fit(
                 last_error: None,
             };
         }
-        match compact_session(session, provider, context_window, prefix).await {
+        // 只有第一轮复用滚动文档：压缩发生后历史已被摘要替换，
+        // 文档的 `covered_messages` 指向压缩前，再用会导致两份叙述互相矛盾。
+        let doc_for_this_pass = if pass == 0 { session_memory } else { None };
+        match compact_session_with_session_memory(
+            session,
+            provider,
+            context_window,
+            prefix,
+            cas,
+            doc_for_this_pass,
+        )
+        .await
+        {
             Ok(result) => {
                 last_result = Some(Ok(result));
                 let after = measure(&session.messages);
@@ -895,6 +1239,44 @@ fn safe_keep_from_budget(messages: &[Message], budget: u32) -> Option<usize> {
         keep_from = messages.len().saturating_sub(1);
     }
     safe_keep_from(messages, messages.len() - keep_from)
+}
+
+/// 从即将被压缩的消息里提取「操作过的文件路径」，按**出现顺序去重**。
+///
+/// 只认 `Read` / `Edit` / `Write` / `NotebookEdit` 的 `file_path` 参数——
+/// 这四个是「模型确实碰过这个文件」的直接证据。`Grep` / `Glob` 的 `path`
+/// 是目录或搜索根，列进「touched files」只会误导（模型会以为自己读过它）。
+///
+/// 上限 20 条：这个列表进摘要消息，而摘要消息本身要尽量短。按**倒序取**
+/// （最近操作的在前面）——压缩后最需要的是「刚刚在改什么」，不是「一小时前
+/// 读过什么」。
+fn collect_touched_files(messages: &[Message]) -> Vec<String> {
+    const MAX_FILES: usize = 20;
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    // 倒着走：最近的优先。
+    for message in messages.iter().rev() {
+        for block in message.content.iter().rev() {
+            let ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            if !matches!(name.as_str(), "Read" | "Edit" | "Write" | "NotebookEdit") {
+                continue;
+            }
+            let Some(path) = input.get("file_path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = path.trim();
+            if path.is_empty() || !seen.insert(path.to_string()) {
+                continue;
+            }
+            out.push(path.to_string());
+            if out.len() >= MAX_FILES {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 fn messages_to_text(messages: &[Message]) -> String {
@@ -1122,6 +1504,7 @@ mod tests {
                 output_tokens: 0,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
             })
         }
     }
@@ -1205,6 +1588,242 @@ mod tests {
         assert!(after < before);
     }
 
+    /// 首代摘要就是第 1 代，且正文里**不**出现代际警示。
+    #[tokio::test]
+    async fn first_compaction_is_generation_one_without_a_warning() {
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+            .await
+            .expect("应能压缩");
+        assert_eq!(result.generation, 1);
+        assert!(
+            !session.messages[0]
+                .text()
+                .contains("generation 1 of a layered summary"),
+            "第 1 代不该出现警示文案: {}",
+            session.messages[0].text()
+        );
+    }
+
+    /// 已有摘要再被压缩 → 代际 +1，且摘要正文里写出「第 N 代」。
+    ///
+    /// 这条钉的是「摘要的摘要」这个真实失败模式：信息逐代衰减
+    /// （精确数值 / 否定知识 / 先后因果最先死），而模型对此毫无感知。
+    #[tokio::test]
+    async fn recompacting_a_summary_bumps_the_generation_and_warns() {
+        let mut session = Session::new();
+        // 先造一份「第 1 代摘要」，形式与生产环境一致（前缀 + 正文）。
+        session
+            .messages
+            .push(user_text(&crate::prompts::compact_summary_message(
+                9,
+                "第一代摘要",
+            )));
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("后续任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+            .await
+            .expect("应能压缩");
+        assert_eq!(result.generation, 2, "在摘要之上再摘要必须升一代");
+        let text = session.messages[0].text();
+        assert!(
+            text.contains("generation 2 of a layered summary"),
+            "第 2 代必须在正文里声明: {text}"
+        );
+        assert!(
+            text.contains("may have drifted"),
+            "应说明细节可能已漂移: {text}"
+        );
+    }
+
+    /// 超过代际上限后措辞要更强：从「可能漂移」升级成「当地图用」。
+    #[tokio::test]
+    async fn past_the_generation_cap_the_wording_gets_stronger() {
+        let mut session = Session::new();
+        let deep = crate::prompts::compact_summary_message_full(
+            99,
+            "第四代摘要",
+            &[],
+            None,
+            MAX_COMPACT_GENERATIONS,
+        );
+        session.messages.push(user_text(&deep));
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let result = compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+            .await
+            .expect("应能压缩");
+        assert_eq!(result.generation, MAX_COMPACT_GENERATIONS + 1);
+        let text = session.messages[0].text();
+        assert!(
+            text.contains("past the point where"),
+            "超过上限后应换成更强的措辞: {text}"
+        );
+    }
+
+    /// `summary_generation` 只认摘要前缀：普通用户消息不该被误判成摘要。
+    #[test]
+    fn summary_generation_only_matches_real_summary_messages() {
+        assert_eq!(
+            crate::prompts::summary_generation(&user_text("普通的一轮对话")),
+            None
+        );
+        assert_eq!(
+            crate::prompts::summary_generation(&user_text(
+                &crate::prompts::compact_summary_message(3, "老摘要")
+            )),
+            Some(1),
+            "老格式（无代际字样）按第 1 代处理"
+        );
+        assert_eq!(
+            crate::prompts::summary_generation(&user_text(
+                &crate::prompts::compact_summary_message_full(3, "新摘要", &[], None, 5)
+            )),
+            Some(5)
+        );
+    }
+
+    /// 滚动文档可用时，压缩**不得**发生 LLM 往返：这是它存在的全部理由。
+    ///
+    /// 顺带钉住记账口径——`api_calls` 不能因为「复用了文档」就 +1，
+    /// 否则 `/cost` 会显示一笔并不存在的调用。
+    #[tokio::test]
+    async fn usable_session_memory_replaces_the_summary_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::session_memory::SessionMemory::new(dir.path(), "s1");
+        let doc = format!(
+            "## Task & Intent\n把压缩改成滚动文档。\n## Current State\n{}",
+            "细节。".repeat(200)
+        );
+        std::fs::write(
+            dir.path().join(format!(
+                "{}-s1.md",
+                crate::session_memory::SESSION_MEMORY_FILENAME_PREFIX
+            )),
+            &doc,
+        )
+        .unwrap();
+
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let api_calls_before = session.api_calls;
+        let result = compact_session_with_session_memory(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            None,
+            None,
+            Some(&memory),
+        )
+        .await
+        .expect("应能压缩");
+
+        assert!(result.messages_removed > 0);
+        assert_eq!(
+            session.api_calls, api_calls_before,
+            "复用滚动文档时零 LLM 往返，api_calls 不得增加"
+        );
+        let text = session.messages[0].text();
+        assert!(
+            text.contains("把压缩改成滚动文档"),
+            "摘要正文必须来自滚动文档而不是模型输出: {text}"
+        );
+    }
+
+    /// 文档不可用时必须**退回**全量摘要，而不是交出一份空摘要。
+    ///
+    /// 「开了 session memory 但一次都没成功更新」是真实会发生的状态
+    /// （首轮就撞阈值 / 更新一直失败）。此时若直接 splice 空文档，
+    /// 压缩会静默销毁整段历史。
+    #[tokio::test]
+    async fn unusable_session_memory_falls_back_to_a_full_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = crate::session_memory::SessionMemory::new(dir.path(), "s1");
+        // 只有几十字节，远低于 MIN_USABLE_BYTES。
+        std::fs::write(
+            dir.path().join(format!(
+                "{}-s1.md",
+                crate::session_memory::SESSION_MEMORY_FILENAME_PREFIX
+            )),
+            "太短",
+        )
+        .unwrap();
+
+        let mut session = Session::new();
+        for i in 0..6 {
+            session
+                .messages
+                .push(user_text(&format!("任务 {i}: {}", "x".repeat(2_000))));
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "已记录".to_string(),
+                }],
+            });
+        }
+        let api_calls_before = session.api_calls;
+        compact_session_with_session_memory(
+            &mut session,
+            &StaticSummaryProvider,
+            200_000,
+            None,
+            None,
+            Some(&memory),
+        )
+        .await
+        .expect("应能压缩");
+
+        assert_eq!(
+            session.api_calls,
+            api_calls_before + 1,
+            "退回全量摘要时必须真的发生了往返"
+        );
+        assert!(
+            session.messages[0].text().contains("继续完成当前任务"),
+            "应使用模型输出的摘要: {}",
+            session.messages[0].text()
+        );
+    }
+
     /// 前缀复用路径：压缩请求的 system / tools / messages 必须**逐字节等于**
     /// 主对话前缀，否则 provider 的前缀缓存一次都命中不了。
     ///
@@ -1259,6 +1878,7 @@ mod tests {
                     output_tokens: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    reasoning_tokens: 0,
                 })
             }
         }
@@ -1647,6 +2267,7 @@ mod tests {
                     output_tokens: 0,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
+                    reasoning_tokens: 0,
                 })
             }
         }
@@ -1825,6 +2446,7 @@ mod tests {
                 output_tokens: 56,
                 cache_read_input_tokens: 7,
                 cache_creation_input_tokens: 8,
+                reasoning_tokens: 0,
             })
         }
     }
@@ -1858,6 +2480,123 @@ mod tests {
         assert_eq!(session.total_cache_read_tokens, 7);
         assert_eq!(session.total_cache_write_tokens, 8);
         assert_eq!(session.api_calls, 1);
+    }
+
+    /// 压缩后必须把「被压段里操作过的文件」列进摘要消息。
+    ///
+    /// 钉的是「压缩后模型不知道现场在哪」这个缺陷：摘要里只会写「改过 auth
+    /// 模块」，模型要么重新 Read 一遍（多付一次完整文件 token），要么凭印象
+    /// 改错地方。对齐 Claude Code 的「What survives compaction」表。
+    #[test]
+    fn compact_summary_lists_files_touched_before_compaction() {
+        // 有文件操作 → 摘要消息里必须出现路径。
+        let mut session = Session::new();
+        session.push_user("把 auth 模块的错误处理修一下");
+        for i in 0..8 {
+            session.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: format!("t{i}"),
+                    name: if i % 2 == 0 { "Edit" } else { "Read" }.to_string(),
+                    input: serde_json::json!({
+                        "file_path": format!("/repo/src/auth_{i}.rs"),
+                        "content": "x".repeat(400),
+                    }),
+                }],
+            });
+            session.push_tool_result(format!("t{i}"), ToolResultContent::text("ok"), false);
+        }
+        futures::executor::block_on(async {
+            compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+                .await
+                .expect("should compact");
+        });
+        let summary_text = session
+            .messages
+            .first()
+            .and_then(|m| match &m.content[0] {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            summary_text.contains("Files touched before compaction"),
+            "有文件操作时必须列出这一段，实际摘要：{summary_text}"
+        );
+        assert!(
+            summary_text.contains("/repo/src/auth_"),
+            "必须列出具体路径，实际摘要：{summary_text}"
+        );
+    }
+
+    /// 没有文件操作的历史不该凭空多出一段（不制造噪音）。
+    #[test]
+    fn compact_summary_omits_file_section_when_nothing_touched() {
+        let mut session = multi_turn_session();
+        futures::executor::block_on(async {
+            compact_session(&mut session, &StaticSummaryProvider, 200_000, None)
+                .await
+                .expect("should compact");
+        });
+        let summary_text = session
+            .messages
+            .first()
+            .and_then(|m| match &m.content[0] {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            !summary_text.contains("Files touched before compaction"),
+            "没有文件操作时不该加这一段"
+        );
+    }
+
+    /// `collect_touched_files` 只认真正的文件操作工具，且最近的排在前面。
+    #[test]
+    fn collect_touched_files_ignores_search_roots_and_orders_recent_first() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "a".to_string(),
+                    name: "Read".to_string(),
+                    input: serde_json::json!({ "file_path": "/repo/old.rs" }),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "b".to_string(),
+                    name: "Grep".to_string(),
+                    // 搜索根不是「读过的文件」，不该进列表。
+                    input: serde_json::json!({ "path": "/repo/src", "pattern": "foo" }),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "c".to_string(),
+                    name: "Edit".to_string(),
+                    input: serde_json::json!({ "file_path": "/repo/new.rs" }),
+                }],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "d".to_string(),
+                    name: "Read".to_string(),
+                    // 重复路径只记一次。
+                    input: serde_json::json!({ "file_path": "/repo/old.rs" }),
+                }],
+            },
+        ];
+        let files = collect_touched_files(&messages);
+        assert_eq!(
+            files,
+            vec!["/repo/old.rs".to_string(), "/repo/new.rs".to_string()],
+            "最近的排前面、去重、且不含 Grep 的搜索根"
+        );
     }
 
     #[test]

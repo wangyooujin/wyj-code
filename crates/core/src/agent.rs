@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_session_until_fit, compact_trigger_buffer, ContextAudit};
+use crate::compact::{compact_trigger_buffer, ContextAudit};
 use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
@@ -322,6 +322,41 @@ fn soft_threshold_tokens(
     }
 }
 
+/// 服务端上下文清理的**触发线**。
+///
+/// 刻意比本地软阈值（`0.55 × window`）**更晚**：服务端清理不重建缓存前缀，
+/// 提前发只是让端点白跑一遍判定；而本地清理是它的兜底，必须更早动手。
+/// 取 `0.7 × window` 折中——足够在压缩硬阈值（`window - buffer`，约 0.8~0.9
+/// 窗口）之前腾出空间，又不会在每轮都发一个注定不触发的 trigger。
+///
+/// `keep_tool_uses` 与 `[context_edit].protect_recent` 保持一致：两条路径
+/// 对「最近几个工具结果算现场」的判断必须相同，否则模型会看到本地保留 3 个、
+/// 服务端又清掉其中一个的错位现场。
+fn server_context_management_trigger(context_window: u32) -> u32 {
+    ((context_window as f64) * 0.7).round() as u32
+}
+
+/// 静态容量表给出的窗口至少要能为「输出预算 + 协议开销 + 可压缩提示段」
+/// 留出空间，否则它不是保守下限，而是一个错值。
+///
+/// `known_model_capacity` 用子串匹配模型族名，聚合路由的 ID（
+/// `deepseek/deepseek-v4.1-flash-1017`）会被 `("deepseek", 64_000)` 命中，
+/// 而这个真实模型往往有更大的窗口。把窗口收窄到 64K 本身只是「压得勤」，
+/// 但配合用户配置的 `max_tokens = 64_000` 就会算出
+/// `64_000 - (64_000 + 8_192) = 0` 的压缩阈值——每个回合都判定超限，
+/// 历史压到只剩摘要也「降不下来」，形成压缩死循环。
+///
+/// 所以低于 `max_output + 8_192 + MIN_PROMPT_BUDGET` 的目录值一律不采纳：
+/// 保留配置值，让端点 400 给出实测上界（`Session::overflow_window_hint`）。
+fn consistent_catalog_window(model: &str, max_output_tokens: u32) -> Option<u32> {
+    const MIN_PROMPT_BUDGET: u64 = 16_384;
+    wyj_api::known_model_capacity(model)
+        .map(|cap| cap.context_window)
+        .filter(|window| {
+            u64::from(*window) > u64::from(max_output_tokens) + 8_192 + MIN_PROMPT_BUDGET
+        })
+}
+
 #[derive(Clone)]
 pub struct Agent {
     provider: Arc<dyn Provider>,
@@ -337,6 +372,11 @@ pub struct Agent {
     /// 与 `max_turns` 分开是因为两者判据不同：这个只作用于「思考关不掉」的
     /// 端点，见 [`helpers::max_turns_for_model`]。
     forced_thinking_max_turns: usize,
+    /// 花费熔断闸（金额 + 输出 token）。默认全关（`BudgetLimits::default`）。
+    ///
+    /// 与轮数闸**互补**：轮数管「跑了多少趟」，这个管「每趟多贵」。用户
+    /// 看到的失控现场常常是「每轮都在推进、但每轮都很贵」，轮数闸拦不住。
+    budget_limits: crate::budget::BudgetLimits,
     /// 模型最大上下文窗口（token 数），用于触发自动压缩
     context_window: u32,
     /// 跨会话记忆存储（可选）
@@ -355,6 +395,13 @@ pub struct Agent {
     /// Memory v3 是普通跨会话事实、偏好、状态和历史的主控制/数据面。模型通过
     /// Memory 工具自主探索；Agent 只注入少量相关 claim 并提交耐久提取任务。
     memory_v3: Option<Arc<MemoryV3Store>>,
+    /// 会话滚动工作文档（可选）。`Some` 时压缩优先 splice 它而不是跑一次
+    /// 全量摘要；同时每 [`SESSION_MEMORY_EVERY_TURNS`] 轮增量更新一次。
+    ///
+    /// 与 `memory_v3` 的分工：那个管**跨会话**的结构化事实，这个管**本会话**
+    /// 「做到哪了」的连续叙述。混成一体会让 `project_brief` 的 8KB 预算被
+    /// 会话内的临时进展挤占。
+    session_memory: Option<Arc<crate::session_memory::SessionMemory>>,
     /// 证据化自进化存储（可选）。Memory v3 存在时只记录 Episode 并发现需审批
     /// 的 Rule/Skill 候选；无 v3 时保留旧 Memory v2 兼容行为。
     evolution: Option<Arc<EvolutionStore>>,
@@ -470,6 +517,12 @@ pub struct Agent {
     /// tool-result context editing 的装配：`None` = 关闭（不清理旧工具输出）。
     /// 见 `crate::context_edit` 与 `doc/plan/v0.2.26-context-management-plan.md`。
     context_edit: Option<crate::context_edit::ContextEditCfg>,
+    /// 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）的共享用量累加器。
+    ///
+    /// 这五类调用都拿不到 `&mut Session`，各自在自己的调用点 `record()`，
+    /// 主循环在回合开头与收尾各抽干一次计入 `Session::aux_*`。`None` = 未注入
+    /// （测试、纯 headless 路径），此时辅助往返不记账但不影响功能。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
     /// 跨会话记忆快照缓存（system prompt 稳定前缀的一部分）。分桶重算，
     /// 避免每轮改写 system 尾部击穿 prompt cache。用 `Arc<Mutex<..>>` 是为了
     /// 兼容 `Agent: Clone`（TUI `/model` 重建与模式切换都会 clone），
@@ -512,6 +565,29 @@ const MEMORY_SNAPSHOT_REFRESH_TURNS: u32 = 10;
 /// 概率远高于一个 2 轮的问答。因此降到 1/3，交互路径立刻轻下来，记忆的时效性
 /// 代价很小（最迟 3 轮后可见）。
 const MEMORY_EXTRACT_EVERY_TURNS: usize = 3;
+
+/// 会话滚动工作文档的更新间隔（用户轮次）。
+///
+/// 与 [`MEMORY_EXTRACT_EVERY_TURNS`] **刻意错开**（3 vs 4）：两者都是辅助
+/// LLM 往返，撞在同一轮会让主循环多等一趟；错开后最坏情况也只是隔轮有活。
+///
+/// 取 4 而不是更大的值，是因为滚动文档的价值全部来自「压缩时不用再算」——
+/// 它越新，被 splice 时丢的尾巴越少。文档本身很小（≤12KB），单次增量
+/// 输入只含新增消息，成本远低于一次全量摘要。
+const SESSION_MEMORY_EVERY_TURNS: usize = 4;
+
+/// 缓存观测样本的保留条数。
+///
+/// 归因只需**相邻两次**请求的对比（缓存是「前缀命中」机制，一次失效只
+/// 影响它之后那几趟），所以 16 条足够覆盖「掉了之后又跑了几轮才注意到」
+/// 的典型场景。留着更多只是让会话文件变大。
+const CACHE_SAMPLE_HISTORY: usize = 16;
+
+/// 滚动文档单次更新的输出 token 上限。
+///
+/// 文档上限是 12000 **字节**（中文约 4000 字），对应 token 远小于 4096。
+/// 留足余量是因为模型偶尔会用被截断的中间态输出，重新组织一遍就要重写。
+const SESSION_MEMORY_MAX_TOKENS: u32 = 4096;
 
 /// 后台辅助 LLM 调用的让路延迟。
 ///
@@ -571,10 +647,12 @@ impl Agent {
             // 真正的成本/时长上限由每轮 token 预算触发的自动压缩承担；这里仅防止模型死循环
             max_turns: 200,
             forced_thinking_max_turns: 64,
+            budget_limits: crate::budget::BudgetLimits::default(),
             context_window: 200_000,
             memory: None,
             aux_provider: None,
             memory_v3: None,
+            session_memory: None,
             evolution: None,
             claude_md: None,
             tool_cb: None,
@@ -613,7 +691,18 @@ impl Agent {
             title_attempted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             persist_cap: None,
             context_edit: None,
+            aux_usage: None,
         }
+    }
+
+    /// 注入辅助往返用量累加器（装配期调用）。
+    ///
+    /// 装配方应把**同一个** `Arc` 同时交给 `SummaryGenerator`、
+    /// `AutoGateImpl`、`MemoryV3Store`、`MemoryStore`、`EvolutionStore`，
+    /// 这样五类辅助往返都汇入同一处，主循环抽干时一次性计入 `Session`。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
+        self
     }
 
     /// 注入能力缓存：Agent 在 `parameter_degraded` 撤掉端点不认的参数重试
@@ -640,6 +729,64 @@ impl Agent {
     pub fn with_context_edit(mut self, cfg: Option<crate::context_edit::ContextEditCfg>) -> Self {
         self.context_edit = cfg.filter(|c| c.enabled);
         self
+    }
+
+    /// 构造本次请求的服务端上下文清理参数。
+    ///
+    /// **只在官方 Anthropic 线协议上给值**：`context_management` 是官方 beta
+    /// 字段，OpenAI 线协议与第三方 `/anthropic` 兼容端点收到它只会 400
+    /// （provider 侧还有一层单调降级兜底，但没必要每轮都撞一次）。
+    ///
+    /// 与本地 `context_edit` 的关系是**互补而非替代**：
+    ///   - 服务端清理：端点原地删除缓存里的旧 tool_result，**不重建前缀**，
+    ///     因此暖缓存下几乎零成本；
+    ///   - 本地清理：改 `session.messages` 并外置到 CAS，**必然击穿一段前缀**，
+    ///     但它是服务端不支持时的唯一保底，且外置内容可用 `ContextRecall` 召回。
+    ///
+    /// 两者保留窗口取同一个 `protect_recent`——模型看到的「最近 3 个工具结果」
+    /// 在两条路径上必须是同一批，否则会出现「本地还留着、服务端已清掉」的
+    /// 现场错位。
+    fn server_context_management(
+        &self,
+        effective_window: u32,
+        identity: &wyj_api::ModelIdentity,
+    ) -> Option<wyj_api::provider::ServerContextManagement> {
+        let cfg = self.context_edit.as_ref()?;
+        // 只有 Anthropic Messages 线协议 + 官方 vendor 才认这个字段。
+        if !matches!(
+            identity.wire_protocol,
+            wyj_api::WireProtocol::AnthropicMessages
+        ) {
+            return None;
+        }
+        if !matches!(identity.vendor.as_str(), "anthropic" | "claude") {
+            return None;
+        }
+        // 关得掉思考的端点没必要发 `clear_thinking`：它们本来就不再回传
+        // 旧思考块（`echo_back_in_messages` 为 false），多发一条编辑项只是
+        // 给端点多一次 400 的机会。强制思考的端点才真的需要它。
+        let keep_thinking_turns = if thinking_cannot_be_disabled(identity) {
+            Some(cfg.opts.protect_recent.max(1) as u32)
+        } else {
+            None
+        };
+        Some(wyj_api::provider::ServerContextManagement {
+            trigger_tokens: server_context_management_trigger(effective_window),
+            keep_tool_uses: cfg.opts.protect_recent.max(1) as u32,
+            // 省下的量还不够占位符本身时不该动手：那次清理只会多付一次
+            // 前缀失效。取 min_result_bytes 的 token 当量（约 4 字节/token）
+            // 再放宽一个量级，避免对小结果反复触发。
+            clear_at_least_tokens: (cfg.opts.min_bytes / 4).max(1_000) as u32,
+            // 与本地 `is_elidable_tool` 的排除项一致：写工具的回执丢了模型
+            // 会重做（Edit/Write），BashOutput 读的是活动会话、重跑不回来。
+            exclude_tools: vec![
+                "Edit".to_string(),
+                "Write".to_string(),
+                "NotebookEdit".to_string(),
+                "BashOutput".to_string(),
+            ],
+            keep_thinking_turns,
+        })
     }
 
     /// 装配编辑后自动校验。`None`（项目没在 `.wyj-code/settings.json` 里声明
@@ -846,6 +993,15 @@ impl Agent {
         self
     }
 
+    /// 设置花费熔断闸（金额上限 + 输出 token 上限）。
+    ///
+    /// 默认全关。开启后**未知模型不熔断**（查不到单价 = 不知道价格），
+    /// 且触发时先收尾交付再硬中止——见 [`crate::budget`]。
+    pub fn with_budget_limits(mut self, limits: crate::budget::BudgetLimits) -> Self {
+        self.budget_limits = limits;
+        self
+    }
+
     /// 根据当前路由的模型标识推导实际生效的最大推理轮数。
     ///
     /// 判据见 [`helpers::max_turns_for_model`]：模型名命中 `reasoner` / `-r1`，
@@ -934,6 +1090,23 @@ impl Agent {
     pub fn with_memory_v3(mut self, memory: Arc<MemoryV3Store>) -> Self {
         self.memory_v3 = Some(memory);
         self
+    }
+
+    /// 装配会话滚动工作文档。
+    ///
+    /// `None` = 关闭：压缩退回一次性全量摘要（v0.3.x 及更早的行为）。
+    /// 传入即可用，不需要额外开关——它的收益（省一次全量往返 + 不再
+    /// 「摘要的摘要」）在长会话里是单调正向的，而代价被增量更新摊平。
+    pub fn with_session_memory(
+        mut self,
+        memory: Option<Arc<crate::session_memory::SessionMemory>>,
+    ) -> Self {
+        self.session_memory = memory;
+        self
+    }
+
+    pub fn session_memory_ref(&self) -> Option<&Arc<crate::session_memory::SessionMemory>> {
+        self.session_memory.as_ref()
     }
 
     pub fn memory_v3_ref(&self) -> Option<&Arc<MemoryV3Store>> {
@@ -1369,6 +1542,11 @@ impl Agent {
                 Err(error) => tracing::warn!("记录 Evolution Episode 失败: {error}"),
             }
         }
+        // 兜底抽干：`run_turn_with_injection_inner` 中途 `?` 冒泡时它的收尾
+        // 抽干不会执行，而辅助往返的 token 已经花掉了。这里覆盖全部退出路径
+        // （成功 / 失败 / 中断），多调一次是安全的——`take()` 用 `swap(0)`，
+        // 正常路径已经抽干过的话这里是空操作。
+        session.drain_aux_usage(self.aux_usage.as_deref());
         result
     }
 
@@ -1649,6 +1827,10 @@ impl Agent {
         let mut invalid_argument_wrap_up_sent = false;
         // 收尾指令只注入一次；注入后模型仍不交出最终回答，才落到硬中止。
         let mut wrap_up_sent = false;
+        // 花费熔断的收尾标志。与 `wrap_up_sent` 分开：两条闸都可能触发，
+        // 但触发原因不同（轮数 vs 金额），提示语也不同，共用一个标志会
+        // 让第二条闸的提示被第一条吃掉。
+        let mut budget_wrap_up_sent = false;
         // 输出预算被 thinking 吃干净时（`stop_reason == MaxTokens` 且整条
         // 回复只有 thinking 块）自动重试**一次**：临时放大输出预算并把
         // reasoning effort 降一档，把预算从思考让回正文。只做一次是因为
@@ -1661,6 +1843,9 @@ impl Agent {
         // 最低档，避免「思考链越回传越长 → 单次思考吃满 max_tokens」的正反馈。
         // 声明在循环外：提示只在第一次触发时发一次，之后每轮静默沿用降档。
         let mut preemptive_thinking_floor = false;
+        // 本次用户提交内的累计用量（预算闸用）。与 `Session` 的会话级累计
+        // 分开：预算管的是「单次提交」——长会话里的十次提交各自独立计预算。
+        let mut turn_spend = crate::budget::TurnSpend::default();
         loop {
             turn += 1;
             if turn > max_turns {
@@ -1702,6 +1887,86 @@ impl Agent {
             //
             // 注入只做一次（`wrap_up_sent`）。模型无视指令继续调工具时，下一轮
             // 就落到上面的硬中止——那才是真正该报错的情形。
+            // ── 花费熔断 ──
+            // 与轮数闸互补：轮数管「跑了多少趟」，这个管「每趟多贵」。
+            // 用户看到的失控现场常常是「每轮都在推进、但每轮都很贵」——
+            // 轮数闸完全拦不住。
+            //
+            // 复用同一套收尾机制：注入一条「预算已用尽，立即总结」的 user
+            // 消息，模型据此交出最终文本，回合以「完成」收尾。若它无视指令
+            // 继续调工具，下一轮由下面的 `budget_hard_stop` 真正中止。
+            //
+            // 判据在**每轮请求发出前**评估：越闸时这一趟已经花掉了，
+            // 但下一趟不该再花。
+            if !budget_wrap_up_sent && !self.budget_limits.is_disabled() {
+                // 辅助往返（Auto 分类器 / 标题 / 记忆提取 / 滚动文档）同样在
+                // 花这一轮的预算。它们走共享累加器而不是 `add_usage`，不主动
+                // 抽干的话金额闸永远看不到这部分——Auto 模式下分类器每拦一个
+                // 工具就是一次完整往返，漏掉的不是零头。
+                let aux_before = (
+                    session.aux_input_tokens,
+                    session.aux_output_tokens,
+                    session.aux_cache_read_tokens,
+                );
+                session.drain_aux_usage(self.aux_usage.as_deref());
+                turn_spend.add(
+                    session.aux_input_tokens.saturating_sub(aux_before.0),
+                    session.aux_output_tokens.saturating_sub(aux_before.1),
+                    session.aux_cache_read_tokens.saturating_sub(aux_before.2),
+                    0,
+                );
+                // 用 `self.route_model` 而不是当前 route：这段代码在
+                // `'route_attempt` 循环**之外**，那里才有 `route` 变量。
+                // 两者在绝大多数情况下是同一个模型（fallback 时
+                // route_model 仍是主模型）——而 fallback 恰恰是最该
+                // 熔断的场景，用主模型的价格判断只会**高估**花费，
+                // 方向是安全的。
+                let state =
+                    crate::budget::evaluate(&turn_spend, &self.budget_limits, &self.route_model);
+                if let crate::budget::BudgetState::Exceeded(breach) = state {
+                    let reason = breach.describe();
+                    // 上一轮已经提示过「预算用尽」，模型却无视指令继续调工具
+                    // ——那正是轮数闸 `turn > max_turns` 的同一形态：软性请求
+                    // 在模型沉浸态里不产生约束力。此时真正中止，并把工作现场
+                    // 存档，让用户能 `/rewind` 回来。
+                    //
+                    // 与轮数闸一样先落 checkpoint 再报错：中止意味着这一轮
+                    // 几十次工具调用的成果要被丢在原地，用户能用的最近锚点
+                    // 是本次提交开始前的 AutoUser checkpoint。
+                    if budget_wrap_up_sent {
+                        self.create_checkpoint(
+                            session,
+                            ctx.cwd(),
+                            session.messages.clone(),
+                            crate::checkpoint::CheckpointKind::TurnLimit,
+                            Some(format!("花费预算用尽前自动存档（{reason}）")),
+                        )
+                        .await;
+                        anyhow::bail!(
+                            "{reason}。已自动存档到预算用尽前的状态，可用 `/rewind` 回到工作现场后换个思路继续。"
+                        );
+                    }
+                    budget_wrap_up_sent = true;
+                    session.turn_truncated = true;
+                    let notice = format!(
+                        "<spend-budget-exceeded>\n\
+                         {reason}. Do not call any more tools. Immediately write your \
+                         final message: what you completed, what you verified, what \
+                         remains undone, and the exact next step. A partial but honest \
+                         delivery is required — an unfinished task reported accurately \
+                         is far more useful than more tool calls.\n\
+                         本轮预算已用尽（{reason}）。不要再调用任何工具，立即输出最终消息：\
+                         已完成的、已验证的、未完成的、以及下一步具体做什么。\
+                         </spend-budget-exceeded>"
+                    );
+                    session.push_user_blocks_merged(vec![ContentBlock::Text { text: notice }]);
+                    on_text(&wyj_i18n::tr_fmt(
+                        "agent.spend_budget_wrap_up",
+                        &[("reason", &reason)],
+                    ));
+                }
+            }
+
             if !wrap_up_sent && turn >= wrap_up_at {
                 wrap_up_sent = true;
                 // 记到 session 上：上层（TUI）据此区分「正常交付」与「预算
@@ -1832,6 +2097,10 @@ impl Agent {
                         // 少了 catalog 这道，被端点拒过的 beta 会反复重发。
                         interleaved: route.interleaved_thinking
                             && capabilities.interleaved_thinking.value,
+                        // 触发线依赖**有效窗口**（配置 → 容量表 → 端点实测取最小），
+                        // 而有效窗口在上面这个分支之后才算出来。先留空，等
+                        // `effective_window` 就绪后统一回填。
+                        server_context_management: None,
                     }
                 } else {
                     wyj_api::provider::RequestOptions {
@@ -1840,6 +2109,7 @@ impl Agent {
                         reasoning_effort,
                         thinking_switch: route.thinking_switch.clone(),
                         interleaved: route.interleaved_thinking,
+                        server_context_management: None,
                     }
                 };
                 // 第三层：长历史 + 强制思考模型 → 预防性把 reasoning 压到最低档。
@@ -1959,7 +2229,15 @@ impl Agent {
                         session.prompt_drift_since_resume = Some(drift);
                     }
                 }
-                session.prompt_fingerprint = Some(fingerprint);
+                session.prompt_fingerprint = Some(fingerprint.clone());
+                // 每趟都记一条指纹（不只是第一次）：缓存掉量可能发生在
+                // 进程内任何一趟，而归因要对比的是「掉量前后」的两次。
+                // 指纹本身是几 KB 的摘要，16 条封顶后体积可忽略。
+                session.cache_fingerprints.push(Some(fingerprint.clone()));
+                if session.cache_fingerprints.len() > CACHE_SAMPLE_HISTORY {
+                    let excess = session.cache_fingerprints.len() - CACHE_SAMPLE_HISTORY;
+                    session.cache_fingerprints.drain(..excess);
+                }
                 // 存下「本次真正发出去的 volatile 字节」：手动 `/compact` 必须与
                 // 主对话前缀**逐字节相同**才能命中缓存，而尾部三段依赖本次
                 // route 的能力快照与当时的工具集合。子目录规约 reminder 已改
@@ -1986,12 +2264,64 @@ impl Agent {
                 // 按当前路由目标的真实窗口与能力估算；fallback 模型可能比主模型
                 // 上下文更小，不能复用主模型预算。分解结果落进 session，
                 // 供 TUI 的 `/context` 面板与状态栏和压缩决策**共用同一口径**。
-                let context_audit = ContextAudit::from_request(
+                let mut context_audit = ContextAudit::from_request(
                     &request_system,
                     &session.messages,
                     &request_tools,
                     opts.max_tokens,
                 );
+                // 有效窗口：配置值 → 静态容量表 → 端点实测，取最小。
+                //
+                // 中间那层是 2026-10 补的：实测 686 个会话里多个 profile 把
+                // `context_window` 填成 1,000,000，而真实模型只有 204,800，
+                // 于是软/硬阈值双双落在够不着的位置（94% 的长会话从未压缩）。
+                // 之前只靠端点报 400 自愈，而这些第三方端点选择静默截断。
+                //
+                // **目录值必须先过一致性校验**：容量表用子串匹配族名
+                // （`models.rs` 的 `("deepseek", 64_000)` 会命中
+                // `deepseek/deepseek-v4.1-flash-1017` 这种聚合路由 ID）。当猜测
+                // 出的窗口连「用户的输出预算 + 协议开销 + 最小可压缩提示段」
+                // 都装不下时，它不是保守下限而是一个错值——此时宁可保留配置
+                // 值，让端点 400 给出实测上界（`overflow_window_hint`）。
+                // 否则会算出 `window - (max_tokens + 8192) = 0` 的压缩阈值，
+                // 每一轮请求都判定「超限」→ 每回合都压缩 → 死循环。
+                let catalog_hint = consistent_catalog_window(&route.model, route.max_tokens);
+                let effective_window =
+                    session.effective_context_window(route.context_window, catalog_hint);
+
+                // 输出预算与有效窗口必须相容：`compact_trigger_buffer` 不
+                // 小于 `max_tokens`（这是「阈值 + 输出预留 ≤ 窗口」的硬保证），
+                // 所以一旦 `max_tokens + 8192 ≥ 窗口`，阈值会被 `saturating_sub`
+                // 静默压成 0。那不是一个「很紧」的阈值，而是「永远超限」——
+                // 历史压到只剩一条摘要也仍然 > 0，压缩永远收敛不了。
+                //
+                // 这里把输出预算压到窗口的 40%：既留出可压缩的提示空间，也
+                // 让单次请求的结构性 400 风险归零。只改本次请求的 `opts`，
+                // 不动 profile 配置——它表达的是「这个端点的输出上限」，而
+                // 这里要解决的是「窗口根本容不下它」。
+                let requested_max_tokens = opts.max_tokens;
+                if compact_trigger_buffer(effective_window, requested_max_tokens)
+                    >= effective_window
+                {
+                    let clamped = (effective_window.saturating_mul(2) / 5).max(1);
+                    opts.max_tokens = clamped;
+                    context_audit.output_reserve = clamped;
+                    tracing::warn!(
+                        model = %route.model,
+                        window = effective_window,
+                        requested = requested_max_tokens,
+                        applied = clamped,
+                        "输出预算超出有效窗口的可压缩余量，本请求已临时下调"
+                    );
+                    on_text(&wyj_i18n::tr_fmt(
+                        "agent.output_budget_clamped",
+                        &[
+                            ("requested", &requested_max_tokens.to_string()),
+                            ("window", &effective_window.to_string()),
+                            ("applied", &clamped.to_string()),
+                        ],
+                    ));
+                }
                 // 阈值判定用**校准后**的估算：字符启发式对代码 / JSON / 多语言
                 // 混排的偏差可达数十个百分点，而阈值是按比例切的硬线。系数来自
                 // 每轮请求成功后 provider 上报的真实 prompt token（见
@@ -1999,12 +2329,11 @@ impl Agent {
                 // 旧版逐字节相同。
                 let ratio = session.estimate_ratio();
                 let estimated_before = context_audit.calibrated_total(ratio);
-                // 有效窗口：配置值，但被端点拒绝过就按实测值收紧。`context_window`
-                // 是裸配置，填大了两道防线会一起落在够不着的位置。
-                let effective_window = session.effective_context_window(route.context_window);
                 session.context_audit = context_audit.with_window(effective_window);
-                let compact_threshold = effective_window
-                    .saturating_sub(compact_trigger_buffer(effective_window, opts.max_tokens));
+                // 下限兜底：`compact_threshold` 同时守住「阈值 + 输出 ≤ 窗口」
+                // 与「阈值 > 0」两条不变量，详见其文档。
+                let compact_threshold =
+                    crate::compact::compact_threshold(effective_window, opts.max_tokens);
                 // 软阈值：context editing 的**动手线**，与上面的压缩硬阈值分开。
                 // 硬阈值决定"何时停手"，软阈值决定"何时开始"——1M 窗口下硬阈值
                 // 在 900K，等它触发意味着整段历史被原样重发了几百趟。
@@ -2012,6 +2341,13 @@ impl Agent {
                 // `estimated_before > compact_threshold`，与改动前完全一致。
                 let soft_threshold =
                     soft_threshold_tokens(effective_window, self.context_edit.as_ref());
+
+                // 服务端上下文清理：触发线依赖有效窗口，所以必须在这里回填，
+                // 不能放进上面构造 `opts` 的分支里（那时窗口还没算出来）。
+                // provider 侧会再按线协议 / vendor 判一次，这里给的就是
+                // 「如果端点支持，我要什么」。
+                opts.server_context_management =
+                    self.server_context_management(effective_window, &route_identity);
 
                 // 清理优先于摘要：超阈值时先把过期的工具输出外部化掉（更便宜、
                 // 不产生幻觉、更保真），清理后仍超标才跑整段摘要。对齐 Claude
@@ -2067,7 +2403,26 @@ impl Agent {
                     None
                 };
 
-                if estimated > compact_threshold {
+                // 跨回合停滞熔断。`compact_session_until_fit` 的 MIN_PROGRESS_RATIO
+                // 只管**单次请求内**的 3 轮；历史上真正烧钱的是「每一轮用户提交
+                // 都压一次、每次都压不下去」——摘要已是历史里唯一的东西，
+                // 阈值却仍然够不着（典型成因：输出预算/system/工具定义本身
+                // 就占满了窗口）。
+                //
+                // 判据放在这里而不是 `compact` 内部：只有调用方知道「压缩前
+                // 是否超标」，也只有它能把冷却状态随会话带下去。
+                let compact_cooling_down = session.compact_cooldown_turns > 0;
+                if compact_cooling_down {
+                    session.compact_cooldown_turns -= 1;
+                    tracing::warn!(
+                        remaining = session.compact_cooldown_turns,
+                        estimated,
+                        threshold = compact_threshold,
+                        "上次自动压缩未能把上下文压到阈值以下，本轮跳过压缩"
+                    );
+                }
+
+                if estimated > compact_threshold && !compact_cooling_down {
                     // 循环压缩：单次 compact 不一定够（heuristic 偏低 /
                     // reasoning 模型一轮回巨长 / 上次摘要本身偏长）；
                     // `compact_session_until_fit` 最多跑 3 次直到估算
@@ -2090,20 +2445,47 @@ impl Agent {
                         )
                         .calibrated_total(ratio)
                     };
-                    let outcome = compact_session_until_fit(
+                    // 压缩是本次提交里真实发生的花费：历史最长时它往往是
+                    // 一趟与历史等长的输入。不计进 `turn_spend`，金额熔断
+                    // 就会系统性低估——而这正是 `budget.rs` 自己警告过的
+                    // 「面板与熔断两套口径」。
+                    let spend_before = (
+                        session.total_input_tokens,
+                        session.total_output_tokens,
+                        session.total_cache_read_tokens,
+                        session.total_cache_write_tokens,
+                    );
+                    let outcome = crate::compact::compact_session_until_fit_with_session_memory(
                         session,
                         route.provider.as_ref(),
                         effective_window,
                         compact_threshold,
                         compact_prefix,
                         &measure_request,
+                        self.compact_archive_cas(),
+                        self.session_memory.as_deref(),
                     )
                     .await;
+                    turn_spend.add(
+                        session.total_input_tokens.saturating_sub(spend_before.0),
+                        session.total_output_tokens.saturating_sub(spend_before.1),
+                        session
+                            .total_cache_read_tokens
+                            .saturating_sub(spend_before.2),
+                        session
+                            .total_cache_write_tokens
+                            .saturating_sub(spend_before.3),
+                    );
                     if let Some(error) = outcome.last_error {
                         tracing::warn!("上下文压缩失败: {error}");
                     } else if outcome.passes > 0 {
                         if let Some(result) = outcome.last_result {
                             session.compact_count = session.compact_count.saturating_add(1);
+                            // 代际由 `compact_session` 按「被压段里有没有既有摘要」
+                            // 判定，这里只搬运。不能用 `compact_count` 代替：
+                            // `reset_entire_session` 的压缩会把历史换成一份全新
+                            // 摘要，代际归 1 而不是继续累加。
+                            session.compact_generation = result.generation;
                             session.last_compact_saved_tokens = result.tokens_saved_estimate;
                             on_text(&wyj_i18n::tr_fmt(
                                 "agent.compacted",
@@ -2135,6 +2517,28 @@ impl Agent {
                             opts.max_tokens,
                         )
                         .with_window(effective_window);
+                        // 「压完仍超标」= 这条路径收敛不了。此时**不能**让
+                        // 下一个用户回合原样再来一次：那会变成每回合一次
+                        // 全量摘要往返，而历史已经被压到只剩摘要，压无可压。
+                        // 冷却 3 轮后自动重试（窗口/配置可能已被用户改过），
+                        // 期间仍由 `truncate_messages` 与 400 恢复路径兜底。
+                        let after = session.context_audit.calibrated_total(ratio);
+                        if after > compact_threshold {
+                            session.compact_cooldown_turns = 3;
+                            on_text(&wyj_i18n::tr_fmt(
+                                "agent.compact_not_converging",
+                                &[
+                                    ("window", &effective_window.to_string()),
+                                    ("threshold", &compact_threshold.to_string()),
+                                ],
+                            ));
+                            tracing::warn!(
+                                after,
+                                threshold = compact_threshold,
+                                window = effective_window,
+                                "压缩后仍超阈值，暂停自动压缩 3 轮"
+                            );
+                        }
                     }
                 }
 
@@ -2163,7 +2567,10 @@ impl Agent {
                 // （对标 Claude Code 的 "Autocompact is thrashing" 熔断）。
                 let mut context_recovered = false;
                 let result = loop {
-                    session.api_calls += 1;
+                    // 尝试次数与成功往返数分开记：token 只在流完整结束时
+                    // 入账，失败重试不产生 token。把尝试次数当分母会让
+                    // `input_per_api_call` 被系统性稀释。
+                    session.api_attempts += 1;
                     // 把 provider 侧的缓存生效状态同步进会话。第三方端点拒绝
                     // cache_control 时会自动降级，若不回写，`/cost` 看到
                     // cache_read 恒为 0 却无法区分"没配"与"配了但用不了"——
@@ -2233,19 +2640,22 @@ impl Agent {
                                 .calibrated_total(ratio);
                                 session.note_context_overflow(rejected);
                                 on_text(&wyj_i18n::tr("agent.context_overflow"));
-                                match crate::compact::compact_session(
+                                match crate::compact::compact_session_with_session_memory(
                                     session,
                                     route.provider.as_ref(),
                                     effective_window,
                                     // 与主压缩路径同一判据：不缓存的端点不走
                                     // 前缀复用，避免把整段历史全价重发一遍。
                                     compact_prefix,
+                                    self.compact_archive_cas(),
+                                    self.session_memory.as_deref(),
                                 )
                                 .await
                                 {
                                     Ok(result) => {
                                         session.compact_count =
                                             session.compact_count.saturating_add(1);
+                                        session.compact_generation = result.generation;
                                         session.last_compact_saved_tokens =
                                             result.tokens_saved_estimate;
                                         on_text(&wyj_i18n::tr_fmt(
@@ -2353,7 +2763,14 @@ impl Agent {
                     // crate 已知行为而非真正的中断;若此时本轮已收到 MessageStop 或
                     // Usage,把它当作流正常结束,否则保留 stream_err 走原重试路径。
                     let mut seen_completion = false;
-                    let mut pending_usage: Vec<(u32, u32, u32, u32)> = vec![];
+                    // 一次请求可能上报**多条** usage：Anthropic 把 prompt 计数放在
+                    // `message_start`、把 output 计数放在 `message_delta`，而后者
+                    // 的 input 恒为 0。所以这里按字段**取最大值合并**，既不能
+                    // 逐条累加（`message_start` 的 output 占位 1 会被重复计入，
+                    // 缓存样本也会多记一条），也不能后写覆盖（会把真实 input
+                    // 抹成 0，校准系数随之永远不更新）。
+                    // (input, output, cache_read, cache_write, reasoning)
+                    let mut attempt_usage: Option<(u32, u32, u32, u32, u32)> = None;
                     let mut stream_err: Option<anyhow::Error> = None;
 
                     while let Some(event) = stream.next().await {
@@ -2477,13 +2894,21 @@ impl Agent {
                                 output_tokens,
                                 cache_read_input_tokens,
                                 cache_creation_input_tokens,
+                                reasoning_tokens,
                             } => {
-                                pending_usage.push((
+                                // 按字段取最大值合并（见 `attempt_usage` 的说明）。
+                                let merged = attempt_usage.get_or_insert((
                                     input_tokens,
                                     output_tokens,
                                     cache_read_input_tokens,
                                     cache_creation_input_tokens,
+                                    reasoning_tokens,
                                 ));
+                                merged.0 = merged.0.max(input_tokens);
+                                merged.1 = merged.1.max(output_tokens);
+                                merged.2 = merged.2.max(cache_read_input_tokens);
+                                merged.3 = merged.3.max(cache_creation_input_tokens);
+                                merged.4 = merged.4.max(reasoning_tokens);
                                 seen_completion = true;
                             }
                         }
@@ -2512,21 +2937,54 @@ impl Agent {
                             // 仅含未命中缓存的（全价）部分，缓存命中（0.1x）与缓存
                             // 写入（1.25x）单独累计用于 /cost 展示。
                             //
-                            // 校准采样只取**最后一条**：重试路径可能在同一轮回填多次
-                            // usage，累加会把真实 prompt 抬高一倍，系数随之被系统性
-                            // 高估——而系数直接进压缩阈值判定。
-                            let real_prompt = pending_usage
-                                .last()
-                                .map(|(input, _, cache_read, cache_write)| {
-                                    input
-                                        .saturating_add(*cache_read)
-                                        .saturating_add(*cache_write)
+                            // 校准采样：`attempt_usage` 已经是本次尝试的合并值
+                            // （Anthropic 的 input 与 output 分处两条事件，
+                            // 合并后才是完整 prompt）。重试路径每次尝试各有一份，
+                            // 只取本次（成功的那次）——累加会把真实 prompt 抬高一倍。
+                            let real_prompt = attempt_usage
+                                .map(|(input, _, cache_read, cache_write, _)| {
+                                    input.saturating_add(cache_read).saturating_add(cache_write)
                                 })
                                 .unwrap_or(0);
                             session.observe_prompt_tokens(real_prompt);
-                            for (input, output, cache_read, cache_write) in pending_usage {
+                            // 成功往返数：只在流**完整结束**时 +1。
+                            //
+                            // 这里用「流是否完整结束」而不是「有没有 usage 事件」
+                            // 作为判据：端点可能不报 usage（那本身是另一种
+                            // 情况），但请求确实成功过——把它漏掉会让分母偏小，
+                            // 比率反而偏高。
+                            session.api_calls += 1;
+                            if let Some((input, output, cache_read, cache_write, reasoning)) =
+                                attempt_usage
+                            {
                                 session.add_usage(input, output);
                                 session.add_cache_usage(cache_read, cache_write);
+                                session.add_reasoning_tokens(reasoning);
+                                turn_spend.add(input, output, cache_read, cache_write);
+                                // 缓存观测：记下这一趟的命中量与 prompt 的
+                                // 可比段 digest，供「缓存为什么掉了」归因。
+                                session
+                                    .cache_samples
+                                    .push(crate::cache_attribution::CacheSample {
+                                        // 用成功往返数当序号：`cache_samples`
+                                        // 会被截断到 16 条，用 `len() + 1` 会让
+                                        // 第 16 次之后永远显示「第 17 次请求」。
+                                        request_index: session.api_calls,
+                                        main_digest: fingerprint
+                                            .section(crate::prompt_fingerprint::SECTION_MAIN)
+                                            .map(|s| s.digest.clone())
+                                            .unwrap_or_default(),
+                                        tools_digest: fingerprint
+                                            .section(crate::prompt_fingerprint::SECTION_TOOLS)
+                                            .map(|s| s.digest.clone())
+                                            .unwrap_or_default(),
+                                        cache_read_tokens: cache_read,
+                                        input_tokens: input,
+                                    });
+                                if session.cache_samples.len() > CACHE_SAMPLE_HISTORY {
+                                    let excess = session.cache_samples.len() - CACHE_SAMPLE_HISTORY;
+                                    session.cache_samples.drain(..excess);
+                                }
                                 if let Some(cb) = &self.usage_cb {
                                     cb(input, output);
                                 }
@@ -2819,15 +3277,33 @@ impl Agent {
                 // 缓存前缀的最前端，改它会把整段历史（触顶时实测约 42 万 token）
                 // 从 cache_read 打回全价重算——为一次收尾付这个代价不划算。回一条
                 // 结果不动请求体，缓存照常命中。
-                if wrap_up_sent {
+                if wrap_up_sent || budget_wrap_up_sent {
+                    // 两条闸共用「关工具」这一步，但**回执文案必须区分**：
+                    // 模型读到自己那次调用被拒时会顺带读到原因。只写
+                    // 「轮数预算」而实际触发的是金额闸，会让模型以为自己
+                    // 「还有轮数只是没钱了」——下一轮它可能改用更贵的长思考
+                    // 一次性把活干完，反而更烧钱。
+                    let (error_code, instruction) = if budget_wrap_up_sent {
+                        (
+                            "tools_closed_spend_budget_exhausted",
+                            "本轮预算（金额或输出 token）已用尽，工具已关闭。\\
+                             不要再发起任何工具调用；现在直接输出最终消息：\\
+                             已完成什么、验证了什么、下一步具体做什么。",
+                        )
+                    } else {
+                        (
+                            "tools_closed_turn_budget_exhausted",
+                            "本轮工具循环的轮数预算已用尽，工具已关闭。\\
+                             不要再发起任何工具调用；现在直接输出最终消息：\\
+                             已完成什么、验证了什么、下一步具体做什么。",
+                        )
+                    };
                     for (idx, id, name, _input) in calls.drain(..) {
                         let feedback = serde_json::json!({
-                            "error": "tools_closed_turn_budget_exhausted",
+                            "error": error_code,
                             "turn": turn,
                             "max_turns": max_turns,
-                            "instruction": "本轮工具循环的轮数预算已用尽，工具已关闭。\
-                                            不要再发起任何工具调用；现在直接输出最终消息：\
-                                            已完成什么、验证了什么、还剩什么、下一步具体做什么。",
+                            "instruction": instruction,
                         })
                         .to_string();
                         if let Some(cb) = &self.tool_cb {
@@ -2904,7 +3380,11 @@ impl Agent {
                 // 落在"会阻塞"那一侧（`ToolCtx::needs_dialog` 里对应地返回 true）。
                 let mut par_futs = vec![];
                 let mut seq_calls = vec![];
+                // 本批要执行的工具名（供 PostToolBatch hook 的 payload 用）。
+                // 在这里收集是因为 `calls` 在下面的 for 里被 move 消费掉。
+                let mut batch_tool_names: Vec<String> = Vec::new();
                 for (idx, id, name, input) in calls {
+                    batch_tool_names.push(name.clone());
                     let tool_impl = self.tool_impls.get(&name);
                     let needs_ui = tool_impl
                         .map(|t| t.needs_permission(&input))
@@ -2988,6 +3468,50 @@ impl Agent {
                     // 出现正常工具轮即视为自愈，重新给一次收尾机会：收尾指令是
                     // 「本次连撞」的兜底，不是对整轮永久生效的封条。
                     invalid_argument_wrap_up_sent = false;
+                }
+
+                // ── PostToolBatch：整批工具执行完之后触发一次 ──────────────
+                //
+                // 与 PostToolUse 的分工：后者是「每个工具调用后各一次」，
+                // 一批 8 个工具就触发 8 次；本事件是**整批结束后一次**。
+                //
+                // 用户自动化里「跑一次全量 lint / 汇总本批改动 / 统一格式化」
+                // 这类动作，挂在 PostToolUse 上会被执行 N 次（而且并发工具
+                // 的完成顺序不确定）；挂在 PostToolBatch 上才是「这批做完了，
+                // 检查一下」。
+                //
+                // 只在本批确实执行过工具时触发：`tool_results` 为空说明这轮
+                // 没有实际执行（例如收尾宽限期内全部被拒），此时跑批量检查
+                // 没有意义。
+                if let Some(hr) = &self.hook_runner {
+                    if !batch_tool_names.is_empty() {
+                        let payload = serde_json::json!({
+                            "tools": batch_tool_names,
+                        });
+                        match hr
+                            .run(
+                                "PostToolBatch",
+                                None,
+                                self.session_id.as_deref(),
+                                ctx.cwd(),
+                                Some(&payload),
+                                None,
+                            )
+                            .await
+                        {
+                            HookOutcome::Block(reason) => {
+                                session.push_user_blocks_merged(vec![ContentBlock::Text {
+                                    text: format!("[PostToolBatch hook] {reason}"),
+                                }]);
+                            }
+                            HookOutcome::Continue { context: Some(c) } => {
+                                session.push_user_blocks_merged(vec![ContentBlock::Text {
+                                    text: format!("[PostToolBatch hook] {c}"),
+                                }]);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 // 子目录动态加载：本轮工具触达的目录若有未展示过的规约文件，
@@ -3286,6 +3810,33 @@ impl Agent {
                         }
                     }
                 }
+                // 会话滚动工作文档：每 SESSION_MEMORY_EVERY_TURNS 轮增量
+                // 更新一次。与上面的记忆提取**错开**（4 vs 3），两者都是
+                // 辅助 LLM 往返，撞同一轮会让主循环多等一趟。
+                //
+                // 它必须在压缩**之前**尽量新：压缩时若文档足够完整就直接
+                // splice，省掉一次与历史等长的全量摘要往返。文档更新本身
+                // 只喂 `messages[covered..]`，成本与增量成正比。
+                if crate::session_memory::update_due(user_turns, SESSION_MEMORY_EVERY_TURNS) {
+                    if let Some(memory) = self.session_memory.as_ref().cloned() {
+                        let provider = self.aux_provider_or_route();
+                        // 快照历史而不是借 `&session`：spawn 出去的 task
+                        // 必须 'static，而 session 在本轮结束前还要被
+                        // 收尾逻辑（抽干用量、emit 事件）继续使用。
+                        let snapshot = session.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(BACKGROUND_LLM_YIELD).await;
+                            if let Err(error) = memory
+                                .update(&snapshot, provider.as_ref(), SESSION_MEMORY_MAX_TOKENS)
+                                .await
+                            {
+                                // 失败只 debug：滚动文档是压缩的**加速路径**，
+                                // 拿不到就退回全量摘要，不影响任何正确性。
+                                tracing::debug!("会话滚动文档更新失败: {error}");
+                            }
+                        });
+                    }
+                }
                 // 首轮后触发后台标题生成（若已配置 SummaryGenerator 且有 session_id）
                 if let Some(gen) = self.summary.as_ref().cloned() {
                     if let Some(sid) = self.session_id.clone() {
@@ -3314,8 +3865,28 @@ impl Agent {
                 break;
             }
         }
+        // 回合收尾抽干辅助往返用量。放在 `TurnFinished` 之前：TUI 收到
+        // TurnFinished 会立刻刷新 `/cost`，晚一步用户看到的还是旧数。
+        //
+        // 抽干点必须覆盖**所有**退出路径（正常 break / `?` 冒泡 / 中断），
+        // 所以它只能挂在这里——`run_turn_with_injection_inner` 的返回点
+        // 只有一个，而中途 `?` 会跳过它。漏记的那部分会在下一回合开头补上
+        // （见 `run_turn` 入口的对称抽干）。
+        session.drain_aux_usage(self.aux_usage.as_deref());
         self.emit_session_event(crate::SessionEvent::TurnFinished);
         Ok(())
+    }
+
+    /// 压缩归档用的 CAS 池（取自 context editing 的配置）。
+    ///
+    /// 与 context editing 共用同一个池是有意的：两者的 blob 都记进
+    /// `Session.elided_blobs`，共用池意味着共用同一套引用计数与 `gc` 回收，
+    /// 不会出现「压缩归档的 blob 没有回收者」这种分裂。
+    ///
+    /// `None`（未启用 context editing，或 CAS 目录不可写）= 不归档，
+    /// 压缩行为退回旧版（直接丢弃被压缩段）。
+    fn compact_archive_cas(&self) -> Option<&crate::workspace_cas::WorkspaceCas> {
+        self.context_edit.as_ref().map(|cfg| cfg.cas.as_ref())
     }
 
     /// 本次用户提交内该工具是否已拿到授权。
@@ -3472,6 +4043,9 @@ impl Agent {
     ) -> (String, wyj_api::types::ToolResultContent, bool) {
         use wyj_api::types::ToolResultContent;
         let tool = self.tool_impls.get(&name).cloned();
+        // 提前取出「这次调用写了哪个文件」：`input` 在下面会被 move 进
+        // `run_tool`，之后再读就晚了。FileChanged hook 要用它。
+        let file_changed_target = file_write_target(&name, &input);
 
         if let Some(cb) = &self.tool_cb {
             cb(ToolEvent::Start {
@@ -3616,6 +4190,52 @@ impl Agent {
             None => (display, content),
         };
 
+        // ── FileChanged：文件真的被改了才触发 ────────────────────────────
+        //
+        // 与 PostToolUse 的分工：PostToolUse 是「每次工具调用后」，FileChanged
+        // 只在**写类工具成功且确实落在某个文件上**时触发。用户的自动化里，
+        // 「跑 formatter / linter / 重新生成产物」这类动作挂在 PostToolUse 上
+        // 会对着 Read/Grep 也跑一遍，挂在 FileChanged 上才精确。
+        //
+        // 失败的工具不触发：`is_error` 时文件可能处于半改状态，此时跑 formatter
+        // 会对着语法错误的文件报一堆噪音。
+        let file_changed_feedback: Option<String> = if !is_error {
+            match file_changed_target.as_deref() {
+                Some(path) => match &self.hook_runner {
+                    Some(hr) => {
+                        let payload = serde_json::json!({ "file_path": path });
+                        match hr
+                            .run(
+                                "FileChanged",
+                                Some(&name),
+                                self.session_id.as_deref(),
+                                ctx.cwd(),
+                                Some(&payload),
+                                Some(&payload),
+                            )
+                            .await
+                        {
+                            HookOutcome::Block(reason) => Some(reason),
+                            HookOutcome::Continue { context: Some(c) } => Some(c),
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let (display, content) = match file_changed_feedback {
+            Some(fb) => {
+                let suffix = format!("\n\n[FileChanged hook] {fb}");
+                let content = append_hook_feedback(content, &suffix);
+                (format!("{display}{suffix}"), content)
+            }
+            None => (display, content),
+        };
+
         // ── 编辑后校验（verify loop）────────────────────────────────────
         // 排在 PostToolUse hook 之后：hook 是用户私有的自动化，可能已经跑了
         // 自己的校验；声明了 verify 的项目两者并存，两段反馈都留给模型。
@@ -3692,7 +4312,7 @@ impl Agent {
         &self,
         session: &mut Session,
     ) -> Result<crate::compact::CompactResult> {
-        use crate::compact::{compact_session, CompactPrefix};
+        use crate::compact::CompactPrefix;
         let route = self.route_at(self.active_route_index());
 
         // `Arc` 共享：system prompt 含完整 CLAUDE.md 链（本仓库 30KB+），
@@ -3737,10 +4357,15 @@ impl Agent {
             snapshot
         };
 
-        compact_session(
+        crate::compact::compact_session_with_session_memory(
             session,
             route.provider.as_ref(),
-            session.effective_context_window(route.context_window),
+            session.effective_context_window(
+                route.context_window,
+                // 与自动压缩同一份一致性校验：手动 /compact 与自动压缩若用
+                // 两个窗口，摘要预算与保留量都会对不上。
+                consistent_catalog_window(&route.model, route.max_tokens),
+            ),
             // 与 `run_turn` 内两条压缩路径同一判据：不缓存的端点退回独立请求
             // 形态，避免把整段历史全价重发一遍。
             if route
@@ -3759,6 +4384,8 @@ impl Agent {
             } else {
                 None
             },
+            self.compact_archive_cas(),
+            self.session_memory.as_deref(),
         )
         .await
     }
@@ -3817,6 +4444,24 @@ fn append_hook_feedback(
 fn default_system_prompt() -> String {
     // 模型侧提示词统一英文原创措辞（见 prompts.rs 模块注释），不走 i18n
     crate::prompts::MAIN.to_string()
+}
+
+/// 若这次工具调用**写了**某个文件，返回该路径（供 `FileChanged` hook 使用）。
+///
+/// 只认真正会改盘的工具：`Write` / `Edit` / `NotebookEdit`。
+/// `Read` / `Grep` / `Glob` 虽然也有 `file_path`，但它们不改文件——把
+/// FileChanged 挂到它们上面等于让用户的 formatter 对着只读操作空跑。
+fn file_write_target(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    let field = match tool_name {
+        "Write" | "Edit" | "NotebookEdit" => "file_path",
+        _ => return None,
+    };
+    input
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// 从工具调用输入里推导其触达的目录，供项目规约子目录动态加载判断。

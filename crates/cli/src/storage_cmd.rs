@@ -362,7 +362,11 @@ fn run_prune(
         for (session_dir, _path, session_id) in checkpoint_dirs(config_base, extra) {
             checkpoint_sessions += 1;
             let mut store = match wyj_core::CheckpointStore::new(&session_dir, &session_id) {
-                Ok(store) => store.with_max_per_session(storage.checkpoints_per_session),
+                Ok(store) => store
+                    .with_max_per_session(storage.checkpoints_per_session)
+                    // 字节闸门同样要带上：只按条数控制挡不住长会话的体积膨胀
+                    // （实测 5,703 个 checkpoint / 1,836 MB，平均 322 KB）。
+                    .with_max_bytes_per_session(storage.checkpoint_bytes_per_session),
                 Err(error) => {
                     tracing::warn!("打开 checkpoint 目录失败 {session_id}: {error}");
                     checkpoint_failed += 1;
@@ -467,6 +471,68 @@ fn run_prune(
                 "(内容已不可恢复)"
             } else {
                 ""
+            }
+        );
+    }
+
+    // ── Memory v3：过期记录 / 配额截断 ──
+    //
+    // 此前 `storage prune` **完全不碰 memory-v3**：GC 只在 `upsert` 时顺带跑
+    // （见 `MemoryV3Store::upsert`），于是一个停止写入的项目里过期记录会
+    // **永远**留在磁盘上——`expires_at` 只影响召回，不影响物理删除。
+    //
+    // 这里对每个项目目录跑一次 `run_gc`。dry-run 下无法只报计划（`run_gc`
+    // 是读-改-写一体的），因此 dry-run 时**跳过**并明确说明，而不是假装
+    // 报了一个数字——报一个猜出来的数比不报更糟。
+    let mut memory_projects = 0usize;
+    if storage.memory_v3_records_max > 0 {
+        for root in memory_project_roots(config_base, extra) {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let project_dir = entry.path();
+                if !project_dir.is_dir() || !project_dir.join("records.json").exists() {
+                    continue;
+                }
+                memory_projects += 1;
+                if dry_run {
+                    continue;
+                }
+                // 目录名**就是** project_key，直接用 `for_project_key` 构造：
+                // 从 cwd 反推在这里行不通——这些目录对应的仓库可能早已被删除
+                // 或移动，`project_root(cwd)` 会算出一个不同的 key，于是 GC
+                // 打不开任何真实数据，却也不报错。
+                let Some(key) = project_dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                match wyj_core::MemoryV3Store::for_project_key(
+                    &wyj_config::layout::memory_v3_root(config_base),
+                    &root,
+                    key,
+                ) {
+                    Ok(store) => {
+                        let store = store.with_storage_retention(storage.clone());
+                        if let Err(error) = store.run_gc() {
+                            tracing::warn!("memory-v3 GC 失败 {}: {error}", project_dir.display());
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "打开 memory-v3 项目失败 {}: {error}",
+                            project_dir.display()
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "memory-v3: {} 个项目{}",
+            memory_projects,
+            if dry_run {
+                "（dry-run 不执行 GC：GC 是读-改-写一体，无法只报计划）"
+            } else {
+                "已按 retention 配置执行 GC"
             }
         );
     }
@@ -626,15 +692,15 @@ fn run_prune(
     // `cas/locks/` 10641 个 / 42 MB、`sessions/*.lock` 238 个、`*.owner` 65 个。
     // 与上面几段不同，这里删的是**整组会话文件**（含 checkpoint / subagent
     // 旁路目录），所以 dry-run 必须如实报出条数，不能只说「会删一些」。
-    let mut retention_cfg = storage.clone();
+    let retention_cfg = storage.clone();
     if retention_cfg.sessions_ttl_days == 0 {
-        // 显式 prune 时给一个可用的默认值：用户敲 `prune` 就是想看清理计划，
-        // 而 `sessions_ttl_days` 默认 0（启动期不自动删）会让这一段静默空转。
-        // dry-run 与 `--yes` 用同一个值，避免「计划里没提、执行时却删了」。
-        retention_cfg.sessions_ttl_days = 30;
+        // `0` 在配置里是**「永不自动删除」的显式语义**，不是「没配」。
+        // 旧实现把它改写成 30 天再执行，于是「敲一次 prune 回收 CAS」会
+        // 顺手删掉用户明确表示要永久保留的会话——这是不可逆的副作用。
+        // 要清理会话，必须在 config.toml 里显式写天数。
         println!(
-            "session: storage.sessions_ttl_days 未设置,本次按默认 30 天清理\
-             (启动期不会自动执行,除非你把它写进 config.toml)"
+            "session: storage.sessions_ttl_days = 0（永不自动删除），本次跳过会话 TTL 清理；\
+             如需清理请在 config.toml 里显式设置天数"
         );
     }
     if retention_cfg.sessions_ttl_days > 0 || retention_cfg.stale_lock_ttl_days > 0 {
@@ -835,6 +901,20 @@ fn session_dirs(config_base: &Path, extra: &ExtraScopeRoots) -> Vec<PathBuf> {
         }
     }
     dirs
+}
+
+/// memory-v3 的**项目层根目录**列表（每个元素下面是一堆 `<project_key>/`）。
+///
+/// 与 `session_dirs` 同构：`storage.scope = "project"` 时项目记忆落在
+/// `<git-root>/.wyj-code/local/memory-v3/projects/`，只扫 home 会漏掉。
+fn memory_project_roots(config_base: &Path, extra: &ExtraScopeRoots) -> Vec<PathBuf> {
+    let mut roots = vec![wyj_config::layout::memory_v3_root(config_base).join("projects")];
+    if let Some(extra_root) = &extra.memory_projects {
+        if !roots.contains(extra_root) {
+            roots.push(extra_root.clone());
+        }
+    }
+    roots
 }
 
 /// 所有 checkpoint 目录：`(会话目录, checkpoint 目录, session_id)`。

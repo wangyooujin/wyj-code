@@ -352,23 +352,42 @@ enum SessionCommand {
 fn print_config_hints(active: &wyj_config::Profile) {
     // 1) 超大上下文窗口
     if active.context_window > 500_000 {
-        let trigger =
-            active
-                .context_window
-                .saturating_sub(wyj_core::compact::compact_trigger_buffer(
-                    active.context_window,
-                    active.max_tokens,
-                ));
-        println!(
-            "{}",
-            wyj_i18n::tr_fmt(
-                "status.context_window_unverified",
-                &[
-                    ("window", &active.context_window.to_string()),
-                    ("trigger", &trigger.to_string()),
-                ]
-            )
-        );
+        // 静态容量表命中且配置值超过它 → 说清楚「会被自动收紧到多少」，
+        // 而不是只报一个笼统的「未经验证」。实测（2026-10）多个 profile 把
+        // 窗口填成 1M 而模型真实只有 204.8K，导致 94% 的长会话从未压缩过；
+        // 现在 `effective_context_window` 会按目录值收紧，这里要如实告知。
+        let catalog = wyj_api::known_model_capacity(&active.model)
+            .map(|cap| cap.context_window)
+            .filter(|c| *c > 0 && *c < active.context_window);
+        let effective = catalog.unwrap_or(active.context_window);
+        let trigger = effective.saturating_sub(wyj_core::compact::compact_trigger_buffer(
+            effective,
+            active.max_tokens,
+        ));
+        match catalog {
+            Some(supported) => println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.context_window_clamped_to_catalog",
+                    &[
+                        ("window", &active.context_window.to_string()),
+                        ("supported", &supported.to_string()),
+                        ("trigger", &trigger.to_string()),
+                        ("model", &active.model),
+                    ]
+                )
+            ),
+            None => println!(
+                "{}",
+                wyj_i18n::tr_fmt(
+                    "status.context_window_unverified",
+                    &[
+                        ("window", &active.context_window.to_string()),
+                        ("trigger", &trigger.to_string()),
+                    ]
+                )
+            ),
+        }
     }
 
     // 2) `max_tokens` 超过该模型静态目录给出的输出上限。
@@ -991,6 +1010,9 @@ async fn run_model_probe(
                         reasoning_effort: profile.effective_reasoning_effort(),
                         thinking_switch: profile.effective_thinking_switch(),
                         interleaved: profile.interleaved_thinking,
+                        // 探针只问「这个端点认不认 reasoning 参数」，
+                        // 与上下文清理无关，别让它额外多撞一次 400。
+                        server_context_management: None,
                     },
                 )
                 .await?;
@@ -1942,6 +1964,7 @@ async fn main() -> Result<()> {
         !(is_tui_mode || matches!(runtime_command, Some(RuntimeCommand::Acp)));
     wyj_core::checkpoint::set_checkpoint_config(wyj_core::checkpoint::CheckpointConfig {
         max_per_session: cfg.storage.checkpoints_per_session,
+        max_bytes_per_session: cfg.storage.checkpoint_bytes_per_session,
         cas: workspace_cas.clone(),
         non_interactive: checkpoint_non_interactive,
     });
@@ -1958,6 +1981,17 @@ async fn main() -> Result<()> {
     // Phase 3:把 CAS 注入到 externalize,落盘前把超大 image / thinking 移到 CAS。
     wyj_core::serialize::set_externalize_cas(workspace_cas.clone());
 
+    // 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）的统一用量累加器。
+    //
+    // 这五类调用都拿不到 `&mut Session`：标题是 spawn 出去的、分类器挂在
+    // ToolContext 上、记忆提取是后台 durable job。旧实现把它们的 usage 直接
+    // 丢弃，`/cost` 因此系统性低估真实花费——Auto 模式下分类器每拦一个工具
+    // 就是一次往返，一次会话几十次很常见。
+    //
+    // 装配纪律：**同一个 Arc 必须交给全部五处**（下面逐个注入），否则
+    // 各自记各自的、主循环只抽得到其中一部分。
+    let aux_usage = Arc::new(wyj_core::aux_usage::AuxUsageTotals::new());
+
     let memory_v3_store = MemoryV3Store::with_roots_and_legacy(
         &wyj_config::layout::memory_v3_root(&config_base),
         &state_roots.memory_projects,
@@ -1966,7 +2000,9 @@ async fn main() -> Result<()> {
     )
     .map(|store| {
         store.set_enabled(cfg.auto_memory_enabled);
-        store.with_storage_retention(cfg.storage.clone())
+        store
+            .with_storage_retention(cfg.storage.clone())
+            .with_aux_usage(Some(aux_usage.clone()))
     })
     .map(Arc::new)
     .map_err(|error| tracing::warn!("Memory v3 初始化失败: {error}"))
@@ -1989,6 +2025,7 @@ async fn main() -> Result<()> {
             .map(|m| {
                 m.set_enabled(cfg.auto_memory_enabled);
                 m.with_storage_retention(cfg.storage.clone())
+                    .with_aux_usage(Some(aux_usage.clone()))
             })
             .map(Arc::new)
             .map_err(|e| tracing::warn!("记忆存储初始化失败: {e}"))
@@ -2004,6 +2041,7 @@ async fn main() -> Result<()> {
             &cwd,
             cfg.evolution.clone(),
         )
+        .map(|store| store.with_aux_usage(Some(aux_usage.clone())))
         .map(Arc::new)
         .map_err(|error| tracing::warn!("Evolution 存储初始化失败: {error}"))
         .ok()
@@ -2188,9 +2226,10 @@ async fn main() -> Result<()> {
     //
     // TUI 不在这里挂：它在自己的装配层按当前 Agent 重建（见 tui 的 build_auto_gate
     // 调用点），这样 `/model` 换模型后分类器也跟着换。
-    tool_ctx.auto_gate = Some(wyj_core::auto_mode::build_gate(
+    tool_ctx.auto_gate = Some(wyj_core::auto_mode::build_gate_with_usage(
         &cfg,
         Arc::clone(&provider_arc),
+        Some(aux_usage.clone()),
     ));
     tool_ctx.set_execution_surface(if single_shot {
         ExecutionSurface::SinglePrompt
@@ -2304,6 +2343,29 @@ async fn main() -> Result<()> {
             wyj_tools::message_log::DEFAULT_MAX_BYTES_PER_AGENT,
         ))
     });
+    // 主会话消息增量日志：`.json` 只在 save 时整份重写（TUI autosave 是
+    // fire-and-forget，headless/-p/ACP 更只在收尾时写一次），两次 save 之间
+    // 被 SIGKILL 就会丢掉整轮。日志是旁路、尽力而为，`SessionStore::load`
+    // 会在快照落后时把尾巴合并回来（且只在「快照是日志严格前缀」时合并，
+    // 不会用残缺日志覆盖完整历史）。
+    //
+    // 开关同上跟随 `trace_enabled`：两者服务同一类诊断需求。
+    let session_journal_handle = wyj_core::session_journal::SessionJournal::attach(
+        cfg.subagent.trace_enabled,
+        &sessions_dir,
+        wyj_core::session_journal::DEFAULT_MAX_BYTES,
+    );
+    // 会话滚动工作文档：压缩时优先 splice 它，省掉一次与历史等长的全量
+    // 摘要往返；每 4 轮增量更新一次，把这份成本摊平。
+    //
+    // 放在 sessions_dir（按项目分目录）下，文件名带 session_id——同一项目
+    // 并行多个会话时它们各写各的，不会互相覆盖。
+    let session_memory = Some(Arc::new(
+        wyj_core::session_memory::SessionMemory::new(sessions_dir.clone(), session_id.clone())
+            // 文档更新是一次真实的辅助 LLM 往返（每 4 轮一次），必须与
+            // 标题/分类器/记忆提取汇入同一个累加器，否则 `/cost` 少一块。
+            .with_aux_usage(Some(aux_usage.clone())),
+    ));
     // 当前已连接 MCP 工具的共享快照：`-p`/`--headless`/TUI 三种模式各自的
     // MCP 连接时机不同，但都在工具注册成功时 push 进这个句柄，供子 Agent
     // 工厂与 `/model` 重建共同读取（子 Agent 只能看到 spawn 时刻已连好的）。
@@ -2563,6 +2625,8 @@ async fn main() -> Result<()> {
         // 已在上面按首建顺序追加过（Plan / computer-use / TodoWrite 三段），
         // 这里传 None 避免二次 append。
         plugin_output_style: None,
+        aux_usage: Some(aux_usage.clone()),
+        session_memory: session_memory.clone(),
     }
     .apply(agent);
 
@@ -2712,7 +2776,9 @@ async fn main() -> Result<()> {
                 }
             }
         };
-        let gen = Arc::new(SummaryGenerator::new(store.clone(), provider));
+        let gen = Arc::new(
+            SummaryGenerator::new(store.clone(), provider).with_aux_usage(Some(aux_usage.clone())),
+        );
         agent
             .with_summary(gen)
             .with_session_id(session_id.clone())
@@ -2735,6 +2801,9 @@ async fn main() -> Result<()> {
     let agent_defs_for_rebuild = shared_agent_defs.clone();
     let hub_for_rebuild = sub_agent_hub.clone();
     let message_log_for_rebuild = sub_agent_message_log.clone();
+    // 重建时复用同一个滚动文档句柄：`/model` 换模型不该让压缩突然退回
+    // 全量摘要（那会让用户看到「换了模型成本就变了」，而真实原因是装配漏项）。
+    let session_memory_for_rebuild = session_memory.clone();
     let store_for_rebuild = session_store_arc.clone();
     let sid_for_rebuild = session_id.clone();
     let cwd_for_rebuild = cwd.clone();
@@ -2743,6 +2812,9 @@ async fn main() -> Result<()> {
     let mcp_tools_for_rebuild = mcp_tools.clone();
     let workspace_cas_for_rebuild = workspace_cas.clone();
     let context_edit_totals_for_rebuild = context_edit_totals.clone();
+    // `/model` 重建后的 Agent 必须拿到**同一个** sink：换成新 Arc 的话，
+    // 重建之后所有辅助往返都记进一份没人抽干的新累加器里，静默丢失。
+    let aux_usage_for_rebuild = aux_usage.clone();
     // 首建与重建共用同一个 CapabilityCache 实例：它缓存模型能力探测结果，重建
     // 换模型后仍能命中已探过的条目，也不必重复读 catalog。
     let capability_cache_for_rebuild = Arc::new(wyj_api::CapabilityCache::new(&config_base));
@@ -2796,6 +2868,13 @@ async fn main() -> Result<()> {
             context_window: cfg.active_profile().context_window,
             max_turns: cfg.agent.max_turns,
             forced_thinking_max_turns: cfg.agent.forced_thinking_max_turns,
+            // 花费熔断闸：金额上限 + 输出 token 上限。默认全关（0），
+            // 用户显式设值才生效——单价表是硬编码的，默认开启会在调过价
+            // 的模型上莫名截断。
+            budget_limits: wyj_core::budget::BudgetLimits {
+                max_cost_usd: cfg.agent.max_cost_per_turn_usd,
+                max_output_tokens: cfg.agent.max_output_tokens_per_turn,
+            },
             capabilities: model_capabilities,
             route_profile: cfg.active_profile().name.clone(),
             route_vendor: model_resolution.identity.vendor.clone(),
@@ -2829,6 +2908,8 @@ async fn main() -> Result<()> {
                 context_edit_totals_for_rebuild.clone(),
             ),
             plugin_output_style: plugin_output_style_for_rebuild.clone(),
+            aux_usage: Some(aux_usage_for_rebuild.clone()),
+            session_memory: session_memory_for_rebuild.clone(),
         }
         .apply(new_agent);
         // 重建时重新装配辅助 provider：`/model` 面板改的是**分组配置**，
@@ -2845,7 +2926,10 @@ async fn main() -> Result<()> {
                         wyj_api::build_provider(cfg).expect("重建后主 provider 构建不应失败")
                     }),
             };
-            let gen = Arc::new(SummaryGenerator::new(store.clone(), title_provider));
+            let gen = Arc::new(
+                SummaryGenerator::new(store.clone(), title_provider)
+                    .with_aux_usage(Some(aux_usage.clone())),
+            );
             new_agent = new_agent
                 .with_summary(gen)
                 .with_session_id(sid_for_rebuild.clone());
@@ -2937,6 +3021,9 @@ async fn main() -> Result<()> {
             session.restore_usage_from(&file);
         }
         session.messages = initial_messages;
+        if let Some(journal) = &session_journal_handle {
+            session = session.with_message_sink(journal.sink_for(&session_id));
+        }
         session.push_user(prompt);
         let env = SingleTurnEnv {
             plugin_runtime: plugin_runtime.clone(),
@@ -2962,6 +3049,9 @@ async fn main() -> Result<()> {
             session.restore_usage_from(&file);
         }
         session.messages = initial_messages;
+        if let Some(journal) = &session_journal_handle {
+            session = session.with_message_sink(journal.sink_for(&session_id));
+        }
         let env = SingleTurnEnv {
             plugin_runtime: plugin_runtime.clone(),
             session_store: session_store_arc.clone(),
@@ -3050,6 +3140,7 @@ async fn main() -> Result<()> {
                 },
             ),
             permission_constraints,
+            session_memory.clone(),
         )
         .await
     };
@@ -3943,6 +4034,16 @@ async fn repl(
         session.restore_usage_from(&file);
     }
     session.messages = initial_messages;
+    // `repl` 是独立函数，拿不到主函数的 journal 句柄，但共享注册表按
+    // `sessions_dir` 复用同一个写手——主函数那边已经建过就复用它，
+    // 不会出现两个 writer 并发 append 同一个 jsonl。
+    if let Some(store) = &session_store {
+        wyj_core::session_journal::SessionJournal::attach_session(
+            &mut session,
+            store.dir(),
+            &session_id,
+        );
+    }
     let stdin = io::stdin();
     let mut turns = 0usize;
     let repl_home = std::env::var("HOME")
@@ -4097,6 +4198,7 @@ async fn repl(
             context_audit: (session.context_audit.total() > 0).then_some(session.context_audit),
             prompt_drift: session.prompt_drift_since_resume.clone(),
             compact_count: session.compact_count,
+            compact_generation: session.compact_generation,
             context_edit: (
                 wyj_core::context_edit::elided_count(&session.messages) as u32,
                 session.context_edit_freed_tokens,
@@ -4106,6 +4208,16 @@ async fn repl(
             sub_output_tokens: session.sub_output_tokens,
             sub_cache_read_tokens: session.sub_cache_read_tokens,
             sub_cache_write_tokens: session.sub_cache_write_tokens,
+            aux_input_tokens: session.aux_input_tokens,
+            aux_output_tokens: session.aux_output_tokens,
+            aux_cache_read_tokens: session.aux_cache_read_tokens,
+            aux_calls: session.aux_calls,
+            cache_attribution: wyj_core::cache_attribution::attribute(
+                &session.cache_samples,
+                &session.cache_fingerprints,
+            ),
+            reasoning_tokens: session.total_reasoning_tokens,
+            api_attempts: session.api_attempts,
             effective_mcp_count,
             plugin_agent_paths: plugin_agent_paths.clone(),
             hooks_enabled,

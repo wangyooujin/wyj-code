@@ -105,15 +105,19 @@ pub const FIELD_WEBSEARCH_EXCLUDE_DOMAINS: &str =
 /// 关键是把「什么时候该召回」讲清楚：占位符只保留工具名 / 大小 / 首行，模型必须
 /// 自己判断值不值得为这条内容再花一次上下文往返。
 pub fn context_recall_description() -> String {
-    "Retrieve a tool result that was moved out of the context window to save space. \
-Old tool outputs are externalized (not deleted) once the conversation grows: the \
-placeholder left in the conversation shows which tool produced it, how large it was, its \
-first line, and a `cas://<hash>` reference. Call this tool with that hash when you still \
-need the actual content — especially for one-shot commands like Bash or WebFetch, whose \
-output cannot be reproduced by re-running them. The placeholder's tool name and first line \
-are usually enough to decide whether the full content is still relevant; do not recall \
-speculatively, and never invent the content instead of recalling it. Use `offset` to page \
-through results that exceed `max_bytes`."
+    "Retrieve content that was moved out of the context window to save space. Two sources emit \
+a `cas://<hash>` reference you can pass here:\n\
+1. Tool results externalized by context editing. The placeholder left in the conversation shows \
+which tool produced it, how large it was, its first line, and a `cas://<hash>` reference.\n\
+2. A conversation segment removed by compaction. The summary message that replaced it ends with \
+a `## Compacted transcript archive` section carrying `cas://<hash>`; recalling it returns the \
+exact messages that were summarized away (serialized JSON), so prefer it over re-running tools \
+or guessing when a detail is missing from the summary.\n\
+Call this tool when you still need the actual content — especially for one-shot commands like \
+Bash or WebFetch, whose output cannot be reproduced by re-running them. The placeholder's tool \
+name and first line are usually enough to decide whether the full content is still relevant; do \
+not recall speculatively, and never invent the content instead of recalling it. Use `offset` to \
+page through results that exceed `max_bytes`."
         .to_string()
 }
 

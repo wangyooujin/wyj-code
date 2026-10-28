@@ -303,8 +303,9 @@ soft_limit_ratio = 0.55       # **软阈值**：上下文占用超过窗口的�
 
 [notify]                      # 统一通知通道（v0.2.23+）：TUI/CLI 回合完成 / 错误、
                               # 后台子 Agent 完成统一派发到
-                              # 终端响铃（stderr \x07）与桌面通知（macOS osascript /
-                              # Linux notify-send / Windows PowerShell BurntToast）。
+                              # 终端响铃（stderr \x07）与桌面通知（优先终端自带 OSC 通知，
+                              # 回落到 macOS osascript / Linux notify-send /
+                              # Windows PowerShell BurntToast）。
                               # 零新第三方依赖。详见 `wyj_core::notify` 模块文档。
 enabled = true               # master 开关（opt-out 默认开）
 rate_limit_seconds = 30      # 同类事件最小间隔去重；0 = 关闭
@@ -314,6 +315,21 @@ enabled = false              # 终端响铃 opt-in 默认关（TUI 共享场景�
 
 [notify.desktop]
 enabled = true               # 桌面通知 opt-out 默认开（后台子 Agent 场景必须通知）
+prefer_terminal = true       # **点击行为的总开关**。true = 先走终端自带 OSC 通知
+                              # （Ghostty/iTerm2 用 OSC 9，WezTerm 用 OSC 777;notify），
+                              # 点击横幅由终端激活自己的窗口并切到发通知的标签页；
+                              # 终端不支持 / 在 tmux·Zellij 内 / 无 tty 时静默回落到
+                              # 系统命令。false = 直接用系统命令——此时 macOS 上点击
+                              # 会弹「选择应用」面板，因为投递者是 /usr/bin/osascript
+                              # 而没有任何 .app 声明它的 bundle id。
+                              #
+                              # ⚠️ **必须给终端开通知权限**：OSC 走的是终端 App 自己的
+                              # 权限，被拒时终端静默丢弃，wyj-code 探测不到（不回落、
+                              # 不报错）——表现就是"完全没有通知"。去
+                              # 系统设置 → 通知 → 你的终端 → 允许通知。核实用：
+                              #   log show --last 60s --predicate 'subsystem CONTAINS[c] "ghostty"'
+                              # 看到 "Notifications are not allowed for this application"
+                              # 就是这条。不想开权限就设 false 退回系统命令。
 
 [notify.events]
 turn_finished = true         # CLI `-p` / REPL / TUI 回合正常完成

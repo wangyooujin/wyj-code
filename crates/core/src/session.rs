@@ -92,9 +92,21 @@ pub struct Session {
     /// 累计写入 prompt 缓存的输入 token 数（按约 1.25x 价格计费，同样
     /// 不计入 `total_input_tokens`；不统计会系统性低估成本）
     pub total_cache_write_tokens: u32,
-    /// 本会话累计发起的模型推理次数（每次 provider.stream 调用计 1），
-    /// 供评测基准（WYJ_STATS_JSON）衡量任务完成所需的 API 往返数。
+    /// 本会话累计**成功**的模型往返数。
+    ///
+    /// 「成功」是硬要求：token 只在流完整结束时入账，而失败重试
+    /// （400 降级、参数降级、路由切换）**不产生 token**。若把尝试次数
+    /// 当分母，`input_per_api_call` 会被系统性稀释——重试越多，这个数越小，
+    /// 而它的用途恰恰是回答「每次调用带多少上下文」。
+    ///
+    /// 失败的尝试记在 [`Self::api_attempts`] 里，两者分开后
+    /// 「重试开销」也成了可观测的量。
     pub api_calls: u32,
+    /// 本会话累计**发起过**的模型请求次数（含失败重试）。
+    ///
+    /// 与 [`Self::api_calls`] 的差值 = 失败/重试的次数。它不是成本口径
+    /// （失败不花钱），而是**稳定性口径**——差值大说明端点在拒绝或抖动。
+    pub api_attempts: u32,
     /// **累计**随模型请求发送的工具 schema 估算 token（全会话求和，每次
     /// `provider.stream` 前累加一次）。它回答的是"本次会话为工具定义总共
     /// 付了多少"，不是"当前上下文里占了多少"。
@@ -123,6 +135,25 @@ pub struct Session {
     /// 子 Agent 累计缓存写入 token（当前配置的第三方端点不上报，恒为 0，
     /// 与主会话的 `total_cache_write_tokens` 同因，详见 `/cost` 的说明行）。
     pub sub_cache_write_tokens: u32,
+    /// **辅助 LLM 往返**累计消耗：标题生成、Auto 权限分类器、记忆提取、
+    /// 演化分析等「不是主推理循环」的调用。
+    ///
+    /// 为什么要单列而不是并进 `total_input_tokens`：这些调用用的是**另一个
+    /// 模型/端点**（`aux_model`、`classifier_profile`），单价与主模型不同，
+    /// 混进主口径会让 `/cost` 的金额算错。但也绝不能像旧实现那样直接丢弃——
+    /// Auto 模式下分类器每拦一个工具就是一次往返，一次会话几十次很常见，
+    /// 丢掉等于系统性低估真实花费。
+    ///
+    /// 与 `api_calls` 的关系：这些调用**不计入** `api_calls`。`api_calls`
+    /// 的语义是「主推理循环跑了几趟」，它是 `input/api_call` 这个派生指标
+    /// 的分母；把辅助往返混进去会让「每次调用带多少上下文」被系统性低估。
+    pub aux_input_tokens: u32,
+    /// 辅助 LLM 往返累计输出 token。
+    pub aux_output_tokens: u32,
+    /// 辅助 LLM 往返累计缓存命中 token。
+    pub aux_cache_read_tokens: u32,
+    /// 辅助 LLM 往返累计次数。
+    pub aux_calls: u32,
     /// 最近一次模型请求的上下文占用分解。与压缩决策**同源**，供 TUI 的
     /// `/context` 面板使用——旧实现里面板/状态栏自己调 `estimate_tokens`
     /// （只算 messages），与 `estimate_request_tokens`（含 system + tools +
@@ -131,6 +162,33 @@ pub struct Session {
     /// 本会话自动压缩发生次数（含因 provider 报 context 超限触发的强制压缩）。
     /// 压缩对用户不可见，除以数字之外必须让"自动管理发生过"本身可见。
     pub compact_count: u32,
+    /// 当前摘要处于第几代（0 = 还没有摘要）。
+    ///
+    /// 与 [`Self::compact_count`] **不等价**：`reset_entire_session` 的压缩
+    /// 会把历史整体换成一份全新摘要，代际归 1 而不是继续累加。真正决定信息
+    /// 保真度的是代际——它是「摘要叠了多少层」，而 `compact_count` 只是
+    /// 「发生过几次压缩」。
+    ///
+    /// `/context` 与 `/cost` 都展示它：超过
+    /// [`crate::compact::MAX_COMPACT_GENERATIONS`] 时模型看到的是「一张地图
+    /// 而非一份记录」，用户应当知道这件事已经发生。
+    pub compact_generation: u32,
+    /// 自动压缩的**跨回合**停滞冷却：压缩跑完仍超阈值时置位，逐回合递减，
+    /// 期间跳过自动压缩。
+    ///
+    /// 为什么必须存在：单次请求内的 `MAX_COMPACT_PASSES` + 5% 进展判据只
+    /// 挡住「一轮里连压三次」，挡不住「每个用户回合都压一次、每次都压不
+    /// 下去」——那才是用户看到的「不停压缩」死循环，代价是每回合一次全量
+    /// 摘要往返，而历史早已只剩摘要，压无可压。
+    ///
+    /// 冷却而不是永久关闭：窗口/输出预算可能被用户改掉，端点也可能在
+    /// 400 后给出更准的实测上界；3 轮后重试一次的成本远低于永久误关。
+    pub compact_cooldown_turns: u32,
+    /// 本会话累计的**思考** token（输出的子集，用户不可见）。
+    ///
+    /// Anthropic 线不上报这个值（它的 output 已含 thinking），所以那里恒为 0
+    /// ——面板据此**不显示**思考占比，而不是显示「思考占 0%」这种误导性数字。
+    pub total_reasoning_tokens: u32,
     /// 最近一次压缩释放的估算 token。
     pub last_compact_saved_tokens: u32,
     /// 本会话被 context editing 外部化到 CAS 的 blob hash。会话被丢弃时
@@ -139,6 +197,16 @@ pub struct Session {
     pub elided_blobs: Vec<String>,
     /// 本会话 context editing 累计释放的估算 token。
     pub context_edit_freed_tokens: u32,
+    /// 逐请求的缓存观测（最近若干条）。用于归因「缓存命中率为什么掉了」。
+    ///
+    /// 只保留最近 [`CACHE_SAMPLE_HISTORY`] 条：归因只需**相邻两次**的
+    /// 对比，而留着几百条只是让会话文件变大。
+    pub cache_samples: Vec<crate::cache_attribution::CacheSample>,
+    /// 逐请求的 prompt 指纹（最近若干条），与 `cache_samples` 配套。
+    ///
+    /// 指纹本身只采一次（进程内第一次发请求时），但缓存掉量可能发生在
+    /// 后面任何一趟——所以这里存的是**每趟都记**的快照，而不是只存最新。
+    pub cache_fingerprints: Vec<Option<crate::prompt_fingerprint::PromptFingerprint>>,
     /// 同角色模型 fallback 记录。只保存 profile 名与错误分类，不保存请求正文、
     /// endpoint query 或认证信息。
     pub routing_events: Vec<RoutingEvent>,
@@ -392,17 +460,39 @@ impl Session {
 
     /// 本会话实际生效的上下文窗口。
     ///
-    /// 配置值优先，但**被端点拒绝过一次之后**以实测为准：`min(configured,
-    /// hint)`。`context_window` 是裸配置、没有探测兜底，填成远大于真实窗口
-    /// 的值时，压缩阈值会落在一个永远摸不到的位置，两道防线同时失效——只剩
-    /// 400 兜底，而 400 每回合只能恢复一次。
+    /// 三层取值，取最小：
+    ///   1. `configured`——用户填的配置值；
+    ///   2. `catalog_hint`——静态容量表对**这个模型名**给出的已知窗口；
+    ///   3. `overflow_window_hint`——端点亲口拒绝时记下的实测上界。
     ///
-    /// 刻意**不**给 hint 加余量：请求被拒证明「真实窗口 < 这次 prompt」，
-    /// 往下压是安全方向；往上放大 5% 反而可能再撞一次 400。
-    pub fn effective_context_window(&self, configured: u32) -> u32 {
+    /// ## 为什么第 2 层必须有
+    ///
+    /// 实测（2026-10-28，本机 686 个会话）：多个 profile 的 `context_window`
+    /// 填成 `1_000_000`，而实际模型是 `minimax-m3`（真实窗口 204,800）/
+    /// `glm-5.3-flash`。后果是两道防线同时落在够不着的位置——
+    /// `soft_threshold = 1_000_000 × 0.45 = 450k`、压缩硬阈值 ≈ 900k，
+    /// 而真实请求根本到不了这个量级。结果：218 个长会话里 **94% 从未压缩、
+    /// 88% 从未 context 清理**，历史无限累积。
+    ///
+    /// 之前只有第 3 层兜底，它依赖端点主动报 400；而这些第三方端点选择
+    /// **静默截断**而不是报错（686 个会话 `overflow_window_hint` 全为 0），
+    /// 于是自愈路径从未启动。
+    ///
+    /// ## 为什么只在「配置 > 目录值」时收紧
+    ///
+    /// 容量表是**保守下限**（见 `known_model_capacity` 的文档）：命中即代表
+    /// 「至少这么大」。用户填得比它小是刻意的省成本选择，不能反向放大。
+    /// 所以只在 `configured > catalog` 时按目录值收紧，其余保持原值。
+    pub fn effective_context_window(&self, configured: u32, catalog_hint: Option<u32>) -> u32 {
+        let mut window = configured;
+        if let Some(catalog) = catalog_hint.filter(|c| *c > 0) {
+            if configured > catalog {
+                window = catalog;
+            }
+        }
         match self.overflow_window_hint {
-            Some(hint) if hint > 0 => configured.min(hint),
-            _ => configured,
+            Some(hint) if hint > 0 => window.min(hint),
+            _ => window,
         }
     }
 
@@ -550,6 +640,31 @@ impl Session {
         self.total_cache_write_tokens += cache_write;
     }
 
+    /// 记一次输出里的**思考** token。
+    ///
+    /// 它是 `total_output_tokens` 的子集（不可见的推理部分）。单独记一份是
+    /// 为了让 `/cost` 能回答「这次贵在思考还是贵在正文」——两者是不同的
+    /// 优化方向（调低 effort vs 调短输出）。
+    pub fn add_reasoning_tokens(&mut self, reasoning: u32) {
+        self.total_reasoning_tokens = self.total_reasoning_tokens.saturating_add(reasoning);
+    }
+
+    /// 记一次**辅助 LLM 往返**（标题生成 / Auto 分类器 / 记忆提取 / 演化）。
+    ///
+    /// 与 [`Self::add_usage`] 分开是因为这些调用走另一个模型或端点，单价不同；
+    /// 且它们不计入 `api_calls`——那个字段是「主推理循环跑了几趟」，是
+    /// `input/api_call` 派生指标的分母，混进辅助往返会让它系统性偏低。
+    ///
+    /// 调用点必须**在检查返回值之前**记账：即使解析失败、摘要为空、模型回了
+    /// 一句废话，这轮 token 也已经花掉了。这与 `compact.rs` 里压缩往返的
+    /// 记账时机是同一条纪律。
+    pub fn add_aux_usage(&mut self, input: u32, output: u32, cache_read: u32) {
+        self.aux_input_tokens = self.aux_input_tokens.saturating_add(input);
+        self.aux_output_tokens = self.aux_output_tokens.saturating_add(output);
+        self.aux_cache_read_tokens = self.aux_cache_read_tokens.saturating_add(cache_read);
+        self.aux_calls = self.aux_calls.saturating_add(1);
+    }
+
     /// 补齐「停在工具调用中间」的悬空 `tool_use`，返回补了几条。
     ///
     /// 事故背景（`--resume` 后输入「继续」毫无反应，每条消息都复发）：
@@ -649,6 +764,20 @@ impl Session {
             .saturating_add(usage.cache_write);
     }
 
+    /// 抽干辅助往返用量累加器，计入 `aux_*` 字段。
+    ///
+    /// 与 [`Self::drain_sub_usage`] 同构，但**调用时机不同**：子 Agent 只在
+    /// 工具批边界完成，辅助往返（标题 / 分类器 / 记忆 / 演化）随时可能结束，
+    /// 所以主循环在每个回合开头与收尾各调一次。
+    pub fn drain_aux_usage(&mut self, sink: Option<&crate::aux_usage::AuxUsageTotals>) {
+        let Some(sink) = sink else { return };
+        let usage = sink.take();
+        self.aux_input_tokens = self.aux_input_tokens.saturating_add(usage.input);
+        self.aux_output_tokens = self.aux_output_tokens.saturating_add(usage.output);
+        self.aux_cache_read_tokens = self.aux_cache_read_tokens.saturating_add(usage.cache_read);
+        self.aux_calls = self.aux_calls.saturating_add(usage.calls);
+    }
+
     /// 本会话的子 Agent 用量合计（`/cost` 的「子 Agent」行用）。
     pub fn sub_usage(&self) -> SubUsage {
         SubUsage {
@@ -675,16 +804,30 @@ impl Session {
         self.total_cache_read_tokens = file.cache_read_tokens;
         self.total_cache_write_tokens = file.cache_write_tokens;
         self.api_calls = file.api_calls;
+        self.api_attempts = file.api_attempts;
         self.tool_schema_tokens = file.tool_schema_tokens;
         self.tool_schema_tokens_saved = file.tool_schema_tokens_saved;
         self.sub_input_tokens = file.sub_input_tokens;
         self.sub_output_tokens = file.sub_output_tokens;
         self.sub_cache_read_tokens = file.sub_cache_read_tokens;
         self.sub_cache_write_tokens = file.sub_cache_write_tokens;
+        self.aux_input_tokens = file.aux_input_tokens;
+        self.aux_output_tokens = file.aux_output_tokens;
+        self.aux_cache_read_tokens = file.aux_cache_read_tokens;
+        self.aux_calls = file.aux_calls;
         self.prompt_cache_state = file.prompt_cache_state;
         self.input_estimate_ratio = file.input_estimate_ratio;
         self.overflow_window_hint = file.overflow_window_hint;
         self.compact_count = file.compact_count;
+        self.compact_generation = file.compact_generation;
+        // `elided_blobs` 必须一起恢复：它是「外部化到 CAS 的 blob 仍被本会话
+        // 引用」的唯一凭证。漏掉它 = 退出/`/clear` 时一个都不 release，这些
+        // blob 的 ref_count 永远 ≥1，`WorkspaceCas::gc` 永远删不掉；而且下次
+        // 同内容再被外部化时 `intern()` 又 +1——每次 resume 净增一批。
+        self.elided_blobs = file.elided_blobs.clone();
+        self.total_reasoning_tokens = file.reasoning_tokens;
+        self.cache_samples = file.cache_samples.clone();
+        self.cache_fingerprints = file.cache_fingerprints.clone();
         self.context_edit_freed_tokens = file.context_edit_freed_tokens;
         self.session_profile = file.session_profile.clone();
         self.session_effort = file.session_effort.clone();
@@ -832,11 +975,11 @@ mod tests {
     #[test]
     fn overflow_hint_shrinks_the_effective_window() {
         let mut session = Session::new();
-        assert_eq!(session.effective_context_window(1_000_000), 1_000_000);
+        assert_eq!(session.effective_context_window(1_000_000, None), 1_000_000);
         session.note_context_overflow(256_000);
-        assert_eq!(session.effective_context_window(1_000_000), 256_000);
+        assert_eq!(session.effective_context_window(1_000_000, None), 256_000);
         // 配置值更小时依然以配置为准（hint 只是上界证据，不是真相覆盖）
-        assert_eq!(session.effective_context_window(128_000), 128_000);
+        assert_eq!(session.effective_context_window(128_000, None), 128_000);
     }
 
     /// 只往小取：连续撞两次时记住更严的那个。
@@ -846,10 +989,44 @@ mod tests {
         session.note_context_overflow(400_000);
         session.note_context_overflow(200_000);
         assert_eq!(session.overflow_window_hint, Some(200_000));
-        assert_eq!(session.effective_context_window(1_000_000), 200_000);
+        assert_eq!(session.effective_context_window(1_000_000, None), 200_000);
         // 0 是「没量到」，不能把已学到的窗口上界抹成 0
         session.note_context_overflow(0);
         assert_eq!(session.overflow_window_hint, Some(200_000));
+    }
+
+    /// 静态容量表给出的窗口要能收紧配置值——这是「94% 的长会话从未压缩」
+    /// 那个实测缺陷的直接对策：`context_window` 填 1M 而模型真实只有 204.8K。
+    #[test]
+    fn catalog_hint_shrinks_the_configured_window() {
+        let session = Session::new();
+        // minimax-m3 在静态表里是 204,800；配置写成 1M 必须被收紧。
+        assert_eq!(
+            session.effective_context_window(1_000_000, Some(204_800)),
+            204_800
+        );
+        // 配置值比目录值小：用户刻意省成本，不能反向放大。
+        assert_eq!(
+            session.effective_context_window(100_000, Some(204_800)),
+            100_000
+        );
+        // 目录未命中（None / 0）：保持配置值，不猜。
+        assert_eq!(session.effective_context_window(1_000_000, None), 1_000_000);
+        assert_eq!(
+            session.effective_context_window(1_000_000, Some(0)),
+            1_000_000
+        );
+    }
+
+    /// 三层同时存在时取最小：配置 1M、目录 204.8K、端点实测 128K → 128K。
+    #[test]
+    fn effective_window_takes_the_minimum_of_all_three_layers() {
+        let mut session = Session::new();
+        session.note_context_overflow(128_000);
+        assert_eq!(
+            session.effective_context_window(1_000_000, Some(204_800)),
+            128_000
+        );
     }
 
     /// `/clear` 换对话，但端点不会变——校准系数描述的是「这套端点 + 这类

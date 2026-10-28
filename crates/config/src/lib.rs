@@ -679,6 +679,39 @@ pub struct AgentCfg {
     /// 独立的一层。本值只是成本闸，调高它买的是「单轮能推进多远」，代价是
     /// 单次提交的最长耗时与 token 上限。
     pub forced_thinking_max_turns: usize,
+    /// 单次用户提交内允许的最大**花费**（美元）。`0` = 不限制。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 现有的成本闸全是**轮数**闸（`max_turns` / `forced_thinking_max_turns`），
+    /// 而轮数与花费不是一回事：一次请求带 200K 上下文的 Opus 往返和一次
+    /// 带 8K 上下文的 Haiku 往返，轮数相同、花费差两个数量级。用户看到的
+    /// 失控现场往往是「模型很聪明、每轮都在推进，但每轮都很贵」——
+    /// 轮数闸完全拦不住。
+    ///
+    /// ## 为什么默认关闭
+    ///
+    /// 金额闸依赖**单价表**，而单价表是硬编码的、会随官方调价过时（见
+    /// `wyj_core::pricing`）。默认开启会让用户在一个已经调过价的模型上被
+    /// 莫名截断，而且他无法从错误信息里看出「按的是哪张旧表」。所以默认
+    /// 关闭，用户显式设值才生效。
+    ///
+    /// ## 触发后的行为
+    ///
+    /// 与轮数闸一致：**先收尾交付，再硬中止**。模型会收到一条「预算已用尽，
+    /// 请立即总结当前进度」的指令；若它继续调工具，下一轮才真正中止。这样
+    /// 工作树里的成果仍然能被交付，而不是被判成失败。
+    ///
+    /// 未知模型（查不到单价）时**不熔断**：宁可放行也不能在没有价格依据的
+    /// 情况下截断用户的任务。
+    pub max_cost_per_turn_usd: f64,
+    /// 单次用户提交内允许的最大**输出 token**（不含输入与缓存命中）。
+    /// `0` = 不限制。
+    ///
+    /// 为什么单列：输出 token 是**唯一线性放大花费**的一项（输入与缓存命中
+    /// 按上下文大小走，而上下文有窗口上限），也是 reasoning 模型的黑洞。
+    /// 轮数闸管不住「一轮吐 30K token」这种情况。
+    pub max_output_tokens_per_turn: u32,
 }
 
 impl Default for AgentCfg {
@@ -686,6 +719,11 @@ impl Default for AgentCfg {
         Self {
             max_turns: 200,
             forced_thinking_max_turns: 64,
+            // 金额与输出 token 闸默认关闭：单价表是硬编码的，会随官方调价
+            // 过时；默认开启会让用户在调过价的模型上被莫名截断，且无法从
+            // 提示里看出「按的是哪张表」。
+            max_cost_per_turn_usd: 0.0,
+            max_output_tokens_per_turn: 0,
         }
     }
 }
@@ -1110,10 +1148,22 @@ pub struct StorageRetentionCfg {
     /// 而不是让整个 `config.toml` 解析失败。
     #[serde(default = "default_storage_scope")]
     pub scope: String,
-    // 曾经存在的 2 个 Phase 4 字段(`checkpoint_bytes_per_session` /
-    // `checkpoint_ttl_days`)仍无消费点,保持删除:留着只会让人误以为存在
-    // 对应的清理逻辑。`#[serde(default)]` + 无 `deny_unknown_fields`,
-    // 用户既有配置里写了这些键会被静默忽略,不影响加载。
+
+    /// 单个 session 的 checkpoint **字节**预算（0 = 不按字节淘汰）。
+    ///
+    /// 与 [`Self::checkpoints_per_session`] 是**两个独立的闸门**，任一超标即淘汰：
+    /// 条数防「短会话攒出几百个小 checkpoint」，字节数防「长会话留 20 个
+    /// 几 MB 的历史」。
+    ///
+    /// 为什么必须有字节闸门（实测 2026-10-28）：本机 5,703 个 checkpoint 合计
+    /// 1,836 MB、平均 322 KB，其中 **96% 是内联的完整 `messages` 快照**——
+    /// 每个有副作用的工具前后各写一份全量历史。只按条数留 20 个，对一个
+    /// 1,400 条消息的会话就是「留 20 份 × 每份几百 KB」。
+    ///
+    /// 默认 256 MiB：按平均 322 KB 算约等于 800 个 checkpoint，对绝大多数
+    /// 会话是「条数闸门先生效」，只有真正的大历史会话才会被字节闸门削。
+    /// 设成 0 关闭字节淘汰，退回纯条数行为。
+    pub checkpoint_bytes_per_session: u64,
 }
 
 fn default_storage_scope() -> String {
@@ -1144,6 +1194,10 @@ impl Default for StorageRetentionCfg {
             // 锁文件是纯垃圾（内容只有 pid），默认清理没有数据风险。
             stale_lock_ttl_days: 7,
             scope: default_storage_scope(),
+            // 256 MiB。按实测平均 322 KB/个算约等于 800 个 checkpoint，
+            // 所以对绝大多数会话是条数闸门（20）先生效；只有历史特别长的
+            // 会话才会被这条削掉，而那正是磁盘被撑爆的场景。
+            checkpoint_bytes_per_session: 256 * 1024 * 1024,
         }
     }
 }
@@ -1346,6 +1400,17 @@ pub struct NotifyBellCfg {
 #[serde(default)]
 pub struct NotifyDesktopCfg {
     pub enabled: bool,
+    /// 优先用终端自带的 OSC 通知（`OSC 777;notify` / `OSC 9`）投递。
+    ///
+    /// 这不是外观偏好，而是**点击行为**的唯一区别：OSC 通知的发送者是终端 App
+    /// 本身，点击横幅会激活发起它的终端窗口并落到正确的标签页；而 macOS 上
+    /// `osascript -e 'display notification'` 的发送者是 `/usr/bin/osascript`——
+    /// 磁盘上不存在声明 `com.apple.osascript` 的 .app，LaunchServices 解析不到
+    /// 投递者，点击只会弹出「选择应用」面板。详见 `wyj_core::notify` 模块文档。
+    ///
+    /// 只在已知支持的终端（Ghostty / WezTerm / iTerm2 / VS Code 集成终端）且
+    /// 不在 tmux / Zellij 内时生效，其余情况自动回落到系统命令。默认 `true`。
+    pub prefer_terminal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1371,7 +1436,10 @@ impl Default for NotifyCfg {
 
 impl Default for NotifyDesktopCfg {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            prefer_terminal: true,
+        }
     }
 }
 

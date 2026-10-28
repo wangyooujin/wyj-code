@@ -66,6 +66,33 @@ pub struct SessionFile {
     /// 指示不消失——压缩对用户不可见，少了这个数字就等于黑盒。
     #[serde(default)]
     pub compact_count: u32,
+    /// 本会话累计**发起过**的模型请求次数（含失败重试）。
+    ///
+    /// 与 `api_calls`（成功往返数）的差值 = 失败/重试次数。它不是成本口径
+    /// （失败不花钱），而是**稳定性口径**。
+    #[serde(default)]
+    pub api_attempts: u32,
+    /// 本会话累计的**思考** token（输出的子集，用户不可见）。
+    ///
+    /// 落盘是为了 resume 后 `/cost` 仍能显示「贵在思考还是贵在正文」——
+    /// 那正是用户隔天回来最想知道的。
+    #[serde(default)]
+    pub reasoning_tokens: u32,
+    /// 逐请求的缓存观测。落盘是为了 **resume 后仍能归因**：缓存命中率
+    /// 掉量最典型的场景就是「隔天 resume 之后发现成本翻倍」——那次掉量
+    /// 发生在两个进程的交界处，只在进程内统计就永远看不到。
+    #[serde(default)]
+    pub cache_samples: Vec<crate::cache_attribution::CacheSample>,
+    /// 逐请求的 prompt 指纹，与 `cache_samples` 配套。
+    #[serde(default)]
+    pub cache_fingerprints: Vec<Option<crate::prompt_fingerprint::PromptFingerprint>>,
+    /// 当前摘要的代际（0 = 尚未压缩过；1 = 首代摘要；2+ = 摘要的摘要）。
+    ///
+    /// 与 `compact_count` 分开落盘：resume 后的第一次压缩要从正确的代际继续
+    /// 往上叠，否则「第 5 代摘要」会被重新当成首代，头部那句「可能已丢失
+    /// 细节」的警告也随之消失——模型会以为手里这份是新鲜的。
+    #[serde(default)]
+    pub compact_generation: u32,
     /// 本会话被 context editing 外部化到 CAS 的 blob hash。落盘是为了会话被
     /// 丢弃时能逐个 `release` —— CAS 的 `gc` 只回收 `ref_count == 0` 的 blob。
     #[serde(default)]
@@ -133,6 +160,23 @@ pub struct SessionFile {
     /// 子 Agent 扇出累计缓存写入 token。
     #[serde(default)]
     pub sub_cache_write_tokens: u32,
+    /// 辅助 LLM 往返（标题生成 / Auto 分类器 / 记忆提取 / 演化分析）累计输入 token。
+    ///
+    /// 与 `input_tokens` **不重叠**：这些调用走 `aux_model` 或
+    /// `classifier_profile` 指定的另一个端点，单价不同，混进主口径会把
+    /// `/cost` 的金额算错。但也绝不能丢弃——Auto 模式下分类器每拦一个工具
+    /// 就是一次往返，旧实现完全不计，等于系统性低估真实花费。
+    #[serde(default)]
+    pub aux_input_tokens: u32,
+    /// 辅助 LLM 往返累计输出 token。
+    #[serde(default)]
+    pub aux_output_tokens: u32,
+    /// 辅助 LLM 往返累计缓存命中 token。
+    #[serde(default)]
+    pub aux_cache_read_tokens: u32,
+    /// 辅助 LLM 往返累计次数（不计入 `api_calls`，见 `Session::add_aux_usage`）。
+    #[serde(default)]
+    pub aux_calls: u32,
     /// 本会话实际生效的 prompt cache 模式（见 [`PromptCacheState`]）。
     /// 存 u8 而非 enum 是为了旧文件 `#[serde(default)]` 直接落到 0，
     /// 也避免将来加枚举值时反序列化失败。
@@ -224,10 +268,19 @@ impl SessionFile {
             sub_output_tokens: session.sub_output_tokens,
             sub_cache_read_tokens: session.sub_cache_read_tokens,
             sub_cache_write_tokens: session.sub_cache_write_tokens,
+            aux_input_tokens: session.aux_input_tokens,
+            aux_output_tokens: session.aux_output_tokens,
+            aux_cache_read_tokens: session.aux_cache_read_tokens,
+            aux_calls: session.aux_calls,
             prompt_cache_state: session.prompt_cache_state,
             input_estimate_ratio: session.input_estimate_ratio,
             overflow_window_hint: session.overflow_window_hint,
             compact_count: session.compact_count,
+            compact_generation: session.compact_generation,
+            api_attempts: session.api_attempts,
+            reasoning_tokens: session.total_reasoning_tokens,
+            cache_samples: session.cache_samples.clone(),
+            cache_fingerprints: session.cache_fingerprints.clone(),
             context_edit_freed_tokens: session.context_edit_freed_tokens,
             elided_blobs: session.elided_blobs.clone(),
             session_profile: session.session_profile.clone(),
@@ -336,10 +389,29 @@ const SNIPPET_CHARS: usize = 240;
 const TOOL_RESULT_INDEX_BYTES: usize = 800;
 
 /// 一条消息在检索索引里的形态。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SearchDoc {
     message_index: usize,
     role: String,
     text: String,
+}
+
+/// 检索索引文件的内容（`<sid>.index.json`）。
+///
+/// 存在的唯一理由：让「跨会话搜一句话」不必读正文。正文里存着 base64
+/// 图片与被外置的工具结果原文，走 `load()` 会把它们从 CAS 全部读回内存——
+/// 几百个会话时那是几十上百 MB 的 IO，而检索真正需要的只有文本。
+///
+/// 索引是**可重建的派生物**：正文在，索引随时能重新生成。所以它写失败
+/// 只影响检索速度，不影响任何正确性。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct SearchIndex {
+    /// 对应的会话 id。读回时用它校验「索引与会话是不是配对了」——
+    /// 文件名对但内容属于另一个会话的情况（拷贝/改名）必须被拒。
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    docs: Vec<SearchDoc>,
 }
 
 /// 把会话切成可检索的消息文档。
@@ -605,7 +677,40 @@ impl SessionStore {
         // 串行化，tmp+rename 保证任何时刻磁盘上的文件都是完整的一版。
         let _guard =
             wyj_config::filelock::acquire(&self.lock_path(&file.session_id), "session file")?;
-        crate::serialize::write_atomic(&path, json.as_bytes()).inspect(|_| self.write_meta(&owned))
+        // 索引在**正文外置之后**算：外置把图片换成了 `cas://`、工具结果换成了
+        // 占位符，索引里存的正是「检索时能看到的文本」——与从正文现算的结果
+        // 逐字一致，两条路径不会给出不同的命中。
+        let index = SearchIndex {
+            session_id: owned.session_id.clone(),
+            docs: index_session(&owned),
+        };
+        crate::serialize::write_atomic(&path, json.as_bytes()).inspect(|_| {
+            self.write_meta(&owned);
+            self.write_index(&index);
+        })
+    }
+
+    /// 写出检索索引。失败只 warn：索引是**派生物**，正文在就能重建。
+    /// 写失败的后果是「检索退回到读正文」，慢但结果一样。
+    fn write_index(&self, index: &SearchIndex) {
+        let Ok(json) = serde_json::to_string(index) else {
+            return;
+        };
+        if let Err(error) =
+            crate::serialize::write_atomic(&self.index_path(&index.session_id), json.as_bytes())
+        {
+            tracing::warn!("session index 写入失败 {}: {error}", index.session_id);
+        }
+    }
+
+    /// 读检索索引。索引缺失/损坏/与会话不匹配时返回 `None`——
+    /// 调用方据此回退到「读正文现算」。
+    fn read_index(&self, session_id: &str) -> Option<SearchIndex> {
+        let raw = std::fs::read_to_string(self.index_path(session_id)).ok()?;
+        let index: SearchIndex = serde_json::from_str(&raw).ok()?;
+        // 文件名对但内容属于另一个会话（拷贝 / 改名）必须被拒：否则会拿
+        // 别的会话的命中冒充本会话的，模型据此「回到现场」会找错地方。
+        (index.session_id == session_id).then_some(index)
     }
 
     /// [`Self::save`] 的 async 包装：把阻塞 IO（含最长 30 秒的跨进程锁等待）
@@ -634,6 +739,22 @@ impl SessionStore {
     fn meta_path(&self, session_id: &str) -> PathBuf {
         self.locate(session_id)
             .join(format!("{session_id}.meta.json"))
+    }
+
+    /// 检索索引文件路径：`<sid>.index.json`。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 检索只需要**文本**，但正文 `.json` 里存着 base64 图片与被外置的
+    /// 工具结果原文（`cas://`）。走 `load()` 会把 CAS 里的图片与工具输出
+    /// **全部读回内存**——为一个「搜一句话」的动作付出几十 MB 的 IO 与
+    /// 内存分配。
+    ///
+    /// 索引文件在 `save` 时顺手写出（正文已经被遍历过了），检索时只读它。
+    /// 它的体积是「每条消息的索引文本」之和，比正文小一到两个数量级。
+    fn index_path(&self, session_id: &str) -> PathBuf {
+        self.locate(session_id)
+            .join(format!("{session_id}.index.json"))
     }
 
     /// 定位某个会话所属的目录。
@@ -740,7 +861,63 @@ impl SessionStore {
                 }
             }
         }
+        self.merge_journal_tail(&mut file);
         Ok(file)
+    }
+
+    /// 把消息日志里「比快照多出来的那几轮」合并回来。
+    ///
+    /// 场景：进程被 SIGKILL / 断电，`.json` 停在最后一次 save，而日志已经
+    /// 写到了被打断的那一轮。`merge_into_snapshot` 只在**快照是日志的严格
+    /// 前缀**时才采用日志尾巴，因此日志丢过事件（队列满）或快照反而更新时
+    /// 会原样保留快照，不会用一份残缺日志覆盖完整历史。
+    ///
+    /// 合并后立刻回写一次 `.json`：否则同一段尾巴会在每次 `load` 时被重复
+    /// 合并（结果一样，但白读一遍日志），而用户看到的历史已经对了，没有理由
+    /// 让它继续悬在旁路文件里。
+    fn merge_journal_tail(&self, file: &mut SessionFile) {
+        let path =
+            crate::session_journal::journal_file(&self.locate(&file.session_id), &file.session_id);
+        if !path.exists() {
+            return;
+        }
+        let replayed = crate::session_journal::replay(&path);
+        // 日志里存的是**未截断、未外化**的原始消息，而快照在 `save()` 时已经
+        // 过了 `persist_cap` 截断与 `cas://` 外化。两者逐条 `==` 的前缀校验
+        // 因此**必然失败**——只要历史里出现一条超过 20KB 的 tool_result
+        // （读一个源码文件就够了），崩溃恢复就静默失效，而 8MB 日志白写。
+        //
+        // 这里对重放结果做与 `save` **完全相同**的两步变换，再参与比较。
+        // 代价是恢复到的 image/thinking 会多一次 `intern`（引用计数 +1），
+        // 但恢复只在进程被强杀后发生一次，与「日志完全没用」相比可以接受。
+        let mut journal_messages = replayed.messages;
+        if let Some(cfg) = current_persist_cap() {
+            crate::serialize::truncate_messages(&mut journal_messages, &cfg);
+        }
+        let cas = crate::serialize::current_externalize_cas();
+        for message in &mut journal_messages {
+            for block in &mut message.content {
+                crate::serialize::externalize_block_with(block, cas.as_deref());
+            }
+        }
+        let outcome =
+            crate::session_journal::merge_into_snapshot(&mut file.messages, &journal_messages);
+        if let crate::session_journal::MergeOutcome::Recovered(count) = outcome {
+            tracing::info!(
+                session_id = %file.session_id,
+                recovered_messages = count,
+                journal_incomplete = replayed.incomplete,
+                "会话快照落后于消息日志，已从日志补回被打断的那几轮"
+            );
+            // 度量字段无从恢复（日志只记 messages），保持快照原值。
+            // 回写失败不影响本次加载：内存里的历史已经是完整的。
+            if let Err(error) = self.save(file) {
+                tracing::warn!(
+                    session_id = %file.session_id,
+                    "补回日志尾巴后回写会话快照失败: {error}"
+                );
+            }
+        }
     }
 
     /// 列出**当前项目**的会话，按时间戳倒序排列（最新在前）。
@@ -923,14 +1100,24 @@ impl SessionStore {
         };
 
         // 先收集所有 (会话, 消息) 的检索文本，再一次性建 BM25 索引。
+        //
+        // 文本来源**优先用索引文件**：正文里存着 base64 图片与被外置的工具
+        // 结果原文，走 `load()` 会把它们从 CAS 全部读回内存——为一个「搜一句
+        // 话」的动作付出几十 MB 的 IO 与内存分配。索引是派生物，缺失时
+        // 回退到读正文现算（慢，但结果一样）。
         let mut docs: Vec<(SessionMeta, Vec<SearchDoc>)> = Vec::new();
         for meta in metas {
-            let Ok(file) = self.load(&meta.session_id) else {
-                // 单个会话损坏不该让整次检索失败——历史文件在升级/并发写入后
-                // 偶有解析不了的，跳过它继续找别的。
-                continue;
+            let docs_for_session = match self.read_index(&meta.session_id) {
+                Some(index) => index.docs,
+                None => {
+                    let Ok(file) = self.load(&meta.session_id) else {
+                        // 单个会话损坏不该让整次检索失败——历史文件在升级/并发写入后
+                        // 偶有解析不了的，跳过它继续找别的。
+                        continue;
+                    };
+                    index_session(&file)
+                }
             };
-            let docs_for_session = index_session(&file);
             if !docs_for_session.is_empty() {
                 docs.push((meta, docs_for_session));
             }
@@ -1008,6 +1195,17 @@ impl SessionStore {
         let parent = self.load(parent_session_id).ok();
         let session_profile = parent.as_ref().and_then(|f| f.session_profile.clone());
         let session_effort = parent.as_ref().and_then(|f| f.session_effort.clone());
+        // 摘要代际必须跟着**历史**走，不能归零：分支的 messages 里可能就带着
+        // 一份第 N 代摘要，归零会让下一次压缩把它重新标成第 1 代——那句
+        // 「可能已丢失细节」的警告随之消失。优先从消息里解析（最权威），
+        // 解析不到再继承父会话。
+        let compact_generation = checkpoint
+            .messages
+            .iter()
+            .filter_map(crate::prompts::summary_generation)
+            .max()
+            .or_else(|| parent.as_ref().map(|f| f.compact_generation))
+            .unwrap_or(0);
         let file = SessionFile {
             session_id,
             title: extract_title(&checkpoint.messages),
@@ -1031,6 +1229,10 @@ impl SessionStore {
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             input_estimate_ratio: None,
             overflow_window_hint: None,
@@ -1041,6 +1243,11 @@ impl SessionStore {
             branch_parent_checkpoint_id: Some(checkpoint.id.clone()),
             title_generated: false,
             compact_count: 0,
+            compact_generation,
+            cache_samples: Vec::new(),
+            reasoning_tokens: 0,
+            api_attempts: 0,
+            cache_fingerprints: Vec::new(),
             elided_blobs: vec![],
             session_profile,
             session_effort,
@@ -1282,6 +1489,10 @@ mod tests {
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             input_estimate_ratio: None,
             overflow_window_hint: None,
@@ -1292,6 +1503,11 @@ mod tests {
             branch_parent_checkpoint_id: None,
             title_generated: false,
             compact_count: 0,
+            compact_generation: 0,
+            cache_samples: Vec::new(),
+            reasoning_tokens: 0,
+            api_attempts: 0,
+            cache_fingerprints: Vec::new(),
             elided_blobs: vec![],
             session_profile: None,
             session_effort: None,
@@ -1704,6 +1920,10 @@ mod tests {
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             input_estimate_ratio: None,
             overflow_window_hint: None,
@@ -1714,6 +1934,11 @@ mod tests {
             branch_parent_checkpoint_id: None,
             title_generated: false,
             compact_count: 0,
+            compact_generation: 0,
+            cache_samples: Vec::new(),
+            reasoning_tokens: 0,
+            api_attempts: 0,
+            cache_fingerprints: Vec::new(),
             elided_blobs: vec![],
             session_profile: None,
             session_effort: None,
@@ -1774,6 +1999,10 @@ mod tests {
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             prompt_cache_state: prompt_cache_state::OFF,
             input_estimate_ratio: None,
             overflow_window_hint: None,
@@ -1784,6 +2013,11 @@ mod tests {
             branch_parent_checkpoint_id: None,
             title_generated: false,
             compact_count: 0,
+            compact_generation: 0,
+            cache_samples: Vec::new(),
+            reasoning_tokens: 0,
+            api_attempts: 0,
+            cache_fingerprints: Vec::new(),
             elided_blobs: vec![],
             session_profile: None,
             session_effort: None,
@@ -1877,6 +2111,107 @@ mod tests {
             hits.iter().any(|h| h.session_id == "quiet"),
             "被限流的噪音会话不该让安静会话消失"
         );
+    }
+
+    /// 检索必须**优先走索引文件**，而不是读正文。
+    ///
+    /// 这条钉的是一个具体事故形态：正文里存着 base64 图片（外化成
+    /// `cas://`）与被清理的工具结果原文，走 `load()` 会把它们从 CAS 全部
+    /// 读回内存——为一个「搜一句话」的动作付出几十 MB 的 IO。索引是派生物，
+    /// 检索走它才是快的。
+    ///
+    /// 断言方式是「索引文件存在且含会话 id」，而不是去测 IO——后者在单测里
+    /// 不可靠。
+    #[test]
+    fn saving_a_session_writes_a_retrieval_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let mut file = mk_file("s-idx", Path::new("/tmp/proj"), "2026-10-03T00:00:00Z");
+        file.messages = vec![Message::user("索引里必须能搜到这句话")];
+        store.save(&file).unwrap();
+
+        let index_path = dir.path().join("s-idx.index.json");
+        assert!(index_path.exists(), "save 必须写出索引文件");
+        let raw = std::fs::read_to_string(&index_path).unwrap();
+        let index: SearchIndex = serde_json::from_str(&raw).unwrap();
+        assert_eq!(index.session_id, "s-idx");
+        assert!(
+            index
+                .docs
+                .iter()
+                .any(|d| d.text.contains("索引里必须能搜到这句话")),
+            "索引必须含正文文本: {raw}"
+        );
+    }
+
+    /// 索引与正文必须**给出同样的检索结果**——否则「有时搜得到有时搜不到」
+    /// 会变成最难复现的一类 bug。
+    #[test]
+    fn the_index_and_the_body_give_the_same_search_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let mut file = mk_file("s-same", Path::new("/tmp/proj"), "2026-10-03T00:00:00Z");
+        file.messages = vec![
+            Message::user("第一段：关于 香炉峰 回溯点 的记录"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "cargo test --features 量子纠缠"}),
+                }],
+            },
+        ];
+        store.save(&file).unwrap();
+
+        // 索引路径（索引文件在）
+        let with_index = store.search("香炉峰", 8).unwrap();
+        assert!(!with_index.is_empty(), "索引路径应能命中");
+
+        // 删掉索引 → 回退到读正文现算
+        std::fs::remove_file(dir.path().join("s-same.index.json")).unwrap();
+        let without_index = store.search("香炉峰", 8).unwrap();
+        assert_eq!(
+            with_index.len(),
+            without_index.len(),
+            "索引路径与正文路径的命中数必须一致"
+        );
+        assert!(
+            store.search("量子纠缠", 8).is_ok(),
+            "回退路径也应能命中工具调用参数"
+        );
+    }
+
+    /// 索引与会话**配错**时必须被拒：文件名对但内容属于另一个会话
+    /// （拷贝 / 改名），拿它冒充会让模型「回到现场」时找错地方。
+    #[test]
+    fn an_index_belonging_to_another_session_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf()).unwrap();
+        let mut file = mk_file("s-a", Path::new("/tmp/proj"), "2026-10-03T00:00:00Z");
+        file.messages = vec![Message::user("属于 A 会话的内容")];
+        store.save(&file).unwrap();
+
+        // 把 A 的索引内容写到 B 的索引文件里
+        let wrong = SearchIndex {
+            session_id: "s-a".to_string(),
+            docs: vec![SearchDoc {
+                message_index: 0,
+                role: "user".to_string(),
+                text: "属于 A 会话的内容".to_string(),
+            }],
+        };
+        std::fs::write(
+            dir.path().join("s-b.index.json"),
+            serde_json::to_string(&wrong).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            store.read_index("s-b").is_none(),
+            "索引的 session_id 与查询不符时必须被拒"
+        );
+        assert!(store.read_index("s-a").is_some(), "本会话的索引应可用");
     }
 
     #[test]

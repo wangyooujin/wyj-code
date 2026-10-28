@@ -1,6 +1,8 @@
 _version: 1
 command:
   unknown: "Unknown command: /{name}  (type /help to see all commands)"
+  agent_control_desc: "Send follow-up, interrupt or retry to a running sub-agent"
+  agent_control_usage: "/agent-control <id> <follow-up text|interrupt|retry>"
   background_unsupported: "Command /{name} is declared background-executed but returned a result type the TUI cannot render directly: {result}"
   busy_rejected: "Turn in progress — /{name} was not run: it rewrites conversation state, so it cannot be queued into the running turn. Press Enter again once the turn ends, or press ESC to interrupt first."
 skill:
@@ -177,6 +179,8 @@ agent:
     parameter_removed: "[Model endpoint does not support parameter `{name}`; safely removed and retrying]"
   context_overflow: "\n[Context exceeded the model window; compacting urgently and retrying]\n"
   compacted: "\n[Auto-compacted · #{times} · dropped {removed} older messages · kept the last {kept} verbatim · freed about {saved} tokens]\n"
+  output_budget_clamped: "\n[Output budget {requested} leaves no room to compact inside the effective window {window}; lowered to {applied} for this request. Lower max_tokens for this profile, or this will fire every turn.]\n"
+  compact_not_converging: "\n[Context is still above the threshold after compaction (window {window} / threshold {threshold}) — auto-compaction paused for 3 turns. This usually means the output budget or the system/tool definitions alone fill the window; lower max_tokens and check /context for the breakdown.]\n"
   turn_task_lost: "The turn task terminated abnormally (internal error or forced abort); this turn was stopped. You can keep typing."
   turn_stalled: "The turn made no progress for {secs}s (model response or tool call stalled) and was force-stopped. You can keep typing."
   dangling_tool_uses_repaired: "\n[Repaired {count} tool call(s) left without a result by an earlier interruption — they were never executed]\n"
@@ -186,6 +190,7 @@ agent:
   output_truncated: "\n[The reply hit the max_tokens output limit and may be cut off — raise max_tokens or lower reasoning_effort and retry if you need the complete result.]\n"
   preemptive_thinking_floor: "\n[The echoed reasoning chain in this conversation is long; reasoning was lowered to its minimum level to keep a single output from being consumed entirely by thinking.]\n"
   turn_budget_wrap_up: "\n[Tool loop for this submission has used {turn}/{max} turns — the model has been asked to stop calling tools and summarize its progress now]\n"
+  spend_budget_wrap_up: "\n[Spend budget for this submission is exhausted ({reason}) — the model has been asked to stop calling tools and summarize its progress now]\n"
   invalid_arguments_wrap_up: "\n[Tool arguments failed validation several turns in a row — the model has been asked to fix the argument shape or switch approaches, and deliver its current progress]\n"
   acceptance_passed: "\n[Acceptance passed: all {total} criteria satisfied]\n"
   acceptance_failed: "\n[Acceptance failed: {failed}/{total} criteria unsatisfied ({ids}); the evidence was fed back to the model so it can keep fixing]\n"
@@ -315,6 +320,11 @@ help:
     - `/mode [mode]` — Switch run mode (auto / plan / bypass); no arg shows the current mode
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
+    - `/checkpoint [name]` — Snapshot the current conversation and workspace as a rollback point
+    - `/rewind [id]` — Roll back to a checkpoint; conversation + files by default, `--scope conversation|files` to narrow
+    - `/branch [id]` — Start a branch session from a checkpoint (`--restore-files` also restores files)
+    - `/cwd [path]` — Show or switch the working directory
+    - `/agent-control <id> <follow-up text|interrupt|retry>` — Send follow-up, interrupt or retry to a running sub-agent
     - `/init` — Have the Agent explore the project and generate/merge AGENTS.md; also ensures the project-level .wyj-code/ config skeleton (empty mcp.toml/settings.toml templates) exists
     - `/bug [summary]` — Open this repo's GitHub new-issue page prefilled with env info (no deps)
     - `/review [PR#]` — Fetch a PR diff and have the Agent review it (requires gh CLI)
@@ -387,6 +397,7 @@ compact:
   done: "Compacted: removed {removed} messages, saving roughly {saved} tokens"
   noop: "Context is already short; nothing to compact."
   failed_tag: "compaction failed"
+  generation_warning: "⚠ The current summary is generation {generation} (a summary of summaries). Exact values, negations, and ordering may have drifted — re-read the files or recall the archive before relying on specifics."
 
 checkpoint:
   created: "Created checkpoint {id}"
@@ -437,14 +448,23 @@ cost:
   bar_full: "█"
   bar_empty: "░"
   cache_stats_line: "Cache hit {hit_ratio} · ~{saved_pct} saved vs full-price input"
+  cache_drop_line: "⚠ Cache hit rate dropped from {from} to {to}: {cause}"
+  reasoning_share_line: "Reasoning is {share} of output ({tokens} tokens) — billed at output price but invisible to the user"
   api_calls_line: "Avg input per call {avg_input} tokens"
+  retry_line: "{attempts} request(s) sent, {calls} succeeded, {retries} failed/retried (failures cost nothing)"
   context_detail_line: "{pct} · {used} / {window} tokens"
   subagent_section: "Sub-agent fan-out (in total above)"
   subagent_input: "Input"
   subagent_output: "Output"
   subagent_cache: "Cache read"
+  aux_section: "Auxiliary calls (in total above)"
+  aux_input: "Input"
+  aux_output: "Output"
+  aux_cache: "Cache read"
+  aux_note: "Auxiliary calls = title generation / auto-permission classifier / memory extraction / evolution analysis. They use the endpoint from aux_model or classifier_profile, so their unit price differs from the main model."
   note_cache_write_unreported: "This endpoint serves cache hits but never returns a write count, so the amount shown is a lower bound — it excludes the cache-write charge that would otherwise bill at 1.25x input."
   note_compacted: "Auto-compaction ran {times} time(s); older history was summarized away."
+  note_compact_generation: "The current summary is generation {generation} (a summary of summaries) — detail fidelity is significantly degraded. Verify specific values and paths against the original source."
   cache_downgraded_line: "Prompt cache is OFF: this endpoint rejected cache_control / anthropic-beta, so the rest of the session bills at full price."
   price_missing: "No unit price for model \"{model}\" — showing token counts only, no cost estimate."
 
@@ -454,8 +474,10 @@ usage:
   totals: "Sessions: {sessions} · Turns: {turns} · Model calls: {api_calls}"
   tokens: "Input: {input} · Output: {output} · Cache read: {cache_read} · Cache write: {cache_write}"
   subagent_tokens: "Sub-agents: input {sub_input} · output {sub_output} · cache hit {sub_cache_read} (not included in the main-agent figures above)"
+  aux_tokens: "Auxiliary calls: input {aux_input} · output {aux_output} · cache hit {aux_cache_read} · {aux_calls} call(s) (title/classifier/memory/evolution; not included in the main-agent figures above)"
   rates: "Per turn: {input_per_turn} in / {output_per_turn} out · Per call: {input_per_call} in / {output_per_call} out · Cache hit: {cache_hit} · Output share: {output_share}"
   legacy_no_api_calls: "Note: {count} session(s) predate api-call tracking, so the per-call figures cover only recently recorded sessions."
+  retries: "{attempts} request(s) sent, {calls} succeeded, {retries} failed/retried (failures cost nothing)."
   cache_downgraded: "Prompt cache was downgraded by the endpoint in {count} session(s)."
   never_trimmed: "No session in this range was ever compacted or context-edited — tool results accumulated in full."
   by_month: "By month:"
@@ -816,6 +838,7 @@ status:
   api_key_configured: "API Key: {prefix}... (configured)"
   api_key_error: "API Key: {err}"
   context_window_unverified: "Context window {window} tokens is unverified (not probed). Auto-compact will not fire until ~{trigger} tokens, so tool results accumulate in full. If the real window is smaller, lower `context_window` to make trimming and compaction happen."
+  context_window_clamped_to_catalog: "context_window = {window} exceeds the window the static catalog lists for `{model}` ({supported}); it is clamped to {supported} at runtime, so auto-compact fires at ~{trigger} tokens. If this model really does support a larger window, set `context_window` to the real value to lift the clamp."
   parallel_tools_capped: "max_tools_per_turn = {current} is below what this endpoint supports ({supported}). Each extra round-trip re-sends the whole context, so this is the first-order driver of input cost."
   max_tokens_above_catalog: "max_tokens = {current} is above the output limit the static catalog lists for `{model}` ({supported}). That catalog is a conservative floor, not necessarily the real cap — ignore this if the endpoint really allows more; otherwise the request will be rejected."
   high_effort_on_forced_thinking: "reasoning_effort = {effort} while `{model}` cannot turn thinking off: every tool-loop turn runs a full-depth reasoning pass, so a single submission can take 10-30 minutes. Lower it to `medium` for long tasks, or split them into several submissions."

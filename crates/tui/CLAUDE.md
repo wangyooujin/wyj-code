@@ -88,6 +88,8 @@
 
 **高度必须按物理行算，不能按逻辑行算**：`chat_max_scroll` 与 `chat_view_height` 都来自 `heights` 之和，漏掉折行高度会让贴底时最后几条被裁掉。钉子 `chat_viewport_tests::{long_history_renders_only_the_tail_when_following, wrapped_lines_contribute_their_physical_height, scrolling_up_shows_earlier_history}` 分别钉住「只画视口内的行」「折行高度计入滚动上限」「上滚能回到历史开头」。
 
+**内容不足一屏时聊天流贴底绘制**：`draw_chat` 用 `pad = area.height - total_height` 把内容区下移，内容贴着输入框。改回从第 0 行起画会立刻复现用户报过的「tasklist 与 agents 面板中间空出一大段」——Todo 面板挂在**聊天流尾部**、agents 面板是**贴底固定面板**，两者之间的空隙不属于任何一方，纯粹由聊天区顶部对齐挤出来。**欢迎页是唯一例外**（`should_show_welcome` 为真时 `pad = 0`）：`render_welcome` 自带 `TOP_BLANK_LINES` 让 logo 落在上 1/3，再贴底会把整页压到窗口下半部。滚动条与选区仍按原 `area` 算，`pad` 只影响正文落点。钉子 `chat_viewport_tests::{short_chat_content_is_bottom_aligned, welcome_page_is_not_bottom_aligned}`。
+
 **不要为了"省事"退回 `para.line_count()`**：它看着只有一行代码，但只要 `wrap` 打开就是全历史折行，而 `Paragraph` 内部那趟同样省不掉。真正的收口是把输入数据从 O(历史) 降到 O(视口)。
 
 **`!` bash 输出（`MessageRole::BashOutput`）出全文，不折叠、不截断、不受 `Ctrl+O` 影响**（v0.3.6 起）：它过去是「标题行 + 三行预览 + `...`」（`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines`，两个符号已删除）。删除的理由是 `!` 是**用户亲手敲**的命令，它的输出是用户明确要看的东西——按屏幕高度替用户裁掉 4/5，与工具结果的折叠（那是在替长输出让路、且 `Ctrl+O` 一按就能看全）不是一回事。标题行的 `· N lines` 保留，它现在只是「共多少行」的元信息。**代价与它的收口**：这条路径每帧都要把整段输出折行（`Command::output()` 是全量、工具层无上界），正是「折叠态一律不得触碰 content」不变式要防的那类浪费；代价由 `ChatMessage::render_cache` 按宽度缓存折行结果收掉（见下条不变式的豁免③）。渲染入口是 `render_bash_output_body`，空输出回落 `(no output)` 的判据必须是 `content.trim().is_empty()` 而非「body 是否为空」——只含空白的输出经 `lines()` 会得到若干空行，body 非空却毫无信息量。钉子 `bangs_bash_output_renders_every_line_regardless_of_expand` / `bangs_bash_output_wraps_long_lines_instead_of_dropping_them` / `bangs_bash_output_falls_back_to_no_output_placeholder` 分别钉住「不折叠也不省略」「长行折行不丢字」「空输出回落」。

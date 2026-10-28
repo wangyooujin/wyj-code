@@ -14,11 +14,25 @@ use crate::session_store::SessionStore;
 pub struct SummaryGenerator {
     store: Arc<SessionStore>,
     provider: Arc<dyn Provider>,
+    /// 辅助往返用量累加器。标题生成是 `tokio::spawn` 出去的，拿不到
+    /// `&mut Session`，只能靠共享 sink 记账——否则这次 LLM 往返在
+    /// `/cost` 里完全不可见。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
 }
 
 impl SummaryGenerator {
     pub fn new(store: Arc<SessionStore>, provider: Arc<dyn Provider>) -> Self {
-        Self { store, provider }
+        Self {
+            store,
+            provider,
+            aux_usage: None,
+        }
+    }
+
+    /// 注入辅助用量累加器（装配期调用）。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
+        self
     }
 
     /// 首轮后生成标题并更新 session 文件的 title 字段。
@@ -75,6 +89,13 @@ impl SummaryGenerator {
             )
             .await
             .ok()?;
+
+        // 记账必须放在 `.ok()?` 之后、解析之前：走到这里说明往返已经完成、
+        // token 已经花掉，哪怕后面标题解析失败也照样要计。`ok()?` 本身
+        // 吞掉的只是**请求失败**（没产生计费往返），那条路径不记账是对的。
+        if let Some(sink) = self.aux_usage.as_ref() {
+            sink.record_result(&result);
+        }
 
         let raw: String = result
             .content

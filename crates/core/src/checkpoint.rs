@@ -15,6 +15,23 @@ use crate::workspace_cas::WorkspaceCas;
 const CHECKPOINT_VERSION: u32 = 1;
 const NON_GIT_MAX_FILES: usize = 256;
 const NON_GIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// messages 增量链的最大**读取**折叠深度。
+///
+/// 这是防御性上限，不是正常水位：写侧由 [`MAX_MESSAGES_DELTA_WRITE_DEPTH`]
+/// 主动切段，正常情况链长不会到这里。超过它说明磁盘上有病态链（历史遗留 /
+/// 手工编辑），此时宁可放弃折叠（`load` 报错）也不要让一次 `load` 变成
+/// 几十次同步读盘。
+const MAX_MESSAGES_DELTA_DEPTH: usize = 20;
+
+/// messages 增量链的**写侧**上限：到深度就改写全量，把长链切成若干段。
+///
+/// 为什么必须存在：retention 按时间淘汰**最旧**的 checkpoint，而增量链的
+/// 根恰好是最旧的那个。链一旦长过保留窗口，根被淘汰后所有子节点都折叠
+/// 失败、只能退回「本节点尾部」——`/rewind` 会拿到 1~2 条消息的伪历史。
+///
+/// 取 8：默认保留 20 条时最多同时存在 3 段，且任何一段的根被淘汰时，
+/// 受影响的只有该段（下一段的第一个节点是全量，能独立折叠）。
+const MAX_MESSAGES_DELTA_WRITE_DEPTH: u32 = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -51,8 +68,46 @@ pub struct Checkpoint {
     pub name: Option<String>,
     pub kind: CheckpointKind,
     pub timestamp: String,
+    /// 历史正文。增量形态下只有「相对父 checkpoint 新增的尾部」。
+    ///
+    /// 落盘时由 [`CheckpointStore::create`] 决定存全量还是尾部；读回时由
+    /// `load_raw` 沿父链折叠成完整历史，因此**上层拿到的永远是完整
+    /// `messages`**，增量形态只在磁盘上存在。
     pub messages: Vec<Message>,
+    /// 非 `None` 表示 `messages` 只是**尾部增量**，完整历史要沿父链折叠。
+    ///
+    /// 引入原因（实测 2026-10-28）：本机 5,703 个 checkpoint 合计 1,836 MB，
+    /// 抽样 30 个发现 **96% 的体积是内联的完整 `messages` 快照**。根因是
+    /// 每个有副作用的工具在**前后各写一份全量历史**（`PreTool` / `PostTool`），
+    /// 而一次回合里这类工具动辄几十个。
+    ///
+    /// 文件快照早就有 `WorkspaceSnapshot::Delta` 了，messages 没有——这里补齐。
+    /// 增量只对「父快照是本 checkpoint 的严格前缀」成立时才用；不满足时
+    /// 退回全量（`None`），因此旧的读写路径语义完全不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_delta: Option<MessagesDelta>,
+    /// 工作区快照（Git 引用 / 全量 Files / 相对父节点的 Delta）。
     pub workspace: WorkspaceSnapshot,
+}
+
+/// messages 的父链增量描述。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesDelta {
+    /// 父 checkpoint id。折叠时从它取完整历史再追加本 checkpoint 的尾部。
+    pub parent_checkpoint_id: String,
+    /// 父 checkpoint 的历史条数。折叠时用它校验「父链确实是本快照的前缀」——
+    /// 长度对不上说明中间发生过压缩 / 分支，此时**不能**拼，必须退回全量。
+    pub parent_len: usize,
+    /// 本节点在父链上的深度（父节点自身的 `depth + 1`；父为全量时是 1）。
+    ///
+    /// 写侧用它**主动封顶**：链越深，一次 `load` 的递归读盘次数越多，
+    /// 而 retention 淘汰父节点时能「断链」的范围也越大。到
+    /// [`MAX_MESSAGES_DELTA_WRITE_DEPTH`] 就改写全量，把链切成若干段。
+    ///
+    /// `serde(default)`：字段引入前写下的增量按 0 处理，下一次写入会自然
+    /// 按「父深度未知」保守处理。
+    #[serde(default)]
+    pub depth: u32,
 }
 
 impl Checkpoint {
@@ -62,6 +117,11 @@ impl Checkpoint {
             WorkspaceSnapshot::Files(snapshot) => &snapshot.root,
             WorkspaceSnapshot::Delta(snapshot) => &snapshot.root,
         }
+    }
+
+    /// 本 checkpoint 是否为增量形态（`messages` 只是尾部）。
+    pub fn is_messages_delta(&self) -> bool {
+        self.messages_delta.is_some()
     }
 }
 
@@ -181,6 +241,26 @@ pub struct CheckpointSummary {
     /// 表现为「刚才还在的回滚点突然没了」，且无法从数据侧解释。
     #[serde(default)]
     pub owner_pid: u32,
+    /// 该 checkpoint 文件落盘后的字节数（写入时记录）。
+    ///
+    /// 存在的理由：按**条数**淘汰挡不住体积膨胀。实测（2026-10-28）本机
+    /// 5,703 个 checkpoint 合计 1,836 MB，平均 322 KB，其中 96% 是内联的
+    /// 完整 `messages` 快照——`checkpoints_per_session = 20` 对长会话来说
+    /// 意味着「留 20 份几 MB 的历史」，总量随会话长度线性上涨。
+    ///
+    /// `0` = 老版本写入的条目（字段引入前），无法参与字节预算计算，按
+    /// 「不占预算」处理：宁可少删也不误删用户仅剩的回滚点。
+    #[serde(default)]
+    pub bytes: u64,
+    /// 本 checkpoint 的 messages 增量父节点（全量形态为 `None`）。
+    ///
+    /// 冗余存进 manifest 是为了让 retention **不必读 checkpoint 正文**就能
+    /// 找出「父节点即将被删」的子节点——淘汰发生在每次 create 之后，若
+    /// 每次都把 20 个 checkpoints 的完整 JSON 读一遍，长会话的写入成本会
+    /// 直接被 retention 拖垮。字段引入前的条目一律是**全量**形态（delta 与
+    /// 该字段同时出现），因此 `None` 的语义天然正确。
+    #[serde(default)]
+    pub messages_parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +301,8 @@ pub struct CheckpointStore {
     dir: PathBuf,
     /// 单 session checkpoint 上限(builder 注入;0 = 不限)。
     max_per_session: usize,
+    /// 单 session checkpoint 字节预算(builder 注入;0 = 不按字节淘汰)。
+    max_bytes_per_session: u64,
     /// 可选 CAS 池。capture_files / restore_files_snapshot 走 CAS 减少 checkpoint 体积。
     /// None 表示不接 CAS(测试或回滚场景),全部 inline_bytes。
     cas: Option<Arc<WorkspaceCas>>,
@@ -248,6 +330,12 @@ pub struct CheckpointStore {
 pub struct CheckpointConfig {
     /// 单 session checkpoint 条数上限(0 = 不限)。
     pub max_per_session: usize,
+    /// 单 session checkpoint **字节**预算(0 = 不按字节淘汰)。
+    ///
+    /// 与 `max_per_session` 是两个独立闸门,任一超标即淘汰。只按条数控制
+    /// 挡不住体积膨胀:实测 5,703 个 checkpoint 合计 1,836 MB、平均 322 KB,
+    /// 其中 96% 是内联的完整 `messages` 快照。
+    pub max_bytes_per_session: u64,
     /// 可选 CAS 池,用于 capture_files / restore_files_snapshot 去重。
     pub cas: Option<Arc<WorkspaceCas>>,
     /// 本进程的交互面是否**无人可问**（headless / `-p` / 定时任务 / 子 Agent）。
@@ -307,6 +395,7 @@ impl CheckpointStore {
             .unwrap_or_default();
         let mut store = Self::new(sessions_dir, session_id)?;
         store.max_per_session = cfg.max_per_session;
+        store.max_bytes_per_session = cfg.max_bytes_per_session;
         store.cas = cfg.cas;
         store.non_interactive = cfg.non_interactive;
         Ok(store)
@@ -329,6 +418,7 @@ impl CheckpointStore {
             session_id,
             dir,
             max_per_session: 0,
+            max_bytes_per_session: 0,
             cas: None,
             non_interactive: false,
         })
@@ -349,6 +439,16 @@ impl CheckpointStore {
     /// 测试与 `storage prune` 这类「按显式参数跑一次裁剪」的调用方用的。
     pub fn with_max_per_session(mut self, max_per_session: usize) -> Self {
         self.max_per_session = max_per_session;
+        self
+    }
+
+    /// 设置单 session 的 checkpoint **字节**预算（builder 模式，0 = 不按字节淘汰）。
+    ///
+    /// 与 [`Self::with_max_per_session`] 是两个独立闸门，任一超标即淘汰。
+    /// `storage prune` 这类「按显式参数跑一次裁剪」的调用方必须两个都设，
+    /// 否则长会话的体积膨胀清不掉。
+    pub fn with_max_bytes_per_session(mut self, max_bytes: u64) -> Self {
+        self.max_bytes_per_session = max_bytes;
         self
     }
 
@@ -416,6 +516,21 @@ impl CheckpointStore {
             messages
         };
         let workspace = self.capture_workspace_with_delta(&cwd_root, cwd)?;
+        // ── messages 增量 ────────────────────────────────────────────────────
+        //
+        // 判定「上一个 checkpoint 的完整历史是不是本快照的严格前缀」：
+        // 是 → 只存尾部（`messages_delta`），否则存全量。
+        //
+        // 这个判据把**所有不安全的情形**都挡在门外，不需要逐个枚举：
+        // - 压缩后历史被整体重写 → 前缀不成立 → 全量；
+        // - 分支 / rewind 后历史改向 → 前缀不成立 → 全量；
+        // - 首个 checkpoint、父节点已被淘汰 → 拿不到父历史 → 全量；
+        // - 历史反而变短（不该发生）→ `len()` 比较自然排除。
+        //
+        // 为什么值得做：实测 5,703 个 checkpoint / 1,836 MB，抽样 30 个发现
+        // 96% 的体积是内联的完整 `messages`。一次回合里有副作用的工具动辄
+        // 几十个，每个都存两份全量历史（PreTool + PostTool）。
+        let (stored_messages, messages_delta) = self.plan_messages_storage(&truncated_messages);
         let checkpoint = Checkpoint {
             version: CHECKPOINT_VERSION,
             id: id.clone(),
@@ -423,10 +538,11 @@ impl CheckpointStore {
             name: name.clone(),
             kind: kind.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            messages: truncated_messages,
+            messages: stored_messages,
+            messages_delta,
             workspace,
         };
-        write_json_atomic(&self.checkpoint_path(&id), &checkpoint)?;
+        let written_bytes = write_json_atomic_counted(&self.checkpoint_path(&id), &checkpoint)?;
 
         let baseline_id = match &checkpoint.workspace {
             WorkspaceSnapshot::Delta(delta) => Some(delta.parent_checkpoint_id.clone()),
@@ -437,10 +553,24 @@ impl CheckpointStore {
             name,
             kind,
             timestamp: checkpoint.timestamp,
-            message_count: checkpoint.messages.len(),
+            // 对外报告的是**完整**历史条数，不是磁盘上那份尾部——
+            // `/rewind` 列表与 `message_count` 校验都按完整值走。
+            message_count: checkpoint.messages.len()
+                + checkpoint
+                    .messages_delta
+                    .as_ref()
+                    .map(|delta| delta.parent_len)
+                    .unwrap_or(0),
             cwd_root,
             baseline_id,
             owner_pid: std::process::id(),
+            bytes: written_bytes,
+            // 冗余记录增量父节点：retention 靠它找出「父节点即将被删」的
+            // 子节点，从而在删除前把它们改写为全量（见 `prune_manifest_locked`）。
+            messages_parent: checkpoint
+                .messages_delta
+                .as_ref()
+                .map(|delta| delta.parent_checkpoint_id.clone()),
         };
         // push 与 retention 合并在**同一个**临界区里：分成两步的话，中间会被
         // 另一个进程的 push 插进来，把裁剪结果整个盖回去，manifest 于是反复在
@@ -538,7 +668,7 @@ impl CheckpointStore {
     /// 用**不可删条数**反推而不是复制一份淘汰逻辑：后者会随 retention 规则
     /// 演进而漂移，前者只依赖 `prune_manifest_locked` 自己维护的那个判据。
     pub fn estimate_retention_drops(&self) -> Result<usize> {
-        if self.max_per_session == 0 {
+        if self.max_per_session == 0 && self.max_bytes_per_session == 0 {
             return Ok(0);
         }
         let manifest = self.load_manifest()?;
@@ -546,19 +676,43 @@ impl CheckpointStore {
         // 与 `prune_manifest_locked` 的 `foreign_live` **逐字对应**：别人创建的
         // 且（pid 未知为 0 或仍存活）。自己创建的条目不算保护对象——那边会把
         // 它们照常淘汰。
-        let foreign_live = manifest
+        let foreign_live: BTreeSet<&str> = manifest
             .checkpoints
             .iter()
             .filter(|entry| entry.owner_pid != self_pid)
             .filter(|entry| {
                 entry.owner_pid == 0 || wyj_config::filelock::is_process_alive(entry.owner_pid)
             })
-            .count();
-        Ok(manifest
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let removable: Vec<&CheckpointSummary> = manifest
             .checkpoints
-            .len()
-            .saturating_sub(foreign_live)
-            .saturating_sub(self.max_per_session))
+            .iter()
+            .filter(|entry| !foreign_live.contains(entry.id.as_str()))
+            .collect();
+
+        let by_count = if self.max_per_session == 0 {
+            0
+        } else {
+            removable.len().saturating_sub(self.max_per_session)
+        };
+        // 字节闸门：与 `prune_manifest_locked` 同一份判据（跳过 bytes == 0）。
+        let mut byte_drops = 0usize;
+        if self.max_bytes_per_session > 0 {
+            let total: u64 = removable.iter().map(|entry| entry.bytes).sum();
+            let mut over = total.saturating_sub(self.max_bytes_per_session);
+            for entry in &removable {
+                if over == 0 {
+                    break;
+                }
+                if entry.bytes == 0 {
+                    continue;
+                }
+                over = over.saturating_sub(entry.bytes);
+                byte_drops += 1;
+            }
+        }
+        Ok(by_count.max(byte_drops))
     }
 
     /// 把已落盘的 checkpoint **重新外化**一遍，返回 `(处理数, 释放字节数)`。
@@ -724,7 +878,8 @@ impl CheckpointStore {
     /// 会话快照不是本进程的垃圾，哪怕它比自己创建得早——删掉它等于让另一个终端的
     /// `/rewind` 目标凭空消失。单进程场景下 `owner_pid` 就是自己，行为与旧版完全一致。
     fn prune_manifest_locked(&self, manifest: &mut CheckpointManifest) -> Result<()> {
-        if self.max_per_session == 0 {
+        // 两个闸门任一开启就要跑；都为 0 才是「完全不管」。
+        if self.max_per_session == 0 && self.max_bytes_per_session == 0 {
             return Ok(());
         }
         let self_pid = std::process::id();
@@ -740,44 +895,236 @@ impl CheckpointStore {
             })
             .map(|entry| entry.id.clone())
             .collect();
-        let removable = manifest.checkpoints.len() - foreign_live.len();
-        if removable <= self.max_per_session {
-            return Ok(());
-        }
-        // 按 timestamp 升序,保留后 N 条(最新);被跳过的条目原样留回 manifest。
+        // 按 timestamp 升序，从最旧的开始淘汰。
         manifest
             .checkpoints
             .sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-        let drop_count = removable - self.max_per_session;
-        let mut dropped = 0;
-        let mut kept = Vec::with_capacity(manifest.checkpoints.len());
-        for entry in std::mem::take(&mut manifest.checkpoints) {
-            if dropped < drop_count && !foreign_live.contains(&entry.id) {
-                validate_checkpoint_id(&entry.id)?;
-                let path = self.checkpoint_path(&entry.id);
-                // **删除前先释放它引用的 CAS blob**。checkpoint 一旦外化
-                // （image / thinking），它的历史正文只有 `cas://` 占位符，真正的
-                // 数据在 CAS 池里。只删文件不 release，那些 blob 的 ref_count
-                // 永远停在 ≥1，`WorkspaceCas::gc` 永远删不掉——用「删 checkpoint
-                // 省磁盘」换「CAS 无界增长」，总量不减反增。
-                //
-                // 顺序：先 release 再删文件。反过来一旦删成功而 release 失败
-                // （进程被 kill 在这个窗口），blob 就永久失去引用者，只能等
-                // 人工 `storage prune` 之外的路径处理。先 release 最坏是计数多减
-                // 一次（文件还在、内容仍可读）——这与 `release` 的幂等语义一致。
-                if let (Some(cas), Ok(checkpoint)) = (self.cas.as_deref(), self.load_raw(&entry.id))
-                {
-                    release_checkpoint_cas_refs(cas, &checkpoint.messages);
+
+        // ── 两个闸门一起算出「要删几个」────────────────────────────────────
+        //
+        // 条数闸门：能删的条目数超过上限时，删掉最旧的差额。
+        // 字节闸门：可删条目的字节总和超过预算时，从最旧的开始删，直到落回预算内。
+        //
+        // 取两者中**更大的**那个删除量：任一超标都要满足，只满足其一等于没治住。
+        let removable: Vec<&CheckpointSummary> = manifest
+            .checkpoints
+            .iter()
+            .filter(|entry| !foreign_live.contains(&entry.id))
+            .collect();
+        // 条数闸门：能删的条目数超过上限时，删掉最旧的差额。
+        let by_count = if self.max_per_session == 0 {
+            0
+        } else {
+            removable.len().saturating_sub(self.max_per_session)
+        };
+        // 字节闸门：可删条目的字节总和超过预算时，从最旧的开始删到落回预算内。
+        //
+        // `bytes == 0` 的老条目（字段引入前写入）跳过：它们不占预算，砍掉
+        // 纯粹是白丢用户仅剩的回滚点。这条判据必须与下面实际的删除循环
+        // **共用同一份待删集合**，否则会出现「按字节算要删 1 个，实际删掉的
+        // 却是那条不占空间的老条目」。
+        let mut drop_by_bytes: BTreeSet<String> = BTreeSet::new();
+        if self.max_bytes_per_session > 0 {
+            let total: u64 = removable.iter().map(|entry| entry.bytes).sum();
+            let mut over = total.saturating_sub(self.max_bytes_per_session);
+            for entry in &removable {
+                if over == 0 {
+                    break;
                 }
-                if let Err(error) = std::fs::remove_file(&path) {
-                    // 删不掉就留在 manifest 里：manifest 有条目而文件在，是无害的
-                    // （`load` 能读出来）；反过来才是数据损坏。
-                    tracing::warn!("删除旧 checkpoint 失败 {}: {error}", path.display());
-                    kept.push(entry);
-                } else {
-                    dropped += 1;
+                if entry.bytes == 0 {
+                    continue;
                 }
+                over = over.saturating_sub(entry.bytes);
+                drop_by_bytes.insert(entry.id.clone());
+            }
+        }
+
+        // 两个闸门取**更严**的：任一超标都要满足，只满足其一等于没治住。
+        // 条数闸门按「最旧的 N 条」选（与旧行为一致），字节闸门按上面的集合，
+        // 两者并集就是要删的。
+        let mut drop_ids: BTreeSet<String> = drop_by_bytes;
+        if by_count > 0 {
+            for entry in removable.iter().take(by_count) {
+                drop_ids.insert(entry.id.clone());
+            }
+        }
+        if drop_ids.is_empty() {
+            return Ok(());
+        }
+        // 条数闸门可能要求删超过「最旧的 N 条」——当字节闸门选中的是较新的
+        // 条目时，并集已经覆盖；这里只需保证总数不低于 by_count 的要求。
+        if by_count > drop_ids.len() {
+            for entry in removable.iter() {
+                if drop_ids.len() >= by_count {
+                    break;
+                }
+                drop_ids.insert(entry.id.clone());
+            }
+        }
+
+        // ── 删除前：把「父将被删」的增量节点升级为自包含形态 ─────────────
+        //
+        // messages 与 workspace **各有一条父链**，父文件一删，子节点的折叠
+        // 就永久失败：
+        //   * messages 链断 → `load` 只能返回尾部（1~2 条），`/rewind` 静默
+        //     丢掉整段对话；
+        //   * workspace Delta 链断 → `resolve_to_files_caller` 读不到父文件，
+        //     `/rewind --scope files` 直接失败。
+        // 所以两条链都要在**删除之前**折叠成自包含形态。此刻父文件还在盘上。
+        //
+        // 只需处理**直接子节点**：写侧用 `MAX_MESSAGES_DELTA_WRITE_DEPTH`
+        // 主动切段，删一层的代价是每段最多升级一个节点，而不是整条链。
+        for entry in manifest.checkpoints.iter_mut() {
+            if drop_ids.contains(&entry.id) {
+                continue;
+            }
+            let messages_parent = entry
+                .messages_parent
+                .clone()
+                .filter(|parent| drop_ids.contains(parent));
+            let workspace_parent = entry
+                .baseline_id
+                .clone()
+                .filter(|parent| drop_ids.contains(parent));
+            if messages_parent.is_none() && workspace_parent.is_none() {
+                continue;
+            }
+            let Ok(mut checkpoint) = self.read_checkpoint_file(&entry.id) else {
+                tracing::warn!(checkpoint = %entry.id, "checkpoint 无法读取，跳过升级");
+                continue;
+            };
+            let mut rewritten = false;
+
+            if let Some(parent) = messages_parent.as_deref() {
+                let Some(full) = self.messages_of(&checkpoint) else {
+                    // 折叠失败说明这条链**已经**断了（例如历史遗留的多层增量）：
+                    // 不能把尾部当成全量写回——那会永久丢掉前缀。
+                    tracing::warn!(
+                        checkpoint = %entry.id,
+                        parent = %parent,
+                        "增量父链不完整，无法升级为全量；删除父节点后该回滚点会被拒绝"
+                    );
+                    drop_ids.remove(parent);
+                    continue;
+                };
+                checkpoint.messages = full;
+                checkpoint.messages_delta = None;
+                rewritten = true;
+            }
+
+            if let Some(parent) = workspace_parent.as_deref() {
+                match resolve_to_files_caller(&self.dir, &checkpoint) {
+                    Ok(resolved) => {
+                        // **必须重新 intern**：升级后的 Files 快照会引用一批
+                        // 原本只由父 checkpoint 持有的 blob（父链上 Unchanged
+                        // 的文件）。不在这里 +1，删除父节点时的 release 会把
+                        // 计数减到 0，`gc` 随后删掉升级后仍在引用的内容。
+                        if let Some(cas) = self.cas.as_deref() {
+                            for file in resolved.files.values() {
+                                let Some(hash) = file.hash.as_deref() else {
+                                    continue;
+                                };
+                                if let Ok(bytes) = cas.get(hash) {
+                                    let _ = cas.intern(&bytes);
+                                }
+                            }
+                        }
+                        checkpoint.workspace = WorkspaceSnapshot::Files(resolved);
+                        rewritten = true;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            checkpoint = %entry.id,
+                            parent = %parent,
+                            %error,
+                            "工作区父链无法折叠，无法升级为全量；保留父节点"
+                        );
+                        drop_ids.remove(parent);
+                        continue;
+                    }
+                }
+            }
+
+            if !rewritten {
+                continue;
+            }
+            match write_json_atomic_counted(&self.checkpoint_path(&entry.id), &checkpoint) {
+                Ok(_) => {
+                    tracing::debug!(
+                        checkpoint = %entry.id,
+                        "父 checkpoint 即将被淘汰，已把增量节点升级为自包含形态"
+                    );
+                    if messages_parent.is_some() {
+                        entry.messages_parent = None;
+                    }
+                    if workspace_parent.is_some() {
+                        entry.baseline_id = None;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        checkpoint = %entry.id,
+                        %error,
+                        "checkpoint 升级失败；保留父节点以免子节点报废"
+                    );
+                    if let Some(parent) = messages_parent {
+                        drop_ids.remove(&parent);
+                    }
+                    if let Some(parent) = workspace_parent {
+                        drop_ids.remove(&parent);
+                    }
+                }
+            }
+        }
+        if drop_ids.is_empty() {
+            return Ok(());
+        }
+
+        // 先把待删的 checkpoint 全部折叠出来（`release` 需要完整历史里的
+        // 全部 `cas://` 引用）。必须在任何 `remove_file` 之前做：删除是逐条
+        // 进行的，先删了父节点，后面那条就折叠失败，只能看到尾部 →
+        // 前缀 blob 的引用永远不会被释放。
+        let mut dropped: Vec<(CheckpointSummary, Option<Checkpoint>)> = Vec::new();
+        let mut kept: Vec<CheckpointSummary> = Vec::new();
+        for mut entry in std::mem::take(&mut manifest.checkpoints) {
+            if drop_ids.contains(&entry.id) && !foreign_live.contains(&entry.id) {
+                let loaded = self.load_raw(&entry.id).ok();
+                dropped.push((entry, loaded));
             } else {
+                // 父节点已被（或即将被）删除：manifest 里的父指针也要一起
+                // 清掉，否则下一次 prune 还会按旧指针去找一个不存在的父节点。
+                if entry
+                    .messages_parent
+                    .as_deref()
+                    .is_some_and(|parent| drop_ids.contains(parent))
+                {
+                    entry.messages_parent = None;
+                }
+                kept.push(entry);
+            }
+        }
+
+        for (entry, loaded) in dropped {
+            validate_checkpoint_id(&entry.id)?;
+            let path = self.checkpoint_path(&entry.id);
+            // **删除前先释放它引用的 CAS blob**。checkpoint 一旦外化
+            // （image / thinking / 非 git 文件快照），它的正文只有 `cas://`
+            // 占位符，真正的数据在 CAS 池里。只删文件不 release，那些 blob
+            // 的 ref_count 永远停在 ≥1，`WorkspaceCas::gc` 永远删不掉——
+            // 用「删 checkpoint 省磁盘」换「CAS 无界增长」，总量不减反增。
+            //
+            // 顺序：先 release 再删文件。反过来一旦删成功而 release 失败
+            // （进程被 kill 在这个窗口），blob 就永久失去引用者，只能等
+            // 人工 `storage prune` 之外的路径处理。先 release 最坏是计数多减
+            // 一次（文件还在、内容仍可读）——这与 `release` 的幂等语义一致。
+            if let (Some(cas), Some(checkpoint)) = (self.cas.as_deref(), loaded.as_ref()) {
+                release_checkpoint_cas_refs(cas, &checkpoint.messages);
+                release_workspace_cas_refs(cas, &checkpoint.workspace);
+            }
+            if let Err(error) = std::fs::remove_file(&path) {
+                // 删不掉就留在 manifest 里：manifest 有条目而文件在，是无害的
+                // （`load` 能读出来）；反过来才是数据损坏。
+                tracing::warn!("删除旧 checkpoint 失败 {}: {error}", path.display());
                 kept.push(entry);
             }
         }
@@ -795,6 +1142,15 @@ impl CheckpointStore {
 
     pub fn load(&self, checkpoint_id: &str) -> Result<Checkpoint> {
         let mut checkpoint = self.load_raw(checkpoint_id)?;
+        // 折叠失败时 `load_raw` 会保留本节点的尾部（`messages_delta` 仍为
+        // `Some`）。**绝不能**把这半份历史交给 `/rewind`：它会静默覆盖用户
+        // 的当前会话，而丢掉的正是被压缩/被淘汰之前的全部上下文。
+        // 宁可报错让用户换一个更新的回滚点。
+        anyhow::ensure!(
+            checkpoint.messages_delta.is_none(),
+            "checkpoint {checkpoint_id} 的增量父链不完整（父节点可能已被 retention 淘汰），\
+             拒绝用半份历史回滚；请选择更新的回滚点，或改用 `--scope files`"
+        );
         // 与 `create` 的 externalize 对称：盘上超大 image / 长 thinking 是
         // `cas://<hash>` 占位，回滚对话时要还原成真实内容，否则 `/rewind` 之后
         // 模型看到的是字面量 URL。blob 已被 gc 时 `materialize_block_with` 保留
@@ -815,7 +1171,23 @@ impl CheckpointStore {
     }
 
     /// 只反序列化、不做 CAS 还原。内部「只关心 `workspace`」的调用点走这里。
+    ///
+    /// 增量形态在这里**折叠回完整历史**：上层拿到的 `messages` 永远是完整的，
+    /// 增量只是磁盘上的表示（见 [`MessagesDelta`]）。折叠失败（父 checkpoint
+    /// 已被 retention 淘汰 / 父链长度对不上）时**不清空**，保留本文件里已有的
+    /// 尾部并 `warn`——半份历史仍然比空历史有用，且 `rewind` 会因
+    /// `message_count` 不匹配被上层拒绝，不会静默给出错误现场。
     fn load_raw(&self, checkpoint_id: &str) -> Result<Checkpoint> {
+        validate_checkpoint_id(checkpoint_id)?;
+        let mut checkpoint = self.read_checkpoint_file(checkpoint_id)?;
+        if checkpoint.messages_delta.is_some() {
+            self.fold_messages_delta(&mut checkpoint);
+        }
+        Ok(checkpoint)
+    }
+
+    /// 直接读文件，**不做**增量折叠。折叠自身要用它，否则会无限递归。
+    fn read_checkpoint_file(&self, checkpoint_id: &str) -> Result<Checkpoint> {
         validate_checkpoint_id(checkpoint_id)?;
         let path = self.checkpoint_path(checkpoint_id);
         let bytes =
@@ -827,6 +1199,158 @@ impl CheckpointStore {
             "checkpoint belongs to another session"
         );
         Ok(checkpoint)
+    }
+
+    /// 决定这次 checkpoint 的 `messages` 存全量还是尾部增量。
+    ///
+    /// 返回 `(要落盘的 messages, 增量描述)`。增量描述的 `parent_len` 是**父
+    /// checkpoint 的完整条数**，折叠时用它校验前缀关系仍然成立。
+    ///
+    /// 判据只有一条：**上一个 checkpoint 的完整历史必须是本快照的严格前缀**
+    /// （`parent.len() < self.len()` 且逐条相等）。这一条同时覆盖了压缩、
+    /// 分支、rewind、父节点被淘汰等所有不安全情形——它们都会让前缀不成立。
+    ///
+    /// 逐条比较用「引用相等 + 内容相等」而不是 hash：`Message` 没有实现
+    /// `Hash`，而这里比较的是内存里刚拿到的两个 `Vec`，条数通常在千级，
+    /// 内容比较的代价远低于一次全量序列化落盘。
+    fn plan_messages_storage(&self, messages: &[Message]) -> (Vec<Message>, Option<MessagesDelta>) {
+        let Some(parent_id) = self.last_written_id() else {
+            return (messages.to_vec(), None);
+        };
+        // 父节点的**原始**深度：`load_raw` 折叠后会把 `messages_delta` 抹成
+        // `None`，所以必须单独读一次未折叠的形态来取 `depth`。
+        let parent_depth = match self.read_checkpoint_file(&parent_id) {
+            Ok(raw) => raw.messages_delta.map(|delta| delta.depth).unwrap_or(0),
+            // 父文件读不出来（被淘汰 / 损坏）→ 本次写全量。
+            Err(_) => return (messages.to_vec(), None),
+        };
+        // 链到上限就切段：长链的根一定是最旧的 checkpoint，而 retention
+        // 正是从最旧开始删。不主动切段的话，根一被淘汰，整条链上所有节点
+        // 都只能退回「本节点尾部」——`/rewind` 拿到的是 1~2 条伪历史。
+        if parent_depth >= MAX_MESSAGES_DELTA_WRITE_DEPTH {
+            return (messages.to_vec(), None);
+        }
+        let Ok(parent) = self.load_raw(&parent_id) else {
+            return (messages.to_vec(), None);
+        };
+        // 严格前缀：父历史比本快照短，且逐条相同。
+        if parent.messages.len() >= messages.len() {
+            return (messages.to_vec(), None);
+        }
+        if !parent
+            .messages
+            .iter()
+            .zip(messages.iter())
+            .all(|(a, b)| a == b)
+        {
+            return (messages.to_vec(), None);
+        }
+        let tail = messages[parent.messages.len()..].to_vec();
+        (
+            tail,
+            Some(MessagesDelta {
+                parent_checkpoint_id: parent_id,
+                parent_len: parent.messages.len(),
+                depth: parent_depth.saturating_add(1),
+            }),
+        )
+    }
+
+    /// 本 store 最近一次**成功写入**的 checkpoint id（用于增量父节点判定）。
+    ///
+    /// 读 manifest 而不是在 `CheckpointStore` 上挂内存字段：TUI 会反复
+    /// 重建 store（`/model`、模式切换），内存字段一重建就丢，增量会退化成
+    /// 全量；manifest 是磁盘上的单一事实源，重建后照样能接上前一个。
+    fn last_written_id(&self) -> Option<String> {
+        let manifest = self.load_manifest().ok()?;
+        manifest
+            .checkpoints
+            .iter()
+            .max_by(|a, b| a.timestamp.cmp(&b.timestamp))
+            .map(|entry| entry.id.clone())
+    }
+
+    /// 把增量形态折叠成完整历史：递归取父链的完整 `messages`，再接上本节点的尾部。
+    ///
+    /// 三道防线：
+    /// 1. 父文件不存在（被 retention 淘汰）→ 放弃折叠，保留尾部；
+    /// 2. 父链折叠后的长度 ≠ `parent_len`（中间发生过压缩 / 分支）→ 放弃折叠，
+    ///    因为此时「本节点尾部」未必接在父历史后面；
+    /// 3. 链深度超过 [`MAX_MESSAGES_DELTA_DEPTH`] → 放弃折叠，防止病态长链
+    ///    把一次 `load` 变成几十次递归读盘。
+    fn fold_messages_delta(&self, checkpoint: &mut Checkpoint) {
+        let Some(delta) = checkpoint.messages_delta.clone() else {
+            return;
+        };
+        let tail = std::mem::take(&mut checkpoint.messages);
+        match self.fold_parent_chain(&delta.parent_checkpoint_id, 0) {
+            Some(mut parent) if parent.len() == delta.parent_len => {
+                parent.extend(tail);
+                checkpoint.messages = parent;
+                checkpoint.messages_delta = None;
+            }
+            Some(parent) => {
+                tracing::warn!(
+                    checkpoint = %checkpoint.id,
+                    expected = delta.parent_len,
+                    actual = parent.len(),
+                    "checkpoint 增量父链长度不符（可能中途压缩/分支），保留本节点尾部而不拼合"
+                );
+                checkpoint.messages = tail;
+            }
+            None => {
+                tracing::warn!(
+                    checkpoint = %checkpoint.id,
+                    parent = %delta.parent_checkpoint_id,
+                    "checkpoint 增量父节点不可用（已被淘汰？），保留本节点尾部而不拼合"
+                );
+                checkpoint.messages = tail;
+            }
+        }
+    }
+
+    /// 取某个 checkpoint 的完整历史，必要时沿父链继续折叠。`depth` 防病态长链。
+    fn fold_parent_chain(&self, checkpoint_id: &str, depth: usize) -> Option<Vec<Message>> {
+        if depth >= MAX_MESSAGES_DELTA_DEPTH {
+            tracing::warn!(
+                checkpoint = checkpoint_id,
+                depth,
+                "checkpoint 增量父链过深，停止折叠"
+            );
+            return None;
+        }
+        let mut parent = self.read_checkpoint_file(checkpoint_id).ok()?;
+        if let Some(delta) = parent.messages_delta.clone() {
+            let tail = std::mem::take(&mut parent.messages);
+            let mut base = self.fold_parent_chain(&delta.parent_checkpoint_id, depth + 1)?;
+            if base.len() != delta.parent_len {
+                return None;
+            }
+            base.extend(tail);
+            return Some(base);
+        }
+        Some(parent.messages)
+    }
+
+    /// 把单个 checkpoint（可能已是增量形态）还原成**完整历史**。
+    ///
+    /// `None` = 链断了（父节点被淘汰 / 长度对不上 / 深度超限）。与
+    /// [`Self::fold_messages_delta`] 的区别：后者在失败时会**保留尾部**继续
+    /// 返回 `Ok`（供 `/rewind` 列表等「能看一点算一点」的场景），而本方法
+    /// 是给**写回全量**用的——失败时绝不能让调用方把尾部当成完整历史写盘，
+    /// 那会把前缀永久删掉。
+    fn messages_of(&self, checkpoint: &Checkpoint) -> Option<Vec<Message>> {
+        match checkpoint.messages_delta.as_ref() {
+            None => Some(checkpoint.messages.clone()),
+            Some(delta) => {
+                let mut base = self.fold_parent_chain(&delta.parent_checkpoint_id, 0)?;
+                if base.len() != delta.parent_len {
+                    return None;
+                }
+                base.extend(checkpoint.messages.iter().cloned());
+                Some(base)
+            }
+        }
     }
 
     pub fn preview_files(&self, checkpoint_id: &str, cwd: &Path) -> Result<RewindPreview> {
@@ -1137,7 +1661,7 @@ fn annotate_shared_peers(preview: &mut RewindPreview, cwd: &Path) {
 fn preview_workspace_inner(
     checkpoint: &Checkpoint,
     cwd: &Path,
-    cas: Option<&WorkspaceCas>,
+    _cas: Option<&WorkspaceCas>,
     self_dir: &Path,
 ) -> Result<RewindPreview> {
     match &checkpoint.workspace {
@@ -1180,7 +1704,12 @@ fn preview_workspace_inner(
             })
         }
         WorkspaceSnapshot::Files(snapshot) => {
-            let current = capture_files(&snapshot.root, cas)?;
+            // 预览**不得**走 CAS：`capture_files` 会把每个文件内容 `intern()`
+            // 一次并让 ref_count +1，而预览只是算 sha256 差异，不保存任何
+            // 东西。走 CAS 的话「看一眼 /rewind 计划」就会永久泄漏一批引用，
+            // `gc` 永远回收不掉。`cas = None` 时走内联字节，比较用的 sha256
+            // 与大小完全相同。
+            let current = capture_files(&snapshot.root, None)?;
             let affected_files = changed_file_paths(snapshot, &current);
             Ok(RewindPreview {
                 checkpoint_id: checkpoint.id.clone(),
@@ -1204,7 +1733,8 @@ fn preview_workspace_inner(
             // Delta checkpoint 的 preview:沿父链折叠到完整 snapshot 后再 diff
             // 当前 live 状态。注意折叠已读盘 N 次,O(N) 延迟。
             let resolved = resolve_to_files_caller(self_dir, checkpoint)?;
-            let current = capture_files(&resolved.root, cas)?;
+            // 同 `Files` 分支：预览不写 CAS，避免白增引用计数。
+            let current = capture_files(&resolved.root, None)?;
             let affected_files = changed_file_paths(&resolved, &current);
             Ok(RewindPreview {
                 checkpoint_id: checkpoint.id.clone(),
@@ -1541,6 +2071,11 @@ fn restore_files_snapshot(
             Some(entry) => {
                 // CAS 路径:优先 hash 走 cas.get;fallback 到 inline_bytes(兼容老 v1
                 // 直接含 bytes 的 checkpoint)。
+                //
+                // **`hash` 在、`cas` 不在时绝不能回落到 `inline_bytes`**：外化
+                // 过的 entry 其 `inline_bytes` 是空的，回落等于把文件写成 0
+                // 字节——一次静默的数据销毁。CAS 打不开（目录不可写 / 只读
+                // $HOME）是真实会发生的环境，此时必须整体失败。
                 let bytes = match (&entry.hash, cas) {
                     (Some(hash), Some(c)) => match c.get(hash) {
                         Ok(b) => b,
@@ -1549,7 +2084,12 @@ fn restore_files_snapshot(
                             continue;
                         }
                     },
-                    _ => entry.inline_bytes.clone(),
+                    (Some(hash), None) => anyhow::bail!(
+                        "checkpoint 的文件 {} 已外化到 CAS（{hash}），但当前 CAS 不可用；\
+                         拒绝把它写成空文件。请检查 ~/.wyj-code/cas 是否可写",
+                        relative.display()
+                    ),
+                    (None, _) => entry.inline_bytes.clone(),
                 };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -1658,10 +2198,21 @@ fn git_output_bytes(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<
 ///
 /// tmp + rename 的原子替换逻辑委托给 `serialize::write_atomic`，全仓只此一份。
 fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_json_atomic_counted(path, value).map(|_| ())
+}
+
+/// [`write_json_atomic`] 的变体，返回落盘字节数。
+///
+/// 字节数用于 retention 的字节预算判定（见 `CheckpointSummary::bytes`）：
+/// 只按条数淘汰挡不住长会话的 checkpoint 膨胀，实测 96% 的体积是内联的
+/// 完整 `messages` 快照。
+fn write_json_atomic_counted(path: &Path, value: &impl Serialize) -> Result<u64> {
     let mut as_value = serde_json::to_value(value)?;
     crate::secret::redact_json_value(&mut as_value);
     let json = serde_json::to_string(&as_value)?;
-    crate::serialize::write_atomic(path, json.as_bytes())
+    let len = json.len() as u64;
+    crate::serialize::write_atomic(path, json.as_bytes())?;
+    Ok(len)
 }
 
 /// 释放一份 checkpoint 历史里所有 `cas://` 引用。
@@ -1711,6 +2262,41 @@ fn release_checkpoint_cas_refs(cas: &WorkspaceCas, messages: &[Message]) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// 释放一份 checkpoint 的**工作区快照**占用的 CAS 引用。
+///
+/// 与 [`release_checkpoint_cas_refs`] 成对，但覆盖的是另一半引用：`capture_files`
+/// 对每个文件内容 `intern()`（非 git 项目），`capture_workspace_with_delta` 的
+/// `Added`/`Modified` 也一样。只释放 messages 里的 image/thinking 引用，会让
+/// 这部分 blob 的 ref_count 永远 ≥1 ——「删了 checkpoint、磁盘却没少」的另一半
+/// 成因。Git 快照只存 object id，不占 CAS。
+fn release_workspace_cas_refs(cas: &WorkspaceCas, snapshot: &WorkspaceSnapshot) {
+    let release = |hash: &Option<String>| {
+        if let Some(hash) = hash.as_deref() {
+            if let Err(error) = cas.release(hash) {
+                tracing::warn!("释放 checkpoint 文件 blob 失败 {hash}: {error}");
+            }
+        }
+    };
+    match snapshot {
+        WorkspaceSnapshot::Git(_) => {}
+        WorkspaceSnapshot::Files(files) => {
+            for entry in files.files.values() {
+                release(&entry.hash);
+            }
+        }
+        WorkspaceSnapshot::Delta(delta) => {
+            for op in delta.ops.values() {
+                match op {
+                    DeltaOp::Added { hash, .. } | DeltaOp::Modified { hash, .. } => {
+                        release(hash);
+                    }
+                    DeltaOp::Removed => {}
+                }
+            }
         }
     }
 }
@@ -2036,6 +2622,8 @@ mod tests {
                     cwd_root: root.path().display().to_string(),
                     baseline_id: None,
                     owner_pid: std::process::id(),
+                    bytes: 0,
+                    messages_parent: None,
                 });
                 Ok(())
             })
@@ -2087,6 +2675,7 @@ mod tests {
             name: None,
             kind: CheckpointKind::Manual,
             timestamp: "2026-01-01T00:00:00Z".to_string(),
+            messages_delta: None,
             messages: vec![Message {
                 role: wyj_api::types::Role::User,
                 content: vec![wyj_api::types::ContentBlock::ToolResult {
@@ -2123,6 +2712,8 @@ mod tests {
                     cwd_root: root.path().display().to_string(),
                     baseline_id: None,
                     owner_pid: std::process::id(),
+                    bytes: 0,
+                    messages_parent: None,
                 });
                 Ok(())
             })
@@ -2810,6 +3401,7 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 7,
+            max_bytes_per_session: 0,
             cas: None,
             non_interactive: false,
         });
@@ -2827,11 +3419,13 @@ mod tests {
         let sessions = tempfile::tempdir().unwrap();
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 3,
+            max_bytes_per_session: 0,
             cas: None,
             non_interactive: false,
         });
         set_checkpoint_config(CheckpointConfig {
             max_per_session: 5,
+            max_bytes_per_session: 0,
             cas: None,
             non_interactive: false,
         });
@@ -2873,6 +3467,8 @@ mod tests {
                 cwd_root: String::new(),
                 baseline_id: None,
                 owner_pid: live_pid,
+                bytes: 0,
+                messages_parent: None,
             });
         }
         std::fs::write(
@@ -2893,6 +3489,8 @@ mod tests {
                     cwd_root: String::new(),
                     baseline_id: None,
                     owner_pid: std::process::id(),
+                    bytes: 0,
+                    messages_parent: None,
                 });
                 Ok(())
             })
@@ -2948,6 +3546,8 @@ mod tests {
                 cwd_root: String::new(),
                 baseline_id: None,
                 owner_pid: std::process::id(),
+                bytes: 0,
+                messages_parent: None,
             });
         }
         std::fs::write(
@@ -2972,6 +3572,322 @@ mod tests {
             .path()
             .join("s-prune.checkpoints/cp1.json")
             .is_file());
+    }
+
+    /// 字节闸门：条数没超，但总量超预算时也必须淘汰最旧的。
+    ///
+    /// 钉的是「按条数留 20 个挡不住长会话」这个实测缺陷：本机 5,703 个
+    /// checkpoint 合计 1,836 MB，平均 322 KB，其中 96% 是内联的完整
+    /// `messages` 快照。只配条数时，一个 1,400 条消息的会话照样能留 20 份
+    /// 几百 KB 的历史。
+    #[test]
+    fn byte_budget_prunes_even_when_count_is_within_limit() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::new(sessions.path(), "s-bytes").unwrap();
+        store.max_per_session = 10; // 条数闸门很宽松，永不触发
+        store.max_bytes_per_session = 250; // 每个 100 字节 → 只装得下 2 个
+        let mut manifest = CheckpointManifest::default();
+        for i in 0..5 {
+            let id = format!("cp{i}");
+            std::fs::write(
+                sessions
+                    .path()
+                    .join(format!("s-bytes.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: std::process::id(),
+                bytes: 100,
+                messages_parent: None,
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-bytes.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        store.enforce_retention().unwrap();
+        let remaining: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        // 500 字节总量、250 预算 → 砍掉最旧的 3 个，留下最新的 2 个。
+        assert_eq!(remaining, vec!["cp3".to_string(), "cp4".to_string()]);
+    }
+
+    /// 条数与字节两个闸门取**更严**的那个：任一超标都要满足。
+    #[test]
+    fn retention_takes_the_stricter_of_count_and_byte_gates() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::new(sessions.path(), "s-both").unwrap();
+        store.max_per_session = 4; // 5 条 → 需删 1
+        store.max_bytes_per_session = 150; // 5×100=500 → 需删 4
+        let mut manifest = CheckpointManifest::default();
+        for i in 0..5 {
+            let id = format!("cp{i}");
+            std::fs::write(
+                sessions
+                    .path()
+                    .join(format!("s-both.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: std::process::id(),
+                bytes: 100,
+                messages_parent: None,
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-both.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        store.enforce_retention().unwrap();
+        // 字节闸门更严（要删 4），所以只剩最新的 1 个。
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// `bytes == 0` 的老条目（字段引入前写入）不占预算，也不该被字节闸门选中。
+    ///
+    /// 否则升级后第一次启动就会把用户仅剩的老回滚点全部清掉——它们不占空间，
+    /// 砍掉纯粹是白丢历史。
+    #[test]
+    fn legacy_entries_without_byte_count_are_never_pruned_by_byte_gate() {
+        let sessions = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::new(sessions.path(), "s-legacy").unwrap();
+        store.max_per_session = 0; // 只开字节闸门
+        store.max_bytes_per_session = 150;
+        let mut manifest = CheckpointManifest::default();
+        // 3 条老条目（bytes=0）+ 2 条新条目（各 100 字节）
+        for (i, bytes) in [0u64, 0, 0, 100, 100].into_iter().enumerate() {
+            let id = format!("cp{i}");
+            std::fs::write(
+                sessions
+                    .path()
+                    .join(format!("s-legacy.checkpoints/{id}.json")),
+                b"{}",
+            )
+            .unwrap();
+            manifest.checkpoints.push(CheckpointSummary {
+                id,
+                name: None,
+                kind: CheckpointKind::Manual,
+                timestamp: format!("2024-01-0{}T00:00:00Z", i + 1),
+                message_count: 0,
+                cwd_root: String::new(),
+                baseline_id: None,
+                owner_pid: std::process::id(),
+                bytes,
+                messages_parent: None,
+            });
+        }
+        std::fs::write(
+            sessions.path().join("s-legacy.checkpoints/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        store.enforce_retention().unwrap();
+        let remaining: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        // 200 字节 ≤ 150？不，超了 50 → 砍掉最旧的**一个带字节的**条目（cp3）。
+        // 三条老条目（bytes=0）全部保留。
+        assert_eq!(
+            remaining,
+            vec![
+                "cp0".to_string(),
+                "cp1".to_string(),
+                "cp2".to_string(),
+                "cp4".to_string()
+            ]
+        );
+    }
+
+    /// 增量必须真正减小落盘体积，且读回后折叠成完整历史。
+    ///
+    /// 钉的是实测缺陷（2026-10-28）：5,703 个 checkpoint / 1,836 MB，抽样
+    /// 30 个发现 96% 的体积是内联的完整 `messages` 快照。这里用「历史逐步
+    /// 增长」模拟一次回合里连续几次有副作用的工具调用。
+    #[test]
+    fn incremental_messages_shrink_disk_and_fold_back() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "s-inc").unwrap();
+
+        // 造一段有实质体积的历史，让「全量 vs 尾部」的差异可测。
+        let filler = "x".repeat(2_000);
+        let mut history: Vec<Message> = Vec::new();
+        let mut sizes = Vec::new();
+        for i in 0..4 {
+            history.push(Message::user(format!("turn {i} {filler}")));
+            history.push(Message {
+                role: wyj_api::types::Role::Assistant,
+                content: vec![wyj_api::types::ContentBlock::Text {
+                    text: format!("reply {i} {filler}"),
+                }],
+            });
+            let summary = store
+                .create(root.path(), history.clone(), CheckpointKind::PreTool, None)
+                .unwrap();
+            sizes.push(
+                std::fs::metadata(store.checkpoint_path(&summary.id))
+                    .unwrap()
+                    .len(),
+            );
+        }
+
+        // 后三个必须是增量（只存尾部 2 条），所以体积**不随历史增长**：
+        // 第 1 个是全量（2 条）、第 4 个若也是全量就该是 8 条，差出 3 倍。
+        // 这里比的是「增量之间彼此接近」而不是「增量 < 首个全量」——首个
+        // checkpoint 含 baseline 工作区快照（体积固定开销），可能反而更大。
+        assert!(
+            sizes[2] <= sizes[1] + 512 && sizes[3] <= sizes[1] + 512,
+            "增量体积不应随历史增长：{sizes:?}"
+        );
+        assert!(
+            sizes[3] < sizes[0] * 2,
+            "第四个 checkpoint 若是全量应约为首个的 4 倍：{sizes:?}"
+        );
+
+        // 读回必须折叠成完整历史，条数与内容都对。
+        let latest = store.list().unwrap().last().cloned().unwrap();
+        assert_eq!(latest.message_count, history.len(), "summary 报完整条数");
+        let loaded = store.load(&latest.id).unwrap();
+        assert_eq!(loaded.messages.len(), history.len());
+        assert_eq!(loaded.messages, history, "折叠后必须逐条等于原始历史");
+        assert!(!loaded.is_messages_delta(), "折叠后不再是增量形态");
+    }
+
+    /// 历史被整体重写（压缩 / 分支）时必须退回全量，不能拼错。
+    #[test]
+    fn non_prefix_history_falls_back_to_full_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "s-prefix").unwrap();
+
+        let first = store
+            .create(
+                root.path(),
+                vec![
+                    Message::user("a"),
+                    Message {
+                        role: wyj_api::types::Role::Assistant,
+                        content: vec![wyj_api::types::ContentBlock::Text {
+                            text: "b".to_string(),
+                        }],
+                    },
+                ],
+                CheckpointKind::AutoUser,
+                None,
+            )
+            .unwrap();
+        // 完全换掉历史（模拟压缩后的单条摘要），前缀不成立。
+        let rewritten = store
+            .create(
+                root.path(),
+                vec![Message::user("compressed summary")],
+                CheckpointKind::PreTool,
+                None,
+            )
+            .unwrap();
+
+        let raw = std::fs::read_to_string(store.checkpoint_path(&rewritten.id)).unwrap();
+        assert!(
+            !raw.contains("messages_delta"),
+            "前缀不成立时必须存全量，不能写增量描述"
+        );
+        assert_eq!(store.load(&rewritten.id).unwrap().messages.len(), 1);
+        assert_eq!(store.load(&first.id).unwrap().messages.len(), 2);
+    }
+
+    /// 父 checkpoint 缺失时，`load` 必须**报错**而不是交出半份历史。
+    ///
+    /// 历史行为是「保留本节点尾部继续返回 Ok」，而 `/rewind` 会拿这份 1~2 条
+    /// 的伪历史直接覆盖用户当前会话——静默丢掉整段对话。现在内部
+    /// `load_raw` 仍保留尾部（供诊断 / 内部对比），但面向回滚的 `load`
+    /// 拒绝返回不完整的历史。
+    #[test]
+    fn delta_with_missing_parent_is_refused_by_load() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(sessions.path(), "s-orphan").unwrap();
+
+        let first = store
+            .create(
+                root.path(),
+                vec![
+                    Message::user("a"),
+                    Message {
+                        role: wyj_api::types::Role::Assistant,
+                        content: vec![wyj_api::types::ContentBlock::Text {
+                            text: "b".to_string(),
+                        }],
+                    },
+                ],
+                CheckpointKind::AutoUser,
+                None,
+            )
+            .unwrap();
+        let second = store
+            .create(
+                root.path(),
+                vec![
+                    Message::user("a"),
+                    Message {
+                        role: wyj_api::types::Role::Assistant,
+                        content: vec![wyj_api::types::ContentBlock::Text {
+                            text: "b".to_string(),
+                        }],
+                    },
+                    Message::user("c"),
+                ],
+                CheckpointKind::PreTool,
+                None,
+            )
+            .unwrap();
+        // 确认第二个确实是增量。
+        let raw = std::fs::read_to_string(store.checkpoint_path(&second.id)).unwrap();
+        assert!(raw.contains("messages_delta"), "应写成增量");
+
+        // 手动删掉父 checkpoint，模拟被 retention 淘汰。
+        std::fs::remove_file(store.checkpoint_path(&first.id)).unwrap();
+
+        // 内部容错读取仍保留本节点尾部（1 条）——诊断路径需要一个「能读到
+        // 一点」的结果。
+        let raw = store.load_raw(&second.id).unwrap();
+        assert_eq!(raw.messages.len(), 1, "load_raw 应保留自身尾部");
+        assert_eq!(raw.messages[0], Message::user("c"));
+
+        // 但面向 `/rewind` 的 `load` 必须拒绝：半份历史覆盖会话是不可逆的。
+        let error = store.load(&second.id).expect_err("父链断了必须报错");
+        assert!(
+            error.to_string().contains("增量父链不完整"),
+            "错误信息应说明原因，实际: {error}"
+        );
     }
 
     /// `estimate_retention_drops` 必须与 `enforce_retention` 的实际删除数一致。
@@ -3005,6 +3921,8 @@ mod tests {
                 cwd_root: String::new(),
                 baseline_id: None,
                 owner_pid: owner,
+                bytes: 0,
+                messages_parent: None,
             });
         }
         std::fs::write(

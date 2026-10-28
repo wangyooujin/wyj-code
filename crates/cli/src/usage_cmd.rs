@@ -22,6 +22,11 @@ pub struct UsageTotals {
     /// 模型推理次数。旧会话文件没有这个字段，计 0——**比率计算须把它算进分母
     /// 校正**，否则旧数据会把「每次调用平均 input」系统性高估。
     pub api_calls: usize,
+    /// 累计**发起过**的请求次数（含失败重试）。
+    ///
+    /// 与 `api_calls`（成功往返数）的差值 = 失败/重试次数。它不是成本口径
+    /// （失败不花钱），而是**稳定性口径**——差值大说明端点在拒绝或抖动。
+    pub api_attempts: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -33,6 +38,18 @@ pub struct UsageTotals {
     pub sub_output_tokens: u64,
     /// 子 Agent 扇出累计缓存命中 token。
     pub sub_cache_read_tokens: u64,
+    /// 辅助 LLM 往返（标题 / Auto 分类器 / 记忆提取 / 演化）累计输入 token。
+    ///
+    /// 单列的理由与子 Agent 相同：这些调用走另一个端点、单价不同，混进主口径
+    /// 会让「每次调用带多少上下文」失真。旧实现完全不计，Auto 模式下几十次
+    /// 分类器往返在跨会话汇总里一行都看不到。
+    pub aux_input_tokens: u64,
+    /// 辅助往返累计输出 token。
+    pub aux_output_tokens: u64,
+    /// 辅助往返累计缓存命中 token。
+    pub aux_cache_read_tokens: u64,
+    /// 辅助往返累计次数。
+    pub aux_calls: usize,
     /// 只累计 `api_calls > 0` 的会话的 input / output。
     ///
     /// **为什么需要单独一份**：`input_per_api_call` 这类「每次调用平均 X」必须
@@ -48,6 +65,17 @@ pub struct UsageTotals {
     pub attributed_input_tokens: u64,
     pub attributed_output_tokens: u64,
     pub attributed_cache_read_tokens: u64,
+    /// 只累计 `api_calls > 0 的会话` 的 `api_calls`。
+    ///
+    /// **为什么不能直接用 `api_calls` 总量当分母**：分子（`attributed_*`）
+    /// 只收有 calls 的会话，而总量分母会把 `api_calls == 0` 的 legacy 会话
+    /// 也算进去——那些会话 calls 为 0 不影响分母，但它们的 token 若被计进
+    /// 分子就会高估。真正的问题反过来：**总 token / 总 calls** 里总 token
+    /// 含 legacy 会话，而它们的 calls 不进分母，于是比率被高估。
+    ///
+    /// 用 `attributed_api_calls` 让分子分母**逐会话同源**，比"只筛分子"
+    /// 更彻底。
+    pub attributed_api_calls: usize,
     /// 发生过自动压缩 / context editing 清理的会话数。
     pub sessions_compacted: usize,
     /// `context_edit_freed_tokens > 0` 的会话数。
@@ -74,6 +102,13 @@ impl UsageTotals {
         self.sessions += 1;
         self.turns = self.turns.saturating_add(f.turns);
         self.api_calls = self.api_calls.saturating_add(f.api_calls as usize);
+        // 老会话没有 `api_attempts`（字段引入前），此时用 `api_calls` 兜底：
+        // 那时它记的是尝试次数，语义上等价。
+        self.api_attempts = self.api_attempts.saturating_add(if f.api_attempts > 0 {
+            f.api_attempts as usize
+        } else {
+            f.api_calls as usize
+        });
         self.input_tokens += f.input_tokens as u64;
         self.output_tokens += f.output_tokens as u64;
         self.cache_read_tokens += f.cache_read_tokens as u64;
@@ -81,12 +116,19 @@ impl UsageTotals {
         self.sub_input_tokens += f.sub_input_tokens as u64;
         self.sub_output_tokens += f.sub_output_tokens as u64;
         self.sub_cache_read_tokens += f.sub_cache_read_tokens as u64;
+        self.aux_input_tokens += f.aux_input_tokens as u64;
+        self.aux_output_tokens += f.aux_output_tokens as u64;
+        self.aux_cache_read_tokens += f.aux_cache_read_tokens as u64;
+        self.aux_calls += f.aux_calls as usize;
         // 「每次调用平均」类比率的分子只收有 calls 的会话，保证与分母同源。
         // 详见 `attributed_input_tokens` 的注释——这里错一次就是 5 倍偏差。
         if f.api_calls > 0 {
             self.attributed_input_tokens += f.input_tokens as u64;
             self.attributed_output_tokens += f.output_tokens as u64;
             self.attributed_cache_read_tokens += f.cache_read_tokens as u64;
+            self.attributed_api_calls = self
+                .attributed_api_calls
+                .saturating_add(f.api_calls as usize);
         }
         if f.compact_count > 0 {
             self.sessions_compacted += 1;
@@ -108,8 +150,8 @@ impl UsageTotals {
         UsageRates {
             input_per_turn: ratio(self.input_tokens as f64, self.turns as f64),
             output_per_turn: ratio(self.output_tokens as f64, self.turns as f64),
-            input_per_api_call: per_call(fresh, self.api_calls),
-            output_per_api_call: per_call(self.attributed_output_tokens, self.api_calls),
+            input_per_api_call: per_call(fresh, self.attributed_api_calls),
+            output_per_api_call: per_call(self.attributed_output_tokens, self.attributed_api_calls),
             cache_hit_ratio: (cached > 0).then(|| cached as f64 / denominator as f64),
             output_share: ratio(self.attributed_output_tokens as f64, denominator as f64),
         }
@@ -300,6 +342,22 @@ fn print_human(report: &UsageReport) {
             )
         );
     }
+    // 辅助往返（标题 / 分类器 / 记忆 / 演化）同样单列：它们走另一个端点，
+    // 与主 Agent 口径不重叠。旧实现完全不计，Auto 模式下这块开销整片消失。
+    if t.aux_calls > 0 {
+        println!(
+            "{}",
+            tr_fmt(
+                "usage.aux_tokens",
+                &[
+                    ("aux_input", &t.aux_input_tokens.to_string()),
+                    ("aux_output", &t.aux_output_tokens.to_string()),
+                    ("aux_cache_read", &t.aux_cache_read_tokens.to_string()),
+                    ("aux_calls", &t.aux_calls.to_string()),
+                ]
+            )
+        );
+    }
     println!(
         "{}",
         tr_fmt(
@@ -335,6 +393,22 @@ fn print_human(report: &UsageReport) {
             ]
         )
     );
+    // 重试开销：失败不产生费用，所以它不属于「比率」，但它是**稳定性**的
+    // 唯一量化口径——端点一直在拒绝时，用户该去看端点而不是怀疑 prompt。
+    let retries = t.api_attempts.saturating_sub(t.api_calls);
+    if retries > 0 {
+        println!(
+            "{}",
+            tr_fmt(
+                "usage.retries",
+                &[
+                    ("attempts", &t.api_attempts.to_string()),
+                    ("calls", &t.api_calls.to_string()),
+                    ("retries", &retries.to_string()),
+                ]
+            )
+        );
+    }
 
     if report.sessions_without_api_calls > 0 {
         // 必须提示：这些会话的 `api_calls` 是 0（v0.2.28 之前未落盘），
@@ -611,6 +685,49 @@ mod tests {
         // 分子分母同源的另一个出口：cache_hit_ratio 不该被 legacy 的裸 input 稀释。
         assert_eq!(r.rates.cache_hit_ratio, None);
         assert_eq!(r.rates.output_share, 60.0 / 300.0);
+    }
+
+    /// 分母也必须只收有 `api_calls` 的会话：`attributed_api_calls` 让分子
+    /// 分母**逐会话同源**。
+    ///
+    /// 这条钉的是一个只在混合数据里暴露的偏差：分子筛了 legacy、分母没筛时，
+    /// 「成功 3 次 + 失败 5 次」的会话会被算成每次 100 token（300/3），
+    /// 而真实成功往返只有 3 次里的一部分——用户据此判断「上下文多大」
+    /// 会系统性偏低。
+    #[test]
+    fn the_per_call_denominator_is_filtered_to_the_same_sessions_as_the_numerator() {
+        let fx = Fixture::new("denom");
+        // 新会话：5 次尝试、3 次成功、300 input / 60 output
+        fx.write(
+            "with-attempts",
+            serde_json::json!({
+                "session_id": "s",
+                "title": "t",
+                "last_preview": "p",
+                "cwd": "/p",
+                "timestamp": "2026-10-02T00:00:00Z",
+                "turns": 2,
+                "input_tokens": 300,
+                "output_tokens": 60,
+                "api_calls": 3,
+                "api_attempts": 5,
+                "messages": [],
+            }),
+        );
+        // legacy 会话：token 齐全但 calls 全无
+        fx.write(
+            "legacy",
+            session_json("2026-09-01T00:00:00Z", "/p", 100_000, 20_000, 0),
+        );
+        let r = collect(&fx.dir, None, None).unwrap();
+
+        // 分母是**成功往返数**（3），不是尝试数（5）——token 只在成功路径
+        // 入账，用尝试数当分母会把每次调用的输入量系统性算低。
+        assert_eq!(r.rates.input_per_api_call, Some(100.0));
+        assert_eq!(r.rates.output_per_api_call, Some(20.0));
+        // 重试开销单独可见：5 次尝试 - 3 次成功 = 2 次失败/重试。
+        assert_eq!(r.total.api_attempts, 5);
+        assert_eq!(r.total.api_calls, 3);
     }
 
     /// cache_hit_ratio / output_share 同样只认有 api_calls 的会话——

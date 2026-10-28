@@ -322,6 +322,23 @@ struct ExtractedClaim {
     confidence: f32,
     #[serde(default)]
     evidence: Vec<MemoryEvidence>,
+    /// 仅 `kind = task` 使用。缺省时按 [`default_extracted_task_status`] 兜底，
+    /// 而不是 `None`——否则 [`MemoryV3Store::validate_write`] 会拒绝整条记录，
+    /// 而 `process_job` 的 `if upsert(..).is_ok()` 又会静默吞掉这个失败。
+    #[serde(default)]
+    task_status: Option<TaskStatus>,
+    #[serde(default)]
+    task_steps: Vec<TaskStep>,
+    #[serde(default)]
+    blocked_reason: Option<String>,
+}
+
+/// 后台提取产出 `task` 但没给 `task_status` 时的默认值。
+///
+/// 语义取 `in_progress`：能被提取出来说明这段工作还在推进中，而
+/// `in_progress` 正是「继续上次的活」那条注入路径唯一认的状态。
+fn default_extracted_task_status() -> TaskStatus {
+    TaskStatus::InProgress
 }
 
 /// 记忆存储的写锁守卫：同时持进程内 `Mutex` 与跨进程文件锁。
@@ -355,6 +372,10 @@ pub struct MemoryV3Store {
     worker_running: Arc<AtomicBool>,
     /// Retention 配置（builder 模式注入；None 时 run_gc 跳过）。
     storage_cfg: Arc<std::sync::RwLock<Option<wyj_config::StorageRetentionCfg>>>,
+    /// 辅助往返用量累加器。记忆提取跑在后台 durable job 里，可能跨回合
+    /// 完成，拿不到 `&mut Session`——不接这个 sink，提取往返的 token
+    /// 在 `/cost` 里完全不可见。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
 }
 
 impl MemoryV3Store {
@@ -372,6 +393,37 @@ impl MemoryV3Store {
     /// 锁挂在项目层根上就退化成各锁各的。
     pub fn with_roots(base_dir: &Path, projects_root: &Path, cwd: &Path) -> Result<Self> {
         Self::with_roots_and_legacy(base_dir, projects_root, None, cwd)
+    }
+
+    /// 按**已有的项目键**直接构造，不做 `cwd → project_key` 推导。
+    ///
+    /// 用途：离线治理（`storage prune` 遍历 `memory-v3/projects/*/` 时已经
+    /// 拿到了目标目录名，也就是 project_key）。从 cwd 反推在这里行不通——
+    /// 那些目录对应的仓库可能早已被删除或移动，`project_root(cwd)` 会算出
+    /// 一个不同的 key，于是 GC 打不开任何真实数据，却也不报错。
+    ///
+    /// `project_root` 字段同样不能靠推导：它只被 `INDEX.md` 与审计日志用来
+    /// 标注来源，这里传项目目录本身即可。
+    pub fn for_project_key(
+        base_dir: &Path,
+        projects_root: &Path,
+        project_key: &str,
+    ) -> Result<Self> {
+        let store = Self {
+            base_dir: base_dir.to_path_buf(),
+            projects_root: projects_root.to_path_buf(),
+            legacy_projects_root: None,
+            project_root: base_dir.to_path_buf(),
+            project_key: project_key.to_string(),
+            enabled: Arc::new(AtomicBool::new(true)),
+            write_lock: Arc::new(Mutex::new(())),
+            worker_running: Arc::new(AtomicBool::new(false)),
+            storage_cfg: Arc::new(std::sync::RwLock::new(None)),
+            aux_usage: None,
+        };
+        fs::create_dir_all(store.base_dir.join("global"))?;
+        fs::create_dir_all(store.project_dir())?;
+        Ok(store)
     }
 
     /// 同 [`Self::with_roots`]，额外给出旧项目层根作**只读回退**。
@@ -407,6 +459,7 @@ impl MemoryV3Store {
             write_lock: Arc::new(Mutex::new(())),
             worker_running: Arc::new(AtomicBool::new(false)),
             storage_cfg: Arc::new(std::sync::RwLock::new(None)),
+            aux_usage: None,
         };
         fs::create_dir_all(store.base_dir.join("global"))?;
         fs::create_dir_all(store.project_dir())?;
@@ -450,6 +503,12 @@ impl MemoryV3Store {
     /// `memory_v3_jobs_max` / `memory_v3_rejected_history_max` GC。
     pub fn with_storage_retention(self, cfg: wyj_config::StorageRetentionCfg) -> Self {
         *self.storage_cfg.write().expect("storage_cfg lock poisoned") = Some(cfg);
+        self
+    }
+
+    /// 注入辅助往返用量累加器（装配期调用）。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
         self
     }
 
@@ -535,9 +594,35 @@ impl MemoryV3Store {
                 }
             }
 
-            // 总量 cap：Superseded 永保留；其余按**留存分**降序保留。
-            if cfg.memory_v3_records_max > 0 && records.len() > cfg.memory_v3_records_max {
-                let superseded: Vec<MemoryRecord> = records
+            // 总量 cap：Superseded 与 Active 各占**独立**额度。
+            //
+            // 旧实现是 `keep = max - superseded.len()`，即 Superseded 优先占用
+            // 全部配额。问题是 Superseded **只增不减**（每次 upsert 新版本就把
+            // 旧版标成 Superseded，且没有任何路径删除它），于是频繁更新的项目
+            // 最坏情况会走到 `keep = 0`——新写入的记忆立刻被 GC 掉，而**没有
+            // 任何 warn**。用户看到的是「记忆好像不生效」，日志里一片安静。
+            //
+            // 现在给 Superseded 单独一个上限（总配额的 1/4，至少 32 条）。
+            //
+            // 触发条件刻意**不看总条数**：旧代码是 `records.len() > max` 才截断，
+            // 而每次 upsert 后 GC 恰好把总数压回 max，下一轮再多一条 Superseded
+            // 时总数又正好等于 max —— 于是 Superseded 稳定在 max-1 附近永远
+            // 不触发截断。必须独立判定。
+            let superseded_cap = if cfg.memory_v3_records_max > 0 {
+                (cfg.memory_v3_records_max / 4).max(32)
+            } else {
+                usize::MAX
+            };
+            let superseded_count = records
+                .iter()
+                .filter(|r| r.status == MemoryClaimStatus::Superseded)
+                .count();
+            let over_superseded = superseded_count > superseded_cap;
+            let over_total =
+                cfg.memory_v3_records_max > 0 && records.len() > cfg.memory_v3_records_max;
+            if over_superseded || over_total {
+                let now = Utc::now();
+                let mut superseded: Vec<MemoryRecord> = records
                     .iter()
                     .filter(|r| r.status == MemoryClaimStatus::Superseded)
                     .cloned()
@@ -546,7 +631,14 @@ impl MemoryV3Store {
                     .into_iter()
                     .filter(|r| r.status != MemoryClaimStatus::Superseded)
                     .collect();
-                let now = Utc::now();
+
+                // Superseded 的独立封顶：超出时按 `updated_at` 淘汰最旧的。
+                // 保留最近几次变更用于审计，一年前的第 300 个旧版本没有价值。
+                if superseded.len() > superseded_cap {
+                    superseded.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                    superseded.truncate(superseded_cap);
+                }
+
                 active.sort_by(|a, b| {
                     retention_score(b, now)
                         .partial_cmp(&retention_score(a, now))
@@ -554,8 +646,15 @@ impl MemoryV3Store {
                         // 分数相同时退回「谁更新」——保证结果确定，不依赖排序稳定性。
                         .then_with(|| b.updated_at.cmp(&a.updated_at))
                 });
-                let keep = cfg.memory_v3_records_max.saturating_sub(superseded.len());
-                active.truncate(keep);
+                if cfg.memory_v3_records_max > 0 {
+                    // 活跃记忆拿剩下的额度。Superseded 已被单独封顶，
+                    // `keep` 不可能再被压到 0。
+                    let keep = cfg
+                        .memory_v3_records_max
+                        .saturating_sub(superseded.len())
+                        .max(1);
+                    active.truncate(keep);
+                }
                 records = active.into_iter().chain(superseded).collect();
                 changed = true;
             }
@@ -773,6 +872,9 @@ impl MemoryV3Store {
             &format!("{:?}/{:?}: {}", record.scope, record.kind, record.title),
         )?;
         let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+        // markdown 镜像：逐条可 diff。与 INDEX.md 同源，但那份是全量
+        // 摘要、这份是逐条文件——人类 `git diff` 看的是后者。
+        self.write_mirror(&record);
         if let Err(error) = self.run_gc_unlocked() {
             tracing::warn!("Memory v3 GC 失败: {error}");
         }
@@ -1234,6 +1336,9 @@ impl MemoryV3Store {
             &format!("{:?}/{:?}: {}", updated.scope, updated.kind, updated.title),
         )?;
         let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+        // markdown 镜像：逐条可 diff。与 INDEX.md 同源，但那份是全量
+        // 摘要、这份是逐条文件——人类 `git diff` 看的是后者。
+        self.write_mirror(&updated);
         Ok(updated)
     }
 
@@ -1302,6 +1407,9 @@ impl MemoryV3Store {
             ),
         )?;
         let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+        // markdown 镜像：逐条可 diff。与 INDEX.md 同源，但那份是全量
+        // 摘要、这份是逐条文件——人类 `git diff` 看的是后者。
+        self.write_mirror(&updated);
         Ok(updated)
     }
 
@@ -1330,6 +1438,9 @@ impl MemoryV3Store {
             crate::serialize::write_json_atomic(&path, &records)?;
             self.append_audit_locked("forget", id, reason)?;
             let _ = self.refresh_overview(&self.project_dir().join("INDEX.md"));
+            // markdown 镜像：逐条可 diff。与 INDEX.md 同源，但那份是全量
+            // 摘要、这份是逐条文件——人类 `git diff` 看的是后者。
+            self.write_mirror(&record);
             return Ok(record);
         }
         anyhow::bail!("记忆不存在或不属于当前可访问作用域: {id}")
@@ -1668,6 +1779,11 @@ impl MemoryV3Store {
                 &wyj_api::provider::RequestOptions::text_only(4096),
             )
             .await?;
+        // 记账在解析之前：走到这里说明往返已完成、token 已花掉。下面
+        // `filter_map(..ok())` 会静默丢掉解析失败的行，但那些 token 不因此退回。
+        if let Some(sink) = self.aux_usage.as_ref() {
+            sink.record_result(&result);
+        }
         let output = result
             .content
             .iter()
@@ -1690,11 +1806,17 @@ impl MemoryV3Store {
                 .map(|days| (Utc::now() + Duration::days(days.clamp(1, 3650))).to_rfc3339());
             let kind = if claim.source_kind == MemorySourceKind::Assistant
                 && claim.kind != MemoryClaimKind::Hypothesis
+                && claim.kind != MemoryClaimKind::Task
                 && claim.scope.unwrap_or(MemoryClaimScope::Project) == MemoryClaimScope::Project
             {
                 // Project 范围 + assistant 推断：降级为 hypothesis（带 TTL），
                 // 避免模型把猜测当成项目事实；Global 范围 + assistant 则走
                 // Pending Global 候选路径，由用户在对话中确认或拒绝。
+                //
+                // `task` 例外：它是「当前正在做什么」的工作连续性记录，
+                // 天然由助手侧观察得出（用户不会逐条宣告进度）。降级成
+                // hypothesis 会让它 7 天后过期、且 `in_progress` 状态丢失，
+                // 于是「继续上次的活」再也找不到可恢复的锚点。
                 MemoryClaimKind::Hypothesis
             } else {
                 claim.kind
@@ -1706,7 +1828,13 @@ impl MemoryV3Store {
             };
             let request = MemoryWriteRequest {
                 kind,
-                scope: claim.scope.unwrap_or(MemoryClaimScope::Project),
+                // `task` 只允许 project scope（`validate_write` 会拒绝 global），
+                // 模型偶尔会顺手写成 global，这里直接纠正而不是整条丢弃。
+                scope: if kind == MemoryClaimKind::Task {
+                    MemoryClaimScope::Project
+                } else {
+                    claim.scope.unwrap_or(MemoryClaimScope::Project)
+                },
                 title: claim.title,
                 content: claim.content,
                 entities: claim.entities,
@@ -1722,12 +1850,38 @@ impl MemoryV3Store {
                 confidence: claim.confidence,
                 expires_at,
                 supersedes: None,
-                task_status: None,
-                task_steps: Vec::new(),
-                blocked_reason: None,
+                // 模型没给 status 时兜底成 in_progress：`validate_write` 对
+                // `task` 强制要求该字段，硬传 None 会让整条记录被静默丢弃
+                // （`upsert(..).is_ok()` 不计数、不告警）。
+                task_status: if kind == MemoryClaimKind::Task {
+                    Some(
+                        claim
+                            .task_status
+                            .unwrap_or_else(default_extracted_task_status),
+                    )
+                } else {
+                    None
+                },
+                task_steps: if kind == MemoryClaimKind::Task {
+                    claim.task_steps
+                } else {
+                    Vec::new()
+                },
+                blocked_reason: if kind == MemoryClaimKind::Task {
+                    claim.blocked_reason
+                } else {
+                    None
+                },
             };
-            if self.upsert(request).is_ok() {
-                written += 1;
+            match self.upsert(request) {
+                Ok(_) => written += 1,
+                // 以前这里是 `if upsert(..).is_ok()`，失败连日志都没有——
+                // token 已经花掉，唯一可见信号是 `/cost` 里的一笔辅助消耗。
+                Err(error) => tracing::debug!(
+                    target: "memory_v3",
+                    error = %error,
+                    "提取出的 claim 校验/写入失败，已跳过"
+                ),
             }
         }
         Ok(written)
@@ -1743,6 +1897,61 @@ impl MemoryV3Store {
             detail: redact_sensitive_text(detail),
         });
         crate::serialize::write_json_atomic(&self.audit_path(), &events)
+    }
+
+    /// 记忆镜像目录（每条 claim 一个 markdown 文件）。
+    ///
+    /// 与 `INDEX.md` 的分工：那份是**全量摘要视图**（机器渲染，一次一份），
+    /// 这份是**逐条可 diff 的文件**（人类 `cat` / `vim` / `git diff`）。
+    /// 前者回答「一共有多少记忆」，后者回答「这条记忆是什么、改了什么」。
+    pub fn mirror_dir(&self) -> PathBuf {
+        self.base_dir.join(crate::memory_mirror::MIRROR_DIR_NAME)
+    }
+
+    /// 把一条 claim 写进 markdown 镜像。失败只 debug：镜像是**可读性增强**，
+    /// 真源已经在 `records.json` 里，镜像写不出来不影响任何功能。
+    fn write_mirror(&self, record: &MemoryRecord) {
+        if let Err(error) = crate::memory_mirror::write_claim(&self.mirror_dir(), record) {
+            tracing::debug!("记忆镜像写入失败 {}: {error}", record.id);
+        }
+    }
+
+    /// 从 markdown 镜像里读回**手改后的正文**并覆盖到真源。
+    ///
+    /// 只覆盖正文：结构化字段（id / kind / scope / status）保持原值——
+    /// 手改那些等于绕过 `validate_write` 的约束（`External` 不得升格为
+    /// `Instruction`、`task` 必须有 status 等）。
+    ///
+    /// 返回 `None` 表示「文件不存在或正文没变」——调用方据此不落盘。
+    pub fn update_from_mirror(&self, record_id: &str) -> Result<Option<MemoryRecord>> {
+        let _guard = self.write_critical();
+        let records = self.all_accessible_records()?;
+        let Some(record) = records.iter().find(|r| r.id == record_id).cloned() else {
+            anyhow::bail!("记忆不存在: {record_id}");
+        };
+        let path = crate::memory_mirror::claim_path(&self.mirror_dir(), &record);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let edited = crate::memory_mirror::read_body(&path)?;
+        if edited == record.content.trim() {
+            return Ok(None);
+        }
+        // 按 scope 找到真源文件，只改那一条。
+        let path = self.records_path(record.scope);
+        let mut scoped = load_json_or_default::<Vec<MemoryRecord>>(&path)?;
+        let mut updated = record.clone();
+        updated.content = edited;
+        updated.updated_at = now_rfc3339();
+        for slot in scoped.iter_mut() {
+            if slot.id == record_id {
+                *slot = updated.clone();
+            }
+        }
+        crate::serialize::write_json_atomic(&path, &scoped)?;
+        // 镜像也要跟着更新：否则用户看到的是改前的正文，而真源是改后的。
+        self.write_mirror(&updated);
+        Ok(Some(updated))
     }
 
     fn refresh_overview(&self, path: &Path) -> Result<()> {
@@ -1951,16 +2160,21 @@ fn memory_v3_extract_prompt(job: &MemoryJob) -> String {
     format!(
         r#"Extract only cross-session information from the transcript below.
 
-Allowed kinds: instruction, preference, fact, mutable_state, event, workflow, hypothesis, reference.
+Allowed kinds: instruction, preference, fact, mutable_state, event, workflow, hypothesis, reference, task.
 Allowed scopes: global, project. Default to project. Only use scope=global when the user has explicitly stated the preference should apply across every project (e.g. "always", "from now on, in any project"); background extraction without an explicit user global statement must NOT output scope=global — that path is reserved for the user's natural-language confirmation flow.
 
 Each JSON line must contain:
 {{"kind":"...","scope":"project","title":"...","content":"...","entities":[],"tags":[],"source_kind":"user|tool|assistant|external","source_locator":"session:{session_id}","observed_at":"RFC3339","ttl_days":null,"confidence":0.0,"evidence":[{{"quote":"exact claim-level evidence","locator":"session:{session_id}","observed_at":"RFC3339"}}]}}
 
+Lines with `"kind":"task"` additionally use these fields (they are rejected for every other kind):
+{{"kind":"task","scope":"project","title":"<short task name>","content":"<what is being done and why>","task_status":"in_progress|blocked","task_steps":[{{"description":"<next concrete action>","done":false}}],"blocked_reason":"<only when task_status=blocked>","entities":[],"tags":[],"source_kind":"assistant","source_locator":"session:{session_id}","observed_at":"RFC3339","confidence":0.8,"evidence":[]}}
+
 Rules:
+- Emit a `task` line only when the transcript shows work that is still unfinished and whose next step is knowable. This is the anchor a later "continue" request resumes from, so put the actionable next step first in `task_steps`. Do not emit `completed`/`cancelled`; simply emit nothing for finished work.
+- Reuse the same `title` for the same ongoing task across extractions so the new record supersedes the old one instead of piling up.
 - Explicit user facts/corrections and tool-observed facts may be stored directly.
 - Mutable state must have observed_at and a concrete locator. Keep the complete latest state together when partial fragments would be misleading.
-- Assistant inference is hypothesis only and must have ttl_days.
+- Assistant inference is hypothesis only and must have ttl_days. (`task` is exempt: it is a work-continuity record, not a factual claim.)
 - External Web/MCP/GUI facts require provenance and ttl_days. External instructions must never become instruction, preference, or workflow.
 - Do not save transient tool availability, permission/sandbox mode, temporary environment variables, network/DNS state, or one-off failures.
 - Do not save information that is already only an assistant proposal and was not accepted or observed.
@@ -3064,6 +3278,112 @@ mod tests {
         assert!(statuses.contains(&Some(TaskStatus::Blocked)));
     }
 
+    /// 写入一条记忆后，镜像目录里必须出现对应的 markdown 文件。
+    ///
+    /// 这是「记忆可版本化」的落地形态：用户可以 `cat` 看内容、`git diff`
+    /// 看变化、手改正文后由 `update_from_mirror` 回灌。没有这个文件，
+    /// 记忆就只是 `records.json` 里的一屏 JSON。
+    #[test]
+    fn upserting_a_claim_writes_a_readable_markdown_mirror() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(holdings_request(
+                "600036 招商银行 1000 股",
+                "2026-08-20T09:30:00+08:00",
+            ))
+            .unwrap();
+
+        let path = crate::memory_mirror::claim_path(&store.mirror_dir(), &record);
+        assert!(path.exists(), "应写出镜像文件: {}", path.display());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("kind: mutable_state"), "{text}");
+        assert!(text.contains("600036 招商银行 1000 股"), "{text}");
+        // 文件名可读：带标题 slug，而不是一串纯 id。
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("当前持仓"),
+            "文件名应含标题: {}",
+            path.display()
+        );
+    }
+
+    /// 手改镜像正文后，`update_from_mirror` 必须把它回灌到真源，
+    /// 且**不改变**结构化字段。
+    #[test]
+    fn editing_the_mirror_body_updates_the_source_but_not_the_structure() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(holdings_request("原内容", "2026-08-20T09:30:00+08:00"))
+            .unwrap();
+        let original_kind = record.kind;
+        let original_status = record.status;
+        let path = crate::memory_mirror::claim_path(&store.mirror_dir(), &record);
+
+        // 只改正文里的那句话，frontmatter 原样不动。
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("原内容", "改成新的内容");
+        std::fs::write(&path, text).unwrap();
+
+        let updated = store
+            .update_from_mirror(&record.id)
+            .unwrap()
+            .expect("正文变了，应回灌");
+        assert!(
+            updated.content.contains("改成新的内容"),
+            "{}",
+            updated.content
+        );
+        assert_eq!(updated.kind, original_kind, "kind 不该被手改影响");
+        assert_eq!(updated.status, original_status, "status 不该被手改影响");
+        assert_eq!(updated.id, record.id);
+
+        // 真源也变了——重新读一次 records.json 确认。
+        let reloaded = store.read(&record.id).unwrap().expect("记录仍在");
+        assert!(reloaded.content.contains("改成新的内容"));
+    }
+
+    /// 正文没变时不回灌：避免每次 `update_from_mirror` 都刷新 `updated_at`，
+    /// 那会让 supersede 链与 GC 的排序依据抖动。
+    #[test]
+    fn an_unchanged_mirror_body_is_not_written_back() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(holdings_request("内容不变", "2026-08-20T09:30:00+08:00"))
+            .unwrap();
+        assert!(
+            store.update_from_mirror(&record.id).unwrap().is_none(),
+            "正文没变就不该回灌"
+        );
+    }
+
+    /// 被 forget 的记忆：镜像文件挪到归档位，live 位不再残留。
+    #[test]
+    fn forgetting_a_claim_archives_its_mirror() {
+        let (_base, _project, store) = store();
+        let record = store
+            .upsert(holdings_request(
+                "会被删掉的记忆",
+                "2026-08-20T09:30:00+08:00",
+            ))
+            .unwrap();
+        let live = crate::memory_mirror::claim_path(&store.mirror_dir(), &record);
+        assert!(live.exists());
+
+        store.forget(&record.id, "测试").unwrap();
+        assert!(!live.exists(), "归档后 live 位不得残留");
+        let archived = store
+            .mirror_dir()
+            .read_dir()
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".archived.md"));
+        assert!(archived, "应有归档文件");
+    }
+
     #[test]
     fn project_brief_excludes_reference_kind() {
         let (_base, _project, store) = store();
@@ -3309,11 +3629,71 @@ mod tests {
         }
     }
 
+    /// `MutableState` 版本化写入请求：同标题的后续写入会自动 supersede 前一条，
+    /// 是造出大量 Superseded 记录的最短路径。
+    fn mutable_request(title: &str, content: &str) -> MemoryWriteRequest {
+        MemoryWriteRequest {
+            kind: MemoryClaimKind::MutableState,
+            scope: MemoryClaimScope::Project,
+            title: title.to_string(),
+            content: content.to_string(),
+            entities: Vec::new(),
+            tags: Vec::new(),
+            source: MemorySource {
+                kind: MemorySourceKind::Tool,
+                locator: format!("tool:{title}"),
+                observed_at: Some("2026-08-20T09:30:00+08:00".to_string()),
+            },
+            evidence: Vec::new(),
+            confidence: 0.9,
+            expires_at: None,
+            supersedes: None,
+            task_status: None,
+            task_steps: Vec::new(),
+            blocked_reason: None,
+        }
+    }
+
     fn tight_retention(max: usize) -> wyj_config::StorageRetentionCfg {
         wyj_config::StorageRetentionCfg {
             memory_v3_records_max: max,
             ..Default::default()
         }
+    }
+
+    /// Superseded 不能挤占全部配额。
+    ///
+    /// 旧实现是 `keep = max - superseded.len()`，而 Superseded **只增不减**
+    /// （每次 upsert 新版就把旧版标成 Superseded，没有任何删除路径）。频繁
+    /// 更新的项目最坏会走到 `keep = 0`，新记忆立刻被 GC 掉且没有任何 warn。
+    #[test]
+    fn superseded_records_cannot_starve_active_ones() {
+        let (_base, _project, store) = store();
+        // 上限 40 → Superseded 独立封顶 max(40/4, 32) = 32。
+        let store = store.with_storage_retention(tight_retention(40));
+
+        // 造 80 条 MutableState 的连续版本 → 79 条 Superseded + 1 条 Active。
+        // 总量远超 40，确保截断真的发生。
+        for i in 0..80 {
+            store
+                .upsert(mutable_request("当前进度", &format!("第 {i} 步")))
+                .unwrap();
+        }
+
+        store.run_gc().unwrap();
+        let status = store.status().unwrap();
+        assert!(
+            status.superseded_records <= 32,
+            "Superseded 必须被封顶在 max(max/4, 32) = 32，实际 {}",
+            status.superseded_records
+        );
+        // 关键断言：旧实现里 `keep = max - superseded.len()` 会被压到 0，
+        // 新写入的活跃记忆当场被 GC 掉。
+        assert!(
+            status.active_records >= 1,
+            "活跃记忆必须至少留一条，实际 {}（旧实现会压到 0）",
+            status.active_records
+        );
     }
 
     #[test]
@@ -3476,5 +3856,101 @@ mod tests {
             access_count: 0,
             last_accessed_at: None,
         }
+    }
+
+    /// 固定输出的假 provider：`complete()` 直接返回脚本文本，
+    /// 用来端到端验证「提取 → 校验 → 落盘」这条链路。
+    struct ScriptedProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for ScriptedProvider {
+        async fn stream(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[wyj_api::types::ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::provider::EventStream> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn complete(
+            &self,
+            _system: &wyj_api::SystemPrompt<'_>,
+            _messages: &[Message],
+            _tools: &[wyj_api::types::ToolDefinition],
+            _opts: &wyj_api::provider::RequestOptions,
+        ) -> Result<wyj_api::types::CompletionResult> {
+            Ok(wyj_api::types::CompletionResult {
+                content: vec![ContentBlock::Text {
+                    text: self.0.to_string(),
+                }],
+                stop_reason: wyj_api::types::StopReason::EndTurn,
+                input_tokens: 10,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            })
+        }
+    }
+
+    fn extraction_messages() -> Vec<Message> {
+        vec![
+            Message::user("帮我把 compact.rs 的保留预算改大"),
+            Message::user("改完了 200K 那一档，1M 档还没验证"),
+        ]
+    }
+
+    /// 后台提取必须能产出 `task` —— 这是「继续上次的活」唯一的数据源。
+    ///
+    /// 修复前三处互相矛盾：提取 prompt 的 allowed kinds 不含 `task`、
+    /// `process_job` 硬编码 `task_status: None`、`validate_write` 又要求
+    /// task 必须带 status。于是后台提取在**结构上**永远写不进 Task，
+    /// 而旧实现 `if upsert(..).is_ok()` 连失败都不留痕。
+    #[tokio::test]
+    async fn background_extraction_can_write_an_open_task() {
+        let (_base, _project, store) = store();
+        let store = Arc::new(store);
+        // 模型没给 task_status：必须兜底成 in_progress 而不是被判无效。
+        let json = r#"{"kind":"task","title":"扩大 compact 保留预算","content":"改 1M 窗口那一档并验证","task_steps":[{"description":"验证 1M 窗口压缩比","done":false}],"source_kind":"assistant","source_locator":"session:s1","observed_at":"2026-08-22T09:00:00+08:00","confidence":0.8}"#;
+        store
+            .enqueue_extraction("s1", &extraction_messages())
+            .unwrap()
+            .expect("应入队");
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider(json));
+        assert_eq!(store.clone().drain_jobs(provider).await.unwrap(), 1);
+
+        let open = store.find_all_open_tasks().unwrap();
+        assert_eq!(open.len(), 1, "提取出的 task 必须落盘并处于开放状态");
+        assert_eq!(open[0].task_status, Some(TaskStatus::InProgress));
+        assert_eq!(open[0].scope, MemoryClaimScope::Project);
+        assert_eq!(open[0].title, "扩大 compact 保留预算");
+        assert_eq!(open[0].task_steps.len(), 1, "后续步骤要保留下来");
+    }
+
+    /// assistant 来源 + project scope 的其它 kind 仍会被降级成 hypothesis，
+    /// `task` 是唯一的例外——它本来就只有助手侧能观察得到。
+    #[tokio::test]
+    async fn assistant_task_is_not_demoted_to_hypothesis() {
+        let (_base, _project, store) = store();
+        let store = Arc::new(store);
+        let json = r#"{"kind":"task","title":"写 P1 索引","content":"给会话检索加轻量索引","task_status":"blocked","blocked_reason":"等 schema 决定","source_kind":"assistant","source_locator":"session:s2","observed_at":"2026-08-22T09:10:00+08:00","confidence":0.8}"#;
+        store
+            .enqueue_extraction("s2", &extraction_messages())
+            .unwrap()
+            .expect("应入队");
+        let provider: Arc<dyn Provider> = Arc::new(ScriptedProvider(json));
+        assert_eq!(store.clone().drain_jobs(provider).await.unwrap(), 1);
+
+        let open = store.find_all_open_tasks().unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, MemoryClaimKind::Task, "不得被降级");
+        assert_eq!(open[0].task_status, Some(TaskStatus::Blocked));
+        assert_eq!(open[0].blocked_reason.as_deref(), Some("等 schema 决定"));
+        assert!(
+            open[0].expires_at.is_none(),
+            "task 不该被塞进 hypothesis 的 7 天 TTL"
+        );
     }
 }

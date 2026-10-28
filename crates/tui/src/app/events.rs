@@ -249,12 +249,14 @@ impl AppState {
             AgentEvent::CompactFinished {
                 result,
                 compact_count,
+                compact_generation,
             } => {
                 self.is_thinking = false;
                 self.current_op = None;
                 self.current_tool_name = None;
                 self.current_op_started = None;
                 self.compact_count = compact_count;
+                self.compact_generation = compact_generation;
                 self.save_needed = true;
                 match result {
                     Ok(r) if r.messages_removed > 0 => {
@@ -265,6 +267,15 @@ impl AppState {
                                 ("saved", &r.tokens_saved_estimate.to_string()),
                             ],
                         )));
+                        // 代际越深，摘要越像「地图」而不是「记录」。这是用户唯一
+                        // 能直接看到「模型手里的历史已经叠了几层」的地方——
+                        // 静默累积到第 8 代而不提示，等于让用户以为压缩无损。
+                        if r.generation > wyj_core::compact::MAX_COMPACT_GENERATIONS {
+                            self.push_tracked_message(ChatMessage::system(wyj_i18n::tr_fmt(
+                                "compact.generation_warning",
+                                &[("generation", &r.generation.to_string())],
+                            )));
+                        }
                     }
                     Ok(_) => {
                         self.push_tracked_message(ChatMessage::assistant(wyj_i18n::tr(
@@ -349,6 +360,7 @@ impl AppState {
                         file_text,
                         messages,
                         compact_count,
+                        compact_generation,
                         turns,
                     }) => {
                         // live session 已由后台 task 写回，这里只重建展示层
@@ -358,6 +370,7 @@ impl AppState {
                             self.frozen_up_to = 0;
                         }
                         self.compact_count = compact_count;
+                        self.compact_generation = compact_generation;
                         self.turns = turns;
                         self.save_needed = true;
                         self.push_tracked_message(ChatMessage::assistant(format!(
@@ -381,6 +394,8 @@ impl AppState {
                     Ok(branch) => {
                         self.messages = reconstruct_display(&branch.messages);
                         self.compact_count = 0;
+                        // 代际跟着分支历史走（不能归零，见 `BranchSwitch`）。
+                        self.compact_generation = branch.compact_generation;
                         self.turns = branch.turns;
                         self.total_input_tokens = 0;
                         self.total_output_tokens = 0;
@@ -459,6 +474,7 @@ impl AppState {
                 input,
                 output,
                 compact_count,
+                compact_generation,
                 tool_schema_tokens,
                 tool_schema_tokens_saved,
                 latency,
@@ -467,6 +483,7 @@ impl AppState {
                 self.total_input_tokens = input;
                 self.total_output_tokens = output;
                 self.compact_count = compact_count;
+                self.compact_generation = compact_generation;
                 self.tool_schema_tokens = tool_schema_tokens;
                 self.tool_schema_tokens_saved = tool_schema_tokens_saved;
             }

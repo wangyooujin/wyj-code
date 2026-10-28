@@ -1141,6 +1141,214 @@ async fn hitting_the_turn_budget_delivers_a_summary_instead_of_erroring() {
     assert!(has_summary, "回合历史里应留下模型的最终总结");
 }
 
+/// 每次往返都上报**巨额 input token** 的 provider：让花费闸在一两轮内越线。
+///
+/// 之所以不用真实价格计算，而是直接上报 token，是因为闸的判据是「累计花费
+/// 超过上限」——token 数是它的输入。这里报 1M input tokens，按 Opus 的
+/// $15/M 算就是 $15，远超测试里设的 $1 上限。
+struct SpendHeavyProvider {
+    calls: AtomicUsize,
+    seen_reminder: AtomicBool,
+    ignore_reminder: bool,
+}
+#[async_trait::async_trait]
+impl Provider for SpendHeavyProvider {
+    async fn stream(
+        &self,
+        _system: &wyj_api::SystemPrompt<'_>,
+        messages: &[Message],
+        _tools: &[ToolDefinition],
+        _opts: &wyj_api::provider::RequestOptions,
+    ) -> Result<EventStream> {
+        let has_reminder = messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(b, ContentBlock::Text { text } if text.contains("spend-budget-exceeded"))
+            })
+        });
+        if has_reminder {
+            self.seen_reminder.store(true, Ordering::SeqCst);
+            if !self.ignore_reminder {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("预算收尾总结".into())),
+                    Ok(StreamEvent::MessageStop {
+                        stop_reason: StopReason::EndTurn,
+                    }),
+                ])));
+            }
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let id = format!("s{n}");
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(StreamEvent::ToolUseStart {
+                id: id.clone(),
+                name: "Edit".into(),
+            }),
+            Ok(StreamEvent::ToolUseDelta {
+                id: id.clone(),
+                json_delta: format!(r#"{{"path":"s{n}.rs"}}"#),
+            }),
+            Ok(StreamEvent::ToolUseEnd { id }),
+            Ok(StreamEvent::MessageStop {
+                stop_reason: StopReason::ToolUse,
+            }),
+            Ok(StreamEvent::Usage {
+                input_tokens: 1_000_000,
+                output_tokens: 10,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
+            }),
+        ])))
+    }
+}
+
+/// 花费熔断的第一段：越闸后**先收尾交付**，而不是直接报错。
+///
+/// 这条钉的是与轮数闸**同一套语义**：工作树里的成果要被交付，而不是被
+/// 判成失败。用户看到的是一份阶段总结，而不是一句红色报错。
+#[tokio::test]
+async fn exceeding_the_spend_budget_delivers_a_summary_instead_of_erroring() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(SpendHeavyProvider {
+        calls: AtomicUsize::new(0),
+        seen_reminder: AtomicBool::new(false),
+        ignore_reminder: false,
+    });
+    let mut agent = Agent::new(provider.clone())
+        .with_max_turns(50)
+        // $1 上限：每轮 1M input tokens = $15，一轮就越线。
+        .with_budget_limits(crate::budget::BudgetLimits {
+            max_cost_usd: 1.0,
+            max_output_tokens: 0,
+        })
+        // 熔断按模型名查单价，所以必须给一个价格表里有的模型名。
+        .with_route_identity(
+            "test",
+            "anthropic",
+            "claude-opus-4",
+            "https://api.anthropic.com",
+            wyj_config::WireProtocol::AnthropicMessages,
+        );
+    agent.register_tool(Arc::new(GatedTool {
+        name: "Edit",
+        needs_permission: false,
+        runs: runs.clone(),
+    }));
+    let mut session = Session::new();
+
+    let result = agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "预算越线后应正常收尾而不是报错: {:?}",
+        result.err()
+    );
+    assert!(
+        provider.seen_reminder.load(Ordering::SeqCst),
+        "越闸后必须向模型注入收尾指令"
+    );
+    let has_summary = session.messages.iter().any(|m| {
+        m.role == wyj_api::types::Role::Assistant
+            && m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("预算收尾总结")))
+    });
+    assert!(has_summary, "回合历史里应留下模型的最终总结");
+}
+
+/// 花费熔断的第二段：无视收尾指令的模型，其工具调用必须**被关闭**，
+/// 且回执写明是**预算**原因而不是轮数原因。
+///
+/// 回执文案必须区分：模型读到自己那次调用被拒时会顺带读到原因。若一律
+/// 写「轮数预算」，模型会以为自己「还有轮数只是没钱了」——下一轮它可能
+/// 改用更贵的长思考一次性把活干完，反而更烧钱。
+#[tokio::test]
+async fn the_spend_budget_closes_tools_with_its_own_reason() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(SpendHeavyProvider {
+        calls: AtomicUsize::new(0),
+        seen_reminder: AtomicBool::new(false),
+        ignore_reminder: true,
+    });
+    let mut agent = Agent::new(provider.clone())
+        .with_max_turns(50)
+        .with_budget_limits(crate::budget::BudgetLimits {
+            max_cost_usd: 1.0,
+            max_output_tokens: 0,
+        })
+        .with_route_identity(
+            "test",
+            "anthropic",
+            "claude-opus-4",
+            "https://api.anthropic.com",
+            wyj_config::WireProtocol::AnthropicMessages,
+        );
+    agent.register_tool(Arc::new(GatedTool {
+        name: "Edit",
+        needs_permission: false,
+        runs: runs.clone(),
+    }));
+    let mut session = Session::new();
+
+    let _ = agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await;
+
+    let closed = session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| {
+            matches!(b, ContentBlock::ToolResult { content: ToolResultContent::Text(text), .. }
+                    if text.contains("tools_closed_spend_budget_exhausted"))
+        })
+        .count();
+    assert!(closed > 0, "越闸后的工具调用必须被关闭（回执写明预算原因）");
+    let wrong_reason = session
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter(|b| {
+            matches!(b, ContentBlock::ToolResult { content: ToolResultContent::Text(text), .. }
+                    if text.contains("tools_closed_turn_budget_exhausted"))
+        })
+        .count();
+    assert_eq!(
+        wrong_reason, 0,
+        "预算熔断的回执不能写成轮数原因（会误导模型换更贵的策略）"
+    );
+}
+
+/// 默认配置下**不熔断**：金额闸依赖硬编码单价表，默认开启会在调过价的
+/// 模型上莫名截断用户的任务。
+#[tokio::test]
+async fn the_spend_budget_is_off_by_default() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(SpendHeavyProvider {
+        calls: AtomicUsize::new(0),
+        seen_reminder: AtomicBool::new(false),
+        ignore_reminder: false,
+    });
+    let mut agent = Agent::new(provider.clone()).with_max_turns(3);
+    agent.register_tool(Arc::new(GatedTool {
+        name: "Edit",
+        needs_permission: false,
+        runs: runs.clone(),
+    }));
+    let mut session = Session::new();
+
+    let _ = agent
+        .run_turn(&mut session, &PermissionProbeCtx::new(true), &mut |_| {})
+        .await;
+
+    assert!(
+        !provider.seen_reminder.load(Ordering::SeqCst),
+        "默认配置下不该出现预算收尾提示"
+    );
+}
+
 /// 收尾指令**只注入一次**：无视指令的模型不能靠反复注入把自己续命，
 /// 否则「最多 N 轮」这个上限就形同虚设。
 #[tokio::test]
@@ -1997,6 +2205,28 @@ impl Tool for CountingTool {
     }
 }
 
+/// 名字可配置的成功桩工具。`FileChanged` 之类的 hook 判据是**工具名**，
+/// 需要能造出叫 `Write` / `Edit` 的工具。
+struct NamedStubTool(&'static str);
+
+#[async_trait::async_trait]
+impl Tool for NamedStubTool {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.0.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            native: None,
+        }
+    }
+    async fn run(&self, _input: serde_json::Value, _ctx: &dyn ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult::ok("ok".to_string()))
+    }
+}
+
 struct RepeatedTwoToolProvider {
     calls: AtomicUsize,
 }
@@ -2695,6 +2925,55 @@ fn hooks_settings_with(
     HooksSettings { hooks }
 }
 
+/// `FileChanged` 只在**写类工具成功**时触发，只读工具与失败调用都不触发。
+///
+/// 动机：用户想把 formatter/linter 挂在「文件真的被改了」这个时机上。挂在
+/// `PostToolUse` 上会对着 Read/Grep 也跑一遍，一批 8 个工具就跑 8 次。
+#[tokio::test]
+async fn file_changed_hook_fires_only_for_successful_writes() {
+    // hook 命中时往一个临时文件追加一行，用它判断是否触发。
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("fired.txt");
+    let settings = hooks_settings_with(
+        "FileChanged",
+        None,
+        &format!("echo hit >> {}", marker.display()),
+    );
+    let mut agent = Agent::new(Arc::new(EndTurnProvider));
+    agent.register_tool(Arc::new(CountingTool {
+        calls: Arc::new(AtomicUsize::new(0)),
+    }));
+    // `FileChanged` 的判据是**工具名**（Write/Edit/NotebookEdit），所以这里
+    // 需要一个真的叫 `Write` 的桩——复用 CountingTool 的 name() 拿不到它。
+    agent.register_tool(Arc::new(NamedStubTool("Write")));
+    let agent = agent.with_hooks(Arc::new(crate::hooks::HookRunner::from_settings(
+        settings, true,
+    )));
+
+    // 1) Read 不是写类工具 → 不触发。
+    agent
+        .exec_tool_call(
+            &FakeCtx,
+            "1".into(),
+            "Read".into(),
+            serde_json::json!({ "file_path": "/tmp/x" }),
+        )
+        .await;
+    assert!(!marker.exists(), "Read 不该触发 FileChanged");
+
+    // 2) Write 且成功 → 触发。
+    let (_, _, is_error) = agent
+        .exec_tool_call(
+            &FakeCtx,
+            "2".into(),
+            "Write".into(),
+            serde_json::json!({ "file_path": "/tmp/y", "content": "x" }),
+        )
+        .await;
+    assert!(!is_error);
+    assert!(marker.exists(), "成功的 Write 必须触发 FileChanged");
+}
+
 #[tokio::test]
 async fn pre_tool_use_block_prevents_tool_execution() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3101,7 +3380,9 @@ async fn unsupported_safe_parameter_is_removed_once_and_reported() {
     // i18n: agent.degraded.parameter_removed。中文翻译：模型端点不支持参数 `{name}`，已安全移除后重试一次
     let msg = wyj_i18n::tr_fmt("agent.degraded.parameter_removed", &[("name", "thinking")]);
     assert!(visible.contains(&msg), "expected {msg:?} in {visible:?}");
-    assert_eq!(session.api_calls, 2);
+    // 2 次尝试（首次被拒 + 重试成功），成功往返只有 1 次。
+    assert_eq!(session.api_attempts, 2);
+    assert_eq!(session.api_calls, 1);
 }
 
 /// 只认 `reasoning_effort` 的端点（DeepSeek）：profile → route → RequestOptions
@@ -3300,7 +3581,11 @@ async fn rejected_effort_parameter_is_removed_and_reported() {
         &[("name", "reasoning_effort")],
     );
     assert!(visible.contains(&msg), "expected {msg:?} in {visible:?}");
-    assert_eq!(session.api_calls, 2);
+    // 2 次**尝试**（首次被拒 + 重试成功），只有 1 次成功往返。
+    // 断言走 `api_attempts` 而不是 `api_calls`：后者现在只记成功，
+    // 那正是「每次调用带多少上下文」的正确分母。
+    assert_eq!(session.api_attempts, 2);
+    assert_eq!(session.api_calls, 1);
 }
 
 struct TypedFailureProvider {
@@ -3477,8 +3762,9 @@ async fn stream_interruption_retries_and_discards_partial() {
     assert_eq!(assistant_texts.len(), 1);
     assert_eq!(assistant_texts[0], "完整回复");
     assert!(!assistant_texts[0].contains("半成品"));
-    // 两次 API 调用（首次失败 + 重试成功）
-    assert_eq!(session.api_calls, 2);
+    // 两次**尝试**（首次失败 + 重试成功），成功往返只有 1 次。
+    assert_eq!(session.api_attempts, 2);
+    assert_eq!(session.api_calls, 1);
 }
 
 /// 流已正常结束（收到 MessageStop + Usage），但 eventsource_stream 在末尾
@@ -3505,6 +3791,7 @@ impl Provider for EofAfterCompletionProvider {
                 output_tokens: 50,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
             }),
             Err(anyhow::anyhow!("EOF after completion")),
         ];
@@ -3570,8 +3857,9 @@ async fn stream_interruption_exhausts_retries_then_fails_clean() {
         .messages
         .iter()
         .any(|m| matches!(m.role, wyj_api::types::Role::Assistant)));
-    // 首次 + 2 次重试 = 3 次调用
-    assert_eq!(session.api_calls, 3);
+    // 首次 + 2 次重试 = 3 次**尝试**，一次都没成功（最终 clean fail）。
+    assert_eq!(session.api_attempts, 3);
+    assert_eq!(session.api_calls, 0);
 }
 
 /// 先吐 thinking 块（含 signature），再工具调用，再收尾的 provider
@@ -4098,6 +4386,7 @@ impl Provider for PrefixProbeProvider {
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
+            reasoning_tokens: 0,
         })
     }
 }
@@ -4398,14 +4687,11 @@ impl Provider for TruncatedScriptProvider {
         _tools: &[ToolDefinition],
         opts: &wyj_api::provider::RequestOptions,
     ) -> Result<EventStream> {
-        self.seen
-            .lock()
-            .unwrap()
-            .push((
-                opts.max_tokens,
-                opts.reasoning_effort.clone(),
-                opts.thinking_switch.clone(),
-            ));
+        self.seen.lock().unwrap().push((
+            opts.max_tokens,
+            opts.reasoning_effort.clone(),
+            opts.thinking_switch.clone(),
+        ));
         let events = {
             let mut script = self.script.lock().unwrap();
             if script.is_empty() {
@@ -4464,10 +4750,7 @@ async fn truncated_thinking_only_reply_is_retried_once_and_not_kept_in_history()
 
     assert_eq!(
         provider.requests(),
-        vec![
-            (1024, Some("high".to_string())),
-            (2048, None),
-        ],
+        vec![(1024, Some("high".to_string())), (2048, None),],
         "只重试一次，预算翻倍，且关得掉思考的端点第二次走 text_only 把 effort 清空"
     );
     // deepseek-v4-pro 关得掉思考：重试必须把 thinking_switch 置为 disabled，

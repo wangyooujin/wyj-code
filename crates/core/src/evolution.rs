@@ -432,6 +432,9 @@ pub struct EvolutionStore {
     write_lock: Arc<Mutex<()>>,
     activity_generation: Arc<AtomicU64>,
     workers: Arc<Semaphore>,
+    /// 辅助往返用量累加器。演化分析可后台跑、也可从 CLI 子命令触发，
+    /// 拿不到 `&mut Session`，只能靠共享 sink 记账。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
 }
 
 /// Evolution 写入的守卫：同时持进程内 `Mutex` 与跨进程文件锁。
@@ -502,11 +505,18 @@ impl EvolutionStore {
             cfg,
             write_lock: Arc::new(Mutex::new(())),
             activity_generation: Arc::new(AtomicU64::new(0)),
+            aux_usage: None,
         };
         if let Some(legacy) = legacy_evolution_root {
             store.seed_from_legacy(&legacy.join(&store.project_id));
         }
         Ok(store)
+    }
+
+    /// 注入辅助往返用量累加器（装配期调用）。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
+        self
     }
 
     /// 新位置还是空的、旧位置有内容时，把旧项目目录整份复制过来。
@@ -1293,6 +1303,10 @@ impl EvolutionStore {
                 &wyj_api::provider::RequestOptions::text_only(4096),
             )
             .await?;
+        // 记账在解析之前：往返已完成、token 已花掉。
+        if let Some(sink) = self.aux_usage.as_ref() {
+            sink.record_result(&result);
+        }
         let text = result
             .content
             .iter()

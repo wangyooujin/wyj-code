@@ -470,10 +470,10 @@ impl Command for AgentControlCmd {
         "agent-control"
     }
     fn description(&self) -> String {
-        "Send follow-up, interrupt or retry to a running sub-agent".to_string()
+        wyj_i18n::tr("command.agent_control_desc")
     }
     fn usage(&self) -> String {
-        "/agent-control <id> <follow-up text|interrupt|retry>".to_string()
+        wyj_i18n::tr("command.agent_control_usage")
     }
     async fn run(&self, args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
         let mut parts = args.trim().splitn(3, char::is_whitespace);
@@ -502,45 +502,10 @@ impl Command for AgentControlCmd {
 
 pub struct CostCmd;
 
-// (前缀, input_per_mtok, output_per_mtok, cache_read_ratio) in USD
-//
-// 硬编码单价，随官方调价可能过时——这是已知的未决项（计划 U3）。查不到单价时
-// **必须显式提示**而不是静默降级成"只有 token 数"：用户看到没有金额时无法区分
-// 「真的免费」和「我没查到」。
-//
-// **匹配是子串匹配（`contains`），因此顺序即优先级**：更精确的前缀必须排在
-// 更宽的前缀之前，否则 `MiniMax-M3.1-Flash-Preview` 会先命中 `minimax-m3`
-// 而被算成 M3 的价（贵一倍）。
-static PRICES: &[(&str, f64, f64, f64)] = &[
-    ("claude-opus-4", 15.0, 75.0, 0.1),
-    ("claude-opus-3", 15.0, 75.0, 0.1),
-    ("claude-sonnet-4", 3.0, 15.0, 0.1),
-    ("claude-sonnet-3", 3.0, 15.0, 0.1),
-    ("claude-haiku-4", 0.8, 4.0, 0.1),
-    ("claude-haiku-3", 0.25, 1.25, 0.1),
-    // MiniMax 走 Anthropic 兼容端点，单价远低于 Anthropic 同档。
-    //
-    // 官方价（人民币/百万 tokens，2026-10 核对，按 7.0 折美元）：
-    //   M3.1-Flash  输入 1.00 / 输出 4.00 / 缓存读 0.10（= 输入价的 0.1x）
-    //   M3          输入 2.10 / 输出 8.40 / 缓存读 0.42（= 输入价的 0.2x，>512k 输入翻倍）
-    // M3.1-Flash 的条目**必须排在 `minimax-m3` 之前**（子串匹配，顺序即优先级）。
-    // M3 用的是低档价（≤512k 输入）；超长输入按 2 倍计费，本表不区分。
-    //
-    // 放在列表里是因为第三方端点默认**不**开启缓存
-    // （见 `Profile::effective_prompt_cache`），未显式配置时全额按 input 计。
-    ("minimax-m3.1-flash", 0.15, 0.60, 0.1),
-    ("minimax-m3", 0.30, 1.20, 0.2),
-    ("minimax-m2", 0.30, 1.20, 0.1),
-];
-
-/// 查到模型单价：`(input_per_mtok, output_per_mtok, cache_read_ratio)`。
-fn lookup_price(model: &str) -> Option<(f64, f64, f64)> {
-    let model_lower = model.to_lowercase();
-    PRICES
-        .iter()
-        .find(|(prefix, _, _, _)| model_lower.contains(prefix))
-        .map(|(_, i, o, cr)| (*i, *o, *cr))
-}
+// 单价表下沉到 `wyj_core::pricing`：花费熔断在 core 里判断「这一趟还该不该
+// 发」，若两份价格表各写一份，就会出现「面板显示花了 3 美元、熔断器以为只花
+// 了 0.2 美元」——熔断永远不触发，而用户以为它一直在保护自己。
+use wyj_core::pricing::lookup_price;
 
 #[async_trait]
 impl Command for CostCmd {
@@ -578,24 +543,35 @@ impl Command for CostCmd {
         // 输入价的 0.1x，MiniMax M3 是 0.2x），缓存写入按 1.25x 输入价。
         // `cache_write_known` 为 false 时用 None 占位而不是折算成 0 ——
         // 端点不上报 ≠ 不计费。
-        let (input_cost, output_cost, cache_read_cost, cache_write_cost, sub_costs) = match prices {
-            Some((ip, op, cache_read_ratio)) => {
-                let sub = (
-                    ctx.sub_input_tokens as f64 / 1_000_000.0 * ip,
-                    ctx.sub_output_tokens as f64 / 1_000_000.0 * op,
-                    ctx.sub_cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
-                    ctx.sub_cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
-                );
-                (
-                    ctx.input_tokens as f64 / 1_000_000.0 * ip,
-                    ctx.output_tokens as f64 / 1_000_000.0 * op,
-                    ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
-                    ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
-                    sub,
-                )
-            }
-            None => (0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0, 0.0)),
-        };
+        let (input_cost, output_cost, cache_read_cost, cache_write_cost, sub_costs, aux_costs) =
+            match prices {
+                Some((ip, op, cache_read_ratio)) => {
+                    let sub = (
+                        ctx.sub_input_tokens as f64 / 1_000_000.0 * ip,
+                        ctx.sub_output_tokens as f64 / 1_000_000.0 * op,
+                        ctx.sub_cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
+                        ctx.sub_cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
+                    );
+                    // 辅助往返按**主模型的价目表**折算：它们的实际端点由
+                    // `aux_model` / `classifier_profile` 指定，本命令看不到那个
+                    // 端点的模型名。用主模型单价是一个明确的近似，比旧实现
+                    // 完全不计更接近真实花费——但脚注要说明这一点。
+                    let aux = (
+                        ctx.aux_input_tokens as f64 / 1_000_000.0 * ip,
+                        ctx.aux_output_tokens as f64 / 1_000_000.0 * op,
+                        ctx.aux_cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
+                    );
+                    (
+                        ctx.input_tokens as f64 / 1_000_000.0 * ip,
+                        ctx.output_tokens as f64 / 1_000_000.0 * op,
+                        ctx.cache_read_tokens as f64 / 1_000_000.0 * ip * cache_read_ratio,
+                        ctx.cache_write_tokens as f64 / 1_000_000.0 * ip * 1.25,
+                        sub,
+                        aux,
+                    )
+                }
+                None => (0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+            };
         let total_cost = input_cost
             + output_cost
             + cache_read_cost
@@ -603,7 +579,10 @@ impl Command for CostCmd {
             + sub_costs.0
             + sub_costs.1
             + sub_costs.2
-            + sub_costs.3;
+            + sub_costs.3
+            + aux_costs.0
+            + aux_costs.1
+            + aux_costs.2;
 
         // ── 主表 ──────────────────────────────────────────────────────────
         // 缓存命中 > 0 而写入恒 0：端点能缓存却不统计写入量。此时写入行必须
@@ -620,7 +599,13 @@ impl Command for CostCmd {
         let total_tokens = u64::from(ctx.input_tokens)
             + u64::from(ctx.output_tokens)
             + u64::from(ctx.cache_read_tokens)
-            + u64::from(ctx.cache_write_tokens);
+            + u64::from(ctx.cache_write_tokens)
+            + u64::from(ctx.sub_input_tokens)
+            + u64::from(ctx.sub_output_tokens)
+            + u64::from(ctx.sub_cache_read_tokens)
+            + u64::from(ctx.aux_input_tokens)
+            + u64::from(ctx.aux_output_tokens)
+            + u64::from(ctx.aux_cache_read_tokens);
         let mut rows = vec![
             Row::new(
                 tr("cost.row_input"),
@@ -681,6 +666,35 @@ impl Command for CostCmd {
                     tr("cost.subagent_cache"),
                     u64::from(ctx.sub_cache_read_tokens),
                     prices.map(|_| sub_costs.2),
+                )
+                .indented(),
+            );
+        }
+        // 辅助往返（标题 / 分类器 / 记忆 / 演化）。旧实现把它们完全丢弃，
+        // 于是 Auto 模式下几十次分类器往返在 `/cost` 里一行都看不到。
+        if ctx.aux_calls > 0 {
+            rows.push(Row::section(tr("cost.aux_section")));
+            rows.push(
+                Row::new(
+                    tr("cost.aux_input"),
+                    u64::from(ctx.aux_input_tokens),
+                    prices.map(|_| aux_costs.0),
+                )
+                .indented(),
+            );
+            rows.push(
+                Row::new(
+                    tr("cost.aux_output"),
+                    u64::from(ctx.aux_output_tokens),
+                    prices.map(|_| aux_costs.1),
+                )
+                .indented(),
+            );
+            rows.push(
+                Row::new(
+                    tr("cost.aux_cache"),
+                    u64::from(ctx.aux_cache_read_tokens),
+                    prices.map(|_| aux_costs.2),
                 )
                 .indented(),
             );
@@ -754,6 +768,53 @@ impl Command for CostCmd {
                     &fmt_int(u64::from(ctx.input_tokens / ctx.api_calls.max(1))),
                 )],
             ));
+            // 重试开销：尝试次数比成功往返数多出来的部分。
+            //
+            // 这不是成本（失败不花钱），而是**稳定性**——端点在拒绝还是在
+            // 抖动。差值大时用户该去看端点，而不是怀疑自己的 prompt。
+            let retries = ctx.api_attempts.saturating_sub(ctx.api_calls);
+            if retries > 0 {
+                line(tr_fmt(
+                    "cost.retry_line",
+                    &[
+                        ("attempts", &ctx.api_attempts.to_string()),
+                        ("calls", &ctx.api_calls.to_string()),
+                        ("retries", &retries.to_string()),
+                    ],
+                ));
+            }
+        }
+        // 思考占比：区分「贵在思考」与「贵在正文」——两者是完全不同的
+        // 优化方向（调低 effort vs 调短输出长度）。
+        //
+        // 只在**端点真的上报了**思考 token 时才显示：Anthropic 线不单独上报
+        // （output 已含 thinking），那里显示「思考占 0%」会让人以为模型
+        // 完全没思考。
+        if ctx.reasoning_tokens > 0 && ctx.output_tokens > 0 {
+            let share = ctx.reasoning_tokens as f64 / ctx.output_tokens as f64 * 100.0;
+            line(tr_fmt(
+                "cost.reasoning_share_line",
+                &[
+                    ("share", &fmt_pct(share)),
+                    ("tokens", &fmt_int(u64::from(ctx.reasoning_tokens))),
+                ],
+            ));
+        }
+        // 缓存掉量归因：回答「缓存为什么掉了」。这个答案决定用户该做什么
+        // ——改配置 / 关插件 / 什么都不用做（等缓存 TTL 过期即可）。三种猜测
+        // 的方向经常相反，没有归因时用户只能瞎试。
+        if let Some(attribution) = &ctx.cache_attribution {
+            line(tr_fmt(
+                "cost.cache_drop_line",
+                &[
+                    (
+                        "from",
+                        &fmt_pct(attribution.previous_hit_ratio as f64 * 100.0),
+                    ),
+                    ("to", &fmt_pct(attribution.current_hit_ratio as f64 * 100.0)),
+                    ("cause", &attribution.cause.describe()),
+                ],
+            ));
         }
 
         // ── 上下文占比 ────────────────────────────────────────────────
@@ -811,6 +872,21 @@ impl Command for CostCmd {
             notes.push(tr_fmt(
                 "cost.note_compacted",
                 &[("times", &ctx.compact_count.to_string())],
+            ));
+        }
+        // 辅助往返的单价是按主模型估的（它们走 aux_model / classifier_profile
+        // 指定的另一个端点）。有金额就**必须**给出这条脚注，否则用户会把
+        // 一个近似值当成精确账单。
+        if ctx.aux_calls > 0 {
+            notes.push(tr("cost.aux_note"));
+        }
+        // 代际超过上限时说清楚「摘要已经不再是记录」。cost 面板常被用来
+        // 判断「这轮为什么答得不对」，而最容易被忽略的原因正是「模型手里
+        // 的历史已经被压了好几层」。
+        if ctx.compact_generation > wyj_core::compact::MAX_COMPACT_GENERATIONS {
+            notes.push(tr_fmt(
+                "cost.note_compact_generation",
+                &[("generation", &ctx.compact_generation.to_string())],
             ));
         }
         if !notes.is_empty() {
@@ -2548,12 +2624,20 @@ mod help_tests {
             context_audit: None,
             last_latency: Default::default(),
             compact_count: 0,
+            compact_generation: 0,
+            cache_attribution: None,
+            reasoning_tokens: 0,
+            api_attempts: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -2632,12 +2716,20 @@ mod agents_tests {
             context_audit: None,
             last_latency: Default::default(),
             compact_count: 0,
+            compact_generation: 0,
+            cache_attribution: None,
+            reasoning_tokens: 0,
+            api_attempts: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -2681,12 +2773,20 @@ mod subagents_tests {
             context_audit: None,
             last_latency: Default::default(),
             compact_count: 0,
+            compact_generation: 0,
+            cache_attribution: None,
+            reasoning_tokens: 0,
+            api_attempts: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -3045,12 +3145,20 @@ mod cost_tests {
             context_audit: None,
             last_latency: Default::default(),
             compact_count: 0,
+            compact_generation: 0,
+            cache_attribution: None,
+            reasoning_tokens: 0,
+            api_attempts: 0,
             context_edit: (0, 0),
             home_dir: std::path::PathBuf::new(),
             sub_input_tokens: 0,
             sub_output_tokens: 0,
             sub_cache_read_tokens: 0,
             sub_cache_write_tokens: 0,
+            aux_input_tokens: 0,
+            aux_output_tokens: 0,
+            aux_cache_read_tokens: 0,
+            aux_calls: 0,
             effective_mcp_count: 0,
             plugin_agent_paths: vec![],
             hooks_enabled: false,
@@ -3209,18 +3317,80 @@ mod cost_tests {
 
     // ── 数字自洽 ────────────────────────────────────────────────────────
 
-    /// 合计行必须等于各明细行之和——用户会拿它对账，对不上就是 bug。
+    /// 合计行必须等于**面板上所有 token 行**之和——用户会拿它对账，
+    /// 对不上就是 bug。
+    ///
+    /// 合计的口径是「本会话真实花掉的 token 总量」，因此包含主会话四项 +
+    /// 子 Agent 扇出 + 辅助 LLM 往返。三者都在同一张表里逐行列出（子 Agent
+    /// 与辅助调用带一层缩进），所以「加起来」这件事对用户是成立的。
+    ///
+    /// 历史教训：合计一度只累加主会话四项，而子 Agent 明细行却显式标注
+    /// 「已计入合计」——面板自己撒了谎，用户加出来的数与合计差了一整块。
     #[tokio::test]
     async fn total_row_equals_the_sum_of_detail_rows() {
-        let text = render(&full_ctx(64)).await;
-        let sum = 31_845u64 + 535 + 183_427;
+        let ctx = full_ctx(64);
+        let text = render(&ctx).await;
+        let sum = u64::from(ctx.input_tokens)
+            + u64::from(ctx.output_tokens)
+            + u64::from(ctx.cache_read_tokens)
+            + u64::from(ctx.cache_write_tokens)
+            + u64::from(ctx.sub_input_tokens)
+            + u64::from(ctx.sub_output_tokens)
+            + u64::from(ctx.sub_cache_read_tokens)
+            + u64::from(ctx.sub_cache_write_tokens)
+            + u64::from(ctx.aux_input_tokens)
+            + u64::from(ctx.aux_output_tokens)
+            + u64::from(ctx.aux_cache_read_tokens);
         let total_row = text
             .lines()
             .find(|l| l.contains(&tr("cost.row_total")))
             .expect("缺少合计行");
         assert!(
             total_row.contains(&fmt_int(sum)),
-            "合计行与明细和不符: {total_row}"
+            "合计行与明细和不符: {total_row}（期望 {sum}）"
+        );
+    }
+
+    /// 缓存掉量时面板必须**说出原因**，而不是只显示命中率数字。
+    ///
+    /// 「为什么掉了」决定用户该做什么：改配置 / 关插件 / 什么都不用做。
+    /// 三种猜测的方向经常相反，没有归因时用户只能瞎试。
+    #[tokio::test]
+    async fn a_cache_drop_is_explained_in_the_panel() {
+        let attribution = wyj_core::cache_attribution::CacheAttribution {
+            request_index: 7,
+            previous_hit_ratio: 0.82,
+            current_hit_ratio: 0.0,
+            cause: wyj_core::cache_attribution::CacheCause::ToolsChanged {
+                added: vec!["mcp__codegraph__search".to_string()],
+                removed: Vec::new(),
+            },
+        };
+        let ctx = CommandContext {
+            cache_attribution: Some(attribution),
+            // 用较宽的终端：归因行较长，窄终端下会被 `fit_line` 截断
+            // （截断是既有行为，不是这条要测的东西）。
+            ..full_ctx(200)
+        };
+        let text = render(&ctx).await;
+        assert!(
+            text.contains("mcp__codegraph__search"),
+            "面板必须点名是哪个工具变了: {text}"
+        );
+        assert!(
+            text.contains("82") || text.contains("82.0"),
+            "面板必须给出掉量前的命中率: {text}"
+        );
+    }
+
+    /// 没有掉量时不得出现归因行——否则面板上永远挂着一句警告。
+    #[tokio::test]
+    async fn no_cache_drop_means_no_attribution_line() {
+        let ctx = full_ctx(64);
+        let text = render(&ctx).await;
+        assert!(
+            !text.contains("mcp__codegraph__search"),
+            "没掉量时不该有归因: {text}"
         );
     }
 

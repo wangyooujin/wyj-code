@@ -44,6 +44,10 @@ pub struct AnthropicProvider {
     /// 该端点已被实测判定不支持 `cache_control`（首次 400 后单调置位，
     /// 本进程内不再尝试缓存）。供 agent 层据此在 `/cost` 解释缓存为何为 0。
     cache_disabled: Arc<AtomicBool>,
+    /// 该端点已拒绝 `context_management`（首次 400 后单调置位）。与
+    /// `cache_disabled` 分开：两者是不同的可选能力，一个被拒不代表另一个
+    /// 也不可用，共用一位会让「服务端清理不支持」顺带关掉缓存。
+    server_cm_disabled: Arc<AtomicBool>,
     /// vendor 名（anthropic / zhipu / minimax / moonshot / 等）。用于 thinking adapter
     /// dispatch，决定是否发 interleaved-thinking beta header。
     vendor: String,
@@ -83,6 +87,7 @@ impl AnthropicProvider {
             // 未知 beta 头普遍直接 400。降级兜底见 `send_with_cache_fallback`。
             send_cache_beta: is_official,
             cache_disabled: Arc::new(AtomicBool::new(false)),
+            server_cm_disabled: Arc::new(AtomicBool::new(false)),
             vendor,
             is_official_anthropic_endpoint: is_official,
             dropped_parameters,
@@ -133,6 +138,10 @@ struct ApiRequest<'a> {
     /// 思考深度档位，仅 MiniMax M3.1-Flash-Preview 认（`{"effort":"high"}`）。
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<Value>,
+    /// 服务端上下文清理（Anthropic 官方 beta）。第三方兼容端点与 OpenAI 线
+    /// 一律不发：它们不认识这个字段，400 会打断整轮对话。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_management: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -224,6 +233,68 @@ fn build_system_blocks<'a>(
         });
     }
     blocks
+}
+
+/// 在历史里打两个 `cache_control` 断点（中段 + 末尾）。
+///
+/// ## 为什么历史需要两个断点
+///
+/// Anthropic 的缓存是**前缀匹配**：请求从头开始逐字节比对，命中到最后一个
+/// 断点为止。只打末尾一个断点时，任何一次**中段改写**都会让断点之前的全部
+/// 内容失效——而 `context_edit` 恰恰就是原地改写历史中段（把老 `tool_result`
+/// 换成 `cas://` 占位符）。实测一次清理能让几十万 token 的历史全部按全价重算。
+///
+/// 中段再打一个断点后，改写点之后到中间断点之间的内容仍然命中。
+///
+/// ## 断点预算
+///
+/// Anthropic 上限 4 个。当前分配：system 1 + tools 1 + 历史 2 = 4（用满）。
+/// 再加就会 400（`cache_control` 无处安放）。
+///
+/// ## 位置选择
+///
+/// 取**历史条数的中点**，而不是固定条数：历史长度在长会话里从几十条涨到
+/// 上千条，固定值会在早期过度分段、在后期完全失效。
+///
+/// 且必须落在能承载 `cache_control` 的块上——`Image` / `Thinking` /
+/// `RedactedThinking` 不能承载，要向前回退到最近的 `Text` / `ToolUse` /
+/// `ToolResult`。以图片结尾的轮次若直接放弃断点，会丢失整轮缓存写入。
+fn place_history_breakpoints(messages: &mut [ApiMessage]) {
+    // 中段断点：只在 `[..mid]` 范围内找，保证与末尾断点落在不同位置。
+    let mid = messages.len() / 2;
+    if mid > 0 {
+        'mid: for msg in messages[..mid].iter_mut().rev() {
+            for block in msg.content.iter_mut().rev() {
+                match block {
+                    ApiContentBlock::Text { cache_control, .. }
+                    | ApiContentBlock::ToolUse { cache_control, .. }
+                    | ApiContentBlock::ToolResult { cache_control, .. } => {
+                        *cache_control = Some(EPHEMERAL);
+                        break 'mid;
+                    }
+                    ApiContentBlock::Image { .. }
+                    | ApiContentBlock::Thinking { .. }
+                    | ApiContentBlock::RedactedThinking { .. } => {}
+                }
+            }
+        }
+    }
+    // 末尾断点。
+    'tail: for msg in messages.iter_mut().rev() {
+        for block in msg.content.iter_mut().rev() {
+            match block {
+                ApiContentBlock::Text { cache_control, .. }
+                | ApiContentBlock::ToolUse { cache_control, .. }
+                | ApiContentBlock::ToolResult { cache_control, .. } => {
+                    *cache_control = Some(EPHEMERAL);
+                    break 'tail;
+                }
+                ApiContentBlock::Image { .. }
+                | ApiContentBlock::Thinking { .. }
+                | ApiContentBlock::RedactedThinking { .. } => {}
+            }
+        }
+    }
 }
 
 /// 把中立 `ToolDefinition` 序列化为 Anthropic 请求体里的单个工具条目。
@@ -465,6 +536,7 @@ fn collect_beta_header(
     send_cache_beta: bool,
     interleaved_thinking: bool,
     tools: &[ToolDefinition],
+    server_context_management: bool,
 ) -> Option<String> {
     let mut betas: Vec<&str> = vec![];
     if prompt_cache && send_cache_beta {
@@ -472,6 +544,9 @@ fn collect_beta_header(
     }
     if interleaved_thinking {
         betas.push("interleaved-thinking-2025-05-14");
+    }
+    if server_context_management {
+        betas.push("context-management-2025-06-27");
     }
     for t in tools {
         if let Some(native) = &t.native {
@@ -510,18 +585,22 @@ async fn send_anthropic_request(
     .await
 }
 
-/// 该错误是否意味着「端点不接受 cache_control / caching beta 头」。
+/// 判定一次 4xx 是否属于「这个可选参数/头我不认」。
+///
+/// 用于两处自动降级：`cache_control` / caching beta 头被拒，以及
+/// `context_management` 被拒。两者都是**可选增强**，端点不支持时应当摘掉
+/// 重试而不是让整轮对话失败。
 ///
 /// 必须排除 `ContextLengthExceeded`：它也是 400，但语义是
 /// 「提示词太长」，正确反应是上层强制压缩（`agent.rs` 的
-/// `ContextLengthExceeded` 恢复路径）而不是关缓存。若把它误判成缓存不支持，
-/// 用户会遇到「上下文一满就再也不用缓存了」这种莫名其妙的降级。
+/// `ContextLengthExceeded` 恢复路径）而不是摘掉增强项。若把它误判成
+/// 参数不支持，用户会遇到「上下文一满就再也不用缓存了」这种莫名其妙的降级。
 ///
 /// 只认 `UnsupportedParameter` 与 `InvalidRequest` 两类：前者是端点明确说不认识
-/// 该参数，后者是「无法解析请求」——`cache_control` 写坏或 beta 头不被接受时
-/// 都落在这里。其余 400（如 tool schema 非法）不降级，避免把真实 bug 掩盖成
-/// 「缓存不支持」。
-fn is_cache_rejection(err: &anyhow::Error) -> bool {
+/// 该参数，后者是「无法解析请求」——`cache_control` / `context_management`
+/// 写坏或 beta 头不被接受时都落在这里。其余 400（如 tool schema 非法）不降级，
+/// 避免把真实 bug 掩盖成「端点不支持」。
+fn is_unsupported_parameter_rejection(err: &anyhow::Error) -> bool {
     err.downcast_ref::<crate::error::ProviderError>()
         .map(|e| {
             e.provider_status == Some(400)
@@ -623,66 +702,75 @@ impl Provider for AnthropicProvider {
         // 也不应发 caching beta 头（那正是可能触发 400 的东西）。
         let send_cache_beta = self.send_cache_beta;
 
-        let build_request = |cache_active: bool| -> Result<(Value, Option<String>)> {
-            let system_blocks = build_system_blocks(system, cache_active);
+        // ── 服务端上下文清理 ──
+        // 只有官方 Anthropic 端点发：`context_management` 是官方 beta 字段，
+        // 第三方兼容端点收到它普遍直接 400。首次被拒后本进程单调停用。
+        let server_cm_requested = opts.server_context_management.is_some();
+        let mut server_cm_active =
+            server_cm_requested && !self.server_cm_disabled.load(Ordering::Relaxed);
+        let server_cm_edits = opts
+            .server_context_management
+            .as_ref()
+            .map(|cfg| serde_json::json!({ "edits": cfg.to_edits() }));
 
-            let tool_count = tools.len();
-            let api_tools: Vec<Value> = tools
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let cc = (cache_active && tool_count > 0 && i == tool_count - 1)
-                        .then_some(EPHEMERAL);
-                    build_api_tool(t, cc)
-                })
-                .collect();
+        let build_request =
+            |cache_active: bool, server_cm_active: bool| -> Result<(Value, Option<String>)> {
+                let system_blocks = build_system_blocks(system, cache_active);
 
-            // Anthropic 缓存按前缀匹配：把断点放在历史末尾，使「system + tools +
-            // 既有历史」整体被缓存，后续轮次只有新增的 user/assistant 内容按全价。
-            // 注意 breakpoint 总数上限为 4（system 1 + tools 1 + 历史 1 = 3，安全）。
-            let mut api_messages = to_api_messages(messages, self.supports_vision);
-            // 独立 Image 块不能承载 cache_control：从末尾向前回退到最近一个可打
-            // 断点的块（旧实现直接放弃断点，以图片结尾的轮次会丢失缓存写入）。
-            if cache_active {
-                'breakpoint: for msg in api_messages.iter_mut().rev() {
-                    for block in msg.content.iter_mut().rev() {
-                        match block {
-                            ApiContentBlock::Text { cache_control, .. }
-                            | ApiContentBlock::ToolUse { cache_control, .. }
-                            | ApiContentBlock::ToolResult { cache_control, .. } => {
-                                *cache_control = Some(EPHEMERAL);
-                                break 'breakpoint;
-                            }
-                            // Image/Thinking 块不可承载 cache_control，继续向前找
-                            ApiContentBlock::Image { .. }
-                            | ApiContentBlock::Thinking { .. }
-                            | ApiContentBlock::RedactedThinking { .. } => {}
-                        }
-                    }
+                let tool_count = tools.len();
+                let api_tools: Vec<Value> = tools
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let cc = (cache_active && tool_count > 0 && i == tool_count - 1)
+                            .then_some(EPHEMERAL);
+                        build_api_tool(t, cc)
+                    })
+                    .collect();
+
+                // Anthropic 缓存按前缀匹配，断点预算上限 4：
+                // system 1 + tools 1 + 历史 2 = 4。分配理由见 `place_history_breakpoints`。
+                let mut api_messages = to_api_messages(messages, self.supports_vision);
+                if cache_active {
+                    place_history_breakpoints(&mut api_messages);
                 }
-            }
 
-            let body = ApiRequest {
-                model: &self.model,
-                max_tokens,
-                system: system_blocks,
-                messages: api_messages,
-                tools: api_tools,
-                stream: true,
-                thinking: thinking.thinking.clone(),
-                output_config: thinking.output_config.clone(),
+                let body = ApiRequest {
+                    model: &self.model,
+                    max_tokens,
+                    system: system_blocks,
+                    messages: api_messages,
+                    tools: api_tools,
+                    stream: true,
+                    thinking: thinking.thinking.clone(),
+                    output_config: thinking.output_config.clone(),
+                    context_management: if server_cm_active {
+                        server_cm_edits.clone()
+                    } else {
+                        None
+                    },
+                };
+                // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
+                let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
+                let beta = collect_beta_header(
+                    cache_active,
+                    send_cache_beta,
+                    interleaved_enabled,
+                    tools,
+                    server_cm_active,
+                );
+                Ok((body_value, beta))
             };
-            // api_tools 借用 tools 的引用，不能随 body 一起 move，重新序列化
-            let body_value = serde_json::to_value(&body).context("序列化请求失败")?;
-            let beta =
-                collect_beta_header(cache_active, send_cache_beta, interleaved_enabled, tools);
-            Ok((body_value, beta))
-        };
 
-        let (body_value, beta_header) = build_request(cache_active)?;
         let url = format!("{}/v1/messages", self.base_url);
         let policy = crate::retry::RetryPolicy::default();
-        let resp = match send_anthropic_request(
+
+        // 最多三次尝试：原始 → 去掉服务端清理 → 去掉缓存。两处降级都发生在
+        // SSE 开始之前（尚未产出任何 delta），重放安全。顺序固定为「先摘新
+        // 特性、后摘旧特性」：缓存是长期收益，服务端清理是新增能力。
+        let mut cache_active = cache_active;
+        let (body_value, beta_header) = build_request(cache_active, server_cm_active)?;
+        let mut attempt = send_anthropic_request(
             &self.client,
             &self.api_key,
             &url,
@@ -690,16 +778,46 @@ impl Provider for AnthropicProvider {
             &body_value,
             beta_header.as_deref(),
         )
-        .await
+        .await;
+
+        if server_cm_active
+            && attempt
+                .as_ref()
+                .is_err_and(is_unsupported_parameter_rejection)
         {
+            if self
+                .server_cm_disabled
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                tracing::warn!(
+                    vendor = %self.vendor,
+                    model = %self.model,
+                    base_url = %self.base_url,
+                    "端点拒绝了服务端上下文清理（context_management），本进程已停用该能力并重试；本地 context editing 仍然生效"
+                );
+            }
+            server_cm_active = false;
+            let (plain_body, plain_beta) = build_request(cache_active, false)?;
+            attempt = send_anthropic_request(
+                &self.client,
+                &self.api_key,
+                &url,
+                &policy,
+                &plain_body,
+                plain_beta.as_deref(),
+            )
+            .await;
+        }
+
+        // 端点不认 cache_control / caching beta 头 → 单调降级并重试一次。
+        // compare_exchange 保证并发请求里只有一个执行降级，避免重复告警。
+        let resp = match attempt {
             Ok(resp) => resp,
-            // 端点不认 cache_control / caching beta 头 → 单调降级并重试一次。
-            // 发生在 SSE 开始之前，尚未产出任何 delta，重放安全。
             Err(err) => {
-                if !(cache_active && is_cache_rejection(&err)) {
+                if !(cache_active && is_unsupported_parameter_rejection(&err)) {
                     return Err(err);
                 }
-                // compare_exchange 保证并发请求里只有一个执行降级，避免重复告警。
                 if self
                     .cache_disabled
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -712,7 +830,8 @@ impl Provider for AnthropicProvider {
                         "端点拒绝了 prompt cache（cache_control / anthropic-beta），本进程已停用缓存并重试；如需缓存请确认该模型是否支持"
                     );
                 }
-                let (plain_body, plain_beta) = build_request(false)?;
+                cache_active = false;
+                let (plain_body, plain_beta) = build_request(cache_active, server_cm_active)?;
                 send_anthropic_request(
                     &self.client,
                     &self.api_key,
@@ -756,6 +875,9 @@ fn usage_event(usage: UsageData) -> Option<StreamEvent> {
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_write,
+        // Anthropic 不单独上报思考 token（`output_tokens` 已含 thinking）。
+        // 这里填 0 是「不知道」而不是「零思考」——面板据此不显示思考占比。
+        reasoning_tokens: 0,
     })
 }
 
@@ -929,6 +1051,7 @@ mod tests {
                 output_tokens: 256,
                 cache_read_input_tokens: 128,
                 cache_creation_input_tokens: 64,
+                reasoning_tokens: 0,
             }
         ));
     }
@@ -1008,13 +1131,13 @@ mod tests {
     #[test]
     fn beta_header_appends_native_tool_beta_and_dedupes() {
         let tools = vec![computer_tool_def(), computer_tool_def()];
-        let header = collect_beta_header(true, true, false, &tools).unwrap();
+        let header = collect_beta_header(true, true, false, &tools, false).unwrap();
         assert_eq!(header, "prompt-caching-2024-07-31,computer-use-2025-11-24");
     }
 
     #[test]
     fn beta_header_is_none_without_any_beta_source() {
-        assert_eq!(collect_beta_header(false, true, false, &[]), None);
+        assert_eq!(collect_beta_header(false, true, false, &[], false), None);
     }
 
     /// 第三方兼容端点开启缓存时**只发 cache_control、不发 caching beta 头**。
@@ -1022,7 +1145,7 @@ mod tests {
     /// beta 头直接 400；把两者绑死会让「开启缓存」在第三方上必然失败。
     #[test]
     fn third_party_endpoint_sends_cache_control_without_caching_beta() {
-        let header = collect_beta_header(true, false, false, &[]);
+        let header = collect_beta_header(true, false, false, &[], false);
         assert_eq!(header, None, "第三方端点开启缓存不应产生 anthropic-beta 头");
     }
 
@@ -1031,11 +1154,71 @@ mod tests {
     #[test]
     fn third_party_still_sends_unrelated_betas() {
         let tools = vec![computer_tool_def()];
-        let header = collect_beta_header(true, false, true, &tools).unwrap();
+        let header = collect_beta_header(true, false, true, &tools, false).unwrap();
         assert_eq!(
             header,
             "interleaved-thinking-2025-05-14,computer-use-2025-11-24"
         );
+    }
+
+    /// 服务端上下文清理必须带上它自己的 beta 头，否则官方端点会忽略
+    /// `context_management` 字段（静默无效比 400 更难发现）。
+    #[test]
+    fn server_context_management_adds_its_beta_header() {
+        let header = collect_beta_header(false, false, false, &[], true).unwrap();
+        assert_eq!(header, "context-management-2025-06-27");
+    }
+
+    /// 三个 beta 源可以共存，且顺序稳定（缓存 → 交错思考 → 服务端清理 → 原生工具）。
+    #[test]
+    fn beta_header_combines_all_sources_in_a_stable_order() {
+        let tools = vec![computer_tool_def()];
+        let header = collect_beta_header(true, true, true, &tools, true).unwrap();
+        assert_eq!(
+            header,
+            "prompt-caching-2024-07-31,interleaved-thinking-2025-05-14,context-management-2025-06-27,computer-use-2025-11-24"
+        );
+    }
+
+    /// 序列化形态必须与官方 schema 一致：`trigger` / `keep` / `clear_at_least`
+    /// 都是 `{type, value}` 结构，`exclude_tools` 是裸字符串数组。
+    #[test]
+    fn server_context_management_serializes_into_official_edits_shape() {
+        let cfg = crate::provider::ServerContextManagement {
+            trigger_tokens: 120_000,
+            keep_tool_uses: 3,
+            clear_at_least_tokens: 20_000,
+            exclude_tools: vec!["Edit".into(), "Write".into()],
+            keep_thinking_turns: Some(2),
+        };
+        let edits = cfg.to_edits();
+        assert_eq!(edits.len(), 2, "工具清理 + 思考清理两条编辑项");
+        assert_eq!(edits[0]["type"].as_str(), Some("clear_tool_uses_20250919"));
+        assert_eq!(edits[0]["trigger"]["type"].as_str(), Some("input_tokens"));
+        assert_eq!(edits[0]["trigger"]["value"].as_u64(), Some(120_000));
+        assert_eq!(edits[0]["keep"]["type"].as_str(), Some("tool_uses"));
+        assert_eq!(edits[0]["keep"]["value"].as_u64(), Some(3));
+        assert_eq!(edits[0]["clear_at_least"]["value"].as_u64(), Some(20_000));
+        assert_eq!(edits[0]["exclude_tools"][0].as_str(), Some("Edit"));
+        assert_eq!(edits[1]["type"].as_str(), Some("clear_thinking_20251015"));
+        assert_eq!(edits[1]["keep"]["value"].as_u64(), Some(2));
+    }
+
+    /// 不给 `keep_thinking_turns` 时不产生第二条编辑项——官方端点上
+    /// `clear_thinking` 与 interleaved thinking 同时开启有已知冲突，
+    /// 关得掉思考的端点上根本没必要发。
+    #[test]
+    fn server_context_management_omits_thinking_edit_when_not_requested() {
+        let cfg = crate::provider::ServerContextManagement {
+            trigger_tokens: 100_000,
+            keep_tool_uses: 3,
+            clear_at_least_tokens: 5_000,
+            exclude_tools: Vec::new(),
+            keep_thinking_turns: None,
+        };
+        let edits = cfg.to_edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0]["type"].as_str(), Some("clear_tool_uses_20250919"));
     }
 
     /// 400「提示词太长」不是「缓存不支持」。误判会让上下文一满就永久失去缓存，
@@ -1048,7 +1231,7 @@ mod tests {
             &headers,
             r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
         ));
-        assert!(!is_cache_rejection(&err));
+        assert!(!is_unsupported_parameter_rejection(&err));
     }
 
     #[test]
@@ -1059,7 +1242,7 @@ mod tests {
             &headers,
             r#"{"error":{"message":"unsupported parameter: anthropic-beta"}}"#,
         ));
-        assert!(is_cache_rejection(&err));
+        assert!(is_unsupported_parameter_rejection(&err));
     }
 
     #[test]
@@ -1070,7 +1253,7 @@ mod tests {
             &headers,
             r#"{"error":{"message":"unsupported parameter"}}"#,
         ));
-        assert!(!is_cache_rejection(&err));
+        assert!(!is_unsupported_parameter_rejection(&err));
     }
 
     // ── system 分段与 prompt cache 断点 ─────────────────────────────────
@@ -1090,6 +1273,118 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].text, "STABLE-PROMPT");
         assert_eq!(blocks[1].text, "VOLATILE-TAIL");
+    }
+
+    /// 历史必须有两个断点（中段 + 末尾），且总数不超过 Anthropic 的 4 个上限。
+    ///
+    /// 中段断点的动机：`context_edit` 原地改写历史中段，只打末尾断点时
+    /// 任何一次改写都会让断点之前全部内容失效。
+    #[test]
+    fn history_gets_mid_and_tail_breakpoints() {
+        let mut messages = to_api_messages(&long_text_history(10), false);
+        place_history_breakpoints(&mut messages);
+
+        let with_cc: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        ApiContentBlock::Text {
+                            cache_control: Some(_),
+                            ..
+                        }
+                    )
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(with_cc.len(), 2, "历史应有两个断点，实际 {with_cc:?}");
+        assert_eq!(*with_cc.last().unwrap(), 9, "末尾断点必须在最后一条");
+        assert!(with_cc[0] < 9, "另一个断点必须在中段");
+        // 总预算：system 1 + tools 1 + 历史 2 = 4。
+        assert!(with_cc.len() + 2 <= 4, "断点总数不得超过 4");
+    }
+
+    /// 短历史（1 条）时只能打末尾断点，不能越界。
+    #[test]
+    fn single_message_history_gets_one_breakpoint() {
+        let mut messages = to_api_messages(&long_text_history(1), false);
+        place_history_breakpoints(&mut messages);
+        let count = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| {
+                matches!(
+                    b,
+                    ApiContentBlock::Text {
+                        cache_control: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    /// 以 Image / Thinking 结尾时，断点要向前回退到可承载的块。
+    #[test]
+    fn breakpoint_falls_back_from_image_and_thinking_blocks() {
+        let mut messages = to_api_messages(
+            &[
+                Message::user("hello"),
+                Message {
+                    role: crate::types::Role::Assistant,
+                    content: vec![ContentBlock::Thinking {
+                        thinking: "reasoning".to_string(),
+                        signature: "sig".to_string(),
+                        reasoning_details: None,
+                    }],
+                },
+                Message {
+                    role: crate::types::Role::User,
+                    content: vec![ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "AAAA".to_string(),
+                    }],
+                },
+            ],
+            true,
+        );
+        place_history_breakpoints(&mut messages);
+        // 末尾两条（Thinking / Image）都不能承载，断点必须落回第 0 条。
+        assert!(
+            messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(
+                    b,
+                    ApiContentBlock::Text {
+                        cache_control: Some(_),
+                        ..
+                    }
+                )),
+            "不能因为结尾是 Image/Thinking 就放弃断点"
+        );
+    }
+
+    fn long_text_history(n: usize) -> Vec<Message> {
+        (0..n)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Message::user(format!("user turn {i}"))
+                } else {
+                    Message {
+                        role: crate::types::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: format!("assistant turn {i}"),
+                        }],
+                    }
+                }
+            })
+            .collect()
     }
 
     #[test]

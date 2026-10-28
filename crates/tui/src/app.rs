@@ -933,6 +933,7 @@ async fn run_rewind_in_background(
                 file_text,
                 messages: sess.messages.clone(),
                 compact_count: sess.compact_count,
+                compact_generation: sess.compact_generation,
                 turns,
             })
         }
@@ -954,6 +955,7 @@ async fn run_branch_in_background(
     confirmed: bool,
     session: &Arc<Mutex<Session>>,
     shared_agent: &Arc<std::sync::RwLock<Arc<Agent>>>,
+    session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
 ) -> anyhow::Result<BranchSwitch> {
     let store = wyj_core::CheckpointStore::configured(sessions.dir(), session_id.to_string())?;
     let id = resolve_tui_checkpoint_id(&store, checkpoint_id)?;
@@ -995,6 +997,18 @@ async fn run_branch_in_background(
     let new_session_id = branch.session_id.clone();
     let turns = branch.turns;
     *sess = Session::new();
+    // 分支是新会话：日志必须指向新 id，否则后续消息会继续写进父会话的
+    // jsonl，下次 resume 父会话时多出一段根本不属于它的历史。
+    wyj_core::session_journal::SessionJournal::attach_session(
+        &mut sess,
+        sessions.dir(),
+        &new_session_id,
+    );
+    // 滚动文档同理：它是按会话存的，沿用父会话的文档会让新分支继承
+    // 别人的现场，且 `covered_messages` 对不上、增量会算错。
+    if let Some(memory) = session_memory {
+        memory.retarget(&new_session_id);
+    }
     sess.messages = branch.messages.clone();
     sess.current_checkpoint_id = branch.current_checkpoint_id;
     sess.branch_parent_session_id = branch.branch_parent_session_id;
@@ -1003,6 +1017,7 @@ async fn run_branch_in_background(
     // 文件）。内存 Session 也要带上，否则下一次 autosave 会把新分支文件里的
     // 这个字段覆盖成 None，`--resume` 分支时又悄悄回到全局默认端点。
     sess.session_profile = branch.session_profile.clone();
+    sess.compact_generation = branch.compact_generation;
     drop(sess);
     retarget_agent_session(shared_agent, Some(sessions), &new_session_id);
 
@@ -1011,6 +1026,7 @@ async fn run_branch_in_background(
         checkpoint_id,
         messages: branch.messages,
         turns,
+        compact_generation: branch.compact_generation,
     })
 }
 
@@ -2016,6 +2032,9 @@ pub struct AppState {
     /// 而"系统替我丢过历史"这件事必须可见，否则自动管理就成了黑盒。
     /// 精确分解走 `/context`（与压缩阈值同源）。
     pub compact_count: u32,
+    /// 当前摘要的代际（0 = 未压缩）。与 `compact_count` 分开：前者「压了几次」，
+    /// 后者「摘要叠了几层」，只有后者反映保真度。
+    pub compact_generation: u32,
     pub tool_schema_tokens: u32,
     pub tool_schema_tokens_saved: u32,
     pub cwd: PathBuf,
@@ -2395,6 +2414,7 @@ impl AppState {
             session_latency: wyj_core::session::TurnLatency::default(),
             total_output_tokens: 0,
             compact_count: 0,
+            compact_generation: 0,
             tool_schema_tokens: 0,
             tool_schema_tokens_saved: 0,
             cwd,
@@ -2608,6 +2628,7 @@ impl AppState {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
         self.compact_count = 0;
+        self.compact_generation = 0;
         self.tool_schema_tokens = 0;
         self.tool_schema_tokens_saved = 0;
         self.turns = 0;
@@ -3078,6 +3099,9 @@ pub async fn run_tui(
     // 于是这两个参数在 TUI 入口下静默失效（Plan 模式尤其致命：它的存在
     // 意义恰恰主要在 TUI 里）。
     permission_constraints: PermissionConstraints,
+    // 会话滚动工作文档。压缩时优先 splice 它而不是跑一次全量摘要往返；
+    // 会话切换时 retarget 到新 id（文档是按会话存的）。
+    session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -3130,6 +3154,7 @@ pub async fn run_tui(
         workspace_cas,
         session_conflict,
         permission_constraints,
+        session_memory,
     )
     .await;
 
@@ -3634,6 +3659,7 @@ fn spawn_agent_turn(
             input: sess.total_input_tokens,
             output: sess.total_output_tokens,
             compact_count: sess.compact_count,
+            compact_generation: sess.compact_generation,
             tool_schema_tokens: sess.tool_schema_tokens_last,
             tool_schema_tokens_saved: sess.tool_schema_tokens_saved,
             latency: sess.latency,
@@ -4849,6 +4875,8 @@ async fn tui_main(
     session_conflict: Option<SessionConflictInfo>,
     // CLI 启动参数带来的权限约束（`--allowed-tools` / `--allow-plan-write`）。
     permission_constraints: PermissionConstraints,
+    // 会话滚动工作文档。压缩时优先 splice 它；会话切换时 retarget。
+    session_memory: Option<Arc<wyj_core::session_memory::SessionMemory>>,
 ) -> Result<Option<String>> {
     // 主循环与各 turn task 都要读它（切模式时重算、建 ctx 时注入 plan 授权），
     // 所以内部持一份 clone，参数本身留给调用方。
@@ -5017,11 +5045,22 @@ async fn tui_main(
         init_sess.restore_usage_from(&file);
     }
     init_sess.messages = initial_messages;
+    // 主会话增量日志：`.json` 只在 save 时整份重写，而 autosave 是
+    // fire-and-forget，两次 save 之间被 SIGKILL 会丢掉整轮。日志是旁路，
+    // `SessionStore::load` 会合并比快照多出来的尾巴。
+    if let Some(store) = &session_store {
+        wyj_core::session_journal::SessionJournal::attach_session(
+            &mut init_sess,
+            store.dir(),
+            &current_session_id,
+        );
+    }
     if has_initial {
         state.total_input_tokens = init_sess.total_input_tokens;
         state.total_output_tokens = init_sess.total_output_tokens;
         state.welcome_frozen = true;
         state.compact_count = init_sess.compact_count;
+        state.compact_generation = init_sess.compact_generation;
         state.messages = reconstruct_display(&init_sess.messages);
         state.messages.push(ChatMessage::system(format!(
             "已恢复会话  共 {} 条消息",
@@ -5694,8 +5733,21 @@ async fn tui_main(
                                             }
                                         }
                                         *sess = Session::new();
-                                        drop(sess);
                                         current_session_id = new_session_id();
+                                        // 新会话换一份新 sink：沿用旧 sink 会把这个
+                                        // 会话的历史写进上一个会话的 jsonl。
+                                        if let Some(store) = &session_store {
+                                            wyj_core::session_journal::SessionJournal::attach_session(
+                                                &mut sess,
+                                                store.dir(),
+                                                &current_session_id,
+                                            );
+                                        }
+                                        // 滚动文档同样换目标：它是按会话存的。
+                                        if let Some(memory) = &session_memory {
+                                            memory.retarget(&current_session_id);
+                                        }
+                                        drop(sess);
                                         state.reset_for_new_session();
                                         state.current_session_id = current_session_id.clone();
                                         retarget_agent_session(
@@ -5764,7 +5816,23 @@ async fn tui_main(
                                                         reconstruct_display(&file.messages);
                                                     sess.restore_usage_from(&file);
                                                     sess.messages = file.messages;
+                                                    // 换会话必须换 sink：否则这个会话
+                                                    // 的历史会续写进上一个会话的 jsonl。
+                                                    if let Some(store) = &session_store {
+                                                        wyj_core::session_journal::SessionJournal::attach_session(
+                                                            &mut sess,
+                                                            store.dir(),
+                                                            &file.session_id,
+                                                        );
+                                                    }
+                                                    // 滚动文档同理：它按会话存，沿用旧文档
+                                                    // 会让这个会话继承别的会话的现场。
+                                                    if let Some(memory) = &session_memory {
+                                                        memory.retarget(&file.session_id);
+                                                    }
                                                     let compact_count = sess.compact_count;
+                                                    let compact_generation =
+                                                        sess.compact_generation;
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -5780,6 +5848,7 @@ async fn tui_main(
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
                                                     state.compact_count = compact_count;
+                                                    state.compact_generation = compact_generation;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;
@@ -8776,9 +8845,14 @@ async fn tui_main(
                                 api_calls,
                                 prompt_cache_state,
                                 compact_count,
+                                compact_generation,
                                 context_edit,
                                 prompt_drift,
                                 sub_usage,
+                                aux_usage,
+                                cache_attribution,
+                                reasoning_tokens,
+                                api_attempts,
                             ) = match try_session_lock(&session) {
                                 Some(sess) => {
                                     // 优先用 Agent 侧算好的 request 级分解（与自动压缩
@@ -8800,6 +8874,7 @@ async fn tui_main(
                                         sess.api_calls,
                                         sess.prompt_cache_state,
                                         sess.compact_count,
+                                        sess.compact_generation,
                                         (
                                             wyj_core::context_edit::elided_count(&sess.messages)
                                                 as u32,
@@ -8812,6 +8887,25 @@ async fn tui_main(
                                         // `/resume` 后归零。子 Agent 的开销大头恰恰是
                                         // 缓存命中，丢掉它 /cost 会少算一大截。
                                         sess.sub_usage(),
+                                        // 辅助往返（标题 / 分类器 / 记忆 / 演化）：
+                                        // 与子 Agent 一样必须从 Session 读，否则
+                                        // `/resume` 后归零、且看不到真实花费。
+                                        wyj_core::aux_usage::AuxUsage {
+                                            input: sess.aux_input_tokens,
+                                            output: sess.aux_output_tokens,
+                                            cache_read: sess.aux_cache_read_tokens,
+                                            calls: sess.aux_calls,
+                                        },
+                                        // 缓存掉量归因：回答「缓存为什么掉了」。
+                                        wyj_core::cache_attribution::attribute(
+                                            &sess.cache_samples,
+                                            &sess.cache_fingerprints,
+                                        ),
+                                        // 思考 token：区分「贵在思考」与「贵在正文」。
+                                        sess.total_reasoning_tokens,
+                                        // 尝试次数（含失败重试）：与成功往返数的
+                                        // 差值就是重试开销。
+                                        sess.api_attempts,
                                     )
                                 }
                                 None => {
@@ -8831,12 +8925,21 @@ async fn tui_main(
                                         0,
                                         0,
                                         state.compact_count,
+                                        state.compact_generation,
                                         (0, 0),
                                         // 回合进行中拿不到 session，漂移信息一并降级为
                                         // None（= 不知道）。`/context` 不在 `runs_while_busy`
                                         // 白名单里，这条分支实际不会被它命中。
                                         None::<wyj_core::prompt_fingerprint::PromptDrift>,
                                         wyj_core::session::SubUsage::default(),
+                                        wyj_core::aux_usage::AuxUsage::default(),
+                                        // 回合进行中拿不到 session，归因一并降级为
+                                        // None（= 不知道）。`/cost` 不在 `runs_while_busy`
+                                        // 白名单里，这条分支实际不会被它命中。
+                                        None::<wyj_core::cache_attribution::CacheAttribution>,
+                                        // 思考 token 同样拿不到。
+                                        0,
+                                        0,
                                     )
                                 }
                             };
@@ -8856,6 +8959,7 @@ async fn tui_main(
                                 prompt_drift,
                                 last_latency: state.session_latency,
                                 compact_count,
+                                compact_generation,
                                 context_edit,
                                 home_dir: std::env::var("HOME")
                                     .map(std::path::PathBuf::from)
@@ -8864,6 +8968,13 @@ async fn tui_main(
                                 sub_output_tokens: sub_usage.output,
                                 sub_cache_read_tokens: sub_usage.cache_read,
                                 sub_cache_write_tokens: sub_usage.cache_write,
+                                aux_input_tokens: aux_usage.input,
+                                aux_output_tokens: aux_usage.output,
+                                aux_cache_read_tokens: aux_usage.cache_read,
+                                aux_calls: aux_usage.calls,
+                                cache_attribution,
+                                reasoning_tokens,
+                                api_attempts,
                                 effective_mcp_count: wyj_store::mcp_install::effective_mcp_servers(
                                     &state.config,
                                     &cwd,
@@ -8955,6 +9066,7 @@ async fn tui_main(
                                         state.total_input_tokens = 0;
                                         state.total_output_tokens = 0;
                                         state.compact_count = 0;
+                                        state.compact_generation = 0;
                                         state.tool_schema_tokens = 0;
                                         state.tool_schema_tokens_saved = 0;
                                         state.clear_pending_uploads();
@@ -9004,6 +9116,13 @@ async fn tui_main(
                                             );
                                         }
                                         sess.clear_conversation();
+                                        // 滚动工作文档按会话存，`/clear` 换的是对话
+                                        // 内容：留着它会让**新对话**的第一次压缩把
+                                        // 上一段对话的摘要 splice 进来（文档仍可用，
+                                        // 只是内容属于已经清掉的历史）。
+                                        if let Some(memory) = &session_memory {
+                                            memory.clear();
+                                        }
                                         // 必须置位落盘标记：否则 /clear 只清内存，磁盘上的
                                         // <session_id>.json 仍是清空前的完整历史，用户
                                         // 随后退出或崩溃时 `-c` 会把旧对话原样恢复。
@@ -9034,12 +9153,17 @@ async fn tui_main(
                                                 let mut sess = session_c.lock().await;
                                                 let out = agent_c.compact_context(&mut sess).await;
                                                 // 锁内快照，锁必须先放再发事件
-                                                (out.map_err(|e| e.to_string()), sess.compact_count)
+                                                (
+                                                    out.map_err(|e| e.to_string()),
+                                                    sess.compact_count,
+                                                    sess.compact_generation,
+                                                )
                                             };
                                             let _ = tx
                                                 .send(AgentEvent::CompactFinished {
                                                     result: result.0,
                                                     compact_count: result.1,
+                                                    compact_generation: result.2,
                                                 })
                                                 .await;
                                         });
@@ -9098,8 +9222,23 @@ async fn tui_main(
                                                     }
                                                 };
                                                 *sess = Session::new();
+                                                let fresh_id = new_session_id();
+                                                // 新会话换一份新 sink：沿用旧 sink
+                                                // 会把这个会话的历史写进上一个
+                                                // 会话的 jsonl。
+                                                if let Some(store) = &session_store {
+                                                    wyj_core::session_journal::SessionJournal::attach_session(
+                                                        &mut sess,
+                                                        store.dir(),
+                                                        &fresh_id,
+                                                    );
+                                                }
+                                                // 滚动文档同样换目标。
+                                                if let Some(memory) = &session_memory {
+                                                    memory.retarget(&fresh_id);
+                                                }
+                                                current_session_id = fresh_id;
                                             }
-                                            current_session_id = new_session_id();
                                             state.reset_for_new_session();
                                             state.current_session_id = current_session_id.clone();
                                             retarget_agent_session(
@@ -9270,6 +9409,7 @@ async fn tui_main(
                                         let cwd_c = cwd.clone();
                                         let id_c = current_session_id.clone();
                                         let tx = agent_tx.clone();
+                                        let memory_c = session_memory.clone();
                                         state.begin_background_task("/branch".to_string());
                                         let task = spawn_turn_task(async move {
                                             let outcome = run_branch_in_background(
@@ -9281,6 +9421,7 @@ async fn tui_main(
                                                 confirmed,
                                                 &session_c,
                                                 &agent_c,
+                                                memory_c,
                                             )
                                             .await;
                                             let _ = tx
@@ -9574,6 +9715,7 @@ async fn tui_main(
                                                 input: sess.total_input_tokens,
                                                 output: sess.total_output_tokens,
                                                 compact_count: sess.compact_count,
+                                                compact_generation: sess.compact_generation,
                                                 tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
@@ -9733,6 +9875,7 @@ async fn tui_main(
                                                 input: sess.total_input_tokens,
                                                 output: sess.total_output_tokens,
                                                 compact_count: sess.compact_count,
+                                                compact_generation: sess.compact_generation,
                                                 tool_schema_tokens: sess.tool_schema_tokens_last,
                                                 tool_schema_tokens_saved: sess
                                                     .tool_schema_tokens_saved,
@@ -9843,6 +9986,8 @@ async fn tui_main(
                                                         file.branch_parent_checkpoint_id.clone();
                                                     sess.messages = file.messages;
                                                     let compact_count = sess.compact_count;
+                                                    let compact_generation =
+                                                        sess.compact_generation;
                                                     let plan_approved =
                                                         has_plan_approved(&sess.messages);
                                                     drop(sess);
@@ -9858,6 +10003,7 @@ async fn tui_main(
                                                     state.total_input_tokens = file.input_tokens;
                                                     state.total_output_tokens = file.output_tokens;
                                                     state.compact_count = compact_count;
+                                                    state.compact_generation = compact_generation;
                                                     state.turns = file.turns;
                                                     state.frozen_up_to = 0;
                                                     state.welcome_frozen = true;

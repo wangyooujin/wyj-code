@@ -159,6 +159,109 @@ fn tool_name_index(messages: &[Message]) -> std::collections::HashMap<String, St
     map
 }
 
+/// 一条 tool_use 的「可弃性」信号来源。
+///
+/// 只记**能判定价值**的几个字段：工具名、目标路径（Read/Edit/Write 的
+/// `file_path`）、命令（Bash 的 `command`）。
+///
+/// ## 为什么需要它
+///
+/// `protect_recent = 3` 是**纯位置**语义：它只知道「最近 3 个」，不知道
+/// 「这 3 个里有没有值得留的」。两种失效场景都很常见：
+///
+///   - 工具密集任务里那 3 条恰好是三次巨型 `Read`（收益被吃掉）；
+///   - 纯对话里那 3 条毫无价值（保护窗口被浪费）。
+///
+/// 有了调用参数就能判断更细的价值：被后续 `Edit` 消费过的文件，
+/// 其 `Read` 结果价值已经兑现（模型已经从它那里改对了文件）；同一路径
+/// 后来又被 `Read` 过，旧的那份是冗余的。
+#[derive(Debug, Clone)]
+struct ToolCallInfo {
+    /// `Read` / `Edit` / `Write` / `NotebookEdit` 的 `file_path`。
+    ///
+    /// 只记路径不记工具名：工具名已由 `is_elidable_tool` 在清理循环里
+    /// 判过一轮，价值判定只关心「这次结果指向哪个文件」。
+    path: Option<String>,
+}
+
+fn tool_call_index(messages: &[Message]) -> std::collections::HashMap<String, ToolCallInfo> {
+    let mut map = std::collections::HashMap::new();
+    for block in messages.iter().flat_map(|m| m.content.iter()) {
+        let ContentBlock::ToolUse { id, input, .. } = block else {
+            continue;
+        };
+        let path = input
+            .get("file_path")
+            .or_else(|| input.get("path"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        map.insert(id.clone(), ToolCallInfo { path });
+    }
+    map
+}
+
+/// 某条工具结果的「已兑现」程度：后面是否已经有工具消费了它的产物。
+///
+/// 返回 true 的两种情形（都意味着这条结果的信息**已经被用掉了**）：
+///
+///   1. **被写操作消费**：`Read(f)` 之后出现了 `Edit(f)` / `Write(f)`。
+///      模型已经从那次读取里提取出需要的东西并落地了，原文不再有增量价值。
+///   2. **同路径重复读**：`Read(f)` 之后又 `Read(f)`。后一次是前一次的
+///      超集（文件可能变了，新内容才是准的），旧的可以被新内容替代。
+///
+/// 注意判据只看向**后**：向前看会把「后来被改掉的文件」误判成已兑现——
+/// 那次读取恰好是改动前的基线，价值最高。
+fn is_fulfilled(
+    positions: &[(usize, usize)],
+    index: usize,
+    calls: &std::collections::HashMap<String, ToolCallInfo>,
+    messages: &[Message],
+) -> bool {
+    let (mi, bi) = positions[index];
+    let Some(call) = tool_use_for_result(&messages[mi].content[bi], calls) else {
+        return false;
+    };
+    let Some(path) = call.path.as_deref() else {
+        return false;
+    };
+    // 收集本块之后的所有工具调用。
+    let mut seen_later = false;
+    'outer: for (offset, message) in messages[mi..].iter().enumerate() {
+        for (later_bi, block) in message.content.iter().enumerate() {
+            if offset == 0 && later_bi <= bi {
+                continue;
+            }
+            let ContentBlock::ToolUse { name, input, .. } = block else {
+                continue;
+            };
+            let later_path = input
+                .get("file_path")
+                .or_else(|| input.get("path"))
+                .and_then(|v| v.as_str());
+            if later_path != Some(path) {
+                continue;
+            }
+            // 写操作消费了这次读取；或又一次读取使旧结果冗余。
+            if matches!(name.as_str(), "Edit" | "Write" | "NotebookEdit" | "Read") {
+                seen_later = true;
+                break 'outer;
+            }
+        }
+    }
+    seen_later
+}
+
+/// 从 tool_result 块找回它对应的 tool_use 信息。
+fn tool_use_for_result<'a>(
+    block: &ContentBlock,
+    calls: &'a std::collections::HashMap<String, ToolCallInfo>,
+) -> Option<&'a ToolCallInfo> {
+    let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+        return None;
+    };
+    calls.get(tool_use_id.as_str())
+}
+
 /// 找出所有 tool_result 的位置（消息下标 + 块下标），按出现顺序。
 fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
@@ -176,8 +279,25 @@ fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
 fn is_elided(content: &ToolResultContent) -> bool {
     match content {
         ToolResultContent::Text(t) => t.starts_with(ELIDED_MARKER),
-        _ => false,
+        // `Parts` 形态（图片 + 文本）也必须认：清理时文本段被换成了占位符，
+        // 而图片段保持不变。不认的话会有两个后果：
+        //   1. resume 时 `materialize_elided` 跳过它，原文永久只剩占位符；
+        //   2. 下一轮清理把它再当成「未清理」重新 intern 一次，每轮一个新
+        //      blob（占位符里带大小/首行，内容每轮都变）→ CAS 无界增长。
+        ToolResultContent::Parts(parts) => parts.iter().any(|part| match part {
+            ToolResultPart::Text { text, .. } => text.starts_with(ELIDED_MARKER),
+            ToolResultPart::Image { .. } => false,
+        }),
+        ToolResultContent::Blocks(_) => false,
     }
+}
+
+/// 从 `Parts` 里取出占位符的 `cas://<hash>`（未清理 / 只有图片时返回 `None`）。
+fn elided_hash_in_parts(parts: &[ToolResultPart]) -> Option<&str> {
+    parts.iter().find_map(|part| match part {
+        ToolResultPart::Text { text, .. } if text.starts_with(ELIDED_MARKER) => elided_hash(text),
+        _ => None,
+    })
 }
 
 /// 把一批过期工具结果外部化到 CAS，原地替换为带 `cas://` 的占位符。
@@ -199,6 +319,7 @@ pub fn elide_tool_results(
     }
 
     let names = tool_name_index(&session.messages);
+    let calls = tool_call_index(&session.messages);
     let positions = tool_result_positions(&session.messages);
     // 最近 protect_recent 个工具结果受保护（按出现顺序，不是按消息下标）。
     let protected_from = positions.len().saturating_sub(opts.protect_recent);
@@ -206,8 +327,19 @@ pub fn elide_tool_results(
     let mut batched = 0usize;
     // 倒着遍历不了——要按「最旧优先」清理（Anthropic 语义），所以正向收集。
     for (idx, &(mi, bi)) in positions.iter().enumerate() {
-        if idx >= protected_from {
-            break;
+        // 保护窗口的**位置语义保留**，但对「已兑现」的结果放宽一格：
+        // 窗口内的结果若已被后续 Edit/Write 消费（或又被读过一次），
+        // 它的信息已经用掉了，没有理由再占着保护额度。
+        //
+        // 只放宽不收缩：窗口外的结果一定可清，窗口内的看价值。这样
+        // `protect_recent` 仍然是最坏情况下的上界——不会出现「本该保护的
+        // 三条全被清掉」。
+        // 注意这里是 `continue` 而不是 `break`：保护窗口是**逐条**判定的，
+        // 窗口内某个结果未兑现不代表后面那个也未兑现。用 `break` 会让
+        // 「窗口内第 1 个未兑现」把后面已兑现的全部挡在门外。
+        let in_window = idx >= protected_from;
+        if in_window && !is_fulfilled(&positions, idx, &calls, &session.messages) {
+            continue;
         }
         if batched >= opts.batch_size {
             break;
@@ -263,16 +395,24 @@ pub fn elide_tool_results(
         };
         match content {
             ToolResultContent::Parts(parts) => {
-                // 保留图片段，只把文本段换成占位符。
+                // 保留图片段，把**所有**文本段收进同一个占位符：只换第一段
+                // 会让剩下的文本留在上下文里（既没真正外化，`freed_tokens`
+                // 还按整块差值计），而每轮清理都会再 intern 一个新 blob。
                 let mut replaced = false;
                 for part in parts.iter_mut() {
                     if let ToolResultPart::Text { text, .. } = part {
-                        *text = placeholder.clone();
-                        replaced = true;
-                        break;
+                        if replaced {
+                            text.clear();
+                        } else {
+                            *text = placeholder.clone();
+                            replaced = true;
+                        }
                     }
                 }
                 if !replaced {
+                    // 只有图片的 `Parts`：内容没被外化，刚 intern 的 blob
+                    // 没有任何引用者，必须立刻归还，否则引用计数只增不减。
+                    let _ = cas.release(&hash);
                     continue;
                 }
             }
@@ -350,30 +490,57 @@ pub fn materialize_elided(messages: &mut [Message], cas: Option<&WorkspaceCas>) 
         let ContentBlock::ToolResult { content, .. } = block else {
             continue;
         };
-        let ToolResultContent::Text(text) = content else {
-            continue;
-        };
-        let Some(hash) = elided_hash(text).map(str::to_string) else {
-            continue;
-        };
-        match cas.get(&hash) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(full) => {
-                    *text = full;
+        match content {
+            ToolResultContent::Text(text) => {
+                let Some(hash) = elided_hash(text).map(str::to_string) else {
+                    continue;
+                };
+                if restore_from_cas(cas, &hash, text) {
                     restored += 1;
                 }
-                Err(error) => {
-                    tracing::warn!("CAS blob {hash} 不是合法 UTF-8，保留占位符: {error}");
-                }
-            },
-            Err(error) => {
-                // blob 已被 gc：保留占位符，模型仍可看到"这里曾经有过内容"的
-                // 线索并自行重跑工具，而不是看到空洞。
-                tracing::debug!("CAS blob {hash} 已不存在，保留占位符: {error}");
             }
+            // `Parts` 形态：占位符只占据其中一段文本，图片段原样保留。
+            // 不处理这条分支的话，resume 后模型看到的是占位符而不是原文，
+            // 而文件里明明写着「CAS 里有完整内容」——两套语义不一致。
+            ToolResultContent::Parts(parts) => {
+                let Some(hash) = elided_hash_in_parts(parts).map(str::to_string) else {
+                    continue;
+                };
+                for part in parts.iter_mut() {
+                    if let ToolResultPart::Text { text, .. } = part {
+                        if text.starts_with(ELIDED_MARKER) && restore_from_cas(cas, &hash, text) {
+                            restored += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            ToolResultContent::Blocks(_) => {}
         }
     }
     restored
+}
+
+/// 从 CAS 取回原文写回占位符。返回是否真的还原。
+fn restore_from_cas(cas: &WorkspaceCas, hash: &str, slot: &mut String) -> bool {
+    match cas.get(hash) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(full) => {
+                *slot = full;
+                true
+            }
+            Err(error) => {
+                tracing::warn!("CAS blob {hash} 不是合法 UTF-8，保留占位符: {error}");
+                false
+            }
+        },
+        Err(error) => {
+            // blob 已被 gc：保留占位符，模型仍可看到"这里曾经有过内容"的
+            // 线索并自行重跑工具，而不是看到空洞。
+            tracing::debug!("CAS blob {hash} 已不存在，保留占位符: {error}");
+            false
+        }
+    }
 }
 
 /// 从占位符取回原文（`ContextRecall` 工具的底层）。
@@ -514,6 +681,154 @@ mod tests {
             .collect();
         let start = all.len().saturating_sub(n);
         all.split_off(start)
+    }
+
+    /// 保护窗口内的结果，若它的信息**已被后续写操作消费**，可以不保护。
+    ///
+    /// 这条钉的是「位置语义」的具体失效场景：`Read(f)` → `Edit(f)` 之后，
+    /// 那次读取的原文已经完成了它的价值（模型已经从它那里提取出要改的东西
+    /// 并落地了），再占着 3 个保护名额只是在浪费清理额度。
+    #[test]
+    fn a_read_consumed_by_a_later_edit_leaves_the_protection_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = WorkspaceCas::open(dir.path(), 16 * 1024 * 1024).unwrap();
+        let mut session = Session::new();
+
+        // 3 条较早的工具结果（会被正常清掉）
+        for i in 0..3 {
+            push_read_pair(&mut session, &format!("old{i}.rs"), 5_000);
+        }
+        // 最近 3 个里的第 1 个：Read 后紧跟 Edit —— 已兑现
+        push_read_pair(&mut session, "consumed.rs", 5_000);
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "edit-1".into(),
+                name: "Edit".into(),
+                input: serde_json::json!({"file_path": "consumed.rs"}),
+            }],
+        });
+        session.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "edit-1".into(),
+                content: ToolResultContent::text("ok"),
+                is_error: false,
+            }],
+        });
+        // 最近 3 个里的另外 2 个：普通 Read，未兑现
+        push_read_pair(&mut session, "keep1.rs", 5_000);
+        push_read_pair(&mut session, "keep2.rs", 5_000);
+
+        let opts = ElideOptions {
+            protect_recent: 3,
+            batch_size: 10,
+            min_bytes: 1_000,
+        };
+        let stats = elide_tool_results(&mut session, &cas, &opts);
+
+        // 3 条旧的 + 1 条已兑现的 = 4 条被清理。
+        assert_eq!(
+            stats.elided, 4,
+            "旧的 3 条 + 已兑现的 1 条都应被清理，实际 {}",
+            stats.elided
+        );
+        // 未兑现的两条必须原样保留（清理后文本会变成 `[context-edited]`
+        // 占位符，所以「仍是原文」就等于「没被清理」）。
+        let kept: Vec<String> = session
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Text(t),
+                    ..
+                } => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kept.iter().any(|t| t.contains("keep1")),
+            "未兑现的 keep1 不该被清理: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|t| t.contains("keep2")),
+            "未兑现的 keep2 不该被清理: {kept:?}"
+        );
+        // consumed.rs 的那次 Read 已兑现 → 原文被换成了占位符。
+        let elided_count = kept.iter().filter(|t| t.starts_with(ELIDED_MARKER)).count();
+        assert_eq!(elided_count, 4, "应有 4 条被占位化（3 旧 + 1 已兑现）");
+    }
+
+    /// 同路径重复读：后一次是前一次的超集，旧的那份冗余。
+    #[test]
+    fn a_reread_of_the_same_path_makes_the_older_result_redundant() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = WorkspaceCas::open(dir.path(), 16 * 1024 * 1024).unwrap();
+        let mut session = Session::new();
+        for i in 0..3 {
+            push_read_pair(&mut session, &format!("old{i}.rs"), 5_000);
+        }
+        // 最近 3 个里：同路径读两次
+        push_read_pair(&mut session, "twice.rs", 5_000);
+        push_read_pair(&mut session, "twice.rs", 5_000);
+        push_read_pair(&mut session, "solo.rs", 5_000);
+
+        let opts = ElideOptions {
+            protect_recent: 3,
+            batch_size: 10,
+            min_bytes: 1_000,
+        };
+        let stats = elide_tool_results(&mut session, &cas, &opts);
+        assert_eq!(
+            stats.elided, 4,
+            "旧的 3 条 + 重复读的前一次应被清理，实际 {}",
+            stats.elided
+        );
+    }
+
+    /// 保护窗口内**没有**已兑现项时，行为必须与旧版逐字节一致——
+    /// 不能因为引入价值判定就把保护额度悄悄缩小。
+    #[test]
+    fn an_unfulfilled_window_is_protected_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = WorkspaceCas::open(dir.path(), 16 * 1024 * 1024).unwrap();
+        let mut session = Session::new();
+        for i in 0..3 {
+            push_read_pair(&mut session, &format!("old{i}.rs"), 5_000);
+        }
+        for i in 0..3 {
+            push_read_pair(&mut session, &format!("fresh{i}.rs"), 5_000);
+        }
+
+        let opts = ElideOptions {
+            protect_recent: 3,
+            batch_size: 10,
+            min_bytes: 1_000,
+        };
+        let stats = elide_tool_results(&mut session, &cas, &opts);
+        assert_eq!(stats.elided, 3, "只清旧的 3 条，最近 3 条全部保留");
+    }
+
+    /// 造一对 `Read(path)` → tool_result。
+    fn push_read_pair(session: &mut Session, path: &str, bytes: usize) {
+        let id = format!("read-{path}-{}", session.messages.len());
+        session.messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.clone(),
+                name: "Read".into(),
+                input: serde_json::json!({ "file_path": path }),
+            }],
+        });
+        session.messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: ToolResultContent::text(format!("{path} 的内容 {}", "x".repeat(bytes))),
+                is_error: false,
+            }],
+        });
     }
 
     #[test]

@@ -193,6 +193,60 @@ pub struct AutoClassifierUsage {
     pub requests: u32,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// 命中缓存而**省掉**的分类器往返次数。
+    ///
+    /// 与 `requests` 并列而不是混进去：`requests` 是真实花掉的钱，
+    /// 这个是省下来的。混在一起会让「每次判定多少钱」被系统性低估。
+    pub cache_hits: u32,
+}
+
+/// 分类器判定缓存（会话级）。
+///
+/// 见 `AutoGateImpl::verdict_cache` 的文档。用 `VecDeque` 做 FIFO 而不是
+/// `HashMap` 无界增长：一个长会话里输入组合可能上千种，而命中收益集中在
+/// 「最近反复在跑的那几条命令」上。容量 128 条足够覆盖典型工作集。
+#[derive(Debug, Default)]
+struct AutoVerdictCache {
+    entries: std::collections::VecDeque<(String, AutoVerdict)>,
+}
+
+impl AutoVerdictCache {
+    /// 缓存容量。128 条 × 每条几十字节 ≈ 几 KB，内存可忽略。
+    const CAPACITY: usize = 128;
+
+    fn get(&self, key: &str) -> Option<AutoVerdict> {
+        self.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn insert(&mut self, key: String, verdict: AutoVerdict) {
+        if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
+            self.entries.remove(pos);
+        }
+        self.entries.push_back((key, verdict));
+        while self.entries.len() > Self::CAPACITY {
+            self.entries.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// 判定缓存的键：工具名 + 规范化输入 + 本轮用户目标。
+///
+/// `input` 走 `serde_json::to_string`（`Map` 是 `BTreeMap` 语义、键序稳定），
+/// 而不是 hash：哈希碰撞会把 A 的放行结论套到 B 上，而这是安全判定。
+fn verdict_cache_key(request: &AutoReviewRequest) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        request.tool,
+        serde_json::to_string(&request.input).unwrap_or_default(),
+        request.user_goal
+    )
 }
 
 /// 生产实现：确定性规则层 + 可选模型分类器。
@@ -208,6 +262,30 @@ pub struct AutoGateImpl {
     classifier_off: AtomicBool,
     counters: Mutex<AutoCounters>,
     usage: Mutex<AutoClassifierUsage>,
+    /// 会话级统一辅助用量 sink（`None` = 未注入，只记本实例的 `usage`）。
+    /// 见 `crate::aux_usage` 的模块文档：分类器往返是五类「拿不到
+    /// `&mut Session`」的调用之一。
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
+    /// 分类器判定的**结果缓存**：同工具 + 同输入指纹 → 上次的判定。
+    ///
+    /// ## 为什么需要（实测动机）
+    ///
+    /// Auto 模式下每个未授权工具都要一次完整 LLM 往返（默认超时 30s）。
+    /// 而实际会话里大量调用是**逐字重复**的：反复跑同一条 `cargo test`、
+    /// 反复读同一个目录、同一批 `git status`。旧实现每次都重新问一遍，
+    /// 一次回合里几十次串行等待，而且这些等待是**串行**的（需确认的调用
+    /// 不进并发组）。
+    ///
+    /// 缓存只解决「完全相同的问题不重复问」，不改任何判定语义：键是
+    /// `工具名 + 规范化输入 + user_goal`，三者全同才命中。
+    ///
+    /// ## 为什么把 `user_goal` 也放进键
+    ///
+    /// 分类器的核心判断是「这一步是否在用户请求的范围内」。同一个
+    /// `rm -rf build/`，在「清理构建产物」下该放行，在「只读分析这个仓库」
+    /// 下该拦。不带 goal 的缓存会把前者的结论套到后者上——这是安全性质的
+    /// 错误，比多付一次往返严重得多。
+    verdict_cache: Mutex<AutoVerdictCache>,
 }
 
 impl AutoGateImpl {
@@ -218,7 +296,15 @@ impl AutoGateImpl {
             classifier_off: AtomicBool::new(false),
             counters: Mutex::new(AutoCounters::default()),
             usage: Mutex::new(AutoClassifierUsage::default()),
+            aux_usage: None,
+            verdict_cache: Mutex::new(AutoVerdictCache::default()),
         }
+    }
+
+    /// 注入会话级辅助用量 sink（装配期调用）。
+    pub fn with_aux_usage(mut self, sink: Option<crate::aux_usage::SharedAuxUsage>) -> Self {
+        self.aux_usage = sink;
+        self
     }
 
     /// 分类器当前不可用的原因；`None` 表示可用。
@@ -273,6 +359,26 @@ impl AutoGateImpl {
             AutoVerdict::AskUser { .. } => {}
         }
         verdict
+    }
+
+    /// 把一次分类器判定写进缓存。**AskUser 不缓存**（见 `verdict_cache` 的文档）。
+    fn remember_verdict(&self, key: &str, verdict: &AutoVerdict) {
+        if matches!(verdict, AutoVerdict::AskUser { .. }) {
+            return;
+        }
+        if let Ok(mut cache) = self.verdict_cache.lock() {
+            cache.insert(key.to_string(), verdict.clone());
+        }
+    }
+
+    /// 清空判定缓存。
+    ///
+    /// 三个调用点：`disable_classifier`（降级后旧结论不再可信）、
+    /// `enable_classifier`（用户显式重新开启，应当重新判定）、以及模式切换。
+    fn clear_verdict_cache(&self) {
+        if let Ok(mut cache) = self.verdict_cache.lock() {
+            cache.clear();
+        }
     }
 
     /// 确定性放行判定：命中返回 `Some(依据)`，未命中返回 `None`。
@@ -423,6 +529,12 @@ impl AutoGateImpl {
             usage.input_tokens += result.input_tokens;
             usage.output_tokens += result.output_tokens;
         }
+        // 同时汇入会话级的统一辅助用量 sink：`self.usage` 只活在这个 gate
+        // 实例里，`/cost` 与 `wyj-code usage` 都读不到它。Auto 模式下分类器
+        // 每拦一个工具就是一次往返，不进 session 等于系统性低估花费。
+        if let Some(sink) = self.aux_usage.as_ref() {
+            sink.record_result(&result);
+        }
 
         let raw = result
             .content
@@ -488,12 +600,41 @@ impl AutoGate for AutoGateImpl {
             };
         }
 
+        // ── 判定缓存 ──────────────────────────────────────────────────────
+        //
+        // 位置必须在两条确定性规则**之后**：确定性 deny/allow 本来就零成本，
+        // 走缓存只是多一次查表；而把缓存放在它们之前会让「hard_deny 的规则
+        // 被用户改过之后」仍命中旧结论。
+        //
+        // 缓存只存 Allow / Deny，**不存 AskUser**：AskUser 的语义是「这次
+        // 没判出来，交给人」，把它缓存下来等于把一次端点抖动固化成永久行为。
+        let cache_key = verdict_cache_key(request);
+        if let Some(cached) = self
+            .verdict_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key))
+        {
+            tracing::debug!(
+                tool = %request.tool,
+                "auto 判定命中缓存，跳过分类器往返"
+            );
+            if let Ok(mut usage) = self.usage.lock() {
+                usage.cache_hits = usage.cache_hits.saturating_add(1);
+            }
+            return self.apply_verdict(cached);
+        }
+
         match self.call_classifier(request).await {
-            Ok(verdict) => self.apply_verdict(verdict),
+            Ok(verdict) => {
+                self.remember_verdict(&cache_key, &verdict);
+                self.apply_verdict(verdict)
+            }
             // 第一次拿不到判定：换个（加提示、加预算的）输入重试一次。
             Err(_) => match self.call_classifier_attempt(request, true).await {
                 Ok(verdict) => {
                     tracing::info!("分类器首次调用失败，重试后拿到判定");
+                    self.remember_verdict(&cache_key, &verdict);
                     self.apply_verdict(verdict)
                 }
                 // 两次都拿不到判定 → **交回人工**，而不是直接拒绝。
@@ -533,10 +674,15 @@ impl AutoGate for AutoGateImpl {
 
     fn disable_classifier(&self) {
         self.classifier_off.store(true, Ordering::Relaxed);
+        // 降级后旧结论不再可信：用户之所以降级，往往正是因为分类器判错了。
+        // 留着缓存等于让「判错的那条」继续生效，而后续调用连重判的机会都没有。
+        self.clear_verdict_cache();
     }
 
     fn enable_classifier(&self) {
         self.classifier_off.store(false, Ordering::Relaxed);
+        // 显式重新开启 → 重新判定，不复用降级前的结论。
+        self.clear_verdict_cache();
         if let Ok(mut counters) = self.counters.lock() {
             // `total` 也必须清：它只增不减，而 `should_degrade` 是
             // `consecutive >= 连续阈值 || total >= 累计阈值`。只清 consecutive
@@ -561,6 +707,19 @@ impl AutoGate for AutoGateImpl {
 /// 或构建失败时**降级为无分类器**而不是 panic——那时 auto 模式退化成"确定性规则
 /// + 其余逐次弹窗"，仍然是一个正确（只是更啰嗦）的会话。
 pub fn build_gate(config: &wyj_config::Config, provider: Arc<dyn Provider>) -> Arc<dyn AutoGate> {
+    build_gate_with_usage(config, provider, None)
+}
+
+/// 同 [`build_gate`]，但把分类器往返的用量汇入会话级 sink。
+///
+/// 分类器是「五类拿不到 `&mut Session` 的辅助往返」之一（见
+/// `crate::aux_usage`）：Auto 模式下每拦一个工具就是一次完整模型往返，
+/// 一次会话几十次很常见。不接 sink 的话这部分花费在 `/cost` 里完全不可见。
+pub fn build_gate_with_usage(
+    config: &wyj_config::Config,
+    provider: Arc<dyn Provider>,
+    aux_usage: Option<crate::aux_usage::SharedAuxUsage>,
+) -> Arc<dyn AutoGate> {
     let cfg = &config.auto_mode;
     let classifier: Option<Arc<dyn Provider>> = {
         let name = cfg.classifier_profile.trim();
@@ -585,23 +744,26 @@ pub fn build_gate(config: &wyj_config::Config, provider: Arc<dyn Provider>) -> A
             }
         }
     };
-    Arc::new(AutoGateImpl::new(
-        AutoGateConfig {
-            enabled: cfg.enabled,
-            timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
-            max_consecutive_blocks: cfg.max_consecutive_blocks.max(1),
-            max_total_blocks: cfg.max_total_blocks.max(1),
-            classify_all_shell: cfg.classify_all_shell,
-            rules: AutoRuleOverrides {
-                hard_deny: cfg.hard_deny.clone(),
-                soft_deny: cfg.soft_deny.clone(),
-                allow: cfg.allow.clone(),
-                environment: cfg.environment.clone(),
-            }
-            .resolve(),
-        },
-        classifier,
-    ))
+    Arc::new(
+        AutoGateImpl::new(
+            AutoGateConfig {
+                enabled: cfg.enabled,
+                timeout: Duration::from_secs(cfg.timeout_secs.max(1)),
+                max_consecutive_blocks: cfg.max_consecutive_blocks.max(1),
+                max_total_blocks: cfg.max_total_blocks.max(1),
+                classify_all_shell: cfg.classify_all_shell,
+                rules: AutoRuleOverrides {
+                    hard_deny: cfg.hard_deny.clone(),
+                    soft_deny: cfg.soft_deny.clone(),
+                    allow: cfg.allow.clone(),
+                    environment: cfg.environment.clone(),
+                }
+                .resolve(),
+            },
+            classifier,
+        )
+        .with_aux_usage(aux_usage),
+    )
 }
 
 /// 按字节上限截断并回退到 char boundary，避免中文/emoji 被切在半个字符上。
@@ -785,6 +947,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
             })
         }
 
@@ -858,6 +1021,105 @@ mod tests {
         assert!(parse_classifier_output("I think it is fine").is_err());
         assert!(parse_classifier_output("{\"verdict\":\"maybe\"}").is_err());
         assert!(parse_classifier_output("").is_err());
+    }
+
+    /// 完全相同的判定请求必须命中缓存，不再发第二次模型往返。
+    ///
+    /// 动机：Auto 模式下每个未授权工具一次完整 LLM 往返，而实际会话里大量
+    /// 调用是逐字重复的（反复跑同一条 `cargo test`）。这些等待还是**串行**的
+    /// ——需确认的调用不进并发组。
+    #[tokio::test]
+    async fn identical_review_hits_cache_and_skips_model() {
+        let provider = FakeProvider::allow();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        let req = bash_request("npm run deploy:staging");
+
+        let first = gate.review(&req).await;
+        assert!(matches!(first, AutoVerdict::Allow));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "首次必须问模型");
+
+        let second = gate.review(&req).await;
+        assert_eq!(second, first, "缓存必须返回同一判定");
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "第二次必须命中缓存，不再发请求"
+        );
+        assert_eq!(gate.usage().cache_hits, 1);
+    }
+
+    /// `user_goal` 不同则**不能**命中缓存。
+    ///
+    /// 这是安全性质的钉子：分类器的核心判断是「这一步是否在用户请求的范围内」。
+    /// 同一个 `rm -rf build/`，在「清理构建产物」下该放行，在「只读分析」下
+    /// 该拦。把前者的结论套到后者上，比多付一次往返严重得多。
+    #[tokio::test]
+    async fn different_user_goal_misses_cache() {
+        let provider = FakeProvider::allow();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+
+        let mut req = bash_request("npm run deploy:staging");
+        req.user_goal = "清理构建产物".to_string();
+        gate.review(&req).await;
+
+        req.user_goal = "只读分析这个仓库，不要改任何东西".to_string();
+        gate.review(&req).await;
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "goal 不同必须重新判定"
+        );
+        assert_eq!(gate.usage().cache_hits, 0);
+    }
+
+    /// `AskUser` 绝不进缓存：它代表「这次没判出来」，缓存它等于把一次
+    /// 端点抖动固化成永久行为。
+    #[tokio::test]
+    async fn ask_user_verdicts_are_never_cached() {
+        // 两次都失败 → AskUser。缓存命中会让第二次不再尝试。
+        let provider = FakeProvider::delayed("", Duration::ZERO);
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        let req = bash_request("npm run deploy:staging");
+
+        let first = gate.review(&req).await;
+        assert!(matches!(first, AutoVerdict::AskUser { .. }));
+        let calls_after_first = provider.calls.load(Ordering::SeqCst);
+
+        let second = gate.review(&req).await;
+        assert!(matches!(second, AutoVerdict::AskUser { .. }));
+        assert!(
+            provider.calls.load(Ordering::SeqCst) > calls_after_first,
+            "AskUser 不该被缓存，第二次仍要尝试判定"
+        );
+        assert_eq!(gate.usage().cache_hits, 0);
+    }
+
+    /// 降级 / 重新开启都必须清空缓存。
+    #[tokio::test]
+    async fn toggling_classifier_clears_verdict_cache() {
+        let provider = FakeProvider::allow();
+        let gate = gate_with(AutoGateConfig::default(), Some(provider.clone()));
+        let req = bash_request("npm run deploy:staging");
+
+        gate.review(&req).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        // 降级后：缓存清空，且分类器不可用 → 直接 AskUser（不再问模型）。
+        gate.disable_classifier();
+        assert!(matches!(
+            gate.review(&req).await,
+            AutoVerdict::AskUser { .. }
+        ));
+
+        // 重新开启 → 重新判定，不复用降级前的结论。
+        gate.enable_classifier();
+        gate.review(&req).await;
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "重新开启后必须重新问模型"
+        );
     }
 
     #[tokio::test]

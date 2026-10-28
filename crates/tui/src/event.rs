@@ -45,6 +45,9 @@ pub enum AgentEvent {
         input: u32,
         output: u32,
         compact_count: u32,
+        /// 当前摘要的代际（0 = 未压缩）。与 `compact_count` 分开：只有它反映
+        /// 保真度下降。跟着 `Usage` 走是因为采集点与生命周期完全相同。
+        compact_generation: u32,
         tool_schema_tokens: u32,
         tool_schema_tokens_saved: u32,
         /// 本回合的时延画像（TTFT / 总耗时 / 重试开销）。跟着 `Usage` 走而不是
@@ -162,6 +165,8 @@ pub enum AgentEvent {
         result: Result<wyj_core::compact::CompactResult, String>,
         /// 压缩后的自动压缩计数（锁内快照，锁必须先放再发事件）。
         compact_count: u32,
+        /// 压缩后摘要的代际。`/state.compact_generation` 用它同步面板。
+        compact_generation: u32,
     },
     /// 声明了 [`wyj_commands::Command::needs_background`] 的 slash 命令跑完。
     /// 这类命令含子进程 / 网络往返（`gh`、`open`），inline 执行同样冻住主循环。
@@ -202,6 +207,8 @@ pub enum RewindPrepared {
         file_text: String,
         messages: Vec<wyj_api::types::Message>,
         compact_count: u32,
+        /// 回退后历史里那份摘要的代际（`/context` 面板据此提示保真度）。
+        compact_generation: u32,
         turns: usize,
     },
 }
@@ -216,6 +223,10 @@ pub struct BranchSwitch {
     pub checkpoint_id: String,
     pub messages: Vec<wyj_api::types::Message>,
     pub turns: usize,
+    /// 分支历史的摘要代际。分支是「带着一段历史另开一条线」，若归零，
+    /// 下次压缩会把一份第 N 代摘要重新标成第 1 代，那句「细节可能已丢失」
+    /// 的提示随之消失。
+    pub compact_generation: u32,
 }
 
 /// MCP server 后台连接失败的具体原因，供渲染层区分文案

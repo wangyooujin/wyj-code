@@ -206,11 +206,54 @@ struct UsageData {
     completion_tokens: Option<u32>,
     /// OpenAI 服务端自动缓存的命中数（prompt_tokens 已包含它，需要扣减）
     prompt_tokens_details: Option<PromptTokensDetails>,
+    /// 输出侧的细分：其中有多少是**思考** token。
+    ///
+    /// `reasoning_tokens` 是 `completion_tokens` 的**子集**——可见正文 =
+    /// `completion_tokens - reasoning_tokens`。
+    ///
+    /// 为什么值得单独解析：思考 token 按输出价计费，但它对用户不可见。
+    /// 「这次贵在思考还是贵在正文」是两种完全不同的优化方向（前者调低
+    /// effort，后者调输出长度），不拆开就只能给出一个「输出很贵」的
+    /// 无从下手的结论。
+    ///
+    /// 字段名各家略有出入：OpenAI 官方是 `completion_tokens_details`，
+    /// 部分兼容网关把它平铺到 `reasoning_tokens`。两种都收。
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+    /// 部分网关（DeepSeek / 部分中转）把思考数**平铺**在 usage 顶层。
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Deserialize, Debug)]
 struct PromptTokensDetails {
     cached_tokens: Option<u32>,
+}
+
+#[derive(Deserialize, Debug)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+impl UsageData {
+    /// 本次输出里被思考占用的 token 数。
+    ///
+    /// 优先取 `completion_tokens_details.reasoning_tokens`（OpenAI 官方形态），
+    /// 退回顶层的 `reasoning_tokens`（部分兼容网关形态）。
+    ///
+    /// **不会超过 `completion_tokens`**：这是子集关系，若端点报出更大的值
+    /// 说明口径有别的含义（个别网关把它当成独立的思考总量）。按子集口径
+    /// 截断，面板上的「可见正文」才不会变成负数。
+    fn reasoning_tokens(&self) -> u32 {
+        let raw = self
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+            .or(self.reasoning_tokens)
+            .unwrap_or(0);
+        raw.min(self.completion_tokens.unwrap_or(u32::MAX))
+    }
 }
 
 #[derive(Default)]
@@ -278,6 +321,34 @@ fn to_api_messages(
                 }
                 if !tool_results.is_empty() {
                     out.extend(tool_results);
+                    // 同一条 user 消息里既有 tool_result 又有 Text，是**常态**
+                    // 而不是边角：`Session::push_tool_result` 会把验收失败报告、
+                    // 回合中追加的用户指令合并进最后一条 user 消息。旧实现
+                    // 在这里直接丢掉 `text_parts`，模型带着缺失的上下文继续跑
+                    // （验收证据、用户澄清全部静默消失）。
+                    //
+                    // OpenAI 协议要求 `tool` 消息紧邻 assistant 的 `tool_calls`，
+                    // 所以文本只能**后置**成一条独立的 user 消息。
+                    if !text_parts.is_empty() || (supports_vision && !image_parts.is_empty()) {
+                        if supports_vision && !image_parts.is_empty() {
+                            let mut content_parts: Vec<Value> = text_parts
+                                .into_iter()
+                                .map(|t| serde_json::json!({"type": "text", "text": t}))
+                                .collect();
+                            content_parts.extend(image_parts);
+                            out.push(ApiMessage {
+                                role: "user".to_string(),
+                                content: Some(Value::Array(content_parts)),
+                                ..Default::default()
+                            });
+                        } else {
+                            out.push(ApiMessage {
+                                role: "user".to_string(),
+                                content: Some(Value::String(text_parts.join(""))),
+                                ..Default::default()
+                            });
+                        }
+                    }
                 } else if supports_vision && !image_parts.is_empty() {
                     // vision 模式：content 是 [{type:"text",...}, {type:"image_url",...}] 数组
                     let mut content_parts: Vec<Value> = text_parts
@@ -396,6 +467,7 @@ fn usage_event(usage: UsageData) -> StreamEvent {
         output_tokens: usage.completion_tokens.unwrap_or(0),
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: 0,
+        reasoning_tokens: usage.reasoning_tokens(),
     }
 }
 
@@ -741,6 +813,86 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
 
+    /// 思考 token 必须被解析出来 —— 它是「贵在思考还是贵在正文」的答案。
+    ///
+    /// 官方形态是 `completion_tokens_details.reasoning_tokens`（子集于
+    /// `completion_tokens`）；部分兼容网关把它平铺到 usage 顶层。两种都收。
+    #[test]
+    fn reasoning_tokens_are_parsed_from_the_official_shape() {
+        let chunk = SseChunk {
+            choices: vec![],
+            usage: Some(UsageData {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(500),
+                prompt_tokens_details: None,
+                completion_tokens_details: Some(CompletionTokensDetails {
+                    reasoning_tokens: Some(300),
+                }),
+                reasoning_tokens: None,
+            }),
+        };
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        let usage = events.iter().find_map(|e| match e {
+            StreamEvent::Usage {
+                output_tokens,
+                reasoning_tokens,
+                ..
+            } => Some((*output_tokens, *reasoning_tokens)),
+            _ => None,
+        });
+        assert_eq!(usage, Some((500, 300)));
+    }
+
+    /// 平铺形态（部分网关）：顶层 `reasoning_tokens` 也要认。
+    #[test]
+    fn reasoning_tokens_are_parsed_from_the_flat_shape() {
+        let chunk = SseChunk {
+            choices: vec![],
+            usage: Some(UsageData {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(200),
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+                reasoning_tokens: Some(120),
+            }),
+        };
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        let reasoning = events.iter().find_map(|e| match e {
+            StreamEvent::Usage {
+                reasoning_tokens, ..
+            } => Some(*reasoning_tokens),
+            _ => None,
+        });
+        assert_eq!(reasoning, Some(120));
+    }
+
+    /// 端点报出**超过** `completion_tokens` 的思考数时必须截断：
+    /// 那是端点口径不同（把它当独立思考总量），不截断会让「可见正文」
+    /// 变成负数。
+    #[test]
+    fn reasoning_tokens_never_exceed_the_completion_tokens() {
+        let chunk = SseChunk {
+            choices: vec![],
+            usage: Some(UsageData {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                prompt_tokens_details: None,
+                completion_tokens_details: Some(CompletionTokensDetails {
+                    reasoning_tokens: Some(999),
+                }),
+                reasoning_tokens: None,
+            }),
+        };
+        let events = stream_events_from_chunk(&mut std::collections::HashMap::new(), chunk);
+        let reasoning = events.iter().find_map(|e| match e {
+            StreamEvent::Usage {
+                reasoning_tokens, ..
+            } => Some(*reasoning_tokens),
+            _ => None,
+        });
+        assert_eq!(reasoning, Some(50));
+    }
+
     #[test]
     fn finish_chunk_keeps_usage_for_exact_token_accounting() {
         let chunk = SseChunk {
@@ -754,6 +906,8 @@ mod tests {
                 prompt_tokens_details: Some(PromptTokensDetails {
                     cached_tokens: Some(40),
                 }),
+                completion_tokens_details: None,
+                reasoning_tokens: None,
             }),
         };
 
@@ -771,6 +925,7 @@ mod tests {
                 output_tokens: 30,
                 cache_read_input_tokens: 40,
                 cache_creation_input_tokens: 0,
+                reasoning_tokens: 0,
             }
         ));
     }

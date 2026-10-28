@@ -119,6 +119,7 @@ pub async fn execute(req: RunRequest<'_>) -> Result<()> {
         last_latency: session.latency,
         prompt_drift: session.prompt_drift_since_resume.clone(),
         compact_count: session.compact_count,
+        compact_generation: session.compact_generation,
         context_edit: (
             wyj_core::context_edit::elided_count(&session.messages) as u32,
             session.context_edit_freed_tokens,
@@ -128,6 +129,18 @@ pub async fn execute(req: RunRequest<'_>) -> Result<()> {
         sub_output_tokens: session.sub_output_tokens,
         sub_cache_read_tokens: session.sub_cache_read_tokens,
         sub_cache_write_tokens: session.sub_cache_write_tokens,
+        aux_input_tokens: session.aux_input_tokens,
+        aux_output_tokens: session.aux_output_tokens,
+        aux_cache_read_tokens: session.aux_cache_read_tokens,
+        aux_calls: session.aux_calls,
+        // 缓存归因：headless 路径没有「掉量」这一说（单次执行），
+        // 但字段必须给值。
+        cache_attribution: wyj_core::cache_attribution::attribute(
+            &session.cache_samples,
+            &session.cache_fingerprints,
+        ),
+        reasoning_tokens: session.total_reasoning_tokens,
+        api_attempts: session.api_attempts,
         effective_mcp_count,
         plugin_agent_paths,
         hooks_enabled,

@@ -83,6 +83,55 @@ pub struct RequestOptions {
     /// 实际能不能发还受 vendor 的 `emit_interleaved_beta` 二次过滤
     /// （第三方兼容端点一律不发，避免 400）。
     pub interleaved: bool,
+    /// 服务端上下文清理参数（Anthropic 官方 `context_management` beta）。
+    ///
+    /// **只由 provider 决定发不发**：agent 层把「想要什么」填进来，官方
+    /// Anthropic 端点才真正写进请求体；第三方兼容端点、OpenAI 线一律忽略。
+    /// 这与本地 `context_edit`（改 messages、必然击穿一段缓存前缀）互补——
+    /// 服务端清理由端点原地删除缓存里的旧结果，**不重建前缀**。
+    pub server_context_management: Option<ServerContextManagement>,
+}
+
+/// 服务端上下文清理参数。
+///
+/// 语义对齐 Anthropic `clear_tool_uses_20250919` / `clear_thinking_20251015`：
+/// 端点按 `trigger` 判定何时动手，保留最近 `keep_tool_uses` 个工具结果与
+/// `keep_thinking_turns` 轮思考，其余从**服务端缓存**里原地删除。
+/// 详见 <https://docs.claude.com/en/docs/build-with-claude/context-editing>。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerContextManagement {
+    /// 历史输入超过这个 token 数才开始清理（`trigger.type = input_tokens`）。
+    pub trigger_tokens: u32,
+    /// 保留最近 N 个工具结果全文。
+    pub keep_tool_uses: u32,
+    /// 单次至少清掉这么多 token，否则不动手（`clear_at_least`）。低于它时
+    /// 端点会等下一轮——省下的还不够占位符本身，清理只多付一次前缀失效。
+    pub clear_at_least_tokens: u32,
+    /// 这些工具的结果永不清除。写工具的回执丢了模型会重做，BashOutput
+    /// 读的是活动会话、重跑不回来。
+    pub exclude_tools: Vec<String>,
+    /// 保留最近几轮思考；`None` = 不发 `clear_thinking` 编辑项。
+    pub keep_thinking_turns: Option<u32>,
+}
+
+impl ServerContextManagement {
+    /// 序列化成请求体里的 `context_management.edits` 数组。
+    pub fn to_edits(&self) -> Vec<serde_json::Value> {
+        let mut edits = vec![serde_json::json!({
+            "type": "clear_tool_uses_20250919",
+            "trigger": {"type": "input_tokens", "value": self.trigger_tokens},
+            "keep": {"type": "tool_uses", "value": self.keep_tool_uses},
+            "clear_at_least": {"type": "input_tokens", "value": self.clear_at_least_tokens},
+            "exclude_tools": self.exclude_tools,
+        })];
+        if let Some(turns) = self.keep_thinking_turns {
+            edits.push(serde_json::json!({
+                "type": "clear_thinking_20251015",
+                "keep": {"type": "thinking_turns", "value": turns},
+            }));
+        }
+        edits
+    }
 }
 
 impl RequestOptions {
@@ -107,6 +156,9 @@ impl RequestOptions {
             reasoning_effort: None,
             thinking_switch: Some("disabled".to_string()),
             interleaved: false,
+            // 辅助调用（compact/memory/summary/classifier）不带工具历史，
+            // 服务端清理对它们毫无意义，多一个字段只是多一次端点上手机会。
+            server_context_management: None,
         }
     }
 
@@ -128,6 +180,7 @@ impl RequestOptions {
             reasoning_effort,
             thinking_switch: None,
             interleaved: active,
+            server_context_management: None,
         }
     }
 }
@@ -182,6 +235,7 @@ pub trait Provider: Send + Sync {
         let mut output_tokens = 0u32;
         let mut cache_read_input_tokens = 0u32;
         let mut cache_creation_input_tokens = 0u32;
+        let mut reasoning_tokens = 0u32;
 
         while let Some(event) = stream.next().await {
             match event? {
@@ -219,11 +273,18 @@ pub trait Provider: Send + Sync {
                     output_tokens: o,
                     cache_read_input_tokens: c,
                     cache_creation_input_tokens: cw,
+                    reasoning_tokens: r,
                 } => {
-                    input_tokens = i;
-                    output_tokens = o;
-                    cache_read_input_tokens = c;
-                    cache_creation_input_tokens = cw;
+                    // **按字段取最大值**，不能整块覆盖：Anthropic 一轮请求会
+                    // 发两条 usage —— `message_start` 带 input/cache（output 是
+                    // 占位 1），`message_delta` 只带 output（input 缺省为 0）。
+                    // 后写覆盖会把真实 input 抹成 0，压缩/辅助往返的输入 token
+                    // 因此恒记 0，`/cost` 与花费熔断全部低估。
+                    input_tokens = input_tokens.max(i);
+                    output_tokens = output_tokens.max(o);
+                    cache_read_input_tokens = cache_read_input_tokens.max(c);
+                    cache_creation_input_tokens = cache_creation_input_tokens.max(cw);
+                    reasoning_tokens = reasoning_tokens.max(r);
                 }
             }
         }
@@ -253,6 +314,7 @@ pub trait Provider: Send + Sync {
             output_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            reasoning_tokens,
         })
     }
 }

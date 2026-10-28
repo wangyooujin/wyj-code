@@ -1,6 +1,19 @@
 //! Hooks 生命周期自动化：settings 文件里声明的 shell 命令在
-//! PreToolUse/PostToolUse/UserPromptSubmit/Stop 四个时机被执行，沿用真
-//! Claude Code 的配置格式与 stdin/stdout 执行协议（但路径完全自有）。
+//! 六个时机被执行，沿用真 Claude Code 的配置格式与 stdin/stdout 执行协议
+//! （但路径完全自有）。
+//!
+//! 六个事件：
+//! - `PreToolUse`——工具执行前，可 block / approve
+//! - `PostToolUse`——**每个**工具执行后，可追加反馈
+//! - `PostToolBatch`——**整批**工具执行完后触发一次（一批 8 个工具只触发 1 次）
+//! - `FileChanged`——写类工具成功且确实落在某个文件上时触发
+//! - `UserPromptSubmit`——用户提交后进入推理前
+//! - `Stop`——回合结束前，可继续下一轮
+//!
+//! 后两个是 2026-10 补的，补的理由是「PostToolUse 挂错了地方」：用户想跑
+//! formatter/linter，挂在 PostToolUse 上会对着 Read/Grep 也跑一遍，一批 8 个
+//! 工具就跑 8 次；`FileChanged` 只在真改文件时触发，`PostToolBatch` 只在整批
+//! 结束后触发一次。真实 Claude Code 有 33 个事件，这里按实际用途挑最缺的补。
 //!
 //! 三源合并（用户级 `~/.wyj-code/settings.json` → 项目级
 //! `<git-root>/.wyj-code/settings.json` → `<git-root>/.wyj-code/settings.local.json`）
@@ -29,7 +42,8 @@ fn default_hook_type() -> String {
 }
 
 /// 一份 settings 文件里 `hooks` 键的解析结果，key 为事件名
-/// （`"PreToolUse"`/`"PostToolUse"`/`"UserPromptSubmit"`/`"Stop"`）。
+/// （`"PreToolUse"` / `"PostToolUse"` / `"PostToolBatch"` / `"FileChanged"` /
+/// `"UserPromptSubmit"` / `"Stop"`）。未知事件名不会报错，只是永远不会被触发。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HooksSettings {
     pub hooks: HashMap<String, Vec<HookMatcherEntry>>,

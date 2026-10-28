@@ -132,6 +132,13 @@ fn purge_sessions(
             if name.ends_with(".meta.json") {
                 continue;
             }
+            // 检索索引（`<sid>.index.json`）是**派生文件**，不是会话。
+            // 不排除它的话，它会以 `session_id = "<sid>.index"` 的身份参与
+            // `keep_recent` 排名，而且因为写得比正文更晚，往往排得更靠前，
+            // 把真正该保留的老会话挤出保护窗口。
+            if name.ends_with(".index.json") {
+                continue;
+            }
             let Some(session_id) = name.strip_suffix(".json") else {
                 continue;
             };
@@ -176,13 +183,19 @@ fn purge_sessions(
     Ok((removed, freed))
 }
 
-/// 一个会话在磁盘上的全部条目（正文、meta、锁、租约、两个旁路目录）。
+/// 一个会话在磁盘上的全部条目（正文、meta、锁、租约、消息日志、两个旁路目录）。
 fn session_entries(dir: &Path, session_id: &str) -> Vec<PathBuf> {
     vec![
         dir.join(format!("{session_id}.json")),
         dir.join(format!("{session_id}.meta.json")),
         dir.join(format!("{session_id}.json.lock")),
         dir.join(format!("{session_id}.json.owner")),
+        // 主会话消息增量日志（见 `crate::session_journal`）。与正文同目录，
+        // 所以必须列进「整组删除」——漏了它就会留下一堆无主的 jsonl。
+        dir.join(format!("{session_id}.messages.jsonl")),
+        // 检索索引（派生文件，见 `session_store::SearchIndex`）。漏了它就会
+        // 留下一堆无主的 index.json——它们体积不大，但会持续累积。
+        dir.join(format!("{session_id}.index.json")),
         dir.join(format!("{session_id}.checkpoints")),
         dir.join(format!("{session_id}.subagents")),
     ]

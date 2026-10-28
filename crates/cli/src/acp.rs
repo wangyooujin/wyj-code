@@ -353,14 +353,11 @@ async fn handle_message(state: Arc<ConnectionState>, message: Value) -> Result<(
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("session/load is unavailable"))?
                 .load(&session_id)?;
-            let mut session = Session::new();
-            session.messages = file.messages;
-            session.total_input_tokens = file.input_tokens;
-            session.total_output_tokens = file.output_tokens;
-            session.routing_events = file.routing_events;
-            session.current_checkpoint_id = file.current_checkpoint_id;
-            session.branch_parent_session_id = file.branch_parent_session_id;
-            session.branch_parent_checkpoint_id = file.branch_parent_checkpoint_id;
+            // 与 `/resume`、分支、rewind 走同一条恢复通道。以前这里手搬
+            // 7 个字段，漏掉了 cache_read/write、api_calls、compact_count、
+            // session_profile、session_effort、prompt_fingerprint、
+            // elided_blobs——正是 `restore_usage_from` 存在要消灭的那类漏改。
+            let session = session_from_file(file);
             let entry = create_session(&state, session_id.clone(), session, requested_cwd).await?;
             stream_history(&entry, &state.writer).await;
             respond(&state.writer, id, json!({"modes": modes("normal")}));
@@ -475,11 +472,21 @@ async fn handle_message(state: Arc<ConnectionState>, message: Value) -> Result<(
 async fn create_session(
     state: &Arc<ConnectionState>,
     session_id: String,
-    session: Session,
+    mut session: Session,
     cwd: PathBuf,
 ) -> Result<SessionEntry> {
     if state.sessions.read().await.contains_key(&session_id) {
         bail!("session already exists: {session_id}")
+    }
+    // 主会话增量日志：daemon 会话常被客户端断连/重连，`.json` 只在
+    // `persist_session` 时整份重写，中间被 kill 会丢轮次。日志是旁路，
+    // `SessionStore::load` 会合并比快照多出来的尾巴。
+    if let Some(store) = state.session_store.as_ref() {
+        wyj_core::session_journal::SessionJournal::attach_session(
+            &mut session,
+            store.dir(),
+            &session_id,
+        );
     }
     // **不能**用 `agent_template.clone()`：`Agent: Clone` 是浅拷贝，会把
     // `turn_permission_grants` / `loop_guard` / `memory_snapshot` /
@@ -1636,6 +1643,10 @@ mod tests {
                 sub_output_tokens: 0,
                 sub_cache_read_tokens: 0,
                 sub_cache_write_tokens: 0,
+                aux_input_tokens: 0,
+                aux_output_tokens: 0,
+                aux_cache_read_tokens: 0,
+                aux_calls: 0,
                 prompt_cache_state: 0,
                 input_estimate_ratio: None,
                 overflow_window_hint: None,
@@ -1645,6 +1656,11 @@ mod tests {
                 ],
                 routing_events: Vec::new(),
                 compact_count: 0,
+                compact_generation: 0,
+                cache_samples: Vec::new(),
+                reasoning_tokens: 0,
+                api_attempts: 0,
+                cache_fingerprints: Vec::new(),
                 elided_blobs: vec![],
                 session_profile: None,
                 session_effort: None,

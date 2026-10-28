@@ -467,6 +467,78 @@ pub const SUBAGENT_PLAN_DESC: &str = "A research agent used to gather context be
 
 pub const COMPACT_SYSTEM: &str = "You are a conversation summarizer for a coding agent. Produce structured, information-dense summaries that allow seamless continuation of the work.";
 
+// ── 会话滚动工作文档（session memory）────────────────────────────────────────
+
+/// 滚动文档更新的 system prompt。
+///
+/// 与 [`COMPACT_SYSTEM`] 分开是刻意的：这条调用**每 N 轮跑一次**，而
+/// `COMPACT_SYSTEM` 只在压缩时跑。共用一份会让滚动更新也带上一整套
+/// 「从头总结这一段对话」的语气，而它真正要做的是「就地修订一份已有文档」。
+///
+/// 短句 + 独立 system 的另一个好处是不复用主对话前缀——换模型 / 换端点
+/// 时不会打穿主会话的 prompt cache。
+pub const SESSION_MEMORY_SYSTEM: &str = "You maintain a rolling working document for a coding agent. Revise the existing document in place with new information. Keep it accurate and compact; never pad it. Respond with the revised document only.";
+
+/// 滚动文档更新的完整指令。
+///
+/// 三条硬约束各自对应一种写坏的方式：
+///   1. **就地修订，不追加** —— 追加会让文档单调增长，最后自己变成上下文问题；
+///   2. **保留逐字标识符** —— 路径 / 函数名 / 命令 / 报错是压缩最先杀掉、
+///      之后最贵重获的东西；
+///   3. **不写运行态** —— 工具可用性、权限模式之类每轮都在变，写进「长期
+///      文档」会让模型拿过期结论否定当轮真实状态。
+pub fn session_memory_prompt(previous: &str, transcript: &str) -> String {
+    let existing = if previous.trim().is_empty() {
+        "(none yet — this is the first revision; create the document from the new transcript below)"
+    } else {
+        previous.trim()
+    };
+    format!(
+        r#"Revise the rolling working document below so it reflects everything the agent has done so far.
+
+## Rules
+- Revise in place. Merge new information into the existing sections; delete what is no longer true. Do NOT append a changelog and do NOT let the document grow without bound.
+- Keep the whole document under roughly {max} UTF-8 **bytes** (a CJK character costs 3 bytes, so a Chinese document must stay around {max}/3 characters). Compress older, settled work more aggressively than recent work.
+- Preserve exact file paths, function names, command lines, versions, and error messages verbatim. Do not paraphrase them.
+- Do not record tool availability, permission/sandbox mode, environment variables, DNS state, or one-off connection failures. Those are volatile and re-checked every request.
+- Omit a section entirely if it would be empty. Never write filler like "N/A".
+
+## Sections
+## Task & Intent
+What the user is trying to accomplish and why.
+
+## Completed Work
+What has been done so far, in order. Keep it terse; drop detail that later sections supersede.
+
+## Key Technical Decisions
+Decisions made and their rationale.
+
+## Key Reasoning
+Deductions reached through investigation that are not visible in the final answer — ruled-out approaches, constraints discovered by reading the code.
+
+## Files Touched
+Every file read or modified, with its exact path and a one-line note.
+
+## Current State
+Where things stand right now (build passing? tests failing? partially applied change?).
+
+## Next Steps
+What remains to be done, in priority order.
+
+## User Preferences & Constraints
+Instructions, corrections, or constraints the user expressed.
+
+## Existing document
+{existing}
+
+## New transcript since the last revision
+{transcript}"#,
+        max = crate::session_memory::MAX_DOC_BYTES,
+        existing = existing,
+        transcript = transcript
+    )
+}
+
 /// 压缩指令正文（**不含**对话内容）。
 ///
 /// 两条压缩路径共用这一段，防止措辞漂移：
@@ -524,9 +596,154 @@ pub fn compact_prompt(conversation: &str) -> String {
 /// 注意：不能包 `<system-reminder>` 标签——compact 的 `messages_to_text`
 /// 会跳过含该标签的文本，二次压缩时首次摘要会被整段丢弃。
 pub fn compact_summary_message(removed: usize, summary: &str) -> String {
-    format!(
-        "[Conversation summary — {removed} earlier messages were compacted into the following]\n\n<runtime-state-boundary>Claims below about tool availability, permission mode, environment variables, DNS, or connection failures describe past observations only. They are never authoritative for the current request. Re-check the current runtime block and attempt permitted tools before declaring them unavailable.</runtime-state-boundary>\n\n{summary}"
-    )
+    compact_summary_message_with_files(removed, summary, &[])
+}
+
+/// 同 [`compact_summary_message`]，但额外列出**压缩前最近操作过的文件**。
+///
+/// ## 为什么需要这一段
+///
+/// 压缩是单向的信息丢弃：被压段里的工具调用、文件内容、编辑记录全部消失，
+/// 模型只能从摘要里读到「改过 auth 模块」这种级别的描述，却不知道具体是
+/// 哪个文件、改成了什么样——于是它要么重新 `Read` 一遍（多付一次完整
+/// 文件内容的 token），要么凭印象改错地方。
+///
+/// 这是对齐 Claude Code 的「What survives compaction」表：官方在压缩后会
+/// **按最近修改时间重读最多 5 个文件**，超过 5000 token 的文件降级为路径
+/// 引用。本函数做的是同一件事的轻量版——不重读内容（那要多付 token 且可能
+/// 读到已变的文件），只把**路径**摆出来，让模型知道「现场在哪」。
+///
+/// 为什么只给路径而不是内容：摘要已经覆盖了「做了什么」，缺的只是「在哪儿」。
+/// 塞进完整文件内容等于把刚压缩掉的东西又原样塞回去，压缩收益直接归零。
+pub fn compact_summary_message_with_files(
+    removed: usize,
+    summary: &str,
+    touched_files: &[String],
+) -> String {
+    compact_summary_message_with_files_and_archive(removed, summary, touched_files, None)
+}
+
+/// 同 [`compact_summary_message_with_files`]，额外带上**被压缩段的归档 hash**。
+///
+/// ## 为什么要把 hash 摆进摘要
+///
+/// `compact_session_with_archive` 早就把 `to_compact` 的完整 JSON intern 进了
+/// CAS，但在此之前没有任何入口能把它取回来：`ContextRecall` 只认
+/// `[context-edited]` 占位符里的 `cas://`，而压缩是把消息整段**删掉**、
+/// 连占位符都不留。结果是「存了但取不回来」，只买到「不占上下文」。
+///
+/// 现在摘要末尾直接写出 `cas://<hash>`，模型在发现摘要丢了关键细节时，
+/// 可以自己 `ContextRecall` 取回压缩前的原文（按 offset 分页）。
+pub fn compact_summary_message_with_files_and_archive(
+    removed: usize,
+    summary: &str,
+    touched_files: &[String],
+    archive_hash: Option<&str>,
+) -> String {
+    compact_summary_message_full(removed, summary, touched_files, archive_hash, 1)
+}
+
+/// 摘要消息头的固定前缀。代际检测（[`summary_generation`]）与渲染共用它。
+pub const COMPACT_SUMMARY_PREFIX: &str = "[Conversation summary —";
+
+/// 同 [`compact_summary_message_with_files_and_archive`]，并显式标注摘要代际。
+///
+/// ## 为什么要标注「第几代」
+///
+/// 每次压缩都会把上一次的摘要消息一起再摘要一遍（`keep_from > 0` 时摘要必然
+/// 落在被压段里），于是精确数值、否定知识、先后因果逐代衰减。模型对此毫无
+/// 感知——它把一份四代摘要当成事实基线继续推理，遇到冲突时也只会相信自己
+/// 手上这份。
+///
+/// 从第 2 代起在头部写明「这是第 N 代摘要，可能已丢失细节」，并在过
+/// [`crate::compact::MAX_COMPACT_GENERATIONS`] 之后追加一句「优先核对归档
+/// 原文」。这不是让模型变谨慎的修辞，而是给它一个**可执行的出路**：
+/// 摘要里同时带着 `cas://<hash>`，模型可以直接 `ContextRecall`。
+pub fn compact_summary_message_full(
+    removed: usize,
+    summary: &str,
+    touched_files: &[String],
+    archive_hash: Option<&str>,
+    generation: u32,
+) -> String {
+    let generation = generation.max(1);
+    let generation_note = if generation <= 1 {
+        String::new()
+    } else if generation <= crate::compact::MAX_COMPACT_GENERATIONS {
+        format!(
+            "This is generation {generation} of a layered summary — earlier summaries were \
+             themselves summarized. Exact values, negations, and ordering may have drifted; \
+             verify against the workspace or the archive below before relying on them.\n\n"
+        )
+    } else {
+        format!(
+            "This is generation {generation} of a layered summary, past the point where \
+             repeated summarization reliably preserves detail. Treat it as a map rather than a \
+             record: confirm specifics by re-reading files, re-running cheap commands, or \
+             recalling the archive below.\n\n"
+        )
+    };
+    let mut text = format!(
+        "{COMPACT_SUMMARY_PREFIX} {removed} earlier messages were compacted into the following]\n\n{generation_note}<runtime-state-boundary>Claims below about tool availability, permission mode, environment variables, DNS, or connection failures describe past observations only. They are never authoritative for the current request. Re-check the current runtime block and attempt permitted tools before declaring them unavailable.</runtime-state-boundary>\n\n{summary}"
+    );
+    if !touched_files.is_empty() {
+        text.push_str(
+            "\n\n## Files touched before compaction\n\
+             These paths were read or modified in the compacted portion of the conversation. \
+             Re-read the ones you still need — their on-disk content may have changed since.\n",
+        );
+        for path in touched_files {
+            text.push_str("- ");
+            text.push_str(path);
+            text.push('\n');
+        }
+    }
+    if let Some(hash) = archive_hash {
+        text.push_str(&format!(
+            "\n## Compacted transcript archive\n\
+             The {removed} messages summarized above are still recoverable verbatim: \
+             cas://{hash}\n\
+             If a detail you need is missing from the summary, call ContextRecall with this hash \
+             (use `offset` to page through it) instead of re-running tools or guessing.\n"
+        ));
+    }
+    text
+}
+
+/// 读出一条消息里承载的摘要代际；不是摘要消息时返回 `None`。
+///
+/// 判据只有一条：以 [`COMPACT_SUMMARY_PREFIX`] 开头。旧版本写下的摘要没有
+/// 代际字样，一律按第 1 代处理——这比「认不出就一直当第 1 代」更保守：
+/// 一份老摘要被再压一次时至少能升到第 2 代，而不是永远停在 1。
+pub fn summary_generation(message: &wyj_api::types::Message) -> Option<u32> {
+    let text = message.content.iter().find_map(|block| match block {
+        wyj_api::types::ContentBlock::Text { text } => Some(text.as_str()),
+        _ => None,
+    })?;
+    if !text.starts_with(COMPACT_SUMMARY_PREFIX) {
+        return None;
+    }
+    // 只在**头部区域**找代际字样，且要求完整句式
+    // `generation <N> of a layered summary`。
+    //
+    // 为什么不能全文 `split_once("generation ")`：第 1 代摘要**不带**代际
+    // 提示，正文里只要出现 "generation 3"（编码会话里极常见，比如
+    // `app_computer` 的 `generation` 参数）就会被误判成第 3 代，之后每次
+    // 压缩都从错误基线往上叠，`MAX_COMPACT_GENERATIONS` 的告警提前出现。
+    let head: String = text.chars().take(600).collect();
+    let marker = "generation ";
+    head.split_once(marker)
+        .and_then(|(_, rest)| {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            let tail = rest[digits.len()..].trim_start();
+            tail.starts_with("of a layered summary")
+                .then(|| digits.parse::<u32>().ok())
+                .flatten()
+        })
+        .or(Some(1))
 }
 
 /// 压缩后的 assistant 确认语（保持 user/assistant 交替）

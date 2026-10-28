@@ -11,7 +11,10 @@ pub enum Role {
 }
 
 /// 单条消息（含一个或多个内容块）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 实现 `PartialEq` 是为了 checkpoint 的 messages 增量判定：只有「上一个
+/// checkpoint 的历史是本快照的严格前缀」时才存尾部，逐条相等比较依赖它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
@@ -46,7 +49,7 @@ impl Message {
 }
 
 /// 消息内容块
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// 普通文本
@@ -83,7 +86,7 @@ pub enum ContentBlock {
 /// tool_result 内嵌 image block）；`Blocks` 为旧版原始 JSON 透传，仅保留
 /// 以兼容历史会话文件的反序列化（untagged 匹配顺序：Parts 有 type tag
 /// 结构可与 Blocks 区分，必须放在 Blocks 之前）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
@@ -92,7 +95,7 @@ pub enum ToolResultContent {
 }
 
 /// 工具结果的单个内容块
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultPart {
     Text {
@@ -215,6 +218,20 @@ pub enum StreamEvent {
         output_tokens: u32,
         cache_read_input_tokens: u32,
         cache_creation_input_tokens: u32,
+        /// 本次输出里被**思考**占用的 token 数。
+        ///
+        /// 它是 `output_tokens` 的**子集**（OpenAI 的
+        /// `completion_tokens_details.reasoning_tokens` 就是这么定义的），
+        /// 可见正文 = `output_tokens - reasoning_tokens`。
+        ///
+        /// 为什么要单独拆出来：思考 token 按输出价计费，而它对用户是
+        /// **不可见**的——「这次贵在思考还是贵在正文」是两种完全不同的
+        /// 优化方向（前者调低 effort，后者调低输出长度）。不拆开的话，
+        /// `/cost` 只能给出一个「输出很贵」的结论，用户无从下手。
+        ///
+        /// Anthropic 线**不上报**这个值（它的 `output_tokens` 已经含
+        /// thinking），所以那里恒为 0——这是「不知道」而不是「零」。
+        reasoning_tokens: u32,
     },
 }
 
@@ -227,6 +244,11 @@ pub struct CompletionResult {
     pub output_tokens: u32,
     pub cache_read_input_tokens: u32,
     pub cache_creation_input_tokens: u32,
+    /// 输出里被思考占用的 token（`output_tokens` 的子集）。
+    ///
+    /// Anthropic 线不上报（它的 output 已含 thinking），那里恒为 0——
+    /// 是「不知道」而不是「零思考」。
+    pub reasoning_tokens: u32,
 }
 
 #[cfg(test)]

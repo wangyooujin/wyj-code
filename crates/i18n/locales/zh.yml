@@ -1,6 +1,8 @@
 _version: 1
 command:
   unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
+  agent_control_desc: "对正在运行的子 Agent 发续跑、中断或重试指令"
+  agent_control_usage: "/agent-control <id> <续跑文本|interrupt|retry>"
   background_unsupported: "命令 /{name} 声明为后台执行，但返回了 TUI 无法直接渲染的结果类型：{result}"
   busy_rejected: "回合进行中，/{name} 未执行：这条命令会改会话内容，不能排进当前回合。等回合结束后再回车，或按 ESC 中断后再执行。"
 skill:
@@ -174,6 +176,8 @@ agent:
     parameter_removed: "[模型端点不支持参数 `{name}`，已安全移除后重试一次]"
   context_overflow: "\n[上下文超出模型窗口，正在紧急压缩后重试]\n"
   compacted: "\n[已自动压缩 · 第 {times} 次 · 丢弃 {removed} 条旧消息 · 保留最近 {kept} 条原文 · 释放约 {saved} tokens]\n"
+  output_budget_clamped: "\n[输出预算 {requested} 超出有效窗口 {window} 的可压缩余量，本次请求已临时下调到 {applied}。建议把该分组的 max_tokens 调小，否则每轮都会触发这条降级]\n"
+  compact_not_converging: "\n[自动压缩后上下文仍高于阈值（窗口 {window} / 阈值 {threshold}）——已暂停自动压缩 3 轮。这通常意味着输出预算或 system/工具定义本身已占满窗口，请调小 max_tokens 并用 /context 查看分解]\n"
   turn_task_lost: "回合任务已异常终止（内部错误或被强制中断），本轮已中止。可以直接继续输入指令。"
   turn_stalled: "回合已静默 {secs}s 无任何进展（模型响应或工具调用卡住），本轮被强制中止。可以直接继续输入指令。"
   dangling_tool_uses_repaired: "\n[已为此前中断遗留的 {count} 个无结果工具调用补上占位结果（它们从未真正执行）]\n"
@@ -183,6 +187,7 @@ agent:
   output_truncated: "\n[回复达到了 max_tokens 输出上限，正文可能被截断——需要完整结果时把 max_tokens 调大或降低 reasoning_effort 后再试。]\n"
   preemptive_thinking_floor: "\n[会话里回传的思考链已经很长，为避免单次输出被思考吃满，已自动把 reasoning 降到最低档。]\n"
   turn_budget_wrap_up: "\n[本次提交的工具循环已用掉 {turn}/{max} 轮，已要求模型停止调用工具并立即总结当前进度]\n"
+  spend_budget_wrap_up: "\n[本次提交的花费预算已用尽（{reason}），已要求模型停止调用工具并立即总结当前进度]\n"
   invalid_arguments_wrap_up: "\n[工具参数连续校验失败，已要求模型修正参数形态或改用其他方案，并交付当前进度]\n"
   acceptance_passed: "\n[验收通过：{total} 条判据全部满足]\n"
   acceptance_failed: "\n[验收未通过：{failed}/{total} 条判据不满足（{ids}），失败证据已回灌给模型让它继续修]\n"
@@ -312,6 +317,11 @@ help:
     - `/mode [模式]` — 切换运行模式（auto / plan / bypass）；无参数则显示当前模式
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
+    - `/checkpoint [名字]` — 为当前对话与工作区打一个回滚点
+    - `/rewind [id]` — 回退到某个回滚点；默认对话+文件，可加 `--scope conversation|files`
+    - `/branch [id]` — 从某个回滚点开分支会话（`--restore-files` 同时还原文件）
+    - `/cwd [路径]` — 查看或切换工作目录
+    - `/agent-control <id> <续跑文本|interrupt|retry>` — 对正在运行的子 Agent 发续跑、中断或重试指令
     - `/init` — 让 Agent 探索项目并生成/合并更新 AGENTS.md；同时确保项目级 .wyj-code/ 配置骨架（mcp.toml/settings.toml 空模板）存在
     - `/bug [简述]` — 在浏览器打开本仓库 GitHub issue 页并预填环境信息（零依赖）
     - `/review [PR编号]` — 拉取 PR diff 交给 Agent 审查（需已安装 gh CLI）
@@ -384,6 +394,7 @@ compact:
   done: "已压缩：移除 {removed} 条消息，节省约 {saved} tokens"
   noop: "上下文较短，无需压缩。"
   failed_tag: "压缩失败"
+  generation_warning: "⚠ 当前摘要已是第 {generation} 代（摘要的摘要）。精确数值、否定结论和先后顺序可能已经漂移——涉及具体细节时请重新读文件或召回归档原文，不要直接引用这份摘要。"
 
 checkpoint:
   created: "已创建 checkpoint {id}"
@@ -434,14 +445,23 @@ cost:
   bar_full: "█"
   bar_empty: "░"
   cache_stats_line: "缓存命中率 {hit_ratio} · 相对全价节省 {saved_pct}"
+  cache_drop_line: "⚠ 缓存命中率从 {from} 掉到 {to}：{cause}"
+  reasoning_share_line: "思考占输出 {share}（{tokens} tokens，按输出价计费但用户不可见）"
   api_calls_line: "平均每次调用输入 {avg_input} tokens"
+  retry_line: "共发起 {attempts} 次请求，成功 {calls} 次，失败/重试 {retries} 次（失败不产生费用）"
   context_detail_line: "{pct} · {used} / {window} tokens"
   subagent_section: "子 Agent 扇出（已计入合计）"
   subagent_input: "输入"
   subagent_output: "输出"
   subagent_cache: "缓存命中"
+  aux_section: "辅助调用（已计入合计）"
+  aux_input: "输入"
+  aux_output: "输出"
+  aux_cache: "缓存命中"
+  aux_note: "辅助调用 = 标题生成 / Auto 权限分类器 / 记忆提取 / 演化分析，走 aux_model 或 classifier_profile 指定的端点，单价与主模型不同。"
   note_cache_write_unreported: "端点命中缓存但从不返回写入量，上表金额为下界，未计入本应按 1.25x 输入价结算的缓存写入费用。"
   note_compacted: "本会话发生过 {times} 次自动压缩，历史已被摘要。"
+  note_compact_generation: "当前摘要已是第 {generation} 代（摘要的摘要），细节保真度显著下降——回答里出现具体数值/路径时请核对原文。"
   cache_downgraded_line: "Prompt 缓存已停用：端点拒绝了 cache_control / anthropic-beta，本会话余下时间按全价计费。"
   price_missing: "模型 \"{model}\" 暂无单价表条目，仅显示 token 数、不估算费用。"
 
@@ -451,8 +471,10 @@ usage:
   totals: "会话 {sessions} 个 · 回合 {turns} 次 · 模型调用 {api_calls} 次"
   tokens: "输入 {input} · 输出 {output} · 缓存命中 {cache_read} · 缓存写入 {cache_write}"
   subagent_tokens: "子 Agent: 输入 {sub_input} · 输出 {sub_output} · 缓存命中 {sub_cache_read}（不计入上方主 Agent 口径）"
+  aux_tokens: "辅助调用: 输入 {aux_input} · 输出 {aux_output} · 缓存命中 {aux_cache_read} · {aux_calls} 次（标题/分类器/记忆/演化，不计入上方主 Agent 口径）"
   rates: "每回合: 输入 {input_per_turn} / 输出 {output_per_turn} · 每次调用: 输入 {input_per_call} / 输出 {output_per_call} · 缓存命中率 {cache_hit} · 输出占比 {output_share}"
   legacy_no_api_calls: "提示: 有 {count} 个会话早于调用次数记录，「每次调用」指标只覆盖近期记录完整的会话。"
+  retries: "共发起 {attempts} 次请求，成功 {calls} 次，失败/重试 {retries} 次（失败不产生费用）。"
   cache_downgraded: "有 {count} 个会话因端点拒绝缓存而降级。"
   never_trimmed: "该区间内没有任何会话发生过压缩或上下文清理 —— 工具输出一直是全量累积的。"
   by_month: "按月:"
@@ -813,6 +835,7 @@ status:
   api_key_configured: "API Key: {prefix}...（已配置）"
   api_key_error: "API Key: {err}"
   context_window_unverified: "上下文窗口 {window} tokens 未经探测验证。自动压缩要到约 {trigger} tokens 才触发，期间工具输出全量累积；若真实窗口更小，请调低 `context_window` 让清理与压缩真正生效。"
+  context_window_clamped_to_catalog: "context_window = {window} 超过静态目录对 `{model}` 给出的窗口（{supported}），运行时已按 {supported} 收紧：自动压缩约在 {trigger} tokens 触发。若该模型确实支持更大窗口，请把 `context_window` 改成真实值以解除收紧。"
   parallel_tools_capped: "max_tools_per_turn = {current} 低于该端点支持的上限（{supported}）。每多一趟往返就重发一遍完整上下文，是输入成本的一阶驱动因素。"
   max_tokens_above_catalog: "max_tokens = {current} 超过静态目录对 `{model}` 给出的输出上限（{supported}）。该目录是保守下限、不一定是真上限——若端点确实支持更大值可忽略；否则请求会因超限被拒。"
   high_effort_on_forced_thinking: "reasoning_effort = {effort}，而 `{model}` 的思考关不掉：每一轮工具循环都会完整跑一遍最深推理，单次提交可能持续十几分钟到半小时以上。长任务建议降到 `medium`，或拆成多次提交。"
