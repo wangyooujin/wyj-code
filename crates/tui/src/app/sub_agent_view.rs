@@ -135,10 +135,14 @@ fn messages_from_trace(events: &[TraceEvent], state: &SubAgentUiState) -> Vec<Ch
             } => {
                 seq += 1;
                 let index = messages.len();
-                messages.push(ChatMessage::tool_call(
+                let mut call = ChatMessage::tool_call(
                     tool_call_display(tool_name, input_json, *truncated),
                     seq,
-                ));
+                );
+                // Bash 的完整命令：标题行里是截断过的摘要，子 Agent 详情视图
+                // 与主聊天流必须同口径（否则子 Agent 里跑的命令反而看不全）。
+                call.full_command = tool_call_full_command(tool_name, input_json);
+                messages.push(call);
                 pending.push(PendingCall {
                     index,
                     seq,
@@ -350,19 +354,33 @@ fn messages_from_tool_log(state: &SubAgentUiState) -> Vec<ChatMessage> {
 
 /// 工具调用标题行：`工具名(参数摘要)`，与主聊天流同一口径。
 fn tool_call_display(tool_name: &str, input_json: &str, truncated: bool) -> String {
-    let arg = match serde_json::from_str::<serde_json::Value>(input_json) {
+    tool_call_display_from_parts(tool_name, &tool_call_arg(tool_name, input_json, truncated))
+}
+
+/// 从落盘轨迹的入参 JSON 里取展示用的参数摘要。
+///
+/// 入参被截断后不再是合法 JSON：退回展示原文的一小段，别把整段残缺 JSON
+/// 塞进标题行。
+fn tool_call_arg(tool_name: &str, input_json: &str, truncated: bool) -> String {
+    match serde_json::from_str::<serde_json::Value>(input_json) {
         Ok(value) => tool_display_arg(tool_name, &value),
         Err(_) => {
-            // 入参被截断后不再是合法 JSON：退回展示原文的一小段，别把整段
-            // 残缺 JSON 塞进标题行。
             if truncated {
                 input_json.chars().take(40).collect::<String>()
             } else {
                 String::new()
             }
         }
-    };
-    tool_call_display_from_parts(tool_name, &arg)
+    }
+}
+
+/// 落盘轨迹里的 Bash 完整命令（与主聊天流同一口径）。
+///
+/// 轨迹的入参 JSON 可能被截断成非法 JSON，此时取不到完整命令——降级为
+/// 「只有摘要」，与主聊天流里同一场景的表现一致。
+fn tool_call_full_command(tool_name: &str, input_json: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(input_json).ok()?;
+    tool_full_command(tool_name, &value)
 }
 
 /// 由「工具名 + 参数摘要」拼出标题行（并挂上后端标注）。

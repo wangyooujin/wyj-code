@@ -147,6 +147,25 @@ pub(super) fn tool_display_arg(name: &str, input: &serde_json::Value) -> String 
     }
 }
 
+/// Bash 的**完整**命令（未经摘要截断）。
+///
+/// 只有 Bash 需要它：命令是唯一「截断了就完全猜不出意图」的参数——`wc -l
+/// crates/api/…` 后面接的是哪个 glob、要不要 `&&` 串下一条，全都被省略号吞掉。
+/// 其余工具的参数（路径 / 模式 / URL）截断后仍能猜个大概，不必加一行噪音。
+///
+/// 保留原始文本（不做 `~` 缩写）：这行的用途就是**复制粘贴**，缩写过的路径
+/// 粘回去跑不通。
+pub(super) fn tool_full_command(name: &str, input: &serde_json::Value) -> Option<String> {
+    if !name.eq_ignore_ascii_case("Bash") {
+        return None;
+    }
+    let cmd = input.get("command").and_then(|v| v.as_str())?.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(cmd.to_string())
+}
+
 /// 从工具输出生成一行摘要（用于 ⎿ 行）
 pub(super) fn tool_result_summary(name: &str, output: &str, is_error: bool) -> String {
     let trunc1 = |s: &str| -> String {
@@ -278,6 +297,38 @@ mod tool_summary_tests {
         assert_eq!(
             tool_display_arg("WebFetch", &fetch_input),
             "https://example.com"
+        );
+    }
+
+    /// Bash 的完整命令必须**原样**取出：它是「复制回去重跑」的那份文本，
+    /// 做了 `~` 缩写就粘不动了。
+    #[test]
+    pub(super) fn full_command_is_raw_and_only_for_bash() {
+        let input = serde_json::json!({"command": "cd /repo && wc -l crates/api/src/*.rs"});
+        assert_eq!(
+            tool_full_command("Bash", &input).as_deref(),
+            Some("cd /repo && wc -l crates/api/src/*.rs")
+        );
+        // 非 Bash 工具不补全（其余参数截断后仍能猜个大概，补全是噪音）。
+        assert_eq!(tool_full_command("Read", &input), None);
+        // 空命令不产生空行。
+        let empty = serde_json::json!({"command": "   "});
+        assert_eq!(tool_full_command("Bash", &empty), None);
+        // 没有 command 字段（畸形入参）不 panic。
+        assert_eq!(tool_full_command("Bash", &serde_json::json!({})), None);
+    }
+
+    /// 摘要截断与完整命令必须成对成立：摘要只剩省略号，完整命令才是唯一真相。
+    #[test]
+    pub(super) fn bash_summary_is_truncated_but_full_command_is_not() {
+        let input = serde_json::json!({"command": "cd /Volumes/WD_APFS/wyj-code && wc -l crates/api/src/lib.rs"});
+        let summary = tool_display_arg("Bash", &input);
+        assert!(summary.ends_with('…'), "摘要应被截断: {summary}");
+        assert!(summary.chars().count() <= 50, "摘要长度受限: {summary}");
+        let full = tool_full_command("Bash", &input).expect("完整命令");
+        assert!(
+            full.ends_with("crates/api/src/lib.rs"),
+            "完整命令不截断: {full}"
         );
     }
 

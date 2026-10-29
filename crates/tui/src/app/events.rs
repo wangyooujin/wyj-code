@@ -68,7 +68,11 @@ impl AppState {
                 self.tool_info.insert(id, (name.clone(), seq));
                 self.flush_streaming();
                 if !is_todo {
-                    let mut msg = ChatMessage::tool_call(display, seq);
+                    let mut msg = ChatMessage::tool_call_with_command(
+                        display,
+                        seq,
+                        tool_full_command(&name, &input_json),
+                    );
                     // ToolCall 也记录工具名，供 SubAgent Started 事件 FIFO 配对
                     msg.tool_name = Some(name);
                     self.push_tracked_message(msg);

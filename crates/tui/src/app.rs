@@ -135,6 +135,12 @@ pub struct ChatMessage {
     pub tool_name: Option<String>,
     /// ToolResult 的一行摘要（Claude Code ⎿ 行）
     pub display_summary: String,
+    /// Bash 调用的**完整**命令（ToolCall 专用）。
+    ///
+    /// 标题行里的参数是截断过的摘要（`wc -l crates/api/…`），命令被省略号吞掉
+    /// 的后半段就再也看不到了——这行是它的补全，值为 `None` 表示不需要补
+    /// （非 Bash 工具，或命令短到标题行已经看全）。
+    pub full_command: Option<String>,
     /// 绑定的子 Agent id（Agent 工具的 ToolCall/ToolResult 专用）
     pub sub_agent_id: Option<u64>,
     /// 按宽度缓存的正文渲染结果，见 [`RenderCache`]。
@@ -157,6 +163,7 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
+            full_command: None,
             sub_agent_id: None,
             render_cache: std::cell::RefCell::new(None),
         }
@@ -195,6 +202,13 @@ impl ChatMessage {
         m
     }
 
+    /// 工具调用行 + 完整命令（Bash 的命令摘要被截断时用它补全）。
+    fn tool_call_with_command(display: String, seq: usize, full_command: Option<String>) -> Self {
+        let mut m = Self::tool_call(display, seq);
+        m.full_command = full_command;
+        m
+    }
+
     fn tool_result(
         output: String,
         is_error: bool,
@@ -213,6 +227,7 @@ impl ChatMessage {
             sequence_no: Some(seq),
             tool_name: Some(name),
             display_summary: summary,
+            full_command: None,
             sub_agent_id: None,
             render_cache: std::cell::RefCell::new(None),
         }
@@ -229,6 +244,7 @@ impl ChatMessage {
             sequence_no: None,
             tool_name: None,
             display_summary: String::new(),
+            full_command: None,
             sub_agent_id: None,
             render_cache: std::cell::RefCell::new(None),
         }
@@ -590,6 +606,15 @@ mod fmt_tokens_tests {
 /// 实现搬到 `wyj_core::humanize::fmt_duration`——通知正文用同一套口径。
 pub(crate) fn format_hms(secs: f64) -> String {
     wyj_core::humanize::fmt_duration(secs)
+}
+
+/// 工具耗时的显示口径：**亚秒用毫秒**，其余同 [`format_hms`]。
+///
+/// 与 [`format_hms`] 的差别只在亚秒段，而亚秒段恰恰是工具耗时的主战场——
+/// 一次 `ls` / `grep` 往往只有几十毫秒，一位小数秒会把它们全部塌成 `0.0s`，
+/// 用户看到的既是「所有工具都瞬时完成」这样一个假事实，又完全读不出差别。
+pub(crate) fn format_elapsed(secs: f64) -> String {
+    wyj_core::humanize::fmt_duration_precise(secs)
 }
 
 /// 权限确认对话框状态
@@ -12342,5 +12367,49 @@ mod tool_event_ordering_tests {
         // call-2 的结果紧跟 call-2 自己的调用。
         assert_eq!(state.messages[1].content, "content-a");
         assert_eq!(state.messages[3].content, "content-b");
+    }
+
+    /// 端到端钉子：`ToolStart` 事件里的 Bash 命令必须**完整**落到 ToolCall 消息上。
+    ///
+    /// 此前只落了截断摘要（`Bash(cd /repo && wc -l crates/api/…)`），命令后半段
+    /// 无处可寻——渲染层拿不到原文，也就无从补一行。
+    #[test]
+    fn tool_start_keeps_the_full_bash_command_on_the_call_message() {
+        let mut state = make_state();
+        let command = "cd /Volumes/WD_APFS/wyj-code && wc -l crates/api/src/*.rs";
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-1".to_string(),
+            name: "Bash".to_string(),
+            input_json: serde_json::json!({ "command": command }),
+        });
+
+        let call = state
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::ToolCall))
+            .expect("应有工具调用行");
+        assert_eq!(call.full_command.as_deref(), Some(command));
+        // 标题行仍是截断摘要（宽度预算不变）。
+        assert!(call.content.starts_with("Bash("), "{}", call.content);
+        assert!(call.content.contains('…'), "{}", call.content);
+        assert!(
+            !call.content.contains("*.rs"),
+            "摘要里不该有命令后半段: {}",
+            call.content
+        );
+
+        // 非 Bash 工具不补全。
+        let mut state = make_state();
+        state.apply_agent_event(AgentEvent::ToolStart {
+            id: "call-2".to_string(),
+            name: "Read".to_string(),
+            input_json: serde_json::json!({ "file_path": "/tmp/a.rs" }),
+        });
+        let call = state
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, MessageRole::ToolCall))
+            .expect("应有工具调用行");
+        assert_eq!(call.full_command, None);
     }
 }

@@ -1,6 +1,6 @@
 ❯ 宽度敏感
 
-  ⏺ Edit(src/lib.rs) · 0.4s
+  ⏺ Edit(src/lib.rs) · 400ms
     @@ -11,7 +11,7 @@
     11 11 │     let value_9 = compute("payload", 9)?;
     12 12 │     let value_10 = compute("payload", 10)?;

@@ -1,6 +1,6 @@
 ❯ 改一下
 
-  ⏺ Edit(src/main.rs) · 0.4s
+  ⏺ Edit(src/main.rs) · 400ms
     @@ -3,7 +3,7 @@
      3  3 │     let value_3 = 3;
      4  4 │     let value_4 = 4;

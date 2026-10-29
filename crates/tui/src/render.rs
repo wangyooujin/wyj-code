@@ -14,7 +14,7 @@ mod dialogs;
 use dialogs::*;
 
 use crate::app::{
-    fmt_tokens, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
+    fmt_tokens, format_elapsed, format_hms, ActionMenu, AgentsDialog, AppState, AskQuestionDialog,
     AskQuestionStage, Attachment, ChatMessage, EffortPickerDialog, EvolutionDialog, EvolutionRow,
     ExecModeConfirmDialog, ExtensionsDialog, FlatRow, InProgressAnswer, InputOwner, McpConnStatus,
     McpDialog, McpDialogTab, McpOverlay, MemoryDialog, MemoryRow, MessageRole, ModelPickerDialog,
@@ -1249,6 +1249,39 @@ fn render_live_tool_output(lines: &mut Vec<Line<'static>>, tail: &str, ctx: &Cha
     }
 }
 
+/// Bash 的完整命令单独成行（`⏺` 标题行的补全）。
+///
+/// 标题行里的参数是**截断过的摘要**（`wc -l crates/api/…`），被省略号吞掉的
+/// 那半截命令就再也找不回来了——用户没法确认「到底执行了什么」。这行把它补上，
+/// 且**原样保留**（不做 `~` 缩写），以便直接复制粘贴重跑。
+///
+/// 只在标题行确实没看全时才画：命令本来就没被截断时重复一行是纯噪音。
+/// 判据是「标题行里有没有出现完整命令」——它同时覆盖了摘要截断与宽度截断
+/// （窄终端下标题行放不下完整命令）。
+fn render_full_command(
+    lines: &mut Vec<Line<'static>>,
+    msg: &ChatMessage,
+    title: &str,
+    max_content_width: usize,
+) {
+    let Some(cmd) = msg.full_command.as_deref() else {
+        return;
+    };
+    if title.contains(cmd) {
+        return;
+    }
+    // 缩进 4 列，与标题行（`  ⏺ `）后的正文对齐。
+    let width = max_content_width.saturating_sub(4).max(1);
+    for raw in cmd.lines() {
+        for part in wrap_line(raw, width) {
+            lines.push(Line::from(Span::styled(
+                format!("    {part}"),
+                Theme::dim(),
+            )));
+        }
+    }
+}
+
 /// thinking 块的渲染方式。流式（`AppState.thinking_buf`）与定稿
 /// （`ChatMessage::Thinking`）两条数据路径共用同一个渲染入口。
 struct ThinkingRenderOpts<'a> {
@@ -1497,13 +1530,12 @@ fn render_chat_message(
 
         // ─── ⏺ ToolName(arg)  ────────────────────────────────────────
         MessageRole::ToolCall => {
+            let title = truncate_line(&msg.content, max_content_width.saturating_sub(4));
             lines.push(Line::from(vec![
                 Span::styled("  ⏺ ", Theme::tool_call()),
-                Span::styled(
-                    truncate_line(&msg.content, max_content_width.saturating_sub(4)),
-                    Theme::tool_call(),
-                ),
+                Span::styled(title.clone(), Theme::tool_call()),
             ]));
+            render_full_command(lines, msg, &title, max_content_width);
 
             // 正在执行中的工具：把实时输出挂在 ⏺ 行下方，完成后由 ⎿ 结果行接手。
             // 没有这一段的话，执行中的工具在聊天区里只有一行标题，用户只能盯着
@@ -1565,7 +1597,7 @@ fn render_chat_message(
             let elapsed_str = msg
                 .elapsed_secs
                 .filter(|&s| s > 0.0)
-                .map(|s| format!(" · {}", format_hms(s)))
+                .map(|s| format!(" · {}", format_elapsed(s)))
                 .unwrap_or_default();
             let total = msg.content.lines().count();
             lines.push(Line::from(vec![
@@ -1846,16 +1878,14 @@ fn render_tool_result_block(
     let elapsed_str = result
         .elapsed_secs
         .filter(|&s| s > 0.0)
-        .map(|s| format!(" · {}", format_hms(s)))
+        .map(|s| format!(" · {}", format_elapsed(s)))
         .unwrap_or_default();
 
     if let Some(call) = call {
+        let title = truncate_line(&call.content, max_content_width.saturating_sub(16));
         lines.push(Line::from(vec![
             Span::styled("  ⏺ ", Theme::tool_call()),
-            Span::styled(
-                truncate_line(&call.content, max_content_width.saturating_sub(16)),
-                Theme::tool_call(),
-            ),
+            Span::styled(title.clone(), Theme::tool_call()),
             Span::styled(elapsed_str, Theme::dim()),
             if result.is_error {
                 Span::styled(" · failed", Theme::error())
@@ -1863,6 +1893,9 @@ fn render_tool_result_block(
                 Span::raw("")
             },
         ]));
+        // Bash 的完整命令：与「标题行 + 结果行」合并成一块渲染时（工具已跑完），
+        // 补全行也得在这里出——否则命令跑完反而看不到了。
+        render_full_command(lines, call, &title, max_content_width);
     } else {
         lines.push(Line::from(vec![
             Span::styled("  ⎿ result", Theme::dim()),
@@ -5950,6 +5983,93 @@ mod tool_result_fold_tests {
         assert_eq!(expanded[1], "    ⎿ first");
         assert_eq!(expanded[2], "       second");
         assert_eq!(expanded[3], "       third");
+    }
+
+    /// Bash 的完整命令必须在 `⏺` 标题行**单独成行**展示。
+    ///
+    /// 回归钉子：标题行里的参数是截断过的摘要（`… crates/api/…`），命令被省略号
+    /// 吞掉的后半段就再也找不回来了——用户没法确认「到底执行了什么」。
+    #[test]
+    fn truncated_bash_command_is_shown_on_its_own_line() {
+        let mut call = message(
+            MessageRole::ToolCall,
+            "Bash(cd /repo && wc -l crates/api/…)",
+        );
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Bash".to_string());
+        call.full_command = Some("cd /repo && wc -l crates/api/src/*.rs".to_string());
+
+        let rendered = render_messages(&[call], 100);
+
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(rendered[0].contains("⏺ Bash("), "{}", rendered[0]);
+        assert_eq!(
+            rendered[1], "    cd /repo && wc -l crates/api/src/*.rs",
+            "完整命令应原样单独成行（不做 ~ 缩写，便于复制粘贴）: {rendered:?}"
+        );
+    }
+
+    /// 命令本来就短到标题行已经看全时，不许补一行重复的噪音。
+    #[test]
+    fn short_bash_command_is_not_duplicated_on_a_second_line() {
+        let mut call = message(MessageRole::ToolCall, "Bash(ls -la)");
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Bash".to_string());
+        call.full_command = Some("ls -la".to_string());
+
+        let rendered = render_messages(&[call], 100);
+
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert!(rendered[0].contains("ls -la"), "{}", rendered[0]);
+    }
+
+    /// 工具跑完后（标题行与结果行合并成一块渲染）补全行**仍然**要在——
+    /// 否则「正在执行时看得到、跑完反而看不到」是倒退。
+    #[test]
+    fn full_command_survives_the_merged_completed_tool_block() {
+        let mut call = message(
+            MessageRole::ToolCall,
+            "Bash(cd /repo && wc -l crates/api/…)",
+        );
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Bash".to_string());
+        call.full_command = Some("cd /repo && wc -l crates/api/src/*.rs".to_string());
+        let mut result = message(MessageRole::ToolResult, "42 crates/api/src/lib.rs");
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Bash".to_string());
+
+        let rendered = render_messages(&[call, result], 100);
+
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("cd /repo && wc -l crates/api/src/*.rs")),
+            "合并块里也要有完整命令: {rendered:?}"
+        );
+    }
+
+    /// 工具耗时必须落到毫秒：`fmt_duration` 的一位小数会把 3ms 与 300ms
+    /// 全部塌成 `0.0s`——用户看到的是「所有工具都瞬时完成」这样一个假事实。
+    #[test]
+    fn sub_second_tool_elapsed_keeps_millisecond_precision() {
+        let mut call = message(MessageRole::ToolCall, "Bash(ls)");
+        call.sequence_no = Some(1);
+        call.tool_name = Some("Bash".to_string());
+        let mut result = message(MessageRole::ToolResult, "a.rs");
+        result.sequence_no = Some(1);
+        result.tool_name = Some("Bash".to_string());
+        result.elapsed_secs = Some(0.042);
+
+        let rendered = render_messages(&[call, result], 100);
+
+        assert!(
+            rendered[0].contains("42ms"),
+            "亚秒工具耗时应显示毫秒: {rendered:?}"
+        );
+        assert!(
+            !rendered[0].contains("0.0s"),
+            "不得再塌成 0.0s: {rendered:?}"
+        );
     }
 
     #[test]

@@ -37,6 +37,24 @@ pub fn fmt_duration_ms(ms: u64) -> String {
     fmt_duration(ms as f64 / 1000.0)
 }
 
+/// 工具耗时专用口径：**亚秒用毫秒**，其余完全同 [`fmt_duration`]。
+///
+/// 为什么不能直接用 [`fmt_duration`]：工具（一次 `ls`、一次 `grep`）的真实耗时
+/// 往往只有几十毫秒，`fmt_duration` 的一位小数会把它们全部塌成 `0.0s`——
+/// 用户看到的是「所有工具都瞬时完成」，而实际值在 3ms 与 300ms 之间差了百倍。
+/// 毫秒是这类量级唯一有分辨力的单位。
+///
+/// 一秒以上**原样交给 [`fmt_duration`]**：那已经是「跑了一阵」的量级，毫秒是噪音，
+/// 而 `12s` 比 `12340ms` 短得多（面板宽度是硬预算）。
+pub fn fmt_duration_precise(secs: f64) -> String {
+    if secs < 1.0 {
+        // 四舍五入到整毫秒；负数（时钟异常）夹到 0，不显示 `-1ms`。
+        let ms = (secs * 1000.0).round().max(0.0) as u64;
+        return format!("{ms}ms");
+    }
+    fmt_duration(secs)
+}
+
 /// 把 token 数压成短字符串。唯一目标是**宽度**：状态栏、输入框标题栏、
 /// 子 Agent 行内状态、Todo 详情、`/cost` 面板、通知正文都要把 token 与其它
 /// 字段排在同一行，位数越少越好。
@@ -77,6 +95,24 @@ mod tests {
     fn duration_ms_is_the_millisecond_entry_point() {
         assert_eq!(fmt_duration_ms(83_000), "1m 23s");
         assert_eq!(fmt_duration_ms(0), "0.0s");
+    }
+
+    /// 工具耗时口径：亚秒必须落到毫秒。
+    ///
+    /// 这条钉子的由来：`fmt_duration` 的一位小数把 3ms 与 300ms 都显示成
+    /// `0.0s` / `0.3s`，其中前者（绝大多数快工具）等于「没显示耗时」。
+    #[test]
+    fn precise_duration_keeps_sub_second_tools_readable() {
+        assert_eq!(fmt_duration_precise(0.0), "0ms");
+        assert_eq!(fmt_duration_precise(0.003), "3ms");
+        assert_eq!(fmt_duration_precise(0.042), "42ms");
+        assert_eq!(fmt_duration_precise(0.999), "999ms");
+        // 一秒以上完全沿用 fmt_duration（宽度是面板的硬预算）。
+        assert_eq!(fmt_duration_precise(1.0), "1.0s");
+        assert_eq!(fmt_duration_precise(12.34), "12s");
+        assert_eq!(fmt_duration_precise(83.0), "1m 23s");
+        // 时钟异常产生的负值不得显示成 `-1ms`。
+        assert_eq!(fmt_duration_precise(-0.5), "0ms");
     }
 
     #[test]

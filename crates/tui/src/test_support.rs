@@ -37,6 +37,7 @@ pub(crate) fn message(role: MessageRole, content: &str) -> ChatMessage {
         sequence_no: None,
         tool_name: None,
         display_summary: String::new(),
+        full_command: None,
         sub_agent_id: None,
         render_cache: std::cell::RefCell::new(None),
     }
