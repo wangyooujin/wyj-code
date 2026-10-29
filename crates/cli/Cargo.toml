@@ -36,3 +36,6 @@ tracing-subscriber.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

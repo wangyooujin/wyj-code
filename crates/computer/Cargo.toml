@@ -48,3 +48,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSS
 objc2-vision = { version = "0.3", default-features = false, features = ["VNRequestHandler", "VNRequest", "VNRecognizeTextRequest", "VNObservation", "VNTypes", "objc2-core-foundation"] }
 
 [dev-dependencies]
+
+[lints]
+workspace = true

@@ -8,3 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 rust-i18n.workspace = true
+
+[lints]
+workspace = true

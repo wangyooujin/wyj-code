@@ -16,6 +16,14 @@ members = [
     "crates/computer",
 ]
 
+[workspace.lints.clippy]
+# `#[async_trait]` 展开时会给每个 async 方法加上 `#[must_use]`，而它返回的
+# `BoxFuture` / `Pin<Box<dyn Future>>` **本身就是 must_use 类型** → 新版 clippy
+# 报 `double_must_use`。警告点在第三方宏展开里，本仓库无从修改；上游
+# async-trait 尚未适配（rustc 1.99 / clippy 1.99）。
+# 这里只关这一条 lint，其余 clippy 规则照常。
+double_must_use = "allow"
+
 [workspace.package]
 version = "0.3.24"
 edition = "2021"

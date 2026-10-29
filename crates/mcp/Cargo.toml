@@ -18,3 +18,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 rmcp = { version = "1.8", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[lints]
+workspace = true

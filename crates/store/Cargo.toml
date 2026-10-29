@@ -29,3 +29,6 @@ url.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+
+[lints]
+workspace = true
