@@ -1134,6 +1134,6 @@ notify:
     turn_error: "wyj-code turn error"
     subagent_done: "wyj-code subagent finished"
   body:
-    turn_finished: "Duration {duration_ms}ms. {summary}"
+    turn_finished: "Duration {duration}. {summary}"
     turn_error: "{error}"
     subagent_done: "Agent {agent_id}. {summary}"

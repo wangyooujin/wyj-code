@@ -3908,7 +3908,14 @@ async fn run_one_turn(
     match &turn_result {
         Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
             duration_ms: started.elapsed().as_millis() as u64,
-            summary: format!("{} ({turns} msgs)", env.entry_label),
+            // token 走 `humanize::fmt_tokens`：与 TUI 状态栏同一套口径（上万压成
+            // `12.3k`），否则通知正文里的六位数会把摘要挤成噪音。
+            summary: format!(
+                "{} · {}↑ {}↓",
+                env.entry_label,
+                wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
+                wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
+            ),
             session_id: Some(env.session_id.clone()),
         }),
         Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {
@@ -4693,7 +4700,11 @@ async fn repl(
         match &run_result {
             Ok(()) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnFinished {
                 duration_ms: started.elapsed().as_millis() as u64,
-                summary: format!("repl (turn {turns})"),
+                summary: format!(
+                    "repl (turn {turns}) · {}↑ {}↓",
+                    wyj_core::humanize::fmt_tokens(session.total_input_tokens as u64),
+                    wyj_core::humanize::fmt_tokens(session.total_output_tokens as u64),
+                ),
                 session_id: Some(session_id.clone()),
             }),
             Err(e) => wyj_core::notify::emit(wyj_core::notify::NotificationEvent::TurnError {

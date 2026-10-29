@@ -12,6 +12,19 @@
 
 ## [0.3.24] - 2026-10-29
 
+### 改进：通知正文的耗时与 token 改成人可读格式
+
+通知正文此前写的是「耗时 83000 毫秒」——毫秒数对人是纯噪音，且长度随耗时线性
+膨胀，把正文顶出通知栏宽度；token 则是裸的六位数。现在：
+
+* 耗时按 **TUI 聊天区同一套口径**渲染（`1m 23s` / `23s` / `0.3s` / `1h 2m 3s`）；
+* token 与状态栏一致，上万压成 `12.3k`（1000~9999 仍保留千分位 `1,234`）；
+* TUI / CLI `-p` / CLI headless REPL 三处通知摘要的 token 统计统一走这条规则。
+
+实现上把 `fmt_tokens` / `format_hms` 从 `crates/tui/src/app.rs`（`pub(crate)`，
+`core` 用不上）上移到新的 `crates/core/src/humanize.rs`，TUI 侧改为转调——
+通知与界面必须同源，各自写一份必然漂移。
+
 ### 修复：压缩阈值比较口径错误，压缩永远不收敛（P0）
 
 `compact_threshold` 的阈值**已经**通过 `compact_trigger_buffer` 扣掉了输出预留，

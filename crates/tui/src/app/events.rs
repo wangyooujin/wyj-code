@@ -225,8 +225,9 @@ impl AppState {
                     self.last_turn_input_tokens = d_in;
                     self.last_turn_output_tokens = d_out;
                     self.push_tracked_message(ChatMessage::turn_summary(elapsed, d_in, d_out));
-                    // 统一通知：主回合正常完成
-                    let summary = format!("{d_in}↑ {d_out}↓");
+                    // 统一通知：主回合正常完成。token 走 `fmt_tokens`（与状态栏
+                    // 同一套口径）：上万后压成 `12.3k`，避免长会话把通知正文顶爆。
+                    let summary = format!("{}↑ {}↓", fmt_tokens(d_in), fmt_tokens(d_out));
                     let summary = truncate_notify_body(&summary);
                     notify_emit(NotificationEvent::TurnFinished {
                         duration_ms: (elapsed * 1000.0) as u64,

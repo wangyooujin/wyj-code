@@ -1128,6 +1128,6 @@ notify:
     turn_error: "wyj-code 回合出错"
     subagent_done: "wyj-code 子 Agent 完成"
   body:
-    turn_finished: "耗时 {duration_ms} 毫秒。{summary}"
+    turn_finished: "耗时 {duration}。{summary}"
     turn_error: "{error}"
     subagent_done: "子 Agent {agent_id}。{summary}"

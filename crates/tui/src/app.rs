@@ -372,23 +372,11 @@ pub enum TodoExecutionEntry {
 /// 把 token 数压成短字符串。唯一目标是**宽度**：状态栏、输入框标题栏、子 Agent
 /// 行内状态、Todo 详情、`/cost` 面板都要把 token 与其它字段排在同一行，位数越少越好。
 ///
-/// - `>= 1_000_000` → 一位小数的 M（`1.5M`）
-/// - `>= 10_000` → 一位小数的 k（`12.3k`）。这一步是 v0.2.31 加的：会话累计轻易
-///   破六位数，原来的 `format!("{},{:03}")` 会把 `123,456`（7 字符）整段塞进标题栏，
-///   在窄终端里直接把模型名和耗时挤出视野。1000~9999 仍在千分位区间，量级还没
-///   到需要牺牲精度的时候。
-/// - `>= 1_000` → 千分位（`1,234`）
-/// - 其余原样（`678`）
+/// 实现搬到 `wyj_core::humanize::fmt_tokens`——通知正文（`crates/core`）要显示
+/// 同一份 token 统计，两处各写一份必然漂移（阈值改了一处就出现「界面写 1,234、
+/// 通知写 1.2k」）。规则见 core 侧文档。
 pub(crate) fn fmt_tokens(n: u32) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else if n >= 1000 {
-        format!("{},{:03}", n / 1000, n % 1000)
-    } else {
-        n.to_string()
-    }
+    wyj_core::humanize::fmt_tokens(n as u64)
 }
 
 /// 速率滑动窗口长度。太短会把每个 chunk 的抖动放大，太长会让「模型突然变慢」
@@ -599,27 +587,9 @@ mod fmt_tokens_tests {
 }
 
 /// 将秒数格式化为 xh ym zs，便于一眼辨识长耗时。
-/// - 小于 10 秒保留一位小数（0.3s / 1.2s）
-/// - 10-60 秒显示整数秒
-/// - 超过 1 分钟显示 m s；超过 1 小时显示 h m s
+/// 实现搬到 `wyj_core::humanize::fmt_duration`——通知正文用同一套口径。
 pub(crate) fn format_hms(secs: f64) -> String {
-    if secs < 60.0 {
-        if secs < 10.0 {
-            format!("{:.1}s", secs)
-        } else {
-            format!("{:.0}s", secs)
-        }
-    } else {
-        let total = secs as u64;
-        let h = total / 3600;
-        let m = (total % 3600) / 60;
-        let s = total % 60;
-        if h > 0 {
-            format!("{}h {}m {}s", h, m, s)
-        } else {
-            format!("{}m {}s", m, s)
-        }
-    }
+    wyj_core::humanize::fmt_duration(secs)
 }
 
 /// 权限确认对话框状态

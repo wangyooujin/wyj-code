@@ -234,10 +234,12 @@ impl NotifyDispatcher {
                 summary,
                 session_id,
             } => {
-                let duration_str = duration_ms.to_string();
+                // 耗时按 TUI 聊天区同一套口径渲染（`1m 23s`），不再报「83000 毫秒」：
+                // 毫秒数对人是纯噪音，且长度随耗时线性膨胀，会把正文顶出通知栏宽度。
+                let duration_str = crate::humanize::fmt_duration_ms(duration_ms);
                 let body = wyj_i18n::tr_fmt(
                     "notify.body.turn_finished",
-                    &[("duration_ms", &duration_str), ("summary", &summary)],
+                    &[("duration", &duration_str), ("summary", &summary)],
                 );
                 NotificationPayload {
                     kind,
@@ -786,6 +788,25 @@ mod tests {
         });
         // 失败的 sink 不应阻断后续 sink
         assert_eq!(rec_ok.received().len(), 1);
+    }
+
+    #[test]
+    fn turn_finished_body_shows_a_readable_duration_not_raw_milliseconds() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rec = RecordingSink::new(0);
+        let sinks: Vec<Box<dyn NotificationSink>> = vec![Box::new(rec.clone())];
+        init_with_sinks(&NotifyCfg::default(), sinks);
+        emit(NotificationEvent::TurnFinished {
+            duration_ms: 83_000,
+            summary: "12.3k↑ 340↓".to_string(),
+            session_id: None,
+        });
+        let body = &rec.received()[0].1;
+        assert!(
+            body.contains("1m 23s"),
+            "耗时应按 TUI 同一套口径渲染：{body}"
+        );
+        assert!(!body.contains("83000"), "正文里不该再出现裸毫秒数：{body}");
     }
 
     #[test]
