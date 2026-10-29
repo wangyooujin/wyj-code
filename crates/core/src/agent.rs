@@ -1,7 +1,7 @@
 //! Agent 推理循环：多轮工具调用直到 stop_reason 不再是 tool_use。
 
 use crate::claude_md::ClaudeMdLoader;
-use crate::compact::{compact_trigger_buffer, ContextAudit};
+use crate::compact::ContextAudit;
 use crate::evolution::EvolutionStore;
 use crate::hooks::{HookOutcome, HookRunner};
 use crate::memory::MemoryStore;
@@ -334,27 +334,6 @@ fn soft_threshold_tokens(
 /// 服务端又清掉其中一个的错位现场。
 fn server_context_management_trigger(context_window: u32) -> u32 {
     ((context_window as f64) * 0.7).round() as u32
-}
-
-/// 静态容量表给出的窗口至少要能为「输出预算 + 协议开销 + 可压缩提示段」
-/// 留出空间，否则它不是保守下限，而是一个错值。
-///
-/// `known_model_capacity` 用子串匹配模型族名，聚合路由的 ID（
-/// `deepseek/deepseek-v4.1-flash-1017`）会被 `("deepseek", 64_000)` 命中，
-/// 而这个真实模型往往有更大的窗口。把窗口收窄到 64K 本身只是「压得勤」，
-/// 但配合用户配置的 `max_tokens = 64_000` 就会算出
-/// `64_000 - (64_000 + 8_192) = 0` 的压缩阈值——每个回合都判定超限，
-/// 历史压到只剩摘要也「降不下来」，形成压缩死循环。
-///
-/// 所以低于 `max_output + 8_192 + MIN_PROMPT_BUDGET` 的目录值一律不采纳：
-/// 保留配置值，让端点 400 给出实测上界（`Session::overflow_window_hint`）。
-fn consistent_catalog_window(model: &str, max_output_tokens: u32) -> Option<u32> {
-    const MIN_PROMPT_BUDGET: u64 = 16_384;
-    wyj_api::known_model_capacity(model)
-        .map(|cap| cap.context_window)
-        .filter(|window| {
-            u64::from(*window) > u64::from(max_output_tokens) + 8_192 + MIN_PROMPT_BUDGET
-        })
 }
 
 #[derive(Clone)]
@@ -1583,7 +1562,7 @@ impl Agent {
 
         let measure = |messages: &[wyj_api::types::Message]| -> u32 {
             ContextAudit::from_request(request_system, messages, request_tools, max_output_tokens)
-                .calibrated_total(ratio)
+                .calibrated_prompt(ratio)
         };
         let mut estimate = measure(&session.messages);
 
@@ -1633,7 +1612,7 @@ impl Agent {
         )
         .with_window(window);
         session.context_audit = audit;
-        audit.calibrated_total(ratio)
+        audit.calibrated_prompt(ratio)
     }
 
     /// 取本次请求要拼进 system 稳定前缀的跨会话记忆快照。
@@ -2270,55 +2249,73 @@ impl Agent {
                     &request_tools,
                     opts.max_tokens,
                 );
-                // 有效窗口：配置值 → 静态容量表 → 端点实测，取最小。
+                // 有效窗口 = **配置里填的值**，只有端点实测能收紧。
                 //
-                // 中间那层是 2026-10 补的：实测 686 个会话里多个 profile 把
-                // `context_window` 填成 1,000,000，而真实模型只有 204,800，
-                // 于是软/硬阈值双双落在够不着的位置（94% 的长会话从未压缩）。
-                // 之前只靠端点报 400 自愈，而这些第三方端点选择静默截断。
+                // 不再按静态容量表收紧（v0.3.24）：那层用模型名**子串匹配**猜
+                // 窗口，会静默改写用户显式配置，且同一模型换个名字写法
+                // （`MiniMax-M3.1-Flash` vs `minimax/minimax-m3.1-flash:free`）
+                // 就得到不同结果——这正是「anthropic 端点频繁压缩、openai 端点
+                // 不压缩」的表面差异来源。两条线现在走同一套判据。
                 //
-                // **目录值必须先过一致性校验**：容量表用子串匹配族名
-                // （`models.rs` 的 `("deepseek", 64_000)` 会命中
-                // `deepseek/deepseek-v4.1-flash-1017` 这种聚合路由 ID）。当猜测
-                // 出的窗口连「用户的输出预算 + 协议开销 + 最小可压缩提示段」
-                // 都装不下时，它不是保守下限而是一个错值——此时宁可保留配置
-                // 值，让端点 400 给出实测上界（`overflow_window_hint`）。
-                // 否则会算出 `window - (max_tokens + 8192) = 0` 的压缩阈值，
-                // 每一轮请求都判定「超限」→ 每回合都压缩 → 死循环。
-                let catalog_hint = consistent_catalog_window(&route.model, route.max_tokens);
-                let effective_window =
-                    session.effective_context_window(route.context_window, catalog_hint);
+                // 配置填得比端点真实窗口大时，自愈路径仍在：端点报
+                // `ContextLengthExceeded` → `note_context_overflow` 记下实测上界
+                // → 后续窗口按实测收紧（`Session::effective_context_window`）。
+                let effective_window = session.effective_context_window(route.context_window);
 
-                // 输出预算与有效窗口必须相容：`compact_trigger_buffer` 不
-                // 小于 `max_tokens`（这是「阈值 + 输出预留 ≤ 窗口」的硬保证），
-                // 所以一旦 `max_tokens + 8192 ≥ 窗口`，阈值会被 `saturating_sub`
-                // 静默压成 0。那不是一个「很紧」的阈值，而是「永远超限」——
-                // 历史压到只剩一条摘要也仍然 > 0，压缩永远收敛不了。
+                // 输出预算与有效窗口必须相容。两条独立的失败形态，同一次夹紧
+                // 一起处理：
                 //
-                // 这里把输出预算压到窗口的 40%：既留出可压缩的提示空间，也
-                // 让单次请求的结构性 400 风险归零。只改本次请求的 `opts`，
-                // 不动 profile 配置——它表达的是「这个端点的输出上限」，而
-                // 这里要解决的是「窗口根本容不下它」。
-                let requested_max_tokens = opts.max_tokens;
-                if compact_trigger_buffer(effective_window, requested_max_tokens)
-                    >= effective_window
-                {
-                    let clamped = (effective_window.saturating_mul(2) / 5).max(1);
-                    opts.max_tokens = clamped;
-                    context_audit.output_reserve = clamped;
+                // ① **阈值被压成 0**：`compact_trigger_buffer` 不小于
+                //    `max_tokens + 8192`，一旦它 ≥ 窗口，阈值会被
+                //    `saturating_sub` 静默压成 0——那是「永远超限」，历史压到
+                //    只剩一条摘要也仍然 > 0，压缩永远收敛不了。
+                // ② **阈值低到不可用**：口径统一之后不会再死循环，但
+                //    `max_tokens` 正比地吃掉可压缩空间。实测
+                //    `context_window = 204,800` / `max_tokens = 128,000`
+                //    （62.5% 窗口）时阈值只剩 68,608，历史刚过 68K 就压一次——
+                //    能收敛，但每几轮就弹一次压缩提示，每次都要付一趟摘要往返。
+                //
+                // 判据与取值都在 `fit_max_output_tokens` 里：阈值低于窗口一半
+                // 就把输出预算夹到窗口的 40%。它在「阈值被压成 0」这条极端路径
+                // 上与旧代码用同一个 40% 常量，行为不变；只往小夹、永不放大，
+                // 用户填得比 40% 还小时原值返回。
+                //
+                // 只改本次请求的 `opts`，不动 profile 配置——它表达的是「这个
+                // 端点的输出上限」，而这里要解决的是「窗口根本容不下它」。
+                //
+                // **必须先取「实际会发出去」的预算再夹**：`anthropic.rs` 在
+                // `max_tokens <= thinking_budget` 时会把预算抬到 `budget + 4096`
+                // （官方形态的硬性要求）。若拿夹紧后的值去比、又让 provider 抬
+                // 回去，`context_audit.output_reserve` 就与真实请求不符——
+                // 阈值按较小的预留算，实际却发出更大的输出，结构性 400 回来。
+                let provider_floor = opts
+                    .thinking_budget
+                    .map(|budget| budget.saturating_add(4_096))
+                    .unwrap_or(0);
+                let requested_max_tokens = opts.max_tokens.max(provider_floor);
+                let fitted =
+                    crate::compact::fit_max_output_tokens(effective_window, requested_max_tokens);
+                // `max(provider_floor)` 双向兜住：既保证 provider 不会再把预算
+                // 抬高（抬了就是绕过本次夹紧），也保证审计口径等于实际发送值。
+                let applied = fitted.max(provider_floor);
+                if applied != opts.max_tokens || context_audit.output_reserve != applied {
+                    opts.max_tokens = applied;
+                    context_audit.output_reserve = applied;
+                }
+                if fitted < requested_max_tokens {
                     tracing::warn!(
                         model = %route.model,
                         window = effective_window,
                         requested = requested_max_tokens,
-                        applied = clamped,
-                        "输出预算超出有效窗口的可压缩余量，本请求已临时下调"
+                        applied,
+                        "输出预算挤占了过多可压缩提示空间，本请求已临时下调"
                     );
                     on_text(&wyj_i18n::tr_fmt(
                         "agent.output_budget_clamped",
                         &[
                             ("requested", &requested_max_tokens.to_string()),
                             ("window", &effective_window.to_string()),
-                            ("applied", &clamped.to_string()),
+                            ("applied", &applied.to_string()),
                         ],
                     ));
                 }
@@ -2327,8 +2324,14 @@ impl Agent {
                 // 每轮请求成功后 provider 上报的真实 prompt token（见
                 // `Session::observe_prompt_tokens`），未校准时就是 1.0，行为与
                 // 旧版逐字节相同。
+                //
+                // **只取 prompt 部分**（`calibrated_prompt`）：阈值经
+                // `compact_trigger_buffer` 已扣掉输出预留，左边的量若再含
+                // `max_tokens` 就是把它计两遍——`max_tokens = 128000` /
+                // 204,800 窗口时阈值只有 68,608，`128000 > 68608` 恒成立，
+                // 压缩永不收敛。详见 `compact_threshold` 的文档。
                 let ratio = session.estimate_ratio();
-                let estimated_before = context_audit.calibrated_total(ratio);
+                let estimated_before = context_audit.calibrated_prompt(ratio);
                 session.context_audit = context_audit.with_window(effective_window);
                 // 下限兜底：`compact_threshold` 同时守住「阈值 + 输出 ≤ 窗口」
                 // 与「阈值 > 0」两条不变量，详见其文档。
@@ -2443,7 +2446,7 @@ impl Agent {
                             &request_tools,
                             opts.max_tokens,
                         )
-                        .calibrated_total(ratio)
+                        .calibrated_prompt(ratio)
                     };
                     // 压缩是本次提交里真实发生的花费：历史最长时它往往是
                     // 一趟与历史等长的输入。不计进 `turn_spend`，金额熔断
@@ -2522,7 +2525,7 @@ impl Agent {
                         // 全量摘要往返，而历史已经被压到只剩摘要，压无可压。
                         // 冷却 3 轮后自动重试（窗口/配置可能已被用户改过），
                         // 期间仍由 `truncate_messages` 与 400 恢复路径兜底。
-                        let after = session.context_audit.calibrated_total(ratio);
+                        let after = session.context_audit.calibrated_prompt(ratio);
                         if after > compact_threshold {
                             session.compact_cooldown_turns = 3;
                             on_text(&wyj_i18n::tr_fmt(
@@ -2626,11 +2629,16 @@ impl Agent {
                                     .unwrap_or(false);
                             if context_overflow {
                                 context_recovered = true;
-                                // 记下这次被拒的真实 prompt 规模：配置里的
+                                // 记下这次被拒的真实请求规模：配置里的
                                 // `context_window` 是裸值，端点说「太长」就是它
                                 // 唯一一次给的实测证据。后续有效窗口按
                                 // `min(configured, hint)` 收紧，否则阈值会一直
                                 // 落在够不着的位置，每回合都要撞一次 400 才能压。
+                                //
+                                // 这里**必须**用含输出预留的 `calibrated_total`：
+                                // `compact_trigger_buffer` 保证「阈值 + max_tokens
+                                // ≤ 窗口」，若只记 prompt，收紧后的窗口会漏掉
+                                // 输出预留那一段，改完仍然是结构性必 400。
                                 let rejected = ContextAudit::from_request(
                                     &request_system,
                                     outbound_messages,
@@ -4360,12 +4368,9 @@ impl Agent {
         crate::compact::compact_session_with_session_memory(
             session,
             route.provider.as_ref(),
-            session.effective_context_window(
-                route.context_window,
-                // 与自动压缩同一份一致性校验：手动 /compact 与自动压缩若用
-                // 两个窗口，摘要预算与保留量都会对不上。
-                consistent_catalog_window(&route.model, route.max_tokens),
-            ),
+            // 与自动压缩同源：配置值原样生效，只有端点实测能收紧。两处若用
+            // 不同窗口，摘要预算与保留量都会对不上。
+            session.effective_context_window(route.context_window),
             // 与 `run_turn` 内两条压缩路径同一判据：不缓存的端点退回独立请求
             // 形态，避免把整段历史全价重发一遍。
             if route

@@ -10,7 +10,54 @@
 > 而不是漏发。**GitHub 上的旧 tag 仍是 `v1.x.y`**，改名之前历史 release 链接
 > 与自更新比较（`store::self_update::is_newer`）都仍按旧编号走。
 
-## [Unreleased]
+## [0.3.24] - 2026-10-29
+
+### 修复：压缩阈值比较口径错误，压缩永远不收敛（P0）
+
+`compact_threshold` 的阈值**已经**通过 `compact_trigger_buffer` 扣掉了输出预留，
+但判定用的却是含 `output_reserve` 的 `calibrated_total`——`max_tokens` 被计两遍，
+实际约束退化成 `prompt + 2 × max_tokens + 8192 ≤ window`。两个极端同属一个缺陷：
+
+* 官方 Anthropic、`max_tokens = 32000` / 200K 窗口时，prompt 只到 127,008
+  （63.5%）就触发压缩，而 buffer 的设计意图是 90%；
+* `max_tokens = 128000` / 204,800 窗口时阈值只有 68,608，**小于输出预留本身**，
+  于是 `128000 > 68608` 恒成立——历史压到只剩一条摘要仍判定超限，
+  每三轮回退一次、永不收敛（现场：反复弹「已自动压缩 · 保留最近 0 条原文」）。
+
+新增 `ContextAudit::calibrated_prompt`（只含 prompt）与 `prompt_tokens`，
+`calibrated_total` 保留给「这次请求一共多大」的展示口径。四处判定统一改成
+`calibrated_prompt`：`run_turn` 的进入判定、`compact_session_until_fit` 的收敛判定、
+`elide_stale_tool_results` 的停手线、`/context` 面板的阈值。
+**唯一例外**是 400 恢复路径的 `note_context_overflow`——那里记的是「端点实际拒绝的
+完整请求规模」，必须含输出预留。`Session::observe_prompt_tokens` 的分母同步改用
+`prompt_tokens()`：端点上报的 `prompt_tokens` 从不含本次输出，两边都不含才是同一个量。
+
+### 修复：`context_window` 被静态容量表静默改写
+
+`Session::effective_context_window` 此前还有一层「按 `known_model_capacity()` 的
+**模型名子串**收紧配置值」，三个无法弥合的缺陷：① 静默改写用户显式配置，与
+`--config-status` 那套「只提示不改值」自相矛盾；② 判据是子串匹配，同一模型换个
+写法（`MiniMax-M3.1-Flash` vs `minimax/minimax-m3.1-flash:free`）就命中/不命中，
+**Anthropic 与 OpenAI 两条线因此得到不同窗口**——用户实测的「anthropic 端点频繁弹
+压缩提示、openai 端点不弹」就是它造成的，不是协议差异；③ 容量表是保守**下限**，
+用它去收紧更大的配置值方向本来就反。
+
+现在有效窗口只有两档：配置值本身，以及端点亲口报 `ContextLengthExceeded` 后记下的
+实测上界。`consistent_catalog_window` 随之删除。静态表仍用于 `--config-status` 的
+**提示**（`status.context_window_larger_than_catalog`，措辞明说「运行时不会改写」）
+与 `/model` 面板的自动填值，仅此而已。
+
+### 新增：输出预算第二道防线 `fit_max_output_tokens`
+
+口径统一后不再死循环，但 `max_tokens` 会正比吃掉可压缩空间——204,800 窗口配
+128,000 输出（62.5% 窗口）时阈值只剩 68,608，历史刚过 68K 就压一次，能收敛但每
+几轮就弹一次压缩提示、每次都付一趟摘要往返。现在「阈值低于窗口一半」就把输出预算
+夹到窗口的 40%（与旧代码在「阈值被压成 0」那条极端路径上是同一个常量，故小窗口
+行为不变），只往小夹、永不放大，`window = 0` 哨兵视为不夹。
+
+夹紧前先把 `thinking_budget + 4096` 这个 provider 侧硬性下限算进 `requested`，
+否则 `anthropic.rs` 会在 `max_tokens <= budget` 时把预算抬回去，
+`context_audit.output_reserve` 与真实请求脱节、结构性 400 回来。
 
 ### 新增：`wyj-code export` / `import` 配置备份
 

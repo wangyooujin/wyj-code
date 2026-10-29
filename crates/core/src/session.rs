@@ -434,10 +434,10 @@ impl Session {
     ///      上报口径不同（或干脆编了个数）；
     ///   3. EWMA 权重 0.1：系统性偏差几轮内收敛，单轮抖动不会改写阈值。
     pub fn observe_prompt_tokens(&mut self, real_prompt_tokens: u32) {
-        let prompt_estimate = self
-            .context_audit
-            .total()
-            .saturating_sub(self.context_audit.output_reserve);
+        // 分母必须是**不含输出预留**的 prompt：端点上报的 `prompt_tokens`
+        // 也从来不含本次要生成的输出。两边都扣掉才是同一个量，否则系数会被
+        // 系统性放大（`max_tokens` 越大偏得越多），阈值跟着被推晚。
+        let prompt_estimate = self.context_audit.prompt_tokens();
         if prompt_estimate < 1_000 || real_prompt_tokens == 0 {
             return;
         }
@@ -460,39 +460,42 @@ impl Session {
 
     /// 本会话实际生效的上下文窗口。
     ///
-    /// 三层取值，取最小：
+    /// **配置值就是配置值**：`configured` 原样生效，唯一的例外是
+    /// `overflow_window_hint`——端点亲口以「上下文超限」拒绝时记下的实测上界。
+    ///
+    /// 两层取值，取最小：
     ///   1. `configured`——用户填的配置值；
-    ///   2. `catalog_hint`——静态容量表对**这个模型名**给出的已知窗口；
-    ///   3. `overflow_window_hint`——端点亲口拒绝时记下的实测上界。
+    ///   2. `overflow_window_hint`——端点亲口拒绝时记下的实测上界。
     ///
-    /// ## 为什么第 2 层必须有
+    /// ## 为什么不再按静态容量表收紧（v0.3.24 移除）
     ///
-    /// 实测（2026-10-28，本机 686 个会话）：多个 profile 的 `context_window`
-    /// 填成 `1_000_000`，而实际模型是 `minimax-m3`（真实窗口 204,800）/
-    /// `glm-5.3-flash`。后果是两道防线同时落在够不着的位置——
-    /// `soft_threshold = 1_000_000 × 0.45 = 450k`、压缩硬阈值 ≈ 900k，
-    /// 而真实请求根本到不了这个量级。结果：218 个长会话里 **94% 从未压缩、
-    /// 88% 从未 context 清理**，历史无限累积。
+    /// 旧实现还有第三层：按 `known_model_capacity()` 对**模型名子串**猜出的
+    /// 窗口收紧配置值。这条路径有三个无法弥合的缺陷：
     ///
-    /// 之前只有第 3 层兜底，它依赖端点主动报 400；而这些第三方端点选择
-    /// **静默截断**而不是报错（686 个会话 `overflow_window_hint` 全为 0），
-    /// 于是自愈路径从未启动。
+    /// 1. **它改写的是用户显式配置**。用户填 `context_window = 1_000_000`
+    ///    表达的是「我这个端点支持 1M」——那是他掌握的信息，比仓库里一张
+    ///    静态表新。静默收紧到表里的值属于「运行期偷偷改配置」，
+    ///    与 `--config-status` 那套「只提示不改值」的既有做法自相矛盾。
+    /// 2. **判据是子串匹配，两个协议下结果还会不一样**。同一张表要同时服务
+    ///    Anthropic 与 OpenAI 两条线，而模型名写法各异
+    ///    （`MiniMax-M3.1-Flash` vs `minimax/minimax-m3.1-flash:free`），
+    ///    是否命中随名字变。于是「anthropic 有压缩提示、openai 没有」这种
+    ///    表面上的协议差异，实际来自字符串匹配的偶然结果——这正是
+    ///    用户实测反馈的现象。
+    /// 3. **容量表给的是保守下限**（见 `known_model_capacity` 的文档），
+    ///    用它去收紧一个更大的配置值，方向本来就是反的。
     ///
-    /// ## 为什么只在「配置 > 目录值」时收紧
+    /// 配置值填得超过端点真实窗口时，自愈路径仍在：端点报
+    /// `ContextLengthExceeded` → [`Self::note_context_overflow`] 记下实测上界
+    /// → 后续窗口按实测收紧。这是**端点亲口给出的证据**，不是猜的。
     ///
-    /// 容量表是**保守下限**（见 `known_model_capacity` 的文档）：命中即代表
-    /// 「至少这么大」。用户填得比它小是刻意的省成本选择，不能反向放大。
-    /// 所以只在 `configured > catalog` 时按目录值收紧，其余保持原值。
-    pub fn effective_context_window(&self, configured: u32, catalog_hint: Option<u32>) -> u32 {
-        let mut window = configured;
-        if let Some(catalog) = catalog_hint.filter(|c| *c > 0) {
-            if configured > catalog {
-                window = catalog;
-            }
-        }
+    /// `catalog_hint` 已从签名移除：静态表仍用于 `/context` 面板与
+    /// `--config-status` 的**提示**（「你填的窗口比目录值大，确认过吗」），
+    /// 但它不再参与任何判定，留一个被忽略的参数只会让人以为它还有作用。
+    pub fn effective_context_window(&self, configured: u32) -> u32 {
         match self.overflow_window_hint {
-            Some(hint) if hint > 0 => window.min(hint),
-            _ => window,
+            Some(hint) if hint > 0 => configured.min(hint),
+            _ => configured,
         }
     }
 
@@ -975,11 +978,11 @@ mod tests {
     #[test]
     fn overflow_hint_shrinks_the_effective_window() {
         let mut session = Session::new();
-        assert_eq!(session.effective_context_window(1_000_000, None), 1_000_000);
+        assert_eq!(session.effective_context_window(1_000_000), 1_000_000);
         session.note_context_overflow(256_000);
-        assert_eq!(session.effective_context_window(1_000_000, None), 256_000);
+        assert_eq!(session.effective_context_window(1_000_000), 256_000);
         // 配置值更小时依然以配置为准（hint 只是上界证据，不是真相覆盖）
-        assert_eq!(session.effective_context_window(128_000, None), 128_000);
+        assert_eq!(session.effective_context_window(128_000), 128_000);
     }
 
     /// 只往小取：连续撞两次时记住更严的那个。
@@ -989,43 +992,42 @@ mod tests {
         session.note_context_overflow(400_000);
         session.note_context_overflow(200_000);
         assert_eq!(session.overflow_window_hint, Some(200_000));
-        assert_eq!(session.effective_context_window(1_000_000, None), 200_000);
+        assert_eq!(session.effective_context_window(1_000_000), 200_000);
         // 0 是「没量到」，不能把已学到的窗口上界抹成 0
         session.note_context_overflow(0);
         assert_eq!(session.overflow_window_hint, Some(200_000));
     }
 
-    /// 静态容量表给出的窗口要能收紧配置值——这是「94% 的长会话从未压缩」
-    /// 那个实测缺陷的直接对策：`context_window` 填 1M 而模型真实只有 204.8K。
+    /// **配置值就是配置值**：静态容量表不得改写它。
+    ///
+    /// 这是用户明确要求的语义——`context_window` 填多少就是多少，Anthropic
+    /// 与 OpenAI 两条线走同一个判据。旧实现按 `known_model_capacity()` 的
+    /// 模型名子串收紧，导致同一个模型换个名字写法（`MiniMax-M3.1-Flash` vs
+    /// `minimax/minimax-m3.1-flash:free`）就得到不同的窗口，
+    /// 表现为「anthropic 端点频繁压缩、openai 端点不压缩」。
     #[test]
-    fn catalog_hint_shrinks_the_configured_window() {
+    fn configured_window_is_never_rewritten_by_the_catalog() {
         let session = Session::new();
-        // minimax-m3 在静态表里是 204,800；配置写成 1M 必须被收紧。
-        assert_eq!(
-            session.effective_context_window(1_000_000, Some(204_800)),
-            204_800
-        );
-        // 配置值比目录值小：用户刻意省成本，不能反向放大。
-        assert_eq!(
-            session.effective_context_window(100_000, Some(204_800)),
-            100_000
-        );
-        // 目录未命中（None / 0）：保持配置值，不猜。
-        assert_eq!(session.effective_context_window(1_000_000, None), 1_000_000);
-        assert_eq!(
-            session.effective_context_window(1_000_000, Some(0)),
-            1_000_000
-        );
+        // 目录说 204,800、配置写 1M → 仍按 1M 判定（Minimax 现场配置）。
+        assert_eq!(session.effective_context_window(1_000_000), 1_000_000);
+        // 配置值更小：同样保持原值，绝不放大。
+        assert_eq!(session.effective_context_window(100_000), 100_000);
     }
 
-    /// 三层同时存在时取最小：配置 1M、目录 204.8K、端点实测 128K → 128K。
+    /// 真实的收紧只剩一条：端点亲口拒绝时记下的实测上界。
     #[test]
-    fn effective_window_takes_the_minimum_of_all_three_layers() {
+    fn only_the_endpoint_measured_hint_shrinks_the_window() {
         let mut session = Session::new();
+        assert_eq!(
+            session.effective_context_window(1_000_000),
+            1_000_000,
+            "没有实测证据时必须原样使用配置值"
+        );
         session.note_context_overflow(128_000);
         assert_eq!(
-            session.effective_context_window(1_000_000, Some(204_800)),
-            128_000
+            session.effective_context_window(1_000_000),
+            128_000,
+            "端点实测才是唯一有效的收紧依据"
         );
     }
 

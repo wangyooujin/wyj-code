@@ -352,23 +352,26 @@ enum SessionCommand {
 fn print_config_hints(active: &wyj_config::Profile) {
     // 1) 超大上下文窗口
     if active.context_window > 500_000 {
-        // 静态容量表命中且配置值超过它 → 说清楚「会被自动收紧到多少」，
-        // 而不是只报一个笼统的「未经验证」。实测（2026-10）多个 profile 把
-        // 窗口填成 1M 而模型真实只有 204.8K，导致 94% 的长会话从未压缩过；
-        // 现在 `effective_context_window` 会按目录值收紧，这里要如实告知。
+        // **只提示，绝不改值**，而且不能说成「会被收紧」——v0.3.24 起
+        // `effective_context_window` 只认配置值与端点实测，静态表不参与判定。
+        // 静态表的命中结果是「这个模型名看起来像某个已知族，它至少有这么大」，
+        // 用户填得更大可能完全正确（新版本模型 / 代理层扩容），所以这里只能
+        // 提醒他去核对，不能宣称运行时会改写。
         let catalog = wyj_api::known_model_capacity(&active.model)
             .map(|cap| cap.context_window)
             .filter(|c| *c > 0 && *c < active.context_window);
-        let effective = catalog.unwrap_or(active.context_window);
-        let trigger = effective.saturating_sub(wyj_core::compact::compact_trigger_buffer(
-            effective,
-            active.max_tokens,
-        ));
+        let trigger =
+            active
+                .context_window
+                .saturating_sub(wyj_core::compact::compact_trigger_buffer(
+                    active.context_window,
+                    active.max_tokens,
+                ));
         match catalog {
             Some(supported) => println!(
                 "{}",
                 wyj_i18n::tr_fmt(
-                    "status.context_window_clamped_to_catalog",
+                    "status.context_window_larger_than_catalog",
                     &[
                         ("window", &active.context_window.to_string()),
                         ("supported", &supported.to_string()),

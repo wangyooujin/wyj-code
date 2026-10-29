@@ -104,6 +104,23 @@ pub fn compact_trigger_buffer(context_window: u32, max_output_tokens: u32) -> u3
 ///    一条摘要时估算仍然是正数，于是**每个回合都判定「超限」并再压一次**，
 ///    而每次都是它自己刚写下的摘要，压无可压——这就是「不停压缩」的死循环。
 ///
+/// ## 比较口径：拿 [`ContextAudit::calibrated_prompt`]，不是 `calibrated_total`
+///
+/// 本函数返回的阈值**已经**通过 [`compact_trigger_buffer`] 扣掉了输出预留，
+/// 所以左边的量必须**只含 prompt**。用 `calibrated_total()`（含 `output_reserve`）
+/// 去比等于把 `max_tokens` 计两遍，实际约束退化成
+/// `prompt + 2 × max_tokens + 8192 ≤ window`：
+///
+/// * 官方 Anthropic、`max_tokens = 32000` / 200K 窗口时，阈值 159,008，
+///   但 prompt 只到 127,008（63.5%）就触发——而 buffer 的设计意图是 90%；
+/// * `max_tokens = 128000` / 204,800 窗口时，阈值 68,608 **小于输出预留本身**，
+///   于是 `128000 > 68608` 恒成立——历史压到只剩一条摘要也判定超限，
+///   三轮回退一次、永不收敛（实测用户现象：每几轮「已自动压缩 · 保留历史 0 条」）。
+///
+/// 这两个数量级完全不同的故障是同一个缺陷的两个极端，改任一处都必须连带
+/// 检查另一处：`agent.rs` 的进入判定、`compact_session_until_fit` 的收敛判定、
+/// `elide_stale_tool_results` 的停手线，三处必须同口径。
+///
 /// 直接 `window.saturating_sub(buffer)` 在 `max_output_tokens + 8192 >= window`
 /// 时静默返回 0（`saturating_sub` 不会报错），本函数因此加了下限，
 /// 并用 `window - max_output` 把下限夹回不变量 1。
@@ -115,6 +132,44 @@ pub fn compact_threshold(context_window: u32, max_output_tokens: u32) -> u32 {
     context_window
         .saturating_sub(compact_trigger_buffer(context_window, max_output_tokens))
         .max(floor)
+}
+
+/// 把输出预算夹到「窗口还容得下可压缩提示段」的范围内，返回本次请求
+/// **实际应该发**的 `max_tokens`。未超限时原样返回，不做任何改动。
+///
+/// ## 为什么光统一比较口径还不够
+///
+/// 口径修好之后（阈值比的是 prompt，见 [`compact_threshold`]），剩下的问题是
+/// **阈值本身可能低到不可用**：`阈值 = 窗口 - max(max_tokens + 8192, 窗口/10)`，
+/// 输出预留直接正比地吃掉可压缩空间。实测用户配置
+/// `context_window = 204,800` / `max_tokens = 128,000`（62.5% 的窗口）时阈值
+/// 只剩 68,608——历史刚过 68K 就得压一次，虽然能收敛（压完确实落到阈值下），
+/// 但表现就是「几乎每几轮弹一次压缩提示」，而且每次都要付一趟摘要往返。
+///
+/// ## 判据与取值
+///
+/// 要求压缩阈值至少占窗口的一半（`MIN_PROMPT_SHARE`）。不达标的按窗口的
+/// 40% 夹紧——40% 与旧代码在「阈值被压成 0」那条极端路径上用的常量一致，
+/// 因此小窗口（`max_tokens + 8192 >= 窗口`）的行为与改动前完全相同：
+/// 阈值 0 一定小于窗口一半，直接落到同一个 40% 分支。
+///
+/// **只会往小夹，永不放大**：`.min(max_output_tokens)` 保证用户填得比 40% 还
+/// 小时原值返回——那是「刻意省成本」的选择，不是需要修正的错配。
+pub fn fit_max_output_tokens(context_window: u32, max_output_tokens: u32) -> u32 {
+    // 阈值至少要留下的窗口份额：1/2。低于它压缩会频繁到失去意义。
+    const MIN_PROMPT_SHARE_DENOM: u32 = 2;
+    const CLAMPED_OUTPUT_SHARE: u32 = 2; // 分子
+    const CLAMPED_OUTPUT_DENOM: u32 = 5; // 分母 → 40%
+    if context_window == 0 {
+        return max_output_tokens;
+    }
+    let min_threshold = context_window / MIN_PROMPT_SHARE_DENOM;
+    if compact_threshold(context_window, max_output_tokens) >= min_threshold {
+        return max_output_tokens;
+    }
+    let clamped =
+        (context_window.saturating_mul(CLAMPED_OUTPUT_SHARE) / CLAMPED_OUTPUT_DENOM).max(1);
+    clamped.min(max_output_tokens)
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +267,16 @@ impl ContextAudit {
             .saturating_add(self.framing_tokens)
     }
 
-    /// 用**实测校准系数**修正后的上下文占用。
+    /// 本次请求的 **prompt 部分**（system + 工具 schema + 历史 + framing），
+    /// **不含** `output_reserve`。
+    ///
+    /// 这是「实际会被发送上去、可能撞穿窗口的输入」——`output_reserve` 不是
+    /// 已有内容，而是给模型留的输出空间。
+    pub fn prompt_tokens(&self) -> u32 {
+        self.total().saturating_sub(self.output_reserve)
+    }
+
+    /// 用**实测校准系数**修正后的 prompt 部分。
     ///
     /// 只修正 prompt 部分（system / 工具 schema / 历史 / framing），
     /// `output_reserve` 是配置里的 `max_tokens`，不是猜出来的，不能被缩放。
@@ -223,10 +287,21 @@ impl ContextAudit {
     /// 多语言混排的偏差可达数十个百分点，而压缩阈值是一个**硬比例**——
     /// 估算偏低 30% 就意味着在 1M 窗口上要等到真实 910K 才触发压缩，
     /// 撞 400 的概率与「明明还早却已压缩」的误触发都在这个偏差里。
+    pub fn calibrated_prompt(&self, ratio: f32) -> u32 {
+        let prompt = self.prompt_tokens();
+        (prompt as f32 * ratio.clamp(0.5, 2.0)).round() as u32
+    }
+
+    /// 用**实测校准系数**修正后的整次请求占用（prompt + 输出预留）。
+    ///
+    /// ⚠️ **不要拿它去和 [`compact_threshold`] / 软阈值比较**：那两个阈值
+    /// 已经通过 [`compact_trigger_buffer`] 扣掉了输出预留，再比一次等于
+    /// `max_tokens` 被计两遍（详见 [`compact_threshold`] 文档）。与阈值比较
+    /// 一律用 [`Self::calibrated_prompt`]；本方法只用于「这次请求一共多大」
+    /// 这类展示口径（`/context` 的合计行、状态栏占用率）。
     pub fn calibrated_total(&self, ratio: f32) -> u32 {
-        let prompt = self.total().saturating_sub(self.output_reserve);
-        let scaled = (prompt as f32 * ratio.clamp(0.5, 2.0)).round() as u32;
-        scaled.saturating_add(self.output_reserve)
+        self.calibrated_prompt(ratio)
+            .saturating_add(self.output_reserve)
     }
 
     pub fn from_request(
@@ -2724,6 +2799,111 @@ mod tests {
         let never_requested = ContextAudit::default();
         assert_eq!(never_requested.window, 0);
         assert_eq!(never_requested.effective_window(200_000), 200_000);
+    }
+
+    /// 核心回归：阈值比较的量必须**不含**输出预留。
+    ///
+    /// 现场（用户实测）：`context_window = 204,800` / `max_tokens = 128,000`
+    /// 时阈值只有 68,608，而 `calibrated_total` 含 128,000 的输出预留——
+    /// `128000 > 68608` **恒成立**，于是历史压到只剩一条摘要仍然判超限，
+    /// 每三轮回退一次、永不收敛（用户看到「已自动压缩 · 保留最近 0 条原文」）。
+    ///
+    /// 这条测试用「一条消息都没有」的空历史把该恒等式钉死：只要比较口径回退
+    /// 到 `calibrated_total`，空历史的判定也会超阈值，立刻红。
+    #[test]
+    fn empty_history_never_exceeds_the_compact_threshold() {
+        let window = 204_800;
+        let max_tokens = 128_000;
+        let threshold = compact_threshold(window, max_tokens);
+        // 空历史 + 用户配置的输出预留：`output_reserve` 必须真的填成 128,000，
+        // 否则 `calibrated_total` 里根本没有那个「凭空多出来的下界」。
+        let audit = ContextAudit {
+            output_reserve: max_tokens,
+            window,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            threshold, 68_608,
+            "阈值 = window - (max_tokens + 8192)，这是用户现场的实测值"
+        );
+        assert!(
+            threshold < max_tokens,
+            "本用例的意义在于「阈值比输出预留还小」这一形态，参数必须先满足它"
+        );
+        assert_eq!(audit.prompt_tokens(), 0);
+        assert!(
+            audit.calibrated_prompt(1.0) <= threshold,
+            "空历史不存在「已经超阈值」这回事：prompt 0 vs 阈值 {threshold}"
+        );
+        // 反证：同一个 audit 用 calibrated_total 就是恒超阈值。
+        assert!(
+            audit.calibrated_total(1.0) > threshold,
+            "calibrated_total 含输出预留 {}，必然大于阈值 {threshold}——这正是旧缺陷",
+            max_tokens
+        );
+    }
+
+    /// 校准系数只作用于 prompt，`calibrated_prompt` 与 `calibrated_total`
+    /// 必须严格相差一个未被缩放的输出预留。
+    #[test]
+    fn calibrated_prompt_and_total_differ_by_exactly_the_output_reserve() {
+        let audit = ContextAudit {
+            system_tokens: 10_000,
+            tool_schema_tokens: 5_000,
+            history_tokens: 25_000,
+            output_reserve: 32_000,
+            framing_tokens: 100,
+            ..Default::default()
+        };
+        for ratio in [1.0_f32, 1.3, 0.5, 2.0] {
+            assert_eq!(
+                audit.calibrated_total(ratio),
+                audit.calibrated_prompt(ratio) + 32_000,
+                "ratio = {ratio}"
+            );
+        }
+        assert_eq!(audit.prompt_tokens(), 40_100);
+        assert_eq!(audit.calibrated_prompt(1.0), 40_100);
+    }
+
+    /// 输出预算挤占窗口时会被夹到可压缩范围内；不挤占时原值返回。
+    ///
+    /// 用户现场：204,800 窗口 + 128,000 输出（62.5%）→ 阈值只剩 68,608，
+    /// 历史刚过 68K 就压一次。夹到 40% 后阈值回到 114,688，压缩频率正常。
+    #[test]
+    fn oversized_output_budget_is_clamped_to_keep_room_for_prompt() {
+        let window = 204_800;
+        let clamped = fit_max_output_tokens(window, 128_000);
+        assert_eq!(
+            clamped, 81_920,
+            "应夹到窗口的 40%，否则可压缩提示段被输出预留吃掉"
+        );
+        assert!(
+            compact_threshold(window, clamped) >= window / 2,
+            "夹紧后阈值至少要占到窗口一半"
+        );
+        assert!(
+            compact_threshold(window, 128_000) < window / 2,
+            "夹紧前阈值确实不达标——否则这个用例没有验证任何东西"
+        );
+    }
+
+    /// 不过度干预：用户刻意把输出预留填得很小时，原值返回，绝不放大。
+    #[test]
+    fn a_small_output_budget_is_never_raised() {
+        let window = 200_000;
+        for max_tokens in [8_192, 32_000, 64_000, 81_920] {
+            assert_eq!(
+                fit_max_output_tokens(window, max_tokens),
+                max_tokens,
+                "max_tokens = {max_tokens} 已经留够提示空间，必须原样返回"
+            );
+        }
+        // 已夹紧的下限本身不应再被继续往下压。
+        assert_eq!(fit_max_output_tokens(window, 40_000), 40_000);
+        // 空窗口是「还没算出有效窗口」的哨兵，不能把预算归零。
+        assert_eq!(fit_max_output_tokens(0, 32_000), 32_000);
     }
 
     /// `calibrated_total` 只缩放 prompt 部分——`output_reserve` 是配置里的

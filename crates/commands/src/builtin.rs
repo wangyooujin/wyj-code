@@ -119,8 +119,13 @@ impl Command for ContextCmd {
         let pct = total as f64 / window as f64 * 100.0;
         // 压缩阈值 = 窗口 - buffer。buffer 必须覆盖输出预留，否则压缩完
         // 再加 max_tokens 还是会撞穿（见 compact_trigger_buffer）。
-        let buffer = wyj_core::compact::compact_trigger_buffer(window, audit.output_reserve);
-        let threshold = window.saturating_sub(buffer);
+        //
+        // 必须调 `compact_threshold` 而不是自己写 `window - buffer`：它有下限
+        // 兜底（`max(window/4, window - max_tokens)`），自算会在小窗口上显示
+        // 一个 0 或负数的阈值。它已经扣掉了输出预留，所以用来比的量是
+        // `audit.prompt_tokens()`（不含输出预留），与自动压缩的判定同口径。
+        let threshold = wyj_core::compact::compact_threshold(window, audit.output_reserve);
+        let prompt = audit.prompt_tokens();
 
         // 列宽按**显示宽度**算，不能用 `{label:<18}`——那是按字符个数补的，
         // 中文标签每字占 2 列，补出来的列自然歪（"System prompt" 13 字符补到
@@ -193,6 +198,7 @@ impl Command for ContextCmd {
                 ("window", &fmt_num(window)),
                 ("pct", &format!("{pct:.0}")),
                 ("threshold", &fmt_num(threshold)),
+                ("prompt", &fmt_num(prompt)),
             ],
         ));
 
