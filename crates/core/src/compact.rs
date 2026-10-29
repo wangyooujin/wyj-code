@@ -134,6 +134,70 @@ pub fn compact_threshold(context_window: u32, max_output_tokens: u32) -> u32 {
         .max(floor)
 }
 
+/// 官方 Anthropic 对 `thinking.budget_tokens` 的硬性下限（端点会拒绝更小的值）。
+pub const MIN_THINKING_BUDGET_TOKENS: u32 = 1_024;
+
+/// Anthropic provider 在 `max_tokens <= thinking_budget` 时会把输出预算
+/// 抬到 `budget + 4096`（`budget_tokens < max_tokens` 是协议硬约束）。
+pub const THINKING_BUDGET_HEADROOM: u32 = 4_096;
+
+/// 一次请求**最终会发出去**的输出预算，以及被夹紧后的 `thinking_budget`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputBudget {
+    /// 实际发送的 `max_tokens`（= 夹紧后的用户值 与 provider 下限取大）。
+    pub max_tokens: u32,
+    /// 实际发送的 `thinking_budget`；`None` = 本次不发思考预算。
+    pub thinking_budget: Option<u32>,
+}
+
+/// 把「用户配置的输出预算」与「thinking_budget 撑出来的 provider 下限」
+/// 一起夹进窗口，返回本次请求真正应该发的值。
+///
+/// ## 为什么必须一起算
+///
+/// provider 侧有一条硬约束：`max_tokens <= thinking_budget` 时会把预算抬到
+/// `budget + 4096`。于是**真正的输出预留是 `max(max_tokens, budget + 4096)`**，
+/// 两者只夹一个都会出错：
+///
+/// * 只夹 `max_tokens`：`budget` 可以任意大（实测有人填 190K / 200K 窗口），
+///   夹紧结果被 provider 的下限整个作废，`compact_threshold` 塌到窗口的 3%，
+///   任何历史都触发压缩——[`fit_max_output_tokens`] 形同不存在。
+/// * 先合并再夹、把结果赋回 `max_tokens`：`budget` 大而 `max_tokens` 小时，
+///   取到的是窗口 40% 而非用户配置值，等于**放大**用户预算，违背
+///   「只往下夹、永不放大」。
+///
+/// 正确做法是先求窗口允许的输出上限（[`fit_max_output_tokens`]），再用它
+/// **反过来夹 `thinking_budget`**：压到 `ceiling - 4096`，且不低于官方要求的
+/// [`MIN_THINKING_BUDGET_TOKENS`]。压不下去就整个丢弃 budget——发一个必然挤爆
+/// 窗口的组合不如不发。
+pub fn fit_output_budget(
+    context_window: u32,
+    max_output_tokens: u32,
+    thinking_budget: Option<u32>,
+) -> OutputBudget {
+    let provider_floor = thinking_budget
+        .map(|budget| budget.saturating_add(THINKING_BUDGET_HEADROOM))
+        .unwrap_or(0);
+    // 用户配置值单独夹一次：这是「只往下夹、永不放大」的唯一执行点。
+    let fitted_max = fit_max_output_tokens(context_window, max_output_tokens);
+    // 窗口允许的输出上限：以「本次真实会发出的量」为输入再夹一次。
+    let ceiling = fit_max_output_tokens(context_window, max_output_tokens.max(provider_floor));
+    let clamped_budget = match thinking_budget {
+        Some(_) if provider_floor > ceiling => {
+            let squeezed = ceiling.saturating_sub(THINKING_BUDGET_HEADROOM);
+            (squeezed >= MIN_THINKING_BUDGET_TOKENS).then_some(squeezed)
+        }
+        other => other,
+    };
+    let applied_floor = clamped_budget
+        .map(|budget| budget.saturating_add(THINKING_BUDGET_HEADROOM))
+        .unwrap_or(0);
+    OutputBudget {
+        max_tokens: fitted_max.max(applied_floor),
+        thinking_budget: clamped_budget,
+    }
+}
+
 /// 把输出预算夹到「窗口还容得下可压缩提示段」的范围内，返回本次请求
 /// **实际应该发**的 `max_tokens`。未超限时原样返回，不做任何改动。
 ///
@@ -400,33 +464,58 @@ pub fn estimate_system_tokens(system: &wyj_api::SystemPrompt<'_>) -> usize {
     estimate_text_tokens(system.stable) + estimate_text_tokens(system.volatile)
 }
 
-/// 工具定义的 token 估算，按**工具名缓存**。
+/// 工具定义的 token 估算，按**工具内容**缓存。
 ///
 /// 每个工具的 `input_schema.to_string()` 是一次完整 JSON 序列化——本仓库
 /// 工具集（未含 MCP）就能到几万字符，而 `from_request` 每轮最多调 10 次、
 /// 每次遍历 `tools.len()` 个工具，几百次重复序列化同样的字符串。
 ///
-/// 缓存键用工具名：同一进程内 schema 变了（`Agent::refresh_tool_definitions`、
-/// MCP 重连）会重新算并覆盖旧值，代价只是「用新值覆盖旧值」，不会有陈旧读。
+/// ## 缓存键为什么不能只用工具名
+///
+/// 旧实现键是裸工具名、命中即返回，注释却写「schema 变了会重新算并覆盖旧值」
+/// ——那句在实现里**不可能发生**：`Agent::refresh_tool_definitions` 与 MCP
+/// 重连改的是 schema，工具名不变，于是缓存永远命中旧值。后果是 MCP 工具热更新
+/// 后工具 token 估算长期陈旧，压缩阈值判定随之偏移。
+///
+/// 现在命中时**比对 description 与 schema 本体**（`serde_json::Value` 的
+/// 结构比较，比 `to_string` 快且不分配）。内容一致才复用旧值，不一致就地
+/// 重算覆盖——这才是注释描述的行为。
 pub fn estimate_tools_tokens(tools: &[ToolDefinition]) -> u32 {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    static CACHE: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+    struct Cached {
+        description: String,
+        schema: serde_json::Value,
+        tokens: u32,
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<String, Cached>>> = OnceLock::new();
     let mut cache = CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
 
     tools.iter().fold(0u32, |total, tool| {
-        let tokens = match cache.get(&tool.name) {
-            Some(tokens) => *tokens,
+        let cached_tokens = cache
+            .get(&tool.name)
+            .filter(|c| c.description == tool.description && c.schema == tool.input_schema)
+            .map(|c| c.tokens);
+        let tokens = match cached_tokens {
+            Some(tokens) => tokens,
             None => {
                 let schema = tool.input_schema.to_string();
                 let tokens = (estimate_text_tokens(&tool.name)
                     + estimate_text_tokens(&tool.description)
                     + estimate_text_tokens(&schema)) as u32;
-                cache.insert(tool.name.clone(), tokens);
+                cache.insert(
+                    tool.name.clone(),
+                    Cached {
+                        description: tool.description.clone(),
+                        schema: tool.input_schema.clone(),
+                        tokens,
+                    },
+                );
                 tokens
             }
         };
@@ -2790,6 +2879,49 @@ mod tests {
         assert!(audit.history_tokens > 0);
     }
 
+    /// **工具 token 缓存必须随 schema 内容失效**。
+    ///
+    /// 回归背景：旧实现的缓存键是裸工具名、命中即返回，注释却写「schema 变了
+    /// 会重新算并覆盖旧值」——那句在实现里不可能发生。`refresh_tool_definitions`
+    /// 与 MCP 重连改的是 schema，工具名不变，于是估算永远停在旧值，压缩阈值
+    /// 判定随之偏移。
+    #[test]
+    fn tool_token_cache_follows_schema_changes() {
+        let tool = |description: &str, schema: serde_json::Value| ToolDefinition {
+            name: "schema_mutation_probe".to_string(),
+            description: description.to_string(),
+            input_schema: schema,
+            native: None,
+        };
+        let small = tool("d", serde_json::json!({"a": {"type": "string"}}));
+        let before = estimate_tools_tokens(std::slice::from_ref(&small));
+        // 同名、同 description，只把 schema 撑大：必须重算。
+        let big = tool(
+            "d",
+            serde_json::json!({
+                "a": {"type": "string"},
+                "b": {"type": "string", "description": "x".repeat(2_000)},
+            }),
+        );
+        let after = estimate_tools_tokens(std::slice::from_ref(&big));
+        assert!(
+            after > before,
+            "schema 变大后估算必须跟着涨（before={before}, after={after}）"
+        );
+        // description 变化同样要重算。
+        let renamed = tool(&"x".repeat(1_000), big.input_schema.clone());
+        assert!(
+            estimate_tools_tokens(std::slice::from_ref(&renamed)) > after,
+            "description 变化同样必须触发重算"
+        );
+        // 内容回到原样时结果也回到原值（缓存不残留）。
+        assert_eq!(
+            estimate_tools_tokens(std::slice::from_ref(&small)),
+            before,
+            "回到同一份内容必须得到同一个估算"
+        );
+    }
+
     /// `effective_window` 的语义：记录了就用记录的，没记录才回落——面板与
     /// 决策共用同一个分母就是靠它。
     #[test]
@@ -2887,6 +3019,85 @@ mod tests {
             compact_threshold(window, 128_000) < window / 2,
             "夹紧前阈值确实不达标——否则这个用例没有验证任何东西"
         );
+    }
+
+    /// **`thinking_budget` 不能绕过输出预算夹紧**。
+    ///
+    /// 回归背景（用户现场）：`thinking_budget = 190_000` / 200K 窗口时，
+    /// provider 会把 `max_tokens` 抬到 `budget + 4096 = 194_096`，而旧实现
+    /// 用 `.max(provider_floor)` 把夹紧结果整个作废——`compact_threshold`
+    /// 塌到窗口的 3%，任何历史都触发压缩，等于压缩死循环。
+    #[test]
+    fn thinking_budget_cannot_defeat_the_output_clamp() {
+        let window = 200_000;
+        for budget in [100_000, 150_000, 190_000] {
+            let plan = fit_output_budget(window, 32_000, Some(budget));
+            let applied_budget = plan.thinking_budget.unwrap_or(0);
+            let floor = applied_budget.saturating_add(THINKING_BUDGET_HEADROOM);
+            let effective_output = plan.max_tokens.max(floor);
+            let threshold = compact_threshold(window, effective_output);
+            assert!(
+                threshold >= window / 4,
+                "budget={budget}：阈值塌到 {threshold}（窗口 {}），压缩会死循环",
+                window / 4
+            );
+            assert!(
+                threshold + effective_output <= window,
+                "budget={budget}：阈值 + 输出 {effective_output} 超过窗口"
+            );
+        }
+    }
+
+    /// 夹紧方向**只往下**：`budget` 撑大时压 budget，但绝不放大用户配置的
+    /// `max_tokens`。
+    #[test]
+    fn thinking_budget_clamp_never_raises_the_configured_max_tokens() {
+        let window = 200_000;
+        // 用户只想要 8K 输出，却配了个很大的思考预算。
+        let plan = fit_output_budget(window, 8_192, Some(150_000));
+        assert!(
+            plan.max_tokens
+                <= 8_192.max(
+                    plan.thinking_budget
+                        .unwrap_or(0)
+                        .saturating_add(THINKING_BUDGET_HEADROOM)
+                ),
+            "实际输出不该超过「用户配置」与「provider 下限」的较大者"
+        );
+        // 小 budget 完全不该被碰。
+        let small = fit_output_budget(window, 32_000, Some(8_192));
+        assert_eq!(small.thinking_budget, Some(8_192), "小预算原样保留");
+        assert_eq!(small.max_tokens, 32_000, "用户配置值原样保留");
+    }
+
+    /// 窗口小到连「1024 思考预算 + 4096 余量」都容不下时，整个丢弃 budget
+    /// ——发一个必然挤爆窗口的组合不如不发。
+    #[test]
+    fn a_budget_that_cannot_fit_the_window_is_dropped_entirely() {
+        // 窗口 4K：40% 上限 = 1600，减掉 4096 余量后不足 1024。
+        let plan = fit_output_budget(4_000, 1_000, Some(50_000));
+        assert_eq!(plan.thinking_budget, None, "压不下去就必须整个丢弃");
+        assert!(plan.max_tokens > 0);
+    }
+
+    /// 没有 thinking_budget 时行为必须与 `fit_max_output_tokens` **逐字节相同**
+    /// ——绝大多数 profile 走的都是这条路。
+    #[test]
+    fn no_thinking_budget_matches_the_plain_clamp() {
+        for (window, max_tokens) in [
+            (200_000u32, 32_000u32),
+            (204_800, 128_000),
+            (1_000_000, 64_000),
+            (0, 32_000),
+        ] {
+            let plan = fit_output_budget(window, max_tokens, None);
+            assert_eq!(
+                plan.max_tokens,
+                fit_max_output_tokens(window, max_tokens),
+                "window={window} max_tokens={max_tokens}"
+            );
+            assert_eq!(plan.thinking_budget, None);
+        }
     }
 
     /// 不过度干预：用户刻意把输出预留填得很小时，原值返回，绝不放大。

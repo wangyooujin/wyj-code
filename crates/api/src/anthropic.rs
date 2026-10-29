@@ -416,6 +416,39 @@ struct UsageData {
     cache_read_input_tokens: Option<u32>,
     /// 写入 prompt 缓存的输入 token 数（按 1.25x 计费）
     cache_creation_input_tokens: Option<u32>,
+    /// 输出侧细分：其中有多少是**思考** token。
+    ///
+    /// 官方在 `message_delta.usage` 的 `output_tokens_details.thinking_tokens`
+    /// 里给出（`completion_tokens_details.reasoning_tokens` 是 OpenAI 的叫法，
+    /// 两边字段名不同但语义一致：都是 `output_tokens` 的**子集**）。
+    ///
+    /// 旧实现硬编码 `reasoning_tokens: 0`，注释写「Anthropic 不单独上报」——
+    /// 于是 `/cost` 的「思考占比」在 Anthropic profile 下永远缺失，而
+    /// 「这次贵在思考还是贵在正文」恰恰是最需要区分的地方。第三方兼容端点
+    /// 多数不报这个字段，缺省按 0 处理。
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    thinking_tokens: Option<u32>,
+}
+
+impl UsageData {
+    /// 本次输出里被思考占用的 token 数，**不超过 `output_tokens`**。
+    ///
+    /// 子集关系是官方定义；个别兼容网关把它当成独立的思考总量，按子集口径
+    /// 截断才不会让「可见正文 = output - thinking」变成负数。
+    fn thinking_tokens(&self) -> u32 {
+        let raw = self
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.thinking_tokens)
+            .unwrap_or(0);
+        raw.min(self.output_tokens.unwrap_or(u32::MAX))
+    }
 }
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
@@ -870,14 +903,17 @@ fn usage_event(usage: UsageData) -> Option<StreamEvent> {
     let output = usage.output_tokens.unwrap_or(0);
     let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
     let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
+    // 思考 token 是 `output_tokens` 的子集，官方在
+    // `output_tokens_details.thinking_tokens` 里给出（只在 `message_delta`
+    // 的最终 usage 上，`message_start` 的占位值没有）。旧实现硬编码 0，
+    // 导致 `/cost` 的思考占比在 Anthropic 线上永远缺失。
+    let thinking = usage.thinking_tokens();
     (input > 0 || output > 0 || cache_read > 0 || cache_write > 0).then_some(StreamEvent::Usage {
         input_tokens: input,
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_write,
-        // Anthropic 不单独上报思考 token（`output_tokens` 已含 thinking）。
-        // 这里填 0 是「不知道」而不是「零思考」——面板据此不显示思考占比。
-        reasoning_tokens: 0,
+        reasoning_tokens: thinking,
     })
 }
 
@@ -1042,6 +1078,7 @@ mod tests {
             output_tokens: Some(256),
             cache_read_input_tokens: Some(128),
             cache_creation_input_tokens: Some(64),
+            output_tokens_details: None,
         })
         .expect("non-empty provider usage should produce an event");
         assert!(matches!(
@@ -1052,6 +1089,56 @@ mod tests {
                 cache_read_input_tokens: 128,
                 cache_creation_input_tokens: 64,
                 reasoning_tokens: 0,
+            }
+        ));
+    }
+
+    /// 官方在 `output_tokens_details.thinking_tokens` 里给出思考 token，
+    /// 旧实现硬编码 `reasoning_tokens: 0`，导致 `/cost` 的思考占比在
+    /// Anthropic 线上永远缺失。
+    #[test]
+    fn thinking_tokens_are_reported_from_output_tokens_details() {
+        let event = usage_event(UsageData {
+            input_tokens: Some(1_000),
+            output_tokens: Some(2_000),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            output_tokens_details: Some(OutputTokensDetails {
+                thinking_tokens: Some(1_500),
+            }),
+        })
+        .expect("non-empty provider usage should produce an event");
+        assert!(
+            matches!(
+                event,
+                StreamEvent::Usage {
+                    reasoning_tokens: 1_500,
+                    ..
+                }
+            ),
+            "思考 token 必须被上报，而不是恒 0"
+        );
+    }
+
+    /// 思考 token 是 `output_tokens` 的**子集**：个别网关把它当独立总量报，
+    /// 按子集口径截断才不会让「可见正文」变成负数。
+    #[test]
+    fn thinking_tokens_never_exceed_output_tokens() {
+        let event = usage_event(UsageData {
+            input_tokens: Some(10),
+            output_tokens: Some(100),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            output_tokens_details: Some(OutputTokensDetails {
+                thinking_tokens: Some(9_999),
+            }),
+        })
+        .expect("non-empty provider usage should produce an event");
+        assert!(matches!(
+            event,
+            StreamEvent::Usage {
+                reasoning_tokens: 100,
+                ..
             }
         ));
     }

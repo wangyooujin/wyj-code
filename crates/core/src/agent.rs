@@ -2290,19 +2290,55 @@ impl Agent {
                 // 阈值按较小的预留算，实际却发出更大的输出，结构性 400 回来。
                 let provider_floor = opts
                     .thinking_budget
-                    .map(|budget| budget.saturating_add(4_096))
+                    .map(|budget| budget.saturating_add(crate::compact::THINKING_BUDGET_HEADROOM))
                     .unwrap_or(0);
+                // 用户期望的输出预算（含 provider 会强制抬到的那一段），只用于告警文案。
                 let requested_max_tokens = opts.max_tokens.max(provider_floor);
-                let fitted =
-                    crate::compact::fit_max_output_tokens(effective_window, requested_max_tokens);
-                // `max(provider_floor)` 双向兜住：既保证 provider 不会再把预算
-                // 抬高（抬了就是绕过本次夹紧），也保证审计口径等于实际发送值。
-                let applied = fitted.max(provider_floor);
+                // 两个量必须**一起夹**，不能先合并再夹，也不能只夹一个：
+                //
+                // * `max_tokens` 是用户配置的输出预算，夹紧方向只有一个（往下）；
+                // * `thinking_budget + 4096` 是 provider 侧会强制抬到的下限。
+                //
+                // 旧实现写的是 `requested = max(max_tokens, floor)` 再夹、再把
+                // 结果**赋回** `max_tokens`，随后又 `.max(provider_floor)` 兜一次。
+                // 两个方向都错：
+                //   ① `floor` 可以任意大（实测 190K / 200K 窗口），夹紧结果被
+                //      `.max()` 整个作废，`compact_threshold` 塌到窗口的 3%，
+                //      任何历史都触发压缩——`fit_max_output_tokens` 形同不存在；
+                //   ② `floor` 大而 `max_tokens` 小时，夹紧取到的是窗口 40% 而非
+                //      用户配置值，赋回去等于**放大**用户预算。
+                //
+                // 判据与取值都在 `fit_output_budget` 里：先求窗口允许的输出上限，
+                // 再用它反过来夹 `thinking_budget`（不低于官方 1024 下限；压不下去
+                // 就整个丢弃 budget）。
+                let budget_plan = crate::compact::fit_output_budget(
+                    effective_window,
+                    opts.max_tokens,
+                    opts.thinking_budget,
+                );
+                if budget_plan.thinking_budget != opts.thinking_budget {
+                    match budget_plan.thinking_budget {
+                        Some(squeezed) => tracing::warn!(
+                            model = %route.model,
+                            window = effective_window,
+                            original = provider_floor.saturating_sub(crate::compact::THINKING_BUDGET_HEADROOM),
+                            applied = squeezed,
+                            "thinking_budget 挤占了过多可压缩提示空间，本请求已临时下调"
+                        ),
+                        None => tracing::warn!(
+                            model = %route.model,
+                            window = effective_window,
+                            "thinking_budget 与窗口不相容（窗口过小），本请求已关闭思考"
+                        ),
+                    }
+                }
+                opts.thinking_budget = budget_plan.thinking_budget;
+                let applied = budget_plan.max_tokens;
                 if applied != opts.max_tokens || context_audit.output_reserve != applied {
                     opts.max_tokens = applied;
                     context_audit.output_reserve = applied;
                 }
-                if fitted < requested_max_tokens {
+                if applied < requested_max_tokens {
                     tracing::warn!(
                         model = %route.model,
                         window = effective_window,

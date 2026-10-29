@@ -211,8 +211,14 @@ impl ThinkingSpec {
     pub fn anthropic_native(model: &str) -> Self {
         Self {
             control: ThinkingControl::BudgetOnly,
-            user_can_disable: true,
-            budget_tokens_supported: true,
+            // Claude Opus 5.5 的自适应思考**始终开启**，`{"type":"disabled"}`
+            // 在它上面每个档位都 400——面板不该给出「关闭思考」这一项。
+            user_can_disable: !anthropic_thinking_always_on(model),
+            // **按型号判定**，不是无条件 true。`{type:"enabled", budget_tokens}`
+            // 是 legacy 形态：Claude 4.7 及以后直接 400。旧实现无条件 true，
+            // 于是 `claude-opus-4-8` + `thinking_budget` 会发出一个必 400 的
+            // 字段，而 catalog 层又认为「支持 budget」，连 dropped 记录都没有。
+            budget_tokens_supported: anthropic_manual_thinking(model),
             effort_levels: anthropic_effort_levels(model),
             budget_and_effort_coexist: true,
             response_fields: ThinkingResponseFields {
@@ -796,38 +802,79 @@ impl ThinkingAdapter for AnthropicNativeAdapter {
         identity: &ModelIdentity,
         opts: &RequestOptions,
     ) -> AnthropicThinkingPatch {
-        // 官方 Anthropic 有**两个**思考旋钮：
-        // * `thinking.budget_tokens` —— 思考本身的 token 预算（extended thinking）；
-        // * `output_config.effort` —— 整个响应（正文 + 工具调用 + 思考）的
-        //   投入档位（low/medium/high/xhigh/max），与 OpenAI 系的
-        //   `reasoning_effort` 语义对齐。
+        // 官方 Anthropic 的思考形态**按型号代际分成两支**（官方文档
+        // 「Extended thinking」/「Effort」两节）：
         //
-        // 两者**互补而非互斥**：官方文档明确说 effort 与 thinking 可以同时用
-        // （Opus 4.5 上 effort 配合 budget_tokens 一起用）。所以这里两个都发，
-        // 而不是二选一。
-        let budget = opts.thinking_budget.filter(|b| *b > 0);
+        // ① **manual 代际**（4.6 及更早）：`thinking: {type:"enabled",
+        //    budget_tokens:N}` 是唯一形态；`output_config.effort` 从 4.5 起
+        //    可以作为第二个旋钮共存（两者控制不同维度）。
+        // ② **adaptive 代际**（4.7 及以后）：`type:"enabled"` **返回 400**，
+        //    思考形态是 `{type:"adaptive"}`（或省略），深度只由
+        //    `output_config.effort` 控制；关思考用 `{type:"disabled"}`，
+        //    但在 `xhigh`/`max` 档位、以及始终开启的型号上同样 400。
+        //
+        // 旧实现只有第 ① 支，于是 4.7+ 用户配 `thinking_budget` 必定 400，
+        // 而配 `thinking_switch = "disabled"` 则什么都不发——既不关思考，
+        // 也不留告警（`switch_says_off != budget.is_none()` 在两者都为
+        // true 时判等成立）。
+        let manual = anthropic_manual_thinking(&identity.model);
+        let raw_budget = opts.thinking_budget.filter(|b| *b > 0);
+        // manual 代际才把 budget 当成真的旋钮；adaptive 代际上它是死配置，
+        // 必须记成可见的 dropped（catalog 层已按型号过滤，这里是兜底）。
+        let budget = raw_budget.filter(|_| manual);
         let mut patch = AnthropicThinkingPatch {
             thinking: budget.map(|b| json!({"type": "enabled", "budget_tokens": b})),
             budget,
             output_config: None,
             ignored: Vec::new(),
         };
+        if raw_budget.is_some() && !manual {
+            patch.ignored.push("thinking_budget");
+        }
         // effort 走 `output_config.effort`。档位判据统一走 `normalize_effort`
         // （即 spec 的 `effort_levels`），不在本 adapter 里维护第二份白名单。
+        let mut effort_level: Option<&'static str> = None;
         if let Some(raw) = opts.reasoning_effort.as_deref() {
             match normalize_effort(identity, raw) {
-                Some(level) => patch.output_config = Some(json!({ "effort": level })),
+                Some(level) => {
+                    effort_level = Some(level);
+                    patch.output_config = Some(json!({ "effort": level }));
+                }
                 None => patch.ignored.push("reasoning_effort"),
             }
         }
-        // 这条线协议的开关**只有 budget 一个旋钮**，profile 的 thinking_switch
-        // 无处落地。两种静默覆盖都要记进 ignored：配了 `disabled` 却仍发出
-        // `enabled`（thinking 照开）、配了 `enabled` 却没有 budget（thinking
-        // 其实没开）——用户看日志才知道自己配的东西被谁覆盖了。
-        // 注意 `text_only()` 的 `disabled` + budget=None 组合是**被兑现的**，
-        // 不该告警（否则 compact/memory 等每次辅助调用都吵一遍）。
-        if explicit_switch(opts).is_some() && switch_says_off(opts) != budget.is_none() {
-            patch.ignored.push("thinking_switch");
+        // 开关：manual 代际只有 budget 一个旋钮；adaptive 代际才有 `disabled`。
+        match explicit_switch(opts).as_deref() {
+            None => {}
+            Some(switch) if switch_is_off(switch) => {
+                if !manual {
+                    // adaptive 代际：能关就真的发 `disabled`（旧实现从不下发，
+                    // 用户配了关思考却仍在想）。关不掉时记成可见的 dropped。
+                    if anthropic_allows_disabled(&identity.model, effort_level) {
+                        patch.thinking = Some(json!({"type": "disabled"}));
+                    } else {
+                        patch.ignored.push("thinking_switch");
+                    }
+                } else if budget.is_some() {
+                    // manual 代际：配了 budget 就必然发 `enabled`，`disabled`
+                    // 无处落地。这是**真实的静默覆盖**，必须告警。
+                    patch.ignored.push("thinking_switch");
+                }
+                // manual 代际且无 budget：`text_only()` 的形态，思考确实没开，
+                // 字段不发即兑现，不该告警（否则每次辅助调用都刷一条 warn）。
+            }
+            Some(_) => {
+                // 用户显式要开。
+                if manual {
+                    // 无 budget 就发不出 `enabled`，思考其实没开。
+                    if budget.is_none() {
+                        patch.ignored.push("thinking_switch");
+                    }
+                } else if patch.thinking.is_none() {
+                    // adaptive 代际：显式 `adaptive`（省略也是开，但显式更贴合意图）。
+                    patch.thinking = Some(json!({"type": "adaptive"}));
+                }
+            }
         }
         patch
     }
@@ -873,6 +920,68 @@ impl ThinkingAdapter for AnthropicCompatibleAdapter {
         // 路径的兼容模式也按"无 beta"对待。
         false
     }
+}
+
+/// 抽出 Claude 型号的 `(主版本, 次版本)`，非 Claude 或版本不可解析时返回 `None`。
+///
+/// 与 [`anthropic_effort_levels`] 共用同一套「系列名 + 版本段」判据：系列名
+/// 只认 `opus/sonnet/haiku/fable/mythos`（稳定的产品线），营销词（`flash`、
+/// `fast`）不是版本证据。两个函数描述的是同一份型号表的两个面——老型号只有
+/// `budget_tokens`、新型号只有 `effort`/adaptive——所以判据必须同源。
+fn anthropic_series_version(model: &str) -> Option<(u32, Option<u32>)> {
+    let m = model.to_ascii_lowercase();
+    if !m.contains("claude") {
+        return None;
+    }
+    let series = ["opus", "sonnet", "haiku", "fable", "mythos"]
+        .iter()
+        .find(|name| m.contains(*name))?;
+    model_version_segment(&m, series)
+}
+
+/// 官方 Anthropic 型号是否支持**手动 extended thinking**
+/// （`thinking: {"type":"enabled","budget_tokens":N}`）。
+///
+/// 官方已把该形态标为 legacy：**Claude 4.7 及以后直接返回 400**，4.6 代
+/// deprecated 但仍可用，4.5 及更早是唯一形态。因此 `budget_tokens` 能不能发
+/// 必须按型号判定，不能像旧实现那样无条件 `true`——否则用户在 `claude-opus-4-8`
+/// 上配 `thinking_budget` 就会收到一个没有任何提示的 400。
+///
+/// 无法解析版本段的老命名（`claude-3-5-sonnet-20241022` 把日期排在系列名之后，
+/// `model_version_segment` 会拒绝）一律按**支持**处理：3.x / 4.0 确实只有
+/// manual 这一种形态，误判成「不支持」会让它们连思考都开不了。
+fn anthropic_manual_thinking(model: &str) -> bool {
+    match anthropic_series_version(model) {
+        // 5 系全线（Opus 5/5.5、Sonnet 5/5.5、Haiku 5.5、Fable/Mythos 5.x）已移除 manual。
+        Some((major, _)) if major >= 5 => false,
+        // 4.7 / 4.8 明确拒绝 `type: "enabled"`。
+        Some((4, Some(minor))) if minor >= 7 => false,
+        _ => true,
+    }
+}
+
+/// 该型号的自适应思考是否**始终开启**、任何档位都关不掉（Claude Opus 5.5）。
+///
+/// 官方文档：「Adaptive thinking is always on and can't be turned off, so effort
+/// is the primary control」；且 `thinking: {"type":"disabled"}` 在该型号上
+/// **每个 effort 档位**都返回 400。因此它既不能算 `user_can_disable`，
+/// 也不能收到 `disabled` 字段。
+fn anthropic_thinking_always_on(model: &str) -> bool {
+    matches!(anthropic_series_version(model), Some((5, Some(5))))
+        && model.to_ascii_lowercase().contains("opus")
+}
+
+/// 该型号在给定 effort 档位下能否用 `thinking: {"type":"disabled"}` 关掉思考。
+///
+/// 只对**自适应代际**（[`anthropic_manual_thinking`] 为 false）有意义：
+/// * 始终开启的型号（[`anthropic_thinking_always_on`]）任何档位都不接受；
+/// * `xhigh` / `max` 档位下官方一律拒绝 `disabled`（400），此时只能靠降档；
+/// * 其余 4.7+ 型号在 `low`/`medium`/`high` 下接受。
+fn anthropic_allows_disabled(model: &str, effort_level: Option<&str>) -> bool {
+    if anthropic_thinking_always_on(model) {
+        return false;
+    }
+    !matches!(effort_level, Some("xhigh") | Some("max"))
 }
 
 /// 官方 Anthropic（Claude）系列的 effort 档位集合，按型号分档。
@@ -1634,17 +1743,46 @@ mod tests {
         let spec = ThinkingSpec::for_vendor(
             "anthropic",
             &WireProtocol::AnthropicMessages,
-            "claude-opus-4-8",
+            "claude-opus-4-5",
         );
         assert_eq!(spec.control, ThinkingControl::BudgetOnly);
-        assert!(spec.budget_tokens_supported);
-        assert!(spec.user_can_disable);
-        // Opus 4.8 官方支持 effort，且 budget 与 effort 是两个独立旋钮（可共存）。
-        assert!(spec.budget_and_effort_coexist);
-        assert_eq!(
-            spec.effort_levels, MINIMAX_M31_ANTHROPIC_EFFORT_LEVELS,
-            "Opus 4.8 与 M3.1 一样是五档全量"
+        assert!(
+            spec.budget_tokens_supported,
+            "4.5 及更早只有 manual extended thinking 这一种形态"
         );
+        assert!(spec.user_can_disable);
+        // Opus 4.5 官方支持 effort，且 budget 与 effort 是两个独立旋钮（可共存）。
+        assert!(spec.budget_and_effort_coexist);
+        assert_eq!(spec.effort_levels.len(), 3, "Opus 4.5 只到 high");
+    }
+
+    /// **manual extended thinking 必须按型号判定**。
+    ///
+    /// 官方已把 `thinking: {type:"enabled", budget_tokens:N}` 标为 legacy：
+    /// Claude 4.7 及以后直接返回 400。旧实现无条件 `budget_tokens_supported:
+    /// true`，于是 `claude-opus-4-8` + `thinking_budget` 会发出一个必 400 的
+    /// 字段，而 catalog 层又认为「支持 budget」，连 dropped 记录都没有。
+    #[test]
+    fn anthropic_manual_thinking_is_per_model() {
+        let manual = |model: &str| {
+            ThinkingSpec::for_vendor("anthropic", &WireProtocol::AnthropicMessages, model)
+                .budget_tokens_supported
+        };
+        // manual 代际（4.6 及更早，含 3.x 老命名）。
+        assert!(manual("claude-opus-4-5"));
+        assert!(manual("claude-sonnet-4-5"));
+        assert!(manual("claude-opus-4-6"));
+        assert!(manual("claude-sonnet-4-6"));
+        assert!(manual("claude-3-5-sonnet-20241022"));
+        assert!(manual("claude-3-7-sonnet-20250219"));
+        // adaptive 代际（4.7 及以后）：`type:"enabled"` 会 400。
+        assert!(!manual("claude-opus-4-7"), "4.7 已移除 manual");
+        assert!(!manual("claude-opus-4-8"));
+        assert!(!manual("claude-opus-5"));
+        assert!(!manual("claude-opus-5-5"));
+        assert!(!manual("claude-sonnet-5"));
+        assert!(!manual("claude-haiku-5-5"));
+        assert!(!manual("claude-fable-5-1"));
     }
 
     #[test]
@@ -2289,10 +2427,11 @@ mod tests {
 
     #[test]
     fn official_anthropic_keeps_the_native_budget_shape() {
+        // 4.5 是 manual 代际（4.7+ 已拒绝 `type:"enabled"`）。
         let id = identity(
             "anthropic",
             WireProtocol::AnthropicMessages,
-            "claude-opus-4-8",
+            "claude-opus-4-5",
         );
         let patch = apply_anthropic_thinking(
             &id,
@@ -2312,6 +2451,130 @@ mod tests {
             "max_tokens 兜底靠这个结构化字段，不许再从 Value 里反解键名"
         );
         assert!(patch.output_config.is_none());
+    }
+
+    /// **adaptive 代际（4.7+）绝不能发 `{type:"enabled", budget_tokens}`**。
+    ///
+    /// 官方文档：「Claude 4.7 and later models do not support it and reject
+    /// requests that use it, returning a 400 error」。旧实现无条件发，用户
+    /// 在 `claude-opus-4-8` 上配 `thinking_budget` 就是必 400，且没有任何
+    /// dropped 记录。
+    #[test]
+    fn adaptive_models_never_send_budget_tokens() {
+        for model in [
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+        ] {
+            let id = identity("anthropic", WireProtocol::AnthropicMessages, model);
+            let patch = apply_anthropic_thinking(
+                &id,
+                &RequestOptions {
+                    thinking_budget: Some(8192),
+                    ..Default::default()
+                },
+            );
+            assert!(patch.thinking.is_none(), "{model} 不该发 thinking 字段");
+            assert!(patch.budget.is_none(), "{model} 的 budget 必须被丢弃");
+            assert!(
+                patch.ignored.contains(&"thinking_budget"),
+                "{model} 的 budget 必须是**可见**的 dropped：{:?}",
+                patch.ignored
+            );
+        }
+    }
+
+    /// adaptive 代际：`thinking_switch = "disabled"` 必须真的下发
+    /// `{type:"disabled"}`。
+    ///
+    /// 旧实现从不下发它，于是用户在 4.7+ 上配「关思考」既不生效、也不告警
+    /// （`switch_says_off != budget.is_none()` 在两者都为 true 时判等成立）。
+    #[test]
+    fn adaptive_models_honour_disabled_switch() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        let patch = apply_anthropic_thinking(
+            &id,
+            &RequestOptions {
+                thinking_switch: Some("disabled".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            patch.thinking,
+            Some(json!({"type": "disabled"})),
+            "关思考必须真的发出去，不能静默失效"
+        );
+        assert!(patch.ignored.is_empty(), "{:?}", patch.ignored);
+    }
+
+    /// 关思考在 `xhigh` / `max` 档位下会被官方拒绝（400），必须记成可见 dropped。
+    #[test]
+    fn adaptive_models_report_disabled_when_effort_forbids_it() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-4-8",
+        );
+        for level in ["xhigh", "max"] {
+            let patch = apply_anthropic_thinking(
+                &id,
+                &RequestOptions {
+                    thinking_switch: Some("disabled".to_string()),
+                    reasoning_effort: Some(level.to_string()),
+                    ..Default::default()
+                },
+            );
+            assert!(patch.thinking.is_none(), "{level} 档位不该发 disabled");
+            assert!(
+                patch.ignored.contains(&"thinking_switch"),
+                "{level}：{:?}",
+                patch.ignored
+            );
+            assert_eq!(patch.output_config, Some(json!({"effort": level})));
+        }
+    }
+
+    /// Claude Opus 5.5 的自适应思考**始终开启**，任何档位都关不掉。
+    #[test]
+    fn opus_5_5_thinking_cannot_be_disabled() {
+        let id = identity(
+            "anthropic",
+            WireProtocol::AnthropicMessages,
+            "claude-opus-5-5",
+        );
+        assert!(
+            !ThinkingSpec::for_vendor(
+                "anthropic",
+                &WireProtocol::AnthropicMessages,
+                "claude-opus-5-5"
+            )
+            .user_can_disable,
+            "面板不该给出「关闭思考」这一项"
+        );
+        for effort in [None, Some("low".to_string()), Some("high".to_string())] {
+            let patch = apply_anthropic_thinking(
+                &id,
+                &RequestOptions {
+                    thinking_switch: Some("disabled".to_string()),
+                    reasoning_effort: effort.clone(),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                patch.thinking.is_none(),
+                "Opus 5.5 上 disabled 会 400（effort={effort:?}）"
+            );
+            assert!(
+                patch.ignored.contains(&"thinking_switch"),
+                "{effort:?}: {:?}",
+                patch.ignored
+            );
+        }
     }
 
     // ── 官方 Anthropic 的 effort 支持 ──
@@ -2347,12 +2610,15 @@ mod tests {
 
     /// budget 与 effort 是**两个独立旋钮**（官方文档明确说可以一起用）：
     /// budget 限思考的 token 数，effort 限整个响应的投入档位。
+    ///
+    /// 只对 **manual 代际**（4.6 及更早）成立：4.7+ 已拒绝 `budget_tokens`，
+    /// 那里只剩 effort 一个旋钮（见 `adaptive_models_never_send_budget_tokens`）。
     #[test]
     fn official_anthropic_sends_budget_and_effort_together() {
         let id = identity(
             "anthropic",
             WireProtocol::AnthropicMessages,
-            "claude-opus-4-8",
+            "claude-opus-4-6",
         );
         let patch = apply_anthropic_thinking(
             &id,
@@ -2454,12 +2720,12 @@ mod tests {
 
     #[test]
     fn anthropic_native_reports_switch_that_budget_overrode() {
-        // budget 是这条线唯一的开关旋钮：用户要关、却因为有 budget 仍在发
-        // `enabled`（thinking 照开）——必须可见，否则用户以为关掉了。
+        // manual 代际（4.5）：budget 是这条线唯一的开关旋钮——用户要关、却因为
+        // 有 budget 仍在发 `enabled`（thinking 照开），必须可见。
         let id = identity(
             "anthropic",
             WireProtocol::AnthropicMessages,
-            "claude-opus-4-8",
+            "claude-opus-4-5",
         );
         let off = apply_anthropic_thinking(
             &id,
@@ -2490,20 +2756,31 @@ mod tests {
 
     #[test]
     fn text_only_switch_is_honoured_on_official_anthropic_without_warning() {
-        // compact / memory / summary / 分类器全走 text_only()：它的
-        // `disabled` + 无 budget 正好是「被兑现」的组合，绝不能记成 ignored，
-        // 否则每次辅助调用都刷一条 warn。
-        let id = identity(
+        // compact / memory / summary / 分类器全走 text_only()。
+        //
+        // * manual 代际（4.5）：`disabled` + 无 budget 正好是「被兑现」的组合
+        //   ——不发字段＝思考没开，绝不能记成 ignored，否则每次辅助调用都刷 warn。
+        // * adaptive 代际（4.8）：`disabled` 是真的能发出去的字段（`text_only`
+        //   对辅助调用正合适），同样不该告警。
+        for model in ["claude-opus-4-5", "claude-opus-4-8"] {
+            let id = identity("anthropic", WireProtocol::AnthropicMessages, model);
+            let patch = apply_anthropic_thinking(&id, &RequestOptions::text_only(256));
+            assert!(
+                patch.ignored.is_empty(),
+                "{model} 的 text_only 不该产生告警：{:?}",
+                patch.ignored
+            );
+        }
+        // manual 代际：不发字段（思考确实没开）。
+        let manual = identity(
             "anthropic",
             WireProtocol::AnthropicMessages,
-            "claude-opus-4-8",
+            "claude-opus-4-5",
         );
-        let patch = apply_anthropic_thinking(&id, &RequestOptions::text_only(256));
-        assert!(patch.thinking.is_none());
         assert!(
-            patch.ignored.is_empty(),
-            "text_only 不该产生告警：{:?}",
-            patch.ignored
+            apply_anthropic_thinking(&manual, &RequestOptions::text_only(256))
+                .thinking
+                .is_none()
         );
     }
 

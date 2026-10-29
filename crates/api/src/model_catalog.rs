@@ -146,6 +146,14 @@ fn base_capabilities(
     let is_local = matches!(vendor, "ollama" | "vllm");
     let tool_calling = !is_local || model.to_ascii_lowercase().contains("tool");
     let parallel_tools = is_reference;
+    // 这里仍标 `BudgetTokens`（不按型号细分成 `Effort`）是**刻意的**：
+    // `agent.rs` 的 `blocked` 判据把 `BudgetTokens` 当成「budget 可以放行」，
+    // 于是 4.7+ 上配了 `thinking_budget` 时它仍会到达 provider，由
+    // `AnthropicNativeAdapter` 记进 `patch.ignored` 并打 warn——**用户可见**。
+    // 若在这里改标 `Effort`，`agent.rs` 会在到达 provider 之前就把 budget
+    // 静默滤成 None，连那条 warn 都不会出现，用户只看到「配了没生效」。
+    // `request_plan` 层另有 `spec.budget_tokens_supported` 判据（已按型号），
+    // 那里会记成可见的 `dropped_parameters`。
     let thinking = match ThinkingSpec::for_vendor(vendor, wire_protocol, model).control {
         ThinkingControl::Disabled => protocol_cap(ThinkingMode::Unsupported),
         ThinkingControl::BudgetOnly => Capability::new(

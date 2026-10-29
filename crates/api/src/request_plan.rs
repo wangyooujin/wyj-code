@@ -263,7 +263,8 @@ mod tests {
         assert!(plan.dropped_parameters.is_empty());
     }
 
-    /// 官方 Anthropic：budget 与 effort 控制**不同维度**，必须**同时**下发。
+    /// 官方 Anthropic **manual 代际**（4.6 及更早）：budget 与 effort 控制
+    /// **不同维度**，必须**同时**下发。
     ///
     /// 回归背景：旧实现里 budget 优先短路会顺手把 effort 一起废掉，于是
     /// `reasoning_effort` 在 Anthropic 线上成了死配置——用户配了 effort，
@@ -272,7 +273,7 @@ mod tests {
     fn official_anthropic_sends_budget_and_effort_together() {
         let mut profile = Profile {
             provider: wyj_config::Provider::Anthropic,
-            model: "claude-opus-4-8".to_string(),
+            model: "claude-opus-4-6".to_string(),
             base_url: "https://api.anthropic.com".to_string(),
             reasoning_effort: Some("high".to_string()),
             ..Profile::default()
@@ -290,6 +291,45 @@ mod tests {
         assert!(
             plan.dropped_parameters.is_empty(),
             "{:?}",
+            plan.dropped_parameters
+        );
+    }
+
+    /// 官方 Anthropic **adaptive 代际**（4.7+）已拒绝 `type:"enabled"`：
+    /// `thinking_budget` 必须记成可见的 dropped，effort 照常生效。
+    ///
+    /// 回归背景：旧实现 `budget_tokens_supported` 无条件 true，于是
+    /// `claude-opus-4-8` + `thinking_budget` 会发出一个必 400 的字段，
+    /// 而 catalog 层认为「支持」，连 dropped 记录都没有。
+    #[test]
+    fn adaptive_anthropic_drops_thinking_budget_visibly() {
+        let mut profile = Profile {
+            provider: wyj_config::Provider::Anthropic,
+            model: "claude-opus-4-8".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            ..Profile::default()
+        };
+        profile.thinking_budget = Some(4096);
+        let plan = RequestPlan::from_profile(&profile, None);
+        assert_eq!(
+            plan.reasoning,
+            ReasoningRequest::Effort("high".to_string()),
+            "4.8 上只剩 effort 一个旋钮"
+        );
+        assert!(
+            plan.dropped_parameters
+                .iter()
+                .any(|d| d.name == "thinking_budget"),
+            "budget 必须是**可见**的 dropped：{:?}",
+            plan.dropped_parameters
+        );
+        assert!(
+            !plan
+                .dropped_parameters
+                .iter()
+                .any(|d| d.name == "reasoning_effort"),
+            "effort 不能被 budget 连坐：{:?}",
             plan.dropped_parameters
         );
     }
