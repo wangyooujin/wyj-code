@@ -4639,10 +4639,13 @@ fn memory_snapshot_is_shared_across_agent_clones() {
 
 // ── 输出预算被 reasoning 吃满：长会话「跑几轮后静默停住」 ────────────────
 
+/// 一次请求实际发出的输出参数：(max_tokens, reasoning_effort, thinking_switch)。
+type SeenRequest = (u32, Option<String>, Option<String>);
+
 /// 按预置脚本逐次回放事件，并记录每次请求**实际发出**的输出参数。
 struct TruncatedScriptProvider {
     script: Mutex<Vec<Vec<StreamEvent>>>,
-    seen: Mutex<Vec<(u32, Option<String>, Option<String>)>>,
+    seen: Mutex<Vec<SeenRequest>>,
 }
 
 impl TruncatedScriptProvider {
@@ -4662,7 +4665,7 @@ impl TruncatedScriptProvider {
             .collect()
     }
 
-    fn requests_full(&self) -> Vec<(u32, Option<String>, Option<String>)> {
+    fn requests_full(&self) -> Vec<SeenRequest> {
         self.seen.lock().unwrap().clone()
     }
 }
