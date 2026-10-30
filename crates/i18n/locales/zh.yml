@@ -313,8 +313,7 @@ help:
     - `/plugins` — 管理插件（添加插件市场、浏览/安装/升级/卸载/启用/禁用）
     - `/extensions` — 统一查看并诊断 Skill / MCP / Plugin 资源
     - `/hooks` — 列出当前生效的 Hooks 配置（按事件分组）
-    - `/plan` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）
-    - `/mode [模式]` — 切换运行模式（auto / plan / bypass）；无参数则显示当前模式
+    - `/plan [auto]` — 切换至规划模式（只读工具 + 写计划文件 + ExitPlanMode）；`/plan auto` 返回自动模式
     - `/resume [id]` — 恢复历史会话（无参数=选择器）
     - `/sessions` — 查看和切换历史会话
     - `/checkpoint [名字]` — 为当前对话与工作区打一个回滚点
@@ -784,6 +783,8 @@ computer:
   section_probe: "实时探测"
   label_platform: "平台"
   label_registration: "工具注册"
+  label_registration_app: "后台控制"
+  app_computer_text_only: "app_computer 可用（文本路径：AX 树 + OCR）；当前分组无截图回传通道，screenshot/read_text 只返回文本"
   label_foreground: "前台回退"
   label_background: "后台操作"
   label_accessibility: "辅助功能"
@@ -874,11 +875,8 @@ effort:
     headless_unsupported: "[headless 模式不支持 /effort 面板，请用 /effort <档位> 直接切换]"
 
 mode:
-  desc: "切换运行模式: /mode [auto|plan|bypass]"
   switched: "已切换至 {mode} 模式"
   switched_to_plan: "已切换至 plan 模式。请描述你想分析或规划的内容。"
-  current: "当前模式: {mode}（可选: auto / plan / bypass）"
-  unknown: "未知模式 '{args}'。可选：auto / plan / bypass"
 
 selection:
   copied: "已复制 {chars} 个字符"
@@ -886,7 +884,7 @@ selection:
 
 auto:
   mode_notice: "auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。"
-  degraded_to_confirm: "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。"
+  degraded_to_confirm: "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。使用 /plan auto 可重新启用分类器。"
 
 cwd:
   desc: "显示当前工作目录"

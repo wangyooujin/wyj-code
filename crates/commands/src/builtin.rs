@@ -1593,6 +1593,11 @@ impl Command for ComputerCmd {
         // 门控逻辑需与 `cli::register_computer_tool_if_enabled` 的真实注册条件
         // 保持一致（平台 → vision → provider），否则诊断结果会跟实际是否
         // 注册该工具对不上。
+        //
+        // **但「未注册」只对 `computer` / `window_capture` 成立**：`app_computer`
+        // 走 AX 树与 OCR 文本，任何 provider 都能注册，只是没有图片通道时
+        // 拿不到截图。这里分开报，否则 OpenAI profile 的用户会以为后台 GUI
+        // 控制整体不可用，而实际上 `app_computer` 正在工作。
         let cfg = Config::load()?;
         let profile = cfg.active_profile();
         let label_registration = tr("computer.label_registration");
@@ -1622,6 +1627,15 @@ impl Command for ComputerCmd {
             panel = panel.row(Level::Ok, label_registration, tr("computer.mode_native"));
         } else {
             panel = panel.row(Level::Ok, label_registration, tr("computer.mode_custom"));
+        }
+        if wyj_computer::SUPPORTED
+            && !(profile.vision && matches!(profile.provider, Provider::Anthropic))
+        {
+            panel = panel.row(
+                Level::Warn,
+                tr("computer.label_registration_app"),
+                tr("computer.app_computer_text_only"),
+            );
         }
 
         let fallback = match cfg.computer_use.foreground_fallback {
@@ -1976,30 +1990,6 @@ impl Command for EffortCmd {
             return Ok(CommandResult::OpenEffortPicker);
         }
         Ok(CommandResult::SetEffort(args.trim().to_ascii_lowercase()))
-    }
-}
-
-// ── /mode (占位，实际由 app.rs 硬编码拦截) ────────────────────────────────────
-
-pub struct ModeCmd;
-
-#[async_trait]
-impl Command for ModeCmd {
-    fn runs_while_busy(&self) -> bool {
-        true
-    }
-    fn name(&self) -> &str {
-        "mode"
-    }
-    fn description(&self) -> String {
-        tr("mode.desc")
-    }
-    fn usage(&self) -> String {
-        "/mode [normal|plan|bypass]".to_string()
-    }
-    async fn run(&self, _args: &str, _ctx: &CommandContext) -> Result<CommandResult> {
-        // app.rs 在 dispatch 之前已拦截 /mode，此分支实际不会执行
-        Ok(CommandResult::None)
     }
 }
 
@@ -2528,7 +2518,6 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(EffortCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
-    reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
     reg.register(Arc::new(SessionsCmd));
@@ -2590,7 +2579,6 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(ModelCmd));
     reg.register(Arc::new(EffortCmd));
     // SandboxCmd 已随 OS sandbox 一起移除；/sandbox 不再注册。
-    reg.register(Arc::new(ModeCmd));
     reg.register(Arc::new(CwdCmd));
     reg.register(Arc::new(ResumeCmd));
     reg.register(Arc::new(SessionsCmd));

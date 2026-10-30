@@ -8448,7 +8448,7 @@ mod system_message_wrap_tests {
     /// 通知里最长的中文段落，能真正触发折行。
     #[test]
     fn system_message_does_not_split_a_chinese_phrase_across_lines() {
-        let content = "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。用 /mode auto 可重新启用分类器。";
+        let content = "auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。使用 /plan auto 可重新启用分类器。";
         let lines = render_system(content, 60);
         // 折行后所有文字都还在（不丢字）
         assert_eq!(

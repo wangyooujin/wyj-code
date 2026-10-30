@@ -686,9 +686,8 @@ impl AutoGate for AutoGateImpl {
         if let Ok(mut counters) = self.counters.lock() {
             // `total` 也必须清：它只增不减，而 `should_degrade` 是
             // `consecutive >= 连续阈值 || total >= 累计阈值`。只清 consecutive
-            // 的话，若这次降级是由 total 触发的，`/mode auto` 之后
-            // `should_degrade()` **立刻仍为 true**——用户看到的现象是
-            // 「明明重新选了 auto，状态栏还是显示已降级」。
+            // 的话，若这次降级是由 total 触发的，`/plan auto` 之后
+            // `should_degrade()` **立刻仍为 true**，新闸门才会从干净计数开始。
             counters.consecutive = 0;
             counters.total = 0;
             counters.degraded = false;

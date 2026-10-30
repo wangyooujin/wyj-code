@@ -316,8 +316,7 @@ help:
     - `/plugins` — Manage Plugins (add a plugin marketplace, browse/install/upgrade/uninstall/enable/disable)
     - `/extensions` — Inspect and diagnose Skill / MCP / Plugin resources
     - `/hooks` — List currently active Hooks (grouped by event)
-    - `/plan` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode)
-    - `/mode [mode]` — Switch run mode (auto / plan / bypass); no arg shows the current mode
+    - `/plan [auto]` — Switch to plan mode (read-only tools + write plan file + ExitPlanMode); `/plan auto` returns to auto mode
     - `/resume [id]` — Resume a past session (no arg = picker)
     - `/sessions` — View and switch between past sessions
     - `/checkpoint [name]` — Snapshot the current conversation and workspace as a rollback point
@@ -787,6 +786,8 @@ computer:
   section_probe: "Live probes"
   label_platform: "Platform"
   label_registration: "Registration"
+  label_registration_app: "Background control"
+  app_computer_text_only: "app_computer is available (text path: accessibility tree + OCR); this profile has no image channel, so screenshot/read_text return text only"
   label_foreground: "Foreground"
   label_background: "Background"
   label_accessibility: "Accessibility"
@@ -877,11 +878,8 @@ effort:
     headless_unsupported: "[headless mode has no /effort panel; use /effort <level> to switch directly]"
 
 mode:
-  desc: "Switch run mode: /mode [auto|plan|bypass]"
   switched: "Switched to {mode} mode"
   switched_to_plan: "Switched to plan mode. Describe what you'd like to analyze or plan."
-  current: "Current mode: {mode} (options: auto / plan / bypass)"
-  unknown: "Unknown mode '{args}'. Options: auto / plan / bypass"
 
 selection:
   copied: "Copied {chars} characters"
@@ -889,7 +887,7 @@ selection:
 
 auto:
   mode_notice: "Auto mode: most actions run without prompting; dangerous ones are still blocked. Shift+Tab switches to plan / bypass."
-  degraded_to_confirm: "The auto classifier blocked too many actions in a row, so the model classifier has been switched off: dangerous commands are still blocked by the hard rules, and everything else now asks you one by one. Run /mode auto to turn the classifier back on."
+  degraded_to_confirm: "The auto classifier blocked too many actions in a row, so the model classifier has been switched off: dangerous commands are still blocked by the hard rules, and everything else now asks you one by one. Run /plan auto to turn the classifier back on."
 
 cwd:
   desc: "Show the current working directory"

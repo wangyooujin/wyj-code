@@ -424,7 +424,6 @@ mod busy_whitelist_tests {
             "hooks",
             "mcp",
             "memory",
-            "mode",
             "model",
             "plugins",
             "profile",
@@ -436,6 +435,16 @@ mod busy_whitelist_tests {
         ];
         expected.sort_unstable();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn mode_command_is_not_registered() {
+        let reg = standard_registry();
+        assert!(reg.get("mode").is_none());
+        assert!(!reg
+            .complete("/mode")
+            .iter()
+            .any(|(name, _)| name == "/mode"));
     }
 
     /// 四条排除理由逐条钉死：不许把会起新回合 / 改会话 / 读 session 统计 /

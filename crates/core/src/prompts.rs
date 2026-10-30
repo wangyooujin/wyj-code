@@ -406,6 +406,20 @@ pub const COMPUTER_USE_HINT: &str = "For desktop GUI work, preserve the human us
 
 // ── 子 Agent 内置提示 ─────────────────────────────────────────────────────────
 
+/// 只有 `app_computer`、**没有图片回传通道**时的 computer-use 提示。
+///
+/// 为什么不能直接复用 [`COMPUTER_USE_HINT`]：那段通篇假定「截图会回到模型
+/// 眼前」——它教模型读附图、按 `frame_in_screenshot` 定位、在
+/// `root_available:false` 时改用截图坐标。OpenAI 线的 `tool` 角色消息装不下
+/// image block，`openai.rs::to_api_messages` 会把截图降级成
+/// `[image omitted: ...]` 占位符。沿用同一份提示，模型会按「我看得到画面」
+/// 的前提规划，随后对着一个占位符描述界面——比不给提示更糟。
+///
+/// 因此这一段只写文本路径：Accessibility 树（`list_elements` +
+/// `include_text`）与 OCR（`read_text`），并要求每次变更后重新读状态——
+/// 没有画面时动作回执是唯一可验证的信号。
+pub const APP_COMPUTER_TEXT_ONLY_HINT: &str = "For desktop GUI work, preserve the human user's mouse, keyboard focus, and foreground application. `app_computer` is available, but this profile CANNOT receive images: the `screenshot` action is not offered at all on this profile and captures never reach you, so do not look for it and never describe a window you have not read as text. Work the text path: `list_windows` to find the target `window_id` and `generation`, then `list_elements` for that window with `include_text:true` — the accessibility tree gives exact control labels and on-screen text with their positions. Act on the returned `element_ref` ids (`e12`), repeating `window_id`, `generation`, the `tree_id` from that exact `list_elements` call, and `element_ref`; a reference is valid only for the observation that produced it, so on `target_changed` or an unknown `element_ref` call `list_elements` again instead of retrying the old one. Prefer `element_ref` over `coordinate`: with no picture to measure against, a guessed coordinate is just a guess, so use one only when the element you need genuinely is not in the tree. For application commands (File then New Tab, View then Show Path Bar, and similar) use `list_menus` and `press_menu`, which run in the background without moving the pointer. If `list_elements` reports `root_available:false`, that app exposes no accessibility tree — fall back to `read_text`, which runs on-device OCR over the window and returns every line with a confidence and pixel coordinates; treat that as a machine reading rather than ground truth, and re-check numbers, because Chinese and dense digits are the most frequently misread. If it reports `truncated:true`, narrow the target with `role_filter` or `region` rather than assuming the list is complete. After EVERY mutation, call `list_elements` again to confirm the change actually took effect — the action receipt alone only says the event was posted, not that the UI responded, and with no screenshot it is the only evidence you get. Do not run `drag` or `click` at a coordinate you obtained from anywhere other than `read_text` output or an element's reported frame. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, `screen_locked`, or a permission error, STOP and report the condition instead of retrying. To launch an application, use Bash (`open -a \"App Name\"`), then list windows to discover it. Report only what a tool result actually returned; if the text is missing or unreadable, say so plainly rather than inventing plausible-sounding window contents.";
+
 /// 追加给子 Agent system prompt 的「回复语言」段。
 ///
 /// 子 Agent 走 `Agent::with_system` **整体替换** system prompt，拿不到主 Agent

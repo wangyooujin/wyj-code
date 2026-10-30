@@ -2304,6 +2304,11 @@ async fn main() -> Result<()> {
         let mut probe = ToolRegistry::standard();
         register_computer_tool_if_enabled(&mut probe, &cfg)
     };
+    // `app_computer` 的门槛比上面两个低（不需要图片通道），所以 OpenAI profile
+    // 下它仍会注册。那段完整提示（`COMPUTER_USE_HINT`）大量讲「读附带的截图」，
+    // 在这类 profile 上会把模型引向一个它永远看不到的画面，因此只注入
+    // 文本路径版本。
+    let app_computer_enabled = app_computer_registered(&cfg);
 
     // agent 类型定义：内置三类型 + ~/.claude/agents 与项目 .claude/agents 的自定义定义
     // + 已启用插件贡献的 agent 定义 + --plugin-dir 临时加载的 agent 定义
@@ -2565,6 +2570,14 @@ async fn main() -> Result<()> {
     // 且每个变更动作已有独立确认弹窗、无需先在聊天里问用户"允许"
     if computer_use_enabled {
         let extra = wyj_core::prompts::COMPUTER_USE_HINT;
+        agent = agent.append_system(extra);
+        system_prompt_extra.push_str("\n\n");
+        system_prompt_extra.push_str(extra);
+    } else if app_computer_enabled {
+        // 只有 `app_computer`（OpenAI 线，没有图片通道）：给它一份只讲文本路径的
+        // 提示。灌 `COMPUTER_USE_HINT` 会教模型「读附带的截图」，而那张图在
+        // `tool` 消息里会被降级成占位符——模型会以为自己看过画面然后编内容。
+        let extra = wyj_core::prompts::APP_COMPUTER_TEXT_ONLY_HINT;
         agent = agent.append_system(extra);
         system_prompt_extra.push_str("\n\n");
         system_prompt_extra.push_str(extra);
@@ -3305,15 +3318,45 @@ fn register_window_capture_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Co
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_window_capture_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config) {}
 
+/// `app_computer` 是否会真的注册（与 profile 无关，只看平台）。
+///
+/// 注册动作在 `build_tool_registry` 里做，但提示词注入在此之前就要决定注入哪
+/// 一份，所以这里复刻一遍平台判定而不是回头去问注册表。
+#[cfg(target_os = "macos")]
+fn app_computer_registered(_cfg: &Config) -> bool {
+    true
+}
+#[cfg(not(target_os = "macos"))]
+fn app_computer_registered(_cfg: &Config) -> bool {
+    false
+}
+
+/// `app_computer` 能否把截图送回模型。
+///
+/// **与「能不能注册」是两件事**：`computer` / `window_capture` 完全依赖「截图 →
+/// 模型」这条通路，工具结果里没有 image block 就等于闭着眼睛点，所以它们的注册
+/// 门槛是 `vision && Anthropic`。`app_computer` 的主路径却是 Accessibility 树
+/// 与 OCR 文本——`list_elements`（可带 `include_text`）读到的是控件原文，
+/// `read_text` 返回逐行带置信度的识别文本，两条路都不经过图片通道。
+///
+/// 所以它在**任何** provider 下都注册，只是 OpenAI 线上没有截图：`tool` 角色
+/// 消息装不下 image block，`openai.rs::to_api_messages` 会把截图降级成
+/// `[image omitted: ...]` 占位符。注册时用 `without_image_channel()` 把附图整个
+/// 撤掉、并在描述末尾追加 `NO_IMAGE_CHANNEL_NOTE`，免得模型照着「读附带截图」
+/// 的描述去编造画面。
+fn app_computer_image_channel(cfg: &Config) -> bool {
+    let profile = cfg.active_profile();
+    profile.vision && matches!(profile.provider, wyj_config::Provider::Anthropic)
+}
+
 /// macOS 后台优先 computer-use：按稳定窗口目标截图，用 Accessibility/目标 PID
 /// 事件执行，不移动全局光标、不激活应用。Windows 在 v0.2.5 先保持安全边界，
 /// 只提供稳定窗口截图和默认关闭的前台兼容工具。
 #[cfg(target_os = "macos")]
 fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) {
-    let profile = cfg.active_profile();
-    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
-        return;
-    }
+    // 图片通道与注册与否是**两件事**：OpenAI 线的 `tool` 消息装不下 image
+    // block，但 AX/OCR 文本路径照常可用，所以这里只降级能力、不撤掉工具。
+    let image_channel = app_computer_image_channel(cfg);
     wyj_computer::activity::ensure_monitor();
     // AX 消息超时：系统默认 6 秒。目标 App 的 AX 线程挂起时（窗口刚关闭、
     // App 卡顿、元素已失效），`CFRelease` 会一直等，最终让**我们的**进程
@@ -3332,8 +3375,15 @@ fn register_app_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Conf
         wyj_tools::computer::DEFAULT_MAX_DIM,
         std::time::Duration::from_millis(cfg.computer_use.quiet_period_ms),
     );
-    if cfg.computer_use.auto_screenshot {
-        tool = tool.with_auto_screenshot(cfg.computer_use.auto_screenshot_max_dim);
+    if image_channel {
+        if cfg.computer_use.auto_screenshot {
+            tool = tool.with_auto_screenshot(cfg.computer_use.auto_screenshot_max_dim);
+        }
+    } else {
+        // 撤掉图片通道的同时也撤掉自动附图：`without_image_channel` 内部已置
+        // `auto_screenshot = None`，这里显式走 else 分支只是让调用点读起来
+        // 与「有没有图片」这件事对齐，不依赖构造顺序。
+        tool = tool.without_image_channel();
     }
     registry.register_arc(Arc::new(tool));
 }
@@ -4761,6 +4811,36 @@ async fn repl(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    /// 图片通道判定只认 `vision && Anthropic`，与 `computer` /
+    /// `window_capture` 的注册门槛同源。
+    ///
+    /// 这条**不能**跟着 `app_computer` 的注册门槛一起放松：注册可以不看图片，
+    /// 但「能不能附图」永远只看这一条。两者混同就会出现「OpenAI profile 下
+    /// 附图被静默丢弃」或「Anthropic profile 下明明能附图却只给文本」。
+    #[test]
+    fn the_image_channel_is_vision_plus_anthropic_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg =
+            Config::load_file_only_at(&dir.path().join("config.toml")).unwrap_or_default();
+
+        cfg.active_profile_mut().provider = wyj_config::Provider::Anthropic;
+        cfg.active_profile_mut().vision = true;
+        assert!(app_computer_image_channel(&cfg));
+
+        cfg.active_profile_mut().provider = wyj_config::Provider::OpenAI;
+        assert!(
+            !app_computer_image_channel(&cfg),
+            "OpenAI 线的 tool 消息装不下 image block"
+        );
+
+        cfg.active_profile_mut().provider = wyj_config::Provider::Anthropic;
+        cfg.active_profile_mut().vision = false;
+        assert!(
+            !app_computer_image_channel(&cfg),
+            "vision=false 时截图会被降级成占位文本"
+        );
+    }
 
     /// 首建与 `/model` 重建必须给模型**同一个**工具集合。
     ///

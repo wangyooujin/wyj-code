@@ -1819,8 +1819,15 @@ mod busy_slash_tests {
             );
         }
 
-        // 未知命令 / 普通正文 ⇒ 交给排队分支
-        for draft in ["/不存在的命令", "please look at /new", "/model\n再补一句"] {
+        // 已移除的 `/mode` 与普通未知命令都应交给正文排队分支。
+        for draft in [
+            "/mode",
+            "/mode auto",
+            "/mode\n后续内容",
+            "/不存在的命令",
+            "please look at /new",
+            "/model\n再补一句",
+        ] {
             assert!(
                 !draft_is_known_command(&registry, draft),
                 "{draft:?} 不是已注册命令，应作为正文排队"
@@ -3741,7 +3748,7 @@ impl Drop for RestorePermissionOnDrop {
 /// 不警告，用户只会看到「参数写了但没反应」。
 ///
 /// 之所以在 TUI 侧重新施加而不是让 CLI 直接下发算好的 `PermissionMode`：
-/// TUI 允许运行中切换模式（Shift+Tab / `/mode` / Plan 审批），每次切换都要
+/// TUI 允许运行中切换模式（Shift+Tab / Plan 审批），每次切换都要
 /// 重算权限模式。只下发「最终权限模式」的话，切一次模式就把 CLI 的约束
 /// 冲掉了；下发「约束」本身才能在每次重算后重新施加。
 #[derive(Debug, Clone, Default)]
@@ -4135,7 +4142,7 @@ fn attach_agent_session(
 }
 
 /// 统一的模式切换入口：同步更新 shared_mode 与 shared_permission，
-/// 确保任何切换途径（Plan 审批、Shift+Tab、/mode、/plan、resume 确认）
+/// 确保任何切换途径（Plan 审批、Shift+Tab、/plan、resume 确认）
 /// 都不会遗漏 shared_permission 的更新。shared_permission 与正在运行的
 /// turn 共享同一个 Arc<RwLock<..>>，因此这里的写入对当轮剩余的工具调用
 /// 立即生效，无需等待下一轮 spawn_agent_turn。
@@ -4150,26 +4157,6 @@ async fn switch_mode(
 ) {
     *shared_mode.lock().await = new_mode.clone();
     *shared_permission.write().unwrap() = constraints.permission_for(&new_mode);
-}
-
-/// 模式切换后同步闸门的分类器开关。
-///
-/// 降级（`AutoGate::disable_classifier`）是一次性的：闸门在这个会话里已经证明
-/// 判定不可靠，切走再切回来**不应该**悄悄恢复它，否则用户按两下 Shift+Tab 就
-/// 把一个反复拒绝的动作重新塞回分类器往返里。反过来，用户在 `/mode` 里**显式
-/// 选中 auto** 是「我知道了，我要重试」的表态，那就要恢复。
-///
-/// 因此只有 `reset` 为真的调用点（`/mode` 的显式选择与启动装配）才重新打开，
-/// Shift+Tab 的循环走 `reset = false`。
-async fn sync_gate_classifier(
-    gate: Option<&Arc<dyn wyj_core::auto_mode::AutoGate>>,
-    mode: &AgentMode,
-    reset: bool,
-) {
-    let Some(gate) = gate else { return };
-    if matches!(mode, AgentMode::Auto) && reset {
-        gate.enable_classifier();
-    }
 }
 
 /// 扫描目录并按过滤词返回文件候选列表
@@ -8744,9 +8731,16 @@ async fn tui_main(
                                 continue;
                             }
 
-                            // ── /plan 命令：直接切换至 plan 模式 ────────────
-                            if trimmed == "/plan" {
-                                let new_mode = AgentMode::Plan;
+                            // ── /plan 命令：切换至 plan，或用 `/plan auto` 返回 auto ──
+                            if trimmed == "/plan" || trimmed.eq_ignore_ascii_case("/plan auto") {
+                                let new_mode = if trimmed.eq_ignore_ascii_case("/plan auto") {
+                                    if let Some(gate) = auto_gate.as_ref() {
+                                        gate.enable_classifier();
+                                    }
+                                    AgentMode::Auto
+                                } else {
+                                    AgentMode::Plan
+                                };
                                 switch_mode(
                                     &shared_mode,
                                     &shared_permission,
@@ -8754,61 +8748,13 @@ async fn tui_main(
                                     &permission_constraints,
                                 )
                                 .await;
-                                state.mode = new_mode;
-                                state.messages.push(ChatMessage::system(wyj_i18n::tr(
-                                    "mode.switched_to_plan",
-                                )));
-                                state.input_history.push(trimmed);
-                                continue;
-                            }
-
-                            // ── /mode 命令：运行时切换模式 ───────────────────
-                            // 注意：必须要求 "/mode" 后紧跟空格或结尾，否则 "/model" 这类
-                            // 以 "/mode" 为前缀的命令会被误吞（strip_prefix 不检查词边界）。
-                            if trimmed == "/mode" || trimmed.starts_with("/mode ") {
-                                let args = trimmed.strip_prefix("/mode").unwrap().trim();
-                                // 走 `AgentMode::parse` 而不是在这里再写一遍 match：
-                                // CLI 的 `--permission-mode` 与 TUI 的 `/mode` 必须接受
-                                // 同一组名字与别名（`default` ≡ `manual`），两处各写
-                                // 一份必然漂移。
-                                //
-                                // 裸 `/mode` 显示当前模式与可选值，而不是像从前那样
-                                // 「切到 normal」——现在默认值是 auto，一个不带参数的
-                                // 切换命令没有任何自解释的语义。
-                                if args.is_empty() {
-                                    state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
-                                        "mode.current",
-                                        &[("mode", state.mode.label())],
-                                    )));
-                                    state.input_history.push(trimmed);
-                                    continue;
-                                }
-                                match AgentMode::parse(args) {
-                                    Some(m) => {
-                                        let label = m.label();
-                                        switch_mode(
-                                            &shared_mode,
-                                            &shared_permission,
-                                            m.clone(),
-                                            &permission_constraints,
-                                        )
-                                        .await;
-                                        // 显式 `/mode auto` 是「重试」的表态：
-                                        // 恢复本次会话因拦截过多而停用的分类器。
-                                        sync_gate_classifier(auto_gate.as_ref(), &m, true).await;
-                                        state.mode = m;
-                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
-                                            "mode.switched",
-                                            &[("mode", label)],
-                                        )));
-                                    }
-                                    None => {
-                                        state.messages.push(ChatMessage::system(wyj_i18n::tr_fmt(
-                                            "mode.unknown",
-                                            &[("args", args)],
-                                        )));
-                                    }
-                                }
+                                state.mode = new_mode.clone();
+                                let message = if new_mode == AgentMode::Plan {
+                                    wyj_i18n::tr("mode.switched_to_plan")
+                                } else {
+                                    wyj_i18n::tr_fmt("mode.switched", &[("mode", new_mode.label())])
+                                };
+                                state.messages.push(ChatMessage::system(message));
                                 state.input_history.push(trimmed);
                                 continue;
                             }

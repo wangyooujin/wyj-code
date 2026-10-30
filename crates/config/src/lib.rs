@@ -2931,7 +2931,7 @@ context_window = 200000
         assert!(!text.contains("mouse_capture"), "{text}");
     }
 
-    /// CLI 的 `--permission-mode` 与 TUI 的 `/mode` 共用这一个解析器。
+    /// CLI 的 `--permission-mode` 解析器。
     ///
     /// `manual` / `default` / `normal` 是历史遗留拼法，手动模式合并进 auto 后
     /// 它们全部落到 `Auto`——**必须仍然返回 `Some`**：旧配置与脚本里写着

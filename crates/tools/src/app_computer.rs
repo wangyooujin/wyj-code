@@ -73,6 +73,13 @@ pub struct AppComputerTool {
     auto_screenshot: Option<u32>,
     /// 自上次截图以来的连续变更动作数，用于 `MAX_ACTIONS_WITHOUT_SCREENSHOT`。
     mutations_since_screenshot: Mutex<HashMap<u32, u32>>,
+    /// 本次会话能否把截图真正送到模型眼前。
+    ///
+    /// 只有 Anthropic 线（`tool_result` 里可以嵌 image block）且 `profile.vision`
+    /// 为真时才成立。OpenAI 线的 `tool` 角色消息只承载文本，图片会被
+    /// `openai.rs::to_api_messages` 降级成 `[image omitted: ...]` 占位符——那时
+    /// 附图不是「模型看到了画面」，而是「模型以为自己看到了画面」，比不附更糟。
+    image_channel: bool,
 }
 
 /// 连续变更动作的上限。超过之后即使 `auto_screenshot` 关闭也强制附图一次。
@@ -103,7 +110,41 @@ impl AppComputerTool {
             incompatible_actions: Mutex::new(HashSet::new()),
             auto_screenshot: None,
             mutations_since_screenshot: Mutex::new(HashMap::new()),
+            image_channel: true,
         }
+    }
+
+    /// 声明本 profile **没有**图片回传通道，工具只剩文本路径。
+    ///
+    /// OpenAI 线的 `tool` 角色消息装不下 image block（`openai.rs::to_api_messages`
+    /// 会把 Parts 降级成 `display_text()` 的 `[image omitted: ...]` 占位符），
+    /// 于是「附图」在模型眼里等于「这里本该有张图，但你看到的是占位符」。
+    /// 与其让模型对着一张它看不见的图推理，不如把图片整个撤掉、只给
+    /// Accessibility 文本与 OCR 文本，并在回执里说清楚这是能力边界。
+    pub fn without_image_channel(mut self) -> Self {
+        self.image_channel = false;
+        self.auto_screenshot = None;
+        self
+    }
+
+    /// 把截图附进回执。没有图片通道时退化成「文本 + 一句能力说明」。
+    fn attach_capture(&self, display: String, png_base64: String) -> ToolResult {
+        if !self.image_channel {
+            return ToolResult::ok(format!(
+                "{display}\n\n[no image attached: this profile's wire protocol cannot deliver \
+                 images inside tool results, so only the text above is available. Do not retry \
+                 expecting a picture — read the accessibility text (`list_elements` with \
+                 `include_text:true`) or OCR text (`read_text`) instead.]\n\
+                 本端点无法在工具结果里回传图片，以上文本即全部信息，不要重试等图片。"
+            ));
+        }
+        ToolResult::with_parts(
+            display,
+            vec![ToolResultPart::Image {
+                media_type: "image/png".to_string(),
+                data: png_base64,
+            }],
+        )
     }
 
     /// 开启「变更动作后自动附带截图」，`max_dim` 为附图的长边像素上限。
@@ -153,13 +194,7 @@ impl AppComputerTool {
             }
         }))
         .unwrap_or_else(|_| format!("[app_computer screenshot window_id={window_id}]"));
-        ToolResult::with_parts(
-            display,
-            vec![ToolResultPart::Image {
-                media_type: "image/png".to_string(),
-                data: capture.png_base64(),
-            }],
-        )
+        self.attach_capture(display, capture.png_base64())
     }
 
     fn resolve_observation(&self, input: &Value) -> Result<WindowTarget> {
@@ -419,13 +454,7 @@ impl AppComputerTool {
              据此操作前请二次核对。坐标是本截图内的像素坐标，可直接用于 `coordinate` 动作。",
         );
 
-        ToolResult::with_parts(
-            display,
-            vec![ToolResultPart::Image {
-                media_type: "image/png".to_string(),
-                data: capture.png_base64(),
-            }],
-        )
+        self.attach_capture(display, capture.png_base64())
     }
 
     /// 执行一条编译期固定的 AppleScript recipe。
@@ -583,18 +612,21 @@ impl AppComputerTool {
                  `set_text` 与 `scroll` 同理降级。不要重试 `list_elements`。",
             );
         } else if snapshot.truncated {
-            display.push_str(
-                "\n\nPartial result: the element tree exceeded the traversal budget, so some elements are missing. Use the attached screenshot with `coordinate`, or narrow the target window, to reach the rest.",
-            );
+            // 没有图片通道时不能说「用附带的截图」——那张截图模型看不到。
+            let hint = if self.image_channel {
+                "Use the attached screenshot with `coordinate`, or narrow the target window, \
+                 to reach the rest."
+            } else {
+                "There is no attached screenshot on this profile — narrow the target window, \
+                 raise the element quota, or retry with a `role_filter` to reach the rest."
+            };
+            display.push_str(&format!(
+                "\n\nPartial result: the element tree exceeded the traversal budget, so some \
+                 elements are missing. {hint}"
+            ));
         }
 
-        ToolResult::with_parts(
-            display,
-            vec![ToolResultPart::Image {
-                media_type: "image/png".to_string(),
-                data: capture.png_base64(),
-            }],
-        )
+        self.attach_capture(display, capture.png_base64())
     }
 
     /// 列举目标 App 的菜单栏。
@@ -1099,6 +1131,24 @@ impl AppComputerTool {
             *slot
         };
         let forced = count >= MAX_ACTIONS_WITHOUT_SCREENSHOT;
+        // 没有图片通道时，附图只是一段模型看不见的 base64。但「连续盲点」这条
+        // 保护必须保留语义：到阈值就让模型**主动去读一次界面状态**（AX 文本
+        // 或 OCR），而不是继续凭动作回执往下点。
+        if !self.image_channel {
+            if !forced {
+                return ToolResult::ok(content);
+            }
+            self.mutations_since_screenshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target.window_id, 0);
+            return ToolResult::ok(format!(
+                "{content}\n\nThis is mutation #{MAX_ACTIONS_WITHOUT_SCREENSHOT} since the last \
+                 observation. This profile cannot receive screenshots, so verify the window \
+                 state with `list_elements` (with `include_text:true`) or `read_text` before \
+                 continuing."
+            ));
+        }
         // 强制档用观察用的 `max_dim`：既然是被迫补看一次，就给足分辨率。
         let max_dim = match (self.auto_screenshot, forced) {
             (_, true) => Some(self.max_dim),
@@ -1321,6 +1371,13 @@ fn scroll_with_fallback(target: &WindowTarget, direction: &str, amount: u32) -> 
 
 const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. When you need to *read* text rather than click it, prefer `list_elements` with `include_text:true` — the text comes from the accessibility tree, so it is exact. Only when the app exposes no text at all (self-drawn canvases, images, video captions) use `read_text`, which runs on-device OCR over the window pixels and returns every line with a per-line confidence and pixel coordinates; treat those results as a machine reading, not as ground truth, and re-check numbers before acting on them. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying. A few operations cannot be expressed through the accessibility tree at all — naming a brand-new Finder folder, creating a note whose body is rich text, opening a URL without driving the address bar. For those, `run_recipe` runs one of a small fixed set of automation scripts shipped with the binary: you pick the recipe name and pass its positional `args`, and the arguments travel as data rather than being spliced into the script, so quoting in them is harmless. The first time a recipe drives a given app macOS shows an Automation permission dialog that a person must accept, so recipes only run on interactive surfaces; if that permission is refused you get `appleevents_permission_required` and must not retry.";
 
+/// 附在没有图片回传通道的 profile 上的补充说明。
+///
+/// 这段**不能省**：工具描述里大量承诺「附带的截图」「用 coordinate 猜坐标」，
+/// 而 OpenAI 线的 `tool` 消息承载不了图片。不声明这一点，模型会先按描述里的
+/// 截图工作流规划、再拿到一张永远看不见的图，然后开始编造画面内容。
+const NO_IMAGE_CHANNEL_NOTE: &str = "IMPORTANT for this profile: images cannot be delivered inside tool results on this wire protocol, so the `screenshot` action is not available and `read_text` returns text only — no picture ever reaches you. Do NOT plan around seeing a screenshot, and never describe or guess what the window looks like. Read state exclusively through `list_elements` (pass `include_text:true` for on-screen text) and `read_text` (OCR text). Prefer `element_ref` over `coordinate`: with no image to measure against, a guessed coordinate is just a guess. After each mutation, re-run `list_elements` to confirm the change took effect.";
+
 #[async_trait]
 impl Tool for AppComputerTool {
     fn name(&self) -> &str {
@@ -1328,15 +1385,72 @@ impl Tool for AppComputerTool {
     }
 
     fn definition(&self) -> ToolDefinition {
+        // 没有图片通道时，描述里所有「读附带的截图」「用 coordinate」都成了
+        // 模型做不到的事。与其让它反复尝试再困惑，不如把这些能力从描述里
+        // 撤掉，只剩 Accessibility 与 OCR 两条文本路径。
+        let description = if self.image_channel {
+            DESCRIPTION.to_string()
+        } else {
+            format!("{DESCRIPTION} {NO_IMAGE_CHANNEL_NOTE}")
+        };
+        // `screenshot` 在无图片通道时**从枚举里摘掉**，而不是留着返回一段文本。
+        // 留着的代价是双向的：模型看到一个叫 screenshot 的动作就会去调（它的
+        // 训练先验认为这动作能拿到画面），而每次调用都要过一遍权限确认、
+        // 真截一张图、编码 base64 再丢掉。摘掉之后模型从动作面上就知道这条路
+        // 不存在，只会走 `list_elements` / `read_text`。
+        //
+        // 元信息没有损失：窗口尺寸由 `list_windows` 直接给出，`list_elements`
+        // 回执里也带 `capture` 块。
+        let actions: Vec<&str> = if self.image_channel {
+            vec![
+                "list_windows",
+                "screenshot",
+                "list_elements",
+                "list_menus",
+                "inspect_element",
+                "read_text",
+                "wait",
+                "click",
+                "drag",
+                "show_menu",
+                "set_text",
+                "press_menu",
+                "key",
+                "scroll",
+                "run_recipe",
+            ]
+        } else {
+            vec![
+                "list_windows",
+                "list_elements",
+                "list_menus",
+                "inspect_element",
+                "read_text",
+                "wait",
+                "click",
+                "drag",
+                "show_menu",
+                "set_text",
+                "press_menu",
+                "key",
+                "scroll",
+                "run_recipe",
+            ]
+        };
+        let wait_hint = if self.image_channel {
+            "Use it after an action that starts an animation or a load, then screenshot to see the settled state."
+        } else {
+            "Use it after an action that starts an animation or a load, then re-run `list_elements` to see the settled state."
+        };
         ToolDefinition {
             name: self.name().to_string(),
-            description: DESCRIPTION.to_string(),
+            description,
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list_windows", "screenshot", "list_elements", "list_menus", "inspect_element", "read_text", "wait", "click", "drag", "show_menu", "set_text", "press_menu", "key", "scroll", "run_recipe"]
+                        "enum": actions
                     },
                     "window_id": {"type": "integer", "minimum": 0},
                     "generation": {"type": "integer", "minimum": 0},
@@ -1430,7 +1544,7 @@ impl Tool for AppComputerTool {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 3000,
-                        "description": "How long `wait` should pause, in milliseconds (max 3000). Use it after an action that starts an animation or a load, then screenshot to see the settled state."
+                        "description": wait_hint
                     }
                 },
                 "required": ["action"]
@@ -1543,6 +1657,16 @@ impl Tool for AppComputerTool {
                 ),
                 Err(error) => error_result(error),
             },
+            // schema 里已摘掉这个动作，但模型可能凭旧上下文重放或手工拼一个
+            // 调用。这里是最后一道：直接拒绝并说清替代路径，而不是悄悄截一张
+            // 图、编码成模型看不见的 base64 再返回。
+            "screenshot" if !self.image_channel => ToolResult::err(
+                "unsupported app_computer action `screenshot`: this profile has no image \
+                 channel inside tool results, so a capture would never reach you. Use \
+                 `list_elements` (with `include_text:true`) or `read_text` to read the \
+                 window instead.\n\
+                 本端点无法回传图片，请改用 `list_elements` 或 `read_text` 读取窗口。",
+            ),
             "screenshot" => self.screenshot(&input),
             "inspect_element" => self.inspect(&input),
             "list_elements" => self.list_elements(&input),
@@ -1556,10 +1680,14 @@ impl Tool for AppComputerTool {
                     .unwrap_or(500)
                     .clamp(1, MAX_WAIT_MS);
                 tokio::time::sleep(Duration::from_millis(ms)).await;
-                ToolResult::ok(format!(
-                    "waited {ms}ms. Take a screenshot now to see the settled state; \
+                let next = if self.image_channel {
+                    "Take a screenshot now to see the settled state; \
                      do not assume the previous screenshot is still current."
-                ))
+                } else {
+                    "Re-run `list_elements` now to see the settled state; \
+                     do not assume the previous reading is still current."
+                };
+                ToolResult::ok(format!("waited {ms}ms. {next}"))
             }
             "press_menu" => self.press_menu(&input),
             "click" => self.click(&input),
@@ -2055,6 +2183,147 @@ mod tests {
             definition.input_schema["properties"]["action"]["enum"][0],
             "list_windows"
         );
+    }
+
+    /// OpenAI 线拿不到截图：工具必须**主动声明**这一点，而不是继续按
+    /// 「读附带截图」的描述工作。
+    ///
+    /// 没有这条声明，模型会照着 DESCRIPTION 里那套截图工作流规划，随后收到
+    /// 一句 `[image omitted: ...]`——它看不到画面却以为自己看过，然后开始
+    /// 描述界面。这类编造比「工具不可用」难查得多，因为结果里没有任何错误。
+    #[test]
+    fn without_an_image_channel_the_description_declares_it() {
+        let with_images = AppComputerTool::new(1280, Duration::from_secs(2)).definition();
+        let text_only = AppComputerTool::new(1280, Duration::from_secs(2))
+            .without_image_channel()
+            .definition();
+        assert!(
+            !with_images
+                .description
+                .contains("images cannot be delivered"),
+            "有图片通道时不该出现这段声明"
+        );
+        assert!(
+            text_only.description.contains("images cannot be delivered"),
+            "没有图片通道时必须声明"
+        );
+        assert!(
+            text_only.description.contains("include_text:true"),
+            "必须把模型引向唯一可行的文本读取路径"
+        );
+        // 动作面与提示文案的差异**只有两处**：`action` 枚举少了 `screenshot`，
+        // 以及 `ms` 的说明从「截图确认」改成「重读元素」。其余字段与约束逐字
+        // 相同。收紧到这个粒度是为了两边都钉住：看不见画面的模型被授予
+        // screenshot 等于给一个必然浪费往返的陷阱；而多撤任何一项（如
+        // `list_elements`）就是把文本路径也断了。
+        assert_ne!(with_images.input_schema, text_only.input_schema);
+        let normalized = |d: &ToolDefinition| {
+            let mut v = d.input_schema.clone();
+            v["properties"]["action"]["enum"] = serde_json::json!([]);
+            v["properties"]["ms"]["description"] = serde_json::json!("");
+            v
+        };
+        assert_eq!(
+            normalized(&with_images),
+            normalized(&text_only),
+            "除 action 枚举与 ms 说明外，schema 必须完全一致"
+        );
+    }
+
+    /// 没有图片通道时，回执里绝不能出现 image part——那正是被
+    /// `openai.rs` 降级成占位符、让模型以为自己看过画面的东西。
+    #[test]
+    fn attach_capture_degrades_to_text_without_an_image_channel() {
+        let png = "iVBORw0KGgo=".to_string();
+        let with_images = AppComputerTool::new(1280, Duration::from_secs(2))
+            .attach_capture("body".to_string(), png.clone());
+        assert!(with_images.parts.is_some(), "有图片通道时必须附 image part");
+
+        let text_only = AppComputerTool::new(1280, Duration::from_secs(2))
+            .without_image_channel()
+            .attach_capture("body".to_string(), png);
+        assert!(
+            text_only.parts.is_none(),
+            "没有图片通道时不得产出 image part"
+        );
+        assert!(text_only.content.starts_with("body"));
+        assert!(text_only.content.contains("no image attached"));
+    }
+
+    /// `without_image_channel` 必须顺带关掉自动附图。否则每次变更动作都会
+    /// 白白截一张图、编码成 base64、再被上游丢弃——纯浪费，而且描述里的
+    /// 「动作会附截图」与实际回执不符。
+    #[test]
+    fn without_an_image_channel_disables_auto_screenshot() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2))
+            .with_auto_screenshot(960)
+            .without_image_channel();
+        assert!(tool.auto_screenshot.is_none());
+        assert!(!tool.image_channel);
+    }
+
+    /// `screenshot` 在无图片通道时**必须从 action 枚举里消失**。
+    ///
+    /// 只把返回值降级成文本不够：动作名还在，模型的训练先验就会驱使它去调
+    /// （「要看清界面当然先截图」），每次调用还要过一遍权限确认、真截一张图、
+    /// 编码成模型看不见的 base64。动作面本身才是模型能看到的唯一信号。
+    #[test]
+    fn screenshot_is_absent_from_the_action_enum_without_an_image_channel() {
+        let actions = |tool: &AppComputerTool| -> Vec<String> {
+            tool.definition().input_schema["properties"]["action"]["enum"]
+                .as_array()
+                .expect("action enum")
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let with_images = AppComputerTool::new(1280, Duration::from_secs(2));
+        let text_only = AppComputerTool::new(1280, Duration::from_secs(2)).without_image_channel();
+
+        assert!(actions(&with_images).iter().any(|a| a == "screenshot"));
+        assert!(
+            !actions(&text_only).iter().any(|a| a == "screenshot"),
+            "无图片通道时不得暴露 screenshot"
+        );
+        // 其余动作面一个都不能少：降级只摘掉 screenshot。
+        let mut expected = actions(&with_images);
+        expected.retain(|a| a != "screenshot");
+        assert_eq!(actions(&text_only), expected);
+
+        // `wait` 的说明也不能再让模型「截图确认」。
+        let ms_hint = text_only.definition().input_schema["properties"]["ms"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(!ms_hint.contains("screenshot"));
+        assert!(ms_hint.contains("list_elements"));
+    }
+
+    /// 即便模型凭旧上下文硬发一个 `screenshot`，也必须被明确拒绝并指路，
+    /// 而不是默默返回一段它读不懂的文本。
+    #[tokio::test]
+    async fn an_explicit_screenshot_call_is_rejected_without_an_image_channel() {
+        struct Ctx;
+        #[async_trait]
+        impl ToolContext for Ctx {
+            fn cwd(&self) -> &std::path::Path {
+                std::path::Path::new(".")
+            }
+            fn is_allowed(&self, _name: &str, _input: &Value) -> bool {
+                true
+            }
+        }
+
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2)).without_image_channel();
+        let result = tool
+            .run(
+                serde_json::json!({"action": "screenshot", "window_id": 1}),
+                &Ctx,
+            )
+            .await
+            .expect("run returns a result");
+        assert!(result.is_error, "无图片通道时的 screenshot 必须是错误");
+        assert!(result.content.contains("list_elements"));
     }
 
     /// 坐标降级必须**在描述里写明**——模型要能预判「点了会发生什么」，也要知道

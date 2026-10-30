@@ -306,7 +306,7 @@
     </div>
     <div class="tree"><span class="k">Enter 提交</span>
 ├─ <span class="c">!cmd</span>            → tokio::spawn bash → AgentEvent::BashResult
-├─ <span class="c">/plan</span> <span class="c">/mode</span>     → TUI 内联拦截（不走注册表）
+├─ <span class="c">/plan</span>     → TUI 内联拦截（不走注册表）
 ├─ <span class="c">/xxx</span>            → 重建命令注册表 → cmd_registry.dispatch()
 │     ├─ Output / OutputPlain  → 直接渲染
 │     ├─ RunPrompt             → 当普通 prompt 进入 ↓
