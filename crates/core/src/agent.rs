@@ -299,32 +299,79 @@ impl AgentRoute {
     }
 }
 
+/// 软阈值的绝对上限（token）。
+///
+/// `soft_limit_ratio` 按窗口比例算。1M 窗口的默认 0.55 是 550K，而实测长会话
+/// 停在大约 300K——比例线落在真实用量之上，清理永远不发生。上限取 200K：
+/// 200K 窗口上 `0.55 × 200K = 110K` 仍由比例决定；更大的窗口在 200K 就
+/// 开始外部化过期工具输出。
+const SOFT_THRESHOLD_ABSOLUTE_CAP: u32 = 200_000;
+
+/// 清理停手线相对动手线的比例（4/5）。
+///
+/// 动手线和停手线重合时，历史刚超一点就会清一批、改写前缀、下一轮又超，
+/// 缓存每个工具轮都失效。清到动手线的 80% 留下一段回升空间，下一次清理
+/// 要等历史重新涨过动手线。
+const ELIDE_TARGET_NUMERATOR: u64 = 4;
+const ELIDE_TARGET_DENOMINATOR: u64 = 5;
+
+/// 一轮 context editing 的动手线与停手线。
+struct ElideBounds {
+    /// 估算超过它才开始外部化。
+    start: u32,
+    /// 清到它及以下就停。低于 [`Self::start`] 时，两者之间是回升空间。
+    stop: u32,
+}
+
 /// 由 `[context_edit].soft_limit_ratio` 算出 context editing 的**动手线**。
 ///
-/// 返回 `u32::MAX` 表示关闭软阈值——此时 `estimated > u32::MAX` 恒为假，
-/// 条件退化成旧实现的 `estimated > compact_threshold`，行为逐字节一致。
-/// 这样"关闭软阈值"就不需要调用点写任何分支。
-///
-/// 与压缩硬阈值的关系：软阈值只决定**何时开始**清理，硬阈值决定**何时停手**。
-/// 1M 窗口下硬阈值在 900K，实际会话（~300K）永远够不着，context editing
-/// 等于从未运行——这正是实测 129 个会话 `context_edit_freed_tokens` 全为 0
-/// 的原因。提前动手的收益是乘法的：外部化越早，每趟 API 携带的历史越小。
+/// 返回 `u32::MAX` 表示关闭软阈值。调用方用 [`elide_bounds`] 把它和压缩硬阈值
+/// 合成真正的动手/停手线：软线低于硬线时提前清理，否则退回「只在硬线清理」。
 fn soft_threshold_tokens(
     context_window: u32,
     cfg: Option<&crate::context_edit::ContextEditCfg>,
 ) -> u32 {
     match cfg {
-        Some(cfg) if cfg.soft_limit_ratio > 0.0 => (context_window as f64 * cfg.soft_limit_ratio)
-            .floor()
-            .clamp(1.0, u32::MAX as f64) as u32,
+        Some(cfg) if cfg.soft_limit_ratio > 0.0 => {
+            let scaled = (context_window as f64 * cfg.soft_limit_ratio)
+                .floor()
+                .clamp(1.0, u32::MAX as f64) as u32;
+            scaled.min(SOFT_THRESHOLD_ABSOLUTE_CAP)
+        }
         // 未启用 context editing，或显式 `soft_limit_ratio = 0`
         _ => u32::MAX,
     }
 }
 
+/// 把软阈值和压缩硬阈值合成清理的动手线与停手线。
+///
+/// 软线低于硬线时：越过软线就开始外部化，一直清到软线的 80%。硬线只决定
+/// 要不要接着跑摘要。软线关闭（`u32::MAX`）或配得不低于硬线时，两条线都
+/// 等于硬阈值——这是 `soft_limit_ratio = 0` 的旧行为。
+fn elide_bounds(soft_threshold: u32, compact_threshold: u32) -> ElideBounds {
+    if soft_threshold < compact_threshold {
+        let target =
+            (u64::from(soft_threshold) * ELIDE_TARGET_NUMERATOR / ELIDE_TARGET_DENOMINATOR) as u32;
+        let stop = if target == 0 || target >= soft_threshold {
+            soft_threshold
+        } else {
+            target
+        };
+        ElideBounds {
+            start: soft_threshold,
+            stop,
+        }
+    } else {
+        ElideBounds {
+            start: compact_threshold,
+            stop: compact_threshold,
+        }
+    }
+}
+
 /// 服务端上下文清理的**触发线**。
 ///
-/// 刻意比本地软阈值（`0.55 × window`）**更晚**：服务端清理不重建缓存前缀，
+/// 刻意比本地软阈值（`min(0.55 × window, 200K)`）**更晚**：服务端清理不重建缓存前缀，
 /// 提前发只是让端点白跑一遍判定；而本地清理是它的兜底，必须更早动手。
 /// 取 `0.7 × window` 折中——足够在压缩硬阈值（`window - buffer`，约 0.8~0.9
 /// 窗口）之前腾出空间，又不会在每轮都发一个注定不触发的 trigger。
@@ -521,31 +568,31 @@ pub struct Agent {
     last_request_volatile: Arc<std::sync::Mutex<String>>,
 }
 
-/// 跨会话记忆快照的重算间隔（按用户轮次分桶）。
+/// 跨会话记忆快照的重算间隔（按用户提交分桶，不含工具结果）。
 ///
-/// Project Brief 每次都按「最近 4 条 user 消息」重算相关性排序
+/// Project Brief 每次都按「最近几条用户原话」重算相关性排序
 /// （`MemoryV3Store::project_brief`），而它被拼进 system prompt 的稳定前缀
-/// —— 意味着**每个用户轮次都会改写 system 尾部**，把整段 system（约
-/// 1.6k~5k token）的 prompt cache 全部击穿。旧 v1 `MemoryStore` 专门用
-/// `OnceLock` 冻结整个会话来防这件事，v3 路径没继承该保护。
+/// —— 意味着**每个用户提交都会改写 system 尾部**，把整段 system 的
+/// prompt cache 全部击穿。计数必须走 [`user_submission_count`]：工具结果
+/// 的角色也是 user，按角色计数会让一次长任务里的分桶失效好几次。
 ///
-/// 折中：按桶重算 —— 每 10 个用户轮次才重算一次，缓存抖动降到 1/10，
-/// 同时长会话内后台新提取的记忆不会无限期对模型不可见（最迟 10 轮后可见）。
+/// 折中：按桶重算 —— 每 10 次用户提交才重算一次，缓存抖动降到 1/10，
+/// 同时长会话内后台新提取的记忆不会无限期对模型不可见（最迟 10 次提交后可见）。
 const MEMORY_SNAPSHOT_REFRESH_TURNS: u32 = 10;
 
-/// 后台记忆提取的最小用户轮次间隔。
+/// 后台记忆提取的最小间隔，按用户提交计，不含工具结果。
 ///
 /// 提取本身是一次完整的 LLM 往返，打的是主循环正在用的同一个 provider。旧行为
-/// 每个用户轮次都提一次，等于「用户每提交一次，额外插入一趟等长的请求」——在
+/// 每个用户提交都提一次，等于「用户每提交一次，额外插入一趟等长的请求」——在
 /// 并发跑子 Agent 时更要命：主 Agent、子 Agent、提取任务三者挤同一份 rate
 /// limit，交互路径反而被自己的后台活拖慢。
 ///
-/// 记忆的用途是**跨会话召回**，不是逐轮刷新：一个 20 轮的长任务从中受益的
-/// 概率远高于一个 2 轮的问答。因此降到 1/3，交互路径立刻轻下来，记忆的时效性
-/// 代价很小（最迟 3 轮后可见）。
+/// 记忆的用途是**跨会话召回**，不是逐轮刷新：一个 20 次提交的长任务从中受益的
+/// 概率远高于一个 2 次提交的问答。因此降到 1/3，交互路径立刻轻下来，记忆的时效性
+/// 代价很小（最迟 3 次提交后可见）。
 const MEMORY_EXTRACT_EVERY_TURNS: usize = 3;
 
-/// 会话滚动工作文档的更新间隔（用户轮次）。
+/// 会话滚动工作文档的更新间隔（用户提交次数，不含工具结果）。
 ///
 /// 与 [`MEMORY_EXTRACT_EVERY_TURNS`] **刻意错开**（3 vs 4）：两者都是辅助
 /// LLM 往返，撞在同一轮会让主循环多等一趟；错开后最坏情况也只是隔轮有活。
@@ -1531,26 +1578,19 @@ impl Agent {
 
     /// 清理过期工具输出，返回清理后的请求估算 token。
     ///
-    /// 两级阈值：
-    /// - **软阈值**（`soft_threshold`）：开始动手的线。超过就开始外部化。
-    /// - **硬阈值**（`compact_threshold`）：停手的线。降到它以下才停。
-    ///
-    /// 早期只有硬阈值，于是 1M 窗口下这条线在 900K，实际会话（~300K）永远
-    /// 够不着——context editing 等于从未运行。软阈值把「动手时机」提前，
-    /// **不改变**停手目标：清理不动了照样交给 compact 摘要。
-    ///
-    /// `soft_threshold >= compact_threshold`（含 `soft_threshold = u32::MAX`，
-    /// 即 `soft_limit_ratio = 0` 关闭软阈值）时行为与旧实现逐字节一致。
+    /// `stop_at` 来自 [`elide_bounds`]：软阈值生效时是软线的 80%，关闭时
+    /// 等于压缩硬阈值。循环只和这一条线比。用硬阈值当停手线会让「软线与
+    /// 硬线之间」的会话走进函数后立刻退出，一条都不删。
     ///
     /// 批数上限 `max_batches` 防"历史里全是可清理项"时一次请求做掉一大手术、
-    /// 把 prompt cache 前缀反复击穿。
+    /// 把 prompt cache 前缀反复击穿。清理不动了（没有可外部化的结果）照样
+    /// 交给 compact 摘要，那一步仍只看硬阈值。
     #[allow(clippy::too_many_arguments)]
     fn elide_stale_tool_results(
         &self,
         session: &mut Session,
         cfg: &crate::context_edit::ContextEditCfg,
-        compact_threshold: u32,
-        soft_threshold: u32,
+        stop_at: u32,
         request_system: &wyj_api::SystemPrompt<'_>,
         request_tools: &[ToolDefinition],
         max_output_tokens: u32,
@@ -1566,14 +1606,12 @@ impl Agent {
         };
         let mut estimate = measure(&session.messages);
 
-        // 软阈值不得高于硬阈值，否则软阈值形同虚设（等于退回旧的单阈值行为）。
-        let start_threshold = soft_threshold.min(compact_threshold);
-        if estimate <= start_threshold {
+        if estimate <= stop_at {
             return estimate;
         }
 
         for _ in 0..cfg.max_batches.max(1) {
-            if estimate <= compact_threshold {
+            if estimate <= stop_at {
                 break;
             }
             let stats = elide_tool_results(session, &cfg.cas, &cfg.opts);
@@ -1621,11 +1659,7 @@ impl Agent {
     /// 缓存文本，跨桶才真正重算。分桶而非纯计数是为了让「同一桶内的多次
     /// turn」自然命中——即使 session 被 `/clear` 重置，桶号也会自然回退。
     fn memory_snapshot_text(&self, session: &Session) -> String {
-        let user_turns = session
-            .messages
-            .iter()
-            .filter(|m| m.role == wyj_api::types::Role::User)
-            .count() as u32;
+        let user_turns = user_submission_count(&session.messages) as u32;
         let bucket = user_turns / MEMORY_SNAPSHOT_REFRESH_TURNS;
 
         let mut cache = match self.memory_snapshot.lock() {
@@ -2373,13 +2407,12 @@ impl Agent {
                 // 与「阈值 > 0」两条不变量，详见其文档。
                 let compact_threshold =
                     crate::compact::compact_threshold(effective_window, opts.max_tokens);
-                // 软阈值：context editing 的**动手线**，与上面的压缩硬阈值分开。
-                // 硬阈值决定"何时停手"，软阈值决定"何时开始"——1M 窗口下硬阈值
-                // 在 900K，等它触发意味着整段历史被原样重发了几百趟。
-                // `soft_limit_ratio = 0` 时取 u32::MAX，条件退化成
-                // `estimated_before > compact_threshold`，与改动前完全一致。
+                // 软阈值是 context editing 的动手线，压缩硬阈值只决定要不要摘要。
+                // 两条线由 `elide_bounds` 合成：软线更低时清到软线的 80%，
+                // `soft_limit_ratio = 0`（软线为 `u32::MAX`）时动手和停手都退回硬线。
                 let soft_threshold =
                     soft_threshold_tokens(effective_window, self.context_edit.as_ref());
+                let bounds = elide_bounds(soft_threshold, compact_threshold);
 
                 // 服务端上下文清理：触发线依赖有效窗口，所以必须在这里回填，
                 // 不能放进上面构造 `opts` 的分支里（那时窗口还没算出来）。
@@ -2393,13 +2426,12 @@ impl Agent {
                 // Code 的原话 "It clears older tool outputs first, then summarizes
                 // the conversation if needed."。额外好处是清得动就省掉一次
                 // LLM round-trip + 一份摘要的 output token。
-                let estimated = if estimated_before > soft_threshold {
+                let estimated = if self.context_edit.is_some() && estimated_before > bounds.start {
                     match self.context_edit.as_ref() {
                         Some(cfg) => self.elide_stale_tool_results(
                             session,
                             cfg,
-                            compact_threshold,
-                            soft_threshold,
+                            bounds.stop,
                             &request_system,
                             &request_tools,
                             opts.max_tokens,
@@ -3811,11 +3843,7 @@ impl Agent {
                 // ② 让路延迟 `BACKGROUND_LLM_YIELD`，把交互路径的请求排在前面。
                 // 真正的「独立配额」做不到——同一个 API key 在服务端是一份，
                 // 进程内没有隔离手段，能做的只有「别跟主循环抢」。
-                let user_turns = session
-                    .messages
-                    .iter()
-                    .filter(|m| m.role == wyj_api::types::Role::User)
-                    .count();
+                let user_turns = user_submission_count(&session.messages);
 
                 // Memory v3 先把任务原子写入磁盘，再异步消费；即使进程在 spawn
                 // 后退出，pending/running 任务也会在下次 store open 时恢复。

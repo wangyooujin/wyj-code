@@ -136,6 +136,12 @@ pub struct ModelCapabilities {
     pub parallel_tool_calls: Capability<bool>,
     pub tool_choice: Capability<bool>,
     pub strict_tool_schema: Capability<bool>,
+    /// 工具结果里的图片能否**最终送达模型**。
+    ///
+    /// 注意问的不是「能否内嵌在 tool 消息里」：Anthropic 线直接嵌在
+    /// `tool_result` 的 content 数组里，OpenAI 线的 `tool` 角色只能装字符串，
+    /// 图片由 `openai.rs::to_api_messages` 摘出来、后置成紧随其后的 user 消息。
+    /// 两条线都能送达，所以这条能力等价于「端点收不收图」（`profile.vision`）。
     pub tool_result_images: Capability<bool>,
     pub structured_output: Capability<bool>,
     pub max_tools_per_turn: usize,

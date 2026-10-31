@@ -1276,7 +1276,7 @@ pub struct CompactUntilFitOutcome {
 
 /// 判断消息是否为"真实用户发言"边界（而非工具结果回传）：
 /// 只有此类消息可以安全作为压缩截断点，否则会拆散 tool_use/tool_result 配对。
-fn is_user_turn_boundary(msg: &Message) -> bool {
+pub(crate) fn is_user_turn_boundary(msg: &Message) -> bool {
     matches!(msg.role, Role::User)
         && !msg
             .content

@@ -605,7 +605,9 @@ pub struct ContextEditCfg {
     /// 单次请求最多连续清理几批（防"历史里全是可清理项"时一次做掉一大手术）。
     pub max_batches: usize,
     /// **软阈值**：上下文占用超过窗口的这个比例就开始外部化过期工具结果，
-    /// 而不是等到撞上压缩硬阈值才动手。`0.0` = 关闭，完全退回「只在硬阈值清理」。
+    /// 并清到这条线的 80%，而不是等到撞上压缩硬阈值才动手。`0.0` = 关闭，
+    /// 完全退回「只在硬阈值清理」。比例再乘出来的值还有 200K token 的绝对
+    /// 上限：1M 窗口的 0.55 本该是 550K，实测长会话停在约 300K，够不着。
     ///
     /// 为什么需要它：context editing 原本只在 `estimate > compact_threshold`
     /// 时运行，而 `compact_threshold = window - compact_trigger_buffer`。1M 窗口
@@ -616,8 +618,8 @@ pub struct ContextEditCfg {
     /// input 越低；而代价很小——外部化是无损的（原文进 CAS，`ContextRecall`
     /// 能召回），且便宜（无 output token、不幻觉），本就在压缩之前的优先路径上。
     ///
-    /// 软阈值**不改变**最终收敛目标：清理到硬阈值以下才停；清理不动了仍然
-    /// 交给 compact 摘要。
+    /// 停手线低于动手线，是为了避免贴着线每轮都清一批、反复击穿前缀缓存。
+    /// 清不动了仍然交给 compact 摘要，摘要只看硬阈值。
     pub soft_limit_ratio: f64,
 }
 

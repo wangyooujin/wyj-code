@@ -236,6 +236,46 @@ pub(super) fn detect_loop(
         >= LOOP_GUARD_THRESHOLD
 }
 
+/// 数真正的用户提交，不数工具结果。
+///
+/// 协议里工具结果的角色也是 `User`。一次提交跟了 30 轮工具，按角色计数会
+/// 跳大约 30：记忆快照的 10 轮分桶在一次任务里就跨桶（稳定前缀缓存失效），
+/// 记忆提取和滚动文档的辅助调用也会密一个数量级。
+///
+/// 判定与压缩截断用的 [`crate::compact::is_user_turn_boundary`] 相同：不含
+/// `tool_result` 的 user 消息。压缩摘要、规约提醒、轮数提醒、验收报告、
+/// 自动续跑通知是框架写进历史的，不是用户提交，单独排除。
+pub(super) fn user_submission_count(messages: &[wyj_api::types::Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| is_user_submission(message))
+        .count()
+}
+
+fn is_user_submission(message: &wyj_api::types::Message) -> bool {
+    if !crate::compact::is_user_turn_boundary(message) {
+        return false;
+    }
+    message.content.iter().any(|block| match block {
+        ContentBlock::Text { text } => {
+            let trimmed = text.trim();
+            !trimmed.is_empty() && !is_framework_user_text(trimmed)
+        }
+        ContentBlock::Image { .. } => true,
+        _ => false,
+    })
+}
+
+/// 框架注入的 user 文本。整块都是这类内容时不计入用户提交。
+fn is_framework_user_text(text: &str) -> bool {
+    text.starts_with(crate::prompts::COMPACT_SUMMARY_PREFIX)
+        || text.starts_with("<system-reminder>")
+        || text.starts_with("<turn-budget-reminder")
+        || text.starts_with("<spend-budget-exceeded>")
+        || text.starts_with("<acceptance-failures")
+        || text.starts_with("<todo-resume>")
+}
+
 pub(super) fn last_user_goal(session: &Session) -> String {
     session
         .messages

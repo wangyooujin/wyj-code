@@ -2304,9 +2304,9 @@ async fn main() -> Result<()> {
         let mut probe = ToolRegistry::standard();
         register_computer_tool_if_enabled(&mut probe, &cfg)
     };
-    // `app_computer` 的门槛比上面两个低（不需要图片通道），所以 OpenAI profile
-    // 下它仍会注册。那段完整提示（`COMPUTER_USE_HINT`）大量讲「读附带的截图」，
-    // 在这类 profile 上会把模型引向一个它永远看不到的画面，因此只注入
+    // `app_computer` 的门槛比上面两个低（不需要图片通道），所以 `vision=false`
+    // 的 profile 下它仍会注册。那段完整提示（`COMPUTER_USE_HINT`）大量讲「读附带的
+    // 截图」，在这类 profile 上会把模型引向一个它永远看不到的画面，因此只注入
     // 文本路径版本。
     let app_computer_enabled = app_computer_registered(&cfg);
 
@@ -3211,23 +3211,21 @@ fn is_tool_disallowed(name: &str, disallowed: &[String]) -> bool {
 
 /// computer-use 是否应当注册并按需注册：仅 macOS/Windows 编译进 `wyj-tools`
 /// （其余平台该 crate 内 `computer` 模块整体不存在，见 wyj-tools/src/lib.rs），
-/// 且需要当前 profile 支持 vision（截图靠 image content block 回传）+
-/// `provider == Anthropic`（Anthropic Messages API 协议本身——tool_result 内
-/// 嵌原生 image block——才有截图回传给模型的通路；OpenAI Chat Completions 的
-/// `tool` 角色消息不支持图片，`crates/api/src/openai.rs` 会把截图降级成纯
-/// 文本占位符，模型看不到画面，computer-use 名存实亡，因此 provider=OpenAI
-/// 时不注册）。
+/// 且需要当前 profile 支持 vision（截图靠 image content block 回传）。
 ///
-/// 是否用**原生**工具声明由 `Profile::is_official_anthropic_endpoint()` 决定：
+/// **不再要求 `provider == Anthropic`**。旧实现只认 Anthropic Messages API 的
+/// `tool_result` 内嵌 image block，OpenAI 线注册了也看不到画面。现在
+/// `openai.rs::to_api_messages` 会把 tool_result 里的图片摘出来、后置成紧随其后
+/// 的 user 消息（标准 `image_url` 块），两条线都能真正送达模型，因此判据收敛
+/// 成唯一一个真问题：**这个端点收不收图**（= `profile.vision`）。
+///
+/// 是否用**原生**工具声明仍由 `Profile::is_official_anthropic_endpoint()` 决定：
 /// - 官方 api.anthropic.com：注册为原生 `computer_20251124` 工具（无 description/
 ///   input_schema）——Claude 训练时习得了这个空 schema 工具的调用约定。
-/// - 第三方 Anthropic 协议兼容端点（MiniMax/GLM/Kimi 等，常见于
-///   `provider = "anthropic"` + 自定义 `base_url`）：说的是同一套 Messages API
-///   协议、截图回传通路一样打通，但没有 Claude 那层专属训练，收到无 schema
-///   的原生工具类型会因为不知道怎么调用而报错。这类端点改注册为**普通 custom
-///   工具**（带完整 description + input_schema，`ComputerTool::new(_, false)`），
-///   任何具备基本工具调用能力的模型都能按标准协议使用。`run()` 的动作分派逻辑
-///   两种模式完全一致，只是对外声明方式不同。
+/// - 其他端点（第三方 Anthropic 协议兼容端点如 MiniMax/GLM/Kimi，以及全部
+///   OpenAI 线）：改注册为**普通 custom 工具**（带完整 description + input_schema，
+///   `ComputerTool::new(_, false)`），任何具备基本工具调用能力的模型都能按标准
+///   协议使用。`run()` 的动作分派逻辑两种模式完全一致，只是对外声明方式不同。
 ///
 /// 子 Agent 工厂（`make_sub_agent_factory`）不调用本函数——与 Agent/AskQuestion
 /// 一致，默认不给子 Agent。
@@ -3267,7 +3265,7 @@ fn build_context_edit_cfg(
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register_computer_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) -> bool {
     let profile = cfg.active_profile();
-    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
+    if !profile.vision {
         return false;
     }
     let native = profile.is_official_anthropic_endpoint();
@@ -3302,13 +3300,13 @@ fn register_computer_tool_if_enabled(_registry: &mut ToolRegistry, _cfg: &Config
 
 /// WindowCapture：独立于 computer-use 的只读按窗口截图工具（v0.2.5，见
 /// `tools::window_capture::WindowCaptureTool` 文档），注册门槛与
-/// `register_computer_tool_if_enabled` 完全一致（同样需要把截图作为 image
-/// block 塞进 tool_result，因此同样要求 vision + Anthropic provider）。
+/// `register_computer_tool_if_enabled` 完全一致（同样需要把截图送到模型眼前，
+/// 因此同样只要求 `vision`；OpenAI 线的图片经 `openai.rs` 后置成 user 消息送达）。
 /// 刻意复刻同一段短门控，保持此工具可独立演进。
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register_window_capture_tool_if_enabled(registry: &mut ToolRegistry, cfg: &Config) {
     let profile = cfg.active_profile();
-    if !profile.vision || !matches!(profile.provider, wyj_config::Provider::Anthropic) {
+    if !profile.vision {
         return;
     }
     registry.register_arc(Arc::new(wyj_tools::window_capture::WindowCaptureTool::new(
@@ -3335,18 +3333,17 @@ fn app_computer_registered(_cfg: &Config) -> bool {
 ///
 /// **与「能不能注册」是两件事**：`computer` / `window_capture` 完全依赖「截图 →
 /// 模型」这条通路，工具结果里没有 image block 就等于闭着眼睛点，所以它们的注册
-/// 门槛是 `vision && Anthropic`。`app_computer` 的主路径却是 Accessibility 树
-/// 与 OCR 文本——`list_elements`（可带 `include_text`）读到的是控件原文，
-/// `read_text` 返回逐行带置信度的识别文本，两条路都不经过图片通道。
+/// 门槛是 `vision`。`app_computer` 的主路径却是 Accessibility 树与 OCR 文本——
+/// `list_elements`（可带 `include_text`）读到的是控件原文，`read_text` 返回逐行
+/// 带置信度的识别文本，两条路都不经过图片通道。
 ///
-/// 所以它在**任何** provider 下都注册，只是 OpenAI 线上没有截图：`tool` 角色
-/// 消息装不下 image block，`openai.rs::to_api_messages` 会把截图降级成
-/// `[image omitted: ...]` 占位符。注册时用 `without_image_channel()` 把附图整个
-/// 撤掉、并在描述末尾追加 `NO_IMAGE_CHANNEL_NOTE`，免得模型照着「读附带截图」
-/// 的描述去编造画面。
+/// 所以它在**任何** provider 下都注册，图片通道只看 `profile.vision`：两条线现在
+/// 都能把 tool_result 里的图片送到模型眼前（Anthropic 内嵌 `tool_result`；
+/// OpenAI 由 `openai.rs::to_api_messages` 摘出来后置成 user 消息）。只有
+/// `vision=false` 时才用 `without_image_channel()` 把附图整个撤掉、并在描述末尾
+/// 追加 `NO_IMAGE_CHANNEL_NOTE`，免得模型照着「读附带截图」的描述去编造画面。
 fn app_computer_image_channel(cfg: &Config) -> bool {
-    let profile = cfg.active_profile();
-    profile.vision && matches!(profile.provider, wyj_config::Provider::Anthropic)
+    cfg.active_profile().vision
 }
 
 /// macOS 后台优先 computer-use：按稳定窗口目标截图，用 Accessibility/目标 PID
@@ -4812,14 +4809,13 @@ async fn repl(
 mod cli_tests {
     use super::*;
 
-    /// 图片通道判定只认 `vision && Anthropic`，与 `computer` /
-    /// `window_capture` 的注册门槛同源。
-    ///
-    /// 这条**不能**跟着 `app_computer` 的注册门槛一起放松：注册可以不看图片，
-    /// 但「能不能附图」永远只看这一条。两者混同就会出现「OpenAI profile 下
-    /// 附图被静默丢弃」或「Anthropic profile 下明明能附图却只给文本」。
+    /// 图片通道判定只看 `vision`，与 `computer` / `window_capture` 的注册门槛
+    /// 同源。**provider 不再是判据**：两条线都能把 tool_result 里的图片送到模型
+    /// 眼前（Anthropic 内嵌 `tool_result`；OpenAI 由 `openai.rs::to_api_messages`
+    /// 摘出来后置成 user 消息），把 provider 留在判据里会让 OpenAI profile 白白
+    /// 失去截图能力。
     #[test]
-    fn the_image_channel_is_vision_plus_anthropic_only() {
+    fn the_image_channel_is_vision_only() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg =
             Config::load_file_only_at(&dir.path().join("config.toml")).unwrap_or_default();
@@ -4830,8 +4826,8 @@ mod cli_tests {
 
         cfg.active_profile_mut().provider = wyj_config::Provider::OpenAI;
         assert!(
-            !app_computer_image_channel(&cfg),
-            "OpenAI 线的 tool 消息装不下 image block"
+            app_computer_image_channel(&cfg),
+            "OpenAI 线的截图经 to_api_messages 后置成 user 消息，能真正送达"
         );
 
         cfg.active_profile_mut().provider = wyj_config::Provider::Anthropic;

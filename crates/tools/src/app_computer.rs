@@ -75,10 +75,10 @@ pub struct AppComputerTool {
     mutations_since_screenshot: Mutex<HashMap<u32, u32>>,
     /// 本次会话能否把截图真正送到模型眼前。
     ///
-    /// 只有 Anthropic 线（`tool_result` 里可以嵌 image block）且 `profile.vision`
-    /// 为真时才成立。OpenAI 线的 `tool` 角色消息只承载文本，图片会被
-    /// `openai.rs::to_api_messages` 降级成 `[image omitted: ...]` 占位符——那时
-    /// 附图不是「模型看到了画面」，而是「模型以为自己看到了画面」，比不附更糟。
+    /// 只由 `profile.vision` 决定：两条线现在都能送达（Anthropic 内嵌
+    /// `tool_result`；OpenAI 由 `openai.rs::to_api_messages` 摘出来后置成 user
+    /// 消息）。`vision=false` 时附图不是「模型看到了画面」，而是「模型以为自己
+    /// 看到了画面」，比不附更糟。
     image_channel: bool,
 }
 
@@ -116,11 +116,11 @@ impl AppComputerTool {
 
     /// 声明本 profile **没有**图片回传通道，工具只剩文本路径。
     ///
-    /// OpenAI 线的 `tool` 角色消息装不下 image block（`openai.rs::to_api_messages`
-    /// 会把 Parts 降级成 `display_text()` 的 `[image omitted: ...]` 占位符），
-    /// 于是「附图」在模型眼里等于「这里本该有张图，但你看到的是占位符」。
-    /// 与其让模型对着一张它看不见的图推理，不如把图片整个撤掉、只给
-    /// Accessibility 文本与 OCR 文本，并在回执里说清楚这是能力边界。
+    /// 用于 `profile.vision = false`：图片发不出去（Anthropic 线会降级成
+    /// `[image omitted: ...]` 文本块，OpenAI 线同样只留占位符），于是「附图」
+    /// 在模型眼里等于「这里本该有张图，但你看到的是占位符」。与其让模型对着
+    /// 一张它看不见的图推理，不如把图片整个撤掉、只给 Accessibility 文本与
+    /// OCR 文本，并在回执里说清楚这是能力边界。
     pub fn without_image_channel(mut self) -> Self {
         self.image_channel = false;
         self.auto_screenshot = None;
@@ -131,11 +131,11 @@ impl AppComputerTool {
     fn attach_capture(&self, display: String, png_base64: String) -> ToolResult {
         if !self.image_channel {
             return ToolResult::ok(format!(
-                "{display}\n\n[no image attached: this profile's wire protocol cannot deliver \
-                 images inside tool results, so only the text above is available. Do not retry \
-                 expecting a picture — read the accessibility text (`list_elements` with \
-                 `include_text:true`) or OCR text (`read_text`) instead.]\n\
-                 本端点无法在工具结果里回传图片，以上文本即全部信息，不要重试等图片。"
+                "{display}\n\n[no image attached: this profile cannot receive images, so only \
+                 the text above is available. Do not retry expecting a picture — read the \
+                 accessibility text (`list_elements` with `include_text:true`) or OCR text \
+                 (`read_text`) instead.]\n\
+                 本 profile 无法接收图片，以上文本即全部信息，不要重试等图片。"
             ));
         }
         ToolResult::with_parts(
@@ -1374,9 +1374,13 @@ const DESCRIPTION: &str = "Controls a specific macOS application window without 
 /// 附在没有图片回传通道的 profile 上的补充说明。
 ///
 /// 这段**不能省**：工具描述里大量承诺「附带的截图」「用 coordinate 猜坐标」，
-/// 而 OpenAI 线的 `tool` 消息承载不了图片。不声明这一点，模型会先按描述里的
-/// 截图工作流规划、再拿到一张永远看不见的图，然后开始编造画面内容。
-const NO_IMAGE_CHANNEL_NOTE: &str = "IMPORTANT for this profile: images cannot be delivered inside tool results on this wire protocol, so the `screenshot` action is not available and `read_text` returns text only — no picture ever reaches you. Do NOT plan around seeing a screenshot, and never describe or guess what the window looks like. Read state exclusively through `list_elements` (pass `include_text:true` for on-screen text) and `read_text` (OCR text). Prefer `element_ref` over `coordinate`: with no image to measure against, a guessed coordinate is just a guess. After each mutation, re-run `list_elements` to confirm the change took effect.";
+/// 而 `vision=false` 的端点上图片根本发不出去。不声明这一点，模型会先按描述里
+/// 的截图工作流规划、再拿到一张永远看不见的图，然后开始编造画面内容。
+///
+/// 注意这里说的是**这个 profile 收不到图**，而不是「这条线协议不行」——OpenAI
+/// 线的 tool_result 图片现在由 `openai.rs::to_api_messages` 后置成 user 消息送达，
+/// 只有在 `profile.vision = false` 时才会走到本段。
+const NO_IMAGE_CHANNEL_NOTE: &str = "IMPORTANT for this profile: images cannot be delivered to you on this profile, so the `screenshot` action is not available and `read_text` returns text only — no picture ever reaches you. Do NOT plan around seeing a screenshot, and never describe or guess what the window looks like. Read state exclusively through `list_elements` (pass `include_text:true` for on-screen text) and `read_text` (OCR text). Prefer `element_ref` over `coordinate`: with no image to measure against, a guessed coordinate is just a guess. After each mutation, re-run `list_elements` to confirm the change took effect.";
 
 #[async_trait]
 impl Tool for AppComputerTool {

@@ -35,7 +35,7 @@ fn soft_threshold_disabled_falls_back_to_old_behavior() {
         ..mk_edit_cfg()
     };
     assert_eq!(soft_threshold_tokens(1_000_000, Some(&cfg)), u32::MAX);
-    // 未装配 context editing 时同理：u32::MAX 让 `estimated > soft` 恒假。
+    // 未装配 context editing 时同理。`elide_bounds` 看到 `u32::MAX` 会退回硬阈值。
     assert_eq!(soft_threshold_tokens(1_000_000, None), u32::MAX);
 }
 
@@ -48,8 +48,8 @@ fn soft_threshold_starts_editing_earlier_than_compact_threshold() {
     let window = 1_000_000u32;
     let soft = soft_threshold_tokens(window, Some(&cfg));
     let hard = window.saturating_sub(crate::compact::compact_trigger_buffer(window, 32_000));
-    assert_eq!(soft, 550_000);
-    // 软阈值必须严格早于硬阈值，否则 C1 等于没做。
+    // 0.55 × 1M = 550K，但绝对上限把它压到 200K，否则 ~300K 的长会话永远够不着。
+    assert_eq!(soft, SOFT_THRESHOLD_ABSOLUTE_CAP);
     assert!(
         soft < hard,
         "soft {soft} must be below compact threshold {hard}, otherwise trimming never starts early"
@@ -74,7 +74,10 @@ fn soft_threshold_clamps_absurd_ratios() {
         ..mk_edit_cfg()
     };
     let v = soft_threshold_tokens(1_000_000, Some(&huge));
-    assert_eq!(v, u32::MAX, "过大的比例必须夹到 u32::MAX 而非溢出回绕");
+    assert_eq!(
+        v, SOFT_THRESHOLD_ABSOLUTE_CAP,
+        "过大的比例不得溢出回绕，并且不得超过绝对上限"
+    );
 
     let negative = crate::context_edit::ContextEditCfg {
         soft_limit_ratio: -1.0,
@@ -82,6 +85,33 @@ fn soft_threshold_clamps_absurd_ratios() {
     };
     // 负数与 0 同义（关闭），绝不能 clamp 成 1 让清理每轮都触发。
     assert_eq!(soft_threshold_tokens(1_000_000, Some(&negative)), u32::MAX);
+}
+
+/// 介于软线和硬线之间的占用必须继续清理。
+///
+/// 旧循环用硬阈值当停手线：200K 窗口上软线 110K、硬线约 160K，落在中间的
+/// 会话走进清理函数后立刻退出，一条工具输出都不删。
+#[test]
+fn elision_between_soft_and_hard_keeps_clearing_down_to_the_soft_target() {
+    let bounds = elide_bounds(110_000, 160_000);
+    assert_eq!(bounds.start, 110_000);
+    assert_eq!(bounds.stop, 88_000);
+    let between = 120_000;
+    assert!(
+        between > bounds.start && between > bounds.stop,
+        "软硬之间必须既越过动手线、也高于停手线"
+    );
+}
+
+/// `soft_limit_ratio = 0` 时软线是 `u32::MAX`，清理退回「超过硬线才动手、
+/// 降到硬线就停」。
+#[test]
+fn disabled_soft_threshold_elides_only_around_the_compact_line() {
+    let hard = 160_000u32;
+    let bounds = elide_bounds(u32::MAX, hard);
+    assert_eq!(bounds.start, hard);
+    assert_eq!(bounds.stop, hard);
+    assert!(159_000 < bounds.start);
 }
 use wyj_api::provider::EventStream;
 use wyj_api::types::{ContentBlock, Message, Role, StopReason, ToolResultContent};
@@ -775,6 +805,67 @@ fn memory_extraction_fires_on_the_first_turn_then_every_third() {
     assert!(memory_extraction_due(7));
     assert!(memory_extraction_due(31));
     assert!(!memory_extraction_due(0), "空会话没有可提取的内容");
+}
+
+/// 工具结果的角色是 user，但不是一次用户提交。按角色计数会让一次长任务里的
+/// 记忆分桶、提取和滚动文档更新密一个数量级。
+#[test]
+fn user_submission_count_ignores_tool_results_and_framework_text() {
+    use wyj_api::types::{ContentBlock, Message, Role, ToolResultContent};
+
+    let mut messages = vec![Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::Text {
+                text: "<system-reminder>\nrule\n</system-reminder>".into(),
+            },
+            ContentBlock::Text {
+                text: "请改登录".into(),
+            },
+        ],
+    }];
+    for i in 0..30 {
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: format!("t{i}"),
+                name: "Read".into(),
+                input: serde_json::json!({}),
+            }],
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: format!("t{i}"),
+                    content: ToolResultContent::Text("file".into()),
+                    is_error: false,
+                },
+                ContentBlock::Text {
+                    text: "<turn-budget-reminder remaining=\"1\">\nstop\n</turn-budget-reminder>"
+                        .into(),
+                },
+            ],
+        });
+    }
+    messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "[Conversation summary — 12 earlier messages were compacted into the following]\n\nstuff".into(),
+        }],
+    });
+    messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "<todo-resume>\ncontinue\n</todo-resume>".into(),
+        }],
+    });
+
+    assert_eq!(
+        user_submission_count(&messages),
+        1,
+        "30 轮工具结果、压缩摘要和续跑通知都不能算成用户提交"
+    );
 }
 
 // ── 编辑后自动校验（verify loop）───────────────────────────────────────

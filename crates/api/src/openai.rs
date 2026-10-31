@@ -6,7 +6,7 @@ use crate::{
     provider::{EventStream, Provider},
     request_plan::{DroppedParameter, RequestPlan},
     thinking::apply_thinking_to_openai_body,
-    types::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition},
+    types::{ContentBlock, Message, Role, StopReason, StreamEvent, ToolDefinition, ToolResultPart},
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -265,6 +265,32 @@ struct PendingToolCall {
 
 // ── 内部模型 → API 请求转换 ───────────────────────────────────────────────────
 
+/// 把「文本 + 图片」拼成 OpenAI 的 content 数组。
+///
+/// 数组里**至少要有一项 text**：部分兼容端点不接受只有 `image_url` 的
+/// content 数组，而纯附图（工具结果只带图、或用户只贴图没打字）恰恰是
+/// 常见形态。`fallback` 就是这种情况下补进去的那句话。
+fn vision_content_array(text_parts: Vec<String>, image_parts: Vec<Value>, fallback: &str) -> Value {
+    let mut parts: Vec<Value> = text_parts
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| serde_json::json!({"type": "text", "text": t}))
+        .collect();
+    if parts.is_empty() {
+        parts.push(serde_json::json!({"type": "text", "text": fallback}));
+    }
+    parts.extend(image_parts);
+    Value::Array(parts)
+}
+
+/// 单张图片的 OpenAI `image_url` 块（data URL 内联）。
+fn image_url_block(media_type: &str, data: &str) -> Value {
+    serde_json::json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{};base64,{}", media_type, data) },
+    })
+}
+
 /// 内部模型 → API 请求转换。`echo_reasoning` 来自
 /// [`ThinkingSpec::response_fields`]：仅 vendor 声明需要时，才把 assistant 的
 /// 推理内容拼回 `reasoning_content` / `reasoning_details`。
@@ -280,6 +306,8 @@ fn to_api_messages(
                 let mut text_parts: Vec<String> = vec![];
                 let mut image_parts: Vec<Value> = vec![];
                 let mut tool_results = vec![];
+                // `tool_result` 内嵌的图片，见下方 ToolResult 分支的说明。
+                let mut tool_image_parts: Vec<Value> = vec![];
                 for block in &m.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
@@ -287,12 +315,7 @@ fn to_api_messages(
                             // 仅当 supports_vision=true 时序列化 image_url；
                             // 否则丢弃（与原 `_ => {}` 行为一致）。
                             if supports_vision {
-                                image_parts.push(serde_json::json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": format!("data:{};base64,{}", media_type, data),
-                                    }
-                                }));
+                                image_parts.push(image_url_block(media_type, data));
                             }
                         }
                         ContentBlock::ToolResult {
@@ -300,11 +323,46 @@ fn to_api_messages(
                             content,
                             ..
                         } => {
-                            // OpenAI 的 tool 消息不支持图片块：Parts 走
-                            // display_text 降级（图片以占位符表示），第一期接受此限制
+                            // OpenAI 的 `tool` 消息 content 只能是**字符串**，装不下
+                            // image block。但把图片整个丢掉会让模型对着一个它看不见的
+                            // 工具输出继续推理——`Read` 一张 png、`app_computer` 的截图
+                            // 全都落进这一档，模型只能编。
+                            //
+                            // 所以图片从 tool 消息里**摘出来**，紧跟其后作为一条独立
+                            // user 消息用标准 `image_url` 块送出：tool 消息里留一句
+                            // 指路，图片本体放在下一个 user 轮。这是 OpenAI 线上唯一
+                            // 能真正送达图片的位置。
                             let content_str = match content {
                                 crate::types::ToolResultContent::Text(t) => t.clone(),
-                                crate::types::ToolResultContent::Parts(_) => content.display_text(),
+                                crate::types::ToolResultContent::Parts(parts) => {
+                                    let mut texts: Vec<String> = vec![];
+                                    for part in parts {
+                                        match part {
+                                            ToolResultPart::Text { text } => {
+                                                texts.push(text.clone());
+                                            }
+                                            ToolResultPart::Image { media_type, data } => {
+                                                if supports_vision {
+                                                    tool_image_parts
+                                                        .push(image_url_block(media_type, data));
+                                                    texts.push(format!(
+                                                        "[image attached in the message below: \
+                                                         {media_type}]"
+                                                    ));
+                                                } else {
+                                                    // base64 → 字节 ≈ data.len() * 3 / 4
+                                                    let kb =
+                                                        data.len().saturating_mul(3) / 4 / 1024;
+                                                    texts.push(format!(
+                                                        "[image omitted: media_type={media_type}, \
+                                                         ~{kb}KB]"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    texts.join("\n")
+                                }
                                 crate::types::ToolResultContent::Blocks(b) => {
                                     serde_json::to_string(b).unwrap_or_default()
                                 }
@@ -328,17 +386,19 @@ fn to_api_messages(
                     // （验收证据、用户澄清全部静默消失）。
                     //
                     // OpenAI 协议要求 `tool` 消息紧邻 assistant 的 `tool_calls`，
-                    // 所以文本只能**后置**成一条独立的 user 消息。
+                    // 所以文本只能**后置**成一条独立的 user 消息。tool 图片也并进
+                    // 这一条——两条连续的 user 消息在部分兼容端点上会被拒，而语义上
+                    // 它们本就是同一批工具结果的补充说明。
+                    image_parts.extend(tool_image_parts);
                     if !text_parts.is_empty() || (supports_vision && !image_parts.is_empty()) {
                         if supports_vision && !image_parts.is_empty() {
-                            let mut content_parts: Vec<Value> = text_parts
-                                .into_iter()
-                                .map(|t| serde_json::json!({"type": "text", "text": t}))
-                                .collect();
-                            content_parts.extend(image_parts);
                             out.push(ApiMessage {
                                 role: "user".to_string(),
-                                content: Some(Value::Array(content_parts)),
+                                content: Some(vision_content_array(
+                                    text_parts,
+                                    image_parts,
+                                    "The image(s) here were attached by the tool result above.",
+                                )),
                                 ..Default::default()
                             });
                         } else {
@@ -351,14 +411,13 @@ fn to_api_messages(
                     }
                 } else if supports_vision && !image_parts.is_empty() {
                     // vision 模式：content 是 [{type:"text",...}, {type:"image_url",...}] 数组
-                    let mut content_parts: Vec<Value> = text_parts
-                        .into_iter()
-                        .map(|t| serde_json::json!({"type": "text", "text": t}))
-                        .collect();
-                    content_parts.extend(image_parts);
                     out.push(ApiMessage {
                         role: "user".to_string(),
-                        content: Some(Value::Array(content_parts)),
+                        content: Some(vision_content_array(
+                            text_parts,
+                            image_parts,
+                            "The image(s) here were attached by the user.",
+                        )),
                         ..Default::default()
                     });
                 } else {
@@ -1309,6 +1368,106 @@ mod tests {
         let api = to_api_messages(&msgs, true, false);
         assert_eq!(api.len(), 1);
         assert_eq!(api[0].content.as_ref().unwrap().as_str(), Some("hello"));
+    }
+
+    // ── tool_result 内嵌图片：摘出来后置成 user 消息 ──
+
+    /// `Read` 一张 png、`app_computer` 的截图都走 `ToolResultContent::Parts`。
+    /// OpenAI 的 `tool` 消息只能装字符串，旧实现把它们降级成
+    /// `[image omitted: ...]`——模型看不见图却以为自己看过。现在图片被摘出来
+    /// 放进紧随其后的 user 消息，tool 消息里只留一句指路。
+    #[test]
+    fn tool_result_images_are_moved_into_a_following_user_message() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: crate::types::ToolResultContent::Parts(vec![
+                    ToolResultPart::Text {
+                        text: "[image: 12 KB image/png]".to_string(),
+                    },
+                    ToolResultPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: "iVBORw0KGgo=".to_string(),
+                    },
+                ]),
+                is_error: false,
+            }],
+        }];
+
+        let api = to_api_messages(&msgs, true, false);
+        assert_eq!(api.len(), 2);
+
+        // tool 消息：纯字符串，图片只剩一句指路
+        assert_eq!(api[0].role, "tool");
+        assert_eq!(api[0].tool_call_id.as_deref(), Some("call_1"));
+        let tool_text = api[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .expect("tool 必须是字符串");
+        assert!(
+            tool_text.contains("image attached in the message below"),
+            "{tool_text}"
+        );
+        assert!(!tool_text.contains("image omitted"), "{tool_text}");
+
+        // 后置的 user 消息：真正的 image_url 块
+        assert_eq!(api[1].role, "user");
+        let parts = api[1]
+            .content
+            .as_ref()
+            .unwrap()
+            .as_array()
+            .expect("content must be an array");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(
+            parts[1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    /// `vision=false` 时不能发 image_url（第三方代理会 400），仍走占位文本。
+    #[test]
+    fn tool_result_images_stay_omitted_without_vision() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: crate::types::ToolResultContent::Parts(vec![ToolResultPart::Image {
+                    media_type: "image/png".to_string(),
+                    data: "x".repeat(4096),
+                }]),
+                is_error: false,
+            }],
+        }];
+
+        let api = to_api_messages(&msgs, false, false);
+        assert_eq!(api.len(), 1, "没有图片通道时不该多出一条 user 消息");
+        let tool_text = api[0].content.as_ref().unwrap().as_str().unwrap();
+        assert!(tool_text.contains("image omitted"), "{tool_text}");
+        assert!(tool_text.contains("image/png"), "{tool_text}");
+    }
+
+    /// 只贴图不打字时 content 数组不能只有 `image_url`——部分兼容端点会拒。
+    #[test]
+    fn image_only_user_message_gets_a_text_placeholder() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
+            }],
+        }];
+
+        let api = to_api_messages(&msgs, true, false);
+        assert_eq!(api.len(), 1);
+        let parts = api[0].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert!(!parts[0]["text"].as_str().unwrap().is_empty());
+        assert_eq!(parts[1]["type"], "image_url");
     }
 
     // ── reasoning 回传（echo_back_in_messages 接线） ──

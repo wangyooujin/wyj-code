@@ -274,7 +274,12 @@ fn base_capabilities(
         parallel_tool_calls: static_cap(parallel_tools),
         tool_choice: static_cap(is_reference),
         strict_tool_schema: static_cap(is_reference),
-        tool_result_images: static_cap(profile.is_official_anthropic_endpoint() && profile.vision),
+        // 工具结果里的图片能否**最终送达模型**——不是「能否内嵌在 tool 消息里」。
+        // Anthropic 线直接嵌在 `tool_result` 的 content 数组里；OpenAI 线的
+        // `tool` 角色只能装字符串，图片由 `openai.rs::to_api_messages` 摘出来、
+        // 后置成紧随其后的 user 消息（`image_url` 块）。两条线都能送达，因此
+        // 判据只看 `profile.vision`，不再额外要求官方 Anthropic 端点。
+        tool_result_images: static_cap(profile.vision),
         structured_output: static_cap(false),
         max_tools_per_turn: if parallel_tools {
             DEFAULT_PARALLEL_MAX_TOOLS

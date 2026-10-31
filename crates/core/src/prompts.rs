@@ -410,10 +410,14 @@ pub const COMPUTER_USE_HINT: &str = "For desktop GUI work, preserve the human us
 ///
 /// 为什么不能直接复用 [`COMPUTER_USE_HINT`]：那段通篇假定「截图会回到模型
 /// 眼前」——它教模型读附图、按 `frame_in_screenshot` 定位、在
-/// `root_available:false` 时改用截图坐标。OpenAI 线的 `tool` 角色消息装不下
-/// image block，`openai.rs::to_api_messages` 会把截图降级成
-/// `[image omitted: ...]` 占位符。沿用同一份提示，模型会按「我看得到画面」
-/// 的前提规划，随后对着一个占位符描述界面——比不给提示更糟。
+/// `root_available:false` 时改用截图坐标。`vision = false` 的 profile 上图片
+/// 根本发不出去（Anthropic 线降级成 `[image omitted: ...]` 文本块，OpenAI 线
+/// 同样只留占位符）。沿用同一份提示，模型会按「我看得到画面」的前提规划，
+/// 随后对着一个占位符描述界面——比不给提示更糟。
+///
+/// 注意触发条件不是「provider 不是 Anthropic」：OpenAI 线的 tool_result 图片
+/// 现在由 `openai.rs::to_api_messages` 后置成 user 消息送达，那条线走的是
+/// [`COMPUTER_USE_HINT`]。本段只在 `profile.vision = false` 时注入。
 ///
 /// 因此这一段只写文本路径：Accessibility 树（`list_elements` +
 /// `include_text`）与 OCR（`read_text`），并要求每次变更后重新读状态——
