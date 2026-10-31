@@ -219,7 +219,7 @@ Anthropic 协议与 MiniMax 都要求工具调用续轮时把 thinking 块连同
 ```
 
 **项目键必须稳定**（`core::project::project_key`）：`v1-<目录名>-<sha256 前 16 位>`。三条硬约束：
-1. **不用 `DefaultHasher`**——std 明确不保证跨 Rust 版本稳定，换工具链会让全部项目键漂移、状态静默丢失。旧算法保留为 `legacy_project_key` / `legacy_path_hash`，**只供 `storage migrate` 使用**。
+1. **不用 `DefaultHasher`**——std 明确不保证跨 Rust 版本稳定，换工具链会让全部项目键漂移、状态静默丢失。旧算法保留为 `legacy_key_of_root` / `legacy_path_hash`，用来识别迁移前的目录名。
 2. **必须带 `v1-` 前缀**，将来算法再变时能同时识别两代目录。
 3. **`memory::project_id` 已改为委托 `project_key`**。此前它直接哈希传入路径、不做仓库根归一，于是从子目录启动时 `memory/`、`indexes/` 与 `projects/`、`memory-v3/` 目录名不一致——同一项目状态被拆成两处。同理 `code_index` 的构造点此前传的是 `cwd`，现改传 `project_key`。
 

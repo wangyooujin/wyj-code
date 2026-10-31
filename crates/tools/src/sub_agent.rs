@@ -1009,7 +1009,7 @@ impl SubAgentTool {
         );
 
         if background {
-            // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_done_reminder）
+            // 模型侧文本，英文（结果注入通知见 prompts::bg_agent_reminder_with）
             Ok(ToolResult::ok(format!(
                 "Background agent a{id} ({agent_type}: {description}) started. Its result will arrive as a system-reminder when done — continue with your current work, do not wait."
             )))

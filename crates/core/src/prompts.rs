@@ -821,17 +821,6 @@ pub fn subagent_handoff_body(
     )
 }
 
-/// 后台子 Agent 完成结果的注入 reminder（模型侧）
-pub fn bg_agent_done_reminder(
-    id: &str,
-    agent_type: &str,
-    description: &str,
-    elapsed: &str,
-    result: &str,
-) -> String {
-    bg_agent_reminder_with(id, agent_type, description, elapsed, result, None)
-}
-
 /// 后台子 Agent 结果的注入 reminder，可携带**已渲染好的交接外壳**。
 ///
 /// `handoff_body` 为 `Some` 时直接内嵌（它自己已经带了 `<subagent-report>` 与
@@ -856,7 +845,7 @@ pub fn bg_agent_reminder_with(
 
 /// 后台 shell 退出结果的注入 reminder（模型侧）
 ///
-/// 与 `bg_agent_done_reminder` 同构：TUI 检测到后台 shell 退出后把它包成
+/// 与 [`bg_agent_reminder_with`] 同构：TUI 检测到后台 shell 退出后把它包成
 /// reminder 自动唤醒主 Agent 续跑。`output` 由调用方截断（模型不需要完整
 /// 日志，需要的是「跑完了什么、退出码是多少」）。
 ///

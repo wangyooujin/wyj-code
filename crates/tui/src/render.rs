@@ -3219,7 +3219,7 @@ fn draw_sub_agents_panel(f: &mut Frame, state: &mut AppState, area: Rect) {
         };
 
         // 面板只列运行中的条目（见函数头的 `visible_sub_agents`），因此图标恒为
-        // spinner——完成/失败/中断的状态由聊天流与 `bg_agent_done_reminder` 承载。
+        // spinner——完成/失败/中断的状态由聊天流与 `bg_agent_reminder_with` 承载。
         let icon = SPINNER_FRAMES[state.spinner_frame % SPINNER_FRAMES.len()].to_string();
         let item_style = Style::default()
             .fg(Theme::info_color())
@@ -4779,7 +4779,7 @@ mod tool_result_fold_tests {
     #[test]
     fn completed_sub_agents_are_not_listed_even_when_panel_is_focused() {
         // 与 shells 同构：面板口径统一为「只列运行中」。结果早已通过
-        // `bg_agent_done_reminder` 回灌对话，完整轨迹仍可用
+        // `bg_agent_reminder_with` 回灌对话，完整轨迹仍可用
         // `wyj-code subagent-trace` 从落盘文件查阅。
         let mut state = make_state();
         state.sub_agents.insert(1, sub_agent(SubAgentStatus::Done));

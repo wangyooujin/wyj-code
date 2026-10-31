@@ -652,22 +652,6 @@ impl Session {
         self.total_reasoning_tokens = self.total_reasoning_tokens.saturating_add(reasoning);
     }
 
-    /// 记一次**辅助 LLM 往返**（标题生成 / Auto 分类器 / 记忆提取 / 演化）。
-    ///
-    /// 与 [`Self::add_usage`] 分开是因为这些调用走另一个模型或端点，单价不同；
-    /// 且它们不计入 `api_calls`——那个字段是「主推理循环跑了几趟」，是
-    /// `input/api_call` 派生指标的分母，混进辅助往返会让它系统性偏低。
-    ///
-    /// 调用点必须**在检查返回值之前**记账：即使解析失败、摘要为空、模型回了
-    /// 一句废话，这轮 token 也已经花掉了。这与 `compact.rs` 里压缩往返的
-    /// 记账时机是同一条纪律。
-    pub fn add_aux_usage(&mut self, input: u32, output: u32, cache_read: u32) {
-        self.aux_input_tokens = self.aux_input_tokens.saturating_add(input);
-        self.aux_output_tokens = self.aux_output_tokens.saturating_add(output);
-        self.aux_cache_read_tokens = self.aux_cache_read_tokens.saturating_add(cache_read);
-        self.aux_calls = self.aux_calls.saturating_add(1);
-    }
-
     /// 补齐「停在工具调用中间」的悬空 `tool_use`，返回补了几条。
     ///
     /// 事故背景（`--resume` 后输入「继续」毫无反应，每条消息都复发）：

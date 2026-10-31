@@ -18,7 +18,6 @@ pub struct SkillCommand {
     /// `allowed-tools` frontmatter 字段：该命令执行期间临时收紧的工具白名单。
     allowed_tools: Option<Vec<String>>,
     /// `model` frontmatter 字段：引用的 Profile 名；TUI scoped execution 会在本轮使用它。
-    #[allow(dead_code)]
     model: Option<String>,
 }
 

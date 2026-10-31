@@ -198,6 +198,16 @@ fn session_entries(dir: &Path, session_id: &str) -> Vec<PathBuf> {
         dir.join(format!("{session_id}.index.json")),
         dir.join(format!("{session_id}.checkpoints")),
         dir.join(format!("{session_id}.subagents")),
+        // 滚动工作文档（`session_memory-<id>.md/.json`）与正文同目录。
+        // 漏了它们，会话删掉后压缩用的现场文档还留在磁盘上。
+        dir.join(format!(
+            "{}-{session_id}.md",
+            crate::session_memory::SESSION_MEMORY_FILENAME_PREFIX
+        )),
+        dir.join(format!(
+            "{}-{session_id}.json",
+            crate::session_memory::SESSION_MEMORY_FILENAME_PREFIX
+        )),
     ]
 }
 

@@ -2082,6 +2082,24 @@ impl MemoryV3Store {
             }
         }
 
+        // markdown 镜像是子目录，上面的循环只搬文件。整目录一起进备份，
+        // 否则清空后旧 claim 的 .md 还留在原处。
+        let mirror = self.mirror_dir();
+        if mirror.is_dir() {
+            let bytes = directory_bytes(&mirror);
+            let dst = backup_dir.join(crate::memory_mirror::MIRROR_DIR_NAME);
+            match fs::rename(&mirror, &dst) {
+                Ok(()) => moved_files.push(MovedFile {
+                    from: mirror,
+                    to: dst,
+                    bytes,
+                }),
+                Err(error) => {
+                    tracing::warn!("记忆镜像目录搬迁失败，保留在原处: {error}");
+                }
+            }
+        }
+
         // 重新建空目录：让后续访问走 Missing → Default 兜底。
         fs::create_dir_all(self.base_dir.join("global"))?;
         fs::create_dir_all(&project_dir)?;
@@ -2113,6 +2131,25 @@ impl MemoryV3Store {
             cleared_at: now_rfc3339(),
         })
     }
+}
+
+fn directory_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(directory_bytes(&path));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 fn pick_top<'a>(
@@ -3514,6 +3551,14 @@ mod tests {
                 .iter()
                 .any(|m| m.from.ends_with("records.json")),
             "project/records.json 应被搬走"
+        );
+        assert!(
+            !base.path().join("mirror").exists(),
+            "清空后镜像目录应离开原位"
+        );
+        assert!(
+            report.backup_dir.join("mirror").is_dir(),
+            "镜像目录应进备份"
         );
 
         // 新开 store：active=0、被搬走的 records.json 不再被读到。

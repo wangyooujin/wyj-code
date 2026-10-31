@@ -174,7 +174,7 @@ pub struct SessionFile {
     /// 辅助 LLM 往返累计缓存命中 token。
     #[serde(default)]
     pub aux_cache_read_tokens: u32,
-    /// 辅助 LLM 往返累计次数（不计入 `api_calls`，见 `Session::add_aux_usage`）。
+    /// 辅助 LLM 往返累计次数（不计入 `api_calls`，见 `Session::drain_aux_usage`）。
     #[serde(default)]
     pub aux_calls: u32,
     /// 本会话实际生效的 prompt cache 模式（见 [`PromptCacheState`]）。
@@ -576,13 +576,6 @@ impl SessionStore {
     /// 按同一根目录 + `session_id` 定位文件。
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    /// 某个会话实际所在的目录（会跨项目查找）。旁路存储（trace / handoff /
-    /// message log）必须用它而不是 [`Self::dir`]：`--resume` 一个别的仓库的
-    /// 会话时，trace 跟着写在那个仓库的目录下才是对的。
-    pub fn dir_for_session(&self, session_id: &str) -> PathBuf {
-        self.locate(session_id)
     }
 
     /// 会话根目录（`<data_root>/sessions`）。跨项目定位会话时用它。

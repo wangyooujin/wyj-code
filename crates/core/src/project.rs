@@ -13,7 +13,7 @@
 //! - 键带 `v1-` 前缀。将来算法再改时可以同时识别两代目录，而不是静默丢失。
 //!
 //! 旧算法（`DefaultHasher` + 8 位十六进制、无前缀）保留为
-//! [`legacy_project_key`]，只供 `storage migrate` 把老目录搬到新键下。
+//! [`legacy_key_of_root`] 与 [`legacy_path_hash`]，用来识别迁移前的目录名。
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -47,13 +47,7 @@ pub fn key_of_root(root: &Path) -> String {
 
 /// 迁移前的旧键：`<目录名>-<DefaultHasher 低 32 位十六进制>`。
 ///
-/// **不要在新代码里用它落盘**——它存在的唯一目的是让 `storage migrate`
-/// 找得到老目录。同样先归一到项目根。
-pub fn legacy_project_key(path: &Path) -> String {
-    legacy_key_of_root(&project_root(path))
-}
-
-/// 同 [`legacy_project_key`]，但输入已经是项目根。
+/// 输入必须已经是项目根。**不要在新代码里用它落盘**。
 pub fn legacy_key_of_root(root: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};

@@ -1107,35 +1107,10 @@ pub async fn compact_session_until_fit(
     .await
 }
 
-/// 同 [`compact_session_until_fit`]，但把每一轮被压缩的原文归档进 CAS。
+/// 同 [`compact_session_until_fit`]，并可在第一轮之后复用会话滚动工作文档。
 ///
-/// 循环里每一轮都可能丢一段不同的原文，所以归档是**逐轮**发生的
-/// （`compact_session_with_archive` 每次自己 intern 一个 blob）。
-#[allow(clippy::too_many_arguments)]
-pub async fn compact_session_until_fit_with_archive(
-    session: &mut Session,
-    provider: &dyn Provider,
-    context_window: u32,
-    threshold: u32,
-    prefix: Option<CompactPrefix<'_>>,
-    measure: impl Fn(&[Message]) -> u32,
-    cas: Option<&crate::workspace_cas::WorkspaceCas>,
-) -> CompactUntilFitOutcome {
-    compact_session_until_fit_full(
-        session,
-        provider,
-        context_window,
-        threshold,
-        prefix,
-        measure,
-        cas,
-        None,
-    )
-    .await
-}
-
-/// 同 [`compact_session_until_fit_with_archive`]，并可在第一轮之后复用
-/// 会话滚动工作文档。
+/// `cas` 非空时，每一轮被压缩的原文归档进 CAS（`compact_session_with_archive`
+/// 每次自己 intern 一个 blob）。
 ///
 /// 只有**第一轮**会用到文档：一旦压缩发生，历史已被替换成摘要，而
 /// `covered_messages` 指向的是压缩前的条数——第二轮若再取文档，会得到

@@ -126,14 +126,6 @@ subdir! {
     agents_root => "agents",
 }
 
-/// 项目级运行状态目录：`<root>/<kind>/<project_key>`。
-///
-/// `kind` 用 [`sessions_root`] 等的**目录名**（不是绝对路径）。之所以要这一层
-/// 间接，是因为调用方手里往往同时有 base 与 kind，传路径反而更啰嗦。
-pub fn project_state_dir(root: &Path, kind: &str, project_key: &str) -> PathBuf {
-    root.join(kind).join(project_key)
-}
-
 /// 会话文件所在目录：`<root>/sessions/<project_key>`。
 pub fn project_sessions_dir(root: &Path, project_key: &str) -> PathBuf {
     sessions_root(root).join(project_key)

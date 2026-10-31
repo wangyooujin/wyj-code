@@ -34,7 +34,8 @@
 //! # 删除
 //!
 //! claim 变 Superseded / Rejected 时，对应文件**保留**（它的历史仍然有
-//! 意义），只在文件名后加 `.archived.md` 后缀。真删只在 `clear_all` 时。
+//! 意义），只在文件名后加 `.archived.md` 后缀。整目录在 `clear_all` 时
+//! 随库一起搬进备份。
 
 use std::path::{Path, PathBuf};
 
@@ -202,18 +203,6 @@ pub fn write_claim(mirror_dir: &Path, record: &MemoryRecord) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// 删除一条 claim 的镜像文件（`clear_all` 用）。
-pub fn remove_claim(mirror_dir: &Path, record: &MemoryRecord) {
-    let _ = std::fs::remove_file(claim_path(mirror_dir, record));
-    let base = claim_filename(record);
-    let archived_name = format!(
-        "{}{}",
-        base.strip_suffix(".md").unwrap_or(&base),
-        ARCHIVED_SUFFIX
-    );
-    let _ = std::fs::remove_file(mirror_dir.join(archived_name));
 }
 
 /// 从一条 markdown 镜像里读回**正文**（frontmatter 之后的部分）。

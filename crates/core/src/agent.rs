@@ -1131,10 +1131,6 @@ impl Agent {
         self
     }
 
-    pub fn session_memory_ref(&self) -> Option<&Arc<crate::session_memory::SessionMemory>> {
-        self.session_memory.as_ref()
-    }
-
     pub fn memory_v3_ref(&self) -> Option<&Arc<MemoryV3Store>> {
         self.memory_v3.as_ref()
     }

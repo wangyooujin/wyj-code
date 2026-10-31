@@ -642,7 +642,7 @@ impl AppState {
     /// （启动顺序）排列。
     ///
     /// 已完成 / 失败 / 中断的条目不再列出——它们的最终结果已经通过
-    /// `bg_agent_done_reminder` 回灌进对话（前台则直接作为 ToolResult），
+    /// `bg_agent_reminder_with` 回灌进对话（前台则直接作为 ToolResult），
     /// 完整轨迹也仍落盘在 `~/.wyj-code/sessions/<id>.subagents/`，可用
     /// `wyj-code subagent-trace` 或 `/subagents <id>` 之外的落盘路径查阅。
     /// 留在面板里只是占位：用户唯一能对它做的操作（看 trace）已经不在列表上了。

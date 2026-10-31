@@ -16,20 +16,13 @@ fn main() {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 mod probe {
     use anyhow::{Context, Result};
-    use objc2_application_services::{
-        AXCopyMultipleAttributeOptions, AXError, AXUIElement, AXValue, AXValueType,
-    };
-    use objc2_core_foundation::{CFArray, CFBoolean, CFMutableArray, CFRetained, CFString, CFType};
+    use objc2_application_services::{AXError, AXUIElement};
+    use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
     use std::collections::HashMap;
     use std::ptr::NonNull;
     use std::time::Instant;
-
-    /// 探路阶段放宽预算，先看真实规模
-    const MAX_DEPTH: u16 = 12;
-    const MAX_NODES: usize = 3000;
 
     pub fn run(filter: Option<String>) -> Result<()> {
         println!("AXIsProcessTrusted = {}", trusted());
@@ -75,47 +68,10 @@ mod probe {
         Some(unsafe { AXUIElement::new_application(pid) })
     }
 
-    fn retained(raw: *const AXUIElement) -> Option<CFRetained<AXUIElement>> {
-        let raw = NonNull::new(raw.cast_mut())?;
-        // SAFETY: AX copy APIs follow CoreFoundation's create/copy ownership rule.
-        Some(unsafe { CFRetained::from_raw(raw) })
-    }
-
     fn retained_type(raw: *const CFType) -> Option<CFRetained<CFType>> {
         let raw = NonNull::new(raw.cast_mut())?;
         // SAFETY: same ownership rule as above.
         Some(unsafe { CFRetained::from_raw(raw) })
-    }
-
-    fn as_elements(value: &CFRetained<CFType>) -> Vec<CFRetained<AXUIElement>> {
-        let Some(array) = value.downcast_ref::<CFArray>() else {
-            return Vec::new();
-        };
-        // SAFETY: AX array attributes always yield CFType elements.
-        let typed = unsafe { array.cast_unchecked::<CFType>() };
-        typed
-            .to_vec()
-            .into_iter()
-            .filter_map(|item| item.downcast::<AXUIElement>().ok())
-            .collect()
-    }
-
-    fn copy_attr(element: &AXUIElement, name: &str) -> Option<CFRetained<CFType>> {
-        let attr = CFString::from_str(name);
-        let mut raw: *const CFType = std::ptr::null();
-        // SAFETY: `raw` is a valid out-pointer per the copy API contract.
-        let error = unsafe { element.copy_attribute_value(&attr, NonNull::from(&mut raw)) };
-        if error != AXError::Success {
-            return None;
-        }
-        retained_type(raw)
-    }
-
-    fn children(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
-        copy_attr(element, "AXChildren")
-            .as_ref()
-            .map(as_elements)
-            .unwrap_or_default()
     }
 
     fn count_children(app: &AXUIElement) -> String {
@@ -132,181 +88,6 @@ mod probe {
                 Ok(array) => array.len().to_string(),
                 Err(_) => "not-array".to_string(),
             },
-        }
-    }
-
-    fn text_attr(element: &AXUIElement, name: &str) -> Option<String> {
-        copy_attr(element, name)
-            .and_then(|value| value.downcast::<CFString>().ok().map(|s| s.to_string()))
-    }
-
-    /// 一次 IPC 读完一个节点的全部属性。探路实测这是遍历性能的全部来源：
-    /// 逐属性读 3000 节点 = 15000 次 IPC（访达 18.2s），批量读降到 3000 次。
-    struct NodeAttrs {
-        role: Option<String>,
-        title: Option<String>,
-        description: Option<String>,
-        value: Option<String>,
-        enabled: Option<bool>,
-        focused: Option<bool>,
-        selected: Option<bool>,
-        position: Option<(f64, f64)>,
-        size: Option<(f64, f64)>,
-        children: Vec<CFRetained<AXUIElement>>,
-    }
-
-    const NODE_ATTRS: [&str; 9] = [
-        "AXRole",
-        "AXTitle",
-        "AXDescription",
-        "AXValue",
-        "AXEnabled",
-        "AXFocused",
-        "AXSelected",
-        "AXPosition",
-        "AXSize",
-    ];
-
-    fn batch_attrs(element: &AXUIElement) -> NodeAttrs {
-        let names: CFRetained<CFMutableArray<CFString>> =
-            CFMutableArray::with_capacity(NODE_ATTRS.len());
-        for name in NODE_ATTRS {
-            names.append(&CFString::from_str(name));
-        }
-        // CFMutableArray<T>::as_opaque() → 未泛型化的 &CFArray（回调参数用的是它）。
-        let names: &CFArray = names.as_opaque();
-        let mut raw: *const CFArray = std::ptr::null();
-        // options = 0：单个属性出错不影响整批（错误以 kAXValueAXErrorType 占位）
-        // SAFETY: `names`/`raw` 均符合 API 契约；raw 是有效 out-pointer。
-        let error = unsafe {
-            element.copy_multiple_attribute_values(
-                names,
-                AXCopyMultipleAttributeOptions::empty(),
-                NonNull::from(&mut raw),
-            )
-        };
-        let mut out = NodeAttrs {
-            role: None,
-            title: None,
-            description: None,
-            value: None,
-            enabled: None,
-            focused: None,
-            selected: None,
-            position: None,
-            size: None,
-            children: Vec::new(),
-        };
-        if error != AXError::Success || raw.is_null() {
-            return out;
-        }
-        let Some(raw) = NonNull::new(raw.cast_mut()) else {
-            return out;
-        };
-        // SAFETY: 成功时 API 返回 +1 retained array。
-        let values = unsafe { CFRetained::<CFArray>::from_raw(raw) };
-        // SAFETY: 返回数组元素都是 CFType。
-        let values = unsafe { values.cast_unchecked::<CFType>() }.to_vec();
-
-        // CFArray::get 返回借用（downcast 消耗 self），故先 clone 出 owned 再转。
-        let str_at = |i: usize| -> Option<String> {
-            values
-                .get(i)?
-                .clone()
-                .downcast::<CFString>()
-                .ok()
-                .map(|s| s.to_string())
-        };
-        let bool_at = |i: usize| -> Option<bool> {
-            values
-                .get(i)?
-                .clone()
-                .downcast::<CFBoolean>()
-                .ok()
-                .map(|b| b.as_bool())
-        };
-        let ax2_at = |i: usize, ty: AXValueType| -> Option<(f64, f64)> {
-            let ax: CFRetained<AXValue> = values.get(i)?.clone().downcast::<AXValue>().ok()?;
-            // SAFETY: 栈上 out-param，且类型已先核对。
-            unsafe {
-                if ax.r#type().0 != ty.0 {
-                    return None;
-                }
-                let mut pair = [0.0f64; 2];
-                if !ax.value(ty, NonNull::from(&mut pair).cast()) {
-                    return None;
-                }
-                Some((pair[0], pair[1]))
-            }
-        };
-
-        out.role = str_at(0);
-        out.title = str_at(1);
-        out.description = str_at(2);
-        out.value = str_at(3);
-        out.enabled = bool_at(4);
-        out.focused = bool_at(5);
-        out.selected = bool_at(6);
-        out.position = ax2_at(7, AXValueType::CGPoint);
-        out.size = ax2_at(8, AXValueType::CGSize);
-        // AXChildren 不在批量列表里（数组类型需单独读，且常为空）
-        out.children = children(element);
-        out
-    }
-
-    /// AXPosition + AXSize → (x, y, w, h)，全局逻辑点。
-    fn frame(element: &AXUIElement) -> Option<(f64, f64, f64, f64)> {
-        // AXPosition 是 CGPoint，AXSize 是 **CGSize**——两者 AXValue 类型不同，
-        // 必须分别按目标类型读，否则会被类型检查静默拒掉（表现为「无几何」）。
-        fn read2(value: CFRetained<CFType>, ty: AXValueType) -> Option<(f64, f64)> {
-            let ax: CFRetained<AXValue> = value.downcast::<AXValue>().ok()?;
-            // SAFETY: out-params are stack-allocated and the type is checked first.
-            unsafe {
-                if ax.r#type().0 != ty.0 {
-                    return None;
-                }
-                let mut pair = [0.0f64; 2];
-                if !ax.value(ty, NonNull::from(&mut pair).cast()) {
-                    return None;
-                }
-                Some((pair[0], pair[1]))
-            }
-        }
-        let (x, y) = read2(copy_attr(element, "AXPosition")?, AXValueType::CGPoint)?;
-        let (w, h) = read2(copy_attr(element, "AXSize")?, AXValueType::CGSize)?;
-        Some((x, y, w, h))
-    }
-
-    fn actions(element: &AXUIElement) -> Vec<String> {
-        let mut raw: *const CFArray = std::ptr::null();
-        // SAFETY: `raw` is a valid out-pointer per the copy API contract.
-        let error = unsafe { element.copy_action_names(NonNull::from(&mut raw)) };
-        if error != AXError::Success || raw.is_null() {
-            return Vec::new();
-        }
-        let Some(raw) = NonNull::new(raw.cast_mut()) else {
-            return Vec::new();
-        };
-        // SAFETY: successful copy API returns a +1 retained array.
-        let array = unsafe { CFRetained::<CFArray>::from_raw(raw) };
-        // SAFETY: action-name arrays always contain CFString elements.
-        let typed = unsafe { array.cast_unchecked::<CFType>() };
-        typed
-            .to_vec()
-            .into_iter()
-            .filter_map(|v: CFRetained<CFType>| {
-                v.downcast::<CFString>().ok().map(|s| s.to_string())
-            })
-            .collect()
-    }
-
-    fn settable(element: &AXUIElement) -> bool {
-        let attr = CFString::from_str("AXValue");
-        let mut settable: u8 = 0;
-        // SAFETY: `settable` is a valid out-pointer per the is-settable contract.
-        unsafe {
-            element.is_attribute_settable(&attr, NonNull::from(&mut settable)) == AXError::Success
-                && settable != 0
         }
     }
 

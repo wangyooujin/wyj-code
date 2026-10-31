@@ -33,7 +33,7 @@
 //!     写成空文档）；
 //!   - 文档为空或过短 → 压缩时**不**用它，回退到全量摘要。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -62,14 +62,6 @@ pub const MIN_USABLE_BYTES: usize = 400;
 /// 滚动文档的价值在于「小到能整段塞进上下文」。超过这个尺寸它自己就成了
 /// 上下文问题的一部分，所以更新时要求模型压缩已有内容而不是持续追加。
 pub const MAX_DOC_BYTES: usize = 12_000;
-
-/// 一次更新的输入：上一版文档 + 新增的这一段对话。
-#[derive(Debug, Clone)]
-pub struct UpdateRequest<'a> {
-    pub previous: &'a str,
-    /// 自上次更新以来新增的消息（**不是**全量历史）。
-    pub new_messages: &'a [Message],
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionMemoryState {
@@ -155,14 +147,6 @@ impl SessionMemory {
     pub fn is_usable(&self) -> bool {
         let doc = self.read_doc();
         doc.len() >= MIN_USABLE_BYTES && !doc.trim().is_empty()
-    }
-
-    /// 自上次更新以来新增了多少条消息。
-    pub fn pending_messages(&self, session: &Session) -> usize {
-        session
-            .messages
-            .len()
-            .saturating_sub(self.read_state().covered_messages)
     }
 
     /// 文档是否已经覆盖到 `message_count` 之前的历史。
@@ -408,15 +392,6 @@ fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
 /// 两者都是辅助 LLM 往返，撞在同一轮会让主循环多等一趟。
 pub fn update_due(user_turns: usize, every: usize) -> bool {
     every > 0 && user_turns > 0 && user_turns % every == 0
-}
-
-/// 清理某个会话残留的滚动文档（`storage prune` / 会话删除时用）。
-pub fn purge_session_memory(dir: &Path, session_id: &str) {
-    let _ =
-        std::fs::remove_file(dir.join(format!("{SESSION_MEMORY_FILENAME_PREFIX}-{session_id}.md")));
-    let _ = std::fs::remove_file(dir.join(format!(
-        "{SESSION_MEMORY_FILENAME_PREFIX}-{session_id}.json"
-    )));
 }
 
 #[cfg(test)]

@@ -39,8 +39,7 @@ use wyj_config::WireProtocol;
 /// 走不同发送策略。默认 `StandardV1` 与现有 OpenAI Chat Completions 主流
 /// 协议一致；`--probe full` 主动探测时可升级到 ExperimentalV2。
 ///
-/// `detect_vendor_variant` 是占位函数：当前所有已知 vendor 都标 `StandardV1`，
-/// 阶段 7 结构预留为主——后续真实探测接入时只需扩 match 即可。
+/// 当前所有已知 vendor 都标 `StandardV1`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VendorVariant {
@@ -49,13 +48,6 @@ pub enum VendorVariant {
     StandardV1,
     /// 探测发现需要兼容老版本字段（如 vendor 自定义变体）
     ExperimentalV2,
-}
-
-/// 按 vendor × model 名推导字段名版本。占位实现——目前所有已知 vendor 都
-/// 走 StandardV1；阶段 7 预留接口，--probe full 实际接入探测后扩展。
-pub fn detect_vendor_variant(vendor: &str, model: &str) -> VendorVariant {
-    let _ = (vendor, model);
-    VendorVariant::StandardV1
 }
 
 /// OpenAI-vendor `reasoning_effort` 字符串档位的统一表示。

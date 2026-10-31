@@ -388,17 +388,6 @@ pub fn wrap_plain_text_spans(
     wrap_spans(chunks, avail)
 }
 
-/// [`wrap_plain_text_spans`] 的单样式便捷版：整段文本用同一个样式。
-pub fn wrap_plain_text(text: &str, style: Style, avail: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-    wrap_plain_text_spans(&[(text.to_string(), style)], avail)
-        .into_iter()
-        .map(|line| line.into_iter().map(|(t, _)| t).collect())
-        .collect()
-}
-
 // ── 表格渲染 ──────────────────────────────────────────────────────────────────
 
 fn table_border(widths: &[usize], l: char, m: char, r: char, f: char) -> String {
