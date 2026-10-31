@@ -163,11 +163,8 @@ impl AppComputerTool {
             Ok(value) => value,
             Err(error) => return error_result(error),
         };
-        if let Some(generation) = input.get("generation").and_then(Value::as_u64) {
-            if let Err(error) = wyj_computer::target::validate_window_target(window_id, generation)
-            {
-                return error_result(error);
-            }
+        if let Err(error) = guard_supplied_generation(input, window_id) {
+            return error_result(error);
         }
         let (target, capture) =
             match wyj_computer::target::capture_window_by_id(window_id, self.max_dim) {
@@ -184,7 +181,7 @@ impl AppComputerTool {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(window_id, 0);
         let display = serde_json::to_string_pretty(&serde_json::json!({
-            "window": target,
+            "window": crate::window_capture::window_for_model(&target),
             "capture": {
                 "pixel_width": capture.physical_width,
                 "pixel_height": capture.physical_height,
@@ -199,28 +196,37 @@ impl AppComputerTool {
 
     fn resolve_observation(&self, input: &Value) -> Result<WindowTarget> {
         let window_id = required_u32(input, "window_id")?;
-        let generation = required_u64(input, "generation")?;
-        let mut current = wyj_computer::target::validate_window_target(window_id, generation)?;
-
-        if let Some(observed) = self
+        let stored = self
             .observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&window_id)
-            .filter(|observed| observed.generation == generation)
-            .cloned()
-        {
+            .cloned();
+        // 模型传了 generation（包括被舍入的数字）就用它，不再退回存储值。
+        // 没传、且这次工具已经观察过这个窗口时，用存储的 id 再校验一次。
+        let generation =
+            generation_for_mutation(input, stored.as_ref().map(|target| target.generation))?;
+        let mut current = wyj_computer::target::validate_window_target(window_id, generation)?;
+
+        if let Some(observed) = stored.filter(|observed| {
+            observed.generation == generation && coordinate_space_usable(observed, self.max_dim)
+        }) {
             current.target_width = observed.target_width;
             current.target_height = observed.target_height;
             return Ok(current);
         }
 
-        current.target_width = required_u32(input, "target_width")?;
-        current.target_height = required_u32(input, "target_height")?;
+        // 没有可用的截图坐标空间时自己再截一张。`read_text` 会把全分辨率
+        // 观察写进同一张表，长边超过 max_dim，点下去会偏；list 的
+        // target_width/height 又是 0。模型填的窗口点尺寸一律不用。
+        let (_captured, capture) =
+            wyj_computer::target::capture_window_by_id(window_id, self.max_dim)?;
         anyhow::ensure!(
-            current.target_width > 0 && current.target_height > 0,
+            capture.target_width > 0 && capture.target_height > 0,
             "target_changed: invalid captured coordinate space; take a new window screenshot"
         );
+        current.target_width = capture.target_width;
+        current.target_height = capture.target_height;
         self.observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -363,11 +369,8 @@ impl AppComputerTool {
             Ok(value) => value,
             Err(error) => return error_result(error),
         };
-        if let Some(generation) = input.get("generation").and_then(Value::as_u64) {
-            if let Err(error) = wyj_computer::target::validate_window_target(window_id, generation)
-            {
-                return error_result(error);
-            }
+        if let Err(error) = guard_supplied_generation(input, window_id) {
+            return error_result(error);
         }
         // 阈值只接受 [0,1]；传 `"0.4"` 这类字符串说明模型理解偏了，显式报错
         // 而不是静默当成 0（那会让它以为过滤掉了噪音、实际没有）。
@@ -535,11 +538,8 @@ impl AppComputerTool {
             Ok(value) => value,
             Err(error) => return error_result(error),
         };
-        if let Some(generation) = input.get("generation").and_then(Value::as_u64) {
-            if let Err(error) = wyj_computer::target::validate_window_target(window_id, generation)
-            {
-                return error_result(error);
-            }
+        if let Err(error) = guard_supplied_generation(input, window_id) {
+            return error_result(error);
         }
 
         let (target, capture) =
@@ -639,11 +639,8 @@ impl AppComputerTool {
             Ok(value) => value,
             Err(error) => return error_result(error),
         };
-        if let Some(generation) = input.get("generation").and_then(Value::as_u64) {
-            if let Err(error) = wyj_computer::target::validate_window_target(window_id, generation)
-            {
-                return error_result(error);
-            }
+        if let Err(error) = guard_supplied_generation(input, window_id) {
+            return error_result(error);
         }
         let target = match wyj_computer::target::find_window_by_id(window_id) {
             Ok(target) => target,
@@ -671,7 +668,7 @@ impl AppComputerTool {
             .insert(window_id, snapshot.tree_id);
 
         let mut display = serde_json::to_string_pretty(&serde_json::json!({
-            "tree_id": snapshot.tree_id,
+            "tree_id": snapshot.tree_id.to_string(),
             "menu_available": snapshot.menu_available,
             "count": snapshot.items.len(),
             "truncated": snapshot.truncated,
@@ -1369,7 +1366,7 @@ fn scroll_with_fallback(target: &WindowTarget, direction: &str, amount: u32) -> 
     ))
 }
 
-const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. When you need to *read* text rather than click it, prefer `list_elements` with `include_text:true` — the text comes from the accessibility tree, so it is exact. Only when the app exposes no text at all (self-drawn canvases, images, video captions) use `read_text`, which runs on-device OCR over the window pixels and returns every line with a per-line confidence and pixel coordinates; treat those results as a machine reading, not as ground truth, and re-check numbers before acting on them. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying. A few operations cannot be expressed through the accessibility tree at all — naming a brand-new Finder folder, creating a note whose body is rich text, opening a URL without driving the address bar. For those, `run_recipe` runs one of a small fixed set of automation scripts shipped with the binary: you pick the recipe name and pass its positional `args`, and the arguments travel as data rather than being spliced into the script, so quoting in them is harmless. The first time a recipe drives a given app macOS shows an Automation permission dialog that a person must accept, so recipes only run on interactive surfaces; if that permission is refused you get `appleevents_permission_required` and must not retry.";
+const DESCRIPTION: &str = "Controls a specific macOS application window without moving the user's pointer or taking away their keyboard focus. Most apps expose an accessibility tree, and there `element_ref` is the most reliable way to act: `list_windows` or `screenshot` to capture a window, `list_elements` to read its tree and get stable `element_ref` ids (one compact aligned line per element by default; pass `format: json` only when you need every field verbatim), then pass `window_id`, `generation`, the `tree_id` from that `list_elements` call, and `element_ref` (e.g. `e12`). `generation` and `tree_id` are decimal strings: copy them exactly and never send them as JSON numbers, because they are larger than 2^53 and a JSON number gets rounded. Do not send `target_width` or `target_height`; coordinate actions use this tool's own screenshot space (the same max dimension as `window_capture`), not the window's point size. Use a `coordinate` from the attached screenshot instead when `list_elements` reports `root_available:false` (common for self-drawn apps such as WeChat), the element you need is missing, or `truncated:true` hid it. When you need to *read* text rather than click it, prefer `list_elements` with `include_text:true` — the text comes from the accessibility tree, so it is exact. Only when the app exposes no text at all (self-drawn canvases, images, video captions) use `read_text`, which runs on-device OCR over the window pixels and returns every line with a per-line confidence and pixel coordinates; treat those results as a machine reading, not as ground truth, and re-check numbers before acting on them. Coordinate actions fall back automatically when accessibility is unavailable: `click` uses AXPress first and switches to a cursor warp (jumps to the point, clicks, returns the cursor to where it was) if the app exposes no accessibility element there; `set_text` writes through Accessibility when the field is settable and otherwise falls back to a clipboard paste (which handles any script, including Chinese and emoji, at the cost of briefly borrowing the user's clipboard — the previous content is restored afterwards); ASCII-only text may also fall back to per-character target-PID keystrokes. `scroll` degrades the same way. `drag` moves from one screenshot point to another in interpolated steps (needed because apps detect a drag from the intermediate movement, not from press-and-release alone) and is the only way to move files, drag sliders, or reorder lists; like `click`, it refuses to run when the target window is covered. A stale `tree_id` or an out-of-range `element_ref` returns `target_changed` — call `list_elements` again rather than retrying the old reference. To run an application command (File then New Tab, View then Show Path Bar, Window then Minimize), prefer the menu bar: `list_menus` returns every menu item with a `menu_ref` (e.g. `m12`) and a readable `path`, and `press_menu` activates it in the background without touching the pointer; it covers the app's menu bar only, not right-click context menus — for those use `show_menu`, which opens the context menu of an element (via AXShowMenu, no pointer movement) or of a coordinate (as a right click); that menu is a separate window, so list windows again to find it. `key` and unsupported semantic scrolling are posted only to the target PID. Every mutation that succeeds returns a fresh screenshot of the window as it looks afterwards, so read it instead of assuming the action had the effect you intended; when a mutation starts an animation or a load, call `wait` (up to 3000ms) first and then `screenshot`. If the action was supposed to open a dialog or a new window, run `window_capture` action `list` afterwards: a sheet or dialog is usually its own window and will not appear in the previous window's capture. On `target_changed`, capture again — if the window no longer exists, list windows again instead of retrying the old id. On `requires_foreground_takeover`, `preempted_by_user`, `user_active`, or permission errors, stop and report instead of retrying. A few operations cannot be expressed through the accessibility tree at all — naming a brand-new Finder folder, creating a note whose body is rich text, opening a URL without driving the address bar. For those, `run_recipe` runs one of a small fixed set of automation scripts shipped with the binary: you pick the recipe name and pass its positional `args`, and the arguments travel as data rather than being spliced into the script, so quoting in them is harmless. The first time a recipe drives a given app macOS shows an Automation permission dialog that a person must accept, so recipes only run on interactive surfaces; if that permission is refused you get `appleevents_permission_required` and must not retry.";
 
 /// 附在没有图片回传通道的 profile 上的补充说明。
 ///
@@ -1457,10 +1454,16 @@ impl Tool for AppComputerTool {
                         "enum": actions
                     },
                     "window_id": {"type": "integer", "minimum": 0},
-                    "generation": {"type": "integer", "minimum": 0},
-                    "target_width": {"type": "integer", "minimum": 1},
-                    "target_height": {"type": "integer", "minimum": 1},
-                    "tree_id": {"type": "integer", "minimum": 0},
+                    "generation": {
+                        "type": "string",
+                        "pattern": "^(0|[1-9][0-9]*)$",
+                        "description": "Exact decimal string copied from the latest window list, capture, or list_elements result. Required for a mutation. Do not send a JSON number: this id is a u64 past 2^53 and will be rounded. Do not retype or shorten it."
+                    },
+                    "tree_id": {
+                        "type": "string",
+                        "pattern": "^(0|[1-9][0-9]*)$",
+                        "description": "Exact decimal string from the list_elements or list_menus result that produced this element_ref or menu_ref. Copy it verbatim. Do not send a JSON number."
+                    },
                     "element_ref": {"type": "string", "pattern": "^e[0-9]+$"},
                     "click_kind": {
                         "type": "string",
@@ -1479,7 +1482,8 @@ impl Tool for AppComputerTool {
                         "type": "array",
                         "items": {"type": "integer"},
                         "minItems": 2,
-                        "maxItems": 2
+                        "maxItems": 2,
+                        "description": "Screenshot pixels from this tool's own capture (the same max dimension as window_capture and list_elements). Do not convert them from the window's point size. Do not send target_width or target_height; this tool captures that space itself."
                     },
                     "from": {
                         "type": "array",
@@ -1655,7 +1659,7 @@ impl Tool for AppComputerTool {
                 Ok(windows) => ToolResult::ok(
                     serde_json::to_string_pretty(&serde_json::json!({
                         "count": windows.len(),
-                        "windows": windows,
+                        "windows": windows.iter().map(crate::window_capture::window_for_model).collect::<Vec<_>>(),
                     }))
                     .unwrap_or_else(|_| "{\"windows\":[]}".to_string()),
                 ),
@@ -1713,11 +1717,72 @@ fn required_u32(input: &Value, field: &str) -> Result<u32> {
         .ok_or_else(|| anyhow!("missing or invalid required field `{field}`"))
 }
 
+/// 接受规范十进制字符串，也接受无损到达的 u64 数字。
+///
+/// schema 把 `generation` / `tree_id` 声明成 string，避免 JSON number 在
+/// 2^53 处被舍入。工具直接调用（以及修复前就到达这里的整数）仍要能解析。
+fn parse_u64_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(raw) => parse_canonical_u64(raw),
+        _ => None,
+    }
+}
+
+fn parse_canonical_u64(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if raw.len() > 1 && raw.starts_with('0') {
+        return None;
+    }
+    raw.parse().ok()
+}
+
 fn required_u64(input: &Value, field: &str) -> Result<u64> {
-    input
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("missing or invalid required field `{field}`"))
+    match input.get(field) {
+        Some(value) => parse_u64_value(value)
+            .ok_or_else(|| anyhow!("missing or invalid required field `{field}`")),
+        None => Err(anyhow!("missing or invalid required field `{field}`")),
+    }
+}
+
+/// 字段缺席时返回 `Ok(None)`。字段在、但不是规范十进制或 u64 时返回错误，
+/// 不能当成「没传」跳过窗口校验。
+fn supplied_generation(input: &Value) -> Result<Option<u64>> {
+    match input.get("generation") {
+        None => Ok(None),
+        Some(value) => parse_u64_value(value)
+            .map(Some)
+            .ok_or_else(|| anyhow!("missing or invalid required field `generation`")),
+    }
+}
+
+fn guard_supplied_generation(input: &Value, window_id: u32) -> Result<()> {
+    if let Some(generation) = supplied_generation(input)? {
+        wyj_computer::target::validate_window_target(window_id, generation)?;
+    }
+    Ok(())
+}
+
+/// 变更动作的 generation。显式传入的值（含已经舍入的整数）原样使用；
+/// 只有字段缺席时才用这个窗口上一次观察记下的 id。
+fn generation_for_mutation(input: &Value, stored: Option<u64>) -> Result<u64> {
+    match input.get("generation") {
+        Some(value) => parse_u64_value(value)
+            .ok_or_else(|| anyhow!("missing or invalid required field `generation`")),
+        None => stored.ok_or_else(|| anyhow!("missing or invalid required field `generation`")),
+    }
+}
+
+/// 观察能否当作点击坐标空间。
+///
+/// 长边超过 `max_dim` 的是 `read_text` 的全分辨率图，和 `window_capture` /
+/// `list_elements` 的下采样截图不是同一套坐标。0 尺寸是窗口列表，没有截图。
+fn coordinate_space_usable(target: &WindowTarget, max_dim: u32) -> bool {
+    target.target_width > 0
+        && target.target_height > 0
+        && target.target_width.max(target.target_height) <= max_dim
 }
 
 /// 坐标点击的按键类型。模型通过 `click_kind` 指定，缺省左键。
@@ -1848,7 +1913,7 @@ fn render_element_list(
 ) -> String {
     if as_json {
         return serde_json::to_string_pretty(&serde_json::json!({
-            "tree_id": snapshot.tree_id,
+            "tree_id": snapshot.tree_id.to_string(),
             "content_fingerprint": snapshot.content_fingerprint,
             "root_available": snapshot.root_available,
             "count": snapshot.elements.len(),
@@ -2542,10 +2607,23 @@ mod tests {
     fn json_rendering_keeps_every_field() {
         let snapshot = snapshot_with(vec![element(0, "AXButton", Some("Save"), true)]);
         let text = render_element_list(&snapshot, &capture(), true);
-        assert!(text.contains("\"tree_id\": 42"), "{text}");
+        assert!(text.contains("\"tree_id\": \"42\""), "{text}");
         assert!(text.contains("\"content_fingerprint\""), "{text}");
         assert!(text.contains("\"frame_in_screenshot\""), "{text}");
         assert!(text.contains("\"AXButton\""), "{text}");
+    }
+
+    /// 超过 2^53 的 tree_id 必须原样出现在 JSON 字符串里，不能变成舍入后的数字。
+    #[test]
+    fn json_rendering_keeps_a_tree_id_past_the_json_safe_integer() {
+        let mut snapshot = snapshot_with(vec![]);
+        snapshot.tree_id = 17_902_492_282_727_121_041;
+        let text = render_element_list(&snapshot, &capture(), true);
+        assert!(
+            text.contains("\"tree_id\": \"17902492282727121041\""),
+            "{text}"
+        );
+        assert!(!text.contains("17902492282727120000"), "{text}");
     }
 
     /// `no-press` 标记必须出现：它直接决定模型该不该退回坐标路线。
@@ -2736,8 +2814,37 @@ mod tests {
         let properties = &definition.input_schema["properties"];
         assert!(properties.get("tree_id").is_some());
         assert!(properties.get("element_ref").is_some());
+        assert_eq!(properties["generation"]["type"], "string");
+        assert_eq!(properties["tree_id"]["type"], "string");
+        // 坐标空间由工具自己截图决定，schema 不再向模型要窗口点尺寸。
+        assert!(properties.get("target_width").is_none());
+        assert!(properties.get("target_height").is_none());
         // 描述必须把 ref 路线讲成首选，否则模型仍会去猜像素。
         assert!(definition.description.contains("element_ref"));
+        assert!(definition.description.contains("decimal strings"));
+
+        // Draft7 必须能编译这份 schema。编译失败会让每一次调用都变成 InvalidSchema。
+        let mut pipeline = wyj_core::tool_arguments::ToolArgumentPipeline::default();
+        pipeline.register(&definition);
+        let generation = 17_902_492_282_727_121_041u64;
+        let validated = pipeline
+            .process(wyj_api::types::RawToolCall {
+                id: "1".into(),
+                name: "app_computer".into(),
+                raw_arguments: format!(
+                    r#"{{"action":"key","generation":{generation},"tree_id":"{generation}"}}"#
+                ),
+            })
+            .expect("app_computer schema accepts a decimal generation");
+        assert_eq!(
+            validated.input["generation"].as_str(),
+            Some(generation.to_string().as_str())
+        );
+        assert_eq!(
+            validated.input["tree_id"].as_str(),
+            Some(generation.to_string().as_str())
+        );
+        assert!(validated.syntax_repaired);
     }
 
     #[test]
@@ -2853,6 +2960,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("stale"), "{error}");
+
+        // 十进制字符串和无损整数都要能对上同一次观察，包括超过 2^53 的 id。
+        let generation = 17_902_492_282_727_121_041u64;
+        tool.element_observations.lock().unwrap().insert(
+            7,
+            ElementObservation {
+                tree_id: generation,
+                content_fingerprint: 1,
+                centers: vec![None; 8],
+                query: wyj_computer::element::ElementQuery::default(),
+            },
+        );
+        let (reference, _) = tool
+            .resolve_element(
+                &target,
+                &serde_json::json!({"element_ref": "e3", "tree_id": generation.to_string()}),
+            )
+            .unwrap();
+        assert_eq!(reference, ElementRef(3));
+        let (reference, _) = tool
+            .resolve_element(
+                &target,
+                &serde_json::json!({"element_ref": "e3", "tree_id": generation}),
+            )
+            .unwrap();
+        assert_eq!(reference, ElementRef(3));
     }
 
     #[test]
@@ -2929,6 +3062,137 @@ mod tests {
         }));
         assert!(result.is_error);
         // 窗口都不存在，绝不能走到「按序号盲找菜单项」。
+        assert!(
+            result.content.contains("target_changed"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn generation_parsing_keeps_exact_ids_and_does_not_replace_a_supplied_value() {
+        let exact = 17_902_492_282_727_121_041u64;
+        let rounded = 17_902_492_282_727_120_000u64;
+        let from_string = generation_for_mutation(
+            &serde_json::json!({"generation": exact.to_string()}),
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(from_string, exact);
+        let from_number =
+            generation_for_mutation(&serde_json::json!({"generation": exact}), Some(1)).unwrap();
+        assert_eq!(from_number, exact);
+        // 已经舍入的数字仍然按模型给的值用，不能偷偷换成存储的正确 id。
+        let supplied_rounded =
+            generation_for_mutation(&serde_json::json!({"generation": rounded}), Some(exact))
+                .unwrap();
+        assert_eq!(supplied_rounded, rounded);
+        assert_eq!(
+            generation_for_mutation(&serde_json::json!({}), Some(exact)).unwrap(),
+            exact
+        );
+        assert!(generation_for_mutation(&serde_json::json!({}), None).is_err());
+        assert!(generation_for_mutation(
+            &serde_json::json!({"generation": "17902492282727121041.0"}),
+            Some(exact)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn coordinate_space_rejects_a_full_resolution_ocr_capture() {
+        let mut target = WindowTarget {
+            window_id: 1,
+            pid: 1,
+            app_name: "App".into(),
+            title: "T".into(),
+            x: 0,
+            y: 0,
+            width: 1400,
+            height: 860,
+            target_width: 400,
+            target_height: 300,
+            generation: 3,
+            focused: false,
+        };
+        assert!(coordinate_space_usable(&target, 1280));
+        target.target_width = 0;
+        target.target_height = 0;
+        assert!(!coordinate_space_usable(&target, 1280));
+        target.target_width = 2000;
+        target.target_height = 1200;
+        assert!(!coordinate_space_usable(&target, 1280));
+    }
+
+    #[test]
+    fn a_mutation_without_generation_or_an_observation_names_the_missing_field() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let result = tool.key(&serde_json::json!({
+            "action": "key",
+            "window_id": 1,
+            "key": "return"
+        }));
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .contains("missing or invalid required field `generation`"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn an_omitted_generation_still_checks_the_stored_window_identity() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        tool.observations.lock().unwrap().insert(
+            999_999,
+            WindowTarget {
+                window_id: 999_999,
+                pid: 1,
+                app_name: "App".into(),
+                title: "T".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                target_width: 400,
+                target_height: 300,
+                generation: 3,
+                focused: false,
+            },
+        );
+        let result = tool.key(&serde_json::json!({
+            "action": "key",
+            "window_id": 999999,
+            "key": "return"
+        }));
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("target_changed"),
+            "{}",
+            result.content
+        );
+        assert!(
+            !result
+                .content
+                .contains("missing or invalid required field `generation`"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn a_decimal_generation_string_reaches_window_validation() {
+        let tool = AppComputerTool::new(1280, Duration::from_secs(2));
+        let result = tool.press_menu(&serde_json::json!({
+            "action": "press_menu",
+            "window_id": 999999,
+            "generation": "1",
+            "menu_path": ["m0"],
+            "tree_id": "1"
+        }));
+        assert!(result.is_error);
         assert!(
             result.content.contains("target_changed"),
             "{}",

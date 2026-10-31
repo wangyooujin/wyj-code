@@ -4221,6 +4221,35 @@ fn continuation_keyword_detection_matches_documented_phrases() {
 }
 
 #[test]
+fn classifier_goal_keeps_the_named_task_across_a_continuation() {
+    use wyj_api::types::{ContentBlock, Message, Role};
+
+    let mut session = crate::session::Session::default();
+    push_user_text(&mut session, "打开天气应用，看今天的天气");
+    session.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: "好的，我去打开备忘录".to_string(),
+        }],
+    });
+    push_user_text(&mut session, "<system-reminder>framework</system-reminder>");
+    push_user_text(&mut session, "继续");
+    let goal = classifier_user_goal(&session);
+    assert!(goal.contains("打开天气应用，看今天的天气"), "{goal}");
+    assert!(goal.contains("继续"), "{goal}");
+    assert!(!goal.contains("备忘录"), "{goal}");
+    assert!(!goal.contains("system-reminder"), "{goal}");
+}
+
+#[test]
+fn classifier_goal_uses_only_the_latest_concrete_request() {
+    let mut session = crate::session::Session::default();
+    push_user_text(&mut session, "打开天气应用");
+    push_user_text(&mut session, "改成打开备忘录");
+    assert_eq!(classifier_user_goal(&session), "改成打开备忘录");
+}
+
+#[test]
 fn continuation_suffix_resumes_in_progress_task_with_next_step() {
     let base = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();

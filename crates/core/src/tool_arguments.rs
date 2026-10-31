@@ -239,7 +239,11 @@ impl ToolArgumentPipeline {
             let mut repaired_input = input.clone();
             let mut repaired_ok = false;
             let mut issues = None;
-            if repair_numeric_string_types(&mut repaired_input, &errors) {
+            // `|` 而不是 `||`：两个方向都要跑。整数 id 的字符串修复和
+            // 数字修复针对的是不同字段，短路会漏掉后一个。
+            let changed = repair_numeric_string_types(&mut repaired_input, &errors)
+                | repair_exact_integer_ids(&mut repaired_input, &errors);
+            if changed {
                 let outcome = schema.validate(&repaired_input);
                 if outcome.is_ok() {
                     repaired_ok = true;
@@ -324,6 +328,78 @@ fn repair_numeric_string_types(
         repaired = true;
     }
     repaired
+}
+
+/// 把 schema 要求十进制字符串、模型却发了完整整数的 `generation` / `tree_id`
+/// 就地改成规范十进制字符串。
+///
+/// 这两个字段是 FNV-1a u64，超过 JSON 安全整数 2^53。schema 声明为 string，
+/// 模型才不会把它写成会被舍入的 JSON number。已经无损到达这里的整数（Rust
+/// 的 JSON 解析器保留了 u64）仍然接受，改成字符串后由工具自己解析。已经变成
+/// f64 的舍入值不修：修了也只是把错误数字写成看起来合法的字符串。
+///
+/// 只动路径末段叫 `generation` 或 `tree_id` 的字段。普通字符串参数收到数字
+/// 仍是 schema 错误，不能被改写成命令文本。
+fn repair_exact_integer_ids(input: &mut Value, errors: &[jsonschema::ValidationError<'_>]) -> bool {
+    let mut repaired = false;
+    for error in errors {
+        if !type_error_expects_string_only(&error.kind) {
+            continue;
+        }
+        let Some(field) = path_field_name(&error.instance_path) else {
+            continue;
+        };
+        if field != "generation" && field != "tree_id" {
+            continue;
+        }
+        let Some(slot) = value_at_path_mut(input, &error.instance_path) else {
+            continue;
+        };
+        let Some(decimal) = exact_integer_decimal(slot) else {
+            continue;
+        };
+        *slot = Value::String(decimal);
+        repaired = true;
+    }
+    repaired
+}
+
+/// 这条 `Type` 错误是否只期待 string（不同时接受 integer/number）。
+fn type_error_expects_string_only(kind: &ValidationErrorKind) -> bool {
+    let ValidationErrorKind::Type { kind } = kind else {
+        return false;
+    };
+    match kind {
+        TypeKind::Single(primitive) => matches!(primitive, PrimitiveType::String),
+        TypeKind::Multiple(types) => {
+            let types: Vec<_> = types.into_iter().collect();
+            types.contains(&PrimitiveType::String)
+                && !types.contains(&PrimitiveType::Integer)
+                && !types.contains(&PrimitiveType::Number)
+        }
+    }
+}
+
+fn path_field_name(path: &JSONPointer) -> Option<&str> {
+    match path.iter().last()? {
+        PathChunk::Property(key) => Some(key.as_ref()),
+        PathChunk::Index(_) | PathChunk::Keyword(_) => None,
+    }
+}
+
+/// 只接受 JSON 里仍然是精确整数的值。f64（已经舍入）返回 `None`。
+fn exact_integer_decimal(value: &Value) -> Option<String> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    if let Some(value) = number.as_u64() {
+        return Some(value.to_string());
+    }
+    let value = number.as_i64()?;
+    if value < 0 {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 /// 这条 `Type` 错误是否期待 integer / number。
@@ -781,6 +857,65 @@ mod tests {
             r#"{"tree_id":""}"#,             // 空串
             r#"{"limit":"500"}"#,            // 转成数字后仍越界
         ] {
+            let error = p.process(call(raw)).unwrap_err();
+            assert_eq!(
+                error.kind,
+                ToolArgumentErrorKind::SchemaViolation,
+                "must still reject {raw}"
+            );
+        }
+    }
+
+    /// `generation` / `tree_id` 的 schema 是 string。无损到达的 u64 整数改成
+    /// 十进制字符串，已经是字符串的值保持不动。
+    #[test]
+    fn an_exact_integer_id_becomes_a_decimal_string() {
+        let p = pipeline(json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "generation": {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
+                "tree_id": {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"}
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }));
+        let generation = 17902492282727121041u64;
+        let from_number = p
+            .process(call(&format!(
+                r#"{{"action":"key","generation":{generation}}}"#
+            )))
+            .unwrap();
+        assert!(from_number.syntax_repaired);
+        assert_eq!(
+            from_number.input["generation"].as_str(),
+            Some(generation.to_string().as_str())
+        );
+
+        let from_string = p
+            .process(call(&format!(
+                r#"{{"action":"key","tree_id":"{generation}"}}"#
+            )))
+            .unwrap();
+        assert!(!from_string.syntax_repaired);
+        assert_eq!(
+            from_string.input["tree_id"].as_str(),
+            Some(generation.to_string().as_str())
+        );
+    }
+
+    /// 舍入后的浮点、以及名字不是 id 的字符串字段，都不能被改写成数字或字符串。
+    #[test]
+    fn rounded_floats_and_ordinary_string_fields_are_not_rewritten() {
+        let p = pipeline(json!({
+            "type": "object",
+            "properties": {
+                "generation": {"type": "string"},
+                "command": {"type": "string"}
+            },
+            "additionalProperties": false
+        }));
+        for raw in [r#"{"generation":1.5}"#, r#"{"command":1}"#] {
             let error = p.process(call(raw)).unwrap_err();
             assert_eq!(
                 error.kind,

@@ -1135,8 +1135,8 @@ struct ChatRenderCtx<'a> {
     /// `Ctrl+O` 手动强制展开**所有**可折叠正文：thinking 块与工具调用结果。
     ///
     /// `false` 不是「全折叠」而是**自动模式**——正在流式输出的 thinking 与正在
-    /// 执行的工具实时展开，跑完立即收起，因此最终判定是 `output_expanded || is_live`。
-    /// 折叠态一律不得触碰 `content`（见 `render_thinking_block` 的 `live` 分支）。
+    /// 执行的工具实时展开，跑完立即收起。thinking 收起后只留一行尾部摘要
+    /// （见 `thinking_fold_summary`），不做全文重排。
     output_expanded: bool,
     /// 正在执行中的工具调用的实时输出：`sequence_no` → 累计输出的尾部快照。
     ///
@@ -1310,17 +1310,55 @@ fn clean_thinking_lines(content: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 纯围栏行（` ``` ` / `~~~`，允许行尾空白）。它们是排版标记，不是想法。
+fn is_fence_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(marker) = trimmed.chars().next().filter(|c| *c == '`' || *c == '~') else {
+        return false;
+    };
+    trimmed.chars().take_while(|c| *c == marker).count() >= 3
+        && trimmed
+            .chars()
+            .skip_while(|c| *c == marker)
+            .all(|c| c.is_whitespace())
+}
+
+/// 折叠态摘要：取最后一行有效思考，压成单行并按显示宽度截断。
+///
+/// 跳过纯围栏行——它们是排版标记，不是想法。行内换行压成空格，避免摘要
+/// 自己再占一行。空思考（或只剩围栏）返回 `None`，调用方就不画这行。
+///
+/// 用 `rsplit` 惰性取尾而不是 `clean_thinking_lines`：折叠态每帧都会渲染，
+/// 历史里十几段 thinking 全量 trim 一遍纯属浪费，而通常倒数第一两行就是答案。
+fn thinking_fold_summary(content: &str, max_cols: usize) -> Option<String> {
+    let line = content
+        .rsplit('\n')
+        .map(str::trim_end)
+        .find(|line| !line.trim().is_empty() && !is_fence_line(line))?;
+    let flat: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    let width = max_cols.max(1);
+    let flat_width: usize = flat.chars().map(char_display_width).sum();
+    Some(if flat_width <= width {
+        flat
+    } else {
+        truncate_line(&flat, width)
+    })
+}
+
 /// thinking 块的两个态（`ThinkingRenderOpts.live`）：
 ///
-/// - **流式中**：一行状态 + 尾部 [`LIVE_TAIL_LINES`] 行思考正文，跑完即消失。
-/// - **定稿后**：折叠成一行元信息（耗时 + 行数 + 展开提示），Ctrl+O 展开全文。
+/// - **流式中**：一行状态 + 尾部 [`LIVE_TAIL_LINES`] 行思考正文，跑完即收起。
+/// - **定稿后**：折叠成一行元信息（耗时 + 行数 + 展开提示），下面再留
+///   最后一句有效思考当摘要。Ctrl+O 展开全文。
 ///
-/// 旧实现是"固定显示前 3 行 + ` · N lines` 标记"，有三个问题：`✻`(U+273B,
-/// Dingbats) 在终端字体里常缺字形画成豆腐块；`N lines` 数的是去掉空行后的
-/// **原始**行数，与屏幕上折行后再截断到 3 行的**视觉**行数毫无对应；只取头
-/// 3 行意味着几十行思考的结论永远看不到（thinking 是流式追加的，最新结论在
-/// 尾部）。更糟的是流式期间每帧都要把整个 buf 重新折行一遍、再只取前 3 行
-/// 扔掉，纯属浪费——现在 `live` 分支只 `rsplit` 取尾部若干行，两端都不扫全文。
+/// 摘要只取尾部、不取头部：thinking 是流式追加的，收束性的那句在最后。
+/// 旧实现固定显示前 3 行，结论永远看不到；后来改成定稿后一字不留，又让
+/// 「思考完了接下来要做什么」完全取决于模型会不会接着写正文。一行尾部摘要
+/// 两边都不重踩：历史仍然不铺开，收起后至少能看到当时想到哪了。
+/// 流式分支仍然只 `rsplit` 取尾，不扫全文。
 fn render_thinking_block(
     lines: &mut Vec<Line<'static>>,
     content: &str,
@@ -1398,6 +1436,14 @@ fn render_thinking_block(
     ]));
 
     if !opts.expanded {
+        // 折叠头下面留一行尾部摘要。宽度扣掉 4 列缩进，与展开态正文对齐。
+        let summary_width = max_content_width.saturating_sub(4).max(1);
+        if let Some(summary) = thinking_fold_summary(content, summary_width) {
+            lines.push(Line::from(Span::styled(
+                format!("    {summary}"),
+                Theme::dim(),
+            )));
+        }
         return;
     }
     // 展开即全文：用户主动行为，不再截断；超出视口由既有的 chat_scroll 滚动。
@@ -6151,15 +6197,43 @@ mod tool_result_fold_tests {
         thinking.thinking_elapsed_secs = Some(1.5);
         let rendered = render_messages(&[thinking], 100);
 
-        // 折叠态只出一行头（耗时 + 行数 + 展开提示），正文一律不渲染
-        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        // 折叠态：一行头（耗时 + 行数 + 展开提示）+ 一行尾部摘要。
+        // 摘要取最后一句有效思考，不取开头——结论在尾部。
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert!(rendered[0].contains("1.5"), "{}", rendered[0]);
         assert!(rendered[0].contains('7'), "{}", rendered[0]);
         assert!(rendered[0].contains("Ctrl+O"), "{}", rendered[0]);
+        assert_eq!(rendered[1], "    seven");
+        assert!(
+            !rendered.iter().any(|line| line.contains("one")),
+            "折叠态不得铺开开头：{rendered:?}"
+        );
         assert!(
             !rendered[0].contains('✻'),
             "U+273B(Dingbats) 在终端字体里常缺字形画成豆腐块，改用 ⎿: {}",
             rendered[0]
+        );
+    }
+
+    #[test]
+    fn thinking_fold_summary_skips_a_trailing_fence_and_truncates() {
+        let mut thinking = message(
+            MessageRole::Thinking,
+            "开头的铺垫\n所以下一步去读 render.rs 里的折叠逻辑，确认收起后还留不留结论\n```\n",
+        );
+        thinking.thinking_elapsed_secs = Some(2.0);
+        let rendered = render_messages(&[thinking], 28);
+
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert!(
+            rendered[1].contains("所以下一步"),
+            "应跳过末尾围栏，取它前面那句：{rendered:?}"
+        );
+        assert!(!rendered[1].contains("```"), "围栏不是摘要：{rendered:?}");
+        assert!(rendered[1].contains('…'), "超出宽度应截断：{rendered:?}");
+        assert!(
+            !rendered[1].contains("开头的铺垫"),
+            "摘要不该取第一句：{rendered:?}"
         );
     }
 
@@ -6328,9 +6402,10 @@ fn foo() {}
         let thinking = message(MessageRole::Thinking, "one\ntwo");
         let rendered = render_messages(&[thinking], 100);
 
-        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert!(!rendered[0].contains("0.0s"), "{}", rendered[0]);
         assert!(rendered[0].contains('2'), "{}", rendered[0]);
+        assert_eq!(rendered[1], "    two");
     }
 
     #[test]

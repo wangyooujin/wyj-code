@@ -302,6 +302,62 @@ pub(super) fn last_user_goal(session: &Session) -> String {
         .unwrap_or_else(|| "unknown user goal".to_string())
 }
 
+/// 分类器看到的用户目标。
+///
+/// 只收真实用户提交（[`is_user_submission`]）：不含工具结果、压缩摘要和
+/// 框架提醒，也不含 assistant 的推断。最新一句是「继续」这类纯续接时，
+/// 带上最近至多 4 条提交，让「打开天气」不会被续接句盖掉。新的具体请求
+/// 只留最后一句，避免上一件事的范围继续放行。
+pub(super) fn classifier_user_goal(session: &Session) -> String {
+    const RECENT: usize = 4;
+    let mut goals = Vec::new();
+    for message in session.messages.iter().rev() {
+        if !is_user_submission(message) {
+            continue;
+        }
+        let text = submission_text(message);
+        let text = if text.is_empty() {
+            "attachment-only user goal".to_string()
+        } else {
+            text
+        };
+        goals.push(text);
+        if goals.len() == RECENT {
+            break;
+        }
+    }
+    if goals.is_empty() {
+        return "unknown user goal".to_string();
+    }
+    let latest = goals[0].clone();
+    if is_continuation_request(&latest) || latest == "attachment-only user goal" {
+        goals.reverse();
+        goals.join("\n")
+    } else {
+        latest
+    }
+}
+
+/// 一条真实提交里的用户文本。同一条消息里夹带的框架提醒整块丢掉。
+fn submission_text(message: &wyj_api::types::Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() || is_framework_user_text(trimmed) {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Memory v3 检索不能只看最后一句。把最近几个真实 user task 合并后，像“继续”
 /// “再分析一下”这样的续接请求仍然携带上一个主题，同时不把 assistant 推断当查询。
 pub(super) fn memory_query_context(session: &Session) -> String {

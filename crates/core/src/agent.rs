@@ -1707,10 +1707,12 @@ impl Agent {
         if let Ok(mut g) = self.turn_permission_grants.lock() {
             g.clear();
         }
-        // Auto 分类器判断「这一步是否在用户请求范围内」需要本轮原始请求。与
-        // 授权集同一生命周期：入口写一次，工具轮循环里读十几次。
+        // Auto 分类器判断「这一步是否在用户请求范围内」需要本轮原始请求。
+        // 「继续」单独一句会把上一句点名的应用判成越权，所以续接请求带上
+        // 最近几条真实用户提交。与授权集同一生命周期：入口写一次，工具轮
+        // 循环里读十几次。
         if let Ok(mut goal) = self.turn_user_goal.lock() {
-            *goal = last_user_goal(session);
+            *goal = classifier_user_goal(session);
         }
         // system prompt 分两段，见 `wyj_api::SystemPrompt` 的文档：
         //

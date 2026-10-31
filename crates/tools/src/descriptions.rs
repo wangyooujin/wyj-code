@@ -9,7 +9,7 @@ pub const WRITE: &str = "Writes content to a file, replacing anything already th
 
 pub const EDIT: &str = "Performs an exact string replacement in a file. You MUST Read the file first — old_string has to match the current content exactly, including indentation and whitespace. old_string must be unique in the file, or set replace_all=true to replace every occurrence. If the match fails, re-Read the file and adjust. Prefer this over `sed -i` in Bash.";
 
-pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. When a command must search file contents anyway (filtering a live stream, a pipe stage, matching command output), use `rg`, never `grep` — never emit `grep` in a command. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s); for processes meant to keep running (dev servers, watchers), set run_in_background=true and read output later with BashOutput. Commands run inside the OS sandbox by default. For a host integration the sandbox intentionally cannot express — for example macOS `open -a` or Windows `start` to launch a desktop application — set run_outside_sandbox=true. That path requires a separate one-shot interactive approval, cannot be persisted, and fails closed in plan mode, headless, scheduled, hook, and sub-agent execution. Never use it merely to bypass an unexplained command failure or after the user denies approval. Output over 30KB is truncated keeping head and tail.";
+pub const BASH: &str = "Executes a command in the system shell and returns stdout/stderr. Use it for builds, tests, git, and package managers. Do NOT use it for file reading or searching — use Read/Grep/Glob instead, they are faster and formatted for you. When a command must search file contents anyway (filtering a live stream, a pipe stage, matching command output), use `rg`, never `grep` — never emit `grep` in a command. Use absolute paths and avoid `cd`. Quote paths containing spaces. Long-running commands are killed at the timeout (default 120s, max 600s); for processes meant to keep running (dev servers, watchers), set run_in_background=true and read output later with BashOutput. Launching a desktop application is an ordinary command (macOS `open -a \"App Name\"`, Windows `start \"\" \"App Name\"`) and uses the same approval as any other command. Output over 30KB is truncated keeping head and tail.";
 
 pub const GLOB: &str = "Finds files by glob pattern (`**/*.rs`, `src/**/*.test.ts`, ...). Respects .gitignore. Returns absolute paths. Use this instead of `find` in Bash. Can run in parallel with other read-only calls.";
 
@@ -47,21 +47,13 @@ pub const COMPUTER: &str = "Foreground compatibility computer-use tool. Read-onl
 /// 裁剪证实的内容"；`computer` 不绑定窗口、作用于当前最前台窗口，因此切到
 /// 它之前必须先把目标 App 切到最前台，否则会点到/截到叠在上面的其它窗口
 /// （包括模型自己所在的终端）。
-const COMPUTER_CUSTOM_TEMPLATE: &str = "LEGACY FOREGROUND COMPATIBILITY TOOL. Prefer `window_capture` + `app_computer`: those tools bind actions to a stable application window and do not move the user's pointer or activate an app. This tool takes full-desktop screenshots and, for mutations, synthesizes GLOBAL mouse/keyboard input. Foreground mutation is disabled by default and may return `requires_foreground_takeover`; never retry that error automatically and never treat it as permission to fall back from `app_computer`.\n\nScreenshots are returned at {width}x{height} pixels — every coordinate you pass (`coordinate`/`start_coordinate`/`region`) MUST be within that space and is rescaled to the real display. A mutation requires a foreground observation established by a prior `screenshot`; that observation stays valid across multiple mutations (e.g. click a field, then `type` into it) as long as the focused window genuinely hasn't changed — it does NOT need to be refreshed before every single action. Take a new `screenshot` only after `target_changed`, or after roughly 20 actions (you'll be told to). Exact external-input monitoring gives the human absolute priority; stop on `target_changed`, `user_active`, `preempted_by_user`, `input_monitor_unavailable`, or `screen_locked`. Do not retry any of those results automatically.\n\nThe full-desktop screenshot is downscaled. Before reading precise small text, numbers, or anything that looks like configuration/diagnostic output, call `zoom` on the region instead of guessing — never report a value, error code, or file content as fact unless you actually read it in a tool result or a zoomed crop; say so plainly if it stays illegible instead of inventing plausible text. This tool has no target window: every action hits whatever is actually frontmost, so before clicking, dragging, or zooming on a specific app, first confirm that app is the frontmost window (re-activate it, e.g. `open -a \"App Name\"`) — an overlapping window, including your own terminal, is what gets hit otherwise. To open an application, prefer Bash and then observe it. Reading the user's own on-screen messages/documents is an ordinary screenshot task and needs no application API.\n\nActions:\n- `screenshot`: capture the desktop and (re)establish the foreground observation later mutations are validated against.\n- `zoom`: high-fidelity crop; requires `region: [x0, y0, x1, y1]`.\n- `cursor_position`: report the global cursor in the {width}x{height} space.\n- `wait`: pause; optional `duration` (default 1, max 5 seconds).\n- `mouse_move`: global pointer move; requires `coordinate`.\n- `left_click` / `right_click` / `middle_click` / `double_click`: global click; optional `coordinate`, optional modifier combo in `text`.\n- `left_click_drag`: global drag; requires end `coordinate`, optional `start_coordinate`.\n- `key`: global key combo in `text`.\n- `type`: global text in `text`, sent in small preemptible chunks.\n- `scroll`: global scroll; requires `scroll_direction`, optional `coordinate` and `scroll_amount`.";
+const COMPUTER_CUSTOM_TEMPLATE: &str = "LEGACY FOREGROUND COMPATIBILITY TOOL. Prefer `window_capture` + `app_computer`: those tools bind actions to a stable application window and do not move the user's pointer or activate an app. This tool takes full-desktop screenshots and, for mutations, synthesizes GLOBAL mouse/keyboard input. Foreground mutation is disabled by default and may return `requires_foreground_takeover`; never retry that error automatically and never treat it as permission to fall back from `app_computer`.\n\nScreenshots are returned at {width}x{height} pixels — every coordinate you pass (`coordinate`/`start_coordinate`/`region`) MUST be within that space and is rescaled to the real display. A mutation requires a foreground observation established by a prior `screenshot`; that observation stays valid across multiple mutations (e.g. click a field, then `type` into it) as long as the focused window genuinely hasn't changed — it does NOT need to be refreshed before every single action. Take a new `screenshot` only after `target_changed`, or after roughly 20 actions (you'll be told to). Exact external-input monitoring gives the human absolute priority; stop on `target_changed`, `user_active`, `preempted_by_user`, `input_monitor_unavailable`, or `screen_locked`. Do not retry any of those results automatically.\n\nThe full-desktop screenshot is downscaled. Before reading precise small text, numbers, or anything that looks like configuration/diagnostic output, call `zoom` on the region instead of guessing — never report a value, error code, or file content as fact unless you actually read it in a tool result or a zoomed crop; say so plainly if it stays illegible instead of inventing plausible text. This tool has no target window: every action hits whatever is actually frontmost, so before clicking, dragging, or zooming on a specific app, first confirm that app is the frontmost window (re-activate it with Bash, e.g. `open -a \"App Name\"`) — an overlapping window, including your own terminal, is what gets hit otherwise. To open an application, use Bash and then observe it. App launch is an ordinary shell command and uses the same approval as any other Bash command. Reading the user's own on-screen messages/documents is an ordinary screenshot task and needs no application API.\n\nActions:\n- `screenshot`: capture the desktop and (re)establish the foreground observation later mutations are validated against.\n- `zoom`: high-fidelity crop; requires `region: [x0, y0, x1, y1]`.\n- `cursor_position`: report the global cursor in the {width}x{height} space.\n- `wait`: pause; optional `duration` (default 1, max 5 seconds).\n- `mouse_move`: global pointer move; requires `coordinate`.\n- `left_click` / `right_click` / `middle_click` / `double_click`: global click; optional `coordinate`, optional modifier combo in `text`.\n- `left_click_drag`: global drag; requires end `coordinate`, optional `start_coordinate`.\n- `key`: global key combo in `text`.\n- `type`: global text in `text`, sent in small preemptible chunks.\n- `scroll`: global scroll; requires `scroll_direction`, optional `coordinate` and `scroll_amount`.";
 
 /// 按当前截图目标分辨率渲染 [`COMPUTER_CUSTOM_TEMPLATE`]。
 pub fn computer_custom_description(target_width: u32, target_height: u32) -> String {
     COMPUTER_CUSTOM_TEMPLATE
         .replace("{width}", &target_width.to_string())
         .replace("{height}", &target_height.to_string())
-        .replace(
-            "(re-activate it, e.g. `open -a \"App Name\"`)",
-            "(re-activate it with Bash, e.g. `open -a \"App Name\"` plus `run_outside_sandbox=true`)",
-        )
-        .replace(
-            "To open an application, prefer Bash and then observe it.",
-            "App launch is a host OS side effect: use Bash with `run_outside_sandbox=true`, accept only its separate one-shot approval, and stop if that approval is unavailable or denied; then observe the app.",
-        )
 }
 
 // ── schema 字段描述（各工具 input_schema 里复用的英文文案）──────────────────
@@ -126,10 +118,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn computer_hint_routes_app_launch_through_one_shot_host_approval() {
+    fn computer_hint_launches_apps_as_ordinary_bash() {
         let description = computer_custom_description(1280, 720);
-        assert!(description.contains("run_outside_sandbox=true"));
-        assert!(description.contains("separate one-shot approval"));
-        assert!(!description.contains("To open an application, prefer Bash and then observe it."));
+        assert!(
+            description.contains("ordinary shell command"),
+            "{description}"
+        );
+        assert!(description.contains("same approval"), "{description}");
+        assert!(
+            !description.contains("run_outside_sandbox"),
+            "{description}"
+        );
+        assert!(!description.contains("OS sandbox"), "{description}");
+        assert!(BASH.contains("ordinary command"));
+        assert!(!BASH.contains("run_outside_sandbox"));
+        assert!(!BASH.contains("OS sandbox"));
     }
 }

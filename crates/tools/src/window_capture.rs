@@ -20,7 +20,7 @@ impl WindowCaptureTool {
     }
 }
 
-const DESCRIPTION: &str = "Discovers and captures application windows without activating them, moving the pointer, or changing keyboard focus. Start with action `list` (optionally filter with `query`), then call `capture` with the exact `window_id`. The capture result includes a `generation`; pass both `window_id` and `generation` to `app_computer` background actions. If generation changes, discard old coordinates and capture again. A legacy call containing only `query` is treated as capture-by-query for compatibility, but stable IDs are preferred.";
+const DESCRIPTION: &str = "Discovers and captures application windows without activating them, moving the pointer, or changing keyboard focus. Start with action `list` (optionally filter with `query`), then call `capture` with the exact `window_id`. The capture result includes `generation` as a decimal string; copy that string exactly into `app_computer` and do not send it as a JSON number (it is a u64 past 2^53 and a JSON number is rounded). A list leaves `target_width` and `target_height` at 0; the capture metadata sizes are the screenshot coordinate space, not the window's point size. If generation changes, discard old coordinates and capture again. A legacy call containing only `query` is treated as capture-by-query for compatibility, but stable IDs are preferred.";
 
 fn list_result(query: Option<&str>) -> ToolResult {
     let mut windows = match wyj_computer::target::list_windows() {
@@ -34,6 +34,7 @@ fn list_result(query: Option<&str>) -> ToolResult {
                 || window.title.to_lowercase().contains(&query)
         });
     }
+    let windows: Vec<Value> = windows.iter().map(window_for_model).collect();
     match serde_json::to_string_pretty(&serde_json::json!({
         "count": windows.len(),
         "windows": windows,
@@ -49,7 +50,7 @@ fn capture_result(window_id: u32, max_dim: u32) -> ToolResult {
         Err(error) => return ToolResult::err(format!("window_capture failed: {error}")),
     };
     let metadata = serde_json::json!({
-        "window": target,
+        "window": window_for_model(&target),
         "capture": {
             "pixel_width": capture.physical_width,
             "pixel_height": capture.physical_height,
@@ -149,9 +150,51 @@ impl Tool for WindowCaptureTool {
     }
 }
 
+/// 给模型的窗口 JSON。`generation` 必须是十进制字符串。
+///
+/// 它是 FNV-1a u64，超过 JSON 安全整数 2^53。写成 JSON number 后，任何
+/// JavaScript 解析器都会把它舍入，模型再抄回来就对不上 `validate_window_target`。
+pub(crate) fn window_for_model(target: &wyj_computer::target::WindowTarget) -> Value {
+    let mut value = serde_json::to_value(target).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "generation".to_string(),
+            Value::String(target.generation.to_string()),
+        );
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyj_computer::target::WindowTarget;
+
+    #[test]
+    fn generation_is_emitted_as_an_exact_decimal_string() {
+        let target = WindowTarget {
+            window_id: 4303,
+            pid: 1,
+            app_name: "Weather".into(),
+            title: "天气".into(),
+            x: 0,
+            y: 0,
+            width: 1400,
+            height: 860,
+            target_width: 0,
+            target_height: 0,
+            generation: 17_902_492_282_727_121_041,
+            focused: false,
+        };
+        let value = window_for_model(&target);
+        assert_eq!(
+            value["generation"],
+            serde_json::json!("17902492282727121041")
+        );
+        assert!(value["generation"].is_string());
+        assert_eq!(value["target_width"], 0);
+        assert_eq!(value["target_height"], 0);
+    }
 
     #[test]
     fn definition_exposes_stable_window_workflow() {
@@ -162,5 +205,6 @@ mod tests {
             definition.input_schema["properties"]["action"]["enum"],
             serde_json::json!(["list", "capture"])
         );
+        assert!(definition.description.contains("decimal string"));
     }
 }
