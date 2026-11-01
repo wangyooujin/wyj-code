@@ -3342,6 +3342,11 @@ fn app_computer_registered(_cfg: &Config) -> bool {
 /// OpenAI 由 `openai.rs::to_api_messages` 摘出来后置成 user 消息）。只有
 /// `vision=false` 时才用 `without_image_channel()` 把附图整个撤掉、并在描述末尾
 /// 追加 `NO_IMAGE_CHANNEL_NOTE`，免得模型照着「读附带截图」的描述去编造画面。
+///
+/// 调用点在 macos-only 的 `register_app_computer_tool_if_enabled` 里，非 macOS
+/// 正式编译时无人调用会被 `-D warnings` 判成 dead code，故加 `any(test, ...)`
+/// 让 `the_image_channel_is_vision_only` 在各平台都能跑到它。
+#[cfg(any(test, target_os = "macos"))]
 fn app_computer_image_channel(cfg: &Config) -> bool {
     cfg.active_profile().vision
 }
