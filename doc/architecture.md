@@ -375,7 +375,7 @@ Checkpoint 支持：
 
 - 为什么需要这条通路：提示词若只禁止模型自行检索目录、却不给它名单，模型唯一既诚实又不违规的回答就是把禁令复述给用户。子 Agent 类型早就通过 `SUB_AGENT_TEMPLATE.replace("{types}", …)` 走了同一条路，skill 之前缺的就是这个出口。
 - 名单**落在 system prompt 的 stable 段、会话内冻结**，因此 prompt cache 照常命中；代价是 `/skills` 面板中途禁用某个 skill 后本会话名单不更新。
-- 仍**不做 `Skill` 工具化**：skill 正文经 `tool_result` 回传会被 `persist_cap` 截断（超长 SKILL.md 会让模型读到残缺指令）、`allowed-tools` 在 `Tool::run` 层拿不到通道、子 Agent 会误继承、marketplace skill 无信任门控。详见 `CLAUDE.md` 架构节第 23 条的五条权衡。
+- 仍**不做 `Skill` 工具化**：skill 正文经 `tool_result` 回传会被 `persist_cap` 截断（超长 SKILL.md 会让模型读到残缺指令）、`allowed-tools` 在 `Tool::run` 层拿不到通道、子 Agent 会误继承、marketplace skill 无信任门控。详见 `crates/core/CLAUDE.md` 里「不要做 Skill 工具」那条。
 
 ### Agent 定义
 

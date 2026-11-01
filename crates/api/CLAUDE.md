@@ -1,115 +1,34 @@
-# crates/api 规约
+# crates/api
 
-本文件是 `crates/api/CLAUDE.md`。**按目录惰性加载**：只有当工具触达
-`crates/api/` 下的文件时，加载器才把它拼进 system prompt
-（`core::claude_md::ClaudeMdLoader::maybe_dir_reminder`，按目录去重、每会话只展示一次）。
-根目录 `CLAUDE.md` 只留跨 crate 的通则与索引，本目录的实现细节全部沉在这里。
+Provider、SSE、能力表。改 thinking 或 vendor 时先确认 `ThinkingSpec::for_vendor` 有对应臂，再改 adapter。adapter 单测绕开 catalog；新行为要有从 profile 走到 adapter 的端到端测试。
 
+## vendor
 
-## vendor 推断：全仓唯一一份
+`infer_vendor`（`models.rs`）是全仓唯一一份。`Profile.vendor` / `wire_protocol` 已删除，线协议由 `provider` 决定。顺序不能调：
 
-`Profile.vendor` 配置项**已移除**（v0.3.16），vendor 一律由 `base_url` + 模型名**推断**，
-实现只有一份：`api/src/models.rs::infer_vendor(profile, model)`。
+1. 本地端点（ollama 端口 11434，vLLM 路径或端口 8000）先于模型名。`qwen3-coder` 跑在本地不能认成阿里云。vLLM 默认 URL 不含 "vllm" 字样。
+2. `base_url` 为空 → provider 的官方端点。必须在「模型名带 `/` 或 `:`」之前，否则 OpenAI 微调 ID 会被当成聚合路由。
+3. 域名精确或子域命中 `VENDOR_DOMAINS`。不要用子串（`z.ai` 会误伤 `siz.ai`）。
+4. 聚合路由：域名特征词，或模型名带 `/`、`:` → `"custom"`。中转端点不认厂商专属字段，发了会 400。
+5. 模型名 needle。兜底必须是 `"custom"`，不能是 `"anthropic"`。
 
-**为什么必须收敛成一份**：这份实现此前存在**三份互不一致的副本**——`model_catalog.rs`、
-`openai.rs`、`anthropic.rs` 各写一份，needle 表与兜底各不相同（`openai.rs` 缺
-`api.openai.com` 判定，`anthropic.rs` 缺 deepseek/qwen/volcengine/ollama/vllm 且兜底
-返回 `"anthropic"`）。那时无害，因为 `Profile.vendor` 显式写死时三者拿到同一个值；
-**字段一移除三者立刻分歧**——最直接的后果是官方 OpenAI 端点在 `openai.rs` 里被推成
-`"custom"`，于是 `uses_max_completion_tokens` 误判为「非官方 OpenAI」，把
-`max_tokens` 而不是 `max_completion_tokens` 发出去，官方 reasoning 模型直接 400。
+## 缓存分段
 
-**五条分层规则**（顺序本身就是不变式，改动时必须连带想清楚先后）：
+前缀顺序 `tools → system → messages`。tools 只增不减。system 任何字节变化都让 messages 断点失效。能进历史就别进 system。断点打在 stable 段末尾。辅助调用（记忆、标题、evolution）用 `SystemPrompt::stable_only`。`capabilities.prompt_cache.value` 是缓存开关的唯一真相源。
 
-1. **本地端点**（ollama 靠端口 11434，vLLM 靠路径或端口 8000）→ 本地推理。
-   必须排在 needle 表之前：它们的模型名往往含 `qwen`（`qwen3-coder`），
-   先跑 needle 表会被认成阿里云。vLLM 的默认地址 `http://127.0.0.1:8000/v1`
-   **不含 "vllm" 字样**——只靠路径匹配的话它会掉进 needle 表，正是旧模板靠
-   显式 `vendor = "vllm"` 兜住、移除该字段后暴露出来的洞。
-2. **`base_url` 留空** → `provider` 的官方默认端点。无歧义，且必须排在
-   「模型名带命名空间」之前：OpenAI 的微调模型 ID 带冒号
-   （`ft:gpt-4o:acme:123`），顺序反了会被误判成聚合路由。
-3. **端点域名命中厂商官方域名表**（`VENDOR_DOMAINS`，**精确匹配**或子域
-   匹配，不用子串包含——`z.ai` 子串匹配会误伤 `siz.ai`）→ 该厂商。
-   这一层无歧义，排在模型名规则之前正是为了让「厂商官方端点 + 带前缀的
-   模型名」仍走厂商臂。
-4. **聚合路由 / 模型中转** → `"custom"`。两条判据取或：域名特征词
-   （`router` / `oneapi` / `newapi` / `siliconflow` / `openscale` …）**或**
-   **模型名带命名空间分隔符**（`/` 或 `:`）。
-   理由：OpenRouter 这类中转端点的模型 ID 带厂商前缀
-   （`minimax/minimax-m3.1-flash:free`），按模型名认厂商就会给不认
-   `thinking.type` / `reasoning_split` / `output_config.effort` 的中转端点
-   发厂商专属字段 → **400**。「带分隔符」这条覆盖了词表穷举不到的域名。
-   **代价（信息损失）**：中转端点若用**无前缀**的模型 ID
-   （`deepseek-v4.1-flash`），就与厂商官方端点再也区分不开——旧配置里靠显式
-   `vendor = "custom"` 兜住的那个信息随字段移除而消失，只能靠域名特征词兜。
-5. **模型名 needle**（三方并集，宁可多认一个也不要让同一端点在两处推成不同
-   结果）→ 该厂商。兜底到这里说明端点不是任何厂商的官方域名（自建代理 /
-   公司网关），按模型名猜——与旧实现同源。
-   **兜底必须是 `"custom"`**：「认不出来」与「认成 anthropic 官方」是两回事，
-   后者会误开官方端点专属的行为（interleaved beta / `max_completion_tokens` /
-   五档 effort）。
+## Thinking
 
-线协议（`wire_protocol`）配置项**同步移除**，由 `provider` 唯一决定
-（`Profile::effective_wire_protocol`）。`WireProtocol` 枚举本身保留
-（`OpenAiResponses` / `QwenNative` / `Gemini` 变体），只是没有配置入口了。
-
-**移除字段时必须验证「零行为变化」**：推导结果要与用户原先手写的 `vendor`
-**逐条一致**。钉子 `a_real_users_profiles_resolve_to_the_same_vendors_as_before`
-用一位用户真实 config.toml 的 6 个分组样本（含 4 个聚合路由）逐条比对。
-
-## System prompt 分段与 prompt cache
-
-
-21. **System prompt 拆 stable / volatile 两段（v0.2.25+）**：修 Anthropic prompt cache 自我击穿。`Provider::stream/complete` 的 `system` 参数从 `&str` 改为 `&SystemPrompt<'_>`（`api/src/provider.rs`，含 `stable_only()` / `combined()` / `is_empty()`）。**背景**：旧签名迫使整个 system 压成一个字符串，Anthropic 侧只能发单个 text 块且断点打在块尾，而 system 里混了大量每轮会变的内容（工具可用性、模型兼容 suffix、Project Brief），任一变化都让整段 1.6k~5k token 全价重算。**注意**：旧注释"reminder 只增不减、前缀仍可缓存"是**错的**——追加在断点之后同样改写前缀哈希。`build_system_blocks()` 只在 stable 块末尾打 `cache_control: EPHEMERAL`；断点预算 system 1 + tools 1 + 历史 1 = 3（Anthropic 上限 4）。OpenAI 侧无 system 块概念，用 `combined()` 拼成单条 system 消息。辅助 LLM 调用（记忆提取 / 标题摘要 / Evolution 候选提取）一律 `SystemPrompt::stable_only(...)`。**记忆快照分桶**：`MEMORY_SNAPSHOT_REFRESH_TURNS = 10`，Project Brief 按用户提交次数 / 10 分桶缓存（`user_submission_count`，不含工具结果——按 `Role::User` 计数会把一次长任务里的分桶打穿；原本每轮重算相关性排序并拼进稳定前缀，等于每轮改写前缀）——代价是新提取的记忆最迟 10 次提交后可见。
-
-    **缓存前缀的物理顺序是 `tools → system → messages`**（Anthropic 官方文档），这决定了「哪些内容能放进 system」：
-
-    - **tools 在最前端**，官方明写「会话中途增删或重排 tools 会让 tools 缓存**及其后的 system、messages 全部失效**」。故请求里的工具数组必须**单调不减**（实现见 `core::tool_search::LazyToolState::exposed`）。
-    - **system 位于 messages 之前**，而 messages 断点覆盖「tools + system + messages 前缀」。因此 **system 段任何字节变化都会让 messages 断点失效**，整段历史全价重算——「volatile 在 stable 断点之后所以只影响 stable」是**不完整的**推论。凡是每轮可能变的内容都不该待在 system 段（子目录 AGENTS.md reminder 已改注入历史，见 `crates/core/CLAUDE.md` 第 5 条）。
-    - 结论：**能进历史就别进 system**。历史注入只让「新增那一小段」全价，system 注入让「整段历史」全价。
-
-
-## Thinking 的跨轮回传
-
-**两条 provider 路径对推理内容的回传语义完全不同，改任一侧都要先看这段。**
-
-22. **请求侧的 thinking 形态由 vendor × 线协议共同决定，且两家原生形态互不兼容**（`thinking.rs::apply_anthropic_thinking` → `AnthropicThinkingPatch`）。**背景**：Anthropic 路径原先无条件发 `{type:"enabled", budget_tokens:N}`，这对官方 Anthropic 是对的，对 MiniMax 的 `/anthropic` 端点则是两个都不认的死字段——它的 `budget_tokens` 没有语义，思考深度由 `output_config.effort`（`low/medium/high/xhigh/max`）档位控制，于是 profile 里的 `reasoning_effort` 成了**从未上送的死配置**（改配置毫无效果，且碰巧默认 max 掩盖了问题）。端点只承认三种 `thinking.type`：**省略** / `adaptive` / `disabled`，三者的语义还随代际变：
-
-   | 模型 | 省略 | `adaptive` | `disabled` |
-   |---|---|---|---|
-   | M3.1-Flash-Preview | 开 | 开 | **400** |
-   | M3 | 关 | 开 | 保持关 |
-   | M2.x | 开 | 开 | 接收但不生效 |
-
-   因此 adapter 的硬约束是：绝不发 `enabled` / `budget_tokens`；`disabled` 只在 M3 上真能生效，M3.1 发它会 400、M2.x 发了也无效，两者一律降级成「不发 thinking 字段」；`effort` 只在 M3.1 上送且必须命中支持档位。**被否决的配置项不会静默丢弃**——进 `patch.ignored`，provider 打 warn，否则用户会一直以为配置生效了。**注意**：`max_tokens` 被抬高到 `budget+4096` 的兜底只对含 `budget_tokens` 的形态生效，MiniMax 的 adaptive 形态不受此约束；该兜底读的是 `patch.budget`（结构化 `Option<u32>`），**不是**从 `patch.thinking` 这个 `Value` 里反解键名——那是一次字符串往返，adapter 改个键名就会静默失效而后果是端点 400。
-
-   **开/关只认显式 `thinking_switch`，`thinking_budget` 一律不算信号。**「被忽略的参数」不得反过来改变行为：若拿 budget 去翻开关，就会出现「一边记 `ignored`、一边按它改行为」的自相矛盾，且对 M3 是把思考从默认关翻成开这种用户没要求的行为翻转。切勿用 `effective_switch_type()`（它含「配了 budget/effort ⇒ 想开」的推断）判断这件事，用 `explicit_switch()`。
-
-   - **⚠️ 真正的坑不在 adapter，在 catalog 层：adapter 写得对也可能是死代码。**`request_plan` 与 `agent.rs` 都以 `ThinkingSpec::for_vendor(...).effort_levels` 为唯一判据决定 `reasoning_effort` 是否放行，而 `ThinkingSpec::for_vendor` 一旦漏了某条 `(wire, vendor)` 组合（MiniMax + `AnthropicMessages` 曾经就漏着，落到 `anthropic_compatible()` 的 `effort_levels: &[]`），profile 里的 effort 会在**到达 provider 之前**被丢成 `DroppedParameter`，`output_config` 分支永不执行。现已补 `(AnthropicMessages, "minimax")` 臂（`ThinkingSpec::minimax_anthropic`）。**改任何 vendor × 线协议的 thinking 形态时，先确认 for_vendor 有对应臂，再写 adapter。**
-   - **`ThinkingSpec::effort_levels` 是档位判据的唯一真相源**，adapter 一律调 `normalize_effort()`（这也是 `apply_anthropic` 为什么要收 `identity` 参数），禁止在 adapter 里维护第二份白名单。
-   - **模型名分派只认版本段，不认营销词**：`is_minimax_m31_flash` 只匹配 `m3.1` / `m3-1` / `m31`。早先还带 `contains("flash")`，会把将来的 `M2.x-Flash` 误路由到 M3.1 从而白发 `output_config.effort`——分派错误在这里是 400 级事故。
-   - **旧 config 里「budget + effort」都配**时，`budget_tokens_supported: false` 曾让 `request_plan` 的 match 臂在 budget 上短路成 `Disabled`，把 effort 连坐丢掉（用户只看到一条 thinking_budget dropped，reasoning 实际已整条关闭）。现已改为 budget 记 dropped 后继续走 effort 分支，`minimax_anthropic_spec_refuses_budget_but_keeps_effort` 锁住。
-   - **官方 Anthropic 也支持 effort，且 budget 与 effort 可共存**（v0.3.15 补）。`AnthropicNativeAdapter` 此前只认 `thinking.budget_tokens`、从不读 `opts.reasoning_effort`——`reasoning_effort` 在 Anthropic 线上是**死配置**（用户配了只看到一条 dropped，改配置毫无效果），与同一份 profile 换到 OpenAI 线 effort 生效形成尖锐对比。官方协议现已原生支持 `output_config.effort`（与 MiniMax `/anthropic` 端点同构），修法：① `ThinkingSpec::anthropic_native(model)` 按**型号**给档位集合（`anthropic_effort_levels`）——Opus 4.8/4.7/5 系五档全量、Opus 4.6/Sonnet 4.6 到 max、Opus 4.5/Sonnet 4.5 到 high、3.x/4.0 不支持；② adapter 把 effort 发成 `output_config.effort`；③ `ThinkingSpec::budget_and_effort_coexist` 表达「两旋钮控不同维度」，为 true 时 `request_plan` 走新变体 `ReasoningRequest::BudgetAndEffort` 同时下发两者（官方文档明确说 effort 与 thinking 可以一起用：budget 限**思考**的 token 数，effort 限**整个响应**的投入档位）。互斥端点（Qwen 协议明确禁止同传）行为**不变**。
-   - **版本号解析只认 1 位次版本**（`model_version_segment`）：真实型号的次版本都是一位（4.5/4.6/4.7/4.8/5.5），日期段是 8 位（`claude-opus-4-20250514`）。不设这道闸，`claude-3-5-sonnet-20241022` 这种把日期排在系列名**之后**的老命名会把 20241022 当主版本，于是 3.5 型号被误判成「5 系 → 五档全量」。
-   - **⚠️ manual extended thinking 必须按型号判定，不能无条件开**（v0.3.25 修 P0）。官方已把 `thinking: {type:"enabled", budget_tokens:N}` 标为 **legacy**：「Claude 4.7 and later models do not support it and reject requests that use it, returning a 400 error」。`ThinkingSpec::anthropic_native()` 的 `budget_tokens_supported` 此前是无条件 `true`，只有 `effort_levels` 按型号分了档——**同一份协议事实被拆成两半处理**：`claude-opus-4-8` 的 effort 档位表知道它该走 effort，budget 分支却照发 `enabled`。现在由 `anthropic_manual_thinking(model)` 统一判（4.6 及更早 = manual、4.7+ = adaptive；版本段无法解析的老命名一律按 manual，因为 3.x/4.0 确实只有这一种形态）。`request_plan` 据此把 4.7+ 上的 `thinking_budget` 记成可见的 `dropped_parameters`，`AnthropicNativeAdapter` 兜底再记一次 `ignored` 并打 warn。钉子：`anthropic_manual_thinking_is_per_model` / `adaptive_models_never_send_budget_tokens` / `adaptive_anthropic_drops_thinking_budget_visibly`（request_plan 层）。
-   - **adaptive 代际的 `thinking_switch = "disabled"` 必须真的下发 `{type:"disabled"}`**。旧 `AnthropicNativeAdapter` 从不发这个字段，而它的告警判据是 `switch_says_off(opts) != budget.is_none()`——`disabled` + 无 budget 时两边都是 `true`，**判等成立 → 不进 ignored**。结果是用户配了关思考，字段没发（端点按默认档跑满 reasoning），日志里一条告警都没有。现在按 `anthropic_allows_disabled(model, effort)` 分三种情形：能关就发 `disabled`；`xhigh`/`max` 档位官方拒绝（400）→ 记 dropped；Claude Opus 5.5 的自适应思考**始终开启**（任何档位都 400）→ `user_can_disable` 直接为 false、面板不给「关闭思考」这一项。钉子：`adaptive_models_honour_disabled_switch` / `adaptive_models_report_disabled_when_effort_forbids_it` / `opus_5_5_thinking_cannot_be_disabled`。
-   - **Anthropic 线的思考 token 不是「端点不报」，而是 `output_tokens_details.thinking_tokens`**：`anthropic.rs::usage_event` 旧实现硬编码 `reasoning_tokens: 0`，注释写「Anthropic 不单独上报思考 token」——于是 `/cost` 的「思考占比」在 Anthropic profile 下永远缺失，与 OpenAI profile 不对称，而「这次贵在思考还是贵在正文」恰恰是最需要区分的地方。现在解析 `output_tokens_details.thinking_tokens` 并按子集口径 `min(output_tokens)` 截断（个别网关把它当独立总量报）。钉子：`thinking_tokens_are_reported_from_output_tokens_details` / `thinking_tokens_never_exceed_output_tokens`。
-   - 单测：`minimax_m31_maps_effort_to_output_config_not_budget_tokens` / `minimax_m31_refuses_disabled_instead_of_sending_a_400` / `minimax_m3_honours_disabled_and_defaults_to_off` / `minimax_m2_forces_thinking_on_and_drops_effort` / `minimax_budget_alone_never_flips_the_switch` / `minimax_explicit_switch_on_maps_to_adaptive` / `official_anthropic_keeps_the_native_budget_shape`（4.5，manual）/ `anthropic_native_reports_switch_that_budget_overrode`（4.5）/ `text_only_switch_is_honoured_on_official_anthropic_without_warning` / `official_anthropic_emits_output_config_effort` / `official_anthropic_sends_budget_and_effort_together`（4.6）/ `official_anthropic_drops_unsupported_effort_level` / `anthropic_effort_levels_are_per_model` / `anthropic_manual_thinking_is_per_model` / `adaptive_models_never_send_budget_tokens` / `adaptive_models_honour_disabled_switch` / `adaptive_models_report_disabled_when_effort_forbids_it` / `opus_5_5_thinking_cannot_be_disabled` / `official_anthropic_effort_survives_the_catalog_layer`（端到端）/ `adaptive_anthropic_drops_thinking_budget_visibly` + `effort_on_an_unsupported_anthropic_model_is_dropped_visibly`（request_plan 层）。**其中 `official_anthropic_effort_survives_the_catalog_layer` 是端到端的**（从 profile 出发走 `RequestPlan::from_profile` → `from_request_plan` → adapter）——前面那些 adapter 单测都手工构造 `RequestOptions`，恰好绕开会杀人的那一层，写新 adapter 时必须补同形状的端到端断言。
-
-- **Anthropic**：`thinking` 块连同 `signature` 原样回传（`anthropic.rs` 的 `to_api_messages`），是协议硬要求，缺了工具调用续轮被拒。
-- **thinking 不得被任何截断逻辑改写**：`core::serialize::truncate_content_block` 的 `Thinking` 分支是 no-op，`persist_cap` 的 `thinking_bytes` / `reasoning_details_bytes` 已废弃（字段保留仅为兼容旧 `config.toml`，默认值归零）。**原因**：截断文本却保留 `signature` 会让签名校验失配，`reasoning_details` 则是改 `text` 却留下 `id` / `format`，产出结构不自洽的块——且这类改写**不可逆**。体积改由 context_edit / compact 收拾（语义是「丢弃整段历史」，不留半损坏的块）。**与之相对，CAS 外部化（>16KB 落盘外置）保持启用**：它可逆，resume 时 `materialize_block_with` 会原样还原。单测 `thinking_blocks_are_never_truncated_even_above_cap`。
-- **OpenAI 官方（o 系列 / gpt-5 系）是独立一支，不能复用国产 vendor 的臂**：`ThinkingSpec::for_vendor` 的 `(OpenAiChatCompletions, "openai")` 臂此前**不存在**，一律落到 `generic_openai()` 的 `ThinkingControl::Disabled`，于是三层连锁失效——catalog 把 `capabilities.thinking` 标成 `Unsupported` → `agent.rs` 的 `blocked` 判据在**到达 provider 之前**就把 `reasoning_effort` 滤成 `None` → 即便漏过这层，`apply_thinking_to_openai_body` 也会因 `control == Disabled` 直接 return。结果是 `provider = "openai"` 的 profile 配 effort 成为**死配置**。现在 `openai_official(model)` + `OpenAiOfficialAdapter` 补上，三条硬约束：① **只发**顶层 `reasoning_effort`，绝不写 `thinking` / `enable_thinking` / `thinking_budget`（官方判成未知参数直接 400）；② `echo_back_in_messages` 必须 **false**，官方 Chat Completions 不返回也不接受回传 `reasoning_content`（照抄 DeepSeek 臂会 400）；③ 档位**不收 `minimal`**（`gpt-5.1+` 不认），`o1-mini` / `o3-mini` 早代档位集合为空 → 记成可见的 dropped。`text_only()` 辅助调用在这条线上降级成 `reasoning_effort: "low"`（**不是** `"none"`，`o1`/`o3` 不认），否则不发字段＝端点按默认档位跑满 reasoning，正是「预算被思考吃光、可见文本为空」的历史故障形态。钉子：`official_openai_effort_survives_the_catalog_layer`（端到端，从 profile 走到 adapter）/ `official_openai_drops_thinking_budget_visibly` / `official_openai_drops_unsupported_effort_level` / `official_openai_writes_reasoning_effort` / `official_openai_never_echoes_reasoning` / `official_openai_text_only_downgrades_to_low_effort` / `official_openai_early_minis_omit_reasoning_effort`。
-- **`max_tokens` 与 `max_completion_tokens` 二选一，不能同发**：官方 OpenAI 的 reasoning 模型（o1/o3/o4-mini/gpt-5.x）**只认** `max_completion_tokens`，传 `max_tokens` 会作为「不支持的参数」400；第三方（DeepSeek / MiniMax / GLM / Qwen / 火山）文档里仍是 `max_tokens`。判据 `openai.rs::uses_max_completion_tokens()` 只认官方 vendor，刻意不做「都发」的兼容——官方会把 `max_tokens` 判非法。这是一个「错了代价不对称」的判断，必须站在保守侧。
-- **响应侧有两个并存的 reasoning 字段名**：`delta.reasoning_content`（DeepSeek / GLM / Qwen 的既有约定）与 `delta.reasoning`（vLLM / SGLang / GPT-OSS / OpenRouter 的新约定，依据 vLLM RFC #27755 与 GPT-OSS 发布时 OpenAI 对 Chat Completions 的指导；迁移期 vLLM 会把 `reasoning_content` 显式置 **null**）。只认前者会让整条新线**思考永不可见**——不显示、不进历史、跨轮推理链断锚，而用户只会以为是模型没思考。`Delta` 两个字段都收，`stream_events_from_chunk` 用「非空」而非 `is_none()` 择一（有些网关发空串而非 null），**绝不拼接**（否则同一段思考 emit 两次，TUI 上重影）。注意**解析 ≠ 回传**：`echo_back_in_messages` 对 vLLM / ollama 仍为 false。钉子：`reasoning_field_is_parsed_into_thinking_delta` / `reasoning_and_reasoning_content_are_not_double_counted` / `null_reasoning_content_does_not_swallow_reasoning_field` / `empty_string_reasoning_content_does_not_swallow_reasoning_field` / `vllm_reasoning_is_visible_but_never_echoed`。
-- **一个 SSE chunk 里的多个字段必须各自独立处理**：`stream_events_from_chunk` 旧实现把 `finish_reason` / `content` / `tool_calls` 写成一条 `else if` 链，只处理第一个命中者——端点把正文（或工具参数）与 `finish_reason` 合并进同一 chunk 时，后者被静默丢弃，表现为「模型明明说了话，界面少一段正文」。现在三者**互不排斥**，发射顺序固定为 **reasoning → content → tool_calls → MessageStop**：收尾信号必须最后，否则回合收尾会盖掉同 chunk 的最后一段输出。钉子：`content_and_finish_reason_in_same_chunk_are_both_emitted` / `content_tool_calls_and_finish_reason_in_same_chunk_are_all_emitted` / `reasoning_content_and_finish_reason_in_same_chunk_are_both_emitted`。
-- **`wire_protocol = "open_ai_responses"` 目前没有实现**：`OpenAIProvider` 只会打 `/chat/completions`，所以构造期把 identity 归一到 `OpenAiChatCompletions` 并告警一次。不归一的话 `ThinkingSpec::for_vendor` 会按 Responses 查表（无对应臂 → generic → thinking 全关），且 capability_cache 的 fingerprint 与实际请求不符。钉子：`declared_responses_protocol_is_normalized_to_the_one_we_speak`。
-- **缓存状态必须从 provider 回报，自动缓存端点也不例外**：`OpenAIProvider` 此前没覆盖 `prompt_cache_state()`，用默认 0，`agent.rs` 每轮把会话刷成「未启用」——`/cost` 在 DeepSeek/OpenAI 明明命中 `cached_tokens` 时显示未启用，与 catalog 的 `Automatic` 判定、`usage_event` 已读到的缓存数三处矛盾。现在按 catalog 的 `PromptCacheMode` 回报 ON/OFF，**永不返回 `DOWNGRADED`**（那一档语义是「客户端断点被端点拒绝」，这条线不发断点）。钉子：`deepseek_endpoint_reports_cache_on` / `explicit_cache_opt_out_reports_cache_off` / `third_party_endpoint_reports_cache_off`。
-- **`interleaved_thinking` 能力判据是「用户想开 × 端点有思考能力 × Anthropic 线」，不是「配了 budget」**：旧判据 `thinking_budget > 0` 与 provider 侧脱节——`anthropic.rs` 早已改成看 `patch.thinking.is_some()`，而 MiniMax `/anthropic` 的 `adaptive` 形态由显式 switch 触发、**没有 budget**，于是 profile 开了 interleaved 却在 agent 层被置 false，beta 永远发不出。catalog 只表达「有没有这个能力」，「本次发不发」由 provider 单点判断。钉子：`interleaved_capability_follows_thinking_control_not_budget` / `interleaved_capability_stays_off_when_user_did_not_ask` / `interleaved_is_never_claimed_on_the_openai_wire`。
-- **`capabilities.max_output_tokens` 会按静态容量表夹紧**：此前它恒等于 `profile.max_tokens`，使 `request_plan` 与 `agent.rs` 里的 `.min(capabilities.max_output_tokens)` 成为恒等式——两道保护从未运行。现在命中 `known_model_capacity()` 时夹紧，未命中保持原值（不猜一个可能错的数）。钉子：`max_output_tokens_is_clamped_to_the_known_model_capacity` / `max_output_tokens_is_untouched_for_unknown_models`。
-- **`CachePolicy` 已删除**：`RequestPlan::from_capabilities` 曾算出它却**零消费者**，同一判断存在三份（catalog 的 `PromptCacheMode`、两个 provider 各自的逻辑）而只有两份生效。唯一真相源是 `capabilities.prompt_cache.value`（`reuses_prompt_prefix()` 与两个 provider 都读它）。同理 `ThinkingSpec::lock_sampling_params` 与 `body.remove("temperature"/"top_p")` 已删——请求体从不写这两个字段，remove 是空操作；请求体是否需要收敛 sampling 参数由调用方决定，不由 vendor 静态表暗改。
-- **OpenAI Chat Completions**：`reasoning_content` / `reasoning_details` 拼成 assistant 消息的**顶层字段**（不是 content 数组的一项），且**是否回传因 vendor 而异**——DeepSeek/Qwen/GLM/Doubao/Moonshot/MiniMax 要求回传（`echo_back_in_messages = true`），ollama / vllm 虽然响应里同样回填 `reasoning_content`，回传反而 400（`= false`）。这个判定由 `ThinkingResponseFields::echo_back_in_messages` 声明、`build_openai_request_body` 查表喂给 `to_api_messages`，**不是调用方传的开关**。
-- **`echo_back_in_messages` 曾长期是死字段**：字段在 `thinking.rs` 里对六家 vendor 都标了 `true`，但 `to_api_messages` 的 assistant 分支只有 `Text` / `ToolUse` 两个 match、其余走 `_ => {}` 吞掉 `Thinking`。后果不只是「少回一个字段」——跨轮**没有任何历史推理作锚点**，每轮从 system prompt 独立起跑，输出语言漂移概率显著升高。已接线，单测 `assistant_echoes_reasoning_content_when_vendor_requires_it` / `assistant_omits_reasoning_fields_when_vendor_does_not_require_echo` / `body_echoes_reasoning_for_deepseek_but_not_ollama` 双向锁死。
-- **反方向也要钉住**：字段带 `skip_serializing_if = "Option::is_none"` 且空 reasoning 不产出空字符串，多写一个未知字段就可能被第三方端点判 400。改动时**不得**为了「统一」把它挪进 content 数组或无条件序列化。
-
-**思考语言没有任何代码强制**：解析 → 累积（`agent.rs` 纯 `push_str`）→ 存储 → 渲染（`render.rs::clean_thinking_lines` 只 `trim_end` + 丢空行）全链路字节级透传，唯一的语言约束是 system prompt 里那句 "reply in the user's language ... including your extended thinking / reasoning"。因此 thinking 的语言漂移只能从 prompt 侧解决，协议层改不动。
+- 截断逻辑不得改写 thinking / `reasoning_details`。签名对不上，续轮会被拒，且不可逆。体积交给 context edit / compact。
+- 被丢弃的参数进 `patch.ignored` 并 warn，不能静默丢掉。
+- 开/关只认显式 `thinking_switch`。`thinking_budget` 不能反过来当开关。用 `explicit_switch()`，不用 `effective_switch_type()`。
+- `ThinkingSpec::effort_levels` 是档位唯一白名单。adapter 调 `normalize_effort()`，不要再维护一份。
+- 型号分派只认版本段（`m3.1` / `m3-1` / `m31`），不要加 `flash` 这类营销词。次版本只认 1 位，避免把日期段当成主版本。
+- MiniMax `/anthropic`：不发 `enabled` / `budget_tokens`。`disabled` 只在 M3 真能关；M3.1 发它会 400，M2.x 发了无效，两者改为不发该字段。`effort` 只在 M3.1 上送。
+- 官方 Anthropic：4.6 及更早才发 manual `budget_tokens`；4.7+ 拒绝它。`disabled` 在允许的型号上必须真的发出 `{type:"disabled"}`。Opus 5.5 关不掉。budget 与 effort 可共存（`BudgetAndEffort`）；互斥端点（如 Qwen）不要同发。思考 token 读 `output_tokens_details.thinking_tokens`，并 `min(output_tokens)`。
+- 官方 OpenAI：只发顶层 `reasoning_effort`，不回传 reasoning，不发 `thinking` / `max_tokens`（用 `max_completion_tokens`）。`text_only` 降到 `low`，不是 `"none"`。早期 o1-mini / o3-mini 档位为空就记 dropped。第三方仍用 `max_tokens`，两个字段不要同发。
+- OpenAI 兼容线：`reasoning_content` 与 `reasoning` 都要解析，取非空的一个，不要拼接。是否回传看 `echo_back_in_messages`（DeepSeek/Qwen/GLM/豆包/Moonshot/MiniMax 要回传；ollama/vLLM 回传会 400）。空字段不要序列化。
+- 同一 SSE chunk 里的 reasoning、content、tool_calls、finish_reason 都要发出，顺序固定，finish 最后。
+- 声明了未实现的 `open_ai_responses` 时，把 identity 归一到 Chat Completions。
+- `prompt_cache_state()` 按 catalog 回报。自动缓存端点不能回报成未启用。
+- `interleaved_thinking` = 用户想开 × 端点有思考 × Anthropic 线。不要用 `thinking_budget > 0` 当判据。
+- `max_output_tokens` 在命中 `known_model_capacity()` 时夹紧；未命中保持用户配置，不要猜。

@@ -1,12 +1,5 @@
-# crates/mcp 规约
+# crates/mcp
 
-本文件是 `crates/mcp/CLAUDE.md`。**按目录惰性加载**：只有当工具触达
-`crates/mcp/` 下的文件时，加载器才把它拼进 system prompt
-（`core::claude_md::ClaudeMdLoader::maybe_dir_reminder`，按目录去重、每会话只展示一次）。
-根目录 `CLAUDE.md` 只留跨 crate 的通则与索引，本目录的实现细节全部沉在这里。
+`mcp::bridge` 把外部 MCP server 的工具包装成 `Tool` 注册进 Agent。stdio / http 两种传输。
 
-
-## MCP 桥接
-
-
-6. **MCP 桥接**（`mcp::bridge`）：连接外部 MCP server，将其工具包装成 `Tool` trait 对象注册到 Agent。
+项目级 `mcp.toml` 的信任门控在 `crates/store/CLAUDE.md`，不在这里。提供 shell 的 MCP 工具必须接上 `hard_deny_denial()`（见根 `CLAUDE.md`）。

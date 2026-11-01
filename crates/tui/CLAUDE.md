@@ -1,299 +1,61 @@
 # crates/tui
 
-## 模块地图（2026-10-19 首次拆分 / 2026-10-20 二次拆分）
-
-| 文件 | 承载 | 说明 |
-|---|---|---|
-| `app.rs`（11829） | 状态定义 + `impl AppState` 的会话/回合生命周期 + `run_tui` / `tui_main` | 主循环**刻意保持单函数**：它是事件循环，与 agent_tx / session / 各面板状态深度耦合，拆开只会把借用冲突搬个地方 |
-| `app/events.rs`（1299） | `apply_agent_event` / `apply_sub_agent_event`：Agent 事件 → UI 状态 | 只写状态，不读终端尺寸、不排版；事件顺序不变量都在这一个函数里 |
-| `app/profile_panel.rs`（1992） | `/profile` 分组面板 | 字段表 `PROFILE_FIELD_SPECS` 是唯一真相源，渲染/键位/校验三处都从它派生 |
-| `app/model_panel.rs`（233） | `/model` 模型选择面板 | 拉端点 `/models` 列表；切换**只存内存**（不写 config、不落会话文件） |
-| `app/effort_panel.rs`（216） | `/effort` 思考档位面板 | 档位按当前模型的 `ThinkingSpec::effort_levels` 过滤；档位**随会话落盘** |
-| `app/skills_panel.rs`（1113） | `/skills` 面板 | 含 SkillHub 搜索与本地/注册表两个来源的分流 |
-| `app/mcp_panel.rs`（692） | `/mcp` 面板 | server 信任与连接状态 |
-| `app/plugins_panel.rs`（594） | `/plugins` 面板 | 插件激活/停用 |
-| `app/dialogs.rs`（1133） | AskQuestion / PlanApproval / ExecModeConfirm / SessionConflict 四个模态框 | 共享 `InProgressAnswer`；自由输入统一走 `render::freetext_line` |
-| `app/settings_dialogs.rs`（716） | Settings / Memory / Evolution 三个治理面板 | Evolution 的四视图与二次确认状态在这里 |
-| `app/clipboard.rs`（1878） | 剪贴板、附件、输入框文本操作、应用内选区 | 粘贴折叠成 `PasteBlock` 的判据见 `paste_text_should_fold` |
-| `app/tool_view.rs`（350） | 工具展示辅助：显示名、参数摘要、结果摘要 | 纯字符串整形，消息构造时算好并存下，渲染层不重算 |
-| `app/sub_agent_view.rs`（535） | 子 Agent 详情视图的数据准备：执行轨迹 → 聊天消息序列 | 只做翻译不碰绘制；详情视图复用聊天区渲染管线的唯一入口 |
-| `app/terminal.rs`（556） | 终端控制：备用屏幕、鼠标上报、滚轮路由、退出按键释放 | 直接写 ANSI 序列，是 TUI 与终端之间的全部契约面 |
-| `app/menu.rs`（246） | `InputOwner` / `FlatRow` / `ActionMenu` | 各面板共享的「方向键菜单 + 借用底部输入框」基础设施 |
-| `app/agents_panel.rs`（107） | Agents / Extensions 两个列表型面板 | 只有行选中与动作菜单，没有输入框借用 |
-| `app/navigation.rs`（584） | 选区、滚动、焦点、输入历史召回 | 动线而非数据：只读 `self`，不碰 IO |
-| `app/panels.rs`（650） | Todo / 子 Agent / 后台 Shell 面板状态与导航 | 三者共享同一条不变式：面板列出的东西必须和后台真实存活的��致 |
-| `app/util.rs`（36） | `cycle_index` / `is_new_todo_round` / `split_evenly` | 跨面板复用的纯函数 |
-| `render.rs`（7701） | 聊天区、输入框、状态栏、滚动条、排版助手 | 助手被 dialogs 依赖，留在父模块 |
-| `render/dialogs.rs`（3279） | 全部对话框与浮层 | 纯绘制，彼此不共享可变状态 |
-
-**拆分的第二波原则**：面板类代码按「一个命令一个文件」切，切分点是 `app.rs` 里的 `// ── <面板>：/<命令> 命令触发` 注释段。这些段自带完整的类型 + 键位处理 + 执行动作，**段内不引用段外的私有项**（若有，先抽到 `util.rs` 或 `menu.rs`）。整段搬走时连同它的 `#[cfg(test)] mod` 一起搬，否则测试访问的私有字段要先提升可见性——那是拆分边界切错的信号。
-
-**`tui_main`（约 5300 行）仍是已知债务**：事件循环本身没拆，理由是它没有测试覆盖，而拆循环体必然重排借用与 await 点。继续拆它之前应先补主循环级测试（当前只有 `busy_slash_tests` 的静态顺序钉子）。
-
-**拆分的边界规则**：子模块是父模块的子级，因此能访问私有字段；Rust 允许同一 crate 内把 inherent impl 拆到多个模块。被父模块调用的方法提升为 `pub(super)`，其余保持私有。**拆分是纯搬移，不改任何逻辑**——编译器会抓出所有漏改，任何需要"顺手调一下"的地方都说明切错了边界。
-
-**两个必须跟着改的清单**（漏了就是静默失去覆盖）：
-
-1. `theme_tests::production_source` 有待扫描文件白名单。**新增或移动生产文件必须登记**，否则「生产代码不许出现裸 `Color::」的守卫会悄悄漏掉整个文件。`render/dialogs.rs` 拆出时若不登记，近 3000 行绘制代码就脱离了这条规则。2026-10-20 已把 `app/` 下全部 16 个子模块补进白名单（此前只有 `app.rs` 本身在列，拆走的内容一直无人扫描），2026-10-20 新增 `app/sub_agent_view.rs` 时同步登记。**该函数对未登记文件是 `panic!` 而非静默跳过**——新增文件后第一次跑测试就会红，不会悄悄漏。
-2. 源码文本扫描类测试用 `include_str!` 定位函数。**判定函数范围必须按花括号配平**，不要用「下一个顶格 `fn ` / `/// `」这类行前缀启发式——函数体内的语句没有顶格 `fn `，那个启发式会一路扫到文件末尾。`draw_status_never_measures_width_in_chars` 曾因此把后续函数的代码当成被检验函数的正文。
-
-## 配色：全部走 `Theme` 槽位，`theme.rs` 是唯一允许定义颜色的文件
-
-**槽位按「用途」命名，不按颜色命名。** 同一个青色同时出现在 `@file` 引用、System 标记、排队提示、补全选中底色四处，它们是四种语义：亮色主题下输入提示可能要变亮、System 标记可能要变深，留一个 `cyan` 槽位就只能四处一起变。历史上 `render.rs` 里散着 70+ 处 `Color::Cyan`，插件换肤只换得动一半——这不是主题写得不好，是**根本没有主题**，那些字面量谁也管不着。
-
-**取值原则（完整色板与设计依据见 `doc/plan/color-system-redesign.md`）**：冷灰中性底 + 暖橙品牌点缀，设计基准背景 `#1E2127`。四条不能回退的取值规则：
-
-1. **层级靠明度四档，不靠增加色相**：`text`（`#D7DAE0`）> `text_dim`（`#A0A8B8`）> `inactive`（`#7A8397`）> `muted`（`#5A6274`），`border`（`#39404F`）是最弱的结构线。正文**不用纯白**，把亮度预算留给强调色。
-2. **品牌橙只出现在小面积**：assistant 前缀、工具调用行、h1、选中行前景、光标底、状态栏 `◆`。正文、工具结果、列表 bullet、代码一律不染品牌色——旧实现把橙铺到 bullet 和工具结果上，整屏偏暖且失去强调作用。
-3. **语义色成对、同明度**：`success` `#98C379` / `error` `#E06C75` / `warning` `#E5C07B` / `danger` `#E5484D`。`danger` 比 `error` 更沉更硬：前者是常驻模式标识（bypass），后者是内容失败。
-4. **全部槽位都是 RGB**。具名色（`Cyan` / `Red` / `DarkGray`）的真实 RGB 由用户终端主题决定，同屏色温对不上，且非 truecolor 降级对它们无效。`selection_fg` 也必须是 RGB，否则 `relative_luminance` 只能取中性 0.5，`ensure_contrast` 的判断失真。
-
-三条硬规则，**新增颜色前先读**：
-
-1. **生产代码里不许出现裸 `Color::`**（含 `Color::Reset` / `Color::Indexed`）。一律换成 `Theme::xxx()` 或 `Theme::xxx_color()`。唯一例外是欢迎页 logo 的渐变插值，它走 `Theme::rgb_components_or` / `Theme::rgb_from_components`。钉子：`theme_tests::no_hardcoded_colors_outside_theme`（扫描 `render.rs` / `render/dialogs.rs` / `markdown.rs` / `welcome.rs` / `hyperlink.rs` / `input.rs` / `app.rs` 的生产区，跳过 `#[cfg(test)] mod` 与注释行）。这条能落地是因为它检查**源码文本**而非运行时行为——真想写别的颜色，作者得先来改这条规则，那一刻就已经是有意识的决定。
-2. **新增槽位必须同时接三处**：`ThemePalette` 字段 + `Default` + `from_json` 的 match 分支 + getter/Style 方法。`from_json` 对未知键是**静默忽略**的（插件主题不能因为拼错一个键就整份作废），漏接的代价是"主题半截生效且无任何报错"。钉子：`theme_tests::every_palette_slot_is_wired_to_a_json_key`（每个槽位一个互不相同的 RGB，逐字段验接上了）。
-3. **颜色断言断槽位，不断具体值**。`assert_eq!(style, Theme::success())` 而不是 `assert_eq!(style, Style::default().fg(Color::Green))`——后者会在主题换色时集体变红，且挡不住"两处用了同一个绿的近似色"。真要钉具体色值时，钉在 `theme.rs` 的常量表上。
-
-`theme.rs` 里有三组容易混的槽位：**`inactive`（`#7A8397`，主 dim：状态栏、thinking、未闭合围栏）/ `muted`（`#5A6274`，结构性附注：行号、Todo 圆圈、「待发送：」标签、URL 注释）/ `border`（`#39404F`，框线、表格网格、引用竖线、分隔线）**。合并它们会让对应元素整体亮一档；`muted` 与 `inactive` 不是同一档，`code_*` 四件套只服务于 `highlight_code_line` 那个自研词法着色器（零语法高亮依赖的边界所在）。
-
-**`inline_code` 是独立槽位，不要合并回 `code_fg`**：代码块正文是「整块代码」，需要低饱和以保持可读（`#ABB2BF`）；行内代码是「正文里的一个标识符」，需要轻微跳出但**不能有背景色**（`#E5C07B` 琥珀）。旧实现两者共用 `code_fg` 的浅蓝，结果行内代码与用户前缀 `❯`、权限对话框撞成一片蓝紫。
-
-**以下视觉语言是刻意定下的，不要"顺手优化"**：`⏺`（工具调用）与 `⎿`（结果/思考折叠头）图标体系、蓝色 user 前缀（`suggestion` 槽位）、左对齐不居中、消息块之间固定空一行、代码块**无背景色无卡片**（只有左边线 `│` + 顶栏语言标签的纯文本形态）、**引用块顶格**（`│ ` 不额外缩进，`│` 本身就是层级标记）。它们不是"还没来不及设计"，是产品选择。注意与「Markdown 排版」那节并不冲突：块间距是**块之间**留白，缩进体系是**块内部**的事；段落 / 列表 / 表格 / 代码块统一 2 格起，标题与引用块顶格是刻意的。
-
-**Bypass 三处同色为 `danger`**（状态栏芯片 + 标题栏 `[bypass] Enter to send` + 输入框边框）：它等价于"本次会话跳过全部权限确认"，黄色偏中性、承担不了提醒职责。钉子 `draw_status_labels_every_mode_and_paints_bypass_red` 会扫出全屏两处 `[bypass]` 文字**与输入框底边框框角**三处，逐一断言等于 `Theme::danger_color()`——只查状态栏等于没查。
-
-**状态栏两段排版：宽度按显示列宽，右段放不下就整段丢**（`render::draw_status` + `render::status_bar_layout`）。旧实现用 `chars().count()` 算左右两段宽度，而中文与全宽符号是双宽——`● 1 条已排队（等待送达）` char 数 14、显示宽度 24，补位少 10 列 → `Paragraph` 右端溢出 → 溢出是**从右侧硬切**，切点落在全角 `（` 中间，用户看到的就是右下角挂着一个半截的 `(`。这类 bug **只在中文文案下暴露**：英文 `● 1 queued (awaiting delivery)` 全 ASCII，char 数恰好等于显示宽度，纯英文快照对它完全不敏感。三条硬规则：① 任何宽度计算都走 `char_display_width`，`draw_status` 内不许再出现 `chars().count()`；② 两段排版只由 `status_bar_layout` 一处算，别处重算必然漂移；③ 分级降级：右段（排队 / Ctrl+C 待确认，只在特定时刻出现）优先保，cwd 吃剩余预算、超出加省略号、连 2 列都分不出时整段留空；右段**自身**塞不下时整段丢弃，绝不交给 Paragraph 硬切——半个括号不提示任何事，只会让用户以为界面画坏了（排队提示在输入框标题栏还有一份，那里是 `build_thinking_title` 里 rank 最高的一段）。
-
-**状态栏不得设置显式背景色**（`Color::Reset` 以外的一切 `bg`）：深灰带与上方标题栏割裂成两块色块。钉子 `draw_status_does_not_set_explicit_background`。
-
-**状态栏的思考档位段（`/effort`）在 cwd 之前，两种情况整段不显示**（`◆ model [auto] · high ~/proj`）：① 用户从没设过档位（会话级 None 且分组也没配）——没设过的东西不该占地方；② 当前端点根本不认 effort（`ThinkingSpec::effort_levels` 为空，如 GLM 只认开关）——显示一个永远发不出去的值是纯误导。判据与 provider 序列化请求体用的是**同一张能力表**（`wyj_api::supported_effort_levels`），避免「状态栏说 high、请求里被静默丢掉」。`off`（用户显式关思考）**要显示**——那是显式状态，不是「没设」。这段的显示列宽必须算进 `left_fixed` 预算（同上面那条 `char_display_width` 硬规则）。钉子 `status_bar_shows_the_thinking_level_only_when_it_is_in_effect` / `status_bar_shows_the_off_level_when_thinking_is_disabled`。
-
-## 终端能力降级：能力兜底，不是再美化一遍
-
-`theme::TerminalCaps` 两个开关：**`NO_COLOR` 存在即全槽位变成 `Color::Reset`**（颜色全灭，但 BOLD / 斜体 / 删除线这些 Modifier 仍然可用——用户要的是"别用颜色"，不是"别用排版"）；**非 truecolor 时 RGB 槽位量化到 xterm 256 色索引**（等亮度灰优先走 24 级灰阶，否则带色调的暗色会被 6×6×6 立方体量化成偏绿的脏色）。**具名色不动**——任何终端都认它，只有 RGB 才可能超出能力。
-
-三处接线，改动前先想清楚：
-
-1. **`apply_theme_json` 内部自己降级**，而不是只在启动时降一次。它是**整体替换**调色板的，若降级只跑在它之前，插件主题会把降级结果原样覆盖掉——一个 24 位主题丢进 16 色终端就是一团糊，而这恰恰是最需要降级的场景。做成"解析后立刻 `degraded()`"之后，调用顺序就无关了。
-2. **`ThemePalette::degraded()` 是纯函数**，逐字段写。它不碰全局单例，所以能被单测直接断言"27 个槽位一个都没漏降"（`every_slot_is_degraded_not_just_some_of_them`）。漏一个字段的后果极隐蔽：只有一个元素在 16 色终端里颜色不对，且很难联想到"少写了一行"。
-3. **对比度兜底只用在「背景已知」的场合**（选中行、块状光标、补全选中项），走 `Theme::selection_on(bg)`。其余位置的背景是用户终端的背景色，无从探测，无从判断——保持原色，不猜。阈值取 **3.0 而不是 WCAG AA 正文的 4.5**：兜底只用在加粗的短标签上，WCAG 对大号/加粗文本的门槛正是 3.0；用 4.5 会把默认主题品牌橙的选中行判成不合格换成白色，那不是修复，是改设计。
-
-**渲染架构（2026-07 起：永久 Fullscreen，不再有 Inline viewport）**：主循环从进程启动到退出全程运行在 `ratatui::Viewport::Fullscreen` + `EnterAlternateScreen`（`app::run_tui`），不再有 Inline/Fullscreen 切换、不再有"冻结消息写入终端真实 scrollback"这套机制。`AppState.messages` 永远保存完整会话历史，`render::build_pending_chat_lines` 每帧把全部历史当作"待渲染聊天区"交给 `render::draw_chat`；`draw()` 的布局（`Constraint::Min(3)` 撑满 chat 区剩余空间，输入框/状态栏用固定 `Length` 约束贴底）本来就是每帧从 `f.area()`（此时等于整个终端窗口）现算，因此聊天区自动撑满、输入框/状态栏自然贴着窗口最底部，不会再有"内容不够高、底部留一大片空白"的问题。历史消息的翻看改为应用内滚动：`AppState.chat_scroll`/`chat_max_scroll`/`chat_follow_tail`（`app::scroll_chat_lines`/`scroll_focus_lines`）驱动，PageUp/PageDown 与经过终端输入分流的鼠标滚轮共用这一路径。聊天消息本身不再有选中/展开状态；**ToolResult 与 Thinking 默认折叠成一行标题**（工具结果只留 `⏺ Bash(...) · 0.0s`，thinking 留 `⎿ 已思考 12s（41 行）  ·  Ctrl+O 展开`），`Ctrl+O` 全局切换后出**全文**、不再有任何行数上限。**`Ctrl+O` 的两种态不是「全折叠 ↔ 全展开」，而是「自动 ↔ 全展开」**：`AppState.output_expanded == false`（默认）表示**自动模式**——正在执行的步骤自动展开、跑完即收起，历史保持干净；`true` 才是把全部 thinking 与工具结果一次性摊开。判定式就是 `output_expanded || is_live`，其中 `is_live` 只对「工具实时输出」与「流式 thinking」两类成立——**不要给任何一类可折叠正文改回 per-message 选中展开**，`crates/tui/src/app.rs` 里那条 `_ => leave_content_focus()` 兜底和 Enter「回输入框」的语义都是按"聊天区无选中"设计的。**一个例外**：**Edit/Write 的彩色 diff 折叠态仍然内联可见**（`render_collapsed_diff_preview`，上限 `COLLAPSED_DIFF_MAX_LINES = 20` 行，超出折成一行 `… 还有 N 行（Ctrl+O 展开全文）`）。理由是**diff 才是这次调用的结果**，回执「已替换 1 处」信息量为零——折叠掉它等于用户必须先按 Ctrl+O 才知道这次编辑改了什么，对一个以改代码为主业的 CLI 不可接受（对齐 Claude Code）。它**不破坏**下面那条「折叠态一律不得触碰 content」的不变式：Edit/Write 的回执在工具层就被 `MAX_DIFF_LINES = 200` 封顶、构造开销有硬上界，且渲染只取前 20 行；`Bash` 那种动辄几 MB 的输出仍然一个字符都不碰。**不要把这个例外扩大**——把它推广到所有工具就等于把每帧 `lines().collect()` 的浪费请回来。Todo 与 SubAgent 仍保留独立 list/detail 交互，其中 Todo 详情面板的 `ChatRenderCtx` 跟随同一个 `output_expanded` flag（它重放的是**工具消息**，硬编码 false 会让面板只剩一排标题、正文全空）。
-
-**视口窗口化：`draw_chat` 只把覆盖视口的那几条逻辑行交给 `Paragraph`**（v0.3.9）。旧实现每帧把**整个会话历史**塞进 `Paragraph`：先 `line_count()` 全量跑一遍 `WordWrapper`，绘制时 `Paragraph::scroll` 再全量跑一遍——**scroll 只跳过绘制、不跳过折行**（`ratatui-0.29.0/src/widgets/paragraph.rs::render_text` 的 `composer.next_line()` 循环在 `y < scroll.y` 时照样逐 grapheme 折行）。长会话下这两趟 O(历史) 就是「滚几下就卡死」的直接来源；而 `scroll` 是 `u16`，历史超过 65535 物理行后底部内容根本滚不到。现在拆成三个函数，改动它们前先读这段：
-
-1. **`logical_line_height`** 先做一次 `Line::width()` 快判，宽度不超视口直接返回 1 行，只有 System 通知 / 工具标题 / Preformatted 这类不参与 markdown 折行的超宽内容才真跑 `WordWrapper`。markdown 层已经按内容宽度预折行（见本节「Markdown 排版：七条不可回退的规则」），所以绝大多数行都走快路径。
-2. **`locate_scroll_start`** 把物理行偏移换算成 `(起始逻辑行, 行内偏移)`——`Paragraph::scroll` 的语义是「跳过物理行」，不能直接喂逻辑行下标。
-3. **`visible_chat_lines`** 截出覆盖 `intra + area.height` 个物理行的连续区间。`intra` 恒小于一屏，所以 `scroll` 永远不会接近 `u16` 上限。
-
-**高度必须按物理行算，不能按逻辑行算**：`chat_max_scroll` 与 `chat_view_height` 都来自 `heights` 之和，漏掉折行高度会让贴底时最后几条被裁掉。钉子 `chat_viewport_tests::{long_history_renders_only_the_tail_when_following, wrapped_lines_contribute_their_physical_height, scrolling_up_shows_earlier_history}` 分别钉住「只画视口内的行」「折行高度计入滚动上限」「上滚能回到历史开头」。
-
-**内容不足一屏时聊天流贴底绘制**：`draw_chat` 用 `pad = area.height - total_height` 把内容区下移，内容贴着输入框。改回从第 0 行起画会立刻复现用户报过的「tasklist 与 agents 面板中间空出一大段」——Todo 面板挂在**聊天流尾部**、agents 面板是**贴底固定面板**，两者之间的空隙不属于任何一方，纯粹由聊天区顶部对齐挤出来。**欢迎页是唯一例外**（`should_show_welcome` 为真时 `pad = 0`）：`render_welcome` 自带 `TOP_BLANK_LINES` 让 logo 落在上 1/3，再贴底会把整页压到窗口下半部。滚动条与选区仍按原 `area` 算，`pad` 只影响正文落点。钉子 `chat_viewport_tests::{short_chat_content_is_bottom_aligned, welcome_page_is_not_bottom_aligned}`。
-
-**不要为了"省事"退回 `para.line_count()`**：它看着只有一行代码，但只要 `wrap` 打开就是全历史折行，而 `Paragraph` 内部那趟同样省不掉。真正的收口是把输入数据从 O(历史) 降到 O(视口)。
-
-**`!` bash 输出（`MessageRole::BashOutput`）出全文，不折叠、不截断、不受 `Ctrl+O` 影响**（v0.3.6 起）：它过去是「标题行 + 三行预览 + `...`」（`TASK_PREVIEW_MAX_ROWS` / `push_capped_preview_lines`，两个符号已删除）。删除的理由是 `!` 是**用户亲手敲**的命令，它的输出是用户明确要看的东西——按屏幕高度替用户裁掉 4/5，与工具结果的折叠（那是在替长输出让路、且 `Ctrl+O` 一按就能看全）不是一回事。标题行的 `· N lines` 保留，它现在只是「共多少行」的元信息。**代价与它的收口**：这条路径每帧都要把整段输出折行（`Command::output()` 是全量、工具层无上界），正是「折叠态一律不得触碰 content」不变式要防的那类浪费；代价由 `ChatMessage::render_cache` 按宽度缓存折行结果收掉（见下条不变式的豁免③）。渲染入口是 `render_bash_output_body`，空输出回落 `(no output)` 的判据必须是 `content.trim().is_empty()` 而非「body 是否为空」——只含空白的输出经 `lines()` 会得到若干空行，body 非空却毫无信息量。钉子 `bangs_bash_output_renders_every_line_regardless_of_expand` / `bangs_bash_output_wraps_long_lines_instead_of_dropping_them` / `bangs_bash_output_falls_back_to_no_output_placeholder` 分别钉住「不折叠也不省略」「长行折行不丢字」「空输出回落」。
-
-**shells / subagents 面板只列运行中的条目（v0.2.30+）**：两个面板的口径统一为「只显示 `Running`」，完成即从列表消失——对齐 Claude Code。**唯一口径分别是 `AppState::running_shells()` 与 `AppState::visible_sub_agents()`**，`draw_shell_panel` / `draw_sub_agents_panel` / `bottom_panel_size` / `shell_panel_height` / `move_selected_*` / `focus_*_edge` / `/shells` 与 `/subagents` 的定位逻辑**全部**必须走它们，不要有第二处直接遍历 `state.shells` / `state.sub_agents` 做展示决策——**两套口径漂移一次就会复现「列表里有个按不动的幽灵行」**。底层 `state.shells`（Vec，只增不减）与 `state.sub_agents`（BTreeMap）**保留全部条目**：退出状态要留在里面等 `poll_shells` 读、自动唤醒 reminder 也要读，面板只是不再展示它们。移除条目的动作挂在状态翻转处（`poll_shells` 检出退出、`E::Done`、interrupt 控制、ESC 中断），每次翻转后调 `reconcile_shell_selection` / `reconcile_sub_agent_selection`：选中项若已不在列表里就落到最后一个运行项，一个都不剩时收起面板并把 `ui_focus` 交还 `Composer`（否则焦点悬空在看不见的一行上，用户按 ↑↓ 才发现出事了）。**已完成的条目并非不可查**：子 Agent 完整轨迹仍落盘，可用 `wyj-code subagent-trace <session> [id]` 读；shell 输出早已通过 `bg_shell_done_reminder` 回灌模型、聊天流也留了 `bash_N 已退出` 记录。
-
-**子 Agent 详情视图复用聊天区的渲染管线**（2026-10-20，v0.3.13）。此前详情视图自己把 trace 逐行铺开（`in:` / `out:` 前缀一行一条），那份文本墙既没有层级也不能折叠——一次 `Read` 的输出就是几百行 `path:line-content`，读起来像日志倾倒。现在改成**翻译而非重画**：
-
-- `app/sub_agent_view.rs` 把执行轨迹（`TraceEvent`）翻译成与主聊天流同构的 `ChatMessage` 序列（工具调用 / 工具结果 / 助手文本 / 系统通知），`render::draw_sub_agent_content` 再把它交给 `render_message_range`——**同一条管线，同一套折叠语义**：工具结果默认折叠成一行 `⏺ Grep(...)`，`Ctrl+O` 展开全文；`Read` 的行号前缀照旧被 `strip_read_line_number` 剥掉；`Edit`/`Write` 的 diff 照旧内联可见。旧的 `push_sub_agent_trace_lines` / `push_sub_agent_tool_log` 两条平铺路径**已删除**，不要复活。
-- **配对规则**：`ToolStart` 先进待配对表，结果事件按**工具名**取走最早那条还没配上的同名调用（子 Agent 的工具可以并发，同名并发只能按顺序配）。结果行插到调用行**紧后面**——渲染管线靠「相邻且序号相同」把两者认成一块，插到别处会退化成两行各自独立的 `⏺` / `⎿`。
-- **翻译结果必须缓存**（`AppState::sub_agent_detail_cache`）：轨迹里每次工具输出都可能有几十 KB，每帧重建等于每帧搬一遍全部输出、再把每段助手文本的 markdown 重解析一次。轨迹是**只追加**的，所以「事件条数」就是完整的版本号（`SubAgentDetailVersion`），条数没变就直接复用上一帧的翻译结果。
-- **交接摘要收敛成一行**（`render::push_sub_agent_handoff_line`）：状态 → 工具调用次数 → 改动文件数 → 结论。前几段定长，结论按**剩余宽度**截断，保证状态与次数一定看得见。**停下的原因不进这一行**（多半是一整段 provider 报错，塞进来会把结论挤没），它作为一条系统通知进正文（`subagent.reason_line`；有落盘轨迹时它本来就在终态结果 `Done.result` 的最后一段里）。理由不是「好看」——轨迹里有几百条工具动作，用户滚到底才知道停在哪，而 `conclusion` 与 `files_modified` 恰恰是唯一能一眼说明「做到哪了」的东西。`SubAgentUiState.handoff` 从 `a<id>.handoff.json` 读回（`Done` 事件只带模型侧外壳，人读的摘要不在里面），`reload_persisted_sub_agents` 也按 `list_handoff_ids` 补齐只在交接物里出现的 agent，并在 trace 缺失时用交接物重建一条最小记录——**别让「有记录但看不到」比没有更让人困惑**。
-- **终态结果要去重**（`sub_agent_view::strip_rendered_turns`）：`TraceEvent::Done.result` 是各轮助手文本的拼接（`sub_agent.rs` 的 `outputs.join("\n\n")`），逐轮文本已经各自成条——不剥掉就会让人把同一段话读两遍。剥完剩下的才是新信息：出错时的报错、中断时的「已被中断」说明。逐轮文本落盘时被截到 4KB、终态结果里那份可能有 20KB，对不上时剥不掉、整段再出现一次，这是有意的降级（与其猜边界把内容切碎，不如原样展示）。
-- 落盘轨迹缺失时退回面板那份工具流水（`messages_from_tool_log`）：流水只有工具名 / 参数摘要 / 耗时，没有输出正文，所以结果行是空的——展开后看到的是一行状态摘要，而不是（并不存在的）输出。
-
-**Bash 的完整命令必须单独成行**（`render::render_full_command` + `ChatMessage::full_command`）。工具调用标题行里的参数是**截断过的摘要**（`Bash(cd /repo && wc -l crates/api/…)`），省略号吞掉的后半段命令再也找不回来——用户没法确认「到底执行了什么」。补全行的三条硬约束：① **只对 Bash**（其余工具的参数截断后仍能猜个大概，补全是噪音）；② **原样保留、不做 `~` 缩写**（这行的用途就是复制粘贴重跑，缩写过的路径粘回去跑不通）；③ **只在标题行确实没看全时才画**（判据 `title.contains(cmd)`，同时覆盖摘要截断与窄终端宽度截断——短命令重复一行是纯噪音）。补全行在**执行中**（`MessageRole::ToolCall`）与**跑完后**（`render_tool_result_block` 合并块）两条渲染路径都要出，否则「正在跑时看得到、跑完反而看不到」是倒退。子 Agent 详情视图走同一条管线（`sub_agent_view::tool_call_full_command`），不允许只有主聊天流有。钉子：`truncated_bash_command_is_shown_on_its_own_line` / `short_bash_command_is_not_duplicated_on_a_second_line` / `full_command_survives_the_merged_completed_tool_block` / `tool_start_keeps_the_full_bash_command_on_the_call_message`。
-
-**工具耗时必须落到毫秒**（`app::format_elapsed` → `core::humanize::fmt_duration_precise`）。工具耗时的主战场是亚秒段——一次 `ls` / `grep` 往往只有几十毫秒，而 `fmt_duration` 的一位小数会把 3ms 与 300ms **全部**塌成 `0.0s`：用户看到的是「所有工具都瞬时完成」这样一个假事实，还完全读不出差别。亚秒用整数毫秒（`42ms`），**≥1s 原样交给 `fmt_duration`**（`12s` / `1m 23s`）——那已经是「跑了一阵」的量级，毫秒是噪音，且面板宽度是硬预算。注意**长耗时口径不变**：`format_hms` 仍用于回合摘要 / Todo / 子 Agent 面板 / 通知正文，只有**单次工具调用**的耗时走 `format_elapsed`。钉子：`precise_duration_keeps_sub_second_tools_readable`（core 侧）与 `sub_second_tool_elapsed_keeps_millisecond_precision`（TUI 侧）。
-
-**Thinking 三条不可回退的理由**（`render.rs::render_thinking_block`）：① 折叠头用 `⎿`(U+23BF) 而非旧实现的 `✻`(U+273B)，后者属 Dingbats 区，终端字体覆盖率低一个量级，缺字形时画成豆腐块；② 行数统计的是**去空行后的原始行数**，与屏幕上的**视觉行数**（折行后再截断）没有对应关系，所以它只能当元信息、不能当"下面还有多少内容"的提示；③ 流式期间（`live: true`）**只取 `content` 尾部 `LIVE_TAIL_LINES` 行**——旧实现每帧把整个 `thinking_buf` 重新折行一遍、再只取前 3 行扔掉，长 thinking 下是纯浪费；反过来「一个字符都不碰」又让用户看不见模型在想什么。现在的做法是两头兼顾：`str::rsplit` 是反向惰性迭代器，取尾部 N 行只解码 N 行，代价与 `content` 长度无关。**钉子 `live_thinking_block_shows_tail_only_and_stays_cheap`**——把 `rsplit` 改回 `lines()` 或改成全文折行再截断，行数断言会立刻变红。耗时来自 `AppState.thinking_started`（`flush_thinking` 在清空前算出并落到 `ChatMessage::thinking_elapsed_secs`；该字段自 ThinkingDelta 首块写入后曾长期只有写点零读点），`/resume` 的旧会话没有耗时，故有 `thinking.done_no_elapsed` 分支而不是显示假的 `0.0s`。
-
-**thinking 正文必须走 markdown，不能逐行纯文本**（`markdown::render_thinking_markdown` / `render_streaming_thinking_markdown`）。这条是 v0.3.8 之后修的「思考过程显示是乱的」：旧实现把 `clean_thinking_lines` 的结果逐行 `wrap_line` 后原样输出，于是 `- `、`1.`、`**`、`|`、围栏全部字面落地——真实会话统计（350 段 thinking / 1 万行）里约 15% 的行带这些结构、37% 是空行，而空行被整批过滤掉，段落边界随之消失，整块看起来像乱码。四条约束：
-
-1. **软换行保留**（`Ctx.thinking` 为真时 `Event::SoftBreak` 走 `push_break`）。正文那条「段内换行折叠成空格」的规则对 thinking 是灾难：模型的思考天然一行一个念头。用 `push_break` 而不是 `flush`——后者会提前消耗 `cur_bullet`，列表项第二行起会退化成无 bullet 的普通段落。
-2. **围栏退化成 `│` 引用式纯文本**（`emit_thinking_code_block`）：不画 `╭─╮`、不加行号。thinking 里的围栏多半是路径 / 命令片段，套上带行号的方框后它比周围思考亮一大截。**流式取尾还要补围栏**：`live_tail` 可能把开启行切掉、只留闭合行，markdown 会把它当成新的开启行并吞掉后面所有正常思考——`fence_open_before` 扫被丢弃的前缀，命中就补一个 ` ``` ` 行。钉子 `live_thinking_tail_closes_a_fence_cut_by_the_tail_window`。
-3. **整块走 `Theme::dim()` 基色**（`Ctx::cur_style` 的 thinking 分支）：只保留 BOLD / ITALIC 修饰，标题不跳品牌橙、行内代码不加蓝。thinking 是旁白，不是结论。
-4. **外层缩进只补一层**（`render_thinking_block` 统一加 4 格）：`Ctx::block_prefix` 的「普通段落加 2 格」与 `block_indent` 的顶层 2 格在 thinking 模式下一律归零，否则叠加成 6 格、比列表 bullet 还靠右，层级关系正好反了。钉子 `thinking_body_is_indented_exactly_four_columns`。
-
-**展开态按宽度缓存**（复用 `ChatMessage::render_cache`，类型别名 `app::RenderCache`）：展开后是完整 markdown 解析，历史里几十段 thinking 每帧重解析与 assistant 消息是同一类浪费。**流式态不缓存**（每帧内容都在变），但输入是尾部 15 行、有硬上界，解析成本与整段长度无关——这与上面「折叠态一律不得触碰 `content`」不冲突：流式 thinking 属于展开态。
-
-**③ 已泛化成全局不变式：折叠态一律不得触碰 `content`。** 工具结果折叠（v0.2.28）把这个教训外推到了 ToolResult——`render_tool_result_block` 在调 `render_tool_result_preview`（它会把整个 `content` `lines().collect()` 成 Vec）**之前**就 return。旧实现每帧为每条工具结果构建完整 preview 再只取 3 行扔掉，与 thinking 流式态是同一类纯浪费。测试 `collapsed_tool_result_never_touches_content` 是这条不变式的回归钉子：任何人把 `return` 挪晚、或提前构造 `content_lines`，它立刻变红。**显式豁免共三处**：① Edit/Write 的 diff（见上段的例外）；② **正在执行的工具的实时输出块** `render_live_tool_output`——内容按定义处于展开态，且硬截到尾部 `LIVE_TAIL_LINES = 15` 行；③ **`!` bash 输出的全文渲染**（`render_bash_output_body`）——用户亲手敲的命令必须看到全部输出，代价由 `ChatMessage::render_cache` 按宽度缓存折行结果收掉，每帧只有一次 `Vec<Line>` 克隆。②的数据链路是 `BashTool` 的 pump → `ToolContext::tool_output()` 通道 → `AppState.live_tool_out` → `build_pending_chat_lines` 与 `tool_info` 求交集按 `sequence_no` 索引 → 渲染；通道传的是**快照而非增量**（每帧自带完整累计输出），所以满容量时 `try_send` 直接丢弃也是无损的。判断豁免是否越界的标准是**每帧的构造代价与正文长度是否解耦**，两条成立任一即可：实时块是「有硬上界」（`LIVE_TAIL_LINES` 与 `STREAM_TAIL_BYTES` 8KB 快照，钉子 `live_output_block_is_capped_to_tail_lines` 用 10 万行正文验证）；`!` bash 是「有缓存」（`render_cache` 命中时直接 clone，宽度不变就只折行一次）。**既无上界、也无缓存的正文不得开例外**——给那样的工具开例外 = 这条不变式作废。
-
-**实时输出块的两道闸门缺一不可**（`AppState::apply_tool_output_chunk`）：① `tool_info` 里必须已登记该 `tool_use_id`；② `is_thinking` 必须为真。ESC 中断 abort 掉回合 future，但 Bash 的 pump 会一直读到管道 EOF，中断后仍可能推来最后几帧——不过闸就渲染出一块永远转圈的幽灵输出。正常路径由 `ToolEnd` 里的 `live_tool_out.remove(&id)` 摘掉；另外**实时刷新不得调 `note_new_chat_content`**，否则用户上滚翻历史时每帧被计一次「未读」。
-
-**哪些内容加工逻辑留、哪些随折叠删了**（工具结果展开态）：判据是「这段逻辑的动机里有没有『名额 / 预算 / 挤到视野外 / 浪费在…』」。**随折叠删掉的纯预算启发式**：三行预览的 `take(3)` + `...`（原 `push_capped_preview_lines`，已整体删除）、错误输出的 head+tail `⋮`（它当初存在是为了保住尾部的 `request_id`/`reason`，展开后尾部天然可见，保留反而会主动删掉用户明确要求看的中间内容）、非 diff 的空行过滤（空行在全文里是段落分隔，删掉会压平 AskQuestion 这类结构）。**与预算无关、必须保留的表达层规范化**：`is_exit_code_banner`（`bash.rs` 拼这行是**给模型看的**，对人类是纯冗余）、`strip_read_line_number`（传输层的 `N\t` 前缀，纯噪音还加剧折行）、Edit/Write 的 diff 起点定位（diff **才是**结果，回执不是，且找不到 diff 特征行时 `.unwrap_or(raw)` 回落全量）、is_error 首行红/其余 dim（视觉噪音控制；展开态下论证更强——400 行错误块刷成一片红比 3 行时糟糕得多）。渲染空行必须 push 成真正的 `Line::from("")` 而非带缩进 span 的空白行，否则 `trim_trailing_blank_lines`（只弹 `spans.is_empty()`）弹不掉，每个工具结果尾部会留一行拖尾空格。
-
-**按键事件必须成对消费，退出前不得把在途 release 留给 shell**：Ghostty 路径压的 `DISAMBIGUATE_ESCAPE_CODES`（`0b1`）按协议会改写 ctrl+key 的编码——`ctrl+c` 不再以 `0x03` 送达，而是 `CSI 99;5;1u`(press) 与 `CSI 99;5;3u`(release，事件类型字段由 `REPORT_EVENT_TYPES`/`0b10` 追加)。于是"Ctrl+C 两次退出"这条路上，press 被读到时 release 尚未产生（release 的产生时刻 = **用户松手时刻**），而 `PopKeyboardEnhancementFlags`（`CSI < u`）只改写**之后**的编码，杀不掉已发出的字节；进程一退出这串字节就归 shell，zsh 的 ZLE 不认识带参数的 `CSI u`，吃掉 `ESC [` 后把参数当普通字符插进命令行 —— 现场表现是提示符后凭空多出 `9;5;3u`（Ctrl+D 则是 `100;5;3u`）。协议只把 Enter/Tab/Backspace 排除在 release 之外（好让崩掉的程序之后还能敲 `reset`），**Ctrl+C 不在豁免名单里**。三处收口缺一不可：① `await_quit_key_release` 在置 `should_quit` 前按 20ms 切片等回 release（上限 300ms，非 Ghostty 路径直接跳过）；② `terminal_input::drain_pending_input` 在 pop 之后、关 raw mode 之前以 `O_NONBLOCK` 读 `/dev/tty` 到 `EAGAIN`，按 40ms 切片轮询、上限 200ms（覆盖粘贴尾巴等没有配对按键的残留）；③ `panic_guard::restore_terminal_best_effort` 必须**无条件**发 `PopKeyboardEnhancementFlags`（panic 路径拿不到 `TerminalWheelRouting`，漏 pop 会让 shell 永久停在增强模式：Ctrl+C 不再有 SIGINT，之后每次按键都变 `CSI u`），且只在 TUI 所属线程上排空队列（worker panic 同样触发 hook，从 worker 读 `/dev/tty` 会吞掉用户正在敲的键）。**三者的先后不可换**：pop 之前排空时终端还在增强模式、随时可能再写新的 release 进来；关 raw mode 之后排空则 canonical 模式的 `ISIG` 会让队列里残留的 `0x03` 给本进程发 SIGINT。残留边角：按住 Ctrl+C 超过 300ms 才松手，release 仍会漏给 shell，属可接受的极小概率。
-
-**鼠标：`[ui].mouse` 三态，默认 `auto`（v0.3.18 起；此前是布尔 `mouse_capture`）**。`auto` 只对 `TERM` 缺失/空串/`dumb` 关闭，其余一律开启；`on`/`off` 强制。开启时由 `set_mouse_capture` 发送**最小**报告序列 `\x1b[?1000h\x1b[?1002h\x1b[?1006h`（按下/抬起 + 拖拽 + SGR 坐标），**刻意不发 `1003h`**——全移动上报会让触控板轻微移动就持续产生事件，主循环每事件重绘一帧。改这一行的唯一理由是 macOS Terminal.app 不支持 DEC mode 1007：在「不开启鼠标捕获」时它的滚轮事件**根本不会送达应用**，表现为「滚轮完全没反应」。**`/mouse` 已下线**——它当年存在的唯一理由是「开了捕获就失去拖选」，而应用内拖选补上之后这个取舍不存在了；现在要退回终端原生行为只能改配置里的 `[ui].mouse`（旧字段 `mouse_capture` 仍被识别但不写回）。**不要**无条件改回 `DisableMouseCapture`，也不要顺手换成 crossterm 的 `EnableMouseCapture`（它把 1000/1002/1003/1015/1006 全打开，含 `1003`）。钉子 `mouse_capture_enables_only_wheel_and_drag_reporting` 同时钉住「三个模式必须开」与「1003 必须缺席」。
-
-**应用内拖选：捕获鼠标后必须自己把「选择 + 复制」补回来，且要覆盖输入框**（v0.3.11 起，v0.3.18 扩到输入框）。开鼠标报告后终端不再处理拖选——事件全进应用，终端自己的选区缓冲区是空的。Claude Code 的 fullscreen 渲染也是同一套做法（应用内选、松开即写系统剪贴板）。五条实现约束：
-
-1. **选区数据源是屏幕快照，不是消息模型**。`AppState::capture_frame_rows` 在 `render::draw` 末尾从最终 Buffer 抓**内容区 + 输入框正文**两段字符，`selection_text` 只按它拼接。从 `messages` 反推会得到「没有折行、没有折叠态、没有工具图标」的另一份文本——选出来的和看到的不是同一个东西。两段的 y 范围不重叠，按 `ScreenRow.y` 过滤即可。
-2. **拖选不跨区，夹在起手区域内**。`TextSelection.area` 决定边界、高亮范围与取文来源：内容区起手就夹在 `chat_area`，输入框起手就夹在 `composer_area`。允许跨区就得回答「拼接处算不算输入框边框」，没有一致答案（`drag_is_clamped_to_the_starting_area`、`composer_drag_stays_inside_the_composer` 钉住）。有浮层时直接拒绝建立选区（`has_modal_overlay`），否则拖出来的是面板边框和提示行。
-3. **高亮画在最后一层**（`render::paint_selection`），压过链接下划线；前景过 `Theme::ensure_contrast`，因为选中底色是**已知背景**。复制在 `MouseEventKind::Up(Left)` 触发，双击在按下时即复制（`dragging=false` 防重复）。
-4. **滚动不清选区，选区跟着文字走**。`TextSelection.scroll_anchor` 记下建立时的滚动偏移，绘制与取文都按 `当前偏移 − anchor` 把选区整体平移（`TextSelection::shifted`）。旧实现「任意按键与滚轮都清除选区」是把「屏幕坐标会错位」当成了「选区必须作废」；记锚点之后两者可以同时成立。任意按键仍清除选区。
-5. **输入框点击要落到原始 `InputBox` 坐标**。屏幕格子 → 视觉坐标（加 `composer_scroll`）→ 展开占位符后的字符索引 → 原始列号，三层缺一不可：`render::input_with_placeholders_mapped` 产出「显示列 → 原始列」表，`InputBox::text_pos_for_visual` 是 `visual_pos_for` 的反函数，`AppState::composer_text_pos_at` 把两者串起来。少了映射表，点一下 `[Image #1]` 会把光标放到标签内部——一个不存在的列。光标由主循环持有，所以 `begin_selection` 只**返回**目标位置，落笔在 `Event::Mouse` 分支里。
-
-6. **带修饰位的字符键一律不是正文**（`input::plain_char`，v0.3.16）。macOS 上选中内容区后按 `Cmd+C`，Kitty 键盘协议（`app::enter_terminal_screen` 压的 `DISAMBIGUATE_ESCAPE_CODES`）把它报成 `Char('c') + SUPER`；主循环的字符插入分支历史上只过滤 `CONTROL`，于是 `c` 被原样插进输入框，表现为「复制了一下，输入框里多了个 c」。两条约束缺一不可：① 所有 `insert_char` 的入口（主输入框、弹窗自由文本、`input_owner` 借用态）都改走 `plain_char`，判定只排除 `CONTROL|ALT|SUPER|META|HYPER`，**`SHIFT` 必须留着**（它已体现在 `KeyCode` 里，排除会让大写字母全打不进去）；② 复制键本身要在 `state.clear_selection()` **之前**被消费掉，否则选区先被清空、复制拿到空串。复制键是 `Cmd+C` 或 `Ctrl+Shift+C`，**裸 `Ctrl+C` 必须留给中断/退出**。钉子：`input::tests::modified_char_keys_are_never_plain_text`、`clipboard_paste_tests::cmd_c_is_a_copy_shortcut_not_a_typed_c`。
-
-钉子：`selection_text_{takes_only_the_covered_columns,splits_lines_at_the_selection_edges,is_direction_agnostic,trims_trailing_padding}`、`double_click_selects_a_whole_path`、`selection_paints_only_inside_the_content_area`、`selection_follows_the_content_when_scrolled`、`clicking_the_composer_reports_the_target_position`。**注意「不按 Option 拖选」与「滚轮可用」在 Terminal.app 上互斥**：它既不支持 DEC 1007 把滚轮转方向键，终端原生拖选又要求应用不开鼠标报告。唯一两全的路就是应用内选择——所以这条链路是必需品，不是可选优化。
-
-**输入框视口必须按光标开窗（v0.3.18）**：`input_height` 上限 10 行（含 2 行边框 → 正文 8 行），旧实现 `Paragraph` 无滚动、从第 0 行起画，第 9 行之后**永远画不出来**，光标贴底不跟随。旧代码靠把长粘贴折叠成占位符规避，但手写多行（`Shift+Enter`）绕不开。现在 `draw_input` 用 `composer_scroll_for` 按光标视觉行开窗；用户用滚轮翻看长草稿时（`scroll_composer_lines`）光标不动，所以只在 `composer_last_cursor` 变化时才把视口拉回去——否则每帧强制跟随会让滚轮立刻失效。滚轮落在 `composer_area` 上时滚输入框，内容装得下才回落到聊天区。
-
-**Ghostty 的滚轮伪方向键分流仍保留（仅在鼠标捕获关闭时生效）**：Ghostty 在 alternate screen 且未开启鼠标报告时会用 DEC mode 1007 把滚轮转为 `ESC[A`/`ESC[B`，与普通方向键在 crossterm 事件层的结果相同；`TerminalWheelRouting::GhosttyKeyReleases` 通过 Kitty `REPORT_EVENT_TYPES` 的 release/repeat 事件区分真实键盘与滚轮伪键，滚轮只调用 `scroll_focus_lines`，不得进入 `navigate_input_or_history`。非 Ghostty 或 tmux/zellij 路径下不能假定 release 可靠透传，必须用 XTSAVE/XTRESTORE 成对保存、关闭、恢复 mode 1007，至少保证滚轮不会污染输入历史。**默认开启鼠标捕获后，滚轮走 `Event::Mouse` 直接进 `scroll_focus_lines`**，这条伪键分流只在配置里 `[ui].mouse = "off"` 时才会被触发——不要因为「默认不开」就删掉它。复制最后一条 AI 回复仍可用 Ctrl+Y。全部历史每帧都要经过 `build_pending_chat_lines`，但 `ChatMessage::render_cache`（`db9dfb6` 以 `md_cache` 引入，按宽度缓存已定稿 assistant 消息的 markdown 渲染结果；v0.3.6 起改名并同时服务 `!` bash 的折行结果）已经把最大的开销点（markdown 重新解析 / 长输出逐行折行）消掉，每帧只是克隆 `Vec<Line>`。
-
-**应用内滚动条不是「原生滚动条」，且可拖动（v0.3.18）**：alternate screen 里终端没有自己的滚动条（真正的原生滚动条只存在于主屏 scrollback，Inline 方案已因画面撕裂被放弃两次，见下面那节）。`render::draw_scrollbar` 在内容区最右 1 列画 `│`（轨道）/`┃`（滑块），`[ui].scrollbar = false` 可关。四条硬约束：① **只在 `max_scroll > 0` 时画**——满格滑块会误导用户去拖它；② 用 `ScrollbarState::new(max_scroll + viewport)`，`content_length` 必须是「总行数」而不是 `max_scroll`，否则滑块长度与位置都不对；③ 颜色只取既有槽位（轨道 `Theme::border()`、滑块 `Theme::dim()`），**不要新增 `ThemePalette` 字段**——那会连带触发 `theme_tests` 的三处接线要求（JSON 键映射、降级、常量表）；④ **命中优先于拖选**：`begin_selection` 先查 `content_scrollbar.area`，点中就开始拖动而不是建选区，否则滚动条那一列永远只能选中文字。拖动按「滑块行程 ↔ 偏移行程」比例换算（`ScrollbarMetrics::scroll_for_thumb_top`），按下时记 `grab_offset` 让滑块跟手走而不是跳到按下点；`ScrollbarMetrics.target` 决定落到 `chat_scroll` 还是 `sub_agent_detail_scroll`。聊天区与子 Agent 详情各自接入；后台 shell 面板详情区过窄，不接。
-
-**UI 线程绝不能 `await` session 锁**（`try_session_lock`）：回合 task（`spawn_agent_turn` + 两处内联 turn task）在**整个 agent 回合期间**持有 `session` 这把 `tokio::sync::Mutex`——LLM 往返加全部工具调用都在锁内，一次长回合动辄几分钟。主循环任何一处 `session.lock().await` 都会让整个界面停在那一帧：**不重绘、不读按键**（`event::poll` 在这些点之后），连排在保存分支上游的 `abort_stalled_turn()` 看门狗都跑不到下一轮，ESC/Ctrl+C 全部失效——用户看到的就是「执行久了卡死不动」。**这条规则的两端**：① 主循环里凡是碰 session 一律走 `try_session_lock`，拿不到就 `notify_session_busy()` + 跳过本帧（保存路径保留 `save_needed = true` 下一帧重试；命令路径 `anyhow::bail!` 走它自己的错误通道；会话选择器保留不关）。**回合 task 内部的 `lock().await` 不要动**——那正是持锁者。后台 task（如 `spawn_plan_approval_checkpoint`）可以等锁，它不在 UI 线程上。② 终态事件（`Usage` / `TurnDone` / `Error`）走**阻塞式** send（`mpsc::channel(256)`），必须**先 `drop(sess)` 再发**：UI 收到 TurnDone 后置 `save_needed`、下一帧就来取锁，turn task 若还持锁就是环形等待。③ **主循环无条件区段里拿不到锁时只能「跳过这件事」，不能 `continue`**：`continue` 跳回的是整个循环，会连带跳过紧随其后的 `ui_ask_rx` 消费与 `event::poll()`——按键、权限确认弹窗、AskQuestion、计划批准全停摆，而 `terminal.draw()` 在它之前、画面照常刷新，用户看到的是「界面活着但按键全哑」，ESC/Ctrl+C 也救不回来（真正终止回合的是排在 `continue` **上游**的心跳看门狗，现场更像「莫名卡几分钟后自己恢复」）。`TurnDone` 置位 `save_needed` 与自动唤醒/排队兜底的 spawn 发生在同一帧，所以每条排队消息触发的自动续跑都会踩中，整回合失灵。`event::poll()` 按键块**内部**的 `continue` 没问题（消费一个按键、下一帧继续）。钉子：`every_turn_task_releases_the_session_lock_before_terminal_events`（静态检查三处 turn task 的「锁内取 Usage 快照 → drop → 发」顺序）、`try_session_lock_never_waits_for_a_running_turn`（带超时兜底，改回 await 就会挂在 timeout 上）、`autosave_never_continues_past_the_input_layer`（静态检查 autosave 分支内不得出现 `continue`）。
-
-**`pending_queue` 是 steer 队列的镜像，必须跟着真实水位走**（`reconcile_pending_queue`）：入队时 `pending_queue` 与 `core::SteerQueue` 各加一条，正常靠 `AgentEvent::Injected` 出队。共享队列之后**取走者不再唯一**——主 Agent 排空全部、前台子 Agent 只排空 `UserMessage`（`SystemReminder` 是给主 Agent 的后台结论，被抢走就双双丢失）、嵌套子 Agent 同享同一份；子 Agent 没有 UI 事件通道、`on_inject` 是空闭包，**发不出 `Injected`**。镜像于是停在旧水位，回合结束后兜底重发会把已经投递给子 Agent 的消息**再当一条全新用户消息发一遍**，直接违反「一条内容只投递一次」。因此 `TurnDone` / `Error` 里必须在 `injector` 被清空**之前**调用 `reconcile_pending_queue()`，按 `queue.pending_user_messages()` 把镜像裁到真实水位——按水位而不是「谁取走的」，三种取走路径一律正确。钉子：`subagent_drained_steerage_is_not_resent_as_a_new_user_message`（已投递的不得重发）、`undelivered_steerage_survives_reconciliation_for_the_race_fallback`（没投递的必须留下，否则真正的竞态兜底会吞掉用户输入）。
-
-**文本编辑按键只有一份实现**（`input::apply_edit_key`）：主输入框、`InputOwner` 借用态（/model /mcp /skills /plugins 的配置输入）、AskQuestion 与计划批准的"其他"自由输入**全部走它**。历史上有三套各写各的按键表，弹窗那套只有打字/退格/左右，同一个编辑动作换个界面就按不动——这是"交互反人类"的根因。`InputBox` 的原语（`move_word_*` / `kill_*_of_line` / `delete_word_backward` / `delete_char_forward`）一直齐全，缺的只是接线，所以**新增编辑键一律加在这里，不要在调用方单独实现**。刻意**不含** `Enter` / `Esc` / `Tab` / `↑` `↓` / 粘贴：各有应用层语义（提交、取消、翻页、历史、附件），由调用方分发；唯一例外是 `Shift+Enter`（所有输入场景都只表示换行）。主输入框有 5 个键不走共享实现，原因写在代码注释里：`Backspace` / `Delete` / `Ctrl+W` 要连带删附件占位标记，`Home` / `End` 在输入框为空时是"跳到对话首尾"。换行有三种等价写法：`Shift+Enter`（终端支持键盘协议时）/ `Ctrl+J` / 行尾 `\` + `Enter`，后两种是兜底——`Shift+Enter` 在 tmux 默认设置下会被原样报成普通 Enter 直接提交。自由文本的光标用**反色块**而不是移动硬件光标（弹窗是浮层，硬件光标被底部输入框占用，两者会打架）；嵌套弹窗必须贴着父面板摆放，不要和父面板用同一个整屏 `area` 居中（会叠在父面板上，看着像渲染错位）。
-
-**多行输入必须逐行画出来，面板高度跟着行数走**：AskQuestion 的「其他」和计划批准的「手动输入」都接了 `apply_edit_key`，因此都是多行的，提交时取的是 `input.text()`——**只画第一行 = 所见非所发**（用户写三行只看见一行，回车却把三行一起发出去）。两个面板统一走 `render::freetext_line`（真实块状光标 + 超宽横向滚动），`bottom_panel_size` 对 PlanApproval 的高度按 `3 + input.lines.len()` 算，不要写死。横向滚动的 `visible_window` 不变式是**光标之前的文本必须完整落在窗口内**，否则光标被挤出可视区、整块反色消失（比旧的假 `_` 更糟：旧的永远错但永远看得见）；向后走时减的是「即将丢到左窗外的字符」、比的是「留在窗口内的前缀宽度」，反过来写会让光标偏移量无界增长，行宽超过约 `2 × inner_w` 后必然消失，且 CJK 光的预留必须按 `char_width`（2 列）而不是写死 1。钉子：`cursor_stays_visible_on_long_lines`、`window_never_exceeds_available_width`、`freetext_lines_are_all_rendered`、`freetext_can_hold_multiple_lines`。
-
-**附件占位符必须两处同源**（`render::attachment_display_text`）：输入框里的 `[Image #1]` / `[File: name]` 与聊天区里那条用户消息的展示文本**必须逐字节相同**，且占位符停在用户粘贴它的那个位置。附件位置信息只存在于 `InputBox` 的内部原子标记 `ATTACHMENT_MARKER` 里，`InputBox::text()` 会把它们过滤掉，所以**展示文本必须在 `input.take()` 之前算好**（发送路径先 `input.clone()` 留快照）——事后从 `text + attachments` 现拼只能得到「正文末尾追加一行附件列表」，那正是这个 bug 的形态：同一个附件在输入框是 `[Image #1]`、在消息区变成 `[图片 402×288]`，用户会以为发送丢了图或换了一张。因此凡是消息要离开输入框的路径（`pending_queue: Vec<OutgoingMessage>`、`ExecModeConfirmDialog::pending_display`）都必须把 `display` 一起带走，**不允许在消费端重算**。无标记的附件（正文里 `@path` 展开出来的文件）由 `attachment_display_text` 在末尾单列，注意只投影 `attachments[..marked]`——`input_with_attachment_placeholders` 末尾那段「旧状态兼容」兜底会把无标记附件补进行首，两者同时生效就是同一个附件出现两次。`reconstruct_display`（`/resume`）另有一处：图片块此前被 `_ => {}` 整个吞掉，恢复历史会话后聊天流里不留任何痕迹，现补 `[Image #n]`（位置信息从未落盘，只能在末尾）。回归钉子：`chat_display_is_byte_identical_to_the_input_box`、`at_referenced_files_without_a_marker_are_listed_at_the_end`、`user_images_survive_into_the_reconstructed_display`。
-
-**回复中的文件/网页快捷访问**：`hyperlink::linkify_buffer` 在所有聊天内容和浮层完成后扫描最终 chat Buffer，识别 `http(s)://`、`www.`、`file://` 以及基于 `AppState.cwd` 能解析到真实文件/目录的路径（含 `path:line:column`、`#LxCy`），只给对应 cell 增加链接样式并登记屏幕坐标。不要把 OSC 8 直接塞进 `Span`/`Cell::symbol`：ANSI 字节会污染 ratatui 的宽度与 diff 计算。`HyperlinkBackend` 必须保持在 `Terminal` 完成 Buffer diff 之后才包装 OSC 8；鼠标捕获关闭时由终端原生处理 Command/Ctrl+点击，事件循环只保留防御性兜底。目标严格限制为 `http(s)://`/`file://`，系统打开命令按单个参数调用，禁止经过 shell 拼接模型文本。
-
-**为什么这次不会重蹈 Inline 撑满高度的覆辙**：`Viewport::Fullscreen` 的构造路径是 `(area, Position::ORIGIN)`（`ratatui-0.29.0/src/terminal/terminal.rs`），完全不查询终端光标位置；而 `Viewport::Inline` 构造/resize 时（`compute_inline_size`）必须靠 crossterm 查询光标当前行才能决定往终端 scrollback 里写多少行——这个查询在 tmux/部分终端下存在渲染竞态（内部状态一致但视觉结果不稳定，严重时输入内容不可见、状态栏文字错位重叠）。这个问题已经在 Inline 方案上验证过两次都无法安全绕开：`b5729c5`（TUI 改用 Inline scrollback 那次重构）最早试过让 Inline viewport 始终撑满终端高度以消除底部空白，评估后放弃；2026-07 又按"只在空闲态才撑满"的收窄方案重试过一次，依然在用户的真实终端上复现了同一类画面撕裂，当场回退。这两次教训是"不要指望在 Inline 模式下解决贴底问题"，而不是"贴底本身做不到"——换成 `Viewport::Fullscreen` 从根上避开了那个查询，是结构性的差异，不是同一条路子换个参数再试一次。**如果以后又有人想在 Inline 模式下做贴底，先看这一段——那条路已经证明走不通。**
-
-**Fullscreen 全程接管后，原本的 10 个"重量级管理对话框"（`/mcp` `/model` `/plugins` `/skills` `/config` `/memory` `/evolve` `/resume` `/agents` `/extensions`；`/import` 已随 v0.2.24 下线）不再需要临时切换 Terminal 变体**：它们本来就已经假设拥有整个终端来渲染，现在始终身处 Fullscreen，直接作为 `draw()` 尾部的浮层覆盖在 chat/footer 之上即可，不再有任何 `Terminal::with_options`/`clear()` 重建。权限确认框（`PermissionDialog`）因为几乎每次 Edit/Write/Bash 调用都可能弹出，归类为底部常驻面板（`BottomPanel::Permission`）而非全屏浮层，避免高频闪烁——这条不受本次改动影响。
-
-**ProfileDialog 还兼任首次启动缺 API Key 的 onboarding 入口**：`wyj-code` 在 `~/.wyj-code` 缺失时通过 `ProfileDialog::new_for_onboarding` 自动打开（焦点预置到 `profile_api_key_field_idx()` 那一行），用户填写后 `profile_try_save` 经 `rebuild_fn` 重建 agent，无需重启。详见 `crates/cli/CLAUDE.md` "首次启动缺 API Key 的处理"。
-
-**分组面板的字段表是声明式的，不要再加平行数组**：`PROFILE_FIELD_SPECS`（`app.rs`）是字段顺序、i18n label key、交互形态（`ProfileFieldKind`：Provider / Text / Secret / Model / Enum / Bool）与可见性（`ProfileFieldScope`：Always / AnthropicWire / OpenAiWire）的**唯一真相源**。四条硬约束：
-
-1. **顺序即渲染顺序**，也是 `rows()` 和方向键的遍历顺序——重排字段只改这张表。`text_value` / `set_text_value` 按 `spec.key` 分派（不是按下标），所以重排无需同步它们；但新增字段**必须**同时在两个 match 里加分支，否则该字段在面板里永远空串、编辑结果被静默丢弃。测试 `every_profile_field_round_trips_through_text_accessors` 钉死。
-2. **每个 `spec.key` 必须真的在 `zh.yml` / `en.yml` 里有条目**。rust-i18n 缺 key 时**原样回显 key**（不 panic、不告警），历史 bug 就是这样在面板上渲染出 `settings.field.reasoning_effort` 字面量。测试 `every_profile_field_label_key_resolves` 钉死。
-3. **思考字段按线协议分流**：`thinking_budget` / `interleaved_thinking` 只在 Anthropic 线显示，`reasoning_effort` / `thinking_switch` 只在 OpenAI 线显示。两边的参数互不相认，同时平铺只会诱导用户配一个必然被 catalog 丢弃的死字段。可见性过滤在 `ProfileDialog::visible_field_idxs` 里做，**不能只在渲染层做**——`rows()`、键位、光标三者必须看到同一份可见列表，否则方向键会跳到看不见的行上。
-4. **Enum 字段的候选首项必须是空串**（`enum_choices` 自动加）。`reasoning_effort` / `thinking_switch` 在配置里是 `Option<String>`，空串是唯一能表达 `None` 的形态；去掉它用户就再也回不到"跟随端点默认"。
-
-**`max_tools_per_turn` 是枚举字段，新建分组预填 4**：候选固定为「（默认）/ 1 / 2 / 4 / 8」（`MAX_TOOLS_PER_TURN_CHOICES`），草稿侧存 `String`、空串写回 `None`。**预填 4 不是随手取的数**——`None` 会让 `model_catalog` 按 vendor 猜出的 `max_tools_per_turn = 1` 直接生效，而静态目录对所有非 anthropic/openai vendor 一律判 1，于是国内模型新建分组后每轮只能发一个工具调用、一次只能派生一个 subagent。已有分组仍保留原值（`from_profile` 原样透传），用户清空即可回到端点默认。测试 `new_profile_prefills_four_tools_per_turn` / `max_tools_per_turn_enum_cycles_and_clears_to_none` 钉死。
-
-**Model 字段的 Enter 直达拉取**：`ProfileFieldKind::Model` 按 Enter 直接发起 `fetch_model_ids`（`profile_start_fetch_models`），结果菜单**首项固定是「手动输入」**；拉取失败/为空时也弹这个单项目菜单。不能只把拉取挂在菜单里——第三方的 `/models` 常常不支持，用户必须随时能退回手填。选中模型后会调 `autofill_capacity_from_catalog`，只用 `wyj_api::known_model_capacity` 的静态表补 `context_window` / `max_tokens`，且**只覆盖空值或默认值（200000 / 32000）**，用户手改过的数字不动。供应商的 `/models` 接口不返回容量元数据，所以这里没有 live probe 路径。
-
-**会话级分组（「仅本会话使用」）与全局切换是两套语义，不要合并**。`/model` 面板头行菜单里，`Activate` 改的是 `active_idx`（Ctrl+S 后写进 `config.toml` 的全局默认值），`UseForSession` / `FollowGlobal` 只改**本次会话**的生效端点且**绝不写盘**。五条实现约束：
-
-1. **`AppState.config` 永远是全局默认值**，会话级覆盖单独存 `AppState.session_profile_override`，由 `AppState::effective_config()` 在造 Provider 时叠加。任何写盘路径（`/config` 保存、`/memory` 切自动记忆、`profile_try_save`）都必须用 `state.config`，否则一次无关的保存就把临时分组固化成全局默认值，用户下次开别的项目发现默认模型被换了。测试 `effective_config_applies_override_without_touching_global_default` 钉死。
-2. **生命周期跟着会话走，不是跟着进程走**。落盘字段是 `SessionFile.session_profile`（只存分组名，端点/Key 仍以 `config.toml` 为唯一事实来源），`--resume` / `-c` 时由 CLI 读出并传给 `run_tui`。会话切换必须同步：新建会话 → `None`；切历史会话 → 用目标会话自己的值；`/branch` → 继承父会话（`SessionStore::branch_from_checkpoint` 读父文件，内存 `Session` 也要一起写，否则下一次 autosave 会把分支文件里的字段覆盖成 `None`）。统一入口是 `adopt_session_profile`，**不要在各分支各写一遍**。`/clear` 刻意保留（`clear_conversation` 里显式搬运），换的是对话内容不是端点。
-3. **分组名解析不到时静默回落全局**。分组被改名/删除后，旧会话文件里的名字会指向不存在的东西——`set_session_profile` 与 CLI 启动期都做 `profile_by_name` 过滤，而不是让 `build_provider` 在下一轮直接失败。测试 `stale_session_profile_override_falls_back_to_global`。
-4. **状态栏必须显示 `[分组名]`**（`draw_status`，紧跟模型名）。这个功能的全部风险就是用户忘了它只在本次会话生效、或忘了自己切过而以为全局默认值被改了；状态栏是唯一每帧都在的位置。
-5. **三条「立刻改变生效端点」的出口，成功后都必须收起 `/model` 面板**（统一走 `finish_session_profile_switch`）。面板的**渲染**条件（`render.rs` 的 `if let Some(dialog) = &state.profile_dialog`）与**按键拦截**条件（主循环的 `if state.profile_dialog.is_some()`）同源，所以漏关面板留下的不是"顺手 Esc 就能走"的装饰，而是一个没有待办却继续吞掉全部按键的浮层——现场表现是"输入框光标在闪却打不进字"，只能靠 Esc 才发现面板还在（曾只在 `Save` 分支关过，会话级两条漏掉）。**两个例外必须保留**：① `set_session_profile` 返回 `false`（rebuild 失败）时不关，用户要留在面板里才看得到 `profile.switch_failed`；② 面板 `is_dirty()` 时不关——会话级切换刻意不写盘，直接关等于静默丢掉用户刚敲进去的 Key。`adopt_session_profile` 入口反过来**无条件**收起面板：它的 `entries` 是打开那一刻的 config 快照，换会话后必过期。测试 `use_for_session_closes_the_profile_dialog` / `a_failed_switch_keeps_the_panel_open` / `a_session_switch_never_discards_unsaved_field_edits` / `switching_sessions_closes_a_stale_profile_panel`。
-
-**`/evolve` 治理中心**：`EvolutionDialog` 固定提供 Active / Candidates / Episodes / Health 四视图，Tab/Shift+Tab 循环，列表与右侧 evidence/detail 保持独立滚动，PageUp/PageDown 只移动详情。Approve、Reject、Forget、Rollback 都必须先进入 `EvolutionConfirmAction` 二次确认；切换视图、Esc 或完成动作后清空确认状态，避免旧确认落到新选中项。Episode 的 good/bad feedback、external include 与 manual skillize 可以直接执行，但必须在面板中展示成功或错误结果；Skill 批准前先创建 checkpoint，默认只安装到 project scope，任何 Skill/lockfile/candidate 状态写入失败都调用生成 Skill 回滚。对话框 reload 只能刷新下一次视图快照，不能改变正在执行的 Agent 回合 Evolution context。
-
-**`open_path_in_editor`**（`/memory` 面板"用 $EDITOR 打开"）挂起 TUI 时无条件 `LeaveAlternateScreen` + `disable_raw_mode`、编辑完成后 `EnterAlternateScreen` + `enable_raw_mode` + `terminal.clear()`——这个函数写的时候就已经假设调用时处于 alternate screen（原先只在 Fullscreen 对话框打开期间才会被调用），现在全程都在 alternate screen，前置假设依然成立，不需要改。
-
-## 欢迎页（`welcome.rs`）：只承载「品牌 + 操作提示」两块
-
-**页面上不得出现 model / cwd**——状态栏已常驻 `◆ <模型> [模式] · <cwd>`（每帧都在）。欢迎页再写一遍就是同一个事实占两个位置：用户读状态栏时它被欢迎页的同名文本稀释，欢迎页因此多占两行却没多给信息。状态栏答「我现在在哪 / 我以什么身份在跑」，欢迎页答「这是什么 / 从哪开始」，职责不重叠。示例提问引导行（`Try "fix this bug" or ask anything…`）同样删除——它与正下方的输入框说的是同一件事，重复即噪音。
-
-**当前布局**（`render_welcome`，共 15 行）：
-
-```
-(1 行留白)
-WYJ-CODE 艺术字 × 5 行     ← 品牌区
-v0.3.16                     ← 品牌区，紧贴 logo
-(2 行留白)                  ← 唯一的分组边界
-💡 <轮播 tip>               ← 提示区
-常用命令                     ← 提示区：常用命令区块表头
-/profile  切换分组端点       /model  切换模型
-/effort   思考强度档位       /help   全部命令
-/compact  压缩上下文         /clear  清空对话
-/help · Shift+Tab · /compact · Ctrl+C
-```
-
-**「常用命令」区块（v0.3.16 起）**：欢迎页底部常驻一份速查表，替代原先那段
-冗长的 auto 模式说明（那段已压成 `auto.mode_notice` 一句短句）。四条规则：
-
-1. **命令名不翻译**（`/profile` 是字面量），**说明走 i18n**（`welcome.cmd.*`）。
-   两者在 `welcome.rs` 里按**第一个空格**切分——`command_entries()` 是唯一
-   切分点。
-2. **两列布局**：命令名用 `Theme::body()`、说明用 `Theme::dim()`，名与说明
-   之间 2 空格（`COMMAND_DESC_GAP`）、列与列之间 4 空格（`COMMAND_COLUMN_GAP`）。
-3. **窄终端整条丢弃，绝不截断命令名**——半截的 `/prof` 比没有这条更糟：用户
-   会以为有个叫 `/prof` 的命令。丢弃顺序 = `COMMAND_HINTS` 的逆序（末尾先丢），
-   所以最常用的 `/profile` `/model` `/effort` 永远在。
-4. **区块行数恒定**（6 条 ÷ 2 列 = 3 行）：放不下时是**格子留空**而不是整行
-   消失。欢迎页总高度因此与终端宽度无关——聊天区高度测量与滚动位置不会漂移。
-
-钉子：`welcome::tests::command_block_height_does_not_depend_on_terminal_width`、
-`welcome_page_lists_the_common_commands`、
-`narrow_terminal_drops_whole_commands_never_truncates_them`。
-
-两条分组规则：**logo 与版本号同属品牌区、必须紧密相邻**（figlet 原输出的第 6 行是整行空格、不是字形，已裁掉）；**品牌区与提示区之间留 2 行**（1 行在 5 行高的 logo 之后会被读成 logo 的下沿）。左缩进固定 2 空格（`CONTENT_INDENT`），与聊天区助手正文（`markdown::Ctx::block_indent` 的 base=2）同列起首。
-
-**宽度契约：每一行的显示宽度都必须 `<= area_width`**。这是硬约束，不是建议——超宽的行会被 `Paragraph` 从右侧硬切，切点落在半截字符上（项目里已因此出过「右下角挂着半个括号」的事故）。预算必须把**缩进和图标都算在内**：旧实现只对正文算预算，于是窄终端下 `缩进 + 💡 ` 那一段就超宽（宽度 4 时 `  💡 ` 是 5 列）。`💡` 是双宽 emoji，连同后随空格共 **3 列**，放不下时整个图标省略、只留文案。
-
-**窄终端下 logo 只能切到完整字母的边界**。figlet 艺术字里一个字母横跨若干列（`O` 占 6 列），按列硬切会切出半圆——比整块裁掉更难认。`LOGO_LETTER_BOUNDARIES`（`W`=13 / `WY`=20 / `WYJ`=23 / `WYJ-C`=35 / `WYJ-CO`=39 / `WYJ-COD`=45 / `WYJ-CODE`=52）由 `figlet -f standard` 逐前缀实测得出，`snap_to_letter_boundary()` 把可用宽度收敛到最大的可容纳边界；一个字母都放不下时整块留白。
-
-钉子：`welcome::tests::no_line_exceeds_the_given_width_at_any_terminal_size`（4..200 列 × 全部 tip 逐行验宽）、`logo_is_truncated_at_whole_letter_boundaries`、`logo_disappears_entirely_when_not_even_one_letter_fits`、`welcome_page_does_not_repeat_the_status_bar_model_and_cwd`、`welcome_page_has_no_suggestion_prompt_line`、`version_line_has_no_blank_line_between_it_and_the_logo`。
-
-
-## System 通知的折行：走 markdown 折行引擎，不要交给 `WordWrapper`
-
-System 消息（`  ⚙ ` / `  ⚠ ` 标记那类，典型是启动时的 `auto.mode_notice`）**不走 markdown 渲染**，但**必须用 markdown 的折行引擎**折行：`markdown::wrap_plain_text_spans(&[(text, style)], avail)`。
-
-**为什么不能交给 `Paragraph::wrap`**：`Wrap { trim: false }` 走 ratatui 的 `WordWrapper`，它**只在空格处断行**。中文段落几乎没有空格，于是 WordWrapper 一路撑到接近行尾才折回来，把词组拦腰截断。实测（100 列，样例取 `auto.degraded_to_confirm`）：
-
-```
-旧：|  ⚙ auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，|
-    |其余操作改为逐次弹窗确认。使用 /plan auto 可重新启用分类器。…|
-新：|  ⚙ auto 分类器连续拦截过多，已停用模型分类器：危险命令仍按硬规则拦截，其余操作改为逐次弹窗确认。|
-    |使用 /plan auto 可重新启用分类器。…|
-```
-
-`WordWrapper` 还会把 `Shift+Tab` 拆成 `Shift+` / `Tab`（按键名被拆开就认不出了），把 `plan / bypass` 里的斜杠留在行尾。
-
-**启动时的 `auto.mode_notice` 已压成一句短句**（v0.3.16）：「auto 模式：多数操作自动放行，危险操作仍会硬拦。Shift+Tab 切 plan / bypass。」——原来的三行长文把欢迎页压得像免责声明；这句在 100 列下单行放得下，长中文折行的验证改由 `auto.degraded_to_confirm` 承担（`render.rs` 的四个 `system_message_*` 钉子已同步换成新文案）。
-
-**新引擎的三条性质**（都来自 `markdown.rs` 的 `tokenize_atoms` + `wrap_spans`）：宽字符（汉字 / 全角标点 / emoji）逐字之间可断；ASCII 词（`Shift+Tab`）整词不断；遵守中文排版禁则（收尾标点不落行首、开括号不悬行尾）。
-
-**System 消息的标记只出现在首行**，续行顶格（与 markdown 段落续行同款）。标记 `  ⚙ ` 占 5 显示列（2 空格 + ⚙ 2 列 + 1 空格），首行可用宽度 = 内容宽度 − 5。**注意两套口径**：`⚙` 的显示宽度是 2 列、char 数是 1——算宽度预算用 2 列，剥前缀用 char 数。
-
-**新增 System 消息类型时同理**：任何塞进单个 span 的长文本都会踩 `WordWrapper` 的坑。
-
-钉子：`render::system_message_wrap_tests::{system_message_does_not_split_a_chinese_phrase_across_lines, system_message_keeps_ascii_key_names_intact, system_message_lines_never_exceed_the_content_width, system_message_never_starts_a_line_with_closing_punctuation}`。
-
-**副作用**：`logical_line_height` 的快判（`Line::width() <= 视口宽度` → 1 行）现在对 System 消息也成立，因为渲染期已折好行。`chat_viewport_tests::wrapped_lines_contribute_their_physical_height` 因此**不再钉「逻辑行数 < 物理行数」这个中间量**（该中间量依赖「渲染期未折行」的前提，已不成立），改为直接钉结果：贴底时最后一条消息完整可见。
-
-
-## 终端 panic 还原与字符边界安全
-
-18. **TUI 终端 panic 还原 + char-boundary 安全工具（v0.2.21）**：
-    - **`crates/tui/src/panic_guard.rs`** 新增进程级 `panic::set_hook`：在 `cli::main()` 入口最前 `wyj_tui::panic_guard::install()` 注册（`take_hook` 链式保留前一个 hook），`run_tui` 内 `enter_terminal_screen` 成功后 `mark_active()`、`leave_terminal_screen` 成功后 `mark_inactive()`（全局 `AtomicBool TUI_SCREEN_ACTIVE`），panic 触发时 hook 检查到 active 就 best-effort 还原终端（`DisableMouseCapture` → `LeaveAlternateScreen` → `disable_raw_mode` → `Show`，每步吞错）再调 prev hook 写 panic 信息。背景：TUI 进入 alternate screen + raw mode 后若进程 panic，会跳过 `run_tui` 末尾清理，导致终端卡死 + 下次启动画面残留 frame + panic 写 stderr 覆盖 ratatui cell 造成画面撕裂。代价是后台 tokio worker 线程 panic 也会触发（worker 无 TTY，crossterm 命令会失败但错误吞掉，可接受）。另：鼠标捕获在启动阶段已显式关闭，正常退出时再发一次 `DisableMouseCapture` 只是防御性复位；本机制的起因是 2026-09 `stock_fenxi` 项目里 `memory_v3.rs:977` 的 `String::truncate(MAX_CONTEXT_BYTES)` 撞 CJK char boundary panic，panic 输出叠在 alternate screen 上造成排版撕裂（已由 `textutil::floor_char_boundary` 治本）。
-    - **`crates/core/src/textutil.rs` 新增 `floor_char_boundary(&str, usize) -> usize`**：按字节切字符串时（如 `String::truncate(MAX)`），先把上限回退到最近的 char boundary 再 truncate，避免 `String::truncate` 在 CJK / emoji 多字节字符中间触发 `is_char_boundary` assertion panic。`memory_v3.rs` 拼装 Active Memory 上下文超过 `MAX_CONTEXT_BYTES` 时接入；与 `wyj-tools::textutil::truncate_str`（返回 `&str`）分工——这里是 `usize` 索引版本，配合 `String::truncate` 做原地截断避免重复分配。
-    - **TUI 标题栏 / 状态栏文案简化（v0.2.21）**：`thinking_status_label` 改回单层优先级静态字符串（InProgress TodoItem 的 `active_form` 或 `content` → current_op 映射 `Reading file / Running command / Editing file / Updating todos / Delegating task / Browsing / Preparing plan / Running <Tool>` → permission_dialog → plan_dialog → pending_queue → fallback `Thinking`），砍掉旧的"大象装进冰箱"4 秒旋转短语——非功能性、多语言干扰、跨平台兼容性差。`draw_input` 标题栏只在 thinking 态保留 `⠋ {label}{suffix}`（spinner + label + animated dots）+ 加粗品牌橙；非 thinking 态 Plan/Bypass/Normal 三种模式标题栏分别精简为 `[plan] Enter to send` / `[bypass] Enter to send` / `Enter to send`，把 `↑↓ history / Shift+Enter newline / ! bash / / commands / Shift+Tab mode` 等长串提示砍掉（这些在顶部 `/help` 与 docs 里有完整说明）。状态栏（`draw_status`）默认右侧不再放 `ctrl+d or ctrl+c twice to exit  /help`，留给左侧"模型 / 进度 / 用量 / cwd"；thinking 指示器单点（标题栏）而非上下两处同闪烁。删除旧 `draw_input` 在 `is_thinking=true` 时提前 `return` 的逻辑——那个 `return` 跳过了末尾 `f.set_cursor_position`，crossterm 硬件光标永远停在"上次成功提交"位置、用户感觉光标卡死；现实现里 thinking 态仍调 `set_cursor_position` 让光标跟随用户实际操作，配套新增两个 `TestBackend` 回归测试（`draw_input_keeps_cursor_visible_while_thinking` + `draw_input_title_shows_thinking_spinner_when_thinking`）防止再次回归。
-    - **底部两行改为「实时进度 / 常驻身份」（v0.2.29，v0.3.7 改标题栏文案）**：把 v0.2.21 那条里的 `{label}{suffix}`（animated dots）与状态栏的 `total ↑↓ 用量`、`已自动压缩 ×N` 全部换掉。**输入框标题栏**（`draw_input` thinking 态）现在是 `⠋ {label} · {这一步耗时} · {实时速率} · {本轮 token ↑↓}`，耗时由 `AppState.current_op_started` 给出、语义是"这一步跑了多久"、无工具在跑时回落整轮耗时，token 取 `turn_live_input/output_tokens`。**实时速率（`AppState.stream_rate`）只在模型真正吐 token 时出现**：数据源是 `TextDelta` / `ThinkingDelta`（thinking 也算，否则开思考的模型一直 0），按字符经 `wyj_core::estimate_text_tokens_f64` 估 token（**必须用浮点版**——整数版对单字符片段是 `1/3=0`，逐 delta 累加永远是 0），分母只算首 token 之后的生成时长（TTFT/prefill 不算，否则速率被压成个位数），窗口取最近 2 秒滑动（整段平均会被一次长停顿永久拖低）。`ToolStart` / `TurnDone` / `Error` / `interrupt()` / `begin_turn_timing()` 五处必须 `reset()`：工具执行几十秒期间继续显示旧速率是在报一个已不存在的事实；`rate()` 另有 1.5s stale 兜底与 50ms 最小分母（防首帧假峰值）。显示精度 <10 保留一位小数、其余取整。窄屏丢弃优先级 `tokens(0) < elapsed(1) < rate(2) < queue(3)`——速率比累计量更该留下，但排队提示仍最优先。**label 的分工是「标题栏答在做什么，聊天区答对什么做」**：v0.2.29 曾让 label 直接取 `current_op` 原文（`Bash(cargo test)`），而聊天区的 `⏺` 行用的正是**同一个 `display` 字符串**（`app.rs` 的 `ToolStart` 分支一处写两个地方），于是底部那行与聊天区最后一条逐字节相同、只有 spinner 在动——看起来像界面卡住；v0.3.7 一度改成「第 N 步 · 工具名」，但步号既不回答"还剩多少"也不回答"在做什么"（`ToolEnd` 不清它，两次调用之间的纯思考阶段会显示 `第 3 步 · 思考中`，而耗时已回落整轮；并发工具还会跳号），已整体删除（`AppState.turn_step_no` 与 `spinner.step` 都不再存在）。现在的优先级是 `permission_dialog` → `plan_dialog` → InProgress todo 的 `active_form`/`content`（意图）→ `current_tool_name` 经 `tool_activity_label()` 映射成**动词短语**（`Bash` → `运行命令`，i18n 段 `tool_activity.*`；未收录的工具回落注册名，拼错 key 也回落注册名而不是把 `tool_activity.xxx` 露给用户）→ `current_op` 原文（仅剩 `/compact` 这类非工具型后台任务，它们没有对应的聊天区行）→ `pending_queue` → `Thinking`。新增工具时**必须同步 `tool_activity.*` 的中英两条**，钉子 `tool_activity_label_covers_every_registered_tool_and_falls_back_to_name` 逐个验当前全部内置工具。**animated dots 已删除**（与耗时/用量同时动会发飘，窄屏最先被挤掉），spinner 帧是唯一的运动效果。**token 的实时数据源只能是 `AgentEvent::UsageDelta`（`with_usage_callback` 逐请求回调）**——`AgentEvent::Usage` 只在**整回合收尾**时推一次 session 累计（`total_*` 在回合进行中纹丝不动），拿 `total_* - turn_start_*` 做差会让标题栏整个回合都显示 `0↑ 0↓`；所有发起回合的入口（用户消息/排队注入/自动唤醒/slash 命令展开的 prompt）统一走 `AppState::begin_turn_timing()` 归零实时计数器，漏一处就会把上一轮的量带进下一轮。**状态栏**（`draw_status`）收成三段常驻：`◆ <模型> [auto|plan|bypass] · <cwd>`，三种模式**全部显式标注**（旧实现 Normal 不显示任何标记，"看不到标记"无法区分是 Normal 还是芯片被挤出屏幕）；**Bypass 三处同色为 `danger` 槽位**（状态栏芯片 + 标题栏 `[bypass] Enter to send` + 输入框边框），它等价于"本次会话跳过全部权限确认"，黄色偏中性、承担不了提醒职责；**默认档 auto 走中性灰（`dim`）而不是 success 绿**，输入框边框也回到默认 `Theme::border()` 不染色——手动模式并入 auto 之后它是唯一日常档，并没有"通过了什么"，染绿会让用户把状态读成"已获授权"。钉子 `auto_mode_is_painted_neutral_gray_not_success_green` 一并断言状态栏芯片、标题栏标签、输入框边框三处；`已自动压缩 ×N` 下线（压缩情况改查 `/context`）。右侧仅在排队 / Ctrl+C 待确认时出现临时提示，平时为空。回归钉子：`draw_input_title_shows_step_elapsed_and_turn_tokens_when_thinking`（四段整帧断言）、`title_token_text_ignores_session_usage_that_only_lands_at_turn_end`、`draw_status_labels_every_mode_and_paints_bypass_red`、`usage_delta_accumulates_this_turn_and_resets_on_next_turn`。
-
-## 后台任务可见性与自动续跑
-
-20. **后台任务可见性与自动续跑（v0.2.25+）**：解决"派完活就不动"和"后台输出看不见"两个问题。
-    - **自动唤醒**（`app.rs` 主循环 idle 钩子）：后台 subagent 结果此前只进 `pending_bg_reminders` 等用户下一条消息、后台 shell 更只返回 `bash_N` id 靠模型自己轮询 `BashOutput`，两条路都停在等用户输入。现在 idle 时 `AppState::poll_shells()` 同步 `BashSessionManager::global().list()` 到 `shells`，检测到退出就把 `prompts::bg_shell_done_reminder`（含输出尾部，经 `truncate_head_tail` 收口到 4KB）推进 `pending_bg_reminders`；**第二个独立 if 块**在 `!is_thinking && !pending_bg_reminders.is_empty() && !auto_wake_paused` 时起新 turn。多任务同帧完成**合并成一轮**（`reminders.join("\n\n")`），避免连续多次 LLM 往返。
-    - **两种回合必须区分**：`spawn_agent_turn` 的 `text: Option<String>`——`Some(用户输入)` 常规回合，`None` 自动唤醒回合（reminder 本身就是这一轮唯一 user 输入）。若自动唤醒时传 `Some(reminder 原文)`，reminder 会被当成"用户说的话"写进 session 历史并在 `/resume` 后继续显示。聊天流侧只 push `ChatMessage::system(tr("bg_wake.notice"))`，不暴露 reminder 原文。
-    - **ESC 保护**：`AppState.auto_wake_paused` 在 `interrupt()` 置 true、`begin_new_turn()` 清 false——用户主动打断意味着"先别继续"，此时后台任务完成也不该自动唤醒（会显得不听话）。
-    - **只读快照 API**（`bash_session.rs::BackgroundJob::tail(max_bytes)`）：面板每帧要读输出，但 `read_new()` 推进的是 `BashOutput` 工具的增量读游标，两者共用会互相抢内容（面板看到空白、工具看到"无新输出"）。`tail` 按 char boundary 收口（中文/emoji 安全）且**不推进游标**。**新写 UI 侧读输出时不要用 `read_new()`。**
-    - **退出误唤醒**：`kill_all()`（`app.rs` 退出路径 + `cli/main.rs` headless）给所有 Running job 发 SIGKILL，但 `spawn_prepared` 里的 `child.wait()` task 仍会把它们翻成 `Exited(-1)`。轮询检测**必须**用 `!state.should_quit` 守卫拦在前面，否则退出那一帧会把每个后台任务都误判为"刚完成"并触发唤醒。
-    - **两级生命周期粒度**：`begin_new_turn()`（每轮对话）**刻意不清** `shells`——dev server 等任务跨轮次持续存在，在这儿清会让它们从面板凭空消失；真正作废的是 `reset_for_new_session()`（`/clear`/新会话/resume），它现在自己就做三件事：`hub.abort_all()`、记 `stale_shells` 后 `BashSessionManager::global().kill_all()`、清表。**「进程本身由退出路径的 kill_all 收走」是错的**（v0.3.17 修）：`/new` 走不到退出路径，旧会话的 dev server/watcher 会继续跑并继续写文件。
-    - **`/new` 之后 AI 还在继续调用**（v0.3.17 修，两个独立根因，都得修）：① **忙碌期把 slash 命令当正文排队**——`runs_while_busy` 默认 false 是对的（`/new` 绝不能中途改会话），但落点不能是 `queue.push(InjectionKind::UserMessage)`：那等于把字面的 `/new` 当用户消息发给模型并让它再跑一轮。现在 Enter 分支用 `draft_is_known_command` 把「已注册命令」单独判出来，明确拒绝 + `command.busy_rejected` 提示，输入框内容保持原样，ESC 后可重试；只有非命令正文与未知命令才排队。② **清表不作废生产者**——`pending_bg_reminders` 的自动唤醒判据只看「有没有待注入内容」，不认来源会话，于是旧会话的后台子 Agent Done / 后台 shell 退出通知会灌进新会话并起一轮模型请求。修法是两层归属过滤：`apply_sub_agent_event` 的 `E::Done` 在 `sub_agents` 里查不到该 id（`reset_for_new_session` 已清表）就整段 `return`，连 trace 都不写；shell 侧靠 `AppState::stale_shells`，`poll_shells` 见到就跳过——**只 kill 不记黑名单没用**，`BashSessionManager::jobs` 只增不减，下一帧会走 `None => push(Running)` 把 `Exited(-1)` 的旧 job 当新任务登记回来并上报一次「刚完成」，等于把唤醒重新制造一遍。钉子：`busy_drafts_separate_commands_from_plain_text`、`done_from_a_reset_session_never_revives_the_agent`、`reset_for_new_session_retires_background_shells`、`poll_shells_ignores_shells_retired_by_the_previous_session`（另有反向对照 `poll_shells_still_reports_jobs_it_does_not_know_about`，防止 `sync_once` 假通过）。
-    - **面板优先级**（`render.rs::bottom_panel_size`）：`Shells` 与 `SubAgents` 互斥（底部只有一个位置），规则是**用户焦点优先，其次按"有运行中任务"**。两者常同时跑（派 agent 改代码 + 自己起 dev server），固定先后会让其中一方永远看不见也按不了 k。跨区链条 `Chat ↓ → Todos ↓ → SubAgents ↓ → Shells`，`UiFocus` 需在 6 处 match 里同步加分支（`move_focus_selection` / `scroll_focus_lines` / `content_focus_active` / `enter_content_focus` / `leave_content_focus` / `toggle_focused_content_detail` / `close_panel_focus`）。
-    - **`Shift+↑` 进入内容区：三个容易踩回去的坑**（v0.3.11 修）。① 判定必须用 `contains(SHIFT)` + 排除 `CONTROL|ALT|SUPER`，**不能**用 `modifiers == SHIFT`——部分终端会带上额外修饰位，严格相等会让按键静默失效；② 判定位置必须在 `file_completions` / `slash_completions` 拦截**之前**，否则补全列表开着时 `KeyCode::Up` 被补全分支 `continue` 吃掉；③ `enter_content_focus` 的早退条件必须排除 `UiFocus::Chat`——滚动聊天区（PageUp/滚轮）会把焦点留在 Chat，把 Chat 当成「已在内容区」就会让「子 Agent 正在跑但进不去」稳定复现。主循环侧的触发条件因此是 `!content_focus_active() || (ui_focus == Chat && 下方面板存在)`：Chat 焦点下没有下方面板时不抢键，避免「正在滚历史时按 Shift+↑ 突然跳到会话末尾」。钉子：`only_shift_up_is_the_explicit_content_focus_shortcut`、`shift_up_from_chat_focus_still_enters_running_sub_agent`。
-    - **子 Agent 执行内容占内容区，不占面板**（v0.3.3）：选中子 Agent（`Shift+↑` / `↑↓` / `/subagents`）后 `draw()` 把 `chunks[0]` 从 `draw_chat` 换成 `draw_sub_agent_content`，底部面板退化成纯列表 + 选中高亮。**不要再把 trace 塞回面板**：面板高度受 `bottom_panel_size` 预算限制，且列表本身要占行，`ui_focus == SubAgents` 分支给的高度恒等于 `list_rows + 2`，任何"详情区"布局判断（旧的 `inner.height > list_rows`）恒为 false —— 这就是曾经"选中子 Agent 后一片空白"的根因。后台 shell 面板**仍用面板内详情区**（`draw_shell_panel`），两者刻意不对称：shell 详情是实时输出尾巴，量小；subagent trace 是完整工具入参/出参，需要整屏。
-    - **详情区 scroll 语义**：`draw_shell_panel` 的详情区与 `draw_sub_agent_content` 一致——`scroll` 是**"从正文第一行往下跳过的行数"**，与 `Paragraph::scroll` 同向（delta > 0 向下、delta < 0 向上），渲染时用 `Paragraph::line_count` 重算并 clamp 写回 `shell_detail_max_scroll` / `sub_agent_detail_max_scroll`（`draw()` 每帧先防御性清零）。**"贴底跟随新内容"由独立的 `*_detail_follow_tail` 标志表达，不再靠 `scroll == 0` 隐式承担**（v0.3.3 修：曾经把 `scroll` 当"距底部偏移"、渲染时再取反 `max_scroll - clamped`，而按键 `scroll_focus_lines` 原样透传 delta —— 两个约定相反，PageUp 反而把视口推向实时尾部，运行中子 Agent 持续追加 trace 事件就永远停不下来）。现在 `follow_tail` 为真时渲染每帧把 scroll 重置成 `max_scroll`，用户主动上滚即置假、此后新事件只在下方堆积不再拽走视口，滚回底部自动恢复跟随（提示行切成 `subagent.content_more_below`）。收敛与按键推进分别只经 `render::resolve_detail_scroll` 与 `AppState::scroll_detail_lines` 两个入口，**新增详情面板不要各写各的取反/clamp**。复位（切换选中项、关闭详情）一律走 `reset_sub_agent_detail_view` / `reset_shell_detail_view`，不要裸写 `scroll = 0`（会丢掉 follow_tail 语义）。钉子：`sub_agent_detail_scroll_direction_matches_render`、`page_up_moves_rendered_viewport_up_not_down`、`sub_agent_detail_detaches_from_live_tail_after_user_scrolls_up`。
-    - **内容区焦点不得让全局键穿透**：内容区焦点分支只具名处理导航/翻页/Esc，`_ => leave_content_focus()` 兜底**故意没有 `continue`**（普通字符仍需落进输入框），因此 `Ctrl+C` / `Ctrl+D` 会穿过它继续下坠到全局分支 —— `Ctrl+C` 命中 `interrupt()` → `current_task.abort()` + `hub.abort_foreground()`，在浏览执行轨迹时按 Ctrl+C 会把整轮执行和所有前台子 Agent 一起杀掉。修法是在 match **之前**先问 `AppState::content_focus_swallows_global_key(&key)`（只对 `UiFocus::SubAgents | UiFocus::Shells` 生效，`close_panel_focus()` + `continue`）；`Chat` 焦点下 Ctrl+C 仍保留"中断 Agent"的原义。新增内容区焦点类型时记得同步这个判定。
-    - **`k` 键无冲突**：裸 `k` 在内容区焦点态未占用；输入框的 `Ctrl+K`（kill-to-end）走 `key.modifiers.contains(CONTROL)` 另一条分支。`kill_selected_shell` 必须 `&mut self`（要 push 提示消息），且 `BashSessionManager::kill` 是 async（等 2s 兜底 SIGKILL），经 `state.kill_tx` 把 `AgentEvent::ShellKilled` 发回 UI 线程。
-    - **tasklist 摘要**：`push_inline_todo_lines` 在 `all_done` 时只画一行摘要（保留耗时/token 统计的可追溯信息），不画分隔线/条目/展开提示。`TurnDone` **刻意不清** `current_todos`（测试 `turn_done_auto_completes_remaining_in_progress_todos` 用 `expect` 锁死了该行为），所以"全部完成 → 下一条消息之间"面板会一直存在，收成一行是唯一能在不改该测试的前提下消掉干扰的办法。`Ctrl+T` 在 `all_done` 时 no-op（否则展开一个永远渲染不出来的空壳）。
-
-## 主循环绝不做阻塞等待
-
-19. **主循环绝不做阻塞等待（`/compact` 冻死界面的根因与治法）**：
-    - **因果链**：`tui_main` 是**同一个 task** 既重绘又读按键。只要在这个 task 上 `await` 一个完成时间不可预期的操作，`event::poll()` 就再也跑不到——界面停在最后一帧、ESC / Ctrl+C 读不到、回合停滞看门狗也不跑，最后只能 `kill`。`/compact` 曾把一次完整的 LLM 往返 inline 在这里（摘要预算 `min(cw/10, 16000)` + `RetryPolicy::default()` 的 5 次指数退避），端点不稳时能冻住数分钟且零反馈。
-    - **同类成员**：`/checkpoint`、`/rewind`、`/branch`、`/evolve` 的工作区快照（git 管道 / 全树哈希，秒级同步 IO）、`/bug` `/pr-comments` 的子进程（`git` / `gh` / `open`）。
-    - **统一形状**：`state.begin_background_task(label)` 点亮忙碌态（复用 `is_thinking`，顺带获得"输入被挡 + spinner + ESC 可 abort + 15 分钟停滞看门狗"），`spawn_turn_task` 起后台 task，做完经一个 `AgentEvent::*` 变体把**结果**发回主循环渲染。后台 task 里该等锁就 `lock().await`（不会冻结界面），但**发事件前必须先放锁**。
-    - **新增阻塞型 slash 命令**：在 `Command` 上实现 `needs_background() -> true`，TUI 会自动丢后台 task。契约：**只能返回 `Output` / `OutputPlain` / `None`**；返回 `RunPrompt` 的命令不能标（回合 spawn 只存在于主循环里，结果回事件通道起不了回合）——`/review` 就是这个原因才保持 inline，代价是秒级停顿。
-    - **回归钉子**（`app.rs` 测试模块）：`main_loop_never_awaits_the_session_lock`、`compact_runs_in_a_background_task_not_on_the_ui_thread`、`workspace_snapshot_commands_run_in_background_tasks`、`only_process_spawning_commands_are_marked_background`。
+渲染与主循环。颜色只允许出现在 `theme.rs`。模型侧文案不在这里。
+
+## 主循环
+
+- UI 线程**不能** `await` session 锁。回合 task 会把这把锁持有几分钟。用 `try_session_lock`。
+- 会阻塞的斜杠命令实现 `needs_background()`，放进后台 task，做完用 `AgentEvent` 把结果送回主循环。返回 `RunPrompt` 的命令不能标这个（`/review` 因此保持 inline）。
+- `pending_queue` 只是 `SteerQueue` 的镜像。主 Agent 和前台子 Agent 都会取走消息，水位必须按真实队列对账，不能假设只有一处出队。
+- 自动唤醒回合的 `text` 传 `None`。把 reminder 原文当用户消息写进历史，`/resume` 后还会显示。
+- 退出轮询必须看 `should_quit`。否则 `kill_all` 会把每个后台任务误报成刚完成。
+- 忙碌时不要把 `/new` 这类命令的字面文本排进模型。`runs_while_busy` 的默认与白名单见根文件。
+- 内容区焦点的兜底分支不要 `continue` 吞掉 `Ctrl+C`。`Ctrl+C` 仍要落到 `interrupt()`。
+- 面板里列出的 shell / 子 Agent 必须和后台真实存活的一致。口径只有 `running_shells()` 与 `visible_sub_agents()`，完成即从列表消失。读后台输出用 `tail`，不要用会推进游标的 `read_new`。
+
+## 配色与排版
+
+- 生产代码不许出现裸 `Color::`（含 Reset / Indexed）。例外只有欢迎页 logo 的渐变，走 `Theme` 的 RGB 辅助函数。新增或移动生产文件必须登记 `theme_tests::production_source`，否则扫描会漏掉整个文件。
+- 新增槽位同时接 `ThemePalette`、`Default`、`from_json`、getter。`from_json` 对未知键静默忽略，漏接就是主题半截生效且无报错。全部槽位用 RGB，不用具名色。
+- `inline_code` 不要并回 `code_fg`。Bypass 的状态栏芯片、标题栏、输入框边框三处都是 `danger`。状态栏不设显式背景。宽度按显示列宽算，不用 `chars().count()`；右段放不下就整段丢掉。
+- 思考档位没设过，或当前端点不认 effort 时，状态栏不显示档位。
+- `NO_COLOR` 只清颜色，保留粗体等修饰。非 truecolor 时 RGB 量化到 256 色，灰走灰阶。
+- 聊天高度按**物理行**（含折行）算。内容不足一屏时贴底画。不要用 `para.line_count()` 扫整段历史。
+- 折叠态不得读取 `content` 做预览。工具结果默认只画标题行，`Ctrl+O` 才出全文。`!` bash 输出是例外：全文，不折叠。
+- thinking 正文走 markdown。折叠头用 `⎿`。流式只解析尾部，并补上被切掉的未闭合围栏。外层缩进只有 4 列。展开态按宽度缓存；流式不缓存。
+- Bash 的完整命令单独成行，标题行里的摘要是截断过的。工具耗时走 `fmt_duration_precise`。
+- 系统通知用 `markdown::wrap_plain_text_spans` 折行。不要交给 `Paragraph` 的 `WordWrapper`（中文没有空格，会被拦腰截断）。
+- 子 Agent 详情是把 trace **翻译**成聊天消息再走同一条渲染管线，按事件条数缓存。不要在面板里铺原始 trace。交接摘要一行，报错进正文。
+- 实时工具输出两道闸：`tool_use_id` 已登记，且 `is_thinking`。中断后泵仍可能推来尾帧。
+
+## 输入与鼠标
+
+- 文本编辑只有 `input::apply_edit_key` 一份。多行面板必须把每一行画出来。
+- 输入框按光标开窗，上限约 8 行正文。附件占位符在输入框和聊天区必须逐字节相同。
+- `[ui].mouse` 默认 `auto`（只有 `TERM` 空或 `dumb` 才关）。捕获鼠标后，选择和复制由应用做，松开写入系统剪贴板。拖选不跨内容区与输入框。滚动不清除选区，选区按锚点跟着文字走。带修饰位的字符键不是正文（`Cmd+C` 不能变成插入 `c`）。
+- `Shift+↑` 进内容区：用 `contains(SHIFT)` 且排除 Control/Alt/Super，不要用 `modifiers == SHIFT`。判定要在补全菜单之前。
+- 斜杠补全只匹配第一个命令名，参数不参与查询。前缀优先，其次是有序子序列和相邻笔误；单字符只做前缀。命令名已写对且后面有参数时收起菜单。接受建议时替换命令名、保留参数。不要在 TUI 里把候选再按名字重排，排序在 `CommandRegistry::complete`。
+- 欢迎页不重复 model / cwd。每一行显示宽度含缩进和图标，必须 `<=` 栏宽。窄终端整条丢掉命令，不要截断成半个命令名。logo 与版本号紧挨着，和提示区之间空两行。
+
+## 面板
+
+- `/profile` 的字段表是 `PROFILE_FIELD_SPECS`。顺序即渲染顺序。新字段要同时接读写 match，并且 `en.yml` / `zh.yml` 都有 label key（缺 key 会原样显示 key）。枚举候选第一项是空串，表示跟随默认。思考字段按线协议分流，不要两套都铺出来。模型字段 Enter 能手填，不能只有拉取菜单。
+- 「仅本会话使用」的分组存在 `session_profile_override`，不写 `config.toml`。任何写盘路径用 `state.config`，不用叠了覆盖的有效配置。状态栏要显示分组名。切换成功后收起面板。
+- `/evolve` 保持 Active / Candidates / Episodes / Health 四视图。危险动作二次确认。
+- 全部 todo 完成时摘要只留一行。`TurnDone` 不清 `current_todos`；正常结束才把残留的 in_progress 补成完成，截断的回合不要补（见 `core` 的 `turn_truncated`）。
+- 新建分组的 `max_tools_per_turn` 预填 4。留空会让国内端点按目录判成每轮 1 个工具。
+
+## 渲染时不要退回去的行为
+
+- `draw_chat` 只把视口里的行交给 `Paragraph`。`scroll` 是 `u16`，整段历史塞进去会卡，也会滚不到底。高度按物理行算。
+- `Ctrl+O` 是「自动 ↔ 全展开」，不是「全折叠 ↔ 全展开」。正在执行的步骤保持展开。Edit/Write 折叠态仍显示最多约 20 行 diff；不要把这个例外扩到 Bash 这类大输出。
+- 退出前排空在途的按键 release，panic hook 无条件 `PopKeyboardEnhancementFlags`。否则 Ghostty 的 `CSI u` 会漏进 shell，提示符后多出 `9;5;3u`。
+- 鼠标报告只开 1000/1002/1006，不要开 1003，也不要改用 crossterm 的 `EnableMouseCapture`。
+- 不要再试 Inline viewport 来做贴底。那条路已经因为光标查询竞态失败过。
+- 标题栏 token 只累加 `UsageDelta`。`Usage` 要到回合结束才到，用它做差会整轮显示 0。新工具要补 `tool_activity.*` 的中英条文案。
+- 链接画在最终 Buffer 上，不要把 OSC 8 写进 `Span`。打开命令按单个参数调用，不经 shell 拼接。
+- `/new` 不能把字面命令排进模型。清会话时把后台 shell 记进 `stale_shells` 再 kill，只 kill 不记名单，下一帧会把它们当成新任务唤醒。
+- 子 Agent / shell 的内容区焦点要先吞掉 `Ctrl+C`，否则浏览轨迹时会把整轮和前台子 Agent 一起杀掉。Chat 焦点下 `Ctrl+C` 仍是中断。
+- 详情滚动用 `follow_tail`，不要把 `scroll` 取反。上滚必须离开实时尾部。
+- `panic_guard::install` 在进入备用屏幕后 `mark_active`。按字节截断字符串先走 `floor_char_boundary`。
+- 源码扫描测试定位函数体时按花括号配平，不要用「下一个顶格 `fn`」当边界。
