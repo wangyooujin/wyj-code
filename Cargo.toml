@@ -104,7 +104,11 @@ sha2 = "0.10"
 # 压缩包解压（self-update）
 flate2 = "1"
 tar = "0.4"
-zip = "2"
+# 只用 Deflate 一���压缩方式：项目仅使用 CompressionMethod::Deflated，
+# 不需要 xz / zstd / bzip2 / deflate64 / aes-crypto。
+# 裁掉后不再编译 zstd-sys / lzma-sys / bzip2 / aes（4 个 C 依赖），
+# 首次冷构建省约 4.6s。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # 内部 crate
 wyj-config = { path = "crates/config" }
@@ -161,3 +165,13 @@ opt-level = 3
 lto = "thin"
 strip = true
 codegen-units = 1
+
+# ---------------------------------------------------------------------------
+# 本地 patch：裁剪 xcap 拉入的 objc2-app-kit 默认 features
+# ---------------------------------------------------------------------------
+# xcap 未声明 default-features = false，导致 objc2-app-kit 启用全部 298 个
+# 默认 feature（294 个生成文件 / 4.9 MB），而 xcap 只用到十来个 AppKit 类。
+# vendor/xcap 里只改了 Cargo.toml 的依赖声明，源码未改。
+# 详见 vendor/xcap/README-patch.md。
+[patch.crates-io]
+xcap = { path = "vendor/xcap" }

@@ -40,8 +40,11 @@ objc2-application-services = { version = "0.3", default-features = false, featur
 # 是所有后台定向动作的前置安全条件——只剩 AX 一条路等于整个工具在真机上
 # 全面拒绝执行。`NSWorkspace.frontmostApplication` 是 Apple 文档里
 # 「当前接收键盘事件的应用」的官方定义，且不需要任何额外 TCC 授权。
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "std"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSData", "NSArray", "NSDictionary", "std"] }
+# NSGraphics：NSScreen/NSPasteboard 的部分方法依赖它
+# libc：NSRunningApplication.processIdentifier() 需要它
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSPasteboard", "NSPasteboardItem", "NSWorkspace", "NSRunningApplication", "NSGraphics", "libc", "std"] }
+# NSKeyValueCoding：NSDictionary.valueForKey() 需要它
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSString", "NSData", "NSArray", "NSDictionary", "NSValue", "NSObject", "NSKeyValueCoding", "std"] }
 # 系统 OCR（`VNRecognizeTextRequest`）。只在 AX 树空洞时用——微信这类原生
 # 自绘应用既不暴露元素、也无法 hit-test，读屏就只剩视觉这一条路。不引入
 # 任何第三方 OCR 依赖，只链接系统 Vision.framework。
