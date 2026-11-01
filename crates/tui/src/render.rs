@@ -4052,7 +4052,7 @@ fn draw_slash_completions(f: &mut Frame, state: &AppState, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Theme::plan())
         .title(Span::styled(
-            " / 命令 & Skill  ↑↓ 选择  Tab/Enter 填入  Esc 关闭 ",
+            " / 命令 & Skill  ↑↓ 选择  Tab 填入  Enter 执行  Esc 关闭 ",
             Theme::plan(),
         ));
 

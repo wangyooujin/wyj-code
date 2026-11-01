@@ -668,6 +668,8 @@ pub(super) fn clear_composer(state: &mut AppState, input: &mut InputBox) {
     state.pending_pastes.clear();
     state.paste_hint = None;
     state.slash_completions.clear();
+    state.slash_selected = 0;
+    state.slash_token_start = None;
     state.file_completions.clear();
     state.history_idx = None;
     state.history_draft = None;

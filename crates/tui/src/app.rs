@@ -1244,7 +1244,7 @@ mod navigation_focus_tests {
     fn enter_with_completions_open_fills_the_selected_command() {
         assert!(slash_completion_enter_fills("/mo", "/model"));
         assert!(slash_completion_enter_fills("/", "/help"));
-        let filled = slash_completion_input("/mo", "/model");
+        let filled = slash_completion_input("/mo", 0, "/model");
         assert_eq!(filled.display_lines(), &["/model "]);
     }
 
@@ -1252,19 +1252,100 @@ mod navigation_focus_tests {
     /// 大小写不一致也要填入注册表里的原样名字，否则回车会把 `/Model` 提交出去。
     #[test]
     fn accepting_a_suggestion_keeps_arguments_already_typed() {
-        let filled = slash_completion_input("/modle gpt", "/model");
+        let filled = slash_completion_input("/modle gpt", 0, "/model");
         assert_eq!(filled.display_lines(), &["/model gpt"]);
-        assert!(slash_completion_enter_fills("/modle gpt", "/model"));
+        assert!(slash_completion_enter_fills("/modle", "/model"));
         assert!(slash_completion_enter_fills("/Model", "/model"));
-        assert!(!slash_completion_enter_fills("/model gpt", "/model"));
+        assert!(!slash_completion_enter_fills("/model", "/model"));
     }
 
     /// 已经填好的形态（Tab 刚填过、或手输与选中项完全一致）必须放行提交，
     /// 否则用户会经历「回车 → 只填入 → 再回车才执行」的多余一步。
     #[test]
     fn enter_lets_through_once_the_input_already_equals_the_selection() {
-        assert!(!slash_completion_enter_fills("/model ", "/model"));
         assert!(!slash_completion_enter_fills("/model", "/model"));
+    }
+
+    /// mid-input：正文后面的 `/mo` 也能定位到活跃 token（Claude 同款）。
+    #[test]
+    fn finds_slash_token_after_existing_text() {
+        let text = "hello /mo";
+        let span = find_active_slash_token(text, text.chars().count()).unwrap();
+        assert_eq!(span.start, 6);
+        assert_eq!(span.token, "/mo");
+
+        let text = "hello\n/model";
+        let span = find_active_slash_token(text, text.chars().count()).unwrap();
+        assert_eq!(span.start, 6);
+        assert_eq!(span.token, "/model");
+    }
+
+    /// 行首 `/model` 仍走 leading 路径；光标进参数区后收起。
+    #[test]
+    fn leading_slash_token_hides_once_cursor_enters_args() {
+        let text = "/model";
+        assert_eq!(
+            find_active_slash_token(text, text.chars().count())
+                .unwrap()
+                .token,
+            "/model"
+        );
+        let with_args = "/model gpt";
+        // 光标在 "gpt" 上 → 无活跃 token
+        assert!(find_active_slash_token(with_args, with_args.chars().count()).is_none());
+        // 光标仍在命令名末尾 → 仍有 token
+        assert_eq!(
+            find_active_slash_token(with_args, "/model".chars().count())
+                .unwrap()
+                .token,
+            "/model"
+        );
+    }
+
+    /// 路径中间的 `/`（前面不是空白）不算 mid-input 命令。
+    #[test]
+    fn path_slash_without_whitespace_is_not_a_command_token() {
+        let text = "see src/main";
+        assert!(find_active_slash_token(text, text.chars().count()).is_none());
+    }
+
+    /// Tab 填入就地 splice，前缀正文保留。
+    #[test]
+    fn accepting_mid_input_suggestion_keeps_prefix_text() {
+        let flat = "hello /mo";
+        let filled = slash_completion_input(flat, 6, "/model");
+        assert_eq!(filled.display_lines(), &["hello /model "]);
+        assert_eq!(filled.cursor_char_offset(), "hello /model ".chars().count());
+    }
+
+    /// Enter 执行前把整段草稿归一成命令行（丢掉前缀）。
+    #[test]
+    fn submit_text_strips_prefix_before_the_slash_command() {
+        assert_eq!(slash_completion_submit_text("hello /model", 6), "/model");
+        assert_eq!(
+            slash_completion_submit_text("hello /model gpt", 6),
+            "/model gpt"
+        );
+        assert_eq!(slash_completion_submit_text("/model", 0), "/model");
+    }
+
+    /// 正文后打 `/mo` 必须弹出建议，并把 token 起点记下来供 Tab splice。
+    #[test]
+    fn update_slash_completions_opens_menu_for_mid_input_commands() {
+        let registry = wyj_commands::builtin::standard_registry();
+        let mut state = make_state();
+        let mut input = InputBox::new();
+        input.insert_text("hello /mo");
+        update_slash_completions(&mut state, &input, &registry);
+        assert!(
+            state
+                .slash_completions
+                .iter()
+                .any(|(name, _)| name == "/model"),
+            "mid-input `/mo` 应列出 /model，实际: {:?}",
+            state.slash_completions
+        );
+        assert_eq!(state.slash_token_start, Some(6));
     }
 
     #[test]
@@ -2092,6 +2173,11 @@ pub struct AppState {
     pub slash_completions: Vec<(String, String)>,
     /// 当前选中的补全项索引
     pub slash_selected: usize,
+    /// 活跃 slash token 在 composer flat 文本中的 `/` 字符下标。
+    ///
+    /// 补全菜单打开时由 [`update_slash_completions`] 写入；Tab/Enter 填入按这个
+    /// 位置就地 splice，而不是整框替换（Claude mid-input 同款）。
+    pub slash_token_start: Option<usize>,
     /// 输入历史（每次 submit 追加）
     pub input_history: Vec<String>,
     /// 当前历史导航索引（None = 未在导航模式）
@@ -2446,6 +2532,7 @@ impl AppState {
             last_ctrl_c: None,
             slash_completions: vec![],
             slash_selected: 0,
+            slash_token_start: None,
             input_history: vec![],
             history_idx: None,
             history_draft: None,
@@ -4642,6 +4729,85 @@ fn draft_is_known_command(registry: &CommandRegistry, draft: &str) -> bool {
     registry.get(name).is_some()
 }
 
+/// 光标处活跃的 slash 命令片段（Claude mid-input 同款）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlashTokenSpan {
+    /// flat 文本中 `/` 的字符下标。
+    start: usize,
+    /// `/` + 命令名（不含参数），例如 `/model`、`/mo`。
+    token: String,
+}
+
+fn is_slash_cmd_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'
+}
+
+/// 在光标处找活跃的 slash token。
+///
+/// - **行首**：`trim_start` 后以 `/` 开头，且光标仍停在命令名内（未进入参数）；
+/// - **mid-input**：光标前存在「空白 + `/` + 命令名」，且光标未越过该命令名
+///   （Claude `findMidInputSlashCommand`）。
+fn find_active_slash_token(text: &str, cursor_chars: usize) -> Option<SlashTokenSpan> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor_chars.min(chars.len());
+    if let Some(span) = find_mid_input_slash_token(&chars, cursor) {
+        return Some(span);
+    }
+    find_leading_slash_token(&chars, cursor)
+}
+
+fn find_mid_input_slash_token(chars: &[char], cursor: usize) -> Option<SlashTokenSpan> {
+    // 整段以 `/` 开头时走行首路径，避免与 mid-input 抢。
+    if chars.first().is_some_and(|c| *c == '/') {
+        return None;
+    }
+    let before = &chars[..cursor];
+    // 从光标往回跳过命令名字符，前面应是 `/`，再前面应是空白。
+    let mut i = before.len();
+    while i > 0 && is_slash_cmd_char(before[i - 1]) {
+        i -= 1;
+    }
+    if i == 0 || before[i - 1] != '/' {
+        return None;
+    }
+    let slash_pos = i - 1;
+    if slash_pos == 0 || !before[slash_pos - 1].is_whitespace() {
+        return None;
+    }
+    let mut name_end = slash_pos + 1;
+    while name_end < chars.len() && is_slash_cmd_char(chars[name_end]) {
+        name_end += 1;
+    }
+    // 光标已落到参数区（命令名后的空白之后）→ 不显示建议。
+    if cursor > name_end {
+        return None;
+    }
+    let token: String = chars[slash_pos..name_end].iter().collect();
+    Some(SlashTokenSpan {
+        start: slash_pos,
+        token,
+    })
+}
+
+fn find_leading_slash_token(chars: &[char], cursor: usize) -> Option<SlashTokenSpan> {
+    let leading = chars.iter().take_while(|c| c.is_whitespace()).count();
+    if leading >= chars.len() || chars[leading] != '/' {
+        return None;
+    }
+    let mut name_end = leading + 1;
+    while name_end < chars.len() && is_slash_cmd_char(chars[name_end]) {
+        name_end += 1;
+    }
+    if cursor < leading || cursor > name_end {
+        return None;
+    }
+    let token: String = chars[leading..name_end].iter().collect();
+    Some(SlashTokenSpan {
+        start: leading,
+        token,
+    })
+}
+
 /// 根据输入框内容更新 slash 补全候选列表。
 ///
 /// 排序由 `CommandRegistry::complete` 决定（前缀优先于相近拼写）。这里再按
@@ -4651,16 +4817,23 @@ fn update_slash_completions(
     input: &InputBox,
     registry: &wyj_commands::CommandRegistry,
 ) {
-    let first_line = input.lines.first().map(|s| s.as_str()).unwrap_or("");
-    if input.lines.len() == 1 && first_line.trim_start().starts_with('/') {
-        let completions = registry.complete(first_line);
-        if completions != state.slash_completions {
+    let flat = input.flat_text();
+    let cursor = input.cursor_char_offset();
+    if let Some(span) = find_active_slash_token(&flat, cursor) {
+        let completions = registry.complete(&span.token);
+        let start_changed = state.slash_token_start != Some(span.start);
+        if completions != state.slash_completions || start_changed {
             state.slash_completions = completions;
             state.slash_selected = 0;
+            state.slash_token_start = Some(span.start);
         }
-    } else if !state.slash_completions.is_empty() {
+        if state.slash_completions.is_empty() {
+            state.slash_token_start = None;
+        }
+    } else if !state.slash_completions.is_empty() || state.slash_token_start.is_some() {
         state.slash_completions.clear();
         state.slash_selected = 0;
+        state.slash_token_start = None;
     }
 }
 
@@ -4670,26 +4843,44 @@ fn slash_command_token(current: &str) -> &str {
     rest.split_whitespace().next().unwrap_or("")
 }
 
-/// 命令名之后的参数。没有参数时返回空串。
-fn slash_command_args(current: &str) -> &str {
-    let rest = current.trim().strip_prefix('/').unwrap_or("");
-    match rest.find(char::is_whitespace) {
-        Some(pos) => rest[pos..].trim(),
-        None => "",
+/// 活跃 token（`/name`）在 flat 文本中的字符长度。
+fn slash_token_name_len(flat: &str, start: usize) -> usize {
+    let rest: String = flat.chars().skip(start).collect();
+    if !rest.starts_with('/') {
+        return 0;
     }
+    1 + rest
+        .chars()
+        .skip(1)
+        .take_while(|c| is_slash_cmd_char(*c))
+        .count()
 }
 
-/// 补全列表把选中命令写回输入框。
+/// 补全列表把选中命令写回输入框（就地 splice，保留前后正文）。
 ///
 /// 还没写参数时在命令名后补一个空格，方便接着打。已经写了参数（包括命令名
-/// 仍是笔误的 `/modle gpt`）则只替换命令名，参数原样留下。Tab 与 Enter 共用。
-fn slash_completion_input(current: &str, selected: &str) -> InputBox {
-    let mut text = selected.to_string();
-    text.push(' ');
-    text.push_str(slash_command_args(current));
+/// 仍是笔误的 `/modle gpt`）则只替换命令名，参数与后文原样留下。Tab 与 Enter 共用。
+fn slash_completion_input(flat: &str, start: usize, selected: &str) -> InputBox {
+    let name_len = slash_token_name_len(flat, start);
+    let before: String = flat.chars().take(start).collect();
+    let after: String = flat.chars().skip(start + name_len).collect();
+    let mut out = before;
+    out.push_str(selected);
+    out.push(' ');
+    out.push_str(after.trim_start());
+    let cursor = start + selected.chars().count() + 1;
     let mut input = InputBox::new();
-    input.insert_text(&text);
+    input.set_flat_text_with_cursor(&out, cursor);
     input
+}
+
+/// 菜单里命令名已对齐、准备执行时：整段草稿换成从 `/` 起的命令行（丢掉前缀正文）。
+fn slash_completion_submit_text(flat: &str, start: usize) -> String {
+    let line: String = flat.chars().skip(start).collect();
+    match line.find('\n') {
+        Some(i) => line[..i].trim().to_string(),
+        None => line.trim().to_string(),
+    }
 }
 
 /// 补全列表打开时按 Enter：命令名还不是选中项时**填入**，已经一致时放行提交。
@@ -4697,11 +4888,11 @@ fn slash_completion_input(current: &str, selected: &str) -> InputBox {
 /// - `/mo` 或 `/modle gpt` + 选中 `/model` → 填入（参数保留），停住；
 /// - `/model`、`/model `、`/model gpt` → 命令名已是 `/model`，放行提交。
 ///
-/// 比较的是命令名本身，不是整行。大小写必须与注册表一致：`/Model` 仍要填成
-/// `/model`，否则提交会被当成未知命令。
-fn slash_completion_enter_fills(current: &str, selected: &str) -> bool {
+/// 比较的是**活跃 token**的命令名，不是整框。大小写必须与注册表一致：`/Model`
+/// 仍要填成 `/model`，否则提交会被当成未知命令。
+fn slash_completion_enter_fills(token: &str, selected: &str) -> bool {
     let selected_name = selected.trim().trim_start_matches('/');
-    slash_command_token(current) != selected_name
+    slash_command_token(token) != selected_name
 }
 
 /// 未信任的项目级 server 被静默排除在外——一旦用户在信任确认面板里批准
@@ -8502,30 +8693,47 @@ async fn tui_main(
                             KeyCode::Tab => {
                                 let selected =
                                     state.slash_completions[state.slash_selected].0.clone();
-                                input = slash_completion_input(&input.text(), &selected);
+                                let flat = input.flat_text();
+                                let start = state.slash_token_start.unwrap_or(0);
+                                input = slash_completion_input(&flat, start, &selected);
                                 state.slash_completions.clear();
                                 state.slash_selected = 0;
+                                state.slash_token_start = None;
                                 continue;
                             }
                             // Enter 复用 Tab 的填入语义：命令名还不是选中项时写回输入框
-                            // （保留已经打上的参数），而不是提交不完整原文。命令名
-                            // 已经与选中项一致时落穿提交，避免再按一次回车。
+                            // （保留已经打上的参数与前缀正文），而不是提交不完整原文。
+                            // 命令名已经与选中项一致时：整段换成该命令行再落穿提交
+                            // （Claude shouldExecute——丢掉前缀正文，否则 dispatch
+                            // 认不出 mid-input 里的 `/model`）。
                             KeyCode::Enter => {
                                 let selected =
                                     state.slash_completions[state.slash_selected].0.clone();
-                                if slash_completion_enter_fills(&input.text(), &selected) {
-                                    input = slash_completion_input(&input.text(), &selected);
+                                let flat = input.flat_text();
+                                let start = state.slash_token_start.unwrap_or(0);
+                                let token =
+                                    find_active_slash_token(&flat, input.cursor_char_offset())
+                                        .map(|s| s.token)
+                                        .unwrap_or_else(|| selected.clone());
+                                if slash_completion_enter_fills(&token, &selected) {
+                                    input = slash_completion_input(&flat, start, &selected);
                                     state.slash_completions.clear();
                                     state.slash_selected = 0;
+                                    state.slash_token_start = None;
                                     continue;
                                 }
+                                let submit = slash_completion_submit_text(&flat, start);
+                                input = InputBox::new();
+                                input.insert_text(&submit);
                                 state.slash_completions.clear();
                                 state.slash_selected = 0;
+                                state.slash_token_start = None;
                                 // 落穿：不带 continue，让下方 Enter 分支提交
                             }
                             KeyCode::Esc => {
                                 state.slash_completions.clear();
                                 state.slash_selected = 0;
+                                state.slash_token_start = None;
                                 continue;
                             }
                             _ => {} // 其他键落穿到下方正常处理
@@ -8690,6 +8898,8 @@ async fn tui_main(
                         }
                         input.insert_newline();
                         state.slash_completions.clear();
+                        state.slash_selected = 0;
+                        state.slash_token_start = None;
                     } else if key.code == KeyCode::Enter && (!state.is_thinking || busy_slash) {
                         if composer_has_content(&state, &input) {
                             // 附件占位符的位置只存在于输入框内部（`take()` 之后
@@ -8700,6 +8910,8 @@ async fn tui_main(
                             let (text, composer_pastes) =
                                 take_composer_text(&mut state, &mut input);
                             state.slash_completions.clear();
+                            state.slash_selected = 0;
+                            state.slash_token_start = None;
                             state.file_completions.clear();
                             state.history_idx = None;
                             state.history_draft = None;
@@ -10236,6 +10448,8 @@ async fn tui_main(
                             let (text, composer_pastes) =
                                 take_composer_text(&mut state, &mut input);
                             state.slash_completions.clear();
+                            state.slash_selected = 0;
+                            state.slash_token_start = None;
                             state.file_completions.clear();
                             state.history_idx = None;
                             state.history_draft = None;

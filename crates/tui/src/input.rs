@@ -611,6 +611,62 @@ impl InputBox {
         self.cursor_col = self.lines[self.cursor_row].chars().count();
     }
 
+    /// 编辑序列的扁平文本（行以 `\n` 拼接，**保留**原子标记）。
+    ///
+    /// 斜杠命令定位必须与真实编辑位置一致；[`Self::text`] 会滤掉标记，不能拿来算下标。
+    pub fn flat_text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    /// 光标在 [`Self::flat_text`] 里的字符下标。
+    pub fn cursor_char_offset(&self) -> usize {
+        let mut offset = 0usize;
+        for (row, line) in self.lines.iter().enumerate() {
+            if row == self.cursor_row {
+                return offset + self.cursor_col.min(line.chars().count());
+            }
+            offset += line.chars().count() + 1; // +1 for '\n'
+        }
+        offset
+    }
+
+    /// 用扁平文本整体替换，并把光标放到给定字符下标（超出则贴末尾）。
+    pub fn set_flat_text_with_cursor(&mut self, text: &str, cursor_chars: usize) {
+        *self = Self::new();
+        if text.is_empty() {
+            return;
+        }
+        self.lines = text.split('\n').map(str::to_string).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        let mut remaining = cursor_chars;
+        for (row, line) in self.lines.iter().enumerate() {
+            let len = line.chars().count();
+            if remaining <= len {
+                self.cursor_row = row;
+                self.cursor_col = remaining;
+                return;
+            }
+            // 越过本行后还有换行符占 1 个字符下标（最后一行除外）
+            if row + 1 < self.lines.len() {
+                if remaining == len + 1 {
+                    // 光标落在行尾换行处 → 放到下一行行首
+                    self.cursor_row = row + 1;
+                    self.cursor_col = 0;
+                    return;
+                }
+                remaining = remaining.saturating_sub(len + 1);
+            } else {
+                self.cursor_row = row;
+                self.cursor_col = len;
+                return;
+            }
+        }
+        self.cursor_row = self.lines.len().saturating_sub(1);
+        self.cursor_col = self.lines[self.cursor_row].chars().count();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lines
             .iter()
@@ -942,6 +998,19 @@ mod tests {
             InputBox::line_visual_rows(&line, width),
             InputBox::wrap_for_render(&line, width).len()
         );
+    }
+
+    /// flat 文本与光标下标必须能来回对齐，斜杠 mid-input 定位依赖这对。
+    #[test]
+    fn flat_text_cursor_round_trips_across_newlines() {
+        let mut ib = InputBox::new();
+        ib.insert_text("hello\n/mo");
+        assert_eq!(ib.flat_text(), "hello\n/mo");
+        assert_eq!(ib.cursor_char_offset(), "hello\n/mo".chars().count());
+        ib.set_flat_text_with_cursor("hello\n/model ", "hello\n/model ".chars().count());
+        assert_eq!(ib.flat_text(), "hello\n/model ");
+        assert_eq!(ib.cursor_row, 1);
+        assert_eq!(ib.cursor_col, "/model ".chars().count());
     }
 
     /// 文字正好填满整行时，光标必须换到下一行首列，而不是叠在最后一个字符上。
