@@ -1,6 +1,7 @@
 _version: 1
 command:
   unknown: "未知命令: /{name}  (输入 /help 查看所有命令)"
+  unknown_suggest: "未知命令: /{name}。你是不是要 {suggestion}？  (或输入 /help 查看所有命令)"
   agent_control_desc: "对正在运行的子 Agent 发续跑、中断或重试指令"
   agent_control_usage: "/agent-control <id> <续跑文本|interrupt|retry>"
   background_unsupported: "命令 /{name} 声明为后台执行，但返回了 TUI 无法直接渲染的结果类型：{result}"
@@ -227,6 +228,10 @@ cli:
   trust_about: "一次性批准当前项目级的 MCP server、skill 与 hooks/verify"
   run_about: "一次性执行一条斜杠命令 / Skill（等价于在会话里敲 /xxx，但不进交互循环）"
   run_command_help: "要执行的命令（/name 或 name 均可），其后的参数原样传给命令"
+  rules_about: "结构裁剪项目里的 AGENTS.md / CLAUDE.md 等规约文件（不调用模型，默认只预览）"
+  rules_dry_run_help: "只预览，不写盘（默认开）"
+  rules_yes_help: "按预览结果写回文件"
+  rules_json_help: "以 JSON 输出"
 
 backup:
   export_done: "已导出到 {path}（{size}，含 {profiles} 个分组、{skills} 个 skill）"
@@ -301,6 +306,7 @@ help:
     - `/subagents [id]` — 打开子 Agent 聚合面板查看执行详情（含 /resume 恢复的历史会话）；带 id（如 a3）直接定位
     - `/shells [id]` — 打开后台 Shell 面板查看 run_in_background 启动的任务实时输出；带 id（如 bash_1）直接定位
     - `/doctor` — 诊断环境（API Key / 配置 / 记忆）
+    - `/rules [apply]` — 预览项目规约的结构裁剪（只删叙事句，约束句原样保留，不调用模型）；`apply` 才写盘。等价 CLI：`wyj-code rules`（`--yes` 写盘）
     - `/computer` — 诊断 computer-use（桌面 GUI 控制）可用性、注册状态与系统权限
     - `/memory` — 打开项目记忆面板（AGENTS.md / CLAUDE.md 等规约文件）
     - `/memory clear-all` — 清空 Memory v3 全库（Global + Project claims、jobs、audit），旧数据移到 backups/<ts>/，`rejected_history.json` 保留；TUI 二次确认后执行
@@ -352,7 +358,7 @@ help:
     - `拖动右侧滚动条` — 直接跳到对应位置；点轨道也能跳转
     - `Command+↑` / `Command+↓` — 跳到当前会话开头 / 最新消息
     - `Command+点击` / `Ctrl+点击` — 打开回复中的本地文件路径或网页链接
-    - `/` — 命令补全（Tab 确认，Esc 取消）
+    - `/` — 命令补全；名称相近时列出建议（↑↓ 选择，Tab/Enter 填入，Esc 取消）
     - `!<命令>` — 直接执行 Bash 命令
 
     ---
@@ -740,6 +746,31 @@ plugins:
     upgrade_failed: "升级失败: {err}"
     local_no_upgrade: "本地开发插件没有版本信息，无法升级"
 
+rules:
+  desc: "预览或写回项目规约文件的结构裁剪（不调用模型）"
+  usage: "/rules [apply]"
+  title: "规约裁剪"
+  label_file: "文件"
+  label_shadow: "未注入"
+  label_summary: "合计"
+  hint_label: "说明"
+  value_unchanged: "{path}（{size}，无需改动）"
+  value_below: "{path}（{before} → {after}，节省不够，不写盘）"
+  value_ready: "{path}（{before} → {after}，确认后会写盘）"
+  value_written: "{path}（{before} → {after}，已写入）"
+  value_skipped: "{path}（{reason}）"
+  value_failed: "{path}（{reason}）"
+  value_shadow: "{path} 同目录已有更高优先级的文件，这份不会注入"
+  value_empty: "项目里没有 AGENTS.md / CLAUDE.md / GEMINI.md / AGENT.md"
+  value_summary: "{count} 个文件，{ready} 个可裁"
+  skip_symlink: "符号链接，已跳过"
+  skip_utf8: "不是 UTF-8，已跳过"
+  skip_empty: "删完会变成空文件，已跳过"
+  hint_dry: "只删叙事句，约束句原样保留，不调用模型。要写盘：/rules apply 或 wyj-code rules --yes。"
+  hint_applied: "已写回。约束句没有改写。"
+  unknown_arg: "未知参数「{arg}」。用法：/rules 或 /rules apply"
+  failed: "有规约文件没能写回"
+
 doctor:
   desc: "诊断运行环境（API Key / 配置 / 项目规约文件 / 记忆）"
   title: "wyj-code v{version} 环境诊断"
@@ -765,7 +796,7 @@ doctor:
   value_search_unavailable: "未启用（{reason}）"
   value_rules_missing: "未找到（运行 /init 可生成 AGENTS.md）"
   value_rules_file: "{path}（{size}，~{tokens} tok）"
-  value_rules_oversized: "{path}（{size}，~{tokens} tok）— 偏大，建议精简或拆到子目录"
+  value_rules_oversized: "{path}（{size}，~{tokens} tok）— 偏大，可用 /rules 预览结构裁剪，或拆到子目录"
   value_rules_truncated: "{path}（{size}）超过 {limit} 注入上限，以下章节模型看不到：{headings}"
   value_rules_shadowed: "{shadowed} — 与 {path} 同职责但不会被加载"
   value_rules_bad_import: "{path} 中 @{imports} 解析不到，已原样保留"

@@ -254,7 +254,7 @@ pub trait Command: Send + Sync {
     /// 认证挂起、网络重试、大仓库的 `gh pr diff` 都可能拖到几十秒。TUI 主循环是
     /// 一个同时负责重绘和读按键的 task，inline `await` 它等于让界面停在那一帧——
     /// 不重绘、不 `event::poll()`，ESC / Ctrl+C 全部失效（见 `crates/tui/CLAUDE.md`
-    /// 第 19 条）。因此 TUI 见到 `true` 的命令会丢进后台 task，跑完用
+    /// 「主循环」）。因此 TUI 见到 `true` 的命令会丢进后台 task，跑完用
     /// `AgentEvent::BackgroundCommandDone` 把结果发回主循环渲染。
     ///
     /// 约定：后台执行的命令只能返回 `Output` / `OutputPlain` / `None`。
@@ -363,22 +363,273 @@ impl CommandRegistry {
         }
         match self.commands.get(name) {
             Some(cmd) => Some(cmd.run(args, ctx).await),
-            None => Some(Err(anyhow::anyhow!(
-                "{}",
-                wyj_i18n::tr_fmt("command.unknown", &[("name", name)])
-            ))),
+            None => Some(Err(anyhow::anyhow!("{}", self.unknown_message(name)))),
         }
     }
 
-    /// 返回以 prefix 开头的 (命令名, 描述) 对（用于补全）
-    pub fn complete(&self, prefix: &str) -> Vec<(String, String)> {
-        let p = prefix.trim_start_matches('/');
-        self.commands
-            .iter()
-            .filter(|(k, _)| k.starts_with(p))
-            .map(|(k, v)| (format!("/{k}"), v.description()))
-            .collect()
+    /// 按输入行给出斜杠补全。
+    ///
+    /// 只拿第一个命令名做查询，参数不参与匹配。命令名已经是注册表里的原样
+    /// 文本，并且后面已经有参数（含单独的尾随空格）时返回空列表：用户是在
+    /// 填参数，菜单应收起，回车交给 [`Self::dispatch`]。大小写写错（`/Model`）
+    /// 或拼写相近（`/modle`、`/mdl`）时仍返回建议，方便把命令名换对并保留参数。
+    ///
+    /// 排序：精确命中 > 前缀 > 有序子序列 / 词边界缩写 > 短编辑距离（含相邻
+    /// 对调）。同一档里按名字排。单字符只做前缀，避免 `/m` 把含 m 的命令全列出来。
+    pub fn complete(&self, line: &str) -> Vec<(String, String)> {
+        let trimmed_start = line.trim_start();
+        let Some(rest) = trimmed_start.strip_prefix('/') else {
+            return Vec::new();
+        };
+        // 不能先 `trim()`：`/model ` 的尾随空格表示「命令名已结束，接下来是参数」。
+        // 吃掉它之后菜单会在用户准备打参数时再次弹出。
+        let token_end = rest.trim_end();
+        let (token, has_args) = match token_end.find(char::is_whitespace) {
+            Some(i) => (&token_end[..i], true),
+            None => (token_end, rest.len() != token_end.len()),
+        };
+        if has_args && self.commands.contains_key(token) {
+            return Vec::new();
+        }
+        self.ranked_suggestions(token)
     }
+
+    fn unknown_message(&self, name: &str) -> String {
+        let suggestions: Vec<String> = self
+            .ranked_suggestions(name)
+            .into_iter()
+            .take(3)
+            .map(|(cmd, _)| cmd)
+            .collect();
+        if suggestions.is_empty() {
+            wyj_i18n::tr_fmt("command.unknown", &[("name", name)])
+        } else {
+            wyj_i18n::tr_fmt(
+                "command.unknown_suggest",
+                &[("name", name), ("suggestion", &suggestions.join(", "))],
+            )
+        }
+    }
+
+    fn ranked_suggestions(&self, query: &str) -> Vec<(String, String)> {
+        if query.is_empty() {
+            let mut all: Vec<_> = self
+                .commands
+                .iter()
+                .map(|(name, cmd)| (format!("/{name}"), cmd.description()))
+                .collect();
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+            return all;
+        }
+        let mut scored: Vec<(i32, String, String)> = self
+            .commands
+            .iter()
+            .filter_map(|(name, cmd)| {
+                score_command_name(query, name)
+                    .map(|score| (score, format!("/{name}"), cmd.description()))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut strong = Vec::new();
+        let mut weak = Vec::new();
+        for (score, name, desc) in scored {
+            if score >= SCORE_PREFIX {
+                strong.push((name, desc));
+            } else if weak.len() < WEAK_SUGGESTION_LIMIT {
+                weak.push((name, desc));
+            }
+        }
+        strong.extend(weak);
+        strong
+    }
+}
+
+/// 精确命中与前缀必须压过模糊匹配，模糊匹配必须压过笔误。
+/// `/co` 仍先列出 compact / config，而不是被名字里碰巧含有 co 的长命令挤到前面。
+const SCORE_EXACT: i32 = 3_000_000;
+const SCORE_PREFIX: i32 = 2_000_000;
+const SCORE_FUZZY: i32 = 1_000_000;
+/// 没有前缀时，最多再附上这么多条「像，但不是前缀」的建议。
+const WEAK_SUGGESTION_LIMIT: usize = 8;
+
+fn score_command_name(query: &str, name: &str) -> Option<i32> {
+    let query = lowercase_chars(query);
+    let name = lowercase_chars(name);
+    if query.is_empty() {
+        return None;
+    }
+    if name == query {
+        return Some(SCORE_EXACT);
+    }
+    if name.starts_with(&query) {
+        return Some(SCORE_PREFIX);
+    }
+    // 单字符只做前缀。模糊匹配会让 `/m` 命中几乎所有含 m 的命令。
+    if query.len() == 1 {
+        return None;
+    }
+    if fuzzy_acceptable(&query, &name) {
+        if let Some(raw) = fuzzy_score(&query, &name) {
+            return Some(SCORE_FUZZY + raw);
+        }
+    }
+    // 相邻对调（modle → model）不是子序列，前缀和模糊都抓不到。
+    // 查询短于 3 个字符时编辑距离太容易误伤，不启用。
+    if query.len() >= 3 {
+        let max_dist = if query.len() <= 4 { 1 } else { 2 };
+        let delta = name.len().abs_diff(query.len());
+        if delta <= max_dist {
+            let dist = osa_distance(&query, &name);
+            if (1..=max_dist).contains(&dist) {
+                return Some(800 - dist as i32 * 120 - delta as i32);
+            }
+        }
+    }
+    None
+}
+
+fn lowercase_chars(s: &str) -> Vec<char> {
+    s.chars().flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn is_boundary(name: &[char], index: usize) -> bool {
+    index == 0 || !name[index - 1].is_alphanumeric()
+}
+
+fn is_subsequence(query: &[char], name: &[char]) -> bool {
+    let mut i = 0;
+    if query.is_empty() {
+        return true;
+    }
+    for &ch in name {
+        if ch == query[i] {
+            i += 1;
+            if i == query.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn acronym_match(query: &[char], name: &[char]) -> bool {
+    let mut from = 0;
+    for &qc in query {
+        let Some(i) = name
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(i, &nc)| nc == qc && is_boundary(name, *i))
+            .map(|(i, _)| i)
+        else {
+            return false;
+        };
+        from = i + 1;
+    }
+    true
+}
+
+fn find_subslice(hay: &[char], needle: &[char]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 子序列太宽：`/m` 之后第二个字符几乎能套上所有命令。只接受三类对齐——
+/// 从名字开头往后、每个查询字符都落在词边界（`agent-control` 的 `ac`）、
+/// 或者整段查询本身就是某个词开头的连续子串（`control` 里的 `co`）。
+fn fuzzy_acceptable(query: &[char], name: &[char]) -> bool {
+    if query.is_empty() || name.is_empty() || !is_subsequence(query, name) {
+        return false;
+    }
+    if name.first() == query.first() && is_subsequence(&query[1..], &name[1..]) {
+        return true;
+    }
+    if acronym_match(query, name) {
+        return true;
+    }
+    query.len() >= 2 && find_subslice(name, query).is_some_and(|pos| is_boundary(name, pos))
+}
+
+/// fzf 那套打分的缩小版：命中记正分，连续命中和词边界加分，缺口加罚。
+/// 命令名都很短，O(m·n²) 足够，而且比「从左到右贪心」更不容易选错对齐。
+fn fuzzy_score(query: &[char], name: &[char]) -> Option<i32> {
+    let m = query.len();
+    let n = name.len();
+    if m == 0 || n == 0 {
+        return None;
+    }
+    const UNSET: i32 = i32::MIN / 4;
+    let mut dp = vec![vec![UNSET; n]; m];
+    for (j, &nc) in name.iter().enumerate() {
+        if nc != query[0] {
+            continue;
+        }
+        let mut score = 16;
+        if j == 0 {
+            score += 32;
+        } else if is_boundary(name, j) {
+            score += 12;
+        } else {
+            score -= (j as i32) * 2;
+        }
+        dp[0][j] = score;
+    }
+    for i in 1..m {
+        for j in 0..n {
+            if name[j] != query[i] {
+                continue;
+            }
+            let mut best = UNSET;
+            for (k, prev) in dp[i - 1].iter().copied().enumerate().take(j) {
+                if prev == UNSET {
+                    continue;
+                }
+                let gap = (j - k - 1) as i32;
+                let mut score = prev + 16;
+                if gap == 0 {
+                    score += 12;
+                } else {
+                    score -= 3 + gap;
+                }
+                if is_boundary(name, j) {
+                    score += 8;
+                }
+                best = best.max(score);
+            }
+            dp[i][j] = best;
+        }
+    }
+    dp[m - 1].iter().copied().filter(|s| *s != UNSET).max()
+}
+
+/// 最优串对齐距离，含一次相邻对调。笔误里对调（`modle`）比漏字母更常见，
+/// 普通 Levenshtein 会把它算成两次替换。
+fn osa_distance(a: &[char], b: &[char]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev2 = vec![0usize; n + 1];
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                curr[j] = curr[j].min(prev2[j - 2] + 1);
+            }
+        }
+        prev2.clone_from(&prev);
+        prev.clone_from(&curr);
+    }
+    prev[n]
 }
 
 impl Default for CommandRegistry {
@@ -494,5 +745,129 @@ mod busy_whitelist_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod suggest_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Command for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> String {
+            self.0.to_string()
+        }
+        fn usage(&self) -> String {
+            format!("/{}", self.0)
+        }
+        async fn run(&self, _args: &str, _ctx: &CommandContext) -> anyhow::Result<CommandResult> {
+            Ok(CommandResult::None)
+        }
+    }
+
+    fn registry(names: &[&'static str]) -> CommandRegistry {
+        let mut reg = CommandRegistry::new();
+        for name in names {
+            reg.register(Arc::new(Named(name)));
+        }
+        reg
+    }
+
+    fn names(items: &[(String, String)]) -> Vec<String> {
+        items.iter().map(|(name, _)| name.clone()).collect()
+    }
+
+    #[test]
+    fn empty_query_lists_every_command_in_name_order() {
+        let reg = registry(&["model", "help", "compact"]);
+        assert_eq!(
+            names(&reg.complete("/")),
+            vec!["/compact", "/help", "/model"]
+        );
+    }
+
+    #[test]
+    fn prefix_stays_ahead_of_a_weaker_match() {
+        let reg = registry(&["compact", "config", "agent-control"]);
+        let got = names(&reg.complete("/co"));
+        assert_eq!(got[0], "/compact");
+        assert_eq!(got[1], "/config");
+        assert!(got.iter().any(|n| n == "/agent-control"));
+        let weak = got.iter().position(|n| n == "/agent-control").unwrap();
+        assert!(got[..weak].iter().all(|n| n.starts_with("/co")));
+    }
+
+    #[test]
+    fn a_single_character_is_prefix_only() {
+        let reg = registry(&["model", "memory", "compact", "help"]);
+        let got = names(&reg.complete("/m"));
+        assert_eq!(got, vec!["/memory", "/model"]);
+    }
+
+    #[test]
+    fn subsequence_and_transposition_suggest_the_command() {
+        let reg = registry(&["model", "help", "compact"]);
+        assert_eq!(names(&reg.complete("/mdl")), vec!["/model"]);
+        assert_eq!(names(&reg.complete("/modle")), vec!["/model"]);
+        assert_eq!(names(&reg.complete("/hlep")), vec!["/help"]);
+        assert_eq!(names(&reg.complete("/ac")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hyphenated_acronym_is_suggested() {
+        let reg = registry(&["agent-control", "compact"]);
+        assert_eq!(names(&reg.complete("/ac")), vec!["/agent-control"]);
+    }
+
+    #[test]
+    fn case_mismatch_suggests_the_canonical_name() {
+        let reg = registry(&["model"]);
+        assert_eq!(names(&reg.complete("/Model")), vec!["/model"]);
+        assert_eq!(names(&reg.complete("/MODEL extra")), vec!["/model"]);
+    }
+
+    #[test]
+    fn exact_command_with_arguments_hides_the_menu() {
+        let reg = registry(&["model", "help"]);
+        assert!(reg.complete("/model extra").is_empty());
+        assert!(reg.complete("/model ").is_empty());
+        assert_eq!(names(&reg.complete("/modle extra")), vec!["/model"]);
+    }
+
+    #[test]
+    fn unrelated_text_suggests_nothing() {
+        let reg = registry(&["model", "help", "compact"]);
+        assert!(reg.complete("/zzzzqqq").is_empty());
+        assert!(reg.complete("model").is_empty());
+        let msg = reg.unknown_message("modle");
+        assert!(msg.contains("/modle"), "{msg}");
+        assert!(msg.contains("/model"), "{msg}");
+        let miss = reg.unknown_message("zzzzqqq");
+        assert!(miss.contains("/zzzzqqq"), "{miss}");
+        assert!(!miss.contains("/model"), "{miss}");
+    }
+
+    #[test]
+    fn removed_mode_command_suggests_model_instead() {
+        let reg = crate::builtin::standard_registry();
+        let got = names(&reg.complete("/mode"));
+        assert!(!got.iter().any(|n| n == "/mode"));
+        assert_eq!(got.first().map(String::as_str), Some("/model"));
+    }
+
+    #[test]
+    fn abbreviated_context_suggests_context_first() {
+        let reg = crate::builtin::standard_registry();
+        assert_eq!(
+            names(&reg.complete("/ctx")).first().map(String::as_str),
+            Some("/context")
+        );
     }
 }

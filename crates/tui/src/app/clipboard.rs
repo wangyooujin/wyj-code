@@ -999,7 +999,7 @@ mod clipboard_paste_tests {
             .collect()
     }
 
-    /// 核心不变量（`crates/tui/CLAUDE.md` 第 19 条）：**主循环里不得出现
+    /// 核心不变量（`crates/tui/CLAUDE.md`「主循环」）：**主循环里不得出现
     /// `session.lock().await`**。
     ///
     /// 主循环是同时负责重绘与读按键的**同一个 task**；在它上面等 session 锁，

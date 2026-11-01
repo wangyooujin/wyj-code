@@ -833,7 +833,7 @@ async fn execute_evolution_action(
 ///
 /// 为什么独立成函数：这一步 = 读 checkpoint + 预览文件 + **建保护快照**（git
 /// 管道或全树哈希）+ 还原文件，全是同步 IO，大仓库上秒级。放在主循环里
-/// inline await 会把整个界面按住不动（`crates/tui/CLAUDE.md` 第 19 条）。
+/// inline await 会把整个界面按住不动（`crates/tui/CLAUDE.md`「主循环」）。
 ///
 /// 与 `/evolve` 的旧写法不同，这里用 `session.lock().await` 而不是 `try_lock`：
 /// 本函数跑在后台 task 上，等锁不会冻结界面；换来的是"读了 messages 之后
@@ -1244,9 +1244,19 @@ mod navigation_focus_tests {
     fn enter_with_completions_open_fills_the_selected_command() {
         assert!(slash_completion_enter_fills("/mo", "/model"));
         assert!(slash_completion_enter_fills("/", "/help"));
-        // 带参数的中途形态：填入等于丢掉已打参数，因此这里只覆盖前缀形态。
-        let filled = slash_completion_input("/model");
+        let filled = slash_completion_input("/mo", "/model");
         assert_eq!(filled.display_lines(), &["/model "]);
+    }
+
+    /// 命令名写错、参数已经打上时，接受建议只替换命令名。
+    /// 大小写不一致也要填入注册表里的原样名字，否则回车会把 `/Model` 提交出去。
+    #[test]
+    fn accepting_a_suggestion_keeps_arguments_already_typed() {
+        let filled = slash_completion_input("/modle gpt", "/model");
+        assert_eq!(filled.display_lines(), &["/model gpt"]);
+        assert!(slash_completion_enter_fills("/modle gpt", "/model"));
+        assert!(slash_completion_enter_fills("/Model", "/model"));
+        assert!(!slash_completion_enter_fills("/model gpt", "/model"));
     }
 
     /// 已经填好的形态（Tab 刚填过、或手输与选中项完全一致）必须放行提交，
@@ -4632,16 +4642,18 @@ fn draft_is_known_command(registry: &CommandRegistry, draft: &str) -> bool {
     registry.get(name).is_some()
 }
 
-/// 根据输入框内容更新 slash 补全候选列表
+/// 根据输入框内容更新 slash 补全候选列表。
+///
+/// 排序由 `CommandRegistry::complete` 决定（前缀优先于相近拼写）。这里再按
+/// 名字排会把最佳建议沉下去，选中项也会跟着错。
 fn update_slash_completions(
     state: &mut AppState,
     input: &InputBox,
     registry: &wyj_commands::CommandRegistry,
 ) {
     let first_line = input.lines.first().map(|s| s.as_str()).unwrap_or("");
-    if input.lines.len() == 1 && first_line.starts_with('/') {
-        let mut completions = registry.complete(first_line);
-        completions.sort_by(|a, b| a.0.cmp(&b.0));
+    if input.lines.len() == 1 && first_line.trim_start().starts_with('/') {
+        let completions = registry.complete(first_line);
         if completions != state.slash_completions {
             state.slash_completions = completions;
             state.slash_selected = 0;
@@ -4652,26 +4664,44 @@ fn update_slash_completions(
     }
 }
 
-/// 补全列表把选中命令写回输入框时用的新 `InputBox`：命令名 + 一个尾随空格，
-/// 让用户直接接着打参数。Tab 与 Enter 共用这一条构造，避免两处各自逐字插入
-/// 后慢慢走偏。
-fn slash_completion_input(selected: &str) -> InputBox {
-    let mut input = InputBox::new();
-    for c in selected.chars() {
-        input.insert_char(c);
+/// 第一个空白前的命令名，不含前导 `/`。没有命令名时返回空串。
+fn slash_command_token(current: &str) -> &str {
+    let rest = current.trim().strip_prefix('/').unwrap_or("");
+    rest.split_whitespace().next().unwrap_or("")
+}
+
+/// 命令名之后的参数。没有参数时返回空串。
+fn slash_command_args(current: &str) -> &str {
+    let rest = current.trim().strip_prefix('/').unwrap_or("");
+    match rest.find(char::is_whitespace) {
+        Some(pos) => rest[pos..].trim(),
+        None => "",
     }
-    input.insert_char(' ');
+}
+
+/// 补全列表把选中命令写回输入框。
+///
+/// 还没写参数时在命令名后补一个空格，方便接着打。已经写了参数（包括命令名
+/// 仍是笔误的 `/modle gpt`）则只替换命令名，参数原样留下。Tab 与 Enter 共用。
+fn slash_completion_input(current: &str, selected: &str) -> InputBox {
+    let mut text = selected.to_string();
+    text.push(' ');
+    text.push_str(slash_command_args(current));
+    let mut input = InputBox::new();
+    input.insert_text(&text);
     input
 }
 
-/// 补全列表打开时按 Enter：应当**填入选中项**而不是提交输入框原文。
+/// 补全列表打开时按 Enter：命令名还不是选中项时**填入**，已经一致时放行提交。
 ///
-/// 判据是「输入框 trim 后的文本是否已经等于选中命令」：
-/// - `/mo` + 选中 `/model` → 不等，填入后停住，用户接着打参数；
-/// - `/model `（Tab 刚填过、或手输全一致）→ 相等，放行提交，
-///   否则用户会经历「填入 → 再按一次回车才执行」的多余一步。
+/// - `/mo` 或 `/modle gpt` + 选中 `/model` → 填入（参数保留），停住；
+/// - `/model`、`/model `、`/model gpt` → 命令名已是 `/model`，放行提交。
+///
+/// 比较的是命令名本身，不是整行。大小写必须与注册表一致：`/Model` 仍要填成
+/// `/model`，否则提交会被当成未知命令。
 fn slash_completion_enter_fills(current: &str, selected: &str) -> bool {
-    current.trim_end() != selected
+    let selected_name = selected.trim().trim_start_matches('/');
+    slash_command_token(current) != selected_name
 }
 
 /// 未信任的项目级 server 被静默排除在外——一旦用户在信任确认面板里批准
@@ -8472,21 +8502,19 @@ async fn tui_main(
                             KeyCode::Tab => {
                                 let selected =
                                     state.slash_completions[state.slash_selected].0.clone();
-                                input = slash_completion_input(&selected);
+                                input = slash_completion_input(&input.text(), &selected);
                                 state.slash_completions.clear();
                                 state.slash_selected = 0;
                                 continue;
                             }
-                            // Enter 复用 Tab 的填入语义：↑↓ 选中的命令写回输入框
-                            // 并补空格，而不是提交输入框里的不完整原文。若输入框
-                            // 已经是「命令 + 空格」的形态（Tab 刚填过、或手输完
-                            // 全一致），则落穿走正常提交，避免「填入后还要再按
-                            // 一次回车」。
+                            // Enter 复用 Tab 的填入语义：命令名还不是选中项时写回输入框
+                            // （保留已经打上的参数），而不是提交不完整原文。命令名
+                            // 已经与选中项一致时落穿提交，避免再按一次回车。
                             KeyCode::Enter => {
                                 let selected =
                                     state.slash_completions[state.slash_selected].0.clone();
                                 if slash_completion_enter_fills(&input.text(), &selected) {
-                                    input = slash_completion_input(&selected);
+                                    input = slash_completion_input(&input.text(), &selected);
                                     state.slash_completions.clear();
                                     state.slash_selected = 0;
                                     continue;
@@ -9080,7 +9108,7 @@ async fn tui_main(
                                         // 里 inline await：那会让同一个 task 既不重绘
                                         // 也不 `event::poll()`，界面冻死且 ESC /
                                         // Ctrl+C 全部读不到，只能 kill。见
-                                        // `crates/tui/CLAUDE.md` 第 19 条。
+                                        // `crates/tui/CLAUDE.md`「主循环」。
                                         let agent_c = shared_agent.read().unwrap().clone();
                                         let session_c = session.clone();
                                         let tx = agent_tx.clone();
@@ -9511,7 +9539,7 @@ async fn tui_main(
                                     Ok(CommandResult::OpenModelPicker) => {
                                         // 打开模型选择面板并**立即发起拉取**。
                                         // 拉取走后台 task（网络请求不能在主循环里
-                                        // await，见 crates/tui/CLAUDE.md 第 19 条），
+                                        // await，见 crates/tui/CLAUDE.md「主循环」），
                                         // 结果经 AgentEvent::ModelListFetched 回来。
                                         state.model_picker =
                                             Some(ModelPickerDialog::new(state.model_name.clone()));

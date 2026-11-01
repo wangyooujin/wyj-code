@@ -21,6 +21,7 @@ mod evolve_cmd;
 mod extensions_cmd;
 mod memory_cmd;
 mod review_cmd;
+mod rules_cmd;
 mod run_cmd;
 mod skillhub_cmd;
 mod storage_cmd;
@@ -208,6 +209,20 @@ enum Commands {
     Storage {
         #[command(subcommand)]
         command: storage_cmd::StorageCommand,
+    },
+    /// 结构裁剪项目里的 AGENTS.md / CLAUDE.md 等规约文件。
+    /// 不调用模型：只删叙事句，约束句原样保留。默认只预览。
+    #[command(name = "rules", about = wyj_i18n::tr("cli.rules_about"))]
+    Rules {
+        /// 只预览，不写盘（默认开）
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = true, help = wyj_i18n::tr("cli.rules_dry_run_help"))]
+        dry_run: bool,
+        /// 按预览结果写回文件
+        #[arg(long, conflicts_with = "dry_run", help = wyj_i18n::tr("cli.rules_yes_help"))]
+        yes: bool,
+        /// 以 JSON 输出
+        #[arg(long, help = wyj_i18n::tr("cli.rules_json_help"))]
+        json: bool,
     },
     /// 批准当前项目级 MCP server（`.wyj-code/mcp.toml`/`.mcp.json`）的信任确认。
     /// 无 UI 通道的场景（`-p`/`--headless`）会跳过未批准的
@@ -1443,6 +1458,7 @@ async fn main() -> Result<()> {
                     | Commands::Export { .. }
                     | Commands::Import { .. }
                     | Commands::Storage { .. }
+                    | Commands::Rules { .. }
                     | Commands::TrustMcp
                     | Commands::TrustSkills
                     | Commands::TrustHooks
@@ -1527,6 +1543,11 @@ async fn main() -> Result<()> {
             Commands::Storage { command } => {
                 let config_base = wyj_config::config_dir()?;
                 return storage_cmd::run(command, &config_base, &cfg);
+            }
+            Commands::Rules { dry_run, yes, json } => {
+                let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                let root = wyj_core::project_root(&cwd);
+                return rules_cmd::run(&root, yes || !dry_run, json);
             }
             Commands::Model { command } => return run_model_command(command, &cfg).await,
             Commands::Session { command } => return run_session_command(command, &cfg),
@@ -5153,6 +5174,36 @@ mod cli_tests {
                 "true"
             ])
             .is_err(),
+            "--yes 与 --dry-run 必须互斥"
+        );
+    }
+
+    /// `rules` 默认只预览。`--yes` 仍然留着 dry_run 的默认值，写盘判定是 `yes || !dry_run`。
+    #[test]
+    fn rules_subcommand_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["wyj-code", "rules"]).unwrap();
+        match cli.command {
+            Some(Commands::Rules { dry_run, yes, json }) => {
+                assert!(dry_run, "规约裁剪必须默认只预览");
+                assert!(!yes);
+                assert!(!json);
+                assert!(!(yes || !dry_run), "默认不该写盘");
+            }
+            other => panic!("expected Rules subcommand, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["wyj-code", "rules", "--yes"]).unwrap();
+        match cli.command {
+            Some(Commands::Rules { dry_run, yes, .. }) => {
+                assert!(yes);
+                assert!(dry_run);
+                assert!(yes || !dry_run, "--yes 必须写盘");
+            }
+            other => panic!("expected Rules subcommand, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(["wyj-code", "rules", "--yes", "--dry-run", "true"]).is_err(),
             "--yes 与 --dry-run 必须互斥"
         );
     }

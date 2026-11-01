@@ -77,10 +77,10 @@ pub struct RulesFileAudit {
 
 /// 单个目录内注入的规约文本字节上限。
 ///
-/// 规约是**一次性**注入（`seen_dirs` 去重后不再重发），所以这个上限比记忆快照的
-/// `MAX_CONTEXT_BYTES`(8KB) 宽松得多——它要挡的是「把生成物 / 数据导出 / 巨型文档
-/// 误写成 `AGENTS.md`」这类事故，而不是压缩正常规约。64KB 足以覆盖本仓库最大的
-/// `crates/tui/CLAUDE.md`(51KB)，正常规约一个都不会被切。
+/// 根目录规约每轮都进 system prompt；子目录规约每会话注入一次后留在历史里。
+/// 这个上限比记忆快照的 `MAX_CONTEXT_BYTES`(8KB) 宽松，要挡的是「把生成物或
+/// 巨型文档误写成 `AGENTS.md`」。本仓库的规约应远小于此值——超过就会静默丢掉
+/// 尾部规则。回归测试 `workspace_rule_files_stay_under_the_injection_budget`。
 ///
 /// 截断**保留头部并显式标注**：`char` 边界安全地切，绝不 panic；静默丢尾会让
 /// 模型以为自己读全了规则，后果比读到一半更糟。
@@ -640,6 +640,773 @@ fn collect_chain(root: &Path, cwd: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// 项目规约的结构裁剪。
+///
+/// 不调用模型，也不改写留下的句子：只删掉「此前 / 旧实现 / 实测」这类叙事句。
+/// 带约束词（必须、不得、不要、禁止，以及 must / do not / never）的句子原样保留。
+/// 已经够短的文件不会为了几十个字节重写一遍。
+const RULES_OPTIMIZE_MIN_SAVED_BYTES: usize = 400;
+const RULES_OPTIMIZE_MAX_KEEP_RATIO: usize = 92;
+
+const RULE_NAMES: &[&str] = &["AGENTS.md", "CLAUDE.md", "GEMINI.md", "AGENT.md"];
+const RULE_LOCAL_NAMES: &[&str] = &["AGENTS.local.md", "CLAUDE.local.md"];
+const RULES_WALK_SKIP_DIRS: &[&str] = &["target", "node_modules", "dist", "vendor"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RulesOptimizeSkip {
+    Symlink,
+    NotUtf8,
+    WouldBeEmpty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RulesOptimizeAction {
+    Unchanged,
+    BelowThreshold,
+    Ready,
+    Written,
+    Skipped(RulesOptimizeSkip),
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RulesOptimizeFile {
+    pub path: PathBuf,
+    pub before_bytes: usize,
+    pub candidate_bytes: usize,
+    pub shadowed: bool,
+    pub action: RulesOptimizeAction,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RulesOptimizeReport {
+    pub root: PathBuf,
+    pub applied: bool,
+    pub files: Vec<RulesOptimizeFile>,
+}
+
+/// 把一份规约收成候选文本。没有可删的叙事句时与输入逐字节相同（只把 CRLF 收成 LF）。
+pub fn optimize_rule_text(input: &str) -> String {
+    let normalized = input.replace("\r\n", "\n");
+    let Some(body) = condense_rule_text(&normalized) else {
+        return normalized;
+    };
+    if body.trim() == normalized.trim() {
+        return normalized;
+    }
+    let mut out = body.trim_end().to_string();
+    out.push('\n');
+    out
+}
+
+/// 扫描 `root` 下一整棵项目树里的规约文件。`apply == false` 只报告，不写盘。
+pub fn optimize_project_rules(root: &Path, apply: bool) -> anyhow::Result<RulesOptimizeReport> {
+    let mut paths = Vec::new();
+    walk_rule_files(root, &mut paths);
+    paths.sort();
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        files.push(optimize_one(&path, apply));
+    }
+    Ok(RulesOptimizeReport {
+        root: root.to_path_buf(),
+        applied: apply,
+        files,
+    })
+}
+
+fn optimize_one(path: &Path, apply: bool) -> RulesOptimizeFile {
+    let shadowed = is_shadowed_rule(path);
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return failed(path, 0, shadowed, error.to_string());
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes: meta.len() as usize,
+            candidate_bytes: meta.len() as usize,
+            shadowed,
+            action: RulesOptimizeAction::Skipped(RulesOptimizeSkip::Symlink),
+        };
+    }
+    let raw_bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return failed(path, 0, shadowed, error.to_string()),
+    };
+    let before_bytes = raw_bytes.len();
+    let Ok(raw) = String::from_utf8(raw_bytes) else {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes: before_bytes,
+            shadowed,
+            action: RulesOptimizeAction::Skipped(RulesOptimizeSkip::NotUtf8),
+        };
+    };
+    let candidate = optimize_rule_text(&raw);
+    if candidate.trim().is_empty() && !raw.trim().is_empty() {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes: before_bytes,
+            shadowed,
+            action: RulesOptimizeAction::Skipped(RulesOptimizeSkip::WouldBeEmpty),
+        };
+    }
+    let same = candidate.replace("\r\n", "\n") == raw.replace("\r\n", "\n");
+    if same {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes: before_bytes,
+            shadowed,
+            action: RulesOptimizeAction::Unchanged,
+        };
+    }
+    let candidate_bytes = candidate.len();
+    if !worth_writing(before_bytes, candidate_bytes) {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes,
+            shadowed,
+            action: RulesOptimizeAction::BelowThreshold,
+        };
+    }
+    if !apply {
+        return RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes,
+            shadowed,
+            action: RulesOptimizeAction::Ready,
+        };
+    }
+    match crate::serialize::write_atomic(path, candidate.as_bytes()) {
+        Ok(()) => RulesOptimizeFile {
+            path: path.to_path_buf(),
+            before_bytes,
+            candidate_bytes,
+            shadowed,
+            action: RulesOptimizeAction::Written,
+        },
+        Err(error) => failed(path, before_bytes, shadowed, error.to_string()),
+    }
+}
+
+fn failed(path: &Path, before: usize, shadowed: bool, reason: String) -> RulesOptimizeFile {
+    RulesOptimizeFile {
+        path: path.to_path_buf(),
+        before_bytes: before,
+        candidate_bytes: before,
+        shadowed,
+        action: RulesOptimizeAction::Failed { reason },
+    }
+}
+
+fn worth_writing(before: usize, after: usize) -> bool {
+    if after >= before {
+        return false;
+    }
+    let saved = before - after;
+    let clears_cap = before > MAX_RULE_FILE_BYTES && after <= MAX_RULE_FILE_BYTES;
+    let meaningful = saved >= RULES_OPTIMIZE_MIN_SAVED_BYTES
+        && after * 100 <= before * RULES_OPTIMIZE_MAX_KEEP_RATIO;
+    clears_cap || meaningful
+}
+
+fn is_rule_file_name(name: &str) -> bool {
+    RULE_NAMES.contains(&name) || RULE_LOCAL_NAMES.contains(&name)
+}
+
+fn walk_rule_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if file_type.is_dir() {
+            if name.starts_with('.') || RULES_WALK_SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            walk_rule_files(&entry.path(), out);
+        } else if file_type.is_file() && is_rule_file_name(&name) {
+            out.push(entry.path());
+        }
+    }
+}
+
+fn is_shadowed_rule(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    let slot: &[&str] = if RULE_LOCAL_NAMES.contains(&name) {
+        RULE_LOCAL_NAMES
+    } else if RULE_NAMES.contains(&name) {
+        RULE_NAMES
+    } else {
+        return false;
+    };
+    for candidate in slot {
+        if *candidate == name {
+            return false;
+        }
+        if dir.join(candidate).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+fn condense_rule_text(input: &str) -> Option<String> {
+    let (front, body) = split_frontmatter(input);
+    let mut pieces = parse_blocks(body);
+    let mut dropped = false;
+    for piece in &mut pieces {
+        if piece.level == 0 {
+            piece.text = optimize_block(
+                &piece.text,
+                piece.fenced,
+                piece.table,
+                piece.list,
+                &mut dropped,
+            );
+        }
+    }
+    pieces.retain(|piece| !piece.text.trim().is_empty());
+    if prune_empty_headings(&mut pieces) {
+        dropped = true;
+    }
+    if !dropped {
+        return None;
+    }
+    if pieces.is_empty() && front.is_empty() {
+        if input.trim().is_empty() || constraint_sentences(input) > 0 {
+            return None;
+        }
+        return Some(String::new());
+    }
+    let mut out = String::new();
+    if !front.is_empty() {
+        out.push_str(front);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    for (index, piece) in pieces.iter().enumerate() {
+        if (index > 0 || !out.is_empty()) && !out.ends_with("\n\n") {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(piece.text.trim_end());
+        out.push('\n');
+    }
+    while out.contains("\n\n\n") {
+        out = out.replace("\n\n\n", "\n\n");
+    }
+    if !constraints_preserved(input, &out) {
+        return None;
+    }
+    if out.trim() == input.trim() {
+        return None;
+    }
+    Some(out)
+}
+
+struct Block {
+    text: String,
+    level: usize,
+    fenced: bool,
+    table: bool,
+    list: bool,
+}
+
+fn parse_blocks(input: &str) -> Vec<Block> {
+    let lines: Vec<&str> = input.split_inclusive('\n').collect();
+    let mut blocks = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            index += 1;
+            continue;
+        }
+        if let Some(ch) = opening_fence(line) {
+            let start = index;
+            index += 1;
+            while index < lines.len() {
+                let current = lines[index].trim_end_matches(['\n', '\r']);
+                index += 1;
+                if closing_fence(current, ch) {
+                    break;
+                }
+            }
+            let text = join_lines(&lines[start..index]);
+            blocks.push(Block {
+                text,
+                level: 0,
+                fenced: true,
+                table: false,
+                list: false,
+            });
+            continue;
+        }
+        if let Some(level) = heading_level(line) {
+            blocks.push(Block {
+                text: line.to_string(),
+                level,
+                fenced: false,
+                table: false,
+                list: false,
+            });
+            index += 1;
+            continue;
+        }
+        if is_table_line(line) {
+            let start = index;
+            index += 1;
+            while index < lines.len() && is_table_line(lines[index].trim_end_matches(['\n', '\r']))
+            {
+                index += 1;
+            }
+            blocks.push(Block {
+                text: join_lines(&lines[start..index]),
+                level: 0,
+                fenced: false,
+                table: true,
+                list: false,
+            });
+            continue;
+        }
+        if is_list_item(line) {
+            let start = index;
+            index += 1;
+            while index < lines.len() {
+                let current = lines[index].trim_end_matches(['\n', '\r']);
+                if current.trim().is_empty()
+                    || heading_level(current).is_some()
+                    || opening_fence(current).is_some()
+                    || is_table_line(current)
+                {
+                    break;
+                }
+                index += 1;
+            }
+            blocks.push(Block {
+                text: join_lines(&lines[start..index]),
+                level: 0,
+                fenced: false,
+                table: false,
+                list: true,
+            });
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < lines.len() {
+            let current = lines[index].trim_end_matches(['\n', '\r']);
+            if current.trim().is_empty()
+                || heading_level(current).is_some()
+                || opening_fence(current).is_some()
+                || is_table_line(current)
+                || is_list_item(current)
+            {
+                break;
+            }
+            index += 1;
+        }
+        blocks.push(Block {
+            text: join_lines(&lines[start..index]),
+            level: 0,
+            fenced: false,
+            table: false,
+            list: false,
+        });
+    }
+    blocks
+}
+
+fn join_lines(lines: &[&str]) -> String {
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line.trim_end_matches(['\n', '\r']));
+        text.push('\n');
+    }
+    text.trim_end_matches('\n').to_string()
+}
+
+fn optimize_block(text: &str, fenced: bool, table: bool, list: bool, dropped: &mut bool) -> String {
+    if fenced || table {
+        return text.to_string();
+    }
+    if list {
+        return optimize_list(text, dropped);
+    }
+    optimize_paragraph(text, dropped)
+}
+
+fn optimize_list(text: &str, dropped: &mut bool) -> String {
+    let mut items: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if is_list_item(line) && !current.is_empty() {
+            if let Some(item) = optimize_list_item(&current, dropped) {
+                items.push(item);
+            } else {
+                *dropped = true;
+            }
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(line);
+    }
+    if let Some(item) = optimize_list_item(&current, dropped) {
+        items.push(item);
+    } else if !current.trim().is_empty() {
+        *dropped = true;
+    }
+    items.join("\n")
+}
+
+fn optimize_list_item(item: &str, dropped: &mut bool) -> Option<String> {
+    let mut lines = item.lines();
+    let first = lines.next().unwrap_or("");
+    let (marker, rest) = split_list_marker(first);
+    let mut prose = rest.to_string();
+    for line in lines {
+        if !prose.is_empty() {
+            prose.push(' ');
+        }
+        prose.push_str(line.trim());
+    }
+    let optimized = optimize_paragraph(&prose, dropped);
+    if optimized.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{marker}{optimized}"))
+}
+
+fn split_list_marker(line: &str) -> (String, &str) {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    let bytes = trimmed.as_bytes();
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        return (format!("{indent}{} ", trimmed[..2].trim_end()), rest);
+    }
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index > 0 && bytes.get(index) == Some(&b'.') && bytes.get(index + 1) == Some(&b' ') {
+        let marker = &trimmed[..=index];
+        let rest = &trimmed[index + 2..];
+        return (format!("{indent}{marker} "), rest);
+    }
+    (String::new(), line)
+}
+
+fn optimize_paragraph(text: &str, dropped: &mut bool) -> String {
+    let mut kept_lines = Vec::new();
+    let mut prose = String::new();
+    let flush = |prose: &mut String, kept_lines: &mut Vec<String>, dropped: &mut bool| {
+        let optimized = optimize_prose(prose, dropped);
+        prose.clear();
+        if !optimized.is_empty() {
+            kept_lines.push(optimized);
+        }
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if is_import_line(trimmed) {
+            flush(&mut prose, &mut kept_lines, dropped);
+            kept_lines.push(line.trim_end().to_string());
+            continue;
+        }
+        if !prose.is_empty() {
+            prose.push(' ');
+        }
+        prose.push_str(trimmed);
+    }
+    flush(&mut prose, &mut kept_lines, dropped);
+    kept_lines.join("\n")
+}
+
+fn is_import_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('@') else {
+        return false;
+    };
+    !rest.is_empty() && !rest.contains(char::is_whitespace)
+}
+
+fn optimize_prose(text: &str, dropped: &mut bool) -> String {
+    let sentences = split_sentences(text);
+    let kept: Vec<String> = sentences
+        .into_iter()
+        .filter(|sentence| {
+            if should_drop_sentence(sentence) {
+                *dropped = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    let mut out = String::new();
+    for sentence in kept {
+        let sentence = sentence.trim();
+        if sentence.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(sentence);
+    }
+    out
+}
+
+fn should_drop_sentence(sentence: &str) -> bool {
+    let trimmed = sentence.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    is_narrative(trimmed) && !has_constraint(trimmed)
+}
+
+fn has_constraint(text: &str) -> bool {
+    const ZH: &[&str] = &[
+        "必须", "不得", "不要", "禁止", "绝不", "不能", "唯一", "只能", "务必", "严禁",
+    ];
+    if ZH.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    const EN: &[&str] = &[
+        "must", "do not", "don't", "never", "cannot", "can't", "only",
+    ];
+    EN.iter()
+        .any(|marker| contains_ascii_phrase(&lower, marker))
+}
+
+fn is_narrative(text: &str) -> bool {
+    const ZH: &[&str] = &[
+        "此前",
+        "旧实现",
+        "曾经",
+        "历史上",
+        "实测",
+        "失败模式",
+        "事后看",
+        "当时",
+        "后来才",
+    ];
+    if ZH.iter().any(|marker| text.contains(marker)) || text.contains("v0.") {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    const EN: &[&str] = &[
+        "previously",
+        "used to",
+        "the old ",
+        "at the time",
+        "postmortem",
+        "historically",
+    ];
+    EN.iter()
+        .any(|marker| contains_ascii_phrase(&lower, marker))
+}
+
+fn contains_ascii_phrase(haystack: &str, needle: &str) -> bool {
+    haystack.match_indices(needle).any(|(index, _)| {
+        let before_ok = index == 0
+            || !haystack
+                .as_bytes()
+                .get(index - 1)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        let end = index + needle.len();
+        let after_ok = end >= haystack.len()
+            || !haystack
+                .as_bytes()
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric());
+        before_ok && after_ok
+    })
+}
+
+fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        buf.push(ch);
+        let boundary = matches!(ch, '。' | '！' | '？' | '；')
+            || (matches!(ch, '.' | '!' | '?' | ';')
+                && chars
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_whitespace()));
+        if boundary {
+            index += 1;
+            while index < chars.len() && chars[index].is_whitespace() {
+                buf.push(chars[index]);
+                index += 1;
+            }
+            if !buf.trim().is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            continue;
+        }
+        index += 1;
+    }
+    if !buf.trim().is_empty() {
+        out.push(buf);
+    }
+    out
+}
+
+fn constraints_preserved(input: &str, output: &str) -> bool {
+    constraint_sentences(input) <= constraint_sentences(output)
+}
+
+fn constraint_sentences(text: &str) -> usize {
+    let (_, body) = split_frontmatter(text);
+    parse_blocks(body)
+        .into_iter()
+        .filter(|block| !block.fenced && !block.table && block.level == 0)
+        .map(|block| {
+            let prose = if block.list {
+                block
+                    .text
+                    .lines()
+                    .map(|line| split_list_marker(line).1)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                block.text.clone()
+            };
+            split_sentences(&prose)
+                .into_iter()
+                .filter(|sentence| has_constraint(sentence))
+                .count()
+        })
+        .sum()
+}
+
+fn prune_empty_headings(pieces: &mut Vec<Block>) -> bool {
+    let mut drop = vec![false; pieces.len()];
+    for index in 0..pieces.len() {
+        let level = pieces[index].level;
+        if level == 0 {
+            continue;
+        }
+        let mut has_body = false;
+        for next in pieces.iter().skip(index + 1) {
+            if next.level > 0 && next.level <= level {
+                break;
+            }
+            if next.level == 0 && !next.text.trim().is_empty() {
+                has_body = true;
+                break;
+            }
+        }
+        if !has_body {
+            drop[index] = true;
+        }
+    }
+    let removed = drop.iter().any(|flag| *flag);
+    let mut index = 0;
+    pieces.retain(|_| {
+        let keep = !drop[index];
+        index += 1;
+        keep
+    });
+    removed
+}
+
+fn split_frontmatter(input: &str) -> (&str, &str) {
+    let Some(rest) = input.strip_prefix("---\n") else {
+        return ("", input);
+    };
+    let Some(end) = rest.find("\n---\n") else {
+        return ("", input);
+    };
+    let front_end = 4 + end + 5;
+    (&input[..front_end], &input[front_end..])
+}
+
+fn heading_level(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let level = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&level) && trimmed.as_bytes().get(level) == Some(&b' ') {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+fn is_table_line(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+fn is_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return true;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    index > 0 && bytes.get(index) == Some(&b'.') && bytes.get(index + 1) == Some(&b' ')
+}
+
+fn opening_fence(line: &str) -> Option<char> {
+    let trimmed = line.trim();
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let run = trimmed.chars().take_while(|c| *c == ch).count();
+    if run >= 3 {
+        Some(ch)
+    } else {
+        None
+    }
+}
+
+fn closing_fence(line: &str, ch: char) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == ch) && trimmed.chars().count() >= 3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,6 +1420,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 根目录规约每轮都进 stable 前缀；子目录规约进历史后一直留着。
+    /// 超过 [`MAX_RULE_FILE_BYTES`] 时尾部被截掉，模型以为规则已经读全。
+    /// 预算留有余量，但挡住把设计备忘整段贴回来。
+    #[test]
+    fn workspace_rule_files_stay_under_the_injection_budget() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/core 的上两级是仓库根");
+        let root_rules = std::fs::read(repo.join("CLAUDE.md")).expect("根 CLAUDE.md");
+        assert!(
+            root_rules.len() <= 14_000,
+            "根 CLAUDE.md 每轮注入，现在 {} 字节，上限 14000",
+            root_rules.len()
+        );
+        let crates = repo.join("crates");
+        for entry in std::fs::read_dir(&crates).expect("crates/") {
+            let path = entry.expect("dirent").path().join("CLAUDE.md");
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("read rules");
+            assert!(
+                bytes.len() <= MAX_RULE_FILE_BYTES,
+                "{} 超过注入截断线，尾部规则不可见",
+                path.display()
+            );
+            assert!(
+                bytes.len() <= 20_000,
+                "{} 现在 {} 字节；目录规约会留在会话历史里，上限 20000",
+                path.display(),
+                bytes.len()
+            );
+        }
     }
 
     #[test]
@@ -1095,5 +1898,202 @@ mod tests {
         assert_eq!(a.bytes, injected.len());
         assert!(!a.truncated);
         assert_eq!(a.tokens, crate::compact::estimate_text_tokens(&injected));
+    }
+
+    #[test]
+    fn optimize_drops_narrative_and_keeps_constraint_sentences_verbatim() {
+        let input = "\
+必须在授权短路之前拒绝。此前这里只在闸门里检查。
+不要把 hard_deny 挪走。旧实现会放行。
+";
+        let out = optimize_rule_text(input);
+        assert!(out.contains("必须在授权短路之前拒绝。"));
+        assert!(out.contains("不要把 hard_deny 挪走。"));
+        assert!(!out.contains("此前"));
+        assert!(!out.contains("旧实现"));
+        assert_eq!(optimize_rule_text(&out), out);
+    }
+
+    #[test]
+    fn optimize_keeps_a_constraint_sentence_that_also_mentions_history() {
+        let input = "必须在短路之前拒绝，此前漏检是因为授权短路。\n";
+        assert_eq!(optimize_rule_text(input), input);
+    }
+
+    #[test]
+    fn optimize_keeps_fences_tables_and_drops_narrative_list_items() {
+        let input = "\
+| 文件 | 何时 |
+|---|---|
+| a | 触达 |
+
+- 必须保留这条。
+- 此前这条是旧实现的故事。
+- 不要删除这条。
+
+```
+echo keep
+```
+";
+        let out = optimize_rule_text(input);
+        assert!(out.contains("| a | 触达 |"));
+        assert!(out.contains("必须保留这条。"));
+        assert!(out.contains("不要删除这条。"));
+        assert!(out.contains("echo keep"));
+        assert!(!out.contains("此前"));
+    }
+
+    #[test]
+    fn optimize_drops_an_empty_narrative_section() {
+        let input = "\
+# 规则
+
+## 旧实现
+
+此前这里只是回顾。旧实现曾经这样。实测失败过。
+
+## 仍然有效
+
+不要删这条。
+";
+        let out = optimize_rule_text(input);
+        assert!(out.contains("## 仍然有效"));
+        assert!(out.contains("不要删这条。"));
+        assert!(!out.contains("## 旧实现"));
+        assert!(!out.contains("此前"));
+    }
+
+    #[test]
+    fn optimize_project_rules_skips_build_dirs_and_writes_only_when_asked() {
+        let root = unique_dir("rules-optimize");
+        let nested = root.join("crates").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join("target").join("debug")).unwrap();
+        std::fs::write(nested.join("CLAUDE.md"), "不要漏掉子目录。\n").unwrap();
+        std::fs::write(
+            root.join("target").join("CLAUDE.md"),
+            "必须不要扫到构建目录。\n",
+        )
+        .unwrap();
+        let narrative = "此前这段只是回顾，旧实现曾经这样，实测失败过。\n".repeat(30);
+        let live = format!("# 规则\n\n必须保留这条。\n\n{narrative}");
+        let live_path = root.join("AGENTS.md");
+        std::fs::write(&live_path, &live).unwrap();
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "这份被 AGENTS.md 挡住，模型读不到。\n",
+        )
+        .unwrap();
+
+        let preview = optimize_project_rules(&root, false).unwrap();
+        let names: Vec<_> = preview
+            .files
+            .iter()
+            .map(|file| {
+                file.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(names.contains(&"AGENTS.md".to_string()));
+        assert!(names.contains(&"CLAUDE.md".to_string()));
+        assert!(preview
+            .files
+            .iter()
+            .any(|file| file.path.ends_with("crates/demo/CLAUDE.md")));
+        assert!(
+            !preview
+                .files
+                .iter()
+                .any(|file| { file.path.components().any(|c| c.as_os_str() == "target") }),
+            "target/ 里的规约不该进入扫描"
+        );
+        let agents = preview
+            .files
+            .iter()
+            .find(|file| file.path == live_path)
+            .unwrap();
+        assert!(matches!(agents.action, RulesOptimizeAction::Ready));
+        assert!(preview
+            .files
+            .iter()
+            .any(|file| file.path.ends_with("CLAUDE.md") && file.shadowed));
+        assert_eq!(std::fs::read_to_string(&live_path).unwrap(), live);
+
+        let written = optimize_project_rules(&root, true).unwrap();
+        let agents = written
+            .files
+            .iter()
+            .find(|file| file.path == live_path)
+            .unwrap();
+        assert!(matches!(agents.action, RulesOptimizeAction::Written));
+        let after = std::fs::read_to_string(&live_path).unwrap();
+        assert!(after.contains("必须保留这条。"));
+        assert!(!after.contains("此前"));
+        assert!(after.len() + RULES_OPTIMIZE_MIN_SAVED_BYTES <= live.len());
+
+        let again = optimize_project_rules(&root, true).unwrap();
+        assert!(again.files.iter().all(|file| {
+            matches!(
+                file.action,
+                RulesOptimizeAction::Unchanged
+                    | RulesOptimizeAction::BelowThreshold
+                    | RulesOptimizeAction::Skipped(_)
+            )
+        }));
+    }
+
+    #[test]
+    fn optimize_keeps_a_small_file_when_the_savings_are_below_the_threshold() {
+        let root = unique_dir("rules-optimize-small");
+        let path = root.join("CLAUDE.md");
+        let original = "必须保留。此前多写了一句。\n";
+        std::fs::write(&path, original).unwrap();
+        let report = optimize_project_rules(&root, true).unwrap();
+        assert!(matches!(
+            report.files[0].action,
+            RulesOptimizeAction::BelowThreshold
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn optimize_refuses_to_blank_a_file_that_is_only_narrative() {
+        let root = unique_dir("rules-optimize-empty");
+        let path = root.join("CLAUDE.md");
+        let original = "此前这段只是回顾。旧实现曾经这样。实测失败过。\n".repeat(20);
+        std::fs::write(&path, &original).unwrap();
+        let report = optimize_project_rules(&root, true).unwrap();
+        assert!(matches!(
+            report.files[0].action,
+            RulesOptimizeAction::Skipped(RulesOptimizeSkip::WouldBeEmpty)
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn workspace_rule_files_are_already_dense_enough_to_skip_optimize() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("crates/core 的上两级是仓库根");
+        let report = optimize_project_rules(repo, false).unwrap();
+        assert!(!report.files.is_empty());
+        for file in &report.files {
+            assert_eq!(
+                file.before_bytes,
+                file.candidate_bytes,
+                "{} 不该被再裁",
+                file.path.display()
+            );
+            assert!(
+                matches!(file.action, RulesOptimizeAction::Unchanged),
+                "{} 的动作是 {:?}",
+                file.path.display(),
+                file.action
+            );
+        }
     }
 }

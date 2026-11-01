@@ -85,7 +85,7 @@ impl ModelPickerDialog {
 /// `/model` 面板：拉取当前分组端点的可用模型列表。
 ///
 /// **必须走后台 task**——这是网络请求，而主循环绝不能做阻塞等待
-/// （`crates/tui/CLAUDE.md` 第 19 条：inline await 一个完成时间不可预期的
+/// （`crates/tui/CLAUDE.md`「主循环」：inline await 一个完成时间不可预期的
 /// 操作会让界面停在那一帧，ESC / Ctrl+C 全部失效）。结果经
 /// `AgentEvent::ModelListFetched` 回主循环渲染。
 pub(super) fn model_start_fetch_models(

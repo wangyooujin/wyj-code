@@ -156,7 +156,7 @@ pub enum AgentEvent {
     },
     /// `/compact` 的后台压缩结果。
     ///
-    /// 为什么必须走事件而不是在主循环里 `await`（`crates/tui/CLAUDE.md` 第 19 条）：
+    /// 为什么必须走事件而不是在主循环里 `await`（`crates/tui/CLAUDE.md`「主循环」）：
     /// 压缩是一次完整的 LLM 往返，摘要输出预算给到 `min(cw/10, 16000)`，
     /// 再叠 `RetryPolicy::default()` 的 5 次指数退避（单次尝试上限 90s），
     /// 端点不稳时可以拖到数分钟。它挂在主循环上 = 不重绘、不 `event::poll`，

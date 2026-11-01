@@ -1299,6 +1299,140 @@ impl Command for EvolveCmd {
 
 // ── /doctor ───────────────────────────────────────────────────────────────────
 
+pub struct RulesCmd;
+
+#[async_trait]
+impl Command for RulesCmd {
+    fn name(&self) -> &str {
+        "rules"
+    }
+    fn description(&self) -> String {
+        tr("rules.desc")
+    }
+    fn usage(&self) -> String {
+        tr("rules.usage")
+    }
+    async fn run(&self, args: &str, ctx: &CommandContext) -> Result<CommandResult> {
+        let apply = match args.trim() {
+            "" | "plan" | "dry-run" => false,
+            "apply" | "--yes" | "yes" => true,
+            other => {
+                return Ok(CommandResult::Output(tr_fmt(
+                    "rules.unknown_arg",
+                    &[("arg", other)],
+                )));
+            }
+        };
+        let root = wyj_core::project_root(&ctx.cwd);
+        let report = wyj_core::optimize_project_rules(&root, apply)?;
+        Ok(CommandResult::OutputPlain(
+            render_rules_optimize(&report, ctx.terminal_width)
+                .trim_end()
+                .to_string(),
+        ))
+    }
+}
+
+pub fn render_rules_optimize(report: &wyj_core::RulesOptimizeReport, width: usize) -> String {
+    use crate::cost_view::{DiagPanel, Level};
+    use wyj_core::{RulesOptimizeAction, RulesOptimizeSkip};
+
+    let mut panel = DiagPanel::new(tr("rules.title"));
+    if report.files.is_empty() {
+        panel = panel.row(Level::Info, tr("rules.label_file"), tr("rules.value_empty"));
+    }
+    let mut ready = 0usize;
+    for file in &report.files {
+        let path = file
+            .path
+            .strip_prefix(&report.root)
+            .unwrap_or(&file.path)
+            .display()
+            .to_string();
+        let before = human_bytes(file.before_bytes);
+        let after = human_bytes(file.candidate_bytes);
+        let (level, value) = match &file.action {
+            RulesOptimizeAction::Unchanged => (
+                Level::Ok,
+                tr_fmt(
+                    "rules.value_unchanged",
+                    &[("path", &path), ("size", &before)],
+                ),
+            ),
+            RulesOptimizeAction::BelowThreshold => (
+                Level::Info,
+                tr_fmt(
+                    "rules.value_below",
+                    &[("path", &path), ("before", &before), ("after", &after)],
+                ),
+            ),
+            RulesOptimizeAction::Ready => {
+                ready += 1;
+                (
+                    Level::Warn,
+                    tr_fmt(
+                        "rules.value_ready",
+                        &[("path", &path), ("before", &before), ("after", &after)],
+                    ),
+                )
+            }
+            RulesOptimizeAction::Written => {
+                ready += 1;
+                (
+                    Level::Ok,
+                    tr_fmt(
+                        "rules.value_written",
+                        &[("path", &path), ("before", &before), ("after", &after)],
+                    ),
+                )
+            }
+            RulesOptimizeAction::Skipped(reason) => {
+                let why = match reason {
+                    RulesOptimizeSkip::Symlink => tr("rules.skip_symlink"),
+                    RulesOptimizeSkip::NotUtf8 => tr("rules.skip_utf8"),
+                    RulesOptimizeSkip::WouldBeEmpty => tr("rules.skip_empty"),
+                };
+                (
+                    Level::Warn,
+                    tr_fmt("rules.value_skipped", &[("path", &path), ("reason", &why)]),
+                )
+            }
+            RulesOptimizeAction::Failed { reason } => (
+                Level::Err,
+                tr_fmt("rules.value_failed", &[("path", &path), ("reason", reason)]),
+            ),
+        };
+        panel = panel.row(level, tr("rules.label_file"), value);
+        if file.shadowed {
+            panel = panel.row(
+                Level::Info,
+                tr("rules.label_shadow"),
+                tr_fmt("rules.value_shadow", &[("path", &path)]),
+            );
+        }
+    }
+    if !report.files.is_empty() {
+        panel = panel.row(
+            Level::Info,
+            tr("rules.label_summary"),
+            tr_fmt(
+                "rules.value_summary",
+                &[
+                    ("count", &report.files.len().to_string()),
+                    ("ready", &ready.to_string()),
+                ],
+            ),
+        );
+    }
+    let hint = if report.applied {
+        tr("rules.hint_applied")
+    } else {
+        tr("rules.hint_dry")
+    };
+    panel = panel.hint(tr("rules.hint_label"), hint);
+    panel.render(width)
+}
+
 pub struct DoctorCmd;
 
 #[async_trait]
@@ -2513,6 +2647,7 @@ pub fn standard_registry() -> Arc<CommandRegistry> {
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
+    reg.register(Arc::new(RulesCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));
@@ -2574,6 +2709,7 @@ pub fn standard_registry_with_skills(
     reg.register(Arc::new(MemoryCmd));
     reg.register(Arc::new(EvolveCmd));
     reg.register(Arc::new(DoctorCmd));
+    reg.register(Arc::new(RulesCmd));
     reg.register(Arc::new(ComputerCmd));
     reg.register(Arc::new(ProfileCmd));
     reg.register(Arc::new(ModelCmd));

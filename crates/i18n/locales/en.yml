@@ -1,6 +1,7 @@
 _version: 1
 command:
   unknown: "Unknown command: /{name}  (type /help to see all commands)"
+  unknown_suggest: "Unknown command: /{name}. Did you mean {suggestion}?  (or type /help to see all commands)"
   agent_control_desc: "Send follow-up, interrupt or retry to a running sub-agent"
   agent_control_usage: "/agent-control <id> <follow-up text|interrupt|retry>"
   background_unsupported: "Command /{name} is declared background-executed but returned a result type the TUI cannot render directly: {result}"
@@ -230,6 +231,10 @@ cli:
   trust_about: "Approve trust for project-scoped MCP servers, skills and hooks/verify at once"
   run_about: "Run one slash command / skill once, non-interactively (like typing /xxx in a session, without the REPL loop)"
   run_command_help: "The command to run (`/name` or `name`); remaining arguments are passed through to the command"
+  rules_about: "Structurally trim project rule files such as AGENTS.md / CLAUDE.md (no model call; preview only unless asked to write)"
+  rules_dry_run_help: "Preview only, do not write (default)"
+  rules_yes_help: "Write the preview back to the files"
+  rules_json_help: "Print JSON"
 
 backup:
   export_done: "Exported to {path} ({size}; {profiles} profile(s), {skills} skill(s))"
@@ -304,6 +309,7 @@ help:
     - `/subagents [id]` — Open the sub-agent panel to inspect execution detail (including sessions restored via /resume); pass an id (e.g. a3) to jump directly to it
     - `/shells [id]` — Open the background shell panel to watch live output of Bash tasks started with run_in_background; pass an id (e.g. bash_1) to jump directly to it
     - `/doctor` — Diagnose environment (API Key / config / memory)
+    - `/rules [apply]` — Preview a structural trim of project rule files (drops narrative sentences, keeps constraint sentences verbatim, no model call); `apply` writes. CLI equivalent: `wyj-code rules` (`--yes` writes)
     - `/computer` — Diagnose computer-use (desktop GUI control) availability, registration status, and system permissions
     - `/memory` — Open the project memory panel (AGENTS.md / CLAUDE.md and other rule files)
     - `/memory clear-all` — Clear the entire Memory v3 store (Global + Project claims, jobs, audit); old files move to backups/<ts>/, rejected_history.json preserved. TUI requires a second confirmation.
@@ -355,7 +361,7 @@ help:
     - `Drag the right scrollbar` — Jump straight to that position; clicking the track jumps too
     - `Command+↑` / `Command+↓` — Jump to the start / latest message of the current session
     - `Command+Click` / `Ctrl+Click` — Open local file paths or web links in responses
-    - `/` — Command completion (Tab to confirm, Esc to cancel)
+    - `/` — Command completion; similar names are suggested (↑↓ to choose, Tab/Enter to fill, Esc to cancel)
     - `!<command>` — Run a Bash command directly
 
     ---
@@ -743,6 +749,31 @@ plugins:
     upgrade_failed: "Upgrade failed: {err}"
     local_no_upgrade: "Local development plugins have no version info and can't be upgraded"
 
+rules:
+  desc: "Preview or write a structural trim of project rule files (no model call)"
+  usage: "/rules [apply]"
+  title: "Rule trim"
+  label_file: "File"
+  label_shadow: "Not injected"
+  label_summary: "Total"
+  hint_label: "Note"
+  value_unchanged: "{path} ({size}, unchanged)"
+  value_below: "{path} ({before} → {after}, savings too small to write)"
+  value_ready: "{path} ({before} → {after}, will write after confirmation)"
+  value_written: "{path} ({before} → {after}, written)"
+  value_skipped: "{path} ({reason})"
+  value_failed: "{path} ({reason})"
+  value_shadow: "{path} is shadowed by a higher-priority file in the same directory and is never injected"
+  value_empty: "No AGENTS.md / CLAUDE.md / GEMINI.md / AGENT.md in this project"
+  value_summary: "{count} file(s), {ready} trim candidate(s)"
+  skip_symlink: "symlink, skipped"
+  skip_utf8: "not UTF-8, skipped"
+  skip_empty: "trimming would leave an empty file, skipped"
+  hint_dry: "Drops narrative sentences only; constraint sentences stay verbatim. No model call. To write: /rules apply or wyj-code rules --yes."
+  hint_applied: "Written back. Constraint sentences were not rewritten."
+  unknown_arg: "Unknown argument \"{arg}\". Usage: /rules or /rules apply"
+  failed: "One or more rule files could not be written"
+
 doctor:
   desc: "Diagnose the runtime environment (API Key / config / project memory files / memory)"
   title: "wyj-code v{version} environment diagnostics"
@@ -768,7 +799,7 @@ doctor:
   value_search_unavailable: "disabled ({reason})"
   value_rules_missing: "not found (run /init to generate AGENTS.md)"
   value_rules_file: "{path} ({size}, ~{tokens} tok)"
-  value_rules_oversized: "{path} ({size}, ~{tokens} tok) — large; consider trimming or splitting into subdirectories"
+  value_rules_oversized: "{path} ({size}, ~{tokens} tok) — large; run /rules to preview a structural trim, or split into subdirectories"
   value_rules_truncated: "{path} ({size}) exceeds the {limit} injection limit; the model cannot see: {headings}"
   value_rules_shadowed: "{shadowed} — same role as {path} but never loaded"
   value_rules_bad_import: "{path}: {imports} cannot be resolved (kept verbatim)"

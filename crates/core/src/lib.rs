@@ -62,8 +62,9 @@ pub use checkpoint::{
     CheckpointSummary, RewindPreview, RewindScope, WorkspaceSnapshot,
 };
 pub use claude_md::{
-    audit_rules_files, discover_files, ClaudeMdLoader, ClaudeMdSource, DiscoveredFile,
-    RulesFileAudit, RULES_FILE_LIMIT_BYTES, RULES_SIZE_WARN_BYTES,
+    audit_rules_files, discover_files, optimize_project_rules, optimize_rule_text, ClaudeMdLoader,
+    ClaudeMdSource, DiscoveredFile, RulesFileAudit, RulesOptimizeAction, RulesOptimizeFile,
+    RulesOptimizeReport, RulesOptimizeSkip, RULES_FILE_LIMIT_BYTES, RULES_SIZE_WARN_BYTES,
 };
 pub use code_index::{CodeSearchTool, ProjectCodeIndex};
 pub use compact::{

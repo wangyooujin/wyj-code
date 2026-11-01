@@ -5,5 +5,5 @@ pub mod cost_view;
 pub mod registry;
 pub mod skill;
 
-pub use builtin::standard_registry_with_skills;
+pub use builtin::{render_rules_optimize, standard_registry_with_skills};
 pub use registry::{Command, CommandContext, CommandRegistry, CommandResult};
