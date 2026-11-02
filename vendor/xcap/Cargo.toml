@@ -141,6 +141,8 @@ version = "0.3.2"
 [target.'cfg(target_os = "macos")'.dependencies.objc2-core-foundation]
 version = "0.3.2"
 default-features = false
+# `capture` 调用 `CFData::to_vec`，该函数在 `alloc` feature 后面。
+features = ["alloc"]
 
 [target.'cfg(target_os = "macos")'.dependencies.objc2-core-graphics]
 version = "0.3.2"

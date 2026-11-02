@@ -428,6 +428,14 @@ impl BashTool {
 
         let stdout = String::from_utf8_lossy(&bufs.stdout.lock().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&bufs.stderr.lock().unwrap()).into_owned();
+        // 语义过滤在截断之前：30KB 以内的 `cargo test` 通过日志否则会整段进历史。
+        // 命令字符串不改，权限仍看模型提交的原文。被信号杀死时输出不完整，只做
+        // ANSI / 重复行清理。
+        let exit = match status.code() {
+            Some(code) => crate::bash_filter::ExitClass::Exited(code),
+            None => crate::bash_filter::ExitClass::Signal,
+        };
+        let (stdout, stderr) = crate::bash_filter::condense(&inp.command, &stdout, &stderr, exit);
         let mut result = String::new();
 
         // stdout/stderr 共享同一截断预算：先到先得，避免一路很长时
@@ -581,6 +589,43 @@ mod tests {
             bufs.should_send(bufs.total()),
             "过了间隔且有新字节后应恢复推送"
         );
+    }
+
+    #[tokio::test]
+    async fn bash_strips_ansi_and_collapses_repeated_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = TestContext::plain(dir.path().to_path_buf());
+        let result = BashTool
+            .run(
+                serde_json::json!({
+                    "command": "printf '\\033[31mred\\033[0m\\na\\na\\na\\n'"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content, "red\na ×3\n");
+    }
+
+    /// 本地 printf 发出和上次 panic 相同的字节（ESC + U+0085），后面还有一行。
+    /// 工具必须正常返回，不能把进程或这一轮打掉，也不能吞掉后续输出。
+    #[tokio::test]
+    async fn bash_local_esc_nel_keeps_the_following_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = TestContext::plain(dir.path().to_path_buf());
+        let result = BashTool
+            .run(
+                serde_json::json!({
+                    "command": "printf '\\033\\302\\205kept\\n\\033]0;title\\nsecond line\\n'"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("kept"), "{}", result.content);
+        assert!(result.content.contains("second line"), "{}", result.content);
     }
 
     #[tokio::test]

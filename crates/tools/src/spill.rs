@@ -40,6 +40,10 @@ const SPILL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 /// 把完整输出写进 spill 目录，返回可读路径。
 ///
 /// 失败时返回 `None`——**落盘失败绝不能改变工具结果**，调用方应退回纯截断。
+pub(crate) fn save_full(label: &str, text: &str) -> Option<PathBuf> {
+    write_spill(label, text)
+}
+
 fn write_spill(label: &str, text: &str) -> Option<PathBuf> {
     let dir = spill_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
