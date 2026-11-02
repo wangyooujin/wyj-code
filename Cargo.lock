@@ -5000,7 +5000,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wyj-api"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5023,7 +5023,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-code"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5051,7 +5051,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-commands"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-computer"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "base64",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-config"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "directories",
@@ -5104,7 +5104,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-core"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5129,14 +5129,14 @@ dependencies = [
 
 [[package]]
 name = "wyj-i18n"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "rust-i18n",
 ]
 
 [[package]]
 name = "wyj-mcp"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5153,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-store"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5179,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-tools"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5209,7 +5209,7 @@ dependencies = [
 
 [[package]]
 name = "wyj-tui"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "anyhow",
  "arboard",
